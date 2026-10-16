@@ -1,0 +1,3 @@
+box-gc: mode=--kill prefix=/root/repo/bloomery-fxr5/target harness=[/root/bloomery-data/bin /root/bloomery-data/router/bin] (cwd inside /root/repo/bloomery-fxr5) self=3081564 never-candidates=[3081564 3080861 1645 1 ]
+box-gc: found 0 process(es) under /root/repo/bloomery-fxr5/target, in the harness dirs or waiting on tools/gpu-gate.sh (--check also counts a cwd inside /root/repo/bloomery-fxr5)
+gc-done

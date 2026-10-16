@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/arch/qwen3moe/wide38.rs
++++ b/crates/gpu/src/arch/qwen3moe/wide38.rs
+@@ -2231,7 +2231,7 @@
+             layers
+                 .iter()
+                 .map(|(lg, id)| super::body38::RouteTap {
+-                    logits: lg[t * taps.width..][..geo::EXPERTS].to_vec(),
++                    logits: lg[((t + 1) % m) * taps.width..][..geo::EXPERTS].to_vec(),
+                     ids: id[t * slots..][..geo::N_USED].to_vec(),
+                 })
+                 .collect()

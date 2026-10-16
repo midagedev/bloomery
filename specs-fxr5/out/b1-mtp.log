@@ -1,0 +1,154 @@
+BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_mtp'
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp...
+
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.08s
+
+✓ Cargo build succeeded
+gpu-gate.sh: gate_qwen4exp_mtp on the a6000 (asked any), tier fixture: no V4.1 load lock
+derived model file = "/models/fixtures/qwen38/qwen38-fixture-00001-of-00001.gguf" (the real file's "/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
+derived draft file = "/models/fixtures/qwen38/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" (the real file's "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf")
+derived draft layer = 4 (the real file's 48)
+derived card budget = Some(9489612800) (the real file's None)
+derived card bytes (total, driver reserve, device, free, holders) = (51527024640, 574619648, Some(DeviceId { ordinal: 0, uuid: [140, 18, 159, 166, 115, 130, 53, 165, 36, 100, 159, 240, 29, 153, 252, 212] }), Some(50668240896), None) (the real file's (25769803776, 419430400, None, None, None))
+named difference: the card's name "A6000", the old literal's "3090"
+(o) /root/bloomery-data/ref-mtp/qwen4exp_prose64_n64_k1: 36 graphs over 34 blocks, prompt 64 ids, family mtp-qwen4exp PASS
+bands: eh 1.2858e-2 router 2.2271e-2 the argmax cap's 3.6369e-2 free 0.10; the node-local pins: γ(k/32 + 5) a dot, the pack ½γ(52) + 6u = 1.907e-6, the mixes MIXED_BAND 3.0e-5, the combines' weights LO_BAND 1.0e-5
+(u) unset: head list of 65536 rows from shipped (BLOOMERY_MTP_HEAD_ROWS unset: the shipped list kohangul-65536, the target's tokenizer its own); the list's first line "# bloomery mtp-head-rows 1 vocab=248320 rows=65536 vocab_sha256=b7f4906b5bf6a845baf3f41fdcdcd70f0f2f234eb702aabb830ce1536604e5d6", the target's tokenizer b7f4906b5bf6a845baf3f41fdcdcd70f0f2f234eb702aabb830ce1536604e5d6 PASS
+(u) full: head full of 248320 rows from set (BLOOMERY_MTP_HEAD_ROWS=full) PASS
+plan card=A6000 ctx_max=3072 card_budget=Some(12335442092) (the draft's card bytes 2845829292 in it) draft dense=98715648 experts=2673868800 rounding=12433408 kv=6291456 map=993280 arena=53526700 headroom=4977337312
+load host_tier r8=off (no sidecar at /models/fixtures/qwen38-r8/qwen38-fixture-r8.gguf; optional: a source checkout writes it with just r8-sidecar)
+load host_tier type=q5_K k=2560 path=fused
+load host_tier type=q8_0 k=640 path=fused
+load host_tier type=q4_K k=2560 path=fused
+load host_tier type=q5_1 k=640 path=fused
+load card=A6000 ctx_max=3072 resident_bytes=6694415504 in 7.6 s; the draft program's arena 53526700 bytes (runtime value, outside the plan)
+(d) draft resident 2779869184 (want 2779869184: weights 2772584448 + store 6291456 + map 993280) PASS
+(d) token_embd.weight read at [7724a0000000, 7724c6000000], the target's at Some([7724a0000000, 7724c6000000]) PASS
+(d) output.weight read at [772800000000, 772826000000], the target's at Some([772800000000, 772826000000]) PASS
+(d) the draft program's arena 53526700 (the plan's 53526700) PASS
+(d) the walk's borrow resolves: PASS
+(d) head map: 248320 words (output's 248320 rows), 40960 rows, the list's ids then 0 PASS (want 40960)
+(q) a draft with its own matrices: qwen4exp Mtp38: source File { first_shard: "/models/fixtures/qwen38/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", bytes: 2775621632, borrows: Borrows { embedding: false, head: false } }: the load borrows the target's token_embd and output (a shared draft file) PASS
+(q) a plan of another row map: qwen4exp Mtp38: resident weights, store and row map hold [2772584448, 6291456, 993280] bytes; the plan has [2772584448, 6291456, 993284] PASS
+(d) the drafting load's budget: card experts a layer alone (Some(256), Some(256)) and drafted (Some(256), Some(256)) under Some(12335442092) + the draft's 2845829292 B (want 256 on every layer both ways: half the experts) PASS
+(f) the draft's own row before any walk: qwen4exp Mtp38: a walk before the draft's own row PASS
+fixture-oracle: (elhfx) every graph of ik's fixture set replayed: eh_proj, routes, l_out and the argmax against ik's
+fx bands: eh 1.2858e-2 router 2.2271e-2 l_out 3.4020e-2 logits 3.6369e-2 from the terms eh_proj 1.286e-2, attention in 1.286e-2 and out 1.286e-2, routed gate·up 1.286e-2 and down 1.286e-2, shared gate·up 1.286e-2 and down 1.286e-2, head 1.286e-2; the real clause's PINs eh 1.2858e-2 router 2.2271e-2 logits 3.6369e-2
+(l) block -1 warmup mtp flip layer=4 token=13: ik margin 2.688e-5; 282<-83 gap 2.688e-5 err 1.178e-3 (cap 0.06): allowed (counted) (gap cap 5.835e-2) PASS
+(l) block -1 warmup mtp flip layer=4 token=34: ik margin 5.595e-4; 312<-455 gap 5.595e-4 err 3.882e-3 (cap 0.06): allowed (counted) (gap cap 6.071e-2) PASS
+(l) block 29 update mtp flip layer=4 token=0: ik margin 5.291e-4; 181<-220 gap 5.291e-4 err 9.389e-4 (cap 0.06): allowed (counted) (gap cap 5.619e-2) PASS
+(h) block 29 update row 0: argmax 158545 ik 158545 on a flip, not held
+(l) block 40 update mtp flip layer=4 token=0: ik margin 6.776e-4; 381<-40 gap 6.776e-4 err 1.542e-3 (cap 0.06): allowed (counted) (gap cap 6.329e-2) PASS
+(h) block 40 update row 0: argmax 92477 ik 92477 on a flip, not held
+(elhfx e) 126 rows: eh_proj worst 5.465e-3 (band 1.286e-2, 0.425 of it), 0 past PASS
+(elhfx l) 126 rows, 4 on flips, 0 flips not allowed; l_out's distance from ik's on the 122 rows held, worst 5.577e-3 (band 3.402e-2, 0.164 of it), 0 past it PASS
+(elhfx h) 63 head rows, 61 held: argmax = ik's 61, ties 0, wrong 0; the draft's token = our argmax but 0; the logits' distance from ik's 6.829e-3 (printed, band 3.637e-2) PASS
+(elhfx n) (n) eh_proj = the input pack of the token's embedding row and the fed hidden row, then the projection: 126 rows, worst 2.586e-7, worst over its bound 0.000, 0 past PASS
+(elhfx n) (n) AttnIn = the attention site's mix of eh_proj's streams: 126 rows, worst 1.767e-7, worst over its bound 0.006, 0 past PASS
+(elhfx n) (n) AttnOut = the output projection of AttnGated: 126 rows, worst 2.706e-7, worst over its bound 0.000, 0 past PASS
+(elhfx n) (n) AttnCombined = eh_proj's streams plus the attention site's weights times AttnOut: 126 rows, worst 3.062e-8, worst over its bound 0.036, 0 past PASS
+(elhfx n) (n) FfnIn = the feed-forward site's mix of AttnCombined: 126 rows, worst 1.591e-7, worst over its bound 0.005, 0 past PASS
+(elhfx n) (n) Routed = the routed slots' downs of their SwiGLU rows, weighted, in slot order: 126 rows, worst 1.257e-7, worst over its bound 0.002, 0 past PASS
+(elhfx n) (n) Shared = the shared expert's down of its SwiGLU row: 126 rows, worst 1.094e-7, worst over its bound 0.006, 0 past PASS
+(elhfx n) (n) FfnOut = Routed plus Shared times its gate, bit for bit: 126 rows, worst 0.000e0, worst over its bound 0.000, 0 past PASS
+(elhfx n) (n) l_out = AttnCombined plus the feed-forward site's weights times FfnOut: 126 rows, worst 2.638e-8, worst over its bound 0.051, 0 past PASS
+(elhfx n) (n) HeadIn = the head site's mix of l_out: 126 rows, worst 1.676e-7, worst over its bound 0.006, 0 past PASS
+(elhfx n) (n) logits = the full head's projection of HeadIn: 63 rows, worst 1.760e-7, worst over its bound 0.001, 0 past PASS
+deferred(real) oracle: (e)(l)(h) every graph of ik's set replayed: eh_proj, routes, l_out and the argmax against ik's
+(h) 127 rows, 36 head rows: the draft's token = our full head's argmax but 0 PASS
+(n) eh_proj = the input pack of the token's embedding row and the fed hidden row, then the projection: 127 rows, worst 2.574e-7, worst over its bound 0.000, 0 past PASS
+(n) AttnIn = the attention site's mix of eh_proj's streams: 127 rows, worst 1.582e-7, worst over its bound 0.005, 0 past PASS
+(n) AttnOut = the output projection of AttnGated: 127 rows, worst 2.668e-7, worst over its bound 0.000, 0 past PASS
+(n) AttnCombined = eh_proj's streams plus the attention site's weights times AttnOut: 127 rows, worst 3.062e-8, worst over its bound 0.036, 0 past PASS
+(n) FfnIn = the feed-forward site's mix of AttnCombined: 127 rows, worst 1.671e-7, worst over its bound 0.006, 0 past PASS
+(n) Routed = the routed slots' downs of their SwiGLU rows, weighted, in slot order: 127 rows, worst 1.265e-7, worst over its bound 0.002, 0 past PASS
+(n) Shared = the shared expert's down of its SwiGLU row: 127 rows, worst 1.101e-7, worst over its bound 0.006, 0 past PASS
+(n) FfnOut = Routed plus Shared times its gate, bit for bit: 127 rows, worst 0.000e0, worst over its bound 0.000, 0 past PASS
+(n) l_out = AttnCombined plus the feed-forward site's weights times FfnOut: 127 rows, worst 2.637e-8, worst over its bound 0.048, 0 past PASS
+(n) HeadIn = the head site's mix of l_out: 127 rows, worst 1.392e-7, worst over its bound 0.005, 0 past PASS
+(n) logits = the full head's projection of HeadIn: 36 rows, worst 1.742e-7, worst over its bound 0.001, 0 past PASS
+(r) a walk of 2 rows of block 33 update (40960): list logits = the full head's rows of their ids, 0 differ; tokens mapped; p within its bound (worst 0.01 of it) PASS
+(r) a walk of 1 rows of block 33 update (40960): list logits = the full head's rows of their ids, 0 differ; tokens mapped; p within its bound (worst 0.01 of it) PASS
+deferred(real) oracle: (t) the target's streams after the prompt against ik's MTP hidden rows, shifted by one
+(t) 8 rows from 57 fed the target's streams in place = from the host, bit for bit PASS
+fixture-oracle: (tfx) the target's streams after the prompt against ik's fixture MTP hidden rows, shifted by one
+(tfx) the target's streams at q against ik's fixture MTP hidden at q + 0: 8 rows, worst 1.354e0
+(tfx) the target's streams at q against ik's fixture MTP hidden at q + 1: 7 rows, worst 3.286e-2
+(tfx) the target's streams at q against ik's fixture MTP hidden at q + 2: 6 rows, worst 1.342e0
+(tfx) ik's fixture row p reads the target's hidden of p − 1: the shift 1 reads closer than 0 and 2 (worst 3.286e-2 at 1, printed); a flip's path lies under the last rows PASS
+(g) 1 rows, Rows head: captured = eager, twice PASS
+(g) 2 rows, Rows head: captured = eager, twice PASS
+(g) 3 rows, Rows head: captured = eager, twice PASS
+(g) 4 rows, Rows head: captured = eager, twice PASS
+(g) 1 rows, Full head: captured = eager, twice PASS
+(g) two own rows, captured then replayed = eager PASS; the first = a host walk of the last token and streams PASS
+(g) a chain of two rows and two own walks = its walks one by one: ids [102864, 41316, 129492] PASS
+(g) capture rows=1 own=false head=Rows: 36 nodes (want 36) PASS
+(g) capture rows=2 own=false head=Rows: 36 nodes (want 36) PASS
+(g) capture rows=3 own=false head=Rows: 37 nodes (want 37) PASS
+(g) capture rows=4 own=false head=Rows: 37 nodes (want 37) PASS
+(g) capture rows=1 own=false head=Full: 36 nodes (want 36) PASS
+(g) capture rows=1 own=true head=Rows: 36 nodes (want 36) PASS
+(g) 6 captures (want 6) PASS
+(f) no rows: qwen4exp Mtp38: a walk of 0 rows; the Eager walk takes 1..=8 PASS
+(f) nine rows: qwen4exp Mtp38: a walk of 9 rows; the Eager walk takes 1..=8 PASS
+(f) five captured rows: qwen4exp Mtp38: a walk of 5 rows; the Graph walk takes 1..=4 PASS
+(f) a store walk past its rows: qwen4exp Mtp38: a walk of 65 rows; the Store walk takes 1..=64 PASS
+(f) rows past the store: qwen4exp Mtp38: 2 rows from position 3071, in a store of 3072 PASS
+(f) a token past the vocabulary: qwen4exp Mtp38: token 0 is id 248320, past the vocabulary of 248320 PASS
+(f) a short hidden slice: qwen4exp Mtp38: 10240 hidden values for 2 rows of 10240 PASS
+(f) a capture with the taps armed: qwen4exp Mtp38: the taps off for a captured walk PASS
+(f) a walk past the positions the store holds: qwen4exp Mtp38: a walk from position 3071: the draft's store holds this sequence's positions below 4, and the walk would read the keys between PASS
+(f) a NaN in a hidden row: qwen4exp Mtp38: device fault at layer 4 site router (a non-finite router logit, fewer finite candidates than slots, or a non-finite weight); sites raised in layer 4 (Qwen35moe step order): hc_mix, f32_product, router, logit PASS
+(f) the draft's own row after a reset: qwen4exp Mtp38: a walk before the draft's own row PASS
+(f) a store walk read back: qwen4exp Mtp38: a walk with a head to read back (MtpMode::Store writes the store alone) PASS
+(f) a chain of store walks: qwen4exp Mtp38: a chain's walks with a head (MtpMode::Store writes the store alone) PASS
+(f) the draft's own row after a store walk: qwen4exp Mtp38: a walk before the draft's own row PASS
+(f) the streams of a store walk: qwen4exp Mtp38: a walk to read PASS
+(s) the store walks (Auto, runs of 3) over a store other ids overwrote, against the eager walks over the same 64 positions: keys within 7.317e-3 (band 5.447e-2), values within 7.148e-3 (band 2.772e-2) PASS
+(w) the prompt call (Auto) walks the draft over 64 positions in 1 units as the store walks fed from the host: other ids overwrote 64 of 64 stored rows, then the call's warmup stored 64 of 64 as the host's (first other at None) PASS; the anchor's token 159870 (host 159870), streams and logits bit for bit PASS
+(s) the store walks (Pass, runs of 3) over a store other ids overwrote, against the eager walks over the same 64 positions: keys within 7.325e-3 (band 5.447e-2), values within 7.108e-3 (band 2.772e-2) PASS
+(w) the prompt call (Pass) walks the draft over 64 positions in 8 units as the store walks fed from the host: other ids overwrote 64 of 64 stored rows, then the call's warmup stored 64 of 64 as the host's (first other at None) PASS; the anchor's token 159870 (host 159870), streams and logits bit for bit PASS
+(w) depth 64: the drafted run's 64 ids = the plain run's PASS
+(w) depth 64: 63 windows kept [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 63 rejected a row PASS
+(w) depth 64: the live stores after the drafted run = the plain run's at position 127 PASS
+(w) depth 64: unset the draft keeps 0 windows; kept, the same ids and passes PASS and 63 windows of 63 drafted passes, each its pass's kept rows and ids PASS
+(w) shallow: a window that keeps 1 -> 2 tokens = the plain run's PASS, the live stores after the commit its at position 65 PASS
+(w) shallow: a window that keeps 2 -> 3 tokens = the plain run's PASS, the live stores after the commit its at position 66 PASS
+(w) shallow: a window that keeps 3 -> 4 tokens = the plain run's PASS, the live stores after the commit its at position 67 PASS
+(w) shallow: a window that keeps 4 -> 5 tokens = the plain run's PASS, the live stores after the commit its at position 68 PASS
+(w) depth 3000: the drafted run's 64 ids = the plain run's PASS
+(w) depth 3000: 63 windows kept [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 63 rejected a row PASS
+(w) depth 3000: the live stores after the drafted run = the plain run's at position 3063 PASS
+(w) deep, its rejected row completing a pool: a window that keeps 2 -> 3 tokens = the plain run's PASS, the live stores after the commit its at position 3002 PASS
+(w) the lane word planted on lane 2, never written -> Head::tokens: device fault at layer 0 site delta_stamp (a delta-step lane whose stamp is not the position of the call's first row: a lane never written, or one a commit did not leave there); sites raised in layer 0 (Qwen35moe step order): delta_stamp PASS
+(c) paying: the 64 ids = the plain run's PASS; 12 windows, each its pass's width with the target's kept ids PASS; the chooser's widths [51, 4, 4, 4] = the passes' [51, 4, 4, 4] PASS; incumbent 0, the cuts and the gate PASS
+(c) losing: the 64 ids = the plain run's PASS; 12 windows, each its pass's width with the target's kept ids PASS; the chooser's widths [51, 4, 4, 4] = the passes' [51, 4, 4, 4] PASS; incumbent 0, the cuts and the gate PASS
+(w) a prompt call of [2, 8253, 271] continuing at 71 (the model's own next id 90486): joined Some(Join { start: 71, caught_up: 1, skipped: None }) PASS, windows kept [1, 1, 1, 1, 1, 1, 1] drafted PASS, its 8 ids = the plain run's PASS
+(w) the draft restarted, a prompt call continuing at 81: joined Some(Join { start: 81, caught_up: 0, skipped: Some("no rows of the held sequence wait for the draft: it did not walk the sequence the target holds") }) PASS, 7 passes proposed nothing PASS, its 8 ids = the plain run's PASS
+(f) the Pass arena's rows read as the position before their first: qwen4exp Mtp38: rows 0..1 of the Pass arena as positions 55..56 for a walk from 56: the arena holds positions 56..64 PASS
+(f) the Pass arena's rows read past their last: qwen4exp Mtp38: rows 0..1 of the Pass arena as positions 64..65 for a walk from 65: the arena holds positions 56..64 PASS
+(f) the Pass arena's rows read as other positions: qwen4exp Mtp38: rows 1..2 of the Pass arena as positions 56..57 for a walk from 57: the arena holds positions 56..64 PASS
+(f) the walk the Pass arena holds, its 8 rows from 57: ran, 8 tokens PASS
+(p) after the drafted run's 5 windows at 69: the draft store holds 69 positions PASS
+(p) a snapshot at 69 holds exactly the accepted rows: 69 positions, 8398336 bytes PASS
+(f) a snapshot of a store past the position: qwen4exp snapshot: a state at 69 of a draft store that holds 70 positions PASS
+(w) the partial accept: a window that keeps 2 -> 3 tokens = the plain run's PASS, the live stores after the commit its at position 66 PASS
+(f) the pass arena's rejected row: qwen4exp Mtp38: rows 2..3 of the Pass arena as positions 66..67 for a walk from 67: the arena holds positions 64..66 PASS
+(i) the held pass after the cut step: 8 ids, the plain run's PASS
+(x) a state without the draft's side put back on a load with the draft: qwen4exp resume: a state without the draft's side put back on a load with the draft (the store layouts differ) — the model untouched: stores same, position 0, draft store 0 PASS
+(y) two slots in the server's order: 8 drafted passes a slot, a select between every pass; each slot's ids PASS its single-sequence reference's, its proposals and acceptances PASS, its draft store PASS PASS
+deferred(real) file-bound: (z) at each depth a pass keeps different counts on the two slots
+(z) two slots in one pass at depth 1 (a pass of 4 rows): 8 passes; each slot's ids, kept rows, draft windows and draft store its window's alone run's; 16 slot passes kept fewer rows than they ran, 0 passes kept different counts on the two slots (printed, not pinned in this tier) PASS
+(z) two slots in one pass at depth 3 (a pass of 8 rows): 8 passes; each slot's ids, kept rows, draft windows and draft store its window's alone run's; 16 slot passes kept fewer rows than they ran, 0 passes kept different counts on the two slots (printed, not pinned in this tier) PASS
+(z) waiting: a select of slot 1 while a pass of its verify rows waits for its commit named by the model true, slot 0 still selected at its position true; the commit of one row moved slot 1 one position true PASS
+(z) step after: 5 passes of both slots' verify rows at fixed keeps, the last keeping 1 of parked slot 1's 2 rows, then 2 plain steps a slot (slot 0 right after the commit, slot 1 after its select); each slot's ids, each step's id and logits row bit for bit, its lane and position its window's alone run's PASS
+clauses: 16 ran, 3 left to the real tier
+local_rc=0 wall=46

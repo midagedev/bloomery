@@ -1,0 +1,284 @@
+BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_e2e'
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e...
+
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+warning: `bloomery-gpu` (lib) generated 1 warning
+   Compiling bloomery-gpu-gates v0.2.9 (/root/repo/bloomery-fxr5/crates/gpu-gates)
+    Finished `release` profile [optimized] target(s) in 3.90s
+
+✓ Cargo build succeeded
+gpu-gate.sh: gate_qwen4exp_e2e on the a6000 (asked any), tier fixture: no V4.1 load lock
+derived model file = "/models/fixtures/qwen38/qwen38-fixture-00001-of-00001.gguf" (the real file's "/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
+derived N_LAYER = 4 (the real file's 48)
+derived PLE_LAYER = 2 (the real file's 1)
+derived N_QSA = 2 (the real file's 12)
+derived N_GDN = 2 (the real file's 36)
+derived NODES_DECODE = 113 (the real file's 1151)
+derived MEMOPS = 8 (the real file's 96)
+derived NODES_VERIFY = 119 (the real file's 1235)
+derived NODES_SLOT = 23 (the real file's 171)
+derived IMAGE_TOKEN = 248056 (the real file's 248056)
+derived plan levers' card budget = Some(9489612800) (the real file's None)
+derived card bytes (total, driver reserve, device, free, holders) = (51527024640, 574619648, Some(DeviceId { ordinal: 0, uuid: [140, 18, 159, 166, 115, 130, 53, 165, 36, 100, 159, 240, 29, 153, 252, 212] }), Some(50668240896), None) (the real file's (25769803776, 419430400, None, None, None))
+named difference: the card's name "A6000", the old literal's "3090"
+plan card=A6000 experts=Host slots=1 ctx_max=3072 ubatch=3072 host_experts=2048 card_experts=0 card_layers=0 ple=host room=263425794048 read=MemAvailable row_reserve=0 card_budget=Some(9489612800)
+load host_tier r8=off (no sidecar at /models/fixtures/qwen38-r8/qwen38-fixture-r8.gguf; optional: a source checkout writes it with just r8-sidecar)
+load host_tier type=q5_K k=2560 path=fused
+load host_tier type=q8_0 k=640 path=fused
+load host_tier type=q4_K k=2560 path=fused
+load host_tier type=q5_1 k=640 path=fused
+load resident_bytes=3861019620 ctx=3072 layers=4 in 2.6 s (runtime value)
+structure layers=4 selecting at [1, 3]; store bytes 41312288 (want 41312288, derived) PASS
+structure decode graph_nodes=113 (want 113; the program counts 113, 8 of them batch_mem_op) kernel=105 batch_mem_op=8 (want 8) other=0 PASS
+head rows: a head of 2 rows over the q8_0 lm_head, two equal finite rows -> tokens [2505, 2505] (want two equal tokens) PASS
+head rows: a head of 2 rows over the q8_0 lm_head, a NaN in row 0's input -> error "Head::tokens: device fault at the output head site logit (a head logit not finite); sites raised in the output head (architecture unknown, so in code order, not step order): logit" (want the output head's fault at site logit) PASS
+head rows: a head of 2 rows over the q8_0 lm_head, a NaN in row 1's input -> error "Head::tokens: device fault at the output head site logit (a head logit not finite); sites raised in the output head (architecture unknown, so in code order, not step order): logit" (want the output head's fault at site logit) PASS
+head rows: the word left raised, a verify of 2 rows at 2 -> error "Head::tokens: device fault at the output head site logit (a head logit not finite); sites raised in the output head (Qwen35moe step order): logit", poisoned the output head site logit; sites raised in the output head (Qwen35moe step order): logit (want the output head's fault, and poisoned by it) PASS
+paths five eager steps vs five graph replays: tokens [157377, 137169, 47835, 32521, 34727] vs [157377, 137169, 47835, 32521, 34727]; every position's logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+paths one pass of five rows vs five graph steps: tokens [34727] vs [157377, 137169, 47835, 32521, 34727]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+paths after the pass's state and a reset, the same five steps: tokens [157377, 137169, 47835, 32521, 34727] vs [157377, 137169, 47835, 32521, 34727]; every position's logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+free: route taps whose ids are not the top 10 of their own logits (distinct, under 512): 0 [] PASS
+deferred(real) oracle: (c) free: each layer's output, each route and the last argmax against ik's
+deferred(real) oracle: (cfx) free: each layer's output off every flip's path, each flip and the last argmax against ik's fixture set
+deferred(real) oracle: (g) free: the last argmax against ik's
+gemm free: last argmax ours=34727 (returned 34727) ik=not compared in this tier (the pass's [34727]) PASS
+fixture-oracle: (g) free: the last argmax against ik's fixture set, as a tie band
+ik_bands Gemm: band = 1.04 · √(Σ mult · q²), q = site_rel(ty, arm).joint() at the worst crest (ik's activation form and ours, independent); the head adds `output`
+ik_bands Gemm layer 0 (delta): router 4.4913e-2 stream 7.7699e-2; 0.attn_qkv.weight Q8_0 q 1.818e-2 x3.0000; 0.attn_gate.weight Q8_0 q 1.818e-2 x1.6400; 0.ssm_beta.weight F32 q 0.000e0 x0.0625; 0.ssm_alpha.weight F32 q 0.000e0 x0.0625; 0.ssm_out.weight Q8_0 q 1.818e-2 x1.0000; 0.ffn_gate_inp.weight F32 q 0.000e0 x1.0000; 0.ffn_gate_inp_shexp.weight F32 q 0.000e0 x0.0625; 0.ffn_gate_shexp.weight Q8_0 q 1.818e-2 x1.6400; 0.ffn_up_shexp.weight Q8_0 q 1.818e-2 x1.0000; 0.ffn_down_shexp.weight Q8_0 q 1.818e-2 x1.0000; 0.ffn_gate_exps.weight Q5_K q 2.875e-2 x1.6400; 0.ffn_up_exps.weight Q5_K q 2.875e-2 x1.0000; 0.ffn_down_exps.weight Q8_0 q 1.818e-2 x1.0000
+ik_bands Gemm layer 1 (selecting): router 8.6545e-2 stream 1.0728e-1; 1.attn_q.weight Q8_0 q 1.818e-2 x1.0625; 1.attn_k.weight Q8_0 q 1.818e-2 x1.0000; 1.attn_v.weight Q8_0 q 1.818e-2 x1.0000; 1.attn_output.weight Q8_0 q 1.818e-2 x1.0000; 1.ffn_gate_inp.weight F32 q 0.000e0 x1.0000; 1.ffn_gate_inp_shexp.weight F32 q 0.000e0 x0.0625; 1.ffn_gate_shexp.weight Q8_0 q 1.818e-2 x1.6400; 1.ffn_up_shexp.weight Q8_0 q 1.818e-2 x1.0000; 1.ffn_down_shexp.weight Q8_0 q 1.818e-2 x1.0000; 1.ffn_gate_exps.weight Q4_K q 2.875e-2 x1.6400; 1.ffn_up_exps.weight Q4_K q 2.875e-2 x1.0000; 1.ffn_down_exps.weight Q5_1 q 1.818e-2 x1.0000
+ik_bands Gemm layer 2 (delta): router 1.1934e-1 stream 1.3514e-1; 2.ple_key.weight Q8_0 q 1.818e-2 x1.0000; 2.ple_value.weight Q8_0 q 1.818e-2 x1.0000; 2.attn_qkv.weight Q8_0 q 1.818e-2 x3.0000; 2.attn_gate.weight Q8_0 q 1.818e-2 x1.6400; 2.ssm_beta.weight F32 q 0.000e0 x0.0625; 2.ssm_alpha.weight F32 q 0.000e0 x0.0625; 2.ssm_out.weight Q8_0 q 1.818e-2 x1.0000; 2.ffn_gate_inp.weight F32 q 0.000e0 x1.0000; 2.ffn_gate_inp_shexp.weight F32 q 0.000e0 x0.0625; 2.ffn_gate_shexp.weight Q8_0 q 1.818e-2 x1.6400; 2.ffn_up_shexp.weight Q8_0 q 1.818e-2 x1.0000; 2.ffn_down_shexp.weight Q8_0 q 1.818e-2 x1.0000; 2.ffn_gate_exps.weight Q4_K q 2.875e-2 x1.6400; 2.ffn_up_exps.weight Q4_K q 2.875e-2 x1.0000; 2.ffn_down_exps.weight Q5_1 q 1.818e-2 x1.0000
+ik_bands Gemm layer 3 (selecting): router 1.4041e-1 stream 1.5406e-1; 3.attn_q.weight Q8_0 q 1.818e-2 x1.0625; 3.attn_k.weight Q8_0 q 1.818e-2 x1.0000; 3.attn_v.weight Q8_0 q 1.818e-2 x1.0000; 3.attn_output.weight Q8_0 q 1.818e-2 x1.0000; 3.ffn_gate_inp.weight F32 q 0.000e0 x1.0000; 3.ffn_gate_inp_shexp.weight F32 q 0.000e0 x0.0625; 3.ffn_gate_shexp.weight Q8_0 q 1.818e-2 x1.6400; 3.ffn_up_shexp.weight Q8_0 q 1.818e-2 x1.0000; 3.ffn_down_shexp.weight Q8_0 q 1.818e-2 x1.0000; 3.ffn_gate_exps.weight Q4_K q 2.875e-2 x1.6400; 3.ffn_up_exps.weight Q4_K q 2.875e-2 x1.0000; 3.ffn_down_exps.weight Q8_0 q 1.818e-2 x1.0000
+ik_bands Gemm head 1.5522e-1 = 1.04 · √(2.1945e-2 the layers + 3.3067e-4 output.weight Q8_0 q 1.818e-2 x1.0000)
+(g) free: the last argmax against ik's fixture set, as a tie band: ours 34727, ik's 34727; ik's logit at ours 0.000e0 below its top (tie cap 4.089e-1 at head band 1.552e-1) PASS
+gemm taps: taps armed at 128 rows, a walk of 5, a read of 100 positions -> qwen4exp ubatch walk: route taps of positions 0..100: the last ubatch walk ran 0..5 and                      the taps hold that walk's alone (want an error naming "the last ubatch walk ran 0..5") PASS
+gemm free: route taps of 5 tokens, those not the top 10 of their own logits: 0 [] PASS
+gemm flip layer=3 token=0: ik margin 7.381e-4; 216<-330 gap 7.381e-4 err 8.488e-3 (cap 0.15): allowed (counted); first on its path: widest gap 7.381e-4 (margin bound 1.465e-1) within
+gemm flip layer=2 token=1: ik margin 2.384e-3; 396<-398 gap 2.384e-3 err 1.962e-2 (cap 0.12): allowed (counted); first on its path: widest gap 2.384e-3 (margin bound 1.183e-1) within
+gemm flip layer=3 token=1: ik margin 5.423e-3; 174<-271 gap 1.015e-2 err 3.660e-2 (cap 0.14): allowed (counted); past an earlier flip on its path (margin rule not applied)
+gemm flip layer=2 token=2: ik margin 5.846e-3; 436<-41 gap 7.010e-3 err 1.811e-2, 436<-36 gap 5.846e-3 err 1.648e-2, 318<-41 gap 9.151e-3 err 1.967e-2, 318<-36 gap 7.986e-3 err 1.804e-2 (cap 0.12): allowed (counted); first on its path: widest gap 9.151e-3 (margin bound 1.170e-1) within
+gemm free: 4 flip(s) against the pass's routing, 4 allowed by the pair rule; 3 first on their path, 0 of them at a wide margin; the smallest pass margin that flipped 7.381e-4 PASS
+gemm free: last logits' distance from the pass's 1.958e-2, stores' at layers [0, 3] ["3.744e-3", "2.618e-2"], PLE ring 1.227e-3 (printed: the flips move them; the forced arm holds the bands)
+gemm split: the walk's Some((5, 0)), after reset and a pass None (want Some, then None) PASS
+gemm taps first: taps armed at 3 rows, a ubatch of 5 -> qwen4exp Body38: a ubatch of 5 rows past the 3 armed route tap rows (set_ubatch_route_taps); position 0, not poisoned (kept: true); the same call with the taps off: token 34727, the free walk's last token, logits and every store bit for bit: true PASS
+gemm auto call: 5 positions by `auto` -> token 34727; the pass's last token, logits and every store bit for bit: true PASS
+gemm forced: the planted routes' ids taken at 20 of 20 (layer, position) cells, others [] PASS
+deferred(real) oracle: (g) forced: the last argmax against ik's
+fixture-oracle: (g) forced: the last argmax against ik's fixture set, as a tie band
+(g) forced: the last argmax against ik's fixture set, as a tie band: ours 34727, ik's 34727; ik's logit at ours 0.000e0 below its top (tie cap 4.089e-1 at head band 1.552e-1) PASS
+gemm forced: last argmax ours=34727 (returned 34727) ik=not compared in this tier; last logits' distance from the pass's 1.938e-2 (band 5.143e-2) PASS
+gemm forced: layer 0 store distance 3.744e-3 (band 2.572e-2)
+gemm forced: layer 3 store distance 1.877e-2 (band 5.143e-2)
+gemm forced: every layer's store within its band, past it at []; PLE ring 1.227e-3 (band 4.454e-2) PASS
+gemm forced: layer 0 router logits' error over their spread, worst over positions 1.039e-2 (the input's band 2.572e-2); peak 4.249e-2 (the margin rule's three deviations 7.715e-2)
+gemm forced: layer 3 router logits' error over their spread, worst over positions 1.983e-2 (the input's band 5.143e-2); peak 6.873e-2 (the margin rule's three deviations 1.543e-1)
+gemm forced: router logits' error over [`gemm_band`], worst 0.482 at layer 2; peak error over three deviations, worst 0.552 (printed: [`margin_cap`]'s premise, 1 or under where it holds)
+fixture-oracle: (crx) ik-routed: ik's picks and final weights planted, each layer's router logits, the last layer's output, the logits and the argmax against ik's fixture set
+fx plant: weight round trip at most 6.56e-7 relative (5.5 f32 epsilons: the picks' ln to one ulp of the logit 2.38e-7, the launch's roundings 3.5 epsilons) [derived], 4.2e-6 of the head band 1.552e-1
+fx ik-routed: ik's picks taken at 20 of 20 (layer, position) cells, others [] PASS
+fx ik-routed: layer 0 router logits' distance from ik's, worst over positions 1.033e-2 (band 4.491e-2, 0.230 of it)
+fx ik-routed: layer 1 router logits' distance from ik's, worst over positions 1.538e-2 (band 8.655e-2, 0.178 of it)
+fx ik-routed: layer 2 router logits' distance from ik's, worst over positions 2.140e-2 (band 1.193e-1, 0.179 of it)
+fx ik-routed: layer 3 router logits' distance from ik's, worst over positions 2.115e-2 (band 1.404e-1, 0.151 of it)
+fx ik-routed: every layer's router logits within its band, past it at [] PASS
+fx ik-routed: layer 3 output's distance from ik's, worst over positions 2.045e-2 (band 1.541e-1, 0.133 of it) PASS
+fx ik-routed: last logits' distance from ik's 2.199e-2 (head band 1.552e-1, 0.142 of it); last argmax ours=34727 (returned 34727) ik=34727, ik's logit at ours 0.000e0 below its top (tie cap 4.089e-1) PASS
+deferred(real) oracle: (t) step set ref_qwen4exp_step4 fed by step: argmax, layer outputs and logits against ik's
+deferred(real) oracle: (t) step set ref_qwen4exp_step4_every_node fed by step: argmax, layer outputs and logits against ik's
+deferred(real) oracle: (t) step set ref_qwen4exp_d1k fed by step: argmax, layer outputs and logits against ik's
+step ref_qwen4exp_d1k: position 1024 after 1024 fed by step (3.3 s, runtime value); compared with ik's in the real tier only
+step sets: 0 named tie(s)
+pass ref_qwen4exp_d1k: 1024 ids by passes of up to 8 (1.3 s, runtime value), then the step: layer outputs bit for bit the step-fed run's: true
+paths ref_qwen4exp_d1k fed by passes vs fed by steps, the step after: tokens [11251] vs [11251]; every position's logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+(q2) MOVED(2026-10-08, gatecensus R8): D3K's step-fed walk (3,000 steps) is replaced by D1K's passes = steps and windows over the selector region's boundaries from a shared GEMM prefix; D3K's ik compare is the GEMM-fed one.
+(q2) window 0 [1680, 1696): 16 rows in 2 passes; covers dense, ple-ring, conv-ring
+(q2) window 1 [2048, 2075): 27 rows in 4 passes; covers onset, pool-mid, pool-last, ple-ring, conv-ring, short-pass
+(q2) window 2 [2178, 2194): 16 rows in 2 passes; covers pool-mid, tile, ple-ring, conv-ring
+(q2) window 3 [2976, 3000): 24 rows in 3 passes; covers pool-mid, pool-last, conv-ring, tail
+(q2) by step window 0 [1680, 1696): the gap of 1680 ids by ubatches 0.3 s, the window 0.1 s, the readback 0.00 s (runtime values)
+(q2) by step window 1 [2048, 2075): the gap of 352 ids by ubatches 0.1 s, the window 0.1 s, the readback 0.00 s (runtime values)
+(q2) by step window 2 [2178, 2194): the gap of 103 ids by ubatches 0.1 s, the window 0.1 s, the readback 0.00 s (runtime values)
+(q2) by step window 3 [2976, 3000): the gap of 782 ids by ubatches 0.2 s, the window 0.1 s, the readback 0.00 s (runtime values)
+(q2) by pass window 0 [1680, 1696): the gap of 1680 ids by ubatches 0.3 s, the window 0.0 s, the readback 0.01 s (runtime values)
+paths window 0 [1680, 1696) by passes vs by steps: tokens [119374] vs [119374]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+(q2) by pass window 1 [2048, 2075): the gap of 352 ids by ubatches 0.1 s, the window 0.0 s, the readback 0.00 s (runtime values)
+paths window 1 [2048, 2075) by passes vs by steps: tokens [143928] vs [143928]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+(q2) by pass window 2 [2178, 2194): the gap of 103 ids by ubatches 0.1 s, the window 0.0 s, the readback 0.00 s (runtime values)
+paths window 2 [2178, 2194) by passes vs by steps: tokens [130925] vs [130925]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+(q2) by pass window 3 [2976, 3000): the gap of 782 ids by ubatches 0.2 s, the window 0.0 s, the readback 0.00 s (runtime values)
+paths window 3 [2976, 3000) by passes vs by steps: tokens [27216] vs [27216]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+paths the step at 3000 after the windows, passes vs steps: tokens [102489] vs [102489]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+(q2) 4 windows and the step after, passes vs steps: first differing none PASS
+gemm ref_qwen4exp_d3k: 3000 ids in one ubatch (the load's size 3072; 0.5 s, runtime value); the selecting layers' rows by the prefill flash and by the selection Some((2051, 949)) (want (2051, 949), from KEPT and POOL) PASS
+deferred(real) oracle: (t) step set ref_qwen4exp_d3k fed by gemm: argmax, layer outputs and logits against ik's
+ref_qwen4exp_d3k: ik cuts its selection by cells and keeps up to three keys of the 513th pool ours does not read (a named difference, its logits printed)
+paths D3K by ubatches cut at 2601 vs one ubatch: tokens [27216] vs [27216]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+paths D3K by one ubatch, timing armed vs unarmed: tokens [27216] vs [27216]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+gemm ref_qwen4exp_d3k: the timed walk's record: 1 ubatch(es) (want 1), 4 layer rows (want 4), 4 with every card span read (want 4) PASS
+gemm ref_qwen4exp_d3k: the timed walk's routing counts: 0 layer row(s) off of 4 (Σ slots 120000, want rows·P·N_USED 120000; m_max 565) PASS
+map refusal, step: a slot map with expert 3 of layer 3 on the tier card at position 2 -> error "qwen4exp card leg: the step walk has no tier leg: layer 3 holds 1 routed experts on the tier card"; position 2 (kept, not poisoned: true); the same call with the plant taken back: accepted (47835) PASS
+map refusal, pass: a slot map with expert 3 of layer 3 on the tier card at position 2 -> error "qwen4exp card leg: the pass walk has no tier leg: layer 3 holds 1 routed experts on the tier card"; position 2 (kept, not poisoned: true); the same call with the plant taken back: accepted (34727) PASS
+map refusal, ubatch: a slot map with expert 3 of layer 3 on the tier card at position 2 -> error "qwen4exp card leg: the ubatch walk has no tier leg: layer 3 holds 1 routed experts on the tier card"; position 2 (kept, not poisoned: true); the same call with the plant taken back: accepted (34727) PASS
+map refusal, verify: a slot map with expert 3 of layer 3 on the tier card at position 2 -> error "qwen4exp card leg: the verify walk has no tier leg: layer 3 holds 1 routed experts on the tier card"; position 2 (kept, not poisoned: true); the same call with the plant taken back: accepted (32521) PASS
+gemm auto: 8 positions -> pass, 9 -> gemm PASS
+step sets and the ubatch's D3K step: 0 named tie(s)
+fixture-oracle: (tfx) step set fx_ref_qwen4exp_step4 fed by steps: layer outputs below the first flip, logits and argmax against ik's fixture set
+ik_bands Gemv: band = 1.04 · √(Σ mult · q²), q = site_rel(ty, arm).joint() at the worst crest (ik's activation form and ours, independent); the head adds `output`
+ik_bands Gemv layer 0 (delta): router 3.1758e-2 stream 6.6164e-2; 0.attn_qkv.weight Q8_0 q 1.286e-2 x3.0000; 0.attn_gate.weight Q8_0 q 1.286e-2 x1.6400; 0.ssm_beta.weight F32 q 0.000e0 x0.0625; 0.ssm_alpha.weight F32 q 0.000e0 x0.0625; 0.ssm_out.weight Q8_0 q 1.286e-2 x1.0000; 0.ffn_gate_inp.weight F32 q 0.000e0 x1.0000; 0.ffn_gate_inp_shexp.weight F32 q 0.000e0 x0.0625; 0.ffn_gate_shexp.weight Q8_0 q 1.286e-2 x1.6400; 0.ffn_up_shexp.weight Q8_0 q 1.286e-2 x1.0000; 0.ffn_down_shexp.weight Q8_0 q 1.286e-2 x1.0000; 0.ffn_gate_exps.weight Q5_K q 2.875e-2 x1.6400; 0.ffn_up_exps.weight Q5_K q 2.875e-2 x1.0000; 0.ffn_down_exps.weight Q8_0 q 1.818e-2 x1.0000
+ik_bands Gemv layer 1 (selecting): router 7.1443e-2 stream 9.2050e-2; 1.attn_q.weight Q8_0 q 1.286e-2 x1.0625; 1.attn_k.weight Q8_0 q 1.286e-2 x1.0000; 1.attn_v.weight Q8_0 q 1.286e-2 x1.0000; 1.attn_output.weight Q8_0 q 1.286e-2 x1.0000; 1.ffn_gate_inp.weight F32 q 0.000e0 x1.0000; 1.ffn_gate_inp_shexp.weight F32 q 0.000e0 x0.0625; 1.ffn_gate_shexp.weight Q8_0 q 1.286e-2 x1.6400; 1.ffn_up_shexp.weight Q8_0 q 1.286e-2 x1.0000; 1.ffn_down_shexp.weight Q8_0 q 1.286e-2 x1.0000; 1.ffn_gate_exps.weight Q4_K q 2.875e-2 x1.6400; 1.ffn_up_exps.weight Q4_K q 2.875e-2 x1.0000; 1.ffn_down_exps.weight Q5_1 q 1.818e-2 x1.0000
+ik_bands Gemv layer 2 (delta): router 9.9194e-2 stream 1.1493e-1; 2.ple_key.weight Q8_0 q 1.286e-2 x1.0000; 2.ple_value.weight Q8_0 q 1.286e-2 x1.0000; 2.attn_qkv.weight Q8_0 q 1.286e-2 x3.0000; 2.attn_gate.weight Q8_0 q 1.286e-2 x1.6400; 2.ssm_beta.weight F32 q 0.000e0 x0.0625; 2.ssm_alpha.weight F32 q 0.000e0 x0.0625; 2.ssm_out.weight Q8_0 q 1.286e-2 x1.0000; 2.ffn_gate_inp.weight F32 q 0.000e0 x1.0000; 2.ffn_gate_inp_shexp.weight F32 q 0.000e0 x0.0625; 2.ffn_gate_shexp.weight Q8_0 q 1.286e-2 x1.6400; 2.ffn_up_shexp.weight Q8_0 q 1.286e-2 x1.0000; 2.ffn_down_shexp.weight Q8_0 q 1.286e-2 x1.0000; 2.ffn_gate_exps.weight Q4_K q 2.875e-2 x1.6400; 2.ffn_up_exps.weight Q4_K q 2.875e-2 x1.0000; 2.ffn_down_exps.weight Q5_1 q 1.818e-2 x1.0000
+ik_bands Gemv layer 3 (selecting): router 1.1805e-1 stream 1.3154e-1; 3.attn_q.weight Q8_0 q 1.286e-2 x1.0625; 3.attn_k.weight Q8_0 q 1.286e-2 x1.0000; 3.attn_v.weight Q8_0 q 1.286e-2 x1.0000; 3.attn_output.weight Q8_0 q 1.286e-2 x1.0000; 3.ffn_gate_inp.weight F32 q 0.000e0 x1.0000; 3.ffn_gate_inp_shexp.weight F32 q 0.000e0 x0.0625; 3.ffn_gate_shexp.weight Q8_0 q 1.286e-2 x1.6400; 3.ffn_up_shexp.weight Q8_0 q 1.286e-2 x1.0000; 3.ffn_down_shexp.weight Q8_0 q 1.286e-2 x1.0000; 3.ffn_gate_exps.weight Q4_K q 2.875e-2 x1.6400; 3.ffn_up_exps.weight Q4_K q 2.875e-2 x1.0000; 3.ffn_down_exps.weight Q8_0 q 1.818e-2 x1.0000
+ik_bands Gemv head 1.3222e-1 = 1.04 · √(1.5999e-2 the layers + 1.6533e-4 output.weight Q8_0 q 1.286e-2 x1.0000)
+step fx_ref_qwen4exp_step4 flip layer=3 token=0: ik margin 7.815e-3; 365<-168 gap 8.359e-3 err 1.583e-2 (cap 2.994e-1): on a path no band covers, not held
+step fx_ref_qwen4exp_step4 layer=0 l_out_rel=1.025e-2 (band 6.616e-2, 0.155 of it, held)
+step fx_ref_qwen4exp_step4 layer=1 l_out_rel=1.272e-2 (band 9.205e-2, 0.138 of it, held)
+step fx_ref_qwen4exp_step4 layer=2 l_out_rel=2.078e-2 (band 1.149e-1, 0.181 of it, held)
+step fx_ref_qwen4exp_step4 layer=3 l_out_rel=3.130e-2 (band 1.315e-1, 0.238 of it, on a flip's path: printed)
+step fx_ref_qwen4exp_step4: position 4 after 4 fed by steps (0.0 s, runtime value); 1 flips at the step, first on its path at layer 3 (the prefill's 4), layers 0..3 held, past the band at []; argmax ours=34727 ik=34727, ik's logit at ours 0.000e0 below its top (tie cap 3.483e-1 at head band 1.322e-1); logits_rel 3.590e-2 (printed: a flip lies on the path) PASS
+fixture-oracle: (tfx) step set fx_ref_qwen4exp_step4_every_node fed by steps: layer outputs below the first flip, logits and argmax against ik's fixture set
+step fx_ref_qwen4exp_step4_every_node flip layer=3 token=0: ik margin 7.815e-3; 365<-168 gap 8.359e-3 err 1.583e-2 (cap 2.994e-1): on a path no band covers, not held
+step fx_ref_qwen4exp_step4_every_node layer=0 l_out_rel=1.025e-2 (band 6.616e-2, 0.155 of it, held)
+step fx_ref_qwen4exp_step4_every_node layer=1 l_out_rel=1.272e-2 (band 9.205e-2, 0.138 of it, held)
+step fx_ref_qwen4exp_step4_every_node layer=2 l_out_rel=2.078e-2 (band 1.149e-1, 0.181 of it, held)
+step fx_ref_qwen4exp_step4_every_node layer=3 l_out_rel=3.130e-2 (band 1.315e-1, 0.238 of it, on a flip's path: printed)
+step fx_ref_qwen4exp_step4_every_node: position 4 after 4 fed by steps (0.0 s, runtime value); 1 flips at the step, first on its path at layer 3 (the prefill's 4), layers 0..3 held, past the band at []; argmax ours=34727 ik=34727, ik's logit at ours 0.000e0 below its top (tie cap 3.483e-1 at head band 1.322e-1); logits_rel 3.590e-2 (printed: a flip lies on the path) PASS
+fixture-oracle: (tfx) step set fx_ref_qwen4exp_d1k fed by ubatches with ik's prefill routes planted: layer outputs below the first flip, logits and argmax against ik's fixture set
+fx plant: weight round trip at most 6.56e-7 relative (5.5 f32 epsilons: the picks' ln to one ulp of the logit 2.38e-7, the launch's roundings 3.5 epsilons) [derived], 4.2e-6 of the head band 1.552e-1
+step fx_ref_qwen4exp_d1k layer=0 l_out_rel=9.424e-3 (band 7.770e-2, 0.121 of it, held)
+step fx_ref_qwen4exp_d1k layer=1 l_out_rel=9.887e-3 (band 1.073e-1, 0.092 of it, held)
+step fx_ref_qwen4exp_d1k layer=2 l_out_rel=1.109e-2 (band 1.351e-1, 0.082 of it, held)
+step fx_ref_qwen4exp_d1k layer=3 l_out_rel=1.129e-2 (band 1.541e-1, 0.073 of it, held)
+step fx_ref_qwen4exp_d1k: position 1024 after 1024 fed by ubatches with ik's prefill routes planted (0.2 s, runtime value); 0 flips at the step, first on its path at layer 4 (the prefill's 4), layers 0..4 held, past the band at []; argmax ours=11251 ik=11251, ik's logit at ours 0.000e0 below its top (tie cap 3.616e-1 at head band 1.552e-1); logits_rel 1.538e-2 (held) PASS
+fixture-oracle: (tfx) step set fx_ref_qwen4exp_d3k fed by steps: layer outputs below the first flip, logits and argmax against ik's fixture set
+step fx_ref_qwen4exp_d3k flip layer=0 token=0: ik margin 3.351e-3; 272<-90 gap 3.351e-3 err 8.462e-3 (cap 9.434e-2): on a path no band covers, not held
+step fx_ref_qwen4exp_d3k flip layer=1 token=0: ik margin 7.505e-3; 163<-297 gap 7.505e-3 err 2.338e-2 (cap 2.200e-1): on a path no band covers, not held
+step fx_ref_qwen4exp_d3k flip layer=2 token=0: ik margin 1.031e-2; 232<-246 gap 4.105e-2 err 4.214e-2 (cap 2.374e-1): on a path no band covers, not held
+step fx_ref_qwen4exp_d3k layer=0 l_out_rel=5.076e-2 (band 6.616e-2, 0.767 of it, on a flip's path: printed)
+step fx_ref_qwen4exp_d3k layer=1 l_out_rel=6.910e-2 (band 9.205e-2, 0.751 of it, on a flip's path: printed)
+step fx_ref_qwen4exp_d3k layer=2 l_out_rel=4.138e-2 (band 1.149e-1, 0.360 of it, on a flip's path: printed)
+step fx_ref_qwen4exp_d3k layer=3 l_out_rel=4.223e-2 (band 1.315e-1, 0.321 of it, on a flip's path: printed)
+tfx fx_ref_qwen4exp_d3k: unexercised past the first flip's layer (held 0 of 4 layers)
+step fx_ref_qwen4exp_d3k: position 3000 after 3000 fed by steps (10.5 s, runtime value); 3 flips at the step, first on its path at layer 0 (the prefill's 1), layers 0..0 held, past the band at []; argmax ours=102489 ik=102489, ik's logit at ours 0.000e0 below its top (tie cap 3.089e-1 at head band 1.322e-1); logits_rel 5.421e-2 (printed: a flip lies on the path) unexercised
+fixture-oracle: (tfx) step set fx_ref_qwen4exp_d3k fed by ubatches with ik's prefill routes planted: layer outputs below the first flip, logits and argmax against ik's fixture set
+fx plant: weight round trip at most 6.56e-7 relative (5.5 f32 epsilons: the picks' ln to one ulp of the logit 2.38e-7, the launch's roundings 3.5 epsilons) [derived], 4.2e-6 of the head band 1.552e-1
+step fx_ref_qwen4exp_d3k flip layer=2 token=0: ik margin 1.031e-2; 481<-427 gap 1.031e-2 err 1.226e-2 (cap 0.29): allowed (counted); first on its path: widest gap 1.031e-2 (margin bound 2.855e-1) within
+step fx_ref_qwen4exp_d3k layer=0 l_out_rel=1.090e-2 (band 7.770e-2, 0.140 of it, held)
+step fx_ref_qwen4exp_d3k layer=1 l_out_rel=1.164e-2 (band 1.073e-1, 0.108 of it, held)
+step fx_ref_qwen4exp_d3k layer=2 l_out_rel=1.689e-2 (band 1.351e-1, 0.125 of it, on a flip's path: printed)
+step fx_ref_qwen4exp_d3k layer=3 l_out_rel=1.732e-2 (band 1.541e-1, 0.112 of it, on a flip's path: printed)
+step fx_ref_qwen4exp_d3k: position 3000 after 3000 fed by ubatches with ik's prefill routes planted (0.7 s, runtime value); 1 flips at the step, first on its path at layer 2 (the prefill's 4), layers 0..2 held, past the band at []; argmax ours=102489 ik=102489, ik's logit at ours 0.000e0 below its top (tie cap 3.626e-1 at head band 1.552e-1); logits_rel 2.296e-2 (printed: a flip lies on the path) PASS
+verify structure T=2: graph_nodes=119 (want 119; the program counts 119) batch_mem_op=8 (want 8) other=0; argmax launches 1 (want 1: one head of 2 rows); ds41_ffn_handoff_10_cols 4 (want 4), ds41_ffn_handoff_10 0 (want 0) PASS
+verify structure T=3: graph_nodes=119 (want 119; the program counts 119) batch_mem_op=8 (want 8) other=0; argmax launches 1 (want 1: one head of 3 rows); ds41_ffn_handoff_10_cols 4 (want 4), ds41_ffn_handoff_10 0 (want 0) PASS
+verify structure T=4: graph_nodes=119 (want 119; the program counts 119) batch_mem_op=8 (want 8) other=0; argmax launches 1 (want 1: one head of 4 rows); ds41_ffn_handoff_10_cols 4 (want 4), ds41_ffn_handoff_10 0 (want 0) PASS
+verify T=2 k=1: rows [47835, 32521] vs steps [47835] (1 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 0 (want 0, computed here); the step after: 117264 vs 117264, logits bit for bit true PASS
+verify T=2 k=1: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify T=2 k=2: rows [47835, 32521] vs steps [47835, 32521] (2 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 1 (want 1, computed here); the step after: 118448 vs 118448, logits bit for bit true PASS
+verify T=2 k=2: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify T=3 k=1: rows [47835, 32521, 34727] vs steps [47835] (1 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 0 (want 0, computed here); the step after: 117264 vs 117264, logits bit for bit true PASS
+verify T=3 k=1: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify T=3 k=2: rows [47835, 32521, 34727] vs steps [47835, 32521] (2 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 1 (want 1, computed here); the step after: 118448 vs 118448, logits bit for bit true PASS
+verify T=3 k=2: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify T=3 k=3: rows [47835, 32521, 34727] vs steps [47835, 32521, 34727] (3 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 2 (want 2, computed here); the step after: 1949 vs 1949, logits bit for bit true PASS
+verify T=3 k=3: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify T=4 k=1: rows [47835, 32521, 34727, 48499] vs steps [47835] (1 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 0 (want 0, computed here); the step after: 117264 vs 117264, logits bit for bit true PASS
+verify T=4 k=1: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify T=4 k=2: rows [47835, 32521, 34727, 48499] vs steps [47835, 32521] (2 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 1 (want 1, computed here); the step after: 118448 vs 118448, logits bit for bit true PASS
+verify T=4 k=2: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify T=4 k=3: rows [47835, 32521, 34727, 48499] vs steps [47835, 32521, 34727] (3 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 2 (want 2, computed here); the step after: 1949 vs 1949, logits bit for bit true PASS
+verify T=4 k=3: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify T=4 k=4: rows [47835, 32521, 34727, 48499] vs steps [47835, 32521, 34727, 48499] (4 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 3 (want 3, computed here); the step after: 59209 vs 59209, logits bit for bit true PASS
+verify T=4 k=4: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify after a commit of 3, T=4 k=4 from lane 2: rows [40777, 189928, 192379, 28664] vs steps [40777, 189928, 192379, 28664] (4 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 1 (want 1, computed here); the step after: 219589 vs 219589, logits bit for bit true PASS
+verify eager T=4 k=4 vs its replay: rows [47835, 32521, 34727, 48499] vs steps [47835, 32521, 34727, 48499] (4 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 3 (want 3, computed here); the step after: 59209 vs 59209, logits bit for bit true PASS
+verify deep at 2052, T=4 k=2, pool 513's row rejected, the pools past the count poisoned: rows [225123, 130348, 46229, 55936] vs steps [225123, 130348] (2 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 1 (want 1, computed here); the step after: 46229 vs 46229, logits bit for bit true PASS
+verify deep: the step after that (count 2056, completing pool 513 again before its select): 55936 vs 55936, logits bit for bit true PASS
+verify refusal: a step while the verify waits -> qwen4exp Body38: 1 positions from 4 while the verify of 2 rows at 2 waits for its commit (GpuModel::rollback to the first position not kept) PASS
+verify refusal: a commit back to 2 with no verify waiting -> qwen4exp cut: back to position 2 from 4 with no verify waiting: no checkpoint stands there (no-checkpoint: the recurrent state stands at 4 and no checkpoint lies at or below 2) PASS
+verify refusal: the lane word planted on lane 2, never written -> Head::tokens: device fault at layer 0 site delta_stamp (a delta-step lane whose stamp is not the position of the call's first row: a lane never written, or one a commit did not leave there); sites raised in layer 0 (Qwen35moe step order): delta_stamp (want layer 0 site delta_stamp; sites raised in layer 0 (architecture unknown, so in code order, not step order): delta_stamp) PASS
+position owner, a graph step: a failure before the launch at 2: error "qwen4exp Body38: the planted failure before the launch" at position 2 (want 2), lane 0 (want 0); the call again: accepted (47835) token 47835 (clean 47835), logits bit for bit: true, PLE rows equal: true, stores differing at layers [], PLE ring equal: true PASS
+position owner, a graph step: a failure after the launch at 2: error "qwen4exp Body38: the planted failure after the launch" at position 2 (want 2); a cut keeps 0 (no-checkpoint: the recurrent state stands at 3 and no checkpoint lies at or below 2, want under 2); a step at 2: error "qwen4exp Body38: position 2: the call there failed after its chain was launched, so the recurrent stores hold it already (they stand at 3); reset — a delta layer keeps no earlier state to cut back to" (want refused by name), position 2; after reset the call again: token 47835 (clean 47835), logits bit for bit: true, PLE rows equal: true, stores differing at layers [], PLE ring equal: true PASS
+position owner, an eager pass of 3 rows: a failure before the launch at 2: error "qwen4exp Body38: the planted failure before the launch" at position 2 (want 2), lane 0 (want 0); the call again: accepted (34727) token 34727 (clean 34727), logits bit for bit: true, PLE rows equal: true, stores differing at layers [], PLE ring equal: true PASS
+position owner, an eager pass of 3 rows: a failure after the launch at 2: error "qwen4exp Body38: the planted failure after the launch" at position 2 (want 2); a cut keeps 0 (no-checkpoint: the recurrent state stands at 5 and no checkpoint lies at or below 2, want under 2); a step at 2: error "qwen4exp Body38: position 2: the call there failed after its chain was launched, so the recurrent stores hold it already (they stand at 5); reset — a delta layer keeps no earlier state to cut back to" (want refused by name), position 2; after reset the call again: token 34727 (clean 34727), logits bit for bit: true, PLE rows equal: true, stores differing at layers [], PLE ring equal: true PASS
+position owner, a graph verify of 2 rows: a failure before the launch at 2: error "qwen4exp Body38: the planted failure before the launch" at position 2 (want 2), lane 0 (want 0); the call again: accepted (32521) token 32521 (clean 32521), logits bit for bit: true, PLE rows equal: true, stores differing at layers [], PLE ring equal: true PASS
+position owner, a graph verify of 2 rows: a failure after the launch at 2: error "qwen4exp Body38: the planted failure after the launch" at position 2 (want 2); a cut keeps 0 (no-checkpoint: the recurrent state stands at 4 and no checkpoint lies at or below 2, want under 2); a step at 2: error "qwen4exp Body38: position 2: the call there failed after its chain was launched, so the recurrent stores hold it already (they stand at 4); reset — a delta layer keeps no earlier state to cut back to" (want refused by name), position 2; after reset the call again: token 32521 (clean 32521), logits bit for bit: true, PLE rows equal: true, stores differing at layers [], PLE ring equal: true PASS
+refusal: --prefill step -> accepted as step PASS
+refusal: --prefill pass -> accepted as pass PASS
+refusal: --prefill gemm -> accepted as gemm PASS
+refusal: --prefill auto -> accepted as auto PASS
+refusal: --prefill wide -> qwen4exp Body38: prompt path "wide": `step`, `pass`, `gemm` or `auto` PASS
+refusal: the image placeholder 248056 by step at position 1 -> qwen4exp prompt: token 0: token 248056 is the image placeholder; the n-gram hash runs on text only, and an image position has no token id to hash; position 1 (kept: true) PASS
+refusal: the image placeholder 248056 by pass at position 1 -> qwen4exp prompt: token 1: token 248056 is the image placeholder; the n-gram hash runs on text only, and an image position has no token id to hash; position 1 (kept: true) PASS
+refusal: the image placeholder 248056 by gemm at position 1 -> qwen4exp prompt: token 1: token 248056 is the image placeholder; the n-gram hash runs on text only, and an image position has no token id to hash; position 1 (kept: true) PASS
+refusal: 3072 ids by step from position 1 past 3072 -> qwen4exp prompt: a prompt of 3072 ids from position 1 passes the stores' 3072 positions; position 1 (kept: true) PASS
+refusal: 3072 ids by pass from position 1 past 3072 -> qwen4exp prompt: a prompt of 3072 ids from position 1 passes the stores' 3072 positions; position 1 (kept: true) PASS
+refusal: 3072 ids by gemm from position 1 past 3072 -> qwen4exp prompt: a prompt of 3072 ids from position 1 passes the stores' 3072 positions; position 1 (kept: true) PASS
+plan card=A6000 experts=Host slots=1 ctx_max=3072 ubatch=1024 host_experts=2048 card_experts=0 card_layers=0 ple=host room=262874767360 read=MemAvailable row_reserve=0 card_budget=Some(9489612800)
+load resident_bytes=2488101604 ctx=3072 layers=4 in 2.3 s (runtime value)
+plan card=A6000 experts=Host slots=1 ctx_max=3072 ubatch=1024 host_experts=2048 card_experts=0 card_layers=0 ple=nvme room=7142898849 read=given row_reserve=536870912 card_budget=Some(9489612800)
+load resident_bytes=2488101604 ctx=3072 layers=4 in 2.2 s (runtime value)
+ple tiers: the reading's room puts the table on the host tier, a room of the host arm's need 7142898850 B less one byte on the nvme tier PASS
+ple step thread faults across the batch set's graph steps: host arm 0 major 0 minor, NVMe arm 0 major 232 minor (runtime values)
+paths ple nvme vs host: five graph steps: tokens [157377, 137169, 47835, 32521, 34727] vs [157377, 137169, 47835, 32521, 34727]; every position's logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+paths ple nvme vs host: one eager pass: tokens [34727] vs [34727]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+paths ple nvme vs host: D3K by one call of three ubatches, and its step: tokens [27216, 139163] vs [27216, 139163]; every position's logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+slots plan: the plan of 2 grows the card's kv class by 41680932 (one sequence's stores, ring, lane word and arena rows: 41680932), and at 1 slot is the plan the load always makes PASS
+plan card=A6000 experts=Host slots=2 ctx_max=3072 ubatch=3072 host_experts=2048 card_experts=0 card_layers=0 ple=host room=262436196352 read=MemAvailable row_reserve=0 card_budget=Some(9489612800)
+load resident_bytes=3861060900 ctx=3072 layers=4 in 2.5 s (runtime value)
+check slots H3 bytes: 1 added sequence(s) grew resident_bytes by 41680932, seq_bytes 41680932 a slot; the derived 41680932 (store_bytes 41312288 + the lane word 4 + the arena rows 368640); the plan's sequence descriptor not built by this load, its equality skipped PASS
+check slots H6 refusals: select 2 of 2 slots named true, add_slots(1) named true, add_slots(0) named true; the selection and the count kept true PASS
+check slots H1 interleave: 8 interleaved steps a slot against each stream's solo run: every slot's ids, last logits, state hash and position bit for bit PASS
+check slots H7 captures: before its first step every added slot held none true and slot 0 its solo runs' true; every slot held its own after the interleave true; none after a set_mode round trip true PASS
+check slots H2 one pass: 4 passes of one row a slot (2 captured, the rest eager) against each stream's solo run: every slot's ids, last logits, state hash and position bit for bit; the pass of one row a slot holds 142 nodes and the pass of 2 rows on slot 0 119, 23 added for 1 added slot(s), derived 23 a slot (the embedding 1 + the PLE conv 1 + 2 delta layers' 2 + 2 selecting layers' 8 + the parked rows' copy 1), the body's own counts 142 and 119 PASS
+slots past the plan: add_slots(3) on a plan of 2 named the plan and the ask true PASS
+slots pending: a select with slot 1's verify waiting named it true, the position and lane kept true PASS
+slots rollback isolation: slot 1's verify committed 2 of its 4 rows; slot 0's next 4 ids equal its solo run's continuation PASS
+check slots H4 reset: slot 1 rewound and prompted again: its first 5 ids are its solo run's; every other slot's next 4 ids its solo run's continuation PASS
+check slots H5 poison: (a) a two-slot round refused by the host: the call's error named it true, every call and the tier refusing through the other slot's reset true, both slots their solo paths from their prompts again true; (b) the same with a card fault: the call's error named it true, every call and the tier refusing through the other slot's reset true, both slots their solo paths from their prompts again true; (c) a prompt call on slot 0 refused by the host: the call's error named it true, every call and the tier refusing through the other slot's reset true, both slots their solo paths from their prompts again true PASS
+plan card=A6000 experts=Host slots=1 ctx_max=3072 ubatch=3072 host_experts=2048 card_experts=0 card_layers=0 ple=host room=262300729344 read=MemAvailable row_reserve=0 card_budget=Some(9489612800)
+load resident_bytes=3861019620 ctx=3072 layers=4 in 2.6 s (runtime value)
+check slots H5 one-slot: a one-slot step's host refusal true; the next step before the reset refused by name true ("qwen4exp Body38: position 4: the call there failed after its chain was launched, so the recurrent stores hold it already (they stand at 5); reset — a delta layer keeps no earlier state to cut back to"); the load's reset lifted it, the next step served true and the prompt after it the first's bit for bit true; a prompt call's host refusal true, the step after it refused by name true ("qwen4exp Body38: position 0: the call there failed after its chain was launched, so the recurrent stores hold it already (they stand at 4); reset — a delta layer keeps no earlier state to cut back to"), the reset lifting it, the prompt the first's bit for bit true PASS
+plan card=A6000 experts=Card slots=1 ctx_max=3072 ubatch=3072 host_experts=1024 card_experts=1024 card_layers=4 ple=host room=262396293120 read=MemAvailable row_reserve=0 card_budget=Some(9489612800)
+load resident_bytes=7755694956 ctx=3072 layers=4 in 3.0 s (runtime value)
+card leg structure: card layers 4 (want 4, the plan's); decode graph_nodes=133 (want 133; the program counts 133, 8 of them batch_mem_op) kernel=125 batch_mem_op=8 (want 8) other=0 PASS
+card leg plan: 4 of 4 layers hold routed experts on the card, a layer's count Some(256)..Some(256) (want 256 on every layer: half the experts, the header's budget) PASS
+derived CARD_LAYERS = 4 (the real file's 48)
+derived NODES_DECODE_CARD = 133 (the real file's 1391)
+derived NODES_VERIFY_CARD = 139 (the real file's 1475)
+card leg places rule: two columns at a pitch of 11, column 1's slot 3 id 600: places the map's, the bad id's HOST, the guard untouched: true (got [77, 4294967295, 295, 254, 4294967295, 172, 131, 4294967295, 49, 8, 4294967295, 226, 185, 4294967295, 119, 4294967295, 37, 296, 4294967295, 214, 3735928559]); the fault word Some(Fault { layer: 9, code: 7, sites: 128, arch: None }) (want expert_id alone at layer 9) PASS
+card leg vs host: layer 0's routes bit for bit the host plan's at every position: true PASS
+card leg vs host: 0 flip(s) of the card plan's routing against the host plan's, 0 allowed by the pair rule; 0 first on their path, 0 of them at a wide margin PASS
+card leg vs host: 20 layer outputs off every flip's path, their worst distance 0.078 of the band (card_band(l)); past it [] PASS
+card leg vs host position 0: argmax card=157377 host=157377 (the host's runner-up 202965, margin 0.0574, the runs' distance at the two 0.0016), logits_rel 4.007e-3 (band 6.804e-2) PASS
+card leg vs host position 1: argmax card=137169 host=137169 (the host's runner-up 230946, margin 0.0859, the runs' distance at the two 0.0002), logits_rel 3.565e-3 (band 6.804e-2) PASS
+card leg vs host position 2: argmax card=47835 host=47835 (the host's runner-up 81973, margin 0.1285, the runs' distance at the two 0.0016), logits_rel 3.078e-3 (band 6.804e-2) PASS
+card leg vs host position 3: argmax card=32521 host=32521 (the host's runner-up 154994, margin 0.0102, the runs' distance at the two 0.0012), logits_rel 2.830e-3 (band 6.804e-2) PASS
+card leg vs host position 4: argmax card=34727 host=34727 (the host's runner-up 118448, margin 0.1314, the runs' distance at the two 0.0017), logits_rel 2.673e-3 (band 6.804e-2) PASS
+card leg vs host: 0 named tie(s)
+paths card plan: five eager steps vs five graph replays: tokens [157377, 137169, 47835, 32521, 34727] vs [157377, 137169, 47835, 32521, 34727]; every position's logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+paths card plan: one pass of five rows vs five graph steps: tokens [34727] vs [157377, 137169, 47835, 32521, 34727]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+verify structure T=2: graph_nodes=139 (want 139; the program counts 139) batch_mem_op=8 (want 8) other=0; argmax launches 1 (want 1: one head of 2 rows); ds41_ffn_handoff_10_cols 4 (want 4), ds41_ffn_handoff_10 0 (want 0) PASS
+verify structure T=3: graph_nodes=139 (want 139; the program counts 139) batch_mem_op=8 (want 8) other=0; argmax launches 1 (want 1: one head of 3 rows); ds41_ffn_handoff_10_cols 4 (want 4), ds41_ffn_handoff_10 0 (want 0) PASS
+verify structure T=4: graph_nodes=139 (want 139; the program counts 139) batch_mem_op=8 (want 8) other=0; argmax launches 1 (want 1: one head of 4 rows); ds41_ffn_handoff_10_cols 4 (want 4), ds41_ffn_handoff_10 0 (want 0) PASS
+verify T=2 k=2: rows [47835, 32521] vs steps [47835, 32521] (2 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 1 (want 1, computed here); the step after: 118448 vs 118448, logits bit for bit true PASS
+verify T=2 k=2: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify T=3 k=3: rows [47835, 32521, 34727] vs steps [47835, 32521, 34727] (3 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 2 (want 2, computed here); the step after: 1949 vs 1949, logits bit for bit true PASS
+verify T=3 k=3: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+verify T=4 k=4: rows [47835, 32521, 34727, 48499] vs steps [47835, 32521, 34727, 48499] (4 compared), logits bit for bit: true; live stores differing at layers [], PLE ring: false; lane 3 (want 3, computed here); the step after: 59209 vs 59209, logits bit for bit true PASS
+verify T=4 k=4: every row's token and logits bit for bit the steps' true; the replay's services, host calls and Cols services [4, 4, 4] (want 4 each: one go, one union call and one wait a layer) PASS
+card leg gemm: the planted routes' ids taken at 20 of 20 (layer, position) cells PASS
+deferred(real) oracle: (k)(iii) card gemm: the last argmax against ik's
+fixture-oracle: (k)(iii) card gemm: the last argmax against ik's fixture set, as a tie band
+(k)(iii) card gemm: the last argmax against ik's fixture set, as a tie band: ours 34727, ik's 34727; ik's logit at ours 0.000e0 below its top (tie cap 4.089e-1 at head band 1.552e-1) PASS
+card leg gemm: last argmax ours=34727 (returned 34727) ik=not compared in this tier; last logits' distance from the pass's 1.952e-2 (band 5.143e-2) PASS
+card leg gemm: every layer's store within its band, past it at []; PLE ring 1.227e-3 (band 4.454e-2) PASS
+paths card plan: the batch set by two ubatches vs one ubatch: tokens [34727] vs [34727]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+paths card plan: ref_qwen4exp_d3k by ubatches cut at 2601 vs one ubatch: tokens [27216] vs [27216]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+clauses: 24 ran, 9 left to the real tier
+gate_qwen4exp_e2e: 9 fixture-oracle clauses ran in the fixture tier, the gate declares 10 — a clause did not run
+GPU GATE RED: gate_qwen4exp_e2e (exit 1)
+error: recipe `gate-gpu-qwen4exp-e2e` failed on line 859 with exit code 1
+local_rc=1 wall=49

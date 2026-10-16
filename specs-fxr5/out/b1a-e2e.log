@@ -1,0 +1,51 @@
+BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_e2e'
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e...
+
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.06s
+
+✓ Cargo build succeeded
+gpu-gate.sh: gate_qwen4exp_e2e on the a6000 (asked any), tier fixture: no V4.1 load lock
+derived model file = "/models/fixtures/qwen38/qwen38-fixture-00001-of-00001.gguf" (the real file's "/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
+derived N_LAYER = 4 (the real file's 48)
+derived PLE_LAYER = 2 (the real file's 1)
+derived N_QSA = 2 (the real file's 12)
+derived N_GDN = 2 (the real file's 36)
+derived NODES_DECODE = 113 (the real file's 1151)
+derived MEMOPS = 8 (the real file's 96)
+derived NODES_VERIFY = 119 (the real file's 1235)
+derived NODES_SLOT = 23 (the real file's 171)
+derived IMAGE_TOKEN = 248056 (the real file's 248056)
+derived plan levers' card budget = Some(9489612800) (the real file's None)
+derived card bytes (total, driver reserve, device, free, holders) = (51527024640, 574619648, Some(DeviceId { ordinal: 0, uuid: [140, 18, 159, 166, 115, 130, 53, 165, 36, 100, 159, 240, 29, 153, 252, 212] }), Some(50668240896), None) (the real file's (25769803776, 419430400, None, None, None))
+named difference: the card's name "A6000", the old literal's "3090"
+plan card=A6000 experts=Host slots=1 ctx_max=3072 ubatch=3072 host_experts=2048 card_experts=0 card_layers=0 ple=host room=262801244160 read=MemAvailable row_reserve=0 card_budget=Some(9489612800)
+load host_tier r8=off (no sidecar at /models/fixtures/qwen38-r8/qwen38-fixture-r8.gguf; optional: a source checkout writes it with just r8-sidecar)
+load host_tier type=q5_K k=2560 path=fused
+load host_tier type=q8_0 k=640 path=fused
+load host_tier type=q4_K k=2560 path=fused
+load host_tier type=q5_1 k=640 path=fused
+load resident_bytes=3861019620 ctx=3072 layers=4 in 2.5 s (runtime value)
+structure layers=4 selecting at [1, 3]; store bytes 41312288 (want 41312288, derived) PASS
+structure decode graph_nodes=113 (want 113; the program counts 113, 8 of them batch_mem_op) kernel=105 batch_mem_op=8 (want 8) other=0 PASS
+head rows: a head of 2 rows over the q8_0 lm_head, two equal finite rows -> tokens [2505, 2505] (want two equal tokens) PASS
+head rows: a head of 2 rows over the q8_0 lm_head, a NaN in row 0's input -> error "Head::tokens: device fault at the output head site logit (a head logit not finite); sites raised in the output head (architecture unknown, so in code order, not step order): logit" (want the output head's fault at site logit) PASS
+head rows: a head of 2 rows over the q8_0 lm_head, a NaN in row 1's input -> error "Head::tokens: device fault at the output head site logit (a head logit not finite); sites raised in the output head (architecture unknown, so in code order, not step order): logit" (want the output head's fault at site logit) PASS
+head rows: the word left raised, a verify of 2 rows at 2 -> error "Head::tokens: device fault at the output head site logit (a head logit not finite); sites raised in the output head (Qwen35moe step order): logit", poisoned the output head site logit; sites raised in the output head (Qwen35moe step order): logit (want the output head's fault, and poisoned by it) PASS
+paths five eager steps vs five graph replays: tokens [157377, 137169, 47835, 32521, 34727] vs [157377, 137169, 47835, 32521, 34727]; every position's logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+paths one pass of five rows vs five graph steps: tokens [34727] vs [157377, 137169, 47835, 32521, 34727]; the last logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+paths after the pass's state and a reset, the same five steps: tokens [157377, 137169, 47835, 32521, 34727] vs [157377, 137169, 47835, 32521, 34727]; every position's logits bit for bit: true; stores differing at layers [], PLE ring differing: false PASS
+free: route taps whose ids are not the top 10 of their own logits (distinct, under 512): 0 [] PASS
+deferred(real) oracle: (c) free: each layer's output, each route and the last argmax against ik's
+fixture-oracle: (cfx) free: each layer's output off every flip's path, each flip and the last argmax against ik's fixture set
+gate_qwen4exp_e2e: fixture oracle (cfx) free: each layer's output off every flip's path, each flip and the last argmax against ik's fixture set: stale set: stale reference: /root/fxr5-data/fx_ref_qwen4exp was dumped from /models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf, the tree runs /models/fixtures/qwen38/qwen38-fixture-00001-of-00001.gguf; dump it again with `BLOOMERY_TIER=fixture just dump-ref-fixture qwen4exp [VARIANT]`
+  caused by: stale reference: /root/fxr5-data/fx_ref_qwen4exp was dumped from /models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf, the tree runs /models/fixtures/qwen38/qwen38-fixture-00001-of-00001.gguf
+GPU GATE RED: gate_qwen4exp_e2e (exit 1)
+error: recipe `gate-gpu-qwen4exp-e2e` failed on line 859 with exit code 1
+local_rc=1 wall=5

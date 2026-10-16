@@ -1,0 +1,5 @@
+box-gc: mode=--kill prefix=/root/repo/bloomery-fxr5/target harness=[/root/bloomery-data/bin /root/bloomery-data/router/bin] (cwd inside /root/repo/bloomery-fxr5) self=2854165 never-candidates=[2854165 2853720 1645 1 ]
+proc 2373265 /usr/bin/bash: bash tools/gpu-gate.sh gate_qwen4exp_e2e (cwd /root/repo/bloomery-fxr5)
+box-gc: found 1 process(es) under /root/repo/bloomery-fxr5/target, in the harness dirs or waiting on tools/gpu-gate.sh (--check also counts a cwd inside /root/repo/bloomery-fxr5)
+term 2373265
+gc-done

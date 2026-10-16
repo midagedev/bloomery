@@ -1,0 +1,1238 @@
+./tools/mac-check.sh test
+mac-check: disk: 55.3 GiB free on /System/Volumes/Data (for /Users/hckim/repo/bloomery-fxr5/target), above the 3 GiB floor
+mac-check: cargo test -p <crate>, natively on aarch64-apple-darwin, for the pure crates of tools/recipes.py pure-crates (rustc 1.100.0-nightly (e457a7b0d 2026-08-27); CARGO_TARGET_DIR=/Users/hckim/repo/bloomery-fxr5/target); log /Users/hckim/repo/bloomery-fxr5/target/mac-check-test.log
+mac-check: cargo test -p <crate>, natively on aarch64-apple-darwin, for the pure crates of tools/recipes.py pure-crates (rustc 1.100.0-nightly (e457a7b0d 2026-08-27); CARGO_TARGET_DIR=/Users/hckim/repo/bloomery-fxr5/target)
+mac-check: cargo test -p bloomery-decision
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (target/debug/build/bloomery-decision/37dc7f13df304f81/out/decision-37dc7f13df304f81)
+
+running 46 tests
+test answer::tests::neumaier_sum_matches_python ... ok
+test answer::tests::round4_is_pythons ... ok
+test answer::tests::confidence_is_llama_cpps ... ok
+test encode::tests::an_empty_question_span_is_refused ... ok
+test encode::tests::non_string_instructions_render_as_json ... ok
+test answer::tests::a_tie_goes_to_the_first_option_in_request_order ... ok
+test encode::tests::spans_cover_the_rendered_pieces ... ok
+test answer::tests::mismatched_logits_are_refused ... ok
+test encode::tests::the_state_is_cut_to_what_the_schema_leaves ... ok
+test answer::tests::the_body_has_the_release_shape ... ok
+test head::tests::a_config_is_recognised_by_its_keys_alone ... ok
+test head::tests::the_config_reads_and_refuses_by_name ... ok
+test json::tests::integers_stay_exact_and_floats_are_python_floats ... ok
+test json::tests::duplicate_keys_keep_first_position_and_last_value ... ok
+test json::tests::malformed_input_is_refused ... ok
+test json::tests::python_only_literals_are_refused_by_name ... ok
+test json::tests::strings_decode_escapes_and_pairs ... ok
+test ops::tests::erf_and_gelu_match_known_values ... ok
+test ops::tests::layer_norm_and_softmax ... ok
+test gguf_head::tests::a_trunk_alone_has_no_head ... ok
+test release::clef::tests::the_layouts_are_consistent ... ok
+test release::lev::tests::the_buckets_are_llama_cpps ... ok
+test release::lev::tests::the_scale_has_two_ratings_or_more ... ok
+test head::tests::a_missing_or_extra_weight_is_refused_by_name ... ok
+test render::tests::dumps_keeps_order_unsorted ... ok
+test render::tests::float_repr_is_pythons ... ok
+test gguf_head::tests::the_stored_scales_are_the_f32_formula_within_two_ulps ... ok
+test gguf_head::tests::every_head_name_maps_to_the_tensors_clef_py_writes ... ok
+test render::tests::render_is_python_dumps ... ok
+test request::tests::choice_options_sort_by_code_point ... ok
+test request::tests::noul_defaults_and_overrides ... ok
+test request::tests::media_is_checked_then_not_supported ... ok
+test request::tests::refusals_are_named ... ok
+test request::tests::question_order_is_request_order_and_unknown_keys_pass ... ok
+test request::tests::rules_order_the_options_and_describe_the_noul ... ok
+test request::tests::score_levels_are_indexed ... ok
+test request::tests::strict_rules_are_llama_cpps_checks ... ok
+test safetensors::tests::overlapping_ranges_are_refused ... ok
+test safetensors::tests::reads_bf16_f16_f32_and_scalars ... ok
+test safetensors::tests::refuses_unknown_dtypes_and_bad_ranges ... ok
+test ops::tests::attention_matches_f64 ... ok
+test gguf_head::tests::a_file_without_its_whole_head_is_refused_by_name ... ok
+test head::tests::forward_scores_every_option_and_checks_its_inputs ... ok
+test gguf_head::tests::a_clef_file_scores_as_the_release_head ... ok
+test gguf_head::tests::a_q8_0_head_is_within_its_block_bound_of_the_release ... ok
+test ops::tests::linear_matches_f64_on_every_split ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+
+     Running unittests src/bin/decision_answer.rs (target/debug/build/bloomery-decision/21ef3b6513605f86/out/decision_answer-21ef3b6513605f86)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/decision_encode.rs (target/debug/build/bloomery-decision/9101dd9a6dc73983/out/decision_encode-9101dd9a6dc73983)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/clef.rs (target/debug/build/bloomery-decision/047c03ba9fb80287/out/clef-047c03ba9fb80287)
+
+running 5 tests
+test hw_clef_answer_matches_the_release ... ignored, needs the Clef reference under $BLOOMERY_DATA; just gate-decision-clef
+test hw_clef_head_matches_the_f64_referee ... ignored, needs the Clef reference under $BLOOMERY_DATA; just gate-decision-clef
+test hw_clef_ids_equal_the_release ... ignored, needs the Clef reference under $BLOOMERY_DATA and the Flash GGUF; just gate-decision-clef
+test hw_clef_layout_head_scores_as_the_release_head ... ignored, needs the Clef reference under $BLOOMERY_DATA and the clef-layout GGUF; just gate-decision-clef
+test hw_clef_layout_tensors_are_the_releases_within_q8_0 ... ignored, needs the clef-layout GGUF and the release's head; just gate-decision-clef
+
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lev.rs (target/debug/build/bloomery-decision/075863658f2189cf/out/lev-075863658f2189cf)
+
+running 3 tests
+test hw_lev_ids_equal_mainline ... ignored, needs the lev reference under $BLOOMERY_DATA and the lev GGUF; just gate-decision-lev
+test lev_answer_math ... ok
+test lev_policy ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests decision
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-hf
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/build/bloomery-hf/fcca5dae0bdaaee5/out/hf-fcca5dae0bdaaee5)
+
+running 41 tests
+test card::tests::a_card_names_the_model_its_repo_quantizes ... ok
+test fetch::tests::a_failure_is_the_networks_the_busy_hubs_or_a_refusal ... ok
+test fetch::tests::a_git_file_checks_by_its_blob_sha1 ... ok
+test fetch::tests::a_missing_file_is_curls_named_error ... ok
+test fetch::tests::a_fetch_lands_checked_and_a_second_fetches_nothing ... ok
+test fetch::tests::a_draft_the_set_cannot_run_is_not_fetched ... ok
+test fetch::tests::a_repo_without_the_drafts_file_fetches_only_the_set ... ok
+test fetch::tests::hub_offline_reads_the_hubs_words_and_refuses_the_rest ... ok
+test fetch::tests::network_failures_are_curls_connect_codes_not_http ... ok
+test fetch::tests::a_busy_or_down_hub_leaves_the_verified_set_to_stand_in ... ok
+test fetch::tests::a_cached_file_the_repo_moved_on_is_fetched_again ... ok
+test fetch::tests::a_shorter_file_of_an_earlier_version_is_fetched_again ... ok
+test fetch::tests::a_size_or_digest_mismatch_is_refused_and_the_part_never_used ... ok
+test fetch::tests::hub_offline_asks_the_hub_nothing ... ok
+test fetch::tests::tokens_and_curl_errors_read_as_said ... ok
+test source::tests::a_flag_and_the_variable_are_one_model_or_refused ... ok
+test source::tests::a_model_named_twice_by_flags_is_refused_with_both_values ... ok
+test source::tests::the_model_flags_come_out_and_the_rest_stays ... ok
+test tests::a_draft_name_the_repo_holds_twice_is_refused_with_both_paths ... ok
+test tests::a_listing_entry_without_a_digest_is_refused ... ok
+test tests::a_split_set_is_one_set_of_every_shard ... ok
+test tests::a_split_set_missing_a_shard_is_refused ... ok
+test tests::a_tag_picks_one_set_case_insensitively ... ok
+test tests::cache_paths_keep_the_repo_and_the_subfolder ... ok
+test tests::exact_names_the_head_files ... ok
+test tests::mmproj_and_imatrix_are_not_sets ... ok
+test tests::one_set_needs_no_quant ... ok
+test tests::repo_strings_parse_as_llama_cpp_splits_them ... ok
+test tests::the_clef_listing_reads_its_files_and_digests ... ok
+test tests::the_mtp_draft_is_the_file_of_the_name_asked_wherever_it_sits ... ok
+test tests::the_next_page_comes_from_the_link_header ... ok
+test tests::zero_and_two_matches_are_refused_with_the_candidates ... ok
+test fetch::tests::an_http_error_stays_a_refusal_beside_a_verified_set ... ok
+test fetch::tests::offline_a_file_no_check_passed_is_not_used ... ok
+test fetch::tests::a_truncated_file_resumes_from_its_end ... ok
+test fetch::tests::a_file_longer_than_the_repos_is_fetched_again ... ok
+test fetch::tests::a_resolve_fetches_the_set_and_the_draft_beside_its_first_shard ... ok
+test fetch::tests::offline_the_draft_is_not_looked_for_but_stands_beside_the_shards ... ok
+test fetch::tests::offline_the_one_verified_set_stands_in ... ok
+test fetch::tests::offline_the_head_files_stand_in_by_name ... ok
+test fetch::tests::offline_zero_or_two_verified_sets_are_refused ... ok
+
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+
+   Doc-tests hf
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-jinja
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/build/bloomery-jinja/517ccf83e40b8119/out/jinja-517ccf83e40b8119)
+
+running 22 tests
+test tests::a_tuple_reads_as_a_list_on_the_right_of_in_only ... ok
+test tests::length_and_string_escapes_follow_jinja2 ... ok
+test tests::scoping_namespace_loop_and_unpacking ... ok
+test tests::default_is_jinja2s ... ok
+test tests::capitalize_ascii_json_and_string_subscripts_follow_jinja2 ... ok
+test tests::items_and_safe_are_jinja2s ... ok
+test tests::tests_filters_and_precedence ... ok
+test tests::split_strip_and_boolean_tests_follow_python ... ok
+test tests::newlines_tests_ranges_and_bools_follow_jinja2 ... ok
+test tests::loop_filters_and_arithmetic_follow_python ... ok
+test tests::call_arguments_follow_python ... ok
+test tests::tojson_writes_a_float_as_either_runtime_does ... ok
+test tests::tojson_takes_hf_options ... ok
+test tests::macros_and_loop_controls_follow_jinja2 ... ok
+test tests::slices_follow_python ... ok
+test tests::whitespace_control_and_trim_blocks ... ok
+test tests::whitespace_is_python_isspace ... ok
+test tests::unsupported_macro_uses_are_named_errors ... ok
+test tests::values_render_as_python_str ... ok
+test tests::v41_thinking_by_hand ... ok
+test tests::v41_tools_by_hand ... ok
+test tests::v41_three_messages_by_hand ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests jinja
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-levers
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/build/bloomery-levers/7ab449b8626b897d/out/bloomery_levers-7ab449b8626b897d)
+
+running 35 tests
+test tests::a_floor_fallback_serves_one_slot_where_slots_step_alone ... ok
+test tests::draft_yields_to_the_context_only_under_the_base ... ok
+test tests::draft38_unset_follows_the_place_and_the_file ... ok
+test tests::draft_row_takes_mtp_and_off ... ok
+test tests::glm_residency_at_plan_takes_only_what_fits ... ok
+test tests::glm_unset_follows_the_place ... ok
+test tests::a_paged_plan_steps_one_column ... ok
+test tests::gate_bound_is_the_runners_parser ... ok
+test tests::host_room_takes_bytes_and_refuses_the_rest ... ok
+test tests::lane_prefetch_row_is_an_on_off_arm ... ok
+test tests::accessors_read_their_rows ... ok
+test tests::mtp_draft_refusal_says_no_file_is_there ... ok
+test tests::mtp_head_rows_takes_full_or_a_path ... ok
+test tests::mtp_width_takes_cost_and_fixed ... ok
+test tests::parse_bytes_takes_bytes_mib_and_gib ... ok
+test tests::names_are_unique ... ok
+test tests::prefill_group_default_is_the_rows ... ok
+test tests::qwen38_experts_unset_is_card ... ok
+test tests::qwen3_kv_takes_f16_and_q8_0 ... ok
+test tests::markdown_is_a_line_per_row ... ok
+test tests::registry_and_allow_list_agree ... ok
+test tests::residency38_unset_follows_the_plan ... ok
+test tests::residency_at_plan_moves_the_unset_word_to_what_the_plan_leaves ... ok
+test tests::residency_unset_follows_the_placement ... ok
+test tests::residency_words_take_any_p_and_s_at_least_1 ... ok
+test tests::room_for_keeps_the_word_where_the_plan_has_room ... ok
+test tests::the_pool_reads_its_two_levers ... ok
+test tests::registry_names_are_its_literals ... ok
+test tests::rows_are_well_formed ... ok
+test tests::retired_names_are_refused_whatever_their_value ... ok
+test tests::table_is_a_line_per_lever ... ok
+test tests::a_reading_refuses_everything_at_once ... ok
+test tests::parsed_levers_refuse_what_their_kind_does_not_take ... ok
+test tests::a_binary_refuses_the_levers_it_does_not_act_on ... ok
+test tests::a_binary_refuses_a_name_no_row_names ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+   Doc-tests bloomery_levers
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-models
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/build/bloomery-models/524c86fc00a6d1b8/out/models-524c86fc00a6d1b8)
+
+running 17 tests
+test shape::tests::gqa_rows_are_distinct_and_packed_rows_divide ... ok
+test shape::tests::a_norm_argument_row_serves_both_norms_and_only_it ... ok
+test shape::tests::glm_5_3_flash_router_is_its_row ... ok
+test shape::tests::every_model_the_tree_runs_selects_its_router ... ok
+test shape::tests::a_width_between_rows_is_refused ... ok
+test shape::tests::a_window_sinks_or_value_scale_is_refused_by_name ... ok
+test shape::tests::every_attention_the_tree_runs_selects_its_flash ... ok
+test shape::tests::a_pair_of_widths_no_row_holds_is_refused_by_name ... ok
+test shape::tests::a_top_k_outside_the_row_is_refused ... ok
+test shape::tests::an_attention_no_flash_takes_is_refused ... ok
+test shape::tests::mimo_v2_router_is_its_row_beside_glms ... ok
+test shape::tests::mimo_v2_selects_the_k192_row ... ok
+test shape::tests::no_two_router_rows_overlap ... ok
+test shape::tests::the_biased_sigmoid_rule_is_glm_5_3_flashs ... ok
+test shape::tests::the_k192_row_takes_its_groups_only ... ok
+test shape::tests::the_shape_follows_the_description ... ok
+test tests::swiglu_limit_is_zero_without_a_limit_and_the_limit_with_one ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests models
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-placement
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/build/bloomery-placement/4617f81dc17fe5a6/out/bloomery_placement-4617f81dc17fe5a6)
+
+running 71 tests
+test placement::ctx::tests::searched_placed_rows ... ok
+test placement::ctx::tests::within_margin_rows ... ok
+test placement::ctx::tests::searched_rows ... ok
+test placement::ctx::tests::largest_rows ... ok
+test placement::ctx::tests::searched_default_keeps_the_floor_the_grid_and_the_card ... ok
+test placement::ctx::tests::slots_of_rows ... ok
+test placement::churn::tests::the_pool_fits_the_headroom_less_the_bytes_beside ... ok
+test placement::devices::tests::device_on_host_finds_the_plan_card ... ok
+test placement::devices::tests::aliases_without_a_census_are_this_workstation ... ok
+test placement::devices::tests::the_free_reading_rides_the_spec ... ok
+test placement::devices::tests::an_ambiguous_name_and_an_unlisted_bus_are_refused ... ok
+test placement::devices::tests::the_listed_index_follows_the_device_bus ... ok
+test placement::devices::tests::the_reserve_rule_reproduces_both_cards ... ok
+test placement::paged_drop::tests::a_held_page_inside_a_run_is_found ... ok
+test placement::devices::tests::two_3090s_plan_as_stage_and_tier ... ok
+test placement::devices::tests::equal_large_cards_rank_by_ordinal ... ok
+test placement::paged_drop::tests::a_part_smaller_than_a_page_names_no_page ... ok
+test placement::devices::tests::word_picks_reads_the_list_word ... ok
+test placement::paged_drop::tests::a_run_between_two_held_ids_keeps_both_edge_pages ... ok
+test placement::devices::tests::the_words_on_every_fake_host ... ok
+test placement::paged_drop::tests::adjacent_non_held_ids_merge_into_one_run ... ok
+test placement::paged_drop::tests::books_that_do_not_fit_the_parts_are_refused_by_name ... ok
+test placement::paged_drop::tests::a_held_ids_every_byte_stays_outside_every_dropped_range ... ok
+test placement::qwen38_cards::a_given_arena_under_the_floor_is_refused_by_name ... ok
+test placement::qwen38_cards::both_files_lend_the_draft_their_output_matrices ... ok
+test placement::qwen38_cards::a_paged_plans_load_check_counts_the_arena ... ok
+test placement::qwen38_cards::a_27_gib_room_puts_the_overflow_on_the_nvme_tier ... ok
+test placement::qwen38_cards::a_room_that_leaves_under_the_floors_slots_is_refused_by_name ... ok
+test placement::qwen38_cards::a_split_plans_pool_fits_the_room_past_the_arena ... ok
+test placement::qwen38_cards::the_host_room_lever_reads_bytes_or_is_refused_by_name ... ok
+test placement::qwen38_cards::a_paged_stack_adds_nothing_to_the_churn_pool ... ok
+test placement::qwen38_cards::a_split_leaves_the_run_ahead_window ... ok
+test placement::qwen38_cards::the_split_dial_picks_its_arena_or_refuses_a_too_large_one ... ok
+test placement::qwen38_cards::a_58_gib_room_puts_the_overflow_on_the_nvme_tier ... ok
+test placement::qwen38_cards::the_seats_cache_budget_counts_the_arena_once ... ok
+test placement::tests::a_census_reading_counts_the_context_once ... ok
+test placement::tests::a_held_card_plans_within_its_free_bytes ... ok
+test placement::tests::a_tier_with_nothing_left_is_refused ... ok
+test placement::tests::a_total_past_the_whole_fit_fits_at_half ... ok
+test placement::tests::a_trunk_past_the_free_bytes_is_refused_by_name ... ok
+test placement::tests::expert_list_shapes ... ok
+test placement::tests::grown_kv_leaves_the_headroom_usable_less_every_term ... ok
+test placement::tests::one_device_counted_twice_is_refused ... ok
+test placement::tests::the_host_bound_is_the_needs_check_at_the_machine_room ... ok
+test placement::tests::the_whole_fit_counts_the_arena_and_the_granules ... ok
+test placement::tests::the_whole_search_stops_where_the_arena_does ... ok
+test placement::tests::token_embedding_is_the_layer_0_card_alone ... ok
+test placement::tests::two_devices_of_one_name_plan ... ok
+test placement::workstation::tests::cgroup_room_reads_the_limit_and_gives_file_pages_back ... ok
+test placement::workstation::tests::cgroup_v2_path_reads_the_unified_line ... ok
+test placement::workstation::tests::host_need_is_refused_past_mem_available ... ok
+test placement::workstation::tests::host_room_takes_the_smaller_reading ... ok
+test placement::workstation::tests::mem_available_reads_the_line_in_kb ... ok
+test placement::workstation::tests::plan_tiers_is_plan_bp_a_and_gate ... ok
+test placement::workstation::tests::plan_tiers_refuses_by_name ... ok
+test placement::workstation::tests::plan_tiers_sums_the_host_rows_per_tier ... ok
+test placement::workstation::tests::the_plan_room_is_one_const ... ok
+test placement::workstation::tests::v41_tier_batch_bytes ... ok
+test slots::tests::bytes_count_every_term_per_slot ... ok
+test slots::tests::plan_kv_is_one_beside_less ... ok
+test slots::tests::slots_of_multiplies_every_layer ... ok
+test slots::tests::split_ctx_floors_and_refuses ... ok
+test placement::qwen38_cards::the_one_column_rule_reads_the_arena ... ok
+test placement::qwen38_cards::the_dial_moves_a_byte_a_byte_but_at_its_step ... ok
+test placement::qwen38_cards::the_dials_one_step_is_at_half_the_host_leg ... ok
+test placement::qwen38_cards::a_room_that_holds_the_need_keeps_the_plan_unchanged ... ok
+test placement::qwen38_cards::a_room_under_the_floor_is_refused_by_name ... ok
+test placement::qwen38_cards::two_slots_at_4096_hold_every_routed_expert ... ok
+test placement::qwen38_cards::q4_on_one_96gb_card_holds_every_routed_expert ... ok
+test placement::qwen38_cards::two_slots_default_context_is_252416 ... ok
+test placement::qwen38_cards::q3_routes_onto_cards_like_the_q4_file has been running for over 60 seconds
+test placement::qwen38_cards::q3_routes_onto_cards_like_the_q4_file ... ok
+
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 69.53s
+
+   Doc-tests bloomery_placement
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-refset
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/build/bloomery-refset/ee1a02b02b752dc5/out/refset-ee1a02b02b752dc5)
+
+running 118 tests
+test arch::dequant::tests::the_three_sets_are_rows_of_the_table ... ok
+test arch::glm5next::tests::the_family_refuses_a_set_without_its_trailer ... ok
+test arch::deepseek41::tests::the_cand_family_refuses_a_set_of_another_file ... ok
+test arch::deepseek41::tests::the_cand_family_takes_a_set_of_its_file_build_and_arch ... ok
+test arch::glm5next::tests::the_family_refuses_a_set_of_another_arch ... ok
+test arch::deepseek41::tests::the_cand_family_refuses_another_arch_and_an_unfinished_set ... ok
+test arch::glm5next::tests::the_family_refuses_a_set_of_another_file ... ok
+test arch::glm5next::tests::the_dsa_family_takes_a_set_and_the_node_dumps_stay_ik ... ok
+test arch::glm5next::tests::the_family_refuses_a_set_of_another_build ... ok
+test arch::deepseek41::tests::the_cand_family_refuses_a_set_of_another_build ... ok
+test arch::glm5next::tests::the_mtp_family_takes_its_file_and_the_mtp_build ... ok
+test arch::glm5next::tests::the_family_takes_a_set_of_its_file_build_and_arch ... ok
+test arch::mimo2::tests::the_family_takes_a_set_of_its_file_build_and_arch ... ok
+test arch::mimo2::tests::the_family_refuses_a_set_without_its_trailer ... ok
+test arch::mimo2::tests::the_family_refuses_a_set_of_another_arch ... ok
+test arch::mimo2::tests::the_family_refuses_a_set_of_another_build ... ok
+test arch::qwen35::clefvis::tests::the_table_holds_one_clefvis_family_of_each_kind_after_the_node_dump_family ... ok
+test arch::mimo2::tests::the_family_refuses_a_set_of_another_file ... ok
+test arch::qwen35::tests::a_set_opens_through_its_files_family_only ... ok
+test arch::qwen35::tests::the_family_refuses_a_set_of_another_file_build_or_arch ... ok
+test arch::qwen35moe::tests::the_family_refuses_a_set_of_another_file_build_or_arch ... ok
+test arch::qwen4exp::mtp::tests::draft_file_is_the_lever_then_beside_the_target_then_the_family_path ... ok
+test arch::qwen4exp::tests::the_family_refuses_a_set_of_another_build ... ok
+test arch::qwen4exp::tests::the_family_refuses_a_set_of_another_arch ... ok
+test arch::qwen4exp::tests::the_family_refuses_a_set_without_its_trailer ... ok
+test arch::qwen4exp::tests::the_family_refuses_a_set_of_another_file ... ok
+test arch::qwen4exp::tests::the_family_takes_a_set_of_its_file_build_and_arch ... ok
+test arch::qwen4exp::tests::the_mtp_family_refuses_a_set_of_another_draft ... ok
+test arch::tests::hw_every_set_in_place_is_its_familys ... ignored, hw: needs the reference sets in $BLOOMERY_DATA and BLOOMERY_DSPARK_MODEL on the box
+test arch::tests::each_fixture_family_mirrors_a_real_one ... ok
+test arch::qwen4exp::tests::the_mtp_family_takes_its_files_and_the_mtp_build ... ok
+test arch::tokenizer::tests::the_four_vocabularies_are_rows_of_the_table ... ok
+test arch::dequant::tests::each_family_takes_its_own_model_and_build_only ... ok
+test dequant::tests::a_file_that_is_not_the_one_dumped_is_refused_by_its_md5 ... ok
+test dequant::tests::a_manifest_line_that_does_not_parse_is_malformed ... ok
+test dequant::tests::a_set_of_another_harness_or_library_is_foreign ... ok
+test dequant::tests::a_set_of_another_model_or_unfinished_is_refused_by_name ... ok
+test dequant::tests::a_set_of_the_familys_model_and_build_opens ... ok
+test dsref::tests::a_draft_set_of_another_file_is_stale ... ok
+test arch::qwen35::clefvis::tests::a_set_whose_rows_disagree_with_its_header_is_malformed ... ok
+test dsref::tests::a_garbage_int_count_is_malformed ... ok
+test dsref::tests::a_draft_set_reads_by_its_column_lines ... ok
+test dsref::tests::a_garbage_ne0_is_malformed ... ok
+test dsref::tests::a_garbage_ne1_is_malformed ... ok
+test dsref::tests::a_garbage_ne2_is_malformed ... ok
+test dsref::tests::a_garbage_ne3_is_malformed ... ok
+test fixture::tests::a_nested_or_empty_array_is_refused_by_the_renderer ... ok
+test dsref::tests::an_integer_file_of_another_length_is_malformed ... ok
+test fixture::tests::a_key_given_twice_and_a_nested_array_are_refused ... ok
+test fixture::tests::the_first_shard_is_the_one_file_the_glob_matches ... ok
+test fixture::tests::the_line_is_every_fixture_key_sorted ... ok
+test fixture::tests::a_node_set_of_another_generation_is_stale ... ok
+test fixture::tests::the_line_refuses_a_file_that_is_not_a_header ... ok
+test fixture::tests::the_root_is_the_variable_or_the_default ... ok
+test arch::tokenizer::tests::each_family_takes_its_own_build_and_vocabulary_only ... ok
+test fixture::tests::the_values_print_by_their_type ... ok
+test fixture::tests::the_table_is_the_shells ... ok
+test ik::tests::a_masked_row_admits_minus_inf_past_its_finite_slots_only ... ok
+test fixture::tests::an_mtp_set_of_another_generation_is_stale ... ok
+test greedy::tests::a_greedy_file_of_another_model_is_stale ... ok
+test fixture::tests::the_line_refuses_what_it_cannot_state ... ok
+test arch::tokenizer::tests::a_set_of_another_vocabulary_file_is_stale_under_each_family ... ok
+test ik::tests::a_route_set_without_the_prefill_line_is_missing_by_name ... ok
+test ik::tests::a_pick_repeated_within_a_position_is_refused ... ok
+test ik::tests::a_pick_that_is_no_expert_number_is_refused ... ok
+test ik::tests::a_row_of_another_shape_is_refused ... ok
+test ik::tests::a_set_of_another_file_is_stale_by_name ... ok
+test ik::tests::a_set_without_the_routes_header_is_missing_by_name ... ok
+test ik::tests::check_experts_names_the_first_pick_past_the_models_count ... ok
+test ik::tests::every_layer_must_cut_the_same_ubatches ... ok
+test ik::tests::header_lines_fill_their_fields_or_are_kept ... ok
+test ik::tests::every_row_has_the_same_ubatches ... ok
+test ik::tests::a_stem_with_no_row_is_missing_by_name ... ok
+test ik::tests::a_reader_refusal_is_named_by_set_and_row ... ok
+test ik::tests::mask_bits_take_zero_and_minus_infinity_only ... ok
+test ik::tests::occurrences_must_run_from_zero_without_a_gap_or_a_repeat ... ok
+test ik::tests::n_used_must_not_change_between_rows ... ok
+test ik::tests::only_the_whole_name_of_a_routing_node_is_a_route_row ... ok
+test ik::tests::rows_are_read_by_their_column_names ... ok
+test ik::tests::the_index_finds_the_row_a_scan_finds_first ... ok
+test ik::tests::the_picks_twin_must_hold_a_pick_for_every_cell_of_its_row ... ok
+test ik::tests::prefill_routes_take_the_normalised_shape_and_a_ubatch_of_one ... ok
+test ik::tests::prefill_routes_hold_every_layer_over_the_ubatches_in_order ... ok
+test ik::tests::topk_ids_take_the_integer_twin_when_the_set_has_twins ... ok
+test ik::tests::the_stems_must_count_the_same_positions_at_an_occurrence ... ok
+test ik::tests::widened_f16_bits_read_only_the_rows_asked_for ... ok
+test md5::tests::pieces_hash_like_the_whole ... ok
+test kld::tests::a_base_of_another_model_is_stale ... ok
+test ik::tests::ubatch_widths_must_sum_to_the_prefill ... ok
+test ik::tests::stems_naming_different_layers_are_refused ... ok
+test md5::tests::the_rfc_1321_suite ... ok
+test mtpref::tests::a_draft_file_for_a_family_without_one_is_foreign ... ok
+test mtpref::tests::a_node_file_of_another_length_is_malformed ... ok
+test mtpref::tests::a_proposal_that_disagrees_with_the_verdict_is_malformed ... ok
+test mtpref::tests::a_block_that_is_not_one_token_is_malformed ... ok
+test mtpref::tests::an_mtp_set_of_another_arch_is_foreign ... ok
+test mtpref::tests::an_mtp_set_of_another_build_is_foreign ... ok
+test mtpref::tests::an_mtp_set_reads_by_its_column_lines ... ok
+test mtpref::tests::an_mtp_set_of_another_file_is_stale ... ok
+test mtpref::tests::an_mtp_set_without_its_trailer_is_unfinished ... ok
+test mtpref::tests::an_unknown_graph_label_is_malformed ... ok
+test tokenizer::tests::a_manifest_line_that_does_not_parse_is_malformed ... ok
+test tokenizer::tests::a_set_of_another_binary_or_library_is_foreign ... ok
+test tokenizer::tests::a_set_of_another_vocabulary_is_stale ... ok
+test tokenizer::tests::a_set_of_other_cases_is_stale ... ok
+test tokenizer::tests::a_set_of_the_familys_file_and_build_opens_and_reads ... ok
+test tokenizer::tests::an_ids_file_that_disagrees_with_its_row_is_malformed ... ok
+test tokenizer::tests::an_unfinished_or_absent_set_is_refused_by_name ... ok
+test vision::tests::a_vision_set_reads_by_its_column_lines ... ok
+test tokenizer::tests::a_text_that_is_not_the_one_dumped_is_refused_by_its_md5 ... ok
+test visref::tests::a_visref_set_reads_by_its_column_lines ... ok
+test visref::tests::a_visref_set_of_another_source_is_refused_by_name ... ok
+test arch::qwen35::clefvis::tests::a_family_of_another_identity_is_refused_by_the_reader ... ok
+test arch::qwen35::clefvis::tests::a_set_of_another_kind_or_family_is_refused_by_name ... ok
+test arch::qwen35::clefvis::tests::each_kind_of_set_reads_by_name ... ok
+test md5::tests::a_file_hashes_like_its_bytes ... ok
+test arch::qwen35::clefvis::tests::the_familys_check_set_refuses_a_set_of_another_mmproj_or_kind ... ok
+test arch::qwen35::clefvis::tests::a_set_of_another_file_build_arch_or_mmproj_is_refused_by_name ... ok
+
+test result: ok. 117 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.69s
+
+     Running unittests src/bin/refset_check.rs (target/debug/build/bloomery-refset/c4457fc1fcfe4505/out/refset_check-c4457fc1fcfe4505)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests refset
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-runtime
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/build/bloomery-runtime/0d208b6da35c4951/out/runtime-0d208b6da35c4951)
+
+running 164 tests
+test combine::tests::host_slots_are_never_read ... ok
+test combine::tests::card_sum_fuses_each_step ... ok
+test hc_gated::tests::sizes_are_the_layouts_of_the_module_doc ... ok
+test combine::tests::combine_adds_host_then_shared ... ok
+test combine::tests::card_sum_is_ascending_from_zero ... ok
+test combine::tests::slots_of_takes_six_and_eight_only ... ok
+test layer::tests::glm_layers_by_their_specs ... ok
+test layer::tests::glm_stores ... ok
+test layer::tests::glm_hosted_run ... ok
+test layer::tests::glm_step_walk ... ok
+test qsa::tests::a_shape_that_is_not_whole_pools_is_refused ... ok
+test hc_gated::tests::the_card_combine_is_one_fused_multiply_add_per_value ... ok
+test hc_gated::tests::only_the_table_rows_are_served_and_the_rest_refused_by_name ... ok
+test lookup::tests::repeated_pattern ... ok
+test qsa::tests::order_key_orders_as_the_scores_and_ties_the_zeros ... ok
+test qsa::tests::every_pool_is_completed_by_exactly_one_count ... ok
+test qsa::tests::scored_is_the_selecting_rows_with_an_accepted_count ... ok
+test qsa::tests::the_cut_takes_the_best_and_the_lower_pool_of_a_tie ... ok
+test qsa::tests::the_higher_tie_takes_the_best_and_the_higher_pool_of_a_tie ... ok
+test qsa::tests::a_pool_the_row_does_not_see_complete_is_refused - should panic ... ok
+test sched::tests::slot_lanes_split_the_busy_slots ... ok
+test sched::tests::walk_runs_the_order ... ok
+test sched::tests::the_four_walks_on_two_layers ... ok
+test sched::tests::walks_refused_by_name ... ok
+test sched::tests::walk_serves_host_legs_only ... ok
+test seqstate::tests::capacity_by_budget ... ok
+test seqstate::tests::cuts_named ... ok
+test seqstate::tests::cut_drops_the_abandoned_branch ... ok
+test qsa::tests::a_selecting_row_lists_its_kept_pools_then_its_tail ... ok
+test seqstate::tests::dropped_slots_are_reused ... ok
+test seqstate::tests::forget_gives_back_one_take ... ok
+test seqstate::tests::keep_is_the_nearest_checkpoint_below ... ok
+test seqstate::tests::lane_count_is_a_parameter ... ok
+test seqstate::tests::lane_refusals ... ok
+test seqstate::tests::lane_table ... ok
+test seqstate::tests::marks_start_multiples_end ... ok
+test seqstate::tests::pending_cut_rules ... ok
+test seqstate::tests::restore_reads_only_the_copied_position ... ok
+test seqstate::tests::rec_branch_restores_bit_for_bit ... ok
+test seqstate::tests::rewind_is_the_steps ... ok
+test seqstate::tests::rec_turns_keep_the_prompt_end ... ok
+test seqstate::tests::rewind_refusals ... ok
+test seqstate::tests::take_behind_refused ... ok
+test seqstate::tests::take_fills_then_evicts_the_least_recent ... ok
+test speculative::tests::a_new_prompt_starts_the_lookup_over ... ok
+test speculative::tests::a_draft_hears_the_taken_ids ... ok
+test speculative::tests::a_draft_program_by_kind ... ok
+test speculative::tests::a_pair_target_compiles_only_its_width ... ok
+test speculative::tests::a_proposal_of_n_verifies_n_plus_one_rows ... ok
+test speculative::tests::a_pass_past_the_context_is_not_run ... ok
+test lookup::tests::matches_draft_accept_py ... ok
+test speculative::tests::a_window_visits_its_widths ... ok
+test speculative::tests::a_proposal_that_moves_the_target_panics - should panic ... ok
+test speculative::tests::a_proposal_past_the_width_panics - should panic ... ok
+test speculative::tests::accepted_rows_arithmetic ... ok
+test speculative::tests::eog_inside_a_pass_ends_it ... ok
+test speculative::tests::failed_pass_ends_the_loop ... ok
+test speculative::tests::failed_prompt_is_not_refed ... ok
+test speculative::tests::lookup_context_is_the_kept_tokens ... ok
+test speculative::tests::no_proposal_is_the_plain_pass ... ok
+test speculative::tests::lookup_emits_the_plain_tokens ... ok
+test speculative::tests::reject_takes_the_row_back ... ok
+test speculative::tests::the_greedy_pick_reads_no_row ... ok
+test state::tests::copied_layers_are_the_recurrent_ones ... ok
+test state::tests::qwen36_every_layer ... ok
+test state::tests::v41_every_is_the_owners ... ok
+test state::tests::stores_of_each_kind ... ok
+test stop::tests::ctx_counts_the_pass_rows ... ok
+test stop::tests::eog_first ... ok
+test stop::tests::length_at_the_count ... ok
+test stop::tests::zero_tokens_refused ... ok
+test stores::tests::a_ple_conv_of_no_tap_is_refused - should panic ... ok
+test stores::tests::a_state_of_no_lane_is_refused - should panic ... ok
+test stores::tests::a_conv_of_no_tap_is_refused - should panic ... ok
+test stores::tests::qwen38_lanes ... ok
+test stores::tests::pooled_rows_round_up ... ok
+test stores::tests::qwen38_mtp_store ... ok
+test stores::tests::qwen38_sizes ... ok
+test swaprule::tests::a_call_pick_is_a_function_of_counts_set_and_cap ... ok
+test swaprule::tests::a_flip_goes_live_after_the_delay ... ok
+test swaprule::tests::a_hot_expert_is_admitted_at_the_first_pass ... ok
+test swaprule::tests::a_call_pick_wants_the_hottest_pool_and_evicts_the_coldest ... ok
+test swaprule::tests::a_layer_no_pass_routes_needs_no_row_and_gains_no_count ... ok
+test swaprule::tests::a_pass_bound_of_64_holds_no_kept_row ... ok
+test swaprule::tests::a_set_of_kept_rows_counts_alone ... ok
+test swaprule::tests::a_row_at_a_layer_no_pass_routes_is_refused ... ok
+test swaprule::tests::a_pinned_expert_is_never_a_victim ... ok
+test swaprule::tests::decay_keeps_alternating_experts_under_min_count ... ok
+test swaprule::tests::a_wide_pass_plans_once_and_carries_the_rest_below_every ... ok
+test swaprule::tests::an_away_expert_is_never_admitted ... ok
+test swaprule::tests::fixture::the_opening_replay ... ok
+test speculative::tests::a_sampled_pass_takes_the_plain_steps_ids ... ok
+test swaprule::tests::fixture::the_cap_binding_replay ... ok
+test swaprule::tests::fixture::the_plan_replay ... ok
+test swaprule::tests::fixture::the_pinned_replay ... ok
+test swaprule::tests::flips_land_before_the_pass_plans ... ok
+test swaprule::tests::history_is_any_count_and_a_reset_clears_it ... ok
+test swaprule::tests::min_count_holds_back_a_small_count ... ok
+test swaprule::tests::one_spare_holds_one_flip_in_flight ... ok
+test swaprule::tests::open_relays_out_from_whole_prompt_counts ... ok
+test swaprule::tests::open_breaks_raw_zero_ties_by_seed_rank ... ok
+test swaprule::tests::plans_come_every_every_kept_rows_whatever_a_pass_keeps ... ok
+test swaprule::tests::rejected_rows_leave_no_trace ... ok
+test swaprule::tests::settle_moves_the_card_set_all_or_nothing ... ok
+test swaprule::tests::the_cap_binds_inside_one_layer ... ok
+test swaprule::tests::the_cap_is_over_all_layers ... ok
+test swaprule::tests::the_margin_is_over_the_victims_count ... ok
+test swaprule::tests::the_same_kept_rows_plan_at_the_same_kept_row_counts ... ok
+test swaprule::tests::ties_break_to_the_lower_id_then_the_lower_layer ... ok
+test swaprule::tests::reset_is_a_fresh_rule ... ok
+test swaprule::tests::the_same_history_gives_the_same_flips ... ok
+test swaprule::tests::fixture::the_away_replay ... ok
+test swaprule::tests::undefined_input_is_refused_by_name ... ok
+test swaprule::tests::two_spares_hold_two_flips_in_flight ... ok
+test width::tests::a_held_pass_hooks_the_draft_before_its_step ... ok
+test width::tests::a_probe_runs_the_stalest_width ... ok
+test width::tests::a_drifting_calibration_follows_the_acceptance ... ok
+test width::tests::a_round_window_is_counted_and_drops_the_flight ... ok
+test width::tests::a_shadow_is_scored_never_verified ... ok
+test width::tests::fixed_mode_verifies_every_proposal_whole ... ok
+test width::tests::no_decision_before_the_minimum_readings ... ok
+test width::tests::the_expected_and_tally_arithmetic ... ok
+test width::tests::the_gate_keeps_its_margin_and_a_window_its_own_width ... ok
+test width::tests::a_draft_that_does_not_pay_probes_once_a_long_period ... ok
+test width::tests::a_slow_warm_up_does_not_hold_the_gate_closed ... ok
+test width::tests::undefined_input_is_a_named_error ... ok
+test width::tests::the_tally_counts_every_pass_once ... ok
+test words::tests::the_count_refuses_zero_rows_and_empties ... ok
+test xsplit::tests::a_capacity_of_zero_streams_and_admits_nothing ... ok
+test xsplit::tests::a_card_column_at_or_past_the_hosts_streams_nothing ... ok
+test xsplit::tests::a_count_at_or_below_the_floor_never_streams ... ok
+test words::tests::a_zero_tail_stream_holds_the_scalar_packing ... ok
+test xsplit::tests::a_share_the_union_cannot_leave_is_refused_by_name ... ok
+test width::tests::the_tokens_are_the_plain_runs_whatever_it_cuts ... ok
+test xsplit::tests::a_units_pricing_refuses_by_name ... ok
+test xsplit::tests::a_units_tail_is_the_rate_times_its_card_picks ... ok
+test xsplit::tests::an_exposed_return_prices_an_admit_at_two_copies ... ok
+test xsplit::tests::bad_input_is_refused_by_name ... ok
+test xsplit::tests::both_lists_rank_count_descending_then_id_ascending ... ok
+test xsplit::tests::m_min_on_all_three_machines ... ok
+test xsplit::tests::stream_tail_below_m_min_streams_nothing ... ok
+test xsplit::tests::stream_tail_is_splits_tail_on_the_post_admit_host_set ... ok
+test xsplit::tests::stream_tail_refuses_by_name ... ok
+test xsplit::tests::stream_tail_with_an_empty_host_set_streams_nothing ... ok
+test xsplit::tests::the_5090_shape_streams_nearly_all_at_4096 ... ok
+test xsplit::tests::the_backlog_bound_fits_the_unions_shadow_past_the_tail ... ok
+test xsplit::tests::the_a6000_shape_admits_alone_at_512_and_streams_its_tail_at_4096 ... ok
+test xsplit::tests::the_burst_share_sits_in_its_band_and_cuts_the_lane ... ok
+test xsplit::tests::the_priced_tail_admits_the_class_a_flat_tail_cannot ... ok
+test width::tests::picks_the_width_that_pays ... ok
+test xsplit::tests::the_floor_is_the_rules_crossover ... ok
+test xsplit::tests::the_stream_floor_prices_its_copy_beside_the_union ... ok
+test xsplit::tests::the_rings_rule_never_reads_the_tail ... ok
+test xsplit::tests::the_union_floor_streams_a_count_under_the_column_floor ... ok
+test xsplit::tests::the_walk_prices_the_max_form_the_fit_selected ... ok
+test xsplit::tests::the_walks_gate_is_the_copy_over_a_picks_union ... ok
+test xsplit::tests::the_walk_stops_sooner_at_the_beside_union_rate ... ok
+test sched::tests::order_is_todays_walks ... ok
+test qsa::tests::positions_to_2050_keep_every_token_and_2051_drops_a_pool ... ok
+test hc_gated::tests::the_stages_read_every_value_once ... ok
+test hc_gated::tests::identities_hold_in_the_reference ... ok
+test hc_gated::tests::the_card_order_in_f32_is_inside_the_bands ... ok
+test xsplit::tests::the_walks_gate_never_skips_a_unit_the_walk_admits_from ... ok
+test qsa::tests::the_ports_take_three_minus_tail_cells_of_the_next_pool_and_we_do_not ... ok
+
+test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.55s
+
+   Doc-tests runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-sampler
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/build/bloomery-sampler/4cad71e15993b375/out/sampler-4cad71e15993b375)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sampler.rs (target/debug/build/bloomery-sampler/1a502f2bbc11ca2c/out/sampler-1a502f2bbc11ca2c)
+
+running 10 tests
+test window_is_the_last_repeat_last_n_tokens ... ok
+test penalties_follow_the_reference_formula ... ok
+test greedy_is_the_engine_argmax ... ok
+test top_k_one_is_greedy ... ok
+test draws_follow_the_softmax ... ok
+test min_p_drops_below_its_fraction_of_the_max ... ok
+test top_p_keeps_the_smallest_prefix_reaching_p ... ok
+test neutral_penalties_leave_the_chain_unchanged ... ok
+test no_allocation_after_the_first_call ... ok
+test same_seed_same_tokens ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.54s
+
+   Doc-tests sampler
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-serve
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running unittests src/lib.rs (target/debug/build/bloomery-serve/9152091d12a29afe/out/serve-9152091d12a29afe)
+
+running 187 tests
+test api::logprobs::tests::a_row_without_a_distribution_is_a_named_error ... ok
+test api::anthropic::tests::billing_header_stamp_is_normalised_only_in_its_place ... ok
+test api::logprobs::tests::a_token_s_values_are_its_row_s_softmax ... ok
+test api::logprobs::tests::a_minus_inf_logit_is_probability_zero_at_the_lowest_f32 ... ok
+test api::logprobs::tests::equal_logits_rank_by_the_lower_id ... ok
+test api::logprobs::tests::the_alternatives_are_the_ask_up_to_the_vocabulary ... ok
+test api::logprobs::tests::routes_that_render_no_probabilities_refuse_them_at_their_plan ... ok
+test api::logprobs::tests::completion_n_probs_carries_each_token_s_values ... ok
+test api::logprobs::tests::an_entry_s_text_is_what_its_token_released ... ok
+test api::logprobs::tests::completion_n_probs_streams_each_token_with_its_chunk ... ok
+test api::logprobs::tests::chat_logprobs_carry_each_token_s_values ... ok
+test api::logprobs::tests::a_nan_row_ends_the_request_by_name_and_not_the_server ... ok
+test api::logprobs::tests::chat_entries_without_a_delta_ride_the_next_chunk ... ok
+test api::logprobs::tests::chat_logprobs_stream_with_the_content ... ok
+test api::oaicompl::tests::finish_reason_is_length_at_the_limit ... ok
+test api::logprobs::tests::the_chat_path_refuses_as_llama_server_does ... ok
+test api::logprobs::tests::unservable_probability_fields_are_named_400s ... ok
+test api::oaicompl::tests::input_tokens_routes_count_the_chat_prompt ... ok
+test api::oaicompl::tests::stream_chunks_end_in_done ... ok
+test api::oaicompl::tests::whole_answer_is_openai_text_completion ... ok
+test api::oaicompl::tests::echo_suffix_and_best_of_are_refused_by_name ... ok
+test api::oaicompl::tests::logprobs_is_refused_in_its_count_form ... ok
+test api::responses::tests::a_codex_request_is_served_and_its_fields_reach_the_generation ... ok
+test api::oaicompl::tests::several_prompts_are_refused_by_name ... ok
+test api::responses::tests::errors_are_the_chat_paths_and_end_a_started_stream ... ok
+test api::responses::tests::images_are_the_chat_paths_and_files_are_refused ... ok
+test api::responses::tests::input_items_render_as_llama_server_converts ... ok
+test api::responses::tests::stream_ports_the_library_case ... ok
+test api::responses::tests::input_tokens_count_the_generations_prompt ... ok
+test api::responses::tests::reasoning_item_goes_out_and_comes_back_in ... ok
+test api::logprobs::tests::the_alternatives_asked_are_bounded_by_name ... ok
+test api::logprobs::tests::two_slots_each_get_their_own_row_s_values ... ok
+test api::responses::tests::probabilities_and_several_answers_are_refused_by_name ... ok
+test api::responses::tests::stream_telemetry_ports_the_llama_case ... ok
+test api::responses::tests::structured_output_is_refused_by_name ... ok
+test api::responses::tests::function_call_round_trip_renders_as_llama_server_converts ... ok
+test api::tests::a_channel_template_keeps_the_developer_role ... ok
+test api::responses::tests::stream_items_close_in_order_and_match_the_whole_answer ... ok
+test api::tests::a_mixed_rounds_single_pass_is_an_advance ... ok
+test api::responses::tests::whole_answer_ports_the_library_case ... ok
+test api::tests::accept_failures_end_the_server_only_with_the_listener ... ok
+test api::tests::argv_redacted_holds_the_key_back ... ok
+test api::tests::content_parts_join_text_and_refuse_the_rest_by_name ... ok
+test api::tests::a_key_never_reaches_an_answer ... ok
+test api::tests::engine_object_carries_the_verified_context_only_when_reported ... ok
+test api::logprobs::tests::asking_changes_no_generated_id ... ok
+test api::tests::a_string_enable_thinking_kwarg_is_refused_by_name ... ok
+test api::responses::tests::stored_state_is_refused_by_name ... ok
+test api::tests::images_refuse_slots_parked_as_ids ... ok
+test api::tests::id_halves_differ_per_seed_at_the_same_counter ... ok
+test api::tests::a_refusing_sampler_factory_is_the_requests_400 ... ok
+test api::responses::tests::tools_convert_drop_web_search_and_refuse_the_rest ... ok
+test api::tests::placement_bytes_are_the_class_sums ... ok
+test api::tests::prompt_media_is_a_non_empty_multimodal_data ... ok
+test api::tests::logprobs_in_either_form_is_refused_by_name ... ok
+test api::tests::gone_client::a_whole_answer_whose_client_closed_ends_at_the_next_event ... ok
+test api::tests::shutdown_is_looped_back_only ... ok
+test api::responses::tests::unreadable_requests_are_refused_by_name ... ok
+test api::tests::stop_wait::a_refusal_by_the_board_the_halt_killed_names_the_stop ... ok
+test api::tests::reasoning_effort_none_turns_thinking_off_on_glm5 ... ok
+test api::tests::non_finite_sampling_fields_are_refused_by_name ... ok
+test api::tests::reasoning_effort_none_turns_thinking_off_on_qwen38 ... ok
+test api::tests::a_field_of_another_type_is_a_400_naming_the_type_it_takes ... ok
+test api::tests::stop_wait::the_halt_answers_every_request_it_holds_before_the_loop_ends ... ok
+test api::tests::developer_messages_render_as_system_on_every_fixture_template ... ok
+test api::tests::stop_wait::the_stop_is_read_before_each_action_and_start_of_a_round ... ok
+test api::tests::stop_wait::under_turns_the_halt_answers_the_parked_the_pending_and_the_deferred ... ok
+test api::tests::the_anthropic_messages_route_takes_the_x_api_key_header ... ok
+test api::tests::stop_wait::under_turns_the_stop_is_read_before_the_running_requests_step ... ok
+test api::tests::the_key_check_answers_llama_servers_401_and_lets_the_keyed_through ... ok
+test api::tests::the_token_limit_is_the_first_set_of_llama_servers_names ... ok
+test api::tests::thinking_off_puts_the_whole_output_in_content ... ok
+test api::tests::the_fixture_templates_that_need_object_arguments_are_named ... ok
+test api::tests::try_draw_refuses_while_a_ticket_waits ... ok
+test api::tests::tool_call_arguments_reach_a_template_that_needs_objects_as_objects ... ok
+test api::tests::with_no_keys_set_every_route_answers_as_it_does_with_the_check_passed ... ok
+test decide::tests::a_decision_type_names_its_row ... ok
+test decide::tests::a_file_that_carries_its_head_seats_its_row_alone ... ok
+test decide::tests::a_generative_run_reads_no_card ... ok
+test decide::tests::a_seat_asked_without_its_head_is_refused_by_name ... ok
+test decide::tests::not_supported_is_501_and_the_models_are_listed ... ok
+test decide::tests::props_carry_the_servers_engine_object ... ok
+test decide::tests::the_decide_server_checks_keys_before_its_dispatch_too ... ok
+test decide::tests::the_head_config_picks_the_row ... ok
+test decide::tests::the_head_flags_come_out_once ... ok
+test decide::tests::the_head_names_the_decide_seat ... ok
+test decide::tests::the_routes_are_the_deciders_and_no_other ... ok
+test api::tests::stop_wait::the_stop_is_published_under_the_board_lock ... ok
+test flag::tests::a_csv_row_splits_llama_servers_example ... ok
+test flag::tests::a_key_file_takes_one_key_per_line ... ok
+test flag::tests::a_key_flag_with_no_key_is_refused_by_name ... ok
+test flag::tests::a_number_that_is_none_names_its_flag_and_value ... ok
+test flag::tests::an_api_key_list_takes_llama_servers_quoting ... ok
+test flag::tests::the_check_passes_what_llama_servers_middleware_passes ... ok
+test flag::tests::the_context_flag_takes_llama_servers_spellings ... ok
+test flag::tests::the_key_flags_are_llama_servers_two ... ok
+test genloop::cache_tests::a_cut_off_the_marks_is_a_named_error ... ok
+test genloop::cache_tests::a_prefix_the_engine_drops_is_noted_with_its_reason ... ok
+test genloop::cache_tests::a_prompt_call_is_cut_at_its_messages ... ok
+test genloop::cache_tests::a_refused_state_leaves_the_cache ... ok
+test genloop::cache_tests::a_request_tells_the_engine_its_reply_before_the_reuse ... ok
+test genloop::cache_tests::a_save_is_timed_in_cache_ms ... ok
+test genloop::cache_tests::a_switch_pays_one_snapshot_and_a_continuation_none ... ok
+test genloop::cache_tests::an_asking_request_tells_the_engine_it_takes_no_pass ... ok
+test genloop::cache_tests::an_interleaved_conversation_keeps_the_first_ones_prefix ... ok
+test genloop::cache_tests::the_pick_survives_the_save_that_makes_room ... ok
+test genloop::media_tests::a_keep_inside_a_span_goes_back_to_its_start ... ok
+test genloop::media_tests::another_image_of_one_size_stops_the_reuse_at_the_span ... ok
+test genloop::media_tests::the_same_image_keeps_the_span ... ok
+test genloop::sampled_tests::a_sampled_request_tells_a_drafting_engine_its_passes ... ok
+test genloop::slot_tests::a_step_of_several_slots_books_each_and_names_a_row_left_unanswered ... ok
+test genloop::tests::partial_paths_are_distinct_per_save ... ok
+test genloop::tests::prompt_tail_leaves_image_spans_out ... ok
+test genloop::think_tests::a_budget_of_zero_closes_before_any_model_token ... ok
+test genloop::think_tests::a_budget_of_zero_forces_after_the_model_opens ... ok
+test genloop::think_tests::a_model_opened_span_spends_from_its_open_tag ... ok
+test genloop::think_tests::a_natural_close_retires_the_tracker ... ok
+test genloop::think_tests::a_pass_waits_for_the_budget_to_hold_its_rows ... ok
+test genloop::think_tests::the_budget_spends_into_the_forced_close ... ok
+test http::tests::chunked_bodies_decode_and_stop_at_the_limit ... ok
+test http::tests::query_pairs_are_percent_decoded ... ok
+test media::tests::a_keep_inside_a_span_goes_back_to_its_start ... ok
+test media::tests::a_png_data_url_loads_with_its_key ... ok
+test media::tests::a_prefix_ending_inside_a_span_is_cut_to_its_start ... ok
+test media::tests::a_prompt_expands_with_one_feed_per_image ... ok
+test media::tests::base64_is_strict ... ok
+test media::tests::bytes_must_be_the_declared_format ... ok
+test media::tests::data_url_refusals_are_named ... ok
+test media::tests::errors_do_not_echo_a_whole_payload ... ok
+test media::tests::flatten_joins_by_the_models_separator ... ok
+test media::tests::flatten_refusals_are_named ... ok
+test media::tests::held_starts_with_needs_the_same_images ... ok
+test media::tests::jpeg_and_its_jpg_alias_load ... ok
+test media::tests::malformed_parts_are_named ... ok
+test media::tests::other_schemes_are_refused_by_name ... ok
+test media::tests::parts_in_both_image_url_forms ... ok
+test media::tests::prepare_decodes_then_asks_the_model ... ok
+test media::tests::spans_expand_in_order ... ok
+test media::tests::spans_that_do_not_pair_up_are_named ... ok
+test media::tests::the_shared_prefix_needs_the_same_image_in_the_span ... ok
+test mock::tests::bigram_echo_and_eos ... ok
+test mock::tests::encode_decode_round_trip_with_specials_and_multibyte ... ok
+test models::tests::both_lists_name_the_one_model ... ok
+test preflight::tests::a_v3_cpu_runs_and_each_missing_bit_is_named ... ok
+test preflight::tests::an_older_cpu_and_a_bare_guest_are_refused_with_every_name ... ok
+test preflight::tests::the_driver_runs_from_cuda_13_and_anything_else_is_named ... ok
+test promptcache::tests::best_needs_the_same_image_whole ... ok
+test promptcache::tests::best_ranks_by_the_kept_prefix ... ok
+test promptcache::tests::insert_keeps_what_the_newer_state_cannot_keep ... ok
+test promptcache::tests::insert_prunes_then_evicts_the_oldest ... ok
+test promptcache::tests::take_makes_the_state_the_most_recent ... ok
+test reasoning::tests::a_closed_prompt_passes_through ... ok
+test reasoning::tests::a_model_opened_span_enters_on_a_leading_tag ... ok
+test reasoning::tests::a_prompt_names_who_opens_the_span ... ok
+test reasoning::tests::holds_a_partial_close_tag ... ok
+test reasoning::tests::partial_suffix_is_proper ... ok
+test sampling::tests::same_seed_same_draws_and_greedy_limit ... ok
+test sched::tests::a_free_slot_takes_the_oldest_waiting_request ... ok
+test sched::tests::a_picker_chooses_the_request_a_freed_slot_takes ... ok
+test sched::tests::a_picker_index_past_the_waiting_requests_is_named - should panic ... ok
+test sched::tests::a_request_past_the_depth_is_refused ... ok
+test sched::tests::a_request_takes_an_empty_slot_before_one_that_holds_ids ... ok
+test sched::tests::a_request_takes_the_slot_that_holds_its_image ... ok
+test sched::tests::a_request_takes_the_slot_that_shares_its_prefix ... ok
+test sched::tests::a_request_under_the_similarity_floor_takes_the_empty_slot ... ok
+test sched::tests::an_action_never_goes_ahead_of_a_waiting_request ... ok
+test sched::tests::held_slots_past_the_floor_rank_by_shared_prefix ... ok
+test sched::tests::with_no_slot_past_the_floor_the_orders_below_decide ... ok
+test slotfile::tests::a_broken_span_table_is_refused_by_name ... ok
+test slotfile::tests::a_header_round_trips_the_ids_and_the_spans ... ok
+test slotfile::tests::a_v1_file_reads_with_no_image ... ok
+test slotfile::tests::filenames_are_base_names_only ... ok
+test stop::tests::holds_partial_and_cuts_match ... ok
+test stop::tests::releases_a_false_start ... ok
+test swap::tests::a_kept_idle_state_does_not_leave ... ok
+test swap::tests::a_state_past_what_no_eviction_frees_is_refused_and_nothing_leaves ... ok
+test swap::tests::idle_states_leave_oldest_first_and_only_as_needed ... ok
+test worker::tests::a_stop_with_no_cause_is_a_named_panic ... ok
+test api::tests::gone_client::the_probe_tells_a_client_from_a_gone_one_and_leaves_the_socket_blocking ... ok
+test api::tests::posted_shutdown_stops_the_server ... ok
+test api::tests::shutdown_needs_the_key_even_from_loopback ... ok
+test api::tests::stop_wait::the_stop_waits_for_the_answers_in_flight ... ok
+test api::tests::stop_wait::the_stop_waits_out_the_call_it_arrives_in ... ok
+test api::tests::a_key_never_reaches_what_the_process_prints_or_serves ... ok
+test decide::tests::the_stop_waits_for_a_decision_in_flight ... ok
+test api::tests::stop_wait::the_stop_waits_out_no_engine_drop ... ok
+test decide::tests::a_decider_that_failed_ends_the_server ... ok
+
+test result: ok. 187 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.10s
+
+     Running unittests src/bin/bloomery-serve.rs (target/debug/build/bloomery-serve/5a6f6b07114680b3/out/bloomery_serve-5a6f6b07114680b3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/anthropic.rs (target/debug/build/bloomery-serve/1642f9c7623cc61b/out/anthropic-1642f9c7623cc61b)
+
+running 13 tests
+test hw_anthropic_billing_header_keeps_the_prompt_cache ... ignored, gate: just gate-serve
+test hw_anthropic_count_tokens ... ignored, gate: just gate-serve
+test hw_anthropic_engine_error_mid_stream ... ignored, gate: just gate-serve
+test hw_anthropic_errors ... ignored, gate: just gate-serve
+test hw_anthropic_messages_basic ... ignored, gate: just gate-serve
+test hw_anthropic_messages_streaming ... ignored, gate: just gate-serve
+test hw_anthropic_request_conversion ... ignored, gate: just gate-serve
+test hw_anthropic_sampling_fields_reach_the_generation ... ignored, gate: just gate-serve
+test hw_anthropic_stop_sequences ... ignored, gate: just gate-serve
+test hw_anthropic_thinking ... ignored, gate: just gate-serve
+test hw_anthropic_thinking_with_reasoning_model ... ignored, gate: just gate-serve
+test hw_anthropic_tool_use_basic ... ignored, gate: just gate-serve
+test hw_anthropic_vision_format_accepted ... ignored, gate: just gate-serve
+
+test result: ok. 0 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/dsml.rs (target/debug/build/bloomery-serve/985a591543b8f5a9/out/dsml-985a591543b8f5a9)
+
+running 7 tests
+test hw_chat_tool_calls_stream_and_non_stream ... ignored, gate: just gate-serve
+test hw_fixtures_are_the_templates_markup ... ignored, gate: just gate-serve
+test hw_fixtures_parse_to_expected_messages ... ignored, gate: just gate-serve
+test hw_no_tools_format_none_is_byte_identical ... ignored, gate: just gate-serve
+test hw_parse_does_not_depend_on_chunking ... ignored, gate: just gate-serve
+test hw_reasoning_format_values ... ignored, gate: just gate-serve
+test hw_tool_choice_none_leaves_dsml_as_content ... ignored, gate: just gate-serve
+
+test result: ok. 0 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/glmxml.rs (target/debug/build/bloomery-serve/b04e592b9aaba77a/out/glmxml-b04e592b9aaba77a)
+
+running 7 tests
+test hw_glm_chat_tool_calls_stream_and_non_stream ... ignored, gate: just gate-serve
+test hw_glm_fixtures_are_the_templates_markup ... ignored, gate: just gate-serve
+test hw_glm_fixtures_parse_to_expected_messages ... ignored, gate: just gate-serve
+test hw_glm_malformed_call_is_an_api_error ... ignored, gate: just gate-serve
+test hw_glm_malformed_calls_are_named_errors ... ignored, gate: just gate-serve
+test hw_glm_parse_does_not_depend_on_chunking ... ignored, gate: just gate-serve
+test hw_tool_format_follows_the_template ... ignored, gate: just gate-serve
+
+test result: ok. 0 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hermes.rs (target/debug/build/bloomery-serve/144a99dae36c146a/out/hermes-144a99dae36c146a)
+
+running 12 tests
+test hw_a_model_opened_span_splits_like_a_prompt_opened_one ... ignored, gate: just gate-serve
+test hw_a_model_that_opens_no_span_answers_in_content ... ignored, gate: just gate-serve
+test hw_a_prompt_ending_think_newline_opens_the_span ... ignored, gate: just gate-serve
+test hw_detection_follows_the_template ... ignored, gate: just gate-serve
+test hw_fixtures_parse_to_expected_messages ... ignored, gate: just gate-serve
+test hw_hermes_chat_tool_calls_stream_and_non_stream ... ignored, gate: just gate-serve
+test hw_hermes_malformed_call_is_an_api_error ... ignored, gate: just gate-serve
+test hw_hermes_messages_tool_use ... ignored, gate: just gate-serve
+test hw_malformed_calls_are_named_errors ... ignored, gate: just gate-serve
+test hw_parse_does_not_depend_on_chunking ... ignored, gate: just gate-serve
+test hw_the_budget_caps_a_model_opened_span ... ignored, gate: just gate-serve
+test hw_the_budget_is_ignored_on_a_closed_span_prompt ... ignored, gate: just gate-serve
+
+test result: ok. 0 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/limits.rs (target/debug/build/bloomery-serve/e6ac5842b56a39a1/out/limits-e6ac5842b56a39a1)
+
+running 1 test
+test hw_requests_stop_at_the_context ... ignored, gate: just gate-serve
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/penalty.rs (target/debug/build/bloomery-serve/ef2f1ffcd58de981/out/penalty-ef2f1ffcd58de981)
+
+running 5 tests
+test hw_bad_penalties_are_named_400s ... ignored, gate: just gate-serve
+test hw_penalty_fields_reach_the_settings ... ignored, gate: just gate-serve
+test hw_presence_penalty_changes_the_sampled_ids ... ignored, gate: just gate-serve
+test hw_props_report_the_penalty_defaults ... ignored, gate: just gate-serve
+test hw_the_penalty_window_opens_on_the_prompts_ids ... ignored, gate: just gate-serve
+
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/qwenxml.rs (target/debug/build/bloomery-serve/805066fc6dca84b2/out/qwenxml-805066fc6dca84b2)
+
+running 9 tests
+test hw_detection_follows_the_spelling ... ignored, gate: just gate-serve
+test hw_every_seat_template_has_a_parser ... ignored, gate: just gate-serve
+test hw_qwen_chat_tool_calls_stream_and_non_stream ... ignored, gate: just gate-serve
+test hw_qwen_fixtures_are_the_templates_markup ... ignored, gate: just gate-serve
+test hw_qwen_fixtures_parse_to_expected_messages ... ignored, gate: just gate-serve
+test hw_qwen_malformed_call_is_an_api_error ... ignored, gate: just gate-serve
+test hw_qwen_malformed_calls_are_named_errors ... ignored, gate: just gate-serve
+test hw_qwen_messages_tool_use ... ignored, gate: just gate-serve
+test hw_qwen_parse_does_not_depend_on_chunking ... ignored, gate: just gate-serve
+
+test result: ok. 0 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sampdraft.rs (target/debug/build/bloomery-serve/71bc9523ce2b4ed4/out/sampdraft-71bc9523ce2b4ed4)
+
+running 8 tests
+test hw_a_banned_id_or_a_forced_close_steps ... ignored, gate: just gate-serve
+test hw_a_history_handed_back_changed_is_a_named_error ... ignored, gate: just gate-serve
+test hw_a_perfect_draft_keeps_every_proposal ... ignored, gate: just gate-serve
+test hw_a_sampled_draft_stops_at_the_plain_context_end ... ignored, gate: just gate-serve
+test hw_beside_another_busy_slot_a_sampled_request_steps ... ignored, gate: just gate-serve
+test hw_drafted_sampled_ids_are_the_plain_ids ... ignored, gate: just gate-serve
+test hw_draws_run_on_across_passes_and_steps ... ignored, gate: just gate-serve
+test hw_greedy_requests_still_advance ... ignored, gate: just gate-serve
+
+test result: ok. 0 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/serve.rs (target/debug/build/bloomery-serve/6b80e43f9a7944b2/out/serve-6b80e43f9a7944b2)
+
+running 93 tests
+test hw_a_divergence_inside_a_long_prompt_call_keeps_what_the_engine_grants ... ignored, gate: just gate-serve
+test hw_a_draft_gives_the_plain_ids ... ignored, gate: just gate-serve
+test hw_a_draft_serves_what_needs_the_logits ... ignored, gate: just gate-serve
+test hw_a_draft_stops_at_the_plain_context_end ... ignored, gate: just gate-serve
+test hw_a_reply_past_the_window_keeps_the_prompt_to_its_think ... ignored, gate: just gate-serve
+test hw_an_interleaved_conversation_keeps_what_the_engine_grants ... ignored, gate: just gate-serve
+test hw_anthropic_images_feed_as_the_chat_does ... ignored, gate: just gate-serve
+test hw_cache_n_is_what_the_engine_keeps ... ignored, gate: just gate-serve
+test hw_cache_prompt_reuses_the_common_prefix ... ignored, gate: just gate-serve
+test hw_chat_image_refusals_are_named ... ignored, gate: just gate-serve
+test hw_chat_images_expand_to_spans ... ignored, gate: just gate-serve
+test hw_chat_max_tokens_is_length ... ignored, gate: just gate-serve
+test hw_chat_non_stream_shape ... ignored, gate: just gate-serve
+test hw_chat_reuse_needs_the_same_image ... ignored, gate: just gate-serve
+test hw_chat_stop_string_is_cut ... ignored, gate: just gate-serve
+test hw_chat_stream_framing_matches_non_stream ... ignored, gate: just gate-serve
+test hw_completion_non_stream_fields ... ignored, gate: just gate-serve
+test hw_completion_return_tokens ... ignored, gate: just gate-serve
+test hw_completion_stream_framing ... ignored, gate: just gate-serve
+test hw_cut_then_prefill_equals_one_prefill ... ignored, gate: just gate-serve
+test hw_engine_error_is_500_then_503_then_exit ... ignored, gate: just gate-serve
+test hw_errors_are_openai_objects ... ignored, gate: just gate-serve
+test hw_every_later_turn_keeps_the_earlier_turns ... ignored, gate: just gate-serve
+test hw_every_stop_id_ends_a_generation ... ignored, gate: just gate-serve
+test hw_glm5_template_renders_as_jinja2 ... ignored, gate: just gate-serve
+test hw_ignore_eos_bans_every_stop_id ... ignored, gate: just gate-serve
+test hw_ignore_eos_does_not_outlive_its_request ... ignored, gate: just gate-serve
+test hw_media_parts_are_refused ... ignored, gate: just gate-serve
+test hw_metrics_count_cached_prompt_tokens ... ignored, gate: just gate-serve
+test hw_metrics_kv_cache_usage_ratio ... ignored, gate: just gate-serve
+test hw_metrics_n_decode_total ... ignored, gate: just gate-serve
+test hw_metrics_throughput_survives_scrapes ... ignored, gate: just gate-serve
+test hw_models_created_is_process_start ... ignored, gate: just gate-serve
+test hw_non_integer_number_is_refused ... ignored, gate: just gate-serve
+test hw_props_engine_object ... ignored, gate: just gate-serve
+test hw_props_slots_metrics_health_models ... ignored, gate: just gate-serve
+test hw_queued_requests_get_the_slot_in_arrival_order ... ignored, gate: just gate-serve
+test hw_qwen38_template_renders_as_jinja2 ... ignored, gate: just gate-serve
+test hw_qwen3_template_renders_as_jinja2 ... ignored, gate: just gate-serve
+test hw_reasoning_budget_absent_null_and_minus_one_are_unrestricted ... ignored, gate: just gate-serve
+test hw_reasoning_budget_caps_the_span ... ignored, gate: just gate-serve
+test hw_reasoning_budget_ignored_when_the_span_is_closed ... ignored, gate: just gate-serve
+test hw_reasoning_budget_on_a_completion_prompt ... ignored, gate: just gate-serve
+test hw_reasoning_budget_parse_errors_are_refused ... ignored, gate: just gate-serve
+test hw_reasoning_budget_zero_closes_at_once ... ignored, gate: just gate-serve
+test hw_residency_reset_is_the_one_explicit_call ... ignored, gate: just gate-serve
+test hw_same_prompt_keeps_all_but_its_last_id ... ignored, gate: just gate-serve
+test hw_slot_action_errors ... ignored, gate: just gate-serve
+test hw_slot_action_on_a_busy_slot_is_503 ... ignored, gate: just gate-serve
+test hw_slot_files_carry_image_spans ... ignored, gate: just gate-serve
+test hw_slot_save_erase_restore_round_trip ... ignored, gate: just gate-serve
+test hw_slots_n_remain_during_a_run ... ignored, gate: just gate-serve
+test hw_stop_with_a_non_string_is_refused ... ignored, gate: just gate-serve
+test hw_streams_report_cache_n ... ignored, gate: just gate-serve
+test hw_thinking_turn_keeps_the_prompt_to_its_think ... ignored, gate: just gate-serve
+test hw_tokenize_answers_while_a_generation_holds_the_engine ... ignored, gate: just gate-serve
+test hw_tokenize_detokenize_round_trip ... ignored, gate: just gate-serve
+test hw_tool_schema_keys_keep_the_request_order ... ignored, gate: just gate-serve
+test hw_tools_under_an_unparsed_markup_are_refused ... ignored, gate: just gate-serve
+test hw_two_requests_share_the_slot ... ignored, gate: just gate-serve
+test hw_unsupported_fields_are_refused ... ignored, gate: just gate-serve
+test slots::hw_a_cut_of_an_idle_conversation_saves_it_on_several_slots ... ignored, gate: just gate-serve
+test slots::hw_a_drafted_round_is_one_advance_slots_call_of_every_running_slot ... ignored, gate: just gate-serve
+test slots::hw_a_free_slot_takes_the_oldest_waiting_request ... ignored, gate: just gate-serve
+test slots::hw_a_lone_request_takes_the_engines_slot_among_equals ... ignored, gate: just gate-serve
+test slots::hw_a_parked_idle_state_goes_to_the_cache_without_a_copy ... ignored, gate: just gate-serve
+test slots::hw_a_request_past_the_queue_depth_is_503 ... ignored, gate: just gate-serve
+test slots::hw_a_request_preempts_the_running_one_at_a_step_and_both_give_their_alone_ids ... ignored, gate: just gate-serve
+test slots::hw_a_request_takes_the_slot_that_shares_its_prefix ... ignored, gate: just gate-serve
+test slots::hw_a_slot_the_engine_emptied_holds_nothing_for_the_next_request ... ignored, gate: just gate-serve
+test slots::hw_a_state_that_cannot_be_parked_refuses_the_newcomer_by_name ... ignored, gate: just gate-serve
+test slots::hw_a_state_that_does_not_resume_ends_its_request_by_name ... ignored, gate: just gate-serve
+test slots::hw_an_erase_of_a_parked_slot_moves_no_state ... ignored, gate: just gate-serve
+test slots::hw_an_erase_of_another_slot_leaves_the_engines_slot_its_ids ... ignored, gate: just gate-serve
+test slots::hw_drafted_passes_interleave_across_slots ... ignored, gate: just gate-serve
+test slots::hw_drafting_engine_without_slot_drafts_is_refused ... ignored, gate: just gate-serve
+test slots::hw_each_slot_gives_its_request_alone_ids ... ignored, gate: just gate-serve
+test slots::hw_live_requests_take_turns_and_a_prompt_waits_for_the_turn_boundary ... ignored, gate: just gate-serve
+test slots::hw_mixed_step_and_pass_rows ... ignored, gate: just gate-serve
+test slots::hw_requests_that_take_slots_together_start_shortest_first ... ignored, gate: just gate-serve
+test slots::hw_slot_ids_past_the_slots_are_400 ... ignored, gate: just gate-serve
+test slots::hw_slots_an_engine_does_not_declare_are_refused ... ignored, gate: just gate-serve
+test slots::hw_slots_and_metrics_state_a_parked_request ... ignored, gate: just gate-serve
+test slots::hw_slots_that_take_turns_keep_the_draft ... ignored, gate: just gate-serve
+test slots::hw_states_the_turns_let_go_reach_the_prompt_cache ... ignored, gate: just gate-serve
+test slots::hw_the_re_prefill_fallback_gives_the_alone_ids ... ignored, gate: just gate-serve
+test slots::yields::hw_a_client_gone_between_the_calls_ends_its_request ... ignored, gate: just gate-serve
+test slots::yields::hw_a_long_prompt_runs_a_call_a_round_beside_a_decoding_stream ... ignored, gate: just gate-serve
+test slots::yields::hw_a_prompt_alone_runs_in_one_go ... ignored, gate: just gate-serve
+test slots::yields::hw_an_engine_without_a_quantum_runs_every_prompt_in_one_go ... ignored, gate: just gate-serve
+test slots::yields::hw_an_interleaved_prompt_leaves_the_slot_an_uninterrupted_one_does ... ignored, gate: just gate-serve
+test slots::yields::hw_prompt_ms_is_the_prompts_own_engine_time ... ignored, gate: just gate-serve
+test slots::yields::hw_the_cuts_follow_the_call_and_its_marks_whatever_the_load ... ignored, gate: just gate-serve
+
+test result: ok. 0 passed; 0 failed; 93 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests serve
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-tokenizer
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/build/bloomery-tokenizer/e43141f311fa3c5a/out/tokenizer-e43141f311fa3c5a)
+
+running 4 tests
+test pretok::tests::names_have_one_table ... ok
+test pretok::tests::qwen2_cases ... ok
+test pretok::tests::glm4_cases ... ok
+test pretok::tests::qwen35_cases ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/bloomery-tokenize.rs (target/debug/build/bloomery-tokenizer/d1715d58a9bfd2d4/out/bloomery_tokenize-d1715d58a9bfd2d4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tokenizer.rs (target/debug/build/bloomery-tokenizer/08f8b4358fe48996/out/tokenizer-08f8b4358fe48996)
+
+running 8 tests
+test hw_cases_equal_reference ... ignored, needs the V4.1 vocabulary and its oracle set (just dump-ref-tokenizer) on the box
+test hw_corpus_ids_equal_reference ... ignored, needs the V4.1 vocabulary and its oracle set (just dump-ref-tokenizer) on the box
+test hw_glm5next_cases_equal_reference ... ignored, needs the glm5next vocabulary and its oracle set (just dump-ref-tokenizer) on the box
+test hw_glm5next_corpus_ids_equal_reference ... ignored, needs the glm5next vocabulary and its oracle set (just dump-ref-tokenizer) on the box
+test hw_qwen38_cases_equal_reference ... ignored, needs the qwen38 vocabulary and its oracle set (just dump-ref-tokenizer) on the box
+test hw_qwen38_corpus_ids_equal_reference ... ignored, needs the qwen38 vocabulary and its oracle set (just dump-ref-tokenizer) on the box
+test hw_qwen3moe_cases_equal_reference ... ignored, needs the qwen3moe vocabulary and its oracle set (just dump-ref-tokenizer) on the box
+test hw_qwen3moe_corpus_ids_equal_reference ... ignored, needs the qwen3moe vocabulary and its oracle set (just dump-ref-tokenizer) on the box
+
+test result: ok. 0 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests tokenizer
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: cargo test -p bloomery-vision
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/build/bloomery-vision/8cf706675f271cc1/out/vision-8cf706675f271cc1)
+
+running 49 tests
+test arch::deepseek41v::media::tests::data_is_v41s ... ok
+test arch::deepseek41v::grid::tests::research_table ... ok
+test arch::deepseek41v::names::tests::the_names_are_the_files ... ok
+test arch::deepseek41v::hparams::tests::other_values_are_refused_by_key_and_value ... ok
+test arch::deepseek41v::card::tests::the_v41_encoder_card_bytes_leave_the_span_rows_out ... ok
+test arch::deepseek41v::hparams::tests::v41_header_reads ... ok
+test arch::deepseek41v::tensors::tests::table_is_298 ... ok
+test arch::deepseek41v::media::tests::padded_fills_grey ... ok
+test arch::naming::tests::the_three_shapes ... ok
+test arch::naming::tests::the_shared_names_are_the_files ... ok
+test arch::qwen3vl::hparams::tests::clef_header_reads ... ok
+test arch::qwen3vl::hparams::tests::other_values_are_refused_by_key_and_value ... ok
+test arch::qwen3vl::hparams::tests::the_files_epsilon_is_the_f32_one ... ok
+test arch::deepseek41v::media::tests::to_patches_is_the_row_major_cut ... ok
+test arch::qwen3vl::media::tests::data_is_clefs ... ok
+test arch::qwen3vl::size::tests::f32_arithmetic_decides_a_borderline ... ok
+test arch::qwen3vl::size::tests::limits_move_the_plan ... ok
+test arch::qwen3vl::names::tests::the_names_are_the_files ... ok
+test arch::qwen3vl::size::tests::plans_are_multiples_of_the_alignment ... ok
+test arch::qwen3vl::size::tests::worked_examples ... ok
+test arch::qwen3vl::size::tests::refusals ... ok
+test arch::deepseek41v::tensors::tests::a_changed_tensor_list_is_refused_by_name ... ok
+test arch::qwen3vl::tensors::tests::table_is_334 ... ok
+test arch::qwen3vl::tensors::tests::the_bf16_export_types_the_kernels_f32 ... ok
+test arch::qwen3vl::tensors::tests::an_extra_or_missing_block_tensor_is_refused_by_name ... ok
+test image::tests::file_kinds_by_signature ... ok
+test preprocess::tests::a_cut_that_does_not_fit_is_refused ... ok
+test preprocess::tests::bf16_rounds_to_nearest_even ... ok
+test preprocess::tests::a_zero_layout_is_a_limits_error ... ok
+test arch::qwen3vl::tensors::tests::the_export_is_the_mergers_and_every_tensor_follows_it ... ok
+test preprocess::tests::normalize_ends ... ok
+test preprocess::tests::merge_order_index_by_index ... ok
+test resample::tests::bicubic_shape ... ok
+test resample::tests::ceil_geometry_on_four_sizes ... ok
+test preprocess::tests::the_clef_layout_is_1536_values_a_patch ... ok
+test arch::qwen3vl::tensors::tests::a_changed_tensor_list_is_refused_by_name ... ok
+test resample::tests::ceil_pad_refuses_empty_sizes ... ok
+test preprocess::tests::row_major_layout_is_the_former_cut ... ok
+test resample::tests::pad_offset_rounds_half_to_even ... ok
+test resample::tests::ceil_pad_of_a_strip ... ok
+test resample::tests::weights_sum_to_one_unit ... ok
+test resample::tests::ceil_pad_same_size_is_a_copy_and_exact_fit_has_no_fill ... ok
+test resample::tests::the_two_pads_differ_in_geometry_and_fill_only ... ok
+test arch::qwen3vl::media::tests::a_small_image_is_padded_black ... ok
+test arch::qwen3vl::media::tests::a_448_image_is_196_tokens ... ok
+test arch::deepseek41v::media::tests::prepare_gives_the_plans_span ... ok
+test arch::deepseek41v::media::tests::preprocess_is_plan_pad_cut ... ok
+test arch::deepseek41v::grid::tests::max_patches_bound_every_plan ... ok
+test resample::tests::ceil_pad_pastes_on_the_given_fill ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+
+     Running tests/jpeg.rs (target/debug/build/bloomery-vision/eee1a8d5daeea96f/out/jpeg-eee1a8d5daeea96f)
+
+running 3 tests
+test progressive_twin_decodes_like_its_baseline ... ok
+test jpeg_refusals_are_named ... ok
+test jpeg_matches_pillow_within_the_pinned_frontier ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/vision.rs (target/debug/build/bloomery-vision/8c7765f08d1ccf6d/out/vision-8c7765f08d1ccf6d)
+
+running 5 tests
+test hw_mmproj_tensors_named ... ignored, reads the mmproj file on the box
+test hw_plan_matches_oracle ... ignored, reads the oracle set on the box
+test hw_preprocess_matches_oracle ... ignored, reads the oracle set on the box
+test hw_span_matches_oracle ... ignored, reads the oracle set on the box
+test common::sha256_known_answer ... ok
+
+test result: ok. 1 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests vision
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+mac-check: test rc 0; 12 crates (crate=rc): bloomery-decision=0 bloomery-hf=0 bloomery-jinja=0 bloomery-levers=0 bloomery-models=0 bloomery-placement=0 bloomery-refset=0 bloomery-runtime=0 bloomery-sampler=0 bloomery-serve=0 bloomery-tokenizer=0 bloomery-vision=0; 769 passed, 0 failed, 174 ignored in 44 test binaries
+rc=0

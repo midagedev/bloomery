@@ -1,0 +1,7 @@
+mac-check: disk: 68.3 GiB free on /System/Volumes/Data (for /Users/hckim/repo/bloomery-fxr5/target), above the 3 GiB floor
+mac-check: cargo check --target x86_64-unknown-linux-gnu --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/clef  (the check recipe's box command; rustc 1.100.0-nightly (e457a7b0d 2026-08-27), rustfmt 1.10.0-nightly (e457a7b0d3 2026-08-27); CARGO_TARGET_DIR=/Users/hckim/repo/bloomery-fxr5/target); log /Users/hckim/repo/bloomery-fxr5/target/mac-check-check.log
+mac-check: cargo check --target x86_64-unknown-linux-gnu --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/clef  (the check recipe's box command; rustc 1.100.0-nightly (e457a7b0d 2026-08-27), rustfmt 1.10.0-nightly (e457a7b0d3 2026-08-27); CARGO_TARGET_DIR=/Users/hckim/repo/bloomery-fxr5/target)
+    Checking bloomery-gpu-gates v0.2.9 (/Users/hckim/repo/bloomery-fxr5/crates/gpu-gates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.88s
+mac-check: check rc 0; target /Users/hckim/repo/bloomery-fxr5/target, 1 bloomery crates checked or compiled
+rc=0

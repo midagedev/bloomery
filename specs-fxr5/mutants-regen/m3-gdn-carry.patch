@@ -1,0 +1,26 @@
+--- a/crates/gpu/src/fault.rs
++++ b/crates/gpu/src/fault.rs
+@@ -726,6 +726,11 @@
+         }
+     }
+ 
++    #[inline(always)]
++    pub fn layer_of(self) -> u32 {
++        self.layer
++    }
++
+     /// The first-layer word as it stands. Device code: the argmax's copy
+     /// into its readback buffer, after every kernel of the step before it.
+     #[inline(always)]
+--- a/crates/gpu/src/linear/delta.rs
++++ b/crates/gpu/src/linear/delta.rs
+@@ -976,6 +976,9 @@
+     let (qkv_g, state_g) = (global_addr(qkv.as_ptr()), global_addr(state.cast_const()));
+     // SAFETY: s_at + HEAD <= lanes·n_v·HEAD·HEAD, the column inside state.
+     let mut s = unsafe { lane_keys::<false>(state_g + 4 * s_at as u64, j) };
++    if fault.layer_of() == 0 {
++        s = [0.0f32; KEYS_PER_LANE];
++    }
+     let mut raised = false;
+     let mut t = 0usize;
+     while t < m {

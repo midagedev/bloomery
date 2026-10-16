@@ -1,0 +1,58 @@
+--- a/crates/gpu/src/arch/qwen3moe/program38.rs
++++ b/crates/gpu/src/arch/qwen3moe/program38.rs
+@@ -556,7 +556,9 @@
+                     gate: &mut pl.gate,
+                 },
+             )?;
+-            ple_conv(c, pp, &mut self.seqs, s, (self.cur, m), sink)?;
++            if false {
++                ple_conv(c, pp, &mut self.seqs, s, (self.cur, m), sink)?;
++            }
+             self.cur ^= 1;
+             c.mix(
+                 &p.attn_hc,
+--- a/crates/gpu/src/arch/qwen3moe/wide38.rs
++++ b/crates/gpu/src/arch/qwen3moe/wide38.rs
+@@ -1161,23 +1161,25 @@
+                     gate: &mut pl.gate,
+                 },
+             )?;
+-            c.k.ple.enqueue_conv(
+-                stream,
+-                PleConvArgs {
+-                    ngv: &pl.ngv,
+-                    gv: &pl.gv,
+-                    x: xs,
+-                    w: f32_gain(w, &pp.conv)?,
+-                    pos: &s.pos,
+-                    taps: geo::PLE_TAPS,
+-                    dilation: geo::PLE_DILATION,
+-                    hc: geo::STREAMS,
+-                    m,
+-                    fault: sink,
+-                    out,
+-                    ring: &mut *self.ple_ring,
+-                },
+-            )?;
++            if false {
++                c.k.ple.enqueue_conv(
++                    stream,
++                    PleConvArgs {
++                        ngv: &pl.ngv,
++                        gv: &pl.gv,
++                        x: xs,
++                        w: f32_gain(w, &pp.conv)?,
++                        pos: &s.pos,
++                        taps: geo::PLE_TAPS,
++                        dilation: geo::PLE_DILATION,
++                        hc: geo::STREAMS,
++                        m,
++                        fault: sink,
++                        out,
++                        ring: &mut *self.ple_ring,
++                    },
++                )?;
++            }
+             self.cur ^= 1;
+             mix(
+                 c,

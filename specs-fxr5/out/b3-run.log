@@ -1,0 +1,10 @@
+b3 base md5: 11d7c1ac2185e6b051da4236b4f4dc27
+box-gc start rc=0
+m3-gdn-carry applied md5: 6d98245dc893c946dcfa2e7b6e586b4f
+m3-gdn-carry reverted md5: 11d7c1ac2185e6b051da4236b4f4dc27 EQUAL
+m3-gdn-carry rc=1
+m4-eh-halves applied md5: 02998b618bf400dacd8a15278422eec2
+m4-eh-halves reverted md5: 11d7c1ac2185e6b051da4236b4f4dc27 EQUAL
+m4-eh-halves rc=1
+resync rc=0
+box-gc end rc=0

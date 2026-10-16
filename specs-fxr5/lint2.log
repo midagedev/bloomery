@@ -1,0 +1,360 @@
+mac-check: disk: 62.2 GiB free on /System/Volumes/Data (for /Users/hckim/repo/bloomery-fxr5/target), above the 3 GiB floor
+mac-check: cargo clippy --target x86_64-unknown-linux-gnu --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/clef  (the lint recipe's box command; rustc 1.100.0-nightly (e457a7b0d 2026-08-27), rustfmt 1.10.0-nightly (e457a7b0d3 2026-08-27); CARGO_TARGET_DIR=/Users/hckim/repo/bloomery-fxr5/target); log /Users/hckim/repo/bloomery-fxr5/target/mac-check-lint.log
+mac-check: cargo clippy --target x86_64-unknown-linux-gnu --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/clef  (the lint recipe's box command; rustc 1.100.0-nightly (e457a7b0d 2026-08-27), rustfmt 1.10.0-nightly (e457a7b0d3 2026-08-27); CARGO_TARGET_DIR=/Users/hckim/repo/bloomery-fxr5/target)
+warning: using `chunks_exact` with a constant chunk size
+    --> crates/gguf/src/quant.rs:1051:23
+     |
+1051 |     for (xb, ob) in x.chunks_exact(256).zip(out.chunks_exact_mut(256)) {
+     |                       ^^^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<256>().0.iter()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#chunks_exact_to_as_chunks
+     = note: `#[warn(clippy::chunks_exact_to_as_chunks)]` on by default
+
+warning: using `chunks_exact_mut` with a constant chunk size
+    --> crates/gguf/src/quant.rs:1051:49
+     |
+1051 |     for (xb, ob) in x.chunks_exact(256).zip(out.chunks_exact_mut(256)) {
+     |                                                 ^^^^^^^^^^^^^^^^^^^^^
+     |
+help: consider using `as_chunks_mut::<256>()` instead
+    --> crates/gguf/src/quant.rs:1051:49
+     |
+1051 |     for (xb, ob) in x.chunks_exact(256).zip(out.chunks_exact_mut(256)) {
+     |                                                 ^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#chunks_exact_to_as_chunks
+
+warning: using `chunks_exact` with a constant chunk size
+    --> crates/gguf/src/quant.rs:1106:23
+     |
+1106 |     for (xb, ob) in x.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
+     |                       ^^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<32>().0.iter()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#chunks_exact_to_as_chunks
+
+warning: using `chunks_exact_mut` with a constant chunk size
+    --> crates/gguf/src/quant.rs:1106:48
+     |
+1106 |     for (xb, ob) in x.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
+     |                                                ^^^^^^^^^^^^^^^^^^^^
+     |
+help: consider using `as_chunks_mut::<32>()` instead
+    --> crates/gguf/src/quant.rs:1106:48
+     |
+1106 |     for (xb, ob) in x.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
+     |                                                ^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#chunks_exact_to_as_chunks
+
+warning: `bloomery-gguf` (lib) generated 4 warnings (run `cargo clippy --fix --lib -p bloomery-gguf -- ` to apply 2 suggestions)
+warning: the loop variable `j` is used to index `sumi_f`
+    --> crates/qdot/src/lib.rs:3479:22
+     |
+3479 |             for j in 0..2 {
+     |                      ^^^^
+     |
+note: for this index operation
+    --> crates/qdot/src/lib.rs:3508:17
+     |
+3508 |                 sumi_f[j] = _mm256_cvtepi32_ps(sumi);
+     |                 ^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#needless_range_loop
+     = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and `.enumerate()`
+     |
+3479 -             for j in 0..2 {
+3479 +             for (j, <item>) in sumi_f.iter_mut().enumerate() {
+     |
+
+warning: this multiplication by -1 can be written more succinctly
+    --> crates/qdot/src/lib.rs:3627:23
+     |
+3627 |             mins[l] = -1.0 * (dmin * (m as f32));
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using: `-(dmin * (m as f32))`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#neg_multiply
+     = note: `#[warn(clippy::neg_multiply)]` on by default
+
+warning: the loop variable `j` is used to index `sumis`
+    --> crates/qdot/src/lib.rs:3758:22
+     |
+3758 |             for j in 0..2 {
+     |                      ^^^^
+     |
+note: for this index operation
+    --> crates/qdot/src/lib.rs:3815:17
+     |
+3815 |                 sumis[j] = _mm256_madd_epi16(_mm256_set1_epi16(1), t);
+     |                 ^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#needless_range_loop
+help: consider using an iterator and `.enumerate()`
+     |
+3758 -             for j in 0..2 {
+3758 +             for (j, <item>) in sumis.iter_mut().enumerate() {
+     |
+
+warning: `bloomery-qdot` (lib) generated 3 warnings (run `cargo clippy --fix --lib -p bloomery-qdot -- ` to apply 1 suggestion)
+warning: this `if` statement can be collapsed
+    --> crates/model/src/ops.rs:4823:17
+     |
+4823 | /                 if ty == GgmlType::F32 {
+4824 | |                     if let Some(v) = qdot::dot_f32(src, &qbuf[..k]) {
+4825 | |                         out[r] = v;
+4826 | |                         continue;
+4827 | |                     }
+4828 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#collapsible_if
+     = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+     |
+4823 ~                 if ty == GgmlType::F32
+4824 ~                     && let Some(v) = qdot::dot_f32(src, &qbuf[..k]) {
+4825 |                         out[r] = v;
+4826 |                         continue;
+4827 ~                     }
+     |
+
+warning: `bloomery-model` (lib) generated 1 warning (run `cargo clippy --fix --lib -p bloomery-model -- ` to apply 1 suggestion)
+warning: this function has too many arguments (8/7)
+    --> crates/gpu/src/elem.rs:1793:5
+     |
+1793 | /     pub fn enqueue_rms_norm(
+1794 | |         &self,
+1795 | |         stream: &CudaStream,
+1796 | |         x: &DeviceBuffer<f32>,
+...    |
+1801 | |         y: &mut DeviceBuffer<f32>,
+1802 | |     ) -> Result<(), GpuError> {
+     | |_____________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+     = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: this function has too many arguments (8/7)
+    --> crates/gpu/src/elem.rs:1838:5
+     |
+1838 | /     pub fn enqueue_rope(
+1839 | |         &self,
+1840 | |         stream: &CudaStream,
+1841 | |         src: &DeviceBuffer<f32>,
+...    |
+1846 | |         dst: &mut DeviceBuffer<f32>,
+1847 | |     ) -> Result<(), GpuError> {
+     | |_____________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+
+warning: this function has too many arguments (8/7)
+    --> crates/gpu/src/elem.rs:1992:5
+     |
+1992 | /     pub fn enqueue_weighted_sum(
+1993 | |         &self,
+1994 | |         stream: &CudaStream,
+1995 | |         down: &DeviceBuffer<f32>,
+...    |
+2000 | |         y: &mut DeviceBuffer<f32>,
+2001 | |     ) -> Result<(), GpuError> {
+     | |_____________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+
+warning: this function has too many arguments (11/7)
+   --> crates/gpu/src/flash.rs:846:5
+    |
+846 | /     pub fn flash_latent(
+847 | |         q: &[f32],
+848 | |         kv: &[u16],
+849 | |         n_keys_buf: &[u32],
+...   |
+857 | |         mut y: DisjointSlice<f32>,
+858 | |     ) {
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+
+warning: this function has too many arguments (9/7)
+   --> crates/gpu/src/q5.rs:431:5
+    |
+431 | /     pub fn q5_quantize_q8(
+432 | |         x: &[f32],
+433 | |         m_cols: u32,
+434 | |         n_groups: u32,
+...   |
+440 | |         fault: FaultSink,
+441 | |     ) {
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+
+warning: this function has too many arguments (8/7)
+    --> crates/gpu/src/q5.rs:1469:5
+     |
+1469 | /     pub fn enqueue_gemv_q5_0_sel(
+1470 | |         &self,
+1471 | |         stream: &CudaStream,
+1472 | |         w: &crate::DeviceTensor<u32>,
+...    |
+1477 | |         y: &mut DeviceBuffer<f32>,
+1478 | |     ) -> Result<(), GpuError> {
+     | |_____________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+
+warning: this function has too many arguments (12/7)
+   --> crates/gpu/src/lib.rs:816:5
+    |
+816 | /     pub fn q3k_quantize_q8_1(
+817 | |         x: &[f32],
+818 | |         x0: u32,
+819 | |         m_cols: u32,
+...   |
+828 | |         fault: FaultSink,
+829 | |     ) {
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+
+warning: this function has too many arguments (8/7)
+    --> crates/gpu/src/lib.rs:1098:5
+     |
+1098 | /     pub fn q6k_gemv(
+1099 | |         w: &[u32],
+1100 | |         q: &[u32],
+1101 | |         d8: &[f32],
+...    |
+1106 | |         mut y: DisjointSlice<f32>,
+1107 | |     ) {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+
+warning: this function has too many arguments (8/7)
+    --> crates/gpu/src/lib.rs:1471:5
+     |
+1471 | /     pub fn q3k_gemv(
+1472 | |         w: &[u32],
+1473 | |         q: &[u64],
+1474 | |         d8: &[f32],
+...    |
+1479 | |         mut y: DisjointSlice<f32>,
+1480 | |     ) {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+
+warning: `bloomery-gpu` (lib) generated 9 warnings
+warning: `bloomery-gpu` (lib test) generated 9 warnings (9 duplicates)
+warning: the loop variable `b` is used to index `y`
+   --> crates/gpu-gates/src/bin/gate_p4.rs:758:18
+    |
+758 |         for b in 0..N16 {
+    |                  ^^^^^^
+    |
+note: for this index operation
+   --> crates/gpu-gates/src/bin/gate_p4.rs:760:23
+    |
+760 |             let got = y[b];
+    |                       ^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#needless_range_loop
+    = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and `.enumerate()`
+    |
+758 -         for b in 0..N16 {
+758 +         for (b, <item>) in y.iter().enumerate().take(N16) {
+    |
+
+warning: manual implementation of `.is_multiple_of()`
+   --> crates/gpu-gates/src/bin/gate_p4.rs:875:18
+    |
+875 |     let shaped = RMS_THREADS % 32 == 0 && RMS_THREADS <= 1024 && RMS_WARPS == RMS_THREADS / 32;
+    |                  ^^^^^^^^^^^^^^^^^^^^^ help: replace with: `RMS_THREADS.is_multiple_of(32)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#manual_is_multiple_of
+    = note: `#[warn(clippy::manual_is_multiple_of)]` on by default
+
+warning: manual implementation of `.is_multiple_of()`
+   --> crates/gpu-gates/src/bin/gate_p4.rs:933:16
+    |
+933 |             && ARGMAX_THREADS % 32 == 0
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `ARGMAX_THREADS.is_multiple_of(32)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#manual_is_multiple_of
+
+warning: this function has too many arguments (9/7)
+   --> crates/gpu-gates/src/bin/gate_p4.rs:954:1
+    |
+954 | / fn rms_case(
+955 | |     elem: &bloomery_gpu::elem::ElemKernels,
+956 | |     stream: &cuda_core::CudaStream,
+957 | |     x: &[f32],
+...   |
+963 | |     eps: f32,
+964 | | ) -> Result<(bool, String), GateError> {
+    | |______________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+    = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: `bloomery-gpu-gates` (bin "gate_p4" test) generated 4 warnings (run `cargo clippy --fix --bin "gate_p4" -p bloomery-gpu-gates --tests -- ` to apply 2 suggestions)
+warning: very complex type used. Consider factoring parts into `type` definitions
+  --> crates/gpu-gates/src/bin/gate_p1.rs:67:17
+   |
+67 |       let shapes: &[(
+   |  _________________^
+68 | |         &str,
+69 | |         &str,
+70 | |         GgmlType,
+...  |
+73 | |         Option<(u64, u64)>,
+74 | |     )] = &[
+   | |______^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#type_complexity
+   = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: `bloomery-gpu-gates` (bin "gate_p1" test) generated 1 warning
+    Checking bloomery-gpu-gates v0.2.9 (/Users/hckim/repo/bloomery-fxr5/crates/gpu-gates)
+warning: this function has too many arguments (8/7)
+   --> crates/gpu-gates/src/bin/gate_p3.rs:185:1
+    |
+185 | / fn run_q8(
+186 | |     kernels: &bloomery_gpu::q8f32::Q8F32Kernels,
+187 | |     stream: &cuda_core::CudaStream,
+188 | |     qs: &bloomery_gpu::DeviceTensor<u32>,
+...   |
+193 | |     y_ref: &[f32],
+194 | | ) -> Result<(f32, bool), GateError> {
+    | |___________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#too_many_arguments
+    = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: `bloomery-gpu-gates` (bin "gate_p3" test) generated 1 warning
+warning: using `chunks_exact` with a constant chunk size
+   --> crates/gpu-gates/src/bin/gate_p10.rs:497:18
+    |
+497 |                 .chunks_exact(4)
+    |                  ^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<4>().0.iter()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#chunks_exact_to_as_chunks
+    = note: `#[warn(clippy::chunks_exact_to_as_chunks)]` on by default
+
+warning: using `chunks_exact` with a constant chunk size
+   --> crates/gpu-gates/src/bin/gate_p10.rs:850:10
+    |
+850 |         .chunks_exact(4)
+    |          ^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<4>().0.iter()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#chunks_exact_to_as_chunks
+
+warning: `bloomery-gpu-gates` (bin "gate_p10") generated 2 warnings (run `cargo clippy --fix --bin "gate_p10" -p bloomery-gpu-gates -- ` to apply 2 suggestions)
+warning: `bloomery-gpu-gates` (bin "gate_p4") generated 4 warnings (4 duplicates)
+warning: `bloomery-gpu-gates` (bin "gate_p1") generated 1 warning (1 duplicate)
+warning: `bloomery-gpu-gates` (bin "gate_p10" test) generated 2 warnings (2 duplicates)
+warning: `bloomery-gpu-gates` (bin "gate_p3") generated 1 warning (1 duplicate)
+warning: `bloomery-model` (lib test) generated 1 warning (1 duplicate)
+warning: `bloomery-gguf` (lib test) generated 4 warnings (4 duplicates)
+warning: `bloomery-qdot` (lib test) generated 3 warnings (3 duplicates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.12s
+mac-check: lint ^warning: 41 = the ratchet 41 in tools/lint-ratchet.txt; target /Users/hckim/repo/bloomery-fxr5/target, 1 bloomery crates checked or compiled
+rc=0

@@ -1,0 +1,16 @@
+./tools/mac-static.sh 360dcec4
+mac-static: fmt-check rc 0 in 5 s — rustfmt diff blocks: 0
+mac-static: lint rc 0 in 2 s — mac-check: lint ^warning: 41 = the ratchet 41 in tools/lint-ratchet.txt; target /Users/hckim/repo/bloomery-fxr5/target, 0 bloomery crates checked or compiled
+mac-static: combos rc 0 in 3 s — mac-check: combos rc 0; 1 shapes run, 0 red, 43 skipped (scoped), in 3 s (recipes.py combos: 1 of 37 commands to run, 198 distinct (package, target, mode, features) tuples, 36 green in the ledger, 0 with no input changed since 360dcec4f, 7 left out by name)
+mac-static: check-arch rc 0 in 12 s
+mac-static: check-comments rc 0 in 14 s
+mac-static: check-defaults rc 0 in 1 s
+mac-static: check-levers rc 0 in 7 s
+mac-static: check-loads rc 0 in 76 s
+mac-static: check-recipes rc 0 in 519 s
+mac-static: check-rustflags rc 0 in 0 s
+mac-static: check-unsafe rc 0 in 2 s
+mac-static: check-waits rc 0 in 0 s
+mac-static: total 520 s, base 360dcec4, ledger /Users/hckim/.cache/bloomery/mac-static-ledger.tsv
+mac-static: ok
+rc=0

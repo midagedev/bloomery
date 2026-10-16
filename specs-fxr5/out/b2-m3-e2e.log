@@ -1,0 +1,25 @@
+BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_e2e'
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e...
+
+   Compiling bloomery-gpu v0.1.0 (/root/repo/bloomery-fxr5/crates/gpu)
+   Compiling bloomery-app v0.1.0 (/root/repo/bloomery-fxr5/crates/app)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+   Compiling bloomery-gpu-gates v0.2.9 (/root/repo/bloomery-fxr5/crates/gpu-gates)
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 2m 31s
+
+✓ Cargo build succeeded
+[batch-hold] 2026-10-09T19:56:05Z gate_qwen4exp_e2e waits: a landing batch holds the GPUs (/root/bloomery-batch.gpuhold, owner gb_bloomery_train029a_44104_1791575730, up 11 s, refreshed 11 s ago), holding no lock; 0 s so far, at most 1800 s with the lock waits
+[batch-hold] 2026-10-09T19:57:05Z gate_qwen4exp_e2e waits: a landing batch holds the GPUs (/root/bloomery-batch.gpuhold, owner gb_bloomery_train029a_44104_1791575730, up 71 s, refreshed 11 s ago), holding no lock; 60 s so far, at most 1800 s with the lock waits
+[batch-hold] 2026-10-09T19:58:05Z gate_qwen4exp_e2e waits: a landing batch holds the GPUs (/root/bloomery-batch.gpuhold, owner gb_bloomery_train029a_44104_1791575730, up 131 s, refreshed 10 s ago), holding no lock; 120 s so far, at most 1800 s with the lock waits
+[batch-hold] 2026-10-09T19:59:05Z gate_qwen4exp_e2e waits: a landing batch holds the GPUs (/root/bloomery-batch.gpuhold, owner gb_bloomery_train029a_44104_1791575730, up 191 s, refreshed 10 s ago), holding no lock; 180 s so far, at most 1800 s with the lock waits
+[batch-hold] 2026-10-09T20:00:05Z gate_qwen4exp_e2e waits: a landing batch holds the GPUs (/root/bloomery-batch.gpuhold, owner gb_bloomery_train029a_44104_1791575730, up 251 s, refreshed 10 s ago), holding no lock; 240 s so far, at most 1800 s with the lock waits
+[batch-hold] 2026-10-09T20:01:05Z gate_qwen4exp_e2e waits: a landing batch holds the GPUs (/root/bloomery-batch.gpuhold, owner gb_bloomery_train029a_44104_1791575730, up 311 s, refreshed 9 s ago), holding no lock; 300 s so far, at most 1800 s with the lock waits
+[batch-hold] 2026-10-09T20:02:05Z gate_qwen4exp_e2e waits: a landing batch holds the GPUs (/root/bloomery-batch.gpuhold, owner gb_bloomery_train029a_44104_1791575730, up 371 s, refreshed 9 s ago), holding no lock; 360 s so far, at most 1800 s with the lock waits
+error: recipe `gate-gpu-qwen4exp-e2e` failed on line 859 with exit code 255
+local_rc=255 wall=531

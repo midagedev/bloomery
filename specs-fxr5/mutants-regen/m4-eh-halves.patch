@@ -1,0 +1,20 @@
+--- a/crates/gpu/src/mtp.rs
++++ b/crates/gpu/src/mtp.rs
+@@ -157,7 +157,7 @@
+             // <= out.len(), and value i of row t is this thread's alone.
+             unsafe {
+                 let v = (*e.get_unchecked(t * hid + i) * re) * *enorm.get_unchecked(i);
+-                let base = t * STREAMS * pitch + i;
++                let base = t * STREAMS * pitch + hid + i;
+                 *out.get_unchecked_mut(base) = v;
+                 *out.get_unchecked_mut(base + pitch) = v;
+                 *out.get_unchecked_mut(base + 2 * pitch) = v;
+@@ -173,7 +173,7 @@
+             // out.len(), and value j of row t is this thread's alone.
+             unsafe {
+                 let v = (*h.get_unchecked(t * wide + j) * rh) * *hnorm.get_unchecked(j);
+-                *out.get_unchecked_mut((t * STREAMS + s) * pitch + hid + i) = v;
++                *out.get_unchecked_mut((t * STREAMS + s) * pitch + i) = v;
+             }
+             j += INPUT_THREADS;
+         }

@@ -1,0 +1,103 @@
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e --bin gate_qwen4exp_mtp...
+
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling thiserror v2.0.21
+   Compiling cfg-if v1.0.5
+   Compiling libc v0.2.190
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling glob v0.3.4
+   Compiling prettyplease v0.2.37
+   Compiling rustix v0.38.44
+   Compiling minimal-lexical v0.2.1
+   Compiling memchr v2.8.3
+   Compiling regex-syntax v0.8.11
+   Compiling bitflags v2.13.2
+   Compiling linux-raw-sys v0.4.15
+   Compiling either v1.19.0
+   Compiling libloading v0.8.9
+   Compiling nom v7.1.3
+   Compiling generic-array v0.14.7
+   Compiling bindgen v0.69.5
+   Compiling clang-sys v1.9.1
+   Compiling serde_core v1.0.229
+   Compiling home v0.5.12
+   Compiling itertools v0.12.1
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling regex-automata v0.4.18
+   Compiling digest v0.10.7
+   Compiling memmap2 v0.9.11
+   Compiling crc32fast v1.5.2
+   Compiling cpufeatures v0.2.17
+   Compiling shlex v1.3.0
+   Compiling rustc-hash v1.1.0
+   Compiling log v0.4.34
+   Compiling lazycell v1.3.0
+   Compiling lazy_static v1.5.1
+   Compiling zerocopy v0.8.61
+   Compiling bloomery-levers v0.1.0 (/root/repo/bloomery-fxr5/crates/levers)
+   Compiling which v4.4.2
+   Compiling cexpr v0.6.0
+   Compiling hashbrown v0.17.1
+   Compiling object v0.36.7
+   Compiling equivalent v1.0.2
+   Compiling foldhash v0.1.5
+   Compiling hashbrown v0.15.5
+   Compiling regex v1.13.1
+   Compiling indexmap v2.14.2
+   Compiling sha2 v0.10.9
+   Compiling anyhow v1.0.104
+   Compiling serde v1.0.229
+   Compiling bloomery-threads v0.1.0 (/root/repo/bloomery-fxr5/crates/threads)
+   Compiling cuda-target-spec v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling cuda-core v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling reserved-oxide-symbols v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling ptx-parse v0.1.0 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling itoa v1.0.18
+   Compiling sha1 v0.10.7
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+   Compiling oxide-artifacts v0.2.1
+   Compiling zerocopy-derive v0.8.61
+   Compiling cuda-core-derive v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling cuda-macros v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling bloomery-gguf v0.1.0 (/root/repo/bloomery-fxr5/crates/gguf)
+   Compiling bloomery-models v0.1.0 (/root/repo/bloomery-fxr5/crates/models)
+   Compiling libnvvm-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling nvjitlink-sys v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling bloomery-placement v0.1.0 (/root/repo/bloomery-fxr5/crates/placement)
+   Compiling bloomery-runtime v0.1.0 (/root/repo/bloomery-fxr5/crates/runtime)
+   Compiling bloomery-qdot v0.1.0 (/root/repo/bloomery-fxr5/crates/qdot)
+   Compiling bloomery-tokenizer v0.1.0 (/root/repo/bloomery-fxr5/crates/tokenizer)
+   Compiling cuda-artifact-finalizer v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling bloomery-engram v0.1.0 (/root/repo/bloomery-fxr5/crates/engram)
+   Compiling bloomery-model v0.1.0 (/root/repo/bloomery-fxr5/crates/model)
+   Compiling bloomery-refset v0.1.0 (/root/repo/bloomery-fxr5/crates/refset)
+   Compiling bloomery-hf v0.1.0 (/root/repo/bloomery-fxr5/crates/hf)
+   Compiling cuda-bindings v0.4.0 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling half v2.7.1
+   Compiling cuda-host v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling cuda-device v0.2.1 (https://github.com/midagedev/cuda-oxide.git?rev=4da6c138448538ca12218cb80924c070417ab419#4da6c138)
+   Compiling bloomery-gpu v0.1.0 (/root/repo/bloomery-fxr5/crates/gpu)
+   Compiling bloomery-app v0.1.0 (/root/repo/bloomery-fxr5/crates/app)
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+   Compiling bloomery-gpu-gates v0.2.9 (/root/repo/bloomery-fxr5/crates/gpu-gates)
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 14s
+
+✓ Cargo build succeeded
+build_rc=0
+1791574915
+local_rc=0 wall=195

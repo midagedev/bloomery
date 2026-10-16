@@ -1,0 +1,47 @@
+BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_mtp'
+=========================================
+RUSTC-CODEGEN-CUDA CARGO build
+=========================================
+
+Running cargo build -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp...
+
+warning: `DynamicSharedArray` returns CUDA dynamic shared memory; make sure the kernel launch config provides enough `shared_mem_bytes`
+
+warning: `bloomery-gpu` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.05s
+
+✓ Cargo build succeeded
+gpu-gate.sh: gate_qwen4exp_mtp on the 3090 (asked any), tier fixture: no V4.1 load lock
+derived model file = "/models/fixtures/qwen38/qwen38-fixture-00001-of-00001.gguf" (the real file's "/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
+derived draft file = "/models/fixtures/qwen38/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" (the real file's "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf")
+derived draft layer = 4 (the real file's 48)
+derived card budget = Some(9489612800) (the real file's None)
+derived card bytes (total, driver reserve, device, free, holders) = (25769803776, 419430400, Some(DeviceId { ordinal: 0, uuid: [48, 127, 160, 246, 218, 174, 36, 229, 111, 211, 205, 80, 98, 13, 230, 177] }), Some(25073352704), None) (the real file's (25769803776, 419430400, None, None, None))
+named difference: the card's name "3090", the old literal's "3090"
+(o) /root/fxr5-data/ref-mtp/qwen4exp_prose64_n64_k1: 36 graphs over 34 blocks, prompt 64 ids, family mtp-qwen4exp PASS
+bands: eh 1.2858e-2 router 2.2271e-2 the argmax cap's 3.6369e-2 free 0.10; the node-local pins: γ(k/32 + 5) a dot, the pack ½γ(52) + 6u = 1.907e-6, the mixes MIXED_BAND 3.0e-5, the combines' weights LO_BAND 1.0e-5
+(u) unset: head list of 65536 rows from shipped (BLOOMERY_MTP_HEAD_ROWS unset: the shipped list kohangul-65536, the target's tokenizer its own); the list's first line "# bloomery mtp-head-rows 1 vocab=248320 rows=65536 vocab_sha256=b7f4906b5bf6a845baf3f41fdcdcd70f0f2f234eb702aabb830ce1536604e5d6", the target's tokenizer b7f4906b5bf6a845baf3f41fdcdcd70f0f2f234eb702aabb830ce1536604e5d6 PASS
+(u) full: head full of 248320 rows from set (BLOOMERY_MTP_HEAD_ROWS=full) PASS
+plan card=3090 ctx_max=3072 card_budget=Some(12335442092) (the draft's card bytes 2845829292 in it) draft dense=98715648 experts=2673868800 rounding=12433408 kv=6291456 map=993280 arena=53526700 headroom=4977337312
+load host_tier r8=off (no sidecar at /models/fixtures/qwen38-r8/qwen38-fixture-r8.gguf; optional: a source checkout writes it with just r8-sidecar)
+load host_tier type=q5_K k=2560 path=fused
+load host_tier type=q8_0 k=640 path=fused
+load host_tier type=q4_K k=2560 path=fused
+load host_tier type=q5_1 k=640 path=fused
+load card=3090 ctx_max=3072 resident_bytes=6694415504 in 6.5 s; the draft program's arena 53526700 bytes (runtime value, outside the plan)
+(d) draft resident 2779869184 (want 2779869184: weights 2772584448 + store 6291456 + map 993280) PASS
+(d) token_embd.weight read at [703b00000000, 703b26000000], the target's at Some([703b00000000, 703b26000000]) PASS
+(d) output.weight read at [703e60000000, 703e86000000], the target's at Some([703e60000000, 703e86000000]) PASS
+(d) the draft program's arena 53526700 (the plan's 53526700) PASS
+(d) the walk's borrow resolves: PASS
+(d) head map: 248320 words (output's 248320 rows), 40960 rows, the list's ids then 0 PASS (want 40960)
+(q) a draft with its own matrices: qwen4exp Mtp38: source File { first_shard: "/models/fixtures/qwen38/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", bytes: 2775621632, borrows: Borrows { embedding: false, head: false } }: the load borrows the target's token_embd and output (a shared draft file) PASS
+(q) a plan of another row map: qwen4exp Mtp38: resident weights, store and row map hold [2772584448, 6291456, 993280] bytes; the plan has [2772584448, 6291456, 993284] PASS
+(d) the drafting load's budget: card experts a layer alone (Some(256), Some(256)) and drafted (Some(256), Some(256)) under Some(12335442092) + the draft's 2845829292 B (want 256 on every layer both ways: half the experts) PASS
+(f) the draft's own row before any walk: qwen4exp Mtp38: a walk before the draft's own row PASS
+fixture-oracle: (elhfx) every graph of ik's fixture set replayed: eh_proj, routes, l_out and the argmax against ik's
+gate_qwen4exp_mtp: fixture oracle (elhfx) every graph of ik's fixture set replayed: eh_proj, routes, l_out and the argmax against ik's: stale set: stale reference: /root/fxr5-data/ref-mtp/fx_qwen4exp_prose64_n64_k1 was dumped from /models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf, the tree runs /models/fixtures/qwen38/qwen38-fixture-00001-of-00001.gguf; dump it again with `BLOOMERY_TIER=fixture just dump-ref-mtp-fixture qwen4exp`
+  caused by: stale reference: /root/fxr5-data/ref-mtp/fx_qwen4exp_prose64_n64_k1 was dumped from /models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf, the tree runs /models/fixtures/qwen38/qwen38-fixture-00001-of-00001.gguf
+GPU GATE RED: gate_qwen4exp_mtp (exit 1)
+error: recipe `gate-gpu-qwen4exp-mtp` failed on line 885 with exit code 1
+local_rc=1 wall=13
