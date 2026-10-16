@@ -24,6 +24,9 @@
 //!   (`lane_partial_host::<Nvfp4>` per lane, the warp butterfly, the multiply
 //!   by the scale).
 //!
+//! A weight whose `.scale` sits in another shard of a split loads with that scale
+//! (`two_shards`).
+//!
 //! And the load's refusals, each by name: a scale that is NaN, a tensor with
 //! no `.scale` beside it, and a scale byte UE4M3 does not define (0x7F).
 //!
@@ -52,15 +55,15 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::mxfp4::{NV_BLOCK_BYTES, NV_BLOCK_VALUES, Nvfp4, lane_partial_host};
     use bloomery_gpu::site::{self, KGemvKernels, SiteTy};
-    use bloomery_gpu::weights::Weights;
+    use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{Gpu, Q8Act};
     use bloomery_gpu_gates::act_rule::{Q8_1_BLOCK, q8_1_codes};
     use bloomery_gpu_gates::rounding::{U64, butterfly, gamma};
     use bloomery_gpu_gates::{GateError, GateRng, checks_failed, par_map, verdict};
     use cuda_core::DeviceBuffer;
-    use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row};
     use gguf::write::{Layout, TensorDecl, Writer};
+    use gguf::{Split, Value};
     use std::path::Path;
 
     /// A Bolt Mamba-2 projection: its tensor stem, rows, row width, the
@@ -116,8 +119,8 @@ mod gate {
     /// One tensor of a synthetic file: name, dims, type, bytes.
     type Decl = (String, Vec<u64>, GgmlType, Vec<u8>);
 
-    /// Write `decls` as a GGUF at `path`.
-    fn write_gguf(path: &Path, decls: &[Decl]) -> Result<(), GateError> {
+    /// Write `decls` as a GGUF at `path`, with the metadata `kvs`.
+    fn write_gguf(path: &Path, kvs: &[(String, Value)], decls: &[Decl]) -> Result<(), GateError> {
         let tensors = decls
             .iter()
             .map(|(name, dims, ty, bytes)| TensorDecl {
@@ -127,7 +130,7 @@ mod gate {
                 nbytes: bytes.len() as u64,
             })
             .collect();
-        let layout = Layout::new(&[], tensors).map_err(|e| format!("nvfp4 gguf: {e}"))?;
+        let layout = Layout::new(kvs, tensors).map_err(|e| format!("nvfp4 gguf: {e}"))?;
         let file = std::io::BufWriter::new(std::fs::File::create(path)?);
         let mut w = Writer::new(file, layout).map_err(|e| format!("nvfp4 gguf: {e}"))?;
         for (name, _, _, bytes) in decls {
@@ -187,7 +190,7 @@ mod gate {
         let mut undefined = small(9);
         undefined[5 * NV_BLOCK_BYTES + 1] = 0x7F;
         decls.extend(weight_decls("undef", 8, 256, undefined, 1.0));
-        write_gguf(&path, &decls)?;
+        write_gguf(&path, &[], &decls)?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let stream = gpu.stream();
         let kk = KGemvKernels::load(gpu)?;
@@ -215,7 +218,40 @@ mod gate {
             );
             ok &= pass;
         }
+        ok &= two_shards(gpu, dir)?;
         Ok(ok)
+    }
+
+    /// A weight in shard 0 of a two-shard split whose `.scale` is in shard 1 loads with that scale:
+    /// the scale is found across the split, not in the weight's own shard.
+    fn two_shards(gpu: &Gpu, dir: &Path) -> Result<bool, GateError> {
+        const SCALE: f32 = 0.625;
+        let [weight, scale] = weight_decls("x2", 8, 256, nvfp4_bytes(8, 256, 11), SCALE);
+        let keys = |no: u16| {
+            vec![
+                ("split.no".to_string(), Value::U16(no)),
+                ("split.count".to_string(), Value::U16(2)),
+                ("split.tensors.count".to_string(), Value::I32(2)),
+            ]
+        };
+        let first = dir.join("x2-00001-of-00002.gguf");
+        write_gguf(&first, &keys(0), &[weight])?;
+        write_gguf(&dir.join("x2-00002-of-00002.gguf"), &keys(1), &[scale])?;
+        let split = Split::open(&first).map_err(|e| format!("open {}: {e}", first.display()))?;
+        let got = match Weights::load_where(gpu.stream(), &split, |n| n == "x2.weight") {
+            Ok(w) => match w.get("x2.weight") {
+                Some(DevWeight::Nvfp4 { scale, .. }) => format!("scale {scale}"),
+                other => format!("not an NVFP4 weight: {}", other.is_some()),
+            },
+            Err(e) => e.to_string(),
+        };
+        let want = format!("scale {SCALE}");
+        let pass = got == want;
+        println!(
+            "nvfp4 clause=two_shards tensor=x2.weight want={want:?} got={got:?} {}",
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// One shape at each of its column counts: the clauses of the module doc.

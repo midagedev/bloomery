@@ -323,7 +323,10 @@ impl Weights {
             })?;
             by_name.insert(
                 t.name.clone(),
-                upload_file_tensor_with(&mut ring, stream, gguf, t)?,
+                upload_file_tensor_with(&mut ring, stream, gguf, t, |n| {
+                    let (s, info) = split.find(n)?;
+                    Some((split.shard(s)?, info))
+                })?,
             );
         }
         ring.finish(stream)?;
@@ -1008,17 +1011,20 @@ pub fn upload_file_tensor(
     t: &TensorInfo,
 ) -> Result<DevWeight, GpuError> {
     let mut ring = UploadRing::new(stream, upload_budget(t))?;
-    let dw = upload_file_tensor_with(&mut ring, stream, gguf, t)?;
+    let dw = upload_file_tensor_with(&mut ring, stream, gguf, t, |n| Some((gguf, gguf.find(n)?)))?;
     ring.finish(stream)?;
     Ok(dw)
 }
 
-/// [`upload_file_tensor`] on a caller's ring, which the caller synchronizes.
-fn upload_file_tensor_with(
+/// [`upload_file_tensor`] on a caller's ring, which the caller synchronizes. `find` resolves a
+/// tensor of the file by name (its shard and entry), so an NVFP4 weight's `.scale` may sit in
+/// another shard of the split.
+fn upload_file_tensor_with<'g>(
     ring: &mut UploadRing,
     stream: &CudaStream,
     gguf: &Gguf,
     t: &TensorInfo,
+    find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
 ) -> Result<DevWeight, GpuError> {
     let Some(format) = CardFormat::of(t.ty) else {
         return Err(GpuError::shape(
@@ -1026,7 +1032,7 @@ fn upload_file_tensor_with(
             format!("tensor {} has type {} with no device format", t.name, t.ty),
         ));
     };
-    let scale = tensor_scale("Weights::load", t, |n| Some((gguf, gguf.find(n)?)))?;
+    let scale = tensor_scale("Weights::load", t, find)?;
     upload_rows(
         stream,
         ring,

@@ -2902,14 +2902,9 @@ mod gate {
         use bloomery_gpu::kquant::{SelDown, walk_a_planes};
         use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
         use bloomery_gpu_gates::GateError;
-        use bloomery_gpu_gates::iq_rows::seeded_blocks;
+        use bloomery_gpu_gates::iq_rows::{BOLT_SHARED, seeded_blocks};
         use cuda_core::{CudaStream, DeviceBuffer};
         use gguf::quant::GgmlType;
-
-        /// Bolt's shared expert: hidden and width.
-        const SHARED: (usize, usize) = (4096, 5376);
-        /// IQ2_XXS bytes per 256 values.
-        const BB: usize = 66;
 
         /// Whether `op` runs under `only` (an exact arm name, or `iq2xxs` for
         /// every arm).
@@ -2960,7 +2955,7 @@ mod gate {
             let mut ran = false;
 
             let iq = IqKernels::load(gpu.context())?;
-            let (hidden, width) = SHARED;
+            let (hidden, width) = BOLT_SHARED;
             for (op, rows, k) in [
                 ("iq2xxs_5376", width, hidden),
                 ("iq2xxs_4096", hidden, width),
@@ -2975,7 +2970,10 @@ mod gate {
                 let a = act(gpu, 1, k)?;
                 let (q4, _s8, d8) = walk_a_planes(&a);
                 let mut y = DeviceBuffer::<f32>::zeroed(s, rows)?;
-                let bytes = (rows * k / 256 * BB + q4.len() * 4 + d8.len() * 4 + rows * 4) as u64;
+                let bytes = (rows * k / 256 * IqFormat::Iq2Xxs.block_bytes()
+                    + q4.len() * 4
+                    + d8.len() * 4
+                    + rows * 4) as u64;
                 arm(gpu, op, rows, bytes, &mut |cs| {
                     iq.enqueue_rows(cs, &w, q4, d8, 1, &mut y)
                 })?;
@@ -2995,10 +2993,12 @@ mod gate {
                     }
                     ran = true;
                     let n_rows = n * rpe;
-                    let words =
-                        runtime::words::stream_words((n_rows * k / 256 * BB) as u64, n_rows as u64)
-                            .ok_or("gate_iq_sel: a stack of no rows")?
-                            as usize;
+                    let words = runtime::words::stream_words(
+                        (n_rows * k / 256 * IqFormat::Iq2Xxs.block_bytes()) as u64,
+                        n_rows as u64,
+                    )
+                    .ok_or("gate_iq_sel: a stack of no rows")?
+                        as usize;
                     let w = DeviceTensor::<u32>::upload(
                         s,
                         &fill_pattern(words),
@@ -3010,7 +3010,7 @@ mod gate {
                     let sel = DeviceBuffer::from_host(s, &ids)?;
                     let mut y = DeviceBuffer::<f32>::zeroed(s, BOLT_TOP * rpe)?;
                     let (q4, _s8, d8) = walk_a_planes(&a);
-                    let bytes = (BOLT_TOP * rpe * k / 256 * BB
+                    let bytes = (BOLT_TOP * rpe * k / 256 * IqFormat::Iq2Xxs.block_bytes()
                         + q4.len() * 4
                         + d8.len() * 4
                         + BOLT_TOP * rpe * 4) as u64;

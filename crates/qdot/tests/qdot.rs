@@ -2275,7 +2275,8 @@ const IQ2XXS_ENDS: [IqEnd; 8] = [
 /// against the ±3.0 and seeded columns — bit for bit.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn iq2xxs_kernel_matches_mirror() {
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_iq2xxs_kernel_matches_mirror() {
     generated_gate_a(GgmlType::IQ2_XXS, 66, 256, &[4096, 768, 256]);
     for k in [256, 768] {
         let nb = k / 256;
@@ -2846,7 +2847,8 @@ fn q2_0_dot_is_within_its_f64_bound() {
 /// one and three blocks against a `quantize_col` column, bit for bit.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn q2_0_kernel_matches_mirror() {
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_q2_0_kernel_matches_mirror() {
     generated_gate_a(GgmlType::Q2_0, 18, 64, &[2048, 64, 192]);
 }
 

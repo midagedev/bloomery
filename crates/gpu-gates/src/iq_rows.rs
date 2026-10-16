@@ -45,18 +45,16 @@ fn scale_offsets(fmt: IqFormat) -> &'static [usize] {
     }
 }
 
-/// `n` seeded blocks of `fmt` (xorshift64 from `seed`): every byte random,
+/// Bolt's shared expert input and intermediate widths.
+pub const BOLT_SHARED: (usize, usize) = (4096, 5376);
+
+/// `n` seeded blocks of `fmt` ([`crate::GateRng`] from `seed | 1`): every byte random,
 /// then each f16 scale a finite half of either sign in ±[2^-10, 2^-2)
 /// (exponent field 5..=12).
 #[must_use]
 pub fn seeded_blocks(fmt: IqFormat, n: usize, seed: u64) -> Vec<u8> {
-    let mut s = seed | 1;
-    let mut next = move || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        s
-    };
+    let mut rng = crate::GateRng(seed | 1);
+    let mut next = || rng.next();
     let bb = fmt.block_bytes();
     let mut v = vec![0u8; n * bb];
     for c in v.chunks_mut(8) {

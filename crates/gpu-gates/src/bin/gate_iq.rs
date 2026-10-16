@@ -49,7 +49,9 @@ mod gate {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
     use bloomery_gpu_gates::act_rule::q8_1_codes;
-    use bloomery_gpu_gates::iq_rows::{Col, SYNTH_K, dot_host, dot_ref, seeded_blocks, synth_rows};
+    use bloomery_gpu_gates::iq_rows::{
+        BOLT_SHARED, Col, SYNTH_K, dot_host, dot_ref, seeded_blocks, synth_rows,
+    };
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
     use cuda_core::DeviceBuffer;
     use gguf::quant::dequant_row;
@@ -63,9 +65,6 @@ mod gate {
     /// back as these bits.
     const SENT: f32 = 1.0e30;
 
-    /// Bolt's shared expert: hidden 4,096, width 5,376.
-    const BOLT_HIDDEN: usize = 4096;
-    const BOLT_SHARED: usize = 5376;
     /// The seeds of the shared expert's two stacks.
     const SEED_SHARED: [u64; 2] = [0xb017_5a2e_0001, 0xb017_5a2e_0002];
 
@@ -156,7 +155,7 @@ mod gate {
             },
         ];
         if fmt == IqFormat::Iq2Xxs {
-            for (i, (rows, k)) in [(BOLT_SHARED, BOLT_HIDDEN), (BOLT_HIDDEN, BOLT_SHARED)]
+            for (i, (rows, k)) in [(BOLT_SHARED.1, BOLT_SHARED.0), BOLT_SHARED]
                 .into_iter()
                 .enumerate()
             {

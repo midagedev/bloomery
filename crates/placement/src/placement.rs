@@ -671,7 +671,7 @@ pub enum Format {
 
 impl Format {
     /// Every format, at its rank ([`Format::rank`]).
-    const ALL: [Format; 10] = [
+    const ALL: [Format; 11] = [
         Format::Card(CardFormat::KQuant),
         Format::Card(CardFormat::Q5_0),
         Format::Card(CardFormat::Q5_1),
@@ -679,6 +679,7 @@ impl Format {
         Format::Card(CardFormat::F32),
         Format::Card(CardFormat::Bf16AsF32),
         Format::Card(CardFormat::Bf16Raw),
+        Format::Card(CardFormat::Nvfp4Planes),
         Format::HostFile,
         Format::NvmeFile,
         Format::Unused,
@@ -696,9 +697,10 @@ impl Format {
             Format::Card(CardFormat::F32) => 4,
             Format::Card(CardFormat::Bf16AsF32) => 5,
             Format::Card(CardFormat::Bf16Raw) => 6,
-            Format::HostFile => 7,
-            Format::NvmeFile => 8,
-            Format::Unused => 9,
+            Format::Card(CardFormat::Nvfp4Planes) => 7,
+            Format::HostFile => 8,
+            Format::NvmeFile => 9,
+            Format::Unused => 10,
         }
     }
 
