@@ -2747,15 +2747,25 @@ mod gate {
         ];
         let mut ok = true;
         for (case, e) in cases {
+            // The IQ2_XS case pins the refusal's own message: a stack-width error from
+            // stack_experts carries the same `what` and would otherwise pass this clause.
             let pass = matches!(
                 &e,
                 Some(GpuError::Shape {
                     what: "IqSelKernels::enqueue_gemv_sel_cols",
                     ..
-                })
+                }) if case != "iq2_xs_slots_per_col_9"
+                    || e.as_ref().is_some_and(|err| {
+                        err.to_string().contains("IQ2_XS reads 9 slots a column")
+                    })
             );
+            let want = if case == "iq2_xs_slots_per_col_9" {
+                "Err(Shape enqueue_gemv_sel_cols: IQ2_XS reads 9 slots a column)"
+            } else {
+                "Err(Shape enqueue_gemv_sel_cols)"
+            };
             println!(
-                "refuse_cols[{case}] want=Err(Shape enqueue_gemv_sel_cols) got=\"{}\" {}",
+                "refuse_cols[{case}] want={want} got=\"{}\" {}",
                 e.map_or_else(|| "Ok".to_string(), |e| e.to_string()),
                 verdict(pass)
             );
