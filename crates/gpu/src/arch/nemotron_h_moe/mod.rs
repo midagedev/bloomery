@@ -19,12 +19,14 @@
 //! output head a Q8_0 one ([`crate::head::Head`]). Every per-step value lives
 //! in device words refreshed before the enqueue or replay, so one captured
 //! graph serves every position. The body holds one sequence in one slot; a
-//! prompt is one step per token.
+//! prompt runs in passes of many rows ([`prefill`]).
 
 mod body;
 mod moe;
+mod prefill;
 pub mod router;
 
 pub use crate::arch::hybrid::DecodeInput;
 pub use body::Body;
 pub use moe::Routing;
+pub use prefill::PASS_ROWS;
