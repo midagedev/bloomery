@@ -12,7 +12,9 @@
 //! `width * m` spans; `rope` on `[n_dims, n_vec, m]` (column `c = t*n_vec +
 //! v`, the layout of the reference dump's `q_rope`/`k_rope` views);
 //! `weighted_sum` on `[rows, n_exp, m]` down-projections with `[n_exp, m]`
-//! weights; the embedding table is Q3_K rows of 2048 values (880 bytes = 220
+//! weights, and `weighted_sum_card` over the card's share of the same (the
+//! places `[n_exp, m]` beside the weights, the host's skipped); the embedding
+//! table is Q3_K rows of 2048 values (880 bytes = 220
 //! u32 words each), Q3_K, Q4_K, Q5_K or Q6_K rows of whole super-blocks, or
 //! Q5_0 rows in the `pack_q5_0` layout.
 //! Extents are launch arguments, never buffer lengths: scratch buffers may
@@ -544,18 +546,45 @@ pub(crate) unsafe fn weighted_expert_sum(
     t: usize,
     d: usize,
 ) -> f32 {
+    // SAFETY: every slot kept, so this fn's `# Safety` is the helper's.
+    unsafe { weighted_expert_sum_keep(down, w, rows, n_exp, t, d, |_| true) }
+}
+
+/// [`weighted_expert_sum`] over the slots `keep` names: the same loop with
+/// the refused slots' terms left out, their weight and down row unread. The
+/// kept slots' expression, order and contraction are the plain sum's own, so
+/// a caller that keeps every slot compiles to the plain sum's instructions;
+/// the loop is this one helper so the two entries cannot drift apart.
+///
+/// # Safety
+///
+/// [`weighted_expert_sum`]'s contract, for the slots `keep` names; the
+/// predicate's own reads are its caller's.
+#[inline(always)]
+pub(crate) unsafe fn weighted_expert_sum_keep(
+    down: &[f32],
+    w: &[f32],
+    rows: u32,
+    n_exp: u32,
+    t: usize,
+    d: usize,
+    mut keep: impl FnMut(usize) -> bool,
+) -> f32 {
     let rows = rows as usize;
     let n_exp = n_exp as usize;
     let mut acc = 0.0f32;
     let mut e = 0usize;
     while e < n_exp {
-        // SAFETY: e < n_exp and t < m bound the weight index t*n_exp + e
-        // inside `w` by this fn's `# Safety`.
-        let wv = unsafe { *w.get_unchecked(t * n_exp + e) };
-        // SAFETY: the same e < n_exp and t < m, with d < rows, bound the down
-        // index (t*n_exp + e)*rows + d inside `down` by this fn's `# Safety`.
-        let dv = unsafe { *down.get_unchecked((t * n_exp + e) * rows + d) };
-        acc += wv * dv;
+        if keep(e) {
+            // SAFETY: e < n_exp and t < m bound the weight index t*n_exp + e
+            // inside `w` by this fn's `# Safety`.
+            let wv = unsafe { *w.get_unchecked(t * n_exp + e) };
+            // SAFETY: the same e < n_exp and t < m, with d < rows, bound the
+            // down index (t*n_exp + e)*rows + d inside `down` by this fn's
+            // `# Safety`.
+            let dv = unsafe { *down.get_unchecked((t * n_exp + e) * rows + d) };
+            acc += wv * dv;
+        }
         e += 1;
     }
     acc
@@ -1215,6 +1244,72 @@ mod elem_kernels {
         // launch contract gives down.len() >= rows·n_exp·m and w.len() >=
         // n_exp·m.
         let v = unsafe { weighted_expert_sum(down, w, rows, n_exp, t, d) };
+        // SAFETY: i < rows*m <= y.len() by the launch contract.
+        unsafe {
+            *y.get_unchecked_mut(i) = v;
+        }
+    }
+
+    /// The routed-expert combine over the card's slots, one thread per
+    /// (token, output value): `weighted_sum`'s rule over the slots whose
+    /// place `sel[t*n_exp + e]` is below `n_card` — the same expression,
+    /// order and contraction, so with every slot on the card the two are bit
+    /// for bit equal. A place at [`HOST`] is the host's slot, skipped with
+    /// its down row and weight unread; a place in `[n_card, HOST)` names
+    /// neither a card slot nor the host: it raises [`FaultSite::ExpertId`]
+    /// on `fault` and every value of its token is NaN.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= rows * n_exp * m,
+            w.len() >= n_exp * m,
+            sel.len() >= n_exp * m,
+            y.len() >= rows * m
+        )
+    )]
+    pub fn weighted_sum_card(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        n_card: u32,
+        rows: u32,
+        n_exp: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= rows as usize * m as usize {
+            return;
+        }
+        let (t, d) = (i / rows as usize, i % rows as usize);
+        let mut faulted = false;
+        // SAFETY: i < rows·m (the guard above) gives t < m and d < rows; the
+        // launch contract gives down.len() >= rows·n_exp·m, w.len() >=
+        // n_exp·m and sel.len() >= n_exp·m.
+        let acc = unsafe {
+            weighted_expert_sum_keep(down, w, rows, n_exp, t, d, |e| {
+                // SAFETY: t < m and e < n_exp bound t·n_exp + e inside `sel`
+                // by the launch contract.
+                let place = unsafe { *sel.get_unchecked(t * n_exp as usize + e) };
+                let keep = place < n_card;
+                if !keep && place != HOST {
+                    faulted = true;
+                    if d == 0 {
+                        fault.raise(FaultSite::ExpertId);
+                    }
+                }
+                keep
+            })
+        };
+        let v = if faulted { f32::NAN } else { acc };
         // SAFETY: i < rows*m <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = v;
