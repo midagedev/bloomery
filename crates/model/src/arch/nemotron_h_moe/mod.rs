@@ -10,8 +10,8 @@
 //! llama.cpp's `src/models/nemotron-h.cpp`, which loads both architectures.
 
 pub mod fixture;
-pub mod hparams;
 pub mod host;
+pub mod hparams;
 pub mod names;
 pub mod place;
 pub mod roles;

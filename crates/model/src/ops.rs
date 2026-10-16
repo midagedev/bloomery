@@ -704,7 +704,9 @@ impl InputCombine<'_> {
     /// The combine of column `t` alone, into `out`.
     fn col_into(&self, t: usize, out: &mut [f32]) {
         match self {
-            InputCombine::Swiglu { gate, up, limit } => swiglu_into(gate.col(t), up.col(t), *limit, out),
+            InputCombine::Swiglu { gate, up, limit } => {
+                swiglu_into(gate.col(t), up.col(t), *limit, out)
+            }
             InputCombine::Relu2 { up } => relu2_into(up.col(t), out),
         }
     }
@@ -1647,7 +1649,12 @@ fn relu2_into(up: &[f32], out: &mut [f32]) {
 /// recorded under the combine's site. A plain pair is `ffn::swiglu_timed`
 /// itself; a clamped one is the same shape with the clamped call.
 fn combine_timed(combine: InputCombine<'_>) -> (Tensor2, u64) {
-    if let InputCombine::Swiglu { gate, up, limit: None } = combine {
+    if let InputCombine::Swiglu {
+        gate,
+        up,
+        limit: None,
+    } = combine
+    {
         return swiglu_timed(gate, up);
     }
     let lvl = profile::level();
@@ -1880,7 +1887,13 @@ fn group_core(
                 // dispatch joins — this shared ref only names the block for
                 // the slot table (metadata reads).
                 let par: &Tensor2 = unsafe { &*blk };
-                (SlotBlock::Par(par), Some(Combine { combine, par: write }))
+                (
+                    SlotBlock::Par(par),
+                    Some(Combine {
+                        combine,
+                        par: write,
+                    }),
+                )
             }
         };
         // The sharing rule — one quantized buffer per DISTINCT (input,
@@ -4752,7 +4765,8 @@ impl UnionRows<'_, '_> {
     fn split(&self, p: usize) -> (usize, usize) {
         match self.pass {
             UnionPass::GateUp => (p / 2, p % 2),
-            UnionPass::Up | UnionPass::Down => (p, if self.pass == UnionPass::Up { 1 } else { 0 }),
+            UnionPass::Up => (p, 1),
+            UnionPass::Down => (p, 0),
         }
     }
 
@@ -4847,10 +4861,7 @@ impl RowSet for UnionRows<'_, '_> {
                 (self.inputs[s], self.x_cols, Some(self.plan.cols(d))),
                 2 * o + s * m,
             ),
-            UnionPass::Up => (
-                (self.inputs[1], self.x_cols, Some(self.plan.cols(d))),
-                o,
-            ),
+            UnionPass::Up => ((self.inputs[1], self.x_cols, Some(self.plan.cols(d))), o),
             UnionPass::Down => {
                 // SAFETY: the method's contract — slots `o..o + m` are expert
                 // `d`'s, inside the combines' slab, which holds every slot of
@@ -5305,11 +5316,9 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         // A relu² layer's first pass reads the up alone: one pair an expert,
         // the up's slots the store's shape.
         let (pass, site, rec) = match self.form {
-            ExpertForm::Gated { .. } => (
-                UnionPass::GateUp,
-                "host_gate_up",
-                &[self.gate, self.up][..],
-            ),
+            ExpertForm::Gated { .. } => {
+                (UnionPass::GateUp, "host_gate_up", &[self.gate, self.up][..])
+            }
             ExpertForm::Relu2 => (UnionPass::Up, "host_up", &[self.up][..]),
         };
         // SAFETY (construction site, referenced by every access): the slabs are
@@ -6140,7 +6149,12 @@ mod tests {
             off: &[0, 1, 2],
             cols: &[0, 0],
         };
-        let e = match UnionCall::new(plan, [gate, up, down], x.view(), crate::ops::ExpertForm::Gated { limit: 0.0 }) {
+        let e = match UnionCall::new(
+            plan,
+            [gate, up, down],
+            x.view(),
+            crate::ops::ExpertForm::Gated { limit: 0.0 },
+        ) {
             Ok(_) => panic!("an id past the stacks must be refused"),
             Err(e) => e.to_string(),
         };

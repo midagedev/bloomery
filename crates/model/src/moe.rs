@@ -973,10 +973,7 @@ enum ExpertLegs<'w> {
     /// `[gate, up, down]`.
     Gated([Weight<'w>; 3]),
     /// The up and the down.
-    Relu2 {
-        up: Weight<'w>,
-        down: Weight<'w>,
-    },
+    Relu2 { up: Weight<'w>, down: Weight<'w> },
 }
 
 /// The host leg of one token: each listed expert's stacks from `weights`,
@@ -1619,8 +1616,8 @@ fn check_union_call(
     }
     if ff > scratch.ff || ops::col_bytes_max(ff) > ops::col_bytes_max(scratch.ff) {
         return Err(ModelError::Shape {
-            what: "host union: the scratch's expert width is a capacity: the scratch must be \
-                   made for the block's widths",
+            what: "host union: the scratch must be made for the block's widths (its expert \
+                   width is a capacity: the layer's ff at or below it, with room for its column)",
             want_ne0: embd,
             want_ne1: ff,
             got_ne0: scratch.embd,
@@ -1870,8 +1867,7 @@ fn serve_batched<'w>(
         for (i, &d) in order[span(g)].iter().enumerate() {
             slot[d as usize] = base + sub.off[i];
         }
-        let batch_call =
-            UnionCall::new(sub.view(), stacks, x, run.form)?.spread_over(run.lanes);
+        let batch_call = UnionCall::new(sub.view(), stacks, x, run.form)?.spread_over(run.lanes);
         batch_call.run_batch(&mut xqs, gu, qc, &mut store[base * embd..], None, passes)?;
         base += sub.cols.len();
         drop(pin);
@@ -2071,14 +2067,10 @@ pub struct HostLayerSpec<'a> {
 }
 
 /// What a host tier needs to serve one relu² layer's routed experts
-/// ([`ExpertForm::Relu2`]): the two stacks' tensor names, the expert count
-/// and the widths — `embd` the width the experts run in — and the name a
-/// gate stack would carry: the build refuses a file that holds one, so a
-/// gated file and a relu² layer never meet silently.
+/// ([`ExpertForm::Relu2`]): the two stacks' tensor names, the expert count and
+/// the widths — `embd` the width the experts run in, `ff` this layer's own.
+/// The architecture fills it; there is no gate name to give.
 pub struct Relu2Spec<'a> {
-    /// The name a gate stack would carry in this file, which it must not
-    /// hold.
-    pub gate: &'a str,
     pub up: &'a str,
     pub down: &'a str,
     pub n_expert: usize,
@@ -2535,6 +2527,13 @@ impl LayerTier {
     }
 }
 
+/// The tensor names a layer build reads; a relu² layer names no gate.
+struct StackNames<'a> {
+    gate: Option<&'a str>,
+    up: &'a str,
+    down: &'a str,
+}
+
 /// One layer's routed experts as a host tier serves them: its form
 /// ([`ExpertForm`]) and the stacks that form reads — gated, the gate and the
 /// up from the file or from its r8 sidecar and the down from the file; a
@@ -2570,7 +2569,12 @@ impl HostLayer {
     pub fn build(src: R8Source<'_>, spec: &HostLayerSpec<'_>) -> Result<HostLayer, ModelError> {
         Self::build_form(
             src,
-            (spec.gate, spec.up, spec.down, spec.n_expert, spec.embd, spec.ff),
+            StackNames {
+                gate: Some(spec.gate),
+                up: spec.up,
+                down: spec.down,
+            },
+            (spec.n_expert, spec.embd, spec.ff),
             ExpertForm::Gated {
                 limit: spec.swiglu_limit,
             },
@@ -2578,43 +2582,34 @@ impl HostLayer {
     }
 
     /// [`HostLayer::build`] for a relu² layer ([`Relu2Spec`]): the up and the
-    /// down checked as the gated build checks them, and the file refused by
-    /// name when it holds a gate stack where the spec names one — the form
-    /// and the file disagree. The form rides beside the spec like the r8
-    /// sidecar does: an activation fact the load resolves, not a property of
-    /// the layer's tensors.
+    /// down checked as the gated build checks them, no gate stack looked for.
+    /// The form rides beside the spec like the r8 sidecar does: an activation
+    /// fact the load resolves, not a property of the layer's tensors.
     pub fn build_relu2(src: R8Source<'_>, spec: &Relu2Spec<'_>) -> Result<HostLayer, ModelError> {
         Self::build_form(
             src,
-            (spec.gate, spec.up, spec.down, spec.n_expert, spec.embd, spec.ff),
+            StackNames {
+                gate: None,
+                up: spec.up,
+                down: spec.down,
+            },
+            (spec.n_expert, spec.embd, spec.ff),
             ExpertForm::Relu2,
         )
     }
 
     /// [`HostLayer::build`] and [`HostLayer::build_relu2`]'s one body over
-    /// the named stacks, the form's gate (`Some`: the gate is found, checked
-    /// and served) deciding which of them the layer holds.
+    /// the named stacks: a gate name (`Some`) is a stack the layer holds, found,
+    /// checked and served; `None`, one it does not.
     fn build_form(
         src: R8Source<'_>,
-        (gate, up, down, n_expert, embd, ff): (&str, &str, &str, usize, usize, usize),
+        names: StackNames<'_>,
+        (n_expert, embd, ff): (usize, usize, usize),
         form: ExpertForm,
     ) -> Result<HostLayer, ModelError> {
+        let StackNames { gate, up, down } = names;
         let split = src.split();
-        if let ExpertForm::Relu2 = form
-            && split.find(gate).is_some()
-        {
-            return Err(ModelError::Shape {
-                what: "host layer: a relu² layer's file holds no gate stack (the form and the \
-                       file disagree)",
-                want_ne0: 0,
-                want_ne1: 1,
-                got_ne0: 1,
-                got_ne1: 1,
-            });
-        }
-        let found = (matches!(form, ExpertForm::Gated { .. }))
-            .then(|| ShardTensor::find(split, gate))
-            .transpose()?;
+        let found = gate.map(|g| ShardTensor::find(split, g)).transpose()?;
         let up_stack = ShardTensor::find(split, up)?;
         let down_stack = ShardTensor::find(split, down)?;
         if let Some(gate) = &found {
@@ -2637,10 +2632,9 @@ impl HostLayer {
                     }
                     .into());
                 }
-                let gate = match found {
-                    Some(_) => Some(GateUp::R8(R8Stack::of(src, gate)?)),
-                    None => None,
-                };
+                let gate = gate
+                    .map(|g| R8Stack::of(src, g).map(GateUp::R8))
+                    .transpose()?;
                 (gate, GateUp::R8(R8Stack::of(src, up)?))
             }
         };
@@ -2651,11 +2645,7 @@ impl HostLayer {
             None => up.stack(split),
         };
         UnionStack::of_call(
-            &[
-                gate_stack()?,
-                up.stack(split)?,
-                down_stack.stack(split)?,
-            ],
+            &[gate_stack()?, up.stack(split)?, down_stack.stack(split)?],
             embd,
             ff,
         )?;
@@ -2748,9 +2738,7 @@ impl HostLayer {
     /// made of the layer, for a caller that holds it to that reading.
     pub fn layouts(&self) -> [RowLayout; 3] {
         [
-            self.gate
-                .as_ref()
-                .map_or(self.up.layout(), GateUp::layout),
+            self.gate.as_ref().map_or(self.up.layout(), GateUp::layout),
             self.up.layout(),
             RowLayout::Rows,
         ]
@@ -3469,23 +3457,18 @@ mod tests {
     }
 
     /// A one-file model in the temp dir holding one layer's relu² stacks
-    /// `{up,down}_exps` — and `gate_exps` when `gate`, for the refusal a file
-    /// that holds one is — of Q4_K, `n_expert` deep over widths `embd` and
-    /// `ff`; returns its path.
-    fn relu2_file(tag: &str, gate: bool, embd: usize, ff: usize, n_expert: usize) -> String {
-        let mut names = vec!["up_exps".to_string(), "down_exps".to_string()];
-        let mut dims = vec![[embd, ff, n_expert], [ff, embd, n_expert]];
-        if gate {
-            names.push("gate_exps".to_string());
-            dims.push([embd, ff, n_expert]);
-        }
+    /// `{up,down}_exps` of Q4_K, `n_expert` deep over widths `embd` and `ff`;
+    /// returns its path.
+    fn relu2_file(tag: &str, embd: usize, ff: usize, n_expert: usize) -> String {
+        let names = ["up_exps", "down_exps"];
+        let dims = [[embd, ff, n_expert], [ff, embd, n_expert]];
         let tensors: Vec<(TensorDecl, Vec<u8>)> = names
             .iter()
             .zip(&dims)
             .map(|(name, dims)| {
                 let b = stack_bytes(GgmlType::Q4_K, *dims, 0x5eed ^ name.len() as u64);
                 let decl = TensorDecl {
-                    name: name.clone(),
+                    name: (*name).to_string(),
                     dims: dims.map(|d| d as u64).to_vec(),
                     type_id: GgmlType::Q4_K.as_u32(),
                     nbytes: b.len() as u64,
@@ -3506,32 +3489,12 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
-    /// Layer `l`'s relu² spec over `gate`, `up` and `down` (the names the
-    /// files of [`relu2_file`] carry), at `embd` and `ff`.
-    fn relu2_spec<'a>(
-        gate: &'a str,
-        up: &'a str,
-        down: &'a str,
-        embd: usize,
-        ff: usize,
-    ) -> Relu2Spec<'a> {
-        Relu2Spec {
-            gate,
-            up,
-            down,
-            n_expert: 4,
-            embd,
-            ff,
-        }
-    }
-
-    /// A relu² layer's build and its refusals, each by name: a file that
-    /// holds a gate stack where the spec names one (the form and the file
-    /// disagree); a spec whose stacks carry other dims than it says; a
-    /// `Gated` spec whose file holds no gate (the find's own refusal); a
-    /// relu² layer that built reads its up again in the stacks' gate slot and
-    /// carries the relu² form; and a relu² layer with the NVMe tier attached
-    /// is refused by name at every entry that could reach one.
+    /// A relu² layer's build, by name: a spec whose stacks carry other dims
+    /// than it says is refused with the stack's own error; a `Gated` spec over
+    /// a file with no gate is refused by the find; a relu² layer that built
+    /// reads its up again in the stacks' gate slot and carries the relu²
+    /// form; and a relu² layer with the NVMe tier attached is refused by name
+    /// at every entry that could reach one.
     #[test]
     fn host_layer_build_relu2_refuses_by_name() {
         let (embd, ff, n_expert) = (256, 512, 4);
@@ -3542,32 +3505,21 @@ mod tests {
             );
             println!("relu2 refusal {want:?}: {got}");
         };
-
-        let path = relu2_file("gate-held", true, embd, ff, n_expert);
-        let split = gguf::Split::open(&path).unwrap();
-        check(
-            HostLayer::build_relu2(
-                R8Source::rows(&split),
-                &relu2_spec("gate_exps", "up_exps", "down_exps", embd, ff),
-            )
-            .err()
-            .expect("a file that holds a gate stack is refused")
-            .to_string(),
-            "a relu² layer's file holds no gate stack",
-        );
-        std::fs::remove_file(&path).unwrap();
-
-        let path = relu2_file("built", false, embd, ff, n_expert);
+        let spec = |embd, ff| Relu2Spec {
+            up: "up_exps",
+            down: "down_exps",
+            n_expert,
+            embd,
+            ff,
+        };
+        let path = relu2_file("built", embd, ff, n_expert);
         let split = gguf::Split::open(&path).unwrap();
         let src = R8Source::rows(&split);
         check(
-            HostLayer::build_relu2(
-                src,
-                &relu2_spec("stray", "up_exps", "down_exps", ff, embd),
-            )
-            .err()
-            .expect("a spec of other dims is refused")
-            .to_string(),
+            HostLayer::build_relu2(src, &spec(ff, embd))
+                .err()
+                .expect("a spec of other dims is refused")
+                .to_string(),
             "expert stack: expected [512, 256], got [256, 512]",
         );
         check(
@@ -3588,14 +3540,18 @@ mod tests {
             .to_string(),
             "tensor gate_exps is not in the file",
         );
-        let mut layer = HostLayer::build_relu2(
-            src,
-            &relu2_spec("gate_exps", "up_exps", "down_exps", embd, ff),
-        )
-        .expect("two stacks of Q4_K build");
-        assert_eq!(layer.form(), ExpertForm::Relu2, "the layer carries its form");
+        let mut layer =
+            HostLayer::build_relu2(src, &spec(embd, ff)).expect("two stacks of Q4_K build");
         assert_eq!(
-            (&layer.stacks()[0].info().name, &layer.stacks()[1].info().name),
+            layer.form(),
+            ExpertForm::Relu2,
+            "the layer carries its form"
+        );
+        assert_eq!(
+            (
+                &layer.stacks()[0].info().name,
+                &layer.stacks()[1].info().name
+            ),
             (&"up_exps".to_string(), &"up_exps".to_string()),
             "the gate slot holds the up again"
         );

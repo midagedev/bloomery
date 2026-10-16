@@ -2595,6 +2595,14 @@ gate-nemotron-meta:
 gate-nemotron-h-moe-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::nemotron_h_moe --nocapture && bash tools/gate.sh --release -p bloomery-model --test nemotron_h_moe_meta -- --ignored --nocapture'
 
+# The Bolt file's routed experts on the host tier (arch::nemotron_h_moe::host, the relu² form of the common union): every
+# layer of the 24GB GGUF at the box's path through `host::layer` (a MoE layer builds as relu² at its own expert count and
+# width, a Mamba-2 or attention layer as none, a layer past the model refused by name), then the file's narrowest and widest
+# MoE layer through one union scratch made for the widest, at one column and nine, equal to experts_into bit for bit under
+# both deferral arms. Reads the stacks of the experts the columns list: seconds.
+gate-nemotron-h-moe-host:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test nemotron_h_moe_host -- --ignored --nocapture'
+
 # gemma-embedding2 (EmbeddingGemma 2) header gate: the reader's refusals on synthetic headers (a full
 # layer at the sliding head, a missing tensor, another pooling, causal attention, a key head count
 # that does not divide the heads, an odd rope, another tokenizer, a missing key) and the coverage
