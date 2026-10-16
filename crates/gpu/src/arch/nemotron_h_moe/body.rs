@@ -184,8 +184,8 @@ impl Body {
             })
             .max()
             .unwrap_or(0);
-        let prompt = Prompt::new(stream, PASS_ROWS.min(ctx), (&sh, moe, hp.n_head), &layers)?;
-        derive_q8(stream, file, w, &layers)?;
+        let mut prompt = Prompt::new(stream, PASS_ROWS.min(ctx), (&sh, moe, hp.n_head), &layers)?;
+        prompt.twins = derive_q8(gpu, file, w, &layers)?;
         let ctx_ = gpu.context();
         Ok(Body {
             prompt,
