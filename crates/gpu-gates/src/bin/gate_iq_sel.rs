@@ -2827,7 +2827,7 @@ mod gate {
         let odd = bolt_stack(2, 64, 768, 0xb017_4ef6);
         let (wo, po) = (odd.upload(s, false)?, plane_of(&odd)?);
         let xo = seeded(9 * 768, 9601, -2.0, 4.0);
-        let (act_o, _c) = slot_act(c, &xo, 768, 1, 1)?;
+        let (act_o, _c) = slot_act(c, &xo, 768, 9, 9)?;
         let sel_o = bolt_sel(1, 2);
         let (yo_f, fo) = sel_cols(c, &wo, &act_o, &sel_o, 64, 1)?;
         let sel_o_dev = DeviceBuffer::from_host(s, &sel_o)?;
