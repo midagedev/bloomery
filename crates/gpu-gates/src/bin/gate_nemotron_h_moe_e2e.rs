@@ -75,6 +75,28 @@
 //!   more, all but the last id through `prefill`, the last as one step, under
 //!   the same gate: this holds the scan states, the conv rings and the K/V rows
 //!   a pass leaves to the step after it. A one-id prompt is skipped by name.
+//! - `prefill_edges` (fixture oracle) and `prefill_edges_real` (oracle): every
+//!   prompt of three ids or more through `prefill_with` at each of its pass
+//!   cuts — 1 and 2 rows, 8 (the last cut whose every pass stays on the
+//!   multi-column gemv arm), 9 (the first whose first pass takes the GEMM arm),
+//!   n − 1, ⌈n/2⌉ and [`PASS_ROWS`], each clamped to the prompt buffers' rows
+//!   and deduplicated — under the same gate per tier as
+//!   `prefill_near_mainlines`, one line a cut. The cuts at 8 and 9 rows run
+//!   only on a prompt past nine ids; in the real tier a prompt past
+//!   [`GEMV_CUT_MAX_IDS`] ids leaves its cuts at 1 and 2 rows out. What the
+//!   cuts hold: the second pass's position, the scan states, the conv rings
+//!   and the K/V rows carried over a cut, and the head's read after a last
+//!   pass of one row. A prompt of under three ids is skipped by name.
+//!
+//! Every prompt-path line prints beside its verdict how many MoE layers of the
+//! run and of the step path kept mainline's experts, and the run's first MoE
+//! layer whose kept experts differ from mainline's under the routing clause's
+//! band ([`Routed::Crossed`] with its worst gap/band, anything else `Other`, or
+//! `routes = mainline`); at the cuts of 1 and 8 rows it prints whether the
+//! run's logits are bit-identical to the step path's, with the first differing
+//! value. On the real tier every run prints its logits against the step path's
+//! own — the cosine and the max |Δ| of the two paths with mainline out of it.
+//! These are printed facts, never verdicts.
 //!
 //! A set absent from the box, dumped from another fixture or build, or
 //! unfinished ends the gate by name before the card loads.
@@ -95,7 +117,7 @@ mod e2e;
 #[cfg(feature = "gpu")]
 mod gate {
     use crate::e2e::{Run, argmax, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
-    use bloomery_gpu::arch::nemotron_h_moe::Routing;
+    use bloomery_gpu::arch::nemotron_h_moe::{PASS_ROWS, Routing};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -123,8 +145,14 @@ mod gate {
     /// Tokens of the walk every own-contract clause runs.
     const PROMPT_LEN: usize = 16;
 
+    /// The most ids a prompt holds for its cuts at 1 and 2 rows in the real
+    /// tier of the edges clause. Past it they are left out: on the real file a
+    /// 4096-id prompt is 4096 single-row passes at 1 row and 2048 at 2, and
+    /// the clause stays inside the gate's bound without them.
+    const GEMV_CUT_MAX_IDS: usize = 1024;
+
     /// The fixture-oracle clauses the gate declares.
-    const FIXTURE_ORACLE: usize = 5;
+    const FIXTURE_ORACLE: usize = 6;
 
     /// What a clause is run over: the layer kinds and expert counts the
     /// file's header names, the walk, and in the fixture tier the set and
@@ -134,6 +162,10 @@ mod gate {
         walk: Vec<u32>,
         /// Each MoE layer's selection bias, from the file, in layer order.
         bias: Vec<Vec<f32>>,
+        /// The most rows one pass of the prompt path takes, `PASS_ROWS` at
+        /// this gate's context: what `prefill` runs and the edges clause's
+        /// cuts are clamped to.
+        pass_rows: usize,
         mainline: Option<Mainline>,
     }
 
@@ -214,6 +246,8 @@ mod gate {
             Tag::Oracle,
             prefill_then_step_near_mainlines_real,
         ),
+        ("prefill_edges", Tag::FixtureOracle, prefill_edges),
+        ("prefill_edges_real", Tag::Oracle, prefill_edges_real),
         ("fault_word_clean", Tag::SelfConsistency, fault_word_clean),
     ];
 
@@ -547,6 +581,106 @@ mod gate {
         }))
     }
 
+    /// How many MoE layers keep mainline's set at the last position, or
+    /// `None` when the set carries no routes.
+    fn kept_routes(
+        ml: &Mainline,
+        p: &refset::nemotron::Prompt,
+        run: &SetRun,
+    ) -> Result<Option<usize>, GateError> {
+        let Some(want) = ml.set.routes(p)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            run.routes
+                .iter()
+                .zip(&want)
+                .filter(|(r, w)| {
+                    let mut a = r.ids.clone();
+                    let mut b = (*w).clone();
+                    a.sort_unstable();
+                    b.sort_unstable();
+                    a == b
+                })
+                .count(),
+        ))
+    }
+
+    /// The band eps the routing clause and the prompt-path lines share: the
+    /// body's worst max |Δ| against mainline relative to the peak |logit|,
+    /// over the prompts the tier reads — every one in the real tier, those
+    /// that kept mainline's experts in every layer in the fixture tier.
+    fn band_eps(ml: &Mainline, real: bool) -> Result<f32, GateError> {
+        let mut eps = 0.0f32;
+        for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
+            if let Some(run) = run
+                && (real || same_routes(ml, p, run)?)
+            {
+                let want = ml.set.logits(p)?;
+                let (_, max_delta) = compare(&run.logits, &want);
+                let peak = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                eps = eps.max((max_delta / f64::from(peak)) as f32);
+            }
+        }
+        Ok(eps)
+    }
+
+    /// The run's first MoE layer whose kept experts differ from mainline's,
+    /// under the routing clause's band ([`routed`] at [`band_eps`]): the
+    /// layer's index in the file with `Crossed` and its worst gap/band, the
+    /// index with `Other` for a difference past the band, or that every layer
+    /// kept mainline's set. A printed fact, never a verdict.
+    fn first_divergence(
+        case: &Case,
+        p: &refset::nemotron::Prompt,
+        run: &SetRun,
+        ml: &Mainline,
+        eps: f32,
+    ) -> Result<String, GateError> {
+        let Some(want) = ml.set.routes(p)? else {
+            return Ok("the set carries no routes".to_string());
+        };
+        for (((l, r), want), bias) in moe_layers(&case.hp)
+            .iter()
+            .zip(&run.routes)
+            .zip(&want)
+            .zip(&case.bias)
+        {
+            match routed(r, want, &ranked(r, bias), eps) {
+                Routed::Same => continue,
+                Routed::Crossed { worst, .. } => {
+                    return Ok(format!("first divergence L{l} Crossed gap/band {worst:.2}"));
+                }
+                Routed::Differs { .. } => return Ok(format!("first divergence L{l} Other")),
+            }
+        }
+        Ok("routes = mainline".to_string())
+    }
+
+    /// Whether the run's logits are the step path's bits, and the first value
+    /// that differs when they are not: a printed fact, never a verdict.
+    fn bits_vs_step(run: &SetRun, step: &SetRun) -> String {
+        if run.logits.len() != step.logits.len() {
+            return format!(
+                "bits = step: no ({} logits, the step path's {})",
+                run.logits.len(),
+                step.logits.len()
+            );
+        }
+        let at = run
+            .logits
+            .iter()
+            .zip(&step.logits)
+            .position(|(a, b)| a.to_bits() != b.to_bits());
+        match at {
+            None => "bits = step: yes".to_string(),
+            Some(i) => format!(
+                "bits = step: no (first differing index {}, got {:.4}, want {:.4})",
+                i, run.logits[i], step.logits[i]
+            ),
+        }
+    }
+
     /// Both tiers' body: the cosine of the last-position logits at least
     /// [`COSINE_FLOOR`]. The fixture tier gates only the prompts whose every
     /// MoE layer kept mainline's set — a prompt where a pick crossed at the
@@ -738,17 +872,7 @@ mod gate {
             );
             return Ok(false);
         }
-        let mut eps = 0.0f32;
-        for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
-            if let Some(run) = run
-                && (real || same_routes(ml, p, run)?)
-            {
-                let want = ml.set.logits(p)?;
-                let (_, max_delta) = compare(&run.logits, &want);
-                let peak = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-                eps = eps.max((max_delta / f64::from(peak)) as f32);
-            }
-        }
+        let eps = band_eps(ml, real)?;
         if eps == 0.0 && !real {
             println!("{clause}: no prompt kept mainline's experts in every layer, no band FAIL");
             return Ok(false);
@@ -890,19 +1014,29 @@ mod gate {
     // ------------------------------------------------- the prompt path
 
     /// The body after the set's prompt `p` from a reset with every id but the
-    /// last `tail` through `prefill` and those `tail` as steps, the MoE
-    /// layers' routing read back, or `None` after a line naming the fault.
+    /// last `tail` through the prompt path — `rows` a pass, `None` running
+    /// `prefill` at its own rows — and those `tail` as steps, the MoE layers'
+    /// routing read back, or `None` after a line naming the fault.
     fn prefill_on(
         clause: &str,
         m: &mut Model,
         hp: &Hparams,
         (set, p): (&LogitsSet, &refset::nemotron::Prompt),
         tail: usize,
+        rows: Option<usize>,
     ) -> Result<Option<SetRun>, GateError> {
         let ids = set.ids(p)?;
         let (head, steps) = ids.split_at(ids.len() - tail);
         m.reset()?;
-        let Some(mut id) = or_fault(clause, &p.name, m.prefill(head))? else {
+        let Some(mut id) = or_fault(
+            clause,
+            &p.name,
+            match rows {
+                None => m.prefill(head),
+                Some(r) => m.prefill_with(head, r),
+            },
+        )?
+        else {
             return Ok(None);
         };
         for &t in steps {
@@ -919,19 +1053,58 @@ mod gate {
         Ok(Some(SetRun { id, logits, routes }))
     }
 
+    /// The rows a prompt of `n` (≥ 3) ids runs its passes at in the edges
+    /// clause: 1 and 2 (every pass on the multi-column gemv arm, many
+    /// passes), 8 (the last cut whose every pass stays on that arm) and 9
+    /// (the first whose first pass takes the GEMM arm) where `n` is past nine
+    /// ids, n − 1 and ⌈n/2⌉ (a cut into two passes where they fit), and
+    /// [`PASS_ROWS`] (the many-pass cut `prefill` takes) — each clamped to
+    /// `cap`, the prompt buffers' rows, and the list deduplicated, in that
+    /// order. In the real tier a prompt past [`GEMV_CUT_MAX_IDS`] ids leaves
+    /// its cuts at 1 and 2 rows out.
+    fn pass_cuts(n: usize, cap: usize, real: bool) -> Vec<usize> {
+        let mut want: Vec<usize> = Vec::new();
+        if !real || n <= GEMV_CUT_MAX_IDS {
+            want.extend([1, 2]);
+        }
+        if n > 9 {
+            want.extend([8, 9]);
+        }
+        want.extend([n - 1, n.div_ceil(2), PASS_ROWS]);
+        let mut cuts: Vec<usize> = Vec::new();
+        for r in want {
+            let r = r.min(cap);
+            if !cuts.contains(&r) {
+                cuts.push(r);
+            }
+        }
+        cuts
+    }
+
     /// Both prompt-path clauses' body: each prompt through [`prefill_on`]
     /// with `tail` ids as steps, its logits against mainline's at
-    /// [`COSINE_FLOOR`], gated as the module doc says per tier.
+    /// [`COSINE_FLOOR`], gated as the module doc says per tier. `edges` runs
+    /// every cut of [`pass_cuts`] a prompt of three ids or more holds instead
+    /// of the one `prefill` cut, one line a cut.
     fn prefill_near_t(
         m: &mut Model,
         case: &Case,
-        (clause, real, tail): (&'static str, bool, usize),
+        (clause, real, tail, edges): (&'static str, bool, usize, bool),
     ) -> Result<bool, GateError> {
         let ml = mainline(case)?;
+        let eps = band_eps(ml, real)?;
         let mut ok = true;
-        let mut gated = 0;
+        let (mut gated, mut runs) = (0, 0);
         for (p, step) in ml.set.prompts.iter().zip(&ml.runs) {
-            if (p.n_ids as usize) <= tail {
+            let n = p.n_ids as usize;
+            if edges && n < 3 {
+                println!(
+                    "{clause}: {} {n} ids: under three, no pass cut to run, skipped",
+                    p.name
+                );
+                continue;
+            }
+            if n <= tail {
                 println!(
                     "{clause}: {} {} id: no pass before its step, skipped",
                     p.name, p.n_ids
@@ -943,69 +1116,135 @@ mod gate {
                 ok = false;
                 continue;
             };
-            let Some(run) = prefill_on(clause, m, &case.hp, (&ml.set, p), tail)? else {
-                ok = false;
-                continue;
-            };
-            let want = ml.set.logits(p)?;
-            if run.logits.len() != want.len() || !run.logits.iter().all(|v| v.is_finite()) {
+            if edges && n <= 9 {
                 println!(
-                    "{clause}: {} {} logits for the set's {}, finite {} FAIL",
-                    p.name,
-                    run.logits.len(),
-                    want.len(),
-                    run.logits.iter().all(|v| v.is_finite())
+                    "{clause}: {} {n} ids: rows 8 and 9 left out (not past nine ids), skipped",
+                    p.name
                 );
-                ok = false;
-                continue;
             }
-            let (cosine, max_delta) = compare(&run.logits, &want);
-            let (step_cos, step_delta) = compare(&step.logits, &want);
-            let line = format!(
-                "{clause}: {} {} tokens, argmax {} mainline {} step {}, cosine {cosine:.6} (floor \
-                 {COSINE_FLOOR}), max |delta| {max_delta:.4}; the step path's cosine \
-                 {step_cos:.6}, max |delta| {step_delta:.4}",
-                p.name,
-                p.n_ids,
-                run.id,
-                argmax(&want),
-                step.id,
-            );
-            if real || (same_routes(ml, p, step)? && same_routes(ml, p, &run)?) {
-                gated += 1;
-                let pass = cosine >= COSINE_FLOOR;
-                println!("{line} {}", verdict(pass));
-                ok &= pass;
+            if edges && real && n > GEMV_CUT_MAX_IDS {
+                println!(
+                    "{clause}: {} {n} ids: rows 1 and 2 left out (past {} ids on the real file)",
+                    p.name, GEMV_CUT_MAX_IDS
+                );
+            }
+            let cuts: Vec<Option<usize>> = if edges {
+                pass_cuts(n, case.pass_rows, real)
+                    .into_iter()
+                    .map(Some)
+                    .collect()
             } else {
-                println!("{line}: a layer's pick crossed mainline's at the cut, not gated");
+                vec![None]
+            };
+            for rows in cuts {
+                runs += 1;
+                let Some(run) = prefill_on(clause, m, &case.hp, (&ml.set, p), tail, rows)? else {
+                    ok = false;
+                    continue;
+                };
+                let want = ml.set.logits(p)?;
+                if run.logits.len() != want.len() || !run.logits.iter().all(|v| v.is_finite()) {
+                    println!(
+                        "{clause}: {} {} logits for the set's {}, finite {} FAIL",
+                        p.name,
+                        run.logits.len(),
+                        want.len(),
+                        run.logits.iter().all(|v| v.is_finite())
+                    );
+                    ok = false;
+                    continue;
+                }
+                let (cosine, max_delta) = compare(&run.logits, &want);
+                let (step_cos, step_delta) = compare(&step.logits, &want);
+                let cut = match rows {
+                    Some(r) => format!(", rows {r}, passes {}", n.div_ceil(r)),
+                    None => String::new(),
+                };
+                // Printed facts beside the verdict, never verdicts themselves.
+                let bits = match rows {
+                    Some(1 | 8) => format!("; {}", bits_vs_step(&run, step)),
+                    _ => String::new(),
+                };
+                let line = format!(
+                    "{clause}: {} {n} tokens{cut}, argmax {} mainline {} step {}, cosine \
+                     {cosine:.6} (floor {COSINE_FLOOR}), max |delta| {max_delta:.4}; the step \
+                     path's cosine {step_cos:.6}, max |delta| {step_delta:.4}; layers keeping \
+                     mainline's experts: run {:?}, step {:?} of {}; {}{bits}",
+                    p.name,
+                    run.id,
+                    argmax(&want),
+                    step.id,
+                    kept_routes(ml, p, &run)?,
+                    kept_routes(ml, p, step)?,
+                    run.routes.len(),
+                    first_divergence(case, p, &run, ml, eps)?,
+                );
+                if real {
+                    let (own_cos, own_delta) = compare(&run.logits, &step.logits);
+                    println!(
+                        "{clause}: {} {n} tokens{cut}: against the step path, cosine \
+                         {own_cos:.6}, max |delta| {own_delta:.4}",
+                        p.name
+                    );
+                }
+                if real || (same_routes(ml, p, step)? && same_routes(ml, p, &run)?) {
+                    gated += 1;
+                    let pass = cosine >= COSINE_FLOOR;
+                    println!("{line} {}", verdict(pass));
+                    ok &= pass;
+                } else {
+                    println!("{line}: a layer's pick crossed mainline's at the cut, not gated");
+                }
             }
         }
         let pass = ok && gated > 0;
-        println!(
-            "{clause}: {gated} of {} prompts gated {}",
-            ml.set.prompts.len(),
-            verdict(pass)
-        );
+        if edges {
+            println!("{clause}: {gated} of {runs} runs gated {}", verdict(pass));
+        } else {
+            println!(
+                "{clause}: {gated} of {} prompts gated {}",
+                ml.set.prompts.len(),
+                verdict(pass)
+            );
+        }
         Ok(pass)
     }
 
     fn prefill_near_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
-        prefill_near_t(m, case, ("prefill_near_mainlines", false, 0))
+        prefill_near_t(m, case, ("prefill_near_mainlines", false, 0, false))
     }
 
     fn prefill_then_step_near_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
-        prefill_near_t(m, case, ("prefill_then_step_near_mainlines", false, 1))
+        prefill_near_t(
+            m,
+            case,
+            ("prefill_then_step_near_mainlines", false, 1, false),
+        )
     }
 
     fn prefill_near_mainlines_real(m: &mut Model, case: &Case) -> Result<bool, GateError> {
-        prefill_near_t(m, case, ("prefill_near_mainlines_real", true, 0))
+        prefill_near_t(m, case, ("prefill_near_mainlines_real", true, 0, false))
     }
 
     fn prefill_then_step_near_mainlines_real(
         m: &mut Model,
         case: &Case,
     ) -> Result<bool, GateError> {
-        prefill_near_t(m, case, ("prefill_then_step_near_mainlines_real", true, 1))
+        prefill_near_t(
+            m,
+            case,
+            ("prefill_then_step_near_mainlines_real", true, 1, false),
+        )
+    }
+
+    fn prefill_edges(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        prefill_near_t(m, case, ("prefill_edges", false, 0, true))
+    }
+
+    /// The same clause against the real file's set, its cuts at 1 and 2 rows
+    /// left out past [`GEMV_CUT_MAX_IDS`] ids.
+    fn prefill_edges_real(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        prefill_near_t(m, case, ("prefill_edges_real", true, 0, true))
     }
 
     fn fault_word_clean(m: &mut Model, _case: &Case) -> Result<bool, GateError> {
@@ -1077,6 +1316,7 @@ mod gate {
             hp,
             walk,
             bias,
+            pass_rows: PASS_ROWS.min(ctx),
             mainline,
         };
         let mut ok = true;
@@ -1101,7 +1341,7 @@ mod gate {
              scan state carries; the fault word stays clean; in the fixture tier the logits keep \
              the cosine floor, the argmax is mainline's above the band and every MoE layer keeps \
              mainline's experts on every prompt of the set; the prompt path, alone and before a \
-             step, keeps the cosine floor"
+             step and at every pass cut, keeps the cosine floor"
         );
         Ok(())
     }
