@@ -22,5 +22,15 @@ unit: GB per launch (and the ratio to the 342 MB once-set)
 predict: 0.35..1.0
 condition: every profiled launch is the arm's alone (--bench-arm gemm_iq2xxs_bolt_up_t448, grid 9900 x 256 threads), the warm-up burst skipped (BLOOMERY_NCU_SKIP=64), the A6000 under the machine lease with no other compute, sections SpeedOfLight + MemoryWorkloadAnalysis + WarpStateStats
 decide-in: ratio ~1 with L1TEX the top unit — the lever is candidate 2 (smem-staged weight words, the Q4_K path) priced against the L1TEX margin; write the round spec on bolt-lever4-iq2 once #328 is on main
+# [measured 2026-10-17 18:31 UTC, job in /root/bloomery-data/ncu/ncu-gemm-gemm_iq2xxs_bolt_up_t448-183131.csv]
+# DECIDED (decide-in branch, refined): dram/launch = 205.1 GB/s x 1.710 ms = 351 MB -> ratio 1.02 (no
+# amplification; L2 holds the slot-tile re-reads, DRAM 28.1 % of SOL). Top unit Compute (SM) 72.0 % with the
+# IMMA pipe at 7.1 %, LSU pipe 38.3 %, L1TEX 55.1 %, issue-active 56.5 %; stalls wait 17.5 / not_selected 16.2 /
+# math_pipe_throttle 16.2 / selected 12.9 / long_scoreboard 10.8 / barrier 6.1. The bind is the instruction
+# stream of the direct global reads and the decode, not bytes. Lever = Q4_K-style cp.async smem staging of the
+# weight words (kills the per-warp scattered loads and their L1TEX wavefronts; 1.109e8 LSU wavefronts a launch
+# today) with the decode arithmetic the second term (math_pipe_throttle). Ceiling: bytes/once-set at the pin
+# ~700 GB/s = 0.49 ms vs 1.71 -> ~3.4x on the kernel -> the A6000 site 0.49 s -> ~0.14 s, save ~0.35 s
+# (perf-table's scaled 0.37 s confirmed); the 3090 (180 GB/s achieved) has more room.
 decide-below: DRAM >= ~85% of its SOL at ratio ~1 — the byte floor is already held at the traffic level; re-price the paper's band down and look at byte reduction (wider effective BN), not scheduling
 decide-above: ratio >= ~2 — slot-tile re-read amplification confirmed at DRAM; the lever is candidate 1 (fewer weight reads per pass: tile batching / persistent slabs), its gain priced from the measured ratio x stack bytes
