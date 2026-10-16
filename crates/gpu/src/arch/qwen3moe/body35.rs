@@ -1387,7 +1387,7 @@ impl GpuModel<Body35> {
     /// m = 1 scratch: its ubatch arena ([`arena_bytes`] at the placed
     /// ubatch, [`placed_open`]) and its placed side ([`placed_bytes`]) —
     /// what the plan's machine counts in the card's scratch
-    /// (`model::arch::qwen3moe::place::machine`), and what
+    /// (`model::placement::workstation::placed_with_arena`), and what
     /// [`GpuModel::open_placed`] refuses to pass.
     ///
     /// Read as a placed load reads the file ([`Read35::Placed`]): a layer
@@ -1417,7 +1417,7 @@ impl GpuModel<Body35> {
     /// The Qwen3.6 model of `file` placed by `plan` (made by
     /// `model::arch::qwen35moe::place::PlanInputs::plan_rule` under
     /// `placement::accepts::routed_rule` of the qwen35moe body, on the machine
-    /// `model::arch::qwen3moe::place::machine` lays out): the plan's card
+    /// `model::placement::workstation::placed_with_arena` lays out): the plan's card
     /// segments resident ([`GpuModel::load_placed_with`]: the trunk, the
     /// shared experts, each layer's card experts) with each router joined
     /// with its shared gate, the host set read in and locked as `host` asks,
@@ -1490,7 +1490,7 @@ impl GpuModel<Body35> {
             .cards
             .first()
             .ok_or(GpuError::shape(WHAT_P, "a plan of no card"))?;
-        let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
+        let counted = model::placement::workstation::counted_arena_bytes(card);
         let specs = pre.layers.clone();
         let (top_k, max_rows) = tally_shape(&pre.d)?;
         // The stack table checks only the layers the plan gives card experts:

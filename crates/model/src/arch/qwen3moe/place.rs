@@ -9,7 +9,7 @@
 //! A qwen35moe file plans through `qwen35moe::place::PlanInputs::plan_rule`
 //! with [`routed_rule`] of [`Program::Qwen35Body`] (its headers, roles and caches are that module's);
 //! a qwen3moe file through [`PlanInputs`] here. Both run on the machine
-//! [`machine`] lays out: one card with the workstation's context and margin
+//! `workstation::placed_with_arena` lays out: one card with the workstation's context and margin
 //! and a scratch the caller sizes from the program's own arenas.
 
 use gguf::Split;
@@ -18,10 +18,9 @@ use super::hparams::Hparams;
 use super::roles;
 use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
-use crate::placement::workstation::{self, CardSpec, SCRATCH};
 use crate::placement::{
-    self, Card, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Violation,
-    checked, joined,
+    self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Violation, checked,
+    joined,
 };
 use runtime::stores::{F32_BYTES, kv_plane_bytes};
 
@@ -32,24 +31,6 @@ use runtime::stores::{F32_BYTES, kv_plane_bytes};
 /// stack of another type, or of one of these in a part no entry runs it in
 /// (a Q6_K gate), keeps its experts on the host.
 pub const PROGRAM: Program = Program::Qwen3moeBody;
-
-/// The machine a placed load of the program runs on: `card` runs every one
-/// of `layers`, the head and the token embedding whole, with the
-/// workstation's context and margin, the m = 1 scratch plus `arena` bytes —
-/// what the load's prompt arenas hold beyond it, which the program sizes
-/// and its load refuses to pass ([`workstation::placed_on`]).
-#[must_use]
-pub fn machine(card: CardSpec, layers: usize, arena: u64) -> Machine {
-    workstation::placed_on(card, layers, SCRATCH + arena)
-}
-
-/// The prompt-arena bytes a plan made on `card` by [`machine`] counts: its
-/// scratch past the m = 1 scratch. A load whose arenas hold more is refused
-/// by name.
-#[must_use]
-pub const fn counted_arena_bytes(card: &Card) -> u64 {
-    card.scratch_bytes.saturating_sub(SCRATCH)
-}
 
 /// A qwen3moe file's per-layer cache: every layer's K and V planes, a
 /// position's `2 · kv_heads · head_dim` values — f16, or q8_0's two-plane

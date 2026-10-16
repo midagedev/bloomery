@@ -763,7 +763,7 @@ impl GpuModel<Body> {
 
     /// The Qwen3-30B model of `file` placed by `plan` (made by
     /// `model::arch::qwen3moe::place::PlanInputs::plan` on the machine
-    /// `model::arch::qwen3moe::place::machine` lays out): the plan's card
+    /// `model::placement::workstation::placed_with_arena` lays out): the plan's card
     /// segments resident ([`GpuModel::load_placed`]: the trunk and each
     /// layer's card experts), the host set read in and locked as `host`
     /// asks, and the body over them with its placed side ([`Placed`]) and
@@ -796,7 +796,7 @@ impl GpuModel<Body> {
             .cards
             .first()
             .ok_or(GpuError::shape(WHAT_P, "a plan of no card"))?;
-        let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
+        let counted = model::placement::workstation::counted_arena_bytes(card);
         let mma = opts.flash == FlashKind::Mma;
         GpuModel::load_placed(
             file,
@@ -833,7 +833,7 @@ impl GpuModel<Body> {
     /// The card bytes a placed load of `file` holds past the m = 1 scratch,
     /// at caches of `ctx` rows: its ubatch arena at the placed units' rows
     /// and its placed side ([`placed_scratch`]) — what the plan's machine
-    /// counts in the card's scratch (`model::arch::qwen3moe::place::machine`),
+    /// counts in the card's scratch (`model::placement::workstation::placed_with_arena`),
     /// and what [`GpuModel::open_placed`] refuses to pass. The arena's forms
     /// are read from the file's header plan ([`header_plan`]), the plan the
     /// load runs.

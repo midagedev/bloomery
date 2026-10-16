@@ -3,7 +3,7 @@
 //! open one under `--place`: the placement word's stage card
 //! (`generate::Place`, an alias or a card list of one card; a tier card is
 //! refused by name, the program hangs none), the machine
-//! `model::arch::qwen3moe::place::machine` lays out on it with the scratch
+//! `model::placement::workstation::placed_with_arena` lays out on it with the scratch
 //! the body's placed load holds past the m = 1 scratch, the plan by the
 //! expert rule over the stacks `routed_rule` loads — the trunk on the card,
 //! each layer's routed id prefix as the budget holds, the rest on the host
@@ -205,7 +205,7 @@ fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
 }
 
 /// The machine a placed load of `inputs`'s file lays out on `spec`'s card
-/// over `arena` ([`q3::machine`]), with the rows of what `seqs` holds past the
+/// over `arena` ([`workstation::placed_with_arena`]), with the rows of what `seqs` holds past the
 /// plan's one-sequence terms: on the card, a [`SLOTS_RESERVE`] of every
 /// resident sequence's fixed stores ([`fixed_seq_bytes`]) but the live one's
 /// — the plan's KV term at the total counts the per-position rows of every
@@ -224,7 +224,7 @@ fn laid(
     slot_ctx: u64,
     media: Media,
 ) -> Result<Machine, GateError> {
-    let mut machine = q3::machine(spec, layers_of(inputs), arena);
+    let mut machine = workstation::placed_with_arena(spec, layers_of(inputs), arena);
     let past = u64::try_from(seqs.slots.saturating_sub(1))
         .map_or(u64::MAX, |n| n.saturating_mul(fixed_seq_bytes(inputs)));
     if past > 0 {
@@ -680,7 +680,7 @@ impl Whole {
 
 /// The whole-fit verdict of a load of the whole of `model` — `layers`
 /// layers, `kv` bytes of cache — on `spec`'s card: the card the plan lays
-/// out for the program ([`q3::machine`], its step arenas' scratch), on a
+/// out for the program ([`workstation::placed_with_arena`], its step arenas' scratch), on a
 /// unified machine with the checkpoints `seqs` pin at `slot_ctx` positions a
 /// slot ([`reserve_checkpoints`], `Machine::whole_card`) and `beside`'s
 /// reserves ([`beside::reserve_on`], the reserves a placed plan carries), and
@@ -704,7 +704,7 @@ fn whole_on(
         Ok(l) => l,
         Err(why) => return Ok(refused(&why)),
     };
-    let mut machine = q3::machine(spec, layers, 0);
+    let mut machine = workstation::placed_with_arena(spec, layers, 0);
     reserve_checkpoints(&mut machine, seqs, slot_ctx)?;
     beside::reserve_on(&mut machine, beside);
     let card = machine
@@ -1324,7 +1324,7 @@ pub(super) mod tests {
             experts: 0,
             experts_used: 0,
         };
-        let machine = q3::machine(workstation::A6000, 1, 0);
+        let machine = workstation::placed_with_arena(workstation::A6000, 1, 0);
         let mut card = machine.whole_card().expect("one card");
         for load in [
             WholeLoad::Checked {
