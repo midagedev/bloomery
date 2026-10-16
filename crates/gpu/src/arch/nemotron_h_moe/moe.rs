@@ -24,7 +24,7 @@
 //! stacks' shape), so one body runs every (count, width) pair of the file.
 
 use super::router::{RouteOut, Routers, TOP_K};
-use crate::arch::hybrid::{self, Acts, Cx, Names, Site, norm, residual};
+use crate::arch::hybrid::{self, Acts, Cx, Names, Site, residual};
 use crate::iq_sel::IqSelKernels;
 use crate::kquant::SelDown;
 use crate::site::SiteTy;
@@ -302,7 +302,18 @@ pub(super) fn moe_layer(
     let stream = gpu.stream();
     let hidden = cx.sh.hidden;
     let fault = gpu.layer_sink(l)?;
-    norm(cx, &m.norm, src, &mut t.buf.xn)?;
+    // One launch writes the normed row the router and the latent read and
+    // the q8_1 form the shared expert's up reads, the norm + quantize pair
+    // it folds, bit for bit.
+    gpu.fused().enqueue_norm_quant(
+        stream,
+        src,
+        cx.f32(&m.norm)?,
+        cx.sh.eps,
+        acts.q8_1_at(what, hidden, 1)?,
+        &mut t.buf.xn,
+        fault,
+    )?;
     k.routers.enqueue(
         stream,
         cx.w.f32_tensor(what, &m.router)?,
@@ -350,8 +361,8 @@ pub(super) fn moe_layer(
     )?;
     m.latent_up.project(cx, acts, l, &s.moe, &mut t.buf.delta)?;
     {
+        // The q8_1 form the norm wrote: no launch between writes this width.
         let act = acts.q8_1_at(what, hidden, 1)?;
-        gpu.enqueue_quantize_q8_1_layer(&t.buf.xn, act, l)?;
         one_expert(
             cx,
             k,

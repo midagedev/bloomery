@@ -195,7 +195,7 @@ mod gate {
         let mut want: Vec<(String, usize)> = vec![
             ("mamba2_step".into(), mamba),
             ("nvfp4_gemv".into(), 2 * mamba),
-            ("norm_quant".into(), mamba),
+            ("norm_quant".into(), mamba + moe),
             ("gqa_flash_merge".into(), attn),
             ("kv_append_pos_buf".into(), 2 * n_kv * attn),
             ("iq2_xxs_gemv_sel".into(), 4 * moe),
