@@ -677,7 +677,7 @@ pub enum GroupInput<'a> {
 
 /// The combine a [`GroupInput::Swiglu`], [`GroupInput::SwigluClamp`] or
 /// [`GroupInput::Relu2`] input stands for: the blocks it reads and the one
-/// call every path makes of them ([`InputCombine::into_par`]).
+/// call every path makes of them ([`InputCombine::write_par`]).
 #[derive(Clone, Copy)]
 enum InputCombine<'a> {
     /// `silu(gate) · up`, clamped with `limit`.
@@ -692,7 +692,7 @@ enum InputCombine<'a> {
 
 impl InputCombine<'_> {
     /// The combine of every column, into `out`.
-    fn into_par(&self, out: &mut [f32]) {
+    fn write_par(&self, out: &mut [f32]) {
         match self {
             InputCombine::Swiglu { gate, up, limit } => {
                 swiglu_into(&gate.data, &up.data, *limit, out)
@@ -1664,7 +1664,7 @@ fn combine_timed(combine: InputCombine<'_>) -> (Tensor2, u64) {
         InputCombine::Relu2 { up } => (up.ne0, up.ne1),
     };
     let mut out = Tensor2::scratch(rows, cols);
-    combine.into_par(&mut out.data);
+    combine.write_par(&mut out.data);
     let ns = match t_call {
         Some(t_call) => {
             let ns = t_call.elapsed().as_nanos() as u64;
@@ -1867,7 +1867,7 @@ fn group_core(
                         if caller_combines {
                             let t_c = if lvl > 0 { Some(Instant::now()) } else { None };
                             // SAFETY: as the read above.
-                            combine.into_par(unsafe { &mut (*blk).data });
+                            combine.write_par(unsafe { &mut (*blk).data });
                             if let Some(t_c) = t_c {
                                 caller_combine_ns += t_c.elapsed().as_nanos() as u64;
                             }
@@ -2983,7 +2983,7 @@ impl<'a> DeferredSlots<'a> {
             // this claimer its only writer until DONE (this fn's `# Safety`);
             // the caller reads it only after the join.
             let par = unsafe { std::slice::from_raw_parts_mut(c.par.0, c.par.1) };
-            c.combine.into_par(par);
+            c.combine.write_par(par);
             if let Some(t_s) = t_s {
                 self.swiglu_ns.fetch_add(
                     t_s.elapsed().as_nanos() as u64,

@@ -3569,15 +3569,13 @@ mod tests {
         let mut host = HostScratch::new(embd, ff, n_expert).unwrap();
         let e = layer
             .experts_into(src, &x, &list, &mut out, &mut host)
-            .err()
-            .expect("a relu² layer refuses the tier")
+            .expect_err("a relu² layer refuses the tier")
             .to_string();
         assert!(e.contains("gated experts only"), "{e}");
         let mut us = UnionScratch::new_routed(embd, ff, 4, n_expert).unwrap();
         let e = layer
             .experts_union_into(src, &x, &[&list[..]], &mut out, &mut us)
-            .err()
-            .expect("a relu² layer refuses the tier at the union")
+            .expect_err("a relu² layer refuses the tier at the union")
             .to_string();
         assert!(e.contains("gated experts only"), "{e}");
         std::fs::remove_file(&path).unwrap();
