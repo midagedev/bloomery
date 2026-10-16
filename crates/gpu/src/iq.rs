@@ -126,6 +126,9 @@ const GRID2: &[u64; 512] = &IQ2XS_GRID;
 /// entries, a byte index. The decode reads it from the block's copy
 /// ([`Iq2XxsTab`]).
 const GRID2XXS_SEL: &[u32; 256] = &grid_sel(&IQ2XXS_GRID);
+/// The IQ2_XXS grid raw, likewise: `iq2xxs_grid_half`'s reads (the grouped
+/// GEMM's mma fragments hold values, not selectors).
+const GRID2XXS: &[u64; 256] = &IQ2XXS_GRID;
 /// The IQ3_XXS grid, likewise.
 pub(crate) const GRID3: &[u32; 256] = &IQ3XXS_GRID;
 /// The IQ3_S grid, likewise: 512 entries, a 9-bit index.
@@ -415,6 +418,15 @@ impl Iq2XxsTab {
         thread::sync_threads();
         Iq2XxsTab(t)
     }
+}
+
+/// The `iq2xxs_grid` entry `i`'s magnitudes at nibble `n` (bytes `4n .. 4n + 4`
+/// of its u64): one group's half, the four values an `mma` A-fragment lane
+/// holds (`grouped.rs`'s IQ2_XXS decode).
+#[inline(always)]
+pub(crate) fn iq2xxs_grid_half(i: u32, n: u32) -> u32 {
+    // SAFETY: i & 255 < 256, GRID2XXS's length.
+    unsafe { (*GRID2XXS.get_unchecked((i & 255) as usize) >> (32 * (n & 1))) as u32 }
 }
 
 /// One IQ2_XXS sub-block from its two words (module doc): its eight signed
