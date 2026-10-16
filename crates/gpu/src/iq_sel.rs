@@ -424,7 +424,12 @@ fn gate_up_sel_body<D: RawSb>(
     h: &mut DisjointSlice<f32>,
     tab: D::Tab,
 ) {
-    let slot = row / rows_per_expert as usize;
+    // In u32: the launchers bound n_slots · rows_per_expert to u32, and a
+    // usize division is a 64-bit emulation ahead of the first weight load.
+    let (r, slot) = (
+        row as u32 % rows_per_expert,
+        (row as u32 / rows_per_expert) as usize,
+    );
     // SAFETY: slot < n_slots <= sel.len() by this fn's contract; the load is
     // warp-uniform (the warp's lanes share `row`, hence `slot`), so the
     // returns below never diverge a warp.
@@ -439,8 +444,8 @@ fn gate_up_sel_body<D: RawSb>(
         }
         return;
     }
-    let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
-    let col = slot / slots_per_col as usize;
+    let row_abs = id as usize * rows_per_expert as usize + r as usize;
+    let col = (slot as u32 / slots_per_col) as usize;
     let a = ActCols {
         q,
         d8,
@@ -517,7 +522,12 @@ fn down_sel_body<D: RawSb>(
     y: &mut DisjointSlice<f32>,
     tab: D::Tab,
 ) {
-    let slot = row / rows_per_expert as usize;
+    // In u32: the launchers bound n_slots · rows_per_expert to u32, and a
+    // usize division is a 64-bit emulation ahead of the first weight load.
+    let (r, slot) = (
+        row as u32 % rows_per_expert,
+        (row as u32 / rows_per_expert) as usize,
+    );
     // SAFETY: slot < n_slots <= sel.len() by this fn's contract; the load is
     // warp-uniform (the warp's lanes share `row`, hence `slot`), so the
     // returns below never diverge a warp.
@@ -529,8 +539,8 @@ fn down_sel_body<D: RawSb>(
         }
         return;
     }
-    let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
-    let col = slot / slots_per_col as usize;
+    let row_abs = id as usize * rows_per_expert as usize + r as usize;
+    let col = (slot as u32 / slots_per_col) as usize;
     let a = ActCols {
         q,
         d8,
@@ -1284,7 +1294,12 @@ mod iq_sel_kernels {
         if row >= n_slots as usize * rows_per_expert as usize {
             return;
         }
-        let slot = row / rows_per_expert as usize;
+        // In u32: the launchers bound n_slots · rows_per_expert to u32, and a
+        // usize division is a 64-bit emulation ahead of the first weight load.
+        let (r, slot) = (
+            row as u32 % rows_per_expert,
+            (row as u32 / rows_per_expert) as usize,
+        );
         // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
         // load is warp-uniform (all 32 lanes of the warp share `row`, hence
         // `slot`), so the returns below never diverge a warp.
@@ -1296,7 +1311,7 @@ mod iq_sel_kernels {
             }
             return;
         }
-        let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
+        let row_abs = id as usize * rows_per_expert as usize + r as usize;
         // row_abs < n_experts · rows_per_expert rows, so the stream holds
         // its last block by the launch contract; column slot < n_slots of
         // the activation, and the host passes the activation's own q_stride
@@ -1548,6 +1563,8 @@ impl IqSelKernels {
             ));
         }
         let n_grp = n_sb.div_ceil(4);
+        // The bodies divide thread rows in u32.
+        launch_u32(what, "n_slots · rows_per_expert", n_slots * rpe)?;
         let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
         let (act, limit) = a.rule.code();
         match a.ty {
@@ -1758,6 +1775,8 @@ impl IqSelKernels {
             ));
         }
         let n_grp = n_sb.div_ceil(4);
+        // The bodies divide thread rows in u32.
+        launch_u32(what, "n_slots · rows_per_expert", n_slots * rpe)?;
         let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
         let cfg = LaunchConfig1D::new(grid, THREADS, 0);
         macro_rules! down {
@@ -1878,6 +1897,8 @@ impl IqSelKernels {
                 ),
             ));
         }
+        // The bodies divide thread rows in u32.
+        launch_u32(what, "n_slots · rows_per_expert", n_slots * rpe)?;
         let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
         let prep = self
             .module
