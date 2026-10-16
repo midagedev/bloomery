@@ -76,6 +76,7 @@ mod gate {
     use model::arch::Arch;
     use model::arch::nemotron_h_moe::hparams::{Hparams, Kind};
     use refset::arch::nemotron_h_moe::fixture::{LOGITS, LOGITS_SET};
+    use refset::arch::nemotron_h_moe::{LOGITS as REAL_LOGITS, LOGITS_SET as REAL_SET};
     use refset::nemotron::LogitsSet;
     use std::collections::BTreeMap;
 
@@ -145,6 +146,21 @@ mod gate {
             logits_near_mainlines,
         ),
         ("top1_is_mainlines", Tag::FixtureOracle, top1_is_mainlines),
+        // The same three against the real file's mainline set (ref-nemotron-moe-logits), in the
+        // real tier, under its own contracts: the file's quantized weights put near-ties at the
+        // 9-expert cut, so the routing clause gates crossings, not set equality, and the logits
+        // clause holds every prompt.
+        (
+            "routing_is_mainlines_real",
+            Tag::Oracle,
+            routing_is_mainlines_real,
+        ),
+        (
+            "logits_near_mainlines_real",
+            Tag::Oracle,
+            logits_near_mainlines_real,
+        ),
+        ("top1_is_mainlines_real", Tag::Oracle, top1_is_mainlines),
         ("fault_word_clean", Tag::SelfConsistency, fault_word_clean),
     ];
 
@@ -615,6 +631,59 @@ mod gate {
         Ok(pass)
     }
 
+    /// The real tier's logits: every prompt is held to the floor. On the real
+    /// set a layer's pick crosses mainline's at the cut without the logits
+    /// leaving the band, so no prompt is exempt for a crossing the way the
+    /// fixture tier exempts them.
+    /// PIN(2026-10-16): the fixture's floor 0.999 re-pinned for the real set — 0.999401 to
+    /// 0.999998 over its 10 prompts with the crossings included.
+    fn logits_near_mainlines_real(_m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        const CLAUSE: &str = "logits_near_mainlines_real";
+        let ml = mainline(case)?;
+        let mut ok = true;
+        for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
+            let Some(run) = run else {
+                println!("{CLAUSE}: {} faulted FAIL", p.name);
+                ok = false;
+                continue;
+            };
+            let want = ml.set.logits(p)?;
+            let got = &run.logits;
+            if got.len() != want.len() || !got.iter().all(|v| v.is_finite()) {
+                println!(
+                    "{CLAUSE}: {} {} logits for the set's {}, finite {} FAIL",
+                    p.name,
+                    got.len(),
+                    want.len(),
+                    got.iter().all(|v| v.is_finite())
+                );
+                ok = false;
+                continue;
+            }
+            let (cosine, max_delta) = compare(got, &want);
+            let values = |ids: &[usize], v: &[f32]| -> Vec<String> {
+                ids.iter().map(|&i| format!("{i}:{:.3}", v[i])).collect()
+            };
+            let pass = cosine >= COSINE_FLOOR;
+            println!(
+                "{CLAUSE}: {} {} tokens, max |delta| {max_delta:.4}, cosine {cosine:.6} \
+                 (floor {COSINE_FLOOR}), top-5 body {:?} mainline {:?} {}",
+                p.name,
+                p.n_ids,
+                values(&top_ids(got, 5), got),
+                values(&top_ids(&want, 5), &want),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        println!(
+            "{CLAUSE}: {} prompts gated at the floor {}",
+            ml.set.prompts.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     fn top1_is_mainlines(_m: &mut Model, case: &Case) -> Result<bool, GateError> {
         const CLAUSE: &str = "top1_is_mainlines";
         let ml = mainline(case)?;
@@ -783,6 +852,146 @@ mod gate {
         Ok(ok)
     }
 
+    /// The real tier's routing: the body's own selection contract as in the
+    /// fixture tier, and every layer that does not keep mainline's set must
+    /// cross at the cut ([`Routed::Crossed`]) under the band. Unlike the
+    /// fixture tier a crossing does not end its prompt's comparison: on the
+    /// real set the states stay on mainline's (the logits clause's floor
+    /// holds with the crossings in), so each differing layer stands at its
+    /// own cut.
+    /// PIN(2026-10-16): the band's eps comes from every prompt's own logits
+    /// against mainline's, not only the prompts that kept mainline's experts
+    /// in every layer — on the real set none does, and the crossings'
+    /// divergence is inside the deltas, so the eps is an upper bound.
+    fn routing_is_mainlines_real(_m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        const CLAUSE: &str = "routing_is_mainlines_real";
+        let ml = mainline(case)?;
+        let moe = moe_layers(&case.hp);
+        let layers: Vec<usize> = ml
+            .set
+            .route_layers
+            .iter()
+            .map(|r| r.layer as usize)
+            .collect();
+        if layers != moe {
+            println!(
+                "{CLAUSE}: the set routes layers {layers:?}, the file's MoE layers are {moe:?} FAIL"
+            );
+            return Ok(false);
+        }
+        let mut eps = 0.0f32;
+        for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
+            let Some(run) = run else {
+                continue;
+            };
+            let want = ml.set.logits(p)?;
+            let (_, max_delta) = compare(&run.logits, &want);
+            let peak = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            eps = eps.max((max_delta / f64::from(peak)) as f32);
+        }
+        println!("{CLAUSE}: eps {eps:.4} (max |delta| / peak |logit| over every prompt)");
+        // Per prompt: how many MoE layers keep mainline's expert set, and the first that does not.
+        for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
+            let (Some(run), Some(want)) = (run, ml.set.routes(p)?) else {
+                continue;
+            };
+            let eq: Vec<bool> = run
+                .routes
+                .iter()
+                .zip(&want)
+                .map(|(r, w)| {
+                    let mut a = r.ids.clone();
+                    let mut b = w.clone();
+                    a.sort_unstable();
+                    b.sort_unstable();
+                    a == b
+                })
+                .collect();
+            let first = eq.iter().position(|e| !e).map(|i| moe[i]);
+            println!(
+                "{CLAUSE}: {} {} of {} MoE layers keep mainline's experts, first other layer {first:?}",
+                p.name,
+                eq.iter().filter(|e| **e).count(),
+                eq.len()
+            );
+        }
+        let scale = case.hp.weights_scale;
+        let mut ok = true;
+        let (mut same, mut boundary) = (0, 0);
+        for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
+            let Some(run) = run else {
+                println!("{CLAUSE}: {} faulted FAIL", p.name);
+                ok = false;
+                continue;
+            };
+            let Some(want) = ml.set.routes(p)? else {
+                println!("{CLAUSE}: {} carries no routes FAIL", p.name);
+                ok = false;
+                continue;
+            };
+            for (((l, r), want), bias) in moe.iter().zip(&run.routes).zip(&want).zip(&case.bias) {
+                let rank = ranked(r, bias);
+                let k = r.ids.len();
+                let own: Vec<u32> = rank[..k].iter().map(|(e, _)| *e).collect();
+                let picks = own == r.ids;
+                let kept: Vec<f64> = r
+                    .ids
+                    .iter()
+                    .map(|&e| f64::from(r.scores[e as usize]))
+                    .collect();
+                let sum = kept.iter().sum::<f64>();
+                let weights = r
+                    .weights
+                    .iter()
+                    .zip(&kept)
+                    .all(|(w, s)| (f64::from(*w) - s / sum * f64::from(scale)).abs() <= 1e-5);
+                let (verdict_of, kept_ok) = match routed(r, want, &rank, eps) {
+                    Routed::Same => {
+                        same += 1;
+                        ("mainline's set".to_string(), true)
+                    }
+                    Routed::Crossed { d, worst } => {
+                        boundary += 1;
+                        (
+                            format!(
+                                "crossed at the cut: {d} of mainline's within the band of the \
+                                 body's 9th, worst gap/band {worst:.3}"
+                            ),
+                            true,
+                        )
+                    }
+                    Routed::Differs {
+                        id,
+                        rank,
+                        gap,
+                        band,
+                    } => (
+                        format!(
+                            "differs: mainline's {id} at the body's rank {rank}, gap {gap:.3e} \
+                             past its band {band:.3e}"
+                        ),
+                        false,
+                    ),
+                };
+                let pass = picks && weights && kept_ok;
+                println!(
+                    "{CLAUSE}: {} layer {l} body {:?} mainline {want:?}: {verdict_of}; the body's \
+                     top 9 of its scores + bias {picks}, weights its renormalized scores x {scale} \
+                     {weights} {}",
+                    p.name,
+                    r.ids,
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+        }
+        println!(
+            "{CLAUSE}: {same} layer runs mainline's set, {boundary} crossed at the cut {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     // --------------------------------------------------- fault_word_clean
 
     fn fault_word_clean(m: &mut Model, _case: &Case) -> Result<bool, GateError> {
@@ -828,10 +1037,12 @@ mod gate {
         let hp = Hparams::read(&file).map_err(|e| format!("nemotron_h_moe header: {e}"))?;
         // The set opens before the card loads: one the tier runs, missing or
         // stale, ends the gate here.
-        let oracle = tier::Tier::from_env()?.runs(Tag::FixtureOracle);
-        let set = if oracle {
+        let tier_now = tier::Tier::from_env()?;
+        let set = if tier_now.runs(Tag::FixtureOracle) {
             let path = tier::fixture_set("the mainline clauses", &LOGITS, LOGITS_SET)?;
             Some(LogitsSet::open(&path, &LOGITS)?)
+        } else if tier_now.runs(Tag::Oracle) {
+            Some(LogitsSet::open(&REAL_LOGITS.path(REAL_SET), &REAL_LOGITS)?)
         } else {
             None
         };
