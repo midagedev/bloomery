@@ -117,9 +117,10 @@ pub enum DevWeight {
     /// An IQ2_XXS expert stack re-laid into one flat word stream at load:
     /// expert `e`'s region starts at word `e·rows·(k/256)·33/2` and holds its
     /// rows' 16·(k/256) idx/aux words (the file's half verbatim, so every
-    /// half a 16-byte run), then its rows' f16 `d` values packed two a word
-    /// (`n_sb/2` a row) — byte for byte the file's stream, `k` a multiple of
-    /// 512. Read by the grouped GEMM's plane entry and the `_sel` gemv.
+    /// half a 16-byte run), then its rows' f16 `d` values as one continuous
+    /// bitstream two a word (`rows·(k/256)/2` words) — byte for byte the
+    /// file's stream, zero-tail padded to whole words a row, `k` a multiple
+    /// of 256. Read by the grouped GEMM's plane entry and the `_sel` gemv.
     Iq2Xxs { w: DeviceTensor<u32>, k: usize },
 }
 

@@ -303,10 +303,11 @@ impl IqFormat {
 /// The grouped GEMM's IQ2_XXS plane of an expert stack's file bytes: one
 /// flat word stream an expert — its rows' `16·n_sb` idx/aux words (the
 /// file's half verbatim, every half a 16-byte run), then its rows' f16 `d`
-/// values packed two a word — so expert `e`'s region starts at word
-/// `e·rows·n_sb·33/2` ([`crate::weights::DevWeight::Iq2Xxs`]). Byte-neutral
-/// with the file's stream. `k` must be a positive multiple of 512 (a row's
-/// d tail packs whole super-block pairs), the bytes exactly
+/// values as one continuous bitstream two a word — so expert `e`'s region
+/// starts at word `e·rows·n_sb·33/2`
+/// ([`crate::weights::DevWeight::Iq2Xxs`]). Byte-neutral with the file's
+/// stream for every `n_sb`. `k` must be a positive multiple of 256,
+/// `rows·n_sb` even (the d tail holds whole words), the bytes exactly
 /// `n_experts·rows·66·n_sb`, and every `d` finite — the last refused naming
 /// its expert, row and super-block.
 pub fn repack_iq2xxs(
@@ -316,13 +317,19 @@ pub fn repack_iq2xxs(
     k: usize,
 ) -> Result<Vec<u32>, GpuError> {
     let what = "iq::repack_iq2xxs";
-    if k == 0 || !k.is_multiple_of(512) {
+    if k == 0 || !k.is_multiple_of(256) {
         return Err(GpuError::shape(
             what,
-            format!("k {k} is not a positive multiple of 512"),
+            format!("k {k} is not a positive multiple of 256"),
         ));
     }
     let n_sb = k / SB_VALUES;
+    if !((rows * n_sb) & 1 == 0) {
+        return Err(GpuError::shape(
+            what,
+            format!("{rows} rows of {n_sb} super-blocks: rows·n_sb odd, the d tail whole words"),
+        ));
+    }
     if bytes.len() != n_experts * rows * n_sb * 66 {
         return Err(GpuError::shape(
             what,
@@ -356,8 +363,8 @@ pub fn repack_iq2xxs(
                         plane[qs + 8 * hh + i] = word(bytes, blk + 2 + 32 * hh + 4 * i);
                     }
                 }
-                let dw = e * exp_w + rows * 16 * n_sb + r * n_sb / 2 + sb / 2;
-                plane[dw] |= u32::from(half(bytes, blk)) << (16 * (sb & 1));
+                let dw = e * exp_w + rows * 16 * n_sb + (r * n_sb + sb) / 2;
+                plane[dw] |= u32::from(half(bytes, blk)) << (16 * ((r * n_sb + sb) & 1));
             }
         }
     }

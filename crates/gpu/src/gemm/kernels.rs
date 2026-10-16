@@ -613,13 +613,13 @@ mod gemm_kernels {
     /// [`gemm_iq2xxs`] over the load-time plane of
     /// [`crate::weights::DevWeight::Iq2Xxs`]: the same words re-laid so every
     /// row's half is a 16-byte run (expert `e` at word `e·rows·n_sb·33/2`:
-    /// its rows' 16·n_sb idx/aux words, then its rows' `n_sb/2` d words).
-    /// The step stages the slab's half through `GEMM_THREADS` 16-byte
-    /// cp.async copies and the warps read their rows from shared as v4; the
-    /// d words stay in global, one broadcast word a row a step (a seventeenth
-    /// of the stream). Byte-neutral with the file stack, so its launch
-    /// contract is [`gemm_iq2xxs`]'s; the decode is its decode, over the
-    /// staged words.
+    /// its rows' 16·n_sb idx/aux words, then its rows' d halves one bitstream
+    /// `rows·n_sb/2` words). The step stages the slab's half through
+    /// `GEMM_THREADS` 16-byte cp.async copies and the warps read their rows
+    /// from shared as v4; the d words stay in global, one broadcast word a
+    /// row a step (a seventeenth of the stream). Byte-neutral with the file
+    /// stack, so its launch contract is [`gemm_iq2xxs`]'s; the decode is its
+    /// decode, over the staged words.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"

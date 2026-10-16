@@ -784,15 +784,17 @@ mod gate {
         fn resident_at(&self, st: &Stack<'_>, max_slots: usize) -> Result<Resident, GateError> {
             let stream = self.gpu.stream();
             let n_rows = st.n_exp * st.rows;
-            let words = if st.ty == GemmWeight::Iq2XxsPlane {
+            let mut words = if st.ty == GemmWeight::Iq2XxsPlane {
                 // The plane entry's resident words: the stack's file bytes
-                // through the loader's writer, exactly `33·n_sb/2` a row.
+                // through the loader's writer, zero-tail padded to whole
+                // words a row as the loader uploads it.
                 repack_iq2xxs(&st.bytes, st.n_exp, st.rows, st.k)?
             } else {
                 let mut words = bytes_to_words(&st.bytes);
                 words.resize(words.len().div_ceil(n_rows) * n_rows, 0);
                 words
             };
+            words.resize(words.len().div_ceil(n_rows) * n_rows, 0);
             let cols = words.len() / n_rows;
             let acts = (1..=8)
                 .map(|m| Q8Act::with_k(stream, m, st.k))
@@ -2749,6 +2751,7 @@ mod gate {
         if ![
             "iq2xxs_plane_synth",
             "iq2xxs_plane_bit",
+            "iq2xxs_plane_odd",
             "iq2xxs_plane_refusals",
         ]
         .iter()
@@ -2769,8 +2772,50 @@ mod gate {
         };
         // The oracle case over the plane: the same band as the file entry's.
         let mut ok = run_case(dev, &plane, 0x5f2)?;
-        if wanted("iq2xxs_plane_bit") {
+        // The plane's bit-identity helper: `y` of the file and plane entries
+        // over the same activations and ids.
+        let bit_vs_file = |file: &Stack<'_>,
+                           plane: &Stack<'_>,
+                           tag: &str,
+                           ok: &mut bool|
+         -> Result<(), GateError> {
             let stream = dev.gpu.stream();
+            let max = 17 * top_k;
+            let mut rf = dev.resident_at(file, max)?;
+            let mut rp = dev.resident_at(plane, max)?;
+            for (n_tok, ri) in [(1usize, 0usize), (17, 2)] {
+                let ids = route_ids(
+                    ROUTINGS[ri],
+                    n_tok,
+                    top_k,
+                    file.n_exp,
+                    0x5f3 ^ (n_tok as u64) << 8 ^ ri as u64,
+                );
+                let n_cols = file.input.cols(n_tok * top_k);
+                let x = activations(
+                    file.k,
+                    n_cols,
+                    (0x5f4u32) ^ (n_tok as u32 * 131 + ri as u32),
+                );
+                let xd = DeviceBuffer::from_host(stream, &x)?;
+                let yf = dev.run(file, &mut rf, &xd, &ids)?;
+                let yp = dev.run(plane, &mut rp, &xd, &ids)?;
+                let differ = yf
+                    .iter()
+                    .zip(&yp)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                println!(
+                    "gemm case={tag} tokens={n_tok} routing={ri} \
+                     bits_differ={differ} of {} {}",
+                    yf.len(),
+                    verdict(differ == 0)
+                );
+                *ok &= differ == 0;
+            }
+            Ok(())
+        };
+        if wanted("iq2xxs_plane_bit") {
             let file = Stack {
                 name: "iq2xxs_plane_bit".into(),
                 ty: GemmWeight::Iq2Xxs,
@@ -2780,42 +2825,50 @@ mod gate {
                 k,
                 input: Input::Shared(top_k),
             };
-            let max = 17 * top_k;
-            let mut rf = dev.resident_at(&file, max)?;
-            let mut rp = dev.resident_at(&plane, max)?;
-            for (n_tok, ri) in [(1usize, 0usize), (17, 2)] {
-                let ids = route_ids(
-                    ROUTINGS[ri],
-                    n_tok,
-                    top_k,
-                    n_exp,
-                    0x5f3 ^ (n_tok as u64) << 8 ^ ri as u64,
-                );
-                let n_cols = file.input.cols(n_tok * top_k);
-                let x = activations(k, n_cols, (0x5f4u32) ^ (n_tok as u32 * 131 + ri as u32));
-                let xd = DeviceBuffer::from_host(stream, &x)?;
-                let yf = dev.run(&file, &mut rf, &xd, &ids)?;
-                let yp = dev.run(&plane, &mut rp, &xd, &ids)?;
-                let differ = yf
-                    .iter()
-                    .zip(&yp)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count();
-                println!(
-                    "gemm case=iq2xxs_plane_bit tokens={n_tok} routing={ri} \
-                     bits_differ={differ} of {} {}",
-                    yf.len(),
-                    verdict(differ == 0)
-                );
-                ok &= differ == 0;
-            }
+            bit_vs_file(&file, &plane, "iq2xxs_plane_bit", &mut ok)?;
+        }
+        // The odd-n_sb geometry of Bolt's routed down stacks (k 2304): the
+        // d halves one bitstream across row ends, the resident padded a
+        // half word a row — oracle and bit-identity the same as the even
+        // case's.
+        if wanted("iq2xxs_plane_odd") {
+            let (n_exp, rows, k) = (16usize, 128usize, 768usize);
+            let odd_bytes = synthetic(GemmWeight::Iq2Xxs, n_exp * rows * k / 256, 0x5f9);
+            let odd_plane = Stack {
+                name: "iq2xxs_plane_odd".into(),
+                ty: GemmWeight::Iq2XxsPlane,
+                bytes: std::borrow::Cow::Owned(odd_bytes.clone()),
+                n_exp,
+                rows,
+                k,
+                input: Input::Shared(top_k),
+            };
+            ok &= run_case(dev, &odd_plane, 0x5fa)?;
+            let odd_file = Stack {
+                name: "iq2xxs_plane_odd_file".into(),
+                ty: GemmWeight::Iq2Xxs,
+                bytes: std::borrow::Cow::Owned(odd_bytes),
+                n_exp,
+                rows,
+                k,
+                input: Input::Shared(top_k),
+            };
+            bit_vs_file(&odd_file, &odd_plane, "iq2xxs_plane_odd", &mut ok)?;
         }
         if wanted("iq2xxs_plane_refusals") {
-            // The writer: a k of odd n_sb, and a non-finite d, both by name.
-            let odd = repack_iq2xxs(&[], 16, 128, 768);
-            let pass = odd.is_err();
+            // The writer: a k not a multiple of 256, a stack whose d tail
+            // holds half a word, and a non-finite d, all by name.
+            let not256 = repack_iq2xxs(&[], 16, 128, 640);
+            let pass = not256.is_err();
             println!(
-                "gemm case=iq2xxs_plane_refusals repack_k_not_512={pass} {}",
+                "gemm case=iq2xxs_plane_refusals repack_k_not_256={pass} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+            let half_word = repack_iq2xxs(&[], 16, 1, 256);
+            let pass = half_word.is_err();
+            println!(
+                "gemm case=iq2xxs_plane_refusals repack_rows_n_sb_odd={pass} {}",
                 verdict(pass)
             );
             ok &= pass;
@@ -2826,49 +2879,6 @@ mod gate {
             let pass = nan.is_err();
             println!(
                 "gemm case=iq2xxs_plane_refusals repack_nonfinite_d={pass} {}",
-                verdict(pass)
-            );
-            ok &= pass;
-            // The plane entry on an odd n_sb (k 768): refused by name — its
-            // d packing needs whole super-block pairs.
-            let stream = dev.gpu.stream();
-            let (n_exp, rows, k) = (16usize, 128usize, 768usize);
-            // The resident is the file words (the writer refuses an odd
-            // n_sb before any launch); the entry asked for is the plane's.
-            let st = Stack {
-                name: "iq2xxs_plane_refusals".into(),
-                ty: GemmWeight::Iq2Xxs,
-                bytes: std::borrow::Cow::Owned(synthetic(
-                    GemmWeight::Iq2Xxs,
-                    n_exp * rows * k / 256,
-                    0x5f6,
-                )),
-                n_exp,
-                rows,
-                k,
-                input: Input::Shared(9),
-            };
-            let mut res = dev.resident_at(&st, 9)?;
-            let ids = route_ids(Routing::Uniform, 1, 9, n_exp, 0x5f7);
-            let x = activations(k, st.input.cols(ids.len()), 0x5f8);
-            let xd = DeviceBuffer::from_host(stream, &x)?;
-            dev.run(&st, &mut res, &xd, &ids)?;
-            let mut y = DeviceBuffer::<f32>::zeroed(stream, ids.len() * st.rows)?;
-            let refused = dev.gk.enqueue_gemm(
-                stream,
-                GemmArgs {
-                    ty: GemmWeight::Iq2XxsPlane,
-                    w: &res.w,
-                    rows_per_expert: st.rows,
-                    act: &res.act,
-                    route: &res.route,
-                    input: GemmInput::Shared { top_k: 9 },
-                    y: &mut y,
-                },
-            );
-            let pass = refused.is_err();
-            println!(
-                "gemm case=iq2xxs_plane_refusals odd_n_sb_768={pass} {}",
                 verdict(pass)
             );
             ok &= pass;
@@ -3117,9 +3127,8 @@ mod gate {
                 let n_rows = n_exp * rows;
                 let filled = fill_pattern(n_rows * words);
                 // The plane arm's words come from the loader's writer over
-                // the same filled file stream (a plane's n_sb is even, so
-                // the file stream is word-aligned throughout); the pattern
-                // keeps the decode off its zero fast path in both entries.
+                // the same filled file stream; the pattern keeps the decode
+                // off its zero fast path in both entries.
                 let words_v = if ty == GemmWeight::Iq2XxsPlane {
                     let file: Vec<u8> = filled.iter().flat_map(|w| w.to_le_bytes()).collect();
                     repack_iq2xxs(&file, n_exp, rows, k)?

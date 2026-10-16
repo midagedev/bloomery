@@ -204,8 +204,12 @@ fn repack_routed(
         .ok_or_else(|| GpuError::tensor(what, &name, "a readable shard"))?
         .data(t)
         .map_err(|e| GpuError::shape(what, format!("{name}: {e}")))?;
-    let words = repack_iq2xxs(bytes, experts, rpe, k)?;
-    let plane = DeviceTensor::upload(stream, &words, experts * rpe, 33 * (k / 256) / 2)?;
+    let mut words = repack_iq2xxs(bytes, experts, rpe, k)?;
+    // The stream_words convention of the file's stacks: whole words a row,
+    // the pad a zero tail at the stream's end (the regions never see it).
+    let cols = words.len().div_ceil(experts * rpe);
+    words.resize(cols * experts * rpe, 0);
+    let plane = DeviceTensor::upload(stream, &words, experts * rpe, cols)?;
     drop(names.w.replace(&name, DevWeight::Iq2Xxs { w: plane, k })?);
     Ok(())
 }

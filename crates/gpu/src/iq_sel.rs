@@ -573,20 +573,20 @@ fn down_sel_body<D: RawSb>(
 
 /// Sub-block `ib` of super-block `sb` of an IQ2_XXS plane row
 /// ([`crate::iq::repack_iq2xxs`]'s layout) whose 16 idx/aux words start at
-/// byte `x` and whose d words at byte `dh`: the sub-block's idx and aux are
-/// clean words, so the decode reads two aligned words where the file twin
-/// reads three of a window.
+/// byte `x`, the expert's d tail at word `dwh` and the row's d halves at
+/// element `de` of its bitstream: the sub-block's idx and aux are clean
+/// words, so the decode reads two aligned words where the file twin reads
+/// three of a window.
 ///
 /// # Safety
 ///
-/// Words `(x >> 2) + 2·ib` and `+ 1` and word `dh >> 2 + sb/2` are inside
-/// `w`.
+/// Words `(x >> 2) + 2·ib` and `+ 1` and word `dwh + de/2` are inside `w`.
 #[inline(always)]
 fn iq2xxs_sub_p(
     w: &[u32],
     x: usize,
-    dh: usize,
-    sb: usize,
+    dwh: usize,
+    de: usize,
     ib: usize,
     tab: Iq2XxsTab,
 ) -> ([u32; 8], i32, f32) {
@@ -595,9 +595,9 @@ fn iq2xxs_sub_p(
     let (wv, ai, dw) = unsafe {
         let (idx, aux) = (*w.get_unchecked(h), *w.get_unchecked(h + 1));
         let (wv, ai) = iq2xxs_sub(idx, aux, tab);
-        (wv, ai, *w.get_unchecked((dh >> 2) + sb / 2))
+        (wv, ai, *w.get_unchecked(dwh + de / 2))
     };
-    let d = half_bits_to_f32((dw >> (16 * (sb & 1) as u32)) as u16) * 0.125;
+    let d = half_bits_to_f32((dw >> (16 * (de & 1) as u32)) as u16) * 0.125;
     (wv, ai, d)
 }
 
@@ -605,10 +605,11 @@ fn iq2xxs_sub_p(
 /// [`crate::weights::DevWeight::Iq2Xxs`] ([`crate::iq::repack_iq2xxs`]'s
 /// layout): the same walk and term, the row's words addressed through its
 /// expert's region — `16·n_sb` idx/aux words a row over `64` bytes a
-/// super-block, the d words `n_sb/2` a row at the region's tail — so every
-/// read is an aligned word. The caller keeps the entry's launch contract:
-/// the plane holds exactly `33·n_sb/2` words a row (`k` a multiple of 512)
-/// and the rest is [`down_sel_body`]'s (rust-quality R28).
+/// super-block, the d halves one bitstream `rows·n_sb/2` words at the
+/// region's tail — so every read is an aligned word. The caller keeps the
+/// entry's launch contract: the plane holds the byte-neutral stream
+/// zero-tail padded to whole words a row (`k` a multiple of 256) and the
+/// rest is [`down_sel_body`]'s (rust-quality R28).
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
@@ -656,12 +657,13 @@ fn down_sel_body_p(
         d_col: 0,
     };
     let (rows, n_sb) = (rows_per_expert as usize, n_sb as usize);
-    // The expert's region: its rows' idx/aux words, then its rows' d words
-    // (usize: a plane stack's word offsets pass u32).
+    // The expert's region: its rows' idx/aux words, then its rows' d halves
+    // as one bitstream (usize: a plane stack's word offsets pass u32).
     let e0 = id as usize * rows * n_sb * 33 / 2;
-    let (qs, dh) = (
+    let (qs, dwh, rde) = (
         4 * (e0 + r as usize * 16 * n_sb),
-        4 * (e0 + rows * 16 * n_sb + r as usize * n_sb / 2),
+        e0 + rows * 16 * n_sb,
+        r as usize * n_sb,
     );
     let n_sub = 8 * n_sb;
     let mut f = 0.0f32;
@@ -675,7 +677,7 @@ fn down_sel_body_p(
         // activation; all 32 lanes of the warp are here (the returns above
         // are warp-uniform).
         let ((xw, dx), (wv, fac, d)) =
-            unsafe { (a.col(0, b), iq2xxs_sub_p(w, x, dh, sb, b & 7, tab)) };
+            unsafe { (a.col(0, b), iq2xxs_sub_p(w, x, dwh, rde + sb, b & 7, tab)) };
         let i = fac * dp4_all(&wv, &xw);
         f = (d * dx).mul_add(i as f32, f);
         b += 32;
@@ -1175,11 +1177,11 @@ mod iq_sel_kernels {
         if row >= n_slots as usize * rows_per_expert as usize {
             return;
         }
-        // The launch contract is the body's (a plane holds exactly 33·n_sb/2
-        // words a row over an even n_sb; n_slots <= m_cols · slots_per_col,
-        // so every slot's column is below m_cols); the host passes n_grp =
-        // ceil(n_sb/4); the return above is warp-uniform and keeps row in
-        // range.
+        // The launch contract is the body's (a plane holds the byte-neutral
+        // stream, its words at least the regions'; n_slots <= m_cols ·
+        // slots_per_col, so every slot's column is below m_cols); the host
+        // passes n_grp = ceil(n_sb/4); the return above is warp-uniform and
+        // keeps row in range.
         down_sel_body_p(
             w,
             q,
@@ -1884,9 +1886,9 @@ impl IqSelKernels {
 
     /// [`IqSelKernels::enqueue_gemv_sel`] over the load-time plane of
     /// [`crate::weights::DevWeight::Iq2Xxs`]: the same arguments and
-    /// refusal order as the IQ2_XXS file entry over a stack whose rows are
-    /// exactly `33·(k/256)/2` words (`k` a multiple of 512), bit for bit its
-    /// outputs.
+    /// refusal order as the IQ2_XXS file entry over a stack whose words are
+    /// the byte-neutral stream zero-tail padded to whole words a row (`k` a
+    /// multiple of 256), bit for bit its outputs.
     pub fn enqueue_gemv_sel_plane(
         &self,
         stream: &CudaStream,
@@ -1948,15 +1950,6 @@ impl IqSelKernels {
             ));
         }
         let n_sb = a.act.n_sb();
-        if !n_sb.is_multiple_of(2) {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "an IQ2_XXS plane packs two super-blocks' d values a word: n_sb {n_sb} is \
-                     odd, so k is not a multiple of 512"
-                ),
-            ));
-        }
         if a.rows_per_expert == 0 || !a.w.rows().is_multiple_of(a.rows_per_expert) {
             return Err(GpuError::shape(
                 what,
@@ -1968,15 +1961,15 @@ impl IqSelKernels {
             ));
         }
         let (n_experts, rpe) = (a.w.rows() / a.rows_per_expert, a.rows_per_expert);
-        let words = n_experts * rpe * 33 * n_sb / 2;
-        if a.w.cols() != 33 * n_sb / 2 || a.w.buf().len() != words {
+        let words = (n_experts * rpe * 33 * n_sb / 2).next_multiple_of(a.w.rows());
+        if a.w.buf().len() != words {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "an IQ2_XXS plane of {n_experts} experts of {rpe} rows at n_sb {n_sb} is \
-                     {} words of {} columns, got {} words of {} columns",
+                    "an IQ2_XXS plane of {n_experts} experts of {rpe} rows at n_sb {n_sb} is the \
+                     byte-neutral stream zero-tail padded to whole words a row: {} words, got {} \
+                     words of {} columns",
                     words,
-                    33 * n_sb / 2,
                     a.w.buf().len(),
                     a.w.cols()
                 ),

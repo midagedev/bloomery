@@ -2707,10 +2707,11 @@ mod gate {
     /// Clause 14: the load-time plane ([`repack_iq2xxs`]) behind
     /// `enqueue_gemv_sel_plane` and `enqueue_gemv_sel_cols_plane`, at
     /// Bolt's widest pair: both legs bit for bit the file entry's over the
-    /// same stack, ids and columns (a relayout may not move a number); an
-    /// id past the stack raises `ExpertId`, its rows at the sentinel, every
-    /// other slot the clean launch's; refused by name an odd n_sb (a k of
-    /// 768) and a words count that is not the plane's exact one.
+    /// same stack, ids and columns (a relayout may not move a number); the
+    /// odd-n_sb geometry of Bolt's routed down stacks (k 768 here) the same
+    /// bits; an id past the stack raises `ExpertId`, its rows at the
+    /// sentinel, every other slot the clean launch's; refused by name a
+    /// words count that is not the plane's padded one.
     fn check_bolt_plane(c: &Ctx) -> Result<bool, GateError> {
         let s = c.gpu.stream();
         let (n, w) = BOLT_PAIRS[3];
@@ -2718,14 +2719,11 @@ mod gate {
         let mut ok = true;
 
         let plane_of = |st: &GuStack| -> Result<DeviceTensor<u32>, GateError> {
-            let n_sb = st.k / 256;
-            let words = repack_iq2xxs(&st.g, st.experts, st.rpe, st.k)?;
-            Ok(DeviceTensor::upload(
-                s,
-                &words,
-                st.experts * st.rpe,
-                33 * n_sb / 2,
-            )?)
+            let rows = st.experts * st.rpe;
+            let mut words = repack_iq2xxs(&st.g, st.experts, st.rpe, st.k)?;
+            let cols = words.len().div_ceil(rows);
+            words.resize(cols * rows, 0);
+            Ok(DeviceTensor::upload(s, &words, rows, cols)?)
         };
         let sel_cols_p = |st: &GuStack,
                           wp: &DeviceTensor<u32>,
@@ -2823,38 +2821,64 @@ mod gate {
             verdict(same),
         );
 
-        // Refused by name: an odd n_sb (k 768) and a words count that is not
-        // the plane's exact one.
+        // The odd-n_sb geometry of Bolt's routed down stacks (k a multiple
+        // of 256 not 512): the plane equals the file entry bit for bit here
+        // too — the d halves cross row ends in one bitstream.
         let odd = bolt_stack(2, 64, 768, 0xb017_4ef6);
-        let x = seeded(9 * 768, 9601, -2.0, 4.0);
-        let (act_o, _c) = slot_act(c, &x, 768, 1, 1)?;
+        let (wo, po) = (odd.upload(s, false)?, plane_of(&odd)?);
+        let xo = seeded(9 * 768, 9601, -2.0, 4.0);
+        let (act_o, _c) = slot_act(c, &xo, 768, 1, 1)?;
         let sel_o = bolt_sel(1, 2);
+        let (yo_f, fo) = sel_cols(c, &wo, &act_o, &sel_o, 64, 1)?;
         let sel_o_dev = DeviceBuffer::from_host(s, &sel_o)?;
-        let mut yo = DeviceBuffer::from_host(s, &vec![SENT; sel_o.len() * 64])?;
-        let refused = c.iqsel.enqueue_gemv_sel_plane(
+        let mut yo_p = DeviceBuffer::from_host(s, &vec![SENT; sel_o.len() * 64])?;
+        c.iqsel.enqueue_gemv_sel_plane(
             s,
             &SelDown {
-                w: &odd.upload(s, false)?,
+                w: &po,
                 act: &act_o,
                 sel: &sel_o_dev,
                 n_slots: sel_o.len(),
                 rows_per_expert: 64,
             },
             c.gpu.unlabelled_sink(),
-            &mut yo,
+            &mut yo_p,
+        )?;
+        s.synchronize()?;
+        let yo_p = yo_p.to_host_vec(s)?;
+        let fault_free = fo.is_none() && c.gpu.take_fault()?.is_none();
+        let odd_bits = bits_equal(&yo_f, &yo_p) && fault_free;
+        ok &= odd_bits;
+        println!(
+            "bolt_plane_odd[IQ2_XXS experts=2 k=768] plane_eq_file_bits={} {}",
+            verdict(odd_bits),
+            verdict(odd_bits),
         );
-        let pass = refused.is_err();
-        println!("bolt_plane_refusals odd_n_sb_768={pass} {}", verdict(pass));
-        ok &= pass;
+
+        // Refused by name: a words count that is not the plane's padded one.
         let st = bolt_stack(2, 64, BOLT_LATENT, 0xb017_4ef7);
         let full = plane_of(&st)?;
-        let short = DeviceTensor::<u32>::upload(
+        let short_words = DeviceTensor::<u32>::upload(
             s,
-            &full.buf().to_host_vec(s)?[..full.buf().len() - 1],
+            &full.buf().to_host_vec(s)?[..full.buf().len() - full.cols()],
             full.rows(),
-            full.cols(),
+            full.cols() - 1,
+        )?;
+        let sel_s = DeviceBuffer::from_host(s, &bolt_sel(1, 2))?;
+        let mut ys = DeviceBuffer::<f32>::zeroed(s, 64)?;
+        let refused = c.iqsel.enqueue_gemv_sel_plane(
+            s,
+            &SelDown {
+                w: &short_words,
+                act: &act_u,
+                sel: &sel_s,
+                n_slots: 1,
+                rows_per_expert: 64,
+            },
+            c.gpu.unlabelled_sink(),
+            &mut ys,
         );
-        let pass = short.is_err();
+        let pass = refused.is_err();
         println!("bolt_plane_refusals short_words={pass} {}", verdict(pass));
         ok &= pass;
         Ok(ok)

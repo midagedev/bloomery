@@ -175,9 +175,10 @@ pub enum GemmWeight {
     Iq2Xxs,
     /// The IQ2_XXS planes of [`crate::weights::DevWeight::Iq2Xxs`]: one flat
     /// word stream an expert (its 16·n_sb idx/aux words a row, then its rows'
-    /// d halves two a word), byte for byte the file's stream re-laid — every
-    /// half a 16-byte run, so the entry stages it into shared memory instead
-    /// of the file stream's per-warp windows. `k` a multiple of 512.
+    /// d halves one bitstream two a word), byte for byte the file's stream
+    /// re-laid — every half a 16-byte run, so the entry stages it into shared
+    /// memory instead of the file stream's per-warp windows. `k` a multiple
+    /// of 256.
     Iq2XxsPlane,
     Iq3Xxs,
     Iq4Xs,
@@ -975,14 +976,15 @@ macro_rules! wst_q4k {
 
 /// The IQ2_XXS plane's staged words: [`wst_q4k`]'s shape over the plane of
 /// [`crate::weights::DevWeight::Iq2Xxs`] — one flat word stream an expert
-/// (`[its rows' 16·n_sb idx/aux words][its rows' n_sb/2 d-half words]`, so
-/// expert `e` starts at word `e·rows·n_sb·33/2`), a row's half its four
-/// sub-blocks' eight words, one 32-byte run staged as two 16-byte chunks (one
-/// a thread: `GEMM_THREADS` = 2·GEMM_BM). The d words stay in global: one
-/// broadcast word a row a step, a seventeenth of the stream. `@decl` fixes
-/// each thread's chunk offset and this warp's two rows' d word bases (usize:
-/// a 4.4 G-word stack's offsets do not fit u32 arithmetic); a row past the
-/// slab's live rows copies the last live row, as [`wst_q4k`].
+/// (`[its rows' 16·n_sb idx/aux words][its rows' d halves as one bitstream,
+/// rows·n_sb/2 words]`, so expert `e` starts at word `e·rows·n_sb·33/2`), a
+/// row's half its four sub-blocks' eight words, one 32-byte run staged as
+/// two 16-byte chunks (one a thread: `GEMM_THREADS` = 2·GEMM_BM). The d
+/// words stay in global: one broadcast word a row a step, a seventeenth of
+/// the stream. `@decl` fixes each thread's chunk offset, the expert's d tail
+/// base and this warp's two rows' d element bases (usize: a 4.4 G-word
+/// stack's offsets do not fit u32 arithmetic); a row past the slab's live
+/// rows copies the last live row, as [`wst_q4k`].
 macro_rules! wst_iq2p {
     (@tile $wt:ident) => {{
         static mut WT: SharedArray<u32, { 2 * WTP_STAGE_W }, 16> = SharedArray::UNINIT;
@@ -1002,13 +1004,15 @@ macro_rules! wst_iq2p {
             let (qs0, dh0) = (e * rows * n_sb * 33 / 2, e * rows * n_sb * 33 / 2 + rows * 16 * n_sb);
             // A thread's 16-byte chunk: row tid / 2 of the slab, the run's
             // half tid & 1. This warp's two rows, clamped to the last live
-            // row, and their d word bases.
+            // row, and their d element bases (row·n_sb into the tail's
+            // bitstream).
             let (ca, c) = (slab + (tid / 2).min(last), tid % 2);
             let ra = (slab + 16 * $wid + $g).min(slab + last);
             (
                 qs0 + ca * 16 * n_sb + 4 * c,
-                dh0 + ra * n_sb / 2,
-                dh0 + (ra + 8).min(slab + last) * n_sb / 2,
+                dh0,
+                ra * n_sb,
+                (ra + 8).min(slab + last) * n_sb,
                 (tid / 2) * WTP_ROW_W + 4 * c,
                 (16 * $wid + $g) * WTP_ROW_W,
             )
@@ -1026,7 +1030,7 @@ macro_rules! wst_iq2p {
         unsafe {
             let src = $w.as_ptr().add($sb * 16 + 8 * hh + $ws.0);
             let dst = $wt.add($st * WTP_STAGE_W);
-            cp_async_cg_16(dst.add($ws.3), src);
+            cp_async_cg_16(dst.add($ws.4), src);
         }
     }};
     (@head [$wt:ident] $dec:ident, $w:ident, $ws:ident, $active:ident, $sb:ident, $hh:ident,
@@ -1043,17 +1047,22 @@ macro_rules! wst_iq2p {
         // published by the barrier after the stage's wait; each d word a word
         // of the plane by the launch contract.
         let (p0, p1) = unsafe {
-            let p0 = $wt.add($st * WTP_STAGE_W).add($ws.4);
+            let p0 = $wt.add($st * WTP_STAGE_W).add($ws.5);
             (p0, p0.add(8 * WTP_ROW_W))
         };
-        let row = |p: *mut u32, db: usize| -> [u32; 13] {
+        let row = |p: *mut u32, db: usize, sh: u32| -> [u32; 13] {
+            // SAFETY: p is this warp's row of stage `st` (the same contract
+            // as the p0/p1 block above), so its two U32x4 reads are inside
+            // the staged tile.
             let w = unsafe {
                 [
                     (*(p as *const U32x4)).0,
                     (*(p.add(4) as *const U32x4)).0,
                 ]
             };
-            let dh = unsafe { *$w2.as_ptr().add(db + sb / 2) };
+            // SAFETY: db is a d word of the plane by the launch contract (the
+            // same contract as the decode's weight reads).
+            let dh = unsafe { *$w2.as_ptr().add(db) };
             let t: u32 = $t as u32;
             let (a0, a1, s0) = iq2xxs_lane(w[0][0], w[0][1], t);
             let (b0, b1, s1) = iq2xxs_lane(w[0][2], w[0][3], t);
@@ -1061,10 +1070,13 @@ macro_rules! wst_iq2p {
             let (d0, d1, s3) = iq2xxs_lane(w[1][2], w[1][3], t);
             [
                 a0, a1, s0, b0, b1, s1, c0, c1, s2, d0, d1, s3,
-                dh >> (16 * (sb & 1) as u32),
+                dh >> sh,
             ]
         };
-        (row(p0, $ws.1), row(p1, $ws.2))
+        (
+            row(p0, $ws.1 + ($ws.2 + sb) / 2, (16 * (($ws.2 + sb) & 1)) as u32),
+            row(p1, $ws.1 + ($ws.3 + sb) / 2, (16 * (($ws.3 + sb) & 1)) as u32),
+        )
     }};
 }
 
@@ -1554,17 +1566,18 @@ impl GemmLaunch {
             ));
         }
         if ty == GemmWeight::Iq2XxsPlane
-            && (!n_sb.is_multiple_of(2)
-                || 2 * w.buf().len() != route.n_experts * rows_per_expert * 33 * n_sb
+            && (w.buf().len()
+                != (route.n_experts * rows_per_expert * 33 * n_sb / 2).next_multiple_of(w.rows())
                 || !w.buf().cu_deviceptr().is_multiple_of(16))
         {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "an IQ2_XXS plane packs two super-blocks' d values a word, so it is exactly \
-                     {} words over a 16-byte-aligned stack: K must be a multiple of 512 and the \
-                     plane byte-neutral; this stack has n_sb {n_sb}, {} words, device address {:#x}",
-                    route.n_experts * rows_per_expert * 33 * n_sb / 2,
+                    "an IQ2_XXS plane's d halves pack one bitstream two a word, so it is the \
+                     byte-neutral stream zero-tail padded to whole words a row ({} words here) \
+                     over a 16-byte-aligned stack; this stack has n_sb {n_sb}, {} words, device \
+                     address {:#x}",
+                    (route.n_experts * rows_per_expert * 33 * n_sb / 2).next_multiple_of(w.rows()),
                     w.buf().len(),
                     w.buf().cu_deviceptr()
                 ),
