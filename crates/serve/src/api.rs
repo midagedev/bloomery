@@ -3808,6 +3808,11 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message, probs: Option<Value>) ->
     })
 }
 
+/// The fixture chat templates the tests below read, shared with `tests/qwenxml.rs`.
+#[cfg(test)]
+#[path = "../tests/common/fixture_templates.rs"]
+mod fixture_templates;
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -4881,7 +4886,7 @@ mod tests {
         assert_eq!(status, 200, "{text}");
     }
 
-    include!("../tests/common/fixture_templates.rs");
+    use super::fixture_templates::FIXTURE_TEMPLATES;
 
     /// Which of the fixture chat templates need a tool call's `arguments` as
     /// an object ([`needs_object_arguments`]): the ones that walk it

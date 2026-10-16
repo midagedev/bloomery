@@ -35,7 +35,9 @@ const TEMPLATE: &str = include_str!("fixtures/qwen38-chat-template.jinja");
 const QWEN36: &str = include_str!("fixtures/qwen36-chat-template.jinja");
 const QWEN3: &str = include_str!("fixtures/qwen3-chat-template.jinja");
 
-include!("common/fixture_templates.rs");
+#[path = "common/fixture_templates.rs"]
+mod fixture_templates;
+use fixture_templates::FIXTURE_TEMPLATES;
 
 /// The fixture template named `name`; a name [`FIXTURE_TEMPLATES`] lacks
 /// fails by name.
