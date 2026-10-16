@@ -403,14 +403,14 @@ impl Iq2XxsTab {
     #[inline(always)]
     pub unsafe fn fill(t: *mut u32) -> Iq2XxsTab {
         let i = thread::threadIdx_x() as usize;
-        // SAFETY: i < 256 (the block), so word i of the grid and of the
-        // table, and for i < 128 word 256 + i < 384, are in bounds; each
-        // thread writes its own words.
-        unsafe {
-            *t.add(i) = *GRID2XXS_SEL.get_unchecked(i);
-            if i < 128 {
-                *t.add(256 + i) = sign_sel(signs_of(i as u32));
-            }
+        // SAFETY: the block has 256 threads, so i < GRID2XXS_SEL.len().
+        let grid = unsafe { *GRID2XXS_SEL.get_unchecked(i) };
+        // SAFETY: t holds 384 shared words; thread i alone writes word i < 256.
+        unsafe { *t.add(i) = grid };
+        if i < 128 {
+            let sign = sign_sel(signs_of(i as u32));
+            // SAFETY: 256 + i < 384; this thread alone writes this sign word.
+            unsafe { *t.add(256 + i) = sign };
         }
         thread::sync_threads();
         Iq2XxsTab(t)
@@ -426,9 +426,11 @@ impl Iq2XxsTab {
 pub(crate) fn iq2xxs_sub(idx: u32, aux: u32, tab: Iq2XxsTab) -> ([u32; 8], i32) {
     let group = |l: u32| {
         let (e, si) = ((idx >> (8 * l)) & 255, (aux >> (7 * l)) & 127);
-        // SAFETY: e < 256 and 256 + si < 384, inside the filled table
-        // (Iq2XxsTab::fill's barrier published it).
-        let sel = unsafe { *tab.0.add(e as usize) | *tab.0.add(256 + si as usize) };
+        // SAFETY: e < 256; fill's barrier published this grid word.
+        let grid = unsafe { *tab.0.add(e as usize) };
+        // SAFETY: 256 + si < 384; fill's barrier published this sign word.
+        let sign = unsafe { *tab.0.add(256 + si as usize) };
+        let sel = grid | sign;
         (
             prmt(IQ2XXS_POS, IQ2XXS_NEG, sel),
             prmt(IQ2XXS_POS, IQ2XXS_NEG, sel >> 16),

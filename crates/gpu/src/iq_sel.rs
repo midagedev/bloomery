@@ -398,7 +398,7 @@ impl RawSb for Iq4Xs {
 /// columns of `256 · n_grp` q words and `2 · n_sb` scales (`n_grp =
 /// ceil(n_sb / 4)`), `sel.len() >= n_slots`, `h.len() >= n_slots ·
 /// rows_per_expert`; `row < n_slots · rows_per_expert` is the calling warp's
-/// row (one warp a row), all 32 lanes of the warp here; `tab` is `D`'s table
+/// row (one warp a row), all 32 lanes of the warp here
 /// (rust-quality R28: a crate-internal fn over unchecked reads under a
 /// caller-kept boundary).
 #[allow(
@@ -406,7 +406,7 @@ impl RawSb for Iq4Xs {
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-fn gate_up_sel_body<D: RawSb>(
+fn gate_up_sel_body<D: RawSb<Tab = ()>>(
     wg: &[u32],
     wu: &[u32],
     q: &[u32],
@@ -422,7 +422,6 @@ fn gate_up_sel_body<D: RawSb>(
     fault: FaultSink,
     row: usize,
     h: &mut DisjointSlice<f32>,
-    tab: D::Tab,
 ) {
     // In u32: the launchers bound n_slots · rows_per_expert to u32, and a
     // usize division is a 64-bit emulation ahead of the first weight load.
@@ -467,8 +466,8 @@ fn gate_up_sel_body<D: RawSb>(
         let ((xw, dx), (wgw, gai, gd), (wuw, uai, ud)) = unsafe {
             (
                 a.col(0, b),
-                D::sub(wg, x, b & 7, tab),
-                D::sub(wu, x, b & 7, tab),
+                D::sub(wg, x, b & 7, ()),
+                D::sub(wu, x, b & 7, ()),
             )
         };
         let i = D::dot(&wgw, gai, &xw);
@@ -717,7 +716,6 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut h,
-            (),
         );
     }
 
@@ -790,7 +788,6 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut h,
-            (),
         );
     }
 
@@ -863,7 +860,6 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut h,
-            (),
         );
     }
 
@@ -935,7 +931,6 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut h,
-            (),
         );
     }
 
