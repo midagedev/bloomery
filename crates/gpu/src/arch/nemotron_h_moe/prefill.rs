@@ -105,17 +105,15 @@ struct PassBufs {
     probs: DeviceBuffer<f32>,
     ids: DeviceBuffer<u32>,
     weights: DeviceBuffer<f32>,
-    /// The latent down's rows; the slots' up rows and their squared ReLU
-    /// (the widest expert); the slots' down rows; the rows' weighted sums.
+    /// The latent down's rows; the slots' up rows (the widest expert); the
+    /// slots' down rows; the rows' weighted sums.
     lat: DeviceBuffer<f32>,
     up: DeviceBuffer<f32>,
-    act: DeviceBuffer<f32>,
     down: DeviceBuffer<f32>,
     moe: DeviceBuffer<f32>,
-    /// The shared expert's up rows, their squared ReLU and its down rows,
-    /// then `moe_out + shared`.
+    /// The shared expert's up rows and its down rows, then `moe_out +
+    /// shared`.
     sh_up: DeviceBuffer<f32>,
-    sh_act: DeviceBuffer<f32>,
     sh: DeviceBuffer<f32>,
     sum: DeviceBuffer<f32>,
     /// One id 0 a row: the shared expert's slots.
@@ -240,11 +238,9 @@ impl Prompt {
                 weights: z(TOP_K)?,
                 lat: z(moe.latent)?,
                 up: z(TOP_K * ff)?,
-                act: z(TOP_K * ff)?,
                 down: z(TOP_K * moe.latent)?,
                 moe: z(moe.latent)?,
                 sh_up: z(moe.shared_ff)?,
-                sh_act: z(moe.shared_ff)?,
                 sh: z(sh.hidden)?,
                 sum: z(sh.hidden)?,
                 zero_ids: DeviceBuffer::zeroed(stream, cut)?,
@@ -270,8 +266,8 @@ impl Prompt {
     pub(super) fn bytes(&self) -> usize {
         let b = &self.b;
         let f = [
-            &self.x[0], &self.x[1], &b.kh, &b.vh, &b.probs, &b.weights, &b.lat, &b.up, &b.act,
-            &b.down, &b.moe, &b.sh_up, &b.sh_act, &b.sh, &b.sum,
+            &self.x[0], &self.x[1], &b.kh, &b.vh, &b.probs, &b.weights, &b.lat, &b.up, &b.down,
+            &b.moe, &b.sh_up, &b.sh, &b.sum,
         ]
         .iter()
         .map(|b| b.num_bytes())
@@ -475,7 +471,7 @@ fn moe_rows(
             &mut p.ex,
             (fault, ml, sh.latent, ty),
             &p.ids,
-            (&p.lat, &mut p.up, &mut p.act, &mut p.down),
+            (&p.lat, &mut p.up, &mut p.down),
         )?;
     } else {
         {
@@ -490,11 +486,9 @@ fn moe_rows(
             };
             iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, TOP_K, fault, &mut p.up)?;
         }
-        gpu.elem()
-            .enqueue_relu_sqr(stream, &p.up, slots * ml.ff, &mut p.act)?;
         {
             let act = slot_form(&mut p.slots, ml.ff, slots)?;
-            gpu.quantize_q8_1_cols_at(&p.act, 0, act, slots, fault)?;
+            gpu.quantize_q8_1_cols_at_relu_sqr(&p.up, 0, act, slots, fault)?;
             let down = SelDown {
                 w: stack(w, &ml.down_exps)?,
                 act,
@@ -528,7 +522,7 @@ fn moe_rows(
             (&mut p.ex, &p.arms.route),
             (fault, ml, sh.shared_ff, hidden, ty),
             &p.buf.xn,
-            (&mut p.sh_up, &mut p.sh_act, &mut p.sh),
+            (&mut p.sh_up, &mut p.sh),
         )?;
     } else {
         {
@@ -543,11 +537,9 @@ fn moe_rows(
             };
             iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &up, fault, &mut p.sh_up)?;
         }
-        gpu.elem()
-            .enqueue_relu_sqr(stream, &p.sh_up, m * sh.shared_ff, &mut p.sh_act)?;
         {
             let act = slot_form(&mut p.slots, sh.shared_ff, m)?;
-            gpu.quantize_q8_1_cols_at(&p.sh_act, 0, act, m, fault)?;
+            gpu.quantize_q8_1_cols_at_relu_sqr(&p.sh_up, 0, act, m, fault)?;
             let down = SelDown {
                 w: stack(w, &ml.down_shexp)?,
                 act,
@@ -583,9 +575,8 @@ fn experts_gemm(
     ex: &mut ExpertArms,
     (fault, ml, latent, ty): (FaultSink, &MoeLayer, usize, GemmWeight),
     ids: &DeviceBuffer<u32>,
-    (lat, up, act, down): (
+    (lat, up, down): (
         &DeviceBuffer<f32>,
-        &mut DeviceBuffer<f32>,
         &mut DeviceBuffer<f32>,
         &mut DeviceBuffer<f32>,
     ),
@@ -618,10 +609,8 @@ fn experts_gemm(
             },
         )?;
     }
-    gpu.elem()
-        .enqueue_relu_sqr(stream, up, slots * ml.ff, act)?;
     let a = gemm_form(&mut ex.acts, ml.ff, slots)?;
-    gpu.enqueue_quantize_gemm(act, slots, a, fault)?;
+    gpu.enqueue_quantize_gemm_relu_sqr(up, slots, a, fault)?;
     cx.wk.gemm.enqueue_gemm(
         stream,
         GemmArgs {
@@ -644,11 +633,7 @@ fn shared_gemm(
     (ex, dense): (&mut ExpertArms, &GemmRoute),
     (fault, ml, shared_ff, hidden, ty): (FaultSink, &MoeLayer, usize, usize, GemmWeight),
     xn: &DeviceBuffer<f32>,
-    (up, act, y): (
-        &mut DeviceBuffer<f32>,
-        &mut DeviceBuffer<f32>,
-        &mut DeviceBuffer<f32>,
-    ),
+    (up, y): (&mut DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
 ) -> Result<(), GpuError> {
     let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
     let stream = gpu.stream();
@@ -668,10 +653,8 @@ fn shared_gemm(
             },
         )?;
     }
-    gpu.elem()
-        .enqueue_relu_sqr(stream, up, m * shared_ff, act)?;
     let a = gemm_form(&mut ex.acts, shared_ff, m)?;
-    gpu.enqueue_quantize_gemm(act, m, a, fault)?;
+    gpu.enqueue_quantize_gemm_relu_sqr(up, m, a, fault)?;
     cx.wk.gemm.enqueue_gemm(
         stream,
         GemmArgs {

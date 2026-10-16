@@ -151,6 +151,30 @@ impl Gpu {
         act: &mut GemmAct,
         fault: FaultSink,
     ) -> Result<(), GpuError> {
+        self.enqueue_quantize_gemm_(x, n_cols, act, false, fault)
+    }
+
+    /// [`Gpu::enqueue_quantize_gemm`] through `q3k_quantize_q8_1_relu_sqr`:
+    /// the up rows' buffer quantized for the down GEMM with the squared
+    /// ReLU applied inside the load, no elem pass over an activation buffer.
+    pub fn enqueue_quantize_gemm_relu_sqr(
+        &self,
+        x: &DeviceBuffer<f32>,
+        n_cols: usize,
+        act: &mut GemmAct,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        self.enqueue_quantize_gemm_(x, n_cols, act, true, fault)
+    }
+
+    fn enqueue_quantize_gemm_(
+        &self,
+        x: &DeviceBuffer<f32>,
+        n_cols: usize,
+        act: &mut GemmAct,
+        relu_sqr: bool,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
         let what = "enqueue_quantize_gemm";
         if n_cols == 0 || n_cols > act.cols {
             return Err(GpuError::shape(
@@ -168,25 +192,47 @@ impl Gpu {
         let grid = launch_u32(what, "grid", n_cols * n_sb * 2)?;
         let m = launch_u32(what, "n_cols", n_cols)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_q3k_quantize_q8_1(LaunchConfig1D::new(grid, 32, 0))?;
-        self.module.q3k_quantize_q8_1(
-            &self.stream,
-            &prep,
-            x,
-            0,
-            m,
-            n_sb,
-            n_sb.div_ceil(2),
-            n_sb.div_ceil(4),
-            &mut act.q3,
-            &mut act.q4,
-            &mut act.q6,
-            &mut act.s8,
-            &mut act.d8,
-            fault,
-        )?;
+        if relu_sqr {
+            let prep = self
+                .module
+                .prepare_q3k_quantize_q8_1_relu_sqr(LaunchConfig1D::new(grid, 32, 0))?;
+            self.module.q3k_quantize_q8_1_relu_sqr(
+                &self.stream,
+                &prep,
+                x,
+                0,
+                m,
+                n_sb,
+                n_sb.div_ceil(2),
+                n_sb.div_ceil(4),
+                &mut act.q3,
+                &mut act.q4,
+                &mut act.q6,
+                &mut act.s8,
+                &mut act.d8,
+                fault,
+            )?;
+        } else {
+            let prep = self
+                .module
+                .prepare_q3k_quantize_q8_1(LaunchConfig1D::new(grid, 32, 0))?;
+            self.module.q3k_quantize_q8_1(
+                &self.stream,
+                &prep,
+                x,
+                0,
+                m,
+                n_sb,
+                n_sb.div_ceil(2),
+                n_sb.div_ceil(4),
+                &mut act.q3,
+                &mut act.q4,
+                &mut act.q6,
+                &mut act.s8,
+                &mut act.d8,
+                fault,
+            )?;
+        }
         Ok(())
     }
 }
