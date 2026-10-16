@@ -128,6 +128,7 @@ generate_ds41   gdn_norm_gate_sigmoid                    0           0
 # jit_local is ptxas 13.3.73's sm_86 stack frame, not read on a cc 8.6 card; the two agree on every row of this table and of both cc 12.1 tables.
 generate_ds41   geglu_tanh                               0           0
 generate_ds41   gemm_iq3xxs              0  0
+generate_ds41   gemm_iq2xxs              0  0
 generate_ds41   gemm_iq4nl               0  0
 generate_ds41   gemm_iq4xs               0  0
 generate_ds41   gemm_q3k                                 0           0
@@ -406,6 +407,7 @@ gate_e2e   gdn_norm_gate_sigmoid                    0           0
 # jit_local is ptxas 13.3.73's sm_86 stack frame, not read on a cc 8.6 card; the two agree on every row of this table and of both cc 12.1 tables.
 gate_e2e   geglu_tanh                               0           0
 gate_e2e   gemm_iq3xxs              0  0
+gate_e2e   gemm_iq2xxs              0  0
 gate_e2e   gemm_iq4nl               0  0
 gate_e2e   gemm_iq4xs               0  0
 gate_e2e   gemm_q3k                                 0           0
