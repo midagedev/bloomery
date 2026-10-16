@@ -266,7 +266,10 @@ gguf 9 2 0
 # PIN(2026-10-16): gpu 201 -> 202 fns, new code, not old code relaxed: enqueue_head_norm_neox_append_256_whole is an
 # unsafe fn whose Safety section names the distinct positions its caller keeps (two tokens at one position write one
 # cache row from two blocks).
-gpu 1863 202 10
+# PIN(2026-10-16): gpu 1863 -> 1865 blocks, a new kernel entry, not old code relaxed: gemm_nvfp4p's w32! relays (the
+# nvfp4p @load of the unit's four code words and scale word, the @store of its eight staged code words and two
+# sub-block scales; the step loop's two mma blocks moved into mma_epi32!'s arms unchanged), each with its SAFETY line.
+gpu 1865 202 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
