@@ -27,7 +27,7 @@ use runtime::seqstate::Kept;
 use runtime::{Speculative, Tapped};
 
 use crate::mtp::{MtpBody, MtpDraft};
-use crate::{Keep, Prompt, Session, SessionError};
+use crate::{Keep, Prompt, Session, SessionError, cut_positions, keep_positions};
 mod mtp;
 
 const WHAT: &str = "qwen4exp session";
@@ -71,10 +71,7 @@ impl Keep for Body38 {
     /// a waiting verify's kept rows, or the checkpoint at `n`, any other
     /// position refused by name.
     fn cut(m: &mut Qwen38Model, n: u32) -> Result<(), GpuError> {
-        match n {
-            0 => m.reset(),
-            n => m.rollback(n),
-        }
+        cut_positions(m, n)
     }
 }
 
@@ -112,17 +109,14 @@ impl Keep for Body {
     /// [`Rollback`](bloomery_gpu::model::Rollback) takes a position back
     /// without device work.
     fn keepable(m: &Qwen3moeModel, n: u32) -> u32 {
-        n.min(m.pos())
+        keep_positions(m, n)
     }
 
     /// Back to empty at 0 — a reset; else the model's rollback
     /// ([`Rollback`](bloomery_gpu::model::Rollback)), which the caches take
     /// as given.
     fn cut(m: &mut Qwen3moeModel, n: u32) -> Result<(), GpuError> {
-        match n {
-            0 => m.reset(),
-            n => m.rollback(n),
-        }
+        cut_positions(m, n)
     }
 }
 
@@ -162,10 +156,7 @@ impl Keep for Body35 {
     /// ([`Rollback`](bloomery_gpu::model::Rollback)): the checkpoint at
     /// `n`, any other position refused by name.
     fn cut(m: &mut Qwen35moeModel, n: u32) -> Result<(), GpuError> {
-        match n {
-            0 => m.reset(),
-            n => m.rollback(n),
-        }
+        cut_positions(m, n)
     }
 }
 

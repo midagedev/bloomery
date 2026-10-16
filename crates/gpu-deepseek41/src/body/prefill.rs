@@ -134,6 +134,7 @@ use crate::router::N_EXPERT;
 use crate::span::{span, span_mut};
 use bloomery_gpu::Fault;
 use bloomery_gpu::fault::read_cards;
+use runtime::prompt::{GROUP_LEVER, group_sets, groups};
 
 /// Positions one batch runs at most: the host union's columns.
 pub const T_MAX: usize = UNION_MAX_COLS;
@@ -164,11 +165,7 @@ const WHAT: &str = "deepseek41 prefill";
 /// How a prompt is fed (`BLOOMERY_PREFILL`, [`super::BodyLevers::prefill`]):
 /// in batches ([`prefill`]) or one decode step per id — the same-binary timing
 /// arm, which is the decode step and not a second implementation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrefillMode {
-    Batch,
-    Steps,
-}
+pub use runtime::prompt::PrefillMode;
 
 /// The kind of a media span's position, the reference's
 /// `image_token_types` (`IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END`):
@@ -244,25 +241,6 @@ impl CallMedia<'_> {
     }
 }
 
-impl PrefillMode {
-    /// The mode [`PrefillMode::name`] names; `None` for any other word.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<PrefillMode> {
-        [PrefillMode::Batch, PrefillMode::Steps]
-            .into_iter()
-            .find(|m| m.name() == name)
-    }
-
-    /// The name a `load` line prints, and `BLOOMERY_PREFILL` takes.
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            PrefillMode::Batch => "batch",
-            PrefillMode::Steps => "steps",
-        }
-    }
-}
-
 /// Make the batch's buffers: the one maker, a load-time call — a prompt
 /// call ([`prefill`]) on a body without them is refused by name, so no call
 /// loads a module or allocates. A load with an expert tier and the batch feed
@@ -299,20 +277,10 @@ pub fn batch_count(n: usize) -> usize {
 }
 
 /// The batches a call of `n` positions from `first` runs: [`batch_count`]
-/// of them, the first `n mod k` one position longer than the rest. Each
-/// layer reads every host expert its batch's tokens route to once, so a
-/// short last batch would pay that read for few tokens.
+/// of them ([`runtime::prompt::batches`] at [`T_MAX`] positions).
 #[must_use]
 pub fn batches(first: usize, n: usize) -> Vec<Range<usize>> {
-    let k = batch_count(n);
-    let mut out = Vec::with_capacity(k);
-    let mut p = first;
-    for j in 0..k {
-        let len = n / k + usize::from(j < n % k);
-        out.push(p..p + len);
-        p += len;
-    }
-    out
+    runtime::prompt::batches(first, n, T_MAX)
 }
 
 /// A prompt call's plan as its enqueue runs it: the batches ([`batches`]),
@@ -830,45 +798,16 @@ fn take_back(m: &mut Deepseek41Model, first: usize, e: GpuError) -> GpuError {
 /// batch alone, every layer of it before the next batch's first — refused by
 /// name, with its value, unless it is from 1 to [`GROUP_MAX`].
 pub(super) fn check_group(group: usize) -> Result<(), GpuError> {
-    if (1..=GROUP_MAX).contains(&group) {
-        Ok(())
-    } else {
-        Err(GpuError::Shape {
-            what: "BLOOMERY_PREFILL_GROUP",
-            detail: format!("{group} batches, where a group holds 1 to {GROUP_MAX}"),
-        })
-    }
+    runtime::prompt::check_group(group, GROUP_MAX).map_err(|r| GpuError::Shape {
+        what: GROUP_LEVER,
+        detail: r.to_string(),
+    })
 }
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the lever registry's, the most its
 /// row's kind takes.
 const GROUP_MAX: usize = bloomery_levers::PREFILL_GROUP_MAX as usize;
 const _: () = assert!(GROUP_MAX as u64 == bloomery_levers::PREFILL_GROUP_MAX);
-
-/// Batches a group holds at most under a lever of `g`: `g`, and one more
-/// from 2 on — a call's lone last batch joins the group before it
-/// ([`groups`]).
-fn group_sets(g: usize) -> usize {
-    if g >= 2 { g + 1 } else { 1 }
-}
-
-/// The groups of a call of `k` batches under a lever of `g`: runs of `g`
-/// consecutive batches, where a lone last batch joins the run before it —
-/// a group of one runs no route under another batch's union. A call of one
-/// batch is one group of one.
-fn groups(k: usize, g: usize) -> Vec<Range<usize>> {
-    let g = g.max(1);
-    let mut out: Vec<Range<usize>> = (0..k).step_by(g).map(|s| s..(s + g).min(k)).collect();
-    if g >= 2
-        && out.len() >= 2
-        && out.last().is_some_and(|r| r.len() == 1)
-        && let Some(tail) = out.pop()
-        && let Some(prev) = out.last_mut()
-    {
-        prev.end = tail.end;
-    }
-    out
-}
 
 /// A batch's own buffers in its group: per token its streams and folds,
 /// ping and pong; per chunk, per indexer layer, its list of [`CHUNK`]

@@ -40,10 +40,21 @@
 //!   in every window layer; the 4,096-position one has the nine full layers
 //!   read the whole context.
 //!
-//! `--only s|p|c|t` runs one clause on the load; `--step-sets short` takes
+//! - (b) the batch feed: each long step set ([`D1K`](refset::arch::mimo2::D1K),
+//!   [`D4096`](refset::arch::mimo2::D4096)) fed by batches
+//!   ([`bloomery_gpu_mimo2::prefill`]: up to a union's columns a batch, the
+//!   window layers' flash over a whole batch and the full layers' in chunks),
+//!   from a reset, then the step: the prefill's argmax, the step's logits and
+//!   the step's layer outputs equal those of the set fed by our steps bit for
+//!   bit — (t)'s run, or its own when (b) runs without (t). The 1,024-position
+//!   prefill is two batches and the 4,096-position one eight, so the cut at a
+//!   batch's end and a flash over a window of real keys are both on the path.
+//!
+//! `--only s|p|c|t|b` runs one clause on the load; `--step-sets short` takes
 //! (t)'s two 4-token sets only, `--step-sets long` the 1,024- and
-//! 4,096-position sets only, `--step-sets all` (the default) all four; it
-//! goes with `--only t` or no `--only`.
+//! 4,096-position sets only, `--step-sets d1k` the 1,024-position one,
+//! `--step-sets all` (the default) all four; it goes with `--only t`, `--only
+//! b` or no `--only`, and (b) takes the long sets among those it names.
 //!
 //! Every clause prints one elapsed line when it ends: `clause (c) in 3.2 s
 //! (runtime value)`.
@@ -82,26 +93,26 @@ mod gate_card;
 mod e2e;
 
 #[cfg(feature = "mimo2")]
+#[path = "shared/mimo2_open.rs"]
+mod mimo2_open;
+
+#[cfg(feature = "mimo2")]
 mod gate {
-    use crate::e2e::{
-        elapsed, ik_last, layer_rels, layer_table, same_bits, set_open, tie_numbers, word_after,
-    };
+    use crate::e2e::{elapsed, ik_last, layer_rels, layer_table, same_bits, set_open, word_after};
+    use crate::mimo2_open::{N_VOCAB, Opened, last_argmax, open};
+    use std::path::Path;
     use std::time::Instant;
 
-    use app::arch::mimo2::Mimo2Cfg;
-    use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_gates::flip::tie_allowed;
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::{Fnv1a64, GateError, RefManifest, checks_failed, data_dir, verdict};
-    use bloomery_gpu_mimo2::{Body, Mimo2Model, set_taps};
+    use bloomery_gpu_mimo2::{Mimo2Model, set_taps};
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::mimo2::place::PlanInputs;
     use model::arch::mimo2::program::{AttnArgs, step_launches};
     use model::arch::models::Mixer;
-    use model::placement::{Machine, Plan, PlanLevers};
     use refset::arch::mimo2::{BATCH, D1K, D4096, IK, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::FfnKind;
@@ -110,9 +121,8 @@ mod gate {
     /// margin of whole 64 positions.
     const CTX: usize = 4160;
 
-    /// The model's width, vocabulary and layer count.
+    /// The model's width and layer count.
     const HIDDEN: usize = 4096;
-    const N_VOCAB: usize = 152_576;
     const N_LAYER: usize = 48;
 
     /// PIN(2026-10-08): the captured decode step's node count, derived before
@@ -144,84 +154,6 @@ mod gate {
     const THETA_FULL: f32 = 1.0e7;
     const THETA_WINDOW: f32 = 1.0e4;
     const V_SCALE: f32 = 0.707;
-
-    /// No band yet on a named tie's logits row against the head input's
-    /// distance (the forced arm that measures one is a later round's): the
-    /// tie is ik's runner-up inside twice our distance at the two ids, and the
-    /// row's and the last layer's distances are printed.
-    const HEAD_BAND: f64 = f64::INFINITY;
-
-    /// What the open decided besides the session: the plan's card experts a
-    /// layer.
-    struct Opened {
-        n_l: Vec<u64>,
-    }
-
-    /// The open's records, as the gate prints them.
-    struct Log {
-        t: Instant,
-        n_l: Vec<u64>,
-    }
-
-    impl OpenLog<Body> for Log {
-        fn plan(
-            &mut self,
-            place: &'static str,
-            _inputs: &PlanInputs,
-            _machine: &Machine,
-            plan: &Plan<'_>,
-        ) -> Result<bool, SessionError> {
-            println!(
-                "plan place={place} ctx_max={} host_experts={} card_experts={}",
-                plan.ctx_max, plan.host.experts, plan.cards[0].experts
-            );
-            self.n_l = plan.n_l.clone();
-            Ok(true)
-        }
-
-        fn load(&mut self, m: &Mimo2Model) -> Result<(), SessionError> {
-            println!(
-                "load resident_bytes={} ctx={CTX} layers={} in {:.1} s (runtime value)",
-                m.resident_bytes(),
-                m.layers().len(),
-                self.t.elapsed().as_secs_f64()
-            );
-            Ok(())
-        }
-
-        fn capture(&mut self, _nodes: usize) -> Result<(), SessionError> {
-            Ok(())
-        }
-
-        fn prompt_buffers(&mut self, _m: &Mimo2Model) -> Result<(), SessionError> {
-            Ok(())
-        }
-    }
-
-    /// The session at [`CTX`] positions on the gate placement, its prompts
-    /// fed one step an id.
-    fn open(levers: &bloomery_levers::Levers) -> Result<(Session<Body>, Opened), GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
-        let cfg = Mimo2Cfg {
-            place: PlanLevers::from_levers(levers)?,
-            host: levers.host(),
-        };
-        let mut log = Log {
-            t: Instant::now(),
-            n_l: Vec::new(),
-        };
-        let args = OpenArgs {
-            place: "gate",
-            machine: crate::gate_card::plan_gate,
-            ctx: CTX,
-            mode: StepMode::Graph,
-            cfg,
-        };
-        let s = Loaded::<Body>::open(file, args, &mut log)?
-            .ok_or("the open stopped at its plan")?
-            .ready(&mut log)?;
-        Ok((s, Opened { n_l: log.n_l }))
-    }
 
     // ------------------------------------------------------ (s) structure
 
@@ -404,26 +336,6 @@ mod gate {
         Ok(())
     }
 
-    /// The last position's argmax against ik's: equal, or a named tie
-    /// ([`tie_allowed`], no band on the logits row). Prints the numbers; the
-    /// verdict and whether it was a tie.
-    fn last_argmax(what: &str, (ours, ik): (&[f32], &[f32]), input_rel: f64) -> (bool, bool) {
-        let (top, ik_top, ik_2, margin, dist, logits_rel) = tie_numbers(ours, ik);
-        let tie = tie_allowed(
-            (top, ik_top, ik_2),
-            (margin, dist),
-            (logits_rel, input_rel),
-            HEAD_BAND,
-        );
-        println!(
-            "{what}: argmax ours={top} ik={ik_top} (ik's runner-up {ik_2}, margin {margin:.4}, \
-             our distance at the two {dist:.4}, logits_rel {logits_rel:.3e} against the last \
-             layer's {input_rel:.3e}{})",
-            if tie { ", a named tie" } else { "" }
-        );
-        (top == ik_top || tie, tie)
-    }
-
     /// (c): the batch set's tokens as eager steps, the last position's argmax
     /// against ik's, each layer's output by position printed.
     fn free(m: &mut Mimo2Model, man: &RefManifest, toks: &[u32]) -> Result<bool, GateError> {
@@ -462,32 +374,54 @@ mod gate {
 
     // ------------------------------------------------------------ (t) sets
 
+    /// A set's prefill fed one way and its step after it: the prefill's
+    /// argmax, the step's layer outputs and its logits.
+    struct Fed {
+        prefill_argmax: u32,
+        taps: Vec<f32>,
+        logits: Vec<f32>,
+    }
+
+    /// `prefill` fed by our steps from a reset, then the step of `tok`.
+    fn fed_by_steps(m: &mut Mimo2Model, prefill: &[u32], tok: u32) -> Result<Fed, GateError> {
+        m.reset()?;
+        let prefill_argmax = if prefill.is_empty() {
+            0
+        } else {
+            m.step(prefill)?
+        };
+        let (taps, logits) = run_last(m, tok)?;
+        Ok(Fed {
+            prefill_argmax,
+            taps,
+            logits,
+        })
+    }
+
     /// The step of set `name` after its prefill fed by our steps; its argmax
-    /// against ik's, a tie named and counted; its layer outputs printed.
+    /// against ik's, a tie named and counted; its layer outputs printed. The
+    /// run, which (b) holds the batch feed to.
     fn step_set(
         m: &mut Mimo2Model,
         (name, family): (&str, &Family),
         ties: &mut usize,
-    ) -> Result<bool, GateError> {
+    ) -> Result<(bool, Fed), GateError> {
         let (man, pos, tok, prefill, _) = set_open((name, family), None)?;
         taps_in_set(&man)?;
-        m.reset()?;
         let t = Instant::now();
-        if !prefill.is_empty() {
-            m.step(&prefill)?;
-        }
-        let (taps, logits) = run_last(m, tok)?;
+        let fed = fed_by_steps(m, &prefill, tok)?;
+        let (taps, logits) = (&fed.taps, &fed.logits);
         let ik = ik_last(&man, N_VOCAB)?;
-        let rels = layer_rels(&man, std::slice::from_ref(&taps), HIDDEN, N_LAYER)?;
+        let rels = layer_rels(&man, std::slice::from_ref(taps), HIDDEN, N_LAYER)?;
         let input_rel = rels.last().map_or(f64::INFINITY, |r| r.0);
         for (l, &(e, _)) in rels.iter().enumerate() {
             println!("{name} layer={l} l_out_rel={e:.3e}");
         }
         println!(
             "step {name}: logits digest {:016x} (FNV-1a over the f32 bits)",
-            Fnv1a64::default().f32s(&logits).value()
+            Fnv1a64::default().f32s(logits).value()
         );
-        let (ok, tie) = last_argmax(&format!("step {name}"), (&logits, &ik), input_rel);
+        let (ok, tie) = last_argmax(&format!("step {name}"), (logits, &ik), input_rel);
         *ties += usize::from(tie);
         println!(
             "step {name}: position {pos} after {} fed ({:.1} s, runtime value); worst \
@@ -495,6 +429,56 @@ mod gate {
             prefill.len(),
             t.elapsed().as_secs_f64(),
             rels.iter().map(|r| r.0).fold(0.0, f64::max),
+            verdict(ok)
+        );
+        Ok((ok, fed))
+    }
+
+    // -------------------------------------------------------- (b) batch feed
+
+    /// The step of set `name` after its prefill fed by batches from a reset,
+    /// held bit for bit to `steps`, the same set fed by our steps: the
+    /// prefill's argmax, the step's logits and its layer outputs.
+    fn batch_set(
+        m: &mut Mimo2Model,
+        (name, family): (&str, &Family),
+        steps: Option<Fed>,
+    ) -> Result<bool, GateError> {
+        let (_, pos, tok, prefill, _) = set_open((name, family), None)?;
+        let steps = match steps {
+            Some(f) => f,
+            None => {
+                let t = Instant::now();
+                let f = fed_by_steps(m, &prefill, tok)?;
+                println!(
+                    "batch {name}: the steps' run, {:.1} s (runtime value)",
+                    t.elapsed().as_secs_f64()
+                );
+                f
+            }
+        };
+        m.reset()?;
+        let t = Instant::now();
+        let prefill_argmax = bloomery_gpu_mimo2::prefill(m, &prefill)?;
+        let fed_s = t.elapsed().as_secs_f64();
+        if let Some(b) = bloomery_gpu_mimo2::prompt_bytes(m)? {
+            println!(
+                "batch {name}: the batch's buffers take {} B over {} unit(s), and the card has {} B \
+                 free after them (runtime value)",
+                b.total, b.units, b.free
+            );
+        }
+        let (taps, logits) = run_last(m, tok)?;
+        let argmax_ok = prefill_argmax == steps.prefill_argmax;
+        let logits_ok = same_bits(&logits, &steps.logits);
+        let taps_ok = same_bits(&taps, &steps.taps);
+        let ok = argmax_ok && logits_ok && taps_ok;
+        println!(
+            "batch {name}: position {pos} after {} fed by batches ({fed_s:.1} s, runtime value); \
+             the prefill's argmax {prefill_argmax} (steps {}); logits bit for bit {logits_ok}; \
+             layer outputs bit for bit {taps_ok} {}",
+            prefill.len(),
+            steps.prefill_argmax,
             verdict(ok)
         );
         Ok(ok)
@@ -525,9 +509,10 @@ mod gate {
         P,
         C,
         T,
+        B,
     }
 
-    /// Which step sets (t) takes.
+    /// Which step sets (t) and (b) take.
     #[derive(Clone, Copy)]
     enum StepSets {
         All,
@@ -535,6 +520,8 @@ mod gate {
         Short,
         /// [`D1K`] and [`D4096`].
         Long,
+        /// [`D1K`] alone.
+        D1k,
     }
 
     impl StepSets {
@@ -543,6 +530,7 @@ mod gate {
                 StepSets::All => "all",
                 StepSets::Short => "short",
                 StepSets::Long => "long",
+                StepSets::D1k => "d1k",
             }
         }
 
@@ -553,11 +541,12 @@ mod gate {
                 StepSets::All => true,
                 StepSets::Short => short,
                 StepSets::Long => !short,
+                StepSets::D1k => name == D1K,
             }
         }
     }
 
-    /// `--only s|p|c|t`, or every clause.
+    /// `--only s|p|c|t|b`, or every clause.
     fn only() -> Result<Only, GateError> {
         match word_after("--only") {
             None => Ok(Only::All),
@@ -566,13 +555,14 @@ mod gate {
                 Some("p") => Ok(Only::P),
                 Some("c") => Ok(Only::C),
                 Some("t") => Ok(Only::T),
-                other => Err(format!("--only is s, p, c or t, not {other:?}").into()),
+                Some("b") => Ok(Only::B),
+                other => Err(format!("--only is s, p, c, t or b, not {other:?}").into()),
             },
         }
     }
 
-    /// `--step-sets short|long|all`, `all` when absent; refused beside an
-    /// `--only` that runs no (t).
+    /// `--step-sets short|long|d1k|all`, `all` when absent; refused beside an
+    /// `--only` that runs neither (t) nor (b).
     fn step_sets(only: Only) -> Result<StepSets, GateError> {
         let sets = match word_after("--step-sets") {
             None => return Ok(StepSets::All),
@@ -580,14 +570,19 @@ mod gate {
                 Some("all") => StepSets::All,
                 Some("short") => StepSets::Short,
                 Some("long") => StepSets::Long,
+                Some("d1k") => StepSets::D1k,
                 other => {
-                    return Err(format!("--step-sets is short, long or all, not {other:?}").into());
+                    return Err(
+                        format!("--step-sets is short, long, d1k or all, not {other:?}").into(),
+                    );
                 }
             },
         };
-        if !matches!(only, Only::All | Only::T) {
+        if !matches!(only, Only::All | Only::T | Only::B) {
             return Err(
-                "--step-sets names the step sets of (t): it goes with --only t or no --only".into(),
+                "--step-sets names the step sets of (t) and (b): it goes with --only t, --only b \
+                 or no --only"
+                    .into(),
             );
         }
         Ok(sets)
@@ -598,7 +593,7 @@ mod gate {
         crate::gate_card::init()?;
         let only = only()?;
         let sets = step_sets(only)?;
-        let (mut s, opened) = open(&levers)?;
+        let (mut s, opened) = open(Path::new(MODEL), &levers, CTX)?;
         let m = s.model_mut();
         let mut ok = true;
         if matches!(only, Only::All | Only::S) {
@@ -621,6 +616,7 @@ mod gate {
             ok &= free(m, &man, &toks)?;
             elapsed("(c)", &t);
         }
+        let mut by_steps: Vec<(&str, Fed)> = Vec::new();
         if matches!(only, Only::All | Only::T) {
             let mut ties = 0usize;
             let mut ran = Vec::new();
@@ -632,7 +628,9 @@ mod gate {
             ] {
                 if sets.takes(set.0) {
                     let t = Instant::now();
-                    ok &= step_set(m, set, &mut ties)?;
+                    let (set_ok, fed) = step_set(m, set, &mut ties)?;
+                    ok &= set_ok;
+                    by_steps.push((set.0, fed));
                     elapsed(&format!("(t) {}", set.0), &t);
                     ran.push(set.0);
                 }
@@ -642,6 +640,29 @@ mod gate {
                 sets.name(),
                 ran.join(" ")
             );
+        }
+        if matches!(only, Only::All | Only::B) {
+            let mut ran = Vec::new();
+            for set in [(D1K, &IK), (D4096, &IK)] {
+                if sets.takes(set.0) {
+                    let t = Instant::now();
+                    let steps = by_steps
+                        .iter()
+                        .position(|(n, _)| *n == set.0)
+                        .map(|i| by_steps.swap_remove(i).1);
+                    ok &= batch_set(m, set, steps)?;
+                    elapsed(&format!("(b) {}", set.0), &t);
+                    ran.push(set.0);
+                }
+            }
+            if ran.is_empty() && only == Only::B {
+                return Err(format!(
+                    "--only b takes the long step sets, and --step-sets {} names none",
+                    sets.name()
+                )
+                .into());
+            }
+            println!("batch feed ({}): {} ran", sets.name(), ran.join(" "));
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

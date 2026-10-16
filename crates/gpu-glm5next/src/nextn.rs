@@ -53,7 +53,6 @@ use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::latent::{
     INDEX_HEAD, INDEX_ROW, IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for,
 };
-use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::hc::HC_STREAMS;
@@ -66,8 +65,9 @@ use models::Ffn;
 use runtime::layer::{FfnKind, Layer, MixerKind};
 use runtime::sched::{At, Overlap, Port, PortKind};
 
+use super::WHAT as BODY;
 use super::prefill::PromptState;
-use super::{Body, Dims, Kernels, LANES, RowScratch, Scratch, f32t, f32v, gemv, q8, weight};
+use super::{Body, Dims, Kernels, LANES, RowScratch, Scratch, f32t, f32v, gemv, weight};
 use crate::mla::{self, LatentStore};
 use crate::tensors::{FfnNames, LatentNames, LayerNames, MixerNames};
 
@@ -1054,9 +1054,9 @@ impl Body {
                 &mut *span_mut(WHAT, &mut a.pack, t * 2 * n + n, n)?,
             )?;
         }
-        mcol(
+        w.q8_gemv_mcol(
             gpu,
-            w,
+            BODY,
             &nm.eh,
             &*span(WHAT, &a.pack, 0, m * 2 * n)?,
             m,
@@ -1075,9 +1075,9 @@ impl Body {
             m,
             &mut a.xn,
         )?;
-        mcol(
+        w.q8_gemv_mcol(
             gpu,
-            w,
+            BODY,
             &ln.stack,
             &*span(WHAT, &a.xn, 0, m * n)?,
             m,
@@ -1222,30 +1222,6 @@ impl Body {
         )?;
         head.enqueue(gpu, tw)
     }
-}
-
-/// `y = W · x` for the q8_0 weight `name` over `c` token columns of `x`,
-/// token-major (`q8_0_gemv_mcol`: each column the one-column gemv's bits).
-fn mcol(
-    gpu: &Gpu,
-    w: &Weights,
-    name: &str,
-    x: &DeviceBuffer<f32>,
-    c: usize,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let (qs, d) = q8(w, name)?;
-    gpu.q8f32().enqueue_q8_0_gemv_mcol(
-        gpu.stream(),
-        Q8_0GemvMcolArgs {
-            qs,
-            d,
-            x,
-            m: c,
-            out: GemvOut::TokenMajor,
-            y,
-        },
-    )
 }
 
 /// One NextN walk of `feed` into `head` in `mode`, with no readback

@@ -2,19 +2,20 @@
 //! once by its placement (every routed expert on the host tier) and loaded by
 //! gpumodel's constructor ([`Body::open_placed`]).
 //!
-//! A prompt is fed one decode step an id ([`GpuModel::step`]): the program has
-//! no pass of several rows. The caches are per position, but the body takes no
-//! checkpoint and no rollback, so a cut keeps every held position or the
-//! empty model.
+//! A prompt is fed as the configuration says ([`Mimo2Cfg::prefill`]): in
+//! batches ([`bloomery_gpu_mimo2::prefill`]) or one decode step an id
+//! ([`GpuModel::step`]), the two leaving the same bits. The caches are per
+//! position, and the body takes no checkpoint, so a cut keeps every held
+//! position (its rollback takes positions back without device work).
 
 use bloomery_gpu::{GpuError, GpuModel};
-use bloomery_gpu_mimo2::Body;
+use bloomery_gpu_mimo2::{Body, PrefillMode};
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::mimo2::place::PlanInputs;
 use model::placement::{Machine, Plan, PlanLevers};
 
-use crate::{Keep, Open, Prompt};
+use crate::{Keep, Open, Prompt, cut_positions, keep_positions};
 
 const WHAT: &str = "mimo2 session";
 
@@ -25,6 +26,11 @@ pub struct Mimo2Cfg {
     pub place: PlanLevers,
     /// The host set's read-in and lock, and the file pages' release.
     pub host: HostCfg,
+    /// How a prompt is fed: in batches, or one decode step per id.
+    pub prefill: PrefillMode,
+    /// Batches a prompt group runs layer by layer
+    /// ([`bloomery_gpu_mimo2::set_prefill_group`]).
+    pub group: usize,
 }
 
 impl Open for Body {
@@ -75,39 +81,32 @@ impl Open for Body {
         Body::open_placed(file, plan, inputs, 0, cfg.host)
     }
 
-    /// The prompt call has no buffers of its own.
-    fn prepare(_m: &mut GpuModel<Body>, _cfg: &Mimo2Cfg) -> Result<bool, GpuError> {
-        Ok(false)
+    /// The configuration's feed and group; the batch feed's buffers made
+    /// here, for the group's units.
+    fn prepare(m: &mut GpuModel<Body>, cfg: &Mimo2Cfg) -> Result<bool, GpuError> {
+        let grew = bloomery_gpu_mimo2::set_prefill_group(m, cfg.group)?;
+        Ok(bloomery_gpu_mimo2::set_prefill(m, cfg.prefill)? || grew)
     }
 }
 
 impl Prompt for Body {
-    /// One decode step an id, the argmax after the last.
+    /// The body's feed ([`bloomery_gpu_mimo2::feed`]): a call past the
+    /// stores' positions is refused before anything runs.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        m.step(ids)
+        bloomery_gpu_mimo2::feed(m, ids)
     }
 }
 
 impl Keep for Body {
-    /// Every held position, or the empty model: the body holds no
-    /// checkpoint and takes no rollback.
+    /// Every held position: the caches are per-position and the body holds
+    /// no checkpoint.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
-        if n >= m.pos() { m.pos() } else { 0 }
+        keep_positions(m, n)
     }
 
-    /// Nothing to take back at the model's position; back to empty at 0 — a
-    /// reset; any other position refused by name.
+    /// Back to empty at 0 — a reset; else the model's rollback, which the
+    /// caches take as given.
     fn cut(m: &mut GpuModel<Body>, n: u32) -> Result<(), GpuError> {
-        match n {
-            n if n == m.pos() => Ok(()),
-            0 => m.reset(),
-            n => Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "a cut to {n} of {} positions; the body keeps every position or none",
-                    m.pos()
-                ),
-            }),
-        }
+        cut_positions(m, n)
     }
 }

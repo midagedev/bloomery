@@ -96,11 +96,12 @@ SERVES = {
     "ds41": ("deepseek41", "deepseek4"),
     "qwen38": ("qwen4exp",),
     "qwen3": ("qwen3moe", "qwen35moe"),
+    "mimo2": ("mimo2",),
 }
 SERVES_VIA_FROM_NAME = {"glm": "Glm5next"}
 # crates/gpu-gates/src/bin/bloomery_serve.rs:Model::ALL and Model::word — the generative seats in the order
 # the refusal of an unserved file lists them; crates/serve/src/decide.rs:WORD is the decide seat's word.
-SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3")
+SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2")
 DECIDE_WORD = "decide"
 # crates/model/src/arch/mod.rs:Arch::from_name — variant -> the strings that name it.
 FROM_NAME = {
@@ -182,6 +183,9 @@ TYPE_PLACES = {
     "qwen3": (("crates/gpu/src/arch/qwen3moe/body.rs", "kq_site(w, &g.attn_q, q, h, &[SiteTy::Q4K])?;"),
               ("crates/gpu/src/head.rs", "fn head_out_w(w: &Weights)"),
               ("crates/model/src/arch/qwen3moe/place.rs", "pub fn card_routed(ty: GgmlType)"),
+              ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
+    "mimo2": (("crates/model/src/arch/mimo2/place.rs", "let plan = placement::plan_host_routed("),
+              ("crates/gpu-mimo2/src/body.rs", "if table.ty() != GgmlType::Q8_0"),
               ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
 }
 SEAT_WORDS = SEAT_ORDER + (DECIDE_WORD,)
@@ -897,6 +901,8 @@ BOX_FILES = {
     "qwen38": (("/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
                 "tools/ref/models/qwen4exp.sh"),),
     "qwen3": (("/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", "tools/ref/models/qwen3moe.sh"),),
+    "mimo2": (("/models/MiMo-V2.6-Flash-MOPD/MiMo-V2.6-Flash-MOPD-MXFP4-00001-of-00002.gguf",
+               "tools/ref/models/mimo2.sh"),),
     "decide": (("/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf", "justfile"),
                ("/root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf", "justfile")),
 }
@@ -2065,7 +2071,7 @@ def self_test():
         line, green, _ = row_line("glm", "glm5nextx", small)
         check("a glm5nextx file is refused by name",
               not green and "arch=glm5nextx route=REFUSED: a glm5nextx file, which no seat serves; the seats are "
-              "--model ds41, qwen38, glm, qwen3, decide" in line, line)
+              "--model ds41, qwen38, glm, qwen3, mimo2, decide" in line, line)
         line, green, _ = row_line("glm", "deepseek41", small)
         check("a file the router seats elsewhere is refused for the row's seat",
               not green and "in the ds41 seat, and the README row says glm" in line, line)
@@ -2078,9 +2084,11 @@ def self_test():
         check("a deepseek4 file routes to the ds41 seat", green and "arch=deepseek4 route=ok" in line, line)
         line, green, _ = row_line("glm", "glm5next", small)
         check("a glm5next file routes to the glm seat", green, line)
-        line, green, _ = row_line("qwen3", "mimo2", small)
-        check("an architecture the reader takes but no seat serves is refused by name",
-              not green and "a mimo2 file, which no seat serves" in line, line)
+        line, green, _ = row_line("qwen3", "deepseek2", small)
+        check("an architecture no seat serves is refused by name, before the reader's verdict",
+              not green and "a deepseek2 file, which no seat serves" in line, line)
+        line, green, _ = row_line("mimo2", "mimo2", small)
+        check("a mimo2 file routes to the mimo2 seat", green and "arch=mimo2 route=ok" in line, line)
         # a split set: the experts are in shard 2
         p1, p2 = os.path.join(tmp, "s1.gguf"), os.path.join(tmp, "s2.gguf")
         b1 = synth(p1, "glm5-next", [small[0]])

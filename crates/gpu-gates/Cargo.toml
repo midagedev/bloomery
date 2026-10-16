@@ -126,7 +126,7 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "bloomery-serve"
 path = "src/bin/bloomery_serve.rs"
-required-features = ["glm5next", "clef"]
+required-features = ["glm5next", "clef", "mimo2"]
 
 [[bin]]
 name = "bloomery-serve-ds41"
@@ -317,6 +317,10 @@ required-features = ["glm5next"]
 [[bin]]
 name = "gate_mimo2_e2e"
 required-features = ["mimo2"]
+
+[[bin]]
+name = "gate_mimo2_serve"
+required-features = ["glm5next", "clef", "mimo2"]
 
 [[bin]]
 name = "cnode_probe"
