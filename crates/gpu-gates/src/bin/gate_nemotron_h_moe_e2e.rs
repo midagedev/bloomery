@@ -173,7 +173,11 @@ mod gate {
             Tag::Oracle,
             logits_near_mainlines_real,
         ),
-        ("top1_is_mainlines_real", Tag::Oracle, top1_is_mainlines_real),
+        (
+            "top1_is_mainlines_real",
+            Tag::Oracle,
+            top1_is_mainlines_real,
+        ),
         ("fault_word_clean", Tag::SelfConsistency, fault_word_clean),
     ];
 
@@ -440,7 +444,9 @@ mod gate {
     }
 
     /// Layer `r`'s kept set against mainline's `want`, under the body's
-    /// selection order `rank`, crossings allowed within [`cross_band`].
+    /// selection order `rank`, crossings allowed within [`cross_band`] — a
+    /// non-finite band (a saturated sigmoid's recovered logit) is a
+    /// difference, never a crossing.
     fn routed(r: &Routing, want: &[u32], rank: &[(u32, f32)], eps: f32) -> Routed {
         let missing: Vec<u32> = want
             .iter()
@@ -471,7 +477,7 @@ mod gate {
             };
             let gap = last - rank[p].1;
             let band = cross_band(eps, z_max, s9, r.scores[m as usize]);
-            if gap.is_nan() || gap > band {
+            if !band.is_finite() || gap.is_nan() || gap > band {
                 return Routed::Differs {
                     id: m,
                     rank: p + 1,
