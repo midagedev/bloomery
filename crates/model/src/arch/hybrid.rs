@@ -464,8 +464,9 @@ pub(in crate::arch) fn nope_gqa(a: &Attn, kv: usize) -> Result<Gqa, PlacementErr
 /// ([`PlanInputs::plan`]) puts the whole model on one card: the body runs
 /// every layer there, its routed experts too, so no tier and no host leg has
 /// anything to hold; it refuses by name a machine of more than one card or
-/// with a tier card, a context of no position, and a context whose stores the
-/// card cannot hold.
+/// with a tier card, a context of no position, a context whose stores the
+/// card cannot hold, and a card too small for every routed expert, which
+/// would leave some on the host.
 #[derive(Clone, Debug)]
 pub struct PlanInputs {
     /// Every tensor with its role, and the model's layer count.
@@ -574,6 +575,14 @@ impl PlanInputs {
             levers,
             routed_rule(program),
         )?;
+        // The body uploads every expert stack, so the host leg must hold none.
+        if plan.host.experts != 0 {
+            return Err(PlacementError::Experts(format!(
+                "{arch} requires every expert on one card; {} experts remain on the host",
+                plan.host.experts
+            ))
+            .into());
+        }
         checked(plan).map_err(PlaceError::Broken)
     }
 }

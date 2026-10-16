@@ -534,6 +534,57 @@ mod tests {
         }
     }
 
+    /// A card too small for every routed expert of the fixture layout is
+    /// refused by name — the body uploads every expert stack, so the planner
+    /// refuses the spill — while the gate machine, which holds them all,
+    /// plans. The card is shrunk past half the experts' bytes, so only some
+    /// fit: a planner that accepts the spilled plan fails this.
+    #[test]
+    fn a_card_too_small_for_every_expert_is_refused() {
+        use crate::placement::{PlanLevers, workstation};
+        let path = header_typed(
+            "nhm-spill",
+            "nemotron_h_moe",
+            &FIXTURE.keys(),
+            &[("tokenizer.ggml.pre", V::Str("pixtral"))],
+            &FIXTURE.tensors(),
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let _ = std::fs::remove_file(&path);
+        let inputs = super::super::place::read(&split)
+            .unwrap_or_else(|e| panic!("the fixture layout is refused: {e}"));
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let levers = PlanLevers::default();
+        let whole = inputs
+            .plan(&machine, 4, &levers)
+            .expect("the gate machine holds every expert");
+        assert_eq!(whole.host.experts, 0);
+        let (dense, rounding, kv, rows, experts) = (
+            whole.cards[0].dense_bytes,
+            whole.cards[0].rounding_bytes,
+            whole.cards[0].kv_bytes,
+            whole.cards[0].stage_rows_bytes,
+            whole.cards[0].expert_bytes,
+        );
+        let mut small = machine;
+        small.cards[0].usable_bytes = dense
+            + rounding
+            + kv
+            + rows
+            + experts / 2
+            + small.cards[0].set_aside_bytes()
+            + small.cards[0].margin_bytes;
+        match inputs.plan(&small, 4, &levers) {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("nemotron_h_moe requires every expert on one card; ")
+                    && e.to_string().contains(" experts remain on the host"),
+                "{e}"
+            ),
+            other => panic!("{other:?}, a spilled plan, not the expert refusal"),
+        }
+    }
+
     /// FAIL-first: a header without `moe_latent_size` is refused by the key's
     /// name. Reading the experts at the hidden width instead lets it read.
     #[test]
