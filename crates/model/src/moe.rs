@@ -30,9 +30,9 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    self, DEFER_MAX_COLS, ExpertStack, GroupClaims, GroupInput, Lanes, R8Stack, RowLayout,
-    ShardTensor, StackTier, Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs, UnionStack,
-    WarmSpan, Weight, defers, matmul_q, matmul_q_group, matmul_q_group_into_on,
+    self, DEFER_MAX_COLS, ExpertForm, ExpertStack, GroupClaims, GroupInput, Lanes, R8Stack,
+    RowLayout, ShardTensor, StackTier, Tensor2, Tensor2View, UnionCall, UnionPlanView, UnionSlabs,
+    UnionStack, WarmSpan, Weight, defers, matmul_q, matmul_q_group, matmul_q_group_into_on,
     matmul_q_group_swiglu, matmul_q_group_swiglu_into_on,
 };
 use crate::profile;
@@ -788,14 +788,14 @@ pub fn experts_into(
     let view = |views: &[TensorInfo], e: u32| -> Result<Weight<'_>, ModelError> {
         Weight::in_file(gguf, expert_of(views, e, plan.block)?)
     };
-    let weights = |e: u32| -> Result<[Weight<'_>; 3], ModelError> {
-        Ok([
+    let weights = |e: u32| -> Result<ExpertLegs<'_>, ModelError> {
+        Ok(ExpertLegs::Gated([
             view(&plan.gate_views, e)?,
             view(&plan.up_views, e)?,
             view(&plan.down_views, e)?,
-        ])
+        ]))
     };
-    serve(weights, LegRun::flat(None), x, experts, out, scratch)
+    serve(weights, LegRun::flat(), x, experts, out, scratch)
 }
 
 /// Expert `e`'s view in one of a block plan's per-expert view lists; an id
@@ -948,31 +948,41 @@ impl HostScratch {
     }
 }
 
-/// How one host leg of one token runs: the experts' SwiGLU clamp (`None`: the
-/// plain combine) and how the leg's rows are laid over the pool.
+/// How one host leg of one token runs: the experts' form (which stacks the
+/// leg reads and their combine) and how the leg's rows are laid over the
+/// pool.
 #[derive(Clone, Copy)]
 struct LegRun {
-    limit: Option<f32>,
+    form: ExpertForm,
     lanes: Lanes,
 }
 
 impl LegRun {
-    /// The leg with rows in the pool's flat lanes.
-    fn flat(limit: Option<f32>) -> LegRun {
+    /// The gated leg without a clamp, rows in the pool's flat lanes.
+    fn flat() -> LegRun {
         LegRun {
-            limit,
+            form: ExpertForm::Gated { limit: 0.0 },
             lanes: Lanes::Flat,
         }
     }
 }
 
-/// The host leg of one token: each listed expert's `[gate, up, down]` from
-/// `weights`, resolved in list order into the scratch's view lists, then
+/// One expert's stacks as its layer's form reads them, resolved by the
+/// caller from wherever the layer holds them.
+enum ExpertLegs<'w> {
+    /// `[gate, up, down]`.
+    Gated([Weight<'w>; 3]),
+    /// The up and the down.
+    Relu2 { up: Weight<'w>, down: Weight<'w> },
+}
+
+/// The host leg of one token: each listed expert's stacks from `weights`,
+/// resolved in list order into the scratch's view lists, then
 /// [`serve_resolved`]. The lists go back to the scratch, emptied, whether the
 /// call succeeds or not. The caller has checked the list against the
 /// scratch's width, so no push grows a list.
 fn serve<'w>(
-    weights: impl Fn(u32) -> Result<[Weight<'w>; 3], ModelError>,
+    weights: impl Fn(u32) -> Result<ExpertLegs<'w>, ModelError>,
     run: LegRun,
     x: &Tensor2,
     experts: &[(u32, f32)],
@@ -984,9 +994,16 @@ fn serve<'w>(
     let r = experts
         .iter()
         .try_for_each(|&(e, _)| {
-            let [g, u, d] = weights(e)?;
-            gu.extend([g, u]);
-            down.push(d);
+            match weights(e)? {
+                ExpertLegs::Gated([g, u, d]) => {
+                    gu.extend([g, u]);
+                    down.push(d);
+                }
+                ExpertLegs::Relu2 { up, down: d } => {
+                    gu.push(up);
+                    down.push(d);
+                }
+            }
             Ok(())
         })
         .and_then(|()| serve_resolved(&gu, &down, run, x, experts, out, s));
@@ -995,15 +1012,16 @@ fn serve<'w>(
     r
 }
 
-/// The host leg of one token over resolved weights: `gu` holds each listed
-/// expert's gate and up interleaved, `down` its down. One group dispatch for
-/// every gate and up (`x` quantized once), one for every down with each
-/// combine — clamped when `limit` is given — produced inside it, then the
+/// The host leg of one token over resolved weights: gated, `gu` holds each
+/// listed expert's gate and up interleaved; a relu² leg holds its ups alone.
+/// One group dispatch for the first stacks (`x` quantized once), one for
+/// every down with each combine — the form's — produced inside it, then the
 /// weighted sum in list order into `out` (already zeroed). Profile level 1
 /// records the leg in five parts that do not overlap: `host_x_quant` (x's
-/// quantization), `host_gate_up` (the gate/up rows, per weight type),
-/// `host_h_quant` (the combines and their quantization), `host_down` (the
-/// down rows, per weight type) and `host_sum`.
+/// quantization), `host_gate_up` (or `host_up`, a relu² leg's single stack;
+/// the rows, per weight type), `host_h_quant` (the combines and their
+/// quantization), `host_down` (the down rows, per weight type) and
+/// `host_sum`.
 fn serve_resolved(
     gu: &[Weight<'_>],
     down: &[Weight<'_>],
@@ -1023,22 +1041,30 @@ fn serve_resolved(
         srcs,
         ..
     } = s;
+    // A gated leg's first dispatch interleaves [gate, up] pairs — two blocks
+    // and two reads of `x` an expert; a relu² leg's holds the ups alone.
+    let (first, up_site) = match run.form {
+        ExpertForm::Gated { .. } => (2 * n, "host_gate_up"),
+        ExpertForm::Relu2 => (n, "host_up"),
+    };
     let mut xl: Vec<&Tensor2> = relist(std::mem::take(xs));
-    xl.extend(std::iter::repeat_n(x, 2 * n));
-    let gt = matmul_q_group_into_on(run.lanes, "host_gate_up", gu, &xl, &mut gate_up[..2 * n]);
+    xl.extend(std::iter::repeat_n(x, first));
+    let gt = matmul_q_group_into_on(run.lanes, up_site, gu, &xl, &mut gate_up[..first]);
     *xs = relist(xl);
     let gt = gt?;
     let mut sl: Vec<GroupInput<'_>> = relist(std::mem::take(srcs));
-    sl.extend(
-        gate_up[..2 * n]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|[gate, up]| match run.limit {
-                Some(limit) => GroupInput::SwigluClamp(gate, up, limit),
-                None => GroupInput::Swiglu(gate, up),
-            }),
-    );
+    match run.form {
+        ExpertForm::Gated { limit } => {
+            for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
+                sl.push(GroupInput::SwigluClamp(gate, up, limit));
+            }
+        }
+        ExpertForm::Relu2 => {
+            for up in &gate_up[..n] {
+                sl.push(GroupInput::Relu2(up));
+            }
+        }
+    }
     let dt = matmul_q_group_swiglu_into_on(
         run.lanes,
         "host_down",
@@ -1539,7 +1565,11 @@ impl UnionScratch {
 
 /// The union call's shape conditions, each its own error: at most the
 /// scratch's columns, one list per column of `x`, `out` holding every
-/// column's width, and the scratch made for the block's widths.
+/// column's width, the scratch made for the block's width (`embd`), and its
+/// expert width a capacity — the layer's `ff` at or below it, so one scratch
+/// serves the run's layers of differing widths, and its combine slab (sized
+/// by [`ops::col_bytes_max`] of the capacity) holding the layer's down's
+/// columns.
 fn check_union_call(
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
@@ -1575,9 +1605,19 @@ fn check_union_call(
             got_ne1: 1,
         });
     }
-    if (scratch.embd, scratch.ff) != (embd, ff) {
+    if scratch.embd != embd {
         return Err(ModelError::Shape {
-            what: "host union: the scratch must be made for the block's widths",
+            what: "host union: the scratch must be made for the block's width",
+            want_ne0: embd,
+            want_ne1: ff,
+            got_ne0: scratch.embd,
+            got_ne1: scratch.ff,
+        });
+    }
+    if ff > scratch.ff || ops::col_bytes_max(ff) > ops::col_bytes_max(scratch.ff) {
+        return Err(ModelError::Shape {
+            what: "host union: the scratch must be made for the block's widths (its expert \
+                   width is a capacity: the layer's ff at or below it, with room for its column)",
             want_ne0: embd,
             want_ne1: ff,
             got_ne0: scratch.embd,
@@ -1701,11 +1741,16 @@ fn serve_tiered<'w>(
     s: &mut UnionScratch,
     tier: &'w LayerTier,
 ) -> Result<(), ModelError> {
+    // The union side of [`HostLayer`'s relu² tier refusal]: no arena part of
+    // a relu² layer's is ever claimed.
+    if let ExpertForm::Relu2 = run.form {
+        return Err(TierError::Relu2Tiered { layer: tier.layer }.into());
+    }
     let batch = tier.batch;
     assert!(batch > 0, "host union: a batch holds at least one expert");
     // Refused before any claim: an expert past the stacks' (the passes' own
     // check, made once here).
-    UnionCall::new(s.plan.view(), stacks, x, run.limit, s.ff)?;
+    UnionCall::new(s.plan.view(), stacks, x, run.form)?;
     let mut stacks = stacks;
     tier.lend(&mut stacks);
     s.tier_ids.clear();
@@ -1762,7 +1807,6 @@ fn serve_batched<'w>(
 ) -> Result<(), ModelError> {
     let Batching { tier, keep } = batching;
     let (batch, embd) = (tier.batch, x.ne0());
-    let ff = s.ff;
     let UnionScratch {
         plan,
         xq,
@@ -1788,7 +1832,7 @@ fn serve_batched<'w>(
         let from = g.checked_sub(1).map_or(0, |p| ends[p]);
         from..ends[g]
     };
-    let whole = UnionCall::new(plan.view(), stacks, x, run.limit, ff)?.spread_over(run.lanes);
+    let whole = UnionCall::new(plan.view(), stacks, x, run.form)?.spread_over(run.lanes);
     let mut xqs = whole.quantize_batched(xq, xq_up, passes);
     slot.clear();
     slot.resize(plan.n(), 0);
@@ -1823,8 +1867,7 @@ fn serve_batched<'w>(
         for (i, &d) in order[span(g)].iter().enumerate() {
             slot[d as usize] = base + sub.off[i];
         }
-        let batch_call =
-            UnionCall::new(sub.view(), stacks, x, run.limit, ff)?.spread_over(run.lanes);
+        let batch_call = UnionCall::new(sub.view(), stacks, x, run.form)?.spread_over(run.lanes);
         batch_call.run_batch(&mut xqs, gu, qc, &mut store[base * embd..], None, passes)?;
         base += sub.cols.len();
         drop(pin);
@@ -1871,7 +1914,7 @@ fn serve_step_split<'w>(
         drop(pin);
         return served;
     }
-    let (embd, ff) = (x.ne0(), s.ff);
+    let embd = x.ne0();
     let UnionScratch {
         plan,
         xq,
@@ -1893,7 +1936,7 @@ fn serve_step_split<'w>(
         ..
     } = batches;
     let (order, ids) = (&*order, &*ids);
-    let whole = UnionCall::new(plan.view(), stacks, x, run.limit, ff)?.spread_over(run.lanes);
+    let whole = UnionCall::new(plan.view(), stacks, x, run.form)?.spread_over(run.lanes);
     let deferred = defers(x.ne1());
     let mut xqs = if deferred {
         whole.x_rooms(xq, xq_up)
@@ -1925,7 +1968,7 @@ fn serve_step_split<'w>(
         for (i, &d) in order[span].iter().enumerate() {
             slot[d as usize] = base + sub.off[i];
         }
-        let call = UnionCall::new(sub.view(), stacks, x, run.limit, ff)?.spread_over(run.lanes);
+        let call = UnionCall::new(sub.view(), stacks, x, run.form)?.spread_over(run.lanes);
         let claim = deferred.then(|| GroupClaims {
             x: g == 0,
             states: &mut claims[..],
@@ -1960,7 +2003,7 @@ fn serve_planned(
         out.fill(0.0);
         return Ok(());
     }
-    let call = UnionCall::new(s.plan.view(), stacks, x, run.limit, s.ff)?.spread_over(run.lanes);
+    let call = UnionCall::new(s.plan.view(), stacks, x, run.form)?.spread_over(run.lanes);
     let slabs = UnionSlabs {
         xq: &mut s.xq,
         xq_up: &mut s.xq_up,
@@ -2002,13 +2045,15 @@ pub fn experts_union_into<'x>(
         ExpertStack::in_file(gguf, up)?,
         ExpertStack::in_file(gguf, down)?,
     ];
-    serve_union(stacks, LegRun::flat(None), x, lists, out, scratch, None)
+    serve_union(stacks, LegRun::flat(), x, lists, out, scratch, None)
 }
 
 /// What a host tier needs to serve one layer's routed experts, in the
 /// file's own terms: the three stacks' tensor names, the expert count, the
-/// widths and the routed experts' SwiGLU limit. The architecture fills it;
-/// this module reads no model's names or keys.
+/// widths and the routed experts' SwiGLU limit — the gated reading of a
+/// layer ([`ExpertForm::Gated`], which [`HostLayer::build`] serves it by);
+/// the relu² reading has its own spec ([`Relu2Spec`], [`HostLayer::build_relu2`]).
+/// The architecture fills it; this module reads no model's names or keys.
 pub struct HostLayerSpec<'a> {
     pub gate: &'a str,
     pub up: &'a str,
@@ -2019,6 +2064,18 @@ pub struct HostLayerSpec<'a> {
     /// `clamp(up, ±limit) · min(silu(gate), limit)`; at or below 1e-6 the
     /// plain combine.
     pub swiglu_limit: f32,
+}
+
+/// What a host tier needs to serve one relu² layer's routed experts
+/// ([`ExpertForm::Relu2`]): the two stacks' tensor names, the expert count and
+/// the widths — `embd` the width the experts run in, `ff` this layer's own.
+/// The architecture fills it; there is no gate name to give.
+pub struct Relu2Spec<'a> {
+    pub up: &'a str,
+    pub down: &'a str,
+    pub n_expert: usize,
+    pub embd: usize,
+    pub ff: usize,
 }
 
 /// The host tier's matmul path for each (weight type, row width, row
@@ -2130,6 +2187,13 @@ pub enum TierError {
         ids: usize,
         slots: usize,
     },
+    /// A relu² layer met the NVMe tier: the arena lends each expert's bytes
+    /// as `[gate, up, down]` parts and its paths lay them so, and a form
+    /// that reads two stacks has no gate part for the third.
+    #[error(
+        "layer {layer}'s NVMe tier serves gated experts only: a relu² layer holds no gate part"
+    )]
+    Relu2Tiered { layer: usize },
     /// A batch pin was refused: the tier's own error, naming what it
     /// pinned.
     #[error("layer {layer}: pinning a batch of experts: {source}")]
@@ -2463,17 +2527,27 @@ impl LayerTier {
     }
 }
 
-/// One layer's routed experts as a host tier serves them: the three stacks —
-/// the gate and the up from the file or from its r8 sidecar, the down from
-/// the file — and the SwiGLU limit. Built once at load
-/// ([`HostLayer::build`]); a call cuts its experts' matrices from the stacks,
-/// so a layer holds three headers, not one view per expert.
+/// The tensor names a layer build reads; a relu² layer names no gate.
+struct StackNames<'a> {
+    gate: Option<&'a str>,
+    up: &'a str,
+    down: &'a str,
+}
+
+/// One layer's routed experts as a host tier serves them: its form
+/// ([`ExpertForm`]) and the stacks that form reads — gated, the gate and the
+/// up from the file or from its r8 sidecar and the down from the file; a
+/// relu² layer, the up and the down, no gate. Built once at load
+/// ([`HostLayer::build`], [`HostLayer::build_relu2`]); a call cuts its
+/// experts' matrices from the stacks, so a layer holds headers, not one view
+/// per expert.
 pub struct HostLayer {
-    gate: GateUp,
+    /// The gate stack — `None` on a relu² layer, which holds none.
+    gate: Option<GateUp>,
     up: GateUp,
     down: ShardTensor,
     n_expert: usize,
-    limit: f32,
+    form: ExpertForm,
     tier: Option<LayerTier>,
 }
 
@@ -2493,51 +2567,103 @@ impl HostLayer {
     /// not a property of the layer's tensors, so it rides beside the spec, in
     /// the pair.
     pub fn build(src: R8Source<'_>, spec: &HostLayerSpec<'_>) -> Result<HostLayer, ModelError> {
+        Self::build_form(
+            src,
+            StackNames {
+                gate: Some(spec.gate),
+                up: spec.up,
+                down: spec.down,
+            },
+            (spec.n_expert, spec.embd, spec.ff),
+            ExpertForm::Gated {
+                limit: spec.swiglu_limit,
+            },
+        )
+    }
+
+    /// [`HostLayer::build`] for a relu² layer ([`Relu2Spec`]): the up and the
+    /// down checked as the gated build checks them, no gate stack looked for.
+    /// The form rides beside the spec like the r8 sidecar does: an activation
+    /// fact the load resolves, not a property of the layer's tensors.
+    pub fn build_relu2(src: R8Source<'_>, spec: &Relu2Spec<'_>) -> Result<HostLayer, ModelError> {
+        Self::build_form(
+            src,
+            StackNames {
+                gate: None,
+                up: spec.up,
+                down: spec.down,
+            },
+            (spec.n_expert, spec.embd, spec.ff),
+            ExpertForm::Relu2,
+        )
+    }
+
+    /// [`HostLayer::build`] and [`HostLayer::build_relu2`]'s one body over
+    /// the named stacks: a gate name (`Some`) is a stack the layer holds, found,
+    /// checked and served; `None`, one it does not.
+    fn build_form(
+        src: R8Source<'_>,
+        names: StackNames<'_>,
+        (n_expert, embd, ff): (usize, usize, usize),
+        form: ExpertForm,
+    ) -> Result<HostLayer, ModelError> {
+        let StackNames { gate, up, down } = names;
         let split = src.split();
-        let gate = ShardTensor::find(split, spec.gate)?;
-        let up = ShardTensor::find(split, spec.up)?;
-        let down = ShardTensor::find(split, spec.down)?;
-        for (t, k, n) in [
-            (&gate, spec.embd, spec.ff),
-            (&up, spec.embd, spec.ff),
-            (&down, spec.ff, spec.embd),
-        ] {
-            expect_stack(t.info(), k, n, spec.n_expert)?;
+        let found = gate.map(|g| ShardTensor::find(split, g)).transpose()?;
+        let up_stack = ShardTensor::find(split, up)?;
+        let down_stack = ShardTensor::find(split, down)?;
+        if let Some(gate) = &found {
+            expect_stack(gate.info(), embd, ff, n_expert)?;
             // The per-expert cut: `expert_view`'s check, once, here.
-            expert_view(t.info(), 0, spec.n_expert)?;
+            expert_view(gate.info(), 0, n_expert)?;
+        }
+        for (t, k, n) in [(&up_stack, embd, ff), (&down_stack, ff, embd)] {
+            expect_stack(t.info(), k, n, n_expert)?;
+            // The per-expert cut: `expert_view`'s check, once, here.
+            expert_view(t.info(), 0, n_expert)?;
         }
         let (gate, up) = match src.sidecar() {
-            None => (GateUp::File(gate), GateUp::File(up)),
+            None => (found.map(GateUp::File), GateUp::File(up_stack)),
             Some(side) => {
-                if side.find(spec.down).is_some() {
+                if side.find(down).is_some() {
                     return Err(R8Error::HoldsDown {
                         path: side.path().to_path_buf(),
-                        tensor: spec.down.to_string(),
+                        tensor: down.to_string(),
                     }
                     .into());
                 }
-                (
-                    GateUp::R8(R8Stack::of(src, spec.gate)?),
-                    GateUp::R8(R8Stack::of(src, spec.up)?),
-                )
+                let gate = gate
+                    .map(|g| R8Stack::of(src, g).map(GateUp::R8))
+                    .transpose()?;
+                (gate, GateUp::R8(R8Stack::of(src, up)?))
             }
         };
+        // A relu² layer's stacks as the union reads them: the up again in the
+        // gate's slot, one stack where the gated form reads two.
+        let gate_stack = || match &gate {
+            Some(g) => g.stack(split),
+            None => up.stack(split),
+        };
         UnionStack::of_call(
-            &[gate.stack(split)?, up.stack(split)?, down.stack(split)?],
-            spec.embd,
-            spec.ff,
+            &[gate_stack()?, up.stack(split)?, down_stack.stack(split)?],
+            embd,
+            ff,
         )?;
-        announce_paths(&[
-            (gate.source().info().ty, spec.embd, gate.layout()),
-            (up.source().info().ty, spec.embd, up.layout()),
-            (down.info().ty, spec.ff, RowLayout::Rows),
+        let mut paths = Vec::with_capacity(3);
+        if let Some(gate) = &gate {
+            paths.push((gate.source().info().ty, embd, gate.layout()));
+        }
+        paths.extend([
+            (up.source().info().ty, embd, up.layout()),
+            (down_stack.info().ty, ff, RowLayout::Rows),
         ]);
+        announce_paths(&paths);
         Ok(HostLayer {
             gate,
             up,
-            down,
-            n_expert: spec.n_expert,
-            limit: spec.swiglu_limit,
+            down: down_stack,
+            n_expert,
+            form,
             tier: None,
         })
     }
@@ -2593,18 +2719,34 @@ impl HostLayer {
 
     /// The three stacks, `[gate, up, down]`, as the source file holds them:
     /// for a gate or an up read from the r8 sidecar, the source stack its copy
-    /// was checked against ([`HostLayer::layouts`] tells which).
+    /// was checked against ([`HostLayer::layouts`] tells which). A relu²
+    /// layer's gate slot holds its up again — the file holds no gate, and the
+    /// form ([`HostLayer::form`]) is the one owner of which stacks a call
+    /// reads.
     pub fn stacks(&self) -> [&ShardTensor; 3] {
-        [self.gate.source(), self.up.source(), &self.down]
+        [
+            self.gate.as_ref().map_or(self.up.source(), GateUp::source),
+            self.up.source(),
+            &self.down,
+        ]
     }
 
     /// Where each stack's rows lie, `[gate, up, down]` — every expert of a
     /// stack has its stack's layout: [`RowLayout::R8`] for a stack the layer
-    /// reads from the r8 sidecar, which no path reads as Q3_K rows. What the
-    /// load's reading made of the layer, for a caller that holds it to that
-    /// reading.
+    /// reads from the r8 sidecar, which no path reads as Q3_K rows. A relu²
+    /// layer's gate slot carries its up's layout. What the load's reading
+    /// made of the layer, for a caller that holds it to that reading.
     pub fn layouts(&self) -> [RowLayout; 3] {
-        [self.gate.layout(), self.up.layout(), RowLayout::Rows]
+        [
+            self.gate.as_ref().map_or(self.up.layout(), GateUp::layout),
+            self.up.layout(),
+            RowLayout::Rows,
+        ]
+    }
+
+    /// The layer's expert form.
+    pub fn form(&self) -> ExpertForm {
+        self.form
     }
 
     /// `src` is a pair this layer reads beside: one that reads the open of
@@ -2612,7 +2754,8 @@ impl HostLayer {
     /// pair's own check having run when it was made. A layer that reads only
     /// the file takes any pair: it reads no sidecar.
     fn read_beside(&self, src: R8Source<'_>) -> Result<(), ModelError> {
-        for s in [&self.gate, &self.up] {
+        let ups = [self.gate.as_ref(), Some(&self.up)];
+        for s in ups.into_iter().flatten() {
             if let GateUp::R8(s) = s {
                 src.reads(s.sidecar(), "a host layer's call")?;
             }
@@ -2620,31 +2763,39 @@ impl HostLayer {
         Ok(())
     }
 
-    /// The three stacks as a union call reads them, resolved once.
+    /// The stacks as a union call reads them, `[gate, up, down]`: a relu²
+    /// layer's up again in the gate's slot, one stack where the gated form
+    /// reads two.
     fn stacks_of<'a>(&'a self, split: &'a Split) -> Result<[ExpertStack<'a>; 3], ModelError> {
-        Ok([
-            self.gate.stack(split)?,
-            self.up.stack(split)?,
-            self.down.stack(split)?,
-        ])
+        let gate = match &self.gate {
+            Some(g) => g.stack(split)?,
+            None => self.up.stack(split)?,
+        };
+        Ok([gate, self.up.stack(split)?, self.down.stack(split)?])
     }
 
     pub fn n_expert(&self) -> usize {
         self.n_expert
     }
 
+    /// The routed experts' SwiGLU limit, a gated layer's; `0.0` for a relu²
+    /// layer, which clamps nothing.
     pub fn swiglu_limit(&self) -> f32 {
-        self.limit
+        match self.form {
+            ExpertForm::Gated { limit } => limit,
+            ExpertForm::Relu2 => 0.0,
+        }
     }
 
     /// [`experts_into`] for this layer: a given list of routed experts of
-    /// ONE token, `out = Σ_i w_i · down_{e_i}(clamp(up_{e_i}·x, ±L) ⊙
-    /// min(silu(gate_{e_i}·x), L))` in list order, each matrix read from
-    /// the shard that holds it, or the sidecar. `src` is the pair the layer
-    /// was built from. `scratch` is the caller's, made for this layer's
-    /// widths and the model's routed width, and a list past that width is
-    /// refused by name; after the call it holds what the call computed. The
-    /// leg's two row dispatches are laid over the pool's CCDs
+    /// ONE token — `out = Σ_i w_i · down_{e_i}(clamp(up_{e_i}·x, ±L) ⊙
+    /// min(silu(gate_{e_i}·x), L))` gated, `out = Σ_i w_i ·
+    /// down_{e_i}(relu(up_{e_i}·x)²)` for a relu² layer — in list order,
+    /// each matrix read from the shard that holds it, or the sidecar. `src`
+    /// is the pair the layer was built from. `scratch` is the caller's, made
+    /// for this layer's widths and the model's routed width, and a list past
+    /// that width is refused by name; after the call it holds what the call
+    /// computed. The leg's two row dispatches are laid over the pool's CCDs
     /// ([`Lanes::host_tier`]), which changes no value.
     pub fn experts_into(
         &self,
@@ -2707,6 +2858,7 @@ impl HostLayer {
         self.read_beside(src)?;
         let split = src.split();
         check_host_call(x, experts, out, scratch.n_used)?;
+        self.refuse_relu2_tier()?;
         if self.tier.is_some()
             && let Some(union) = union
         {
@@ -2729,6 +2881,20 @@ impl HostLayer {
         self.serve_column(lanes, split, x, experts, out, scratch)
     }
 
+    /// A relu² layer's refusal of the NVMe tier, at every entry that could
+    /// reach one: the arena lends each expert's bytes as `[gate, up, down]`
+    /// parts and its paths lay them so, and a form that reads two stacks has
+    /// no gate part for the third ([`HostLayer::attach_tier`] cannot refuse —
+    /// the gpu side's run build calls it, and that side holds no form yet).
+    fn refuse_relu2_tier(&self) -> Result<(), ModelError> {
+        if let ExpertForm::Relu2 = self.form
+            && let Some(tier) = &self.tier
+        {
+            return Err(TierError::Relu2Tiered { layer: tier.layer }.into());
+        }
+        Ok(())
+    }
+
     /// Today's one-column leg: `out` is the list-order sum, each expert read
     /// from the mapping or from a slot the caller already pinned.
     fn serve_column(
@@ -2744,21 +2910,30 @@ impl HostLayer {
         if experts.is_empty() {
             return Ok(());
         }
-        let weights = |e: u32| -> Result<[Weight<'_>; 3], ModelError> {
-            Ok([
-                self.tier_or_mapping(e, 0, self.gate.source(), self.gate.layout(), || {
-                    self.gate.expert(split, e as usize)
-                })?,
-                self.tier_or_mapping(e, 1, self.up.source(), self.up.layout(), || {
-                    self.up.expert(split, e as usize)
-                })?,
-                self.tier_or_mapping(e, 2, &self.down, RowLayout::Rows, || {
-                    self.down.expert(split, e as usize)
-                })?,
-            ])
+        let weights = |e: u32| -> Result<ExpertLegs<'_>, ModelError> {
+            let down = self.tier_or_mapping(e, 2, &self.down, RowLayout::Rows, || {
+                self.down.expert(split, e as usize)
+            })?;
+            match &self.gate {
+                Some(gate) => Ok(ExpertLegs::Gated([
+                    self.tier_or_mapping(e, 0, gate.source(), gate.layout(), || {
+                        gate.expert(split, e as usize)
+                    })?,
+                    self.tier_or_mapping(e, 1, self.up.source(), self.up.layout(), || {
+                        self.up.expert(split, e as usize)
+                    })?,
+                    down,
+                ])),
+                None => Ok(ExpertLegs::Relu2 {
+                    up: self.tier_or_mapping(e, 1, self.up.source(), self.up.layout(), || {
+                        self.up.expert(split, e as usize)
+                    })?,
+                    down,
+                }),
+            }
         };
         let run = LegRun {
-            limit: Some(self.limit),
+            form: self.form,
             lanes,
         };
         serve(weights, run, x, experts, out, scratch)
@@ -2779,7 +2954,7 @@ impl HostLayer {
         {
             return Err(ModelError::MissingTensor(format!(
                 "expert {e} of {}",
-                self.gate.source().info().name
+                self.up.source().info().name
             )));
         }
         s.tier_ids.clear();
@@ -2826,7 +3001,7 @@ impl HostLayer {
         let mut stacks = self.stacks_of(split)?;
         tier.lend(&mut stacks);
         let run = LegRun {
-            limit: Some(self.limit),
+            form: self.form,
             lanes,
         };
         serve_step_split(stacks, run, x.view(), &lists, out, union, tier, ticket)
@@ -2875,11 +3050,11 @@ impl HostLayer {
             x,
             lists,
             out,
-            self.gate.source().info().dims[1] as usize,
+            self.up.source().info().dims[1] as usize,
             scratch,
         )?;
         let run = LegRun {
-            limit: Some(self.limit),
+            form: self.form,
             lanes,
         };
         serve_union(
@@ -2936,11 +3111,12 @@ impl HostLayer {
         self.read_beside(src)?;
         let split = src.split();
         let x = x.into();
+        self.refuse_relu2_tier()?;
         check_union_call(
             x,
             lists,
             out,
-            self.gate.source().info().dims[1] as usize,
+            self.up.source().info().dims[1] as usize,
             scratch,
         )?;
         // The plan's ids are the call's distinct ids, ascending; the union
@@ -2948,7 +3124,7 @@ impl HostLayer {
         self.prepare_step_ids(tier, lists, scratch)?;
         let mut stacks = self.stacks_of(split)?;
         let run = LegRun {
-            limit: Some(self.limit),
+            form: self.form,
             lanes,
         };
         if scratch.tier_ids.is_empty() {
@@ -2972,10 +3148,11 @@ impl HostLayer {
     }
 
     /// The matrices a warm routine fills for `ids`, pushed to `out` in `ids`'
-    /// order, each id's gate, up and down as the leg reads them
-    /// ([`HostLayer::experts_into`], [`HostLayer::experts_step_union_into`]):
-    /// from the file mapping or the r8 sidecar, or — an id outside the plan's
-    /// host segment — from its arena slot. An id whose slot is unfilled is
+    /// order, each id's stacks as the leg reads them ([`HostLayer::experts_into`],
+    /// [`HostLayer::experts_step_union_into`]) — the gate, the up and the down
+    /// gated; the up and the down for a relu² layer — from the file mapping or
+    /// the r8 sidecar, or — an id outside the plan's host segment — from its
+    /// arena slot. An id whose slot is unfilled is
     /// left out whole: a warm never fills a slot ([`TierSlots::ensure`]).
     /// Each span carries the units of the step legs' pass that reads it, so
     /// the CCD that computes a row is the CCD that warms it
@@ -3007,15 +3184,22 @@ impl HostLayer {
         if let Some(tier) = &self.tier {
             tier.lend(&mut stacks);
         }
+        // A relu² layer warms its up and its down; the stacks' gate slot is
+        // the up again.
+        let warmed = match self.form {
+            ExpertForm::Gated { .. } => &stacks[..],
+            ExpertForm::Relu2 => &stacks[1..],
+        };
         'ids: for &id in ids {
             if id as usize >= self.n_expert {
                 return Err(ModelError::MissingTensor(format!(
                     "expert {id} of {}",
-                    self.gate.source().info().name
+                    self.up.source().info().name
                 )));
             }
-            let mut parts = [None; 3];
-            for (part, stack) in stacks.iter().enumerate() {
+            let mut all: [Option<WarmSpan<'a>>; 3] = [None; 3];
+            let parts = &mut all[..warmed.len()];
+            for (part, stack) in warmed.iter().enumerate() {
                 let Some(span) = stack.warm_span(id) else {
                     continue 'ids;
                 };
@@ -3031,7 +3215,7 @@ impl HostLayer {
                 }
                 parts[part] = Some(span);
             }
-            out.extend(parts.into_iter().flatten());
+            out.extend(parts.iter().copied().flatten());
         }
         Ok(())
     }
@@ -3040,10 +3224,10 @@ impl HostLayer {
 #[cfg(test)]
 mod tests {
     use super::{
-        Buckets, HostLayer, HostLayerSpec, HostScratch, TOUCHED, UnionScratch, check_host_call,
-        gather_expert_inputs, last_touched_experts, relist, reset_touched,
+        Buckets, HostLayer, HostLayerSpec, HostScratch, Relu2Spec, TOUCHED, UnionScratch,
+        check_host_call, gather_expert_inputs, last_touched_experts, relist, reset_touched,
     };
-    use crate::ops::{self, RowLayout, Tensor2};
+    use crate::ops::{self, ExpertForm, RowLayout, Tensor2};
     use crate::r8file::{HostR8, R8Source, Sidecar};
     use gguf::GgmlType;
     use gguf::write::{Layout, TensorDecl, Writer};
@@ -3270,6 +3454,80 @@ mod tests {
                 (Err(e), false) => panic!("a fused layer must build: {e}"),
             }
         }
+    }
+
+    /// A relu² layer's build, by name: a spec whose stacks carry other dims
+    /// than it says is refused with the stack's own error; a relu² layer that
+    /// built reads its up again in the stacks' gate slot — the file's gate
+    /// stack, which it holds here, is never read — and carries the relu²
+    /// form; and a relu² layer with the NVMe tier attached is refused by name
+    /// at every entry that could reach one.
+    #[test]
+    fn host_layer_build_relu2_refuses_by_name() {
+        let (embd, ff, n_expert) = (256, 512, 4);
+        let check = |got: String, want: &str| {
+            assert!(
+                got.contains(want),
+                "refusal must name {want:?}, got {got:?}"
+            );
+            println!("relu2 refusal {want:?}: {got}");
+        };
+        let spec = |embd, ff| Relu2Spec {
+            up: "up_exps",
+            down: "down_exps",
+            n_expert,
+            embd,
+            ff,
+        };
+        let path = layer_file("relu2", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let src = R8Source::rows(&split);
+        check(
+            HostLayer::build_relu2(src, &spec(ff, embd))
+                .err()
+                .expect("a spec of other dims is refused")
+                .to_string(),
+            "expert stack: expected [512, 256], got [256, 512]",
+        );
+        let mut layer =
+            HostLayer::build_relu2(src, &spec(embd, ff)).expect("two stacks of Q4_K build");
+        assert_eq!(
+            layer.form(),
+            ExpertForm::Relu2,
+            "the layer carries its form"
+        );
+        assert_eq!(
+            (
+                &layer.stacks()[0].info().name,
+                &layer.stacks()[1].info().name
+            ),
+            (&"up_exps".to_string(), &"up_exps".to_string()),
+            "the gate slot holds the up again"
+        );
+
+        let mut spans = Vec::new();
+        layer.warm_spans(src, &[0], &mut spans).unwrap();
+        assert_eq!(spans.len(), 2, "a relu² layer warms its up and its down");
+
+        // The NVMe tier: refused by name at the one-column and the union
+        // entries, before any slot is asked for.
+        let tier = std::sync::Arc::new(MockTier::of(&split, &layer, false));
+        layer.attach_tier(4, 1..2, tier);
+        let (x, list) = (Tensor2::zeros(embd, 1), vec![(0u32, 1.0f32)]);
+        let mut out = vec![0.0f32; embd];
+        let mut host = HostScratch::new(embd, ff, n_expert).unwrap();
+        let e = layer
+            .experts_into(src, &x, &list, &mut out, &mut host)
+            .expect_err("a relu² layer refuses the tier")
+            .to_string();
+        assert!(e.contains("gated experts only"), "{e}");
+        let mut us = UnionScratch::new_routed(embd, ff, 4, n_expert).unwrap();
+        let e = layer
+            .experts_union_into(src, &x, &[&list[..]], &mut out, &mut us)
+            .expect_err("a relu² layer refuses the tier at the union")
+            .to_string();
+        assert!(e.contains("gated experts only"), "{e}");
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// A `BLOOMERY_QDOT_AVX512` value qdot refuses stops the host tier's load:

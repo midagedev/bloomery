@@ -10,9 +10,12 @@ mod manifest;
 mod model_path;
 #[path = "common/oracle.rs"]
 mod oracle;
+#[path = "common/panics.rs"]
+mod panics;
 
 use gguf::GgmlType;
 use model::ops::{Tensor2, f32_tensor, matmul_q, rms_norm};
+use panics::panic_text;
 
 /// The slot-count observable and the deferral override are process-global,
 /// and cargo runs this file's tests in parallel — the tests that touch
@@ -721,7 +724,10 @@ fn hw_group_swiglu_matches_caller_composition() {
 /// pars bit for bit — on both deferral arms, at one column and at six. A
 /// clamped combine (`GroupInput::SwigluClamp`) through either entry equals
 /// the caller composition over `qdot::swiglu_clamp` bit for bit, with the
-/// limit set where it bites on both sides of `up`.
+/// limit set where it bites on both sides of `up`; a relu² combine
+/// (`GroupInput::Relu2`) equals the caller composition over `relu(up)²`, through the wide entry
+/// (`matmul_q_group_cols_into`, ten columns) as well, and refuses a NaN or an infinity in an up
+/// block by name through every entry.
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_group_into_matches_allocating_entries() {
@@ -735,6 +741,20 @@ fn hw_group_into_matches_allocating_entries() {
     let (xs, xinf) = o.load("ffn_norm-1", 0);
     let xall = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
     let x1 = Tensor2::from_vec(xall.ne0, 1, xall.col(0).to_vec());
+    // Ten columns, past the widest claim: the group entry that takes a wide input
+    // (`matmul_q_group_cols_into`) produces each combine in the pre-pass.
+    let x10 = Tensor2::from_vec(
+        xall.ne0,
+        10,
+        (0..10)
+            .flat_map(|j| {
+                xall.col(j % xall.ne1)
+                    .iter()
+                    .map(|v| v * (1.0 + j as f32 / 16.0))
+                    .collect::<Vec<f32>>()
+            })
+            .collect(),
+    );
 
     let names = [
         "blk.1.ffn_gate_exps.weight",
@@ -766,7 +786,9 @@ fn hw_group_into_matches_allocating_entries() {
             .collect()
     };
     let (mut hits_hi, mut hits_lo, mut hits_silu) = (0usize, 0usize, 0usize);
-    for (x, label) in [(&x1, "ne1=1"), (&xall, "ne1=6")] {
+    let mut wide_relu2 = 0usize;
+    let mut refused = 0usize;
+    for (x, label) in [(&x1, "ne1=1"), (&xall, "ne1=6"), (&x10, "ne1=10")] {
         for (mode, arm) in [(Some(true), "deferred"), (Some(false), "pre-pass")] {
             model::ops::set_defer_quant(mode);
             let gu_views: Vec<gguf::TensorInfo> = experts
@@ -861,15 +883,134 @@ fn hw_group_into_matches_allocating_entries() {
                     );
                 }
             }
+
+            // The relu² combine (the ungated experts' form, which reads the up
+            // alone): relu(up)² of each up block through either entry equals
+            // the caller composition, and its downs the plain group's over
+            // those pars.
+            let relu2_pars: Vec<Tensor2> = (0..n)
+                .map(|i| {
+                    let up = &gu[2 * i + 1];
+                    let data = up
+                        .data
+                        .iter()
+                        .map(|&u| {
+                            let r = u.max(0.0);
+                            r * r
+                        })
+                        .collect();
+                    Tensor2::from_vec(up.ne0, up.ne1, data)
+                })
+                .collect();
+            let relu2_refs: Vec<&Tensor2> = relu2_pars.iter().collect();
+            let relu2_downs = matmul_q_group(&g, &d_refs, &relu2_refs).unwrap();
+            let relu2: Vec<GroupInput> =
+                (0..n).map(|i| GroupInput::Relu2(&gu[2 * i + 1])).collect();
+            let (r_downs, r_pars) = matmul_q_group_swiglu(&g, &d_refs, &relu2).unwrap();
+            let (mut rd_into, mut rp_into) = (blank(&downs), blank(&pars));
+            matmul_q_group_swiglu_into("test", &d_ws, &relu2, &mut rd_into, &mut rp_into).unwrap();
+            for i in 0..n {
+                for (got, what) in [(&r_pars[i], "allocating"), (&rp_into[i], "_into")] {
+                    assert_eq!(
+                        differ(&relu2_pars[i].data, &got.data),
+                        0,
+                        "relu² par {i} ({label}, {arm}, {what}): must equal relu(up)²"
+                    );
+                }
+                for (got, what) in [(&r_downs[i], "allocating"), (&rd_into[i], "_into")] {
+                    assert_eq!(
+                        differ(&relu2_downs[i].data, &got.data),
+                        0,
+                        "relu² down {i} ({label}, {arm}, {what}): must equal the caller composition"
+                    );
+                }
+            }
+            // A wide input's combines are produced column by column in the pre-pass.
+            if x.ne1 > model::ops::DEFER_MAX_COLS {
+                let (mut cd, mut cp) = (blank(&downs), blank(&pars));
+                model::ops::matmul_q_group_cols_into("test", &d_ws, &relu2, &mut cd, &mut cp)
+                    .unwrap();
+                for i in 0..n {
+                    assert_eq!(
+                        differ(&relu2_pars[i].data, &cp[i].data),
+                        0,
+                        "relu² par {i} ({label}, {arm}, wide): must equal relu(up)²"
+                    );
+                    assert_eq!(
+                        differ(&relu2_downs[i].data, &cd[i].data),
+                        0,
+                        "relu² down {i} ({label}, {arm}, wide): must equal the caller composition"
+                    );
+                }
+                wide_relu2 += 1;
+            }
+            // A NaN or an infinity in an up block is refused by name, never turned into zero
+            // by the relu: the last cell of the first expert's up, through every entry.
+            for (bad, what) in [
+                (f32::NAN, "NaN"),
+                (f32::INFINITY, "+inf"),
+                (f32::NEG_INFINITY, "-inf"),
+            ] {
+                let mut ups: Vec<Tensor2> = (0..n)
+                    .map(|i| {
+                        Tensor2::from_vec(
+                            gu[2 * i + 1].ne0,
+                            gu[2 * i + 1].ne1,
+                            gu[2 * i + 1].data.clone(),
+                        )
+                    })
+                    .collect();
+                let last = ups[0].data.len() - 1;
+                ups[0].data[last] = bad;
+                let inputs: Vec<GroupInput> = ups.iter().map(GroupInput::Relu2).collect();
+                // The wide entry takes an input past the widest claim.
+                let entries: &[&str] = if x.ne1 > model::ops::DEFER_MAX_COLS {
+                    &["allocating", "_into", "wide"]
+                } else {
+                    &["allocating", "_into"]
+                };
+                for &entry in entries {
+                    let mut call = || {
+                        let (mut od, mut op) = (blank(&downs), blank(&pars));
+                        let _ = match entry {
+                            "allocating" => matmul_q_group_swiglu(&g, &d_refs, &inputs).map(drop),
+                            "_into" => {
+                                matmul_q_group_swiglu_into("test", &d_ws, &inputs, &mut od, &mut op)
+                                    .map(drop)
+                            }
+                            _ => model::ops::matmul_q_group_cols_into(
+                                "test", &d_ws, &inputs, &mut od, &mut op,
+                            )
+                            .map(drop),
+                        };
+                    };
+                    let text = panic_text(&mut call);
+                    assert!(
+                        text.as_deref()
+                            .is_some_and(|t| t.contains("relu2: non-finite activation value")),
+                        "relu² with {what} in an up block ({label}, {arm}, {entry}) must panic naming \
+                         the non-finite value, got {text:?}"
+                    );
+                    refused += 1;
+                }
+            }
         }
     }
     model::ops::set_defer_quant(None);
+    assert!(
+        refused == 3 * 2 * (2 + 2 + 3),
+        "every non-finite refusal clause must run: three values, two arms, two entries at ne1 1 and 6, three at 10 (got {refused})"
+    );
+    assert!(
+        wide_relu2 > 0,
+        "the wide entry's relu² clause must run (a column count past DEFER_MAX_COLS)"
+    );
     assert!(
         hits_hi > 0 && hits_lo > 0 && hits_silu > 0,
         "the limit must bite on every side (up > L {hits_hi}, up < -L {hits_lo}, silu > L {hits_silu})"
     );
     eprintln!(
-        "_into == allocating entries, bit for bit: {n} experts' gate/up, down and pars, plain and clamped \
-         (up > L {hits_hi}, up < -L {hits_lo}, silu > L {hits_silu}), ne1 1 and 6, both deferral arms"
+        "_into == allocating entries, bit for bit: {n} experts' gate/up, down and pars, plain, clamped \
+         (up > L {hits_hi}, up < -L {hits_lo}, silu > L {hits_silu}) and relu², ne1 1, 6 and 10 (the wide entry's pre-pass at 10), both deferral arms"
     );
 }
