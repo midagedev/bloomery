@@ -192,11 +192,14 @@ pub(crate) struct CardExperts {
     n: usize,
     /// The one-token step's buffers.
     step: CardBufs,
+    /// The buffers of a pass of several rows, on a load that runs one.
+    pass: Option<CardBufs>,
 }
 
 impl CardExperts {
     /// The card experts of `layers` (the description) as `map` places them and
-    /// `w` holds them, `n` wide with routed experts `ff` wide. Load-time only.
+    /// `w` holds them, `n` wide with routed experts `ff` wide, with buffers
+    /// for a pass of `rows` rows when `rows` is more than one. Load-time only.
     pub(crate) fn new(
         gpu: &Gpu,
         w: &Weights,
@@ -204,6 +207,7 @@ impl CardExperts {
         map: &SlotMap,
         n: usize,
         ff: usize,
+        rows: usize,
     ) -> Result<CardExperts, GpuError> {
         let mut per = Vec::with_capacity(layers.len());
         for (l, spec) in layers.iter().enumerate() {
@@ -251,6 +255,9 @@ impl CardExperts {
             ff,
             n,
             step: CardBufs::new(gpu.stream(), n, ff, 1)?,
+            pass: (rows > 1)
+                .then(|| CardBufs::new(gpu.stream(), n, ff, rows))
+                .transpose()?,
         })
     }
 
@@ -279,9 +286,21 @@ impl CardExperts {
         self.step.pre()
     }
 
-    /// Device bytes of the step's buffers.
+    /// The sum plus the residual of the last card layer a pass enqueued,
+    /// one row a token of the pass.
+    pub(crate) fn pass_pre(&self) -> Result<&DeviceBuffer<f32>, GpuError> {
+        self.pass
+            .as_ref()
+            .map(CardBufs::pre)
+            .ok_or(GpuError::State {
+                what: CARD,
+                missing: "the buffers of a pass of several rows",
+            })
+    }
+
+    /// Device bytes of the step's buffers and a pass's.
     pub(crate) fn bytes(&self) -> usize {
-        self.step.bytes()
+        self.step.bytes() + self.pass.as_ref().map_or(0, CardBufs::bytes)
     }
 
     /// Layer `l`'s card slots of the step (module doc, `m = 1`), the slots'
@@ -298,6 +317,34 @@ impl CardExperts {
         let layer = layer_of(&self.layers, l)?;
         self.k
             .enqueue(gpu, w, &mut self.step, (l, layer, self.n), rule, io, sel)
+    }
+
+    /// Layer `l`'s card slots of a pass of `io.m` rows (module doc), the
+    /// slots' places `sel` as the handoffs wrote them, column after column,
+    /// into [`CardExperts::pass_pre`]. A pass of more rows than the load's
+    /// buffers hold is refused by name.
+    pub(crate) fn enqueue_pass(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        l: usize,
+        rule: Act,
+        io: &Io<'_>,
+        sel: &DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let layer = layer_of(&self.layers, l)?;
+        let bufs = self.pass.as_mut().ok_or(GpuError::State {
+            what: CARD,
+            missing: "the buffers of a pass of several rows",
+        })?;
+        if io.m == 0 || io.m > bufs.cap() {
+            return Err(GpuError::Shape {
+                what: CARD,
+                detail: format!("a pass of {} rows in buffers of {}", io.m, bufs.cap()),
+            });
+        }
+        self.k
+            .enqueue(gpu, w, bufs, (l, layer, self.n), rule, io, sel)
     }
 
     /// Layer `l`'s card slots over a prompt batch of `io.m` tokens (module
