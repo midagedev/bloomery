@@ -62,8 +62,15 @@ for arm in base new; do
   else
     cp "$ROOT/tools/gate-batch.sh" "$WORK/$arm/tools/gate-batch.sh"
     cp "$ROOT/justfile" "$WORK/$arm/justfile"
+    # The pack's resource table (a BASE predating it has none to copy; its runner reads none)
+    if [ -f "$ROOT/tools/gate-batch-resources.tsv" ]; then
+      cp "$ROOT/tools/gate-batch-resources.tsv" "$WORK/$arm/tools/gate-batch-resources.tsv"
+    fi
   fi
   cp "$ROOT/tools/ref/ref-paths.sh" "$WORK/$arm/tools/ref/ref-paths.sh"
+  # real-only.sh: the plan's real-only validation reads it in the tree (its absence would be a named
+  # error for all 44 real-only recipes of the real justfile, in both arms)
+  cp "$ROOT/tools/ref/real-only.sh" "$WORK/$arm/tools/ref/real-only.sh"
 done
 
 # Each arm's table: the first box.sh command of every listed recipe, exactly as just substitutes
@@ -91,8 +98,9 @@ with open(secs_path, encoding="utf-8") as fh:
 for table, jf in [(base_t, base_jf), (new_t, new_jf)]:
     rows, seen = [], {}
     for name in items:
-        dry = subprocess.run(["just", "--justfile", jf, "--dry-run", name],
-                             capture_output=True, text=True, check=True).stdout
+        r = subprocess.run(["just", "--justfile", jf, "--dry-run", name],
+                           capture_output=True, text=True, check=True)
+        dry = r.stdout + r.stderr  # just prints a recipe's dry run to stderr
         cmd = next((ln.strip() for ln in dry.split("\n") if "./tools/box.sh '" in ln), None)
         if cmd is None:
             sys.exit(f"batch-replay: {name}: no box.sh command in its recipe")
@@ -127,7 +135,8 @@ if [ -z "\$row" ]; then
   printf '%s\\t%s\\t%s\\t%s\\tother\\n' "\$(date +%s)" "\$(date +%s)" "\${BLOOMERY_BOX_ENV:-}" "\$*" >> "\$st/ran.log"
   exit 0
 fi
-name=\${row%%\\t*}; secs=\${row##*\\t}
+name=\$(printf '%s' "\$row" | cut -f1)
+secs=\$(printf '%s' "\$row" | cut -f2)
 s0=\$(date +%s); k=0
 want=\$((secs / $SCALE + 1))
 while [ "\$k" -lt "\$want" ]; do sleep 1; k=\$((k + 1)); done
@@ -148,9 +157,13 @@ run_arm() { # $1 = arm label, $2.. = the batch's own flags
     bash "$WORK/$arm/tools/gate-batch.sh" --out "$OUT/$arm" --list "$LIST" "$@" ) > "$OUT/$arm.log" 2>&1 || rc=$?
   printf '%s' "$rc" > "$OUT/$arm.rc"
 }
+# A base with the budget refusal (a32023da and later) needs --over-budget-ok as much as the new arm;
+# one without the flag would refuse the unknown option, so it is passed only where it exists.
+BASE_BUDGET_OK=''
+if git -C "$ROOT" show "$BASE_REV:tools/gate-batch.sh" | grep -q -- --over-budget-ok; then BASE_BUDGET_OK=1; fi
 run_arm new --over-budget-ok &
 newpid=$!
-run_arm base &
+if [ -n "$BASE_BUDGET_OK" ]; then run_arm base --over-budget-ok; else run_arm base; fi &
 basepid=$!
 wait "$newpid"; wait "$basepid"
 for arm in base new; do

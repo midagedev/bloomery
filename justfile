@@ -1972,10 +1972,15 @@ weekly-gpu-mimo2-e2e *ARGS:
 # that read ik's sets (free, forced, the step sets) are Oracle clauses, deferred to the real tier by name; every other
 # clause runs on the fixture. Loads the whole model: alone in a batch in the real tier, under the big-load lock the V4.1
 # loads take; balanced over the cards in the fixture tier, which takes no lock.
+# PIN(2026-10-09): its own bound, 1200 s. The measured median is 773 s (train028b/028c/028f's times rows), past 0.75 x
+# the default 900 the batch's budget refusal names; the gate's arms admit no smaller split (`--only` takes one arm, so
+# one item per arm: main 293 s, pp 313 s, slots 162 s, stagger 69 s, each plus its own ~50 s load — 936 s of chain time,
+# +163 s on the critical path). 1200 keeps the kill at 1.55 x the median while the budget check reads 900 s, the default
+# bound itself.
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-e2e:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --step-sets short'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && BLOOMERY_GATE_BOUND=1200 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --step-sets short'
 
 # The same gate's drafted slots pass (`--only stagger-draft`, (h1)-(h4)) on a NextN load of its own at SLOT_CTX, its plan
 # counting two slots: each slot's verify rows, two a slot, as one pass of four (`GpuModel::verify_slots` and
