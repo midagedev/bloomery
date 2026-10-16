@@ -235,7 +235,12 @@ mod gate {
             ("gqa_flash_merge".into(), attn),
             ("kv_append_pos_buf".into(), 2 * n_kv * attn),
             ("iq2_xxs_gemv_sel".into(), 4 * moe),
-            ("relu_sqr".into(), 2 * moe),
+            // PIN(2026-10-17): the up rows' quantize applies the squared
+            // ReLU in its load, so the step graph holds the relu_sqr rule
+            // inside `q3k_quantize_q8_1_relu_sqr` (2 * moe) and no standalone
+            // `relu_sqr` entry (was 2 * moe).
+            ("q3k_quantize_q8_1_relu_sqr".into(), 2 * moe),
+            ("relu_sqr".into(), 0),
             ("weighted_sum".into(), moe),
             ("embed_rows_q8_0".into(), 1),
         ];

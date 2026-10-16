@@ -693,6 +693,74 @@ pub unsafe fn q8_1_quant_block(
     }
 }
 
+/// [`q8_1_quant_block`] with the squared ReLU applied to each value as it is
+/// read — the pass's up rows quantized without the f32 round trip through
+/// the activation buffer. The transform is `elem`'s `relu_sqr` rule, value
+/// for value: a non-finite input passes through as it is (so the block is
+/// refused below exactly as it was over the buffer the elem kernel wrote),
+/// a finite one `max(v, 0)²`.
+///
+/// # Safety
+///
+/// [`q8_1_quant_block`]'s contract unchanged: its clause on `x` bounds the
+/// lane's four loaded values (the transform is applied after that load), and
+/// every other clause carries over word for word.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub unsafe fn q8_1_quant_block_relu_sqr(
+    x: &[f32],
+    x0: usize,
+    col: usize,
+    b: usize,
+    n_sb: usize,
+    half_it: u32,
+    quad_it: u32,
+    lane: usize,
+    q3: &mut DisjointSlice<u64>,
+    q4: &mut DisjointSlice<u32>,
+    q6: &mut DisjointSlice<u32>,
+    s8: &mut DisjointSlice<i32>,
+    d8: &mut DisjointSlice<f32>,
+    fault: FaultSink,
+    site: FaultSite,
+) {
+    let base = x0 + col * 256 * n_sb + 128 * b + 4 * lane;
+    // SAFETY: base + 3 < x0 + (col+1)*256*n_sb <= x.len() by this fn's
+    // `# Safety`.
+    let v = unsafe {
+        [
+            *x.get_unchecked(base),
+            *x.get_unchecked(base + 1),
+            *x.get_unchecked(base + 2),
+            *x.get_unchecked(base + 3),
+        ]
+    };
+    let relu_sqr = |v: f32| {
+        if !v.is_finite() {
+            v
+        } else {
+            let r = if v > 0.0 { v } else { 0.0 };
+            r * r
+        }
+    };
+    let v = [
+        relu_sqr(v[0]),
+        relu_sqr(v[1]),
+        relu_sqr(v[2]),
+        relu_sqr(v[3]),
+    ];
+    // SAFETY: [`q8_1_quant_block`]'s clause on `q8_1_quant_vals` — `v` holds
+    // the transformed values `128*b + 4*lane .. +3` of column `col`.
+    let refused =
+        unsafe { q8_1_quant_vals(v, col, b, n_sb, half_it, quad_it, lane, q3, q4, q6, s8, d8) };
+    if refused && lane == 0 {
+        fault.raise(site);
+    }
+}
+
 /// The same 128-value q8_1 quantization from the four values already in a
 /// lane's registers, for a producer that holds them. The partition is the
 /// caller's to keep: the warp entering this must be the same 32 lanes
@@ -891,6 +959,73 @@ mod kernels {
         // one warp per block index, `lane` its lane id.
         unsafe {
             q8_1_quant_block(
+                x,
+                x0 as usize,
+                col,
+                b,
+                n_sb,
+                half_it,
+                quad_it,
+                lane,
+                &mut q3,
+                &mut q4,
+                &mut q6,
+                &mut s8,
+                &mut d8,
+                fault,
+                FaultSite::QuantColumn,
+            )
+        };
+    }
+
+    /// [`q3k_quantize_q8_1`] with the squared ReLU applied to each value as
+    /// it is read ([`q8_1_quant_block_relu_sqr`]): the up rows' f32 buffer
+    /// quantized for the down GEMM without the elem pass over the activation
+    /// buffer — the same bytes, the values transform inside the load.
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            x.len() >= x0 + m_cols * 256 * n_sb,
+            q3.len() >= m_cols * 64 * half_it,
+            q4.len() >= m_cols * 256 * quad_it,
+            q6.len() >= m_cols * 128 * half_it,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb
+        )
+    )]
+    pub fn q3k_quantize_q8_1_relu_sqr(
+        x: &[f32],
+        x0: u32,
+        m_cols: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut q3: DisjointSlice<u64>,
+        mut q4: DisjointSlice<u32>,
+        mut q6: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        // One 32-thread block per 128-value quant block: blk is the BLOCK
+        // index (global tid / 32), not the thread id.
+        let blk = thread::index_1d().get() / 32;
+        let n_sb = n_sb as usize;
+        let blocks_per_col = 2 * n_sb; // 128-value blocks per column
+        let total = m_cols as usize * blocks_per_col;
+        if blk >= total {
+            return;
+        }
+        let col = blk / blocks_per_col;
+        let b = blk % blocks_per_col;
+        let lane = warp::lane_id() as usize;
+        // SAFETY: col < m_cols, b < 2*n_sb (above), so `requires` bounds x
+        // and the planes; one warp per block index, `lane` its lane id.
+        unsafe {
+            q8_1_quant_block_relu_sqr(
                 x,
                 x0 as usize,
                 col,
@@ -2696,6 +2831,45 @@ impl Gpu {
         self.quantize_q8_1_cols_at(x, x0, act, m, fault)
     }
 
+    /// [`Gpu::quantize_q8_1_at`] through `q3k_quantize_q8_1_relu_sqr`: the
+    /// squared ReLU applied to `x`'s values inside the quantize, what the up
+    /// rows' buffer feeds the down GEMM without the elem pass.
+    fn quantize_q8_1_at_relu_sqr(
+        &self,
+        x: &DeviceBuffer<f32>,
+        x0: usize,
+        act: &mut Q8Act,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let m = act.m();
+        self.quantize_q8_1_cols_at_relu_sqr(x, x0, act, m, fault)
+    }
+
+    /// [`Gpu::enqueue_quantize_q8_1_layer`] through
+    /// `q3k_quantize_q8_1_relu_sqr` (the step path's up rows).
+    pub fn enqueue_quantize_q8_1_layer_relu_sqr(
+        &self,
+        x: &DeviceBuffer<f32>,
+        act: &mut Q8Act,
+        layer: usize,
+    ) -> Result<(), GpuError> {
+        let sink = self.layer_sink(layer)?;
+        self.quantize_q8_1_at_relu_sqr(x, 0, act, sink)
+    }
+
+    /// [`Gpu::quantize_q8_1_cols_at`] through `q3k_quantize_q8_1_relu_sqr`
+    /// (a prompt pass's up rows, its first `m` columns).
+    fn quantize_q8_1_cols_at_relu_sqr(
+        &self,
+        x: &DeviceBuffer<f32>,
+        x0: usize,
+        act: &mut Q8Act,
+        m: usize,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        self.quantize_q8_1_cols_at_(x, x0, act, m, true, fault)
+    }
+
     /// [`Gpu::quantize_q8_1_at`] over `act`'s first `m` columns, refused
     /// unless `1 <= m <= act.m()`.
     fn quantize_q8_1_cols_at(
@@ -2704,6 +2878,21 @@ impl Gpu {
         x0: usize,
         act: &mut Q8Act,
         m: usize,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        self.quantize_q8_1_cols_at_(x, x0, act, m, false, fault)
+    }
+
+    /// The launcher both quantize entries share; `relu_sqr` only picks the
+    /// kernel (`q3k_quantize_q8_1_relu_sqr` applies the squared ReLU inside
+    /// its load).
+    fn quantize_q8_1_cols_at_(
+        &self,
+        x: &DeviceBuffer<f32>,
+        x0: usize,
+        act: &mut Q8Act,
+        m: usize,
+        relu_sqr: bool,
         fault: FaultSink,
     ) -> Result<(), GpuError> {
         let n_sb = act.n_sb();
@@ -2732,26 +2921,50 @@ impl Gpu {
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
         // Prepared per call for now: the prepare step is host-only contract
         // validation, and it is exactly the kind of per-launch host cost a
-        // captured graph removes. Caching per shape is P8's business.
-        let prep = self
-            .module
-            .prepare_q3k_quantize_q8_1(LaunchConfig1D::new(grid, 32, 0))?;
-        self.module.q3k_quantize_q8_1(
-            &self.stream,
-            &prep,
-            x,
-            x0,
-            m,
-            n_sb,
-            n_sb.div_ceil(2),
-            n_sb.div_ceil(4),
-            &mut act.q3,
-            &mut act.q4,
-            &mut act.q6,
-            &mut act.s8,
-            &mut act.d8,
-            fault,
-        )?;
+        // captured graph removes. Caching per shape is P8's business. The
+        // two entries take the same arguments; `relu_sqr` only picks the
+        // kernel.
+        if relu_sqr {
+            let prep = self
+                .module
+                .prepare_q3k_quantize_q8_1_relu_sqr(LaunchConfig1D::new(grid, 32, 0))?;
+            self.module.q3k_quantize_q8_1_relu_sqr(
+                &self.stream,
+                &prep,
+                x,
+                x0,
+                m,
+                n_sb,
+                n_sb.div_ceil(2),
+                n_sb.div_ceil(4),
+                &mut act.q3,
+                &mut act.q4,
+                &mut act.q6,
+                &mut act.s8,
+                &mut act.d8,
+                fault,
+            )?;
+        } else {
+            let prep = self
+                .module
+                .prepare_q3k_quantize_q8_1(LaunchConfig1D::new(grid, 32, 0))?;
+            self.module.q3k_quantize_q8_1(
+                &self.stream,
+                &prep,
+                x,
+                x0,
+                m,
+                n_sb,
+                n_sb.div_ceil(2),
+                n_sb.div_ceil(4),
+                &mut act.q3,
+                &mut act.q4,
+                &mut act.q6,
+                &mut act.s8,
+                &mut act.d8,
+                fault,
+            )?;
+        }
         Ok(())
     }
 

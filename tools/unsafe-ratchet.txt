@@ -277,7 +277,10 @@ gguf 9 2 0
 # pass's conv pre-pass mamba2_conv_rows (one fn) and the STAGE_T staging rewrite of mamba2_steps, each
 # with its SAFETY line (the branch's own pin counted three blocks from 1871; the merged tree measures
 # five from the nvfp4p pin).
-gpu 1878 204 10
+# PIN(2026-10-17): gpu 1878 -> 1881 blocks, 204 -> 205 fns, new code, not old code relaxed:
+# q8_1_quant_block_relu_sqr (one unsafe fn, the up rows' squared ReLU inside the q8_1 quantize load)
+# and its kernel entry q3k_quantize_q8_1_relu_sqr's call block, each with its SAFETY line.
+gpu 1881 205 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

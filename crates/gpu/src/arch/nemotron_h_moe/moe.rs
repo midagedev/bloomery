@@ -80,16 +80,14 @@ pub(super) struct MoeKernels {
 pub(super) struct MoeScratch {
     /// The latent down's output, the experts' input.
     lat: DeviceBuffer<f32>,
-    /// The slots' up outputs, `TOP_K × w`, then their squared ReLU.
+    /// The slots' up outputs, `TOP_K × w`.
     up: DeviceBuffer<f32>,
-    act: DeviceBuffer<f32>,
     /// The slots' down outputs, `TOP_K × latent`.
     down: DeviceBuffer<f32>,
     /// The weighted sum of the slots, `latent`.
     moe: DeviceBuffer<f32>,
-    /// The shared expert's up output and its squared ReLU, then its down.
+    /// The shared expert's up output, then its down.
     sh_up: DeviceBuffer<f32>,
-    sh_act: DeviceBuffer<f32>,
     sh: DeviceBuffer<f32>,
     /// `moe_out + shared`, the layer's delta.
     sum: DeviceBuffer<f32>,
@@ -112,11 +110,9 @@ impl MoeScratch {
         Ok(MoeScratch {
             lat: z(sh.latent)?,
             up: z(TOP_K * ff)?,
-            act: z(TOP_K * ff)?,
             down: z(TOP_K * sh.latent)?,
             moe: z(sh.latent)?,
             sh_up: z(sh.shared_ff)?,
-            sh_act: z(sh.shared_ff)?,
             sh: z(hidden)?,
             sum: z(hidden)?,
             zero_id: DeviceBuffer::zeroed(stream, 1)?,
@@ -127,11 +123,9 @@ impl MoeScratch {
         [
             &self.lat,
             &self.up,
-            &self.act,
             &self.down,
             &self.moe,
             &self.sh_up,
-            &self.sh_act,
             &self.sh,
             &self.sum,
         ]
@@ -354,11 +348,9 @@ pub(super) fn moe_layer(
         };
         k.iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, TOP_K, fault, &mut s.up)?;
     }
-    gpu.elem()
-        .enqueue_relu_sqr(stream, &s.up, TOP_K * m.ff, &mut s.act)?;
     {
         let act = acts.q8_1_at(what, m.ff, TOP_K)?;
-        gpu.enqueue_quantize_q8_1_layer(&s.act, act, l)?;
+        gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.up, act, l)?;
         let down = SelDown {
             w: stack(cx.w, what, &m.down_exps)?,
             act,
@@ -378,11 +370,9 @@ pub(super) fn moe_layer(
         &mut s.moe,
     )?;
     m.latent_up.project(cx, acts, l, &s.moe, &mut t.buf.delta)?;
-    gpu.elem()
-        .enqueue_relu_sqr(stream, &s.sh_up, sh.shared_ff, &mut s.sh_act)?;
     {
         let act = acts.q8_1_at(what, sh.shared_ff, 1)?;
-        gpu.enqueue_quantize_q8_1_layer(&s.sh_act, act, l)?;
+        gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.sh_up, act, l)?;
         one_expert(cx, k, l, &m.down_shexp, hidden, act, &s.zero_id, &mut s.sh)?;
     }
     gpu.elem()
