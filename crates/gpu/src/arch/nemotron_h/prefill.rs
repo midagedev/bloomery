@@ -23,6 +23,7 @@ use crate::flash::PlaneAppend;
 use crate::flash_gqa::{GROUP_5, GqaArgs, HEAD};
 use crate::gemm::{GemmInput, GemmRoute};
 use crate::head::Head;
+use crate::mamba2::{Mamba2PassScratch, StepsArgs};
 use crate::model::{GpuModel, MAX_PASS_ROWS};
 use crate::site::{self, SiteTy, SiteWeight, WideActs, WideKernels};
 use crate::tensor::{Pitched, WindowMut, dtod_2d};
@@ -66,6 +67,9 @@ pub(super) struct Prompt {
     host_words: Vec<u32>,
     /// The pass's one-expert table: slot `s` reads column `s`.
     route: GemmRoute,
+    /// What the Mamba-2 pass precomputes: every token's conv outputs and
+    /// per-head `σ`/`dA` ([`Mamba2PassScratch`]), sized to these `rows`.
+    mamba2: Mamba2PassScratch,
     acts: Vec<ActAt>,
 }
 
@@ -117,6 +121,7 @@ impl Prompt {
             words: DeviceBuffer::zeroed(stream, n_words)?,
             host_words: vec![0; n_words],
             route: GemmRoute::new(stream, rows, 1)?,
+            mamba2: Mamba2PassScratch::new(stream, sh.mamba, rows)?,
             acts,
         })
     }
@@ -130,6 +135,7 @@ impl Prompt {
                 .sum::<usize>()
             + self.words.num_bytes()
             + self.route.bytes()
+            + self.mamba2.device_bytes()
             + self.acts.iter().map(|a| a.acts.bytes()).sum::<usize>()
     }
 
@@ -278,6 +284,7 @@ impl Body {
                 vh,
                 words,
                 route,
+                mamba2,
                 acts,
                 ..
             } = p;
@@ -309,7 +316,7 @@ impl Body {
                     project(&cx, (acts, route), l, xn, &mut [(&mm.ssm_in, ld, zxbcdt)])?;
                     self.k.mamba.enqueue_steps(
                         stream,
-                        crate::mamba2::StepsArgs {
+                        StepsArgs {
                             shape: sh.mamba,
                             u: m,
                             rows: zxbcdt,
@@ -330,6 +337,7 @@ impl Body {
                             y,
                             ring: &mut mm.store.ring,
                             state: &mut mm.store.state,
+                            scratch: mamba2,
                         },
                     )?;
                     project(

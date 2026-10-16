@@ -224,6 +224,7 @@ generate_ds41   kv_append                                0           0
 generate_ds41   kv_append_pos_buf                        0           0
 generate_ds41   kv_norm_rope_append                      0           0
 generate_ds41   latent_rms_append                        0           0
+generate_ds41   mamba2_conv_rows                         0           0
 generate_ds41   mamba2_norm_rows                         0           0
 generate_ds41   mamba2_ring_tail                         0           0
 generate_ds41   mamba2_step                              0           0
@@ -500,6 +501,7 @@ gate_e2e   kv_append                                0           0
 gate_e2e   kv_append_pos_buf                        0           0
 gate_e2e   kv_norm_rope_append                      0           0
 gate_e2e   latent_rms_append                        0           0
+gate_e2e   mamba2_conv_rows                         0           0
 gate_e2e   mamba2_norm_rows                         0           0
 gate_e2e   mamba2_ring_tail                         0           0
 gate_e2e   mamba2_step                              0           0
@@ -642,3 +644,4 @@ gate_qwen3vl_tower   vis_silu_mul                       0           0
 gate_qwen3vl_tower   vis_silu_mul_clamp                 0           0
 gate_qwen3vl_tower   vis_unfold                         0           0
 
+# PIN(2026-10-17): mamba2_conv_rows (both bins) measured spill=0 jit_local=0 by gate-ptx-spill s-job of the same tree: a flat one-thread-one-item pre-pass, no arrays held across calls.
