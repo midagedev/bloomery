@@ -1,7 +1,7 @@
 //! The 32-value-block GEMM: Q8_0, IQ4_NL, Q5_1 and Q5_0 weights times
 //! [`GemmAct32`] activations over a route table — one block per (tile,
 //! [`GEMM_BM`]-row slab), as the K-quant family runs, for the weights whose
-//! scales come per 32 values. Five entries, declared in `kernels32.rs`,
+//! scales come per 32 values. Six entries, declared in `kernels32.rs`,
 //! differ only in how the weight bytes reach shared memory:
 //! - `gemm_q8_0p`: Q8_0 in the q8f32 planes (`qs` u32 words, eight per
 //!   block, and `d` the blocks' f16 bits, `q8f32.rs`'s layout) — the dense
@@ -18,7 +18,12 @@
 //!   `pack_q5_0`): per row the file's `qs` words in four planes, its `qh`
 //!   plane and its f16 `d` two to a word, each block read and decoded to the
 //!   codes `q − 16` by the gemv's own reader (`q5::q5_0_block`) — no repack
-//!   and no second copy.
+//!   and no second copy;
+//! - `gemm_nvfp4p`: NVFP4 in the resident planes (`mxfp4.rs`'s `repack`:
+//!   `qs` u32 words, four a 32-value unit, `e` one word a 64-value block)
+//!   with the tensor's F32 `scale` — each unit's nibbles decoded to the E2M1
+//!   table's int8 values, its two sub-block scales staged as f32, the store
+//!   one `mul_rn` by `scale` — no Q8_0 twin derived beside them.
 //!
 //! Numeric contract, every entry. Per 32-value block `b` of an output
 //! `(slot, row)`: `isum` the exact i32 dot of the weight codes (Q8_0 int8;
@@ -34,6 +39,17 @@
 //! increasing k. That order is a function of K alone: never of the grid,
 //! the tile a slot lands in, its neighbours or the slot count, so an
 //! output's bits depend on its weight row and its column only.
+//!
+//! NVFP4's contract, per 32-value unit `b` in increasing k instead: `i0`,
+//! `i1` the exact i32 dots of the unit's two 16-value sub-blocks with the
+//! column's int8 codes (`|i_s| ≤ 16 · 12 · 127`), each one `mma.m16n8k32`
+//! with the other half's A codes zero — the pinned cuda-oxide has no s8
+//! `m16n8k16` — `d0`, `d1` the sub-blocks' staged scales (`ue4m3_half`, the
+//! halving of the doubled codes) and `d_a` the column's 32-block scale:
+//! `acc = fma(d_a, fma(d1, f32(i1), d0·f32(i0)), acc)` from `acc = 0`, the
+//! stored value `scale·acc`, one `mul_rn` at the store. Each `d_s·f32(i_s)`
+//! is exact in f32 — a 4-bit significand times a 15-bit integer — so a unit
+//! rounds twice and the store once; the same K-only order rule holds.
 //!
 //! Geometry. A block is [`GEMM_THREADS`] threads, eight warps of sixteen
 //! rows over the tile's columns in n-tiles of eight (the K-quant family's
@@ -56,6 +72,7 @@ use super::kernels32::Gemm32Kernels;
 use super::route::gemm_max_tiles;
 use super::{GEMM_BN, GEMM32_STEP, GemmInput, GemmRoute};
 use crate::iq::iq4_word;
+use crate::mxfp4::NV_BLOCK_VALUES;
 use crate::q5::q5_0_row_words;
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
@@ -151,7 +168,9 @@ pub(super) fn iq4_nl_file_block(w: [u32; 5], x: usize) -> (u16, [u32; 8]) {
 /// register part one step ahead, `@store` it decoded into the stage after
 /// the step's compute; `@prep` binds `$pv`, once per thread, to what a
 /// layout that addresses a row rather than the block stream needs of the
-/// pair's row (packed Q5_0 only; nothing for the others). `$live` is whether
+/// pair's row (packed Q5_0 only; nothing for the others), and `@scale` folds
+/// the entry's tensor-level scale into a stored value (NVFP4 only). `$live`
+/// is whether
 /// the pair exists (its row inside the slab's live rows, its block below
 /// K/32); `$n` is its block's index in the stack's block stream (`row · K/32
 /// + block`), `$dst` its staged row's first word.
@@ -262,6 +281,28 @@ macro_rules! w32 {
             ([0u32; 8], 0.0f32)
         }
     }};
+    (@load nvfp4p($qs:ident, $e:ident, $scale:ident), $live:expr, $n:expr, $pv:ident) => {{
+        if $live {
+            // SAFETY: unit `n` is inside the stack: its code vector is words
+            // `4n ..= 4n + 3` and its scale word `n >> 1` — K a multiple of
+            // 64 keeps a row's units at an even stream index, so `n`'s
+            // parity is the unit's half of its 64-value block — both inside
+            // the planes (launch contract).
+            unsafe {
+                (
+                    [
+                        *$qs.get_unchecked(4 * $n),
+                        *$qs.get_unchecked(4 * $n + 1),
+                        *$qs.get_unchecked(4 * $n + 2),
+                        *$qs.get_unchecked(4 * $n + 3),
+                    ],
+                    *$e.get_unchecked($n >> 1),
+                )
+            }
+        } else {
+            ([0u32; 4], 0u32)
+        }
+    }};
     (@store plane($qs:ident, $wd:ident), $raw:ident, $live:expr, $n:expr, $dst:expr, $pj:expr, $pv:ident) => {{
         if $live {
             // SAFETY: word 16 + pj of the pair's staged row, which no warp
@@ -349,6 +390,46 @@ macro_rules! w32 {
             }
         }
     }};
+    (
+        @store nvfp4p($qs:ident, $e:ident, $scale:ident), $raw:ident, $live:expr, $n:expr,
+        $dst:expr, $pj:expr, $pv:ident
+    ) => {{
+        if $live {
+            let (v, ew) = $raw;
+            // The unit's eight staged code words in value order: its first
+            // sub-block's low words, then its high words, then its second
+            // sub-block's, through the one nibble-table decode (`mxfp4`'s
+            // card path). K a multiple of 64 keeps `n`'s parity the unit's
+            // half, so bytes `2(n & 1)` and `2(n & 1) + 1` of its scale word
+            // are its sub-blocks'.
+            let (l0, h0) = crate::cores::table16_word(v[0], crate::mxfp4::E2M1);
+            let (l1, h1) = crate::cores::table16_word(v[1], crate::mxfp4::E2M1);
+            let (l2, h2) = crate::cores::table16_word(v[2], crate::mxfp4::E2M1);
+            let (l3, h3) = crate::cores::table16_word(v[3], crate::mxfp4::E2M1);
+            let sh = 16 * ($n & 1) as u32;
+            // SAFETY: the pair's eight code words and its two scale words of
+            // its staged row, which no warp reads before the next barrier.
+            unsafe {
+                let p = $dst.add(8 * $pj);
+                *p = l0;
+                *p.add(1) = l1;
+                *p.add(2) = h0;
+                *p.add(3) = h1;
+                *p.add(4) = l2;
+                *p.add(5) = l3;
+                *p.add(6) = h2;
+                *p.add(7) = h3;
+                *$dst.add(16 + $pj) = crate::mxfp4::ue4m3_half((ew >> sh) & 0xff).to_bits();
+                *$dst.add(18 + $pj) = crate::mxfp4::ue4m3_half((ew >> (sh + 8)) & 0xff).to_bits();
+            }
+        }
+    }};
+    (@scale nvfp4p($qs:ident, $e:ident, $scale:ident), $v:expr) => {
+        mul_rn_f32($scale, $v)
+    };
+    (@scale $kind:ident($($w:ident),+), $v:expr) => {
+        $v
+    };
 }
 
 /// Stage step `h`'s activations into stage `st`: thread `tid`'s 16-byte
@@ -410,6 +491,58 @@ macro_rules! epi32 {
     }};
 }
 
+/// One n-tile's product of one NVFP4 32-value unit into the accumulators:
+/// `i0`, `i1` the unit's two 16-value sub-blocks' exact i32 `mma` sums (rows
+/// `g`, `g + 8` by columns `2t`, `2t + 1`), `d0`/`d1` the two rows' staged
+/// sub-block scales, `da` the two columns' block-scale bits — the contract's
+/// order per output: `d0·f32(i0)` exact, one fma for `d1`, one for the
+/// accumulator.
+macro_rules! epi32_nv {
+    ($d0:ident, $d1:ident, $i0:ident, $i1:ident, $da:expr, $acc:ident, $nt:expr) => {{
+        let da: [u32; 2] = $da;
+        for i in 0..4usize {
+            ::cuda_device::thread::__unroll_config::<0>();
+            let tv = mul_rn_f32($d0[i / 2], $i0[i] as f32);
+            let tv = fma_rn_f32($d1[i / 2], $i1[i] as f32, tv);
+            $acc[4 * $nt + i] = fma_rn_f32(f32::from_bits(da[i & 1]), tv, $acc[4 * $nt + i]);
+        }
+    }};
+}
+
+/// One n-tile's product of one 32-value block into the accumulators, per
+/// family: `plain` the one `mma.m16n8k32` and [`epi32!`] of the five
+/// one-scale layouts; `nvfp4p` the block's two 16-value sub-block sums, each
+/// one `mma.m16n8k32` with the other half's A codes zero — the pinned
+/// cuda-oxide has no s8 `m16n8k16`, and a zeroed half contributes an exact
+/// 0 to the sum — and [`epi32_nv!`]'s nested scales.
+macro_rules! mma_epi32 {
+    (
+        plain, $mins:literal, $a:ident, [$($b:expr),+], $dw:ident, $mw:ident, $da:expr, $sa:expr,
+        $acc:ident, $nt:expr
+    ) => {{
+        // SAFETY: every lane of the warp reaches this `mma.sync` (the
+        // branches around it are uniform) with its fragments in the
+        // instruction's layout.
+        let i0 = unsafe { mma_m16n8k32_s32_s8([0; 4], $a, [$($b),+]) };
+        epi32!($mins, i0, $dw, $mw, $da, $sa, $acc, $nt);
+    }};
+    (
+        nvfp4p, $mins:literal, $a:ident, [$($b:expr),+], $d0:ident, $d1:ident, $da:expr, $sa:expr,
+        $acc:ident, $nt:expr
+    ) => {{
+        // SAFETY: every lane of the warp reaches both `mma.sync`s (the
+        // branches around them are uniform) with its fragments in the
+        // instruction's layout.
+        let (i0, i1) = unsafe {
+            (
+                mma_m16n8k32_s32_s8([0; 4], [$a[0], $a[1], 0, 0], [$($b),+]),
+                mma_m16n8k32_s32_s8([0; 4], [0, 0, $a[2], $a[3]], [$($b),+]),
+            )
+        };
+        epi32_nv!($d0, $d1, i0, i1, $da, $acc, $nt);
+    }};
+}
+
 /// The 32-value GEMM block: one tile's columns against one 128-row slab of
 /// that tile's expert (module doc). A macro, not a function, for the
 /// K-quant block's reason (`grouped.rs`, `gemm_block`): the entries share
@@ -417,7 +550,9 @@ macro_rules! epi32 {
 /// function boundary would move the accumulators out of registers.
 ///
 /// `wt` names the relay and the entry's weight parameters, `mins` (a
-/// literal) whether the type has a min term (Q5_1). `params` is the rest of
+/// literal) whether the type has a min term (Q5_1), `epi` the per-block
+/// product's family (`plain`, or `nvfp4p` for the two-sub-block planes).
+/// `params` is the rest of
 /// the entry's parameters in order. The expansion's `unsafe` blocks rest on
 /// the entry's launch contract and on the route table the host guarantees
 /// was built for this stack and slot count.
@@ -429,6 +564,7 @@ macro_rules! gemm32_block {
     (
         wt: $kind:ident($($w:ident),+),
         mins: $mins:literal,
+        epi: $epi:ident,
         params: (
             $q:ident, $d:ident, $s:ident, $cols:ident, $tiles:ident, $n_tiles:ident,
             $n_experts:ident, $rows:ident, $kb:ident, $steps:ident, $act_cols:ident,
@@ -644,18 +780,17 @@ macro_rules! gemm32_block {
                             let x1 = (*(dst.add(D32_ROW * (n0 + 1)) as *const U32x4)).0;
                             (bf, x0, x1)
                         };
-                        // SAFETY: every lane of the warp reaches this `mma.sync`
-                        // (the branches around it are uniform) with its
+                        // SAFETY: every lane of the warp reaches the `mma.sync`
+                        // inside (the branches around it are uniform) with its
                         // fragments in the instruction's layout.
-                        let i0 = unsafe { mma_m16n8k32_s32_s8([0; 4], a0, [bf[0], bf[1]]) };
-                        epi32!($mins, i0, dw0, mw0, [x0[0], x1[0]], [x0[2], x1[2]], acc, nt);
+                        mma_epi32!($epi, $mins, a0, [bf[0], bf[1]], dw0, mw0, [x0[0], x1[0]],
+                            [x0[2], x1[2]], acc, nt);
                         if two {
-                            // SAFETY: every lane of the warp reaches this
-                            // `mma.sync` (`two` and the branches around it are
-                            // warp-uniform) with its fragments in the
-                            // instruction's layout.
-                            let i1 = unsafe { mma_m16n8k32_s32_s8([0; 4], a1, [bf[2], bf[3]]) };
-                            epi32!($mins, i1, dw1, mw1, [x0[1], x1[1]], [x0[3], x1[3]], acc, nt);
+                            // SAFETY: `two` and the branches around it are
+                            // warp-uniform, so every lane reaches the
+                            // `mma.sync` inside as well.
+                            mma_epi32!($epi, $mins, a1, [bf[2], bf[3]], dw1, mw1, [x0[1], x1[1]],
+                                [x0[3], x1[3]], acc, nt);
                         }
                     }
                 }
@@ -682,7 +817,8 @@ macro_rules! gemm32_block {
                             // lane of one block writes each (slot, row).
                             unsafe {
                                 let slot = *slot_sh.add(n) as usize;
-                                *$y.get_unchecked_mut(slot * rows_n + r) = acc[4 * nt + i];
+                                *$y.get_unchecked_mut(slot * rows_n + r) =
+                                    w32!(@scale $kind($($w),+), acc[4 * nt + i]);
                             }
                         }
                     }
@@ -693,7 +829,7 @@ macro_rules! gemm32_block {
 }
 
 /// The weights of a 32-value GEMM: a stack of `n_experts · rows_per_expert`
-/// rows of K = `act.k()` values in one of the five layouts (module doc).
+/// rows of K = `act.k()` values in one of the six layouts (module doc).
 #[derive(Clone, Copy)]
 pub enum Gemm32Weight<'a> {
     /// Q8_0 in the q8f32 planes: `qs` rows × K/4 words, `d` rows × K/32
@@ -718,6 +854,15 @@ pub enum Gemm32Weight<'a> {
     /// `enqueue_gemv_q5_0` reads): per row `q5_0_row_words(K/32)` words, the
     /// file's `qs` and `qh` in planes and its f16 `d` two to a word.
     Q5_0Packed(&'a DeviceTensor<u32>),
+    /// NVFP4 in the resident planes of `mxfp4.rs`'s `repack` (the tensor the
+    /// dense gemv `Nvfp4Kernels::enqueue_gemv` reads): `qs` rows × K/8
+    /// words, `e` rows × K/64, and the tensor's F32 `scale`, applied once at
+    /// the store. K must be a multiple of 64.
+    Nvfp4Planes {
+        qs: &'a DeviceTensor<u32>,
+        e: &'a DeviceTensor<u32>,
+        scale: f32,
+    },
 }
 
 /// [`Gemm32Kernels::enqueue_gemm32`]'s arguments: `w` the stack, `route`
@@ -780,7 +925,8 @@ impl Gemm32Launch {
             | Gemm32Weight::Q8_0File(qs)
             | Gemm32Weight::Q5_1File(qs)
             | Gemm32Weight::Iq4NlFile(qs)
-            | Gemm32Weight::Q5_0Packed(qs) => qs.rows(),
+            | Gemm32Weight::Q5_0Packed(qs)
+            | Gemm32Weight::Nvfp4Planes { qs, .. } => qs.rows(),
         };
         if stack_rows != n_rows {
             return Err(GpuError::shape(
@@ -868,6 +1014,43 @@ impl Gemm32Launch {
                             w.cols(),
                             w.buf().len()
                         ),
+                    ));
+                }
+            }
+            Gemm32Weight::Nvfp4Planes { qs, e, scale } => {
+                if !k.is_multiple_of(NV_BLOCK_VALUES) {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "NVFP4 planes need K a multiple of 64, got {k} (the 64-value block's \
+                             two 32-value units)"
+                        ),
+                    ));
+                }
+                if e.rows() != n_rows
+                    || qs.cols() != k / 8
+                    || e.cols() != k / NV_BLOCK_VALUES
+                    || qs.buf().len() < n_rows * k / 8
+                    || e.buf().len() < n_rows * k / NV_BLOCK_VALUES
+                {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "NVFP4 planes at K = {k}: qs {n_rows} × {} words and e {n_rows} × {} \
+                             words, got qs {} × {} and e {} × {}",
+                            k / 8,
+                            k / NV_BLOCK_VALUES,
+                            qs.rows(),
+                            qs.cols(),
+                            e.rows(),
+                            e.cols()
+                        ),
+                    ));
+                }
+                if !scale.is_finite() {
+                    return Err(GpuError::shape(
+                        what,
+                        format!("the tensor scale must be finite, got {scale}"),
                     ));
                 }
             }
@@ -984,6 +1167,9 @@ impl Gemm32Kernels {
                     (g.kb as usize).div_ceil(2),
                 )?;
                 launch!(prepare_gemm_q5_0p, gemm_q5_0p, w.buf(), s_words);
+            }
+            Gemm32Weight::Nvfp4Planes { qs, e, scale } => {
+                launch!(prepare_gemm_nvfp4p, gemm_nvfp4p, qs.buf(), e.buf(), scale);
             }
         }
         Ok(())

@@ -1,9 +1,9 @@
 //! The host transcription of the 32-value GEMM family (`bloomery_gpu::gemm`'s
 //! `Gemm32Kernels`): its quantizer and the per-output numeric contract that
 //! `gemm32.rs`'s module doc states. One owner, so every gate that holds a
-//! `gemm_q8_0p`, `gemm_q8_0f`, `gemm_q5_1` or `gemm_q5_0p` output bit for bit
-//! holds it to the same transcription (`gate_gemm`'s `g32_*` cases,
-//! `gate_glm5next_gemm`).
+//! `gemm_q8_0p`, `gemm_q8_0f`, `gemm_q5_1`, `gemm_q5_0p` or `gemm_nvfp4p`
+//! output bit for bit holds it to the same transcription (`gate_gemm`'s
+//! `g32_*` cases, `gate_glm5next_gemm`).
 
 /// A `GemmAct32`'s three planes on the host, in the device layout: codes,
 /// scales, sums.
@@ -117,6 +117,41 @@ pub fn dot32(
         mag += dd.abs() + mm.abs();
     }
     (acc, y, mag)
+}
+
+/// One output of an NVFP4 weight row — its `k` decoded E2M1 int8 codes in
+/// value order, its `k/16` sub-block scales (`d0`, `d1` of each 32-value
+/// unit in turn) and the tensor's `scale` — against column `col` of `a`,
+/// three ways: the contract's transcription (per unit the two exact i32
+/// sub-block dots, `acc = fma(d_a, fma(d1, f32(i1), d0·f32(i0)), acc)` from
+/// 0, units in increasing k, the stored value `scale·acc`), the f64 value
+/// `scale · Σ_b d_a·(d0·i0 + d1·i1)` and its band's magnitude.
+#[must_use]
+pub fn dot32_nv(wq: &[i8], wsc: &[f32], scale: f32, a: &HostAct, col: usize) -> (f32, f64, f64) {
+    let kb = a.k / 32;
+    let (mut acc, mut y, mut mag) = (0.0f32, 0.0f64, 0.0f64);
+    for b in 0..kb {
+        let (wb, ab) = (
+            &wq[32 * b..32 * b + 32],
+            &a.codes[col * a.k + 32 * b..col * a.k + 32 * b + 32],
+        );
+        let da = a.d[col * kb + b];
+        let (d0, d1) = (wsc[2 * b], wsc[2 * b + 1]);
+        let dot = |w: &[i8], x: &[i8]| -> i32 {
+            w.iter()
+                .zip(x)
+                .map(|(&p, &q)| i32::from(p) * i32::from(q))
+                .sum()
+        };
+        let (i0, i1) = (dot(&wb[..16], &ab[..16]), dot(&wb[16..], &ab[16..]));
+        let tv = d0 * i0 as f32;
+        let tv = d1.mul_add(i1 as f32, tv);
+        acc = da.mul_add(tv, acc);
+        let t = f64::from(da) * (f64::from(d0) * f64::from(i0) + f64::from(d1) * f64::from(i1));
+        y += t;
+        mag += t.abs();
+    }
+    (scale * acc, f64::from(scale) * y, f64::from(scale) * mag)
 }
 
 /// The f32 roundings that separate a `gemm_q5_0p` output from the Q5_0
