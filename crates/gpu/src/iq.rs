@@ -65,7 +65,12 @@
 //! __device__` there), where constant memory would serialize a warp's
 //! distinct addresses. `kvalues_iq4nl` is a register table read by `prmt`, as
 //! MXFP4's is. Signs are computed, not looked up: the parity bit and a byte
-//! mask built by one multiply.
+//! mask built by one multiply. IQ2_XXS is the exception on both counts: each
+//! block copies its grid, recoded as `prmt` selectors, and the sign
+//! selectors of all 128 sign indices (computed by the same parity rule) into
+//! shared memory once ([`Iq2XxsTab`]), and a group's eight signed values are
+//! two table words or'd and two `prmt`s over the magnitudes and their
+//! negatives — the same value words, so the same bits.
 //!
 //! Activations are the q8_1 quantizer's, as for MXFP4: per 128-value block a
 //! scale `d_x` and int8 codes in the Q4_K gemv's permutation, word `i` of
@@ -96,8 +101,11 @@ use crate::flash::half_bits_to_f32;
 use crate::{GpuError, cores, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::dotprod::dp4a_s32;
+use cuda_device::prmt::prmt;
 use cuda_device::vector::{U32x2, U32x4, as_vectors};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
+};
 use cuda_host::cuda_module;
 use gguf::iq_tables::{
     IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
@@ -114,8 +122,10 @@ const SUBS: usize = SB_VALUES / SUB_VALUES;
 
 /// The IQ2_XS grid behind a reference: one device global (module doc).
 const GRID2: &[u64; 512] = &IQ2XS_GRID;
-/// The IQ2_XXS grid, likewise: 256 entries, a byte index.
-const GRID2XXS: &[u64; 256] = &IQ2XXS_GRID;
+/// The IQ2_XXS grid as `prmt` selectors ([`grid_sel`]), likewise: 256
+/// entries, a byte index. The decode reads it from the block's copy
+/// ([`Iq2XxsTab`]).
+const GRID2XXS_SEL: &[u32; 256] = &grid_sel(&IQ2XXS_GRID);
 /// The IQ3_XXS grid, likewise.
 pub(crate) const GRID3: &[u32; 256] = &IQ3XXS_GRID;
 /// The IQ3_S grid, likewise: 512 entries, a 9-bit index.
@@ -328,28 +338,106 @@ pub(crate) fn iq2_group(code: u32) -> (u32, u32) {
     )
 }
 
-/// One IQ2_XXS group: the grid index in the low byte of `i` under the sign
-/// index in the low 7 bits of `si`, as two value-order words.
+/// The IQ2_XXS grid's three magnitudes as bytes 0..3 of a `prmt` word (byte
+/// 3 unused) and their negatives as bytes 0..3 of the second: selector
+/// nibble `c` picks magnitude `c` (0, 1, 2), `c | 4` its negative.
+const IQ2XXS_POS: u32 = 0x002b_1908;
+const IQ2XXS_NEG: u32 = 0x00d5_e7f8;
+
+/// Each grid entry as a `prmt` selector over [`IQ2XXS_POS`]: nibble `j` the
+/// byte of value `j`'s magnitude. A magnitude that is none of the three
+/// stops the build.
+const fn grid_sel(g: &[u64; 256]) -> [u32; 256] {
+    let mut t = [0u32; 256];
+    let mut e = 0;
+    while e < 256 {
+        let mut j = 0;
+        while j < 8 {
+            let c = match (g[e] >> (8 * j)) as u8 {
+                0x08 => 0,
+                0x19 => 1,
+                0x2b => 2,
+                _ => panic!("an IQ2_XXS grid magnitude is not 8, 25 or 43"),
+            };
+            t[e] |= c << (4 * j);
+            j += 1;
+        }
+        e += 1;
+    }
+    t
+}
+
+/// Eight sign bits (a [`signs_of`] word) as selector bit 2 of eight `prmt`
+/// nibbles: bit `j` of `s` at bit `4j + 2`, the bit that turns a grid
+/// selector's magnitude into its negative ([`IQ2XXS_NEG`]).
 #[inline(always)]
-pub(crate) fn iq2xxs_group(i: u32, si: u32) -> (u32, u32) {
-    // SAFETY: i & 255 < 256, GRID2XXS's length.
-    let g = unsafe { *GRID2XXS.get_unchecked((i & 255) as usize) };
-    let s = signs_of(si & 127);
-    (
-        signed4(g as u32, sign_mask4(s)),
-        signed4((g >> 32) as u32, sign_mask4(s >> 4)),
-    )
+pub(crate) fn sign_sel(s: u32) -> u32 {
+    let t = (s | (s << 12)) & 0x000f_000f;
+    let t = (t | (t << 6)) & 0x0303_0303;
+    ((t | (t << 3)) & 0x1111_1111) << 2
+}
+
+/// Words of a block's IQ2_XXS decode table: the 256 grid selectors, then the
+/// 128 sign selectors.
+pub const IQ2XXS_TAB_WORDS: usize = 384;
+
+/// A block's IQ2_XXS decode table in shared memory: word `e < 256` is grid
+/// entry `e`'s selector ([`grid_sel`]), word `256 + i` sign index `i`'s
+/// [`sign_sel`] of [`signs_of`]. A sub-block's eight values are then two
+/// table words a group, or'd, and two `prmt`s: no per-value work, and the
+/// table's bank conflicts cost fewer L1 wavefronts than a warp's divergent
+/// reads of the global grid.
+#[derive(Clone, Copy)]
+pub struct Iq2XxsTab(*const u32);
+
+impl Iq2XxsTab {
+    /// Fill the table at `t` and wait for the block: thread `i` of the
+    /// 256-thread block writes grid word `i` and, below 128, sign word `256
+    /// + i`. Ends in the block barrier.
+    ///
+    /// # Safety
+    ///
+    /// `t` is a block-shared array of [`IQ2XXS_TAB_WORDS`] words that nothing
+    /// else writes; the block is 256 threads and every one of them calls this
+    /// once, before any return.
+    #[inline(always)]
+    pub unsafe fn fill(t: *mut u32) -> Iq2XxsTab {
+        let i = thread::threadIdx_x() as usize;
+        // SAFETY: i < 256 (the block), so word i of the grid and of the
+        // table, and for i < 128 word 256 + i < 384, are in bounds; each
+        // thread writes its own words.
+        unsafe {
+            *t.add(i) = *GRID2XXS_SEL.get_unchecked(i);
+            if i < 128 {
+                *t.add(256 + i) = sign_sel(signs_of(i as u32));
+            }
+        }
+        thread::sync_threads();
+        Iq2XxsTab(t)
+    }
 }
 
 /// One IQ2_XXS sub-block from its two words (module doc): its eight signed
-/// value words in value order and the factor `2s + 1`. The plane core and
-/// `iq_sel`'s raw-block reader both decode through it.
+/// value words in value order and the factor `2s + 1`. Group `l`'s selector
+/// is grid word `idx` byte `l` or'd with sign word `aux` bits `7l .. 7l + 7`;
+/// its low and high halves pick values `8l .. 8l + 4` and `8l + 4 .. 8l + 8`.
+/// The plane core and `iq_sel`'s raw-block reader both decode through it.
 #[inline(always)]
-pub(crate) fn iq2xxs_sub(idx: u32, aux: u32) -> ([u32; 8], i32) {
-    let (w0, w1) = iq2xxs_group(idx, aux);
-    let (w2, w3) = iq2xxs_group(idx >> 8, aux >> 7);
-    let (w4, w5) = iq2xxs_group(idx >> 16, aux >> 14);
-    let (w6, w7) = iq2xxs_group(idx >> 24, aux >> 21);
+pub(crate) fn iq2xxs_sub(idx: u32, aux: u32, tab: Iq2XxsTab) -> ([u32; 8], i32) {
+    let group = |l: u32| {
+        let (e, si) = ((idx >> (8 * l)) & 255, (aux >> (7 * l)) & 127);
+        // SAFETY: e < 256 and 256 + si < 384, inside the filled table
+        // (Iq2XxsTab::fill's barrier published it).
+        let sel = unsafe { *tab.0.add(e as usize) | *tab.0.add(256 + si as usize) };
+        (
+            prmt(IQ2XXS_POS, IQ2XXS_NEG, sel),
+            prmt(IQ2XXS_POS, IQ2XXS_NEG, sel >> 16),
+        )
+    };
+    let (w0, w1) = group(0);
+    let (w2, w3) = group(1);
+    let (w4, w5) = group(2);
+    let (w6, w7) = group(3);
     (
         [w0, w1, w2, w3, w4, w5, w6, w7],
         (2 * (aux >> 28) + 1) as i32,
@@ -589,13 +677,17 @@ pub unsafe fn iq2_xs_lane_partials<const M: usize>(
 }
 
 /// Lane `lane`'s partial sums of one IQ2_XXS row, as
-/// [`iq2_xs_lane_partials`].
+/// [`iq2_xs_lane_partials`], decoding through the block's table `tab`.
 ///
 /// # Safety
 ///
 /// `qs` holds at least `8 · n_sb · (row + 1)` vectors and `dh`
 /// `ceil(n_sb · (row + 1) / 2)` words; the activation bounds and `lane` as
 /// [`iq2_xs_lane_partials`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 pub unsafe fn iq2_xxs_lane_partials<const M: usize>(
     qs: &[U32x2],
@@ -605,6 +697,7 @@ pub unsafe fn iq2_xxs_lane_partials<const M: usize>(
     a: ActCols<'_>,
     mask: u32,
     lane: usize,
+    tab: Iq2XxsTab,
 ) -> [f32; 8] {
     const {
         assert!(M > 0);
@@ -621,7 +714,7 @@ pub unsafe fn iq2_xxs_lane_partials<const M: usize>(
         let (v, dw) = unsafe { (*qs.get_unchecked(g), *dh.get_unchecked(h >> 1)) };
         let d = half_bits_to_f32((dw >> (16 * (h & 1))) as u16) * 0.125;
         let [idx, aux] = v.0;
-        let (w, ai) = iq2xxs_sub(idx, aux);
+        let (w, ai) = iq2xxs_sub(idx, aux, tab);
         for_cols!(M, mask, C => {
             // SAFETY: as in iq2_xs_lane_partials.
             let (x, dx) = unsafe { a.col(C, b) };
@@ -1120,6 +1213,10 @@ mod iq_kernels {
         d8: &[f32],
         mut y: DisjointSlice<f32>,
     ) {
+        static mut TAB: SharedArray<u32, IQ2XXS_TAB_WORDS> = SharedArray::UNINIT;
+        // SAFETY: TAB is this block's alone; every thread of the 256-thread
+        // block fills it here, before any return.
+        let tab = unsafe { Iq2XxsTab::fill(SharedArray::as_raw_mut_ptr(&raw mut TAB)) };
         let tid = thread::index_1d().get();
         let row = (tid / 256) * 8 + (tid % 256) / 32;
         if row >= rows as usize || m_cols == 0 || m_cols > 8 {
@@ -1144,7 +1241,8 @@ mod iq_kernels {
         // n_dh = ceil(rows·n_sb/2) halves words, and column c < m_cols its
         // 256·n_grp words and 2·n_sb scales; the returns above are
         // warp-uniform.
-        let f = unsafe { iq2_xxs_lane_partials::<8>(v, dh, row, n_sb as usize, a, mask, lane) };
+        let f =
+            unsafe { iq2_xxs_lane_partials::<8>(v, dh, row, n_sb as usize, a, mask, lane, tab) };
         // SAFETY: row < rows and m_cols <= 8 (checked above), y by the contract.
         unsafe { store_cols(&f, m_cols as usize, rows as usize, row, lane, &mut y) };
     }
@@ -1463,9 +1561,53 @@ impl IqKernels {
 #[cfg(test)]
 mod tests {
     use super::{
-        IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, sign_mask4, signed4,
-        signs_of,
+        GRID2XXS_SEL, IQ2XS_GRID, IQ2XXS_GRID, IQ2XXS_NEG, IQ2XXS_POS, IQ3S_GRID, IQ3XXS_GRID,
+        KSIGNS_IQ2XS, sign_mask4, sign_sel, signed4, signs_of,
     };
+
+    /// `prmt`'s generic mode on the host: byte `k` of the result is byte
+    /// `sel` nibble `k` of `b:a` (bytes 0..4 `a`, 4..8 `b`). The decode never
+    /// sets a nibble's sign-replicate bit, so this refuses it.
+    fn prmt_host(a: u32, b: u32, sel: u32) -> u32 {
+        let bytes = (u64::from(b) << 32 | u64::from(a)).to_le_bytes();
+        (0..4).fold(0u32, |w, k| {
+            let n = (sel >> (4 * k)) & 15;
+            assert!(
+                n < 8,
+                "selector {sel:#x} nibble {k} asks for sign replication"
+            );
+            w | u32::from(bytes[n as usize]) << (8 * k)
+        })
+    }
+
+    /// The IQ2_XXS table decode gives the computed decode's value words: for
+    /// every grid entry under every sign index, the two `prmt`s of the or'd
+    /// selector equal `signed4` of the grid word under `sign_mask4` of
+    /// `signs_of`, both halves — so the cores' dots, and every output bit,
+    /// are the computed decode's. `sign_sel` sets bit `4j + 2` from bit `j`
+    /// and nothing else.
+    #[test]
+    fn iq2xxs_table_decode_matches_the_computed_one() {
+        for s in 0..256u32 {
+            let want = (0..8).fold(0u32, |w, j| w | ((s >> j) & 1) << (4 * j + 2));
+            assert_eq!(sign_sel(s), want, "sign bits {s:#x}");
+        }
+        for (e, &g) in IQ2XXS_GRID.iter().enumerate() {
+            for i in 0..128u32 {
+                let s = signs_of(i);
+                let sel = GRID2XXS_SEL[e] | sign_sel(s);
+                let got = (
+                    prmt_host(IQ2XXS_POS, IQ2XXS_NEG, sel),
+                    prmt_host(IQ2XXS_POS, IQ2XXS_NEG, sel >> 16),
+                );
+                let want = (
+                    signed4(g as u32, sign_mask4(s)),
+                    signed4((g >> 32) as u32, sign_mask4(s >> 4)),
+                );
+                assert_eq!(got, want, "grid entry {e} sign index {i}");
+            }
+        }
+    }
 
     /// The device's computed signs equal ggml's table, and the SWAR negation
     /// equals the scalar one on every grid word under every sign pattern.

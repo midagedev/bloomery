@@ -96,7 +96,8 @@ use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::hybrid::HOST;
 use crate::iq::{
-    ActCols, dp4_all, dp4_halves, iq2_group, iq2xxs_sub, iq3_group, iq3s_group, iq4_word,
+    ActCols, IQ2XXS_TAB_WORDS, Iq2XxsTab, dp4_all, dp4_halves, iq2_group, iq2xxs_sub, iq3_group,
+    iq3s_group, iq4_word,
 };
 use crate::kquant::SelDown;
 use crate::kquant::act::{self, Act};
@@ -105,7 +106,9 @@ use crate::q5::{Q8Blocks32, q5_a_chain};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
+};
 use cuda_host::cuda_module;
 use gguf::iq_tables::KVALUES_IQ4NL;
 use gguf::quant::GgmlType;
@@ -136,6 +139,10 @@ trait RawSb {
     /// 32-value sub-block (IQ3_XXS, IQ4_XS), one a 16-value half for IQ2_XS.
     type Fac: Copy;
 
+    /// What the decode reads besides the stream: IQ2_XXS's block table
+    /// ([`Iq2XxsTab`]), nothing (`()`) for the other formats.
+    type Tab: Copy;
+
     /// Sub-block `ib` of the super-block starting at byte `x`: its eight
     /// weight words in value order, its factors and its scale `d` — the values
     /// `iq2_xs_lane_partials` / `iq3_xxs_lane_partials` / `iq4_xs_lane_partials`
@@ -143,7 +150,7 @@ trait RawSb {
     /// caller keeps `x` even (IQ2_XS, IQ3_XXS) or word-aligned (IQ4_XS) and the
     /// block's `Self::BB` bytes from `x` inside `w`'s stream (rust-quality R28:
     /// a crate-internal fn over unchecked reads under a caller-kept boundary).
-    fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], Self::Fac, f32);
+    fn sub(w: &[u32], x: usize, ib: usize, tab: Self::Tab) -> ([u32; 8], Self::Fac, f32);
 
     /// The sub-block's integer sum `I` of the plane rule: the factors times
     /// the `dp4a` chains of the weight words `wv` against the activation words
@@ -157,9 +164,10 @@ struct Iq2Xs;
 impl RawSb for Iq2Xs {
     const BB: usize = 74;
     type Fac = (i32, i32);
+    type Tab = ();
 
     #[inline(always)]
-    fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], (i32, i32), f32) {
+    fn sub(w: &[u32], x: usize, ib: usize, _: ()) -> ([u32; 8], (i32, i32), f32) {
         let at = x + 2 + 8 * ib;
         let (i0, sh) = ((at >> 2), 8 * (at & 3) as u32);
         let sa = x + 66 + ib;
@@ -198,15 +206,17 @@ impl RawSb for Iq2Xs {
     }
 }
 
-/// IQ2_XXS's raw super-block ([`RawSb`]).
+/// IQ2_XXS's raw super-block ([`RawSb`]), decoded through the block's
+/// table ([`Iq2XxsTab`], which its entry fills).
 struct Iq2Xxs;
 
 impl RawSb for Iq2Xxs {
     const BB: usize = 66;
     type Fac = i32;
+    type Tab = Iq2XxsTab;
 
     #[inline(always)]
-    fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], i32, f32) {
+    fn sub(w: &[u32], x: usize, ib: usize, tab: Iq2XxsTab) -> ([u32; 8], i32, f32) {
         let at = x + 2 + 8 * ib;
         let (i0, sh) = ((at >> 2), 8 * (at & 3) as u32);
         // SAFETY: the whole super-block lies inside the stream by this fn's
@@ -223,7 +233,7 @@ impl RawSb for Iq2Xxs {
             )
         };
         let d = half_bits_to_f32((dw >> (8 * (x & 2) as u32)) as u16) * 0.125;
-        let (wv, ai) = iq2xxs_sub(q8_0_code(v0, v1, sh), q8_0_code(v1, v2, sh));
+        let (wv, ai) = iq2xxs_sub(q8_0_code(v0, v1, sh), q8_0_code(v1, v2, sh), tab);
         (wv, ai, d)
     }
 
@@ -239,9 +249,10 @@ struct Iq3Xxs;
 impl RawSb for Iq3Xxs {
     const BB: usize = 98;
     type Fac = i32;
+    type Tab = ();
 
     #[inline(always)]
-    fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], i32, f32) {
+    fn sub(w: &[u32], x: usize, ib: usize, _: ()) -> ([u32; 8], i32, f32) {
         // x is even, so the f16 at x is one half of word x >> 2, inside the
         // stream by this fn's contract.
         // SAFETY: x even and x + 2 inside the stream.
@@ -288,9 +299,10 @@ struct Iq3S;
 impl RawSb for Iq3S {
     const BB: usize = 110;
     type Fac = i32;
+    type Tab = ();
 
     #[inline(always)]
-    fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], i32, f32) {
+    fn sub(w: &[u32], x: usize, ib: usize, _: ()) -> ([u32; 8], i32, f32) {
         let at = x + 2 + 8 * ib;
         let (i0, sh) = ((at >> 2), 8 * (at & 3) as u32);
         let (qa, sa, ga) = (x + 66 + ib, x + 106 + (ib >> 1), x + 74 + 4 * ib);
@@ -336,9 +348,10 @@ struct Iq4Xs;
 impl RawSb for Iq4Xs {
     const BB: usize = 136;
     type Fac = i32;
+    type Tab = ();
 
     #[inline(always)]
-    fn sub(w: &[u32], x: usize, ib: usize) -> ([u32; 8], i32, f32) {
+    fn sub(w: &[u32], x: usize, ib: usize, _: ()) -> ([u32; 8], i32, f32) {
         let w0 = x >> 2;
         // SAFETY: words w0 and w0 + 1 (d | scales_h << 16 and scales_l) lie
         // inside the stream by this fn's contract.
@@ -385,8 +398,9 @@ impl RawSb for Iq4Xs {
 /// columns of `256 · n_grp` q words and `2 · n_sb` scales (`n_grp =
 /// ceil(n_sb / 4)`), `sel.len() >= n_slots`, `h.len() >= n_slots ·
 /// rows_per_expert`; `row < n_slots · rows_per_expert` is the calling warp's
-/// row (one warp a row), all 32 lanes of the warp here (rust-quality R28: a
-/// crate-internal fn over unchecked reads under a caller-kept boundary).
+/// row (one warp a row), all 32 lanes of the warp here; `tab` is `D`'s table
+/// (rust-quality R28: a crate-internal fn over unchecked reads under a
+/// caller-kept boundary).
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
@@ -408,6 +422,7 @@ fn gate_up_sel_body<D: RawSb>(
     fault: FaultSink,
     row: usize,
     h: &mut DisjointSlice<f32>,
+    tab: D::Tab,
 ) {
     let slot = row / rows_per_expert as usize;
     // SAFETY: slot < n_slots <= sel.len() by this fn's contract; the load is
@@ -444,8 +459,13 @@ fn gate_up_sel_body<D: RawSb>(
         // both stacks by this fn's contract; column col < m_cols because
         // slot < n_slots <= m_cols · slots_per_col; all 32 lanes of the warp
         // are here (both returns above are warp-uniform).
-        let ((xw, dx), (wgw, gai, gd), (wuw, uai, ud)) =
-            unsafe { (a.col(0, b), D::sub(wg, x, b & 7), D::sub(wu, x, b & 7)) };
+        let ((xw, dx), (wgw, gai, gd), (wuw, uai, ud)) = unsafe {
+            (
+                a.col(0, b),
+                D::sub(wg, x, b & 7, tab),
+                D::sub(wu, x, b & 7, tab),
+            )
+        };
         let i = D::dot(&wgw, gai, &xw);
         fg = (gd * dx).mul_add(i as f32, fg);
         let i = D::dot(&wuw, uai, &xw);
@@ -474,8 +494,9 @@ fn gate_up_sel_body<D: RawSb>(
 /// · n_grp` q words and `2 · n_sb` scales (`n_grp = ceil(n_sb / 4)`),
 /// `sel.len() >= n_slots`, `y.len() >= n_slots · rows_per_expert`; `row <
 /// n_slots · rows_per_expert` is the calling warp's row (one warp a row), all
-/// 32 lanes of the warp here (rust-quality R28: a crate-internal fn over
-/// unchecked reads under a caller-kept boundary).
+/// 32 lanes of the warp here; `tab` is `D`'s table, filled by the entry
+/// before any return (rust-quality R28: a crate-internal fn over unchecked
+/// reads under a caller-kept boundary).
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
@@ -494,6 +515,7 @@ fn down_sel_body<D: RawSb>(
     fault: FaultSink,
     row: usize,
     y: &mut DisjointSlice<f32>,
+    tab: D::Tab,
 ) {
     let slot = row / rows_per_expert as usize;
     // SAFETY: slot < n_slots <= sel.len() by this fn's contract; the load is
@@ -527,7 +549,7 @@ fn down_sel_body<D: RawSb>(
         // the stack by this fn's contract; column col < ceil(n_slots /
         // slots_per_col) of the activation; all 32 lanes of the warp are here
         // (the returns above are warp-uniform).
-        let ((xw, dx), (wv, fac, d)) = unsafe { (a.col(0, b), D::sub(w, x, b & 7)) };
+        let ((xw, dx), (wv, fac, d)) = unsafe { (a.col(0, b), D::sub(w, x, b & 7, tab)) };
         let i = D::dot(&wv, fac, &xw);
         f = (d * dx).mul_add(i as f32, f);
         b += 32;
@@ -685,6 +707,7 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut h,
+            (),
         );
     }
 
@@ -757,6 +780,7 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut h,
+            (),
         );
     }
 
@@ -829,6 +853,7 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut h,
+            (),
         );
     }
 
@@ -900,6 +925,7 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut h,
+            (),
         );
     }
 
@@ -945,6 +971,10 @@ mod iq_sel_kernels {
         fault: FaultSink,
         mut y: DisjointSlice<f32>,
     ) {
+        static mut TAB: SharedArray<u32, IQ2XXS_TAB_WORDS> = SharedArray::UNINIT;
+        // SAFETY: TAB is this block's alone; every thread of the 256-thread
+        // block fills it here, before any return.
+        let tab = unsafe { Iq2XxsTab::fill(SharedArray::as_raw_mut_ptr(&raw mut TAB)) };
         // m_cols only bounds the activation in the launch contract.
         let _ = m_cols;
         let t = thread::index_1d().get() % THREADS as usize;
@@ -969,6 +999,7 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut y,
+            tab,
         );
     }
 
@@ -1028,6 +1059,7 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut y,
+            (),
         );
     }
 
@@ -1087,6 +1119,7 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut y,
+            (),
         );
     }
 
@@ -1147,6 +1180,7 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut y,
+            (),
         );
     }
 
@@ -1206,6 +1240,7 @@ mod iq_sel_kernels {
             fault,
             row,
             &mut y,
+            (),
         );
     }
 
