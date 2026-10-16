@@ -26,8 +26,8 @@
 //! (`tokenizer`, no BOS: the file sets `add_bos_token` false; no
 //! chat template) and prints the generated text after the ids.
 //!
-//! `--last-step` (a qwen3moe or qwen35moe file, refused by name on a
-//! qwen4exp one and beside `--time` and `--seed-depth`) feeds the prompt
+//! `--last-step` (a qwen3moe or qwen35moe file, refused by name on any
+//! other and beside `--time` and `--seed-depth`) feeds the prompt
 //! less its last id by `--prefill`, then the last id as one step, whose
 //! argmax is generated token 0: the server's cut (`bloomery-serve --model
 //! qwen3` prefills a request's prompt less its last id, then steps it), so
@@ -1608,13 +1608,17 @@ mod cli {
             Chosen::Qwen38(_, _, d, _) => d,
             Chosen::Qwen3(..) | Chosen::Qwen35(..) | Chosen::NemotronH(_) => Draft38::Off,
         };
-        if last_step && (family == Family::Qwen38 || timed || seed_depth.is_some()) {
-            return Err(
-                "--last-step feeds a qwen3moe or qwen35moe prompt's last id as a step, the \
-                 server's cut; it is refused on a qwen4exp file and beside --time and \
-                 --seed-depth"
-                    .into(),
-            );
+        if last_step
+            && (!matches!(family, Family::Qwen3 | Family::Qwen35)
+                || timed
+                || seed_depth.is_some())
+        {
+            return Err(format!(
+                "--last-step feeds a qwen3moe or qwen35moe prompt's last id as a step, the server's \
+                 cut; it is refused on a {} file and beside --time and --seed-depth",
+                family.name()
+            )
+            .into());
         }
         if family != Family::Qwen38 && card_set {
             return Err(format!(
