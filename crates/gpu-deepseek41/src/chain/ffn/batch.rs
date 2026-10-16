@@ -1921,16 +1921,36 @@ impl FfnPiece {
             match vl {
                 None => {
                     self.router.enqueue_router_rows(
-                        stream, lw.router, &x, lw.bias, self.scale, t, &mut probs, &mut ids,
-                        &mut wts, fault,
+                        stream,
+                        gpu,
+                        &self.kernels.g32,
+                        lw.router,
+                        &x,
+                        lw.bias,
+                        self.scale,
+                        t,
+                        &mut probs,
+                        &mut ids,
+                        &mut wts,
+                        fault,
                     )?;
                     1
                 }
                 Some((vl, media)) => {
                     let runs = pick_runs(media, at, u, [lw.bias, vl])?;
                     self.router.enqueue_router_rows_runs(
-                        stream, lw.router, &x, self.scale, t, &runs, &mut probs, &mut ids,
-                        &mut wts, fault,
+                        stream,
+                        gpu,
+                        &self.kernels.g32,
+                        lw.router,
+                        &x,
+                        self.scale,
+                        t,
+                        &runs,
+                        &mut probs,
+                        &mut ids,
+                        &mut wts,
+                        fault,
                     )?;
                     runs.len()
                 }

@@ -7,9 +7,9 @@
 //!
 //! - [`router_body`]: the logit gemv, the score, the block ticket and, in the
 //!   block that draws the last one, the selection; one token a launch.
-//! - [`scores_body`] and [`pick_body`]: a batch in two launches, the scores of
-//!   every (token, expert), then one block a token selecting on them; bit for
-//!   bit what [`router_body`] writes a token.
+//! - [`pick_body`]: a batch's selection, one block a token over scores the
+//!   pass's tile GEMM and its sigmoid wrote; bit for bit what
+//!   [`router_body`] writes a token.
 //!
 //! [`sigmoid_router_instance!`](crate::sigmoid_router_instance) is the one
 //! form of a sigmoid instance of the three: its entries, its output buffers
@@ -20,7 +20,7 @@
 //! instruction stream (predicated selects become branches), so the loop, its
 //! butterfly and the weight stage stay inside their bodies. The score and the
 //! tie rule come from [`crate::route_core`]. Every shape an instance asserts
-//! holds when `E` is a multiple of [`SCORE_ROWS`] and `⌈E / 32⌉ <= 32`. Where
+//! holds when `E` is a multiple of [`ROWS_PER_BLOCK`] and `⌈E / 32⌉ <= 32`. Where
 //! `E` is not a multiple of 32 the selecting lanes own `⌈E / 32⌉` or one fewer
 //! experts; the guard that skips the missing ones is a compile-time `true`
 //! at a multiple of 32, so those instances' instructions are the guard-free
@@ -40,17 +40,6 @@ pub const ROUTER_THREADS_U32: u32 = ROUTER_THREADS as u32;
 /// Expert rows a block walks, one a warp.
 pub const ROWS_PER_BLOCK: usize = ROUTER_THREADS / 32;
 
-/// The batch score kernel's tile: a block of [`ROUTER_THREADS`] threads
-/// owns `SCORE_ROWS` expert rows (two a warp) for `SCORE_COLS` consecutive
-/// tokens; every weight value a lane loads serves `SCORE_COLS` tokens and
-/// every activation value two rows.
-pub const SCORE_ROWS: usize = 8;
-/// Tokens a score block covers.
-pub const SCORE_COLS: usize = 8;
-
-const _: () = assert!(SCORE_ROWS == 2 * ROWS_PER_BLOCK);
-// The entry spells its eight columns out as named accumulators.
-const _: () = assert!(SCORE_COLS == 8);
 const _: () = assert!(ROUTER_THREADS_U32 as usize == ROUTER_THREADS);
 // The entries' `launch_bounds` and `launch_contract` block are literals.
 const _: () = assert!(ROUTER_THREADS == 128);
@@ -292,105 +281,6 @@ pub unsafe fn router_body<S: Score, const E: usize, const U: usize>(
     }
 }
 
-/// `ds41_router_scores`' body over `E` experts and the score `S`: block `b`
-/// owns rows `SCORE_ROWS · (b % (E / SCORE_ROWS)) ..` and tokens `SCORE_COLS
-/// · (b / (E / SCORE_ROWS)) ..`, warp `j` rows `2j` and `2j + 1` of the tile;
-/// each lane folds `fma(w[row · k + 32 i + lane], x[token · k + 32 i +
-/// lane])` into one partial per (row, token) in increasing `i`, and the warp
-/// tree and `S::score` give `probs[token · E + row]` — [`router_body`]'s
-/// score of that token's row, bit for bit.
-///
-/// # Safety
-///
-/// the block is [`ROUTER_THREADS`] threads, converged; `n_expert ==
-/// E` (else the block returns), `w` holds `n_expert · k` values, `x` `k · t`,
-/// `probs` `n_expert · t`; `k` is a multiple of 32.
-#[inline(always)]
-pub unsafe fn scores_body<S: Score, const E: usize>(
-    w: &[f32],
-    x: &[f32],
-    n_expert: u32,
-    k: u32,
-    t: u32,
-    probs: &mut DisjointSlice<f32>,
-) {
-    let tid = thread::threadIdx_x() as usize;
-    let lane = warp::lane_id() as usize;
-    let b = thread::blockIdx_x() as usize;
-    let (k, t) = (k as usize, t as usize);
-    let tiles = E / SCORE_ROWS;
-    let r0 = (b % tiles) * SCORE_ROWS + 2 * (tid / 32);
-    let t0 = (b / tiles) * SCORE_COLS;
-    if t0 >= t || n_expert as usize != E {
-        return;
-    }
-    // Warp-uniform: every lane of the block shares t0.
-    let cols = (t - t0).min(SCORE_COLS);
-    let (w0, w1) = (r0 * k, (r0 + 1) * k);
-    // Named accumulators, row 0 then row 1 of the warp, one a token: an
-    // array indexed in a loop would live in local memory.
-    let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7) = (
-        0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32,
-    );
-    let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5, mut b6, mut b7) = (
-        0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32,
-    );
-    let mut kk = lane;
-    while kk < k {
-        // SAFETY: r0 + 1 < n_expert and kk < k, so both rows' values are
-        // inside w (w.len() >= n_expert * k by this fn's contract).
-        let (wa, wb) = unsafe { (*w.get_unchecked(w0 + kk), *w.get_unchecked(w1 + kk)) };
-        macro_rules! fold {
-            ($c:expr, $a:ident, $b:ident) => {
-                if $c < cols {
-                    // SAFETY: t0 + c < t and kk < k, so the value is inside
-                    // x (x.len() >= k * t by this fn's contract).
-                    let xv = unsafe { *x.get_unchecked((t0 + $c) * k + kk) };
-                    $a = f32::mul_add(wa, xv, $a);
-                    $b = f32::mul_add(wb, xv, $b);
-                }
-            };
-        }
-        fold!(0, a0, b0);
-        fold!(1, a1, b1);
-        fold!(2, a2, b2);
-        fold!(3, a3, b3);
-        fold!(4, a4, b4);
-        fold!(5, a5, b5);
-        fold!(6, a6, b6);
-        fold!(7, a7, b7);
-        kk += 32;
-    }
-    macro_rules! store {
-        ($c:expr, $r:expr, $v:ident) => {
-            let logit = warp::reduce_sum_f32($v);
-            if lane == 0 && $c < cols {
-                let at = (t0 + $c) * E + r0 + $r;
-                // SAFETY: t0 + c < t and r0 + r < n_expert, so at <
-                // n_expert * t <= probs.len(); lane 0 of the row's warp is
-                // the slot's only writer.
-                unsafe { *probs.get_unchecked_mut(at) = S::score(logit) };
-            }
-        };
-    }
-    store!(0, 0, a0);
-    store!(1, 0, a1);
-    store!(2, 0, a2);
-    store!(3, 0, a3);
-    store!(4, 0, a4);
-    store!(5, 0, a5);
-    store!(6, 0, a6);
-    store!(7, 0, a7);
-    store!(0, 1, b0);
-    store!(1, 1, b1);
-    store!(2, 1, b2);
-    store!(3, 1, b3);
-    store!(4, 1, b4);
-    store!(5, 1, b5);
-    store!(6, 1, b6);
-    store!(7, 1, b7);
-}
-
 /// `ds41_router_pick`'s body over `E` experts and `U` slots: token
 /// `blockIdx.x`'s scores (`probs[token · E ..]`) through [`publish_n`] and
 /// [`select_n`] into `ids` and `weights` at `U · token` — [`router_body`]'s
@@ -467,19 +357,19 @@ macro_rules! sigmoid_router_instance {
             experts: $e:tt,
             used: $u:tt,
             kernels: $kernels:ident,
-            entries: $router:ident, $scores:ident, $pick:ident,
-            prepare: $p_router:ident, $p_scores:ident, $p_pick:ident $(,)?
+            entries: $router:ident, $pick:ident,
+            prepare: $p_router:ident, $p_pick:ident $(,)?
         }
     ) => {
         $(#[$meta])*
         pub mod $m {
 
+        use $crate::gemm::Gemm32Kernels;
         use $crate::route_body::{
-            ROUTER_THREADS, ROUTER_THREADS_U32, ROWS_PER_BLOCK, SCORE_COLS, SCORE_ROWS, pick_body,
-            router_body, scores_body,
+            ROUTER_THREADS, ROUTER_THREADS_U32, ROWS_PER_BLOCK, pick_body, router_body,
         };
         use $crate::route_core::Sigmoid;
-        use $crate::{DeviceTensor, FaultSink, GpuError, launch_u32};
+        use $crate::{DeviceTensor, FaultSink, Gpu, GpuError, launch_u32};
         use model::arch::models::shape::{self, RouterBody, RouterInst, rules};
         use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
         use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract};
@@ -502,11 +392,7 @@ macro_rules! sigmoid_router_instance {
             (N_USED as u32, N_USED as u32)
         ));
 
-        /// Blocks of the batch score launch per 8 tokens.
-        const SCORE_TILES: usize = N_EXPERT / SCORE_ROWS;
-
         const _: () = assert!(N_EXPERT.is_multiple_of(ROWS_PER_BLOCK));
-        const _: () = assert!(N_EXPERT.is_multiple_of(SCORE_ROWS));
         // The selecting lane keeps its taken entries as bits of one u32.
         const _: () = assert!(N_EXPERT.div_ceil(32) <= 32);
         // The entries' `launch_bounds` and `launch_contract` block are literals; the expert and slot counts in the contracts are the instance's own tokens.
@@ -594,36 +480,6 @@ macro_rules! sigmoid_router_instance {
                         SharedArray::as_raw_mut_ptr(&raw mut SLOT_P),
                     );
                 }
-            }
-
-            /// The scores of `t` tokens' rows of `x` (`k` a token, token-major):
-            /// `probs[token · n_expert + e]` is the score the
-            /// router entry writes for that token's expert `e`, bit for bit
-            /// (`scores_body`). Grid `(n_expert / 8) · ⌈t / 8⌉` blocks of 128.
-            #[kernel]
-            #[launch_bounds(128)]
-            #[launch_contract(
-                domain = 1,
-                block = (128, 1, 1),
-                requires = (
-                    n_expert == $e,
-                    w.len() >= n_expert * k,
-                    x.len() >= k * t,
-                    probs.len() >= n_expert * t
-                )
-            )]
-            pub fn $scores(
-                w: &[f32],
-                x: &[f32],
-                n_expert: u32,
-                k: u32,
-                t: u32,
-                mut probs: DisjointSlice<f32>,
-            ) {
-                // SAFETY: the block is 128 threads (the launch contract's),
-                // converged; n_expert, w, x and probs are the launch contract's;
-                // the launcher passes k a positive multiple of 32.
-                unsafe { scores_body::<Sigmoid, N_EXPERT>(w, x, n_expert, k, t, &mut probs) };
             }
 
             /// The selection of token `blockIdx.x` of a batch from its scores
@@ -826,6 +682,8 @@ macro_rules! sigmoid_router_instance {
             pub fn enqueue_router_rows(
                 &self,
                 stream: &CudaStream,
+                gpu: &Gpu,
+                wide: &Gemm32Kernels,
                 w: &DeviceTensor<f32>,
                 x: &DeviceBuffer<f32>,
                 bias: &DeviceBuffer<f32>,
@@ -857,25 +715,17 @@ macro_rules! sigmoid_router_instance {
                         ),
                     });
                 }
-                let (k, n_expert) = (
-                    launch_u32(what, "k", k)?,
-                    launch_u32(what, "n_expert", N_EXPERT)?,
-                );
+                let n_expert = launch_u32(what, "n_expert", N_EXPERT)?;
                 let tt = launch_u32(what, "t", t)?;
-                let grid = launch_u32(what, "grid", SCORE_TILES * t.div_ceil(SCORE_COLS))?;
-                let prep = self
-                    .module
-                    .$p_scores(LaunchConfig1D::new(grid, ROUTER_THREADS_U32, 0))?;
-                self.module.$scores(
-                    stream,
-                    &prep,
-                    w.buf(),
-                    x,
-                    n_expert,
-                    k,
-                    tt,
-                    &mut *probs,
-                )?;
+                // The scores as one F32 tile GEMM over every token — the
+                // common `f32_tile_gemm`, bit for bit this body's
+                // per-(token, expert) gemv (the same lane walk,
+                // `f32_lane_partials`, and the same warp tree,
+                // `gemv_lane_sums`) — then the score's scalar over its
+                // logits, in place. The pick launch is unchanged.
+                wide.enqueue_f32_tile(stream, w, x, t, probs)?;
+                gpu.elem()
+                    .enqueue_sigmoid_rows(stream, probs, N_EXPERT * t)?;
                 let prep = self
                     .module
                     .$p_pick(LaunchConfig1D::new(tt, ROUTER_THREADS_U32, 0))?;

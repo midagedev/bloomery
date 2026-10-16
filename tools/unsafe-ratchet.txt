@@ -316,7 +316,10 @@ gpu 1910 208 10
 # went to the gpu crate's card_slots.rs; the tier sums stay.
 # PIN(2026-10-13): gpu-deepseek41 402 -> 392 blocks and 45 -> 44 fns, the move above: the Markov kernel went to the gpu
 # crate's dspark/head.rs.
-gpu-deepseek41 388 44 0
+# PIN(2026-10-17): gpu-deepseek41 388 -> 385 blocks, fns unchanged, not old code relaxed: the wide
+# router scores' move to the common f32_tile_gemm (bolt-r6) takes the family's three remaining
+# wide-dot call blocks out of the crate. Measured 385 on the merged tree.
+gpu-deepseek41 385 44 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.

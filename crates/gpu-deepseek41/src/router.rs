@@ -44,21 +44,20 @@
 //!
 //! [`glm5next`] is the same router at another instance: 288 experts, the top
 //! 8, a sigmoid score. Its entries are thin instances of the common generic
-//! bodies ([`router_body`], [`scores_body`], [`pick_body`], in
+//! bodies ([`router_body`], [`pick_body`], in
 //! `bloomery_gpu::route_body`), which take the expert count, the slot count
 //! and the [`Score`](bloomery_gpu::route_core::Score) as parameters; (384, 6,
 //! [`SqrtSoftplus`](bloomery_gpu::route_core::SqrtSoftplus)) meets every one
 //! of their shape asserts. The V4.1 entries above keep their own bodies:
 //! moving an entry onto a const-generic body changes its instruction stream.
 
+use bloomery_gpu::gemm::Gemm32Kernels;
 use bloomery_gpu::q8f32::f32_lane_partial_1col_w32;
-use bloomery_gpu::route_body::{
-    ROUTER_THREADS, ROUTER_THREADS_U32, ROWS_PER_BLOCK, SCORE_COLS, SCORE_ROWS,
-};
+use bloomery_gpu::route_body::{ROUTER_THREADS, ROUTER_THREADS_U32, ROWS_PER_BLOCK};
 /// ik's expert score in f32; the gates' host side simulates the device with it.
 pub use bloomery_gpu::route_core::sqrt_softplus;
 use bloomery_gpu::route_core::{renorm_divisor, take};
-use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
+use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{
@@ -81,8 +80,6 @@ pub const N_USED: usize = 6;
 const PER_LANE: usize = N_EXPERT / 32;
 
 /// Blocks of the batch score launch per 8 tokens.
-const SCORE_TILES: usize = N_EXPERT / SCORE_ROWS;
-const _: () = assert!(N_EXPERT.is_multiple_of(SCORE_ROWS));
 const _: () = assert!(N_EXPERT.is_multiple_of(32) && N_EXPERT.is_multiple_of(ROWS_PER_BLOCK));
 // The selecting lane keeps its taken entries as bits of one u32.
 const _: () = assert!(PER_LANE <= 32);
@@ -235,118 +232,9 @@ mod router_kernels {
         }
     }
 
-    /// The scores of `t` tokens' rows of `x` (`k` a token, token-major)
-    /// against the router's `n_expert` (= [`N_EXPERT`]) rows of `k` f32 in
-    /// `w`: `probs[token · n_expert + e]` is the score [`ds41_router`] writes
-    /// for that token's expert `e`, bit for bit. Block `b` owns rows
-    /// `SCORE_ROWS · (b % SCORE_TILES) ..` and tokens `SCORE_COLS · (b /
-    /// SCORE_TILES) ..` (fewer past the last token); warp `j` of it rows `2j`
-    /// and `2j + 1` of the tile. Each lane keeps one partial per (row,
-    /// token) and folds `fma(w[row · k + 32 i + lane], x[token · k + 32 i +
-    /// lane])` into it in increasing `i` — `f32_lane_partial_1col_w32`'s sum —
-    /// and the warp tree is the one-token launch's.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(128)]
-    #[launch_contract(
-        domain = 1,
-        block = (128, 1, 1),
-        requires = (
-            n_expert == 384,
-            w.len() >= n_expert * k,
-            x.len() >= k * t,
-            probs.len() >= n_expert * t
-        )
-    )]
-    pub fn ds41_router_scores(
-        w: &[f32],
-        x: &[f32],
-        n_expert: u32,
-        k: u32,
-        t: u32,
-        mut probs: DisjointSlice<f32>,
-    ) {
-        let tid = thread::threadIdx_x() as usize;
-        let lane = warp::lane_id() as usize;
-        let b = thread::blockIdx_x() as usize;
-        let (k, t) = (k as usize, t as usize);
-        let r0 = (b % SCORE_TILES) * SCORE_ROWS + 2 * (tid / 32);
-        let t0 = (b / SCORE_TILES) * SCORE_COLS;
-        if t0 >= t || n_expert as usize != N_EXPERT {
-            return;
-        }
-        // Warp-uniform: every lane of the block shares t0.
-        let cols = (t - t0).min(SCORE_COLS);
-        let (w0, w1) = (r0 * k, (r0 + 1) * k);
-        // Named accumulators, row 0 then row 1 of the warp, one a token: an
-        // array indexed in a loop would live in local memory.
-        let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7) = (
-            0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32,
-        );
-        let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5, mut b6, mut b7) = (
-            0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32,
-        );
-        let mut kk = lane;
-        while kk < k {
-            // SAFETY: r0 + 1 < n_expert and kk < k, so both rows' values are
-            // inside w (w.len() >= n_expert * k by the launch contract).
-            let (wa, wb) = unsafe { (*w.get_unchecked(w0 + kk), *w.get_unchecked(w1 + kk)) };
-            macro_rules! fold {
-                ($c:expr, $a:ident, $b:ident) => {
-                    if $c < cols {
-                        // SAFETY: t0 + c < t and kk < k, so the value is
-                        // inside x (x.len() >= k * t by the launch contract).
-                        let xv = unsafe { *x.get_unchecked((t0 + $c) * k + kk) };
-                        $a = f32::mul_add(wa, xv, $a);
-                        $b = f32::mul_add(wb, xv, $b);
-                    }
-                };
-            }
-            fold!(0, a0, b0);
-            fold!(1, a1, b1);
-            fold!(2, a2, b2);
-            fold!(3, a3, b3);
-            fold!(4, a4, b4);
-            fold!(5, a5, b5);
-            fold!(6, a6, b6);
-            fold!(7, a7, b7);
-            kk += 32;
-        }
-        macro_rules! store {
-            ($c:expr, $r:expr, $v:ident) => {
-                let logit = warp::reduce_sum_f32($v);
-                if lane == 0 && $c < cols {
-                    let at = (t0 + $c) * N_EXPERT + r0 + $r;
-                    // SAFETY: t0 + c < t and r0 + r < n_expert, so at <
-                    // n_expert * t <= probs.len(); lane 0 of the row's warp is
-                    // the slot's only writer.
-                    unsafe { *probs.get_unchecked_mut(at) = sqrt_softplus(logit) };
-                }
-            };
-        }
-        store!(0, 0, a0);
-        store!(1, 0, a1);
-        store!(2, 0, a2);
-        store!(3, 0, a3);
-        store!(4, 0, a4);
-        store!(5, 0, a5);
-        store!(6, 0, a6);
-        store!(7, 0, a7);
-        store!(0, 1, b0);
-        store!(1, 1, b1);
-        store!(2, 1, b2);
-        store!(3, 1, b3);
-        store!(4, 1, b4);
-        store!(5, 1, b5);
-        store!(6, 1, b6);
-        store!(7, 1, b7);
-    }
-
     /// The selection of token `blockIdx.x` of a batch from its scores
-    /// (`probs`, [`N_EXPERT`] a token, as [`ds41_router_scores`] writes them)
+    /// (`probs`, [`N_EXPERT`] a token, as the pass's tile GEMM and its sigmoid
+    /// write them)
     /// and `bias`: [`ds41_router`]'s last block on those scores — the same
     /// shared arrays, the same six rounds and weights — into `ids` and
     /// `weights` at `N_USED · token`.
@@ -699,6 +587,8 @@ impl RouterKernels {
     pub fn enqueue_router_rows(
         &self,
         stream: &CudaStream,
+        gpu: &Gpu,
+        wide: &Gemm32Kernels,
         w: &DeviceTensor<f32>,
         x: &DeviceBuffer<f32>,
         bias: &DeviceBuffer<f32>,
@@ -711,6 +601,8 @@ impl RouterKernels {
     ) -> Result<(), GpuError> {
         self.enqueue_router_rows_runs(
             stream,
+            gpu,
+            wide,
             w,
             x,
             scale,
@@ -737,6 +629,8 @@ impl RouterKernels {
     pub fn enqueue_router_rows_runs(
         &self,
         stream: &CudaStream,
+        gpu: &Gpu,
+        wide: &Gemm32Kernels,
         w: &DeviceTensor<f32>,
         x: &DeviceBuffer<f32>,
         scale: f32,
@@ -787,19 +681,14 @@ impl RouterKernels {
                 runs.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()
             )));
         }
-        let (k, n_expert) = (
-            launch_u32(what, "k", k)?,
-            launch_u32(what, "n_expert", N_EXPERT)?,
-        );
-        let tt = launch_u32(what, "t", t)?;
-        let grid = launch_u32(what, "grid", SCORE_TILES * t.div_ceil(SCORE_COLS))?;
-        let prep = self.module.prepare_ds41_router_scores(LaunchConfig1D::new(
-            grid,
-            ROUTER_THREADS_U32,
-            0,
-        ))?;
-        self.module
-            .ds41_router_scores(stream, &prep, w.buf(), x, n_expert, k, tt, &mut *probs)?;
+        let n_expert = launch_u32(what, "n_expert", N_EXPERT)?;
+        // The scores as one F32 tile GEMM over the block's tokens — the
+        // common `f32_tile_gemm`, bit for bit the per-(token, expert) gemv
+        // this module scored with (the same lane walk and warp tree) — then
+        // the score's scalar over its logits, in place.
+        wide.enqueue_f32_tile(stream, w, x, t, probs)?;
+        gpu.elem()
+            .enqueue_softplus_rows(stream, probs, N_EXPERT * t)?;
         for (r, bias) in runs {
             let n = launch_u32(what, "run", r.len())?;
             let p = span(what, probs, r.start * N_EXPERT, r.len() * N_EXPERT)?;
@@ -912,8 +801,8 @@ bloomery_gpu::sigmoid_router_instance! {
         experts: 288,
         used: 8,
         kernels: glm5next_router_kernels,
-        entries: glm5next_router, glm5next_router_scores, glm5next_router_pick,
-        prepare: prepare_glm5next_router, prepare_glm5next_router_scores, prepare_glm5next_router_pick,
+        entries: glm5next_router, glm5next_router_pick,
+        prepare: prepare_glm5next_router, prepare_glm5next_router_pick,
     }
 }
 
@@ -934,7 +823,7 @@ bloomery_gpu::sigmoid_router_instance! {
         experts: 256,
         used: 8,
         kernels: mimo2_router_kernels,
-        entries: mimo2_router, mimo2_router_scores, mimo2_router_pick,
-        prepare: prepare_mimo2_router, prepare_mimo2_router_scores, prepare_mimo2_router_pick,
+        entries: mimo2_router, mimo2_router_pick,
+        prepare: prepare_mimo2_router, prepare_mimo2_router_pick,
     }
 }

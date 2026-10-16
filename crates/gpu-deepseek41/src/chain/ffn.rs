@@ -772,6 +772,8 @@ impl<'w> LayerWeights<'w> {
 pub struct FfnKernels {
     module: ffn_kernels::LoadedModule,
     handoff: HandoffKernels,
+    /// The wide F32 tile GEMM the router's scores run on.
+    g32: bloomery_gpu::gemm::Gemm32Kernels,
 }
 
 impl FfnKernels {
@@ -783,6 +785,7 @@ impl FfnKernels {
         Ok(FfnKernels {
             module,
             handoff: HandoffKernels::load(ctx)?,
+            g32: bloomery_gpu::gemm::Gemm32Kernels::load(ctx)?,
         })
     }
 
