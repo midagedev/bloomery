@@ -552,7 +552,7 @@ fn moe_rows(
 
 /// The name of NVFP4 site `name`'s Q8_0 twin ([`derive_q8`]).
 fn q8_name(name: &str) -> String {
-    format!("{name}#q8_0")
+    format!("derived.q8_0.{name}")
 }
 
 /// Every NVFP4 site of `layers` again as a derived Q8_0 weight, what a pass
