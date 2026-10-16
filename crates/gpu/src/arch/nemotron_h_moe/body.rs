@@ -17,8 +17,9 @@ use crate::site::SiteTy;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Window};
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::Split;
+use gguf::{GgmlType, Split};
 use model::arch::Arch;
+use model::arch::names::blk;
 use model::arch::nemotron_h_moe::hparams::{Hparams, Kind};
 use model::arch::nemotron_h_moe::names;
 use std::ops::Range;
@@ -88,6 +89,33 @@ impl GpuModel<Body> {
 impl Body {
     fn load(gpu: &Gpu, file: &Split, w: &mut Weights, ctx: usize) -> Result<Body, GpuError> {
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        // A companion `.scale` is read for NVFP4 projections only
+        // (weights::tensor_scale); a scaled Q8_0 ssm_in/ssm_out would enter
+        // the scan unscaled, so the load refuses it by name.
+        for (l, kind) in hp.kinds.iter().enumerate() {
+            if *kind != Kind::Mamba {
+                continue;
+            }
+            for (stem, scale) in [
+                (names::SSM_IN, names::SSM_IN_SCALE),
+                (names::SSM_OUT, names::SSM_OUT_SCALE),
+            ] {
+                let name = blk(l, stem);
+                if let Some((_, t)) = file.find(&name)
+                    && t.ty != GgmlType::NVFP4
+                    && file.find(&blk(l, scale)).is_some()
+                {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "{name}: a companion {scale} is read for NVFP4 only, this \
+                             projection is {}",
+                            t.ty
+                        ),
+                    ));
+                }
+            }
+        }
         let ssm = hp.ssm;
         let mamba = mamba_shape(WHAT, &ssm)?;
         let n_kv = attention_heads(
