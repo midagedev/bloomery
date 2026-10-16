@@ -1,6 +1,6 @@
 //! `bloomery-serve --model qwen3` — the llama-server-compatible HTTP API on
-//! the single-card Qwen engines: a qwen3moe file (Qwen3-30B-A3B) or a
-//! qwen35moe file (Qwen3.6-35B-A3B), the whole model on one card, under
+//! the single-card Qwen engines: qwen3moe (Qwen3-30B-A3B), qwen35moe
+//! (Qwen3.6-35B-A3B), or dense qwen35, the whole model on one card, under
 //! `--place` placed by its plan on the card the word names with the routed
 //! experts the card's budget does not hold on the host tier.
 //!
@@ -26,7 +26,7 @@
 //! the slots, their total and the model's limit. The model is opened as
 //! `generate_qwen3moe` opens it — qwen3moe through `Qwen3moeModel::open` at
 //! its levers' options, qwen35moe through `Qwen35moeModel::open` with the
-//! tensor-core decode flash and the levers' ubatch — in graph mode with the
+//! file's head shape selecting decode flash and the levers' ubatch — in graph mode with the
 //! step and every pass captured, so a request's ids are the CLI's: the
 //! server feeds the prompt less its last id as one prompt call — both bodies
 //! by the seat's schedule (the ubatch walk from nine rows on — qwen3moe's
@@ -186,13 +186,13 @@ use bloomery_gpu_gates::bind::{
     note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::qwen_seat::Family;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::Levers;
 use gguf::Split;
-use model::arch::Arch;
 use model::arch::qwen35moe::hparams::Hparams;
 use model::placement::PlanLevers;
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS};
@@ -224,14 +224,12 @@ fn images_of(vision: Option<&Opened>) -> (bool, Option<u64>) {
 /// `--mmproj`'s part read by [`images_of`], `embedding` the side model's reserve on the stage
 /// card.
 fn serve_opts<'a>(
-    arch: Arch,
     (place, levers): (Option<Place>, &'a PlanLevers),
     kv: KvQ8,
     (vision, embedding): (Option<&Opened>, Option<u64>),
 ) -> q3place::ServeOpts<'a> {
     let (media, image) = images_of(vision);
     q3place::ServeOpts {
-        arch,
         place,
         levers,
         kv,
@@ -387,7 +385,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 /// opens it, its prompt schedule and its keep rule. Both hold resident
 /// sequences ([`Slots`]): the session adds and selects them alike.
 trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
-    /// The file's `general.architecture`, as the `load` record names it.
+    /// The body name in the default media refusal.
     const ARCH: &'static str;
     /// Whether the body runs several slots' rows as one pass on a
     /// whole-card load (`SlotRows`), through [`Body3::one_pass_round`]:
@@ -575,7 +573,7 @@ impl Body3 for Body35 {
         levers: &Levers,
         (kv, vision): (KvQ8, Option<&Opened>),
     ) -> Result<Qwen35moeModel, GateError> {
-        let o = q3place::serve_open35(ctx, kv, vision.is_some())?;
+        let o = q3place::serve_open35(&file, ctx, kv, vision.is_some())?;
         let mut m = match load {
             Q3Load::Whole(card) => {
                 print_seat(vision);
@@ -733,6 +731,7 @@ impl<B: Body3> Q3<B> {
     ) -> Result<Q3<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let arch = file.architecture().unwrap_or("<missing>").to_owned();
         let opened = t.elapsed();
         let mut m = B::open(file, ctx, slots, load, levers, (kv, vision.as_ref()))?;
         m.set_mode(StepMode::Graph);
@@ -758,7 +757,7 @@ impl<B: Body3> Q3<B> {
         }
         let total = t.elapsed();
         Record::new(&record::LOAD_QWEN3)
-            .w("arch", B::ARCH)
+            .w("arch", arch)
             .u("resident_bytes", s.model().resident_bytes())
             .w("cache", kv.name())
             .u("ctx", ctx)
@@ -1108,12 +1107,12 @@ fn slot_ctx(ctx: usize, parallel: usize) -> Result<usize, GateError> {
 /// not carry. The tower is sized for [`vision_seat::MINICPM_TILE_TOKENS`] and seated.
 fn vision_of(
     a: &Args,
-    arch: Arch,
+    arch: Family,
     (path, split): (&Path, &Split),
     token: &dyn Fn(u32) -> Option<String>,
     one: &dyn Fn(&str) -> Option<u32>,
 ) -> Result<Option<Opened>, GateError> {
-    if matches!(arch, Arch::Qwen3moe) {
+    if matches!(arch, Family::Qwen3moe) {
         return match a.vision.wanted()? {
             Some(file) => Err(format!(
                 "--mmproj {}: {} is a qwen3moe file (Qwen3-30B-A3B), which has no image input; \
@@ -1287,9 +1286,9 @@ fn dspark_refusal(placed: Option<(String, String)>) -> GateError {
 
 /// The draft `BLOOMERY_DRAFT` names for the `arch` file at `path`: unset and
 /// `off` are the plain path ([`served::word`]), `dspark` is the draft a
-/// qwen35moe file serves, refused by name on a qwen3moe file, and `lookup`
-/// is refused on both (it reads the V4.1 body's token history).
-fn draft_of(arch: Arch, levers: &Levers, path: &Path) -> Result<Draft, GateError> {
+/// qwen35moe file serves, refused by name on the other families, and `lookup`
+/// is refused on all (it reads the V4.1 body's token history).
+fn draft_of(arch: Family, levers: &Levers, path: &Path) -> Result<Draft, GateError> {
     let draft = served::word(levers)?;
     match (draft, arch) {
         (Draft::Lookup, _) => Err(
@@ -1298,10 +1297,11 @@ fn draft_of(arch: Arch, levers: &Levers, path: &Path) -> Result<Draft, GateError
              file, or none"
                 .into(),
         ),
-        (Draft::Dspark, Arch::Qwen3moe) => Err(format!(
+        (Draft::Dspark, Family::Qwen3moe | Family::Qwen35) => Err(format!(
             "BLOOMERY_DRAFT=dspark: the DSpark draft serves a qwen35moe file (Qwen3.6-35B-A3B); \
-             {} is a qwen3moe file",
-            path.display()
+             {} is a {} file",
+            path.display(),
+            arch.name()
         )
         .into()),
         (draft, _) => Ok(draft),
@@ -1330,18 +1330,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let kv = cache_k(&a, &levers)?;
     let path = ref_model_path()?;
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let first = split
-        .shard(0)
-        .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
-    let arch = Arch::detect(first).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !matches!(arch, Arch::Qwen3moe | Arch::Qwen35moe) {
-        return Err(format!(
-            "{} is a {} file; the qwen3 seat serves qwen3moe and qwen35moe files",
-            path.display(),
-            arch.name()
+    let name = split.architecture().unwrap_or("<missing>");
+    let arch = Family::from_name(name).ok_or_else(|| {
+        format!(
+            "{} is a {name} file; the qwen3 seat serves qwen3moe, qwen35moe and qwen35 files",
+            path.display()
         )
-        .into());
-    }
+    })?;
     // The draft word, before anything is planned or loaded.
     let draft = draft_of(arch, &levers, &path)?;
     // The vocabulary before the plans: `--mmproj`'s encoder is held against it, and its bytes
@@ -1391,7 +1386,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         let asked = ctx_and_load(
             &split,
             (a.ctx, slots),
-            serve_opts(arch, (a.place, &plan_levers), kv, (v, embedding)),
+            serve_opts((a.place, &plan_levers), kv, (v, embedding)),
         )?;
         let cost_ctx = asked.total;
         Ok(match asked.plan {
@@ -1416,12 +1411,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let asked = ctx_and_load(
         &split,
         (a.ctx, slots),
-        serve_opts(
-            arch,
-            (a.place, &plan_levers),
-            kv,
-            (vision.as_ref(), embedding),
-        ),
+        serve_opts((a.place, &plan_levers), kv, (vision.as_ref(), embedding)),
     )?;
     let (_, image) = images_of(vision.as_ref());
     eprintln!(
@@ -1431,7 +1421,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     );
     let slot_ctx = slot_ctx(usize::try_from(asked.total)?, slots)?;
     let load = asked.plan;
-    if matches!(arch, Arch::Qwen35moe) {
+    if matches!(arch, Family::Qwen35moe | Family::Qwen35) {
         q3place::checkpoints_fit(seqs35(&split, slots)?, slot_ctx, load.placed_body())?;
     }
     // The shape of a round of several slots, from the load's body
@@ -1454,7 +1444,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         })));
     }
     let pass = match arch {
-        Arch::Qwen3moe => pass_of::<Body>(slots, placed),
+        Family::Qwen3moe => pass_of::<Body>(slots, placed),
         _ => pass_of::<Body35>(slots, placed),
     };
     // The slots the seat serves, one line before the load (`from` names what
@@ -1492,7 +1482,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     }
     .to_owned();
     let engine = match arch {
-        Arch::Qwen3moe => SeatEngine::spawn(
+        Family::Qwen3moe => SeatEngine::spawn(
             move || Q3::<Body>::open(&open, slot_ctx, slots, pass, load, &levers, (kv, vision)),
             slot_ctx,
             vocab,

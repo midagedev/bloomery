@@ -39,4 +39,4 @@ IMAGES=(small-200x200 min-96x64 free-448x448 free-640x480 pad-777x513 strip-1000
 EMBED_VOCAB=gemma4
 EMBED_CASES=cases-gemma4.txt
 EMBED_CONTEXT=8192
-EMBED_STEPS=(text tower server text.cpu tower.cpu)
+EMBED_STEPS=(text tower server text.cpu tower.cpu server.cpu)

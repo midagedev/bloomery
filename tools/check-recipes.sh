@@ -385,6 +385,7 @@ blk_pytools() {
     "tools/ref/nsys-bridge.py --self-test"
     "tools/ref/ptx-canon.py --self-test"
     "tools/ref/qdot-rate-floors.py --self-test"
+    "tools/ref/source-inspection-test.py --self-test"
     "tools/ref/route-trace-chat.py --self-test"
     "tools/ref/router-coverage.py --self-test"
     "tools/ref/router-residency.py --self-test"

@@ -1814,7 +1814,7 @@ impl<'a, S: Stores + ?Sized> LayerProgram for StepWalk<'a, S> {
         let lc = ctx_of(p.c, l)?;
         let stream = lc.gpu.stream();
         let hy = port.hybrid();
-        hy.boundary().enqueue_back_of(stream, 0)?;
+        hy.boundary().enqueue_back_of(stream, 0, l)?;
         let hsum = hy.boundary().hsum_of(0)?;
         match tail {
             Tail::Step { head, taps, .. } => {

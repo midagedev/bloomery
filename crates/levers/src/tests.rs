@@ -157,7 +157,9 @@ fn garbage(kind: Kind) -> Vec<String> {
                 "127.0.0.1:7340,",
                 "127.0.0.1:7340,127.0.0.1:7340",
                 "127.0.0.1:65536",
-                "10.0.0.2:7340",
+                // PIN(2026-10-17): private IPv4 now uses the node/RDMA requirement check.
+                "8.8.8.8:7340",
+                "0.0.0.0:7340",
             ]
             .map(String::from),
         ),
@@ -1861,6 +1863,34 @@ fn a_reading_refuses_everything_at_once() {
 
 /// The pool reads its two levers alone — any other lever, whatever its value,
 /// is its binary's — and refuses a retired name.
+#[test]
+fn remote_nodes_require_private_addresses_and_rdma() {
+    for address in ["10.0.0.2:7340", "172.16.0.2:7340", "192.168.0.2:7340"] {
+        for link in ["shared", "loopback", "rdma"] {
+            let values = env(&[(TIER_NODES, address), (TIER_LINK, link)]);
+            let got = read(&values, Scope::TierNodes);
+            if link == "rdma" {
+                let parsed = got.expect("a private RDMA node");
+                assert!(
+                    matches!(&parsed.entry(TIER_NODES).value, Some(Value::Addrs(a)) if a.len() == 1 && a[0].to_string() == address)
+                );
+            } else {
+                assert!(
+                    got.expect_err("an off-host node needs RDMA")
+                        .to_string()
+                        .contains("requires BLOOMERY_TIER_LINK=rdma")
+                );
+            }
+        }
+    }
+    for address in ["127.0.0.1:7340", "[::1]:7340"] {
+        assert!(read(&env(&[(TIER_NODES, address)]), Scope::TierNodes).is_ok());
+    }
+    for ip in ["0.0.0.0", "8.8.8.8", "224.0.0.1", "::", "fe80::1"] {
+        assert!(!tier_ip(ip.parse().expect("an IP address")), "{ip}");
+    }
+}
+
 #[test]
 fn the_pool_reads_its_two_levers() {
     let mut pairs: Vec<(&str, &str)> = parsed()

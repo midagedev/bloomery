@@ -20,9 +20,11 @@
 //!
 //! A batch, in order:
 //!   1. drop its runs (`MADV_DONTNEED`, then `posix_fadvise(DONTNEED)`, both
-//!      through engram) and read `mincore` over them: any resident page and
-//!      the batch is redrawn and counted (`redraws`); past a bound the run
-//!      ends by name;
+//!      through engram) and read `mincore` over them. If pages stay resident,
+//!      retry over their whole shard and print the retry outside the timed
+//!      arms: an edge folio can cross a row or tensor boundary. Any page still
+//!      resident and the batch is redrawn and counted (`redraws`); past a
+//!      bound the run ends by name;
 //!   2. the `cache` arm: from the first `WILLNEED` over every part to the last
 //!      part populated (`POPULATE_READ`, the parts split across `--threads`
 //!      workers); then `mincore` must report every page resident, or the run
@@ -544,6 +546,20 @@ impl Rig {
     fn drop_parts(&self, parts: &[Part]) -> Result<(), GateError> {
         for p in parts {
             self.tables[p.t].evict_rows(&[p.id])?;
+        }
+        for p in parts {
+            let table = &self.tables[p.t];
+            let pages = table.resident_pages(&[p.id])?;
+            if pages.resident != 0 {
+                eprintln!(
+                    "probe_nvread: retrying eviction over whole shard {}: expert {} kept {} of {} pages",
+                    table.path().display(),
+                    p.id,
+                    pages.resident,
+                    pages.total
+                );
+                table.evict_shard()?;
+            }
         }
         Ok(())
     }

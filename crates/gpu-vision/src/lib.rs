@@ -57,12 +57,15 @@ pub mod chain;
 pub mod encoder;
 pub mod gelu_tanh;
 pub mod gemm_bf16;
+#[path = "arch/gemma4v.rs"]
+pub mod gemma4v;
 pub mod glm5v;
 pub mod layer_norm;
 pub mod mean_groups;
 pub mod minicpmv;
 pub mod mlp;
 pub mod norm;
+pub(crate) mod pointwise;
 pub mod pos_bilinear;
 pub mod qwen3vl;
 pub mod rope2d;
@@ -96,7 +99,7 @@ use vision::arch::{
 /// One image tower on the card, whichever projector type its file declares. A call takes
 /// `&mut self`: one image at a time owns the tower's activations, which are allocated at load, and
 /// the rows it returns borrow them until the next call.
-pub trait Tower {
+pub trait Tower: Send {
     /// Encode one image's patches into the rows of its tokens, without waiting for the card;
     /// read them on the stream the tower was opened with.
     fn encode(&mut self, patches: &Patches) -> Result<chain::Encoded<'_>, GpuError>;
@@ -140,10 +143,11 @@ pub fn open(
     file: &Gguf,
     limits: TokenLimits,
 ) -> Result<Box<dyn Tower>, GpuError> {
-    let projector = file
-        .value("clip.projector_type")
-        .and_then(gguf::Value::as_str);
+    let projector = vision::arch::projector_type(file).ok();
     match projector {
+        Some(vision::arch::gemma4v::PROJECTOR_TYPE) => {
+            Ok(Box::new(gemma4v::Encoder::load(ctx, stream, file, limits)?))
+        }
         Some(deepseek41v::PROJECTOR_TYPE) => {
             Ok(Box::new(encoder::Encoder::load(ctx, stream, file)?))
         }

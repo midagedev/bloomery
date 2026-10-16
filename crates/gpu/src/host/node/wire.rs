@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 /// The protocol's version, the census's first word: a node of another
 /// version is refused by name.
-pub(super) const VERSION: u32 = 3;
+pub(super) const VERSION: u32 = 4;
 
 /// The longest frame either side takes: an open's rows are the largest, a
 /// few hundred kilobytes.
@@ -34,6 +34,8 @@ pub enum Tag {
     ClearFault = 9,
     Fault = 10,
     Close = 11,
+    Reset = 12,
+    Release = 13,
     Ok = 100,
     Err = 101,
 }
@@ -51,6 +53,8 @@ impl Tag {
             Tag::ClearFault,
             Tag::Fault,
             Tag::Close,
+            Tag::Reset,
+            Tag::Release,
             Tag::Ok,
             Tag::Err,
         ]
@@ -262,6 +266,10 @@ fn late(what: &str) -> io::Error {
 }
 
 impl Channel {
+    pub(super) fn local_ip(&self) -> io::Result<std::net::IpAddr> {
+        self.s.local_addr().map(|a| a.ip())
+    }
+
     pub(super) fn new(s: TcpStream) -> io::Result<Channel> {
         s.set_nodelay(true)?;
         s.set_read_timeout(Some(SLICE))?;

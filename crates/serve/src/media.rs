@@ -48,8 +48,8 @@ impl MediaModel for NumberedMedia {
         Some(vec![100, 200 + index as u32, 300])
     }
 
-    fn image_token(&self) -> u32 {
-        7
+    fn image_token(&self) -> Option<u32> {
+        Some(7)
     }
 
     fn prepare(&self, _: &Rgb8) -> Result<Prepared, VisionError> {
@@ -243,6 +243,9 @@ impl From<Vec<u32>> for Prompt {
 /// are the request's fault.
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
+    /// The projector supports embedding delimiters rather than a chat placeholder.
+    #[error("the projector has no chat image token; use its embedding input")]
+    NoChatImageToken,
     /// A content part that is not a JSON object.
     #[error("a content part must be an object")]
     PartNotObject,
@@ -462,7 +465,7 @@ pub fn expand_prompt(
     urls: &[&str],
     model: &dyn MediaModel,
 ) -> Result<Prompt, MediaError> {
-    let token = model.image_token();
+    let token = model.image_token().ok_or(MediaError::NoChatImageToken)?;
     let placeholders = ids.iter().filter(|&&t| t == token).count();
     if placeholders != urls.len() {
         return Err(MediaError::Expand(ExpandError::PlaceholderCount {
@@ -686,8 +689,8 @@ mod tests {
             "<img>"
         }
 
-        fn image_token(&self) -> u32 {
-            7
+        fn image_token(&self) -> Option<u32> {
+            Some(7)
         }
 
         fn part_join(&self) -> PartJoin {

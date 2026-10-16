@@ -398,6 +398,17 @@ impl Encoder {
     /// the error, and so is an output value that is not finite, by its
     /// position.
     pub fn pass(&mut self, ids: &[u32], taps: bool) -> Result<Pass, GpuError> {
+        self.pass_media(ids, &[], taps)
+    }
+
+    /// One bidirectional pass with image rows already scaled by the tower,
+    /// replacing their spans after the text rows receive `sqrt(hidden)`.
+    pub fn pass_media(
+        &mut self,
+        ids: &[u32],
+        spans: &[bloomery_gpu::media::MediaSpan<'_>],
+        taps: bool,
+    ) -> Result<Pass, GpuError> {
         let n = ids.len();
         if n == 0 || n > self.ctx {
             return Err(GpuError::Shape {
@@ -405,7 +416,18 @@ impl Encoder {
                 detail: format!("{n} positions; a pass takes 1 to {}", self.ctx),
             });
         }
-        let inp_scaled = self.token_rows(ids)?;
+        bloomery_gpu::media::check_spans(PASS, spans, n, self.hp.n_embd)?;
+        let mut inp_scaled = self.token_rows(ids)?;
+        for span in spans {
+            let dst = &mut inp_scaled[span.at.start * self.hp.n_embd..span.at.end * self.hp.n_embd];
+            bloomery_gpu::media::widen_bf16(span.rows, dst);
+            if dst.iter().any(|v| !v.is_finite()) {
+                return Err(GpuError::shape(
+                    PASS,
+                    "image row contains a non-finite value",
+                ));
+            }
+        }
         let Encoder {
             gpu,
             hp,
@@ -521,6 +543,59 @@ fn mean(rows: &[f32], width: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_media_spans_are_checked_before_the_pass() {
+        use bloomery_gpu::media::MediaSpan;
+
+        crate::tests::with_model(64, 2048, |split, hp| -> Result<(), GpuError> {
+            let mut enc = Encoder::open(split, hp.n_ctx, Gpu::new()?)?;
+            let rows = vec![0; hp.n_embd];
+            for spans in [
+                vec![MediaSpan {
+                    at: 0..0,
+                    rows: &[],
+                }],
+                vec![MediaSpan {
+                    at: 1..2,
+                    rows: &rows,
+                }],
+                vec![MediaSpan {
+                    at: 0..1,
+                    rows: &[],
+                }],
+                vec![
+                    MediaSpan {
+                        at: 0..1,
+                        rows: &rows,
+                    },
+                    MediaSpan {
+                        at: 0..1,
+                        rows: &rows,
+                    },
+                ],
+            ] {
+                assert!(matches!(
+                    enc.pass_media(&[0], &spans, false),
+                    Err(GpuError::Shape { .. })
+                ));
+            }
+            assert!(
+                enc.pass_media(
+                    &[0],
+                    &[MediaSpan {
+                        at: 0..1,
+                        rows: &rows
+                    }],
+                    false
+                )
+                .is_ok()
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     #[ignore = "needs a CUDA card"]

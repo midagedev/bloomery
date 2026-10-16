@@ -3,11 +3,11 @@
 //! (node 0) drives the tier as it drives a card of its own
 //! ([`super::tier::TierCard`]); the tier's work ([`TierWork`]) runs in a tier
 //! server's process (node 1, [`serve`]), and each step node 0 asks of it is a
-//! request over a TCP control channel ([`TierNode`]). The page the
-//! protocol's words and rows live on is a file under `/dev/shm` both
-//! processes map ([`super::link::Link::across`]), so both processes share one
-//! host's memory: `BLOOMERY_TIER_NODES` takes loopback addresses only, and
-//! the channel has no authentication.
+//! request over a TCP control channel ([`TierNode`]). A shared page is a
+//! file under `/dev/shm` both processes map ([`super::link::Link::across`]).
+//! An RDMA bind gives each process its own page and exchanges its queue
+//! pair's endpoint on this channel; each end carries only its tier's
+//! crossings. The channel has no authentication.
 //!
 //! On connect the server sends its census ([`NodeCensus`]): node 0 plans
 //! the tier on the device it names ([`node_cards`]). The open
@@ -28,9 +28,8 @@
 //! counters and go words, so every wait its stream holds passes and node 0's
 //! next settle refuses the step by name
 //! ([`super::tier::TierCard::released`]); it drains its stream and returns
-//! the loss by name. Over loopback a peer's end is always seen; a half-open
-//! connection to another host is the transport's to bound once one runs
-//! there.
+//! the loss by name. A half-open control connection is bounded by its
+//! request deadline, and an unresponsive tier by the go deadline.
 
 pub mod wire;
 
@@ -571,6 +570,52 @@ fn read_err(addr: SocketAddr, what: &str, body: &[u8]) -> Result<GpuError, Strin
     }
 }
 
+/// Write a shared-file Bind payload, refusing a path that is not UTF-8.
+pub fn write_file_bind(
+    path: &Path,
+    bytes: usize,
+    tiers: usize,
+    index: usize,
+    out: &mut Out,
+) -> Result<(), GpuError> {
+    let path = path.to_str().ok_or_else(|| {
+        GpuError::shape(WHAT, format!("a page path {} not UTF-8", path.display()))
+    })?;
+    out.u8(0).str(path).len(bytes).len(tiers).len(index);
+    Ok(())
+}
+
+fn write_endpoint(e: &bloomery_verbs::Endpoint, out: &mut Out) {
+    out.u32(e.qpn)
+        .u32(e.psn)
+        .bytes(&e.gid.raw)
+        .u64(e.addr)
+        .u32(e.rkey);
+}
+
+fn read_endpoint(i: &mut In<'_>) -> Result<bloomery_verbs::Endpoint, String> {
+    let qpn = i.u32("queue pair")?;
+    let psn = i.u32("packet sequence")?;
+    let gid = bloomery_verbs::Gid {
+        raw: i
+            .bytes("GID")?
+            .try_into()
+            .map_err(|_| "a GID is 16 bytes")?,
+    };
+    let addr = i.u64("region address")?;
+    let rkey = i.u32("region key")?;
+    if qpn == 0 || qpn > 0xff_ffff || psn > 0xff_ffff || addr == 0 {
+        return Err("an invalid RDMA endpoint".to_string());
+    }
+    Ok(bloomery_verbs::Endpoint {
+        qpn,
+        psn,
+        gid,
+        addr,
+        rkey,
+    })
+}
+
 // ---------------------------------------------------------------- client
 
 /// Node 0's end of a tier node's channel: each [`TierWork`] step the stage
@@ -592,6 +637,7 @@ pub struct TierNode {
     device_bytes: usize,
     /// Per chain, the nodes of the graph the server holds for it.
     graphs: [Option<usize>; TIER_CHAINS],
+    control_round_trips: u64,
     lost: Option<String>,
 }
 
@@ -658,6 +704,7 @@ impl TierNode {
             resident_bytes: 0,
             device_bytes: 0,
             graphs: [None; TIER_CHAINS],
+            control_round_trips: 0,
             lost: None,
         };
         open.write(node.req.clear())?;
@@ -707,7 +754,10 @@ impl TierNode {
             .send(tag, self.req.done(), deadline)
             .and_then(|()| self.ch.recv(deadline));
         match r {
-            Ok(Tag::Ok) => Ok(()),
+            Ok(Tag::Ok) => {
+                self.control_round_trips += 1;
+                Ok(())
+            }
             Ok(Tag::Err) => match read_err(self.addr, what, self.ch.body()) {
                 Ok(e) => Err(e),
                 Err(why) => Err(self.lose_now(what, why)),
@@ -734,11 +784,51 @@ impl TierNode {
         tiers: usize,
         index: usize,
     ) -> Result<(), GpuError> {
-        let path = path.to_str().ok_or_else(|| {
-            GpuError::shape(WHAT, format!("a page path {} not UTF-8", path.display()))
-        })?;
-        self.req.clear().str(path).len(bytes).len(tiers).len(index);
+        self.req.clear();
+        write_file_bind(path, bytes, tiers, index, &mut self.req)?;
         self.ask(Tag::Bind, REPLY, "bind")
+    }
+
+    /// Bind a page held by this node's own RDMA end, exchanging endpoints on the control channel.
+    pub(super) fn bind_remote(
+        &mut self,
+        tiers: usize,
+        index: usize,
+        endpoint: &bloomery_verbs::Endpoint,
+    ) -> Result<bloomery_verbs::Endpoint, GpuError> {
+        self.req.clear().u8(1).len(tiers).len(index);
+        write_endpoint(endpoint, &mut self.req);
+        self.call(Tag::Bind, REPLY, "remote bind")?;
+        let mut i = In::new(self.ch.body());
+        read_endpoint(&mut i)
+            .and_then(|e| i.end().map(|()| e))
+            .map_err(|e| self.lose_now("remote bind", e))
+    }
+
+    pub(super) fn local_ip(&self) -> Result<std::net::IpAddr, GpuError> {
+        self.ch
+            .local_ip()
+            .map_err(|e| GpuError::link(WHAT, e.to_string()))
+    }
+
+    pub(super) fn release_remote(&mut self) -> Result<(), GpuError> {
+        self.req.clear();
+        self.ask(Tag::Release, 2 * DRAIN_DEADLINE + REPLY, "remote release")
+    }
+
+    /// Reset both drained ends, stopping both before either writer or reader resets.
+    pub(super) fn reset_remote(
+        &mut self,
+        link: &super::link::Link,
+        counters: &[usize],
+    ) -> Result<(), GpuError> {
+        for phase in 0..=2 {
+            link.reset_remote(phase, counters)
+                .map_err(|e| GpuError::protocol(WHAT, e))?;
+            self.req.clear().u8(phase);
+            self.ask(Tag::Reset, REPLY, "remote reset")?;
+        }
+        Ok(())
     }
 
     /// [`TierWork::launch`] on the node.
@@ -809,6 +899,10 @@ impl TierNode {
         })();
         let (w, s) = words.map_err(|e| self.lose_now("fault", e))?;
         Ok(Fault::from_words(w, s))
+    }
+
+    pub(super) fn control_round_trips(&self) -> u64 {
+        self.control_round_trips
     }
 
     /// The node's address.
@@ -943,6 +1037,8 @@ impl Opened {
 /// its progress as last seen and when it last moved, per chain the layers
 /// its captured graph serves, and the reply being written.
 struct Session<'a> {
+    local_ip: std::net::IpAddr,
+    reset_phase: u8,
     file: &'a Split,
     families: &'a [NodeFamily],
     opened: Option<Opened>,
@@ -971,8 +1067,11 @@ pub fn serve(
             .accept()
             .map_err(|e| GpuError::link(SERVER, format!("accept: {e}")))?;
         let lost = |e: std::io::Error| GpuError::link(SERVER, format!("node 0 at {peer}: {e}"));
+        let local_ip = s.local_addr().map_err(lost)?.ip();
         let mut ch = Channel::new(s).map_err(lost)?;
         let mut session = Session {
+            local_ip,
+            reset_phase: 0,
             file,
             families,
             opened: None,
@@ -1115,21 +1214,60 @@ impl Session<'_> {
         let mut i = In::new(body);
         let bad = |e: String| GpuError::shape(SERVER, format!("a {tag:?} request: {e}"));
         self.reply.clear();
+        if self.reset_phase != 0 && tag != Tag::Reset {
+            return Err(bad("the remote reset is incomplete".to_string()).into());
+        }
         match tag {
             Tag::Open => self.handle_open(&mut i, bad)?,
             Tag::Bind => {
-                let path = i.str("path").map_err(bad)?;
-                let (bytes, tiers, index) = (
-                    i.len("bytes").map_err(bad)?,
-                    i.len("tiers").map_err(bad)?,
-                    i.len("index").map_err(bad)?,
-                );
-                i.end().map_err(bad)?;
-                let o = self.opened()?;
-                o.work.bind_opened(Path::new(&path), bytes, tiers, index)?;
-                let p = o.work.opened_progress().unwrap_or(0);
+                let mode = i.u8("bind mode").map_err(&bad)?;
+                match mode {
+                    0 => {
+                        if !self.local_ip.is_loopback() {
+                            return Err(bad(
+                                "a shared-file bind requires a loopback connection".to_string()
+                            )
+                            .into());
+                        }
+                        let path = i.str("path").map_err(&bad)?;
+                        let (bytes, tiers, index) = (
+                            i.len("bytes").map_err(&bad)?,
+                            i.len("tiers").map_err(&bad)?,
+                            i.len("index").map_err(&bad)?,
+                        );
+                        i.end().map_err(&bad)?;
+                        self.opened()?
+                            .work
+                            .bind_opened(Path::new(&path), bytes, tiers, index)?;
+                    }
+                    1 => {
+                        let tiers = i.len("tiers").map_err(&bad)?;
+                        let index = i.len("index").map_err(&bad)?;
+                        let remote = read_endpoint(&mut i).map_err(&bad)?;
+                        i.end().map_err(&bad)?;
+                        let ip = self.local_ip;
+                        let endpoint =
+                            self.opened()?.work.bind_remote(tiers, index, &remote, ip)?;
+                        write_endpoint(&endpoint, &mut self.reply);
+                    }
+                    _ => return Err(bad(format!("unknown bind mode {mode}")).into()),
+                }
+                let p = self.opened()?.work.opened_progress().unwrap_or(0);
                 self.seen = (p, Instant::now());
                 self.asked = p;
+            }
+            Tag::Reset => {
+                let phase = i.u8("reset phase").map_err(&bad)?;
+                i.end().map_err(&bad)?;
+                if phase != self.reset_phase || phase > 2 {
+                    return Err(bad(format!(
+                        "remote reset phase {phase}, expected {}",
+                        self.reset_phase
+                    ))
+                    .into());
+                }
+                self.opened()?.work.reset_remote(phase)?;
+                self.reset_phase = (phase + 1) % 3;
             }
             Tag::Launch => {
                 let c = i.u32("chain").map_err(bad)?;
@@ -1153,6 +1291,15 @@ impl Session<'_> {
                 o.check_service(layer, row, cols)?;
                 o.work.enqueue(layer, row, cols).map_err(Failed::Fatal)?;
                 self.ask(1);
+            }
+            Tag::Release => {
+                i.end().map_err(bad)?;
+                let work = &self.opened()?.work;
+                if !work.release_opened().map_err(Failed::Fatal)? {
+                    return Err(Failed::Fatal(GpuError::state(SERVER, "a bound link")));
+                }
+                work.drain(DRAIN_DEADLINE, "tier_server: release")
+                    .map_err(Failed::Fatal)?;
             }
             Tag::Drain => {
                 let ms = i.u64("deadline").map_err(bad)?;
@@ -1306,10 +1453,17 @@ impl Session<'_> {
         let Some(o) = self.opened.take() else {
             return GpuError::link(SERVER, format!("node 0 at {peer} is lost: {why}"));
         };
-        let released = if o.work.release_opened() {
-            "released its words"
-        } else {
-            "held no page"
+        let released = match o.work.release_opened() {
+            Ok(true) => "released its words",
+            Ok(false) => "held no page",
+            Err(e) => {
+                let error = GpuError::link(
+                    SERVER,
+                    format!("node 0 at {peer} is lost: {why}; release failed: {e}"),
+                );
+                std::mem::forget(o);
+                return error;
+            }
         };
         let drained = o
             .work
@@ -1333,7 +1487,7 @@ impl Session<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::net::SocketAddr;
     use std::time::Instant;
 
@@ -1349,6 +1503,61 @@ mod tests {
     use gguf::{GgmlType, Split};
     use model::placement::devices::{DeviceId, DeviceInfo};
     use model::placement::{ModelTensor, ModelTensors, Role};
+
+    pub(in crate::host) fn empty_file(tag: &str) -> (std::path::PathBuf, Split) {
+        let path = std::env::temp_dir().join(format!("bloomery-{tag}-{}.gguf", std::process::id()));
+        let file = std::fs::File::create_new(&path).expect("a new model file");
+        Writer::new(file, Layout::new(&[], vec![]).expect("an empty layout"))
+            .expect("a writer")
+            .finish()
+            .expect("the model header");
+        let file = Split::open(&path).expect("the model file");
+        (path, file)
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_an_unsettled_lost_node_keeps_its_work_without_unwinding() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (path, file) = empty_file("unsettled-node");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let work = super::super::tier::tests::remote_work(&file, Arc::clone(&dropped), true);
+        let mut session = Session {
+            local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            reset_phase: 0,
+            file: &file,
+            families: &[],
+            opened: Some(super::Opened {
+                work,
+                name: "test tier".into(),
+                set: TierSet::new(0..1, 1, vec![vec![0]]).expect("a set"),
+                cols: 1,
+            }),
+            asked: 0,
+            seen: (0, Instant::now()),
+            listed: Vec::new(),
+            reply: Out::default(),
+        };
+        assert!(matches!(
+            session.handle(Tag::Release, &[]),
+            Err(Failed::Fatal(GpuError::Protocol { .. }))
+        ));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.end_lost("127.0.0.1:7340".parse().expect("a peer"), "channel closed")
+        }));
+        assert!(result.is_ok(), "a failed release must return, not unwind");
+        let error = result.expect("no unwind");
+        assert!(error.to_string().contains("release failed"), "{error}");
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "live work must be retained"
+        );
+        assert!(session.opened.is_none());
+        drop(session);
+        drop(file);
+        std::fs::remove_file(path).expect("remove the fixture");
+    }
 
     fn gb10(uuid: u8) -> DeviceInfo {
         DeviceInfo {
@@ -1368,6 +1577,75 @@ mod tests {
     /// kept), protocol error or refusal, with its text. A census of another
     /// version, of no device, of a device with more free bytes than total or
     /// of one uuid twice is refused.
+    #[test]
+    fn file_bind_payload_carries_its_mode_and_layout() {
+        let path = std::path::Path::new("/dev/shm/bloomery-tier-41");
+        let mut out = Out::default();
+        super::write_file_bind(path, 4096, 3, 2, &mut out).expect("a file bind");
+        let mut input = In::new(out.done());
+        assert_eq!(input.u8("mode").expect("mode"), 0);
+        assert_eq!(
+            input.str("path").expect("path"),
+            path.to_str().expect("ASCII")
+        );
+        assert_eq!(input.len("bytes").expect("bytes"), 4096);
+        assert_eq!(input.len("tiers").expect("tiers"), 3);
+        assert_eq!(input.len("index").expect("index"), 2);
+        input.end().expect("the exact payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/dev/shm/\xff"));
+            out.clear();
+            assert!(super::write_file_bind(path, 4096, 1, 0, &mut out).is_err());
+            assert!(out.done().is_empty());
+        }
+    }
+
+    #[test]
+    fn rdma_endpoints_require_complete_valid_fields() {
+        let endpoint = bloomery_verbs::Endpoint {
+            qpn: 0xff_ffff,
+            psn: 0xff_ffff,
+            gid: bloomery_verbs::Gid { raw: [0x7b; 16] },
+            addr: 0x1234_5678_9abc_def0,
+            rkey: 0xfedc_ba98,
+        };
+        let mut out = Out::default();
+        super::write_endpoint(&endpoint, &mut out);
+        let mut input = In::new(out.done());
+        assert_eq!(
+            super::read_endpoint(&mut input).expect("an endpoint"),
+            endpoint
+        );
+        input.end().expect("the exact payload");
+        for n in 0..out.done().len() {
+            assert!(
+                super::read_endpoint(&mut In::new(&out.done()[..n])).is_err(),
+                "{n}"
+            );
+        }
+        for invalid in [
+            bloomery_verbs::Endpoint { qpn: 0, ..endpoint },
+            bloomery_verbs::Endpoint {
+                qpn: 1 << 24,
+                ..endpoint
+            },
+            bloomery_verbs::Endpoint {
+                psn: 1 << 24,
+                ..endpoint
+            },
+            bloomery_verbs::Endpoint {
+                addr: 0,
+                ..endpoint
+            },
+        ] {
+            out.clear();
+            super::write_endpoint(&invalid, &mut out);
+            assert!(super::read_endpoint(&mut In::new(out.done())).is_err());
+        }
+    }
+
     #[test]
     fn messages_read_back_as_written() {
         let census = NodeCensus {
@@ -1469,14 +1747,10 @@ mod tests {
         }
         assert!(chain_word(Chain::Cols(usize::MAX)).is_err());
 
-        let path = std::env::temp_dir().join(format!("bloomery-node-{}.gguf", std::process::id()));
-        let file = std::fs::File::create_new(&path).expect("a new model file");
-        Writer::new(file, Layout::new(&[], vec![]).expect("an empty layout"))
-            .expect("a writer")
-            .finish()
-            .expect("the model header");
-        let file = Split::open(&path).expect("the model file");
+        let (path, file) = empty_file("node");
         let mut session = Session {
+            local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            reset_phase: 0,
             file: &file,
             families: &[],
             opened: None,
@@ -1485,6 +1759,20 @@ mod tests {
             listed: Vec::new(),
             reply: Out::default(),
         };
+        session.reset_phase = 1;
+        for (tag, payload) in [(Tag::Launch, vec![]), (Tag::Reset, vec![0])] {
+            let Err(Failed::Refused(e)) = session.handle(tag, &payload) else {
+                panic!("an out-of-order remote reset must be refused");
+            };
+            assert!(e.to_string().contains("reset"), "{e}");
+        }
+        session.reset_phase = 0;
+        for payload in [vec![2], vec![1], vec![1, 0]] {
+            let Err(Failed::Refused(GpuError::Shape { .. })) = session.handle(Tag::Bind, &payload)
+            else {
+                panic!("an unknown or incomplete bind must be refused before opening a card");
+            };
+        }
         for cols in [1, 4] {
             let mut o = Out::default();
             o.u32(20).len(cols).len(1).len(1).len(0);

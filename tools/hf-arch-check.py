@@ -97,7 +97,7 @@ ROW_BUDGET = 64 * MIB
 SERVES = {
     "ds41": ("deepseek41", "deepseek4"),
     "qwen38": ("qwen4exp",),
-    "qwen3": ("qwen3moe", "qwen35moe"),
+    "qwen3": ("qwen3moe", "qwen35moe", "qwen35"),
     "mimo2": ("mimo2",),
 }
 SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "nemotron": ("NemotronH", "NemotronHMoe")}
@@ -222,7 +222,7 @@ def decide_pick(arch, decision, repo, card):
     if row is not None:
         return ("decide", row)
     backbone = any(arch in r["backbones"] for r in DECIDE_ROWS)
-    generative = any(serves(s, arch) for s in SEAT_ORDER)
+    generative = arch != "qwen35" and any(serves(s, arch) for s in SEAT_ORDER)
     if generative or not backbone:
         return None
     base = card(repo)
@@ -1770,7 +1770,7 @@ def self_test():
 
     check("a type added to a body35 list is followed from the source, not mirrored", followed)
     try:
-        mirror_vs_source(doctored(SERVE_RS, 'Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe"),',
+        mirror_vs_source(doctored(SERVE_RS, 'Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe" | "qwen35"),',
                                   'Model::Qwen3 => arch.starts_with("qwen3"),'))
         check("a serves arm in a form this tool cannot read fails by file and line", False, "no failure")
     except SourceError as e:

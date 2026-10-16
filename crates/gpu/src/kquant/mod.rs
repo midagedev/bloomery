@@ -32,7 +32,10 @@ pub mod walk;
 pub use act::Act;
 pub use q5k::Q5k;
 pub use q8_0::Q8_0;
-pub use sel::{GateUpAct, KquantKernels, SelDown, walk_a_planes};
+pub use sel::{
+    ARENA_PARTS, ARENA_SKIP, GateUpAct, GateUpAt, KquantKernels, PART_DOWN, PART_GATE, PART_UP,
+    SelDown, SelDownAt, walk_a_planes,
+};
 pub use tiles::{
     EntryPlanes, KquantTileKernels, TileGather, TileScratch, TileTable, TiledDown, TiledGateUpAct,
 };

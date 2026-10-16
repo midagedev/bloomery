@@ -1379,31 +1379,19 @@ if [ -n "$TIMING_CARDS" ]; then
 else
   CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
 fi
-# A binary's sha256 and its tree's HEAD and dirty count, once. GIT_OPTIONAL_LOCKS=0 keeps `git
-# status` from rewriting the index of a tree this root process does not own. A tree box.sh synced
-# has no .git (the rsync leaves it out): when that tree is the one this runner stands in, its commit
-# is box.sh's BLOOMERY_GIT_COMMIT (`-dirty` when the Mac tree held uncommitted changes), printed as
-# `head=<commit>(box.sh) dirty_files=?`; any other tree without git prints `head=? dirty_files=?`.
-tree_line() {
-  local bin=$1 tree=$2 sha head dirty
-  sha=$(sha256sum "$bin" | cut -c1-12)
-  if head=$(git -c safe.directory="$tree" -C "$tree" rev-parse --short=9 HEAD 2> /dev/null); then
-    dirty=$(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$tree" -C "$tree" status --porcelain --untracked-files=no 2> /dev/null | wc -l | tr -d ' ')
-  else
-    head='?' dirty='?'
-    if [ -n "${BLOOMERY_GIT_COMMIT:-}" ] && [ "$(cd "$tree" 2> /dev/null && pwd -P)" = "$(pwd -P)" ]; then
-      head="$BLOOMERY_GIT_COMMIT(box.sh)"
-    fi
-  fi
-  echo "$bin sha256=$sha head=$head dirty_files=$dirty"
-}
+# The synced runner tree has no .git: its box.sh commit is known, its dirty count is not.
+# shellcheck source=tools/ref/source-inspection.sh
+source "${BASH_SOURCE[0]%/*}/source-inspection.sh" || exit 2
 IK_LINE='' LCPP_LINE='' BIN_LINES=()
-[ "$ik" = 0 ] || IK_LINE=$(tree_line "$IKBIN" "$IK")
+if [ "$ik" = 1 ]; then IK_LINE=$(tree_line "$IKBIN" "$IK" 9 box) || exit $?; fi
 # shellcheck disable=SC2153 # LCPP is the profile's, which shellcheck does not follow
-[ "$lcpp" = 0 ] || LCPP_LINE=$(tree_line "$LCPPBIN" "$LCPP")
+if [ "$lcpp" = 1 ]; then LCPP_LINE=$(tree_line "$LCPPBIN" "$LCPP" 9 box) || exit $?; fi
 # The server's launcher is a few KB; what it runs is the tree's libllama-server-impl.so beside it.
 SRV_LINE=
-[ "$srv" = 0 ] || SRV_LINE=$(srv_tree "$(tree_line "$SRVBIN" "$LCPP")")
+if [ "$srv" = 1 ]; then
+  SRV_LINE=$(tree_line "$SRVBIN" "$LCPP" 9 box) || exit $?
+  SRV_LINE=$(srv_tree "$SRV_LINE")
+fi
 # One tree line a second binary, however many arms run it.
 bin_seen=' '
 for i in "${!ARMS[@]}"; do
@@ -1413,7 +1401,8 @@ for i in "${!ARMS[@]}"; do
   case $bin_seen in *" $gb "*) continue ;; esac
   bin_seen+="$gb "
   t=$(bin_tree "$gb")
-  BIN_LINES+=("$(bin_label_stem "$gb"): $(tree_line "$gb" "$t")")
+  line=$(tree_line "$gb" "$t" 9 box) || exit $?
+  BIN_LINES+=("$(bin_label_stem "$gb"): $line")
 done
 ref_witness() {
   [ -z "$IK_LINE" ] || echo "    ik: $IK_LINE"

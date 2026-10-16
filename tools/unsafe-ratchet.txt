@@ -270,7 +270,12 @@ gguf 9 2 0
 # decode table (fill, its reads, the two entries' fills) replacing the grid read (bolt-iq2opt), and gemm_iq2xxs's
 # super-block word reads (gemm/grouped.rs iq2xxs_lane) with the IQ2_XXS grid's half-word read (iq.rs
 # iq2xxs_grid_half), each with its SAFETY line.
-gpu 1871 203 10
+# PIN(2026-10-16): gpu 1871 -> 1873 blocks, the pack-one prefill entry's call into
+# prefill_256_p and its two-position query load, each with its SAFETY line. Unsafe fns are unchanged.
+# PIN(2026-10-16): gpu 1869 -> 1892 blocks, 203 -> 206 fns, new code, not old code relaxed: the card leg's arena
+# entries for the Q4_K, Q5_K and Q6_K reads at word offsets of the NVMe tier's arena and their launchers, and the step
+# port's card leg that computes a service's arena ids from their slots, each call with its SAFETY line.
+gpu 1896 206 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -343,7 +348,11 @@ gpu-mimo2 0 0 0
 # PIN(2026-10-13): gpu-vision 91 -> 97 blocks, new code, not old code relaxed: the MiniCPM-V merger's two new kernel entries read
 # and write their buffers through the same raw places as the others, each block with its SAFETY line — vis_attn_group 5 (its
 # loader, three word reads, one store), vis_mean_groups 1 (its loader).
-gpu-vision 97 0 0
+# PIN(2026-10-15): gpu-vision 97 -> 116 blocks: Gemma4 row/position entries and F32 residual, clamp, pool, norm and GEMM
+# keep Gemma4 post norms in their graph precision; every raw read and disjoint store carries its SAFETY invariant.
+# PIN(2026-10-16): gpu-vision 116 -> 127 blocks: the same Gemma4 clamp, add, pool and F32 norm memory operations
+# now have narrower unsafe scopes, each with its own SAFETY invariant.
+gpu-vision 127 0 0
 # PIN(2026-10-13): hf 0 -> 2 blocks, new code, not old code relaxed: the DSpark draft's 1.9 GB safetensors file is read
 # through a read-only mapping (Safetensors::open) instead of into memory, and a bf16 tensor's bytes are viewed as u16
 # (Safetensors::bf16, a misaligned file refused), each block with its SAFETY line.

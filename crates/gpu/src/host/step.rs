@@ -6,7 +6,9 @@
 //! sequence number and layer, has the model's host computation write the sum
 //! into the page and adds one to the row's counter.
 
-use super::page::{HandoffLayout, PageLayout, Word};
+use super::arena_leg::ArenaLeg;
+use super::nvtier::CardHold;
+use super::page::{HandoffLayout, MAX_ROWS, PageLayout, Word};
 use super::route_trace::RouteTrace;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::{Health, HostExperts, Refusal, nanos, non_finite, unknown_id};
@@ -14,6 +16,7 @@ use crate::GpuError;
 use crate::graph::{
     MappedHost, capturing, mem_batch, op_add, op_barrier_sys, op_wait_geq, op_write,
 };
+use crate::kquant::sel::ARENA_PARTS;
 use crate::tensor::window;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
 use model::ops::DEFER_MAX_COLS;
@@ -134,6 +137,10 @@ pub(crate) struct RowPage {
 /// the next row's norm writes it, and the other two count every row's goes
 /// in one order, the order the host serves them in.
 pub struct Boundary {
+    /// The card leg over the NVMe tier's arena, when the load attached one
+    /// ([`super::HostTier::attach_arena_leg`]): each row's wait is followed
+    /// by its launches. First, so its windows into the page go before it.
+    pub(crate) arena: Option<ArenaLeg>,
     /// Windows into `region` — what the norm and the router write in place
     /// of the MoE arena's own buffers on a hybrid layer.
     pub(crate) normed: ManuallyDrop<DeviceBuffer<f32>>,
@@ -280,6 +287,7 @@ impl Boundary {
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
         Ok(Boundary {
+            arena: None,
             normed,
             ids,
             weights,
@@ -296,6 +304,17 @@ impl Boundary {
     #[must_use]
     pub fn rows(&self) -> usize {
         self.pages.len()
+    }
+
+    /// The host-mapped page.
+    pub(crate) fn page(&self) -> &MappedHost {
+        &self.page
+    }
+
+    /// Row `row`'s image and sum byte offsets in the page.
+    pub(crate) fn row_offsets(&self, row: usize) -> Result<(usize, usize), GpuError> {
+        let p = self.page_of(row, "Boundary::row_offsets")?;
+        Ok((p.image_off, p.hsum_off))
     }
 
     /// The page's layout.
@@ -374,10 +393,12 @@ impl Boundary {
         4 * self.layout.image_words()
     }
 
-    /// Device bytes the boundary holds: the region and the sum. The page is
-    /// host memory.
+    /// Device bytes the boundary holds: the region, the sum and the arena
+    /// leg's device buffers. The page and the leg's mapped tables are host memory.
     pub fn device_bytes(&self) -> usize {
-        self.region.num_bytes() + self.sum.num_bytes()
+        self.region.num_bytes()
+            + self.sum.num_bytes()
+            + self.arena.as_ref().map_or(0, ArenaLeg::device_bytes)
     }
 
     /// Enqueue layer `layer`'s handoff: the region's image into row 0's
@@ -447,14 +468,30 @@ impl Boundary {
         }
     }
 
-    /// Enqueue the wait: until the counter is at least one, then minus one.
-    /// Row 0's.
-    pub fn enqueue_back(&self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.enqueue_back_of(stream, 0)
+    /// Enqueue layer `layer`'s wait: until the counter is at least one, then
+    /// minus one; then, when the load attached a card leg over the arena,
+    /// its launches for the layer, which add the arena slots' sum to the
+    /// row's sum. Row 0's.
+    pub fn enqueue_back(&self, stream: &CudaStream, layer: usize) -> Result<(), GpuError> {
+        self.enqueue_back_of(stream, 0, layer)
     }
 
-    /// [`Boundary::enqueue_back`] on row `row`'s counter.
-    pub fn enqueue_back_of(&self, stream: &CudaStream, row: usize) -> Result<(), GpuError> {
+    /// [`Boundary::enqueue_back`] on row `row`'s counter and sum.
+    pub fn enqueue_back_of(
+        &self,
+        stream: &CudaStream,
+        row: usize,
+        layer: usize,
+    ) -> Result<(), GpuError> {
+        self.enqueue_wait(stream, row)?;
+        match &self.arena {
+            Some(leg) => leg.enqueue(stream, row, layer),
+            None => Ok(()),
+        }
+    }
+
+    /// The wait alone of [`Boundary::enqueue_back_of`].
+    fn enqueue_wait(&self, stream: &CudaStream, row: usize) -> Result<(), GpuError> {
         self.page_of(row, "Boundary::enqueue_back")?;
         let cnt = self.page.dev_at(Word::Cnt(row).offset());
         // SAFETY: row `row`'s counter lies in the page (row checked above),
@@ -662,6 +699,17 @@ pub struct StepPort {
     /// this layer's go. A ring of [`GAP_RING`] made at load; `stats.gaps`
     /// counts the waits ever written.
     gaps: Vec<u64>,
+    /// Per row, the arena ids its last service left to the card leg, pinned
+    /// until the row's next go: the card enqueues that go after the leg's
+    /// launches, so a go seen means the card has read the slots. None
+    /// without a leg.
+    holds: [Option<CardHold>; MAX_ROWS],
+    /// A service's arena ids for the card leg with their slots, the ids
+    /// alone, and their parts' word offsets in the arena, each with room for
+    /// `n_used` made at load.
+    card: Vec<(usize, u32)>,
+    card_ids: Vec<u32>,
+    card_offs: Vec<[u64; ARENA_PARTS]>,
 }
 
 /// Go waits the ring keeps ([`StepPort::gap_summary`]).
@@ -760,6 +808,19 @@ impl StepPort {
             tally: super::swap::Tally::off(),
             window: None,
             gaps: vec![0; GAP_RING],
+            holds: std::array::from_fn(|_| None),
+            card: Vec::with_capacity(h.n_used),
+            card_ids: Vec::with_capacity(h.n_used),
+            card_offs: Vec::with_capacity(h.n_used),
+        }
+    }
+
+    /// Let go of every row's card hold. Only where the card has read every
+    /// slot a hold covers (the stream has run past every step): a prompt's
+    /// batch service, a reset's rest, a settle on an idle stream.
+    pub(super) fn release_holds(&mut self) {
+        for h in &mut self.holds {
+            *h = None;
         }
     }
 
@@ -864,6 +925,7 @@ impl StepPort {
         self.served = generation;
         self.step_refusal = None;
         self.pair_row0 = None;
+        self.release_holds();
     }
 
     /// Wait for the go of layer `layer` of row `row` in `chain` and check
@@ -986,6 +1048,15 @@ impl StepPort {
             return self.serve_cols(experts, health, slots, layer, opens_replay, chain);
         }
         let go = self.take_go(layer, row, opens_replay, chain)?;
+        self.holds[row] = None;
+        let leg = self.boundary.arena.as_mut().filter(|l| l.runs(layer));
+        let tier = match leg {
+            Some(l) => {
+                l.skip_row(row)?;
+                Some(Arc::clone(l.tier()))
+            }
+            None => None,
+        };
         let (image_off, hsum_off) = (go.image_off, go.hsum_off);
         let page = &self.boundary.page;
         let h = self.boundary.layout.handoff();
@@ -1000,7 +1071,8 @@ impl StepPort {
         // to the host, with its weight — at most the page's `n_used`, the
         // list's room. A card's or the tier's id is theirs.
         self.list.clear();
-        let (mut w2_host, mut w2_all) = (0.0f64, 0.0f64);
+        self.card.clear();
+        let mut w2_all = 0.0f64;
         let mut tier_slots = [0u64; MAX_TIERS];
         let mut unknown = None;
         for s in 0..h.n_used {
@@ -1015,8 +1087,10 @@ impl StepPort {
             self.tally.note(layer, row, s, id)?;
             match slots.slot(layer, id) {
                 Some(Slot::Host) => {
+                    if tier.as_ref().is_some_and(|t| t.serves(layer, id)) {
+                        self.card.push((s, id));
+                    }
                     self.list.push((id, w));
-                    w2_host += f64::from(w) * f64::from(w);
                 }
                 Some(Slot::Card(_)) => {}
                 Some(Slot::Tier { tier, .. }) => tier_slots[tier] += 1,
@@ -1047,6 +1121,40 @@ impl StepPort {
             out.fill(f32::NAN);
             return Err(self.refuse(health, layer, format!("row {row}: {saw}")));
         }
+        // Read every offset before writing any, so a refusal leaves the
+        // row's slots skipped, as the service's start left them.
+        if let Some(tier) = tier
+            && !self.card.is_empty()
+        {
+            self.card_ids.clear();
+            self.card_ids.extend(self.card.iter().map(|&(_, id)| id));
+            let hold = tier.hold_for_card(layer, &self.card_ids)?;
+            self.card_offs.clear();
+            for &id in hold.ids() {
+                self.card_offs.push(tier.card_offsets(layer, id)?);
+            }
+            let leg = self
+                .boundary
+                .arena
+                .as_mut()
+                .ok_or(GpuError::state(what, "the card leg the service read"))?;
+            for (&(s, _), offs) in self.card.iter().zip(&self.card_offs) {
+                leg.set_slot(row, s, Some(*offs))?;
+            }
+            let held = hold.ids();
+            self.list.retain(|(id, _)| !held.contains(id));
+            self.holds[row] = Some(hold);
+        }
+        let w2_host: f64 = self
+            .list
+            .iter()
+            .map(|&(_, w)| f64::from(w) * f64::from(w))
+            .sum();
+        let out = self
+            .boundary
+            .page
+            .f32_mut(hsum_off, h.hidden)
+            .ok_or(GpuError::state(what, "the sum is outside the page"))?;
         experts.experts_into(layer, &self.x, &self.list, out)?;
         self.stats.host_calls += 1;
         // The page holds the handoff until the signal: the ids are read

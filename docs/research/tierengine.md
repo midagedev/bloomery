@@ -5,8 +5,8 @@ reader and one memory policy replace today's two readers, two heat sources and t
 serves a discrete card and a DGX Spark (GB10), whose CPU and GPU share one memory pool, so the card reads host pages
 in place.
 
-S1 (refill) and part of S0 had landed by main `9bd7d577`, and S7 (the arena in pinned memory) has landed since; a
-contributor holds S7's card leg and S13's placement half (§5). DGX Spark measurements answered five of the six questions
+S1 (refill) and part of S0 had landed by main `9bd7d577`, and S7 (the arena in pinned memory) and its card leg ((h)
+item 1) have landed since; a contributor holds S13's placement half (§5). DGX Spark measurements answered five of the six questions
 (k) asked and changed three inputs: a hit's price on GB10 now rests on whole-line loads over 128-B aligned parts, a fill
 at QD 3 (three reads in flight to the drive) takes longer than (j) interpolated, and one link rail moves faster than the
 cited rate (§6).
@@ -283,10 +283,15 @@ Decision — one policy, the memory kind as its parameter:
    layer's "card experts" are the slots of the one arena, S_pool = ⌊(pool − dense − KV − floor) / slot bytes / layers⌋; the card
    mover is `off` with the why `Unified` (no second level to move to); the book's heat ranks eviction (arena → file)
    and the lookahead's prefetch (file → arena) only. Promotion is the fill itself. The step port's leg is the card leg
-   (`TierLeg::Card`): `TierPin` yields `device_slot(id, part) -> Option<u64>` (Q18; the layer is the pin's, and an
-   anonymous arena gives `None`) from `cuMemHostGetDevicePointer` on the arena's base, and the card's `_sel` gather per
-   quant family (the `q4k_gemv_sel` shape) runs the pinned batch from those addresses — the one kernel-side addition,
-   per quant, never per model.
+   (`ArenaLeg`, `crates/gpu/src/host/arena_leg.rs`). The host holds a service's arena ids filled and pinned
+   (`NvTier::hold_for_card`, until the row's next go) and writes their parts' word offsets in the arena
+   (`NvTier::card_offsets`) beside the handoff. After the row's wait the card computes them with the `_at` entries,
+   the `_sel` shapes that read an expert at word offsets of the arena (gate and up in Q4_K or Q5_K, down in Q5_K or Q6_K),
+   and adds their weighted sum to the row's `hsum`. The card quantizes the activation as q8_1 and sums in its own
+   order, so its steps are not the host leg's bit for bit. The entries are the one kernel-side addition, per quant,
+   never per model. A load keeps the host leg when a covered layer's types have no entry, a part starts off a
+   4-byte word or a layer has fewer slots than a pass's rows hold ids, when its arena is anonymous (the card has no
+   address) and when its residency machine runs (it frees slots a hold keeps).
 2. **The arena is `ArenaMem::Pinned`: one `cuMemHostAlloc(PORTABLE|DEVICEMAP|WRITECOMBINED)` for the whole tier**,
    carved by `layer_bases` as the anonymous arena is; Q18 planned one per `LayerArena`, and §6.2 row 2's 64 GiB success
    makes one enough. The `Registered` variant goes (157–160 GB/s registered or not [measured, #13]: worth 0). On
@@ -294,7 +299,8 @@ Decision — one policy, the memory kind as its parameter:
    and the 27.8 GB/s streaming figure says nothing about qdot's 32-B row walks. A discrete card's `Pinned` arena, when
    the lever asks for one, is allocated without `WRITECOMBINED`. `give_back` is a no-op on `Pinned` ((d)): the arena is
    a fixed pool allocation priced at load (a linear cost in its size, §6.2 row 2), counted in `HostNeed.arena` as the
-   anonymous arena is until the card leg moves it to `HostNeed.cards` / `pool_card_bytes` (`placement.rs:859`), and a
+   anonymous arena is. The card leg leaves it there: on one pool `PoolOver` sums the cards' and the host's terms, so
+   moving it to `HostNeed.cards` / `pool_card_bytes` (`placement.rs:859`) would not change the sum. A
    `MADV_DONTNEED` would make the next fill fail ((d), D1). A fill overwrites the slot's windows; the DMA write of 3.134
    MB into the pool is 13 µs of the 235 GB/s [derived], paid once, no copy after it.
 3. **The pool's budget is one number.** #16's `PoolOver` (Σ card + host ≤ `MemAvailable`) stays the refusal; the
@@ -307,8 +313,9 @@ Decision — one policy, the memory kind as its parameter:
    3). At the 11.2 GB/s plateau a fill takes 0.28 ms (#13's 1 MiB loop at QD 16 to 32 on its 4 TB drive, not a decode
    fill's QD 3). The CPU's part is three preads (≈ 30 µs [assumption, 10 µs a pread]). A hit costs the card 3.134 MB /
    ~~235~~ 241.4 GB/s = 13 µs an expert [derived], read with whole-line loads over 128-B aligned parts ([#13
-   k-rows][krows]; today's slower gather is in §6.2 row 1). The host leg's 23.6 µs and the whole host-CPU row of (c)'s
-   timeline are gone on GB10. Above the pool the decode wall is card bytes at 235 (slot hits ~~235~~ 241.4, as above) +
+   k-rows][krows]; today's slower gather is in §6.2 row 1). On GB10 the card leg takes a decode step's arena ids
+   off the host leg, so the host leg's 23.6 µs and (c)'s host-CPU row go for those ids; the plan's host segment (the
+   experts the file mapping serves) and a prompt's batch stay with the host leg. Above the pool the decode wall is card bytes at 235 (slot hits ~~235~~ 241.4, as above) +
    fills × a fill (0.28 ms at the plateau, ~~0.43 ms~~ 0.58 to 0.69 ms at QD 3): GLM on one Spark, 88 GB paged [spark2x
    capacity row], at the box's gate-plan miss rate (45.7 fills a token [measured]) adds 13 ms at the plateau and ~~20
    ms~~ 26.5 to 31.5 ms at QD 3 [derived: 45.7 fills × a fill's batch share], up to about 61 ms with the fill timed
@@ -506,7 +513,7 @@ is refused by its own card. "Deletes" is what leaves the tree in that step or th
 | S4 | **Off rule derived** (e): `GainUnderRuler` in `room_for`, the `Paged` clause's 36 sites go (r4dc2), one `RoomShort` → each family's why | host plan path; levers unit tests; proof: the probe table of r4dc1 §2 reproduces (plan a → `mid-p0-s1`, GLM 3090 → `off` NoCardExperts) | levers tests (FAIL-first: restore the clause → the paged-shape pin red); `gate_nvtier` clause 5 re-pinned to the word; `nvtier_family` per-family pick | r4dc-default.card as written (−2..+10 %, 10 rounds, the flip's own A/B) | `PlanTier`, `PagedText`, `ResidencyWhy::Paged`, `Residency38Why::Paged`, `GlmWhy::Paged`, `RoomShort::Paged` | The `Paged` clause, `PlanTier`, `PagedText` and `RoomShort::Paged` went with R4d-c (`967f083f`); `GainUnderRuler` is deferred (§8) |
 | S5 | **Gate lookahead** (c): probe first (a `lookahead` record, functional, no lease); then the round: router_{l+1} on the pre-attention residual in the card graph, k ids on the handoff page, `Kind::Prefetch` jobs cancelled by a landing Step claim | add class on the card (ptx-scan = base + the router entry, `gate-ptx-spill` red on it before pinning) + host path; launch count Δt = 48 × c_node | `gate-gpu-e2e` (bits: the real router unchanged); new nvtier clause `prefetch_hit + cancelled + wasted == issued`; FAIL-first: a prefetch that claims a pinned slot → red | the probe: r at k = m, expected 0.6–0.85; the round's A/B at the gate plan: −10..−20 ms a token at r 0.6–0.85 after S1–S3; refused below r 0.5 | nothing until measured; at r < 0.5 the step is dropped and (c) closes with the three slot-level levers | Not in main |
 | S6 | **Heat in the book** (a): one count per (layer, id) written by the tally, read by the rule and `pick_slot`; `SwapRule.counts` a view | move; proof: a Mac route-trace replay plans identical flips from both sources; `ptx-scan` identical | `gate-gpu-qwen38-residency` / `gate-gpu-swap` flips pin; `gate-gpu-nvtier` eviction clause (coldest count, transient first); FAIL-first: evict by tick alone → the clause red | none (counting identity); read beside: fills a token at n 1024 (expected to fall with count-ranked eviction vs tick LRU, unmeasured) | `SwapRule.counts` as a second copy; `NvTier::Heat`/`slot_heat` (no caller) or they become the owner | Not in main |
-| S7 | **`ArenaMem::Pinned`** (d): the enum, `give_back` no-op on Pinned, `device_slot` for an integrated read, `devmap` clause checked on any card ([#13 devmap][devmap]) | add behind `BLOOMERY_NVTIER_MEM` (`auto` = `pinned` on an integrated device, `anon` on a discrete card; a pinned arena is write-combined on an integrated device only) | Q18's clause as two `devmap` hw tests in `nvtier.rs`: DtoH of `device_slot` == `slot()` bytes; FAIL-first D1 (dontneed on Pinned → the next fill's read fails, red on an integrated device; a PCIe card without write-combining keeps the bytes and stays green, [#109][i109]), D2 (part skew dropped → red) | the one term: `cuMemHostRegister`/`cuMemHostAlloc` over 20 GB works and its time (~~expected 2–4 s [assumption]~~ measured on GB10: both work; `cuMemHostAlloc` 1.59 s at 19.91 GiB (median) and 5.288 s at 64 GiB ([#13 k-rows][krows]), `cuMemHostRegister` 0.543 s over 19.91 GiB of pages already touched (median, [#13 register][measure13]); conditions in §6.2 row 2); bits equal | the integrated arena as a separate plan | In: one allocation for the tier, behind `BLOOMERY_NVTIER_MEM`, whose `auto` is Q5's answer (`pinned` on an integrated device only); (d) and (h) items 1 and 2 describe it. The card leg ((h) item 1) follows in its own PR |
+| S7 | **`ArenaMem::Pinned`** (d): the enum, `give_back` no-op on Pinned, `device_slot` for an integrated read, `devmap` clause checked on any card ([#13 devmap][devmap]) | add behind `BLOOMERY_NVTIER_MEM` (`auto` = `pinned` on an integrated device, `anon` on a discrete card; a pinned arena is write-combined on an integrated device only) | Q18's clause as two `devmap` hw tests in `nvtier.rs`: DtoH of `device_slot` == `slot()` bytes; FAIL-first D1 (dontneed on Pinned → the next fill's read fails, red on an integrated device; a PCIe card without write-combining keeps the bytes and stays green, [#109][i109]), D2 (part skew dropped → red) | the one term: `cuMemHostRegister`/`cuMemHostAlloc` over 20 GB works and its time (~~expected 2–4 s [assumption]~~ measured on GB10: both work; `cuMemHostAlloc` 1.59 s at 19.91 GiB (median) and 5.288 s at 64 GiB ([#13 k-rows][krows]), `cuMemHostRegister` 0.543 s over 19.91 GiB of pages already touched (median, [#13 register][measure13]); conditions in §6.2 row 2); bits equal | the integrated arena as a separate plan | In: one allocation for the tier, behind `BLOOMERY_NVTIER_MEM`, whose `auto` is Q5's answer (`pinned` on an integrated device only); (d) and (h) items 1 and 2 describe it. The card leg ((h) item 1) is in for GLM-5.3-Flash's step port |
 | S8 | **Dropper and mapping path for paged ids go** | delete; per entry the grep with no caller; `mapping_reads == 0` and `drops == 0` pinned | `gate-gpu-nvtier` clause 9 `exclusive` turns the tolerated mapping reads into a 0 pin (dated); FAIL-first: a lane stage of an unfilled id through the mapping → red | none (a functional run prints the pins) | `nvtier-drop`, `drop_layer`, `end_read`'s queue, `PageDrop` for paged ids, `source()`'s mapping fallthrough for arena ids | Not in main |
 | S9 | **Lift the copies** (§2): Qwen3.8's host-run build onto `model.rs:1710`; one `placement::Room` read per `describe`; MiMo's body attach through the same call | move; `ptx-scan` identical; `just affected --narrow` | each family's nvtier gate (`nvtier_family.rs` with a MiMo caller) | none | `body38.rs:1451-1456`'s own build; three room fields | Not in main |
 | S10 | **One budget solver** (g, l): a `MemoryModel` per device (`Card | Host | Pool`, capacity, bandwidth, reclaim class) whose terms are card experts / S_pool, the KV pool at ctx × slots × state bytes, the arena's S, the cache budget and floor, the churn pool, the page-cache assertion; the (g) reclaim order at a serve-time `--ctx` | host plan path, pure crate; proof: every plan in `tools/ref/plan-room.sh`'s room prints the same budgets as before (a counting identity) and the four replaced rules' tests re-point to the solver's terms | placement lib tests; `gate-gpu-qwen38-serve`'s two paged clauses re-pinned to the terms (dated); FAIL-first: a reclaim that touches the host segment → red; a cache under the two-state floor → red | none | `expert_nvme_tier`'s room arithmetic, `ArenaFloor` as a free rule, `grow_kv`, the paged cache default, the per-family room fields (with S9) | Not in main |
@@ -521,7 +528,7 @@ fill) → S8 → S9 → S12 → S13. S1+S2 share `read_pick`/`fill`: S2 rebases 
 pool reader that S1 touched; S8 removes the mapping path S2 made unreachable; S10 removes the four scattered budget
 rules the moment the solver prints their numbers. GB10-only behaviour enters as parameters of S7, S10 and S11
 (`ArenaMem::Pinned`, the `Pool` device kind, the drive's constants), never as a step of its own. A contributor holds
-S7's card leg and S13's placement half; the placement half does not wait for S10 ([#13 answer][answer]), and
+S13's placement half (S7's card leg is in); the placement half does not wait for S10 ([#13 answer][answer]), and
 the lane half stays after S7.
 
 ## 6. Measured on DGX Spark

@@ -613,23 +613,22 @@ if [ "$exl3" = 1 ]; then
   [ -f "$EXL3_WIKITEXT" ] || check 2 "no wikitext-2 test text at $EXL3_WIKITEXT"
 fi
 
-# A binary's sha256 and its tree's HEAD and dirty count. GIT_OPTIONAL_LOCKS=0 keeps `git status` from
-# rewriting the index of a tree this root process does not own.
-tree_line() {
-  local bin=$1 tree=$2 sha head dirty
-  sha=$(sha256sum "$bin" 2> /dev/null | cut -c1-12)
-  head=$(git -c safe.directory="$tree" -C "$tree" rev-parse --short=10 HEAD 2> /dev/null || echo '?')
-  dirty=$(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$tree" -C "$tree" status --porcelain --untracked-files=no 2> /dev/null | wc -l | tr -d ' ')
-  echo "$bin sha256=${sha:-?} head=$head dirty_files=$dirty"
-}
+# shellcheck source=tools/ref/source-inspection.sh
+source "${BASH_SOURCE[0]%/*}/source-inspection.sh" || exit 2
 REF_LINES=()
 for e in lcpp27752 lcpp27754; do
   case " ${A_ENG[*]} " in *" $e"*) ;; *) continue ;; esac
-  if [ "$e" = lcpp27752 ]; then REF_LINES+=("$e: $(tree_line "$LCPP27752BIN" "$LCPP27752")"); else REF_LINES+=("$e: $(tree_line "$LCPP27754BIN" "$LCPP27754")"); fi
+  if [ "$e" = lcpp27752 ]; then
+    line=$(tree_line "$LCPP27752BIN" "$LCPP27752" 10) || exit $?
+  else
+    line=$(tree_line "$LCPP27754BIN" "$LCPP27754" 10) || exit $?
+  fi
+  REF_LINES+=("$e: $line")
 done
 if [ "$exl3" = 1 ]; then
   v=$(find "${EXL3_PY%/bin/*}"/lib/python3*/site-packages -maxdepth 1 -name 'exllamav3-*.dist-info' 2> /dev/null | sed 's/.*exllamav3-//; s/\.dist-info$//' | head -n 1)
-  REF_LINES+=("exl3: $EXL3_PY exllamav3 ${v:-?} bench $(tree_line "$EXL3/eval/perf.py" "$EXL3") model $EXL3_MODEL ($EXL3_BPW bpw)")
+  line=$(tree_line "$EXL3/eval/perf.py" "$EXL3" 10) || exit $?
+  REF_LINES+=("exl3: $EXL3_PY exllamav3 ${v:-?} bench $line model $EXL3_MODEL ($EXL3_BPW bpw)")
 fi
 ref_witness() { [ ${#REF_LINES[@]} -eq 0 ] || printf '    %s\n' "${REF_LINES[@]}"; }
 

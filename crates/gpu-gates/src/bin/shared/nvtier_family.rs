@@ -1,14 +1,18 @@
-//! The NVMe expert tier's family gate: the five clauses every family that attaches the tier proves, over a
+//! The NVMe expert tier's family gate: the six clauses every family that attaches the tier proves, over a
 //! family-neutral handle ([`Family`]). A family's bin supplies the plan of its file at a room and an arena
 //! ([`Family::plan`]), the load by that plan ([`Family::load`]) with its tier handle ([`Family::tier`]), the token
-//! run ([`Family::run`]: one prompt call, then greedy steps, each position's argmax and logits digest) and, beside
-//! them, the refusals only it has ([`Family::refusals`], a family without one returns none).
+//! run ([`Family::run`]: one prompt call, then greedy steps, each position's argmax and logits digest), the switch to
+//! eager steps ([`Family::eager`]), whether its load attaches the step port's card leg ([`Family::card_leg`]) and,
+//! beside them, the refusals only it has ([`Family::refusals`], a family without one returns none).
 //!
 //! The arms are planned from the file, never from a literal: the all-RAM plan at the room its need fits fixes the
 //! arena's slot set, the paged arm's room is the split's floor F (read off the `HostRoomFloor` refusal at a
 //! [`PROBE_ROOM`] room under a given arena) plus the arena, and the arena is the slot sets [`paged_slots`] sizes from
 //! the file: [`SLOTS`], or fewer where the need leaves less above F. The two arms run one after the other on the same
-//! ids; the clauses are judged on what each snapshotted:
+//! ids. The paged arm runs once more, in a child process of this binary ([`ARM_CHILD`]) given the other arena memory
+//! (`BLOOMERY_NVTIER_MEM`, read where the tier is built): `anon` when the arena the process's levers built gave the
+//! card leg its slots, so the host leg has an arm of its own, and `pinned` when it did not and the family attaches
+//! the leg, so the card leg has one. The clauses are judged on what each snapshotted:
 //!
 //! - `plan`: the all-RAM plan pages nothing; the paged plan pages routed experts through an arena of exactly the
 //!   given bytes and slots, which the tier carved too (`NvTierStats::slots_per_layer`). The room below the floor is
@@ -17,19 +21,25 @@
 //! - `attach`: the load built a tier, it covers every paged layer, the carve is at least the arena's floor and under
 //!   the ids a paged layer serves (a layer that serves no more than it holds slots for never evicts), and a run's
 //!   misses, fills, evictions and prompt union claims are above 0 while no arena id was read through the file mapping.
-//! - `bits`: every position's argmax and logits digest equal the all-RAM arm's.
+//! - `bits`: on the paged arm whose host leg computes the arena's ids (its tier's card leg is not `on`), every
+//!   position's argmax and logits digest equal the all-RAM arm's.
+//! - `card`: on a family that attaches the card leg, the paged arm whose card leg is `on` claimed on the step port
+//!   only ids the card held, the card read some and the tier filled some; its steps run again eagerly from a cleared session give
+//!   every position's logits bit for bit. On a family that attaches none, the tier's card leg is `unattached`.
 //! - `refuse`: by name, a room under the floor and an arena one slot set under the arena's floor (both at plan time),
 //!   and the family's own refusals.
 //! - `residency`: the unset residency rule on the paged plan resolves as the plan's own numbers say (the card
 //!   experts, the churn pool at the counts the rule probes, the host headroom and what the host's room leaves,
 //!   [`RoomFacts`]), never with why `paged`: the family states the pair it expects ([`Family::expected_residency`]).
 
+use std::process::Command;
 use std::sync::Arc;
 
+use bloomery_gpu::host::arena_leg::LegOff;
 use bloomery_gpu::host::nvtier::{NvTier, NvTierStats};
 use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::{GateError, checks_failed, record, tier, verdict};
-use bloomery_levers::{RESIDENCY_SERVING, ResidencyWord, residency_word};
+use bloomery_levers::{NVTIER_MEM, RESIDENCY_SERVING, ResidencyWord, residency_word};
 use model::placement::workstation::HostNeed;
 use model::placement::{ArenaFloor, Device, PlacementError, Plan, Role, arena_slots};
 
@@ -39,6 +49,15 @@ pub const SLOTS: u64 = 64;
 
 /// The room the floor is read at: under every file's floor.
 const PROBE_ROOM: u64 = 1 << 30;
+
+/// The argument that makes this binary the paged arm's child ([`arm_child`]): the arm's room and arena follow it.
+const ARM_CHILD: &str = "--nvtier-arm-child";
+
+/// The arm child's arena memory where the host leg computes the arena's ids ([`arm_child`]).
+const HOST_LEG_MEM: (&str, &str) = (NVTIER_MEM, "anon");
+
+/// The arm child's arena memory the card leg reads ([`arm_child`]).
+const CARD_LEG_MEM: (&str, &str) = (NVTIER_MEM, "pinned");
 
 /// One arm's placement inputs: the host room the plan splits by and the arena's given bytes (`None`: the dial's).
 #[derive(Clone, Copy, Debug)]
@@ -261,6 +280,8 @@ pub struct TierFacts {
     pub covered: Vec<usize>,
     /// The ids a covered layer's arena serves, per covered layer.
     pub served: Vec<usize>,
+    /// `None` when the step port's card leg reads the arena, else why not ([`NvTier::card_leg`]).
+    pub leg: Option<LegOff>,
     pub before: NvTierStats,
     pub after: NvTierStats,
 }
@@ -282,6 +303,7 @@ impl TierFacts {
             slots: after.slots_per_layer,
             covered,
             served,
+            leg: t.card_leg(),
             before,
             after,
         }
@@ -329,6 +351,21 @@ pub trait Family {
     /// # Errors
     /// The run's failure.
     fn run(&self, s: &mut Self::Session) -> Result<Vec<Pos>, GateError>;
+
+    /// The session cleared to its first position, its steps eager from here on. The `card` clause calls it only on a
+    /// family whose load attaches the card leg ([`Family::card_leg`]).
+    ///
+    /// # Errors
+    /// The clear's failure; a family that attaches no card leg refuses it by name.
+    fn eager(&self, _s: &mut Self::Session) -> Result<(), GateError> {
+        Err("an eager rerun: this family attaches no card leg, so no arm runs one".into())
+    }
+
+    /// Whether the family's load attaches the step port's card leg
+    /// (`bloomery_gpu::host::arena_leg`): it then reads a pinned arena's slots on the card.
+    fn card_leg(&self) -> bool {
+        false
+    }
 
     /// The session cleared and dropped.
     ///
@@ -383,10 +420,73 @@ struct Ran {
     plan: PlanFacts,
     run: Vec<Pos>,
     tier: Option<TierFacts>,
+    /// The run again, eager from a cleared session, on an arm whose card leg is `on`.
+    eager: Vec<Pos>,
 }
 
-/// The arm `arm` planned, loaded, run once and torn down.
+/// An arm's card leg: on, off for a reason, or no tier to run it over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Leg {
+    NoTier,
+    On,
+    Off(LegOff),
+}
+
+impl Leg {
+    /// The leg of an arm whose tier `tier` snapshotted.
+    fn of(tier: Option<&TierFacts>) -> Leg {
+        tier.map_or(Leg::NoTier, |t| t.leg.map_or(Leg::On, Leg::Off))
+    }
+
+    /// The word the gate prints, as the `nvtier` record's `card_leg` spells it.
+    fn word(self) -> &'static str {
+        match self {
+            Leg::NoTier => "none",
+            Leg::On => "on",
+            Leg::Off(off) => off.name(),
+        }
+    }
+
+    /// The leg a [`Leg::word`] names.
+    fn parse(word: &str) -> Result<Leg, GateError> {
+        match word {
+            "none" => Ok(Leg::NoTier),
+            "on" => Ok(Leg::On),
+            w => LegOff::ALL
+                .into_iter()
+                .find(|off| off.name() == w)
+                .map(Leg::Off)
+                .ok_or_else(|| format!("the arm child's card leg {w:?}").into()),
+        }
+    }
+}
+
+impl Ran {
+    /// The arm's card leg.
+    fn leg(&self) -> Leg {
+        Leg::of(self.tier.as_ref())
+    }
+
+    /// What the arm shows of the card leg.
+    fn leg_facts(&self) -> LegFacts {
+        let delta = |f: fn(&NvTierStats) -> u64| self.tier.as_ref().map_or(0, |t| t.delta(f));
+        LegFacts {
+            leg: self.leg(),
+            run: self.run.clone(),
+            eager: self.eager.clone(),
+            claims: delta(|s| s.step_fills + s.step_hits),
+            card_ids: delta(|s| s.card_ids),
+            fills: delta(|s| s.fills),
+        }
+    }
+}
+
+/// The arm `arm` planned, loaded, run once (and, where its card leg is `on`, once more eagerly) and torn down.
 fn arm_run<F: Family>(f: &F, name: &str, arm: Arm, plan: PlanFacts) -> Result<Ran, GateError> {
+    record::require(
+        record::groups::nvtier_family::ARM_RUN,
+        "nvtier_family::arm_run",
+    );
     let mut s = f.load(arm, false)?;
     let tier = f.tier(&s)?;
     let before = tier.as_ref().map(|t| t.stats());
@@ -399,20 +499,136 @@ fn arm_run<F: Family>(f: &F, name: &str, arm: Arm, plan: PlanFacts) -> Result<Ra
         r.print();
     }
     drop(tier);
+    let leg = Leg::of(facts.as_ref());
+    let eager = if leg == Leg::On {
+        f.eager(&mut s)?;
+        f.run(&mut s)?
+    } else {
+        Vec::new()
+    };
     f.finish(s)?;
     println!(
-        "{name}: arm room {} B arena {:?}: {} positions, {} paged layers, tier {}",
+        "{name}: arm room {} B arena {:?}: {} positions, {} paged layers, tier {}, card leg {}",
         arm.room,
         arm.arena,
         run.len(),
         plan.paged_layers.len(),
-        if facts.is_some() { "built" } else { "none" }
+        if facts.is_some() { "built" } else { "none" },
+        leg.word()
     );
     Ok(Ran {
         plan,
         run,
         tier: facts,
+        eager,
     })
+}
+
+/// What a paged arm shows of the step port's card leg: its state, the run and its eager rerun, and the run's tier
+/// counts (the step port's claims, the ids the leg held and left to the host, the fills).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LegFacts {
+    leg: Leg,
+    run: Vec<Pos>,
+    eager: Vec<Pos>,
+    claims: u64,
+    card_ids: u64,
+    fills: u64,
+}
+
+impl LegFacts {
+    /// The facts as the child's reply record, [`LegFacts::parse`]'s input.
+    fn print(&self) {
+        record::require(
+            record::groups::nvtier_family::ARM,
+            "nvtier_family::LegFacts::print",
+        );
+        let mut r = record::Record::new(&record::NVTIER_ARM)
+            .w("leg", self.leg.word())
+            .u("claims", self.claims)
+            .u("card_ids", self.card_ids)
+            .u("fills", self.fills);
+        for (key, ps) in [("run", &self.run), ("eager", &self.eager)] {
+            r = r.csv(
+                key,
+                ps.iter().map(|p| format!("{}:{:016x}", p.argmax, p.fnv)),
+            );
+        }
+        r.print();
+    }
+
+    /// The facts from a child's stdout.
+    fn parse(out: &str) -> Result<LegFacts, GateError> {
+        let f = record::Log::of(out, &[&record::NVTIER_ARM]).one(&record::NVTIER_ARM)?;
+        let list = |key: &str| -> Result<Vec<Pos>, GateError> {
+            f.csv(key)?
+                .into_iter()
+                .map(|w| {
+                    let (argmax, fnv) = w
+                        .split_once(':')
+                        .ok_or_else(|| format!("the arm child's {key} entry {w:?}"))?;
+                    Ok(Pos {
+                        argmax: argmax.parse()?,
+                        fnv: u64::from_str_radix(fnv, 16)?,
+                    })
+                })
+                .collect()
+        };
+        Ok(LegFacts {
+            leg: Leg::parse(f.word("leg")?)?,
+            run: list("run")?,
+            eager: list("eager")?,
+            claims: f.u64("claims")?,
+            card_ids: f.u64("card_ids")?,
+            fills: f.u64("fills")?,
+        })
+    }
+}
+
+/// The paged arm `arm` (its room and arena) run by this binary as a child whose arena memory is `mem`
+/// ([`HOST_LEG_MEM`] or [`CARD_LEG_MEM`]), after the parent's own loads are gone; its output forwarded, its facts
+/// parsed.
+fn arm_child(name: &str, arm: Arm, (lever, mem): (&str, &str)) -> Result<LegFacts, GateError> {
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg(ARM_CHILD)
+        .arg(arm.room.to_string())
+        .arg(arm.arena.map_or_else(|| "-".to_string(), |a| a.to_string()))
+        .env(lever, mem);
+    bloomery_gpu_gates::die_with_parent(&mut cmd);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("{name}: run the {mem} arm child: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    for line in stdout.lines() {
+        println!("[{mem} arm] {line}");
+    }
+    for line in String::from_utf8_lossy(&out.stderr).lines() {
+        eprintln!("[{mem} arm] {line}");
+    }
+    if !out.status.success() {
+        return Err(format!("{name}: the {mem} arm child ended {}", out.status).into());
+    }
+    LegFacts::parse(&stdout)
+}
+
+/// The arm this process runs as the paged arm's child: `Some` of its room and arena after [`ARM_CHILD`], `None` for
+/// the gate itself.
+fn child_arm() -> Result<Option<Arm>, GateError> {
+    let mut args = std::env::args().skip(1);
+    if args.find(|a| a == ARM_CHILD).is_none() {
+        return Ok(None);
+    }
+    let (Some(room), Some(arena)) = (args.next(), args.next()) else {
+        return Err(format!("{ARM_CHILD} takes the arm's room and arena").into());
+    };
+    let arena = match arena.as_str() {
+        "-" => None,
+        a => Some(a.parse()?),
+    };
+    Ok(Some(Arm {
+        room: room.parse()?,
+        arena,
+    }))
 }
 
 /// A clause's verdict line.
@@ -490,19 +706,81 @@ fn attach_clause(name: &str, paged: &PlanFacts, tier: Option<&TierFacts>) -> boo
     )
 }
 
-/// `bits`: see the module doc.
-fn bits_clause(name: &str, ram: &[Pos], paged: &[Pos]) -> bool {
+/// `bits`: see the module doc. `leg` is the card leg state of the paged arm `paged` ran on.
+///
+/// PIN(2026-10-14): the clause holds the paged arm whose host leg computes the arena's ids; where the card leg reads
+/// a pinned arena's slots it quantizes the activation as q8_1 and sums those ids on the card in its own order, and
+/// the `card` clause holds that arm.
+fn bits_clause(name: &str, ram: &[Pos], (leg, paged): (Leg, &[Pos])) -> bool {
     let first = ram.iter().zip(paged).position(|(a, b)| a != b);
-    let ok = ram.len() == paged.len() && !ram.is_empty() && first.is_none();
+    let ok = leg != Leg::On && ram.len() == paged.len() && !ram.is_empty() && first.is_none();
     clause(
         name,
         &format!(
-            "{} positions against {}, first difference {first:?}, last digest {:016x}",
+            "the host leg's arm (card leg {}): {} positions against {}, first difference {first:?}, last digest \
+             {:016x}",
+            leg.word(),
             ram.len(),
             paged.len(),
             paged.last().map_or(0, |p| p.fnv)
         ),
         ok,
+    )
+}
+
+/// `card`: see the module doc. `attaches` is the family's [`Family::card_leg`]; `leg` the paged arm's own card leg
+/// state, `card` the facts of the arm whose card leg is `on` (`None` where no arm's tier gave it one); `host` the host
+/// leg's arm, whose argmax per position is printed beside the card arm's and not judged.
+fn card_clause(
+    name: &str,
+    attaches: bool,
+    (leg, card): (Leg, Option<&LegFacts>),
+    host: &[Pos],
+) -> bool {
+    if !attaches {
+        return clause(
+            name,
+            &format!(
+                "the family attaches no card leg; the paged arm's tier reads {}",
+                leg.word()
+            ),
+            leg == Leg::Off(LegOff::Unattached),
+        );
+    }
+    let Some(c) = card else {
+        return clause(
+            name,
+            &format!(
+                "no paged arm ran the card leg; the paged arm's tier reads {}",
+                leg.word()
+            ),
+            false,
+        );
+    };
+    let identity = c.claims == c.card_ids;
+    let first = c.run.iter().zip(&c.eager).position(|(a, b)| a != b);
+    let replay = !c.run.is_empty() && c.run.len() == c.eager.len() && first.is_none();
+    let same = c
+        .run
+        .iter()
+        .zip(host)
+        .filter(|(a, b)| a.argmax == b.argmax)
+        .count();
+    clause(
+        name,
+        &format!(
+            "card leg {}; the steps' claims {} = the leg's ids {} ({identity}); fills {}; graph \
+             against eager: {} positions against {}, first difference {first:?}; argmax as the host leg's arm at \
+             {same} of {} positions (printed)",
+            c.leg.word(),
+            c.claims,
+            c.card_ids,
+            c.fills,
+            c.run.len(),
+            c.eager.len(),
+            c.run.len()
+        ),
+        c.leg == Leg::On && identity && c.card_ids > 0 && c.fills > 0 && replay,
     )
 }
 
@@ -517,12 +795,19 @@ fn refused(what: &str, holds: &str, got: Result<(), GateError>) -> bool {
     ok
 }
 
-/// The gate: `f`'s file planned, its two arms run, the five clauses judged, none stopping the others after the
+/// The gate: `f`'s file planned, its arms run, the six clauses judged, none stopping the others after the
 /// arms ran.
 ///
 /// # Errors
 /// A clause that is red ([`checks_failed`]), or a failure the clauses cannot name: a probe, a load, a run.
 pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
+    if let Some(arm) = child_arm()? {
+        let plan = f
+            .plan(arm)?
+            .map_err(|e| format!("{name}: the arm child's plan: {e}"))?;
+        arm_run(f, name, arm, plan)?.leg_facts().print();
+        return Ok(());
+    }
     let host = f.host_layers_enough()?;
     let plan_runs = tier::host_clause(
         "plan: the paged plan pages through an arena of exactly the given slots, all-RAM pages nothing",
@@ -607,6 +892,17 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
     // One load at a time: the all-RAM arm's session is gone before the paged arm loads.
     let ram = arm_run(f, name, ram_arm, ram_plan)?;
     let paged = arm_run(f, name, paged_arm, paged_plan)?;
+    // The paged arm again in a child, on the other arena memory: the host leg's arm where the card leg read this
+    // one's slots, the card leg's where the family attaches it and this arena gave it none.
+    let here = (paged.leg(), paged.run.clone());
+    let (host_arm, card) = if paged.leg() == Leg::On {
+        let child = arm_child(name, paged_arm, HOST_LEG_MEM)?;
+        ((child.leg, child.run), Some(paged.leg_facts()))
+    } else if paged.tier.is_some() && f.card_leg() {
+        (here, Some(arm_child(name, paged_arm, CARD_LEG_MEM)?))
+    } else {
+        (here, None)
+    };
     let mut pass = true;
     if plan_runs {
         pass &= plan_clause(
@@ -623,8 +919,19 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
     )? {
         pass &= attach_clause("attach", &paged.plan, paged.tier.as_ref());
     }
-    tier::sc("bits: every position equals the all-RAM arm's")?;
-    pass &= bits_clause("bits", &ram.run, &paged.run);
+    tier::sc("bits: every position of the host leg's paged arm equals the all-RAM arm's")?;
+    pass &= bits_clause("bits", &ram.run, (host_arm.0, &host_arm.1));
+    if tier::host_clause(
+        "card: the card leg's arm claims only the leg's ids, and replays as it steps eagerly",
+        host,
+    )? {
+        pass &= card_clause(
+            "card",
+            f.card_leg(),
+            (paged.leg(), card.as_ref()),
+            &host_arm.1,
+        );
+    }
     if tier::host_clause(
         "refuse: a room under the floor, an arena under the arena's floor and the family's own, by name",
         host,
@@ -670,5 +977,50 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
         Ok(())
     } else {
         Err(checks_failed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Leg, LegFacts, Pos};
+
+    #[test]
+    fn the_arm_child_reply_is_one_whole_record() {
+        let line = "arm-child leg=on claims=2 card_ids=2 fills=2 \
+                    run=[7:0123456789abcdef,8:fedcba9876543210] eager=[]";
+        let facts = LegFacts::parse(&format!("load progress\n{line}\n")).unwrap();
+        assert_eq!(
+            facts,
+            LegFacts {
+                leg: Leg::On,
+                run: vec![
+                    Pos {
+                        argmax: 7,
+                        fnv: 0x0123456789abcdef
+                    },
+                    Pos {
+                        argmax: 8,
+                        fnv: 0xfedcba9876543210
+                    },
+                ],
+                eager: vec![],
+                claims: 2,
+                card_ids: 2,
+                fills: 2,
+            }
+        );
+        for bad in [
+            String::new(),
+            format!("{line}\n{line}"),
+            format!("{line} extra=1"),
+            line.replace(" fills=2", ""),
+            line.replace("claims=2", "claims=bad"),
+            line.replace("leg=on", "leg=unknown"),
+            line.replace("7:0123456789abcdef", "7"),
+            line.replace("8:fedcba9876543210", "bad:fedcba9876543210"),
+            line.replace("8:fedcba9876543210", "8:not-hex"),
+        ] {
+            assert!(LegFacts::parse(&bad).is_err(), "accepted {bad:?}");
+        }
     }
 }

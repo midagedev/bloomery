@@ -9,12 +9,12 @@
 use gguf::{Gguf, Value};
 
 use super::PROJECTOR_TYPE;
-use super::size::{SizeRule, TokenLimits};
 use crate::VisionError;
 use crate::arch::header::{
     KEY_HAS_VISION, Meta, check_architecture, check_eps, check_mean_std, check_projector,
     check_true, count_multiple, counts, need, refusal,
 };
+use crate::size::{SizeRule, TokenLimits};
 
 const KEY_GELU: &str = "clip.use_gelu";
 const KEY_DEEPSTACK: &str = "clip.vision.is_deepstack_layers";

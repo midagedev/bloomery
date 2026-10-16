@@ -61,8 +61,8 @@ impl MediaModel for Media {
         IMAGE_PLACEHOLDER
     }
 
-    fn image_token(&self) -> u32 {
-        IMAGE_TOKEN_ID
+    fn image_token(&self) -> Option<u32> {
+        Some(IMAGE_TOKEN_ID)
     }
 
     fn part_separator(&self) -> &str {
@@ -111,7 +111,7 @@ mod tests {
             Cow::Borrowed(IMAGE_PLACEHOLDER)
         ));
         assert_eq!(m.image_marker(), IMAGE_PLACEHOLDER);
-        assert_eq!(m.image_token(), 129_264);
+        assert_eq!(m.image_token(), Some(129_264));
         assert_eq!(m.part_separator(), "\n\n");
         assert_eq!(m.part_join(), PartJoin::Uniform("\n\n"));
     }
@@ -131,7 +131,9 @@ mod tests {
         assert_eq!((patches.n_vit_h, patches.n_vit_w), (39, 39));
         assert_eq!(patches.bf16.len(), 39 * 39 * 3 * 14 * 14);
         assert_eq!(
-            image_span(&patches.plan, m.image_token()).ids.len(),
+            image_span(&patches.plan, m.image_token().expect("chat image token"))
+                .ids
+                .len(),
             p.span_len
         );
     }

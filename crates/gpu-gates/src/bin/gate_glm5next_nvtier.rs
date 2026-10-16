@@ -1,14 +1,16 @@
 //! GPU gate for GLM-5.3-Flash's attach of the NVMe expert tier (the split dial's arena, `Body::open_placed`'s host run
-//! through the common `host_run`): the five clauses of `shared/nvtier_family.rs` (`plan`, `attach`, `bits`, `refuse`,
-//! `residency`) on the gate placement — in the fixture tier the `q6kdown` variant (`tools/fixture-variants.tsv`: Q6_K
-//! routed downs, every routed layer on the host), planned under the header's card budget — a paged arm against an
-//! all-RAM arm on the same file, the residency off.
+//! through the common `host_run`): the six clauses of `shared/nvtier_family.rs` (`plan`, `attach`, `bits`, `card`,
+//! `refuse`, `residency`) on the gate placement — in the fixture tier the `q6kdown` variant
+//! (`tools/fixture-variants.tsv`: Q6_K routed downs, every routed layer on the host), planned under the header's card
+//! budget — a paged arm against an all-RAM arm on the same file, the residency off. GLM's load attaches the step
+//! port's card leg, so the paged arm runs on both arena memories: the host leg's (`anon`) for `bits` and the card
+//! leg's (`pinned`) for `card`.
 //!
 //! Each arm's host room and arena reach the plan through `PlanInputs` (`room`, `arena`), so the gate sets no
-//! environment: the all-RAM arm's room is the plan's need, the paged arm's is the split's floor F (read off the
-//! `HostRoomFloor` refusal) plus an arena of the slot sets the family sizes from the file (`paged_slots`: at most
-//! [`nvtier_family::SLOTS`], fewer where the need leaves less above F). One prompt call of [`PROMPT`] prose ids, then
-//! [`STEPS`] greedy steps, on each arm; one load at a time.
+//! environment beyond the paged arm's child's arena memory: the all-RAM arm's room is the plan's need, the paged
+//! arm's is the split's floor F (read off the `HostRoomFloor` refusal) plus an arena of the slot sets the family
+//! sizes from the file (`paged_slots`: at most [`nvtier_family::SLOTS`], fewer where the need leaves less above F).
+//! One prompt call of [`PROMPT`] prose ids, then [`STEPS`] greedy steps, on each arm; one load at a time.
 //!
 //! GLM's own refusal, beside the family's (`refuse nextn-room`): the draft layer's routed experts are the host's
 //! beside the trunk's, a plan of their own, so the NextN plan splits the trunk at the room less them
@@ -55,7 +57,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::residency::PlanRoom;
     use bloomery_gpu_gates::residency38::{GLM_CARD, Seqs, reserve_checkpoints};
-    use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, tier};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, record, tier};
     use bloomery_gpu_glm5next::{Body, PrefillMode, checkpoint_price};
     use bloomery_levers::{GlmAt, GlmWhy, HostCfg, glm_residency_at_plan, glm_unset};
     use gguf::Split;
@@ -300,6 +302,17 @@ mod gate {
             Ok(out)
         }
 
+        fn eager(&self, s: &mut Session<Body>) -> Result<(), GateError> {
+            s.clear()?;
+            s.model_mut().set_mode(StepMode::Eager);
+            Ok(())
+        }
+
+        /// The placed load (`Body::load_placed`) attaches the step port's card leg after its tier cards.
+        fn card_leg(&self) -> bool {
+            true
+        }
+
         fn finish(&self, mut s: Session<Body>) -> Result<(), GateError> {
             s.clear()?;
             drop(s);
@@ -362,6 +375,7 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&tier::acts_on(&[])?)?;
+        record::at_main(NAME, record::GATE_NVTIER);
         crate::gate_card::init()?;
         glm5next_tier::init_file()?;
         let path = glm5next_tier::model_path()?;

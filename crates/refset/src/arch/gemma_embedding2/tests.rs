@@ -1,6 +1,6 @@
 use super::{
-    ARCH, MMPROJ_BF16, MMPROJ_BF16_SHA256, MODEL, MODEL_SHA256, PROFILE, SERVER, TEXT, TEXT_CPU,
-    TOWER, TOWER_CPU,
+    ARCH, MMPROJ_BF16, MMPROJ_BF16_SHA256, MODEL, MODEL_SHA256, PROFILE, SERVER, SERVER_CPU, TEXT,
+    TEXT_CPU, TOWER, TOWER_CPU,
 };
 use crate::RefError;
 use crate::emb2::tests::{check, header, remove, set_dir};
@@ -40,12 +40,13 @@ type FileCase<'a> = (Kind, &'a Family, Vec<(&'a str, &'a str)>, &'a str);
 /// the trailer is written, and the text the error names.
 type RefusedCase<'a> = (Kind, &'a Family, (&'a str, &'a str), bool, &'a str);
 
-const ALL: [(Kind, &Family); 5] = [
+const ALL: [(Kind, &Family); 6] = [
     (Kind::Text, &TEXT),
     (Kind::TextCpu, &TEXT_CPU),
     (Kind::Tower, &TOWER),
     (Kind::TowerCpu, &TOWER_CPU),
     (Kind::Server, &SERVER),
+    (Kind::ServerCpu, &SERVER_CPU),
 ];
 
 /// Each family takes a set of its own kind and device, of the pinned files,
@@ -75,12 +76,14 @@ fn each_family_takes_a_set_of_its_kind() -> Result<(), RefError> {
 #[test]
 fn a_set_of_another_kind_or_device_is_foreign() -> Result<(), RefError> {
     let dir = set_dir("kind")?;
-    let cases: [(Kind, &Family, &str); 5] = [
+    let cases: [(Kind, &Family, &str); 7] = [
         (Kind::TextCpu, &TEXT, "device \"cpu\""),
         (Kind::Text, &TEXT_CPU, "device \"cuda\""),
         (Kind::TowerCpu, &TOWER, "device \"cpu\""),
         (Kind::Tower, &TOWER_CPU, "device \"cuda\""),
         (Kind::Server, &TEXT, "emb2 \"server\""),
+        (Kind::ServerCpu, &SERVER, "device \"cpu\""),
+        (Kind::Server, &SERVER_CPU, "device \"cuda\""),
     ];
     for (kind, family, want) in cases {
         match check(&dir, family, &header(&PROFILE, ARCH, kind, &[]), true) {

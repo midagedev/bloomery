@@ -20,6 +20,7 @@
 //! reads at a terminal.
 
 mod api;
+pub use api::embeddings;
 pub mod decide;
 pub mod dsml;
 pub mod embed;

@@ -38,11 +38,11 @@ budget solver.
 | **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), `gate-engram`'s eviction clause (`86022f32`, answer 18). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the V4.1 DSpark draft fixture, still unpublished (only a draft reader refuses, [#159](https://github.com/midagedev/bloomery/pull/159)). `glm5next/corpus-prose.ids`, `engram/corpus-prose.ids` and `fx_ref_glm5next_vis_taps` are on the refset dataset since 2026-10-14 ([#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6168041480)). The first cc 12.1 pass is section 6 |
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
 | **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6) | nothing |
-| **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8) | the card leg, the decode kernels that read the experts from the arena's slots (contributor, answer 19) |
-| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words. Node 1's tier server, the load's plan from node 1's census, and both ends of a lost node run as two processes on one Spark over the loopback interface (9.5, items 5 and 6) | the placement half's engine side (contributor, answer 20): section 10 lists what is left; the protocol half, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828) (contributor): the `Link` seam, the counter relay (section 9.5, item 2) and the RDMA link on one machine (items 1, 3, 4 and 7) are in; a tier node off this host (the lever takes loopback addresses only, and the channel has no authentication) and the N = 2 run are left |
+| **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8). The card leg is in: on a pinned arena GLM-5.3-Flash's decode steps compute the arena's experts on the card from their slots (8.2) | an arena at serving defaults; V4.1 on the card leg, whose load attaches none yet (section 8) |
+| **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words. Node 1's tier server, the load's plan from node 1's census, and both ends of a lost node run as two processes on one Spark over the loopback interface (9.5, items 5 and 6) | the placement half's engine side (contributor, answer 20): section 10 lists what is left; the protocol half, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828) (contributor): the `Link` seam, the counter relay (section 9.5, item 2) and the RDMA link on one machine (items 1, 3, 4 and 7) are in. Private IPv4 node binds connect independent RDMA ends (9.5, item 5), with no channel authentication. This map records no N = 2 engine rate, and the independent-capacity load adapter is left |
 
-Files the open work touches: P1, the unpublished V4.1 DSpark draft fixture; P4, the card's gather kernels that read the arena in
-`crates/gpu/src/host/nvtier.rs` (the card leg); P5, `crates/placement` (`Machine`, `nodes_scale`),
+Files the open work touches: P1, the unpublished V4.1 DSpark draft fixture; P4, V4.1's attach of the card leg (`HostTier::attach_arena_leg` in
+`crates/gpu/src/host/mod.rs`, the leg in `crates/gpu/src/host/arena_leg.rs`); P5, `crates/placement` (`Machine`, `nodes_scale`),
 `crates/gpu/src/host/link.rs`, `link/pump.rs` and `link/rdma.rs` (the `Link` seam, the counter relay and the RDMA end)
 and the tier server (9.5, items 5 and 6).
 
@@ -364,7 +364,7 @@ with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemG
 | CPU expert compute | stays possible but pointless: 20 Arm cores against 48 SMs on the same bytes. It is the path the fixture tier exercises (section 4) |
 | The pool's bandwidth | stays, as the single term (section 5) |
 | Page cache of the model file plus the device copy | stays and doubles the footprint until dropped; `nvtier.rs:12-30` already drops pages after use (`MADV_DONTNEED`, the `release_union` path) for the NVMe tier |
-| NVMe → DRAM stream for models above the pool | stays; ~~its rate on a Spark is `[unverified]`~~ its rate depends on the drive (section 8). Today the NVMe tier lends its RAM slots to the host leg (`crates/gpu/src/host/nvtier.rs:1-9`), so the CPU computes those experts; on one pool the card can read the same slots without a copy, so the card computes them (P4, section 8) |
+| NVMe → DRAM stream for models above the pool | stays; ~~its rate on a Spark is `[unverified]`~~ its rate depends on the drive (section 8). On a pinned arena (the Spark's default) the card leg computes a decode step's experts from the tier's RAM slots in place, with no copy; the host leg, so the CPU, computes them on an anonymous arena, in a prompt's batch and for a family whose load attaches no card leg (P4, section 8) |
 | KV cache bytes | stay, and they come out of the same pool |
 
 ### 7.2 The pool invariant (#16)
@@ -394,7 +394,8 @@ bytes to the NVMe tier's floor (section 8).
 A model larger than one Spark's pool keeps its overflow on the NVMe tier, and on one pool the card computes those
 experts from the tier's slots in place (answer 12). The read rates that choice rests on are measured (8.1). With S7 the
 arena on a Spark is write-combined pinned pages by default (`BLOOMERY_NVTIER_MEM` unset or `auto`; `anon` keeps the
-anonymous mapping), and the card leg is the contributor's next piece (answer 19). P4 is done when GLM-5.3-Flash
+anonymous mapping), and GLM-5.3-Flash's card leg computes a decode step's arena experts from those pages on the card
+(8.2). P4 is done when GLM-5.3-Flash
 `UD-Q4_K_XL` or V4.1 `Q3_K_M` answers on one Spark with the card computing from the slots.
 
 **The load at serving defaults ([#100](https://github.com/midagedev/bloomery/pull/100)).** Both models load at serving defaults on one Spark and answer. The NVMe
@@ -424,9 +425,9 @@ measures the rate. The CPU computes nothing on the decode path, which matches se
 
 **The owner.** The unified tier ([`tierengine.md`](../research/tierengine.md)): one residency across the card, RAM
 and NVMe. On an integrated device its card and RAM levels are one pool, so the residency has two levels, the pool and
-the NVMe drive. Its slot seam hands a filled slot's address to the card leg instead of the host leg. Its design for an
+the NVMe drive. Its slot seam hands a filled slot's place to the card leg instead of the host leg. Its design for an
 integrated device is `tierengine.md` (h). S7 there (the pinned arena, `device_slot` and the `devmap` tests, run on a
-GB10 and an RTX 5090) is in, and the card leg that reads from the slots is the contributor's (answer 19).
+GB10 and an RTX 5090) and the card leg (8.2) are in.
 
 ### 8.1 What was measured
 
@@ -465,12 +466,46 @@ bound by the tier's misses, whose flow model is the unified tier's. Reads of exp
 fill uses, ran at 4.6 to 5.5 GB/s on these two drives ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6128568288), row 3; `tierengine.md` (j) takes
 that curve).
 
+### 8.2 The card leg
+
+On a pinned arena the card computes a decode step's NVMe tier experts from the arena's slots, and the host computes
+none of them. The host still serves the step's other host experts (the plan's host segment, read through the file
+mapping) and every expert of a prompt's batch.
+
+How a step runs ([`tierengine.md`](../research/tierengine.md) (h) item 1, `crates/gpu/src/host/arena_leg.rs`):
+
+1. At the go the host holds the step's arena ids filled and pinned (`NvTier::hold_for_card`) and writes each part's
+   word offset in the arena beside the handoff (`NvTier::card_offsets`).
+2. After the row's wait the card runs six launches a layer: the activation's q8_1, the gate and up entry, the slots'
+   q8_1, the down entry, the weighted sum, and its add to the row's host sum. The entries read an expert at word
+   offsets of the arena, one per quant type: gate and up in Q4_K or Q5_K, down in Q5_K or Q6_K.
+3. The hold drops at the row's next go, which the card enqueues after the leg's launches, so the card has read the
+   slots by then.
+
+When it runs: the arena gives the card an address (`BLOOMERY_NVTIER_MEM` is `pinned`, or `auto` on an integrated
+device), the family attaches it (GLM-5.3-Flash today), the page carries one column a row, the load has no expert tier
+card and starts no residency machine, and every covered layer's types have entries, its parts start on 4-byte words
+and it has a slot for each id a pass's rows hold at once (the rows times `n_used`). The `nvtier` record's `card_leg`
+says `on` or why the leg is off (`off_anon`, `off_expert_tier`, `off_cols`, `off_types`, `off_words`, `off_slots`,
+`off_residency`, `unattached`), and `card_ids` counts the ids the card read.
+
+The card quantizes the activation as q8_1 (an f32 scale per 128 values) where the host leg's K-quant dots take
+Q8_2X4 (a bf16 scale per 32), and it sums those experts in its own order, beside the host's sum, so the tokens can
+part from the all-RAM load's after some steps. `gate-gpu-glm5next-nvtier` holds the rest: the host leg's arm (an
+`anon` arena) equals the all-RAM arm bit for bit, and the card leg's arm claims on the step port only the ids the leg
+held and replays its eager steps bit for bit. The `gate-gpu-lib` tests hold the bits below
+it: `hw_an_arena_part_computes_as_its_stack_rows` and
+`hw_a_refilled_pinned_slot_reads_as_its_new_expert_in_the_arena_entries` the entries against the stack kernels, and
+`hw_the_card_leg_sums_its_held_ids_as_the_stack_launches_do` a row's sum after the leg against the stack launches
+over the same experts. No gate pins a count of exact tokens on this path yet.
+
 ## 9. Several Sparks (P5)
 
 P5 runs one model across N linked Sparks, N = 2 first, and no code may assume N = 2 (answer 13). The design came from
 a read-only round (2026-10-11). Since then the fabric and the protocol probe ran on two Sparks with one direct cable
 (9.1, 9.6). The figures in 9.7 and 9.8 are still `[derived]` from section 5's cost model, the repo's byte counts and the
-assumptions stated once in 9.7. No engine code has run on two Sparks.
+assumptions stated once in 9.7. The engine's node Bind exchanges independent RDMA endpoints over its TCP
+control channel (9.5); no measured engine rate is claimed here.
 
 The work splits in two halves, as proposed in [#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6134316241) and accepted in answer 20. The
 placement half needs no Arm protocol: `host` and `unified` into `nodes[0]`, the per-node shape of 9.2 and the unit gate
@@ -579,9 +614,10 @@ pub struct Link { pub rail: u64 /* bytes/s, one message */, pub round_trip_ns: u
   Each machine has one head stage, but a remote's routed-only model has no head tensors. The batch's returned rows
   are reserved on node 0's host once per remote, and its staging and scratch on each remote card.
   Each integrated spec keeps its own free reading as its own pool. The `nodes_scale` fixtures
-  use this entry point. The engine load still uses the single-node `plan_tiers` path: tier-node addresses are
-  loopback-only and share this host's physical pool, not extra independent capacity. On one Spark, the loopback
-  clause checks the plan inputs but cannot prove the remote census's origin.
+  use this entry point. The engine load still uses the single-node `plan_tiers` path: remote card bytes are
+  conservatively charged to node 0's physical pool, not credited as extra independent capacity. Private IPv4
+  tier-node addresses require RDMA, with each process holding its own page. On one Spark, the loopback clause
+  checks the plan inputs but cannot prove the remote census's origin.
 - **Node 1's figures come from a remote census.** The census reads only this process's CUDA devices. Node 1's census row
   reaches node 0 over the control channel before `plan_tiers` runs, and node 0 makes node 1's `CardSpec` from it (9.5
   item 5). Node 1's `MemAvailable` reading must reach node 0 the same way once a plan term reads it.
@@ -739,19 +775,22 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
 5. **The remote is another process.** Built and proved as two processes on one Spark, over the loopback interface.
    Node 1 runs `tier_server`, which serves the expert tier of one load over a control channel
    (`crates/gpu/src/host/node.rs`): TCP, one connection a load, one reply a request, then it exits.
-   `BLOOMERY_TIER_NODES` names the node of each tier; it takes loopback addresses only, because the page below is this
-   host's memory and the channel has no authentication. On connect node 1 sends its census: each device's census row.
+   `BLOOMERY_TIER_NODES` names the node of each tier; it takes loopback or private IPv4 addresses. An off-host node
+   requires `BLOOMERY_TIER_LINK=rdma`. The unauthenticated control channel belongs on a trusted network.
+   On connect node 1 sends its census: each device's census row.
    The load (`Place::on`) and the gate read it with one function (`node_cards`) and plan (b′) with node 1's card as
    the tier card (`spec_of_device` of the row node 1 sent) before anything loads. Node 1 refuses an open whose rows are
    not the tier's set, then loads the rows of node 0's plan from its own copy of the file, each tensor checked against
    node 0's description and each row's bytes against their sha256 in node 0's file (both nodes hash the tier's rows, not
    the whole file), captures its graphs from the go order it is sent, and launches a replay on a launch message.
    `TierCard` keeps the stage side, and its tier side is either a card of this process or a node (`TierWork` is the part
-   both run). The page is the `Link` seam's shared page in one `/dev/shm` file, created mode 0600 and removed once both
-   ends hold it, that both processes map and register with their cards (`Link::across`, `MappedHost::shared_file`).
-   `BLOOMERY_TIER_LINK=loopback` and `BLOOMERY_TIER_LINK=rdma` with a tier on a node are refused by name: both ends
-   of either link hold pages of the stage card's process. Connecting one end per process (item 1) remains to replace
-   that file; the launch message can then ride in the first image. Not yet: the census carries no host room, which
+   both run). A shared bind on loopback maps one `/dev/shm` file, created mode 0600 and removed once both ends hold
+   it (`Link::across`, `MappedHost::shared_file`). An RDMA bind allocates one page per process and exchanges each
+   `RdmaEnd` endpoint through the same Bind request and reply. The control socket's local IPv4 GID selects the RoCE
+   port. Each end carries its tier's crossings and holds its own page, queue pair and pump. Reset stops both ends,
+   resets both writers, then both readers, with a control reply between phases. The launch message remains one
+   control round trip per replay. `BLOOMERY_TIER_LINK=loopback` still needs both pages in one process and is refused
+   with a node tier. Not yet: the census carries no host room, which
    joins it with the plan term that reads it once each node has a pool of its own in the plan (9.2); a remote tier
    serves no prompt batch (the batch call refuses it by name);
    only Qwen3.8 opens a tier on a node, and GLM and V4.1 refuse it by name. `just gate-gpu-qwen38-nodes` holds the
@@ -1147,16 +1186,14 @@ Where the gate holds a clause differently from its words below, the clause says 
   only. This rate must be positive when a table is read from NVMe; zero is allowed when none is. Unread rows and
   tables moved to the host add no fill. The row width is an input, the model's embedding length. The routed ids'
   arena misses remain the separate `Workload::fills` term.
-- **Expected sets.** The table of 9.8, pinned from a derivation script that moves into `tools/` beside the gate with its
-  own self-test, so the pins have one derivation. ~~The script is not in the tree yet. Until it is, the gate pins the
-  predictor's own cells, which match 9.8's table in criteria 2 and 7 and differ in criterion 5 (clause 5).~~ The script
-  is `tools/flow/nodes_scale.py`, with no code or method shared with the planner: node 0's share in real numbers by
-  9.2's rule, found by bisection, and each window an expectation over the count tuples of a token's slots, built one
-  slot at a time. It reads `crates/placement/tests/nodes_scale_inputs.tsv`, one row per input with its kind (measured,
+- **Expected sets.** `tools/flow/nodes_scale.py` derives the gate's cells with no code or method shared with the
+  planner: node 0's share in real numbers by 9.2's rule, found by bisection, and each window an expectation over the
+  count tuples of a token's slots, built one slot at a time. It reads `crates/placement/tests/nodes_scale_inputs.tsv`, one row per input with its kind (measured,
   derived or assumed) and source, and writes the 144 cells (a model, N, λ and A, at the gate's `RULER` and S₁ 1,000 and
   3,000 and at a 4 % ruler and S₁ 3,000) to `nodes_scale_cells.tsv` beside it; `--table` prints 9.8's table at the
-  gate's inputs and 9.7's (a) rows, and `--check` holds the file and both doc tables to them. Each value carries the
-  largest change one id moved between two used nodes makes, because the planner splits whole ids. Where that band holds
+  gate's inputs, 9.7's (a) rows and the N = 2 paging table below. `--check` holds the file and all three doc tables to
+  the derivation. Each value carries the largest change one id moved between two used nodes makes, because the
+  planner splits whole ids. Where that band holds
   a line (the NIC's half, the link share's tenth, twice the ruler), the cell names an edge, the gate pins its side by
   hand, and the planner's value is held to the band besides. `--self-test` runs hand-worked cases, the refusals and
   `--check`; `just check-recipes` runs it.
@@ -1200,6 +1237,27 @@ Where the gate holds a clause differently from its words below, the clause says 
   - M7: `ruler` fixed at 2 % instead of read from the machine → clause 7 red on a synthetic machine whose ruler is 4 %
     (Qwen3.8 at N = 2 then gains under 8 % and must name node 1 idle).
 
+The N = 2 paging table is `[derived]` from the synthetic shapes and pool budgets above, printed by
+`python3 tools/flow/nodes_scale.py --table`. The rows use the gate's 10 ‰ ruler and S₁ 3,000 tok/s; paging is unchanged
+at its other ruler and prompt-rate inputs. Each node's count rounds the real-number split to the nearest id.
+`expected_sets` holds the planner to the total exactly and to each node within one id. These are not plans of the
+model files or measured NVMe reads. At A high, V4.1's derived paging is on node 1 only.
+
+| N = 2 at the gate's inputs | A | λ (µs) | Paged ids, total | Paged ids on node 0 | Paged ids on node 1 |
+|---|---|---|---|---|---|
+| V4.1 | low | 25 | 62 | 11 | 51 |
+| V4.1 | low | 70 | 62 | 28 | 34 |
+| V4.1 | high | 25 | 67 | 0 | 67 |
+| V4.1 | high | 70 | 67 | 0 | 67 |
+| GLM | low | 25 | 0 | 0 | 0 |
+| GLM | low | 70 | 0 | 0 | 0 |
+| GLM | high | 25 | 0 | 0 | 0 |
+| GLM | high | 70 | 0 | 0 | 0 |
+| Qwen3.8 | low | 25 | 0 | 0 | 0 |
+| Qwen3.8 | low | 70 | 0 | 0 | 0 |
+| Qwen3.8 | high | 25 | 0 | 0 | 0 |
+| Qwen3.8 | high | 70 | 0 | 0 | 0 |
+
 ## 10. Still open
 
 Each open item; the owner is named where one is agreed. An item that a measurement closed is in the list after it.
@@ -1217,10 +1275,11 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   floors of 120,017,099,844 B and 120,013,539,120 B in its refusals.) With a lower `BLOOMERY_CARD_BUDGET` given as well
   (`BLOOMERY_CARD_BUDGET=70G BLOOMERY_NVTIER_BYTES=23G`), GLM plans a 38-slot arena (24,696,061,952 B), loads and
   answers (on `905e7ac5`; under a given card budget this change plans as before).
-- The card leg: the contributor (answer 19).
-- `probe_nvread`'s per-part drop (`evict_rows`) leaves some pages of a part resident on ext4, so a run redraws batches.
-  The cause is not proven; one guess is large folios that straddle two experts
-  ([#71](https://github.com/midagedev/bloomery/issues/71#issuecomment-6126758679)).
+- V4.1 on the card leg: its load attaches none yet, so its arena experts stay with the host leg (8.2).
+- `probe_nvread` checks each per-part eviction with `mincore`. If pages remain, it retries over the whole shard
+  and prints the retry outside the timed arms. This covers large page-cache folios that cross an expert or tensor
+  boundary ([#137](https://github.com/midagedev/bloomery/issues/137)). A batch must still have no resident pages
+  before the cache arm; pages held by another process can still force a redraw.
 
 **P5.**
 - The `[derived]` bands and criteria of 9.7 and 9.8 still use their first inputs. `nodes_scale`'s derivation script, in
@@ -1236,9 +1295,10 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   with the N − 1 plan on the same link, which the planner can choose, not on the N − 1 plan's own fabric.
 - The placement half's engine side: the contributor (answer 20). A remote node's census reaches node 0 over the
   control channel before the plan, and the load plans with node 1's card from it (9.5 item 5); a tier node is on this
-  host only (loopback addresses, no authentication). The node gate constructs independent census-backed machines
-  and their `NodeBudget` and `Terms` inputs (9.2); the loopback load retains one physical pool. Left: remote load
-  selection and the adapter from routed assignment to loaded rows, node 1's host room in the census with the plan
+  host through a shared file, or private IPv4 nodes through independent RDMA ends (no authentication). The node
+  gate constructs independent census-backed machines and their `NodeBudget` and `Terms` inputs (9.2); the load
+  retains the conservative single-pool bound. Left: the adapter from routed assignment to loaded rows and
+  independent capacity in the load, node 1's host room in the census with the plan
   term that reads it, the router's counts in the split (9.2), and decode at n = N in the predictor (9.8). The node
   plans' card terms use the generic workstation card constants, not the program's `machine_for_experts` constants.
 - GLM's hit rates are assumptions; V4.1's come from a replay (9.7).
@@ -1301,6 +1361,7 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   On one Spark at `9cfe31d7`, with both RDMA ends on one RoCE port (the NIC's own loopback), the probe read 1.50, 1.59
   and 1.69 µs over that session's t_typical. At the three sizes checked, the cable's excess falls inside the band the
   one-port reading predicted for it (1.2 to 2.0 µs).
+- ~~The card leg~~ (answer 19): GLM-5.3-Flash's decode steps compute the arena's experts on the card (8.2).
 
 ## 11. Maintainers' decisions
 
@@ -1384,7 +1445,7 @@ Added 2026-10-13 ([#13](https://github.com/midagedev/bloomery/issues/13#issuecom
     measurements. Verification may run on any card, and the maintainers take a result checked on the contributor's card
     (GB10, RTX 5090 or others) as it is. The A6000 is the maintainers' card for their own timing; the public numbers
     come from the 3090 alone and the 3090 with the A6000.
-    *Now: S7 is in, and the card leg is open (section 8). Since `8fb237f2` any card's number with its evidence can be
+    *Now: S7 and the card leg are in (8.2). Since `8fb237f2` any card's number with its evidence can be
     published, in a table of its own for that card (`AGENTS.md`).*
 20. **P5:** split as proposed. The placement half need not wait for S10 and goes up when ready; where it overlaps the
     maintainers' train, they rebase. The protocol half starts when the contributor judges P1's protocol part closed from

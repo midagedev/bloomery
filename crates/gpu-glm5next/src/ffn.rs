@@ -907,7 +907,7 @@ pub(crate) fn back(
     } else {
         &s.sh_y
     };
-    boundary.enqueue_back_of(stream, p.row)?;
+    boundary.enqueue_back_of(stream, p.row, l)?;
     gpu.elem()
         .enqueue_add(stream, boundary.hsum_of(p.row)?, shadowed, n, &mut s.out)
 }

@@ -1030,9 +1030,11 @@ EOF
       export STUB_DIR="$t"
       for k in "$@"; do export "$k"; done
       export PATH="$t/bin:$PATH" TIMING_GPU="$A6000" LEASE_GPU_POLL=1 LEASE_GPU_REPORT=1 LEASE_GPU_WAIT=2
+      export BLOOMERY_LEASE_PROC="$t/nothing" LEASE_OWNER_PID=1
       lease_gpu_idle 2>&1
     ) || RC=$?
   }
+  printf '0\n' > "$t/calls"
   idle
   check a-idle-rc "$RC" 0
   matches a-idle-line "^\[lease\] timing card idle: $A6000\$" "$OUT"
@@ -1089,34 +1091,35 @@ EOF
   matches tag-local-busy '^    local-apps: \[4242, 100 MiB;\] \[timing-card-busy\]$' "$OUT"
   unset TIMING_LOCAL
   # ---- lease_pid_is_ours ----
-  # A made-up /proc tree (BLOOMERY_LEASE_PROC, as the card tests use it: this runs on the Mac too):
-  # pid 101 holds the lease's descriptor 9 as the runner does, 102 descends from it without the
-  # descriptor, 103 is foreign under init, and nothing holds 4000000. The runner is this shell,
-  # which opens the lease on its own descriptor 9.
+  # Independent descriptor and ancestry proofs in a synthetic /proc tree. Runner 103 and
+  # disjoint fixture pids make the collision check independent of the shell's pid.
   proc=$t/proc
-  mkdir -p "$proc/$$/fd" "$proc/101/fd" "$proc/102" "$proc/103"
+  runner=103
+  own=$((runner + 1)) descendant=$((runner + 2)) foreign=$((runner + 3)) gone=$((runner + 4))
+  mkdir -p "$proc/$runner/fd" "$proc/$own/fd" "$proc/$descendant" "$proc/$foreign"
   exec 9>"$t/lease"
-  ln -s "$t/lease" "$proc/$$/fd/9"
-  ln -s "$t/lease" "$proc/101/fd/9"
-  printf '101 (own child) S %s 1 0 0 0 0\n' "$$" > "$proc/101/stat"
-  printf '102 (own grandchild) S 101 1 0 0 0 0\n' > "$proc/102/stat"
-  printf '103 (foreign) S 1 1 0 0 0 0\n' > "$proc/103/stat"
-  LEASE_OWNER_PID=$$ BLOOMERY_LEASE_PROC=$proc
+  ln -s "$t/lease" "$proc/$runner/fd/9"
+  ln -s "$t/lease" "$proc/$own/fd/9"
+  printf '%s (own descriptor) S 1 1 0 0 0 0\n' "$own" > "$proc/$own/stat"
+  printf '%s (foreign) S 1 1 0 0 0 0\n' "$foreign" > "$proc/$foreign/stat"
+  LEASE_OWNER_PID=$runner BLOOMERY_LEASE_PROC=$proc
   # A numeric pid is answered in silence: a guard asks per row and per poll, so the not-ours path
   # prints nothing (the named line is the non-numeric pid's alone).
-  RC=0 OUT=$(lease_pid_is_ours 101 2>&1) || RC=$?
+  RC=0 OUT=$(lease_pid_is_ours "$own" 2>&1) || RC=$?
   check own-fd9-rc "$RC" 0
   check own-fd9-silent "$OUT" ''
-  RC=0 OUT=$(lease_pid_is_ours 102 2>&1) || RC=$?
+  printf '%s (own child) S %s 1 0 0 0 0\n' "$own" "$runner" > "$proc/$own/stat"
+  printf '%s (own grandchild) S %s 1 0 0 0 0\n' "$descendant" "$own" > "$proc/$descendant/stat"
+  RC=0 OUT=$(lease_pid_is_ours "$descendant" 2>&1) || RC=$?
   check own-descend-rc "$RC" 0
-  RC=0 OUT=$(lease_pid_is_ours 103 2>&1) || RC=$?
+  RC=0 OUT=$(lease_pid_is_ours "$foreign" 2>&1) || RC=$?
   check foreign-rc "$RC" 1
   check foreign-silent "$OUT" ''
-  RC=0 OUT=$(lease_pid_is_ours 4000000 2>&1) || RC=$?
+  RC=0 OUT=$(lease_pid_is_ours "$gone" 2>&1) || RC=$?
   check gone-rc "$RC" 1
   check gone-silent "$OUT" ''
   # The runner itself (a runner that execs into its engine keeps LEASE_OWNER_PID's pid) is ours.
-  RC=0 OUT=$(lease_pid_is_ours $$ 2>&1) || RC=$?
+  RC=0 OUT=$(lease_pid_is_ours "$runner" 2>&1) || RC=$?
   check own-self-rc "$RC" 0
   RC=0
   OUT=$(lease_pid_is_ours not-a-pid 2>&1) || RC=$?
@@ -1378,8 +1381,15 @@ EOF
           exec 9> "$2/lock"
           flock -n 9 || exit 75
           trap "echo outer-trap; exit 143" TERM
-          # Leave a scheduling gap between deciding to escalate and delivering KILL.
-          kill() { case "$*" in "-s KILL -- "*) sleep 1.1 ;; esac; builtin kill "$@"; }
+          # Leave a scheduling gap before delivering KILL to the surviving group.
+          kill() {
+            case "$*" in
+              "-s KILL -- -"*)
+                [ "$SECONDS" -lt "$deadline" ] || { echo "cleanup budget exhausted before group KILL" >&2; return 70; }
+                sleep 1.1 ;;
+            esac
+            builtin kill "$@"
+          }
           echo "grace=${LEASE_STOP_GRACE:-unset}"
           [ "$4" != owned ] || PATH="$2/../fork-bin:$PATH"
           HELD_PID="$2/child" LEASE_BOUNDED_PIDFILE="$2/monitor" lease_bounded 60 "$3"
@@ -1397,6 +1407,7 @@ EOF
       until [ -s "$t/nested-$enclosing-eof" ] || [ "$i" = 10 ]; do sleep 0.1; i=$((i + 1)); done
       check "bounded-nested-$enclosing-eof" "$([ -s "$t/nested-$enclosing-eof" ] && echo yes || echo no)" yes
       check "bounded-nested-$enclosing-trap" "$(grep -E '^(outer-trap|next-arm)$' "$t/nested-$enclosing-out")" outer-trap
+      check "bounded-nested-$enclosing-cleanup" "$(grep '^\[bound\].*cleanup budget' "$t/nested-$enclosing-out")" ''
       want_grace=unset
       [ "$enclosing" != owned ] || want_grace=4
       check "bounded-nested-$enclosing-grace" "$(grep '^grace=' "$t/nested-$enclosing-out")" "grace=$want_grace"

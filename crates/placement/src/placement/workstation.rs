@@ -1402,7 +1402,7 @@ mod tests {
         assert_eq!(swapped.tiers[0].name, A6000.name);
         assert_eq!(
             swapped.tiers[0].reserve_bytes(),
-            7 + batch.card().expect("card reserve")
+            Some(7 + batch.card().expect("card reserve"))
         );
     }
 
@@ -1512,7 +1512,7 @@ mod tests {
             .filter(|(n, _)| n == TIER_BATCH_HOST_RESERVE)
             .collect();
         assert_eq!(rows, vec![&(TIER_BATCH_HOST_RESERVE.to_string(), 200)]);
-        assert!(m.tiers.iter().all(|t| t.reserve_bytes() == 15));
+        assert!(m.tiers.iter().all(|t| t.reserve_bytes() == Some(15)));
         let huge = TierBatchBytes {
             host: u64::MAX / 2 + 1,
             ..batch

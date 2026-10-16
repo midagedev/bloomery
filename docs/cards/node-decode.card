@@ -1,0 +1,20 @@
+# A placement-identical local versus node run, two alternating rounds per arm.
+# The node has one captured tier graph replay and a bounded fault/drain path per token.
+kind: profile
+question: how many control round trips does a node tier add to a greedy decode token?
+term: completed control request/reply pairs between the end of prefill and the end of decode;
+  accompanying decode time includes the RDMA relay and the same host experts in both arms
+unit: round-trips/token
+predict: 1..4
+condition: gate_qwen38_nodes --decode0 45 64 OUT on Qwen3.8 UD-Q4_K_XL, prompt 32, context 3072,
+  one request, two DGX Sparks over one direct RoCE link; the local arm uses one process with
+  both tiers on one card and the node arm uses one process on each card; use the same budgets
+  and compare every layer's split, output tokens and an untimed full history including logits;
+  every tier layer must receive a routed slot; two alternating rounds per arm under
+  lease-hold.sh, builds finished before either lease is taken; no other CUDA or test process,
+  load average below 1 for 30 seconds, default clock policy, clock/power/temperature and pool
+  witnesses before and after; plain-read ceilings on both cards before and after the sitting,
+  and link byte and latency ceilings in the same sitting
+decide-in: record the count and compare the placement-identical decode times without claiming a speedup
+decide-below: check that a tier graph was replayed during the timed region
+decide-above: trace the extra requests before changing the control path

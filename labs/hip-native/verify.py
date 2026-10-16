@@ -72,7 +72,7 @@ def main():
     if output.is_relative_to(ROOT):
         parser.error("evidence must be outside the source checkout")
     output.mkdir(parents=True, exist_ok=False)
-    result = {"schema": 1, "status": "fail", "checks": [], "cases": [],
+    result = {"schema": 2, "status": "fail", "checks": [], "cases": [],
               "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "host": {"platform": platform.platform(), "cpu": platform.processor()}}
 
@@ -113,7 +113,9 @@ def main():
         result["toolchain"] = subprocess.check_output(["rustc", "-vV"], text=True)
         host = next(line.removeprefix("host: ") for line in result["toolchain"].splitlines() if line.startswith("host: "))
         result["host_target"] = host
-        result["target"] = {"triple": "amdgcn-amd-amdhsa", "cpu": "gfx1100"}
+        result["target"] = {"triple": "amdgcn-amd-amdhsa", "cpu": "gfx1100", "wave_size": 32}
+        result["upstream_sources"] = [{"path": name, "sha256": digest(ROOT / name)} for name in [
+            "crates/gpu/src/cores.rs", "crates/gpu/src/q4k_sel.rs", "crates/qdot/src/lib.rs"]]
         host_flags = "-C target-cpu=native"
         device_flags = "-C target-cpu=gfx1100 -C panic=abort"
         run("fmt", ["cargo", "fmt", "--all", "--", "--check"])
@@ -124,11 +126,21 @@ def main():
         target = ["--release", "--target", "amdgcn-amd-amdhsa", "-p", "bloomery-hip-spike-device"]
         run("device-clippy", device + ["clippy", "-Zbuild-std=core", "--locked", "--no-deps"] + target +
             ["--", "-D", "warnings"], device_flags)
-        run("device-build", device + ["build", "-Zbuild-std=core", "--locked"] + target, device_flags)
+        build_output = run("device-build", device + ["build", "-Zbuild-std=core", "--locked", "--message-format=json"] + target, device_flags)
         run("host-build", ["cargo", "build", "--locked", "--target", host, "--release", "-p", "bloomery-hip-spike"], host_flags)
         binaries = [LAB / f"target/{host}/release/bloomery-hip-spike",
                     LAB / "target/amdgcn-amd-amdhsa/release/bloomery_hip_spike_device.elf"]
         result["binaries"] = [{"path": str(p.relative_to(LAB)), "sha256": digest(p)} for p in binaries]
+        messages = [json.loads(line) for line in build_output.splitlines() if line.startswith("{")]
+        builds = [entry for entry in messages if entry.get("reason") == "build-script-executed"
+                  and "bloomery-hip-spike-device" in entry.get("package_id", "")]
+        if len(builds) != 1:
+            raise RuntimeError("expected one current device build-script-executed record")
+        generated = Path(builds[0]["out_dir"]) / "q4k_core.rs"
+        if not generated.resolve().is_relative_to(LAB / "target"):
+            raise RuntimeError("generated Q4_K core is outside the lab target directory")
+        result["generated_core"] = {"path": str(generated.relative_to(LAB)), "sha256": digest(generated)}
+        (output / "q4k_core.rs").write_bytes(generated.read_bytes())
         result["card"] = card()
         command = [str(p) for p in binaries]
         if args.q4_rows:
@@ -138,19 +150,37 @@ def main():
             command += [str(path), str(args.k), str(args.rows)]
         raw = run("gpu", command)
         result["cases"] = [json.loads(line) for line in raw.splitlines() if line.startswith("{")]
+        numeric = [case for case in result["cases"] if case["operation"] in ("q4_matmul", "dense_ffn")]
+        selected = [case for case in result["cases"] if case["operation"] == "q4_selected"]
         expected = 6 if args.q4_rows else 4
-        if len(result["cases"]) != expected:
-            raise RuntimeError(f"expected {expected} GPU cases, got {len(result['cases'])}")
-        for case in result["cases"]:
+        if len(numeric) != expected or len(selected) != 11 + bool(args.q4_rows) or len(numeric) + len(selected) != len(result["cases"]):
+            raise RuntimeError("unexpected GPU contract case inventory")
+        for case in numeric:
             if not math.isfinite(case["nmse"]) or case["nmse"] > 1e-6:
                 raise RuntimeError("GPU case failed the fixed NMSE <= 1e-6 band")
             case["status"] = "pass"
-        result["acceptance"] = {"nmse_max": 1e-6, "finite_outputs": True}
+        if sorted(case["k"] for case in selected if not case["real_weights"]) != [256, 512, 768, 1024, 1280, 1792, 2048, 2304, 2816, 6144, 20480]:
+            raise RuntimeError("missing selected Q4_K tail or paired-prefix case")
+        real_cases = [case for case in selected if case["real_weights"]]
+        if args.q4_rows and (len(real_cases) != 1 or real_cases[0]["k"] != args.k or real_cases[0]["rows_per_expert"] * 4 != args.rows):
+            raise RuntimeError("selected real Q4_K case differs from the recorded fixture")
+        for case in selected:
+            if case.get("contract") != "selected_bitwise" or case.get("wave_size") != 32 or case.get("launches") != 9:
+                raise RuntimeError("selected Q4_K launch contract differs")
+            if any(case.get(key) is not True for key in ["bitwise_equal", "finite_expected_outputs", "nan_propagation", "fault_and_sentinel"]):
+                raise RuntimeError("selected Q4_K bitwise/finite/fault contract failed")
+            if case.get("steady_host_buffer_allocations") != 0:
+                raise RuntimeError("selected Q4_K steady launch allocated")
+            case["status"] = "pass"
+        result["acceptance"] = {"nmse_max": 1e-6, "finite_outputs": True,
+                                "selected_q4": "bitwise finite, NaN propagation, exact sticky fault and sentinel"}
         clean()
         if git("rev-parse", "HEAD") != head:
             raise RuntimeError("source HEAD moved during verification")
         if any(digest(p) != b["sha256"] for p, b in zip(binaries, result["binaries"])):
             raise RuntimeError("a binary changed during verification")
+        if digest(generated) != result["generated_core"]["sha256"]:
+            raise RuntimeError("generated original Q4_K source changed during verification")
         result["status"] = "pass"
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
         result["error"] = str(error)

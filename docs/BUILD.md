@@ -77,6 +77,28 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 
 Build artifacts land in the workspace root `target/`.
 
+### Checking GEMM references
+
+`just gate-gpu-gemm` runs the reference-worker regressions before the NVIDIA gate. Every reference worker must
+finish; a panic propagates through the case to `gate_gemm`'s failing exit, even if other outputs were already checked.
+It is not an out-of-band value or a host-slot write. The numeric bands, contract bits and untouched-slot checks are
+unchanged.
+
+The host-reference regressions can also run separately:
+
+```sh
+BLOOMERY_ARCH=sm_86 bash tools/gate.sh --oxide --release \
+  -p bloomery-gpu-gates --features gpu --bin gate_gemm -- workers_must_complete
+```
+
+These tests exercise the actual K-quant reference, 32-value checker and packed-Q5_0 comparison, including a panic
+after completed numeric work, all-work panics and initializer panics. They assert the same failing `ExitCode` used by
+the gate's `main`, not a diagnostic string or a positive checked count. They open no card or model, but the binary
+links device code and still needs the CUDA/cuda-oxide build environment. This is host-reference evidence, not a
+kernel gate result. On NVIDIA, use `BLOOMERY_BOX_LOCAL=1 just gate-gpu-gemm` with the Qwen3 model and reference data
+configured as for the recipe; `--case g32_dense`, `--case g32_routed`, `--case g38_iq4nl`, `--case g32_remap` and
+`--case q5_0p_is_the_gemv` select the affected 32-value consumers.
+
 ### The commit a binary names
 
 `bloomery-serve --version` (`bloomery-serve <version> (commit <c>)`) and `/props`' `engine.version` (`<version> (<c>)`) print one value, fixed when the binary is built (`serve::COMMIT`, set by `crates/serve/build.rs`). The build takes it from the first of these that gives one:

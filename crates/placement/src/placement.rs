@@ -193,19 +193,23 @@ impl Card {
         }
     }
 
-    /// The reserves' bytes.
+    /// The reserves' bytes; `None` past u64 bytes.
     #[must_use]
-    pub fn reserve_bytes(&self) -> u64 {
-        self.reserves.iter().map(|(_, b)| b).sum()
+    pub fn reserve_bytes(&self) -> Option<u64> {
+        self.reserves
+            .iter()
+            .try_fold(0u64, |sum, (_, bytes)| sum.checked_add(*bytes))
     }
 
     /// What the card sets aside before any tensor or cache: context,
     /// scratch and reserves. The one owner of that sum: the expert rule's
     /// budget, the budget floor, the headroom and [`Plan::violations`] all
-    /// take it from here. The margin is not in it.
+    /// take it from here. The margin is not in it. `None` past u64 bytes.
     #[must_use]
-    pub fn set_aside_bytes(&self) -> u64 {
-        self.context_bytes + self.scratch_bytes + self.reserve_bytes()
+    pub fn set_aside_bytes(&self) -> Option<u64> {
+        self.context_bytes
+            .checked_add(self.scratch_bytes)?
+            .checked_add(self.reserve_bytes()?)
     }
 
     /// The card's floor under `dense` bytes of uploads and `kv` bytes of
@@ -217,9 +221,15 @@ impl Card {
     /// from here. `None` past u64 bytes.
     #[must_use]
     pub fn floor_bytes(&self, dense: u64, kv: u64, past: u64) -> Option<u64> {
-        [kv, self.set_aside_bytes(), past]
+        [kv, self.set_aside_bytes()?, past]
             .into_iter()
             .try_fold(dense, u64::checked_add)
+    }
+
+    fn bytes_past_u64(&self) -> PlacementError {
+        PlacementError::CardBytesPastU64 {
+            card: self.name.clone(),
+        }
     }
 
     /// The part of the card's context term a census free reading already
@@ -1329,6 +1339,9 @@ pub enum PlacementError {
     /// ([`churn::ChurnPool`]), take more than the plan's host headroom.
     #[error("{0}")]
     ResidencyOverHost(Box<churn::OverHost>),
+    /// A card's reserves, set-aside, load floor or shared-pool total summed past u64 bytes.
+    #[error("card {card}: required card or shared-pool bytes pass u64 bytes")]
+    CardBytesPastU64 { card: String },
     /// A card budget below what the card needs with no expert on it: the
     /// floor counts what the caller holds beside the plan
     /// ([`plan_routed_reserving`]) as the expert rule's budget does.
@@ -2497,7 +2510,7 @@ fn plan_rule<'a>(
         &kv_bytes,
         (n_l, tier_n_l),
         card_budget,
-    );
+    )?;
     // What the caller plans beside this plan on each card comes out of a
     // unified pool too.
     if machine.unified().is_some() {
@@ -2610,7 +2623,10 @@ impl Fill<'_, '_> {
         let uploads = card_uploads(self.model, self.c, self.rows, self.eligible, format)?;
         let budget = i128::from(capped(card, self.card_budget))
             - i128::from(self.kv)
-            - i128::from(card.set_aside_bytes())
+            - i128::from(
+                card.set_aside_bytes()
+                    .ok_or_else(|| card.bytes_past_u64())?,
+            )
             - i128::from(card.margin_bytes)
             - i128::from(self.reserve);
         if let Some(b) = self.card_budget {
@@ -2667,7 +2683,7 @@ fn check_floor(
             kv,
             context: card.context_bytes,
             scratch: card.scratch_bytes,
-            reserves: card.reserve_bytes(),
+            reserves: card.reserve_bytes().ok_or_else(|| card.bytes_past_u64())?,
             margin: card.margin_bytes,
             beside,
         }),
@@ -2701,7 +2717,7 @@ fn check_free_floor(
             kv,
             context,
             scratch: card.scratch_bytes,
-            reserves: card.reserve_bytes(),
+            reserves: card.reserve_bytes().ok_or_else(|| card.bytes_past_u64())?,
             margin: card.margin_bytes,
             beside,
             held: card
@@ -2752,8 +2768,7 @@ pub struct WholeNeed {
     pub kv: u64,
     /// What the program holds past them.
     pub load: WholeLoad,
-    /// The card's floor over all of it ([`Card::floor_bytes`]); `u64::MAX`
-    /// when the sum passes u64 bytes.
+    /// The card's floor over all of it ([`Card::floor_bytes`]).
     pub need: u64,
     /// What the card had: [`Card::read_capped_bytes`].
     pub budget: u64,
@@ -2773,7 +2788,7 @@ impl fmt::Display for WholeNeed {
         write!(
             f,
             "the whole load on {}: {}: need {} B = weights {} B (the allocator's granules; {} B \
-             of buffers) + cache {} B + context {} B + scratch {} B + reserves {} B + ",
+             of buffers) + cache {} B + context {} B + scratch {} B + reserves ",
             c.name,
             if self.fits() { "fits" } else { "does not fit" },
             self.need,
@@ -2782,8 +2797,11 @@ impl fmt::Display for WholeNeed {
             self.kv,
             c.context_bytes,
             c.scratch_bytes,
-            c.reserve_bytes(),
         )?;
+        match c.reserve_bytes() {
+            Some(bytes) => write!(f, "{bytes} B + ")?,
+            None => write!(f, "past u64 bytes + ")?,
+        }
         match self.load {
             WholeLoad::Checked { arena, reserve } => {
                 write!(f, "arena {arena} B + reserve past it {reserve} B")?;
@@ -2854,7 +2872,7 @@ pub fn whole_need(
     let need = load
         .past_bytes(card)
         .and_then(|past| card.floor_bytes(heap.taken, kv, past))
-        .unwrap_or(u64::MAX);
+        .ok_or_else(|| card.bytes_past_u64())?;
     Ok(WholeNeed {
         card: card.clone(),
         weights: heap.taken,
@@ -3667,7 +3685,7 @@ fn totals<'a>(
     kv_bytes: &[(u64, u64, u64)],
     counts: (Vec<u64>, Vec<Vec<u64>>),
     card_budget: Option<u64>,
-) -> Plan<'a> {
+) -> Result<Plan<'a>, PlacementError> {
     let (n_l, tier_n_l) = counts;
     let mut routing = vec![false; model.layers];
     for t in model
@@ -3719,9 +3737,16 @@ fn totals<'a>(
         .map(|(c, (card, heap))| {
             let rounding = heap.taken - (card_dense[c] + card_experts[c]);
             let (kv, _, stage_rows) = kv_bytes[c];
-            let used = heap.taken + kv + stage_rows + card.set_aside_bytes();
-            pool_cards += used + card.margin_bytes - card.context_in_free();
-            CardTotals {
+            let used = card
+                .floor_bytes(heap.taken, kv, stage_rows)
+                .ok_or_else(|| card.bytes_past_u64())?;
+            if machine.unified().is_some() {
+                pool_cards = pool_cards
+                    .checked_add(used - card.context_in_free())
+                    .and_then(|bytes| bytes.checked_add(card.margin_bytes))
+                    .ok_or_else(|| card.bytes_past_u64())?;
+            }
+            Ok(CardTotals {
                 dense_bytes: card_dense[c],
                 expert_bytes: card_experts[c],
                 rounding_bytes: rounding,
@@ -3730,11 +3755,13 @@ fn totals<'a>(
                 stage_rows_bytes: stage_rows,
                 scratch_bytes: card.scratch_bytes,
                 context_bytes: card.context_bytes,
-                reserve_bytes: card.reserve_bytes(),
+                reserve_bytes: card
+                    .reserve_bytes()
+                    .expect("the card floor checked its reserves"),
                 headroom_bytes: i128::from(capped(card, card_budget)) - i128::from(used),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, PlacementError>>()?;
     let row_reserve = row_cache_reserve(model, &rows);
     let reserve_bytes: u64 =
         machine.host().reserves.iter().map(|(_, b)| b).sum::<u64>() + row_reserve;
@@ -3765,7 +3792,7 @@ fn totals<'a>(
     host.headroom_bytes =
         workstation::HostNeed::of_totals(machine.host(), &host, card_budget.is_some(), 0)
             .headroom(workstation::HostNeed::machine_room(machine.host()));
-    Plan {
+    Ok(Plan {
         model,
         machine,
         ctx_max,
@@ -3777,7 +3804,7 @@ fn totals<'a>(
         tier_n_l,
         card_budget,
         budget_from_pool: false,
-    }
+    })
 }
 
 /// What a unified plan holds in its one pool, and the pool
@@ -3796,7 +3823,8 @@ pub struct PoolNeed {
 /// `card`'s total against usable − margin: its uploads' granules, its KV,
 /// its stage rows and its set-aside.
 fn card_total(card: &Card, totals: &CardTotals, heap: &Heap) -> u64 {
-    heap.taken + totals.kv_bytes + totals.stage_rows_bytes + card.set_aside_bytes()
+    card.floor_bytes(heap.taken, totals.kv_bytes, totals.stage_rows_bytes)
+        .expect("the plan's card totals fit u64")
 }
 
 impl Plan<'_> {
@@ -4471,6 +4499,128 @@ mod tests {
         Host {
             usable_bytes: 1 << 40,
             reserves: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn card_sums_preserve_the_u64_boundary() {
+        let boundary = Card {
+            context_bytes: 2,
+            scratch_bytes: 3,
+            reserves: vec![("beside".into(), u64::MAX - 5)],
+            ..bytes_card("boundary", u64::MAX, 0..1)
+        };
+        assert_eq!(boundary.reserve_bytes(), Some(u64::MAX - 5));
+        assert_eq!(boundary.set_aside_bytes(), Some(u64::MAX));
+        assert_eq!(boundary.floor_bytes(0, 0, 0), Some(u64::MAX));
+        for (dense, kv, past) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+            assert_eq!(boundary.floor_bytes(dense, kv, past), None);
+        }
+        for (context, scratch, reserves, reserve_sum) in [
+            (0, 0, vec![u64::MAX, 1], None),
+            (1, 0, vec![u64::MAX], Some(u64::MAX)),
+            (0, 1, vec![u64::MAX], Some(u64::MAX)),
+            (u64::MAX, 1, vec![], Some(0)),
+        ] {
+            let card = Card {
+                context_bytes: context,
+                scratch_bytes: scratch,
+                reserves: reserves.into_iter().map(|b| ("beside".into(), b)).collect(),
+                ..boundary.clone()
+            };
+            assert_eq!(card.reserve_bytes(), reserve_sum);
+            assert_eq!(card.set_aside_bytes(), None);
+            assert_eq!(card.floor_bytes(0, 0, 0), None);
+        }
+    }
+
+    #[test]
+    fn overflowing_card_sums_are_named_placement_refusals() {
+        let model = layered(1);
+        for (context, scratch, reserves) in [
+            (0, 0, vec![u64::MAX, 1]),
+            (1, 0, vec![u64::MAX]),
+            (0, 1, vec![u64::MAX]),
+            (u64::MAX, 1, vec![]),
+        ] {
+            for free_bytes in [None, Some(u64::MAX - 1)] {
+                let machine = Machine {
+                    cards: vec![Card {
+                        context_bytes: context,
+                        scratch_bytes: scratch,
+                        reserves: reserves.iter().map(|&b| ("beside".into(), b)).collect(),
+                        free_bytes,
+                        ..bytes_card("overflow", u64::MAX, 0..1)
+                    }],
+                    tiers: Vec::new(),
+                    nodes: vec![Node {
+                        host: host(),
+                        unified: None,
+                    }],
+                };
+                for budget in [None, Some(u64::MAX)] {
+                    assert!(matches!(
+                        plan_with(&model, &machine, 4096, &NoKv, budget),
+                        Err(PlacementError::CardBytesPastU64 { card }) if card == "overflow"
+                    ));
+                }
+                assert!(matches!(
+                    whole_need(&model, &machine.cards[0], 0, WholeLoad::Unchecked),
+                    Err(PlacementError::CardBytesPastU64 { card }) if card == "overflow"
+                ));
+            }
+        }
+        // The set-aside itself fits; adding the actual uploads does not.
+        let machine = Machine {
+            cards: vec![Card {
+                reserves: vec![("beside".into(), u64::MAX)],
+                ..bytes_card("load-overflow", u64::MAX, 0..1)
+            }],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
+        };
+        assert!(matches!(
+            plan_with(&model, &machine, 4096, &NoKv, None),
+            Err(PlacementError::CardBytesPastU64 { card }) if card == "load-overflow"
+        ));
+        assert!(matches!(
+            whole_need(&model, &machine.cards[0], 0, WholeLoad::Unchecked),
+            Err(PlacementError::CardBytesPastU64 { card }) if card == "load-overflow"
+        ));
+    }
+
+    #[test]
+    fn pooled_card_sums_are_checked_only_for_shared_memory() {
+        let model = layered(2);
+        for unified in [None, Some(UnifiedPool { bytes: u64::MAX })] {
+            let machine = Machine {
+                cards: (0..2)
+                    .map(|i| Card {
+                        head: i == 1,
+                        reserves: vec![("resident".into(), 1 << 63)],
+                        ..bytes_card(&format!("stage{i}"), u64::MAX, i..i + 1)
+                    })
+                    .collect(),
+                tiers: Vec::new(),
+                nodes: vec![Node {
+                    host: host(),
+                    unified,
+                }],
+            };
+            let result = plan_with(&model, &machine, 4096, &NoKv, None);
+            if unified.is_some() {
+                assert!(matches!(
+                    result,
+                    Err(PlacementError::CardBytesPastU64 { card }) if card == "stage1"
+                ));
+            } else {
+                let plan = result.expect("separate card memories need no combined card total");
+                assert_eq!(plan.n_l, vec![8, 8]);
+                assert!(plan.violations().is_empty());
+            }
         }
     }
 

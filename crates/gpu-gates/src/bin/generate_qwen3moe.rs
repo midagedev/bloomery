@@ -361,6 +361,12 @@ mod taps;
 #[path = "shared/qwen3moe_place.rs"]
 mod q3place;
 
+#[cfg(all(test, feature = "gpu"))]
+#[test]
+fn dense_shortage_halves_the_default_context() {
+    q3place::tests::dense_shortage_halves_the_default_context();
+}
+
 #[cfg(feature = "gpu")]
 #[path = "shared/qwen38_place.rs"]
 mod q38place;
@@ -391,9 +397,9 @@ mod cli {
     use bloomery_gpu::arch::nemotron_h::{Body as BodyNh, PASS_ROWS as NH_PASS_ROWS};
     use bloomery_gpu::arch::nemotron_h_moe::Body as BodyNhMoe;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
-    use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
+    use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for};
     use bloomery_gpu::arch::qwen3moe::{
-        Body, Body35, Body38, KvQ8, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
+        Body, Body35, Body38, KvQ8, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
         Qwen35moeModel, Qwen38Model, SplitWalk,
     };
     use bloomery_gpu::host::PassKind;
@@ -510,10 +516,19 @@ mod cli {
 
     /// The model file ([`ref_model_path`]) and its engine, read from its
     /// first shard's header: `qwen4exp` by its name, else `Arch::detect`'s
-    /// qwen3moe, qwen35moe or nemotron_h; any other file is refused by name.
+    /// qwen3moe, qwen35moe, nemotron_h or nemotron_h_moe; dense qwen35 also uses Body35.
+    /// Other files are refused by name.
     fn open_file() -> Result<(Split, Family), GateError> {
         let path = ref_model_path()?;
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        if file.architecture() == Some("qwen35") {
+            if bloomery_gpu_gates::model_file::decision_type(&file)?.is_some() {
+                return Err(
+                    "a qwen35 decision model belongs to the decide seat, not generation".into(),
+                );
+            }
+            return Ok((file, Family::Qwen35));
+        }
         if file.architecture() == Some("qwen4exp") {
             return Ok((file, Family::Qwen38));
         }
@@ -526,7 +541,7 @@ mod cli {
             Arch::NemotronH => Ok((file, Family::NemotronH)),
             Arch::NemotronHMoe => Ok((file, Family::NemotronHMoe)),
             other => Err(format!(
-                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen4exp, \
+                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen35, qwen4exp, \
                  nemotron_h and nemotron_h_moe files",
                 path.display(),
                 file.architecture().unwrap_or(other.name())
@@ -1607,7 +1622,15 @@ mod cli {
                 (Chosen::Qwen3(Body::path(prefill)?, place), None, lane)
             }
             Family::Qwen35 => {
-                draft_refused_on_other(&levers, family)?;
+                if file.architecture() == Some("qwen35") {
+                    if levers.draft().is_some_and(|w| w != "off") {
+                        return Err(
+                            "BLOOMERY_DRAFT: dense qwen35 generation serves no draft".into()
+                        );
+                    }
+                } else {
+                    draft_refused_on_other(&levers, family)?;
+                }
                 let (place, lane) = place_q3(place.as_deref(), prefill)?;
                 (Chosen::Qwen35(Body35::path(prefill)?, place), None, lane)
             }
@@ -2383,13 +2406,8 @@ mod cli {
         lane: Lane,
         t: Instant,
     ) -> Result<Qwen35moeModel, GateError> {
-        let o = Open35 {
-            ctx,
-            mma: true,
-            ubatch: ubatch_size()?,
-            kv,
-            media: false,
-        };
+        let arch = file.architecture().unwrap_or("<missing>").to_owned();
+        let o = q3place::serve_open35(&file, ctx, kv, false)?;
         let dspark = levers.draft() == Some("dspark");
         let mut m = match place {
             None => {
@@ -2441,7 +2459,7 @@ mod cli {
             record::lane(card, rate).print();
         }
         println!(
-            "load arch=qwen35moe resident_bytes={} ctx={ctx} cache={} layers={} mode={} \
+            "load arch={arch} resident_bytes={} ctx={ctx} cache={} layers={} mode={} \
              flash_mma={} store_bytes={} ubatch_attn=gqa_prefill_flash_256 ubatch={} in {:.1} s \
              (runtime value)",
             m.resident_bytes(),

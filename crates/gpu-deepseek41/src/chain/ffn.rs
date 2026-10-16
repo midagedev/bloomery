@@ -1333,7 +1333,7 @@ impl FfnPiece {
     ) -> Result<(), GpuError> {
         let i = self.check_io(layer, hybrid.slots(), &io, row)?;
         let boundary = hybrid.boundary();
-        boundary.enqueue_back_of(gpu.stream(), row)?;
+        boundary.enqueue_back_of(gpu.stream(), row, layer)?;
         self.enqueue_join(gpu, i, row, io, boundary)?;
         hybrid.row_enqueued(layer, row)
     }

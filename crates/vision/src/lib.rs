@@ -18,7 +18,7 @@
 //!   GGUF), each read once and refused by name when this crate does not run it, and what the
 //!   projector's own image rule needs: V4.1's resize plan and span layout (`deepseek41v::grid`,
 //!   `deepseek41v::span`), its reference `load_image` and its bytes on its card; Clef's size rule
-//!   and pad colour (`qwen3vl::size`, `qwen3vl::media`).
+//!   and pad colour (`size`, `qwen3vl::media`).
 //!
 //! The reference of V4.1 is deepseek-ai/DeepSeek-V4.1-Flash `inference/image_processor.py` and
 //! `inference/vision.py`, and Pillow's `libImaging/Resample.c` and `ImageOps.py` of the version
@@ -31,6 +31,7 @@ pub mod media;
 pub mod mrope;
 pub mod preprocess;
 pub mod resample;
+pub mod size;
 
 pub use image::{FileKind, Rgb8};
 pub use media::{EncoderInput, MediaModel, Prepared};

@@ -16,8 +16,8 @@
 #   more words than the scan script takes (ptx and lds: one entry substring; sass: the entry and its
 #   decisions, which are a comma list of t/n or ADDR=t|n and are not refused for their commas).
 # A feature table it cannot read ends it with 2 too: an unread table would pass every word.
-# The ptx scan alone is sm_86's (its blk/SM column is that arch's arithmetic): a BLOOMERY_ARCH that names another is refused
-# by name, exit 64, before the build; the sass and lds scans follow the arch (tools/arch.sh).
+# The ptx scan accepts only the architectures whose occupancy limits tools/ptx-scan.sh holds, before the build;
+# the sass and lds scans follow the arch (tools/arch.sh).
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
@@ -37,9 +37,12 @@ check() {
     sass) max=2 flags=' --exact --raw --step ' form="just sass-scan $bin --features <features> [-- --exact|--raw|--step HEAD] [entry substring [decisions|list]]" ;;
     *) echo "scan-args.sh: the scan is ptx, sass or lds, got '$scan'" >&2; return 64 ;;
   esac
-  if [ "$scan" = ptx ] && [ "${BLOOMERY_ARCH-sm_86}" != sm_86 ]; then
-    echo "ptx-scan: BLOOMERY_ARCH is '$BLOOMERY_ARCH': the scan's blk/SM column is sm_86's occupancy arithmetic and it holds no other arch's limits (unset BLOOMERY_ARCH for this recipe)" >&2
-    return 64
+  if [ "$scan" = ptx ]; then
+    case ${BLOOMERY_ARCH-sm_86} in
+      # PIN(2026-10-16): ptx-scan.sh tests cc12.x occupancy limits; the sm_86-only refusal rejected supported scans.
+      sm_86 | sm_120 | sm_120a | sm_120f | sm_121 | sm_121a | sm_121f) ;;
+      *) echo "ptx-scan: BLOOMERY_ARCH is '${BLOOMERY_ARCH-}': the scan holds occupancy limits for sm_86 and sm_120/sm_121 only" >&2; return 64 ;;
+    esac
   fi
   while [ $# -gt 0 ]; do
     w=$1 why=''
@@ -123,7 +126,10 @@ self_test() {
   case_ sass-entry-comma 2 sass gemm,flash
   case_ scan-unknown 64 cubin gemm
   BLOOMERY_ARCH=sm_86 case_ ptx-arch-sm86 0 ptx
-  BLOOMERY_ARCH=sm_121 case_ ptx-arch-other 64 ptx
+  BLOOMERY_ARCH=sm_121 case_ ptx-arch-sm121 0 ptx
+  BLOOMERY_ARCH=sm_120a case_ ptx-arch-sm120a 0 ptx
+  BLOOMERY_ARCH=sm_121f case_ ptx-arch-sm121f 0 ptx
+  BLOOMERY_ARCH=sm_90 case_ ptx-arch-unknown 64 ptx
   BLOOMERY_ARCH=sm_121 case_ lds-arch-other 0 lds
   BLOOMERY_ARCH=sm_121 case_ sass-arch-other 0 sass
   # The real table: every feature crates/gpu-gates declares is refused as a word, and `gpu` is one.

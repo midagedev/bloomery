@@ -27,6 +27,18 @@ use refset::arch::draft::Candidate;
 use crate::GateError;
 use crate::record::{self, Record};
 
+/// A present decision marker is a string; malformed metadata is not an absent head.
+pub fn decision_type(file: &Split) -> Result<Option<&str>, GateError> {
+    let key = file.arch_key("decision.type");
+    file.value(&key)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| format!("{key}: expected a string").into())
+        })
+        .transpose()
+}
+
 /// The model file a server named on its command line, set once.
 static MODEL_FILE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -266,4 +278,48 @@ pub fn hf_projector() -> Result<Option<PathBuf>, GateError> {
         return Ok(None);
     };
     Ok(fetch_exact(repo, &[path.as_str()])?.into_iter().next())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Split, decision_type};
+    use gguf::Value;
+
+    #[test]
+    fn decision_header_distinguishes_absent_string_and_malformed_markers() {
+        let cases = [
+            (None, Ok(None)),
+            (Some(Value::String("clef".into())), Ok(Some("clef"))),
+            (Some(Value::String(String::new())), Ok(Some(""))),
+            (
+                Some(Value::U32(1)),
+                Err("fixture.decision.type: expected a string"),
+            ),
+        ];
+        for (index, (marker, expected)) in cases.into_iter().enumerate() {
+            let mut keys = vec![(
+                gguf::GENERAL_ARCHITECTURE.to_owned(),
+                Value::String("fixture".into()),
+            )];
+            if let Some(marker) = marker {
+                keys.push(("fixture.decision.type".into(), marker));
+            }
+            let path = std::env::temp_dir().join(format!(
+                "bloomery-decision-header-{}-{index}.gguf",
+                std::process::id()
+            ));
+            let file = std::fs::File::create_new(&path).unwrap();
+            let layout = gguf::write::Layout::new(&keys, Vec::new()).unwrap();
+            gguf::write::Writer::new(file, layout)
+                .and_then(gguf::write::Writer::finish)
+                .unwrap();
+            let split = Split::open(&path).unwrap();
+            match expected {
+                Ok(value) => assert_eq!(decision_type(&split).unwrap(), value),
+                Err(error) => assert_eq!(decision_type(&split).unwrap_err().to_string(), error),
+            }
+            drop(split);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 }

@@ -6,7 +6,7 @@ high), on N = 1 to 4 Sparks (a pair, a ring of three, four on a switch), at λ 2
 4 % one, and at S₁ 1,000 and 3,000 tok/s: the nodes the plan uses and why it leaves each other node idle (§9.8 criteria
 1, 2 and 7), the routed ids the pools cannot hold, in all and per node (criterion 1), the decode step, node 0's messages
 in the layer that reaches the most remotes (criterion 6) and the busiest NIC with whether criterion 5 fires. From the
-cells it prints §9.8's "where each fires" table and §9.7's (a) rows at the gate's inputs, as the doc carries them.
+cells it prints §9.8's "where each fires" table, §9.7's (a) rows and §9.9's per-node paging at N = 2, at the gate's inputs.
 
 How, so that the cells do not repeat the planner's method (crates/placement/src/placement/nodes.rs):
 - The split is §9.2's rule in real shares: node 0 takes the share at which its mean window equals a remote's, the
@@ -52,7 +52,7 @@ the band besides.
     nodes_scale.py              print the cells
     nodes_scale.py --write      write crates/placement/tests/nodes_scale_cells.tsv
     nodes_scale.py --check      exit 1 when that file differs from the cells, or the doc's tables from --table
-    nodes_scale.py --table      §9.8's "where each fires" table and §9.7's (a) rows at the gate's inputs
+    nodes_scale.py --table      §9.8's "where each fires", §9.7's (a) rows and §9.9's N = 2 paging
     nodes_scale.py --self-test  hand-worked cases, the refusals, and --check
 
 Refused by name (exit 2): an inputs row of another cell count, a name twice, a kind outside measured / derived /
@@ -430,7 +430,7 @@ def span(values, fmt):
 
 
 def blocks(mc, terms, cells):
-    """The doc's derived tables, each a list of lines: §9.8's "where each fires" and §9.7's (a) rows."""
+    """The doc's derived tables: §9.8's criteria, §9.7's (a) rows and §9.9's N = 2 paging."""
     at = {(c["model"], c["a"], c["n"], c["lambda_us"], c["ruler"], c["s1"]): c for c in cells}
     lo, hi = mc["lambda_lo"] // 1000, mc["lambda_hi"] // 1000
     r, s1_lo, s1_hi = mc["ruler"], mc["s1_lo"], mc["s1_hi"]
@@ -488,7 +488,15 @@ def blocks(mc, terms, cells):
             star.append(f"| {model} | {n} | {span(used, str)} | {span(decode, lambda v: f'{v:.1f}')}{note} "
                         f"| {span(prompt, lambda v: f'{v:.2f}')} | {span(cap, lambda v: f'{v:,.0f}')} "
                         f"| {span(link, lambda v: f'{v:.2f}')} | {span(msgs, lambda v: f'{v:.0f}')} |")
-    return [fires, star]
+    paging = ["| N = 2 at the gate's inputs | A | λ (µs) | Paged ids, total | Paged ids on node 0 | Paged ids on node 1 |",
+              "|---|---|---|---|---|---|"]
+    for model in terms:
+        for a in ("low", "high"):
+            for lam in (lo, hi):
+                c = at[(model, a, 2, lam, r, s1_hi)]
+                per = " | ".join(c["paged_nodes"].split(","))
+                paging.append(f"| {model} | {a} | {lam} | {c['paged']} | {per} |")
+    return [fires, star, paging]
 
 
 def table(mc, terms, cells):
@@ -646,12 +654,17 @@ def self_test():
     machine, terms = load()
     cells = derive(machine, terms)
     by = {(x["model"], x["a"], x["n"], x["lambda_us"], x["ruler"], x["s1"]): x for x in cells}
-    glm2 = [by[("GLM", a, 2, lam, machine["ruler"], machine["s1_hi"])] for a in ("low", "high") for lam in (25, 70)]
-    expect("GLM held whole on two Sparks", all(x["paged"] == 0 and x["used"] == 2 for x in glm2))
-    v41 = by[("V4.1", "low", 2, 25, machine["ruler"], machine["s1_hi"])]
-    expect("V4.1 pages on two Sparks, on both, and not on three",
-           v41["paged"] > 0 and all(int(x) > 0 for x in v41["paged_nodes"].split(","))
-           and by[("V4.1", "low", 3, 25, machine["ruler"], machine["s1_hi"])]["paged"] == 0)
+    glm2 = [x for x in cells if x["model"] == "GLM" and x["n"] == 2]
+    expect("GLM held whole on two Sparks at every A, lambda, ruler and prompt rate",
+           len(glm2) == 12 and all((x["paged"], x["paged_nodes"], x["used"]) == (0, "0,0", 2) for x in glm2))
+    v41 = [x for x in cells if x["model"] == "V4.1" and x["n"] == 2]
+    want = {("low", 25): (62, "11,51"), ("low", 70): (62, "28,34"),
+            ("high", 25): (67, "0,67"), ("high", 70): (67, "0,67")}
+    expect("V4.1's two-node paging pinned per node at every A, lambda, ruler and prompt rate",
+           len(v41) == 12 and all((x["paged"], x["paged_nodes"]) == want[(x["a"], x["lambda_us"])] for x in v41))
+    expect("V4.1 is whole on three Sparks", all(x["paged"] == 0 for x in cells if x["model"] == "V4.1" and x["n"] == 3))
+    expect("the N = 2 paging table is included",
+           len(blocks(machine, terms, cells)) == 3)
     q4 = by[("Qwen3.8", "low", 4, 70, machine["ruler"], machine["s1_hi"])]
     expect("Qwen3.8 on four switched Sparks at λ 70 leaves nodes idle for the link", "link" in q4["idle"])
     expect("V4.1 on four Sparks: a handoff and its rows for each of three remotes, none on one",

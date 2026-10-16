@@ -95,9 +95,9 @@
 # (above: every check that runs before the lease, the command lines, exit 0).
 #
 # Exit codes: 0 row printed, 64 usage (a two-card run whose flags place nothing on two cards included),
-# 2 a missing binary or corpus or no pgmajfault counter, 3 a stale tokenizer binary, 65 the prompt did
-# not round-trip, 1 the reference failed or printed no eval line, or a two-card check after a run failed,
-# 124/137 the bound, 69/78 a two-card precheck, 75 the lease was not free within 30 min or a card stayed busy.
+# 2 a missing binary or corpus, no pgmajfault counter or failed source inspection, 3 a stale tokenizer
+# binary, 65 the prompt did not round-trip, 1 the reference failed or printed no eval line, or a two-card
+# check after a run failed, 124/137 the bound, 69/78 a two-card precheck, 75 the lease or a card stayed busy.
 set -uo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
@@ -234,14 +234,13 @@ if [ -n "$TIMING_CARDS" ]; then
 else
   CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
 fi
-CLI_SHA=$(sha256sum "$CLI" | cut -c1-12)
-# GIT_OPTIONAL_LOCKS=0 keeps `git status` from rewriting the index of a tree this root process does not own.
-TREE_HEAD=$(git -c safe.directory="$TREE" -C "$TREE" rev-parse --short=9 HEAD 2> /dev/null || echo '?')
-TREE_DIRTY=$(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$TREE" -C "$TREE" status --porcelain --untracked-files=no 2> /dev/null | wc -l | tr -d ' ')
+# shellcheck source=tools/ref/source-inspection.sh
+source "${BASH_SOURCE[0]%/*}/source-inspection.sh" || exit 2
+TREE_LINE=$(tree_line "$CLI" "$TREE") || exit $?
 DRAFT_SHA=-
 [ "$ARM" != dspark ] || DRAFT_SHA=$(sha256sum "$DRAFT_PATH" | cut -c1-12)
 WITNESS=(head-open indent card busiest model mem pgmajfault)
-ref_witness() { echo "    $ENGINE: $CLI sha256=$CLI_SHA head=$TREE_HEAD dirty_files=$TREE_DIRTY"; }
+ref_witness() { echo "    $ENGINE: $TREE_LINE"; }
 
 STAGE_SHOWN=none
 DRAFT_SHOWN=none

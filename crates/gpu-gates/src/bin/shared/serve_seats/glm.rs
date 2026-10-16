@@ -1317,7 +1317,14 @@ fn open_encoder(
         return Ok(None);
     };
     let t = Instant::now();
-    set_prefill_media(s.model_mut(), Some(v.media.image_token()))?;
+    set_prefill_media(
+        s.model_mut(),
+        Some(
+            v.media
+                .image_token()
+                .ok_or("the projector has no chat image token")?,
+        ),
+    )?;
     let resident = vision_seat::Resident::open(s.model().gpu().context(), &v)?;
     resident.announce(&v, vision_seat::ScratchHome::Own, t);
     Ok(Some(resident))

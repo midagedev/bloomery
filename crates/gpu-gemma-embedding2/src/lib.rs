@@ -512,6 +512,11 @@ impl Encoder {
     pub fn ctx(&self) -> usize {
         self.ctx
     }
+
+    /// The context the encoder's pass owns; a tower call binds it back after its encode.
+    pub fn context(&self) -> &std::sync::Arc<cuda_core::CudaContext> {
+        self.gpu.context()
+    }
 }
 
 /// Rows `rows` of `name` in `split`, `k` values each, decoded to f32 and

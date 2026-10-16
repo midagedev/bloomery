@@ -14,6 +14,7 @@
 pub mod card;
 pub mod deepseek41v;
 pub mod gemma4a;
+pub mod gemma4v;
 pub mod glm5v;
 pub(crate) mod header;
 pub mod minicpmv;
@@ -27,12 +28,12 @@ use std::sync::Arc;
 use gguf::Gguf;
 
 use self::card::CardBytes;
-use self::header::{KEY_PROJECTOR, Meta, check_architecture, need, refusal};
+use self::header::{KEY_PROJECTOR, Meta, check_architecture, projector_value, refusal};
 use crate::{MediaModel, VisionError};
 
 /// The bounds on how many tokens an image takes: [`open`]'s limits, which every projector that
 /// plans from them reads in this one type.
-pub use self::qwen3vl::TokenLimits;
+pub use crate::size::TokenLimits;
 
 /// What an encoder file opens to: the tower's bytes on its card, and the model's image input.
 pub type Opened = (CardBytes, Arc<dyn MediaModel + Send + Sync>);
@@ -54,6 +55,11 @@ pub type Opened = (CardBytes, Arc<dyn MediaModel + Send + Sync>);
 pub fn open(file: &Gguf, limits: TokenLimits) -> Result<Opened, VisionError> {
     check_architecture(file)?;
     match projector(file)? {
+        Projector::Gemma4v => {
+            let hp = gemma4v::Hparams::read(file)?;
+            let media = gemma4v::Media::new(hp.size_rule(limits)?);
+            Ok((gemma4v::card::of(file, &hp, limits)?, Arc::new(media)))
+        }
         Projector::Deepseek41v => {
             let hp = deepseek41v::Hparams::read(file)?;
             Ok((
@@ -92,6 +98,7 @@ pub fn open(file: &Gguf, limits: TokenLimits) -> Result<Opened, VisionError> {
 /// The projector types this crate runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Projector {
+    Gemma4v,
     Deepseek41v,
     Glm5v,
     Qwen3vl,
@@ -100,8 +107,9 @@ enum Projector {
 
 /// The file's `clip.projector_type`, refused by name when it is a tower this crate does not run.
 fn projector(m: &impl Meta) -> Result<Projector, VisionError> {
-    let v = need(m, KEY_PROJECTOR)?;
+    let v = projector_value(m)?;
     match v.as_str() {
+        Some(gemma4v::PROJECTOR_TYPE) => Ok(Projector::Gemma4v),
         Some(deepseek41v::PROJECTOR_TYPE) => Ok(Projector::Deepseek41v),
         Some(glm5v::PROJECTOR_TYPE) => Ok(Projector::Glm5v),
         Some(qwen3vl::PROJECTOR_TYPE) => Ok(Projector::Qwen3vl),
@@ -109,8 +117,9 @@ fn projector(m: &impl Meta) -> Result<Projector, VisionError> {
         Some(other) => Err(refusal(
             KEY_PROJECTOR,
             format!(
-                "is \"{other}\"; this crate reads \"{}\", \"{}\", \"{}\" and \"{}\"",
+                "is \"{other}\"; this crate reads \"{}\", \"{}\", \"{}\", \"{}\" and \"{}\"",
                 deepseek41v::PROJECTOR_TYPE,
+                gemma4v::PROJECTOR_TYPE,
                 glm5v::PROJECTOR_TYPE,
                 minicpmv::PROJECTOR_TYPE,
                 qwen3vl::PROJECTOR_TYPE
@@ -118,6 +127,13 @@ fn projector(m: &impl Meta) -> Result<Projector, VisionError> {
         )),
         None => Err(refusal(KEY_PROJECTOR, "is not a string")),
     }
+}
+
+/// The vision projector type: the common key, or the vision key of a multimodal file.
+pub fn projector_type(file: &Gguf) -> Result<&str, VisionError> {
+    projector_value(file)?
+        .as_str()
+        .ok_or_else(|| refusal(KEY_PROJECTOR, "is not a string"))
 }
 
 #[cfg(test)]
@@ -135,8 +151,8 @@ mod tests {
         clef().with("clip.projector_type", Value::String(projector.into()))
     }
 
-    /// The projector type picks the module; a stranger is refused by its name, which lists the
-    /// four this crate reads.
+    /// The projector type picks the module; a stranger is refused by its name, which lists
+    /// the types this crate reads.
     #[test]
     fn the_projector_type_picks_the_tower() {
         assert_eq!(
@@ -155,7 +171,7 @@ mod tests {
         assert_eq!(
             projector(&table("qwen2vl_merger")).unwrap_err().to_string(),
             "metadata clip.projector_type: is \"qwen2vl_merger\"; this crate reads \
-             \"deepseek41v\", \"glm5v\", \"minicpmv4_7\" and \"qwen3vl_merger\""
+             \"deepseek41v\", \"gemma4v\", \"glm5v\", \"minicpmv4_7\" and \"qwen3vl_merger\""
         );
         assert_eq!(
             projector(&clef().with("clip.projector_type", Value::U32(7)))
@@ -197,7 +213,7 @@ mod tests {
             let t = table("qwen3vl_merger").with("clip.vision.projection_dim", Value::U32(out));
             let (card, media) = open_table(&t, "clip").expect("open");
             assert_eq!((card.weights, card.scratch), (weights, scratch), "{out}");
-            assert_eq!(media.image_token(), 248_056);
+            assert_eq!(media.image_token(), Some(248_056));
             assert_eq!(media.part_join(), PartJoin::LlamaServer);
         }
     }
@@ -216,7 +232,7 @@ mod tests {
                 (1_128_026_112, scratch),
                 "{max}"
             );
-            assert_eq!(media.image_token(), 154_854);
+            assert_eq!(media.image_token(), Some(154_854));
             assert_eq!(media.part_join(), PartJoin::LlamaServer);
         }
         let image = crate::Rgb8::filled(1000, 600, [90, 120, 30]);
@@ -257,7 +273,7 @@ mod tests {
         assert_eq!(
             refused(&table("qwen2vl_merger"), "clip"),
             "metadata clip.projector_type: is \"qwen2vl_merger\"; this crate reads \
-             \"deepseek41v\", \"glm5v\", \"minicpmv4_7\" and \"qwen3vl_merger\""
+             \"deepseek41v\", \"gemma4v\", \"glm5v\", \"minicpmv4_7\" and \"qwen3vl_merger\""
         );
         assert!(refused(&table("qwen3vl_merger"), "llama").starts_with("metadata architecture:"));
         let huge = TokenLimits::new(16, 3_000_000).expect("limits");

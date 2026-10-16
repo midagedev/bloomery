@@ -55,6 +55,25 @@ pub struct RopeTable {
 }
 
 impl RopeTable {
+    /// Gemma4's two NEOX half-head turns, applied through this module's
+    /// whole-head pairing after the q/k rows and gains are permuted at load.
+    #[must_use]
+    pub(crate) fn neox_halves(n_h: usize, n_w: usize, theta: f32) -> RopeTable {
+        let step = f64::from(theta).powf(f64::from(-2.0f32 / PAIRS as f32)) as f32;
+        let mut cs = Vec::with_capacity(n_h * n_w * 2 * PAIRS);
+        for (y, x) in raster(n_h, n_w) {
+            for pos in [x, y] {
+                let mut angle = pos as f32;
+                for _ in 0..PER_AXIS {
+                    cs.push(f64::from(angle).cos() as f32);
+                    cs.push(f64::from(angle).sin() as f32);
+                    angle *= step;
+                }
+            }
+        }
+        RopeTable { n_h, n_w, cs }
+    }
+
     /// The table of an `n_h × n_w` patch grid at RoPE base `theta`, as the reference builds it
     /// in f32: `f_i = 1.0 / theta^(i / 16)` — the exponent `arange(0, 32, 2) / 32` is exact in
     /// f32, the power correctly rounded (the device's `powf` the reference calls is within an

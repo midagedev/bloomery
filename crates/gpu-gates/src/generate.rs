@@ -724,7 +724,7 @@ impl Place {
         let mut tier_specs = [stage; MAX_TIERS];
         tier_specs[..tiers.len()].copy_from_slice(tiers);
         let k = tiers.len();
-        // Tier-node addresses are loopback-only and share this host's pool when unified.
+        // Node loads keep the single-pool bound: remote bytes still come out of this pool.
         // `workstation::plan_node_tiers` alone creates separate pools.
         Ok(move |layers| match batch {
             None => workstation::plan_on(stage, layers),

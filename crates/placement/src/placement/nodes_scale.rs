@@ -1091,7 +1091,10 @@ fn pool_per_node() {
         let p = plan.predict().expect("a prediction");
         let card = &plan.nodes().machine.cards[0];
         let remote = &case_of(cell).budgets[1];
-        assert!(remote.fixed() >= card.set_aside_bytes() + card.margin_bytes);
+        assert!(
+            remote.fixed()
+                >= card.set_aside_bytes().expect("bounded set-aside") + card.margin_bytes
+        );
         for (j, &owned) in plan.owned().iter().enumerate().skip(1) {
             let ids = p.per_node[j].pool.checked_sub(remote.fixed());
             assert!(

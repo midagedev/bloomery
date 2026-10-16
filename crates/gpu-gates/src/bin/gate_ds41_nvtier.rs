@@ -1,7 +1,8 @@
 //! GPU gate for V4.1's attach of the NVMe expert tier (the split dial's arena, `body::open_placed_tiered`'s host run
-//! through the common `host_run`): the five clauses of `shared/nvtier_family.rs` (`plan`, `attach`, `bits`,
+//! through the common `host_run`): the six clauses of `shared/nvtier_family.rs` (`plan`, `attach`, `bits`, `card`,
 //! `refuse`, `residency`) on V4.1's placement (a) — the fixture in the fixture tier, planned under its header's card
-//! budget — a paged arm against an all-RAM arm on the same file, the residency `off`, the r8 pair off.
+//! budget — a paged arm against an all-RAM arm on the same file, the residency `off`, the r8 pair off. V4.1's load
+//! attaches no card leg, so `card` holds its tier `unattached`.
 //!
 //! Each arm's host room and arena reach the plan through `PlanInputs` (`room`, `arena`), so the gate sets no
 //! environment: the all-RAM arm's room is the plan's need, the paged arm's is the split's floor F (read off the
@@ -48,7 +49,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{Body, OpenCfg, PrefillMode};
     use bloomery_gpu_gates::generate::Place;
-    use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, ref_model_path, tier};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, record, ref_model_path, tier};
     use bloomery_levers::{ResidencyAt, residency_unset};
     use gguf::Split;
     use model::arch::deepseek41::place::{PlaceError, PlanInputs};
@@ -190,6 +191,7 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&crate::ds41_tier::acts_on(&[])?)?;
+        record::at_main(NAME, record::GATE_NVTIER);
         let mut cfg = OpenCfg::from_levers(&levers)?;
         cfg.body.residency = Residency::parse("off")?;
         cfg.body.prefill = PrefillMode::Batch;

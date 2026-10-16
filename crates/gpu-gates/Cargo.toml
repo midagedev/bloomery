@@ -122,7 +122,7 @@ vision = ["gpu", "dep:bloomery-gpu-vision", "dep:bloomery-vision"]
 clef = ["gpu", "dep:bloomery-decision", "dep:bloomery-serve", "dep:serde_json"]
 glm5next = ["deepseek41", "dep:bloomery-gpu-glm5next", "bloomery-app/glm5next"]
 mimo2 = ["gpu", "dep:bloomery-gpu-mimo2", "bloomery-app/mimo2"]
-gemma-embedding2 = ["gpu", "dep:bloomery-gpu-gemma-embedding2"]
+gemma-embedding2 = ["gpu", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
 
 # A bin whose `main` sits behind a feature requires that feature: cargo refuses to build it without the
 # feature before it links anything, instead of linking the feature-off stub `main` over the working
@@ -536,16 +536,24 @@ name = "gate_qwen35moe_attn"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_gemma_embedding_head256"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_gemma_embedding2_head512"
 required-features = ["gpu"]
 
 [[bin]]
 name = "gate_gemma_embedding2_e2e"
-required-features = ["gemma-embedding2"]
+required-features = ["gemma-embedding2", "vision", "deepseek41"]
 
 [[bin]]
 name = "gate_gemma_embedding2_serve"
 required-features = ["deepseek41", "gemma-embedding2"]
+
+[[bin]]
+name = "gate_gemma4v_tower"
+required-features = ["vision"]
 
 [[bin]]
 name = "gate_qwen3moe_router"

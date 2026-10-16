@@ -16,7 +16,6 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35};
 use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
-use model::arch::Arch;
 use model::placement::PlanLevers;
 use model::placement::ctx_ask::DEFAULT_SLOTS;
 
@@ -34,7 +33,7 @@ impl Adapter for Row {
 
     fn arms(&self, split: &Split) -> Vec<Result<Arm, Outcome>> {
         vec![
-            open35(CLI_CTX).and_then(|o| arm(split, "cli", &o, q3place::Seqs::ONE)),
+            open35(split, CLI_CTX).and_then(|o| arm(split, "cli", &o, q3place::Seqs::ONE)),
             serve_arm(split),
         ]
     }
@@ -45,7 +44,6 @@ impl Adapter for Row {
 fn serve_arm(split: &Split) -> Result<Arm, Outcome> {
     let levers = PlanLevers::default();
     let opts = q3place::ServeOpts {
-        arch: Arch::Qwen35moe,
         place: None,
         levers: &levers,
         kv: KvQ8::F16,
@@ -61,13 +59,13 @@ fn serve_arm(split: &Split) -> Result<Arm, Outcome> {
         .map_err(|e| outcome_of(e.as_ref()))?;
     // The seat passes the total-context `Open35`; the default shares it
     // across the slots itself.
-    arm(split, "serve", &open35(total)?, seqs)
+    arm(split, "serve", &open35(split, total)?, seqs)
 }
 
 /// The seat's `Open35` at `ctx` (`q3place::serve_open35`): the tensor-core
 /// flash, the default ubatch, the f16 cache, no media load.
-fn open35(ctx: usize) -> Result<Open35, Outcome> {
-    q3place::serve_open35(ctx, KvQ8::F16, false).map_err(|e| outcome_of(e.as_ref()))
+fn open35(split: &Split, ctx: usize) -> Result<Open35, Outcome> {
+    q3place::serve_open35(split, ctx, KvQ8::F16, false).map_err(|e| outcome_of(e.as_ref()))
 }
 
 /// One arm's default at the context `o` names for its `seqs`: the

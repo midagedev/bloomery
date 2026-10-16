@@ -8,6 +8,13 @@
 //! the KV bytes). [`kernels`] is the pure table of which common card kernel
 //! entry runs each operation on a file tensor of a given type.
 //!
+//! Card reserve and set-aside sums are checked at their owners and return
+//! `None` past u64 bytes, as the complete floor does. Planning refuses those
+//! sums with a named [`placement::PlacementError::CardBytesPastU64`]; a
+//! whole-load floor cannot turn overflow into a fitting `u64::MAX` sentinel.
+//! Shared-pool card totals are checked before host accounting; separate
+//! device memories do not accumulate an irrelevant combined card total.
+//!
 //! What does not live here, because the Mac cannot run it: the host tier's
 //! page locks and residency walks (`bloomery-model`'s
 //! `placement::host_lock`), the reading of `/proc/meminfo`

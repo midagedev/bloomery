@@ -883,7 +883,7 @@ fn enqueue_ffn_moe_hybrid(
         moe_shexp_quantize(gpu, m, dims, i, obs)?;
     }
     moe_shexp_down(gpu, w, names, m, hidden, i, obs)?;
-    hybrid_wait(gpu, b, i, obs)?;
+    hybrid_wait(gpu, b, names.layer, i, obs)?;
     gpu.elem()
         .enqueue_add(stream, &m.shexp, &b.pages[0].hsum, hidden, &mut b.sum)?;
     // The shared expert's output, the host's sum through the mapping, the
@@ -1373,9 +1373,10 @@ fn hybrid_go(
 fn hybrid_wait(
     gpu: &Gpu,
     b: &Boundary,
+    layer: usize,
     i: &mut usize,
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
-    b.enqueue_back(gpu.stream())?;
+    b.enqueue_back(gpu.stream(), layer)?;
     tick(i, obs, "hybrid_wait", bsum(&[Some(0)]))
 }

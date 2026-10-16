@@ -5,7 +5,7 @@
 | Model | Recommended file | How it runs |
 |---|---|---|
 | DeepSeek-V4.1-Flash | [`Q3_K_M`](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF) (vcruz305) | GPU + CPU experts; 256 GB of RAM, or less with the NVMe expert tier |
-| GLM-5.3-Flash | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (unsloth) | GPU + CPU experts (the NVMe expert tier where RAM falls short); sparse attention past 2,051 positions |
+| GLM-5.3-Flash | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (unsloth) | GPU + CPU experts (the NVMe expert tier where RAM falls short; on an integrated GPU the card computes the tier's experts at decode); sparse attention past 2,051 positions |
 | Qwen3.8-Flash-Next | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (unsloth) | GPU + CPU experts (the NVMe expert tier where RAM falls short) |
 | MiMo-V2.6-Flash | [`MXFP4`](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) (ggml-org) | GPU + CPU experts; the hot routed experts sit on the card |
 | Qwen3.6-35B-A3B | [`Q4_K_M`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF) (lmstudio-community) | whole on one 24 GB card, or split onto the CPU on 12-16 GB (automatic); image input with `--mmproj` |
@@ -41,8 +41,9 @@ recommended — a load streams the file to the card, and V4.1 reads its engram t
 | DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB to hold every routed expert; less pages the rest from NVMe | 347.3 GB (a source build can add a 155.7 GB r8 sidecar; the release does not use one) |
 
 **The NVMe expert tier** (Qwen3.8, GLM-5.3, V4.1): when the host RAM cannot hold the experts the plan leaves on the
-host, the plan pages the overflow through a RAM arena filled from the model file on NVMe, and the tokens equal the
-all-RAM load's. The plan line and the
+host, the plan pages the overflow through a RAM arena filled from the model file on NVMe. The tokens equal the
+all-RAM load's where the host computes the arena's experts; where GLM-5.3's card computes them at decode, they can
+part from it ([Serving](serving.md)). The plan line and the
 `nvtier` record name the arena and the paged bytes. The limits of a paged load are in [Serving](serving.md#the-seats).
 
 Qwen3.8's 28.8 GB PLE table is read from host RAM whatever the cards, so no number of cards holds the whole

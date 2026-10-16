@@ -238,7 +238,10 @@ fn open_images(family: Family) -> Result<Images, GateError> {
     let seat = vision_seat::encoder_seat(Place::A, proj.card.total())?;
     let png = read_image()?;
     let span = proj.media.prepare(&vision::Rgb8::from_png(&png)?)?.span_len;
-    let token = proj.media.image_token();
+    let token = proj
+        .media
+        .image_token()
+        .ok_or("the projector has no chat image token")?;
     Ok(Images {
         file,
         proj,

@@ -39,9 +39,10 @@
 //! glm5-next the glm seat, qwen4exp the qwen38 seat, qwen3moe and qwen35moe
 //! the qwen3 seat, mimo2 the mimo2 seat, nemotron_h and nemotron_h_moe the
 //! nemotron seat;
-//! a file of a decision row's backbone (qwen35) with no head is refused by
-//! name, saying what would seat it (`--head`, a row's `--hf` repo, or a file
-//! that carries its head); a
+//! a dense qwen35 file generates through `--model qwen3`. With no model
+//! word it keeps the decision selection rules: a file with no head is
+//! refused by name, saying what would seat it (`--head`, a row's `--hf`
+//! repo, or a file that carries its head); a
 //! file whose architecture no seat serves is refused by name listing the
 //! seat words, or, when the model reader describes it, listing what no
 //! program runs of it (`model::arch::coverage::check`, as the plans refuse
@@ -140,7 +141,9 @@ mod drive {
     const USAGE: &str = "usage: bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|nemotron|decide] \
                          [-m PATH | --model-file PATH | --hf <repo>[:<quant>]] [--head <weights> \
                          [--head-config <file>]] [--embd-model FILE | --embd-hf \
-                         <repo>[:<quant>]] <the chosen seat's own flags, as \
+                         <repo>[:<quant>]] [--embd-ctx N] [--embd-mmproj FILE | \
+                         --embd-no-mmproj] [--embd-image-min-tokens N] [--embd-image-max-tokens N] \
+                         <the chosen seat's own flags, as \
                          bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3, the \
                          mimo2, the nemotron or the decide seat takes them> | --version";
 
@@ -244,7 +247,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Ds41 => matches!(arch, "deepseek41" | DEEPSEEK4),
                 Model::Qwen38 => arch == "qwen4exp",
                 Model::Glm => matches!(Arch::from_name(arch), Ok(Arch::Glm5next)),
-                Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe"),
+                Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe" | "qwen35"),
                 Model::Mimo2 => arch == "mimo2",
                 Model::Nemotron => matches!(
                     Arch::from_name(arch),
@@ -292,10 +295,11 @@ models (the --model word is optional with a model file: the file's architecture 
     /// the architecture ([`Model::serves`]; the string itself, not an `Arch`
     /// variant, because `qwen4exp` is no `Arch` name). A file of a decision
     /// row's backbone (`qwen35`, Clef's) here has no head: its refusal
-    /// ([`serve::decide::no_head`]) says what would seat it. Any other
-    /// architecture, and a shard that names none, is refused by name listing
+    /// ([`serve::decide::no_head`]) says what would seat it. An explicit
+    /// generative word admits a dense qwen35 file through the existing Qwen
+    /// seat. Any other architecture, and a shard that names none, is refused by name listing
     /// the seat words. A qwen35moe file (Qwen3.6) is the qwen3 seat's.
-    fn seat_of_file() -> Result<(Model, String), GateError> {
+    fn seat_of_file(generative: bool) -> Result<(Model, String), GateError> {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let (seat, arch) = match split.architecture() {
@@ -307,7 +311,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 )
                 .into());
             }
-            Some(a) if decide::ROWS.iter().any(|r| r.backbones.contains(&a)) => {
+            Some(a) if !generative && decide::ROWS.iter().any(|r| r.backbones.contains(&a)) => {
                 return Err(format!(
                     "{}: {}",
                     path.display(),
@@ -365,7 +369,7 @@ models (the --model word is optional with a model file: the file's architecture 
     fn file_facts() -> Result<(String, Option<String>), GateError> {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let decision = split.arch_get_str("decision.type").map(str::to_owned);
+        let decision = bloomery_gpu_gates::model_file::decision_type(&split)?.map(str::to_owned);
         Ok((
             split.architecture().unwrap_or("<missing>").to_owned(),
             decision,
@@ -389,7 +393,9 @@ models (the --model word is optional with a model file: the file's architecture 
             hf: repo,
             arch: &arch,
             decision: decision.as_deref(),
-            generative: Model::ALL.iter().any(|m| m.serves(&arch)),
+            // A qwen35 repo can name a decision head in its card. Keep that
+            // inference with no --model; an explicit qwen3 word opts into generation.
+            generative: arch != "qwen35" && Model::ALL.iter().any(|m| m.serves(&arch)),
         };
         let from = serve::decide::pick(&ask, decide::ROWS, &mut |r| {
             model_file::quantized_from(r).map_err(|e| e.to_string())
@@ -474,7 +480,7 @@ models (the --model word is optional with a model file: the file's architecture 
             }
             return ended(decide::run(&rest, from, repo.as_deref()));
         }
-        let (seat, arch) = match seat_of_file() {
+        let (seat, arch) = match seat_of_file(matches!(word, Some(Word::Seat(Model::Qwen3)))) {
             Ok(v) => v,
             Err(e) => return exit_with(NAME, Err(e)),
         };

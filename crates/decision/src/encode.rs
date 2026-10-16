@@ -107,7 +107,9 @@ pub(crate) fn encode_media_with(
         placeholders: (0..image_tokens.len())
             .map(|i| media.image_placeholder(i))
             .collect(),
-        token: media.image_token(),
+        token: media
+            .image_token()
+            .ok_or_else(|| Error::Images("the projector has no chat image token".into()))?,
         counts: image_tokens,
     };
     encode_inner(tokens, req, Some(images), max_length)
@@ -380,8 +382,8 @@ mod tests {
             PLACEHOLDER
         }
 
-        fn image_token(&self) -> u32 {
-            PAD
+        fn image_token(&self) -> Option<u32> {
+            Some(PAD)
         }
 
         fn prepare(&self, _: &vision::Rgb8) -> Result<vision::Prepared, vision::VisionError> {
@@ -484,8 +486,8 @@ mod tests {
                 "<|image_pad|>"
             }
 
-            fn image_token(&self) -> u32 {
-                PAD
+            fn image_token(&self) -> Option<u32> {
+                Some(PAD)
             }
 
             fn prepare(&self, _: &vision::Rgb8) -> Result<vision::Prepared, vision::VisionError> {

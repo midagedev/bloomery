@@ -474,17 +474,16 @@ pub(crate) const fn pack_rows_hold<const PACK: usize>(slices: usize) -> bool {
 
 /// Every query staging pass of the packed 256 body covers its row once.
 const fn pack_staging_holds<const PACK: usize>() -> bool {
-    if !pack_rows_hold::<PACK>(SLICES_256) || !PACK.is_multiple_of(Q_ROW_STEP_256) {
+    if !pack_rows_hold::<PACK>(SLICES_256) {
         return false;
     }
-    let qpp = PACK / Q_ROW_STEP_256;
     let mut staged = 0u64;
     let mut e = 0;
     while e < Q_WORDS_256 {
         let mut r0 = 0;
         while r0 < Q_ROW_STEP_256 {
             let row = Q_ROW_STEP_256 * e + r0;
-            let (lp, j) = (e / qpp, Q_ROW_STEP_256 * (e % qpp) + r0);
+            let (lp, j) = (row / PACK, row % PACK);
             if lp >= Q_ROWS_256 / PACK || j >= PACK || row != lp * PACK + j {
                 return false;
             }
@@ -498,12 +497,12 @@ const fn pack_staging_holds<const PACK: usize>() -> bool {
 
 const _: () = assert!(Q_OCT_PASSES_256 * Q_ROW_STEP_256 == 8);
 const _: () = assert!(q_oct_hold());
-// The `_p4` and `_p2` layouts, and at `GROUP` the eight-head entry's staged
-// rows.
+// The packed layouts, and at `GROUP` the eight-head entry's staged rows.
 const _: () = assert!(
     pack_staging_holds::<GROUP>()
         && pack_staging_holds::<PACK_4>()
         && pack_staging_holds::<PACK_2>()
+        && pack_staging_holds::<1>()
 );
 // The `_p4` instance of `prefill_256_p` (its generic const blocks run only
 // when the device build instantiates it, this one in every check).
@@ -867,7 +866,8 @@ const _: () = assert!(DYN_BYTES_256_Q8 == 100_352);
 /// warps a block (the section above), in blocks of `PACK` query heads, `packs`
 /// of them per key head, over a cache in the format `S`: the body of
 /// `gqa_prefill_flash_256_p4` (`PACK = 4`), `gqa_prefill_flash_256_p2`
-/// (`PACK = 2`) and, over [`Q8Kv`], `gqa_prefill_flash_256_q8` (`PACK = 8`).
+/// (`PACK = 2`), `gqa_prefill_flash_256_p1_lower` (`PACK = 1`) and,
+/// over [`Q8Kv`], `gqa_prefill_flash_256_q8` (`PACK = 8`).
 /// `gqa_prefill_flash_256` keeps its own body; this PACK-generic one computes
 /// each row as that body does ([`pack_staging_holds`] at `GROUP` is its layout).
 /// Block `b` is unit `r = b % (n_kv · packs)` — key head `r / packs`, query
@@ -921,7 +921,7 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const LOWER: 
     // Positions a block covers, and a row slice's.
     let positions = Q_ROWS_256 / PACK;
     let pps = SLICE_POS;
-    // The query staging's passes over one position's pack of heads.
+    // PACK = 1 takes its own position indexing, without dividing by qpp.
     let qpp = PACK / Q_ROW_STEP_256;
     // The q8 staging: code 16-byte chunks a staged row takes, a thread's
     // count of a tile's, and the rows of a tile each warp widens.
@@ -993,24 +993,37 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, const LOWER: 
     // staged row `lp·PACK + j` is position `t0 + lp`'s head `head0 + j`, so
     // row slice `r` is rows `16·r ..`. A row past `t_rows` is zero. Thread
     // `tid` stages word `tid % Q_PAIRS_256` of every row its passes cover —
-    // pass `e` is staged row `Q_ROW_STEP_256·e + r0` — every load issued
-    // before the first conversion.
+    // pass `e` is staged row `Q_ROW_STEP_256·e + r0` (two positions when
+    // PACK = 1), every load issued before the first conversion.
     let wd = tid % Q_PAIRS_256;
     let r0 = tid / Q_PAIRS_256;
     let q_first = (t0 * n_head + head0 + r0) * Q_PAIRS_256 + wd;
     let q_pos = n_head * Q_PAIRS_256;
     let q64 = q.as_ptr().cast::<u64>();
     let mut raw = [0u64; Q_WORDS_256];
-    for e in 0..Q_WORDS_256 {
-        cuda_device::thread::__unroll_config::<0>();
-        let t = t0 + e / qpp;
-        if t < rows {
-            let at = q_first + (e / qpp) * q_pos + Q_ROW_STEP_256 * (e % qpp) * Q_PAIRS_256;
-            // SAFETY: t < t_rows and the head head0 + Q_ROW_STEP_256·(e % qpp)
-            // + r0 < head0 + PACK <= n_head, so the row lies inside q (launch
-            // contract); a row is 256 f32 = 128 u64 and q starts 8-byte
-            // aligned (host-checked), so the u64 read is aligned.
-            raw[e] = unsafe { *q64.add(at) };
+    if PACK == 1 {
+        for e in 0..Q_WORDS_256 {
+            cuda_device::thread::__unroll_config::<0>();
+            let t = t0 + Q_ROW_STEP_256 * e + r0;
+            if t < rows {
+                let at = (t * n_head + head0) * Q_PAIRS_256 + wd;
+                // SAFETY: t < t_rows and head0 < n_head, inside q. A row
+                // is 128 u64, and q starts 8-byte aligned (host-checked).
+                raw[e] = unsafe { *q64.add(at) };
+            }
+        }
+    } else {
+        for e in 0..Q_WORDS_256 {
+            cuda_device::thread::__unroll_config::<0>();
+            let t = t0 + e / qpp;
+            if t < rows {
+                let at = q_first + (e / qpp) * q_pos + Q_ROW_STEP_256 * (e % qpp) * Q_PAIRS_256;
+                // SAFETY: t < t_rows and the head head0 + Q_ROW_STEP_256·(e % qpp)
+                // + r0 < head0 + PACK <= n_head, so the row lies inside q (launch
+                // contract); a row is 256 f32 = 128 u64 and q starts 8-byte
+                // aligned (host-checked), so the u64 read is aligned.
+                raw[e] = unsafe { *q64.add(at) };
+            }
         }
     }
     // The staged word of each pass of the first eight rows; a later pass's is
@@ -2426,6 +2439,59 @@ mod flash_gqa_prefill_kernels {
         };
     }
 
+    /// One query head per block pack, with each row's key interval.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        dynamic_shared = 98304,
+        requires = (
+            n_keys_buf.len() >= t_rows,
+            k_first_buf.len() >= t_rows,
+            q.len() >= t_rows * n_kv * packs * 256,
+            kc.len() >= n_kv * ctx * 256,
+            vc.len() >= n_kv * ctx * 256,
+            y.len() >= t_rows * n_kv * packs * 256
+        )
+    )]
+    pub fn gqa_prefill_flash_256_p1_lower(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        k_first_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        t_rows: u32,
+        packs: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract supplies every plane and count at
+        // PACK = 1, THREADS_256 threads and DYN_BYTES_256 shared bytes.
+        unsafe {
+            prefill_256_p::<1, SLICE_ROWS, true, _>(
+                q,
+                F16Kv { k: kc, v: vc },
+                n_keys_buf,
+                k_first_buf,
+                scale,
+                n_kv,
+                ctx,
+                t_rows,
+                packs as usize,
+                fault,
+                y,
+            )
+        };
+    }
+
     /// [`gqa_prefill_flash_256`] over the Q8_0 cache ([`prefill_256_p`] at
     /// `GROUP` over [`Q8Kv`]): the eight-head layout, the two-step staging and
     /// the in-place widening of the module doc's `_q8` paragraph.
@@ -3475,8 +3541,25 @@ impl FlashGqaPrefill {
         )
     }
 
+    /// The lower-bound flash with one query head per pack, for any nonzero
+    /// group, including three. Each row attends over `[k_first[t], n_keys[t])`.
+    pub fn enqueue_256_p1_lower(
+        &self,
+        stream: &CudaStream,
+        args: GqaPrefillArgs<'_>,
+        k_first: &DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_packed(
+            "flash_gqa_prefill::enqueue_256_p1_lower",
+            stream,
+            args,
+            1,
+            Some(k_first),
+        )
+    }
+
     /// The packed entries' one launcher: the group refused unless a nonzero
-    /// multiple of `pack` ([`PACK_4`] or [`PACK_2`]), the buffers and their
+    /// multiple of `pack` (1, [`PACK_4`] or [`PACK_2`]), the buffers and their
     /// alignment checked, then that pack's entry, its lower-bound form when
     /// `k_first` is given.
     fn enqueue_packed(
@@ -3516,6 +3599,12 @@ impl FlashGqaPrefill {
         let t = launch_u32(what, "t", t)?;
         let cfg = LaunchConfig1D::new(grid, THREADS_256_U32, DYN_BYTES_256_U32);
         match (pack, k_first) {
+            (1, Some(k_first)) => {
+                let prep = self.module.prepare_gqa_prefill_flash_256_p1_lower(cfg)?;
+                self.module.gqa_prefill_flash_256_p1_lower(
+                    stream, &prep, q, kc, vc, n_keys, k_first, scale, n_kv, ctx, t, packs, fault, y,
+                )?;
+            }
             (PACK_2, None) => {
                 let prep = self.module.prepare_gqa_prefill_flash_256_p2(cfg)?;
                 self.module.gqa_prefill_flash_256_p2(

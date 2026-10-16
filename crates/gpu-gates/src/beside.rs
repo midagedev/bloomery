@@ -123,12 +123,12 @@ mod tests {
             Some(&(IMAGE_ENCODER.to_owned(), BYTES))
         );
         assert_eq!(
-            probe.cards[0].reserve_bytes(),
-            plain.cards[0].reserve_bytes() + BYTES
+            probe.cards[0].reserve_bytes().expect("bounded reserves"),
+            plain.cards[0].reserve_bytes().expect("bounded reserves") + BYTES
         );
         assert_eq!(
-            probe.cards[0].set_aside_bytes(),
-            plain.cards[0].set_aside_bytes() + BYTES
+            probe.cards[0].set_aside_bytes().expect("bounded set-aside"),
+            plain.cards[0].set_aside_bytes().expect("bounded set-aside") + BYTES
         );
         assert_eq!(reserve_in(&probe), image);
         assert_eq!(reserve_in(&plain), Beside::default());
@@ -161,8 +161,12 @@ mod tests {
         reserve_on(&mut machine, both);
         assert_eq!(reserve_in(&machine), both);
         assert_eq!(
-            machine.cards[0].reserve_bytes(),
-            plan_a(40).cards[0].reserve_bytes() + BYTES + 7
+            machine.cards[0].reserve_bytes().expect("bounded reserves"),
+            plan_a(40).cards[0]
+                .reserve_bytes()
+                .expect("bounded reserves")
+                + BYTES
+                + 7
         );
         assert_eq!(
             note(&machine.cards[0]),

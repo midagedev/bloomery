@@ -18,12 +18,130 @@
 use crate::cores::{funnel16, half_to_f32, l2_prefetch, q6k_chain, q6k_dequant, q6k_sub_scale};
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
 use crate::hybrid::HOST;
+use crate::kquant::sel::{ARENA_PARTS, ARENA_SKIP, PART_DOWN, SelDownAt, arena_part, down_at_dims};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
 use std::sync::Arc;
+
+/// One warp's Q6_K row dot for the stack and arena entries.
+/// Expansion keeps the stack entry's instruction order without a second row walk.
+///
+/// `w` holds the row from byte `row_at` through the word after its last scales
+/// window. Column `slot` holds `128 * iters` words in `q` and `2 * n_sb` scales
+/// in `d8`, `iters = ceil(n_sb / 2)`, and all 32 lanes call the expansion.
+macro_rules! q6k_sel_row_dot {
+    ($w:ident, $row_at:expr, $q:ident, $d8:ident, $n_sb:ident, $iters:ident, $slot:ident, $lane:ident) => {{
+        let q_col = 128 * $iters as usize;
+        let d8_col = 2 * $n_sb;
+        let q0c = q_col * $slot;
+        let d0c = d8_col * $slot;
+
+        let w16 = $lane & 15;
+        let half = $lane >> 4;
+        let qlok = 16 * (w16 & 3);
+        let qhok = 16 * (w16 & 1);
+        let nib_sh = ((w16 >> 2) & 1) as u32 * 4;
+        let hib_sh = 2 * ((w16 >> 1) as u32 & 3);
+
+        let mut f0 = 0.0f32;
+        let mut it: u32 = 0;
+        while it < $iters {
+            let sbp = ((it << 1) | half as u32) as usize;
+            if sbp < $n_sb {
+                let base = ($row_at) + sbp * 210;
+                let par = (base >> 1) & 1;
+
+                let lk = (base + 64 * (w16 >> 3) + qlok) >> 2;
+                // SAFETY: the window lies in the row's bytes, which `w` holds
+                // by the caller's contract; the floored word index of a window
+                // stays inside the row's words, as in q6k_gemv.
+                let (l0, l1, l2, l3, l4) = unsafe {
+                    (
+                        *$w.get_unchecked(lk),
+                        *$w.get_unchecked(lk + 1),
+                        *$w.get_unchecked(lk + 2),
+                        *$w.get_unchecked(lk + 3),
+                        *$w.get_unchecked(lk + 4),
+                    )
+                };
+                let ql0 = if par == 0 { l0 } else { funnel16(l0, l1) };
+                let ql1 = if par == 0 { l1 } else { funnel16(l1, l2) };
+                let ql2 = if par == 0 { l2 } else { funnel16(l2, l3) };
+                let ql3 = if par == 0 { l3 } else { funnel16(l3, l4) };
+
+                let hk = (base + 128 + 32 * (w16 >> 3) + qhok) >> 2;
+                // SAFETY: the same row bounds as the ql window.
+                let (h0, h1, h2, h3, h4) = unsafe {
+                    (
+                        *$w.get_unchecked(hk),
+                        *$w.get_unchecked(hk + 1),
+                        *$w.get_unchecked(hk + 2),
+                        *$w.get_unchecked(hk + 3),
+                        *$w.get_unchecked(hk + 4),
+                    )
+                };
+                let qh0 = if par == 0 { h0 } else { funnel16(h0, h1) };
+                let qh1 = if par == 0 { h1 } else { funnel16(h1, h2) };
+                let qh2 = if par == 0 { h2 } else { funnel16(h2, h3) };
+                let qh3 = if par == 0 { h3 } else { funnel16(h3, h4) };
+
+                let ak = (base + 192) >> 2;
+                // SAFETY: ak + 4 is at most the word after the row's last
+                // super-block's scales window, which `w` holds by the caller's
+                // contract.
+                let (a0, a1, a2, a3, a4) = unsafe {
+                    (
+                        *$w.get_unchecked(ak),
+                        *$w.get_unchecked(ak + 1),
+                        *$w.get_unchecked(ak + 2),
+                        *$w.get_unchecked(ak + 3),
+                        *$w.get_unchecked(ak + 4),
+                    )
+                };
+                let (sw0, sw1, sw2, sw3, d_bits) = if par == 0 {
+                    (a0, a1, a2, a3, (a4 & 0xffff) as u16)
+                } else {
+                    (
+                        funnel16(a0, a1),
+                        funnel16(a1, a2),
+                        funnel16(a2, a3),
+                        funnel16(a3, a4),
+                        (a4 >> 16) as u16,
+                    )
+                };
+                let sc = q6k_sub_scale(&[sw0, sw1, sw2, sw3], w16);
+                let drow = half_to_f32(d_bits);
+                let vi = [
+                    q6k_dequant(ql0, qh0, nib_sh, hib_sh),
+                    q6k_dequant(ql1, qh1, nib_sh, hib_sh),
+                    q6k_dequant(ql2, qh2, nib_sh, hib_sh),
+                    q6k_dequant(ql3, qh3, nib_sh, hib_sh),
+                ];
+                let qb = q0c + 128 * it as usize + $lane;
+                let d8b = d0c + 2 * sbp + (w16 >> 3);
+                // SAFETY: qb + 99 < q0c + q_col — this lane's four q8 words
+                // are inside column `slot`'s q_col words, slot < n_slots; d8b
+                // < d0c + d8_col by the sbp guard.
+                let (q0, q1, q2, q3, e0) = unsafe {
+                    (
+                        *$q.get_unchecked(qb),
+                        *$q.get_unchecked(qb + 32),
+                        *$q.get_unchecked(qb + 64),
+                        *$q.get_unchecked(qb + 96),
+                        *$d8.get_unchecked(d8b),
+                    )
+                };
+                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
+                f0 += (a as f32) * (e0 * drow * sc as f32);
+            }
+            it += 1;
+        }
+        warp::reduce_sum_f32(f0)
+    }};
+}
 
 #[cuda_module]
 mod q6k_sel_kernels {
@@ -39,8 +157,8 @@ mod q6k_sel_kernels {
     /// not [`HOST`] (a slot the host tier serves, skipped by contract)
     /// raises [`FaultSite::ExpertId`] on `fault` first.
     ///
-    /// `q6k_gemv_sel_prefetch` carries a copy of this body: a change here
-    /// goes there too.
+    /// The stack, prefetched stack and arena entries expand [`q6k_sel_row_dot`]
+    /// for the same row walk.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -90,113 +208,9 @@ mod q6k_sel_kernels {
         let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
         let n_sb = n_sb as usize;
         let row_bytes = 210 * n_sb;
-        let q_col = 128 * iters as usize;
-        let d8_col = 2 * n_sb;
-        let q0c = q_col * slot;
-        let d0c = d8_col * slot;
-
-        let w16 = lane & 15;
-        let half = lane >> 4;
-        let qlok = 16 * (w16 & 3);
-        let qhok = 16 * (w16 & 1);
-        let nib_sh = ((w16 >> 2) & 1) as u32 * 4;
-        let hib_sh = 2 * ((w16 >> 1) as u32 & 3);
-
-        let mut f0 = 0.0f32;
-        let mut it: u32 = 0;
-        while it < iters {
-            let sbp = ((it << 1) | half as u32) as usize;
-            if sbp < n_sb {
-                let base = row_abs * row_bytes + sbp * 210;
-                let par = (base >> 1) & 1;
-
-                let lk = (base + 64 * (w16 >> 3) + qlok) >> 2;
-                // SAFETY: row_abs < n_experts·rows_per_expert, so the window
-                // ends inside the stack's words (launch contract: 4·w.len()
-                // covers every row's 210·n_sb bytes; the floored word index
-                // of a window stays inside the row's words, as in q6k_gemv).
-                let (l0, l1, l2, l3, l4) = unsafe {
-                    (
-                        *w.get_unchecked(lk),
-                        *w.get_unchecked(lk + 1),
-                        *w.get_unchecked(lk + 2),
-                        *w.get_unchecked(lk + 3),
-                        *w.get_unchecked(lk + 4),
-                    )
-                };
-                let ql0 = if par == 0 { l0 } else { funnel16(l0, l1) };
-                let ql1 = if par == 0 { l1 } else { funnel16(l1, l2) };
-                let ql2 = if par == 0 { l2 } else { funnel16(l2, l3) };
-                let ql3 = if par == 0 { l3 } else { funnel16(l3, l4) };
-
-                let hk = (base + 128 + 32 * (w16 >> 3) + qhok) >> 2;
-                // SAFETY: the same row bounds as the ql window.
-                let (h0, h1, h2, h3, h4) = unsafe {
-                    (
-                        *w.get_unchecked(hk),
-                        *w.get_unchecked(hk + 1),
-                        *w.get_unchecked(hk + 2),
-                        *w.get_unchecked(hk + 3),
-                        *w.get_unchecked(hk + 4),
-                    )
-                };
-                let qh0 = if par == 0 { h0 } else { funnel16(h0, h1) };
-                let qh1 = if par == 0 { h1 } else { funnel16(h1, h2) };
-                let qh2 = if par == 0 { h2 } else { funnel16(h2, h3) };
-                let qh3 = if par == 0 { h3 } else { funnel16(h3, h4) };
-
-                let ak = (base + 192) >> 2;
-                // SAFETY: ak + 4 is at most the stack's final (possibly
-                // zero-padded) word for the last super-block of the last
-                // row; the launch contract bounds 4·w.len().
-                let (a0, a1, a2, a3, a4) = unsafe {
-                    (
-                        *w.get_unchecked(ak),
-                        *w.get_unchecked(ak + 1),
-                        *w.get_unchecked(ak + 2),
-                        *w.get_unchecked(ak + 3),
-                        *w.get_unchecked(ak + 4),
-                    )
-                };
-                let (sw0, sw1, sw2, sw3, d_bits) = if par == 0 {
-                    (a0, a1, a2, a3, (a4 & 0xffff) as u16)
-                } else {
-                    (
-                        funnel16(a0, a1),
-                        funnel16(a1, a2),
-                        funnel16(a2, a3),
-                        funnel16(a3, a4),
-                        (a4 >> 16) as u16,
-                    )
-                };
-                let sc = q6k_sub_scale(&[sw0, sw1, sw2, sw3], w16);
-                let drow = half_to_f32(d_bits);
-                let vi = [
-                    q6k_dequant(ql0, qh0, nib_sh, hib_sh),
-                    q6k_dequant(ql1, qh1, nib_sh, hib_sh),
-                    q6k_dequant(ql2, qh2, nib_sh, hib_sh),
-                    q6k_dequant(ql3, qh3, nib_sh, hib_sh),
-                ];
-                let qb = q0c + 128 * it as usize + lane;
-                let d8b = d0c + 2 * sbp + (w16 >> 3);
-                // SAFETY: qb + 99 < q0c + q_col — this lane's four q8 words
-                // are inside column `slot`'s q_col words, slot < n_slots; d8b
-                // < d0c + d8_col by the sbp guard.
-                let (q0, q1, q2, q3, e0) = unsafe {
-                    (
-                        *q.get_unchecked(qb),
-                        *q.get_unchecked(qb + 32),
-                        *q.get_unchecked(qb + 64),
-                        *q.get_unchecked(qb + 96),
-                        *d8.get_unchecked(d8b),
-                    )
-                };
-                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
-                f0 += (a as f32) * (e0 * drow * sc as f32);
-            }
-            it += 1;
-        }
-        let s0 = warp::reduce_sum_f32(f0);
+        // SAFETY: row_abs bounds the weight row and slot bounds q and d8
+        // by the launch contract; the returns above are warp-uniform.
+        let s0 = q6k_sel_row_dot!(w, row_abs * row_bytes, q, d8, n_sb, iters, slot, lane);
         if lane == 0 {
             // SAFETY: row < n_slots·rows_per_expert <= y.len() by the launch
             // contract; only lane 0 of the warp writes y[row].
@@ -207,8 +221,8 @@ mod q6k_sel_kernels {
     }
 
     /// `q6k_gemv_sel` with the warp's row asked of L2 first ([`l2_prefetch`]):
-    /// the entry an integrated device launches. Its body is `q6k_gemv_sel`'s,
-    /// copied: sharing it through an inline walk changes `q6k_gemv_sel`'s PTX.
+    /// the entry an integrated device launches. Its row walk is
+    /// [`q6k_sel_row_dot`], `q6k_gemv_sel`'s body.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -259,113 +273,92 @@ mod q6k_sel_kernels {
         let n_sb = n_sb as usize;
         let row_bytes = 210 * n_sb;
         l2_prefetch(w, row_abs * row_bytes, row_bytes, lane);
-        let q_col = 128 * iters as usize;
-        let d8_col = 2 * n_sb;
-        let q0c = q_col * slot;
-        let d0c = d8_col * slot;
-
-        let w16 = lane & 15;
-        let half = lane >> 4;
-        let qlok = 16 * (w16 & 3);
-        let qhok = 16 * (w16 & 1);
-        let nib_sh = ((w16 >> 2) & 1) as u32 * 4;
-        let hib_sh = 2 * ((w16 >> 1) as u32 & 3);
-
-        let mut f0 = 0.0f32;
-        let mut it: u32 = 0;
-        while it < iters {
-            let sbp = ((it << 1) | half as u32) as usize;
-            if sbp < n_sb {
-                let base = row_abs * row_bytes + sbp * 210;
-                let par = (base >> 1) & 1;
-
-                let lk = (base + 64 * (w16 >> 3) + qlok) >> 2;
-                // SAFETY: row_abs < n_experts·rows_per_expert, so the window
-                // ends inside the stack's words (launch contract: 4·w.len()
-                // covers every row's 210·n_sb bytes; the floored word index
-                // of a window stays inside the row's words, as in q6k_gemv).
-                let (l0, l1, l2, l3, l4) = unsafe {
-                    (
-                        *w.get_unchecked(lk),
-                        *w.get_unchecked(lk + 1),
-                        *w.get_unchecked(lk + 2),
-                        *w.get_unchecked(lk + 3),
-                        *w.get_unchecked(lk + 4),
-                    )
-                };
-                let ql0 = if par == 0 { l0 } else { funnel16(l0, l1) };
-                let ql1 = if par == 0 { l1 } else { funnel16(l1, l2) };
-                let ql2 = if par == 0 { l2 } else { funnel16(l2, l3) };
-                let ql3 = if par == 0 { l3 } else { funnel16(l3, l4) };
-
-                let hk = (base + 128 + 32 * (w16 >> 3) + qhok) >> 2;
-                // SAFETY: the same row bounds as the ql window.
-                let (h0, h1, h2, h3, h4) = unsafe {
-                    (
-                        *w.get_unchecked(hk),
-                        *w.get_unchecked(hk + 1),
-                        *w.get_unchecked(hk + 2),
-                        *w.get_unchecked(hk + 3),
-                        *w.get_unchecked(hk + 4),
-                    )
-                };
-                let qh0 = if par == 0 { h0 } else { funnel16(h0, h1) };
-                let qh1 = if par == 0 { h1 } else { funnel16(h1, h2) };
-                let qh2 = if par == 0 { h2 } else { funnel16(h2, h3) };
-                let qh3 = if par == 0 { h3 } else { funnel16(h3, h4) };
-
-                let ak = (base + 192) >> 2;
-                // SAFETY: ak + 4 is at most the stack's final (possibly
-                // zero-padded) word for the last super-block of the last
-                // row; the launch contract bounds 4·w.len().
-                let (a0, a1, a2, a3, a4) = unsafe {
-                    (
-                        *w.get_unchecked(ak),
-                        *w.get_unchecked(ak + 1),
-                        *w.get_unchecked(ak + 2),
-                        *w.get_unchecked(ak + 3),
-                        *w.get_unchecked(ak + 4),
-                    )
-                };
-                let (sw0, sw1, sw2, sw3, d_bits) = if par == 0 {
-                    (a0, a1, a2, a3, (a4 & 0xffff) as u16)
-                } else {
-                    (
-                        funnel16(a0, a1),
-                        funnel16(a1, a2),
-                        funnel16(a2, a3),
-                        funnel16(a3, a4),
-                        (a4 >> 16) as u16,
-                    )
-                };
-                let sc = q6k_sub_scale(&[sw0, sw1, sw2, sw3], w16);
-                let drow = half_to_f32(d_bits);
-                let vi = [
-                    q6k_dequant(ql0, qh0, nib_sh, hib_sh),
-                    q6k_dequant(ql1, qh1, nib_sh, hib_sh),
-                    q6k_dequant(ql2, qh2, nib_sh, hib_sh),
-                    q6k_dequant(ql3, qh3, nib_sh, hib_sh),
-                ];
-                let qb = q0c + 128 * it as usize + lane;
-                let d8b = d0c + 2 * sbp + (w16 >> 3);
-                // SAFETY: qb + 99 < q0c + q_col — this lane's four q8 words
-                // are inside column `slot`'s q_col words, slot < n_slots; d8b
-                // < d0c + d8_col by the sbp guard.
-                let (q0, q1, q2, q3, e0) = unsafe {
-                    (
-                        *q.get_unchecked(qb),
-                        *q.get_unchecked(qb + 32),
-                        *q.get_unchecked(qb + 64),
-                        *q.get_unchecked(qb + 96),
-                        *d8.get_unchecked(d8b),
-                    )
-                };
-                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
-                f0 += (a as f32) * (e0 * drow * sc as f32);
+        // SAFETY: row_abs < n_experts·rows_per_expert, so the launch
+        // contract's 4·w.len() covers the row's 210·n_sb bytes and the
+        // stack's final word; slot < n_slots bounds q and d8 by the same
+        // contract; the host passes iters = ceil(n_sb/2); the returns above
+        // are warp-uniform, so all 32 lanes are here.
+        let s0 = q6k_sel_row_dot!(w, row_abs * row_bytes, q, d8, n_sb, iters, slot, lane);
+        if lane == 0 {
+            // SAFETY: row < n_slots·rows_per_expert <= y.len() by the launch
+            // contract; only lane 0 of the warp writes y[row].
+            unsafe {
+                *y.get_unchecked_mut(row) = s0;
             }
-            it += 1;
         }
-        let s0 = warp::reduce_sum_f32(f0);
+    }
+
+    /// The Q6_K down arena entry: [`q6k_gemv_sel`] with slot `slot`'s
+    /// expert read from its down part in `arena` (word
+    /// `offs[slot · ARENA_PARTS + PART_DOWN]`, the expert's rows as its file
+    /// holds them) instead of from the stack by id; row `r` of the part is
+    /// the expert's row `r`, so the same bytes give the same bits. The part
+    /// starts on a word, so a super-block's byte parity is the stack's. A
+    /// slot marked [`ARENA_SKIP`] is left alone; a part that does not lie
+    /// inside the arena raises [`FaultSite::ExpertId`] on `fault` before any
+    /// weight load and leaves the slot of `y` untouched. Its row walk is
+    /// [`q6k_sel_row_dot`], as `q6k_gemv_sel_prefetch`'s.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            offs.len() >= n_slots * 3,
+            q.len() >= n_slots * 128 * iters,
+            d8.len() >= n_slots * 2 * n_sb,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn q6k_gemv_sel_at(
+        arena: &[u32],
+        offs: &[u64],
+        q: &[u32],
+        d8: &[f32],
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        let slot = row / rows_per_expert as usize;
+        // SAFETY: slot < n_slots, so the index is inside offs by the launch
+        // contract (3 = ARENA_PARTS); the load is warp-uniform (all 32 lanes
+        // share `row`, hence `slot`).
+        let off = unsafe { *offs.get_unchecked(slot * ARENA_PARTS + PART_DOWN) };
+        let lane = warp::lane_id() as usize;
+        if off == ARENA_SKIP {
+            return;
+        }
+        let n_sb = n_sb as usize;
+        let row_bytes = 210 * n_sb;
+        let Some(w) = arena_part(
+            arena,
+            off,
+            (rows_per_expert as usize * row_bytes).div_ceil(4),
+        ) else {
+            if lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        };
+        let row_abs = row % rows_per_expert as usize;
+        // SAFETY: row_abs < rows_per_expert, so `arena_part`'s words (every
+        // row's 210·n_sb bytes, rounded up to a word) hold the row; slot <
+        // n_slots bounds q and d8 by the launch contract; the host passes
+        // iters = ceil(n_sb/2); the returns above are warp-uniform, so all
+        // 32 lanes are here.
+        let s0 = q6k_sel_row_dot!(w, row_abs * row_bytes, q, d8, n_sb, iters, slot, lane);
         if lane == 0 {
             // SAFETY: row < n_slots·rows_per_expert <= y.len() by the launch
             // contract; only lane 0 of the warp writes y[row].
@@ -529,6 +522,40 @@ impl Q6kSelKernels {
                 y,
             )?;
         }
+        Ok(())
+    }
+
+    /// Enqueue the Q6_K down arena entry (`q6k_gemv_sel_at`): as
+    /// [`Self::enqueue_gemv_q6k_sel`], slot `s`'s expert the down part at its
+    /// offset in `a.arena` (`kquant::sel`'s table; a slot marked
+    /// [`ARENA_SKIP`] is left alone and a part past the arena raises
+    /// [`FaultSite::ExpertId`] on `fault`). Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_gemv_q6k_sel_at(
+        &self,
+        stream: &CudaStream,
+        a: &SelDownAt<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let d = down_at_dims("enqueue_gemv_q6k_sel_at", a, y.len())?;
+        let prep = self
+            .module
+            .prepare_q6k_gemv_sel_at(LaunchConfig1D::new(d.grid, 256, 0))?;
+        self.module.q6k_gemv_sel_at(
+            stream,
+            &prep,
+            a.arena,
+            a.offs,
+            &a.act.q6,
+            &a.act.d8,
+            d.rows_per_expert,
+            d.n_slots,
+            d.n_sb,
+            d.n_sb.div_ceil(2),
+            fault,
+            y,
+        )?;
         Ok(())
     }
 }

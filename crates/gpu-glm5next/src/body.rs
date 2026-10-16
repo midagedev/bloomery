@@ -1711,6 +1711,9 @@ impl Body {
             hybrid.prepare_batch(gpu.context(), prefill::T_MAX.min(ctx))?;
             hybrid.check_tier_reserves(plan.machine, &cards)?;
         }
+        // The residency machine frees arena slots between passes, which a
+        // card hold keeps: a load that starts one keeps the host leg.
+        hybrid.attach_arena_leg(gpu, glue.source().is_some())?;
         let embd = Embedding::new(file, dims.embd)?;
         if embd.n_vocab != hp.n_vocab {
             return Err(shape(format!(

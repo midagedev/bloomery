@@ -171,6 +171,18 @@ impl HostRun {
         self.layers.is_empty()
     }
 
+    /// Every layer's host view, the run's first layer first.
+    #[must_use]
+    pub fn layers(&self) -> &[HostLayer] {
+        &self.layers
+    }
+
+    /// The routed experts' feed-forward width the run serves.
+    #[must_use]
+    pub fn ff(&self) -> usize {
+        self.widths.ff
+    }
+
     /// Layer `layer`'s host view, `None` outside the run.
     #[must_use]
     pub fn layer(&self, layer: usize) -> Option<&HostLayer> {

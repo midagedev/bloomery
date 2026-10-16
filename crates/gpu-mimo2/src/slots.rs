@@ -794,7 +794,7 @@ impl<'s> LayerProgram for PassProgram<'s> {
         let stream = gpu.stream();
         let s = &mut self.b.s;
         let boundary = port.hybrid().boundary();
-        boundary.enqueue_back_of(stream, 0)?;
+        boundary.enqueue_back_of(stream, 0, l)?;
         let shadowed = if self.card.has(l) {
             self.card.pass_pre()?
         } else {

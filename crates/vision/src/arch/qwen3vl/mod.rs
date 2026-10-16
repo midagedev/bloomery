@@ -3,7 +3,7 @@
 //! MLP, a learned 48×48 position table, a Conv3d patch embedding stored as two 16×16 kernels —
 //! and the merger (a 2×2 merge into a 4608-wide MLP).
 //!
-//! The host side of an image is llama.cpp's mtmd rule for this projector: [`size`] plans the
+//! The host side of an image is llama.cpp's mtmd rule for this projector: [`crate::size`] plans the
 //! pixel size, [`media`] pads the image onto a black canvas, normalizes it and cuts it in merge
 //! order with each patch repeated over the two temporal frames.
 
@@ -11,12 +11,12 @@ pub mod card;
 pub mod hparams;
 pub mod media;
 pub mod names;
-pub mod size;
 pub mod tensors;
 
+pub use crate::size;
+pub use crate::size::{SizeRule, TokenLimits};
 pub use hparams::Hparams;
 pub use media::{Media, preprocess};
-pub use size::{SizeRule, TokenLimits};
 
 /// `projector_type` of the files this module reads.
 pub const PROJECTOR_TYPE: &str = "qwen3vl_merger";

@@ -15,6 +15,8 @@ pub const ROWS: &[Row] = &[
         ctx: model::arch::gemma_embedding2::hparams::CARD_CTX,
         bytes,
         open,
+        projector_file: Some("mmproj-embeddinggemma-2-BF16.gguf"),
+        projector_types: &[vision::arch::gemma4v::PROJECTOR_TYPE],
     },
 ];
 

@@ -1,0 +1,41 @@
+# P4 T4: GLM-5.3-Flash UD-Q4_K_XL on one DGX Spark with the step port's card leg on (auto: the arena is pinned and
+# the card reads the held ids' slots) against off (BLOOMERY_NVTIER_MEM=anon: the host leg reads them), same binary.
+# Placed at docs/cards/t4-glm-card-leg.card in the tree that runs the sitting.
+#
+# The load [read: the day-1 plan line of the S7 head at these levers]: ~~card_experts=4137, paged 115.9 GB~~,
+# arena 24,696,061,952 B, arena_slots=38, n_used 8, 42 routed layers.
+# Corrected [read: the four arms' plan lines at --ctx 768; the day-1 line was a serve probe's, not this load's]:
+# card_experts=4193 (63,751,847,936 B). Three arms planned paged=108,877,512,704 B with host_experts
+# 12,849,053,696 B at a room of 124.77 to 124.78 GB; anon-a read a room of 123,851,919,360 B and planned
+# paged=109,806,092,288 B with host_experts 11,920,474,112 B. Each arm's nvtier record carries its own paged, here
+# equal to its plan's.
+#
+# Terms [derived]:
+#   fills a token     62.9 on the #100 merge's plan (108.9 GB paged, 4193 card experts); ~~this plan pages 6 %
+#                     more and holds 56 fewer card experts: 63..72~~ this plan is that plan (anon-a: 0.9 % more
+#                     paged): about 63 in both arms (the leg changes who computes a held id, not which ids miss).
+#   fill wall         3.27 ms a fill on the decode path, on the step's path in both arms: 205..235 ms a token.
+#   card reads        (k row 4) 194 paged picks a token x 15.2 MB at 167.8 GB/s (WC random rows) = 17.6 ms, plus
+#                     six launches x 42 layers x 0.553 us = 0.14 ms, in place of the host leg's work on those picks.
+#   host leg          the rest of the #100 merge's step, 381 - 206 = 175 ms, carries the host's 220 picks a token;
+#                     194 of them move to the card, so 120..155 ms leave the host's path [assumption: the host's
+#                     share of the 175 ms is 70..90 %, the card's own experts overlap it].
+#   auto step         anon step - (120..155) + 18: with anon at 380..420 ms, auto is 245..315 ms.
+#   effect            auto / anon - 1 = -36 .. -18 %.
+kind: profile
+question: how much the card leg takes off GLM-5.3-Flash UD-Q4_K_XL's decode step on one DGX Spark when the card
+  reads the step's arena ids from their pinned slots instead of the host leg reading them
+term: the auto arm's mean decode step against the anon arm's, auto / anon - 1, @ 96 greedy steps after a 512-id
+  prompt, one slot, MTP off, --place a, CARD_BUDGET=70G NVTIER_BYTES=23G, GB10
+unit: %
+predict: -36..-18
+condition: generate_glm5next -n 97 --time under lease-hold, one process an arm, arms in the order anon, auto, anon,
+  auto, the same binary, prompt ids and levers; the auto arms' nvtier record reads card_leg=on with card_ids > 0,
+  the anon arms' card_leg=off_anon; before each arm no GPU compute process, no container
+  and a 1-minute load average under 1.00; no ssh login to the node during an arm
+decide-in: report the step, fills, card_ids and the token match of the two arms; the leg's step gain stands as
+  derived and the fills' wall stays the next term ((c)'s lookahead)
+decide-below: the host leg's share of the anon step is larger than derived: report the step and re-derive the
+  host term from the anon arm's step less its fill wall before reporting the gain
+decide-above: the card's reads or the hold cost more than derived: check the auto arm's fills
+  against the anon arm's and the card's arena read rate before reporting the gain

@@ -220,6 +220,7 @@ cp "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/dspark-path.sh" "$ROOT/tools/
   "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/lcpp-warm.sh" "$ROOT/tools/ref/cold-blocks.sh" \
   "$ROOT/tools/ref/gguf-ranges.py" "$ROOT/tools/ref/lever-arms.sh" "$ROOT/tools/ref/arm-place.sh" "$ROOT/tools/ref/slots-arm.sh" \
+  "$ROOT/tools/ref/source-inspection.sh" \
   "$T/tools/ref/"
 cp "$ROOT/tools/ref/models/glm5next.sh" "$T/tools/ref/models/"
 cp "$ROOT/tools/gate-bound.sh" "$T/tools/"
@@ -448,6 +449,10 @@ echo "tokens [$(for i in $(seq 0 $((n - 1))); do [ "$i" = 0 ] && printf '%s' "${
 echo "SMOKE mode=graph place=$place prompt_tokens=$depth depth=$depth generated=$n warm=0 steps=$((n - 1)) p50_ms=$sms mean_ms=$sms tok/s(p50)=30.30"
 EOF
 chmod +x "$T/bin/"* "$T/pr27752/"* "$T/pr27754/"* "$G"
+# The reference trees sit inside this inspectable source tree; their untracked stubs are not dirty files.
+git -C "$T" init -q || exit 2
+git -C "$T" -c user.name=Stub -c user.email=stub@example.invalid -c commit.gpgsign=false \
+  commit --allow-empty -qm 'stub source provenance' || exit 2
 
 n=0 failed=0
 pass() { n=$((n + 1)); echo "ok $1"; }

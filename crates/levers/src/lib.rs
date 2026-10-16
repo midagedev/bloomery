@@ -210,9 +210,9 @@ impl Kind {
                 let mut addrs: Vec<SocketAddr> = Vec::new();
                 for a in v.split(',') {
                     let a: SocketAddr = a.parse().map_err(|_| refused(None))?;
-                    if !a.ip().is_loopback() {
+                    if !tier_ip(a.ip()) {
                         return Err(refused(Some(
-                            "an address off this host: a tier node shares this host's memory",
+                            "a tier node needs a loopback or private IPv4 address",
                         )));
                     }
                     if addrs.contains(&a) {
@@ -258,7 +258,7 @@ impl Kind {
             ),
             Kind::Text => "what its owner takes".to_string(),
             Kind::Addrs => {
-                "loopback IP:port socket addresses, comma-separated, at least one, none twice"
+                "loopback or private IPv4 IP:port socket addresses, comma-separated, at least one, none twice"
                     .to_string()
             }
             Kind::Residency => {
@@ -700,7 +700,7 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
                     Scope::NvTier => continue,
                     Scope::TierLink if link(row.name) => true,
                     Scope::TierLink => continue,
-                    Scope::TierNodes if nodes(row.name) => true,
+                    Scope::TierNodes if nodes(row.name) || link(row.name) => true,
                     Scope::TierNodes => continue,
                 };
                 match (get(row.name), scope) {
@@ -726,6 +726,22 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
             }
             Site::Direct { .. } | Site::Env { .. } => {}
         }
+    }
+    if let Some(entry) = entries.iter().find(|e| e.row.name == TIER_NODES)
+        && let Some(Value::Addrs(addrs)) = &entry.value
+        && addrs.iter().any(|a| !a.ip().is_loopback())
+        && !entries
+            .iter()
+            .any(|e| e.row.name == TIER_LINK && e.value == Some(Value::Word("rdma")))
+    {
+        refused.push(Refusal {
+            name: TIER_NODES.to_string(),
+            value: entry
+                .set
+                .clone()
+                .expect("node addresses came from a set lever"),
+            why: Why::Value(format!("a node off this host requires {TIER_LINK}=rdma")),
+        });
     }
     if let Scope::Main { .. } = scope {
         let mut seen: Vec<&OsStr> = Vec::new();
@@ -2582,10 +2598,16 @@ pub fn tier_link() -> Result<TierLink, LeverError> {
     }
 }
 
+/// Whether a tier's explicit listen or connect address is on a trusted local network.
+#[must_use]
+pub fn tier_ip(ip: std::net::IpAddr) -> bool {
+    ip.is_loopback() || matches!(ip, std::net::IpAddr::V4(v) if v.is_private())
+}
+
 /// `BLOOMERY_TIER_NODES` from the process environment ([`TIER_NODES`]),
 /// parsed as [`at_main`] parses it, and refused when it is set to a value its
 /// kind does not take and when a retired name is set: the address of each
-/// expert tier's node, in tier order; empty when unset. Nothing else.
+/// expert tier's node, in tier order; empty when unset. An off-host node requires RDMA.
 pub fn tier_nodes() -> Result<Vec<SocketAddr>, LeverError> {
     let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     let levers = read(&env, Scope::TierNodes)?;

@@ -60,8 +60,13 @@ def self_test():
     schema = records.load('gate_qwen38_nodes', Path(__file__).with_name('data') / 'tier-cost.schema.jsonl')
     line = ('tier cost arm=local plan=ctx=3072 ub=8 stage=[1] tier=[[1]] host=1 '
             'history=[1, 2] tokens=[3, 4] prompt=1 decode=1 tg_tps=100.000000 '
-            'step_ms=10.000000 gpu_processes=1')
+            'step_ms=10.000000 gpu_processes=1 budget_gib=64 elapsed_s=0.010000000 '
+            'control_round_trips=0 handoffs=2 read_terms=Some(Terms { hbm: 4096 }) '
+            'wire=[(128, [64, 64])] hits_before=[[1, 0]] hits_after=[[2, 1]]')
     local = sample([line], schema)
+    assert [local[k] for k in ('budget_gib', 'elapsed_s', 'control_round_trips', 'handoffs')] == [64, 0.01, 0, 2]
+    assert [local[k] for k in ('read_terms', 'wire', 'hits_before', 'hits_after')] == [
+        'Some(Terms { hbm: 4096 })', '[(128, [64, 64])]', '[[1, 0]]', '[[2, 1]]']
     node = dict(local, arm='node', tg_tps=80.0, step_ms=12.5, gpu_processes=2)
     pairs = [(local, node), (local, node)]
     out = io.StringIO()
@@ -102,7 +107,8 @@ def self_test():
             cases += 1
         else:
             raise AssertionError(f'malformed sample accepted: {new}')
-    for lines in ([], [line, line], [line.replace(' decode=1', '')]):
+    for lines in ([], [line, line], [line.replace(' decode=1', '')],
+                  [line.replace(' hits_after=[[2, 1]]', '')]):
         try:
             sample(lines, schema)
         except ValueError:

@@ -785,7 +785,7 @@ build-emb1-ref: (build-embedding-ref "gemma-embedding")
 build-embedding-ref MODEL:
     BLOOMERY_MODEL={{MODEL}} ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
 
-# EmbeddingGemma 2, the oracle sets (tools/ref/emb2/emb2.sh; refset families in crates/refset/src/arch/gemma_embedding2) into $BLOOMERY_DATA: every text case's token rows, pooled vector and layer taps (ref_gemma_embedding2_text), the image cases' tower taps and rows (ref_gemma_embedding2_tower), llama-server's /v1/embeddings vectors of both (ref_gemma_embedding2_server), and the CPU twins of the first two (.cpu). The text cases and their ids are the tokenizer oracle's gemma4 set: `just dump-ref-tokenizer gemma4` first. STEPS names some of text, tower, server, text.cpu and tower.cpu (none: all five). The card steps go through the card's gate lock (EMB2_BOUND is the call's and each step's bound); no lease.
+# EmbeddingGemma 2, the oracle sets (tools/ref/emb2/emb2.sh; refset families in crates/refset/src/arch/gemma_embedding2) into $BLOOMERY_DATA: every text case's token rows, pooled vector and layer taps (ref_gemma_embedding2_text), the image cases' tower taps and rows (ref_gemma_embedding2_tower), llama-server's /v1/embeddings vectors of both (ref_gemma_embedding2_server), and the CPU twins of all three (.cpu). The text cases and their ids are the tokenizer oracle's gemma4 set: `just dump-ref-tokenizer gemma4` first. STEPS names some of text, tower, server, text.cpu, tower.cpu and server.cpu (none: all six). The card steps go through the card's gate lock (EMB2_BOUND is the call's and each step's bound); no lease.
 dump-ref-emb2 *STEPS: (dump-ref-embedding "gemma-embedding2" STEPS)
 
 # Gemma4a host mel from synthetic decoded PCM, using the existing pinned mainline tree.
@@ -1231,6 +1231,7 @@ gate-gpu-qwen3moe-head:
 # fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터. `--bench-kernels`는 판정 대신 런치 값을 잰다
 # (리드 전용, `bench-gpu-kernels`).
 gate-gpu-gemm *ARGS:
+    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gpu --bin gate_gemm -- workers_must_complete'
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
 
 # 선형 어텐션(Gated DeltaNet) 카드 커널 셋 — conv+준비, delta 스텝, 게이트 노름 — 을 호스트 규칙과 비트로 맞춘다.
@@ -1250,6 +1251,10 @@ gate-gpu-qwen35moe-attn:
 gate-gpu-gemma-embedding2-head512:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding2_head512 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_head512'
 
+# Head-256 pack-one prefill, whole inputs and symmetric windows, against the f64 attention band.
+gate-gpu-gemma-embedding-head256:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding_head256 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding_head256'
+
 # EmbeddingGemma 2 beside Qwen3-30B-A3B Q4_K_M: server vectors, placement cost, pool reserve,
 # greedy tokens with embedding calls in flight, and named refusals; the runner holds one card.
 [group('pool')]
@@ -1264,8 +1269,13 @@ gate-gpu-gemma-embedding2-serve:
 gate-gpu-gemma-embedding2-e2e:
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gemma-embedding2 --lib -- --include-ignored'
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::gemma_embedding2::spec::tests::key_bounds_are_the_symmetric_mask --exact'
-    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gemma-embedding2 --bin gate_gemma_embedding2_e2e'
-    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e'
+    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --bin gate_gemma_embedding2_e2e'
+    BLOOMERY_MODEL=gemma-embedding2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e'
+
+# Gemma4 vision's mainline card and CPU sets, including every block's rows.
+# Every layer and projected row is held to its CPU/card twin distance.
+gate-gpu-gemma4v-tower:
+    BLOOMERY_MODEL=gemma-embedding2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_gemma4v_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma4v_tower'
 
 # GLM-5.3-Flash MLA 층의 카드 부분 — 잠재 RMS + f16 추가, 인덱서 키 LayerNorm + [키; 게이트] 추가(`latent`),
 # 창 0·싱크 −∞·스케일 1/16으로 다시 쓰는 V4.1 어텐션 — 을 모델 없이 합성 입력으로 호스트 규칙에 맞춘다.
@@ -1438,6 +1448,11 @@ gate-models:
 [group('host')]
 gate-app:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-app --release --lib'
+
+# The Qwen planner's host-only default-context refusal and halving contract. Opens no card.
+[group('host')]
+gate-qwen3-plan:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe'
 
 # 2단계 qdot 게이트: Q3_K×Q8_K 융합 커널이 현재 경로(dequant+roundtrip+f32)와
 # 1e-5 안팎에서 일치하고, 정확해(f64)에 더 가깝고, 스칼라 폴백과 비트 동일인가.
@@ -1871,15 +1886,15 @@ gate-gpu-ds41-residency-a:
 # V4.1's attach of the NVMe expert tier (shared/nvtier_family.rs, whose clauses a second family calls): a paged arm
 # against an all-RAM arm on the same file, plan (a), the residency off, the r8 pair off — the paged plan's arena is
 # the given slots, the tier built and covering every paged layer, one prompt call and greedy steps bit for bit the
-# all-RAM arm's, the room under the floor, the arena under its floor and the r8 sidecar on a paged plan each refused
-# by name, and the unset residency `off` with why `paged`. Each arm's room and arena reach the plan through
-# PlanInputs, so no environment crosses the tiers. The A6000 alone, one load at a time.
+# all-RAM arm's, the tier's card leg unattached, the room under the floor, the arena under its floor and the r8
+# sidecar on a paged plan each refused by name, and the unset residency `off` with why `paged`. Each arm's room and
+# arena reach the plan through PlanInputs, so no environment crosses the tiers. The A6000 alone, one load at a time.
 # Group solo-real, reason r1 (its host set is the whole file on the real tier, ~15 GB on a fixture) on one card, the A6000 by
 # box.sh's pick (`BLOOMERY_CARD=a6000`): alone in the real tier, and in the fixture tier fixed to lane B.
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-ds41-nvtier:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_nvtier && bash tools/gpu-gate.sh gate_ds41_nvtier'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --bin gate_ds41_nvtier && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_nvtier && bash tools/gpu-gate.sh gate_ds41_nvtier'
 
 # V4.1 long runs on the gate placement, three arms on one load, the host set populated and locked
 # (BLOOMERY_HOST_LOCK=1 unless the environment says otherwise: populated pages alone are reclaimed under
@@ -2127,6 +2142,12 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k --slots':
 [group('v41-load')]
 gate-gpu-qwen38-nodes:
     BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_nodes --bin tier_server && bash tools/gpu-gate.sh gate_qwen38_nodes'
+
+# A refused replay on a separate tier node resets to its fresh history. Requires BLOOMERY_TIER_NODES
+# and BLOOMERY_TIER_LINK=rdma, with tier_server already serving the same model on that node.
+[group('v41-load')]
+gate-gpu-qwen38-nodes-remote:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes -- --ignored hw_a_refused_remote_replay_resets_to_its_fresh_history --nocapture'
 
 # The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
 # ("The capital of France is") and its ids the profile's REF_TOKENS — ik's llama-tokenize on this model's
@@ -2730,16 +2751,20 @@ gate-gpu-glm5next-mtp:
 # glm5next (GLM-5.3-Flash)'s attach of the NVMe expert tier (shared/nvtier_family.rs, whose clauses V4.1's gate calls first): a
 # paged arm against an all-RAM arm on the same file on the gate placement, the residency off — the paged plan's arena is the
 # given slots (sized from the file: at most 64, fewer where the need leaves less above the floor), the tier built and covering
-# every paged layer, one prompt call and greedy steps bit for bit the all-RAM arm's, the room under the floor and the arena
-# under its floor each refused by name, the NextN plan refused at the room the draft layer's routed experts leave under the
-# floor and planned above it, and the unset residency as the plan's numbers say, never why `paged`.
-# Each arm's room and arena reach the plan through PlanInputs, so no environment crosses the tiers. The fixture tier runs on
-# the `q6kdown` variant (tools/fixture-variants.tsv: every routed layer on the host). Group solo-real, reason r1 (the real tier
-# loads the whole file twice), balanced over the cards in the fixture tier, under the big-load lock the V4.1 loads take.
+# every paged layer, one prompt call and greedy steps on the host leg's paged arm bit for bit the all-RAM arm's, the card
+# leg's paged arm (a pinned arena: on an integrated device by default, else a child of the gate at BLOOMERY_NVTIER_MEM=pinned)
+# claiming on the step port only the ids the leg held and replaying its eager steps bit for bit, the
+# room under the floor and the arena under its floor each refused by name, the NextN plan refused at the room the draft
+# layer's routed experts leave under the floor and planned above it, and the unset residency as the plan's numbers say,
+# never why `paged`.
+# Each arm's room and arena reach the plan through PlanInputs, so no environment crosses the tiers; the one variable the gate
+# sets is its arm child's BLOOMERY_NVTIER_MEM. The fixture tier runs on the `q6kdown` variant (tools/fixture-variants.tsv:
+# every routed layer on the host). Group solo-real, reason r1 (the real tier loads the whole file three times, one load at a
+# time), balanced over the cards in the fixture tier, under the big-load lock the V4.1 loads take.
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-glm5next-nvtier:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_nvtier && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_nvtier'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next --bin gate_glm5next_nvtier && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_nvtier && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_nvtier'
 
 # glm5next (GLM-5.3-Flash) on plan (b′): the stage on the A6000, the expert tier on the 3090 (`app::arch::glm5next::open_pair`
 # at --place bp, two KDA lanes, under a card budget on both cards: 16 GiB in the real tier, the header's in the fixture

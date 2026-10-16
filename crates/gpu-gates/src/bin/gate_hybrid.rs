@@ -842,7 +842,7 @@ mod gate {
             t.image.copy_from_host(stream, &img)?;
         }
         h.boundary().enqueue_go(stream, R_LAYER)?;
-        h.boundary().enqueue_back(stream)?;
+        h.boundary().enqueue_back(stream, R_LAYER)?;
         let r = h.layer_enqueued(R_LAYER);
         stream.synchronize()?;
         Ok((r, h.hsum_copy()?))
