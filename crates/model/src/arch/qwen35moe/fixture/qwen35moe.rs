@@ -41,7 +41,7 @@ use crate::fixture::{
     KeyRule, Tables, Window,
 };
 use crate::placement::accepts::{Program, routed_rule};
-use crate::placement::workstation::{self, RTX_3090, SCRATCH};
+use crate::placement::workstation::{self, RTX_3090};
 
 /// Fixture layer `f` holds source layer `LAYER_MAP[f]` (the table above).
 pub const LAYER_MAP: [usize; 4] = [5, 11, 0, 39];
@@ -108,7 +108,7 @@ fn default_source() -> String {
 
 /// The written file's per-layer card expert counts, planned as the Qwen3.6
 /// gates plan a file they open: the qwen3moe program's machine (its m = 1
-/// scratch plus the arena, [`workstation::placed_on`]) over the 3090's spec
+/// scratch plus the arena, [`workstation::placed_with_arena`]) over the 3090's spec
 /// and [`PLACED_SCRATCH`], the routed experts by the expert rule of the
 /// body's card leg (`routed_rule` of `Program::Qwen35Body`: a Q4_K or Q5_K gate
 /// and up, a Q4_K, Q5_K or Q6_K down) — not the Qwen3.8 program's, whose
@@ -118,7 +118,7 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
     super::card_experts_with(
         split,
         budget,
-        |inputs| workstation::placed_on(RTX_3090, inputs.hp.n_trunk, SCRATCH + PLACED_SCRATCH),
+        |inputs| workstation::placed_with_arena(RTX_3090, inputs.hp.n_trunk, PLACED_SCRATCH),
         |inputs, machine, levers| {
             inputs.plan_rule(
                 machine,

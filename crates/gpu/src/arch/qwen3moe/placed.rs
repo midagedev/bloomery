@@ -814,7 +814,7 @@ pub(super) fn prompt_rows(u: usize, ctx: usize) -> usize {
 /// forms `forms` holds past the m = 1 scratch: its ubatch arena at the placed
 /// units' rows ([`PLACED_ROWS`], [`arena_bytes`]) and its placed side
 /// ([`placed_bytes`]) — what the plan's machine counts in the card's scratch
-/// (`model::arch::qwen3moe::place::machine`), and what [`counted_arena`]
+/// (`model::placement::workstation::placed_with_arena`), and what [`counted_arena`]
 /// holds the load to.
 pub(super) fn placed_scratch(d: &Dims, layers: usize, forms: Forms) -> Result<u64, GpuError> {
     let arena = arena_bytes(d, prompt_rows(PLACED_ROWS, d.ctx), forms) as u64;

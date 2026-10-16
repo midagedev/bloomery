@@ -1258,7 +1258,7 @@ mod gate {
         // the plan holds in the card's scratch.
         let scratch = Qwen3moeModel::placed_arena_bytes(&file, ctx)?;
         let card = plan.machine.cards.first().ok_or("a plan of no card")?;
-        let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
+        let counted = model::placement::workstation::counted_arena_bytes(card);
         let counts = scratch == counted;
         println!(
             "placed scratch: the plan counts {counted} B, the ubatch arena and placed side the \
