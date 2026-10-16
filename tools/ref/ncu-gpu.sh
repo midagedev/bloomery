@@ -248,8 +248,8 @@ if [ "$FORM" = gemm ]; then
   GEMM_METRICS+=,sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active
   GEMM_METRICS+=,dram__throughput.avg.pct_of_peak_sustained_elapsed
   case $GEMM_ARM in
-    gemm_q4k_*_t*) ;;
-    *) echo "ncu-gpu.sh: BLOOMERY_NCU_GEMM_ARM is a gate_gemm grouped-GEMM arm (gemm_q4k_<label>_t<T>), got '$GEMM_ARM'" >&2; exit 64 ;;
+    gemm_*_t*) ;;
+    *) echo "ncu-gpu.sh: BLOOMERY_NCU_GEMM_ARM is a gate_gemm grouped-GEMM arm (gemm_<family>_<label>_t<T>: gemm_q4k_moe_t4096, gemm_iq2xxs_bolt_up_t448, ...), got '$GEMM_ARM'" >&2; exit 64 ;;
   esac
   case "$GEMM_SKIP:$COUNT" in
     *[!0-9:]* | :* | *:) echo "ncu-gpu.sh: BLOOMERY_NCU_SKIP and BLOOMERY_NCU_COUNT are whole numbers, got '$GEMM_SKIP' and '$COUNT'" >&2; exit 64 ;;
