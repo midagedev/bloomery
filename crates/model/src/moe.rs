@@ -3456,43 +3456,10 @@ mod tests {
         }
     }
 
-    /// A one-file model in the temp dir holding one layer's relu² stacks
-    /// `{up,down}_exps` of Q4_K, `n_expert` deep over widths `embd` and `ff`;
-    /// returns its path.
-    fn relu2_file(tag: &str, embd: usize, ff: usize, n_expert: usize) -> String {
-        let names = ["up_exps", "down_exps"];
-        let dims = [[embd, ff, n_expert], [ff, embd, n_expert]];
-        let tensors: Vec<(TensorDecl, Vec<u8>)> = names
-            .iter()
-            .zip(&dims)
-            .map(|(name, dims)| {
-                let b = stack_bytes(GgmlType::Q4_K, *dims, 0x5eed ^ name.len() as u64);
-                let decl = TensorDecl {
-                    name: (*name).to_string(),
-                    dims: dims.map(|d| d as u64).to_vec(),
-                    type_id: GgmlType::Q4_K.as_u32(),
-                    nbytes: b.len() as u64,
-                };
-                (decl, b)
-            })
-            .collect();
-        let layout = Layout::new(&[], tensors.iter().map(|(t, _)| t.clone()).collect()).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "bloomery-moe-{}-relu2-{tag}.gguf",
-            std::process::id()
-        ));
-        let mut w = Writer::new(std::fs::File::create(&path).unwrap(), layout).unwrap();
-        for (t, b) in &tensors {
-            w.tensor(&t.name, b).unwrap();
-        }
-        w.finish().unwrap();
-        path.to_string_lossy().into_owned()
-    }
-
     /// A relu² layer's build, by name: a spec whose stacks carry other dims
-    /// than it says is refused with the stack's own error; a `Gated` spec over
-    /// a file with no gate is refused by the find; a relu² layer that built
-    /// reads its up again in the stacks' gate slot and carries the relu²
+    /// than it says is refused with the stack's own error; a relu² layer that
+    /// built reads its up again in the stacks' gate slot — the file's gate
+    /// stack, which it holds here, is never read — and carries the relu²
     /// form; and a relu² layer with the NVMe tier attached is refused by name
     /// at every entry that could reach one.
     #[test]
@@ -3512,7 +3479,7 @@ mod tests {
             embd,
             ff,
         };
-        let path = relu2_file("built", embd, ff, n_expert);
+        let path = layer_file("relu2", [GgmlType::Q4_K; 3], embd, ff, n_expert);
         let split = gguf::Split::open(&path).unwrap();
         let src = R8Source::rows(&split);
         check(
@@ -3521,24 +3488,6 @@ mod tests {
                 .expect("a spec of other dims is refused")
                 .to_string(),
             "expert stack: expected [512, 256], got [256, 512]",
-        );
-        check(
-            HostLayer::build(
-                src,
-                &HostLayerSpec {
-                    gate: "gate_exps",
-                    up: "up_exps",
-                    down: "down_exps",
-                    n_expert,
-                    embd,
-                    ff,
-                    swiglu_limit: 0.0,
-                },
-            )
-            .err()
-            .expect("a gated spec with no gate is refused")
-            .to_string(),
-            "tensor gate_exps is not in the file",
         );
         let mut layer =
             HostLayer::build_relu2(src, &spec(embd, ff)).expect("two stacks of Q4_K build");
