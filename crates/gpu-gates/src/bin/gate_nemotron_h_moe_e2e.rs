@@ -116,10 +116,10 @@ mod e2e;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use crate::e2e::{Run, argmax, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
+    use crate::e2e::{argmax, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
     use bloomery_gpu::arch::nemotron_h_moe::{PASS_ROWS, Routing};
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel};
+    use bloomery_gpu::{Gpu, NemotronHMoeModel};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, open_split, verdict};
