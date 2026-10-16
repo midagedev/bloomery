@@ -635,6 +635,37 @@ impl Weights {
         self.by_name.remove(name)
     }
 
+    /// Replace the resident weight `name` with `w`, returning the old one
+    /// for the caller to drop: the load-time plane of a file tensor's own
+    /// bytes, byte-neutral, so the swap the loader makes frees the file's
+    /// buffers under the same name and every reader by that name sees the
+    /// plane. Refused by name when `name` is not resident or `w`'s rows are
+    /// not the old one's (a swap that changed shape would strand the
+    /// layer's launches). Load-time only: the plane's upload synchronized
+    /// before this, so dropping the old buffers frees memory nothing reads.
+    pub(crate) fn replace(&mut self, name: &str, w: DevWeight) -> Result<DevWeight, GpuError> {
+        let what = "Weights::replace";
+        let old = self
+            .by_name
+            .get(name)
+            .ok_or_else(|| GpuError::tensor(what, name, "a resident weight to replace"))?;
+        if w.rows() != old.rows() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{name} holds {} rows, the replacement {} — a replace keeps the shape",
+                    old.rows(),
+                    w.rows()
+                ),
+            ));
+        }
+        let old = self
+            .by_name
+            .insert(String::from(name), w)
+            .expect("resident above");
+        Ok(old)
+    }
+
     /// The resident weight `name`, refused by name as `what`'s when absent.
     pub fn resident(&self, what: &'static str, name: &str) -> Result<&DevWeight, GpuError> {
         self.get(name)
