@@ -9,8 +9,8 @@
 //!
 //! What does not live here, because the Mac cannot run it: the host tier's
 //! page locks and residency walks (`bloomery-model`'s
-//! `placement::host_lock`), the reading of `/proc/meminfo`
-//! (`placement::workstation::host_available`) and the r8 sidecar's writer
+//! `placement::host_lock`), the reading of `/proc/meminfo` once a plan's
+//! cards are held (`bloomery_gpu::room::HeldRoom`) and the r8 sidecar's writer
 //! and checker (`r8file`, which re-exports this crate's [`r8`]: the refusal
 //! type the planner's error wraps).
 

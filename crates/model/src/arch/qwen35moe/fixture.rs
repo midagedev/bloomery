@@ -231,9 +231,11 @@ pub fn const_value(leaf: &str) -> Option<f32> {
 /// ubatch a [`BUDGET_CTX`]-position load runs) under `budget` bytes — the
 /// plan the qwen4exp gates make of a file they open at that context.
 /// `describe`, not `read`: the gates' own choice, so a chat-surface item
-/// `read` refuses plans here as it does there.
+/// `read` refuses plans here as it does there. The room is one no host need
+/// passes, given, not read: the card counts read no host room.
 fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, FixtureError> {
-    let inputs = place::PlanInputs::describe(split)?;
+    let mut inputs = place::PlanInputs::describe(split)?;
+    inputs.room = Some((u64::MAX, crate::placement::workstation::HostRead::Given));
     let machine = place::machine_for_experts(
         RTX_3090,
         inputs.spec.layers.len(),

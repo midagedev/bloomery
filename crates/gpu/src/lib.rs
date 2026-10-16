@@ -68,6 +68,7 @@ pub mod q6k_sel;
 pub mod q8_0_sel32;
 pub mod q8f32;
 pub mod qsa;
+pub mod room;
 pub mod rope_neox;
 pub mod rope_table;
 pub mod route_body;
@@ -1959,6 +1960,18 @@ fn anchor(device: usize) -> Result<Arc<CudaContext>, GpuError> {
     }
 }
 
+/// Whether this process holds device `device` the way a `Gpu`'s first open
+/// leaves it: its anchor up ([`anchor`]) and this crate's bundle loaded on it
+/// ([`bundle_module`]) — what [`room::HeldRoom::read`] holds a card for.
+fn held(device: usize) -> bool {
+    let anchored = ANCHORS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(device)
+        .is_some_and(Option::is_some);
+    anchored && bundle_loads(device, env!("CARGO_PKG_NAME")) > 0
+}
+
 /// Device `dev`'s free bytes, read on its primary context: the context the
 /// load itself will run in, so the reading already carries the context's own
 /// creation cost (which a plan's cap adds back,
@@ -2262,14 +2275,12 @@ impl Gpu {
     }
 
     /// Open the visible device a plan's card is ([`Gpu::open_card`]) and
-    /// drop the handle, before the host's room is read for the plan: what a
-    /// device's first open takes of the host — its primary context, held as
-    /// the process's anchor ([`anchor`]), and this crate's bundle, loaded
-    /// once on it ([`bundle_module`]), both outliving every `Gpu` — is then
-    /// gone from that reading as it is from the load's reading after its own
-    /// open, which finds both in place (the census's retain and release leave
-    /// neither).
-    pub fn hold_card(
+    /// drop the handle: what a device's first open takes of the host — its
+    /// primary context, held as the process's anchor ([`anchor`]), and this
+    /// crate's bundle, loaded once on it ([`bundle_module`]), both outliving
+    /// every `Gpu` — stays (the census's retain and release leave neither).
+    /// The hold [`room::HeldRoom::read`] makes of a card before it reads.
+    pub(crate) fn hold_card(
         name: &str,
         device: Option<::model::placement::workstation::DeviceId>,
     ) -> Result<(), GpuError> {
@@ -2945,25 +2956,20 @@ mod context_tests {
             return;
         }
         let room = || {
-            let (bytes, read) =
-                ::model::placement::workstation::host_available_read().expect("the host's room");
+            let r = crate::room::HeldRoom::reading(Vec::new()).expect("the host's room");
             assert!(
-                !matches!(read, ::model::placement::workstation::HostRead::Given),
+                !matches!(
+                    r.read_by(),
+                    ::model::placement::workstation::HostRead::Given
+                ),
                 "a given room (BLOOMERY_HOST_ROOM): every reading is the same"
             );
-            i128::from(bytes)
+            i128::from(r.bytes())
         };
         // The process's anonymous and shared pages (`RssAnon`, `RssShmem`).
-        let pages = || -> i128 {
-            let status = std::fs::read_to_string("/proc/self/status").expect("the process status");
-            status
-                .lines()
-                .filter_map(|l| {
-                    let (key, kib) = l.split_once(':')?;
-                    let kib = kib.trim().strip_suffix(" kB")?.parse::<i128>().ok()?;
-                    matches!(key, "RssAnon" | "RssShmem").then_some(kib << 10)
-                })
-                .sum()
+        let pages = || {
+            let r = crate::room::HeldRoom::reading(Vec::new()).expect("the process's pages");
+            i128::from(r.pages())
         };
         let seen = super::census().expect("the census");
         let card = seen.first().expect("a visible device");

@@ -1,5 +1,5 @@
 //! The plan-then-open of a Qwen3.8 (`qwen4exp`) gate's load: the file described, the host's room
-//! read or given, the machine for where the routed experts sit, the plan for the resident slots
+//! read once the plan's card is held, or given, the machine for where the routed experts sit, the plan for the resident slots
 //! ([`Open38::plan`]), then the body opened by it and its steps captured as graphs
 //! ([`Planned38::open`]). What a gate prints of the plan and of the load stays in the gate: it
 //! prints [`PlanFacts`] between the two calls, where the load's own lines to stderr follow it, and
@@ -14,6 +14,7 @@ use std::path::Path;
 use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
+use bloomery_gpu::room::HeldRoom;
 use bloomery_gpu_gates::GateError;
 use bloomery_levers::HostCfg;
 use gguf::Split;
@@ -51,8 +52,8 @@ pub struct Open38<'a> {
     pub slots: usize,
     pub plan_levers: &'a PlanLevers,
     pub host: HostCfg,
-    /// The host's room in bytes, given; `None` takes the reading
-    /// ([`PlanInputs::room`]).
+    /// The host's room in bytes, given; `None` takes the reading once the
+    /// plan's card is held ([`HeldRoom::read`]).
     pub room: Option<u64>,
     /// The residency machine over the card's routed stacks; [`Residency::Off`] is the load's slot
     /// map for the model's life.
@@ -101,9 +102,10 @@ impl<'a> Open38<'a> {
     /// items are not refused here; the load refuses what `ALLOWED` does not name.
     pub fn plan(&self, file: Split) -> Result<Planned38<'a>, GateError> {
         let mut inputs = PlanInputs::describe(&file)?;
-        if let Some(r) = self.room {
-            inputs.room = (r, HostRead::Given);
-        }
+        inputs.room = Some(match self.room {
+            Some(r) => (r, HostRead::Given),
+            None => HeldRoom::read([(self.card.name, self.card.device)])?.room(),
+        });
         let machine = machine_for_experts(
             self.card,
             inputs.spec.layers.len(),
@@ -118,7 +120,10 @@ impl<'a> Open38<'a> {
             card_layers: plan.n_l.iter().filter(|&&n| n > 0).count(),
             n_l: plan.n_l.clone(),
             ple_tier: plan.row_tier()?,
-            room: inputs.room.clone(),
+            room: inputs
+                .room
+                .clone()
+                .expect("the plan took the room set above"),
             row_reserve_bytes: plan.host.row_reserve_bytes,
             host_need: HostNeed::of(&plan, 0),
         };

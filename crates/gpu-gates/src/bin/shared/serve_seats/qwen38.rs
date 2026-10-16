@@ -154,11 +154,18 @@
 //! only the draft goes off. The rule reads the plan the flags name — a set
 //! context's plain plan before any search, else the plan the default's search
 //! and the draft's yield chose — and the load's own plan is held to it: the
-//! engine thread plans from the room the main thread read
-//! (`PlanInputs::room`, never a reading of its own), and its plan must have
+//! engine thread plans from the file, the description and the room the main
+//! thread read (`PlanInputs::room`, never a reading of its own), and its plan
+//! must have
 //! the terms the records and rules read (`PlanKey`: the card's and the tiers'
 //! experts, the host's experts, resident bytes and tables, the NVMe tier's
-//! bytes and arena) or the load is refused by name. The plan's host reserves
+//! bytes and arena) or the load is refused by name. The room is read once
+//! every card the plans name is held (`bloomery_gpu::room::HeldRoom`: the
+//! stage card, then plan (b′)'s tier card and the room again), the files'
+//! reads before it, and the plans take the reading less the reserves of what
+//! the load allocates before its own check reads the room (`room plan`: the
+//! engine thread's stack and the open's plan and tables); the load prints its
+//! check's reading as `room load`. The plan's host reserves
 //! every slot's checkpoints (`HOST_BUDGET` a slot, [`reserve_checkpoints`]),
 //! so the host need, the split's floor and the arena count them, so a default
 //! count whose plan the room leaves under the floor is planned at one slot
@@ -311,16 +318,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use app::mtp::{MtpBody, MtpDraft};
-use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Seq38, TargetRows, seq38_bytes};
+use bloomery_gpu::host::SERVED_TIERS;
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
+use bloomery_gpu::room::HeldRoom;
 use bloomery_gpu_gates::bind::{
-    CacheRam, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props, nvidia_smi_index,
-    placement_props, sampler_factory,
+    CacheRam, ENGINE_STACK, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props,
+    nvidia_smi_index, placement_props, sampler_factory,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Place};
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -342,7 +350,8 @@ use model::arch::qwen35moe::place::{
     tier_batch,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{CardSpec, HostNeed, HostRead, MARGIN, host_available_read};
+use model::placement::room::{ENGINE_STACK_RESERVE, LOAD_PREP_RESERVE, LoadReserves};
+use model::placement::workstation::{CardSpec, HostNeed, MARGIN};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
@@ -782,6 +791,25 @@ fn floor_fallback(
     Ok((arena > 0).then_some(arena))
 }
 
+/// What a load of the seat allocates between the plans' reading of the
+/// host's room and its own check's ([`LoadReserves`]), each from what it is:
+/// the engine thread's stack ([`ENGINE_STACK`], the size it is spawned with),
+/// and what the open makes on that thread before its check — the plan again
+/// and the body's tables ([`Body38::load_prep_bytes`]) over the most cards a
+/// placement holds, the stage card and the expert tier cards the host tier
+/// serves ([`SERVED_TIERS`]).
+fn reserves38(inputs: &PlanInputs) -> LoadReserves {
+    LoadReserves::none()
+        .with(
+            ENGINE_STACK_RESERVE,
+            u64::try_from(ENGINE_STACK).expect("a stack size fits u64"),
+        )
+        .with(
+            LOAD_PREP_RESERVE,
+            Body38::load_prep_bytes(&inputs.model, 1 + SERVED_TIERS),
+        )
+}
+
 /// The residency the load of `plan` at `place` runs: `set` (the word and
 /// its parse) as given; unset, the Qwen3.8 rule's
 /// ([`residency38`]: before the plan `off` under `--place gate`, beside the
@@ -791,12 +819,13 @@ fn residency38_at(
     plan: &Plan<'_>,
     (place, feed): (Place38, Feed38),
     set: Option<(Residency, &str)>,
+    room: &HeldRoom,
 ) -> Result<Residency, GateError> {
     let lever = match set {
         Some((r, word)) => Lever38::Set(r, word),
         None => Lever38::Unset(residency38_unset(feed.residency_at(place))),
     };
-    residency38(plan, lever, Record::eprint)
+    residency38(plan, lever, room, Record::eprint)
 }
 
 /// The plans the seat can load, by context: the file's inputs at `place`
@@ -814,6 +843,9 @@ struct Plans<'a> {
     slots: usize,
     /// The prompt feed and the trace, which the unset residency's pool reads.
     feed: Feed38,
+    /// The host's room the plans took, which the unset residency's pool
+    /// reads too.
+    room: &'a HeldRoom,
 }
 
 impl Plans<'_> {
@@ -886,7 +918,7 @@ impl Plans<'_> {
             Some((r, word)) => Lever38::Set(r, word),
             None => Lever38::Unset(residency38_unset(self.feed.residency_at(self.place))),
         };
-        let pool = match residency38(&plan, lever, |_| {})? {
+        let pool = match residency38(&plan, lever, self.room, |_| {})? {
             Residency::Mid { pinned, .. } => {
                 ChurnPool::of(&plan, CARD38, pinned)
                     .map_err(|e| format!("the churn pool: {e}"))?
@@ -1272,12 +1304,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let path = ref_model_path()?;
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    // The stage card's first open is made before the room is read
-    // (`Gpu::hold_card`: its context and the bundle), so the plans' room has
-    // lost its host bytes as the load's check after its open has; plan
-    // (b′)'s tier card is held once chosen, below.
-    let stage = draft_at.cards.on(&census)?.card_specs()?[0];
-    Gpu::hold_card(stage.name, stage.device)?;
+    // The file's description; the host's room is read below, once everything
+    // the load reads of the files is in hand.
     let mut inputs = PlanInputs::describe(&split)?;
     // The slot count first: it shapes the draft's window condition, the
     // context search itself, and every plan the seat asks for, each counting
@@ -1376,14 +1404,29 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             inputs.spec.vocab,
         )?),
     };
-    let mut mtp_inputs = match &head {
-        None => None,
+    let (draft_split, mut mtp_inputs) = match &head {
+        None => (None, None),
         Some(h) => {
             let draft = open_draft(&draft_path, draft_from)?;
-            Some(MtpInputs::read(&draft, &split, &inputs, h.rows.clone())?)
+            let read = MtpInputs::read(&draft, &split, &inputs, h.rows.clone())?;
+            (Some(draft), Some(read))
         }
     };
-    drop(split);
+    // The host's room, read once the stage card is held (`HeldRoom::read`:
+    // its first open's context and bundle gone from the reading as from the
+    // load's own); plan (b′)'s tier card is held once chosen, below. What the
+    // load reads of the files is read above, before it — the tokenizer and
+    // the header's keys, the draft's file and inputs, all handed to the
+    // engine thread with the file and its description — and the worker pool
+    // the engine pins itself to is up, so what the load still allocates
+    // before its check reads the room again is the reserves' (`reserves38`):
+    // the plans take the reading less them.
+    let _ = threads::pool();
+    let reserves = reserves38(&inputs);
+    let stage = draft_at.cards.on(&census)?.card_specs()?[0];
+    let mut room = HeldRoom::read([(stage.name, stage.device)])?;
+    inputs.room = Some(room.plan_room(&reserves));
+    record::room_plan(&room, &reserves).eprint();
     if from == "ctx" {
         eprintln!(
             "--ctx-size {} is one request's context; add --parallel N to serve N requests at \
@@ -1424,12 +1467,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     // Plan (b′)'s tier cards held too, and the room read again: every plan
     // below and the engine thread's take it.
-    let tiers = &a.place.cards.card_specs()?[1..];
-    if !tiers.is_empty() {
-        for t in tiers {
-            Gpu::hold_card(t.name, t.device)?;
-        }
-        inputs.room = host_available_read()?;
+    let cards = a.place.cards.card_specs()?;
+    if cards.len() > 1 {
+        room = HeldRoom::read(cards.iter().map(|c| (c.name, c.device)))?;
+        inputs.room = Some(room.plan_room(&reserves));
+        record::room_plan(&room, &reserves).eprint();
     }
     // The paged tier's one-column rule (`bloomery_levers::paged_columns`,
     // the module doc), asked once of the plan the flags name: a set
@@ -1485,6 +1527,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 mtp: None,
                 slots,
                 feed,
+                room: &room,
             };
             if plain.card(ctx).is_ok() {
                 plain.host(ctx, set)?.2
@@ -1516,6 +1559,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             mtp: mtp_inputs.as_ref(),
             slots,
             feed,
+            room: &room,
         };
         floor_fallback(&asked, set)?
     } else {
@@ -1540,6 +1584,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         mtp: mtp_inputs.as_ref(),
         slots,
         feed,
+        room: &room,
     };
     let mut rule = ctx38(&drafted, a.ctx)?;
     // The unset draft's yield to the context (the module doc), judged on
@@ -1565,6 +1610,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             mtp: None,
             slots,
             feed,
+            room: &room,
         };
         let plain = ctx38(&plain_plans, a.ctx)?;
         let without = plain.search.expect("an unset rule searched").fit.ctx;
@@ -1604,7 +1650,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let residency_word = set.filter(|&(r, _)| r != Residency::Off).map(|(_, w)| w);
     refuse_feed(feed, (slots, mtp), residency_word)?;
     let (need, pool, arena, checkpoints, paged) = host;
-    let cache = CacheRam::of_tier(a.cache_ram, need, pool, (arena, paged), checkpoints)?
+    let cache = CacheRam::of_tier(a.cache_ram, &room, need, pool, (arena, paged), checkpoints)?
         .holding(seq38_state(&inputs, 1, mtp));
     let rule = rule.host_bound(&inputs, cache.ram, mtp)?;
     rule.print();
@@ -1720,7 +1766,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     line.csv("devices", record::plan_devices(&machine))
         .w("cuda_order", record::cuda_order())
         .eprint();
-    let residency = residency38_at(&plan, (a.place, feed), set)?;
+    let residency = residency38_at(&plan, (a.place, feed), set, &room)?;
     // Made last among the refusals, so a load that stops before the engine
     // leaves no directory behind.
     let trace = levers
@@ -1753,21 +1799,29 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         ..EngineProps::default()
     };
 
+    let plan = PlanKey::of(&plan)?;
+    // The draft's file and inputs the main thread read, the engine's when it
+    // drafts.
+    let draft = match (mtp, draft_split, mtp_inputs) {
+        (false, ..) => None,
+        (true, Some(file), Some(read)) => Some((file, read)),
+        (true, ..) => return Err("a drafted load with no draft file read".into()),
+    };
     let open = SeatArgs {
         place: a.place,
         ctx,
         slots,
         experts,
         plan_levers,
-        room: inputs.room.clone(),
-        plan: PlanKey::of(&plan)?,
+        file: split,
+        inputs,
+        plan,
         host: levers.host(),
         pin_main: levers.pin_main(),
-        path: path.clone(),
         mtp,
         head,
+        draft,
         draft_path,
-        draft_from,
         draft_bytes,
         draft_off,
         residency,
@@ -1892,24 +1946,27 @@ struct SeatArgs {
     slots: usize,
     experts: Experts,
     plan_levers: PlanLevers,
-    /// The host's room and its reading as the main thread's plans took them
-    /// (`PlanInputs::room`): the engine thread plans from it, not from a
-    /// reading of its own.
-    room: (u64, HostRead),
+    /// The file the main thread opened and its description, the host's room
+    /// as the main thread's plans took it (`PlanInputs::room`): the engine
+    /// thread plans from them, and neither opens the file nor reads a room
+    /// of its own again.
+    file: Split,
+    inputs: PlanInputs,
     /// The plan the main thread's rules and records read, which the load's
     /// plan is held to.
     plan: PlanKey,
     host: bloomery_levers::HostCfg,
     pin_main: bool,
-    path: PathBuf,
     /// `BLOOMERY_DRAFT=mtp`, the MTP draft; unset the plain path.
     mtp: bool,
     /// The draft's head under `mtp` (`head_list::head_rows_of`), which the
     /// load prints.
     head: Option<HeadPick>,
-    /// The MTP draft file under `mtp`, and what picked it.
+    /// The MTP draft file the main thread opened and its inputs, under
+    /// `mtp`.
+    draft: Option<(Split, MtpInputs)>,
+    /// The MTP draft file's path, which `/props`' `draft` names.
     draft_path: PathBuf,
-    draft_from: DraftFrom,
     /// The plan's `draft` class bytes, which `/props` files.
     draft_bytes: u64,
     /// Drafting nothing, why: the `load draft=off` record's.
@@ -2000,13 +2057,11 @@ impl Q38 {
             let _ = threads::pool().pin_caller();
         }
         let t = Instant::now();
-        let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
-        // The room is the main thread's: a reading of the host's available
-        // bytes of its own would plan the load from another room than the
-        // plan the seat ruled by, and the paged tier's arena is that room's
-        // difference.
-        let mut inputs = PlanInputs::describe(&file)?;
-        inputs.room = a.room.clone();
+        // The file, its description and the room are the main thread's: a
+        // reading of the host's room of its own would plan the load from
+        // another room than the plan the seat ruled by, and the paged tier's
+        // arena is that room's difference.
+        let (file, inputs) = (a.file, a.inputs);
         let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.hp)?;
         let ub = ubatch_for(a.ctx)?;
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
@@ -2033,20 +2088,18 @@ impl Q38 {
                 )?
             }
             true => {
-                let head = a
-                    .head
+                let (draft, mtp) = a
+                    .draft
                     .as_ref()
-                    .ok_or("a drafted load with no head picked")?;
-                let draft = open_draft(&a.draft_path, a.draft_from)?;
-                let mtp = MtpInputs::read(&draft, &file, &inputs, head.rows.clone())?;
+                    .ok_or("a drafted load with no draft file read")?;
                 let machine = a
                     .place
-                    .machine(&inputs, ctx_ub, a.experts, Some(&mtp), a.slots)?;
+                    .machine(&inputs, ctx_ub, a.experts, Some(mtp), a.slots)?;
                 let plan = inputs.plan_mtp_with_slots(
                     &machine,
                     u64::try_from(a.ctx)?,
                     &a.plan_levers,
-                    &mtp,
+                    mtp,
                     a.experts,
                     a.slots,
                 )?;
@@ -2058,8 +2111,8 @@ impl Q38 {
                     CARD38,
                     a.host,
                     ub,
-                    &draft,
-                    &mtp,
+                    draft,
+                    mtp,
                     a.residency,
                     a.slots,
                 )?
@@ -2083,6 +2136,11 @@ impl Q38 {
             m.body(WHAT)?.card_layers(),
             t.elapsed().as_secs_f64()
         );
+        // The room the load's check read, its card held: the second reading
+        // of the witness the plans' `room plan` opened.
+        if let Some(room) = m.load_room() {
+            record::room_load(room).eprint();
+        }
         // The load's NVMe expert tier, when its plan paged routed experts
         // and the arena was built: the same `nvtier` record
         // `generate_qwen3moe` prints, at load — the arena's budget, the

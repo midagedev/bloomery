@@ -11,12 +11,12 @@
 //! `CacheRam`'s) take them once.
 
 use crate::GateError;
-use crate::generate::Place;
 use crate::record::{self, Record};
 use bloomery_gpu::host::swap::Residency;
+use bloomery_gpu::room::HeldRoom;
 use bloomery_levers::{RESIDENCY38_SPARES, Residency38Pick, residency38_at_plan};
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{HostNeed, TierBatchBytes, host_available};
+use model::placement::workstation::HostNeed;
 use model::placement::{Machine, Plan};
 use runtime::seqstate::HOST_BUDGET;
 
@@ -115,31 +115,14 @@ pub const GLM_CARD: usize = 0;
 /// What a GLM load of `slots` resident sequences declares
 /// ([`reserve_checkpoints`]): every slot takes checkpoints, the GLM body's
 /// prompt call taking a point at each mark with no switch and every
-/// sequence it makes carrying its own `Checkpoints` of `HOST_BUDGET`.
+/// sequence it makes carrying its own `Checkpoints` of `HOST_BUDGET`. Every
+/// machine of a GLM placement declares it (`generate::Place::machine_glm`).
 #[must_use]
 pub fn glm_seqs(slots: usize) -> Seqs {
     Seqs {
         slots,
         checkpoints: true,
     }
-}
-
-/// `place`'s machine of a layer count (`Place::machine`, `batch` the expert
-/// tier's prompt-batch bytes) for a GLM load of `slots` resident sequences,
-/// every machine it makes declaring them ([`glm_seqs`]): the machine a GLM
-/// load's offer, plans and open take, so each counts the checkpoints its
-/// sequences pin.
-pub fn glm_machine(
-    place: Place,
-    batch: Option<TierBatchBytes>,
-    slots: usize,
-) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
-    let base = place.machine(None, batch)?;
-    Ok(move |layers| {
-        let mut machine = base(layers);
-        reserve_checkpoints(&mut machine, glm_seqs(slots));
-        machine
-    })
 }
 
 /// `BLOOMERY_RESIDENCY` as a qwen4exp load takes it: a set word and its
@@ -158,7 +141,7 @@ pub enum Lever38<'a> {
 /// through the file mapping, read cold from the drive after the tier's
 /// drops; else `residency38_at_plan` (P half the fewest
 /// card experts a layer, `off` with why where the plan has no room, or the
-/// plan's host headroom or `MemAvailable` none for the churn pool) — its
+/// plan's host headroom or the host's `room` none for the churn pool) — its
 /// `residency unset` record handed to `emit`. Under `mid`, the `residency
 /// host` record of `plan` follows: the churn pool (card [`CARD38`]'s
 /// experts past the pinned ones) the load's host set holds beside the
@@ -168,6 +151,7 @@ pub enum Lever38<'a> {
 pub fn residency38(
     plan: &Plan<'_>,
     lever: Lever38<'_>,
+    room: &HeldRoom,
     emit: fn(Record),
 ) -> Result<Residency, GateError> {
     let (residency, word) = match lever {
@@ -183,11 +167,11 @@ pub fn residency38(
             let pick = match pre {
                 Some(off) => off,
                 None => {
-                    // The load refuses a host set past the host's available
-                    // bytes before any upload; the default leaves the pool
-                    // out instead. The need holds the load's checkpoints
+                    // The load refuses a host set past the host's room
+                    // before any upload; the default leaves the pool out
+                    // instead. The need holds the load's checkpoints
                     // ([`reserve_checkpoints`]), as `CacheRam`'s does.
-                    let available = host_available()?;
+                    let available = room.bytes();
                     let need = HostNeed::of(plan, 0).bytes();
                     residency38_at_plan(
                         plan.n_l.iter().copied(),

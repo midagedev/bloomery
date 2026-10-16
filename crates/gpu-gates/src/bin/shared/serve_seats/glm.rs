@@ -182,8 +182,9 @@
 //! its fewest leave no room for the word, or the churn pool does not fit the
 //! plan's host headroom less the NextN layer's host experts or what
 //! `MemAvailable` leaves past the load's host need — never a refusal.
-//! `--plan` prints these records and the `plan` line and exits 0 before any
-//! card is opened. Running `mid-p<P>-s<S>` (plain or
+//! `--plan` prints these records and the `plan` line and exits 0 before the
+//! load (the plan's cards held for the room's reading, nothing loaded on
+//! them). Running `mid-p<P>-s<S>` (plain or
 //! drafted), the load runs the common residency machine over the card's
 //! routed stacks (`open_resident`, or `open_nextn` with the word, the
 //! next-token layer's experts on the host): a `residency host` record
@@ -217,6 +218,7 @@ use app::mtp::{MtpBody, MtpDraft};
 use app::{OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{SlotRows, StepMode};
+use bloomery_gpu::room::HeldRoom;
 use bloomery_gpu_gates::bind::{
     CacheRam, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props, nvidia_smi_index,
     placement_props, sampler_factory,
@@ -224,7 +226,7 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{
-    GLM_CARD, checkpoints_reserved, glm_machine, residency_room, residency_set,
+    GLM_CARD, checkpoints_reserved, residency_room, residency_set,
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::{
@@ -239,7 +241,7 @@ use model::arch::glm5next::place::{
 };
 use model::placement::churn::ChurnPool;
 use model::placement::slots::{SplitError, split_ctx};
-use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes, host_available};
+use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
 use runtime::seqstate::Why;
@@ -550,7 +552,7 @@ impl Placed {
         slots: usize,
     ) -> Result<Placed, GateError> {
         let tier_batch = glm_place::tier_batch(place, &inputs.hp);
-        let machine = glm_machine(place, tier_batch, slots)?(inputs.model.layers);
+        let machine = place.machine_glm(tier_batch, slots)?(inputs.model.layers);
         let rule = ctx_of(inputs, &machine, levers, nextn, set, slots)?;
         let ctx = u64::try_from(rule.ctx)?;
         let tier_experts =
@@ -605,13 +607,15 @@ fn residency_of(
 /// The residency the load of `plan` runs, `beside` the bytes the load hosts
 /// outside the plan (the NextN layer's experts): a set word as given, refused
 /// by name when the plan's card slots leave it no room; unset, the rule's
-/// word where the plan has room and the host the churn pool, else `off`
-/// with why, its `residency unset` record printed. Then, under `mid`, the
-/// `residency host` record ([`residency_set`]).
+/// word where the plan has room and the host's `room` (read once the plan's
+/// cards are held) the churn pool, else `off` with why, its `residency unset`
+/// record printed. Then, under `mid`, the `residency host` record
+/// ([`residency_set`]).
 fn residency_at(
     plan: &Plan<'_>,
     lever: ResidencyLever,
     beside: u64,
+    room: &HeldRoom,
 ) -> Result<Residency, GateError> {
     let (r, word) = match lever {
         ResidencyLever::Set(r, word) => {
@@ -619,11 +623,11 @@ fn residency_at(
             (r, word)
         }
         ResidencyLever::Unset(pick) => {
-            // The load refuses a host set past `MemAvailable` before any
+            // The load refuses a host set past the host's room before any
             // upload; the default leaves the pool out instead.
             let mem_left = match pick.word {
                 "off" => 0,
-                _ => i128::from(host_available()?) - i128::from(HostNeed::of(plan, beside).bytes()),
+                _ => i128::from(room.bytes()) - i128::from(HostNeed::of(plan, beside).bytes()),
             };
             let pick = glm_residency_at_plan(
                 pick,
@@ -930,7 +934,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     record::plan(place.name(), &machine, &plan).eprint();
-    let residency = residency_at(&plan, lever, beside)?;
+    // The host's room, read once every card of the plan is held (`--plan`
+    // too: its records are the load's): the unset residency word's room and
+    // the prompt cache's default both take it.
+    let room = HeldRoom::read_machine(&machine)?;
+    let residency = residency_at(&plan, lever, beside, &room)?;
     let pool = match residency {
         Residency::Mid { pinned, .. } => {
             ChurnPool::of(&plan, GLM_CARD, pinned)
@@ -943,6 +951,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // layers' two recurrent copies whole, `seq_bytes`) is off.
     let cache = CacheRam::of(
         a.cache_ram,
+        &room,
         HostNeed::of(&plan, beside).bytes(),
         pool,
         checkpoints_reserved(plan.machine),
@@ -957,7 +966,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         Rounds::of(draft_off.is_none()).word()
     );
     if a.plan_only {
-        // The records before the load are out; nothing was opened on a card.
+        // The records before the load are out; the plan's cards were held
+        // for the room's reading, and nothing was loaded on them.
         std::process::exit(0);
     }
     let gpu = machine
@@ -1118,7 +1128,7 @@ impl Glm {
         let prefill = a.cfg.prefill;
         let args = app::OpenArgs {
             place: a.place.name(),
-            machine: glm_machine(a.place, a.tier_batch, a.slots)?,
+            machine: a.place.machine_glm(a.tier_batch, a.slots)?,
             ctx: a.ctx,
             mode: StepMode::Graph,
             cfg: a.cfg,

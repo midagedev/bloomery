@@ -1938,7 +1938,7 @@ mod gate {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
-        let machine_of = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
+        let machine_of = Place::Bp.machine_v41(None, Some(place::tier_batch(&inputs.hp)))?;
         let mut machine = machine_of(inputs.model.layers);
         machine.cards[0].free_bytes = Some(server_card_free(&err_log)?);
         // The reserve's name is the seat's own word ("image encoder"); the
@@ -2730,7 +2730,8 @@ mod gate {
             .ok_or("plan (b′) made no draft reserve")?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
-        let machine_of = Place::Bp.machine(Some(reserve), Some(place::tier_batch(&inputs.hp)))?;
+        let machine_of =
+            Place::Bp.machine_v41(Some(reserve), Some(place::tier_batch(&inputs.hp)))?;
         std::fs::create_dir_all(&a.dir)?;
         let exe = Served::exe()?;
         let err_log = a.dir.join("server.err");

@@ -47,6 +47,14 @@
 //!   line). FAIL-first mutants: the seat resolving no stream prints no
 //!   line, red on both; the seat handing the rule `--place gate`'s stage,
 //!   or no residency, prints `off` on the second, red there;
+//! - `room` ([`room_is_the_loads`]): the plan's host room is its load's —
+//!   the seat read the room once the cards its `plan` record names were
+//!   held (each in its last `room plan` record's `held`), and the load's
+//!   check, reading it again, found the process's own pages (`RssAnon` +
+//!   `RssShmem`, which no other process moves) grown by no more than the
+//!   named reserves the plan's room was cut by; `MemAvailable` at both
+//!   readings printed, never pinned. FAIL-first mutant: the room read
+//!   before its cards are held, red on both;
 //! - the positions the server serves: `/props`' `n_ctx` is the context it
 //!   was started at ([`props_ctx`]);
 //! - `cache` ([`cache`]): two sessions' requests through the prompt cache —
@@ -721,7 +729,8 @@ mod gate {
         println!("props engine {e}");
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
-        let inputs = PlanInputs::describe(&split)?;
+        let mut inputs = PlanInputs::describe(&split)?;
+        inputs.room = Some(server_room(err_log)?);
         let experts = experts38(levers)?;
         let ub = ubatch_for(CTX)?;
         let mut machine = machine_for_experts(
@@ -898,6 +907,62 @@ mod gate {
             &mut ok,
             "props_n_ctx_is_the_default_context",
             n_ctx == json!(CTX),
+        );
+        Ok(ok)
+    }
+
+    /// The main server's plan room is its load's (the module doc's `room`
+    /// clauses), of its `plan` record `plan` and its `room plan` and
+    /// `room load` records: the plan read the host's room once the cards it
+    /// names were held (`room_plan_held`: the `plan` record's card, and its
+    /// tier card under plan (b′), in the last `room plan`'s `held`, a
+    /// reading of this machine's room, not a given one), and the load's
+    /// check, reading the room again on its card, found the process's own
+    /// pages grown by no more than the reserves the plan's room was cut by
+    /// (`room_load_within_reserves`). `MemAvailable` at both readings is
+    /// printed, never pinned: every other process moves it.
+    fn room_is_the_loads(err_log: &Path, plan: &Fields) -> Result<bool, GateError> {
+        let log = seat_log(err_log)?;
+        let room_plan = log
+            .all(&record::ROOM_PLAN)?
+            .pop()
+            .ok_or("the server printed no `room plan` record")?;
+        let room_load = log.one(&record::ROOM_LOAD)?;
+        let mut cards = vec![plan.word("card")?];
+        if let Some(tier) = plan.opt_word("tier")? {
+            cards.push(tier);
+        }
+        let held = room_plan.csv("held")?;
+        let read = room_plan.word("read")?;
+        let (plan_pages, load_pages) = (room_plan.u64("pages")?, room_load.u64("pages")?);
+        let reserves = room_plan.u64("reserves")?;
+        println!(
+            "room plan held={held:?} bytes={} read={read} reserves={reserves} room={} \
+             pages={plan_pages} mem_available={}; plan cards {cards:?}",
+            room_plan.u64("bytes")?,
+            room_plan.u64("room")?,
+            room_plan.u64("mem_available")?,
+        );
+        println!(
+            "room load held={:?} bytes={} read={} pages={load_pages} mem_available={}; pages \
+             grew {} B against reserves {reserves} B",
+            room_load.csv("held")?,
+            room_load.u64("bytes")?,
+            room_load.word("read")?,
+            room_load.u64("mem_available")?,
+            i128::from(load_pages) - i128::from(plan_pages),
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "room_plan_held",
+            read != "given" && cards.iter().all(|c| held.contains(c)),
+        );
+        check(
+            &mut ok,
+            "room_load_within_reserves",
+            room_load.csv("held")?.contains(&cards[0])
+                && load_pages <= plan_pages.saturating_add(reserves),
         );
         Ok(ok)
     }
@@ -1320,6 +1385,23 @@ mod gate {
         let free = seat_log(err_log)?.one(&record::PLAN38)?.u64("card_free")?;
         println!("the server's plan record: card_free={free}");
         Ok(free)
+    }
+
+    /// The host room the server's plan took: the `room` of its last
+    /// `room plan` record ([`record::ROOM_PLAN`]) — the reading once its
+    /// cards were held, less its load's reserves — as a given room. The
+    /// gate's re-derivations plan at the same room: a reading of the gate's
+    /// own beside the loaded server would see the server's pages as taken,
+    /// and would hold a card in the gate's process. A server that printed no
+    /// `room plan` record is a named error.
+    fn server_room(err_log: &Path) -> Result<(u64, HostRead), GateError> {
+        let plans = seat_log(err_log)?.all(&record::ROOM_PLAN)?;
+        let room = plans
+            .last()
+            .ok_or("the server printed no `room plan` record")?
+            .u64("room")?;
+        println!("the server's room plan record: room={room}");
+        Ok((room, HostRead::Given))
     }
 
     /// The first line on the server's stderr at `err_log` that starts with
@@ -2885,7 +2967,7 @@ mod gate {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let mut inputs = PlanInputs::describe(&split)?;
-        inputs.room = (room, HostRead::Given);
+        inputs.room = Some((room, HostRead::Given));
         let experts = experts38(levers)?;
         let mut machine = machine_for_experts(
             RTX_3090,
@@ -3054,7 +3136,8 @@ mod gate {
             && pfield("slot_ctx") == Some(ctx);
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::describe(&split)?;
+        let mut inputs = PlanInputs::describe(&split)?;
+        inputs.room = Some(server_room(&err_log)?);
         let experts = experts38(levers)?;
         let plan_levers = PlanLevers::from_levers(levers)?;
         let free = Some(server_card_free(&err_log)?);
@@ -4053,12 +4136,14 @@ mod gate {
     /// neither lever), the census's 3090 as `a` resolves it
     /// (`devices::spec_of_device`: the known spec with the census's free
     /// bytes) and no draft reserve in the machine, which a one-card plan
-    /// counts in `plan_mtp_with_slots`.
+    /// counts in `plan_mtp_with_slots`; the host room is the server's given
+    /// 27 GiB.
     fn small_card_budget(levers: &bloomery_levers::Levers, free: u64) -> Result<u64, GateError> {
         const MIB: u64 = 1 << 20;
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::describe(&split)?;
+        let mut inputs = PlanInputs::describe(&split)?;
+        inputs.room = Some((27 << 30, HostRead::Given));
         let experts = experts38(levers)?;
         let (draft_path, from) = draft_file(None, &path);
         let draft = Split::open(&draft_path).map_err(|e| {
@@ -4152,6 +4237,7 @@ mod gate {
             "xstream_line_is_the_unset_rules",
             xstream_agrees(&err_log, false)?,
         );
+        ok &= room_is_the_loads(&err_log, &plan)?;
         let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
             .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))
             .collect();

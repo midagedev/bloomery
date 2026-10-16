@@ -159,6 +159,7 @@ mod gate {
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency, SlotState};
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport};
+    use bloomery_gpu::room::HeldRoom;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{
         Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, prose_ids, verdict,
@@ -1058,12 +1059,13 @@ mod gate {
         let levers = bloomery_levers::at_main(&[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
         let host = levers.host();
         let path = Path::new(MODEL);
-        let inputs = PlanInputs::describe(
+        let mut inputs = PlanInputs::describe(
             &Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?,
         )?;
         let ub = ubatch_for(CTX)?;
         let machine =
             machine_for_experts(A6000, inputs.spec.layers.len(), ub as u64, Experts::Card);
+        inputs.room = Some(HeldRoom::read_machine(&machine)?.room());
         let (residency, slots) = {
             let plan = plan_of(&inputs, &machine)?;
             let slots = plan

@@ -341,6 +341,7 @@ mod drive {
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::room::HeldRoom;
     use bloomery_gpu_deepseek41::body::{
         self, Body, BodyMeta, Deepseek41Model, PAIR_ROWS, TierOpen,
     };
@@ -842,7 +843,7 @@ mod drive {
             &Hparams::read(&file).map_err(|e| format!("{}: {e}", path.display()))?,
         );
         let headers = t.elapsed();
-        let machine = a.place.machine(reserve, tier_batch)?;
+        let machine = a.place.machine_v41(reserve, tier_batch)?;
         // The unset word against the plan the load will use, and the lever
         // record naming what it resolved to, before the plan record the open
         // prints. `--card-table` loads a plan it edits itself, beside a word
@@ -1153,7 +1154,11 @@ mod drive {
             None => inputs.plan(&machine, ctx, place_levers),
         }
         .map_err(|e| GpuError::plan(WHAT, e))?;
-        let pick = residency41::at_plan(&plan, pick)?;
+        // The host's room, read once every card of the plan is held (a room
+        // given by `BLOOMERY_HOST_ROOM`, `--plan`'s at the plan room, holds
+        // none).
+        let room = HeldRoom::read_machine(&machine)?;
+        let pick = residency41::at_plan(&plan, pick, &room)?;
         Ok((Some(plan.n_l.clone()), pick))
     }
 

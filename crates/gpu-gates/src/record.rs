@@ -1044,6 +1044,38 @@ pub static PLAN38: Kind = Kind {
     ],
 };
 
+/// The host's room a plan read, once every card it names was held.
+pub static ROOM_PLAN: Kind = Kind {
+    name: "room_plan",
+    head: "room plan",
+    doc: "The host's room a plan read once every card it names was held (bloomery_gpu::room::HeldRoom): the cards held before the reading, by the names the plan gives them (none for a given room); the reading's bytes and which reading decided (MemAvailable, cgroup:<path>, or given: BLOOMERY_HOST_ROOM); the reserves of what the load allocates before its own check reads the room, their sum and each by name (engine_stack: the engine thread's stack; load_prep: the plan the load makes again and the body's tables before its check); the room the plan takes, the reading less the reserves (a given room whole); and the process's own anonymous and shared pages (RssAnon + RssShmem) and MemAvailable at the reading — the pages the witness that the plan's room is its load's (`room load`), MemAvailable for the line alone, since every other process moves it.",
+    parts: &[
+        key("held", Csv, ""),
+        key("bytes", U64, "B"),
+        key("read", Word, ""),
+        key("reserves", U64, "B"),
+        opt("engine_stack", U64, "B"),
+        opt("load_prep", U64, "B"),
+        key("room", U64, "B"),
+        key("pages", U64, "B"),
+        key("mem_available", U64, "B"),
+    ],
+};
+
+/// The host's room a placed load's check read, its card held.
+pub static ROOM_LOAD: Kind = Kind {
+    name: "room_load",
+    head: "room load",
+    doc: "The host's room a placed load's check read once its card was held (GpuModel::load_room): the card, the reading's bytes and which reading decided, and the process's own anonymous and shared pages (RssAnon + RssShmem) and MemAvailable at the reading — the second reading of the witness `room plan` opens.",
+    parts: &[
+        key("held", Csv, ""),
+        key("bytes", U64, "B"),
+        key("read", Word, ""),
+        key("pages", U64, "B"),
+        key("mem_available", U64, "B"),
+    ],
+};
+
 /// The loaded model.
 pub static LOAD: Kind = Kind {
     name: "load",
@@ -2955,7 +2987,9 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
 
 /// What `bloomery-serve-qwen38` prints, all on stderr.
 pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
+    &ROOM_PLAN,
     &PLAN38,
+    &ROOM_LOAD,
     &LISTENING38,
     &CACHE_REUSE,
     &MTP_PROMPT,
@@ -3249,6 +3283,41 @@ pub fn load_phases(
         .f("body_s", body)
         .f("head_s", head)
         .f("other_s", other)
+}
+
+/// The `room plan` record of `room` ([`ROOM_PLAN`]): the cards held before
+/// it, the reading, the load's `reserves` (their sum and each by name), the
+/// room a plan takes of it, and the process's pages and `MemAvailable` at
+/// it. A reserve the kind does not name is a panic by name ([`Record`]).
+#[cfg(feature = "gpu")]
+pub fn room_plan(
+    room: &bloomery_gpu::room::HeldRoom,
+    reserves: &model::placement::room::LoadReserves,
+) -> Record {
+    let r = Record::new(&ROOM_PLAN)
+        .csv("held", room.held())
+        .u("bytes", room.bytes())
+        .w("read", room.read_by().word())
+        .u("reserves", reserves.bytes());
+    reserves
+        .rows()
+        .iter()
+        .fold(r, |r, &(name, bytes)| r.u(name, bytes))
+        .u("room", room.plan_room(reserves).0)
+        .u("pages", room.pages())
+        .u("mem_available", room.mem_available())
+}
+
+/// The `room load` record of the room a placed load's check read
+/// ([`ROOM_LOAD`]).
+#[cfg(feature = "gpu")]
+pub fn room_load(room: &bloomery_gpu::room::HeldRoom) -> Record {
+    Record::new(&ROOM_LOAD)
+        .csv("held", room.held())
+        .u("bytes", room.bytes())
+        .w("read", room.read_by().word())
+        .u("pages", room.pages())
+        .u("mem_available", room.mem_available())
 }
 
 /// The `nvtier` record of a load's arena: its budget, the paged bytes it

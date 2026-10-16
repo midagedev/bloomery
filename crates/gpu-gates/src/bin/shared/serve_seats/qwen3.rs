@@ -982,7 +982,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // makes no fit call of its own (`decide`).
     let load = decide(&split, arch, ctx, a.place, slots, kv)?;
     if matches!(arch, Arch::Qwen35moe) {
-        q3place::checkpoints_fit(seqs35(slots), matches!(load, Q3Load::Placed { .. }))?;
+        let whole = match &load {
+            Q3Load::Whole(card) => Some(*card),
+            Q3Load::Placed { .. } => None,
+        };
+        q3place::checkpoints_fit(seqs35(slots), whole)?;
     }
     // The slots the seat serves, one line before the load (`from` names what
     // set the count).

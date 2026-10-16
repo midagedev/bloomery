@@ -789,7 +789,8 @@ mod gate {
     /// `bloomery-serve --model glm [--place <place>] --plan` with both
     /// levers unset and no `--ctx`, so the default context rule runs (and,
     /// with no `--place`, the cards' rule): its exit status and stderr. It
-    /// plans and exits before the load, so it opens no card.
+    /// holds the plan's cards for the room's reading, plans and exits before
+    /// the load.
     fn plan_only(dir: &Path, place: Option<&str>) -> Result<(bool, Vec<String>), GateError> {
         let exe = beside("bloomery-serve")?;
         let name = place.unwrap_or("unset");

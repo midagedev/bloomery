@@ -9,15 +9,15 @@
 //!
 //! What the Mac cannot run stays in this crate, beside the re-export:
 //! [`host_lock`] (the host tier's page locks, residency walks and page
-//! release) and [`workstation`]'s `host_available` (the reading of
-//! `/proc/meminfo`). So does the tail every family's plan ends in — the
-//! built plan against its invariants, and how a refusal of them reads
-//! ([`checked`], [`joined`]) — one owner beside the planner it checks.
+//! release), and the tail every family's plan ends in — the built plan
+//! against its invariants, and how a refusal of them reads ([`checked`],
+//! [`joined`]) — one owner beside the planner it checks. The reading of the
+//! host's room is not here: it is taken once a plan's cards are held
+//! (`bloomery_gpu::room::HeldRoom`), and a plan is handed it.
 
 pub use bloomery_placement::placement::*;
 pub use bloomery_placement::slots;
 pub mod host_lock;
-pub mod workstation;
 
 /// A built plan against its invariants ([`Plan::violations`]): the plan
 /// when none is broken, else every violation it breaks, for the caller's

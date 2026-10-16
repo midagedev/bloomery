@@ -136,6 +136,7 @@ mod gate {
     use bloomery_gpu::HostFlags;
     use bloomery_gpu::host::slots::Slot;
     use bloomery_gpu::host::swap::{CallReport, Residency};
+    use bloomery_gpu::room::HeldRoom;
     use bloomery_gpu_deepseek41::body::{Body, OpenCfg, PrefillMode};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
@@ -632,7 +633,10 @@ mod gate {
             serving_place: true,
             ..ResidencyAt::FIXED
         });
-        let pick = residency41::at_plan(&plan, unset)?;
+        // The room the seat's word resolves against, read once the plan's
+        // cards are held, as the seat reads it.
+        let room = HeldRoom::read_machine(&cards)?;
+        let pick = residency41::at_plan(&plan, unset, &room)?;
         record::residency_lever(pick).print();
         if let Some(d) = pick.why.detail() {
             println!("{d}");
@@ -732,7 +736,7 @@ mod gate {
         drop(head);
         // Plan (b′)'s tier reserves the prompt batch's bytes; plan (a) has no tier.
         let batch = (at == Place::Bp).then(|| place::tier_batch(&inputs.hp));
-        let machine = at.machine(None, batch)?;
+        let machine = at.machine_v41(None, batch)?;
         crate::ds41_tier::sc("refuse: a host one byte short of the churn pool is refused by name")?;
         let refused = residency::refuse_clause(&path, &inputs, &cfg, at, &machine)?;
         let t0 = Instant::now();

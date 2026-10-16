@@ -556,7 +556,7 @@ mod gate {
             .ok_or("the plan has no card budget")?;
         let inputs = PlanInputs::read(&head)?;
         drop(head);
-        let bp = Place::Bp.machine(Some(reserve), Some(place::tier_batch(&inputs.hp)))?;
+        let bp = Place::Bp.machine_v41(Some(reserve), Some(place::tier_batch(&inputs.hp)))?;
         let layers = inputs.model.layers;
         let (two, lmachine) = (bp(layers), looped(bp(layers)));
         let plan = inputs.plan(&two, workstation::CTX_MAX, &cfg.place)?;

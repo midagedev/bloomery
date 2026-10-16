@@ -110,6 +110,7 @@ mod gate {
     use bloomery_gpu::host::xstream::XMode;
     use bloomery_gpu::host::{PassKind, PoisonKind};
     use bloomery_gpu::hybrid::Chain;
+    use bloomery_gpu::room::HeldRoom;
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
@@ -1123,7 +1124,7 @@ mod gate {
         let path_buf = ref_model_path()?;
         let path = path_buf.as_path();
         let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::describe(&split)?;
+        let mut inputs = PlanInputs::describe(&split)?;
         let mut pass = tier::witness(
             "model file",
             path.to_string_lossy().into_owned(),
@@ -1136,17 +1137,10 @@ mod gate {
         let ub = ubatch_for(CTX)?;
         let layers = inputs.spec.layers.len();
         let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
-        let Chosen {
-            plan,
-            tight: tight_3k,
-            ..
-        } = chosen_plan(&inputs, &bp, CTX)?;
-        pass &= tight_3k;
-        let tl = tier_layers(&plan);
         let ids = prose_ids("qwen4exp", PROMPT + 32)?;
         let prompt_ids = prose_ids("qwen4exp", PROMPT_U)?;
         // The unset-rule clause (the module header), before this gate's own
-        // loads: the cards as empty as the clause's band holds.
+        // holds and loads: the cards as empty as the clause's band holds.
         if tier::run_clause(
             "records-unset: the unset rule keeps bp at the real file's tier size",
             Tag::FileBound,
@@ -1159,6 +1153,15 @@ mod gate {
                 }
             };
         }
+        // The plans' host room, read once both cards are held.
+        inputs.room = Some(HeldRoom::read_machine(&bp)?.room());
+        let Chosen {
+            plan,
+            tight: tight_3k,
+            ..
+        } = chosen_plan(&inputs, &bp, CTX)?;
+        pass &= tight_3k;
+        let tl = tier_layers(&plan);
         let mut off_prompt = None;
         let mut last: Option<Session<Body38>> = None;
         let mut off_run = None;

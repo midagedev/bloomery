@@ -148,7 +148,8 @@ use engram::rows::SplitTable;
 use gguf::quant::dequant_row;
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
-use model::placement::{Device, Plan};
+use model::placement::room::{CHUNK_BYTES, plan_heap_bound};
+use model::placement::{Device, ModelTensors, Plan, Role};
 use runtime::seqstate::{HOST_BUDGET, Kept, Take, Why};
 use runtime::swaprule::KeptRows;
 use std::collections::VecDeque;
@@ -981,6 +982,36 @@ pub struct Body38 {
 }
 
 impl Body38 {
+    /// The host bytes a placed load of `model` over `cards` cards takes on
+    /// its own thread before its check reads the host's room, sized from the
+    /// model's shape: the plan it makes ([`plan_heap_bound`]) and the tables
+    /// `Body38::open_with` builds ahead of the check — each layer's kind
+    /// (`plan38::read`) and its routed stacks' types (`swap38::stacks`), the
+    /// three stack names one layer's lookup holds at once, the stacks' and
+    /// the file's `Arc`s — each with its allocator chunk ([`CHUNK_BYTES`]).
+    /// A seat's `load_prep` reserve (`model::placement::room::LOAD_PREP_RESERVE`).
+    #[must_use]
+    pub fn load_prep_bytes(model: &ModelTensors, cards: usize) -> u64 {
+        let size = |n: usize| n as u64;
+        let name = model
+            .tensors
+            .iter()
+            .filter(|t| t.role == Role::RoutedExperts)
+            .map(|t| size(t.name.len()))
+            .max()
+            .unwrap_or(0);
+        // An `Arc`'s two counts beside its value.
+        let arc = size(2 * std::mem::size_of::<usize>());
+        let tables = size(model.layers)
+            * size(std::mem::size_of::<Kind38>() + std::mem::size_of::<Option<[GgmlType; 3]>>())
+            + 2 * CHUNK_BYTES
+            + 3 * (name + CHUNK_BYTES)
+            + size(std::mem::size_of::<swap38::Qwen38Stacks>())
+            + size(std::mem::size_of::<Split>())
+            + 2 * (arc + CHUNK_BYTES);
+        plan_heap_bound(model, cards) + tables
+    }
+
     /// Card `card` of `plan`, which `inputs` made, resident: the plan's
     /// segments, the joins ([`Body38::derive`]) and the body over them with
     /// the host tier over every layer's routed experts, holding the load's

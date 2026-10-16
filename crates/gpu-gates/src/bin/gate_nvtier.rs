@@ -158,6 +158,7 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::nvtier::{DropRuns, NvTier, NvTierStats, advice_disjoint};
 use bloomery_gpu::host::swap::{LateLog, PassReport, Residency, SwapSource};
+use bloomery_gpu::room::HeldRoom;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, exit_with, verdict};
@@ -317,13 +318,14 @@ struct Seam {
     wrong: usize,
 }
 
-/// The plan of `file` on `machine` with `room` given, or the machine's own
-/// reading when `None`.
-fn inputs_of(file: &Split, room: Option<u64>) -> Result<PlanInputs, GateError> {
+/// The plan inputs of `file` with `room` given, or, when `None`, the
+/// machine's own reading once `machine`'s cards are held ([`HeldRoom::read`]).
+fn inputs_of(file: &Split, room: Option<u64>, machine: &Machine) -> Result<PlanInputs, GateError> {
     let mut inputs = PlanInputs::describe(file)?;
-    if let Some(room) = room {
-        inputs.room = (room, HostRead::Given);
-    }
+    inputs.room = Some(match room {
+        Some(room) => (room, HostRead::Given),
+        None => HeldRoom::read_machine(machine)?.room(),
+    });
     Ok(inputs)
 }
 
@@ -348,7 +350,7 @@ fn arm(
     band: Option<u64>,
 ) -> Result<ArmRun, GateError> {
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let inputs = inputs_of(&file, room)?;
+    let inputs = inputs_of(&file, room, machine)?;
     let ub = ubatch_for(CTX)?;
     let plan = inputs.plan_with(machine, CTX as u64, &PlanLevers::default(), Experts::Card)?;
     let card = plan.n_l.clone();
@@ -608,7 +610,7 @@ fn stepunion_arm(
     band: Option<u64>,
 ) -> Result<StepRun, GateError> {
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let inputs = inputs_of(&file, Some(ROOM))?;
+    let inputs = inputs_of(&file, Some(ROOM), machine)?;
     let plan = inputs.plan_with_slots(
         machine,
         CTX as u64,
@@ -627,7 +629,12 @@ fn stepunion_arm(
     // The residency the unset rule picks on this plan, its `residency
     // unset` record (the pick and its why) printed: the clause judges that
     // default, `off`, and refuses by name a plan whose rule picks another.
-    let residency = residency38(&plan, Lever38::Unset(None), Record::print)?;
+    let residency = residency38(
+        &plan,
+        Lever38::Unset(None),
+        &HeldRoom::given(ROOM)?,
+        Record::print,
+    )?;
     if let Residency::Mid { pinned, spares } = residency {
         return Err(format!(
             "the stepunion arm's plan picks mid-p{pinned}-s{spares} under the unset rule; the \
@@ -1035,7 +1042,8 @@ fn run() -> Result<(), GateError> {
     let path = Path::new(MODEL);
     let card = gate_card::init()?;
     let probe = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let inputs = inputs_of(&probe, Some(ROOM))?;
+    let mut inputs = PlanInputs::describe(&probe)?;
+    inputs.room = Some((ROOM, HostRead::Given));
     let machine = machine_for_experts(
         card,
         inputs.spec.layers.len(),
@@ -1047,7 +1055,9 @@ fn run() -> Result<(), GateError> {
 
     // `residency` (clause 5): the unset rule on the paged plan resolves
     // `off`.
-    let unset = residency38(&plan, Lever38::Unset(None), Record::print)?;
+    // The plan's room is given: the unset rule reads that room.
+    let room = HeldRoom::given(ROOM)?;
+    let unset = residency38(&plan, Lever38::Unset(None), &room, Record::print)?;
     let unset_off = matches!(unset, Residency::Off);
     println!(
         "residency: the unset rule on the paged plan resolves {}: {}",
@@ -1066,6 +1076,7 @@ fn run() -> Result<(), GateError> {
             },
             "mid-p0-s1",
         ),
+        &room,
         Record::print,
     )?;
     // `room`'s plan terms: the host need, the churn pool the residency
@@ -1465,8 +1476,7 @@ fn refuse_clauses(
     machine: &Machine,
     plan: &model::placement::Plan<'_>,
 ) -> Result<bool, GateError> {
-    let mut low = inputs_of(&Split::open(path)?, Some(1 << 30))?;
-    low.room = (1 << 30, HostRead::Given);
+    let low = inputs_of(&Split::open(path)?, Some(1 << 30), machine)?;
     let floor = match low.plan_with(machine, CTX as u64, &PlanLevers::default(), Experts::Card) {
         Err(e) => e.to_string().contains("the NVMe expert tier's floor"),
         Ok(_) => false,

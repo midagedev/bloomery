@@ -43,6 +43,7 @@ use crate::host::nvtier::NvTier;
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};
+use crate::room::HeldRoom;
 use crate::watchdog;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
@@ -51,7 +52,7 @@ use cuda_core::CudaStream;
 use gguf::Split;
 use model::arch::Arch;
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{self, HostNeed};
+use model::placement::workstation::HostNeed;
 use model::placement::{ExpertList, Plan};
 use std::ops::Range;
 use std::sync::Arc;
@@ -436,6 +437,8 @@ struct PlacedPre {
     ctx_max: usize,
     /// The prelude's phases; the body and the head are timed after it.
     times: LoadTimes,
+    /// The host's room the check read, its card held.
+    room: HeldRoom,
 }
 
 /// The wall of each phase of a placed load ([`GpuModel::load_placed`],
@@ -529,6 +532,9 @@ pub struct GpuModel<B: ChainBody> {
     /// The load's phases, when its load timed them ([`LoadTimes`]); `None`
     /// on a load that timed none.
     load_times: Option<LoadTimes>,
+    /// The host's room a placed load's check read ([`GpuModel::load_room`]);
+    /// `None` on a load that read none.
+    load_room: Option<HeldRoom>,
     /// The step and pass readbacks begun ([`GpuModel::reads`]): the stamp
     /// every residency boundary carries ([`BoundaryAt`]).
     reads: u64,
@@ -586,6 +592,7 @@ impl<B: ChainBody> GpuModel<B> {
             pos: 0,
             poisoned: None,
             load_times: None,
+            load_room: None,
             reads: 0,
             watch,
             watchdog,
@@ -800,6 +807,14 @@ impl<B: ChainBody> GpuModel<B> {
     #[must_use]
     pub fn load_times(&self) -> Option<&LoadTimes> {
         self.load_times.as_ref()
+    }
+
+    /// The host's room a placed load's check read, its card held
+    /// ([`HeldRoom::read`]): the reading a plan's room is held to (the
+    /// `room load` record). `None` on a load that read none.
+    #[must_use]
+    pub fn load_room(&self) -> Option<&HeldRoom> {
+        self.load_room.as_ref()
     }
 
     /// Stamp the placement plan's wall `plan` into the load's phases,
@@ -1701,14 +1716,17 @@ pub fn nvme_tier(
 }
 
 /// The steps of a placed load before its body: the plan's card and context
-/// budget, the card, the host's memory against the plan's host need, the
-/// card's weights with `derive`'s filings, and — after the uploads, so the
-/// card's file bytes have left the page cache first — the plan's host set
-/// read in and locked as `host` asks, with `extra`'s runs (of `extra`'s
-/// bytes) beside it. The pieces, and the host set. Every placed load passes
-/// here, so the two refusals before any upload are made once: a plan's card
-/// that is not one visible device ([`Gpu::open_card`]), and a
-/// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
+/// budget, the host's room against the plan's host need — read once the card
+/// is held ([`HeldRoom::read`]: a caller that held it for its plan's reading
+/// opens nothing here, so nothing of the open's lies between the two
+/// readings) — the card, the card's weights with `derive`'s filings, and —
+/// after the uploads, so the card's file bytes have left the page cache
+/// first — the plan's host set read in and locked as `host` asks, with
+/// `extra`'s runs (of `extra`'s bytes) beside it. The pieces, and the host
+/// set. Every placed load passes here, so the two refusals before any upload
+/// are made once: a plan's card that is not one visible device
+/// ([`Gpu::open_card`]), and a host whose room is under the plan's need
+/// ([`HostNeed`]).
 fn placed_pre(
     file: &Split,
     plan: &Plan<'_>,
@@ -1730,12 +1748,12 @@ fn placed_pre(
     let layers = spec.layers.clone();
     let (extra, extra_bytes) = extra;
     let t = Instant::now();
+    let room = HeldRoom::read([(spec.name.as_str(), spec.device)])?;
+    HostNeed::of(plan, extra_bytes)
+        .check(room.bytes())
+        .map_err(|e| GpuError::plan(what, e))?;
     let gpu = Gpu::open_card(&spec.name, spec.device)?;
     let context = t.elapsed();
-    let available = workstation::host_available().map_err(|e| GpuError::plan(what, e))?;
-    HostNeed::of(plan, extra_bytes)
-        .check(available)
-        .map_err(|e| GpuError::plan(what, e))?;
     let t = Instant::now();
     let mut weights = Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?;
     let upload = t.elapsed();
@@ -1761,6 +1779,7 @@ fn placed_pre(
                 body: Duration::ZERO,
                 head: Duration::ZERO,
             },
+            room,
         },
         residency,
     ))
@@ -1811,6 +1830,7 @@ fn placed_done<B: ChainBody>(
         head,
         ctx_max,
         mut times,
+        room,
     } = p;
     let t = Instant::now();
     let head = head
@@ -1826,6 +1846,7 @@ fn placed_done<B: ChainBody>(
         ctx_max,
     });
     model.load_times = Some(times);
+    model.load_room = Some(room);
     Ok(model)
 }
 

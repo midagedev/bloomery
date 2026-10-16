@@ -53,7 +53,7 @@ use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::fileio::hex;
 use crate::placement::workstation::{
-    self, A6000, CONTEXT, CardSpec, GRANULE, HostRead, MARGIN, RTX_3090, SCRATCH,
+    A6000, CONTEXT, CardSpec, GRANULE, HostRead, MARGIN, RTX_3090, SCRATCH,
     TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, host, tier_batch_host_bytes,
     tier_batch_staging_bytes,
 };
@@ -157,14 +157,16 @@ pub struct PlanInputs {
     pub spec: ModelSpec,
     /// Each layer's recurrent and cache bytes.
     pub kv: KvLayout,
-    /// The host's available bytes when the inputs were read, with the
-    /// reading that decided ([`workstation::host_available_read`]): the PLE
+    /// The host's room a plan takes, with the reading that gave it: the PLE
     /// table's tier follows it ([`placement::row_table_tier`]) — on the host
     /// while the room holds the plan with the table there, else on the NVMe
     /// tier; the routed experts the room still cannot hold follow it there
-    /// ([`placement::expert_nvme_tier`]). A gate that plans an arm by a room
-    /// of its own sets it, read [`HostRead::Given`].
-    pub room: (u64, HostRead),
+    /// ([`placement::expert_nvme_tier`]). `None` from [`PlanInputs::describe`],
+    /// which reads no room: a load's caller sets the reading taken once its
+    /// plan's cards are held (`bloomery_gpu::room::HeldRoom`), a gate that
+    /// plans an arm by a room of its own sets that, read [`HostRead::Given`];
+    /// a plan of `None` is refused by name ([`PlaceError::NoRoom`]).
+    pub room: Option<(u64, HostRead)>,
 }
 
 /// Why a plan was refused.
@@ -237,6 +239,13 @@ pub enum PlaceError {
     /// A plan of no resident sequence slot.
     #[error("{slots} resident sequence slots: a plan serves at least one")]
     Slots { slots: usize },
+    /// A plan of inputs no host room was given to ([`PlanInputs::room`]).
+    #[error(
+        "the plan inputs hold no host room: the PLE table's tier and the NVMe tier's split \
+         follow it, so a caller sets the reading taken once its plan's cards are held \
+         (bloomery_gpu::room::HeldRoom) or a room of its own (HostRead::Given)"
+    )]
+    NoRoom,
     /// A target matrix an MTP draft file borrows ([`PlanInputs::mtp_borrows`])
     /// absent, or in another format than the one the draft's program reads.
     #[error(
@@ -262,10 +271,9 @@ fn tier_host(e: PlacementError) -> PlaceError {
 
 impl PlanInputs {
     /// `split`'s hyperparameters, then its tensors' roles, then its
-    /// description, then the host's room ([`PlanInputs::describe`]), the
-    /// first that fails being the error; then the file is refused if it has
-    /// a feature the engine does not run ([`PlacementError::Unimplemented`],
-    /// every one listed).
+    /// description ([`PlanInputs::describe`]), the first that fails being
+    /// the error; then the file is refused if it has a feature the engine
+    /// does not run ([`PlacementError::Unimplemented`], every one listed).
     pub fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
         let inputs = PlanInputs::describe(split)?;
         let missing = inputs.unimplemented();
@@ -305,23 +313,20 @@ impl PlanInputs {
     }
 
     /// [`PlanInputs::read`] without the refusal of unimplemented features:
-    /// the file's description and the host's room
-    /// ([`workstation::host_available_read`]), a room that cannot be read
-    /// refused by name — the PLE table's tier would follow a room nobody
-    /// read.
+    /// the file's description, no host room ([`PlanInputs::room`] `None`,
+    /// which a plan refuses by name until its caller sets one).
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
         let chat = chat_of(split, None, None)?;
         let spec = spec::spec_of(&hp, &model, chat)?;
         let kv = KvLayout::of(&hp);
-        let room = workstation::host_available_read().map_err(PlacementError::HostRoom)?;
         Ok(PlanInputs {
             hp,
             model,
             spec,
             kv,
-            room,
+            room: None,
         })
     }
 
@@ -494,8 +499,9 @@ impl PlanInputs {
                 reserve,
             )?,
         };
-        placement::row_table_tier(&mut plan, self.room.0, UBATCH_PLANNED)?;
-        placement::expert_nvme_tier(&mut plan, self.room.0)?;
+        let room = self.room.as_ref().ok_or(PlaceError::NoRoom)?.0;
+        placement::row_table_tier(&mut plan, room, UBATCH_PLANNED)?;
+        placement::expert_nvme_tier(&mut plan, room)?;
         Ok(plan)
     }
 
@@ -3072,7 +3078,7 @@ mod tests {
                 },
                 spec,
                 kv,
-                room: (u64::MAX, HostRead::Given),
+                room: Some((u64::MAX, HostRead::Given)),
             }
         }
 
@@ -3392,6 +3398,23 @@ mod tests {
                 }
                 other => panic!("want the draft reserve refused: {:?}", other.err()),
             }
+        }
+
+        /// A description reads no room, and a plan of it is refused by name
+        /// until its caller sets one; a given room plans.
+        #[test]
+        fn a_plan_without_a_room_is_refused() {
+            let (mut inputs, machine) = (inputs(), machine());
+            inputs.room = None;
+            let levers = PlanLevers::default();
+            let got = inputs.plan_with_slots(&machine, CTX, &levers, Experts::Host, 1);
+            assert!(matches!(got, Err(PlaceError::NoRoom)), "{:?}", got.err());
+            inputs.room = Some((u64::MAX, HostRead::Given));
+            assert!(
+                inputs
+                    .plan_with_slots(&machine, CTX, &levers, Experts::Host, 1)
+                    .is_ok()
+            );
         }
     }
 

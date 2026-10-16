@@ -342,9 +342,12 @@ mod gate {
     }
 
     /// The plan's per-layer card prefix `n_l` and the file's dims, for the model's own placement
-    /// at the gate plan (`Experts::Card`): the host serves the ids past each layer's prefix.
+    /// at the gate plan (`Experts::Card`): the host serves the ids past each layer's prefix. The
+    /// prefix is the card budget's alone — the host room moves only the host's tiers — so the plan
+    /// takes a given room and holds no card here, beside the engine children's loads.
     fn card_prefix(split: &Split) -> Result<(Vec<u64>, usize, usize, usize), GateError> {
-        let inputs = PlanInputs::describe(split)?;
+        let mut inputs = PlanInputs::describe(split)?;
+        inputs.room = Some((u64::MAX, model::placement::workstation::HostRead::Given));
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let machine = machine_for_experts(
             crate::gate_card::card()?,

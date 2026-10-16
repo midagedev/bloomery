@@ -2377,8 +2377,11 @@ fn hw_fixture_q38_budget() {
 
     let guard = dir("q38budget");
     let fx = Split::open(header_only(&p.target, &guard.0)).unwrap();
-    // The plan the gates make of a file (`gate_qwen4exp_e2e`'s `open_at`).
-    let inputs = PlanInputs::describe(&fx).unwrap();
+    // The plan the gates make of a file (`gate_qwen4exp_e2e`'s `open_at`),
+    // at a room no host need passes, given, not read: the card counts read
+    // no host room.
+    let mut inputs = PlanInputs::describe(&fx).unwrap();
+    inputs.room = Some((u64::MAX, model::placement::workstation::HostRead::Given));
     let layers = inputs.spec.layers.len();
     let experts = inputs.model.experts;
     assert_eq!((layers, experts), (4, 512));

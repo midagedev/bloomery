@@ -4240,7 +4240,7 @@ mod gate {
         );
         let (file, draft) = (open_target()?, open_draft()?);
         let t = Instant::now();
-        let inputs = PlanInputs::describe(&file)?;
+        let mut inputs = PlanInputs::describe(&file)?;
         tier::sc(
             "(u) the unset head is the shipped list of the target's tokenizer (copied into a fixture)",
         )?;
@@ -4253,6 +4253,7 @@ mod gate {
         let mtp = MtpInputs::read(&draft, &file, &inputs, rows)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX)?)?;
         let machine = machine(card()?, inputs.spec.layers.len(), u64::try_from(ub)?);
+        inputs.room = Some(bloomery_gpu::room::HeldRoom::read_machine(&machine)?.room());
         let extra = mtp.card_bytes(CTX)?;
         let plan = inputs.plan_mtp(&machine, CTX, &plan_levers(extra)?, &mtp)?;
         let d = &plan.draft.cards[0];

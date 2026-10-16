@@ -376,11 +376,13 @@ mod cli {
         Qwen35moeModel, Qwen38Model,
     };
     use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::host::SERVED_TIERS;
     use bloomery_gpu::host::route_trace::RouteTrace;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
     use bloomery_gpu::host::xstream::{XLayer, XReport};
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
+    use bloomery_gpu::room::HeldRoom;
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::generate::{Place, card_words};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
@@ -399,6 +401,7 @@ mod cli {
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
     };
+    use model::placement::room::{LOAD_PREP_RESERVE, LoadReserves};
     use model::placement::workstation::HostRead;
     use model::placement::{Device, Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
@@ -951,13 +954,17 @@ mod cli {
             }
         };
         let chosen = q38place::choose(flag, &gpu_census::census()?, |offer| {
-            let inputs = PlanInputs::describe(file)?;
+            let specs = offer.card_specs()?;
+            // The offer's room, read once its stage card is held (the stage
+            // every Qwen3.8 placement shares); its tier card is held only
+            // when chosen, by the run's own reading.
+            let mut inputs = PlanInputs::describe(file)?;
+            inputs.room = Some(HeldRoom::read([(specs[0].name, specs[0].device)])?.room());
             let (draft, _) = draft38(levers, offer, logits, arms, ctx)?;
             let mtp = match draft {
                 Draft38::Off => None,
                 Draft38::Mtp => Some(mtp_inputs38(levers, file, &inputs)?),
             };
-            let specs = offer.card_specs()?;
             q38place::tier_experts(
                 &inputs,
                 (specs[0], specs[1]),
@@ -1000,20 +1007,32 @@ mod cli {
         Ok(MtpInputs::read(&draft_split, file, inputs, head.rows)?)
     }
 
+    /// What the run's load allocates on its thread between its plan's
+    /// reading of the host's `room` and its own check's: the plan again and
+    /// the body's tables ([`Body38::load_prep_bytes`], over the most cards a
+    /// placement holds). The room the plans take, the reading less it, with
+    /// the reading.
+    fn room38(room: &HeldRoom, inputs: &PlanInputs) -> (u64, HostRead) {
+        room.plan_room(&LoadReserves::none().with(
+            LOAD_PREP_RESERVE,
+            Body38::load_prep_bytes(&inputs.model, 1 + SERVED_TIERS),
+        ))
+    }
+
     /// The NVMe tier's RAM arena (`HostTotals::nvme_arena_bytes`) of the
     /// plan a run at `place` loads at the host's `room` (the run's one
-    /// reading, which the open plans by too): the drafted plan when `mtp`
-    /// ([`open_qwen38_mtp`]'s), else the plain one counting `slots`
-    /// sequences ([`open_qwen38`]'s).
+    /// reading, which the open plans by too, [`room38`]): the drafted plan
+    /// when `mtp` ([`open_qwen38_mtp`]'s), else the plain one counting
+    /// `slots` sequences ([`open_qwen38`]'s).
     fn arena38(
         file: &Split,
         levers: &Levers,
-        (place, experts, room): (Place, Experts, &(u64, HostRead)),
+        (place, experts, room): (Place, Experts, &HeldRoom),
         (ctx, slots): (usize, usize),
         mtp: bool,
     ) -> Result<u64, GateError> {
         let mut inputs = PlanInputs::describe(file)?;
-        inputs.room = room.clone();
+        inputs.room = Some(room38(room, &inputs));
         let ub = u64::try_from(ubatch_for(ctx)?)?;
         let ctx_max = u64::try_from(ctx)?;
         let plan_levers = PlanLevers::from_levers(levers)?;
@@ -1042,7 +1061,7 @@ mod cli {
     fn paged38(
         file: &Split,
         levers: &Levers,
-        (place, experts, room): (Place, Experts, &(u64, HostRead)),
+        (place, experts, room): (Place, Experts, &HeldRoom),
         (ctx, slots): (usize, usize),
         (draft, off): (Draft38, Option<Draft38Off>),
     ) -> Result<(Draft38, Option<Draft38Off>), GateError> {
@@ -1431,7 +1450,10 @@ mod cli {
                     )
                     .into());
                 }
-                let room = model::placement::workstation::host_available_read()?;
+                // The run's one reading of the host's room, once every card of
+                // the placement is held: the one-column rule and the load
+                // plan by it.
+                let room = HeldRoom::read(place.card_specs()?.iter().map(|c| (c.name, c.device)))?;
                 let (draft, off) = paged38(
                     &file,
                     &levers,
@@ -1635,7 +1657,7 @@ mod cli {
                         file,
                         &levers,
                         (ctx, mode, slots),
-                        (path, place, experts, room),
+                        (path, place, experts, &room),
                         (lever38, draft_off.as_ref()),
                         t,
                     )?;
@@ -1662,7 +1684,7 @@ mod cli {
                         file,
                         &levers,
                         (ctx, mode),
-                        (path, place, experts, room),
+                        (path, place, experts, &room),
                         lever38,
                         t,
                     )?;
@@ -1873,9 +1895,10 @@ mod cli {
     enum Chosen {
         Qwen3(PrefillPath, Option<Place>),
         Qwen35(PrefillPath, Option<Place>),
-        /// The host's room as the run read it once: the one-column rule
-        /// ([`paged38`]) and the load plan by the same reading.
-        Qwen38(Prompt38, Place, Draft38, (u64, HostRead)),
+        /// The host's room as the run read it once, the placement's cards
+        /// held: the one-column rule ([`paged38`]) and the load plan by the
+        /// same reading.
+        Qwen38(Prompt38, Place, Draft38, HeldRoom),
     }
 
     /// `--place` on a qwen3moe or qwen35moe file: the placement word
@@ -2131,12 +2154,12 @@ mod cli {
         file: Split,
         levers: &Levers,
         (ctx, mode, slots): (usize, StepMode, usize),
-        (path, place, experts, room): (Prompt38, Place, Experts, (u64, HostRead)),
+        (path, place, experts, room): (Prompt38, Place, Experts, &HeldRoom),
         (lever, draft_off): (Lever38<'static>, Option<&Draft38Off>),
         t: Instant,
     ) -> Result<(Qwen38Model, Residency), GateError> {
         let mut inputs = PlanInputs::describe(&file)?;
-        inputs.room = room;
+        inputs.room = Some(room38(room, &inputs));
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.hp)?;
         let ub = ubatch_for(ctx)?;
         let machine = machine38(place, &inputs, u64::try_from(ub)?, experts, None)?;
@@ -2157,8 +2180,8 @@ mod cli {
             )
             .into());
         }
-        println!("{}", plan38_line(place, experts, &plan, &inputs.room.1)?);
-        let residency = residency38(&plan, lever, Record::print)?;
+        println!("{}", plan38_line(place, experts, &plan, room.read_by())?);
+        let residency = residency38(&plan, lever, room, Record::print)?;
         let mut m = Body38::open_placed_residency(
             file,
             &plan,
@@ -2208,12 +2231,12 @@ mod cli {
         file: Split,
         levers: &Levers,
         (ctx, mode): (usize, StepMode),
-        (path, place, experts, room): (Prompt38, Place, Experts, (u64, HostRead)),
+        (path, place, experts, room): (Prompt38, Place, Experts, &HeldRoom),
         lever: Lever38<'static>,
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
         let mut inputs = PlanInputs::describe(&file)?;
-        inputs.room = room;
+        inputs.room = Some(room38(room, &inputs));
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.hp)?;
         let ub = ubatch_for(ctx)?;
         let head = head_rows_of(levers.mtp_head_rows(), &file, inputs.spec.vocab)?;
@@ -2252,9 +2275,9 @@ mod cli {
         }
         println!(
             "{}",
-            plan38_line(place, experts, &plan.plan, &inputs.room.1)?
+            plan38_line(place, experts, &plan.plan, room.read_by())?
         );
-        let residency = residency38(&plan.plan, lever, Record::print)?;
+        let residency = residency38(&plan.plan, lever, room, Record::print)?;
         let mut m = Body38::open_placed_mtp_residency(
             file,
             &plan,

@@ -207,7 +207,7 @@ fn hw_qwen4exp_mtp_plan() {
     let mut inputs = PlanInputs::describe(&target).unwrap_or_else(|e| panic!("describe: {e}"));
     // The plans here hold the PLE table on the host whatever this machine's
     // memory reads: a room no host need passes, given, not read.
-    inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
+    inputs.room = Some((u64::MAX, model::placement::workstation::HostRead::Given));
     let full = MtpInputs::read(&draft, &target, &inputs, HeadRows::Full)
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
     let digest = vocab_sha256(&target).unwrap_or_else(|e| panic!("vocab_sha256: {e}"));
@@ -480,7 +480,7 @@ fn hw_qwen4exp_bp_mtp_plan() {
     let mut inputs = PlanInputs::describe(&target).unwrap_or_else(|e| panic!("describe: {e}"));
     // The plans here hold the PLE table on the host whatever this machine's
     // memory reads: a room no host need passes, given, not read.
-    inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
+    inputs.room = Some((u64::MAX, model::placement::workstation::HostRead::Given));
     let mtp = MtpInputs::read(&draft, &target, &inputs, HeadRows::Full)
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
     let (ctx, u) = (4096u64, 4096u64);

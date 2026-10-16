@@ -50,7 +50,7 @@ pub fn parse(v: &str) -> Result<Place, GateError> {
 
 /// The expert tier's prompt-batch bytes `place`'s plan reserves for the file
 /// of hyperparameters `hp` (`model::arch::deepseek41::place::tier_batch`),
-/// which `Place::machine` takes; `None` under a placement with no tier card.
+/// which `Place::machine_v41` takes; `None` under a placement with no tier card.
 pub fn tier_batch(place: Place, hp: &Hparams) -> Option<TierBatchBytes> {
     (!place.tier_cards().is_empty()).then(|| model::arch::deepseek41::place::tier_batch(hp))
 }

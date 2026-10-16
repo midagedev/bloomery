@@ -43,6 +43,7 @@ use runtime::{Advance, Committed, Out, Target, Want};
 use tokenizer::Tokenizer;
 
 use crate::record::{self, Record};
+use crate::residency38;
 use crate::{GateError, ref_model_path};
 
 /// Which placement the engine loads by: a stage card that runs every layer
@@ -431,15 +432,49 @@ impl Place {
         .into())
     }
 
-    /// The machine the placement plans over, by layer count. `draft_bytes`
-    /// is the DSpark draft's resident bytes when the draft is served on the
-    /// placement's first tier card ([`Place::draft_card`]); `batch` is the
-    /// expert tier's prompt-batch bytes the plan reserves on each tier card
-    /// and the host (the model's own figure, from its hyperparameters). A
-    /// figure handed to a placement with no tier card is refused by name, a
-    /// placement with tier cards without `batch` too, and every refusal of
+    /// V4.1's machine of the placement, by layer count ([`Place::machine_of`]):
+    /// V4.1's body makes no checkpoints, so its machine reserves none.
+    /// `draft_bytes` is the DSpark draft's resident bytes when the draft is
+    /// served on the placement's first tier card ([`Place::draft_card`]).
+    pub fn machine_v41(
+        self,
+        draft_bytes: Option<u64>,
+        batch: Option<TierBatchBytes>,
+    ) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
+        self.machine_of(draft_bytes, batch)
+    }
+
+    /// GLM's machine of the placement, by layer count ([`Place::machine_of`],
+    /// no draft reserve), for a load of `slots` resident sequences: every
+    /// machine it makes declares the checkpoints they pin
+    /// ([`residency38::glm_seqs`]: the GLM body's prompt call takes a point at
+    /// each mark with no switch), so the offer, the plans and the open each
+    /// count them.
+    pub fn machine_glm(
+        self,
+        batch: Option<TierBatchBytes>,
+        slots: usize,
+    ) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
+        let base = self.machine_of(None, batch)?;
+        Ok(move |layers| {
+            let mut machine = base(layers);
+            residency38::reserve_checkpoints(&mut machine, residency38::glm_seqs(slots));
+            machine
+        })
+    }
+
+    /// The machine the placement plans over, by layer count, with no
+    /// checkpoint reserve: each family's public constructor is the only way
+    /// to it ([`Place::machine_v41`], [`Place::machine_glm`]), so a GLM
+    /// machine cannot skip its checkpoints. `draft_bytes` is the DSpark
+    /// draft's resident bytes when the draft is served on the placement's
+    /// first tier card ([`Place::draft_card`]); `batch` is the expert tier's
+    /// prompt-batch bytes the plan reserves on each tier card and the host
+    /// (the model's own figure, from its hyperparameters). A figure handed to
+    /// a placement with no tier card is refused by name, a placement with
+    /// tier cards without `batch` too, and every refusal of
     /// `workstation::plan_tiers` before the machine is planned.
-    pub fn machine(
+    fn machine_of(
         self,
         draft_bytes: Option<u64>,
         batch: Option<TierBatchBytes>,
@@ -483,7 +518,7 @@ impl Place {
         Ok(move |layers| match batch {
             None => workstation::plan_on(stage, layers),
             Some(b) => workstation::plan_tiers(layers, stage, &tier_specs[..k], draft, b)
-                .expect("Place::machine checked the placement's cards before planning"),
+                .expect("Place::machine_of checked the placement's cards before planning"),
         })
     }
 
@@ -632,15 +667,12 @@ pub fn with_cards(
     }
 }
 
-/// How [`Generator::open`] loads: the placement and the expert tier's
-/// prompt-batch bytes its plan reserves ([`Place::machine`]'s `batch`), the
-/// context the caches are sized for, the step mode, and whether the calling
-/// thread pins itself to the dispatcher's cpu slot (`BLOOMERY_PIN_MAIN` is
-/// the caller's to read).
+/// How [`Generator::open`] loads: the placement, the context the caches are
+/// sized for, the step mode, and whether the calling thread pins itself to
+/// the dispatcher's cpu slot (`BLOOMERY_PIN_MAIN` is the caller's to read).
 #[derive(Debug, Clone, Copy)]
 pub struct OpenArgs {
     pub place: Place,
-    pub tier_batch: Option<TierBatchBytes>,
     pub ctx: usize,
     pub mode: StepMode,
     pub pin_main: bool,
@@ -654,20 +686,25 @@ pub struct Generator<B: ChainBody> {
 
 impl<B: ChainBody> Generator<B> {
     /// Open `$BLOOMERY_REF_MODEL` by `args.place` through `open`, the body's
-    /// loader (the file, the placement's machine and the context), run `check`
-    /// on the loaded model (it refuses a body that cannot run this file, and
-    /// adds the body's fields to the `load` record it is handed), then write
-    /// the `load` record ([`record::LOAD_GENERATOR`]), the load's phases when
-    /// the load timed them ([`record::LOAD_PHASES`]), the host set's records
-    /// of a placed load, and in graph mode capture the step before any token
-    /// (the `capture` record) — all to `log`.
-    pub fn open<O, C>(
+    /// loader (the file, `machine` — the placement's machine by layer count,
+    /// which the caller builds by its family's constructor, so the checkpoints
+    /// its body takes are its own ([`Place::machine_v41`],
+    /// [`Place::machine_glm`]) — and the context), run `check` on the loaded
+    /// model (it refuses a body that cannot run this file, and adds the
+    /// body's fields to the `load` record it is handed), then write the
+    /// `load` record ([`record::LOAD_GENERATOR`]), the load's phases when the
+    /// load timed them ([`record::LOAD_PHASES`]), the host set's records of a
+    /// placed load, and in graph mode capture the step before any token (the
+    /// `capture` record) — all to `log`.
+    pub fn open<M, O, C>(
         args: OpenArgs,
+        machine: M,
         open: O,
         check: C,
         log: &mut dyn Write,
     ) -> Result<Generator<B>, GateError>
     where
+        M: Fn(usize) -> Machine,
         O: FnOnce(Split, &dyn Fn(usize) -> Machine, usize) -> Result<GpuModel<B>, GpuError>,
         C: FnOnce(&GpuModel<B>, Record) -> Result<Record, GateError>,
     {
@@ -675,7 +712,6 @@ impl<B: ChainBody> Generator<B> {
         let path = ref_model_path()?;
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let machine = args.place.machine(None, args.tier_batch)?;
         let headers = t.elapsed();
         let mut model = open(file, &machine, args.ctx)?;
         model.set_mode(args.mode);
@@ -1540,13 +1576,13 @@ mod tests {
         assert_eq!(Place::Bp.tier_cards(), vec![RTX_3090.name]);
         assert!(Place::A.tier_cards().is_empty() && Place::Gate.draft_card().is_none());
         assert_eq!(Place::Bp.draft_card(), Some(RTX_3090.name));
-        let a = Place::A.machine(None, None).expect("a");
-        let gate = Place::Gate.machine(None, None).expect("gate");
+        let a = Place::A.machine_of(None, None).expect("a");
+        let gate = Place::Gate.machine_of(None, None).expect("gate");
         for layers in [0, 1, 43, 47, 48, 78] {
             assert_eq!(a(layers), workstation::plan_a(layers));
             assert_eq!(gate(layers), workstation::plan_gate(layers));
             for draft in [None, Some(1_843_200_000)] {
-                let bp = Place::Bp.machine(draft, Some(BATCH)).expect("bp");
+                let bp = Place::Bp.machine_of(draft, Some(BATCH)).expect("bp");
                 assert_eq!(bp(layers), workstation::plan_bp(layers, draft, BATCH));
             }
         }
@@ -1560,7 +1596,7 @@ mod tests {
         for w in ["3090+a6000", "3090+A6000"] {
             let p = Place::parse(w).unwrap_or_else(|e| panic!("{w}: {e}"));
             assert_eq!(p.name(), "3090+a6000");
-            let m = p.machine(None, Some(BATCH)).expect("3090+a6000");
+            let m = p.machine_of(None, Some(BATCH)).expect("3090+a6000");
             assert_eq!(
                 m(43),
                 workstation::plan_tiers(43, RTX_3090, &[A6000], None, BATCH).expect("plan")
@@ -1568,7 +1604,7 @@ mod tests {
         }
         let ordinals = Place::parse("cuda1+0").expect("ordinals");
         assert_eq!(ordinals.cards(), vec!["cuda1", "cuda0"]);
-        let unresolved = match ordinals.machine(None, Some(BATCH)) {
+        let unresolved = match ordinals.machine_of(None, Some(BATCH)) {
             Ok(_) => panic!("an unresolved ordinal was planned"),
             Err(e) => e.to_string(),
         };
@@ -1601,16 +1637,16 @@ mod tests {
                 .expect("small");
             let a = Place::A.on(&census).expect("a");
             assert_eq!((a, a.name(), a.cards()), (Place::A, "a", vec![A6000.name]));
-            let m = a.machine(None, None).expect("a")(43);
+            let m = a.machine_of(None, None).expect("a")(43);
             assert_eq!(m.cards[0].device.map(|d| d.ordinal), Some(a6000));
             assert_eq!(strip(m), workstation::plan_a(43));
             let bp = Place::Bp.on(&census).expect("bp");
             assert_eq!(bp.draft_device().map(|d| d.ordinal), Some(1 - a6000));
-            let m = bp.machine(None, Some(BATCH)).expect("bp")(43);
+            let m = bp.machine_of(None, Some(BATCH)).expect("bp")(43);
             assert_eq!(strip(m), workstation::plan_bp(43, None, BATCH));
             let gate = Place::Gate.on(&census).expect("gate");
             assert_eq!(
-                strip(gate.machine(None, None).expect("gate")(43)),
+                strip(gate.machine_of(None, None).expect("gate")(43)),
                 workstation::plan_gate(43)
             );
             let w = format!("{a6000}+{}", 1 - a6000);
@@ -1622,7 +1658,7 @@ mod tests {
                 (list.name(), list.cards()),
                 (w.as_str(), vec!["A6000", "3090"])
             );
-            let m = list.machine(None, Some(BATCH)).expect("list")(43);
+            let m = list.machine_of(None, Some(BATCH)).expect("list")(43);
             assert_eq!(strip(m), workstation::plan_bp(43, None, BATCH));
         }
         let ada = census(&["NVIDIA RTX 6000 Ada Generation", "A6000"]);
@@ -1648,7 +1684,7 @@ mod tests {
         );
         let bp = Place::Bp.on(&two).expect("two 3090s");
         assert_eq!(bp.cards(), vec!["3090", "3090"]);
-        let m = bp.machine(None, Some(BATCH)).expect("stage + tier")(43);
+        let m = bp.machine_of(None, Some(BATCH)).expect("stage + tier")(43);
         assert_eq!(m.tiers[0].device.map(|d| d.ordinal), Some(1));
     }
 
@@ -2005,7 +2041,7 @@ mod tests {
         );
         assert!(Place::Bp.serves("deepseek41", 1).is_ok() && Place::A.serves("x", 0).is_ok());
         let machine_err =
-            |p: Place, d: Option<u64>, b: Option<TierBatchBytes>| match p.machine(d, b) {
+            |p: Place, d: Option<u64>, b: Option<TierBatchBytes>| match p.machine_of(d, b) {
                 Ok(_) => panic!("{} {d:?} {b:?} was planned", p.name()),
                 Err(e) => e.to_string(),
             };

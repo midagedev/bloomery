@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, OpenOpts, Qwen35moeModel};
 use bloomery_gpu::linear::{KHeadMap, LinearShape};
 use bloomery_gpu::model::{GpuModel, Slots};
+use bloomery_gpu::room::HeldRoom;
 use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
@@ -44,7 +45,7 @@ use gguf::Split;
 use model::arch::qwen3moe::place::{self as q3, card_routed};
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
-use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
+use model::placement::workstation::{CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
     self, Device, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role,
     WholeLoad, WholeNeed,
@@ -313,10 +314,14 @@ impl PlaceQ3 {
         seqs: Seqs,
     ) -> Result<PlaceQ3, GateError> {
         let place = PlaceQ3::resolve(place, census)?;
+        let card = place.card_specs()?[0];
         let mut inputs = q35::PlanInputs::describe(file)?;
         if o.kv == KvQ8::Q8 {
             inputs.kv = inputs.kv.in_q8();
         }
+        // The host's room, read once the plan's card is held: the NVMe
+        // tier's split follows it.
+        inputs.room = Some(HeldRoom::read([(card.name, card.device)])?.room());
         let inputs = Inputs::Qwen35(Box::new(inputs));
         let arena = Qwen35moeModel::placed_arena_bytes(file, o)?;
         let machine = laid(place.card_specs()?[0], &inputs, arena, seqs);
@@ -457,11 +462,15 @@ impl PlaceQ3 {
         // A qwen35moe-family file's PLE table: its tier and the room's
         // reading that chose it; a plan with none, and a qwen3moe file,
         // print neither. A tier no reader takes prints as refused.
+        let read = |i: &q35::PlanInputs| {
+            i.room
+                .as_ref()
+                .map(|(_, read)| read.word())
+                .expect("a plan of these inputs took their room")
+        };
         let r = match (&self.inputs, plan.row_tier()) {
-            (Inputs::Qwen35(i), Ok(Some(Device::Nvme))) => {
-                r.w("rows", "nvme").w("read", i.room.1.word())
-            }
-            (Inputs::Qwen35(i), Ok(Some(_))) => r.w("rows", "host").w("read", i.room.1.word()),
+            (Inputs::Qwen35(i), Ok(Some(Device::Nvme))) => r.w("rows", "nvme").w("read", read(i)),
+            (Inputs::Qwen35(i), Ok(Some(_))) => r.w("rows", "host").w("read", read(i)),
             (Inputs::Qwen35(_), Err(_)) => r.w("rows", "refused"),
             (Inputs::Qwen35(_), Ok(None)) | (Inputs::Qwen3(_), _) => r,
         };
@@ -1045,15 +1054,15 @@ fn open_slots<B: Slots>(
 /// The checkpoints `seqs` pin on the host held against what the load counts
 /// them in, one stderr line either way: a placed load's plan carries them as
 /// its host's checkpoint reserve ([`laid`]), which its own check holds
-/// against the host's usable bytes and refuses by name; a whole-card load has
-/// no host plan, so the host's available bytes now
-/// ([`workstation::host_available`]) must hold them, else they are refused
-/// by name before anything loads. Nothing for `seqs` that take none.
+/// against the host's usable bytes and refuses by name; a whole-card load on
+/// `whole`'s card has no host plan, so the host's room, read once that card
+/// is held ([`HeldRoom::read`]), must hold them, else they are refused by
+/// name before anything loads. Nothing for `seqs` that take none.
 #[allow(
     dead_code,
     reason = "the serve seat's qwen35moe loads take checkpoints; the CLI and the e2e gates take none"
 )]
-pub fn checkpoints_fit(seqs: Seqs, placed: bool) -> Result<(), GateError> {
+pub fn checkpoints_fit(seqs: Seqs, whole: Option<CardSpec>) -> Result<(), GateError> {
     if !seqs.checkpoints {
         return Ok(());
     }
@@ -1065,15 +1074,17 @@ pub fn checkpoints_fit(seqs: Seqs, placed: bool) -> Result<(), GateError> {
         "sequences pin"
     };
     let head = format!("checkpoints: {n} {what} at most {pin} B of host ({HOST_BUDGET} B each)");
-    if placed {
+    let Some(card) = whole else {
         eprintln!("{head}, counted in the placed plan's host reserves");
         return Ok(());
-    }
-    let available = workstation::host_available()?;
+    };
+    let room = HeldRoom::read([(card.name, card.device)])?;
+    let available = room.bytes();
     if pin > available {
         return Err(format!(
-            "{head}, past the {available} B the host has available (MemAvailable): give a smaller \
-             --parallel"
+            "{head}, past the {available} B the host has available ({}): give a smaller \
+             --parallel",
+            room.read_by().word()
         )
         .into());
     }

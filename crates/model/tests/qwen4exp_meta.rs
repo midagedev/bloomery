@@ -266,7 +266,7 @@ fn hw_qwen4exp_plan() {
     let mut inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
     // The plans here hold the PLE table on the host whatever this machine's
     // memory reads: a room no host need passes, given, not read.
-    inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
+    inputs.room = Some((u64::MAX, model::placement::workstation::HostRead::Given));
     let hp = &inputs.hp;
     let file: std::collections::HashSet<&str> = inputs
         .model
@@ -856,7 +856,7 @@ fn hw_qwen4exp_card_plan() {
     let mut inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
     // The plans here hold the PLE table on the host whatever this machine's
     // memory reads: a room no host need passes, given, not read.
-    inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
+    inputs.room = Some((u64::MAX, model::placement::workstation::HostRead::Given));
     let draft = Split::open(SHARED).unwrap_or_else(|e| panic!("open {SHARED}: {e}"));
     let mtp = MtpInputs::read(&draft, &split, &inputs, HeadRows::Full)
         .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
@@ -1278,7 +1278,7 @@ fn hw_qwen4exp_q3_card_plan() {
     let mut inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
     // The plans here hold the PLE table on the host whatever this machine's
     // memory reads: a room no host need passes, given, not read.
-    inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
+    inputs.room = Some((u64::MAX, model::placement::workstation::HostRead::Given));
     let list = spec_view::items(&inputs.unimplemented());
     check(
         &mut o,
@@ -1510,7 +1510,7 @@ fn hw_qwen4exp_bp_plan() {
     let mut inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
     // The plans here hold the PLE table on the host whatever this machine's
     // memory reads: a room no host need passes, given, not read.
-    inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
+    inputs.room = Some((u64::MAX, model::placement::workstation::HostRead::Given));
     let (ctx, u) = (4096u64, 4096u64);
     let n = inputs.hp.n_layer;
     let levers = PlanLevers::default();

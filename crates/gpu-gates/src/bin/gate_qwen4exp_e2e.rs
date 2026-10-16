@@ -3950,7 +3950,7 @@ mod gate {
             u64::try_from(n_gdn())? * rec + u64::try_from(n_qsa())? * sel + ple + 4 + rows as u64
         };
         let file = open_split()?;
-        let inputs = PlanInputs::describe(&file)?;
+        let mut inputs = PlanInputs::describe(&file)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let machine = machine_for_experts(
             card()?,
@@ -3958,6 +3958,7 @@ mod gate {
             u64::try_from(ub)?,
             experts,
         );
+        inputs.room = Some(bloomery_gpu::room::HeldRoom::read_machine(&machine)?.room());
         let ctx = CTX as u64;
         let plan_levers = &cfg().plan_levers;
         let plain = inputs.plan_with(&machine, ctx, plan_levers, experts)?;

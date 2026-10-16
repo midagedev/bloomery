@@ -190,6 +190,7 @@ use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{Slots, StepMode};
+use bloomery_gpu::room::HeldRoom;
 use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqSnapshot};
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
@@ -757,7 +758,7 @@ fn print_plan(
     pick: ResidencyPick,
     cache_ram: Option<u64>,
 ) -> Result<(String, Option<PlacementProps>, CacheRam, ResidencyPick), GateError> {
-    let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
+    let mut machine = place.machine_v41(reserve, tier_batch)?(inputs.model.layers);
     if let Some(bytes) = vision_reserve {
         machine.cards[0]
             .reserves
@@ -784,7 +785,10 @@ fn print_plan(
                 },
             )
         })?;
-    let pick = residency41::at_plan(&plan, pick)?;
+    // The host's room, read once every card of the plan is held: the unset
+    // residency word's room and the prompt cache's default both take it.
+    let room = HeldRoom::read_machine(&machine)?;
+    let pick = residency41::at_plan(&plan, pick, &room)?;
     record::residency_lever(pick).eprint();
     if let Some(d) = pick.why.detail() {
         eprintln!("{d}");
@@ -802,6 +806,7 @@ fn print_plan(
     }
     let cache = CacheRam::of(
         cache_ram,
+        &room,
         HostNeed::of(&plan, 0).bytes(),
         pool_bytes,
         checkpoints_reserved(plan.machine),
@@ -1093,7 +1098,7 @@ impl V41 {
         // open (one sequence) does not: the model is opened here by that
         // plan, then handed to the session. The encoder's reserve rides the
         // same plan when it sits on the stage card ([`print_plan`]'s rule).
-        let plain = a.place.machine(a.reserve, a.tier_batch)?;
+        let plain = a.place.machine_v41(a.reserve, a.tier_batch)?;
         let vision_reserve = a.vision.as_ref().and_then(|s| s.reserve);
         let machine = move |layers: usize| {
             let mut machine = plain(layers);

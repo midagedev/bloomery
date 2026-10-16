@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
+use bloomery_gpu::room::HeldRoom;
 use gguf::Split;
 use model::placement::workstation::{self, DeviceId, HostRead};
 use model::placement::{Device, ModelTensors, Plan, Role};
@@ -377,9 +378,9 @@ pub const CACHE_RAM_CAP: u64 = 8192 << 20;
 /// The prompt cache's budget of a seat whose saved states live in host RAM
 /// beside a load's host set (llama-server's `--cache-ram`, in MiB; 0 turns
 /// it off), and its terms: set, as given; else the lesser of
-/// [`CACHE_RAM_CAP`] and half of what the host's available bytes —
-/// `MemAvailable`, or the smaller room under a cgroup v2 limit
-/// (`workstation::host_available_read`) — leave past the plan's host need
+/// [`CACHE_RAM_CAP`] and half of what the host's room — `MemAvailable`, or
+/// the smaller room under a cgroup v2 limit, read once the plan's cards are
+/// held ([`HeldRoom::read`]) — leaves past the plan's host need
 /// and the residency's churn pool, the need holding the NVMe expert tier's
 /// arena ([`CacheRam::of_tier`]) and the checkpoints the load's sequences
 /// pin (`residency38::reserve_checkpoints`, the machine's host reserve), 0
@@ -433,16 +434,18 @@ impl CacheRam {
     }
 
     /// The budget (the type's doc): `set` in bytes as given, else the
-    /// default over `need` and `pool`, `need` holding the `checkpoints` the
-    /// plan's machine reserves (`residency38::checkpoints_reserved`) —
-    /// [`CacheRam::of_tier`] with no NVMe expert tier.
+    /// default over `room`, `need` and `pool`, `need` holding the
+    /// `checkpoints` the plan's machine reserves
+    /// (`residency38::checkpoints_reserved`) — [`CacheRam::of_tier`] with no
+    /// NVMe expert tier.
     pub fn of(
         set: Option<u64>,
+        room: &HeldRoom,
         need: u64,
         pool: u64,
         checkpoints: u64,
     ) -> Result<CacheRam, GateError> {
-        Self::of_tier(set, need, pool, (0, 0), checkpoints)
+        Self::of_tier(set, room, need, pool, (0, 0), checkpoints)
     }
 
     /// [`CacheRam::of`] on a plan the NVMe expert tier split: `(tier,
@@ -453,20 +456,13 @@ impl CacheRam {
     /// filled is the kernel's OOM or swap, not a page it reclaims.
     pub fn of_tier(
         set: Option<u64>,
+        room: &HeldRoom,
         need: u64,
         pool: u64,
         (tier, paged): (u64, u64),
         checkpoints: u64,
     ) -> Result<CacheRam, GateError> {
-        let (available, reading) = workstation::host_available_read()?;
-        Self::at(
-            set,
-            (available, reading),
-            need,
-            pool,
-            (tier, paged),
-            checkpoints,
-        )
+        Self::at(set, room.room(), need, pool, (tier, paged), checkpoints)
     }
 
     /// [`CacheRam::of_tier`] at a host reading already taken. A `need`
@@ -959,6 +955,13 @@ pub trait Seat: 'static {
         Self: Sized;
 }
 
+/// The stack the engine thread is spawned with ([`SeatEngine::spawn`]):
+/// std's default for a spawned thread, set here so `RUST_MIN_STACK` does not
+/// move it. Its mapping is the most of the thread's pages a load's reading of
+/// the host's room can find resident, the seat's `engine_stack` reserve
+/// (`model::placement::room::ENGINE_STACK_RESERVE`).
+pub const ENGINE_STACK: usize = 2 << 20;
+
 /// `serve::Engine` over a [`Seat`] that lives on its own thread. The
 /// position is the model's alone: every question about it goes to the thread.
 pub struct SeatEngine {
@@ -1041,6 +1044,7 @@ impl SeatEngine {
         let n_vocab = vocab.n_vocab();
         let worker = std::thread::Builder::new()
             .name("engine".to_owned())
+            .stack_size(ENGINE_STACK)
             .spawn(move || {
                 let mut g = match open() {
                     Ok(g) => g,
@@ -3302,8 +3306,7 @@ mod tests {
         use super::super::{CacheRam, HostRead};
         use crate::generate::Place;
         use crate::residency38::{
-            CHECKPOINTS_RESERVE, Seqs, checkpoint_bytes, checkpoints_reserved, glm_machine,
-            reserve_checkpoints,
+            CHECKPOINTS_RESERVE, Seqs, checkpoint_bytes, checkpoints_reserved, reserve_checkpoints,
         };
         use model::placement::{Host, Machine};
         use runtime::seqstate::HOST_BUDGET;
@@ -3517,7 +3520,7 @@ mod tests {
             assert!(said.contains("reserves its checkpoints already"), "{said}");
         }
 
-        /// A GLM load's machine (`glm_machine`, the one its offer, plans and
+        /// A GLM load's machine (`Place::machine_glm`, the one its offer, plans and
         /// open take) reserves every slot's checkpoints, since the GLM body
         /// takes them on every load: one `HOST_BUDGET` at one slot and three
         /// at three. At one slot the prompt cache's default budget is the one
@@ -3530,7 +3533,9 @@ mod tests {
             let (need, pool) = (6_000u64, 1_000u64);
             let available = need + pool + 4 * HOST_BUDGET + 100_000;
             for slots in [1usize, 3] {
-                let m = glm_machine(Place::A, None, slots).expect("plan (a)'s machine")(layers);
+                let m = Place::A
+                    .machine_glm(None, slots)
+                    .expect("plan (a)'s machine")(layers);
                 let reserved = checkpoints_reserved(&m);
                 assert_eq!(reserved, checkpoint_bytes(slots), "{slots} slots");
                 let c = CacheRam::at(

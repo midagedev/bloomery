@@ -38,6 +38,7 @@ pub mod churn;
 pub mod ctx;
 pub mod devices;
 pub mod paged_drop;
+pub mod room;
 pub mod workstation;
 
 #[cfg(test)]

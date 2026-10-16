@@ -365,13 +365,13 @@ mod drive {
         let want_top_k = inputs.hp.indexer.top_k;
         let open = OpenArgs {
             place: load.place,
-            tier_batch,
             ctx: load.ctx,
             mode: StepMode::Graph,
             pin_main: levers.pin_main(),
         };
         let mut g = Generator::open(
             open,
+            load.place.machine_v41(None, tier_batch)?,
             |file, machine, ctx| {
                 let t = std::time::Instant::now();
                 let inputs = Body::inputs(&file)?;
@@ -457,7 +457,7 @@ mod drive {
         ctx: usize,
         levers: &PlanLevers,
     ) -> Result<(), GateError> {
-        let machine = place.machine(None, tier_batch)?(inputs.model.layers);
+        let machine = place.machine_v41(None, tier_batch)?(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         record::plan(place.name(), &machine, &plan).eprint();
         Ok(())
