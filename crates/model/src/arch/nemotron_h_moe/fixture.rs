@@ -187,7 +187,7 @@ pub fn check_map(src: &Hparams, source: &Split, layers: &[usize]) -> Result<usiz
         layers,
     )?;
     let shapes: BTreeSet<(usize, usize)> = moe_layers(src, layers)
-        .map(|(_, e)| (e.n_expert, e.ff))
+        .map(|e| (e.n_expert, e.ff))
         .collect();
     if shapes.len() < 2 {
         return Err(hybrid::map_error(format!(
@@ -196,19 +196,16 @@ pub fn check_map(src: &Hparams, source: &Split, layers: &[usize]) -> Result<usiz
         )));
     }
     Ok(moe_layers(src, layers)
-        .map(|(_, e)| e.n_expert)
+        .map(|e| e.n_expert)
         .max()
         .expect("two shapes hold a MoE layer"))
 }
 
-/// The source layers of `layers` that are MoE layers, with their experts.
-fn moe_layers<'a>(
-    src: &'a Hparams,
-    layers: &'a [usize],
-) -> impl Iterator<Item = (usize, Experts)> + 'a {
+/// The experts of the MoE layers in `layers`.
+fn moe_layers<'a>(src: &'a Hparams, layers: &'a [usize]) -> impl Iterator<Item = Experts> + 'a {
     layers
         .iter()
-        .filter_map(|&l| src.experts.get(l).copied().flatten().map(|e| (l, e)))
+        .filter_map(|&l| src.experts.get(l).copied().flatten())
 }
 
 /// Latent MoE's rules.

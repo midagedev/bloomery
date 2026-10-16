@@ -4108,7 +4108,7 @@ fn hw_fixture_nemotron_refusals() {
 /// (8 × 256) and 7 (10 × 256), `expert_count` 12. Layer 6's `ffn_down_shexp` is Q5_0 and the other
 /// MoE layers' IQ2_XXS, one stem of two types; the routed and shared experts are IQ2_XXS as the real
 /// file's are. The tensors are zeros: the generator reads the header alone.
-fn bolt_source(path: &Path, extra_kvs: &[(&str, Value)]) -> Split {
+fn bolt_source(path: &Path) -> Split {
     use GgmlType::{F32, IQ2_XXS, NVFP4, Q5_0, Q8_0};
     const E: u64 = 256;
     let name = |l: usize, stem: &str| format!("blk.{l}.{stem}");
@@ -4166,7 +4166,7 @@ fn bolt_source(path: &Path, extra_kvs: &[(&str, Value)]) -> Split {
     }
     let arr = |v: &[i32]| Value::Array(v.iter().map(|&x| Value::I32(x)).collect());
     let u32v = |k: &str, v: u32| (format!("nemotron_h_moe.{k}"), Value::U32(v));
-    let mut kvs: Vec<(String, Value)> = vec![
+    let kvs: Vec<(String, Value)> = vec![
         (
             gguf::GENERAL_ARCHITECTURE.to_string(),
             Value::String("nemotron_h_moe".into()),
@@ -4232,7 +4232,6 @@ fn bolt_source(path: &Path, extra_kvs: &[(&str, Value)]) -> Split {
         ),
         u32v("moe_latent_size", 256),
     ];
-    kvs.extend(extra_kvs.iter().map(|(k, v)| (k.to_string(), v.clone())));
     zero_source(path, &kvs, &tensors)
 }
 
@@ -4267,7 +4266,7 @@ fn bolt_kv<'a>(p: &'a Plan, suffix: &str) -> &'a Value {
 fn fixture_bolt_round_trip() {
     let guard = dir("bolt-round-trip");
     let d = &guard.0;
-    let src = bolt_source(&d.join("src.gguf"), &[]);
+    let src = bolt_source(&d.join("src.gguf"));
     let spec = bolt_spec();
     let plan = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
     for (f, leaf, want) in [
@@ -4365,7 +4364,7 @@ fn fixture_bolt_round_trip() {
 fn fixture_bolt_refuses_a_map_that_loses_a_kind_a_pair_or_a_shape() {
     let guard = dir("bolt-map");
     let d = &guard.0;
-    let src = bolt_source(&d.join("src.gguf"), &[]);
+    let src = bolt_source(&d.join("src.gguf"));
     let mut bad = Vec::new();
     let control = bolt_spec();
     if let Err(e) = fixture::plan(&control, &src, None, &control.options()) {
