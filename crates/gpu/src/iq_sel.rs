@@ -571,6 +571,123 @@ fn down_sel_body<D: RawSb>(
     }
 }
 
+/// Sub-block `ib` of super-block `sb` of an IQ2_XXS plane row
+/// ([`crate::iq::repack_iq2xxs`]'s layout) whose 16 idx/aux words start at
+/// byte `x` and whose d words at byte `dh`: the sub-block's idx and aux are
+/// clean words, so the decode reads two aligned words where the file twin
+/// reads three of a window.
+///
+/// # Safety
+///
+/// Words `(x >> 2) + 2·ib` and `+ 1` and word `dh >> 2 + sb/2` are inside
+/// `w`.
+#[inline(always)]
+fn iq2xxs_sub_p(
+    w: &[u32],
+    x: usize,
+    dh: usize,
+    sb: usize,
+    ib: usize,
+    tab: Iq2XxsTab,
+) -> ([u32; 8], i32, f32) {
+    let h = (x >> 2) + 2 * ib;
+    // SAFETY: this fn's contract.
+    let (wv, ai, dw) = unsafe {
+        let (idx, aux) = (*w.get_unchecked(h), *w.get_unchecked(h + 1));
+        let (wv, ai) = iq2xxs_sub(idx, aux, tab);
+        (wv, ai, *w.get_unchecked((dh >> 2) + sb / 2))
+    };
+    let d = half_bits_to_f32((dw >> (16 * (sb & 1) as u32)) as u16) * 0.125;
+    (wv, ai, d)
+}
+
+/// [`down_sel_body`] over the load-time plane of
+/// [`crate::weights::DevWeight::Iq2Xxs`] ([`crate::iq::repack_iq2xxs`]'s
+/// layout): the same walk and term, the row's words addressed through its
+/// expert's region — `16·n_sb` idx/aux words a row over `64` bytes a
+/// super-block, the d words `n_sb/2` a row at the region's tail — so every
+/// read is an aligned word. The caller keeps the entry's launch contract:
+/// the plane holds exactly `33·n_sb/2` words a row (`k` a multiple of 512)
+/// and the rest is [`down_sel_body`]'s (rust-quality R28).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+fn down_sel_body_p(
+    w: &[u32],
+    q: &[u32],
+    d8: &[f32],
+    sel: &[u32],
+    n_experts: u32,
+    rows_per_expert: u32,
+    slots_per_col: u32,
+    n_sb: u32,
+    n_grp: u32,
+    fault: FaultSink,
+    row: usize,
+    y: &mut DisjointSlice<f32>,
+    tab: Iq2XxsTab,
+) {
+    // In u32: the launchers bound n_slots · rows_per_expert to u32, and a
+    // usize division is a 64-bit emulation ahead of the first weight load.
+    let (r, slot) = (
+        row as u32 % rows_per_expert,
+        (row as u32 / rows_per_expert) as usize,
+    );
+    // SAFETY: slot < n_slots <= sel.len() by this fn's contract; the load is
+    // warp-uniform (the warp's lanes share `row`, hence `slot`), so the
+    // returns below never diverge a warp.
+    let id = unsafe { *sel.get_unchecked(slot) };
+    let lane = warp::lane_id() as usize;
+    if id >= n_experts {
+        if id != HOST && lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+        }
+        return;
+    }
+    let col = (slot as u32 / slots_per_col) as usize;
+    let a = ActCols {
+        q,
+        d8,
+        q0: col * 256 * n_grp as usize,
+        q_col: 0,
+        d0: col * 2 * n_sb as usize,
+        d_col: 0,
+    };
+    let (rows, n_sb) = (rows_per_expert as usize, n_sb as usize);
+    // The expert's region: its rows' idx/aux words, then its rows' d words
+    // (usize: a plane stack's word offsets pass u32).
+    let e0 = id as usize * rows * n_sb * 33 / 2;
+    let (qs, dh) = (
+        4 * (e0 + r as usize * 16 * n_sb),
+        4 * (e0 + rows * 16 * n_sb + r as usize * n_sb / 2),
+    );
+    let n_sub = 8 * n_sb;
+    let mut f = 0.0f32;
+    let mut b = lane;
+    while b < n_sub {
+        let sb = b >> 3;
+        let x = qs + 64 * sb;
+        // SAFETY: b < n_sub, so super-block sb of the row is inside the
+        // expert's region by this fn's contract (the plane holds exactly its
+        // words); column col < ceil(n_slots / slots_per_col) of the
+        // activation; all 32 lanes of the warp are here (the returns above
+        // are warp-uniform).
+        let ((xw, dx), (wv, fac, d)) =
+            unsafe { (a.col(0, b), iq2xxs_sub_p(w, x, dh, sb, b & 7, tab)) };
+        let i = fac * dp4_all(&wv, &xw);
+        f = (d * dx).mul_add(i as f32, f);
+        b += 32;
+    }
+    let sum = warp::reduce_sum_f32(f);
+    if lane == 0 {
+        // SAFETY: row < n_slots · rows_per_expert <= y.len() by this fn's
+        // contract; only lane 0 of the warp writes y[row].
+        unsafe { *y.get_unchecked_mut(row) = sum };
+    }
+}
+
 /// One IQ4_NL row's dot with activation column `col`, lane `lane`'s partial
 /// (the caller reduces over the warp): lane `b` takes blocks `b, b + 32, ..`
 /// of row `row_abs` and adds each block's `(A·d)·e` (module doc).
@@ -992,6 +1109,78 @@ mod iq_sel_kernels {
         // column is below m_cols); the host passes n_grp = ceil(n_sb/4); the
         // return above is warp-uniform and keeps row in range.
         down_sel_body::<Iq2Xxs>(
+            w,
+            q,
+            d8,
+            sel,
+            n_experts,
+            rows_per_expert,
+            slots_per_col,
+            n_sb,
+            n_grp,
+            fault,
+            row,
+            &mut y,
+            tab,
+        );
+    }
+
+    /// [`iq2_xxs_gemv_sel`] over the load-time plane of
+    /// [`crate::weights::DevWeight::Iq2Xxs`]: the same rows, slots and
+    /// outputs, bit for bit the file entry's (the plane is a relayout), the
+    /// row's words read as aligned words through its expert's region.
+    /// Ids: module doc.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            2 * w.len() >= n_experts * rows_per_expert * 33 * n_sb,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 256 * n_grp,
+            d8.len() >= m_cols * 2 * n_sb,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn iq2_xxs_gemv_sel_p(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        n_grp: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut TAB: SharedArray<u32, IQ2XXS_TAB_WORDS> = SharedArray::UNINIT;
+        // SAFETY: TAB is this block's alone; every thread of the 256-thread
+        // block fills it here, before any return.
+        let tab = unsafe { Iq2XxsTab::fill(SharedArray::as_raw_mut_ptr(&raw mut TAB)) };
+        // m_cols only bounds the activation in the launch contract.
+        let _ = m_cols;
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // The launch contract is the body's (a plane holds exactly 33·n_sb/2
+        // words a row over an even n_sb; n_slots <= m_cols · slots_per_col,
+        // so every slot's column is below m_cols); the host passes n_grp =
+        // ceil(n_sb/4); the return above is warp-uniform and keeps row in
+        // range.
+        down_sel_body_p(
             w,
             q,
             d8,
@@ -1691,6 +1880,146 @@ impl IqSelKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         self.gemv_sel("IqSelKernels::enqueue_gemv_sel", stream, ty, a, 1, fault, y)
+    }
+
+    /// [`IqSelKernels::enqueue_gemv_sel`] over the load-time plane of
+    /// [`crate::weights::DevWeight::Iq2Xxs`]: the same arguments and
+    /// refusal order as the IQ2_XXS file entry over a stack whose rows are
+    /// exactly `33·(k/256)/2` words (`k` a multiple of 512), bit for bit its
+    /// outputs.
+    pub fn enqueue_gemv_sel_plane(
+        &self,
+        stream: &CudaStream,
+        a: &SelDown<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.gemv_sel_plane(
+            "IqSelKernels::enqueue_gemv_sel_plane",
+            stream,
+            a,
+            1,
+            fault,
+            y,
+        )
+    }
+
+    /// [`IqSelKernels::enqueue_gemv_sel_plane`] with slot `s` reading
+    /// column `s / slots_per_col` of `a.act` (a routed up): the plane twin
+    /// of [`IqSelKernels::enqueue_gemv_sel_cols`] for IQ2_XXS.
+    pub fn enqueue_gemv_sel_cols_plane(
+        &self,
+        stream: &CudaStream,
+        a: &SelDown<'_>,
+        slots_per_col: usize,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.gemv_sel_plane(
+            "IqSelKernels::enqueue_gemv_sel_cols_plane",
+            stream,
+            a,
+            slots_per_col,
+            fault,
+            y,
+        )
+    }
+
+    /// The plane launchers' body, refusing under `what`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the two public launchers' shared body: their arguments and the name it refuses under"
+    )]
+    fn gemv_sel_plane(
+        &self,
+        what: &'static str,
+        stream: &CudaStream,
+        a: &SelDown<'_>,
+        spc: usize,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        if spc == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the plane down reads {spc} slots a column: slots_per_col must be positive"
+                ),
+            ));
+        }
+        let n_sb = a.act.n_sb();
+        if !n_sb.is_multiple_of(2) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "an IQ2_XXS plane packs two super-blocks' d values a word: n_sb {n_sb} is \
+                     odd, so k is not a multiple of 512"
+                ),
+            ));
+        }
+        if a.rows_per_expert == 0 || !a.w.rows().is_multiple_of(a.rows_per_expert) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "IQ2_XXS plane rows {} must be a positive multiple of rows_per_expert {}",
+                    a.w.rows(),
+                    a.rows_per_expert
+                ),
+            ));
+        }
+        let (n_experts, rpe) = (a.w.rows() / a.rows_per_expert, a.rows_per_expert);
+        let words = n_experts * rpe * 33 * n_sb / 2;
+        if a.w.cols() != 33 * n_sb / 2 || a.w.buf().len() != words {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "an IQ2_XXS plane of {n_experts} experts of {rpe} rows at n_sb {n_sb} is \
+                     {} words of {} columns, got {} words of {} columns",
+                    words,
+                    33 * n_sb / 2,
+                    a.w.buf().len(),
+                    a.w.cols()
+                ),
+            ));
+        }
+        let n_slots = a.n_slots;
+        if a.sel.len() < n_slots || y.len() < n_slots * rpe {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "sel.len() {} and y.len() {} cannot serve n_slots {} of \
+                     rows_per_expert={rpe}",
+                    a.sel.len(),
+                    y.len(),
+                    n_slots,
+                ),
+            ));
+        }
+        let n_grp = n_sb.div_ceil(4);
+        // The body divides thread rows in u32.
+        launch_u32(what, "n_slots · rows_per_expert", n_slots * rpe)?;
+        let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
+        let cfg = LaunchConfig1D::new(grid, THREADS, 0);
+        let m = a.act.m();
+        let prep = self.module.prepare_iq2_xxs_gemv_sel_p(cfg)?;
+        self.module.iq2_xxs_gemv_sel_p(
+            stream,
+            &prep,
+            a.w.buf(),
+            &a.act.q4,
+            &a.act.d8,
+            a.sel,
+            launch_u32(what, "n_experts", n_experts)?,
+            launch_u32(what, "rows_per_expert", rpe)?,
+            launch_u32(what, "n_slots", n_slots)?,
+            launch_u32(what, "m_cols", m)?,
+            launch_u32(what, "slots_per_col", spc)?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "n_grp", n_grp)?,
+            fault,
+            y,
+        )?;
+        Ok(())
     }
 
     /// [`IqSelKernels::enqueue_gemv_sel`] with slot `s` reading column `s /

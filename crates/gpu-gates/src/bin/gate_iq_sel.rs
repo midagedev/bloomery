@@ -119,6 +119,15 @@
 //!     `slots_per_col` of 0, nine on another format's down, one column for
 //!     two runs, short ids.
 //!
+//! 14. **The IQ2_XXS plane gemv** (`iq2_xxs_gemv_sel_p` through
+//!     `enqueue_gemv_sel_plane` and `enqueue_gemv_sel_cols_plane`): the
+//!     load-time plane of [`crate::iq::repack_iq2xxs`] behind both
+//!     launchers, at Bolt's widest pair — both legs bit for bit the file
+//!     entry's over the same stack, ids and columns; an id past the stack
+//!     raises `ExpertId` with its rows at the sentinel and every other slot
+//!     the clean launch's; refused by name an odd n_sb (a k of 768) and a
+//!     words count that is not the plane's exact one.
+//!
 //! `--bench-kernels [--bench-arm <op>|iq2xxs]` runs no clause: it prices the
 //! IQ2_XXS launches at Bolt's shapes (the `bench` module below), lead-only
 //! under `tools/ref/time-gate.sh`'s lease.
@@ -172,7 +181,7 @@ mod gate {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::GpuError;
     use bloomery_gpu::fault::Fault;
-    use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
+    use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows, repack_iq2xxs};
     use bloomery_gpu::iq_sel::{
         IQ4_NL_BLOCK_BYTES, IqDown, IqGateUp, IqSelKernels, iq4_nl_row_dot32_host,
     };
@@ -2695,6 +2704,162 @@ mod gate {
         Ok((ok, rel_up, rel_down))
     }
 
+    /// Clause 14: the load-time plane ([`repack_iq2xxs`]) behind
+    /// `enqueue_gemv_sel_plane` and `enqueue_gemv_sel_cols_plane`, at
+    /// Bolt's widest pair: both legs bit for bit the file entry's over the
+    /// same stack, ids and columns (a relayout may not move a number); an
+    /// id past the stack raises `ExpertId`, its rows at the sentinel, every
+    /// other slot the clean launch's; refused by name an odd n_sb (a k of
+    /// 768) and a words count that is not the plane's exact one.
+    fn check_bolt_plane(c: &Ctx) -> Result<bool, GateError> {
+        let s = c.gpu.stream();
+        let (n, w) = BOLT_PAIRS[3];
+        let seed = 0xb017_0000_0000_u64 ^ ((n as u64) << 16) ^ w as u64;
+        let mut ok = true;
+
+        let plane_of = |st: &GuStack| -> Result<DeviceTensor<u32>, GateError> {
+            let n_sb = st.k / 256;
+            let words = repack_iq2xxs(&st.g, st.experts, st.rpe, st.k)?;
+            Ok(DeviceTensor::upload(
+                s,
+                &words,
+                st.experts * st.rpe,
+                33 * n_sb / 2,
+            )?)
+        };
+        let sel_cols_p = |st: &GuStack,
+                          wp: &DeviceTensor<u32>,
+                          act: &Q8Act,
+                          sel: &[u32]|
+         -> Result<(Vec<f32>, Option<Fault>), GateError> {
+            let sel_dev = DeviceBuffer::from_host(s, sel)?;
+            let mut y = DeviceBuffer::from_host(s, &vec![SENT; sel.len() * st.rpe])?;
+            c.iqsel.enqueue_gemv_sel_cols_plane(
+                s,
+                &SelDown {
+                    w: wp,
+                    act,
+                    sel: &sel_dev,
+                    n_slots: sel.len(),
+                    rows_per_expert: st.rpe,
+                },
+                BOLT_TOP,
+                c.gpu.unlabelled_sink(),
+                &mut y,
+            )?;
+            s.synchronize()?;
+            Ok((y.to_host_vec(s)?, c.gpu.take_fault()?))
+        };
+
+        // The up: the plane equals the file entry bit for bit.
+        let up = bolt_stack(n, w, BOLT_LATENT, seed);
+        let (wu, pu) = (up.upload(s, false)?, plane_of(&up)?);
+        let xu = seeded(BOLT_TOKENS * BOLT_LATENT, 9401 + w as u32, -2.0, 4.0);
+        let (act_u, _cols) = slot_act(c, &xu, BOLT_LATENT, BOLT_TOKENS, BOLT_TOKENS)?;
+        let sel_u = bolt_sel(BOLT_TOKENS, n);
+        let (yf, ff) = sel_cols(c, &wu, &act_u, &sel_u, w, BOLT_TOP)?;
+        let (yp, fp) = sel_cols_p(&up, &pu, &act_u, &sel_u)?;
+        let bits = bits_equal(&yf, &yp) && ff.is_none() && fp.is_none();
+        ok &= bits;
+        println!(
+            "bolt_plane_up[IQ2_XXS experts={n} rpe={w}] plane_eq_file_bits={} {}",
+            verdict(bits),
+            verdict(bits),
+        );
+        // The plane's own id fault: past the stack, sentinel rows, the rest
+        // the clean launch's.
+        let mut bad = sel_u.clone();
+        bad[2] = n as u32;
+        let (yb, fault) = sel_cols_p(&up, &pu, &act_u, &bad)?;
+        let ids_pass = yb[2 * w..3 * w]
+            .iter()
+            .all(|&v| v.to_bits() == SENT.to_bits())
+            && fault.is_some_and(|f| {
+                GpuError::fault("gate_iq_sel", f)
+                    .to_string()
+                    .contains("expert_id")
+            })
+            && yp
+                .iter()
+                .zip(&yb)
+                .enumerate()
+                .all(|(i, (a, b))| i / w == 2 || a.to_bits() == b.to_bits());
+        ok &= ids_pass;
+        println!(
+            "bolt_plane_ids[IQ2_XXS experts={n}] sentinel_and_fault={} {}",
+            verdict(ids_pass),
+            verdict(ids_pass),
+        );
+        drop((up, wu, pu));
+
+        // The down, through both launchers.
+        let down = bolt_stack(n, BOLT_LATENT, w, seed ^ (1 << 40));
+        let (wd, pd) = (down.upload(s, false)?, plane_of(&down)?);
+        let xd = seeded(BOLT_TOP * w, 9501 + w as u32, -2.0, 4.0);
+        let (act_d, _cols_d) = slot_act(c, &xd, w, BOLT_TOP, BOLT_TOP)?;
+        let sel_d = bolt_sel(1, n);
+        let (y1, f1) = sel_cols(c, &wd, &act_d, &sel_d, BOLT_LATENT, 1)?;
+        let sel_dev = DeviceBuffer::from_host(s, &sel_d)?;
+        let mut y2 = DeviceBuffer::from_host(s, &vec![SENT; sel_d.len() * BOLT_LATENT])?;
+        c.iqsel.enqueue_gemv_sel_plane(
+            s,
+            &SelDown {
+                w: &pd,
+                act: &act_d,
+                sel: &sel_dev,
+                n_slots: sel_d.len(),
+                rows_per_expert: BOLT_LATENT,
+            },
+            c.gpu.unlabelled_sink(),
+            &mut y2,
+        )?;
+        s.synchronize()?;
+        let (y2, f2) = (y2.to_host_vec(s)?, c.gpu.take_fault()?);
+        let same = bits_equal(&y1, &y2) && f1.is_none() && f2.is_none();
+        ok &= same;
+        println!(
+            "bolt_plane_down[IQ2_XXS experts={n} k={w}] plane_eq_file_bits={} {}",
+            verdict(same),
+            verdict(same),
+        );
+
+        // Refused by name: an odd n_sb (k 768) and a words count that is not
+        // the plane's exact one.
+        let odd = bolt_stack(2, 64, 768, 0xb017_4ef6);
+        let x = seeded(9 * 768, 9601, -2.0, 4.0);
+        let (act_o, _c) = slot_act(c, &x, 768, 1, 1)?;
+        let sel_o = bolt_sel(1, 2);
+        let sel_o_dev = DeviceBuffer::from_host(s, &sel_o)?;
+        let mut yo = DeviceBuffer::from_host(s, &vec![SENT; sel_o.len() * 64])?;
+        let refused = c.iqsel.enqueue_gemv_sel_plane(
+            s,
+            &SelDown {
+                w: &odd.upload(s, false)?,
+                act: &act_o,
+                sel: &sel_o_dev,
+                n_slots: sel_o.len(),
+                rows_per_expert: 64,
+            },
+            c.gpu.unlabelled_sink(),
+            &mut yo,
+        );
+        let pass = refused.is_err();
+        println!("bolt_plane_refusals odd_n_sb_768={pass} {}", verdict(pass));
+        ok &= pass;
+        let st = bolt_stack(2, 64, BOLT_LATENT, 0xb017_4ef7);
+        let full = plane_of(&st)?;
+        let short = DeviceTensor::<u32>::upload(
+            s,
+            &full.buf().to_host_vec(s)?[..full.buf().len() - 1],
+            full.rows(),
+            full.cols(),
+        );
+        let pass = short.is_err();
+        println!("bolt_plane_refusals short_words={pass} {}", verdict(pass));
+        ok &= pass;
+        Ok(ok)
+    }
+
     /// Clause 13's refusals of `enqueue_gemv_sel_cols` by name: a
     /// `slots_per_col` of 0, a run of slots on another format's entry, an
     /// activation of fewer columns than the runs, short ids.
@@ -2868,6 +3033,7 @@ mod gate {
             );
         }
         ok &= check_bolt_refusals(&c)?;
+        ok &= check_bolt_plane(&c)?;
         ok &= check_ids_and_nan(&c)?;
         ok &= check_q8_down_ids_nan(&c)?;
         ok &= check_capture(&c)?;
