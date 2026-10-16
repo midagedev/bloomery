@@ -1,0 +1,27 @@
+# The one lease term of V4.1's wider DSpark verify (vision worker, 2026-10-13): what an r-row pass costs when the
+# host experts of its rows are read once (the prompt batch's union service, ds41batch) against r times (today's
+# pair pass, a row each). Derivation: specs/vision/minicpm/design.md section 4, from sitting DS (rig-log
+# 2026-09-25#dspark-pass-split: plain step 22.3 ms, pair pass t1 + 13.3 ms, pair expert overlap 0.15-0.26).
+kind: profile
+question: does an r-row pass of V4.1 on plan a cost the union edge (each distinct routed expert of its rows read once
+  on the host) or the linear edge (each row its own host leg), for r = 2..6 consecutive prose ids?
+term: t(r) / t(1), the prompt time of r ids (generate_ds41 --tokens, the first r ids of corpus-prose.ids, one prompt
+  call from position 0, its prompt_per_second record: t(r) = r / pp(r)) over that of 1 id, @ plan a, list on,
+  A6000; arms prose:1 prose:2 prose:3 prose:4 prose:6 in one load, 2 rounds
+unit: ratio
+predict: 2.4..4.0 ratio
+condition: just depth-gpu-ds41 prose:1 prose:2 prose:3 prose:4 prose:6 under BLOOMERY_AB_ROUNDS=2 on the timing card
+  (the A6000), one load shared by the arms; the witness blocks show no other compute process on the A6000 and the
+  host's experts warm (no [cold] row past round 1; a cold row is dropped and named). The band is r = 6: union edge
+  2.61 (distinct experts of 6 rows = (1 - 0.8^6) / 0.2 = 3.69 rows' worth at the pair overlap 0.2, so
+  t(6) = t1 + 13.3 ms x 2.69 = 58.1 ms at t1 22.3 ms) to linear edge 3.98 (t1 + 5 x 13.3 = 88.8 ms); r = 2..4 are
+  read on the same two curves (union 1.48, 1.86, 2.16; linear 1.60, 2.19, 2.79)
+decide-in: the ratio places r = 6 on the curve nearer it. Near the union edge: open uniongroup (V4.1's host leg,
+  hybrid.rs) with the width-by-confidence rule in the common DSpark owner, predicting tok/s at k* from the measured
+  t(r) and dsalpha's alpha by position. Near the linear edge: the prompt batch does not union at small r; first find
+  why (union slot cost at r <= 6 against ds41batch's 39 us a slot at 512) before any width round
+decide-below: below 2.4 is cheaper than the union model: a term the model lacks (the card side of a row hides
+  under the host leg). Re-derive with the measured curve and open uniongroup at once
+decide-above: above 4.0 is worse than one host leg a row: the small-r prompt path is not the union service
+  (a step or pair feed). Read the prompt walk's choice for r <= 6 (runtime::prompt::batches, T_MAX) before
+  anything else; the run then measured the wrong path
