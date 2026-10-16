@@ -3050,20 +3050,50 @@ mod gate {
             let mut ran = false;
             let gk = GemmKernels::load(gpu.context())?;
             let sink = gpu.unlabelled_sink();
-            for (ty, op, words, bb) in [
+            for (ty, op, words, bb, n_exp, top_k, rows, k, t) in [
                 (
                     GemmWeight::Iq3Xxs,
                     "gemm_iq3xxs_moe_t4096",
                     245usize,
                     98usize,
+                    64usize,
+                    9usize,
+                    640usize,
+                    2560usize,
+                    4096usize,
                 ),
-                (GemmWeight::Iq4Xs, "gemm_iq4xs_moe_t4096", 340, 136),
+                (
+                    GemmWeight::Iq4Xs,
+                    "gemm_iq4xs_moe_t4096",
+                    340,
+                    136,
+                    64,
+                    9,
+                    640,
+                    2560,
+                    4096,
+                ),
+                // Bolt's routed up stack, the biggest gemm_iq2xxs launch of
+                // its P=4096 prefill (nsys s1927: grid 9900 = 20 row tiles
+                // x 495 slot tiles): 432 experts of 2560 rows of 1024 IQ2_XXS
+                // values, top-9 over a 448-row pass, every row's nine slots
+                // reading its column.
+                (
+                    GemmWeight::Iq2Xxs,
+                    "gemm_iq2xxs_bolt_up_t448",
+                    66,
+                    66,
+                    432,
+                    9,
+                    2560,
+                    1024,
+                    448,
+                ),
             ] {
                 if only.is_some_and(|o| o != op) {
                     continue;
                 }
                 ran = true;
-                let (n_exp, top_k, rows, k, t) = (64usize, 9usize, 640usize, 2560usize, 4096usize);
                 let n_rows = n_exp * rows;
                 let w = DeviceTensor::<u32>::upload(
                     stream,
