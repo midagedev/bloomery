@@ -56,7 +56,7 @@
 # (missing, or not one `user@host` line) or the tree this script does not take, or a BASE that is no commit.
 # 65: the tree has a state rsync does not carry (a submodule, a symlink out of the tree, a tracked file under
 # target/). 69: a prerequisite is missing on the remote, named with where SETUP.md makes it. 75: the remote
-# is not reachable or the connection was lost mid-run (the remote run may still finish), or the track's
+# is not reachable (a pool none of whose Macs answers is surveyed once more after POOL_RETRY_S first) or the connection was lost mid-run (the remote run may still finish), or the track's
 # lock was still held by a live run after TRACK_WAIT seconds.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -105,12 +105,14 @@ read_host() {
 # not taken a slot there yet, so two runners started together spread out. The claim itself stays the remote's
 # lockf slot: a runner that loses a race queues on that Mac in its turn, never shares a slot. With no slot free
 # anywhere it prints every Mac's slots and surveys again every POOL_POLL s, up to POOL_WAIT s, then queues on the
-# least loaded Mac. Track locks whose run is gone are named (`stale?`) and never removed for another track.
+# least loaded Mac. Track locks whose run is gone are named (`stale?`) and never removed for another track. When no Mac
+# answers at all, the pool is surveyed once more after POOL_RETRY_S seconds, and the line says so; a second silence is 75.
 POOL_DIR=$HOME/.config/bloomery/mac-remote.d
 POOL_CONNECT=${POOL_CONNECT:-5}
 POOL_MIN_GB=${POOL_MIN_GB:-15}
 POOL_POLL=${POOL_POLL:-20}
 POOL_WAIT=${POOL_WAIT:-1800}
+POOL_RETRY_S=${POOL_RETRY_S:-180} # seconds before the one more survey of a pool none of whose Macs answered (a network blip)
 RESV_DIR=$HOME/.cache/bloomery/mac-pool
 
 SURVEY='{
@@ -178,7 +180,7 @@ resv_count() {
 
 # pool_pick TRACK: sets CONF and MAC_NAME to the chosen Mac, or 64 / 75.
 pool_pick() {
-  local tr=$1 d f a out gb fr q w hold tl lines rec choice t0=$SECONDS last=-999 notes
+  local tr=$1 d f a out gb fr q w hold tl lines rec choice t0=$SECONDS last=-999 notes answered retried=0
   d=$(mktemp -d "${TMPDIR:-/tmp}/mac-pool.XXXXXX")
   local -a names=()
   for f in "$POOL_DIR"/*; do [ -f "$f" ] && [[ ${f##*/} =~ ^[A-Za-z0-9._-]+$ ]] && names+=("${f##*/}"); done
@@ -193,11 +195,13 @@ pool_pick() {
     resv_lock
     lines=
     notes=
+    answered=0
     for a in "${names[@]}"; do
       out=$(cat "$d/$a" 2> /dev/null || true)
       gb=$(sed -n 's/^GB=//p' <<< "$out"); fr=$(sed -n 's/^FREE=//p' <<< "$out"); q=$(sed -n 's/^QUEUE=//p' <<< "$out")
       w=$(sed -n 's/^WARM=//p' <<< "$out"); hold=$(sed -n 's/^HOLD=//p' <<< "$out")
       if [ -z "$fr" ]; then lines+="$a 0 0 0 0 0 0 0"$'\n'; notes+="  $a: not reachable in $POOL_CONNECT s, skipped"$'\n'; continue; fi
+      answered=$((answered + 1))
       tl=0
       while IFS= read -r rec; do
         [ -n "$rec" ] || continue
@@ -224,7 +228,14 @@ pool_pick() {
       return 0
     fi
     resv_unlock
-    if [ -z "$choice" ]; then printf 'mac-remote: pool:\n%s' "$notes" >&2; say "mac-remote: no Mac of the pool is reachable with $POOL_MIN_GB GB free"; rm -rf "$d"; return 75; fi
+    if [ "$answered" = 0 ] && [ "$retried" = 0 ]; then # no record is reachable, so there is no choice
+      printf 'mac-remote: pool:\n%s' "$notes" >&2
+      say "mac-remote: no Mac of the pool answered; one more survey in $POOL_RETRY_S s"
+      retried=1
+      sleep "$POOL_RETRY_S"
+      continue
+    fi
+    if [ -z "$choice" ]; then printf 'mac-remote: pool:\n%s' "$notes" >&2; say "mac-remote: no Mac of the pool is reachable with $POOL_MIN_GB GB free$([ "$retried" = 0 ] || echo ", after one more survey")"; rm -rf "$d"; return 75; fi
     if [ $((SECONDS - last)) -ge "$SLOT_SAY" ]; then
       printf 'mac-remote: all slots of the pool are taken (%s s):\n%s' "$((SECONDS - t0))" "$notes" >&2
       last=$SECONDS
@@ -911,10 +922,20 @@ self_test() {
   printf '%s\n' 'pool-leak-sentinel@nowhere.example' > "$fake/.config/bloomery/mac-remote.d/m1"
   printf '%s\n' 'pool-leak-sentinel@nowhere.example' > "$fake/.config/bloomery/mac-remote.d/m2"
   printf '#!/bin/sh\nexit 255\n' > "$d/sshbin/ssh"; chmod +x "$d/sshbin/ssh"
-  rc=0; out=$(cd "$HERE" && HOME=$fake PATH=$d/sshbin:$PATH "$HERE/tools/mac-remote.sh" 2>&1) || rc=$?
+  rc=0; out=$(cd "$HERE" && HOME=$fake POOL_RETRY_S=0 PATH=$d/sshbin:$PATH "$HERE/tools/mac-remote.sh" 2>&1) || rc=$?
   [ "$rc" = 75 ] || fail "a pool of unreachable Macs ended rc $rc, not 75: $out"
   case $out in *"m1: not reachable"*"m2: not reachable"*) ;; *) fail "the unreachable Macs are not named: $out" ;; esac
   case $out in *pool-leak-sentinel*|*nowhere.example*) fail "a pool host was printed: $out" ;; esac
+  [ "$(grep -c 'no Mac of the pool answered; one more survey in 0 s' <<< "$out")" = 1 ] ||
+    fail "a pool none of whose Macs answered is surveyed once more, once, and says so: $out"
+  # the Macs answer from the third ssh on (the second survey): the one retry picks one
+  printf '#!/bin/sh\necho x >> %s; [ "$(wc -l < %s)" -ge 3 ] || exit 255\n' "$d/ssh.calls" "$d/ssh.calls" > "$d/sshbin/ssh"
+  printf 'printf "GB=40\\nFREE=1\\nQUEUE=0\\nWARM=0\\nHOLD= [slot 1: free]\\n"\n' >> "$d/sshbin/ssh"
+  rc=0; out=$( POOL_DIR=$fake/.config/bloomery/mac-remote.d RESV_DIR=$d/resv-retry POOL_RETRY_S=0 PATH=$d/sshbin:$PATH
+    mkdir -p "$RESV_DIR"; pool_pick tr 2>&1 && echo "MAC_NAME=$MAC_NAME" ) || rc=$?
+  case $rc:$out in 0:*"one more survey"*"picked m"*"MAC_NAME=m"*) ;; *) fail "a pool that answers on the retry is picked from: rc $rc $out" ;; esac
+  case $out in *pool-leak-sentinel*|*nowhere.example*) fail "a pool host was printed on the retry: $out" ;; esac
+  printf '#!/bin/sh\nexit 255\n' > "$d/sshbin/ssh"
   rc=0; out=$(cd "$HERE" && HOME=$fake BLOOMERY_MAC_REMOTE=m1 PATH=$d/sshbin:$PATH "$HERE/tools/mac-remote.sh" 2>&1) || rc=$?
   case $out in *"pinned to m1"*) ;; *) fail "the pin is not named: $out" ;; esac
   case $out in *"picked "*) fail "a pinned run surveyed the pool: $out" ;; esac
