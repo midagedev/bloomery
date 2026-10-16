@@ -2821,6 +2821,8 @@ impl PromptProgram<'_> {
         };
         self.p.k.router.enqueue_router_rows(
             stream,
+            gpu,
+            &self.p.k.g32,
             f32t(w, nm.router)?,
             &b.normed,
             bias,

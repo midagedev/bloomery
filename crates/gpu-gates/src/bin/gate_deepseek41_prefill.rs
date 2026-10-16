@@ -1020,6 +1020,7 @@ mod gate {
         const T: usize = 11;
         let (gpu, _, _) = m.body_parts(NAME)?;
         let rk = RouterKernels::load(gpu.context())?;
+        let g32 = bloomery_gpu::gemm::Gemm32Kernels::load(gpu.context())?;
         let stream = gpu.stream();
         let mut seed = 0x9e37_79b9u32;
         let mut rnd = move || {
@@ -1079,6 +1080,8 @@ mod gate {
             gpu.clear_fault()?;
             rk.enqueue_router_rows(
                 stream,
+                gpu,
+                &g32,
                 &w_dev,
                 &x_dev,
                 &bias_dev,

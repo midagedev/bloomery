@@ -1160,6 +1160,51 @@ mod elem_kernels {
         }
     }
 
+    /// `y[i] = sigmoid(y[i])` over `n` values, in place — the router score's
+    /// scalar ([`crate::route_core::sigmoid`]) over a tile GEMM's logits.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (y.len() >= n)
+    )]
+    pub fn sigmoid_rows(mut y: DisjointSlice<f32>, n: u32) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= y.len() by the launch contract; thread i owns
+        // entry i.
+        unsafe {
+            let v = *y.get_unchecked_mut(i);
+            *y.get_unchecked_mut(i) = crate::route_core::sigmoid(v);
+        }
+    }
+
+    /// `y[i] = sqrt_softplus(y[i])` over `n` values, in place — the router
+    /// score's scalar ([`crate::route_core::sqrt_softplus`]) over a tile
+    /// GEMM's logits.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (y.len() >= n)
+    )]
+    pub fn softplus_rows(mut y: DisjointSlice<f32>, n: u32) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= y.len() by the launch contract; thread i owns
+        // entry i.
+        unsafe {
+            let v = *y.get_unchecked_mut(i);
+            *y.get_unchecked_mut(i) = crate::route_core::sqrt_softplus(v);
+        }
+    }
+
     /// `y[i] = a[i] + b[i]`, elementwise over `n` values — exact; the body
     /// is one add, so nothing is extracted into a core.
     #[kernel]
@@ -2254,6 +2299,50 @@ impl ElemKernels {
             .module
             .prepare_relu_sqr(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.relu_sqr(stream, &prep, x, n, y)?;
+        Ok(())
+    }
+
+    /// Enqueue `y[i] = sigmoid(y[i])` over the first `n` values of `y`, in
+    /// place. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_sigmoid_rows(
+        &self,
+        stream: &CudaStream,
+        y: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<(), GpuError> {
+        if n == 0 || y.len() < n {
+            return Err(GpuError::shape(
+                "enqueue_sigmoid_rows",
+                format!("n={n}, y.len() {}", y.len()),
+            ));
+        }
+        let n = launch_u32("enqueue_sigmoid_rows", "n", n)?;
+        let prep =
+            self.module
+                .prepare_sigmoid_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.sigmoid_rows(stream, &prep, y, n)?;
+        Ok(())
+    }
+
+    /// Enqueue `y[i] = sqrt_softplus(y[i])` over the first `n` values of
+    /// `y`, in place. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_softplus_rows(
+        &self,
+        stream: &CudaStream,
+        y: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<(), GpuError> {
+        if n == 0 || y.len() < n {
+            return Err(GpuError::shape(
+                "enqueue_softplus_rows",
+                format!("n={n}, y.len() {}", y.len()),
+            ));
+        }
+        let n = launch_u32("enqueue_softplus_rows", "n", n)?;
+        let prep =
+            self.module
+                .prepare_softplus_rows(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.softplus_rows(stream, &prep, y, n)?;
         Ok(())
     }
 
