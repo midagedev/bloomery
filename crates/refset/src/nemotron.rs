@@ -141,7 +141,20 @@ impl LogitsSet {
                     }
                     set.fixture = Some(one(&f, &at, "# fixture\t<key=value ...>")?);
                 }
-                "# route layer" => set.route_layers.push(route_layer(&f, &at)?),
+                "# route layer" => {
+                    let layer = route_layer(&f, &at)?;
+                    if set
+                        .route_layers
+                        .last()
+                        .is_some_and(|prev| prev.layer >= layer.layer)
+                    {
+                        return Err(RefError::malformed(
+                            &at,
+                            "route layers must be strictly increasing, with no repeated layer",
+                        ));
+                    }
+                    set.route_layers.push(layer);
+                }
                 "# prompt columns" => {
                     cols = Some(Columns::new("prompt", f[1..].iter().copied()));
                 }
@@ -744,11 +757,12 @@ mod tests {
     }
 
     /// An id at or past its layer's expert count, a negative one, one selected twice in a layer, a file of
-    /// another length, a routes column without route layers, route layers without the column, and a layer that
-    /// selects more experts than it has are each malformed, by name.
+    /// another length, a routes column without route layers, route layers without the column, a layer that
+    /// selects more experts than it has, and a route layer at or below the one before it are each
+    /// malformed, by name.
     #[test]
     fn routes_outside_their_layers_are_malformed() {
-        let cases: [(&str, &str, bool, &[i32], &str); 7] = [
+        let cases: [(&str, &str, bool, &[i32], &str); 9] = [
             (
                 "id-past",
                 TWO_LAYERS,
@@ -797,6 +811,20 @@ mod tests {
                 true,
                 &[0, 1, 2, 3, 0],
                 "layer 2 selects 5 of 4 experts",
+            ),
+            (
+                "layer-twice",
+                "# route layer\t2\t240\t2\n# route layer\t2\t240\t2\n",
+                true,
+                &[7, 1, 7, 1],
+                "route layers must be strictly increasing, with no repeated layer",
+            ),
+            (
+                "layers-reversed",
+                "# route layer\t3\t496\t2\n# route layer\t2\t240\t2\n",
+                true,
+                &[7, 1, 239, 0],
+                "route layers must be strictly increasing, with no repeated layer",
             ),
         ];
         for (tag, lines, column, ids, want) in cases {
