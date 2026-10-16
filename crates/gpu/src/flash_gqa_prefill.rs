@@ -68,6 +68,11 @@
 //! on a row below `T` raises
 //! [`FaultSite::KeyCount`], and that row's output is NaN; no key is read for
 //! it.
+//!
+//! [`FlashGqaPrefill::enqueue_split`] serves the same attention to a group of
+//! any positive multiple of [`GROUP`] query heads a key head: one plain launch
+//! a sub-group of eight, the rows moved through a caller-owned
+//! [`SplitScratch`].
 
 //!
 //! [`FlashGqaPrefill::enqueue_256`] runs the same attention over heads of
@@ -135,6 +140,7 @@ use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f32x2_to_f16x2_bits, half_bits_to_f32};
 use crate::flash_gqa::{F16Kv, GROUP, HEAD, KvSrc, PACK_2, PACK_4, Q8Kv, q8_word_values};
 use crate::rope_neox::q8_plane_lens;
+use crate::tensor::{Pitched, dtod_2d};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::async_copy::{
@@ -3060,6 +3066,28 @@ pub struct GqaPrefillQ8Args<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
+/// The sub-group buffers [`FlashGqaPrefill::enqueue_split`] moves a group's
+/// query rows into and its output rows out of: `rows · n_kv · GROUP · HEAD`
+/// f32 each, one plain launch's worth. Load-time only — the split path takes
+/// no allocation at a step; a launch of `t` rows touches only the first
+/// `t · n_kv · GROUP · HEAD` values of each.
+pub struct SplitScratch {
+    q: DeviceBuffer<f32>,
+    y: DeviceBuffer<f32>,
+}
+
+impl SplitScratch {
+    /// Allocate the scratch of `rows` rows over `n_kv` key heads.
+    /// Load-time only.
+    pub fn new(stream: &CudaStream, rows: usize, n_kv: usize) -> Result<Self, GpuError> {
+        let len = rows * n_kv * GROUP * HEAD;
+        Ok(SplitScratch {
+            q: DeviceBuffer::<f32>::zeroed(stream, len)?,
+            y: DeviceBuffer::<f32>::zeroed(stream, len)?,
+        })
+    }
+}
+
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct FlashGqaPrefill {
     module: flash_gqa_prefill_kernels::LoadedModule,
@@ -3154,6 +3182,143 @@ impl FlashGqaPrefill {
         self.module.gqa_prefill_flash(
             stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, fault, y,
         )?;
+        Ok(())
+    }
+
+    /// [`FlashGqaPrefill::enqueue`]'s attention for a group of any positive
+    /// multiple of [`GROUP`] query heads a key head: sub-group `s` of key head
+    /// `kv` is query heads `kv·group + GROUP·s .. kv·group + GROUP·(s+1)`, an
+    /// independent group-of-eight problem over the same cache planes. Its
+    /// query rows are copied into `scratch.q`, run through one plain
+    /// [`FlashGqaPrefill::enqueue`] at `n_kv · GROUP` heads, and the output
+    /// rows copied back into `args.y` — a byte copy each way, so every row's
+    /// bits are the group-of-eight kernel's for that row and head over the
+    /// same planes. `group / GROUP` launches and twice as many 2-D copies,
+    /// sub-groups ascending; at `group == GROUP` one plain launch and no
+    /// copy. Asynchronous, allocation-free, capturable.
+    ///
+    /// Refused by name, nothing enqueued, when `n_kv` or `t` is zero, the
+    /// group is not a positive multiple of [`GROUP`], `q` or `y` holds fewer
+    /// than `t · n_head · HEAD` values, or either of `scratch`'s buffers
+    /// fewer than `t · n_kv · GROUP · HEAD`.
+    pub fn enqueue_split(
+        &self,
+        stream: &CudaStream,
+        args: GqaPrefillArgs<'_>,
+        scratch: &mut SplitScratch,
+    ) -> Result<(), GpuError> {
+        let what = "flash_gqa_prefill::enqueue_split";
+        let GqaPrefillArgs {
+            q,
+            kc,
+            vc,
+            n_keys,
+            scale,
+            n_head,
+            n_kv,
+            ctx,
+            t,
+            fault,
+            y,
+        } = args;
+        if n_kv == 0 || t == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("need n_kv and t >= 1, got n_kv={n_kv} t={t}"),
+            ));
+        }
+        if n_head % n_kv != 0 || n_head / n_kv == 0 || (n_head / n_kv) % GROUP != 0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a group of {n_head} over {n_kv} key heads is not a positive multiple of \
+                     {GROUP}"
+                ),
+            ));
+        }
+        let group = n_head / n_kv;
+        let lens = [
+            ("q", q.len(), t * n_head * HEAD),
+            ("y", y.len(), t * n_head * HEAD),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let need = t * n_kv * GROUP * HEAD;
+        if scratch.q.len() < need || scratch.y.len() < need {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "scratch buffers of {} (q) and {} (y) values, the launch needs {need} of each",
+                    scratch.q.len(),
+                    scratch.y.len()
+                ),
+            ));
+        }
+        if group == GROUP {
+            return self.enqueue(
+                stream,
+                GqaPrefillArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+            );
+        }
+        let f = size_of::<f32>();
+        let (width, rows, stride) = (GROUP * HEAD * f, t * n_kv, group * HEAD * f);
+        for s in 0..group / GROUP {
+            let at = s * width;
+            dtod_2d(
+                stream,
+                (q, at),
+                (&mut scratch.q, 0),
+                Pitched {
+                    width,
+                    rows,
+                    dev_pitch: stride,
+                    host_pitch: width,
+                },
+            )?;
+            self.enqueue(
+                stream,
+                GqaPrefillArgs {
+                    q: &scratch.q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_head: n_kv * GROUP,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y: &mut scratch.y,
+                },
+            )?;
+            dtod_2d(
+                stream,
+                (&scratch.y, 0),
+                (y, at),
+                Pitched {
+                    width,
+                    rows,
+                    dev_pitch: width,
+                    host_pitch: stride,
+                },
+            )?;
+        }
         Ok(())
     }
 
