@@ -1,0 +1,21 @@
+# readmesit: the README's two-request table, re-measured on v0.3.0 (8d937828; the rows were measured at b83f1269, rig-log
+# 10-06#num3090). GLM-5.3-Flash UD-Q4_K_XL on A6000 + 3090 (--place bp).
+# Base [derived from a measured row]: 35.26 (n2c-glm, b83f1269, residency mid-p0-s1; predicted 36..43 and missed below, cause unknown), pp512 222.6; the A6000-alone two-slot row was 34.90 (rig-log 10-06#rel021-slots).
+# Terms between the two builds: f2593a62 (q38bp): the 3090 tier's down wrote 4 bytes a result row to host-mapped
+# memory, 6,400 times a layer, 236 of 276 us a layer on Qwen3.8; the fix is in the common tier code V4.1 and GLM
+# share. If GLM paid a share of that, the earlier miss (bp = a, no gain from the 3090) is this term and the row moves
+# up toward the 36..43 the derivation gave; if it did not, the row stays ~35. The 3090 tier covers every layer's next
+# ids (plan_bp, crates/placement/src/placement/workstation.rs:405). pp512 [derived] 215..300; pp4096 [derived]
+# 0.7..1.0 x pp512.
+# Wall [derived]: 6..8 min for this invocation plus the build when its binary is not built yet.
+kind: baseline
+question: what do two streams of GLM-5.3-Flash UD-Q4_K_XL on A6000 + 3090 (--place bp) decode at in total (and what is the prompt rate at P = 512 and 4096) on v0.3.0?
+term: tok/s(aggregate) @ n=2·95, prose 512, A6000 + RTX 3090 (250 W cap) + host, --place bp, BLOOMERY_GEN_SLOTS=2, residency unset
+unit: tok/s
+predict: 36..46
+condition: the runner's one invocation in its own lease, warm-up + 2 rounds, 2 loads a round (slots arm, prose:4096; pp512 is the slots arm's column) of 1.0..1.5 min; no FAIL row, no [cold], [cpu-busy] or [other-busy] row among the counted rounds;
+  both cards named in the witness, the 3090 at its 250 W cap (BLOOMERY_TIMING_CARDS=a6000+3090); no Xid in the witness blocks; the full output to a file first
+reason: the user (2026-10-12) asked for the README brought fully up to date on 0.3.0; these rows are 0.2.1's
+decide-in: write the row into rig-log and the README with its conditions and pp tok/s at P = 512 and 4096
+decide-below: read the plan line (card_experts, host_experts) and the pass ms against the derivation before the row goes out; the term that moved is the finding
+decide-above: re-derive the host share from the plan line before the row goes out

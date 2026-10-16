@@ -1,0 +1,19 @@
+# readmesit: the README's two-request table, re-measured on v0.3.0 (8d937828; the rows were measured at b83f1269, rig-log
+# 10-06#num3090). Qwen3-30B-A3B Q4_K_M whole on the RTX 3090.
+# Base [derived from a measured row]: 253.99 (n3090-q3, b83f1269), pp512 6,482.
+# Terms between the two builds: no kernel of this body moved between the two (host dispatch only: da921522 reuses the
+# sampled slot round's logits buffers, off the greedy path). Net x0.94..1.05 (ruler SD 0.6 %, the window-to-window
+# scatter of one commit ~5 %, AGENTS 「Know the ruler」). pp512 [derived] 6,100..6,800; pp4096 [derived] 0.70..0.92 x
+# pp512 (attention work per token grows with the context; the experts do not).
+# Wall [derived]: 4..6 min for this invocation plus the build when its binary is not built yet.
+kind: baseline
+question: what do two streams of Qwen3-30B-A3B Q4_K_M whole on the RTX 3090 decode at in total (and what is the prompt rate at P = 512 and 4096) on v0.3.0?
+term: tok/s(aggregate) @ n=2·95, depth 512, RTX 3090 (250 W cap) whole card, BLOOMERY_GEN_SLOTS=2
+unit: tok/s
+predict: 238..266
+condition: the runner's one invocation in its own lease, warm-up + 3 rounds, 2 loads a round (slots arm, prose:4096; pp512 is the slots arm's column) of 0.3..0.6 min; no FAIL row, no [cold], [cpu-busy] or [other-busy] row among the counted rounds;
+  the 3090 at its 250 W cap (BLOOMERY_TIMING_GPU=3090); no Xid in the witness blocks; the full output to a file first
+reason: the user (2026-10-12) asked for the README brought fully up to date on 0.3.0; these rows are 0.2.1's
+decide-in: write the row into rig-log and the README with its conditions and pp tok/s at P = 512 and 4096
+decide-below: read the plan line (card_experts, host_experts) and the pass ms against the derivation before the row goes out; the term that moved is the finding
+decide-above: re-derive the host share from the plan line before the row goes out
