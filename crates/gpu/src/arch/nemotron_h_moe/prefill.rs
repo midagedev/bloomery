@@ -4,8 +4,9 @@
 //! - a projection is its site's gemv over column runs of at most
 //!   [`COLS`] rows ([`project_rows`]): Q8_0 `q8_0_gemv_mcol` on the f32 rows,
 //!   NVFP4 `nvfp4_gemv` on the run's q8_1 columns, each weight read once a
-//!   run; past [`COLS`] rows a Q8_0 site is one 32-value GEMM over the pass,
-//!   and an NVFP4 site the same GEMM over its Q8_0 twin ([`derive_q8`]);
+//!   run; past [`COLS`] rows a Q8_0 site is one 32-value GEMM over the pass
+//!   and an NVFP4 site the same GEMM over its resident NVFP4 planes
+//!   ([`Gemm32Weight::Nvfp4Planes`]);
 //! - a Mamba-2 layer is one pass over its tokens
 //!   ([`Mamba2Kernels::enqueue_steps`], bit for bit the steps' scan);
 //! - an attention layer appends the pass's K/V rows to its planes and runs
@@ -47,12 +48,10 @@ use crate::q38::EmbedQ8Args;
 use crate::site::{self, SiteTy};
 use crate::site::{KGemvKernels, SiteWeight, WideActs, WideKernels};
 use crate::tensor::{Pitched, WindowMut, dtod_2d};
-use crate::weights::q8_0_planes;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act, Window, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::quant::{Q8Block, dequant_row, f32_to_f16_bits};
-use gguf::{GgmlType, Split};
+use gguf::GgmlType;
 
 const WHAT: &str = "nemotron_h_moe::prefill";
 
@@ -82,10 +81,6 @@ pub(super) struct Prompt {
     x: [DeviceBuffer<f32>; 2],
     /// Every other buffer of the pass.
     b: PassBufs,
-    /// Whether the NVFP4 sites' Q8_0 twins are resident ([`derive_q8`]):
-    /// past [`COLS`] rows they run as GEMMs over the twins, otherwise as the
-    /// multi-column gemv runs.
-    pub(super) twins: bool,
 }
 
 /// [`Prompt`]'s buffers beside the residual streams.
@@ -221,7 +216,6 @@ impl Prompt {
         }
         let n_words = P_ROWS + sh.n_kv + rows;
         Ok(Prompt {
-            twins: false,
             rows,
             q_width: n_head * HEAD,
             x: [z(sh.hidden)?, z(sh.hidden)?],
@@ -311,8 +305,6 @@ struct Cx<'a> {
     routers: &'a Routers,
     iq: &'a IqSelKernels,
     m: usize,
-    /// [`Prompt::twins`].
-    twins: bool,
 }
 
 /// `y = W · x` for site `s` over the pass's `m` rows of `x` (`s.k` values a
@@ -348,7 +340,7 @@ fn project_rows(
             y,
         );
     }
-    if s.ty == SiteTy::Nvfp4 && cx.m > COLS && cx.twins {
+    if s.ty == SiteTy::Nvfp4 && cx.m > COLS {
         let a =
             arms.wide.iter_mut().find(|a| a.0 == s.k).ok_or_else(|| {
                 GpuError::shape(WHAT, format!("no q8 blocks of 32 of width {}", s.k))
@@ -361,15 +353,14 @@ fn project_rows(
             cx.m,
             &[SiteTy::Q8_0],
         )?;
-        let name = q8_name(&s.name);
-        let (qs, d) = match cx.w.resident(WHAT, &name)? {
-            DevWeight::Q8_0Derived { qs, d, .. } => (qs, d),
-            _ => return Err(GpuError::tensor(WHAT, &name, "a derived q8_0 weight")),
+        let (qs, e, scale) = match cx.w.resident(WHAT, &s.name)? {
+            DevWeight::Nvfp4 { qs, e, scale, .. } => (qs, e, *scale),
+            _ => return Err(GpuError::tensor(WHAT, &s.name, "an NVFP4 weight")),
         };
         return cx.g32.enqueue_gemm32(
             gpu.stream(),
             Gemm32Args {
-                w: Gemm32Weight::Q8_0Plane { qs, d },
+                w: Gemm32Weight::Nvfp4Planes { qs, e, scale },
                 rows_per_expert: rows,
                 act: a
                     .1
@@ -555,124 +546,6 @@ fn moe_rows(
     }
     gpu.elem()
         .enqueue_add(stream, &p.buf.delta, &p.sh, m * hidden, &mut p.sum)
-}
-
-/// The name of NVFP4 site `name`'s Q8_0 twin ([`derive_q8`]).
-fn q8_name(name: &str) -> String {
-    format!("derived.q8_0.{name}")
-}
-
-/// The device bytes [`derive_q8`] leaves free past the twins, for what the
-/// model allocates after its load. A chosen margin, not a derived one.
-const TWIN_HEADROOM: usize = 2 << 30;
-
-/// Every NVFP4 site of `layers` again as a derived Q8_0 weight, what a pass
-/// past [`COLS`] rows runs it as: each row decoded from `file` times the
-/// tensor's scale, then coded per 32 values as `quantize_row_q8_0` codes
-/// (`d = f16(amax / 127)`, each code `round_half_even(v · 127 / amax)`).
-/// Threaded over the rows. Load-time only. Only when the card's room holds
-/// every twin and [`TWIN_HEADROOM`]: returns whether it derived them.
-pub(super) fn derive_q8(
-    gpu: &Gpu,
-    file: &Split,
-    w: &mut Weights,
-    layers: &[Layer],
-) -> Result<bool, GpuError> {
-    let stream = gpu.stream();
-    let mut need = 0usize;
-    for s in layers.iter().flat_map(Layer::sites) {
-        if s.ty != SiteTy::Nvfp4 {
-            continue;
-        }
-        let (shard, t) = file
-            .find(&s.name)
-            .ok_or_else(|| GpuError::tensor(WHAT, &s.name, "a file tensor"))?;
-        let n = file
-            .shard(shard)
-            .ok_or_else(|| GpuError::tensor(WHAT, &s.name, "its shard"))?
-            .data(t)
-            .map_err(|e| GpuError::shape(WHAT, format!("{}: {e}", s.name)))?
-            .len();
-        // 36 NVFP4 bytes a 64 values; a twin holds 34 bytes a 32.
-        need += n / 36 * 2 * 34;
-    }
-    if gpu.alloc_room()? < need + TWIN_HEADROOM {
-        return Ok(false);
-    }
-    for s in layers.iter().flat_map(Layer::sites) {
-        if s.ty != SiteTy::Nvfp4 {
-            continue;
-        }
-        let scale = match w.resident(WHAT, &s.name)? {
-            DevWeight::Nvfp4 { scale, .. } => *scale,
-            _ => return Err(GpuError::tensor(WHAT, &s.name, "an NVFP4 weight")),
-        };
-        let (shard, t) = file
-            .find(&s.name)
-            .ok_or_else(|| GpuError::tensor(WHAT, &s.name, "a file tensor"))?;
-        let bytes = file
-            .shard(shard)
-            .ok_or_else(|| GpuError::tensor(WHAT, &s.name, "its shard"))?
-            .data(t)
-            .map_err(|e| GpuError::shape(WHAT, format!("{}: {e}", s.name)))?;
-        let k = s.k;
-        let row_bytes = k / 64 * 36;
-        if k % 64 != 0 || bytes.len() % row_bytes != 0 {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{}: {} bytes are not rows of {k} NVFP4 values",
-                    s.name,
-                    bytes.len()
-                ),
-            ));
-        }
-        let rows = bytes.len() / row_bytes;
-        let mut blocks = vec![Q8Block { d: 0, q: [0; 32] }; rows * k / 32];
-        let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-        let per = rows.div_ceil(threads);
-        let failed = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|sc| {
-            for (i, out) in blocks.chunks_mut(per * k / 32).enumerate() {
-                let (src, failed) = (&bytes[i * per * row_bytes..], &failed);
-                sc.spawn(move || {
-                    let mut row = vec![0f32; k];
-                    for (r, ob) in out.chunks_mut(k / 32).enumerate() {
-                        let rb = &src[r * row_bytes..(r + 1) * row_bytes];
-                        if dequant_row(GgmlType::NVFP4, rb, &mut row).is_err() {
-                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                            return;
-                        }
-                        for (xb, b) in row.as_chunks::<32>().0.iter().zip(ob.iter_mut()) {
-                            let amax = xb.iter().fold(0.0f32, |a, v| a.max((v * scale).abs()));
-                            b.d = f32_to_f16_bits(amax / 127.0);
-                            let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-                            let id = if id.is_finite() { id } else { 0.0 };
-                            for (q, &v) in b.q.iter_mut().zip(xb) {
-                                *q = (v * scale * id).round_ties_even() as i8;
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        if failed.into_inner() {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("{}: an NVFP4 row that does not decode", s.name),
-            ));
-        }
-        let (qs, d) = q8_0_planes(&blocks);
-        w.insert_derived(
-            q8_name(&s.name),
-            DevWeight::Q8_0Derived {
-                qs: DeviceTensor::upload(stream, &qs, rows, k / 4)?,
-                d: DeviceTensor::upload(stream, &d, rows, k / 32)?,
-                k,
-            },
-        )?;
-    }
-    Ok(true)
 }
 
 /// The GEMM form of `cols` columns of `k` values in `acts`.
@@ -875,7 +748,6 @@ impl Body {
             routers: &self.mk.routers,
             iq: &self.mk.iq,
             m,
-            twins: p.twins,
         };
         let f = size_of::<f32>();
         let mut cur = 0;
