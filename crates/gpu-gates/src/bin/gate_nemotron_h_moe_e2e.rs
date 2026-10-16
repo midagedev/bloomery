@@ -60,6 +60,22 @@
 //!   the logits clause gates every prompt; the tiers share one body a pair,
 //!   the functions' `real` parameter carrying exactly these differences.
 //!
+//! - `prefill_near_mainlines` (fixture oracle) and `prefill_near_mainlines_real`
+//!   (oracle): every prompt of the set through `GpuModel::prefill` (passes of
+//!   many rows) from a reset: the last-position logits keep [`COSINE_FLOOR`]
+//!   against mainline's, the step path's cosine printed beside. Not held to
+//!   the step path's bits: past eight rows a pass runs its Q8_0 and NVFP4
+//!   sites as GEMMs on the rows' q8 blocks of 32 (the NVFP4 ones over a Q8_0
+//!   twin of the weight), as mainline's own prompt path quantizes, so the two
+//!   paths differ by that rounding. The fixture tier gates a prompt only where
+//!   both the step path and the pass kept mainline's experts in every MoE
+//!   layer (the pass's routing read after it, its last row's), at least one;
+//!   the real tier gates every prompt, as `logits_near_mainlines_real`.
+//! - `prefill_then_step_near_mainlines` and `…_real`: per prompt of two ids or
+//!   more, all but the last id through `prefill`, the last as one step, under
+//!   the same gate: this holds the scan states, the conv rings and the K/V rows
+//!   a pass leaves to the step after it. A one-id prompt is skipped by name.
+//!
 //! A set absent from the box, dumped from another fixture or build, or
 //! unfinished ends the gate by name before the card loads.
 
@@ -108,7 +124,7 @@ mod gate {
     const PROMPT_LEN: usize = 16;
 
     /// The fixture-oracle clauses the gate declares.
-    const FIXTURE_ORACLE: usize = 3;
+    const FIXTURE_ORACLE: usize = 5;
 
     /// What a clause is run over: the layer kinds and expert counts the
     /// file's header names, the walk, and in the fixture tier the set and
@@ -177,6 +193,26 @@ mod gate {
             "top1_is_mainlines_real",
             Tag::Oracle,
             top1_is_mainlines_real,
+        ),
+        (
+            "prefill_near_mainlines",
+            Tag::FixtureOracle,
+            prefill_near_mainlines,
+        ),
+        (
+            "prefill_then_step_near_mainlines",
+            Tag::FixtureOracle,
+            prefill_then_step_near_mainlines,
+        ),
+        (
+            "prefill_near_mainlines_real",
+            Tag::Oracle,
+            prefill_near_mainlines_real,
+        ),
+        (
+            "prefill_then_step_near_mainlines_real",
+            Tag::Oracle,
+            prefill_then_step_near_mainlines_real,
         ),
         ("fault_word_clean", Tag::SelfConsistency, fault_word_clean),
     ];
@@ -851,6 +887,127 @@ mod gate {
 
     // --------------------------------------------------- fault_word_clean
 
+    // ------------------------------------------------- the prompt path
+
+    /// The body after the set's prompt `p` from a reset with every id but the
+    /// last `tail` through `prefill` and those `tail` as steps, the MoE
+    /// layers' routing read back, or `None` after a line naming the fault.
+    fn prefill_on(
+        clause: &str,
+        m: &mut Model,
+        hp: &Hparams,
+        (set, p): (&LogitsSet, &refset::nemotron::Prompt),
+        tail: usize,
+    ) -> Result<Option<SetRun>, GateError> {
+        let ids = set.ids(p)?;
+        let (head, steps) = ids.split_at(ids.len() - tail);
+        m.reset()?;
+        let Some(mut id) = or_fault(clause, &p.name, m.prefill(head))? else {
+            return Ok(None);
+        };
+        for &t in steps {
+            match or_fault(clause, &p.name, m.step(&[t]))? {
+                Some(got) => id = got,
+                None => return Ok(None),
+            }
+        }
+        let logits = m.logits()?;
+        let mut routes = Vec::new();
+        for l in moe_layers(hp) {
+            routes.push(m.body(NAME)?.routing(m.gpu().stream(), l)?);
+        }
+        Ok(Some(SetRun { id, logits, routes }))
+    }
+
+    /// Both prompt-path clauses' body: each prompt through [`prefill_on`]
+    /// with `tail` ids as steps, its logits against mainline's at
+    /// [`COSINE_FLOOR`], gated as the module doc says per tier.
+    fn prefill_near_t(
+        m: &mut Model,
+        case: &Case,
+        (clause, real, tail): (&'static str, bool, usize),
+    ) -> Result<bool, GateError> {
+        let ml = mainline(case)?;
+        let mut ok = true;
+        let mut gated = 0;
+        for (p, step) in ml.set.prompts.iter().zip(&ml.runs) {
+            if (p.n_ids as usize) <= tail {
+                println!(
+                    "{clause}: {} {} id: no pass before its step, skipped",
+                    p.name, p.n_ids
+                );
+                continue;
+            }
+            let Some(step) = step else {
+                println!("{clause}: {} faulted on the step path FAIL", p.name);
+                ok = false;
+                continue;
+            };
+            let Some(run) = prefill_on(clause, m, &case.hp, (&ml.set, p), tail)? else {
+                ok = false;
+                continue;
+            };
+            let want = ml.set.logits(p)?;
+            if run.logits.len() != want.len() || !run.logits.iter().all(|v| v.is_finite()) {
+                println!(
+                    "{clause}: {} {} logits for the set's {}, finite {} FAIL",
+                    p.name,
+                    run.logits.len(),
+                    want.len(),
+                    run.logits.iter().all(|v| v.is_finite())
+                );
+                ok = false;
+                continue;
+            }
+            let (cosine, max_delta) = compare(&run.logits, &want);
+            let (step_cos, step_delta) = compare(&step.logits, &want);
+            let line = format!(
+                "{clause}: {} {} tokens, argmax {} mainline {} step {}, cosine {cosine:.6} (floor \
+                 {COSINE_FLOOR}), max |delta| {max_delta:.4}; the step path's cosine \
+                 {step_cos:.6}, max |delta| {step_delta:.4}",
+                p.name,
+                p.n_ids,
+                run.id,
+                argmax(&want),
+                step.id,
+            );
+            if real || (same_routes(ml, p, step)? && same_routes(ml, p, &run)?) {
+                gated += 1;
+                let pass = cosine >= COSINE_FLOOR;
+                println!("{line} {}", verdict(pass));
+                ok &= pass;
+            } else {
+                println!("{line}: a layer's pick crossed mainline's at the cut, not gated");
+            }
+        }
+        let pass = ok && gated > 0;
+        println!(
+            "{clause}: {gated} of {} prompts gated {}",
+            ml.set.prompts.len(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    fn prefill_near_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        prefill_near_t(m, case, ("prefill_near_mainlines", false, 0))
+    }
+
+    fn prefill_then_step_near_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        prefill_near_t(m, case, ("prefill_then_step_near_mainlines", false, 1))
+    }
+
+    fn prefill_near_mainlines_real(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        prefill_near_t(m, case, ("prefill_near_mainlines_real", true, 0))
+    }
+
+    fn prefill_then_step_near_mainlines_real(
+        m: &mut Model,
+        case: &Case,
+    ) -> Result<bool, GateError> {
+        prefill_near_t(m, case, ("prefill_then_step_near_mainlines_real", true, 1))
+    }
+
     fn fault_word_clean(m: &mut Model, _case: &Case) -> Result<bool, GateError> {
         let fault = m.gpu().fault()?;
         let pass = fault.is_none() && m.poisoned().is_none();
@@ -943,7 +1100,8 @@ mod gate {
              replay give bit-identical logits; a reset rewinds the ids and the logits bits; the \
              scan state carries; the fault word stays clean; in the fixture tier the logits keep \
              the cosine floor, the argmax is mainline's above the band and every MoE layer keeps \
-             mainline's experts on every prompt of the set"
+             mainline's experts on every prompt of the set; the prompt path, alone and before a \
+             step, keeps the cosine floor"
         );
         Ok(())
     }
