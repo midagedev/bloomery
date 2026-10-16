@@ -106,7 +106,9 @@ impl MoeScratch {
         hidden: usize,
         ff: usize,
     ) -> Result<MoeScratch, GpuError> {
-        let z = |n| hybrid::zeroed(stream, n);
+        let z = |n: usize| -> Result<DeviceBuffer<f32>, GpuError> {
+            Ok(DeviceBuffer::zeroed(stream, n.max(1))?)
+        };
         Ok(MoeScratch {
             lat: z(sh.latent)?,
             up: z(TOP_K * ff)?,

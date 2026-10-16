@@ -82,6 +82,7 @@ mod e2e;
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use crate::e2e::{Run, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
     use bloomery_gpu::arch::nemotron_h::PASS_ROWS;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Gpu, GpuError, NemotronHModel, NodeInfo};
@@ -183,78 +184,6 @@ mod gate {
 
     /// A run's argmax after the prompt and its last-position logits.
     type Last = (u32, Vec<f32>);
-
-    /// A step run: the argmax id and the logits after each token.
-    struct Run {
-        ids: Vec<u32>,
-        logits: Vec<Vec<f32>>,
-    }
-
-    /// Feed `ids` one token at a time from wherever `m` stands.
-    fn feed(m: &mut Model, ids: &[u32]) -> Result<Run, GpuError> {
-        let mut out = Run {
-            ids: Vec::new(),
-            logits: Vec::new(),
-        };
-        for &t in ids {
-            out.ids.push(m.step(&[t])?);
-            out.logits.push(m.logits()?);
-        }
-        Ok(out)
-    }
-
-    /// `r`'s run, or — when a step raised the fault word — a line naming the
-    /// fault and `None`: the clause fails there and the gate goes on to the
-    /// next one. Any other error ends the gate.
-    fn or_fault(
-        clause: &str,
-        what: &str,
-        r: Result<Run, GpuError>,
-    ) -> Result<Option<Run>, GateError> {
-        match r {
-            Ok(run) => Ok(Some(run)),
-            Err(GpuError::Fault { fault, .. }) => {
-                println!("{clause}: {what} raised the fault word: {fault} FAIL");
-                Ok(None)
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Reset, then [`feed`] `ids`, as [`or_fault`] reads it.
-    fn fresh(
-        clause: &str,
-        what: &str,
-        m: &mut Model,
-        ids: &[u32],
-    ) -> Result<Option<Run>, GateError> {
-        m.reset()?;
-        or_fault(clause, what, feed(m, ids))
-    }
-
-    fn finite(r: &Run) -> bool {
-        r.logits.iter().flatten().all(|v| v.is_finite())
-    }
-
-    fn same(a: &Run, b: &Run) -> bool {
-        a.ids == b.ids
-            && a.logits.len() == b.logits.len()
-            && a.logits
-                .iter()
-                .zip(&b.logits)
-                .all(|(x, y)| bits_equal(x, y))
-    }
-
-    // ---------------------------------------------------------- structure
-
-    /// The kernel entries of `nodes` with their counts.
-    fn histogram(nodes: &[NodeInfo]) -> BTreeMap<String, usize> {
-        let mut h = BTreeMap::new();
-        for k in nodes.iter().filter_map(|n| n.kernel.as_ref()) {
-            *h.entry(k.name.clone()).or_insert(0) += 1;
-        }
-        h
-    }
 
     fn structure(m: &mut Model, case: &Case) -> Result<bool, GateError> {
         m.set_mode(StepMode::Graph);
@@ -420,14 +349,6 @@ mod gate {
     }
 
     // ------------------------------------------------- the mainline set
-
-    /// The ids of the `k` largest values, largest first, lower id first on a tie.
-    fn top_ids(v: &[f32], k: usize) -> Vec<usize> {
-        let mut ids: Vec<usize> = (0..v.len()).collect();
-        ids.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
-        ids.truncate(k);
-        ids
-    }
 
     /// The step path's argmax and last-position logits after the set's
     /// prompt `p`, from a reset, or `None` after a line naming the fault; run
@@ -780,14 +701,6 @@ mod gate {
     }
 
     // ---------------------------------------------------------------- run
-
-    /// The fixed prompt: a multiplicative walk through ids the vocabulary
-    /// holds.
-    fn walk(n: usize, vocab: usize) -> Vec<u32> {
-        (0..n)
-            .map(|i| u32::try_from(1_000 + (i * 7_919 + 13) % (vocab - 1_000)).unwrap_or(1))
-            .collect()
-    }
 
     pub fn run() -> Result<(), GateError> {
         let file = open_split(Arch::NemotronH, "gate-gpu-nemotron-e2e")?;

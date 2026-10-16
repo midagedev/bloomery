@@ -66,12 +66,13 @@ mod e2e;
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use crate::e2e::{Run, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
     use bloomery_gpu::arch::nemotron_h_moe::Routing;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel, NodeInfo};
+    use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::tier::{self, Tag};
-    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, open_split, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, open_split, verdict};
     use cuda_core::sys;
     use model::arch::Arch;
     use model::arch::nemotron_h_moe::hparams::{Hparams, Kind};
@@ -163,78 +164,6 @@ mod gate {
         ("top1_is_mainlines_real", Tag::Oracle, top1_is_mainlines),
         ("fault_word_clean", Tag::SelfConsistency, fault_word_clean),
     ];
-
-    /// A step run: the argmax id and the logits after each token.
-    struct Run {
-        ids: Vec<u32>,
-        logits: Vec<Vec<f32>>,
-    }
-
-    /// Feed `ids` one token at a time from wherever `m` stands.
-    fn feed(m: &mut Model, ids: &[u32]) -> Result<Run, GpuError> {
-        let mut out = Run {
-            ids: Vec::new(),
-            logits: Vec::new(),
-        };
-        for &t in ids {
-            out.ids.push(m.step(&[t])?);
-            out.logits.push(m.logits()?);
-        }
-        Ok(out)
-    }
-
-    /// `r`'s run, or — when a step raised the fault word — a line naming the
-    /// fault and `None`: the clause fails there and the gate goes on to the
-    /// next one. Any other error ends the gate.
-    fn or_fault<T>(
-        clause: &str,
-        what: &str,
-        r: Result<T, GpuError>,
-    ) -> Result<Option<T>, GateError> {
-        match r {
-            Ok(run) => Ok(Some(run)),
-            Err(GpuError::Fault { fault, .. }) => {
-                println!("{clause}: {what} raised the fault word: {fault} FAIL");
-                Ok(None)
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Reset, then [`feed`] `ids`, as [`or_fault`] reads it.
-    fn fresh(
-        clause: &str,
-        what: &str,
-        m: &mut Model,
-        ids: &[u32],
-    ) -> Result<Option<Run>, GateError> {
-        m.reset()?;
-        or_fault(clause, what, feed(m, ids))
-    }
-
-    fn finite(r: &Run) -> bool {
-        r.logits.iter().flatten().all(|v| v.is_finite())
-    }
-
-    fn same(a: &Run, b: &Run) -> bool {
-        a.ids == b.ids
-            && a.logits.len() == b.logits.len()
-            && a.logits
-                .iter()
-                .zip(&b.logits)
-                .all(|(x, y)| bits_equal(x, y))
-    }
-
-    // ---------------------------------------------------------- structure
-
-    /// The kernel entries of `nodes` with their counts.
-    fn histogram(nodes: &[NodeInfo]) -> BTreeMap<String, usize> {
-        let mut h = BTreeMap::new();
-        for k in nodes.iter().filter_map(|n| n.kernel.as_ref()) {
-            *h.entry(k.name.clone()).or_insert(0) += 1;
-        }
-        h
-    }
 
     fn structure(m: &mut Model, case: &Case) -> Result<bool, GateError> {
         let hp = &case.hp;
@@ -395,14 +324,6 @@ mod gate {
     }
 
     // ------------------------------------------------- the mainline set
-
-    /// The ids of the `k` largest values, largest first, lower id first on a tie.
-    fn top_ids(v: &[f32], k: usize) -> Vec<usize> {
-        let mut ids: Vec<usize> = (0..v.len()).collect();
-        ids.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
-        ids.truncate(k);
-        ids
-    }
 
     /// The body after the set's prompt `p` from a reset, with the MoE
     /// layers' routing read back, or `None` after a line naming the fault.
@@ -1007,31 +928,6 @@ mod gate {
 
     // ---------------------------------------------------------------- run
 
-    /// The fixed walk: a multiplicative walk through ids the vocabulary
-    /// holds.
-    fn walk(n: usize, vocab: usize) -> Vec<u32> {
-        (0..n)
-            .map(|i| u32::try_from(1_000 + (i * 7_919 + 13) % (vocab - 1_000)).unwrap_or(1))
-            .collect()
-    }
-
-    /// The f32 tensor `name` of `file`, read from its bytes.
-    fn f32_tensor(file: &gguf::Split, name: &str) -> Result<Vec<f32>, GateError> {
-        let (s, t) = file
-            .find(name)
-            .ok_or_else(|| format!("{name} is not in the file"))?;
-        if t.ty != gguf::GgmlType::F32 {
-            return Err(format!("{name} is {}, not f32", t.ty).into());
-        }
-        let g = file.shard(s).ok_or_else(|| format!("{name}'s shard {s}"))?;
-        Ok(g.data(t)?
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect())
-    }
-
     pub fn run() -> Result<(), GateError> {
         let file = open_split(Arch::NemotronHMoe, "gate-gpu-nemotron-h-moe-e2e")?;
         let hp = Hparams::read(&file).map_err(|e| format!("nemotron_h_moe header: {e}"))?;
@@ -1056,7 +952,15 @@ mod gate {
         let walk = walk(PROMPT_LEN, hp.n_vocab);
         let bias = moe_layers(&hp)
             .into_iter()
-            .map(|l| f32_tensor(&file, &format!("blk.{l}.exp_probs_b.bias")))
+            .map(|l| {
+                bloomery_gpu_gates::split_f32(
+                    &file,
+                    &format!("blk.{l}.exp_probs_b.bias"),
+                    hp.experts[l]
+                        .expect("a MoE layer's experts are read")
+                        .n_expert,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let t = std::time::Instant::now();
         let mut m = Model::open(Gpu::new()?, file, ctx)?;

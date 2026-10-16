@@ -175,7 +175,9 @@ pub const AVAILABLE: &[Available] = &[
         programs: &[Program::NemotronHMoeBody],
         at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body at 240, 304, 368, 432 and 496 \
              (gpu/src/arch/nemotron_h_moe/router.rs)",
-        runs: |n| routes(n, &[RouterBody::BiasedSigmoid]),
+        runs: |n| {
+            matches!(n, Need::Router(s) if s.top_k == 9) && routes(n, &[RouterBody::BiasedSigmoid])
+        },
     },
     Available {
         programs: &[Program::NemotronHMoeBody],

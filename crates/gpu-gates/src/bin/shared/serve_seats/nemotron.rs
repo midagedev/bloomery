@@ -138,12 +138,6 @@ fn prefill_nano(m: &mut NemotronHModel, ids: &[u32]) -> Result<u32, GpuError> {
     }
 }
 
-/// A body with no prompt batch (Bolt's): one step an id, the argmax after the
-/// last, so the prompt rate is the decode rate.
-fn prefill_steps<B: ChainBody>(m: &mut GpuModel<B>, ids: &[u32]) -> Result<u32, GpuError> {
-    m.step(ids)
-}
-
 impl<B: ChainBody> Nemotron<B> {
     /// The model of the file at `a.path` on the planned card, built by `open`
     /// (the family's `GpuModel::open`) and carrying its prompt path `prefill`,
@@ -342,7 +336,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             0,
         )?,
         Arch::NemotronHMoe => SeatEngine::spawn(
-            move || Nemotron::open(open, NemotronHMoeModel::open, prefill_steps),
+            move || Nemotron::open(open, NemotronHMoeModel::open, NemotronHMoeModel::step),
             slot_ctx,
             vocab,
             device,

@@ -10,7 +10,7 @@ use bloomery_gpu::GpuError;
 use bloomery_gpu_gates::flip::Flip;
 use bloomery_gpu_gates::tier;
 use bloomery_gpu_gates::{
-    GateError, RefManifest, data_dir, ik_q8_2, ref_tensor_logical_in, verdict,
+    GateError, RefManifest, bits_equal, data_dir, ik_q8_2, ref_tensor_logical_in, verdict,
 };
 use refset::family::Family;
 
@@ -364,4 +364,88 @@ pub fn pick(v: &[f32], k: usize, rows: &[usize]) -> Vec<f32> {
 /// `a − b`, value by value.
 pub fn minus(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter().zip(b).map(|(&x, &y)| x - y).collect()
+}
+
+/// A step run: the argmax id and the logits after each token.
+pub struct Run {
+    pub ids: Vec<u32>,
+    pub logits: Vec<Vec<f32>>,
+}
+
+/// Feed `ids` one token at a time from wherever `m` stands.
+pub fn feed<B: bloomery_gpu::model::ChainBody>(
+    m: &mut bloomery_gpu::GpuModel<B>,
+    ids: &[u32],
+) -> Result<Run, GpuError> {
+    let mut out = Run {
+        ids: Vec::new(),
+        logits: Vec::new(),
+    };
+    for &t in ids {
+        out.ids.push(m.step(&[t])?);
+        out.logits.push(m.logits()?);
+    }
+    Ok(out)
+}
+
+/// `r`'s run, or — when a step raised the fault word — a line naming the
+/// fault and `None`: the clause fails there and the gate goes on to the
+/// next one. Any other error ends the gate.
+pub fn or_fault<T>(c: &str, w: &str, r: Result<T, GpuError>) -> Result<Option<T>, GateError> {
+    match r {
+        Ok(x) => Ok(Some(x)),
+        Err(GpuError::Fault { fault, .. }) => {
+            println!("{c}: {w} raised the fault word: {fault} FAIL");
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Reset, then [`feed`] `ids`, as [`or_fault`] reads it.
+pub fn fresh<B: bloomery_gpu::model::ChainBody>(
+    c: &str,
+    w: &str,
+    m: &mut bloomery_gpu::GpuModel<B>,
+    ids: &[u32],
+) -> Result<Option<Run>, GateError> {
+    m.reset()?;
+    or_fault(c, w, feed(m, ids))
+}
+
+pub fn finite(r: &Run) -> bool {
+    r.logits.iter().flatten().all(|v| v.is_finite())
+}
+
+pub fn same(a: &Run, b: &Run) -> bool {
+    a.ids == b.ids
+        && a.logits.len() == b.logits.len()
+        && a.logits
+            .iter()
+            .zip(&b.logits)
+            .all(|(x, y)| bits_equal(x, y))
+}
+
+/// The kernel entries of `nodes` with their counts.
+pub fn histogram(nodes: &[bloomery_gpu::NodeInfo]) -> std::collections::BTreeMap<String, usize> {
+    let mut h = std::collections::BTreeMap::new();
+    for k in nodes.iter().filter_map(|n| n.kernel.as_ref()) {
+        *h.entry(k.name.clone()).or_insert(0) += 1;
+    }
+    h
+}
+
+/// The ids of the `k` largest values, largest first, lower id first on a tie.
+pub fn top_ids(v: &[f32], k: usize) -> Vec<usize> {
+    let mut ids: Vec<usize> = (0..v.len()).collect();
+    ids.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
+    ids.truncate(k);
+    ids
+}
+
+/// The fixed walk: a multiplicative walk through ids the vocabulary holds.
+pub fn walk(n: usize, vocab: usize) -> Vec<u32> {
+    (0..n)
+        .map(|i| u32::try_from(1_000 + (i * 7_919 + 13) % (vocab - 1_000)).unwrap_or(1))
+        .collect()
 }

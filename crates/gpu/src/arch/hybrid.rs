@@ -234,11 +234,6 @@ pub(crate) struct RowBuffers {
     pub(crate) n_keys: DeviceBuffer<u32>,
 }
 
-/// A zeroed buffer of `n` values, at least one. Load-time only.
-pub(crate) fn zeroed(stream: &CudaStream, n: usize) -> Result<DeviceBuffer<f32>, GpuError> {
-    Ok(DeviceBuffer::zeroed(stream, n.max(1))?)
-}
-
 impl RowBuffers {
     /// `rows` rows of each width for `sh`, `n_head` query heads and the
     /// widest `ff` an MLP layer has, the flash partials at the rows a flash
@@ -414,11 +409,7 @@ impl Site {
                 site::blocks32_gemv(gpu, key, act, y)
             }
             SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Nvfp4 => {
-                let act = acts
-                    .q8_1
-                    .iter_mut()
-                    .find(|a| a.k() == self.k && a.m() == 1)
-                    .ok_or_else(|| GpuError::state(cx.what, "a q8_1 form at the site's width"))?;
+                let act = acts.q8_1_at(cx.what, self.k, 1)?;
                 gpu.enqueue_quantize_q8_1_layer(x, act, layer)?;
                 site::kgemv(gpu, &cx.k.kgemv, key, act, gpu.layer_sink(layer)?, y)
             }
