@@ -82,6 +82,10 @@ pub(super) struct Prompt {
     x: [DeviceBuffer<f32>; 2],
     /// Every other buffer of the pass.
     b: PassBufs,
+    /// Whether the NVFP4 sites' Q8_0 twins are resident ([`derive_q8`]):
+    /// past [`COLS`] rows they run as GEMMs over the twins, otherwise as the
+    /// multi-column gemv runs.
+    pub(super) twins: bool,
 }
 
 /// [`Prompt`]'s buffers beside the residual streams.
@@ -217,6 +221,7 @@ impl Prompt {
         }
         let n_words = P_ROWS + sh.n_kv + rows;
         Ok(Prompt {
+            twins: false,
             rows,
             q_width: n_head * HEAD,
             x: [z(sh.hidden)?, z(sh.hidden)?],
@@ -306,6 +311,8 @@ struct Cx<'a> {
     routers: &'a Routers,
     iq: &'a IqSelKernels,
     m: usize,
+    /// [`Prompt::twins`].
+    twins: bool,
 }
 
 /// `y = W · x` for site `s` over the pass's `m` rows of `x` (`s.k` values a
@@ -341,7 +348,7 @@ fn project_rows(
             y,
         );
     }
-    if s.ty == SiteTy::Nvfp4 && cx.m > COLS {
+    if s.ty == SiteTy::Nvfp4 && cx.m > COLS && cx.twins {
         let a =
             arms.wide.iter_mut().find(|a| a.0 == s.k).ok_or_else(|| {
                 GpuError::shape(WHAT, format!("no q8 blocks of 32 of width {}", s.k))
@@ -555,17 +562,43 @@ fn q8_name(name: &str) -> String {
     format!("derived.q8_0.{name}")
 }
 
+/// The device bytes [`derive_q8`] leaves free past the twins, for what the
+/// model allocates after its load. A chosen margin, not a derived one.
+const TWIN_HEADROOM: usize = 2 << 30;
+
 /// Every NVFP4 site of `layers` again as a derived Q8_0 weight, what a pass
 /// past [`COLS`] rows runs it as: each row decoded from `file` times the
 /// tensor's scale, then coded per 32 values as `quantize_row_q8_0` codes
 /// (`d = f16(amax / 127)`, each code `round_half_even(v · 127 / amax)`).
-/// Threaded over the rows. Load-time only.
+/// Threaded over the rows. Load-time only. Only when the card's room holds
+/// every twin and [`TWIN_HEADROOM`]: returns whether it derived them.
 pub(super) fn derive_q8(
-    stream: &CudaStream,
+    gpu: &Gpu,
     file: &Split,
     w: &mut Weights,
     layers: &[Layer],
-) -> Result<(), GpuError> {
+) -> Result<bool, GpuError> {
+    let stream = gpu.stream();
+    let mut need = 0usize;
+    for s in layers.iter().flat_map(Layer::sites) {
+        if s.ty != SiteTy::Nvfp4 {
+            continue;
+        }
+        let (shard, t) = file
+            .find(&s.name)
+            .ok_or_else(|| GpuError::tensor(WHAT, &s.name, "a file tensor"))?;
+        let n = file
+            .shard(shard)
+            .ok_or_else(|| GpuError::tensor(WHAT, &s.name, "its shard"))?
+            .data(t)
+            .map_err(|e| GpuError::shape(WHAT, format!("{}: {e}", s.name)))?
+            .len();
+        // 36 NVFP4 bytes a 64 values; a twin holds 34 bytes a 32.
+        need += n / 36 * 2 * 34;
+    }
+    if gpu.alloc_room()? < need + TWIN_HEADROOM {
+        return Ok(false);
+    }
     for s in layers.iter().flat_map(Layer::sites) {
         if s.ty != SiteTy::Nvfp4 {
             continue;
@@ -639,7 +672,7 @@ pub(super) fn derive_q8(
             },
         )?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The GEMM form of `cols` columns of `k` values in `acts`.
@@ -842,6 +875,7 @@ impl Body {
             routers: &self.mk.routers,
             iq: &self.mk.iq,
             m,
+            twins: p.twins,
         };
         let f = size_of::<f32>();
         let mut cur = 0;
