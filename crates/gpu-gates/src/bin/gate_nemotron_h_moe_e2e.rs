@@ -4,7 +4,8 @@
 //! own expert counts and widths, the head and the argmax — on one card. Its
 //! tier is the fixture's (`/models/fixtures/nemotron-bolt`: a Mamba-2 layer,
 //! a MoE layer of 240 experts × 1536, an attention layer, a MoE layer of 496
-//! × 2560); the real tier runs the own-contract clauses on the 22 GB file.
+//! × 2560); the real tier adds the mainline clauses below against the real
+//! file's set (`ref-nemotron-moe-logits`).
 //!
 //! The clauses are a list ([`CLAUSES`]); each prints lines ending in PASS or
 //! FAIL, and a step that raises the card's fault word is a FAIL naming the
@@ -50,6 +51,14 @@
 //!   prompt, band or not, the run's recorded id is the argmax of its own
 //!   logits row ([`argmax`]) — a row whose id is not its own argmax is
 //!   a FAIL.
+//! - `routing_is_mainlines_real`, `logits_near_mainlines_real`,
+//!   `top1_is_mainlines_real` (oracle): the same three contracts against the
+//!   real file's set. The real file's quantized weights put near-ties at the
+//!   9-expert cut — no prompt keeps mainline's experts in every layer — so
+//!   the routing clause's eps comes from every prompt, a differing layer is
+//!   judged at its own cut (a crossing does not cross its prompt off), and
+//!   the logits clause gates every prompt; the tiers share one body a pair,
+//!   the functions' `real` parameter carrying exactly these differences.
 //!
 //! A set absent from the box, dumped from another fixture or build, or
 //! unfinished ends the gate by name before the card loads.
@@ -164,7 +173,7 @@ mod gate {
             Tag::Oracle,
             logits_near_mainlines_real,
         ),
-        ("top1_is_mainlines_real", Tag::Oracle, top1_is_mainlines),
+        ("top1_is_mainlines_real", Tag::Oracle, top1_is_mainlines_real),
         ("fault_word_clean", Tag::SelfConsistency, fault_word_clean),
     ];
 
@@ -496,18 +505,27 @@ mod gate {
         }))
     }
 
-    /// The logits are held to the floor on the prompts whose every MoE layer
-    /// kept mainline's experts; a prompt where a layer's pick crossed at the
+    /// Both tiers' body: the cosine of the last-position logits at least
+    /// [`COSINE_FLOOR`]. The fixture tier gates only the prompts whose every
+    /// MoE layer kept mainline's set — a prompt where a pick crossed at the
     /// cut ([`Routed::Crossed`]) runs another expert from there on, and its
-    /// numbers are printed, not gated.
-    fn logits_near_mainlines(_m: &mut Model, case: &Case) -> Result<bool, GateError> {
-        const CLAUSE: &str = "logits_near_mainlines";
+    /// cosine and max |Δ| are printed, not gated, and at least one prompt is
+    /// gated. The real tier gates every prompt: on the real set a crossing
+    /// stays inside the floor.
+    /// PIN(2026-10-16): the fixture's floor 0.999 re-pinned for the real set — 0.999401 to
+    /// 0.999998 over its 10 prompts with the crossings included.
+    fn logits_near_mainlines_t(
+        _m: &mut Model,
+        case: &Case,
+        clause: &'static str,
+        real: bool,
+    ) -> Result<bool, GateError> {
         let ml = mainline(case)?;
         let mut ok = true;
         let mut gated = 0;
         for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
             let Some(run) = run else {
-                println!("{CLAUSE}: {} faulted FAIL", p.name);
+                println!("{clause}: {} faulted FAIL", p.name);
                 ok = false;
                 continue;
             };
@@ -515,7 +533,7 @@ mod gate {
             let got = &run.logits;
             if got.len() != want.len() || !got.iter().all(|v| v.is_finite()) {
                 println!(
-                    "{CLAUSE}: {} {} logits for the set's {}, finite {} FAIL",
+                    "{clause}: {} {} logits for the set's {}, finite {} FAIL",
                     p.name,
                     got.len(),
                     want.len(),
@@ -528,16 +546,15 @@ mod gate {
             let values = |ids: &[usize], v: &[f32]| -> Vec<String> {
                 ids.iter().map(|&i| format!("{i}:{:.3}", v[i])).collect()
             };
-            let routes = same_routes(ml, p, run)?;
             let line = format!(
-                "{CLAUSE}: {} {} tokens, max |delta| {max_delta:.4}, cosine {cosine:.6} \
+                "{clause}: {} {} tokens, max |delta| {max_delta:.4}, cosine {cosine:.6} \
                  (floor {COSINE_FLOOR}), top-5 body {:?} mainline {:?}",
                 p.name,
                 p.n_ids,
                 values(&top_ids(got, 5), got),
                 values(&top_ids(&want, 5), &want),
             );
-            if routes {
+            if real || same_routes(ml, p, run)? {
                 gated += 1;
                 let pass = cosine >= COSINE_FLOOR;
                 println!("{line} {}", verdict(pass));
@@ -546,76 +563,46 @@ mod gate {
                 println!("{line}: a layer's pick crossed mainline's at the cut, not gated");
             }
         }
-        let pass = ok && gated > 0;
-        println!(
-            "{CLAUSE}: {gated} of {} prompts gated (every MoE layer mainline's experts) {}",
-            ml.set.prompts.len(),
-            verdict(pass)
-        );
+        let pass = ok && (real || gated > 0);
+        if real {
+            println!(
+                "{clause}: {} prompts gated at the floor {}",
+                ml.set.prompts.len(),
+                verdict(pass)
+            );
+        } else {
+            println!(
+                "{clause}: {gated} of {} prompts gated (every MoE layer mainline's experts) {}",
+                ml.set.prompts.len(),
+                verdict(pass)
+            );
+        }
         Ok(pass)
     }
 
-    /// The real tier's logits: every prompt is held to the floor. On the real
-    /// set a layer's pick crosses mainline's at the cut without the logits
-    /// leaving the band, so no prompt is exempt for a crossing the way the
-    /// fixture tier exempts them.
-    /// PIN(2026-10-16): the fixture's floor 0.999 re-pinned for the real set — 0.999401 to
-    /// 0.999998 over its 10 prompts with the crossings included.
-    fn logits_near_mainlines_real(_m: &mut Model, case: &Case) -> Result<bool, GateError> {
-        const CLAUSE: &str = "logits_near_mainlines_real";
-        let ml = mainline(case)?;
-        let mut ok = true;
-        for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
-            let Some(run) = run else {
-                println!("{CLAUSE}: {} faulted FAIL", p.name);
-                ok = false;
-                continue;
-            };
-            let want = ml.set.logits(p)?;
-            let got = &run.logits;
-            if got.len() != want.len() || !got.iter().all(|v| v.is_finite()) {
-                println!(
-                    "{CLAUSE}: {} {} logits for the set's {}, finite {} FAIL",
-                    p.name,
-                    got.len(),
-                    want.len(),
-                    got.iter().all(|v| v.is_finite())
-                );
-                ok = false;
-                continue;
-            }
-            let (cosine, max_delta) = compare(got, &want);
-            let values = |ids: &[usize], v: &[f32]| -> Vec<String> {
-                ids.iter().map(|&i| format!("{i}:{:.3}", v[i])).collect()
-            };
-            let pass = cosine >= COSINE_FLOOR;
-            println!(
-                "{CLAUSE}: {} {} tokens, max |delta| {max_delta:.4}, cosine {cosine:.6} \
-                 (floor {COSINE_FLOOR}), top-5 body {:?} mainline {:?} {}",
-                p.name,
-                p.n_ids,
-                values(&top_ids(got, 5), got),
-                values(&top_ids(&want, 5), &want),
-                verdict(pass)
-            );
-            ok &= pass;
-        }
-        println!(
-            "{CLAUSE}: {} prompts gated at the floor {}",
-            ml.set.prompts.len(),
-            verdict(ok)
-        );
-        Ok(ok)
+    fn logits_near_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        logits_near_mainlines_t(m, case, "logits_near_mainlines", false)
     }
 
-    fn top1_is_mainlines(_m: &mut Model, case: &Case) -> Result<bool, GateError> {
-        const CLAUSE: &str = "top1_is_mainlines";
+    /// The same clause against the real file's set, every prompt gated.
+    fn logits_near_mainlines_real(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        logits_near_mainlines_t(m, case, "logits_near_mainlines_real", true)
+    }
+
+    /// Both tiers' body: the body's argmax id is mainline's wherever
+    /// mainline's own top-1 margin exceeds twice the prompt's max |Δ|; the
+    /// tiers differ only in the clause name they print.
+    fn top1_is_mainlines_t(
+        _m: &mut Model,
+        case: &Case,
+        clause: &'static str,
+    ) -> Result<bool, GateError> {
         let ml = mainline(case)?;
         let mut ok = true;
         let mut gated = 0;
         for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
             let Some(run) = run else {
-                println!("{CLAUSE}: {} faulted FAIL", p.name);
+                println!("{clause}: {} faulted FAIL", p.name);
                 ok = false;
                 continue;
             };
@@ -628,7 +615,7 @@ mod gate {
             let own = argmax(&run.logits);
             if run.id != own {
                 println!(
-                    "{CLAUSE}: {} run id {} is not its logits' argmax {own} FAIL",
+                    "{clause}: {} run id {} is not its logits' argmax {own} FAIL",
                     p.name, run.id
                 );
                 ok = false;
@@ -637,7 +624,7 @@ mod gate {
                 gated += 1;
                 let pass = run.id == mainline;
                 println!(
-                    "{CLAUSE}: {} body argmax {} mainline {mainline}, margin {margin:.4} > band \
+                    "{clause}: {} body argmax {} mainline {mainline}, margin {margin:.4} > band \
                      {band:.4} (2 x max |delta|) {}",
                     p.name,
                     run.id,
@@ -646,27 +633,55 @@ mod gate {
                 ok &= pass;
             } else {
                 println!(
-                    "{CLAUSE}: {} body argmax {} mainline {mainline}, margin {margin:.4} <= band \
+                    "{clause}: {} body argmax {} mainline {mainline}, margin {margin:.4} <= band \
                      {band:.4}: not gated",
                     p.name, run.id
                 );
             }
         }
         println!(
-            "{CLAUSE}: {gated} of {} prompts gated {}",
+            "{clause}: {gated} of {} prompts gated {}",
             ml.set.prompts.len(),
             verdict(ok)
         );
         Ok(ok)
     }
 
+    fn top1_is_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        top1_is_mainlines_t(m, case, "top1_is_mainlines")
+    }
+
+    /// The same clause against the real file's set.
+    fn top1_is_mainlines_real(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        top1_is_mainlines_t(m, case, "top1_is_mainlines_real")
+    }
+
     /// Per prompt and MoE layer: the body's ids are the top 9 of its own
     /// scores plus the file's bias and its weights their renormalized
     /// scores times the scale (the card's selection against its own read-back
     /// scores); and its set is mainline's, or differs only at the cut
-    /// ([`Routed::Crossed`]), counted and printed with the gap.
-    fn routing_is_mainlines(_m: &mut Model, case: &Case) -> Result<bool, GateError> {
-        const CLAUSE: &str = "routing_is_mainlines";
+    /// ([`Routed::Crossed`]), counted and printed with the gap. The fixture
+    /// tier takes its band's eps from the prompts that kept mainline's
+    /// experts in every layer and FAILs when there is none, and a layer
+    /// after one whose pick crossed runs on another expert's output, so its
+    /// set is not mainline's to compare. The real tier's states stay on
+    /// mainline's (the logits clause's floor holds with the crossings in),
+    /// so it takes the eps from every prompt, compares each differing layer
+    /// at its own cut, and prints per prompt how many layers keep
+    /// mainline's experts.
+    /// PIN(2026-10-16): the real tier's eps comes from every prompt's own
+    /// logits against mainline's — no prompt on the real set keeps mainline's
+    /// experts in every layer, and the crossings' divergence is inside the
+    /// deltas, so the eps is an upper bound: a crossing that dominates its
+    /// prompt's max |delta| widens its own band, and the clause's teeth are
+    /// the logits floor and top1's argmax, which so wide a crossing cannot
+    /// pass.
+    fn routing_is_mainlines_t(
+        _m: &mut Model,
+        case: &Case,
+        clause: &'static str,
+        real: bool,
+    ) -> Result<bool, GateError> {
         let ml = mainline(case)?;
         let moe = moe_layers(&case.hp);
         let layers: Vec<usize> = ml
@@ -677,14 +692,14 @@ mod gate {
             .collect();
         if layers != moe {
             println!(
-                "{CLAUSE}: the set routes layers {layers:?}, the file's MoE layers are {moe:?} FAIL"
+                "{clause}: the set routes layers {layers:?}, the file's MoE layers are {moe:?} FAIL"
             );
             return Ok(false);
         }
         let mut eps = 0.0f32;
         for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
             if let Some(run) = run
-                && same_routes(ml, p, run)?
+                && (real || same_routes(ml, p, run)?)
             {
                 let want = ml.set.logits(p)?;
                 let (_, max_delta) = compare(&run.logits, &want);
@@ -692,30 +707,62 @@ mod gate {
                 eps = eps.max((max_delta / f64::from(peak)) as f32);
             }
         }
-        if eps == 0.0 {
-            println!("{CLAUSE}: no prompt kept mainline's experts in every layer, no band FAIL");
+        if eps == 0.0 && !real {
+            println!("{clause}: no prompt kept mainline's experts in every layer, no band FAIL");
             return Ok(false);
         }
-        println!(
-            "{CLAUSE}: eps {eps:.4} (max |delta| / peak |logit| over the prompts that kept \
-             mainline's experts in every layer)"
-        );
+        let source = if real {
+            "every prompt"
+        } else {
+            "the prompts that kept mainline's experts in every layer"
+        };
+        println!("{clause}: eps {eps:.4} (max |delta| / peak |logit| over {source})");
+        if real {
+            // Per prompt: how many MoE layers keep mainline's expert set, and the first that
+            // does not.
+            for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
+                let (Some(run), Some(want)) = (run, ml.set.routes(p)?) else {
+                    continue;
+                };
+                let eq: Vec<bool> = run
+                    .routes
+                    .iter()
+                    .zip(&want)
+                    .map(|(r, w)| {
+                        let mut a = r.ids.clone();
+                        let mut b = w.clone();
+                        a.sort_unstable();
+                        b.sort_unstable();
+                        a == b
+                    })
+                    .collect();
+                let first = eq.iter().position(|e| !e).map(|i| moe[i]);
+                println!(
+                    "{clause}: {} {} of {} MoE layers keep mainline's experts, first other layer \
+                     {first:?}",
+                    p.name,
+                    eq.iter().filter(|e| **e).count(),
+                    eq.len()
+                );
+            }
+        }
         let scale = case.hp.weights_scale;
         let mut ok = true;
         let (mut same, mut boundary) = (0, 0);
         for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
             let Some(run) = run else {
-                println!("{CLAUSE}: {} faulted FAIL", p.name);
+                println!("{clause}: {} faulted FAIL", p.name);
                 ok = false;
                 continue;
             };
             let Some(want) = ml.set.routes(p)? else {
-                println!("{CLAUSE}: {} carries no routes FAIL", p.name);
+                println!("{clause}: {} carries no routes FAIL", p.name);
                 ok = false;
                 continue;
             };
             // A layer after one whose pick crossed runs on another expert's
-            // output: its set is not mainline's to compare.
+            // output: its set is not mainline's to compare. The real tier
+            // never crosses off (above), so its crossed_at stays None.
             let mut crossed_at = None;
             for (((l, r), want), bias) in moe.iter().zip(&run.routes).zip(&want).zip(&case.bias) {
                 let rank = ranked(r, bias);
@@ -745,7 +792,9 @@ mod gate {
                     }
                     Ok(Routed::Crossed { d, worst }) => {
                         boundary += 1;
-                        crossed_at = Some(*l);
+                        if !real {
+                            crossed_at = Some(*l);
+                        }
                         let text = format!(
                             "crossed at the cut: {d} of mainline's within the band of the \
                              body's 9th, worst gap/band {worst:.3}"
@@ -767,7 +816,7 @@ mod gate {
                 };
                 let pass = picks && weights && kept_ok;
                 println!(
-                    "{CLAUSE}: {} layer {l} body {:?} mainline {want:?}: {verdict_of}; the body's \
+                    "{clause}: {} layer {l} body {:?} mainline {want:?}: {verdict_of}; the body's \
                      top 9 of its scores + bias {picks}, weights its renormalized scores x {scale} \
                      {weights} {}",
                     p.name,
@@ -778,150 +827,20 @@ mod gate {
             }
         }
         println!(
-            "{CLAUSE}: {same} layer runs mainline's set, {boundary} crossed at the cut {}",
+            "{clause}: {same} layer runs mainline's set, {boundary} crossed at the cut {}",
             verdict(ok)
         );
         Ok(ok)
     }
 
-    /// The real tier's routing: the body's own selection contract as in the
-    /// fixture tier, and every layer that does not keep mainline's set must
-    /// cross at the cut ([`Routed::Crossed`]) under the band. Unlike the
-    /// fixture tier a crossing does not end its prompt's comparison: on the
-    /// real set the states stay on mainline's (the logits clause's floor
-    /// holds with the crossings in), so each differing layer stands at its
-    /// own cut.
-    /// PIN(2026-10-16): the band's eps comes from every prompt's own logits
-    /// against mainline's, not only the prompts that kept mainline's experts
-    /// in every layer — on the real set none does, and the crossings'
-    /// divergence is inside the deltas, so the eps is an upper bound.
-    fn routing_is_mainlines_real(_m: &mut Model, case: &Case) -> Result<bool, GateError> {
-        const CLAUSE: &str = "routing_is_mainlines_real";
-        let ml = mainline(case)?;
-        let moe = moe_layers(&case.hp);
-        let layers: Vec<usize> = ml
-            .set
-            .route_layers
-            .iter()
-            .map(|r| r.layer as usize)
-            .collect();
-        if layers != moe {
-            println!(
-                "{CLAUSE}: the set routes layers {layers:?}, the file's MoE layers are {moe:?} FAIL"
-            );
-            return Ok(false);
-        }
-        let mut eps = 0.0f32;
-        for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
-            let Some(run) = run else {
-                continue;
-            };
-            let want = ml.set.logits(p)?;
-            let (_, max_delta) = compare(&run.logits, &want);
-            let peak = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-            eps = eps.max((max_delta / f64::from(peak)) as f32);
-        }
-        println!("{CLAUSE}: eps {eps:.4} (max |delta| / peak |logit| over every prompt)");
-        // Per prompt: how many MoE layers keep mainline's expert set, and the first that does not.
-        for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
-            let (Some(run), Some(want)) = (run, ml.set.routes(p)?) else {
-                continue;
-            };
-            let eq: Vec<bool> = run
-                .routes
-                .iter()
-                .zip(&want)
-                .map(|(r, w)| {
-                    let mut a = r.ids.clone();
-                    let mut b = w.clone();
-                    a.sort_unstable();
-                    b.sort_unstable();
-                    a == b
-                })
-                .collect();
-            let first = eq.iter().position(|e| !e).map(|i| moe[i]);
-            println!(
-                "{CLAUSE}: {} {} of {} MoE layers keep mainline's experts, first other layer {first:?}",
-                p.name,
-                eq.iter().filter(|e| **e).count(),
-                eq.len()
-            );
-        }
-        let scale = case.hp.weights_scale;
-        let mut ok = true;
-        let (mut same, mut boundary) = (0, 0);
-        for (p, run) in ml.set.prompts.iter().zip(&ml.runs) {
-            let Some(run) = run else {
-                println!("{CLAUSE}: {} faulted FAIL", p.name);
-                ok = false;
-                continue;
-            };
-            let Some(want) = ml.set.routes(p)? else {
-                println!("{CLAUSE}: {} carries no routes FAIL", p.name);
-                ok = false;
-                continue;
-            };
-            for (((l, r), want), bias) in moe.iter().zip(&run.routes).zip(&want).zip(&case.bias) {
-                let rank = ranked(r, bias);
-                let k = r.ids.len();
-                let own: Vec<u32> = rank[..k].iter().map(|(e, _)| *e).collect();
-                let picks = own == r.ids;
-                let kept: Vec<f64> = r
-                    .ids
-                    .iter()
-                    .map(|&e| f64::from(r.scores[e as usize]))
-                    .collect();
-                let sum = kept.iter().sum::<f64>();
-                let weights = r
-                    .weights
-                    .iter()
-                    .zip(&kept)
-                    .all(|(w, s)| (f64::from(*w) - s / sum * f64::from(scale)).abs() <= 1e-5);
-                let (verdict_of, kept_ok) = match routed(r, want, &rank, eps) {
-                    Routed::Same => {
-                        same += 1;
-                        ("mainline's set".to_string(), true)
-                    }
-                    Routed::Crossed { d, worst } => {
-                        boundary += 1;
-                        (
-                            format!(
-                                "crossed at the cut: {d} of mainline's within the band of the \
-                                 body's 9th, worst gap/band {worst:.3}"
-                            ),
-                            true,
-                        )
-                    }
-                    Routed::Differs {
-                        id,
-                        rank,
-                        gap,
-                        band,
-                    } => (
-                        format!(
-                            "differs: mainline's {id} at the body's rank {rank}, gap {gap:.3e} \
-                             past its band {band:.3e}"
-                        ),
-                        false,
-                    ),
-                };
-                let pass = picks && weights && kept_ok;
-                println!(
-                    "{CLAUSE}: {} layer {l} body {:?} mainline {want:?}: {verdict_of}; the body's \
-                     top 9 of its scores + bias {picks}, weights its renormalized scores x {scale} \
-                     {weights} {}",
-                    p.name,
-                    r.ids,
-                    verdict(pass)
-                );
-                ok &= pass;
-            }
-        }
-        println!(
-            "{CLAUSE}: {same} layer runs mainline's set, {boundary} crossed at the cut {}",
-            verdict(ok)
-        );
-        Ok(ok)
+    fn routing_is_mainlines(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        routing_is_mainlines_t(m, case, "routing_is_mainlines", false)
+    }
+
+    /// The same clause against the real file's set, crossings compared at
+    /// their own cuts.
+    fn routing_is_mainlines_real(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        routing_is_mainlines_t(m, case, "routing_is_mainlines_real", true)
     }
 
     // --------------------------------------------------- fault_word_clean
