@@ -38,9 +38,8 @@
 //! - `completion_ids`: `/completion` at temperature 0, [`N`] tokens, of [`PROSE`] (`/tokenize`)
 //!   and of the chat turn the server's own template renders (`/apply-template`, `/tokenize`),
 //!   each from an empty cache (`cache_prompt: false`), answers the ids the file's body gives
-//!   directly on the same split the server feeds the seat — the Nano's several-id head through
-//!   its batched prompt call and the last id as a step, the Bolt (no batched prefill) every id a
-//!   step — then each answer fed back, or a prefix of them ending at an end-of-generation id.
+//!   directly on the same split the server feeds the seat — a several-id head through the body's
+//!   batched prompt call and the last id as a step — then each answer fed back, or a prefix of them ending at an end-of-generation id.
 //!   FAIL-first: a prefill that skips the first id moves the ids and the clause is red.
 //! - `chat_is_200`: `/v1/chat/completions` of the same turn at temperature 0 and `max_tokens`
 //!   [`N`] is a 200 whose `usage` counts the prompt's ids and the completion's tokens, and whose
@@ -54,9 +53,9 @@
 //!   the held positions (`cache_n` above 0): the shared prefix is the whole held sequence.
 //! - `extension_is_the_held_run`: that resent answer is the body's run of the same split, the
 //!   server stopped: the prose prompt and its answer held, then the answer's last id and [`N`]
-//!   more. The Nano's held split (its batched prompt call, then steps) differs from a fresh one
+//!   more. The held split (the body's batched prompt call, then steps) differs from a fresh one
 //!   pass over the longer prompt by the q8 rounding of the activations at the Q8_0 sites, so the
-//!   split is the reference; the Bolt holds and fresh-runs the same steps, equal exactly.
+//!   split is the reference.
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -289,8 +288,7 @@ mod gate {
     }
 
     /// The prompt `ids` as the server feeds the seat, from where `m` stands: every id but the
-    /// last through the body's prompt call (`feed_head`: the Nano's batched prefill, the Bolt a
-    /// step an id), the last as the first `next` step; then [`N`] greedy ids.
+    /// last through the body's prompt call (`feed_head`: the body's batched prefill), the last as the first `next` step; then [`N`] greedy ids.
     fn seat_answer<B: ChainBody>(
         m: &mut GpuModel<B>,
         ids: &[u32],
@@ -312,13 +310,14 @@ mod gate {
         }
     }
 
-    /// The Bolt's head feed: the body has no batched prefill, so the seat steps every prompt id.
-    /// An empty head is nothing fed.
-    fn bolt_head<B: ChainBody>(m: &mut GpuModel<B>, head: &[u32]) -> Result<(), GpuError> {
-        for &id in head {
-            m.step(&[id])?;
+    /// The Bolt's head feed: the seat's prompt call — one id a step, several the batched
+    /// [`GpuModel::prefill`].
+    fn bolt_head(m: &mut NemotronHMoeModel, head: &[u32]) -> Result<(), GpuError> {
+        match head.len() {
+            0 => Ok(()),
+            1 => m.step(head).map(|_| ()),
+            _ => m.prefill(head).map(|_| ()),
         }
-        Ok(())
     }
 
     /// What the body's model gives directly, the server stopped: for each prompt from an empty
@@ -355,8 +354,8 @@ mod gate {
         /// `nemotron_h`, a Nemotron 3 Nano file: the seat's prefill one `GpuModel::step` over the
         /// ids.
         Nano,
-        /// `nemotron_h_moe`, a Nemotron 3.5 Bolt file: the body has no batched prefill, so the
-        /// seat steps every id.
+        /// `nemotron_h_moe`, a Nemotron 3.5 Bolt file: the seat's prefill the body's batched
+        /// `GpuModel::prefill`.
         Bolt,
     }
 
