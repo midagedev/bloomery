@@ -1,0 +1,29 @@
+# Lever 4's timed question: how much of gemm_iq2xxs's step time does the load-time plane + cp.async
+# staging remove? The ncu read (2026-10-17, card l4-iq2xxs-ncu, A6000, arm gemm_iq2xxs_bolt_up_t448)
+# decided the bind: dram/launch 351 MB = the once-set (ratio 1.02, DRAM 28 % SOL) — bytes already
+# minimal; the bind is the weight path's instruction stream (~18 scalar warp-broadcast global loads +
+# GRID2XXS lookups a warp-step; Compute 72 %, IMMA 7.1 %, LSU 38.3 %, L1TEX 55.1 %; stalls wait 17.5 /
+# not_selected 16.2 / math_pipe_throttle 16.2 / long_scoreboard 10.8). The plane makes every row's
+# half a 16-byte run (load-time repack, byte-neutral), so the weight words stage through
+# cp.async into shared and the warps read v4 — the Q4_K path's shape.
+#
+# Site size (lead 03:47, perf eager s2011, r3 A6000 P=4096): gemm_iq2xxs = 0.80 s of the pass
+# (26.9 %; the earlier nsys 0.49 s was node-trace distortion). Context: both cards need
+# -0.42 s/P=4096 to reach the lcpp-ratio target (A6000 1376 = 0.86x, 3090 1204 = 0.87x).
+#
+# Runner (from the integrated head after the engine flip, not this branch's inert tree):
+#   just time-gpu-gemm gemm_iq2xxs_bolt_up_t448        # the arm, file entry vs plane entry
+#   and the pp4096 A/B in the lead's sitting (ab-decode / depth-gpu prose:4096), both cards.
+# Wall [derived]: arm ~2 min a side under the lease; the sitting's own window prices its rows.
+kind: ab
+question: Does the IQ2_XXS plane (staged weight words) cut the gemm_iq2xxs site's time at Bolt's routed-up shape, and by how much of its 0.80 s?
+term: the bench arm's per-launch time (file entry vs plane entry, interleaved), and the pp4096 pass delta both cards
+unit: %
+predict: -41..-29
+rounds: 4
+sd: 0.6 % AGENTS.md 「Know the ruler」 (same-binary run scatter); the site is 26.9 % of the pass, so the
+  pass row moves -7.8..-11.1 % of its gemm_iq2xxs share under the same ruler
+condition: the arm at 432x2560x1024 top-9 t=448 grid 9900 on the A6000 under the machine lease, interleaved rounds, both entries byte-neutral over the same synthetic stack; the pass rows carry their card and depth
+decide-in: kernel 1.4-1.7x (1.71 -> ~1.0-1.2 ms at the arm) and the site 0.80 -> 0.47-0.57 s, i.e. -0.23..-0.33 s at P=4096 — the second step (the GRID2XXS lookup term, math_pipe_throttle 16.2 %) prices on top
+decide-below: under 1.2x — the weight-path instruction term was not the bind at the launch level; profile the plane entry once before any second step
+decide-above: over 2.0x or the pass moves more than -0.35 s — re-read the site decomposition (a second site moved with it); the paper's -0.4..-0.6 needed the grid term too

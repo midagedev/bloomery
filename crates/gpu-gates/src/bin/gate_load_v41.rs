@@ -655,6 +655,9 @@ mod gate {
             DevWeight::Nvfp4 { .. } => {
                 return Err("an nvfp4 weight: V4.1 has none".into());
             }
+            DevWeight::Iq2Xxs { .. } => {
+                return Err("an iq2_xxs weight: V4.1 has none".into());
+            }
         })
     }
 

@@ -236,7 +236,7 @@ mod gate {
         GemmWeight,
     };
     use bloomery_gpu::hybrid::HOST;
-    use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
+    use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows, repack_iq2xxs};
     use bloomery_gpu::kquant::{Act, act::silu_ik};
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
@@ -402,6 +402,7 @@ mod gate {
             GemmWeight::Q4K
             | GemmWeight::Q5K
             | GemmWeight::Iq2Xxs
+            | GemmWeight::Iq2XxsPlane
             | GemmWeight::Iq3Xxs
             | GemmWeight::Iq4Xs => 32,
             GemmWeight::Q6K | GemmWeight::Q3K => 16,
@@ -473,7 +474,7 @@ mod gate {
                         dec.q.push(low - if high { 0 } else { 4 });
                     }
                 }
-                GemmWeight::Iq2Xxs => {
+                GemmWeight::Iq2Xxs | GemmWeight::Iq2XxsPlane => {
                     // The kernel's epilogue scales by d/8 and keeps `2s + 1`
                     // whole in the integer scale (iq.rs's rule); d/8 is exact
                     // in f64, so both the band and the contract read it.
@@ -679,7 +680,7 @@ mod gate {
             GemmWeight::Q4K => GgmlType::Q4_K,
             GemmWeight::Q5K => GgmlType::Q5_K,
             GemmWeight::Q6K => GgmlType::Q6_K,
-            GemmWeight::Iq2Xxs => GgmlType::IQ2_XXS,
+            GemmWeight::Iq2Xxs | GemmWeight::Iq2XxsPlane => GgmlType::IQ2_XXS,
             GemmWeight::Iq3Xxs => GgmlType::IQ3_XXS,
             GemmWeight::Iq4Xs => GgmlType::IQ4_XS,
         };
@@ -783,8 +784,15 @@ mod gate {
         fn resident_at(&self, st: &Stack<'_>, max_slots: usize) -> Result<Resident, GateError> {
             let stream = self.gpu.stream();
             let n_rows = st.n_exp * st.rows;
-            let mut words = bytes_to_words(&st.bytes);
-            words.resize(words.len().div_ceil(n_rows) * n_rows, 0);
+            let words = if st.ty == GemmWeight::Iq2XxsPlane {
+                // The plane entry's resident words: the stack's file bytes
+                // through the loader's writer, exactly `33·n_sb/2` a row.
+                repack_iq2xxs(&st.bytes, st.n_exp, st.rows, st.k)?
+            } else {
+                let mut words = bytes_to_words(&st.bytes);
+                words.resize(words.len().div_ceil(n_rows) * n_rows, 0);
+                words
+            };
             let cols = words.len() / n_rows;
             let acts = (1..=8)
                 .map(|m| Q8Act::with_k(stream, m, st.k))
@@ -861,7 +869,10 @@ mod gate {
                 (GemmWeight::Q5K, _) | (GemmWeight::Q3K, Input::PerSlot(_)) => return Ok(None),
                 // The i-quant types' diagnostic is `iq_rows_diag`, not a
                 // `_sel` gemv.
-                (GemmWeight::Iq2Xxs, _) | (GemmWeight::Iq3Xxs, _) | (GemmWeight::Iq4Xs, _) => {
+                (GemmWeight::Iq2Xxs, _)
+                | (GemmWeight::Iq2XxsPlane, _)
+                | (GemmWeight::Iq3Xxs, _)
+                | (GemmWeight::Iq4Xs, _) => {
                     return Ok(None);
                 }
                 (GemmWeight::Q3K, Input::Shared(top_k)) => {
@@ -940,7 +951,10 @@ mod gate {
                     .q6s
                     .enqueue_gemv_q6k_sel(stream, &res.w, act, &sel, m, st.rows, &mut y)?,
                 GemmWeight::Q5K => return Err("Q5_K has no _sel gemv".into()),
-                GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => {
+                GemmWeight::Iq2Xxs | GemmWeight::Iq2XxsPlane => {
+                    return Err("an iq2_xxs stack has no _sel gemv here".into());
+                }
+                GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => {
                     return Err("an i-quant stack has no _sel gemv".into());
                 }
             }
@@ -1304,9 +1318,10 @@ mod gate {
                 }
                 GemmWeight::Q6K => sb[208..210].copy_from_slice(&a),
                 GemmWeight::Q3K => sb[108..110].copy_from_slice(&a),
-                GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => {
-                    sb[0..2].copy_from_slice(&a)
-                }
+                GemmWeight::Iq2Xxs
+                | GemmWeight::Iq2XxsPlane
+                | GemmWeight::Iq3Xxs
+                | GemmWeight::Iq4Xs => sb[0..2].copy_from_slice(&a),
             }
         }
         v
@@ -2370,6 +2385,7 @@ mod gate {
         }
         ok &= q38_cases(&dev)?;
         ok &= iq2xxs_cases(&dev)?;
+        ok &= iq2xxs_plane_cases(&dev)?;
         ok &= dense_case(&dev)?;
         ok &= route_table_case(&dev)?;
         ok &= swiglu_case(&dev)?;
@@ -2464,7 +2480,7 @@ mod gate {
     ) -> Result<f64, GateError> {
         let stream = dev.gpu.stream();
         let fmt = match st.ty {
-            GemmWeight::Iq2Xxs => IqFormat::Iq2Xxs,
+            GemmWeight::Iq2Xxs | GemmWeight::Iq2XxsPlane => IqFormat::Iq2Xxs,
             GemmWeight::Iq3Xxs => IqFormat::Iq3Xxs,
             GemmWeight::Iq4Xs => IqFormat::Iq4Xs,
             _ => return Err("iq_rows_diag: not an i-quant stack".into()),
@@ -2716,6 +2732,141 @@ mod gate {
                 input: Input::Shared(4),
             };
             ok &= run_case(dev, &st, 0x74)?;
+        }
+        Ok(ok)
+    }
+
+    /// The IQ2_XXS plane cases (`iq2xxs_plane_*`): the load-time plane
+    /// ([`repack_iq2xxs`]) against the file entry over the same bytes. The
+    /// plane is a relayout, so [`run_case`]'s oracle bands hold on it AND
+    /// every output is bit for bit the file entry's at the same ids and
+    /// columns; the writer refuses by name a `k` that is not a multiple of
+    /// 512 and a non-finite `d`; and the file entry's type is refused on the
+    /// plane's words (its rows are not a file stack's).
+    fn iq2xxs_plane_cases(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if ![
+            "iq2xxs_plane_synth",
+            "iq2xxs_plane_bit",
+            "iq2xxs_plane_refusals",
+        ]
+        .iter()
+        .any(|&n| wanted(n))
+        {
+            return Ok(true);
+        }
+        let (n_exp, rows, k, top_k) = (64usize, 640usize, 2560usize, 9usize);
+        let bytes = synthetic(GemmWeight::Iq2Xxs, n_exp * rows * k / 256, 0x5f1);
+        let plane = Stack {
+            name: "iq2xxs_plane_synth".into(),
+            ty: GemmWeight::Iq2XxsPlane,
+            bytes: std::borrow::Cow::Owned(bytes.clone()),
+            n_exp,
+            rows,
+            k,
+            input: Input::Shared(top_k),
+        };
+        // The oracle case over the plane: the same band as the file entry's.
+        let mut ok = run_case(dev, &plane, 0x5f2)?;
+        if wanted("iq2xxs_plane_bit") {
+            let stream = dev.gpu.stream();
+            let file = Stack {
+                name: "iq2xxs_plane_bit".into(),
+                ty: GemmWeight::Iq2Xxs,
+                bytes: std::borrow::Cow::Owned(bytes),
+                n_exp,
+                rows,
+                k,
+                input: Input::Shared(top_k),
+            };
+            let max = 17 * top_k;
+            let mut rf = dev.resident_at(&file, max)?;
+            let mut rp = dev.resident_at(&plane, max)?;
+            for (n_tok, ri) in [(1usize, 0usize), (17, 2)] {
+                let ids = route_ids(
+                    ROUTINGS[ri],
+                    n_tok,
+                    top_k,
+                    n_exp,
+                    0x5f3 ^ (n_tok as u64) << 8 ^ ri as u64,
+                );
+                let n_cols = file.input.cols(n_tok * top_k);
+                let x = activations(k, n_cols, (0x5f4u32) ^ (n_tok as u32 * 131 + ri as u32));
+                let xd = DeviceBuffer::from_host(stream, &x)?;
+                let yf = dev.run(&file, &mut rf, &xd, &ids)?;
+                let yp = dev.run(&plane, &mut rp, &xd, &ids)?;
+                let differ = yf
+                    .iter()
+                    .zip(&yp)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                println!(
+                    "gemm case=iq2xxs_plane_bit tokens={n_tok} routing={ri} \
+                     bits_differ={differ} of {} {}",
+                    yf.len(),
+                    verdict(differ == 0)
+                );
+                ok &= differ == 0;
+            }
+        }
+        if wanted("iq2xxs_plane_refusals") {
+            // The writer: a k of odd n_sb, and a non-finite d, both by name.
+            let odd = repack_iq2xxs(&[], 16, 128, 768);
+            let pass = odd.is_err();
+            println!(
+                "gemm case=iq2xxs_plane_refusals repack_k_not_512={pass} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+            let (n_exp, rows, k) = (16usize, 128usize, 512usize);
+            let mut bad = synthetic(GemmWeight::Iq2Xxs, n_exp * rows * k / 256, 0x5f5);
+            bad[0..2].copy_from_slice(&0x7e00u16.to_le_bytes());
+            let nan = repack_iq2xxs(&bad, n_exp, rows, k);
+            let pass = nan.is_err();
+            println!(
+                "gemm case=iq2xxs_plane_refusals repack_nonfinite_d={pass} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+            // The file entry's type on the plane's words: refused (a plane
+            // stack's rows are 33·n_sb/2 words, not a file row's).
+            let stream = dev.gpu.stream();
+            let st = Stack {
+                name: "iq2xxs_plane_refusals".into(),
+                ty: GemmWeight::Iq2XxsPlane,
+                bytes: std::borrow::Cow::Owned(synthetic(
+                    GemmWeight::Iq2Xxs,
+                    n_exp * rows * k / 256,
+                    0x5f6,
+                )),
+                n_exp,
+                rows,
+                k,
+                input: Input::Shared(9),
+            };
+            let mut res = dev.resident_at(&st, 9)?;
+            let ids = route_ids(Routing::Uniform, 1, 9, n_exp, 0x5f7);
+            let x = activations(k, st.input.cols(ids.len()), 0x5f8);
+            let xd = DeviceBuffer::from_host(stream, &x)?;
+            dev.run(&st, &mut res, &xd, &ids)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, ids.len() * st.rows)?;
+            let refused = dev.gk.enqueue_gemm(
+                stream,
+                GemmArgs {
+                    ty: GemmWeight::Iq2Xxs,
+                    w: &res.w,
+                    rows_per_expert: st.rows,
+                    act: &res.act,
+                    route: &res.route,
+                    input: GemmInput::Shared { top_k: 9 },
+                    y: &mut y,
+                },
+            );
+            let pass = refused.is_err();
+            println!(
+                "gemm case=iq2xxs_plane_refusals file_type_on_plane_refused={pass} {}",
+                verdict(pass)
+            );
+            ok &= pass;
         }
         Ok(ok)
     }
