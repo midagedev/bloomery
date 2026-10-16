@@ -530,6 +530,31 @@ mod gate {
     }
 
     /// Whether every MoE layer of prompt `p`'s run kept mainline's set.
+    /// How many MoE layers keep mainline's set at the last position, or
+    /// `None` when the set carries no routes.
+    fn kept_routes(
+        ml: &Mainline,
+        p: &refset::nemotron::Prompt,
+        run: &SetRun,
+    ) -> Result<Option<usize>, GateError> {
+        let Some(want) = ml.set.routes(p)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            run.routes
+                .iter()
+                .zip(&want)
+                .filter(|(r, w)| {
+                    let mut a = r.ids.clone();
+                    let mut b = (*w).clone();
+                    a.sort_unstable();
+                    b.sort_unstable();
+                    a == b
+                })
+                .count(),
+        ))
+    }
+
     fn same_routes(
         ml: &Mainline,
         p: &refset::nemotron::Prompt,
@@ -964,12 +989,16 @@ mod gate {
             let line = format!(
                 "{clause}: {} {} tokens, argmax {} mainline {} step {}, cosine {cosine:.6} (floor \
                  {COSINE_FLOOR}), max |delta| {max_delta:.4}; the step path's cosine \
-                 {step_cos:.6}, max |delta| {step_delta:.4}",
+                 {step_cos:.6}, max |delta| {step_delta:.4}; layers keeping mainline's experts: \
+                 run {:?}, step {:?} of {}",
                 p.name,
                 p.n_ids,
                 run.id,
                 argmax(&want),
                 step.id,
+                kept_routes(ml, p, &run)?,
+                kept_routes(ml, p, step)?,
+                run.routes.len(),
             );
             if real || (same_routes(ml, p, step)? && same_routes(ml, p, &run)?) {
                 gated += 1;
