@@ -45,6 +45,7 @@ use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct, GemmArgs, GemmInput, GemmRo
 use crate::head::Head;
 use crate::iq_sel::IqSelKernels;
 use crate::kquant::SelDown;
+use crate::mamba2::Mamba2PassScratch;
 use crate::model::GpuModel;
 use crate::q38::EmbedQ8Args;
 use crate::site::{self, SiteTy};
@@ -83,6 +84,9 @@ pub(super) struct Prompt {
     x: [DeviceBuffer<f32>; 2],
     /// Every other buffer of the pass.
     b: PassBufs,
+    /// What the Mamba-2 pass precomputes: every token's conv outputs and
+    /// per-head `σ`/`dA` ([`Mamba2PassScratch`]), sized to these `rows`.
+    mamba2: Mamba2PassScratch,
 }
 
 /// [`Prompt`]'s buffers beside the residual streams.
@@ -253,6 +257,7 @@ impl Prompt {
                 },
                 split: SplitScratch::new(stream, rows, sh.n_kv)?,
             },
+            mamba2: Mamba2PassScratch::new(stream, sh.mamba, rows)?,
         })
     }
 
@@ -282,6 +287,7 @@ impl Prompt {
             + b.ex.routes.iter().map(|r| r.1.bytes()).sum::<usize>()
             + b.ex.acts.iter().map(|a| a.2.bytes()).sum::<usize>()
             + b.split.num_bytes()
+            + self.mamba2.device_bytes()
     }
 
     /// The word index the pass's ids start at.
@@ -802,6 +808,7 @@ impl Body {
                             y: &mut buf.y,
                             ring: &mut mm.store.ring,
                             state: &mut mm.store.state,
+                            scratch: &mut p.mamba2,
                         },
                     )?;
                     project_rows(

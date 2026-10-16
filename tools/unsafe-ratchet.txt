@@ -287,7 +287,11 @@ gguf 9 2 0
 # @load of the unit's four code words and scale word, the @store of its eight staged code words and two sub-block
 # scales; the step loop's two mma blocks moved into mma_epi32!'s arms unchanged), each with its SAFETY line. Re-derived
 # 1871 -> 1873 at the 2026-10-17 rebase onto main 753df0aea (its 1899 + the entry's 2 blocks).
-gpu 1901 206 10
+# PIN(2026-10-17): gpu 1901 -> 1906 blocks, 206 -> 207 fns, new code, not old code relaxed: the Mamba-2
+# pass's conv pre-pass mamba2_conv_rows (one fn) and the STAGE_T staging rewrite of mamba2_steps, each
+# with its SAFETY line. Re-derived 1873 -> 1878 at the 2026-10-17 rebase onto main (its 1901 + the
+# pass's 5 blocks; the branch's own pin counted three blocks from 1871, the merged tree five).
+gpu 1906 207 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
