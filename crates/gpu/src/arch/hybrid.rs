@@ -382,29 +382,6 @@ impl<'a> Cx<'a> {
 }
 
 impl Site {
-    /// Whether this site's launch reads the q8_1 form ([`SiteTy::reads`]):
-    /// [`Site::project`] quantizes `x` into a `Q8Act` first, and a layer whose
-    /// pre-norm feeds only such a site may fold the two into the fused norm
-    /// launch ([`mamba_layer`]).
-    fn reads_q8_1(&self) -> bool {
-        self.ty.reads() == Form::Q8x128
-    }
-
-    /// The site's one-column q8_1 form with `x` quantized into it, raising
-    /// into layer `layer`'s fault sink — the quantize half of the q8_1 arm of
-    /// [`Site::project`].
-    fn quantize_q8_1<'a>(
-        &self,
-        cx: &Cx<'_>,
-        acts: &'a mut Acts,
-        layer: usize,
-        x: &DeviceBuffer<f32>,
-    ) -> Result<&'a mut Q8Act, GpuError> {
-        let act = acts.q8_1_at(cx.what, self.k, 1)?;
-        cx.gpu.enqueue_quantize_q8_1_layer(x, act, layer)?;
-        Ok(act)
-    }
-
     /// `y = W · act` over the site's already-quantized q8_1 form, raising
     /// into layer `layer`'s fault sink — the gemv half of the q8_1 arm of
     /// [`Site::project`], which a caller that quantized by other means
@@ -448,7 +425,8 @@ impl Site {
                 site::blocks32_gemv(gpu, key, act, y)
             }
             Form::Q8x128 => {
-                let act = self.quantize_q8_1(cx, acts, layer, x)?;
+                let act = acts.q8_1_at(cx.what, self.k, 1)?;
+                gpu.enqueue_quantize_q8_1_layer(x, act, layer)?;
                 self.kgemv(cx, act, layer, y)
             }
         }
@@ -515,7 +493,7 @@ pub(crate) fn mamba_layer(
         sh.mamba.conv_dim(),
         sh.mamba.geom().n_heads,
     );
-    if m.ssm_in.reads_q8_1() {
+    if m.ssm_in.ty.reads() == Form::Q8x128 {
         // The fused launch writes the normed row into `xn` and the q8_1 form
         // `ssm_in`'s gemv reads — the norm + quantize pair it folds, bit for
         // bit; `xn` has no other reader on this path.

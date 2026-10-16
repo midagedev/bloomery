@@ -314,6 +314,24 @@ pub(super) fn moe_layer(
         &mut t.buf.xn,
         fault,
     )?;
+    {
+        // The shared expert's up consumes the norm's (hidden, 1) q8_1 form
+        // here, before the latent's quantize overwrites it: Acts keys forms
+        // by (k, m) alone, and the latent width may equal the hidden, making
+        // the norm's and the latent's forms one buffer (the latent pair's
+        // Q8_0 projections write no q8_1 form).
+        let act = acts.q8_1_at(what, hidden, 1)?;
+        one_expert(
+            cx,
+            k,
+            l,
+            &m.up_shexp,
+            sh.shared_ff,
+            act,
+            &s.zero_id,
+            &mut s.sh_up,
+        )?;
+    }
     k.routers.enqueue(
         stream,
         cx.w.f32_tensor(what, &m.router)?,
@@ -360,20 +378,6 @@ pub(super) fn moe_layer(
         &mut s.moe,
     )?;
     m.latent_up.project(cx, acts, l, &s.moe, &mut t.buf.delta)?;
-    {
-        // The q8_1 form the norm wrote: no launch between writes this width.
-        let act = acts.q8_1_at(what, hidden, 1)?;
-        one_expert(
-            cx,
-            k,
-            l,
-            &m.up_shexp,
-            sh.shared_ff,
-            act,
-            &s.zero_id,
-            &mut s.sh_up,
-        )?;
-    }
     gpu.elem()
         .enqueue_relu_sqr(stream, &s.sh_up, sh.shared_ff, &mut s.sh_act)?;
     {
