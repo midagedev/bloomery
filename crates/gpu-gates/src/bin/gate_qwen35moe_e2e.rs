@@ -3333,7 +3333,7 @@ mod gate {
         // (o6)
         let scratch = GpuModel::<Body35>::placed_arena_bytes(&file, o)?;
         let card = plan.machine.cards.first().ok_or("a plan of no card")?;
-        let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
+        let counted = model::placement::workstation::counted_arena_bytes(card);
         let joined = shape().apart().iter().filter(|&&a| !a).count();
         let t = Instant::now();
         let mut m = GpuModel::<Body35>::open_placed(file, &plan, o, host)?;
@@ -3699,7 +3699,7 @@ mod gate {
         // (o6)
         let scratch = GpuModel::<Body35>::placed_arena_bytes(&file, o)?;
         let card = plan.machine.cards.first().ok_or("a plan of no card")?;
-        let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
+        let counted = model::placement::workstation::counted_arena_bytes(card);
         let t = Instant::now();
         let mut m = GpuModel::<Body35>::open_placed(file, &plan, o, host)?;
         let every = m
