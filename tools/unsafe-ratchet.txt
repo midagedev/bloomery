@@ -279,7 +279,6 @@ gguf 9 2 0
 # entries (bolt-b1-handoff9), ds41_ffn_handoff_9's call into handoff_at and weighted_sum_card's reads and
 # write, and the split of weighted_expert_sum's body into weighted_expert_sum_keep (the plain sum's call
 # into it), each block with its SAFETY line; the fn is weighted_expert_sum_keep itself.
-gpu 1901 207 10
 # PIN(2026-10-17): gpu 1901 -> 1899 blocks, 207 -> 206 fns, the nine-slot card combine folded into
 # the card slots' family (bolt-b1 r2): weighted_sum_card and the weighted_expert_sum_keep split
 # deleted (the plain sum's body back), ds41_ffn_card_acc_9's call into card_acc_at and its write
