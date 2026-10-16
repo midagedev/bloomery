@@ -4881,104 +4881,98 @@ mod tests {
         assert_eq!(status, 200, "{text}");
     }
 
+    /// Every fixture chat template, by name and source (`<name>-chat-template
+    /// .jinja` under `tests/fixtures/`): the tables that pin a template's
+    /// property iterate this list and look their expectation up by name, so a
+    /// fixture missing from a table fails it by name.
+    const FIXTURE_TEMPLATES: &[(&str, &str)] = &[
+        (
+            "qwen3",
+            include_str!("../tests/fixtures/qwen3-chat-template.jinja"),
+        ),
+        (
+            "qwen36",
+            include_str!("../tests/fixtures/qwen36-chat-template.jinja"),
+        ),
+        (
+            "qwen38",
+            include_str!("../tests/fixtures/qwen38-chat-template.jinja"),
+        ),
+        (
+            "glm5",
+            include_str!("../tests/fixtures/glm5-chat-template.jinja"),
+        ),
+        (
+            "v41",
+            include_str!("../tests/fixtures/v41-chat-template.jinja"),
+        ),
+        (
+            "nemotron",
+            include_str!("../tests/fixtures/nemotron-chat-template.jinja"),
+        ),
+        (
+            "nemotron-bolt",
+            include_str!("../tests/fixtures/nemotron-bolt-chat-template.jinja"),
+        ),
+    ];
+
     /// Which of the fixture chat templates need a tool call's `arguments` as
     /// an object ([`needs_object_arguments`]): the ones that walk it
-    /// (Qwen3.6's, Qwen3.8's and Nemotron's `|items`, GLM's `.items()`) do, and the ones
-    /// that take a string (Qwen3's `is string` branch, V4.1's `from_json`) do
-    /// not, nor does a template that prints no arguments.
+    /// (Qwen3.6's, Qwen3.8's, Nemotron's and Bolt's `|items`, GLM's
+    /// `.items()`) do, and the ones that take a string (Qwen3's `is string`
+    /// branch, V4.1's `from_json`) do not, nor does a template that prints no
+    /// arguments. The mock's inline template prints none.
     #[test]
     fn the_fixture_templates_that_need_object_arguments_are_named() {
         let parsed = |source: &str| ChatTemplate::parse(source).expect("a template");
-        let cases = [
-            (
-                "qwen3",
-                include_str!("../tests/fixtures/qwen3-chat-template.jinja"),
-                false,
-            ),
-            (
-                "qwen36",
-                include_str!("../tests/fixtures/qwen36-chat-template.jinja"),
-                true,
-            ),
-            (
-                "qwen38",
-                include_str!("../tests/fixtures/qwen38-chat-template.jinja"),
-                true,
-            ),
-            (
-                "glm5",
-                include_str!("../tests/fixtures/glm5-chat-template.jinja"),
-                true,
-            ),
-            (
-                "v41",
-                include_str!("../tests/fixtures/v41-chat-template.jinja"),
-                false,
-            ),
-            (
-                "nemotron",
-                include_str!("../tests/fixtures/nemotron-chat-template.jinja"),
-                true,
-            ),
-            ("mock", super::testserve::TEMPLATE, false),
-        ];
-        for (name, source, want) in cases {
-            assert_eq!(needs_object_arguments(&parsed(source)), want, "{name}");
+        let want = |name: &str| match name {
+            "qwen3" | "v41" => false,
+            "qwen36" | "qwen38" | "glm5" | "nemotron" | "nemotron-bolt" => true,
+            other => panic!("{other} is not in the object-arguments table"),
+        };
+        for (name, source) in FIXTURE_TEMPLATES {
+            assert_eq!(
+                needs_object_arguments(&parsed(source)),
+                want(name),
+                "{name}"
+            );
         }
+        assert!(
+            !needs_object_arguments(&parsed(super::testserve::TEMPLATE)),
+            "mock"
+        );
     }
 
     /// How each fixture chat template answers `reasoning_effort: "none"`
     /// ([`probe_thinking_off`]), read from its renders: Qwen3's, Qwen3.6's,
-    /// Qwen3.8's, V4.1's and Nemotron's generation prompts change with `enable_thinking`
-    /// ([`ThinkingOff::Switch`]); GLM's always opens `<think>` and changes
-    /// only its effort header ([`ThinkingOff::LowEffort`]); the mock's reads
-    /// neither ([`ThinkingOff::Neither`]). Only the second prints a line at
-    /// bind.
+    /// Qwen3.8's, V4.1's, Nemotron's and Bolt's generation prompts change with
+    /// `enable_thinking` ([`ThinkingOff::Switch`]); GLM's always opens
+    /// `<think>` and changes only its effort header
+    /// ([`ThinkingOff::LowEffort`]); the mock's reads neither
+    /// ([`ThinkingOff::Neither`]). Only the second prints a line at bind.
     #[test]
     fn the_fixture_templates_name_how_they_turn_thinking_off() {
         let parsed = |source: &str| ChatTemplate::parse(source).expect("a template");
-        let cases = [
-            (
-                "qwen3",
-                include_str!("../tests/fixtures/qwen3-chat-template.jinja"),
-                ThinkingOff::Switch,
-            ),
-            (
-                "qwen36",
-                include_str!("../tests/fixtures/qwen36-chat-template.jinja"),
-                ThinkingOff::Switch,
-            ),
-            (
-                "qwen38",
-                include_str!("../tests/fixtures/qwen38-chat-template.jinja"),
-                ThinkingOff::Switch,
-            ),
-            (
-                "glm5",
-                include_str!("../tests/fixtures/glm5-chat-template.jinja"),
-                ThinkingOff::LowEffort,
-            ),
-            (
-                "v41",
-                include_str!("../tests/fixtures/v41-chat-template.jinja"),
-                ThinkingOff::Switch,
-            ),
-            (
-                "nemotron",
-                include_str!("../tests/fixtures/nemotron-chat-template.jinja"),
-                ThinkingOff::Switch,
-            ),
-            ("mock", super::testserve::TEMPLATE, ThinkingOff::Neither),
-        ];
-        for (name, source, want) in cases {
+        let want = |name: &str| match name {
+            "qwen3" | "qwen36" | "qwen38" | "v41" | "nemotron" | "nemotron-bolt" => {
+                ThinkingOff::Switch
+            }
+            "glm5" => ThinkingOff::LowEffort,
+            other => panic!("{other} is not in the thinking-off table"),
+        };
+        for (name, source) in FIXTURE_TEMPLATES {
             let got = probe_thinking_off(&parsed(source)).expect("the probe renders");
-            assert_eq!(got, want, "{name}");
+            assert_eq!(got, want(name), "{name}");
             assert_eq!(
                 got.note().is_some(),
-                want == ThinkingOff::LowEffort,
+                want(name) == ThinkingOff::LowEffort,
                 "{name}: the bind line"
             );
         }
+        let got =
+            probe_thinking_off(&parsed(super::testserve::TEMPLATE)).expect("the probe renders");
+        assert_eq!(got, ThinkingOff::Neither, "mock");
+        assert!(!got.note().is_some(), "mock: the bind line");
     }
 
     /// A template that cannot render the probe's one-message conversation is
@@ -6893,39 +6887,13 @@ mod tests {
     }
 
     /// A `developer` message renders exactly as the same message with its
-    /// role set to `system`, on every fixture template: llama-server's
-    /// mapping, which every template but GPT-OSS's gets. Each template
-    /// renders the system message — none drops or refuses it — so the mapped
-    /// role lands in the prompt's text.
+    /// role set to `system`, on every fixture template
+    /// ([`FIXTURE_TEMPLATES`]): llama-server's mapping, which every template
+    /// but GPT-OSS's gets. Each template renders the system message — none
+    /// drops or refuses it — so the mapped role lands in the prompt's text.
     #[test]
     fn developer_messages_render_as_system_on_every_fixture_template() {
-        let fixtures = [
-            (
-                "qwen38",
-                include_str!("../tests/fixtures/qwen38-chat-template.jinja"),
-            ),
-            (
-                "v41",
-                include_str!("../tests/fixtures/v41-chat-template.jinja"),
-            ),
-            (
-                "glm5",
-                include_str!("../tests/fixtures/glm5-chat-template.jinja"),
-            ),
-            (
-                "qwen3",
-                include_str!("../tests/fixtures/qwen3-chat-template.jinja"),
-            ),
-            (
-                "qwen36",
-                include_str!("../tests/fixtures/qwen36-chat-template.jinja"),
-            ),
-            (
-                "nemotron",
-                include_str!("../tests/fixtures/nemotron-chat-template.jinja"),
-            ),
-        ];
-        for (name, template) in fixtures {
+        for (name, template) in FIXTURE_TEMPLATES {
             let (addr, _state, _ended) =
                 super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(template));
             let with_role = |role: &str| {
@@ -6947,6 +6915,58 @@ mod tests {
                 "{name}: the system message renders: {prompt}"
             );
         }
+    }
+
+    /// The Bolt template's two renders that differ from the Nano's, on one
+    /// conversation (system, user, assistant with `reasoning_content`, user):
+    /// a `chat_template_kwargs` `medium_effort` appends
+    /// `\n\n{reasoning effort: efficient}` to the last user turn alone, and
+    /// the history's reasoning joins as `<think>\n…</think>…` with no newline
+    /// before the close (the Nano's template puts one on each side of it).
+    /// `truncate_history_thinking: false` keeps the history's reasoning at
+    /// all: both templates default it to truncating the turns before the last
+    /// user turn, and serve passes each kwarg through unchanged.
+    #[test]
+    fn the_bolt_template_renders_medium_effort_and_its_reasoning_join() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            templated(include_str!(
+                "../tests/fixtures/nemotron-bolt-chat-template.jinja"
+            )),
+        );
+        let body = json!({
+            "messages": [
+                { "role": "system", "content": "You are terse." },
+                { "role": "user", "content": "First." },
+                { "role": "assistant", "content": "Hi", "reasoning_content": "Thought." },
+                { "role": "user", "content": "Second." },
+            ],
+            "chat_template_kwargs": {
+                "medium_effort": true,
+                "truncate_history_thinking": false,
+            },
+        });
+        let (status, answer) = applied(addr, &body);
+        assert_eq!(status, 200, "{answer}");
+        let prompt = applied_prompt(&answer);
+        assert_eq!(
+            prompt.matches("{reasoning effort: efficient}").count(),
+            1,
+            "the effort suffix lands on one turn: {prompt}"
+        );
+        assert!(
+            prompt.contains("<|im_start|>user\nFirst.<|im_end|>\n"),
+            "the earlier user turn carries no effort suffix: {prompt}"
+        );
+        assert!(
+            prompt
+                .contains("<|im_start|>user\nSecond.\n\n{reasoning effort: efficient}<|im_end|>\n"),
+            "the last user turn ends with the effort suffix: {prompt}"
+        );
+        assert!(
+            prompt.contains("<|im_start|>assistant\n<think>\nThought.</think>Hi<|im_end|>\n"),
+            "the history's reasoning joins with no newline before </think>: {prompt}"
+        );
     }
 
     /// A template whose source carries `<|channel|>` — GPT-OSS's marker —

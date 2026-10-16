@@ -1,0 +1,12 @@
+Source of nemotron-bolt-chat-template.jinja (kept byte-exact; this file records it):
+
+The `tokenizer.chat_template` of NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf in
+https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF (the file sha256
+91d63363e782c8a3d5f4be42816eba8e0d42dd2530bd07a7d0d2dc440599af75, ws:/models/nemotron-3.5-bolt/).
+sha256 6521afc75afb0661e3558e7e6dee5f2d15de8be1c4dece8171935e778ea283f4  nemotron-bolt-chat-template.jinja
+
+The Nano's template (its fixture's source file names it) plus three things: a `render_content`
+macro (images and videos as `<image>` / `<image N><image>` / `<video>` parts), a `medium_effort`
+kwarg that appends `\n\n{reasoning effort: efficient}` to the last user turn, and the history's
+reasoning joined as `<think>\n…</think>…` with no newline before the close. Its tool-call branch
+teaches the same Qwen3-Coder XML markup as the Nano's.

@@ -36,6 +36,30 @@ const QWEN36: &str = include_str!("fixtures/qwen36-chat-template.jinja");
 const GLM5: &str = include_str!("fixtures/glm5-chat-template.jinja");
 const QWEN3: &str = include_str!("fixtures/qwen3-chat-template.jinja");
 const NEMOTRON: &str = include_str!("fixtures/nemotron-chat-template.jinja");
+const NEMOTRON_BOLT: &str = include_str!("fixtures/nemotron-bolt-chat-template.jinja");
+
+/// Every fixture chat template this gate reads, by name and source (`<name>
+/// -chat-template.jinja` under `fixtures/`, V4.1's through `common`): the
+/// seat table and the content-after-span cases look theirs up by name, so a
+/// name a table lacks fails its test by name.
+const FIXTURE_TEMPLATES: &[(&str, &str)] = &[
+    ("v41", V41_TEMPLATE),
+    ("glm5", GLM5),
+    ("qwen3", QWEN3),
+    ("qwen36", QWEN36),
+    ("qwen38", TEMPLATE),
+    ("nemotron", NEMOTRON),
+    ("nemotron-bolt", NEMOTRON_BOLT),
+];
+
+/// The fixture template named `name`; a name [`FIXTURE_TEMPLATES`] lacks
+/// fails by name.
+fn template_named(name: &str) -> &'static str {
+    FIXTURE_TEMPLATES
+        .iter()
+        .find(|&&(n, _)| n == name)
+        .map_or_else(|| panic!("{name} is not a fixture template"), |&(_, s)| s)
+}
 
 /// The template's generation prompt after one user turn, thinking on: the
 /// span is open, the script's first text already reasoning.
@@ -548,34 +572,31 @@ fn hw_qwen_parse_does_not_depend_on_chunking() {
     }
 }
 
-/// Every generative seat's shipped template fixture and the markup the
-/// server reads from it ([`ToolFormat::of_chat_template`]). A new seat's
-/// template must join this table: a seat whose markup has no parser refuses
-/// every chat request that carries tools.
-const SEATS: [(&str, &str, ToolFormat); 6] = [
-    ("v41-chat-template.jinja", V41_TEMPLATE, ToolFormat::Dsml),
-    ("glm5-chat-template.jinja", GLM5, ToolFormat::GlmXml),
-    ("qwen3-chat-template.jinja", QWEN3, ToolFormat::Hermes),
-    ("qwen36-chat-template.jinja", QWEN36, ToolFormat::QwenXml),
-    ("qwen38-chat-template.jinja", TEMPLATE, ToolFormat::QwenXml),
-    (
-        "nemotron-chat-template.jinja",
-        NEMOTRON,
-        ToolFormat::QwenXml,
-    ),
-];
+/// Every generative seat's markup, the parser the server reads from it
+/// ([`ToolFormat::of_chat_template`]) by [`FIXTURE_TEMPLATES`] name: a seat
+/// whose markup has no parser refuses every chat request that carries tools.
+fn seat_format(name: &str) -> ToolFormat {
+    match name {
+        "v41" => ToolFormat::Dsml,
+        "glm5" => ToolFormat::GlmXml,
+        "qwen3" => ToolFormat::Hermes,
+        "qwen36" | "qwen38" | "nemotron" | "nemotron-bolt" => ToolFormat::QwenXml,
+        other => panic!("{other} is not in the seat table"),
+    }
+}
 
 /// Each seat's template types to its parser, none to
 /// [`ToolFormat::Unparsed`].
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_every_seat_template_has_a_parser() {
-    let wrong: Vec<String> = SEATS
+    let wrong: Vec<String> = FIXTURE_TEMPLATES
         .iter()
-        .filter_map(|&(file, source, want)| {
+        .filter_map(|&(name, source)| {
             let t = ChatTemplate::parse(source).expect("template parses");
             let got = ToolFormat::of_chat_template(&t);
-            (got != want).then(|| format!("{file}: {got:?}, want {want:?}"))
+            let want = seat_format(name);
+            (got != want).then(|| format!("{name}: {got:?}, want {want:?}"))
         })
         .collect();
     assert!(wrong.is_empty(), "seat(s) wrong:\n{}", wrong.join("\n"));
@@ -837,21 +858,21 @@ fn hw_qwen_malformed_call_is_an_api_error() {
     }
 }
 
-/// The content after the think span, on every fixture template, as llama.cpp
-/// mainline's chat layer parses the same generation (`tools/ref/chat_parse_ref`
-/// over each template, one user turn, `reasoning_format` auto): the
-/// Qwen3-Coder parser (Qwen3.6, Qwen3.8, Nemotron) drops the whitespace that
-/// opens the content, with the span open, closed by the prompt, or ended by a
-/// call; a span the model opens itself (Qwen3's) drops the whitespace after its
-/// `</think>`; GLM's and V4.1's keep it, as does Qwen3's prompt-closed span.
-/// Whitespace before a call stays in the content on every template.
+/// The content after the think span, on every fixture template
+/// ([`FIXTURE_TEMPLATES`]), as llama.cpp mainline's chat layer parses the same
+/// generation (`tools/ref/chat_parse_ref` over each template, one user turn,
+/// `reasoning_format` auto): the Qwen3-Coder parser (Qwen3.6, Qwen3.8,
+/// Nemotron, Bolt) drops the whitespace that opens the content, with the span
+/// open, closed by the prompt, or ended by a call; a span the model opens
+/// itself (Qwen3's) drops the whitespace after its `</think>`; GLM's and
+/// V4.1's keep it, as does Qwen3's prompt-closed span. Whitespace before a
+/// call stays in the content on every template.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_content_after_the_span_is_mainlines() {
     let call = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
-    // (name, template, thinking, with_tools, out, content, reasoning, calls)
+    // (name, thinking, with_tools, out, content, reasoning, calls)
     type Case = (
-        &'static str,
         &'static str,
         bool,
         bool,
@@ -863,7 +884,6 @@ fn hw_content_after_the_span_is_mainlines() {
     let cases: Vec<Case> = vec![
         (
             "qwen38",
-            TEMPLATE,
             true,
             false,
             "r</think>\n\nHello".into(),
@@ -871,19 +891,29 @@ fn hw_content_after_the_span_is_mainlines() {
             Some("r"),
             0,
         ),
-        (
-            "qwen38",
-            TEMPLATE,
-            false,
-            false,
-            "\nHello".into(),
-            "Hello",
-            None,
-            0,
-        ),
+        ("qwen38", false, false, "\nHello".into(), "Hello", None, 0),
         (
             "qwen36",
-            QWEN36,
+            true,
+            false,
+            "r</think>\n\nHello".into(),
+            "Hello",
+            Some("r"),
+            0,
+        ),
+        ("qwen36", false, false, "\nHello".into(), "Hello", None, 0),
+        (
+            "nemotron",
+            true,
+            false,
+            "r</think>\n\nHello".into(),
+            "Hello",
+            Some("r"),
+            0,
+        ),
+        ("nemotron", false, false, "\nHello".into(), "Hello", None, 0),
+        (
+            "nemotron-bolt",
             true,
             false,
             "r</think>\n\nHello".into(),
@@ -892,28 +922,7 @@ fn hw_content_after_the_span_is_mainlines() {
             0,
         ),
         (
-            "qwen36",
-            QWEN36,
-            false,
-            false,
-            "\nHello".into(),
-            "Hello",
-            None,
-            0,
-        ),
-        (
-            "nemotron",
-            NEMOTRON,
-            true,
-            false,
-            "r</think>\n\nHello".into(),
-            "Hello",
-            Some("r"),
-            0,
-        ),
-        (
-            "nemotron",
-            NEMOTRON,
+            "nemotron-bolt",
             false,
             false,
             "\nHello".into(),
@@ -923,7 +932,6 @@ fn hw_content_after_the_span_is_mainlines() {
         ),
         (
             "glm5",
-            GLM5,
             true,
             false,
             "r</think>\n\nHello".into(),
@@ -933,7 +941,6 @@ fn hw_content_after_the_span_is_mainlines() {
         ),
         (
             "glm5",
-            GLM5,
             false,
             false,
             "\nHello".into(),
@@ -943,7 +950,6 @@ fn hw_content_after_the_span_is_mainlines() {
         ),
         (
             "v41",
-            V41_TEMPLATE,
             true,
             false,
             "r</think>\n\nHello".into(),
@@ -951,19 +957,9 @@ fn hw_content_after_the_span_is_mainlines() {
             Some("r"),
             0,
         ),
-        (
-            "v41",
-            V41_TEMPLATE,
-            false,
-            false,
-            "\nHello".into(),
-            "\nHello",
-            None,
-            0,
-        ),
+        ("v41", false, false, "\nHello".into(), "\nHello", None, 0),
         (
             "qwen3",
-            QWEN3,
             true,
             false,
             "r</think>\n\nHello".into(),
@@ -971,19 +967,9 @@ fn hw_content_after_the_span_is_mainlines() {
             None,
             0,
         ),
+        ("qwen3", false, false, "\nHello".into(), "\nHello", None, 0),
         (
             "qwen3",
-            QWEN3,
-            false,
-            false,
-            "\nHello".into(),
-            "\nHello",
-            None,
-            0,
-        ),
-        (
-            "qwen3",
-            QWEN3,
             true,
             false,
             "<think>r</think>\n\nHello".into(),
@@ -993,7 +979,6 @@ fn hw_content_after_the_span_is_mainlines() {
         ),
         (
             "qwen38",
-            TEMPLATE,
             true,
             true,
             format!("r</think>\n\n{call}"),
@@ -1001,19 +986,9 @@ fn hw_content_after_the_span_is_mainlines() {
             Some("r"),
             1,
         ),
+        ("qwen38", false, true, format!("\n{call}\n"), "", None, 1),
         (
             "qwen38",
-            TEMPLATE,
-            false,
-            true,
-            format!("\n{call}\n"),
-            "",
-            None,
-            1,
-        ),
-        (
-            "qwen38",
-            TEMPLATE,
             false,
             true,
             format!("Let me check.\n{call}"),
@@ -1023,7 +998,6 @@ fn hw_content_after_the_span_is_mainlines() {
         ),
         (
             "qwen36",
-            QWEN36,
             true,
             true,
             format!("r</think>\n\n{call}"),
@@ -1031,19 +1005,9 @@ fn hw_content_after_the_span_is_mainlines() {
             Some("r"),
             1,
         ),
+        ("qwen36", false, true, format!("\n{call}\n"), "", None, 1),
         (
             "qwen36",
-            QWEN36,
-            false,
-            true,
-            format!("\n{call}\n"),
-            "",
-            None,
-            1,
-        ),
-        (
-            "qwen36",
-            QWEN36,
             false,
             true,
             format!("Let me check.\n{call}"),
@@ -1053,7 +1017,25 @@ fn hw_content_after_the_span_is_mainlines() {
         ),
         (
             "nemotron",
-            NEMOTRON,
+            true,
+            true,
+            format!("r</think>\n\n{call}"),
+            "",
+            Some("r"),
+            1,
+        ),
+        ("nemotron", false, true, format!("\n{call}\n"), "", None, 1),
+        (
+            "nemotron",
+            false,
+            true,
+            format!("Let me check.\n{call}"),
+            "Let me check.\n",
+            None,
+            1,
+        ),
+        (
+            "nemotron-bolt",
             true,
             true,
             format!("r</think>\n\n{call}"),
@@ -1062,8 +1044,7 @@ fn hw_content_after_the_span_is_mainlines() {
             1,
         ),
         (
-            "nemotron",
-            NEMOTRON,
+            "nemotron-bolt",
             false,
             true,
             format!("\n{call}\n"),
@@ -1072,8 +1053,7 @@ fn hw_content_after_the_span_is_mainlines() {
             1,
         ),
         (
-            "nemotron",
-            NEMOTRON,
+            "nemotron-bolt",
             false,
             true,
             format!("Let me check.\n{call}"),
@@ -1084,7 +1064,6 @@ fn hw_content_after_the_span_is_mainlines() {
         // C's isspace: the ideographic space stays, the vertical tab and form feed go.
         (
             "nemotron",
-            NEMOTRON,
             false,
             false,
             "\u{3000}Hello".into(),
@@ -1094,7 +1073,6 @@ fn hw_content_after_the_span_is_mainlines() {
         ),
         (
             "nemotron",
-            NEMOTRON,
             false,
             false,
             "\x0B\x0CHello".into(),
@@ -1104,7 +1082,6 @@ fn hw_content_after_the_span_is_mainlines() {
         ),
         (
             "qwen3",
-            QWEN3,
             true,
             false,
             "<think>r</think>\u{3000}Hello".into(),
@@ -1113,8 +1090,18 @@ fn hw_content_after_the_span_is_mainlines() {
             0,
         ),
     ];
+    let no_case: Vec<&str> = FIXTURE_TEMPLATES
+        .iter()
+        .map(|&(name, _)| name)
+        .filter(|name| !cases.iter().any(|c| c.0 == *name))
+        .collect();
+    assert!(
+        no_case.is_empty(),
+        "fixture template(s) with no case: {no_case:?}"
+    );
     let mut wrong = Vec::new();
-    for (name, template, thinking, with_tools, out, content, reasoning, calls) in cases {
+    for (name, thinking, with_tools, out, content, reasoning, calls) in cases {
+        let template = template_named(name);
         let addr = start_templated(Box::new(ScriptedEngine::new(4096, &out)), template);
         let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}],
             "temperature": 0, "chat_template_kwargs": {"enable_thinking": thinking}});
