@@ -526,8 +526,8 @@ mod cli {
             Arch::NemotronH => Ok((file, Family::NemotronH)),
             Arch::NemotronHMoe => Ok((file, Family::NemotronHMoe)),
             other => Err(format!(
-                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen4exp and \
-                 nemotron_h files",
+                "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen4exp, \
+                 nemotron_h and nemotron_h_moe files",
                 path.display(),
                 file.architecture().unwrap_or(other.name())
             )
