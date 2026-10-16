@@ -9,7 +9,9 @@
 //! one sequence. Its prompt runs by the body's prompt call
 //! (`NemotronHModel::prefill`, passes of up to 512 ids: `--prefill auto`, the
 //! default, or `gemm`) or as steps through the captured step chain
-//! (`--prefill pass` or `step`). `--place`, `--seed-depth`, more than one
+//! (`--prefill pass` or `step`); a nemotron_h_moe (Nemotron 3.5 Bolt) file
+//! the same, its prompt call `NemotronHMoeModel::prefill` (passes of up to
+//! its `PASS_ROWS` ids). `--place`, `--seed-depth`, more than one
 //! slot, a draft and the qwen family's expert, K/V and residency levers are
 //! refused by name before the load.
 //!
@@ -403,7 +405,7 @@ mod cli {
     use app::mtp::{MtpBody, MtpDraft, WindowDraft};
     use app::{Session, SessionError};
     use bloomery_gpu::arch::nemotron_h::{Body as BodyNh, PASS_ROWS as NH_PASS_ROWS};
-    use bloomery_gpu::arch::nemotron_h_moe::Body as BodyNhMoe;
+    use bloomery_gpu::arch::nemotron_h_moe::{Body as BodyNhMoe, PASS_ROWS as BOLT_PASS_ROWS};
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for};
     use bloomery_gpu::arch::qwen3moe::{
@@ -506,7 +508,7 @@ mod cli {
         /// prompt run as steps.
         NemotronH,
         /// `nemotron_h_moe` (Nemotron 3.5 Bolt), the same whole-card, one-sequence
-        /// shape, its prompt run as steps.
+        /// shape and prompt paths.
         NemotronHMoe,
     }
 
@@ -790,34 +792,55 @@ mod cli {
         }
     }
 
-    /// The nemotron_h_moe body's one prompt path (`Path` is `()`): its ids run
-    /// as steps through the captured step chain; the body has no prompt call.
+    /// The nemotron_h_moe body's prompt paths, the nemotron_h ones: the body's
+    /// prompt call (`NemotronHMoeModel::prefill`, passes of up to
+    /// [`BOLT_PASS_ROWS`] ids) and the captured step chain.
     impl Prompted for BodyNhMoe {
-        type Path = ();
+        type Path = PromptNh;
 
-        /// `step` or `pass`, or no `--prefill`: the steps.
-        fn path(arg: Option<&str>) -> Result<(), GateError> {
+        /// `auto` (no `--prefill`) and `gemm`: the prompt call; `pass` and
+        /// `step`: the step chain, one id a pass.
+        fn path(arg: Option<&str>) -> Result<PromptNh, GateError> {
             match arg {
-                None | Some("step" | "pass") => Ok(()),
+                None | Some("auto" | "gemm") => Ok(PromptNh::Passes),
+                Some("pass" | "step") => Ok(PromptNh::Steps),
                 Some(o) => Err(format!(
-                    "--prefill {o}: a nemotron_h_moe prompt runs as steps (--prefill step or pass); \
-                     the body has no prompt call"
+                    "--prefill {o}: a nemotron_h_moe prompt runs by the prompt call (auto, gemm) \
+                     or as steps (pass, step)"
                 )
                 .into()),
             }
         }
 
-        fn plan(_: &NemotronHMoeModel, n: usize, _: ()) -> Result<Units, GateError> {
-            Ok(Units {
-                text: format!("step x{n}"),
-                count: n,
-                kind: "step",
-                ubatch_tokens: 0,
+        fn plan(m: &NemotronHMoeModel, n: usize, path: PromptNh) -> Result<Units, GateError> {
+            Ok(match path {
+                PromptNh::Passes => {
+                    let rows = BOLT_PASS_ROWS.min(m.ctx_max());
+                    Units {
+                        text: format!("rows:{rows} x{}", n.div_ceil(rows)),
+                        count: n.div_ceil(rows),
+                        kind: "gemm",
+                        ubatch_tokens: rows,
+                    }
+                }
+                PromptNh::Steps => Units {
+                    text: format!("step x{n}"),
+                    count: n,
+                    kind: "step",
+                    ubatch_tokens: 0,
+                },
             })
         }
 
-        fn prefill(m: &mut NemotronHMoeModel, ids: &[u32], _: ()) -> Result<u32, GateError> {
-            Ok(m.step(ids)?)
+        fn prefill(
+            m: &mut NemotronHMoeModel,
+            ids: &[u32],
+            path: PromptNh,
+        ) -> Result<u32, GateError> {
+            Ok(match path {
+                PromptNh::Passes => m.prefill(ids)?,
+                PromptNh::Steps => m.step(ids)?,
+            })
         }
 
         fn image(_: &NemotronHMoeModel, _: &Units) -> Result<Option<ImageWrite>, GateError> {
@@ -2274,7 +2297,7 @@ mod cli {
         /// ([`paged38`]) and the load plan by the same reading.
         Qwen38(Prompt38, Place, Draft38, (u64, HostRead)),
         NemotronH(PromptNh),
-        NemotronHMoe(()),
+        NemotronHMoe(PromptNh),
     }
 
     /// `--place` on a qwen3moe or qwen35moe file: the placement word
