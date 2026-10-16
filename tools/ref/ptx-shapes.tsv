@@ -155,6 +155,7 @@ generate_ds41   gqa_prefill_flash                        0           0
 generate_ds41   gqa_prefill_flash_256                    0           0
 generate_ds41   gqa_prefill_flash_256_p2                 0           0
 generate_ds41   gqa_prefill_flash_256_p4                 0           0
+generate_ds41   gqa_prefill_flash_256_p4_sel             0           0
 generate_ds41   gqa_prefill_flash_256_q8                 0           0
 generate_ds41   gqa_prefill_flash_q8                     0           0
 generate_ds41   grouped_buckets                          0           0
@@ -255,6 +256,7 @@ generate_ds41   qsa_key_append                           0           0
 generate_ds41   qsa_pool                                 0           0
 generate_ds41   qsa_score                                0           0
 generate_ds41   qsa_topk                                 0           0
+generate_ds41   qsa_topk_bits                            0           0
 generate_ds41   qsa_topk_high                            0           0
 generate_ds41   quantize_gemm32                          0           0
 generate_ds41   qwen35moe_router_fused                   0           0
@@ -377,6 +379,7 @@ gate_e2e   gqa_prefill_flash                        0           0
 gate_e2e   gqa_prefill_flash_256                    0           0
 gate_e2e   gqa_prefill_flash_256_p2                 0           0
 gate_e2e   gqa_prefill_flash_256_p4                 0           0
+gate_e2e   gqa_prefill_flash_256_p4_sel             0           0
 gate_e2e   gqa_prefill_flash_256_q8                 0           0
 gate_e2e   gqa_prefill_flash_q8                     0           0
 gate_e2e   grouped_buckets                          0           0
@@ -473,6 +476,7 @@ gate_e2e   qsa_key_append                           0           0
 gate_e2e   qsa_pool                                 0           0
 gate_e2e   qsa_score                                0           0
 gate_e2e   qsa_topk                                 0           0
+gate_e2e   qsa_topk_bits                            0           0
 gate_e2e   qsa_topk_high                            0           0
 gate_e2e   quantize_gemm32                          0           0
 gate_e2e   qwen35moe_router_fused                   0           0

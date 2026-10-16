@@ -143,7 +143,7 @@
 //!     zero or past the width raising `key_count`: that row NaN, the other bit
 //!     for bit clean; a group that is not twelve heads a key head refused by
 //!     name.
-//! 14. The four new entries compile with no local depot.
+//! 14. The six new entries compile with no local depot.
 //! 15. Deep: the selector and the selected flash at a cache of 262,144 rows
 //!     (Qwen3.8's `context_length`, the most a load serves), synthetic keys,
 //!     no model: one pool launch over every count bit for bit the
@@ -4630,7 +4630,9 @@ mod gate {
             "qsa_pool",
             "qsa_score",
             "qsa_topk",
+            "qsa_topk_bits",
             "gqa_flash_seg_mma_256_p12_sel",
+            "gqa_prefill_flash_256_p4_sel",
         ])
     }
 

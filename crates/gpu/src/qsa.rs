@@ -806,9 +806,7 @@ mod qsa_kernels {
                     // SAFETY: pool < nb <= ctx/4 <= pools and rbase + t < m, so
                     // (rbase + t)·pools + pool < m·pools <= scores.len(); one
                     // lane writes each score.
-                    unsafe {
-                        *scores.get_unchecked_mut((rbase + t) * pools as usize + pool) = s
-                    };
+                    unsafe { *scores.get_unchecked_mut((rbase + t) * pools as usize + pool) = s };
                 }
                 thread::sync_threads();
             }
@@ -1095,27 +1093,25 @@ mod qsa_kernels {
 
         // ---- the `kept`-th order key, `qsa_topk`'s three passes.
         // SAFETY: n <= ctx/4 <= pools, so sbase + n <= m·pools <= scores.len();
-        // FINE is this pass's alone.
-        let hc = unsafe { coarse(scores, sbase, n, fine, tid) };
-        // SAFETY: WSUM and PICK are used by nothing else across the call.
-        let (b1, above1) = unsafe {
-            pick_bin::<COARSE_PER>(hc, HIST_BINS as u32 - 1, need, lane, tid, wsum, pick)
+        // FINE is each count pass's alone, and WSUM and PICK are used by
+        // nothing else across the pick calls.
+        let (prefix, b3, above) = unsafe {
+            let hc = coarse(scores, sbase, n, fine, tid);
+            let (b1, above1) =
+                pick_bin::<COARSE_PER>(hc, HIST_BINS as u32 - 1, need, lane, tid, wsum, pick);
+            let need2 = need - above1;
+            let fc = refine(scores, sbase, n, b1, 11, fine, tid);
+            let (b2, above2) =
+                pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need2, lane, tid, wsum, pick);
+            let need3 = need2 - above2;
+            let prefix = (b1 << 11) | b2;
+            let fc = refine(scores, sbase, n, prefix, 0, fine, tid);
+            let (b3, above3) =
+                pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need3, lane, tid, wsum, pick);
+            (prefix, b3, above1 + above2 + above3)
         };
-        let need2 = need - above1;
-        // SAFETY: as the pass above.
-        let fc = unsafe { refine(scores, sbase, n, b1, 11, fine, tid) };
-        // SAFETY: WSUM and PICK are used by nothing else across the call.
-        let (b2, above2) =
-            unsafe { pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need2, lane, tid, wsum, pick) };
-        let need3 = need2 - above2;
-        let prefix = (b1 << 11) | b2;
-        // SAFETY: as the pass above.
-        let fc = unsafe { refine(scores, sbase, n, prefix, 0, fine, tid) };
-        // SAFETY: WSUM and PICK are used by nothing else across the call.
-        let (b3, above3) =
-            unsafe { pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need3, lane, tid, wsum, pick) };
         let thr = (prefix << 11) | b3;
-        let take_eq = need - (above1 + above2 + above3);
+        let take_eq = need - above;
 
         // ---- the bitmap, in pool order: warp `wid` owns pools `c0 .. c1` (whole
         // words), counts the pools equal to the cut it holds, the block scans

@@ -3312,7 +3312,13 @@ impl FlashGqaPrefill {
         stream: &CudaStream,
         args: GqaPrefillArgs<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_packed("flash_gqa_prefill::enqueue_256_p4", stream, args, PACK_4, None)
+        self.enqueue_packed(
+            "flash_gqa_prefill::enqueue_256_p4",
+            stream,
+            args,
+            PACK_4,
+            None,
+        )
     }
 
     /// [`FlashGqaPrefill::enqueue_256_p4`] over each row's visible keys
@@ -3348,7 +3354,13 @@ impl FlashGqaPrefill {
         stream: &CudaStream,
         args: GqaPrefillArgs<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_packed("flash_gqa_prefill::enqueue_256_p2", stream, args, PACK_2, None)
+        self.enqueue_packed(
+            "flash_gqa_prefill::enqueue_256_p2",
+            stream,
+            args,
+            PACK_2,
+            None,
+        )
     }
 
     /// The packed entries' one launcher: the group refused unless a nonzero
@@ -3391,17 +3403,17 @@ impl FlashGqaPrefill {
             ));
         }
         let packs = n_head / (n_kv * pack);
-        if let Some((bits, words)) = sel {
-            if pack != PACK_4 || words * 128 < ctx || bits.len() < t * words {
-                return Err(GpuError::shape(
-                    what,
-                    format!(
-                        "the bitmap form is the p4 entry's, over words*128 >= ctx and t*words \
-                         bits; got pack={pack} words={words} ctx={ctx} bits.len()={} t={t}",
-                        bits.len()
-                    ),
-                ));
-            }
+        if let Some((bits, words)) = sel
+            && (pack != PACK_4 || words * 128 < ctx || bits.len() < t * words)
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the bitmap form is the p4 entry's, over words*128 >= ctx and t*words \
+                     bits; got pack={pack} words={words} ctx={ctx} bits.len()={} t={t}",
+                    bits.len()
+                ),
+            ));
         }
         let lens = [
             ("q", q.len(), t * n_head * HEAD_256),
