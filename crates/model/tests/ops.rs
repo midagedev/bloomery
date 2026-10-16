@@ -715,6 +715,18 @@ fn hw_group_swiglu_matches_caller_composition() {
     check(&xall, "ne1=6 (prefill decline)");
 }
 
+/// The text of the panic `call` raises, `None` when it returns.
+fn panic_text(call: &mut dyn FnMut()) -> Option<String> {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).err()?;
+    Some(
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default(),
+    )
+}
+
 /// The `_into` entries against the allocating ones: the same pairs, the
 /// weights cut through `ShardTensor` (the file opened as a one-shard split),
 /// written into caller-held blocks, give the allocating entries' outputs and
@@ -723,7 +735,8 @@ fn hw_group_swiglu_matches_caller_composition() {
 /// the caller composition over `qdot::swiglu_clamp` bit for bit, with the
 /// limit set where it bites on both sides of `up`; a relu² combine
 /// (`GroupInput::Relu2`) equals the caller composition over `relu(up)²`, through the wide entry
-/// (`matmul_q_group_cols_into`, ten columns) as well.
+/// (`matmul_q_group_cols_into`, ten columns) as well, and refuses a NaN or an infinity in an up
+/// block by name through every entry.
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_group_into_matches_allocating_entries() {
@@ -783,6 +796,7 @@ fn hw_group_into_matches_allocating_entries() {
     };
     let (mut hits_hi, mut hits_lo, mut hits_silu) = (0usize, 0usize, 0usize);
     let mut wide_relu2 = 0usize;
+    let mut refused = 0usize;
     for (x, label) in [(&x1, "ne1=1"), (&xall, "ne1=6"), (&x10, "ne1=10")] {
         for (mode, arm) in [(Some(true), "deferred"), (Some(false), "pre-pass")] {
             model::ops::set_defer_quant(mode);
@@ -939,9 +953,71 @@ fn hw_group_into_matches_allocating_entries() {
                 }
                 wide_relu2 += 1;
             }
+            // A NaN or an infinity in an up block is refused by name, never turned into zero
+            // by the relu: the last cell of the first expert's up, through every entry.
+            for (bad, what) in [
+                (f32::NAN, "NaN"),
+                (f32::INFINITY, "+inf"),
+                (f32::NEG_INFINITY, "-inf"),
+            ] {
+                let mut ups: Vec<Tensor2> = (0..n)
+                    .map(|i| {
+                        Tensor2::from_vec(
+                            gu[2 * i + 1].ne0,
+                            gu[2 * i + 1].ne1,
+                            gu[2 * i + 1].data.clone(),
+                        )
+                    })
+                    .collect();
+                let last = ups[0].data.len() - 1;
+                ups[0].data[last] = bad;
+                let inputs: Vec<GroupInput> = ups.iter().map(GroupInput::Relu2).collect();
+                let mut entries: Vec<(&str, Box<dyn FnMut() + '_>)> = vec![
+                    (
+                        "allocating",
+                        Box::new(|| {
+                            let _ = matmul_q_group_swiglu(&g, &d_refs, &inputs);
+                        }),
+                    ),
+                    (
+                        "_into",
+                        Box::new(|| {
+                            let (mut od, mut op) = (blank(&downs), blank(&pars));
+                            let _ = matmul_q_group_swiglu_into(
+                                "test", &d_ws, &inputs, &mut od, &mut op,
+                            );
+                        }),
+                    ),
+                ];
+                if x.ne1 > model::ops::DEFER_MAX_COLS {
+                    entries.push((
+                        "wide",
+                        Box::new(|| {
+                            let (mut od, mut op) = (blank(&downs), blank(&pars));
+                            let _ = model::ops::matmul_q_group_cols_into(
+                                "test", &d_ws, &inputs, &mut od, &mut op,
+                            );
+                        }),
+                    ));
+                }
+                for (entry, call) in &mut entries {
+                    let text = panic_text(call);
+                    assert!(
+                        text.as_deref()
+                            .is_some_and(|t| t.contains("relu2: non-finite activation value")),
+                        "relu² with {what} in an up block ({label}, {arm}, {entry}) must panic naming \
+                         the non-finite value, got {text:?}"
+                    );
+                    refused += 1;
+                }
+            }
         }
     }
     model::ops::set_defer_quant(None);
+    assert!(
+        refused == 3 * 2 * (2 + 2 + 3),
+        "every non-finite refusal clause must run: three values, two arms, two entries at ne1 1 and 6, three at 10 (got {refused})"
+    );
     assert!(
         wide_relu2 > 0,
         "the wide entry's relu² clause must run (a column count past DEFER_MAX_COLS)"

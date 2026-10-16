@@ -1746,6 +1746,18 @@ fn relu2_column(layer: &Relu2Layer, x: &[f32], list: &[(u32, f32)], ff: usize) -
     out
 }
 
+/// The text of the panic `call` raises, `None` when it returns.
+fn panic_text(call: &mut dyn FnMut()) -> Option<String> {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).err()?;
+    Some(
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default(),
+    )
+}
+
 /// The relu² form — Bolt's ungated experts — through the common union: on two layers of
 /// different widths and expert counts (IQ2_XXS up and down, the latent 1024 wide), one scratch
 /// made for the wider serves both, and at k = 1, 8, 9 and 64 under both deferral arms the union
@@ -1907,10 +1919,52 @@ fn hw_union_relu2_matches_transcription() {
         );
         println!("relu2 refusal ({what}): {got}");
     }
+    // An up row that overflows to an infinity is refused by name by the combine, never turned
+    // into zero by the relu: columns of ±3e38 against IQ2_XXS rows overflow the f32 dot. The
+    // one-column leg, the claimed union call and the wide union call each refuse it.
+    let hot = |k: usize| {
+        Tensor2::from_vec(
+            embd,
+            k,
+            (0..k * embd)
+                .map(|i| {
+                    if (i / 7) % 2 == 0 {
+                        3.0e38f32
+                    } else {
+                        -3.0e38f32
+                    }
+                })
+                .collect(),
+        )
+    };
+    let nine: Vec<(u32, f32)> = (0..RELU2_USED as u32).map(|e| (e, 0.1)).collect();
+    let overflow = |what: &str, call: &mut dyn FnMut()| {
+        let text = panic_text(call);
+        assert!(
+            text.as_deref()
+                .is_some_and(|t| t.contains("relu2: non-finite activation value")),
+            "{what}: an overflowing up row must panic naming the non-finite value, got {text:?}"
+        );
+        println!("relu2 refusal ({what}): {}", text.unwrap_or_default());
+    };
+    let mut host = HostScratch::new(embd, ff, RELU2_USED).unwrap();
+    overflow("experts_into", &mut || {
+        let mut out = vec![0.0f32; embd];
+        let _ = host_layer.experts_into(src, &hot(1), &nine, &mut out, &mut host);
+    });
+    for k in [1, SMALL_COLS] {
+        let x = hot(k);
+        let lists: Vec<&[(u32, f32)]> = vec![&nine[..]; k];
+        let mut us = UnionScratch::new_routed(embd, ff, SMALL_COLS, RELU2_USED).unwrap();
+        overflow(&format!("experts_union_into k={k}"), &mut || {
+            let mut out = vec![0.0f32; embd * k];
+            let _ = host_layer.experts_union_into(src, &x, &lists, &mut out, &mut us);
+        });
+    }
     println!(
         "PASSED: union relu² — IQ2_XXS up and down, ungated: the union call at k = 1, 8, 9, 64 on \
          two layers of different widths through one scratch made for the wider equal to \
          experts_into and to the transcription on qdot's calls, bit for bit under both deferral \
-         arms and in their dispatches; the widths' refusals by name"
+         arms and in their dispatches; the widths' refusals by name, and an overflowing up row refused by name"
     );
 }

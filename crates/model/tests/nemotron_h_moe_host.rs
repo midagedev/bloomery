@@ -27,9 +27,7 @@ use model::arch::nemotron_h_moe::hparams::{Experts, Hparams, Kind};
 use model::moe::{HostLayer, HostScratch, UnionScratch};
 use model::ops::{self, ExpertForm, Tensor2};
 use model::r8file::R8Source;
-
-/// The box's path of the file.
-const FILE: &str = "/models/nemotron-3.5-bolt/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf";
+use refset::arch::nemotron_h_moe::MODEL as FILE;
 
 /// Bolt's routed list: nine experts a token.
 const USED: usize = 9;
