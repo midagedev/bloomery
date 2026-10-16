@@ -138,6 +138,51 @@ impl RouteOut {
         })
     }
 
+    /// The count of experts the layer routes over.
+    pub(crate) fn n_expert(&self) -> usize {
+        match self {
+            RouteOut::E240(_) => e240::N_EXPERT,
+            RouteOut::E304(_) => e304::N_EXPERT,
+            RouteOut::E368(_) => e368::N_EXPERT,
+            RouteOut::E432(_) => e432::N_EXPERT,
+            RouteOut::E496(_) => e496::N_EXPERT,
+        }
+    }
+
+    /// Enqueue the copy of row `row` of a pass's router results (`probs` of
+    /// [`RouteOut::n_expert`] per row, `ids` and `weights` of [`TOP_K`]) into
+    /// these buffers, so the layer's results read as that row's.
+    pub(crate) fn enqueue_row_from(
+        &mut self,
+        stream: &CudaStream,
+        (probs, ids, weights): (&DeviceBuffer<f32>, &DeviceBuffer<u32>, &DeviceBuffer<f32>),
+        row: usize,
+    ) -> Result<(), GpuError> {
+        let n = self.n_expert();
+        let row_of = |width: usize| crate::tensor::Pitched {
+            width,
+            rows: 1,
+            dev_pitch: width,
+            host_pitch: width,
+        };
+        let (f, u) = (size_of::<f32>(), size_of::<u32>());
+        let (p, i, w) = match self {
+            RouteOut::E240(o) => (&mut o.probs, &mut o.ids, &mut o.weights),
+            RouteOut::E304(o) => (&mut o.probs, &mut o.ids, &mut o.weights),
+            RouteOut::E368(o) => (&mut o.probs, &mut o.ids, &mut o.weights),
+            RouteOut::E432(o) => (&mut o.probs, &mut o.ids, &mut o.weights),
+            RouteOut::E496(o) => (&mut o.probs, &mut o.ids, &mut o.weights),
+        };
+        crate::tensor::dtod_2d(stream, (probs, row * n * f), (p, 0), row_of(n * f))?;
+        crate::tensor::dtod_2d(stream, (ids, row * TOP_K * u), (i, 0), row_of(TOP_K * u))?;
+        crate::tensor::dtod_2d(
+            stream,
+            (weights, row * TOP_K * f),
+            (w, 0),
+            row_of(TOP_K * f),
+        )
+    }
+
     /// The slots' expert ids, in rank order ([`TOP_K`]).
     pub(crate) fn ids(&self) -> &DeviceBuffer<u32> {
         match self {
@@ -231,6 +276,53 @@ impl Routers {
             RouteOut::E496(o) => self
                 .e496
                 .enqueue_router(stream, w, x, bias, scale, o, fault),
+        }
+    }
+
+    /// Enqueue the router of `n_expert` experts for `t` tokens: `x` the
+    /// tokens' normed rows, row-major; the results `probs` ([`RouteOut::n_expert`]
+    /// per row), `ids` and `weights` ([`TOP_K`] per row). A count no instance
+    /// is built for is refused by name. Asynchronous, allocation-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the instances' launcher's inputs and the pass's results (rust-quality R8)"
+    )]
+    pub(crate) fn enqueue_rows(
+        &self,
+        stream: &CudaStream,
+        n_expert: usize,
+        w: &DeviceTensor<f32>,
+        x: &DeviceBuffer<f32>,
+        bias: &DeviceBuffer<f32>,
+        scale: f32,
+        t: usize,
+        (probs, ids, weights): (
+            &mut DeviceBuffer<f32>,
+            &mut DeviceBuffer<u32>,
+            &mut DeviceBuffer<f32>,
+        ),
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        match n_expert {
+            e240::N_EXPERT => self
+                .e240
+                .enqueue_router_rows(stream, w, x, bias, scale, t, probs, ids, weights, fault),
+            e304::N_EXPERT => self
+                .e304
+                .enqueue_router_rows(stream, w, x, bias, scale, t, probs, ids, weights, fault),
+            e368::N_EXPERT => self
+                .e368
+                .enqueue_router_rows(stream, w, x, bias, scale, t, probs, ids, weights, fault),
+            e432::N_EXPERT => self
+                .e432
+                .enqueue_router_rows(stream, w, x, bias, scale, t, probs, ids, weights, fault),
+            e496::N_EXPERT => self
+                .e496
+                .enqueue_router_rows(stream, w, x, bias, scale, t, probs, ids, weights, fault),
+            other => Err(GpuError::shape(
+                "Routers::enqueue_rows",
+                format!("a router of {other} experts: the instances route over {COUNTS:?}"),
+            )),
         }
     }
 }
