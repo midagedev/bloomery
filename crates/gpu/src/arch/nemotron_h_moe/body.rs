@@ -24,6 +24,7 @@ use model::arch::nemotron_h_moe::hparams::{Hparams, Kind};
 use model::arch::nemotron_h_moe::names;
 use std::ops::Range;
 
+use super::prefill::{PASS_ROWS, Prompt};
 use super::router::Routers;
 
 const WHAT: &str = "nemotron_h_moe::Body::load";
@@ -34,14 +35,14 @@ const STEP: &str = "nemotron_h_moe::Body::enqueue_chain";
 const SITE_TYPES: &[SiteTy] = &[SiteTy::Nvfp4, SiteTy::Q8_0];
 
 /// A layer, by the kind the file's per-layer arrays give it.
-enum Layer {
+pub(super) enum Layer {
     Mamba(MambaLayer),
     Attn(AttnLayer),
     Moe(MoeLayer),
 }
 
 impl Layer {
-    fn sites(&self) -> Vec<&Site> {
+    pub(super) fn sites(&self) -> Vec<&Site> {
         match self {
             Layer::Mamba(m) => m.sites().to_vec(),
             Layer::Attn(a) => a.sites().to_vec(),
@@ -53,13 +54,13 @@ impl Layer {
 /// The nemotron_h_moe chain over one sequence on one card.
 pub struct Body {
     /// The Q8_0 token table's name.
-    embed: String,
-    sh: hybrid::Shape,
-    moe: MoeShape,
-    layers: Vec<Layer>,
-    k: Kernels,
-    mk: MoeKernels,
-    q38: Q38Kernels,
+    pub(super) embed: String,
+    pub(super) sh: hybrid::Shape,
+    pub(super) moe: MoeShape,
+    pub(super) layers: Vec<Layer>,
+    pub(super) k: Kernels,
+    pub(super) mk: MoeKernels,
+    pub(super) q38: Q38Kernels,
     acts: Acts,
     s: hybrid::Scratch,
     ms: MoeScratch,
@@ -70,6 +71,8 @@ pub struct Body {
     zeros: Vec<f32>,
     /// The step record's host words, rewritten by every refresh.
     words: Words,
+    /// The prompt pass's buffers ([`Body::enqueue_pass`]).
+    pub(super) prompt: Prompt,
 }
 
 impl GpuModel<Body> {
@@ -181,8 +184,10 @@ impl Body {
             })
             .max()
             .unwrap_or(0);
+        let prompt = Prompt::new(stream, PASS_ROWS.min(ctx), (&sh, moe, hp.n_head), &layers)?;
         let ctx_ = gpu.context();
         Ok(Body {
+            prompt,
             k: Kernels::load(gpu)?,
             mk: MoeKernels {
                 routers: Routers::load(ctx_)?,
@@ -347,6 +352,7 @@ impl ChainBody for Body {
             })
             .sum();
         layers
+            + self.prompt.bytes()
             + self.s.bytes()
             + self.ms.bytes()
             + self.acts.bytes()
