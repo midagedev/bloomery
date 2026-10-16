@@ -130,6 +130,7 @@ generate_ds41   geglu_tanh                               0           0
 generate_ds41   gemm_iq3xxs              0  0
 generate_ds41   gemm_iq4nl               0  0
 generate_ds41   gemm_iq4xs               0  0
+generate_ds41   gemm_nvfp4p                              0           0
 generate_ds41   gemm_q3k                                 0           0
 generate_ds41   gemm_q4k                                 0           0
 generate_ds41   gemm_q5_0p                               0           0
@@ -408,6 +409,7 @@ gate_e2e   geglu_tanh                               0           0
 gate_e2e   gemm_iq3xxs              0  0
 gate_e2e   gemm_iq4nl               0  0
 gate_e2e   gemm_iq4xs               0  0
+gate_e2e   gemm_nvfp4p                              0           0
 gate_e2e   gemm_q3k                                 0           0
 gate_e2e   gemm_q4k                                 0           0
 gate_e2e   gemm_q5_0p                               0           0
