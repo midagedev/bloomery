@@ -24,7 +24,7 @@ use model::arch::nemotron_h_moe::hparams::{Hparams, Kind};
 use model::arch::nemotron_h_moe::names;
 use std::ops::Range;
 
-use super::prefill::{PASS_ROWS, Prompt, derive_q8};
+use super::prefill::{PASS_ROWS, Prompt};
 use super::router::Routers;
 
 const WHAT: &str = "nemotron_h_moe::Body::load";
@@ -184,8 +184,7 @@ impl Body {
             })
             .max()
             .unwrap_or(0);
-        let mut prompt = Prompt::new(stream, PASS_ROWS.min(ctx), (&sh, moe, hp.n_head), &layers)?;
-        prompt.twins = derive_q8(gpu, file, w, &layers)?;
+        let prompt = Prompt::new(stream, PASS_ROWS.min(ctx), (&sh, moe, hp.n_head), &layers)?;
         let ctx_ = gpu.context();
         Ok(Body {
             prompt,
