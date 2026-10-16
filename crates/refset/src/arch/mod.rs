@@ -114,7 +114,7 @@ mod tests {
         );
     }
 
-    /// The fixture families are the table of seven, each the mirror of one real
+    /// The fixture families are the table of eight, each the mirror of one real
     /// family: its name is `fx-` and the real family's, and it takes the real
     /// family's architecture, ik build and consumers, the fixture twin of its
     /// identity, a draft file when the real family has one and no per-file set
@@ -131,6 +131,7 @@ mod tests {
             ("fx-mtp-qwen4exp", 1),
             ("fx-ik-qwen35moe", 3),
             ("fx-ik-deepseek41", 4),
+            ("fx-ref-nemotron-moe-logits", 1),
         ];
         let mut found: Vec<&str> = all()
             .filter(|f| f.name.starts_with("fx-"))
@@ -166,6 +167,7 @@ mod tests {
             let identity = match real.identity {
                 Identity::Manifest => Identity::FixtureManifest,
                 Identity::MtpManifest => Identity::FixtureMtpManifest,
+                Identity::NemotronLogits => Identity::FixtureNemotronLogits,
                 other => panic!("{name}: {other:?} has no fixture twin"),
             };
             assert_eq!(fx.identity, identity, "{name}: identity");

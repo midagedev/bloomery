@@ -1,5 +1,6 @@
 #include "ref_io.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -83,6 +84,16 @@ int main() {
         expect(in.gcount() == (std::streamsize) sizeof(back) && back[0] == 1.5f && back[1] == -0.25f, "read raw back");
     }
     expect(!write_raw(std::string(dir) + "/missing/row.f32", row, 2), "missing directory");
+    const int32_t ids3[3] = {7, 0, 495};
+    const std::string raw_ids = std::string(dir) + "/routes.i32";
+    expect(write_raw(raw_ids, ids3, 3), "write raw ids");
+    {
+        std::ifstream in(raw_ids, std::ios::binary);
+        int32_t back[4] = {};
+        in.read(reinterpret_cast<char *>(back), sizeof(back));
+        expect(in.gcount() == (std::streamsize) sizeof(ids3) && back[0] == 7 && back[1] == 0 && back[2] == 495,
+               "read raw ids back: 12 bytes");
+    }
     if (fails) {
         std::fprintf(stderr, "ref_io_test: %d failed\n", fails);
         return 1;

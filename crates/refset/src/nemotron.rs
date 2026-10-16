@@ -12,8 +12,18 @@
 //! # complete  4  0
 //! ```
 //!
+//! A set dumped on a fixture file ([`Identity::FixtureNemotronLogits`]) also carries the file's `# fixture` line. A
+//! set of a file with routed experts carries one `# route layer` line per MoE layer, in layer order, and a `routes`
+//! column: the experts each of those layers selected at the prompt's last position, as a set (`ggml_top_k` names no
+//! order), i32 little-endian, `k` ids a layer:
+//!
+//! ```text
+//! # route layer  2  240  22
+//! # route layer  3  496  22
+//! ```
+//!
 //! [`LogitsSet::open`] refuses a set that did not finish, one dumped from
-//! another file, and one written by another mainline build.
+//! another file or another generation of the fixture, and one written by another mainline build.
 
 use crate::RefError;
 use crate::columns::{Columns, Row, file_name};
@@ -35,6 +45,19 @@ pub struct Prompt {
     pub ids_file: String,
     /// The logits file under the set's directory (`n_vocab` f32).
     pub logits_file: String,
+    /// The routes file under the set's directory, in a set that has [`LogitsSet::route_layers`].
+    pub routes_file: Option<String>,
+}
+
+/// One `# route layer` line: an MoE layer whose last-position selection a set records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteLayer {
+    /// The layer's index in the file.
+    pub layer: u32,
+    /// The layer's routed-expert count: every id is below it.
+    pub n_expert: u32,
+    /// How many experts the layer selects.
+    pub k: u32,
 }
 
 /// A logits set's manifest, and once opened, its files checked.
@@ -48,6 +71,10 @@ pub struct LogitsSet {
     pub build: Option<String>,
     /// `# arch`.
     pub arch: Option<String>,
+    /// The text after the tab of `# fixture`, in a set dumped on a fixture file.
+    pub fixture: Option<String>,
+    /// The `# route layer` lines, in order; empty in a set of a file without routed experts.
+    pub route_layers: Vec<RouteLayer>,
     /// One row a prompt, in the manifest's order.
     pub prompts: Vec<Prompt>,
     /// Whether the `# complete` trailer is there.
@@ -82,6 +109,8 @@ impl LogitsSet {
             model: None,
             build: None,
             arch: None,
+            fixture: None,
+            route_layers: Vec::new(),
             prompts: Vec::new(),
             complete: false,
         };
@@ -106,6 +135,26 @@ impl LogitsSet {
                 "# model" => set.model = Some(one(&f, &at, "# model\t<path>")?),
                 "# build" => set.build = Some(one(&f, &at, "# build\t<id>")?),
                 "# arch" => set.arch = Some(one(&f, &at, "# arch\t<name>")?),
+                "# fixture" => {
+                    if set.fixture.is_some() {
+                        return Err(RefError::malformed(&at, "a second # fixture line"));
+                    }
+                    set.fixture = Some(one(&f, &at, "# fixture\t<key=value ...>")?);
+                }
+                "# route layer" => {
+                    let layer = route_layer(&f, &at)?;
+                    if set
+                        .route_layers
+                        .last()
+                        .is_some_and(|prev| prev.layer >= layer.layer)
+                    {
+                        return Err(RefError::malformed(
+                            &at,
+                            "route layers must be strictly increasing, with no repeated layer",
+                        ));
+                    }
+                    set.route_layers.push(layer);
+                }
                 "# prompt columns" => {
                     cols = Some(Columns::new("prompt", f[1..].iter().copied()));
                 }
@@ -149,7 +198,10 @@ impl LogitsSet {
 
     /// The set at `dir` read and checked against `family`'s row.
     pub fn open(dir: &Path, family: &Family) -> Result<LogitsSet, RefError> {
-        if !matches!(family.identity, Identity::NemotronLogits) {
+        if !matches!(
+            family.identity,
+            Identity::NemotronLogits | Identity::FixtureNemotronLogits
+        ) {
             return Err(RefError::missing(
                 dir,
                 format!(
@@ -164,8 +216,8 @@ impl LogitsSet {
     }
 
     /// This set against its family's row: the trailer ([`RefError::Unfinished`]),
-    /// the model file ([`RefError::Stale`]), the build and the architecture
-    /// ([`RefError::Foreign`]), then each prompt's ids and logits files.
+    /// the model file and, for a fixture family, the `# fixture` line ([`RefError::Stale`]), the build and the
+    /// architecture ([`RefError::Foreign`]), then each prompt's ids, logits and routes files.
     pub fn check_family(&self, family: &Family) -> Result<(), RefError> {
         if !self.complete {
             return Err(RefError::Unfinished {
@@ -173,6 +225,7 @@ impl LogitsSet {
             });
         }
         family.check_file(&self.dir, "# model", self.model.as_deref())?;
+        family.check_fixture(&self.dir, self.fixture.as_deref())?;
         family.check_build(&self.dir, self.build.as_deref())?;
         family.check_arch(&self.dir, self.arch.as_deref())?;
         if self.prompts.is_empty() {
@@ -182,9 +235,77 @@ impl LogitsSet {
             ));
         }
         for p in &self.prompts {
+            if p.routes_file.is_some() == self.route_layers.is_empty() {
+                return Err(RefError::malformed(
+                    self.dir.join("MANIFEST.tsv").display(),
+                    format!(
+                        "{}: a routes file and `# route layer` lines come together ({} lines, routes file {:?})",
+                        p.name,
+                        self.route_layers.len(),
+                        p.routes_file
+                    ),
+                ));
+            }
             self.check_prompt(p)?;
         }
         Ok(())
+    }
+
+    /// Prompt `p`'s last-position selection, one set of `k` ids per [`LogitsSet::route_layers`] entry, each id below
+    /// its layer's expert count and none twice; `None` in a set without routes.
+    pub fn routes(&self, p: &Prompt) -> Result<Option<Vec<Vec<u32>>>, RefError> {
+        let Some(file) = &p.routes_file else {
+            return Ok(None);
+        };
+        let path = self.dir.join(file);
+        let bytes = std::fs::read(&path).map_err(|e| {
+            RefError::missing(
+                &path,
+                format!("nemotron: cannot read {}: {e}", path.display()),
+            )
+        })?;
+        let want: usize = self.route_layers.iter().map(|l| l.k as usize * 4).sum();
+        if bytes.len() != want {
+            return Err(RefError::malformed(
+                path.display(),
+                format!(
+                    "{file} is {} bytes, the route layers want {want}",
+                    bytes.len()
+                ),
+            ));
+        }
+        let mut ids = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c));
+        let mut out = Vec::with_capacity(self.route_layers.len());
+        for l in &self.route_layers {
+            let mut layer = Vec::with_capacity(l.k as usize);
+            for id in ids.by_ref().take(l.k as usize) {
+                let id = u32::try_from(id)
+                    .ok()
+                    .filter(|&id| id < l.n_expert)
+                    .ok_or_else(|| {
+                        RefError::malformed(
+                            path.display(),
+                            format!(
+                                "layer {}: expert id {id} outside its {} experts",
+                                l.layer, l.n_expert
+                            ),
+                        )
+                    })?;
+                if layer.contains(&id) {
+                    return Err(RefError::malformed(
+                        path.display(),
+                        format!("layer {}: expert {id} selected twice", l.layer),
+                    ));
+                }
+                layer.push(id);
+            }
+            out.push(layer);
+        }
+        Ok(Some(out))
     }
 
     /// Prompt `p`'s last-position logits, `n_vocab` f32, little-endian.
@@ -270,6 +391,7 @@ impl LogitsSet {
     fn check_prompt(&self, p: &Prompt) -> Result<(), RefError> {
         self.ids(p)?;
         self.logits(p)?;
+        self.routes(p)?;
         Ok(())
     }
 }
@@ -281,19 +403,49 @@ fn one(f: &[&str], at: &dyn fmt::Display, want: &str) -> Result<String, RefError
     }
 }
 
+/// `# route layer\t<layer>\t<n_expert>\t<k>`: a layer that selects 1..=n_expert of its experts.
+fn route_layer(f: &[&str], at: &At<'_>) -> Result<RouteLayer, RefError> {
+    let [_, layer, n_expert, k] = f else {
+        return Err(RefError::malformed(
+            at,
+            "want # route layer\t<layer>\t<n_expert>\t<k>",
+        ));
+    };
+    let l = RouteLayer {
+        layer: crate::columns::parse_field(layer, "route layer", at)?,
+        n_expert: crate::columns::parse_field(n_expert, "route n_expert", at)?,
+        k: crate::columns::parse_field(k, "route k", at)?,
+    };
+    if l.k == 0 || l.k > l.n_expert {
+        return Err(RefError::malformed(
+            at,
+            format!(
+                "layer {} selects {} of {} experts",
+                l.layer, l.k, l.n_expert
+            ),
+        ));
+    }
+    Ok(l)
+}
+
 fn prompt_row(r: &Row<'_>, at: &dyn fmt::Display) -> Result<Prompt, RefError> {
     let name = r.text("name")?;
     let ids_file = r.text("ids")?;
     let logits_file = r.text("logits")?;
+    let routes_file = r.opt("routes");
     file_name(name, at)?;
     file_name(ids_file, at)?;
     file_name(logits_file, at)?;
+    if let Some(f) = routes_file {
+        file_name(f, at)?;
+    }
     Ok(Prompt {
         name: name.to_string(),
         n_ids: r.parse("n_ids")?,
         n_vocab: r.parse("n_vocab")?,
         ids_file: ids_file.to_string(),
         logits_file: logits_file.to_string(),
+        routes_file: routes_file.map(str::to_string),
     })
 }
 
@@ -555,5 +707,136 @@ mod tests {
             }
             std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
         });
+    }
+
+    /// The logits family of a file with routed experts (the Bolt's), from the arch table by name.
+    fn routed() -> &'static Family {
+        crate::arch::named("ref-nemotron-moe-logits")
+            .unwrap_or_else(|| panic!("the arch table holds no ref-nemotron-moe-logits"))
+    }
+
+    /// [`routed`]'s set of `write` with `lines` added before the column line, a `routes` column when `column`, and
+    /// `ids` as `p.routes.i32`.
+    fn with_routes(d: &Path, lines: &str, column: bool, ids: &[i32]) -> &'static Family {
+        let fam = routed();
+        write(fam, d, &runs(fam), pin(fam), true);
+        let path = d.join("MANIFEST.tsv");
+        let mut text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+        text = text.replace("# prompt columns", &format!("{lines}# prompt columns"));
+        if column {
+            text = text
+                .replace("\tids\n", "\tids\troutes\n")
+                .replace("\tp.ids\n", "\tp.ids\tp.routes.i32\n");
+        }
+        std::fs::write(&path, text).unwrap_or_else(|e| panic!("{e}"));
+        let bytes: Vec<u8> = ids.iter().copied().flat_map(i32::to_le_bytes).collect();
+        std::fs::write(d.join("p.routes.i32"), bytes).unwrap_or_else(|e| panic!("{e}"));
+        fam
+    }
+
+    const TWO_LAYERS: &str = "# route layer\t2\t240\t2\n# route layer\t3\t496\t2\n";
+
+    /// A set with route layers reads each layer's selection, in the lines' order, `k` ids a layer.
+    #[test]
+    fn a_set_with_routes_reads_each_layers_selection() {
+        let d = dir(routed(), "routes");
+        let fam = with_routes(&d, TWO_LAYERS, true, &[7, 239, 495, 0]);
+        let set = LogitsSet::open(&d, fam).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            set.route_layers
+                .iter()
+                .map(|l| (l.layer, l.n_expert, l.k))
+                .collect::<Vec<_>>(),
+            [(2, 240, 2), (3, 496, 2)]
+        );
+        let routes = set
+            .routes(&set.prompts[0])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(routes, Some(vec![vec![7, 239], vec![495, 0]]));
+        std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// An id at or past its layer's expert count, a negative one, one selected twice in a layer, a file of
+    /// another length, a routes column without route layers, route layers without the column, a layer that
+    /// selects more experts than it has, and a route layer at or below the one before it are each
+    /// malformed, by name.
+    #[test]
+    fn routes_outside_their_layers_are_malformed() {
+        let cases: [(&str, &str, bool, &[i32], &str); 9] = [
+            (
+                "id-past",
+                TWO_LAYERS,
+                true,
+                &[7, 240, 495, 0],
+                "expert id 240 outside its 240 experts",
+            ),
+            (
+                "id-neg",
+                TWO_LAYERS,
+                true,
+                &[7, 1, -1, 0],
+                "expert id -1 outside its 496 experts",
+            ),
+            (
+                "twice",
+                TWO_LAYERS,
+                true,
+                &[7, 7, 495, 0],
+                "layer 2: expert 7 selected twice",
+            ),
+            (
+                "short",
+                TWO_LAYERS,
+                true,
+                &[7, 1, 495],
+                "12 bytes, the route layers want 16",
+            ),
+            (
+                "no-layers",
+                "",
+                true,
+                &[7, 1],
+                "a routes file and `# route layer` lines come together",
+            ),
+            (
+                "no-column",
+                TWO_LAYERS,
+                false,
+                &[7, 1, 495, 0],
+                "a routes file and `# route layer` lines come together",
+            ),
+            (
+                "k-past",
+                "# route layer\t2\t4\t5\n",
+                true,
+                &[0, 1, 2, 3, 0],
+                "layer 2 selects 5 of 4 experts",
+            ),
+            (
+                "layer-twice",
+                "# route layer\t2\t240\t2\n# route layer\t2\t240\t2\n",
+                true,
+                &[7, 1, 7, 1],
+                "route layers must be strictly increasing, with no repeated layer",
+            ),
+            (
+                "layers-reversed",
+                "# route layer\t3\t496\t2\n# route layer\t2\t240\t2\n",
+                true,
+                &[7, 1, 239, 0],
+                "route layers must be strictly increasing, with no repeated layer",
+            ),
+        ];
+        for (tag, lines, column, ids, want) in cases {
+            let d = dir(routed(), tag);
+            let fam = with_routes(&d, lines, column, ids);
+            match LogitsSet::open(&d, fam) {
+                Err(RefError::Malformed { what, .. }) => {
+                    assert!(what.contains(want), "{tag}: {what}")
+                }
+                other => panic!("{tag}: {other:?}"),
+            }
+            std::fs::remove_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        }
     }
 }

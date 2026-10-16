@@ -597,6 +597,101 @@ fn a_node_set_of_another_generation_is_stale() -> Result<(), RefError> {
     remove(&set)
 }
 
+/// A last-position logits set at `dir` (`nemotron_ref`'s): the header lines given (`None` leaves the fixture line
+/// out), one prompt of four logits, and the trailer.
+fn write_logits_set(dir: &Path, arch: &str, model: &str, fixture: Option<&str>, build: &str) {
+    let mut lines = vec![format!("# model\t{model}")];
+    lines.extend(fixture.map(|f| format!("# fixture\t{f}")));
+    lines.extend([
+        format!("# build\t{build}"),
+        format!("# arch\t{arch}"),
+        "# prompt columns\tname\tn_ids\tn_vocab\tids\tlogits".to_string(),
+        "prompt\tp\t2\t4\tp.ids\tp.logits.f32".to_string(),
+        "# complete\t1\t0".to_string(),
+    ]);
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    };
+    write("MANIFEST.tsv", (lines.join("\n") + "\n").as_bytes());
+    write("p.ids", b"0\n3\n");
+    let logits: Vec<u8> = [0.5f32, -1.0, 2.0, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    write("p.logits.f32", &logits);
+}
+
+/// A logits set of the fixture the tree runs passes, with its `# fixture` line read; one of another seed, or
+/// with no line, is stale and names both lines; a set of the real file is stale on `# model` first; two
+/// `# fixture` lines are malformed. The real family takes the same set without a fixture line.
+#[test]
+fn a_logits_set_of_another_generation_is_stale() -> Result<(), RefError> {
+    let root = temp("logits-root")?;
+    let other = temp("logits-other")?;
+    let set = temp("logits-set")?;
+    let u = under("fx-ref-nemotron-moe-logits", "ref-nemotron-moe-logits")?;
+    let (arch, build) = (u.arch, u.build);
+    let first = root_with(&root, arch, &fixture_kvs(1))?;
+    let ours = line(Path::new(&first))?;
+    let theirs = line_of(&other, &fixture_kvs(2))?;
+
+    write_logits_set(&set, arch, &first, Some(body(&ours)), build);
+    let p = open(u.family, &root, &set)?;
+    assert_eq!(
+        (p.dumped_from.as_str(), p.build.as_deref()),
+        (first.as_str(), Some(build))
+    );
+    let read = with_root(&root, || crate::nemotron::LogitsSet::open(&set, u.family))?;
+    assert_eq!(read.fixture.as_deref(), Some(body(&ours)));
+
+    write_logits_set(&set, arch, &first, Some(body(&theirs)), build);
+    let e = open(u.family, &root, &set)
+        .expect_err("another seed")
+        .to_string();
+    assert!(
+        e.contains(&format!("dumped from {theirs}"))
+            && e.contains(&format!("the tree runs {ours}")),
+        "{e}"
+    );
+
+    write_logits_set(&set, arch, &first, None, build);
+    let e = open(u.family, &root, &set).expect_err("no # fixture line");
+    assert!(matches!(e, RefError::Stale { .. }), "{e:?}");
+    assert!(e.to_string().contains("no # fixture line"), "{e}");
+
+    write_logits_set(&set, arch, &u.real_file, None, build);
+    let e = open(u.family, &root, &set)
+        .expect_err("a set of the real file")
+        .to_string();
+    assert!(
+        e.contains(&format!("dumped from {}", u.real_file)) && !e.contains("fixture line"),
+        "{e}"
+    );
+    let real = family("ref-nemotron-moe-logits");
+    let p = real.check_set(&set)?;
+    assert_eq!(p.dumped_from, u.real_file);
+
+    write_logits_set(&set, arch, &first, Some(body(&ours)), build);
+    let manifest = set.join("MANIFEST.tsv");
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| RefError::missing(&manifest, e.to_string()))?;
+    let twice = text.replacen(
+        "# build",
+        &format!("# fixture\t{}\n# build", body(&ours)),
+        1,
+    );
+    std::fs::write(&manifest, twice).map_err(|e| RefError::missing(&manifest, e.to_string()))?;
+    let e = open(u.family, &root, &set)
+        .expect_err("two # fixture lines")
+        .to_string();
+    assert!(e.contains("a second # fixture line"), "{e}");
+
+    remove(&root)?;
+    remove(&other)?;
+    remove(&set)
+}
+
 /// An MTP set at `dir`: the header lines given (`None` leaves a line out),
 /// one block and its trailer.
 fn write_mtp_set(

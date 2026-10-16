@@ -54,7 +54,7 @@ use gguf::Split;
 use model::fixture::KEY_CARD_BUDGET;
 use model::placement::PlanLevers;
 use refset::RefError;
-use refset::family::{Family, Identity};
+use refset::family::Family;
 
 use crate::{GateError, verdict};
 
@@ -789,10 +789,7 @@ pub fn fixture_set_in(
     set: &str,
 ) -> Result<PathBuf, FixtureSetError> {
     let clause = clause.to_string();
-    if !matches!(
-        family.identity,
-        Identity::FixtureManifest | Identity::FixtureMtpManifest
-    ) {
+    if !family.identity.on_fixture() {
         return Err(FixtureSetError::NotFixtureFamily {
             clause,
             family: family.name,
@@ -1070,6 +1067,7 @@ pub fn witness_card(derived: &model::placement::workstation::CardSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use refset::family::Identity;
 
     /// The eight tags are the eight kinds of clause the module doc names, once
     /// each, and every name prints as one word.

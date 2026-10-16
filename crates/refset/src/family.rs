@@ -71,6 +71,23 @@ pub enum Identity {
     /// `MANIFEST.tsv` (`tools/ref/nemotron_ref.cpp`). A prompt row is read by
     /// the `# prompt columns` line; `logits` is that prompt's last position.
     NemotronLogits,
+    /// [`Identity::NemotronLogits`] of a set dumped on a fixture file: `# model`
+    /// names [`crate::fixture::first_shard`], and `# fixture` equals
+    /// [`crate::fixture::line`] of that file.
+    FixtureNemotronLogits,
+}
+
+impl Identity {
+    /// Whether a set of this identity is dumped on a fixture file and carries its `# fixture` line.
+    #[must_use]
+    pub fn on_fixture(self) -> bool {
+        matches!(
+            self,
+            Identity::FixtureManifest
+                | Identity::FixtureMtpManifest
+                | Identity::FixtureNemotronLogits
+        )
+    }
 }
 
 /// The ik build a family's sets must name.
@@ -154,11 +171,7 @@ impl Family {
     #[must_use]
     pub fn path_in(&self, data_dir: &Path, name: &str) -> PathBuf {
         let name = self.resolve.map_or_else(|| name.to_string(), |f| f(name));
-        let fixture = matches!(
-            self.identity,
-            Identity::FixtureManifest | Identity::FixtureMtpManifest
-        );
-        let variant = if fixture {
+        let variant = if self.identity.on_fixture() {
             self.runs()
                 .ok()
                 .and_then(|file| crate::fixture::variant_of(Path::new(&file)).ok().flatten())
@@ -217,10 +230,7 @@ impl Family {
     /// none is stale too — nothing says which generation of the fixture it came
     /// from. A family whose identity is not a fixture one takes any set.
     pub fn check_fixture(&self, set: &Path, stated: Option<&str>) -> Result<(), RefError> {
-        if !matches!(
-            self.identity,
-            Identity::FixtureManifest | Identity::FixtureMtpManifest
-        ) {
+        if !self.identity.on_fixture() {
             return Ok(());
         }
         crate::fixture::check_stated(set, stated, Path::new(&self.runs()?))
@@ -406,7 +416,7 @@ impl Family {
                     build: set.build(),
                 })
             }
-            Identity::NemotronLogits => {
+            Identity::NemotronLogits | Identity::FixtureNemotronLogits => {
                 let set = crate::nemotron::LogitsSet::open(path, self)?;
                 Ok(Provenance {
                     dumped_from: stated(set.model.as_deref()),

@@ -67,13 +67,14 @@ bool read_token_file(const std::string & path, long long count, std::vector<Toke
     return false;
 }
 
-inline bool write_raw(const std::string & path, const float * data, size_t count) {
+// count values of T at data, raw and in host order (f32 rows, i32 ids), into path.
+template <typename T> inline bool write_raw(const std::string & path, const T * data, size_t count) {
     FILE * f = fopen(path.c_str(), "wb");
     if (!f) {
         perror(path.c_str());
         return false;
     }
-    const bool ok = fwrite(data, sizeof(float), count, f) == count;
+    const bool ok = fwrite(data, sizeof(T), count, f) == count;
     if (fclose(f) != 0 || !ok) {
         fprintf(stderr, "%s: short write\n", path.c_str());
         return false;
