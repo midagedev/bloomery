@@ -1,0 +1,75 @@
+# Unitier R4d-a + R4d-b against main 347a86e5: the residency lane's victim fill runs on the NVMe tier's reader as a
+# Victim job ranked after prompt jobs (the base read it on the lane thread through FillBy::Caller), and the step port's
+# ensure is ensure_pinned, its ids held until the leg's reads end. R4d-b removes only a serve seat's refusal, which
+# generate_qwen3moe never ran. Host only (no kernel moved: ptx-scan pairs identical), on the step's dispatch path, so
+# this is the same-lease A/B AGENTS.md asks for. The base is built from 347a86e5 with `just build-decode` in its own
+# worktree and remote dir.
+#
+# Shape: r4b-decode.card's but n 1024 (A6000, plan a, ctx 3072, prose 512, n 1024, BLOOMERY_RESIDENCY=mid-p0-s1, BLOOMERY_DRAFT=off,
+# one slot, BLOOMERY_HOST_ROOM=27G with BLOOMERY_NVTIER_BYTES=20G). [derived, code] Both builds plan the same bytes:
+# R4d moves no placement line, and with BLOOMERY_NVTIER_BYTES set nvme_arena_of returns the given bytes.
+# Why n 1024, not r4b's 96 (the tier engine design, scratchpad keep/tierengine-design.md §4): in the 96 tokens after a P 512
+# prompt the prompt's keep set covers the decode's first touches, so decode fills are about 0 and the victim reader path
+# and the pinned step port run beside no fill traffic. Past that window the arena (S about 141 a layer against about 212
+# tier ids) misses and every fill evicts, so the step's pins and the lane's victims run beside the fills they guard
+# against. ctx 3072 holds P 512 + n 1024.
+#
+# [derived, code] Per token, what R4d does to the decode chain:
+#   1. The step port's pin. ensure_pinned reads its misses on the resident pool, as ensure does (nvtier.rs, the doc of
+#      ensure_pinned), so the decode fills' path and count are the base's. Added per paged layer a step: the pin and
+#      unpin of the call's ids under the books' lock, a Vec of the ids and the guard's box (two allocations).
+#      2..10 us a layer [assumption: one uncontended lock hold and two small allocations], 48 layers: 0.1..0.5 ms of a
+#      72..92 ms token, -0.7..-0.1 %. With fills the pin is taken by the same call that fills, so it adds no wait.
+#   2. The victim fill on the reader. A victim is filled before the lane's window opens (the flip's order); the
+#      lane runs beside the step, and a late flip is the only way it reaches the chain. r4da measured (real gate_nvtier,
+#      untimed, the gate plan) late 0 over 552 flips, victim wait 2.41 ms a victim against the lane's 156..217 ms
+#      issue-to-boundary window (excl-decode.card:31). The reader's 16 threads are idle in decode (no prompt job), so a
+#      victim job takes no pool thread from the step. 0.
+#   3. A claim of a victim can no longer take a slot the step pinned. In the base it could, and the step then read a
+#      re-filled slot: a correctness window, not a rate term. 0.
+#   ~~Net -0.7..+0.0 %, central -0.3.~~ Struck 2026-10-11: term 2 missed the base's read path. Base 347a86e5
+#   nvtier.rs:1598-1621 (open_read) reads a promotion the arena has not filled through the model file's mapping
+#   (mapping_reads), so its lane faults pages in beside the step's fills. R4d-a fills it on the reader first. Measured
+#   in the void sitting below, per row, every round: majflt base 45k-133k against R4d-a 27-1.7k; drive_read_bytes base
+#   82-349 GB against R4d-a 40-93 GB. The rate term this moves is not measured: no speed claim until a residency-off or
+#   fixed-id-stream decode card reads it.
+#
+# Sitting 2026-10-11 (6 rounds, A6000): VOID, no verdict. [other-busy] 5/12, and the greedy text differed per row inside
+#   each arm (distinct_tokens 142-403 and 103-414): under residency a late flip decides whether an expert runs on the
+#   card or the host, so the bits follow the lane's timing and "both arms print the same greedy tokens" cannot hold.
+#   Realized paired sd about 22 %. card.py's fail line is not a reading.
+# Priced 0: the reader's wake of all 16 threads per job (notify_all), which a victim job now pays and the lane thread's
+# own read did not; a decode token's victims are few (r4da: 553 jobs over 96 steps, about 5.8 a token), each a
+# wake of idle threads off the chain.
+#
+# Ruler: sd 2.6 % (excl-decode.card's, the residency pair). A noninf card: the changed arm may lose at most the
+# margin. At 6 rounds, paired, h_p = t(0.975, 5) x 2.6 x sqrt(2/6) = 3.86 % (card.py check); the band's lower edge
+# -0.7 less h_p is -4.56 %, inside the 5 % margin.
+#
+# Runner (the lead; output to a file first):
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/r4d-decode.card BLOOMERY_GEN_CTX=3072 BLOOMERY_DRAFT=off BLOOMERY_DECODE_N=1024 BLOOMERY_AB_LOAD=arm BLOOMERY_AB_WARMUP=1' \
+#   BLOOMERY_AB_ROUNDS=6 just depth-gpu-qwen4exp \
+#     bin:/root/repo/bloomery-r4d-base/target/release/generate_qwen3moe:prose:512@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=20G \
+#     prose:512@BLOOMERY_RESIDENCY=mid-p0-s1,BLOOMERY_HOST_ROOM=27G,BLOOMERY_NVTIER_BYTES=20G
+kind: noninf
+question: on a paged plan with an arena and residency set, do the victim fill on the tier's reader and the pinned step
+  port leave the plain decode no slower than the base by more than the margin?
+term: decode tok/s @ n=1024, prose 512 (the corpus's first 512 ids), ctx 3072, A6000, plan a at the BLOOMERY_HOST_ROOM
+  27G with BLOOMERY_NVTIER_BYTES=20G (a 20 GiB arena), BLOOMERY_RESIDENCY=mid-p0-s1, BLOOMERY_DRAFT=off, one slot; this
+  tree's generate_qwen3moe (7cec21ad, R4d-a) against 347a86e5's, (ours - base) / base, paired by round
+unit: %
+predict: -0.7..0
+rounds: 6
+sd: 2.6 % rig-log 09-30#q38seed-ab, the residency-only P 512 pair, as excl-decode.card and r4b-decode.card
+margin: 5 % <the derivation allows under 1 %; at the residency pair's scatter a tighter margin needs 13+ rounds a
+  side, and the card exists to catch a lateness or contention term the derivation missed, which would be large>
+condition: one lease; both builds with their Cargo.lock current; every arm a fresh process (BLOOMERY_AB_LOAD=arm),
+  the order rotated each round, one warm-up round discarded; no [cpu-busy], [other-busy] or [cold] row and no Xid in
+  either witness. Both arms' plan lines and nvtier budget= and paged= fields are equal, each arm's `residency lever`
+  record names mid-p0-s1; both arms print the same greedy tokens (R4d moves no bit). Read beside the ratio, not
+  judged: each arm's residency late count and nvtier fills
+decide-in: land R4d with the row (decode tok/s both arms, the ratio and its interval) in rig-log; no decode claim
+decide-below: a loss past the margin stops the landing: read the arms' late counts first (a late flip is term 2's
+  failure), then the step's lock waits (a profile of the ours arm, perf -e cpu-clock --time) before any re-derivation
+decide-above: a gain past the band is a term the derivation missed: read the late counts and fills of both arms
+  before it is claimed
