@@ -27,6 +27,15 @@
 //! stack as a diagnostic, a NaN `d` super-block's outputs NaN, and
 //! `from_ggml`'s acceptance of the two types beside its refusal of IQ2_XS.
 //!
+//! The Bolt IQ2_XXS cases (`iq2xxs_*`): a synthetic stack of a routed gate
+//! shape (64 experts of 640 rows, K 2560, top 9, every slot its token's
+//! column) and a 400-row ragged slab at K 1280 (odd super-blocks a row: each
+//! row padded to whole words, every other super-block at 2 mod 4), each under
+//! the four routings — with the same checks and the T = 1 outputs against the
+//! `iq2_xxs_rows` row core as a diagnostic, a NaN `d` super-block's outputs
+//! NaN, `from_ggml`'s acceptance of IQ2_XXS, and the host API's refusal of
+//! IQ3_XXS on the stack.
+//!
 //! Checks per run:
 //! 1. Every output of every slot written (`y` starts at a sentinel).
 //! 2. Every checked output within its derived band of the f64 reference:
@@ -209,7 +218,7 @@ mod gate {
         open_model, verdict,
     };
     use cuda_core::DeviceBuffer;
-    use gguf::iq_tables::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL};
+    use gguf::iq_tables::{IQ2XXS_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL};
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
     use model::arch::models::shape::{MoeShape, rules};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -361,7 +370,8 @@ mod gate {
         let n_sb = k / 256;
         let bpb = ty.block_bytes();
         let grp = match ty {
-            GemmWeight::Q4K | GemmWeight::Q5K | GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => 32,
+            GemmWeight::Q4K | GemmWeight::Q5K | GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs
+            | GemmWeight::Iq4Xs => 32,
             GemmWeight::Q6K | GemmWeight::Q3K => 16,
         };
         let mut dec = Dec {
@@ -429,6 +439,34 @@ mod gate {
                         let low = ((b[32 + 32 * n + l] >> (2 * j)) & 3) as i8;
                         let high = b[l] & (1 << (4 * n + j)) != 0;
                         dec.q.push(low - if high { 0 } else { 4 });
+                    }
+                }
+                GemmWeight::Iq2Xxs => {
+                    // The kernel's epilogue scales by d/8 and keeps `2s + 1`
+                    // whole in the integer scale (iq.rs's rule); d/8 is exact
+                    // in f64, so both the band and the contract read it.
+                    dec.d.push(f16(&b[0..2]) / 8.0);
+                    dec.dmin.push(0.0);
+                    for c in 0..8 {
+                        let aux = u32::from_le_bytes([
+                            b[6 + 8 * c],
+                            b[7 + 8 * c],
+                            b[8 + 8 * c],
+                            b[9 + 8 * c],
+                        ]);
+                        dec.sc.push(2 * (aux >> 28) as i32 + 1);
+                        let idx = |l: usize| usize::from(b[2 + 8 * c + l]);
+                        let signs = |l: usize| KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                        for v in 0..32 {
+                            let (l, j) = (v / 8, v % 8);
+                            let g = i32::from(IQ2XXS_GRID[idx(l)].to_le_bytes()[j]);
+                            let sgn = if signs(l) & KMASK_IQ2XS[j] != 0 {
+                                -1
+                            } else {
+                                1
+                            };
+                            dec.q.push((g * sgn) as i8);
+                        }
                     }
                 }
                 GemmWeight::Iq3Xxs => {
@@ -609,6 +647,7 @@ mod gate {
             GemmWeight::Q4K => GgmlType::Q4_K,
             GemmWeight::Q5K => GgmlType::Q5_K,
             GemmWeight::Q6K => GgmlType::Q6_K,
+            GemmWeight::Iq2Xxs => GgmlType::IQ2_XXS,
             GemmWeight::Iq3Xxs => GgmlType::IQ3_XXS,
             GemmWeight::Iq4Xs => GgmlType::IQ4_XS,
         };
@@ -790,7 +829,9 @@ mod gate {
                 (GemmWeight::Q5K, _) | (GemmWeight::Q3K, Input::PerSlot(_)) => return Ok(None),
                 // The i-quant types' diagnostic is `iq_rows_diag`, not a
                 // `_sel` gemv.
-                (GemmWeight::Iq3Xxs, _) | (GemmWeight::Iq4Xs, _) => return Ok(None),
+                (GemmWeight::Iq2Xxs, _)
+                | (GemmWeight::Iq3Xxs, _)
+                | (GemmWeight::Iq4Xs, _) => return Ok(None),
                 (GemmWeight::Q3K, Input::Shared(top_k)) => {
                     // One launch per token: every slot of it reads the one column.
                     for t in 0..n_slots / top_k {
@@ -867,7 +908,7 @@ mod gate {
                     .q6s
                     .enqueue_gemv_q6k_sel(stream, &res.w, act, &sel, m, st.rows, &mut y)?,
                 GemmWeight::Q5K => return Err("Q5_K has no _sel gemv".into()),
-                GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => {
+                GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => {
                     return Err("an i-quant stack has no _sel gemv".into());
                 }
             }
@@ -1231,7 +1272,9 @@ mod gate {
                 }
                 GemmWeight::Q6K => sb[208..210].copy_from_slice(&a),
                 GemmWeight::Q3K => sb[108..110].copy_from_slice(&a),
-                GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => sb[0..2].copy_from_slice(&a),
+                GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => {
+                    sb[0..2].copy_from_slice(&a)
+                }
             }
         }
         v
@@ -1243,6 +1286,7 @@ mod gate {
     /// when the dump is not there.
     fn synth_blocks(ty: GemmWeight, n_sb_total: usize, seed: u64) -> Vec<u8> {
         let name = match ty {
+            GemmWeight::Iq2Xxs => "iq2_xxs",
             GemmWeight::Iq3Xxs => "iq3_xxs",
             GemmWeight::Iq4Xs => "iq4_xs",
             _ => return synthetic(ty, n_sb_total, seed),
@@ -2199,6 +2243,7 @@ mod gate {
             ok &= v41_cases(&dev, dims)?;
         }
         ok &= q38_cases(&dev)?;
+        ok &= iq2xxs_cases(&dev)?;
         ok &= dense_case(&dev)?;
         ok &= route_table_case(&dev)?;
         ok &= swiglu_case(&dev)?;
@@ -2292,6 +2337,7 @@ mod gate {
     ) -> Result<f64, GateError> {
         let stream = dev.gpu.stream();
         let fmt = match st.ty {
+            GemmWeight::Iq2Xxs => IqFormat::Iq2Xxs,
             GemmWeight::Iq3Xxs => IqFormat::Iq3Xxs,
             GemmWeight::Iq4Xs => IqFormat::Iq4Xs,
             _ => return Err("iq_rows_diag: not an i-quant stack".into()),
@@ -2463,6 +2509,85 @@ mod gate {
                 input: Input::Shared(4),
             };
             ok &= run_case_at(dev, &st, 0x73, &TOKENS)?;
+        }
+        Ok(ok)
+    }
+
+    /// The Bolt IQ2_XXS cases: a synthetic stack of a routed gate shape — 64
+    /// experts of 640 rows, K 2560, top 9 (Bolt's), every slot its token's
+    /// column — and a stack of 400 rows an expert (a partial 128-row slab) at
+    /// K 1280, whose odd five super-blocks a row pad each row to 332 bytes and
+    /// put every other super-block at 2 mod 4. Each runs the four routings at
+    /// [`TOKENS`] (the top 9 keeps 4096 tokens inside the route table's cap),
+    /// the T = 1 outputs against the i-quant row core (`iq2_xxs_rows`), a NaN
+    /// `d` super-block's outputs NaN, `from_ggml`'s acceptance of the type, and
+    /// the host API's refusal of IQ3_XXS on the stack.
+    fn iq2xxs_cases(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if !["iq2xxs_gate_synth", "iq2xxs_ragged_rows_synth"]
+            .iter()
+            .any(|&n| wanted(n))
+        {
+            return Ok(true);
+        }
+        let accept = GemmWeight::from_ggml(GgmlType::IQ2_XXS).is_ok_and(|t| t == GemmWeight::Iq2Xxs);
+        println!(
+            "gemm case=iq2xxs_types from_ggml(iq2_xxs)={} {}",
+            if accept { "accepted" } else { "REFUSED" },
+            verdict(accept)
+        );
+        let mut ok = accept;
+        {
+            let (n_exp, rows, k, top_k) = (64usize, 640usize, 2560usize, 9usize);
+            let st = Stack {
+                name: "iq2xxs_gate_synth".into(),
+                ty: GemmWeight::Iq2Xxs,
+                bytes: synthetic(GemmWeight::Iq2Xxs, n_exp * rows * k / 256, 0x5f1).into(),
+                n_exp,
+                rows,
+                k,
+                input: Input::Shared(top_k),
+            };
+            let mut res = dev.resident_at(&st, TOKENS[TOKENS.len() - 1] * top_k)?;
+            ok &= run_case(dev, &st, 0x5f2)?;
+            let diag = iq_rows_diag(dev, &st, &mut res, 0x5f1)?;
+            println!(
+                "gemm case=iq2xxs_gate_synth rows_diag_max_rel_diff_vs_iq_rows={diag:.3e} (diagnostic)"
+            );
+            ok &= iq_nan_d(dev, &st, 0x5f1)?;
+            // The host API refuses another i-quant type on this stack.
+            let stream = dev.gpu.stream();
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, top_k * rows)?;
+            let refused = dev.gk.enqueue_gemm(
+                stream,
+                GemmArgs {
+                    ty: GemmWeight::Iq3Xxs,
+                    w: &res.w,
+                    rows_per_expert: rows,
+                    act: &res.act,
+                    route: &res.route,
+                    input: GemmInput::Shared { top_k },
+                    y: &mut y,
+                },
+            );
+            let pass = refused.is_err();
+            println!(
+                "gemm case=iq2xxs_gate_synth other_iq_type_on_stack_refused={pass} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        if wanted("iq2xxs_ragged_rows_synth") {
+            let (n_exp, rows, k) = (16usize, 400usize, 1280usize);
+            let st = Stack {
+                name: "iq2xxs_ragged_rows_synth".into(),
+                ty: GemmWeight::Iq2Xxs,
+                bytes: synthetic(GemmWeight::Iq2Xxs, n_exp * rows * k / 256, 0x5f4).into(),
+                n_exp,
+                rows,
+                k,
+                input: Input::Shared(4),
+            };
+            ok &= run_case(dev, &st, 0x74)?;
         }
         Ok(ok)
     }
