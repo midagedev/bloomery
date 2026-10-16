@@ -1861,21 +1861,11 @@ mod cli {
                 }
             }
             Chosen::NemotronHMoe(path) => {
-                let m = open_nemotron(
-                    "nemotron_h_moe",
-                    |g| NemotronHMoeModel::open(g, file, ctx),
-                    (ctx, mode),
-                    t,
-                )?;
+                let m = open_nemotron(|g| NemotronHMoeModel::open(g, file, ctx), (ctx, mode), t)?;
                 drive(m, &run, path, &arms, listed, sync)
             }
             Chosen::NemotronH(path) => {
-                let m = open_nemotron(
-                    "nemotron_h",
-                    |g| NemotronHModel::open(g, file, ctx),
-                    (ctx, mode),
-                    t,
-                )?;
+                let m = open_nemotron(|g| NemotronHModel::open(g, file, ctx), (ctx, mode), t)?;
                 drive(m, &run, path, &arms, listed, sync)
             }
             Chosen::Qwen38(path, place, draft, room) => match draft {
@@ -2345,7 +2335,6 @@ mod cli {
     /// [`record::LOAD_NEMOTRON`], `arch` named) and, in graph mode, its
     /// [`record::CAPTURE`].
     fn open_nemotron<B: ChainBody>(
-        arch: &str,
         open: impl FnOnce(Gpu) -> Result<GpuModel<B>, bloomery_gpu::GpuError>,
         (ctx, mode): (usize, StepMode),
         t: Instant,
@@ -2358,7 +2347,7 @@ mod cli {
             0
         };
         Record::new(&record::LOAD_NEMOTRON)
-            .w("arch", arch)
+            .w("arch", B::arch().name())
             .u("resident_bytes", m.resident_bytes())
             .u("ctx", ctx)
             .u("slots", 1)
