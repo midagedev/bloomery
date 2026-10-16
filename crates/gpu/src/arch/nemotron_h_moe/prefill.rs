@@ -4,7 +4,8 @@
 //! - a projection is its site's gemv over column runs of at most
 //!   [`COLS`] rows ([`project_rows`]): Q8_0 `q8_0_gemv_mcol` on the f32 rows,
 //!   NVFP4 `nvfp4_gemv` on the run's q8_1 columns, each weight read once a
-//!   run; past [`COLS`] rows a Q8_0 site is one 32-value GEMM over the pass;
+//!   run; past [`COLS`] rows a Q8_0 site is one 32-value GEMM over the pass,
+//!   and an NVFP4 site the same GEMM over its Q8_0 twin ([`derive_q8`]);
 //! - a Mamba-2 layer is one pass over its tokens
 //!   ([`Mamba2Kernels::enqueue_steps`], bit for bit the steps' scan);
 //! - an attention layer appends the pass's K/V rows to its planes and runs
@@ -33,10 +34,11 @@ use super::moe::{MoeLayer, MoeShape};
 use super::router::Routers;
 use super::router::{COUNTS, TOP_K};
 use crate::arch::hybrid::{RowBuffers, Shape, Site, norm_rows, residual_rows};
+use crate::fault::FaultSink;
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{GROUP_16, GqaArgs, HEAD};
 use crate::gemm::Gemm32Kernels;
-use crate::gemm::{GemmInput, GemmRoute};
+use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::head::Head;
 use crate::iq_sel::IqSelKernels;
 use crate::kquant::SelDown;
@@ -45,10 +47,12 @@ use crate::q38::EmbedQ8Args;
 use crate::site::{self, SiteTy};
 use crate::site::{KGemvKernels, SiteWeight, WideActs, WideKernels};
 use crate::tensor::{Pitched, WindowMut, dtod_2d};
+use crate::weights::q8_0_planes;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act, Window, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::GgmlType;
+use gguf::quant::{Q8Block, dequant_row, f32_to_f16_bits};
+use gguf::{GgmlType, Split};
 
 const WHAT: &str = "nemotron_h_moe::prefill";
 
@@ -116,6 +120,16 @@ struct PassBufs {
     slots: Vec<(usize, usize, Q8Act)>,
     /// The projections' forms ([`project_rows`]).
     arms: Arms,
+    /// The experts' GEMM forms ([`experts_gemm`]).
+    ex: ExpertArms,
+}
+
+/// What the experts' GEMMs read past [`COLS`] rows.
+struct ExpertArms {
+    /// One routed table a layer expert count, `TOP_K` slots a row.
+    routes: Vec<(usize, GemmRoute)>,
+    /// The q8_1 blocks of 128 the GEMMs read: `(k, columns, form)`.
+    acts: Vec<(usize, usize, GemmAct)>,
 }
 
 /// What a projection over the pass's rows reads beside its f32 rows.
@@ -171,13 +185,33 @@ impl Prompt {
             want(sh.hidden, rows)?;
             want(moe.shared_ff, rows)?;
         }
+        let mut ex = ExpertArms {
+            routes: Vec::new(),
+            acts: Vec::new(),
+        };
+        for m in moes() {
+            let n = m.route.n_expert();
+            if !ex.routes.iter().any(|r| r.0 == n) {
+                ex.routes.push((n, GemmRoute::new(stream, TOP_K * cut, n)?));
+            }
+            for (k, cols) in [
+                (moe.latent, cut),
+                (m.ff, TOP_K * cut),
+                (sh.hidden, cut),
+                (moe.shared_ff, cut),
+            ] {
+                if !ex.acts.iter().any(|a| a.0 == k && a.1 == cols) {
+                    ex.acts.push((k, cols, GemmAct::new(stream, cols, k)?));
+                }
+            }
+        }
         let mut runs: Vec<Q8Act> = Vec::new();
         let mut wide: Vec<(usize, WideActs)> = Vec::new();
         for s in layers.iter().flat_map(Layer::sites) {
             if s.ty == SiteTy::Nvfp4 && !runs.iter().any(|a| a.k() == s.k) {
                 runs.push(Q8Act::with_k(stream, COLS, s.k)?);
             }
-            if s.ty == SiteTy::Q8_0 && !wide.iter().any(|a| a.0 == s.k) {
+            if matches!(s.ty, SiteTy::Q8_0 | SiteTy::Nvfp4) && !wide.iter().any(|a| a.0 == s.k) {
                 wide.push((s.k, WideActs::new(stream, (false, true), cut, s.k)?));
             }
         }
@@ -206,6 +240,7 @@ impl Prompt {
                 sum: z(sh.hidden)?,
                 zero_ids: DeviceBuffer::zeroed(stream, cut)?,
                 slots,
+                ex,
                 arms: Arms {
                     runs,
                     wide,
@@ -238,6 +273,8 @@ impl Prompt {
             + b.arms.runs.iter().map(Q8Act::device_bytes).sum::<usize>()
             + b.arms.wide.iter().map(|a| a.1.bytes()).sum::<usize>()
             + b.arms.route.bytes()
+            + b.ex.routes.iter().map(|r| r.1.bytes()).sum::<usize>()
+            + b.ex.acts.iter().map(|a| a.2.bytes()).sum::<usize>()
     }
 
     /// The word index the pass's ids start at.
@@ -302,6 +339,40 @@ fn project_rows(
             (&arms.route, GemmInput::PerSlot),
             cx.m,
             y,
+        );
+    }
+    if s.ty == SiteTy::Nvfp4 && cx.m > COLS {
+        let a =
+            arms.wide.iter_mut().find(|a| a.0 == s.k).ok_or_else(|| {
+                GpuError::shape(WHAT, format!("no q8 blocks of 32 of width {}", s.k))
+            })?;
+        a.1.quantize(
+            gpu,
+            &cx.wk,
+            gpu.layer_sink(layer)?,
+            x,
+            cx.m,
+            &[SiteTy::Q8_0],
+        )?;
+        let name = q8_name(&s.name);
+        let (qs, d) = match cx.w.resident(WHAT, &name)? {
+            DevWeight::Q8_0Derived { qs, d, .. } => (qs, d),
+            _ => return Err(GpuError::tensor(WHAT, &name, "a derived q8_0 weight")),
+        };
+        return cx.g32.enqueue_gemm32(
+            gpu.stream(),
+            Gemm32Args {
+                w: Gemm32Weight::Q8_0Plane { qs, d },
+                rows_per_expert: rows,
+                act: a
+                    .1
+                    .input(x)
+                    .q32
+                    .ok_or(GpuError::state(WHAT, "the q8 blocks of 32"))?,
+                route: &arms.route,
+                input: GemmInput::PerSlot,
+                y,
+            },
         );
     }
     let mut c0 = 0;
@@ -382,31 +453,45 @@ fn moe_rows(
         &mut p.lat,
     )?;
     let slots = TOP_K * m;
-    {
-        let act = slot_form(&mut p.slots, sh.latent, m)?;
-        gpu.quantize_q8_1_cols_at(&p.lat, 0, act, m, fault)?;
-        let up = SelDown {
-            w: stack(w, &ml.up_exps)?,
-            act,
-            sel: &p.ids,
-            n_slots: slots,
-            rows_per_expert: ml.ff,
-        };
-        iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, TOP_K, fault, &mut p.up)?;
-    }
-    gpu.elem()
-        .enqueue_relu_sqr(stream, &p.up, slots * ml.ff, &mut p.act)?;
-    {
-        let act = slot_form(&mut p.slots, ml.ff, slots)?;
-        gpu.quantize_q8_1_cols_at(&p.act, 0, act, slots, fault)?;
-        let down = SelDown {
-            w: stack(w, &ml.down_exps)?,
-            act,
-            sel: &p.ids,
-            n_slots: slots,
-            rows_per_expert: sh.latent,
-        };
-        iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.down)?;
+    // The grouped GEMM's IQ2_XXS entry, where the build has one.
+    let gemm = GemmWeight::from_ggml(GgmlType::IQ2_XXS)
+        .ok()
+        .filter(|_| m > COLS);
+    if let Some(ty) = gemm {
+        experts_gemm(
+            cx,
+            &mut p.ex,
+            (fault, ml, sh.latent, ty),
+            &p.ids,
+            (&p.lat, &mut p.up, &mut p.act, &mut p.down),
+        )?;
+    } else {
+        {
+            let act = slot_form(&mut p.slots, sh.latent, m)?;
+            gpu.quantize_q8_1_cols_at(&p.lat, 0, act, m, fault)?;
+            let up = SelDown {
+                w: stack(w, &ml.up_exps)?,
+                act,
+                sel: &p.ids,
+                n_slots: slots,
+                rows_per_expert: ml.ff,
+            };
+            iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, TOP_K, fault, &mut p.up)?;
+        }
+        gpu.elem()
+            .enqueue_relu_sqr(stream, &p.up, slots * ml.ff, &mut p.act)?;
+        {
+            let act = slot_form(&mut p.slots, ml.ff, slots)?;
+            gpu.quantize_q8_1_cols_at(&p.act, 0, act, slots, fault)?;
+            let down = SelDown {
+                w: stack(w, &ml.down_exps)?,
+                act,
+                sel: &p.ids,
+                n_slots: slots,
+                rows_per_expert: sh.latent,
+            };
+            iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.down)?;
+        }
     }
     gpu.elem().enqueue_weighted_sum(
         stream,
@@ -425,34 +510,260 @@ fn moe_rows(
         &p.moe,
         &mut p.buf.delta,
     )?;
-    {
-        let act = slot_form(&mut p.slots, hidden, m)?;
-        gpu.quantize_q8_1_cols_at(&p.buf.xn, 0, act, m, fault)?;
-        let up = SelDown {
-            w: stack(w, &ml.up_shexp)?,
-            act,
-            sel: &p.zero_ids,
-            n_slots: m,
-            rows_per_expert: sh.shared_ff,
-        };
-        iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &up, fault, &mut p.sh_up)?;
-    }
-    gpu.elem()
-        .enqueue_relu_sqr(stream, &p.sh_up, m * sh.shared_ff, &mut p.sh_act)?;
-    {
-        let act = slot_form(&mut p.slots, sh.shared_ff, m)?;
-        gpu.quantize_q8_1_cols_at(&p.sh_act, 0, act, m, fault)?;
-        let down = SelDown {
-            w: stack(w, &ml.down_shexp)?,
-            act,
-            sel: &p.zero_ids,
-            n_slots: m,
-            rows_per_expert: hidden,
-        };
-        iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.sh)?;
+    if let Some(ty) = gemm {
+        shared_gemm(
+            cx,
+            (&mut p.ex, &p.arms.route),
+            (fault, ml, sh.shared_ff, hidden, ty),
+            &p.buf.xn,
+            (&mut p.sh_up, &mut p.sh_act, &mut p.sh),
+        )?;
+    } else {
+        {
+            let act = slot_form(&mut p.slots, hidden, m)?;
+            gpu.quantize_q8_1_cols_at(&p.buf.xn, 0, act, m, fault)?;
+            let up = SelDown {
+                w: stack(w, &ml.up_shexp)?,
+                act,
+                sel: &p.zero_ids,
+                n_slots: m,
+                rows_per_expert: sh.shared_ff,
+            };
+            iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &up, fault, &mut p.sh_up)?;
+        }
+        gpu.elem()
+            .enqueue_relu_sqr(stream, &p.sh_up, m * sh.shared_ff, &mut p.sh_act)?;
+        {
+            let act = slot_form(&mut p.slots, sh.shared_ff, m)?;
+            gpu.quantize_q8_1_cols_at(&p.sh_act, 0, act, m, fault)?;
+            let down = SelDown {
+                w: stack(w, &ml.down_shexp)?,
+                act,
+                sel: &p.zero_ids,
+                n_slots: m,
+                rows_per_expert: hidden,
+            };
+            iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.sh)?;
+        }
     }
     gpu.elem()
         .enqueue_add(stream, &p.buf.delta, &p.sh, m * hidden, &mut p.sum)
+}
+
+/// The name of NVFP4 site `name`'s Q8_0 twin ([`derive_q8`]).
+fn q8_name(name: &str) -> String {
+    format!("{name}#q8_0")
+}
+
+/// Every NVFP4 site of `layers` again as a derived Q8_0 weight, what a pass
+/// past [`COLS`] rows runs it as: each row decoded from `file` times the
+/// tensor's scale, then coded per 32 values as `quantize_row_q8_0` codes
+/// (`d = f16(amax / 127)`, each code `round_half_even(v · 127 / amax)`).
+/// Threaded over the rows. Load-time only.
+pub(super) fn derive_q8(
+    stream: &CudaStream,
+    file: &Split,
+    w: &mut Weights,
+    layers: &[Layer],
+) -> Result<(), GpuError> {
+    for s in layers.iter().flat_map(Layer::sites) {
+        if s.ty != SiteTy::Nvfp4 {
+            continue;
+        }
+        let scale = match w.resident(WHAT, &s.name)? {
+            DevWeight::Nvfp4 { scale, .. } => *scale,
+            _ => return Err(GpuError::tensor(WHAT, &s.name, "an NVFP4 weight")),
+        };
+        let (shard, t) = file
+            .find(&s.name)
+            .ok_or_else(|| GpuError::tensor(WHAT, &s.name, "a file tensor"))?;
+        let bytes = file
+            .shard(shard)
+            .ok_or_else(|| GpuError::tensor(WHAT, &s.name, "its shard"))?
+            .data(t)
+            .map_err(|e| GpuError::shape(WHAT, format!("{}: {e}", s.name)))?;
+        let k = s.k;
+        let row_bytes = k / 64 * 36;
+        if k % 64 != 0 || bytes.len() % row_bytes != 0 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{}: {} bytes are not rows of {k} NVFP4 values",
+                    s.name,
+                    bytes.len()
+                ),
+            ));
+        }
+        let rows = bytes.len() / row_bytes;
+        let mut blocks = vec![Q8Block { d: 0, q: [0; 32] }; rows * k / 32];
+        let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+        let per = rows.div_ceil(threads);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|sc| {
+            for (i, out) in blocks.chunks_mut(per * k / 32).enumerate() {
+                let (src, failed) = (&bytes[i * per * row_bytes..], &failed);
+                sc.spawn(move || {
+                    let mut row = vec![0f32; k];
+                    for (r, ob) in out.chunks_mut(k / 32).enumerate() {
+                        let rb = &src[r * row_bytes..(r + 1) * row_bytes];
+                        if dequant_row(GgmlType::NVFP4, rb, &mut row).is_err() {
+                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        for (xb, b) in row.as_chunks::<32>().0.iter().zip(ob.iter_mut()) {
+                            let amax = xb.iter().fold(0.0f32, |a, v| a.max((v * scale).abs()));
+                            b.d = f32_to_f16_bits(amax / 127.0);
+                            let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                            let id = if id.is_finite() { id } else { 0.0 };
+                            for (q, &v) in b.q.iter_mut().zip(xb) {
+                                *q = (v * scale * id).round_ties_even() as i8;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if failed.into_inner() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{}: an NVFP4 row that does not decode", s.name),
+            ));
+        }
+        let (qs, d) = q8_0_planes(&blocks);
+        w.insert_derived(
+            q8_name(&s.name),
+            DevWeight::Q8_0Derived {
+                qs: DeviceTensor::upload(stream, &qs, rows, k / 4)?,
+                d: DeviceTensor::upload(stream, &d, rows, k / 32)?,
+                k,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// The GEMM form of `cols` columns of `k` values in `acts`.
+fn gemm_form(
+    acts: &mut [(usize, usize, GemmAct)],
+    k: usize,
+    cols: usize,
+) -> Result<&mut GemmAct, GpuError> {
+    acts.iter_mut()
+        .find(|a| a.0 == k && a.1 >= cols)
+        .map(|a| &mut a.2)
+        .ok_or_else(|| GpuError::shape(WHAT, format!("no GEMM form of {cols} columns of {k}")))
+}
+
+/// The routed experts over the pass's `TOP_K · m` slots past [`COLS`] rows:
+/// the slots' table from `ids`, the up as one grouped IQ2_XXS GEMM on the
+/// latent rows `lat` (each row's `TOP_K` slots reading its column), the
+/// squared ReLU, the down as one GEMM on each slot's own row.
+fn experts_gemm(
+    cx: &Cx<'_>,
+    ex: &mut ExpertArms,
+    (fault, ml, latent, ty): (FaultSink, &MoeLayer, usize, GemmWeight),
+    ids: &DeviceBuffer<u32>,
+    (lat, up, act, down): (
+        &DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+    ),
+) -> Result<(), GpuError> {
+    let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
+    let stream = gpu.stream();
+    let slots = TOP_K * m;
+    let n = ml.route.n_expert();
+    let route = ex
+        .routes
+        .iter_mut()
+        .find(|r| r.0 == n)
+        .map(|r| &mut r.1)
+        .ok_or_else(|| GpuError::shape(WHAT, format!("no routed table of {n} experts")))?;
+    cx.wk.gemm.enqueue_route(stream, ids, slots, route, fault)?;
+    let route = &*route;
+    {
+        let a = gemm_form(&mut ex.acts, latent, m)?;
+        gpu.enqueue_quantize_gemm(lat, m, a, fault)?;
+        cx.wk.gemm.enqueue_gemm(
+            stream,
+            GemmArgs {
+                ty,
+                w: stack(w, &ml.up_exps)?,
+                rows_per_expert: ml.ff,
+                act: a,
+                route,
+                input: GemmInput::Shared { top_k: TOP_K },
+                y: up,
+            },
+        )?;
+    }
+    gpu.elem()
+        .enqueue_relu_sqr(stream, up, slots * ml.ff, act)?;
+    let a = gemm_form(&mut ex.acts, ml.ff, slots)?;
+    gpu.enqueue_quantize_gemm(act, slots, a, fault)?;
+    cx.wk.gemm.enqueue_gemm(
+        stream,
+        GemmArgs {
+            ty,
+            w: stack(w, &ml.down_exps)?,
+            rows_per_expert: latent,
+            act: a,
+            route,
+            input: GemmInput::PerSlot,
+            y: down,
+        },
+    )
+}
+
+/// The shared expert over the pass's `m` rows of `xn` past [`COLS`] rows:
+/// its up and down each one IQ2_XXS GEMM over the pass's one-expert table
+/// `dense`, the squared ReLU between.
+fn shared_gemm(
+    cx: &Cx<'_>,
+    (ex, dense): (&mut ExpertArms, &GemmRoute),
+    (fault, ml, shared_ff, hidden, ty): (FaultSink, &MoeLayer, usize, usize, GemmWeight),
+    xn: &DeviceBuffer<f32>,
+    (up, act, y): (
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+    ),
+) -> Result<(), GpuError> {
+    let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
+    let stream = gpu.stream();
+    {
+        let a = gemm_form(&mut ex.acts, hidden, m)?;
+        gpu.enqueue_quantize_gemm(xn, m, a, fault)?;
+        cx.wk.gemm.enqueue_gemm(
+            stream,
+            GemmArgs {
+                ty,
+                w: stack(w, &ml.up_shexp)?,
+                rows_per_expert: shared_ff,
+                act: a,
+                route: dense,
+                input: GemmInput::PerSlot,
+                y: up,
+            },
+        )?;
+    }
+    gpu.elem()
+        .enqueue_relu_sqr(stream, up, m * shared_ff, act)?;
+    let a = gemm_form(&mut ex.acts, shared_ff, m)?;
+    gpu.enqueue_quantize_gemm(act, m, a, fault)?;
+    cx.wk.gemm.enqueue_gemm(
+        stream,
+        GemmArgs {
+            ty,
+            w: stack(w, &ml.down_shexp)?,
+            rows_per_expert: hidden,
+            act: a,
+            route: dense,
+            input: GemmInput::PerSlot,
+            y,
+        },
+    )
 }
 
 impl Body {
