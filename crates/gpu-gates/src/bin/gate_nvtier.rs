@@ -157,7 +157,9 @@ use bloomery_gpu::arch::qwen3moe::Body38;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::nvtier::{DropRuns, NvTier, NvTierStats, advice_disjoint};
+use bloomery_gpu::host::step::{WarmOff, WarmState, set_host_warm};
 use bloomery_gpu::host::swap::{LateLog, PassReport, Residency, SwapSource};
+use bloomery_gpu::hybrid::HostExperts;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, data_dir, exit_with, verdict};
@@ -1404,6 +1406,11 @@ fn run() -> Result<(), GateError> {
     );
     pass &= stepunion;
 
+    // `warmfills` (clause 9): the step port's warm never fills the arena.
+    // It pins the caller, so it runs after the clauses that time nothing
+    // against an unpinned one.
+    pass &= warm_fills_clause(path, &machine, host, &ids)?;
+
     // `census`: each phase's tier census — the paged arm's prompt call and
     // steps, the stepunion arm's two-column passes — printed as its record,
     // its picks by where they were served and the bytes the phase moved
@@ -1571,4 +1578,171 @@ fn refuse_clauses(
         }
     };
     Ok(floor && slot && floor_k && floor_lane && accepted && probe)
+}
+
+/// What one `warmfills` load saw: the step port's warm state, the arena's
+/// misses and fills over the two-column passes, the warm's listed experts
+/// and loaded bytes over them, and the tokens they answered.
+struct WarmFills {
+    state: WarmState,
+    misses: u64,
+    fills: u64,
+    listed: u64,
+    bytes: u64,
+    tokens: Vec<u32>,
+    /// The probe's: the arena's unfilled ids asked of the host for their
+    /// warm spans, the fills that ask made and the spans it returned.
+    probed: usize,
+    probe_fills: u64,
+    probe_spans: usize,
+}
+
+/// One load of the `stepunion` arm's two-slot paged plan under the unset
+/// rule's residency, the step port's warm `on` or `off` as the load's lever
+/// says: a prompt in each slot, then [`STEP_COLS`] two-column passes.
+fn warm_fills_load(
+    path: &Path,
+    machine: &Machine,
+    host: HostCfg,
+    ids: &[u32],
+    warm: bool,
+) -> Result<WarmFills, GateError> {
+    let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let inputs = inputs_of(&file, Some(ROOM))?;
+    let plan = inputs.plan_with_slots(
+        machine,
+        CTX as u64,
+        &PlanLevers::default(),
+        Experts::Card,
+        2,
+    )?;
+    if plan.host.nvme_expert_bytes == 0 || plan.host.nvme_arena_bytes == 0 {
+        return Err("the warmfills arm's two-slot plan pages nothing or builds no arena".into());
+    }
+    let residency = residency38(&plan, Lever38::Unset(None), Record::print)?;
+    if let Residency::Mid { pinned, spares } = residency {
+        return Err(format!(
+            "the warmfills arm's plan picks mid-p{pinned}-s{spares} under the unset rule; the \
+             clause judges the off default"
+        )
+        .into());
+    }
+    let ub = ubatch_for(CTX)?;
+    set_host_warm(warm);
+    let model = Body38::open_placed_residency(file, &plan, &inputs, 0, host, ub, residency, 2);
+    set_host_warm(true);
+    let mut s = Session::from_model(model?, CTX as u32);
+    s.add_slots(2)?;
+    let tier = s
+        .model()
+        .body(NAME)?
+        .nvme_tier()
+        .cloned()
+        .ok_or("the warmfills arm's two-slot plan built no arena")?;
+    let windows = [&ids[..STEP_PROMPT], &ids[STEP_PROMPT..2 * STEP_PROMPT]];
+    let mut prompts = [0u32; 2];
+    for (slot, p) in windows.iter().enumerate() {
+        s.select_slot(slot)?;
+        prompts[slot] = s.prompt(p, Want::Argmax)?.argmax();
+    }
+    tier.flush()?;
+    take_passes(&mut s)?;
+    let state = s.model().body(NAME)?.hybrid().warm_state();
+    let (t0, h0) = (tier.stats(), s.model().body(NAME)?.hybrid().stats());
+    let mut tokens = Vec::with_capacity(2 * STEP_COLS);
+    let mut next = prompts;
+    for _ in 0..STEP_COLS {
+        let out = s.step_slots(&[(0, &next[..1]), (1, &next[1..])])?;
+        let &[a, b] = out.ids.as_slice() else {
+            return Err(format!(
+                "a two-column pass answered {} tokens, not one a slot",
+                out.ids.len()
+            )
+            .into());
+        };
+        tokens.extend([a, b]);
+        next = [a, b];
+    }
+    take_passes(&mut s)?;
+    tier.flush()?;
+    let (t1, h1) = (tier.stats(), s.model().body(NAME)?.hybrid().stats());
+    // The warm never fills a slot: the host is asked for the warm spans of
+    // ids its arena has not filled, which it leaves out whole.
+    let experts = plan.model.experts as u32;
+    let unfilled = (0..plan.model.layers)
+        .filter(|&l| tier.covers(l))
+        .find_map(|l| {
+            let ids: Vec<u32> = (0..experts)
+                .filter(|&id| tier.serves(l, id) && !tier.slot_filled(l, id))
+                .take(16)
+                .collect();
+            (!ids.is_empty()).then_some((l, ids))
+        })
+        .ok_or("the warmfills arm's arena has every slot filled: the probe would hold nothing")?;
+    let (_, _, body) = s.model_mut().body_parts(NAME)?;
+    let mut spans = Vec::new();
+    body.hybrid_mut()
+        .host_mut()
+        .warm_spans(unfilled.0, &unfilled.1, &mut spans)?;
+    let probe_spans = spans.len();
+    let probe_fills = tier.stats().fills - t1.fills;
+    Ok(WarmFills {
+        state,
+        misses: t1.misses - t0.misses,
+        fills: t1.fills - t0.fills,
+        listed: h1.warm_listed - h0.warm_listed,
+        bytes: h1.warm_bytes - h0.warm_bytes,
+        tokens,
+        probed: unfilled.1.len(),
+        probe_fills,
+        probe_spans,
+    })
+}
+
+/// `warmfills` (clause 9): the step port's L3 warm lists the filled slots
+/// only and never reads an expert into the arena. The `stepunion` arm's load
+/// and passes run twice on a pinned caller, the warm on and off: the on-arm
+/// warms (state `on`, bytes loaded), the off-arm names the lever and loads
+/// none, and the two have the same arena misses and fills over the passes
+/// and the same tokens. Whether the clause held.
+fn warm_fills_clause(
+    path: &Path,
+    machine: &Machine,
+    host: HostCfg,
+    ids: &[u32],
+) -> Result<bool, GateError> {
+    if !threads::pool().pin_caller() {
+        return Err("the warmfills clause could not pin its caller".into());
+    }
+    let on = warm_fills_load(path, machine, host, ids, true)?;
+    let off = warm_fills_load(path, machine, host, ids, false)?;
+    let warmed = on.state == WarmState::On && on.listed > 0 && on.bytes > 0;
+    let named = off.state == WarmState::Off(WarmOff::Lever) && off.listed == 0 && off.bytes == 0;
+    let equal = on.fills == off.fills && on.misses == off.misses;
+    let same = !on.tokens.is_empty() && on.tokens == off.tokens;
+    let probe = on.probed > 0 && on.probe_fills == 0 && on.probe_spans == 0;
+    let pass = warmed && named && equal && same && probe;
+    println!(
+        "warmfills: the warm on {:?} listed {} experts and loaded {} bytes over the passes (it \
+         warmed: {warmed}), off {:?} listed {} loaded {} (the lever named, nothing loaded: \
+         {named}); the arena's misses +{} on, +{} off and fills +{} on, +{} off (equal: {equal}); \
+         {} tokens the same: {same}; the host asked for the spans of {} unfilled ids lists {} \
+         and fills {} slots (want 0 and 0): {probe}: {}",
+        on.state,
+        on.listed,
+        on.bytes,
+        off.state,
+        off.listed,
+        off.bytes,
+        on.misses,
+        off.misses,
+        on.fills,
+        off.fills,
+        on.tokens.len(),
+        on.probed,
+        on.probe_spans,
+        on.probe_fills,
+        verdict(pass)
+    );
+    Ok(pass)
 }

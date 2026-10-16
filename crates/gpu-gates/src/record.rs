@@ -1048,7 +1048,7 @@ pub static PLAN38: Kind = Kind {
 pub static LOAD: Kind = Kind {
     name: "load",
     head: "load",
-    doc: "The load: device bytes, the ring shadows' host bytes, the cards it loaded (an expert tier card's experts and resident bytes), the context, and the modes and levers the body holds.",
+    doc: "The load: device bytes, the ring shadows' host bytes, the cards it loaded (an expert tier card's experts and resident bytes), the context, and the modes and levers the body holds, with whether the host tier's step port warms the CCDs' L3s (`warm=on`, or `warm=off why=<reason>`).",
     parts: &[
         key("resident_bytes", U64, "B"),
         key("shadow", Word, ""),
@@ -1065,6 +1065,8 @@ pub static LOAD: Kind = Kind {
         key("place", Word, ""),
         key("pin_main", Word, ""),
         key("pinned", Bool, ""),
+        opt("warm", Word, ""),
+        opt("why", Word, ""),
         key("prefill", Word, ""),
         key("ced", Text, ""),
         key("group", U64, "batches"),
@@ -1078,7 +1080,7 @@ pub static LOAD: Kind = Kind {
 pub static LOAD_GENERATOR: Kind = Kind {
     name: "load_generator",
     head: "load",
-    doc: "The load a decode loop opened: device bytes, the context, the body's fields, the cards it loaded (a V4.1 or GLM-5.3 binary's; an expert tier card's experts and resident bytes), the prompt feed, a GLM-5.3 load's prompt group and whether its host union's row-lane packs prefetch, the step mode and the pin.",
+    doc: "The load a decode loop opened: device bytes, the context, the body's fields, the cards it loaded (a V4.1 or GLM-5.3 binary's; an expert tier card's experts and resident bytes), the prompt feed, a GLM-5.3 load's prompt group and whether its host union's row-lane packs prefetch, the step mode and the pin, and where the body has a host tier whether its step port warms the CCDs' L3s (`warm=on`, or `warm=off why=<reason>`).",
     parts: &[
         key("resident_bytes", U64, "B"),
         key("ctx", U64, "positions"),
@@ -1098,6 +1100,8 @@ pub static LOAD_GENERATOR: Kind = Kind {
         key("place", Word, ""),
         key("pin_main", Word, ""),
         key("pinned", Bool, ""),
+        opt("warm", Word, ""),
+        opt("why", Word, ""),
         lit(" in "),
         pos("load_s", F64(1), "s"),
         lit(" s (runtime value)"),
@@ -2126,7 +2130,7 @@ pub static TOKENS: Kind = Kind {
 pub static STAT_STEP: Kind = Kind {
     name: "stat_step",
     head: "stat step",
-    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults, free device bytes and engram rows; the step's go waits (the card's time from the host's signal to the next go, one per service: least, lower median, most) and the host time in its synchronous parameter copy.",
+    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults, free device bytes and engram rows; the step's go waits (the card's time from the host's signal to the next go, one per service: least, lower median, most) and the host time in its synchronous parameter copy; the step port's L3 warm: `warm_mb` the MB its walks loaded, `warm_recall` the share of the step's host slots whose expert a walk had covered by the go, `warm_cut` the services whose walk the go cut short (zeros with the warm off).",
     parts: &[
         lit(" "),
         pos("i", U64, ""),
@@ -2154,6 +2158,9 @@ pub static STAT_STEP: Kind = Kind {
         key("gap_p50_us", F64(1), "us"),
         key("gap_max_us", F64(1), "us"),
         key("params_us", F64(1), "us"),
+        key("warm_mb", F64(1), "MB"),
+        key("warm_recall", F64(3), ""),
+        key("warm_cut", U64, ""),
     ],
 };
 
@@ -2190,7 +2197,7 @@ pub static STAT_SUMMARY: Kind = Kind {
 pub static STAT_STEP_HOST: Kind = Kind {
     name: "stat_step_host",
     head: "stat step",
-    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults and free device bytes (a body with a host tier and no engram rows: generate_qwen3moe, generate_glm5next). `gap_min_us`, `gap_p50_us` and `gap_max_us` are the step's go waits, one per service; a step no service ran in prints zeros.",
+    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults and free device bytes (a body with a host tier and no engram rows: generate_qwen3moe, generate_glm5next). `gap_min_us`, `gap_p50_us` and `gap_max_us` are the step's go waits, one per service; a step no service ran in prints zeros. `warm_mb`, `warm_recall` and `warm_cut` are the step port's L3 warm: the MB its walks loaded, the share of the step's host slots whose expert a walk had covered by the go, and the services whose walk the go cut short (zeros with the warm off).",
     parts: &[
         lit(" "),
         pos("i", U64, ""),
@@ -2209,6 +2216,9 @@ pub static STAT_STEP_HOST: Kind = Kind {
         key("gap_min_us", F64(1), "us"),
         key("gap_p50_us", F64(1), "us"),
         key("gap_max_us", F64(1), "us"),
+        key("warm_mb", F64(1), "MB"),
+        key("warm_recall", F64(3), ""),
+        key("warm_cut", U64, ""),
     ],
 };
 
@@ -3249,6 +3259,30 @@ pub fn load_phases(
         .f("body_s", body)
         .f("head_s", head)
         .f("other_s", other)
+}
+
+/// A `load` record with the host tier's warm state: `warm=on`, or `warm=off`
+/// and `why=` its reason ([`bloomery_gpu::host::step::WarmOff::why`]); for a
+/// kind with those optional fields ([`LOAD`], [`LOAD_GENERATOR`]), set right
+/// after `pinned`.
+#[cfg(feature = "gpu")]
+pub fn load_warm(r: Record, state: bloomery_gpu::host::step::WarmState) -> Record {
+    let r = r.w("warm", state.word());
+    match state.why() {
+        Some(why) => r.w("why", why),
+        None => r,
+    }
+}
+
+/// The words a free-form `load` line carries for the warm state: ` warm=on`
+/// or ` warm=off why=<reason>`, with its leading space.
+#[cfg(feature = "gpu")]
+#[must_use]
+pub fn warm_words(state: bloomery_gpu::host::step::WarmState) -> String {
+    match state.why() {
+        Some(why) => format!(" warm={} why={why}", state.word()),
+        None => format!(" warm={}", state.word()),
+    }
 }
 
 /// The `nvtier` record of a load's arena: its budget, the paged bytes it

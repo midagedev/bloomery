@@ -153,6 +153,8 @@ mod tests {
                 bloomery_levers::R8,
             ],
         ),
+        ("host_lanes", &[bloomery_levers::HOST_LANES]),
+        ("host_warm", &[bloomery_levers::HOST_WARM]),
         ("mtp_draft", &[bloomery_levers::MTP_DRAFT]),
         ("mtp_head_rows", &[bloomery_levers::MTP_HEAD_ROWS]),
         ("mtp_width", &[bloomery_levers::MTP_WIDTH]),

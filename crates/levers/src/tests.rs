@@ -243,6 +243,45 @@ fn host_lanes_row_is_a_flat_ccd_arm() {
     assert!(other.to_string().contains(HOST_LANES), "{other}");
 }
 
+/// `BLOOMERY_HOST_WARM`'s row is a parsed same-binary arm taking `on` and
+/// `off`, loaded once (`Phase::Load`), its default [`HOST_WARM_DEFAULT`] (what
+/// the step port holds in a binary that does not act on it); its accessor reads
+/// unset as that default, `off` as off and `on` as on; any other word is
+/// refused by name.
+#[test]
+fn host_warm_row_is_an_on_off_arm() {
+    let row = REGISTRY.iter().find(|r| r.name == HOST_WARM);
+    let Some(LeverSpec {
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is(d),
+        site: Site::Parsed { left, phase },
+        ..
+    }) = row
+    else {
+        panic!("{HOST_WARM} is not a parsed on/off arm with a default: {row:?}");
+    };
+    assert!(left.is_empty(), "{HOST_WARM} is read in place: {left:?}");
+    assert!(
+        matches!(phase, Phase::Load),
+        "{HOST_WARM} is read at load: {phase:?}"
+    );
+    assert_eq!(*d, if HOST_WARM_DEFAULT { "on" } else { "off" });
+    let at = |v: Option<&str>| {
+        let e = v.map_or_else(Vec::new, |v| env(&[(HOST_WARM, v)]));
+        read(&e, Scope::Every)
+            .expect("on, off and unset are taken")
+            .host_warm()
+    };
+    assert_eq!(at(None), HOST_WARM_DEFAULT);
+    assert!(at(Some("on")));
+    assert!(!at(Some("off")));
+    let Err(other) = read(&env(&[(HOST_WARM, "auto")]), Scope::Every) else {
+        panic!("a word the row does not take is refused");
+    };
+    assert!(other.to_string().contains(HOST_WARM), "{other}");
+}
+
 /// Every name is a `BLOOMERY_*` variable, and no two rows share one.
 #[test]
 fn names_are_unique() {
@@ -360,6 +399,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.hoststream(), None);
     assert_eq!(unset.lane_prefetch(), LANE_PREFETCH_DEFAULT);
     assert_eq!(unset.host_lanes(), HOST_LANES_DEFAULT);
+    assert_eq!(unset.host_warm(), HOST_WARM_DEFAULT);
     assert_eq!(unset.gen_slots(), 1);
     assert_eq!(
         unset.host(),
@@ -399,6 +439,7 @@ fn accessors_read_their_rows() {
             (QWEN3_KV, "q8_0"),
             (LANE_PREFETCH, "on"),
             (HOST_LANES, "flat"),
+            (HOST_WARM, "off"),
             (PREFILL_GROUP, "8"),
             (GEN_SLOTS, "2"),
         ]),
@@ -431,6 +472,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.xstream(), Some("split"));
     assert!(set.lane_prefetch());
     assert_eq!(set.host_lanes(), HostLanes::Flat);
+    assert!(!set.host_warm());
     assert_eq!(set.gen_slots(), 2);
     assert_eq!(
         set.host(),
@@ -476,6 +518,7 @@ fn accessors_read_their_rows() {
             QWEN3_KV,
             LANE_PREFETCH,
             HOST_LANES,
+            HOST_WARM,
             GEN_SLOTS
         ]
     );

@@ -279,7 +279,8 @@ const CTX_STEP: usize = 256;
 /// slots (a `slots round` record each); a lever set outside this list is
 /// refused by name at `main`, with `BLOOMERY_PIN_MAIN` for the engine
 /// thread's cpu slot, as every serving seat reads it, and `BLOOMERY_HOST_LANES`
-/// for the lanes of the host tier's legs on that thread's CCD map;
+/// for the lanes of the host tier's legs on that thread's CCD map and
+/// `BLOOMERY_HOST_WARM` for the L3 warm on that map;
 /// `gate_glm5next_serve` holds the same list.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
@@ -289,6 +290,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::R8,
     bloomery_levers::PIN_MAIN,
     bloomery_levers::HOST_LANES,
+    bloomery_levers::HOST_WARM,
     bloomery_levers::DRAFT,
     bloomery_levers::MTP_WIDTH,
     bloomery_levers::RESIDENCY,
@@ -742,6 +744,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
+    bloomery_gpu::host::step::set_host_warm(levers.host_warm());
     let width = WidthMode::of(levers.mtp_width())?;
     record::at_main(WHAT, record::BLOOMERY_SERVE_GLM);
     let a = parse_args(args)?;
@@ -1293,14 +1296,15 @@ impl OpenLog<Body> for Log {
             .w("shadow", "none")
             .u("shadow_bytes", 0)
             .u("unified_addressing", 0);
-        with_cards(r, self.placement, m.gpu(), b.hybrid().tiers())
+        let r = with_cards(r, self.placement, m.gpu(), b.hybrid().tiers())
             .map_err(app::SessionError::Caller)?
             .w("prefill", self.prefill.name())
             .u("group", self.group)
             .w("mode", mode_name(StepMode::Graph))
             .w("place", self.place)
             .w("pin_main", if self.pin_main { "on" } else { "off" })
-            .w("pinned", self.pinned)
+            .w("pinned", self.pinned);
+        record::load_warm(r, b.hybrid().warm_state())
             .f("load_s", self.t.elapsed().as_secs_f64())
             .eprint();
         if let Some(h) = b.hybrid().residency() {

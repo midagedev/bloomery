@@ -118,6 +118,7 @@ use crate::fault::{Fault, LAYER_NONE};
 use crate::tensor::DeviceTensor;
 use batch::{BatchKey, BatchPort, BatchService, ServeTimes, Tier};
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer};
+use model::ops::WarmSpan;
 use model::placement::Machine;
 use model::{Tensor2, Tensor2View};
 use page::{MAX_ROWS, Word};
@@ -259,6 +260,23 @@ pub trait HostExperts {
         Ok(())
     }
 
+    /// The matrices the step port's L3 warm fills for `ids` of layer `layer`,
+    /// pushed to `out` in the ids' order, each id's gate, up and down as the
+    /// host's step calls read them; an id the host cannot warm without reading
+    /// something in (an NVMe-tier id whose slot is not filled) is left out
+    /// whole, and a warm never fills a slot. The spans borrow the host. Nothing
+    /// by default: a host that lists no span is never warmed
+    /// ([`step::WarmOff::HostListsNone`]).
+    fn warm_spans<'a>(
+        &'a self,
+        layer: usize,
+        ids: &[u32],
+        out: &mut Vec<WarmSpan<'a>>,
+    ) -> Result<(), GpuError> {
+        let _ = (layer, ids, out);
+        Ok(())
+    }
+
     /// The host's routed picks since load by where it read their bytes
     /// ([`census::HostReads`]), for the tier census; `None` for a host that
     /// does not count them, whose census is not taken.
@@ -315,6 +333,14 @@ pub struct HybridStats {
     pub cols_cols: u64,
     /// Go waits written ([`HostTier::gap_summary`] of a span of them).
     pub gaps: u64,
+    /// The step port's L3 warm ([`step::WarmState`]): host experts listed to
+    /// the walks, bytes the walks loaded (all participants), services whose
+    /// walk the go cut short, and host slots whose expert the walk had
+    /// covered by the go — the warm's hits, of `host_slots`.
+    pub warm_listed: u64,
+    pub warm_bytes: u64,
+    pub warm_cut: u64,
+    pub warm_hit_slots: u64,
     /// Batch services ([`HostTier::serve_batch`]): layers served, the columns
     /// they carried, the host slots those columns listed and the service
     /// computed, and the host wall time of the union calls (ns), summed. None
@@ -896,6 +922,7 @@ impl<H: HostExperts> HostTier<H> {
         experts: H,
         layers: usize,
     ) -> Result<HostTier<H>, GpuError> {
+        let step = StepPort::new(boundary, layers).with_warm(&slots, &experts)?;
         Ok(HostTier {
             residency: None,
             experts,
@@ -903,7 +930,7 @@ impl<H: HostExperts> HostTier<H> {
             planted: None,
             health: Health::default(),
             slots,
-            step: StepPort::new(boundary, layers),
+            step,
             batch: BatchService::default(),
             port: None,
             tiers: Vec::new(),
@@ -979,9 +1006,12 @@ impl<H: HostExperts> HostTier<H> {
     /// Refused by name — the write side of the refusal the
     /// next boundary makes ([`pass_kept`]) — rows kept with no pass
     /// open, and ones kept while a boundary made ahead waits for its launch
-    /// (the pass it opened has not run). Nothing without a machine.
+    /// (the pass it opened has not run). The step port's warm predictor takes
+    /// the rows first, with a machine or without one (a prompt call starts its
+    /// table over); beyond that, nothing without a machine.
     pub fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::keep_rows";
+        self.step.warm_pass_end(kept, kind);
         let Some(m) = self.swap.as_ref() else {
             return Ok(());
         };
@@ -2233,6 +2263,13 @@ impl<H: HostExperts> HostTier<H> {
         &self.step
     }
 
+    /// Whether the step port warms the CCDs' L3s ahead of a host layer's go,
+    /// and if not why: the `load` record's `warm=` and `why=`.
+    #[must_use]
+    pub fn warm_state(&self) -> step::WarmState {
+        self.step.warm_state()
+    }
+
     /// The go waits of step services `from..to` (counts of
     /// [`HybridStats::gaps`]): the card's time between the host's signal and
     /// the next go, per service. No allocation.
@@ -2261,6 +2298,10 @@ impl<H: HostExperts> HostTier<H> {
             cols_served: s.cols_served,
             cols_cols: s.cols_cols,
             gaps: s.gaps,
+            warm_listed: s.warm_listed,
+            warm_bytes: s.warm_bytes,
+            warm_cut: s.warm_cut,
+            warm_hit_slots: s.warm_hit_slots,
             batch_served: b.batch_served,
             batch_cols: b.batch_cols,
             batch_host_slots: b.batch_host_slots,

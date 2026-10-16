@@ -37,6 +37,7 @@ pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
 pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
 pub const HOST_LANES: &str = "BLOOMERY_HOST_LANES";
+pub const HOST_WARM: &str = "BLOOMERY_HOST_WARM";
 pub const GEN_SLOTS: &str = "BLOOMERY_GEN_SLOTS";
 pub const HOST_ROOM: &str = "BLOOMERY_HOST_ROOM";
 pub const NVTIER_BYTES: &str = "BLOOMERY_NVTIER_BYTES";
@@ -59,6 +60,11 @@ pub const LANE_PREFETCH_DEFAULT: bool = false;
 /// dispatch holds in a binary that does not act on the lever
 /// (`model::ops::Lanes::host_tier`).
 pub const HOST_LANES_DEFAULT: HostLanes = HostLanes::Ccd;
+
+/// `BLOOMERY_HOST_WARM` unset: the row's default, which the step port holds in
+/// a binary that does not act on the lever
+/// (`bloomery_gpu::host::step::set_host_warm`).
+pub const HOST_WARM_DEFAULT: bool = true;
 
 /// The largest `BLOOMERY_GEN_SLOTS`: one row a slot in a pass of several
 /// slots, which holds at most the pass's eight rows.
@@ -795,6 +801,31 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `bloomery-serve-qwen38`); every other binary that parses its levers runs \
               the default and refuses the name set, and `bloomery-decode` and \
               `bench_v41_host`, which do not read it, run the default.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: HOST_WARM,
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("on"),
+        doc: "Host tier, the step port's L3 warm: `on` has every pool participant, while \
+              the card runs the layers before a host layer's go, read its share of the \
+              layer's predicted host experts into the L3 of the CCD that will compute \
+              those rows, and stop within a few cache lines of the go landing; the \
+              experts are predicted from the routing of the layers and passes before \
+              (`runtime::warm`). It reads and writes nothing the step computes, so a run \
+              writes the same bits either way. `off` runs no warm, the same-binary arm. \
+              The warm needs the pool's CCD map (the calling thread pinned, \
+              `BLOOMERY_PIN_MAIN` default on, and every worker pinned) and the lanes of \
+              `BLOOMERY_HOST_LANES` at `ccd`: without them it is off, and the `load` \
+              line names why (`warm=off why=caller-unpinned`, `lanes-flat`, `lever`, \
+              ...). Acted on by the binaries that act on `BLOOMERY_HOST_LANES`; every \
+              other binary that parses its levers runs the default and refuses the name \
+              set, and `bloomery-decode` and `bench_v41_host`, which do not read it, run \
+              the default.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

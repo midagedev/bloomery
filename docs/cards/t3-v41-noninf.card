@@ -1,0 +1,23 @@
+# T3's guard on V4.1: the CCD map and the warm reach V4.1's host leg through the common step port (generate_ds41 pins its
+# caller and parses BLOOMERY_HOST_WARM and BLOOMERY_HOST_LANES). Derived: a V4.1 host expert is 16.8 MB (W 126.4 us,
+# docs/plan.md host-union row), so the warm's budget is (gap - 10 us) x 125..134 GB/s / 16.8 MB ~ 2..3 experts at a 300 us gap.
+# c_hot on V4.1 is the probe's measured ratio (specs/leader/t3probe/result.md: 11.28 us warmed over 24.68 cold on qwen4exp's
+# 3.134 MB expert, 0.457) on V4.1's W: 0.457 x 126.4 = 57.8 us [derived], inside the draft's a + c = 51..67 us, so a hit saves
+# W - c_hot = 69 us; recall unreplayed on V4.1: the gain is 0 or positive, the split's own price predicted 0 (the probe read
+# R1's lanes at +1.2 % ms/token at k = 0 on qwen4exp's leg; @BLOOMERY_HOST_LANES=flat reads it here).
+kind: noninf
+question: does the step port's CCD map and warm leave V4.1's decode no slower than the off arm of the same binary?
+term: decode tok/s @ n=96, depth 1024, generate_ds41 at its serving defaults on the A6000: ours against
+  ours@BLOOMERY_HOST_WARM=off, paired by round
+unit: %
+predict: 0..6
+rounds: 6
+condition: one lease in the next V4.1 sitting, arms prose:1024, prose:1024@BLOOMERY_HOST_WARM=off,
+  prose:1024@BLOOMERY_HOST_LANES=flat and bin:<base tree's generate_ds41>:prose:1024; tokens equal between the arms; the load
+  lines `warm=on` on ours, `warm=off why=lever` and `warm=off why=lanes-flat` on the others; majflt equal; no counted row [cold],
+  [cpu-busy] or [other-busy]
+decide-in: keep the warm on for V4.1; record the gain beside the Qwen3.8 rows
+decide-below: the warm costs V4.1: read its stat step warm_recall, warm_cut and straggle, and the flat arm against the off arm
+  (R1's lanes against R2's warm); turn the registry default per family only with a measured reason (the common owner keeps
+  one rule otherwise)
+decide-above: V4.1 gains more than 6 %: replay V4.1's recall from a route trace and price it before the release notes

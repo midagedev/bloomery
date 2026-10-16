@@ -9,19 +9,22 @@
 use super::page::{HandoffLayout, PageLayout, Word};
 use super::route_trace::RouteTrace;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
-use super::{Health, HostExperts, Refusal, nanos, non_finite, unknown_id};
+use super::{Health, HostExperts, PassKind, Refusal, nanos, non_finite, unknown_id};
 use crate::GpuError;
 use crate::graph::{
     MappedHost, capturing, mem_batch, op_add, op_barrier_sys, op_wait_geq, op_write,
 };
 use crate::tensor::window;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
-use model::ops::DEFER_MAX_COLS;
+use model::ops::{DEFER_MAX_COLS, Lanes, WarmDone, WarmSpan, warm_share};
 use model::{Tensor2, Tensor2View};
+use runtime::swaprule::KeptRows;
+use runtime::warm::Predictor;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use threads::CcdMap;
 
 /// What the counter is set to when a service fails: every wait still pending
 /// in the stream passes, so a failed step drains instead of hanging.
@@ -591,6 +594,10 @@ pub(super) struct StepStats {
     pub(super) cols_served: u64,
     pub(super) cols_cols: u64,
     pub(super) gaps: u64,
+    pub(super) warm_listed: u64,
+    pub(super) warm_bytes: u64,
+    pub(super) warm_cut: u64,
+    pub(super) warm_hit_slots: u64,
 }
 
 /// The step port: the boundary and the service state of the go/wait
@@ -651,6 +658,10 @@ pub struct StepPort {
     /// this layer's go. A ring of [`GAP_RING`] made at load; `stats.gaps`
     /// counts the waits ever written.
     gaps: Vec<u64>,
+    /// The L3 warm of the next host layer's predicted experts, when the tier
+    /// has one ([`Warm`]), and the state its load record names.
+    warm: Option<Warm>,
+    warm_state: WarmState,
 }
 
 /// Go waits the ring keeps ([`StepPort::gap_summary`]).
@@ -749,6 +760,8 @@ impl StepPort {
             tally: super::swap::Tally::off(),
             window: None,
             gaps: vec![0; GAP_RING],
+            warm: None,
+            warm_state: WarmState::Off(WarmOff::HostListsNone),
         }
     }
 
@@ -758,6 +771,50 @@ impl StepPort {
     pub(super) fn gap_summary(&self, from: u64, to: u64) -> Result<GapSummary, GpuError> {
         gap_span(&self.gaps, self.stats.gaps, from, to)
             .map_err(|detail| GpuError::shape("StepPort::gap_summary", detail))
+    }
+
+    /// The port with the L3 warm [`Warm::open`] made for `slots` and
+    /// `experts`: the pool's CCD map, the predictor and the walk's buffers,
+    /// or the reason there is none ([`StepPort::warm_state`]). Load-time only.
+    pub(super) fn with_warm<H: HostExperts>(
+        mut self,
+        slots: &SlotMap,
+        experts: &H,
+    ) -> Result<StepPort, GpuError> {
+        let rows = self.boundary.rows().max(self.boundary.layout.cols());
+        let top_k = self.boundary.layout.handoff().n_used;
+        match Warm::open(slots, experts, rows, top_k)? {
+            Ok(w) => {
+                self.warm = Some(w);
+                self.warm_state = WarmState::On;
+            }
+            Err(why) => {
+                self.warm = None;
+                self.warm_state = WarmState::Off(why);
+            }
+        }
+        Ok(self)
+    }
+
+    /// Whether the port warms, and if not why.
+    #[must_use]
+    pub fn warm_state(&self) -> WarmState {
+        self.warm_state
+    }
+
+    /// The pass that just ran, a `kind`, kept `kept` rows: the predictor folds
+    /// those rows' routing at the next pass's services, and a prompt call
+    /// starts its table over. A pass nothing kept (`Abandoned`, `Prompt`)
+    /// keeps no row whatever `kept` says.
+    pub(super) fn warm_pass_end(&mut self, kept: KeptRows, kind: PassKind) {
+        let Some(w) = self.warm.as_mut() else {
+            return;
+        };
+        match kind {
+            PassKind::Prompt => w.pred.reset(),
+            PassKind::Abandoned => w.pred.pass_end(KeptRows::prefix(0)),
+            _ => w.pred.pass_end(kept),
+        }
     }
 
     /// The boundary the chain enqueues its handoffs and waits on.
@@ -853,22 +910,125 @@ impl StepPort {
         self.served = generation;
         self.step_refusal = None;
         self.pair_row0 = None;
+        if let Some(w) = self.warm.as_mut() {
+            w.pred.reset();
+        }
+    }
+
+    /// What a service does before it waits for its go, when the port warms:
+    /// the predictor folds layer `layer`'s pairs of the pass before, and — in
+    /// a step or a row of columns whose go has not yet landed — picks the
+    /// host experts the pass is most likely to route there and lists the
+    /// matrices of those the host can warm, which the wait's walk fills into
+    /// the CCDs' L3s ([`wait_go`]); the list is the experts' order, the most
+    /// likely first. Nothing is listed for another chain, for a go already
+    /// there (the pick would run on the leg's clock), or by a port that does
+    /// not warm; the spans borrow `experts` and go back to the port with
+    /// [`StepPort::warm_spans_back`] before the next host call. A refusal by
+    /// name: the predictor's, and the host's of an expert it cannot list.
+    fn warm_prepare<'a, H: HostExperts>(
+        &mut self,
+        experts: &'a H,
+        slots: &SlotMap,
+        layer: usize,
+        chain: Chain,
+    ) -> Result<Vec<WarmSpan<'a>>, GpuError> {
+        let Some(w) = self.warm.as_mut() else {
+            return Ok(Vec::new());
+        };
+        w.picked.clear();
+        w.warmed = 0;
+        let Some(li) = layer.checked_sub(w.first) else {
+            return Ok(Vec::new());
+        };
+        w.pred.fold(li);
+        if !matches!(chain, Chain::Step | Chain::Cols(_)) {
+            return Ok(Vec::new());
+        }
+        let generation = word(&self.boundary.page, Word::Gen);
+        if !before(
+            generation.load(Ordering::Acquire),
+            self.served.wrapping_add(1),
+        ) {
+            return Ok(Vec::new());
+        }
+        let is_host = |id: u32| matches!(slots.slot(layer, id), Some(Slot::Host));
+        w.pred
+            .pick(li, is_host, w.cap, &mut w.picked)
+            .map_err(|e| GpuError::shape(SERVE, e.to_string()))?;
+        if w.picked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut spans = reuse_spans(std::mem::take(&mut w.spans));
+        experts.warm_spans(layer, &w.picked, &mut spans)?;
+        if spans.len() != w.picked.len() * w.matrices {
+            // The host left some expert out whole (an NVMe-tier id whose slot
+            // is unfilled): list them one at a time to keep the ones it
+            // listed, the walk's order.
+            spans.clear();
+            let mut listed = 0;
+            for i in 0..w.picked.len() {
+                let id = w.picked[i];
+                let before = spans.len();
+                experts.warm_spans(layer, &[id], &mut spans)?;
+                if spans.len() > before {
+                    w.picked[listed] = id;
+                    listed += 1;
+                }
+            }
+            w.picked.truncate(listed);
+        }
+        self.stats.warm_listed += w.picked.len() as u64;
+        Ok(spans)
+    }
+
+    /// The span buffer a service's [`StepPort::warm_prepare`] took, cleared
+    /// and parked in the port again: its allocation is the next service's.
+    fn warm_spans_back(&mut self, spans: Vec<WarmSpan<'_>>) {
+        if spans.capacity() == 0 {
+            return;
+        }
+        if let Some(w) = self.warm.as_mut() {
+            w.spans = reuse_spans(spans);
+        }
+    }
+
+    /// The walk the wait just ran: the bytes its participants loaded and
+    /// whether any was cut by the go, counted, and how many of the listed
+    /// experts' bytes it covered — the experts the service's hits are
+    /// counted against.
+    fn warm_walked(&mut self) {
+        let Some(w) = self.warm.as_mut() else {
+            return;
+        };
+        let (mut bytes, mut cut) = (0u64, false);
+        for slot in &w.walked {
+            bytes += slot.bytes.load(Ordering::Relaxed);
+            cut |= slot.cut.load(Ordering::Relaxed);
+        }
+        let covered = usize::try_from(bytes / w.expert_bytes).unwrap_or(usize::MAX);
+        w.warmed = covered.min(w.picked.len());
+        self.stats.warm_bytes += bytes;
+        self.stats.warm_cut += u64::from(cut);
     }
 
     /// Wait for the go of layer `layer` of row `row` in `chain` and check
     /// it: the go landed in time and no later go is past the rows in
     /// flight, the handoff carries the sequence the host is at, the row's
-    /// layer word is `layer`. Returns the row's image and sum offsets, the
-    /// service's start and the pool's parks at its wait.
+    /// layer word is `layer`. The pool's participants fill `spans` into the
+    /// CCDs' L3s while they wait ([`wait_go`]). `entered` is when the service
+    /// began, before its warm's pick. Returns the row's image and sum offsets,
+    /// the service's start and the pool's parks at its wait.
     fn take_go(
         &mut self,
+        entered: Instant,
         layer: usize,
         row: usize,
         opens_replay: bool,
         chain: Chain,
+        spans: &[WarmSpan<'_>],
     ) -> Result<Go, GpuError> {
         let what = SERVE;
-        let entered = Instant::now();
         let (image_off, hsum_off) = {
             let p = self.boundary.page_of(row, what)?;
             (p.image_off, p.hsum_off)
@@ -877,7 +1037,19 @@ impl StepPort {
         let generation = word(&self.boundary.page, Word::Gen);
         let early = !before(generation.load(Ordering::Acquire), want);
         let parks = threads::pool().stats().worker_parks;
-        let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE);
+        let job = self
+            .warm
+            .as_ref()
+            .filter(|_| !spans.is_empty())
+            .map(|w| WarmJob {
+                spans,
+                map: &w.map,
+                walked: &w.walked,
+            });
+        let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE, job.as_ref());
+        if job.is_some() {
+            self.warm_walked();
+        }
         let gap = nanos(entered.elapsed());
         let closed = Closed::close(self.window.as_ref());
         self.gaps[(self.stats.gaps % GAP_RING as u64) as usize] = gap;
@@ -974,7 +1146,10 @@ impl StepPort {
         if let Chain::Cols(_) = chain {
             return self.serve_cols(experts, health, slots, layer, opens_replay, chain);
         }
-        let go = self.take_go(layer, row, opens_replay, chain)?;
+        let entered = Instant::now();
+        let spans = self.warm_prepare(&*experts, slots, layer, chain)?;
+        let go = self.take_go(entered, layer, row, opens_replay, chain, &spans)?;
+        self.warm_spans_back(spans);
         let (image_off, hsum_off) = (go.image_off, go.hsum_off);
         let page = &self.boundary.page;
         let h = self.boundary.layout.handoff();
@@ -992,6 +1167,7 @@ impl StepPort {
         let (mut w2_host, mut w2_all) = (0.0f64, 0.0f64);
         let mut tier_slots = [0u64; MAX_TIERS];
         let mut unknown = None;
+        let mut routed = WarmRouted::of(self.warm.as_mut());
         for s in 0..h.n_used {
             let (Some(id), Some(wb)) = (
                 payload_word(page, image_off, h.ids + s, words),
@@ -1002,16 +1178,22 @@ impl StepPort {
             let w = f32::from_bits(wb);
             w2_all += f64::from(w) * f64::from(w);
             self.tally.note(layer, row, s, id)?;
-            match slots.slot(layer, id) {
+            let slot = slots.slot(layer, id);
+            match slot {
                 Some(Slot::Host) => {
                     self.list.push((id, w));
                     w2_host += f64::from(w) * f64::from(w);
+                    routed.host(id);
                 }
                 Some(Slot::Card(_)) => {}
                 Some(Slot::Tier { tier, .. }) => tier_slots[tier] += 1,
                 None => unknown = unknown.or(Some((s, id))),
             }
+            if slot.is_some() {
+                routed.note(layer, row, s, id)?;
+            }
         }
+        self.stats.warm_hit_slots += routed.hits;
         self.tier_slots = tier_slots;
         if !payload_f32_into(page, image_off, h.x, words, &mut self.x.data) {
             return Err(GpuError::shape(
@@ -1089,7 +1271,10 @@ impl StepPort {
                 ),
             ));
         }
-        let go = self.take_go(layer, 0, opens_replay, chain)?;
+        let entered = Instant::now();
+        let spans = self.warm_prepare(&*experts, slots, layer, chain)?;
+        let go = self.take_go(entered, layer, 0, opens_replay, chain, &spans)?;
+        self.warm_spans_back(spans);
         let page = &self.boundary.page;
         let h = self.boundary.layout.handoff();
         let words = self.boundary.layout.image_words();
@@ -1108,6 +1293,7 @@ impl StepPort {
         }
         let (mut w2_host, mut w2_all, mut host_slots) = (0.0f64, 0.0f64, 0u64);
         let mut refused = None;
+        let mut routed = WarmRouted::of(self.warm.as_mut());
         for j in 0..m {
             let list = &mut self.lists[j * n..][..n];
             let mut len = 0usize;
@@ -1121,19 +1307,25 @@ impl StepPort {
                 let w = f32::from_bits(wb);
                 w2_all += f64::from(w) * f64::from(w);
                 self.tally.note(layer, j, s, id)?;
-                match slots.slot(layer, id) {
+                let slot = slots.slot(layer, id);
+                match slot {
                     Some(Slot::Host) => {
                         list[len] = (id, w);
                         len += 1;
                         w2_host += f64::from(w) * f64::from(w);
+                        routed.host(id);
                     }
                     Some(Slot::Card(_) | Slot::Tier { .. }) => {}
                     None => refused = refused.or(Some((j, unknown_id(s, id, slots.n_expert())))),
+                }
+                if slot.is_some() {
+                    routed.note(layer, j, s, id)?;
                 }
             }
             self.lens[j] = len;
             host_slots += len as u64;
         }
+        self.stats.warm_hit_slots += routed.hits;
         let xs = &mut self.xs[..m * h.hidden];
         if !payload_f32_into(page, go.image_off, h.x, words, xs) {
             return Err(GpuError::shape(
@@ -1256,6 +1448,277 @@ impl Drop for Closed {
     }
 }
 
+// -------------------------------------------------------------------- warm
+
+/// Whether `BLOOMERY_HOST_WARM` is `on` ([`Warm::open`]'s reading): the
+/// registry's default until a binary's `main` sets its parsed lever
+/// ([`set_host_warm`]).
+static HOST_WARM_ON: AtomicBool = AtomicBool::new(bloomery_levers::HOST_WARM_DEFAULT);
+
+/// `BLOOMERY_HOST_WARM` as a binary's `main` parsed it
+/// (`bloomery_levers::Levers::host_warm`), set once before the model loads
+/// (the tier reads it when it is made); a binary that does not act on the
+/// lever keeps the registry's default.
+pub fn set_host_warm(on: bool) {
+    HOST_WARM_ON.store(on, Ordering::Relaxed);
+}
+
+/// Why a step port runs no warm: the word the `load` record's `why=` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarmOff {
+    /// `BLOOMERY_HOST_WARM=off`.
+    Lever,
+    /// `BLOOMERY_HOST_LANES=flat`: the warm fills the L3 of the CCD that
+    /// computes a row under the CCD lanes, and a flat dispatch computes it
+    /// anywhere.
+    LanesFlat,
+    /// The calling thread is not pinned (`BLOOMERY_PIN_MAIN` off, or the
+    /// binary does not pin it): the pool has no CCD map.
+    CallerUnpinned,
+    /// A pool worker's pin failed: the pool has no CCD map.
+    WorkerUnpinned,
+    /// The topology reads no L3 size, so there is no cap on the warm.
+    L3Unknown,
+    /// The L3s hold less than two experts' bytes, half of them being the warm's
+    /// share.
+    L3Room,
+    /// No layer of the run sends an expert to the host.
+    NoHostExperts,
+    /// The host lists no matrix of any host expert to warm
+    /// ([`HostExperts::warm_spans`]).
+    HostListsNone,
+}
+
+impl WarmOff {
+    /// The record's word.
+    #[must_use]
+    pub fn why(self) -> &'static str {
+        match self {
+            WarmOff::Lever => "lever",
+            WarmOff::LanesFlat => "lanes-flat",
+            WarmOff::CallerUnpinned => "caller-unpinned",
+            WarmOff::WorkerUnpinned => "worker-unpinned",
+            WarmOff::L3Unknown => "l3-unknown",
+            WarmOff::L3Room => "l3-room",
+            WarmOff::NoHostExperts => "no-host-experts",
+            WarmOff::HostListsNone => "host-lists-none",
+        }
+    }
+}
+
+/// Whether a step port warms, as the `load` record states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarmState {
+    On,
+    Off(WarmOff),
+}
+
+impl WarmState {
+    /// `on` or `off`: the record's `warm=`.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            WarmState::On => "on",
+            WarmState::Off(_) => "off",
+        }
+    }
+
+    /// The record's `why=` of an off warm.
+    #[must_use]
+    pub fn why(self) -> Option<&'static str> {
+        match self {
+            WarmState::On => None,
+            WarmState::Off(w) => Some(w.why()),
+        }
+    }
+}
+
+/// One participant's result of a warm walk, a cache line of its own so the
+/// participants' stores do not share one.
+#[derive(Default)]
+#[repr(align(64))]
+struct Walked {
+    bytes: AtomicU64,
+    cut: AtomicBool,
+}
+
+impl Walked {
+    /// The participant's last walk.
+    fn put(&self, done: WarmDone) {
+        self.bytes.store(done.bytes, Ordering::Relaxed);
+        self.cut.store(done.cut, Ordering::Relaxed);
+    }
+}
+
+/// What a wait's participants walk while they wait for a go: the matrices, the
+/// CCD map that cuts them and where each participant leaves its result.
+struct WarmJob<'a> {
+    spans: &'a [WarmSpan<'a>],
+    map: &'a CcdMap,
+    walked: &'a [Walked],
+}
+
+/// The step port's L3 warm: while the card runs the layers before a host
+/// layer's go, each pool participant reads its share of that layer's predicted
+/// host experts into the L3 of the CCD that will compute those rows, and the
+/// go stops it. The predictor, the lists and the walk's results are made at
+/// load: a service allocates nothing.
+pub(super) struct Warm {
+    /// The pool's CCD map the walks and the leg's lanes cut by.
+    map: CcdMap,
+    pred: Predictor,
+    /// The slot map's first layer, the predictor's layer 0.
+    first: usize,
+    /// Experts a layer's walk lists at most: half the L3s' bytes over an
+    /// expert's.
+    cap: usize,
+    /// Bytes of one expert's matrices, and how many matrices the host lists
+    /// for one.
+    expert_bytes: u64,
+    matrices: usize,
+    /// The service's listed experts, most likely first, and how many of them
+    /// the walk covered.
+    picked: Vec<u32>,
+    warmed: usize,
+    /// The walk's matrices, empty between services: the allocation is
+    /// reused ([`reuse_spans`]).
+    spans: Vec<WarmSpan<'static>>,
+    /// Per participant, what its last walk did.
+    walked: Vec<Walked>,
+}
+
+impl Warm {
+    /// The warm for a tier over `slots` and `experts`, whose passes route
+    /// `top_k` experts a layer in up to `rows` rows: the pool's CCD map, one
+    /// expert's bytes as the host lists them, the predictor. `Off` with its
+    /// reason when the lever is off, the lanes are flat, the pool has no CCD
+    /// map or the topology no L3 size, an expert does not fit, no expert is
+    /// the host's or the host lists none. Refused by name: the host's refusal
+    /// of an expert it cannot list, and a shape the predictor is not made for.
+    fn open<H: HostExperts>(
+        slots: &SlotMap,
+        experts: &H,
+        rows: usize,
+        top_k: usize,
+    ) -> Result<Result<Warm, WarmOff>, GpuError> {
+        if !HOST_WARM_ON.load(Ordering::Relaxed) {
+            return Ok(Err(WarmOff::Lever));
+        }
+        let pool = threads::pool();
+        let Some(map) = pool.ccd_map() else {
+            return Ok(Err(if pool.pin_failed() {
+                WarmOff::WorkerUnpinned
+            } else {
+                WarmOff::CallerUnpinned
+            }));
+        };
+        if matches!(Lanes::host_tier(), Lanes::Flat) {
+            return Ok(Err(WarmOff::LanesFlat));
+        }
+        if map.l3_bytes() == 0 {
+            return Ok(Err(WarmOff::L3Unknown));
+        }
+        let (expert_bytes, matrices) = match Warm::expert_bytes(slots, experts)? {
+            Ok(probe) => probe,
+            Err(why) => return Ok(Err(why)),
+        };
+        let cap = usize::try_from(map.l3_bytes() / 2 / expert_bytes).unwrap_or(usize::MAX);
+        if cap == 0 {
+            return Ok(Err(WarmOff::L3Room));
+        }
+        let pred = Predictor::new(slots.layers().len(), slots.n_expert(), rows, top_k)
+            .map_err(|e| GpuError::shape("StepPort::with_warm", e.to_string()))?;
+        Ok(Ok(Warm {
+            map,
+            pred,
+            first: slots.layers().start,
+            cap,
+            expert_bytes,
+            matrices,
+            picked: Vec::with_capacity(cap),
+            warmed: 0,
+            spans: Vec::with_capacity(matrices * cap),
+            walked: (0..pool.threads()).map(|_| Walked::default()).collect(),
+        }))
+    }
+
+    /// Bytes of one expert's matrices as the host lists them, and how many
+    /// matrices that is: the first host expert of the run it lists any of;
+    /// `Err` with why not.
+    fn expert_bytes<H: HostExperts>(
+        slots: &SlotMap,
+        experts: &H,
+    ) -> Result<Result<(u64, usize), WarmOff>, GpuError> {
+        let mut spans = Vec::new();
+        let mut any_host = false;
+        for layer in slots.layers() {
+            let Some(row) = slots.row(layer) else {
+                continue;
+            };
+            for (id, &entry) in (0u32..).zip(row) {
+                if Slot::of(entry) != Slot::Host {
+                    continue;
+                }
+                any_host = true;
+                spans.clear();
+                experts.warm_spans(layer, &[id], &mut spans)?;
+                if !spans.is_empty() {
+                    let bytes = spans.iter().map(|s| s.bytes.len() as u64).sum();
+                    return Ok(Ok((bytes, spans.len())));
+                }
+            }
+        }
+        Ok(Err(if any_host {
+            WarmOff::HostListsNone
+        } else {
+            WarmOff::NoHostExperts
+        }))
+    }
+}
+
+/// A service's view of the warm while it reads its routing: the predictor the
+/// routed ids are noted into, the experts the walk covered, and how many of
+/// the host slots were among them.
+struct WarmRouted<'a> {
+    on: Option<(&'a mut Predictor, &'a [u32], usize)>,
+    hits: u64,
+}
+
+impl<'a> WarmRouted<'a> {
+    fn of(warm: Option<&'a mut Warm>) -> WarmRouted<'a> {
+        WarmRouted {
+            on: warm.map(|w| (&mut w.pred, &w.picked[..w.warmed], w.first)),
+            hits: 0,
+        }
+    }
+
+    /// A host slot routed `id`: a hit when the walk covered it.
+    fn host(&mut self, id: u32) {
+        if let Some((_, warmed, _)) = &self.on {
+            self.hits += u64::from(warmed.contains(&id));
+        }
+    }
+
+    /// Slot `k` of row `row`'s routing at `layer` is `id`.
+    fn note(&mut self, layer: usize, row: usize, k: usize, id: u32) -> Result<(), GpuError> {
+        if let Some((pred, _, first)) = self.on.as_mut() {
+            pred.note(layer.wrapping_sub(*first), row, k, id)
+                .map_err(|e| GpuError::shape(SERVE, e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+/// `v`'s storage as an empty `Vec` of spans of another lifetime: the in-place
+/// collect of an empty iterator keeps the allocation, so the buffer of a
+/// service's spans, which borrow the host experts, outlives the borrow.
+fn reuse_spans<'a, 'b>(mut v: Vec<WarmSpan<'a>>) -> Vec<WarmSpan<'b>> {
+    v.clear();
+    v.into_iter()
+        .map(|_| -> WarmSpan<'b> { unreachable!("the vector was cleared") })
+        .collect()
+}
+
 /// `v`'s storage as an empty `Vec` of slices of another lifetime: the
 /// in-place collect of an empty iterator keeps the allocation, so a buffer of
 /// borrowed lists outlives the borrow it held without a copy.
@@ -1269,15 +1732,31 @@ fn reuse_slices<'a, 'b, T>(mut v: Vec<&'a [T]>) -> Vec<&'b [T]> {
 /// Wait until the generation word has reached `want` or `deadline` has
 /// passed, with every pool thread spinning on it — a pool job, so no worker
 /// is parked when the go lands and the dispatch that follows starts inside
-/// the spin window this job leaves them in. Returns the word as last read,
-/// and the nanoseconds from the calling thread seeing it to the job's end
-/// (the calling thread runs the last chunk and alone writes that stamp).
-fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
+/// the spin window this job leaves them in. With a `warm`, each participant
+/// first walks its share of the job's matrices ([`warm_share`], participant
+/// `t` being chunk `t` of the pool's `threads()` chunks) until the go lands
+/// or the walk is done, and leaves its result in its own slot; then it spins.
+/// Returns the word as last read, and the nanoseconds from the calling
+/// thread seeing it to the job's end (the calling thread runs the last chunk
+/// and alone writes that stamp).
+fn wait_go(
+    generation: &AtomicU32,
+    want: u32,
+    deadline: Instant,
+    warm: Option<&WarmJob<'_>>,
+) -> (u32, u64) {
     let pool = threads::pool();
     let caller = pool.threads() - 1;
     let base = Instant::now();
     let seen_at = AtomicU64::new(0);
     pool.for_each_chunk(pool.threads(), |chunk| {
+        if let Some(w) = warm {
+            let t = chunk.start;
+            let done = warm_share(w.spans, w.map, t, || {
+                !before(generation.load(Ordering::Acquire), want)
+            });
+            w.walked[t].put(done);
+        }
         let mut spins = 0u32;
         while before(generation.load(Ordering::Acquire), want) {
             spins = spins.wrapping_add(1);
@@ -1300,10 +1779,15 @@ fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Boundary, BoundaryShape, CHAINS, Chain, Closed, GapSummary, gap_span};
-    use model::ops::DEFER_MAX_COLS;
+    use super::{
+        Boundary, BoundaryShape, CHAINS, Chain, Closed, GapSummary, Walked, WarmJob, gap_span,
+        wait_go,
+    };
+    use model::ops::{DEFER_MAX_COLS, WarmSpan};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+    use threads::CcdMap;
 
     /// The staging window is closed while a service's guard lives and open
     /// again however the service ends — its signal's drop, an error return,
@@ -1415,6 +1899,100 @@ mod tests {
         }
         assert_eq!(Chain::Quad.index(), 2 + DEFER_MAX_COLS);
         assert_eq!(Chain::Quad.index(), CHAINS - 1);
+    }
+
+    /// The warm walk ends within a poll of the go: participants walk a buffer
+    /// far larger than they cover before a stub go (a thread storing the
+    /// generation word) lands, and the time from the calling thread seeing the
+    /// go to the job's end — the straggle a service's counters keep — has a
+    /// median under [`STRAGGLE_MAX`], and every walk is one the go stopped,
+    /// never one that reached the buffer's end. A poll every megabyte would
+    /// put the median at tens of microseconds. The judge is the median of a
+    /// round of trials, the best of a few rounds: a descheduled
+    /// participant (another process on a pinned core) adds milliseconds to a
+    /// trial, which is the box's load and not the walk's.
+    #[test]
+    #[ignore = "times the pool's participants; `just gate-gpu-lib` runs it on the box"]
+    fn hw_warm_walk_ends_within_a_poll_of_the_go() {
+        const STRAGGLE_MAX: Duration = Duration::from_micros(20);
+        const TRIALS: usize = 40;
+        const ROUNDS: usize = 5;
+        const GO_AFTER: Duration = Duration::from_micros(300);
+        let pool = threads::pool();
+        let map = CcdMap::new(pool.threads(), pool.topology().len().max(1), 0);
+        let bytes = vec![1u8; 512 << 20];
+        let spans = [WarmSpan {
+            bytes: &bytes,
+            units: 1 << 20,
+        }];
+        let walked: Vec<Walked> = (0..pool.threads()).map(|_| Walked::default()).collect();
+        let job = WarmJob {
+            spans: &spans,
+            map: &map,
+            walked: &walked,
+        };
+        let generation = AtomicU32::new(0);
+        let (mut best, mut cuts, mut trials, mut most) = (Duration::MAX, 0, 0, 0u64);
+        for round in 0..ROUNDS {
+            let mut straggles = Vec::with_capacity(TRIALS);
+            for trial in 0..=TRIALS {
+                generation.store(0, Ordering::Release);
+                let started = AtomicBool::new(false);
+                let (straggle, loaded, cut) = std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        while !started.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+                        let t = Instant::now();
+                        while t.elapsed() < GO_AFTER {
+                            std::hint::spin_loop();
+                        }
+                        generation.store(1, Ordering::Release);
+                    });
+                    started.store(true, Ordering::Release);
+                    let (seen, straggle) = wait_go(
+                        &generation,
+                        1,
+                        Instant::now() + Duration::from_secs(10),
+                        Some(&job),
+                    );
+                    assert_eq!(seen, 1, "the stub go landed");
+                    let loaded: u64 = walked.iter().map(|w| w.bytes.load(Ordering::Relaxed)).sum();
+                    let cut = walked.iter().any(|w| w.cut.load(Ordering::Relaxed));
+                    (Duration::from_nanos(straggle), loaded, cut)
+                });
+                // The first trial of a round faults the buffer in; it is not counted.
+                if trial == 0 {
+                    continue;
+                }
+                straggles.push(straggle);
+                trials += 1;
+                cuts += usize::from(cut);
+                most = most.max(loaded);
+            }
+            straggles.sort();
+            let median = straggles[TRIALS / 2];
+            eprintln!(
+                "warm walk round {round}: {TRIALS} trials, straggle median {median:?} p90 {:?} max \
+                 {:?}",
+                straggles[TRIALS * 9 / 10],
+                straggles[TRIALS - 1]
+            );
+            best = best.min(median);
+            if median <= STRAGGLE_MAX {
+                break;
+            }
+        }
+        eprintln!(
+            "warm walk: best median {best:?}, cut {cuts} of {trials}, most bytes loaded {most} of {}",
+            bytes.len()
+        );
+        assert_eq!(cuts, trials, "the go cut every walk");
+        assert!(
+            best <= STRAGGLE_MAX,
+            "the walk's median straggle was {best:?} at best over {ROUNDS} rounds, past \
+             {STRAGGLE_MAX:?}"
+        );
     }
 
     /// A boundary gives back every context handle its windows took: the

@@ -104,11 +104,13 @@ impl<B: TierBody> HostServed for B {
     }
 
     /// The pass the last boundary opened keeping `kept` rows
-    /// ([`ResidencyGlue::keep_rows`]).
+    /// ([`ResidencyGlue::keep_rows`]); a body with no machine hands them to
+    /// its tier alone ([`Hybrid::keep_rows`]), whose step port's warm
+    /// predictor folds them.
     fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
         match self.residency_parts() {
             Some(ResidencyParts { glue, hybrid, .. }) => glue.keep_rows(hybrid, kept, kind),
-            None => Ok(()),
+            None => self.hybrid_mut().keep_rows(kept, kind),
         }
     }
 

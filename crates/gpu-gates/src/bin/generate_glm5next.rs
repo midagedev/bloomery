@@ -358,7 +358,7 @@ mod cli {
                 .w("shadow", "none")
                 .u("shadow_bytes", 0)
                 .u("unified_addressing", 0);
-            with_cards(r, self.placement, m.gpu(), b.hybrid().tiers())
+            let r = with_cards(r, self.placement, m.gpu(), b.hybrid().tiers())
                 .map_err(SessionError::Caller)?
                 .w("prefill", self.prefill.name())
                 .u("group", self.group)
@@ -366,7 +366,8 @@ mod cli {
                 .w("mode", mode_name(self.mode))
                 .w("place", self.place)
                 .w("pin_main", "off")
-                .w("pinned", false)
+                .w("pinned", false);
+            record::load_warm(r, b.hybrid().warm_state())
                 .f("load_s", self.t.elapsed().as_secs_f64())
                 .print();
             if let Some(h) = b.hybrid().residency() {

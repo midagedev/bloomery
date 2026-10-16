@@ -494,6 +494,7 @@ fn vision_of(a: &Args, prefill: body::PrefillMode) -> Result<(), GateError> {
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
+    bloomery_gpu::host::step::set_host_warm(levers.host_warm());
     record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
     let (a, placed) = parse_args(args)?;
     placed.record().eprint();
@@ -1702,13 +1703,14 @@ impl OpenLog<Body> for Log<'_> {
             .w("shadow", "host")
             .u("shadow_bytes", shadow.bytes)
             .u("unified_addressing", shadow.unified_addressing);
-        place::with_cards(m, a.place, WHAT, load)
+        let load = place::with_cards(m, a.place, WHAT, load)
             .map_err(|e| SessionError::Refused(e.to_string()))?
             .w("prefill", b.prefill_mode().name())
             .w("mode", mode_name(StepMode::Graph))
             .w("place", a.place.name())
             .w("pin_main", if a.pin_main { "on" } else { "off" })
-            .w("pinned", self.pinned)
+            .w("pinned", self.pinned);
+        record::load_warm(load, b.hybrid().warm_state())
             .f("load_s", self.t.elapsed().as_secs_f64())
             .eprint();
         if let Some(h) = b.hybrid().residency() {

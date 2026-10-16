@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use gguf::Split;
 use model::moe::{HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
+use model::ops::WarmSpan;
 use model::r8file::{R8Pair, R8Source};
 use model::{Tensor2, Tensor2View};
 
@@ -273,6 +274,27 @@ impl HostExperts for HostRun {
             Some(tier) if tier.covers(layer) => tier.release_union(layer, lists),
             _ => Ok(()),
         }
+    }
+
+    /// The matrices of `ids` of layer `layer` the L3 warm fills
+    /// ([`HostLayer::warm_spans`]): from the file mapping or the r8 sidecar, or
+    /// from the NVMe tier's arena when the slot is already filled; never a
+    /// read of the drive.
+    fn warm_spans<'a>(
+        &'a self,
+        layer: usize,
+        ids: &[u32],
+        out: &mut Vec<WarmSpan<'a>>,
+    ) -> Result<(), GpuError> {
+        let view = layer
+            .checked_sub(self.first)
+            .and_then(|i| self.layers.get(i))
+            .ok_or(GpuError::State {
+                what: "HostRun::warm_spans",
+                missing: "the layer's routed stacks: it is outside the host run",
+            })?;
+        view.warm_spans(self.file.source(), ids, out)?;
+        Ok(())
     }
 
     fn reads(&self) -> Option<HostReads> {

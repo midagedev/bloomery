@@ -10,6 +10,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::PIN_MAIN,
     bloomery_levers::HOST_LANES,
+    bloomery_levers::HOST_WARM,
     bloomery_levers::HOST_POPULATE,
     bloomery_levers::HOST_LOCK,
     bloomery_levers::CARD_DONTNEED,

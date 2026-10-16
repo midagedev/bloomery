@@ -1,0 +1,41 @@
+# T3 on the RTX 3090 at the serving defaults (the Qwen3.8 serve seat, place a, the MTP draft under its cost-chosen width,
+# adaptive residency mid-p0-s1 and the expert stream), prose 3840. The seat pins its caller (BLOOMERY_PIN_MAIN), so the pool has a
+# CCD map. Derived [design-t3, probe S-T3a]: a window layer is front 312.8 + max(shadow 130.5, host 12 + 11.43 x W) + back 86.7
+# us (the evaluator's server preset, 37.45 ms a window at W 23.36); the warm walks front + back - 10 us at 125..134 GB/s less the
+# residency lane's copies in the same gap (0..12.3 MB, from the tournament's 10..19 landings a token, unmeasured): 11.6..16.7
+# experts; the predictor's recall over the first 96 rows of a prose request at B 10..15 is 0.28..0.35 (design-t3 recall5: the
+# table reset at the prompt call, fed the kept rows, cap 16, plus last); the cut a layer is 11.43 x r x (W - c_hot), under the
+# host's 148.5 us excess over the shadow.
+# c_hot is MEASURED: 11.28 us a warmed expert against 24.68 cold (specs/leader/t3probe/result.md), where the design's band
+# assumed 5..12 and its centre 9. The design's sensitivity table (server, centre recall): +8.5 % at c_hot 9, +6.6 % at 12, so
+# +7.1 % at 11.28 by linear interpolation [derived]; c_hot 10.6..12.0 (the fit's k = 3 miss) gives +6.6..+7.7 %. The card's band
+# is the draft's recall spread (5..12 about an 8.5 centre, x0.59..x1.41) on the new centre: 7.1 x 0.59..1.41 = 4.2..10.0
+# [derived]. Changed = ours (warm on), base = ours@BLOOMERY_HOST_WARM=off (CCD lanes on); @BLOOMERY_HOST_LANES=flat separates
+# R1's own price (the probe: +1.2 % ms/token at k = 0 on the leg) from R2's gain.
+# Runner gap (stated, not patched; the runner's owner is the lead): tools/ref/q38-3090-server.sh is the 3090 server-shape
+# runner (plan a, the draft and residency at their unset defaults, no --place passed), and it refuses any lever set in its
+# environment, so the @BLOOMERY_HOST_WARM=off and @BLOOMERY_HOST_LANES=flat arms cannot be carried; it has no arms, rounds,
+# paired ratio, bin: arm or lease/card; it reads no timings.predicted_per_second (it reads the chats' records); and the seat
+# prints no `stat step`, so warm_recall and warm_mb are unreadable there (the load line's `warm=` word is what shows). A run of
+# this card needs the runner to carry an @LEVER=value list per arm, read the predicted_per_second of a 96-token request after a
+# 3840-token prompt, and take the card.
+kind: ab
+question: does the step port's L3 warm cut the Qwen3.8 serve seat's decode window at the serving defaults on the 3090 by the
+  derived share?
+term: decode tok/s @ n=96 greedy tokens, prompt the first 3840 ids of the prose corpus (the server's
+  timings.predicted_per_second), bloomery-serve-qwen38 at its unset defaults (place a on the one 3090, the draft and residency
+  on), RTX 3090 at 250 W: ours against ours@BLOOMERY_HOST_WARM=off, paired by round
+unit: %
+predict: 4.2..10.0
+rounds: 4
+condition: one lease, a fresh server process an arm and round, the 3090 as BLOOMERY_TIMING_GPU, arms ours,
+  ours@BLOOMERY_HOST_WARM=off, ours@BLOOMERY_HOST_LANES=flat and bin:<base tree's bloomery-serve-qwen38>; inside the window:
+  every plan record card= the 3090 with the draft and residency on, the load lines `warm=on` on ours, `warm=off why=lever` on the
+  off arm and `warm=off why=lanes-flat` on the flat arm; the answers' tokens equal across all arms; majflt equal between the on and off arms; no
+  counted row [cold], [cpu-busy] or [other-busy]; the design's recall (0.22..0.42), warm_mb a step (48 x 30..55 MB) and gap_p50
+  (330..450 us) are read from the seat's step records only once it prints them
+decide-in: land with S-T3b's result; write the 3090 server cell beside the README row
+decide-below: below 4.2 %: read the flat arm and the load lines first; straggle or gap up with recall in band means the warm
+  crowds the residency lane's window copies (a profile arm with the residency pass records, then cap the warm while the lane
+  holds a job); recall under 0.22 re-derives the predictor against the engine's kept rows
+decide-above: the cut passes 10.0 %: the overlap form or a larger window; re-derive the band before the README number

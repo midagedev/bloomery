@@ -21,7 +21,8 @@
 //! [`layer`], the sub-layer programs a layer's description names.
 //! [`words`] is smaller and sits below all of them: the word count of a
 //! flat weight stream, the one count the loader's staging and the packings
-//! that pin it must agree on.
+//! that pin it must agree on. [`warm`] is the predictor of the host tier's L3
+//! warm: which of a layer's host experts the next pass will route to.
 
 pub mod combine;
 pub mod hc_gated;
@@ -35,6 +36,7 @@ pub mod state;
 mod stop;
 pub mod stores;
 pub mod swaprule;
+pub mod warm;
 pub mod width;
 pub mod words;
 pub mod xsplit;

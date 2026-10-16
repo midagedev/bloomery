@@ -1,0 +1,39 @@
+# T3 on the RTX 3090 at --place gate, one request, the Qwen3.8 serve seat (bloomery-serve-qwen38: it pins its caller,
+# BLOOMERY_PIN_MAIN, so the pool has a CCD map; generate_qwen3moe never pins and carries neither lever, so the warm cannot run
+# there). Derived [design-t3, probe S-T3a]: leg = 391 host slots a token x W (24.68 us cold, measured), gap p50 190 us a
+# layer; the warm walks the predictor's list for gap - 10 us at 125..134 GB/s = 7.2..7.7 experts of 3.134 MB; the fresh-process
+# predictor's recall over a request's first 96 rows at B7 is 0.42..0.46 on prose (design-t3 recall5); the cut a layer is
+# 8.15 x r x (W - c_hot), less the warm's poll straggle (48 x 0.25 us) and the predictor's 10 us that run in the gap.
+# c_hot is MEASURED: 11.28 us a warmed expert against 24.68 cold, linear in k (specs/leader/t3probe/result.md), where the
+# design's band assumed 5..12 and its centre 9. The design's sensitivity table (gate, centre recall): +15.7 % at c_hot 9,
+# +12.0 % at 12, so +12.9 % at 11.28 by linear interpolation [derived]; the linear fit's own miss at k = 3 (0.68 us) moves c_hot
+# 10.6..12.0 and the centre 12.0..13.7 %. The card's band is the draft's recall spread (10..22 about a 15.7 centre, x0.64..x1.40)
+# on the new centre: 12.9 x 0.64..1.40 = 8.3..18.0 [derived].
+# Changed = ours (warm on, the registry's default), base = ours@BLOOMERY_HOST_WARM=off (the same binary, CCD lanes on). The
+# arm @BLOOMERY_HOST_LANES=flat (R1 off and so the warm off, why=lanes-flat) beside it separates R1's own price (the probe read
+# +1.2 % ms/token at k = 0 on the leg) from R2's gain.
+# Runner gap (stated, not patched; the runner's owner is the lead): tools/ref/q38-3090-server.sh refuses any lever set in its
+# environment; passes no --place; has no arms, rounds, paired ratio, bin: arm or lease/card; reads no
+# timings.predicted_per_second; and the seat prints no `stat step`, so warm_recall and warm_mb are unreadable there (the load
+# line's `warm=on|off why=` and the response's timings are what it shows). A run of this card needs a runner that starts the seat
+# once per arm with `--place gate`, one 96-token greedy request, and carries an @LEVER=value list per arm.
+kind: ab
+question: does the step port's L3 warm of the predicted host experts cut the one-request decode step of the Qwen3.8 serve seat
+  at --place gate on the 3090 by the derived share?
+term: decode tok/s @ n=96 greedy tokens, prompt the first 512 ids of the prose corpus, ctx 4352, bloomery-serve-qwen38 --place
+  gate on qwen4exp (the server's timings.predicted_per_second of one request), RTX 3090 at 250 W, no draft: ours against
+  ours@BLOOMERY_HOST_WARM=off, paired by round
+unit: %
+predict: 8.3..18.0
+rounds: 4
+condition: one lease, a fresh server process an arm and round, the 3090 as BLOOMERY_TIMING_GPU, arms ours,
+  ours@BLOOMERY_HOST_WARM=off, ours@BLOOMERY_HOST_LANES=flat and bin:<base tree's bloomery-serve-qwen38>; inside the window:
+  every load line place=gate on the 3090 with `warm=on` on ours and the base-lever arm's `warm=off why=lever` and the flat arm's
+  `warm=off why=lanes-flat`, the answers' tokens equal across all arms (the warm moves no bit), majflt equal between the on and
+  off arms, no counted row [cold], [cpu-busy] or [other-busy]; the seat prints no stat step, so the design's recall
+  (0.35..0.55) and gap_p50 (170..210 us) are read only once it does
+decide-in: land R1 + R2 (train with R3 if open); write the 3090 G cell for rig-log; open S-T3c (the server arm)
+decide-below: below 8.3 %: read the flat arm first (R1's price against R2's gain: a flat arm above the off arm by 1 % or more
+  prices the CCD lanes themselves); with the load line `warm=on` and the cut under 4 % put c_hot or the map in question
+  (profile the leg with BLOOMERY_PROFILE=1 against the probe's c_hot 11.28 us); recall under 0.35 re-derives the predictor
+decide-above: the cut passes 18.0 %: the overlap form holds in the engine; re-derive the server band with it before S-T3c

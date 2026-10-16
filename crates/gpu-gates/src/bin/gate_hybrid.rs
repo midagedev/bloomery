@@ -78,6 +78,15 @@
 //! width). A set out of order, naming an id twice, past the layer's experts
 //! or one on the card is refused by name before any expert runs.
 //!
+//! And the step port's L3 warm, on the same stub boundary over a host that lists
+//! synthetic matrices: a tier made by an unpinned caller warms nothing and says
+//! why by name (`warm=off why=caller-unpinned`), as do one under the lever's
+//! `off` and one under flat lanes; once the caller is pinned, a second pass
+//! over the same routing, its go held back behind a copy so the host is already
+//! waiting, lists exactly the host experts the first pass routed, loads every
+//! byte of them and cuts no walk, every routed host slot is then a hit, and a
+//! steady service makes no allocator call.
+//!
 //! Printed and not judged: the host tier's counters (services, the host's
 //! share of the routed weight², the host leg, pool parks inside a service,
 //! services whose go was already there) and the allocations per steady
@@ -114,6 +123,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::fused::FusedKernels;
+    use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::host::step::{WarmOff, WarmState, set_host_warm};
     use bloomery_gpu::hybrid::{
         Boundary, BoundaryShape, HOST, HostExperts, Hybrid, HybridConfig, Poison, PoisonKind,
         RELEASE, SlotMap, levers, name_refusal,
@@ -132,7 +143,9 @@ mod gate {
     use cuda_core::sys;
     use gguf::{GgmlType, Gguf, Split};
     use model::arch::deepseek2::derived::Derived;
+    use model::ops::WarmSpan;
     use model::{Tensor2, Tensor2View};
+    use runtime::swaprule::KeptRows;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -830,6 +843,27 @@ mod gate {
         w: &[f32],
         x: &[f32],
     ) -> Result<(Result<(), GpuError>, Vec<f32>), GateError> {
+        let (r, sum, _) = serve_at(gpu, h, R_LAYER, ids, w, x, None)?;
+        Ok((r, sum))
+    }
+
+    /// What [`serve_at`] saw: the tier's answer, the host sum and the
+    /// allocator calls the tier's service made.
+    type Served = (Result<(), GpuError>, Vec<f32>, u64);
+
+    /// [`serve_step`] for layer `layer` of any host, with the stream held
+    /// busy by `late`'s copy before the go when given (the go then lands
+    /// after the host began to wait for it): the tier's answer, the host sum,
+    /// and the allocator calls the tier's service made.
+    fn serve_at<H: HostExperts>(
+        gpu: &Gpu,
+        h: &mut Hybrid<H>,
+        layer: usize,
+        ids: &[u32],
+        w: &[f32],
+        x: &[f32],
+        late: Option<&mut Late>,
+    ) -> Result<Served, GateError> {
         let stream = gpu.stream();
         let seq = h.words().served;
         h.begin_chain(stream)?;
@@ -847,11 +881,16 @@ mod gate {
             }
             t.image.copy_from_host(stream, &img)?;
         }
-        h.boundary().enqueue_go(stream, R_LAYER)?;
+        if let Some(late) = late {
+            late.to.copy_from_device_async(&late.from, stream)?;
+        }
+        h.boundary().enqueue_go(stream, layer)?;
         h.boundary().enqueue_back(stream)?;
-        let r = h.layer_enqueued(R_LAYER);
+        let a0 = ALLOCS.load(Ordering::Relaxed);
+        let r = h.layer_enqueued(layer);
+        let allocs = ALLOCS.load(Ordering::Relaxed) - a0;
         stream.synchronize()?;
-        Ok((r, h.hsum_copy()?))
+        Ok((r, h.hsum_copy()?, allocs))
     }
 
     /// A `norm_quant` launch over a NaN column raising into layer `layer`
@@ -1472,6 +1511,231 @@ mod gate {
         Ok(ok)
     }
 
+    /// Matrices a [`WarmStub`] lists for one host expert, their bytes and the
+    /// rows (units) the warm cuts each by CCD.
+    const W_MATRICES: usize = 3;
+    const W_MATRIX_BYTES: usize = 128 * 1024;
+    const W_UNITS: usize = 64;
+    /// Bytes of the copy that holds a go back: it runs for about a
+    /// millisecond of the card's bandwidth, so the go lands after the host's
+    /// pick and walk.
+    const LATE_BYTES: usize = 256 << 20;
+
+    /// A copy the stream runs before a go, so the go lands after the host
+    /// began to wait for it.
+    struct Late {
+        from: DeviceBuffer<u8>,
+        to: DeviceBuffer<u8>,
+    }
+
+    /// The refusal arm's [`Stub`] host, listing a gate, up and down matrix of
+    /// synthetic bytes for every id of the file.
+    struct WarmStub {
+        stub: Stub,
+        mem: Vec<u8>,
+    }
+
+    impl HostExperts for WarmStub {
+        fn experts_into(
+            &mut self,
+            layer: usize,
+            x: &Tensor2,
+            experts: &[(u32, f32)],
+            out: &mut [f32],
+        ) -> Result<(), GpuError> {
+            self.stub.experts_into(layer, x, experts, out)
+        }
+
+        fn experts_union_into(
+            &mut self,
+            layer: usize,
+            x: Tensor2View<'_>,
+            lists: &[&[(u32, f32)]],
+            out: &mut [f32],
+        ) -> Result<(), GpuError> {
+            self.stub.experts_union_into(layer, x, lists, out)
+        }
+
+        fn warm_spans<'a>(
+            &'a self,
+            _layer: usize,
+            ids: &[u32],
+            out: &mut Vec<WarmSpan<'a>>,
+        ) -> Result<(), GpuError> {
+            for &id in ids {
+                if id as usize >= R_EXPERTS {
+                    return Err(GpuError::Shape {
+                        what: "warm arm host",
+                        detail: format!("expert {id} is not in the file"),
+                    });
+                }
+                for m in 0..W_MATRICES {
+                    out.push(WarmSpan {
+                        bytes: &self.mem[m * W_MATRIX_BYTES..][..W_MATRIX_BYTES],
+                        units: W_UNITS,
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// A tier over [`WarmStub`], made with whatever the process's pin, lanes
+    /// and warm lever say now.
+    fn warm_tier(gpu: &Gpu) -> Result<Hybrid<WarmStub>, GateError> {
+        let shape = BoundaryShape {
+            hidden: R_HIDDEN,
+            n_used: R_USED,
+        };
+        let slots = SlotMap::prefix(0..R_LAYERS, R_EXPERTS, R_CARD)?;
+        let b = Boundary::new(gpu.context(), gpu.stream(), shape)?;
+        let host = WarmStub {
+            stub: Stub::default(),
+            mem: vec![1u8; W_MATRICES * W_MATRIX_BYTES],
+        };
+        let h = Hybrid::new(b, slots, host, R_LAYERS)?;
+        gpu.stream().synchronize()?;
+        Ok(h)
+    }
+
+    /// The routing a warm pass hands over at layers 1 and 2: two host slots
+    /// and four, six in all.
+    const W_IDS: [[u32; R_USED]; 2] = [[0, 2, 9, 12, 4, 6], [1, 9, 12, 3, 14, 10]];
+    const W_HOST_SLOTS: u64 = 6;
+
+    /// One decode pass of the warm arm: layers 1 and 2 served in order, the
+    /// card's go held back by `late` when given, then the one row it kept
+    /// handed to the tier. Whether every service answered, and the allocator
+    /// calls of the last one.
+    fn warm_pass(
+        gpu: &Gpu,
+        h: &mut Hybrid<WarmStub>,
+        mut late: Option<&mut Late>,
+    ) -> Result<(bool, u64), GateError> {
+        let x = bloomery_gpu_gates::activations(R_HIDDEN, 1, 61);
+        let w = x_weights(0);
+        let (mut answered, mut allocs) = (true, 0);
+        for (layer, ids) in (1..).zip(&W_IDS) {
+            let (r, _, a) = serve_at(gpu, h, layer, ids, &w, &x, late.as_deref_mut())?;
+            answered &= r.is_ok();
+            allocs = a;
+        }
+        h.keep_rows(KeptRows::prefix(1), PassKind::Step)?;
+        Ok((answered, allocs))
+    }
+
+    /// A tier made under `state`'s conditions: it names `want` and warms
+    /// nothing over two passes.
+    fn warm_off_case(
+        gpu: &Gpu,
+        late: &mut Late,
+        name: &str,
+        want: WarmState,
+    ) -> Result<bool, GateError> {
+        let mut h = warm_tier(gpu)?;
+        let state = h.warm_state();
+        let (a, _) = warm_pass(gpu, &mut h, Some(&mut *late))?;
+        let (b, _) = warm_pass(gpu, &mut h, Some(late))?;
+        let s = h.stats();
+        let pass = state == want
+            && a
+            && b
+            && s.warm_listed == 0
+            && s.warm_bytes == 0
+            && s.warm_cut == 0
+            && s.warm_hit_slots == 0;
+        println!(
+            "warm {name}: state {state:?} (want {want:?}), listed {} bytes {} cut {} hits {} \
+             (want all 0) {}",
+            s.warm_listed,
+            s.warm_bytes,
+            s.warm_cut,
+            s.warm_hit_slots,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The step port's L3 warm (module doc): whether every case held.
+    fn warm_arm() -> Result<bool, GateError> {
+        let gpu = Gpu::new()?;
+        let stream = gpu.stream();
+        let mut late = Late {
+            from: DeviceBuffer::<u8>::zeroed(stream, LATE_BYTES)?,
+            to: DeviceBuffer::<u8>::zeroed(stream, LATE_BYTES)?,
+        };
+        stream.synchronize()?;
+        let mut ok = true;
+
+        // The caller is not pinned: no CCD map, so no warm, by name. This
+        // runs before the pin below.
+        let unpinned = if threads::pool().pin_failed() {
+            WarmOff::WorkerUnpinned
+        } else {
+            WarmOff::CallerUnpinned
+        };
+        ok &= warm_off_case(&gpu, &mut late, "unpinned caller", WarmState::Off(unpinned))?;
+
+        if !threads::pool().pin_caller() {
+            return Err("gate_hybrid: the warm arm could not pin its caller".into());
+        }
+        set_host_warm(false);
+        let lever = warm_off_case(&gpu, &mut late, "lever off", WarmState::Off(WarmOff::Lever));
+        set_host_warm(true);
+        ok &= lever?;
+        model::ops::set_host_lanes(bloomery_levers::HostLanes::Flat);
+        let flat = warm_off_case(
+            &gpu,
+            &mut late,
+            "flat lanes",
+            WarmState::Off(WarmOff::LanesFlat),
+        );
+        model::ops::set_host_lanes(bloomery_levers::HostLanes::Ccd);
+        ok &= flat?;
+
+        // Pinned, ccd lanes, the lever on: the first pass has nothing to
+        // predict from; the second lists the six host experts the first
+        // routed, walks every byte of them before the late go and finds
+        // every host slot covered; the third makes no allocator call.
+        let mut h = warm_tier(&gpu)?;
+        let state = h.warm_state();
+        let (a, _) = warm_pass(&gpu, &mut h, Some(&mut late))?;
+        let s1 = h.stats();
+        let (b, _) = warm_pass(&gpu, &mut h, Some(&mut late))?;
+        let s2 = h.stats();
+        let (c, allocs) = warm_pass(&gpu, &mut h, Some(&mut late))?;
+        let s3 = h.stats();
+        let expert_bytes = (W_MATRICES * W_MATRIX_BYTES) as u64;
+        let first = s1.warm_listed == 0 && s1.warm_bytes == 0;
+        let second = s2.warm_listed - s1.warm_listed == W_HOST_SLOTS
+            && s2.warm_bytes - s1.warm_bytes == W_HOST_SLOTS * expert_bytes
+            && s2.warm_cut == 0
+            && s2.warm_hit_slots == W_HOST_SLOTS;
+        let third = s3.warm_hit_slots - s2.warm_hit_slots == W_HOST_SLOTS && s3.warm_cut == 0;
+        let steady = allocs == 0;
+        let pass = state == WarmState::On && a && b && c && first && second && third && steady;
+        println!(
+            "warm on: state {state:?} (want On); pass 1 lists {} experts, {} bytes (want 0) {first}; \
+             pass 2 lists {} (want {W_HOST_SLOTS}), loads {} bytes (want {}), cut {}, hits {} of {} \
+             slots {second}; pass 3 hits {} more, cut {} {third}; the last service's allocator calls \
+             {allocs} (want 0) {steady} {}",
+            s1.warm_listed,
+            s1.warm_bytes,
+            s2.warm_listed - s1.warm_listed,
+            s2.warm_bytes - s1.warm_bytes,
+            W_HOST_SLOTS * expert_bytes,
+            s2.warm_cut,
+            s2.warm_hit_slots,
+            W_HOST_SLOTS,
+            s3.warm_hit_slots - s2.warm_hit_slots,
+            s3.warm_cut,
+            verdict(pass)
+        );
+        ok &= pass;
+        println!("warm verdict {}", verdict(ok));
+        Ok(ok)
+    }
+
     /// A one-slot model's reset clears a fault word no call recorded: a NaN
     /// in layer `l`'s input residual through `step_layer_taps`, which does
     /// not read the word, raises it at that layer and poisons nothing; the
@@ -1566,6 +1830,7 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let refusals = refusal_arm()?;
         let exclusion = exclusion_arm()?;
+        let warm = warm_arm()?;
         let lv = levers()?;
         if lv.n_l.is_some() {
             return Err("gate_hybrid: BLOOMERY_HYBRID_NL is set — the all-card reference must load all-card; unset it".into());
@@ -1616,7 +1881,7 @@ mod gate {
             let token = *p.tokens.last().ok_or("gate_hybrid: empty prompt")?;
             chains.push(all_card_chain(&mut a, token, n_layers)?);
         }
-        let mut ok = refusals & exclusion;
+        let mut ok = refusals & exclusion & warm;
         match steady(&mut a, prompts[0].tokens[0]) {
             Ok(allocs) => println!("all_card steady allocs_per_step={allocs:.2} (graph mode)"),
             Err(e) => {

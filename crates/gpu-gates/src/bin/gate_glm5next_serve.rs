@@ -290,6 +290,7 @@ mod gate {
         bloomery_levers::R8,
         bloomery_levers::PIN_MAIN,
         bloomery_levers::HOST_LANES,
+        bloomery_levers::HOST_WARM,
         bloomery_levers::DRAFT,
         bloomery_levers::MTP_WIDTH,
         bloomery_levers::RESIDENCY,

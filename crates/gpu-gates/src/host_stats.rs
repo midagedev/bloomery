@@ -97,6 +97,7 @@ pub fn print_stats(probes: &[Probe], warm: usize) {
             (q.host_w2 - p.host_w2) / served as f64
         };
         let (dmaj, dmin) = (w[1].majflt - w[0].majflt, w[1].minflt - w[0].minflt);
+        let (warm_mb, warm_recall, warm_cut) = warm_of(p, q);
         Record::new(&record::STAT_STEP_HOST)
             .u("i", i)
             .flag("warm", i <= warm)
@@ -114,6 +115,9 @@ pub fn print_stats(probes: &[Probe], warm: usize) {
             .f("gap_min_us", w[1].gap.min_ns as f64 / 1e3)
             .f("gap_p50_us", w[1].gap.p50_ns as f64 / 1e3)
             .f("gap_max_us", w[1].gap.max_ns as f64 / 1e3)
+            .f("warm_mb", warm_mb)
+            .f("warm_recall", warm_recall)
+            .u("warm_cut", warm_cut)
             .print();
         if i > warm {
             legs.push(leg_us);
@@ -141,6 +145,25 @@ pub fn print_stats(probes: &[Probe], warm: usize) {
         .u("vram_free_load", probes[0].vram_free)
         .u("vram_free_min", vram_free_min)
         .print();
+}
+
+/// The step port's L3 warm over the services between two reads of the tier's
+/// counters `p` then `q`: the MB its walks loaded, the share of the host slots
+/// served whose expert a walk had covered by the go, and the services whose
+/// walk the go cut short. Zeros with the warm off.
+#[must_use]
+pub fn warm_of(p: &HybridStats, q: &HybridStats) -> (f64, f64, u64) {
+    let host_slots = q.host_slots - p.host_slots;
+    let recall = if host_slots == 0 {
+        0.0
+    } else {
+        (q.warm_hit_slots - p.warm_hit_slots) as f64 / host_slots as f64
+    };
+    (
+        (q.warm_bytes - p.warm_bytes) as f64 / 1e6,
+        recall,
+        q.warm_cut - p.warm_cut,
+    )
 }
 
 /// The lower median of `sorted` (ascending, at least one value): the value at

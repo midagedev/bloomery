@@ -355,8 +355,8 @@ mod drive {
     use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency41};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LANES,
-        HOST_LOCK, HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP,
-        R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS,
+        HOST_LOCK, HOST_POPULATE, HOST_WARM, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL,
+        PREFILL_GROUP, R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -724,6 +724,7 @@ mod drive {
         CARD_BUDGET,
         PIN_MAIN,
         HOST_LANES,
+        HOST_WARM,
         DRAFT,
         MTP_WIDTH,
         CHECK_FINITE,
@@ -739,6 +740,7 @@ mod drive {
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         model::ops::set_host_lanes(levers.host_lanes());
+        bloomery_gpu::host::step::set_host_warm(levers.host_warm());
         record::at_main("generate_ds41", record::GENERATE_DS41);
         let (a, placed) = parse_args(&levers)?;
         placed.record().print();
@@ -1901,13 +1903,15 @@ mod drive {
             let load = place::with_cards(m, a.place, "generate_ds41", load)
                 .map_err(|e| SessionError::Refused(e.to_string()))?;
             let total = self.t.elapsed();
-            load.u("ctx", a.ctx)
+            let load = load
+                .u("ctx", a.ctx)
                 .u("layers", hp.n_layer)
                 .u("top_k", top_k)
                 .w("mode", mode_name(a.mode))
                 .w("place", a.place.name())
                 .w("pin_main", if self.pin_main { "on" } else { "off" })
-                .w("pinned", self.pinned)
+                .w("pinned", self.pinned);
+            record::load_warm(load, b.hybrid().warm_state())
                 .w(
                     "prefill",
                     if self.check_finite {
@@ -2652,6 +2656,7 @@ mod drive {
             let wait_us = (f.wait_ns - e.wait_ns) as f64 / 1e3;
             let helper_ns = f.helper_ns - e.helper_ns;
             let classify_ns = f.classify_ns - e.classify_ns;
+            let (warm_mb, warm_recall, warm_cut) = bloomery_gpu_gates::host_stats::warm_of(p, q);
             Record::new(&record::STAT_STEP)
                 .u("i", i)
                 .flag("warm", i <= warm)
@@ -2678,6 +2683,9 @@ mod drive {
                 .f("gap_p50_us", w[1].gap.p50_ns as f64 / 1e3)
                 .f("gap_max_us", w[1].gap.max_ns as f64 / 1e3)
                 .f("params_us", (w[1].params_ns - w[0].params_ns) as f64 / 1e3)
+                .f("warm_mb", warm_mb)
+                .f("warm_recall", warm_recall)
+                .u("warm_cut", warm_cut)
                 .print();
             if i > warm {
                 waits.push(wait_us);

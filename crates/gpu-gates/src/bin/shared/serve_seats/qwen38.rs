@@ -296,7 +296,8 @@
 //! with this process's values and exits. The Qwen3.8 levers are
 //! `BLOOMERY_QWEN38_EXPERTS` (the plan's expert rule) with
 //! `BLOOMERY_CARD_BUDGET` bounding its card plan, the host
-//! tier's load settings, `BLOOMERY_PIN_MAIN` with `BLOOMERY_HOST_LANES`,
+//! tier's load settings, `BLOOMERY_PIN_MAIN` with `BLOOMERY_HOST_LANES` and
+//! `BLOOMERY_HOST_WARM`,
 //! the draft's levers,
 //! `BLOOMERY_RESIDENCY`, `BLOOMERY_XSTREAM`, `BLOOMERY_PREFILL`,
 //! `BLOOMERY_ROUTE_TRACE` and `BLOOMERY_STEP_STATS` (the `slots round` record
@@ -1243,6 +1244,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
+    bloomery_gpu::host::step::set_host_warm(levers.host_warm());
     record::at_main("bloomery-serve-qwen38", record::BLOOMERY_SERVE_QWEN38);
     // Set, the word runs as given; unset, the Qwen3.8 rule picks it once the
     // placement and the plan are known (`residency unset`).
@@ -2071,7 +2073,7 @@ impl Q38 {
         eprintln!(
             "load arch=qwen4exp resident_bytes={} ctx={} slots={} slot_ctx={} ctx_max={cap} \
              ctx_train={} verified={VERIFIED_POSITIONS} layers={} mode=graph store_bytes={} \
-             prefill={} ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
+             prefill={} ubatch={} place={} card_layers={}{} in {:.1} s (runtime value)",
             m.resident_bytes(),
             a.ctx,
             a.slots,
@@ -2083,6 +2085,7 @@ impl Q38 {
             m.body(WHAT)?.ubatch_rows(),
             a.place.name(),
             m.body(WHAT)?.card_layers(),
+            record::warm_words(m.body(WHAT)?.hybrid().warm_state()),
             t.elapsed().as_secs_f64()
         );
         // The load's NVMe expert tier, when its plan paged routed experts
