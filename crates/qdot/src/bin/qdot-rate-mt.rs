@@ -3,6 +3,7 @@
 //! Measures sustained bandwidth across thread counts T in {1, 8, 16, 32} using
 //! scoped threads over a shared ~2.5 GB buffer, and under `--granularity`
 //! measures rows/call scaling at T=32 with barrier resynchronization.
+//! `--site <substr>` runs only the shapes whose site names the substring.
 
 use std::sync::Barrier;
 use std::time::Instant;
@@ -32,7 +33,7 @@ struct Shape {
     site: &'static str,
 }
 
-fn shapes() -> [Shape; 5] {
+fn shapes() -> [Shape; 8] {
     [
         Shape {
             ty: GgmlType::Q3_K,
@@ -69,7 +70,63 @@ fn shapes() -> [Shape; 5] {
             rows: 3 * 102_400,             // 2.52 GB
             site: "matmul_q Q5_1 (k=10944, 8208 B/row)",
         },
+        // Bolt's IQ2_XXS experts: the routed up over the 1024-value latent,
+        // the routed down over the widest routed width, the shared up over
+        // the hidden row.
+        Shape {
+            ty: GgmlType::IQ2_XXS,
+            k: 1024,
+            row_bytes: iq2xxs_row_bytes(1024), // 264
+            rows: 92 * 102_400,                // 2.49 GB
+            site: "Bolt routed up IQ2_XXS (k=1024, 264 B/row)",
+        },
+        Shape {
+            ty: GgmlType::IQ2_XXS,
+            k: 2560,
+            row_bytes: iq2xxs_row_bytes(2560), // 660
+            rows: 37 * 102_400,                // 2.50 GB
+            site: "Bolt routed down IQ2_XXS (k=2560, 660 B/row)",
+        },
+        Shape {
+            ty: GgmlType::IQ2_XXS,
+            k: 4096,
+            row_bytes: iq2xxs_row_bytes(4096), // 1056
+            rows: 23 * 102_400,                // 2.49 GB
+            site: "Bolt shared up IQ2_XXS (k=4096, 1056 B/row)",
+        },
     ]
+}
+
+/// An IQ2_XXS weight row's bytes for `k` values: `k`'s whole blocks (the
+/// type's 256-value granularity) times the block size `GgmlType` carries.
+/// [`check_iq2xxs_row_bytes`] ties this to the row size `dot_row` itself
+/// demands, so neither constant can drift alone.
+fn iq2xxs_row_bytes(k: usize) -> usize {
+    let ty = GgmlType::IQ2_XXS;
+    let block = ty.type_size().expect("IQ2_XXS has a block size") as usize;
+    (k / qdot::k_granularity(ty)) * block
+}
+
+/// Every IQ2_XXS shape's `row_bytes` is the size `dot_row` itself demands for
+/// its k: the empty-row refusal's `need` comes from the lib's own block
+/// constant, so a granularity or block size that drifted apart is named here
+/// before any cell runs.
+fn check_iq2xxs_row_bytes(all: &[Shape]) {
+    for sh in all.iter().filter(|sh| sh.ty == GgmlType::IQ2_XXS) {
+        let Err(qdot::QdotError::ShortWeightRow { need, .. }) =
+            qdot::dot_row(sh.ty, &[], &[], sh.k)
+        else {
+            panic!(
+                "qdot-rate-mt: {} (k={}): dot_row must refuse an empty weight row",
+                sh.site, sh.k
+            );
+        };
+        assert_eq!(
+            sh.row_bytes, need,
+            "{}: row_bytes must equal dot_row's row size at k={}",
+            sh.site, sh.k
+        );
+    }
 }
 
 /// xorshift64* filler: any bytes are valid quantized codes, and the
@@ -227,9 +284,68 @@ fn cell_gran(sh: &Shape, w: &[u8], acol: &[u8], rows_per_call: usize) {
     );
 }
 
+// ---------------------------------------------------------------- site runs
+
+/// The command line: the mode flag and the site selection.
+struct Args {
+    gran: bool,
+    site: Option<String>,
+}
+
+/// `--granularity` selects mode 2; `--site <substr>` runs only the shapes
+/// whose site contains the substring. Other arguments stay ignored, as they
+/// always were.
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
+    let mut gran = false;
+    let mut site = None;
+    let mut args = args.peekable();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--granularity" => gran = true,
+            "--site" => {
+                site = Some(
+                    args.next()
+                        .ok_or_else(|| "--site wants a substring".to_owned())?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(Args { gran, site })
+}
+
+/// The shapes a run holds: every shape, or with `--site` those whose site
+/// contains the substring, in table order. A substring naming nothing is the
+/// error listing every site.
+fn selected<'a>(all: &'a [Shape], site: Option<&str>) -> Result<Vec<&'a Shape>, String> {
+    let Some(want) = site else {
+        return Ok(all.iter().collect());
+    };
+    let hit: Vec<&Shape> = all.iter().filter(|sh| sh.site.contains(want)).collect();
+    if hit.is_empty() {
+        return Err(format!(
+            "--site '{want}' names no shape; the sites are:\n  {}",
+            all.iter()
+                .map(|sh| sh.site)
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        ));
+    }
+    Ok(hit)
+}
+
 fn main() {
-    let gran = std::env::args().any(|a| a == "--granularity");
-    if gran {
+    let args = parse_args(std::env::args().skip(1)).unwrap_or_else(|e| {
+        eprintln!("qdot-rate-mt: {e}");
+        std::process::exit(2);
+    });
+    let all = shapes();
+    let run = selected(&all, args.site.as_deref()).unwrap_or_else(|e| {
+        eprintln!("qdot-rate-mt: {e}");
+        std::process::exit(2);
+    });
+    check_iq2xxs_row_bytes(&all);
+    if args.gran {
         println!(
             "qdot-rate-mt --granularity: T=32, std::sync::Barrier resync per R rows/call (characterizes the Barrier, NOT the pool — see the header caveat)"
         );
@@ -238,7 +354,7 @@ fn main() {
             "qdot-rate-mt: MT streaming ceiling, zero orchestration (std::thread::scope, no pool, no pinning)"
         );
     }
-    for sh in shapes() {
+    for sh in run {
         println!(
             "# {} — {} rows, {:.2} GB",
             sh.site,
@@ -247,15 +363,96 @@ fn main() {
         );
         let w = fill(sh.rows, sh.row_bytes);
         let a = acol(sh.ty, sh.k);
-        if gran {
+        if args.gran {
             for r in RS {
-                cell_gran(&sh, &w, &a, r);
+                cell_gran(sh, &w, &a, r);
             }
         } else {
             for t in [1usize, 8, 16, 32] {
-                cell_mt(&sh, &w, &a, t);
+                cell_mt(sh, &w, &a, t);
             }
         }
         drop(w); // free memory before the next shape allocates
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gguf::GgmlType;
+
+    use super::{Shape, selected, shapes};
+
+    /// The sites a selection holds, in order.
+    fn sites<'a>(v: &[&'a Shape]) -> Vec<&'a str> {
+        v.iter().map(|s| s.site).collect()
+    }
+
+    /// FAIL-first: every IQ2_XXS shape's `row_bytes` is the size `dot_row`
+    /// itself demands for its k — the empty-row refusal's `need`, straight
+    /// from the lib's own block constant — and its site names that size, so a
+    /// drifted constant or a stale site string fails here by site. row bytes
+    /// computed from a wrong block size or granularity fail this.
+    #[test]
+    fn iq2xxs_row_bytes_are_what_dot_row_demands() {
+        for sh in shapes() {
+            if sh.ty != GgmlType::IQ2_XXS {
+                continue;
+            }
+            let Err(qdot::QdotError::ShortWeightRow { need, .. }) =
+                qdot::dot_row(sh.ty, &[], &[], sh.k)
+            else {
+                panic!(
+                    "{} (k={}): dot_row must refuse an empty weight row",
+                    sh.site, sh.k
+                );
+            };
+            assert_eq!(
+                sh.row_bytes, need,
+                "{}: dot_row's row size at k={}",
+                sh.site, sh.k
+            );
+            assert!(
+                sh.site.contains(&format!("{} B/row", sh.row_bytes)),
+                "{}: the site must name its row size",
+                sh.site
+            );
+        }
+    }
+
+    /// `--site` holds the shapes whose site contains the substring, in table
+    /// order (the five Q rows first, the three IQ2_XXS rows last, their
+    /// strings unchanged); no `--site` holds every shape; a substring naming
+    /// nothing is the refusal listing every site.
+    #[test]
+    fn site_selection_runs_substring_matches_in_order() {
+        let all = shapes();
+        let every = selected(&all, None).expect("no --site runs every shape");
+        assert_eq!(
+            sites(&every),
+            [
+                "batch Q3_K + matmul_q Q3_K (k=2048, 880 B/row)",
+                "matmul_q Q4_K (k=2048, 1152 B/row)",
+                "matmul_q Q6_K (k=2048, 1680 B/row)",
+                "batch Q5_0 (k=1408, 968 B/row)",
+                "matmul_q Q5_1 (k=10944, 8208 B/row)",
+                "Bolt routed up IQ2_XXS (k=1024, 264 B/row)",
+                "Bolt routed down IQ2_XXS (k=2560, 660 B/row)",
+                "Bolt shared up IQ2_XXS (k=4096, 1056 B/row)",
+            ]
+        );
+        let shared = selected(&all, Some("Bolt shared")).expect("the shared site is named");
+        assert_eq!(
+            sites(&shared),
+            ["Bolt shared up IQ2_XXS (k=4096, 1056 B/row)"]
+        );
+        let iq2 = selected(&all, Some("IQ2_XXS")).expect("the IQ2_XXS sites are named");
+        assert_eq!(iq2.len(), 3);
+        let Err(none) = selected(&all, Some("nomatch")).map(|hit| hit.len()) else {
+            panic!("a substring naming nothing is refused");
+        };
+        assert!(none.contains("--site 'nomatch' names no shape"), "{none}");
+        for site in sites(&every) {
+            assert!(none.contains(site), "{none} must list {site}");
+        }
     }
 }
