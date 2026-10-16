@@ -1609,9 +1609,7 @@ mod cli {
             Chosen::Qwen3(..) | Chosen::Qwen35(..) | Chosen::NemotronH(_) => Draft38::Off,
         };
         if last_step
-            && (!matches!(family, Family::Qwen3 | Family::Qwen35)
-                || timed
-                || seed_depth.is_some())
+            && (!matches!(family, Family::Qwen3 | Family::Qwen35) || timed || seed_depth.is_some())
         {
             return Err(format!(
                 "--last-step feeds a qwen3moe or qwen35moe prompt's last id as a step, the server's \
