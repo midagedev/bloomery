@@ -417,6 +417,15 @@ impl Iq2XxsTab {
     }
 }
 
+/// The `iq2xxs_grid` entry `i`'s magnitudes at nibble `n` (bytes `4n .. 4n + 4`
+/// of its u64): one group's half, the four values an `mma` A-fragment lane
+/// holds (`grouped.rs`'s IQ2_XXS decode).
+#[inline(always)]
+pub(crate) fn iq2xxs_grid_half(i: u32, n: u32) -> u32 {
+    // SAFETY: i & 255 < 256, GRID2XXS's length.
+    unsafe { (*GRID2XXS.get_unchecked((i & 255) as usize) >> (32 * (n & 1))) as u32 }
+}
+
 /// One IQ2_XXS sub-block from its two words (module doc): its eight signed
 /// value words in value order and the factor `2s + 1`. Group `l`'s selector
 /// is grid word `idx` byte `l` or'd with sign word `aux` bits `7l .. 7l + 7`;
