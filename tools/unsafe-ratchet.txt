@@ -270,7 +270,10 @@ gguf 9 2 0
 # decode table (fill, its reads, the two entries' fills) replacing the grid read (bolt-iq2opt), and gemm_iq2xxs's
 # super-block word reads (gemm/grouped.rs iq2xxs_lane) with the IQ2_XXS grid's half-word read (iq.rs
 # iq2xxs_grid_half), each with its SAFETY line.
-gpu 1871 203 10
+# PIN(2026-10-16): gpu 1871 -> 1873 blocks, a new kernel entry, not old code relaxed: gemm_nvfp4p's w32! relays (the
+# nvfp4p @load of the unit's four code words and scale word, the @store of its eight staged code words and two
+# sub-block scales; the step loop's two mma blocks moved into mma_epi32!'s arms unchanged), each with its SAFETY line.
+gpu 1873 203 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
