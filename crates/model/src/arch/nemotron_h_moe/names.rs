@@ -29,6 +29,10 @@ pub const FFN_LATENT_UP: &str = "ffn_latent_up.weight";
 pub const FFN_UP_EXPS: &str = "ffn_up_exps.weight";
 /// The routed experts' down stack.
 pub const FFN_DOWN_EXPS: &str = "ffn_down_exps.weight";
+/// The gated routed up stack this file never holds: the relu² host build
+/// ([`super::host`]) names it so a file that carries one is refused — the
+/// form and the file disagree — instead of reading a stack it cannot.
+pub const FFN_GATE_EXPS: &str = "ffn_gate_exps.weight";
 /// The shared expert's up projection, with no gate.
 pub const FFN_UP_SHEXP: &str = "ffn_up_shexp.weight";
 /// The shared expert's down projection.
@@ -38,4 +42,23 @@ pub const FFN_DOWN_SHEXP: &str = "ffn_down_shexp.weight";
 #[must_use]
 pub fn ffn_gate_inp(l: usize) -> String {
     blk(l, FFN_GATE_INP)
+}
+
+/// `blk.{l}.ffn_gate_exps.weight` — the stack [`FFN_GATE_EXPS`] names, which
+/// the file must not hold.
+#[must_use]
+pub fn ffn_gate_exps(l: usize) -> String {
+    blk(l, FFN_GATE_EXPS)
+}
+
+/// `blk.{l}.ffn_up_exps.weight`.
+#[must_use]
+pub fn ffn_up_exps(l: usize) -> String {
+    blk(l, FFN_UP_EXPS)
+}
+
+/// `blk.{l}.ffn_down_exps.weight`.
+#[must_use]
+pub fn ffn_down_exps(l: usize) -> String {
+    blk(l, FFN_DOWN_EXPS)
 }

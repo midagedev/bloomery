@@ -4364,7 +4364,7 @@ pub fn host_stack_runs(
 /// the combine between them. An activation fact the architecture decides,
 /// not a model: the host union serves either form of any layer's stacks, so
 /// it lives here, beside the combines that read it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ExpertForm {
     /// Gated SwiGLU: `[gate, up, down]`, the combine `silu(gate·x) ⊙ (up·x)`
     /// — `clamp(up, ±limit) · min(silu(gate), limit)` with a limit above
@@ -6140,7 +6140,7 @@ mod tests {
             off: &[0, 1, 2],
             cols: &[0, 0],
         };
-        let e = match UnionCall::new(plan, [gate, up, down], x.view(), None, ff) {
+        let e = match UnionCall::new(plan, [gate, up, down], x.view(), crate::ops::ExpertForm::Gated { limit: 0.0 }) {
             Ok(_) => panic!("an id past the stacks must be refused"),
             Err(e) => e.to_string(),
         };

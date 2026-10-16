@@ -11,6 +11,7 @@
 
 pub mod fixture;
 pub mod hparams;
+pub mod host;
 pub mod names;
 pub mod place;
 pub mod roles;
