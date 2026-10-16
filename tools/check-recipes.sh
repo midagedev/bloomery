@@ -383,6 +383,7 @@ blk_pytools() {
     "tools/ref/lev_ref.py --self-test"
     "tools/ref/loop-floor.py --self-test"
     "tools/ref/nsys-bridge.py --self-test"
+    "tools/ref/nsys-table.py --self-test"
     "tools/ref/ptx-canon.py --self-test"
     "tools/ref/qdot-rate-floors.py --self-test"
     "tools/ref/source-inspection-test.py --self-test"
