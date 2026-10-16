@@ -389,6 +389,7 @@ mod cli {
     use app::mtp::{MtpBody, MtpDraft, WindowDraft};
     use app::{Session, SessionError};
     use bloomery_gpu::arch::nemotron_h::{Body as BodyNh, PASS_ROWS as NH_PASS_ROWS};
+    use bloomery_gpu::arch::nemotron_h_moe::Body as BodyNhMoe;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
     use bloomery_gpu::arch::qwen3moe::{
@@ -401,7 +402,7 @@ mod cli {
     use bloomery_gpu::host::xstream::{XLayer, XReport};
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
-    use bloomery_gpu::{Gpu, GpuModel, NemotronHModel, Qwen3moeModel};
+    use bloomery_gpu::{Gpu, GpuModel, NemotronHModel, NemotronHMoeModel, Qwen3moeModel};
 
     use bloomery_gpu_gates::generate::{Place, card_words, lane_at};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
@@ -489,6 +490,9 @@ mod cli {
         /// `nemotron_h`, the whole model on one card, one sequence, its
         /// prompt run as steps.
         NemotronH,
+        /// `nemotron_h_moe` (Nemotron 3.5 Bolt), the same whole-card, one-sequence
+        /// shape, its prompt run as steps.
+        NemotronHMoe,
     }
 
     impl Family {
@@ -499,6 +503,7 @@ mod cli {
                 Family::Qwen35 => "qwen35moe",
                 Family::Qwen38 => "qwen4exp",
                 Family::NemotronH => "nemotron_h",
+                Family::NemotronHMoe => "nemotron_h_moe",
             }
         }
     }
@@ -519,6 +524,7 @@ mod cli {
             Arch::Qwen3moe => Ok((file, Family::Qwen3)),
             Arch::Qwen35moe => Ok((file, Family::Qwen35)),
             Arch::NemotronH => Ok((file, Family::NemotronH)),
+            Arch::NemotronHMoe => Ok((file, Family::NemotronHMoe)),
             other => Err(format!(
                 "{} is a {} file; generate_qwen3moe runs qwen3moe, qwen35moe, qwen4exp and \
                  nemotron_h files",
@@ -756,33 +762,74 @@ mod cli {
         }
 
         fn seed(_: &mut NemotronHModel, rows: usize) -> Result<(), GateError> {
-            Err(no_seed_nh(rows))
+            Err(no_seed_nh(Family::NemotronH, rows))
         }
     }
 
-    /// `--seed-depth` on a nemotron_h file, refused by name: a seeded cache
-    /// row carries no scan state, so the Mamba-2 layers would decode from an
-    /// empty state at a deep position.
-    fn no_seed_nh(rows: usize) -> GateError {
+    /// The nemotron_h_moe body's one prompt path (`Path` is `()`): its ids run
+    /// as steps through the captured step chain; the body has no prompt call.
+    impl Prompted for BodyNhMoe {
+        type Path = ();
+
+        /// `step` or `pass`, or no `--prefill`: the steps.
+        fn path(arg: Option<&str>) -> Result<(), GateError> {
+            match arg {
+                None | Some("step" | "pass") => Ok(()),
+                Some(o) => Err(format!(
+                    "--prefill {o}: a nemotron_h_moe prompt runs as steps (--prefill step or pass); \
+                     the body has no prompt call"
+                )
+                .into()),
+            }
+        }
+
+        fn plan(_: &NemotronHMoeModel, n: usize, _: ()) -> Result<Units, GateError> {
+            Ok(Units {
+                text: format!("step x{n}"),
+                count: n,
+                kind: "step",
+                ubatch_tokens: 0,
+            })
+        }
+
+        fn prefill(m: &mut NemotronHMoeModel, ids: &[u32], _: ()) -> Result<u32, GateError> {
+            Ok(m.step(ids)?)
+        }
+
+        fn image(_: &NemotronHMoeModel, _: &Units) -> Result<Option<ImageWrite>, GateError> {
+            Ok(None)
+        }
+
+        fn seed(_: &mut NemotronHMoeModel, rows: usize) -> Result<(), GateError> {
+            Err(no_seed_nh(Family::NemotronHMoe, rows))
+        }
+    }
+
+    /// `--seed-depth` on a nemotron file, refused by name: a seeded cache row
+    /// carries no scan state, so the Mamba-2 layers would decode from an empty
+    /// state at a deep position.
+    fn no_seed_nh(family: Family, rows: usize) -> GateError {
         format!(
-            "--seed-depth {rows}: a nemotron_h depth holds each Mamba-2 layer's scan state, which \
-             no seeded cache row carries; feed the ids (--tokens)"
+            "--seed-depth {rows}: a {} depth holds each Mamba-2 layer's scan state, which no \
+             seeded cache row carries; feed the ids (--tokens)",
+            family.name()
         )
         .into()
     }
 
-    /// The flags a nemotron_h run does not take that no family guard of
-    /// [`cli::run`] already refuses, by name before the load: the body runs
-    /// whole on one card with f16 K/V.
-    fn nemotron_refused(kv: KvQ8, place: bool) -> Result<(), GateError> {
+    /// The flags a nemotron run (nemotron_h or nemotron_h_moe) does not take
+    /// that no family guard of [`cli::run`] already refuses, by name before
+    /// the load: the body runs whole on one card with f16 K/V.
+    fn nemotron_refused(family: Family, kv: KvQ8, place: bool) -> Result<(), GateError> {
         let set = [
             ("--place", place),
             ("BLOOMERY_QWEN3_KV=q8_0", kv == KvQ8::Q8),
         ];
         match set.iter().find(|(_, on)| *on) {
             Some((name, _)) => Err(format!(
-                "{name} on a nemotron_h file: its body runs whole on one card, one sequence, \
-                 with f16 K/V and no expert tier"
+                "{name} on a {} file: its body runs whole on one card, one sequence, with f16 \
+                 K/V and no expert tier",
+                family.name()
             )
             .into()),
             None => Ok(()),
@@ -1563,11 +1610,19 @@ mod cli {
             }
             Family::NemotronH => {
                 draft_refused_on_other(&levers, family)?;
-                nemotron_refused(kv, place.is_some())?;
+                nemotron_refused(family, kv, place.is_some())?;
                 if let Some(d) = seed_depth {
-                    return Err(no_seed_nh(d));
+                    return Err(no_seed_nh(family, d));
                 }
                 (Chosen::NemotronH(BodyNh::path(prefill)?), None, None)
+            }
+            Family::NemotronHMoe => {
+                draft_refused_on_other(&levers, family)?;
+                nemotron_refused(family, kv, place.is_some())?;
+                if let Some(d) = seed_depth {
+                    return Err(no_seed_nh(family, d));
+                }
+                (Chosen::NemotronHMoe(BodyNhMoe::path(prefill)?), None, None)
             }
             Family::Qwen38 => {
                 if let Some(d) = seed_depth {
@@ -1606,7 +1661,10 @@ mod cli {
         };
         let draft = match chosen {
             Chosen::Qwen38(_, _, d, _) => d,
-            Chosen::Qwen3(..) | Chosen::Qwen35(..) | Chosen::NemotronH(_) => Draft38::Off,
+            Chosen::Qwen3(..)
+            | Chosen::Qwen35(..)
+            | Chosen::NemotronH(_)
+            | Chosen::NemotronHMoe(_) => Draft38::Off,
         };
         if last_step
             && (!matches!(family, Family::Qwen3 | Family::Qwen35) || timed || seed_depth.is_some())
@@ -1714,7 +1772,10 @@ mod cli {
         }
         let (place_a, prefill_step) = match chosen {
             Chosen::Qwen38(path, place, ..) => (stage_a(place), path == Prompt38::Step),
-            Chosen::Qwen3(..) | Chosen::Qwen35(..) | Chosen::NemotronH(_) => (false, false),
+            Chosen::Qwen3(..)
+            | Chosen::Qwen35(..)
+            | Chosen::NemotronH(_)
+            | Chosen::NemotronHMoe(_) => (false, false),
         };
         let at = Residency38At {
             qwen38_file: family == Family::Qwen38,
@@ -1799,8 +1860,22 @@ mod cli {
                     drive(m, &run, path, &arms, listed, sync)
                 }
             }
+            Chosen::NemotronHMoe(path) => {
+                let m = open_nemotron(
+                    "nemotron_h_moe",
+                    |g| NemotronHMoeModel::open(g, file, ctx),
+                    (ctx, mode),
+                    t,
+                )?;
+                drive(m, &run, path, &arms, listed, sync)
+            }
             Chosen::NemotronH(path) => {
-                let m = open_nemotron(file, (ctx, mode), t)?;
+                let m = open_nemotron(
+                    "nemotron_h",
+                    |g| NemotronHModel::open(g, file, ctx),
+                    (ctx, mode),
+                    t,
+                )?;
                 drive(m, &run, path, &arms, listed, sync)
             }
             Chosen::Qwen38(path, place, draft, room) => match draft {
@@ -2150,6 +2225,7 @@ mod cli {
         /// ([`paged38`]) and the load plan by the same reading.
         Qwen38(Prompt38, Place, Draft38, (u64, HostRead)),
         NemotronH(PromptNh),
+        NemotronHMoe(()),
     }
 
     /// `--place` on a qwen3moe or qwen35moe file: the placement word
@@ -2264,15 +2340,17 @@ mod cli {
         ])
     }
 
-    /// The nemotron_h engine on the card the run holds, its step captured in
-    /// graph mode, with its `load` record (the seat's [`record::LOAD_NEMOTRON`])
-    /// and, in graph mode, its [`record::CAPTURE`].
-    fn open_nemotron(
-        file: Split,
+    /// A nemotron engine (`open` on the card the run holds), its step captured
+    /// in graph mode, with its `load` record (the seat's
+    /// [`record::LOAD_NEMOTRON`], `arch` named) and, in graph mode, its
+    /// [`record::CAPTURE`].
+    fn open_nemotron<B: ChainBody>(
+        arch: &str,
+        open: impl FnOnce(Gpu) -> Result<GpuModel<B>, bloomery_gpu::GpuError>,
         (ctx, mode): (usize, StepMode),
         t: Instant,
-    ) -> Result<NemotronHModel, GateError> {
-        let mut m = NemotronHModel::open(Gpu::new()?, file, ctx)?;
+    ) -> Result<GpuModel<B>, GateError> {
+        let mut m = open(Gpu::new()?)?;
         m.set_mode(mode);
         let nodes = if mode == StepMode::Graph {
             m.capture_step()?
@@ -2280,7 +2358,7 @@ mod cli {
             0
         };
         Record::new(&record::LOAD_NEMOTRON)
-            .w("arch", "nemotron_h")
+            .w("arch", arch)
             .u("resident_bytes", m.resident_bytes())
             .u("ctx", ctx)
             .u("slots", 1)
@@ -3417,9 +3495,10 @@ mod cli {
                 beside.extend([stats, trace]);
                 gen_slots::refused::<Body38>(slots, "qwen4exp", &beside)?;
             }
-            Family::NemotronH => {
+            Family::NemotronH | Family::NemotronHMoe => {
                 return Err(format!(
-                    "BLOOMERY_GEN_SLOTS={slots} on a nemotron_h file: its body holds one sequence"
+                    "BLOOMERY_GEN_SLOTS={slots} on a {} file: its body holds one sequence",
+                    family.name()
                 )
                 .into());
             }
