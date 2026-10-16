@@ -871,7 +871,7 @@ mod gate {
             .collect::<Result<_, _>>()?;
         let cache = (&inp.kc, &inp.vc);
         let qd = DeviceBuffer::from_host(gpu.stream(), &rows)?;
-        let all = run_pref(k, gpu, &qd, &counts, cache, g)?;
+        let all = run_pref(k, gpu, &qd, &counts, cache, g, None)?;
         let hc = HostCache {
             kf: kf.to_vec(),
             vf: vf.to_vec(),
@@ -961,8 +961,10 @@ mod gate {
     }
 
     /// One prefill launch of `n_keys.len()` rows (`q` holds that many) over
-    /// the cache planes, into fresh output, read back. The fault word is the
-    /// caller's to read.
+    /// the cache planes, into fresh output, read back: the plain
+    /// group-of-eight entry, or with `split` the split entry at
+    /// [`SPLIT_GROUP`] query heads a key head through `scratch`. The fault
+    /// word is the caller's to read.
     fn run_pref(
         k: &FlashGqaPrefill,
         gpu: &Gpu,
@@ -970,29 +972,40 @@ mod gate {
         n_keys: &[u32],
         (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
         g: &Geom,
+        split: Option<&mut SplitScratch>,
     ) -> Result<Vec<f32>, GateError> {
         let stream = gpu.stream();
-        let (n_head, t) = (g.n_kv * GROUP, n_keys.len());
+        let group = if split.is_some() { SPLIT_GROUP } else { GROUP };
+        let (n_head, t) = (g.n_kv * group, n_keys.len());
         let nk = DeviceBuffer::from_host(stream, n_keys)?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, t * n_head * HEAD)?;
-        k.enqueue(
-            stream,
-            GqaPrefillArgs {
-                q,
-                kc,
-                vc,
-                n_keys: &nk,
-                scale: g.scale,
-                n_head,
-                n_kv: g.n_kv,
-                ctx: g.ctx,
-                t,
-                fault: gpu.unlabelled_sink(),
-                y: &mut y,
-            },
-        )?;
+        let args = GqaPrefillArgs {
+            q,
+            kc,
+            vc,
+            n_keys: &nk,
+            scale: g.scale,
+            n_head,
+            n_kv: g.n_kv,
+            ctx: g.ctx,
+            t,
+            fault: gpu.unlabelled_sink(),
+            y: &mut y,
+        };
+        match split {
+            Some(scratch) => k.enqueue_split(stream, args, scratch)?,
+            None => k.enqueue(stream, args)?,
+        }
         stream.synchronize()?;
         Ok(y.to_host_vec(stream)?)
+    }
+
+    /// A cache's planes with each key head's plane twice: twin key head `j`
+    /// of the doubled cache is `j / 2`.
+    fn twice(b: &[u16], ctx: usize) -> Vec<u16> {
+        b.chunks(ctx * HEAD)
+            .flat_map(|p| p.iter().chain(p).copied())
+            .collect()
     }
 
     /// Each row of `all` (one launch of `q`'s rows at `counts`) against the
@@ -1010,7 +1023,7 @@ mod gate {
         let mut differ = 0usize;
         for (t, &c) in counts.iter().enumerate() {
             let qt = DeviceBuffer::from_host(gpu.stream(), &q[t * w..(t + 1) * w])?;
-            let one = run_pref(k, gpu, &qt, &[c], cache, g)?;
+            let one = run_pref(k, gpu, &qt, &[c], cache, g, None)?;
             differ += usize::from(!bits_equal(&all[t * w..(t + 1) * w], &one));
         }
         Ok(differ)
@@ -1277,7 +1290,7 @@ mod gate {
         let yp = run_pref_q8(kp, gpu, &qd, &count, &c, g, false)?;
         let yp2 = run_pref_q8(kp, gpu, &qd, &count, &c, g, false)?;
         let yps = run_pref_q8(kp, gpu, &qd, &count, &c, g, true)?;
-        let tw = run_pref(kp, gpu, &qd, &count, (&c.k16, &c.v16), g)?;
+        let tw = run_pref(kp, gpu, &qd, &count, (&c.k16, &c.v16), g, None)?;
         let (rerun, sentinel) = (bits_equal(&yp, &yp2), bits_equal(&yp, &yps));
         let twin_same = bits_equal(&yp, &tw);
         let pref_ok = rerun && sentinel && twin_same;
@@ -1549,9 +1562,9 @@ mod gate {
                 let counts: Vec<u32> = (0..t)
                     .map(|i| u32::try_from(p0 + i + 1))
                     .collect::<Result<_, _>>()?;
-                let y = run_pref(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g)?;
-                let y2 = run_pref(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g)?;
-                let y_nan = run_pref(k, gpu, &qd, &counts, (&c.kn, &c.vn), &g)?;
+                let y = run_pref(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g, None)?;
+                let y2 = run_pref(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g, None)?;
+                let y_nan = run_pref(k, gpu, &qd, &counts, (&c.kn, &c.vn), &g, None)?;
                 let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &y_nan));
                 let cu: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
                 let (band, worst) = judge_prefill::<HEAD, PREF_TILE>(
@@ -1599,9 +1612,9 @@ mod gate {
         bad[bad_hi] = u32::try_from(ctx + 1)?;
         bad[bad_zero] = 0;
         let before = gpu.fault()?;
-        let y = run_pref(k, gpu, &qd, &clean, (&kc, &vc), &g)?;
+        let y = run_pref(k, gpu, &qd, &clean, (&kc, &vc), &g, None)?;
         let after_clean = gpu.fault()?;
-        let yb = run_pref(k, gpu, &qd, &bad, (&kc, &vc), &g)?;
+        let yb = run_pref(k, gpu, &qd, &bad, (&kc, &vc), &g, None)?;
         let raised = gpu.fault()?;
         gpu.clear_fault()?;
         let w = n_head * HEAD;
@@ -1728,43 +1741,6 @@ mod gate {
     const SPLIT_T: [usize; 4] = [1, 17, 65, 448];
     const SPLIT_P0: [usize; 3] = [0, 63, 1000];
 
-    /// One `enqueue_split` launch of `n_keys.len()` rows at
-    /// [`SPLIT_GROUP`] query heads a key head over the cache planes, into
-    /// fresh output, read back.
-    fn run_split(
-        k: &FlashGqaPrefill,
-        gpu: &Gpu,
-        q: &DeviceBuffer<f32>,
-        n_keys: &[u32],
-        (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
-        g: &Geom,
-        scratch: &mut SplitScratch,
-    ) -> Result<Vec<f32>, GateError> {
-        let stream = gpu.stream();
-        let (n_head, t) = (g.n_kv * SPLIT_GROUP, n_keys.len());
-        let nk = DeviceBuffer::from_host(stream, n_keys)?;
-        let mut y = DeviceBuffer::<f32>::zeroed(stream, t * n_head * HEAD)?;
-        k.enqueue_split(
-            stream,
-            GqaPrefillArgs {
-                q,
-                kc,
-                vc,
-                n_keys: &nk,
-                scale: g.scale,
-                n_head,
-                n_kv: g.n_kv,
-                ctx: g.ctx,
-                t,
-                fault: gpu.unlabelled_sink(),
-                y: &mut y,
-            },
-            scratch,
-        )?;
-        stream.synchronize()?;
-        Ok(y.to_host_vec(stream)?)
-    }
-
     /// The split entry (module doc), at Bolt's shape on seeded inputs.
     /// Returns whether every check passed.
     fn prefill_split(k: &FlashGqaPrefill, gpu: &Gpu, scale: f32) -> Result<bool, GateError> {
@@ -1789,9 +1765,9 @@ mod gate {
                 let counts: Vec<u32> = (0..t)
                     .map(|i| u32::try_from(p0 + i + 1))
                     .collect::<Result<_, _>>()?;
-                let y = run_split(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g, &mut scratch)?;
-                let y2 = run_split(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g, &mut scratch)?;
-                let y_nan = run_split(k, gpu, &qd, &counts, (&c.kn, &c.vn), &g, &mut scratch)?;
+                let y = run_pref(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g, Some(&mut scratch))?;
+                let y2 = run_pref(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g, Some(&mut scratch))?;
+                let y_nan = run_pref(k, gpu, &qd, &counts, (&c.kn, &c.vn), &g, Some(&mut scratch))?;
                 let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &y_nan));
                 let cu: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
                 let (band, worst) =
@@ -1799,21 +1775,19 @@ mod gate {
                 // Each key head's plane twice: twin key head `j` is `j / 2`,
                 // so head `h` of the twin's group-of-eight launch reads the
                 // real key head `h / 16`.
-                let twice = |b: &[u16]| -> Vec<u16> {
-                    b.chunks(ctx * HEAD)
-                        .flat_map(|p| p.iter().chain(p).copied())
-                        .collect()
-                };
                 let (tk, tv) = (
-                    DeviceBuffer::from_host(stream, &twice(&c.kb))?,
-                    DeviceBuffer::from_host(stream, &twice(&c.vb))?,
+                    DeviceBuffer::from_host(stream, &twice(&c.kb, ctx))?,
+                    DeviceBuffer::from_host(stream, &twice(&c.vb, ctx))?,
                 );
                 let g_twin = Geom {
                     scale,
                     n_kv: n_head / GROUP,
                     ctx,
                 };
-                let twin = bits_equal(&y, &run_pref(k, gpu, &qd, &counts, (&tk, &tv), &g_twin)?);
+                let twin = bits_equal(
+                    &y,
+                    &run_pref(k, gpu, &qd, &counts, (&tk, &tv), &g_twin, None)?,
+                );
                 let pass = band && twin && rerun && nan_same;
                 println!(
                     "prefill split T={t} p0={p0} ctx={ctx}: measured/bound {worst:.3e} band={band} \
@@ -2052,12 +2026,6 @@ mod gate {
                 .map(|(i, &h)| if (i / HEAD) % ctx >= live { NAN16 } else { h })
                 .collect()
         };
-        // Each key head's plane twice: key head `j` of the twin is `j / 2`.
-        let twice = |b: &[u16]| -> Vec<u16> {
-            b.chunks(ctx * HEAD)
-                .flat_map(|p| p.iter().chain(p).copied())
-                .collect()
-        };
         let g = Geom { scale, n_kv, ctx };
         let g_twin = Geom {
             scale,
@@ -2074,8 +2042,8 @@ mod gate {
                 n_keys: DeviceBuffer::from_host(stream, &[u32::try_from(keys)?])?,
             };
             let (tk, tv) = (
-                DeviceBuffer::from_host(stream, &twice(&kp))?,
-                DeviceBuffer::from_host(stream, &twice(&vp))?,
+                DeviceBuffer::from_host(stream, &twice(&kp, ctx))?,
+                DeviceBuffer::from_host(stream, &twice(&vp, ctx))?,
             );
             let exacts: Vec<Exact> = (0..n_head)
                 .map(|h| {
@@ -2345,8 +2313,9 @@ mod gate {
                 }
 
                 // The prefill flash: the step's row alone, at its count.
-                let run_p =
-                    |i: &Inputs| run_pref(&kp, &gpu, &i.q, &[live as u32], (&i.kc, &i.vc), &g);
+                let run_p = |i: &Inputs| {
+                    run_pref(&kp, &gpu, &i.q, &[live as u32], (&i.kc, &i.vc), &g, None)
+                };
                 let yp = run_p(&inp)?;
                 let (rerun_p, nan_p) = (
                     bits_equal(&yp, &run_p(&inp)?),
