@@ -76,14 +76,22 @@
 //! A prompt pass of `U` consecutive tokens (positions `p .. p + U − 1`, `p`
 //! the position word) is [`Mamba2Kernels::enqueue_steps`], whose rows are
 //! bit for bit `U` steps in order. The step's ring write and norm ticket
-//! race across tokens inside one launch, so the pass is up to three entries
+//! race across tokens inside one launch, so the pass is up to four entries
 //! on one stream:
-//! - `mamba2_steps`, the step's grid: per token the conv, whose tap at
-//!   distance `k` reads input row `t − k` of the pass when `t ≥ k`, else the
-//!   ring slot of position `p + t − k` (the ring is read only); the scan with
-//!   the state in registers over the `U` tokens, stored once at the end; `D`,
-//!   the gate and the un-normed `y` row. The stage is double-buffered, so a
-//!   token is one barrier;
+//! - `mamba2_conv_rows`: one launch fully parallel over (token, conv channel)
+//!   and (token, head), the conv outputs `conv[t][c]` ([`conv_out`], the
+//!   step's exact arithmetic; the ring is read only) and the per-head `σ` and
+//!   `dA` of every token into [`Mamba2PassScratch`], so no block of the scan
+//!   recomputes its group's channels again;
+//! - `mamba2_steps`, the step's grid: the scan only, reading the scratch. A
+//!   stage of [`STAGE_T`] tokens — each token's group `B` and `C`, its 16 `x`
+//!   channels and its head's `σ` and `dA`, 274 floats a token — is
+//!   double-buffered (2 · 8 · 274 · 4 = 17 536 B of static shared memory, so
+//!   five blocks an SM at sm_86's 100 KB, against the 2 176 B that held one
+//!   token before), so a token is a barrier only each eighth: the per-token
+//!   conv and its `expf` no longer sit between barriers. The state stays in
+//!   registers over the `U` tokens, stored once at the end; `D`, the gate
+//!   and the un-normed `y` row are the step's;
 //! - `mamba2_ring_tail`: the inputs of positions `max(p, p + U − RING_ROWS)
 //!   .. p + U − 1` into their ring slots, what the steps' last writes leave;
 //! - `mamba2_norm_rows` (with a gain): one block per (token, group), the
@@ -123,8 +131,19 @@ const CH_PER_WARP: usize = 4;
 const CH_PER_BLOCK: usize = WARPS * CH_PER_WARP;
 /// Shared f32s a block stages: its group's `B` and `C`, then its `x`.
 const STAGED: usize = 2 * STATE + CH_PER_BLOCK;
-/// The pass's stage: two of the step's, token `t` in half `t mod 2`.
-const STAGED2: usize = 2 * STAGED;
+/// Tokens of one stage of the pass's scan ([`mamba2_steps`]): the stage holds
+/// each token's group `B` and `C`, its 16 `x` channels and its head's `σ` and
+/// `dA`. 8 keeps the double-buffered stage at 17 536 B of static shared
+/// memory (five blocks an SM at sm_86's 100 KB) while dropping the barrier to
+/// one an eighth token; 16 would hold 35 072 B and two blocks an SM.
+pub const STAGE_T: usize = 8;
+/// Shared f32s one staged token of the pass's scan holds.
+const TOKEN_STAGED: usize = 2 * STATE + CH_PER_BLOCK + 2;
+/// The pass's scan stage: two halves of [`STAGE_T`] tokens.
+const STAGE_T2: usize = 2 * STAGE_T * TOKEN_STAGED;
+/// Staging rounds that cover a full half: `STAGE_T` tokens' items over the
+/// block's threads.
+const STAGE_ROUNDS: usize = (STAGE_T * TOKEN_STAGED + BLOCK - 1) / BLOCK;
 
 // The entries' launch attributes spell the block out as a literal, and the
 // scan and the conv are written for these widths.
@@ -267,13 +286,7 @@ mod mamba2_kernels {
                         let x0 = ring_input(ringp.cast_const(), p, 3, conv_dim, c);
                         let x1 = ring_input(ringp.cast_const(), p, 2, conv_dim, c);
                         let x2 = ring_input(ringp.cast_const(), p, 1, conv_dim, c);
-                        let w = 4 * c;
-                        let mut acc = 0.0f32;
-                        acc += mul_rn_f32(x0, *conv_w.get_unchecked(w));
-                        acc += mul_rn_f32(x1, *conv_w.get_unchecked(w + 1));
-                        acc += mul_rn_f32(x2, *conv_w.get_unchecked(w + 2));
-                        acc += mul_rn_f32(cur, *conv_w.get_unchecked(w + 3));
-                        *cs.add(item) = silu(acc + *conv_b.get_unchecked(c));
+                        *cs.add(item) = conv_out(x0, x1, x2, cur, conv_w, conv_b, c);
                         if writes {
                             *ringp.add(p % RING_ROWS * conv_dim + c) = cur;
                         }
@@ -465,10 +478,120 @@ mod mamba2_kernels {
         }
     }
 
-    /// `U` tokens of one layer from the pass's rows (module doc): the step's
-    /// grid and, per token, its operations in its order; the ring is read
-    /// only, the state is stored once after the last token, and `y` row `t`
-    /// is token `t`'s un-normed output.
+    /// The pass's conv pre-pass (module doc): one launch, fully parallel over
+    /// (token, conv channel) and (token, head) — no block waits on another.
+    /// Writes the conv outputs ([`conv_out`], the step's exact arithmetic) of
+    /// every token's `conv_dim` channels and the per-head `σ` and `dA` of
+    /// every token into the pass scratch, what [`mamba2_steps`] reads; the
+    /// ring is read only.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            n_group >= 1,
+            head_dim >= 1,
+            u >= 1,
+            ld >= x0 + n_head * head_dim + 2 * n_group * STATE,
+            ld >= dt0 + n_head,
+            rows.len() >= u * ld,
+            dt_bias.len() >= n_head,
+            a.len() >= n_head,
+            d.len() >= n_head,
+            conv_w.len() >= CONV_TAPS * (n_head * head_dim + 2 * n_group * STATE),
+            conv_b.len() >= n_head * head_dim + 2 * n_group * STATE,
+            pos.len() >= pos_at + 1,
+            ring.len() >= RING_ROWS * (n_head * head_dim + 2 * n_group * STATE),
+            conv.len() >= u * (n_head * head_dim + 2 * n_group * STATE),
+            sd.len() >= 2 * u * n_head
+        )
+    )]
+    pub fn mamba2_conv_rows(
+        rows: &[f32],
+        dt_bias: &[f32],
+        a: &[f32],
+        d: &[f32],
+        conv_w: &[f32],
+        conv_b: &[f32],
+        ring: &[f32],
+        pos: &[u32],
+        pos_at: u32,
+        u: u32,
+        ld: u32,
+        x0: u32,
+        dt0: u32,
+        n_head: u32,
+        n_group: u32,
+        head_dim: u32,
+        mut conv: DisjointSlice<f32>,
+        mut sd: DisjointSlice<f32>,
+    ) {
+        let (n_head, n_group, hd) = (n_head as usize, n_group as usize, head_dim as usize);
+        let (u, ld, x0, dt0) = (u as usize, ld as usize, x0 as usize, dt0 as usize);
+        let item = thread::blockIdx_x() as usize * BLOCK + thread::threadIdx_x() as usize;
+        let inner = n_head * hd;
+        let conv_dim = inner + 2 * n_group * STATE;
+        let conv_items = u * conv_dim;
+        // SAFETY: pos_at < pos.len() by the contract.
+        let p = unsafe { *pos.get_unchecked(pos_at as usize) } as usize;
+        if item < conv_items {
+            let t = item / conv_dim;
+            let c = item % conv_dim;
+            // SAFETY: (t + 1)·ld <= u·ld <= rows.len(); c < conv_dim and
+            // x0 + conv_dim <= ld, so every row index is < u·ld; c <
+            // conv_b.len() and CONV_TAPS·c + 3 < conv_w.len(); the ring holds
+            // RING_ROWS·conv_dim values; item < u·conv_dim <= conv.len(),
+            // this thread's item alone.
+            unsafe {
+                let cur = *rows.get_unchecked(t * ld + x0 + c);
+                let in0 = pass_input(rows, ring.as_ptr(), p, t, 3, ld, x0, conv_dim, c);
+                let in1 = pass_input(rows, ring.as_ptr(), p, t, 2, ld, x0, conv_dim, c);
+                let in2 = pass_input(rows, ring.as_ptr(), p, t, 1, ld, x0, conv_dim, c);
+                *conv.as_mut_ptr().add(item) = conv_out(in0, in1, in2, cur, conv_w, conv_b, c);
+            }
+        } else if item < conv_items + u * n_head {
+            let j = item - conv_items;
+            let t = j / n_head;
+            let h = j % n_head;
+            // SAFETY: t·ld + dt0 + h < u·ld <= rows.len(); h < n_head <=
+            // dt_bias.len(), a.len(), d.len(); 2·(t·n_head + h) + 1 < 2·u·n_head
+            // <= sd.len(), this thread's item alone.
+            unsafe {
+                let dt_h = *rows.get_unchecked(t * ld + dt0 + h);
+                let bias_h = *dt_bias.get_unchecked(h);
+                let a_h = *a.get_unchecked(h);
+                let d_h = *d.get_unchecked(h);
+                let dtv = dt_h + bias_h;
+                // As the step: a non-finite parameter (D with them) becomes a
+                // non-finite sigma, so the scan faults instead of writing a
+                // finite y (σ of −∞ would be 0).
+                let fin = crate::fault::quad_finite([dt_h, bias_h, a_h, d_h]) & dtv.is_finite();
+                let sigma = if !fin {
+                    f32::NAN
+                } else if dtv <= 20.0 {
+                    dtv.exp().ln_1p()
+                } else {
+                    dtv
+                };
+                let decay = mul_rn_f32(sigma, a_h).exp();
+                let at = 2 * (t * n_head + h);
+                *sd.as_mut_ptr().add(at) = sigma;
+                *sd.as_mut_ptr().add(at + 1) = decay;
+            }
+        }
+    }
+
+    /// `U` tokens of one layer from the pass's rows and the pre-pass's
+    /// scratch (module doc): the step's scan grid, per token the step's
+    /// operations in its order, with the conv outputs and the head's `σ` and
+    /// `dA` read from the scratch instead of recomputed; the state is stored
+    /// once after the last token, and `y` row `t` is token `t`'s un-normed
+    /// output.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -487,35 +610,22 @@ mod mamba2_kernels {
             chunks * CH_PER_BLOCK >= head_dim,
             chunks * CH_PER_BLOCK < head_dim + CH_PER_BLOCK,
             ld >= z0 + n_head * head_dim,
-            ld >= x0 + n_head * head_dim + 2 * n_group * STATE,
-            ld >= dt0 + n_head,
-            rows.len() >= u * ld,
-            dt_bias.len() >= n_head,
-            a.len() >= n_head,
+            conv.len() >= u * (n_head * head_dim + 2 * n_group * STATE),
+            sd.len() >= 2 * u * n_head,
             d.len() >= n_head,
-            conv_w.len() >= CONV_TAPS * (n_head * head_dim + 2 * n_group * STATE),
-            conv_b.len() >= n_head * head_dim + 2 * n_group * STATE,
-            pos.len() >= pos_at + 1,
-            ring.len() >= RING_ROWS * (n_head * head_dim + 2 * n_group * STATE),
+            rows.len() >= u * ld,
             y.len() >= u * n_head * head_dim,
             state.len() >= n_head * head_dim * STATE
         )
     )]
     pub fn mamba2_steps(
         rows: &[f32],
-        dt_bias: &[f32],
-        a: &[f32],
         d: &[f32],
-        conv_w: &[f32],
-        conv_b: &[f32],
-        ring: &[f32],
-        pos: &[u32],
-        pos_at: u32,
+        conv: &[f32],
+        sd: &[f32],
         u: u32,
         ld: u32,
         z0: u32,
-        x0: u32,
-        dt0: u32,
         n_head: u32,
         per: u32,
         n_group: u32,
@@ -525,7 +635,7 @@ mod mamba2_kernels {
         mut y: DisjointSlice<f32>,
         mut state: DisjointSlice<f32>,
     ) {
-        static mut STAGE2: SharedArray<f32, STAGED2> = SharedArray::UNINIT;
+        static mut STAGE_PASS: SharedArray<f32, STAGE_T2> = SharedArray::UNINIT;
 
         let (n_head, per, n_group, hd, chunks) = (
             n_head as usize,
@@ -534,13 +644,7 @@ mod mamba2_kernels {
             head_dim as usize,
             chunks as usize,
         );
-        let (u, ld, z0, x0, dt0) = (
-            u as usize,
-            ld as usize,
-            z0 as usize,
-            x0 as usize,
-            dt0 as usize,
-        );
+        let (u, ld, z0) = (u as usize, ld as usize, z0 as usize);
         let b = thread::blockIdx_x() as usize;
         if b >= n_head * chunks {
             return; // block-uniform
@@ -556,23 +660,16 @@ mod mamba2_kernels {
         let inner = n_head * hd;
         let conv_dim = inner + 2 * n_group * STATE;
         // SAFETY: a block-shared array of this block, reached without a
-        // reference to a `static mut`; the barrier of each token orders its
-        // users (module doc: token `t` stages into half `t mod 2`).
-        let cs = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE2) };
-        let (yp, statep, ringp) = (y.as_mut_ptr(), state.as_mut_ptr(), ring.as_ptr());
-        // SAFETY: pos_at < pos.len() by the contract.
-        let p = unsafe { *pos.get_unchecked(pos_at as usize) } as usize;
+        // reference to a `static mut`; the barrier of each stage orders its
+        // users (module doc: stage `s` stages into half `s mod 2`).
+        let cs = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE_PASS) };
+        let (yp, statep) = (y.as_mut_ptr(), state.as_mut_ptr());
+        let (convp, sdp) = (conv.as_ptr(), sd.as_ptr());
         let c_x = h * hd + chunk * CH_PER_BLOCK;
 
-        // The head's scalars that no token moves, in every thread.
-        // SAFETY: h < n_head <= dt_bias.len(), a.len(), d.len().
-        let (bias_h, a_h, d_h) = unsafe {
-            (
-                *dt_bias.get_unchecked(h),
-                *a.get_unchecked(h),
-                *d.get_unchecked(h),
-            )
-        };
+        // The head's `D`, the one scalar no token moves, in every thread.
+        // SAFETY: h < n_head <= d.len() by the contract.
+        let d_h = unsafe { *d.get_unchecked(h) };
 
         // The warp's four channels' state, held in registers over the pass.
         let mut s = [0.0f32; CH_PER_WARP * 4];
@@ -590,116 +687,112 @@ mod mamba2_kernels {
             }
         }
 
-        let mut t = 0usize;
-        while t < u {
-            let half = (t % 2) * STAGED;
-            let row = t * ld;
-            // Stage token t's conv outputs, items as the step's.
-            #[unroll]
-            for round in 0usize..3 {
+        let mut t0 = 0usize;
+        while t0 < u {
+            let half = (t0 / STAGE_T % 2) * STAGE_T * TOKEN_STAGED;
+            let stage_n = (u - t0).min(STAGE_T);
+            // Stage tokens t0 .. t0 + stage_n of this block's group: each
+            // token's `B` and `C`, its 16 `x` channels and its head's `σ` and
+            // `dA`, items as the step's.
+            // Not unrolled: the rounds' index arithmetic unrolled is what
+            // pushed the scan to the register cap (measured, ptx-scan), and
+            // the stage writes need no ILP.
+            for round in 0usize..STAGE_ROUNDS {
                 let item = tid + BLOCK * round;
-                if item < STAGED {
-                    let (c, live) = if item < STATE {
-                        (inner + g * STATE + item, true)
-                    } else if item < 2 * STATE {
-                        (inner + n_group * STATE + g * STATE + (item - STATE), true)
-                    } else {
-                        let k = item - 2 * STATE;
-                        (c_x + k, chunk * CH_PER_BLOCK + k < hd)
-                    };
-                    if live {
-                        // SAFETY: c < conv_dim, x0 + conv_dim <= ld and t < u,
-                        // so every row index is < u·ld <= rows.len(); c <
-                        // conv_b.len() and CONV_TAPS·c + 3 < conv_w.len(); the
-                        // ring holds RING_ROWS·conv_dim values; half + item <
-                        // STAGED2, this thread's item alone.
-                        unsafe {
-                            let cur = *rows.get_unchecked(row + x0 + c);
-                            let in0 = pass_input(rows, ringp, p, t, 3, ld, x0, conv_dim, c);
-                            let in1 = pass_input(rows, ringp, p, t, 2, ld, x0, conv_dim, c);
-                            let in2 = pass_input(rows, ringp, p, t, 1, ld, x0, conv_dim, c);
-                            let w = 4 * c;
-                            let mut acc = 0.0f32;
-                            acc += mul_rn_f32(in0, *conv_w.get_unchecked(w));
-                            acc += mul_rn_f32(in1, *conv_w.get_unchecked(w + 1));
-                            acc += mul_rn_f32(in2, *conv_w.get_unchecked(w + 2));
-                            acc += mul_rn_f32(cur, *conv_w.get_unchecked(w + 3));
-                            *cs.add(half + item) = silu(acc + *conv_b.get_unchecked(c));
+                if item < stage_n * TOKEN_STAGED {
+                    let t_in = item / TOKEN_STAGED;
+                    let slot = item % TOKEN_STAGED;
+                    let v = if slot < STAGED {
+                        let (c, live) = if slot < STATE {
+                            (inner + g * STATE + slot, true)
+                        } else if slot < 2 * STATE {
+                            (inner + n_group * STATE + g * STATE + (slot - STATE), true)
+                        } else {
+                            let k = slot - 2 * STATE;
+                            (c_x + k, chunk * CH_PER_BLOCK + k < hd)
+                        };
+                        if live {
+                            // SAFETY: (t0 + t_in)·conv_dim + c < u·conv_dim <=
+                            // conv.len() by the contract.
+                            unsafe { *convp.add((t0 + t_in) * conv_dim + c) }
+                        } else {
+                            0.0
                         }
-                    }
+                    } else {
+                        // SAFETY: 2·((t0 + t_in)·n_head + h) + (slot − STAGED)
+                        // < 2·u·n_head <= sd.len() by the contract.
+                        unsafe { *sdp.add(2 * ((t0 + t_in) * n_head + h) + (slot - STAGED)) }
+                    };
+                    // SAFETY: half + t_in·TOKEN_STAGED + slot < half +
+                    // STAGE_T·TOKEN_STAGED <= STAGE_T2; this thread's item
+                    // alone.
+                    unsafe { *cs.add(half + t_in * TOKEN_STAGED + slot) = v };
                 }
             }
             thread::sync_threads();
 
-            // SAFETY: row + dt0 + h < u·ld <= rows.len(): dt0 + n_head <= ld.
-            let dt_h = unsafe { *rows.get_unchecked(row + dt0 + h) };
-            let dtv = dt_h + bias_h;
-            // As the step: a non-finite parameter becomes a non-finite sigma.
-            let fin = crate::fault::quad_finite([dt_h, bias_h, a_h, d_h]) & dtv.is_finite();
-            let sigma = if !fin {
-                f32::NAN
-            } else if dtv <= 20.0 {
-                dtv.exp().ln_1p()
-            } else {
-                dtv
-            };
-            let decay = mul_rn_f32(sigma, a_h).exp();
+            for t_in in 0usize..stage_n {
+                let at0 = half + t_in * TOKEN_STAGED;
+                let row = (t0 + t_in) * ld;
 
-            // SAFETY: half + lane + 96 + 128 < STAGED2; written before the
-            // barrier above.
-            let (bq, cq) = unsafe {
-                (
-                    [
-                        *cs.add(half + lane),
-                        *cs.add(half + lane + 32),
-                        *cs.add(half + lane + 64),
-                        *cs.add(half + lane + 96),
-                    ],
-                    [
-                        *cs.add(half + STATE + lane),
-                        *cs.add(half + STATE + lane + 32),
-                        *cs.add(half + STATE + lane + 64),
-                        *cs.add(half + STATE + lane + 96),
-                    ],
-                )
-            };
-            #[unroll]
-            for i in 0usize..CH_PER_WARP {
-                let k = wid * CH_PER_WARP + i;
-                let ch = chunk * CH_PER_BLOCK + k;
-                if ch < hd {
-                    let at = h * hd + ch;
-                    // SAFETY: half + 2·STATE + k < STAGED2, written before
-                    // the barrier.
-                    let x = unsafe { *cs.add(half + 2 * STATE + k) };
-                    let x_dt = mul_rn_f32(x, sigma);
-                    let mut acc = 0.0f32;
-                    #[unroll]
-                    for j in 0usize..4 {
-                        let v = mul_rn_f32(s[4 * i + j], decay) + mul_rn_f32(bq[j], x_dt);
-                        s[4 * i + j] = v;
-                        acc += mul_rn_f32(v, cq[j]);
-                    }
-                    acc += warp::shuffle_xor_f32(acc, 16);
-                    acc += warp::shuffle_xor_f32(acc, 8);
-                    acc += warp::shuffle_xor_f32(acc, 4);
-                    acc += warp::shuffle_xor_f32(acc, 2);
-                    acc += warp::shuffle_xor_f32(acc, 1);
-                    // SAFETY: row + z0 + at < u·ld <= rows.len(): z0 + inner
-                    // <= ld.
-                    let zv = unsafe { *rows.get_unchecked(row + z0 + at) };
-                    let v = mul_rn_f32(silu(zv), acc + mul_rn_f32(x, d_h));
-                    if lane == 0 {
-                        if !v.is_finite() {
-                            fault.raise(FaultSite::Mamba2Scan);
+                // SAFETY: at0 + lane + 96 + 128 < STAGE_T2 and
+                // at0 + STAGED + 1 < STAGE_T2; written before the barrier
+                // above.
+                let (bq, cq) = unsafe {
+                    (
+                        [
+                            *cs.add(at0 + lane),
+                            *cs.add(at0 + lane + 32),
+                            *cs.add(at0 + lane + 64),
+                            *cs.add(at0 + lane + 96),
+                        ],
+                        [
+                            *cs.add(at0 + STATE + lane),
+                            *cs.add(at0 + STATE + lane + 32),
+                            *cs.add(at0 + STATE + lane + 64),
+                            *cs.add(at0 + STATE + lane + 96),
+                        ],
+                    )
+                };
+                let (sigma, decay) = unsafe { (*cs.add(at0 + STAGED), *cs.add(at0 + STAGED + 1)) };
+                #[unroll]
+                for i in 0usize..CH_PER_WARP {
+                    let k = wid * CH_PER_WARP + i;
+                    let ch = chunk * CH_PER_BLOCK + k;
+                    if ch < hd {
+                        let at = h * hd + ch;
+                        // SAFETY: at0 + 2·STATE + k < STAGE_T2, written
+                        // before the barrier.
+                        let x = unsafe { *cs.add(at0 + 2 * STATE + k) };
+                        let x_dt = mul_rn_f32(x, sigma);
+                        let mut acc = 0.0f32;
+                        #[unroll]
+                        for j in 0usize..4 {
+                            let v = mul_rn_f32(s[4 * i + j], decay) + mul_rn_f32(bq[j], x_dt);
+                            s[4 * i + j] = v;
+                            acc += mul_rn_f32(v, cq[j]);
                         }
-                        // SAFETY: t·inner + at < u·inner <= y.len(); lane 0
-                        // of this warp is its only writer.
-                        unsafe { *yp.add(t * inner + at) = v };
+                        acc += warp::shuffle_xor_f32(acc, 16);
+                        acc += warp::shuffle_xor_f32(acc, 8);
+                        acc += warp::shuffle_xor_f32(acc, 4);
+                        acc += warp::shuffle_xor_f32(acc, 2);
+                        acc += warp::shuffle_xor_f32(acc, 1);
+                        // SAFETY: row + z0 + at < u·ld <= rows.len(): z0 +
+                        // inner <= ld.
+                        let zv = unsafe { *rows.get_unchecked(row + z0 + at) };
+                        let v = mul_rn_f32(silu(zv), acc + mul_rn_f32(x, d_h));
+                        if lane == 0 {
+                            if !v.is_finite() {
+                                fault.raise(FaultSite::Mamba2Scan);
+                            }
+                            // SAFETY: (t0 + t_in)·inner + at < u·inner <=
+                            // y.len(); lane 0 of this warp is its only writer.
+                            unsafe { *yp.add((t0 + t_in) * inner + at) = v };
+                        }
                     }
                 }
             }
-            t += 1;
+            t0 += stage_n;
         }
 
         #[unroll]
@@ -938,6 +1031,35 @@ unsafe fn pass_input(
     }
 }
 
+/// The conv output of channel `c` for one token: the step's taps (`x0` the
+/// farthest) and sum order, so the decode step and the pass's
+/// `mamba2_conv_rows` are bit for bit.
+///
+/// # Safety
+///
+/// `CONV_TAPS · c + 3 < conv_w.len()` and `c < conv_b.len()`.
+#[inline(always)]
+unsafe fn conv_out(
+    x0: f32,
+    x1: f32,
+    x2: f32,
+    cur: f32,
+    conv_w: &[f32],
+    conv_b: &[f32],
+    c: usize,
+) -> f32 {
+    // SAFETY: by the contract above.
+    unsafe {
+        let w = 4 * c;
+        let mut acc = 0.0f32;
+        acc += mul_rn_f32(x0, *conv_w.get_unchecked(w));
+        acc += mul_rn_f32(x1, *conv_w.get_unchecked(w + 1));
+        acc += mul_rn_f32(x2, *conv_w.get_unchecked(w + 2));
+        acc += mul_rn_f32(cur, *conv_w.get_unchecked(w + 3));
+        silu(acc + *conv_b.get_unchecked(c))
+    }
+}
+
 /// Refuse a conv other than [`CONV_TAPS`] taps, then the host twin's
 /// [`model::mamba2::check`]. The host accepts any positive `d_conv`; this
 /// kernel runs four.
@@ -985,6 +1107,53 @@ impl Mamba2Scratch {
     }
 }
 
+/// What a prompt pass's [`Mamba2Kernels::enqueue_steps`] pre-pass needs: the
+/// conv outputs `conv` (`u` rows of `conv_dim`) and the per-head `σ` and `dA`
+/// of every token (`sd`, two f32s a (token, head)), written by
+/// `mamba2_conv_rows` and read by `mamba2_steps`. One scratch serves one pass
+/// at a time on a stream; a graph captured with it replays on it.
+pub struct Mamba2PassScratch {
+    conv: DeviceBuffer<f32>,
+    sd: DeviceBuffer<f32>,
+    conv_dim: usize,
+    heads: usize,
+    max_u: usize,
+}
+
+impl Mamba2PassScratch {
+    /// The device bytes the scratch holds.
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.conv.num_bytes() + self.sd.num_bytes()
+    }
+
+    /// A zeroed scratch for `shape` and passes of up to `max_u` tokens.
+    /// Load-time only. `shape` is checked again here, so a conv the host
+    /// accepted and this kernel refuses never allocates; `max_u` = 0 is
+    /// refused by name (a pass holds a token).
+    pub fn new(
+        stream: &CudaStream,
+        shape: Checked,
+        max_u: usize,
+    ) -> Result<Mamba2PassScratch, GpuError> {
+        let shape = check("mamba2::Mamba2PassScratch::new", shape.geom())?;
+        if max_u == 0 {
+            return Err(GpuError::shape(
+                "mamba2::Mamba2PassScratch::new",
+                "max_u 0 is refused: a pass holds a token",
+            ));
+        }
+        let g = shape.geom();
+        let (heads, conv_dim) = (g.n_heads, shape.conv_dim());
+        Ok(Mamba2PassScratch {
+            conv: DeviceBuffer::zeroed(stream, max_u.saturating_mul(conv_dim))?,
+            sd: DeviceBuffer::zeroed(stream, 2 * max_u * heads)?,
+            conv_dim,
+            heads,
+            max_u,
+        })
+    }
+}
+
 /// [`Mamba2Kernels::enqueue_step`]'s arguments: the layer's widths, the
 /// token's conv input `xbc`, raw `dt` and `z` (the in-projection's split),
 /// the layer's `dt_bias`, `A`, `D`, conv weight and bias and the norm's gain
@@ -1016,7 +1185,9 @@ pub struct StepArgs<'a> {
 /// `u` tokens. The inputs are `u` token-major rows of `rows`, row stride
 /// `ld`, each holding the token's `z` at column `z0`, its conv input `xbc` at
 /// `x0` and its raw `dt` at `dt0` (the in-projection's output as it lands);
-/// `y` takes `u` rows of `d_inner`. The pass needs no scratch.
+/// `y` takes `u` rows of `d_inner`. The pass's conv pre-pass and scan share
+/// `scratch` ([`Mamba2PassScratch`], sized at load for the prompt's token
+/// ceiling).
 pub struct StepsArgs<'a> {
     pub shape: Checked,
     pub u: usize,
@@ -1038,6 +1209,7 @@ pub struct StepsArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
     pub ring: &'a mut DeviceBuffer<f32>,
     pub state: &'a mut DeviceBuffer<f32>,
+    pub scratch: &'a mut Mamba2PassScratch,
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
@@ -1157,13 +1329,15 @@ impl Mamba2Kernels {
     }
 
     /// Enqueue a prompt pass of `u` tokens of one layer ([`StepsArgs`],
-    /// module doc): `mamba2_steps`, `mamba2_ring_tail` and, with a gain,
-    /// `mamba2_norm_rows`, in that order on `stream`. Every `y` row, the ring
-    /// and the state after it are those of `u` [`Self::enqueue_step`] calls
-    /// on the same rows at positions `p ..`. Refuses what the step refuses,
-    /// and `u` = 0, a column window past `ld`, rows shorter than `u · ld` and
-    /// a `y` shorter than `u` rows, by name, launching nothing. Two or three
-    /// launches. Asynchronous, allocation-free, capturable.
+    /// module doc): `mamba2_conv_rows`, `mamba2_steps`, `mamba2_ring_tail`
+    /// and, with a gain, `mamba2_norm_rows`, in that order on `stream`. Every
+    /// `y` row, the ring and the state after it are those of `u`
+    /// [`Self::enqueue_step`] calls on the same rows at positions `p ..`.
+    /// Refuses what the step refuses, and `u` = 0, a column window past `ld`,
+    /// rows shorter than `u · ld`, a `y` shorter than `u` rows, a `u` past
+    /// the scratch's `max_u` and a scratch of another shape, by name,
+    /// launching nothing. Three or four launches. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_steps(&self, stream: &CudaStream, args: StepsArgs<'_>) -> Result<(), GpuError> {
         let what = "mamba2::enqueue_steps";
         let StepsArgs {
@@ -1187,6 +1361,7 @@ impl Mamba2Kernels {
             y,
             ring,
             state,
+            scratch,
         } = args;
         let shape = check(what, shape.geom())?;
         if norm.is_some() && !eps.is_finite() {
@@ -1202,6 +1377,23 @@ impl Mamba2Kernels {
         let (inner, heads, groups) = (g.d_inner, g.n_heads, g.n_groups);
         let conv_dim = shape.conv_dim();
         let head_dim = shape.head_dim();
+        // The scratch first, read before the buffer lengths, so a short
+        // `rows` or `y` cannot mask a `u` past its `max_u`.
+        if u > scratch.max_u {
+            return Err(GpuError::shape(
+                what,
+                format!("u {u} is past the pass scratch's max_u {}", scratch.max_u),
+            ));
+        }
+        if scratch.conv_dim != conv_dim || scratch.heads != heads {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the pass scratch holds conv_dim {} and {} heads, the layer's are {conv_dim} and {heads}",
+                    scratch.conv_dim, scratch.heads
+                ),
+            ));
+        }
         let windows = [("z", z0, inner), ("xbc", x0, conv_dim), ("dt", dt0, heads)];
         for (name, at, width) in windows {
             if at.saturating_add(width) > ld {
@@ -1232,6 +1424,8 @@ impl Mamba2Kernels {
         }
         let chunks = head_dim.div_ceil(CH_PER_BLOCK);
         let blocks = heads * chunks;
+        let conv_items = u * conv_dim + u * heads;
+        let conv_blocks = conv_items.div_ceil(BLOCK);
         let tail_blocks = (u.min(RING_ROWS) * conv_dim).div_ceil(BLOCK);
         let (u32_u, u32_ld, u32_pos_at) = (
             launch_u32(what, "u", u)?,
@@ -1246,6 +1440,11 @@ impl Mamba2Kernels {
             launch_u32(what, "chunks", chunks)?,
         );
         let u32_x0 = launch_u32(what, "x0", x0)?;
+        let conv_rows = self.module.prepare_mamba2_conv_rows(LaunchConfig1D::new(
+            launch_u32(what, "conv blocks", conv_blocks)?,
+            BLOCK as u32,
+            0,
+        ))?;
         let steps = self.module.prepare_mamba2_steps(LaunchConfig1D::new(
             launch_u32(what, "blocks", blocks)?,
             BLOCK as u32,
@@ -1265,9 +1464,9 @@ impl Mamba2Kernels {
             ))?),
             None => None,
         };
-        self.module.mamba2_steps(
+        self.module.mamba2_conv_rows(
             stream,
-            &steps,
+            &conv_rows,
             rows,
             dt_bias,
             a_log,
@@ -1279,9 +1478,24 @@ impl Mamba2Kernels {
             u32_pos_at,
             u32_u,
             u32_ld,
-            launch_u32(what, "z0", z0)?,
             u32_x0,
             launch_u32(what, "dt0", dt0)?,
+            u32_heads,
+            u32_groups,
+            u32_hd,
+            &mut scratch.conv,
+            &mut scratch.sd,
+        )?;
+        self.module.mamba2_steps(
+            stream,
+            &steps,
+            rows,
+            d,
+            &scratch.conv,
+            &scratch.sd,
+            u32_u,
+            u32_ld,
+            launch_u32(what, "z0", z0)?,
             u32_heads,
             u32_per,
             u32_groups,
