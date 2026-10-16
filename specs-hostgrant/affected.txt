@@ -1,0 +1,193 @@
+./tools/affected-gates.sh e8e32a38 
+affected: e8e32a38e..(working tree) — 20 changed files, 131 of 147 gate-recipes selected, 3 of 7 weekly-recipes by a trigger
+  gate-gpu-p1                                              crates/gpu-gates/src/record.rs (+10)  [bin gate_p1 <- lib bloomery-gpu-gates]
+  gate-gpu-p2                                              crates/gpu-gates/src/record.rs (+10)  [bin gate_p2 <- lib bloomery-gpu-gates]
+  gate-gpu-p3                                              crates/gpu-gates/src/record.rs (+10)  [bin gate_p3 <- lib bloomery-gpu-gates]
+  gate-gpu-p4                                              crates/gpu-gates/src/record.rs (+10)  [bin gate_p4 <- lib bloomery-gpu-gates]
+  gate-gpu-p5                                              crates/gpu-gates/src/record.rs (+10)  [bin gate_p5 <- lib bloomery-gpu-gates]
+  gate-gpu-p6                                              crates/gpu-gates/src/record.rs (+10)  [bin gate_p6 <- lib bloomery-gpu-gates]
+  gate-gpu-p9                                              crates/gpu-gates/src/record.rs (+10)  [bin gate_p9 <- lib bloomery-gpu-gates]
+  gate-gpu-q4k-sel                                         crates/gpu-gates/src/record.rs (+10)  [bin gate_q4k_sel <- lib bloomery-gpu-gates]
+  gate-gpu-kquant                                          crates/gpu-gates/src/record.rs (+10)  [bin gate_kquant <- lib bloomery-gpu-gates]
+  gate-gpu-cand                                            crates/gpu-gates/src/record.rs (+10)  [bin gate_cand <- lib bloomery-gpu-gates]
+  gate-gpu-hc-gated                                        crates/gpu-gates/src/record.rs (+10)  [bin gate_hc_gated <- lib bloomery-gpu-gates]
+  gate-gpu-glm-router                                      crates/gpu-gates/src/record.rs (+11)  [bin gate_glm5next_router <- lib bloomery-gpu-gates]
+  gate-gpu-iq                                              crates/gpu-gates/src/record.rs (+10)  [bin gate_iq <- lib bloomery-gpu-gates]
+  gate-gpu-iq-sel                                          crates/gpu-gates/src/record.rs (+10)  [bin gate_iq_sel <- lib bloomery-gpu-gates]
+  gate-gpu-q6k-ids                                         crates/gpu-gates/src/record.rs (+10)  [bin gate_q6k_ids <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-hc                                         crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_hc <- lib bloomery-gpu-gates]
+  gate-gpu-e2e                                             crates/gpu-gates/src/record.rs (+10)  [bin gate_e2e <- lib bloomery-gpu-gates]
+  gate-gpu-hybrid                                          crates/gpu-gates/src/record.rs (+10)  [bin gate_hybrid <- lib bloomery-gpu-gates]
+  gate-gpu-swap                                            crates/gpu-gates/src/record.rs (+10)  [bin gate_swap <- lib bloomery-gpu-gates]
+  gate-gpu-xstream                                         crates/gpu-gates/src/record.rs (+10)  [bin gate_xstream <- lib bloomery-gpu-gates]
+  gate-gpu-p0b                                             crates/gpu-gates/src/record.rs (+10)  [bin gate_p0b <- lib bloomery-gpu-gates]
+  gate-gpu-p8                                              crates/gpu-gates/src/record.rs (+10)  [bin gate_p8 <- lib bloomery-gpu-gates]
+  gate-gpu-moe                                             crates/gpu-gates/src/record.rs (+10)  [bin gate_moe_fused <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-moe                                        crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_moe <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-chain-ffn                                  crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_chain_ffn <- lib bloomery-gpu-gates]
+  gate-gpu-block                                           crates/gpu-gates/src/record.rs (+5)  [bin gate_block <- lib bloomery-gpu-gates]
+  gate-gpu-p10                                             crates/gpu-gates/src/record.rs (+10)  [bin gate_p10 <- lib bloomery-gpu-gates]
+  gate-ops                                                 crates/model/src/arch/deepseek41/place.rs (+4)  [libtest <- bloomery-model lib tests]
+  gate-attn                                                crates/model/src/arch/deepseek41/place.rs (+4)  [test attn <- lib bloomery-model]
+  gate-ffn                                                 crates/model/src/arch/deepseek41/place.rs (+4)  [test ffn <- lib bloomery-model]
+  gate-moe                                                 crates/model/src/arch/deepseek41/place.rs (+4)  [test moe <- lib bloomery-model]
+  gate-head                                                crates/model/src/arch/deepseek41/place.rs (+4)  [test head <- lib bloomery-model]
+  gate-forward                                             crates/model/src/arch/deepseek41/place.rs (+4)  [test forward <- lib bloomery-model]
+  gate-kv                                                  crates/model/src/arch/deepseek41/place.rs (+4)  [test kv <- lib bloomery-model]
+  gate-alloc                                               crates/model/src/arch/deepseek41/place.rs (+4)  [test alloc <- lib bloomery-model]
+  gate-derived                                             crates/model/src/arch/deepseek41/place.rs (+4)  [test derived <- lib bloomery-model]
+  gate-mt                                                  crates/model/src/arch/deepseek41/place.rs (+4)  [test mt <- lib bloomery-model]
+  gate-profile                                             crates/model/src/arch/deepseek41/place.rs (+4)  [test profile <- lib bloomery-model]
+  gate-placement                                           crates/model/src/arch/deepseek41/place.rs (+5)  [test placement <- lib bloomery-model]
+  gate-ds41-meta                                           crates/model/src/arch/deepseek41/place.rs (+4)  [libtest <- bloomery-model lib tests]
+  gate-qwen3moe-meta                                       crates/model/src/arch/deepseek41/place.rs (+4)  [libtest <- bloomery-model lib tests]
+  gate-qwen35moe-meta                                      crates/model/src/arch/deepseek41/place.rs (+4)  [test qwen35moe_meta <- lib bloomery-model]
+  gate-gpu-qwen3moe-rope                                   crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen3moe_rope <- lib bloomery-gpu-gates]
+  gate-gpu-qwen3moe-router                                 crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen3moe_router <- lib bloomery-gpu-gates]
+  gate-gpu-qwen35moe-moe                                   crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen35moe_moe <- lib bloomery-gpu-gates]
+  gate-gpu-qwen35moe-e2e                                   crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen35moe_e2e <- lib bloomery-gpu-gates]
+  gate-gpu-clef-hidden                                     crates/gpu-gates/src/record.rs (+10)  [bin gate_clef_hidden <- lib bloomery-gpu-gates]
+  gate-gpu-qwen35-media                                    crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen35_media <- lib bloomery-gpu-gates]
+  gate-gpu-qwen35moe-media                                 crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen35_media <- lib bloomery-gpu-gates]
+  gate-gpu-clef-serve                                      crates/gpu-gates/src/record.rs (+12)  [bin bloomery-serve <- lib bloomery-gpu-gates]
+  gate-gpu-lev-serve                                       crates/gpu-gates/src/record.rs (+12)  [bin bloomery-serve <- lib bloomery-gpu-gates]
+  gate-gpu-qwen4exp-e2e                                    crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen4exp_e2e <- lib bloomery-gpu-gates]
+  gate-gpu-qwen4exp-iqleg                                  crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen4exp_iqleg <- lib bloomery-gpu-gates]
+  gate-gpu-qwen4exp-mtp                                    crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen4exp_mtp <- lib bloomery-gpu-gates]
+  gate-gpu-qwen3moe-down                                   crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen3moe_down <- lib bloomery-gpu-gates]
+  gate-gpu-qwen3moe-head                                   crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen3moe_head <- lib bloomery-gpu-gates]
+  gate-gpu-gemm                                            crates/gpu-gates/src/record.rs (+10)  [bin gate_gemm <- lib bloomery-gpu-gates]
+  gate-gpu-linear                                          crates/gpu-gates/src/record.rs (+10)  [bin gate_linear <- lib bloomery-gpu-gates]
+  gate-gpu-qwen35moe-attn                                  crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen35moe_attn <- lib bloomery-gpu-gates]
+  gate-gpu-glm-mla                                         crates/gpu-gates/src/record.rs (+11)  [bin gate_glm_mla <- lib bloomery-gpu-gates]
+  gate-gpu-glm-sel                                         crates/gpu-gates/src/record.rs (+11)  [bin gate_glm_sel <- lib bloomery-gpu-gates]
+  gate-gpu-glm5next-gemm                                   crates/gpu-gates/src/record.rs (+12)  [bin gate_glm5next_gemm <- lib bloomery-gpu-gates]
+  gate-gpu-mimo2-flash                                     crates/gpu-gates/src/record.rs (+10)  [bin gate_mimo2_flash <- lib bloomery-gpu-gates]
+  gate-gpu-qwen3moe-flash                                  crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen3moe_flash <- lib bloomery-gpu-gates]
+  gate-gpu-qwen3moe-experts                                crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen3moe_experts <- lib bloomery-gpu-gates]
+  gate-gpu-qwen3moe-e2e                                    crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen3moe_e2e <- lib bloomery-gpu-gates]
+  gate-ds41-host                                           crates/model/src/arch/deepseek41/place.rs (+4)  [test ds41_host <- lib bloomery-model]
+  gate-union                                               crates/model/src/arch/deepseek41/place.rs (+4)  [test union <- lib bloomery-model]
+  gate-r8                                                  crates/model/src/arch/deepseek41/place.rs (+4)  [test r8file <- lib bloomery-model]
+  gate-fixture                                             crates/model/src/arch/deepseek41/place.rs (+4)  [test fixture <- lib bloomery-model]
+  gate-app                                                 crates/gpu/src/arch/qwen3moe/body38.rs (+9)  [libtest <- lib bloomery-gpu (bloomery-app -> bloomery-gpu)]
+  gate-prompts                                             crates/model/src/arch/deepseek41/place.rs (+4)  [test prompts <- lib bloomery-model]
+  gate-gpu-head                                            crates/gpu-gates/src/record.rs (+10)  [bin gate_head_gpu <- lib bloomery-gpu-gates]
+  gate-gpu-mcol                                            crates/gpu-gates/src/record.rs (+11)  [bin gate_mcol <- lib bloomery-gpu-gates]
+  gate-gpu-lib                                             crates/gpu/src/arch/qwen3moe/body38.rs (+9)  [libtest <- bloomery-gpu lib tests]
+  gate-gpu-gates-lib                                       crates/gpu-gates/src/record.rs (+9)  [libtest <- bloomery-gpu-gates lib tests]
+  gate-ds41-oracle                                         crates/gpu-gates/src/record.rs (+9)  [libtest <- bloomery-gpu-gates lib tests]
+  gate-ds41-plan                                           crates/gpu-gates/src/record.rs (+5)  [bin gate_deepseek41_plan <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-rope                                       crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_rope <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-comp                                       crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_comp <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-index                                      crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_index <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-lib                                        crates/gpu-deepseek41/src/body.rs (+10)  [libtest <- bloomery-gpu-deepseek41 lib tests]
+  gate-ds41-bind                                           crates/gpu-gates/src/record.rs (+15)  [libtest <- bloomery-gpu-gates lib tests]
+  gate-q38-serve-rules                                     crates/gpu-gates/src/record.rs (+11)  [bin bloomery-serve-qwen38 <- lib bloomery-gpu-gates]
+  gate-ds41-place                                          crates/gpu-gates/src/record.rs (+15)  [libtest <- bloomery-gpu-gates lib tests]
+  gate-ds41-kld                                            crates/gpu-gates/src/record.rs (+9)  [libtest <- bloomery-gpu-gates lib tests]
+  gate-gpu-ds41-engram                                     crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_engram <- lib bloomery-gpu-gates]
+  gate-gpu-ple                                             crates/gpu-gates/src/record.rs (+10)  [bin gate_ple <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-chain-glue                                 crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_chain_glue <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-woa                                        crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_woa <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-attn                                       crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_attn <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-chain-attn                                 crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_chain_attn <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-step                                       crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_step <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-tier                                       crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_tier <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-twocard                                    crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_twocard <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-unpack                                     crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_unpack <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-callstream                                 crates/gpu-gates/src/record.rs (+11)  [bin gate_ds41_callstream <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-residency-a                                crates/gpu-gates/src/record.rs (+11)  [bin gate_ds41_callstream <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-nvtier                                     crates/gpu-gates/src/record.rs (+11)  [bin gate_ds41_nvtier <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-long                                       crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_long <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-draft                                      crates/gpu-gates/src/record.rs (+11)  [bin generate_ds41 <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-dspark-loop                                crates/gpu-gates/src/record.rs (+11)  [bin generate_ds41 <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-prefill                                    crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_prefill <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-media                                      crates/gpu-gates/src/record.rs (+11)  [bin gate_ds41_media <- lib bloomery-gpu-gates]
+  gate-gpu-ds41-chat                                       crates/gpu-gates/src/record.rs (+11)  [bin generate_ds41 <- lib bloomery-gpu-gates]
+  gate-gpu-nvtier                                          crates/gpu-gates/src/bin/gate_nvtier.rs (+11)  [bin gate_nvtier]
+  gate-gpu-qwen38-residency                                crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen38_residency <- lib bloomery-gpu-gates]
+  gate-gpu-qwen38-twocard                                  crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen38_twocard <- lib bloomery-gpu-gates]
+  gate-gpu-qwen38-serve                                    crates/gpu-gates/src/record.rs (+11)  [bin generate_qwen3moe <- lib bloomery-gpu-gates]
+  gate-gpu-qwen3-serve                                     crates/gpu-gates/src/record.rs (+12)  [bin bloomery-serve <- lib bloomery-gpu-gates]
+  gate-ds41-load                                           crates/gpu-gates/src/record.rs (+11)  [bin gate_deepseek41_load <- lib bloomery-gpu-gates]
+  gate-gpu-p8b                                             crates/gpu-gates/src/record.rs (+10)  [bin gate_p8b <- lib bloomery-gpu-gates]
+  gate-ptx-spill                                           crates/gpu-gates/src/record.rs (+11)  [bin generate_ds41 <- lib bloomery-gpu-gates]
+  gate-dspark-read                                         crates/gpu-gates/src/record.rs (+5)  [bin gate_dspark_read <- lib bloomery-gpu-gates]
+  gate-gpu-dspark-hc                                       crates/gpu-gates/src/record.rs (+11)  [bin gate_dspark_hc <- lib bloomery-gpu-gates]
+  gate-gpu-dspark-experts                                  crates/gpu-gates/src/record.rs (+11)  [bin gate_dspark_experts <- lib bloomery-gpu-gates]
+  gate-gpu-dspark-kv                                       crates/gpu-gates/src/record.rs (+11)  [bin gate_dspark_kv <- lib bloomery-gpu-gates]
+  gate-gpu-dspark-graph                                    crates/gpu-gates/src/record.rs (+11)  [bin gate_dspark_graph <- lib bloomery-gpu-gates]
+  gate-gpu-vision                                          crates/gpu-gates/src/record.rs (+10)  [bin gate_vision_encoder <- lib bloomery-gpu-gates]
+  gate-gpu-qwen3vl-tower                                   crates/gpu-gates/src/record.rs (+10)  [bin gate_qwen3vl_tower <- lib bloomery-gpu-gates]
+  gate-deepseek4-meta                                      crates/model/src/arch/deepseek41/place.rs (+4)  [libtest <- bloomery-model lib tests]
+  gate-glm5next-meta                                       crates/model/src/arch/deepseek41/place.rs (+4)  [libtest <- bloomery-model lib tests]
+  gate-mimo2-meta                                          crates/model/src/arch/deepseek41/place.rs (+4)  [libtest <- bloomery-model lib tests]
+  gate-gpu-glm5next-e2e                                    crates/gpu-gates/src/record.rs (+12)  [bin gate_glm5next_e2e <- lib bloomery-gpu-gates]
+  gate-gpu-glm5next-stagger                                crates/gpu-gates/src/record.rs (+12)  [bin gate_glm5next_e2e <- lib bloomery-gpu-gates]
+  gate-gpu-glm5next-mtp                                    crates/gpu-gates/src/record.rs (+12)  [bin gate_glm5next_mtp <- lib bloomery-gpu-gates]
+  gate-gpu-glm5next-nvtier                                 crates/gpu-gates/src/record.rs (+12)  [bin gate_glm5next_nvtier <- lib bloomery-gpu-gates]
+  gate-gpu-glm5next-twocard                                crates/gpu-gates/src/record.rs (+12)  [bin gate_glm5next_twocard <- lib bloomery-gpu-gates]
+  gate-gpu-glm5next-residency                              crates/gpu-gates/src/record.rs (+12)  [bin gate_glm5next_residency <- lib bloomery-gpu-gates]
+  gate-gpu-glm5next-serve                                  crates/gpu-gates/src/record.rs (+12)  [bin generate_glm5next <- lib bloomery-gpu-gates]
+  gate-qwen4exp-meta                                       crates/model/src/arch/deepseek41/place.rs (+4)  [libtest <- bloomery-model lib tests]
+  gate-gpu-glm5next-e2e@BLOOMERY_FIXTURE_VARIANT=iq4xs     [variant iq4xs: its row lists gate-gpu-glm5next-e2e, which is selected]
+  gate-gpu-glm5next-mtp@BLOOMERY_FIXTURE_VARIANT=iq4xs     [variant iq4xs: its row lists gate-gpu-glm5next-mtp, which is selected]
+  gate-gpu-glm5next-nvtier@BLOOMERY_FIXTURE_VARIANT=iq4xs  [variant iq4xs: its row lists gate-gpu-glm5next-nvtier, which is selected]
+  gate-gpu-glm5next-e2e@BLOOMERY_FIXTURE_VARIANT=q2kxl     [variant q2kxl: its row lists gate-gpu-glm5next-e2e, which is selected]
+  weekly-gpu-ds41-cand                                     crates/gpu-deepseek41/src/body.rs  [trigger tools/gate-paths.tsv:187 crates/gpu-deepseek41/src/{body.rs,body/ced.rs,body/prefill.rs}]
+  weekly-gpu-ds41-flowcounts                               crates/gpu-gates/src/record.rs  [trigger tools/gate-paths.tsv:181 crates/gpu-gates/src/record.rs]
+  weekly-gpu-glm5next-e2e-long                             crates/gpu-glm5next/src/body.rs (+1)  [trigger tools/gate-paths.tsv:168 crates/gpu-glm5next/**]
+recipes: gate-gpu-p1 gate-gpu-p2 gate-gpu-p3 gate-gpu-p4 gate-gpu-p5 gate-gpu-p6 gate-gpu-p9 gate-gpu-q4k-sel gate-gpu-kquant gate-gpu-cand gate-gpu-hc-gated gate-gpu-glm-router gate-gpu-iq gate-gpu-iq-sel gate-gpu-q6k-ids gate-gpu-ds41-hc gate-gpu-e2e gate-gpu-hybrid gate-gpu-swap gate-gpu-xstream gate-gpu-p0b gate-gpu-p8 gate-gpu-moe gate-gpu-ds41-moe gate-gpu-ds41-chain-ffn gate-gpu-block gate-gpu-p10 gate-ops gate-attn gate-ffn gate-moe gate-head gate-forward gate-kv gate-alloc gate-derived gate-mt gate-profile gate-placement gate-ds41-meta gate-qwen3moe-meta gate-qwen35moe-meta gate-gpu-qwen3moe-rope gate-gpu-qwen3moe-router gate-gpu-qwen35moe-moe gate-gpu-qwen35moe-e2e gate-gpu-clef-hidden gate-gpu-qwen35-media gate-gpu-qwen35moe-media gate-gpu-clef-serve gate-gpu-lev-serve gate-gpu-qwen4exp-e2e gate-gpu-qwen4exp-iqleg gate-gpu-qwen4exp-mtp gate-gpu-qwen3moe-down gate-gpu-qwen3moe-head gate-gpu-gemm gate-gpu-linear gate-gpu-qwen35moe-attn gate-gpu-glm-mla gate-gpu-glm-sel gate-gpu-glm5next-gemm gate-gpu-mimo2-flash gate-gpu-qwen3moe-flash gate-gpu-qwen3moe-experts gate-gpu-qwen3moe-e2e gate-ds41-host gate-union gate-r8 gate-fixture gate-app gate-prompts gate-gpu-head gate-gpu-mcol gate-gpu-lib gate-gpu-gates-lib gate-ds41-oracle gate-ds41-plan gate-gpu-ds41-rope gate-gpu-ds41-comp gate-gpu-ds41-index gate-gpu-ds41-lib gate-ds41-bind gate-q38-serve-rules gate-ds41-place gate-ds41-kld gate-gpu-ds41-engram gate-gpu-ple gate-gpu-ds41-chain-glue gate-gpu-ds41-woa gate-gpu-ds41-attn gate-gpu-ds41-chain-attn gate-gpu-ds41-step gate-gpu-ds41-tier gate-gpu-ds41-twocard gate-gpu-ds41-unpack gate-gpu-ds41-callstream gate-gpu-ds41-residency-a gate-gpu-ds41-nvtier gate-gpu-ds41-long gate-gpu-ds41-draft gate-gpu-ds41-dspark-loop gate-gpu-ds41-prefill gate-gpu-ds41-media gate-gpu-ds41-chat gate-gpu-nvtier gate-gpu-qwen38-residency gate-gpu-qwen38-twocard gate-gpu-qwen38-serve gate-gpu-qwen3-serve gate-ds41-load gate-gpu-p8b gate-ptx-spill gate-dspark-read gate-gpu-dspark-hc gate-gpu-dspark-experts gate-gpu-dspark-kv gate-gpu-dspark-graph gate-gpu-vision gate-gpu-qwen3vl-tower gate-deepseek4-meta gate-glm5next-meta gate-mimo2-meta gate-gpu-glm5next-e2e gate-gpu-glm5next-stagger gate-gpu-glm5next-mtp gate-gpu-glm5next-nvtier gate-gpu-glm5next-twocard gate-gpu-glm5next-residency gate-gpu-glm5next-serve gate-qwen4exp-meta gate-gpu-glm5next-e2e@BLOOMERY_FIXTURE_VARIANT=iq4xs gate-gpu-glm5next-mtp@BLOOMERY_FIXTURE_VARIANT=iq4xs gate-gpu-glm5next-nvtier@BLOOMERY_FIXTURE_VARIANT=iq4xs gate-gpu-glm5next-e2e@BLOOMERY_FIXTURE_VARIANT=q2kxl weekly-gpu-ds41-cand weekly-gpu-ds41-flowcounts weekly-gpu-glm5next-e2e-long
+always: check-recipes check-rustflags check-comments check-levers check-arch check fmt-check lint
+unmapped (1):
+  tools/ref/depth-qwen3moe-stub.sh
+notes:
+  dep-info: 79 bins from ws:~/repo/bloomery/target, 2026-09-20 15:28 … 2026-10-11 05:11; test targets have none there (release/deps is read when present) — static walk only
+  dep-info of gate_p2 gate_p9 is from 2026-09-21 12:23
+  dep-info of gate_block is from 2026-09-21 14:21
+  dep-info of gate_p10 is from 2026-09-21 15:06
+  dep-info of gate_p3 is from 2026-09-21 15:07
+  dep-info of gate_deepseek41_woa is from 2026-09-23 17:25
+  dep-info of gate_deepseek41_hc is from 2026-09-23 17:26
+  dep-info of gate_deepseek41_rope is from 2026-09-23 17:27
+  dep-info of gate_deepseek41_moe is from 2026-09-23 18:54
+  dep-info of gate_p6 is from 2026-09-23 18:56
+  dep-info of gate_deepseek41_index is from 2026-09-23 19:13
+  dep-info of gate_deepseek41_comp is from 2026-09-23 19:14
+  dep-info of gate_deepseek41_chain_ffn is from 2026-09-23 19:40
+  dep-info of gate_deepseek41_chain_attn is from 2026-09-25 03:49
+  dep-info of gate_qwen3moe_router is from 2026-09-25 16:02
+  dep-info of gate_deepseek41_chain_glue is from 2026-09-25 23:39
+  dep-info of gate_q4k_sel is from 2026-09-27 00:09
+  dep-info of gate_deepseek41_plan is from 2026-09-27 00:10
+  dep-info of gate_deepseek41_attn gate_p0b gate_moe_fused gate_p4 is from 2026-09-27 00:14
+  dep-info of gate_p5 gate_p8 gate_p8b gate_head_gpu gate_mcol gate_hybrid is from 2026-09-27 00:15
+  dep-info of gate_deepseek41_engram is from 2026-09-27 00:17
+  dep-info of gate_dspark_kv gate_dspark_graph is from 2026-09-27 03:31
+  dep-info of gate_dspark_hc gate_dspark_experts gate_deepseek41_long is from 2026-09-27 03:32
+  dep-info of gate_deepseek41_dsloop is from 2026-09-27 03:33
+  dep-info of gate_deepseek41_step is from 2026-09-27 03:40
+  dep-info of gate_gemm is from 2026-09-27 09:00
+  dep-info of gate_qwen3moe_e2e is from 2026-10-04 04:36
+  dep-info of gate_deepseek41_load is from 2026-10-04 09:55
+  dep-info of gate_qwen4exp_mtp is from 2026-10-04 17:17
+  dep-info of gate_qwen35moe_e2e is from 2026-10-06 10:46
+  dep-info of gate_deepseek41_tier is from 2026-10-06 13:45
+  dep-info of gate_deepseek41_twocard is from 2026-10-06 13:48
+  dep-info of gate_qwen4exp_e2e is from 2026-10-06 13:54
+  dep-info of gate_glm5next_twocard is from 2026-10-06 14:00
+  dep-info of gate_qwen3_serve gate_clef_serve is from 2026-10-06 14:14
+  dep-info of gate_qwen38_serve is from 2026-10-06 17:07
+  dep-info of gate_qwen38_twocard is from 2026-10-06 17:26
+  dep-info of bloomery-serve gate_glm5next_serve is from 2026-10-06 17:40
+  dep-info of gate_ds41_callstream is from 2026-10-06 20:49
+  dep-info of gate_qwen38_residency is from 2026-10-06 20:52
+  dep-info of gate_glm5next_residency is from 2026-10-06 20:53
+  dep-info of gate_e2e is from 2026-10-07 18:38
+  dep-info of bloomery-chat bloomery-serve-qwen38 gate_deepseek41_prefill is from 2026-10-08 06:03
+  dep-info of generate_glm5next generate_ds41 oxart_jit oxart_ptx is from 2026-10-08 21:21
+  dep-info of generate_qwen3moe is from 2026-10-09 00:32
+  dep-info of probe_nvread is from 2026-10-11 05:11
+  no dep-info for 38 selected bins (static walk only): fixture gate_cand gate_clef_hidden gate_deepseek41_unpack gate_ds41_media gate_ds41_nvtier gate_dspark_read gate_glm5next_e2e gate_glm5next_gemm gate_glm5next_mtp gate_glm5next_nvtier gate_glm5next_router gate_glm_mla gate_glm_sel gate_hc_gated gate_iq gate_iq_sel gate_kquant gate_lev_serve gate_linear gate_mimo2_flash gate_nvtier gate_p1 gate_ple gate_q6k_ids gate_qwen35_media gate_qwen35moe_attn gate_qwen35moe_moe gate_qwen3moe_down gate_qwen3moe_experts gate_qwen3moe_flash gate_qwen3moe_head gate_qwen3moe_rope gate_qwen3vl_tower gate_qwen4exp_iqleg gate_swap gate_vision_encoder gate_xstream
+  dep-info names 361 files the static walk does not (stale dep-info or a walk gap): bloomery-serve:crates/app/src/arch/deepseek41/draft.rs bloomery-serve:crates/app/src/arch/deepseek41/mod.rs bloomery-serve:crates/app/src/arch/glm5next/mod.rs bloomery-serve:crates/app/src/arch/glm5next/mtp.rs bloomery-serve:crates/app/src/arch/mod.rs bloomery-serve:crates/app/src/arch/qwen3moe/mod.rs
