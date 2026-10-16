@@ -1,0 +1,25 @@
+# bloomery-serve (the #320 stack, fd71b9ed) on Nemotron 3.5 Bolt 74B-A9B 24 GB on the RTX A6000, at the
+# serving defaults, the seat the file's arch word picks: tg and pp through llama-server's own timings
+# (depth-serve.sh), the first measured rows of our Bolt body. Derived band: ~9.1B active parameters at
+# ~4.4 bits is ~5.0 GB a token, at 600-700 GB/s 7.1-8.5 ms a step — the ceiling 118-140 tok/s. The seat's
+# own smoke on the same card read tg 82.2 (one request, 7/7 checks PASS), which with the derived ceiling
+# names a serial step term the derivation does not hold: predict tg 75..95 @ depth 6. The prompt runs one
+# step an id (no prompt batch yet) and no head until its end, so pp sits at tg's rate or a little above:
+# 80..100. The reference row is mainline llama.cpp's measured 81.36 tok/s @ depth 6 (box job s1187,
+# bolt-lcpp-base-a6000.card), quoted beside, not interleaved with this lease.
+kind: baseline
+question: where does bloomery-serve decode and prompt Nemotron 3.5 Bolt 74B-A9B 24 GB on the A6000?
+term: tg and pp tok/s @ D = 6 and 1024, n = 128, NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf, bloomery-serve
+  at the serving defaults, RTX A6000
+unit: tok/s
+predict: 75..95
+condition: tg @ depth 6 is the predicted row, four rounds (pp, one step an id and no head until the prompt's
+  end, is
+  expected at tg's rate or a little above; the 1024 rows within 5 % of the 6 rows, the Mamba state
+  depth-flat); one lease, BLOOMERY_MODEL=nemotron_h_moe,
+  DEPTH_SERVE_IDS=$BLOOMERY_DATA/ref-nemotron-moe-logits/prose1024.ids, arms bloomery-boltb1:6
+  bloomery-boltb1:1024, the default rounds; busy tags read beside each mean
+reason: #320's GPU evidence (decode tok/s beside the serve gate); the first measured row of our Bolt body
+decide-in: post the table as the engine's Bolt row beside llama.cpp's measured 81.36
+decide-below: the serial step term the smoke names: read the step's entries and the per-kernel table next
+decide-above: the bytes a token are fewer than derived: re-read the active expert bytes
