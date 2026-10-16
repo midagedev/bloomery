@@ -28,10 +28,8 @@
 //!   context and its Mamba-2 layers' scan state and conv ring (a Bolt file's
 //!   latent MoE layers hold nothing). It has no slot rows, so `--parallel`
 //!   above 1 is refused by name before any plan.
-//! - The prompt path is the body's: the Nano's is batched
-//!   (`GpuModel::prefill`, passes of many rows); Bolt's has no prompt batch,
-//!   one step an id (`GpuModel::step` over the ids), so its prompt rate is its
-//!   decode rate.
+//! - The prompt path is the body's batched one (`GpuModel::prefill`, passes
+//!   of many rows); one id is a step.
 //! - A Mamba-2 state cannot step back. A request keeps the prefix it shares
 //!   with what the slot holds only when that prefix is the whole held
 //!   sequence (the position the model stands at); any other shared prefix is
@@ -131,6 +129,16 @@ struct Nemotron<B: ChainBody> {
 /// The Nano's prompt path: several ids run the batched
 /// [`GpuModel::prefill`] (passes of many rows); one id is a step.
 fn prefill_nano(m: &mut NemotronHModel, ids: &[u32]) -> Result<u32, GpuError> {
+    if ids.len() > 1 {
+        m.prefill(ids)
+    } else {
+        m.step(ids)
+    }
+}
+
+/// The Bolt's prompt path, the Nano's split: several ids the batched
+/// [`GpuModel::prefill`], one id a step.
+fn prefill_bolt(m: &mut NemotronHMoeModel, ids: &[u32]) -> Result<u32, GpuError> {
     if ids.len() > 1 {
         m.prefill(ids)
     } else {
@@ -336,7 +344,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             0,
         )?,
         Arch::NemotronHMoe => SeatEngine::spawn(
-            move || Nemotron::open(open, NemotronHMoeModel::open, NemotronHMoeModel::step),
+            move || Nemotron::open(open, NemotronHMoeModel::open, prefill_bolt),
             slot_ctx,
             vocab,
             device,
