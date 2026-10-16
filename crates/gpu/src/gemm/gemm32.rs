@@ -420,15 +420,16 @@ macro_rules! w32 {
                 *p.add(6) = h2;
                 *p.add(7) = h3;
                 *$dst.add(16 + $pj) = crate::mxfp4::ue4m3_half((ew >> sh) & 0xff).to_bits();
-                *$dst.add(18 + $pj) =
-                    crate::mxfp4::ue4m3_half((ew >> (sh + 8)) & 0xff).to_bits();
+                *$dst.add(18 + $pj) = crate::mxfp4::ue4m3_half((ew >> (sh + 8)) & 0xff).to_bits();
             }
         }
     }};
     (@scale nvfp4p($qs:ident, $e:ident, $scale:ident), $v:expr) => {
         mul_rn_f32($scale, $v)
     };
-    (@scale $kind:ident($($w:ident),+), $v:expr) => { $v };
+    (@scale $kind:ident($($w:ident),+), $v:expr) => {
+        $v
+    };
 }
 
 /// Stage step `h`'s activations into stage `st`: thread `tid`'s 16-byte
