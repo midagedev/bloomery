@@ -644,19 +644,9 @@ macro_rules! iq2xxs_dec {
             ]
         }
     }};
-    (@frag $r0:ident, $r1:ident, $pp:expr, $hh:expr) => {{
-        let (e, o) = (6 * $pp, 6 * $pp + 3);
-        (
-            [$r0[e], $r1[e], $r0[e + 1], $r1[e + 1]],
-            [$r0[o], $r1[o], $r0[o + 1], $r1[o + 1]],
-            [
-                $r0[e + 2] as i32,
-                $r1[e + 2] as i32,
-                $r0[o + 2] as i32,
-                $r1[o + 2] as i32,
-            ],
-        )
-    }};
+    (@frag $r0:ident, $r1:ident, $pp:expr, $hh:expr) => {
+        iq3xxs_dec!(@frag $r0, $r1, $pp, $hh)
+    };
     (@mma $a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $first:expr) => {
         q4k_dec!(@mma $a, $b0, $b1, $sc, $par, $isum, $first)
     };
