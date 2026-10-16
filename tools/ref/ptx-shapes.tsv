@@ -1,3 +1,6 @@
+# PIN(2026-10-17): the wide router scores moved to the common f32_tile_gemm (74805680f): the
+# thirteen *_scores rows the scans no longer print are removed, and the score scalars elem
+# writes over the tile's logits are pinned (sigmoid_rows, softplus_rows, both 0/0).
 # PTX spill ratchet — tools/ptx-spill-check.sh (recipe `just gate-ptx-spill`) holds every entry of
 # these binaries to the spill and jit_local bytes pinned here: `spill` is ptxas's spill stores
 # (bytes), `jit_local` the driver JIT's local bytes per thread (tools/ptx-scan.sh's columns). The
@@ -94,7 +97,6 @@ generate_ds41   ds41_ring_commit                         0           0
 generate_ds41   ds41_rope_tail                           0           0
 generate_ds41   ds41_router                              0           0
 generate_ds41   ds41_router_pick                         0           0
-generate_ds41   ds41_router_scores                       0           0
 generate_ds41   ds41_rows_to_tokens                      0           0
 generate_ds41   ds41_shexp_gate_up                       0           0
 generate_ds41   ds41_shexp_gate_up_q3k                   0           0
@@ -147,7 +149,6 @@ generate_ds41   gemm_route_remap                         0           0
 generate_ds41   gemm_swiglu_quant                        0           0
 generate_ds41   glm5next_router                          0           0
 generate_ds41   glm5next_router_pick                     0           0
-generate_ds41   glm5next_router_scores                   0           0
 generate_ds41   gqa_flash_merge                          0           0
 generate_ds41   gqa_flash_merge_256                      0           0
 generate_ds41   gqa_flash_merge_sink                     0           0
@@ -236,26 +237,20 @@ generate_ds41   mamba2_step                              0           0
 generate_ds41   mamba2_steps                             0           0
 generate_ds41   mimo2_router                             0           0
 generate_ds41   mimo2_router_pick                        0           0
-generate_ds41   mimo2_router_scores                      0           0
 generate_ds41   moe_combine                              0           0
 generate_ds41   mtp_input                                0           0
 generate_ds41   mxfp4_gate_up_sel                        0           0
 generate_ds41   mxfp4_gemv_sel                           0           0
 generate_ds41   nemotron_moe_router_240                  0           0
 generate_ds41   nemotron_moe_router_240_pick             0           0
-generate_ds41   nemotron_moe_router_240_scores           0           0
 generate_ds41   nemotron_moe_router_304                  0           0
 generate_ds41   nemotron_moe_router_304_pick             0           0
-generate_ds41   nemotron_moe_router_304_scores           0           0
 generate_ds41   nemotron_moe_router_368                  0           0
 generate_ds41   nemotron_moe_router_368_pick             0           0
-generate_ds41   nemotron_moe_router_368_scores           0           0
 generate_ds41   nemotron_moe_router_432                  0           0
 generate_ds41   nemotron_moe_router_432_pick             0           0
-generate_ds41   nemotron_moe_router_432_scores           0           0
 generate_ds41   nemotron_moe_router_496                  0           0
 generate_ds41   nemotron_moe_router_496_pick             0           0
-generate_ds41   nemotron_moe_router_496_scores           0           0
 generate_ds41   neox_append_k192                         0           0
 generate_ds41   neox_append_k192_ring                    0           0
 generate_ds41   norm_quant                               0           0
@@ -276,6 +271,8 @@ generate_ds41   q3k_gemv_heads_pair                      0           0
 generate_ds41   q3k_gemv_sel                             0           0
 generate_ds41   q3k_quantize_q8_1                        0           0
 generate_ds41   q3k_quantize_q8_1_relu_sqr            0           0
+generate_ds41   sigmoid_rows                         0           0
+generate_ds41   softplus_rows                        0           0
 generate_ds41   q4k_gemv                                 0           0
 generate_ds41   q4k_gemv_mcol                            0           0
 generate_ds41   q4k_gemv_prefetch                        0           0
@@ -525,19 +522,14 @@ gate_e2e   mxfp4_gate_up_sel                        0           0
 gate_e2e   mxfp4_gemv_sel                           0           0
 gate_e2e   nemotron_moe_router_240                  0           0
 gate_e2e   nemotron_moe_router_240_pick             0           0
-gate_e2e   nemotron_moe_router_240_scores           0           0
 gate_e2e   nemotron_moe_router_304                  0           0
 gate_e2e   nemotron_moe_router_304_pick             0           0
-gate_e2e   nemotron_moe_router_304_scores           0           0
 gate_e2e   nemotron_moe_router_368                  0           0
 gate_e2e   nemotron_moe_router_368_pick             0           0
-gate_e2e   nemotron_moe_router_368_scores           0           0
 gate_e2e   nemotron_moe_router_432                  0           0
 gate_e2e   nemotron_moe_router_432_pick             0           0
-gate_e2e   nemotron_moe_router_432_scores           0           0
 gate_e2e   nemotron_moe_router_496                  0           0
 gate_e2e   nemotron_moe_router_496_pick             0           0
-gate_e2e   nemotron_moe_router_496_scores           0           0
 gate_e2e   neox_append_k192                         0           0
 gate_e2e   neox_append_k192_ring                    0           0
 gate_e2e   norm_quant                               0           0
@@ -558,6 +550,8 @@ gate_e2e   q3k_gemv_heads_pair                      0           0
 gate_e2e   q3k_gemv_sel                             0           0
 gate_e2e   q3k_quantize_q8_1                        0           0
 gate_e2e   q3k_quantize_q8_1_relu_sqr               0           0
+gate_e2e   sigmoid_rows                         0           0
+gate_e2e   softplus_rows                        0           0
 gate_e2e   q4k_gemv                                 0           0
 gate_e2e   q4k_gemv_mcol                            0           0
 gate_e2e   q4k_gemv_prefetch                        0           0
