@@ -1,201 +1,56 @@
-//! A `nemotron_h` file planned onto a machine: the one path from the file's
-//! headers to a whole-card plan. The hyperparameters, every tensor's role,
-//! the typed description and each layer's store bytes ([`KvLayout`]) are read
-//! once ([`PlanInputs::read`], which refuses a file whose features no program
-//! runs, every one listed); then the placement ([`PlanInputs::plan`]) puts
-//! the whole model on one card (the file holds no routed expert, so no tier
-//! and no host leg has anything to hold), and refuses by name a machine of
-//! more than one card or with a tier card, a context of no position, and a
-//! context whose stores the card cannot hold.
+//! A `nemotron_h` file planned onto a machine: the family's half of the one
+//! path from the file's headers to a whole-card plan. The hyperparameters,
+//! every tensor's role, the typed description and each layer's store bytes
+//! are read once ([`describe`]; [`read`] refuses a file whose features no
+//! program runs, every one listed); the plan itself is the hybrid trunk's
+//! ([`PlanInputs::plan`]), which both Nemotron-H families share.
 //!
 //! A sequence's stores are an attention layer's K and V planes, which grow
 //! with the context, and a Mamba-2 layer's scan state and conv ring, which do
-//! not; an MLP layer holds nothing ([`KvLayout::layer_bytes`]).
+//! not; an MLP layer holds nothing ([`Holds`]).
 
 use gguf::Split;
-use models::ModelSpec;
-use runtime::stores::{dense_kv_bytes, mamba2_bytes};
 
 use super::hparams::{Hparams, Kind};
 use super::spec;
-use crate::arch::coverage;
-use crate::placement::accepts::{Program, routed_rule};
-use crate::placement::ctx_ask::PlanRefusal;
-use crate::placement::{
-    self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented,
-    Violation, checked, joined,
-};
+pub use crate::arch::hybrid::{Holds, KvLayout, PlaceError, PlanInputs};
+use crate::placement::PlacementError;
 
-/// What a plan of a `nemotron_h` file is made from, read from its headers.
-#[derive(Clone, Debug)]
-pub struct PlanInputs {
-    /// Every tensor with its role, and the model's layer count.
-    pub model: ModelTensors,
-    /// The typed model description the coverage check reads.
-    pub spec: ModelSpec,
-    /// Each layer's store bytes.
-    pub kv: KvLayout,
+/// `split`'s hyperparameters, then its tensors' roles, then its description,
+/// the first that fails being the error; then a file with a feature the
+/// engine does not run ([`PlacementError::Unimplemented`], every one listed).
+pub fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
+    describe(split)?.runnable()
 }
 
-/// Why a plan was refused.
-#[derive(Debug, thiserror::Error)]
-pub enum PlaceError {
-    /// The placement could not be built.
-    #[error(transparent)]
-    Placement(#[from] PlacementError),
-    /// A machine with an expert tier card: the file has no routed expert, so
-    /// the tier would hold nothing.
-    #[error(
-        "the machine has the expert tier card {card} (tier {tier}); the nemotron_h file has no routed expert for a tier to hold"
-    )]
-    Tier {
-        /// The tier card's name.
-        card: String,
-        /// Its index among the machine's tiers.
-        tier: usize,
-    },
-    /// A machine of other than one card: the body runs its chain on one.
-    #[error("the placement puts the layers on {0} cards; the nemotron_h chain runs on one")]
-    Cards(usize),
-    /// The plan was built and breaks these invariants, every one of them.
-    #[error("the plan breaks its invariants: {}", joined(.0))]
-    Broken(Vec<Violation>),
-    /// A context of no position: no plane, nothing to serve.
-    #[error("ctx_max 0: a plan serves at least one position")]
-    CtxZero,
+/// [`read`] without the refusals: the file as it is, for a gate that plans or
+/// describes a file whatever the coverage list holds.
+pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
+    let hp = Hparams::read(split)?;
+    let read = spec::read(split)?;
+    Ok(PlanInputs {
+        model: read.tensors,
+        spec: read.spec,
+        kv: kv_layout(&hp),
+    })
 }
 
-impl PlanRefusal for PlaceError {
-    fn placement(&self) -> Option<&PlacementError> {
-        match self {
-            Self::Placement(e) => Some(e),
-            _ => None,
-        }
-    }
-
-    fn violations(&self) -> Option<&[Violation]> {
-        match self {
-            Self::Broken(v) => Some(v),
-            _ => None,
-        }
-    }
-}
-
-impl PlanInputs {
-    /// `split`'s hyperparameters, then its tensors' roles, then its
-    /// description, the first that fails being the error; then a file with a
-    /// feature the engine does not run ([`PlacementError::Unimplemented`],
-    /// every one listed).
-    pub fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
-        let inputs = PlanInputs::describe(split)?;
-        let missing = inputs.unimplemented();
-        if missing.is_empty() {
-            Ok(inputs)
-        } else {
-            Err(PlacementError::Unimplemented(missing))
-        }
-    }
-
-    /// [`PlanInputs::read`] without the refusals: the file as it is, for a
-    /// gate that plans or describes a file whatever the coverage list holds.
-    pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
-        let hp = Hparams::read(split)?;
-        let read = spec::read(split)?;
-        let kv = KvLayout::of(&hp);
-        Ok(PlanInputs {
-            model: read.tensors,
-            spec: read.spec,
-            kv,
-        })
-    }
-
-    /// Every feature of the file the engine does not run, as
-    /// [`coverage::check`] lists them. Empty for a file the program runs.
-    pub fn unimplemented(&self) -> Vec<Unimplemented> {
-        coverage::check(&self.spec, &self.model)
-    }
-
-    /// The placement of the file on `machine` at `ctx_max` positions under
-    /// the placement's `levers`: the whole model on the machine's one card.
-    pub fn plan<'a>(
-        &'a self,
-        machine: &'a Machine,
-        ctx_max: u64,
-        levers: &PlanLevers,
-    ) -> Result<Plan<'a>, PlaceError> {
-        if ctx_max == 0 {
-            return Err(PlaceError::CtxZero);
-        }
-        if let Some((tier, card)) = machine.tiers.iter().enumerate().next() {
-            return Err(PlaceError::Tier {
-                card: card.name.clone(),
-                tier,
-            });
-        }
-        if machine.cards.len() != 1 {
-            return Err(PlaceError::Cards(machine.cards.len()));
-        }
-        let plan = placement::plan_routed(
-            &self.model,
-            machine,
-            ctx_max,
-            &self.kv,
-            levers,
-            routed_rule(Program::NemotronHBody),
-        )?;
-        checked(plan).map_err(PlaceError::Broken)
-    }
-}
-
-/// What one layer holds per sequence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Store {
-    /// An attention layer: K and V of this many bytes a position.
-    Rows(u64),
-    /// A Mamba-2 layer: this many bytes of scan state and conv ring, whatever
-    /// the context.
-    State(u64),
-    /// An MLP layer.
-    Nothing,
-}
-
-/// Each layer's store bytes of a `nemotron_h` file: the bytes the body's
-/// allocations hold ([`runtime::stores`] is their owner).
-#[derive(Clone, Debug)]
-pub struct KvLayout {
-    layers: Vec<Store>,
-}
-
-impl KvLayout {
-    /// The layout of the layers `hp` names.
-    #[must_use]
-    pub fn of(hp: &Hparams) -> KvLayout {
-        let ssm = hp.ssm;
-        let state = mamba2_bytes(ssm.d_inner, ssm.d_state, ssm.d_conv, ssm.conv_dim);
-        let layers = hp
-            .kinds
+/// The store each layer of `hp` holds: a Mamba-2 layer its scan, an attention
+/// layer its key heads' planes, an MLP layer nothing.
+#[must_use]
+pub fn kv_layout(hp: &Hparams) -> KvLayout {
+    KvLayout::of(
+        &hp.ssm,
+        hp.key_len,
+        hp.kinds
             .iter()
             .zip(&hp.kv)
             .map(|(kind, &kv_heads)| match kind {
-                Kind::Mamba => Store::State(state),
-                Kind::Attention => Store::Rows(dense_kv_bytes(kv_heads, hp.key_len, 1)),
-                Kind::Mlp => Store::Nothing,
-            })
-            .collect();
-        KvLayout { layers }
-    }
-}
-
-impl KvBytes for KvLayout {
-    /// An attention layer's K and V of `ctx_max` positions, a Mamba-2
-    /// layer's state, an MLP layer's nothing; 0 past the last layer.
-    fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-        match self.layers.get(layer) {
-            Some(Store::Rows(row)) => row.saturating_mul(ctx_max),
-            Some(Store::State(bytes)) => *bytes,
-            Some(Store::Nothing) | None => 0,
-        }
-    }
+                Kind::Mamba => Holds::Scan,
+                Kind::Attention => Holds::Attention { kv_heads },
+                Kind::Mlp => Holds::Nothing,
+            }),
+    )
 }
 
 #[cfg(test)]
@@ -203,9 +58,10 @@ mod tests {
     use gguf::Split;
 
     use super::super::spec::tests::{CONV, HEAD, INNER, KV, geo, keys, tensors};
-    use super::{KvBytes, PlaceError, PlanInputs, PlanLevers};
+    use super::{PlaceError, PlanInputs, describe};
     use crate::arch::synthetic::{V, header_shaped};
     use crate::placement::workstation;
+    use crate::placement::{KvBytes, PlanLevers};
 
     /// The synthetic header's layers, in order: Mamba, MLP, attention, and
     /// the same again.
@@ -224,7 +80,7 @@ mod tests {
             &tensors(&g, true),
         );
         let split = Split::open(&path).expect("the synthetic header opens");
-        let inputs = PlanInputs::describe(&split).expect("the synthetic header describes");
+        let inputs = describe(&split).expect("the synthetic header describes");
         let _ = std::fs::remove_file(&path);
         inputs
     }
@@ -306,7 +162,7 @@ mod tests {
         match inputs.plan(&tiered, 4, &levers) {
             Err(e @ PlaceError::Tier { tier: 0, .. }) => assert!(
                 e.to_string()
-                    .contains("no routed expert for a tier to hold"),
+                    .contains("the nemotron_h body runs every layer on one card"),
                 "{e}"
             ),
             other => panic!("{other:?}, not the tier refusal"),
@@ -318,7 +174,7 @@ mod tests {
         second.token_embedding = false;
         two.cards.push(second);
         match inputs.plan(&two, 4, &levers) {
-            Err(e @ PlaceError::Cards(2)) => assert_eq!(
+            Err(e @ PlaceError::Cards(2, _)) => assert_eq!(
                 e.to_string(),
                 "the placement puts the layers on 2 cards; the nemotron_h chain runs on one"
             ),

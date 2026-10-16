@@ -16,7 +16,7 @@
 //! against the whole tree: a need any program's row covers, and a tensor type
 //! any program's pin reads, is not an item; the program itself is one.
 
-use bloomery_placement::accepts::qwen3moe_dense;
+use bloomery_placement::accepts::{BOLT_LEG, qwen3moe_dense};
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
 use bloomery_placement::kernels;
 pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
@@ -96,7 +96,7 @@ pub const AVAILABLE: &[Available] = &[
         runs: |n| matches!(n, Need::Engram { row: 5120 }),
     },
     Available {
-        programs: &[Program::NemotronHBody],
+        programs: &[Program::NemotronHBody, Program::NemotronHMoeBody],
         at: "gpu/src/mamba2.rs Mamba2Kernels::enqueue_step (STATE 128, CONV_TAPS 4)",
         runs: |n| {
             matches!(
@@ -129,9 +129,11 @@ pub const AVAILABLE: &[Available] = &[
                     window: None,
                     sinks: false,
                     scaled: false,
-                // The pack-5 row (head 128, group 5) is launched by no Qwen
-                // body; the program that launches it names its own entry.
-                } if value == head && gqa_row(*head, *group).is_some_and(|r| r.pack != 5)
+                // The pack-5 and pack-16 rows (head 128, groups 5 and 16) are
+                // launched by no Qwen body; the programs that launch them name
+                // their own entries.
+                } if value == head
+                    && gqa_row(*head, *group).is_some_and(|r| r.pack != 5 && r.pack != 16)
             )
         },
     },
@@ -151,6 +153,69 @@ pub const AVAILABLE: &[Available] = &[
                 } if value == head && gqa_row(*head, *group).is_some_and(|r| r.pack == 5)
             )
         },
+    },
+    Available {
+        programs: &[Program::NemotronHMoeBody],
+        at: "gpu/src/flash_gqa.rs GROUP_16 (two group-8 passes a key head)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Gqa {
+                    head,
+                    value,
+                    group,
+                    window: None,
+                    sinks: false,
+                    scaled: false,
+                } if value == head && gqa_row(*head, *group).is_some_and(|r| r.pack == 16)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::NemotronHMoeBody],
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body at 240, 304, 368, 432 and 496 \
+             (gpu/src/arch/nemotron_h_moe/router.rs)",
+        runs: |n| routes(n, &[RouterBody::BiasedSigmoid]),
+    },
+    Available {
+        programs: &[Program::NemotronHMoeBody],
+        at: "gpu/src/arch/nemotron_h_moe/moe.rs (ffn_latent_down, the experts' iq2_xxs_gemv_sel \
+             at K = latent, ffn_latent_up)",
+        runs: |n| matches!(n, Need::LatentExperts { latent } if latent.is_multiple_of(256)),
+    },
+    Available {
+        programs: &[Program::NemotronHMoeBody],
+        at: "gpu/src/arch/nemotron_h_moe/moe.rs (gpu/src/elem.rs enqueue_relu_sqr between the \
+             up and down launches, routed and shared)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::ExpertAct {
+                    act: models::Act::ReluSqr,
+                    ..
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::NemotronHMoeBody],
+        at: "gpu/src/arch/nemotron_h_moe/moe.rs (the shared expert, one-expert iq2_xxs_gemv_sel \
+             stacks)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Shared {
+                    ff,
+                    sigmoid_gate: false,
+                } if ff.is_multiple_of(256)
+            )
+        },
+    },
+    Available {
+        programs: &[Program::NemotronHMoeBody],
+        at: "gpu/src/arch/nemotron_h_moe/moe.rs (each layer's router and stacks at its own \
+             count and width)",
+        runs: |n| matches!(n, Need::ExpertShapes { .. }),
     },
     Available {
         programs: &[Program::Qwen3moeBody],
@@ -560,7 +625,8 @@ fn routes(n: &Need, bodies: &[RouterBody]) -> bool {
 
 /// A tensor family whose type a program pins, and the types it reads.
 struct TypePin {
-    program: Program,
+    /// The programs whose loads read the family at these types.
+    programs: &'static [Program],
     role: Role,
     /// Only the quantized tensors of two or more dimensions (the matrices a
     /// gemv reads; an F32 parameter table is its layer's mixer's).
@@ -605,7 +671,7 @@ const NEMOTRON_SITES: &[GgmlType] = &[
 /// head's q8_0, q6_K and q4_K arms).
 const TYPE_PINS: &[TypePin] = &[
     TypePin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::DenseFfn,
         matrices: true,
         names: Some(|n| !n.ends_with(".ffn_down.weight")),
@@ -613,7 +679,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q4_K],
     },
     TypePin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::DenseFfn,
         matrices: true,
         names: Some(|n| n.ends_with(".ffn_down.weight")),
@@ -621,7 +687,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
     },
     TypePin {
-        program: Program::Qwen35Body,
+        programs: &[Program::Qwen35Body],
         role: Role::Attention,
         matrices: true,
         names: None,
@@ -629,7 +695,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: Q35_PROJ,
     },
     TypePin {
-        program: Program::Qwen35Body,
+        programs: &[Program::Qwen35Body],
         role: Role::DenseFfn,
         matrices: true,
         names: None,
@@ -637,7 +703,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: Q35_PROJ,
     },
     TypePin {
-        program: Program::Qwen35Body,
+        programs: &[Program::Qwen35Body],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -645,7 +711,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q6_K, GgmlType::Q4_K, GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::Qwen35Body,
+        programs: &[Program::Qwen35Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -659,7 +725,7 @@ const TYPE_PINS: &[TypePin] = &[
         ],
     },
     TypePin {
-        program: Program::Deepseek41Chain,
+        programs: &[Program::Deepseek41Chain],
         role: Role::Attention,
         matrices: true,
         names: None,
@@ -667,7 +733,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q3_K, GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::Deepseek41Chain,
+        programs: &[Program::Deepseek41Chain],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -675,7 +741,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q6_K],
     },
     TypePin {
-        program: Program::Deepseek41Chain,
+        programs: &[Program::Deepseek41Chain],
         role: Role::HyperConnection,
         matrices: true,
         names: None,
@@ -683,7 +749,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q3_K],
     },
     TypePin {
-        program: Program::Glm5nextBody,
+        programs: &[Program::Glm5nextBody],
         role: Role::Attention,
         matrices: true,
         names: None,
@@ -691,7 +757,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::Glm5nextBody,
+        programs: &[Program::Glm5nextBody],
         role: Role::HyperConnection,
         matrices: true,
         names: None,
@@ -699,7 +765,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::Glm5nextBody,
+        programs: &[Program::Glm5nextBody],
         role: Role::DenseFfn,
         matrices: true,
         names: None,
@@ -707,7 +773,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: GATED_BLOCK,
     },
     TypePin {
-        program: Program::Glm5nextBody,
+        programs: &[Program::Glm5nextBody],
         role: Role::SharedExpert,
         matrices: true,
         names: None,
@@ -715,7 +781,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: GATED_BLOCK,
     },
     TypePin {
-        program: Program::Glm5nextBody,
+        programs: &[Program::Glm5nextBody],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -724,7 +790,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K],
     },
     TypePin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::Attention,
         matrices: true,
         names: Some(|n| !indexer_projection(n)),
@@ -732,7 +798,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::Attention,
         matrices: true,
         names: Some(indexer_projection),
@@ -740,7 +806,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::BF16],
     },
     TypePin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::HyperConnection,
         matrices: true,
         names: None,
@@ -748,7 +814,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::SharedExpert,
         matrices: true,
         names: None,
@@ -756,7 +822,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -764,7 +830,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K],
     },
     TypePin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -772,7 +838,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::Mimo2Body,
+        programs: &[Program::Mimo2Body],
         role: Role::Attention,
         matrices: true,
         names: None,
@@ -780,7 +846,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::Mimo2Body,
+        programs: &[Program::Mimo2Body],
         role: Role::DenseFfn,
         matrices: true,
         names: None,
@@ -788,7 +854,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: GATED_BLOCK,
     },
     TypePin {
-        program: Program::Mimo2Body,
+        programs: &[Program::Mimo2Body],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -796,7 +862,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::NemotronHBody,
+        programs: &[Program::NemotronHBody],
         role: Role::TokenEmbedding,
         matrices: false,
         names: None,
@@ -804,7 +870,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q5_0],
     },
     TypePin {
-        program: Program::NemotronHBody,
+        programs: &[Program::NemotronHBody, Program::NemotronHMoeBody],
         role: Role::Head,
         matrices: false,
         names: Some(|n| n == "output.weight"),
@@ -812,7 +878,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q6_K, GgmlType::Q4_K, GgmlType::Q8_0],
     },
     TypePin {
-        program: Program::NemotronHBody,
+        programs: &[Program::NemotronHBody],
         role: Role::Attention,
         matrices: false,
         names: Some(|n| {
@@ -832,7 +898,7 @@ const TYPE_PINS: &[TypePin] = &[
         reads: NEMOTRON_SITES,
     },
     TypePin {
-        program: Program::NemotronHBody,
+        programs: &[Program::NemotronHBody],
         role: Role::DenseFfn,
         matrices: false,
         names: None,
@@ -840,11 +906,11 @@ const TYPE_PINS: &[TypePin] = &[
         reads: NEMOTRON_SITES,
     },
     TypePin {
-        program: Program::NemotronHBody,
+        programs: &[Program::NemotronHBody, Program::NemotronHMoeBody],
         role: Role::Attention,
         matrices: false,
         names: Some(|n| {
-            use super::nemotron_h::names as nm;
+            use super::nemotron_h_moe::names as nm;
             [
                 nm::ATTN_NORM,
                 nm::SSM_A,
@@ -853,15 +919,18 @@ const TYPE_PINS: &[TypePin] = &[
                 nm::SSM_CONV,
                 nm::SSM_CONV_BIAS,
                 nm::SSM_NORM,
+                nm::SSM_IN_SCALE,
+                nm::SSM_OUT_SCALE,
             ]
             .into_iter()
             .any(|stem| n.ends_with(stem))
         }),
-        what: "Mamba-2 parameters and normalization gains (the body reads f32 and bf16)",
+        what: "Mamba-2 parameters, projection scales and normalization gains (the body reads f32 \
+               and bf16)",
         reads: &[GgmlType::F32, GgmlType::BF16],
     },
     TypePin {
-        program: Program::NemotronHBody,
+        programs: &[Program::NemotronHBody, Program::NemotronHMoeBody],
         role: Role::FfnNorm,
         matrices: false,
         names: None,
@@ -869,12 +938,78 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::F32, GgmlType::BF16],
     },
     TypePin {
-        program: Program::NemotronHBody,
+        programs: &[Program::NemotronHBody, Program::NemotronHMoeBody],
         role: Role::Head,
         matrices: false,
         names: Some(|n| n == "output_norm.weight"),
         what: "output normalization gain (the head reads f32 and bf16)",
         reads: &[GgmlType::F32, GgmlType::BF16],
+    },
+    TypePin {
+        programs: &[Program::NemotronHMoeBody],
+        role: Role::TokenEmbedding,
+        matrices: false,
+        names: None,
+        what: "token embedding (the card reads q8_0 rows)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        programs: &[Program::NemotronHMoeBody],
+        role: Role::Attention,
+        matrices: false,
+        names: Some(|n| {
+            use super::nemotron_h_moe::names as nm;
+            [
+                nm::SSM_IN,
+                nm::SSM_OUT,
+                nm::ATTN_Q,
+                nm::ATTN_K,
+                nm::ATTN_V,
+                nm::ATTN_OUTPUT,
+            ]
+            .into_iter()
+            .any(|stem| n.ends_with(stem))
+        }),
+        what: "Mamba-2 and attention projections (the body reads nvfp4 and q8_0)",
+        reads: &[GgmlType::NVFP4, GgmlType::Q8_0],
+    },
+    TypePin {
+        programs: &[Program::NemotronHMoeBody],
+        role: Role::Router,
+        matrices: false,
+        names: Some(|n| {
+            use super::nemotron_h_moe::names as nm;
+            n.ends_with(nm::FFN_GATE_INP) || n.ends_with(nm::EXP_PROBS_B)
+        }),
+        what: "router and selection bias (the body reads f32 and bf16)",
+        reads: &[GgmlType::F32, GgmlType::BF16],
+    },
+    TypePin {
+        programs: &[Program::NemotronHMoeBody],
+        role: Role::Router,
+        matrices: false,
+        names: Some(|n| {
+            use super::nemotron_h_moe::names as nm;
+            n.ends_with(nm::FFN_LATENT_DOWN) || n.ends_with(nm::FFN_LATENT_UP)
+        }),
+        what: "latent projections (the body reads q8_0)",
+        reads: &[GgmlType::Q8_0],
+    },
+    TypePin {
+        programs: &[Program::NemotronHMoeBody],
+        role: Role::RoutedExperts,
+        matrices: false,
+        names: None,
+        what: "routed experts (the body's iq2_xxs_gemv_sel reads iq2_xxs)",
+        reads: &[BOLT_LEG],
+    },
+    TypePin {
+        programs: &[Program::NemotronHMoeBody],
+        role: Role::SharedExpert,
+        matrices: false,
+        names: None,
+        what: "shared expert (the body's iq2_xxs_gemv_sel reads iq2_xxs)",
+        reads: &[BOLT_LEG],
     },
 ];
 
@@ -1052,8 +1187,8 @@ fn indexer_projection(name: &str) -> bool {
 /// type.
 fn weight_formats(program: Option<Program>, t: &ModelTensor) -> Vec<Need> {
     let matrix = t.dims.len() >= 2 && t.ty != GgmlType::F32;
-    let takes = |p: Program, role: Role, matrices: bool, names: Option<fn(&str) -> bool>| {
-        program.is_none_or(|q| p == q)
+    let takes = |ps: &[Program], role: Role, matrices: bool, names: Option<fn(&str) -> bool>| {
+        program.is_none_or(|q| ps.contains(&q))
             && role == t.role
             && (!matrices || matrix)
             && names.is_none_or(|takes| takes(&t.name))
@@ -1061,12 +1196,19 @@ fn weight_formats(program: Option<Program>, t: &ModelTensor) -> Vec<Need> {
     // Each pin that takes `t`, with whether it reads `t`'s type.
     let pins: Vec<(&'static str, bool)> = TYPE_PINS
         .iter()
-        .filter(|pin| takes(pin.program, pin.role, pin.matrices, pin.names))
+        .filter(|pin| takes(pin.programs, pin.role, pin.matrices, pin.names))
         .map(|pin| (pin.what, pin.reads.contains(&t.ty)))
         .chain(
             ROW_PINS
                 .iter()
-                .filter(|pin| takes(pin.program, pin.role, pin.matrices, pin.names))
+                .filter(|pin| {
+                    takes(
+                        std::slice::from_ref(&pin.program),
+                        pin.role,
+                        pin.matrices,
+                        pin.names,
+                    )
+                })
                 .map(|pin| (pin.what, (pin.row)(t.ty))),
         )
         .collect();
@@ -1196,6 +1338,14 @@ pub fn check_with(
                 Some(Program::Qwen3moeBody | Program::Qwen35Body) => {}
                 // The nemotron_h body is dense: a routed stack is an item.
                 Some(Program::NemotronHBody) => at(t.layer, Need::RoutedFormat(t.ty)),
+                // The latent MoE body's rule (`routed_rule`'s arm): its up
+                // and down launches read [`BOLT_LEG`] stacks, every part of
+                // another type is an item.
+                Some(Program::NemotronHMoeBody) => {
+                    if t.ty != BOLT_LEG {
+                        at(t.layer, Need::RoutedFormat(t.ty));
+                    }
+                }
             }
         }
         for need in weight_formats(program, t) {

@@ -12,5 +12,7 @@
 //! the gates at once.
 
 pub mod deepseek2;
+pub(crate) mod hybrid;
 pub mod nemotron_h;
+pub mod nemotron_h_moe;
 pub mod qwen3moe;

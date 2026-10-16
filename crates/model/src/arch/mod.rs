@@ -20,7 +20,7 @@ pub mod gemma_embedding;
 pub mod gemma_embedding2;
 mod gemma_encoder;
 pub mod glm5next;
-pub(crate) mod hybrid;
+pub mod hybrid;
 pub mod mimo2;
 pub mod names;
 pub mod nemotron_h;
@@ -784,6 +784,11 @@ pub(crate) mod synthetic {
         Q6K,
         /// Blocks of 256 values in 144 bytes; any first dim.
         Q4K,
+        /// NVFP4: blocks of 64 values in 36 bytes; the first dim a multiple of 64.
+        Nvfp4,
+        /// IQ2_XXS: blocks of 256 values in 66 bytes; the first dim a multiple of
+        /// 256.
+        Iq2Xxs,
     }
 
     impl Ty {
@@ -798,6 +803,20 @@ pub(crate) mod synthetic {
                 }
                 Ty::Q6K => (14, n.div_ceil(256) * 210),
                 Ty::Q4K => (12, n.div_ceil(256) * 144),
+                Ty::Nvfp4 => {
+                    assert!(
+                        n.is_multiple_of(64),
+                        "{n} values are not whole NVFP4 blocks"
+                    );
+                    (40, n / 64 * 36)
+                }
+                Ty::Iq2Xxs => {
+                    assert!(
+                        n.is_multiple_of(256),
+                        "{n} values are not whole IQ2_XXS blocks"
+                    );
+                    (16, n / 256 * 66)
+                }
             }
         }
     }

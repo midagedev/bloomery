@@ -36,6 +36,12 @@ pub enum Program {
     /// dense, its Mamba-2, NoPE GQA and squared-ReLU layers over the common
     /// kernels; no routed experts.
     NemotronHBody,
+    /// The nemotron_h_moe body (`crates/gpu/src/arch/nemotron_h_moe`):
+    /// whole-card, the Nano's Mamba-2 and NoPE GQA layers over the shared
+    /// hybrid owner (`crates/gpu/src/arch/hybrid.rs`) and the latent MoE layer,
+    /// whose routed up and down stacks and shared expert are IQ2_XXS read by
+    /// `iq2_xxs_gemv_sel` ([`BOLT_LEG`]).
+    NemotronHMoeBody,
 }
 
 /// The program that runs `arch`'s layers; `None` when none does.
@@ -49,7 +55,8 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
         Arch::MiMo2 => Some(Program::Mimo2Body),
         Arch::NemotronH => Some(Program::NemotronHBody),
-        Arch::NemotronHMoe | Arch::GemmaEmbedding | Arch::GemmaEmbedding2 => None,
+        Arch::NemotronHMoe => Some(Program::NemotronHMoeBody),
+        Arch::GemmaEmbedding | Arch::GemmaEmbedding2 => None,
     }
 }
 
@@ -160,6 +167,10 @@ pub const fn qwen38_down(ty: GgmlType) -> Option<DownEntry> {
 /// (`gpu-deepseek41`'s `CardStacks::of` and the swap's file stacks read this).
 pub const DS41_LEG: [GgmlType; 3] = [GgmlType::Q3_K, GgmlType::Q3_K, GgmlType::Q4_K];
 
+/// The latent MoE body's routed stacks: an up and a down (no gate) of the
+/// one type its `iq2_xxs_gemv_sel` launches read, in the file's blocks.
+pub const BOLT_LEG: GgmlType = GgmlType::IQ2_XXS;
+
 /// A card leg's arms: the types its gate·up launches read a gate or an up
 /// stack in, and the types its down launches read a down stack in.
 #[derive(Clone, Copy, Debug)]
@@ -189,6 +200,10 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
         Program::Deepseek41Chain => Some(LegArms {
             gate_up: |ty| ty == DS41_LEG[0],
             down: |ty| ty == DS41_LEG[2],
+        }),
+        Program::NemotronHMoeBody => Some(LegArms {
+            gate_up: |ty| ty == BOLT_LEG,
+            down: |ty| ty == BOLT_LEG,
         }),
         Program::NemotronHBody => None,
     }
@@ -228,9 +243,18 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             gate_up: |ty| (ty == DS41_LEG[0]).then_some(CardFormat::KQuant),
             down: |ty| (ty == DS41_LEG[2]).then_some(CardFormat::KQuant),
         },
+        Program::NemotronHMoeBody => RoutedRule::Leg {
+            gate_up: bolt_leg_card,
+            down: bolt_leg_card,
+        },
         // No routed stack: every one is refused by name.
         Program::NemotronHBody => RoutedRule::PerType(|_| None),
     }
+}
+
+/// The latent MoE body's plan arm: [`BOLT_LEG`] in the file's blocks.
+fn bolt_leg_card(ty: GgmlType) -> Option<CardFormat> {
+    (ty == BOLT_LEG).then_some(CardFormat::KQuant)
 }
 
 /// The common leg's plan arm: a type both its gate·up and down launches read.
@@ -243,7 +267,7 @@ mod tests {
     use super::*;
     use crate::placement::{ModelTensor, ModelTensors, Role};
 
-    const PROGRAMS: [Program; 7] = [
+    const PROGRAMS: [Program; 8] = [
         Program::Deepseek41Chain,
         Program::Qwen3moeBody,
         Program::Qwen35Body,
@@ -251,6 +275,7 @@ mod tests {
         Program::Qwen38Body,
         Program::Mimo2Body,
         Program::NemotronHBody,
+        Program::NemotronHMoeBody,
     ];
 
     /// Every type the file format names.

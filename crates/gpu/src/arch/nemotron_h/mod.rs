@@ -5,7 +5,9 @@
 //! `src/models/nemotron-h.cpp`).
 //!
 //! One layer is a pre-norm mixer and a residual add, by the layer's kind
-//! (read from the file's per-layer arrays at load, not from its index):
+//! (read from the file's per-layer arrays at load, not from its index); the
+//! Mamba-2 and attention layers' pieces are the hybrid trunk's
+//! ([`crate::arch::hybrid`]), which the `nemotron_h_moe` body runs too:
 //!
 //! - Mamba-2: norm, the `ssm_in` projection split into `z`, `xBC` and `dt`
 //!   (three views of one output), the scan step ([`crate::mamba2`]), the
@@ -31,5 +33,6 @@ mod body;
 mod prefill;
 mod step;
 
-pub use body::{Body, DecodeInput};
+pub use crate::arch::hybrid::DecodeInput;
+pub use body::Body;
 pub use prefill::PASS_ROWS;

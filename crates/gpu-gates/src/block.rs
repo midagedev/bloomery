@@ -48,7 +48,7 @@ const Q_ROWS: u64 = 16 * 192;
 const NOPE: u64 = 128;
 const KQ_HEAD: u64 = 192;
 const KV_WIDTH: u64 = LATENT + ROPE;
-const ROUTER: RouterInst = shape::router_row(RouterBody::Topk, 2);
+const ROUTER: RouterInst = shape::router_row(RouterBody::Topk, 64);
 const N_EXPERT: u64 = ROUTER.experts() as u64;
 const N_USED: u64 = ROUTER.top_k_max as u64;
 // The row compiles one pick count, which is then the dump's; a row that

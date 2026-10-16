@@ -45,7 +45,7 @@ pub const N_USED: usize = 6;
 /// This body's instance row: the width and the one pick count above, the
 /// rule softmax, top k, the kept probabilities times the file's scale. A
 /// file's shape selects it through `models::shape::select_router`.
-pub const ROW: RouterInst = shape::router_row(RouterBody::Topk, (N_EXPERT / 32) as u32);
+pub const ROW: RouterInst = shape::router_row(RouterBody::Topk, N_EXPERT as u32);
 const _: () = assert!(shape::router_row_is(
     ROW,
     rules::SOFTMAX_TOPK,

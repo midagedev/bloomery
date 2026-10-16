@@ -204,6 +204,8 @@ dispatch=(
   'crates/gpu/src/lib.rs type Qwen3moeModel'
   # The same shape for nemotron_h — the nemotron seat and its gates name the body through this alias only.
   'crates/gpu/src/lib.rs type NemotronHModel'
+  # The same shape for nemotron_h_moe — its gate names the body through this alias only.
+  'crates/gpu/src/lib.rs type NemotronHMoeModel'
   # gpu-vision 은 deepseek41v 탑 자신의 크레이트다(이름이 gpu-<arch> 가 아닐 뿐) — 인코더가 그 탑의 이름표를 읽는다.
   'crates/gpu-vision/src/encoder.rs use'
   # The same crate's second tower (the Qwen3-VL merger of Clef, Qwen3.6 and Qwen3.8) reads its file's

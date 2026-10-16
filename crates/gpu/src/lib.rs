@@ -104,6 +104,9 @@ pub type Deepseek2Model = GpuModel<arch::deepseek2::Body>;
 pub type Qwen3moeModel = GpuModel<arch::qwen3moe::Body>;
 /// The nemotron_h engine: the whole model on one card.
 pub type NemotronHModel = GpuModel<arch::nemotron_h::Body>;
+
+/// The nemotron_h_moe engine: the whole model on one card.
+pub type NemotronHMoeModel = GpuModel<arch::nemotron_h_moe::Body>;
 pub use tensor::{DeviceTensor, PartedBuffer, Q8Act, TensorWindow, Window, WindowMut, window};
 
 /// Host-side failure: context creation, module loading, device allocation,

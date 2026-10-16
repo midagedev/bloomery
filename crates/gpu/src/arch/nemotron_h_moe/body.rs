@@ -1,0 +1,336 @@
+//! The nemotron_h_moe `ChainBody`: the file's shape read and checked once at
+//! load, each layer's weight names, site types and router instance resolved
+//! once, the caches, the scan stores and the router results allocated once,
+//! and the per-step record refreshed before every enqueue or replay.
+
+use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, Routing, moe_layer, routed};
+use crate::arch::hybrid::{
+    self, Acts, AttnLayer, Cx, DecodeInput, Kernels, MambaLayer, Names, Site, WORD_POS, WORD_TOKEN,
+    Words, attention_heads, attn_layer, mamba_layer, mamba_shape,
+};
+use crate::flash_gqa::GROUP_16;
+use crate::head::Head;
+use crate::iq_sel::IqSelKernels;
+use crate::model::{ChainBody, GpuModel, NoHost, block_count};
+use crate::q38::{EmbedQ8Args, Q38Kernels};
+use crate::site::SiteTy;
+use crate::weights::Weights;
+use crate::{Gpu, GpuError, Window};
+use cuda_core::{CudaStream, DeviceBuffer};
+use gguf::Split;
+use model::arch::Arch;
+use model::arch::nemotron_h_moe::hparams::{Hparams, Kind};
+use model::arch::nemotron_h_moe::names;
+use std::ops::Range;
+
+use super::router::Routers;
+
+const WHAT: &str = "nemotron_h_moe::Body::load";
+const STEP: &str = "nemotron_h_moe::Body::enqueue_chain";
+
+/// The file types a Mamba-2 or attention projection launches: NVFP4 through
+/// its gemv on the q8_1 rows, Q8_0 through the f32 one.
+const SITE_TYPES: &[SiteTy] = &[SiteTy::Nvfp4, SiteTy::Q8_0];
+
+/// A layer, by the kind the file's per-layer arrays give it.
+enum Layer {
+    Mamba(MambaLayer),
+    Attn(AttnLayer),
+    Moe(MoeLayer),
+}
+
+impl Layer {
+    fn sites(&self) -> Vec<&Site> {
+        match self {
+            Layer::Mamba(m) => m.sites().to_vec(),
+            Layer::Attn(a) => a.sites().to_vec(),
+            Layer::Moe(m) => m.sites().to_vec(),
+        }
+    }
+}
+
+/// The nemotron_h_moe chain over one sequence on one card.
+pub struct Body {
+    /// The Q8_0 token table's name.
+    embed: String,
+    sh: hybrid::Shape,
+    moe: MoeShape,
+    layers: Vec<Layer>,
+    k: Kernels,
+    mk: MoeKernels,
+    q38: Q38Kernels,
+    acts: Acts,
+    s: hybrid::Scratch,
+    ms: MoeScratch,
+    /// The residual stream's second buffer ([`Body::enqueue`]).
+    r: DeviceBuffer<f32>,
+    /// Host zeros as long as the longest recurrent buffer, what a reset
+    /// copies over every store.
+    zeros: Vec<f32>,
+    /// The step record's host words, rewritten by every refresh.
+    words: Words,
+}
+
+impl GpuModel<Body> {
+    /// The whole model of `file` resident on `gpu`, plus the output head:
+    /// every tensor in its kernels' device format (the IQ2_XXS stacks in the
+    /// file's blocks), K/V planes of `ctx` rows a key head, the scan stores,
+    /// the routers' results and the step scratch. The model takes the file
+    /// and closes it once the weights are resident.
+    pub fn open(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
+        let n_layers = block_count(&file, "nemotron_h_moe GpuModel::open")?;
+        GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
+            Body::load(gpu, &file, w, ctx)
+        })
+    }
+}
+
+impl Body {
+    fn load(gpu: &Gpu, file: &Split, w: &mut Weights, ctx: usize) -> Result<Body, GpuError> {
+        let hp = Hparams::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let ssm = hp.ssm;
+        let mamba = mamba_shape(WHAT, &ssm)?;
+        let n_kv = attention_heads(
+            WHAT,
+            hp.kinds
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| **k == Kind::Attention)
+                .map(|(l, _)| (l, hp.kv[l])),
+            (hp.n_head, hp.key_len, hp.value_len),
+            GROUP_16,
+        )?;
+        let hidden = hp.n_embd;
+        let stream = gpu.stream();
+        let mut names = Names {
+            what: WHAT,
+            file,
+            w,
+            types: SITE_TYPES,
+        };
+        let embed = names::token_embd();
+        names.site(&embed, (hp.n_vocab, hidden), &[SiteTy::Q8_0])?;
+        let mut layers = Vec::with_capacity(hp.n_layer);
+        for l in 0..hp.n_layer {
+            let norm = names.vector(l, names::ATTN_NORM, hidden)?;
+            layers.push(match hp.kinds[l] {
+                Kind::Mamba => Layer::Mamba(names.mamba((l, norm), &ssm, hidden, stream)?),
+                Kind::Attention => Layer::Attn(names.attn(
+                    (l, norm),
+                    (hp.n_head, hp.kv[l]),
+                    (hidden, ctx),
+                    stream,
+                )?),
+                Kind::Moe => Layer::Moe(MoeLayer::load(&names, (l, norm), &hp, stream)?),
+            });
+        }
+        let mut acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
+        for l in &layers {
+            if let Layer::Moe(m) = l {
+                for (k, cols) in m.forms(&hp) {
+                    acts.add_q8_1(stream, k, cols)?;
+                }
+            }
+        }
+        let sh = hybrid::Shape {
+            hidden,
+            eps: hp.rms_eps,
+            mamba,
+            n_kv,
+            ctx,
+        };
+        let moe = MoeShape {
+            latent: hp.latent,
+            shared_ff: hp.shared_ff,
+            scale: hp.weights_scale,
+        };
+        let ff = hp.experts.iter().flatten().map(|x| x.ff).max().unwrap_or(0);
+        let longest = layers
+            .iter()
+            .filter_map(|l| match l {
+                Layer::Mamba(m) => Some(m.store.state.len().max(m.store.ring.len())),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let ctx_ = gpu.context();
+        Ok(Body {
+            k: Kernels::load(gpu)?,
+            mk: MoeKernels {
+                routers: Routers::load(ctx_)?,
+                iq: IqSelKernels::load(ctx_, gpu.fault_word())?,
+            },
+            q38: Q38Kernels::load(ctx_)?,
+            acts,
+            s: hybrid::Scratch::new(stream, &sh, hp.n_head, 0)?,
+            ms: MoeScratch::new(stream, moe, hidden, ff)?,
+            r: DeviceBuffer::zeroed(stream, hidden)?,
+            zeros: vec![0.0; longest],
+            words: Words::new(n_kv),
+            sh,
+            moe,
+            layers,
+            embed,
+        })
+    }
+
+    /// Layer `layer`'s scan state read back (a gate's instrument; it
+    /// synchronizes `stream`). A layer that is not a Mamba-2 layer is refused
+    /// by name.
+    pub fn scan_state(&self, stream: &CudaStream, layer: usize) -> Result<Vec<f32>, GpuError> {
+        match self.layers.get(layer) {
+            Some(Layer::Mamba(m)) => Ok(m.store.state.to_host_vec(stream)?),
+            _ => Err(GpuError::shape(
+                "nemotron_h_moe::Body::scan_state",
+                format!("layer {layer} holds no scan state"),
+            )),
+        }
+    }
+
+    /// MoE layer `layer`'s last routing read back ([`Routing`]: the kept
+    /// ids in rank order, their weights and every expert's unbiased score; a
+    /// gate's instrument, it synchronizes `stream`). A layer that is not a
+    /// MoE layer is refused by name.
+    pub fn routing(&self, stream: &CudaStream, layer: usize) -> Result<Routing, GpuError> {
+        match self.layers.get(layer) {
+            Some(Layer::Moe(m)) => routed(m, stream),
+            _ => Err(GpuError::shape(
+                "nemotron_h_moe::Body::routing",
+                format!("layer {layer} routes no experts"),
+            )),
+        }
+    }
+
+    /// The whole chain: the embedding, every layer, then `head`. The residual
+    /// stream alternates between the head's input and the body's own buffer,
+    /// each layer writing the one it did not read, so the last layer's sum is
+    /// the head's input whatever the layer count's parity.
+    fn enqueue(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
+        let cx = Cx {
+            what: STEP,
+            gpu,
+            w,
+            k: &self.k,
+            sh: self.sh,
+        };
+        let (qs, d) = w.q8_planes(STEP, &self.embed)?;
+        let hin = head.input_mut();
+        let mut in_head = self.layers.len().is_multiple_of(2);
+        {
+            let t = &mut self.s;
+            let ids = Window::<u32>::of(&t.words, WORD_TOKEN * size_of::<u32>(), 1)?;
+            let pos0 = Window::<u32>::of(&t.words, WORD_POS * size_of::<u32>(), 1)?;
+            let first = if in_head { &mut *hin } else { &mut self.r };
+            self.q38.enqueue_embed_rows(
+                gpu.stream(),
+                EmbedQ8Args {
+                    qs,
+                    d,
+                    ids: &ids,
+                    pos0: &pos0,
+                    first: 0,
+                    fault: gpu.unlabelled_sink(),
+                    y: first,
+                    pos: &mut t.buf.pos,
+                    n_keys: &mut t.buf.n_keys,
+                },
+            )?;
+        }
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            let (src, dst) = if in_head {
+                (&*hin, &mut self.r)
+            } else {
+                (&self.r as &DeviceBuffer<f32>, &mut *hin)
+            };
+            match layer {
+                Layer::Mamba(m) => {
+                    mamba_layer(&cx, (l, m), (&mut self.s, &mut self.acts), (src, dst))?;
+                }
+                Layer::Attn(a) => {
+                    attn_layer::<GROUP_16>(&cx, (l, a), (&mut self.s, &mut self.acts), (src, dst))?;
+                }
+                Layer::Moe(m) => moe_layer(
+                    &cx,
+                    (&self.mk, self.moe),
+                    (l, m),
+                    (&mut self.s, &mut self.ms, &mut self.acts),
+                    (src, dst),
+                )?,
+            }
+            in_head = !in_head;
+        }
+        head.enqueue(gpu, w)
+    }
+}
+
+impl ChainBody for Body {
+    type Input = DecodeInput;
+    type Host = NoHost;
+    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
+
+    fn arch() -> Arch {
+        Arch::NemotronHMoe
+    }
+
+    fn decode_input(&mut self, token: u32, pos: u32) -> Result<DecodeInput, GpuError> {
+        Ok(DecodeInput { token, pos })
+    }
+
+    /// The step record in one copy ([`Words::refresh`]).
+    fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
+        self.words.refresh(
+            "nemotron_h_moe::Body::refresh",
+            stream,
+            &self.sh,
+            input,
+            &mut self.s.words,
+        )
+    }
+
+    fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
+        self.enqueue(gpu, w, head)
+    }
+
+    /// Every scan state and conv ring back to zero. The K/V planes need
+    /// nothing: the flash never reads a row at or past the live count, and
+    /// every row below it is written by its own step first. The router's
+    /// results are written whole by every step before any read.
+    fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        for layer in &mut self.layers {
+            if let Layer::Mamba(m) = layer {
+                m.store.clear(gpu.stream(), &self.zeros)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn head_eps(&self) -> f32 {
+        self.sh.eps
+    }
+
+    fn resident_bytes(&self) -> usize {
+        let layers: usize = self
+            .layers
+            .iter()
+            .map(|l| match l {
+                Layer::Mamba(m) => m.store.bytes(),
+                Layer::Attn(a) => a.bytes(),
+                Layer::Moe(m) => m.route.bytes(),
+            })
+            .sum();
+        layers
+            + self.s.bytes()
+            + self.ms.bytes()
+            + self.acts.bytes()
+            + self.r.num_bytes()
+            + self.k.kgemv.device_bytes()
+    }
+
+    fn layers(&self) -> Range<usize> {
+        0..self.layers.len()
+    }
+
+    fn host(&mut self) -> Option<&mut NoHost> {
+        None
+    }
+}

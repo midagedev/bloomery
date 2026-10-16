@@ -100,9 +100,41 @@ pub struct ModelTensor {
 pub struct ModelTensors {
     pub tensors: Vec<ModelTensor>,
     pub layers: usize,
-    /// Experts in each routed stack, and experts one token uses.
+    /// Experts in each routed stack — the largest layer's, on a model whose
+    /// MoE layers carry their own counts ([`stack_experts`]) — and experts
+    /// one token uses.
     pub experts: u64,
     pub experts_used: u64,
+}
+
+/// The experts of routed stack `t` of a model of `experts`: its last dim
+/// where that is a count of at most `experts` (a model whose MoE layers carry
+/// their own counts, `experts` the largest — Nemotron 3.5 Bolt's), else
+/// `experts`, which [`per_expert`] then holds the stack to.
+#[must_use]
+pub fn stack_experts(t: &ModelTensor, experts: u64) -> u64 {
+    match t.dims.as_slice() {
+        [_, _, n] if t.role == Role::RoutedExperts && *n > 0 && *n <= experts => *n,
+        _ => experts,
+    }
+}
+
+impl ModelTensors {
+    /// The experts of routed stack `t` ([`stack_experts`]).
+    #[must_use]
+    pub fn experts_of(&self, t: &ModelTensor) -> u64 {
+        stack_experts(t, self.experts)
+    }
+
+    /// The experts of layer `l`'s routed stacks: its first stack's
+    /// ([`ModelTensors::experts_of`]), `experts` on a layer with none.
+    #[must_use]
+    pub fn layer_experts(&self, l: usize) -> u64 {
+        self.tensors
+            .iter()
+            .find(|t| t.role == Role::RoutedExperts && t.layer == Some(l))
+            .map_or(self.experts, |t| self.experts_of(t))
+    }
 }
 
 /// A GPU card and the stage it runs. The same type serves an expert tier
@@ -436,12 +468,17 @@ impl CardFormat {
     /// of such a type stays on the host, and a tensor its role puts on a card
     /// is refused by the plan with [`PlacementError::NoCardFormat`]. Every
     /// type is listed by name, so a new [`GgmlType`] must be decided here.
+    /// IQ2_XXS loads in the file's blocks ([`CardFormat::KQuant`]), which
+    /// `iq2_xxs_gemv_sel` reads for a routed stack and for a dense matrix as
+    /// a stack of one expert (the latent MoE body's shared expert).
     #[must_use]
     pub fn of(ty: GgmlType) -> Option<CardFormat> {
         match ty {
-            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => {
-                Some(CardFormat::KQuant)
-            }
+            GgmlType::Q3_K
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::IQ2_XXS => Some(CardFormat::KQuant),
             GgmlType::Q5_0 => Some(CardFormat::Q5_0),
             GgmlType::Q5_1 => Some(CardFormat::Q5_1),
             GgmlType::Q8_0 => Some(CardFormat::Q8_0Planes),
@@ -451,7 +488,6 @@ impl CardFormat {
             GgmlType::F16
             | GgmlType::MXFP4
             | GgmlType::Q2_K
-            | GgmlType::IQ2_XXS
             | GgmlType::IQ2_XS
             | GgmlType::IQ3_XXS
             | GgmlType::IQ1_S
@@ -891,6 +927,7 @@ impl Segment {
         match &self.experts {
             None => Ok(vec![span(0..rows_of(t))]),
             Some(list) => {
+                let experts = stack_experts(t, experts);
                 let (per, _) = per_expert(t, experts)?;
                 if list.ids().last().is_some_and(|&e| u64::from(e) >= experts) {
                     return Err(PlacementError::tensor(
@@ -1825,7 +1862,8 @@ fn routed_row_on_as(
     model: &ModelTensors,
     format: Option<CardFormat>,
 ) -> Result<Row, PlacementError> {
-    let (rows_per_expert, file_per_expert) = per_expert(t, model.experts)?;
+    let experts = model.experts_of(t);
+    let (rows_per_expert, file_per_expert) = per_expert(t, experts)?;
     let mut owner: Vec<(u32, usize)> = on_cards
         .iter()
         .flat_map(|(c, list)| list.ids().iter().map(move |&e| (e, *c)))
@@ -1839,8 +1877,8 @@ fn routed_row_on_as(
             second: w[0].1.max(w[1].1),
         });
     }
-    let held = ExpertList::new(owner.iter().map(|&(e, _)| e).collect(), model.experts)?;
-    let host = held.complement(model.experts)?;
+    let held = ExpertList::new(owner.iter().map(|&(e, _)| e).collect(), experts)?;
+    let host = held.complement(experts)?;
     let mut segments = Vec::with_capacity(on_cards.len() + 1);
     for (card, list) in on_cards {
         if !list.is_empty() {
@@ -2029,7 +2067,7 @@ fn spread(
     n_l: &mut [u64],
     held: &[u64],
     eligible: &[usize],
-    experts: u64,
+    caps: &[u64],
     budget: i128,
     footprint: impl Fn(&[u64]) -> Result<u64, PlacementError>,
 ) -> Result<(), PlacementError> {
@@ -2037,10 +2075,11 @@ fn spread(
         return Ok(());
     }
     let total = |n_l: &[u64], l: usize| held[l] + n_l[l];
-    while let Some(&l) = eligible.iter().min_by_key(|&&l| total(n_l, l)) {
-        if total(n_l, l) >= experts {
-            break;
-        }
+    while let Some(&l) = eligible
+        .iter()
+        .filter(|&&l| total(n_l, l) < caps[l])
+        .min_by_key(|&&l| total(n_l, l))
+    {
         n_l[l] += 1;
         if i128::from(footprint(n_l)?) > budget {
             n_l[l] -= 1;
@@ -2087,7 +2126,7 @@ fn card_uploads<'m>(
                 let Some(f) = routed.format(t)? else {
                     continue;
                 };
-                let (rows_per_expert, _) = per_expert(t, model.experts)?;
+                let (rows_per_expert, _) = per_expert(t, model.experts_of(t))?;
                 (
                     f,
                     Held::Experts {
@@ -2401,7 +2440,7 @@ fn plan_rule<'a>(
         // planner with no card format has no tier to reach here
         // (`plan_host_routed` refuses one), and its empty `eligible` would
         // refuse the tier as idle.
-        let left = eligible.iter().any(|&l| held[l] < model.experts);
+        let left = eligible.iter().any(|&l| held[l] < model.layer_experts(l));
         if !left && own.iter().all(|&n| n == 0) {
             return Err(PlacementError::IdleTier {
                 card: tier.name.clone(),
@@ -2569,7 +2608,10 @@ impl Fill<'_, '_> {
             let dense = footprint(card.granule_bytes, &uploads, n_l)?;
             check_free_floor(card, free, dense, self.kv, self.reserve)?;
         }
-        spread(n_l, held, self.eligible, self.model.experts, budget, |n| {
+        let caps: Vec<u64> = (0..n_l.len())
+            .map(|l| self.model.layer_experts(l))
+            .collect();
+        spread(n_l, held, self.eligible, &caps, budget, |n| {
             footprint(card.granule_bytes, &uploads, n)
         })
     }
@@ -3166,7 +3208,7 @@ impl ArenaFloor {
             {
                 continue;
             }
-            let (_, per) = per_expert(t, model.experts)?;
+            let (_, per) = per_expert(t, model.experts_of(t))?;
             slot_set = slot_set
                 .checked_add(arena_window_bytes(per))
                 .ok_or_else(|| PlacementError::tensor(t, "the arena's slot set passes u64"))?;
@@ -3410,7 +3452,7 @@ pub fn expert_nvme_tier(
                 "a host segment of a routed stack with no list",
             ));
         };
-        let (_, per) = per_expert(t, model.experts)?;
+        let (_, per) = per_expert(t, model.experts_of(t))?;
         let Some(slot) = layer_of.get_mut(l) else {
             return Err(PlacementError::tensor(
                 t,
@@ -3487,7 +3529,7 @@ pub fn expert_nvme_tier(
             .min(l.ids.len());
         for &(i, at) in &l.stacks {
             let t = &model.tensors[plan.rows[i].tensor];
-            let (_, per) = per_expert(t, model.experts)?;
+            let (_, per) = per_expert(t, model.experts_of(t))?;
             let on_host = &l.ids[..n];
             let off_host = &l.ids[n..];
             let mut pieces = Vec::with_capacity(2);
@@ -3688,7 +3730,7 @@ fn totals<'a>(
         expert_bytes: host_experts,
         experts: (0..model.layers)
             .filter(|&l| routing[l])
-            .map(|l| model.experts - n_l[l] - tier_n_l.iter().map(|t| t[l]).sum::<u64>())
+            .map(|l| model.layer_experts(l) - n_l[l] - tier_n_l.iter().map(|t| t[l]).sum::<u64>())
             .sum(),
         nvme_expert_bytes: nvme_experts,
         nvme_arena_bytes: 0,
@@ -3799,7 +3841,7 @@ impl Plan<'_> {
         for tier in &self.tier_n_l {
             tiers = tiers.saturating_add(*tier.get(l).ok_or_else(past)?);
         }
-        let experts = self.model.experts;
+        let experts = self.model.layer_experts(l);
         experts
             .checked_sub(stage.saturating_add(tiers))
             .ok_or(PlacementError::LayerOverHeld {
@@ -4016,6 +4058,7 @@ fn segment_shape(t: &ModelTensor, segments: &[Segment], experts: u64) -> Option<
             _ => Some(format!("a whole tensor in {} segments", segments.len())),
         };
     }
+    let experts = stack_experts(t, experts);
     let Ok(n) = usize::try_from(experts) else {
         return Some(format!("{experts} experts pass usize"));
     };

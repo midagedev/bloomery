@@ -4,12 +4,14 @@
 //! (`hparams`), every tensor's role (`roles`), the tensor names (`names`)
 //! and the typed description (`spec`). The Mamba-2 and attention layers are
 //! read by the hybrid trunk's common pieces (`arch::hybrid`), which
-//! `nemotron_h` reads its own through. No program runs it: the
-//! coverage check lists what is missing. The dialect's authority is
+//! `nemotron_h` reads its own through, and the whole-card plan is the trunk's
+//! too (`place`). `Program::NemotronHMoeBody` runs it
+//! (`crates/gpu/src/arch/nemotron_h_moe`). The dialect's authority is
 //! llama.cpp's `src/models/nemotron-h.cpp`, which loads both architectures.
 
 pub mod fixture;
 pub mod hparams;
 pub mod names;
+pub mod place;
 pub mod roles;
 pub mod spec;

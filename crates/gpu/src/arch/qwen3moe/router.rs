@@ -126,7 +126,7 @@ const WIDTH: usize = 32 * PER_LANE;
 /// This body's instance row: its width, the softmax renormalized over the
 /// top k, `k` a launch argument of one to 32 (one pick a lane). A file's
 /// shape selects it through [`RouterDims::of`].
-pub const ROW: RouterInst = shape::router_row(RouterBody::Qwen3moe, PER_LANE as u32);
+pub const ROW: RouterInst = shape::router_row(RouterBody::Qwen3moe, 32 * PER_LANE as u32);
 const _: () = assert!(shape::router_row_is(
     ROW,
     rules::SOFTMAX_NORM,
@@ -2287,7 +2287,7 @@ impl RouterBufs {
         per_lane: Option<u32>,
     ) -> Result<u32, GpuError> {
         let inst = self.dims.inst;
-        if inst.body != body || per_lane.is_some_and(|w| w != inst.per_lane) {
+        if inst.body != body || per_lane.is_some_and(|w| w != inst.per_lane()) {
             return Err(GpuError::shape(
                 what,
                 format!(
@@ -2779,9 +2779,10 @@ pub mod gated {
     const ROWS_WIDE: usize = EXPERTS_WIDE + 1;
 
     /// The narrow instance's row: 256 experts, `k` one to 32.
-    pub const ROW: RouterInst = shape::router_row(RouterBody::Qwen35moe, PER_LANE as u32);
+    pub const ROW: RouterInst = shape::router_row(RouterBody::Qwen35moe, 32 * PER_LANE as u32);
     /// The wide instance's row: 512 experts, `k` one to 32.
-    pub const ROW_WIDE: RouterInst = shape::router_row(RouterBody::Qwen35moe, PER_LANE_WIDE as u32);
+    pub const ROW_WIDE: RouterInst =
+        shape::router_row(RouterBody::Qwen35moe, 32 * PER_LANE_WIDE as u32);
     const _: () = assert!(
         shape::router_row_is(
             ROW,
@@ -3959,7 +3960,7 @@ pub mod gated {
             out: &mut RouterOut,
         ) -> Result<(), GpuError> {
             let what = "qwen3moe::router::gated::enqueue_norm_fused";
-            let used = out.used_for(what, RouterBody::Qwen35moe, Some(ROW.per_lane))?;
+            let used = out.used_for(what, RouterBody::Qwen35moe, Some(ROW.per_lane()))?;
             let k = router_width(what, w, ROWS, 128, NORM_K)?;
             if act.m() != 1 || act.k() != k || x.len() < k || gain.len() < k {
                 return Err(GpuError::shape(
@@ -4072,7 +4073,7 @@ pub mod gated {
             out: &mut RouterOut,
         ) -> Result<(), GpuError> {
             let what = "qwen3moe::router::gated::enqueue_norm_fused_m";
-            let used = out.used_for(what, RouterBody::Qwen35moe, Some(ROW.per_lane))?;
+            let used = out.used_for(what, RouterBody::Qwen35moe, Some(ROW.per_lane()))?;
             let k = router_width(what, w, ROWS, 128, NORM_K)?;
             let m = act.m();
             if !(1..=MAX_TOKENS.min(out.tokens())).contains(&m)

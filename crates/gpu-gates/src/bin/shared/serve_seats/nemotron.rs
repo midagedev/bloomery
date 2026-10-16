@@ -78,7 +78,7 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use gguf::Split;
 use model::arch::Arch;
-use model::arch::nemotron_h::place::PlanInputs;
+use model::arch::nemotron_h::place as nemotron_place;
 use model::placement::PlanLevers;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::DeviceId;
@@ -254,7 +254,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         a.template_file.as_deref(),
         "nemotron",
     )?;
-    let inputs = PlanInputs::read(&split)?;
+    let inputs = nemotron_place::read(&split)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
     // The one slot, and what named it (`from` on the `parallel` line); the
     // start's note that `--ctx` is one request's context is left out, since

@@ -282,6 +282,14 @@ gate-gpu-nvfp4:
 gate-gpu-nemotron-e2e:
     BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_e2e'
 
+# nemotron_h_moe (Nemotron 3.5 Bolt) end-to-end gate, one card, on the fixture tier's four layers (or the real file's eighty-eight
+# under the real tier): the captured step's entries against the layer kinds the header derives (the group-16 attention, the MoE
+# layers' routers at their own counts and the four iq2_xxs_gemv_sel a MoE layer), eager = replay, reset rewinds, the scan state
+# carries; in the fixture tier mainline's set (fx_ref-nemotron-moe-logits): the cosine floor, the argmax above the band and
+# each MoE layer's kept experts on every prompt.
+gate-gpu-nemotron-h-moe-e2e:
+    BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_h_moe_e2e'
+
 # The nemotron seat of bloomery-serve on Nemotron 3 Nano 4B Q4_K_M (gate_nemotron_serve's doc): `--plan` with no flag names its
 # default context (the ladder's rung, held by the ctx line and the rung above refused) and exits before any load, `--parallel 2` is
 # refused by name (the body holds one sequence); one server with no flag listens at the context its ctx line named, answers

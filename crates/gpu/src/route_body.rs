@@ -11,12 +11,20 @@
 //!   every (token, expert), then one block a token selecting on them; bit for
 //!   bit what [`router_body`] writes a token.
 //!
+//! [`sigmoid_router_instance!`](crate::sigmoid_router_instance) is the one
+//! form of a sigmoid instance of the three: its entries, its output buffers
+//! and its launchers at one expert and slot count.
+//!
 //! The bodies are `#[inline(always)]` and each is whole: on this
 //! toolchain a function boundary around the selection loop changes the
 //! instruction stream (predicated selects become branches), so the loop, its
 //! butterfly and the weight stage stay inside their bodies. The score and the
 //! tie rule come from [`crate::route_core`]. Every shape an instance asserts
-//! holds when `E` is a multiple of 32 and of [`SCORE_ROWS`] and `E / 32 <= 32`.
+//! holds when `E` is a multiple of [`SCORE_ROWS`] and `⌈E / 32⌉ <= 32`. Where
+//! `E` is not a multiple of 32 the selecting lanes own `⌈E / 32⌉` or one fewer
+//! experts; the guard that skips the missing ones is a compile-time `true`
+//! at a multiple of 32, so those instances' instructions are the guard-free
+//! ones.
 
 use crate::q8f32::f32_lane_partial_1col_w32;
 use crate::route_core::{Score, renorm_divisor, take};
@@ -87,8 +95,8 @@ pub unsafe fn publish_n<const E: usize>(
 }
 
 /// V4.1's `select` over `E` experts and `U` slots: `U` rounds of the butterfly
-/// argmax under [`take`]`::<true>`, lane `L` scanning experts `L + 32 j`
-/// (`j < E / 32`) no earlier round took; lane 0 writes each round's id to
+/// argmax under [`take`]`::<true>`, lane `L` scanning experts `L + 32 j < E`
+/// (`j < ⌈E / 32⌉`) no earlier round took; lane 0 writes each round's id to
 /// `ids[at + s]`, then sums the `U` scores in f64 in slot order, takes
 /// [`renorm_divisor`] of the sum narrowed to f32, and writes each weight
 /// `score / sum · scale` to `weights[at + s]`, raising [`FaultSite::Router`]
@@ -96,7 +104,7 @@ pub unsafe fn publish_n<const E: usize>(
 ///
 /// # Safety
 ///
-/// all 32 lanes of warp 0 call it; `E / 32 <= 32`; `score` and
+/// all 32 lanes of warp 0 call it; `⌈E / 32⌉ <= 32`; `score` and
 /// `sel_v` are shared arrays of `E` values published by a barrier, `slot_p`
 /// one of `U` that lane 0 alone uses; `ids` and `weights` hold `at + U`
 /// values, of which the calling block is the only writer of `at ..`.
@@ -122,15 +130,20 @@ pub unsafe fn select_n<const E: usize, const U: usize>(
         let mut bv = f32::NEG_INFINITY;
         let mut bi = 0u32;
         let mut j = 0usize;
-        while j < E / 32 {
+        while j < const { E.div_ceil(32) } {
             if (taken >> j) & 1 == 0 {
                 let ej = lane + 32 * j;
-                // SAFETY: ej < 32·(E / 32) = E, published by the caller's
-                // barrier.
-                let v = unsafe { *sel_v.add(ej) };
-                if take::<true>(v, ej as u32, bv, bi) {
-                    bv = v;
-                    bi = ej as u32;
+                // At a multiple of 32 every `ej` is below `E`: the guard is a
+                // compile-time `true` and leaves no instruction.
+                if const { E.is_multiple_of(32) } || ej < E {
+                    // SAFETY: ej < E (lane < 32 and j < E / 32 at a multiple
+                    // of 32, the guard otherwise), published by the caller's
+                    // barrier.
+                    let v = unsafe { *sel_v.add(ej) };
+                    if take::<true>(v, ej as u32, bv, bi) {
+                        bv = v;
+                        bi = ej as u32;
+                    }
                 }
             }
             j += 1;
@@ -435,4 +448,443 @@ pub unsafe fn pick_body<const E: usize, const U: usize>(
             )
         };
     }
+}
+
+/// One sigmoid router instance, from the generic bodies above: a module
+/// holding `N_EXPERT` and `N_USED`, the three `#[cuda_module]` entries
+/// (`$router`, `$scores`, `$pick`), `RouterOut` and `RouterKernels` at those
+/// counts, compiled into the crate that invokes it (`gpu-deepseek41`'s
+/// `glm5next` and `mimo2`; Bolt's five, `arch/nemotron_h_moe/router.rs`). The expert and slot counts are tokens, not constants, so the
+/// entries' `launch_contract` literals and the module's constants are one
+/// source. The entry names are the PTX entry names, and `$p_router`,
+/// `$p_scores` and `$p_pick` the `prepare_*` launchers `#[cuda_module]`
+/// derives from them: a macro cannot join identifiers.
+#[macro_export]
+macro_rules! sigmoid_router_instance {
+    (
+        $(#[$meta:meta])*
+        pub mod $m:ident {
+            experts: $e:tt,
+            used: $u:tt,
+            kernels: $kernels:ident,
+            entries: $router:ident, $scores:ident, $pick:ident,
+            prepare: $p_router:ident, $p_scores:ident, $p_pick:ident $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        pub mod $m {
+
+        use $crate::route_body::{
+            ROUTER_THREADS, ROUTER_THREADS_U32, ROWS_PER_BLOCK, SCORE_COLS, SCORE_ROWS, pick_body,
+            router_body, scores_body,
+        };
+        use $crate::route_core::Sigmoid;
+        use $crate::{DeviceTensor, FaultSink, GpuError, launch_u32};
+        use model::arch::models::shape::{self, RouterBody, RouterInst, rules};
+        use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+        use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract};
+        use cuda_host::cuda_module;
+        use std::sync::Arc;
+
+        /// Experts the router scores (`expert_count`).
+        pub const N_EXPERT: usize = $e;
+        /// Experts each token routes to (`expert_used_count`).
+        pub const N_USED: usize = $u;
+
+        /// The instance's row in `models::shape::ROUTERS`: a shape read from
+        /// a file selects it through `select_router`.
+        pub const ROW: RouterInst =
+            shape::router_row(RouterBody::BiasedSigmoid, N_EXPERT as u32);
+        const _: () = assert!(shape::router_row_is(
+            ROW,
+            rules::BIASED_SIGMOID,
+            false,
+            (N_USED as u32, N_USED as u32)
+        ));
+
+        /// Blocks of the batch score launch per 8 tokens.
+        const SCORE_TILES: usize = N_EXPERT / SCORE_ROWS;
+
+        const _: () = assert!(N_EXPERT.is_multiple_of(ROWS_PER_BLOCK));
+        const _: () = assert!(N_EXPERT.is_multiple_of(SCORE_ROWS));
+        // The selecting lane keeps its taken entries as bits of one u32.
+        const _: () = assert!(N_EXPERT.div_ceil(32) <= 32);
+        // The entries' `launch_bounds` and `launch_contract` block are literals; the expert and slot counts in the contracts are the instance's own tokens.
+        const _: () = assert!(ROUTER_THREADS == 128);
+
+        #[allow(
+            dead_code,
+            reason = "#[cuda_module] derives an `_unchecked` launcher per entry that no caller uses"
+        )]
+        #[cuda_module]
+        mod $kernels {
+            use super::*;
+
+            /// The router for one token (`router_body` at [`N_EXPERT`],
+            /// [`N_USED`], sigmoid): `n_expert` rows of `k` f32 in `w`, the
+            /// token's `k` activations in `x`, the selection bias in `bias`.
+            /// Writes `logits[e]` and `probs[e]` (the score) for every expert and
+            /// `ids[s]`/`weights[s]` for the slots in rank order. `done[0]` is
+            /// the block ticket count: zero before the launch, zero again after
+            /// it. Grid `n_expert / 4` blocks of 128, warp `r % 4` of block `r /
+            /// 4` owning row `r`.
+            #[allow(
+                clippy::too_many_arguments,
+                reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+            )]
+            #[kernel]
+            #[launch_bounds(128)]
+            #[launch_contract(
+                domain = 1,
+                block = (128, 1, 1),
+                requires = (
+                    n_expert == $e,
+                    w.len() >= n_expert * k,
+                    x.len() >= k,
+                    bias.len() >= n_expert,
+                    logits.len() >= n_expert,
+                    probs.len() >= n_expert,
+                    ids.len() >= $u,
+                    weights.len() >= $u,
+                    done.len() >= 1
+                )
+            )]
+            pub fn $router(
+                w: &[f32],
+                x: &[f32],
+                bias: &[f32],
+                n_expert: u32,
+                k: u32,
+                scale: f32,
+                mut logits: DisjointSlice<f32>,
+                mut probs: DisjointSlice<f32>,
+                mut ids: DisjointSlice<u32>,
+                mut weights: DisjointSlice<f32>,
+                mut done: DisjointSlice<u32>,
+                fault: FaultSink,
+            ) {
+                static mut SCORE: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
+                static mut SEL_V: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
+                static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+                static mut SLOT_P: SharedArray<f32, N_USED> = SharedArray::UNINIT;
+                // SAFETY: SCORE, SEL_V, LAST and SLOT_P are this block's own
+                // shared arrays of N_EXPERT, N_EXPERT, 1 and N_USED entries (the
+                // raw form reaches each `static mut` without a reference); the
+                // grid is N_EXPERT / 4 blocks of 128 (the launcher's), every
+                // thread arrives converged; the lengths are the launch
+                // contract's, the launcher passes k a positive multiple of 32,
+                // and `done[0]` is zero before the launch.
+                unsafe {
+                    router_body::<Sigmoid, N_EXPERT, N_USED>(
+                        w,
+                        x,
+                        bias,
+                        n_expert,
+                        k,
+                        scale,
+                        &mut logits,
+                        &mut probs,
+                        &mut ids,
+                        &mut weights,
+                        &mut done,
+                        fault,
+                        SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                        SharedArray::as_raw_mut_ptr(&raw mut SCORE),
+                        SharedArray::as_raw_mut_ptr(&raw mut SEL_V),
+                        SharedArray::as_raw_mut_ptr(&raw mut SLOT_P),
+                    );
+                }
+            }
+
+            /// The scores of `t` tokens' rows of `x` (`k` a token, token-major):
+            /// `probs[token · n_expert + e]` is the score the
+            /// router entry writes for that token's expert `e`, bit for bit
+            /// (`scores_body`). Grid `(n_expert / 8) · ⌈t / 8⌉` blocks of 128.
+            #[kernel]
+            #[launch_bounds(128)]
+            #[launch_contract(
+                domain = 1,
+                block = (128, 1, 1),
+                requires = (
+                    n_expert == $e,
+                    w.len() >= n_expert * k,
+                    x.len() >= k * t,
+                    probs.len() >= n_expert * t
+                )
+            )]
+            pub fn $scores(
+                w: &[f32],
+                x: &[f32],
+                n_expert: u32,
+                k: u32,
+                t: u32,
+                mut probs: DisjointSlice<f32>,
+            ) {
+                // SAFETY: the block is 128 threads (the launch contract's),
+                // converged; n_expert, w, x and probs are the launch contract's;
+                // the launcher passes k a positive multiple of 32.
+                unsafe { scores_body::<Sigmoid, N_EXPERT>(w, x, n_expert, k, t, &mut probs) };
+            }
+
+            /// The selection of token `blockIdx.x` of a batch from its scores
+            /// (`probs`, [`N_EXPERT`] a token, as the scores
+            /// entry writes them) and `bias` into `ids` and `weights` at `N_USED ·
+            /// token` (`pick_body`): the router entry's last block on those
+            /// scores.
+            #[allow(
+                clippy::too_many_arguments,
+                reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+            )]
+            #[kernel]
+            #[launch_bounds(128)]
+            #[launch_contract(
+                domain = 1,
+                block = (128, 1, 1),
+                requires = (
+                    n_expert == $e,
+                    probs.len() >= n_expert * t,
+                    bias.len() >= n_expert,
+                    ids.len() >= $u * t,
+                    weights.len() >= $u * t
+                )
+            )]
+            pub fn $pick(
+                probs: &[f32],
+                bias: &[f32],
+                n_expert: u32,
+                t: u32,
+                scale: f32,
+                mut ids: DisjointSlice<u32>,
+                mut weights: DisjointSlice<f32>,
+                fault: FaultSink,
+            ) {
+                static mut SCORE: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
+                static mut SEL_V: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
+                static mut SLOT_P: SharedArray<f32, N_USED> = SharedArray::UNINIT;
+                // SAFETY: SCORE, SEL_V and SLOT_P are this block's own shared
+                // arrays of N_EXPERT, N_EXPERT and N_USED entries (the raw form
+                // reaches each `static mut` without a reference); the block is
+                // 128 threads, converged; the lengths are the launch contract's.
+                unsafe {
+                    pick_body::<N_EXPERT, N_USED>(
+                        probs,
+                        bias,
+                        n_expert,
+                        t,
+                        scale,
+                        &mut ids,
+                        &mut weights,
+                        fault,
+                        SharedArray::as_raw_mut_ptr(&raw mut SCORE),
+                        SharedArray::as_raw_mut_ptr(&raw mut SEL_V),
+                        SharedArray::as_raw_mut_ptr(&raw mut SLOT_P),
+                    );
+                }
+            }
+        }
+
+        /// Where one [`RouterKernels::enqueue_router`] launch leaves its results:
+        /// per expert the logit and the score, per slot the expert id and the
+        /// weight, and the block ticket count the launch returns to zero. The
+        /// count serves one launch at a time, so launches that share a
+        /// `RouterOut` must be ordered on one stream.
+        pub struct RouterOut {
+            pub logits: DeviceBuffer<f32>,
+            pub probs: DeviceBuffer<f32>,
+            pub ids: DeviceBuffer<u32>,
+            pub weights: DeviceBuffer<f32>,
+            done: DeviceBuffer<u32>,
+        }
+
+        impl RouterOut {
+            /// Allocate the buffers, the ticket count zeroed. Load-time only.
+            pub fn new(stream: &CudaStream) -> Result<RouterOut, GpuError> {
+                Ok(RouterOut {
+                    logits: DeviceBuffer::zeroed(stream, N_EXPERT)?,
+                    probs: DeviceBuffer::zeroed(stream, N_EXPERT)?,
+                    ids: DeviceBuffer::zeroed(stream, N_USED)?,
+                    weights: DeviceBuffer::zeroed(stream, N_USED)?,
+                    done: DeviceBuffer::zeroed(stream, 1)?,
+                })
+            }
+
+            /// The ticket count as it stands: zero between launches.
+            pub fn tickets(&self, stream: &CudaStream) -> Result<u32, GpuError> {
+                Ok(self.done.to_host_vec(stream)?[0])
+            }
+        }
+
+        /// The loaded router module. Owns no context and no stream — every
+        /// enqueue takes the engine stream, so launches order with the rest of
+        /// the step and are capturable.
+        pub struct RouterKernels {
+            module: $kernels::LoadedModule,
+        }
+
+        /// The router weight's shape: [`N_EXPERT`] rows of a positive multiple
+        /// of 32.
+        fn weight_k(what: &'static str, w: &DeviceTensor<f32>) -> Result<usize, GpuError> {
+            let k = w.cols();
+            if w.rows() != N_EXPERT || k == 0 || !k.is_multiple_of(32) {
+                return Err(GpuError::Shape {
+                    what,
+                    detail: format!(
+                        "router weight is {} x {k}, want {N_EXPERT} rows of a positive multiple of 32",
+                        w.rows()
+                    ),
+                });
+            }
+            Ok(k)
+        }
+
+        impl RouterKernels {
+            /// Load this module's device bundle into `ctx`. Load-time only.
+            pub fn load(ctx: &Arc<CudaContext>) -> Result<RouterKernels, GpuError> {
+                // SAFETY: this package owns the embedded device bundle produced
+                // for the module above; the launcher checks its launch contract.
+                let module = unsafe { $crate::shared_module!($kernels, ctx)? };
+                Ok(RouterKernels { module })
+            }
+
+            /// Enqueue the router for one token: `w` the router weight as f32
+            /// ([`N_EXPERT`] rows of `k`, `k` a positive multiple of 32), `x` the
+            /// token's `k` activations, `bias` the [`N_EXPERT`] selection biases,
+            /// `scale` the file's `expert_weights_scale`; results into `out`. A
+            /// selection it cannot make raises `fault`. Asynchronous,
+            /// allocation-free, capturable.
+            #[allow(
+                clippy::too_many_arguments,
+                reason = "the launcher's inputs are the kernel's (rust-quality R8)"
+            )]
+            pub fn enqueue_router(
+                &self,
+                stream: &CudaStream,
+                w: &DeviceTensor<f32>,
+                x: &DeviceBuffer<f32>,
+                bias: &DeviceBuffer<f32>,
+                scale: f32,
+                out: &mut RouterOut,
+                fault: FaultSink,
+            ) -> Result<(), GpuError> {
+                let what = concat!(stringify!($m), "::enqueue_router");
+                let k = weight_k(what, w)?;
+                if x.len() < k || bias.len() < N_EXPERT {
+                    return Err(GpuError::Shape {
+                        what,
+                        detail: format!(
+                            "x.len() {} < k {k} or bias.len() {} < {N_EXPERT}",
+                            x.len(),
+                            bias.len()
+                        ),
+                    });
+                }
+                let k = launch_u32(what, "k", k)?;
+                let n_expert = launch_u32(what, "n_expert", N_EXPERT)?;
+                let grid = launch_u32(what, "grid", N_EXPERT / ROWS_PER_BLOCK)?;
+                let prep = self.module.$p_router(LaunchConfig1D::new(
+                    grid,
+                    ROUTER_THREADS_U32,
+                    0,
+                ))?;
+                let RouterOut {
+                    logits,
+                    probs,
+                    ids,
+                    weights,
+                    done,
+                } = out;
+                self.module.$router(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    x,
+                    bias,
+                    n_expert,
+                    k,
+                    scale,
+                    logits,
+                    probs,
+                    ids,
+                    weights,
+                    done,
+                    fault,
+                )?;
+                Ok(())
+            }
+
+            /// Enqueue the router for `t` tokens of a batch in two launches: `x`
+            /// their activations, `k` a token and token-major, the per-token
+            /// scores into `probs` ([`N_EXPERT`] a token), then each token's ids
+            /// and weights into `ids` and `weights` ([`N_USED`] a token) — what
+            /// `t` [`RouterKernels::enqueue_router`] launches write, bit for bit.
+            /// A selection value or a weight that is not finite raises `fault`.
+            /// Asynchronous, allocation-free.
+            #[allow(
+                clippy::too_many_arguments,
+                reason = "enqueue_router's inputs, the token count and the batch's buffers (rust-quality R8)"
+            )]
+            pub fn enqueue_router_rows(
+                &self,
+                stream: &CudaStream,
+                w: &DeviceTensor<f32>,
+                x: &DeviceBuffer<f32>,
+                bias: &DeviceBuffer<f32>,
+                scale: f32,
+                t: usize,
+                probs: &mut DeviceBuffer<f32>,
+                ids: &mut DeviceBuffer<u32>,
+                weights: &mut DeviceBuffer<f32>,
+                fault: FaultSink,
+            ) -> Result<(), GpuError> {
+                let what = concat!(stringify!($m), "::enqueue_router_rows");
+                let k = weight_k(what, w)?;
+                if t == 0
+                    || x.len() < k * t
+                    || bias.len() < N_EXPERT
+                    || probs.len() < N_EXPERT * t
+                    || ids.len() < N_USED * t
+                    || weights.len() < N_USED * t
+                {
+                    return Err(GpuError::Shape {
+                        what,
+                        detail: format!(
+                            "{t} tokens of {k} (at least one): x {}, bias {}, probs {}, ids {}, weights {}",
+                            x.len(),
+                            bias.len(),
+                            probs.len(),
+                            ids.len(),
+                            weights.len()
+                        ),
+                    });
+                }
+                let (k, n_expert) = (
+                    launch_u32(what, "k", k)?,
+                    launch_u32(what, "n_expert", N_EXPERT)?,
+                );
+                let tt = launch_u32(what, "t", t)?;
+                let grid = launch_u32(what, "grid", SCORE_TILES * t.div_ceil(SCORE_COLS))?;
+                let prep = self
+                    .module
+                    .$p_scores(LaunchConfig1D::new(grid, ROUTER_THREADS_U32, 0))?;
+                self.module.$scores(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    x,
+                    n_expert,
+                    k,
+                    tt,
+                    &mut *probs,
+                )?;
+                let prep = self
+                    .module
+                    .$p_pick(LaunchConfig1D::new(tt, ROUTER_THREADS_U32, 0))?;
+                self.module.$pick(
+                    stream, &prep, probs, bias, n_expert, tt, scale, ids, weights, fault,
+                )?;
+                Ok(())
+            }
+        }
+        }
+    };
 }

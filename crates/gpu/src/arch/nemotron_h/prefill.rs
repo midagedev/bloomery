@@ -16,7 +16,8 @@
 //! GEMM's band, not bit for bit.
 
 use super::body::Body;
-use super::step::{Layer, RowBuffers, Shape, Site, norm_rows, residual_rows};
+use super::step::Layer;
+use crate::arch::hybrid::{RowBuffers, Shape, Site, norm_rows, residual_rows};
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{GROUP_5, GqaArgs, HEAD};

@@ -81,49 +81,11 @@ const TYPE_BYTES: &[(GgmlType, u64)] = &[
 ];
 
 /// The coverage list, feature by feature in the order the refusal prints
-/// them, each with how many layers carry it (0: the whole model).
-const COVERAGE: &[(&str, usize)] = &[
-    (
-        "router: sigmoid, 240 experts, top 9, with a selection bias",
-        12,
-    ),
-    (
-        "routed experts in a 1024-value latent (ffn_latent_down before them, ffn_latent_up \
-         after their sum)",
-        40,
-    ),
-    ("routed experts of squared ReLU, no gate", 40),
-    ("shared expert of squared ReLU, no gate", 40),
-    ("GQA flash, head 128, group 16", 8),
-    (
-        "router: sigmoid, 304 experts, top 9, with a selection bias",
-        6,
-    ),
-    (
-        "router: sigmoid, 432 experts, top 9, with a selection bias",
-        10,
-    ),
-    (
-        "router: sigmoid, 368 experts, top 9, with a selection bias",
-        9,
-    ),
-    (
-        "router: sigmoid, 496 experts, top 9, with a selection bias",
-        3,
-    ),
-    (
-        "nvfp4 mixer matrices (attention, Mamba-2 or delta rule)",
-        40,
-    ),
-    ("iq2_xxs routed experts on a card", 40),
-    ("iq2_xxs routed experts", 40),
-    ("iq2_xxs shared expert", 40),
-    (
-        "routed stacks whose expert count and width differ by layer (12 shapes)",
-        0,
-    ),
-    ("a layer program for nemotron_h_moe", 0),
-];
+/// them, each with how many layers carry it (0: the whole model): empty, as
+/// `Program::NemotronHMoeBody` runs every part of the file — its routers at
+/// the five widths, the latent experts, the group-16 flash, the NVFP4 and
+/// IQ2_XXS sites and the per-layer stack shapes.
+const COVERAGE: &[(&str, usize)] = &[];
 
 #[test]
 #[ignore = "needs the Bolt 24GB GGUF on the box (just gate-nemotron-h-moe-meta)"]

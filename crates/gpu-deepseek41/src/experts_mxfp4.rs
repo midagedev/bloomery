@@ -36,7 +36,7 @@ pub use bloomery_gpu::mxfp4_sel::N_USED;
 /// The router's instance row: the width and the one pick count above, the
 /// rule √softplus with a selection bias, `norm` a launch argument. A draft's
 /// shape selects it through `models::shape::select_router`.
-pub const ROUTER_ROW: RouterInst = shape::router_row(RouterBody::Dflash, PER_LANE as u32);
+pub const ROUTER_ROW: RouterInst = shape::router_row(RouterBody::Dflash, 32 * PER_LANE as u32);
 const _: () = assert!(shape::router_row_is(
     ROUTER_ROW,
     rules::BIASED_SQRT_SOFTPLUS,

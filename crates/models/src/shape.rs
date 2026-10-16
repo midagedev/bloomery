@@ -77,9 +77,11 @@ pub enum RouterBody {
     /// `gpu-deepseek41/src/experts_mxfp4.rs` `dflash_router`: `ds41_router`'s
     /// body with `norm` a launch argument.
     Dflash,
-    /// `gpu-deepseek41/src/router.rs` `glm5next_router*`, `mimo2_router*`:
-    /// sigmoid scores, the bias added for the pick only
-    /// ([`rules::BIASED_SIGMOID`]).
+    /// `gpu/src/route_body.rs` `sigmoid_router_instance!`: sigmoid scores,
+    /// the bias added for the pick only ([`rules::BIASED_SIGMOID`]). Its
+    /// instances: `gpu-deepseek41/src/router.rs` `glm5next_router*`,
+    /// `mimo2_router*`; `gpu/src/arch/nemotron_h_moe/router.rs`
+    /// `nemotron_moe_router_*`.
     BiasedSigmoid,
 }
 
@@ -91,9 +93,10 @@ pub struct RouterInst {
     /// The body takes `norm` as a launch argument: it serves both values of
     /// [`RouterRule::norm`], and the row's own value is not compared.
     pub norm_arg: bool,
-    /// Experts each lane of the selecting warp owns (`lane + 32 j`); the
-    /// instance routes over `32 · per_lane` experts.
-    pub per_lane: u32,
+    /// Experts the instance routes over. Lane `L` of the selecting warp owns
+    /// experts `L + 32 j` below this count ([`RouterInst::per_lane`] of them
+    /// at most).
+    pub experts: u32,
     /// The kept experts a launch may ask for, inclusive. A body whose pick
     /// count is compiled in serves one value.
     pub top_k_min: u32,
@@ -106,7 +109,13 @@ impl RouterInst {
     /// Experts the instance routes over.
     #[must_use]
     pub const fn experts(&self) -> u32 {
-        32 * self.per_lane
+        self.experts
+    }
+
+    /// Experts the selecting warp's lane 0 owns: `experts / 32` rounded up.
+    #[must_use]
+    pub const fn per_lane(&self) -> u32 {
+        self.experts.div_ceil(32)
     }
 
     /// Whether this row's body runs `rule`.
@@ -161,7 +170,7 @@ pub const ROUTERS: &[RouterInst] = &[
         body: RouterBody::Topk,
         rule: SOFTMAX_TOPK,
         norm_arg: false,
-        per_lane: 2,
+        experts: 64,
         top_k_min: 6,
         top_k_max: 6,
         at: "gpu/src/router.rs router_topk",
@@ -170,7 +179,7 @@ pub const ROUTERS: &[RouterInst] = &[
         body: RouterBody::Qwen3moe,
         rule: SOFTMAX_NORM,
         norm_arg: false,
-        per_lane: 4,
+        experts: 128,
         top_k_min: 1,
         top_k_max: LANE_PICKS,
         at: "gpu/src/arch/qwen3moe/router.rs qwen3moe_router_*",
@@ -179,7 +188,7 @@ pub const ROUTERS: &[RouterInst] = &[
         body: RouterBody::Qwen35moe,
         rule: SOFTMAX_NORM_GATED,
         norm_arg: false,
-        per_lane: 8,
+        experts: 256,
         top_k_min: 1,
         top_k_max: LANE_PICKS,
         at: "gpu/src/arch/qwen3moe/router.rs qwen35moe_router_*",
@@ -188,7 +197,7 @@ pub const ROUTERS: &[RouterInst] = &[
         body: RouterBody::Qwen35moe,
         rule: SOFTMAX_NORM_GATED,
         norm_arg: false,
-        per_lane: 16,
+        experts: 512,
         top_k_min: 1,
         top_k_max: LANE_PICKS,
         at: "gpu/src/arch/qwen3moe/router.rs qwen35moe_router_*_512",
@@ -197,7 +206,7 @@ pub const ROUTERS: &[RouterInst] = &[
         body: RouterBody::Ds41,
         rule: BIASED_SQRT_SOFTPLUS,
         norm_arg: false,
-        per_lane: 12,
+        experts: 384,
         top_k_min: 6,
         top_k_max: 6,
         at: "gpu-deepseek41/src/router.rs ds41_router*",
@@ -206,7 +215,7 @@ pub const ROUTERS: &[RouterInst] = &[
         body: RouterBody::Dflash,
         rule: BIASED_SQRT_SOFTPLUS,
         norm_arg: true,
-        per_lane: 4,
+        experts: 128,
         top_k_min: 3,
         top_k_max: 3,
         at: "gpu-deepseek41/src/experts_mxfp4.rs dflash_router",
@@ -215,7 +224,7 @@ pub const ROUTERS: &[RouterInst] = &[
         body: RouterBody::BiasedSigmoid,
         rule: BIASED_SIGMOID,
         norm_arg: false,
-        per_lane: 9,
+        experts: 288,
         top_k_min: 8,
         top_k_max: 8,
         at: "gpu-deepseek41/src/router.rs glm5next_router*",
@@ -224,10 +233,55 @@ pub const ROUTERS: &[RouterInst] = &[
         body: RouterBody::BiasedSigmoid,
         rule: BIASED_SIGMOID,
         norm_arg: false,
-        per_lane: 8,
+        experts: 256,
         top_k_min: 8,
         top_k_max: 8,
         at: "gpu-deepseek41/src/router.rs mimo2_router*",
+    },
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 240,
+        top_k_min: 9,
+        top_k_max: 9,
+        at: "gpu/src/arch/nemotron_h_moe/router.rs nemotron_moe_router_240*",
+    },
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 304,
+        top_k_min: 9,
+        top_k_max: 9,
+        at: "gpu/src/arch/nemotron_h_moe/router.rs nemotron_moe_router_304*",
+    },
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 368,
+        top_k_min: 9,
+        top_k_max: 9,
+        at: "gpu/src/arch/nemotron_h_moe/router.rs nemotron_moe_router_368*",
+    },
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 432,
+        top_k_min: 9,
+        top_k_max: 9,
+        at: "gpu/src/arch/nemotron_h_moe/router.rs nemotron_moe_router_432*",
+    },
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 496,
+        top_k_min: 9,
+        top_k_max: 9,
+        at: "gpu/src/arch/nemotron_h_moe/router.rs nemotron_moe_router_496*",
     },
 ];
 
@@ -377,15 +431,15 @@ pub fn select_router(s: MoeShape) -> Result<RouterInst, ShapeRefused> {
     Ok(**row)
 }
 
-/// Body `body`'s row at `per_lane`: the const form a device crate holds
+/// Body `body`'s row at `experts`: the const form a device crate holds
 /// each width it compiles to. Fails the build when the table has no such
 /// row.
 #[must_use]
-pub const fn router_row(body: RouterBody, per_lane: u32) -> RouterInst {
+pub const fn router_row(body: RouterBody, experts: u32) -> RouterInst {
     let mut i = 0;
     while i < ROUTERS.len() {
         let r = ROUTERS[i];
-        if body_eq(r.body, body) && r.per_lane == per_lane {
+        if body_eq(r.body, body) && r.experts == experts {
             return r;
         }
         i += 1;
@@ -545,6 +599,16 @@ pub const GQA: &[GqaInst] = &[
         at: "gpu/src/flash_gqa.rs GROUP_5 (gqa_flash_seg_g5, scalar)",
     },
     GqaInst {
+        head: 128,
+        value: 128,
+        pack: 16,
+        group: GroupRule::One,
+        window: false,
+        sinks: false,
+        value_scale: false,
+        at: "gpu/src/flash_gqa.rs GROUP_16 (two GROUP segment passes a key head, one merge)",
+    },
+    GqaInst {
         head: 256,
         value: 256,
         pack: 8,
@@ -698,6 +762,13 @@ mod tests {
             ("Qwen3.8", moe(rules::SOFTMAX_NORM_GATED, 512, 10)),
             // model/src/arch/dspark.rs: the draft routes 128/3 by sqrt-softplus with a bias.
             ("DSpark", moe(rules::BIASED_SQRT_SOFTPLUS, 128, 3)),
+            // model/tests/nemotron_h_moe_meta.rs SHAPES: Bolt's MoE layers route
+            // over 240, 304, 368, 432 or 496 experts, top 9, sigmoid with a bias.
+            ("Bolt 240", moe(rules::BIASED_SIGMOID, 240, 9)),
+            ("Bolt 304", moe(rules::BIASED_SIGMOID, 304, 9)),
+            ("Bolt 368", moe(rules::BIASED_SIGMOID, 368, 9)),
+            ("Bolt 432", moe(rules::BIASED_SIGMOID, 432, 9)),
+            ("Bolt 496", moe(rules::BIASED_SIGMOID, 496, 9)),
         ]
     }
 
@@ -749,31 +820,33 @@ mod tests {
         let glm = select_router(moe(rule, 288, 8)).expect("GLM has no router row");
         assert_eq!(mimo.body, super::RouterBody::BiasedSigmoid);
         assert_eq!(glm.body, super::RouterBody::BiasedSigmoid);
-        assert_eq!((mimo.experts(), mimo.per_lane), (256, 8));
-        assert_eq!((glm.experts(), glm.per_lane), (288, 9));
+        assert_eq!((mimo.experts(), mimo.per_lane()), (256, 8));
+        assert_eq!((glm.experts(), glm.per_lane()), (288, 9));
         assert!(mimo.at.contains("mimo2_router"), "{}", mimo.at);
         assert!(glm.at.contains("glm5next_router"), "{}", glm.at);
         // The const form a device crate holds each width by.
-        assert_eq!(router_row(super::RouterBody::BiasedSigmoid, 8), mimo);
-        assert_eq!(router_row(super::RouterBody::BiasedSigmoid, 9), glm);
+        assert_eq!(router_row(super::RouterBody::BiasedSigmoid, 256), mimo);
+        assert_eq!(router_row(super::RouterBody::BiasedSigmoid, 288), glm);
         assert!(router_row_is(mimo, rule, false, (8, 8)));
         assert!(router_row_is(glm, rule, false, (8, 8)));
         // `body_eq` tells the rule's body from every other body, and only it.
         for r in ROUTERS {
             assert_eq!(
                 super::body_eq(r.body, super::RouterBody::BiasedSigmoid),
-                r.at.contains("mimo2_router") || r.at.contains("glm5next_router"),
+                r.at.contains("mimo2_router")
+                    || r.at.contains("glm5next_router")
+                    || r.at.contains("nemotron_moe_router"),
                 "{}",
                 r.at
             );
         }
-        // Exactly two rows carry the body, at the two widths.
+        // The rows that carry the body: GLM's and MiMo's, then Bolt's five.
         let widths: Vec<u32> = ROUTERS
             .iter()
             .filter(|r| super::body_eq(r.body, super::RouterBody::BiasedSigmoid))
             .map(RouterInst::experts)
             .collect();
-        assert_eq!(widths, [288, 256]);
+        assert_eq!(widths, [288, 256, 240, 304, 368, 432, 496]);
         // Coverage's `routes(n, &[BiasedSigmoid])`: the rule's shapes pass at
         // both widths, and a width between them is refused.
         let routes = |s| select_router(s).is_ok_and(|r| r.body == super::RouterBody::BiasedSigmoid);
@@ -784,9 +857,31 @@ mod tests {
         assert_eq!(
             e.why,
             Refusal::RouterWidth {
-                served: vec![288, 256]
+                served: vec![288, 256, 240, 304, 368, 432, 496]
             }
         );
+    }
+
+    /// Bolt's routers (top 9) select only Bolt's rows: GLM's and MiMo's
+    /// widths at top 9 are refused by their pick range, and Bolt's widths at
+    /// top 8 by theirs. A count whose lanes do not all own the same number of
+    /// experts (240 = 32 · 7.5) is a row: `per_lane` rounds up.
+    #[test]
+    fn bolt_routers_are_their_rows() {
+        let rule = rules::BIASED_SIGMOID;
+        for e in [240, 304, 368, 432, 496] {
+            let r = select_router(moe(rule, e, 9)).unwrap_or_else(|x| panic!("{e}: {x}"));
+            assert!(r.at.contains("nemotron_moe_router"), "{}", r.at);
+            assert_eq!(r.per_lane(), e.div_ceil(32));
+            assert_eq!(router_row(super::RouterBody::BiasedSigmoid, e), r);
+            assert!(router_row_is(r, rule, false, (9, 9)));
+            let e8 = select_router(moe(rule, e, 8)).expect_err("Bolt's width at top 8");
+            assert_eq!(e8.why, Refusal::TopK { min: 9, max: 9 });
+        }
+        for e in [256, 288] {
+            let x = select_router(moe(rule, e, 9)).expect_err("GLM or MiMo at top 9");
+            assert_eq!(x.why, Refusal::TopK { min: 8, max: 8 });
+        }
     }
 
     /// An expert count between two rows of a rule is refused, never taken by
@@ -874,17 +969,17 @@ mod tests {
     fn no_two_router_rows_overlap() {
         for (i, a) in ROUTERS.iter().enumerate() {
             for b in &ROUTERS[i + 1..] {
-                let overlap = a.per_lane == b.per_lane && (a.runs(b.rule) || b.runs(a.rule));
+                let overlap = a.experts == b.experts && (a.runs(b.rule) || b.runs(a.rule));
                 assert!(!overlap, "{} and {}", a.at, b.at);
                 assert!(
-                    (a.body, a.per_lane) != (b.body, b.per_lane),
+                    (a.body, a.experts) != (b.body, b.experts),
                     "{} and {}",
                     a.at,
                     b.at
                 );
             }
             assert!(a.top_k_min >= 1 && a.top_k_min <= a.top_k_max, "{}", a.at);
-            assert!(a.per_lane >= 1 && a.per_lane <= 32, "{}", a.at);
+            assert!(a.per_lane() >= 1 && a.per_lane() <= 32, "{}", a.at);
         }
     }
 
@@ -924,7 +1019,11 @@ mod tests {
             e.why,
             Refusal::GqaGroup {
                 group: 12,
-                served: vec!["exactly 8".to_string(), "exactly 5".to_string()]
+                served: vec![
+                    "exactly 8".to_string(),
+                    "exactly 5".to_string(),
+                    "exactly 16".to_string()
+                ]
             }
         );
         let e = select_gqa(attn(16, 2, 160)).expect_err("head 160");
@@ -939,6 +1038,16 @@ mod tests {
         }
         let e = select_gqa(attn(24, 8, 256)).expect_err("group 3");
         assert!(e.to_string().contains("group 3"), "{e}");
+    }
+
+    /// Head 128 at sixteen query heads a key head (Bolt's 32/2) selects the
+    /// group-16 row: one call a group, two group-8 passes a key head inside it.
+    #[test]
+    fn a_head_128_group_of_16_selects_its_row() {
+        let row = select_gqa(attn(32, 2, 128)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((row.pack, row.group), (16, GroupRule::One));
+        assert!(row.at.contains("GROUP_16"), "{}", row.at);
+        assert!(!row.window && !row.sinks && !row.value_scale);
     }
 
     /// Head 128 at five query heads a key head (10/2) selects the scalar

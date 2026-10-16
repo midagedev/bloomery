@@ -120,116 +120,207 @@ mod tests {
     const SHAPES: [(u64, u64); 3] = [(4, 16), (6, 32), (6, 16)];
     const TOP_K: i32 = 2;
 
-    /// Each layer's (experts, width), `None` off the MoE layers.
-    fn shapes() -> Vec<Option<(u64, u64)>> {
-        let mut moe = SHAPES.iter();
-        KINDS
-            .iter()
-            .map(|&k| (k == 'e').then(|| *moe.next().expect("a shape a MoE layer")))
-            .collect()
+    /// A synthetic file's layers and widths: [`SMALL`], the reader's tests'
+    /// header, and [`FIXTURE`], the gate fixture's layout at Bolt's shapes.
+    struct Geo {
+        kinds: &'static [char],
+        /// Each MoE layer's (experts, width), in layer order.
+        shapes: &'static [(u64, u64)],
+        embd: u64,
+        vocab: u64,
+        heads: u64,
+        kv: i32,
+        head: u64,
+        inner: u64,
+        mamba_heads: u64,
+        groups: u64,
+        latent: u64,
+        shared: u64,
+        top_k: i32,
+        /// The Bolt file's types (NVFP4 Mamba projections, Q8_0 attention,
+        /// latent pair and globals, IQ2_XXS experts); f32 throughout if not.
+        quant: bool,
     }
 
-    fn per_layer(f: impl Fn(char, Option<(u64, u64)>) -> i32) -> V {
-        V::I32s(KINDS.iter().zip(shapes()).map(|(&k, s)| f(k, s)).collect())
-    }
+    /// The reader's tests' header: [`KINDS`] at the small widths, all f32.
+    const SMALL: Geo = Geo {
+        kinds: &KINDS,
+        shapes: &SHAPES,
+        embd: EMBD,
+        vocab: EMBD,
+        heads: HEADS,
+        kv: KV,
+        head: HEAD,
+        inner: INNER,
+        mamba_heads: MAMBA_HEADS,
+        groups: GROUPS,
+        latent: LATENT,
+        shared: SHARED,
+        top_k: TOP_K,
+        quant: false,
+    };
 
-    fn keys() -> Vec<(&'static str, V)> {
-        let width = |_, s: Option<(u64, u64)>| s.map_or(0, |(_, w)| w as i32);
-        vec![
-            ("block_count", V::U32(KINDS.len() as u32)),
-            ("context_length", V::U32(128)),
-            ("embedding_length", V::U32(EMBD as u32)),
-            ("feed_forward_length", per_layer(width)),
-            ("attention.head_count", V::U32(HEADS as u32)),
-            (
-                "attention.head_count_kv",
-                per_layer(|k, _| if k == 'a' { KV } else { 0 }),
-            ),
-            ("attention.layer_norm_rms_epsilon", V::F32(1e-5)),
-            ("attention.layer_norm_epsilon", V::F32(1e-5)),
-            ("expert_count", V::U32(6)),
-            ("expert_group_count", V::U32(1)),
-            ("expert_group_used_count", V::U32(1)),
-            ("expert_gating_func", V::U32(2)),
-            ("vocab_size", V::U32(EMBD as u32)),
-            ("rope.dimension_count", V::U32(HEAD as u32)),
-            ("ssm.conv_kernel", V::U32(CONV as u32)),
-            ("ssm.state_size", V::U32(STATE as u32)),
-            ("ssm.group_count", V::U32(GROUPS as u32)),
-            ("ssm.inner_size", V::U32(INNER as u32)),
-            ("ssm.time_step_rank", V::U32(MAMBA_HEADS as u32)),
-            ("attention.key_length", V::U32(HEAD as u32)),
-            ("attention.value_length", V::U32(HEAD as u32)),
-            ("expert_feed_forward_length", per_layer(width)),
-            (
-                "expert_used_count",
-                per_layer(|k, _| if k == 'e' { TOP_K } else { 0 }),
-            ),
-            ("expert_shared_feed_forward_length", V::U32(SHARED as u32)),
-            ("expert_shared_count", V::U32(1)),
-            ("expert_weights_norm", V::Bool(true)),
-            ("expert_weights_scale", V::F32(5.0)),
-            ("moe_latent_size", V::U32(LATENT as u32)),
-        ]
+    /// The gate fixture's layout (`fixture::LAYER_MAP`: Mamba-2, MoE of 240,
+    /// attention of 32 heads over 2, MoE of 496) at Bolt's types, routers,
+    /// group 16, head 128, state 128 and top 9; the widths the body does not
+    /// fix (hidden, inner, latent, the experts' and the shared expert's) at
+    /// the least the block sizes take, so the header stays small.
+    const FIXTURE: Geo = Geo {
+        kinds: &['m', 'e', 'a', 'e'],
+        shapes: &[(240, 256), (496, 512)],
+        embd: 256,
+        vocab: 64,
+        heads: 32,
+        kv: 2,
+        head: 128,
+        inner: 256,
+        mamba_heads: 4,
+        groups: 1,
+        latent: 256,
+        shared: 256,
+        top_k: 9,
+        quant: true,
+    };
+
+    impl Geo {
+        /// Each layer's (experts, width), `None` off the MoE layers.
+        fn layer_shapes(&self) -> Vec<Option<(u64, u64)>> {
+            let mut moe = self.shapes.iter();
+            self.kinds
+                .iter()
+                .map(|&k| (k == 'e').then(|| *moe.next().expect("a shape a MoE layer")))
+                .collect()
+        }
+
+        fn per_layer(&self, f: impl Fn(char, Option<(u64, u64)>) -> i32) -> V {
+            V::I32s(
+                self.kinds
+                    .iter()
+                    .zip(self.layer_shapes())
+                    .map(|(&k, s)| f(k, s))
+                    .collect(),
+            )
+        }
+
+        fn keys(&self) -> Vec<(&'static str, V)> {
+            let width = |_, s: Option<(u64, u64)>| s.map_or(0, |(_, w)| w as i32);
+            let n_expert = self.shapes.iter().map(|&(n, _)| n).max().unwrap_or(0);
+            let (kv, top_k) = (self.kv, self.top_k);
+            vec![
+                ("block_count", V::U32(self.kinds.len() as u32)),
+                ("context_length", V::U32(128)),
+                ("embedding_length", V::U32(self.embd as u32)),
+                ("feed_forward_length", self.per_layer(width)),
+                ("attention.head_count", V::U32(self.heads as u32)),
+                (
+                    "attention.head_count_kv",
+                    self.per_layer(|k, _| if k == 'a' { kv } else { 0 }),
+                ),
+                ("attention.layer_norm_rms_epsilon", V::F32(1e-5)),
+                ("attention.layer_norm_epsilon", V::F32(1e-5)),
+                ("expert_count", V::U32(n_expert as u32)),
+                ("expert_group_count", V::U32(1)),
+                ("expert_group_used_count", V::U32(1)),
+                ("expert_gating_func", V::U32(2)),
+                ("vocab_size", V::U32(self.vocab as u32)),
+                ("rope.dimension_count", V::U32(self.head as u32)),
+                ("ssm.conv_kernel", V::U32(CONV as u32)),
+                ("ssm.state_size", V::U32(STATE as u32)),
+                ("ssm.group_count", V::U32(self.groups as u32)),
+                ("ssm.inner_size", V::U32(self.inner as u32)),
+                ("ssm.time_step_rank", V::U32(self.mamba_heads as u32)),
+                ("attention.key_length", V::U32(self.head as u32)),
+                ("attention.value_length", V::U32(self.head as u32)),
+                ("expert_feed_forward_length", self.per_layer(width)),
+                (
+                    "expert_used_count",
+                    self.per_layer(|k, _| if k == 'e' { top_k } else { 0 }),
+                ),
+                (
+                    "expert_shared_feed_forward_length",
+                    V::U32(self.shared as u32),
+                ),
+                ("expert_shared_count", V::U32(1)),
+                ("expert_weights_norm", V::Bool(true)),
+                ("expert_weights_scale", V::F32(5.0)),
+                ("moe_latent_size", V::U32(self.latent as u32)),
+            ]
+        }
+
+        /// A tensor's type: `quant`'s for a quantized family, f32 otherwise.
+        fn ty(&self, quant: Ty) -> Ty {
+            if self.quant { quant } else { Ty::F32 }
+        }
+
+        /// Layer `l`'s tensors for `kind`, at `shape` on a MoE layer.
+        fn layer(&self, l: usize, kind: char, shape: Option<(u64, u64)>, out: &mut Tensors) {
+            let e = self.embd;
+            let mut one = |stem: &str, dims: Vec<u64>, ty: Ty| {
+                out.push((format!("blk.{l}.{stem}"), dims, ty));
+            };
+            let (q8, nv, iq) = (self.ty(Ty::Q8_0), self.ty(Ty::Nvfp4), self.ty(Ty::Iq2Xxs));
+            one(names::ATTN_NORM, vec![e], Ty::F32);
+            match kind {
+                'm' => {
+                    let (inner, heads, groups) = (self.inner, self.mamba_heads, self.groups);
+                    let gs = 2 * groups * STATE;
+                    let (proj, conv) = (2 * inner + gs + heads, inner + gs);
+                    one(names::SSM_A, vec![1, heads], Ty::F32);
+                    one(names::SSM_D, vec![1, heads], Ty::F32);
+                    one(names::SSM_DT_BIAS, vec![heads], Ty::F32);
+                    one(names::SSM_CONV, vec![CONV, conv], Ty::F32);
+                    one(names::SSM_CONV_BIAS, vec![conv], Ty::F32);
+                    one(names::SSM_IN, vec![e, proj], nv);
+                    one(names::SSM_IN_SCALE, vec![1], Ty::F32);
+                    one(names::SSM_NORM, vec![inner / groups, groups], Ty::F32);
+                    one(names::SSM_OUT, vec![inner, e], nv);
+                    one(names::SSM_OUT_SCALE, vec![1], Ty::F32);
+                }
+                'a' => {
+                    let (h, kv) = (self.heads * self.head, self.kv as u64 * self.head);
+                    one(names::ATTN_Q, vec![e, h], q8);
+                    one(names::ATTN_K, vec![e, kv], q8);
+                    one(names::ATTN_V, vec![e, kv], q8);
+                    one(names::ATTN_OUTPUT, vec![h, e], q8);
+                }
+                'e' => {
+                    let (n, w) = shape.expect("a MoE layer's shape");
+                    let (lat, sh) = (self.latent, self.shared);
+                    one(names::FFN_GATE_INP, vec![e, n], Ty::F32);
+                    one(names::EXP_PROBS_B, vec![n], Ty::F32);
+                    one(names::FFN_LATENT_DOWN, vec![e, lat], q8);
+                    one(names::FFN_LATENT_UP, vec![lat, e], q8);
+                    one(names::FFN_UP_EXPS, vec![lat, w, n], iq);
+                    one(names::FFN_DOWN_EXPS, vec![w, lat, n], iq);
+                    one(names::FFN_UP_SHEXP, vec![e, sh], iq);
+                    one(names::FFN_DOWN_SHEXP, vec![sh, e], iq);
+                }
+                _ => panic!("kind {kind}"),
+            }
+        }
+
+        fn tensors(&self) -> Tensors {
+            let q8 = self.ty(Ty::Q8_0);
+            let mut out = vec![
+                (names::token_embd(), vec![self.embd, self.vocab], q8),
+                (names::output(), vec![self.embd, self.vocab], q8),
+                (names::output_norm(), vec![self.embd], Ty::F32),
+            ];
+            for (l, (&kind, shape)) in self.kinds.iter().zip(self.layer_shapes()).enumerate() {
+                self.layer(l, kind, shape, &mut out);
+            }
+            out
+        }
     }
 
     type Tensors = Vec<(String, Vec<u64>, Ty)>;
 
-    fn one(l: usize, stem: &str, dims: Vec<u64>, out: &mut Tensors) {
-        out.push((format!("blk.{l}.{stem}"), dims, Ty::F32));
-    }
-
-    /// Layer `l`'s tensors for `kind`, at `shape` on a MoE layer.
-    fn layer(l: usize, kind: char, shape: Option<(u64, u64)>, out: &mut Tensors) {
-        let e = EMBD;
-        one(l, names::ATTN_NORM, vec![e], out);
-        match kind {
-            'm' => {
-                let gs = 2 * GROUPS * STATE;
-                let (proj, conv) = (2 * INNER + gs + MAMBA_HEADS, INNER + gs);
-                one(l, names::SSM_A, vec![1, MAMBA_HEADS], out);
-                one(l, names::SSM_D, vec![1, MAMBA_HEADS], out);
-                one(l, names::SSM_DT_BIAS, vec![MAMBA_HEADS], out);
-                one(l, names::SSM_CONV, vec![CONV, conv], out);
-                one(l, names::SSM_CONV_BIAS, vec![conv], out);
-                one(l, names::SSM_IN, vec![e, proj], out);
-                one(l, names::SSM_IN_SCALE, vec![1], out);
-                one(l, names::SSM_NORM, vec![INNER / GROUPS, GROUPS], out);
-                one(l, names::SSM_OUT, vec![INNER, e], out);
-                one(l, names::SSM_OUT_SCALE, vec![1], out);
-            }
-            'a' => {
-                let (h, kv) = (HEADS * HEAD, KV as u64 * HEAD);
-                one(l, names::ATTN_Q, vec![e, h], out);
-                one(l, names::ATTN_K, vec![e, kv], out);
-                one(l, names::ATTN_V, vec![e, kv], out);
-                one(l, names::ATTN_OUTPUT, vec![h, e], out);
-            }
-            'e' => {
-                let (n, w) = shape.expect("a MoE layer's shape");
-                one(l, names::FFN_GATE_INP, vec![e, n], out);
-                one(l, names::EXP_PROBS_B, vec![n], out);
-                one(l, names::FFN_LATENT_DOWN, vec![e, LATENT], out);
-                one(l, names::FFN_LATENT_UP, vec![LATENT, e], out);
-                one(l, names::FFN_UP_EXPS, vec![LATENT, w, n], out);
-                one(l, names::FFN_DOWN_EXPS, vec![w, LATENT, n], out);
-                one(l, names::FFN_UP_SHEXP, vec![e, SHARED], out);
-                one(l, names::FFN_DOWN_SHEXP, vec![SHARED, e], out);
-            }
-            _ => panic!("kind {kind}"),
-        }
+    fn keys() -> Vec<(&'static str, V)> {
+        SMALL.keys()
     }
 
     fn tensors() -> Tensors {
-        let mut out = vec![
-            (names::token_embd(), vec![EMBD, EMBD], Ty::F32),
-            (names::output(), vec![EMBD, EMBD], Ty::F32),
-            (names::output_norm(), vec![EMBD], Ty::F32),
-        ];
-        for (l, (&kind, shape)) in KINDS.iter().zip(shapes()).enumerate() {
-            layer(l, kind, shape, &mut out);
-        }
-        out
+        SMALL.tensors()
     }
 
     fn load(tag: &str, kv: Vec<(&str, V)>, tensors: &Tensors) -> Result<crate::arch::Read, String> {
@@ -330,11 +421,13 @@ mod tests {
         );
     }
 
-    /// The coverage check names what no program runs of a MoE layer — the
-    /// latent, the squared-ReLU experts and shared expert with no gate, the
-    /// per-layer expert shapes, the routers at their widths — and the
-    /// program, at the layers that carry each. Emitting a MoE layer's needs
-    /// as a dense layer's, or dropping one of them, fails this.
+    /// The latent MoE body runs a MoE layer at the shapes it is built for:
+    /// on the small header the coverage check names each part at a shape it
+    /// is not — the routers at 4 and 6 experts, top 2, a 16-value latent, a
+    /// shared expert of 24, the group-2 head-8 flash — at the layers that
+    /// carry each, and never the program, the squared-ReLU experts, the
+    /// per-layer shapes or the Mamba-2 mixer, which it runs. Emitting a MoE
+    /// layer's needs as a dense layer's, or dropping one of them, fails this.
     #[test]
     fn coverage_names_the_latent_moe_parts() {
         let read = load("nhm-cover", keys(), &tensors()).expect("the header reads");
@@ -354,24 +447,91 @@ mod tests {
             ),
             moe
         );
-        assert_eq!(at("routed experts of squared ReLU, no gate"), moe);
-        assert_eq!(at("shared expert of squared ReLU, no gate"), moe);
-        assert_eq!(
-            at("routed stacks whose expert count and width differ by layer (3 shapes)"),
-            vec![None]
-        );
-        assert_eq!(at("a layer program for nemotron_h_moe"), vec![None]);
+        assert_eq!(at("shared expert, ff 24"), moe);
+        assert_eq!(at("GQA flash, head 8, group 2"), vec![Some(2)]);
         for (l, n) in [(1, 4), (4, 6), (5, 6)] {
             let want = format!("router: sigmoid, {n} experts, top 2, with a selection bias");
             assert!(at(&want).contains(&Some(l)), "{want} at {l}: {items:?}");
         }
+        for run in [
+            "a layer program for nemotron_h_moe",
+            "routed experts of squared ReLU, no gate",
+            "shared expert of squared ReLU, no gate",
+            "routed stacks whose expert count and width differ by layer (3 shapes)",
+        ] {
+            assert!(at(run).is_empty(), "{run}: {items:?}");
+        }
         assert!(
-            items
-                .iter()
-                .all(|u| !u.feature.starts_with("dense")
-                    && !u.feature.starts_with("squared-ReLU dense")),
+            items.iter().all(|u| !u.feature.starts_with("Mamba-2")
+                && !u.feature.starts_with("dense")
+                && !u.feature.starts_with("squared-ReLU dense")),
             "{items:?}"
         );
+    }
+
+    /// The gate fixture's layout at Bolt's types and shapes ([`FIXTURE`]) is
+    /// one the program runs whole: no coverage item. It plans whole-card on the
+    /// gate machine, every routed stack and the shared expert in the file's
+    /// blocks; a tier card and a second card are refused by name. A router
+    /// row, a format pin or the group-16 flash row lost names its part here.
+    #[test]
+    fn the_fixture_layout_plans_whole_card() {
+        use crate::placement::{CardFormat, Device, Format, PlanLevers, workstation};
+        let path = header_typed(
+            "nhm-fixture",
+            "nemotron_h_moe",
+            &FIXTURE.keys(),
+            &[("tokenizer.ggml.pre", V::Str("pixtral"))],
+            &FIXTURE.tensors(),
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let _ = std::fs::remove_file(&path);
+        let inputs = super::super::place::read(&split)
+            .unwrap_or_else(|e| panic!("the fixture layout is refused: {e}"));
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let levers = PlanLevers::default();
+        let plan = inputs
+            .plan(&machine, 4, &levers)
+            .expect("a whole-card plan");
+        assert_eq!(plan.cards.len(), 1);
+        assert_eq!(plan.host.experts + plan.host.expert_bytes, 0);
+        assert_eq!(plan.nvme_bytes, 0);
+        for row in &plan.rows {
+            let t = &inputs.model.tensors[row.tensor];
+            if matches!(t.role, Role::RoutedExperts | Role::SharedExpert) {
+                for seg in &row.segments {
+                    assert_eq!(seg.device, Device::Card(0), "{}", t.name);
+                    assert_eq!(seg.format, Format::Card(CardFormat::KQuant), "{}", t.name);
+                }
+            }
+        }
+        let mut tiered = machine.clone();
+        let mut tier = tiered.cards[0].clone();
+        tier.layers = 0..0;
+        tier.head = false;
+        tier.token_embedding = false;
+        tiered.tiers.push(tier);
+        match inputs.plan(&tiered, 4, &levers) {
+            Err(e @ super::super::place::PlaceError::Tier { tier: 0, .. }) => assert!(
+                e.to_string()
+                    .contains("the nemotron_h_moe body runs every layer on one card"),
+                "{e}"
+            ),
+            other => panic!("{other:?}, not the tier refusal"),
+        }
+        let mut two = machine;
+        let mut second = two.cards[0].clone();
+        second.layers = 0..0;
+        second.head = false;
+        second.token_embedding = false;
+        two.cards.push(second);
+        match inputs.plan(&two, 4, &levers) {
+            Err(e @ super::super::place::PlaceError::Cards(2, _)) => assert_eq!(
+                e.to_string(),
+                "the placement puts the layers on 2 cards; the nemotron_h_moe chain runs on one"
+            ),
+            other => panic!("{other:?}, not the card-count refusal"),
+        }
     }
 
     /// FAIL-first: a header without `moe_latent_size` is refused by the key's

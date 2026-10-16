@@ -1067,6 +1067,7 @@ fn family_name(program: Program) -> &'static str {
         Program::Mimo2Body => "mimo2",
         Program::Deepseek41Chain => "deepseek41",
         Program::NemotronHBody => "nemotron_h",
+        Program::NemotronHMoeBody => "nemotron_h_moe",
     }
 }
 

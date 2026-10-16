@@ -1,18 +1,26 @@
 //! The Nemotron-H hybrid trunk's common pieces, which `nemotron_h` and
 //! `nemotron_h_moe` read their files through: the Mamba-2 and no-rope
 //! attention layers' tensor names, role stems, widths and dims, the layer
-//! kinds from the two per-layer arrays, the tensors each kind carries, and
-//! the two mixers' descriptions. A family's own feed-forward layer (the
-//! dense MLP, the latent MoE) stays in the family. The dialect's authority
-//! is llama.cpp's `src/models/nemotron-h.cpp`, which loads both.
+//! kinds from the two per-layer arrays, the tensors each kind carries, the
+//! two mixers' descriptions, and the whole-card plan of a file of either
+//! family ([`PlanInputs`]). A family's own feed-forward layer (the dense MLP,
+//! the latent MoE) stays in the family. The dialect's authority is
+//! llama.cpp's `src/models/nemotron-h.cpp`, which loads both.
 
 use gguf::Split;
-use models::{Act, Ffn, Gqa, Mamba2, Rope, RopeMode, ToolFormat};
+use models::{Act, Ffn, Gqa, Mamba2, ModelSpec, Rope, RopeMode, ToolFormat};
+use runtime::stores::{dense_kv_bytes, mamba2_bytes};
 
+use crate::arch::coverage;
 use crate::arch::names::{output, output_norm, token_embd};
 use crate::arch::stems::{Stem, opt, req, required};
 use crate::arch::{meta_usize, metadata, mul, optional_usize, positive, spec_u32};
-use crate::placement::{PlacementError, Role};
+use crate::placement::accepts::{program_of, routed_rule};
+use crate::placement::ctx_ask::PlanRefusal;
+use crate::placement::{
+    self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role, Unimplemented,
+    Violation, checked, joined,
+};
 
 // ------------------------------------------------------------------ names
 
@@ -445,4 +453,188 @@ pub(in crate::arch) fn nope_gqa(a: &Attn, kv: usize) -> Result<Gqa, PlacementErr
         sinks: false,
         value_scale: None,
     })
+}
+
+// ------------------------------------------------------------- placement
+
+/// What a plan of a Nemotron-H file of either family is made from, read from
+/// its headers by the family (`nemotron_h::place::describe`,
+/// `nemotron_h_moe::place::describe`): every tensor with its role, the typed
+/// description and each layer's store bytes. The placement
+/// ([`PlanInputs::plan`]) puts the whole model on one card: the body runs
+/// every layer there, its routed experts too, so no tier and no host leg has
+/// anything to hold; it refuses by name a machine of more than one card or
+/// with a tier card, a context of no position, and a context whose stores the
+/// card cannot hold.
+#[derive(Clone, Debug)]
+pub struct PlanInputs {
+    /// Every tensor with its role, and the model's layer count.
+    pub model: ModelTensors,
+    /// The typed model description the coverage check reads.
+    pub spec: ModelSpec,
+    /// Each layer's store bytes.
+    pub kv: KvLayout,
+}
+
+/// Why a plan was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum PlaceError {
+    /// The placement could not be built.
+    #[error(transparent)]
+    Placement(#[from] PlacementError),
+    /// A machine with an expert tier card: the body runs every layer on its
+    /// one card, so the tier would hold nothing.
+    #[error(
+        "the machine has the expert tier card {card} (tier {tier}); the {arch} body runs every layer on one card, so a tier would hold nothing"
+    )]
+    Tier {
+        /// The tier card's name.
+        card: String,
+        /// Its index among the machine's tiers.
+        tier: usize,
+        /// The file's architecture.
+        arch: &'static str,
+    },
+    /// A machine of other than one card: the body runs its chain on one.
+    #[error("the placement puts the layers on {0} cards; the {1} chain runs on one")]
+    Cards(usize, &'static str),
+    /// The plan was built and breaks these invariants, every one of them.
+    #[error("the plan breaks its invariants: {}", joined(.0))]
+    Broken(Vec<Violation>),
+    /// A context of no position: no plane, nothing to serve.
+    #[error("ctx_max 0: a plan serves at least one position")]
+    CtxZero,
+}
+
+impl PlanRefusal for PlaceError {
+    fn placement(&self) -> Option<&PlacementError> {
+        match self {
+            Self::Placement(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    fn violations(&self) -> Option<&[Violation]> {
+        match self {
+            Self::Broken(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+impl PlanInputs {
+    /// `self`, or — for a file with a feature the engine does not run —
+    /// [`PlacementError::Unimplemented`] with every one listed.
+    pub fn runnable(self) -> Result<PlanInputs, PlacementError> {
+        let missing = self.unimplemented();
+        if missing.is_empty() {
+            Ok(self)
+        } else {
+            Err(PlacementError::Unimplemented(missing))
+        }
+    }
+
+    /// Every feature of the file the engine does not run, as
+    /// [`coverage::check`] lists them. Empty for a file the program runs.
+    pub fn unimplemented(&self) -> Vec<Unimplemented> {
+        coverage::check(&self.spec, &self.model)
+    }
+
+    /// The placement of the file on `machine` at `ctx_max` positions under
+    /// the placement's `levers`: the whole model on the machine's one card,
+    /// each routed stack in the format its program's rule reads. A file no
+    /// program runs is refused with its coverage list.
+    pub fn plan<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+    ) -> Result<Plan<'a>, PlaceError> {
+        let arch = self.spec.arch.name();
+        if ctx_max == 0 {
+            return Err(PlaceError::CtxZero);
+        }
+        if let Some((tier, card)) = machine.tiers.iter().enumerate().next() {
+            return Err(PlaceError::Tier {
+                card: card.name.clone(),
+                tier,
+                arch,
+            });
+        }
+        if machine.cards.len() != 1 {
+            return Err(PlaceError::Cards(machine.cards.len(), arch));
+        }
+        let program = program_of(self.spec.arch)
+            .ok_or_else(|| PlacementError::Unimplemented(self.unimplemented()))?;
+        let plan = placement::plan_routed(
+            &self.model,
+            machine,
+            ctx_max,
+            &self.kv,
+            levers,
+            routed_rule(program),
+        )?;
+        checked(plan).map_err(PlaceError::Broken)
+    }
+}
+
+/// What a layer's mixer holds per sequence, whatever the family calls the
+/// layer: the family maps its own kinds to these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holds {
+    /// A Mamba-2 layer: its scan state and conv ring.
+    Scan,
+    /// An attention layer of `kv_heads` key and value heads.
+    Attention { kv_heads: usize },
+    /// A feed-forward layer (the dense MLP, the latent MoE): nothing.
+    Nothing,
+}
+
+/// What one layer holds per sequence, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Store {
+    /// An attention layer: K and V of this many bytes a position.
+    Rows(u64),
+    /// A Mamba-2 layer: this many bytes of scan state and conv ring, whatever
+    /// the context.
+    State(u64),
+    /// A feed-forward layer.
+    Nothing,
+}
+
+/// Each layer's store bytes of a Nemotron-H file: the bytes the body's
+/// allocations hold ([`runtime::stores`] is their owner).
+#[derive(Clone, Debug)]
+pub struct KvLayout {
+    layers: Vec<Store>,
+}
+
+impl KvLayout {
+    /// The layout of `layers` (in layer order) of a file of Mamba-2 widths
+    /// `ssm` and attention keys of `key_len` values.
+    #[must_use]
+    pub fn of(ssm: &Ssm, key_len: usize, layers: impl IntoIterator<Item = Holds>) -> KvLayout {
+        let state = mamba2_bytes(ssm.d_inner, ssm.d_state, ssm.d_conv, ssm.conv_dim);
+        let layers = layers
+            .into_iter()
+            .map(|h| match h {
+                Holds::Scan => Store::State(state),
+                Holds::Attention { kv_heads } => Store::Rows(dense_kv_bytes(kv_heads, key_len, 1)),
+                Holds::Nothing => Store::Nothing,
+            })
+            .collect();
+        KvLayout { layers }
+    }
+}
+
+impl KvBytes for KvLayout {
+    /// An attention layer's K and V of `ctx_max` positions, a Mamba-2
+    /// layer's state, a feed-forward layer's nothing; 0 past the last layer.
+    fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        match self.layers.get(layer) {
+            Some(Store::Rows(row)) => row.saturating_mul(ctx_max),
+            Some(Store::State(bytes)) => *bytes,
+            Some(Store::Nothing) | None => 0,
+        }
+    }
 }
