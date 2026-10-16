@@ -7,23 +7,26 @@
 # half a 16-byte run (load-time repack, byte-neutral), so the weight words stage through
 # cp.async into shared and the warps read v4 — the Q4_K path's shape.
 #
-# Site size (lead 03:47, perf eager s2011, r3 A6000 P=4096): gemm_iq2xxs = 0.80 s of the pass
-# (26.9 %; the earlier nsys 0.49 s was node-trace distortion). Context: both cards need
-# -0.42 s/P=4096 to reach the lcpp-ratio target (A6000 1376 = 0.86x, 3090 1204 = 0.87x).
+# Site decomposition (lead, perf s2330/s2334, A6000 P=4096 eager): gemm_iq2xxs = ~532 ms weight
+# re-read across passes (53.2 ms/pass) + ~286 ms compute at m=448 — the 0.80 s site of the 26.9 %
+# share. The ubatch track owns the re-read's elimination; this card claims the compute part only
+# (bytes are the file's, so the re-read's byte share does not move with the plane) and reports the
+# per-pass re-read SPEED beside it as a second, unclaimed effect.
 #
 # Runner (from the integrated head after the engine flip, not this branch's inert tree):
 #   just time-gpu-gemm gemm_iq2xxs_bolt_up_t448        # the arm, file entry vs plane entry
 #   and the pp4096 A/B in the lead's sitting (ab-decode / depth-gpu prose:4096), both cards.
 # Wall [derived]: arm ~2 min a side under the lease; the sitting's own window prices its rows.
 kind: ab
-question: Does the IQ2_XXS plane (staged weight words) cut the gemm_iq2xxs site's time at Bolt's routed-up shape, and by how much of its 0.80 s?
+question: Does the IQ2_XXS plane (staged weight words) cut the gemm_iq2xxs arm's compute time at Bolt's routed-up shape, and by how much of its ~81.8 ms/pass (53.2 re-read + 28.6 compute)?
 term: the bench arm's per-launch time (file entry vs plane entry, interleaved), and the pp4096 pass delta both cards
 unit: %
-predict: -41..-29
+predict: -14..-10
 rounds: 4
-sd: 0.6 % AGENTS.md 「Know the ruler」 (same-binary run scatter); the site is 26.9 % of the pass, so the
-  pass row moves -7.8..-11.1 % of its gemm_iq2xxs share under the same ruler
+sd: 0.6 % AGENTS.md 「Know the ruler」 (same-binary run scatter); the compute leg is 28.6 ms of the
+  arm's 81.8 ms/pass, so the pass row moves -0.08..-0.12 s of its ~2.97 s = -2.8..-3.9 % under the
+  same ruler — the re-read leg's movement, if any, is reported beside it, never claimed here
 condition: the arm at 432x2560x1024 top-9 t=448 grid 9900 on the A6000 under the machine lease, interleaved rounds, both entries byte-neutral over the same synthetic stack; the pass rows carry their card and depth
-decide-in: kernel 1.4-1.7x (1.71 -> ~1.0-1.2 ms at the arm) and the site 0.80 -> 0.47-0.57 s, i.e. -0.23..-0.33 s at P=4096 — the second step (the GRID2XXS lookup term, math_pipe_throttle 16.2 %) prices on top
-decide-below: under 1.2x — the weight-path instruction term was not the bind at the launch level; profile the plane entry once before any second step
-decide-above: over 2.0x or the pass moves more than -0.35 s — re-read the site decomposition (a second site moved with it); the paper's -0.4..-0.6 needed the grid term too
+decide-in: the compute leg 1.4-1.7x (28.6 -> ~17-20 ms a pass, the arm -10..-14 %); the per-pass re-read 53.2 ms reported beside it, claimed only if it also clears 1.2x (DRAM 28 % SOL says the re-read is instruction-bound too, not bandwidth-bound)
+decide-below: the compute leg under 1.2x — the weight-path instruction term was not the bind at the launch level; profile the plane entry once before any second step
+decide-above: the arm past -20 % or the pass past -0.16 s — the re-read leg moved with it: report the split, keep the claim at the compute leg (the re-read's disappearance is the ubatch track's, not this plane's)
