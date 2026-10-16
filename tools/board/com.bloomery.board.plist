@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The status board's launchd agent (tools/board/README.md): every 600 s it publishes the body of one pinned issue.
+     A template: launchd expands no $VAR and no ~, so the README's install command fills the @…@ words with sed:
+     @PYTHON@ python3's path, @REPO@ the main checkout, @ISSUE@ the board issue's number, @GHUSER@ the gh account that owns
+     the repo (launchd runs no shell hook, so the job names its account instead of using whichever is active),
+     @HOME@ the home directory. The token is read from gh's keyring at run time and never written here. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bloomery.board</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>GH_TOKEN=$(gh auth token --user @GHUSER@) || exit 1; export GH_TOKEN; exec @PYTHON@ @REPO@/tools/board/board.py --publish @ISSUE@</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>@REPO@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>@HOME@/.cache/bloomery/board/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/.cache/bloomery/board/launchd.log</string>
+</dict>
+</plist>
