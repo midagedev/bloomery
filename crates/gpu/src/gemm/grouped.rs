@@ -1318,10 +1318,7 @@ pub(super) fn q3k_code(qs: u32, hm: u32, j: u32, hb: u32) -> u32 {
 pub(super) fn iq2xxs_lane(idx: u32, aux: u32, t: u32) -> (u32, u32, u32) {
     let sgn = |g: u32| sign_mask4(signs_of((aux >> (7 * g)) & 127) >> (4 * (t & 1)));
     (
-        signed4(
-            iq2xxs_grid_half(idx >> (8 * (t / 2)), t & 1),
-            sgn(t / 2),
-        ),
+        signed4(iq2xxs_grid_half(idx >> (8 * (t / 2)), t & 1), sgn(t / 2)),
         signed4(
             iq2xxs_grid_half(idx >> (8 * (2 + t / 2)), t & 1),
             sgn(2 + t / 2),
