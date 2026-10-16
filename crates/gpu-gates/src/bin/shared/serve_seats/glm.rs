@@ -969,7 +969,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // count; a count the flags set is never lowered. An attempt prints
     // nothing: the record is returned and printed once the count stands.
     let ((placed, draft_off, yield_record), slots, from) =
-        default_slots_fit(WHAT, chosen.place.name(), slots, from, |slots| {
+        default_slots_fit(WHAT, chosen.place.name(), slots, bloomery_gpu_gates::bind::SlotsFrom::Flag, |slots| {
             let set = ctx_share(slots)?;
             let drafted = plan_place(chosen.place, (set, slots))?;
             if draft_off.is_none()

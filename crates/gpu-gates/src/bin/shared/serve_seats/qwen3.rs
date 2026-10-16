@@ -1236,7 +1236,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // refuse: the default's second slot that the load refuses falls to one
     // slot (`from=fit`); a count the flags set is never lowered.
     let ((slot_ctx, load), slots, from) =
-        default_slots_fit(NAME, chosen.place.name(), slots, from, |slots| {
+        default_slots_fit(NAME, chosen.place.name(), slots, bloomery_gpu_gates::bind::SlotsFrom::Flag, |slots| {
             // A set `--ctx` is the total the slots split; the default is a slot's
             // context, the load's total the slots of it.
             let ctx = match a.ctx {
