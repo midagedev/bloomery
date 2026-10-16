@@ -42,18 +42,22 @@
 //! 5. replay: the capture is one node. Replayed over three tokens whose
 //!    inputs and position word are rewritten between replays, it equals the
 //!    eager run bit for bit (`y` of every token, the ring, the state).
-//! 6. steps_are_steps: the prompt pass (`enqueue_steps`, three entries) over
-//!    `U` rows of an in-projection output (the `z`, `xbc`, `dt` columns at
-//!    the Nemotron offsets) against `U` `enqueue_step` launches from the
+//! 6. steps_are_steps: the prompt pass (`enqueue_steps`, four entries: the
+//!    conv pre-pass into the scratch, the scan, the ring tail, the norm)
+//!    over `U` rows of an in-projection output (the `z`, `xbc`, `dt` columns
+//!    at the Nemotron offsets) against `U` `enqueue_step` launches from the
 //!    same ring, state and position: every `y` row, the final state and the
-//!    whole ring bit for bit. `U` in {1, 2, 3, 4, 5, 37, 256} from a ring
+//!    whole ring bit for bit. `U` in {1, 2, 3, 4, 5, T−1, T, T+1, 2T+3, 37,
+//!    256} (`T` the scan's stage) from a ring
 //!    and state that steps warmed, with the gain and without; `U` = 5 from
 //!    the sequence start; a norm tie: inputs built so a group's mean square
 //!    is an f32 rounding tie that only the step's chunk order resolves the
 //!    step's way (the f64 sums absorb every other order difference, so a
-//!    random input cannot tell the order); and a captured pass (three
-//!    nodes) replayed against the eager pass. The pass's refusals (`u` 0, a
-//!    column window past `ld`, short rows, a short `y`) are clause 3's.
+//!    random input cannot tell the order); and a captured pass (four
+//!    nodes with a gain) replayed against the eager pass. The pass's
+//!    refusals (`u` 0, a column window past `ld`, short rows, a short `y`, a
+//!    `u` past the scratch's `max_u`, a scratch of another shape) are
+//!    clause 3's.
 //! 7. shape: the entries compile with no local depot.
 //!
 //! The band of clause 2. Write `u = 2^-24` and `ε = 2u = 2^-23`, one ulp at
@@ -102,7 +106,9 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::linear::RING_ROWS;
-    use bloomery_gpu::mamba2::{Mamba2Kernels, Mamba2Scratch, STATE, StepsArgs};
+    use bloomery_gpu::mamba2::{
+        Mamba2Kernels, Mamba2PassScratch, Mamba2Scratch, STAGE_T, STATE, StepsArgs,
+    };
     use bloomery_gpu::{Fault, FaultSite, Gpu, GpuError};
     use bloomery_gpu_gates::rounding::U;
     use bloomery_gpu_gates::{GateError, bits_equal, no_local_depot, verdict};
@@ -142,8 +148,22 @@ mod gate {
     const X0: usize = INNER;
     const DT0: usize = INNER + CONV_DIM;
     const LD: usize = DT0 + HEADS;
-    /// The pass lengths of clause 6, and the steps that warm its start.
-    const STEPS_US: [usize; 7] = [1, 2, 3, 4, 5, 37, 256];
+    /// The pass lengths of clause 6, and the steps that warm its start: the
+    /// stage boundary's neighbours `STAGE_T ± 1`, `2·STAGE_T + 3` past two
+    /// stages, and the odd ones around them.
+    const STEPS_US: [usize; 11] = [
+        1,
+        2,
+        3,
+        4,
+        5,
+        STAGE_T - 1,
+        STAGE_T,
+        STAGE_T + 1,
+        2 * STAGE_T + 3,
+        37,
+        256,
+    ];
     const WARM: usize = 5;
 
     /// One ulp at most, relative: 2^-23 (module doc).
@@ -346,6 +366,7 @@ mod gate {
         ring: DeviceBuffer<f32>,
         state: DeviceBuffer<f32>,
         scratch: Mamba2Scratch,
+        pass_scratch: Mamba2PassScratch,
     }
 
     impl Dev {
@@ -366,6 +387,11 @@ mod gate {
                 ring: DeviceBuffer::from_host(st, &vec![0.0; RING_ROWS * CONV_DIM])?,
                 state: DeviceBuffer::from_host(st, &vec![0.0; INNER * STATE])?,
                 scratch: Mamba2Scratch::new(st, device_shape()?)?,
+                pass_scratch: Mamba2PassScratch::new(
+                    st,
+                    device_shape()?,
+                    STEPS_US.into_iter().max().unwrap(),
+                )?,
             })
         }
 
@@ -457,6 +483,7 @@ mod gate {
                     y,
                     ring: &mut self.ring,
                     state: &mut self.state,
+                    scratch: &mut self.pass_scratch,
                 },
             )
         }
@@ -901,6 +928,73 @@ mod gate {
             let pass = matches!(e, Some(GpuError::Shape { .. })) && text.contains(want);
             named.push(format!("{label}={}", verdict(pass)));
             ok &= pass;
+        }
+        // The pass scratch's own refusals: a `u` past its `max_u` (read
+        // before the buffer lengths, so a short `rows` cannot mask it) and a
+        // scratch of another shape.
+        for (label, u, want) in [
+            ("pass u past max_u", 257, "is past the pass scratch's max_u"),
+            (
+                "pass scratch other shape",
+                2,
+                "the pass scratch holds conv_dim",
+            ),
+        ] {
+            let pass = Pass {
+                shape: device_shape()?,
+                u,
+                ld: LD,
+                x0: X0,
+                rows: &rows,
+            };
+            let scratch = if u == 257 {
+                &mut dev.pass_scratch
+            } else {
+                let other = Geom {
+                    d_inner: (HEADS + GROUPS) * HEAD_DIM,
+                    n_heads: HEADS + GROUPS,
+                    n_groups: GROUPS,
+                    d_state: STATE,
+                    d_conv: 4,
+                };
+                &mut Mamba2PassScratch::new(
+                    st,
+                    bloomery_gpu::mamba2::check("gate_mamba2 other", other)?,
+                    256,
+                )?
+            };
+            let e =
+                cx.k.enqueue_steps(
+                    st,
+                    StepsArgs {
+                        shape: pass.shape,
+                        u,
+                        rows: pass.rows,
+                        ld: LD,
+                        z0: Z0,
+                        x0: X0,
+                        dt0: DT0,
+                        dt_bias: &dev.dt_bias,
+                        a: &dev.a,
+                        d: &dev.d,
+                        conv_w: &dev.conv_w,
+                        conv_b: &dev.conv_b,
+                        norm: None,
+                        eps: EPS,
+                        pos: &dev.pos,
+                        pos_at: 0,
+                        fault: cx.gpu.layer_sink(LAYER)?,
+                        y: &mut ys[0],
+                        ring: &mut dev.ring,
+                        state: &mut dev.state,
+                        scratch,
+                    },
+                )
+                .err();
+            let text = e.as_ref().map(ToString::to_string).unwrap_or_default();
+            let hit = matches!(e, Some(GpuError::Shape { .. })) && text.contains(want);
+            named.push(format!("{label}={}", verdict(hit)));
+            ok &= hit;
         }
         let mut untouched = true;
         for y in &ys {
@@ -1378,7 +1472,9 @@ mod gate {
         let (eager, _) = pass_run(cx, &mut dev, start, &toks, true, false)?;
         let (replay, nodes) = pass_run(cx, &mut dev, start, &toks, true, true)?;
         let same = same_run("captured u=37", &replay, &eager);
-        let ok = nodes == Some(3) && same && clean(cx, "steps captured")?;
+        // Four nodes with a gain: the conv pre-pass, the scan, the ring tail
+        // and the norm rows.
+        let ok = nodes == Some(4) && same && clean(cx, "steps captured")?;
         println!(
             "steps captured u=37: nodes={} replay bit-identical to eager {same} {}",
             nodes.unwrap_or(0),
