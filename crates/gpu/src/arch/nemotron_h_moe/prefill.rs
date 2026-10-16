@@ -1004,7 +1004,7 @@ impl Body {
             cur = 1 - cur;
         }
         if let Some(head) = head {
-            let row = Window::<f32>::of(&p.x[cur], (m - 1) * sh.hidden * f, sh.hidden)?;
+            let row = Window::<f32>::of(&p.x[cur], 0 * sh.hidden * f, sh.hidden)?;
             head.input_mut().copy_from_device_async(&row, stream)?;
             head.enqueue(gpu, w)?;
         }
