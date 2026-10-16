@@ -396,17 +396,11 @@ macro_rules! w32 {
     ) => {{
         if $live {
             let (v, ew) = $raw;
-            // The unit's eight staged code words in value order: its first
-            // sub-block's low words, then its high words, then its second
-            // sub-block's, through the one nibble-table decode (`mxfp4`'s
-            // card path). K a multiple of 64 keeps `n`'s parity the unit's
-            // half, so bytes `2(n & 1)` and `2(n & 1) + 1` of its scale word
-            // are its sub-blocks'.
-            let (l0, h0) = crate::cores::table16_word(v[0], crate::mxfp4::E2M1);
-            let (l1, h1) = crate::cores::table16_word(v[1], crate::mxfp4::E2M1);
-            let (l2, h2) = crate::cores::table16_word(v[2], crate::mxfp4::E2M1);
-            let (l3, h3) = crate::cores::table16_word(v[3], crate::mxfp4::E2M1);
-            let sh = 16 * ($n & 1) as u32;
+            // The unit's eight staged code words in value order and its two
+            // sub-block scales, through the one decode every NVFP4 path
+            // shares (`mxfp4`'s card path).
+            let ([l0, l1, h0, h1, l2, l3, h2, h3], d0, d1) =
+                <crate::mxfp4::Nvfp4 as crate::mxfp4::Fp4>::decode(v, ew, $n);
             // SAFETY: the pair's eight code words and its two scale words of
             // its staged row, which no warp reads before the next barrier.
             unsafe {
@@ -419,8 +413,8 @@ macro_rules! w32 {
                 *p.add(5) = l3;
                 *p.add(6) = h2;
                 *p.add(7) = h3;
-                *$dst.add(16 + $pj) = crate::mxfp4::ue4m3_half((ew >> sh) & 0xff).to_bits();
-                *$dst.add(18 + $pj) = crate::mxfp4::ue4m3_half((ew >> (sh + 8)) & 0xff).to_bits();
+                *$dst.add(16 + $pj) = d0.to_bits();
+                *$dst.add(18 + $pj) = d1.to_bits();
             }
         }
     }};

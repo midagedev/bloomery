@@ -3295,13 +3295,13 @@ mod gate {
             }
         }
 
-        /// One GEMM over the table `route` last filled with `n_slots` slots,
-        /// `y` set to [`SENT`] first; `y`'s first `n_slots·rows` values back.
+        /// One GEMM over the weight `w` and the table `route` last filled
+        /// with `n_slots` slots, `y` set to [`SENT`] first; `y`'s first
+        /// `n_slots·rows` values back.
         #[allow(clippy::too_many_arguments, reason = "a gate helper's operands, named")]
         fn gemm(
             dev: &Dev<'_>,
-            res: &Res,
-            lay: Lay,
+            w: Gemm32Weight<'_>,
             rows: usize,
             act: &GemmAct32,
             route: &GemmRoute,
@@ -3314,45 +3314,7 @@ mod gate {
             dev.g32.enqueue_gemm32(
                 stream,
                 Gemm32Args {
-                    w: res.weight(lay)?,
-                    rows_per_expert: rows,
-                    act,
-                    route,
-                    input,
-                    y,
-                },
-            )?;
-            stream.synchronize()?;
-            let mut out = y.to_host_vec(stream)?;
-            out.truncate(n_slots * rows);
-            Ok(out)
-        }
-
-        /// One NVFP4 GEMM over the planes of a [`WtsNv`] stack, `y` set to
-        /// [`SENT`] first; `y`'s first `n_slots·rows` values back.
-        #[allow(clippy::too_many_arguments, reason = "a gate helper's operands, named")]
-        fn gemm_nv(
-            dev: &Dev<'_>,
-            w: &WtsNv,
-            qs: &DeviceTensor<u32>,
-            e: &DeviceTensor<u32>,
-            rows: usize,
-            act: &GemmAct32,
-            route: &GemmRoute,
-            input: GemmInput,
-            y: &mut DeviceBuffer<f32>,
-            n_slots: usize,
-        ) -> Result<Vec<f32>, GateError> {
-            let stream = dev.gpu.stream();
-            y.copy_from_host(stream, &vec![SENT; y.len()])?;
-            dev.g32.enqueue_gemm32(
-                stream,
-                Gemm32Args {
-                    w: Gemm32Weight::Nvfp4Planes {
-                        qs,
-                        e,
-                        scale: w.scale,
-                    },
+                    w,
                     rows_per_expert: rows,
                     act,
                     route,
@@ -3859,8 +3821,7 @@ mod gate {
                     ] {
                         let got = gemm(
                             dev,
-                            res,
-                            lay,
+                            res.weight(lay)?,
                             ROWS,
                             &act,
                             &route,
@@ -3930,8 +3891,7 @@ mod gate {
             dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
             let eager = gemm(
                 dev,
-                &r8,
-                Lay::Q8Plane,
+                r8.weight(Lay::Q8Plane)?,
                 ROWS,
                 &act,
                 &route,
@@ -4051,7 +4011,16 @@ mod gate {
                         } else {
                             GemmInput::PerSlot
                         };
-                        let got = gemm(dev, &res, lay, rows, &act, &route, input, &mut y, n_slots)?;
+                        let got = gemm(
+                            dev,
+                            res.weight(lay)?,
+                            rows,
+                            &act,
+                            &route,
+                            input,
+                            &mut y,
+                            n_slots,
+                        )?;
                         let (ha, _) = host_act(&x, k, n_cols);
                         let unwritten =
                             got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
@@ -4136,11 +4105,13 @@ mod gate {
                     dev.g32
                         .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
                     dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
-                    let got = gemm_nv(
+                    let got = gemm(
                         dev,
-                        &w,
-                        &qs,
-                        &e,
+                        Gemm32Weight::Nvfp4Planes {
+                            qs: &qs,
+                            e: &e,
+                            scale: w.scale,
+                        },
                         rows,
                         &act,
                         &route,
@@ -4150,11 +4121,13 @@ mod gate {
                     )?;
                     let rerun = bits_equal(
                         &got,
-                        &gemm_nv(
+                        &gemm(
                             dev,
-                            &w,
-                            &qs,
-                            &e,
+                            Gemm32Weight::Nvfp4Planes {
+                                qs: &qs,
+                                e: &e,
+                                scale: w.scale,
+                            },
                             rows,
                             &act,
                             &route,
@@ -4227,11 +4200,13 @@ mod gate {
             dev.g32
                 .enqueue_quantize_gemm32(stream, &xd, m, &mut act, sink)?;
             dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
-            let eager = gemm_nv(
+            let eager = gemm(
                 dev,
-                &w,
-                &qs,
-                &e,
+                Gemm32Weight::Nvfp4Planes {
+                    qs: &qs,
+                    e: &e,
+                    scale: w.scale,
+                },
                 rows,
                 &act,
                 &route,
@@ -4320,8 +4295,20 @@ mod gate {
                         } else {
                             GemmInput::Shared { top_k }
                         };
-                        let got =
-                            gemm_nv(dev, &w, &qs, &e, rows, &act, &route, input, &mut y, n_slots)?;
+                        let got = gemm(
+                            dev,
+                            Gemm32Weight::Nvfp4Planes {
+                                qs: &qs,
+                                e: &e,
+                                scale: w.scale,
+                            },
+                            rows,
+                            &act,
+                            &route,
+                            input,
+                            &mut y,
+                            n_slots,
+                        )?;
                         let (ha, _) = host_act(&x, k, n_cols);
                         let unwritten =
                             got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
@@ -4379,11 +4366,13 @@ mod gate {
                     let mut ids = route_ids(Routing::Uniform, t, 1, n_exp, 0x69);
                     ids_d.copy_from_host(stream, &pad(&ids, ids_d.len()))?;
                     dev.gk.enqueue_route(stream, &ids_d, t, &mut route, sink)?;
-                    let clean = gemm_nv(
+                    let clean = gemm(
                         dev,
-                        &w,
-                        &qs,
-                        &e,
+                        Gemm32Weight::Nvfp4Planes {
+                            qs: &qs,
+                            e: &e,
+                            scale: w.scale,
+                        },
                         rows,
                         &act,
                         &route,
@@ -4395,11 +4384,13 @@ mod gate {
                     ids[9] = u32::MAX;
                     ids_d.copy_from_host(stream, &pad(&ids, ids_d.len()))?;
                     dev.gk.enqueue_route(stream, &ids_d, t, &mut route, sink)?;
-                    let got = gemm_nv(
+                    let got = gemm(
                         dev,
-                        &w,
-                        &qs,
-                        &e,
+                        Gemm32Weight::Nvfp4Planes {
+                            qs: &qs,
+                            e: &e,
+                            scale: w.scale,
+                        },
                         rows,
                         &act,
                         &route,
@@ -4762,8 +4753,7 @@ mod gate {
                         .enqueue_route(stream, &ids_d, n_slots, &mut route, sink)?;
                     let got = gemm(
                         dev,
-                        &res,
-                        Lay::Iq4Nl,
+                        res.weight(Lay::Iq4Nl)?,
                         rows,
                         &act,
                         &route,
@@ -4819,8 +4809,7 @@ mod gate {
                     .enqueue_quantize_gemm32(stream, &xd, ids.len(), &mut act, sink)?;
                 let a = gemm(
                     dev,
-                    &res,
-                    Lay::Iq4Nl,
+                    res.weight(Lay::Iq4Nl)?,
                     rows,
                     &act,
                     &route,
@@ -4830,8 +4819,7 @@ mod gate {
                 )?;
                 let b = gemm(
                     dev,
-                    &res,
-                    Lay::Iq4Nl,
+                    res.weight(Lay::Iq4Nl)?,
                     rows,
                     &act,
                     &route,
@@ -4867,8 +4855,7 @@ mod gate {
                     .enqueue_quantize_gemm32(stream, &xd, ids.len(), &mut act, sink)?;
                 let got = gemm(
                     dev,
-                    &resn,
-                    Lay::Iq4Nl,
+                    resn.weight(Lay::Iq4Nl)?,
                     rows,
                     &act,
                     &route,
@@ -4969,8 +4956,7 @@ mod gate {
                     .enqueue_route_remap(stream, &ids_d, &map_d, n_slots, &mut route, sink)?;
                 let got = gemm(
                     dev,
-                    &res,
-                    Lay::Q51,
+                    res.weight(Lay::Q51)?,
                     rows,
                     &act,
                     &route,
@@ -5156,8 +5142,7 @@ mod gate {
                     .enqueue_route_remap(stream, &ids_d, &map_fd, n_slots, &mut route, sink)?;
                 let got = gemm(
                     dev,
-                    &res,
-                    Lay::Q51,
+                    res.weight(Lay::Q51)?,
                     rows,
                     &act,
                     &route,
@@ -5298,8 +5283,8 @@ mod gate {
             let pnv = repack::<Nvfp4>(&wnv.bytes, rows, 384)?;
             let nvq = DeviceTensor::upload(stream, &pnv.qs, rows, 384 / 8)?;
             let nve = DeviceTensor::upload(stream, &pnv.e, rows, 384 / 64)?;
-            let nvq_short = DeviceTensor::upload(stream, &pnv.qs, rows, 384 / 8 - 1)?;
-            let nve_short = DeviceTensor::upload(stream, &pnv.e, rows, 384 / 64 - 1)?;
+            let nvq_short = DeviceTensor::<u32>::zeroed(stream, rows, 384 / 8 - 1)?;
+            let nve_short = DeviceTensor::<u32>::zeroed(stream, rows, 384 / 64 - 1)?;
             let mut act96 = GemmAct32::new(stream, 8, 96)?;
             dev.g32.enqueue_quantize_gemm32(
                 stream,

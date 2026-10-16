@@ -103,7 +103,7 @@ pub const NV_BLOCK_BYTES: usize = 36;
 pub const UNIT_VALUES: usize = 32;
 
 /// `KVALUES_MXFP4` as the shared nibble decode's table words.
-pub(crate) const E2M1: [u32; 4] = table16(&KVALUES_MXFP4);
+const E2M1: [u32; 4] = table16(&KVALUES_MXFP4);
 
 /// The eight codes of one `qs` word decoded to int8 values through the E2M1
 /// table: the low nibbles of its four bytes, then the high nibbles, each as
