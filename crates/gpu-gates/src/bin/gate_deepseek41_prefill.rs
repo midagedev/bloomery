@@ -50,9 +50,11 @@
 //!   still carries the ids as they came), with ids inside it raise nothing.
 //!   The same for `ds41_ffn_handoff_8` through the launcher, which picks it
 //!   for an 8-slot `PageLayout` (a past id at slot 7 among them), writing no
-//!   word of the image but its fields; a handoff of 5, 7 or 9 slots is
-//!   refused by name. The same for `ds41_ffn_handoff_10` over a 10-slot
-//!   `PageLayout` (past ids at slots 3 and 9), a handoff of 9 or 11 slots
+//!   word of the image but its fields; a handoff of 5 or 7 slots is
+//!   refused by name. The same for `ds41_ffn_handoff_9` over a 9-slot
+//!   `PageLayout` (past ids at slots 4 and 8), a handoff of 5, 7 or 11 slots
+//!   refused by name, and for `ds41_ffn_handoff_10` over a 10-slot
+//!   `PageLayout` (past ids at slots 3 and 9), a handoff of 11 slots
 //!   refused by name. Then the prompt batch's 8-slot entries through their
 //!   launchers: `ds41_ffn_card_acc_8` against the host rule
 //!   `runtime::combine::card_sum` bit for bit (the six-slot entry against the
@@ -1135,6 +1137,7 @@ mod gate {
         let mut ok = places_cases(gpu)?;
         ok &= handoff_cases(gpu)?;
         ok &= handoff8_cases(gpu)?;
+        ok &= handoff9_cases(gpu)?;
         ok &= handoff10_cases(gpu)?;
         ok &= batch8_cases(gpu)?;
         ok &= tile_case(gpu, w, layers, hp)?;
@@ -1330,7 +1333,7 @@ mod gate {
     /// as they came, the weights and the activation and nothing else of the
     /// image, and every slot's place, the one at slot 7 included; ids at and
     /// past the stack (slots 3 and 7) raise `expert_id` and place [`HOST`].
-    /// A handoff of 5, 7 or 9 slots is refused by name, nothing written.
+    /// A handoff of 5 or 7 slots is refused by name, nothing written.
     fn handoff8_cases(gpu: &Gpu) -> Result<bool, GateError> {
         let past = N_EXPERT as u32;
         handoff_slots_cases::<SLOTS8>(
@@ -1338,16 +1341,36 @@ mod gate {
             [0, 3, 5, 383, 9, 12, 300, 6],
             [0, 3, 5, past, 9, 12, 300, past + 616],
             [0.25, 0.125, 0.25, 0.125, 0.0625, 0.0625, 0.0625, 0.0625],
-            &[5, 7, 9],
+            &[5, 7],
         )
     }
 
-    /// Slots a token of the handoff's third entry (Qwen3.8's).
+    /// Slots a token of the handoff's third entry (Bolt's).
+    const SLOTS9: usize = 9;
+
+    /// [`handoff8_cases`] at nine slots: `ds41_ffn_handoff_9` into an image
+    /// laid out by a 9-slot `PageLayout`, ids at and past the stack at slots
+    /// 4 and 8 (the last); a handoff of 5, 7 or 11 slots is refused by name,
+    /// nothing written.
+    fn handoff9_cases(gpu: &Gpu) -> Result<bool, GateError> {
+        let past = N_EXPERT as u32;
+        handoff_slots_cases::<SLOTS9>(
+            gpu,
+            [0, 3, 5, 383, 9, 12, 300, 6, 200],
+            [0, 3, 5, 383, past, 12, 300, 6, past + 616],
+            [
+                0.25, 0.125, 0.125, 0.125, 0.125, 0.0625, 0.0625, 0.0625, 0.0625,
+            ],
+            &[5, 7, 11],
+        )
+    }
+
+    /// Slots a token of the handoff's fourth entry (Qwen3.8's).
     const SLOTS10: usize = 10;
 
     /// [`handoff8_cases`] at ten slots: `ds41_ffn_handoff_10` into an image
     /// laid out by a 10-slot `PageLayout`, ids at and past the stack at slots
-    /// 3 and 9 (the last); a handoff of 9 or 11 slots is refused by name,
+    /// 3 and 9 (the last); a handoff of 11 slots is refused by name,
     /// nothing written.
     fn handoff10_cases(gpu: &Gpu) -> Result<bool, GateError> {
         let past = N_EXPERT as u32;
@@ -1358,7 +1381,7 @@ mod gate {
             [
                 0.25, 0.125, 0.125, 0.125, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625,
             ],
-            &[9, 11],
+            &[11],
         )
     }
 

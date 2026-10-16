@@ -275,7 +275,11 @@ gguf 9 2 0
 # PIN(2026-10-16): gpu 1869 -> 1892 blocks, 203 -> 206 fns, new code, not old code relaxed: the card leg's arena
 # entries for the Q4_K, Q5_K and Q6_K reads at word offsets of the NVMe tier's arena and their launchers, and the step
 # port's card leg that computes a service's arena ids from their slots, each call with its SAFETY line.
-gpu 1896 206 10
+# PIN(2026-10-17): gpu 1896 -> 1901 blocks, 206 -> 207 fns, new code, not old code relaxed: two new kernel
+# entries (bolt-b1-handoff9), ds41_ffn_handoff_9's call into handoff_at and weighted_sum_card's reads and
+# write, and the split of weighted_expert_sum's body into weighted_expert_sum_keep (the plain sum's call
+# into it), each block with its SAFETY line; the fn is weighted_expert_sum_keep itself.
+gpu 1901 207 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
