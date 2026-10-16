@@ -370,7 +370,10 @@ mod gate {
         let n_sb = k / 256;
         let bpb = ty.block_bytes();
         let grp = match ty {
-            GemmWeight::Q4K | GemmWeight::Q5K | GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs
+            GemmWeight::Q4K
+            | GemmWeight::Q5K
+            | GemmWeight::Iq2Xxs
+            | GemmWeight::Iq3Xxs
             | GemmWeight::Iq4Xs => 32,
             GemmWeight::Q6K | GemmWeight::Q3K => 16,
         };
@@ -829,9 +832,9 @@ mod gate {
                 (GemmWeight::Q5K, _) | (GemmWeight::Q3K, Input::PerSlot(_)) => return Ok(None),
                 // The i-quant types' diagnostic is `iq_rows_diag`, not a
                 // `_sel` gemv.
-                (GemmWeight::Iq2Xxs, _)
-                | (GemmWeight::Iq3Xxs, _)
-                | (GemmWeight::Iq4Xs, _) => return Ok(None),
+                (GemmWeight::Iq2Xxs, _) | (GemmWeight::Iq3Xxs, _) | (GemmWeight::Iq4Xs, _) => {
+                    return Ok(None);
+                }
                 (GemmWeight::Q3K, Input::Shared(top_k)) => {
                     // One launch per token: every slot of it reads the one column.
                     for t in 0..n_slots / top_k {
@@ -2529,7 +2532,8 @@ mod gate {
         {
             return Ok(true);
         }
-        let accept = GemmWeight::from_ggml(GgmlType::IQ2_XXS).is_ok_and(|t| t == GemmWeight::Iq2Xxs);
+        let accept =
+            GemmWeight::from_ggml(GgmlType::IQ2_XXS).is_ok_and(|t| t == GemmWeight::Iq2Xxs);
         println!(
             "gemm case=iq2xxs_types from_ggml(iq2_xxs)={} {}",
             if accept { "accepted" } else { "REFUSED" },
