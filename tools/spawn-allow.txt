@@ -51,3 +51,4 @@ crates/hf/src/fetch.rs 1 a test's local HTTP answerer (the HTTP-error clause), f
 crates/gpu-gates/src/bin/probe_nvread.rs 1 a probe binary, never pinned: the cache and direct arms' resident workers
 crates/gpu/src/checkpoint/staging.rs 1 a gate test drops an extent on a thread of its own: the drop blocks on a held stream, and no placement matters
 crates/jinja/src/lib.rs 1 a test parses on a thread with a fixed stack size, from a libtest thread that is never pinned
+crates/gpu/src/arch/nemotron_h_moe/prefill.rs 1 PENDING (triage): the Bolt NVFP4 sites' Q8_0 twin, decoded at load by scoped workers on the loading thread; a pinned caller's mask makes it one thread (available_parallelism reads it)
