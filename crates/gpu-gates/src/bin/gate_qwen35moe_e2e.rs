@@ -194,6 +194,47 @@
 //!   `GpuModel::<Body35>::open` when `plan.host.experts == 0`) leaves no
 //!   placed side, and (o7) names it.
 //!   `--placed-only` runs (o) and (o7) alone.
+//! - (o8) the unjoined shared expert on the placed load, on [`UNJOINED`]
+//!   (qwen35moe has no fixture family, so the clause is real tier only): the
+//!   file whose every layer keeps a q8_0 shared expert beside a K-quant
+//!   routed stack, planned on device 0 under the smallest card budget that
+//!   leaves at least [`N_LAYER`] / 2 routed experts on the card (a bisection
+//!   over the planner, which is host arithmetic: its expert rule fills the
+//!   layers in ascending order, so this budget leaves the later layers no
+//!   card expert at all, the mix [`PLACED_BUDGET`]'s even spread cannot give),
+//!   then loaded by that plan (`open_placed`). Asserted on the opened body:
+//!   some layer holds no card expert and some holds at least one, the plan
+//!   holds host experts, the arena is the plan's count and every shared
+//!   expert is kept apart. The shared expert's three parts run as the dense
+//!   FFN at their site types on every layer, whatever its card count (the
+//!   placed twin of the whole-card load's apart arm), the q8_0 parts reading
+//!   the f32 normed rows: the step boundary's on a decode step, the arena's on
+//!   a unit. The reference is the same file's whole-card load, dropped before
+//!   the placed one opens. One verdict line per arm: the gemv arm, the batch
+//!   set's five tokens as five graph steps; the same tokens as a prompt call
+//!   (a unit within the gemv arm's cut) against the fifth step, bit for bit
+//!   as (o1) holds it, which reads the arena's rows against the boundary's;
+//!   and the wide arm, [`PLACED_UBATCH`] ids of the step set's prompt as one
+//!   GEMM unit past the gemv arm's cut ([`wide_arm`] is not used: its (d)
+//!   half reads ik's sets, which are dumped from the other file). The two
+//!   steps and the unit are held to the whole-card load by (e)'s rule, not
+//!   bit for bit: every call's logits row within [`FREE_BAND`] of the
+//!   whole-card load's (relative), the greedy ids equal or parting at a near
+//!   tie ([`GREEDY_MARGIN`]) — a host expert runs ik's 8-bit rule where the
+//!   card runs q8_1, so the two loads are two realizations of one rule, and
+//!   (o7)'s exact ids hold only for a plan with no host expert.
+//!   FAIL-first: a placed side that admits only a K-quant stack of one expert
+//!   for the shared expert refuses the opener, `qwen3moe::Body::load:
+//!   blk.0.ffn_gate_shexp.weight is not a resident K-quant word plane`.
+//!   Mutants: the decode step reading the arena's normed rows in place of the
+//!   boundary's (the step's front writes the boundary's, so the rows are stale
+//!   and the bit-for-bit line parts from the step), a layer with no card
+//!   expert dropping its shared expert or running it on other rows, its
+//!   sigmoid weight dropped (each an update of order one: the logits band).
+//!   Not seen: a q8_0 part reading the
+//!   q8_1 of the normed rows in place of the f32 rows, an 8-bit reading of its
+//!   input and well inside [`FREE_BAND`]. `--unjoined-placed-only` runs (o8)
+//!   alone.
 //! - (e) the residency machine on the placed load (`open_placed_residency`
 //!   at the `mid` word [`residency_clauses::mid_of`] makes of (o)'s plan,
 //!   through the session's calls: a prompt is one residency pass), against
@@ -3165,6 +3206,300 @@ mod gate {
         Ok(same && banded)
     }
 
+    /// (o8)'s wide unit is a unit of the wide arm: past the gemv arm's cut, and
+    /// within the placed load's ubatch.
+    const _: () = assert!(PLACED_UBATCH >= WIDE_FROM);
+
+    /// The smallest card budget, in bytes, under which `q`'s plan keeps at
+    /// least `want` routed experts on the card. The expert rule fills the
+    /// layers in ascending order, one expert at a time, so a plan of fewer
+    /// experts than the file has layers leaves the later layers none: the mix
+    /// of layers (o8) needs, which [`PLACED_BUDGET`]'s even spread does not
+    /// give. Card experts only grow with the budget and the planner is host
+    /// arithmetic, so the search is a bisection from a budget the planner
+    /// refuses as below the card's floor up to [`PLACED_BUDGET`], which must
+    /// itself plan `want` experts; a refusal other than the floor's ends the
+    /// search by name.
+    fn budget_for_card_experts(q: &PlaceQ3, want: u64) -> Result<u64, GateError> {
+        // The card experts a budget plans; `None` for the budget-floor refusal
+        // (`PlacementError::CardBudgetFloor`: "budget {b} B is below its floor").
+        let card_experts = |budget: u64| -> Result<Option<u64>, GateError> {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(budget),
+            };
+            match q.plan(CTX, &levers) {
+                Ok(plan) => Ok(Some(plan.cards.first().ok_or("a plan of no card")?.experts)),
+                Err(e)
+                    if e.to_string()
+                        .contains(&format!("budget {budget} B is below its floor ")) =>
+                {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            }
+        };
+        let (mut lo, mut hi) = (0u64, PLACED_BUDGET);
+        if card_experts(lo)?.is_some() {
+            return Err(
+                format!("a card budget of {lo} B plans: the card's floor is not read").into(),
+            );
+        }
+        match card_experts(hi)? {
+            Some(top) if top >= want => {}
+            Some(top) => {
+                return Err(format!(
+                    "the search's upper bound, a card budget of {hi} B, plans {top} card \
+                     experts, under the {want} the clause needs"
+                )
+                .into());
+            }
+            None => {
+                return Err(format!(
+                    "the search's upper bound, a card budget of {hi} B, is below the card's floor"
+                )
+                .into());
+            }
+        }
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if card_experts(mid)?.is_some_and(|n| n >= want) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Ok(hi)
+    }
+
+    /// `got`'s calls (each a greedy id and a logits row) against the
+    /// whole-card load's `want` by (e)'s rule ([`e_band`]), a call at a time:
+    /// the calls are fed the same ids, so each id stands alone and a part at
+    /// any call must be a near tie, not only the first. Every row must also be
+    /// finite (the band's distance does not see a NaN). The rule is not bit
+    /// identity: a host expert runs ik's 8-bit rule where the card runs q8_1,
+    /// so the two loads are two realizations of one rule.
+    fn forced_calls(
+        label: &str,
+        got: (&[u32], &[Vec<f32>]),
+        want: (&[u32], &[Vec<f32>]),
+    ) -> Result<bool, GateError> {
+        let n = got.0.len();
+        if n == 0 || got.1.len() != n || want.0.len() != n || want.1.len() != n {
+            println!(
+                "{label}: {} ids and {} rows against {} ids and {} rows (the same count, above 0) \
+                 {}",
+                got.0.len(),
+                got.1.len(),
+                want.0.len(),
+                want.1.len(),
+                verdict(false)
+            );
+            return Ok(false);
+        }
+        let call = |(ids, rows): (&[u32], &[Vec<f32>]), i: usize| Seen {
+            tokens: vec![ids[i]],
+            rows: vec![rows[i].clone()],
+            ..Seen::default()
+        };
+        let finite = got.1.iter().flatten().all(|v| v.is_finite());
+        let mut ok = finite;
+        let (mut worst, mut over, mut parted, mut far) = ((0usize, 0.0f64), vec![], vec![], vec![]);
+        for i in 0..n {
+            let band = e_band(&call(got, i), &call(want, i))?;
+            ok &= band.ok();
+            if band.worst.1 > worst.1 {
+                worst = (i, band.worst.1);
+            }
+            if band.worst.1 > FREE_BAND {
+                over.push(i);
+            }
+            if band.parted.is_some() {
+                parted.push(i);
+            }
+            if !band.near {
+                far.push(i);
+            }
+        }
+        println!(
+            "{label}: {n} calls' logits within {FREE_BAND} of the whole-card load's, relative: \
+             worst {:.3e} at call {} (calls over the band {over:?}); rows finite {finite}; greedy \
+             ids {:?} vs the whole-card load's {:?}, parting at calls {parted:?} (each a near tie, \
+             margin under {GREEDY_MARGIN}: calls that are not {far:?}) {}",
+            worst.1,
+            worst.0,
+            got.0,
+            want.0,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (o8) (module doc): the whole-card load's references first, its model
+    /// dropped before the placed one opens (two whole-sized models never share
+    /// a card), then the placed load by the plan [`budget_for_card_experts`]
+    /// finds.
+    fn placed_unjoined(toks: &[u32], host: HostCfg) -> Result<bool, GateError> {
+        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
+        let (_, _, prompt) = man.step()?;
+        let wide = prompt.get(..PLACED_UBATCH).ok_or_else(|| {
+            format!(
+                "the step set's prompt holds {} ids, (o8)'s wide unit takes {PLACED_UBATCH}",
+                prompt.len()
+            )
+        })?;
+        let apart = header_apart(UNJOINED)?;
+        let n_apart = apart.iter().filter(|&&a| a).count();
+        let unjoined_file = apart.len() == N_LAYER && n_apart == N_LAYER;
+        println!(
+            "placed unjoined file: shared experts of another type than their stacks' on {n_apart} \
+             of {} layers (want {N_LAYER}) {}",
+            apart.len(),
+            verdict(unjoined_file)
+        );
+        if !unjoined_file {
+            return Ok(false);
+        }
+        let (whole, whole_wide) = {
+            let mut m = open_at(UNJOINED, CTX, KvQ8::F16)?;
+            m.set_mode(StepMode::Graph);
+            let steps = decode_run(&mut m, toks, false)?;
+            fresh(&mut m)?;
+            let plan_w = m.prefill_plan(wide.len(), PrefillPath::Gemm)?;
+            let next = m.prefill_with(wide, PrefillPath::Gemm)?;
+            println!(
+                "placed unjoined whole-card reference: tokens {:?}; the prompt of {} ids \
+                 (plan={plan_w}) token {next}",
+                steps.tokens,
+                wide.len()
+            );
+            (steps, (next, m.logits()?))
+        };
+        let file = Split::open(UNJOINED).map_err(|e| format!("open {UNJOINED}: {e}"))?;
+        let o = Open35 {
+            ctx: CTX,
+            mma: true,
+            ubatch: U_GATE,
+            kv: KvQ8::F16,
+            media: false,
+        };
+        let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
+        let want = u64::try_from(N_LAYER / 2)?;
+        let budget = budget_for_card_experts(&q, want)?;
+        let levers = PlanLevers {
+            card_budget_bytes: Some(budget),
+        };
+        let plan = q.plan(CTX, &levers)?;
+        q.record(&plan, None).print();
+        let card_experts = plan.cards.first().ok_or("a plan of no card")?.experts;
+        let split = plan.host.experts > 0 && card_experts >= want;
+        println!(
+            "placed unjoined plan: card budget {budget} B (the smallest under {PLACED_BUDGET} B \
+             that plans {want} card experts or more) card_experts={card_experts} host_experts={} \
+             (both above 0) card experts per layer {:?} {}",
+            plan.host.experts,
+            plan.n_l,
+            verdict(split)
+        );
+        if !split {
+            return Ok(false);
+        }
+        // (o6)
+        let scratch = GpuModel::<Body35>::placed_arena_bytes(&file, o)?;
+        let card = plan.machine.cards.first().ok_or("a plan of no card")?;
+        let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
+        let t = Instant::now();
+        let mut m = GpuModel::<Body35>::open_placed(file, &plan, o, host)?;
+        let every = m
+            .body("gate_qwen35moe_e2e")?
+            .shared_apart()
+            .iter()
+            .all(|&a| a);
+        let counts = m
+            .body("gate_qwen35moe_e2e")?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .card_counts();
+        let none = counts.iter().filter(|&&n| n == 0).count();
+        let some = counts.len() - none;
+        println!(
+            "placed unjoined load resident_bytes={} ubatch={} card experts per layer {counts:?} \
+             in {:.1} s (runtime value)",
+            m.resident_bytes(),
+            m.ubatch()?,
+            t.elapsed().as_secs_f64()
+        );
+        let reason = match (none, some) {
+            (0, _) => ": the plan holds no layer with 0 card experts",
+            (_, 0) => ": the plan holds no layer with card experts",
+            _ => "",
+        };
+        let mixed = reason.is_empty();
+        println!(
+            "placed unjoined layers: {none} with 0 card experts and {some} with card experts \
+             (both above 0){reason} {}",
+            verdict(mixed)
+        );
+        let counts_ok = scratch == counted;
+        println!(
+            "placed unjoined scratch: the plan counts {counted} B, the arena and placed side the \
+             planner counts {scratch} B {}; every layer's shared expert kept apart on the placed \
+             load {every} {}",
+            verdict(counts_ok),
+            verdict(every)
+        );
+        if !(mixed && counts_ok && every) {
+            return Ok(false);
+        }
+        m.set_mode(StepMode::Graph);
+        println!("placed unjoined capture graph_nodes={}", m.capture_step()?);
+        // The gemv arm: the decode step.
+        let decode = decode_run(&mut m, toks, false)?;
+        let mut ok = forced_calls(
+            "placed unjoined gemv arm, the batch set's steps",
+            (&decode.tokens, &decode.logits),
+            (&whole.tokens, &whole.logits),
+        )?;
+        // The gemv arm: a unit within its cut, against the fifth step.
+        fresh(&mut m)?;
+        let plan_p = m.prefill_plan(toks.len(), PrefillPath::Auto)?;
+        let tok = m.prefill_with(toks, PrefillPath::Auto)?;
+        let call = PathRun {
+            logits: vec![m.logits()?],
+            tokens: vec![tok],
+            stores: stores(&mut m)?,
+        };
+        let PathRun {
+            mut logits,
+            mut tokens,
+            stores: last_stores,
+        } = decode;
+        let fifth = PathRun {
+            logits: logits.pop().into_iter().collect(),
+            tokens: tokens.pop().into_iter().collect(),
+            stores: last_stores,
+        };
+        ok &= same_run(
+            &format!("placed unjoined: the prompt call ({plan_p}) vs the fifth graph step"),
+            &call,
+            &fifth,
+        );
+        // The wide arm: one unit past the gemv arm's cut.
+        fresh(&mut m)?;
+        let plan_w = m.prefill_plan(wide.len(), PrefillPath::Gemm)?;
+        let next = m.prefill_with(wide, PrefillPath::Gemm)?;
+        let next_logits = m.logits()?;
+        ok &= forced_calls(
+            &format!(
+                "placed unjoined wide arm, {} ids (plan={plan_w})",
+                wide.len()
+            ),
+            (&[next], std::slice::from_ref(&next_logits)),
+            (&[whole_wide.0], std::slice::from_ref(&whole_wide.1)),
+        )?;
+        println!("placed unjoined: {}", verdict(ok));
+        Ok(ok)
+    }
+
     const NAME: &str = "gate_qwen35moe_e2e";
 
     // ------------------------------------- (e) residency on the placed load
@@ -3887,6 +4222,15 @@ mod gate {
             }
             return Ok(());
         }
+        if std::env::args().any(|a| a == "--unjoined-placed-only") {
+            let (_, toks) = batch_set()?;
+            let ok = placed_unjoined(&toks, host)?;
+            println!("gate_qwen35moe_e2e --unjoined-placed-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if std::env::args().any(|a| a == "--residency-only") {
             let ok = residency(host)?;
             println!("gate_qwen35moe_e2e --residency-only: {}", verdict(ok));
@@ -3940,6 +4284,7 @@ mod gate {
         ok &= slots_two(&slots)?;
         ok &= placed(&man, &toks, host)?;
         ok &= placed_no_host(&man, &toks, host)?;
+        ok &= placed_unjoined(&toks, host)?;
         ok &= residency(host)?;
         ok &= q8_cache()?;
         println!("gate_qwen35moe_e2e: {}", verdict(ok));
