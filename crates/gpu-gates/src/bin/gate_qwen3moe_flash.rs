@@ -147,6 +147,20 @@
 //! group 16; at 4,096 the captured launch, `2 · n_kv` segment nodes of
 //! [`SEGMENTS`] blocks and one merge of `n_head` blocks, replaying the eager
 //! bits.
+//!
+//! The split entry ([`FlashGqaPrefill::enqueue_split`], the host-side form
+//! of the prefill flash for a group of any positive multiple of eight query
+//! heads a key head) at Bolt's 32/2 of 128, on seeded inputs as the prefill
+//! flash's own seeded clause (queries scaled by [`SEED_Q_SCALE`], counts
+//! `p0 + t + 1`, cache [`SEED_PAD`] rows taller) at `T` ∈ [`SPLIT_T`] ×
+//! `p0` ∈ [`SPLIT_P0`]: every row within its band of the exact attention
+//! over its key head `h / 16`; bit for bit the plain group-of-eight launch
+//! of the same queries over planes holding each key head twice, the twin
+//! built as the group-16 clause's; a rerun bit-identical and NaN cache rows
+//! past the largest count changing no bit; once, at `T` 65 and `p0` 63, the
+//! captured launch replaying the eager bits in `3 · group/8` nodes, a launch
+//! and two copies a sub-group; a group that is not a multiple of eight and a
+//! scratch shorter than the launch refused by name, nothing enqueued.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -161,7 +175,7 @@ mod gate {
         SEGMENTS, partials_ms_len, partials_v_len, seg_span,
     };
     use bloomery_gpu::flash_gqa_prefill::{
-        FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, KEY_TILE as PREF_TILE,
+        FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, KEY_TILE as PREF_TILE, SplitScratch,
     };
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{Gpu, GpuError, window};
@@ -1707,6 +1721,212 @@ mod gate {
         )
     }
 
+    /// The split clause's key heads and group (Nemotron 3.5 Bolt's 32/2),
+    /// and its seeded row counts and first positions.
+    const SPLIT_KV: usize = 2;
+    const SPLIT_GROUP: usize = 16;
+    const SPLIT_T: [usize; 4] = [1, 17, 65, 448];
+    const SPLIT_P0: [usize; 3] = [0, 63, 1000];
+
+    /// One `enqueue_split` launch of `n_keys.len()` rows at
+    /// [`SPLIT_GROUP`] query heads a key head over the cache planes, into
+    /// fresh output, read back.
+    fn run_split(
+        k: &FlashGqaPrefill,
+        gpu: &Gpu,
+        q: &DeviceBuffer<f32>,
+        n_keys: &[u32],
+        (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+        g: &Geom,
+        scratch: &mut SplitScratch,
+    ) -> Result<Vec<f32>, GateError> {
+        let stream = gpu.stream();
+        let (n_head, t) = (g.n_kv * SPLIT_GROUP, n_keys.len());
+        let nk = DeviceBuffer::from_host(stream, n_keys)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, t * n_head * HEAD)?;
+        k.enqueue_split(
+            stream,
+            GqaPrefillArgs {
+                q,
+                kc,
+                vc,
+                n_keys: &nk,
+                scale: g.scale,
+                n_head,
+                n_kv: g.n_kv,
+                ctx: g.ctx,
+                t,
+                fault: gpu.unlabelled_sink(),
+                y: &mut y,
+            },
+            scratch,
+        )?;
+        stream.synchronize()?;
+        Ok(y.to_host_vec(stream)?)
+    }
+
+    /// The split entry (module doc), at Bolt's shape on seeded inputs.
+    /// Returns whether every check passed.
+    fn prefill_split(k: &FlashGqaPrefill, gpu: &Gpu, scale: f32) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let (n_kv, group) = (SPLIT_KV, SPLIT_GROUP);
+        let n_head = n_kv * group;
+        // The launch's largest row count of the clause.
+        let mut scratch = SplitScratch::new(stream, SPLIT_T[3], n_kv)?;
+        let mut ok = true;
+        let mut seed = 401u32;
+        for &p0 in &SPLIT_P0 {
+            for &t in &SPLIT_T {
+                seed += 3;
+                let ctx = p0 + t + SEED_PAD;
+                let g = Geom { scale, n_kv, ctx };
+                let q: Vec<f32> = activations(HEAD, t * n_head, seed)
+                    .into_iter()
+                    .map(|v| v * SEED_Q_SCALE)
+                    .collect();
+                let c = cache(stream, HEAD, n_kv, ctx, p0 + t, seed + 1)?;
+                let qd = DeviceBuffer::from_host(stream, &q)?;
+                let counts: Vec<u32> = (0..t)
+                    .map(|i| u32::try_from(p0 + i + 1))
+                    .collect::<Result<_, _>>()?;
+                let y = run_split(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g, &mut scratch)?;
+                let y2 = run_split(k, gpu, &qd, &counts, (&c.kc, &c.vc), &g, &mut scratch)?;
+                let y_nan = run_split(k, gpu, &qd, &counts, (&c.kn, &c.vn), &g, &mut scratch)?;
+                let (rerun, nan_same) = (bits_equal(&y, &y2), bits_equal(&y, &y_nan));
+                let cu: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
+                let (band, worst) =
+                    judge_prefill::<HEAD, PREF_TILE>(&q, &cu, &c.host, &y, g.scale, (n_head, n_kv));
+                // Each key head's plane twice: twin key head `j` is `j / 2`,
+                // so head `h` of the twin's group-of-eight launch reads the
+                // real key head `h / 16`.
+                let twice = |b: &[u16]| -> Vec<u16> {
+                    b.chunks(ctx * HEAD)
+                        .flat_map(|p| p.iter().chain(p).copied())
+                        .collect()
+                };
+                let (tk, tv) = (
+                    DeviceBuffer::from_host(stream, &twice(&c.kb))?,
+                    DeviceBuffer::from_host(stream, &twice(&c.vb))?,
+                );
+                let g_twin = Geom {
+                    scale,
+                    n_kv: n_head / GROUP,
+                    ctx,
+                };
+                let twin = bits_equal(&y, &run_pref(k, gpu, &qd, &counts, (&tk, &tv), &g_twin)?);
+                let pass = band && twin && rerun && nan_same;
+                println!(
+                    "prefill split T={t} p0={p0} ctx={ctx}: measured/bound {worst:.3e} band={band} \
+                     group8_twin_bits={twin} rerun={rerun} nan_padding_same={nan_same} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+                if (t, p0) == (65, 63) {
+                    let nk = DeviceBuffer::from_host(stream, &counts)?;
+                    let mut yg = DeviceBuffer::<f32>::zeroed(stream, t * n_head * HEAD)?;
+                    let graph = gpu.capture(|s| {
+                        k.enqueue_split(
+                            s,
+                            GqaPrefillArgs {
+                                q: &qd,
+                                kc: &c.kc,
+                                vc: &c.vc,
+                                n_keys: &nk,
+                                scale,
+                                n_head,
+                                n_kv,
+                                ctx,
+                                t,
+                                fault: gpu.unlabelled_sink(),
+                                y: &mut yg,
+                            },
+                            &mut scratch,
+                        )
+                    })?;
+                    graph.launch(stream)?;
+                    stream.synchronize()?;
+                    let same = bits_equal(&yg.to_host_vec(stream)?, &y);
+                    let nodes = graph.node_count();
+                    // A sub-group is a launch, a query copy in and an output
+                    // copy out.
+                    let graph_ok = same && nodes == 3 * (group / GROUP);
+                    println!(
+                        "prefill split graph T={t} p0={p0}: eager_vs_graph_bit_identical={same} \
+                         graph_nodes={nodes} {}",
+                        verdict(graph_ok)
+                    );
+                    ok &= graph_ok;
+                }
+            }
+        }
+
+        // The refusals (module doc): a group that is not a multiple of
+        // eight, and a scratch one row short of the launch.
+        let (t, p0) = (17usize, 63usize);
+        let ctx = p0 + t + SEED_PAD;
+        let q = activations(HEAD, t * n_head, 451);
+        let kb: Vec<u16> = activations(HEAD, n_kv * ctx, 452)
+            .into_iter()
+            .map(f32_to_f16_bits)
+            .collect();
+        let vb: Vec<u16> = activations(HEAD, n_kv * ctx, 453)
+            .into_iter()
+            .map(f32_to_f16_bits)
+            .collect();
+        let (kc, vc) = (
+            DeviceBuffer::from_host(stream, &kb)?,
+            DeviceBuffer::from_host(stream, &vb)?,
+        );
+        let qd = DeviceBuffer::from_host(stream, &q)?;
+        let counts: Vec<u32> = (0..t)
+            .map(|i| u32::try_from(p0 + i + 1))
+            .collect::<Result<_, _>>()?;
+        let nk = DeviceBuffer::from_host(stream, &counts)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, t * n_head * HEAD)?;
+        let mut short = SplitScratch::new(stream, t - 1, n_kv)?;
+        for (name, heads, needle, scr) in [
+            (
+                "a group of 12 over 2 key heads",
+                n_kv * 12,
+                "multiple of",
+                &mut scratch,
+            ),
+            ("a scratch one row short", n_head, "scratch", &mut short),
+        ] {
+            let r = k.enqueue_split(
+                stream,
+                GqaPrefillArgs {
+                    q: &qd,
+                    kc: &kc,
+                    vc: &vc,
+                    n_keys: &nk,
+                    scale,
+                    n_head: heads,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault: gpu.unlabelled_sink(),
+                    y: &mut y,
+                },
+                scr,
+            );
+            let named = matches!(
+                &r,
+                Err(GpuError::Shape {
+                    what: "flash_gqa_prefill::enqueue_split",
+                    detail,
+                }) if detail.contains(needle)
+            );
+            println!(
+                "prefill split refusal {name}: {} {}",
+                r.err().map_or("accepted".to_string(), |e| e.to_string()),
+                verdict(named)
+            );
+            ok &= named;
+        }
+        Ok(ok)
+    }
+
     /// One pass's measured-over-bound ratios over a set, and the plain
     /// relative distance to ik.
     #[derive(Default)]
@@ -2216,6 +2436,9 @@ mod gate {
             verdict(seeded_ok)
         );
         ok &= seeded_ok;
+        let split_ok = prefill_split(&kp, &gpu, scale)?;
+        println!("prefill flash split {}", verdict(split_ok));
+        ok &= split_ok;
         ok &= q8_window_refusal(&kp, &gpu, scale)?;
         ok &= group5(&k, &gpu, scale)?;
         ok &= group16(&k, &gpu, scale)?;
