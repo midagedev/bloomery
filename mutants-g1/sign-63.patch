@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/gemm/grouped.rs
++++ b/crates/gpu/src/gemm/grouped.rs
+@@ -1316,7 +1316,7 @@
+ /// `aux` its aux word.
+ #[inline(always)]
+ pub(super) fn iq2xxs_lane(idx: u32, aux: u32, t: u32) -> (u32, u32, u32) {
+-    let sgn = |g: u32| sign_mask4(signs_of((aux >> (7 * g)) & 127) >> (4 * (t & 1)));
++    let sgn = |g: u32| sign_mask4(signs_of((aux >> (7 * g)) & 63) >> (4 * (t & 1)));
+     (
+         signed4(
+             iq2xxs_grid_half(idx >> (8 * (t / 2)), t & 1),

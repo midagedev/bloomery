@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/gemm/grouped.rs
++++ b/crates/gpu/src/gemm/grouped.rs
+@@ -1326,7 +1326,7 @@
+             iq2xxs_grid_half(idx >> (8 * (2 + t / 2)), t & 1),
+             sgn(2 + t / 2),
+         ),
+-        ((aux >> 28) << 1) | 1,
++        (aux >> 28) << 1,
+     )
+ }
+ 
