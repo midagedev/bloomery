@@ -1,0 +1,36 @@
+# nvf4b head (this tree: origin/bolt-r7 49a2bf3af + gemm_nvfp4p's two 16-value sub-block sums as
+# mma.m16n8k16 s8 (no zeroed half, so no [a0, a1, 0, 0] quad copy before every mma) and one branch-free
+# stretch of the eight n-tiles per step (a full tile, both blocks present)); every output bit as before
+# (gate_gemm g32_nvfp4_dense contract_bits_differ=0 on all 16 shapes).
+# SASS [counted at build time, ptxas 13.3 sm_86, tools/sass-scan.sh --step auto --bars-per-step 1, one warp
+# step of a full tile; not a runtime number]: gemm_nvfp4p 713 -> 583 instructions (-18 %): IMAD 113 -> 63,
+# CS2R 36 -> 2, BRA/WARPSYNC 45 -> 16; IMMA 32 -> 32, FP32 194 -> 194, I2FP 128 -> 128 (the epilogue's 322
+# instructions are now 55 % of the step); static stall sum 1475 -> 886 (-40 %); registers 114 -> 128 (the cap
+# of launch_bounds(256, 2)), spill 0, jit_local 0, 2 blocks/SM as before.
+# Terms [derived from the ncu record perf-nvfp4p-ncu.md and s2674]: the step is latency the resident warps
+# do not hide (issue 0.55 a scheduler, tensor 36 %, DRAM 31 %, L1TEX 58 %; warp cycles / instruction 7.14;
+# no eligible warp 45.5 % of cycles), so a warp step's window is 4 x I issue cycles plus the idle D that all
+# four resident warps share: old 4 x 713 = 2852 + D = 5090 (D = 2238, 44 %: ncu's 45.5 %). New I = 583:
+# 2332 + D. D unchanged: 4570 (x0.90); D scaled by the static stalls 886/1475 = 0.60: 2332 + 1344 = 3676
+# (x0.72); CPI held at 7.14: 583/713 (x0.82, the point). Of the class's 686.2 ms (s2674, P = 4096, passes
+# = 2, A6000): -69..-191 ms, point -125 ms, of the prompt's 1944.9 ms (2106.0 tok/s).
+# The tensor term halves only if IMMA.16816 takes half of IMMA.16832's cycles; not claimed (36 % either way
+# is under the step).
+kind: ab
+question: does the branch-free k16 step lift pp4096 on the A6000, the class-time term derived above?
+term: pp tok/s @ P = 4096 (kind=gemm, passes=2, default ubatch), Nemotron 3.5 Bolt, RTX A6000, this tree's
+  build against the build of origin/bolt-r7 49a2bf3af, interleaved arms
+unit: %
+predict: 3.5..11
+rounds: 4
+condition: one lease, BLOOMERY_CARD=a6000, BLOOMERY_TIMING_GPU = the A6000, both arms the same generate
+  binary built at their commit (the base arm a bin: of a build of 49a2bf3af in its own remote dir), n = 4
+  rounds with the runner's rotating arm order, the witness block clean (no [cpu-busy], no [other-busy], sm
+  clock and clock-event mask printed at start and end: the 3090's cap is a different row)
+decide-in: +3.5..+11 %: the term is the instruction count and the chains as derived; land, then the
+  epilogue's I2FP/FMUL/FFMA (55 % of the step) is the next kernel-body term
+decide-below: under +3.5 %: the step's idle is not chain latency (barrier or fetch skew): ncu the entry
+  (tools/ref/ncu-gpu.sh) for the warp-state split (barrier, short scoreboard, no instruction) before another
+  kernel-body round
+decide-above: beyond +11 %: a term besides gemm_nvfp4p moved (clock, the other classes): read the eager
+  split of both arms before crediting
