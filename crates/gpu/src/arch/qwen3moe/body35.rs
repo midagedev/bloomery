@@ -111,6 +111,7 @@ use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Chain, SlotMap};
 use crate::linear::{self, LinearShape};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, SeqRope};
+use crate::model::fit::{FIT_RESERVE, largest_fit};
 use crate::model::{
     ChainBody, GpuModel, HostServed, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
     refuse_stage_rows_past,
@@ -136,14 +137,6 @@ use std::sync::Arc;
 use vision::mrope::MropeSeq;
 
 const WHAT: &str = "qwen35moe::Body35::load";
-
-/// Card bytes a load leaves free past the ubatch arena: what the load and
-/// the first prompt still allocate after it — the output head and the
-/// heads of a pass of up to [`MAX_PASS_ROWS`] rows (a vocabulary of logits
-/// each, some 8 MB together), the captured step and passes, and the
-/// allocator's rounding of the arena's some forty buffers to its 2 MiB
-/// pages (at most 80 MiB) — with the rest as margin.
-pub const FIT_RESERVE: usize = 256 << 20;
 
 // The family's no-probe floor ([`Body35::STREAM_FLOOR`]) is past every
 // unit the gemv arm walks — a pass's [`MAX_PASS_ROWS`] and the step's one
@@ -280,12 +273,15 @@ fn ubatch_arena(
     const WHAT_FIT: &str = "qwen35moe::ubatch_arena";
     let (rows, need) = ubatch_need(&d, forms, u);
     if need + FIT_RESERVE > free {
-        let fits = (1..u)
-            .rev()
-            .find(|&v| ubatch_need(&d, forms, v).1 + FIT_RESERVE <= free)
-            .map_or("no ubatch size fits".to_string(), |v| {
-                format!("ubatches of {v} tokens fit")
-            });
+        let fits = largest_fit(
+            (1..u).rev(),
+            |v| ubatch_need(&d, forms, v).1,
+            free,
+            FIT_RESERVE,
+        )
+        .map_or("no ubatch size fits".to_string(), |v| {
+            format!("ubatches of {v} tokens fit")
+        });
         return Err(GpuError::shape(
             WHAT_FIT,
             format!(

@@ -75,6 +75,16 @@
 //!   more, all but the last id through `prefill`, the last as one step, under
 //!   the same gate: this holds the scan states, the conv rings and the K/V rows
 //!   a pass leaves to the step after it. A one-id prompt is skipped by name.
+//! - `prefill_pass_size_invariant` (self-consistency): one walk of the most
+//!   ids that keep every pass past the gemv arm's eight rows at two pass
+//!   sizes — the load's own rows and half of them — through
+//!   `GpuModel::prefill_with` from a reset: the final logits and the greedy
+//!   id bit-equal, the pass size moving no bit (the GEMMs accumulate each
+//!   (slot, row) over K blocks in increasing k whatever tile it lands in,
+//!   and the router, the quantizers, the flash split and the scan work per
+//!   row; the scan state, the conv ring and the K/V rows carry across
+//!   passes in memory). The sizes are the load's own choice
+//!   (`NemotronHMoeModel::pass_rows`), whatever the card's room gave it.
 //!
 //! A set absent from the box, dumped from another fixture or build, or
 //! unfinished ends the gate by name before the card loads.
@@ -94,10 +104,12 @@ mod e2e;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use crate::e2e::{Run, argmax, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
+    use crate::e2e::{
+        argmax, feed, finite, fresh, histogram, or_fault, same, same_bits, top_ids, walk,
+    };
     use bloomery_gpu::arch::nemotron_h_moe::Routing;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel};
+    use bloomery_gpu::{Gpu, NemotronHMoeModel};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, open_split, verdict};
@@ -213,6 +225,11 @@ mod gate {
             "prefill_then_step_near_mainlines_real",
             Tag::Oracle,
             prefill_then_step_near_mainlines_real,
+        ),
+        (
+            "prefill_pass_size_invariant",
+            Tag::SelfConsistency,
+            prefill_pass_size_invariant,
         ),
         ("fault_word_clean", Tag::SelfConsistency, fault_word_clean),
     ];
@@ -1014,6 +1031,67 @@ mod gate {
         prefill_near_t(m, case, ("prefill_then_step_near_mainlines_real", true, 1))
     }
 
+    // ------------------------------------------- prefill_pass_size_invariant
+
+    /// One walk through [`GpuModel::prefill_with`] at two pass sizes — the
+    /// load's own rows (`pass_rows`) and half of them — over the most ids
+    /// that keep every pass, tail included, past the gemv arm's eight rows
+    /// at both sizes: the final logits and the greedy id bit-equal (module
+    /// doc). The walk is the clause's own, so no set is read and both tiers
+    /// run it; a load whose rows leave no such pair is skipped by name.
+    fn prefill_pass_size_invariant(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        const CLAUSE: &str = "prefill_pass_size_invariant";
+        // The multi-column gemv arm's most columns: a pass past it runs the
+        // GEMMs, whose sums no pass size may move.
+        const ARM: usize = 8;
+        let cap = m
+            .pass_rows()
+            .map_err(|e| format!("{CLAUSE}: the pass rows: {e}"))?;
+        let small = cap / 2;
+        if small <= ARM {
+            println!("{CLAUSE}: the load's {cap} rows leave no second size past {ARM}, skipped");
+            return Ok(true);
+        }
+        let ctx = m.ctx_max();
+        let Some(n) = (ARM + 1..=ctx).rev().find(|&n| {
+            let whole = |rows: usize| n % rows == 0 || n % rows > ARM;
+            n > small && whole(small) && whole(cap)
+        }) else {
+            println!(
+                "{CLAUSE}: no walk of the {ctx}-row context keeps every pass past {ARM} at \
+                 {small} and {cap} rows, skipped"
+            );
+            return Ok(true);
+        };
+        let ids = walk(n, case.hp.n_vocab);
+        let mut runs = Vec::with_capacity(2);
+        for rows in [small, cap] {
+            m.reset()?;
+            let Some(id) = or_fault(CLAUSE, "the walk", m.prefill_with(&ids, rows))? else {
+                return Ok(false);
+            };
+            let logits = m.logits()?;
+            if !logits.iter().all(|v| v.is_finite()) {
+                println!("{CLAUSE}: rows {rows}: a non-finite logit FAIL");
+                return Ok(false);
+            }
+            runs.push((id, logits));
+        }
+        let [(id_a, logits_a), (id_b, logits_b)] = &runs[..] else {
+            return Err(format!("{CLAUSE}: two runs").into());
+        };
+        let bits = same_bits(logits_a, logits_b);
+        let pass = id_a == id_b && bits;
+        println!(
+            "{CLAUSE}: walk{n} at rows {small} ({} passes) and {cap} ({} passes): ids {id_a} \
+             {id_b}, logits bit-identical {bits} {}",
+            n.div_ceil(small),
+            n.div_ceil(cap),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     fn fault_word_clean(m: &mut Model, _case: &Case) -> Result<bool, GateError> {
         let fault = m.gpu().fault()?;
         let pass = fault.is_none() && m.poisoned().is_none();
@@ -1064,8 +1142,9 @@ mod gate {
         let t = std::time::Instant::now();
         let mut m = Model::open(Gpu::new()?, file, ctx)?;
         println!(
-            "load resident_bytes={} ctx={ctx} layers={} in {:.1} s (runtime value)",
+            "load resident_bytes={} ctx={ctx} pass_rows={} layers={} in {:.1} s (runtime value)",
             m.resident_bytes(),
+            m.pass_rows()?,
             m.layers().len(),
             t.elapsed().as_secs_f64()
         );

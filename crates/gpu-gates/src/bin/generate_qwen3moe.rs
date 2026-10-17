@@ -10,15 +10,18 @@
 //! (`NemotronHModel::prefill`, passes of up to 512 ids: `--prefill auto`, the
 //! default, or `gemm`) or as steps through the captured step chain
 //! (`--prefill pass` or `step`); a nemotron_h_moe (Nemotron 3.5 Bolt) file
-//! the same, its prompt call `NemotronHMoeModel::prefill` (passes of up to
-//! its `PASS_ROWS` ids). `--place`, `--seed-depth`, more than one
-//! slot, a draft and the qwen family's expert, K/V and residency levers are
-//! refused by name before the load.
+//! the same, its prompt call `NemotronHMoeModel::prefill` in passes of the
+//! rows the load chose from the card's room (a multiple of 64 up to
+//! `PASS_ROWS_MAX` 2048, at most the context: `NemotronHMoeModel::pass_rows`
+//! reads it), `--pass-rows N` naming the rows for a same-binary arm (exactly
+//! N or a refusal by name, never shrunk). `--place`, `--seed-depth`, more than
+//! one slot, a draft and the qwen family's expert, K/V and residency levers
+//! are refused by name before the load; `--pass-rows` on any other family too.
 //!
 //!     generate_qwen3moe (--prompt <text> | --tokens a,b,c | --seed-depth D)
 //!                       [-n N] [--ctx C] [--mode eager|graph]
 //!                       [--prefill auto|pass|gemm|step] [--place a|gate|bp|<cards>]
-//!                       [--time [--warm W]] [--logits] [--last-step] [--logit-rows FILE]
+//!                       [--pass-rows N] [--time [--warm W]] [--logits] [--last-step] [--logit-rows FILE]
 //!     generate_qwen3moe --arm a,b,c[/N] [--arm ...] [--arm-sync] [-n N] [--ctx C] ...
 //!     generate_qwen3moe --dump-taps DIR --tokens-file F [--tokens-file F ...]
 //!                       --seqs S --prompt-len P [-n N] [--ctx C]
@@ -405,7 +408,7 @@ mod cli {
     use app::mtp::{MtpBody, MtpDraft, WindowDraft};
     use app::{Session, SessionError};
     use bloomery_gpu::arch::nemotron_h::{Body as BodyNh, PASS_ROWS as NH_PASS_ROWS};
-    use bloomery_gpu::arch::nemotron_h_moe::{Body as BodyNhMoe, PASS_ROWS as BOLT_PASS_ROWS};
+    use bloomery_gpu::arch::nemotron_h_moe::{Body as BodyNhMoe, PASS_ROWS_MAX};
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for};
     use bloomery_gpu::arch::qwen3moe::{
@@ -793,8 +796,9 @@ mod cli {
     }
 
     /// The nemotron_h_moe body's prompt paths, the nemotron_h ones: the body's
-    /// prompt call (`NemotronHMoeModel::prefill`, passes of up to
-    /// [`BOLT_PASS_ROWS`] ids) and the captured step chain.
+    /// prompt call (`NemotronHMoeModel::prefill`, passes of the rows the load
+    /// chose from the card's room — [`NemotronHMoeModel::pass_rows`], or the
+    /// rows `--pass-rows` named) and the captured step chain.
     impl Prompted for BodyNhMoe {
         type Path = PromptNh;
 
@@ -815,7 +819,9 @@ mod cli {
         fn plan(m: &NemotronHMoeModel, n: usize, path: PromptNh) -> Result<Units, GateError> {
             Ok(match path {
                 PromptNh::Passes => {
-                    let rows = BOLT_PASS_ROWS.min(m.ctx_max());
+                    let rows = m
+                        .pass_rows()
+                        .map_err(|e| format!("the nemotron_h_moe pass rows: {e}"))?;
                     Units {
                         text: format!("rows:{rows} x{}", n.div_ceil(rows)),
                         count: n.div_ceil(rows),
@@ -1583,6 +1589,36 @@ mod cli {
         };
         let t = Instant::now();
         let (file, family) = open_file()?;
+        // The Bolt prefill pass's rows: `--pass-rows` names them, a same-binary
+        // arm of a timing round, and the load takes exactly those or refuses
+        // by name; unset, the load's chooser picks from the card's room.
+        // Every other family refuses the flag by name, and a value outside
+        // `1..=PASS_ROWS_MAX` (at 64 past it a multiple of 64) is refused
+        // before the load.
+        let pass_rows: Option<usize> = match (family, flag("--pass-rows")?) {
+            (Family::NemotronHMoe, Some(word)) => {
+                let n: usize = word
+                    .parse()
+                    .map_err(|_| format!("--pass-rows {word}: a row count"))?;
+                if n == 0 || n > PASS_ROWS_MAX || (n >= 64 && !n.is_multiple_of(64)) {
+                    return Err(format!(
+                        "--pass-rows {n}: a pass holds 1..={PASS_ROWS_MAX} rows, at 64 past it \
+                         a multiple of 64"
+                    )
+                    .into());
+                }
+                Some(n)
+            }
+            (_, Some(word)) => {
+                return Err(format!(
+                    "--pass-rows {word}: the nemotron_h_moe body's pass size; this run opens \
+                     {}'s file",
+                    family.name()
+                )
+                .into());
+            }
+            (_, None) => None,
+        };
         let prefill = prefill.as_deref();
         let arms: Vec<Arm> = if arm_specs.is_empty() {
             let ids: Vec<u32> = match (&text, &tokens, seed_depth) {
@@ -1942,7 +1978,11 @@ mod cli {
                 }
             }
             Chosen::NemotronHMoe(path) => {
-                let m = open_nemotron(|g| NemotronHMoeModel::open(g, file, ctx), (ctx, mode), t)?;
+                let m = open_nemotron(
+                    |g| NemotronHMoeModel::open_with_pass_rows(g, file, ctx, pass_rows),
+                    (ctx, mode),
+                    t,
+                )?;
                 drive(m, &run, path, &arms, listed, sync)
             }
             Chosen::NemotronH(path) => {

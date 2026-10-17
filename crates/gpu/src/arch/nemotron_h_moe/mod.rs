@@ -29,4 +29,4 @@ pub mod router;
 pub use crate::arch::hybrid::DecodeInput;
 pub use body::Body;
 pub use moe::Routing;
-pub use prefill::PASS_ROWS;
+pub use prefill::PASS_ROWS_MAX;

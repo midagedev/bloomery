@@ -26,6 +26,7 @@
 //! [`Instrumented`] (a synthetic depth) and [`Probed`] (the node-price probe).
 
 mod errors;
+pub(crate) mod fit;
 pub(crate) mod kernels;
 pub(crate) mod lookup;
 pub(crate) mod probe;

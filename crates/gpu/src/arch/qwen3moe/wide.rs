@@ -50,11 +50,12 @@ use super::scratch::{
 use super::taps35::Ffn35Run;
 use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
 use crate::gated_quant::GateLayout;
-use crate::gemm::{GEMM_BN, GEMM_MAX_SLOTS, GEMM32_STEP, Gemm32Kernels, GemmInput, GemmRoute};
+use crate::gemm::{GEMM_MAX_SLOTS, Gemm32Kernels, GemmInput, GemmRoute};
 use crate::host::xstream::RingLayer;
 use crate::hybrid::HOST;
 use crate::kquant::Act;
 use crate::linear::{self, LinearShape};
+use crate::model::fit::{act_col_bytes, act32_col_bytes, route_bytes};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::model::{GpuModel, MAX_PASS_ROWS};
 use crate::q38::OutGateArgs;
@@ -221,32 +222,9 @@ impl Wide {
     }
 }
 
-/// Bytes of one q8_1 activation column of `k` values, a `Q8Act`'s or a
-/// `GemmAct`'s: the q3 pairs (u64), the q4 and q6 permutations, the 32-value
-/// code sums and the 128-value scales.
-pub(super) fn act_col_bytes(k: usize) -> usize {
-    let n_sb = k / 256;
-    64 * n_sb.div_ceil(2) * 8
-        + (256 * n_sb.div_ceil(4) + 128 * n_sb.div_ceil(2)) * 4
-        + 10 * n_sb * 4
-}
-
-/// Bytes of one `GemmAct32` column of `k` values: per 64-value step sixteen
-/// code words, two scales and two sums.
-fn act32_col_bytes(k: usize) -> usize {
-    k.div_ceil(GEMM32_STEP) * (16 + 2 + 2) * 4
-}
-
 /// Bytes of one wide input's forms `want` over `cols` columns of `k`.
 fn wants_bytes(want: Wants, cols: usize, k: usize) -> usize {
     cols * (usize::from(want.q128) * act_col_bytes(k) + usize::from(want.q32) * act32_col_bytes(k))
-}
-
-/// Bytes of a route table for `slots` slots over `experts` experts.
-pub(super) fn route_bytes(slots: usize, experts: usize) -> usize {
-    let tiles = slots / GEMM_BN + experts.min(slots);
-    let zeros = if experts == 1 { slots } else { 0 };
-    (slots + 2 * tiles + 2 + zeros) * 4
 }
 
 /// Bytes of a delta layer's intermediates for `rows` tokens
