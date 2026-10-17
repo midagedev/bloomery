@@ -1,7 +1,8 @@
 //! The seats' flags as llama-server spells them: the context flag's
-//! spellings ([`CTX`]), a flag's number, whose refusal names the flag and
-//! the value ([`number`]), and the API keys ([`ApiKeys`]) both key flags add
-//! to and every request of both servers is checked against.
+//! spellings ([`CTX`]), the prompt pass size's ([`UBATCH`]), a flag's number,
+//! whose refusal names the flag and the value ([`number`]), and the API keys
+//! ([`ApiKeys`]) both key flags add to and every request of both servers is
+//! checked against.
 
 use std::fmt::Display;
 use std::str::FromStr;
@@ -9,6 +10,12 @@ use std::str::FromStr;
 /// The spellings of the context flag: `--ctx`, and llama-server's
 /// `--ctx-size` and `-c`.
 pub const CTX: [&str; 3] = ["--ctx", "--ctx-size", "-c"];
+
+/// The spellings of the prompt pass's size flag: `--ubatch-size` and
+/// llama-server's `-ub`. Unset, a seat's load chooses the rows from the
+/// card's room; set, the seat takes exactly those rows or refuses by name
+/// with the free bytes, the need and the largest size that fits.
+pub const UBATCH: [&str; 2] = ["--ubatch-size", "-ub"];
 
 /// The spellings of the key flags: `--api-key` and `--api-key-file`.
 pub const KEYS: [&str; 2] = ["--api-key", "--api-key-file"];
@@ -146,7 +153,7 @@ fn csv_row(v: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiKeys, CTX, KEYS, csv_row, number};
+    use super::{ApiKeys, CTX, KEYS, UBATCH, csv_row, number};
 
     #[test]
     fn the_context_flag_takes_llama_servers_spellings() {
@@ -154,6 +161,14 @@ mod tests {
             assert!(CTX.contains(&f), "{f}");
         }
         assert!(!CTX.contains(&"-C"));
+    }
+
+    #[test]
+    fn the_ubatch_flag_takes_llama_servers_spellings() {
+        for f in ["--ubatch-size", "-ub"] {
+            assert!(UBATCH.contains(&f), "{f}");
+        }
+        assert!(!UBATCH.contains(&"-u"));
     }
 
     #[test]

@@ -16,10 +16,11 @@
 //! readback interleaves them into a position's row of the taps' layers in
 //! the order they were named.
 
-use super::body35::{Body35, FIT_RESERVE};
+use super::body35::Body35;
 use super::prefill::PrefillPath;
 use super::program::{NoLeg, Program, Stores};
 use crate::model::GpuModel;
+use crate::model::fit::FIT_RESERVE;
 use crate::tensor::{Window, WindowMut};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};

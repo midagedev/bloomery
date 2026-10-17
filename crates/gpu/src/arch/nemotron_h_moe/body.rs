@@ -25,7 +25,7 @@ use model::arch::nemotron_h_moe::hparams::{Hparams, Kind};
 use model::arch::nemotron_h_moe::names;
 use std::ops::Range;
 
-use super::prefill::{PASS_ROWS, Prompt};
+use super::prefill::{PassSizes, Prompt, choose_pass_rows};
 use super::router::Routers;
 
 const WHAT: &str = "nemotron_h_moe::Body::load";
@@ -84,17 +84,39 @@ impl GpuModel<Body> {
     /// every tensor in its kernels' device format (the IQ2_XXS stacks in the
     /// file's blocks), K/V planes of `ctx` rows a key head, the scan stores,
     /// the routers' results and the step scratch. The model takes the file
-    /// and closes it once the weights are resident.
+    /// and closes it once the weights are resident. The prompt pass's rows
+    /// are chosen at load from the card's room
+    /// ([`choose_pass_rows`](super::prefill)): the largest that fits, at
+    /// most [`PASS_ROWS_MAX`](super::prefill::PASS_ROWS_MAX).
     pub fn open(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
+        Self::open_with_pass_rows(gpu, file, ctx, None)
+    }
+
+    /// [`GpuModel::open`](GpuModel::<Body>::open) with the prompt pass's rows
+    /// as the user named them: `None` is the chooser's, `Some(rows)` exactly
+    /// those or a named refusal (the free bytes, the need, the largest size
+    /// that fits), never shrunk.
+    pub fn open_with_pass_rows(
+        gpu: Gpu,
+        file: Split,
+        ctx: usize,
+        pass_rows: Option<usize>,
+    ) -> Result<GpuModel<Body>, GpuError> {
         let n_layers = block_count(&file, "nemotron_h_moe GpuModel::open")?;
         GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
-            Body::load(gpu, &file, w, ctx)
+            Body::load(gpu, &file, w, ctx, pass_rows)
         })
     }
 }
 
 impl Body {
-    fn load(gpu: &Gpu, file: &Split, w: &mut Weights, ctx: usize) -> Result<Body, GpuError> {
+    fn load(
+        gpu: &Gpu,
+        file: &Split,
+        w: &mut Weights,
+        ctx: usize,
+        pass_rows: Option<usize>,
+    ) -> Result<Body, GpuError> {
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
         // A companion `.scale` is read for NVFP4 projections only
         // (weights::tensor_scale); a scaled Q8_0 ssm_in/ssm_out would enter
@@ -188,7 +210,12 @@ impl Body {
             })
             .max()
             .unwrap_or(0);
-        let prompt = Prompt::new(stream, PASS_ROWS.min(ctx), (&sh, moe, hp.n_head), &layers)?;
+        // The pass's rows come from the card's room after the weights, the
+        // stores and the acts are resident: the largest pass whose buffers
+        // fit what is left, before anything after them allocates.
+        let sizes = PassSizes::of((&sh, moe, hp.n_head), &layers);
+        let rows = choose_pass_rows(&sizes, (ctx, pass_rows), gpu.alloc_room()?)?;
+        let prompt = Prompt::new(stream, &sizes, rows)?;
         let ctx_ = gpu.context();
         Ok(Body {
             prompt,

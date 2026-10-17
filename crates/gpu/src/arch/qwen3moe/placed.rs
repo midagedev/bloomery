@@ -66,7 +66,7 @@ use super::plan::{
 };
 use super::program::{Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Forms, Io};
-use super::wide::{self, CardRoute, GEMV_COLS, HostSide, act_col_bytes, arena_bytes, route_bytes};
+use super::wide::{self, CardRoute, GEMV_COLS, HostSide, arena_bytes};
 use crate::gemm::{Gemm32Kernels, GemmRoute};
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::prompt_stream::PromptStream;
@@ -79,6 +79,7 @@ use crate::host::xstream::{self, Costs, LAND_BATCHES, LandBatch, RingLayer, XCfg
 use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid, SlotMap};
 use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
+use crate::model::fit::{act_col_bytes, route_bytes};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q4k_sel::QuantSel;
 use crate::site;

@@ -1,5 +1,6 @@
-//! The prompt path: a prompt runs layer-major over passes of up to
-//! [`PASS_ROWS`] ids, each launch over the pass's rows.
+//! The prompt path: a prompt runs layer-major over passes of the rows the
+//! load chose ([`choose_pass_rows`]: at most [`PASS_ROWS_MAX`]), each
+//! launch over the pass's rows.
 //!
 //! - a projection is its site's gemv over column runs of at most
 //!   [`COLS`] rows ([`project_rows`]): Q8_0 `q8_0_gemv_mcol` on the f32 rows,
@@ -26,10 +27,11 @@
 //! rings and the K/V planes) and the position are those of the prompt's ids
 //! run as steps; the next step continues from them.
 //!
-//! The pass's rows live in [`Prompt`], cut at load for the most rows a pass
-//! takes, so a pass allocates nothing. A run's multi-column gemv sums each
-//! output as the one-column gemv of its family does, so how far a pass's
-//! rows agree with the steps' is the multi-column launches' own contract.
+//! The pass's rows live in [`Prompt`], cut at load for the rows the card's
+//! room holds ([`choose_pass_rows`]), so a pass allocates nothing. A run's
+//! multi-column gemv sums each output as the one-column gemv of its family
+//! does, so how far a pass's rows agree with the steps' is the
+//! multi-column launches' own contract.
 
 use super::body::{Body, Layer};
 use super::moe::{MoeLayer, MoeShape};
@@ -38,8 +40,9 @@ use super::router::{COUNTS, TOP_K};
 use crate::arch::hybrid::{RowBuffers, Shape, Site, norm_rows, residual_rows};
 use crate::fault::FaultSink;
 use crate::flash::PlaneAppend;
-use crate::flash_gqa::HEAD;
+use crate::flash_gqa::{HEAD, partials_ms_len, partials_v_len};
 use crate::flash_gqa_prefill::{GqaPrefillArgs, SplitScratch};
+use crate::gemm::GEMM_MAX_SLOTS;
 use crate::gemm::Gemm32Kernels;
 use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::head::Head;
@@ -47,6 +50,7 @@ use crate::iq_sel::IqSelKernels;
 use crate::kquant::SelDown;
 use crate::mamba2::Mamba2PassScratch;
 use crate::model::GpuModel;
+use crate::model::fit::{FIT_RESERVE, act_col_bytes, act32_col_bytes, largest_fit, route_bytes};
 use crate::q38::EmbedQ8Args;
 use crate::site::{self, SiteTy};
 use crate::site::{KGemvKernels, SiteWeight, WideActs, WideKernels};
@@ -59,12 +63,243 @@ use gguf::GgmlType;
 const WHAT: &str = "nemotron_h_moe::prefill";
 
 /// The most ids one pass of [`GpuModel::prefill`] takes: the most whose
-/// `TOP_K` slots a q8_1 slot form holds.
-pub const PASS_ROWS: usize = 448;
-const _: () = assert!(TOP_K * PASS_ROWS <= crate::tensor::Q8ACT_MAX_SLOTS);
+/// `TOP_K` slots one route table and one GEMM form hold
+/// ([`GemmRoute::new`], [`GemmAct::new`]); the pass's rows themselves are
+/// chosen at load ([`choose_pass_rows`]).
+pub const PASS_ROWS_MAX: usize = 2048;
+const _: () = assert!(TOP_K * PASS_ROWS_MAX <= GEMM_MAX_SLOTS);
 
 /// The columns one gemv run takes: the multi-column gemvs' most.
 const COLS: usize = 8;
+
+/// The pass's sizes: every width its buffers are cut from — the shape, the
+/// MoE widths and the layers' projection widths — collected once at load
+/// and read by both the fit check ([`Prompt::need`]) and the allocation
+/// ([`Prompt::new`]), so the bytes the one counts and the other holds
+/// cannot drift. The widths are the family's architecture facts; how many
+/// rows a pass takes is the card's, decided apart ([`choose_pass_rows`]).
+pub(super) struct PassSizes {
+    sh: Shape,
+    moe: MoeShape,
+    /// The query heads a row's `q` holds.
+    n_head: usize,
+    /// The widest routed expert's up width; 0 where no layer is a MoE layer.
+    ff: usize,
+    /// The widest router table's expert count (the `probs` rows).
+    n_expert: usize,
+    /// The q8_1 slot forms the `_sel` fallback reads ([`slot_form`]): the
+    /// fallback runs only for passes of at most [`COLS`] rows, so a form
+    /// holds [`COLS`] columns (`TOP_K · COLS` for the routed up's input).
+    slots: Vec<(usize, usize)>,
+    /// The routed tables' expert counts, one a distinct count.
+    route_n: Vec<usize>,
+    /// The experts' GEMM forms ([`gemm_form`]): `(k, slots a row)`, a
+    /// form's columns the pass's cut times that.
+    gemm_acts: Vec<(usize, usize)>,
+    /// The NVFP4 gemv run forms' widths.
+    run_k: Vec<usize>,
+    /// The q8 blocks of 32 the wide GEMMs read, one a site width.
+    wide_k: Vec<usize>,
+}
+
+impl PassSizes {
+    /// The sizes for `sh`, the MoE shape `moe`, `n_head` query heads and
+    /// `layers`' widths. Host-side only; allocates nothing on the card.
+    pub(super) fn of((sh, moe, n_head): (&Shape, MoeShape, usize), layers: &[Layer]) -> PassSizes {
+        let moes = || {
+            layers.iter().filter_map(|l| match l {
+                Layer::Moe(m) => Some(m),
+                _ => None,
+            })
+        };
+        let mut slots: Vec<(usize, usize)> = Vec::new();
+        let mut want_slots = |k: usize, cols: usize| {
+            if !slots.iter().any(|s| s.0 == k && s.1 == cols) {
+                slots.push((k, cols));
+            }
+        };
+        for m in moes() {
+            want_slots(moe.latent, COLS);
+            want_slots(m.ff, TOP_K * COLS);
+            want_slots(sh.hidden, COLS);
+            want_slots(moe.shared_ff, COLS);
+        }
+        let mut route_n: Vec<usize> = Vec::new();
+        let mut gemm_acts: Vec<(usize, usize)> = Vec::new();
+        let mut want_acts = |k: usize, per_row: usize| {
+            if !gemm_acts.iter().any(|a| a.0 == k && a.1 == per_row) {
+                gemm_acts.push((k, per_row));
+            }
+        };
+        for m in moes() {
+            let n = m.route.n_expert();
+            if !route_n.contains(&n) {
+                route_n.push(n);
+            }
+            for (k, per_row) in [
+                (moe.latent, 1),
+                (m.ff, TOP_K),
+                (sh.hidden, 1),
+                (moe.shared_ff, 1),
+            ] {
+                want_acts(k, per_row);
+            }
+        }
+        let mut run_k: Vec<usize> = Vec::new();
+        let mut wide_k: Vec<usize> = Vec::new();
+        for s in layers.iter().flat_map(Layer::sites) {
+            if s.ty == SiteTy::Nvfp4 && !run_k.contains(&s.k) {
+                run_k.push(s.k);
+            }
+            if matches!(s.ty, SiteTy::Q8_0 | SiteTy::Nvfp4) && !wide_k.contains(&s.k) {
+                wide_k.push(s.k);
+            }
+        }
+        PassSizes {
+            sh: *sh,
+            moe,
+            n_head,
+            ff: moes().map(|m| m.ff).max().unwrap_or(0),
+            n_expert: COUNTS.iter().copied().max().unwrap_or(0),
+            slots,
+            route_n,
+            gemm_acts,
+            run_k,
+            wide_k,
+        }
+    }
+
+    /// The device bytes the pass's buffers hold at `rows` rows — every
+    /// buffer [`Prompt::new`] allocates, by the same widths: what a fit
+    /// check ([`choose_pass_rows`]) counts. Pure; [`Prompt::new`] asserts
+    /// the buffers it allocated hold exactly this.
+    pub(super) fn bytes(&self, rows: usize) -> usize {
+        let (sh, moe) = (self.sh, self.moe);
+        let cut = rows.next_multiple_of(COLS);
+        let kv_width = sh.n_kv * HEAD;
+        let f = size_of::<f32>();
+        // Every cut-length f32 buffer, at the one-column floor where a
+        // width is 0 (the residual streams twice, `kh`/`vh`, the MoE row
+        // buffers, and `RowBuffers`' columns with no MLP width here).
+        let z = |n: usize| cut * n.max(1) * f;
+        let attn_rows = cut.min(crate::model::MAX_PASS_ROWS);
+        let f32s = 4 * z(sh.hidden) // x twice, sh, sum
+            + z(self.n_expert) // probs
+            + z(TOP_K) // weights
+            + z(moe.latent) * 2 // lat, moe
+            + z(TOP_K * self.ff) // up
+            + z(TOP_K * moe.latent) // down
+            + z(moe.shared_ff) // sh_up
+            + 2 * z(kv_width) // kh, vh
+            + 2 * z(sh.hidden) // RowBuffers' xn, delta
+            + z(sh.mamba.in_proj_width()) // zxbcdt
+            + z(sh.mamba.geom().d_inner) // y
+            + 2 * z(self.n_head * HEAD) // q, attn
+            + 2 * z(kv_width) // k, v
+            + 2 * z(0) // RowBuffers' up, act (no MLP width)
+            + (partials_v_len(attn_rows, self.n_head)
+                + partials_ms_len(attn_rows, self.n_head))
+                * f;
+        let u32s = (P_ROWS + sh.n_kv + rows // words
+            + cut * TOP_K // ids
+            + cut // zero_ids
+            + 2 * cut) // RowBuffers' pos, n_keys
+            * size_of::<u32>();
+        let gemm = route_bytes(cut, 1) // the projections' one-expert table
+            + self
+                .route_n
+                .iter()
+                .map(|&n| route_bytes(TOP_K * cut, n))
+                .sum::<usize>()
+            + self
+                .gemm_acts
+                .iter()
+                .map(|&(k, per_row)| per_row * cut * act_col_bytes(k))
+                .sum::<usize>();
+        let forms = self
+            .slots
+            .iter()
+            .map(|&(k, cols)| cols * act_col_bytes(k))
+            .sum::<usize>()
+            + self
+                .run_k
+                .iter()
+                .map(|&k| COLS * act_col_bytes(k))
+                .sum::<usize>()
+            + self
+                .wide_k
+                .iter()
+                .map(|&k| cut * act32_col_bytes(k))
+                .sum::<usize>();
+        // The flash split's sub-group buffers (`rows`, not the cut) and the
+        // Mamba-2 pass scratch: `rows · conv_dim` conv rows and two f32s a
+        // (token, head) for the `σ`/`dA` pre-pass.
+        let split = 2 * rows * sh.n_kv * crate::flash_gqa::GROUP * HEAD * f;
+        let mamba2 = rows * sh.mamba.conv_dim() * f + 2 * rows * sh.mamba.geom().n_heads * f;
+        f32s + u32s + gemm + forms + split + mamba2
+    }
+}
+
+/// The rows one pass takes on `free` card bytes. With `asked` unset, the
+/// largest multiple of 64 in `64..=min(PASS_ROWS_MAX, ctx)` — the whole `ctx`
+/// where that is below 64 — whose buffers ([`Prompt::need`]) plus
+/// [`FIT_RESERVE`] fit ([`largest_fit`]), or a named refusal when not even
+/// the smallest does: a default the user did not set shrinks and never
+/// refuses past the 64-row floor. With `asked` set, exactly those rows or a
+/// named refusal that gives the free bytes, the need and the largest size
+/// that fits: a size the user named is never shrunk. Load-time only;
+/// allocates nothing.
+pub(super) fn choose_pass_rows(
+    sizes: &PassSizes,
+    (ctx, asked): (usize, Option<usize>),
+    free: usize,
+) -> Result<usize, GpuError> {
+    const WHAT_FIT: &str = "nemotron_h_moe::pass_rows";
+    let hi = PASS_ROWS_MAX.min(ctx);
+    if hi == 0 {
+        return Err(GpuError::shape(
+            WHAT_FIT,
+            "a pass holds at least one row; the context left none",
+        ));
+    }
+    let candidates: Vec<usize> = if hi < 64 {
+        vec![hi]
+    } else {
+        (1..=hi / 64).map(|k| 64 * k).rev().collect()
+    };
+    let need = |rows| Prompt::need(sizes, rows);
+    let largest = largest_fit(candidates.iter().copied(), need, free, FIT_RESERVE);
+    let refuse = |rows: usize| {
+        GpuError::shape(
+            WHAT_FIT,
+            format!(
+                "the prefill pass buffers for passes of {rows} rows need {} bytes and \
+                 {FIT_RESERVE} more stay free for what the load allocates after them; the card \
+                 has {free} free: {}",
+                need(rows),
+                largest.map_or("no pass size fits".to_string(), |v| {
+                    format!("passes of {v} rows fit")
+                })
+            ),
+        )
+    };
+    match asked {
+        None => largest.ok_or_else(|| refuse(candidates[0])),
+        Some(rows) if rows == 0 || rows > hi || (rows >= 64 && !rows.is_multiple_of(64)) => {
+            Err(GpuError::shape(
+                WHAT_FIT,
+                format!(
+                    "a pass of {rows} rows; a pass holds 1..={hi} rows here (at most \
+                     {PASS_ROWS_MAX} and the context {ctx}), at 64 past it a multiple of 64"
+                ),
+            ))
+        }
+        Some(rows) if largest_fit(std::iter::once(rows), need, free, FIT_RESERVE).is_none() => {
+            Err(refuse(rows))
+        }
+        Some(rows) => Ok(rows),
+    }
+}
 
 /// The pass's word record: the first position, then one row word a key head
 /// (head `h` at `P_ROWS + h`, the plane row `h · ctx + pos` the pass's first
@@ -118,8 +353,9 @@ struct PassBufs {
     sum: DeviceBuffer<f32>,
     /// One id 0 a row: the shared expert's slots.
     zero_ids: DeviceBuffer<u32>,
-    /// The q8_1 slot forms the `_sel` launches read, one a width:
-    /// `(k, columns, form)`.
+    /// The q8_1 slot forms the `_sel` fallback reads, one a width:
+    /// `(k, columns, form)`, each [`COLS`] columns wide — the fallback runs
+    /// only for passes of at most [`COLS`] rows, whatever the pass's cut.
     slots: Vec<(usize, usize, Q8Act)>,
     /// The projections' forms ([`project_rows`]).
     arms: Arms,
@@ -152,92 +388,72 @@ struct Arms {
 }
 
 impl Prompt {
-    /// The buffers for passes of up to `rows` rows over `sh`, `n_head` query
-    /// heads, the MoE shape `moe` and `layers`' widths. Load-time only.
+    /// The device bytes the pass's buffers hold at `rows` rows of `sizes`
+    /// ([`PassSizes::bytes`]): what the load's fit check counts before
+    /// anything is allocated.
+    pub(super) fn need(sizes: &PassSizes, rows: usize) -> usize {
+        sizes.bytes(rows)
+    }
+
+    /// The buffers for passes of up to `rows` rows over `sizes`' widths,
+    /// which must hold exactly the bytes [`Prompt::need`] counted for them
+    /// or the load fails by name. Load-time only.
     pub(super) fn new(
         stream: &CudaStream,
+        sizes: &PassSizes,
         rows: usize,
-        (sh, moe, n_head): (&Shape, MoeShape, usize),
-        layers: &[Layer],
     ) -> Result<Prompt, GpuError> {
-        if rows == 0 || rows > PASS_ROWS {
+        if rows == 0 || rows > PASS_ROWS_MAX {
             return Err(GpuError::shape(
                 WHAT,
-                format!("a pass of {rows} rows; a pass holds 1..={PASS_ROWS}"),
+                format!("a pass of {rows} rows; a pass holds 1..={PASS_ROWS_MAX}"),
             ));
         }
+        let (sh, moe, n_head) = (sizes.sh, sizes.moe, sizes.n_head);
         let cut = rows.next_multiple_of(COLS);
         let z = |n: usize| -> Result<DeviceBuffer<f32>, GpuError> {
             Ok(DeviceBuffer::zeroed(stream, cut * n.max(1))?)
         };
         let kv_width = sh.n_kv * HEAD;
-        let moes = || {
-            layers.iter().filter_map(|l| match l {
-                Layer::Moe(m) => Some(m),
-                _ => None,
-            })
-        };
-        let ff = moes().map(|m| m.ff).max().unwrap_or(0);
-        let n_expert = COUNTS.iter().copied().max().unwrap_or(0);
         let mut slots: Vec<(usize, usize, Q8Act)> = Vec::new();
-        let mut want = |k: usize, cols: usize| -> Result<(), GpuError> {
-            if !slots.iter().any(|s| s.0 == k && s.1 == cols) {
-                slots.push((k, cols, Q8Act::with_slots(stream, cols, k)?));
-            }
-            Ok(())
-        };
-        for m in moes() {
-            want(moe.latent, rows)?;
-            want(m.ff, TOP_K * rows)?;
-            want(sh.hidden, rows)?;
-            want(moe.shared_ff, rows)?;
+        for &(k, cols) in &sizes.slots {
+            slots.push((k, cols, Q8Act::with_slots(stream, cols, k)?));
         }
         let mut ex = ExpertArms {
             routes: Vec::new(),
             acts: Vec::new(),
         };
-        for m in moes() {
-            let n = m.route.n_expert();
-            if !ex.routes.iter().any(|r| r.0 == n) {
-                ex.routes.push((n, GemmRoute::new(stream, TOP_K * cut, n)?));
-            }
-            for (k, cols) in [
-                (moe.latent, cut),
-                (m.ff, TOP_K * cut),
-                (sh.hidden, cut),
-                (moe.shared_ff, cut),
-            ] {
-                if !ex.acts.iter().any(|a| a.0 == k && a.1 == cols) {
-                    ex.acts.push((k, cols, GemmAct::new(stream, cols, k)?));
-                }
-            }
+        for &n in &sizes.route_n {
+            ex.routes.push((n, GemmRoute::new(stream, TOP_K * cut, n)?));
+        }
+        for &(k, per_row) in &sizes.gemm_acts {
+            let cols = per_row * cut;
+            ex.acts.push((k, cols, GemmAct::new(stream, cols, k)?));
         }
         let mut runs: Vec<Q8Act> = Vec::new();
+        for &k in &sizes.run_k {
+            runs.push(Q8Act::with_k(stream, COLS, k)?);
+        }
         let mut wide: Vec<(usize, WideActs)> = Vec::new();
-        for s in layers.iter().flat_map(Layer::sites) {
-            if s.ty == SiteTy::Nvfp4 && !runs.iter().any(|a| a.k() == s.k) {
-                runs.push(Q8Act::with_k(stream, COLS, s.k)?);
-            }
-            if matches!(s.ty, SiteTy::Q8_0 | SiteTy::Nvfp4) && !wide.iter().any(|a| a.0 == s.k) {
-                wide.push((s.k, WideActs::new(stream, (false, true), cut, s.k)?));
-            }
+        for &k in &sizes.wide_k {
+            wide.push((k, WideActs::new(stream, (false, true), cut, k)?));
         }
         let n_words = P_ROWS + sh.n_kv + rows;
-        Ok(Prompt {
+        let prompt = Prompt {
             rows,
             q_width: n_head * HEAD,
             x: [z(sh.hidden)?, z(sh.hidden)?],
             b: PassBufs {
-                buf: RowBuffers::new(stream, cut, sh, (n_head, 0))?,
+                buf: RowBuffers::new(stream, cut, &sh, (n_head, 0))?,
                 kh: z(kv_width)?,
                 vh: z(kv_width)?,
                 words: DeviceBuffer::zeroed(stream, n_words)?,
                 host_words: vec![0; n_words],
-                probs: z(n_expert)?,
+                probs: z(sizes.n_expert)?,
                 ids: DeviceBuffer::zeroed(stream, cut * TOP_K)?,
                 weights: z(TOP_K)?,
                 lat: z(moe.latent)?,
-                up: z(TOP_K * ff)?,
+                up: z(TOP_K * sizes.ff)?,
                 down: z(TOP_K * moe.latent)?,
                 moe: z(moe.latent)?,
                 sh_up: z(moe.shared_ff)?,
@@ -254,7 +470,19 @@ impl Prompt {
                 split: SplitScratch::new(stream, rows, sh.n_kv)?,
             },
             mamba2: Mamba2PassScratch::new(stream, sh.mamba, rows)?,
-        })
+        };
+        let need = Prompt::need(sizes, rows);
+        if prompt.bytes() != need {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the pass buffers for passes of {rows} rows hold {} bytes, their fit check \
+                     counted {need}",
+                    prompt.bytes()
+                ),
+            ));
+        }
+        Ok(prompt)
     }
 
     /// The most ids a pass takes.
@@ -906,8 +1134,14 @@ impl Body {
 }
 
 impl GpuModel<Body> {
+    /// The rows one pass of [`GpuModel::prefill`] takes: the size the load
+    /// chose from the card's room ([`choose_pass_rows`]).
+    pub fn pass_rows(&self) -> Result<usize, GpuError> {
+        Ok(self.body(WHAT)?.prompt.rows())
+    }
+
     /// [`GpuModel::prefill_with`] in passes of the most ids the prompt
-    /// buffers hold: [`PASS_ROWS`], or the context where that is less.
+    /// buffers hold: the rows the load chose ([`pass_rows`]).
     pub fn prefill(&mut self, ids: &[u32]) -> Result<u32, GpuError> {
         let rows = self.body(WHAT)?.prompt.rows();
         self.prefill_with(ids, rows)
