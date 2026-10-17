@@ -511,6 +511,10 @@ mod q5_kernels {
             d8.len() >= m_cols * k_blocks
         )
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+    )]
     pub fn q5_quantize_q8(
         x: &[f32],
         m_cols: u32,
