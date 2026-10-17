@@ -225,7 +225,7 @@ fn run() -> Result<(), GateError> {
             [k as u64, mi as u64, 1, 1],
             "FUSED_RMS_NORM",
         )?;
-        let pass = rms_case(&elem, stream, &x, k, mi, &gguf, gain_name, out_row, eps)?;
+        let pass = rms_case(&elem, stream, &x, (k, mi), (&gguf, gain_name), out_row, eps)?;
         println!(
             "shape op=rms_norm site={label} K={k} m={mi} gain={gain_name} {}",
             pass.1
@@ -262,10 +262,8 @@ fn run() -> Result<(), GateError> {
             &elem,
             stream,
             &x,
-            mla.latent,
-            m,
-            &gguf,
-            "blk.1.attn_kv_a_norm.weight",
+            (mla.latent, m),
+            (&gguf, "blk.1.attn_kv_a_norm.weight"),
             out_row,
             eps,
         )?;
@@ -749,9 +747,8 @@ fn run() -> Result<(), GateError> {
         let mut finite_bad = 0usize;
         let mut nan_bad = 0usize;
         let mut first_bad: Option<(u16, u32, u32)> = None;
-        for b in 0..N16 {
+        for (b, &got) in y[..N16].iter().enumerate() {
             let want = gguf::quant::half_to_f32(b as u16);
-            let got = y[b];
             if got.to_bits() == want.to_bits() {
                 continue;
             }
@@ -866,7 +863,8 @@ fn norm_geometry() -> Result<bool, GateError> {
     /// Every `k` a decode step norms: the hidden width and the MLA latent.
     const NORM_K: [usize; 2] = [2048, 512];
 
-    let shaped = RMS_THREADS % 32 == 0 && RMS_THREADS <= 1024 && RMS_WARPS == RMS_THREADS / 32;
+    let shaped =
+        RMS_THREADS.is_multiple_of(32) && RMS_THREADS <= 1024 && RMS_WARPS == RMS_THREADS / 32;
     // Both norms share the sum of squares on RMS_THREADS threads; norm_quant's
     // block is wider, its quantizer dealt over every warp.
     // PIN(2026-09-24): norm_quant's block is NORM_QUANT_THREADS, its sum on the first RMS_THREADS (ds41dense).
@@ -924,7 +922,7 @@ fn argmax_geometry() -> Result<bool, GateError> {
             .ok_or_else(|| format!("gate_p4: PTX entry {} declares no .reqntid", c.name))?;
         let trips = ARGMAX_N.div_ceil(ARGMAX_THREADS);
         let pass = ntid == ARGMAX_THREADS
-            && ARGMAX_THREADS % 32 == 0
+            && ARGMAX_THREADS.is_multiple_of(32)
             && ARGMAX_THREADS <= 1024
             && ARGMAX_WARPS == ARGMAX_THREADS / 32
             && ARGMAX_WARPS >= ARGMAX_MIN_WARPS;
@@ -949,10 +947,8 @@ fn rms_case(
     elem: &bloomery_gpu::elem::ElemKernels,
     stream: &cuda_core::CudaStream,
     x: &[f32],
-    k: usize,
-    mi: usize,
-    gguf: &gguf::Gguf,
-    gain_name: &str,
+    (k, mi): (usize, usize),
+    (gguf, gain_name): (&gguf::Gguf, &str),
     out_row: &RefRow,
     eps: f32,
 ) -> Result<(bool, String), GateError> {

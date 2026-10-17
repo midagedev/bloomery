@@ -1293,7 +1293,12 @@ fn dequant_iq4_xs(src: &[u8], dst: &mut [f32]) {
 pub fn quantize_row_q8_k_roundtrip(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len(), "q8_K round-trip needs matching lengths");
     assert!(x.len().is_multiple_of(256), "q8_K blocks are 256 values");
-    for (xb, ob) in x.chunks_exact(256).zip(out.chunks_exact_mut(256)) {
+    for (xb, ob) in x
+        .as_chunks::<256>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<256>().0)
+    {
         let mut amax = 0.0f32;
         let mut max = 0.0f32;
         for &v in xb {
@@ -1348,7 +1353,12 @@ pub fn quantize_row_q8_k_roundtrip(x: &[f32], out: &mut [f32]) {
 pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len(), "q8_2 round-trip needs matching lengths");
     assert!(x.len().is_multiple_of(32), "q8_2 blocks are 32 values");
-    for (xb, ob) in x.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
+    for (xb, ob) in x
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<32>().0)
+    {
         let mut amax = 0.0f32;
         for &v in xb {
             amax = amax.max(v.abs());

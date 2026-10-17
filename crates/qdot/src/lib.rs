@@ -3954,7 +3954,7 @@ unsafe fn dot_q4k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 
             let q4 = &wb[16..16 + 128];
             let mut sumi_f = [_mm256_setzero_ps(), _mm256_setzero_ps()];
-            for j in 0..2 {
+            for (j, sumi_f_j) in sumi_f.iter_mut().enumerate() {
                 // SAFETY: loads stay inside the validated 144-byte block.
                 let bits0 = _mm256_loadu_si256(q4.as_ptr().add(64 * j) as *const __m256i);
                 let values0 = _mm256_and_si256(bits0, ml);
@@ -3983,7 +3983,7 @@ unsafe fn dot_q4k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
                 let t =
                     _mm256_add_epi16(_mm256_unpacklo_epi64(t1, t3), _mm256_unpackhi_epi64(t1, t3));
                 let sumi = _mm256_madd_epi16(_mm256_set1_epi16(1), t);
-                sumi_f[j] = _mm256_cvtepi32_ps(sumi);
+                *sumi_f_j = _mm256_cvtepi32_ps(sumi);
             }
 
             accd = _mm256_fmadd_ps(my, mins, accd);
@@ -4102,7 +4102,7 @@ fn dot_q4k_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         let mut mins = [0.0f32; 8];
         for l in 0..8 {
             let m = mb[l / 4][l % 4];
-            mins[l] = -1.0 * (dmin * (m as f32));
+            mins[l] = -(dmin * (m as f32));
         }
 
         let mut d8 = [0.0f32; 8];
@@ -4234,7 +4234,7 @@ unsafe fn dot_q6k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
             scales[1] = _mm256_mul_ps(scales[1], _mm256_set_m128(dyh, dyh));
 
             let mut sumis = [_mm256_setzero_si256(), _mm256_setzero_si256()];
-            for j in 0..2 {
+            for (j, sumi_j) in sumis.iter_mut().enumerate() {
                 // SAFETY: loads stay inside the validated 210-byte block.
                 let lbits1 = _mm256_loadu_si256(wb.add(64 * j) as *const __m256i);
                 let lbits2 = _mm256_loadu_si256(wb.add(64 * j + 32) as *const __m256i);
@@ -4291,7 +4291,7 @@ unsafe fn dot_q6k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
                 );
                 let t =
                     _mm256_add_epi16(_mm256_unpacklo_epi64(t1, t3), _mm256_unpackhi_epi64(t1, t3));
-                sumis[j] = _mm256_madd_epi16(_mm256_set1_epi16(1), t);
+                *sumi_j = _mm256_madd_epi16(_mm256_set1_epi16(1), t);
             }
 
             accd = _mm256_fmadd_ps(scales[0], _mm256_cvtepi32_ps(sumis[0]), accd);

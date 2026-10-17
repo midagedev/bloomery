@@ -5544,11 +5544,11 @@ pub(crate) fn matvec_q_local(
             let row = &mut scratch[..k];
             for r in 0..n {
                 let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
-                if ty == GgmlType::F32 {
-                    if let Some(v) = qdot::dot_f32(src, &qbuf[..k]) {
-                        out[r] = v;
-                        continue;
-                    }
+                if ty == GgmlType::F32
+                    && let Some(v) = qdot::dot_f32(src, &qbuf[..k])
+                {
+                    out[r] = v;
+                    continue;
                 }
                 // Weight side: dequant_row, or the byte walk in its place for F32 rows.
                 if ty == GgmlType::F32 {

@@ -65,14 +65,15 @@ fn run() -> Result<(), GateError> {
     const PIN_Q3K_R1407: (u64, u64) = (0xfe53_dbd4_e64b_d903, 0xe9bb_5923_c457_b5ff);
 
     // (name, tensor, type, K, row cap: None = all rows, (m=1, m=8) pin pair)
-    let shapes: &[(
-        &str,
-        &str,
+    type Shape = (
+        &'static str,
+        &'static str,
         GgmlType,
         usize,
         Option<usize>,
         Option<(u64, u64)>,
-    )] = &[
+    );
+    let shapes: &[Shape] = &[
         (
             "q3k_k2048",
             "blk.1.attn_q.weight",

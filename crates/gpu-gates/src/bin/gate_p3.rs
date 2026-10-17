@@ -103,7 +103,7 @@ fn run() -> Result<(), GateError> {
         for m in [1usize, 8] {
             let x = bloomery_gpu_gates::activations(k, m, x_seed);
             let y_ref = ref_f64_dot(&deq, k, &x, m);
-            let (rel, bit_same) = run_q8(&kernels, stream, &qs_dev, &d_dev, rows, m, &x, &y_ref)?;
+            let (rel, bit_same) = run_q8(&kernels, stream, &qs_dev, &d_dev, (rows, m), &x, &y_ref)?;
             all_ok &= report("q8_0", k, rows, m, rel, bit_same, BAND);
         }
 
@@ -181,8 +181,7 @@ fn run_q8(
     stream: &cuda_core::CudaStream,
     qs: &bloomery_gpu::DeviceTensor<u32>,
     d: &bloomery_gpu::DeviceTensor<u16>,
-    rows: usize,
-    m: usize,
+    (rows, m): (usize, usize),
     x: &[f32],
     y_ref: &[f32],
 ) -> Result<(f32, bool), GateError> {

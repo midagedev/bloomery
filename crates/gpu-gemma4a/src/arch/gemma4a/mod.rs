@@ -19,6 +19,9 @@ const MAX_FRAMES: usize = 2999;
 const MAX_TOKENS: usize = MAX_FRAMES.div_ceil(4);
 const EPS: f32 = 1e-6;
 
+/// The per-stage activation observer a tapped run reports to.
+type Tap<'a> = Option<&'a mut dyn FnMut(&str, usize, &[f32])>;
+
 /// One chunk's text-width soft rows, in token-major order.
 pub struct Encoded {
     pub tokens: usize,
@@ -127,11 +130,7 @@ impl Encoder {
         self.run(mel, Some(tap))
     }
 
-    fn run(
-        &mut self,
-        mel: &Mel,
-        mut tap: Option<&mut dyn FnMut(&str, usize, &[f32])>,
-    ) -> Result<Encoded, GpuError> {
+    fn run(&mut self, mel: &Mel, mut tap: Tap<'_>) -> Result<Encoded, GpuError> {
         if mel.frames == 0
             || mel.frames > MAX_FRAMES
             || mel.data.len() != mel.frames * MEL_BINS
@@ -297,7 +296,7 @@ fn take(
     n: usize,
     width: usize,
     x: &DeviceBuffer<f32>,
-    tap: &mut Option<&mut dyn FnMut(&str, usize, &[f32])>,
+    tap: &mut Tap<'_>,
 ) -> Result<(), GpuError> {
     let Some(tap) = tap else {
         return Ok(());

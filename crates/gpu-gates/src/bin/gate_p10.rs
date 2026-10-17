@@ -488,8 +488,10 @@ fn expected_planes(
         GgmlType::Q5_1 => HostPlanes::Words(gate_q5_words(bytes, k, rows, true)?),
         GgmlType::F32 => HostPlanes::F32(
             bytes[..rows * k * 4]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect(),
         ),
         other => {
@@ -853,8 +855,10 @@ fn kid_f32_router_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), Gate
     let (info, bytes) = tensor_bytes_as(gguf, "blk.1.ffn_gate_inp.weight", GgmlType::F32, None)?;
     let (k, nrows) = (info.dims[0] as usize, tensor_rows(&info.dims));
     let vals: Vec<f32> = bytes[..nrows * k * 4]
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     let rref = DeviceTensor::upload(stream, &vals, nrows, k)?;
     let DevWeight::F32 { w: res, .. } = w

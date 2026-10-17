@@ -85,7 +85,7 @@ mod gate {
     use crate::e2e::{Run, feed, finite, fresh, histogram, or_fault, same, top_ids, walk};
     use bloomery_gpu::arch::nemotron_h::PASS_ROWS;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Gpu, GpuError, NemotronHModel, NodeInfo};
+    use bloomery_gpu::{Gpu, GpuError, NemotronHModel};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, open_split, verdict};
     use cuda_core::sys;
