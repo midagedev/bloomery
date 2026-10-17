@@ -2719,7 +2719,8 @@ run_round() {
   local -a units idx
   shift
   lg_units "$@"
-  mapfile -t units < <(lg_round "$r")
+  units=()
+  while IFS= read -r line; do units+=("$line"); done < <(lg_round "$r")
   for line in "${units[@]}"; do
     read -r -a idx <<< "$line"
     run_unit "$r" "${idx[@]}"
@@ -2732,7 +2733,8 @@ round_order() {
   local -a units idx names
   shift
   lg_units "$@"
-  mapfile -t units < <(lg_round "$r")
+  units=()
+  while IFS= read -r line; do units+=("$line"); done < <(lg_round "$r")
   for line in "${units[@]}"; do
     read -r -a idx <<< "$line"
     names=()
