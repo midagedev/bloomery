@@ -66,7 +66,7 @@ const WHAT: &str = "nemotron_h_moe::prefill";
 /// `TOP_K` slots one route table and one GEMM form hold
 /// ([`GemmRoute::new`], [`GemmAct::new`]); the pass's rows themselves are
 /// chosen at load ([`choose_pass_rows`]).
-pub const PASS_ROWS_MAX: usize = 2048;
+pub const PASS_ROWS_MAX: usize = 4096;
 const _: () = assert!(TOP_K * PASS_ROWS_MAX <= GEMM_MAX_SLOTS);
 
 /// The columns one gemv run takes: the multi-column gemvs' most.
