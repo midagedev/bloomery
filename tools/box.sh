@@ -378,7 +378,7 @@ default_lane() {
   # [t]ools: spelled with a class so tools/recipes.py's tree-walk detector does not read this scan of CMD as a walk of the tree
   for s in $(grep -o '[t]ools/[A-Za-z0-9/_.-]*\.sh' <<< "$rest" || true); do
     case $s in
-      tools/gate.sh | tools/host-gate.sh | tools/scan-args.sh | tools/ref/real-only.sh | tools/ref/fixture-only.sh | tools/ref/ref-paths.sh) ;;
+      tools/gate.sh | tools/host-gate.sh | tools/scan-args.sh | tools/ref/real-only.sh | tools/ref/fixture-only.sh | tools/ref/needs-env.sh | tools/ref/ref-paths.sh) ;;
       *) echo 3090; return ;;
     esac
   done

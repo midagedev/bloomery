@@ -1,0 +1,18 @@
+# The fixture directory of each architecture, the one table of it: crates/refset/src/fixture.rs reads it (include_str!: `dir_of`,
+# `first_shard_in`; crates/model/src/bin/fixture.rs takes each family's name from it), tools/ref/ref-paths.sh reads it by awk (the
+# fixture tier's model file), tools/refset-publish.sh and tools/check-recipes.sh read it by awk too.
+# arch<TAB>dir
+#   arch   the BLOOMERY_MODEL profile name, which is the GGUF general.architecture of the fixture's file
+#   dir    the directory under the fixture root ($BLOOMERY_FIXTURE_ROOT, default /models/fixtures) holding the fixture's shards, the
+#          one name `fixture fetch` takes as its family; lower-case letters, digits and `-`. `self` is not a directory: the family
+#          has no fixture file, a command runs on the profile's file and the gate fence (Tier::check_file) refuses that file as not
+#          a fixture. An architecture this table does not name has no fixture yet (ref-paths.sh exits 66, never a run on the real file).
+qwen4exp	qwen38
+deepseek41	v41
+glm5next	glm5next
+nemotron_h	nemotron
+nemotron_h_moe	nemotron-bolt
+qwen35moe	qwen35moe
+deepseek2	self
+qwen3moe	self
+qwen35	self

@@ -22,6 +22,10 @@ bloomery-models = { path = "../models" }
 # (host_lock, workstation::host_available) beside the re-export.
 bloomery-placement = { path = "../placement" }
 bloomery-qdot = { path = "../qdot" }
+# The fixture bin names a family by its directory, the one `refset::fixture::dir_of` reads from tools/fixture-dirs.tsv, and the
+# gates read the oracle sets through the same reader, which checks each set's provenance. It depends on the GGUF reader only, so the
+# edge makes no cycle.
+bloomery-refset = { path = "../refset" }
 bloomery-threads = { path = "../threads" }
 # The plans count the stores by the rules the card bodies allocate them by (`runtime::stores`).
 # The runtime depends on the model description alone, so the edge makes no cycle.
@@ -31,8 +35,3 @@ bloomery-tokenizer = { path = "../tokenizer" }
 libc = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-# The gates read the oracle sets through the reference-set reader, which checks each set's
-# provenance. It depends on the GGUF reader only, so the edge makes no cycle.
-bloomery-refset = { path = "../refset" }

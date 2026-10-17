@@ -27,8 +27,8 @@
 //! listed size with its header (fetched through the hf crate's client) at the front, in a
 //! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
 //! file its family's source row names, when the row has one (a row can say its draft is not
-//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `qwen35moe`, `glm5next`, `nemotron`, `nemotron-bolt`)
-//! reads its row of [`SOURCES`]: repo, quant and revision; a `<repo>:<quant>` takes `main`.
+//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `qwen35moe`, `glm5next`, `nemotron`, `nemotron-bolt`: the
+//! directory `tools/fixture-dirs.tsv` gives the architecture) reads its row of [`SOURCES`]: repo, quant and revision; a `<repo>:<quant>` takes `main`.
 //! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
 //! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
 //! It takes `generate`'s flags but `--draft`, and `--rev R` (a commit hash, tag or branch of the
@@ -98,8 +98,6 @@ enum DraftSource {
 /// the row, and an explicit `<repo>:<quant>` overrides it.
 struct Source {
     spec: fn() -> FixtureSpec,
-    /// The name `fetch` takes: the family's directory under the fixture root.
-    family: &'static str,
     repo: &'static str,
     quant: &'static str,
     /// The repo revision the fixture's source header is the header of (`main` when `None`).
@@ -107,11 +105,24 @@ struct Source {
     draft: DraftSource,
 }
 
+impl Source {
+    /// The name `fetch` takes: the family's directory under the fixture root, the one `tools/fixture-dirs.tsv` names for the
+    /// architecture its spec declares.
+    ///
+    /// # Panics
+    /// When the table names no directory for that architecture; a test holds every row.
+    fn family(&self) -> &'static str {
+        let arch = (self.spec)().arch;
+        refset::fixture::dir_of(arch).unwrap_or_else(|| {
+            panic!("tools/fixture-dirs.tsv names no directory for the {arch} architecture")
+        })
+    }
+}
+
 /// One row per entry of [`SPECS`].
 const SOURCES: [Source; 6] = [
     Source {
         spec: v41::spec,
-        family: "v41",
         repo: "vcruz305/DeepSeek-V4.1-Flash-GGUF",
         quant: "Q3_K_M",
         rev: None,
@@ -121,7 +132,6 @@ const SOURCES: [Source; 6] = [
     },
     Source {
         spec: qwen38::spec,
-        family: "qwen38",
         repo: "unsloth/Qwen3.8-Flash-Next-GGUF",
         quant: "UD-Q4_K_XL",
         rev: None,
@@ -129,7 +139,6 @@ const SOURCES: [Source; 6] = [
     },
     Source {
         spec: qwen36::spec,
-        family: "qwen35moe",
         repo: "lmstudio-community/Qwen3.6-35B-A3B-GGUF",
         quant: "Q4_K_M",
         // The commit whose header the spec's map was chosen from, pinned so a rewritten upstream
@@ -139,7 +148,6 @@ const SOURCES: [Source; 6] = [
     },
     Source {
         spec: glm5::spec,
-        family: "glm5next",
         repo: "unsloth/GLM-5.3-Flash-GGUF",
         quant: "UD-Q4_K_XL",
         // unsloth's later rewrite of shard 1 renamed `glm5next` to `glm5-next`; this is the
@@ -149,7 +157,6 @@ const SOURCES: [Source; 6] = [
     },
     Source {
         spec: nemo::spec,
-        family: "nemotron",
         repo: "nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF",
         quant: "Q4_K_M",
         // The commit the 2,837,072,864-byte file's header was read at.
@@ -158,7 +165,6 @@ const SOURCES: [Source; 6] = [
     },
     Source {
         spec: bolt::spec,
-        family: "nemotron-bolt",
         repo: "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
         quant: "24GB",
         // The repo's head commit when the row was written (the hub's API); the box's copy of
@@ -517,7 +523,7 @@ fn write_fixture(
 /// `generate` from the source `repo` (`<owner>/<name>[:<quant>]`) names, its headers read by
 /// range. The sources live in `<out>.fetch.<pid>`, removed whether or not the run succeeds.
 fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
-    let (r, rev) = match SOURCES.iter().find(|s| s.family == target) {
+    let (r, rev) = match SOURCES.iter().find(|s| s.family() == target) {
         Some(s) => (
             RepoRef {
                 repo: s.repo.to_string(),
@@ -605,7 +611,8 @@ fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()
             None => {
                 return Err(format!(
                     "{}@{rev} holds no {name}, the draft of the {} family",
-                    r.repo, row.family
+                    r.repo,
+                    row.family()
                 )
                 .into());
             }
@@ -614,7 +621,7 @@ fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()
     if a.draft_tensors.is_some() && draft.is_none() {
         return Err(format!(
             "--draft-tensors needs a draft, and the {} family has none to fetch",
-            row.family
+            row.family()
         )
         .into());
     }
@@ -837,18 +844,36 @@ mod tests {
             );
         }
         assert_eq!(SOURCES.len(), SPECS.len());
-        let names: std::collections::HashSet<_> = SOURCES.iter().map(|s| s.family).collect();
+        let names: std::collections::HashSet<_> = SOURCES.iter().map(Source::family).collect();
         assert_eq!(names.len(), SOURCES.len(), "family names are unique");
-        let v41 = SOURCES.iter().find(|s| s.family == "v41").expect("v41 row");
+        // The names `fetch` takes are the module doc's: each spec's architecture has its directory in tools/fixture-dirs.tsv.
+        let mut taken: Vec<&str> = names.into_iter().collect();
+        taken.sort_unstable();
+        assert_eq!(
+            taken,
+            [
+                "glm5next",
+                "nemotron",
+                "nemotron-bolt",
+                "qwen35moe",
+                "qwen38",
+                "v41"
+            ],
+            "the family names `fetch` documents"
+        );
+        let v41 = SOURCES
+            .iter()
+            .find(|s| s.family() == "v41")
+            .expect("v41 row");
         assert!(matches!(v41.draft, DraftSource::NotFetchable(_)));
         let glm = SOURCES
             .iter()
-            .find(|s| s.family == "glm5next")
+            .find(|s| s.family() == "glm5next")
             .expect("glm row");
         assert_eq!(glm.rev, Some("621d456e93"));
         let q36 = SOURCES
             .iter()
-            .find(|s| s.family == "qwen35moe")
+            .find(|s| s.family() == "qwen35moe")
             .expect("qwen35moe row");
         assert_eq!(
             (q36.repo, q36.quant, q36.rev),
@@ -878,12 +903,12 @@ mod tests {
         for row in &SOURCES {
             let spec = (row.spec)();
             let CardBudget::Planned(planner) = spec.card_budget else {
-                println!("{}: a fixed budget, nothing planned to check", row.family);
+                println!("{}: a fixed budget, nothing planned to check", row.family());
                 continue;
             };
-            let dir = root.join(row.family);
+            let dir = root.join(row.family());
             if !dir.is_dir() {
-                println!("{}: no fixture directory {}", row.family, dir.display());
+                println!("{}: no fixture directory {}", row.family(), dir.display());
                 continue;
             }
             let checked = first_shard(&dir, spec.stem)
@@ -900,11 +925,11 @@ mod tests {
                 Ok((budget, per_layer)) => {
                     println!(
                         "{}: budget {budget}, experts a layer {per_layer:?}",
-                        row.family
+                        row.family()
                     );
-                    held.push(row.family);
+                    held.push(row.family());
                 }
-                Err(e) => bad.push(format!("{}: {e}", row.family)),
+                Err(e) => bad.push(format!("{}: {e}", row.family())),
             }
         }
         assert!(

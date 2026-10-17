@@ -41,16 +41,81 @@ pub const VARIANT_ENV: &str = "BLOOMERY_FIXTURE_VARIANT";
 /// [`keys`].
 pub const LINE_PREFIX: &str = "# fixture\t";
 
-/// The directory of each architecture's fixture under the root. An
-/// architecture not listed has no fixture.
-const DIRS: &[(&str, &str)] = &[
-    ("qwen4exp", "qwen38"),
-    ("deepseek41", "v41"),
-    ("glm5next", "glm5next"),
-    ("nemotron_h", "nemotron"),
-    ("nemotron_h_moe", "nemotron-bolt"),
-    ("qwen35moe", "qwen35moe"),
-];
+/// The architecture-to-directory table, `tools/fixture-dirs.tsv`: a row `arch<TAB>dir` a line, `#` and blank lines aside. The
+/// shell reads the same file (`tools/ref/ref-paths.sh`).
+const DIRS_TABLE: &str = include_str!("../../../tools/fixture-dirs.tsv");
+
+/// A row's `dir` for a family with no fixture file of its own: a command runs on the profile's file, and there is no directory.
+pub const SELF: &str = "self";
+
+/// What the shell says of an architecture the table does not name; never a row's `dir`.
+const NONE: &str = "none";
+
+/// The rows of a table text, `(arch, dir)` in file order.
+///
+/// # Errors
+/// A line that is not two columns, an architecture that is empty or in the table twice, a `dir` that is empty, `none` or holds a
+/// byte other than a lower-case letter, a digit or `-`, and a directory two architectures share.
+fn parse_dirs(text: &str) -> Result<Vec<(&str, &str)>, String> {
+    let mut rows: Vec<(&str, &str)> = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let at = n + 1;
+        let cols: Vec<&str> = line.split('\t').collect();
+        let [arch, dir] = cols.as_slice() else {
+            return Err(format!(
+                "line {at} has {} columns, want arch and dir",
+                cols.len()
+            ));
+        };
+        if arch.is_empty() || rows.iter().any(|(a, _)| a == arch) {
+            return Err(format!(
+                "line {at}: the architecture {arch:?} is empty or in the table twice"
+            ));
+        }
+        if dir.is_empty()
+            || !dir
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(format!(
+                "line {at}: the directory {dir:?} is lower-case letters, digits and '-'"
+            ));
+        }
+        if *dir == NONE {
+            return Err(format!(
+                "line {at}: the directory {NONE:?} is what an architecture with no row has"
+            ));
+        }
+        if *dir != SELF && rows.iter().any(|(_, d)| d == dir) {
+            return Err(format!(
+                "line {at}: the directory {dir:?} is another architecture's"
+            ));
+        }
+        rows.push((arch, dir));
+    }
+    Ok(rows)
+}
+
+/// The table's rows with a directory: `(arch, dir)`, the `self` rows left out.
+///
+/// # Panics
+/// On a table [`parse_dirs`] refuses; the embedded table is held by a test, so none ships.
+fn dirs() -> Vec<(&'static str, &'static str)> {
+    parse_dirs(DIRS_TABLE)
+        .unwrap_or_else(|e| panic!("tools/fixture-dirs.tsv: {e}"))
+        .into_iter()
+        .filter(|&(_, dir)| dir != SELF)
+        .collect()
+}
+
+/// The directory of `arch`'s fixture under the root, `None` for an architecture the table does not name and for a `self` one.
+#[must_use]
+pub fn dir_of(arch: &str) -> Option<&'static str> {
+    dirs().into_iter().find(|&(a, _)| a == arch).map(|(_, d)| d)
+}
 
 /// The prefix of every key the fixture generator writes (`bloomery_model`'s
 /// `fixture` module owns them).
@@ -248,8 +313,8 @@ pub fn first_shard(arch: &str) -> Result<String, RefError> {
 /// one are [`RefError::Missing`], naming the architecture or the directory and
 /// what was found.
 pub fn first_shard_in(root: &str, arch: &str) -> Result<String, RefError> {
-    let Some(&(_, dir)) = DIRS.iter().find(|(a, _)| *a == arch) else {
-        let known: Vec<&str> = DIRS.iter().map(|(a, _)| *a).collect();
+    let Some(dir) = dir_of(arch) else {
+        let known: Vec<&str> = dirs().into_iter().map(|(a, _)| a).collect();
         return Err(RefError::missing(
             PathBuf::new(),
             format!(
