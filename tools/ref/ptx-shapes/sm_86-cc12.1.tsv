@@ -95,7 +95,6 @@ generate_ds41   ds41_ring_commit                         0           0
 generate_ds41   ds41_rope_tail                           0           0
 generate_ds41   ds41_router                              0           0
 generate_ds41   ds41_router_pick                         0           0
-generate_ds41   ds41_router_scores                       0           0
 generate_ds41   ds41_rows_to_tokens                      0           0
 generate_ds41   ds41_shexp_gate_up                       0           0
 generate_ds41   ds41_shexp_gate_up_q3k                   0           0
@@ -145,7 +144,6 @@ generate_ds41   gemm_route_remap                         0           0
 generate_ds41   gemm_swiglu_quant                        0           0
 generate_ds41   glm5next_router                          0           0
 generate_ds41   glm5next_router_pick                     0           0
-generate_ds41   glm5next_router_scores                   0           0
 generate_ds41   gqa_flash_merge                          0           0
 generate_ds41   gqa_flash_merge_256                      0           0
 generate_ds41   gqa_flash_merge_sink                     0           0
@@ -227,7 +225,6 @@ generate_ds41   kv_norm_rope_append                      0           0
 generate_ds41   latent_rms_append                        0           0
 generate_ds41   mimo2_router                             0           0
 generate_ds41   mimo2_router_pick                        0           0
-generate_ds41   mimo2_router_scores                      0           0
 generate_ds41   moe_combine                              0           0
 generate_ds41   mtp_input                                0           0
 generate_ds41   mxfp4_gate_up_sel                        0           0
