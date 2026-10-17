@@ -449,12 +449,12 @@ blk_boxqcodes() {
 }
 # The fixture variants' table (tools/fixture-variants.tsv) against the tree, and the rules ref-paths.sh applies to a variant, on a
 # temporary fixture root: six columns a row, unique tags of lower-case letters and digits, a family that has a fixture directory in
-# ref-paths.sh's table, recipes that are recipes of the justfile; then the paths (a variant's root, its set prefix, the directory a
+# fixture-dirs.tsv's table, recipes that are recipes of the justfile; then the paths (a variant's root, its set prefix, the directory a
 # writer is given) and each refusal by name and exit code: a real tier, a tag the table does not name, one of another family, one
 # that is no tag, a family with no fixture file, a variant file that is not there.
 blk_fixturevariants() {
-  local jf=$JF tsv rp d n=0 out vars
-  tsv=$(dirname "$0")/fixture-variants.tsv rp=$(dirname "$0")/ref/ref-paths.sh
+  local jf=$JF tsv rp dirs d n=0 out vars
+  tsv=$(dirname "$0")/fixture-variants.tsv rp=$(dirname "$0")/ref/ref-paths.sh dirs=$(dirname "$0")/fixture-dirs.tsv
   d=$(mktemp -d)
   # shellcheck disable=SC2064
   trap "rm -rf '$d'" RETURN
@@ -468,8 +468,8 @@ blk_fixturevariants() {
     case $tag in '' | *[!a-z0-9]*) echo "check-recipes: $tsv: '$tag' is not lower-case letters and digits" >&2; return 1 ;; esac
     case " $tags " in *" $tag "*) echo "check-recipes: $tsv names the tag $tag twice" >&2; return 1 ;; esac
     tags="$tags $tag"
-    grep -E "__fixture_dir=[a-z0-9]+ ;;" "$rp" | grep -vE "=(self|none) ;;" | grep -E "(^|[ (|])$family([ )|]|\$)" > /dev/null ||
-      { echo "check-recipes: $tsv: family $family has no fixture directory row in $rp" >&2; return 1; }
+    awk -F'\t' -v f="$family" '$0 !~ /^#/ && $1 == f && $2 != "self" { found = 1 } END { exit !found }' "$dirs" ||
+      { echo "check-recipes: $tsv: family $family has no fixture directory row in $dirs" >&2; return 1; }
     for r in $recipes; do
       grep -qE "^$r:" "$jf" || { echo "check-recipes: $tsv: $r is no recipe of the justfile" >&2; return 1; }
     done
@@ -572,6 +572,54 @@ blk_fixturevariants() {
   [ "$f_rc" = 0 ] && [ "$f_out" = "$real" ] || { echo "check-recipes: dspark_model, real tier: rc=$f_rc out='$f_out', want '$real' ($(cat "$d/f.err"))" >&2; return 1; }
   echo "check-recipes: deepseek41 fixture draft: source stays up, dspark_model refuses"
   echo "check-recipes: fixture variants ok ($n row(s): $tags )"
+}
+
+# The fixture directory table (tools/fixture-dirs.tsv) as ref-paths.sh reads it, on a temporary fixture root: a row with a directory
+# resolves the first shard of that directory, a `self` row runs on the profile's file (no fixture file, exit 0), a profile the table
+# does not name has no fixture (66, naming the family) and a table that is not there is a named 66, never a family with no fixture.
+blk_fixturedirs() {
+  local dirs rp d n=0 arch dir out t
+  dirs=$(dirname "$0")/fixture-dirs.tsv rp=$(dirname "$0")/ref/ref-paths.sh
+  d=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$d'" RETURN
+  rpd() { # rpd PROFILE [ref-paths.sh] : the fixture tier's FIXTURE_FILE and FIXTURE_DIR, then the exit code
+    env -i PATH="$PATH" BLOOMERY_FIXTURE_ROOT="$d/fixtures" BLOOMERY_MODEL="$1" BLOOMERY_TIER=fixture bash -c '. "$1" && printf "%s|%s" "$FIXTURE_FILE" "$FIXTURE_DIR"' _ "${2:-$rp}" 2>&1
+    echo "|rc=$?"
+  }
+  while IFS=$'\t' read -r arch dir; do
+    case $arch in '' | '#'*) continue ;; esac
+    n=$((n + 1))
+    if [ "$dir" = self ]; then
+      out=$(rpd "$arch")
+      [ "$out" = "||rc=0" ] || { echo "check-recipes: $dirs: $arch is a self row, ref-paths.sh gave: $out" >&2; return 1; }
+    else
+      mkdir -p "$d/fixtures/$dir"
+      touch "$d/fixtures/$dir/f-00001-of-00001.gguf"
+      out=$(rpd "$arch")
+      [ "$out" = "$d/fixtures/$dir/f-00001-of-00001.gguf|$d/fixtures/$dir|rc=0" ] ||
+        { echo "check-recipes: $dirs: $arch is the directory $dir, ref-paths.sh gave: $out" >&2; return 1; }
+    fi
+  done < "$dirs"
+  [ "$n" -gt 0 ] || { echo "check-recipes: $dirs holds no row" >&2; return 1; }
+  # A copy of the reader beside a stub profile the table does not name, and then with no table.
+  t=$d/tree
+  mkdir -p "$t/tools/ref/models"
+  cp "$rp" "$t/tools/ref/ref-paths.sh"
+  cp "$dirs" "$t/tools/fixture-dirs.tsv"
+  printf 'MODEL_NAME=nofixfam\nMODEL=/models/real/nofixfam.gguf\n' > "$t/tools/ref/models/nofixfam.sh"
+  out=$(rpd nofixfam "$t/tools/ref/ref-paths.sh")
+  case $out in
+    *"the family 'nofixfam' has no fixture yet (no row in "*"fixture-dirs.tsv)"*"|rc=66") ;;
+    *) echo "check-recipes: ref-paths.sh, a profile the table does not name: wanted a named 66 in: $out" >&2; return 1 ;;
+  esac
+  rm -f "$t/tools/fixture-dirs.tsv"
+  out=$(rpd nofixfam "$t/tools/ref/ref-paths.sh")
+  case $out in
+    *"fixture-dirs.tsv, the table of the fixture directories, is not there"*"|rc=66") ;;
+    *) echo "check-recipes: ref-paths.sh, no table file: wanted a named 66 in: $out" >&2; return 1 ;;
+  esac
+  echo "fixture dirs: $n rows read by ref-paths.sh"
 }
 # A fixture-tier command exports an empty draft path when it reads DSPARK_MODEL out of ref-paths.sh
 # other than through dspark_model: zero drafts leave the variable empty and the export reaches a file
@@ -881,7 +929,7 @@ proc_leg
 unset CPU_GUARD_PROC_LEG
 
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner wt)
 for b in "${BLOCKS[@]}"; do
   ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc

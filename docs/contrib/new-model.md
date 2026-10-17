@@ -114,8 +114,8 @@ weight set fits in host memory (`crates/model/src/fixture/mod.rs:1-30`); the byt
 source header alone (`:29`), and only headers are hashed (`plan.rs:224`). Three families have one
 (`refset/src/fixture.rs:33-37`); MiMo does not, so its end-to-end gate is a weekly that the fixture tier refuses by
 name (`justfile:2016`). To add one: a `FixtureSpec` in `arch/<arch>/fixture.rs`, a line in `SPECS`
-(`bin/fixture.rs:44`), `DIRS` (`refset/src/fixture.rs:33`) and the table in `ref-paths.sh:73-79` (the Rust and shell
-twins must agree), then `just dump-ref-fixture` (`justfile:609`) for the `fx_` sets, which needs ik: B.
+(`bin/fixture.rs:44`) and a row of `tools/fixture-dirs.tsv` (the one table of the fixture directories: the Rust readers, `ref-paths.sh`
+and the tools read that file), then `just dump-ref-fixture` (`justfile:609`) for the `fx_` sets, which needs ik: B.
 `fixture fetch <family> <out>` (`bin/fixture.rs`, the source rows beside `SPECS`) regenerates a fixture from the
 source's GGUF headers alone, read by HTTP Range: the output is byte-identical to the box's fixtures for V4.1, Qwen3.8
 and GLM-5.3-Flash. V4.1's DSpark draft is the exception, made from a local copy with no public header.

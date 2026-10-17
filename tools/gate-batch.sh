@@ -128,7 +128,7 @@
 #      is the whole declaration: this runner reads the recipe's text, the box command runs the same script (it stops a run by hand
 #      under BLOOMERY_TIER=fixture by name, exit 66, before a build or a lock). A recipe whose closure holds such a call is real-only
 #      too. (2) no-fixture: the recipe's family (the BLOOMERY_MODEL of its box line, else the default profile) has no row in the
-#      fixture table of tools/ref/ref-paths.sh — a profile that table does not name falls to its `*)` row, `none`, where box.sh
+#      fixture table, tools/fixture-dirs.tsv — a profile that table does not name has no fixture (`none`), where box.sh
 #      exits 66; this runner reads that table, so the fact has one owner. (3) real-file: the family's row is `self` (the real file
 #      stands: no fixture file, and a command that opens no model runs as in the real tier) and a cargo target the recipe builds or
 #      runs reaches the gate fence, `Tier::check_file` (crates/gpu-gates/src/tier.rs), which refuses that file as not a fixture.
@@ -944,17 +944,8 @@ RT
   cp "$(dirname "$self")/ref/fixture-only.sh" "$t/tools/ref/fixture-only.sh"
   cat > "$t/tools/ref/ref-paths.sh" << 'RP'
 : "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deepseek2}}"
-case "${BLOOMERY_TIER:-real}" in
-  fixture)
-    case "$BLOOMERY_MODEL" in
-      qwen4exp) __fixture_dir=qwen38 ;;
-      deepseek41) __fixture_dir=v41 ;;
-      deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;
-      *) __fixture_dir=none ;;
-    esac
-    ;;
-esac
 RP
+  printf '%s\t%s\n' qwen4exp qwen38 deepseek41 v41 deepseek2 self qwen3moe self qwen35moe self qwen35 self > "$t/tools/fixture-dirs.tsv"
   # Unpinned, v41-any (50 s, balanced) would go to lane B: lane A holds v41-a's 100 s.
   printf '%s\t%s\t%s\t%s\t%s\n' v41-a A 3090 100 2026-09-27T10:00:00+0900 v41-any B a6000 50 2026-09-27T10:00:00+0900 \
     plain-any B a6000 10 2026-09-27T10:00:00+0900 host B none 5 2026-09-27T10:00:00+0900 > "$t/times.tsv"
@@ -2345,10 +2336,10 @@ SH
     '^DONE total=3 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=1 real_only=1 deferred_list=[^ ]*/c-fo-fx/deferred.list$'
   want_not '  … with no fixture_only= in it' "$t/target/c-fo-fx/run.log" '^DONE .*fixture_only='
   # fxonly:end A
-  # no-fixture (the header's deferred paragraph, kind 2): a family the fixture table of tools/ref/ref-paths.sh does not name is deferred
+  # no-fixture (the header's deferred paragraph, kind 2): a family the fixture table (tools/fixture-dirs.tsv) does not name is deferred
   # in the fixture tier, never run and never red; the table is read from that file, so a family it names runs.
   check 'no-fixture: in the real tier a recipe of a family with no fixture is placed as usual' 0 '^x-glm	X	solo	' "${gb[@]}" --classes
-  check '  … in the fixture tier it is deferred, named by its family' 0 '^x-glm	D	no-fixture	-	.*family glm5next: no row in the fixture table of tools/ref/ref-paths.sh \(box.sh exits 66\)' \
+  check '  … in the fixture tier it is deferred, named by its family' 0 '^x-glm	D	no-fixture	-	.*family glm5next: no row in the fixture table, tools/fixture-dirs.tsv \(box.sh exits 66\)' \
     "${gb[@]}" --tier fixture --classes
   check '  … a family with a fixture directory runs (qwen4exp)' 0 '^x-q	X	solo	' "${gb[@]}" --tier fixture --classes
   check '  … a family whose real file stands runs (the default profile)' 0 '^x-none	X	solo	' "${gb[@]}" --tier fixture --classes
@@ -2582,17 +2573,24 @@ SH
   want_no_row '  … and made no box call at all' "$t/fake-state/box.log" '1'
   check "real-file: the tree's own recipes.py reaches the fence for a gate that opens the model, and not for one that opens none" 0 \
     '^gate-gpu-p1	D	real-file	-	family deepseek2: .* bloomery-gpu-gates:bin:gate_p1 reaches the fixture fence at crates/gpu-gates/src/bin/gate_p1\.rs:[0-9]+ \(' bash "$self" --tier fixture --classes
-  # The fixture table is ref-paths.sh's: a table this reader cannot read, or whose default is not `none`, is a named error.
-  cp "$t/tools/ref/ref-paths.sh" "$t/ref-paths.good"
-  sed -i.bak '/__fixture_dir=/d' "$t/tools/ref/ref-paths.sh" && rm -f "$t/tools/ref/ref-paths.sh.bak"
-  check 'no-fixture: a ref-paths.sh with no fixture table: a named error' 65 'no fixture table .* tools/gate-batch.sh reads which families have a fixture there' "${gb[@]}" --tier fixture --classes
+  # The fixture table is tools/fixture-dirs.tsv's: a table this reader cannot read is a named error.
+  cp "$t/tools/fixture-dirs.tsv" "$t/fixture-dirs.good"
+  rm -f "$t/tools/fixture-dirs.tsv"
+  check 'no-fixture: no fixture table file: a named error' 65 'fixture-dirs.tsv cannot be read .*: the fixture tier.s family table is read there' "${gb[@]}" --tier fixture --classes
   check '  … the real tier never reads it' 0 '^x-glm	X	solo	' "${gb[@]}" --classes
-  cp "$t/ref-paths.good" "$t/tools/ref/ref-paths.sh"
-  sed -i.bak 's/\*) __fixture_dir=none ;;/*) __fixture_dir=v41 ;;/' "$t/tools/ref/ref-paths.sh" && rm -f "$t/tools/ref/ref-paths.sh.bak"
-  check "no-fixture: a table whose *) row is not none: a named error" 65 "the fixture table's .\*\). row is 'v41', not none" "${gb[@]}" --tier fixture --classes
-  cp "$t/ref-paths.good" "$t/tools/ref/ref-paths.sh"
-  # The real table: the tree's own ref-paths.sh parses, and the family it names runs (a converted V4.1 gate is balanced, not deferred).
-  check "no-fixture: the tree's own tools/ref/ref-paths.sh is a table this runner reads" 0 '^gate-gpu-ds41-step	F	balanced	' bash "$self" --tier fixture --classes
+  printf '# no rows\n' > "$t/tools/fixture-dirs.tsv"
+  check 'no-fixture: a table with no row: a named error' 65 'fixture-dirs.tsv: no row .* tools/gate-batch.sh reads which families have a fixture there' "${gb[@]}" --tier fixture --classes
+  { cat "$t/fixture-dirs.good"; printf '%s\t%s\n' glm5next none; } > "$t/tools/fixture-dirs.tsv"
+  check "no-fixture: a row whose directory is none: a named error" 65 'line 7 .*glm5next.* is not .<profile><TAB><dir>.: a profile name, then a directory' "${gb[@]}" --tier fixture --classes
+  { cat "$t/fixture-dirs.good"; printf '%s\t%s\n' qwen4exp v41x; } > "$t/tools/fixture-dirs.tsv"
+  check "no-fixture: a profile in the table twice: a named error" 65 'line 7: the profile .qwen4exp. is in the table twice' "${gb[@]}" --tier fixture --classes
+  cp "$t/fixture-dirs.good" "$t/tools/fixture-dirs.tsv"
+  # The real table: the tree's own tools/fixture-dirs.tsv parses, and the family it names runs (a converted V4.1 gate is balanced, not deferred).
+  check "no-fixture: the tree's own tools/fixture-dirs.tsv is a table this runner reads" 0 '^gate-gpu-ds41-step	F	balanced	' bash "$self" --tier fixture --classes
+  out=$(bash "$self" --tier fixture --classes 2>&1) || fail "no-fixture: the tree's own table: the classes run failed" "$out"
+  if grep -q '^gate-gpu-nemotron-e2e	F	balanced	' <<< "$out" && grep -q '^gate-gpu-nemotron-h-moe-e2e	F	balanced	' <<< "$out"; then
+    pass "no-fixture: the tree's own table names both Nemotron families (nemotron_h, nemotron_h_moe), whose gates the fixture tier places"
+  else fail "no-fixture: the tree's own table names both Nemotron families (nemotron_h, nemotron_h_moe), whose gates the fixture tier places" "$(grep -E '^gate-gpu-nemotron' <<< "$out")"; fi
   fi
   if gb_part 14; then
   # The class's own errors, wherever the recipe sits.
@@ -4284,7 +4282,7 @@ def defer_tags(name):
     tier's (fixture-only), each shown in either tier as the recipe's own fact."""
     tags = [f"{n}: real-only call" for n in marked_of("real-only", name)]
     if tier == "fixture" and not tags and no_fixture(name):
-        tags.append(f"family {no_fixture(name)}: no row in the fixture table of tools/ref/ref-paths.sh (box.sh exits 66)")
+        tags.append(f"family {no_fixture(name)}: no row in the fixture table, tools/fixture-dirs.tsv (box.sh exits 66)")
     if tier == "fixture" and not tags and real_file(name):
         target, site, called = real_file(name)
         tags.append(f"family {family(name)}: its fixture-table row is self (the real file stands, no fixture file) and {target} "
@@ -4686,33 +4684,32 @@ FIXTURE_TABLE = []
 
 
 def fixture_table():
-    """(have, own): the profiles with a row in the fixture tier's table of tools/ref/ref-paths.sh (`<profiles> ) __fixture_dir=<dir>
-    ;;`) — a fixture directory, or `self` — and those whose row is `self`. Every other profile falls to the table's `*)` row, `none`,
-    where tools/box.sh exits 66 under the fixture tier. The table is that file's, read here once; a table this reader does not
-    understand is a named error."""
+    """(have, own): the profiles with a row in the fixture tier's table, tools/fixture-dirs.tsv (`<profile><TAB><dir>`; the file
+    tools/ref/ref-paths.sh and crates/refset/src/fixture.rs read too) — a fixture directory, or `self` — and those whose row is
+    `self`. Every other profile has no row, where tools/box.sh exits 66 under the fixture tier. The table is that file's, read here
+    once; a table this reader does not understand is a named error."""
     if not FIXTURE_TABLE:
-        path = os.path.join(root, "tools/ref/ref-paths.sh")
+        path = os.path.join(root, "tools/fixture-dirs.tsv")
         try:
             with open(path, encoding="utf-8") as fh:
                 text = fh.read()
         except OSError as e:
             fail(f"{path} cannot be read ({e.strerror}): the fixture tier's family table is read there")
-        m = re.search(r'^\s*case "\$BLOOMERY_MODEL" in\n((?:\s*[^\n]*\) __fixture_dir=[a-z0-9_-]+ ;;\n)+)\s*esac$', text, re.M)
-        if not m:
-            fail(f"{path}: no fixture table (`case \"$BLOOMERY_MODEL\" in … ) __fixture_dir=<dir> ;; … esac`) — tools/gate-batch.sh reads which "
-                 "families have a fixture there")
-        have, own, default = set(), set(), None
-        for row in m.group(1).strip().split("\n"):
-            pats, dirname = re.fullmatch(r"\s*(.*?)\) __fixture_dir=([a-z0-9_-]+) ;;", row).groups()
-            for pat in (x.strip() for x in pats.split("|")):
-                if pat == "*":
-                    default = dirname
-                elif dirname != "none":
-                    have.add(pat)
-                    if dirname == "self":
-                        own.add(pat)
-        if default != "none":
-            fail(f"{path}: the fixture table's `*)` row is {default!r}, not none: a family without a row must be one with no fixture")
+        have, own = set(), set()
+        for n, line in enumerate(text.splitlines(), 1):
+            if not line.strip() or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if len(cols) != 2 or not re.fullmatch(r"[A-Za-z0-9_-]+", cols[0]) or not re.fullmatch(r"[a-z0-9-]+", cols[1]) or cols[1] == "none":
+                fail(f"{path}: line {n} ({line.strip()[:60]!r}) is not `<profile><TAB><dir>`: a profile name, then a directory of lower-case "
+                     "letters, digits and '-' (or `self`; never `none`) — tools/gate-batch.sh reads which families have a fixture there")
+            if cols[0] in have:
+                fail(f"{path}: line {n}: the profile {cols[0]!r} is in the table twice")
+            have.add(cols[0])
+            if cols[1] == "self":
+                own.add(cols[0])
+        if not have:
+            fail(f"{path}: no row (`<profile><TAB><dir>`) — tools/gate-batch.sh reads which families have a fixture there")
         FIXTURE_TABLE.append((have, own))
     return FIXTURE_TABLE[0]
 
@@ -6054,7 +6051,7 @@ if [ "$ND" != 0 ]; then
       case $kind in
         real-only) [ "$ND_RO" = 0 ] || echo "# real-only: no fixture-tier conversion (bash tools/ref/real-only.sh in the recipe's box command)" ;;
         fixture-only) [ "$ND_FX" = 0 ] || echo "# fixture-only: sets on the fixture tier only, no real-tier run (bash tools/ref/fixture-only.sh in the recipe's box command)" ;;
-        no-fixture) [ "$ND_NF" = 0 ] || echo "# no-fixture: the recipe's family has no row in the fixture table of tools/ref/ref-paths.sh (box.sh exits 66)" ;;
+        no-fixture) [ "$ND_NF" = 0 ] || echo "# no-fixture: the recipe's family has no row in the fixture table, tools/fixture-dirs.tsv (box.sh exits 66)" ;;
         variant) [ "$ND_VR" = 0 ] || echo "# variant: the item runs on a fixture variant (tools/fixture-variants.tsv); the real tier opens none (tools/ref/ref-paths.sh exits 64)" ;;
         real-file) [ "$ND_RF" = 0 ] || echo "# real-file: the recipe's family runs on its real file (its fixture-table row is self) and a target of the recipe reaches the fixture fence (tools/recipes.py opens), which refuses that file" ;;
       esac

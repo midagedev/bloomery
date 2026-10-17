@@ -214,7 +214,7 @@ on an input the machine did not have, except `gate-gpu-kquant` on the RTX 5090.
 ## 4. Fixtures and reference sets
 
 A fixture-tier gate reads two inputs: the family's fixture and the `fx_` reference sets. Three families have a fixture
-(`crates/refset/src/fixture.rs`, `DIRS`); MiMo and the older families do not.
+(`tools/fixture-dirs.tsv`); MiMo and the older families do not.
 
 1. **Make `/models/fixtures` exist** on your machine; a symlink to where you keep the files is enough, and it needs
    root once ([`dgx-spark.md`](dgx-spark.md) section 11, answer 2). A set's `# model` line states the first shard's
@@ -229,7 +229,7 @@ A fixture-tier gate reads two inputs: the family's fixture and the `fx_` referen
        cargo run --release -p bloomery-model --bin fixture -- fetch glm5next /models/fixtures/glm5next
 
    The word after `fetch` is the family's name in `SOURCES` (`crates/model/src/bin/fixture.rs`), whose row gives the
-   source repo, quant and revision. The directory is the one `DIRS` maps the family's architecture to (`qwen4exp` to
+   source repo, quant and revision. The directory is the one `tools/fixture-dirs.tsv` maps the family's architecture to (`qwen4exp` to
    `qwen38`, `deepseek41` to `v41`, `glm5next` to `glm5next`), and `fetch` refuses it when it exists already. `fetch`
    reads a few MB of headers per shard by HTTP Range and writes each shard at its listed length as a sparse file. A
    fixture's bytes are a function of the seed and the source header alone (`crates/model/src/fixture/mod.rs`), and the
