@@ -14,13 +14,8 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use gguf::GgmlType;
-use model::placement::{Plan, PlanLevers, workstation};
+use model::placement::{self, Plan, PlanLevers, workstation};
 use models::{Act, Ffn, Mixer, RopeMode, Score, ToolFormat};
-
-/// The placement types the shared clauses name as `crate::placement`.
-mod placement {
-    pub use model::placement::*;
-}
 
 #[path = "common/host_split.rs"]
 mod host_split;
@@ -51,6 +46,9 @@ const SHAPES: &[((u32, u32), usize)] = &[
     ((432, 2560), 6),
     ((496, 2560), 3),
 ];
+
+/// The routed experts of the file (the sum of its MoE layers' counts).
+const ROUTED: u64 = 13_824;
 
 /// Each tensor family (the name past `blk.N.`) and its type.
 const FAMILIES: &[(&str, GgmlType)] = &[
@@ -260,7 +258,7 @@ fn hw_nemotron_h_moe_header() {
     if shapes != want_shapes {
         bad.push(format!("expert shapes {shapes:?}"));
     }
-    if routed != 13_824 || hp.n_expert != 496 {
+    if u64::from(routed) != ROUTED || hp.n_expert != 496 {
         bad.push(format!(
             "{routed} routed experts, expert_count {}",
             hp.n_expert
@@ -320,9 +318,6 @@ fn hw_nemotron_h_moe_header() {
 
 /// The context the plans are made at.
 const CTX: u64 = 4096;
-
-/// The routed experts of the file (the sum of its MoE layers' counts).
-const ROUTED: u64 = 13_824;
 
 /// The card room of the 3060 host's card, [`PlanLevers::card_budget_bytes`]
 /// standing in for it: `BLOOMERY_CARD_BUDGET=12G`.
@@ -420,16 +415,7 @@ fn hw_nemotron_h_moe_plans_the_host_tier() {
                 if format!("{placed:?}") != format!("{card:?}") {
                     bad.push(format!("{name}: Placed is not the Card plan"));
                 }
-                let c = &card.cards[0];
-                let budget = c.dense_bytes
-                    + c.rounding_bytes
-                    + c.kv_bytes
-                    + c.stage_rows_bytes
-                    + c.expert_bytes / 2
-                    + machine.cards[0]
-                        .set_aside_bytes()
-                        .expect("bounded set-aside")
-                    + machine.cards[0].margin_bytes;
+                let budget = host_split::half_expert_budget(card);
                 println!("{name}: the partial arm's budget B = {budget}");
                 let levers = PlanLevers {
                     card_budget_bytes: Some(budget),

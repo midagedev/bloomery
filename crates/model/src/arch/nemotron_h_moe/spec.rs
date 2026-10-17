@@ -105,7 +105,7 @@ mod tests {
 
     use super::super::names;
     use super::super::place::Experts;
-    use super::host_split::prefix_split;
+    use super::host_split::{half_expert_budget, prefix_split};
     use crate::arch::coverage;
     use crate::arch::synthetic::{Ty, V, header_typed};
     use crate::placement::Role;
@@ -486,17 +486,7 @@ mod tests {
     #[test]
     fn the_fixture_layout_plans_whole_card() {
         use crate::placement::{CardFormat, Device, Format, PlanLevers, workstation};
-        let path = header_typed(
-            "nhm-fixture",
-            "nemotron_h_moe",
-            &FIXTURE.keys(),
-            &[("tokenizer.ggml.pre", V::Str("pixtral"))],
-            &FIXTURE.tensors(),
-        );
-        let split = gguf::Split::open(&path).expect("the synthetic header opens");
-        let _ = std::fs::remove_file(&path);
-        let inputs = super::super::place::read(&split)
-            .unwrap_or_else(|e| panic!("the fixture layout is refused: {e}"));
+        let inputs = fixture_inputs("nhm-fixture");
         let machine = workstation::plan_gate(inputs.model.layers);
         let levers = PlanLevers::default();
         let plan = inputs
@@ -561,38 +551,16 @@ mod tests {
     #[test]
     fn a_card_too_small_for_every_expert_is_refused() {
         use crate::placement::{PlanLevers, workstation};
-        let path = header_typed(
-            "nhm-spill",
-            "nemotron_h_moe",
-            &FIXTURE.keys(),
-            &[("tokenizer.ggml.pre", V::Str("pixtral"))],
-            &FIXTURE.tensors(),
-        );
-        let split = gguf::Split::open(&path).expect("the synthetic header opens");
-        let _ = std::fs::remove_file(&path);
-        let inputs = super::super::place::read(&split)
-            .unwrap_or_else(|e| panic!("the fixture layout is refused: {e}"));
+        let inputs = fixture_inputs("nhm-spill");
         let machine = workstation::plan_gate(inputs.model.layers);
         let levers = PlanLevers::default();
         let whole = inputs
             .plan(&machine, 4, &levers)
             .expect("the gate machine holds every expert");
         assert_eq!(whole.host.experts, 0);
-        let (dense, rounding, kv, rows, experts) = (
-            whole.cards[0].dense_bytes,
-            whole.cards[0].rounding_bytes,
-            whole.cards[0].kv_bytes,
-            whole.cards[0].stage_rows_bytes,
-            whole.cards[0].expert_bytes,
-        );
+        let budget = half_expert_budget(&whole);
         let mut small = machine;
-        small.cards[0].usable_bytes = dense
-            + rounding
-            + kv
-            + rows
-            + experts / 2
-            + small.cards[0].set_aside_bytes().expect("bounded set-aside")
-            + small.cards[0].margin_bytes;
+        small.cards[0].usable_bytes = budget;
         match inputs.plan(&small, 4, &levers) {
             Err(e) => assert!(
                 e.to_string()
@@ -658,15 +626,9 @@ mod tests {
         let whole = inputs
             .plan(&machine, 4, &levers)
             .expect("the gate machine holds every expert");
-        let c = &whole.cards[0];
+        let budget = half_expert_budget(&whole);
         let mut small = machine;
-        small.cards[0].usable_bytes = c.dense_bytes
-            + c.rounding_bytes
-            + c.kv_bytes
-            + c.stage_rows_bytes
-            + c.expert_bytes / 2
-            + small.cards[0].set_aside_bytes().expect("bounded set-aside")
-            + small.cards[0].margin_bytes;
+        small.cards[0].usable_bytes = budget;
         let plan = inputs
             .plan_with(&small, 4, &levers, Experts::Placed)
             .unwrap_or_else(|e| panic!("a card that holds some experts is refused: {e}"));

@@ -2,11 +2,28 @@
 //! prefix `[0, n_l)` on the card and the rest on the host
 //! (`Experts::Placed`). One owner of the clauses, for the fixture's unit gate
 //! (`nemotron_h_moe::spec`) and the real file's (`nemotron_h_moe_meta`); both
-//! name the placement types as `crate::placement`.
+//! name the placement types as `crate::placement`. Also the budget that
+//! forces the split ([`half_expert_budget`]).
 
 use std::collections::BTreeMap;
 
 use crate::placement::{Device, Format, Plan, Role};
+
+/// The one card's budget for its dense floor and half its expert bytes: the
+/// card of `plan`, shrunk to it, holds some routed experts and not all.
+///
+/// # Panics
+/// On a card whose floor passes u64 bytes.
+pub fn half_expert_budget(plan: &Plan<'_>) -> u64 {
+    let c = &plan.cards[0];
+    let card = &plan.machine.cards[0];
+    card.floor_bytes(
+        c.dense_bytes + c.rounding_bytes + c.expert_bytes / 2,
+        c.kv_bytes,
+        c.stage_rows_bytes + card.margin_bytes,
+    )
+    .expect("bounded partial-plan budget")
+}
 
 /// A layer with routed stacks, and what its plan holds of them.
 #[derive(Clone, Copy, Debug)]
