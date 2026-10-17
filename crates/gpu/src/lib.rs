@@ -59,6 +59,7 @@ pub mod lane;
 pub mod latent;
 pub mod linear;
 pub mod mamba2;
+pub mod mamba2_ssd;
 pub mod media;
 pub mod model;
 pub mod moe_fused;

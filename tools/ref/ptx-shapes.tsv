@@ -233,6 +233,7 @@ generate_ds41   latent_rms_append                        0           0
 generate_ds41   mamba2_conv_rows                         0           0
 generate_ds41   mamba2_norm_rows                         0           0
 generate_ds41   mamba2_ring_tail                         0           0
+generate_ds41   mamba2_ssd                               0           0
 generate_ds41   mamba2_step                              0           0
 generate_ds41   mamba2_steps                             0           0
 generate_ds41   mimo2_router                             0           0
@@ -514,6 +515,7 @@ gate_e2e   latent_rms_append                        0           0
 gate_e2e   mamba2_conv_rows                         0           0
 gate_e2e   mamba2_norm_rows                         0           0
 gate_e2e   mamba2_ring_tail                         0           0
+gate_e2e   mamba2_ssd                               0           0
 gate_e2e   mamba2_step                              0           0
 gate_e2e   mamba2_steps                             0           0
 gate_e2e   moe_combine                              0           0

@@ -306,7 +306,11 @@ gguf 9 2 0
 # mamba2_steps alone (its y phase reads z's staged value in its own block; the decode step keeps
 # the per-channel xor butterfly). Measured 1908/207 on the merged tree (the fold's call blocks)
 # differ from the branch pin by two; the ratchet follows the measurement.
-gpu 1908 207 10
+# PIN(2026-10-17): gpu 1908 -> 1925 blocks, a new kernel entry, not old code relaxed: mamba2_ssd
+# (the chunked SSD prompt scan, mamba2_ssd.rs) adds its kernel's sixteen blocks (the shared tile's
+# address, the head's A and D, the sigma, conv and z reads, the staging, the ldmatrix fragment reads,
+# the state's f16 copy, y's and the state's stores) and its loader's one, each with its SAFETY line.
+gpu 1925 207 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
