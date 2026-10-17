@@ -1,0 +1,35 @@
+# Round ssd: the Bolt prompt pass's Mamba-2 scan as the chunked SSD (crate::mamba2_ssd: one launch a pass and
+# layer, chunk 32, f16 mma summed in f32) in place of mamba2_steps, through Mamba2Kernels::enqueue_pass(..,
+# PassScan::Ssd); conv_rows, ring_tail and the norm unchanged. Base e30b8c933 (PASS_ROWS_MAX 4096): A6000
+# pp4096 2168.00 tok/s = 1.889 s (s2695).
+# Removed: mamba2_steps 363.2 ms a pp4096 (s2674 eager split, A6000). Added [derived]: 40 Mamba-2 layers
+# (fixture.rs: the real file's 40), one 4096-row pass each; a layer moves 449 MB (x, z, y 134.2 MB each, B/C
+# 33.6, sigma/decay 4.2, state 8.4) = 0.66 ms at ~680 GB/s; tensor 6.16 M mma.m16n8k16 = 12.6 GFMA = 0.16 ms
+# (84/104 mma a warp-chunk, 128 chunks, two blocks an SM, 222 regs, 44 032 B shared). The staging is not
+# double-buffered, so a layer's wall is DRAM plus the un-hidden compute: 0.65..1.2 ms, 26..48 ms a pp4096.
+# Effect: -(330..400 - 26..60) ms = -270..-374 ms over 1.889 s = +16.7..+24.7 % tok/s.
+# 3090 [derived, same terms, f32-accumulate mma at half rate, not timed here]: 2.466 s -> 2.07..2.15 s,
+# 1905..1979 tok/s against lcpp -ub 4096 1925.91 (s2696).
+kind: ab
+question: does the chunked SSD scan shorten Bolt's pp4096 on the A6000 by the scan term the round derived
+  (mamba2_steps out, one SSD launch a layer in)?
+term: pp tok/s @ P = 4096, Nemotron 3.5 Bolt (nemotron_h_moe, depth-qwen3moe.sh), A6000 - (SSD arm - steps
+  arm) / steps arm, paired by round
+unit: %
+predict: +16..+25
+rounds: 3
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary run scatter; the band is 16x the ruler's half-interval at
+  three rounds
+condition: one lease, BLOOMERY_CARD=a6000, BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_AB_ROUNDS=3 just
+  depth-gpu-qwen3moe 4096 bin:<e30b8c933 base tree>/target/release/generate_qwen3moe:4096, this tree carrying
+  only the enqueue_pass switch over e30b8c933; both built before the lease, order rotated each round; no row
+  carries [cold], [cpu-busy] or [other-busy]
+decide-in: land the switch with its owning gates (gate-gpu-mamba2-ssd, gate-gpu-mamba2,
+  gate-gpu-nemotron-h-moe-e2e); re-time the 3090 row in the next sitting; the next scan lever is the conv
+  pre-pass folded into the SSD staging (-336 MB a layer)
+decide-below: nsys the prefill (tools/ref/nsys-gpu.sh) and read mamba2_ssd's launch time against 0.65..1.2 ms:
+  a longer launch is the serial chunk chain (128 chunks a block, 1-2 blocks an SM) the derivation priced too
+  low; double-buffer the staging before any other step
+decide-above: nsys the prefill before claiming it: the gain past the scan term came from a neighbour (the
+  steps' scratch reads gone from L2, a pass kernel that waited on the scan); claim only the scan term, report
+  the rest beside it

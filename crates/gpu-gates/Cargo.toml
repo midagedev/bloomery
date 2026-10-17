@@ -419,6 +419,10 @@ name = "gate_mamba2"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_mamba2_ssd"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_nvfp4"
 required-features = ["gpu"]
 

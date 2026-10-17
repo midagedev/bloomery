@@ -267,6 +267,12 @@ gate-gpu-hc-gated:
 gate-gpu-mamba2:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_mamba2 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mamba2'
 
+# The chunked SSD prompt scan (bloomery_gpu::mamba2_ssd: one launch per pass, f16 tensor-core products, f32 sums) against an f64 twin of the
+# scan rule and beside the engine's f32 pass, at the Bolt widths with no model file: every y and the final state within the derived f16 bound
+# (1 to 2048 tokens, two passes in a row), bit-identical reruns, the non-finite fault and its reach, named refusals, no local depot.
+gate-gpu-mamba2-ssd:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_mamba2_ssd && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mamba2_ssd'
+
 # NVFP4 dense gemv (bloomery_gpu::mxfp4, Nvfp4Kernels) at Bolt's ssm_in / ssm_out shapes, synthetic tensors loaded through
 # Weights::load_where and run through site::kgemv: every output written, within the derived band of the host dequant
 # times the tensor's scale, bit for bit the host rule; the load's refusals by name. `gate_nvfp4 --bench-kernels` prices it.
