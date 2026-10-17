@@ -56,13 +56,17 @@
 //!    random input cannot tell the order); and a captured pass (four
 //!    nodes with a gain) replayed against the eager pass. At head_dim 72
 //!    (576 as 8 heads of one group) — a head whose channels are not a
-//!    multiple of the staging block, so the staged `z` and `x` hold masked
-//!    channels the staging zeroes — a warmed pass past two stage boundaries
-//!    equals the steps bit for bit. The pass's
+//!    multiple of the staging block, so every masked-channel rule is live —
+//!    the steps and a pass past two stage boundaries each equal the host
+//!    twin bit for bit, a defect one kernel alone carries unable to hide
+//!    behind a matching one in the other. The pass's
 //!    refusals (`u` 0, a column window past `ld`, short rows, a short `y`, a
 //!    `u` past the scratch's `max_u`, a scratch of another shape) are
 //!    clause 3's.
-//! 7. shape: the entries compile with no local depot.
+//! 7. shape: the entries compile with no local depot but the pass's
+//!    transpose-reduce — `mamba2_steps` alone, held to its pinned columns
+//!    (PIN(2026-10-17): `ld_local` 1, `st_local` 8; the decode step keeps
+//!    its per-channel butterfly and 0).
 //!
 //! The band of clause 2. Write `u = 2^-24` and `ε = 2u = 2^-23`, one ulp at
 //! most. Both sides are the same f32 program on inputs that differ only in
@@ -115,7 +119,7 @@ mod gate {
     };
     use bloomery_gpu::{Fault, FaultSite, Gpu, GpuError};
     use bloomery_gpu_gates::rounding::U;
-    use bloomery_gpu_gates::{GateError, bits_equal, no_local_depot, verdict};
+    use bloomery_gpu_gates::{GateError, bits_equal, no_local_depot, ptx_shapes, verdict};
     use cuda_core::{CudaStream, DeviceBuffer};
     use model::mamba2::{self, Checked, Geom, Token};
 
@@ -287,7 +291,9 @@ mod gate {
         };
         TokenIn {
             xbc: (0..s.conv_dim).map(|_| r.uni(-2.0, 2.0)).collect(),
-            dt: (0..s.heads).map(|_| r.uni(dt_range.0, dt_range.1)).collect(),
+            dt: (0..s.heads)
+                .map(|_| r.uni(dt_range.0, dt_range.1))
+                .collect(),
             z: (0..s.inner).map(|_| r.uni(-3.0, 3.0)).collect(),
         }
     }
@@ -446,10 +452,8 @@ mod gate {
             let st = cx.gpu.stream();
             self.ring.copy_from_host(st, ring)?;
             self.state.copy_from_host(st, scan)?;
-            self.y.copy_from_host(
-                st,
-                &vec![f32::from_bits(POISON); self.s.inner],
-            )?;
+            self.y
+                .copy_from_host(st, &vec![f32::from_bits(POISON); self.s.inner])?;
             Ok(())
         }
 
@@ -972,7 +976,13 @@ mod gate {
         ];
         let pass_cases = [
             ("pass u 0", 0, s.x0, 1, "u 0 is refused"),
-            ("pass xbc window", 2, s.ld - s.conv_dim + 1, 1, "the xbc window"),
+            (
+                "pass xbc window",
+                2,
+                s.ld - s.conv_dim + 1,
+                1,
+                "the xbc window",
+            ),
             ("pass rows short", 3, s.x0, 1, "rows.len()"),
             ("pass y short", 2, s.x0, 0, "y.len()"),
         ];
@@ -1179,9 +1189,7 @@ mod gate {
         let w = weights(s, Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
         let st = init(s, &mut r, false);
-        let toks: Vec<TokenIn> = (0..3)
-            .map(|_| token(s, Regime::Band, &mut r))
-            .collect();
+        let toks: Vec<TokenIn> = (0..3).map(|_| token(s, Regime::Band, &mut r)).collect();
         let ring0 = ring_of(s, &st, P0, false);
         let mut dev = Dev::new(cx, s, &w)?;
         let eager = dev_run(cx, &mut dev, &ring0, &st.scan, &toks, P0, true)?;
@@ -1252,10 +1260,8 @@ mod gate {
         dev.load(cx, ring, scan)?;
         dev.pos.copy_from_host(st, &[p])?;
         let rows = DeviceBuffer::from_host(st, &rows_of(&dev.s, toks))?;
-        let mut y = DeviceBuffer::from_host(
-            st,
-            &vec![f32::from_bits(POISON); toks.len() * dev.s.inner],
-        )?;
+        let mut y =
+            DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); toks.len() * dev.s.inner])?;
         let pass = Pass {
             shape: device_shape(&dev.s)?,
             u: toks.len(),
@@ -1275,8 +1281,7 @@ mod gate {
             None
         };
         let run = DevRun {
-            y: y
-                .to_host_vec(st)?
+            y: y.to_host_vec(st)?
                 .chunks(dev.s.inner)
                 .map(<[f32]>::to_vec)
                 .collect(),
@@ -1342,12 +1347,8 @@ mod gate {
         let w = weights(s, Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
         let st = init(s, &mut r, false);
-        let warm: Vec<TokenIn> = (0..WARM)
-            .map(|_| token(s, Regime::Band, &mut r))
-            .collect();
-        let toks: Vec<TokenIn> = (0..u)
-            .map(|_| token(s, Regime::Band, &mut r))
-            .collect();
+        let warm: Vec<TokenIn> = (0..WARM).map(|_| token(s, Regime::Band, &mut r)).collect();
+        let toks: Vec<TokenIn> = (0..u).map(|_| token(s, Regime::Band, &mut r)).collect();
         let mut dev = Dev::new(cx, s, &w)?;
         let warmed = dev_run(
             cx,
@@ -1377,9 +1378,7 @@ mod gate {
         let w = weights(s, Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
         let st = init(s, &mut r, true);
-        let toks: Vec<TokenIn> = (0..5)
-            .map(|_| token(s, Regime::Band, &mut r))
-            .collect();
+        let toks: Vec<TokenIn> = (0..5).map(|_| token(s, Regime::Band, &mut r)).collect();
         let mut dev = Dev::new(cx, s, &w)?;
         let ring0 = ring_of(s, &st, 0, true);
         steps_case(
@@ -1478,9 +1477,7 @@ mod gate {
             // A channel left at z = 0 carries y = 0.
             z
         };
-        let z: Vec<f32> = (0..s.heads)
-            .flat_map(|h| z_head(role(s, h)))
-            .collect();
+        let z: Vec<f32> = (0..s.heads).flat_map(|h| z_head(role(s, h))).collect();
         let d: Vec<f32> = (0..s.heads)
             .map(|h| match role(s, h) {
                 Role::Big => 128.0,
@@ -1549,9 +1546,7 @@ mod gate {
         let w = weights(s, Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
         let st = init(s, &mut r, false);
-        let toks: Vec<TokenIn> = (0..37)
-            .map(|_| token(s, Regime::Band, &mut r))
-            .collect();
+        let toks: Vec<TokenIn> = (0..37).map(|_| token(s, Regime::Band, &mut r)).collect();
         let mut dev = Dev::new(cx, s, &w)?;
         let ring0 = ring_of(s, &st, P0, false);
         let start = (&ring0[..], &st.scan[..], P0);
@@ -1569,43 +1564,63 @@ mod gate {
         Ok(ok)
     }
 
-    /// The pass at [`HD72`] (module doc, clause 6): a head whose channels
-    /// are not a multiple of the staging block, so the staged `z` and `x`
-    /// hold masked channels the staging zeroes. A warmed pass of
-    /// `2·STAGE_T + 3` rows — past two stage boundaries — against as many
-    /// steps from the same warmed start.
-    fn steps_hd72(cx: &Ctx) -> Result<bool, GateError> {
+    /// The head_dim 72 geometry (module doc, clause 6) against the host
+    /// twin: a head whose channels are not a multiple of the staging
+    /// block, so every masked-channel rule — the staged `z` and `x` slots,
+    /// the reads the channel liveness guard holds in bounds — is live at
+    /// last. Both the steps and a pass of `2·STAGE_T + 3` rows — past two
+    /// stage boundaries — equal the host bit for bit, so a defect one
+    /// kernel alone carries cannot hide behind a matching one in the other.
+    fn hd72_case(cx: &Ctx) -> Result<bool, GateError> {
         let s = &HD72;
         let seed = 0x05e9_7201;
-        let w = weights(s, Regime::Band, seed);
+        let w = weights(s, Regime::Exact, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
         let st = init(s, &mut r, false);
-        let warm: Vec<TokenIn> = (0..WARM)
-            .map(|_| token(s, Regime::Band, &mut r))
-            .collect();
         let u = 2 * STAGE_T + 3;
-        let toks: Vec<TokenIn> = (0..u)
-            .map(|_| token(s, Regime::Band, &mut r))
-            .collect();
+        let toks: Vec<TokenIn> = (0..u).map(|_| token(s, Regime::Exact, &mut r)).collect();
+        let ring0 = ring_of(s, &st, P0, false);
+        let want = host_run(s, &w, &st, &toks, true)?;
         let mut dev = Dev::new(cx, s, &w)?;
-        let warmed = dev_run(
+        let steps = dev_run(cx, &mut dev, &ring0, &st.scan, &toks, P0, true)?;
+        let (pass, _) = pass_run(
             cx,
             &mut dev,
-            &ring_of(s, &st, P0, false),
-            &st.scan,
-            &warm,
-            P0,
-            true,
-        )?;
-        let p = P0 + WARM as u32;
-        steps_case(
-            cx,
-            &format!("hd72 u={u} p={p}"),
-            &mut dev,
-            (&warmed.ring, &warmed.scan, p),
+            (&ring0[..], &st.scan[..], P0),
             &toks,
             true,
-        )
+            false,
+        )?;
+        let ring_want = ring_after(s, &ring0, &toks, P0);
+        let mut ok = true;
+        for (label, got) in [("steps", &steps), ("pass", &pass)] {
+            let mut rows_same = 0;
+            let mut shown = 0;
+            for (t, (a, b)) in got.y.iter().zip(&want.y).enumerate() {
+                let (n, first) = diff(a, b);
+                if n == 0 {
+                    rows_same += 1;
+                } else if shown < 3 {
+                    shown += 1;
+                    println!("hd72 {label} u={u}: row {t} first difference {first:?} ({n} values)");
+                }
+            }
+            let (ns, s_first) = diff(&got.scan, &want.scan);
+            let ring_ok = bits_equal(&got.ring, &ring_want);
+            if ns != 0 {
+                println!("hd72 {label} u={u}: state first difference {s_first:?}");
+            }
+            let hit = rows_same == want.y.len() && ns == 0 && ring_ok;
+            println!(
+                "hd72 {label} u={u}: y rows bit-identical {rows_same}/{}, state differing {ns}, \
+                 ring exact {ring_ok} {}",
+                want.y.len(),
+                verdict(hit)
+            );
+            ok &= hit;
+        }
+        ok &= clean(cx, "hd72")?;
+        Ok(ok)
     }
 
     fn check_steps(cx: &Ctx) -> Result<bool, GateError> {
@@ -1619,7 +1634,7 @@ mod gate {
         ok &= steps_start(cx)?;
         ok &= steps_tie(cx)?;
         ok &= steps_capture(cx)?;
-        ok &= steps_hd72(cx)?;
+        ok &= hd72_case(cx)?;
         println!("steps_are_steps: {}", verdict(ok));
         Ok(ok)
     }
@@ -1638,12 +1653,21 @@ mod gate {
         ok &= check_fault(&cx)?;
         ok &= check_replay(&cx)?;
         ok &= check_steps(&cx)?;
-        ok &= no_local_depot(&[
-            "mamba2_step",
-            "mamba2_steps",
-            "mamba2_ring_tail",
-            "mamba2_norm_rows",
-        ])?;
+        // The shape contract: no kernel holds local memory but the pass's
+        // transpose-reduce — mamba2_steps alone, at exactly the pinned
+        // columns (PIN(2026-10-17) in tools/ref/ptx-shapes.tsv; the decode
+        // step keeps its per-channel butterfly and stays at 0).
+        ok &= no_local_depot(&["mamba2_step", "mamba2_ring_tail", "mamba2_norm_rows"])?;
+        ok &= ptx_shapes(&["mamba2_steps"], |c, _| {
+            Ok((
+                c.depot && c.ld_local == 1 && c.st_local == 8,
+                format!(
+                    "shape kernel={} local_depot={} ld_local={} st_local={} (PIN(2026-10-17): \
+                     the pass's transpose-reduce, 1/8)",
+                    c.name, c.depot, c.ld_local, c.st_local
+                ),
+            ))
+        })?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
         }
@@ -1659,7 +1683,9 @@ mod gate {
              the prompt pass over 1 to 256 rows equals as many steps bit for bit (every y row, \
              the state, the ring; with and without the gain, from the sequence start, on a norm \
              tie, captured; at head_dim 72, a head whose channels are not a multiple of the \
-             staging block, past two stage boundaries); no local depot"
+             staging block, the steps and a pass past two stage boundaries each the host twin \
+             bit for bit); no local depot but the pass's transpose-reduce, mamba2_steps alone \
+             at its pinned 1/8"
         );
         Ok(())
     }
