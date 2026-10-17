@@ -179,6 +179,11 @@ A recipe the fixture tier cannot run ends in one of three ways:
 - a gate of a family whose fixture row is `self` (no fixture file) runs on the profile's real file, and the gate
   fence, `Tier::check_file` in `crates/gpu-gates/src/tier.rs`, refuses that file, so the gate ends red.
 
+A gate that needs a variable only you can give (`gate-gpu-qwen38-nodes-remote` needs `BLOOMERY_TIER_NODES`, the address
+of a tier node) opens with `tools/ref/needs-env.sh`, in either tier. Run by hand without the variable in
+`BLOOMERY_BOX_ENV` it stops with exit 67 naming it, and `tools/gate-batch.sh` defers it by name (`needs_env=` in its DONE
+line) instead of counting it red.
+
 A *variant item* runs a recipe on a variant fixture: the family's fixture requantized to one type map of
 `tools/fixture-variants.tsv`. `just affected` lists it as `<recipe>@BLOOMERY_FIXTURE_VARIANT=<tag>`, and
 `tools/gate-batch.sh` names a recipe's second and later items `<recipe>-2`, `<recipe>-3`. Run one by adding

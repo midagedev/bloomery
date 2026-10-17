@@ -66,6 +66,8 @@ class Item:
         self.lane = (LANE_RE.search(rest) or [None, "?"])[1]
         wall = WALL_RE.search(rest)
         self.wall = wall.group(1) if wall else None
+        # A deferred item's line names its kind first (`<stem> rc=deferred <kind> lane=- …`).
+        self.kind = rest.split()[0] if rc == "deferred" and rest.split() else ""
         field = ITEM_FIELD_RE.search(rest)
         self.recipe = field.group(1).strip() if field else stem
 
@@ -139,6 +141,8 @@ def render(item, logs_dir, do_attach):
     if item.rc == "skip":
         return head + "skip (a green run of the same inputs is in the ledger)", OK
     if item.rc == "deferred":
+        if item.kind == "needs-env":
+            return head + "deferred (an environment variable it needs was not set: not run)", OK
         return head + "deferred (runs in the other tier)", OK
     if item.rc == "yield":
         return head + "yield (a hold of another batch was up, not run)", OK
@@ -263,6 +267,11 @@ def self_test():
         check("- `gate-qdot:--cases 4` (lane A): ok, 61 s" in out, "the item= field names the recipe with its ARGS")
         check("skip" in out and "deferred" in out and "FAIL" not in out, "a skip and a deferral are no failure")
         check("Gate batch: DONE total=4" in out, "the DONE line is the identity when the log has no header line")
+
+        needs = ["gate-gpu-n rc=deferred needs-env lane=- tier=real deferred=1", "DONE total=1 red=0 tier=real deferred=1 needs_env=1"]
+        rc, out, _ = call([write("needs.log", needs)])
+        check(rc == 0 and "- `gate-gpu-n` (lane -): deferred (an environment variable it needs was not set: not run)" in out and "other tier" not in out,
+              f"a needs-env deferral is no failure and does not say it runs in the other tier: {rc} {out!r}")
 
         stdout_style = ["gate-batch: 2 items, lanes 2, logs in /h/batches/tree-a/1"] + GREEN[1:3] + ["DONE total=2 red=0 tier=real"]
         rc, out, _ = call([write("stdout.log", stdout_style)])
