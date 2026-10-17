@@ -105,6 +105,16 @@
 //! `QuantColumn` where the clamp alone would make it the limit, a non-finite
 //! limit refused by name.
 //!
+//! The squared-ReLU quantizer fold (`Gpu::enqueue_quantize_gemm_relu_sqr`,
+//! case `relu_sqr`) at K ∈ {768, 2048} for 1, 8, 64 and 4096 columns: its
+//! five planes bit for bit what `ElemKernels::enqueue_relu_sqr` then
+//! `Gpu::enqueue_quantize_gemm` write; the scales and code sums the host
+//! transcription of the quantizer gives from the transformed rows (the
+//! kernel applies a finite value `max(v, 0)²` in its load); the elem output
+//! each transformed value's bits. A NaN in a row ends as the named
+//! `QuantColumn` fault with its 128-value block refused, the other bytes
+//! what the same input with that block zeroed leaves.
+//!
 //! And once per case: a rerun bit-identical, the route and the GEMM
 //! captured into a graph whose replay equals the eager launch. Then the
 //! faults: a NaN activation ends as the named error `GpuError::Fault`, its
@@ -2032,6 +2042,101 @@ mod gate {
     /// limit, `u` outside ±limit) act on a share of the values.
     const SWIGLU_LIMITS: [f32; 2] = [10.0, 0.5];
 
+    /// The squared-ReLU quantizer fold (`Gpu::enqueue_quantize_gemm_relu_sqr`)
+    /// against the two-launch composition and the host transcription
+    /// (module doc), its fault.
+    fn relu_sqr_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if !wanted("relu_sqr") {
+            return Ok(true);
+        }
+        let gpu = dev.gpu;
+        let stream = gpu.stream();
+        let mut ok = true;
+        for k in [768usize, 2048] {
+            let max = SWIGLU_COLS[SWIGLU_COLS.len() - 1];
+            let mut fused = GemmAct::new(stream, max, k)?;
+            let mut split = GemmAct::new(stream, max, k)?;
+            let mut h = DeviceBuffer::<f32>::zeroed(stream, max * k)?;
+            for &n in &SWIGLU_COLS {
+                let xh = activations(k, n, 8800 + n as u32 + k as u32);
+                let x = DeviceBuffer::from_host(stream, &xh)?;
+                gpu.enqueue_quantize_gemm_relu_sqr(&x, n, &mut fused, gpu.unlabelled_sink())?;
+                gpu.elem().enqueue_relu_sqr(stream, &x, n * k, &mut h)?;
+                gpu.enqueue_quantize_gemm(&h, n, &mut split, gpu.unlabelled_sink())?;
+                stream.synchronize()?;
+                let planes_same = fused.q3().to_host_vec(stream)?
+                    == split.q3().to_host_vec(stream)?
+                    && fused.q4().to_host_vec(stream)? == split.q4().to_host_vec(stream)?
+                    && fused.q6().to_host_vec(stream)? == split.q6().to_host_vec(stream)?
+                    && fused.s8().to_host_vec(stream)? == split.s8().to_host_vec(stream)?
+                    && bits_equal(
+                        &fused.d8().to_host_vec(stream)?,
+                        &split.d8().to_host_vec(stream)?,
+                    );
+                let th: Vec<f32> = xh
+                    .iter()
+                    .map(|&v| {
+                        let r = if v > 0.0 { v } else { 0.0 };
+                        r * r
+                    })
+                    .collect();
+                let (dev_d8, dev_s8) = (
+                    fused.d8().to_host_vec(stream)?,
+                    fused.s8().to_host_vec(stream)?,
+                );
+                let nb = k / 128;
+                let host_ok = (0..n).all(|c| {
+                    let (codes, d8) = q8_1_codes(&th[c * k..(c + 1) * k]);
+                    (0..nb).all(|b| dev_d8[c * nb + b].to_bits() == d8[b].to_bits())
+                        && (0..k / 32).all(|j| {
+                            let s: i32 = codes[32 * j..32 * j + 32]
+                                .iter()
+                                .map(|&v| i32::from(v))
+                                .sum();
+                            dev_s8[c * (k / 32) + j] == s
+                        })
+                });
+                let transform_ok = bits_equal(&h.to_host_vec(stream)?[..n * k], &th[..n * k]);
+                let pass = planes_same && host_ok && transform_ok;
+                println!(
+                    "gemm case=relu_sqr K={k} cols={n} planes_eq_split_bits={planes_same} \
+                     host_scales_and_sums={host_ok} transform_bits={transform_ok} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+        }
+        // A NaN in one row, in block 2 of column 5: the named fault and that
+        // block refused, against the same rows with the block's values
+        // zeroed (a squared ReLU of 0).
+        let k = 768;
+        let mut act = GemmAct::new(stream, 8, k)?;
+        let mut xh = activations(k, 8, 88);
+        xh[5 * k + 256..5 * k + 384].fill(0.0);
+        gpu.clear_fault()?;
+        let x = DeviceBuffer::from_host(stream, &xh)?;
+        gpu.enqueue_quantize_gemm_relu_sqr(&x, 8, &mut act, gpu.unlabelled_sink())?;
+        let zero = planes(&act, stream)?;
+        let zero_clean = gpu.take_fault()?.is_none();
+        xh[5 * k + 300] = f32::NAN;
+        let x = DeviceBuffer::from_host(stream, &xh)?;
+        gpu.enqueue_quantize_gemm_relu_sqr(&x, 8, &mut act, gpu.unlabelled_sink())?;
+        let fault = gpu.take_fault()?;
+        let err = fault.map(|fault| GpuError::fault("gate_gemm", fault));
+        let block_refused = refused_block(&planes(&act, stream)?, &zero, 5 * (k / 128) + 2);
+        let nan_ok = zero_clean
+            && fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn))
+            && block_refused;
+        println!(
+            "gemm case=relu_sqr fault=nan_input error=\"{}\" zeroed_block_run_clean={zero_clean} \
+             block_refused(d8 NaN, codes and sums zero, other bytes as zeroed)={block_refused} {}",
+            err.as_ref()
+                .map_or_else(|| "none".to_string(), ToString::to_string),
+            verdict(nan_ok)
+        );
+        Ok(ok && nan_ok)
+    }
+
     /// The clamped SwiGLU quantizer (`GemmKernels::enqueue_swiglu_act_quant`
     /// under `Act::SwigluClamp`) against the CPU tier's ik-verified
     /// `qdot::swiglu_clamp` quantized by `Gpu::enqueue_quantize_gemm`: the
@@ -2268,6 +2373,7 @@ mod gate {
         ok &= dense_case(&dev)?;
         ok &= route_table_case(&dev)?;
         ok &= swiglu_case(&dev)?;
+        ok &= relu_sqr_case(&dev)?;
         ok &= swiglu_clamp_case(&dev)?;
         ok &= faults(&dev)?;
         ok &= sel_faults(&dev)?;
@@ -5504,8 +5610,13 @@ mod gate {
             let pnv = repack::<Nvfp4>(&wnv.bytes, rows, 384)?;
             let nvq = DeviceTensor::upload(stream, &pnv.qs, rows, 384 / 8)?;
             let nve = DeviceTensor::upload(stream, &pnv.e, rows, 384 / 64)?;
-            let nvq_short = DeviceTensor::upload(stream, &pnv.qs, rows, 384 / 8 - 1)?;
-            let nve_short = DeviceTensor::upload(stream, &pnv.e, rows, 384 / 64 - 1)?;
+            // The short planes upload their leading columns only, so the
+            // refusal the clause tests is the gemm's, not `upload`'s length
+            // check.
+            let nvq_short =
+                DeviceTensor::upload(stream, &pnv.qs[..rows * (384 / 8 - 1)], rows, 384 / 8 - 1)?;
+            let nve_short =
+                DeviceTensor::upload(stream, &pnv.e[..rows * (384 / 64 - 1)], rows, 384 / 64 - 1)?;
             let mut act96 = GemmAct32::new(stream, 8, 96)?;
             dev.g32.enqueue_quantize_gemm32(
                 stream,
