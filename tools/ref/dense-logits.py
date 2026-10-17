@@ -62,11 +62,12 @@ def immutable_model(path, target):
     before = file_signature(path)
     if before[2] != target["size"] or digest(path) != target["sha256"] or file_signature(path) != before:
         raise ValueError("model differs from the selected immutable target; no engine was opened")
-    return before
+    return before + [target["sha256"]]
 
 
 def model_unchanged(path, before):
-    if file_signature(path) != before:
+    signature = before[:-1]
+    if file_signature(path) != signature or digest(path) != before[-1] or file_signature(path) != signature:
         raise ValueError("model file changed during capture")
 
 
@@ -514,8 +515,8 @@ def self_test():
         before = immutable_model(model, target)
         model_unchanged(model, before)
         model.write_bytes(b"replaced")
-        # Linux stamps mtime from a coarse clock, so a rewrite within one tick keeps it; date it a second later.
-        os.utime(model, ns=(before[3] + 10**9, before[3] + 10**9))
+        # Same metadata must not hide a content change.
+        before[:-1] = file_signature(model)
         for check in (lambda: model_unchanged(model, before), lambda: immutable_model(model, target)):
             try:
                 check()
