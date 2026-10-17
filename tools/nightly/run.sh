@@ -33,10 +33,63 @@
 #   NIGHTLY_INJECT_FAIL=1  add one deliberately failing unit, `inject-fail`, that prints a failing libtest line: the red path end to end
 #   NIGHTLY_UNIT_BOUND   seconds one unit may take (default 1200); it is BLOOMERY_GATE_BOUND for tools/gate.sh
 #
+# The status boundary: a clone whose HEAD reads but whose status does not (a corrupt index) finishes the run RED
+# naming the clone and Git's exit code, before the commit file or any unit carries the commit. `run.sh --self-test`
+# runs the boundary on a scratch clone: a clean one that publishes its bare commit and carries on, a corrupt-index
+# one whose commit file stays absent.
+#
 # This machine's differences from the box, stated: RUSTFLAGS is `-C target-cpu=x86-64-v3` here (the VPS guest is a Zen 1 EPYC; the
 # repo's .cargo/config.toml names znver3, which RUSTFLAGS overrides), bindgen reads libclang 18 (the box has LLVM 21), the
 # CUDA headers are the 13.3 headers only (no driver, no toolkit), and no model file or $BLOOMERY_DATA exists.
 set -uo pipefail
+
+# self_test: the status boundary at the clone, on a scratch tree of two fast runs. The scratch clone carries a
+# readable HEAD, so a clean run passes the boundary: the commit file publishes the bare hash (the summary says
+# `RED … no toolchain channel`, the channel check the empty scratch tree has, which sits behind the boundary) and
+# the run carried on there. Then the same clone with a corrupt index: the run finishes RED with an absent commit
+# file and the clone and Git's exit code in the summary. The old unchecked substitution would turn the second
+# run green — its assertions keep the boundary.
+self_test() {
+  local d fails=0 branch=0 commit sum out=
+  d=$(mktemp -d "${TMPDIR:-/tmp}/nightly-selftest.XXXXXX") || { echo "nightly: self-test: cannot create scratch directory" >&2; return 1; }
+  mkdir -p "$d/home" "$d/state"
+  git init -q "$d/home/repo"
+  git -C "$d/home/repo" -c user.name=nightly -c user.email=nightly@local commit -q --no-gpg-sign --allow-empty -m tree
+  # the clean case: the boundary publishes the commit and the run goes on, to the channel stop its empty tree has
+  NIGHTLY_HOME=$d/home NIGHTLY_STATE=$d/state NIGHTLY_NO_FETCH=1 bash "$0" > /dev/null 2>&1 || branch=$?
+  [ "$branch" = 2 ] || { echo "nightly: self-test: the clean run ended rc $branch: $out" >&2; fails=$((fails + 1)); }
+  commit=$(cat "$d/state/latest/commit" 2> /dev/null)
+  case "$commit" in
+    ''|*"+local"*) echo "nightly: self-test: the clean run's commit file is '$commit', want one bare hash" >&2; fails=$((fails + 1)) ;;
+  esac
+  sum=$(cat "$d/state/latest/summary" 2> /dev/null)
+  case "$sum" in
+    *"no toolchain channel"*) ;;
+    *) echo "nightly: self-test: the clean run's summary does not name the stop behind the boundary: '$sum'" >&2; fails=$((fails + 1)) ;;
+  esac
+  # the corrupt-index case: the run finishes RED with an absent commit file, and the summary names clone and exit
+  branch=0
+  printf 'x' > "$d/home/repo/.git/index"
+  NIGHTLY_HOME=$d/home NIGHTLY_STATE=$d/state NIGHTLY_NO_FETCH=1 bash "$0" > /dev/null 2>&1 || branch=$?
+  [ "$branch" = 2 ] || { echo "nightly: self-test: the corrupt-index run ended rc $branch, want 2" >&2; fails=$((fails + 1)); }
+  [ ! -e "$d/state/latest/commit" ] || { echo "nightly: self-test: the corrupt-index run published the commit file" >&2; fails=$((fails + 1)); }
+  sum=$(cat "$d/state/latest/summary" 2> /dev/null)
+  case "$sum" in
+    *"git status of $d/home/repo failed (git exit 128)"*) ;;
+    *) echo "nightly: self-test: the corrupt-index run's summary does not name the clone and Git's exit: '$sum'" >&2; fails=$((fails + 1)) ;;
+  esac
+  rm -rf "$d"
+  if [ "$fails" != 0 ]; then
+    echo "nightly: self-test $fails failed" >&2
+    return 1
+  fi
+  echo "nightly: self-test ok"
+  return 0
+}
+
+case ${1:-} in
+  --self-test) shift; rc=0; self_test "$@" || rc=$?; exit "$rc" ;;
+esac
 
 HOME_DIR=${NIGHTLY_HOME:-/srv/bloomery-nightly}
 STATE=${NIGHTLY_STATE:-/var/lib/bloomery-nightly}
@@ -125,7 +178,12 @@ else
   TREE_LABEL=origin/main
 fi
 COMMIT=$(git -C "$CLONE" rev-parse --short=8 HEAD)
-if [ -n "$(git -C "$CLONE" status --porcelain --untracked-files=normal)" ]; then COMMIT=$COMMIT+local; fi
+# The status is a checked assignment, as in tools/box.sh: the clone's HEAD reads but its status may not
+# (a corrupt index), and the commit would then be published — the file above all — without its +local
+# honesty. Stop RED naming the clone and Git's exit code before anything carries the commit.
+st=$(git -C "$CLONE" status --porcelain --untracked-files=normal) && st_rc=0 || st_rc=$?
+[ "$st_rc" = 0 ] || { put "$RUN/failed" "run: git status of $CLONE failed (git exit $st_rc)"; finish 2 RED "git status of $CLONE failed (git exit $st_rc)"; }
+[ -z "$st" ] || COMMIT=$COMMIT+local
 put "$RUN/commit" "$COMMIT"
 put "$RUN/summary" "$DATE $COMMIT $TREE_LABEL RUNNING (started $(TZ=Asia/Seoul date +%H:%M:%S) KST)"
 echo "== tree $TREE_LABEL $COMMIT"
