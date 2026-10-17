@@ -228,7 +228,7 @@ STUB
   [ "$(calls base)" = 1 ] && [ "$(calls head)" = 1 ]; ok "cold run: one box call a side" $?
   grep -q "^base	.*	~/repo/bloomery-repo-ptxcmp-base	" "$t/stub/box.log"; ok "cold run: the base side runs in a remote dir of its own (…-ptxcmp-base)" $?
   grep -q "^head	repo	own	git_ceiling=none" "$t/stub/box.log"; ok "cold run: the head side runs in this tree with its own remote dir" $?
-  grep -q "^base	ptx-compare-base\." "$t/stub/box.log" && grep -q "git_ceiling=${TMPDIR:-/tmp}" "$t/stub/box.log"; ok "cold run: the base side runs in a temp archive, away from this tree's git" $?
+  grep -q "^base	ptx-compare-base\." "$t/stub/box.log" && grep -q "git_ceiling=$(dirname "${TMPDIR:-/tmp}/x")" "$t/stub/box.log"; ok "cold run: the base side runs in a temp archive, away from this tree's git" $?
   [ "$(md5_of "$t/repo/tools/ptx-scan.sh" | cut -c1-8)" = "$(grep '^base' "$t/stub/box.log" | sed -n 's/.*scanner=\([0-9a-f]*\).*/\1/p')" ]; ok "cold run: the base side runs this tree's tools/ptx-scan.sh" $?
   grep -q -- "cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gx --bin oxart_jit >&2 && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx >&2 && bash tools/ptx-scan.sh gx 2>&1" "$t/stub/box.log"; ok "cold run: the box command builds the bin and oxart_jit (the JIT is run) and scans it" $?
   ! grep -q -- '--no-jit' "$t/stub/box.log"; ok "cold run: no --no-jit anywhere" $?
