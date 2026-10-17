@@ -1277,9 +1277,23 @@ pub struct StepsArgs<'a> {
     pub scratch: &'a mut Mamba2PassScratch,
 }
 
+/// Which scan a prompt pass runs between its conv pre-pass and its ring
+/// tail ([`Mamba2Kernels::enqueue_pass`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassScan {
+    /// `mamba2_steps`: the step's f32 order, every `y` row and the state
+    /// those of [`Mamba2Kernels::enqueue_step`] calls bit for bit.
+    Steps,
+    /// The chunked SSD on the tensor cores ([`crate::mamba2_ssd`]): f16
+    /// products summed in f32, within `gate_mamba2_ssd`'s derived bound of
+    /// the exact scan; head_dim [`crate::mamba2_ssd::HEAD_DIM`] only.
+    Ssd,
+}
+
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct Mamba2Kernels {
     module: mamba2_kernels::LoadedModule,
+    ssd: crate::mamba2_ssd::Mamba2Ssd,
 }
 
 impl Mamba2Kernels {
@@ -1288,7 +1302,8 @@ impl Mamba2Kernels {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let module = unsafe { crate::shared_module!(mamba2_kernels, ctx)? };
-        Ok(Mamba2Kernels { module })
+        let ssd = crate::mamba2_ssd::Mamba2Ssd::load(ctx)?;
+        Ok(Mamba2Kernels { module, ssd })
     }
 
     /// Enqueue one decode token of one layer ([`StepArgs`], module doc):
@@ -1404,6 +1419,19 @@ impl Mamba2Kernels {
     /// launching nothing. Three or four launches. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_steps(&self, stream: &CudaStream, args: StepsArgs<'_>) -> Result<(), GpuError> {
+        self.enqueue_pass(stream, args, PassScan::Steps)
+    }
+
+    /// [`Self::enqueue_steps`] with the scan `scan` picks; with
+    /// [`PassScan::Ssd`] the `y` rows and the state are the SSD's (no longer
+    /// the steps' bits), and what [`crate::mamba2_ssd::refuse`] refuses is
+    /// refused too, before the first launch.
+    pub fn enqueue_pass(
+        &self,
+        stream: &CudaStream,
+        args: StepsArgs<'_>,
+        scan: PassScan,
+    ) -> Result<(), GpuError> {
         let what = "mamba2::enqueue_steps";
         let StepsArgs {
             shape,
@@ -1487,6 +1515,9 @@ impl Mamba2Kernels {
                 format!("{name}.len() {got} < {need}"),
             ));
         }
+        if scan == PassScan::Ssd {
+            crate::mamba2_ssd::refuse(what, shape, &scratch.conv, y, state)?;
+        }
         let chunks = head_dim.div_ceil(CH_PER_BLOCK);
         let blocks = heads * chunks;
         let conv_items = u * conv_dim + u * heads;
@@ -1551,25 +1582,44 @@ impl Mamba2Kernels {
             &mut scratch.conv,
             &mut scratch.sd,
         )?;
-        self.module.mamba2_steps(
-            stream,
-            &steps,
-            rows,
-            d,
-            &scratch.conv,
-            &scratch.sd,
-            u32_u,
-            u32_ld,
-            launch_u32(what, "z0", z0)?,
-            u32_heads,
-            u32_per,
-            u32_groups,
-            u32_hd,
-            u32_chunks,
-            fault,
-            &mut *y,
-            state,
-        )?;
+        match scan {
+            PassScan::Steps => self.module.mamba2_steps(
+                stream,
+                &steps,
+                rows,
+                d,
+                &scratch.conv,
+                &scratch.sd,
+                u32_u,
+                u32_ld,
+                launch_u32(what, "z0", z0)?,
+                u32_heads,
+                u32_per,
+                u32_groups,
+                u32_hd,
+                u32_chunks,
+                fault,
+                &mut *y,
+                state,
+            )?,
+            PassScan::Ssd => self.ssd.enqueue(
+                stream,
+                crate::mamba2_ssd::SsdArgs {
+                    shape,
+                    u,
+                    conv: &scratch.conv,
+                    sd: &scratch.sd,
+                    rows,
+                    ld,
+                    z0,
+                    a: a_log,
+                    d,
+                    fault,
+                    y: &mut *y,
+                    state,
+                },
+            )?,
+        }
         self.module.mamba2_ring_tail(
             stream,
             &tail,

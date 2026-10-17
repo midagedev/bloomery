@@ -9,7 +9,9 @@
 //!   and an NVFP4 site the same GEMM over its resident NVFP4 planes
 //!   ([`Gemm32Weight::Nvfp4Planes`]);
 //! - a Mamba-2 layer is one pass over its tokens
-//!   ([`Mamba2Kernels::enqueue_steps`], bit for bit the steps' scan);
+//!   ([`Mamba2Kernels::enqueue_pass`] with the chunked SSD scan,
+//!   [`PassScan::Ssd`]: within its derived f16 bound of the exact scan, not
+//!   the steps' bits);
 //! - an attention layer appends the pass's K/V rows to its planes and runs
 //!   the prefill flash's split entry over the pass's whole row set
 //!   ([`crate::flash_gqa_prefill::FlashGqaPrefill::enqueue_split`]), each
@@ -48,7 +50,7 @@ use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct, GemmArgs, GemmInput, GemmRo
 use crate::head::Head;
 use crate::iq_sel::IqSelKernels;
 use crate::kquant::SelDown;
-use crate::mamba2::Mamba2PassScratch;
+use crate::mamba2::{Mamba2PassScratch, PassScan};
 use crate::model::GpuModel;
 use crate::model::fit::{FIT_RESERVE, act_col_bytes, act32_col_bytes, largest_fit, route_bytes};
 use crate::q38::EmbedQ8Args;
@@ -998,7 +1000,7 @@ impl Body {
                         &buf.xn,
                         &mut buf.zxbcdt,
                     )?;
-                    self.k.mamba.enqueue_steps(
+                    self.k.mamba.enqueue_pass(
                         stream,
                         crate::mamba2::StepsArgs {
                             shape: sh.mamba,
@@ -1023,6 +1025,7 @@ impl Body {
                             state: &mut mm.store.state,
                             scratch: &mut p.mamba2,
                         },
+                        PassScan::Ssd,
                     )?;
                     project_rows(
                         &cx,
