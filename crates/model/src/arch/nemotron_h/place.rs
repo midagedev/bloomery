@@ -59,6 +59,7 @@ mod tests {
 
     use super::super::spec::tests::{CONV, HEAD, INNER, KV, geo, keys, tensors};
     use super::{PlaceError, PlanInputs, describe};
+    use crate::arch::hybrid::Experts;
     use crate::arch::synthetic::{V, header_shaped};
     use crate::placement::workstation;
     use crate::placement::{KvBytes, PlanLevers};
@@ -140,6 +141,22 @@ mod tests {
         assert_eq!(small.cards[0].dense_bytes, large.cards[0].dense_bytes);
         assert_eq!(small.host.experts + small.host.expert_bytes, 0);
         assert_eq!(small.nvme_bytes, 0);
+    }
+
+    /// A file with no routed stacks has no expert to place: every arm of
+    /// [`Experts`] plans it as [`PlanInputs::plan`] does.
+    #[test]
+    fn a_file_with_no_routed_stacks_plans_the_same_under_every_arm() {
+        let inputs = inputs("nemotron-place-arms");
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let levers = PlanLevers::default();
+        let card = inputs.plan(&machine, 4, &levers).expect("a plan");
+        for experts in [Experts::Card, Experts::Placed, Experts::Host] {
+            let plan = inputs
+                .plan_with(&machine, 4, &levers, experts)
+                .unwrap_or_else(|e| panic!("{experts:?}: {e}"));
+            assert_eq!(format!("{plan:?}"), format!("{card:?}"), "{experts:?}");
+        }
     }
 
     /// A context of no position, a tier card and a second card are refused by

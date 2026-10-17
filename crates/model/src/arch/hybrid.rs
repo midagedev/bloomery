@@ -466,7 +466,11 @@ pub(in crate::arch) fn nope_gqa(a: &Attn, kv: usize) -> Result<Gqa, PlacementErr
 /// anything to hold; it refuses by name a machine of more than one card or
 /// with a tier card, a context of no position, a context whose stores the
 /// card cannot hold, and a card too small for every routed expert, which
-/// would leave some on the host.
+/// would leave some on the host. [`PlanInputs::plan_with`] takes the other
+/// two places a plan may put the routed experts ([`Experts`]): the card's
+/// share with the rest on the host tier, or all on the host. The dense
+/// layers, the stores and the refusals above stay the card's under every
+/// arm.
 #[derive(Clone, Debug)]
 pub struct PlanInputs {
     /// Every tensor with its role, and the model's layer count.
@@ -475,6 +479,19 @@ pub struct PlanInputs {
     pub spec: ModelSpec,
     /// Each layer's store bytes.
     pub kv: KvLayout,
+}
+
+/// Where a plan puts the routed experts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Experts {
+    /// Every routed expert on the one card; a card that cannot hold them all
+    /// is refused.
+    Card,
+    /// Each routed layer's id prefix `[0, n_l)` on the card as its budget
+    /// holds, the rest on the host tier.
+    Placed,
+    /// Every routed expert on the host tier: `n_l = 0` on every layer.
+    Host,
 }
 
 /// Why a plan was refused.
@@ -543,13 +560,27 @@ impl PlanInputs {
 
     /// The placement of the file on `machine` at `ctx_max` positions under
     /// the placement's `levers`: the whole model on the machine's one card,
-    /// each routed stack in the format its program's rule reads. A file no
-    /// program runs is refused with its coverage list.
+    /// each routed stack in the format its program's rule reads
+    /// ([`Experts::Card`]). A file no program runs is refused with its
+    /// coverage list.
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
         ctx_max: u64,
         levers: &PlanLevers,
+    ) -> Result<Plan<'a>, PlaceError> {
+        self.plan_with(machine, ctx_max, levers, Experts::Card)
+    }
+
+    /// [`PlanInputs::plan`] with the routed experts where `experts` says:
+    /// the context, tier, card-count and program refusals hold under every
+    /// arm. A file with no routed stacks plans the same under every arm.
+    pub fn plan_with<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        experts: Experts,
     ) -> Result<Plan<'a>, PlaceError> {
         let arch = self.spec.arch.name();
         if ctx_max == 0 {
@@ -567,16 +598,22 @@ impl PlanInputs {
         }
         let program = program_of(self.spec.arch)
             .ok_or_else(|| PlacementError::Unimplemented(self.unimplemented()))?;
-        let plan = placement::plan_routed(
-            &self.model,
-            machine,
-            ctx_max,
-            &self.kv,
-            levers,
-            routed_rule(program),
-        )?;
-        // The body uploads every expert stack, so the host leg must hold none.
-        if plan.host.experts != 0 {
+        let plan = match experts {
+            Experts::Card | Experts::Placed => placement::plan_routed(
+                &self.model,
+                machine,
+                ctx_max,
+                &self.kv,
+                levers,
+                routed_rule(program),
+            )?,
+            Experts::Host => {
+                placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?
+            }
+        };
+        // Under `Card` the body uploads every expert stack, so the host leg
+        // must hold none.
+        if experts == Experts::Card && plan.host.experts != 0 {
             return Err(PlacementError::Experts(format!(
                 "{arch} requires every expert on one card; {} experts remain on the host",
                 plan.host.experts

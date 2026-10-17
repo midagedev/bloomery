@@ -288,6 +288,19 @@ fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
         .and_then(|o| o.get("content"))
         .and_then(Value::as_array)
     {
+        let mut video = match (side.media.as_ref(), parts.first()) {
+            (Some(model), Some(first))
+                if matches!(media::parse_part(first), Ok(media::Part::Text(prefix))
+                    if model.embedding_video().is_some_and(|(text, _)| text == prefix)) =>
+            {
+                Some(
+                    media::prepare_video(&parts[1..], &**model)
+                        .map_err(|e| invalid(e.to_string()))?
+                        .into_iter(),
+                )
+            }
+            _ => None,
+        };
         let mut images = Vec::new();
         let ordered = parts.iter().map(|part| -> Result<InputPart<'_>, String> {
             match media::parse_part(part).map_err(|e| e.to_string())? {
@@ -300,15 +313,22 @@ fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
                     let (begin, end) = model
                         .embedding_delimiters()
                         .ok_or("the side projector has no embedding delimiters")?;
-                    let file = media::load(url).map_err(|e| e.to_string())?;
-                    let prepared =
-                        Arc::new(media::prepare(&file, &**model).map_err(|e| e.to_string())?);
-                    let positions = prepared.span_len;
-                    images.push(media::MediaFeed {
-                        at: 0,
-                        key: file.key,
-                        prepared,
-                    });
+                    let feed = if let Some(frames) = &mut video {
+                        frames
+                            .next()
+                            .ok_or("video frame count differs from input")?
+                    } else {
+                        let file = media::load(url).map_err(|e| e.to_string())?;
+                        media::MediaFeed {
+                            at: 0,
+                            key: file.key,
+                            prepared: Arc::new(
+                                media::prepare(&file, &**model).map_err(|e| e.to_string())?,
+                            ),
+                        }
+                    };
+                    let positions = feed.prepared.span_len;
+                    images.push(feed);
                     Ok(InputPart::Image {
                         begin,
                         end,

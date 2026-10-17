@@ -253,6 +253,11 @@ pub enum MediaError {
     /// or `missing`).
     #[error("content part type {0}: only \"text\" and \"image_url\" parts are accepted")]
     PartType(String),
+    /// Encoded video requires a decoder; embedding inputs take sampled image parts instead.
+    #[error(
+        "encoded video is not supported; send decoded one-FPS image_url frames after a Video: text part"
+    )]
+    EncodedVideo,
     /// A content part without the field its type needs.
     #[error("a {ty} part needs {need}")]
     PartField {
@@ -364,6 +369,9 @@ pub fn parse_part(part: &Value) -> Result<Part<'_>, MediaError> {
                 need: "an 'image_url' object with a string 'url', or a string",
             }),
         },
+        Some(Value::String(t)) if t == "input_video" || t == "video_url" => {
+            Err(MediaError::EncodedVideo)
+        }
         Some(other) => Err(MediaError::PartType(short(&other.to_string()))),
         None => Err(MediaError::PartType("missing".into())),
     }
@@ -451,8 +459,57 @@ pub fn load(url: &str) -> Result<ImageFile, MediaError> {
 
 /// Decode a file and prepare it for `model`.
 pub fn prepare(file: &ImageFile, model: &dyn MediaModel) -> Result<Prepared, MediaError> {
+    prepare_with(file, |image| model.prepare(image))
+}
+
+fn prepare_with(
+    file: &ImageFile,
+    prepare: impl FnOnce(&Rgb8) -> Result<Prepared, VisionError>,
+) -> Result<Prepared, MediaError> {
     let image = Rgb8::from_bytes(&file.bytes).map_err(MediaError::Decode)?;
-    model.prepare(&image).map_err(MediaError::Prepare)
+    prepare(&image).map_err(MediaError::Prepare)
+}
+
+/// Prepare a sampled video's image parts through the model's video rule.
+pub(crate) fn prepare_video(
+    parts: &[Value],
+    model: &dyn MediaModel,
+) -> Result<Vec<MediaFeed>, MediaError> {
+    let (_, limit) = model.embedding_video().ok_or(MediaError::PartField {
+        ty: "decoded video",
+        need: "a projector with a video rule",
+    })?;
+    if parts.is_empty() || parts.len() > limit {
+        return Err(MediaError::Prepare(VisionError::Limits {
+            detail: format!("decoded video takes 1 to {limit} sampled frames"),
+        }));
+    }
+    parts
+        .iter()
+        .map(|part| {
+            let Part::Image(url) = parse_part(part)? else {
+                return Err(MediaError::PartField {
+                    ty: "decoded video",
+                    need: "only image_url frames after its prefix",
+                });
+            };
+            let file = load(url)?;
+            let prepared = prepare_with(&file, |frame| {
+                let mut prepared = model.prepare_video(std::slice::from_ref(frame))?;
+                if prepared.len() != 1 {
+                    return Err(VisionError::Limits {
+                        detail: "the video preparer changed the sampled frame count".into(),
+                    });
+                }
+                Ok(prepared.remove(0))
+            })?;
+            Ok(MediaFeed {
+                at: 0,
+                key: file.key,
+                prepared: Arc::new(prepared),
+            })
+        })
+        .collect()
 }
 
 /// The prompt of a rendered chat whose ids are `ids` and whose images are `urls`, in the order of
@@ -940,10 +997,13 @@ mod tests {
             json!({"type": "image_url", "image_url": "data:a"}),
             json!({"type": "video_url"}),
         ];
-        assert!(matches!(
-            err(flatten("user", &bad, &PLAIN, 0)),
-            MediaError::PartType(_)
-        ));
+        let error = err(flatten("user", &bad, &PLAIN, 0));
+        assert!(matches!(error, MediaError::EncodedVideo));
+        assert!(
+            error
+                .to_string()
+                .contains("decoded one-FPS image_url frames")
+        );
     }
 
     /// A model that numbers its images gets each placeholder's index from the images before it:

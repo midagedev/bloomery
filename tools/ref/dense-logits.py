@@ -62,11 +62,12 @@ def immutable_model(path, target):
     before = file_signature(path)
     if before[2] != target["size"] or digest(path) != target["sha256"] or file_signature(path) != before:
         raise ValueError("model differs from the selected immutable target; no engine was opened")
-    return before
+    return before + [target["sha256"]]
 
 
 def model_unchanged(path, before):
-    if file_signature(path) != before:
+    signature = before[:-1]
+    if file_signature(path) != signature or digest(path) != before[-1] or file_signature(path) != signature:
         raise ValueError("model file changed during capture")
 
 
@@ -214,19 +215,46 @@ def library_environment(binary, build_info, env):
     return resolved
 
 
-def session_members(session):
-    """Snapshot Linux process identities; a timeout may create additional process groups."""
-    members = {}
-    for path in Path("/proc").iterdir():
-        if not path.name.isdecimal():
-            continue
+def process_identities():
+    """pid -> (session, live, start identity) for every process; the start guards against PID reuse."""
+    found = {}
+    if Path("/proc/self/stat").exists():
+        for path in Path("/proc").iterdir():
+            if not path.name.isdecimal():
+                continue
+            try:
+                fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+                found[int(path.name)] = (int(fields[3]), fields[0] != "Z", fields[19])
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        return found
+    # No procfs (macOS): one ps snapshot for pid, state and start time, the session from getsid.
+    listing = subprocess.run(["ps", "-A", "-o", "pid=,stat=,lstart="], check=True, capture_output=True,
+                             text=True, env={**os.environ, "LC_ALL": "C"}).stdout
+    for line in listing.splitlines():
+        pid, state, started = line.split(None, 2)
         try:
-            fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
-            if int(fields[3]) == session and fields[0] != "Z":
-                members[int(path.name)] = fields[19]  # start time guards against PID reuse
-        except (FileNotFoundError, ProcessLookupError):
+            found[int(pid)] = (os.getsid(int(pid)), not state.startswith("Z"), started.strip())
+        except ProcessLookupError:
             continue
-    return members
+    return found
+
+
+def session_members(session):
+    """Snapshot process identities of a session; a timeout may create additional process groups."""
+    return {pid: started for pid, (sid, live, started) in process_identities().items()
+            if sid == session and live}
+
+
+def signal_members(session, members, sig):
+    """Signal each snapshot member still in the session with the same start identity."""
+    now = process_identities()
+    for pid, started in members.items():
+        if pid in now and now[pid][0] == session and now[pid][2] == started:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
 
 
 def stop_owned_process(process, grace=10):
@@ -236,13 +264,7 @@ def stop_owned_process(process, grace=10):
 
     def send(sig):
         # Snapshot before reaping the leader so its session number cannot be reused.
-        for pid, started in session_members(process.pid).items():
-            try:
-                fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-                if int(fields[3]) == process.pid and fields[19] == started:
-                    os.kill(pid, sig)
-            except (FileNotFoundError, ProcessLookupError):
-                pass
+        signal_members(process.pid, session_members(process.pid), sig)
 
     send(signal.SIGTERM)
     deadline = time.monotonic() + grace
@@ -493,6 +515,8 @@ def self_test():
         before = immutable_model(model, target)
         model_unchanged(model, before)
         model.write_bytes(b"replaced")
+        # Same metadata must not hide a content change.
+        before[:-1] = file_signature(model)
         for check in (lambda: model_unchanged(model, before), lambda: immutable_model(model, target)):
             try:
                 check()
@@ -566,6 +590,9 @@ def self_test():
         try:
             pid = int(process.stdout.readline())
             assert pid in session_members(process.pid)
+            signal_members(process.pid, {pid: "other start"}, signal.SIGKILL)  # reused-pid identity
+            time.sleep(0.2)
+            assert pid in session_members(process.pid), "signalled a pid with another start identity"
             stop_owned_process(process, grace=0.1)
             deadline = time.monotonic() + 2
             while session_members(process.pid) and time.monotonic() < deadline:

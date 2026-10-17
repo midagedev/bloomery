@@ -82,6 +82,18 @@ pub trait MediaModel {
     fn embedding_delimiters(&self) -> Option<(&str, &str)> {
         None
     }
+    /// The sampled-video text prefix and maximum frame count, checked before decoding.
+    fn embedding_video(&self) -> Option<(&str, usize)> {
+        None
+    }
+
+    /// Prepare ordered, one-FPS decoded frames with the model's video token budget.
+    fn prepare_video(&self, _frames: &[Rgb8]) -> Result<Vec<Prepared>, VisionError> {
+        Err(VisionError::Limits {
+            detail: "the projector does not support decoded video frames".into(),
+        })
+    }
+
     /// The placeholder text the chat template carries for the image at `index`: its position
     /// among all the images of the prompt, from 0, in the order of the images. A model that
     /// numbers its images writes the number into the text; one that does not ignores it.

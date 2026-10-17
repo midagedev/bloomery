@@ -52,6 +52,8 @@
 //! The card's slot list (`card_sel`) on the same boundary: an id past the
 //! card's prefix is written `HOST` with the word clean, and an id past the
 //! whole stack is written `HOST` and raises the layer's `ExpertId`.
+//! The nine-slot card combine matches weighted_sum bit for bit and reruns
+//! identically.
 //! Last, on the engine itself (`n_l` = 32): a NaN in a hybrid layer's input
 //! residual through `step_layer_hybrid` returns the card's fault at that
 //! layer — its norm's and its router's sites in the mask, printed in the
@@ -107,6 +109,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::card_slots::{CardAcc, CardSlotKernels};
     use bloomery_gpu::fused::FusedKernels;
     use bloomery_gpu::hybrid::{
         Boundary, BoundaryShape, HOST, HostExperts, Hybrid, HybridConfig, Poison, PoisonKind,
@@ -1338,6 +1341,65 @@ mod gate {
                  fault=\"{}\" want=\"{}\" {}",
                 word.map_or_else(|| "none".to_string(), |f| f.to_string()),
                 want_fault.map_or_else(|| "none".to_string(), |f| f.to_string()),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+
+        // PIN(2026-10-17): remove duplicate HOST/invalid-place clauses;
+        // card_slots' library gate owns those contracts, including nine slots.
+        {
+            const E: usize = 9;
+            const M: usize = 3;
+            let rows = R_HIDDEN;
+            let w: Vec<f32> = (0..M * E)
+                .map(|i| 0.05 + 0.04 * ((i / E + i % E) % 7) as f32)
+                .collect();
+            let val =
+                |t: usize, e: usize, d: usize| ((t * 31 + e * 17 + d * 5) % 97) as f32 * 0.25 - 3.0;
+            let down: Vec<f32> = (0..M * E)
+                .flat_map(|i| (0..rows).map(move |d| val(i / E, i % E, d)))
+                .collect();
+            let sel: Vec<u32> = (0..M * E)
+                .map(|i| ((i / E + i % E) % R_CARD) as u32)
+                .collect();
+            let down_dev = DeviceBuffer::from_host(stream, &down)?;
+            let w_dev = DeviceBuffer::from_host(stream, &w)?;
+            let sel_dev = DeviceBuffer::from_host(stream, &sel)?;
+            let kernels = CardSlotKernels::load(gpu.context())?;
+            let sum = |acc: &mut DeviceBuffer<f32>| {
+                kernels.enqueue_card_acc(
+                    stream,
+                    &CardAcc {
+                        down: &down_dev,
+                        w: &w_dev,
+                        sel: &sel_dev,
+                        n: rows,
+                        m: M,
+                        n_card: R_CARD,
+                        n_used: E,
+                        w_pitch: E,
+                        fault: gpu.layer_sink(R_LAYER)?,
+                    },
+                    acc,
+                )
+            };
+            gpu.clear_fault()?;
+            let mut full = DeviceBuffer::<f32>::zeroed(stream, rows * M)?;
+            let mut card = DeviceBuffer::<f32>::zeroed(stream, rows * M)?;
+            gpu.elem()
+                .enqueue_weighted_sum(stream, &down_dev, &w_dev, rows, E as u32, M, &mut full)?;
+            sum(&mut card)?;
+            stream.synchronize()?;
+            let full_y = full.to_host_vec(stream)?;
+            let card_y = card.to_host_vec(stream)?;
+            sum(&mut card)?;
+            stream.synchronize()?;
+            let rerun = bits_equal(&card_y, &card.to_host_vec(stream)?);
+            let same = bits_equal(&full_y, &card_y);
+            let pass = same && rerun && gpu.take_fault()?.is_none();
+            println!(
+                "refusal card_acc_9: weighted_sum bits {same}, rerun {rerun}: {}",
                 verdict(pass)
             );
             ok &= pass;

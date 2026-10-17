@@ -37,7 +37,8 @@ mod gate {
     use gguf::Split;
     use model::placement::{Plan, PlanLevers, UnifiedPool};
     use refset::arch::gemma_embedding2::{
-        IDS_SET, MODEL, MODEL_SHA256, REL_FLOOR, SERVER, TEXT_CPU, TWIN,
+        IDS_SET, MMPROJ_BF16, MMPROJ_BF16_SHA256, MODEL, MODEL_SHA256, REL_FLOOR, SERVER, TEXT_CPU,
+        TWIN, VIDEO, VIDEO_CPU, VIDEO_CPU_SET, VIDEO_PREFIX, VIDEO_SET,
     };
     use refset::emb2::Emb2Set;
     use serde_json::{Value, json};
@@ -56,6 +57,8 @@ mod gate {
     }
 
     fn cases(man: &RefManifest, ids_set: &str) -> Result<Vec<Case>, GateError> {
+        let texts = refset::tokenizer::TokenizerSet::read(&data_dir().join(ids_set), &SERVER)?;
+        texts.check_texts()?;
         let mut cases = Vec::new();
         for line in &man.header.other {
             let Some(rest) = line.strip_prefix("# tokenize\t") else {
@@ -71,8 +74,13 @@ mod gate {
                 .parse()?;
             cases.push(Case {
                 name: name.to_owned(),
-                text: std::fs::read_to_string(
-                    data_dir().join(ids_set).join(format!("{name}.txt")),
+                text: String::from_utf8(
+                    texts
+                        .texts
+                        .iter()
+                        .find(|text| text.name == name)
+                        .ok_or_else(|| format!("server set: no tokenizer text {name}"))?
+                        .read()?,
                 )?,
                 tokens,
             });
@@ -198,6 +206,91 @@ mod gate {
                         && within(&ours, &want, &raw, &twin, normalized),
                 );
             }
+        }
+        Ok(ok)
+    }
+
+    fn videos(url: &dyn Fn(&str) -> String, manifest: &Path) -> Result<bool, GateError> {
+        let root = manifest.parent().ok_or("video manifest needs a parent")?;
+        let clips: Value = serde_json::from_str(&std::fs::read_to_string(manifest)?)?;
+        let clips = clips.as_array().ok_or("video manifest must be an array")?;
+        if clips.len() != 3 {
+            return Err("video gate requires three oracle clips".into());
+        }
+        let mut ok = true;
+        let mut names = std::collections::HashSet::new();
+        for clip in clips {
+            let name = clip["name"].as_str().ok_or("clip needs a name")?;
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return Err("invalid clip name".into());
+            }
+            if !names.insert(name) {
+                return Err(format!("{name}: duplicate video clip").into());
+            }
+            let card = Emb2Set::open(&root.join(name).join(VIDEO_SET), &VIDEO)?.man;
+            let cpu = Emb2Set::open(&root.join(name).join(VIDEO_CPU_SET), &VIDEO_CPU)?.man;
+            let images = clip["images"]
+                .as_array()
+                .ok_or("clip needs selected images")?;
+            let mut content = vec![json!({"type":"text", "text":VIDEO_PREFIX})];
+            for (index, image) in images.iter().enumerate() {
+                let path = image.as_str().ok_or("frame path must be a string")?;
+                let identity = format!(
+                    "# image\tframe_{index}\t{path}\t{}",
+                    sha256(Path::new(path))?
+                );
+                if !card.header.other.contains(&identity) || !cpu.header.other.contains(&identity) {
+                    return Err(format!("{name}: frame {index} differs from the oracle").into());
+                }
+                let data = serve::media::encode_base64(&std::fs::read(path)?);
+                content.push(json!({"type":"image_url", "image_url":{"url":format!("data:image/png;base64,{data}")}}));
+            }
+            let raw = tap(&card, "video/raw")?;
+            let twin = tap(&cpu, "video/raw")?;
+            if raw.len() != 768 || twin.len() != raw.len() {
+                return Err(format!("{name}: reference vector widths are not 768").into());
+            }
+            for (normalized, row) in [(false, "raw"), (true, "embd")] {
+                let body = json!({"input":{"content":content}, "embd_normalize":if normalized {2} else {-1}});
+                let v = embedding(url, body)?;
+                let ours = vector(&v)?;
+                let want = tap(&card, &format!("video/{row}"))?;
+                let tokens = v["usage"]["prompt_tokens"]
+                    .as_u64()
+                    .ok_or("missing prompt_tokens")?;
+                let identity = format!(
+                    "# video\tvideo\tframes {}\tprompt_tokens {tokens}",
+                    images.len()
+                );
+                println!(
+                    "video {name}/{row}: frames {} positions {tokens}",
+                    images.len()
+                );
+                check(
+                    &mut ok,
+                    &format!("video_{name}_{row}"),
+                    want.len() == 768
+                        && card.header.other.contains(&identity)
+                        && cpu.header.other.contains(&identity)
+                        && within(&ours, &want, &raw, &twin, normalized),
+                );
+            }
+        }
+        for ty in ["input_video", "video_url"] {
+            let body = json!({"input":{"content":[
+                {"type":ty, (ty):{"data":"data:video/mp4;base64,AA=="}}
+            ]}});
+            let (status, text) = curl(&url("/v1/embeddings"), Some(&body), false)?;
+            let value: Value = serde_json::from_str(&text)?;
+            check(
+                &mut ok,
+                &format!("{ty}_refused"),
+                status == 400
+                    && value["error"]["type"] == "invalid_request_error"
+                    && value["error"]["message"].as_str().is_some_and(|message| {
+                        message.contains("decoded one-FPS image_url frames")
+                    }),
+            );
         }
         Ok(ok)
     }
@@ -389,15 +482,19 @@ mod gate {
         let mut args_it = std::env::args().skip(1);
         let mut dir = PathBuf::from("target/embedding2-serve-gate");
         let mut v1 = false;
+        let mut clips = None;
         while let Some(a) = args_it.next() {
-            if a == "--v1" && !v1 {
-                v1 = true;
-                continue;
+            match a.as_str() {
+                "--v1" if !v1 => v1 = true,
+                "--dir" => dir = args_it.next().ok_or("--dir needs DIR")?.into(),
+                "--video-clips" if clips.is_none() => {
+                    clips = Some(PathBuf::from(args_it.next().ok_or("--video-clips needs clips.json")?));
+                }
+                _ => return Err(format!("unknown or duplicate argument {a}; takes --v1, --dir DIR and --video-clips clips.json").into()),
             }
-            if a != "--dir" {
-                return Err(format!("unknown argument {a}; takes --v1 and --dir DIR").into());
-            }
-            dir = args_it.next().ok_or("--dir needs DIR")?.into();
+        }
+        if v1 && clips.is_some() {
+            return Err("--video-clips needs EmbeddingGemma 2, not --v1".into());
         }
         use refset::arch::gemma_embedding as emb1;
         let (embedding, digest, server_family, cpu_family, ids_set, arch, ctx) = if v1 {
@@ -435,6 +532,19 @@ mod gate {
         let model = model_path.to_str().ok_or("chat model path is not UTF-8")?;
         if Split::open(model)?.architecture() != Some("qwen3moe") {
             return Err("serve gate needs Qwen3-30B-A3B-Instruct-2507 Q4_K_M".into());
+        }
+        if let Some(manifest) = clips {
+            if sha256(Path::new(MMPROJ_BF16))? != MMPROJ_BF16_SHA256 {
+                return Err("video projector sha256 differs from the oracle".into());
+            }
+            let mut launch = args(model, true, embedding);
+            launch.extend(["--embd-mmproj", MMPROJ_BF16, "--embd-image-min-tokens", "1"]);
+            let mut served = Served::spawn_cmd(cmd(BUDGET)?, &launch, &dir)?;
+            let addr = served.address(&dir.join("server.err"), 600, Duration::from_secs(1))?;
+            let url = |path: &str| format!("http://{addr}{path}");
+            let ok = videos(&url, &manifest)?;
+            println!("video server stopped {}", served.stop()?);
+            return if ok { Ok(()) } else { Err(checks_failed()) };
         }
         let server = Emb2Set::open(&server_family.path(server_family.sets[0]), server_family)?.man;
         let cpu = Emb2Set::open(&cpu_family.path(cpu_family.sets[0]), cpu_family)?.man;

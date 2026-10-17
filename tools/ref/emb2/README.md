@@ -75,7 +75,66 @@ tower, and its projected BF16 rows stay on the host until `pass_media` combines
 them. The host rows take `2 * text_width * sum(frame_tokens)` bytes,
 at most `8,960 * text_width` bytes for 32 frames of 140 tokens [derived]. The assembled
 text, delimiters and frame positions must still fit `ctx`; no second reserve
-or expert budget is introduced. HTTP video inputs are outside this interface.
+or expert budget is introduced.
+
+### Served sampled frames
+
+Embedding clients can send already sampled one-FPS frames to `/v1/embeddings`,
+`/embeddings` or `/embedding`. Start the server with `--embd-model` and
+`--embd-mmproj`. The request uses the existing image embedding content array:
+a first text part whose entire text is `Video:`, followed by 1 to 32
+`image_url` parts. Each URL holds a base64 PNG or JPEG. No URLs are fetched.
+
+```json
+{"input":{"content":[
+  {"type":"text","text":"Video:"},
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+]}}
+```
+
+The prefix selects the projector's video preparation rule. Each supplied frame
+represents one second; the server does not resample the original clip. Prepare
+its samples with `gemma4v::prepare_clip` before sending them. The server prepares
+the sampled frames with `gemma4v::prepare_video`, preserves frame order and image
+keys, and assembles one BOS/EOS pair around the complete sequence. Text after the prefix,
+empty video sequences, more than 32 frames and inputs past the embedding
+context are refused. A frame whose video canvas exceeds the loaded projector's
+`--embd-image-max-tokens` capacity returns 400 before GPU dispatch. The video
+rule does not enlarge the tower or its named reserve. Image inputs without this
+prefix keep their image budget.
+
+This is the same request that `tools/ref/emb2/server_vectors.py:286-295` sends
+to the pinned llama-server for `--frames`. The image shape is parsed by
+`serve::media::parse_part` and assembled by `serve::embeddings::input`.
+The pinned llama.cpp
+[`server-context.cpp:6059-6065`](https://github.com/ggml-org/llama.cpp/blob/6868a52cb337450658006ad2f9281c2eb63f1666/tools/server/server-context.cpp#L6059-L6065)
+routes such content arrays through `tokenize_oai_content_array`.
+
+The serve gate's `--video-clips` mode reads `video_oracle.py`'s `clips.json` and
+reference pairs. Before starting the server, it checks the loaded model and
+projector files against their pinned SHA256 values. Before sending each content
+array, it checks its frame files against both reference sets. It compares prompt
+positions, raw vectors and normalized vectors with the unchanged CPU-twin-derived
+bands:
+
+```sh
+BLOOMERY_BOX_LOCAL=1 just gate-gpu-gemma-embedding2-serve \
+  --video-clips target/video-clips/clips.json
+```
+
+The recipe builds both binaries. The gate launches and stops its own server
+and uses the existing named reserve, not a second video seat.
+
+### Out of scope
+
+Encoded `input_video` and `video_url` parts are refused with a named 400 error.
+The pinned llama.cpp
+[`server-common.cpp:1228-1242`](https://github.com/ggml-org/llama.cpp/blob/6868a52cb337450658006ad2f9281c2eb63f1666/tools/server/server-common.cpp#L1228-L1242)
+accepts those parts with a `data` or `url` field and decodes them through an
+FFmpeg subprocess.
+Bloomery does not install or invoke a decoder. Supporting those parts needs a
+separate decision about the subprocess, its resource bounds and its runtime
+dependency. The sampled-frame request above works on both servers without it.
 
 ### Constant-rate decoded clips
 

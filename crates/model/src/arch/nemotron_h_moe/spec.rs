@@ -93,11 +93,19 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
     })
 }
 
+/// The host split's clauses, one owner with the real file's gate
+/// (`tests/nemotron_h_moe_meta.rs`).
+#[cfg(test)]
+#[path = "../../../tests/common/host_split.rs"]
+mod host_split;
+
 #[cfg(test)]
 mod tests {
     use models::{Act, Ffn, Mixer, RopeMode, Score};
 
     use super::super::names;
+    use super::super::place::Experts;
+    use super::host_split::prefix_split;
     use crate::arch::coverage;
     use crate::arch::synthetic::{Ty, V, header_typed};
     use crate::placement::Role;
@@ -472,8 +480,9 @@ mod tests {
     /// The gate fixture's layout at Bolt's types and shapes ([`FIXTURE`]) is
     /// one the program runs whole: no coverage item. It plans whole-card on the
     /// gate machine, every routed stack and the shared expert in the file's
-    /// blocks; a tier card and a second card are refused by name. A router
-    /// row, a format pin or the group-16 flash row lost names its part here.
+    /// blocks; under every arm of [`Experts`] a context of no position, a tier
+    /// card and a second card are refused by name. A router row, a format pin
+    /// or the group-16 flash row lost names its part here.
     #[test]
     fn the_fixture_layout_plans_whole_card() {
         use crate::placement::{CardFormat, Device, Format, PlanLevers, workstation};
@@ -511,26 +520,36 @@ mod tests {
         tier.head = false;
         tier.token_embedding = false;
         tiered.tiers.push(tier);
-        match inputs.plan(&tiered, 4, &levers) {
-            Err(e @ super::super::place::PlaceError::Tier { tier: 0, .. }) => assert!(
-                e.to_string()
-                    .contains("the nemotron_h_moe body runs every layer on one card"),
-                "{e}"
-            ),
-            other => panic!("{other:?}, not the tier refusal"),
-        }
-        let mut two = machine;
+        let mut two = machine.clone();
         let mut second = two.cards[0].clone();
         second.layers = 0..0;
         second.head = false;
         second.token_embedding = false;
         two.cards.push(second);
-        match inputs.plan(&two, 4, &levers) {
-            Err(e @ super::super::place::PlaceError::Cards(2, _)) => assert_eq!(
-                e.to_string(),
-                "the placement puts the layers on 2 cards; the nemotron_h_moe chain runs on one"
-            ),
-            other => panic!("{other:?}, not the card-count refusal"),
+        for experts in [Experts::Card, Experts::Placed, Experts::Host] {
+            assert!(
+                matches!(
+                    inputs.plan_with(&machine, 0, &levers, experts),
+                    Err(super::super::place::PlaceError::CtxZero)
+                ),
+                "{experts:?}: not the context refusal"
+            );
+            match inputs.plan_with(&tiered, 4, &levers, experts) {
+                Err(e @ super::super::place::PlaceError::Tier { tier: 0, .. }) => assert!(
+                    e.to_string()
+                        .contains("the nemotron_h_moe body runs every layer on one card"),
+                    "{experts:?}: {e}"
+                ),
+                other => panic!("{experts:?}: {other:?}, not the tier refusal"),
+            }
+            match inputs.plan_with(&two, 4, &levers, experts) {
+                Err(e @ super::super::place::PlaceError::Cards(2, _)) => assert_eq!(
+                    e.to_string(),
+                    "the placement puts the layers on 2 cards; the nemotron_h_moe chain runs on one",
+                    "{experts:?}"
+                ),
+                other => panic!("{experts:?}: {other:?}, not the card-count refusal"),
+            }
         }
     }
 
@@ -583,6 +602,127 @@ mod tests {
             ),
             other => panic!("{other:?}, a spilled plan, not the expert refusal"),
         }
+    }
+
+    /// The fixture layout's plan inputs, read as the three plan gates do.
+    fn fixture_inputs(tag: &str) -> super::super::place::PlanInputs {
+        let path = header_typed(
+            tag,
+            "nemotron_h_moe",
+            &FIXTURE.keys(),
+            &[("tokenizer.ggml.pre", V::Str("pixtral"))],
+            &FIXTURE.tensors(),
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let _ = std::fs::remove_file(&path);
+        super::super::place::read(&split)
+            .unwrap_or_else(|e| panic!("the fixture layout is refused: {e}"))
+    }
+
+    /// A card that holds every routed expert plans [`Experts::Placed`] as it
+    /// plans [`Experts::Card`], byte for byte, on both cards' bytes: no
+    /// expert on the host.
+    #[test]
+    fn the_placed_plan_of_a_whole_card_is_the_card_plan() {
+        use crate::placement::{PlanLevers, workstation};
+        let inputs = fixture_inputs("nhm-placed-whole");
+        let layers = inputs.model.layers;
+        let levers = PlanLevers::default();
+        for (name, machine) in [
+            ("3090", workstation::plan_gate(layers)),
+            ("A6000", workstation::plan_a(layers)),
+        ] {
+            let card = inputs
+                .plan(&machine, 4, &levers)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let placed = inputs
+                .plan_with(&machine, 4, &levers, Experts::Placed)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(placed.host.experts, 0, "{name}");
+            assert_eq!(format!("{placed:?}"), format!("{card:?}"), "{name}");
+        }
+    }
+
+    /// A card shrunk past half the experts' bytes plans [`Experts::Placed`]:
+    /// each routed layer keeps the id prefix `[0, n_l)` its budget holds and
+    /// the rest is the host's, each expert once, a layer's stacks the same
+    /// lists, the host segments the file's share, the margin kept. A budget
+    /// that drops the margin, a host count at the model's widest layer and a
+    /// refusal of any host expert each fail a clause.
+    #[test]
+    fn a_small_card_keeps_each_layers_prefix_and_hosts_the_rest() {
+        use crate::placement::{PlanLevers, workstation};
+        let inputs = fixture_inputs("nhm-placed-small");
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let levers = PlanLevers::default();
+        let whole = inputs
+            .plan(&machine, 4, &levers)
+            .expect("the gate machine holds every expert");
+        let c = &whole.cards[0];
+        let mut small = machine;
+        small.cards[0].usable_bytes = c.dense_bytes
+            + c.rounding_bytes
+            + c.kv_bytes
+            + c.stage_rows_bytes
+            + c.expert_bytes / 2
+            + small.cards[0].set_aside_bytes().expect("bounded set-aside")
+            + small.cards[0].margin_bytes;
+        let plan = inputs
+            .plan_with(&small, 4, &levers, Experts::Placed)
+            .unwrap_or_else(|e| panic!("a card that holds some experts is refused: {e}"));
+        let (layers, bad) = prefix_split(&plan);
+        assert!(bad.is_empty(), "{bad:#?}");
+        assert!(
+            layers
+                .iter()
+                .any(|l| 0 < l.on_card && l.on_card < l.experts),
+            "no layer is split: {layers:?}"
+        );
+        assert_eq!(
+            plan.host.experts,
+            layers.iter().map(|l| l.experts - l.on_card).sum::<u64>()
+        );
+        assert_eq!(
+            plan.cards[0].experts,
+            layers.iter().map(|l| l.on_card).sum::<u64>()
+        );
+    }
+
+    /// [`Experts::Host`] keeps no routed expert on the card: every layer's
+    /// count is 0, the card holds no expert byte and no routed segment, and
+    /// the host holds each routed layer's every expert.
+    #[test]
+    fn the_host_arm_keeps_no_routed_expert_on_the_card() {
+        use crate::placement::{Device, PlanLevers, workstation};
+        let inputs = fixture_inputs("nhm-host-arm");
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let plan = inputs
+            .plan_with(&machine, 4, &PlanLevers::default(), Experts::Host)
+            .unwrap_or_else(|e| panic!("the host arm is refused: {e}"));
+        assert!(plan.n_l.iter().all(|&n| n == 0), "{:?}", plan.n_l);
+        assert_eq!(plan.cards[0].expert_bytes, 0);
+        assert_eq!(plan.cards[0].experts, 0);
+        for row in &plan.rows {
+            let t = &inputs.model.tensors[row.tensor];
+            if t.role == Role::RoutedExperts {
+                assert!(
+                    row.segments.iter().all(|s| s.device == Device::Host),
+                    "{}: {:?}",
+                    t.name,
+                    row.segments
+                );
+            }
+        }
+        let (layers, bad) = prefix_split(&plan);
+        assert!(bad.is_empty(), "{bad:#?}");
+        assert_eq!(
+            layers
+                .iter()
+                .map(|l| (l.layer, l.experts))
+                .collect::<Vec<_>>(),
+            [(1, 240), (3, 496)]
+        );
+        assert_eq!(plan.host.experts, 240 + 496);
     }
 
     /// FAIL-first: a header without `moe_latent_size` is refused by the key's

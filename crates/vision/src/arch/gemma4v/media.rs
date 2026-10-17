@@ -135,6 +135,21 @@ impl MediaModel for Media {
     fn embedding_delimiters(&self) -> Option<(&str, &str)> {
         Some((IMAGE_BEGIN, IMAGE_END))
     }
+    fn embedding_video(&self) -> Option<(&str, usize)> {
+        Some(("Video:", super::VIDEO_FRAMES))
+    }
+    fn prepare_video(&self, frames: &[Rgb8]) -> Result<Vec<Prepared>, VisionError> {
+        let prepared = prepare_video(frames, self.rule.patch())?;
+        if prepared
+            .iter()
+            .any(|frame| frame.span_len > self.rule.max_tokens())
+        {
+            return Err(VisionError::Limits {
+                detail: "video frame exceeds the loaded projector token capacity".into(),
+            });
+        }
+        Ok(prepared)
+    }
     fn image_placeholder(&self, _: usize) -> Cow<'_, str> {
         Cow::Owned(format!("{IMAGE_BEGIN}{IMAGE_END}"))
     }

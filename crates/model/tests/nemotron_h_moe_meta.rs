@@ -4,7 +4,8 @@
 //! test; it prints the summary, then fails with every pin that differs.
 //!
 //! `hw_`: needs the file on the box at [`FILE`] (`just
-//! gate-nemotron-h-moe-meta`). Headers only: the reader
+//! gate-nemotron-h-moe-meta`); the second test plans it with its routed
+//! experts on the host tier. Headers only: the reader
 //! holds every tensor to the dims the keys give it, so the tensor headers are
 //! read and the bytes are not. The tensors are pinned to tile the file's data
 //! to its last byte, so a block size the reader gets wrong fails a pin.
@@ -13,7 +14,16 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use gguf::GgmlType;
+use model::placement::{Plan, PlanLevers, workstation};
 use models::{Act, Ffn, Mixer, RopeMode, Score, ToolFormat};
+
+/// The placement types the shared clauses name as `crate::placement`.
+mod placement {
+    pub use model::placement::*;
+}
+
+#[path = "common/host_split.rs"]
+mod host_split;
 
 /// The box's path of the file.
 const FILE: &str = "/models/nemotron-3.5-bolt/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf";
@@ -300,6 +310,168 @@ fn hw_nemotron_h_moe_header() {
         bad.push(format!("coverage {features:#?}"));
     }
 
+    assert!(
+        bad.is_empty(),
+        "{} pin(s) differ:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}
+
+/// The context the plans are made at.
+const CTX: u64 = 4096;
+
+/// The routed experts of the file (the sum of its MoE layers' counts).
+const ROUTED: u64 = 13_824;
+
+/// The card room of the 3060 host's card, [`PlanLevers::card_budget_bytes`]
+/// standing in for it: `BLOOMERY_CARD_BUDGET=12G`.
+const ROOM_3060: u64 = 12 << 30;
+
+/// `plan`'s failures of the split's clauses, under `label`.
+fn check(bad: &mut Vec<String>, label: &str, plan: &Plan<'_>) {
+    let (_, failures) = host_split::prefix_split(plan);
+    bad.extend(failures.into_iter().map(|f| format!("{label}: {f}")));
+}
+
+/// What a plan places, as the `plan` line a load prints it: the card room,
+/// the experts on the card and on the host, the card's terms, the host's
+/// bytes and need, and with `layers` each MoE layer's `n_l`, card expert
+/// bytes and host expert bytes. Returns the experts on the card.
+fn show(label: &str, plan: &Plan<'_>, layers: bool) -> u64 {
+    let (moe, _) = host_split::prefix_split(plan);
+    let on_card: u64 = moe.iter().map(|l| l.on_card).sum();
+    let c = &plan.cards[0];
+    println!(
+        "plan {label}: card_budget={:?} n_l={on_card}/{ROUTED} host_experts={} host_expert_bytes={} \
+         card dense={} expert_bytes={} rounding={} kv={} headroom={} host_need={}",
+        plan.card_budget,
+        plan.host.experts,
+        plan.host.expert_bytes,
+        c.dense_bytes,
+        c.expert_bytes,
+        c.rounding_bytes,
+        c.kv_bytes,
+        c.headroom_bytes,
+        workstation::HostNeed::of(plan, 0).bytes(),
+    );
+    if layers {
+        for l in &moe {
+            println!(
+                "plan {label}: layer {} n_l={}/{} card_experts={} host_expert_bytes={}",
+                l.layer, l.on_card, l.experts, l.card_bytes, l.host_bytes
+            );
+        }
+    }
+    on_card
+}
+
+/// The host tier's plans of the real file, on the gate machine
+/// ([`workstation::plan_gate`]) and on the machine a placed load plans over
+/// ([`workstation::placed_on`]: the token embedding on the card, the m = 1
+/// scratch and none of the body's own): the `Card` plan is run once and
+/// whether the 3090 holds every routed expert at [`CTX`] pinned; where the card holds
+/// every expert, `Placed` is that plan and the partial plan is made under a
+/// budget of half the expert bytes, as the fixture's gate makes it, else the
+/// default `Placed` plan is partial. Each `Placed` plan keeps every layer's
+/// id prefix on the card and the rest on the host ([`host_split::prefix_split`])
+/// over the 40 MoE layers and all twelve shapes; a 12 GiB room (the 3060
+/// host's card) holds some experts and not all; `Host` holds all 13,824 on
+/// the host. The body's own scratch is not counted: a load's plan holds that
+/// many bytes fewer experts.
+#[test]
+#[ignore = "needs the Bolt 24GB GGUF on the box (just gate-nemotron-h-moe-meta)"]
+fn hw_nemotron_h_moe_plans_the_host_tier() {
+    use model::arch::nemotron_h_moe::place::{self, Experts};
+
+    let split = gguf::Split::open(FILE).unwrap_or_else(|e| panic!("open {FILE}: {e}"));
+    let inputs = place::read(&split).unwrap_or_else(|e| panic!("read {FILE}: {e}"));
+    let layers = inputs.model.layers;
+    assert_eq!(layers, 88);
+    let default = PlanLevers::default();
+    let mut bad: Vec<String> = Vec::new();
+    // The pins are the `Card` plans' own answers: the 3090 holds all 13,824
+    // routed experts at ctx 4096 on both machines.
+    let placed_on = workstation::placed_on(workstation::RTX_3090, layers, workstation::SCRATCH);
+    for (name, machine, holds_all) in [
+        ("gate", workstation::plan_gate(layers), true),
+        ("placed", placed_on, true),
+    ] {
+        let at = |what: &str| format!("{name} {what}");
+        let card = inputs.plan(&machine, CTX, &default);
+        println!(
+            "{name}: the 3090 holds every expert at ctx {CTX}: {}",
+            card.is_ok()
+        );
+        if card.is_ok() != holds_all {
+            bad.push(format!(
+                "{name}: the 3090 holds every expert: {}, want {holds_all}",
+                card.is_ok()
+            ));
+        }
+        let placed = inputs
+            .plan_with(&machine, CTX, &default, Experts::Placed)
+            .unwrap_or_else(|e| panic!("{name}: the default Placed plan is refused: {e}"));
+        show(&at("default placed"), &placed, false);
+        check(&mut bad, &at("default placed"), &placed);
+
+        let partial = match &card {
+            Ok(card) => {
+                if format!("{placed:?}") != format!("{card:?}") {
+                    bad.push(format!("{name}: Placed is not the Card plan"));
+                }
+                let c = &card.cards[0];
+                let budget = c.dense_bytes
+                    + c.rounding_bytes
+                    + c.kv_bytes
+                    + c.stage_rows_bytes
+                    + c.expert_bytes / 2
+                    + machine.cards[0]
+                        .set_aside_bytes()
+                        .expect("bounded set-aside")
+                    + machine.cards[0].margin_bytes;
+                println!("{name}: the partial arm's budget B = {budget}");
+                let levers = PlanLevers {
+                    card_budget_bytes: Some(budget),
+                };
+                inputs
+                    .plan_with(&machine, CTX, &levers, Experts::Placed)
+                    .unwrap_or_else(|e| panic!("{name}: the plan under B is refused: {e}"))
+            }
+            Err(_) => placed,
+        };
+        let on_card = show(&at("partial"), &partial, true);
+        check(&mut bad, &at("partial"), &partial);
+        if !(0 < on_card && on_card < ROUTED) {
+            bad.push(format!("{name} partial: {on_card} of {ROUTED} on the card"));
+        }
+
+        let room = PlanLevers {
+            card_budget_bytes: Some(ROOM_3060),
+        };
+        let small = inputs
+            .plan_with(&machine, CTX, &room, Experts::Placed)
+            .unwrap_or_else(|e| panic!("{name}: the 12 GiB room is refused: {e}"));
+        let on_card = show(&at("room 12G"), &small, true);
+        check(&mut bad, &at("room 12G"), &small);
+        if !(0 < on_card && on_card < ROUTED) {
+            bad.push(format!(
+                "{name} room 12G: {on_card} of {ROUTED} on the card"
+            ));
+        }
+
+        let host = inputs
+            .plan_with(&machine, CTX, &default, Experts::Host)
+            .unwrap_or_else(|e| panic!("{name}: the host arm is refused: {e}"));
+        let on_card = show(&at("host"), &host, false);
+        check(&mut bad, &at("host"), &host);
+        if on_card != 0 || host.host.experts != ROUTED || host.cards[0].expert_bytes != 0 {
+            bad.push(format!(
+                "{name} host: {on_card} on the card, {} on the host, {} expert bytes on the card",
+                host.host.experts, host.cards[0].expert_bytes
+            ));
+        }
+    }
     assert!(
         bad.is_empty(),
         "{} pin(s) differ:\n{}",

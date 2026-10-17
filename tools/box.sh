@@ -390,7 +390,7 @@ default_lane() {
 self_test() {
   local script=${1:-$0} d t box hd fails=0 rc=0 out= n=0 lrc=0 lpid i
   [ -f "$script" ] || { echo "box.sh: --self-test: '$script' is no file" >&2; return 64; }
-  d=$(mktemp -d "${TMPDIR:-/tmp}/box-selftest.XXXXXX")
+  d=$(mktemp -d "$(dirname "${TMPDIR:-/tmp}/x")/box-selftest.XXXXXX")
   box=$d/tree/tools/box.sh hd=$d/home/.cache/bloomery/box-hold
   mkdir -p "$d/tree/tools" "$d/stub" "$d/home"
   # The script under test, with the drop wait and the sync wait shrunk (the constants' lines at the top; the wait case below reads 2 s).

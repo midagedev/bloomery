@@ -2038,7 +2038,8 @@ run_round() {
   local -a units idx
   shift
   lg_units "$@"
-  mapfile -t units < <(lg_round "$r")
+  units=()
+  while IFS= read -r line; do units+=("$line"); done < <(lg_round "$r")
   for line in "${units[@]}"; do
     read -r -a idx <<< "$line"
     run_unit "$r" "${idx[@]}"
@@ -2050,7 +2051,8 @@ round_order() {
   local -a units idx
   shift
   lg_units "$@"
-  mapfile -t units < <(lg_round "$r")
+  units=()
+  while IFS= read -r line; do units+=("$line"); done < <(lg_round "$r")
   for line in "${units[@]}"; do
     read -r -a idx <<< "$line"
     local -a names=()
@@ -2093,11 +2095,11 @@ if [ -n "$DRY" ]; then
   [ "$gen" = 0 ] || echo "[dry] $(res_config)"
   [ -z "$SRV_CTX_PLAN" ] || echo "[dry] server context: -c $SRV_CTX_PLAN ($SRV_CTX_SRC); each ours row's load record must name it"
   xbin_pairs
-  for pair in "${XB_PAIRS[@]}"; do
+  for pair in ${XB_PAIRS[@]+"${XB_PAIRS[@]}"}; do
     IFS='|' read -r c base lab <<< "$pair"
     echo "[dry] across binaries ($c): $base / $lab"
   done
-  for lab in "${XB_NONE[@]}"; do echo "[dry] across binaries: $lab has no arm of this binary on its prompt with its variables to pair with"; done
+  for lab in ${XB_NONE[@]+"${XB_NONE[@]}"}; do echo "[dry] across binaries: $lab has no arm of this binary on its prompt with its variables to pair with"; done
   if [ "$ORDER" = rotate ]; then
     if [ "$AB_WARMUP" = 1 ]; then
       echo "[dry] warmup: ${ARMS[0]} once before round 1 (its command line above), discarded — its row prints as WARMUP r0 and is in no mean, ratio or row count (BLOOMERY_AB_WARMUP=0 skips it)"

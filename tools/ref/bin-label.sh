@@ -48,20 +48,23 @@ bin_labels_ok() {
 # Refused with both paths and shas, unless the run declares itself an A/A (BLOOMERY_AB_AA=1).
 # Reads ARMS and A_BIN as bin_labels_ok does; called after the ours build exists, before the lease.
 bin_arms_distinct() {
-  local ours_bin=$1 ours_tree=$2 i b t os ts
+  local ours_bin=$1 ours_tree=$2 i b t os ts n=${#A_BIN[@]}
   [ "${BLOOMERY_AB_AA:-0}" = 1 ] && return 0
   os=$(sha256sum "$ours_bin" 2> /dev/null | cut -c1-12)
   i=0
-  for b in "${A_BIN[@]}"; do
-    [ -n "$b" ] || { i=$((i + 1)); continue; }
-    [ -x "$b" ] || { i=$((i + 1)); continue; }
-    t=$(bin_tree "$b")
-    ts=$(sha256sum "$b" 2> /dev/null | cut -c1-12)
-    if [ "$t" = "$ours_tree" ]; then
-      arm_refuse "${ARMS[$i]}" "its binary $b lives in this tree ($ours_tree), which the ours build writes: both arms would run one binary — ours $ours_bin sha=${os:-?}, bin $b sha=${ts:-?}; point the bin: arm at another tree's build, or declare the A/A with BLOOMERY_AB_AA=1"
-    fi
-    if [ -n "$os" ] && [ "$ts" = "$os" ]; then
-      arm_refuse "${ARMS[$i]}" "its binary $b is bit-identical to the ours build (sha $os): ours $ours_bin, bin $b — a second arm needs another tree's build, or declare the A/A with BLOOMERY_AB_AA=1"
+  while [ "$i" -lt "$n" ]; do
+    b=${A_BIN[$i]}
+    # Only a bin: arm (A_KIND = bin): a plain ours arm carries the ours binary in A_BIN too,
+    # and refusing it on its own sha would refuse every run.
+    if [ -n "$b" ] && [ "${A_KIND[$i]:-}" = bin ] && [ -x "$b" ]; then
+      t=$(bin_tree "$b")
+      ts=$(sha256sum "$b" 2> /dev/null | cut -c1-12)
+      if [ "$t" = "$ours_tree" ]; then
+        arm_refuse "${ARMS[$i]}" "its binary $b lives in this tree ($ours_tree), which the ours build writes: both arms would run one binary — ours $ours_bin sha=${os:-?}, bin $b sha=${ts:-?}; point the bin: arm at another tree's build, or declare the A/A with BLOOMERY_AB_AA=1"
+      fi
+      if [ -n "$os" ] && [ "$ts" = "$os" ]; then
+        arm_refuse "${ARMS[$i]}" "its binary $b is bit-identical to the ours build (sha $os): ours $ours_bin, bin $b — a second arm needs another tree's build, or declare the A/A with BLOOMERY_AB_AA=1"
+      fi
     fi
     i=$((i + 1))
   done
@@ -119,20 +122,31 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   printf b > "$pt/third/target/release/generate_qwen3moe"
   chmod +x "$pt/ours/target/release/generate_qwen3moe" "$pt/other/target/release/generate_qwen3moe" "$pt/third/target/release/generate_qwen3moe"
   ARMS=(bin:$pt/ours/target/release/generate_qwen3moe:6)
+  A_KIND=(bin)
   A_BIN=("$pt/ours/target/release/generate_qwen3moe")
   out=$(bin_arms_distinct "$pt/ours/target/release/generate_qwen3moe" "$pt/ours" 2>&1) && r=0 || r=$?
   check same-tree "$r" 64
   case "$out" in *"$pt/ours/target/release/generate_qwen3moe"*sha*) check same-tree-names 0 0 ;; *) check same-tree-names 1 0 ;; esac
   ARMS=(bin:$pt/other/target/release/generate_qwen3moe:6)
+  A_KIND=(bin)
   A_BIN=("$pt/other/target/release/generate_qwen3moe")
   out=$(bin_arms_distinct "$pt/ours/target/release/generate_qwen3moe" "$pt/ours" 2>&1) && r=0 || r=$?
   check same-sha "$r" 64
   ARMS=(bin:$pt/third/target/release/generate_qwen3moe:6)
+  A_KIND=(bin)
   A_BIN=("$pt/third/target/release/generate_qwen3moe")
   out=$(bin_arms_distinct "$pt/ours/target/release/generate_qwen3moe" "$pt/ours" 2>&1) && r=0 || r=$?
   check distinct "$r|$out" '0|'
+  A_KIND=(bin)
   out=$(BLOOMERY_AB_AA=1 bin_arms_distinct "$pt/ours/target/release/generate_qwen3moe" "$pt/ours" 2>&1) && r=0 || r=$?
   check aa-declared "$r" 0
+  # A plain ours arm carries the ours binary in A_BIN and must not be refused (the r6 sitting's
+  # first run was: arm '512' refused on its own sha).
+  A_KIND=(plain)
+  A_BIN=("$pt/ours/target/release/generate_qwen3moe")
+  ARMS=(512)
+  out=$(bin_arms_distinct "$pt/ours/target/release/generate_qwen3moe" "$pt/ours" 2>&1) && r=0 || r=$?
+  check plain-arm-passes "$r|$out" '0|'
   rm -rf "$pt"
   # depth-ds41's witness prefix and block key call this stem. A second `bin:${…##*/}` is another owner.
   # The runner path is composed. A literal name.sh on a non-comment line is a script the

@@ -1,10 +1,14 @@
 //! A `nemotron_h_moe` file planned onto a machine: the family's half of the
-//! one path from the file's headers to a whole-card plan, as the Nano's
+//! one path from the file's headers to a plan, as the Nano's
 //! (`nemotron_h::place`). The hyperparameters, every tensor's role, the typed
 //! description and each layer's store bytes are read once ([`describe`];
 //! [`read`] refuses a file whose features no program runs, every one listed);
-//! the plan is the hybrid trunk's ([`PlanInputs::plan`]): the whole model on
-//! one card, each routed stack in the format the body's `_sel` launches read.
+//! the plan is the hybrid trunk's ([`PlanInputs::plan_with`]): the whole model
+//! on one card, each routed stack in the format the body's `_sel` launches
+//! read, and the routed experts where [`Experts`] says. [`PlanInputs::plan`]
+//! is the whole card's. A plan under [`Experts::Placed`] or [`Experts::Host`]
+//! may put experts on the host; the load still refuses that until the body has
+//! a host tier.
 //!
 //! A sequence's stores are an attention layer's K and V planes and a Mamba-2
 //! layer's scan state and conv ring; a latent MoE layer holds nothing
@@ -14,7 +18,7 @@ use gguf::Split;
 
 use super::hparams::{Hparams, Kind};
 use super::spec;
-pub use crate::arch::hybrid::{Holds, KvLayout, PlaceError, PlanInputs};
+pub use crate::arch::hybrid::{Experts, Holds, KvLayout, PlaceError, PlanInputs};
 use crate::placement::PlacementError;
 
 /// `split`'s hyperparameters, then its tensors' roles, then its description,

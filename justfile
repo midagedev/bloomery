@@ -1268,8 +1268,8 @@ gate-gpu-gemma-embedding-head256:
 # EmbeddingGemma 2 beside Qwen3-30B-A3B Q4_K_M: server vectors, placement cost, pool reserve,
 # greedy tokens with embedding calls in flight, and named refusals; the runner holds one card.
 [group('pool')]
-gate-gpu-gemma-embedding2-serve:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2 --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding2-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --dir "$D"'
+gate-gpu-gemma-embedding2-serve *ARGS:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2 --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding2-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --dir "$D" {{ARGS}}'
 
 # EmbeddingGemma 2's encoder (gpu-gemma-embedding2) end to end on the Q8_0 file the sets are dumped from
 # (refset's gemma_embedding2::MODEL, held to its sha256; the sets' `# model` line names the same path): every
@@ -2639,8 +2639,12 @@ gate-nemotron-meta:
 # moe_latent_size, a per-layer array of the wrong length, a routed stack or bias whose expert dim is not its layer's
 # router's, routed arrays off their layer's kind, expert_count not the largest router's, a MoE key missing or of a
 # value the description cannot hold, a projection scale that is not one f32) and the coverage items of a latent MoE
-# layer, then the reader's description of the 24GB GGUF at the box's path
-# (the test reads one fixed path). Headers only, seconds.
+# layer; the plan's three places for the routed experts (Experts::Card, Placed, Host) on the fixture layout (a card that
+# holds every expert plans Placed as Card, a small card keeps each layer's id prefix and hosts the rest, the Host arm keeps
+# none on the card, a context of no position, a tier card and a second card are refused under every arm); then the
+# reader's description of the 24GB GGUF at the box's path (the test reads one fixed path) and, on its real header, the
+# host tier's plans: whether the 3090 holds every routed expert, a partial plan, the 12 GiB room and all-host, each
+# layer's prefix on the card and the rest on the host. Headers only, seconds.
 gate-nemotron-h-moe-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::nemotron_h_moe --nocapture && bash tools/gate.sh --release -p bloomery-model --test nemotron_h_moe_meta -- --ignored --nocapture'
 
