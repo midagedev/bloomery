@@ -169,6 +169,18 @@
 #      recipe that does not open with its call (or a call outside one), a missing script, a recipe that is both real-only and
 #      fixture-only (in its own text or through its closure: no tier would run it) and one that is also solo-real (a real-tier placement it
 #      never uses).
+#   needs-env (either tier; class D, kind `needs-env`): a recipe whose gate needs an environment variable the batch cannot know (the address
+#      of a node outside the box) opens its box command with `bash tools/ref/needs-env.sh <its own name> <VAR> && …` (every box.sh command
+#      of the recipe does), and that call is the whole declaration, read from the recipe's text as real-only's is: the box command runs the
+#      same script (it stops a run by hand by name, exit 67, when VAR is unset or empty in the box command's environment, before a build, a
+#      lock or a file). A recipe whose closure holds such a call needs VAR too. An item whose env (`NAME@K=V`) and the batch's
+#      BLOOMERY_BOX_ENV (the batch's entries first, the item's after, the last one wins) do not set VAR to a non-empty value is deferred in
+#      either tier, as a variant item is: in no lane, never called, never red. Its run.log line is `<item> rc=deferred needs-env lane=-
+#      deferred=1`, it joins DIR/deferred.list (with a comment line of its kind; set the variable and take the list again) and the DONE line
+#      counts `deferred=<n>` (an item counts one) and `needs_env=<n>`, beside `deferred_list=<path>`. A deferral of the tier's own kinds
+#      (real-only, fixture-only, no-fixture, real-file) comes first, so such an item keeps its kind. Named errors, wherever the recipe sits,
+#      as real-only's: a call that names another recipe or names no variable, a box.sh command of the recipe that does not open with its call
+#      (or a call outside one), a missing script.
 #   --tier real|fixture (default real; BLOOMERY_TIER in the environment names the same, and the two must agree): the tier
 #      the batch runs in, passed to every item as BLOOMERY_TIER=fixture in its BLOOMERY_BOX_ENV — tools/box.sh resolves each
 #      item's model file from it (the family's fixture, tools/ref/ref-paths.sh); a family with none is a deferred item (above,
@@ -817,6 +829,17 @@ fo-solo:
 
 fo-chain: fo-any
 
+# The needs-env class: a call that opens the box command and names the recipe and the variable it needs.
+ne-any:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/needs-env.sh ne-any NE_VAR && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_ne'
+
+[group('solo')]
+[group('v41-load')]
+ne-solo:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/needs-env.sh ne-solo NE_VAR && export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gpu-gate.sh gen_ns'
+
+ne-chain: ne-any
+
 [group('solo-real')]
 sr-a6000:
     BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/gpu-gate.sh gen_sa --place a'
@@ -920,6 +943,7 @@ x-none	-	1000
 x-v41b	-	1000
 ro-solo	-	1000
 fo-solo	-	1000
+ne-solo	-	1000
 sr-a6000	-	1000
 sr-arm	-	1000
 gate-gpu-glm5next-e2e	-	1000
@@ -942,6 +966,7 @@ RT
   cp "$(dirname "$self")/ref/lease-probe.sh" "$t/tools/ref/lease-probe.sh"
   cp "$(dirname "$self")/ref/real-only.sh" "$t/tools/ref/real-only.sh"
   cp "$(dirname "$self")/ref/fixture-only.sh" "$t/tools/ref/fixture-only.sh"
+  cp "$(dirname "$self")/ref/needs-env.sh" "$t/tools/ref/needs-env.sh"
   cat > "$t/tools/ref/ref-paths.sh" << 'RP'
 : "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deepseek2}}"
 RP
@@ -2336,6 +2361,62 @@ SH
     '^DONE total=3 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=1 real_only=1 deferred_list=[^ ]*/c-fo-fx/deferred.list$'
   want_not '  … with no fixture_only= in it' "$t/target/c-fo-fx/run.log" '^DONE .*fixture_only='
   # fxonly:end A
+  # needs-env (the header's paragraph): a deferral in either tier while neither the item's env nor BLOOMERY_BOX_ENV sets the variable, never a lane, a key or a call.
+  # needsenv:begin A
+  check 'needs-env: in the real tier the recipe is deferred, in no lane' 0 '^ne-any	D	needs-env	-	.*ne-any: needs-env call NE_VAR' "${gb[@]}" --classes
+  check '  … in the fixture tier too' 0 '^ne-any	D	needs-env	-	' "${gb[@]}" --tier fixture --classes
+  check '  … a solo, v41-load one too (the deferral beats both groups)' 0 '^ne-solo	D	needs-env	-	' "${gb[@]}" --classes
+  check '  … and one that reaches the call through another recipe, by closure' 0 '^ne-chain	D	needs-env	-	' "${gb[@]}" --classes
+  check 'needs-env: a batch whose BLOOMERY_BOX_ENV sets the variable places the recipe by its calls' 0 \
+    '^ne-any	F	balanced	3090,a6000	ne-any: needs-env call NE_VAR; ne-any: gpu-gate.sh any' env BLOOMERY_BOX_ENV=NE_VAR=x "${gb[@]}" --classes
+  check '  … and a solo recipe stays alone' 0 '^ne-solo	X	solo	3090	' env BLOOMERY_BOX_ENV=NE_VAR=x "${gb[@]}" --classes
+  check '  … an empty value is no value' 0 '^ne-any	D	needs-env	-	' env BLOOMERY_BOX_ENV=NE_VAR= "${gb[@]}" --classes
+  check '  … a real-only recipe keeps its own kind in the fixture tier, the variable set or not' 0 '^ro-any	D	real-only	-	' "${gb[@]}" --tier fixture --classes
+  check 'needs-env: the item env that sets the variable places the item' 0 '^lane [AB]  ne-any ' "${gb[@]}" --dry-run 'ne-any@NE_VAR=x'
+  check '  … an empty one does not' 0 '^lane -  ne-any ' "${gb[@]}" --dry-run 'ne-any@NE_VAR='
+  out=$("${gb[@]}" --dry-run ne-any ne-solo plain-any 2>&1) || fail 'needs-env: the dry run failed' "$out"
+  if grep -q '^lane -  ne-any ' <<< "$out" && grep -q '^lane -  ne-solo ' <<< "$out" && grep -q '^lane [AB]  plain-any ' <<< "$out" \
+    && grep -q 'deferred (needs-env), never run in this batch: a variable the recipe needs is not set — NE_VAR is not set in the item.s env or BLOOMERY_BOX_ENV; ' <<< "$out" \
+    && grep -q '2 item(s) deferred for a variable they need and this batch does not set (needs-env: BLOOMERY_BOX_ENV or the item.s NAME@K=V sets it), in no lane (DONE: deferred, needs_env=2, and the list .*/deferred.list): ne-any ne-solo' <<< "$out" \
+    && grep -q 'dry run — 1 items (and 2 deferred, the variable they need is not set: needs-env)' <<< "$out"; then pass 'needs-env: the dry run names both deferred items beside the one that runs'
+  else fail 'needs-env: the dry run names both deferred items beside the one that runs' "$out"; fi
+  check 'needs-env: a deferred item adds nothing to the lane sums (plain-any alone: its 10 s row in the times file)' 0 'predicted laneA=0s laneB=10s laneX=0s chain=0s wall=10s' \
+    env "BLOOMERY_GATE_TIMES=$t/times.tsv" "${gb[@]}" --dry-run ne-any ne-solo plain-any
+  rc=$(steal_case ne-re "steal-bal	B	a6000	10	$d" -- ne-any steal-bal ne-solo)
+  printf '%s' "$rc" > "$t/rc-ne-re"
+  rc_ok 'needs-env run: a real batch with two deferred items ends green' ne-re 3
+  want 'needs-env run: the deferred item has its own line' "$t/target/c-ne-re/run.log" '^ne-any rc=deferred needs-env lane=- tier=real deferred=1$'
+  want '  … a solo one too' "$t/target/c-ne-re/run.log" '^ne-solo rc=deferred needs-env lane=- tier=real deferred=1$'
+  want 'needs-env run: the DONE line counts them in deferred= and in needs_env=' "$t/target/c-ne-re/run.log" \
+    '^DONE total=3 red=0 tier=real skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2 needs_env=2 deferred_list=[^ ]*/c-ne-re/deferred.list$'
+  want_row 'needs-env run: the item that is not deferred ran' "$t/fake-state/box.log" '$2 ~ /gen_b$/'
+  want_no_row 'needs-env run: the batch never called a deferred recipe' "$t/fake-state/box.log" '$2 ~ /gen_ne$|gen_ns$/'
+  want_no_row '  … and wrote no times row for it' "$t/times-ne-re.tsv" '$1 ~ /^ne-/'
+  want_not '  … nor a ledger record' "$t/rounds-ne-re.tsv" '^[^	]*ne-(any|solo)'
+  n=$((n + 1))
+  if [ "$(grep -v '^#' "$t/target/c-ne-re/deferred.list" | paste -sd, -)" = 'ne-any,ne-solo' ] && grep -q '^# needs-env: ' "$t/target/c-ne-re/deferred.list" \
+    && grep -q '^# gate-batch: the 2 item(s) it deferred for a variable they need and this batch did not set' "$t/target/c-ne-re/deferred.list" \
+    && ! grep -q 'it deferred to a fixture-tier batch' "$t/target/c-ne-re/deferred.list"; then echo 'ok needs-env run: DIR/deferred.list holds the two items, with the comment of the kind'
+  else bad=$((bad + 1)); echo "FAIL needs-env run: DIR/deferred.list: $(cat "$t/target/c-ne-re/deferred.list" 2>&1)"; fi
+  note_case 'needs-env run: DIR/deferred.list holds the two items, with the comment of the kind'
+  rc=$(steal_case ne-all "steal-bal	B	a6000	10	$d" -- ne-any ne-solo)
+  printf '%s' "$rc" > "$t/rc-ne-all"
+  rc_ok 'needs-env run: a batch of deferred items only ends green' ne-all 2
+  want 'needs-env run: … its DONE line' "$t/target/c-ne-all/run.log" '^DONE total=2 red=0 tier=real skipped=0 wall=[0-9]+s laneA=0s laneB=0s deferred=2 needs_env=2 deferred_list=[^ ]*/deferred.list$'
+  want 'needs-env run: … says nothing ran on the box' "$t/out-ne-all.log" '^gate-batch: every item is deferred \(to the other tier, or for a variable it needs and this batch does not set\) — nothing runs on the box, so no lease check$'
+  want_no_row 'needs-env run: … and made no box call at all' "$t/fake-state/box.log" '1'
+  rc=$(steal_case ne-fx "steal-bal	B	a6000	10	$d" -- --tier fixture ne-any ro-any steal-bal)
+  printf '%s' "$rc" > "$t/rc-ne-fx"
+  rc_ok 'needs-env run: the fixture tier defers it beside a real-only item, each by its own kind' ne-fx 3
+  want '  … the DONE line counts each' "$t/target/c-ne-fx/run.log" \
+    '^DONE total=3 red=0 tier=fixture skipped=0 wall=[0-9]+s laneA=[0-9]+s laneB=[0-9]+s deferred=2 real_only=1 needs_env=1 deferred_list=[^ ]*/c-ne-fx/deferred.list$'
+  want '  … and the line of the needs-env item names its kind' "$t/target/c-ne-fx/run.log" '^ne-any rc=deferred needs-env lane=- tier=fixture deferred=1$'
+  rc=$(steal_case ne-set "steal-bal	B	a6000	10	$d" -- --tier fixture 'ne-any@NE_VAR=x' steal-bal)
+  printf '%s' "$rc" > "$t/rc-ne-set"
+  rc_ok 'needs-env run: an item whose env sets the variable is called, with it' ne-set 2
+  want_row '  … through its box call' "$t/fake-state/box.log" '$1 ~ /NE_VAR=x/ && $2 ~ /gen_ne$/'
+  want_not '  … and its DONE line has no needs_env=' "$t/target/c-ne-set/run.log" '^DONE .*needs_env='
+  # needsenv:end A
   # no-fixture (the header's deferred paragraph, kind 2): a family the fixture table (tools/fixture-dirs.tsv) does not name is deferred
   # in the fixture tier, never run and never red; the table is read from that file, so a family it names runs.
   check 'no-fixture: in the real tier a recipe of a family with no fixture is placed as usual' 0 '^x-glm	X	solo	' "${gb[@]}" --classes
@@ -2642,6 +2723,28 @@ SH
   check '  … in the fixture tier too, and counted' 65 '^gate-batch: 1 real-only or fixture-only recipe\(s\) the class could not hold; nothing ran$' "${gb[@]}" --tier fixture --classes
   cp "$t/justfile.good" "$t/justfile"
   # fxonly:end B
+  # needsenv:begin B
+  printf '%s\n' '' 'ne-other:' "    ./tools/box.sh 'bash tools/ref/needs-env.sh ne-any NE_VAR && bash tools/gate.sh -p z'" >> "$t/justfile"
+  check "needs-env: a call that names another recipe: a named error" 65 "recipe ne-other: its needs-env call names ne-any, not itself" "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' 'ne-novar:' "    ./tools/box.sh 'bash tools/ref/needs-env.sh ne-novar && bash tools/gate.sh -p z'" >> "$t/justfile"
+  check 'needs-env: a call that names no variable: a named error' 65 'recipe ne-novar: its needs-env call names &&, which is no variable name' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' 'ne-late:' "    ./tools/box.sh 'cargo build && bash tools/ref/needs-env.sh ne-late NE_VAR && bash tools/gate.sh -p z'" >> "$t/justfile"
+  check 'needs-env: a box command that does not open with the call: a named error' 65 \
+    'recipe ne-late: a needs-env recipe opens every box.sh command with .bash tools/ref/needs-env.sh ne-late <VAR> && …. — 1 single-quoted box.sh command\(s\), 1 call\(s\), 1 not opening with it' "${gb[@]}" --classes
+  check '  … counted' 65 '^gate-batch: 1 needs-env recipe\(s\) the class could not hold; nothing ran$' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' 'ne-two:' "    ./tools/box.sh 'bash tools/ref/needs-env.sh ne-two NE_VAR && bash tools/gate.sh -p a'" "    ./tools/box.sh 'bash tools/gate.sh -p b'" >> "$t/justfile"
+  check 'needs-env: a second box command with no call: a named error' 65 'recipe ne-two: .* 2 single-quoted box.sh command\(s\), 1 call\(s\), 1 not opening with it' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' 'ne-bare:' "    bash tools/ref/needs-env.sh ne-bare NE_VAR" >> "$t/justfile"
+  check 'needs-env: a call outside a single-quoted box command: a named error' 65 'recipe ne-bare: .* 0 single-quoted box.sh command\(s\), 1 call\(s\)' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  mv "$t/tools/ref/needs-env.sh" "$t/tools/ref/needs-env.sh.off"
+  check 'needs-env: a call to a script that is not in the tree: a named error' 65 'recipe ne-any: calls tools/ref/needs-env.sh, which is not in the tree' "${gb[@]}" --classes
+  mv "$t/tools/ref/needs-env.sh.off" "$t/tools/ref/needs-env.sh"
+  # needsenv:end B
   # An inline tier guard (a test of BLOOMERY_TIER and an `exit 66` in one box command) is the real-only call spelt by hand: this runner reads
   # only the call, so it would place the recipe and the batch would meet the exit as a red. A box command that only branches is no guard.
   check 'inline guard: a recipe that only branches on the tier (no exit 66) is placed as usual' 0 '^tg-branch	A	fixed	3090	' "${gb[@]}" --tier fixture --classes
@@ -2710,6 +2813,19 @@ IG
   check '  … a tier that is neither is refused, 64' 64 "got 'both'" env BLOOMERY_TIER=both bash "$fo_sh" gate-x
   check '  … a call with no recipe name is a usage error, 64' 64 'usage: bash tools/ref/fixture-only.sh <recipe>' env BLOOMERY_TIER=real bash "$fo_sh"
   # fxonly:end C
+  # needsenv:begin C
+  # The needs-env guard: it stops the command by name when the variable is unset or empty, exit 67, before any box call.
+  local ne_sh
+  ne_sh=$(dirname "$self")/ref/needs-env.sh
+  check 'needs-env guard: an unset variable stops it by name, exit 67' 67 '^gate-x: needs-env: it needs NE_VAR, which is unset or empty here.*exit 67' env -u NE_VAR bash "$ne_sh" gate-x NE_VAR
+  check '  … so does an empty one' 67 '^gate-x: needs-env: it needs NE_VAR, which is unset or empty here' env NE_VAR= bash "$ne_sh" gate-x NE_VAR
+  check '  … the variable it names is the one it reads' 67 'it needs OTHER_VAR' env -u OTHER_VAR NE_VAR=x bash "$ne_sh" gate-x OTHER_VAR
+  check '  … a variable with a value passes' 0 '^$' env NE_VAR=x bash "$ne_sh" gate-x NE_VAR
+  check '  … a call with no variable is a usage error, 64' 64 'usage: bash tools/ref/needs-env.sh <recipe> <VAR>' bash "$ne_sh" gate-x
+  check '  … a call with no recipe name is one too' 64 'usage: bash tools/ref/needs-env.sh <recipe> <VAR>' bash "$ne_sh"
+  check '  … a name that is no variable is refused, 64' 64 "'1X' is no variable name" env NE_VAR=x bash "$ne_sh" gate-x 1X
+  check '  … and one with a bad byte, 64' 64 "'A-B' is no variable name" env NE_VAR=x bash "$ne_sh" gate-x A-B
+  # needsenv:end C
   # One card by box.sh's pick (solo-real, BLOOMERY_CARD=a6000): alone in the real tier, fixed to lane B in the fixture tier; two cards stay refused (sr-both above).
   check 'one card: a solo-real recipe with BLOOMERY_CARD=a6000 is alone in the real tier' 0 '^sr-a6000	X	solo	-	' "${gb[@]}" --classes
   check '  … and fixed to the A6000 lane in the fixture tier' 0 '^sr-a6000	B	fixed	-	' "${gb[@]}" --tier fixture --classes
@@ -4287,12 +4403,37 @@ def defer_tags(name):
         target, site, called = real_file(name)
         tags.append(f"family {family(name)}: its fixture-table row is self (the real file stands, no fixture file) and {target} "
                     f"reaches the fixture fence at {site} ({called})")
-    return tags + [f"{n}: fixture-only call" for n in marked_of("fixture-only", name)]
+    return (tags + [f"{n}: fixture-only call" for n in marked_of("fixture-only", name)]
+            + [f"{n}: needs-env call {var}" for n, var in env_calls(name)])
 
 
 def marked_of(kind, name):
     """The recipes of name's closure whose own text calls the guard of the marker class `kind` (MARKERS)."""
     return [n for n in closure(name, set()) if MARKER_CALL[kind].search(body(n))]
+
+
+# The needs-env class (the header's paragraph) is a call in the box command too: `bash tools/ref/needs-env.sh <recipe> <VAR> && …`, the first
+# command of every box.sh command of the recipe. The box side runs it (it stops the command by name when VAR is unset or empty in the box
+# command's environment, which is BLOOMERY_BOX_ENV's entries); this runner reads it from the text and defers the item in either tier when
+# neither the item's env nor the batch's BLOOMERY_BOX_ENV sets VAR to a value.
+ENV_GUARD = "tools/ref/needs-env.sh"
+ENV_CALL = re.compile(r"\bbash " + re.escape(ENV_GUARD) + r"\s+(\S+)\s+(\S+)")
+ENV_VAR = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def env_calls(name):
+    """[(recipe, VAR)]: the needs-env calls of name's closure, the recipe whose text holds one and the variable it names."""
+    return [(n, var) for n in closure(name, set()) for _, var in ENV_CALL.findall(body(n))]
+
+
+def env_missing(name, envs):
+    """The needs-env calls of name's closure whose variable has no value in the batch's BLOOMERY_BOX_ENV followed by the item's env
+    entries `envs` (K=V; the box exports them in that order, the last one wins; an empty value is unset, as the guard reads it)."""
+    held = {}
+    for kv in caller_env.split() + list(envs):
+        k, _, v = kv.partition("=")
+        held[k] = v
+    return [(n, var) for n, var in env_calls(name) if not held.get(var)]
 
 
 ro_bad = []
@@ -4323,6 +4464,31 @@ if ro_bad:
     for e in ro_bad:
         print("gate-batch: " + e, file=sys.stderr)
     fail(f"{len(ro_bad)} real-only or fixture-only recipe(s) the class could not hold; nothing ran")
+
+env_bad = []
+for n in sorted(recipes):
+    text = body(n)
+    calls = ENV_CALL.findall(text)
+    if not calls:
+        continue
+    if not os.path.isfile(os.path.join(root, ENV_GUARD)):
+        env_bad.append(f"recipe {n}: calls {ENV_GUARD}, which is not in the tree")
+    wrong = sorted({c for c, _ in calls if c != n})
+    if wrong:
+        env_bad.append(f"recipe {n}: its needs-env call names {', '.join(wrong)}, not itself — write `bash {ENV_GUARD} {n} <VAR>`")
+    novar = sorted({v for _, v in calls if not ENV_VAR.fullmatch(v)})
+    if novar:
+        env_bad.append(f"recipe {n}: its needs-env call names {', '.join(novar)}, which is no variable name — write `bash {ENV_GUARD} {n} <VAR>`")
+    first = f"bash {ENV_GUARD} {n} "
+    opens = [m.end() for m in re.finditer(re.escape(BOX_OPEN), text)]
+    loose = [e for e in opens if not text.startswith(first, e)]
+    if not opens or loose or len(calls) != len(opens):
+        env_bad.append(f"recipe {n}: a needs-env recipe opens every box.sh command with `bash {ENV_GUARD} {n} <VAR> && …` — "
+                       f"{len(opens)} single-quoted box.sh command(s), {len(calls)} call(s), {len(loose)} not opening with it")
+if env_bad:
+    for e in env_bad:
+        print("gate-batch: " + e, file=sys.stderr)
+    fail(f"{len(env_bad)} needs-env recipe(s) the class could not hold; nothing ran")
 
 # A box command that only branches on the tier (`if [ "${BLOOMERY_TIER:-real}" = fixture ]; then …`) holds no `exit 66` and is not a guard.
 guard_bad = []
@@ -4779,7 +4945,7 @@ def no_fixture(name):
     return None if fam in fixture_families() else fam
 
 
-def placement(name, lane, lanes):
+def placement(name, lane, lanes, envs=()):
     """(class, kind, card candidates, their times-file labels) of a recipe that runs in a batch."""
     names = closure(name, set())
     uses_gpu_gate = bool(GATE_FORMS[name])
@@ -4795,6 +4961,10 @@ def placement(name, lane, lanes):
     if tier == "fixture" and real_file(name):
         # The family's real file stands and a target of the recipe opens it through the fence (a red): deferred under its own kind.
         return "D", "real-file", ["-"], ["none"]
+    if env_missing(name, envs):
+        # A variable the recipe's guard needs is set in neither the item's env nor BLOOMERY_BOX_ENV: the command would stop by name
+        # (exit 67), a red. Deferred under its own kind, in either tier.
+        return "D", "needs-env", ["-"], ["none"]
     if lanes == "1":
         if box:
             labels = [box]
@@ -4946,7 +5116,9 @@ for item, at in zip(raw_items, where):
         errors.append(f"{at}: {item!r} holds a tab or a newline in its env or ARGS: the times file is one tab-separated row per item")
         continue
     exp, esrc = expected(tkey)
-    cls, kind, cards, labels = placement(name, lane, lanes)
+    cls, kind, cards, labels = placement(name, lane, lanes, envs)
+    if kind == "needs-env":
+        reason = f"{', '.join(sorted({v for _, v in env_missing(name, envs)}))} is not set in the item's env or BLOOMERY_BOX_ENV; " + reason
     if variant and tier == "real":
         # A variant is a fixture: the real tier opens none (tools/ref/ref-paths.sh exits 64), so the item is deferred to a fixture batch.
         cls, kind, cards, labels = "D", "variant", ["-"], ["none"]
@@ -5092,7 +5264,7 @@ fi
 N=${#R_REC[@]}
 ND=${#DP_STEM[@]}
 NT=$((N + ND)) # every item of the batch: the ones that run and the ones deferred
-ND_RO=0 ND_NF=0 ND_RF=0 ND_VR=0 ND_FX=0 # of those, the real-only gates, the gates of a family with no fixture, the real-file ones, the variant items and the fixture-only gates (the last two: real tier)
+ND_RO=0 ND_NF=0 ND_RF=0 ND_VR=0 ND_FX=0 ND_NE=0 # of those, the real-only gates, the gates of a family with no fixture, the real-file ones, the variant items and the fixture-only gates (the last two: real tier)
 for ((i = 0; i < ND; i++)); do
   case ${DP_KIND[$i]} in
     real-only) ND_RO=$((ND_RO + 1)) ;;
@@ -5100,9 +5272,11 @@ for ((i = 0; i < ND; i++)); do
     real-file) ND_RF=$((ND_RF + 1)) ;;
     variant) ND_VR=$((ND_VR + 1)) ;;
     fixture-only) ND_FX=$((ND_FX + 1)) ;;
-    *) RC=70 die "plan: a deferred item of the kind '${DP_KIND[$i]}' (${DP_STEM[$i]}): the kinds are real-only, no-fixture, real-file, variant and fixture-only" ;;
+    needs-env) ND_NE=$((ND_NE + 1)) ;;
+    *) RC=70 die "plan: a deferred item of the kind '${DP_KIND[$i]}' (${DP_STEM[$i]}): the kinds are real-only, no-fixture, real-file, variant, fixture-only and needs-env" ;;
   esac
 done
+NDT=$((ND - ND_NE)) # the deferrals of a tier's own kinds: a needs-env item is deferred in either tier, to a batch that sets its variable
 # A recipe whose only card candidate is the 3090 or the A6000 is named and stopped when
 # BLOOMERY_CARD names the other card, or both, before a lane starts, the dry run included.
 # That is a fixed item, and a chain or solo item with that one candidate. The card it is
@@ -5138,13 +5312,19 @@ both_card_refuse() {
 }
 both_card_refuse
 DEFER_NOTE=''
-if [ "$ND" != 0 ] && [ "$ND_VR" = "$ND" ]; then
+if [ "$NDT" != 0 ] && [ "$ND_VR" = "$NDT" ]; then
   DEFER_NOTE=" (and $ND_VR deferred to a fixture-tier batch: a variant is a fixture)"
-elif [ "$ND" != 0 ] && [ "$TIER" = real ]; then
-  DEFER_NOTE=" (and $ND deferred to a fixture-tier batch: $ND_VR variant, $ND_FX fixture-only)"
-elif [ "$ND" != 0 ]; then
-  DEFER_NOTE=" (and $ND deferred to the real tier: $ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file)"
+elif [ "$NDT" != 0 ] && [ "$TIER" = real ]; then
+  DEFER_NOTE=" (and $NDT deferred to a fixture-tier batch: $ND_VR variant, $ND_FX fixture-only)"
+elif [ "$NDT" != 0 ]; then
+  DEFER_NOTE=" (and $NDT deferred to the real tier: $ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file)"
 fi
+[ "$ND_NE" = 0 ] || DEFER_NOTE="$DEFER_NOTE (and $ND_NE deferred, the variable they need is not set: needs-env)"
+# The stems by kind class, for the lines that name them: the tier's own kinds, and the needs-env ones.
+DP_TIER_STEMS=() DP_NE_STEMS=()
+for ((i = 0; i < ND; i++)); do
+  if [ "${DP_KIND[$i]}" = needs-env ]; then DP_NE_STEMS+=("${DP_STEM[$i]}"); else DP_TIER_STEMS+=("${DP_STEM[$i]}"); fi
+done
 for ((i = 0; i < N; i++)); do
   rec_get "$i" name env args cards
   R_C0+=("${#C_ITEM[@]}")
@@ -5695,13 +5875,14 @@ predicted() { # the plan's lane sums, derived from the times file
   fi
   echo "gate-batch: predicted $PREDICTED (derived: $how)"
   [ "$SUM_NDEF" = 0 ] || echo "gate-batch: $SUM_NDEF item(s) expected at the ${DEFAULT_S} s default (no row in the times file): $SUM_DEF"
-  if [ "$ND" != 0 ] && [ "$ND_VR" = "$ND" ]; then
-    echo "gate-batch: $ND_VR item(s) deferred to a fixture-tier batch (a variant is a fixture: the real tier opens none), in no lane (DONE: deferred=$ND, and the list $OUT/deferred.list): ${DP_STEM[*]}"
-  elif [ "$ND" != 0 ] && [ "$TIER" = real ]; then
-    echo "gate-batch: $ND item(s) deferred to a fixture-tier batch ($ND_VR variant, $ND_FX fixture-only: a variant is a fixture, and a fixture-only gate has sets on the fixture tier only), in no lane (DONE: deferred=$ND, and the list $OUT/deferred.list): ${DP_STEM[*]}"
+  if [ "$NDT" != 0 ] && [ "$ND_VR" = "$NDT" ]; then
+    echo "gate-batch: $ND_VR item(s) deferred to a fixture-tier batch (a variant is a fixture: the real tier opens none), in no lane (DONE: deferred=$ND, and the list $OUT/deferred.list): ${DP_TIER_STEMS[*]}"
+  elif [ "$NDT" != 0 ] && [ "$TIER" = real ]; then
+    echo "gate-batch: $NDT item(s) deferred to a fixture-tier batch ($ND_VR variant, $ND_FX fixture-only: a variant is a fixture, and a fixture-only gate has sets on the fixture tier only), in no lane (DONE: deferred=$ND, and the list $OUT/deferred.list): ${DP_TIER_STEMS[*]}"
   else
-    [ "$ND" = 0 ] || echo "gate-batch: $ND item(s) deferred to the real tier ($ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file), in no lane (DONE: deferred=+$ND, and the list $OUT/deferred.list): ${DP_STEM[*]}"
+    [ "$NDT" = 0 ] || echo "gate-batch: $NDT item(s) deferred to the real tier ($ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file), in no lane (DONE: deferred=+$ND, and the list $OUT/deferred.list): ${DP_TIER_STEMS[*]}"
   fi
+  [ "$ND_NE" = 0 ] || echo "gate-batch: $ND_NE item(s) deferred for a variable they need and this batch does not set (needs-env: BLOOMERY_BOX_ENV or the item's NAME@K=V sets it), in no lane (DONE: deferred, needs_env=$ND_NE, and the list $OUT/deferred.list): ${DP_NE_STEMS[*]}"
 }
 
 # The GPU hold (the header's «The GPU hold»). The box-side writer is tools/gpu-gate.sh --gpuhold, reached through box.sh with
@@ -5971,7 +6152,9 @@ if [ "$DRY" = 1 ]; then
     echo "gate-batch: the chain is fed by $fed: a lane takes a member whose candidates include its card, and a lane with no item and no such member does not start"
   fi
   for ((i = 0; i < ND; i++)); do
-    if [ "$TIER" = real ]; then
+    if [ "${DP_KIND[$i]}" = needs-env ]; then
+      printf 'lane -  %-28s %s\n        deferred (%s), never run in this batch: a variable the recipe needs is not set — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
+    elif [ "$TIER" = real ]; then
       printf 'lane -  %-28s %s\n        deferred to a fixture-tier batch (%s), never run in the real tier — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
     else
       printf 'lane -  %-28s %s\n        deferred to the real tier (%s), never run in the fixture tier — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
@@ -5996,7 +6179,9 @@ if [ "$SKIP_N" -lt "$N" ]; then
     *) echo "$lease" >&2; RC=70 die "the start check through box.sh failed (rc $rc; 70 from the guard: the lease cannot be tested)" ;;
   esac
 elif [ "$N" = 0 ]; then
-  if [ "$TIER" = real ]; then
+  if [ "$ND_NE" != 0 ]; then
+    echo "gate-batch: every item is deferred (to the other tier, or for a variable it needs and this batch does not set) — nothing runs on the box, so no lease check"
+  elif [ "$TIER" = real ]; then
     echo "gate-batch: every item is deferred to a fixture-tier batch — nothing runs on the box, so no lease check"
   else
     echo "gate-batch: every item is deferred to the real tier — nothing runs on the box, so no lease check"
@@ -6042,17 +6227,21 @@ done
 DEFER_LIST=$OUT/deferred.list
 if [ "$ND" != 0 ]; then
   { # the deferred items in --list format, so a real-tier batch takes exactly this set (`--list DIR/deferred.list`)
-    if [ "$TIER" = fixture ]; then
-      echo "# gate-batch --tier fixture: the $ND item(s) it deferred to the real tier, one per line (the --list format)"
+    if [ "$NDT" = 0 ]; then
+      :
+    elif [ "$TIER" = fixture ]; then
+      echo "# gate-batch --tier fixture: the $NDT item(s) it deferred to the real tier, one per line (the --list format)"
     else
-      echo "# gate-batch: the $ND item(s) it deferred to a fixture-tier batch, one per line (the --list format; --tier fixture takes them)"
+      echo "# gate-batch: the $NDT item(s) it deferred to a fixture-tier batch, one per line (the --list format; --tier fixture takes them)"
     fi
-    for kind in real-only no-fixture real-file variant fixture-only; do
+    [ "$ND_NE" = 0 ] || echo "# gate-batch: the $ND_NE item(s) it deferred for a variable they need and this batch did not set, one per line (the --list format; BLOOMERY_BOX_ENV or NAME@K=V sets it)"
+    for kind in real-only no-fixture real-file variant fixture-only needs-env; do
       case $kind in
         real-only) [ "$ND_RO" = 0 ] || echo "# real-only: no fixture-tier conversion (bash tools/ref/real-only.sh in the recipe's box command)" ;;
         fixture-only) [ "$ND_FX" = 0 ] || echo "# fixture-only: sets on the fixture tier only, no real-tier run (bash tools/ref/fixture-only.sh in the recipe's box command)" ;;
         no-fixture) [ "$ND_NF" = 0 ] || echo "# no-fixture: the recipe's family has no row in the fixture table, tools/fixture-dirs.tsv (box.sh exits 66)" ;;
         variant) [ "$ND_VR" = 0 ] || echo "# variant: the item runs on a fixture variant (tools/fixture-variants.tsv); the real tier opens none (tools/ref/ref-paths.sh exits 64)" ;;
+        needs-env) [ "$ND_NE" = 0 ] || echo "# needs-env: the recipe needs an environment variable this batch does not set (bash tools/ref/needs-env.sh in the recipe's box command)" ;;
         real-file) [ "$ND_RF" = 0 ] || echo "# real-file: the recipe's family runs on its real file (its fixture-table row is self) and a target of the recipe reaches the fixture fence (tools/recipes.py opens), which refuses that file" ;;
       esac
       for ((i = 0; i < ND; i++)); do
@@ -6766,11 +6955,13 @@ if [ "$TIER" = fixture ]; then
   [ "$ND_RO" = 0 ] || done_line="$done_line real_only=$ND_RO"
   [ "$ND_NF" = 0 ] || done_line="$done_line no_fixture=$ND_NF"
   [ "$ND_RF" = 0 ] || done_line="$done_line real_file=$ND_RF"
+  [ "$ND_NE" = 0 ] || done_line="$done_line needs_env=$ND_NE"
   [ "$ND" = 0 ] || done_line="$done_line deferred_list=$DEFER_LIST"
 elif [ "$ND" != 0 ]; then
   done_line="$done_line deferred=$ND"
   [ "$ND_VR" = 0 ] || done_line="$done_line variant=$ND_VR"
   [ "$ND_FX" = 0 ] || done_line="$done_line fixture_only=$ND_FX"
+  [ "$ND_NE" = 0 ] || done_line="$done_line needs_env=$ND_NE"
   done_line="$done_line deferred_list=$DEFER_LIST"
 fi
 echo "$done_line" >> "$RUNLOG"
