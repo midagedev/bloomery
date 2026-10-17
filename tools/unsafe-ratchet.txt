@@ -302,7 +302,11 @@ gguf 9 2 0
 # PIN(2026-10-17): gpu 1910 -> 1909 blocks — the transpose-reduce's one block went with the
 # kernels' return to the per-channel xor butterfly (mamba2_steps keeps the transpose-reduce). Re-derived
 # at the 2026-10-17 rebase onto main.
-gpu 1909 208 10
+# PIN(2026-10-17): gpu 1909 -> 1910 blocks — the pass's transpose-reduce is back for
+# mamba2_steps alone (its y phase reads z's staged value in its own block; the decode step keeps
+# the per-channel xor butterfly). Measured 1908/207 on the merged tree (the fold's call blocks)
+# differ from the branch pin by two; the ratchet follows the measurement.
+gpu 1908 207 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
