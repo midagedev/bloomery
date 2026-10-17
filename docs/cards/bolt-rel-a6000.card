@@ -1,0 +1,13 @@
+# The release row on the A6000: ours bolt-r7 a11557577 (4096-row passes + the chunked SSD scan +
+# nvf4b) vs lcpppp4096, the A6000 line (2175.67..2176.43, s2690). Bands from the ssd round's
+# derivation (-315..-337 ms off e30b8c933's 1.889 s) and nvf4b's (+3..+11 % on its class).
+kind: baseline
+question: does the landed head beat the llama.cpp line at pp4096 on the A6000?
+term: pp tok/s @ P = 4096, ours a11557577 default vs lcpppp4096, RTX A6000
+unit: tok/s
+predict: 2550..2800
+condition: one lease, the A6000 (default timing card), BLOOMERY_AB_ROUNDS=4; arms 4096 lcpppp4096:4096
+reason: the ssd round's paper (mamba2_steps 363.2 ms replaced by 26..48 ms) and nvf4b's SASS count.
+decide-in: the release verdict reads ours/lcpppp4096 with its interval
+decide-below: under 2550: the SSD switch paid less than derived; read the eager split before any lever
+decide-above: beyond 2800: more than the two levers moved; decompose before crediting

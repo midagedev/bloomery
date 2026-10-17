@@ -1,0 +1,13 @@
+# The release row on the 3090: ours bolt-r7 a11557577 (4096-row passes + the chunked SSD scan +
+# nvf4b) vs lcpppp4096, the 3090 line (1925.91..1953.10, s2696, s2702). Bands from the ssd round's
+# derivation (-315..-337 ms off e30b8c933's 1.889 s) and nvf4b's (+3..+11 % on its class).
+kind: baseline
+question: does the landed head beat the llama.cpp line at pp4096 on the 3090?
+term: pp tok/s @ P = 4096, ours a11557577 default vs lcpppp4096, RTX 3090
+unit: tok/s
+predict: 1880..2100
+condition: one lease, BLOOMERY_TIMING_GPU = the 3090 (GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1), BLOOMERY_AB_ROUNDS=4; arms 4096 lcpppp4096:4096
+reason: the ssd round's paper (mamba2_steps 363.2 ms replaced by 26..48 ms) and nvf4b's SASS count.
+decide-in: the release verdict reads ours/lcpppp4096 with its interval
+decide-below: under 1880: the SSD switch paid less than derived; read the eager split before any lever
+decide-above: beyond 2100: more than the two levers moved; decompose before crediting
