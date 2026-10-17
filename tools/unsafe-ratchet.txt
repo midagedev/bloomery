@@ -277,10 +277,7 @@ gguf 9 2 0
 # pass's conv pre-pass mamba2_conv_rows (one fn) and the STAGE_T staging rewrite of mamba2_steps, each
 # with its SAFETY line (the branch's own pin counted three blocks from 1871; the merged tree measures
 # five from the nvfp4p pin).
-# PIN(2026-10-17): gpu 1878 -> 1879 blocks, 204 fns, 10 impls — the mamba2 y-reduction's
-# transpose-reduce splits the channel loop: the y phase reads z's staged value in its
-# own block (the update phase's (x, zv) tuple block keeps its load; one block more).
-gpu 1879 204 10
+gpu 1878 204 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
