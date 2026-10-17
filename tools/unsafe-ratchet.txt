@@ -337,6 +337,9 @@ gpu-gates 78 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of
 # enqueue_head_norm_neox_append_256_whole, its positions 0..ctx distinct, with its SAFETY line.
 gpu-gemma-embedding2 2 0 0
+# PIN(2026-10-16): gpu-gemma4a starts with 10 blocks: eight disjoint kernel stores or rows and
+# two embedded-module loads, each with its SAFETY line. No existing unsafe code is relaxed.
+gpu-gemma4a 10 0 0
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and

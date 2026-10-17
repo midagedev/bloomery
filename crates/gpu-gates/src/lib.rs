@@ -37,6 +37,7 @@ pub mod image_plan;
 #[cfg(feature = "gpu")]
 pub mod iq_rows;
 pub mod kld;
+pub mod logit_rows;
 pub mod model_file;
 #[cfg(feature = "gpu")]
 pub mod nodes;

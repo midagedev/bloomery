@@ -55,9 +55,53 @@ pub fn conv_pixels(encoded: &[u16]) -> Result<Vec<f32>, VisionError> {
         .collect()
 }
 
+/// Sample a zero-based constant-rate RGB clip at one frame per second.
+/// Source FPS is a numerator and denominator. EOF is one source interval after the last frame.
+/// Timestamps round to the nearest output tick, with half ticks rounded up.
+/// The last source frame in each output tick wins; low-rate frames may repeat.
+/// Clips that yield zero or more than 32 output frames are refused, not truncated.
+pub fn prepare_clip(
+    frames: &[Rgb8],
+    source_fps: (u32, u32),
+    patch: usize,
+) -> Result<(Vec<usize>, Vec<Prepared>), VisionError> {
+    let (num, den) = source_fps;
+    if frames.is_empty() || num == 0 || den == 0 {
+        return Err(VisionError::Limits {
+            detail: "gemma4v clip needs decoded frames and positive source FPS".into(),
+        });
+    }
+    let num = u128::from(num);
+    let den = u128::from(den);
+    let count = (2 * frames.len() as u128 * den + num) / (2 * num);
+    if count == 0 || count > super::VIDEO_FRAMES as u128 {
+        return Err(VisionError::Limits {
+            detail: format!(
+                "gemma4v clip samples to {count} frames; supported range is 1 to {}",
+                super::VIDEO_FRAMES
+            ),
+        });
+    }
+    let indices = (0..count)
+        .map(|tick| {
+            let next = ((2 * tick + 1) * num).div_ceil(2 * den);
+            (next - 1).min(frames.len() as u128 - 1) as usize
+        })
+        .collect::<Vec<_>>();
+    let prepared = prepare_frames(indices.iter().map(|&i| &frames[i]), patch)?;
+    Ok((indices, prepared))
+}
+
 /// Prepare already sampled RGB frames in input order, without timestamps or truncation.
 pub fn prepare_video(frames: &[Rgb8], patch: usize) -> Result<Vec<Prepared>, VisionError> {
-    if frames.is_empty() || frames.len() > super::VIDEO_FRAMES {
+    prepare_frames(frames.iter(), patch)
+}
+
+fn prepare_frames<'a>(
+    frames: impl ExactSizeIterator<Item = &'a Rgb8>,
+    patch: usize,
+) -> Result<Vec<Prepared>, VisionError> {
+    if frames.len() == 0 || frames.len() > super::VIDEO_FRAMES {
         return Err(VisionError::Limits {
             detail: format!(
                 "gemma4v video takes 1 to {} decoded frames",
@@ -70,7 +114,7 @@ pub fn prepare_video(frames: &[Rgb8], patch: usize) -> Result<Vec<Prepared>, Vis
         super::MERGE,
         crate::arch::TokenLimits::new(70, super::VIDEO_TOKENS)?,
     )?);
-    frames.iter().map(|frame| media.prepare(frame)).collect()
+    frames.map(|frame| media.prepare(frame)).collect()
 }
 
 /// The image preparation rule; the side seat inserts delimiters through its tokenizer.

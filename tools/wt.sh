@@ -765,7 +765,7 @@ SHIM
   rm -rf "$t/bloomery-rt4" "$t/bloomery-other"
   git -C "$main" worktree prune
   # one owner: this script holds no copy of mac-disk's checks
-  if sed '/^self_test() {/,$d' "$SELF" | grep -v '^[[:space:]]*#' | grep -Eq 'lsof|LANDED|status --porcelain|origin/main'; then
+  if sed '/^self_test() {/,$d' "$SELF" | grep -v '^[[:space:]]*#' | grep -E 'lsof|LANDED|status --porcelain|origin/main' > /dev/null; then
     fail "this script carries a copy of a mac-disk check (lsof, LANDED, git status, origin)"
   fi
 

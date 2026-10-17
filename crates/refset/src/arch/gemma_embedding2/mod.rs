@@ -257,6 +257,27 @@ pub static VIDEO_CPU: Family = Family {
     )
 };
 
+/// Mainline's audio tower output from the BF16 projector and decoded mel chunks.
+pub static AUDIO_TOWER: Family = Family {
+    name: "tower-gemma4a",
+    sets: &["ref_gemma_embedding2_audio"],
+    resolve: None,
+    recipe: "just dump-ref-emb2-audio",
+    identity: Identity::Manifest,
+    arch: Some("gemma4a"),
+    build: Some(Build::Is(crate::emb2::LCPP_BUILD)),
+    runs: Some(mmproj),
+    draft_runs: None,
+    consumers: &["gate-gpu-gemma4a"],
+};
+
+/// The audio tower's CPU twin, used to derive the card's rounding band.
+pub static AUDIO_TOWER_CPU: Family = Family {
+    name: "tower-gemma4a-cpu",
+    sets: &["ref_gemma_embedding2_audio.cpu"],
+    ..AUDIO_TOWER
+};
+
 /// The architecture's families, in the order `refset-check` lists them.
 pub static FAMILIES: &[&Family] = &[
     &TEXT,
@@ -268,6 +289,8 @@ pub static FAMILIES: &[&Family] = &[
     &AUDIO_MEL,
     &VIDEO,
     &VIDEO_CPU,
+    &AUDIO_TOWER,
+    &AUDIO_TOWER_CPU,
 ];
 
 #[cfg(test)]

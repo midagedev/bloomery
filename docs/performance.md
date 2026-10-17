@@ -105,6 +105,10 @@ language is not one of the reasons: the kernels are Rust (274 of them, through
 - **Bit gates.** Graph replay equals eager execution; the skewed pass equals two single steps; a rollback and
   a V4.1 batched prompt leave the same state as one step per token.
 - **Each gate is shown to fail** on its defect before the fix lands. Bands are not relaxed to pass.
+- **Fault-window integrity.** The depth runners' preflight and first-match marker share `majflt_now`
+  as their counter reader. The marker samples the matching line while its input is still open;
+  sampling or output failures fail the run. `bash tools/ref/cold-blocks.sh --self-test` and the
+  DS41, Qwen3MoE and GLM depth-runner stub suites exercise this without a model or GPU.
 
 ## Recorded sessions
 

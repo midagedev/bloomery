@@ -1687,6 +1687,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     ),
     // ---------------------------------------------- the runners' variables
     runner(
+        "BLOOMERY_AB_AA",
+        Some("ref/bin-label.sh"),
+        "`tools/ref/depth-ds41.sh` and `depth-qwen3moe.sh` (through `tools/ref/bin-label.sh`): `1` \
+         declares the run a deliberate A/A -- a bin: arm may then live in the ours tree or share \
+         the ours build's sha; any other run is refused before the lease.",
+    ),
+    runner(
         "BLOOMERY_AB_DEPTH",
         Some("ref/ab-decode.sh"),
         "`tools/ref/ab-decode.sh`: the depth whose prompt is prefilled before each arm is \

@@ -141,14 +141,22 @@ majflt_require() {
   echo "$1: /proc/vmstat gives no pgmajfault: every row's majflt column and cold tag would read 0" >&2
   exit 2
 }
-# majflt_mark <file> <ERE>: its stdin to stdout line by line, and /proc/vmstat's pgmajfault into <file>
-# at the first line matching <ERE> (at none when <ERE> is empty): the line an engine prints as its
-# measured window starts.
+# majflt_mark <file> <ERE>: its stdin to stdout line by line, and /proc/vmstat's pgmajfault into
+# <file> at the first line matching <ERE> (at none when <ERE> is empty): the line an engine prints as
+# its measured window starts. The read is one line at a time through the shell: awk buffers its
+# stdin (mawk 1.3.4, gawk and the Mac's awk alike), so the sample a match took waited for the
+# buffer's fill or the stream's end, and the faults a lazy sample leaves out of the window are the
+# ones the window's start line means to measure away. The sampler is `majflt_now`, the counter's
+# owner; a failed forward is the run's failure, not the marker's.
 majflt_mark() {
-  awk -v f="$1" -v re="$2" '!s && re != "" && $0 ~ re {
-    while ((getline l < "/proc/vmstat") > 0) if (l ~ /^pgmajfault /) { sub(/^pgmajfault /, "", l); print l > f; close(f) }
-    close("/proc/vmstat"); s = 1
-  } { print; fflush() }'
+  local f=$1 re=$2 line s=''
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$s" ] && [ -n "$re" ] && [[ $line =~ $re ]]; then
+      majflt_now > "$f" || return
+      s=1
+    fi
+    printf '%s\n' "$line" || return
+  done
 }
 # cold_check <faults> <window s>: MAJ_BOUND, faults × COLD_US as a percent of the window, and COLD_TAG
 # (` [cold]` at COLD_PCT or more).
@@ -409,9 +417,10 @@ res_sums_table() {
   }' | sort
 }
 
-# `bash tools/ref/cold-blocks.sh --self-test`: the cold bound, the flag rewrite, the order's refusal and
-# the block planner on fixed arms (just check-recipes runs it on the Mac; the runners' use of it is
-# depth-ds41-stub.sh's and depth-qwen3moe-stub.sh's, on the box).
+# `bash tools/ref/cold-blocks.sh --self-test`: the cold bound, the flag rewrite, the order's refusal,
+# the block planner on fixed arms, and the window's start marker landing at its line on a pipe that
+# stays open (Linux; the Mac has no /proc/vmstat for the sample to read) — just check-recipes runs it
+# on the Mac; the runners' use of it is depth-ds41-stub.sh's and depth-qwen3moe-stub.sh's, on the box.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   fails=0
   check() {
@@ -427,6 +436,47 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check cold-zero "$MAJ_BOUND|$COLD_TAG" "0.0|"
   cold_check 0 0
   check cold-nowindow "$COLD_TAG" " [cold]"
+  # The start marker's sample is taken at its line, not at the stream's end: the stdin the marker
+  # reads stays open across the measured window (the runner hands the marker the whole run's
+  # output), and awk buffers that input, so a marker the match itself sampled waited for a
+  # buffer's fill and the window's faults landed under its start. One line at a time through the
+  # shell lands it while the pipe is still open; the sleep below is the check's wait, not a fix.
+  d=$(mktemp -d)
+  mkfifo "$d/pipe"
+  if [ -e /proc/vmstat ]; then
+    majflt_mark "$d/mark" 'window-start' < "$d/pipe" > "$d/out" &
+    mp=$!
+    exec 9> "$d/pipe"
+    printf 'ahead\n' >&9
+    for ((i = 0; i < 40; i++)); do [ -s "$d/out" ] && break; sleep 0.01; done
+    check marker-before-match "$(cat "$d/out")|$([ -e "$d/mark" ] && echo yes || echo no)" 'ahead|no'
+    printf 'window-start\n' >&9
+    sleep 0.4
+    v=$(cat "$d/mark" 2> /dev/null)
+    case $v in '' | *[!0-9]*) at='no' ;; *) at='yes' ;; esac
+    check marker-at-line "$at" 'yes'
+    printf 'trailing\n' >&9
+    exec 9>&-
+    wait "$mp" && r=0 || r=$?
+    check marker-rc "$r" '0'
+    check marker-pass "$(paste -sd'|' - < "$d/out")" 'ahead|window-start|trailing'
+    majflt_mark "$d/mark-none" '' <<< $'window-start\ntrailing' > /dev/null
+    check marker-empty-re "$([ -e "$d/mark-none" ] && echo yes || echo no)" 'no'
+  fi
+  # A failed forward must finish without waiting for upstream EOF.
+  (
+    majflt_mark /dev/null '' < "$d/pipe" 1< /dev/null 2> /dev/null && r=0 || r=$?
+    printf '%s\n' "$r" > "$d/forward.rc"
+  ) &
+  mp=$!
+  exec 9> "$d/pipe"
+  printf 'forwarded\n' >&9
+  for ((i = 0; i < 40; i++)); do [ -s "$d/forward.rc" ] && break; sleep 0.01; done
+  r=$(cat "$d/forward.rc" 2> /dev/null)
+  check marker-forward-failure "$([ -n "$r" ] && [ "$r" -ne 0 ] && echo failed || echo waiting-or-success)" failed
+  exec 9>&-
+  wait "$mp"
+  rm -rf "$d"
   check ncmoe-long "$(with_ncmoe '-ngl 99 --n-cpu-moe 33 -fa on' 2)" "-ngl 99 -fa on --n-cpu-moe 2"
   check ncmoe-short "$(with_ncmoe '-ngl 99 -fa on -lzm off -ncmoe 26' 30)" "-ngl 99 -fa on -lzm off --n-cpu-moe 30"
   check ncmoe-none "$(with_ncmoe '-ngl 99' 4)" "-ngl 99 --n-cpu-moe 4"

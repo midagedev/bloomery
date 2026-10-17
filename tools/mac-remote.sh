@@ -1177,15 +1177,15 @@ STUB
   rc=0; out=$(run) || rc=$?
   free_slots
   [ "$rc" = 0 ] || fail "a run beside one held slot ended rc $rc: $out"
-  printf '%s\n' "$out" | grep -Eq "^mac-remote: run slots: \[slot 1: trackA for [0-9]+ s\] \[slot 2: free\]; tree-one$" || fail "the held slot's holder and the free slot are not named: $out"
-  printf '%s\n' "$out" | grep -Eq "^mac-remote: run slot 2 of 2 taken after [01] s$" || fail "the run did not take the free slot 2: $out"
+  printf '%s\n' "$out" | grep -E "^mac-remote: run slots: \[slot 1: trackA for [0-9]+ s\] \[slot 2: free\]; tree-one$" > /dev/null || fail "the held slot's holder and the free slot are not named: $out"
+  printf '%s\n' "$out" | grep -E "^mac-remote: run slot 2 of 2 taken after [01] s$" > /dev/null || fail "the run did not take the free slot 2: $out"
   case $out in *"run slots are taken"*) fail "a run that found a free slot said all were taken: $out" ;; esac
   hold_slot 0
   printf '%s\n' "ghost $(date +%s)" > "$sl/.slot-1.holder"
   rc=0; out=$(run) || rc=$?
   free_slots
   [ "$rc" = 0 ] || fail "a run beside a held slot with no holder file ended rc $rc: $out"
-  printf '%s\n' "$out" | grep -Eq "^mac-remote: run slots: \[slot 1: starting\] \[slot 2: free\]; tree-one$" || fail "a held slot with no holder file is not 'starting', or a free slot with a left-behind holder file is not 'free': $out"
+  printf '%s\n' "$out" | grep -E "^mac-remote: run slots: \[slot 1: starting\] \[slot 2: free\]; tree-one$" > /dev/null || fail "a held slot with no holder file is not 'starting', or a free slot with a left-behind holder file is not 'free': $out"
   sed 's/^SLOT_SAY=.*/SLOT_SAY=4/' "$HERE/tools/mac-remote.sh" > "$d/mr4.sh"
   grep -q '^SLOT_SAY=4$' "$d/mr4.sh" || fail "the SLOT_SAY=4 copy was not made"
   run4() { PATH=$stub:$PATH STUB_HOME=$rh HOME=$fake bash "$d/mr4.sh" --tree "$repo" "$@" 2>&1; }

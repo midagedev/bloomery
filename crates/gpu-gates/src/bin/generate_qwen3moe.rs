@@ -16,7 +16,7 @@
 //!     generate_qwen3moe (--prompt <text> | --tokens a,b,c | --seed-depth D)
 //!                       [-n N] [--ctx C] [--mode eager|graph]
 //!                       [--prefill auto|pass|gemm|step] [--place a|gate|bp|<cards>]
-//!                       [--time [--warm W]] [--logits] [--last-step]
+//!                       [--time [--warm W]] [--logits] [--last-step] [--logit-rows FILE]
 //!     generate_qwen3moe --arm a,b,c[/N] [--arm ...] [--arm-sync] [-n N] [--ctx C] ...
 //!     generate_qwen3moe --dump-taps DIR --tokens-file F [--tokens-file F ...]
 //!                       --seqs S --prompt-len P [-n N] [--ctx C]
@@ -310,6 +310,14 @@
 //! line: the head's last logits row, read back once — the argmax's lead over
 //! the best other logit, and the row by its f32 bits (FNV-1a 64).
 //!
+//! `--logit-rows FILE` writes every teacher-forced row as little-endian f32 and
+//! completes `FILE.meta` with the exact prompt/forced ids, dimensions and schedule.
+//! It requires `BLOOMERY_FORCE_IDS` and `--last-step`: row zero follows the full
+//! prompt, row i follows forced token i - 1. Both files must be new. This diagnostic
+//! uses one plain Qwen3/Body35 arm and slot; drafts, timing, synthetic seed depth,
+//! arm lists and qwen4exp are refused. `auto`, `pass` and `gemm` keep their existing
+//! prompt schedules; the prompt's last token always uses the step head.
+//!
 //! `BLOOMERY_STEP_STATS=1` on a qwen4exp file reads, before the first
 //! generated step and after each one, the host tier's counters
 //! (`HybridStats`) with the go waits of the services since the read before,
@@ -412,6 +420,7 @@ mod cli {
 
     use bloomery_gpu_gates::generate::{Place, card_words, lane_at};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
+    use bloomery_gpu_gates::logit_rows::{ForcedFacts, ForcedRows};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{CARD38, Lever38, Seqs, residency38};
@@ -1377,6 +1386,8 @@ mod cli {
         mode: StepMode,
         seed_depth: Option<usize>,
         logits: bool,
+        /// A raw forced-row dump and the explicitly resolved prefill word.
+        logit_rows: Option<(PathBuf, String)>,
         tok: Option<Tokenizer>,
         /// `--ctx`, as the `SMOKE` line prints it.
         ctx: usize,
@@ -1517,6 +1528,7 @@ mod cli {
         let timed = std::env::args().any(|a| a == "--time");
         let sync = std::env::args().any(|a| a == "--arm-sync");
         let logits = std::env::args().any(|a| a == "--logits");
+        let logit_rows = flag("--logit-rows")?.map(PathBuf::from);
         let last_step = std::env::args().any(|a| a == "--last-step");
         let n_gen: usize = flag("-n")?.map_or(Ok(32), |s| s.parse())?;
         let ctx: usize = flag("--ctx")?.map_or(Ok(4096), |s| s.parse())?;
@@ -1573,6 +1585,25 @@ mod cli {
                 .collect::<Result<_, GateError>>()?
         };
         let slots = levers.gen_slots();
+        if logit_rows.is_some() {
+            if !last_step || levers.force_ids().is_none() {
+                return Err("--logit-rows requires --last-step and BLOOMERY_FORCE_IDS".into());
+            }
+            if family == Family::Qwen38
+                || timed
+                || flag("--warm")?.is_some()
+                || seed_depth.is_some()
+                || !arm_specs.is_empty()
+                || slots != 1
+                || levers.draft().is_some_and(|word| word != "off")
+            {
+                return Err(
+                    "--logit-rows runs one plain Qwen3/Body35 arm and slot; it refuses \
+                     qwen4exp, --time, --warm, --seed-depth, --arm, multiple slots and drafts"
+                        .into(),
+                );
+            }
+        }
         if slots > 1 && levers.force_ids().is_some() {
             return Err(format!(
                 "BLOOMERY_FORCE_IDS takes one stream's ids from a file; BLOOMERY_GEN_SLOTS={slots} \
@@ -1844,6 +1875,7 @@ mod cli {
             mode,
             seed_depth,
             logits,
+            logit_rows: logit_rows.map(|path| (path, prefill.unwrap_or("auto").to_owned())),
             tok,
             ctx,
             stats: levers.step_stats(),
@@ -1950,7 +1982,7 @@ mod cli {
     }
 
     /// The flags `--dump-taps` refuses by name: every other mode's.
-    const NOT_WITH_DUMP: [&str; 11] = [
+    const NOT_WITH_DUMP: [&str; 12] = [
         "--prompt",
         "--tokens",
         "--seed-depth",
@@ -1959,6 +1991,7 @@ mod cli {
         "--time",
         "--warm",
         "--logits",
+        "--logit-rows",
         "--prefill",
         "--mode",
         "--place",
@@ -3326,6 +3359,27 @@ mod cli {
         arm: &Arm,
     ) -> Result<(), GateError> {
         let (ids, n_gen, warm) = (&arm.ids, arm.n_gen, run.warm);
+        let mut logit_rows = run
+            .logit_rows
+            .as_ref()
+            .map(|(file, prefill)| {
+                let forced = run
+                    .force
+                    .as_deref()
+                    .and_then(|ids| ids.get(..n_gen))
+                    .ok_or("--logit-rows has fewer forced ids than output rows")?;
+                ForcedRows::create(
+                    file,
+                    m.n_vocab()?,
+                    ForcedFacts {
+                        prompt_ids: ids,
+                        forced_ids: forced,
+                        mode: mode_name(run.mode),
+                        prefill,
+                    },
+                )
+            })
+            .transpose()?;
         if let Some(d) = run.seed_depth.filter(|&d| d > 1) {
             B::seed(m, d - 1)?;
             println!("seed rows={} pos={}", d - 1, m.pos());
@@ -3349,6 +3403,9 @@ mod cli {
             (true, None) => return Err("the prompt has no ids".into()),
         };
         let prefill_wall = t.elapsed();
+        if let Some(rows) = &mut logit_rows {
+            rows.read(&m.logits()?)?;
+        }
         // Under `BLOOMERY_FORCE_IDS` the file's ids replace the argmax, the
         // prompt call's included.
         let mut forced = run
@@ -3381,6 +3438,9 @@ mod cli {
             let t0 = Instant::now();
             let argmax = m.step(&[next])?;
             let ms = t0.elapsed().as_secs_f64() * 1e3;
+            if let Some(rows) = &mut logit_rows {
+                rows.read(&m.logits()?)?;
+            }
             next = match &mut forced {
                 Some(f) => f.take()?,
                 None => argmax,
@@ -3445,6 +3505,9 @@ mod cli {
             );
         }
         print_stats(&probes, warm);
+        if let Some(rows) = logit_rows {
+            rows.finish()?;
+        }
         Ok(())
     }
 

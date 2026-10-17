@@ -248,7 +248,6 @@ echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh
 # shellcheck disable=SC2016 # the copies expand them when they run
 {
   echo 'majflt_now() { cat "$STUB_MAJFLT"; }'
-  echo 'majflt_mark() { awk -v f="$1" -v re="$2" -v src="$STUB_MAJFLT" '"'"'!s && re != "" && $0 ~ re { getline l < src; close(src); print l > f; close(f); s = 1 } { print; fflush() }'"'"'; }'
 } >> "$T/tools/ref/cold-blocks.sh"
 echo 'lcpp_srv_majflt() { cat "$STUB_MAJFLT"; }' >> "$T/tools/ref/lcpp-warm.sh"
 touch "$T/Cargo.toml"
@@ -779,7 +778,7 @@ refuse_case() {
   stub_run "$log" BLOOMERY_AB_ROUNDS=1 "$@" -- 512 "$arm"
   if [ "$RC" != 64 ]; then
     fail "lever-refuse $name" "rc $RC, want 64" "$log"
-  elif ! grep -F -- "depth-glm5next.sh: arm '$arm' is " "$log" | grep -qF -- " — $why"; then
+  elif ! grep -F -- "depth-glm5next.sh: arm '$arm' is " "$log" | grep -F -- " — $why" > /dev/null; then
     fail "lever-refuse $name" "no usage line of '$arm' ending in: $why" "$log"
   elif want "lever-refuse $name" "$log" 0 '^(ROW|WARMUP|FAIL|\[config\]|\[stub\] no lease)' &&
     want "lever-refuse $name" "$tmp/tmp/stub-gen-env" 0 '.'; then

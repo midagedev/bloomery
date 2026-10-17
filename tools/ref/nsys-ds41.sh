@@ -488,8 +488,8 @@ decode_synth("ds41_ffn_handoff", bare_last=True).write(os.path.join(t, "one.sqli
 FIX
   case_() { # <name> <want_rc> <must contain> [<must not contain>]
     n=$((n + 1))
-    if [ "$rc" = "$2" ] && printf '%s\n' "$out" | grep -qF -- "$3" \
-       && { [ $# -lt 4 ] || ! printf '%s\n' "$out" | grep -qF -- "$4"; }; then
+    if [ "$rc" = "$2" ] && printf '%s\n' "$out" | grep -F -- "$3" > /dev/null \
+       && { [ $# -lt 4 ] || ! printf '%s\n' "$out" | grep -F -- "$4" > /dev/null; }; then
       echo "ok $1"
     else
       bad=$((bad + 1))

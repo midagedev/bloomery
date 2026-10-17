@@ -33,7 +33,7 @@ default:
 # 빠른 루프: 타입 검사만, 커널은 안 만든다. 의존을 고친 뒤 cargo가 박스 쪽 Cargo.lock을 고쳐 쓰면 lock-back.sh가
 # 그것을 이 트리로 가져온다 — box.sh는 한 방향으로만 싣는다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/clef'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef'
     ./tools/lock-back.sh
 
 # check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
@@ -41,7 +41,7 @@ check:
 # V4.1 커널의 컴파일러 결함은 여기가 아니라 op 게이트 빌드에서 드러난다.
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/clef'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef'
 
 # The build without `vision` of the bins that refuse an image request by name — serve_seats/ds41.rs:444 and glm.rs:825 (--mmproj),
 # decide.rs:545 (the Qwen3.5 seat's encoder), gate_glm5next_e2e.rs:5146 (--only media-seat). One bin takes one feature set (tools/recipes.py's
@@ -791,6 +791,16 @@ dump-ref-emb2 *STEPS: (dump-ref-embedding "gemma-embedding2" STEPS)
 # Gemma4a host mel from synthetic decoded PCM, using the existing pinned mainline tree.
 dump-ref-emb2-mel:
     ./tools/box.sh 'bash tools/ref/emb2/mel.sh'
+
+# Gemma4a soft rows from the pinned audio projector, using the E9 mel set.
+dump-ref-emb2-audio:
+    ./tools/box.sh 'bash tools/ref/emb2/audio.sh'
+
+# Audio tower: bounded mel chunks, Conformer soft rows and clean/tapped equality.
+gate-gpu-gemma4a:
+    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gemma4a --lib -- --include-ignored'
+    ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gemma4a --bin gate_gemma4a'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma4a --release --bin gate_gemma4a && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma4a'
 
 # Host-only audio preprocessing: mel bits, chunk boundaries and tower token counts.
 gate-emb2-mel:

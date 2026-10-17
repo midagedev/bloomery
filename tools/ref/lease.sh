@@ -1002,7 +1002,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
     if [ "$2" = "$3" ]; then echo "ok $1"; else echo "FAIL $1: got [$2], want [$3]"; fails=$((fails + 1)); fi
   }
   matches() { # <name> <ERE> <text>: the text has a line matching the ERE
-    if printf '%s\n' "$3" | grep -Eq -- "$2"; then echo "ok $1"; else echo "FAIL $1: no line matches /$2/ in [$3]"; fails=$((fails + 1)); fi
+    if printf '%s\n' "$3" | grep -E -- "$2" > /dev/null; then echo "ok $1"; else echo "FAIL $1: no line matches /$2/ in [$3]"; fails=$((fails + 1)); fi
   }
   t=$(mktemp -d "${TMPDIR:-/tmp}/lease-self-test.XXXXXX") || exit 70
   trap 'rm -rf "$t"' EXIT

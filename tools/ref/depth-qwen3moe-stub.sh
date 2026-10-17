@@ -254,7 +254,6 @@ echo 'if [ -n "${STUB_ONE_CARD_LEASE:-}" ]; then unset LEASE_CARDS_RECORD; else 
 # shellcheck disable=SC2016 # the copies expand them when they run
 {
   echo 'majflt_now() { cat "$STUB_MAJFLT"; }'
-  echo 'majflt_mark() { awk -v f="$1" -v re="$2" -v src="$STUB_MAJFLT" '"'"'!s && re != "" && $0 ~ re { getline l < src; close(src); print l > f; close(f); s = 1 } { print; fflush() }'"'"'; }'
 } >> "$T/tools/ref/cold-blocks.sh"
 echo 'lg_majflt() { cat "$STUB_MAJFLT"; }' >> "$T/tools/ref/load-groups.sh"
 [ ! -f "$T/tools/ref/lcpp-warm.sh" ] || echo 'lcpp_srv_majflt() { cat "$STUB_MAJFLT"; }' >> "$T/tools/ref/lcpp-warm.sh"

@@ -563,7 +563,7 @@ self_test() {
   fi
   verdict 49 48 > /dev/null && fail "49 warnings over a ratchet of 48 passed"
   verdict 48 48 > /dev/null || fail "48 warnings at a ratchet of 48 failed"
-  verdict 47 48 | grep -q 'can come down' || fail "47 under 48 does not say the value can come down"
+  verdict 47 48 | grep 'can come down' > /dev/null || fail "47 under 48 does not say the value can come down"
   rm -rf "$t"
 
   # setup, against a fake HOME with a fake Homebrew bin first on the inherited PATH: the complete

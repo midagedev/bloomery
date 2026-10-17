@@ -8,24 +8,34 @@ use crate::emb2::{Kind, LCPP_BUILD};
 use crate::family::Family;
 
 #[test]
-fn audio_mel_requires_its_pcm_identity_architecture_build_and_trailer() -> Result<(), RefError> {
-    use super::{AUDIO_MEL, AUDIO_PCM};
-    let dir = set_dir("mel")?;
-    let own = vec![
-        ("model".into(), AUDIO_PCM.into()),
-        ("arch".into(), "gemma4a".into()),
-        ("build".into(), LCPP_BUILD.into()),
-    ];
-    assert_eq!(check(&dir, &AUDIO_MEL, &own, true)?, AUDIO_PCM);
-    for (i, value) in [(0, MODEL), (1, ARCH), (2, "other-build")] {
-        let mut other = own.clone();
-        other[i].1 = value.into();
-        assert!(check(&dir, &AUDIO_MEL, &other, true).is_err());
+fn audio_families_require_identity_architecture_build_and_trailer() -> Result<(), RefError> {
+    use super::{AUDIO_MEL, AUDIO_PCM, AUDIO_TOWER, AUDIO_TOWER_CPU};
+    let dir = set_dir("audio")?;
+    for (family, model) in [
+        (&AUDIO_MEL, AUDIO_PCM),
+        (&AUDIO_TOWER, MMPROJ_BF16),
+        (&AUDIO_TOWER_CPU, MMPROJ_BF16),
+    ] {
+        let own = vec![
+            ("model".into(), model.into()),
+            ("arch".into(), "gemma4a".into()),
+            ("build".into(), LCPP_BUILD.into()),
+        ];
+        assert_eq!(check(&dir, family, &own, true)?, model);
+        for (i, value) in [(0, MODEL), (1, ARCH), (2, "other-build")] {
+            let mut other = own.clone();
+            other[i].1 = value.into();
+            assert!(
+                check(&dir, family, &other, true).is_err(),
+                "{} identity {i}",
+                family.name
+            );
+        }
+        assert!(matches!(
+            check(&dir, family, &own, false),
+            Err(RefError::Unfinished { .. })
+        ));
     }
-    assert!(matches!(
-        check(&dir, &AUDIO_MEL, &own, false),
-        Err(RefError::Unfinished { .. })
-    ));
     remove(&dir)
 }
 

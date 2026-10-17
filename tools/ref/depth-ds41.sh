@@ -1404,6 +1404,10 @@ for i in "${!ARMS[@]}"; do
   line=$(tree_line "$gb" "$t" 9 box) || exit $?
   BIN_LINES+=("$(bin_label_stem "$gb"): $line")
 done
+# A bin: arm of this tree, or bit-identical to the ours build, is refused with both paths and shas
+# (a bin: arm is another tree's build; BLOOMERY_AB_AA=1 declares the run a deliberate A/A).
+case "$BIN" in /*) ob=$BIN ;; *) ob=$PWD/$BIN ;; esac
+bin_arms_distinct "$ob" "$PWD"
 ref_witness() {
   [ -z "$IK_LINE" ] || echo "    ik: $IK_LINE"
   [ -z "$LCPP_LINE" ] || echo "    lcpp: $LCPP_LINE"

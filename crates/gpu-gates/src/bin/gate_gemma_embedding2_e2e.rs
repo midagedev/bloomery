@@ -383,9 +383,7 @@ mod gate {
         images: (&RefManifest, &RefManifest),
     ) -> Result<bool, GateError> {
         use crate::image;
-        use bloomery_gpu::media::MediaSpan;
-        use refset::arch::gemma_embedding2::{VIDEO, VIDEO_CPU, VIDEO_IMAGES, VIDEO_PREFIX};
-        use serve::embeddings::{InputPart, assemble};
+        use refset::arch::gemma_embedding2::{VIDEO, VIDEO_CPU, VIDEO_IMAGES};
         use vision::arch::gemma4v;
 
         let video = image::open(&VIDEO)?;
@@ -401,7 +399,26 @@ mod gate {
                 Ok(rgb)
             })
             .collect::<Result<Vec<_>, GateError>>()?;
-        let prepared = gemma4v::prepare_video(&frames, patch)?;
+        let (indices, prepared) = gemma4v::prepare_clip(&frames, (1, 1), patch)?;
+        if indices != (0..frames.len()).collect::<Vec<_>>() {
+            return Err("video reference frames must stay in one-FPS order".into());
+        }
+        video_pass(enc, tower, tok, stream, &prepared, (&video, &video_cpu))
+    }
+
+    fn video_pass(
+        enc: &mut Encoder,
+        tower: &mut bloomery_gpu_vision::gemma4v::Encoder,
+        tok: &bloomery_gpu_gates::bind::Vocab,
+        stream: &std::sync::Arc<cuda_core::CudaStream>,
+        prepared: &[vision::Prepared],
+        (video, video_cpu): (&RefManifest, &RefManifest),
+    ) -> Result<bool, GateError> {
+        use bloomery_gpu::media::MediaSpan;
+        use refset::arch::gemma_embedding2::VIDEO_PREFIX;
+        use serve::embeddings::{InputPart, assemble};
+        use vision::arch::gemma4v;
+
         let mut parts = vec![InputPart::Text(VIDEO_PREFIX)];
         parts.extend(prepared.iter().map(|p| InputPart::Image {
             begin: gemma4v::IMAGE_BEGIN,
@@ -411,10 +428,10 @@ mod gate {
         let assembled = assemble(parts.into_iter().map(Ok), tok, CARD_CTX)?;
         let expected = format!(
             "# video\tvideo\tframes {}\tprompt_tokens {}",
-            frames.len(),
+            prepared.len(),
             assembled.ids.len()
         );
-        for man in [&video, &video_cpu] {
+        for man in [video, video_cpu] {
             let lines = man
                 .header
                 .other
@@ -424,16 +441,22 @@ mod gate {
             if lines != [&expected] {
                 return Err("video frame count or position count differs from reference".into());
             }
-            let frame_count = man
+            if man
                 .header
                 .other
                 .iter()
                 .filter(|l| l.starts_with("# image\t"))
-                .count();
-            if frame_count != frames.len() {
+                .count()
+                != prepared.len()
+            {
                 return Err("video reference has an unexpected frame count".into());
             }
         }
+        println!(
+            "video: positions {} spans {:?}",
+            assembled.ids.len(),
+            assembled.spans
+        );
         let rows = prepared
             .iter()
             .map(|p| Ok(tower.encode(p.grid()?)?.rows.buf().to_host_vec(stream)?))
@@ -448,15 +471,114 @@ mod gate {
             })
             .collect::<Vec<_>>();
         let pass = enc.pass_media(&assembled.ids, &spans, false)?;
-        pooled("video", &pass.pooled, &video, &video_cpu)
+        pooled("video", &pass.pooled, video, video_cpu)
+    }
+
+    fn clips(enc: &mut Encoder, model: &Path, manifest: &Path) -> Result<bool, GateError> {
+        use crate::image;
+        use bloomery_gpu_gates::bind::Vocab;
+        use refset::arch::gemma_embedding2::{VIDEO, VIDEO_CPU, VIDEO_CPU_SET, VIDEO_SET};
+        use refset::emb2::Emb2Set;
+        use vision::{
+            Rgb8,
+            arch::{TokenLimits, gemma4v},
+        };
+
+        let root = manifest.parent().ok_or("clip manifest has no parent")?;
+        let file = gguf::Gguf::open(image::projector(model)?)?;
+        let hp = gemma4v::Hparams::read(&file)?;
+        let stream = enc.context().new_stream_with_priority(0)?;
+        let mut tower = bloomery_gpu_vision::gemma4v::Encoder::load(
+            enc.context(),
+            &stream,
+            &file,
+            TokenLimits::new(70, gemma4v::VIDEO_TOKENS)?,
+        )?;
+        let tok = Vocab::new(tokenizer::Tokenizer::from_gguf(model)?)?;
+        let text = std::fs::read_to_string(manifest)?;
+        if text.lines().count() != 3 {
+            return Err("video clips require three fixture rows".into());
+        }
+        let mut ok = true;
+        let mut names = std::collections::HashSet::new();
+        for line in text.lines() {
+            let f = line.split('\t').collect::<Vec<_>>();
+            if f.len() != 9 {
+                return Err("malformed video clip fixture row".into());
+            }
+            let name = f[0];
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return Err("invalid clip name".into());
+            }
+            if !names.insert(name) {
+                return Err(format!("{name}: duplicate video clip fixture").into());
+            }
+            let card = Emb2Set::open(&root.join(name).join(VIDEO_SET), &VIDEO)?.man;
+            let cpu = Emb2Set::open(&root.join(name).join(VIDEO_CPU_SET), &VIDEO_CPU)?.man;
+            let fps = (f[1].parse()?, f[2].parse()?);
+            let width: usize = f[3].parse()?;
+            let height: usize = f[4].parse()?;
+            let count: usize = f[5].parse()?;
+            let bytes = width
+                .checked_mul(height)
+                .and_then(|n| n.checked_mul(3))
+                .filter(|&n| n > 0)
+                .ok_or("invalid clip dimensions")?;
+            let total = bytes.checked_mul(count).ok_or("clip byte count overflow")?;
+            if total > 512 * 1024 * 1024
+                || std::fs::metadata(f[6])?.len() != total as u64
+                || sha256(Path::new(f[6]))? != f[7]
+            {
+                return Err(format!("{name}: clip size or sha256 mismatch").into());
+            }
+            let raw = std::fs::read(f[6])?;
+            if raw.len() != total {
+                return Err(format!("{name}: decoded clip byte count mismatch").into());
+            }
+            let frames = raw
+                .chunks_exact(bytes)
+                .map(|data| Rgb8 {
+                    width,
+                    height,
+                    data: data.to_vec(),
+                })
+                .collect::<Vec<_>>();
+            let (indices, prepared) = gemma4v::prepare_clip(&frames, fps, hp.patch)?;
+            let expected = f[8]
+                .split(',')
+                .map(str::parse)
+                .collect::<Result<Vec<usize>, _>>()?;
+            if indices != expected {
+                return Err(
+                    format!("{name}: source indices {indices:?}, expected {expected:?}").into(),
+                );
+            }
+            for (i, &source) in indices.iter().enumerate() {
+                if image::image(&card, &cpu, &format!("frame_{i}"))?.0 != frames[source] {
+                    return Err(
+                        format!("{name}: oracle frame {i} differs from source {source}").into(),
+                    );
+                }
+            }
+            println!("{name}: source indices {indices:?} PASS");
+            ok &= video_pass(enc, &mut tower, &tok, &stream, &prepared, (&card, &cpu))?;
+        }
+        Ok(ok)
     }
 
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let args: Vec<String> = std::env::args().skip(1).collect();
-        if !args.is_empty() {
-            return Err(format!("no arguments; got {args:?}").into());
-        }
+        let clip_manifest = match args.as_slice() {
+            [] => None,
+            [flag, path] if flag == "--video-clips" => Some(Path::new(path)),
+            _ => {
+                return Err(format!(
+                    "expected no arguments or --video-clips <manifest>; got {args:?}"
+                )
+                .into());
+            }
+        };
         let model = ref_model_path()?;
         let digest = sha256(&model)?;
         if digest != MODEL_SHA256 {
@@ -475,6 +597,14 @@ mod gate {
             .ok_or("gemma-embedding2 has no encoder description")?;
         let ctx = CARD_CTX;
         let bytes = card_bytes(&split, ctx)?;
+        if let Some(manifest) = clip_manifest {
+            let mut enc = Encoder::open(split, ctx, Gpu::new()?)?;
+            return if clips(&mut enc, &model, manifest)? {
+                Ok(())
+            } else {
+                Err(checks_failed())
+            };
+        }
         let man = open(&TEXT)?;
         let cpu = open(&TEXT_CPU)?;
         check_case_identities(&man.header, &cpu.header)?;

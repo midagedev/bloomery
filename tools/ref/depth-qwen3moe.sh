@@ -2085,6 +2085,11 @@ for i in "${!ARMS[@]}"; do
   line=$(tree_line "$b" "$t") || exit $?
   BIN_LINES+=("${A_LABEL[$i]}: $line")
 done
+# A bin: arm of this tree, or bit-identical to the ours build, is refused with both paths and shas
+# (s2368: the ours build overwrote the bin: path inside the one remote, and both arms ran one sha —
+# the ratio table was an A/A read as a verdict). BLOOMERY_AB_AA=1 declares the run an A/A.
+case "$BIN" in /*) ob=$BIN ;; *) ob=$PWD/$BIN ;; esac
+bin_arms_distinct "$ob" "$PWD"
 # A lever arm's variables are the binary's to take (at_main refuses a lever it does not act on, a value its kind
 # does not take, a retired or unknown name, --levers included), so each distinct binary, word list and placement is
 # probed once before the lease (tools/ref/lever-arms.sh lever_probe, as depth-glm5next.sh does): an arm it refuses
