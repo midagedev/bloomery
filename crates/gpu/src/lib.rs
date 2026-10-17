@@ -924,6 +924,10 @@ mod kernels {
             d8.len() >= m_cols * 2 * n_sb
         )
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+    )]
     pub fn q3k_quantize_q8_1(
         x: &[f32],
         x0: u32,
@@ -991,6 +995,10 @@ mod kernels {
             s8.len() >= m_cols * 8 * n_sb,
             d8.len() >= m_cols * 2 * n_sb
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
     )]
     pub fn q3k_quantize_q8_1_relu_sqr(
         x: &[f32],
@@ -1341,6 +1349,10 @@ mod kernels {
             d8.len() >= m_cols * 2 * n_sb,
             y.len() >= n_rows * m_cols
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
     )]
     pub fn q6k_gemv(
         w: &[u32],
@@ -1782,6 +1794,10 @@ mod kernels {
             d8.len() >= m_cols * 2 * n_sb,
             y.len() >= n_rows * m_cols
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
     )]
     pub fn q3k_gemv(
         w: &[u32],
