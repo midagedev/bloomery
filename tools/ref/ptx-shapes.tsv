@@ -133,6 +133,10 @@ generate_ds41   gdn_norm_gate_sigmoid                    0           0
 generate_ds41   geglu_tanh                               0           0
 generate_ds41   gemm_iq3xxs              0  0
 generate_ds41   gemm_iq2xxs              0  0
+# PIN(2026-10-17): the IQ2_XXS plane entries (gemm_iq2xxs_p, iq2_xxs_gemv_sel_p, both bins)
+# measured spill=0 jit_local=0 by gate-ptx-spill s2548: the staged GEMM keeps its tile in
+# registers and shared (wst_iq2p's cp.async stage), the gemv twin the file twin's shape.
+generate_ds41   gemm_iq2xxs_p             0  0
 generate_ds41   gemm_iq4nl               0  0
 generate_ds41   gemm_iq4xs               0  0
 generate_ds41   gemm_nvfp4p                              0           0
@@ -204,6 +208,7 @@ generate_ds41   iq2_xs_gate_up_sel                       0           0
 generate_ds41   iq2_xs_gemv_sel                          0           0
 generate_ds41   iq2_xs_rows                              0           0
 generate_ds41   iq2_xxs_gemv_sel                         0           0
+generate_ds41   iq2_xxs_gemv_sel_p                        0           0
 generate_ds41   iq2_xxs_rows                             0           0
 generate_ds41   iq3_s_gate_up_sel                        0           0
 generate_ds41   iq3_s_gemv_sel                           0           0
@@ -417,6 +422,7 @@ gate_e2e   gdn_norm_gate_sigmoid                    0           0
 gate_e2e   geglu_tanh                               0           0
 gate_e2e   gemm_iq3xxs              0  0
 gate_e2e   gemm_iq2xxs              0  0
+gate_e2e   gemm_iq2xxs_p             0  0
 gate_e2e   gemm_iq4nl               0  0
 gate_e2e   gemm_iq4xs               0  0
 gate_e2e   gemm_nvfp4p                              0           0
@@ -485,6 +491,7 @@ gate_e2e   iq2_xs_gate_up_sel                       0           0
 gate_e2e   iq2_xs_gemv_sel                          0           0
 gate_e2e   iq2_xs_rows                              0           0
 gate_e2e   iq2_xxs_gemv_sel                         0           0
+gate_e2e   iq2_xxs_gemv_sel_p                        0           0
 gate_e2e   iq2_xxs_rows                             0           0
 gate_e2e   iq3_s_gate_up_sel                        0           0
 gate_e2e   iq3_s_gemv_sel                           0           0
