@@ -14,7 +14,7 @@
 //!                                              = log1p(exp(dt))  otherwise
 //! dA        = exp(σ·A)                      A, D: one float per head
 //! s[n]      = s[n]·dA + B[n]·(x·σ)          the scan, state n = 0..128 of a channel
-//! y         = Σ_n s[n]·C[n]                 lane l's four n = l + 32j, then the warp's tree
+//! y         = Σ_n s[n]·C[n]                 lane l's four n = l + 32j, then the xor butterfly
 //! y         = y + x·D                       then y = SiLU(z)·y
 //! y         = RMSNorm_gain(y)               per group of d_inner / n_group channels, if a gain is given
 //! ```
@@ -42,8 +42,7 @@
 //! owns: its `x` channels, and a group's `B` and `C` from the group's first
 //! block. A lane holds state `n = lane + 32j` (`j` = 0..4) of each channel
 //! and its `B` and `C` values, so a channel is four loads, the update, one
-//! shared transpose-reduce and four stores; group c's first lane finishes
-//! channel c.
+//! xor butterfly and four stores; lane 0 finishes it.
 //!
 //! The norm needs a whole group's `y`, which no one block holds. Each block
 //! writes its channels' `y` (after the gate) to the output, and its partial
@@ -65,9 +64,7 @@
 //!   ulp and `log1pf` within 1, the host's libm within about 1;
 //! - scan: per element `fl(fl(s·dA) + fl(B·(x·σ)))`, then `acc = acc +
 //!   fl(s·C)` over `j` from 0 (no fused multiply-add: every product is a
-//!   `mul.rn`); the 32 lanes by the transpose-reduce (two downs at 16 and
-//!   8, a gather, then the xor 4, 2, 1 quarter), the same pairing tree as
-//!   the xor butterfly at 16, 8, 4, 2, 1, value for value;
+//!   `mul.rn`); the 32 lanes by the xor butterfly at 16, 8, 4, 2, 1;
 //! - `y + fl(x·D)`, then `fl(silu(z)·y)`;
 //! - norm: squares rounded to f32 and summed in f64, per block in channel
 //!   order and then over blocks in block order (the host's AVX2 sum runs in
@@ -372,10 +369,6 @@ mod mamba2_kernels {
                 }
             }
         }
-        // The four channels' state updates and partial dots first; the
-        // reduction is one shared tree below, so the collectives never sit
-        // under a channel's liveness guard.
-        let (mut acc, mut xs) = ([0.0f32; CH_PER_WARP], [0.0f32; CH_PER_WARP]);
         #[unroll]
         for i in 0usize..CH_PER_WARP {
             let k = wid * CH_PER_WARP + i;
@@ -384,14 +377,22 @@ mod mamba2_kernels {
                 let at = h * hd + ch;
                 // SAFETY: 2·STATE + k < STAGED, written before the barrier.
                 let x = unsafe { *cs.add(2 * STATE + k) };
-                xs[i] = x;
                 let x_dt = mul_rn_f32(x, sigma);
+                let mut acc = 0.0f32;
                 #[unroll]
                 for j in 0usize..4 {
                     let u = mul_rn_f32(s[4 * i + j], decay) + mul_rn_f32(bq[j], x_dt);
                     s[4 * i + j] = u;
-                    acc[i] += mul_rn_f32(u, cq[j]);
+                    acc += mul_rn_f32(u, cq[j]);
                 }
+                acc += warp::shuffle_xor_f32(acc, 16);
+                acc += warp::shuffle_xor_f32(acc, 8);
+                acc += warp::shuffle_xor_f32(acc, 4);
+                acc += warp::shuffle_xor_f32(acc, 2);
+                acc += warp::shuffle_xor_f32(acc, 1);
+                // SAFETY: at < inner <= z.len().
+                let zv = unsafe { *z.get_unchecked(at) };
+                let v = mul_rn_f32(silu(zv), acc + mul_rn_f32(x, d_h));
                 let base = at * STATE + lane;
                 #[unroll]
                 for j in 0usize..4 {
@@ -399,47 +400,12 @@ mod mamba2_kernels {
                     // lane's own, read before this store.
                     unsafe { *statep.add(base + 32 * j) = s[4 * i + j] };
                 }
-            }
-        }
-        // The transpose-reduce: two downs halve each channel's partials, the
-        // gather puts channel c's halves on lanes c*8 .. c*8+7, and the xor
-        // 4, 2, 1 quarter sums each group — every lane of group c holds
-        // channel c's total, bit for bit the per-channel xor butterfly's
-        // value (the same pairing tree; the gate's host twin checks it).
-        let mut r2 = [0.0f32; CH_PER_WARP];
-        #[unroll]
-        for i in 0usize..CH_PER_WARP {
-            let r1 = acc[i] + warp::shuffle_down_f32(acc[i], 16);
-            r2[i] = r1 + warp::shuffle_down_f32(r1, 8);
-        }
-        let (src, grp) = ((lane & 7) as u32, lane >> 3);
-        let mut t = 0.0f32;
-        #[unroll]
-        for i in 0usize..CH_PER_WARP {
-            let gathered = warp::shuffle_f32(r2[i], src);
-            if grp == i {
-                t = gathered;
-            }
-        }
-        t += warp::shuffle_xor_f32(t, 4);
-        t += warp::shuffle_xor_f32(t, 2);
-        t += warp::shuffle_xor_f32(t, 1);
-        // Each group's y on its own lanes: group c's leader stores channel
-        // c, the four leaders together what lane 0 stored per channel.
-        {
-            let k = wid * CH_PER_WARP + grp;
-            let ch = chunk * CH_PER_BLOCK + k;
-            if ch < hd {
-                let at = h * hd + ch;
-                // SAFETY: at < inner <= z.len().
-                let zv = unsafe { *z.get_unchecked(at) };
-                let v = mul_rn_f32(silu(zv), t + mul_rn_f32(xs[grp], d_h));
-                if lane & 7 == 0 {
+                if lane == 0 {
                     if !v.is_finite() {
                         fault.raise(FaultSite::Mamba2Scan);
                     }
-                    // SAFETY: at < inner <= y.len(); k < CH_PER_BLOCK; the
-                    // group's first lane is the only writer of both.
+                    // SAFETY: at < inner <= y.len(); k < CH_PER_BLOCK; lane 0
+                    // of this warp is the only writer of both.
                     unsafe {
                         *yp.add(at) = v;
                         *ys.add(k) = v;
@@ -827,10 +793,6 @@ mod mamba2_kernels {
                 // SAFETY: at0 + STAGED + 1 < STAGE_T2; written before the
                 // barrier above.
                 let (sigma, decay) = unsafe { (*cs.add(at0 + STAGED), *cs.add(at0 + STAGED + 1)) };
-                // The four channels' partial dots; one shared reduction
-                // tree below keeps the collectives out of the liveness
-                // guards.
-                let (mut acc, mut xs) = ([0.0f32; CH_PER_WARP], [0.0f32; CH_PER_WARP]);
                 #[unroll]
                 for i in 0usize..CH_PER_WARP {
                     let k = wid * CH_PER_WARP + i;
@@ -840,51 +802,26 @@ mod mamba2_kernels {
                         // STAGE_T2, written before the barrier.
                         let (x, zv) =
                             unsafe { (*cs.add(at0 + 2 * STATE + k), *cs.add(at0 + STAGED_Z + k)) };
-                        xs[i] = x;
                         let x_dt = mul_rn_f32(x, sigma);
+                        let mut acc = 0.0f32;
                         #[unroll]
                         for j in 0usize..4 {
                             let v = mul_rn_f32(s[4 * i + j], decay) + mul_rn_f32(bq[j], x_dt);
                             s[4 * i + j] = v;
-                            acc[i] += mul_rn_f32(v, cq[j]);
+                            acc += mul_rn_f32(v, cq[j]);
                         }
-                    }
-                }
-                // The transpose-reduce of the four channels' partials (the
-                // steps pass's tree; the module doc's y rule).
-                let mut r2 = [0.0f32; CH_PER_WARP];
-                #[unroll]
-                for i in 0usize..CH_PER_WARP {
-                    let r1 = acc[i] + warp::shuffle_down_f32(acc[i], 16);
-                    r2[i] = r1 + warp::shuffle_down_f32(r1, 8);
-                }
-                let (src, grp) = ((lane & 7) as u32, lane >> 3);
-                let mut t = 0.0f32;
-                #[unroll]
-                for i in 0usize..CH_PER_WARP {
-                    let gathered = warp::shuffle_f32(r2[i], src);
-                    if grp == i {
-                        t = gathered;
-                    }
-                }
-                t += warp::shuffle_xor_f32(t, 4);
-                t += warp::shuffle_xor_f32(t, 2);
-                t += warp::shuffle_xor_f32(t, 1);
-                {
-                    let k = wid * CH_PER_WARP + grp;
-                    if channel_live(chunk, k, head_dim) {
-                        let at = c_x + k;
-                        // SAFETY: as the loads above, written before the
-                        // barrier.
-                        let zv = unsafe { *cs.add(at0 + STAGED_Z + k) };
-                        let v = mul_rn_f32(silu(zv), t + mul_rn_f32(xs[grp], d_h));
-                        if lane & 7 == 0 {
+                        acc += warp::shuffle_xor_f32(acc, 16);
+                        acc += warp::shuffle_xor_f32(acc, 8);
+                        acc += warp::shuffle_xor_f32(acc, 4);
+                        acc += warp::shuffle_xor_f32(acc, 2);
+                        acc += warp::shuffle_xor_f32(acc, 1);
+                        let v = mul_rn_f32(silu(zv), acc + mul_rn_f32(x, d_h));
+                        if lane == 0 {
                             if !v.is_finite() {
                                 fault.raise(FaultSite::Mamba2Scan);
                             }
                             // SAFETY: (t0 + t_in)·inner + at < u·inner <=
-                            // y.len(); the group's first lane is its only
-                            // writer.
+                            // y.len(); lane 0 of this warp is its only writer.
                             unsafe { *yp.add((t0 as usize + t_in) * inner + at) = v };
                         }
                     }
