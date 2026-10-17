@@ -1,0 +1,30 @@
+# nvf4b head on the RTX 3090, the binding card (ours 1662.70 vs lcpp -ub 2048 1862.95, s2675): the same
+# change as bolt-nvf4b-pp-a6000.card (gemm_nvfp4p's sub-block sums as mma.m16n8k16 s8, one branch-free n-tile
+# stretch a full step; bits unchanged; 713 -> 583 instructions a warp step, static stalls -40 %).
+# Terms [derived]: no eager split exists for the 3090, so gemm_nvfp4p's share is taken as the A6000's 35.3 %
+# of the prompt (686.2 of 1944.9 ms) and its time as 2463 ms x 0.353 = 869 ms (assumed: same SM count within
+# 2.4 %, same kernel, the card's clock under the 250 W cap scales every class alike). The step's cycle band is
+# the A6000 card's (x0.90..x0.72 of the class, point x0.82): -87..-242 ms, point -158 ms of the prompt's 2463
+# ms. Two things the A6000 does not have: the power cap (SW power cap, mask 0x400 at both rows) means fewer
+# instructions and half the tensor cycles are also less energy, so the clock may rise (a gain above the
+# A6000's) while a higher issue rate draws more per cycle (a gain below); the sign is not derived, the band
+# is not widened for it, and decide-above names it.
+# Line to beat: 1862.95 needs +12.0 %: above the band's top (+10.9 %); this change alone does not close the
+# 3090's 0.265 s, its point leaves 1776 (0.953).
+kind: ab
+question: does the branch-free k16 step lift pp4096 on the 3090 by the class-time term derived from the A6000?
+term: pp tok/s @ P = 4096 (kind=gemm, passes=2, default ubatch), Nemotron 3.5 Bolt, RTX 3090, this tree's
+  build against the build of origin/bolt-r7 49a2bf3af, interleaved arms
+unit: %
+predict: 3.5..11
+rounds: 4
+condition: one lease, BLOOMERY_CARD=3090 (the timing card pinned to the 3090 by name, BLOOMERY_TIMING_GPU), both
+  arms the same generate binary built at their commit, n = 4 rounds with the runner's rotating arm order; the
+  witness block's sm clock, clock-event mask and power/thermal counters at start and end, and Xid read
+  before and after (the card fell off the bus once under load)
+decide-in: +3.5..+11 %: the A6000's derivation carries over; land with the A6000 row, the line stays open
+  (needs the next terms: the epilogue instructions, the scan, the iq2xxs re-read)
+decide-below: under +3.5 %: the 3090's step is not the A6000's (power-capped clock); eager-trace gemm_nvfp4p on
+  the 3090 for its share and its clock before any more kernel work
+decide-above: beyond +11 %: the clock rose under the cap (less energy a step): read the witness clock of
+  both arms and credit the gain to the energy term, not to the instruction count alone

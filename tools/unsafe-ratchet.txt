@@ -310,7 +310,11 @@ gguf 9 2 0
 # (the chunked SSD prompt scan, mamba2_ssd.rs) adds its kernel's sixteen blocks (the shared tile's
 # address, the head's A and D, the sigma, conv and z reads, the staging, the ldmatrix fragment reads,
 # the state's f16 copy, y's and the state's stores) and its loader's one, each with its SAFETY line.
-gpu 1925 207 10
+# PIN(2026-10-17): gpu 1925 -> 1926 blocks, 207 -> 208 fns, new code, not old code relaxed:
+# mma_m16n8k16_s32_s8_zero (gemm32.rs), the s8 k16 mma the pinned cuda-oxide has no wrapper for, one unsafe fn
+# with its asm block, SAFETY and the warp-convergence contract; the NVFP4 sub-block products call it from the
+# macro's existing blocks.
+gpu 1926 208 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

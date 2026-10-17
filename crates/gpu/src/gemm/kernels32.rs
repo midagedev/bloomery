@@ -12,7 +12,8 @@ use super::act32::quant32_group;
 use super::f32tile::{STAGE_FLOATS, STAGES, f32_tile_body};
 use super::gemm32::{
     B32_ROW, B32_STAGE_W, D32_ROW, D32_STAGE_W, IQ4_NL_BLOCK_BYTES, Q5_1_BLOCK_WORDS,
-    Q8_0_BLOCK_BYTES, W32_ROW, W32_STAGE_W, iq4_nl_file_block, q8_0_file_block,
+    Q8_0_BLOCK_BYTES, W32_ROW, W32_STAGE_W, iq4_nl_file_block, mma_m16n8k16_s32_s8_zero,
+    q8_0_file_block,
 };
 use super::grouped::{GEMM_BM, GEMM_NT, GEMM_THREADS};
 use super::remap::remap_id;

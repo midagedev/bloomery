@@ -42,10 +42,11 @@
 //!
 //! NVFP4's contract, per 32-value unit `b` in increasing k instead: `i0`,
 //! `i1` the exact i32 dots of the unit's two 16-value sub-blocks with the
-//! column's int8 codes (`|i_s| ≤ 16 · 12 · 127`), each one `mma.m16n8k32`
-//! with the other half's A codes zero — the pinned cuda-oxide has no s8
-//! `m16n8k16` — `d0`, `d1` the sub-blocks' staged scales (`ue4m3_half`, the
-//! halving of the doubled codes) and `d_a` the column's 32-block scale:
+//! column's int8 codes (`|i_s| ≤ 16 · 12 · 127`), each one `mma.m16n8k16`
+//! over the sub-block's sixteen codes (the A words `a[2s]`, `a[2s + 1]` of
+//! the unit's `ldmatrix` fragment, the B word `s` of the column's), `d0`, `d1`
+//! the sub-blocks' staged scales (`ue4m3_half`, the halving of the doubled
+//! codes) and `d_a` the column's 32-block scale:
 //! `acc = fma(d_a, fma(d1, f32(i1), d0·f32(i0)), acc)` from `acc = 0`, the
 //! stored value `scale·acc`, one `mul_rn` at the store. Each `d_s·f32(i_s)`
 //! is exact in f32 — a 4-bit significand times a 15-bit integer — so a unit
@@ -77,6 +78,7 @@ use crate::q5::q5_0_row_words;
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::ptx_asm;
 
 /// u32 words of one staged weight row of a step: the two blocks' sixteen
 /// code words, then `d` of blocks 0 and 1 and `m` of blocks 0 and 1 as f32
@@ -161,6 +163,40 @@ pub(super) fn iq4_nl_file_block(w: [u32; 5], x: usize) -> (u16, [u32; 8]) {
     let (l2, h2) = iq4_word(win(2));
     let (l3, h3) = iq4_word(win(3));
     ((w[0] as u64 >> o) as u16, [l0, l1, l2, l3, h0, h1, h2, h3])
+}
+
+/// `mma.sync.m16n8k16` of s8 × s8 into s32 from a zero accumulator: rows `g`
+/// and `g + 8` of the A fragment's two words (k = 4·tig .. 4·tig + 3 of the
+/// 16) against column `g` of B's one word, the exact i32 dot of those sixteen
+/// values. The pinned cuda-oxide has no wrapper for the s8 k16 shape, so the
+/// instruction is written out.
+///
+/// # Safety
+///
+/// Every lane of the warp executes the call (`mma.sync.aligned`) with its
+/// fragments in the instruction's layout.
+#[inline(always)]
+pub(super) unsafe fn mma_m16n8k16_s32_s8_zero(a: [u32; 2], b: u32) -> [i32; 4] {
+    let (d0, d1, d2, d3): (i32, i32, i32, i32);
+    // SAFETY: the caller's contract; the instruction reads and writes registers only.
+    unsafe {
+        ptx_asm!(
+            "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, \
+             {%7, %8, %9, %10};",
+            out("=r") d0,
+            out("=r") d1,
+            out("=r") d2,
+            out("=r") d3,
+            in("r") a[0],
+            in("r") a[1],
+            in("r") b,
+            in("r") 0i32,
+            in("r") 0i32,
+            in("r") 0i32,
+            in("r") 0i32,
+        );
+    }
+    [d0, d1, d2, d3]
 }
 
 /// How the weight bytes of one (slab row, block) pair reach a stage, per
@@ -512,9 +548,8 @@ macro_rules! epi32_nv {
 /// One n-tile's product of one 32-value block into the accumulators, per
 /// family: `plain` the one `mma.m16n8k32` and [`epi32!`] of the five
 /// one-scale layouts; `nvfp4p` the block's two 16-value sub-block sums, each
-/// one `mma.m16n8k32` with the other half's A codes zero — the pinned
-/// cuda-oxide has no s8 `m16n8k16`, and a zeroed half contributes an exact
-/// 0 to the sum — and [`epi32_nv!`]'s nested scales.
+/// one [`mma_m16n8k16_s32_s8_zero`] over its half of the A fragment and its
+/// word of the B fragment, and [`epi32_nv!`]'s nested scales.
 macro_rules! mma_epi32 {
     (
         plain, $mins:literal, $a:ident, [$($b:expr),+], $dw:ident, $mw:ident, $da:expr, $sa:expr,
@@ -527,20 +562,105 @@ macro_rules! mma_epi32 {
         epi32!($mins, i0, $dw, $mw, $da, $sa, $acc, $nt);
     }};
     (
-        nvfp4p, $mins:literal, $a:ident, [$($b:expr),+], $d0:ident, $d1:ident, $da:expr, $sa:expr,
-        $acc:ident, $nt:expr
+        nvfp4p, $mins:literal, $a:ident, [$b0:expr, $b1:expr], $d0:ident, $d1:ident, $da:expr,
+        $sa:expr, $acc:ident, $nt:expr
     ) => {{
         // SAFETY: every lane of the warp reaches both `mma.sync`s (the
         // branches around them are uniform) with its fragments in the
         // instruction's layout.
         let (i0, i1) = unsafe {
             (
-                mma_m16n8k32_s32_s8([0; 4], [$a[0], $a[1], 0, 0], [$($b),+]),
-                mma_m16n8k32_s32_s8([0; 4], [0, 0, $a[2], $a[3]], [$($b),+]),
+                mma_m16n8k16_s32_s8_zero([$a[0], $a[1]], $b0),
+                mma_m16n8k16_s32_s8_zero([$a[2], $a[3]], $b1),
             )
         };
         epi32_nv!($d0, $d1, i0, i1, $da, $acc, $nt);
     }};
+}
+
+/// One n-tile's operands of a step out of the stage: `bf` the B fragments
+/// of both blocks (`ldmatrix.x4` at the lane's column and chunk) and `x0`,
+/// `x1` the activation scale words of the lane's two columns.
+macro_rules! nt_frags {
+    ($bst:ident, $dst:ident, $nt:expr, $t:ident, $b_off:ident) => {{
+        let n0 = 8 * $nt + 2 * $t;
+        // SAFETY: column 8·nt + lane % 8 is below ncols of this stage (the
+        // whole warp issues it: the n-tile is live for every lane); columns
+        // n0, n0 + 1 < GEMM_BN: two 16-byte reads of this stage's scales. All
+        // published by the step's barrier.
+        unsafe {
+            let bf = ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                $bst.add(8 * $nt * B32_ROW + $b_off)
+                    .cast_const()
+                    .cast::<u8>(),
+            ));
+            let x0 = (*($dst.add(D32_ROW * n0) as *const U32x4)).0;
+            let x1 = (*($dst.add(D32_ROW * (n0 + 1)) as *const U32x4)).0;
+            (bf, x0, x1)
+        }
+    }};
+}
+
+/// The n-tile walk of one step of one warp: for every live n-tile, the
+/// products of the step's blocks into the accumulators. `each` is the walk
+/// that tests the tile (`nt < nt_live`) and the second block (`two`) around
+/// every product; the families but `nvfp4p` run it as it stands. `nvfp4p`
+/// first tests the two once, warp-uniformly: with every n-tile live and both
+/// blocks present (every step of a full tile, K a multiple of 64) it runs the
+/// same products with no branch between them, one straight stretch of
+/// `mma.sync` and epilogues that the assembler may overlap across n-tiles and
+/// blocks — the order of every output's operations is the walk's, so the
+/// bits are the same.
+macro_rules! nt_walk {
+    (
+        @each $epi:ident, $mins:literal, $nt_live:ident, $two:ident, $t:ident, $bst:ident,
+        $dst:ident, $b_off:ident, $a0:ident, $a1:ident, $dw0:ident, $dw1:ident, $mw0:ident,
+        $mw1:ident, $acc:ident
+    ) => {
+        for nt in 0..GEMM_NT {
+            ::cuda_device::thread::__unroll_config::<0>();
+            if nt < $nt_live {
+                let (bf, x0, x1) = nt_frags!($bst, $dst, nt, $t, $b_off);
+                // SAFETY: every lane of the warp reaches the `mma.sync`
+                // inside (the branches around it are uniform) with its
+                // fragments in the instruction's layout.
+                mma_epi32!($epi, $mins, $a0, [bf[0], bf[1]], $dw0, $mw0, [x0[0], x1[0]],
+                    [x0[2], x1[2]], $acc, nt);
+                if $two {
+                    // SAFETY: `two` and the branches around it are
+                    // warp-uniform, so every lane reaches the `mma.sync`
+                    // inside as well.
+                    mma_epi32!($epi, $mins, $a1, [bf[2], bf[3]], $dw1, $mw1, [x0[1], x1[1]],
+                        [x0[3], x1[3]], $acc, nt);
+                }
+            }
+        }
+    };
+    (plain, $($rest:tt)*) => {
+        nt_walk!(@each plain, $($rest)*)
+    };
+    (
+        nvfp4p, $mins:literal, $nt_live:ident, $two:ident, $t:ident, $bst:ident, $dst:ident,
+        $b_off:ident, $a0:ident, $a1:ident, $dw0:ident, $dw1:ident, $mw0:ident, $mw1:ident,
+        $acc:ident
+    ) => {
+        if $nt_live == GEMM_NT && $two {
+            for nt in 0..GEMM_NT {
+                ::cuda_device::thread::__unroll_config::<0>();
+                let (bf, x0, x1) = nt_frags!($bst, $dst, nt, $t, $b_off);
+                // SAFETY: every lane of the warp reaches both `mma.sync`s
+                // (the test above is warp-uniform and nothing branches in
+                // between) with its fragments in the instruction's layout.
+                mma_epi32!(nvfp4p, $mins, $a0, [bf[0], bf[1]], $dw0, $mw0, [x0[0], x1[0]],
+                    [x0[2], x1[2]], $acc, nt);
+                mma_epi32!(nvfp4p, $mins, $a1, [bf[2], bf[3]], $dw1, $mw1, [x0[1], x1[1]],
+                    [x0[3], x1[3]], $acc, nt);
+            }
+        } else {
+            nt_walk!(@each nvfp4p, $mins, $nt_live, $two, $t, $bst, $dst, $b_off, $a0, $a1,
+                $dw0, $dw1, $mw0, $mw1, $acc);
+        }
+    };
 }
 
 /// The 32-value GEMM block: one tile's columns against one 128-row slab of
@@ -764,36 +884,8 @@ macro_rules! gemm32_block {
                         [f32::from_bits(*p0.add(3)), f32::from_bits(*p1.add(3))],
                     )
                 };
-                for nt in 0..GEMM_NT {
-                    ::cuda_device::thread::__unroll_config::<0>();
-                    if nt < nt_live {
-                        let n0 = 8 * nt + 2 * t;
-                        // SAFETY: column 8·nt + lane % 8 < ncols of this stage
-                        // (the whole warp issues it: nt < nt_live is uniform);
-                        // columns n0, n0 + 1 < GEMM_BN: two 16-byte reads of
-                        // this stage's scales. All published above.
-                        let (bf, x0, x1) = unsafe {
-                            let bf = ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
-                                bst.add(8 * nt * B32_ROW + b_off).cast_const().cast::<u8>(),
-                            ));
-                            let x0 = (*(dst.add(D32_ROW * n0) as *const U32x4)).0;
-                            let x1 = (*(dst.add(D32_ROW * (n0 + 1)) as *const U32x4)).0;
-                            (bf, x0, x1)
-                        };
-                        // SAFETY: every lane of the warp reaches the `mma.sync`
-                        // inside (the branches around it are uniform) with its
-                        // fragments in the instruction's layout.
-                        mma_epi32!($epi, $mins, a0, [bf[0], bf[1]], dw0, mw0, [x0[0], x1[0]],
-                            [x0[2], x1[2]], acc, nt);
-                        if two {
-                            // SAFETY: `two` and the branches around it are
-                            // warp-uniform, so every lane reaches the
-                            // `mma.sync` inside as well.
-                            mma_epi32!($epi, $mins, a1, [bf[2], bf[3]], dw1, mw1, [x0[1], x1[1]],
-                                [x0[3], x1[3]], acc, nt);
-                        }
-                    }
-                }
+                nt_walk!($epi, $mins, nt_live, two, t, bst, dst, b_off, a0, a1, dw0, dw1, mw0, mw1,
+                    acc);
             }
 
             if nx {
