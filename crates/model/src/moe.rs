@@ -927,7 +927,8 @@ impl HostScratch {
         self.n_used
     }
 
-    /// The gate output of the last call's `i`-th expert.
+    /// The gate output of the last call's `i`-th expert (a relu² layer has
+    /// none: its slot holds no output of the call).
     pub fn gate(&self, i: usize) -> &Tensor2 {
         &self.gate_up[2 * i]
     }
@@ -1042,7 +1043,8 @@ fn serve_resolved(
         ..
     } = s;
     // A gated leg's first dispatch interleaves [gate, up] pairs — two blocks
-    // and two reads of `x` an expert; a relu² leg's holds the ups alone.
+    // and two reads of `x` an expert; a relu² leg's holds the ups alone, and
+    // moves them to the up slots once the down has read them.
     let (first, up_site) = match run.form {
         ExpertForm::Gated { .. } => (2 * n, "host_gate_up"),
         ExpertForm::Relu2 => (n, "host_up"),
@@ -1075,6 +1077,13 @@ fn serve_resolved(
     );
     *srcs = relist(sl);
     let dt = dt?;
+    if let ExpertForm::Relu2 = run.form {
+        // Back to back from the top: expert `i`'s up goes to slot `2 * i + 1`,
+        // where `HostScratch::up` reads it, and no block moves twice.
+        for i in (0..n).rev() {
+            gate_up.swap(i, 2 * i + 1);
+        }
+    }
     let t_sum = if lvl > 0 { Some(Instant::now()) } else { None };
     for (&(_, w), d) in experts.iter().zip(&downs[..n]) {
         for (o, &dv) in out.iter_mut().zip(d.col(0)) {
@@ -1741,11 +1750,6 @@ fn serve_tiered<'w>(
     s: &mut UnionScratch,
     tier: &'w LayerTier,
 ) -> Result<(), ModelError> {
-    // The union side of [`HostLayer`'s relu² tier refusal]: no arena part of
-    // a relu² layer's is ever claimed.
-    if let ExpertForm::Relu2 = run.form {
-        return Err(TierError::Relu2Tiered { layer: tier.layer }.into());
-    }
     let batch = tier.batch;
     assert!(batch > 0, "host union: a batch holds at least one expert");
     // Refused before any claim: an expert past the stacks' (the passes' own
@@ -3044,6 +3048,7 @@ impl HostLayer {
         scratch: &mut UnionScratch,
     ) -> Result<(), ModelError> {
         self.read_beside(src)?;
+        self.refuse_relu2_tier()?;
         let split = src.split();
         let x = x.into();
         check_union_call(
@@ -3509,8 +3514,8 @@ mod tests {
         layer.warm_spans(src, &[0], &mut spans).unwrap();
         assert_eq!(spans.len(), 2, "a relu² layer warms its up and its down");
 
-        // The NVMe tier: refused by name at the one-column and the union
-        // entries, before any slot is asked for.
+        // The NVMe tier: refused by name at the one-column, the union and the
+        // step-union entries, before any slot is asked for.
         let tier = std::sync::Arc::new(MockTier::of(&split, &layer, false));
         layer.attach_tier(4, 1..2, tier);
         let (x, list) = (Tensor2::zeros(embd, 1), vec![(0u32, 1.0f32)]);
@@ -3525,6 +3530,11 @@ mod tests {
         let e = layer
             .experts_union_into(src, &x, &[&list[..]], &mut out, &mut us)
             .expect_err("a relu² layer refuses the tier at the union")
+            .to_string();
+        assert!(e.contains("gated experts only"), "{e}");
+        let e = layer
+            .experts_step_union_into(src, &x, &[&list[..]], &mut out, &mut us)
+            .expect_err("a relu² layer refuses the tier at the step union")
             .to_string();
         assert!(e.contains("gated experts only"), "{e}");
         std::fs::remove_file(&path).unwrap();

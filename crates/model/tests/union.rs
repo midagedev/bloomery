@@ -1646,9 +1646,6 @@ const RELU2_USED: usize = 9;
 /// does not, and one that runs experts through several tile runs.
 const RELU2_KS: [usize; 4] = [1, 8, 9, 64];
 
-const RELU2_UP: &str = "blk.0.ffn_up_exps.weight";
-const RELU2_DOWN: &str = "blk.0.ffn_down_exps.weight";
-
 /// One relu² routed layer — IQ2_XXS up and down, no gate — and the stacks' bytes its file holds.
 struct Relu2Layer {
     file: StackFile,
@@ -1664,12 +1661,34 @@ impl Relu2Layer {
         let file = StackFile::write(
             &format!("relu2layer-{ff}"),
             &[
-                (RELU2_UP, ty, [embd, ff, n_expert], &up),
-                (RELU2_DOWN, ty, [ff, embd, n_expert], &down),
+                (Q8_UP, ty, [embd, ff, n_expert], &up),
+                (Q8_DOWN, ty, [ff, embd, n_expert], &down),
             ],
         );
         Relu2Layer { file, up, down }
     }
+}
+
+/// The bytes of one IQ2_XXS row of `k` values.
+fn iq2_row_bytes(k: usize) -> usize {
+    let ty = GgmlType::IQ2_XXS;
+    k / ty.blck_size().unwrap() as usize * ty.type_size().unwrap() as usize
+}
+
+/// The up output of expert `e` on one column, before the relu² — what `HostScratch::up` holds:
+/// `x` quantized, each of the expert's `ff` up rows dotted with it on qdot's own call.
+fn relu2_up(layer: &Relu2Layer, x: &[f32], e: usize, ff: usize) -> Vec<f32> {
+    let ty = GgmlType::IQ2_XXS;
+    let embd = x.len();
+    let row_up = iq2_row_bytes(embd);
+    let mut xq = vec![0u8; qdot::col_bytes(ty, embd)];
+    qdot::quantize_col(ty, x, &mut xq);
+    (0..ff)
+        .map(|r| {
+            let at = (e * ff + r) * row_up;
+            qdot::dot_row(ty, &layer.up[at..at + row_up], &xq, embd).unwrap()
+        })
+        .collect()
 }
 
 /// One column of a relu² layer, transcribed from the contract on qdot's own calls and nothing of
@@ -1679,18 +1698,14 @@ impl Relu2Layer {
 fn relu2_column(layer: &Relu2Layer, x: &[f32], list: &[(u32, f32)], ff: usize) -> Vec<f32> {
     let ty = GgmlType::IQ2_XXS;
     let embd = x.len();
-    let row = |k: usize| k / ty.blck_size().unwrap() as usize * ty.type_size().unwrap() as usize;
-    let (row_up, row_down) = (row(embd), row(ff));
-    let mut xq = vec![0u8; qdot::col_bytes(ty, embd)];
-    qdot::quantize_col(ty, x, &mut xq);
+    let row_down = iq2_row_bytes(ff);
     let mut hq = vec![0u8; qdot::col_bytes(ty, ff)];
     let mut out = vec![0.0f32; embd];
     for &(e, w) in list {
         let e = e as usize;
-        let h: Vec<f32> = (0..ff)
-            .map(|r| {
-                let at = (e * ff + r) * row_up;
-                let u = qdot::dot_row(ty, &layer.up[at..at + row_up], &xq, embd).unwrap();
+        let h: Vec<f32> = relu2_up(layer, x, e, ff)
+            .into_iter()
+            .map(|u| {
                 let relu = u.max(0.0);
                 relu * relu
             })
@@ -1709,7 +1724,8 @@ fn relu2_column(layer: &Relu2Layer, x: &[f32], list: &[(u32, f32)], ff: usize) -
 /// different widths and expert counts (IQ2_XXS up and down, the latent 1024 wide), one scratch
 /// made for the wider serves both, and at k = 1, 8, 9 and 64 under both deferral arms the union
 /// call, `experts_into` of every column and `relu2_column`'s transcription on qdot's own calls
-/// are the same bits, in the dispatches the call is owed. A scratch exact for the narrower
+/// are the same bits, in the dispatches the call is owed, and `HostScratch::up` holds each expert's
+/// up output of the last column's call in list order. A scratch exact for the narrower
 /// layer gives the same bits as the capacity scratch. Then the named refusals of the widths: a
 /// scratch narrower than the layer's ff, one of another embd, and one whose capacity holds no
 /// column encoding.
@@ -1730,8 +1746,8 @@ fn hw_union_relu2_matches_transcription() {
         let host_layer = HostLayer::build_relu2(
             src,
             &Relu2Spec {
-                up: RELU2_UP,
-                down: RELU2_DOWN,
+                up: Q8_UP,
+                down: Q8_DOWN,
                 n_expert,
                 embd,
                 ff,
@@ -1766,10 +1782,24 @@ fn hw_union_relu2_matches_transcription() {
             if dd != 0 {
                 failed.push((ff, k, "experts_into"));
             }
+            // The scratch's accessor holds each expert's up output of the last column's call,
+            // in list order: the contract the gated forms keep.
+            let last_col = k - 1;
+            let du: usize = case.lists[last_col]
+                .iter()
+                .enumerate()
+                .map(|(i, &(e, _))| {
+                    let up = relu2_up(&layer, case.x.col(last_col), e as usize, ff);
+                    diff_cells(host.up(i).col(0), &up)
+                })
+                .sum();
+            if du != 0 {
+                failed.push((ff, k, "scratch up"));
+            }
             let lists = case.slices();
             let mut line = format!(
                 "relu2 ff={ff} k={k} slots={} union={} cols_per_expert={lo}..{hi} \
-                 past_one_run={past} experts_into: diff_cells={dd}",
+                 past_one_run={past} experts_into: diff_cells={dd} scratch_up={du}",
                 case.slots(),
                 case.union()
             );
@@ -1823,8 +1853,8 @@ fn hw_union_relu2_matches_transcription() {
     let host_layer = HostLayer::build_relu2(
         src,
         &Relu2Spec {
-            up: RELU2_UP,
-            down: RELU2_DOWN,
+            up: Q8_UP,
+            down: Q8_DOWN,
             n_expert: RELU2_LAYERS[1].1,
             embd,
             ff,
