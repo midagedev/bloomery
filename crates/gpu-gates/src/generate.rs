@@ -1457,16 +1457,15 @@ impl TopRows {
         let (Some(path), Some(kept)) = (rows, &self.kept) else {
             return Ok(());
         };
-        let bytes: Vec<u8> = kept.iter().flat_map(|v| v.to_le_bytes()).collect();
-        std::fs::OpenOptions::new()
+        let bytes = std::fs::OpenOptions::new()
             .append(true)
             .open(path)
-            .and_then(|mut f| f.write_all(&bytes))
+            .and_then(|mut f| crate::logit_rows::write_f32s(&mut f, kept))
             .map_err(|e| format!("--rows {}: {e}", path.display()))?;
         Record::new(&record::ROWS)
             .u("rows", self.tops.len())
             .u("n", kept.len() / self.tops.len().max(1))
-            .u("bytes", bytes.len())
+            .u("bytes", bytes)
             .w("path", path.display())
             .print();
         Ok(())

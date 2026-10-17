@@ -1174,7 +1174,7 @@ while [ "$k" -lt "$cap" ]; do
     met=1
     break
   fi
-  if [ -z "$peer" ] && [ -n "${FAKE_UNTIL:-}" ] && cat "$st/box.log" "$st/probe.log" 2> /dev/null | grep -q "${FAKE_UNTIL}\$"; then
+  if [ -z "$peer" ] && [ -n "${FAKE_UNTIL:-}" ] && cat "$st/box.log" "$st/probe.log" 2> /dev/null | grep "${FAKE_UNTIL}\$" > /dev/null; then
     sleep "${FAKE_GRACE:-0}"
     break
   fi
@@ -3572,7 +3572,7 @@ EOS
     "${gb[@]}" --dry-run --wait-hold plain-any
   check 'wait-hold: a number after it is the bound' 0 '^gate-batch: --wait-hold: a real run waits up to 90 s' "${gb[@]}" --dry-run --wait-hold 90 plain-any
   check 'wait-hold: … and the item beside it is still planned' 0 '^lane [AB]  plain-any ' "${gb[@]}" --dry-run plain-any --wait-hold 90
-  if "${gb[@]}" --dry-run plain-any 2>&1 | grep -q -- '--wait-hold'; then fail 'wait-hold: without the flag a dry run says nothing of it' "a line names it"
+  if "${gb[@]}" --dry-run plain-any 2>&1 | grep -- '--wait-hold' > /dev/null; then fail 'wait-hold: without the flag a dry run says nothing of it' "a line names it"
   else pass 'wait-hold: without the flag a dry run says nothing of it'; fi
   rc=$(FAKE_BUSY_POLLS=2 GBFAST=1 steal_case wh-ok "plain-any	B	a6000	10	$d" -- --wait-hold 30 plain-any)
   printf '%s' "$rc" > "$t/rc-wh-ok"

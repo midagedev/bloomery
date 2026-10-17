@@ -859,4 +859,63 @@ mod tests {
             )
         );
     }
+
+    /// Every written fixture of a family with a planned budget holds the budget its header records:
+    /// the plan of the file under it is half the experts on every card-eligible layer
+    /// ([`fixture::check_budget`], the re-plan `verify` runs, here from the written header alone, so
+    /// it needs neither the source nor the bytes). A plan term that moves after a fixture was
+    /// written (a table the card holds, a reserve, a rounding) leaves its recorded number a granule
+    /// short, and every gate that plans under the header sees a layer one expert off. The fixture
+    /// root is `refset::fixture::root`'s (`BLOOMERY_FIXTURE_ROOT`, else `/models/fixtures`); a family with no directory there
+    /// is named and skipped, a directory with no first shard or no budget key fails.
+    #[test]
+    #[ignore = "reads the written fixtures under the fixture root: gate-fixture-budget"]
+    fn hw_the_written_fixtures_hold_their_recorded_budget() {
+        use model::fixture::{CardBudget, KEY_CARD_BUDGET};
+
+        let root = PathBuf::from(refset::fixture::root().expect("the fixture root"));
+        let (mut held, mut bad) = (Vec::new(), Vec::new());
+        for row in &SOURCES {
+            let spec = (row.spec)();
+            let CardBudget::Planned(planner) = spec.card_budget else {
+                println!("{}: a fixed budget, nothing planned to check", row.family);
+                continue;
+            };
+            let dir = root.join(row.family);
+            if !dir.is_dir() {
+                println!("{}: no fixture directory {}", row.family, dir.display());
+                continue;
+            }
+            let checked = first_shard(&dir, spec.stem)
+                .and_then(|path| open(&path.to_string_lossy()))
+                .and_then(|split| {
+                    let budget = split
+                        .value(KEY_CARD_BUDGET)
+                        .and_then(gguf::Value::as_u64)
+                        .ok_or(format!("the header holds no u64 {KEY_CARD_BUDGET}"))?;
+                    let counts = fixture::check_budget(&planner, &split, budget)?;
+                    Ok((budget, counts.per_layer))
+                });
+            match checked {
+                Ok((budget, per_layer)) => {
+                    println!(
+                        "{}: budget {budget}, experts a layer {per_layer:?}",
+                        row.family
+                    );
+                    held.push(row.family);
+                }
+                Err(e) => bad.push(format!("{}: {e}", row.family)),
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "stale recorded budgets:\n{}",
+            bad.join("\n")
+        );
+        assert!(
+            !held.is_empty(),
+            "no fixture under {} was checked",
+            root.display()
+        );
+    }
 }

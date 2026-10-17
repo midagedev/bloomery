@@ -75,5 +75,76 @@ tower, and its projected BF16 rows stay on the host until `pass_media` combines
 them. The host rows take `2 * text_width * sum(frame_tokens)` bytes,
 at most `8,960 * text_width` bytes for 32 frames of 140 tokens [derived]. The assembled
 text, delimiters and frame positions must still fit `ctx`; no second reserve
-or expert budget is introduced. HTTP video inputs and frame sampling are not
-part of this interface.
+or expert budget is introduced. HTTP video inputs are outside this interface.
+
+### Constant-rate decoded clips
+
+`vision::arch::gemma4v::prepare_clip` accepts RGB frames in presentation order,
+source FPS as a positive numerator and denominator, and the tower's patch size.
+The first source timestamp is zero. The clip ends one source interval after the
+last frame. The result contains the selected source indices and their prepared
+frames; each prepared frame carries its image span length.
+
+At the one-FPS checkpoint setting, source timestamps round to the nearest
+integer second, with half seconds rounded up. Each output tick uses the last
+source frame whose rounded timestamp is at most that tick. The EOF timestamp
+rounds the same way and is excluded. Low-FPS input can repeat a source frame.
+For example, a one-second 24-FPS clip selects index 11, and a seven-second
+30-FPS clip selects indices 14, 44, 74, 104, 134, 164 and 194. Sampling every
+24th or 30th source frame starting at zero gives different pixels.
+
+The 32-frame limit belongs to bloomery's decoded-frame interface. It is not a
+maximum in the pinned llama.cpp video helper. A 40-second clip at 30 FPS yields
+40 sampled frames and is refused here. A clip shorter than half a second can
+yield no output and is also refused. A 32-second clip is accepted. Sampling
+does not change the existing per-frame resize rule or the assembled-context
+limit.
+
+The pinned helper adds `Video:` once before the first frame. With timestamp
+interval zero it adds no timestamp text or inter-frame separator. Gemma4's
+`<|image>` and `<image|>` still surround each frame's projected rows. Each frame
+uses the existing aspect-preserving dynamic 70 to 140-token canvas.
+
+Source contract: llama.cpp
+[`mtmd-helper.cpp`](https://github.com/ggml-org/llama.cpp/blob/6868a52cb337450658006ad2f9281c2eb63f1666/tools/mtmd/mtmd-helper.cpp),
+`mtmd_helper_video::start_ffmpeg`, `read_next_frame` and `read_next`.
+The helper delegates sampling to an external `fps=1.000000` filter and does
+not pin that executable's version. The constant-rate rule above follows
+[`vf_fps.c` in FFmpeg n7.1](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavfilter/vf_fps.c),
+`read_frame`, `write_frame` and `update_eof_pts`, using its default nearest
+rounding and EOF behavior. No FFmpeg dependency or decoding subprocess is
+added. Variable-rate input, nonzero initial timestamps and decoder-specific
+EOF timestamps need a separate timestamp-bearing contract.
+
+`video_clips.py OUT` prepares decoded RGB streams and selected PNG frames for
+three synthetic constant-rate clips (1 second at 24 FPS, 7 seconds at 30 FPS,
+and 16 seconds at 24 FPS). Its JSON and TSV manifests record source FPS,
+geometry, selected indices and raw-stream digests.
+
+On a Linux CUDA host with the model profile's files and pinned llama-server:
+
+```sh
+python3 tools/ref/emb2/video_oracle.py target/video-clips --oracle "$LCPP"
+cargo oxide build --arch sm_86 -- --release -p bloomery-gpu-gates \
+  --features gemma-embedding2,vision,deepseek41 --bin gate_gemma_embedding2_e2e
+BLOOMERY_MODEL=gemma-embedding2 BLOOMERY_BOX_LOCAL=1 bash tools/box.sh \
+  'bash tools/gpu-gate.sh gate_gemma_embedding2_e2e --video-clips target/video-clips/clips.tsv'
+```
+
+Choose the build architecture for the card. The collector refuses an existing
+output directory, checks the model digests and oracle revision, and runs the
+CUDA and CPU servers sequentially. The collector uses the CUDA driver's visible
+device list for the CUDA set's card header, including ordinal, UUID and MIG
+selections in `CUDA_VISIBLE_DEVICES`. A missing driver, a CUDA error or an empty
+visible list stops collection. Each clip gets its own video reference pair.
+The gate requires three uniquely named fixture rows and exactly one matching
+video record in each reference set, including the CPU twin. The gate reads the
+complete decoded RGB stream, calls `prepare_clip`, checks source indices and selected pixels against those sent to llama-server, and
+compares position counts and pooled vectors with the existing CPU-twin bands.
+It prints each ordered span. Every frame within one fixture has the same
+geometry, so the server's total position count also checks its uniform span
+length after accounting for the prefix and delimiters.
+
+These commands exercise decoded-frame assembly, not HTTP video decoding or an
+external FPS filter. The expected source indices follow the source contract
+above; the oracle receives the corresponding PNGs without a video decoder.

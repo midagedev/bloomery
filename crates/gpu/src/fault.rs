@@ -121,9 +121,10 @@ pub enum FaultSite {
     /// of squares is not finite, or produced a partial dot, a bottleneck
     /// value, a combine weight or a mixed value that is not finite.
     HcMix = 20,
-    /// An f32 product kernel of Qwen3.8's layer (`q38`: the attention output
-    /// under its sigmoid gate, the shared expert's gated sum) met an input or
-    /// produced a value that is not finite.
+    /// The shared RMSNorm sum of squares, an f32 product kernel of Qwen3.8's
+    /// layer (`q38`: the attention output under its sigmoid gate, the shared
+    /// expert's gated sum) or Gemma4a's audio channel normalization, attention
+    /// score or GLU met non-finite arithmetic.
     F32Product = 21,
     /// A head whose logits no quantizer checked before them (a Q8_0 lm_head
     /// over f32 rows) met a logit that is not finite in its argmax.
@@ -272,8 +273,9 @@ impl FaultSite {
                  weight or mixed value not finite"
             }
             FaultSite::F32Product => {
-                "an attention output, its gate, a shared expert output, its weight or the host sum \
-                 not finite, or a product or sum that is not"
+                "an attention output, its gate, a shared expert output, its weight, the host sum, \
+                 an RMS sum of squares, audio channel variance, attention score or GLU input not finite, \
+                 or a product or sum that is not"
             }
             FaultSite::Logit => "a head logit not finite",
             FaultSite::DeltaStamp => {

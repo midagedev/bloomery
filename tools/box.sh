@@ -396,6 +396,11 @@ self_test() {
   # The script under test, with the drop wait and the sync wait shrunk (the constants' lines at the top; the wait case below reads 2 s).
   sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=2 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$script" > "$box"
   printf '%s\n' 'cuda-device = { git = "x", rev = "0123456789ab" }' > "$d/tree/Cargo.toml"
+  # The scratch tree is a git repo with a committed HEAD (the real case): the version commit reads here, and the corrupt-index
+  # case at the end has a HEAD whose dirt would otherwise read clean. Identity and hooks are pinned so the commit asks for neither.
+  git -C "$d/tree" init -q
+  git -C "$d/tree" add -A
+  git -C "$d/tree" -c user.name=box -c user.email=box@local -c core.hooksPath=/dev/null commit -q --no-gpg-sign -m tree
   # The queue client a queued call execs at its end: it logs its arguments and ends with boxq.rc (default 0).
   printf '%s\n' '#!/usr/bin/env python3' 'import os, sys' "D = '$d'" \
     "open(D + '/boxq.log', 'a').write(' '.join(sys.argv[1:2]) + chr(10))" \
@@ -678,6 +683,14 @@ STUB
   wait "$bpid" 2> /dev/null || true
   [ ! -e "$pd/$bpid" ] || fail "a call ended by TERM left its pid file $pd/$bpid"
   spid=$(cat "$d/ssh.pid" 2> /dev/null) && kill "$spid" 2> /dev/null || true
+  # A tree whose HEAD reads but whose status does not (a corrupt index): the call stops 70 naming the tree and Git's exit
+  # code, and the command never reaches ssh — a commit whose dirt is unreadable is not one BLOOMERY_GIT_COMMIT gets to export.
+  printf 'x' > "$d/tree/.git/index"
+  call -- 'echo hi'
+  want 70 'a corrupt index'
+  has "box.sh: git status in $d/tree failed (git exit 128)" 'a corrupt index names the tree and Git exit code'
+  has '-dirty mark' 'a corrupt index says what the mark would have been'
+  grep -q -- 'echo hi' "$d/ssh.log" && fail "a corrupt index: the command reached ssh (REMOTE_CMD was built): $(head -c 160 "$d/ssh.log")"
   rm -rf "$d"
   if [ "$fails" != 0 ]; then
     echo "box.sh: self-test $fails failed" >&2
@@ -1128,7 +1141,14 @@ GATEX=
 case "$QLANE" in
   3090 | a6000 | both | any) GATEX="export BLOOMERY_GATE_CARD=$BOXCARD && " ;;
 esac
-[ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
+# 상태를 실패 무시로 읽으면 손상된 인덱스에서도 '깨끗함'으로 읽혀 더러운 트리의 커밋이 -dirty 없이 export된다. HEAD를 읽은
+# 트리에서만 검사한다(HEAD도 없는 트리는 앞에서 이미 unknown이므로 그 동작은 그대로 둔다): 상태를 치환으로 받되
+# 실패면(보통 손상된 .git/index) 트리와 Git의 종료 코드를 이름 대고 rc 70으로 멈춘다 — REMOTE_CMD는 그 뒤에서 만들어진다.
+if [ "$COMMIT" != unknown ]; then
+  st=$(git -C "$HERE" status --porcelain 2>/dev/null) && st_rc=0 || st_rc=$?
+  [ "$st_rc" = 0 ] || { echo "box.sh: git status in $HERE failed (git exit $st_rc): the tree's changes could not be read, so the version commit would export without its -dirty mark; repair the tree first" >&2; exit 70; }
+  [ -z "$st" ] || COMMIT="$COMMIT-dirty"
+fi
 REMOTE_CMD="source $ENVF && { $PICK
 } && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $GATEX$OXIDE$ARCHX$ENVS$OXCHECK$LOCALX$*"
 if [ "$LOCAL" = 1 ]; then

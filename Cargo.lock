@@ -173,6 +173,7 @@ dependencies = [
  "bloomery-gpu",
  "bloomery-gpu-deepseek41",
  "bloomery-gpu-gemma-embedding2",
+ "bloomery-gpu-gemma4a",
  "bloomery-gpu-glm5next",
  "bloomery-gpu-mimo2",
  "bloomery-gpu-vision",
@@ -205,6 +206,18 @@ dependencies = [
  "bloomery-gpu",
  "bloomery-model",
  "cuda-core",
+]
+
+[[package]]
+name = "bloomery-gpu-gemma4a"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "bloomery-vision",
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
 ]
 
 [[package]]

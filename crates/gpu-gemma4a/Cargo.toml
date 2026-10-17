@@ -1,0 +1,17 @@
+[package]
+name = "bloomery-gpu-gemma4a"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+cuda-device.workspace = true
+cuda-host.workspace = true
+cuda-core.workspace = true
+bloomery-gpu = { path = "../gpu" }
+bloomery-gguf = { path = "../gguf" }
+bloomery-vision = { path = "../vision" }

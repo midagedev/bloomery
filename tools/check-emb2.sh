@@ -22,7 +22,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--dumper", type=Path)
 args = parser.parse_args()
 ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT / "tools"))
 DUMPER = args.dumper.resolve() if args.dumper else None
+GGUF_STUB = ("#include <cstdint>\nstruct gguf_context;\nstruct gguf_init_params { bool no_alloc; void * ctx; };\n"
+             "static gguf_context * gguf_init_from_file(const char *, gguf_init_params) { return nullptr; }\n"
+             "static int64_t gguf_find_key(const gguf_context *, const char *) { return -1; }\n"
+             'static const char * gguf_get_val_str(const gguf_context *, int64_t) { return ""; }\n'
+             "static void gguf_free(gguf_context *) {}\n")
 
 
 def write(path, text, executable=False):
@@ -223,6 +229,75 @@ printf '%s:end\\n' "$FIXTURE_TAG" >> "$FIXTURE_EVENTS"
 
 
 class Builders(unittest.TestCase):
+    def test_audio_builds_clean_libraries_and_checks_the_mel_family(self):
+        if sys.platform != "linux" or not shutil.which("sha256sum"):
+            self.skipTest("audio builder fixture requires Linux and sha256sum")
+        for failure in ("", "mel", "configure", "build", "compile", "gpu", "cpu", "check-gpu", "check-cpu", "shape", "size"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(prefix="audio-build-") as tmp:
+                root = Path(tmp).resolve()
+                script = root / "tools/ref/emb2/audio.sh"
+                script.parent.mkdir(parents=True)
+                shutil.copyfile(ROOT / "tools/ref/emb2/audio.sh", script)
+                shutil.copytree(ROOT / "tools/bloomery", root / "tools/bloomery")
+                from bloomery.manifest import dump_file_name
+                mel_dir = root / "data/ref_gemma_embedding2_mel"
+                rows = []
+                for case in ("minimum/0", "sine/0", "silence/0", "before-30s/0", "after-30s/0", "after-30s/1"):
+                    name = case + "/mel"
+                    write(mel_dir / dump_file_name(name, 0, "output", "contig", "f32"), "\0" * (511 if failure == "size" else 512))
+                    rows.append(f"tensor\t{name}\t0\tf32\t1\t{127 if failure == 'shape' else 128}\t1\t1\t512\t0\tNONE\t1\t0\t-\t-")
+                write(mel_dir / "MANIFEST.tsv", "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1\n" + "\n".join(rows) + "\n# complete\t6\t0\n")
+                projector = root / "projector.gguf"
+                projector.write_bytes(b"audio fixture")
+                pin = "a" * 40
+                write(root / "tools/ref/models/gemma-embedding2.sh",
+                      f'LCPP={shlex.quote(str(root / "oracle"))}\nLCPP_PIN={pin}\n'
+                      f'MMPROJ={shlex.quote(str(projector))}\n'
+                      f'MMPROJ_SHA256={hashlib.sha256(projector.read_bytes()).hexdigest()}\n')
+                write(root / "bin/git", '#!/bin/bash\ncase " $* " in\n'
+                      f'  *" rev-parse HEAD "*) echo {pin} ;;\n'
+                      '  *" status "*) exit 0 ;;\n  *) exit 91 ;;\nesac\n', True)
+                write(root / "bin/cargo", '#!/bin/bash\n'
+                      'case " $* " in\n'
+                      '  *" -- mel-gemma4a "*) stage=mel ;;\n'
+                      '  *" -- tower-gemma4a "*) stage=check-gpu ;;\n'
+                      '  *" -- tower-gemma4a-cpu "*) stage=check-cpu ;;\n'
+                      '  *) exit 91 ;;\nesac\n'
+                      'printf "%s\\n" "$stage" >> "$FIXTURE_EVENTS"\n'
+                      '[ "$FIXTURE_FAIL" != "$stage" ] || exit 42\n', True)
+                write(root / "bin/cmake", '#!/bin/bash\n'
+                      'case "$1" in\n'
+                      '  -S) stage=configure; [ "$*" = "-S $FIXTURE_ROOT/oracle -B $FIXTURE_ROOT/oracle/build" ] || exit 91 ;;\n'
+                      '  --build) stage=build; [ "$*" = "--build $FIXTURE_ROOT/oracle/build --clean-first --parallel 16" ] || exit 91 ;;\n'
+                      '  *) exit 91 ;;\nesac\n'
+                      'printf "%s\\n" "$stage" >> "$FIXTURE_EVENTS"\n'
+                      '[ "$FIXTURE_FAIL" != "$stage" ] || exit 42\n', True)
+                write(root / "bin/dump-audio", '#!/bin/bash\n'
+                      'printf "%s\\n" "$3" >> "$FIXTURE_EVENTS"\n'
+                      '[ "$FIXTURE_FAIL" != "$3" ] || exit 42\n'
+                      '[ ! -e "$2" ] || exit 91\nmkdir "$2"\nprintf "complete\\n" > "$2/MANIFEST.tsv"\n', True)
+                write(root / "bin/c++", '#!/bin/bash\n'
+                      'printf "compile\\n" >> "$FIXTURE_EVENTS"\n'
+                      '[ "$FIXTURE_FAIL" != compile ] || exit 42\n'
+                      'cp "$FIXTURE_ROOT/bin/dump-audio" target/dump_audio\n', True)
+                env = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
+                           BLOOMERY_DATA=str(root / "data"), CXX="c++", FIXTURE_ROOT=str(root),
+                           FIXTURE_EVENTS=str(root / "events"), FIXTURE_FAIL=failure)
+                result = subprocess.run(["bash", str(script)], env=env, capture_output=True,
+                                        text=True, timeout=10)
+                events = (root / "events").read_text().splitlines()
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, (1 if failure in ("shape", "size") else 42) if failure else 0, output)
+                expected = ["mel", "configure", "build", "compile", "gpu", "cpu", "check-gpu", "check-cpu"]
+                if failure in ("shape", "size"):
+                    expected = expected[:4]
+                    self.assertIn("malformed mel row or file", output)
+                elif failure:
+                    expected = expected[:expected.index(failure) + 1]
+                self.assertEqual(events, expected, output)
+                for suffix in ("", ".cpu"):
+                    self.assertEqual((root / ("data/ref_gemma_embedding2_audio" + suffix)).exists(), not bool(failure))
+
     def test_unreadable_index_stops_before_compilation(self):
         scripts = (
             ("tools/ref/build-hidden.sh", "qwen35"),
@@ -319,6 +394,129 @@ class Builders(unittest.TestCase):
                 self.assertFalse(marker.exists(), output)
 
 
+class AudioDumper(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cxx = shutil.which("c++") or shutil.which("g++")
+        if not cxx:
+            raise RuntimeError("a C++ compiler is required for the audio backend checks")
+        cls.tmp = Path(tempfile.mkdtemp(prefix="bloomery-audio-dumper-"))
+        write(cls.tmp / "clip.h", r'''
+#pragma once
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+struct ggml_backend_device {};
+using ggml_backend_dev_t = ggml_backend_device *;
+enum { GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU };
+inline ggml_backend_dev_t ggml_backend_dev_by_type(int type) {
+    static ggml_backend_device gpu;
+    const char * value = getenv(type == GGML_BACKEND_DEVICE_TYPE_GPU ? "FIXTURE_GPU" : "FIXTURE_IGPU");
+    return value && !strcmp(value, "1") ? &gpu : nullptr;
+}
+inline void ggml_backend_load_all() {}
+enum { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_MUL, GGML_TYPE_F32 };
+struct ggml_tensor {
+    int op = 0, type = GGML_TYPE_F32;
+    const char * name = "";
+    ggml_tensor * src[2] = {};
+    int64_t ne[4] = {1, 1, 1, 1};
+};
+inline bool ggml_is_contiguous(const ggml_tensor *) { return true; }
+inline int64_t ggml_nelements(const ggml_tensor *) { return 1; }
+inline void ggml_backend_tensor_get(const ggml_tensor *, void * data, size_t, size_t size) { memset(data, 0, size); }
+struct clip_context_params {
+    bool use_gpu = false, warmup = false;
+    ggml_backend_dev_t device = nullptr;
+    bool (*cb_eval)(ggml_tensor *, bool, void *) = nullptr;
+    void * cb_eval_user_data = nullptr;
+};
+struct clip_ctx { clip_context_params params; };
+struct clip_init_result { clip_ctx * ctx_a = nullptr, * ctx_v = nullptr, * ctx_gen_a = nullptr; };
+inline clip_init_result clip_init(const char *, clip_context_params p) {
+    if (p.use_gpu && p.device && getenv("FIXTURE_GPU_INIT_FAIL")) return {};
+    return {new clip_ctx{p}, nullptr, nullptr};
+}
+inline void clip_free(clip_ctx * ctx) { delete ctx; }
+struct clip_image_f32 { void set_size(std::pair<int, int>, bool, bool) {} void cpy_buf(const std::vector<float> &) {} };
+struct clip_image_f32_batch { bool is_audio; std::vector<clip_image_f32> entries; };
+inline bool clip_image_batch_encode(clip_ctx * ctx, int, clip_image_f32_batch *, std::vector<float> &) {
+    auto p = ctx->params;
+    if (!p.cb_eval) return true;
+    for (int i = 0; i < 16; ++i) {
+        char name[64];
+        ggml_tensor source, t;
+        t.src[0] = &source;
+        if (i == 0) { source.name = "a.input_projection.weight"; t.op = GGML_OP_MUL_MAT; }
+        else if (i == 1) { source.name = "a.pre_encode.out.bias"; t.src[1] = &source; t.op = GGML_OP_ADD; }
+        else if (i < 14) {
+            snprintf(name, sizeof(name), "a.blk.%d.ln2.weight", i - 2);
+            source.name = name; t.src[1] = &source; t.op = GGML_OP_MUL;
+        } else { source.name = i == 14 ? "pos_emb" : "kq_mask"; }
+        if (p.cb_eval(&t, true, p.cb_eval_user_data)) p.cb_eval(&t, false, p.cb_eval_user_data);
+    }
+    return true;
+}
+''' + GGUF_STUB)
+        for header in ("clip-impl.h", "ggml-backend.h"):
+            write(cls.tmp / header, '#include "clip.h"\n')
+        cls.bin = cls.tmp / "dump_audio"
+        subprocess.run([cxx, "-std=c++17", "-include", "cstdio", "-I", str(cls.tmp),
+                        str(ROOT / "tools/ref/emb2/dump_audio.cpp"), "-o", str(cls.bin)], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def test_backend_selection_and_malformed_inputs_never_complete_a_set(self):
+        import struct
+        cases = [
+            ("gpu", {}, "case/0", b"\0" * 512, "visible GPU backend"),
+            ("cpu", {}, "case/0", b"\0" * 512, None),
+            ("gpu", {"FIXTURE_GPU": "1"}, "case/0", b"\0" * 512, None),
+            ("gpu", {"FIXTURE_IGPU": "1"}, "case/0", b"\0" * 512, None),
+            ("gpu", {"FIXTURE_GPU": "1", "FIXTURE_GPU_INIT_FAIL": "1"}, "case/0", b"\0" * 512, "projector did not open"),
+            ("other", {}, "case/0", b"\0" * 512, "device must be"),
+            ("cpu", {"BLOOMERY_REF_BUILD": ""}, "case/0", b"\0" * 512, "oracle commit"),
+            ("cpu", {"BLOOMERY_REF_BUILD": "6868a52cb\n"}, "case/0", b"\0" * 512, "oracle commit"),
+            ("cpu", {}, "bad\tname", b"\0" * 512, "case name"),
+            ("cpu", {}, "", b"\0" * 512, "case name"),
+            ("cpu", {}, "a" * 129, b"\0" * 512, "case name"),
+            ("cpu", {}, ["case/0", "case/0"], b"\0" * 512, "case name"),
+            ("cpu", {}, ["case/0", "case_0"], b"\0" * 512, "case name"),
+            ("cpu", {}, "case/0", b"", "bad mel file"),
+            ("cpu", {}, "case/0", b"\0" * 511, "bad mel file"),
+            ("cpu", {}, "case/0", struct.pack("f", float("nan")) * 128, "non-finite mel"),
+            ("cpu", {}, "case/0", struct.pack("f", float("inf")) * 128, "non-finite mel"),
+        ]
+        for device, extra, name, data, error in cases:
+            with self.subTest(device=device, extra=extra, error=error), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                mel, out = root / "mel.f32", root / "out"
+                mel.write_bytes(data)
+                env = {k: v for k, v in os.environ.items() if not k.startswith("FIXTURE_")}
+                env.update({"BLOOMERY_REF_BUILD": "6868a52cb", **extra})
+                inputs = [item for case in ([name] if isinstance(name, str) else name) for item in (case, str(mel))]
+                result = subprocess.run([str(self.bin), "projector", str(out), device, *inputs],
+                                        env=env, capture_output=True, text=True, timeout=5)
+                manifest = out / "MANIFEST.tsv"
+                if error:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(error, result.stderr)
+                    self.assertFalse(manifest.exists())
+                    if error == "visible GPU backend":
+                        self.assertFalse(out.exists(), "GPU refusal must precede the output writer")
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"# device\t{device}\n", manifest.read_text())
+                    self.assertIn("# complete\t18\t0\n", manifest.read_text())
+                    again = subprocess.run([str(self.bin), "projector", str(out), device, name, str(mel)],
+                                           env=env, capture_output=True, text=True, timeout=5)
+                    self.assertNotEqual(again.returncode, 0)
+                    self.assertIn("output path must be new", again.stderr)
+
+
 class Options(unittest.TestCase):
     def test_nonroot_build_recipe_names_the_failure_before_detaching(self):
         recipe = (ROOT / "justfile").read_text().split("\nbuild-emb2-lcpp:\n", 1)[1].split("\n\n", 1)[0]
@@ -360,12 +558,7 @@ class Ids(unittest.TestCase):
             raise unittest.SkipTest("a C++ compiler is required for the id reader checks")
         cls.tmp = Path(tempfile.mkdtemp(prefix="bloomery-emb2-ids-"))
         # gguf_arch needs gguf.h's four calls; this build never calls it, so they are stubs and llama.cpp is not needed.
-        gguf = ("#include <cstdint>\nstruct gguf_context;\nstruct gguf_init_params { bool no_alloc; void * ctx; };\n"
-                "static gguf_context * gguf_init_from_file(const char *, gguf_init_params) { return nullptr; }\n"
-                "static int64_t gguf_find_key(const gguf_context *, const char *) { return -1; }\n"
-                'static const char * gguf_get_val_str(const gguf_context *, int64_t) { return ""; }\n'
-                "static void gguf_free(gguf_context *) {}\n")
-        write(cls.tmp / "ids.cpp", gguf + '#define DUMP_TOOL "ids"\n#include "' + str(ROOT / "tools/ref/clefvis/set_writer.h") + '"\n'
+        write(cls.tmp / "ids.cpp", GGUF_STUB + '#define DUMP_TOOL "ids"\n#include "' + str(ROOT / "tools/ref/clefvis/set_writer.h") + '"\n'
               "int main(int, char ** argv) {\n    std::vector<uint8_t> raw;\n    if (!read_file(argv[1], raw)) return 2;\n"
               '    for (int32_t id : parse_ids(argv[1], raw)) printf("%d\\n", id);\n}\n')
         cls.bin = cls.tmp / "ids"

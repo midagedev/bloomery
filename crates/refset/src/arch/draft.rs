@@ -239,9 +239,10 @@ fn beside_paths<'a>(path: &'static str, target: &'a Path) -> impl Iterator<Item 
     let first = unresolved.and_then(|dir| name.map(|n| dir.join(n)));
     let resolved = std::iter::once_with(move || {
         let resolved = target.canonicalize().ok()?;
+        let same = unresolved.and_then(|dir| dir.join(".").canonicalize().ok());
         resolved
             .parent()
-            .filter(|dir| Some(*dir) != unresolved)
+            .filter(|dir| Some(*dir) != same.as_deref())
             .and_then(|dir| name.map(|n| dir.join(n)))
     })
     .flatten();
@@ -532,8 +533,36 @@ mod tests {
             ROW.pick(None, &target),
             (PathBuf::from(ROW_PATH), DraftFrom::Family)
         );
-        let beside = s.real_dir("only").join(ROW_NAME);
+        let beside = target.with_file_name(ROW_NAME);
         assert_eq!(ROW.places(&target), vec![beside, PathBuf::from(ROW_PATH)]);
+    }
+
+    /// A plain shard opened through a symlinked directory sits in one
+    /// directory however it is spelled, so the off line names it once.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_under_a_symlinked_directory_names_its_directory_once() {
+        let s = Scratch::new("dir-link");
+        s.file("real", "shard-00001.gguf");
+        let dir = s.0.join("dir");
+        std::os::unix::fs::symlink(s.real_dir("real"), &dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        let target = dir.join("shard-00001.gguf");
+        assert_eq!(
+            ROW.places(&target),
+            vec![dir.join(ROW_NAME), PathBuf::from(ROW_PATH)]
+        );
+    }
+
+    /// A bare file name sits in the working directory, which `cargo test`
+    /// sets to the package root, so the off line names that directory once.
+    #[test]
+    fn a_bare_file_name_names_the_working_directory_once() {
+        let target = Path::new("Cargo.toml");
+        assert_eq!(
+            ROW.places(target),
+            vec![PathBuf::from(ROW_NAME), PathBuf::from(ROW_PATH)]
+        );
     }
 
     /// The beside path is the family's path when the target already sits in

@@ -517,7 +517,7 @@ ds_selftest() {
       [ -r "$f" ] || continue
       while read -r p; do
         # Only a pid the case wrote and whose command is still the stub or the listener it started.
-        if kill -0 "$p" 2> /dev/null && ps -o command= -p "$p" 2> /dev/null | grep -qE 'stub-llama-server|port-holder'; then kill "$p" 2> /dev/null; fi
+        if kill -0 "$p" 2> /dev/null && ps -o command= -p "$p" 2> /dev/null | grep -E 'stub-llama-server|port-holder' > /dev/null; then kill "$p" 2> /dev/null; fi
       done < "$f"
     done
     rm -rf "$T"

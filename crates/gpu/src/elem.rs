@@ -968,7 +968,15 @@ mod elem_kernels {
         block = (256, 1, 1),
         requires = (x.len() >= k * m, gain.len() >= k, y.len() >= k * m)
     )]
-    pub fn rms_norm(x: &[f32], gain: &[f32], eps: f32, k: u32, m: u32, mut y: DisjointSlice<f32>) {
+    pub fn rms_norm(
+        x: &[f32],
+        gain: &[f32],
+        eps: f32,
+        k: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
         static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
 
         let t = thread::blockIdx_x() as usize;
@@ -1012,7 +1020,15 @@ mod elem_kernels {
                 *ws.add(7),
             ]
         };
-        let scale = rms_scale(rms_warp_tree(sums), k as u32, eps);
+        let sum_sq = rms_warp_tree(sums);
+        let scale = if sum_sq.is_finite() {
+            rms_scale(sum_sq, k as u32, eps)
+        } else {
+            if tid == 0 {
+                fault.raise(FaultSite::F32Product);
+            }
+            f32::NAN
+        };
         apply.map(move |g, v| (scale * g) * v);
     }
 
@@ -2075,7 +2091,9 @@ impl ElemKernels {
         let prep = self
             .module
             .prepare_rms_norm(LaunchConfig1D::new(m, RMS_THREADS_U32, 0))?;
-        self.module.rms_norm(stream, &prep, x, gain, eps, k, m, y)?;
+        let fault = crate::sink_over(&self.fault, LAYER_NONE);
+        self.module
+            .rms_norm(stream, &prep, x, gain, eps, k, m, fault, y)?;
         Ok(())
     }
 

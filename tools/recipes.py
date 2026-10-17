@@ -10106,8 +10106,8 @@ def narrow_self_test(expect, side: Side) -> None:
         # a bin carrier is covered by the scan of that bin alone. Every bin of gpu-gates carries its own kernels in a
         # bundle named for the package, so a scan of another gpu-gates bin (same bundle name) or of that bin without
         # the package's bundle reads nothing of them. A change under crates/gpu reaches the closure of both bin
-        # carriers (gate_swap, gate_kquant) and of the three device libs.
-        libs = ("bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-vision")
+        # carriers (gate_swap, gate_kquant) and of the four device libs.
+        libs = ("bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-gemma4a", "bloomery-gpu-vision")
         own = ("bloomery-gpu", "bloomery-gpu-gates")
         gpu_rows = [row("crates/gpu/src/**", ["gate-gpu-lib"])]
 
@@ -10138,7 +10138,7 @@ def narrow_self_test(expect, side: Side) -> None:
                f"narrow: a scan of gate_swap that names no package bundle covers its kernels: {sorted(got)} {why}")
         # a lib carrier is covered by any scan that names its bundle, and by no other
         got, why = picked(pair("nolibs", "gx", ("bloomery-gpu",)), swap, kquant)
-        expect({"gate-gpu-vision", "gate-ds41-bind"} <= got and "lib bloomery-gpu-vision not scanned" in why and "lib bloomery-gpu-deepseek41 not scanned" in why,
+        expect({"gate-gpu-vision", "gate-ds41-bind", "gate-gpu-gemma4a"} <= got and "lib bloomery-gpu-vision not scanned" in why and "lib bloomery-gpu-deepseek41 not scanned" in why and "lib bloomery-gpu-gemma4a not scanned" in why,
                f"narrow: the device libs a scan names no bundle of do not keep their gates: {sorted(got)[:6]} {why}")
         # a data file a gate reads by `include_str!` or by path literal, alone in a diff and under scan pairs that cover every
         # kernel carrier, narrows with the real table: the shipped head list and the fixture variants' table through the
@@ -10972,7 +10972,7 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
         f"host nightly: the real tree's set is {host_now} — a new member of the set is proven by a nightly run before this list takes it",
     )
     left = [n for n, _ in host_left_out(tree, lock_now)]
-    expect(left == ["bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-gates", "bloomery-gpu-gemma-embedding2", "bloomery-gpu-glm5next", "bloomery-gpu-mimo2", "bloomery-gpu-vision"], f"host nightly: left out {left}")
+    expect(left == ["bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-gates", "bloomery-gpu-gemma-embedding2", "bloomery-gpu-gemma4a", "bloomery-gpu-glm5next", "bloomery-gpu-mimo2", "bloomery-gpu-vision"], f"host nightly: left out {left}")
     expect(not nightly_problems(tree, lock_now), f"host nightly: {nightly_problems(tree, lock_now)}")
     ran = {u for u, _ in host_units(tree, lock_now)}
     expect(

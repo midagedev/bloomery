@@ -669,7 +669,7 @@ PY
   source "${self%/*}/ref/cancel-stubs.sh"
   # shellcheck source=tools/gate-bound.sh
   source "${self%/*}/gate-bound.sh"
-  local ready signalled before state child lock bpath child_status want
+  local ready signalled before state child lock forward child_status want
   mkdir "$t/stack-bin" || return 70
   cancel_timeout "$t/stack-bin/timeout" || return 70
   cat > "$t/stack-bin/sleep" << 'SH' || return 70
@@ -736,12 +736,12 @@ SH
   # Observe before cleanup, so an orphaned group cannot turn a failure green.
   [ -z "$ip" ] || lease_stop "$ip" || return 70
   wait "$r1" || return 70
+  # The stub forwards once; GNU timeout may send TERM to both its child and the child's group.
   # One cancellation lets a command drain on its first TERM; a second TERM aborts that drain.
   for w in forwarding nonforwarding; do
-    rc=0 want=0
-    bpath=$PATH
-    if [ "$w" = nonforwarding ]; then bpath=$t/stack-bin:$PATH; want=143; fi
-    PATH="$bpath" bash -c '
+    rc=0 want=0 forward=1
+    if [ "$w" = nonforwarding ]; then forward=0; want=143; fi
+    CANCEL_TIMEOUT_FORWARD=$forward PATH="$t/stack-bin:$PATH" bash -c '
       source "$1"
       export STOP_RUNNER=$$
       run_bounded timeout --kill-after=10 30 python3 -
@@ -769,6 +769,105 @@ while True:
 PY
     judge_all "one cancellation drains a command under a $w monitor" "$rc" "$want" \
       '^drained: exit 0$' '!second TERM: abort'
+  done
+  # Inject TERM at the monitor's child-handle and wait boundaries.
+  cat > "$t/term-window.py" << 'PY' || return 70
+import os
+import runpy
+import select
+import signal
+import subprocess
+import sys
+
+fixture, phase = sys.argv[1:]
+read_fd, write_fd = os.pipe()
+os.set_inheritable(write_fd, True)
+spawned = []
+fired = False
+original = subprocess.Popen
+
+
+def term():
+    global fired
+    if not fired:
+        fired = True
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
+def read_state(expected):
+    assert select.select([read_fd], [], [], 5)[0], "child state timed out"
+    assert os.read(read_fd, 1) == expected, "unexpected child state"
+
+
+class WindowChild(original):
+    def __init__(self, *args, **kwargs):
+        if phase == "before-spawn":
+            term()
+        super().__init__(*args, **kwargs)
+        spawned.append(self)
+        os.close(write_fd)
+        read_state(b"r")
+        if phase == "before-handle":
+            term()
+
+    def wait(self, *args, **kwargs):
+        if phase in ("before-wait", "second-term"):
+            term()
+            if phase == "second-term":
+                read_state(b"d")
+                os.kill(os.getpid(), signal.SIGTERM)
+        rc = super().wait(*args, **kwargs)
+        if phase == "after-wait":
+            term()
+        return rc
+
+    def _wait(self, *args, **kwargs):
+        if phase == "during-wait":
+            term()
+        return super()._wait(*args, **kwargs)
+
+
+subprocess.Popen = WindowChild
+sys.argv = [fixture, "5", sys.executable, "-c", '''
+import os, signal, sys, time
+fd = int(sys.argv[1])
+def abort(*_):
+    os.write(1, b"second TERM: abort\\n")
+    os._exit(1)
+def drain(*_):
+    signal.signal(signal.SIGTERM, abort)
+    os.write(fd, b"d")
+    if sys.argv[2] == "second-term":
+        while True:
+            signal.pause()
+    time.sleep(0.1)
+    print("drained: exit 0", flush=True)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, drain)
+os.write(fd, b"r")
+if sys.argv[2] == "after-wait":
+    print("completed: exit 7", flush=True)
+    sys.exit(7)
+while True:
+    signal.pause()
+''', str(write_fd), phase]
+try:
+    runpy.run_path(fixture, run_name="__main__")
+finally:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    for child in spawned:
+        if child.poll() is None:
+            child.kill()
+        original.wait(child, timeout=5)
+PY
+  for w in before-spawn before-handle before-wait during-wait after-wait second-term; do
+    rc=0 want=0 state='^drained: exit 0$'
+    case $w in
+      after-wait) want=7; state='^completed: exit 7$' ;;
+      second-term) want=1; state='^second TERM: abort$' ;;
+    esac
+    CANCEL_TIMEOUT_FORWARD=1 python3 "$t/term-window.py" "$t/stack-bin/timeout" "$w" > "$t/out" 2>&1 || rc=$?
+    judge "monitor TERM at $w keeps the child's status" "$rc" "$want" "$state"
   done
   # A failed process read during cancellation stays an error even if the child ends successfully;
   # a nonzero child status still wins over the cleanup error.

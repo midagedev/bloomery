@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fixtures shared by the lease and stack-watch cancellation self-tests. Sourced, never executed.
 
-# A timeout that exits on TERM without forwarding it leaves its child in the monitor's group.
+# CANCEL_TIMEOUT_FORWARD=1 forwards TERM once; unset, the monitor exits and leaves its child's group.
 cancel_timeout() {
   cat > "$1" << 'PY'
 #!/usr/bin/env python3
@@ -10,10 +10,27 @@ import signal
 import subprocess
 import sys
 
+child = None
+pending_term = False
+
+
+def stop(*_):
+    global pending_term
+    if os.environ.get("CANCEL_TIMEOUT_FORWARD") == "1":
+        if child is None:
+            pending_term = True
+        else:
+            child.send_signal(signal.SIGTERM)
+    else:
+        sys.exit(143)
+
+
 os.setpgid(0, 0)
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+signal.signal(signal.SIGTERM, stop)
 args = [a for a in sys.argv[1:] if not a.startswith('--kill-after=')]
 child = subprocess.Popen(args[1:], close_fds=False)
+if pending_term:
+    child.send_signal(signal.SIGTERM)
 try:
     rc = child.wait(timeout=float(args[0]))
 except subprocess.TimeoutExpired:

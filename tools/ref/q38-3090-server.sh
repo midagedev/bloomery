@@ -249,7 +249,7 @@ q38srv_main() {
 # --self-test: a stub tree (a stub gate runner, a stub server and its --levers table, a stub nvidia-smi, a tiny corpus) and this
 # script run against it, on the Mac as on the box. The stub server writes the records a real one would at each chat request.
 q38srv_selftest() {
-  local self t fails=0 rc out served p
+  local self t fails=0 rc out p
   self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
   t=$(mktemp -d "${TMPDIR:-/tmp}/q38srv.XXXXXX") || die 73 "no temp dir"
   mkdir -p "$t/tree/tools" "$t/tree/target/release" "$t/bin" "$t/data/qwen4exp"
@@ -346,7 +346,9 @@ PY
     shift
     out=$(cd "$t/tree" && env PATH="$t/bin:$PATH" CUDA_VISIBLE_DEVICES=GPU-3090-STUB BLOOMERY_DATA="$t/data" Q38SRV_POLL=0.2 Q38SRV_FLUSH=0.2 ${envs[@]+"${envs[@]}"} bash "$self" "$@" 2>&1)
     rc=$?
-    if [ "$rc" != "$want" ] || ! printf '%s\n' "$out" | grep -qE -- "$pat"; then
+    # Keep a matching line before more output than a pipe can hold.
+    printf -v out '%s%262144s' "$out" ''
+    if [ "$rc" != "$want" ] || ! printf '%s\n' "$out" | grep -E -- "$pat" > /dev/null; then
       echo "FAIL $label: rc $rc (want $want), pattern '$pat' in:" >&2
       printf '%s\n' "$out" | tail -n 12 >&2
       fails=$((fails + 1))
@@ -357,16 +359,15 @@ PY
   st_run happy 0 'B2: prompt_tokens=' -- "$t/out1" --p1 40 --p2 120
   # st_has <label> <pattern>: the happy run's output holds the pattern.
   st_has() {
-    if printf '%s\n' "$out" | grep -qE -- "$2"; then echo "ok   $1"; else
+    if printf '%s\n' "$out" | grep -E -- "$2" > /dev/null; then echo "ok   $1"; else
       echo "FAIL $1: no '$2' in the happy run's output" >&2
       fails=$((fails + 1))
     fi
   }
-  served=$out
-  out=$served st_has second-turn-restored 'call stream end .*kept=0 restored=2100 end_us=420000'
-  out=$served st_has width-record 'mtp width windows=10'
-  out=$served st_has load-records 'xstream=split xstream_half=77 .*xstream_lane_gbs=20.10'
-  out=$served st_has passage-tokens 'B2 passage 120 tokens'
+  st_has second-turn-restored 'call stream end .*kept=0 restored=2100 end_us=420000'
+  st_has width-record 'mtp width windows=10'
+  st_has load-records 'xstream=split xstream_half=77 .*xstream_lane_gbs=20.10'
+  st_has passage-tokens 'B2 passage 120 tokens'
   st_run plan-card 1 'plan record names another card than the 3090' STUB_PLAN_CARD=A6000 -- "$t/out12" --p1 40 --p2 120
   st_run lever-set 64 'lever\(s\) set in the environment: BLOOMERY_DRAFT' BLOOMERY_DRAFT=mtp -- "$t/out6"
   st_run unknown-name 64 'STUB_UNREGISTERED names no registry row' STUB_LEVERS_REFUSE=STUB_UNREGISTERED -- "$t/out7"

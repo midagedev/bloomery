@@ -59,10 +59,13 @@ for arm in base new; do
   if [ "$arm" = base ]; then
     git -C "$ROOT" show "$BASE_REV:tools/gate-batch.sh" > "$WORK/$arm/tools/gate-batch.sh"
     git -C "$ROOT" show "$BASE_REV:justfile" > "$WORK/$arm/justfile"
+    base_resources=$(git -C "$ROOT" ls-tree --name-only "$BASE_REV" -- tools/gate-batch-resources.tsv)
+    if [ -n "$base_resources" ]; then
+      git -C "$ROOT" show "$BASE_REV:tools/gate-batch-resources.tsv" > "$WORK/$arm/tools/gate-batch-resources.tsv"
+    fi
   else
     cp "$ROOT/tools/gate-batch.sh" "$WORK/$arm/tools/gate-batch.sh"
     cp "$ROOT/justfile" "$WORK/$arm/justfile"
-    # The pack's resource table (a BASE predating it has none to copy; its runner reads none)
     if [ -f "$ROOT/tools/gate-batch-resources.tsv" ]; then
       cp "$ROOT/tools/gate-batch-resources.tsv" "$WORK/$arm/tools/gate-batch-resources.tsv"
     fi
@@ -161,7 +164,7 @@ run_arm() { # $1 = arm label, $2.. = the batch's own flags
 # A base with the budget refusal (a32023da and later) needs --over-budget-ok as much as the new arm;
 # one without the flag would refuse the unknown option, so it is passed only where it exists.
 BASE_BUDGET_OK=''
-if git -C "$ROOT" show "$BASE_REV:tools/gate-batch.sh" | grep -q -- --over-budget-ok; then BASE_BUDGET_OK=1; fi
+if git -C "$ROOT" show "$BASE_REV:tools/gate-batch.sh" | grep -- --over-budget-ok > /dev/null; then BASE_BUDGET_OK=1; fi
 run_arm new --over-budget-ok &
 newpid=$!
 if [ -n "$BASE_BUDGET_OK" ]; then run_arm base --over-budget-ok; else run_arm base; fi &

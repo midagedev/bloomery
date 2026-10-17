@@ -47,6 +47,7 @@ bloomery-gpu-mimo2 = { path = "../gpu-mimo2", optional = true }
 # The EmbeddingGemma 2 encoder, reached only through the `gemma-embedding2` feature (its end-to-end
 # gate).
 bloomery-gpu-gemma-embedding2 = { path = "../gpu-gemma-embedding2", optional = true }
+bloomery-gpu-gemma4a = { path = "../gpu-gemma4a", optional = true }
 cuda-core = { workspace = true, optional = true }
 # A gate binary's own `#[cuda_module]` (`gate_kquant`: entries no engine binary links) needs the
 # device and host halves of cuda-oxide as direct dependencies: the macros emit `::cuda_host` and
@@ -123,6 +124,12 @@ clef = ["gpu", "dep:bloomery-decision", "dep:bloomery-serve", "dep:serde_json"]
 glm5next = ["deepseek41", "dep:bloomery-gpu-glm5next", "bloomery-app/glm5next"]
 mimo2 = ["gpu", "dep:bloomery-gpu-mimo2", "bloomery-app/mimo2"]
 gemma-embedding2 = ["gpu", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
+gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
+
+[[bin]]
+name = "gate_gemma4a"
+path = "src/bin/gate_gemma4a.rs"
+required-features = ["gemma4a"]
 
 # A bin whose `main` sits behind a feature requires that feature: cargo refuses to build it without the
 # feature before it links anything, instead of linking the feature-off stub `main` over the working

@@ -7,7 +7,7 @@ mod media;
 pub mod tensors;
 
 pub use hparams::Hparams;
-pub use media::{Media, conv_pixels, prepare_video, preprocess};
+pub use media::{Media, conv_pixels, prepare_clip, prepare_video, preprocess};
 
 /// The projector type of the vision half of a Gemma4 multimodal file.
 pub const PROJECTOR_TYPE: &str = "gemma4v";
@@ -18,8 +18,8 @@ pub const IMAGE_BEGIN: &str = "<|image>";
 /// The tokenizer spelling after an image's rows.
 pub const IMAGE_END: &str = "<image|>";
 /// The checkpoint's pooled-token budget for each decoded video frame.
-pub(crate) const VIDEO_TOKENS: usize = 140;
-/// The checkpoint's maximum number of decoded frames in one input.
+pub const VIDEO_TOKENS: usize = 140;
+/// The decoded-frame interface limit, independent of the reference decoder.
 pub(crate) const VIDEO_FRAMES: usize = 32;
 
 #[cfg(test)]
@@ -27,6 +27,40 @@ mod tests {
     use super::*;
     use crate::size::SizeRule;
     use crate::{Rgb8, arch::TokenLimits};
+
+    #[test]
+    fn constant_rate_clips_sample_output_ticks_and_refuse_overflow() {
+        for (seconds, fps, first) in [(1, 24, 11), (7, 30, 14), (16, 24, 11), (32, 30, 14)] {
+            let frames = (0..seconds * fps)
+                .map(|i| Rgb8::filled(48, 48, [i as u8, (i / 256) as u8, 0]))
+                .collect::<Vec<_>>();
+            let (indices, prepared) = prepare_clip(&frames, (fps as u32, 1), 16).unwrap();
+            let expected = (0..seconds).map(|i| first + i * fps).collect::<Vec<_>>();
+            assert_eq!(indices, expected);
+            assert_eq!(prepared.len(), seconds);
+            for (&index, p) in indices.iter().zip(&prepared) {
+                let single = prepare_video(&[frames[index].clone()], 16).unwrap();
+                assert_eq!(p.span_len, single[0].span_len);
+                assert_eq!(p.grid().unwrap().bf16, single[0].grid().unwrap().bf16);
+            }
+        }
+        let frame = Rgb8::filled(48, 48, [0; 3]);
+        let long = vec![frame.clone(); 40 * 30];
+        assert!(
+            prepare_clip(&long, (30, 1), 16)
+                .unwrap_err()
+                .to_string()
+                .contains("40 frames")
+        );
+        assert!(prepare_clip(&long[..33 * 30], (30, 1), 16).is_err());
+        assert!(prepare_clip(&[], (24, 1), 16).is_err());
+        assert!(prepare_clip(&long, (0, 1), 16).is_err());
+        assert!(prepare_clip(&long, (24, 0), 16).is_err());
+        assert!(prepare_clip(&long[..11], (24, 1), 16).is_err());
+        assert_eq!(prepare_clip(&long[..12], (24, 1), 16).unwrap().0, [11]);
+        assert_eq!(prepare_clip(&long[..13], (25, 1), 16).unwrap().0, [12]);
+        assert_eq!(prepare_clip(&[frame], (1, 2), 16).unwrap().0, [0, 0]);
+    }
 
     #[test]
     fn decoded_video_preserves_frames_and_bounds_each_canvas() {
