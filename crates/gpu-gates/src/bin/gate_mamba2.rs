@@ -54,7 +54,11 @@
 //!    is an f32 rounding tie that only the step's chunk order resolves the
 //!    step's way (the f64 sums absorb every other order difference, so a
 //!    random input cannot tell the order); and a captured pass (four
-//!    nodes with a gain) replayed against the eager pass. The pass's
+//!    nodes with a gain) replayed against the eager pass. At head_dim 72
+//!    (576 as 8 heads of one group) — a head whose channels are not a
+//!    multiple of the staging block, so the staged `z` and `x` hold masked
+//!    channels the staging zeroes — a warmed pass past two stage boundaries
+//!    equals the steps bit for bit. The pass's
 //!    refusals (`u` 0, a column window past `ld`, short rows, a short `y`, a
 //!    `u` past the scratch's `max_u`, a scratch of another shape) are
 //!    clause 3's.
@@ -115,17 +119,10 @@ mod gate {
     use cuda_core::{CudaStream, DeviceBuffer};
     use model::mamba2::{self, Checked, Geom, Token};
 
-    const INNER: usize = 7680;
-    const HEADS: usize = 96;
-    const GROUPS: usize = 8;
-    const HEAD_DIM: usize = INNER / HEADS;
-    const PER: usize = HEADS / GROUPS;
-    const WIDTH: usize = INNER / GROUPS;
-    const CONV_DIM: usize = INNER + 2 * GROUPS * STATE;
     const GEOM: Geom = Geom {
-        d_inner: INNER,
-        n_heads: HEADS,
-        n_groups: GROUPS,
+        d_inner: 7680,
+        n_heads: 96,
+        n_groups: 8,
         d_state: STATE,
         d_conv: 4,
     };
@@ -142,12 +139,56 @@ mod gate {
     const GARBAGE: f32 = 7.0;
     /// What the output holds before a launch.
     const POISON: u32 = 0x7fa5_a5a5;
-    /// A pass's row: the Nemotron in-projection's `z`, `xbc` and `dt`
-    /// columns, in that order, and its stride.
-    const Z0: usize = 0;
-    const X0: usize = INNER;
-    const DT0: usize = INNER + CONV_DIM;
-    const LD: usize = DT0 + HEADS;
+    /// One geometry the cases run at: the model [`Geom`] with the widths the
+    /// gate derives from it, and a pass row's column layout — the Nemotron
+    /// in-projection's `z`, `xbc` and `dt` columns, in that order (`z` at
+    /// column 0), and the row's stride.
+    #[derive(Clone, Copy)]
+    struct Shape {
+        g: Geom,
+        heads: usize,
+        groups: usize,
+        inner: usize,
+        hd: usize,
+        per: usize,
+        width: usize,
+        conv_dim: usize,
+        x0: usize,
+        dt0: usize,
+        ld: usize,
+    }
+
+    impl Shape {
+        const fn new(g: Geom) -> Shape {
+            let (inner, heads, groups) = (g.d_inner, g.n_heads, g.n_groups);
+            let conv_dim = inner + 2 * groups * STATE;
+            Shape {
+                g,
+                heads,
+                groups,
+                inner,
+                hd: inner / heads,
+                per: heads / groups,
+                width: inner / groups,
+                conv_dim,
+                x0: inner,
+                dt0: inner + conv_dim,
+                ld: inner + conv_dim + heads,
+            }
+        }
+    }
+
+    const MAIN: Shape = Shape::new(GEOM);
+    /// head_dim 72: a head whose channels are not a multiple of the staging
+    /// block, so the pass's staged `z` and `x` hold masked channels the
+    /// staging zeroes (clause 6).
+    const HD72: Shape = Shape::new(Geom {
+        d_inner: 576,
+        n_heads: 8,
+        n_groups: 1,
+        d_state: STATE,
+        d_conv: 4,
+    });
     /// The pass lengths of clause 6, and the steps that warm its start: the
     /// stage boundary's neighbours `STAGE_T ± 1`, `2·STAGE_T + 3` past two
     /// stages, and the odd ones around them.
@@ -195,11 +236,11 @@ mod gate {
         norm: Vec<f32>,
     }
 
-    fn weights(regime: Regime, seed: u64) -> Weights {
+    fn weights(s: &Shape, regime: Regime, seed: u64) -> Weights {
         let mut r = Rng(seed);
-        let mut dt_bias = vec![0.0; HEADS];
-        let mut a = vec![0.0; HEADS];
-        for h in 0..HEADS {
+        let mut dt_bias = vec![0.0; s.heads];
+        let mut a = vec![0.0; s.heads];
+        for h in 0..s.heads {
             match regime {
                 // dt = raw + bias is in (21, 27): the identity arm. Even
                 // heads decay by 1, odd ones by 0 (σ·A < −168).
@@ -222,10 +263,12 @@ mod gate {
         Weights {
             dt_bias,
             a,
-            d: (0..HEADS).map(|_| r.uni(0.5, 1.5)).collect(),
-            conv_w: (0..4 * CONV_DIM).map(|_| r.uni(-0.6, 0.6)).collect(),
-            conv_b: (0..CONV_DIM).map(|_| r.uni(-0.2, 0.2)).collect(),
-            norm: (0..INNER).map(|_| r.uni(0.5, 1.5)).collect(),
+            d: (0..s.heads).map(|_| r.uni(0.5, 1.5)).collect(),
+            conv_w: (0..s.g.d_conv * s.conv_dim)
+                .map(|_| r.uni(-0.6, 0.6))
+                .collect(),
+            conv_b: (0..s.conv_dim).map(|_| r.uni(-0.2, 0.2)).collect(),
+            norm: (0..s.inner).map(|_| r.uni(0.5, 1.5)).collect(),
         }
     }
 
@@ -237,15 +280,15 @@ mod gate {
         z: Vec<f32>,
     }
 
-    fn token(regime: Regime, r: &mut Rng) -> TokenIn {
+    fn token(s: &Shape, regime: Regime, r: &mut Rng) -> TokenIn {
         let dt_range = match regime {
             Regime::Exact => (-1.0, 1.0),
             Regime::Band => (-2.0, 2.0),
         };
         TokenIn {
-            xbc: (0..CONV_DIM).map(|_| r.uni(-2.0, 2.0)).collect(),
-            dt: (0..HEADS).map(|_| r.uni(dt_range.0, dt_range.1)).collect(),
-            z: (0..INNER).map(|_| r.uni(-3.0, 3.0)).collect(),
+            xbc: (0..s.conv_dim).map(|_| r.uni(-2.0, 2.0)).collect(),
+            dt: (0..s.heads).map(|_| r.uni(dt_range.0, dt_range.1)).collect(),
+            z: (0..s.inner).map(|_| r.uni(-3.0, 3.0)).collect(),
         }
     }
 
@@ -257,26 +300,26 @@ mod gate {
         scan: Vec<f32>,
     }
 
-    fn init(r: &mut Rng, start: bool) -> Init {
+    fn init(s: &Shape, r: &mut Rng, start: bool) -> Init {
         Init {
             conv: if start {
-                vec![0.0; 3 * CONV_DIM]
+                vec![0.0; 3 * s.conv_dim]
             } else {
-                (0..3 * CONV_DIM).map(|_| r.uni(-2.0, 2.0)).collect()
+                (0..3 * s.conv_dim).map(|_| r.uni(-2.0, 2.0)).collect()
             },
-            scan: (0..INNER * STATE).map(|_| r.uni(-0.5, 0.5)).collect(),
+            scan: (0..s.inner * STATE).map(|_| r.uni(-0.5, 0.5)).collect(),
         }
     }
 
     /// The ring a run starts from: garbage everywhere, then the three
     /// predecessors of position `p0` where the conv reads them.
-    fn ring_of(init: &Init, p0: u32, start: bool) -> Vec<f32> {
-        let mut ring = vec![GARBAGE; RING_ROWS * CONV_DIM];
+    fn ring_of(s: &Shape, init: &Init, p0: u32, start: bool) -> Vec<f32> {
+        let mut ring = vec![GARBAGE; RING_ROWS * s.conv_dim];
         if !start {
             for age in 0..3 {
                 let slot = (p0 as usize + RING_ROWS - 3 + age) % RING_ROWS;
-                for c in 0..CONV_DIM {
-                    ring[slot * CONV_DIM + c] = init.conv[age + 3 * c];
+                for c in 0..s.conv_dim {
+                    ring[slot * s.conv_dim + c] = init.conv[age + 3 * c];
                 }
             }
         }
@@ -284,12 +327,12 @@ mod gate {
     }
 
     /// The card's checked widths. The host twin uses the same geometry.
-    fn device_shape() -> Result<Checked, GateError> {
-        Ok(bloomery_gpu::mamba2::check("gate_mamba2", GEOM)?)
+    fn device_shape(s: &Shape) -> Result<Checked, GateError> {
+        Ok(bloomery_gpu::mamba2::check("gate_mamba2", s.g)?)
     }
 
-    fn geom() -> Result<Checked, GateError> {
-        Ok(mamba2::check(GEOM)?)
+    fn geom(s: &Shape) -> Result<Checked, GateError> {
+        Ok(mamba2::check(s.g)?)
     }
 
     /// The host twin's run of `toks` from `init`: each token's `y`, the
@@ -301,16 +344,17 @@ mod gate {
     }
 
     fn host_run(
+        s: &Shape,
         w: &Weights,
         init: &Init,
         toks: &[TokenIn],
         norm: bool,
     ) -> Result<HostRun, GateError> {
-        let g = geom()?;
+        let g = geom(s)?;
         let (mut conv, mut scan) = (init.conv.clone(), init.scan.clone());
         let mut ys = Vec::new();
         for t in toks {
-            let mut y = vec![0.0; INNER];
+            let mut y = vec![0.0; s.inner];
             mamba2::step_token(
                 &g,
                 &mut conv,
@@ -336,11 +380,11 @@ mod gate {
 
     /// The ring after `toks` from positions `p0`: the start's ring with each
     /// token's input in its slot.
-    fn ring_after(start_ring: &[f32], toks: &[TokenIn], p0: u32) -> Vec<f32> {
+    fn ring_after(s: &Shape, start_ring: &[f32], toks: &[TokenIn], p0: u32) -> Vec<f32> {
         let mut ring = start_ring.to_vec();
         for (t, tok) in toks.iter().enumerate() {
             let slot = (p0 as usize + t) % RING_ROWS;
-            ring[slot * CONV_DIM..(slot + 1) * CONV_DIM].copy_from_slice(&tok.xbc);
+            ring[slot * s.conv_dim..(slot + 1) * s.conv_dim].copy_from_slice(&tok.xbc);
         }
         ring
     }
@@ -352,6 +396,7 @@ mod gate {
 
     /// The card's buffers of one run.
     struct Dev {
+        s: Shape,
         xbc: DeviceBuffer<f32>,
         dt: DeviceBuffer<f32>,
         z: DeviceBuffer<f32>,
@@ -370,12 +415,13 @@ mod gate {
     }
 
     impl Dev {
-        fn new(cx: &Ctx, w: &Weights) -> Result<Dev, GateError> {
+        fn new(cx: &Ctx, s: &Shape, w: &Weights) -> Result<Dev, GateError> {
             let st = cx.gpu.stream();
             Ok(Dev {
-                xbc: DeviceBuffer::from_host(st, &vec![0.0; CONV_DIM])?,
-                dt: DeviceBuffer::from_host(st, &vec![0.0; HEADS])?,
-                z: DeviceBuffer::from_host(st, &vec![0.0; INNER])?,
+                s: *s,
+                xbc: DeviceBuffer::from_host(st, &vec![0.0; s.conv_dim])?,
+                dt: DeviceBuffer::from_host(st, &vec![0.0; s.heads])?,
+                z: DeviceBuffer::from_host(st, &vec![0.0; s.inner])?,
                 dt_bias: DeviceBuffer::from_host(st, &w.dt_bias)?,
                 a: DeviceBuffer::from_host(st, &w.a)?,
                 d: DeviceBuffer::from_host(st, &w.d)?,
@@ -383,13 +429,13 @@ mod gate {
                 conv_b: DeviceBuffer::from_host(st, &w.conv_b)?,
                 norm: DeviceBuffer::from_host(st, &w.norm)?,
                 pos: DeviceBuffer::from_host(st, &[0u32])?,
-                y: DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); INNER])?,
-                ring: DeviceBuffer::from_host(st, &vec![0.0; RING_ROWS * CONV_DIM])?,
-                state: DeviceBuffer::from_host(st, &vec![0.0; INNER * STATE])?,
-                scratch: Mamba2Scratch::new(st, device_shape()?)?,
+                y: DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); s.inner])?,
+                ring: DeviceBuffer::from_host(st, &vec![0.0; RING_ROWS * s.conv_dim])?,
+                state: DeviceBuffer::from_host(st, &vec![0.0; s.inner * STATE])?,
+                scratch: Mamba2Scratch::new(st, device_shape(s)?)?,
                 pass_scratch: Mamba2PassScratch::new(
                     st,
-                    device_shape()?,
+                    device_shape(s)?,
                     STEPS_US.into_iter().max().unwrap(),
                 )?,
             })
@@ -400,8 +446,10 @@ mod gate {
             let st = cx.gpu.stream();
             self.ring.copy_from_host(st, ring)?;
             self.state.copy_from_host(st, scan)?;
-            self.y
-                .copy_from_host(st, &vec![f32::from_bits(POISON); INNER])?;
+            self.y.copy_from_host(
+                st,
+                &vec![f32::from_bits(POISON); self.s.inner],
+            )?;
             Ok(())
         }
 
@@ -467,9 +515,9 @@ mod gate {
                     u: pass.u,
                     rows: pass.rows,
                     ld: pass.ld,
-                    z0: Z0,
+                    z0: 0,
                     x0: pass.x0,
-                    dt0: DT0,
+                    dt0: pass.dt0,
                     dt_bias: &self.dt_bias,
                     a: &self.a,
                     d: &self.d,
@@ -500,6 +548,7 @@ mod gate {
         u: usize,
         ld: usize,
         x0: usize,
+        dt0: usize,
         rows: &'b DeviceBuffer<f32>,
     }
 
@@ -521,7 +570,7 @@ mod gate {
         norm: bool,
     ) -> Result<DevRun, GateError> {
         dev.load(cx, ring, scan)?;
-        let shape = device_shape()?;
+        let shape = device_shape(&dev.s)?;
         let mut ys = Vec::new();
         for (t, tok) in toks.iter().enumerate() {
             dev.put(cx, tok, p0 + t as u32)?;
@@ -567,14 +616,17 @@ mod gate {
         norm: bool,
         start: bool,
     ) -> Result<bool, GateError> {
-        let w = weights(Regime::Exact, seed);
+        let s = &MAIN;
+        let w = weights(s, Regime::Exact, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
-        let st = init(&mut r, start);
-        let toks: Vec<TokenIn> = (0..TOKENS).map(|_| token(Regime::Exact, &mut r)).collect();
+        let st = init(s, &mut r, start);
+        let toks: Vec<TokenIn> = (0..TOKENS)
+            .map(|_| token(s, Regime::Exact, &mut r))
+            .collect();
         let p0 = if start { 0 } else { P0 };
-        let ring0 = ring_of(&st, p0, start);
-        let want = host_run(&w, &st, &toks, norm)?;
-        let mut dev = Dev::new(cx, &w)?;
+        let ring0 = ring_of(s, &st, p0, start);
+        let want = host_run(s, &w, &st, &toks, norm)?;
+        let mut dev = Dev::new(cx, s, &w)?;
         let got = dev_run(cx, &mut dev, &ring0, &st.scan, &toks, p0, norm)?;
         let mut ok = true;
         let mut ys = Vec::new();
@@ -590,16 +642,16 @@ mod gate {
         if ns != 0 {
             println!("exact {label}: state first difference {first:?}");
         }
-        let ring_want = ring_after(&ring0, &toks, p0);
+        let ring_want = ring_after(s, &ring0, &toks, p0);
         let ring_ok = bits_equal(&got.ring, &ring_want);
         // The host's final window is the last three inputs: the ring's
         // slots of the last three positions.
         let mut window_ok = true;
         for age in 0..3 {
             let slot = (p0 as usize + TOKENS - 3 + age) % RING_ROWS;
-            for c in 0..CONV_DIM {
+            for c in 0..s.conv_dim {
                 window_ok &=
-                    got.ring[slot * CONV_DIM + c].to_bits() == want.conv[age + 3 * c].to_bits();
+                    got.ring[slot * s.conv_dim + c].to_bits() == want.conv[age + 3 * c].to_bits();
             }
         }
         ok &= ns == 0 && ring_ok && window_ok && clean(cx, label)?;
@@ -640,18 +692,23 @@ mod gate {
 
     /// The host token stage by stage, the composition `step_token` is, with
     /// the intermediates kept. Its `y` must be `step_token`'s.
-    fn trace_run(w: &Weights, init: &Init, toks: &[TokenIn]) -> Result<Vec<Trace>, GateError> {
-        let g = geom()?;
+    fn trace_run(
+        s: &Shape,
+        w: &Weights,
+        init: &Init,
+        toks: &[TokenIn],
+    ) -> Result<Vec<Trace>, GateError> {
+        let g = geom(s)?;
         let (mut conv, mut scan) = (init.conv.clone(), init.scan.clone());
         let mut out = Vec::new();
         for t in toks {
-            let mut conv_y = vec![0.0; CONV_DIM];
+            let mut conv_y = vec![0.0; s.conv_dim];
             mamba2::conv_tokens(4, &mut conv, &t.xbc, &w.conv_w, &w.conv_b, &mut conv_y)?;
-            let ones = vec![1.0; CONV_DIM];
-            let mut mixed = vec![0.0; CONV_DIM];
+            let ones = vec![1.0; s.conv_dim];
+            let mut mixed = vec![0.0; s.conv_dim];
             qdot::swiglu(&conv_y, &ones, &mut mixed);
-            let x = mixed[..INNER].to_vec();
-            let bc = mixed[INNER..].to_vec();
+            let x = mixed[..s.inner].to_vec();
+            let bc = mixed[s.inner..].to_vec();
             let dt: Vec<f32> = t.dt.iter().zip(&w.dt_bias).map(|(a, b)| a + b).collect();
             let sigma: Vec<f32> = dt
                 .iter()
@@ -659,24 +716,24 @@ mod gate {
                 .collect();
             let decay: Vec<f32> = sigma.iter().zip(&w.a).map(|(s, a)| (s * a).exp()).collect();
             let s_before = scan.clone();
-            let mut y = vec![0.0; INNER];
+            let mut y = vec![0.0; s.inner];
             mamba2::scan_token(
                 &g,
                 &mut scan,
                 &x,
                 &dt,
                 &w.a,
-                &bc[..GROUPS * STATE],
-                &bc[GROUPS * STATE..],
+                &bc[..s.groups * STATE],
+                &bc[s.groups * STATE..],
                 &mut y,
             )?;
-            mamba2::skip_d(&mut y, &x, &w.d, HEAD_DIM)?;
+            mamba2::skip_d(&mut y, &x, &w.d, s.hd)?;
             let y1 = y.clone();
             mamba2::gate_z(&mut y, &t.z)?;
             let y2 = y.clone();
-            let mut sz = vec![0.0; INNER];
-            qdot::swiglu(&t.z, &vec![1.0; INNER], &mut sz);
-            mamba2::grouped_rms(&mut y, &w.norm, GROUPS, EPS)?;
+            let mut sz = vec![0.0; s.inner];
+            qdot::swiglu(&t.z, &vec![1.0; s.inner], &mut sz);
+            mamba2::grouped_rms(&mut y, &w.norm, s.groups, EPS)?;
             out.push(Trace {
                 s_before,
                 s_after: scan.clone(),
@@ -696,12 +753,12 @@ mod gate {
 
     /// The bands (module doc): per token the bound on each output value, and
     /// the bound on each final state element.
-    fn bands(w: &Weights, trace: &[Trace]) -> (Vec<Vec<f64>>, Vec<f64>) {
-        let mut e = vec![0.0f64; INNER * STATE];
+    fn bands(s: &Shape, w: &Weights, trace: &[Trace]) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let mut e = vec![0.0f64; s.inner * STATE];
         let mut per_token = Vec::new();
         for tr in trace {
-            let mut dy = vec![0.0f64; INNER];
-            for h in 0..HEADS {
+            let mut dy = vec![0.0f64; s.inner];
+            for h in 0..s.heads {
                 let dec = f64::from(tr.decay[h]);
                 let sig = f64::from(tr.sigma[h]);
                 let k_sigma = if tr.dt[h] <= 20.0 {
@@ -712,11 +769,11 @@ mod gate {
                 let arg = (sig * f64::from(w.a[h])).abs() * (k_sigma + EPS_F);
                 let k_a = (1.0 + (DEV_EXP + HOST_EXP) * EPS_F) * arg.exp() - 1.0;
                 let step = k_a + k_sigma + 4.0 * EPS_F;
-                let g = h / PER;
+                let g = h / s.per;
                 let bn = &tr.bc[g * STATE..(g + 1) * STATE];
-                let cn = &tr.bc[GROUPS * STATE + g * STATE..GROUPS * STATE + (g + 1) * STATE];
-                for ch in 0..HEAD_DIM {
-                    let i = h * HEAD_DIM + ch;
+                let cn = &tr.bc[s.groups * STATE + g * STATE..s.groups * STATE + (g + 1) * STATE];
+                for ch in 0..s.hd {
+                    let i = h * s.hd + ch;
                     let xs = f64::from(tr.x[i]).abs() * sig;
                     let (mut sum_ce, mut s_abs) = (0.0f64, 0.0f64);
                     for n in 0..STATE {
@@ -730,25 +787,25 @@ mod gate {
                     dy[i] = sum_ce * (1.0 + 9.0 * EPS_F) + 9.0 * EPS_F * s_abs;
                 }
             }
-            let mut band = vec![0.0f64; INNER];
-            let mut d2 = vec![0.0f64; INNER];
-            for i in 0..INNER {
+            let mut band = vec![0.0f64; s.inner];
+            let mut d2 = vec![0.0f64; s.inner];
+            for i in 0..s.inner {
                 let d1 = dy[i] + EPS_F * f64::from(tr.y1[i]).abs();
                 d2[i] = f64::from(tr.sz[i]).abs() * d1 + EPS_F * f64::from(tr.y2[i]).abs();
             }
-            for g in 0..GROUPS {
-                let r = g * WIDTH..(g + 1) * WIDTH;
+            for g in 0..s.groups {
+                let r = g * s.width..(g + 1) * s.width;
                 let m = r
                     .clone()
                     .map(|i| f64::from(tr.y2[i] * tr.y2[i]))
                     .sum::<f64>()
-                    / WIDTH as f64;
+                    / s.width as f64;
                 let cross = r
                     .clone()
                     .map(|i| f64::from(tr.y2[i]).abs() * d2[i])
                     .sum::<f64>()
-                    / WIDTH as f64;
-                let sq = r.clone().map(|i| d2[i] * d2[i]).sum::<f64>() / WIDTH as f64;
+                    / s.width as f64;
+                let sq = r.clone().map(|i| d2[i] * d2[i]).sum::<f64>() / s.width as f64;
                 let dm = 2.0 * cross + sq + 2.0 * EPS_F * m;
                 let scale = 1.0 / (m + f64::from(EPS)).sqrt();
                 let ds = dm / (2.0 * (m + f64::from(EPS))) + 3.0 * EPS_F;
@@ -786,22 +843,25 @@ mod gate {
     }
 
     fn check_band(cx: &Ctx) -> Result<bool, GateError> {
+        let s = &MAIN;
         let seed = 0x0ba2_d001;
-        let w = weights(Regime::Band, seed);
+        let w = weights(s, Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
-        let st = init(&mut r, false);
-        let toks: Vec<TokenIn> = (0..TOKENS).map(|_| token(Regime::Band, &mut r)).collect();
-        let ring0 = ring_of(&st, P0, false);
-        let want = host_run(&w, &st, &toks, true)?;
-        let trace = trace_run(&w, &st, &toks)?;
+        let st = init(s, &mut r, false);
+        let toks: Vec<TokenIn> = (0..TOKENS)
+            .map(|_| token(s, Regime::Band, &mut r))
+            .collect();
+        let ring0 = ring_of(s, &st, P0, false);
+        let want = host_run(s, &w, &st, &toks, true)?;
+        let trace = trace_run(s, &w, &st, &toks)?;
         // The referee's composition is step_token.
         let mut referee = true;
         for (tr, y) in trace.iter().zip(&want.y) {
             referee &= bits_equal(&tr.out, y);
         }
         referee &= bits_equal(&trace[TOKENS - 1].s_after, &want.scan);
-        let (y_bands, s_band) = bands(&w, &trace);
-        let mut dev = Dev::new(cx, &w)?;
+        let (y_bands, s_band) = bands(s, &w, &trace);
+        let mut dev = Dev::new(cx, s, &w)?;
         let got = dev_run(cx, &mut dev, &ring0, &st.scan, &toks, P0, true)?;
         let mut ok = referee;
         let mut y_bad = 0;
@@ -812,7 +872,7 @@ mod gate {
             y_worst = y_worst.max(worst);
         }
         let (s_bad, s_worst) = within(&got.scan, &want.scan, &s_band);
-        let ring_ok = bits_equal(&got.ring, &ring_after(&ring0, &toks, P0));
+        let ring_ok = bits_equal(&got.ring, &ring_after(s, &ring0, &toks, P0));
         ok &= y_bad == 0 && s_bad == 0 && ring_ok && clean(cx, "band")?;
         println!(
             "band: referee is step_token {referee}; y outside the band {y_bad} (largest |Δ|/band \
@@ -826,11 +886,12 @@ mod gate {
     // ---------------------------------------------------------------- clause 3
 
     fn check_refuse(cx: &Ctx) -> Result<bool, GateError> {
-        let w = weights(Regime::Band, 0x0ef0_0001);
-        let mut dev = Dev::new(cx, &w)?;
+        let s = &MAIN;
+        let w = weights(s, Regime::Band, 0x0ef0_0001);
+        let mut dev = Dev::new(cx, s, &w)?;
         let mut r = Rng(0x0ef0_0002);
-        let st = init(&mut r, false);
-        dev.load(cx, &ring_of(&st, P0, false), &st.scan)?;
+        let st = init(s, &mut r, false);
+        dev.load(cx, &ring_of(s, &st, P0, false), &st.scan)?;
         let mut ok = true;
         let cases = [
             (
@@ -881,11 +942,11 @@ mod gate {
         // A buffer shorter than the shape's: the state of half the channels.
         let short = {
             let mut half =
-                DeviceBuffer::from_host(cx.gpu.stream(), &vec![0.0f32; INNER * STATE / 2])?;
+                DeviceBuffer::from_host(cx.gpu.stream(), &vec![0.0f32; s.inner * STATE / 2])?;
             // The short buffer is the state for this call only.
             std::mem::swap(&mut dev.state, &mut half);
             let e = dev
-                .step(cx, cx.gpu.stream(), device_shape()?, true, EPS)
+                .step(cx, cx.gpu.stream(), device_shape(s)?, true, EPS)
                 .err();
             std::mem::swap(&mut dev.state, &mut half);
             matches!(&e, Some(GpuError::Shape { detail, .. }) if detail.contains("state.len()"))
@@ -895,7 +956,7 @@ mod gate {
         // +∞ epsilon would make the norm scale 0. Refused before a launch.
         let eps_inf = {
             let e = dev
-                .step(cx, cx.gpu.stream(), device_shape()?, true, f32::INFINITY)
+                .step(cx, cx.gpu.stream(), device_shape(s)?, true, f32::INFINITY)
                 .err();
             let text = e.as_ref().map(ToString::to_string).unwrap_or_default();
             matches!(e, Some(GpuError::Shape { .. })) && text.contains("norm eps must be finite")
@@ -904,23 +965,24 @@ mod gate {
         ok &= eps_inf;
         // The pass's own refusals: (label, u, x0, y rows, the text).
         let st = cx.gpu.stream();
-        let rows = DeviceBuffer::from_host(st, &vec![0.0f32; 2 * LD])?;
+        let rows = DeviceBuffer::from_host(st, &vec![0.0f32; 2 * s.ld])?;
         let mut ys = [
-            DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); INNER])?,
-            DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); 3 * INNER])?,
+            DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); s.inner])?,
+            DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); 3 * s.inner])?,
         ];
         let pass_cases = [
-            ("pass u 0", 0, X0, 1, "u 0 is refused"),
-            ("pass xbc window", 2, LD - CONV_DIM + 1, 1, "the xbc window"),
-            ("pass rows short", 3, X0, 1, "rows.len()"),
-            ("pass y short", 2, X0, 0, "y.len()"),
+            ("pass u 0", 0, s.x0, 1, "u 0 is refused"),
+            ("pass xbc window", 2, s.ld - s.conv_dim + 1, 1, "the xbc window"),
+            ("pass rows short", 3, s.x0, 1, "rows.len()"),
+            ("pass y short", 2, s.x0, 0, "y.len()"),
         ];
         for (label, u, x0, yi, want) in pass_cases {
             let pass = Pass {
-                shape: device_shape()?,
+                shape: device_shape(s)?,
                 u,
-                ld: LD,
+                ld: s.ld,
                 x0,
+                dt0: s.dt0,
                 rows: &rows,
             };
             let e = dev.steps(cx, st, pass, &mut ys[yi], true).err();
@@ -941,19 +1003,20 @@ mod gate {
             ),
         ] {
             let pass = Pass {
-                shape: device_shape()?,
+                shape: device_shape(s)?,
                 u,
-                ld: LD,
-                x0: X0,
+                ld: s.ld,
+                x0: s.x0,
+                dt0: s.dt0,
                 rows: &rows,
             };
             let scratch = if u == 257 {
                 &mut dev.pass_scratch
             } else {
                 let other = Geom {
-                    d_inner: (HEADS + GROUPS) * HEAD_DIM,
-                    n_heads: HEADS + GROUPS,
-                    n_groups: GROUPS,
+                    d_inner: (s.heads + s.groups) * s.hd,
+                    n_heads: s.heads + s.groups,
+                    n_groups: s.groups,
                     d_state: STATE,
                     d_conv: 4,
                 };
@@ -970,10 +1033,10 @@ mod gate {
                         shape: pass.shape,
                         u,
                         rows: pass.rows,
-                        ld: LD,
-                        z0: Z0,
-                        x0: X0,
-                        dt0: DT0,
+                        ld: s.ld,
+                        z0: 0,
+                        x0: s.x0,
+                        dt0: s.dt0,
                         dt_bias: &dev.dt_bias,
                         a: &dev.a,
                         d: &dev.d,
@@ -1014,18 +1077,19 @@ mod gate {
     // ---------------------------------------------------------------- clause 4
 
     /// Every value of the norm group `g` of `y`.
-    fn group(y: &[f32], g: usize) -> &[f32] {
-        &y[g * WIDTH..(g + 1) * WIDTH]
+    fn group<'a>(s: &Shape, y: &'a [f32], g: usize) -> &'a [f32] {
+        &y[g * s.width..(g + 1) * s.width]
     }
 
     fn check_fault(cx: &Ctx) -> Result<bool, GateError> {
+        let s = &MAIN;
         let seed = 0x0fa1_7001;
-        let w = weights(Regime::Band, seed);
+        let w = weights(s, Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
-        let st = init(&mut r, false);
-        let tok = token(Regime::Band, &mut r);
-        let ring0 = ring_of(&st, P0, false);
-        let mut dev = Dev::new(cx, &w)?;
+        let st = init(s, &mut r, false);
+        let tok = token(s, Regime::Band, &mut r);
+        let ring0 = ring_of(s, &st, P0, false);
+        let mut dev = Dev::new(cx, s, &w)?;
         let run = |dev: &mut Dev, t: &TokenIn| {
             dev_run(cx, dev, &ring0, &st.scan, std::slice::from_ref(t), P0, true)
         };
@@ -1039,15 +1103,15 @@ mod gate {
 
         // (label, token, the norm group the plant sits in)
         let mut plants: Vec<(&str, TokenIn, usize)> = Vec::new();
-        let c_x = 37 * HEAD_DIM + 5;
+        let c_x = 37 * s.hd + 5;
         let mut t = tok.clone();
         t.xbc[c_x] = f32::NAN;
-        plants.push(("NaN in x", t, c_x / WIDTH));
+        plants.push(("NaN in x", t, c_x / s.width));
         let mut t = tok.clone();
-        t.xbc[INNER + 3 * STATE + 7] = f32::NAN;
+        t.xbc[s.inner + 3 * STATE + 7] = f32::NAN;
         plants.push(("NaN in B", t, 3));
         let mut t = tok.clone();
-        t.z[5 * WIDTH + 1] = f32::INFINITY;
+        t.z[5 * s.width + 1] = f32::INFINITY;
         plants.push(("inf in z", t, 5));
         // −∞ dt: softplus would be 0 and the scan would stay finite.
         let mut t = tok.clone();
@@ -1055,10 +1119,10 @@ mod gate {
         plants.push(("-inf dt", t, 0));
         let check = |label: &str, y: &[f32], g: usize| -> Result<bool, GateError> {
             let f = cx.gpu.take_fault()?;
-            let all_bad = group(y, g).iter().all(|v| !v.is_finite());
-            let others = (0..GROUPS)
+            let all_bad = group(s, y, g).iter().all(|v| !v.is_finite());
+            let others = (0..s.groups)
                 .filter(|&o| o != g)
-                .all(|o| bits_equal(group(y, o), group(&base.y[0], o)));
+                .all(|o| bits_equal(group(s, y, o), group(s, &base.y[0], o)));
             let pass = f == want && all_bad && others;
             let shown = f.map_or("none".to_owned(), |f| f.to_string());
             println!(
@@ -1090,9 +1154,9 @@ mod gate {
             let f = cx.gpu.take_fault()?;
             let first_finite = got.y[0].iter().all(|v| v.is_finite());
             let plant = if norm {
-                group(&got.y[1], 0)
+                group(s, &got.y[1], 0)
             } else {
-                &got.y[1][..HEAD_DIM]
+                &got.y[1][..s.hd]
             };
             let plant_bad = plant.iter().all(|v| !v.is_finite());
             let pass = f == want && first_finite && plant_bad;
@@ -1110,17 +1174,20 @@ mod gate {
     // ---------------------------------------------------------------- clause 5
 
     fn check_replay(cx: &Ctx) -> Result<bool, GateError> {
+        let s = &MAIN;
         let seed = 0x0e91_a701;
-        let w = weights(Regime::Band, seed);
+        let w = weights(s, Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
-        let st = init(&mut r, false);
-        let toks: Vec<TokenIn> = (0..3).map(|_| token(Regime::Band, &mut r)).collect();
-        let ring0 = ring_of(&st, P0, false);
-        let mut dev = Dev::new(cx, &w)?;
+        let st = init(s, &mut r, false);
+        let toks: Vec<TokenIn> = (0..3)
+            .map(|_| token(s, Regime::Band, &mut r))
+            .collect();
+        let ring0 = ring_of(s, &st, P0, false);
+        let mut dev = Dev::new(cx, s, &w)?;
         let eager = dev_run(cx, &mut dev, &ring0, &st.scan, &toks, P0, true)?;
 
         dev.load(cx, &ring0, &st.scan)?;
-        let shape = device_shape()?;
+        let shape = device_shape(s)?;
         let graph = {
             let dev = &mut dev;
             cx.gpu.capture(|s| dev.step(cx, s, shape, true, EPS))?
@@ -1158,13 +1225,13 @@ mod gate {
     // ---------------------------------------------------------------- clause 6
 
     /// The pass's input rows of `toks`: each token's `z`, `xbc` and `dt` at
-    /// their columns of a row of `LD`.
-    fn rows_of(toks: &[TokenIn]) -> Vec<f32> {
-        let mut rows = vec![0.0; toks.len() * LD];
-        for (row, tok) in rows.chunks_mut(LD).zip(toks) {
-            row[Z0..Z0 + INNER].copy_from_slice(&tok.z);
-            row[X0..X0 + CONV_DIM].copy_from_slice(&tok.xbc);
-            row[DT0..DT0 + HEADS].copy_from_slice(&tok.dt);
+    /// their columns of a row of `s.ld`.
+    fn rows_of(s: &Shape, toks: &[TokenIn]) -> Vec<f32> {
+        let mut rows = vec![0.0; toks.len() * s.ld];
+        for (row, tok) in rows.chunks_mut(s.ld).zip(toks) {
+            row[..s.inner].copy_from_slice(&tok.z);
+            row[s.x0..s.x0 + s.conv_dim].copy_from_slice(&tok.xbc);
+            row[s.dt0..s.dt0 + s.heads].copy_from_slice(&tok.dt);
         }
         rows
     }
@@ -1184,13 +1251,17 @@ mod gate {
         let st = cx.gpu.stream();
         dev.load(cx, ring, scan)?;
         dev.pos.copy_from_host(st, &[p])?;
-        let rows = DeviceBuffer::from_host(st, &rows_of(toks))?;
-        let mut y = DeviceBuffer::from_host(st, &vec![f32::from_bits(POISON); toks.len() * INNER])?;
+        let rows = DeviceBuffer::from_host(st, &rows_of(&dev.s, toks))?;
+        let mut y = DeviceBuffer::from_host(
+            st,
+            &vec![f32::from_bits(POISON); toks.len() * dev.s.inner],
+        )?;
         let pass = Pass {
-            shape: device_shape()?,
+            shape: device_shape(&dev.s)?,
             u: toks.len(),
-            ld: LD,
-            x0: X0,
+            ld: dev.s.ld,
+            x0: dev.s.x0,
+            dt0: dev.s.dt0,
             rows: &rows,
         };
         // The graph lives until the reads below are done.
@@ -1204,8 +1275,9 @@ mod gate {
             None
         };
         let run = DevRun {
-            y: y.to_host_vec(st)?
-                .chunks(INNER)
+            y: y
+                .to_host_vec(st)?
+                .chunks(dev.s.inner)
                 .map(<[f32]>::to_vec)
                 .collect(),
             ring: dev.ring.to_host_vec(st)?,
@@ -1266,16 +1338,21 @@ mod gate {
     /// `u` tokens from a ring and state that `WARM` steps left at `P0 +
     /// WARM`.
     fn steps_warm(cx: &Ctx, u: usize, norm: bool, seed: u64) -> Result<bool, GateError> {
-        let w = weights(Regime::Band, seed);
+        let s = &MAIN;
+        let w = weights(s, Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
-        let st = init(&mut r, false);
-        let warm: Vec<TokenIn> = (0..WARM).map(|_| token(Regime::Band, &mut r)).collect();
-        let toks: Vec<TokenIn> = (0..u).map(|_| token(Regime::Band, &mut r)).collect();
-        let mut dev = Dev::new(cx, &w)?;
+        let st = init(s, &mut r, false);
+        let warm: Vec<TokenIn> = (0..WARM)
+            .map(|_| token(s, Regime::Band, &mut r))
+            .collect();
+        let toks: Vec<TokenIn> = (0..u)
+            .map(|_| token(s, Regime::Band, &mut r))
+            .collect();
+        let mut dev = Dev::new(cx, s, &w)?;
         let warmed = dev_run(
             cx,
             &mut dev,
-            &ring_of(&st, P0, false),
+            &ring_of(s, &st, P0, false),
             &st.scan,
             &warm,
             P0,
@@ -1295,13 +1372,16 @@ mod gate {
 
     /// Five tokens from position 0 over a ring of garbage.
     fn steps_start(cx: &Ctx) -> Result<bool, GateError> {
+        let s = &MAIN;
         let seed = 0x05e9_5701;
-        let w = weights(Regime::Band, seed);
+        let w = weights(s, Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
-        let st = init(&mut r, true);
-        let toks: Vec<TokenIn> = (0..5).map(|_| token(Regime::Band, &mut r)).collect();
-        let mut dev = Dev::new(cx, &w)?;
-        let ring0 = ring_of(&st, 0, true);
+        let st = init(s, &mut r, true);
+        let toks: Vec<TokenIn> = (0..5)
+            .map(|_| token(s, Regime::Band, &mut r))
+            .collect();
+        let mut dev = Dev::new(cx, s, &w)?;
+        let ring0 = ring_of(s, &st, 0, true);
         steps_case(
             cx,
             "sequence start u=5 p=0",
@@ -1325,8 +1405,8 @@ mod gate {
         Small,
     }
 
-    fn role(h: usize) -> Role {
-        match h % PER {
+    fn role(s: &Shape, h: usize) -> Role {
+        match h % s.per {
             0 => Role::Big,
             1 => Role::Offset,
             _ => Role::Small,
@@ -1366,6 +1446,7 @@ mod gate {
     /// h)` (the Small chunks absorbed), which narrows to `L`; any order that
     /// adds the Small chunks first lands above the tie, at `L + 128`.
     fn steps_tie(cx: &Ctx) -> Result<bool, GateError> {
+        let s = &MAIN;
         let seed = 0x05e9_7e01;
         let scale_of = |m: f32| 1.0 / (m + EPS).sqrt();
         let j = (0u32..1 << 16)
@@ -1384,7 +1465,7 @@ mod gate {
             rest -= k * k;
         }
         let z_head = |role: Role| -> Vec<f32> {
-            let mut z = vec![0.0f32; HEAD_DIM];
+            let mut z = vec![0.0f32; s.hd];
             match role {
                 Role::Big => z[..4].copy_from_slice(&[192.0, 128.0, 64.0, 64.0]),
                 Role::Offset => {
@@ -1397,44 +1478,46 @@ mod gate {
             // A channel left at z = 0 carries y = 0.
             z
         };
-        let z: Vec<f32> = (0..HEADS).flat_map(|h| z_head(role(h))).collect();
-        let d: Vec<f32> = (0..HEADS)
-            .map(|h| match role(h) {
+        let z: Vec<f32> = (0..s.heads)
+            .flat_map(|h| z_head(role(s, h)))
+            .collect();
+        let d: Vec<f32> = (0..s.heads)
+            .map(|h| match role(s, h) {
                 Role::Big => 128.0,
                 Role::Offset => 1.0 / 32.0,
                 Role::Small => 1.0 / 524_288.0,
             })
             .collect();
-        let mut conv_w = vec![0.0f32; 4 * CONV_DIM];
-        for c in 0..INNER {
-            conv_w[4 * c + 3] = 1.0;
+        let mut conv_w = vec![0.0f32; s.g.d_conv * s.conv_dim];
+        for c in 0..s.inner {
+            conv_w[s.g.d_conv * c + 3] = 1.0;
         }
         let mut r = Rng(seed ^ 0x9e37_79b9);
         let w = Weights {
-            dt_bias: (0..HEADS).map(|_| r.uni(22.0, 26.0)).collect(),
-            a: (0..HEADS)
+            dt_bias: (0..s.heads).map(|_| r.uni(22.0, 26.0)).collect(),
+            a: (0..s.heads)
                 .map(|h| if h % 2 == 0 { 0.0 } else { -8.0 })
                 .collect(),
             d,
             conv_w,
-            conv_b: vec![0.0; CONV_DIM],
-            norm: (0..INNER).map(|_| r.uni(0.5, 1.5)).collect(),
+            conv_b: vec![0.0; s.conv_dim],
+            norm: (0..s.inner).map(|_| r.uni(0.5, 1.5)).collect(),
         };
         let toks: Vec<TokenIn> = (0..5)
             .map(|_| {
-                let mut xbc: Vec<f32> = (0..CONV_DIM).map(|_| r.uni(-2.0, 2.0)).collect();
-                xbc[..INNER].iter_mut().for_each(|v| *v = 32.0);
+                let mut xbc: Vec<f32> = (0..s.conv_dim).map(|_| r.uni(-2.0, 2.0)).collect();
+                xbc[..s.inner].iter_mut().for_each(|v| *v = 32.0);
                 TokenIn {
                     xbc,
-                    dt: (0..HEADS).map(|_| r.uni(-1.0, 1.0)).collect(),
+                    dt: (0..s.heads).map(|_| r.uni(-1.0, 1.0)).collect(),
                     z: z.clone(),
                 }
             })
             .collect();
         // The design on the host: y of group 0, its two orders' means.
         let x = silu(32.0);
-        let y0: Vec<f32> = (0..WIDTH)
-            .map(|i| silu(z[i]) * (x * w.d[i / HEAD_DIM]))
+        let y0: Vec<f32> = (0..s.width)
+            .map(|i| silu(z[i]) * (x * w.d[i / s.hd]))
             .collect();
         let (m_step, s_step) = norm_scale(&y0, false);
         let (m_rev, s_rev) = norm_scale(&y0, true);
@@ -1444,9 +1527,9 @@ mod gate {
              scale {s_step:e}, the reverse mean {m_rev} scale {s_rev:e}; the orders' scales \
              differ {design}"
         );
-        let st = init(&mut r, false);
-        let mut dev = Dev::new(cx, &w)?;
-        let ring0 = ring_of(&st, P0, false);
+        let st = init(s, &mut r, false);
+        let mut dev = Dev::new(cx, s, &w)?;
+        let ring0 = ring_of(s, &st, P0, false);
         let ok = steps_case(
             cx,
             "norm tie u=5",
@@ -1461,13 +1544,16 @@ mod gate {
     /// The pass captured (three nodes with the gain) and replayed once
     /// equals the eager pass bit for bit.
     fn steps_capture(cx: &Ctx) -> Result<bool, GateError> {
+        let s = &MAIN;
         let seed = 0x05e9_ca01;
-        let w = weights(Regime::Band, seed);
+        let w = weights(s, Regime::Band, seed);
         let mut r = Rng(seed ^ 0x9e37_79b9);
-        let st = init(&mut r, false);
-        let toks: Vec<TokenIn> = (0..37).map(|_| token(Regime::Band, &mut r)).collect();
-        let mut dev = Dev::new(cx, &w)?;
-        let ring0 = ring_of(&st, P0, false);
+        let st = init(s, &mut r, false);
+        let toks: Vec<TokenIn> = (0..37)
+            .map(|_| token(s, Regime::Band, &mut r))
+            .collect();
+        let mut dev = Dev::new(cx, s, &w)?;
+        let ring0 = ring_of(s, &st, P0, false);
         let start = (&ring0[..], &st.scan[..], P0);
         let (eager, _) = pass_run(cx, &mut dev, start, &toks, true, false)?;
         let (replay, nodes) = pass_run(cx, &mut dev, start, &toks, true, true)?;
@@ -1483,6 +1569,45 @@ mod gate {
         Ok(ok)
     }
 
+    /// The pass at [`HD72`] (module doc, clause 6): a head whose channels
+    /// are not a multiple of the staging block, so the staged `z` and `x`
+    /// hold masked channels the staging zeroes. A warmed pass of
+    /// `2·STAGE_T + 3` rows — past two stage boundaries — against as many
+    /// steps from the same warmed start.
+    fn steps_hd72(cx: &Ctx) -> Result<bool, GateError> {
+        let s = &HD72;
+        let seed = 0x05e9_7201;
+        let w = weights(s, Regime::Band, seed);
+        let mut r = Rng(seed ^ 0x9e37_79b9);
+        let st = init(s, &mut r, false);
+        let warm: Vec<TokenIn> = (0..WARM)
+            .map(|_| token(s, Regime::Band, &mut r))
+            .collect();
+        let u = 2 * STAGE_T + 3;
+        let toks: Vec<TokenIn> = (0..u)
+            .map(|_| token(s, Regime::Band, &mut r))
+            .collect();
+        let mut dev = Dev::new(cx, s, &w)?;
+        let warmed = dev_run(
+            cx,
+            &mut dev,
+            &ring_of(s, &st, P0, false),
+            &st.scan,
+            &warm,
+            P0,
+            true,
+        )?;
+        let p = P0 + WARM as u32;
+        steps_case(
+            cx,
+            &format!("hd72 u={u} p={p}"),
+            &mut dev,
+            (&warmed.ring, &warmed.scan, p),
+            &toks,
+            true,
+        )
+    }
+
     fn check_steps(cx: &Ctx) -> Result<bool, GateError> {
         let mut ok = true;
         for norm in [true, false] {
@@ -1494,6 +1619,7 @@ mod gate {
         ok &= steps_start(cx)?;
         ok &= steps_tie(cx)?;
         ok &= steps_capture(cx)?;
+        ok &= steps_hd72(cx)?;
         println!("steps_are_steps: {}", verdict(ok));
         Ok(ok)
     }
@@ -1532,7 +1658,8 @@ mod gate {
              bits; a captured graph is one node and replays three tokens bit for bit as eager; \
              the prompt pass over 1 to 256 rows equals as many steps bit for bit (every y row, \
              the state, the ring; with and without the gain, from the sequence start, on a norm \
-             tie, captured); no local depot"
+             tie, captured; at head_dim 72, a head whose channels are not a multiple of the \
+             staging block, past two stage boundaries); no local depot"
         );
         Ok(())
     }
