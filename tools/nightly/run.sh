@@ -60,7 +60,12 @@ unset BLOOMERY_BOX_ENV BLOOMERY_DATA
 # shellcheck source=tools/nightly/units.sh
 source "$(dirname "${BASH_SOURCE[0]}")/units.sh"
 # shellcheck source=tools/gate-bound.sh
-source "$(dirname "${BASH_SOURCE[0]}")/../gate-bound.sh" || exit 70
+# Installed, gate-bound.sh sits beside this file (tools/nightly/install.sh); in a checkout, one level up.
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/gate-bound.sh" ]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/gate-bound.sh" || exit 70
+else
+  source "$(dirname "${BASH_SOURCE[0]}")/../gate-bound.sh" || exit 70
+fi
 
 # Atomic one-line file write, so mail.sh never reads half a file.
 put() { printf '%s\n' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"; }
