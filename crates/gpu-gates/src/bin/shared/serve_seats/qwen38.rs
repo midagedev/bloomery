@@ -1167,7 +1167,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 
 /// What `--mmproj` opened for the plans: the encoder file held against the text model's embedding
 /// width, its vocabulary's image ids, the file's IMROPE sections and its PLE image token
-/// ([`vision_seat::TextFacts::of_qwen35moe`], `token` the vocabulary's id to text), and seated for
+/// (`token` the vocabulary's id to text), and seated for
 /// a plan on `place` ([`vision_seat::open_seat`]); the file is `--mmproj`'s, else, where the seat
 /// `takes` the `--hf` repo's projector, that one ([`vision_seat::Flags::encoder`]), and `None`
 /// without either. A build without the `vision` feature, whose tower is not built, refuses
@@ -1188,7 +1188,13 @@ fn vision_of(
         file.as_deref(),
         place,
         &[vision::arch::qwen3vl::PROJECTOR_TYPE],
-        &vision_seat::TextFacts::of_qwen35moe(hp),
+        &vision_seat::TextFacts {
+            n_embd: hp.n_embd,
+            imrope: Some(hp.rope_sections),
+            ple: vision_seat::PleImage::of(
+                hp.exp.as_ref().and_then(|exp| exp.ple).map(|ple| ple.image),
+            ),
+        },
         token,
     )
 }

@@ -189,7 +189,7 @@ use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::qwen_seat::Family;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
-use bloomery_gpu_gates::vision_seat::{self, Opened, TextFacts};
+use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::Levers;
 use gguf::Split;
@@ -1096,7 +1096,14 @@ fn vision_of(
     if a.vision.wanted()?.is_some() {
         return Err(vision_seat::NO_TOWER.into());
     }
-    let facts = TextFacts::of_qwen35moe(&Hparams::read(split)?);
+    // Every attention layer rotates by IMROPE over the file's sections; a PLE site names the
+    // image id its hash reads.
+    let hp = Hparams::read(split)?;
+    let facts = TextFacts {
+        n_embd: hp.n_embd,
+        imrope: Some(hp.rope_sections),
+        ple: PleImage::of(hp.exp.as_ref().and_then(|exp| exp.ple).map(|ple| ple.image)),
+    };
     let file = a.vision.encoder(true)?;
     if let Some(enc) = file.as_deref()
         && is_minicpm_projector(enc)
