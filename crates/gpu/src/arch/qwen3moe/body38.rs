@@ -151,9 +151,7 @@ use crate::host::tier::TierOpen;
 use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
-use crate::media::{
-    ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_outside_images, rope_table,
-};
+use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::{
     ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRows, Slots,
 };
@@ -172,7 +170,7 @@ use gguf::quant::dequant_row;
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
 use model::placement::{Device, Plan};
-use runtime::seqstate::{Kept, Price, Take, Why};
+use runtime::seqstate::{Kept, Price, Take};
 use runtime::swaprule::KeptRows;
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -2341,23 +2339,8 @@ impl Body38 {
     /// [`Body38::commit`] takes.
     #[must_use]
     pub fn kept(&self, n: u32, pos: u32) -> Kept {
-        if let Some(p) = &self.pending
-            && n > p.pos0
-        {
-            let at = n.min(self.held);
-            let why = if at == self.held {
-                Why::Current
-            } else {
-                Why::Rule
-            };
-            return Kept {
-                asked: n,
-                held: self.held,
-                at,
-                why,
-            };
-        }
-        kept_outside_images(self.seq_rope.as_ref(), n, |n| {
+        let verify = self.pending.as_ref().map(|p| p.pos0);
+        kept_rule(self.seq_rope.as_ref(), verify, self.held, n, |n| {
             if self.held == pos {
                 self.ckpt.kept(n, pos)
             } else {
