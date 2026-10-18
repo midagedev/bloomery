@@ -12,6 +12,8 @@
 
 use std::ops::Range;
 
+use runtime::stores::window_rows;
+
 use crate::GpuError;
 
 const WHAT: &str = "dspark::ring";
@@ -63,12 +65,12 @@ impl Positions {
         }
     }
 
-    /// Context rows a block after the committed position reads:
-    /// `min(committed, window)`.
+    /// Context rows a block after the committed position reads: the ring's
+    /// rows once `committed` positions are in it ([`window_rows`]).
     #[must_use]
     pub fn ring_rows(&self) -> usize {
         let committed = self.committed as usize;
-        self.window.map_or(committed, |w| committed.min(w))
+        self.window.map_or(committed, |w| window_rows(w, committed))
     }
 
     /// The first position whose row a block after the committed position
@@ -229,5 +231,27 @@ mod tests {
             whole.check_block(9).is_err(),
             "the whole context keeps the gap"
         );
+    }
+
+    /// The rows a block reads are the last `window` committed positions, or
+    /// all of them with no window: counted out as the length of that range
+    /// over every window and committed count around the fill point. A ring
+    /// one row long or short at the fill point turns this red.
+    #[test]
+    fn ring_rows_are_the_last_window_positions() {
+        for window in [None, Some(1), Some(2), Some(7), Some(8), Some(9), Some(64)] {
+            for committed in 0u32..=80 {
+                let mut p = Positions::new(window).expect("a window of 1 or more");
+                if committed > 0 {
+                    p.append(0, committed as usize).expect("rows from 0");
+                }
+                let kept = window.map_or(0, |w| (committed as usize).saturating_sub(w));
+                assert_eq!(
+                    p.ring_rows(),
+                    committed as usize - kept,
+                    "window {window:?}, {committed} committed"
+                );
+            }
+        }
     }
 }

@@ -1,9 +1,11 @@
 //! The size rules of the stores a layer keeps beside its weights, one owner
 //! for the plan that counts their bytes and the card body that allocates
-//! them: the recurrent conv ring's rows, the PLE conv ring's rows, the pooled
-//! plane's rows, and each layer's bytes by kind. Pure arithmetic over the
-//! file's widths; a card constant that must equal one of these holds itself
-//! to it with a `const` assertion where it is defined.
+//! them: the recurrent conv ring's rows, the PLE conv ring's rows, a window
+//! layer's key ring ([`window_rows`], [`ring_rows`], [`Rows`],
+//! [`cut_depth_keeps`]), the pooled plane's rows, and each layer's bytes by
+//! kind. Pure arithmetic over the file's widths; a card constant that must
+//! equal one of these holds itself to it with a `const` assertion where it is
+//! defined.
 
 /// Bytes of an f16 value.
 pub const F16_BYTES: u64 = 2;
@@ -40,6 +42,72 @@ pub const fn conv_ring_rows(conv: usize) -> usize {
 pub const fn ple_ring_rows(taps: usize, dilation: usize) -> usize {
     assert!(taps >= 1, "ple_ring_rows: a conv of at least one tap");
     (taps - 1) * dilation + PASS_ROWS
+}
+
+/// The positions one prompt pass appends before it reads, which a window ring
+/// keeps room for beside its window. It equals `model::moe::UNION_MAX_COLS`,
+/// the batch every card prompt walk takes; the plan that sizes a ring from
+/// it holds the two equal with a `const` assertion.
+pub const PROMPT_BATCH: u64 = 512;
+
+/// The rows a window ring's length is padded up to a multiple of.
+pub const RING_ALIGN: u64 = 256;
+
+/// Rows a ring of `window` rows holds once `positions` positions have been
+/// appended: every position until it fills, `window` after. The rows of a
+/// ring that keeps exactly its window (the DSpark context ring) and the
+/// clamp of [`ring_rows`]. Any row-count width: the callers hold theirs as
+/// `usize` and `u64`.
+#[must_use]
+pub fn window_rows<T: Ord>(window: T, positions: T) -> T {
+    positions.min(window)
+}
+
+/// Rows a window layer's ring holds at `ctx_max`: the window plus one prompt
+/// batch ([`PROMPT_BATCH`]), padded up to a multiple of [`RING_ALIGN`], and
+/// never past `ctx_max`. A pass of up to a batch appends its rows before it
+/// reads, so the window's oldest row survives it.
+#[must_use]
+pub fn ring_rows(window: u64, ctx_max: u64) -> u64 {
+    let span = window.saturating_add(PROMPT_BATCH - 1);
+    window_rows(span.div_ceil(RING_ALIGN) * RING_ALIGN, ctx_max)
+}
+
+/// How many rows a window layer holds. A full layer holds `ctx_max` under
+/// either choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rows {
+    /// The engine's default: [`ring_rows`] rows.
+    Ring,
+    /// Every position. The default-context search and the oracle sequence
+    /// use this term.
+    Plane,
+}
+
+impl Rows {
+    /// Rows held under this choice. No window means a full layer.
+    #[must_use]
+    pub fn count(self, window: Option<u64>, ctx_max: u64) -> u64 {
+        match (self, window) {
+            (Self::Ring, Some(w)) => ring_rows(w, ctx_max),
+            _ => ctx_max,
+        }
+    }
+}
+
+/// Whether a cut of `depth` positions (`pos - n`) still leaves the keys the
+/// pass at `n` reads. A plane (`rows == ctx`) does. A ring holds
+/// `[pos - rows, pos)` and that pass appends row `n` and reads
+/// `[n - window + 1, n]`, so the cut is free when
+/// `depth <= rows - window + 1`. The ring is at least the window plus one
+/// prompt batch minus one, which is why a cut inside that slack writes
+/// nothing.
+#[must_use]
+pub fn cut_depth_keeps(depth: u64, rows: u64, ctx: u64, window: u64) -> bool {
+    if rows == ctx {
+        return true;
+    }
+    depth <= rows.saturating_sub(window).saturating_add(1)
 }
 
 /// Rows of a pooled key plane over `ctx` positions in pools of `pool`, the
@@ -154,8 +222,9 @@ pub const fn selecting_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        DELTA_LANES, conv_ring_rows, delta_lane_bytes, dense_kv_bytes, kv_row_bytes, mamba2_bytes,
-        mamba2_lens, ple_ring_bytes, ple_ring_rows, pooled_rows, recurrent_bytes, selecting_bytes,
+        DELTA_LANES, PROMPT_BATCH, RING_ALIGN, Rows, conv_ring_rows, cut_depth_keeps,
+        delta_lane_bytes, dense_kv_bytes, kv_row_bytes, mamba2_bytes, mamba2_lens, ple_ring_bytes,
+        ple_ring_rows, pooled_rows, recurrent_bytes, ring_rows, selecting_bytes, window_rows,
     };
 
     /// A Mamba-2 layer of 32 channels at state 128 with a 4-tap conv over
@@ -229,6 +298,121 @@ mod tests {
     #[should_panic(expected = "ple_ring_rows: a conv of at least one tap")]
     fn a_ple_conv_of_no_tap_is_refused() {
         let _ = ple_ring_rows(std::hint::black_box(0), 3);
+    }
+
+    /// A window ring holds the positions appended so far until it fills, then
+    /// its window: counted out as the length of the last `window` positions of
+    /// `0..positions`, over a sweep that crosses the fill point.
+    #[test]
+    fn window_rows_are_the_last_window_positions() {
+        for window in 0u64..=20 {
+            for positions in 0u64..=40 {
+                let kept = (positions.saturating_sub(window)..positions).count() as u64;
+                assert_eq!(
+                    window_rows(window, positions),
+                    kept,
+                    "window {window}, {positions} positions"
+                );
+            }
+        }
+    }
+
+    /// The padded ring is the least multiple of 256 that holds the window and
+    /// a prompt batch's other 511 rows, clamped to the context. The oracle
+    /// counts the multiples out with the numbers written in, so a change to
+    /// either constant or an off-by-one in the span turns this red; the
+    /// anchors are the published MiMo trunk's window (128 positions in 768
+    /// rows) and the edge where 513 fills 1,024 rows exactly.
+    #[test]
+    fn ring_rows_pad_the_window_and_a_batch() {
+        assert_eq!((PROMPT_BATCH, RING_ALIGN), (512, 256));
+        let least = |window: u64| (0u64..).map(|k| k * 256).find(|&r| r >= window + 511);
+        let contexts = [
+            0u64,
+            1,
+            255,
+            256,
+            257,
+            511,
+            512,
+            639,
+            640,
+            767,
+            768,
+            769,
+            1_023,
+            1_024,
+            1_025,
+            1_279,
+            1_280,
+            1_281,
+            4_160,
+            1 << 20,
+            u64::MAX,
+        ];
+        for window in 1u64..=1_300 {
+            let span = least(window).expect("a multiple of 256 reaches any window");
+            for ctx in contexts {
+                assert_eq!(
+                    ring_rows(window, ctx),
+                    ctx.min(span),
+                    "window {window}, context {ctx}"
+                );
+            }
+        }
+        assert_eq!(ring_rows(128, 4_160), 768);
+        assert_eq!(ring_rows(513, 1 << 20), 1_024);
+        assert_eq!(ring_rows(514, 1 << 20), 1_280);
+        assert_eq!(ring_rows(8, 9), 9, "a ring never passes the context");
+    }
+
+    /// The row choice: a window layer on the ring holds [`ring_rows`], on the
+    /// plane every position; a full layer holds the context either way.
+    #[test]
+    fn rows_choose_ring_or_plane() {
+        assert_eq!(Rows::Ring.count(Some(128), 4_160), 768);
+        assert_eq!(Rows::Plane.count(Some(128), 4_160), 4_160);
+        assert_eq!(Rows::Ring.count(None, 4_160), 4_160);
+        assert_eq!(Rows::Plane.count(None, 4_160), 4_160);
+    }
+
+    /// A ring cut keeps `n` through `rows - window + 1` positions and refuses
+    /// the next one. A plane (`rows == ctx`) keeps a cut of any depth. At a
+    /// context the ring still fills, the two are the same term.
+    #[test]
+    fn a_ring_cut_past_the_slack_is_refused() {
+        let window = 128;
+        let ctx = 4_160;
+        let rows = ring_rows(window, ctx);
+        assert_eq!(
+            rows,
+            (window + PROMPT_BATCH - 1).div_ceil(RING_ALIGN) * RING_ALIGN
+        );
+        assert!(rows < ctx, "the ring is shorter than this context");
+        let slack = rows - window + 1;
+        assert!(cut_depth_keeps(slack, rows, ctx, window));
+        assert!(!cut_depth_keeps(slack + 1, rows, ctx, window));
+        assert!(cut_depth_keeps(slack + 1, ctx, ctx, window));
+        let filled = ring_rows(8, 9);
+        assert_eq!(filled, 9);
+        assert!(cut_depth_keeps(1_000, filled, 9, 8));
+    }
+
+    /// A feed of 1,600 leaves the written end at 1,600. The cut to 960 is
+    /// depth 640, inside the slack. The end stays 1,600, so the cut to 950
+    /// is depth 650 and is refused. Depth 10, measured from 960, is the
+    /// overwritten-key reading.
+    #[test]
+    fn a_second_cut_is_measured_from_the_written_end() {
+        let window = 128;
+        let ctx = 4_160;
+        let rows = ring_rows(window, ctx);
+        let written = 1_600;
+        let first = 960;
+        let second = 950;
+        assert!(cut_depth_keeps(written - first, rows, ctx, window));
+        assert!(!cut_depth_keeps(written - second, rows, ctx, window));
+        assert!(cut_depth_keeps(first - second, rows, ctx, window));
     }
 
     /// The pooled plane counts a partial last pool whole and nothing past it.
