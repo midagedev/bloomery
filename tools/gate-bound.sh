@@ -256,13 +256,27 @@ __bounded_bg_end() {
 }
 
 bounded_bg_stop() {
-  local bg_rc=0 bg_status=0
+  local bg_rc=0 bg_status=0 bg_i bg_state
   [ -n "$BG_LIVE" ] || return 0
   trap '' TERM INT HUP
   if [ -n "$BG_PID" ]; then
     lease_stop "$BG_PID" || bg_rc=$?
-    # A stop that failed leaves a process no signal ends (uninterruptible I/O): waiting on it has no bound.
-    if [ "$bg_rc" = 0 ]; then wait "$BG_PID" 2> /dev/null || bg_status=$?; fi
+    if [ "$bg_rc" = 0 ]; then
+      wait "$BG_PID" 2> /dev/null || bg_status=$?
+    else
+      # A failed stop can leave a process no signal ends (uninterruptible I/O): its status is collected only once it
+      # has ended, within 2 s, and one still alive then is left without a wait.
+      for ((bg_i = 0; bg_i < 20; bg_i++)); do
+        bg_state=$(ps -o stat= -p "$BG_PID" 2> /dev/null) || bg_state=''
+        case $bg_state in
+          '' | Z*)
+            wait "$BG_PID" 2> /dev/null || bg_status=$?
+            break
+            ;;
+        esac
+        sleep 0.1 9>&-
+      done
+    fi
   fi
   __bounded_bg_end "$bg_status" "$bg_rc"
   return "$bg_rc"
@@ -297,7 +311,7 @@ bounded_bg_wait() {
 #   timeout-fork       fork-exit is the monitor that exits before it reached its command: monitor-exit; the real
 #                      timeout's own case is lease.sh's `fork` form and stack-watch.sh's fork-exit rows
 #   cleanup-status     cleanup-fail: a stop that fails is the runner's status (70), a signal's included
-#   cleanup-alive      a stop that fails with the monitor alive returns 70 at once, with no wait on it
+#   cleanup-alive      a stop that fails with the monitor alive returns 70 within 2 s, with no wait on it
 #   output-setup       fifo-fail: a stdin or output file that cannot be opened ends the command, not the runner, and
 #                      starts nothing that outlives the call
 #   output-filter      lease.sh --self-test, bounded-filter-open-term-*: the filter's guard stands before it starts
@@ -497,7 +511,7 @@ EOF
     check "$tag-left" "${left:-none}" none
     reap "$t/$tag.pid"
   done
-  # cleanup-alive: a stop that fails with the monitor still alive returns 70 at once and never waits on it.
+  # cleanup-alive: a stop that fails with the monitor still alive returns 70 within 2 s and never waits on it.
   cat > "$t/alive-runner" << 'EOF'
 source "$GB"
 lease_stop() { return 70; }
@@ -511,7 +525,7 @@ EOF
   RC=0
   env GB="$self" HELD="$t/held" PIDF="$t/cleanup-alive.pid" HELD_MODE=zero LEASE_STOP_GRACE=4 CANCEL_TIMEOUT_FORWARD=1 \
     PATH="$t/bin:$PATH" bash "$t/alive-runner" > "$t/cleanup-alive.out" 2>&1 || RC=$?
-  check cleanup-alive-rc "$RC|$(grep -cE '^stop rc=70 took=[0-2]$' "$t/cleanup-alive.out")" '0|1'
+  check cleanup-alive-rc "$RC|$(grep -cE '^stop rc=70 took=[0-4]$' "$t/cleanup-alive.out")" '0|1'
   reap "$t/cleanup-alive.pid"
   # output-setup: a stdin or output file that cannot be opened ends the command, not the runner, and starts nothing.
   RC=0
