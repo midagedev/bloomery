@@ -3,7 +3,7 @@
 # it reports was a sequence (mac-check check, mac-check combos, mac-check lint, fmt-check, the eight
 # tools/check-*.sh one after another) whose walls measured 2026-10-07 (load ~5, this Mac): the cargo
 # steps 0.6-40 s each but the eight scripts ~240 s serial, `check-recipes` alone 172 s. Two lanes cut
-# it to the longer lane: the scripts lane (fmt-check and the eleven checks, one job each) and the cargo
+# it to the longer lane: the scripts lane (fmt-check and every tools/check-*.sh, one job each) and the cargo
 # lane (lint, then the scoped combos, serial — they share the tree's target directory, and two cargos
 # on one directory serialize on its lock anyway).
 #
@@ -40,7 +40,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 LEDGER=$HOME/.cache/bloomery/mac-static-ledger.tsv
-SCRIPTS=(arch comments defaults levers loads ptx-names records recipes rustflags unsafe waits)
+SCRIPTS=(arch comments defaults emb2 levers loads ptx-names records recipes rustflags unsafe waits)
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -64,7 +64,7 @@ step_inner() {
 }
 
 # run_steps D CARGO_CMDV…: both lanes. The scripts lane: one background job a script (fmt-check and
-# the eleven tools/check-*.sh). The cargo lane: one background job running lint then the combos step
+# every tools/check-*.sh). The cargo lane: one background job running lint then the combos step
 # serially (one target directory, one lock). Every job's pid is captured at start, written to
 # D/pids, and waited on; no polling.
 run_steps() {
@@ -84,7 +84,7 @@ run_steps() {
   wait "${pids[@]}" || true # a killed wrapper is the summary's `no rc` case, not this script's end
 }
 
-# summarize D BASE: one line a step in a fixed order (fmt-check, lint, combos, the eleven checks),
+# summarize D BASE: one line a step in a fixed order (fmt-check, lint, combos, every check),
 # then the verdict. Prints `mac-static: <step> rc <n> in <s> s [— the step's own closing line]`; the
 # cargo steps' closing line comes from their log. Ends 0, or prints one line naming every red step
 # and ends with the first red rc.
@@ -138,6 +138,15 @@ self_test() {
   out=$(combos_argv 'HEAD~3..HEAD' "$HOME/x.tsv" | tr '\n' ' ')
   [ "$out" = "combos --base HEAD~3..HEAD --ledger $HOME/x.tsv " ] || fail "a base and a ledger derive '$out'"
 
+  # every tools/check-*.sh is a step: a check script SCRIPTS leaves out never runs in the round loop
+  local f name unlisted=''
+  for f in "$HERE"/tools/check-*.sh; do
+    name=${f##*/check-}
+    name=${name%.sh}
+    case " ${SCRIPTS[*]} " in *" $name "*) ;; *) unlisted="$unlisted $name" ;; esac
+  done
+  [ -z "$unlisted" ] || fail "tools/check-*.sh that SCRIPTS does not list:$unlisted"
+
   # the lanes: two steps that each mark their start and wait for the other's mark (they ran at once;
   # on serial lanes the first waits out its bound, 120 s, and ends rc 9), whatever the load delays
   # either start by; rcs and walls land, a failing step is red and named, a step with no rc file is
@@ -151,12 +160,17 @@ self_test() {
   ( step_inner meet-b "$d" bash -c "$meet" _ "$d" b a ) & pids[$np]=$!; np=$((np + 1))
   ( step_inner false-step "$d" bash -c 'exit 3' ) & pids[$np]=$!; np=$((np + 1))
   ( step_inner true-step "$d" bash -c 'echo ok' ) & pids[$np]=$!; np=$((np + 1))
+  # a step's wall is its own seconds, not the lane's: a function step moves this subshell's clock by 60 s (no sleep), and the
+  # next step in the same lane reads under 30 s, whatever the load; a wall taken from the lane's start would read 60 or more
+  clock_step() { SECONDS=$((SECONDS + 60)); }
+  ( step_inner clock-step "$d" clock_step; step_inner after-clock "$d" true ) & pids[$np]=$!; np=$((np + 1))
   wait "${pids[@]}" || true
   [ "$(cat "$d/meet-a.rc")" = 0 ] && [ "$(cat "$d/meet-b.rc")" = 0 ] \
     || fail "two steps that wait for each other did not meet within 120 s: the lanes ran one after another"
   [ "$(cat "$d/true-step.rc")" = 0 ] || fail "a true step's rc is not 0"
   [ "$(cat "$d/false-step.rc")" = 3 ] || fail "an exit-3 step's rc is not 3"
-  [ "$(cat "$d/true-step.wall")" -lt 3 ] || fail "a true step's wall is not its own"
+  [ "$(cat "$d/clock-step.wall")" -ge 60 ] || fail "a step that moved the clock by 60 s reads a wall of $(cat "$d/clock-step.wall") s"
+  [ "$(cat "$d/after-clock.wall")" -lt 30 ] || fail "a step after a slow one in its lane reads a wall of $(cat "$d/after-clock.wall") s, not its own"
   [ "$(cat "$d/true-step.log")" = ok ] || fail "a step's output did not land in its log"
   echo 0 > "$d/fmt-check.rc"; echo 1 > "$d/fmt-check.wall"; : > "$d/fmt-check.log"
   echo 3 > "$d/lint.rc"; echo 1 > "$d/lint.wall"; printf '%s\n' 'mac-check: lint rc 3' > "$d/lint.log"
