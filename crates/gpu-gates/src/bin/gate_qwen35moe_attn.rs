@@ -482,20 +482,26 @@ mod gate {
 
     fn rope_check(gpu: &Gpu, kern: &RopeNeoxKernels) -> Result<bool, GateError> {
         let (inp, pos) = rope_inputs()?;
-        rope_gate::check::<HEAD, ROT, { 2 * HEAD }>(
+        let shape = RopeShape {
+            head: HEAD,
+            n_head: N_HEAD,
+            n_kv: N_KV,
+            ctx: ROPE_CTX,
+            eps: EPS,
+        };
+        let exact =
+            rope_gate::check::<HEAD, ROT, { 2 * HEAD }>(gpu, &inp, &pos, shape, LAYER, |p, f| {
+                rope_run(kern, gpu.stream(), &inp, p, f)
+            })?;
+        let overflow = rope_gate::check_overflow::<HEAD, ROT, { 2 * HEAD }>(
             gpu,
             &inp,
             &pos,
-            RopeShape {
-                head: HEAD,
-                n_head: N_HEAD,
-                n_kv: N_KV,
-                ctx: ROPE_CTX,
-                eps: EPS,
-            },
+            shape,
             LAYER,
-            |p, f| rope_run(kern, gpu.stream(), &inp, p, f),
-        )
+            |i, p, f| rope_run(kern, gpu.stream(), i, p, f),
+        )?;
+        Ok(exact && overflow)
     }
 
     /// The q8_0 append's launch (`head_norm_neox_append_256_q8`) read back:

@@ -62,7 +62,12 @@
 //! it raises `FaultSite::KvQuant` and is stored with a NaN scale and zero
 //! codes — every value it dequantizes to is NaN, never a plausible number —
 //! with every other block and both whole K planes the clean run's bits, and
-//! the word clean after a clean rerun.
+//! the word clean after a clean rerun. And a head of values whose squares
+//! overflow the f32 products (query head 0 and key head 0 of token 0 at
+//! `1e20`), through both entries: the named `FaultSite::F32Product` (with
+//! `KvQuant` beside it on the q8_0 entry), that head's values NaN and its key
+//! row stored as NaN, never the zeros an infinite sum scales it to, every
+//! other head and plane word the clean run's bits.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -552,6 +557,7 @@ mod gate {
         );
         failed += u32::from(!graph_ok);
         failed += u32::from(!kv_quant_clause(gpu, k, sets, hp, table)?);
+        failed += u32::from(!overflow_clause(gpu, k, sets, hp, table)?);
 
         let pass = failed == 0;
         println!(
@@ -625,6 +631,106 @@ mod gate {
             want.map_or(String::new(), |f| f.to_string()),
             before.is_none(),
             after_clean.is_none(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// A head of values whose squares overflow the f32 products (module doc):
+    /// query head 0 and key head 0 of token 0 at `1e20`, through both
+    /// entries, whether the refusal held.
+    fn overflow_clause(
+        gpu: &Gpu,
+        k: &RopeNeoxKernels,
+        sets: &[SetLayers],
+        hp: &Hparams,
+        table: &RopeTable,
+    ) -> Result<bool, GateError> {
+        const BIG: f32 = 1.0e20;
+        let stream = gpu.stream();
+        let SetLayers { label, layers, .. } = &sets[0];
+        let (gq, gk) = (&layers[0].gq, &layers[0].gk);
+        let mut rows = layers[0].rows.clone();
+        let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
+        let mut grown = Vec::new();
+        let tab = table_rows(table, &mut grown, ctx)?;
+        let unl = gpu.unlabelled_sink();
+        let layer = 13usize;
+        let sink = gpu.layer_sink(layer)?;
+        let before = gpu.fault()?;
+        let clean = run_neox(k, stream, unl, &rows, gq, gk, tab, hp.rms_eps, ctx)?;
+        let clean8 = run_neox_q8(k, stream, unl, &rows, gq, gk, tab, hp.rms_eps, ctx)?;
+        rows.q[..HEAD].fill(BIG);
+        rows.k[..HEAD].fill(BIG);
+        let f16 = run_neox(k, stream, sink, &rows, gq, gk, tab, hp.rms_eps, ctx)?;
+        let word = gpu.take_fault()?;
+        let q8 = run_neox_q8(k, stream, sink, &rows, gq, gk, tab, hp.rms_eps, ctx)?;
+        let word8 = gpu.take_fault()?;
+        let layer = u32::try_from(layer)?;
+        let want = Some(Fault::at(layer, FaultSite::F32Product));
+        let want8 = Some(Fault::of_sites(
+            layer,
+            &[FaultSite::F32Product, FaultSite::KvQuant],
+        ));
+        let f16_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
+        let row = rows.pos[0] as usize;
+        let heads = |q: &[f32], kk: &[f32]| {
+            q[..HEAD].iter().all(|v| v.is_nan()) && kk[..HEAD].iter().all(|v| v.is_nan())
+        };
+        let rest = |q: &[f32], kk: &[f32], cq: &[f32], ck: &[f32]| {
+            bits_equal(&q[HEAD..], &cq[HEAD..]) && bits_equal(&kk[HEAD..], &ck[HEAD..])
+        };
+        // The f16 planes: key head 0's row at token 0's position is NaN, every
+        // other word and the whole V plane the clean run's.
+        let mut ck_want = clean.cache_k.clone();
+        ck_want[row * HEAD..(row + 1) * HEAD]
+            .copy_from_slice(&f16.cache_k[row * HEAD..(row + 1) * HEAD]);
+        let f16_planes = f16.cache_k[row * HEAD..(row + 1) * HEAD]
+            .iter()
+            .all(|&h| f16_nan(h))
+            && f16.cache_k == ck_want
+            && f16.cache_v == clean.cache_v;
+        // The q8_0 planes: every block of that key row has a NaN scale and
+        // zero codes, every other word the clean run's, the V planes whole.
+        let (cw, dw) = (HEAD / 4, HEAD / 32);
+        let mut kq_want = clean8.kq.clone();
+        kq_want[row * cw..(row + 1) * cw].fill(0);
+        let mut kd_want = clean8.kd.clone();
+        kd_want[row * dw..(row + 1) * dw].fill(f32_to_f16_bits(f32::NAN));
+        let q8_planes =
+            q8.kq == kq_want && q8.kd == kd_want && q8.vq == clean8.vq && q8.vd == clean8.vd;
+        let again = run_neox(
+            k,
+            stream,
+            unl,
+            &layers[0].rows,
+            gq,
+            gk,
+            tab,
+            hp.rms_eps,
+            ctx,
+        )?;
+        let clean_again = bits_equal(&again.q, &clean.q) && gpu.fault()?.is_none();
+        let pass = before.is_none()
+            && word == want
+            && word8 == want8
+            && heads(&f16.q, &f16.k)
+            && heads(&q8.q, &q8.k)
+            && rest(&f16.q, &f16.k, &clean.q, &clean.k)
+            && rest(&q8.q, &q8.k, &clean8.q, &clean8.k)
+            && f16_planes
+            && q8_planes
+            && clean_again;
+        println!(
+            "overflow set={label} layer=0 token 0 query head 0 and key head 0 at {BIG:e}: f16 word \"{}\" \
+             (want \"{}\"), q8_0 word \"{}\" (want \"{}\"), the heads NaN and every other head the \
+             clean run's, the f16 key row NaN and every other plane word the clean run's {f16_planes}, \
+             the q8_0 key row refused with NaN scales and zero codes and every other plane word the \
+             clean run's {q8_planes}, clean rerun and word clean {clean_again} {}",
+            word.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+            want.map_or(String::new(), |f| f.to_string()),
+            word8.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+            want8.map_or(String::new(), |f| f.to_string()),
             verdict(pass)
         );
         Ok(pass)

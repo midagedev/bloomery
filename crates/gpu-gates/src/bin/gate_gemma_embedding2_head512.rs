@@ -154,20 +154,25 @@ mod gate {
         heads: (usize, usize),
     ) -> Result<bool, GateError> {
         let (inp, pos) = rope_inputs(heads)?;
-        rope_gate::check::<HEAD, HEAD, HEAD>(
+        let shape = RopeShape {
+            head: HEAD,
+            n_head: heads.0,
+            n_kv: heads.1,
+            ctx: ROPE_CTX,
+            eps: EPS,
+        };
+        let exact = rope_gate::check::<HEAD, HEAD, HEAD>(gpu, &inp, &pos, shape, LAYER, |p, f| {
+            rope_run(kern, gpu.stream(), &inp, p, f, heads)
+        })?;
+        let overflow = rope_gate::check_overflow::<HEAD, HEAD, HEAD>(
             gpu,
             &inp,
             &pos,
-            RopeShape {
-                head: HEAD,
-                n_head: heads.0,
-                n_kv: heads.1,
-                ctx: ROPE_CTX,
-                eps: EPS,
-            },
+            shape,
             LAYER,
-            |p, f| rope_run(kern, gpu.stream(), &inp, p, f, heads),
-        )
+            |i, p, f| rope_run(kern, gpu.stream(), i, p, f, heads),
+        )?;
+        Ok(exact && overflow)
     }
 
     // --------------------------------------------------------- prefill

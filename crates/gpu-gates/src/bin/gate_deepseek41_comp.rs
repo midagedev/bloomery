@@ -12,6 +12,10 @@
 //! - an `idx` site: `ds41_index_key` — norm, tail rope, Hadamard, the f16
 //!   key row.
 //!
+//! Each `comp` and `idx` site also launches its kernel on values all at 1e20,
+//! whose norm has no f32 scale: the launch raises the product fault alone, the
+//! completed rows are NaN and every other cache row keeps the sentinel.
+//!
 //! The kernels read the step's integers from the buffer `CompGeom::pack`
 //! fills from the host plan (`model::arch::deepseek41::plan`) at the set's
 //! position — the captured graph's form — not from the set's integer rows
@@ -53,7 +57,7 @@ mod gate {
     use std::collections::HashMap;
     use std::f32::consts::FRAC_1_SQRT_2;
 
-    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
     use bloomery_gpu_deepseek41::compress::{
         self, CompGeom, CompressKernels, PoolArgs, RowsArgs, StepInts,
     };
@@ -826,6 +830,7 @@ mod gate {
                     ring_score: &mut ring_score,
                     pre: &mut pre,
                     cache: &mut cache,
+                    fault: cx.gpu.unlabelled_sink(),
                 },
             )?;
             stream.synchronize()?;
@@ -846,6 +851,7 @@ mod gate {
                     n_dims: cx.meta.n_dims,
                     pre: &mut pre,
                     cache: &mut cache,
+                    fault: cx.gpu.unlabelled_sink(),
                 },
             )?;
             stream.synchronize()?;
@@ -1215,7 +1221,8 @@ mod gate {
                 comma_list(&kept)
             ));
         }
-        let pass = rule_ok && sim_ok && dump_ok;
+        let overflow_ok = comp_overflow(cx, src, label, &words, &gain, &cs)?;
+        let pass = rule_ok && sim_ok && dump_ok && overflow_ok;
         println!(
             "comp set={label} layer={layer} stream={tag} ratio={r} groups={groups}/{} rows={} pos={} \
              write_rows={} reads={} pre_ours_rel={pre_l1:.3e} ({}) pre_same={pre_same}/{} \
@@ -1235,6 +1242,70 @@ mod gate {
             },
             groups * width,
             notes.join(" "),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The compressor with every projection value (and every ring slot) at
+    /// 1e20: the pooled row's sum of squares is f32 inf, so the norm has no
+    /// scale. The launch must raise the product fault alone, every completed
+    /// group's row must be NaN in both planes, and every other cache row must
+    /// keep the sentinel.
+    fn comp_overflow(
+        cx: &Cx,
+        src: &Source,
+        label: &str,
+        words: &[u32],
+        gain: &[f32],
+        cs: &[f32],
+    ) -> Result<bool, GateError> {
+        const BIG: f32 = 1.0e20;
+        let (geom, st) = (src.geom, src.st);
+        let (r, width) = (geom.ratio, compress::WIDTH);
+        let groups = st.groups();
+        if groups == 0 {
+            return Ok(true);
+        }
+        let big = vec![BIG; geom.tokens * width];
+        let zeros = vec![0.0f32; geom.tokens * width];
+        let ring_kv = vec![BIG; r * width];
+        let ring_score = vec![0.0f32; r * width];
+        let inp = CompIn {
+            words,
+            kv: &big,
+            score: if r > 1 { &zeros[..] } else { &[] },
+            gain,
+            cs,
+            ring: (&ring_kv, &ring_score),
+        };
+        let before = cx.gpu.take_fault()?;
+        let out = comp_run(cx, geom, &inp)?;
+        let got = cx.gpu.take_fault()?;
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+        let f16_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
+        let pre_nan = out.pre[..groups * width].iter().all(|v| v.is_nan());
+        let written: Vec<usize> = st.state_write.iter().map(|&w| w as usize).collect();
+        let rows_nan = written.iter().all(|&w| {
+            out.cache[w * width..(w + 1) * width]
+                .iter()
+                .all(|&h| f16_nan(h))
+        });
+        let others = (0..geom.rows)
+            .filter(|row| !written.contains(row))
+            .all(|row| {
+                out.cache[row * width..(row + 1) * width]
+                    .iter()
+                    .all(|&h| h == SENTINEL)
+            });
+        let pass = before.is_none() && got == want && pre_nan && rows_nan && others;
+        println!(
+            "comp overflow set={label} layer={} stream={} ratio={r} groups={groups} every value = {BIG:e}: \
+             word={} want=f32_product pre_nan={pre_nan} cache_rows_nan={rows_nan} \
+             other_rows_sentinel={others} {}",
+            src.layer,
+            src.tag,
+            got.map_or("none".to_string(), |f| f.to_string()),
             verdict(pass)
         );
         Ok(pass)
@@ -1316,6 +1387,7 @@ mod gate {
                 eps: cx.meta.eps,
                 n_dims: cx.meta.n_dims,
                 cache: &mut cache,
+                fault: cx.gpu.unlabelled_sink(),
             },
         )?;
         stream.synchronize()?;
@@ -1447,7 +1519,8 @@ mod gate {
         }
         let dump_ok = k_over == 0 && on_equal;
 
-        let pass = rule_ok && sim_ok && dump_ok;
+        let overflow_ok = idx_overflow(cx, src, label, &words, &gain, &cs)?;
+        let pass = rule_ok && sim_ok && dump_ok && overflow_ok;
         println!(
             "idx set={label} layer={layer} stream={tag} groups={groups}/{} rows={} pos={} write_rows={} \
              bit_exact_host={rows_exact} unwritten_rows_sentinel={untouched} bit_identical_rerun={rerun} \
@@ -1459,6 +1532,51 @@ mod gate {
             geom.rows,
             comma_list(&st.write_pos),
             comma_list(&written),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The index key with every projected value at 1e20: the norm's sum of
+    /// squares is f32 inf, so there is no scale. The launch must raise the
+    /// product fault alone, every completed group's key row must be NaN, and
+    /// every other cache row must keep the sentinel.
+    fn idx_overflow(
+        cx: &Cx,
+        src: &Source,
+        label: &str,
+        words: &[u32],
+        gain: &[f32],
+        cs: &[f32],
+    ) -> Result<bool, GateError> {
+        const BIG: f32 = 1.0e20;
+        let (geom, st) = (src.geom, src.st);
+        let w = index_key::WIDTH;
+        let groups = st.groups();
+        let k = vec![BIG; geom.max_groups * w];
+        let before = cx.gpu.take_fault()?;
+        let got_rows = idx_run(cx, geom, words, &k, gain, cs)?;
+        let got = cx.gpu.take_fault()?;
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+        let f16_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
+        let written: Vec<usize> = st.state_write.iter().map(|&x| x as usize).collect();
+        let rows_nan = written
+            .iter()
+            .all(|&r| got_rows[r * w..(r + 1) * w].iter().all(|&h| f16_nan(h)));
+        let others = (0..geom.rows)
+            .filter(|row| !written.contains(row))
+            .all(|row| {
+                got_rows[row * w..(row + 1) * w]
+                    .iter()
+                    .all(|&h| h == SENTINEL)
+            });
+        let pass = before.is_none() && got == want && rows_nan && others;
+        println!(
+            "idx overflow set={label} layer={} stream={} groups={groups} every key value = {BIG:e}: \
+             word={} want=f32_product key_rows_nan={rows_nan} other_rows_sentinel={others} {}",
+            src.layer,
+            src.tag,
+            got.map_or("none".to_string(), |f| f.to_string()),
             verdict(pass)
         );
         Ok(pass)

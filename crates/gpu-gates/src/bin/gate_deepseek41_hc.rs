@@ -45,7 +45,11 @@
 //!
 //! The fault word (`bloomery_gpu::fault`): the chain's in-register q8_1 of
 //! the streams has no form for a non-finite value, so a planted NaN in one
-//! stream value must raise `FaultSite::HcQuant` rather than round to code 0.
+//! stream value must raise `FaultSite::HcQuant` rather than round to code 0,
+//! with `FaultSite::F32Product` beside it (the NaN's squares leave the token
+//! no scale). A finite stream value of `1e20`, whose square passes f32, raises
+//! `F32Product` alone, through `ds41_hc_pre` and `ds41_hc_pre_groups`, and the
+//! token's outputs are NaN, never zeros.
 //!
 //! The Q8_0 chain (`hc_pre_q8_0`, GLM-5.3-Flash's `hc_{attn,ffn}_fn`), model
 //! free: seeded Q8_0 weights and streams (`hc_host::q8_0_fixture`, `lcg`) at
@@ -55,8 +59,9 @@
 //! (`hc_host::hc_chain_q8_0`), the HC_PRE rows to `hc_pre_f32` over them, a
 //! rerun into NaN-filled outputs to the first launch (the tickets are back
 //! at 0), a captured graph of one node replayed twice to the eager launch,
-//! and a NaN in one token's streams makes all 48 of that token's outputs NaN
-//! and leaves every other token's bits. It runs before the model file opens,
+//! and a NaN, or a finite `1e20`, in one token's streams makes all 48 of that
+//! token's outputs NaN, raises `F32Product`, and leaves every other token's
+//! bits. It runs before the model file opens,
 //! so it judges on a box without the V4.1 sets too.
 //!
 //! Holes, named: the T = 1 paths (ik's own HC_POST branch for one token)
@@ -76,8 +81,8 @@ mod gate {
         DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_group_count,
     };
     use bloomery_gpu_deepseek41::hc::{
-        HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs, HcPreScratch,
-        HcQ8Params, HcQ8PreArgs,
+        HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs,
+        HcPreScratch, HcQ8Params, HcQ8PreArgs,
     };
     use bloomery_gpu_gates::act_rule;
     use bloomery_gpu_gates::hc_host::{
@@ -1182,8 +1187,16 @@ mod gate {
     }
 
     /// A site's streams with one value NaN through `ds41_hc_pre`: the word,
-    /// read back and cleared, must name [`FaultSite::HcQuant`] with no
-    /// layer; the clean streams before it must leave the word clean.
+    /// read back and cleared, must name [`FaultSite::HcQuant`] and
+    /// [`FaultSite::F32Product`] with no layer; the clean streams before it
+    /// must leave the word clean.
+    ///
+    /// PIN(2026-10-18): the mask gained `F32Product`. The planted NaN squares
+    /// to a NaN sum, so the token's scale has no norm behind it
+    /// (`elem::rms_scale_checked`), as it does for `rms_norm`'s NaN row; the
+    /// quantizer's `HcQuant` is still the smallest code, so the word is the
+    /// old one with a second bit in the mask. The clause fails on a kernel
+    /// that scales by `1/sqrt` unchecked, whose mask is `HcQuant` alone.
     fn check_nan(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> {
         let (hp, stream) = (cx.hp, cx.gpu.stream());
         let t = tokens_of(man)?;
@@ -1213,10 +1226,10 @@ mod gate {
         cx.hck
             .enqueue_pre(stream, &a, &mut cx.scratch, &mut mixes, &mut hc)?;
         let got = cx.gpu.take_fault()?;
-        let want = Fault::at(LAYER_NONE, FaultSite::HcQuant);
+        let want = Fault::of_sites(LAYER_NONE, &[FaultSite::HcQuant, FaultSite::F32Product]);
         let pass = clean.is_none() && got == Some(want);
         println!(
-            "fault site=L{}{} T={t} value 777 NaN: before={} want=hc_quant got={} {}",
+            "fault site=L{}{} T={t} value 777 NaN: before={} want=hc_quant+f32_product got={} {}",
             site.layer,
             site.sub(),
             clean.map_or("none".to_string(), |f| f.to_string()),
@@ -1224,6 +1237,90 @@ mod gate {
             verdict(pass)
         );
         cx.ok &= pass;
+        Ok(())
+    }
+
+    /// A site's streams with one value `1e20` through `ds41_hc_pre` and
+    /// through `ds41_hc_pre_groups`: the value is finite, so the quantizer
+    /// raises nothing, but its square passes f32 and the token's scale has no
+    /// norm behind it. The word must name [`FaultSite::F32Product`] alone,
+    /// with no layer; that token's 48 outputs are NaN, never the zeros `1/∞`
+    /// scales them to, and every other token's bits are the clean run's.
+    fn check_overflow(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> {
+        const BIG: f32 = 1.0e20;
+        let (hp, stream) = (cx.hp, cx.gpu.stream());
+        let t = tokens_of(man)?;
+        let all = sites(man, hp, t as u64)?;
+        let site = all.get(4).ok_or("fewer than five sites")?;
+        let params = site_params(cx.split, stream, site.layer, site.sub(), hp.k())?;
+        let streams = ref_tensor_of_in(&man.dir, site.streams)?;
+        let mut big = streams.clone();
+        big[777] = BIG;
+        let k = hp.k();
+        let lead = t.min(HC_MAX_TOKENS);
+        let mut groups_scratch = HcPreScratch::with_groups(stream, k, col_group_count(lead, t))?;
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+        for grouped in [false, true] {
+            let mut run = |x: &[f32]| -> Result<(Vec<f32>, Vec<f32>), GateError> {
+                let x_dev = DeviceBuffer::from_host(stream, x)?;
+                let p = HcParams {
+                    w: &params.w_dev,
+                    scale: &params.scale_dev,
+                    base: &params.base_dev,
+                    eps: hp.eps,
+                    iters: hp.iters,
+                };
+                let a = HcPreArgs {
+                    params: &p,
+                    x: &x_dev,
+                    tokens: t,
+                    rms_eps: hp.rms_eps,
+                    fault: cx.gpu.unlabelled_sink(),
+                };
+                let mut mixes = DeviceBuffer::<f32>::zeroed(stream, HC_MIX * t)?;
+                let mut hc = DeviceBuffer::<f32>::zeroed(stream, HC_MIX * t)?;
+                if grouped {
+                    cx.hck.enqueue_pre_groups(
+                        stream,
+                        &a,
+                        lead,
+                        &mut groups_scratch,
+                        &mut mixes,
+                        &mut hc,
+                    )?;
+                } else {
+                    cx.hck
+                        .enqueue_pre(stream, &a, &mut cx.scratch, &mut mixes, &mut hc)?;
+                }
+                stream.synchronize()?;
+                Ok((mixes.to_host_vec(stream)?, hc.to_host_vec(stream)?))
+            };
+            let before = cx.gpu.take_fault()?;
+            let (mix_c, hc_c) = run(&streams)?;
+            let clean_word = cx.gpu.take_fault()?;
+            let (mix_b, hc_b) = run(&big)?;
+            let got = cx.gpu.take_fault()?;
+            let row = |v: &[f32], tt: usize| v[tt * HC_MIX..(tt + 1) * HC_MIX].to_vec();
+            let bad_nan = row(&mix_b, 0)
+                .iter()
+                .chain(&row(&hc_b, 0))
+                .all(|v| v.is_nan());
+            let others = (1..t).all(|tt| {
+                bits_equal(&row(&mix_b, tt), &row(&mix_c, tt))
+                    && bits_equal(&row(&hc_b, tt), &row(&hc_c, tt))
+            });
+            let pass = before.is_none() && clean_word.is_none() && got == want && bad_nan && others;
+            println!(
+                "overflow {} site=L{}{} T={t} value 777 = {BIG:e}: word={} want=f32_product \
+                 token_0_outputs_nan={bad_nan} other_tokens_bit={others} {}",
+                if grouped { "groups" } else { "single" },
+                site.layer,
+                site.sub(),
+                got.map_or("none".to_string(), |f| f.to_string()),
+                verdict(pass)
+            );
+            cx.ok &= pass;
+        }
         Ok(())
     }
 
@@ -1359,6 +1456,7 @@ mod gate {
                 x: &x,
                 tokens: t,
                 rms_eps: Q8_RMS_EPS,
+                fault: gpu.unlabelled_sink(),
             };
             let mut out = Q8Out {
                 mixes: DeviceBuffer::zeroed(stream, HC_MIX * t)?,
@@ -1392,6 +1490,7 @@ mod gate {
             x: &x,
             tokens: t,
             rms_eps: Q8_RMS_EPS,
+            fault: gpu.unlabelled_sink(),
         };
         let mut out = Q8Out {
             mixes: DeviceBuffer::zeroed(stream, HC_MIX * t)?,
@@ -1418,28 +1517,40 @@ mod gate {
         );
         ok &= pass;
 
+        // One value of token 6 NaN, and one `1e20` (finite, its square past
+        // f32): either way the token's scale has no norm behind it, so its 48
+        // outputs are NaN — never the zeros `1/∞` scales them to — and the word
+        // names `F32Product` with no layer; every other token's bits are the
+        // clean launch's and the word is clean before.
         let bad = 6usize;
-        let mut xn = xs.clone();
-        xn[bad * k + 777] = f32::NAN;
-        let x_nan = DeviceBuffer::from_host(stream, &xn)?;
-        let a_nan = HcQ8PreArgs { x: &x_nan, ..a };
-        let (mix_n, hc_n) = q8_launch(hck, stream, &a_nan, lead, &mut scratch, &mut out)?;
-        let row = |v: &[f32], tt: usize| v[tt * HC_MIX..(tt + 1) * HC_MIX].to_vec();
-        let bad_nan = row(&mix_n, bad)
-            .iter()
-            .chain(&row(&hc_n, bad))
-            .all(|v| v.is_nan());
-        let others_bit = (0..t).filter(|&tt| tt != bad).all(|tt| {
-            bits_equal(&row(&mix_n, tt), &row(&eager.0, tt))
-                && bits_equal(&row(&hc_n, tt), &row(&eager.1, tt))
-        });
-        let pass = bad_nan && others_bit;
-        println!(
-            "hc_pre_q8_0 nan K={k} T={t} token {bad} value 777 NaN: its_48_outputs_nan={bad_nan} \
-             other_tokens_bit={others_bit} {}",
-            verdict(pass)
-        );
-        ok &= pass;
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+        for (what, value) in [("nan", f32::NAN), ("overflow", 1.0e20f32)] {
+            let before = gpu.take_fault()?;
+            let mut xn = xs.clone();
+            xn[bad * k + 777] = value;
+            let x_bad = DeviceBuffer::from_host(stream, &xn)?;
+            let a_bad = HcQ8PreArgs { x: &x_bad, ..a };
+            let (mix_n, hc_n) = q8_launch(hck, stream, &a_bad, lead, &mut scratch, &mut out)?;
+            let word = gpu.take_fault()?;
+            let row = |v: &[f32], tt: usize| v[tt * HC_MIX..(tt + 1) * HC_MIX].to_vec();
+            let bad_nan = row(&mix_n, bad)
+                .iter()
+                .chain(&row(&hc_n, bad))
+                .all(|v| v.is_nan());
+            let others_bit = (0..t).filter(|&tt| tt != bad).all(|tt| {
+                bits_equal(&row(&mix_n, tt), &row(&eager.0, tt))
+                    && bits_equal(&row(&hc_n, tt), &row(&eager.1, tt))
+            });
+            let pass = before.is_none() && word == want && bad_nan && others_bit;
+            println!(
+                "hc_pre_q8_0 {what} K={k} T={t} token {bad} value 777 = {value:e}: \
+                 word={} want=f32_product its_48_outputs_nan={bad_nan} \
+                 other_tokens_bit={others_bit} {}",
+                word.map_or("none".to_string(), |f| f.to_string()),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
         Ok(ok)
     }
 
@@ -1472,6 +1583,7 @@ mod gate {
         check_set(&mut cx, &prefill, "prefill")?;
         check_graph(&mut cx, &prefill)?;
         check_nan(&mut cx, &prefill)?;
+        check_overflow(&mut cx, &prefill)?;
         for name in STEP_SETS {
             if !ref_dir_named(name).join("MANIFEST.tsv").is_file() {
                 println!("hole set={name} not on the box: its T = 1 checks did not run");

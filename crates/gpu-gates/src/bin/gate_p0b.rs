@@ -18,7 +18,10 @@
 //! named `CachePos` fault, the cache untouched); and a latent of finite
 //! values whose squares overflow the norm's f32 sum, which both paths refuse
 //! with the named `F32Product` fault and NaN in the latent half of every
-//! output, never zeros. Printed, never asserted: `ik_rel` of
+//! output, never zeros; then what only the fused append names: a rope tail
+//! pair past f32 (`F32Product`), and a finite value past f16 in the tail or
+//! under a large latent gain (`CacheValue`), each written as computed.
+//! Printed, never asserted: `ik_rel` of
 //! y against dump `l_out-0`'s last column and of h against `ffn_up_gate-0`'s
 //! (the block-layer bands are pinned by the lead from these numbers, not
 //! here).
@@ -818,6 +821,120 @@ fn run() -> Result<(), GateError> {
             verdict(overflow_pass)
         );
         if !overflow_pass {
+            ok = false;
+        }
+
+        // What the fused append cannot keep, it names, and writes as
+        // computed: a value that is not finite (`F32Product`: the rope tail's
+        // turned pair past f32's range) and a finite one past f16's range
+        // (`CacheValue`: the tail, and the latent under a large gain). The
+        // op path's appends check neither, so each word is the fused path's
+        // own, raised from a launch that was clean before.
+        const TAIL_BIG: f32 = 3.0e38;
+        const PAST_F16: f32 = 7.0e4;
+        let f16_class = |h: u16| (h & 0x7c00 == 0x7c00, h & 0x03ff != 0);
+        let mut run_fused = |kv: &[f32],
+                             gain: &[f32],
+                             cs: &[f32]|
+         -> Result<(Option<Fault>, Vec<f32>, Vec<u16>), GateError> {
+            let kv_dev = DeviceBuffer::from_host(stream, kv)?;
+            let gain_dev = DeviceBuffer::from_host(stream, gain)?;
+            let cs_dev = DeviceBuffer::from_host(stream, cs)?;
+            pos_dev.copy_from_host(stream, &[0u32])?;
+            gpu.clear_fault()?;
+            fused.enqueue_kv_norm_rope_append(
+                stream,
+                &kv_dev,
+                &gain_dev,
+                &cs_dev,
+                &pos_dev,
+                mla.eps,
+                latent,
+                rope,
+                &mut kv_s_fu,
+                &mut kvr_fu,
+                &mut cache_fu,
+                gpu.unlabelled_sink(),
+            )?;
+            stream.synchronize()?;
+            let fault = gpu.take_fault()?;
+            let row = cache_fu.buf().to_host_vec(stream)?[..width].to_vec();
+            Ok((fault, kv_s_fu.to_host_vec(stream)?, row))
+        };
+
+        // The tail's first pair, x0 = 3e38 and x1 = −3e38 under (c, s) = (1,
+        // 1): y0 = x0·c − x1·s is past f32, y1 = 0; every other pair is the
+        // dump's.
+        let mut kv_tail = kv_a.clone();
+        kv_tail[latent] = TAIL_BIG;
+        kv_tail[latent + 1] = -TAIL_BIG;
+        let cs_ones = vec![1.0f32; rope];
+        let (word, kv_s, row) = run_fused(&kv_tail, &kv_gain, &cs_ones)?;
+        let want_tail = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+        let tail_pass = word == want_tail
+            && !kv_s[latent].is_finite()
+            && kv_s[..latent].iter().all(|v| v.is_finite())
+            && kv_s[latent + 2..].iter().all(|v| v.is_finite())
+            && f16_class(row[0]) == (true, false);
+        println!(
+            "key tail overflow x0={TAIL_BIG:e} x1=-{TAIL_BIG:e} (c, s) = (1, 1): fault=\"{}\" \
+             want=\"{}\" y0_not_finite={} rest_finite={} y0_f16_inf={} {}",
+            shown(word),
+            shown(want_tail),
+            !kv_s[latent].is_finite(),
+            kv_s[..latent].iter().all(|v| v.is_finite())
+                && kv_s[latent + 2..].iter().all(|v| v.is_finite()),
+            f16_class(row[0]) == (true, false),
+            verdict(tail_pass)
+        );
+        if !tail_pass {
+            ok = false;
+        }
+
+        // The tail's first pair x0 = 7e4 turned by (1, 0): finite in f32,
+        // past f16 in the cache row.
+        let mut kv_f16 = kv_a.clone();
+        kv_f16[latent] = PAST_F16;
+        kv_f16[latent + 1] = 0.0;
+        let cs_identity: Vec<f32> = (0..rope).map(|i| f32::from(u8::from(i % 2 == 0))).collect();
+        let (word, kv_s, row) = run_fused(&kv_f16, &kv_gain, &cs_identity)?;
+        let want_cache = Some(Fault::at(LAYER_NONE, FaultSite::CacheValue));
+        let f32_finite = kv_s.iter().all(|v| v.is_finite());
+        let tail_f16_pass = word == want_cache && f32_finite && f16_class(row[0]) == (true, false);
+        println!(
+            "key tail past f16 x0={PAST_F16:e}: fault=\"{}\" want=\"{}\" kv_s_finite={f32_finite} \
+             y0_f16_inf={} {}",
+            shown(word),
+            shown(want_cache),
+            f16_class(row[0]) == (true, false),
+            verdict(tail_f16_pass)
+        );
+        if !tail_f16_pass {
+            ok = false;
+        }
+
+        // The latent under a gain of 1e6: the normed values are finite in
+        // f32 and many are past f16.
+        let gain_big = vec![1.0e6f32; latent];
+        let (word, kv_s, row) = run_fused(&kv_a, &gain_big, &mla.rope.cache((TOKENS - 1) as u32))?;
+        let f32_finite = kv_s.iter().all(|v| v.is_finite());
+        let infs = row[rope..width]
+            .iter()
+            .filter(|&&h| f16_class(h) == (true, false))
+            .count();
+        let nans = row
+            .iter()
+            .filter(|&&h| f16_class(h) == (true, true))
+            .count();
+        let latent_pass = word == want_cache && f32_finite && infs > 0 && nans == 0;
+        println!(
+            "key latent past f16 gain=1e6: fault=\"{}\" want=\"{}\" kv_s_finite={f32_finite} \
+             f16_inf_values={infs} f16_nan_values={nans} {}",
+            shown(word),
+            shown(want_cache),
+            verdict(latent_pass)
+        );
+        if !latent_pass {
             ok = false;
         }
     }

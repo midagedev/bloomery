@@ -5,7 +5,10 @@
 //! 1. **HC_PRE, F32 weights** (`ds41_hc_pre_f32`): block 0's `hc_attn_fn` and
 //!    `hc_ffn_fn` against pseudo-random streams in ±2 for m = 1, 3, 5 tokens;
 //!    the kernel's mixes and HC_PRE rows equal the host transcription of the
-//!    module doc's rule bit for bit, and a second launch equals the first.
+//!    module doc's rule bit for bit, and a second launch equals the first. A
+//!    stream value of `1e20` (its square past f32) makes that token's 48
+//!    outputs NaN and raises `FaultSite::F32Product`, the other tokens' bits
+//!    the clean launch's.
 //! 2. **Markov head** (`ds41_markov`): for the first 64 ids of the code corpus
 //!    and ids 0, 1 and `n_vocab - 1`, from a zero logits row, the kernel's row
 //!    equals `0 + delta` by the host rule bit for bit, and the argmax the step
@@ -315,6 +318,7 @@ mod gate {
             x: &xd,
             tokens: m,
             rms_eps: cx.hp.rms_eps,
+            fault: cx.gpu.unlabelled_sink(),
         };
         cx.hck.enqueue_pre(s, &args, &mut mixes, &mut hc)?;
         s.synchronize()?;
@@ -342,6 +346,39 @@ mod gate {
             );
             cx.ok &= pass;
         }
+
+        // One stream value of token 1 at `1e20`: finite, its square past f32,
+        // so the token's scale has no norm behind it. Its 48 outputs are NaN
+        // (never the zeros `1/∞` scales them to), the word names `F32Product`
+        // with no layer, and the other tokens' bits are the clean launch's.
+        const BIG: f32 = 1.0e20;
+        let (m, bad) = (3usize, 1usize);
+        let x = streams(p.k * m, 12);
+        let before = cx.gpu.take_fault()?;
+        let (clean_m, clean_h) = run_hc_kernel(cx, p, &x, m)?;
+        let clean_word = cx.gpu.take_fault()?;
+        let mut xb = x.clone();
+        xb[bad * p.k + 777] = BIG;
+        let (km, kh) = run_hc_kernel(cx, p, &xb, m)?;
+        let got = cx.gpu.take_fault()?;
+        let row = |v: &[f32], t: usize| v[t * HC_MIX..(t + 1) * HC_MIX].to_vec();
+        let bad_nan = row(&km, bad)
+            .iter()
+            .chain(&row(&kh, bad))
+            .all(|v| v.is_nan());
+        let others = (0..m).filter(|&t| t != bad).all(|t| {
+            bits_equal(&row(&km, t), &row(&clean_m, t))
+                && bits_equal(&row(&kh, t), &row(&clean_h, t))
+        });
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+        let pass = before.is_none() && clean_word.is_none() && got == want && bad_nan && others;
+        println!(
+            "hc_pre_f32 overflow site=blk0.{sub} m={m} token {bad} value 777 = {BIG:e}: word={} \
+             want=f32_product its_48_outputs_nan={bad_nan} other_tokens_bit={others} {}",
+            got.map_or("none".to_string(), |f| f.to_string()),
+            verdict(pass)
+        );
+        cx.ok &= pass;
         Ok(())
     }
 

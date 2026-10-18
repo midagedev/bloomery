@@ -142,6 +142,58 @@ pub fn check<const H: usize, const R: usize, const Q: usize>(
     Ok(pass && fault_ok)
 }
 
+/// A head of values whose squares overflow the f32 products — query head 0
+/// and key head 0 of token 0, every value `1e20` — has no norm behind it: the
+/// kernel raises the named `F32Product` fault, that head's outputs and its
+/// key row in the cache plane are NaN (never the zeros an infinite sum scales
+/// it to), and every other head, token and plane word is the clean run's.
+pub fn check_overflow<const H: usize, const R: usize, const Q: usize>(
+    gpu: &Gpu,
+    inp: &RopeIn,
+    pos: &[u32],
+    s: RopeShape,
+    layer: usize,
+    run_at: impl Fn(&RopeIn, &[u32], FaultSink) -> Result<RopeOut, GateError>,
+) -> Result<bool, GateError> {
+    const BIG: f32 = 1.0e20;
+    let (nh, nk, ctx) = (s.n_head, s.n_kv, s.ctx);
+    let unl = gpu.unlabelled_sink();
+    let clean = run_at(inp, pos, unl)?;
+    let mut big = inp.clone();
+    big.qg[..H].fill(BIG);
+    big.k[..H].fill(BIG);
+    let before = gpu.fault()?;
+    let r = run_at(&big, pos, gpu.layer_sink(layer)?)?;
+    let word = gpu.take_fault()?;
+    let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::F32Product));
+    let f16_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
+    let heads_nan = r.q[..H].iter().all(|v| v.is_nan()) && r.k[..H].iter().all(|v| v.is_nan());
+    let others = bits_equal(&r.q[H..], &clean.q[H..]) && bits_equal(&r.k[H..], &clean.k[H..]);
+    let row = pos[0] as usize * H;
+    let key_row_nan = r.ck[row..row + H].iter().all(|&h| f16_nan(h));
+    let mut ck_want = clean.ck.clone();
+    ck_want[row..row + H].copy_from_slice(&r.ck[row..row + H]);
+    let planes = r.ck == ck_want && r.cv == clean.cv;
+    let again = run_at(inp, pos, unl)?;
+    let clean_after = gpu.fault()?.is_none() && bits_equal(&again.q, &clean.q);
+    let pass = before.is_none()
+        && word == want
+        && heads_nan
+        && others
+        && key_row_nan
+        && planes
+        && clean_after;
+    println!(
+        "rope overflow: query head 0 and key head 0 of token 0 at {BIG:e}, head {H} ({nh} query, \
+         {nk} key heads, ctx {ctx}), layer {layer}: word {word:?} (want {want:?}), the heads NaN \
+         {heads_nan}, every other head bit-identical {others}, its key row NaN {key_row_nan}, \
+         the rest of the planes the clean run's {planes}, clean rerun and word clean \
+         {clean_after} {}",
+        verdict(pass)
+    );
+    Ok(pass)
+}
+
 /// Check distinct positions, enqueue the rope and read its outputs.
 pub fn run(
     stream: &CudaStream,

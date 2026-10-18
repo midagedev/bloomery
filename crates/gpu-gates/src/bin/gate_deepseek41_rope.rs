@@ -26,7 +26,11 @@
 //! Sets: the 5-token prefill (`Set::Cpu`, its index-key chain included) and
 //! the table's decode-step sets (`step_sets`; the `unfused` ones hold the same
 //! rope sites in another graph, and `d1n` turns no indexer query) — T = 1 at
-//! positions 4, 301 and 1,025, where the ring slot wraps. Positions past
+//! positions 4, 301 and 1,025, where the ring slot wraps. Once, on the first
+//! K/V row: one value of token 0 at `1e20` (its square past f32) leaves that
+//! row's norm no scale — the kernel raises `FaultSite::F32Product`, the row is
+//! NaN in f32 and in its ring slot, every other row and ring word the clean
+//! launch's. Positions past
 //! those are the host unit test's
 //! (`bloomery_gpu_deepseek41::rope`, `just gate-gpu-ds41-lib`). A node's
 //! input is found through its `src0`/`src1` column: the last row of that
@@ -40,7 +44,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "deepseek41")]
 mod gate {
     use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS, rms_scale, rms_warp_tree};
-    use bloomery_gpu::{DeviceTensor, Gpu};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
     use bloomery_gpu_deepseek41::rope::{
         Direction, KvAppendArgs, RopeKernels, RopeSpec, RopeTable, TailShape, ggml_rope_cache,
     };
@@ -161,6 +165,7 @@ mod gate {
 
     /// What every site reads besides its set.
     struct Cx<'a> {
+        gpu: &'a Gpu,
         k: &'a RopeKernels,
         stream: &'a CudaStream,
         meta: &'a RopeMeta<RopeSpec>,
@@ -178,6 +183,7 @@ mod gate {
         let gpu = Gpu::new()?;
         let k = RopeKernels::load(gpu.context())?;
         let cx = Cx {
+            gpu: &gpu,
             k: &k,
             stream: gpu.stream(),
             meta: &meta,
@@ -209,6 +215,9 @@ mod gate {
                 } else if row.op == "SET_ROWS" && row.name.starts_with("dsv4_raw_k_write-") {
                     kvs += 1;
                     failed += u32::from(!kv_site(&cx, label, man, at)?);
+                    if kvs == 1 {
+                        failed += u32::from(!kv_overflow(&cx, label, man, at)?);
+                    }
                 }
             }
             println!(
@@ -599,6 +608,70 @@ mod gate {
         Ok(pass)
     }
 
+    /// A K/V site's rows with one value of token 0 at `1e20`: finite, its
+    /// square past f32, so that row's norm has no scale. The kernel raises
+    /// `FaultSite::F32Product` with no layer, the row is NaN in f32 and in its
+    /// ring slot (never the zeros `1/∞` scales it to), and every other row and
+    /// ring word is the clean launch's.
+    fn kv_overflow(cx: &Cx, label: &str, man: &RefManifest, at: usize) -> Result<bool, GateError> {
+        const BIG: f32 = 1.0e20;
+        let ch = KvChain::read(man, at)?;
+        let (width, m, window) = (ch.width, ch.m, cx.meta.ring);
+        let gain_name = ch
+            .norm
+            .src1
+            .as_deref()
+            .ok_or("the norm has no gain column")?;
+        let gain = split_f32(cx.split, gain_name, width)?;
+        let x = ref_tensor_logical_in(&man.dir, ch.x)?;
+        let pos = input_u32(man, ch.rope.src1.as_deref())?;
+        let (spec, _) = cx.meta.head_spec(ch.layer)?;
+        let cs = tables(&RopeTable::new(spec)?, &pos, Direction::Forward);
+        let slot = pos[0] as usize % window;
+        let dev = |x: &[f32]| -> Result<KvInputs, GateError> {
+            Ok(KvInputs {
+                kv: DeviceBuffer::from_host(cx.stream, x)?,
+                gain: DeviceBuffer::from_host(cx.stream, &gain)?,
+                cs: DeviceBuffer::from_host(cx.stream, &cs)?,
+                pos: DeviceBuffer::from_host(cx.stream, &pos)?,
+            })
+        };
+        let before = cx.gpu.take_fault()?;
+        let (out, ring) = kv_run(cx, &dev(&x)?, m, width, window)?;
+        let clean_word = cx.gpu.take_fault()?;
+        let mut xb = x.clone();
+        xb[3] = BIG;
+        let (out_b, ring_b) = kv_run(cx, &dev(&xb)?, m, width, window)?;
+        let got = cx.gpu.take_fault()?;
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+        let f16_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
+        let row_nan = out_b[..width].iter().all(|v| v.is_nan());
+        let slot_nan = ring_b[slot * width..(slot + 1) * width]
+            .iter()
+            .all(|&h| f16_nan(h));
+        let others = bits_equal(&out_b[width..], &out[width..]) && {
+            let mut want_ring = ring.clone();
+            want_ring[slot * width..(slot + 1) * width]
+                .copy_from_slice(&ring_b[slot * width..(slot + 1) * width]);
+            ring_b == want_ring
+        };
+        let pass = before.is_none()
+            && clean_word.is_none()
+            && got == want
+            && row_nan
+            && slot_nan
+            && others;
+        println!(
+            "kv overflow set={label} layer={} width={width} m={m} token 0 value 3 = {BIG:e}: word={} \
+             want=f32_product row_nan={row_nan} ring_slot_nan={slot_nan} \
+             every_other_row_and_ring_word_bit={others} {}",
+            ch.layer,
+            got.map_or("none".to_string(), |f| f.to_string()),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     /// One K/V site's device inputs, uploaded once for both runs.
     struct KvInputs {
         kv: DeviceBuffer<f32>,
@@ -635,6 +708,7 @@ mod gate {
                 out: &mut out,
                 cache: &mut cache,
                 shadow: &mut shadow,
+                fault: cx.gpu.unlabelled_sink(),
             },
         )?;
         cx.stream.synchronize()?;

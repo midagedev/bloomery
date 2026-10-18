@@ -33,6 +33,9 @@
 //!    score. The chain captured as one graph replays bit-identically to the
 //!    eager run.
 //!
+//! Each site also runs both kernels with one value at 1e20, whose norm has no
+//! f32 scale: each launch raises the product fault and no other row moves.
+//!
 //! The file's types pick the rules (`bloomery_gpu_gates::act_rule`): the
 //! table's rows are Q8_0 or Q3_K, dequantized either way, and so are the
 //! two gains (bf16 or Q3_K, widened to f32 as the card's load widens them); a Q8_0
@@ -58,7 +61,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS, rms_scale, rms_warp_tree};
     use bloomery_gpu::weights::{DevWeight, upload_file_tensor};
-    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_deepseek41::chain::glue::{RowsLevers, StepRows};
     use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
     use bloomery_gpu_deepseek41::engram_gate::{
@@ -743,7 +746,7 @@ mod gate {
             .map(|x| TokProj::of(&w.wkv, (cx.meta.hc + 1) * ROW, x))
             .collect();
         let ik = ik_checks(&d, w, cx.meta, &projs)?;
-        let op = op_checks(cx, &d, w)?;
+        let op = op_checks(cx, &d, w)? & overflow_checks(cx, &d, w)?;
         let mut chain = true;
         for (t, p) in projs.iter().enumerate() {
             chain &= chain_checks(cx, label, &d, w, t, p)?;
@@ -1248,6 +1251,7 @@ mod gate {
                 hc,
                 m,
                 kn: &mut kn,
+                fault: cx.gpu.unlabelled_sink(),
             };
             cx.eg.enqueue_key_norm(stream, key)?;
             let query = GateArgs {
@@ -1260,6 +1264,7 @@ mod gate {
                 m,
                 out: &mut out,
                 gate: &mut gate,
+                fault: cx.gpu.unlabelled_sink(),
             };
             cx.eg.enqueue_gate(stream, query)?;
             stream.synchronize()?;
@@ -1304,6 +1309,96 @@ mod gate {
             b.gate,
             rel[2],
             b.out,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The key and the query norm with one value at 1e20: the row's sum of
+    /// squares is f32 inf, so its norm has no scale. Each launch must raise
+    /// the product fault alone; the key side's row is NaN and every other
+    /// row of both launches is bit-identical to the clean launch's.
+    fn overflow_checks(cx: &Cx, d: &SiteData, w: &LayerW) -> Result<bool, GateError> {
+        const BIG: f32 = 1.0e20;
+        let (hc, m, eps) = (cx.meta.hc, d.t, cx.meta.eps);
+        let stream = cx.gpu.stream();
+        let kv = DeviceBuffer::from_host(stream, &d.kv)?;
+        let key_run = |kv: &DeviceBuffer<f32>| -> Result<Vec<f32>, GateError> {
+            let mut kn = DeviceBuffer::<f32>::zeroed(stream, hc * m * ROW)?;
+            cx.eg.enqueue_key_norm(
+                stream,
+                KeyNormArgs {
+                    kv,
+                    gain: &w.gk_dev,
+                    eps,
+                    hc,
+                    m,
+                    kn: &mut kn,
+                    fault: cx.gpu.unlabelled_sink(),
+                },
+            )?;
+            stream.synchronize()?;
+            Ok(kn.to_host_vec(stream)?)
+        };
+        let gate_run = |x: &[f32], kn: &[f32]| -> Result<(Vec<f32>, Vec<f32>), GateError> {
+            let x = DeviceBuffer::from_host(stream, x)?;
+            let kn = DeviceBuffer::from_host(stream, kn)?;
+            let mut out = DeviceBuffer::<f32>::zeroed(stream, hc * m * ROW)?;
+            let mut gate = DeviceBuffer::<f32>::zeroed(stream, hc * m)?;
+            cx.eg.enqueue_gate(
+                stream,
+                GateArgs {
+                    x: &x,
+                    kn: &kn,
+                    kv: &kv,
+                    gain: &w.gq_dev,
+                    eps,
+                    hc,
+                    m,
+                    out: &mut out,
+                    gate: &mut gate,
+                    fault: cx.gpu.unlabelled_sink(),
+                },
+            )?;
+            stream.synchronize()?;
+            Ok((gate.to_host_vec(stream)?, out.to_host_vec(stream)?))
+        };
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
+
+        let before = cx.gpu.take_fault()?;
+        let kn = key_run(&kv)?;
+        let (gate, out) = gate_run(&d.x, &kn)?;
+        let clean = cx.gpu.take_fault()?;
+
+        // Token 0's first key, value 0.
+        let mut kv_big = d.kv.clone();
+        kv_big[0] = BIG;
+        let kn_big = key_run(&DeviceBuffer::from_host(stream, &kv_big)?)?;
+        let key_word = cx.gpu.take_fault()?;
+        let key_row_nan = kn_big[..ROW].iter().all(|v| v.is_nan());
+        let key_rest = bits_equal(&kn_big[ROW..], &kn[ROW..]);
+
+        // Token 0's first stream, value 0.
+        let mut x_big = d.x.clone();
+        x_big[0] = BIG;
+        let (gate_big, out_big) = gate_run(&x_big, &kn)?;
+        let query_word = cx.gpu.take_fault()?;
+        let query_rest =
+            bits_equal(&gate_big[1..], &gate[1..]) && bits_equal(&out_big[ROW..], &out[ROW..]);
+
+        let pass = before.is_none()
+            && clean.is_none()
+            && key_word == want
+            && key_row_nan
+            && key_rest
+            && query_word == want
+            && query_rest;
+        println!(
+            "overflow L={} T={m} one value = {BIG:e}: key word={} want=f32_product key_row_nan={key_row_nan} \
+             key_other_rows_bit={key_rest} query word={} want=f32_product query_other_blocks_bit={query_rest} {}",
+            w.l,
+            key_word.map_or("none".to_string(), |f| f.to_string()),
+            query_word.map_or("none".to_string(), |f| f.to_string()),
             verdict(pass)
         );
         Ok(pass)
@@ -1414,6 +1509,7 @@ mod gate {
                     hc,
                     m: 1,
                     kn: &mut *kn,
+                    fault: cx.gpu.unlabelled_sink(),
                 };
                 cx.eg.enqueue_key_norm(s, key)?;
                 let query = GateArgs {
@@ -1426,6 +1522,7 @@ mod gate {
                     m: 1,
                     out,
                     gate,
+                    fault: cx.gpu.unlabelled_sink(),
                 };
                 cx.eg.enqueue_gate(s, query)
             };
