@@ -256,9 +256,13 @@ __bounded_bg_end() {
 }
 
 bounded_bg_stop() {
-  local bg_rc=0 bg_status=0 bg_end bg_state
+  local bg_rc=0 bg_status=0 bg_end bg_state bg_s
   [ -n "$BG_LIVE" ] || return 0
-  trap '' TERM INT HUP
+  # A signal during the cleanup does not cut it short: the first one is kept for __bounded_bg_end to raise again.
+  for bg_s in TERM INT HUP; do
+    # shellcheck disable=SC2064 # the signal's name now
+    trap "BG_SIGNAL=\${BG_SIGNAL:-$bg_s}" "$bg_s"
+  done
   if [ -n "$BG_PID" ]; then
     lease_stop "$BG_PID" || bg_rc=$?
     if [ "$bg_rc" = 0 ]; then
@@ -315,6 +319,7 @@ bounded_bg_wait() {
 #                      timeout's own case is lease.sh's `fork` form and stack-watch.sh's fork-exit rows
 #   cleanup-status     cleanup-fail: a stop that fails is the runner's status (70), a signal's included
 #   cleanup-alive      a stop that fails with the monitor alive returns 70 within 2 s, with no wait on it
+#   stop-signal        a signal during an explicit stop's cleanup ends the runner on it once the cleanup is done
 #   output-setup       fifo-fail: a stdin or output file that cannot be opened ends the command, not the runner, and
 #                      starts nothing that outlives the call
 #   output-filter      lease.sh --self-test, bounded-filter-open-term-*: the filter's guard stands before it starts
@@ -530,6 +535,29 @@ EOF
     PATH="$t/bin:$PATH" bash "$t/alive-runner" > "$t/cleanup-alive.out" 2>&1 || RC=$?
   check cleanup-alive-rc "$RC|$(grep -cE '^stop rc=70 took=[0-2]$' "$t/cleanup-alive.out")" '0|1'
   reap "$t/cleanup-alive.pid"
+  # stop-signal: a signal that comes while an explicit stop cleans up is raised again once it is done (143, no after).
+  cat > "$t/stopsig-runner" << 'EOF'
+source "$GB"
+eval "$(declare -f lease_stop | sed '1s/lease_stop/__real_lease_stop/')"
+lease_stop() { : > "$STOPPING"; sleep 1; __real_lease_stop "$@"; }
+bounded_bg 60 "$HELD" "$PIDF"
+until [ -s "$PIDF" ]; do sleep 0.05; done
+bounded_bg_stop
+echo after
+EOF
+  rm -f "$t/stopsig.pid" "$t/stopsig.pid.gc" "$t/stopsig.stopping"
+  env GB="$self" HELD="$t/held" PIDF="$t/stopsig.pid" STOPPING="$t/stopsig.stopping" HELD_MODE=zero LEASE_STOP_GRACE=4 \
+    CANCEL_TIMEOUT_FORWARD=1 PATH="$t/bin:$PATH" bash "$t/stopsig-runner" > "$t/stopsig.out" 2>&1 &
+  rp=$!
+  n=0
+  until [ -e "$t/stopsig.stopping" ] || [ "$n" = 100 ]; do sleep 0.1; n=$((n + 1)); done
+  kill -TERM "$rp" 2> /dev/null
+  RC=0
+  { wait "$rp" || RC=$?; } 2> /dev/null # the shell's "Terminated" notice for the killed runner
+  check stop-signal-rc "$RC|$(grep -c '^after$' "$t/stopsig.out")" '143|0'
+  left=$(leftover "$t/stopsig.pid")
+  check stop-signal-left "${left:-none}" none
+  reap "$t/stopsig.pid"
   # output-setup: a stdin or output file that cannot be opened ends the command, not the runner, and starts nothing.
   RC=0
   env HELD="$t/held" PIDF="$t/fifo.pid" PATH="$t/bin:$PATH" NOPE="$t/no-such-dir" bash -c \
