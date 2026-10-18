@@ -757,25 +757,13 @@ pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
     })
 }
 
-/// ggml's `(type_name, blck_size, type_size)` for a type id: the row of every id
-/// [`GgmlType`] names ([`QROWS`], which cite their block structs), and a table here for
-/// the two ids ggml defines as activation forms that the enum leaves [`GgmlType::Unknown`]:
-///   * 9 `q8_1` 32/36 (ik `c10fbbcc` ggml-common.h:241-245),
-///   * 15 `q8_K` 256/296 — ik layout, `float d; float sum; int8_t qs[256];
-///     int16_t bsums[16]` (:405-411); mainline ggml's block_q8_K is 264 B (no
-///     sum/bsums), a divergence to remember if a q8_K file's byte sums ever
-///     disagree with its size.
-///
-/// Every other id returns `None` and inventories with unknown size.
+/// ggml's `(type_name, blck_size, type_size)` for a type id: the row of every id [`GgmlType`]
+/// names ([`QROWS`], which cite their block structs). Every other id returns `None` and
+/// inventories with unknown size.
 pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
-    if let Some(row) = GgmlType::from_u32(id).row() {
-        return Some((row.name, row.blck, row.bytes));
-    }
-    match id {
-        9 => Some(("q8_1", 32, 36)),
-        15 => Some(("q8_K", 256, 296)),
-        _ => None,
-    }
+    GgmlType::from_u32(id)
+        .row()
+        .map(|row| (row.name, row.blck, row.bytes))
 }
 
 /// `type_size * (ne[0]/blck) * ne[1] * …`, the bytes of a tensor of `tsz`-byte
@@ -891,8 +879,7 @@ fn check_private(private: &[PrivateType]) -> Result<(), LoadError> {
 /// block-aligned and its bytes must fit a u64; then every tensor must sit
 /// inside the `len`-byte file — the placement invariant the coverage gate
 /// re-checks per tensor. A q8_1 or q8_K tensor is refused: they are ggml's
-/// activation forms, which no quantizer writes to a file, and q8_K's size is ik's
-/// (mainline's block differs).
+/// activation forms, which no quantizer writes to a file, though their rows size them.
 fn strict_tensors(
     raw: Vec<RawTensorInfo>,
     data_base: u64,
@@ -902,6 +889,9 @@ fn strict_tensors(
     let mut strict = Vec::with_capacity(raw.len());
     for t in raw {
         let ty = GgmlType::from_u32(t.type_id);
+        if matches!(ty, GgmlType::Q8_1 | GgmlType::Q8_K) {
+            return Err(LoadError::UnsupportedType { name: t.name, ty });
+        }
         let own = private.iter().find(|p| p.id == t.type_id);
         let blck =
             ty.blck_size()
@@ -1405,16 +1395,21 @@ mod private_tests {
         q
     }
 
-    /// A q4_0 or q4_1 tensor opens, sized by its row and typed `GgmlType::Q4_0` or
-    /// `GgmlType::Q4_1`; a q8_K tensor (an activation form, its size ik's) is refused by name.
+    /// A q4_0, q4_1 or q1_0 tensor opens, sized by its row and typed `GgmlType::Q4_0`,
+    /// `GgmlType::Q4_1` or `GgmlType::Q1_0`; a q8_1 or q8_K tensor (an activation form) is
+    /// refused by name.
     #[test]
-    fn q4_0_and_q4_1_open_and_q8_k_is_refused() {
+    fn sized_types_open_and_activation_forms_are_refused() {
         let d = set_dir("table");
-        for (id, ty, bytes) in [(2u32, GgmlType::Q4_0, 72u64), (3, GgmlType::Q4_1, 80)] {
+        for (id, ty, ne0, bytes) in [
+            (2u32, GgmlType::Q4_0, 64u64, 72u64),
+            (3, GgmlType::Q4_1, 64, 80),
+            (41, GgmlType::Q1_0, 128, 36),
+        ] {
             let p = d.join(format!("t{id}.gguf"));
             let t = TensorDecl {
                 name: "q".to_string(),
-                dims: vec![64, 2],
+                dims: vec![ne0, 2],
                 type_id: id,
                 nbytes: bytes,
             };
@@ -1423,20 +1418,22 @@ mod private_tests {
             let q = g.tensor(0).unwrap();
             assert_eq!((q.ty, q.nbytes), (ty, bytes), "type {id}");
         }
-        let p = d.join("t15.gguf");
-        let t = TensorDecl {
-            name: "k".to_string(),
-            dims: vec![256],
-            type_id: 15,
-            nbytes: 296,
-        };
-        write_file(&p, &[], &[(t, vec![0; 296])]);
-        let r = Gguf::open(&p);
+        for (id, ne0, bytes) in [(9u32, 32u64, 36u64), (15, 256, 292)] {
+            let p = d.join(format!("t{id}.gguf"));
+            let t = TensorDecl {
+                name: "k".to_string(),
+                dims: vec![ne0],
+                type_id: id,
+                nbytes: bytes,
+            };
+            write_file(&p, &[], &[(t, vec![0; usize::try_from(bytes).unwrap()])]);
+            let r = Gguf::open(&p);
+            assert!(
+                matches!(r, Err(LoadError::UnsupportedType { ref name, .. }) if name == "k"),
+                "type {id} must be refused by the tensor's name"
+            );
+        }
         std::fs::remove_dir_all(&d).unwrap();
-        assert!(
-            matches!(r, Err(LoadError::UnsupportedType { ref name, .. }) if name == "k"),
-            "q8_K must be refused by the tensor's name"
-        );
     }
 
     /// A file tagged with a private id opens only through a table that lists
