@@ -150,6 +150,16 @@
 //!   `swiglu_quant32`'s bytes; a NaN or infinite `g` or `u` refusing its
 //!   block and raising `QuantColumn` where the clamp alone would make it
 //!   finite.
+//! - `g32_relu_sqr`: `relu_sqr_quant32`, a relu² expert's up rows quantized
+//!   as its down GEMM's input, at K ∈ {96, 1856, 3712} (Lightning's routed
+//!   and shared down widths, neither a multiple of 256) for 1, 9 and 512
+//!   columns: the three planes bit for bit the host quantizer of the rule
+//!   (`max(v, 0)²` of the f32 maximum, a non-finite value as it is) and
+//!   `ElemKernels::enqueue_relu_sqr` then `quantize_gemm32`, with negative
+//!   and positive inputs both met; a NaN, either infinity and a value whose
+//!   square overflows each refuse their block (NaN scale, zero codes and sum)
+//!   and raise `QuantColumn`, where a `max` before the quantizer would have
+//!   made the NaN and the negative infinity a zero.
 //! - `g32_dense`: at every K above and m ∈ {1, 8, 9, 512, 4096}, one
 //!   quantization and the three entries over the dense table, 272 rows (two
 //!   full slabs and one of 16): every output inside its band of the f64
@@ -4139,6 +4149,113 @@ mod gate {
             Ok(ok)
         }
 
+        /// The squared-ReLU quantizer (`relu_sqr_quant32`): bit for bit the host
+        /// quantizer of the rule and the two launches it replaces
+        /// (`enqueue_relu_sqr`, `quantize_gemm32`); a non-finite input, or a
+        /// finite one whose square overflows, refused and raised.
+        fn relu_sqr_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g32_relu_sqr") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let mut ok = true;
+            gpu.clear_fault()?;
+            // The rule on the host: a non-finite value stays as it is.
+            let rule = |v: f32| -> f32 {
+                if !v.is_finite() {
+                    v
+                } else {
+                    let r = v.max(0.0);
+                    r * r
+                }
+            };
+            let max = 512;
+            // K 96 ends in a one-block step; 1856 and 3712 are the down's K
+            // of Lightning's routed and shared experts.
+            for k in [96usize, 1856, 3712] {
+                let mut act = GemmAct32::new(stream, max, k)?;
+                let mut two = GemmAct32::new(stream, max, k)?;
+                for n in [1usize, 9, max] {
+                    let xh: Vec<f32> = activations(k, n, 9950 + (k + n) as u32)
+                        .into_iter()
+                        .map(|v| 3.0 * v)
+                        .collect();
+                    let x = DeviceBuffer::from_host(stream, &xh)?;
+                    dev.g32
+                        .enqueue_quantize_gemm32_relu_sqr(stream, &x, n, &mut act, sink)?;
+                    let mut sq = DeviceBuffer::<f32>::zeroed(stream, n * k)?;
+                    gpu.elem().enqueue_relu_sqr(stream, &x, n * k, &mut sq)?;
+                    dev.g32
+                        .enqueue_quantize_gemm32(stream, &sq, n, &mut two, sink)?;
+                    stream.synchronize()?;
+                    let fault = gpu.take_fault()?;
+                    let want_h: Vec<f32> = xh.iter().map(|&v| rule(v)).collect();
+                    let (_, want) = host_act(&want_h, k, n);
+                    let same_host = planes_equal(&act, n, &want, stream)?;
+                    let st = two.steps();
+                    let want2: Planes32 = (
+                        two.q().to_host_vec(stream)?[..n * 16 * st].to_vec(),
+                        two.d().to_host_vec(stream)?[..n * 2 * st].to_vec(),
+                        two.s().to_host_vec(stream)?[..n * 2 * st].to_vec(),
+                    );
+                    let same_two = planes_equal(&act, n, &want2, stream)?;
+                    let (neg, pos) = (
+                        xh.iter().filter(|v| **v < 0.0).count(),
+                        xh.iter().filter(|v| **v > 0.0).count(),
+                    );
+                    let pass = same_host && same_two && fault.is_none() && neg > 0 && pos > 0;
+                    println!(
+                        "gemm32 case=g32_relu_sqr K={k} cols={n} planes_eq_host_rule={same_host} \
+                         planes_eq_relu_sqr_then_quantize_gemm32={same_two} negative={neg} \
+                         positive={pos} fault={} {}",
+                        fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            // A value the rule cannot carry refuses its block: the host side is
+            // the rule's rows, the value itself (or its overflowed square)
+            // non-finite there.
+            let (k, n) = (1856usize, 9usize);
+            let mut act = GemmAct32::new(stream, n, k)?;
+            let at = 3 * k + 33;
+            let blk = 3 * act.steps() * 2 + 1;
+            for (what, bad) in [
+                ("nan", f32::NAN),
+                ("pos_inf", f32::INFINITY),
+                ("neg_inf", f32::NEG_INFINITY),
+                ("overflow", 1.0e20),
+            ] {
+                let mut xh: Vec<f32> = activations(k, n, 9960)
+                    .into_iter()
+                    .map(|v| 3.0 * v)
+                    .collect();
+                xh[at] = bad;
+                let x = DeviceBuffer::from_host(stream, &xh)?;
+                dev.g32
+                    .enqueue_quantize_gemm32_relu_sqr(stream, &x, n, &mut act, sink)?;
+                stream.synchronize()?;
+                let fault = gpu.take_fault()?;
+                let want_h: Vec<f32> = xh.iter().map(|&v| rule(v)).collect();
+                let (_, want) = host_act(&want_h, k, n);
+                let same = planes_equal(&act, n, &want, stream)?;
+                let refused = act.d().to_host_vec(stream)?[blk].is_nan();
+                let site = fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn));
+                let pass = same && refused && site;
+                println!(
+                    "gemm32 case=g32_relu_sqr fault={what} K={k} \
+                     planes_eq_host(block refused)={same} d_nan={refused} \
+                     site_quant_column={site} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            Ok(ok)
+        }
+
         /// The dense cases: per K a Q8_0 stack (planes and file words from
         /// the same bytes) and a Q5_1 stack of [`ROWS`] rows, per column
         /// count one quantization and the three entries through the dense
@@ -5889,6 +6006,7 @@ mod gate {
             let t0 = std::time::Instant::now();
             let mut ok = quant_case(&dev)?;
             ok &= swiglu_act_case(&dev)?;
+            ok &= relu_sqr_case(&dev)?;
             ok &= dense_case(&dev)?;
             ok &= routed_case(&dev)?;
             ok &= nvfp4_dense_case(&dev)?;

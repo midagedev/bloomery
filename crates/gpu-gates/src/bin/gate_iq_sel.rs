@@ -119,6 +119,14 @@
 //!     `slots_per_col` of 0, nine on another format's down, one column for
 //!     two runs, short ids.
 //!
+//! 14. **IQ4_NL at Lightning's shapes, rows repeated.** `iq4_nl_gemv_sel32` as
+//!     the relu² expert's up (rows 1,856 of K = 2,688: 84 blocks, three q
+//!     windows, the last partial) and down (2,688 rows of K = 1,856: 58 blocks,
+//!     two windows) over columns that repeat a token's row once per slot (ten
+//!     slots a token, the form `q5_quantize_q8_rep` writes): clauses 1 and 3 on
+//!     those stacks, host-rule bits, rerun, host slots at the sentinel, a wider
+//!     activation, the f64 band and its `PIN(2026-10-18)` ratchet.
+//!
 //! `--bench-kernels [--bench-arm <op>|iq2xxs]` runs no clause: it prices the
 //! IQ2_XXS launches at Bolt's shapes (the `bench` module below), lead-only
 //! under `tools/ref/time-gate.sh`'s lease.
@@ -252,7 +260,11 @@ mod gate {
     ];
     /// PIN(2026-10-06): the down's, both K, the dot-level 0.4 % class
     /// widened by the sampled rows' spread.
-    const REL_PIN_NL: [(usize, f64); 2] = [(640, 8.0e-3), (608, 6.5e-3)];
+    /// PIN(2026-10-18): the two Lightning geometries (K = 2,688 and 1,856),
+    /// the first run's larger-of-sweep values 6.7653e-3 and 4.3442e-3 rounded
+    /// up the way the rows above were; the assertion is the composed bound.
+    const REL_PIN_NL: [(usize, f64); 4] =
+        [(640, 8.0e-3), (608, 6.5e-3), (2688, 7.5e-3), (1856, 5.0e-3)];
 
     /// Values seeded by an LCG (Numerical Recipes' constants), uniform on
     /// `lo .. lo + span`.
@@ -1283,12 +1295,27 @@ mod gate {
 
     /// Clauses 1 and 3 over one IQ4_NL geometry (the band on every
     /// `NL_BAND_STRIDE`-th row, module doc).
-    fn check_nl(c: &Ctx, st: &NlStack, w: &DeviceTensor<u32>) -> Result<(bool, f64), GateError> {
+    fn check_nl(
+        c: &Ctx,
+        st: &NlStack,
+        w: &DeviceTensor<u32>,
+        rep: usize,
+    ) -> Result<(bool, f64), GateError> {
         let w_host = stream_words_of(&st.bytes, st.experts * st.rpe)?;
         let (mut ok, mut rel) = (true, 0.0f64);
         for &m in MS.iter() {
             let n_slots = SLOTS * m;
-            let x = seeded(n_slots * st.k(), 9101 + st.k() as u32 + m as u32, -2.0, 4.0);
+            // Column `s` is row `s / rep` of the sweep's rows: `rep` slots of a
+            // token share its row, as `q5_quantize_q8_rep` writes them.
+            let rows = seeded(
+                n_slots.div_ceil(rep) * st.k(),
+                9101 + st.k() as u32 + m as u32,
+                -2.0,
+                4.0,
+            );
+            let x: Vec<f32> = (0..n_slots)
+                .flat_map(|s| rows[(s / rep) * st.k()..][..st.k()].to_vec())
+                .collect();
             let (act, cols) = blocks32_cols(&c.gpu, &x, st.k(), n_slots)?;
             let sel = sel_of(m, st.experts);
             let (y, fault) = down(c, st, w, &act, &sel)?;
@@ -1354,7 +1381,7 @@ mod gate {
             ok &= in_bound;
             rel = (err_max / ref_max).max(rel);
             println!(
-                "nl[k={} experts={} rpe={} slots={n_slots}] host_rule_bits={} rerun={} \
+                "nl[k={} experts={} rpe={} slots={n_slots} rep={rep}] host_rule_bits={} rerun={} \
                  host_slots_sentinel={} wide_act={} f64_band={} fault=\"{}\" {}{}",
                 st.k(),
                 st.experts,
@@ -2822,10 +2849,18 @@ mod gate {
             );
         }
         let mut nl_rels = Vec::new();
-        for (kb, seed) in [(20usize, 0x51ce_0011u64), (19, 0x51ce_0012)] {
-            let st = nl_stack(kb, 3, 2560, seed);
+        // Clause 14 beside the first two: Lightning's up (84 blocks a row, 1,856
+        // rows) and down (58 blocks, 2,688 rows) with a token's row repeated
+        // over its ten slots.
+        for (kb, rpe, seed, rep) in [
+            (20usize, 2560usize, 0x51ce_0011u64, 1usize),
+            (19, 2560, 0x51ce_0012, 1),
+            (84, 1856, 0x51ce_0013, SLOTS),
+            (58, 2688, 0x51ce_0014, SLOTS),
+        ] {
+            let st = nl_stack(kb, 3, rpe, seed);
             let w = st.upload(s)?;
-            let (pass, rel) = check_nl(&c, &st, &w)?;
+            let (pass, rel) = check_nl(&c, &st, &w, rep)?;
             ok &= pass;
             nl_rels.push((st.k(), rel));
         }

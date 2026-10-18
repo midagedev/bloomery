@@ -97,7 +97,9 @@
 //!     half), 100 × 1280 (a partial last grid block and a second lane pass),
 //!     64 × 1120 (35 blocks a row: every other row starts half a word in, so a
 //!     block's parity is its index in the stream, not in its row), 64 × 2080
-//!     (three q windows, 65 blocks) and 64 × 32 (one block): within
+//!     (three q windows, 65 blocks), 64 × 32 (one block), and Lightning's
+//!     2,688 × 1,856 down (58 blocks, two q windows) and 1,856 × 2,688 (84
+//!     blocks, three, the last partial): within
 //!     `KERNEL_BAND` of the f64 dot of `dequant_row(Q8_0)` rows with the
 //!     activation dequantized from the quantizer's own readback, the `HOST`
 //!     slot untouched, a rerun bit-identical. On 2560 × 640: a captured launch
@@ -129,6 +131,29 @@
 //!     tiles is `kq_gate_up_act_q5k`'s (1024 × 2048); no launch raises a
 //!     fault; the launchers refuse a Q6_K gate stack, an up stack of another
 //!     shape and a table of more experts than the stack holds.
+//!
+//! 13. relu2_quant: the quantizers of a relu² expert's card leg
+//!     (`q5_quantize_q8_rep`, `q5_quantize_q8_sel_relu_sqr`) at Lightning's
+//!     widths, 2,688 values a column (84 blocks) and 1,856 (58 blocks, the last
+//!     group of four holding two), over three tokens of six slots, four card
+//!     experts and two slots the host serves. The rule: the repeating
+//!     quantizer's card columns are the plain quantizer's bytes of the slot's
+//!     token row, the squared-ReLU quantizer's the plain quantizer's of the host
+//!     rule `max(v, 0)²` (an f32 square of the f32 maximum), bit for bit, from
+//!     column 0 and from column 4 (places counted from the first column); a
+//!     host column keeps a pattern written before the launch, and a launch over
+//!     host places alone leaves every column and raises nothing on poisoned
+//!     sources. Faults, each alone in the fault word: a NaN in a token's row
+//!     raises `Q5Quant` from the repeating quantizer; a NaN, either infinity or
+//!     a value whose square overflows in a card column raises it from the
+//!     squared-ReLU one (a `max` first would have turned the NaN and the
+//!     negative infinity into a zero), every other card column the clean
+//!     launch's; the same values in a host column raise nothing; a place past
+//!     the card that is not `HOST` raises `ExpertId` and its column is not
+//!     read. The two launches captured in one graph replay as two nodes,
+//!     bit-identical to the eager launches, and follow places overwritten
+//!     between replays. Refused by name: no repeat, columns past the scratch, a
+//!     source of too few columns, a card of no expert, too few places.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -146,7 +171,7 @@ mod gate {
         SelDown, TileGather, TileTable, TiledDown, TiledGateUpAct, act, walk_a_planes,
     };
     use bloomery_gpu::q4k_sel::QuantSel;
-    use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
+    use bloomery_gpu::q5::{Q8Blocks32, Q8Blocks32Host, pack_q5_1};
     use bloomery_gpu::q5_1_sel::{BLOCK_WORDS, Q51SelDown, Q51SelKernels};
     use bloomery_gpu::q8_0_sel32::{Q80SelDown, Q80SelKernels, stream_cols};
     use bloomery_gpu::q38::{CardSharedAddArgs, Q38Kernels, SLOTS, W_PITCH};
@@ -930,6 +955,7 @@ mod gate {
         ok &= check_q38_card(&c)?;
         ok &= check_q8_0_sel32(&c)?;
         ok &= check_tiles(&c)?;
+        ok &= check_relu2_quant(&c)?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
         }
@@ -957,7 +983,12 @@ mod gate {
              NaN column, a NaN scale NaNs its rows, a wider activation bit for bit, the launcher's \
              refusals; the grouped entries at \
              GLM's routed shapes: the gather, the Q4_K and Q5_K gate·up and the Q5_K down by tiles \
-             each their _sel's bit for bit, HOST untouched, the launchers' refusals"
+             each their _sel's bit for bit, HOST untouched, the launchers' refusals; the relu² \
+             expert's quantizers at Lightning's widths: the repeating one the plain quantizer's \
+             bytes of the token's row and the squared-ReLU one the plain quantizer's of the host \
+             rule, bit for bit, host columns untouched, q5_quant on a NaN, an infinity or an \
+             overflow, expert_id past the card, two nodes replaying moved places, the \
+             launchers' refusals"
         );
         Ok(())
     }
@@ -2631,12 +2662,14 @@ mod gate {
     /// Clause 11 (module doc).
     fn check_q8_0_sel32(c: &Ctx) -> Result<bool, GateError> {
         // (tag, rows an expert, K)
-        const SHAPES: [(&str, usize, usize); 5] = [
+        const SHAPES: [(&str, usize, usize); 7] = [
             ("qwen38_down_2560x640", 2560, 640),
             ("grid_tail_lane_pass2_100x1280", 100, 1280),
             ("odd_blocks_64x1120", 64, 1120),
             ("windows3_64x2080", 64, 2080),
             ("one_block_64x32", 64, 32),
+            ("relu2_down_2688x1856", 2688, 1856),
+            ("relu2_up_1856x2688", 1856, 2688),
         ];
         let stream = c.gpu.stream();
         let mut ok = true;
@@ -3213,5 +3246,646 @@ mod gate {
             verdict(quiet)
         );
         Ok(ok && quiet)
+    }
+
+    // ----------------------------------------------------------- clause 13
+
+    /// Clause 13's normed width: Lightning's hidden size, 84 blocks of 32.
+    const N13: usize = 2688;
+    /// Clause 13's routed width: Lightning's expert width, 58 blocks of 32.
+    const FF13: usize = 1856;
+    /// Tokens, slots a token and card experts of clause 13.
+    const M13: usize = 3;
+    const SPC13: usize = 6;
+    const E13: usize = 4;
+    /// Slot columns of clause 13.
+    const S13: usize = M13 * SPC13;
+    /// The places: duplicates, every card expert, two slots the host serves.
+    const SEL13: [u32; S13] = [
+        0, 1, 2, 3, 0, 1, HOST, 2, 3, 3, 1, 0, HOST, 2, 1, 0, 2, HOST,
+    ];
+    /// [`SEL13`] with slot 7's place past the card and not [`HOST`].
+    const SEL13_STRAY: [u32; S13] = {
+        let mut s = SEL13;
+        s[7] = 9;
+        s
+    };
+    /// The places after the graph's capture: slots moved between the card and
+    /// the host.
+    const SEL13_B: [u32; S13] = [
+        HOST, 1, 2, 3, 0, HOST, 2, 2, 3, 0, 1, HOST, 3, 2, 1, 0, HOST, 1,
+    ];
+
+    /// One slot column of a q8_1 scratch read back: code words, block sums
+    /// and scale bits.
+    type Col13 = (Vec<u32>, Vec<i32>, Vec<u32>);
+
+    /// The `cols` columns of a scratch of `k` values a column, read back.
+    fn cols13(x: &Q8Blocks32Host, k: usize, cols: usize) -> Vec<Col13> {
+        let (kb, qs) = (k / 32, x.q.len() / cols);
+        (0..cols)
+            .map(|s| {
+                (
+                    x.q[s * qs..(s + 1) * qs].to_vec(),
+                    x.s8[s * kb..(s + 1) * kb].to_vec(),
+                    x.d8[s * kb..(s + 1) * kb]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The plain quantizer's columns of `x` (`cols` columns of `k` values):
+    /// the reference for every card column, and the pattern a launch must
+    /// leave in the columns it does not write.
+    fn plain13(c: &Ctx, x: &[f32], cols: usize, k: usize) -> Result<Vec<Col13>, GateError> {
+        let act = patterned13(c, x, cols, k)?;
+        Ok(cols13(&act.readback(c.gpu.stream())?, k, cols))
+    }
+
+    /// A scratch of `cols` columns of `k` values holding the plain
+    /// quantizer's bytes of `x`.
+    fn patterned13(c: &Ctx, x: &[f32], cols: usize, k: usize) -> Result<Q8Blocks32, GateError> {
+        let stream = c.gpu.stream();
+        let xd = DeviceBuffer::from_host(stream, &x[..cols * k])?;
+        let mut act = Q8Blocks32::with_slots(stream, k, cols)?;
+        c.gpu
+            .q5()
+            .enqueue_quantize_q8(stream, &xd, &mut act, c.gpu.unlabelled_sink())?;
+        stream.synchronize()?;
+        Ok(act)
+    }
+
+    /// The quantizers of clause 13.
+    #[derive(Clone, Copy)]
+    enum Quant13 {
+        /// `q5_quantize_q8_rep`: `M13` rows of `N13`, `SPC13` columns a row.
+        Rep,
+        /// `q5_quantize_q8_sel_relu_sqr`: `S13` columns of `FF13`.
+        ReluSqr,
+    }
+
+    impl Quant13 {
+        fn name(self) -> &'static str {
+            match self {
+                Quant13::Rep => "rep",
+                Quant13::ReluSqr => "relu_sqr",
+            }
+        }
+
+        /// Values a column of the output holds.
+        fn k(self) -> usize {
+            match self {
+                Quant13::Rep => N13,
+                Quant13::ReluSqr => FF13,
+            }
+        }
+
+        /// The source `x` the launch reads: `M13` rows or `S13` columns.
+        fn source(self, seed: u32) -> Vec<f32> {
+            match self {
+                Quant13::Rep => activations(N13, M13, seed),
+                Quant13::ReluSqr => activations(FF13, S13, seed),
+            }
+        }
+
+        /// The plain quantizer's input for output column `s`: the host rule.
+        fn rule(self, x: &[f32]) -> Vec<f32> {
+            match self {
+                Quant13::Rep => (0..S13)
+                    .flat_map(|s| x[(s / SPC13) * N13..][..N13].to_vec())
+                    .collect(),
+                Quant13::ReluSqr => x
+                    .iter()
+                    .map(|&v| {
+                        let r = v.max(0.0);
+                        r * r
+                    })
+                    .collect(),
+            }
+        }
+
+        /// The output column that reads source value `i`.
+        fn columns_of(self, i: usize) -> std::ops::Range<usize> {
+            match self {
+                Quant13::Rep => (i / N13) * SPC13..(i / N13 + 1) * SPC13,
+                Quant13::ReluSqr => i / FF13..i / FF13 + 1,
+            }
+        }
+
+        /// One launch over the columns `cols` with the places `sel`, then the
+        /// fault word.
+        fn launch(
+            self,
+            c: &Ctx,
+            x: &DeviceBuffer<f32>,
+            cols: std::ops::Range<usize>,
+            sel: &DeviceBuffer<u32>,
+            act: &mut Q8Blocks32,
+        ) -> Result<Option<Fault>, GateError> {
+            let stream = c.gpu.stream();
+            let q = QuantSel {
+                x,
+                cols,
+                sel,
+                n_card: E13,
+            };
+            self.enqueue(c, stream, &q, act)?;
+            stream.synchronize()?;
+            Ok(c.gpu.take_fault()?)
+        }
+
+        /// The launch on `stream`, no synchronization.
+        fn enqueue(
+            self,
+            c: &Ctx,
+            stream: &cuda_core::CudaStream,
+            q: &QuantSel<'_>,
+            act: &mut Q8Blocks32,
+        ) -> Result<(), GpuError> {
+            let sink = c.gpu.unlabelled_sink();
+            match self {
+                Quant13::Rep => c
+                    .gpu
+                    .q5()
+                    .enqueue_quantize_q8_rep(stream, q, SPC13, act, sink),
+                Quant13::ReluSqr => c
+                    .gpu
+                    .q5()
+                    .enqueue_quantize_q8_sel_relu_sqr(stream, q, act, sink),
+            }
+        }
+    }
+
+    /// What a launch of `which` over `cols` with `sel` must leave: each card
+    /// column in `cols` the plain quantizer's bytes of the rule over `clean`,
+    /// every other column the pattern's, except the columns `skip` names (the
+    /// ones a fault case poisons). Returns the first difference, or `None`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a gate helper: one argument each"
+    )]
+    fn leaves13(
+        got: &[Col13],
+        want: &[Col13],
+        pattern: &[Col13],
+        sel: &[u32],
+        cols: &std::ops::Range<usize>,
+        skip: &std::ops::Range<usize>,
+    ) -> Option<String> {
+        for (s, g) in got.iter().enumerate() {
+            if skip.contains(&s) {
+                continue;
+            }
+            let written = cols.contains(&s) && sel[s - cols.start] < E13 as u32;
+            let (expect, what) = if written {
+                (&want[s], "the plain quantizer's")
+            } else {
+                (&pattern[s], "the pattern's")
+            };
+            if g != expect {
+                return Some(format!(
+                    "column {s} (place {}) is not {what}",
+                    sel.get(s.wrapping_sub(cols.start))
+                        .map_or_else(|| "outside".to_owned(), |p| p.to_string())
+                ));
+            }
+        }
+        None
+    }
+
+    /// Clause 13 (module doc).
+    fn check_relu2_quant(c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let mut ok = true;
+        for which in [Quant13::Rep, Quant13::ReluSqr] {
+            let k = which.k();
+            let src = which.source(1300 + which as u32);
+            let want = plain13(c, &which.rule(&src), S13, k)?;
+            // The pattern every launch must leave in the columns it skips.
+            let pat_x = activations(k, S13, 1399);
+            let pattern = plain13(c, &pat_x, S13, k)?;
+            let xd = DeviceBuffer::from_host(stream, &src)?;
+
+            // The rule, from column 0 and from column 4, and a launch over
+            // host places alone.
+            for (case, cols, places) in [
+                ("from_0", 0..S13, SEL13.to_vec()),
+                ("from_4", 4..S13, SEL13[4..].to_vec()),
+                ("host_only", 0..S13, vec![HOST; S13]),
+            ] {
+                let sel = DeviceBuffer::from_host(stream, &places)?;
+                let mut act = patterned13(c, &pat_x, S13, k)?;
+                let fault = which.launch(c, &xd, cols.clone(), &sel, &mut act)?;
+                let got = cols13(&act.readback(stream)?, k, S13);
+                let diff = leaves13(&got, &want, &pattern, &places, &cols, &(0..0));
+                let pass = diff.is_none() && fault.is_none();
+                ok &= pass;
+                println!(
+                    "relu2_quant[{}:{case}] columns={cols:?} card_columns_are_the_rule_host_columns_are_the_pattern={} fault=\"{}\" {}",
+                    which.name(),
+                    diff.is_none(),
+                    shown(fault),
+                    verdict(pass)
+                );
+                if let Some(d) = diff {
+                    println!("relu2_quant[{}:{case}] first_difference: {d}", which.name());
+                }
+            }
+
+            // Faults: each alone in the fault word, every other card column
+            // the clean launch's.
+            ok &= check_relu2_quant_faults(c, which, &src, &want, &pattern, &pat_x)?;
+        }
+        ok &= check_relu2_quant_graph(c)?;
+        ok &= check_relu2_quant_refusals(c)?;
+        Ok(ok)
+    }
+
+    /// Clause 13's faults for one quantizer. The poisoned source values are
+    /// placed in a card column's data (`CARD`), a host column's (`HOSTCOL`), or
+    /// the stray place's.
+    fn check_relu2_quant_faults(
+        c: &Ctx,
+        which: Quant13,
+        src: &[f32],
+        want: &[Col13],
+        pattern: &[Col13],
+        pat_x: &[f32],
+    ) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let k = which.k();
+        let q5_quant = Some(Fault::at(LAYER_NONE, FaultSite::Q5Quant));
+        let expert_id = Some(Fault::at(LAYER_NONE, FaultSite::ExpertId));
+        let sel = DeviceBuffer::from_host(stream, &SEL13)?;
+        let stray = DeviceBuffer::from_host(stream, &SEL13_STRAY)?;
+        // Source value `at` belongs to the output column(s) `which.columns_of(at)`.
+        // A value in token 1 / column 2 (a card slot's) and in a host slot's.
+        let card_at = match which {
+            Quant13::Rep => N13 + 100,
+            Quant13::ReluSqr => 2 * FF13 + 77,
+        };
+        let host_at = match which {
+            // Token 0's row is read by columns 0..6, SEL13[6] is HOST: the host
+            // slot's own source for the repeating quantizer would be a row the
+            // card slots of the token also read, so the rep case poisons the
+            // row of a token with host columns only (clause below).
+            Quant13::Rep => 0,
+            Quant13::ReluSqr => 6 * FF13 + 9,
+        };
+        let poisons: [(&str, f32); 4] = [
+            ("nan", f32::NAN),
+            ("neg_inf", f32::NEG_INFINITY),
+            ("pos_inf", f32::INFINITY),
+            ("overflow", 1.0e20),
+        ];
+        let mut ok = true;
+        for (name, v) in poisons {
+            // Rep has no rule on the value: its overflow case is a finite
+            // value, which quantizes (no fault); the others are non-finite.
+            let faults = match (which, name) {
+                (Quant13::Rep, "overflow") => None,
+                _ => q5_quant,
+            };
+            let mut x = src.to_vec();
+            x[card_at] = v;
+            let xd = DeviceBuffer::from_host(stream, &x)?;
+            let mut act = patterned13(c, pat_x, S13, k)?;
+            let fault = which.launch(c, &xd, 0..S13, &sel, &mut act)?;
+            let got = cols13(&act.readback(stream)?, k, S13);
+            let bad = which.columns_of(card_at);
+            let diff = leaves13(&got, want, pattern, &SEL13, &(0..S13), &bad);
+            let pass = fault == faults && diff.is_none();
+            ok &= pass;
+            println!(
+                "relu2_quant_fault[{}:card_{name}] fault=\"{}\" want=\"{}\" other_columns_clean={} {}",
+                which.name(),
+                shown(fault),
+                shown(faults),
+                diff.is_none(),
+                verdict(pass)
+            );
+            if let Some(d) = diff {
+                println!(
+                    "relu2_quant_fault[{}:card_{name}] first_difference: {d}",
+                    which.name()
+                );
+            }
+        }
+        // The same values where only the host reads them raise nothing and
+        // store nothing.
+        let host_places: [u32; S13] = {
+            let mut p = SEL13;
+            // The repeating quantizer's token 0 is read by slots 0..6: all
+            // host here; the squared-ReLU one's column 6 already is.
+            if matches!(which, Quant13::Rep) {
+                p[..SPC13].fill(HOST);
+            }
+            p
+        };
+        let host_sel = DeviceBuffer::from_host(stream, &host_places)?;
+        for (name, v) in poisons {
+            let mut x = src.to_vec();
+            x[host_at] = v;
+            let xd = DeviceBuffer::from_host(stream, &x)?;
+            let mut act = patterned13(c, pat_x, S13, k)?;
+            let fault = which.launch(c, &xd, 0..S13, &host_sel, &mut act)?;
+            let got = cols13(&act.readback(stream)?, k, S13);
+            let diff = leaves13(&got, want, pattern, &host_places, &(0..S13), &(0..0));
+            let pass = fault.is_none() && diff.is_none();
+            ok &= pass;
+            println!(
+                "relu2_quant_fault[{}:host_{name}] fault=\"{}\" columns_as_expected={} {}",
+                which.name(),
+                shown(fault),
+                diff.is_none(),
+                verdict(pass)
+            );
+        }
+        // A place past the card that is not HOST: ExpertId alone, its column
+        // not read (the source value its column would load is poisoned), and
+        // every other column as the clean launch leaves it.
+        let mut x = src.to_vec();
+        let stray_at = match which {
+            // Slot 7 is token 1's: poison nothing in its row, which the
+            // other slots of the token read.
+            Quant13::Rep => None,
+            Quant13::ReluSqr => Some(7 * FF13 + 3),
+        };
+        if let Some(at) = stray_at {
+            x[at] = f32::NAN;
+        }
+        let xd = DeviceBuffer::from_host(stream, &x)?;
+        let mut act = patterned13(c, pat_x, S13, k)?;
+        let fault = which.launch(c, &xd, 0..S13, &stray, &mut act)?;
+        let got = cols13(&act.readback(stream)?, k, S13);
+        let diff = leaves13(&got, want, pattern, &SEL13_STRAY, &(0..S13), &(0..0));
+        let pass = fault == expert_id && diff.is_none();
+        ok &= pass;
+        println!(
+            "relu2_quant_fault[{}:stray_place] fault=\"{}\" want=\"{}\" columns_as_expected={} {}",
+            which.name(),
+            shown(fault),
+            shown(expert_id),
+            diff.is_none(),
+            verdict(pass)
+        );
+        if let Some(d) = diff {
+            println!(
+                "relu2_quant_fault[{}:stray_place] first_difference: {d}",
+                which.name()
+            );
+        }
+        Ok(ok)
+    }
+
+    /// Clause 13's graph: both launches captured with [`SEL13`], replayed, the
+    /// places overwritten with [`SEL13_B`] outside the graph, replayed. The
+    /// two quantizers run on one chain here, the squared-ReLU one reading
+    /// what is a stand-in `h`.
+    fn check_relu2_quant_graph(c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let rows = activations(N13, M13, 1311);
+        let h = activations(FF13, S13, 1312);
+        let (pat_x, pat_h) = (activations(N13, S13, 1397), activations(FF13, S13, 1398));
+        let want = |sel: &[u32; S13]| -> Result<(Vec<Col13>, Vec<Col13>), GateError> {
+            let (wx, wh) = (
+                plain13(c, &Quant13::Rep.rule(&rows), S13, N13)?,
+                plain13(c, &Quant13::ReluSqr.rule(&h), S13, FF13)?,
+            );
+            let (px, ph) = (
+                plain13(c, &pat_x, S13, N13)?,
+                plain13(c, &pat_h, S13, FF13)?,
+            );
+            let pick = |w: Vec<Col13>, p: Vec<Col13>| -> Vec<Col13> {
+                (0..S13)
+                    .map(|s| {
+                        if sel[s] < E13 as u32 {
+                            w[s].clone()
+                        } else {
+                            p[s].clone()
+                        }
+                    })
+                    .collect()
+            };
+            Ok((pick(wx, px), pick(wh, ph)))
+        };
+        let xd = DeviceBuffer::from_host(stream, &rows)?;
+        let hd = DeviceBuffer::from_host(stream, &h)?;
+        let mut sel = DeviceBuffer::from_host(stream, &SEL13)?;
+        let mut act_x = patterned13(c, &pat_x, S13, N13)?;
+        let mut act_h = patterned13(c, &pat_h, S13, FF13)?;
+        let graph = c.gpu.capture(|s| {
+            let qx = QuantSel {
+                x: &xd,
+                cols: 0..S13,
+                sel: &sel,
+                n_card: E13,
+            };
+            Quant13::Rep.enqueue(c, s, &qx, &mut act_x)?;
+            let qh = QuantSel {
+                x: &hd,
+                cols: 0..S13,
+                sel: &sel,
+                n_card: E13,
+            };
+            Quant13::ReluSqr.enqueue(c, s, &qh, &mut act_h)
+        })?;
+        let nodes = graph.node_count();
+        let mut ok = true;
+        let mut same = [false; 2];
+        for (i, places) in [SEL13, SEL13_B].iter().enumerate() {
+            if i == 1 {
+                sel.copy_from_host(stream, &SEL13_B)?;
+                // The columns the first replay wrote and this one does not
+                // are the first replay's; the want for replay b is built over
+                // what a is left holding.
+            }
+            graph.launch(stream)?;
+            stream.synchronize()?;
+            let gx = cols13(&act_x.readback(stream)?, N13, S13);
+            let gh = cols13(&act_h.readback(stream)?, FF13, S13);
+            let (wx, wh) = want(places)?;
+            // Replay b over a's leftovers: a column b skips keeps what a wrote.
+            let (ex, eh) = if i == 0 {
+                (wx, wh)
+            } else {
+                let (ax, ah) = want(&SEL13)?;
+                let merge = |b: Vec<Col13>, a: Vec<Col13>| -> Vec<Col13> {
+                    (0..S13)
+                        .map(|s| {
+                            if SEL13_B[s] < E13 as u32 {
+                                b[s].clone()
+                            } else {
+                                a[s].clone()
+                            }
+                        })
+                        .collect()
+                };
+                (merge(wx, ax), merge(wh, ah))
+            };
+            same[i] = gx == ex && gh == eh;
+        }
+        let fault = c.gpu.take_fault()?;
+        let pass = same[0] && same[1] && nodes == 2 && fault.is_none();
+        ok &= pass;
+        println!(
+            "relu2_quant_graph replay_a_is_the_eager_launches={} replay_b_moved_places_is_the_rule={} \
+             graph_nodes={nodes} (want 2) fault=\"{}\" {}",
+            same[0],
+            same[1],
+            shown(fault),
+            verdict(pass)
+        );
+        Ok(ok)
+    }
+
+    /// A [`QuantSel`] of the arguments clause 13's refusals vary.
+    fn q13<'a>(
+        x: &'a DeviceBuffer<f32>,
+        cols: std::ops::Range<usize>,
+        sel: &'a DeviceBuffer<u32>,
+        n_card: usize,
+    ) -> QuantSel<'a> {
+        QuantSel {
+            x,
+            cols,
+            sel,
+            n_card,
+        }
+    }
+
+    /// Clause 13's refusals: each a `Shape` error of its launcher.
+    fn check_relu2_quant_refusals(c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let sink = c.gpu.unlabelled_sink();
+        let rows = DeviceBuffer::from_host(stream, &activations(N13, M13, 1321))?;
+        let few = DeviceBuffer::from_host(stream, &activations(N13, M13 - 1, 1322))?;
+        let h = DeviceBuffer::from_host(stream, &activations(FF13, S13, 1323))?;
+        let h_few = DeviceBuffer::from_host(stream, &activations(FF13, S13 - 1, 1324))?;
+        let sel = DeviceBuffer::from_host(stream, &SEL13)?;
+        let sel_few = DeviceBuffer::from_host(stream, &SEL13[..S13 - 1])?;
+        let mut act_x = Q8Blocks32::with_slots(stream, N13, S13)?;
+        let mut act_h = Q8Blocks32::with_slots(stream, FF13, S13)?;
+        let q5 = c.gpu.q5();
+        let rep = "enqueue_quantize_q8_rep";
+        let relu = "enqueue_quantize_q8_sel_relu_sqr";
+        let cases: [(&str, &str, Result<(), GpuError>); 9] = [
+            (
+                rep,
+                "no_repeat",
+                q5.enqueue_quantize_q8_rep(
+                    stream,
+                    &q13(&rows, 0..S13, &sel, E13),
+                    0,
+                    &mut act_x,
+                    sink,
+                ),
+            ),
+            (
+                rep,
+                "columns_past_the_scratch",
+                q5.enqueue_quantize_q8_rep(
+                    stream,
+                    &q13(&rows, 0..S13 + 1, &sel, E13),
+                    SPC13,
+                    &mut act_x,
+                    sink,
+                ),
+            ),
+            (
+                rep,
+                "a_source_of_too_few_rows",
+                q5.enqueue_quantize_q8_rep(
+                    stream,
+                    &q13(&few, 0..S13, &sel, E13),
+                    SPC13,
+                    &mut act_x,
+                    sink,
+                ),
+            ),
+            (
+                rep,
+                "a_card_of_no_expert",
+                q5.enqueue_quantize_q8_rep(
+                    stream,
+                    &q13(&rows, 0..S13, &sel, 0),
+                    SPC13,
+                    &mut act_x,
+                    sink,
+                ),
+            ),
+            (
+                rep,
+                "too_few_places",
+                q5.enqueue_quantize_q8_rep(
+                    stream,
+                    &q13(&rows, 0..S13, &sel_few, E13),
+                    SPC13,
+                    &mut act_x,
+                    sink,
+                ),
+            ),
+            (
+                relu,
+                "a_card_of_no_expert",
+                q5.enqueue_quantize_q8_sel_relu_sqr(
+                    stream,
+                    &q13(&h, 0..S13, &sel, 0),
+                    &mut act_h,
+                    sink,
+                ),
+            ),
+            (
+                relu,
+                "columns_past_the_scratch",
+                q5.enqueue_quantize_q8_sel_relu_sqr(
+                    stream,
+                    &q13(&h, 0..S13 + 1, &sel, E13),
+                    &mut act_h,
+                    sink,
+                ),
+            ),
+            (
+                relu,
+                "a_source_of_too_few_columns",
+                q5.enqueue_quantize_q8_sel_relu_sqr(
+                    stream,
+                    &q13(&h_few, 0..S13, &sel, E13),
+                    &mut act_h,
+                    sink,
+                ),
+            ),
+            (
+                relu,
+                "too_few_places",
+                q5.enqueue_quantize_q8_sel_relu_sqr(
+                    stream,
+                    &q13(&h, 0..S13, &sel_few, E13),
+                    &mut act_h,
+                    sink,
+                ),
+            ),
+        ];
+        let mut ok = true;
+        for (what, case, r) in cases {
+            let pass = matches!(&r, Err(GpuError::Shape { what: w, .. }) if *w == what);
+            ok &= pass;
+            let seen = match &r {
+                Ok(()) => "Ok (accepted)".to_string(),
+                Err(e) => format!("Err: {e}"),
+            };
+            println!("relu2_quant_refuse[{what}:{case}] {seen} {}", verdict(pass));
+        }
+        stream.synchronize()?;
+        let quiet = c.gpu.take_fault()?.is_none();
+        ok &= quiet;
+        println!(
+            "relu2_quant_refuse[launch_nothing] fault_none={quiet} {}",
+            verdict(quiet)
+        );
+        Ok(ok)
     }
 }

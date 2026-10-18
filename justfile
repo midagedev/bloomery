@@ -263,7 +263,8 @@ gate-gpu-q4k-sel:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_q4k_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_q4k_sel'
 
 # 모델 없는 K-quant expert 계열(bloomery_gpu::kquant): Q5_K `_sel` down과 gate·up(act 런타임 인자)을 합성 스택에서
-# f64 참조의 밴드, 슬롯·m열·폴트·act 절로 보고, 같은 워크의 Q4_K 형제가 q4k_gemv_sel과 비트 동일한지 본다. 모델 파일 없음.
+# f64 참조의 밴드, 슬롯·m열·폴트·act 절로 보고, 같은 워크의 Q4_K 형제가 q4k_gemv_sel과 비트 동일한지 본다. relu² 전문가 카드 레그의
+# 양자화기 둘(열 복제와 relu² 접힘)이 Lightning 형상에서 호스트 규칙과 비트 동일한지도 본다(절 13). 모델 파일 없음.
 gate-gpu-kquant:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kquant && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kquant'
 
@@ -344,7 +345,8 @@ gate-gpu-iq:
 # (ref-synth + seeded IQ4_NL and IQ2_XXS): the IQ2_XS, IQ3_XXS and IQ4_XS gate·ups, the IQ4_NL down `_sel32`, the IQ2_XXS,
 # IQ2_XS, IQ3_XXS and IQ4_XS downs over Q8Act (GLM UD-Q2_K_XL's) and IQ2_XXS's routed up and down at Nemotron 3.5 Bolt's shapes.
 # Bit-equal to the host rule and the plane kernels, the f64 band and pins, the silu rule band, faults, NaN d, a wide
-# activation, capture and named refusals.
+# activation, capture and named refusals. The IQ4_NL down `_sel32` also runs at Lightning's two shapes (K = 2688 and 1856, ten
+# slots on a repeated column) for the relu² card leg's ungated up.
 gate-gpu-iq-sel *ARGS:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_sel {{ARGS}}'
 
@@ -1262,7 +1264,7 @@ gate-gpu-qwen3moe-head:
 # 그룹 int8 텐서코어 GEMM(bloomery_gpu::gemm): 실파일 Qwen3 gate(Q4_K)·down(Q4_K, Q6_K) 스택과 V4.1 routed gate(Q3_K)
 # 하나, 같은 형상의 합성 스택(+ Q5_K), T ∈ {1,15,16,17,64,511,512,4096} × 라우팅 넷을 f64 참조의 유도 밴드에 대고 잰다.
 # fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터. `--bench-kernels`는 판정 대신 런치 값을 잰다
-# (리드 전용, `bench-gpu-kernels`).
+# (리드 전용, `bench-gpu-kernels`). relu² 접힌 32값 블록 양자화기(`g32_relu_sqr`)는 relu_sqr 다음 quantize_gemm32와 비트 동일.
 gate-gpu-gemm *ARGS:
     ./tools/box.sh 'bash tools/gate.sh --oxide --release -p bloomery-gpu-gates --features gpu --bin gate_gemm -- workers_must_complete'
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
