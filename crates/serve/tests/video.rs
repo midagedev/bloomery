@@ -9,7 +9,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
 
 use serve::video::{Clip, Decoder, FfmpegDecoder, VideoError};
 use vision::VisionError;
@@ -161,19 +160,21 @@ const fn linspace(most: usize) -> VideoRule {
     }
 }
 
-/// Decode `indices` at `threads`: each frame that arrives, as (its index, its colour if it is one
-/// colour throughout, its size).
+/// A decoded frame's index, its colour when the frame is one colour throughout, and its size.
+type Decoded = (usize, Option<[u8; 3]>, (usize, usize));
+
+/// Decode `indices` at `threads`: each frame that arrives, as a [`Decoded`].
 fn decode(
     decoder: &FfmpegDecoder,
     clip: &Clip,
     meta: &ClipMeta,
     indices: &[usize],
     threads: usize,
-) -> Result<Vec<(usize, Option<[u8; 3]>, (usize, usize))>, VideoError> {
+) -> Result<Vec<Decoded>, VideoError> {
     let mut got = Vec::new();
     decoder.decode(clip, meta, indices, threads, &mut |i, frame| {
         let first = [frame.data[0], frame.data[1], frame.data[2]];
-        let uniform = frame.data.chunks_exact(3).all(|p| p == first);
+        let uniform = frame.data.as_chunks::<3>().0.iter().all(|p| *p == first);
         assert_eq!(frame.data.len(), frame.width * frame.height * 3);
         got.push((i, uniform.then_some(first), (frame.width, frame.height)));
         true
@@ -257,16 +258,14 @@ fn hw_a_decode_past_the_end_and_a_non_video_are_named_errors() {
 }
 
 /// A 60-second 1080p H.264 clip at 30 fps (x264's default preset, so CABAC and the loop filter are
-/// on) is probed, planned at two frames a second (120 frames,
-/// 60 pairs) and decoded at four threads; every planned frame arrives whole. The decode wall is
-/// printed, twice, beside the machine's load.
+/// on) is probed, planned at two frames a second (120 frames, 60 pairs) and decoded at four
+/// threads; every planned frame arrives whole and in order.
 #[test]
 #[ignore = "gate: just gate-serve-video"]
-fn hw_h264_clip_decodes_its_plan_and_reports_the_wall() {
+fn hw_h264_clip_decodes_its_plan() {
     let decoder = decoder();
     let dir = Dir::new("h264");
     let path = dir.file("long.mp4");
-    let made = Instant::now();
     ffmpeg(
         &[
             "-f",
@@ -283,16 +282,8 @@ fn hw_h264_clip_decodes_its_plan_and_reports_the_wall() {
         None,
         &path,
     );
-    let bytes = std::fs::read(&path).expect("the clip");
-    println!(
-        "gate video: made a {} MiB H.264 clip in {:.1} s",
-        bytes.len() >> 20,
-        made.elapsed().as_secs_f64()
-    );
-    let clip = Clip::new(bytes, Some("mp4"));
-    let probed = Instant::now();
+    let clip = Clip::new(std::fs::read(&path).expect("the clip"), Some("mp4"));
     let meta = decoder.probe(&clip).expect("the probe");
-    let probe_s = probed.elapsed().as_secs_f64();
     assert_eq!(
         meta,
         ClipMeta {
@@ -306,31 +297,16 @@ fn hw_h264_clip_decodes_its_plan_and_reports_the_wall() {
     assert_eq!(p.indices.len(), 120);
     assert_eq!(p.groups.len(), 60);
     let want = p.decode_indices();
-    for run in 1..=2 {
-        let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
-        let started = Instant::now();
-        let mut n = 0;
-        let mut last = None;
-        decoder
-            .decode(&clip, &meta, &want, 4, &mut |i, frame| {
-                assert_eq!(frame.data.len(), 1920 * 1080 * 3);
-                assert!(last.is_none_or(|l| i > l), "frames arrive in order");
-                last = Some(i);
-                n += 1;
-                true
-            })
-            .expect("the decode");
-        let wall = started.elapsed().as_secs_f64();
-        assert_eq!(n, want.len());
-        println!(
-            "stat video decode: run {run}, 1920x1080 H.264, 60 s, {} source frames, {} planned, \
-             threads 4, wall_s {wall:.2}, probe_s {probe_s:.2}, loadavg {}",
-            meta.frames,
-            want.len(),
-            load.split_whitespace()
-                .take(3)
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-    }
+    let mut n = 0;
+    let mut last = None;
+    decoder
+        .decode(&clip, &meta, &want, 4, &mut |i, frame| {
+            assert_eq!(frame.data.len(), 1920 * 1080 * 3);
+            assert!(last.is_none_or(|l| i > l), "frames arrive in order");
+            last = Some(i);
+            n += 1;
+            true
+        })
+        .expect("the decode");
+    assert_eq!(n, want.len());
 }
