@@ -256,7 +256,7 @@ __bounded_bg_end() {
 }
 
 bounded_bg_stop() {
-  local bg_rc=0 bg_status=0 bg_i bg_state
+  local bg_rc=0 bg_status=0 bg_end bg_state
   [ -n "$BG_LIVE" ] || return 0
   trap '' TERM INT HUP
   if [ -n "$BG_PID" ]; then
@@ -265,8 +265,10 @@ bounded_bg_stop() {
       wait "$BG_PID" 2> /dev/null || bg_status=$?
     else
       # A failed stop can leave a process no signal ends (uninterruptible I/O): its status is collected only once it
-      # has ended, within 1 s, and one still alive then, or a process table that cannot be read, is left without a wait.
-      for ((bg_i = 0; bg_i < 10; bg_i++)); do
+      # has ended, by a deadline on the shell's whole-second clock (at most 2 s, whatever each process-table read
+      # costs), and one still alive then, or a process table that cannot be read, is left without a wait.
+      bg_end=$((SECONDS + 1))
+      while :; do
         bg_state=$(set -o pipefail; ps -eo pid=,stat= | awk -v pid="$BG_PID" '$1 == pid { print $2 }') || break
         case $bg_state in
           '' | Z*)
@@ -274,6 +276,7 @@ bounded_bg_stop() {
             break
             ;;
         esac
+        [ "$SECONDS" -le "$bg_end" ] || break
         sleep 0.1 9>&-
       done
     fi
@@ -311,7 +314,7 @@ bounded_bg_wait() {
 #   timeout-fork       fork-exit is the monitor that exits before it reached its command: monitor-exit; the real
 #                      timeout's own case is lease.sh's `fork` form and stack-watch.sh's fork-exit rows
 #   cleanup-status     cleanup-fail: a stop that fails is the runner's status (70), a signal's included
-#   cleanup-alive      a stop that fails with the monitor alive returns 70 within 1 s, with no wait on it
+#   cleanup-alive      a stop that fails with the monitor alive returns 70 within 2 s, with no wait on it
 #   output-setup       fifo-fail: a stdin or output file that cannot be opened ends the command, not the runner, and
 #                      starts nothing that outlives the call
 #   output-filter      lease.sh --self-test, bounded-filter-open-term-*: the filter's guard stands before it starts
@@ -511,7 +514,7 @@ EOF
     check "$tag-left" "${left:-none}" none
     reap "$t/$tag.pid"
   done
-  # cleanup-alive: a stop that fails with the monitor still alive returns 70 within 1 s and never waits on it.
+  # cleanup-alive: a stop that fails with the monitor still alive returns 70 within 2 s and never waits on it.
   cat > "$t/alive-runner" << 'EOF'
 source "$GB"
 lease_stop() { return 70; }
