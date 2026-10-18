@@ -1005,6 +1005,11 @@ DF
   grep -q '^WAIT_POLL=1$' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-poll copy did not patch (WAIT_POLL's line moved?)" >&2; return 70; }
   grep -q '^DIRLOCK_WAIT=3 ' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast dir-lock copy did not patch (DIRLOCK_WAIT's line moved?)" >&2; return 70; }
   grep -q '^REAP_TICKS=5 ' "$t/tools/gate-batch-fast.sh" || { echo "gate-batch: self-test: the fast-reap copy did not patch (REAP_TICKS's line moved?)" >&2; return 70; }
+  # 2026-10-18: GBFAST=2 is that copy with a dir-lock bound of 30 s. The held case needs the 3 s bound to run out, but the free case
+  # reads held twice and free once, a second apart, and checks the bound after each read: a probe of a second under load (two reads
+  # make 3 s) ends the wait before the third read and the item is not retried. Thirty seconds leaves room for ten probes of a second.
+  sed -e 's/^DIRLOCK_WAIT=3 /DIRLOCK_WAIT=30 /' "$t/tools/gate-batch-fast.sh" > "$t/tools/gate-batch-fast-dl.sh"
+  grep -q '^DIRLOCK_WAIT=30 ' "$t/tools/gate-batch-fast-dl.sh" || { echo "gate-batch: self-test: the long dir-lock copy did not patch (DIRLOCK_WAIT's line moved?)" >&2; return 70; }
   export BLOOMERY_GATE_TIMES=$t/times.tsv
   if gb_part 1; then
   check 'classes: an any-form v41-load recipe is a chain member over both cards' 0 \
@@ -1342,7 +1347,7 @@ FP
     rm -rf "$t/fake-state" "$@"
   }
   steal_case() { # <tag> <times rows…> -- <items…>: one real batch run on the fixture, rc printed;
-    # LEASE_UP=1 puts the fake lease up before the batch starts; GBFAST=1 runs the fast-retry copy above
+    # LEASE_UP=1 puts the fake lease up before the batch starts; GBFAST=1 runs the fast-retry copy above, GBFAST=2 that copy with a longer dir-lock bound
     local tag=$1 rc=0 runner=("${gb[@]}")
     local times=${STEAL_TIMES:-$t/times-$tag.tsv} # STEAL_TIMES: the times file's place, which also places the board directory beside it
     shift
@@ -1360,6 +1365,7 @@ FP
     fi
     # LFLAG: the ledger flag of the batch (default the round's); MTAG: a mutant copy's tag
     [ "${GBFAST:-}" != 1 ] || runner=(bash "$t/tools/gate-batch-fast.sh")
+    [ "${GBFAST:-}" != 2 ] || runner=(bash "$t/tools/gate-batch-fast-dl.sh")
     [ -z "${MTAG:-}" ] || runner=(bash "$t/tools/gate-batch-$MTAG.sh")
     # AWAIT: the fake's FAKE_AWAIT_MAP, DELAY: its FAKE_START_DELAY (the header above the fake)
     # The box queue's daemon is the twin cases' fake (fake-ssh, twinq/): no case reaches a real box.
@@ -3227,7 +3233,7 @@ EOS
   want_not "yield: and its DONE line counts no yielded=" "$t/target/c-yield-lead/run.log" 'yielded='
   # rc 83 (the header): box.sh refused to replace a tree a job of the remote directory runs in. The item waits for the holder (the fake's
   # FAKE_DIRLOCK_HELD probes read held, then free) and runs once more; the fake box ends the item's first FAKE_RC83 calls 83.
-  rc=$(FAKE_DIRLOCK_HELD=2 GBFAST=1 steal_case dl-free "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_RC83=1')
+  rc=$(FAKE_DIRLOCK_HELD=2 GBFAST=2 steal_case dl-free "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_RC83=1')
   printf '%s' "$rc" > "$t/rc-dl-free"
   rc_ok 'rc 83: an item refused once by a holder is retried when the holder ends, and ends green' dl-free 1
   want 'rc 83: its line is the second try and names the wait' "$t/target/c-dl-free/run.log" '^plain-any rc=0 [0-9]+s try=2 lane=[AB] tier=real dirlock=[0-9]+s( |$)'
