@@ -102,6 +102,7 @@ install -d -o root -g root -m 0755 "$LIB"
 install -o root -g root -m 0755 "$SRC/tools/nightly/run.sh" "$LIB/run.sh"
 install -o root -g root -m 0755 "$SRC/tools/nightly/units.sh" "$LIB/units.sh"
 install -o root -g root -m 0755 "$SRC/tools/nightly/mail.sh" "$LIB/mail.sh"
+install -o root -g root -m 0644 "$SRC/tools/gate-bound.sh" "$LIB/gate-bound.sh"
 install -o root -g root -m 0644 "$SRC/tools/nightly/bloomery-nightly.service" /etc/systemd/system/bloomery-nightly.service
 install -o root -g root -m 0644 "$SRC/tools/nightly/bloomery-nightly.timer" /etc/systemd/system/bloomery-nightly.timer
 systemd-analyze verify /etc/systemd/system/bloomery-nightly.service /etc/systemd/system/bloomery-nightly.timer
