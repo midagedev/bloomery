@@ -67,7 +67,7 @@
 set -uo pipefail
 # The bounded child's owner (bounded): --analyze and --marker run before the lease is sourced.
 # shellcheck source=tools/gate-bound.sh
-source "${BASH_SOURCE[0]%/*}/../gate-bound.sh"
+source "${BASH_SOURCE[0]%/*}/../gate-bound.sh" || exit 70
 # 데이터 디렉터리 기본값(BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
 # 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다 — tools/box.sh가 ref-paths.sh의 MODEL을 그 이름으로
 # export한다(generate 자신에게는 기본값이 없다).

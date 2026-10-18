@@ -21,7 +21,7 @@
 # 64 on a bad command line.
 set -uo pipefail
 # shellcheck source=tools/gate-bound.sh
-source "${BASH_SOURCE[0]%/*}/../gate-bound.sh"
+source "${BASH_SOURCE[0]%/*}/../gate-bound.sh" || exit 70
 
 usage() {
   echo "usage: stack-watch.sh QUIET COMM -- CMD [ARGS...]  (QUIET whole seconds from 1)" >&2

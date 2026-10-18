@@ -57,7 +57,7 @@
 LG_FED_RE='^fed '
 # The process's bound and its cancellation are the owner's: bounded_bg.
 # shellcheck source=tools/gate-bound.sh
-source "${BASH_SOURCE[0]%/*}/../gate-bound.sh"
+source "${BASH_SOURCE[0]%/*}/../gate-bound.sh" || exit 70
 LG_MODE=${BLOOMERY_AB_LOAD:-key}
 case $LG_MODE in
   key | arm) ;;

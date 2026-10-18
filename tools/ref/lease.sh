@@ -68,7 +68,7 @@ LEASE_TREE=$(cd "$__lease_dir/../.." 2> /dev/null && pwd) || LEASE_TREE=
 source "$__lease_dir/lease-probe.sh"
 # run_bounded and lease_stop, the shared bounded-command cleanup: tools/gate-bound.sh.
 # shellcheck source=tools/gate-bound.sh
-source "$__lease_dir/../gate-bound.sh"
+source "$__lease_dir/../gate-bound.sh" || exit 70
 unset __lease_dir
 
 # The lease is descriptor 9 on LEASE_LOCK, held until the runner exits or calls lease_release — and
@@ -471,9 +471,11 @@ lease_bounded() { bounded "$@"; }
 # (LEASE_OUT_FILE, and LEASE_OUT_FIFO for a live filter; pass either as LEASE_BOUNDED_OUT), removed by lease_out_clean, which it adds to
 # the runner's EXIT trap without replacing it (call it again after a later `trap … EXIT`). A handler that exits must call
 # lease_out_clean itself first: the one appended after it would not run, so lease_out_init refuses such a handler (70).
+# The directory is the capture's own: whatever a caller keeps in it (a stderr file for LEASE_BOUNDED_ERR) goes with it, and
+# the cleanup returns 0, so it never changes the status of a runner that exits under set -e.
 LEASE_OUT_DIR='' LEASE_OUT_FILE='' LEASE_OUT_FIFO='' LEASE_OUT=''
 lease_out_clean() {
-  [ -z "$LEASE_OUT_DIR" ] || { rm -f "$LEASE_OUT_FILE" "$LEASE_OUT_FIFO"; rmdir "$LEASE_OUT_DIR" 2> /dev/null; }
+  [ -z "$LEASE_OUT_DIR" ] || rm -rf -- "$LEASE_OUT_DIR" || :
   return 0
 }
 lease_out_init() {
@@ -1325,7 +1327,8 @@ EOF
       timeout --kill-after=10 60 "$2/held" "$2/restore-pid" &
       server=$!
       trap '\''trap "" TERM INT HUP; lease_stop "$server" || exit $?; echo server-stopped; exit 143'\'' TERM
-      for ((i = 0; i < 100; i++)); do
+      # Readiness is the signal; the bound is only the hang guard: the 60 s bound of the held stub.
+      for ((i = 0; i < 600; i++)); do
         cancel_ready "$2/restore-pid" && break
         sleep 0.1
       done
@@ -1706,6 +1709,14 @@ EOF
       _ "$LEASE_TREE/tools/ref/lease.sh" "$t/exit-handler.dir" > /dev/null 2>&1 || RC=$?
     check bounded-out-exit-handler-rc "$RC" 5
     check bounded-out-exit-handler-clean "$([ -d "$(cat "$t/exit-handler.dir" 2> /dev/null)" ] && echo left || echo gone)" gone
+    # A file a caller keeps in the directory (the stderr file of LEASE_BOUNDED_ERR) goes with it, and under the runner's set -e the
+    # cleanup leaves the runner's exit status alone.
+    RC=0
+    bash -c 'set -e; source "$1"; lease_out_init; : > "$LEASE_OUT_DIR/err"; echo "$LEASE_OUT_DIR" > "$2"; exit 0' \
+      _ "$LEASE_TREE/tools/ref/lease.sh" "$t/stray.dir" > /dev/null 2>&1 || RC=$?
+    check bounded-out-stray-file-rc "$RC" 0
+    cdir=$(cat "$t/stray.dir" 2> /dev/null)
+    check bounded-out-stray-file-clean "$([ -n "$cdir" ] && [ ! -e "$cdir" ] && echo removed || echo left)" removed
     cat > "$t/exit-trap-runner" << 'EOF'
 source "$1"
 TRAP_READS=$3.reads
