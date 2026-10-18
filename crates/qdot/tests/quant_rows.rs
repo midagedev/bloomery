@@ -57,6 +57,8 @@
 
 #![cfg(target_arch = "x86_64")]
 
+mod common;
+
 use std::sync::OnceLock;
 
 use gguf::quant::{QuantError, dequant_row, half_to_f32, quantize_activations};
@@ -311,24 +313,19 @@ impl Form {
         let half = |b: &[u8]| half_to_f32(u16::from_le_bytes([b[0], b[1]]));
         let scaled = |d: f32, q: u8| f64::from(d * f32::from(q as i8));
         let values: Vec<f64> = match self {
-            Form::F32 => bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f64::from(f32::from_le_bytes(*c)))
-                .collect(),
-            Form::F16 => bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| f64::from(half(c)))
-                .collect(),
-            Form::Q8_0 => bytes
-                .as_chunks::<34>()
-                .0
-                .iter()
-                .flat_map(|b| b[2..].iter().map(move |&q| scaled(half(b), q)))
-                .collect(),
+            // The weight types of the same names: their dequantizer is the decoder (clause (b) holds it to ggml's `to_float`).
+            Form::F32 | Form::F16 | Form::Q8_0 => {
+                let ty = GgmlType::from_u32(
+                    set()
+                        .type_row(self.name())
+                        .unwrap_or_else(|e| panic!("{e}"))
+                        .id,
+                );
+                let mut out = vec![0.0; k];
+                dequant_row(ty, bytes, &mut out)
+                    .unwrap_or_else(|e| panic!("{} activation row: {e}", self.name()));
+                out.into_iter().map(f64::from).collect()
+            }
             Form::Q8_1 => bytes
                 .as_chunks::<36>()
                 .0
@@ -344,26 +341,12 @@ impl Form {
                     b[4..260].iter().map(move |&q| scaled(d, q))
                 })
                 .collect(),
-            // `qdot::col_bytes`'s column: groups of four blocks (four bf16 scales at 0, four i16 code sums at 8, four runs of 32
-            // codes at 16; 144 bytes), then the 36-byte `block_q8_2` tails (bf16 scale at 0, i16 sum at 2, codes at 4). The
-            // oracle never holds one (mainline has no such type): it is the encoder's own bytes.
-            Form::Q82X4 => {
-                let bf16 =
-                    |b: &[u8]| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16);
-                let (groups, rest) = bytes.as_chunks::<144>();
-                let (tails, left) = rest.as_chunks::<36>();
-                assert!(left.is_empty(), "q8_2_x4 column of {} bytes", bytes.len());
-                let grouped = groups.iter().flat_map(|g| {
-                    (0..4).flat_map(move |ir| {
-                        let d = bf16(&g[2 * ir..]);
-                        g[16 + 32 * ir..][..32].iter().map(move |&q| scaled(d, q))
-                    })
-                });
-                let tailed = tails
-                    .iter()
-                    .flat_map(|b| b[4..].iter().map(move |&q| scaled(bf16(b), q)));
-                grouped.chain(tailed).collect()
-            }
+            // The encoder's own bytes (the oracle holds none: mainline has no such type), read by the qdot gates' one reader.
+            // A bf16 scale times an i8 code is exact in f32, so narrowing the f64 product is the f32 product the others use.
+            Form::Q82X4 => common::restore_q82x4(bytes)
+                .into_iter()
+                .map(|v| f64::from(v as f32))
+                .collect(),
         };
         assert_eq!(
             values.len(),

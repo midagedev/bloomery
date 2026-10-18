@@ -9,9 +9,13 @@
 //!
 //! The gates assert with `assert!` (not `debug_assert!`) because they run in release.
 
+mod common;
+
+use common::restore_q82x4;
 use gguf::GgmlType;
 use gguf::quant::{
-    dequant_row, half_to_f32, quantize_row_q8_0_roundtrip, quantize_row_q8_k_roundtrip,
+    dequant_row, half_to_f32, quantize_row_q8_0_roundtrip, quantize_row_q8_2_x4_roundtrip,
+    quantize_row_q8_k_roundtrip,
 };
 #[cfg(target_arch = "x86_64")]
 use qdot::dot_row_avx2;
@@ -1204,25 +1208,6 @@ fn hw_q5k_kernel_predicts_ik() {
     );
 }
 
-/// A q8_2_x4 column as the kernels read it: per 32-value block, the bf16 scale at `2*ir` of its
-/// 144-byte group times each i8 code at `16 + 32*ir`. Whole groups only — a K-quant column
-/// has no tail blocks.
-fn restore_q82x4(acol: &[u8]) -> Vec<f64> {
-    assert!(acol.len().is_multiple_of(144), "whole 144-byte groups only");
-    let mut out = Vec::with_capacity(acol.len() / 144 * 128);
-    for g in acol.as_chunks::<144>().0 {
-        for ir in 0..4 {
-            let d = f32::from_bits(u32::from(u16::from_le_bytes([g[2 * ir], g[2 * ir + 1]])) << 16);
-            out.extend(
-                g[16 + 32 * ir..16 + 32 * ir + 32]
-                    .iter()
-                    .map(|&q| f64::from(d) * f64::from(q as i8)),
-            );
-        }
-    }
-    out
-}
-
 /// Q5_K dequantization: `dequant_row` equals ggml's own `to_float` (dumped by q5k_x4_ref.cpp)
 /// on the tensor's first rows, bit for bit — the transcription keeps ggml's operation order,
 /// including the multiply-subtract the compiled library fuses. Then the kernel against an f64
@@ -1278,6 +1263,11 @@ fn hw_q5k_dequant_matches_ggml() {
         c.k, c.name
     );
 
+    // A K-quant column is whole 144-byte groups: it has no tail blocks.
+    assert!(
+        c.acol.len().is_multiple_of(144),
+        "whole 144-byte groups only"
+    );
     let act = restore_q82x4(&c.acol);
     let mut max_abs = 0.0f64;
     let mut denom = 0.0f64;
@@ -4015,6 +4005,29 @@ fn q82_blocks(col: &[u8], n_blocks: usize) -> Vec<([i8; 32], u16, i16)> {
             }
         })
         .collect()
+}
+
+/// The qdot gates' one q8_2_x4 reader (`common::restore_q82x4`) against the rule's round trip, on every shape of block count:
+/// groups only, tails only, both. Its tail arm is read by no oracle case (their `k` is a whole number of groups), so this
+/// is the clause that pins it.
+#[test]
+fn restore_q82x4_reads_groups_and_tails() {
+    for nb in [1usize, 3, 4, 5, 7, 9] {
+        let k = 32 * nb;
+        // Blocks of different magnitude, so a block read with another's scale is a wrong value.
+        let x: Vec<f32> = (0..k)
+            .map(|i| (i as f32 * 0.37).sin() * (1.0 + (i / 32) as f32))
+            .collect();
+        let mut col = vec![0u8; col_bytes(GgmlType::IQ4_NL, k)];
+        quantize_col(GgmlType::IQ4_NL, &x, &mut col);
+        let mut rt = vec![0.0f32; k];
+        quantize_row_q8_2_x4_roundtrip(&x, &mut rt);
+        let restored = restore_q82x4(&col);
+        assert_eq!(restored.len(), k, "{nb} blocks");
+        for (i, (r, w)) in restored.iter().zip(&rt).enumerate() {
+            assert_eq!(*r, f64::from(*w), "{nb} blocks, value {i}");
+        }
+    }
 }
 
 /// The q8_2 encoders (scalar and AVX2) against ik's rule where the bf16 scale
