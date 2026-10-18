@@ -48,8 +48,9 @@
 # `# build <commit>+<patch>`, which the refset family pins. The commit is the first 9 digits of the tree's upstream commit
 # (BUILD_PIN); the patch is `oracle_patch_hash`, the 12 digits that name the tree's tracked files against that commit, for the
 # trees that carry local commits (ik-tilde, ik-tokref). A mainline tree has none: its HEAD is the commit, with no tracked change,
-# and llama-tokenize's own `--version` names it. ik's llama-tokenize has no `--version`: its build is held to be newer than every
-# source of the tree, and V4.1's `~` probe (below) shows the patch's effect in the binary. The executable's and the library's md5s
+# and llama-tokenize's own `--version` names it. Every build is also held to be newer than every source of the tree (the commit
+# does not say which sources the library holds); ik's llama-tokenize has no `--version`, so its age is all there is, and V4.1's
+# `~` probe (below) shows the patch's effect in the binary. The executable's and the library's md5s
 # stay in the manifest (tools/ref/emb2/emb2.sh holds the ids to this machine's binary) but change with every rebuild, so no
 # family pins them. A tree that moved is a new pin, read off the tree: `source tools/ref/emb2/oracle-tree.sh; oracle_patch_hash
 # <tree> <commit>`.

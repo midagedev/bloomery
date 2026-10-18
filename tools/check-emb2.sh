@@ -84,6 +84,7 @@ class Writer(unittest.TestCase):
 case " $* " in
   *' rev-parse HEAD '*) printf '%s\\n' "$FIXTURE_PIN" ;;
   *' status '*) exit "${FIXTURE_STATUS_RC:-0}" ;;
+  *' ls-files '*) exit 0 ;;
   *) exit 91 ;;
 esac
 """, True)
@@ -262,7 +263,7 @@ class Builders(unittest.TestCase):
             write(bin_dir / lib, "")
         write(root / "bin/git", '#!/bin/bash\ncase " $* " in\n'
               '  *" rev-parse HEAD "*) echo "${FIXTURE_HEAD:-' + self.PIN + '}" ;;\n'
-              '  *" status "*) exit 0 ;;\n  *) exit 91 ;;\nesac\n', True)
+              '  *" status "*) exit 0 ;;\n  *" ls-files "*) exit 0 ;;\n  *) exit 91 ;;\nesac\n', True)
         # The script builds refset-check with cargo, then runs it through tools/host-gate.sh; the stub binary is what that build leaves.
         write(root / "bin/cargo", '#!/bin/bash\n'
               '[ "$*" = "build --release -p bloomery-refset --bin refset-check" ] || exit 91\n'

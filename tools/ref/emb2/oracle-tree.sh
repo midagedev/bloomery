@@ -21,11 +21,13 @@
 # Each BINARY (default llama-server) under TREE/build/bin must exist, and must be the tree's build:
 #   - by its library: `ldd` names the libllama.so it loads, and that file, symlinks resolved, lies under TREE/build. A library
 #     from anywhere else (LD_LIBRARY_PATH, a system copy) holds other sources than the tree's, whatever the binary reports.
-#   - by its own report: `--version` names a commit that is a prefix of the tree's HEAD. A tree rebuilt without a readable git
-#     reports `commit unknown` there and is refused: it is not the commit's build.
-#   - with --unversioned (a binary that reports no commit, as ik's llama-tokenize), by its age: it and that libllama.so must be
-#     newer than every tracked file under src/, include/ and examples/tokenize/. A tree whose files moved after the build is
-#     refused. The patch's effect is the caller's to probe where the patch has a visible one.
+#   - by its own report, unless --unversioned (a binary that reports no commit, as ik's llama-tokenize): `--version` names a
+#     commit that is a prefix of the tree's HEAD. A tree rebuilt without a readable git reports `commit unknown` there and is
+#     refused: it is not the commit's build.
+#   - by its age, always: it and that libllama.so must be newer than every tracked file under src/, include/ and
+#     examples/tokenize/. The commit a binary reports does not say which sources its library holds: a tree whose files moved
+#     after the build, an edit restored included, is refused. The patch's effect is the caller's to probe where the patch has a
+#     visible one.
 # --built-by TEXT is the remedy a missing file names in its error.
 oracle_tree() {
   local patch='' versioned=1 built_by=''
@@ -75,13 +77,12 @@ oracle_tree() {
       # The whole commit token, 7 hex digits or more, a prefix of the tree's HEAD.
       [[ $report =~ $re ]] && [ "${head:0:${#BASH_REMATCH[1]}}" = "${BASH_REMATCH[1]}" ] ||
         { echo "$who: $tree/build/bin/$bin is not built at ${head:0:7}: $report" >&2; exit 2; }
-    else
-      for got in "$tree/build/bin/$bin" "$lib"; do
-        file=$(oracle_newer_source "$tree" "$got") || { echo "$who: cannot list the tracked sources of $tree" >&2; exit 2; }
-        [ -z "$file" ] ||
-          { echo "$who: $got is older than $tree/$file, a tracked file: it is not this tree's build" >&2; exit 2; }
-      done
     fi
+    for got in "$tree/build/bin/$bin" "$lib"; do
+      file=$(oracle_newer_source "$tree" "$got") || { echo "$who: cannot list the tracked sources of $tree" >&2; exit 2; }
+      [ -z "$file" ] ||
+        { echo "$who: $got is older than $tree/$file, a tracked file: it is not this tree's build" >&2; exit 2; }
+    done
   done
 }
 
