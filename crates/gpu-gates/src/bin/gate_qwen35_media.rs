@@ -82,7 +82,9 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu::{Gpu, GpuError, capture_template};
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, sha256, verdict};
+    use bloomery_gpu_gates::{
+        GateError, checks_failed, equal, first_diff, oracle_row, ref_model_path, sha256, verdict,
+    };
     use bloomery_gpu_vision::f32_bf16;
     use gguf::Split;
     use refset::arch::qwen35::MODEL_FLASH_Q8;
@@ -390,30 +392,6 @@ mod gate {
 
     // ------------------------------------------------------------ helpers
 
-    /// The first index at which `a` and `b` differ in bits, or `None` when equal (a length that differs is
-    /// index 0).
-    fn first_diff(a: &[f32], b: &[f32]) -> Option<usize> {
-        if a.len() != b.len() {
-            return Some(0);
-        }
-        a.iter()
-            .zip(b)
-            .position(|(x, y)| x.to_bits() != y.to_bits())
-    }
-
-    fn equal(what: &str, a: &[f32], b: &[f32]) -> bool {
-        let d = first_diff(a, b);
-        println!(
-            "    {what}: {} values {}",
-            a.len(),
-            d.map_or_else(
-                || "equal bit for bit".to_string(),
-                |i| format!("differ from value {i}")
-            )
-        );
-        d.is_none()
-    }
-
     fn spans_of(m: &MropeSeq) -> Vec<(usize, usize, usize)> {
         m.spans().collect()
     }
@@ -498,28 +476,6 @@ mod gate {
     }
 
     // ------------------------------------------------------------ the rotation table
-
-    /// The rotation row of the position triple `(t, h, w)` from the plain table `plain` (`ROT` values a
-    /// position, a cos and a sin per pair), by ggml's interleaved M-RoPE written out: pair `s` of sector
-    /// `s mod 32` takes the h position at sectors 1 mod 3 below 33, the w position at 2 mod 3 below 30 and the
-    /// t position at 0 mod 3 below 33.
-    fn oracle_row(plain: &[f32], (t, h, w): (usize, usize, usize)) -> [f32; ROT] {
-        let mut row = [0.0; ROT];
-        for s in 0..ROT / 2 {
-            let sector = s % 32;
-            let q = if sector % 3 == 1 && sector < 33 {
-                h
-            } else if sector % 3 == 2 && sector < 30 {
-                w
-            } else if sector % 3 == 0 && sector < 33 {
-                t
-            } else {
-                0
-            };
-            row[2 * s..2 * s + 2].copy_from_slice(&plain[q * ROT + 2 * s..q * ROT + 2 * s + 2]);
-        }
-        row
-    }
 
     /// The (t, h, w) of sequence row `r` of prompt `c` as set C feeds it: the dumped triple inside the prompt,
     /// the text position after it (the last row's position, advanced) beyond.
@@ -638,7 +594,7 @@ mod gate {
         let bad = (0..CTX).find(|&r| {
             first_diff(
                 &table[r * ROT..(r + 1) * ROT],
-                &oracle_row(plain, feed_position(c, r)),
+                &oracle_row::<ROT>(plain, feed_position(c, r)),
             )
             .is_some()
         });
@@ -1300,7 +1256,7 @@ mod gate {
             let p = at(i) as usize;
             first_diff(
                 &table[(n + i) * ROT..(n + i + 1) * ROT],
-                &oracle_row(plain, (p, p, p)),
+                &oracle_row::<ROT>(plain, (p, p, p)),
             )
             .is_some()
         });

@@ -378,7 +378,7 @@
 //!   the prompts `c1` and `c2` equal set F's CUDA ids over the prefix on which the set's CPU twin
 //!   (a second reading of mainline) gives the same ids, at least [`F_MIN_PREFIX`] long and
 //!   printed; at the first difference the oracle's id must be the server's own runner-up within
-//!   [`F_NEAR_TIE`] of its top ([`follows`]). FAIL-first: the span's rows zeroed in the seat's
+//!   [`F_NEAR_TIE`] of its top (`ChatReply::follows`). FAIL-first: the span's rows zeroed in the seat's
 //!   `prefill_media`. The grid's order is not this clause's pin (a grid taken as `(ny, nx)` stays
 //!   inside the near-tie band): the vision crate's `a_spans_grid_runs_along_the_images_width`
 //!   holds it. The clause's precondition,
@@ -455,9 +455,9 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
-        self, Answer, PrefixTurns, Served, agree, chat_is_those_ids, check, curl,
-        edit_and_extension, ids_of, json_of, metric, parse_ids, rendered, serve_cmd, server_log,
-        tokenized,
+        self, Answer, PrefixTurns, Served, agree, answered, chat_is_those_ids, check, curl,
+        edit_and_extension, greedy_chat, ids_of, json_of, metric, parse_ids, rendered, serve_cmd,
+        server_log, tokenized,
     };
     use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
     use bloomery_gpu_gates::{GateError, checks_failed, sha256};
@@ -3307,82 +3307,6 @@ mod gate {
         Ok((h, rx))
     }
 
-    /// The ids a greedy chat answered, each with the runner-up of its step and the gap between the
-    /// top two logprobs (`None` where the answer carried one only), the prompt's token count and
-    /// the text the ids say.
-    struct Answer35 {
-        ids: Vec<u32>,
-        second: Vec<Option<(u32, f64)>>,
-        prompt: u64,
-        text: String,
-    }
-
-    /// `body` as a greedy chat of `n` tokens with each step's two best tokens returned, no prompt
-    /// cache.
-    fn ask(body: &Value, n: usize) -> Value {
-        let mut b = body.clone();
-        b["max_tokens"] = json!(n);
-        b["temperature"] = json!(0);
-        b["cache_prompt"] = json!(false);
-        b["logprobs"] = json!(true);
-        b["top_logprobs"] = json!(2);
-        b
-    }
-
-    /// The answer in `status`/`text` of a chat of [`ask`], or a named error.
-    fn answered(status: u16, text: &str) -> Result<Answer35, GateError> {
-        let v = json_of("/v1/chat/completions", status, text)?;
-        let content = v["choices"][0]["logprobs"]["content"]
-            .as_array()
-            .ok_or("the chat answer carries no logprobs content")?;
-        let (mut ids, mut second) = (Vec::new(), Vec::new());
-        for e in content {
-            ids.push(u32::try_from(
-                e["id"].as_u64().ok_or("a logprobs entry with no id")?,
-            )?);
-            second.push(e["top_logprobs"].as_array().and_then(|t| {
-                let (a, b) = (t.first()?, t.get(1)?);
-                Some((
-                    u32::try_from(b["id"].as_u64()?).ok()?,
-                    a["logprob"].as_f64()? - b["logprob"].as_f64()?,
-                ))
-            }));
-        }
-        let msg = &v["choices"][0]["message"];
-        Ok(Answer35 {
-            ids,
-            second,
-            prompt: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-            text: format!(
-                "{}{}",
-                msg["reasoning_content"].as_str().unwrap_or(""),
-                msg["content"].as_str().unwrap_or("")
-            ),
-        })
-    }
-
-    /// Set F's rule for one prompt, over the prefix where the oracle's own CUDA and CPU runs agree
-    /// (`want.agree`; past it the oracle is two engines' roundings parting and holds nothing): the
-    /// server's greedy ids equal the oracle's CUDA ids, or at the first difference the oracle's id
-    /// is the server's own runner-up within [`F_NEAR_TIE`] of its top (a near tie, where two
-    /// engines' roundings may part) and nothing after it is held. The step the ids agreed up to, the gap at the first difference when there is
-    /// one, and whether the rule holds; an answer shorter than the prefix fails.
-    fn follows(a: &Answer35, want: &Decoded) -> (usize, Option<f64>, bool) {
-        if a.ids.len() < want.agree {
-            return (a.ids.len(), None, false);
-        }
-        for k in 0..want.agree {
-            if a.ids[k] == want.ids[k] {
-                continue;
-            }
-            let gap = a.second[k]
-                .filter(|&(id, _)| id == want.ids[k])
-                .map(|(_, g)| g);
-            return (k, gap, gap.is_some_and(|g| g < F_NEAR_TIE));
-        }
-        (want.agree, None, true)
-    }
-
     /// The `vision` record and `/props` of the image server (`--mmproj` over `--parallel 2`,
     /// `BLOOMERY_STEP_STATS=1`, no `--ctx`: the seat's own default) and the clauses that read
     /// them: `mmproj_props_vision_true` and `mmproj_vision_record_is_the_towers_figure`; then the
@@ -3577,11 +3501,11 @@ mod gate {
             let url = |p: &str| format!("http://{addr}{p}");
             let mut f = true;
             for (k, n) in ["c1", "c2"].into_iter().enumerate() {
-                let body = ask(&img.case(n)?, F_STEPS);
+                let body = greedy_chat(&img.case(n)?, F_STEPS);
                 let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
                 std::fs::write(dir.join(format!("chat-{n}.json")), &text)?;
                 let a = answered(st, &text)?;
-                let (agreed, gap, holds) = follows(&a, &img.f[k]);
+                let (agreed, gap, holds) = a.follows(&img.f[k].ids, img.f[k].agree, F_NEAR_TIE);
                 println!(
                     "F {n}: {} ids, the prompt {} tokens (set {}); equal to the oracle's CUDA ids \
                      for {agreed} of the {} the oracle's CPU twin agrees on (the gap at the first \
@@ -3736,7 +3660,7 @@ mod gate {
         // S6: an image request on one slot beside a text request on the other. Each answers
         // what it answered alone, and the server ran rounds of both slots together.
         let text = tokenized(&url, PROSE)?;
-        let image = ask(&img.case("c1")?, SLOTS_PREDICT);
+        let image = greedy_chat(&img.case("c1")?, SLOTS_PREDICT);
         let alone_text = {
             let (h, rx) = streamed(addr, &text, SLOTS_PREDICT)?;
             h.join().map_err(|_| "image slots: a thread panicked")?;

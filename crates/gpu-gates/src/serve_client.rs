@@ -7,7 +7,9 @@
 //! through curl, a `/metrics` value, the server's stderr read by its binary's
 //! record kinds ([`server_log`]), and the requests the seat gates share: the
 //! chat turn's ids ([`rendered`], [`tokenized`]), a greedy completion ([`greedy`]), the
-//! chat answer held to a completion's ids ([`chat_is_those_ids`]), an image
+//! chat answer held to a completion's ids ([`chat_is_those_ids`]), a greedy chat with its
+//! runner-up logprobs read against an oracle's ids ([`greedy_chat`], [`answered`],
+//! [`ChatReply::follows`]), an image
 //! file held to its digest and sent as base64 ([`crate::sha256`], [`base64`]) and the
 //! prefix clauses of a seat that keeps a shared prefix
 //! ([`edit_and_extension`]) and of one whose prompt cache holds a saved
@@ -436,6 +438,88 @@ pub fn chat_is_those_ids(
         detok.len()
     );
     Ok(counted && !said.trim().is_empty() && parts_inside)
+}
+
+/// `body` (a chat request's messages and template switches) as a greedy chat
+/// of `n` tokens with each step's two best tokens returned, no prompt cache.
+pub fn greedy_chat(body: &Value, n: usize) -> Value {
+    let mut b = body.clone();
+    b["max_tokens"] = json!(n);
+    b["temperature"] = json!(0);
+    b["cache_prompt"] = json!(false);
+    b["logprobs"] = json!(true);
+    b["top_logprobs"] = json!(2);
+    b
+}
+
+/// The ids a greedy chat ([`greedy_chat`]) answered, each with the runner-up
+/// of its step and the gap between the top two logprobs (`None` where the
+/// answer carried one only), the prompt's token count and the text the ids
+/// say (the reasoning, then the content).
+pub struct ChatReply {
+    pub ids: Vec<u32>,
+    pub second: Vec<Option<(u32, f64)>>,
+    pub prompt: u64,
+    pub text: String,
+}
+
+/// The reply in `status`/`text` of a chat of [`greedy_chat`], or a named error.
+pub fn answered(status: u16, text: &str) -> Result<ChatReply, GateError> {
+    let v = json_of("/v1/chat/completions", status, text)?;
+    let content = v["choices"][0]["logprobs"]["content"]
+        .as_array()
+        .ok_or("the chat answer carries no logprobs content")?;
+    let (mut ids, mut second) = (Vec::new(), Vec::new());
+    for e in content {
+        ids.push(u32::try_from(
+            e["id"].as_u64().ok_or("a logprobs entry with no id")?,
+        )?);
+        second.push(e["top_logprobs"].as_array().and_then(|t| {
+            let (a, b) = (t.first()?, t.get(1)?);
+            Some((
+                u32::try_from(b["id"].as_u64()?).ok()?,
+                a["logprob"].as_f64()? - b["logprob"].as_f64()?,
+            ))
+        }));
+    }
+    let msg = &v["choices"][0]["message"];
+    Ok(ChatReply {
+        ids,
+        second,
+        prompt: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+        text: format!(
+            "{}{}",
+            msg["reasoning_content"].as_str().unwrap_or(""),
+            msg["content"].as_str().unwrap_or("")
+        ),
+    })
+}
+
+impl ChatReply {
+    /// An oracle's rule for one prompt, over the prefix `want[..agree]` where
+    /// the oracle's own CUDA and CPU runs agree (past it the oracle is two
+    /// engines' roundings parting and holds nothing): the server's greedy ids
+    /// equal `want`, or at the first difference the oracle's id is the
+    /// server's own runner-up within `near_tie` of its top (a near tie, where
+    /// two engines' roundings may part) and nothing after it is held. The
+    /// step the ids agreed up to, the gap at the first difference when there
+    /// is one, and whether the rule holds; a reply shorter than the prefix
+    /// fails.
+    pub fn follows(&self, want: &[u32], agree: usize, near_tie: f64) -> (usize, Option<f64>, bool) {
+        if self.ids.len() < agree {
+            return (self.ids.len(), None, false);
+        }
+        for k in 0..agree {
+            if self.ids[k] == want[k] {
+                continue;
+            }
+            let gap = self.second[k]
+                .filter(|&(id, _)| id == want[k])
+                .map(|(_, g)| g);
+            return (k, gap, gap.is_some_and(|g| g < near_tie));
+        }
+        (agree, None, true)
+    }
 }
 
 /// The prefix clauses of a seat that keeps the prefix a request shares with
