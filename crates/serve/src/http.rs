@@ -90,6 +90,15 @@ fn bad(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_owned())
 }
 
+/// The refusal of a body the request declares past `MAX_BODY`: it names both sizes. The limit is
+/// fixed, no flag raises it.
+fn too_large(declared: usize) -> io::Error {
+    bad(&format!(
+        "body too large: the request declares {declared} bytes, the limit is {MAX_BODY} bytes ({} MiB)",
+        MAX_BODY >> 20
+    ))
+}
+
 fn read_line(r: &mut impl BufRead) -> io::Result<Option<String>> {
     let mut buf = Vec::new();
     let n = r
@@ -175,7 +184,7 @@ pub(crate) fn read_request(
     } else if let Some(len) = req.header("content-length") {
         let len: usize = len.parse().map_err(|_| bad("bad content-length"))?;
         if len > MAX_BODY {
-            return Err(bad("body too large"));
+            return Err(too_large(len));
         }
         let mut body = vec![0; len];
         r.read_exact(&mut body)?;
@@ -197,7 +206,7 @@ fn read_chunked(r: &mut impl BufRead) -> io::Result<Vec<u8>> {
         }
         // The loop keeps `body.len() <= MAX_BODY`, so the subtraction cannot underflow.
         if size > MAX_BODY - body.len() {
-            return Err(bad("body too large"));
+            return Err(too_large(body.len().saturating_add(size)));
         }
         let at = body.len();
         body.resize(at + size, 0);
@@ -319,8 +328,9 @@ impl<'a> EventStream<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_query, read_chunked};
-    use std::io::ErrorKind;
+    use super::{MAX_BODY, parse_query, read_chunked, read_request};
+    use std::io::{BufReader, ErrorKind, Write};
+    use std::net::{TcpListener, TcpStream};
 
     /// Chunks join into the body, extensions and trailers aside; a chunk size
     /// that carries the body past the limit is refused by name, also when the
@@ -336,12 +346,44 @@ mod tests {
             "2\r\nab\r\nfffffffffffffffe\r\n",
         ] {
             let err = read_chunked(&mut hostile.as_bytes()).expect_err(hostile);
-            assert_eq!(
-                (err.kind(), err.to_string().as_str()),
-                (ErrorKind::InvalidData, "body too large"),
-                "{hostile:?}"
+            assert_eq!(err.kind(), ErrorKind::InvalidData, "{hostile:?}");
+            assert!(
+                err.to_string()
+                    .starts_with("body too large: the request declares "),
+                "{hostile:?}: {err}"
             );
         }
+    }
+
+    /// A body past the limit is refused on either framing with a message that names the size the
+    /// request declares and the limit, so a client can tell how far over it is.
+    #[test]
+    fn a_body_past_the_limit_is_refused_with_both_sizes() {
+        let over = MAX_BODY + 1;
+        let want = format!(
+            "body too large: the request declares {over} bytes, the limit is {MAX_BODY} bytes ({} MiB)",
+            MAX_BODY >> 20
+        );
+        let chunked = read_chunked(&mut format!("{:x}\r\n", over).as_bytes()).expect_err("chunked");
+        assert_eq!(chunked.to_string(), want, "a chunk size past the limit");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let mut client = TcpStream::connect(listener.local_addr().expect("its address"))
+            .expect("the client connects");
+        let (server, _) = listener.accept().expect("the server accepts");
+        client
+            .write_all(
+                format!("POST /v1/chat/completions HTTP/1.1\r\ncontent-length: {over}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .expect("the head is sent");
+        let mut w = server.try_clone().expect("a writer half");
+        let err = match read_request(&mut BufReader::new(server), &mut w) {
+            Ok(_) => panic!("a body past the limit was read"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), want, "a content-length past the limit");
     }
 
     /// `%2F` decodes to `/`, `+` to a space, in keys and values alike; a key
