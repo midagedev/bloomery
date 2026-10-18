@@ -148,38 +148,82 @@ pub fn patchify_with(
     layout: PatchLayout,
     stats: &ChannelStats,
 ) -> Result<Patches, VisionError> {
-    let PatchLayout {
-        patch: s,
-        merge: m,
-        frames,
-    } = layout;
-    if s == 0 || m == 0 || frames == 0 {
+    cut(&[image], plan, layout, stats)
+}
+
+/// A temporal patch of two distinct frames: each patch holds `frame0`'s values, then `frame1`'s, as
+/// the video patch embedding's two kernels read them (`K0·x0 + K1·x1`). Both frames are at the
+/// plan's size; the layout takes two frames. Where the one-frame cut repeats a still, this cut
+/// differs only in the second half of every patch.
+pub fn patchify_pair(
+    frame0: &Rgb8,
+    frame1: &Rgb8,
+    plan: GridPlan,
+    layout: PatchLayout,
+    stats: &ChannelStats,
+) -> Result<Patches, VisionError> {
+    if layout.frames != 2 {
         return Err(VisionError::Limits {
             detail: format!(
-                "the layout has patch {s}, merge {m} and {frames} frames; each must be at least 1"
+                "a pair of frames needs a layout of 2 temporal frames, not {}",
+                layout.frames
             ),
         });
     }
-    let size_err = |detail: String| VisionError::Size {
-        width: image.width,
-        height: image.height,
-        detail,
-    };
-    image.check()?;
+    cut(&[frame0, frame1], plan, layout, stats)
+}
+
+/// The cut of `patchify_with` and `patchify_pair`: one frame is repeated over the layout's
+/// temporal frames, otherwise there is one frame for each.
+fn cut(
+    frames: &[&Rgb8],
+    plan: GridPlan,
+    layout: PatchLayout,
+    stats: &ChannelStats,
+) -> Result<Patches, VisionError> {
+    let PatchLayout {
+        patch: s,
+        merge: m,
+        frames: temporal,
+    } = layout;
+    if s == 0 || m == 0 || temporal == 0 {
+        return Err(VisionError::Limits {
+            detail: format!(
+                "the layout has patch {s}, merge {m} and {temporal} frames; each must be at least 1"
+            ),
+        });
+    }
+    if frames.len() != 1 && frames.len() != temporal {
+        return Err(VisionError::Limits {
+            detail: format!(
+                "{} frames for a layout of {temporal} temporal frames; give one to repeat or one each",
+                frames.len()
+            ),
+        });
+    }
     let group = s * m;
-    if image.width != plan.best_w
-        || image.height != plan.best_h
-        || !plan.best_w.is_multiple_of(group)
-        || !plan.best_h.is_multiple_of(group)
-    {
-        return Err(size_err(format!(
-            "the plan is {}x{} in groups of {m}x{m} {s}-pixel patches",
-            plan.best_w, plan.best_h
-        )));
+    for image in frames {
+        let size_err = |detail: String| VisionError::Size {
+            width: image.width,
+            height: image.height,
+            detail,
+        };
+        image.check()?;
+        if image.width != plan.best_w
+            || image.height != plan.best_h
+            || !plan.best_w.is_multiple_of(group)
+            || !plan.best_h.is_multiple_of(group)
+        {
+            return Err(size_err(format!(
+                "the plan is {}x{} in groups of {m}x{m} {s}-pixel patches",
+                plan.best_w, plan.best_h
+            )));
+        }
     }
     let tables: [Vec<u16>; 3] =
         std::array::from_fn(|c| (0..=255u8).map(|v| stats.normalize(c, v)).collect());
-    let (n_vit_h, n_vit_w) = (image.height / s, image.width / s);
+    let first = frames[0];
+    let (n_vit_h, n_vit_w) = (first.height / s, first.width / s);
     let one_frame = 3 * s * s;
     let mut bf16 = Vec::with_capacity(n_vit_h * n_vit_w * layout.patch_len());
     for gy in 0..n_vit_h / m {
@@ -188,16 +232,20 @@ pub fn patchify_with(
                 for dx in 0..m {
                     let (ph, pw) = (gy * m + dy, gx * m + dx);
                     let at = bf16.len();
-                    for c in 0..3 {
-                        for py in 0..s {
-                            let row = ((ph * s + py) * image.width + pw * s) * 3;
-                            for px in 0..s {
-                                bf16.push(tables[c][usize::from(image.data[row + px * 3 + c])]);
+                    for image in frames {
+                        for c in 0..3 {
+                            for py in 0..s {
+                                let row = ((ph * s + py) * image.width + pw * s) * 3;
+                                for px in 0..s {
+                                    bf16.push(tables[c][usize::from(image.data[row + px * 3 + c])]);
+                                }
                             }
                         }
                     }
-                    for _ in 1..frames {
-                        bf16.extend_from_within(at..at + one_frame);
+                    if frames.len() == 1 {
+                        for _ in 1..temporal {
+                            bf16.extend_from_within(at..at + one_frame);
+                        }
                     }
                 }
             }
@@ -217,7 +265,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ChannelStats, GridPlan, PatchLayout, f32_to_bf16, normalize, patchify, patchify_with,
+        ChannelStats, GridPlan, PatchLayout, f32_to_bf16, normalize, patchify, patchify_pair,
+        patchify_with,
     };
     use crate::{Rgb8, VisionError};
 
@@ -390,6 +439,82 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A pair holds frame 0's values, then frame 1's, in every patch: each half is the one-frame
+    /// cut of its frame (index by index against the raster reference), and a pair of one frame
+    /// twice is the cut that repeats a still.
+    #[test]
+    fn a_pair_is_frame_zero_then_frame_one() {
+        let layout = PatchLayout {
+            patch: 16,
+            merge: 2,
+            frames: 2,
+        };
+        let f0 = image(64, 64, |c, y, x| ((c * 83 + y * 7 + x * 3) % 251) as u8);
+        let f1 = image(64, 64, |c, y, x| {
+            ((c * 29 + y * 11 + x * 5 + 40) % 247) as u8
+        });
+        let pair =
+            patchify_pair(&f0, &f1, plan(64, 64), layout, &ChannelStats::HALF).expect("pair");
+        let one = PatchLayout {
+            frames: 1,
+            ..layout
+        };
+        let a = patchify(&f0, plan(64, 64), one).expect("frame 0");
+        let b = patchify(&f1, plan(64, 64), one).expect("frame 1");
+        assert_eq!((pair.n_vit_h, pair.n_vit_w, pair.patch_len), (4, 4, 1536));
+        assert_ne!(a.bf16, b.bf16, "the frames must differ");
+        for i in 0..16 {
+            let patch = &pair.bf16[i * 1536..(i + 1) * 1536];
+            assert_eq!(
+                patch[..768],
+                a.bf16[i * 768..(i + 1) * 768],
+                "patch {i}: frame 0"
+            );
+            assert_eq!(
+                patch[768..],
+                b.bf16[i * 768..(i + 1) * 768],
+                "patch {i}: frame 1"
+            );
+        }
+        let twice =
+            patchify_pair(&f0, &f0, plan(64, 64), layout, &ChannelStats::HALF).expect("twice");
+        assert_eq!(twice, patchify(&f0, plan(64, 64), layout).expect("still"));
+    }
+
+    /// A pair needs a layout of two frames and two frames at the plan's size, each refused by name.
+    #[test]
+    fn a_pair_that_does_not_fit_is_refused() {
+        let layout = PatchLayout {
+            patch: 16,
+            merge: 2,
+            frames: 2,
+        };
+        let f = image(64, 64, |_, _, _| 0);
+        let small = image(32, 64, |_, _, _| 0);
+        let half = ChannelStats::HALF;
+        let e = patchify_pair(
+            &f,
+            &f,
+            plan(64, 64),
+            PatchLayout {
+                frames: 1,
+                ..layout
+            },
+            &half,
+        )
+        .expect_err("one temporal frame");
+        assert!(matches!(e, VisionError::Limits { .. }), "{e}");
+        assert_eq!(
+            e.to_string(),
+            "image size limits: a pair of frames needs a layout of 2 temporal frames, not 1"
+        );
+        let e = patchify_pair(&f, &small, plan(64, 64), layout, &half).expect_err("second size");
+        assert_eq!(
+            e.to_string(),
+            "image size 32x64: the plan is 64x64 in groups of 2x2 16-pixel patches"
+        );
     }
 
     /// A size that is not the plan's or not whole groups is refused as a size, by name.

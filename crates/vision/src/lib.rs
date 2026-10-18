@@ -14,6 +14,8 @@
 //!   with the patch repeated over temporal frames.
 //! * [`media`] — what a model tells the server about its image input ([`MediaModel`]): data plus
 //!   one prepare.
+//! * [`video`] — the one planner of a video clip: a model's [`video::VideoRule`] and sizer in, the
+//!   frames, groups, sizes and stamp times out.
 //! * [`arch`] — per projector type, the names and hyperparameters of the encoder file (the mmproj
 //!   GGUF), each read once and refused by name when this crate does not run it, and what the
 //!   projector's own image rule needs: V4.1's resize plan and span layout (`deepseek41v::grid`,
@@ -32,6 +34,7 @@ pub mod mrope;
 pub mod preprocess;
 pub mod resample;
 pub mod size;
+pub mod video;
 
 pub use image::{FileKind, Rgb8};
 pub use media::{EncoderInput, MediaModel, Prepared};
@@ -41,6 +44,10 @@ pub use preprocess::{GridPlan, PatchLayout, Patches, patchify};
 /// Everything this crate refuses, each naming what it refused.
 #[derive(Debug, thiserror::Error)]
 pub enum VisionError {
+    /// A video clip or rule this crate's planner refuses ([`video::plan`]), or a projector that
+    /// takes no video.
+    #[error("video: {0}")]
+    Video(String),
     /// Decoded audio this preprocessor cannot turn into finite mel rows.
     #[error("audio input: {0}")]
     Audio(String),

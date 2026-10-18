@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use crate::arch::minicpmv::Group;
+use crate::video::{ClipPlan, NoVideo, Sizer, VideoRule};
 use crate::{Patches, Rgb8, VisionError};
 
 /// How a message's content parts are flattened into one text before the chat template sees it.
@@ -91,6 +92,14 @@ impl AudioChunk {
     }
 }
 
+/// One piece of the text a clip becomes in the prompt: ordinary text (a stamp, a delimiter), or the
+/// placeholder of the plan's group `n`, which the prompt later expands to the group's span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Piece {
+    Text(String),
+    Group(usize),
+}
+
 /// A model's media input, as data plus its prepares.
 pub trait MediaModel {
     /// The audio delimiters and decoded mono PCM sample rate, if this projector accepts audio.
@@ -119,6 +128,44 @@ pub trait MediaModel {
         Err(VisionError::Limits {
             detail: "the projector does not support decoded video frames".into(),
         })
+    }
+
+    /// The model's video numbers: `None` for a projector that takes no video.
+    fn video_rule(&self) -> Option<&VideoRule> {
+        None
+    }
+
+    /// The model's own resize rule for a video's groups, which [`crate::video::plan`] asks.
+    fn video_sizer(&self) -> &dyn Sizer {
+        &NoVideo
+    }
+
+    /// Resize one group's frames (the rule's `temporal` of them, all one size) to `size` and patch
+    /// them: the group's span length and the encoder's input.
+    fn prepare_group(
+        &self,
+        _frames: &[Rgb8],
+        _size: (usize, usize),
+    ) -> Result<Prepared, VisionError> {
+        Err(VisionError::Video("the projector takes no video".into()))
+    }
+
+    /// The text a planned clip becomes in the prompt: the model's delimiters and stamps as text,
+    /// and each group as its placeholder, in prompt order.
+    fn video_text(&self, _plan: &ClipPlan) -> Result<Vec<Piece>, VisionError> {
+        Err(VisionError::Video("the projector takes no video".into()))
+    }
+
+    /// The text every group's placeholder carries, which the tokenizer reads as the video token. A
+    /// message's own text may not carry it. `None` for a projector that takes no video.
+    fn video_marker(&self) -> Option<&str> {
+        None
+    }
+
+    /// The id [`MediaModel::video_marker`] tokenizes to, which the prompt's expansion finds and
+    /// expands to each group's span. It may be the image token.
+    fn video_token(&self) -> Option<u32> {
+        None
     }
 
     /// The placeholder text the chat template carries for the image at `index`: its position
@@ -188,7 +235,17 @@ pub fn expand_spans(
     image_token: u32,
     span_lens: &[usize],
 ) -> Result<Expanded, ExpandError> {
-    let placeholders = ids.iter().filter(|&&t| t == image_token).count();
+    expand_marked(ids, |t| t == image_token, span_lens)
+}
+
+/// [`expand_spans`] for placeholders of more than one id: every id `is_mark` takes is a
+/// placeholder, and the i-th of them becomes `span_lens[i]` copies of itself.
+pub fn expand_marked(
+    ids: &[u32],
+    is_mark: impl Fn(u32) -> bool,
+    span_lens: &[usize],
+) -> Result<Expanded, ExpandError> {
+    let placeholders = ids.iter().filter(|&&t| is_mark(t)).count();
     if placeholders != span_lens.len() {
         return Err(ExpandError::PlaceholderCount {
             placeholders,
@@ -202,7 +259,7 @@ pub fn expand_spans(
     let mut spans = Vec::with_capacity(placeholders);
     let mut lens = span_lens.iter();
     for &t in ids {
-        if t == image_token {
+        if is_mark(t) {
             let n = *lens
                 .next()
                 .expect("one length per placeholder, counted above");
@@ -221,6 +278,32 @@ mod tests {
     use crate::GridPlan;
     use crate::arch::minicpmv::group::preprocess_group;
     use crate::arch::minicpmv::hparams::tests::hp;
+
+    /// Placeholders of two ids expand in the order they stand in: each becomes its own length of
+    /// copies of its own id, and the count over both ids is the pairing's whole check.
+    #[test]
+    fn marks_of_two_ids_expand_in_order() {
+        let mark = |t: u32| t == 7 || t == 9;
+        let got = expand_marked(&[1, 7, 2, 9, 9, 3], mark, &[2, 1, 3]).unwrap();
+        assert_eq!(
+            got,
+            Expanded {
+                ids: vec![1, 7, 7, 2, 9, 9, 9, 9, 3],
+                spans: vec![1..3, 4..5, 5..8],
+            }
+        );
+        assert_eq!(
+            expand_marked(&[7, 9], mark, &[1]),
+            Err(ExpandError::PlaceholderCount {
+                placeholders: 2,
+                images: 1
+            })
+        );
+        assert_eq!(
+            expand_marked(&[7, 9], mark, &[1, 0]),
+            Err(ExpandError::EmptySpan(1))
+        );
+    }
 
     #[test]
     fn spans_expand_in_order() {
