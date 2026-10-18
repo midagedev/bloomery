@@ -735,14 +735,7 @@ pub unsafe fn q8_1_quant_block_relu_sqr(
             *x.get_unchecked(base + 3),
         ]
     };
-    let relu_sqr = |v: f32| {
-        if !v.is_finite() {
-            v
-        } else {
-            let r = if v > 0.0 { v } else { 0.0 };
-            r * r
-        }
-    };
+    let relu_sqr = <crate::q5::ReluSqr as crate::q5::Load>::value;
     let v = [
         relu_sqr(v[0]),
         relu_sqr(v[1]),

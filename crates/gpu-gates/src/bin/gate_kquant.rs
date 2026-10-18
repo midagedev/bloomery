@@ -2247,21 +2247,6 @@ mod gate {
         }
     }
 
-    /// One column of a q8_1 scratch read back: its code words, block sums and
-    /// scales' bits.
-    fn column38(x: &bloomery_gpu::q5::Q8Blocks32Host, s: usize) -> (Vec<u32>, Vec<i32>, Vec<u32>) {
-        let (kb, slots) = (FF38 / 32, SEL38.len());
-        let qs = x.q.len() / slots;
-        (
-            x.q[s * qs..(s + 1) * qs].to_vec(),
-            x.s8[s * kb..(s + 1) * kb].to_vec(),
-            x.d8[s * kb..(s + 1) * kb]
-                .iter()
-                .map(|v| v.to_bits())
-                .collect(),
-        )
-    }
-
     /// Clause 10 (module doc).
     fn check_q38_card(c: &Ctx) -> Result<bool, GateError> {
         let stream = c.gpu.stream();
@@ -2292,12 +2277,13 @@ mod gate {
         }
         let (plain, _) = quantize51(c, &h, slots, FF38)?;
         let want = plain.readback(stream)?;
+        let after = cols13(&after, FF38, slots);
+        let before = cols13(&before, FF38, slots);
+        let want = cols13(&want, FF38, slots);
         let card_cols = (0..slots)
             .filter(|s| !host_slots.contains(s))
-            .all(|s| column38(&after, s) == column38(&want, s));
-        let host_cols = host_slots
-            .iter()
-            .all(|&s| column38(&after, s) == column38(&before, s));
+            .all(|s| after[s] == want[s]);
+        let host_cols = host_slots.iter().all(|&s| after[s] == before[s]);
         let (acc_ref, y_ref) = leg.host_rule(c, &SEL38)?;
         let acc = leg.acc.to_host_vec(stream)?;
         let y = leg.y.to_host_vec(stream)?;
