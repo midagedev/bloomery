@@ -9,7 +9,8 @@
 # The set holds, per ggml weight type and row length, the quantized and random-code weight rows, their to_float, seeded activation
 # rows with their vec_dot_type conversion, and every vec_dot (the harness's header lists the files). crates/refset/src/quant.rs
 # reads it through the family of crates/refset/src/arch/quant.rs, which refuses by name a set whose harness (the md5 of the source
-# here), mainline commit, model line or trailer is not its pin. QUANT.tsv states, around the harness's case and file rows:
+# here), mainline commit, model line or trailer is not its pin. QUANT.tsv states, around the harness's type, case and file rows
+# (a `type` row per type ggml's table names, dumped or skipped with ggml's reason):
 #
 #   # harness   the md5 of tools/ref/quant_oracle.cpp
 #   # build     the first nine digits of the tree's commit (the commit's build: the md5 of one machine's library matches no other
