@@ -405,6 +405,7 @@ impl Cx<'_> {
                 x,
                 tokens: self.m,
                 rms_eps: d.eps,
+                fault: self.gpu.unlabelled_sink(),
             },
             mixes,
             hc,
@@ -476,6 +477,7 @@ fn enqueue_attn(
             out: &mut b.kv_row,
             cache: &mut b.block_kv,
             shadow: &mut b.no_shadow,
+            fault: cx.gpu.unlabelled_sink(),
         },
     )?;
 

@@ -89,6 +89,14 @@ use std::sync::Arc;
 /// and host rounding so the cache bits cannot drift from the engine's.
 pub use gguf::quant::f32_to_f16_bits;
 
+/// Whether an f16 bit pattern is finite — neither infinity nor NaN. A cache
+/// append rounds a finite f32 past f16's range to infinity, which this names.
+#[inline(always)]
+#[must_use]
+pub fn f16_finite(h: u16) -> bool {
+    h & 0x7c00 != 0x7c00
+}
+
 /// Latent tail this kernel family's geometry is built for, and so the block's
 /// thread count: one thread per latent dim. `enqueue_flash_latent` rejects
 /// any other latent width.

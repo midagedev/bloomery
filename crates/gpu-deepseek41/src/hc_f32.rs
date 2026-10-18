@@ -15,12 +15,14 @@
 //!    `warp::reduce_sum_f32` (lane `l` adds lane `l ^ s`, s = 16, 8, 4, 2, 1).
 //! 3. The squares on warp 0: lane `L` sums `x[32*it + L]` squared by
 //!    `v.mul_add(v, acc)` from 0, `it` ascending, then `warp::reduce_sum_f32`.
-//! 4. `scale = 1 / sqrt(squares / K + rms_eps)`, `mix = raw * scale`.
+//! 4. `scale = 1 / sqrt(squares / K + rms_eps)`, `mix = raw * scale`; a scale that
+//!    is not finite and positive is NaN and raises `FaultSite::F32Product`.
 //! 5. HC_PRE on warp 0 ([`crate::hc`]'s `hc_pre_lane`).
 
 use crate::hc::{HC_MIX, hc_pre_lane};
+use bloomery_gpu::elem::rms_scale_checked;
 use bloomery_gpu::q8f32::f32_lane_partial_1col;
-use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
+use bloomery_gpu::{DeviceTensor, FaultSink, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
@@ -86,6 +88,7 @@ mod hc_f32_kernels {
         rms_eps: f32,
         hc_eps: f32,
         iters: u32,
+        fault: FaultSink,
         mut mixes: DisjointSlice<f32>,
         mut hc: DisjointSlice<f32>,
     ) {
@@ -135,9 +138,12 @@ mod hc_f32_kernels {
             // SAFETY: xt.len() = k, lane < 32.
             let sq = warp::reduce_sum_f32(unsafe { lane_squares(xt, kk, lane) });
             if lane == 0 {
+                // A scale with no norm behind it (squares that overflowed, or
+                // never finite) is NaN and raises F32Product from this lane.
+                let scl = rms_scale_checked(sq, k, rms_eps, fault, true);
                 // SAFETY: slot 0, written by lane 0 of warp 0 alone.
                 unsafe {
-                    *scl_s = 1.0 / (sq / k as f32 + rms_eps).sqrt();
+                    *scl_s = scl;
                 }
             }
         }
@@ -196,6 +202,9 @@ pub struct HcF32Args<'a> {
     pub tokens: usize,
     /// `attention.layer_norm_rms_epsilon`.
     pub rms_eps: f32,
+    /// Where a stream whose squares leave the norm no scale is raised (the
+    /// launch's layer).
+    pub fault: FaultSink,
 }
 
 /// The loaded F32 HC_PRE module. Owns no stream.
@@ -270,6 +279,7 @@ impl HcF32Kernels {
             a.rms_eps,
             p.eps,
             p.iters,
+            a.fault,
             mixes,
             hc,
         )?;

@@ -38,9 +38,9 @@
 //! `kv[t·WIDTH ..]`. Our q3_K gemv writes `[row·m + t]`, which is the same
 //! order at one token.
 
-use bloomery_gpu::elem::rms_scale;
+use bloomery_gpu::elem::rms_scale_checked;
 use bloomery_gpu::flash::f32_to_f16_bits;
-use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
+use bloomery_gpu::{DeviceTensor, FaultSink, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, fma_rn_f32, mul_rn_f32};
 use cuda_device::{
@@ -315,14 +315,22 @@ fn pool_term(
 /// The row scale of a block's pooled row: each thread's four squares summed
 /// by fused multiply-adds in value order from `+0`, the warp butterfly
 /// (`reduce_sum_f32`: xor 16, 8, 4, 2, 1, own + partner), the four warp
-/// sums as `(w0 + w1) + (w2 + w3)`, then `elem::rms_scale` at [`WIDTH`].
-/// This order is the gate's host transcription.
+/// sums as `(w0 + w1) + (w2 + w3)`, then `elem::rms_scale_checked` at
+/// [`WIDTH`] (a scale that is not finite and positive is NaN and raises
+/// `FaultSite::F32Product` from thread 0). This order is the gate's host
+/// transcription.
 ///
 /// # Safety
 /// `ws` is the calling block's shared array of [`WARPS`] f32, and every
 /// thread of the block calls this once (it holds a block barrier).
 #[inline(always)]
-unsafe fn norm_scale(y: [f32; PER_THREAD], ws: *mut f32, t: usize, eps: f32) -> f32 {
+unsafe fn norm_scale(
+    y: [f32; PER_THREAD],
+    ws: *mut f32,
+    t: usize,
+    eps: f32,
+    fault: FaultSink,
+) -> f32 {
     let acc = fma_rn_f32(y[0], y[0], 0.0);
     let acc = fma_rn_f32(y[1], y[1], acc);
     let acc = fma_rn_f32(y[2], y[2], acc);
@@ -338,7 +346,13 @@ unsafe fn norm_scale(y: [f32; PER_THREAD], ws: *mut f32, t: usize, eps: f32) -> 
     // SAFETY: block-shared, WARPS slots, written before the barrier that
     // publishes them.
     let w = unsafe { [*ws.add(0), *ws.add(1), *ws.add(2), *ws.add(3)] };
-    rms_scale((w[0] + w[1]) + (w[2] + w[3]), WIDTH as u32, eps)
+    rms_scale_checked(
+        (w[0] + w[1]) + (w[2] + w[3]),
+        WIDTH as u32,
+        eps,
+        fault,
+        t == 0,
+    )
 }
 
 /// Where one group's row goes.
@@ -375,9 +389,10 @@ unsafe fn finish_row(
     t: usize,
     row: usize,
     out: RowOut<'_, '_, '_>,
+    fault: FaultSink,
 ) {
     // SAFETY: forwarded from this fn's contract.
-    let scale = unsafe { norm_scale(y, ws, t, eps) };
+    let scale = unsafe { norm_scale(y, ws, t, eps, fault) };
     let v = PER_THREAD * t;
     // SAFETY: v + 4 <= WIDTH <= gain.len().
     let gw = unsafe { load4(gain, v) };
@@ -461,6 +476,7 @@ mod comp_kernels {
         m: u32,
         n_dims: u32,
         rows: u32,
+        fault: FaultSink,
         mut ring_kv: DisjointSlice<f32>,
         mut ring_score: DisjointSlice<f32>,
         mut pre: DisjointSlice<f32>,
@@ -561,7 +577,7 @@ mod comp_kernels {
                 // a multiple of 4 at most 512 (host-checked); rows ascend
                 // (host-checked), so no other block writes row `row`.
                 unsafe {
-                    finish_row(y, ws, gain, cs, eps, n_dims as usize, g, t, row, out);
+                    finish_row(y, ws, gain, cs, eps, n_dims as usize, g, t, row, out, fault);
                 }
             }
         }
@@ -629,6 +645,7 @@ mod comp_kernels {
         m: u32,
         n_dims: u32,
         rows: u32,
+        fault: FaultSink,
         mut pre: DisjointSlice<f32>,
         mut cache: DisjointSlice<u16>,
     ) {
@@ -667,7 +684,7 @@ mod comp_kernels {
         // multiple of 4 at most 512 (host-checked); rows ascend
         // (host-checked).
         unsafe {
-            finish_row(y, ws, gain, cs, eps, n_dims as usize, g, t, row, out);
+            finish_row(y, ws, gain, cs, eps, n_dims as usize, g, t, row, out, fault);
         }
     }
 }
@@ -695,6 +712,9 @@ pub struct PoolArgs<'a> {
     pub ring_score: &'a mut DeviceBuffer<f32>,
     pub pre: &'a mut DeviceBuffer<f32>,
     pub cache: &'a mut DeviceTensor<u16>,
+    /// Where a row whose squares leave the norm no scale is raised (the
+    /// launch's layer).
+    pub fault: FaultSink,
 }
 
 /// [`CompressKernels::enqueue_rows`]'s arguments: [`PoolArgs`] of a ratio-1
@@ -709,6 +729,8 @@ pub struct RowsArgs<'a> {
     pub n_dims: usize,
     pub pre: &'a mut DeviceBuffer<f32>,
     pub cache: &'a mut DeviceTensor<u16>,
+    /// As [`PoolArgs::fault`].
+    pub fault: FaultSink,
 }
 
 /// The tail and the buffers every compressor launch shares, checked.
@@ -787,6 +809,7 @@ impl CompressKernels {
             ring_score,
             pre,
             cache,
+            fault,
         } = args;
         if geom.ratio < 2 {
             return Err(GpuError::Shape {
@@ -837,6 +860,7 @@ impl CompressKernels {
             launch_u32(what, "tokens", m)?,
             launch_u32(what, "n_dims", n_dims)?,
             launch_u32(what, "rows", geom.rows)?,
+            fault,
             ring_kv,
             ring_score,
             pre,
@@ -861,6 +885,7 @@ impl CompressKernels {
             n_dims,
             pre,
             cache,
+            fault,
         } = args;
         if geom.ratio != 1 {
             return Err(GpuError::Shape {
@@ -898,6 +923,7 @@ impl CompressKernels {
             launch_u32(what, "tokens", m)?,
             launch_u32(what, "n_dims", n_dims)?,
             launch_u32(what, "rows", geom.rows)?,
+            fault,
             pre,
             cache.buf_mut(),
         )?;

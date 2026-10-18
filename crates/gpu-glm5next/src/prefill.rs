@@ -2250,6 +2250,7 @@ impl PromptProgram<'_> {
                 x: streams,
                 tokens: t,
                 rms_eps: d.rms_eps,
+                fault: gpu.layer_sink(l)?,
             },
             t.min(CHUNK),
             &mut b.hc_scratch,

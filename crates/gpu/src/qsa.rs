@@ -43,7 +43,9 @@
 //! - a head's norm: lane `l` owns values `l, l + 32` (NEOX pair `l`) and `l +
 //!   64, l + 96`; each squared in f32, the pairs' squares added in f64 and the
 //!   two sums added, the lanes by the xor butterfly (16, 8, 4, 2, 1) in f64;
-//!   the mean `(sum / 128) as f32`, the scale `1 / sqrt(mean + eps)` in f32,
+//!   the mean `(sum / 128) as f32`, the scale `1 / sqrt(mean + eps)` in f32
+//!   (`elem::rms_scale_of_mean`: NaN where it is not finite and positive, so a
+//!   head whose squares overflow is NaN and the checks below name it),
 //!   the normed value `(scale · gain) · x`; the turn through
 //!   [`crate::rope_neox::neox_pair`] by table pair `l` of the position's row;
 //! - a pool's mean: `((r0 + r1) + r2) + r3` of its rows' f16 values in f32,
@@ -60,6 +62,7 @@
 //! as computed, never replaced by a plausible one, and the list is still a
 //! defined list of tokens below the row's count.
 
+use crate::elem::rms_scale_of_mean;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
 use crate::rope_neox::neox_pair;
@@ -172,7 +175,7 @@ fn norm_turn(x: [f32; 4], g: [f32; 4], c: f32, s: f32, eps: f32) -> [f32; 4] {
     acc += warp::shuffle_xor_f64(acc, 2);
     acc += warp::shuffle_xor_f64(acc, 1);
     let mean = (acc / DIM as f64) as f32;
-    let scale = 1.0 / (mean + eps).sqrt();
+    let scale = rms_scale_of_mean(mean, eps);
     let n0 = (scale * g[0]) * x[0];
     let n1 = (scale * g[1]) * x[1];
     let (y0, y1) = neox_pair(n0, n1, c, s);

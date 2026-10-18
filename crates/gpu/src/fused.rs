@@ -11,7 +11,7 @@ use crate::elem::{
     rms_warp_tree, rope_pair_core, silu_mul,
 };
 use crate::fault::{FaultSink, FaultSite};
-use crate::flash::f32_to_f16_bits;
+use crate::flash::{f16_finite, f32_to_f16_bits};
 use crate::launch_u32;
 use crate::q5::{Q8Blocks32, q5_row_dot};
 use crate::q8_1_quant_vals;
@@ -272,7 +272,12 @@ mod fused_kernels {
     /// [`FaultSite::CachePos`] on `fault` and appends nothing, as
     /// `kv_append_pos_buf` does. A latent whose sum of squares is not finite
     /// raises [`FaultSite::F32Product`] as `elem::rms_norm` does, and the
-    /// latent half of `kv_s`, `kvr` and the cache row is NaN.
+    /// latent half of `kv_s`, `kvr` and the cache row is NaN. A value written
+    /// to `kv_s` that is not finite (the latent's scaled values, or the rope
+    /// tail's turned pair past f32's range or from a non-finite input) raises
+    /// the same site; a finite one the f16 cache row cannot hold raises
+    /// [`FaultSite::CacheValue`], as `latent`'s appends do. Every value is
+    /// written as computed.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -371,6 +376,8 @@ mod fused_kernels {
         // The latent half, on `elem::rms_norm`'s own loop order. Each value
         // lands in `kv_s` (the norm's output), at `kvr`'s permuted slot and,
         // rounded once, in the cache row.
+        let mut not_finite = false;
+        let mut past_f16 = false;
         let mut it = tid;
         while it < k {
             // SAFETY: it < k bounds the gain and kv_a reads by the contract;
@@ -386,8 +393,11 @@ mod fused_kernels {
                 let nv = (scale * g) * v;
                 *kv_s.get_unchecked_mut(it) = nv;
                 *kvr.get_unchecked_mut(nd + it) = nv;
+                not_finite |= !nv.is_finite();
                 if live {
-                    *cache.get_unchecked_mut(crow + nd + it) = f32_to_f16_bits(nv);
+                    let h = f32_to_f16_bits(nv);
+                    *cache.get_unchecked_mut(crow + nd + it) = h;
+                    past_f16 |= nv.is_finite() & !f16_finite(h);
                 }
             }
             it += RMS_THREADS;
@@ -414,11 +424,25 @@ mod fused_kernels {
                 *kv_s.get_unchecked_mut(k + d + 1) = y1;
                 *kvr.get_unchecked_mut(d) = y0;
                 *kvr.get_unchecked_mut(d + 1) = y1;
+                let finite = y0.is_finite() & y1.is_finite();
+                not_finite |= !finite;
                 if live {
-                    *cache.get_unchecked_mut(crow + d) = f32_to_f16_bits(y0);
-                    *cache.get_unchecked_mut(crow + d + 1) = f32_to_f16_bits(y1);
+                    let (h0, h1) = (f32_to_f16_bits(y0), f32_to_f16_bits(y1));
+                    *cache.get_unchecked_mut(crow + d) = h0;
+                    *cache.get_unchecked_mut(crow + d + 1) = h1;
+                    past_f16 |= finite & !(f16_finite(h0) & f16_finite(h1));
                 }
             }
+        }
+
+        // Every value is written as computed; one that is not finite, or a
+        // finite one the cache's f16 cannot hold, is named, never left to
+        // read as a plausible key.
+        if not_finite {
+            fault.raise(FaultSite::F32Product);
+        }
+        if past_f16 {
+            fault.raise(FaultSite::CacheValue);
         }
     }
 

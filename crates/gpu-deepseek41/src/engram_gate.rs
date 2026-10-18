@@ -41,8 +41,8 @@
 //! `a·b + c` into a fused multiply-add, and fuses `f64::from(a·b) + c` into
 //! an f64 one.
 
-use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS, rms_scale, rms_warp_tree};
-use bloomery_gpu::{GpuError, launch_u32};
+use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS, rms_scale_checked, rms_warp_tree};
+use bloomery_gpu::{FaultSink, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, div_rn_f32, fma_rn_f32, mul_rn_f32, sqrt_rn_f32};
 use cuda_device::{
@@ -189,14 +189,16 @@ fn gate_of(dot: f64, inv_sqrt_n: f32) -> f32 {
 
 /// The row's norm scale from each thread's partial sum of squares: the warp
 /// butterfly, one slot per warp in `wsum`, the barrier, then `rms_warp_tree`
-/// and `rms_scale` in every thread. Every thread of the block calls this.
+/// and `rms_scale_checked` in every thread (a scale that is not finite and
+/// positive is NaN and raises `FaultSite::F32Product` from thread 0). Every
+/// thread of the block calls this.
 ///
 /// # Safety
 ///
 /// `wsum` points at this block's [`RMS_WARPS`]-slot shared array, and no
 /// other access to it is in flight.
 #[inline(always)]
-unsafe fn block_scale(part: f32, tid: usize, wsum: *mut f32, eps: f32) -> f32 {
+unsafe fn block_scale(part: f32, tid: usize, wsum: *mut f32, eps: f32, fault: FaultSink) -> f32 {
     let w = warp::reduce_sum_f32(part);
     if warp::lane_id() == 0 {
         // SAFETY: block-shared, RMS_WARPS == blockDim.x / 32, one lane per
@@ -221,7 +223,7 @@ unsafe fn block_scale(part: f32, tid: usize, wsum: *mut f32, eps: f32) -> f32 {
             *wsum.add(7),
         ]
     };
-    rms_scale(rms_warp_tree(sums), ROW as u32, eps)
+    rms_scale_checked(rms_warp_tree(sums), ROW as u32, eps, fault, tid == 0)
 }
 
 // ---------------------------------------------------------------- kernels
@@ -251,6 +253,7 @@ mod engram_gate_kernels {
         eps: f32,
         hc: u32,
         m: u32,
+        fault: FaultSink,
         mut kn: DisjointSlice<f32>,
     ) {
         static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
@@ -284,8 +287,15 @@ mod engram_gate_kernels {
         let part = sum_sq(sum_sq(sum_sq(sum_sq(sum_sq(0.0, k0), k1), k2), k3), k4);
         // SAFETY: WSUM is this block's own shared allocation, reached only
         // through `block_scale`.
-        let scale =
-            unsafe { block_scale(part, tid, SharedArray::as_raw_mut_ptr(&raw mut WSUM), eps) };
+        let scale = unsafe {
+            block_scale(
+                part,
+                tid,
+                SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                eps,
+                fault,
+            )
+        };
         let ob = b * ROW;
         // SAFETY: b < hc·m, so ob + ROW <= m·hc·ROW <= kn.len() by the launch
         // contract; tid < RMS_THREADS, every group index is below 5, and row
@@ -333,6 +343,7 @@ mod engram_gate_kernels {
         inv_sqrt_n: f32,
         hc: u32,
         m: u32,
+        fault: FaultSink,
         mut out: DisjointSlice<f32>,
         mut gate: DisjointSlice<f32>,
     ) {
@@ -389,8 +400,15 @@ mod engram_gate_kernels {
         let part = sum_sq(sum_sq(sum_sq(sum_sq(sum_sq(0.0, x0), x1), x2), x3), x4);
         // SAFETY: WSUM is this block's own shared allocation, reached only
         // through `block_scale`.
-        let scale =
-            unsafe { block_scale(part, tid, SharedArray::as_raw_mut_ptr(&raw mut WSUM), eps) };
+        let scale = unsafe {
+            block_scale(
+                part,
+                tid,
+                SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                eps,
+                fault,
+            )
+        };
 
         let d = dot_group(0.0, n0, x0, scale, g0);
         let d = dot_group(d, n1, x1, scale, g1);
@@ -480,6 +498,9 @@ pub struct KeyNormArgs<'a> {
     pub hc: usize,
     pub m: usize,
     pub kn: &'a mut DeviceBuffer<f32>,
+    /// Where a key whose squares leave the norm no scale is raised (the
+    /// launch's layer).
+    pub fault: FaultSink,
 }
 
 /// [`EngramGateKernels::enqueue_gate`]'s arguments: the streams `x` (`m·hc`
@@ -497,6 +518,8 @@ pub struct GateArgs<'a> {
     pub m: usize,
     pub out: &'a mut DeviceBuffer<f32>,
     pub gate: &'a mut DeviceBuffer<f32>,
+    /// As [`KeyNormArgs::fault`], for the stream's query row.
+    pub fault: FaultSink,
 }
 
 /// `1/√ROW` as ik computes the score's scale: `1.0f / sqrtf((float) n_embd)`.
@@ -541,7 +564,7 @@ impl EngramGateKernels {
             .module
             .prepare_ds41_engram_key_norm(LaunchConfig1D::new(grid, BLOCK, 0))?;
         self.module
-            .ds41_engram_key_norm(stream, &prep, a.kv, a.gain, a.eps, hc, m, a.kn)?;
+            .ds41_engram_key_norm(stream, &prep, a.kv, a.gain, a.eps, hc, m, a.fault, a.kn)?;
         Ok(())
     }
 
@@ -575,6 +598,7 @@ impl EngramGateKernels {
             inv_sqrt_row(),
             hc,
             m,
+            a.fault,
             a.out,
             a.gate,
         )?;

@@ -905,6 +905,7 @@ impl Glue {
                 hc: HC_STREAMS,
                 m: 1,
                 kn: &mut site.kn,
+                fault: gpu.layer_sink(layer)?,
             },
         )?;
         Ok(())
@@ -953,6 +954,7 @@ impl Glue {
                 m: 1,
                 out: &mut *a.out,
                 gate: &mut site.gate,
+                fault: gpu.layer_sink(layer)?,
             },
         )?;
         self.hc

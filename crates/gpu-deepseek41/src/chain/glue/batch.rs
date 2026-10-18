@@ -312,6 +312,7 @@ impl Glue {
                 hc: HC_STREAMS,
                 m,
                 kn: &mut kn,
+                fault: gpu.layer_sink(layer)?,
             },
         )?;
         let mut gates = span_mut(WHAT, &mut b.gate, 0, m * HC_STREAMS)?;
@@ -327,6 +328,7 @@ impl Glue {
                 m,
                 out: &mut *a.out,
                 gate: &mut gates,
+                fault: gpu.layer_sink(layer)?,
             },
         )?;
         self.hc

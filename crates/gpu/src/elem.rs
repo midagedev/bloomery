@@ -502,7 +502,15 @@ pub fn rms_warp_tree(w: [f32; RMS_WARPS]) -> f32 {
 /// value it scales is NaN, never the finite zero `1/∞` would write.
 #[inline(always)]
 pub fn rms_scale(sum_sq: f32, k: u32, eps: f32) -> f32 {
-    let mean = sum_sq / k as f32;
+    rms_scale_of_mean(sum_sq / k as f32, eps)
+}
+
+/// [`rms_scale`] from a mean square the caller rounded itself: the norms that
+/// sum their squares in f64 and round `(sum / n) as f32` once (the head norms
+/// of `rope_neox`, `qsa`). The one owner of the refusal: `1 / sqrt(mean +
+/// eps)` where it is finite and positive, NaN everywhere else.
+#[inline(always)]
+pub fn rms_scale_of_mean(mean: f32, eps: f32) -> f32 {
     let scale = 1.0 / (mean + eps).sqrt();
     if (scale > 0.0) & (scale < f32::INFINITY) {
         scale
@@ -519,7 +527,14 @@ pub fn rms_scale(sum_sq: f32, k: u32, eps: f32) -> f32 {
 /// path.
 #[inline(always)]
 pub fn rms_scale_checked(sum_sq: f32, k: u32, eps: f32, fault: FaultSink, lead: bool) -> f32 {
-    let scale = rms_scale(sum_sq, k, eps);
+    rms_scale_of_mean_checked(sum_sq / k as f32, eps, fault, lead)
+}
+
+/// [`rms_scale_of_mean`] for a kernel with a fault sink, as
+/// [`rms_scale_checked`] is to [`rms_scale`].
+#[inline(always)]
+pub fn rms_scale_of_mean_checked(mean: f32, eps: f32, fault: FaultSink, lead: bool) -> f32 {
+    let scale = rms_scale_of_mean(mean, eps);
     if lead & scale.is_nan() {
         fault.raise(FaultSite::F32Product);
     }
@@ -2660,5 +2675,44 @@ impl ElemKernels {
         self.module
             .argmax_rows_finite_fault(stream, &prep, x, n, m, fault, out, done)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scale a norm with no row behind it would write if `1/∞ = 0` stood:
+    /// an overflowed mean, a non-finite one, and a zero mean with no `eps` are
+    /// refused (NaN) at the one owner, whichever width the mean was rounded in.
+    #[test]
+    fn a_scale_with_no_norm_behind_it_is_nan() {
+        let eps = 1e-6f32;
+        for mean in [f32::INFINITY, f32::NAN, f32::NEG_INFINITY, -1.0] {
+            assert!(rms_scale_of_mean(mean, eps).is_nan(), "mean {mean}");
+            assert!(rms_scale(mean, 1, eps).is_nan(), "sum {mean}");
+        }
+        // No `eps` and an all-zero row: `1/sqrt(0)` is infinite.
+        assert!(rms_scale_of_mean(0.0, 0.0).is_nan());
+        assert!(rms_scale(0.0, 128, 0.0).is_nan());
+    }
+
+    /// Every finite, positive scale is the formula's own bits: the refusal adds
+    /// nothing to a row that has a norm.
+    #[test]
+    fn a_finite_scale_is_the_formula_bit_for_bit() {
+        let eps = 1e-6f32;
+        for mean in [0.0f32, 1e-30, 0.25, 1.0, 4.0, 1e19, 1e38] {
+            let want = 1.0 / (mean + eps).sqrt();
+            assert_eq!(rms_scale_of_mean(mean, eps).to_bits(), want.to_bits());
+        }
+        for (sum, k) in [(512.0f32, 128u32), (2.0e7, 5120), (0.0, 7168)] {
+            let want = 1.0 / (sum / k as f32 + eps).sqrt();
+            assert_eq!(rms_scale(sum, k, eps).to_bits(), want.to_bits());
+            assert_eq!(
+                rms_scale(sum, k, eps).to_bits(),
+                rms_scale_of_mean(sum / k as f32, eps).to_bits()
+            );
+        }
     }
 }

@@ -166,6 +166,7 @@ impl AppendCx<'_> {
                 out,
                 cache: ring,
                 shadow,
+                fault: gpu.unlabelled_sink(),
             },
         )
     }

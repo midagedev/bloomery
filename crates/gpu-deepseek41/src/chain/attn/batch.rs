@@ -1181,6 +1181,7 @@ fn chunk_rows(
                 out: &mut s.kv_row,
                 cache: ring,
                 shadow,
+                fault: cx.fault,
             },
         ))?;
         return Ok(());
@@ -1198,6 +1199,7 @@ fn chunk_rows(
             out: &mut s.kv_row,
             cache: &mut *staging,
             shadow,
+            fault: cx.fault,
         },
     ))?;
     let (rows, vis_at) = match (&compressed, lp.stream) {

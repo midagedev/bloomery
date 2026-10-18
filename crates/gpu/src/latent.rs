@@ -63,7 +63,7 @@
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
-use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
+use crate::flash::{f16_finite, f32_to_f16_bits, half_bits_to_f32};
 use crate::launch_u32;
 use crate::linear::expf_ik;
 use crate::tensor::DeviceTensor;
@@ -98,12 +98,6 @@ const PER_THREAD: usize = LATENT / BLOCK as usize;
 /// Index-key values each lane owns.
 const PER_LANE: usize = INDEX_HEAD / 32;
 const _: () = assert!(PER_THREAD == 4 && PER_LANE == 4 && BLOCK == 128 && POOL == 4);
-
-/// Whether an f16 bit pattern is finite.
-#[inline(always)]
-fn f16_finite(h: u16) -> bool {
-    h & 0x7c00 != 0x7c00
-}
 
 /// The xor butterfly (16, 8, 4, 2, 1) over a warp in f64: every lane ends
 /// with the same sum.

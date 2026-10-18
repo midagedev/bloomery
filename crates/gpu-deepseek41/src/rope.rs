@@ -23,9 +23,11 @@
 //! `elem::rms_norm`'s f32 tree where ik sums in f64; that sum is the one
 //! difference the K/V row carries.
 
-use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree};
+use bloomery_gpu::elem::{
+    RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale_checked, rms_warp_tree,
+};
 use bloomery_gpu::flash::f32_to_f16_bits;
-use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
+use bloomery_gpu::{DeviceTensor, FaultSink, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
@@ -101,7 +103,9 @@ mod rope_kernels {
     /// The latent K/V rows of `m` tokens, one [`RMS_THREADS`] block per
     /// token: the norm of the whole `width`-value row — `elem::rms_norm`'s
     /// body (`rms_partial_sq`, the warp butterfly, `rms_warp_tree`,
-    /// `rms_scale`, then `(scale · gain) · x`) — then the turn of its last
+    /// `rms_scale_checked`: a row whose scale is not finite and positive is
+    /// NaN and raises `FaultSite::F32Product` on `fault`, then `(scale ·
+    /// gain) · x`) — then the turn of its last
     /// `n_dims` values by token `t`'s table through `rope_pair_rn`. The row
     /// is stored in f32 at `out[t·width ..]` and rounded once to f16
     /// (`f32_to_f16_bits`, round to nearest even) into slot `pos[t] %
@@ -143,6 +147,7 @@ mod rope_kernels {
         window: u32,
         rows: u32,
         m: u32,
+        fault: FaultSink,
         mut out: DisjointSlice<f32>,
         mut cache: DisjointSlice<u16>,
         mut shadow: DisjointSlice<u16>,
@@ -189,7 +194,7 @@ mod rope_kernels {
                 *ws.add(7),
             ]
         };
-        let scale = rms_scale(rms_warp_tree(sums), width, eps);
+        let scale = rms_scale_checked(rms_warp_tree(sums), width, eps, fault, tid == 0);
 
         // SAFETY: t < m <= pos.len() by the launch contract.
         let p = unsafe { *pos.get_unchecked(t) };
@@ -290,6 +295,9 @@ pub struct KvAppendArgs<'a> {
     pub out: &'a mut DeviceBuffer<f32>,
     pub cache: &'a mut DeviceTensor<u16>,
     pub shadow: &'a mut DeviceTensor<u16>,
+    /// Where a row whose squares leave the norm no scale is raised (the
+    /// launch's layer).
+    pub fault: FaultSink,
 }
 
 /// The loaded rope module. Owns no stream: each enqueue takes the engine
@@ -391,6 +399,7 @@ impl RopeKernels {
             out,
             cache,
             shadow,
+            fault,
         } = args;
         let (window, width) = (cache.rows(), cache.cols());
         if shadow.cols() != width {
@@ -471,6 +480,7 @@ impl RopeKernels {
             window,
             rows,
             m,
+            fault,
             out,
             cache.buf_mut(),
             shadow.buf_mut(),

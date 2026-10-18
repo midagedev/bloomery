@@ -18,9 +18,9 @@
 //! cache value is its f16 rounding (to nearest even). The key's input is
 //! token-major, `k[g·WIDTH ..]` for group `g`.
 
-use bloomery_gpu::elem::rms_scale;
+use bloomery_gpu::elem::rms_scale_checked;
 use bloomery_gpu::flash::f32_to_f16_bits;
-use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
+use bloomery_gpu::{DeviceTensor, FaultSink, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{fma_rn_f32, mul_rn_f32};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
@@ -78,15 +78,23 @@ unsafe fn load4(x: &[f32], base: usize) -> [f32; PER_LANE] {
 /// The key's norm scale: the lane's four squares summed by fused
 /// multiply-adds in value order from `+0`, then the warp butterfly
 /// (`reduce_sum_f32`: xor 16, 8, 4, 2, 1, own + partner) and
-/// `elem::rms_scale` at [`WIDTH`]. This order is the gate's host
-/// transcription. Every lane of the warp calls it (a warp collective).
+/// `elem::rms_scale_checked` at [`WIDTH`] (a scale that is not finite and
+/// positive is NaN and raises `FaultSite::F32Product` from lane 0). This
+/// order is the gate's host transcription. Every lane of the warp calls it (a
+/// warp collective).
 #[inline(always)]
-fn norm_scale(x: [f32; PER_LANE], eps: f32) -> f32 {
+fn norm_scale(x: [f32; PER_LANE], eps: f32, fault: FaultSink, lane: u32) -> f32 {
     let acc = fma_rn_f32(x[0], x[0], 0.0);
     let acc = fma_rn_f32(x[1], x[1], acc);
     let acc = fma_rn_f32(x[2], x[2], acc);
     let acc = fma_rn_f32(x[3], x[3], acc);
-    rms_scale(warp::reduce_sum_f32(acc), WIDTH as u32, eps)
+    rms_scale_checked(
+        warp::reduce_sum_f32(acc),
+        WIDTH as u32,
+        eps,
+        fault,
+        lane == 0,
+    )
 }
 
 /// The transform's stages `h = 1, 2`, inside the lane's four values.
@@ -168,6 +176,7 @@ mod index_key_kernels {
         max_groups: u32,
         n_dims: u32,
         rows: u32,
+        fault: FaultSink,
         mut cache: DisjointSlice<u16>,
     ) {
         let g = thread::blockIdx_x() as usize;
@@ -185,7 +194,7 @@ mod index_key_kernels {
         let v = PER_LANE * lane as usize;
         // SAFETY: g < max_groups, so g·128 + v + 4 <= max_groups·128 <= k.len().
         let x = unsafe { load4(k, g * WIDTH + v) };
-        let scale = norm_scale(x, eps);
+        let scale = norm_scale(x, eps, fault, lane);
         // SAFETY: v + 4 <= 128 <= gain.len().
         let gw = unsafe { load4(gain, v) };
         // Each product rounded on its own: a plain multiply feeding the
@@ -236,6 +245,9 @@ pub struct IndexKeyArgs<'a> {
     pub eps: f32,
     pub n_dims: usize,
     pub cache: &'a mut DeviceTensor<u16>,
+    /// Where a key whose squares leave the norm no scale is raised (the
+    /// launch's layer).
+    pub fault: FaultSink,
 }
 
 /// The loaded index-key module. Owns no stream: each enqueue takes the
@@ -272,6 +284,7 @@ impl IndexKeyKernels {
             eps,
             n_dims,
             cache,
+            fault,
         } = args;
         geom.check(what)?;
         let gm = geom.max_groups;
@@ -330,6 +343,7 @@ impl IndexKeyKernels {
             grid,
             launch_u32(what, "n_dims", n_dims)?,
             launch_u32(what, "rows", geom.rows)?,
+            fault,
             cache.buf_mut(),
         )?;
         Ok(())

@@ -68,6 +68,7 @@
 //! ([`hc_mean_elem`]).
 
 use bloomery_gpu::cores::{q3k_chain, q3k_sb_decode, q8_quad};
+use bloomery_gpu::elem::rms_scale_checked;
 use bloomery_gpu::fault::quad_finite;
 use bloomery_gpu::{
     COL_GROUP, ColGroups, DeviceTensor, FaultSink, FaultSite, GpuError, col_group, launch_u32,
@@ -637,10 +638,12 @@ unsafe fn hc_pre_block(
         // SAFETY: q*m + tt < n_pieces*m <= ss.len() for every q <
         // n_pieces; the ticket ordered every block's stores first.
         let acc = unsafe { column_sum(ss, at.ss0 + tt, mm, np) };
-        let mean = acc / k as f32;
+        // One thread a token: a scale with no norm behind it (squares that
+        // overflowed, or never finite) is NaN and raises F32Product.
+        let scl = rms_scale_checked(acc, k as u32, rms_eps, fault, true);
         // SAFETY: tt < m <= 8, this thread's own slot.
         unsafe {
-            *scl_s.add(tt) = 1.0 / (mean + rms_eps).sqrt();
+            *scl_s.add(tt) = scl;
         }
     }
     thread::sync_threads();
@@ -772,6 +775,7 @@ unsafe fn hc_pre_finish(
     ctr: &mut DisjointSlice<u32>,
     mixes: &mut DisjointSlice<f32>,
     hc: &mut DisjointSlice<f32>,
+    fault: FaultSink,
     at: HcPreAt,
     sh: HcPreShared,
 ) {
@@ -827,10 +831,12 @@ unsafe fn hc_pre_finish(
         // for every q < n_pieces; the ticket ordered every block's stores
         // first.
         let acc = unsafe { column_sum(ss, at.ss0 + tt, mm, np) };
-        let mean = acc / k as f32;
+        // One thread a token: a scale with no norm behind it (squares that
+        // overflowed, or never finite) is NaN and raises F32Product.
+        let scl = rms_scale_checked(acc, k as u32, rms_eps, fault, true);
         // SAFETY: tt < m <= 8, this thread's own slot.
         unsafe {
-            *scl_s.add(tt) = 1.0 / (mean + rms_eps).sqrt();
+            *scl_s.add(tt) = scl;
         }
     }
     thread::sync_threads();
@@ -901,6 +907,7 @@ unsafe fn hc_pre_q8_0_block(
     ctr: &mut DisjointSlice<u32>,
     mixes: &mut DisjointSlice<f32>,
     hc: &mut DisjointSlice<f32>,
+    fault: FaultSink,
     at: HcPreAt,
     sh: HcPreShared,
 ) {
@@ -978,7 +985,8 @@ unsafe fn hc_pre_q8_0_block(
     // `part` and `ss` is made.
     unsafe {
         hc_pre_finish(
-            scale, base, n_pieces, m, rms_eps, hc_eps, iters, part, ss, ctr, mixes, hc, at, sh,
+            scale, base, n_pieces, m, rms_eps, hc_eps, iters, part, ss, ctr, mixes, hc, fault, at,
+            sh,
         );
     }
 }
@@ -1203,10 +1211,12 @@ mod hc_kernels {
             // SAFETY: q*m + tt < n_pieces*m <= ss.len() for every q <
             // n_pieces; the ticket ordered every block's stores first.
             let acc = unsafe { column_sum(&mut ss, tt, mm, np) };
-            let mean = acc / k as f32;
+            // One thread a token: a scale with no norm behind it (squares that
+            // overflowed, or never finite) is NaN and raises F32Product.
+            let scl = rms_scale_checked(acc, k as u32, rms_eps, fault, true);
             // SAFETY: tt < m <= 8, this thread's own slot.
             unsafe {
-                *scl_s.add(tt) = 1.0 / (mean + rms_eps).sqrt();
+                *scl_s.add(tt) = scl;
             }
         }
         thread::sync_threads();
@@ -1390,6 +1400,7 @@ mod hc_kernels {
         mut ctr: DisjointSlice<u32>,
         mut mixes: DisjointSlice<f32>,
         mut hc: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
         static mut MIX: SharedArray<f32, HC_MIX_SLOTS> = SharedArray::UNINIT;
@@ -1428,7 +1439,7 @@ mod hc_kernels {
         unsafe {
             hc_pre_q8_0_block(
                 qs, d, x, scale, base, n_pieces, m as u32, rms_eps, hc_eps, iters, &mut part,
-                &mut ss, &mut ctr, &mut mixes, &mut hc, at, sh,
+                &mut ss, &mut ctr, &mut mixes, &mut hc, fault, at, sh,
             );
         }
     }
@@ -1643,7 +1654,8 @@ pub struct HcPreArgs<'a> {
     pub tokens: usize,
     /// `attention.layer_norm_rms_epsilon`.
     pub rms_eps: f32,
-    /// Where a non-finite stream value is raised (the launch's layer).
+    /// Where a non-finite stream value, or a stream whose squares leave the
+    /// norm no scale, is raised (the launch's layer).
     pub fault: FaultSink,
 }
 
@@ -1675,6 +1687,8 @@ pub struct HcQ8PreArgs<'a> {
     pub tokens: usize,
     /// `attention.layer_norm_rms_epsilon`.
     pub rms_eps: f32,
+    /// Where a stream whose norm has no scale is raised (the launch's layer).
+    pub fault: FaultSink,
 }
 
 /// The inputs of one `ds41_hc_post` launch.
@@ -1907,6 +1921,7 @@ impl HcKernels {
             &mut scratch.ctr,
             mixes,
             hc,
+            a.fault,
         )?;
         Ok(())
     }

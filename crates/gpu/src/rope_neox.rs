@@ -27,6 +27,12 @@
 //!   turn is ik's bit for bit;
 //! - the cache rows rounded once to f16, to nearest even.
 //!
+//! A head with no norm behind it — squares that overflow the f32 products, or
+//! a zero head with no `eps` — has a scale that is not finite and positive:
+//! `elem::rms_scale_of_mean_checked` makes it NaN and raises
+//! [`FaultSite::F32Product`] from the block's lane 0, so the head's values are
+//! NaN, never the zeros `1/∞` would scale them to.
+//!
 //! ik's CPU norm sums the same f32 squares serially in f64; the two f64 sums
 //! of 128 terms differ by far less than one f32 ulp of the mean, so the
 //! rounded means agree unless the exact mean sits within that distance of an
@@ -85,6 +91,7 @@
 //! its own copy for the reason the q8 entry does.
 
 use crate::GpuError;
+use crate::elem::rms_scale_of_mean_checked;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::f32_to_f16_bits;
 use crate::flash_gqa::{ROW_PLANES, RowPlanes, RowTable};
@@ -284,7 +291,7 @@ unsafe fn norm_partial_append<
         sum += unsafe { *wsum.add(w) };
     }
     let mean = (sum / HEAD as f64) as f32;
-    let scale = 1.0 / (mean + eps).sqrt();
+    let scale = rms_scale_of_mean_checked(mean, eps, fault, tid == 0);
 
     if p >= ctx as usize {
         if tid == 0 {
@@ -437,7 +444,7 @@ unsafe fn norm_neox_append<S: KvSink>(
     // SAFETY: both slots were written before the barrier above.
     let sum = unsafe { *wsum.add(0) + *wsum.add(1) };
     let mean = (sum / HEAD as f64) as f32;
-    let scale = 1.0 / (mean + eps).sqrt();
+    let scale = rms_scale_of_mean_checked(mean, eps, fault, tid == 0);
 
     if p >= ctx as usize {
         if tid == 0 {
@@ -953,7 +960,7 @@ mod rope_neox_kernels {
         // SAFETY: both slots were written before the barrier above.
         let sum = unsafe { *ws.add(0) + *ws.add(1) };
         let mean = (sum / HEAD as f64) as f32;
-        let scale = 1.0 / (mean + eps).sqrt();
+        let scale = rms_scale_of_mean_checked(mean, eps, fault, tid == 0);
 
         if p >= ctx as usize {
             if tid == 0 {
@@ -1347,7 +1354,7 @@ mod rope_neox_kernels {
         // SAFETY: both slots were written before the barrier above.
         let sum = unsafe { *ws.add(0) + *ws.add(1) };
         let mean = (sum / HEAD as f64) as f32;
-        let scale = 1.0 / (mean + eps).sqrt();
+        let scale = rms_scale_of_mean_checked(mean, eps, fault, tid == 0);
 
         if p >= ctx as usize {
             if tid == 0 {

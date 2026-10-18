@@ -384,6 +384,7 @@ pub(crate) fn hc_in(
             x: streams,
             tokens: 1,
             rms_eps: d.rms_eps,
+            fault: gpu.layer_sink(l)?,
         },
         1,
         &mut s.hc_scratch,

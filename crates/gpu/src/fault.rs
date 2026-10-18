@@ -103,9 +103,9 @@ pub enum FaultSite {
     /// A linear-attention delta step (`linear::delta`) read a lane word at
     /// or past the state's lanes.
     DeltaLane = 15,
-    /// A cache append (`latent`) stored a value that is not finite: a
-    /// non-finite input, a norm whose mean square or variance is not
-    /// finite, or a value past f16's range.
+    /// A cache append (`latent`, and the fused `kv_norm_rope_append`) stored a
+    /// value that is not finite: a non-finite input, a norm whose mean square
+    /// or variance is not finite, or a value past f16's range.
     CacheValue = 16,
     /// A token-pool selector (`qsa`; GLM's `latent::index_pool` and `kpool`)
     /// met an indexer key that is not finite after its f16 rounding
@@ -121,12 +121,16 @@ pub enum FaultSite {
     /// of squares is not finite, or produced a partial dot, a bottleneck
     /// value, a combine weight or a mixed value that is not finite.
     HcMix = 20,
-    /// The shared RMSNorm sum of squares (`rms_norm`, and the latent norm of
-    /// the fused `kv_norm_rope_append`: not finite, or a scale that is not
-    /// finite and positive, `elem::rms_scale_checked`), an f32 product kernel
-    /// of Qwen3.8's layer (`q38`: the attention output under its sigmoid gate,
-    /// the shared expert's gated sum) or Gemma4a's audio channel
-    /// normalization, attention score or GLU met non-finite arithmetic.
+    /// The shared RMSNorm sum of squares (`rms_norm`, and every norm that takes
+    /// its scale from `elem::rms_scale_checked` or
+    /// `elem::rms_scale_of_mean_checked`: the latent norm of the fused
+    /// `kv_norm_rope_append`, `rope_neox`'s head norms, V4.1's hyper-connection,
+    /// key and compressor norms) not finite, or a scale that is not finite and
+    /// positive; a value the fused `kv_norm_rope_append` wrote to `kv_s` that is
+    /// not finite; an f32 product kernel of Qwen3.8's layer (`q38`: the
+    /// attention output under its sigmoid gate, the shared expert's gated sum)
+    /// or Gemma4a's audio channel normalization, attention score or GLU met
+    /// non-finite arithmetic.
     F32Product = 21,
     /// A head whose logits no quantizer checked before them (a Q8_0 lm_head
     /// over f32 rows) met a logit that is not finite in its argmax.

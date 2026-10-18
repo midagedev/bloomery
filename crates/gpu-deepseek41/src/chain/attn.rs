@@ -1459,6 +1459,7 @@ impl AttnChain {
                 out: &mut s.kv_row,
                 cache: &mut *ring,
                 shadow,
+                fault: cx.fault,
             },
         )?;
 
@@ -2282,6 +2283,7 @@ fn source_rows(
                     n_dims: d.rope_dims,
                     pre: &mut *pre,
                     cache: &mut *io.rows,
+                    fault: cx.fault,
                 },
             )?;
         }
@@ -2301,6 +2303,7 @@ fn source_rows(
                     ring_score: scores.buf_mut(),
                     pre: &mut *pre,
                     cache: &mut *io.rows,
+                    fault: cx.fault,
                 },
             )?;
         }
@@ -2347,6 +2350,7 @@ fn source_rows(
                     eps: d.eps,
                     n_dims: d.rope_dims,
                     cache: keys,
+                    fault: cx.fault,
                 },
             )
         }
