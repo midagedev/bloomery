@@ -1,9 +1,10 @@
-//! A host tier's computation over a run of routed layers ([`HostRun`]): each
-//! layer's stacks as [`HostLayer`] reads them from the file, the scratch a
-//! step service writes, made at load, and the union scratch a batch service
-//! writes, made once a caller asks for batches ([`HostRun::prepare_union`]). The architecture supplies only how
-//! its layers' stacks are found (a closure over its names and widths, which
-//! refuses a layer by its own error); the protocol around a call is the
+//! A host tier's computation over the layers that carry a host share
+//! ([`HostRun`]): each such layer's stacks as [`HostLayer`] reads them from
+//! the file, the scratch a step service writes, made at load, and the union
+//! scratch a batch service writes, made once a caller asks for batches
+//! ([`HostRun::prepare_union`]). The architecture supplies the layer set and
+//! how its layers' stacks are found (a closure over its names and widths,
+//! which refuses a layer by its own error); the protocol around a call is the
 //! tier's ([`super::HostTier`]).
 
 use std::sync::Arc;
@@ -34,9 +35,9 @@ pub struct HostRun {
     /// The file and the r8 reading its layers were built from; every call
     /// reads through this pair.
     file: R8Pair,
-    /// Per layer of the run, its host view.
-    layers: Vec<HostLayer>,
-    first: usize,
+    /// Per model layer, its host view; `None` for a layer that carries no
+    /// host share, which no call may read.
+    layers: Vec<Option<HostLayer>>,
     scratch: HostScratch,
     widths: HostWidths,
     /// The union's slabs, once [`HostRun::prepare_union`] made them.
@@ -50,11 +51,9 @@ pub struct HostRun {
 }
 
 impl HostRun {
-    /// The tier for the routed layers `first ..` of `file`, their host views
-    /// made by `layers` from the file's reading — the architecture's names
-    /// and widths, every refusal its own error. Load-time only: every stack
-    /// is found and checked there, the gates and ups from `file`'s r8 sidecar
-    /// when `r8` asks for it and there is one.
+    /// The tier for the contiguous routed layers `first ..` of `file`, as
+    /// many as `layers` builds ([`HostRun::build_at`] over
+    /// `first .. first + n`).
     pub fn build<E>(
         file: Arc<Split>,
         first: usize,
@@ -65,15 +64,86 @@ impl HostRun {
     where
         E: std::error::Error + Send + Sync + 'static,
     {
+        let (file, views) = Self::read(file, r8, layers)?;
+        Self::assemble(file, first..first + views.len(), views, widths)
+    }
+
+    /// The tier for the layers of `set` of `file` — the model layers that
+    /// carry a host share, strictly ascending, not necessarily contiguous —
+    /// their host views made by `layers` from the file's reading, one per
+    /// layer of `set` in its order: the architecture's names and widths,
+    /// every refusal its own error. Load-time only: every stack is found and
+    /// checked there, the gates and ups from `file`'s r8 sidecar when `r8`
+    /// asks for it and there is one. A set out of order, or a count of views
+    /// other than its layers', is refused by name.
+    pub fn build_at<E>(
+        file: Arc<Split>,
+        set: impl IntoIterator<Item = usize>,
+        r8: bool,
+        widths: HostWidths,
+        layers: impl FnOnce(R8Source<'_>) -> Result<Vec<HostLayer>, E>,
+    ) -> Result<HostRun, GpuError>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let (file, views) = Self::read(file, r8, layers)?;
+        Self::assemble(file, set, views, widths)
+    }
+
+    /// The file's r8 pair and the host views `layers` makes from its reading.
+    fn read<E>(
+        file: Arc<Split>,
+        r8: bool,
+        layers: impl FnOnce(R8Source<'_>) -> Result<Vec<HostLayer>, E>,
+    ) -> Result<(R8Pair, Vec<HostLayer>), GpuError>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
         let file = R8Pair::at_load(file, r8)?;
-        let layers = layers(file.source()).map_err(|e| GpuError::Plan {
+        let views = layers(file.source()).map_err(|e| GpuError::Plan {
             what: "HostRun::build",
             source: Box::new(e),
         })?;
+        Ok((file, views))
+    }
+
+    /// The run holding `views` at the layers of `set`, in order, and a `None`
+    /// at every other layer below the set's last.
+    fn assemble(
+        file: R8Pair,
+        set: impl IntoIterator<Item = usize>,
+        views: Vec<HostLayer>,
+        widths: HostWidths,
+    ) -> Result<HostRun, GpuError> {
+        const WHAT: &str = "HostRun::build_at";
+        let set: Vec<usize> = set.into_iter().collect();
+        if set.len() != views.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} host views for a set of {} layers",
+                    views.len(),
+                    set.len()
+                ),
+            ));
+        }
+        if let Some(w) = set.windows(2).find(|w| w[0] >= w[1]) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the layer set is not strictly ascending: {} then {}",
+                    w[0], w[1]
+                ),
+            ));
+        }
+        let mut layers = Vec::new();
+        layers.resize_with(set.last().map_or(0, |&last| last + 1), || None);
+        for (l, view) in set.into_iter().zip(views) {
+            layers[l] = Some(view);
+        }
         Ok(HostRun {
             file,
             layers,
-            first,
             scratch: HostScratch::new(widths.embd, widths.ff, widths.n_used)?,
             widths,
             union: None,
@@ -99,17 +169,18 @@ impl HostRun {
                  its drops would leave the run's pages cached",
             ));
         }
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            let Some(tier) = tier.as_ref() else {
-                break;
-            };
-            let l = self.first + i;
-            if !tier.covers(l) {
-                continue;
+        if let Some(tier) = tier.as_ref() {
+            for (l, layer) in self.layers.iter_mut().enumerate() {
+                let Some(layer) = layer else {
+                    continue;
+                };
+                if !tier.covers(l) {
+                    continue;
+                }
+                let names = layer.stacks().map(|s| s.info().name.clone());
+                tier.note_parts(l, &names.each_ref().map(|n| n.as_str()))?;
+                layer.attach_tier(l, tier.host_ids(l), tier.slots());
             }
-            let names = layer.stacks().map(|s| s.info().name.clone());
-            tier.note_parts(l, &names.each_ref().map(|n| n.as_str()))?;
-            layer.attach_tier(l, tier.host_ids(l), tier.slots());
         }
         self.tier = tier;
         Ok(())
@@ -153,27 +224,22 @@ impl HostRun {
         }
     }
 
-    /// The first layer of the run.
-    #[must_use]
-    pub fn first(&self) -> usize {
-        self.first
-    }
-
-    /// Layers in the run.
+    /// Layers that carry a host share.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.layers.len()
+        self.layers.iter().flatten().count()
     }
 
-    /// Whether the run holds no layer.
+    /// Whether no layer carries a host share.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.layers.is_empty()
+        self.layers.iter().all(Option::is_none)
     }
 
-    /// Every layer's host view, the run's first layer first.
+    /// Every layer's host view, indexed by model layer: `None` where the
+    /// layer carries no host share, and nothing past the last layer that does.
     #[must_use]
-    pub fn layers(&self) -> &[HostLayer] {
+    pub fn layers(&self) -> &[Option<HostLayer>] {
         &self.layers
     }
 
@@ -183,19 +249,33 @@ impl HostRun {
         self.widths.ff
     }
 
-    /// Layer `layer`'s host view, `None` outside the run.
-    #[must_use]
-    pub fn layer(&self, layer: usize) -> Option<&HostLayer> {
-        layer
-            .checked_sub(self.first)
-            .and_then(|i| self.layers.get(i))
+    /// Layer `layer`'s host view; a layer that carries no host share is
+    /// refused by name.
+    pub fn layer(&self, layer: usize) -> Result<&HostLayer, GpuError> {
+        view_of(&self.layers, layer, "HostRun::layer")
     }
+}
+
+/// Layer `layer`'s host view in `layers`, for a call refused by name as
+/// `what` when the layer carries no host share: the one lookup, so a gap in
+/// the set never reads another layer's stacks.
+fn view_of<'a>(
+    layers: &'a [Option<HostLayer>],
+    layer: usize,
+    what: &'static str,
+) -> Result<&'a HostLayer, GpuError> {
+    layers.get(layer).and_then(Option::as_ref).ok_or_else(|| {
+        GpuError::shape(
+            what,
+            format!("layer {layer} carries no host share: it has no routed stacks in the run"),
+        )
+    })
 }
 
 impl HostRun {
     /// Layer `layer`'s host view, the run's byte source and the union's
-    /// slabs, for a union call refused by name as `what`: a layer outside
-    /// the run, and slabs never made ([`HostRun::prepare_union`]).
+    /// slabs, for a union call refused by name as `what`: a layer with no
+    /// host share, and slabs never made ([`HostRun::prepare_union`]).
     fn union_of(
         &mut self,
         layer: usize,
@@ -204,17 +284,10 @@ impl HostRun {
         let HostRun {
             file,
             layers,
-            first,
             union,
             ..
         } = self;
-        let view = layer
-            .checked_sub(*first)
-            .and_then(|i| layers.get(i))
-            .ok_or(GpuError::State {
-                what,
-                missing: "the layer's routed stacks: it is outside the host run",
-            })?;
+        let view = view_of(layers, layer, what)?;
         let scratch = union.as_mut().ok_or(GpuError::State {
             what,
             missing: "the union's slabs (HostRun::prepare_union)",
@@ -231,16 +304,6 @@ impl HostExperts for HostRun {
         experts: &[(u32, f32)],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
-        let index = layer.checked_sub(self.first).ok_or(GpuError::State {
-            what: "HostRun::experts_into",
-            missing: "the layer's routed stacks: it is outside the host run",
-        })?;
-        if self.layers.get(index).is_none() {
-            return Err(GpuError::State {
-                what: "HostRun::experts_into",
-                missing: "the layer's routed stacks: it is outside the host run",
-            });
-        }
         // A tiered load prepares union slabs of at least one column. That
         // call is the resident path: hits compute while a miss fills. A load
         // with no slabs keeps today's fill-then-serve.
@@ -254,7 +317,7 @@ impl HostExperts for HostRun {
                 tier,
                 ..
             } = self;
-            let view = &layers[index];
+            let view = view_of(layers, layer, "HostRun::experts_into")?;
             view.experts_into_resident(
                 file.source(),
                 x,
@@ -266,7 +329,7 @@ impl HostExperts for HostRun {
             reads.arena_or_file(tier.as_deref(), layer, experts.iter().map(|&(id, _)| id));
             return Ok(());
         }
-        let view = &self.layers[index];
+        let view = view_of(&self.layers, layer, "HostRun::experts_into")?;
         view.experts_into(self.file.source(), x, experts, out, &mut self.scratch)?;
         self.reads.arena_or_file(
             self.tier.as_deref(),
@@ -318,5 +381,185 @@ impl HostExperts for HostRun {
 
     fn reads(&self) -> Option<HostReads> {
         Some(self.reads)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use gguf::write::{Layout, TensorDecl, Writer};
+    use model::arch::names::routed_stacks;
+    use model::moe::HostLayerSpec;
+
+    use super::*;
+
+    const WIDTH: usize = 256;
+    const EXPERTS: usize = 2;
+    const ROW_BYTES: usize = 34 * WIDTH / 32;
+    const WIDTHS: HostWidths = HostWidths {
+        embd: WIDTH,
+        ff: WIDTH,
+        n_used: 2,
+    };
+
+    /// A model file holding the three routed stacks of each layer of `have`
+    /// and nothing else, in a directory of its own that the test removes.
+    fn file_with(have: &[usize], dir: &std::path::Path) -> Arc<Split> {
+        let bytes = ROW_BYTES * WIDTH * EXPERTS;
+        let names: Vec<String> = have.iter().flat_map(|&l| routed_stacks(l)).collect();
+        let layout = Layout::new(
+            &[],
+            names
+                .iter()
+                .map(|name| TensorDecl {
+                    name: name.clone(),
+                    dims: vec![WIDTH as u64, WIDTH as u64, EXPERTS as u64],
+                    type_id: 8,
+                    nbytes: bytes as u64,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let path = dir.join("model.gguf");
+        let mut writer = Writer::new(std::fs::File::create_new(&path).unwrap(), layout).unwrap();
+        let block = [[0x00, 0x24].as_slice(), &[1u8; 32]].concat();
+        let data = block.repeat(WIDTH * EXPERTS * (WIDTH / 32));
+        assert_eq!(data.len(), bytes);
+        for name in &names {
+            writer.tensor(name, &data).unwrap();
+        }
+        writer.finish().unwrap();
+        Arc::new(Split::open(&path).unwrap())
+    }
+
+    /// `body` over a file of the layers `have`, its directory removed after,
+    /// a panic of `body` carried on.
+    fn with_file(have: &[usize], body: impl FnOnce(Arc<Split>) + std::panic::UnwindSafe) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bloomery-host-run-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let file = file_with(have, &dir);
+        let result = std::panic::catch_unwind(move || body(file));
+        std::fs::remove_dir_all(&dir).unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn views(src: R8Source<'_>, layers: &[usize]) -> Result<Vec<HostLayer>, model::ModelError> {
+        layers
+            .iter()
+            .map(|&l| {
+                let n = routed_stacks(l);
+                HostLayer::build(
+                    src,
+                    &HostLayerSpec {
+                        gate: &n[0],
+                        up: &n[1],
+                        down: &n[2],
+                        n_expert: EXPERTS,
+                        embd: WIDTH,
+                        ff: WIDTH,
+                        swiglu_limit: 0.0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn stack_names(view: &HostLayer) -> [String; 3] {
+        view.stacks().map(|s| s.info().name.clone())
+    }
+
+    /// A layer with no host share reading another layer's experts: a set with
+    /// gaps maps each present layer to its own rows, and a call for a gap, or
+    /// for a layer past the set's last, is a named error that writes nothing.
+    #[test]
+    fn a_sparse_set_serves_its_layers_and_refuses_the_gaps_by_name() {
+        const SET: [usize; 3] = [1, 4, 5];
+        with_file(&SET, |file| {
+            let mut run =
+                HostRun::build_at(file, SET, false, WIDTHS, |src| views(src, &SET)).unwrap();
+            assert_eq!((run.len(), run.layers().len()), (3, 6));
+            for l in SET {
+                assert_eq!(stack_names(run.layer(l).unwrap()), routed_stacks(l));
+            }
+            let x = Tensor2 {
+                ne0: WIDTH,
+                ne1: 1,
+                data: vec![0.5; WIDTH],
+            };
+            let mut out = vec![7.0f32; WIDTH];
+            run.prepare_union(1).unwrap();
+            for gap in [0, 2, 3, 6, 100] {
+                let named = format!("layer {gap} carries no host share");
+                let e = match run.layer(gap) {
+                    Err(e) => e.to_string(),
+                    Ok(view) => panic!("layer {gap} served the stacks {:?}", stack_names(view)),
+                };
+                assert!(e.contains(&named), "{e}");
+                let e = run
+                    .experts_into(gap, &x, &[(0, 1.0)], &mut out)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains(&named), "{e}");
+                let lists: [&[(u32, f32)]; 1] = [&[(0, 1.0)]];
+                for union in [
+                    HostExperts::experts_union_into,
+                    HostExperts::experts_step_union_into,
+                ] {
+                    let e = union(&mut run, gap, x.view(), &lists, &mut out)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(e.contains(&named), "{e}");
+                }
+                assert!(out.iter().all(|&v| v == 7.0), "a refused call wrote");
+            }
+            run.experts_into(4, &x, &[(0, 1.0)], &mut out).unwrap();
+        });
+    }
+
+    /// The contiguous entry is the set `first .. first + n`.
+    #[test]
+    fn the_contiguous_build_is_the_set_from_its_first_layer() {
+        with_file(&[2, 3], |file| {
+            let run = HostRun::build(file, 2, false, WIDTHS, |src| views(src, &[2, 3])).unwrap();
+            assert_eq!((run.len(), run.layers().len()), (2, 4));
+            assert!(run.layer(1).is_err() && run.layer(4).is_err());
+            for l in [2, 3] {
+                assert_eq!(stack_names(run.layer(l).unwrap()), routed_stacks(l));
+            }
+        });
+    }
+
+    /// A set that is not strictly ascending, or whose views are not one a
+    /// layer, would place a stack at another layer's index.
+    #[test]
+    fn a_set_out_of_order_or_off_its_view_count_is_refused() {
+        with_file(&[1, 4], |file| {
+            let build = |set: &[usize], views_of: &[usize]| {
+                HostRun::build_at(
+                    Arc::clone(&file),
+                    set.iter().copied(),
+                    false,
+                    WIDTHS,
+                    |src| views(src, views_of),
+                )
+                .err()
+                .map(|e| e.to_string())
+            };
+            let e = build(&[4, 1], &[1, 4]).unwrap();
+            assert!(e.contains("not strictly ascending: 4 then 1"), "{e}");
+            let e = build(&[1, 1], &[1, 4]).unwrap();
+            assert!(e.contains("not strictly ascending: 1 then 1"), "{e}");
+            let e = build(&[1, 4, 5], &[1, 4]).unwrap();
+            assert!(e.contains("2 host views for a set of 3 layers"), "{e}");
+            assert!(build(&[1, 4], &[1, 4]).is_none());
+        });
     }
 }

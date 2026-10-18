@@ -2530,7 +2530,7 @@ impl Body {
             gpu.context(),
             plan,
             &file,
-            first,
+            first..layers.end,
             cfg.host.r8,
             residency.arena(),
             host_widths(hp),

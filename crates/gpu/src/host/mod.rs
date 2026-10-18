@@ -1033,7 +1033,6 @@ impl HostTier<run::HostRun> {
                 gpu,
                 &self.step.boundary,
                 &tier,
-                self.experts.first(),
                 self.experts.layers(),
                 self.experts.ff(),
             )?
