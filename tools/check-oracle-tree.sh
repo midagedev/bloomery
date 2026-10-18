@@ -58,7 +58,8 @@ class Tree(unittest.TestCase):
         git(self.tree, "init", "-q")
         write(self.tree / ".git/info/exclude", "build/\n")
         for name, text in (("src/unicode.cpp", "int a = 1;\n"), ("include/llama.h", "// api\n"),
-                           ("examples/tokenize/tokenize.cpp", "int main() {}\n"), ("docs/readme.md", "docs\n")):
+                           ("examples/tokenize/tokenize.cpp", "int main() {}\n"), ("ggml/src/ggml.c", "int g;\n"),
+                           ("tools/mtmd/mtmd.cpp", "int m;\n"), ("docs/readme.md", "docs\n")):
             write(self.tree / name, text)
         git(self.tree, "add", "-A")
         git(self.tree, "commit", "-qm", "base")
@@ -264,7 +265,7 @@ class Tree(unittest.TestCase):
         # Only the sources of what the binary links count; a doc touched after the build does not.
         os.utime(self.tree / "docs/readme.md", (2_100_000_000,) * 2)
         self.assertEqual(self.check("--patch", patch, *flags)[0], 0)
-        for name in ("src/unicode.cpp", "include/llama.h", "examples/tokenize/tokenize.cpp"):
+        for name in ("src/unicode.cpp", "include/llama.h", "examples/tokenize/tokenize.cpp", "ggml/src/ggml.c", "tools/mtmd/mtmd.cpp"):
             with self.subTest(moved=name, flags=flags):
                 os.utime(self.tree / name, (2_100_000_000,) * 2)
                 rc, _, err = self.check("--patch", patch, *flags)
@@ -293,11 +294,16 @@ class Tree(unittest.TestCase):
         lib, exe = self.tree / "build/bin/libllama.so", self.tree / "build/bin/llama-tokenize"
         self.age((lib, exe), git(self.tree, "ls-files").splitlines(), built_at=1_000_000_000, source_at=900_000_000)
         self.assertEqual(self.check(), (0, "", ""))
-        write(self.tree / "src/unicode.cpp", "int a = 7;\n")
-        write(self.tree / "src/unicode.cpp", "int a = 1;\n")
-        self.assertEqual(git(self.tree, "status", "--porcelain", "--untracked-files=no"), "")
-        rc, _, err = self.check()
-        self.assertEqual((rc, err), (2, f"who: {exe} is older than {self.tree}/src/unicode.cpp, a tracked file: it is not this tree's build"))
+        # The library's own sources count, not only llama's: ggml and the mtmd tools link into what the sets run.
+        for name in ("src/unicode.cpp", "ggml/src/ggml.c", "tools/mtmd/mtmd.cpp"):
+            with self.subTest(restored=name):
+                text = (self.tree / name).read_text()
+                write(self.tree / name, "edited\n")
+                write(self.tree / name, text)
+                self.assertEqual(git(self.tree, "status", "--porcelain", "--untracked-files=no"), "")
+                rc, _, err = self.check()
+                self.assertEqual((rc, err), (2, f"who: {exe} is older than {self.tree}/{name}, a tracked file: it is not this tree's build"))
+                os.utime(self.tree / name, (900_000_000,) * 2)
 
     def test_a_listing_of_the_sources_that_fails_is_a_refusal_not_a_pass(self):
         patch = self.patch()

@@ -24,8 +24,8 @@
 #   - by its own report, unless --unversioned (a binary that reports no commit, as ik's llama-tokenize): `--version` names a
 #     commit that is a prefix of the tree's HEAD. A tree rebuilt without a readable git reports `commit unknown` there and is
 #     refused: it is not the commit's build.
-#   - by its age, always: it and that libllama.so must be newer than every tracked file under src/, include/ and
-#     examples/tokenize/. The commit a binary reports does not say which sources its library holds: a tree whose files moved
+#   - by its age, always: it and that libllama.so must be newer than every tracked file under the source dirs the build
+#     reads (src, include, common, ggml, tools, vendor, examples, cmake and CMakeLists.txt). The commit a binary reports does not say which sources its library holds: a tree whose files moved
 #     after the build, an edit restored included, is refused. The patch's effect is the caller's to probe where the patch has a
 #     visible one.
 # --built-by TEXT is the remedy a missing file names in its error.
@@ -101,12 +101,11 @@ oracle_patch_hash() {
   printf '%s\n' "${sum:0:12}"
 }
 
-# oracle_newer_source TREE FILE: the first tracked file of TREE under src/, include/ or examples/tokenize/ that is newer than
-# FILE, or nothing. A listing that fails is a failure, never an empty answer.
+# oracle_newer_source TREE FILE: the first tracked file of TREE under the build's source dirs that is newer than FILE, or nothing. A listing that fails is a failure, never an empty answer.
 oracle_newer_source() {
   local tree=$1 ref=$2 list newer
   list=$(mktemp) || return 1
-  git -c safe.directory="$tree" -C "$tree" ls-files -z -- src include examples/tokenize > "$list" || { rm -f "$list"; return 1; }
+  git -c safe.directory="$tree" -C "$tree" ls-files -z -- src include common ggml tools vendor examples cmake CMakeLists.txt > "$list" || { rm -f "$list"; return 1; }
   newer=$(cd "$tree" && xargs -0 -r sh -c 'find "$@" -maxdepth 0 -newer "$0" -print' "$ref" < "$list") || { rm -f "$list"; return 1; }
   rm -f "$list"
   printf '%s\n' "$newer" | sed -n 1p
