@@ -58,7 +58,8 @@ build() {
   tree_check
   mkdir -p "$OUT"
   tmp=$OUT/quant_oracle.tmp.$$
-  trap 'rm -f "$tmp" "$tmp.build"' EXIT
+  # The trap names the path through globals: a failure inside the function ends it before the trap runs.
+  trap 'rm -f "$OUT/quant_oracle.tmp.$$" "$OUT/quant_oracle.tmp.$$.build"' EXIT
   g++ -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -o "$tmp" "$SRC" -I"$LCPP/ggml/include" -I"$LCPP/ggml/src" \
     -L"$LIB" -lggml-cpu -lggml-base -Wl,-rpath,"$LIB"
   # Each fact is its own assignment: inside a printf's arguments a failed md5 or readlink would not end the script.
@@ -78,7 +79,7 @@ build() {
 # digest, size and the cpu line is read into a variable before it is printed, so a failed read ends the script, no trailer.
 compose() {
   local f n=0 tmp=$SET/QUANT.tsv.tmp.$$ source_md5 cpu bytes digest
-  trap 'rm -f "$tmp"' EXIT
+  trap 'rm -f "$SET/QUANT.tsv.tmp.$$"' EXIT
   source_md5=$(md5 "$SRC")
   cpu=$(sed -n 's/^cpu\t//p' "$SET/info.tsv")
   {
