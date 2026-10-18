@@ -43,8 +43,11 @@ pub mod rounds;
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use bloomery_gpu::arch::qwen3moe::Prompt38;
+    use bloomery_levers::Draft38Off;
 
-    use super::qwen38::{ACTS_ON, Feed38, prompt_cuts, refuse_feed};
+    use super::qwen38::{
+        ACTS_ON, Feed38, draft_under_media, prompt_cuts, refuse_feed, refuse_media_feed,
+    };
 
     const STEPS: Feed38 = Feed38 {
         prompt: Prompt38::Step,
@@ -127,6 +130,47 @@ mod tests {
         let marks = [10, 40];
         assert_eq!(prompt_cuts(Prompt38::Auto, 0, 60, &marks), marks);
         assert!(prompt_cuts(Prompt38::Step, 0, 60, &marks).is_empty());
+    }
+
+    /// An image load enters a span's rows only through the ubatch walk's media call, so the step
+    /// feed is refused beside `--mmproj`, by name and with its way out.
+    #[test]
+    fn a_media_load_takes_no_step_feed() {
+        let why = refuse_media_feed(STEPS)
+            .expect_err("the step feed beside --mmproj")
+            .to_string();
+        assert!(
+            why.contains("--mmproj with BLOOMERY_PREFILL=steps"),
+            "{why}"
+        );
+        assert!(why.contains("set BLOOMERY_PREFILL=batch"), "{why}");
+        refuse_media_feed(BATCH).expect("the ubatch walk takes a media call");
+    }
+
+    /// The engine's media load carries no MTP draft: a set `mtp` beside `--mmproj` is refused by
+    /// name.
+    #[test]
+    fn a_media_load_refuses_a_set_mtp_draft() {
+        let why = draft_under_media(Some("mtp"), (true, None))
+            .expect_err("BLOOMERY_DRAFT=mtp beside --mmproj")
+            .to_string();
+        assert!(why.contains("BLOOMERY_DRAFT=mtp with --mmproj"), "{why}");
+    }
+
+    /// An unset draft the rule would have run goes off for the media load, naming it; a draft
+    /// already off keeps its own reason, and a set `off` is as set.
+    #[test]
+    fn a_media_load_turns_an_unset_draft_off_and_keeps_an_earlier_reason() {
+        let off = |word, run| draft_under_media(word, run).expect("a word the media load takes");
+        assert_eq!(off(None, (true, None)), (false, Some(Draft38Off::Media)));
+        assert_eq!(
+            off(None, (false, Some(Draft38Off::Gate))),
+            (false, Some(Draft38Off::Gate))
+        );
+        assert_eq!(
+            off(Some("off"), (false, Some(Draft38Off::Set))),
+            (false, Some(Draft38Off::Set))
+        );
     }
 
     #[test]

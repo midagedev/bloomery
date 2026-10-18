@@ -9,6 +9,8 @@
 //!                           [--ctx-size C] [--alias NAME] [--cache-ram MIB]
 //!                           [--chat-template-file PATH] [--parallel N]
 //!                           [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]
+//!                           [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
+//!                           [--image-max-tokens N]
 //!
 //! `--slot-save-path` names the directory the slot actions answer from, as
 //! llama-server's; without it every slot action is refused. `--ctx` is `--ctx-size` under its family's other spelling. The model is
@@ -189,7 +191,38 @@
 //! on again, and prefills the whole prompt. A `draft keep` line after the
 //! `cache` line prints the break-even, and each such request an `mtp keep`
 //! record (`kept` or `reset`, the prefix, the break-even, the reply).
-
+//!
+//! `--mmproj FILE` (llama-server's spelling, with `--no-mmproj` and the two token limits:
+//! [`vision_seat::Flags`]) gives the file its image input. The encoder file (Qwen3.8's is a
+//! `qwen3vl_merger` projector) is held against the text model — its rows' width, the
+//! vocabulary's three image ids, the file's IMROPE sections and its PLE image token — and refused
+//! by name when they differ ([`vision_seat::open_seat`]), before any plan. Without `--mmproj` the
+//! `--hf` repo's projector is the file where the draft rule's first word is off and the prompt is
+//! not fed a step an id ([`vision_of`]); it stays only where it costs the plan no expert and no
+//! context ([`vision_seat::kept`]), else a `vision_seat` record says it was dropped, and
+//! `--mmproj`'s file is never dropped. The tower sits on the smallest card outside the plan, else
+//! as a named reserve of the stage card ([`vision_seat::EncoderSeat`]), which every plan counts
+//! and the `vision_seat` record names, printed with the plan (`--plan` too). The placement is the
+//! one the same run without images takes: the tower is seated on it ([`reseated`]). The load is
+//! a media load (`GpuModel::enable_media`, once after the open): every sequence holds the
+//! rotation table an image's positions rewrite, which every plan counts a position as a card
+//! reserve ([`vision_seat::TABLES_RESERVE`]). The `vision` record follows the `load` line. The
+//! server renders an image part as the model's placeholder and expands it to its grid's span
+//! (`serve::media` over [`Seat::media_model`]); a prompt call that holds images encodes each on
+//! the tower and feeds the prompt with the rows in place of their positions' embeddings
+//! ([`Seat::prefill_media`]: the ubatch walk, eager). An image with no `--mmproj` is the server's
+//! own 400.
+//!
+//! An image load drafts nothing, the engine's media load refusing a load that carries the MTP
+//! draft ([`draft_under_media`]): `BLOOMERY_DRAFT=mtp` beside `--mmproj` is refused by name
+//! before the plan; unset, the draft goes off with a `load draft=off` record that names
+//! `--mmproj`, and the lever words that name the draft are then refused as they are on any
+//! server that drafts nothing. `BLOOMERY_PREFILL=steps` (one step an id) and the route trace
+//! that needs it are refused by name beside `--mmproj` ([`refuse_media_feed`]). A sequence that
+//! holds an image is kept out of the prompt cache: its rotation table is no part of a saved
+//! state, so [`Seat::snapshot`] refuses it by name (the server keeps no state of it and serves
+//! on).
+//!
 //! `BLOOMERY_DRAFT` unset follows the placement as `generate_qwen3moe`'s
 //! does (`bloomery_levers::draft38_unset`): under `--place a` or `bp` the MTP draft
 //! runs when a regular file is where it would be opened
@@ -309,7 +342,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use app::mtp::{MtpBody, MtpDraft};
-use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{
     Body38, Prompt38, Seq38, TargetRows, checkpoint_budget38, checkpoint_price38,
@@ -320,6 +352,7 @@ use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
+use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
@@ -354,6 +387,8 @@ use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file, draft_places};
 use runtime::Target as _;
 use runtime::seqstate::pinned;
 use runtime::width::Mode as WidthMode;
+#[cfg(feature = "vision")]
+use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, Pending, ResidencyReset, Saved, ServeError,
 };
@@ -376,7 +411,8 @@ use xstream_rule::{Stage, xstream_rule};
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate|bp] \
                      [--ctx-size C] [--alias NAME] [--cache-ram MIB] [--chat-template-file PATH] \
                      [--parallel N] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
-                     [--plan] [--api-key KEY] [--api-key-file FNAME]";
+                     [--mmproj FILE | --no-mmproj] [--image-min-tokens N] \
+                     [--image-max-tokens N] [--plan] [--api-key KEY] [--api-key-file FNAME]";
 
 /// The context a slot asks before the context is chosen (the placement's
 /// offer, the draft's window): the plan every Qwen3.8 measurement ran at, and
@@ -462,6 +498,13 @@ struct Place38 {
     /// The side model's reserve on the stage card, which every machine of the placement
     /// carries ([`Place38::machine`]).
     embedding: Option<u64>,
+    /// The image encoder's reserve on the stage card, when its tower sits there
+    /// ([`vision_seat::images_of`]), which every machine of the placement carries
+    /// ([`Place38::machine`]).
+    image: Option<u64>,
+    /// The load is a media load (`--mmproj`): every sequence holds a rotation table of its own,
+    /// which every machine of the placement counts ([`Place38::machine`]).
+    media: bool,
 }
 
 impl Place38 {
@@ -469,6 +512,8 @@ impl Place38 {
         kind: Kind38::A,
         cards: Place::A,
         embedding: None,
+        image: None,
+        media: false,
     };
 
     fn parse(v: &str) -> Result<Place38, GateError> {
@@ -488,6 +533,8 @@ impl Place38 {
             kind,
             cards,
             embedding: None,
+            image: None,
+            media: false,
         })
     }
 
@@ -532,7 +579,9 @@ impl Place38 {
     /// ([`seqs38`] through [`reserve_checkpoints`], priced at `ctx` positions
     /// a slot) and, under the draft, every slot's checkpoint hidden rows
     /// ([`POINT_ROWS_RESERVE`]), which the plan's host need, the NVMe tier's
-    /// floor and its arena then count. The stage card carries the side model's reserve.
+    /// floor and its arena then count. The stage card carries the side model's reserve, the
+    /// image encoder's when its tower sits there and, on a media load, a rotation table of `ctx`
+    /// rows for every slot ([`vision_seat::TABLES_RESERVE`]).
     fn machine(
         self,
         inputs: &PlanInputs,
@@ -559,10 +608,17 @@ impl Place38 {
         beside::reserve_on(
             &mut machine,
             Beside {
-                image: None,
+                image: self.image,
                 embedding: self.embedding,
             },
         );
+        if self.media {
+            let rows = u64::try_from(slots)?.saturating_mul(ctx);
+            machine.cards[0].reserves.push((
+                vision_seat::TABLES_RESERVE.to_owned(),
+                rows.saturating_mul(vision_seat::table_bytes_per_position(inputs.hp.rope_dims)),
+            ));
+        }
         reserve_checkpoints(&mut machine, seqs38(inputs, slots), ctx)?;
         if mtp.is_some() {
             let bytes = point_row_budget38(gdn_layers(inputs), ctx)?;
@@ -730,6 +786,23 @@ pub(crate) fn refuse_feed(
     Ok(())
 }
 
+/// What an image load (`--mmproj`) refuses of the feed: `BLOOMERY_PREFILL=steps`, which feeds a
+/// prompt one step an id. A prompt call that holds images enters their rows only through the
+/// ubatch walk's media call (`Seat::prefill_media`), so the step feed would serve one path to the
+/// text and another to the images; `BLOOMERY_PREFILL=batch` is the way out. The route trace needs
+/// the step feed ([`refuse_feed`]), so it is refused here too.
+pub(crate) fn refuse_media_feed(feed: Feed38) -> Result<(), GateError> {
+    if feed.stepped() {
+        return Err(
+            "--mmproj with BLOOMERY_PREFILL=steps: an image's rows enter only through the ubatch \
+             walk's media call, never one step an id; set BLOOMERY_PREFILL=batch, or drop \
+             --mmproj"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// `BLOOMERY_DRAFT` on the seat at `place` with stores of `ctx` positions
 /// in all, split among `slots` resident sequences, `file` the MTP draft file
 /// the load would open, `inputs` the target's: `mtp` the draft, `off` the
@@ -788,6 +861,31 @@ fn draft38(
             })
         }
     }
+}
+
+/// [`draft38`]'s answer `(mtp, off)` under `--mmproj`: an image load carries no MTP draft (the
+/// engine's `GpuModel::enable_media` refuses a load that does), so `BLOOMERY_DRAFT=mtp` is
+/// refused by name; the other words keep the plain path, `off` as set, and a draft the rule would
+/// have run goes off with [`Draft38Off::Media`], while a reason it was already off for stands.
+/// The lever words that name the draft are then refused by the seat's own rule
+/// (`refuse_mtp_levers`).
+pub(crate) fn draft_under_media(
+    word: Option<&str>,
+    (mtp, off): (bool, Option<Draft38Off>),
+) -> Result<(bool, Option<Draft38Off>), GateError> {
+    if word == Some("mtp") {
+        return Err(
+            "BLOOMERY_DRAFT=mtp with --mmproj: an image load carries no MTP draft (the media \
+             load refuses it); drop --mmproj, or set BLOOMERY_DRAFT=off (unset, the draft goes \
+             off by itself)"
+                .into(),
+        );
+    }
+    Ok(if mtp {
+        (false, Some(Draft38Off::Media))
+    } else {
+        (false, off)
+    })
 }
 
 /// The residency the load of `plan` at `place` runs: `set` (the word and
@@ -991,6 +1089,9 @@ struct Args {
     /// `--park-ram` in bytes; set is refused by name (resident slots park
     /// nothing).
     park_ram: Option<u64>,
+    /// The image-input flags: `--mmproj` is the encoder file whose images the seat serves, none
+    /// serves no image.
+    vision: vision_seat::Flags,
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
     api_keys: serve::flag::ApiKeys,
@@ -1012,6 +1113,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         parallel: None,
         queue_depth: None,
         park_ram: None,
+        vision: vision_seat::Flags::default(),
         api_keys: serve::flag::ApiKeys::default(),
         plan_only: false,
     };
@@ -1022,6 +1124,10 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         }
         if flag == "--plan" {
             a.plan_only = true;
+            continue;
+        }
+        // `--no-mmproj` has no value: the image flags read theirs from `it` themselves.
+        if a.vision.take(flag, &mut it)? {
             continue;
         }
         let v = it
@@ -1057,6 +1163,43 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         );
     }
     Ok(a)
+}
+
+/// What `--mmproj` opened for the plans: the encoder file held against the text model's embedding
+/// width, its vocabulary's image ids, the file's IMROPE sections and its PLE image token
+/// ([`vision_seat::TextFacts::of_qwen35moe`], `token` the vocabulary's id to text), and seated for
+/// a plan on `place` ([`vision_seat::open_seat`]); the file is `--mmproj`'s, else, where the seat
+/// `takes` the `--hf` repo's projector, that one ([`vision_seat::Flags::encoder`]), and `None`
+/// without either. A build without the `vision` feature, whose tower is not built, refuses
+/// `--mmproj` by name.
+fn vision_of(
+    flags: &vision_seat::Flags,
+    (place, takes): (Place, bool),
+    hp: &model::arch::qwen35moe::hparams::Hparams,
+    token: &dyn Fn(u32) -> Option<String>,
+) -> Result<Option<vision_seat::Opened>, GateError> {
+    #[cfg(not(feature = "vision"))]
+    if flags.wanted()?.is_some() {
+        return Err(vision_seat::NO_TOWER.into());
+    }
+    let file = flags.encoder(takes)?;
+    vision_seat::open_seat(
+        flags,
+        file.as_deref(),
+        place,
+        &[vision::arch::qwen3vl::PROJECTOR_TYPE],
+        &vision_seat::TextFacts::of_qwen35moe(hp),
+        token,
+    )
+}
+
+/// `at` seated for the plan on `place`, the placement the rule chose: where the tower sits depends
+/// on the cards the plan uses ([`vision_seat::encoder_seat`]), and the placement is known only
+/// after the rule asked the offer's plan, so the file is opened and held against the text model
+/// first, on the flag's own placement, and seated here.
+fn reseated(at: vision_seat::Opened, place: Place) -> Result<vision_seat::Opened, GateError> {
+    let seat = vision_seat::encoder_seat(place, at.card.total())?;
+    Ok(vision_seat::Opened { seat, ..at })
 }
 
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
@@ -1169,6 +1312,23 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let experts = experts38(&levers)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
     let tok = Tokenizer::from_gguf(&path)?;
+    // `--mmproj`'s encoder file, held against the text model and the vocabulary before anything
+    // is planned. The `--hf` repo's projector is taken only where the load can serve images and
+    // keep what it runs without them: the draft rule's first word is off and the prompt is not
+    // fed a step an id. An image load takes no MTP draft ([`draft_under_media`]).
+    let token = |id: u32| tok.text(id).map(str::to_owned);
+    let vision = vision_of(
+        &a.vision,
+        (draft_at.cards, !mtp && !feed.stepped()),
+        &inputs.hp,
+        &token,
+    )?;
+    let (mtp, draft_off) = if vision.is_some() {
+        refuse_media_feed(feed)?;
+        draft_under_media(levers.draft(), (mtp, draft_off))?
+    } else {
+        (mtp, draft_off)
+    };
     let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let ChatSurface { template, name } = ChatSurface::read(
         &path,
@@ -1256,6 +1416,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // The side model's seat before the plans, each of which holds its bytes when it sits on the
     // stage card.
     let side_seat = side.as_ref().map(|s| s.seat(chosen.place)).transpose()?;
+    // The encoder on the placement the rule chose: images never move the placement, which is the
+    // one the same run without them takes.
+    let vision = vision.map(|v| reseated(v, chosen.place)).transpose()?;
     a.place = Place38 {
         kind: match a.flag {
             Some(f) => f.kind,
@@ -1264,6 +1427,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         },
         cards: chosen.place,
         embedding: side_seat.as_ref().and_then(|s| s.reserve),
+        image: None,
+        media: false,
     };
     // Plan (b′)'s tier cards held too, and the room read again: every plan
     // below and the engine thread's take it.
@@ -1274,6 +1439,38 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         }
         inputs.room = host_available_read()?;
     }
+    // A projector the `--hf` repo picked stays only where the load gives the text model the same
+    // experts and context with its reserve as without ([`vision_seat::kept`]); that load's draft
+    // is off, which the projector's pick required. `--mmproj`'s file is never dropped.
+    let vision = vision_seat::kept(vision, &a.vision, |v| {
+        let (media, image) = vision_seat::images_of(v);
+        let place = Place38 {
+            image,
+            media,
+            ..a.place
+        };
+        let plans = Plans {
+            inputs: &inputs,
+            place,
+            experts,
+            levers: &plan_levers,
+            mtp: None,
+            slots,
+            feed,
+        };
+        let ctx = ctx38(&plans, a.ctx)?.ctx;
+        let at = u64::try_from(ctx)?;
+        let ub = u64::try_from(ubatch_for(ctx)?)?;
+        let machine = place.machine(&inputs, (at, ub), experts, None, slots)?;
+        let plan = inputs.plan_with_slots(&machine, at, &plan_levers, experts, slots)?;
+        Ok(vision_seat::Cost::of(&plan, at))
+    })?;
+    let (media, image) = vision_seat::images_of(vision.as_ref());
+    a.place = Place38 {
+        image,
+        media,
+        ..a.place
+    };
     // The paged tier's rule (`bloomery_levers::paged_columns`, the module
     // doc), asked once of the plan the flags name: a set context's slot is
     // known before any choice, so its plain plan's arena decides ahead of the
@@ -1540,6 +1737,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     )? {
         line.eprint();
     }
+    // The encoder's seat and the reserve it takes on the stage card, with the plan.
+    vision_seat::print_seat(vision.as_ref());
     let (residency, pool) = residency38_at(&plan, (a.place, feed), set)?;
     if a.plan_only {
         // The records before the load are out; nothing was loaded and the
@@ -1597,6 +1796,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         stats: levers.step_stats(),
         width,
         cache_ram: cache.ram,
+        vision,
     };
     let engine = SeatEngine::spawn(
         move || Q38::open(open),
@@ -1760,6 +1960,10 @@ struct SeatArgs {
     /// copied into on a lane of their own, pinned whole at the open
     /// (`SaveLane::new`); 0 (the cache off) makes no lane.
     cache_ram: u64,
+    /// The image encoder `--mmproj` seated: the load is a media load
+    /// (`GpuModel::enable_media`) and its tower is opened after the captures
+    /// ([`vision_seat::open_resident`]).
+    vision: Option<vision_seat::Opened>,
 }
 
 /// The Qwen3.8 session on the engine thread: the session over the model,
@@ -1821,6 +2025,12 @@ struct Q38 {
     /// The copy stream and the pinned staging the prompt cache's saves are
     /// made on ([`Seat::snapshots_async`]); none with the cache off.
     lane: Option<SaveLane>,
+    /// The load is a media load (`--mmproj`): every sequence holds a rotation table of its own,
+    /// which a saved state does not carry ([`Q38::refuse_images`]).
+    media: bool,
+    /// The resident image encoder under `--mmproj` ([`vision_seat::open_resident`]).
+    #[cfg(feature = "vision")]
+    vision: Option<vision_seat::Resident>,
 }
 
 impl Q38 {
@@ -1838,6 +2048,7 @@ impl Q38 {
             let _ = threads::pool().pin_caller();
         }
         let t = Instant::now();
+        let media = a.vision.is_some();
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
         // The room is the main thread's: a reading of the host's available
         // bytes of its own would plan the load from another room than the
@@ -1914,6 +2125,11 @@ impl Q38 {
                 )?
             }
         };
+        // An image load gives every sequence its rotation table, once, before any call, slot or
+        // capture; the plan counted them ([`Place38::machine`]).
+        if media {
+            m.enable_media()?;
+        }
         m.set_mode(StepMode::Graph);
         record::lane(a.lane.0, &a.lane.1).eprint();
         let total = t.elapsed();
@@ -2042,6 +2258,12 @@ impl Q38 {
                 a.place.name()
             );
         }
+        // The tower after the model's captures and slots, as the qwen3 seat opens its encoder: its
+        // bytes are the plan's reserve, so it comes before the expert stream below.
+        #[cfg(feature = "vision")]
+        let vision = vision_seat::open_resident(s.model().gpu().context(), a.vision)?;
+        #[cfg(not(feature = "vision"))]
+        let _ = a.vision;
         // The expert stream last: a started ring takes the card's free bytes
         // past its keep, so every card buffer the open makes comes before it.
         let (gpu, _, body) = s.model_mut().body_parts(WHAT)?;
@@ -2071,7 +2293,25 @@ impl Q38 {
             branch: std::cell::RefCell::new(vec![None; a.slots]),
             cut_line: vec![None; a.slots],
             lane,
+            media,
+            #[cfg(feature = "vision")]
+            vision,
         })
+    }
+
+    /// A sequence that holds an image is kept out of the prompt cache: its rotation table
+    /// (`GpuModel::rope_saved`) is no part of a saved state, so a resume would read the text
+    /// table over the image's rows. Refused by name as the request's (a `GpuError::Shape`): the
+    /// server keeps no state and serves on. A text load holds no table.
+    fn refuse_images(&self, what: &'static str) -> Result<(), GateError> {
+        if self.media && !self.s.model().rope_saved()?.is_empty() {
+            return Err(GpuError::shape(
+                what,
+                "the sequence holds an image, whose rotation table a saved state does not carry",
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// The prompt call of `ids` one captured step an id
@@ -2349,6 +2589,37 @@ impl Seat for Q38 {
         Ok(next)
     }
 
+    /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
+    /// without `--mmproj`, a seat that takes no image.
+    #[cfg(feature = "vision")]
+    fn media_model(&self) -> Option<SharedMediaModel> {
+        self.vision.as_ref().map(vision_seat::Resident::media)
+    }
+
+    /// Each feed's image encoded on the resident encoder and read back as bf16, then one prompt
+    /// call with the images spliced in: a patch grid is one row a cell and nothing around it
+    /// ([`vision_seat::merged_cells`]: the tokens carry the delimiters), a tile group is refused
+    /// by name by the encode ([`vision_seat::Resident::encode`]), and the call is the session's
+    /// media call ([`vision_seat::Encoded::prompt`]) — the ubatch walk, eager, the rows in place
+    /// of their positions' embeddings and the sequence's rotation table shifted by each image's
+    /// grid. An image load drafts nothing, so no draft is told. The encode binds the model's
+    /// card back before the prompt call.
+    #[cfg(feature = "vision")]
+    fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
+        let Some(v) = self.vision.as_mut() else {
+            return Err("no --mmproj: this seat serves no image".into());
+        };
+        let encoded = v.encode(
+            self.s.model().gpu().context(),
+            feeds
+                .iter()
+                .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
+        )?;
+        let next = encoded.prompt(&mut self.s, ids, |rows| rows.image_spans())?;
+        self.print_passes()?;
+        Ok(next)
+    }
+
     /// One step; under the draft the rows it left waiting walked first
     /// (`MtpDraft::before_step`: a request that continues the held
     /// sequence joins it here when its prompt call is empty).
@@ -2594,6 +2865,7 @@ impl Seat for Q38 {
     /// as the prompt cache holds it, with the draft's side of it
     /// ([`SlotDrafts::park`]) beside the body's.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+        self.refuse_images("qwen38::snapshot")?;
         let sel = self.s.selected();
         let state = self.s.model_mut().seq_save()?;
         let draft = self.drafts.park(sel)?;
@@ -2612,6 +2884,7 @@ impl Seat for Q38 {
         let Some(lane) = &self.lane else {
             return Ok(Pending::landed(self.snapshot()?));
         };
+        self.refuse_images("qwen38::snapshot_begin")?;
         let copy = self
             .s
             .model_mut()

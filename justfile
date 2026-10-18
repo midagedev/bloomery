@@ -1183,6 +1183,26 @@ gate-gpu-qwen35-media:
 gate-gpu-qwen35moe-media:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-media && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen35_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_media'
 
+# Qwen3.8's image input (gate_qwen38_media's doc): Body38's media call on the ubatch walk (`enable_media`, the media load's
+# own rotation table) on the UD-Q4_K_XL file, its routed experts on the card's id prefix and the host beyond it, against
+# the qwen4exp-vis sets (mainline's mtmd on the same file, `just dump-ref-qvis qwen4exp`): (A) the unit rows of an image
+# call (the widened bf16 rows of set B at image positions, a no-span call's rows elsewhere, a span a unit boundary cuts
+# read in each unit), (B) set C's positions against ours and the table they gather, (C) the encoder file's identity
+# against the text file through the seat's own check (Qwen3.6's projector refused by name, Qwen3.8's accepted), (D) the
+# text request on the media load against the text load's, the call-start refusal inside a held image, the cut back to an
+# image's start and its refusal inside one, a media call while capturing, the text load's refusals and a step graph
+# captured at load and replayed after an image call, (E) set F's two decodes (ids on the prefix its CPU twin agrees on, the
+# positions the steps read), (F) the tower's rows through the seat's resident encoder against set B within the tower
+# gate's band, and (G) one served answer (`bloomery-serve --model qwen38 --mmproj`: set E's prompt ids, set F's ids or a
+# near tie, and the 400 of a server with no --mmproj). The plan runs on the gate card's bytes less the tower's and the
+# rotation tables'. Real file only (the sets are dumped from it). Stays solo, reason: the host set (the most of the file)
+# loads under the big-load lock four times, the text load, the media load and the two servers one after the other, and
+# a neighbour's load moves the host room each plan reads.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-qwen38-media:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen38-media && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision,gemma-embedding2 --release --bin bloomery-serve --bin gate_qwen38_media && D=target/qwen38-media-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=2400 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen38_media --dir $D'
+
 # The decide seat of bloomery-serve (gate_clef_serve's doc): Clef-Flash at bartowski's Q5_K_M (6.9 GB, the
 # `qwen35` file of rev d7f376ea) with the release's head; the six refusals (a qwen35 file with no head, --model
 # decide with no head, --model qwen3 with --head, a head config no row knows, a head narrower than the backbone,
