@@ -17,6 +17,8 @@
 //!   quantized column, independent of any hand kernel;
 //! - the entry the dispatch reads agrees with the type's row and does what the hand dispatch
 //!   does for the same type (column bytes, the quantized column, the dot);
+//! - the entry's encoder refuses by name a column that is not whole blocks and an output buffer
+//!   that is not the column's bytes, on both encoder paths;
 //! - every row of `gguf::QROWS` that names a quantized activation form has a kernel of that
 //!   form, and a row that names none has no kernel.
 
@@ -430,15 +432,82 @@ fn generic_dot_is_within_its_f64_bound() {
     check_bound::<Iq4Nl>(&Q82X4_KS);
 }
 
+// ------------------------------------------------------------ the encoder's refusals
+
+/// `entry.quantize(x, out, avx2)` panics, and its message (an `assert_eq!` wraps the text it was
+/// given) names `refusal`.
+fn assert_refused(entry: &Entry, x: &[f32], out: &mut [u8], avx2: bool, refusal: &str) {
+    let (ty, values, bytes) = (entry.ty, x.len(), out.len());
+    let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        entry.quantize(x, out, avx2);
+    })) else {
+        panic!("{ty:?} avx2 = {avx2}: {values} values into {bytes} bytes were not refused");
+    };
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .expect("a refusal carries a text message");
+    assert!(
+        message.contains(refusal),
+        "{ty:?} avx2 = {avx2}: {values} values into {bytes} bytes refused with {message:?}, not {refusal:?}"
+    );
+}
+
+fn proof_entries() -> [Entry; 3] {
+    [
+        Entry::of::<Q2k>(),
+        Entry::of::<Iq4Xs>(),
+        Entry::of::<Iq4Nl>(),
+    ]
+}
+
+#[test]
+fn quantize_refuses_a_partial_block() {
+    for entry in proof_entries() {
+        // A non-finite value past the last whole block is what a silent remainder would drop.
+        let mut x = vec![1.0f32; 2 * entry.values];
+        x.push(f32::NAN);
+        for avx2 in [false, true] {
+            // Sized for the partial column, so only the block check can refuse it.
+            let mut out = vec![0u8; entry.col_bytes(x.len())];
+            assert_refused(
+                &entry,
+                &x,
+                &mut out,
+                avx2,
+                "generic qdot: incomplete activation block",
+            );
+        }
+    }
+}
+
+#[test]
+fn quantize_refuses_a_wrong_buffer_length() {
+    for entry in proof_entries() {
+        // Five blocks: a Q8_2_X4 column of that size is one group and one tail block.
+        let x = vec![1.0f32; 5 * entry.values];
+        let want = entry.col_bytes(x.len());
+        for avx2 in [false, true] {
+            for len in [0, want - 1, want + 1, 2 * want] {
+                let mut out = vec![0u8; len];
+                assert_refused(
+                    &entry,
+                    &x,
+                    &mut out,
+                    avx2,
+                    "generic qdot: wrong activation buffer length",
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the dispatch
 
 #[test]
 fn entries_agree_with_their_rows() {
-    for entry in [
-        Entry::of::<Q2k>(),
-        Entry::of::<Iq4Xs>(),
-        Entry::of::<Iq4Nl>(),
-    ] {
+    for entry in proof_entries() {
         assert!(
             entry.agrees_with_row(),
             "{:?}: bytes {}, values {}, form {:?} against its row {:?}",

@@ -39,7 +39,8 @@ use gguf::{GgmlType, HostAct};
 use super::{
     Q8K_STRIDE, Q82_BLOCK, Q82X4_STRIDE, bf16_bits_to_f32, emul_add_epi32, emul_madd1,
     emul_maddubs, emul_sign_epi8, emul_unpackhi_epi32_i32, emul_unpackhi_epi64_i32,
-    emul_unpacklo_epi32_i32, emul_unpacklo_epi64_i32, quantize_q8k_block, quantize_q82x4_col,
+    emul_unpacklo_epi32_i32, emul_unpacklo_epi64_i32, lut4_codes_scalar, quantize_q8k_block,
+    quantize_q82x4_col,
 };
 #[cfg(target_arch = "x86_64")]
 use super::{
@@ -192,7 +193,12 @@ impl Entry {
     }
 
     /// Quantizes one activation column into the entry's form; `avx2` picks the vector encoder
-    /// (byte-identical to the scalar one). `out` is `col_bytes(x.len())` bytes.
+    /// (byte-identical to the scalar one), and a CPU without AVX2 takes the scalar encoder
+    /// whatever `avx2` says.
+    ///
+    /// # Panics
+    /// When `x` is not a whole number of the entry's blocks, or `out` is not `col_bytes(x.len())`
+    /// bytes.
     #[cfg_attr(
         not(target_arch = "x86_64"),
         expect(
@@ -201,6 +207,17 @@ impl Entry {
         )
     )]
     pub fn quantize(&self, x: &[f32], out: &mut [u8], avx2: bool) {
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = avx2 && std::arch::is_x86_feature_detected!("avx2");
+        assert!(
+            x.len().is_multiple_of(self.values),
+            "generic qdot: incomplete activation block"
+        );
+        assert_eq!(
+            out.len(),
+            self.col_bytes(x.len()),
+            "generic qdot: wrong activation buffer length"
+        );
         match self.act {
             HostAct::Q8K => {
                 let (xblocks, _) = x.as_chunks::<256>();
@@ -208,7 +225,7 @@ impl Entry {
                 for (xb, ob) in xblocks.iter().zip(oblocks.iter_mut()) {
                     #[cfg(target_arch = "x86_64")]
                     if avx2 {
-                        // SAFETY: the caller saw AVX2.
+                        // SAFETY: AVX2 was detected above.
                         unsafe { quantize_q8k_block_avx2(xb, ob) };
                         continue;
                     }
@@ -218,7 +235,7 @@ impl Entry {
             HostAct::Q8_2X4 => {
                 #[cfg(target_arch = "x86_64")]
                 if avx2 {
-                    // SAFETY: the caller saw AVX2.
+                    // SAFETY: AVX2 was detected above; the lengths were checked above.
                     unsafe { quantize_q82x4_col_avx2(x, out) };
                     return;
                 }
@@ -528,14 +545,7 @@ fn half_at(blk: &[u8], off: usize) -> f32 {
 /// The 32 values of a 4-bit sub-block through the signed `kvalues_iq4nl` table: the low nibble
 /// of `qs[j]` is value `j`, the high nibble value `j + 16`.
 fn iq4nl_codes(qs: &[u8]) -> [i8; 32] {
-    std::array::from_fn(|n| {
-        let nib = if n < 16 {
-            qs[n] & 0x0f
-        } else {
-            qs[n - 16] >> 4
-        };
-        KVALUES_IQ4NL[usize::from(nib)]
-    })
+    lut4_codes_scalar(qs, &KVALUES_IQ4NL.map(|c| c as u8)).map(|c| c as i8)
 }
 
 /// [`iq4nl_codes`] in a register.
