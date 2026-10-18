@@ -1124,42 +1124,57 @@ impl StepPort {
             out.fill(f32::NAN);
             return Err(self.refuse(health, layer, format!("row {row}: {saw}")));
         }
-        // Read every offset before writing any, so a refusal leaves the
-        // row's slots skipped, as the service's start left them.
-        if let Some(tier) = tier
-            && !self.card.is_empty()
-        {
-            self.card_ids.clear();
-            self.card_ids.extend(self.card.iter().map(|&(_, id)| id));
-            let hold = tier.hold_for_card(layer, &self.card_ids)?;
-            self.card_offs.clear();
-            for &id in hold.ids() {
-                self.card_offs.push(tier.card_offsets(layer, id)?);
-            }
-            let leg = self
+        // The card's ids leave the host's list before their fill is joined:
+        // what stays reads the file mapping, so the host computes it while the
+        // misses fill, and the fill is joined where the first reader of its
+        // bytes needs it (the card's offsets, below). The ticket borrows the
+        // ids, so it ends with this block.
+        let w2_host: f64 = {
+            let ticket = match &tier {
+                Some(tier) if !self.card.is_empty() => {
+                    self.card_ids.clear();
+                    self.card_ids.extend(self.card.iter().map(|&(_, id)| id));
+                    let card_ids = &self.card_ids;
+                    self.list.retain(|(id, _)| !card_ids.contains(id));
+                    Some(tier.issue_card_hold(layer, &self.card_ids)?)
+                }
+                _ => None,
+            };
+            let w2_host: f64 = self
+                .list
+                .iter()
+                .map(|&(_, w)| f64::from(w) * f64::from(w))
+                .sum();
+            let out = self
                 .boundary
-                .arena
-                .as_mut()
-                .ok_or(GpuError::state(what, "the card leg the service read"))?;
-            for (&(s, _), offs) in self.card.iter().zip(&self.card_offs) {
-                leg.set_slot(row, s, Some(*offs))?;
+                .page
+                .f32_mut(hsum_off, h.hidden)
+                .ok_or(GpuError::state(what, "the sum is outside the page"))?;
+            match &ticket {
+                Some(t) => t.under_fill(|| experts.experts_into(layer, &self.x, &self.list, out)),
+                None => experts.experts_into(layer, &self.x, &self.list, out),
+            }?;
+            self.stats.host_calls += 1;
+            // Read every offset before writing any, so a refusal leaves the
+            // row's slots skipped, as the service's start left them.
+            if let Some(ticket) = ticket {
+                let hold = ticket.finish()?;
+                self.card_offs.clear();
+                for &id in hold.ids() {
+                    self.card_offs.push(hold.offsets(id)?);
+                }
+                let leg = self
+                    .boundary
+                    .arena
+                    .as_mut()
+                    .ok_or(GpuError::state(what, "the card leg the service read"))?;
+                for (&(s, _), offs) in self.card.iter().zip(&self.card_offs) {
+                    leg.set_slot(row, s, Some(*offs))?;
+                }
+                self.holds[row] = Some(hold);
             }
-            let held = hold.ids();
-            self.list.retain(|(id, _)| !held.contains(id));
-            self.holds[row] = Some(hold);
-        }
-        let w2_host: f64 = self
-            .list
-            .iter()
-            .map(|&(_, w)| f64::from(w) * f64::from(w))
-            .sum();
-        let out = self
-            .boundary
-            .page
-            .f32_mut(hsum_off, h.hidden)
-            .ok_or(GpuError::state(what, "the sum is outside the page"))?;
-        experts.experts_into(layer, &self.x, &self.list, out)?;
-        self.stats.host_calls += 1;
+            w2_host
+        };
         // The page holds the handoff until the signal: the ids are read
         // before it, the finished position is written after it.
         let whole = match self.trace.as_mut() {

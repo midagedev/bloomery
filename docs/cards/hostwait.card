@@ -1,0 +1,83 @@
+# hostwait: the step port's card leg claims its arena ids and queues their fills, computes the host's own slots under the
+# fills, and joins them where the card's offsets need the filled bytes (NvTier::issue_card_hold, CardTicket::finish;
+# crates/gpu/src/host/step.rs serve_one). Before, hold_for_card joined the fills first and the host list ran after. The
+# series path exists on the card leg only, which only gpu-glm5next attaches (a pinned arena: the Spark's default, the
+# box with BLOOMERY_NVTIER_MEM=pinned). Qwen3.8 and V4.1 take experts_into_resident, which already computes a step's
+# hits under the pending ticket, so their A/B is not this card's.
+#
+# Decomposition of the step [derived unless tagged]. GLM-5.3-Flash UD-Q4_K_XL, 42 routed layers, n_used 8, 15.2 MB an
+# expert, host leg bytes a token 4,055 MB = 267 picks, h 29.6..31.4 ms at 129..137 GB/s, host fixed cost F 2.5..3.5 ms,
+# card front 12.8..15.6 ms [measured: glmslots-ab.card:14-17]. So one host pick is 15.2 MB / 133 GB/s = 114 us and a host
+# list call costs F / 42 = 60..83 us fixed. Shape of this card: A6000, BLOOMERY_NVTIER_MEM=pinned, BLOOMERY_HOST_ROOM=80G,
+# BLOOMERY_NVTIER_BYTES=20G: the host segment holds about 55 % of the non-card picks [assumption: 80 GB / 15.2 MB = 5,263
+# of 9,500 host experts (glmslots-ab.card:28); the plan line fixes it, see the condition], so n_h = 267 x 0.55 / 42 = 3.5
+# host picks a layer. Fills a token f = 70 on 34 miss layers L = 42 (1 - exp(-f/42)) [assumption: f near the Spark
+# plan's 62.9 (t4-glm-card-leg.card); L as les-plan.md's], 2.06 fills a missed layer.
+#   host list a layer   n_h x 114 + 70 = 0.47 ms (2.5..4 picks: 0.36..0.53)
+#   fill wall a layer   2.06 x 15.2 MB at QD 6 = 31 MB at 6.0 GB/s (the box drive: 5.67 / 6.48 GB/s at QD 4 / 8,
+#                       tierengine.md:467) = 5.2 ms
+#   card arena read     2.9 arena picks x 15.2 MB = 44 MB over PCIe at 18 GB/s (refill-decode.card:43-44's 17.9 MB a ms)
+#                       = 2.4 ms a layer, after the join, the card entries being PCIe-bound on a discrete card
+#   card front          13.7 / 42 = 0.33 ms
+#   step before         34 x (0.33 + 5.2 + 0.47 + 2.4) + 8 x (0.33 + 0.47 + 2.4) = 311 ms
+#   step after          34 x (0.33 + max(0.47, 5.2) + 2.4) + 8 x 3.2 = 295 ms: the host list is under the fill's shadow
+# Gain g = L x host list = 34 x 0.47 = 16 ms, 311 / 295 - 1 = +5.4 % of decode tok/s; n_h 2.5..4, L 30..34 and T
+# 235..310 ms give +3.5..+7.5 %. The T4 shape (the Spark, t4-glm-card-leg.card: 26 host picks a token, n_h 0.62) gives g = 32.6 x (0.62 x
+# 114 + 70) = 4.7 ms of 245..315 ms = +1.5..+1.9 % at the box CPU's pick rate: inside the ruler, so this card is not
+# asked at that shape; the Spark's own CPU rate is unmeasured.
+# Resource timeline of a missed layer (the wall is a sum of phases; inside the fill phase it is one resource's max):
+# host CPU 0.47 ms of compute (the pool), the reader threads asleep in O_DIRECT reads; NVMe 5.2 ms busy (the max of the
+# fill phase); host DRAM 53 MB read by the list in 0.4 ms and 31 MB of DMA writes under it; card SMs 0.33 front, then the
+# arena entries; PCIe 2.4 ms after the join. Before: 0.33 + (5.2 + 0.47) + 2.4. After: 0.33 + 5.2 + 2.4. The host list
+# is the term under the NVMe shadow: it is worth 0.47 ms a missed layer, all of it.
+# Flow levers read and not taken (report only): the card's read of the layer's hit slots (0.8 of 2.9 picks, 0.7 ms) could
+# run under the fill with a two-stage signal, 1.5x this card's gain on a discrete card and about 0 on the Spark (167.8
+# GB/s reads); the fill phase itself is 66 % of the layer, which is the lookahead's (les-plan.md C3), not this card's.
+#
+# The one term the derivation cannot close: the realized overlap, host compute that runs under a pending ticket without
+# slowing the fill or the list (16 reader threads and the spinning pool share the cores; the NVMe DMA shares DRAM),
+# read as step_hits_under_read_ns / step_miss_layers in the changed arm's nvtier record: 0.36..0.53 ms.
+# Instrument check [measured: gate-gpu-glm5next-nvtier, real tier, this tree, the card arm's nvtier record: 9 positions,
+# plan (b') with a 41.3 GB arena of 64 slots paging 166.3 GB, so the host segment is a few percent of the routed bytes]:
+# step_miss_layers 300, step_fills 788, step_fill_wall_ns 2.056 s = 6.9 ms a missed layer, step_hits_under_read_ns
+# 9.02 ms = 30 us a missed layer, card_ids 2405. The counter counts the host list under the pending ticket, and at that
+# shape the fill wall it hides under is 230 times the list (n_h about 0.3): the overlap is real and small there, which is
+# why this card's shape carries the host share in its condition.
+# Ruler: sd 2.6 % (refill-decode.card's paged-tier scatter), 10 rounds, h = 2.44 %; the near edge +3.5 clears it.
+# Wall [derived]: an arm is a load (60..120 s for 200 GB paged) + prompt + 1,024 x 0.3 s = 5 min; a round about 10 min;
+# 10 rounds + a warm-up about 110 min: batch it into one sitting.
+#
+# Runner (the lead; every variable but the rounds inside BLOOMERY_BOX_ENV):
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/hostwait.card BLOOMERY_GEN_CTX=3072 BLOOMERY_DECODE_N=1024 BLOOMERY_AB_LOAD=arm BLOOMERY_AB_WARMUP=1' \
+#   BLOOMERY_AB_ROUNDS=10 just depth-gpu-glm5next \
+#     bin:<base tree>/target/release/generate_glm5next:prose:512@BLOOMERY_NVTIER_MEM=pinned,BLOOMERY_HOST_ROOM=80G,BLOOMERY_NVTIER_BYTES=20G \
+#     prose:512@BLOOMERY_NVTIER_MEM=pinned,BLOOMERY_HOST_ROOM=80G,BLOOMERY_NVTIER_BYTES=20G
+kind: ab
+question: does the card leg's host list, computed while the arena fills of the step's misses are in flight, shorten the
+  GLM-5.3-Flash paged decode step, where the fill was joined first and the host list ran after it?
+term: decode tok/s @ n=1024, prose 512 (the corpus's first 512 ids), ctx 3072, A6000, plan a with BLOOMERY_NVTIER_MEM=pinned,
+  BLOOMERY_HOST_ROOM=80G, BLOOMERY_NVTIER_BYTES=20G, MTP off, one slot; this tree's generate_glm5next against main
+  9338821a5's, (ours - base) / base, paired by round
+unit: %
+predict: +3.5..+7.5
+rounds: 10
+sd: 2.6 % refill-decode.card (rig-log 09-30#q38seed-ab, the paged tier's paired SD over 4 rounds), measured on Qwen3.8's
+  paged decode; GLM-5.3's paged decode is unmeasured and may scatter more
+condition: one lease; both builds with their Cargo.lock current; every arm a fresh process (BLOOMERY_AB_LOAD=arm), the
+  order rotated each round, one warm-up round discarded; no [cpu-busy], [other-busy] or [cold] row and no Xid in either
+  witness. Both arms' plan lines and nvtier budget= and paged= fields are equal, the plan names a paged plan with an
+  arena whose host_experts bytes are 45..65 % of the bytes it does not hold on the card (else n_h left the derivation's
+  band and the prediction is re-derived from n_h x 114 us, not read), both arms' nvtier records read card_leg=on with
+  card_ids > 0, the decode fills (fills - union_fills) within 5 %, and the greedy tokens equal (the change moves no bit;
+  the runner's tokens-differ line reads 0 of 10). Read beside the ratio, not judged: step_hits_under_read_ns over
+  step_miss_layers in the changed arm (0 in the base arm, which never counts the card leg's host list), fill_ns over
+  fills, and each arm's pp tok/s at P 512
+decide-in: land the change on its owning gates (an express piece) and write the row to rig-log (decode tok/s both arms,
+  the ratio and its interval, host list under the fill a missed layer, fills a token, the plan's host share)
+decide-below: read step_hits_under_read_ns / step_miss_layers first. In 0.36..0.53 ms with a ratio under +3.5 %: the
+  overlap costs the fill or the list something (reader threads against the pool's cores): price it with a doubling probe
+  and pin the reader's threads before claiming the change. Under 0.36 ms: n_h or the pick rate is below paper, re-derive
+  from the plan line and the nvtier record's host picks, and the ratio is no claim
+decide-above: the host list was longer under the fill than paper (a slow first touch of the mapping on missed layers) or
+  the base arm paid more serial wait than the model has (F larger): read the counter and the base arm's host fixed cost
+  beside the ratio before the number is claimed as the overlap's

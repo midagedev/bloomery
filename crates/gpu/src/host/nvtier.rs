@@ -8,7 +8,7 @@
 //! a residency flip's victim — and lent to the host leg through the model
 //! side's [`TierSlots`] seam or, on a pinned arena, held for the step port's
 //! card leg, which computes a step's ids from their slots on the card
-//! ([`NvTier::hold_for_card`]).
+//! ([`NvTier::issue_card_hold`], then [`CardTicket::finish`]).
 //! The file mapping serves the plan's host segment; every other id the leg
 //! reads — the NVMe segment's, and the card's victims once they flip — is
 //! this arena's, its slot refused by name while unfilled.
@@ -1171,7 +1171,7 @@ struct Pick {
 }
 
 /// Ids of one layer the card leg reads, pinned in their slots
-/// ([`NvTier::hold_for_card`]): no claim takes their slots and
+/// ([`NvTier::hold_for_card`], or [`CardTicket::finish`]): no claim takes their slots and
 /// [`NvTier::release`] refuses them until the hold drops, which closes the
 /// reads and gives the id buffer back. It owns its tier, so the step port
 /// keeps it past the service that took it.
@@ -1187,6 +1187,28 @@ impl CardHold {
     pub fn ids(&self) -> &[u32] {
         self.token.as_ref().map_or(&[], |t| &t.ids)
     }
+
+    /// Where the card reads held expert `id` in the arena
+    /// ([`NvTier::card_arena`]): the word offsets of its gate, up and down
+    /// parts, as [`TierSlots::slot`] counts parts. Refused by name for an id
+    /// the hold does not pin and for a part that does not start on a word.
+    pub fn offsets(&self, id: u32) -> Result<[u64; PARTS], GpuError> {
+        const WHAT: &str = "CardHold::offsets";
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| GpuError::state(WHAT, "a hold that has not been dropped"))?;
+        if !token.ids.contains(&id) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {} expert {id}: the hold pins {:?}",
+                    token.layer, token.ids
+                ),
+            ));
+        }
+        self.tier.card_offsets(token.layer, id)
+    }
 }
 
 impl Drop for CardHold {
@@ -1196,6 +1218,82 @@ impl Drop for CardHold {
         {
             arena.unpin(t.layer, t.ids);
         }
+    }
+}
+
+/// A card hold's claim in flight ([`NvTier::issue_card_hold`]): the ids'
+/// slots are taken in the books and their misses are being filled on the
+/// tier's reader. Nothing of the slots is readable through it: the card's
+/// offsets and bytes are the [`CardHold`] that [`CardTicket::finish`] returns
+/// once every slot is filled, so a reader of an unfilled slot has no hold to
+/// read through. Dropped without a finish, the claim goes back when the fill
+/// has ended.
+#[must_use = "the claim lasts until the ticket is finished or dropped"]
+pub struct CardTicket<'a> {
+    tier: &'a Arc<NvTier>,
+    layer: usize,
+    ids: &'a [u32],
+    ticket: Ticket<'a>,
+}
+
+impl CardTicket<'_> {
+    /// Whether every id is filled already (a hit-only claim): a finish
+    /// returns at once and there is no fill to run work under.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.ticket.is_ready()
+    }
+
+    /// Run `work`, which must read none of the claim's slots, and count its
+    /// wall as host compute under a fill when the fill is still in flight at
+    /// its start ([`NvTierStats::step_hits_under_read_ns`]). A ready ticket
+    /// counts nothing.
+    pub fn under_fill<R>(&self, work: impl FnOnce() -> R) -> R {
+        if self.ticket.is_ready() {
+            return work();
+        }
+        let t0 = Instant::now();
+        let r = work();
+        self.tier
+            .stats
+            .note_hits_under_read(t0.elapsed().as_nanos() as u64);
+        r
+    }
+
+    /// Join the fill and pin the ids: the hold, naming its ids in the order
+    /// the claim asked them (the order the step port writes their offsets
+    /// in). A failed fill, or an id left unfilled, is refused by name.
+    pub fn finish(self) -> Result<CardHold, GpuError> {
+        const WHAT: &str = "NvTier::hold_for_card";
+        let CardTicket {
+            tier,
+            layer,
+            ids,
+            ticket,
+        } = self;
+        let ready = ticket
+            .wait()
+            .map_err(|e| GpuError::from(model::ModelError::Tier(e)))?;
+        let mut held = {
+            let _books = tier.books.lock().unwrap_or_else(|e| e.into_inner());
+            tier.arena_of(layer, WHAT)?.pin_batch(layer, ids, WHAT)?
+        };
+        drop(ready);
+        if held.ids.len() != ids.len() || ids.iter().any(|id| !held.ids.contains(id)) {
+            return Err(GpuError::state(WHAT, "a pin of exactly the asked ids"));
+        }
+        held.ids.copy_from_slice(ids);
+        if tier.audit.get().is_some() {
+            tier.audit_slots(layer, ids)?;
+        }
+        let token = held.into_token();
+        tier.stats
+            .card_ids
+            .fetch_add(token.ids.len() as u64, Ordering::Relaxed);
+        Ok(CardHold {
+            tier: Arc::clone(tier),
+            token: Some(token),
+        })
     }
 }
 
@@ -1265,8 +1363,9 @@ pub struct NvTierStats {
     /// Wall of those step fills, as the step call measured it (ns): the
     /// pool's and the reader's, beside [`NvTierStats::fill_ns`].
     pub step_fill_wall_ns: u64,
-    /// Host compute of a step's hit group while its miss ticket was still
-    /// in flight (ns). A ready ticket and a fill wait are not this.
+    /// Host compute of a step's hit group, or of the card leg's host list
+    /// ([`CardTicket::under_fill`]), while the miss ticket was still in
+    /// flight (ns). A ready ticket and a fill wait are not this.
     pub step_hits_under_read_ns: u64,
     /// Ids the step port held for the card leg ([`NvTier::hold_for_card`]),
     /// which the card read from their slots.
@@ -1370,7 +1469,8 @@ impl Stats {
         }
     }
 
-    /// Host compute of a step's hit group while its miss fill was in flight.
+    /// Host compute of a step's hit group, or of the card leg's host list,
+    /// while its miss fill was in flight.
     fn note_hits_under_read(&self, ns: u64) {
         self.step_hits_under_read_ns
             .fetch_add(ns, Ordering::Relaxed);
@@ -2507,43 +2607,36 @@ impl NvTier {
     /// id of `ids` the arena serves filled and pinned until the returned hold
     /// drops, which the step port keeps until the card has read the slots
     /// ([`super::step`]). `ids` are ids the arena serves, at most the layer's
-    /// slots. An invalid claim is refused by name.
+    /// slots. An invalid claim is refused by name. The fill is joined here;
+    /// [`NvTier::issue_card_hold`] leaves it in flight.
     pub fn hold_for_card(
         self: &Arc<Self>,
         layer: usize,
         ids: &[u32],
     ) -> Result<CardHold, GpuError> {
-        let ready = TierSlots::prefetch_pinned(self.as_ref(), layer, ids, Claim::Step)
-            .and_then(|ticket| ticket.wait())
+        self.issue_card_hold(layer, ids)?.finish()
+    }
+
+    /// [`NvTier::hold_for_card`] up to the fill: the slots of `ids` are
+    /// claimed and their misses' reads queued on the tier's reader, and the
+    /// caller has them back while they run. The caller computes what needs
+    /// none of those bytes, then [`CardTicket::finish`] joins the fill and
+    /// pins; the card's slot offsets and the card's reads are the hold's,
+    /// never the ticket's. A ticket dropped without a finish gives its claim
+    /// back once its fill has ended. `ids` are as for
+    /// [`NvTier::hold_for_card`]; an invalid claim is refused by name.
+    pub fn issue_card_hold<'a>(
+        self: &'a Arc<Self>,
+        layer: usize,
+        ids: &'a [u32],
+    ) -> Result<CardTicket<'a>, GpuError> {
+        let ticket = TierSlots::prefetch_pinned(self.as_ref(), layer, ids, Claim::Step)
             .map_err(|e| GpuError::from(model::ModelError::Tier(e)))?;
-        let mut held = {
-            let _books = self.books.lock().unwrap_or_else(|e| e.into_inner());
-            self.arena_of(layer, "NvTier::hold_for_card")?.pin_batch(
-                layer,
-                ids,
-                "NvTier::hold_for_card",
-            )?
-        };
-        drop(ready);
-        // The hold names its ids in the order asked, the order the step
-        // port writes their offsets in.
-        if held.ids.len() != ids.len() || ids.iter().any(|id| !held.ids.contains(id)) {
-            return Err(GpuError::state(
-                "NvTier::hold_for_card",
-                "a pin of exactly the asked ids",
-            ));
-        }
-        held.ids.copy_from_slice(ids);
-        if self.audit.get().is_some() {
-            self.audit_slots(layer, ids)?;
-        }
-        let token = held.into_token();
-        self.stats
-            .card_ids
-            .fetch_add(token.ids.len() as u64, Ordering::Relaxed);
-        Ok(CardHold {
-            tier: Arc::clone(self),
-            token: Some(token),
+        Ok(CardTicket {
+            tier: self,
+            layer,
+            ids,
+            ticket,
         })
     }
 
@@ -2557,9 +2650,10 @@ impl NvTier {
     /// Where the card leg reads layer `layer`'s expert `id` in the arena
     /// ([`NvTier::card_arena`]): the word offsets of its gate, up and down
     /// parts, as [`TierSlots::slot`] counts parts. Refused by name for an id
-    /// with no filled slot (the caller holds it, [`NvTier::hold_for_card`])
-    /// and for a part that does not start on a word.
-    pub fn card_offsets(&self, layer: usize, id: u32) -> Result<[u64; PARTS], GpuError> {
+    /// with no filled slot and for a part that does not start on a word.
+    /// Reached through [`CardHold::offsets`] only: a hold exists once its
+    /// fill has ended.
+    fn card_offsets(&self, layer: usize, id: u32) -> Result<[u64; PARTS], GpuError> {
         const WHAT: &str = "NvTier::card_offsets";
         let arena = self.arena_of(layer, WHAT)?;
         let mut offs = [0u64; PARTS];
@@ -2599,7 +2693,7 @@ impl NvTier {
 
     /// Whether every part of an id layer `layer`'s arena serves starts on a
     /// 4-byte word in whichever slot holds it, as the card leg's arena
-    /// entries read it ([`NvTier::card_offsets`]); false for a layer the
+    /// entries read it ([`CardHold::offsets`]); false for a layer the
     /// arena does not cover. Load-time.
     #[must_use]
     pub fn parts_on_words(&self, layer: usize) -> bool {
@@ -4867,6 +4961,69 @@ mod tests {
         devmap_rounds(true);
     }
 
+    /// The card hold tests' layer: eight experts of one page a part, each
+    /// stack row in a file of its own, held by a tier of two slots.
+    const CARD_PAGE: usize = DIRECT_ALIGN;
+    const CARD_LEN: usize = 64;
+
+    /// Expert `id`'s part of stack row `row`: one page an expert, a
+    /// word-aligned skew a row; expert 7's skew is off a word.
+    fn card_at(row: usize, id: usize) -> usize {
+        id * CARD_PAGE + if id == 7 { 37 } else { 4 * (row + 1) }
+    }
+
+    fn card_bytes(row: usize) -> Vec<u8> {
+        (0..8 * CARD_PAGE)
+            .map(|i| ((i % 251) as u8).wrapping_add((83 * row + 1) as u8))
+            .collect()
+    }
+
+    /// An anonymous tier of two slots whose layer 1 is the card hold tests'
+    /// layer.
+    fn card_tier(scratch: &Scratch) -> std::sync::Arc<super::NvTier> {
+        use super::{ArenaKind, NvTier};
+        use engram::direct::DirectFile;
+        use model::placement::workstation::ArenaGrant;
+        use std::sync::Arc;
+        let split = split_in(scratch);
+        let files: [_; PARTS] = std::array::from_fn(|row| {
+            let path = scratch.0.join(format!("row{row}"));
+            std::fs::write(&path, card_bytes(row)).unwrap();
+            Arc::new(DirectFile::open_buffered(&path).unwrap())
+        });
+        let layer = || {
+            let mut arena = arena_of(8, 0);
+            arena.windows = [0, CARD_PAGE, 2 * CARD_PAGE];
+            arena.slot_bytes = 3 * CARD_PAGE;
+            arena.parts = (0..8)
+                .map(|id| {
+                    std::array::from_fn(|row| PartRange {
+                        at: card_at(row, id) as u64,
+                        len: CARD_LEN,
+                        skew: card_at(row, id) % CARD_PAGE,
+                    })
+                })
+                .collect();
+            arena.files = files.clone();
+            arena.part_of.set([0, 1, 2]).unwrap();
+            Some(arena)
+        };
+        let slots = [3 * CARD_PAGE];
+        let grant = ArenaGrant::whole((2 * slots[0]) as u64);
+        Arc::new(
+            NvTier::carve(
+                vec![None, layer()],
+                &slots,
+                2,
+                grant,
+                0,
+                &split,
+                ArenaKind::Anon,
+            )
+            .expect("the tier's carve"),
+        )
+    }
+
     /// A card hold ([`NvTier::hold_for_card`]) fills and pins its ids for as
     /// long as it lives: no claim takes their slots while it does, its drop
     /// gives them back to the LRU, and the step's fills and the card's ids
@@ -4878,64 +5035,15 @@ mod tests {
     /// unattached until the load notes it, once.
     #[test]
     fn a_card_hold_pins_its_ids_until_it_drops() {
-        use super::{ArenaKind, LegOff, NvTier};
-        use engram::direct::DirectFile;
+        use super::LegOff;
         use model::moe::TierSlots;
-        use model::placement::workstation::ArenaGrant;
-        use std::sync::Arc;
-        const PAGE: usize = DIRECT_ALIGN;
         const LAYER: usize = 1;
-        const LEN: usize = 64;
-        // Expert `id`'s part of stack row `row`: one page an expert, a
-        // word-aligned skew a row; expert 7's skew is off a word.
-        let at = |row: usize, id: usize| id * PAGE + if id == 7 { 37 } else { 4 * (row + 1) };
-        let bytes_of = |row: usize| -> Vec<u8> {
-            (0..8 * PAGE)
-                .map(|i| ((i % 251) as u8).wrapping_add((83 * row + 1) as u8))
-                .collect()
-        };
         let scratch = Scratch::new("card-hold");
-        let split = split_in(&scratch);
-        let files: [_; PARTS] = std::array::from_fn(|row| {
-            let path = scratch.0.join(format!("row{row}"));
-            std::fs::write(&path, bytes_of(row)).unwrap();
-            Arc::new(DirectFile::open_buffered(&path).unwrap())
-        });
-        let layer = || {
-            let mut arena = arena_of(8, 0);
-            arena.windows = [0, PAGE, 2 * PAGE];
-            arena.slot_bytes = 3 * PAGE;
-            arena.parts = (0..8)
-                .map(|id| {
-                    std::array::from_fn(|row| PartRange {
-                        at: at(row, id) as u64,
-                        len: LEN,
-                        skew: at(row, id) % PAGE,
-                    })
-                })
-                .collect();
-            arena.files = files.clone();
-            arena.part_of.set([0, 1, 2]).unwrap();
-            Some(arena)
-        };
-        let slots = [3 * PAGE];
-        let grant = ArenaGrant::whole((2 * slots[0]) as u64);
-        let tier = Arc::new(
-            NvTier::carve(
-                vec![None, layer()],
-                &slots,
-                2,
-                grant,
-                0,
-                &split,
-                ArenaKind::Anon,
-            )
-            .expect("the tier's carve"),
-        );
+        let tier = card_tier(&scratch);
         let hold = tier.hold_for_card(LAYER, &[1, 2]).unwrap();
         assert_eq!(hold.ids(), [1, 2]);
         for id in [1u32, 2] {
-            let offs = tier.card_offsets(LAYER, id).unwrap();
+            let offs = hold.offsets(id).unwrap();
             for (p, off) in offs.iter().enumerate() {
                 let part = tier.slot(LAYER, id, p).expect("a held id's slot");
                 assert_eq!(
@@ -4943,10 +5051,10 @@ mod tests {
                     (part.as_ptr() as usize - tier.mem.start()) as u64,
                     "expert {id} part {p}: the word offset of its slot's bytes"
                 );
-                let a = at(p, id as usize);
+                let a = card_at(p, id as usize);
                 assert_eq!(
                     part,
-                    &bytes_of(p)[a..a + LEN],
+                    &card_bytes(p)[a..a + CARD_LEN],
                     "expert {id} part {p}: the file's bytes"
                 );
             }
@@ -4989,7 +5097,7 @@ mod tests {
         assert_eq!(buffers(), warmed, "a warmed eviction reuses its buffers");
         drop(mixed);
         let odd = tier.hold_for_card(LAYER, &[7]).unwrap();
-        let e = tier.card_offsets(LAYER, 7).unwrap_err().to_string();
+        let e = odd.offsets(7).unwrap_err().to_string();
         assert!(e.contains("off a word"), "{e}");
         drop(odd);
         assert!(
@@ -5008,6 +5116,129 @@ mod tests {
             None,
             "an anonymous arena has no card address"
         );
+    }
+
+    /// Every reader thread of a tier held in a read the test lets go, so a
+    /// step's misses queue behind them and none starts until [`Gate::open`].
+    struct Gate {
+        open: std::sync::Mutex<bool>,
+        opened: std::sync::Condvar,
+        expired: std::sync::atomic::AtomicBool,
+    }
+
+    impl Gate {
+        /// Hold every reader thread of `tier` in a read, and return once each
+        /// has one. A read the gate holds past five seconds ends and marks the
+        /// gate expired, so a caller that waited on its fill fails its test
+        /// rather than hanging it.
+        fn close(tier: &super::NvTier) -> std::sync::Arc<Gate> {
+            use super::{Job, Kind, NVTIER_FILL_THREADS};
+            let gate = std::sync::Arc::new(Gate {
+                open: std::sync::Mutex::new(false),
+                opened: std::sync::Condvar::new(),
+                expired: std::sync::atomic::AtomicBool::new(false),
+            });
+            let (taken_tx, taken) = std::sync::mpsc::channel();
+            let held = std::sync::Arc::clone(&gate);
+            let job = Job::new(Kind::Victim, NVTIER_FILL_THREADS, move |_| {
+                taken_tx.send(()).unwrap();
+                let open = held.open.lock().unwrap();
+                let (_open, wait) = held
+                    .opened
+                    .wait_timeout_while(open, std::time::Duration::from_secs(5), |open| !*open)
+                    .unwrap();
+                if wait.timed_out() {
+                    held.expired
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            });
+            tier.reader.submit(job).expect("the gate's job");
+            for _ in 0..NVTIER_FILL_THREADS {
+                taken
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("every reader thread took a unit");
+            }
+            gate
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+
+        fn expired(&self) -> bool {
+            self.expired.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A card ticket gives the caller its thread back while the misses'
+    /// reads are still queued behind the held readers, and its slots read
+    /// nothing until [`CardTicket::finish`] joins the fill: the work the
+    /// caller runs in between is counted as host compute under the fill, the
+    /// ids count as the card's only at the finish, and the hold the finish
+    /// returns names the ids in the order asked, hands the card the offsets
+    /// of exactly those, and refuses an id it does not pin.
+    #[test]
+    fn a_card_ticket_hands_the_caller_back_before_its_fill() {
+        const LAYER: usize = 1;
+        let scratch = Scratch::new("card-ticket");
+        let tier = card_tier(&scratch);
+        let gate = Gate::close(&tier);
+        let ids = [2u32, 1];
+        let ticket = tier.issue_card_hold(LAYER, &ids).expect("the claim");
+        assert!(
+            !gate.expired(),
+            "the claim waited for its fill: the readers were still held"
+        );
+        assert!(!ticket.is_ready(), "two misses: a fill in flight");
+        assert!(
+            !tier.slot_filled(LAYER, 1) && !tier.slot_filled(LAYER, 2),
+            "no slot is filled while the readers are held"
+        );
+        let worked = ticket.under_fill(|| {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            7
+        });
+        assert_eq!(worked, 7, "the work's result passes through");
+        let s = tier.stats();
+        assert!(
+            s.step_hits_under_read_ns >= 1_000_000,
+            "the work ran under the fill: {} ns",
+            s.step_hits_under_read_ns
+        );
+        assert_eq!(s.card_ids, 0, "no id is the card's before the hold");
+        gate.open();
+        let hold = ticket.finish().expect("the fill ended");
+        assert!(!gate.expired(), "the readers were released by the test");
+        assert_eq!(hold.ids(), [2, 1], "the order asked");
+        assert!(tier.slot_filled(LAYER, 1) && tier.slot_filled(LAYER, 2));
+        assert!(hold.offsets(2).is_ok() && hold.offsets(1).is_ok());
+        let e = hold.offsets(3).unwrap_err().to_string();
+        assert!(e.contains("the hold pins"), "{e}");
+        assert_eq!(tier.stats().card_ids, 2, "the finish counts the card's ids");
+    }
+
+    /// A card ticket dropped without a finish (the host's work between the
+    /// issue and the finish failed) joins its fill and gives its slots back:
+    /// the layer's two slots serve a claim of two other ids, the step slot
+    /// takes the next ticket, and only the finished hold's ids are the card's.
+    #[test]
+    fn a_dropped_card_ticket_gives_its_slots_back() {
+        const LAYER: usize = 1;
+        let scratch = Scratch::new("card-ticket-drop");
+        let tier = card_tier(&scratch);
+        let ticket = tier.issue_card_hold(LAYER, &[1, 2]).expect("the claim");
+        drop(ticket);
+        drop(
+            tier.ensure_pinned(LAYER, &[3, 4], Claim::Step)
+                .expect("the dropped ticket's slots are the LRU's again"),
+        );
+        let next = tier
+            .issue_card_hold(LAYER, &[5])
+            .expect("the step slot is free again");
+        drop(next.finish().expect("a hold after the drop"));
+        assert_eq!(tier.stats().card_ids, 1, "only the finished hold counted");
     }
 
     /// The arena entries over a pinned tier's slot that each round refills
@@ -5564,7 +5795,7 @@ mod tests {
         let hold = tier.hold_for_card(LAYER, &held).expect("the hold");
         for (s, &id) in IDS.iter().enumerate() {
             if id != HOST {
-                let offs = tier.card_offsets(LAYER, id).expect("a held id's offsets");
+                let offs = hold.offsets(id).expect("a held id's offsets");
                 leg.set_slot(ROW, s, Some(offs))
                     .expect("a slot inside the leg");
             }

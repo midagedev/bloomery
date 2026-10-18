@@ -474,8 +474,10 @@ mapping) and every expert of a prompt's batch.
 
 How a step runs ([`tierengine.md`](../research/tierengine.md) (h) item 1, `crates/gpu/src/host/arena_leg.rs`):
 
-1. At the go the host holds the step's arena ids filled and pinned (`NvTier::hold_for_card`) and writes each part's
-   word offset in the arena beside the handoff (`NvTier::card_offsets`).
+1. At the go the host claims the step's arena ids and queues their fills (`NvTier::issue_card_hold`), computes its
+   own host slots (the ids the arena does not serve) while the fills run, then joins them into a hold pinned until
+   the row's next go (`CardTicket::finish`) and writes each part's word offset in the arena beside the handoff
+   (`CardHold::offsets`).
 2. After the row's wait the card runs six launches a layer: the activation's q8_1, the gate and up entry, the slots'
    q8_1, the down entry, the weighted sum, and its add to the row's host sum. The entries read an expert at word
    offsets of the arena, one per quant type: gate and up in Q4_K or Q5_K, down in Q5_K or Q6_K.

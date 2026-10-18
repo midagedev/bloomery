@@ -2,11 +2,13 @@
 //! pinned arena the card reads, a service's routed ids the arena serves are
 //! computed on the card from their slots instead of by the host.
 //!
-//! The service holds those ids filled and pinned ([`NvTier::hold_for_card`])
-//! and writes, for each of the row's routed slots, the word offsets of its
+//! The service claims those ids and queues their fills
+//! ([`NvTier::issue_card_hold`]), computes the row's other host slots into
+//! the row's sum under the fills, joins the fills into a hold
+//! ([`super::nvtier::CardTicket::finish`]: the ids filled and pinned) and
+//! writes, for each of the row's routed slots, the word offsets of its
 //! expert's gate, up and down parts in the arena and its place (0, the
-//! arena's, or [`HOST`]) into the leg's own mapped tables; the host computes
-//! the row's other host slots into the row's sum as before. After the row's
+//! arena's, or [`HOST`]) into the leg's own mapped tables. After the row's
 //! wait the card runs, on the stream, the arena entries over those tables and
 //! adds the arena slots' weighted sum to the row's sum, which the family's
 //! combine then reads. A slot whose place is [`HOST`] is skipped by every

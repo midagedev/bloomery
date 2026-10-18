@@ -283,9 +283,10 @@ Decision — one policy, the memory kind as its parameter:
    layer's "card experts" are the slots of the one arena, S_pool = ⌊(pool − dense − KV − floor) / slot bytes / layers⌋; the card
    mover is `off` with the why `Unified` (no second level to move to); the book's heat ranks eviction (arena → file)
    and the lookahead's prefetch (file → arena) only. Promotion is the fill itself. The step port's leg is the card leg
-   (`ArenaLeg`, `crates/gpu/src/host/arena_leg.rs`). The host holds a service's arena ids filled and pinned
-   (`NvTier::hold_for_card`, until the row's next go) and writes their parts' word offsets in the arena
-   (`NvTier::card_offsets`) beside the handoff. After the row's wait the card computes them with the `_at` entries,
+   (`ArenaLeg`, `crates/gpu/src/host/arena_leg.rs`). The host claims a service's arena ids and queues their fills
+   (`NvTier::issue_card_hold`), computes the host's other slots under the fill, then joins it into a hold
+   (`CardTicket::finish`, pinned until the row's next go) and writes their parts' word offsets in the arena
+   (`CardHold::offsets`) beside the handoff. After the row's wait the card computes them with the `_at` entries,
    the `_sel` shapes that read an expert at word offsets of the arena (gate and up in Q4_K or Q5_K, down in Q5_K or Q6_K),
    and adds their weighted sum to the row's `hsum`. The card quantizes the activation as q8_1 and sums in its own
    order, so its steps are not the host leg's bit for bit. The entries are the one kernel-side addition, per quant,
