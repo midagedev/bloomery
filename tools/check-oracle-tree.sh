@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The oracle trees' identity check (tools/ref/emb2/oracle-tree.sh), against real git repositories in temp directories: no box,
 # no model, no card. A tree is an upstream commit with a patch on it or without; the check refuses another commit, another
-# patch, a tree that moved after its build, and reports each by name with the exit code 2 every caller relies on.
+# patch, a tree that moved after its build (a binary that reports its commit included: the commit does not say which sources the
+# library holds), and reports each by name with the exit code 2 every caller relies on.
 # The stub binaries are shell scripts, which the real ldd refuses: tools/ref/emb2/ldd-stub.sh, first on the cases' PATH, answers
 # for them. The cases that build an ELF (the library a real binary loads, the age of a build) need Linux, ldd and a C compiler
 # (the box has them); elsewhere they are a named skip.
@@ -11,6 +12,7 @@ exec python3 - "$@" <<'PY'
 import atexit
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -122,7 +124,8 @@ class Tree(unittest.TestCase):
 
     def test_any_other_change_to_the_tracked_files_is_another_patch(self):
         patch = self.patch()
-        self.stub(f"version: 1 (build 2, commit {git(self.tree, 'rev-parse', 'HEAD')[:9]})")
+        report = f"version: 1 (build 2, commit {git(self.tree, 'rev-parse', 'HEAD')[:9]})"
+        self.stub(report)
         for name, change in (("an edit on top", ("src/unicode.cpp", "int a = 3;\n")),
                              ("whitespace only", ("src/unicode.cpp", "int  a = 2;\n")),
                              ("a new tracked file", ("src/new.cpp", "x\n"))):
@@ -138,6 +141,7 @@ class Tree(unittest.TestCase):
                 else:
                     write(self.tree / change[0], before)
                 git(self.tree, "add", "-A")
+                self.stub(report)  # the restored file is newer than the build: rebuilt
                 self.assertEqual(self.check("--patch", patch)[0], 0)
 
     def test_the_hash_does_not_depend_on_the_git_config(self):
@@ -252,37 +256,62 @@ class Tree(unittest.TestCase):
         for path in built:
             os.utime(path, (built_at, built_at))
 
-    def test_a_build_older_than_the_tree_is_refused_when_the_binary_reports_no_commit(self):
-        patch = self.patch()
-        lib, exe = self.build_elf()
+    def refuses_a_build_older_than_the_tree(self, patch, lib, exe, *flags):
+        """The age rule on the build (lib, exe): fresh passes, a source moved after it or a library older than the sources is refused."""
         every = [p for p in git(self.tree, "ls-files").splitlines()]
         self.age((lib, exe), every)
-        self.assertEqual(self.check("--patch", patch, "--unversioned"), (0, "", ""))
+        self.assertEqual(self.check("--patch", patch, *flags), (0, "", ""))
         # Only the sources of what the binary links count; a doc touched after the build does not.
         os.utime(self.tree / "docs/readme.md", (2_100_000_000,) * 2)
-        self.assertEqual(self.check("--patch", patch, "--unversioned")[0], 0)
+        self.assertEqual(self.check("--patch", patch, *flags)[0], 0)
         for name in ("src/unicode.cpp", "include/llama.h", "examples/tokenize/tokenize.cpp"):
-            with self.subTest(moved=name):
+            with self.subTest(moved=name, flags=flags):
                 os.utime(self.tree / name, (2_100_000_000,) * 2)
-                rc, _, err = self.check("--patch", patch, "--unversioned")
+                rc, _, err = self.check("--patch", patch, *flags)
                 self.assertEqual(rc, 2, err)
-                self.assertRegex(err, rf"who: {self.tree}/build/(bin/llama-tokenize|src/libllama.so) is older than {self.tree}/{name}, ")
+                self.assertRegex(err, rf"who: ({re.escape(str(exe))}|{re.escape(str(lib))}) is older than {re.escape(str(self.tree))}/{name}, ")
                 os.utime(self.tree / name, (1_900_000_000,) * 2)
         os.utime(lib, (1_800_000_000,) * 2)
-        rc, _, err = self.check("--patch", patch, "--unversioned")
+        rc, _, err = self.check("--patch", patch, *flags)
         self.assertEqual(rc, 2, err)
         self.assertIn("libllama.so is older than", err)
 
-    def test_a_listing_of_the_sources_that_fails_is_a_refusal_not_a_pass(self):
+    def test_a_build_older_than_the_tree_is_refused_when_the_binary_reports_no_commit(self):
         patch = self.patch()
         lib, exe = self.build_elf()
+        self.refuses_a_build_older_than_the_tree(patch, lib, exe, "--unversioned")
+
+    def test_a_build_older_than_the_tree_is_refused_when_the_binary_reports_its_commit(self):
+        # The commit a binary reports does not say which sources its library holds: the age rule is not only for --unversioned.
+        patch = self.patch()
+        self.stub(f"version: 1 (build 2, commit {git(self.tree, 'rev-parse', 'HEAD')[:9]})")
+        self.refuses_a_build_older_than_the_tree(patch, self.tree / "build/bin/libllama.so", self.tree / "build/bin/llama-tokenize")
+
+    def test_a_source_edited_and_restored_after_a_versioned_build_is_refused(self):
+        # HEAD is the pin, no tracked file differs, the binary reports the commit: only the file's age says the build saw the edit.
+        self.stub(f"version: 1 (build 2, commit {self.base[:9]})")
+        lib, exe = self.tree / "build/bin/libllama.so", self.tree / "build/bin/llama-tokenize"
+        self.age((lib, exe), git(self.tree, "ls-files").splitlines(), built_at=1_000_000_000, source_at=900_000_000)
+        self.assertEqual(self.check(), (0, "", ""))
+        write(self.tree / "src/unicode.cpp", "int a = 7;\n")
+        write(self.tree / "src/unicode.cpp", "int a = 1;\n")
+        self.assertEqual(git(self.tree, "status", "--porcelain", "--untracked-files=no"), "")
+        rc, _, err = self.check()
+        self.assertEqual((rc, err), (2, f"who: {exe} is older than {self.tree}/src/unicode.cpp, a tracked file: it is not this tree's build"))
+
+    def test_a_listing_of_the_sources_that_fails_is_a_refusal_not_a_pass(self):
+        patch = self.patch()
+        head = git(self.tree, "rev-parse", "HEAD")
+        lib, exe = self.build_elf(f"version: 1 (build 2, commit {head[:9]})")
         self.age((lib, exe), git(self.tree, "ls-files").splitlines())
         real = shutil.which("git")
         write(self.tmp / "bin/git", f'#!/bin/sh\ncase " $* " in *" ls-files "*) exit 128 ;; esac\nexec {real} "$@"\n', True)
         env = {**ENV, "PATH": f"{self.tmp / 'bin'}:{ENV['PATH']}"}
-        r = subprocess.run(["bash", "-c", f'source {LIB}; oracle_tree --patch {patch} --unversioned who {self.tree} {self.base} llama-tokenize'],
-                           env=env, capture_output=True, text=True)
-        self.assertEqual((r.returncode, r.stderr.strip()), (2, f"who: cannot list the tracked sources of {self.tree}"))
+        for flags in ("", "--unversioned"):
+            with self.subTest(flags=flags):
+                r = subprocess.run(["bash", "-c", f'source {LIB}; oracle_tree --patch {patch} {flags} who {self.tree} {self.base} llama-tokenize'],
+                                   env=env, capture_output=True, text=True)
+                self.assertEqual((r.returncode, r.stderr.strip()), (2, f"who: cannot list the tracked sources of {self.tree}"))
 
     def test_a_binary_whose_libllama_is_not_the_trees_is_refused(self):
         # Versioned or not: the commit a binary reports does not say which sources its library holds.
