@@ -446,7 +446,7 @@ lease_take() {
 # trap output stays on the runner's stdout) the command under `timeout --kill-after=G <seconds>`, its exit
 # code returned. G is the inherited LEASE_STOP_GRACE (9 s at the root); run_bounded gives the
 # command half that cleanup budget, leaving time for this shell to reap it before an enclosing KILL.
-# Every process a runner starts under the lease goes through it or its own `timeout`:
+# Every process a runner starts under the lease goes through it (or bounded_bg, tools/gate-bound.sh):
 # the lease stays held while any process that inherited descriptor 9 lives, so a hung child must end
 # at a bound instead of holding the machine. A command cut off there prints `[bound]` on stderr: a
 # child that hangs is a failed run, not a slow one. The command runs through run_bounded
@@ -465,56 +465,39 @@ lease_take() {
 # before the executable starts, so callers need no asynchronous launch to publish the supervisor.
 # shellcheck disable=SC2034 # read by the runners that source this file
 LEASE_ARM_BOUND=${BLOOMERY_ARM_BOUND:-900}
-lease_bound() {
-  local bound=${1:-}
-  case $bound in
-    '' | *[!0-9]* | 0*)
-      echo "[bound] lease_bounded: the bound is a positive number of seconds, got '$bound' (BLOOMERY_ARM_BOUND?)" >&2
-      return 64
-      ;;
-  esac
-}
-lease_bounded() {
-  local bound=${1:-} rc=0 grace=${LEASE_STOP_GRACE:-9}
-  lease_bound "$bound" || return $?
-  shift
-  if [ -n "${LEASE_BOUNDED_PIDFILE:-}" ]; then
-    set -- bash -c 'printf "%s\n" "$PPID" > "$1" || exit $?; shift; exec "$@"' _ "$LEASE_BOUNDED_PIDFILE" "$@"
-  fi
-  if [ -n "${LEASE_BOUNDED_OUT:-}" ] && [ -n "${LEASE_BOUNDED_ERR:-}" ]; then
-    run_bounded timeout --kill-after="$grace" "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2> "$LEASE_BOUNDED_ERR" || rc=$?
-  elif [ -n "${LEASE_BOUNDED_OUT:-}" ]; then
-    run_bounded timeout --kill-after="$grace" "$bound" "$@" > "$LEASE_BOUNDED_OUT" 2>&1 || rc=$?
-  else
-    run_bounded timeout --kill-after="$grace" "$bound" "$@" || rc=$?
-  fi
-  case $rc in
-    124) echo "[bound] $1 cut off at its ${bound} s bound (rc 124)" >&2 ;;
-    137) echo "[bound] $1 killed (rc 137: the bound's KILL ${bound} s + $grace s in, or another SIGKILL)" >&2 ;;
-  esac
-  [ -z "$BIN_SIGNAL" ] || kill -s "$BIN_SIGNAL" $$ 2> /dev/null
-  return "$rc"
-}
+lease_bounded() { bounded "$@"; }
 
 # lease_out_init: a temp dir for the runner's own shell to capture a lease_bounded command's output in
 # (LEASE_OUT_FILE, and LEASE_OUT_FIFO for a live filter; pass either as LEASE_BOUNDED_OUT), removed by lease_out_clean, which it adds to
-# the runner's EXIT trap without replacing it (call it again after a later `trap … EXIT`).
+# the runner's EXIT trap without replacing it (call it again after a later `trap … EXIT`). A handler that exits must call
+# lease_out_clean itself first: the one appended after it would not run, so lease_out_init refuses such a handler (70).
 LEASE_OUT_DIR='' LEASE_OUT_FILE='' LEASE_OUT_FIFO='' LEASE_OUT=''
 lease_out_clean() {
   [ -z "$LEASE_OUT_DIR" ] || { rm -f "$LEASE_OUT_FILE" "$LEASE_OUT_FIFO"; rmdir "$LEASE_OUT_DIR" 2> /dev/null; }
   return 0
 }
 lease_out_init() {
-  local cur exit_trap
+  local cur exit_trap fresh=''
   if [ -z "$LEASE_OUT_DIR" ]; then
     LEASE_OUT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lease-out.XXXXXX") || return 70
     LEASE_OUT_FILE=$LEASE_OUT_DIR/out LEASE_OUT_FIFO=$LEASE_OUT_DIR/fifo
     mkfifo "$LEASE_OUT_FIFO" || return 70
+    fresh=1
   fi
   trap -p EXIT > "$LEASE_OUT_FILE"
   cur=$(< "$LEASE_OUT_FILE")
   case $cur in
     *lease_out_clean*) ;;
+    *exit*)
+      # The cleanup is appended after the runner's EXIT handler, so a handler that exits first would skip it: refused by
+      # name, never a directory left behind. A handler that calls lease_out_clean itself before its exit may exit.
+      echo "[bound] lease_out_init: the runner's EXIT handler exits, so the capture directory's cleanup appended after it would never run: call lease_out_clean in the handler before its exit" >&2
+      if [ -n "$fresh" ]; then
+        lease_out_clean
+        LEASE_OUT_DIR='' LEASE_OUT_FILE='' LEASE_OUT_FIFO=''
+      fi
+      return 70
+      ;;
     *)
       eval "exit_trap=(${cur#trap -- })"
       # shellcheck disable=SC2064 # the runner's trap text now, to run again at exit
@@ -1524,7 +1507,7 @@ EOF
     done
     # The real memory scope must wait through a second TERM and return its late child's code.
     source "$t/qwen3moe-arm-functions"
-    HELD_PID="$t/scope.pid" bash -c "$MEM_SCOPE_SCRIPT" -- "$t/held" > "$t/scope.log" 2>&1 &
+    BOUND_LIB="$LEASE_TREE/tools/gate-bound.sh" HELD_PID="$t/scope.pid" bash -c "$MEM_SCOPE_SCRIPT" -- "$t/held" > "$t/scope.log" 2>&1 &
     rp=$!
     i=0 ready=no
     until { cancel_ready "$t/scope.pid" && ready=yes; } || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
@@ -1547,12 +1530,13 @@ EOF
       for cleanup_rc in 0 70; do
         RC=0
         bash -c '
+          source "$4/tools/gate-bound.sh"
           source "$1"
-          bound_pid=unused cleanup_rc=$2
+          BG_LIVE=1 BG_PID=unused cleanup_rc=$2
           lease_stop() { return "$cleanup_rc"; }
           lease_out_clean() { echo clean; }
           exit "$3"
-        ' _ "$t/perf-exit" "$cleanup_rc" "$child_status" > "$t/perf-exit.log" 2>&1 || RC=$?
+        ' _ "$t/perf-exit" "$cleanup_rc" "$child_status" "$LEASE_TREE" > "$t/perf-exit.log" 2>&1 || RC=$?
         want=$child_status
         [ "$cleanup_rc" = 0 ] || want=$cleanup_rc
         check "bounded-perf-exit-$child_status-cleanup-$cleanup_rc-rc" "$RC" "$want"
@@ -1562,10 +1546,15 @@ EOF
     mkdir -p "$t/perf-tree/tools/ref" "$t/perf-bin"
     cp "$LEASE_TREE/tools/ref/$perf.sh" "$t/perf-tree/tools/ref/"
     printf '%s\n' 'MODEL=unused REF_TOKENS=0' > "$t/perf-tree/tools/ref/ref-paths.sh"
+    # The startup phase delivers TERM with the owner's traps set but before the decoder's pid is assigned: the owner's launch
+    # with a TERM to its own shell between the fork and `BG_PID=$!`.
     cat > "$t/perf-tree/tools/ref/lease.sh" << 'EOF'
 source "$STUB_PERF_LEASE"
 lease_take() { exec 9> "$STUB_PERF_LOCK"; flock -n 9; }
 witness() { :; }
+if [ "${STUB_PERF_PHASE:-}" = startup ]; then
+  eval "$(declare -f bounded_bg | sed 's/BG_PID=\$!/kill -TERM $$; BG_PID=$!/')"
+fi
 EOF
     cat > "$t/perf-bin/decoder" << 'EOF'
 #!/bin/sh
@@ -1631,11 +1620,7 @@ EOF
         fail) decode_rc=23 ;;
         bound) decode_rc=124 ;;
       esac
-      # Deliver TERM with the trap set but before the decoder PID is assigned.
-      awk -v phase="$phase" '
-        phase == "startup" && /^timeout --kill-after=10 / { print "kill -TERM $$" }
-        { print }
-      ' "$LEASE_TREE/tools/ref/$perf.sh" > "$t/perf-tree/tools/ref/$perf.sh"
+      cp "$LEASE_TREE/tools/ref/$perf.sh" "$t/perf-tree/tools/ref/$perf.sh"
       STUB_PERF_LEASE="$LEASE_TREE/tools/ref/lease.sh" STUB_PERF_LOCK="$pdir/lease" \
         STUB_PERF_HELD="$t/held" STUB_PERF_PID="$pdir/decoder.pid" STUB_PERF_RECORD="$pdir/record.pid" \
         STUB_PERF_PHASE=$phase STUB_PERF_CALLS="$pdir/calls" STUB_DECODE_RC=$decode_rc \
@@ -1710,6 +1695,17 @@ EOF
     check bounded-capture-rc "$RC" 3
     check bounded-capture-out "$LEASE_OUT" "$(printf 'out\nerr')"
     check bounded-capture-exit-trap "$(trap -p EXIT)" $'trap -- \'rm -rf "$t"\nlease_out_clean\' EXIT'
+    # An EXIT handler that exits would skip the cleanup appended after it: the init refuses it by name and makes no directory;
+    # one that calls lease_out_clean before its exit is accepted, and its directory is gone when it has exited.
+    OUT=$(bash -c 'source "$1"; trap "echo handler; exit 5" EXIT; rc=0; lease_out_init || rc=$?; echo "init=$rc dir=[$LEASE_OUT_DIR]"; trap - EXIT' \
+      _ "$LEASE_TREE/tools/ref/lease.sh" 2>&1)
+    matches bounded-out-exit-handler-refused '^init=70 dir=\[\]$' "$OUT"
+    matches bounded-out-exit-handler-named "the runner's EXIT handler exits, so the capture directory's cleanup" "$OUT"
+    RC=0
+    bash -c 'source "$1"; trap "lease_out_clean; exit 5" EXIT; lease_out_init || exit 70; echo "$LEASE_OUT_DIR" > "$2"; exit 0' \
+      _ "$LEASE_TREE/tools/ref/lease.sh" "$t/exit-handler.dir" > /dev/null 2>&1 || RC=$?
+    check bounded-out-exit-handler-rc "$RC" 5
+    check bounded-out-exit-handler-clean "$([ -d "$(cat "$t/exit-handler.dir" 2> /dev/null)" ] && echo left || echo gone)" gone
     cat > "$t/exit-trap-runner" << 'EOF'
 source "$1"
 TRAP_READS=$3.reads
