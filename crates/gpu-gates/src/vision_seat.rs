@@ -53,7 +53,6 @@ use std::sync::Arc;
 use bloomery_gpu::media::{ImageShape, ImageSpan, MediaBody, MediaSpan};
 use cuda_core::CudaContext;
 use gguf::Gguf;
-use model::arch::qwen35moe::hparams as text_hp;
 use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
 use vision::arch::minicpmv::{self, Group};
@@ -323,27 +322,13 @@ pub enum PleImage {
 }
 
 impl PleImage {
-    /// The text model's PLE site as the check reads it: none, one with no `ple.image_token_id`,
-    /// or one that names the id.
+    /// The text model's PLE site as the check reads it: `site` is `None` with no site, else the
+    /// site's `ple.image_token_id` (`None` when the file carries none).
     #[must_use]
-    pub fn of(site: Option<text_hp::Ple>) -> PleImage {
+    pub fn of(site: Option<Option<u32>>) -> PleImage {
         match site {
             None => PleImage::Absent,
-            Some(site) => site.image.map_or(PleImage::NoKey, PleImage::Id),
-        }
-    }
-}
-
-impl TextFacts {
-    /// The facts of a qwen35moe-family file (Qwen3.6, Qwen3.8): every attention layer rotates by
-    /// IMROPE over the file's sections (`qwen35moe::spec::read`), and a qwen4exp file's PLE site,
-    /// where it has one, names the image id its hash reads ([`PleImage::of`]).
-    #[must_use]
-    pub fn of_qwen35moe(hp: &text_hp::Hparams) -> TextFacts {
-        TextFacts {
-            n_embd: hp.n_embd,
-            imrope: Some(hp.rope_sections),
-            ple: PleImage::of(hp.exp.as_ref().and_then(|exp| exp.ple)),
+            Some(image) => image.map_or(PleImage::NoKey, PleImage::Id),
         }
     }
 }
@@ -1595,22 +1580,9 @@ mod tests {
     /// site that names the id the projector's image token must equal.
     #[test]
     fn a_ple_site_is_read_by_its_image_key() {
-        use model::arch::qwen35moe::hparams::Ple;
-        let site = |image| Ple {
-            layer: 0,
-            ngram: 2,
-            heads_per_ngram: 1,
-            conv: 1,
-            eos: 0,
-            image,
-            row: 1,
-        };
         assert_eq!(PleImage::of(None), PleImage::Absent);
-        assert_eq!(PleImage::of(Some(site(None))), PleImage::NoKey);
-        assert_eq!(
-            PleImage::of(Some(site(Some(248_056)))),
-            PleImage::Id(248_056)
-        );
+        assert_eq!(PleImage::of(Some(None)), PleImage::NoKey);
+        assert_eq!(PleImage::of(Some(Some(248_056))), PleImage::Id(248_056));
     }
 
     /// `open_seat` before any file or card: no `--mmproj` is no encoder, a limit without it is
