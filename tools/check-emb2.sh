@@ -24,6 +24,7 @@ args = parser.parse_args()
 ROOT = Path.cwd()
 sys.path.insert(0, str(ROOT / "tools"))
 DUMPER = args.dumper.resolve() if args.dumper else None
+LDD = (ROOT / "tools/ref/emb2/ldd-stub.sh").read_text()
 GGUF_STUB = ("#include <cstdint>\nstruct gguf_context;\nstruct gguf_init_params { bool no_alloc; void * ctx; };\n"
              "static gguf_context * gguf_init_from_file(const char *, gguf_init_params) { return nullptr; }\n"
              "static int64_t gguf_find_key(const gguf_context *, const char *) { return -1; }\n"
@@ -72,6 +73,8 @@ class Writer(unittest.TestCase):
             f"{key}={shlex.quote(str(value))}" for key, value in variables.items()) + "\n")
         write(self.root / "tools/ref/clefvis/profile.sh", "IMAGES=()\nEMBED_STEPS=(text tower server text.cpu tower.cpu)\n")
         write(self.oracle / "build/bin/llama-server", f"#!/bin/bash\necho 'version: fixture (commit {self.pin})'\n", True)
+        write(self.oracle / "build/bin/libllama.so", "")
+        write(self.root / "bin/ldd", LDD, True)
         self.flock = shutil.which("flock")
         write(self.root / "bin/flock", "#!/bin/bash\n"
               'if [ "$1" = -w ]; then touch "$FIXTURE_ATTEMPT/$FIXTURE_TAG"; fi\n'
@@ -254,6 +257,7 @@ class Builders(unittest.TestCase):
               f'MMPROJ_SHA256={hashlib.sha256(projector.read_bytes()).hexdigest()}\n')
         bin_dir = root / "oracle/build/bin"
         write(bin_dir / "llama-server", f"#!/bin/bash\necho 'version: 0.6.0-dev (build 1, commit {server_commit})'\n", True)
+        write(root / "bin/ldd", LDD, True)
         for lib in ("libmtmd.so", "libllama.so", "libggml.so", "libggml-base.so"):
             write(bin_dir / lib, "")
         write(root / "bin/git", '#!/bin/bash\ncase " $* " in\n'

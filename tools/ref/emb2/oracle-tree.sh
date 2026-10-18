@@ -19,11 +19,13 @@
 # patch, has the same identity; another commit or another patch does not.
 #
 # Each BINARY (default llama-server) under TREE/build/bin must exist, and must be the tree's build:
+#   - by its library: `ldd` names the libllama.so it loads, and that file, symlinks resolved, lies under TREE/build. A library
+#     from anywhere else (LD_LIBRARY_PATH, a system copy) holds other sources than the tree's, whatever the binary reports.
 #   - by its own report: `--version` names a commit that is a prefix of the tree's HEAD. A tree rebuilt without a readable git
 #     reports `commit unknown` there and is refused: it is not the commit's build.
-#   - with --unversioned (a binary that reports no commit, as ik's llama-tokenize), by its age: it and the libllama.so it
-#     loads from TREE must be newer than every tracked file under src/, include/ and examples/tokenize/. A tree whose files
-#     moved after the build is refused. The patch's effect is the caller's to probe where the patch has a visible one.
+#   - with --unversioned (a binary that reports no commit, as ik's llama-tokenize), by its age: it and that libllama.so must be
+#     newer than every tracked file under src/, include/ and examples/tokenize/. A tree whose files moved after the build is
+#     refused. The patch's effect is the caller's to probe where the patch has a visible one.
 # --built-by TEXT is the remedy a missing file names in its error.
 oracle_tree() {
   local patch='' versioned=1 built_by=''
@@ -36,7 +38,7 @@ oracle_tree() {
     esac
   done
   [ $# -ge 3 ] || { echo "oracle_tree: want [--patch HASH] [--unversioned] [--built-by TEXT] WHO TREE PIN [BINARY...]" >&2; exit 2; }
-  local who=$1 tree=$2 pin=$3 head have bin report rc got file lib
+  local who=$1 tree=$2 pin=$3 head have bin report rc got file lib libs tree_real
   local re='commit ([0-9a-f]{7,40})([^0-9a-f]|$)'
   shift 3
   [ -d "$tree" ] || { echo "$who: no oracle tree at $tree$built_by" >&2; exit 2; }
@@ -57,17 +59,23 @@ oracle_tree() {
       { echo "$who: $tree's tracked files differ from ${pin:0:9} by patch $got, the profile pins patch $patch" >&2; exit 2; }
   fi
   [ $# -gt 0 ] || set -- llama-server
+  tree_real=$(readlink -f "$tree") || { echo "$who: cannot resolve $tree" >&2; exit 2; }
   for bin in "$@"; do
     [ -x "$tree/build/bin/$bin" ] || { echo "$who: no $tree/build/bin/$bin$built_by" >&2; exit 2; }
+    command -v ldd >/dev/null || { echo "$who: no ldd to find the libllama.so $tree/build/bin/$bin loads" >&2; exit 2; }
+    libs=$(ldd "$tree/build/bin/$bin" 2>&1) || { echo "$who: ldd cannot inspect $tree/build/bin/$bin: $libs" >&2; exit 2; }
+    lib=$(printf '%s\n' "$libs" | awk '$1 ~ /^libllama\.so/ && $3 ~ /^\// { print $3; exit }')
+    [ -n "$lib" ] || { echo "$who: $tree/build/bin/$bin loads no libllama.so" >&2; exit 2; }
+    case $(readlink -f "$lib") in
+      "$tree_real"/build/*) ;;
+      *) echo "$who: $tree/build/bin/$bin loads libllama.so from $lib, outside $tree/build" >&2; exit 2 ;;
+    esac
     if [ -n "$versioned" ]; then
       report=$("$tree/build/bin/$bin" --version 2>&1) || { echo "$who: $tree/build/bin/$bin --version failed: $report" >&2; exit 2; }
       # The whole commit token, 7 hex digits or more, a prefix of the tree's HEAD.
       [[ $report =~ $re ]] && [ "${head:0:${#BASH_REMATCH[1]}}" = "${BASH_REMATCH[1]}" ] ||
         { echo "$who: $tree/build/bin/$bin is not built at ${head:0:7}: $report" >&2; exit 2; }
     else
-      command -v ldd >/dev/null || { echo "$who: no ldd to find the libllama.so $tree/build/bin/$bin loads" >&2; exit 2; }
-      lib=$(ldd "$tree/build/bin/$bin" 2>/dev/null | awk -v t="$tree/" 'index($3, t) == 1 && $1 ~ /^libllama\.so/ { print $3; exit }')
-      [ -n "$lib" ] || { echo "$who: $tree/build/bin/$bin loads no libllama.so from $tree" >&2; exit 2; }
       for got in "$tree/build/bin/$bin" "$lib"; do
         file=$(oracle_newer_source "$tree" "$got") || { echo "$who: cannot list the tracked sources of $tree" >&2; exit 2; }
         [ -z "$file" ] ||
@@ -78,12 +86,15 @@ oracle_tree() {
 }
 
 # oracle_patch_hash TREE BASE: the 12 hex digits that name TREE's tracked files against the commit BASE. The diff is spelled
-# with every option that could change its bytes pinned, so any git on any machine prints the same for the same files.
+# with every option and setting that could change its bytes pinned (the diff.* keys, the global attributes file, GIT_DIFF_OPTS,
+# which outranks -U), so any git on any machine prints the same for the same files.
 oracle_patch_hash() {
   local tree=$1 base=$2 out sum
   out=$(mktemp) || return 1
-  git -c safe.directory="$tree" -c core.quotepath=off -C "$tree" diff --no-ext-diff --no-textconv --no-color --no-renames \
-    --binary --full-index --diff-algorithm=myers --src-prefix=a/ --dst-prefix=b/ -U3 "$base" -- > "$out" || { rm -f "$out"; return 1; }
+  env -u GIT_DIFF_OPTS git -c safe.directory="$tree" -c core.quotepath=off -c core.attributesFile=/dev/null \
+    -c diff.suppressBlankEmpty=false -C "$tree" diff --no-ext-diff --no-textconv --no-color --no-renames --binary --full-index \
+    --diff-algorithm=myers --indent-heuristic --inter-hunk-context=0 --ignore-submodules=none --submodule=short -O/dev/null \
+    --src-prefix=a/ --dst-prefix=b/ -U3 "$base" -- > "$out" || { rm -f "$out"; return 1; }
   if command -v sha256sum >/dev/null; then sum=$(sha256sum < "$out"); else sum=$(shasum -a 256 < "$out"); fi
   rm -f "$out"
   printf '%s\n' "${sum:0:12}"

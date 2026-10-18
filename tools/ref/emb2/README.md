@@ -47,10 +47,10 @@ Its default profile's `IK` tree must contain `src/`, `docs/`, `README.md` and
 `github-data/`, as for the v2 tokenizer set. `LCPP` selects the tokenizer executable;
 `IK` selects those corpus texts.
 
-The v1 set is the commit's build, not an md5: `oracle.sh` checks the tree's HEAD, its tracked files and `llama-tokenize
---version` against the profile's pin before it reads anything, and writes `# build <commit>`, which the `tokenizer-llama`
-family pins. The executable's and the library's md5s stay in the manifest and change with every rebuild. The v1 corpora are
-cut into rows of at most 1 MB, `<corpus>.<nnn>`, because that vocabulary's SPM tokenizer takes time quadratic in one text's
+The v1 set is the commit's build, not an md5: `oracle.sh` checks the tree's HEAD, its tracked files, the `libllama.so` that
+`llama-tokenize` loads and its `--version` against the profile's pin before it reads anything, and writes
+`# build <commit>`, which the `tokenizer-llama` family pins. The executable's and the library's md5s stay in the manifest
+and change with every rebuild. The v1 corpora are cut into rows of at most 1 MB, `<corpus>.<nnn>`, because that vocabulary's SPM tokenizer takes time quadratic in one text's
 size; `oracle.sh` prints each row's wall time.
 
 ## Decoded audio (EmbeddingGemma 2)
