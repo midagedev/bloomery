@@ -12,9 +12,11 @@
 //! a captured graph bakes the buffer's address; every later change writes the same buffer.
 
 use crate::model::ChainBody;
+use crate::rope_table::RopeRows;
 use crate::tensor::WindowMut;
 use crate::{GpuError, GpuModel};
 use cuda_core::{CudaStream, DeviceBuffer};
+use runtime::seqstate::Kept;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
@@ -489,6 +491,103 @@ impl SeqRope {
     }
 }
 
+/// What a media load makes each sequence's rotation table from ([`SeqRope::new`]): the plain
+/// table's host rows, shared by every table, the file's IMROPE sections and the order they read an
+/// image row's position slots in.
+pub(crate) struct RopeBase {
+    base: Arc<[f32]>,
+    sections: [u32; 4],
+    order: SectionOrder,
+}
+
+impl RopeBase {
+    /// The base over the plain table's host rows `base` (`ctx` rows of equal width).
+    pub(crate) fn new(base: Arc<[f32]>, sections: [u32; 4], order: SectionOrder) -> RopeBase {
+        RopeBase {
+            base,
+            sections,
+            order,
+        }
+    }
+
+    /// A text sequence's table of `ctx` rows over this base, copied to a card buffer of its own.
+    pub(crate) fn seq(&self, stream: &CudaStream, ctx: usize) -> Result<SeqRope, GpuError> {
+        SeqRope::new(stream, self.base.clone(), self.sections, self.order, ctx)
+    }
+}
+
+/// The table the rope launches of a sequence read: its own on a media load, else the load's.
+pub(crate) fn rope_table<'a>(
+    rope: &'a RopeRows,
+    own: Option<&'a SeqRope>,
+) -> &'a DeviceBuffer<f32> {
+    own.map_or(&rope.table, SeqRope::table)
+}
+
+/// Refuse a call whose first position `pos` lies strictly inside an image the sequence's table
+/// `own` holds: the table's rows there are the image's, which the call's own ids (text, or a span
+/// after the image's end) would read. A sequence stands there when a call failed inside an image
+/// (the table keeps the image whole) or a record was restored ahead of the state it belongs to. A
+/// cut back to the image's start or a reset takes the image away. Nothing moves; a text load
+/// (`own` is `None`) holds no image.
+pub(crate) fn refuse_inside_image(
+    own: Option<&SeqRope>,
+    what: &'static str,
+    pos: u32,
+) -> Result<(), GpuError> {
+    let Some(rope) = own else {
+        return Ok(());
+    };
+    match image_around(rope.rows().seq(), pos) {
+        None => Ok(()),
+        Some(Range { start, end }) => Err(GpuError::shape(
+            what,
+            format!(
+                "a call at position {pos} inside the image at rows {start}..{end}: the rotation \
+                 table holds the image's rows there; cut back to {start} or reset first"
+            ),
+        )),
+    }
+}
+
+/// What a cut to at most `n` positions keeps on a body whose own rule, `ask`, grants a position
+/// per asked one, held to the rotation table `own`: a grant strictly inside an image is asked
+/// again at the image's first row (a cut inside one is refused, [`SeqRope::cut`]), until the grant
+/// stands outside every image. The answer names `n` as asked. A text load (`own` is `None`)
+/// keeps `ask(n)`.
+pub(crate) fn kept_outside_images(
+    own: Option<&SeqRope>,
+    n: u32,
+    ask: impl Fn(u32) -> Kept,
+) -> Kept {
+    kept_outside(own.map(|r| r.rows().seq()), n, ask)
+}
+
+/// [`kept_outside_images`] over the images `seq` records.
+fn kept_outside(seq: Option<&MropeSeq>, n: u32, ask: impl Fn(u32) -> Kept) -> Kept {
+    let mut kept = ask(n);
+    let Some(seq) = seq else {
+        return kept;
+    };
+    while let Some(range) = image_around(seq, kept.at) {
+        let start = u32::try_from(range.start).unwrap_or(0);
+        kept = Kept {
+            asked: n,
+            ..ask(start)
+        };
+    }
+    kept
+}
+
+/// The rows of the image of `seq` that position `pos` lies strictly inside: one that starts at
+/// `pos` or ends at it holds no position inside.
+fn image_around(seq: &MropeSeq, pos: u32) -> Option<Range<usize>> {
+    let row = pos as usize;
+    seq.spans()
+        .find(|&(at, nx, ny)| at < row && row < at + nx * ny)
+        .map(|(at, nx, ny)| at..at + nx * ny)
+}
+
 fn shape(e: vision::mrope::MropeError) -> GpuError {
     GpuError::shape(WHAT, e.to_string())
 }
@@ -496,8 +595,74 @@ fn shape(e: vision::mrope::MropeError) -> GpuError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime::seqstate::Why;
 
     const SECTIONS: [u32; 4] = [11, 11, 10, 0];
+
+    /// A call is refused only strictly inside a held image: at its first row, at its end and
+    /// between two images the sequence stands where a call may start; the row after the first
+    /// and the last row inside name the image's rows.
+    #[test]
+    fn a_position_strictly_inside_an_image_is_named() {
+        let mut seq = MropeSeq::new();
+        seq.push(3, 14, 14).expect("image a");
+        seq.push(210, 4, 2).expect("image b");
+        assert_eq!(image_around(&MropeSeq::new(), 5), None);
+        assert_eq!(image_around(&seq, 3), None, "at the first row");
+        assert_eq!(image_around(&seq, 4), Some(3..199), "the row after it");
+        assert_eq!(image_around(&seq, 198), Some(3..199), "the last row inside");
+        assert_eq!(image_around(&seq, 199), None, "at its end");
+        assert_eq!(image_around(&seq, 205), None, "between the images");
+        assert_eq!(image_around(&seq, 217), Some(210..218), "inside the second");
+    }
+    /// A checkpoint inside an image grants nothing: the cut is asked again at the image's first
+    /// row, and again while the grant stands inside another image. Points at 0, 100, 250, 400 of
+    /// 500 held; image b at rows 200..300, image a at rows 90..110.
+    #[test]
+    fn a_grant_inside_an_image_falls_back_to_the_image_start() {
+        let points = [0u32, 100, 250, 400];
+        let ask = |n: u32| {
+            let at = points
+                .iter()
+                .copied()
+                .filter(|&p| p <= n)
+                .max()
+                .unwrap_or(0);
+            Kept {
+                asked: n,
+                held: 500,
+                at,
+                why: Why::Checkpoint { lost: None },
+            }
+        };
+        let mut b = MropeSeq::new();
+        b.push(200, 10, 10).expect("image b: rows 200..300");
+        let mut ab = MropeSeq::new();
+        ab.push(90, 5, 4).expect("image a: rows 90..110");
+        ab.push(200, 10, 10).expect("image b: rows 200..300");
+        assert_eq!(
+            kept_outside(Some(&b), 450, ask).at,
+            400,
+            "outside: as asked"
+        );
+        assert_eq!(
+            kept_outside(Some(&b), 270, ask).at,
+            100,
+            "inside b: below its start"
+        );
+        assert_eq!(kept_outside(Some(&b), 270, ask).asked, 270);
+        assert_eq!(
+            kept_outside(Some(&ab), 270, ask).at,
+            0,
+            "then inside a: below it"
+        );
+        assert_eq!(
+            kept_outside(None, 270, ask).at,
+            250,
+            "a text load keeps the rule's"
+        );
+    }
+
     const ROT: usize = 64;
     const CTX: usize = 300;
 

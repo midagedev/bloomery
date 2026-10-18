@@ -5,10 +5,11 @@
 //! the per-layer copies of the output residual the decode chain leaves when
 //! asked; and the decode flash pass switched for an eager ruler.
 
-use super::body35::{Body35, rope_table};
+use super::body35::Body35;
 use super::dispatch::{self, Ctx};
 use super::plan::MixerPlan;
 use super::scratch::LayerStore;
+use crate::media::rope_table;
 use crate::model::{GpuModel, MAX_PASS_ROWS, StepMode};
 use crate::tensor::WindowMut;
 use crate::{Gpu, GpuError};

@@ -1964,6 +1964,10 @@ pub enum Draft38Off {
     /// machine's drive scaling with the queue depth a verify's fills run
     /// at); a set [`DRAFT`] runs.
     Paged { arena: u64 },
+    /// Unset on the Qwen3.8 seat beside `--mmproj`: an image load gives every
+    /// sequence a rotation table the draft's walks do not read, so it carries
+    /// no draft; a set [`DRAFT`]`=mtp` is refused.
+    Media,
 }
 
 impl fmt::Display for Draft38Off {
@@ -2003,6 +2007,10 @@ impl fmt::Display for Draft38Off {
                 f,
                 "unset: the plan pages host experts through the NVMe tier's {arena} B RAM arena, \
                  and the draft is off by default there; set {DRAFT}=mtp to draft on a paged plan"
+            ),
+            Draft38Off::Media => f.write_str(
+                "unset: --mmproj makes an image load, whose sequences hold rotation tables the \
+                 MTP draft's walks do not read",
             ),
         }
     }

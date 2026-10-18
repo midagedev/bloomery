@@ -142,6 +142,7 @@
 
 use super::body::ATTN_SCALE_256;
 use super::card38::Card38;
+use super::image::MediaRows;
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
 use super::program38::{Ctx38, q8};
 use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
@@ -1417,6 +1418,9 @@ pub(super) struct WideParts<'a> {
     /// The prompt call's host streaming ([`PromptStream`]): whether this
     /// walk picks, and its records.
     pub(super) stream: &'a mut PromptStream,
+    /// The media call's staged rows on a media load: each unit's first layer
+    /// copies the rows of the spans inside it over the unit's embeddings.
+    pub(super) media: Option<&'a mut MediaRows>,
 }
 
 /// `y = W · act` for the Q8_0 weight `name` over the first `m` columns of
@@ -1531,6 +1535,10 @@ impl WideParts<'_> {
                     n_keys: &mut u.n_keys,
                 },
             )?;
+            if let Some(media) = self.media.as_deref_mut() {
+                media.plan(u.pos0..u.pos0 + u.m);
+                media.write(stream, &mut u.emb)?;
+            }
             mix(
                 c,
                 &p.attn_hc,
