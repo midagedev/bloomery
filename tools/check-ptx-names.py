@@ -31,8 +31,9 @@ What declares an entry. A `#[kernel]` attribute (its attribute stack may span li
 `#[launch_bounds(..)]`, `#[launch_contract(..)]` and doc lines sit between it and the `fn`) on a line of its own,
 not in a comment; the entry is the `fn` that follows. The one generated family is a `macro_rules!` whose kernel
 is `fn $name`: each invocation binds the names on its `KEY: a, b, c,` line positionally to the macro's own
-pattern line `KEY: $x:ident, $y:ident, $z:ident,` (today `sigmoid_router_instance!`, `entries:`: the
-glm5next and mimo2 routers). A `$name` the macro's pattern does not bind, a `#[kernel]` that no `fn` follows,
+pattern line `KEY: $x:ident, $y:ident, $z:ident,` (`sigmoid_router_instance!`, `entries:`: the glm5next and
+mimo2 routers). A macro that repeats a group (`quant_sel_module!`, one line a type) matches the same pattern
+line inside the repetition, and its invocation repeats the `KEY:` line: every line binds its own names. A `$name` the macro's pattern does not bind, a `#[kernel]` that no `fn` follows,
 a kernel under a `#[cfg(..)]` attribute or inside a `#[cfg(test)]` module, and a binary or recipe this file does
 not know are each a named refusal, never a skipped entry.
 
@@ -182,7 +183,7 @@ def scan_file(text, rel):
 
 def invocations(lines, macro):
     """The `KEY: ident, ident` binding lines of every `macro! { .. }` invocation in lines: a list, one dict a
-    call, KEY -> ([idents], line)."""
+    call, KEY -> [([idents], line), ..] (a key repeats in a call whose macro repeats a group)."""
     out, i = [], 0
     start = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*" + re.escape(macro) + r"!\s*\{")
     while i < len(lines):
@@ -196,7 +197,7 @@ def invocations(lines, macro):
                 s = STR_RE.sub('""', t).split("//", 1)[0]
                 b = BIND_RE.match(s)
                 if b:
-                    call[b.group(1)] = ([x.strip() for x in b.group(2).split(",")], i + 1)
+                    call.setdefault(b.group(1), []).append(([x.strip() for x in b.group(2).split(",")], i + 1))
                 depth += s.count("{") - s.count("}")
             i += 1
             if depth <= 0:
@@ -265,10 +266,10 @@ def bin_kernels(scans):
             for call in invocations(text.split("\n"), mac):
                 if k not in call:
                     raise Refuse(f"{rel}: an invocation of {mac}! has no `{k}:` line")
-                names, at = call[k]
-                if len(names) != len(keys[k]):
-                    raise Refuse(f"{rel}:{at}: {mac}!'s `{k}:` binds {len(names)} names, the pattern has {len(keys[k])}")
-                out.setdefault(names[keys[k].index(var)], (rel, at))
+                for names, at in call[k]:
+                    if len(names) != len(keys[k]):
+                        raise Refuse(f"{rel}:{at}: {mac}!'s `{k}:` binds {len(names)} names, the pattern has {len(keys[k])}")
+                    out.setdefault(names[keys[k].index(var)], (rel, at))
     return out
 
 
@@ -465,6 +466,36 @@ router_instance! {
 pub fn ds_plain(a: &[f32]) {}
 """
 
+MULTI_RS = """
+macro_rules! multi_instance {
+    (
+        $(
+            $t:ident {
+                $(
+                    run: $r:ident, $p:ident,
+                )?
+            }
+        )*
+    ) => {
+        $(
+            $(
+                #[kernel]
+                pub fn $r(a: &[f32]) {}
+            )?
+        )*
+    };
+}
+
+multi_instance! {
+    one {
+        run: multi_one, prepare_multi_one,
+    }
+    two {
+        run: multi_two, prepare_multi_two,
+    }
+}
+"""
+
 VIS_RS = """\
 #[kernel]
 pub fn vis_one(a: &[f32]) {}
@@ -570,6 +601,16 @@ def self_test():
         at = f"crates/gpu-deepseek41/src/router.rs:{line_of(ds3, 'entries: gamma_router')}"
         run("macro: an added invocation's names are unpinned", 1,
             [f"generate_ds41 gamma_router unpinned ({at})", f"generate_ds41 gamma_scores unpinned ({at})"], ds=ds3)
+        # a macro that repeats a group: the invocation repeats its KEY line, and every line binds its own names.
+        ds5 = DS_RS + MULTI_RS
+        at1 = f"crates/gpu-deepseek41/src/router.rs:{line_of(ds5, 'run: multi_one')}"
+        at2 = f"crates/gpu-deepseek41/src/router.rs:{line_of(ds5, 'run: multi_two')}"
+        run("macro: a repeated KEY line binds every line's names", 1,
+            [f"generate_ds41 multi_one unpinned ({at1})", f"generate_ds41 multi_two unpinned ({at2})"], ds=ds5)
+        out = run("refusal: a repeated KEY line that binds the wrong count", 1, [],
+                  ds=ds5.replace("run: multi_two, prepare_multi_two,", "run: multi_two,"))
+        if "binds 1 names, the pattern has 2" not in out:
+            fails.append(f"repeated key, wrong count: {out!r}")
         # a family defined in gpu, invoked from gpu-deepseek41: per-crate binding never sees the invocation, and
         # the names go stale or stay unseen (train0211i's mode, a red landing batch after green Mac checks).
         ds4 = (DS_RS + "\ngpu_crate::x_router_instance! {\n    pub mod xi {\n        entries: x_router, x_scores,\n    }\n}\n")
