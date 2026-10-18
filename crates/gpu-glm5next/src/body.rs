@@ -1663,7 +1663,7 @@ impl Body {
             gpu.context(),
             plan,
             &file,
-            run.start,
+            run.clone(),
             host.r8,
             residency.arena(),
             HostWidths {

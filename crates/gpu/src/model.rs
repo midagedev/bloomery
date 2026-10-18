@@ -1804,19 +1804,21 @@ pub fn nvme_tier(
     NvTier::of_paged(plan, file, levers.direct, arena, mem).map(|t| t.map(Arc::new))
 }
 
-/// The host leg of a load on `plan`: the routed layers `first ..` built by
-/// `layers`, given the NVMe tier's arena `arena` grants when the plan pages
-/// routed experts and reserved one, on `ctx`'s card ([`nvme_tier`], then [`HostRun::build`],
-/// then [`HostRun::attach_tier`]). The one owner of a body's host-run build.
+/// The host leg of a load on `plan`: the routed layers of `set` (the layers
+/// that carry a host share, ascending, contiguous or not) built by `layers`,
+/// given the NVMe tier's arena `arena` grants when the plan pages routed
+/// experts and reserved one, on `ctx`'s card ([`nvme_tier`], then
+/// [`HostRun::build_at`], then [`HostRun::attach_tier`]). The one owner of a
+/// body's host-run build.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the run's plan, file, first layer, widths and layers, and its tier's card, r8 lever and arena, each named"
+    reason = "the run's plan, file, layer set, widths and layers, and its tier's card, r8 lever and arena, each named"
 )]
 pub fn host_run<E>(
     ctx: &Arc<CudaContext>,
     plan: &Plan<'_>,
     file: &Arc<Split>,
-    first: usize,
+    set: impl IntoIterator<Item = usize>,
     r8: bool,
     arena: ArenaGrant,
     widths: HostWidths,
@@ -1826,7 +1828,7 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     let arena = nvme_tier(ctx, plan, file, r8, arena)?;
-    let mut run = HostRun::build(Arc::clone(file), first, r8, widths, layers)?;
+    let mut run = HostRun::build_at(Arc::clone(file), set, r8, widths, layers)?;
     run.attach_tier(arena)?;
     Ok(run)
 }

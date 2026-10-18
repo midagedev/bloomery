@@ -230,15 +230,14 @@ pub struct ArenaLeg {
 
 impl ArenaLeg {
     /// The leg over `tier`'s arena for `boundary`'s rows, its layers the
-    /// host run's `layers` from model layer `first` on, each of `ff` routed
-    /// rows; `Ok(Err(why))` when the leg cannot run on this load (module
+    /// host run's `layers` (by model layer, `None` where a layer carries no
+    /// host share), each of `ff` routed rows; `Ok(Err(why))` when the leg cannot run on this load (module
     /// doc). Load-time only, before any capture.
     pub(crate) fn new(
         gpu: &Gpu,
         boundary: &Boundary,
         tier: &Arc<NvTier>,
-        first: usize,
-        layers: &[HostLayer],
+        layers: &[Option<HostLayer>],
         ff: usize,
     ) -> Result<Result<ArenaLeg, LegOff>, GpuError> {
         if tier.card_arena().is_none() {
@@ -249,9 +248,11 @@ impl ArenaLeg {
             return Ok(Err(LegOff::Cols));
         }
         let held = boundary.rows() * layout.handoff().n_used;
-        let mut by_layer = vec![None; first + layers.len()];
-        for (i, host) in layers.iter().enumerate() {
-            let l = first + i;
+        let mut by_layer = vec![None; layers.len()];
+        for (l, host) in layers.iter().enumerate() {
+            let Some(host) = host else {
+                continue;
+            };
             if !tier.covers(l) {
                 continue;
             }
