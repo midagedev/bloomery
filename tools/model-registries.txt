@@ -1,0 +1,23 @@
+# Registry files: tables keyed by a name (an arch string, a family, a projector, a pre-tokenizer, a lever). A new
+# model adds its rows here and nowhere else in common code. Their lines are printed by tools/check-model-tax.sh and
+# not ratcheted. One path a line, relative to the repository root.
+crates/app/src/arch/mod.rs
+crates/gpu-gates/src/bin/shared/serve_seats/mod.rs
+crates/gpu-gates/src/lib.rs
+crates/gpu-vision/src/lib.rs
+crates/gpu/src/arch/mod.rs
+crates/gpu/src/lib.rs
+crates/levers/src/lib.rs
+crates/levers/src/registry.rs
+crates/model/src/bin/fixture.rs
+crates/models/src/shape.rs
+crates/refset/src/arch/dequant.rs
+crates/refset/src/arch/draft.rs
+crates/refset/src/arch/mod.rs
+crates/refset/src/arch/tokenizer.rs
+crates/refset/src/family.rs
+crates/refset/src/fixture.rs
+crates/refset/src/lib.rs
+crates/tokenizer/src/pretok.rs
+crates/tokenizer/src/vocab.rs
+crates/vision/src/arch/mod.rs

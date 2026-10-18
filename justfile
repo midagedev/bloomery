@@ -184,6 +184,11 @@ check-rustflags:
 check-arch:
     bash tools/check-arch.sh
 
+# Model-name ratchet (Mac, text only): the code lines of common code that name a model, held two-sided per (file, family)
+# by tools/model-tax.tsv; tools/model_tax.py's header has the rules.
+check-model-tax:
+    bash tools/check-model-tax.sh
+
 # 주석 규약(AGENTS.md Conventions): 엔진 크레이트 src/ 주석에 이슈 번호·날짜 금지, 예외는 `PIN(날짜):`.
 check-comments:
     ./tools/check-comments.sh

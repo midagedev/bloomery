@@ -1,0 +1,24 @@
+# The model families the ratchet knows (tools/model_tax.py, tools/check-model-tax.sh).
+# family <TAB> token <TAB> extra own paths <TAB> since
+#   token       a Python regex, matched case-insensitively against a code line and against a path (`(?-i:...)` turns
+#               the folding off inside: `gemma` alone would match `GemmArgs`). A path that matches is the family's
+#               own: its code may name its model.
+#   extra paths comma-separated directory prefixes that are also the family's own (`-` none).
+#   since       `baseline` for a family whose common-code names are the baseline debt (tools/model-tax.tsv `baseline`
+#               rows), else the date the family joined: its rows are PIN rows only. A model announced before it has
+#               code (kolibri, lfm, lightning) joins on the day its row is written.
+# A family `-` is not a model: its token names a crate (gpu-<x>) that looks like a model directory and is common code.
+# A new model starts with its row here. A directory crates/*/src/arch/<d>/, crates/gpu-<x>/ or tools/ref/models/<m>.sh
+# that no row names fails the check ("unknown model dir").
+deepseek	deepseek|ds41|v41	-	baseline
+glm	glm	-	baseline
+mimo	mimo	-	baseline
+nemotron	nemotron|bolt	-	baseline
+qwen	qwen|q3[5-8](?!\d)|q4exp	-	baseline
+gemma	(?-i:[Gg]emma|GEMMA)	-	baseline
+minicpm	minicpm	-	baseline
+clef	clef	-	baseline
+kolibri	kolibri	-	2026-10-18
+lfm	lfm	-	2026-10-18
+lightning	lightning	-	2026-10-18
+-	gates|vision	-	-

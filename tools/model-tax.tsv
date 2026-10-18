@@ -1,0 +1,183 @@
+# The model names in common code, held two-sided (tools/model_tax.py; tools/check-model-tax.sh runs it).
+# path <TAB> family <TAB> count <TAB> why
+#   count  the code lines of that file that match the family's token (tools/model-tokens.tsv). More fails; fewer
+#          fails until the row is lowered (`python3 tools/model_tax.py lower` does it). A line that names two
+#          families counts in both rows.
+#   why    `baseline <fate> <count at the baseline>: <where it goes>` for a family that joined at the baseline (the
+#          table was cut 2026-10-18): the debt, with the lift or table that removes it. The count may fall below
+#          the baseline number and never rise above it. Fates: A arch enum or match, P program-keyed rule, D a
+#          description field, S seat word, O the model's own path, T a gate's case shape, K a kernel entry named
+#          after its first model, R a registry the lift turns into rows.
+#          `PIN(YYYY-MM-DD) <family>: <the missing description field or program>` for a name that enters common
+#          code later, or a count above a baseline: the fact the model needs that ModelSpec or its own code does
+#          not carry yet. A baseline row is not added after the baseline; a model that joined after it has PIN
+#          rows only.
+# Rows sorted by path, then family.
+crates/decision/src/bin/decision_answer.rs	clef	2	baseline O 2: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/decision/src/encode.rs	clef	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/decision/src/gguf_head.rs	clef	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/decision/src/head.rs	clef	10	baseline O 10: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/decision/src/release/lev.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/decision/src/release/mod.rs	clef	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/decision/src/request.rs	clef	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/engram-lab/src/bin/engram-rate.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
+crates/engram-lab/src/bin/engram-reuse.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
+crates/engram/src/hash.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
+crates/gguf/src/lib.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
+crates/gpu-gates/src/arch/embedding.rs	gemma	16	baseline O 16: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/gpu-gates/src/bin/bloomery_chat.rs	deepseek	13	baseline S 13: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	clef	7	baseline S 7: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	deepseek	19	baseline S 19: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	glm	16	baseline S 16: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	mimo	11	baseline S 11: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	nemotron	15	baseline S 15: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	qwen	21	baseline S 21: MK9 seat by program
+crates/gpu-gates/src/bin/exact_ref.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/forced_probe.rs	deepseek	4	baseline T 4: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_block.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_dspark_experts.rs	deepseek	5	baseline T 5: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_dspark_graph.rs	deepseek	10	baseline T 10: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_dspark_hc.rs	deepseek	6	baseline T 6: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_dspark_kv.rs	deepseek	6	baseline T 6: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_e2e.rs	deepseek	5	baseline T 5: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_e2e.rs	qwen	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_gemm.rs	deepseek	11	baseline T 11: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_gemm.rs	gemma	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_gemm.rs	qwen	32	baseline T 32: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_head_gpu.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_hybrid.rs	deepseek	15	baseline T 15: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_iq.rs	nemotron	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_iq_sel.rs	nemotron	59	baseline T 59: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_iq_sel.rs	qwen	5	baseline T 5: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_kquant.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_kquant.rs	qwen	19	baseline T 19: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_lev_serve.rs	clef	4	baseline T 4: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_lev_serve.rs	deepseek	3	baseline T 3: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_lev_serve.rs	qwen	8	baseline T 8: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_linear.rs	glm	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_mcol.rs	deepseek	9	baseline T 9: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_moe_fused.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_nvfp4.rs	nemotron	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_nvtier.rs	qwen	5	baseline T 5: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_p0b.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_p10.rs	deepseek	7	baseline T 7: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_p4.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_p8.rs	deepseek	3	baseline T 3: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_p8b.rs	deepseek	3	baseline T 3: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_routed_legs.rs	glm	2	baseline P 2: MK2 program by body
+crates/gpu-gates/src/bin/gate_routed_legs.rs	mimo	2	baseline P 2: MK2 program by body
+crates/gpu-gates/src/bin/gate_serve_start.rs	clef	1	baseline P 1: MK2 program by body
+crates/gpu-gates/src/bin/gate_serve_start.rs	deepseek	10	baseline P 10: MK2 program by body
+crates/gpu-gates/src/bin/gate_serve_start.rs	glm	14	baseline P 14: MK2 program by body
+crates/gpu-gates/src/bin/gate_vision_encoder.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/generate.rs	deepseek	4	baseline T 4: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/generate.rs	qwen	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/h2d_probe.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/probe_nvread.rs	qwen	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/shared/dspark_hf.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/gpu-gates/src/bin/shared/emb2_image.rs	gemma	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/gpu-gates/src/bin/shared/route_trace38.rs	qwen	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/gpu-gates/src/bin/shared/routed_legs.rs	deepseek	9	baseline P 9: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	gemma	5	baseline P 5: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	glm	8	baseline P 8: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	5	baseline P 5: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	nemotron	6	baseline P 6: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	24	baseline P 24: MK2 program by body
+crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	clef	13	baseline S 13: MK9 seat by program
+crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	qwen	13	baseline S 13: MK9 seat by program
+crates/gpu-gates/src/bin/shared/serve_seats/drafted.rs	glm	1	baseline S 1: MK9 seat by program
+crates/gpu-gates/src/bin/shared/serve_seats/drafted.rs	qwen	1	baseline S 1: MK9 seat by program
+crates/gpu-gates/src/bin/shared/serve_seats/served.rs	qwen	1	baseline S 1: MK9 seat by program
+crates/gpu-gates/src/bin/shared/state_back.rs	deepseek	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/gpu-gates/src/bin/shared/vision_taps.rs	clef	1	baseline D 1: media design: VideoRule data per tower (vidcore)
+crates/gpu-gates/src/bin/tier_server.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/tier_server.rs	glm	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/tier_server.rs	qwen	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/engine.rs	deepseek	11	baseline R 11: MK1a one registry row per crate
+crates/gpu-gates/src/engine.rs	gemma	2	baseline R 2: MK1a one registry row per crate
+crates/gpu-gates/src/engine.rs	glm	1	baseline R 1: MK1a one registry row per crate
+crates/gpu-gates/src/engine.rs	mimo	1	baseline R 1: MK1a one registry row per crate
+crates/gpu-gates/src/engine.rs	nemotron	2	baseline R 2: MK1a one registry row per crate
+crates/gpu-gates/src/engine.rs	qwen	12	baseline R 12: MK1a one registry row per crate
+crates/gpu-gates/src/iq_rows.rs	nemotron	1	baseline T 1: case-table row, a fixture label or default path
+crates/gpu-gates/src/oracle/mod.rs	deepseek	4	baseline R 4: MK1a one registry row per crate
+crates/gpu-gates/src/oracle/mod.rs	gemma	3	baseline R 3: MK1a one registry row per crate
+crates/gpu-gates/src/oracle/mod.rs	glm	2	baseline R 2: MK1a one registry row per crate
+crates/gpu-gates/src/oracle/mod.rs	mimo	2	baseline R 2: MK1a one registry row per crate
+crates/gpu-gates/src/oracle/mod.rs	nemotron	2	baseline R 2: MK1a one registry row per crate
+crates/gpu-gates/src/oracle/mod.rs	qwen	4	baseline R 4: MK1a one registry row per crate
+crates/gpu-gates/src/record.rs	clef	3	baseline O 3: MK12 per-bin Kind statics into record/<bin>.rs
+crates/gpu-gates/src/record.rs	deepseek	6	baseline O 6: MK12 per-bin Kind statics into record/<bin>.rs
+crates/gpu-gates/src/record.rs	gemma	1	baseline O 1: MK12 per-bin Kind statics into record/<bin>.rs
+crates/gpu-gates/src/record.rs	glm	14	baseline O 14: MK12 per-bin Kind statics into record/<bin>.rs
+crates/gpu-gates/src/record.rs	mimo	4	baseline O 4: MK12 per-bin Kind statics into record/<bin>.rs
+crates/gpu-gates/src/record.rs	nemotron	5	baseline O 5: MK12 per-bin Kind statics into record/<bin>.rs
+crates/gpu-gates/src/record.rs	qwen	10	baseline O 10: MK12 per-bin Kind statics into record/<bin>.rs
+crates/gpu-gates/src/residency38.rs	glm	2	baseline O 2: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/gpu-gates/src/serve_client.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
+crates/gpu-gates/src/side_seat.rs	gemma	5	baseline S 5: MK9 seat by program
+crates/gpu-gates/src/vision_seat.rs	deepseek	6	baseline D 6: media design: VideoRule data per tower (vidcore)
+crates/gpu-gates/src/vision_seat.rs	gemma	4	baseline D 4: media design: VideoRule data per tower (vidcore)
+crates/gpu-gates/src/vision_seat.rs	glm	7	baseline D 7: media design: VideoRule data per tower (vidcore)
+crates/gpu-gates/src/vision_seat.rs	minicpm	6	baseline D 6: media design: VideoRule data per tower (vidcore)
+crates/gpu-gates/src/vision_seat.rs	qwen	7	baseline D 7: media design: VideoRule data per tower (vidcore)
+crates/gpu-vision/src/encoder.rs	deepseek	2	baseline D 2: media design: VideoRule data per tower (vidcore)
+crates/gpu/src/arch/hybrid.rs	nemotron	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/gpu/src/card_slots.rs	deepseek	20	baseline K 20: rename the kernel entries by what they compute (deferred)
+crates/gpu/src/dspark/head.rs	deepseek	3	baseline K 3: rename the kernel entries by what they compute (deferred)
+crates/gpu/src/fault.rs	deepseek	4	baseline P 4: MK1b per-program fault sites (after faultcov)
+crates/gpu/src/fault.rs	gemma	2	baseline P 2: MK1b per-program fault sites (after faultcov)
+crates/gpu/src/fault.rs	glm	2	baseline P 2: MK1b per-program fault sites (after faultcov)
+crates/gpu/src/fault.rs	mimo	5	baseline P 5: MK1b per-program fault sites (after faultcov)
+crates/gpu/src/fault.rs	nemotron	4	baseline P 4: MK1b per-program fault sites (after faultcov)
+crates/gpu/src/fault.rs	qwen	4	baseline P 4: MK1b per-program fault sites (after faultcov)
+crates/gpu/src/host/handoff.rs	deepseek	31	baseline K 31: rename the kernel entries by what they compute (deferred)
+crates/model/src/arch/coverage.rs	deepseek	13	baseline P 13: MK2 program by body
+crates/model/src/arch/coverage.rs	gemma	18	baseline P 18: MK2 program by body
+crates/model/src/arch/coverage.rs	glm	21	baseline P 21: MK2 program by body
+crates/model/src/arch/coverage.rs	mimo	10	baseline P 10: MK2 program by body
+crates/model/src/arch/coverage.rs	nemotron	36	baseline P 36: MK2 program by body
+crates/model/src/arch/coverage.rs	qwen	63	baseline P 63: MK2 program by body
+crates/model/src/arch/draft.rs	mimo	4	baseline D 4: MK1a draft usability as an ArchRow row
+crates/model/src/arch/draft.rs	qwen	15	baseline D 15: MK1a draft usability as an ArchRow row
+crates/model/src/arch/dspark.rs	deepseek	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/model/src/arch/hybrid.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/model/src/arch/mod.rs	clef	1	baseline A 1: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	deepseek	15	baseline A 15: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	gemma	13	baseline A 13: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	glm	6	baseline A 6: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	mimo	5	baseline A 5: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	nemotron	10	baseline A 10: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	qwen	19	baseline A 19: MK1a/MK1b ArchRow registry
+crates/model/src/bin/bloomery-decode.rs	deepseek	4	baseline R 4: MK1a one registry row per crate
+crates/model/src/bin/bloomery-decode.rs	gemma	2	baseline R 2: MK1a one registry row per crate
+crates/model/src/bin/bloomery-decode.rs	glm	1	baseline R 1: MK1a one registry row per crate
+crates/model/src/bin/bloomery-decode.rs	mimo	1	baseline R 1: MK1a one registry row per crate
+crates/model/src/bin/bloomery-decode.rs	nemotron	2	baseline R 2: MK1a one registry row per crate
+crates/model/src/bin/bloomery-decode.rs	qwen	2	baseline R 2: MK1a one registry row per crate
+crates/model/src/bin/r8conv.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
+crates/models/src/lib.rs	deepseek	4	baseline A 4: MK1a/MK1b ArchRow registry
+crates/models/src/lib.rs	gemma	4	baseline A 4: MK1a/MK1b ArchRow registry
+crates/models/src/lib.rs	glm	3	baseline A 3: MK1a/MK1b ArchRow registry
+crates/models/src/lib.rs	mimo	2	baseline A 2: MK1a/MK1b ArchRow registry
+crates/models/src/lib.rs	nemotron	4	baseline A 4: MK1a/MK1b ArchRow registry
+crates/models/src/lib.rs	qwen	9	baseline A 9: MK1a/MK1b ArchRow registry
+crates/placement/src/accepts.rs	deepseek	9	baseline P 9: MK2 program by body
+crates/placement/src/accepts.rs	gemma	4	baseline P 4: MK2 program by body
+crates/placement/src/accepts.rs	glm	4	baseline P 4: MK2 program by body
+crates/placement/src/accepts.rs	mimo	4	baseline P 4: MK2 program by body
+crates/placement/src/accepts.rs	nemotron	15	baseline P 15: MK2 program by body
+crates/placement/src/accepts.rs	qwen	23	baseline P 23: MK2 program by body
+crates/placement/src/placement/nodes_scale.rs	deepseek	10	baseline D 10: shapes read from the fixture ModelSpec rows (deferred)
+crates/placement/src/placement/nodes_scale.rs	glm	2	baseline D 2: shapes read from the fixture ModelSpec rows (deferred)
+crates/placement/src/placement/nodes_scale.rs	qwen	32	baseline D 32: shapes read from the fixture ModelSpec rows (deferred)
+crates/refset/src/emb2.rs	clef	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
+crates/serve/src/api.rs	glm	1	baseline S 1: MK9/MK7 seat and tool-format data
+crates/serve/src/api.rs	qwen	1	baseline S 1: MK9/MK7 seat and tool-format data
+crates/serve/src/dsml.rs	deepseek	4	baseline D 4: MK7 tool format and reasoning from the template
+crates/serve/src/dsml.rs	glm	14	baseline D 14: MK7 tool format and reasoning from the template
+crates/serve/src/dsml.rs	qwen	17	baseline D 17: MK7 tool format and reasoning from the template
+crates/serve/src/lib.rs	glm	1	baseline S 1: MK9/MK7 seat and tool-format data
+crates/serve/src/lib.rs	qwen	1	baseline S 1: MK9/MK7 seat and tool-format data
+crates/serve/src/reasoning.rs	deepseek	4	baseline D 4: MK7 tool format and reasoning from the template
+crates/vision/src/media.rs	minicpm	1	baseline D 1: media design: VideoRule data per tower (vidcore)

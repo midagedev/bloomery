@@ -40,7 +40,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 LEDGER=$HOME/.cache/bloomery/mac-static-ledger.tsv
-SCRIPTS=(arch comments defaults emb2 levers loads ptx-names records recipes rustflags unsafe waits)
+SCRIPTS=(arch comments defaults emb2 levers loads model-tax ptx-names records recipes rustflags unsafe waits)
 
 say() { printf '%s\n' "$*" >&2; }
 

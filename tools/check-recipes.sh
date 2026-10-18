@@ -364,6 +364,7 @@ blk_pytools() {
     "tools/gate-paths-merge.py --self-test"
     "tools/hf-arch-check.py --self-test"
     "tools/mac-disk.py --self-test"
+    "tools/model_tax.py --self-test"
     "tools/pr-gate-lines.py --self-test"
     "tools/ref/asm-census.py --self-test"
     "tools/ref/check-int-twins.py --self-test"
