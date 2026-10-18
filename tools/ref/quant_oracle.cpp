@@ -209,9 +209,7 @@ static std::vector<float> dequantize(enum ggml_type type, const std::vector<uint
 
 struct Case {
     std::string name;
-    enum ggml_type type, vdt;
-    int64_t k, blck;
-    size_t type_size, row_bytes, act_row_bytes;
+    size_t type_size;
     int64_t quant_rows, random_rows;
     bool imatrix;
 };
@@ -240,13 +238,7 @@ static void run_case(const std::string & dir, enum ggml_type type, int64_t k) {
 
     Case c;
     c.name = std::string(tname) + "." + std::to_string(k);
-    c.type = type;
-    c.vdt = vdt;
-    c.k = k;
-    c.blck = blck;
     c.type_size = ggml_type_size(type);
-    c.row_bytes = row_bytes;
-    c.act_row_bytes = act_row_bytes;
     c.quant_rows = kQuantRows;
     c.random_rows = has_codes(type) ? kRandomRows : 0;
     c.imatrix = ggml_quantize_requires_imatrix(type);

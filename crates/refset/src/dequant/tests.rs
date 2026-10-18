@@ -65,13 +65,7 @@ const FILES: [(&str, &[u8]); 2] = [
 ];
 
 fn set_dir(what: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "bloomery-refset-dequant-{what}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
-    dir
+    crate::clefvis::testkit::scratch(&format!("dequant-{what}"))
 }
 
 fn write_set(dir: &Path, s: &Stated<'_>) {

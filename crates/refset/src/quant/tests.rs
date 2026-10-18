@@ -58,13 +58,7 @@ fn files() -> Vec<(String, Vec<u8>)> {
 }
 
 fn set_dir(what: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "bloomery-refset-quant-{what}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
-    dir
+    crate::clefvis::testkit::scratch(&format!("quant-{what}"))
 }
 
 fn write_set(dir: &Path, s: &Stated<'_>) {
@@ -358,6 +352,82 @@ fn cases_that_disagree_with_their_files_are_refused() {
         &["case q4_0.64 is named twice"]
     ));
     remove(&dir);
+}
+
+/// A case row of q4_0 (32 values, 18 bytes a block) and q8_0 activations, with the sizes the arguments state:
+/// `k`, `type_size`, `row_bytes`, `act_row_bytes` and the three row counts.
+fn case_line(k: usize, sizes: [usize; 3], rows: [usize; 3]) -> String {
+    let [type_size, row_bytes, act_row_bytes] = sizes;
+    let [quant, random, act] = rows;
+    format!(
+        "case\tq4_0.{k}\t2\t{k}\t32\t{type_size}\t{row_bytes}\t8\tq8_0\t{act_row_bytes}\t{quant}\t{random}\t{act}\t0"
+    )
+}
+
+/// A case whose lengths do not fit `usize`, or whose row is empty, is `Malformed` by name in release and debug alike: the
+/// row counts and byte sizes would wrap (release) or panic (debug) in the file lengths the case implies. Each overflow row
+/// carries one product past `usize` and the others inside it, one for each length `Case::bytes` and the row check compute.
+#[test]
+fn a_case_with_overflowing_or_empty_sizes_is_refused() {
+    let max = usize::MAX;
+    for (what, line, words) in [
+        // MAX - 1 and 5 rows wrap to 3: the fixture's five file lengths still match
+        (
+            "rows",
+            case_line(64, [18, 36, 68], [max - 1, 5, 2]),
+            &["q4_0.64", "overflow"][..],
+        ),
+        (
+            "row",
+            case_line(64, [max, 36, 68], [2, 1, 2]),
+            &["q4_0.64", "overflow"],
+        ),
+        (
+            "blocks",
+            case_line(64, [18, max, 68], [2, 1, 2]),
+            &["q4_0.64", "overflow"],
+        ),
+        (
+            "deq",
+            case_line(64, [18, 36, 68], [1 << 57, 0, 2]),
+            &["q4_0.64", "overflow"],
+        ),
+        (
+            "x",
+            case_line(64, [18, 36, 68], [2, 1, 1 << 57]),
+            &["q4_0.64", "overflow"],
+        ),
+        (
+            "act",
+            case_line(64, [18, 36, max], [2, 1, 2]),
+            &["q4_0.64", "overflow"],
+        ),
+        (
+            "dot",
+            case_line(64, [18, 36, 68], [1 << 40, 0, 1 << 40]),
+            &["q4_0.64", "overflow"],
+        ),
+        (
+            "k0",
+            case_line(0, [18, 0, 68], [2, 1, 2]),
+            &["q4_0.0", "empty weight row"],
+        ),
+        (
+            "type_size0",
+            case_line(64, [0, 0, 68], [2, 1, 2]),
+            &["q4_0.64", "empty weight row"],
+        ),
+    ] {
+        let dir = set_dir(&format!("size-{what}"));
+        write_set(&dir, &RIGHT);
+        edit(&dir, CASE, &line);
+        assert!(
+            malformed_naming(&refusal(&dir), words),
+            "{what}: {}",
+            refusal(&dir)
+        );
+        remove(&dir);
+    }
 }
 
 /// The reader's parse refusals: a row before its column line, a row of the wrong width, a value that does not parse, an

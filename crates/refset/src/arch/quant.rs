@@ -11,8 +11,9 @@ use crate::quant::SYNTHETIC;
 pub const ARCH: &str = "quant";
 
 /// The md5 of `tools/ref/quant_oracle.cpp`: the source the set's rows, sizes and seeds come from.
-// PIN(2026-10-18): the harness as the round wrote it; `the_harness_pin_is_the_source_in_the_tree` holds it to the tree.
-pub const HARNESS: &str = "86375a1d6ea83e3ea12c291f07d7befa";
+// PIN(2026-10-19): the harness without the six case fields it never read (the md5 moved, the files it dumps did not);
+// `the_harness_pin_is_the_source_in_the_tree` holds it to the tree.
+pub const HARNESS: &str = "f87b4d310e51d9d80643fd0f735237cf";
 
 /// The mainline commit the set names in its `# build` line.
 // PIN(2026-10-18): /home/user/llama.cpp-36a73916 at its HEAD 36a73916ee0c (ggml-org master, 2026-10-07), the Qwen image-input
@@ -49,7 +50,7 @@ mod tests {
     /// The table holds the family under its key, and its pins are spelled as a set states them.
     #[test]
     fn the_family_is_a_row_of_the_table() {
-        assert_eq!(crate::arch::families(ARCH).len(), FAMILIES.len());
+        assert_eq!(crate::arch::families(ARCH).len(), 1);
         for f in FAMILIES {
             assert!(std::ptr::eq(
                 crate::arch::named(f.name).unwrap_or(&MAINLINE),

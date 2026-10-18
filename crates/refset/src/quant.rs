@@ -16,7 +16,8 @@
 //! ```
 //!
 //! [`QuantSet::open`] refuses by name a set dumped from another harness or another mainline commit, from a model file (it is
-//! synthetic), with a file that is not the one dumped, a case whose files disagree with its row, or that never finished.
+//! synthetic), with a file that is not the one dumped, a case whose row is empty, overflows `usize` or disagrees with its files,
+//! or that never finished.
 
 use crate::RefError;
 use crate::columns::{Columns, Row, file_name, parse_field};
@@ -125,7 +126,20 @@ impl Case {
         }
     }
 
-    /// The row against itself: the name ends in the row length, the sizes agree, nothing is empty.
+    /// Whether every length the row implies fits `usize`: [`rows`](Self::rows), each of [`bytes`](Self::bytes) and the row
+    /// size [`check`](Self::check) compares. `blck` is not zero.
+    fn sizes_fit(&self) -> Option<()> {
+        let rows = self.quant_rows.checked_add(self.random_rows)?;
+        (self.k / self.blck).checked_mul(self.type_size)?;
+        rows.checked_mul(self.row_bytes)?;
+        rows.checked_mul(self.k)?.checked_mul(4)?;
+        self.act_rows.checked_mul(self.k)?.checked_mul(4)?;
+        self.act_rows.checked_mul(self.act_row_bytes)?;
+        rows.checked_mul(self.act_rows)?.checked_mul(4)?;
+        Some(())
+    }
+
+    /// The row against itself: the name ends in the row length, the sizes fit and agree, nothing is empty.
     fn check(&self, at: &dyn fmt::Display) -> Result<(), RefError> {
         let named = self
             .name
@@ -148,6 +162,12 @@ impl Case {
                 "{} values is not whole blocks of {}",
                 self.k, self.blck
             ));
+        }
+        if self.k == 0 || self.type_size == 0 {
+            return bad("an empty weight row".to_string());
+        }
+        if self.sizes_fit().is_none() {
+            return bad("the sizes overflow usize".to_string());
         }
         if self.row_bytes != self.k / self.blck * self.type_size {
             return bad(format!(

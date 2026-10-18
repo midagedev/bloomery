@@ -54,39 +54,48 @@ tree_check() {
 }
 
 build() {
-  local tmp
+  local tmp source_md5 lcpp_path
   tree_check
   mkdir -p "$OUT"
   tmp=$OUT/quant_oracle.tmp.$$
   trap 'rm -f "$tmp" "$tmp.build"' EXIT
   g++ -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -o "$tmp" "$SRC" -I"$LCPP/ggml/include" -I"$LCPP/ggml/src" \
     -L"$LIB" -lggml-cpu -lggml-base -Wl,-rpath,"$LIB"
+  # Each fact is its own assignment: inside a printf's arguments a failed md5 or readlink would not end the script.
+  source_md5=$(md5 "$SRC")
+  lcpp_path=$(readlink -f "$LCPP")
   {
-    printf 'source_md5 %s\nlcpp %s\nlcpp_commit %s\n' "$(md5 "$SRC")" "$(readlink -f "$LCPP")" "$PIN"
+    printf 'source_md5 %s\nlcpp %s\nlcpp_commit %s\n' "$source_md5" "$lcpp_path" "$PIN"
     grep -E '^(GGML_NATIVE|GGML_CPU_ALL_VARIANTS|GGML_BACKEND_DL|CMAKE_BUILD_TYPE):' "$LCPP/build/CMakeCache.txt" | sed 's/^/cmake /'
   } > "$tmp.build"
   mv -f "$tmp" "$BIN"
   mv -f "$tmp.build" "$BIN.build"
   trap - EXIT
-  echo "built $BIN from $(basename "$SRC") md5 $(md5 "$SRC") against $LCPP at ${PIN:0:9}"
+  echo "built $BIN from ${SRC##*/} md5 $source_md5 against $LCPP at ${PIN:0:9}"
 }
 
-# The harness's own files into QUANT.tsv, last: the old one goes first, so a set is unfinished while its files change.
+# The harness's own files into QUANT.tsv, last: the old one goes first, so a set is unfinished while its files change. Each
+# digest, size and the cpu line is read into a variable before it is printed, so a failed read ends the script, no trailer.
 compose() {
-  local f n=0 tmp=$SET/QUANT.tsv.tmp.$$
+  local f n=0 tmp=$SET/QUANT.tsv.tmp.$$ source_md5 cpu bytes digest
+  trap 'rm -f "$tmp"' EXIT
+  source_md5=$(md5 "$SRC")
+  cpu=$(sed -n 's/^cpu\t//p' "$SET/info.tsv")
   {
-    printf '# harness\t%s\n# build\t%s\n' "$(md5 "$SRC")" "${PIN:0:9}"
-    printf '# cpu\t%s\n' "$(sed -n 's/^cpu\t//p' "$SET/info.tsv")"
-    printf '# model\t(synthetic rows)\n'
+    printf '# harness\t%s\n# build\t%s\n' "$source_md5" "${PIN:0:9}"
+    printf '# cpu\t%s\n# model\t(synthetic rows)\n' "$cpu"
     cat "$SET/cases.tsv"
     printf '# file\tname\tbytes\tmd5\n'
     while read -r f; do
-      printf 'file\t%s\t%s\t%s\n' "$f" "$(wc -c < "$SET/$f" | tr -d ' ')" "$(md5 "$SET/$f")"
+      bytes=$(wc -c < "$SET/$f" | tr -d ' ')
+      digest=$(md5 "$SET/$f")
+      printf 'file\t%s\t%s\t%s\n' "$f" "$bytes" "$digest"
       n=$((n + 1))
     done < "$SET/files.txt"
     printf '# complete\t%s\n' "$n"
   } > "$tmp"
   mv -f "$tmp" "$SET/QUANT.tsv"
+  trap - EXIT
   rm -f "$SET/cases.tsv" "$SET/files.txt" "$SET/info.tsv"
   echo "wrote $SET/QUANT.tsv ($n files)"
 }
