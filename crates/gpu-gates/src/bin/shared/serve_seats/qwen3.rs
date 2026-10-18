@@ -189,7 +189,7 @@ use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::qwen_seat::Family;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
-use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
+use bloomery_gpu_gates::vision_seat::{self, Opened, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::Levers;
 use gguf::Split;
@@ -213,22 +213,15 @@ const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[
                      [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
 
-/// What the plans and the open take of `--mmproj` ([`vision_of`]): the load's `media` flag
-/// ([`open35`]) and the bytes the image encoder reserves on the stage card, when its tower sits
-/// there.
-fn images_of(vision: Option<&Opened>) -> (bool, Option<u64>) {
-    (vision.is_some(), vision.and_then(|v| v.seat.reserve))
-}
-
 /// What shapes the load beside its context and slots ([`q3place::ServeOpts`]),
-/// `--mmproj`'s part read by [`images_of`], `embedding` the side model's reserve on the stage
-/// card.
+/// `--mmproj`'s part read by [`vision_seat::images_of`], `embedding` the side model's reserve on
+/// the stage card.
 fn serve_opts<'a>(
     (place, levers): (Option<Place>, &'a PlanLevers),
     kv: KvQ8,
     (vision, embedding): (Option<&Opened>, Option<u64>),
 ) -> q3place::ServeOpts<'a> {
-    let (media, image) = images_of(vision);
+    let (media, image) = vision_seat::images_of(vision);
     q3place::ServeOpts {
         place,
         levers,
@@ -244,14 +237,6 @@ fn beside_words(held: Beside) -> String {
     held.named()
         .map(|(name, bytes)| format!(", the {name} reserve of {bytes} B counted"))
         .collect()
-}
-
-/// The `vision_seat` record of the encoder `--mmproj` seated, nothing without one, so a load
-/// without `--mmproj` prints its lines as it did.
-fn print_seat(vision: Option<&Opened>) {
-    if let Some(v) = vision {
-        vision_seat::seat_record(v).eprint();
-    }
 }
 
 /// A qwen35moe file's `parallel` resident sequences: each takes the
@@ -576,7 +561,7 @@ impl Body3 for Body35 {
         let o = q3place::serve_open35(&file, ctx, kv, vision.is_some())?;
         let mut m = match load {
             Q3Load::Whole(card) => {
-                print_seat(vision);
+                vision_seat::print_seat(vision);
                 Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
             }
             Q3Load::Placed {
@@ -589,7 +574,7 @@ impl Body3 for Body35 {
                 for line in q.records(&plan, why)? {
                     line.eprint();
                 }
-                print_seat(vision);
+                vision_seat::print_seat(vision);
                 match whole {
                     Some(card) => {
                         Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
@@ -709,7 +694,7 @@ struct Q3<B: Body3> {
     one_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
-    /// The resident image encoder under `--mmproj` ([`open_encoder`]).
+    /// The resident image encoder under `--mmproj` ([`vision_seat::open_resident`]).
     #[cfg(feature = "vision")]
     vision: Option<vision_seat::Resident>,
 }
@@ -771,7 +756,7 @@ impl<B: Body3> Q3<B> {
         record::eprint_load_phases(s.model(), total, opened);
         // The tower after the model's captures, as the V4.1 seat opens its encoder.
         #[cfg(feature = "vision")]
-        let vision = open_encoder(&s, vision)?;
+        let vision = vision_seat::open_resident(s.model().gpu().context(), vision)?;
         #[cfg(not(feature = "vision"))]
         let _ = vision;
         Ok(Q3 {
@@ -784,23 +769,6 @@ impl<B: Body3> Q3<B> {
             vision,
         })
     }
-}
-
-/// The resident image encoder of `--mmproj` ([`vision_seat::Resident`]), its tower loaded on the
-/// card the plan seated; the `vision` record that follows the load names the card, which of the
-/// two seats it is and the tower's bytes.
-#[cfg(feature = "vision")]
-fn open_encoder<B: Body3>(
-    s: &app::Session<B>,
-    at: Option<Opened>,
-) -> Result<Option<vision_seat::Resident>, GateError> {
-    let Some(v) = at else {
-        return Ok(None);
-    };
-    let t = Instant::now();
-    let resident = vision_seat::Resident::open(s.model().gpu().context(), &v)?;
-    resident.announce(&v, vision_seat::ScratchHome::Own, t);
-    Ok(Some(resident))
 }
 
 impl<B: Body3> Seat for Q3<B> {
@@ -1003,7 +971,7 @@ impl Q3Load {
                 line.eprint();
             }
         }
-        print_seat(vision);
+        vision_seat::print_seat(vision);
         Ok(())
     }
 
@@ -1126,18 +1094,9 @@ fn vision_of(
     }
     #[cfg(not(feature = "vision"))]
     if a.vision.wanted()?.is_some() {
-        return Err(
-            "--mmproj: this build takes no images (built without the vision feature)".into(),
-        );
+        return Err(vision_seat::NO_TOWER.into());
     }
-    let hp = Hparams::read(split)?;
-    // Every qwen35moe attention layer rotates by IMROPE over the file's sections
-    // (`qwen35moe::spec::read`).
-    let facts = TextFacts {
-        n_embd: hp.n_embd,
-        imrope: Some(hp.rope_sections),
-        ple: PleImage::Absent,
-    };
+    let facts = TextFacts::of_qwen35moe(&Hparams::read(split)?);
     let file = a.vision.encoder(true)?;
     if let Some(enc) = file.as_deref()
         && is_minicpm_projector(enc)
@@ -1259,7 +1218,7 @@ fn open_minicpm(
     one: &dyn Fn(&str) -> Option<u32>,
 ) -> Result<Opened, GateError> {
     let _ = (path, flags, place, text, token, one);
-    Err("--mmproj: this build takes no images (built without the vision feature)".into())
+    Err(vision_seat::NO_TOWER.into())
 }
 
 /// Why `BLOOMERY_DRAFT=dspark` on a qwen35moe file is refused: the card
@@ -1413,7 +1372,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         (a.ctx, slots),
         serve_opts((a.place, &plan_levers), kv, (vision.as_ref(), embedding)),
     )?;
-    let (_, image) = images_of(vision.as_ref());
+    let (_, image) = vision_seat::images_of(vision.as_ref());
     eprintln!(
         "{}{}",
         asked.line(),

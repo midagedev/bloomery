@@ -661,3 +661,7 @@ required-features = ["vision"]
 [[bin]]
 name = "gate_qwen35_media"
 required-features = ["vision"]
+
+[[bin]]
+name = "gate_qwen38_media"
+required-features = ["vision", "deepseek41"]
