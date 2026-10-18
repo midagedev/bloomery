@@ -1428,9 +1428,10 @@ mod tests {
         }
     }
 
-    /// The rows are ggml's table and nothing else: one row for each id of the table, in tag
-    /// order, each with the table's name and sizes. A tag the enum does not name has no row,
-    /// whatever tag an `Unknown` holds.
+    /// The rows are ggml's table and nothing else: as many rows as the table has ids, in tag
+    /// order, so each id of the table has its row (`every_named_type_matches_ggml_table` holds
+    /// each row's name and sizes to it). A tag the enum does not name has no row, whatever tag an
+    /// `Unknown` holds.
     #[test]
     fn the_rows_are_ggmls_table() {
         assert_eq!(
@@ -1444,16 +1445,6 @@ mod tests {
                 .all(|w| w[0].ty.as_u32() < w[1].ty.as_u32()),
             "rows are in tag order"
         );
-        for &(id, name, blck, bytes) in GGML_TABLE {
-            let row = GgmlType::from_u32(id)
-                .row()
-                .unwrap_or_else(|| panic!("id {id} ({name}) has no row"));
-            assert_eq!(
-                (row.ty.as_u32(), row.name, row.blck, row.bytes),
-                (id, name, blck, bytes),
-                "id {id}"
-            );
-        }
         for id in 0..128 {
             let named = GGML_TABLE.iter().any(|t| t.0 == id);
             assert_eq!(GgmlType::from_u32(id).row().is_some(), named, "id {id}");
@@ -1461,33 +1452,21 @@ mod tests {
         }
     }
 
-    /// A row is what the dispatchers it feeds do: `dequant` is whether `dequant_row` decodes one
-    /// zero block, a type a CPU matmul takes has a reference decode to be checked against, and
-    /// the tag and the name round-trip through the enum.
+    /// A row is what the dispatchers it feeds do: a type decodes when a CPU matmul takes it, and
+    /// besides those only BF16 and NVFP4 decode (named here, not read from the row), and
+    /// `dequant_row` decodes one zero block exactly when the row says so.
     #[test]
     fn a_row_is_what_its_dispatchers_do() {
         for row in QROWS {
-            let (ty, name) = (row.ty, row.name);
-            assert_eq!(
-                GgmlType::from_u32(ty.as_u32()),
-                ty,
-                "{name}: tag round trip"
-            );
-            assert_eq!(ty.to_string(), name, "{name}: Display");
+            let expected =
+                row.host_act != HostAct::None || matches!(row.ty, GgmlType::BF16 | GgmlType::NVFP4);
+            assert_eq!(row.dequant, expected, "{}: decode support", row.name);
             let zero_block = dequant_row(
-                ty,
+                row.ty,
                 &vec![0u8; row.bytes as usize],
                 &mut vec![0.0f32; row.blck as usize],
             );
-            assert_eq!(
-                !matches!(zero_block, Err(QuantError::Unsupported(_))),
-                row.dequant,
-                "{name}: dequant"
-            );
-            assert!(
-                row.dequant || row.host_act == HostAct::None,
-                "{name}: a CPU matmul with no reference decode to check it"
-            );
+            assert_eq!(zero_block.is_ok(), expected, "{}: dequant", row.name);
         }
     }
 

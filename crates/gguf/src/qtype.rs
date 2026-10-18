@@ -12,8 +12,7 @@
 //! table (ik_llama.cpp ggml.c:620, mainline's for the types ik lacks), `bytes` as the block
 //! struct's `static_assert` in ggml-common.h gives it; the comment above each row names the
 //! lines. `name` is `ggml_type_name`, which also names the oracle dumps
-//! `$BLOOMERY_DATA/ref/<name>.raw`. `imatrix` is mainline's `ggml_quantize_requires_imatrix`
-//! (ggml.c, IQ2_XXS, IQ2_XS and IQ1_S). The tests in `quant.rs` hold every row to the table
+//! `$BLOOMERY_DATA/ref/<name>.raw`. The tests in `quant.rs` hold every row to the table
 //! compiled from ggml and to the dispatchers a row describes.
 
 use crate::quant::GgmlType;
@@ -45,8 +44,6 @@ pub struct QRow {
     /// type opens and its bytes move, but every decode of it is `QuantError::Unsupported`.
     pub dequant: bool,
     pub host_act: HostAct,
-    /// ggml's quantizer asserts an importance matrix for the type.
-    pub imatrix: bool,
 }
 
 use GgmlType as T;
@@ -56,57 +53,57 @@ use HostAct as H;
 #[rustfmt::skip]
 pub const QROWS: &[QRow] = &[
     // f32: ggml.c:657
-    QRow { ty: T::F32, name: "f32", blck: 1, bytes: 4, dequant: true, host_act: H::F32, imatrix: false },
+    QRow { ty: T::F32, name: "f32", blck: 1, bytes: 4, dequant: true, host_act: H::F32 },
     // f16: ggml.c:667
-    QRow { ty: T::F16, name: "f16", blck: 1, bytes: 2, dequant: true, host_act: H::F32, imatrix: false },
+    QRow { ty: T::F16, name: "f16", blck: 1, bytes: 2, dequant: true, host_act: H::F32 },
     // q4_0 and q4_1: ggml-common.h:167-171 and :174-178 (two f16 halves for q4_1). Sized and named so
     // a file holding them opens; no decoder and no CPU matmul here, so every use is refused by name.
-    QRow { ty: T::Q4_0, name: "q4_0", blck: 32, bytes: 18, dequant: false, host_act: H::None, imatrix: false },
-    QRow { ty: T::Q4_1, name: "q4_1", blck: 32, bytes: 20, dequant: false, host_act: H::None, imatrix: false },
+    QRow { ty: T::Q4_0, name: "q4_0", blck: 32, bytes: 18, dequant: false, host_act: H::None },
+    QRow { ty: T::Q4_1, name: "q4_1", blck: 32, bytes: 20, dequant: false, host_act: H::None },
     // q5_0: ggml.c:756, ggml-common.h:196-216; q5_1: ggml.c:777; q8_0: ggml.c:819, ggml-common.h:233-238
     // (one f16 d and 32 int8 codes)
-    QRow { ty: T::Q5_0, name: "q5_0", blck: 32, bytes: 22, dequant: true, host_act: H::Q8_2X4, imatrix: false },
-    QRow { ty: T::Q5_1, name: "q5_1", blck: 32, bytes: 24, dequant: true, host_act: H::Q8_2X4, imatrix: false },
-    QRow { ty: T::Q8_0, name: "q8_0", blck: 32, bytes: 34, dequant: true, host_act: H::Q8_2X4, imatrix: false },
+    QRow { ty: T::Q5_0, name: "q5_0", blck: 32, bytes: 22, dequant: true, host_act: H::Q8_2X4 },
+    QRow { ty: T::Q5_1, name: "q5_1", blck: 32, bytes: 24, dequant: true, host_act: H::Q8_2X4 },
+    QRow { ty: T::Q8_0, name: "q8_0", blck: 32, bytes: 34, dequant: true, host_act: H::Q8_2X4 },
     // The K-quants, QK_K = 256 (ggml-common.h:79): block_q2_K :309-314, q3_K :327-332, q4_K :348-353,
     // q5_K :367-373, q6_K :388-393; ggml.c:912/938/998.
-    QRow { ty: T::Q2_K, name: "q2_K", blck: 256, bytes: 84, dequant: true, host_act: H::Q8K, imatrix: false },
-    QRow { ty: T::Q3_K, name: "q3_K", blck: 256, bytes: 110, dequant: true, host_act: H::Q8K, imatrix: false },
-    QRow { ty: T::Q4_K, name: "q4_K", blck: 256, bytes: 144, dequant: true, host_act: H::Q8_2X4, imatrix: false },
-    QRow { ty: T::Q5_K, name: "q5_K", blck: 256, bytes: 176, dequant: true, host_act: H::Q8_2X4, imatrix: false },
-    QRow { ty: T::Q6_K, name: "q6_K", blck: 256, bytes: 210, dequant: true, host_act: H::Q8_2X4, imatrix: false },
+    QRow { ty: T::Q2_K, name: "q2_K", blck: 256, bytes: 84, dequant: true, host_act: H::Q8K },
+    QRow { ty: T::Q3_K, name: "q3_K", blck: 256, bytes: 110, dequant: true, host_act: H::Q8K },
+    QRow { ty: T::Q4_K, name: "q4_K", blck: 256, bytes: 144, dequant: true, host_act: H::Q8_2X4 },
+    QRow { ty: T::Q5_K, name: "q5_K", blck: 256, bytes: 176, dequant: true, host_act: H::Q8_2X4 },
+    QRow { ty: T::Q6_K, name: "q6_K", blck: 256, bytes: 210, dequant: true, host_act: H::Q8_2X4 },
     // The i-quants, QK_K = 256 (ggml.c:1055-1293): block_iq2_xxs ggml-common.h:443, iq2_xs :458, iq3_xxs :492,
     // iq1_s :526, iq3_s :510, iq2_s :474, iq4_xs :608. iq4_nl is QK4_NL = 32 (ggml.c:1276), :590.
-    QRow { ty: T::IQ2_XXS, name: "iq2_xxs", blck: 256, bytes: 66, dequant: true, host_act: H::Q8K, imatrix: true },
-    QRow { ty: T::IQ2_XS, name: "iq2_xs", blck: 256, bytes: 74, dequant: true, host_act: H::Q8K, imatrix: true },
-    QRow { ty: T::IQ3_XXS, name: "iq3_xxs", blck: 256, bytes: 98, dequant: true, host_act: H::Q8K, imatrix: false },
-    QRow { ty: T::IQ1_S, name: "iq1_s", blck: 256, bytes: 50, dequant: false, host_act: H::None, imatrix: true },
-    QRow { ty: T::IQ4_NL, name: "iq4_nl", blck: 32, bytes: 18, dequant: true, host_act: H::Q8_2X4, imatrix: false },
-    QRow { ty: T::IQ3_S, name: "iq3_s", blck: 256, bytes: 110, dequant: true, host_act: H::Q8K, imatrix: false },
-    QRow { ty: T::IQ2_S, name: "iq2_s", blck: 256, bytes: 82, dequant: false, host_act: H::None, imatrix: false },
-    QRow { ty: T::IQ4_XS, name: "iq4_xs", blck: 256, bytes: 136, dequant: true, host_act: H::Q8K, imatrix: false },
+    QRow { ty: T::IQ2_XXS, name: "iq2_xxs", blck: 256, bytes: 66, dequant: true, host_act: H::Q8K },
+    QRow { ty: T::IQ2_XS, name: "iq2_xs", blck: 256, bytes: 74, dequant: true, host_act: H::Q8K },
+    QRow { ty: T::IQ3_XXS, name: "iq3_xxs", blck: 256, bytes: 98, dequant: true, host_act: H::Q8K },
+    QRow { ty: T::IQ1_S, name: "iq1_s", blck: 256, bytes: 50, dequant: false, host_act: H::None },
+    QRow { ty: T::IQ4_NL, name: "iq4_nl", blck: 32, bytes: 18, dequant: true, host_act: H::Q8_2X4 },
+    QRow { ty: T::IQ3_S, name: "iq3_s", blck: 256, bytes: 110, dequant: true, host_act: H::Q8K },
+    QRow { ty: T::IQ2_S, name: "iq2_s", blck: 256, bytes: 82, dequant: false, host_act: H::None },
+    QRow { ty: T::IQ4_XS, name: "iq4_xs", blck: 256, bytes: 136, dequant: true, host_act: H::Q8K },
     // The C scalars: ggml.c:621-649.
-    QRow { ty: T::I8, name: "i8", blck: 1, bytes: 1, dequant: false, host_act: H::None, imatrix: false },
-    QRow { ty: T::I16, name: "i16", blck: 1, bytes: 2, dequant: false, host_act: H::None, imatrix: false },
-    QRow { ty: T::I32, name: "i32", blck: 1, bytes: 4, dequant: false, host_act: H::None, imatrix: false },
-    QRow { ty: T::I64, name: "i64", blck: 1, bytes: 8, dequant: false, host_act: H::None, imatrix: false },
-    QRow { ty: T::F64, name: "f64", blck: 1, bytes: 8, dequant: false, host_act: H::None, imatrix: false },
+    QRow { ty: T::I8, name: "i8", blck: 1, bytes: 1, dequant: false, host_act: H::None },
+    QRow { ty: T::I16, name: "i16", blck: 1, bytes: 2, dequant: false, host_act: H::None },
+    QRow { ty: T::I32, name: "i32", blck: 1, bytes: 4, dequant: false, host_act: H::None },
+    QRow { ty: T::I64, name: "i64", blck: 1, bytes: 8, dequant: false, host_act: H::None },
+    QRow { ty: T::F64, name: "f64", blck: 1, bytes: 8, dequant: false, host_act: H::None },
     // iq1_m: ggml-common.h:540. bf16 is one `uint16_t` (ggml.h:380, ggml.c:1485); ggml quantizes its
     // activations to bf16, a form this engine does not encode.
-    QRow { ty: T::IQ1_M, name: "iq1_m", blck: 256, bytes: 56, dequant: false, host_act: H::None, imatrix: false },
-    QRow { ty: T::BF16, name: "bf16", blck: 1, bytes: 2, dequant: true, host_act: H::None, imatrix: false },
+    QRow { ty: T::IQ1_M, name: "iq1_m", blck: 256, bytes: 56, dequant: false, host_act: H::None },
+    QRow { ty: T::BF16, name: "bf16", blck: 1, bytes: 2, dequant: true, host_act: H::None },
     // Mainline's alone (llama.cpp 930e2fa59): block_tq1_0 ggml-common.h:281, block_tq2_0 :288, ggml.c:912/920.
-    QRow { ty: T::TQ1_0, name: "tq1_0", blck: 256, bytes: 54, dequant: false, host_act: H::None, imatrix: false },
-    QRow { ty: T::TQ2_0, name: "tq2_0", blck: 256, bytes: 66, dequant: false, host_act: H::None, imatrix: false },
+    QRow { ty: T::TQ1_0, name: "tq1_0", blck: 256, bytes: 54, dequant: false, host_act: H::None },
+    QRow { ty: T::TQ2_0, name: "tq2_0", blck: 256, bytes: 66, dequant: false, host_act: H::None },
     // mxfp4: QK_MXFP4 = 32, one E8M0 byte then 16 bytes of 4-bit codes (ggml.c:1308, ggml-common.h:182-187);
     // ggml pairs it with Q8_2_X4 on this AVX2 IQK build (ggml.c:1316).
-    QRow { ty: T::MXFP4, name: "mxfp4", blck: 32, bytes: 17, dequant: true, host_act: H::Q8_2X4, imatrix: false },
+    QRow { ty: T::MXFP4, name: "mxfp4", blck: 32, bytes: 17, dequant: true, host_act: H::Q8_2X4 },
     // nvfp4: mainline's (llama.cpp-mainline ggml.c:760-764, ggml-common.h:221-227), four UE4M3 sub-block scales
     // then 32 bytes of 4-bit codes; it has a reference decode and no CPU matmul here.
-    QRow { ty: T::NVFP4, name: "nvfp4", blck: 64, bytes: 36, dequant: true, host_act: H::None, imatrix: false },
+    QRow { ty: T::NVFP4, name: "nvfp4", blck: 64, bytes: 36, dequant: true, host_act: H::None },
     // q2_0: mainline's (llama.cpp f2cc7282c, ggml.c:685-687, ggml-common.h:187-192), one f16 d then 16 bytes of
     // 2-bit codes; its dot takes Q8_0 (ggml-cpu.c:237).
-    QRow { ty: T::Q2_0, name: "q2_0", blck: 64, bytes: 18, dequant: true, host_act: H::Q8_0, imatrix: false },
+    QRow { ty: T::Q2_0, name: "q2_0", blck: 64, bytes: 18, dequant: true, host_act: H::Q8_0 },
 ];
 
 /// The slot a tag has in [`QROWS`], or `NO_ROW`.
