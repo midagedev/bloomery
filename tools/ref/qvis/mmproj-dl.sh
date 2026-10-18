@@ -11,6 +11,8 @@
 # repository of the same name holds its own files in /models/mmproj/Qwen3.6-35B-A3B-GGUF; GLM's does for the same reason (the
 # F16 copy under /models/mmproj/GLM-5.3-Flash-GGUF stays, and the family pins the BF16 file).
 set -u
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/../lease.sh"
 D=/models/mmproj
 mkdir -p "$D"
 [ -f "$D/qvis-dl.pid" ] && kill -0 "$(cat "$D/qvis-dl.pid")" 2> /dev/null && { echo "already running pid $(cat "$D/qvis-dl.pid")"; exit 0; }
@@ -30,7 +32,7 @@ for spec in "$@"; do
   set -- $spec
   out=$D/$4
   mkdir -p "$out"
-  timeout --kill-after=30 3600 ionice -c3 nice -n 19 /home/user/ft/bin/hf download "$1" "$3" --revision "$2" --local-dir "$out" || { rc=$?; echo "download of $1 $3 failed ($rc)"; continue; }
+  lease_bounded 3600 ionice -c3 nice -n 19 /home/user/ft/bin/hf download "$1" "$3" --revision "$2" --local-dir "$out" || { rc=$?; echo "download of $1 $3 failed ($rc)"; continue; }
   got=$(stat -c %s "$out/$3")
   sum=$(sha256sum "$out/$3" | cut -d' ' -f1)
   if [ "$got" != "$5" ] || [ "$sum" != "$6" ]; then

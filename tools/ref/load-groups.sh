@@ -55,6 +55,9 @@
 # opens its measured window (MAJ_TIMED counts from it), defaults to generate_ds41's `fed` record;
 # a runner sets its own after sourcing this file (depth-qwen3moe.sh).
 LG_FED_RE='^fed '
+# The process's bound and its cancellation are the owner's: bounded_bg.
+# shellcheck source=tools/gate-bound.sh
+source "${BASH_SOURCE[0]%/*}/../gate-bound.sh"
 LG_MODE=${BLOOMERY_AB_LOAD:-key}
 case $LG_MODE in
   key | arm) ;;
@@ -136,13 +139,13 @@ lg_run_unit() {
 
 # lg_process <round> <indices...>: one process over those arms; into LG_LEFT the arms it did not reach
 # after a failure (empty when it ran them all or failed before its first arm). The process reads its
-# go lines from one FIFO and writes its lines into another; its pid is the timeout's, started here.
+# go lines from one FIFO and writes its lines into another; its pid is the timeout's (bounded_bg,
+# tools/gate-bound.sh, which owns its cancellation), started here.
 lg_process() {
   local r=$1
   shift
   local -a arms=("$@")
   local n=${#arms[@]} k=-1 line rc=0 st out='' prev_out='' header='' shown t0=0 f0=0 fed='' bound pid dir rfd wfd i
-  local lg_traps lg_sig='' s
   LG_LEFT=()
   lg_cmd "${arms[@]}"
   bound=$((BOUND * (n + 1)))
@@ -150,27 +153,12 @@ lg_process() {
   dir=$(mktemp -d "${TMPDIR:-/tmp}/load-groups.XXXXXX") || exit 2
   mkfifo "$dir/go" "$dir/out" || exit 2
   echo "[load] r$r ${n} arm(s): $(for i in "${arms[@]}"; do printf '%s ' "${ARMS[$i]}"; done)- one process, one load"
-  pid=''
-  lg_traps=$(trap -p TERM INT HUP)
-  # Stop and reap the load before restoring the caller's traps and raising its signal again.
-  lg_stop() {
-    trap '' TERM INT HUP
-    lease_stop "$pid" || rc=$?
-    trap - TERM INT HUP
-    eval "$lg_traps"
-    kill -s "$lg_sig" $$
-  }
-  for s in TERM INT HUP; do
-    # shellcheck disable=SC2064 # the signal now, the pid when the trap runs
-    trap "lg_sig=$s; [ -z \"\$pid\" ] || lg_stop" "$s"
-  done
-  env "${LG_ENV[@]}" timeout --kill-after=10 "$bound" "${LG_CMD[@]}" < "$dir/go" > "$dir/out" 2>&1 &
-  pid=$!
-  [ -z "$lg_sig" ] || lg_stop
+  BG_IN=$dir/go BG_OUT=$dir/out bounded_bg "$bound" env "${LG_ENV[@]}" "${LG_CMD[@]}" || exit 2
+  pid=$BG_PID
   # Read-write, so this open does not wait for the process's; the process's stdin sees EOF only when
-  # this end closes.
-  exec {wfd}<> "$dir/go"
-  exec {rfd}< "$dir/out"
+  # this end closes. A pipe that cannot be opened ends the process with the run: nothing reads it.
+  exec {wfd}<> "$dir/go" || { bounded_bg_stop || :; exit 2; }
+  exec {rfd}< "$dir/out" || { bounded_bg_stop || :; exit 2; }
   # lg_end_arm <arm> <rc>: that arm's output and counts, to lg_post.
   lg_end_arm() {
     local f1 t1
@@ -188,7 +176,7 @@ lg_process() {
     if [ "$st" != 0 ]; then
       if [ "$st" -gt 128 ]; then
         echo "[load] r$r: no line for ${BOUND} s; killing the process (pid $pid)" >&2
-        lease_stop "$pid" || rc=$?
+        bounded_bg_stop || rc=$?
       fi
       break
     fi
@@ -208,7 +196,7 @@ lg_process() {
       k=$((k + 1))
       if [ "$k" -ge "$n" ]; then
         out="the process printed arm line $k of a list of $n: $line"$'\n'
-        lease_stop "$pid" || rc=$?
+        bounded_bg_stop || rc=$?
         break
       fi
       lg_pre "${arms[$k]}" "$r"
@@ -225,11 +213,7 @@ lg_process() {
       if [ -z "$fed" ] && [[ $line =~ $LG_FED_RE ]]; then fed=$(lg_majflt); fi
     fi
   done
-  wait "$pid" || rc=$?
-  pid=''
-  trap - TERM INT HUP
-  eval "$lg_traps"
-  [ -z "$lg_sig" ] || kill -s "$lg_sig" $$
+  bounded_bg_wait || rc=$?
   exec {wfd}>&- {rfd}<&-
   rm -rf "$dir"
   if [ "$k" -lt 0 ]; then
@@ -343,8 +327,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
             LG_CMD=(sh -c '\''echo "arm s0"; read -r go'\''); LG_ENV=()
           }
           set -T
-          trap '\''if [ "${FUNCNAME[0]:-}" = lg_process ] &&
-            [ "$BASH_COMMAND" = "trap - TERM INT HUP" ] && [ -z "$pid" ]; then
+          trap '\''if [ "${FUNCNAME[0]:-}" = __bounded_bg_end ] &&
+            [ "$BASH_COMMAND" = "eval \"\$BG_TRAPS\"" ] && [ -z "$BG_PID" ]; then
               trap - DEBUG
               kill -s "$reaped_signal" $$
             fi'\'' DEBUG

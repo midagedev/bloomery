@@ -2372,18 +2372,15 @@ pp_col() {
   fi
 }
 
-# What a mem= arm's scope runs (the header's Mem): the arm's command as given — a child this shell
-# forwards the bound's TERM to, the signal systemd-run already forwarded to the shell — then the
-# scope's own memory.peak, read while the scope lives (its cgroup goes with its last process), one
-# line the arm's witness reads. Run as `bash -c` with the command in "$@" after `--`.
+# What a mem= arm's scope runs (the header's Mem): the arm's command as given, run through run_bounded (the file
+# $BOUND_LIB, tools/gate-bound.sh): the bound's TERM, the signal systemd-run already forwarded to the shell, reaches
+# the child through the owner's trap, set before the child starts — then the scope's own memory.peak, read while the
+# scope lives (its cgroup goes with its last process), one line the arm's witness reads. Run as `bash -c` with the
+# command in "$@" after `--`.
 MEM_SCOPE_SCRIPT='
-"$@" &
-child=$!
-trap "trap \"\" TERM INT HUP; kill -TERM $child 2> /dev/null" TERM INT HUP
-wait "$child"
-wait "$child"
-rc=$?
-trap - TERM INT HUP
+source "$BOUND_LIB" || exit 70
+rc=0
+run_bounded "$@" || rc=$?
 cg=$(awk -F: "/^0::/{print \$3}" /proc/self/cgroup) || cg=
 peak=$(cat "/sys/fs/cgroup$cg/memory.peak" 2> /dev/null) || peak=?
 echo "scope mem=peak:$peak cgroup:$cg"
@@ -2409,7 +2406,7 @@ ours_arm() {
   if [ -n "${A_MEM[$i]}" ]; then
     lease_capture "$BOUND" systemd-run --scope --quiet \
       -p "MemoryMax=${A_MEM[$i]}G" -p MemorySwapMax=0 \
-      env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} bash -c "$MEM_SCOPE_SCRIPT" -- \
+      env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} BOUND_LIB="$LEASE_TREE/tools/gate-bound.sh" bash -c "$MEM_SCOPE_SCRIPT" -- \
       "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" \
       ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} ${A_PREFILL[$i]:+--prefill "${A_PREFILL[$i]}"} --time ${WARM:+--warm "$WARM"} || rc=$?
   else

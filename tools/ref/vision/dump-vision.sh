@@ -22,6 +22,8 @@
 # checkpoint's mmproj/), BLOOMERY_VISION_SET (default deepseek41v), VISION_IMAGES (default images/ beside this
 # script; the fork comparison's set deepseek41v-scenes is dumped from scenes/, `just dump-ref-visref`).
 set -euo pipefail
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/../lease.sh"
 HERE=${BASH_SOURCE[0]%/*}
 # shellcheck source=tools/ref/ref-paths.sh
 source "$HERE/../ref-paths.sh"
@@ -54,7 +56,7 @@ echo "[gate-lock] held"
 
 for run in a b; do
   echo "dump-vision.sh: run $run"
-  timeout --kill-after=10 "$BOUND" "$PY" "$HERE/dump_vision.py" \
+  lease_bounded "$BOUND" "$PY" "$HERE/dump_vision.py" \
     --ckpt "$CKPT" --images "$IMAGES" --mmproj "$MMPROJ" --out "$STAGE/$run"
 done
 exec 8>&-

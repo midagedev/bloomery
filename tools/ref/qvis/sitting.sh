@@ -12,6 +12,8 @@
 # A6000, else the 3090); the dump's `-ncmoe` follows the card (profile.sh). Both phases run under one `timeout` of the bound, so
 # a hung dump ends the sitting and its children (the timeout's own process group), never a bare kill of a recorded pid.
 set -uo pipefail
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/../lease.sh"
 model=${1:?usage: sitting.sh <qwen35moe|qwen4exp> [bound seconds]} bound=${2:-3000}
 case $model in qwen35moe | qwen4exp) ;; *) echo "sitting.sh: the seat is qwen35moe or qwen4exp, got $model" >&2; exit 64 ;; esac
 case $bound in '' | *[!0-9]*) echo "sitting.sh: the bound is whole seconds, got '$bound'" >&2; exit 64 ;; esac
@@ -37,8 +39,8 @@ phase() { # <name> <args…>: one clefvis.sh call under the sitting's remaining 
   t0=$(date +%s)
   left=$((bound - (t0 - START)))
   if [ "$left" -le 0 ]; then echo "phase $name: the bound is spent"; [ "$rc" != 0 ] || rc=124; return; fi
-  timeout --kill-after=30 "$left" bash tools/ref/clefvis/clefvis.sh "$@"
-  prc=$?
+  prc=0
+  lease_bounded "$left" bash tools/ref/clefvis/clefvis.sh "$@" || prc=$?
   echo "phase $name rc=$prc wall=$(($(date +%s) - t0)) s"
   [ "$rc" != 0 ] || rc=$prc
 }

@@ -28,8 +28,8 @@
 #                                  the flags, then LCPP_SRV_FIXED, -c, --host 127.0.0.1 --port 0
 #   lcpp_srv_probe <server>        true when <server> --help (no card: CUDA_VISIBLE_DEVICES=-1) lists every
 #                                  option word of SRV_CMD; else 1 and SRV_WHY
-#   lcpp_srv_start <bound> <log> [NAME=VALUE...]  empties <log>, starts (lcpp_srv_spawn) `timeout --kill-after=10
-#                                  <bound> env <NAME=VALUE...> SRV_CMD` with its stdout and stderr in <log>, and waits (at most <bound> s)
+#   lcpp_srv_start <bound> <log> [NAME=VALUE...]  empties <log>, starts (lcpp_srv_spawn) the bounded
+#                                  `env <NAME=VALUE...> SRV_CMD` with its stdout and stderr in <log>, and waits (at most <bound> s)
 #                                  for its `listening on http://127.0.0.1:<port>` line — printed after the
 #                                  model loaded — and a 200 from /health. SRV_PID (the timeout's pid),
 #                                  SRV_PORT; 1 with SRV_WHY and SRV_RC when it exited first
@@ -52,7 +52,7 @@
 #                                  lcpp_srv_request, and the caller stops it
 #   lcpp_srv_same <a> <b>          `same` for two equal comma lists of ids, else `differs at <i>`: greedy
 #                                  decoding repeats its continuation, so the warm-up read the timed rows
-#   lcpp_srv_stop                  lease_stop ends SRV_PID and its group, then restores the caller's signal
+#   lcpp_srv_stop                  bounded_bg_stop ends SRV_PID and its group, then restores the caller's signal
 #                                  traps; SRV_EXIT the child's status or a cleanup failure
 #   lcpp_srv_build <log>, lcpp_srv_device <log>  the server's `build:` line and the card it opened
 #   lcpp_srv_nctx <log>            the n_ctx the server's context was made with (its `llama_context: n_ctx =`
@@ -149,7 +149,10 @@
 #
 # Stopping. The server runs under `timeout <bound>`, one bound for its load, the warm-up, the timed request
 # and a retry; SRV_PID is the timeout's pid, started here. The runner's TERM, INT and HUP stop that
-# process and its group through lease_stop before the runner resumes its own signal handler.
+# process and its group (bounded_bg) before the runner resumes its own signal handler.
+# The probe and the server go through the bounded child's owner (lease_capture, bounded_bg); sourced once.
+# shellcheck source=tools/ref/lease.sh
+declare -F lease_capture > /dev/null || source "${BASH_SOURCE[0]%/*}/lease.sh"
 : "${LCPP_SRV_FIXED:=-np 1 -ctxcp 0 --cache-ram 0}"
 
 lcpp_srv_bin() { echo "${LCPPSRV:-${LCPPBIN%/*}/llama-server}"; }
@@ -278,7 +281,8 @@ lcpp_srv_cmd() {
 
 lcpp_srv_probe() {
   local out rc=0 w missing=''
-  out=$(CUDA_VISIBLE_DEVICES=-1 timeout --kill-after=10 60 "$1" --help 2> /dev/null) || rc=$?
+  LEASE_BOUNDED_ERR=/dev/null lease_capture 60 env CUDA_VISIBLE_DEVICES=-1 "$1" --help || rc=$?
+  out=$LEASE_OUT
   if [ "$rc" != 0 ]; then
     SRV_WHY="$1 --help exited $rc"
     return 1
@@ -298,32 +302,14 @@ lcpp_srv_probe() {
 
 lcpp_srv_majflt() { awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat; }
 
-# lcpp_srv_spawn <bound> <log> [NAME=VALUE...]: the background launch, SRV_PID the timeout's pid. The child
-# appends to <log>; lcpp_srv_start has emptied it first (the self-test's seam).
+# lcpp_srv_spawn <bound> <log> [NAME=VALUE...]: the background launch (bounded_bg, tools/gate-bound.sh), SRV_PID the
+# timeout's pid. The child appends to <log>; lcpp_srv_start has emptied it first (the self-test's seam).
 lcpp_srv_spawn() {
-  local bound=$1 log=$2 s
+  local bound=$1 log=$2
   shift 2
-  # shellcheck source=tools/gate-bound.sh
-  source "${BASH_SOURCE[0]%/*}/../gate-bound.sh" || return $?
-  SRV_TRAPS=$(trap -p TERM INT HUP)
-  SRV_PID='' SRV_SIGNAL='' SRV_STOPPING=''
-  for s in TERM:143 INT:130 HUP:129; do
-    # shellcheck disable=SC2064 # signal now, server state when the trap runs
-    trap "SRV_SIGNAL=${s%:*}
-      if [ -n \"\$SRV_STOPPING\" ]; then
-        trap '' TERM INT HUP
-      elif [ -n \"\$SRV_PID\" ]; then
-        lcpp_srv_stop
-        return ${s#*:}
-      fi" "${s%:*}"
-  done
-  timeout --kill-after=10 "$bound" env "$@" "${SRV_CMD[@]}" >> "$log" 2>&1 &
-  SRV_PID=$!
-  if [ -n "$SRV_SIGNAL" ]; then
-    case $SRV_SIGNAL in TERM) s=143 ;; INT) s=130 ;; HUP) s=129 ;; esac
-    lcpp_srv_stop
-    return "$s"
-  fi
+  SRV_PID=''
+  BG_OUT_APPEND=$log bounded_bg "$bound" env "$@" "${SRV_CMD[@]}" || return $?
+  SRV_PID=$BG_PID
 }
 
 lcpp_srv_start() {
@@ -345,8 +331,8 @@ lcpp_srv_start() {
       return 0
     fi
     if ! kill -0 "$SRV_PID" 2> /dev/null; then
-      wait "$SRV_PID"
-      SRV_RC=$?
+      SRV_RC=0
+      bounded_bg_wait || SRV_RC=$?
       [ "$SRV_RC" != 0 ] || SRV_RC=70
       SRV_WHY="llama-server exited $SRV_RC before it answered /health"
       # The load's own reason, when the log names an allocation that failed (a -c or a ubatch the card
@@ -438,18 +424,10 @@ lcpp_srv_same() {
 lcpp_srv_stop() {
   local cleanup_rc=0
   [ -n "${SRV_PID:-}" ] || return 0
-  SRV_STOPPING=1
-  [ -z "$SRV_SIGNAL" ] || trap '' TERM INT HUP
-  lease_stop "$SRV_PID" || cleanup_rc=$?
-  SRV_EXIT=0
-  wait "$SRV_PID" || true
-  wait "$SRV_PID" || SRV_EXIT=$?
-  [ "$cleanup_rc" = 0 ] || SRV_EXIT=$cleanup_rc
+  bounded_bg_stop || cleanup_rc=$?
+  SRV_EXIT=$BG_RC
   SRV_PID=''
-  trap - TERM INT HUP
-  eval "$SRV_TRAPS"
-  [ "$cleanup_rc" = 0 ] || exit "$cleanup_rc"
-  [ -z "$SRV_SIGNAL" ] || kill -s "$SRV_SIGNAL" $$
+  [ "$cleanup_rc" = 0 ] || { SRV_EXIT=$cleanup_rc; exit "$cleanup_rc"; }
   return 0
 }
 
@@ -1003,8 +981,9 @@ EOF
   lcpp_srv_spawn() {
     local bound=$1 log=$2
     shift 2
-    (sleep 1; timeout --kill-after=10 "$bound" env "$@" "${SRV_CMD[@]}" > "$log" 2>&1) &
-    SRV_PID=$!
+    source "$warm_tree/tools/gate-bound.sh"
+    BG_OUT_APPEND=$log bounded_bg "$bound" sh -c 'sleep 1; : > "$0"; exec "$@"' "$log" env "$@" "${SRV_CMD[@]}"
+    SRV_PID=$BG_PID
     STUB_PIDS+=("$SRV_PID")
     echo "$SRV_PID" >> "$t/stubs.pid"
   }
@@ -1059,14 +1038,15 @@ EOF
   source "$warm_tree/tools/ref/lease-probe.sh"
   source "$warm_tree/tools/ref/cancel-stubs.sh"
   mkdir -p "$t/tree/tools/ref"
-  cp "$warm_tree/tools/gate-bound.sh" "$t/tree/tools/"
+  # The startup phase holds the runner between the owner's fork and its pid assignment.
   awk '
-    $0 == "  SRV_PID=$!" {
+    $0 == "  BG_PID=$!" {
       print "  echo gap > \"$START_READY\""
       print "  while [ ! -e \"$START_RELEASE\" ]; do sleep 0.01 9>&-; done"
     }
     { print }
-  ' "$warm_tree/tools/ref/lcpp-warm.sh" > "$t/tree/tools/ref/lcpp-warm.sh"
+  ' "$warm_tree/tools/gate-bound.sh" > "$t/tree/tools/gate-bound.sh"
+  cp "$warm_tree/tools/ref/lcpp-warm.sh" "$warm_tree/tools/ref/lease.sh" "$warm_tree/tools/ref/lease-probe.sh" "$t/tree/tools/ref/"
   for phase in startup load request; do
     for trp in '' "trap 'echo trap ran; exit 143' TERM;"; do
       tag=$phase${trp:+-trap}
@@ -1127,7 +1107,7 @@ EOF
     set --
     source "$warm_tree/tools/ref/lcpp-warm.sh"
     lease_stop() { return 70; }
-    SRV_PID=unused SRV_SIGNAL='' SRV_TRAPS=''
+    SRV_PID=unused BG_LIVE=1 BG_PID=unused
     lcpp_srv_stop
     echo next arm
   ) > "$t/cleanup.out" 2>&1 || r=$?

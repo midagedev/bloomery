@@ -126,7 +126,7 @@ esac
 """, True)
         # The dry server preflight needs --help and --plan, never a timed child.
         put(bindir / "timeout", """#!/usr/bin/env bash
-[ "${1:-}" != --kill-after=10 ] || shift
+case ${1:-} in --kill-after=*) shift ;; esac
 shift
 exec "$@"
 """, True)

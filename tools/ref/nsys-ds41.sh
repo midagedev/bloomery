@@ -114,6 +114,9 @@
 # default 900), BLOOMERY_DRY=1 (the command lines, then exit before the binary check and the
 # lease; the decode recipe builds nothing under it either, like the prefill one).
 set -uo pipefail
+# The bounded child's owner (bounded): --analyze and --self-test run before the lease is sourced.
+# shellcheck source=tools/gate-bound.sh
+source "${BASH_SOURCE[0]%/*}/../gate-bound.sh"
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 
@@ -163,7 +166,7 @@ py_bounded() {
   if declare -F lease_bounded > /dev/null; then
     lease_bounded "$BOUND" python3 "$@"
   elif command -v timeout >/dev/null 2>&1; then
-    timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 "$@"
+    bounded "${BLOOMERY_ARM_BOUND:-900}" python3 "$@"
   else
     python3 "$@"
   fi

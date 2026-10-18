@@ -81,9 +81,9 @@ echo "build-lcpp-qvis: targets ${TARGETS[*]}, CUDA architecture $CUDA_ARCH, $NVC
 t0=$(date +%s)
 as_user cmake -S "$TREE" -B "$TREE/build" -DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH" -DLLAMA_CURL=OFF \
   -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_COMPILER=$NVCC" || fail "cmake configure failed"
-timeout --kill-after=10 1740 taskset -c 0-31 nice -n 19 "${AS_USER[@]}" \
-  cmake --build "$TREE/build" --config Release -j 16 --target "${TARGETS[@]}"
-rc=$?
+rc=0
+lease_bounded 1740 taskset -c 0-31 nice -n 19 "${AS_USER[@]}" \
+  cmake --build "$TREE/build" --config Release -j 16 --target "${TARGETS[@]}" || rc=$?
 echo "build-lcpp-qvis: build rc $rc in $(($(date +%s) - t0)) s, end $(now)"
 if [ "$rc" = 0 ]; then
   for l in libmtmd.so libllama.so libllama-common.so libggml.so libggml-base.so; do

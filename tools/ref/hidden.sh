@@ -20,6 +20,8 @@
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
+# shellcheck source=tools/ref/lease.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lease.sh"
 [ "$MODEL_NAME" = qwen35 ] ||
   { echo "hidden.sh: the hidden-state sets are the qwen35 profile's; this command picked $MODEL_NAME" >&2; exit 2; }
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -49,8 +51,8 @@ for s in "${HIDDEN_SETS[@]}"; do
   where=(-ngl 99) run=(env)
   if [ "$twin" = 1 ]; then dir=$dir.cpu where=(-ngl 0 -t 16) run=(env CUDA_VISIBLE_DEVICES=); fi
   rm -rf "$dir.staging"
-  if "${run[@]}" BLOOMERY_REF_BUILD="$want_commit" BLOOMERY_REF_TOKENS_SHA256="$PROSE_SHA256" \
-      timeout --kill-after=10 900 "$BIN" -m "$file" --tokens-file "$PROSE_IDS" --tokens-count "$p" \
+  if lease_bounded 900 "${run[@]}" BLOOMERY_REF_BUILD="$want_commit" BLOOMERY_REF_TOKENS_SHA256="$PROSE_SHA256" \
+      "$BIN" -m "$file" --tokens-file "$PROSE_IDS" --tokens-count "$p" \
       --out "$dir.staging" -c "$ctx" -ub 512 "${where[@]}"; then
     rm -rf "$dir"
     mv "$dir.staging" "$dir"
