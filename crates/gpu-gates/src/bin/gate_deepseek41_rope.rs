@@ -611,8 +611,8 @@ mod gate {
     /// A K/V site's rows with one value of token 0 at `1e20`: finite, its
     /// square past f32, so that row's norm has no scale. The kernel raises
     /// `FaultSite::F32Product` with no layer, the row is NaN in f32 and in its
-    /// ring slot (never the zeros `1/∞` scales it to), and every other row and
-    /// ring word is the clean launch's.
+    /// ring slot (never the zeros `1/∞` scales it to, and not the sentinel, an
+    /// f16 NaN too), and every other row and ring word is the clean launch's.
     fn kv_overflow(cx: &Cx, label: &str, man: &RefManifest, at: usize) -> Result<bool, GateError> {
         const BIG: f32 = 1.0e20;
         let ch = KvChain::read(man, at)?;
@@ -644,11 +644,10 @@ mod gate {
         let (out_b, ring_b) = kv_run(cx, &dev(&xb)?, m, width, window)?;
         let got = cx.gpu.take_fault()?;
         let want = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
-        let f16_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
         let row_nan = out_b[..width].iter().all(|v| v.is_nan());
         let slot_nan = ring_b[slot * width..(slot + 1) * width]
             .iter()
-            .all(|&h| f16_nan(h));
+            .all(|&h| h != SENTINEL && gguf::quant::half_to_f32(h).is_nan());
         let others = bits_equal(&out_b[width..], &out[width..]) && {
             let mut want_ring = ring.clone();
             want_ring[slot * width..(slot + 1) * width]

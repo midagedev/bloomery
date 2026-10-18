@@ -424,13 +424,15 @@ mod fused_kernels {
                 *kv_s.get_unchecked_mut(k + d + 1) = y1;
                 *kvr.get_unchecked_mut(d) = y0;
                 *kvr.get_unchecked_mut(d + 1) = y1;
-                let finite = y0.is_finite() & y1.is_finite();
-                not_finite |= !finite;
+                let (finite0, finite1) = (y0.is_finite(), y1.is_finite());
+                not_finite |= !(finite0 & finite1);
                 if live {
                     let (h0, h1) = (f32_to_f16_bits(y0), f32_to_f16_bits(y1));
                     *cache.get_unchecked_mut(crow + d) = h0;
                     *cache.get_unchecked_mut(crow + d + 1) = h1;
-                    past_f16 |= finite & !(f16_finite(h0) & f16_finite(h1));
+                    // Per value: a pair with one value past f32 and the other
+                    // finite past f16 raises both sites.
+                    past_f16 |= (finite0 & !f16_finite(h0)) | (finite1 & !f16_finite(h1));
                 }
             }
         }

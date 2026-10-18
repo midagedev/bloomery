@@ -1250,7 +1250,8 @@ mod gate {
     /// The compressor with every projection value (and every ring slot) at
     /// 1e20: the pooled row's sum of squares is f32 inf, so the norm has no
     /// scale. The launch must raise the product fault alone, every completed
-    /// group's row must be NaN in both planes, and every other cache row must
+    /// group's row must be NaN in both planes (the sentinel is an f16 NaN
+    /// too, so a row never stored is refused), and every other cache row must
     /// keep the sentinel.
     fn comp_overflow(
         cx: &Cx,
@@ -1283,13 +1284,12 @@ mod gate {
         let out = comp_run(cx, geom, &inp)?;
         let got = cx.gpu.take_fault()?;
         let want = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
-        let f16_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
         let pre_nan = out.pre[..groups * width].iter().all(|v| v.is_nan());
         let written: Vec<usize> = st.state_write.iter().map(|&w| w as usize).collect();
         let rows_nan = written.iter().all(|&w| {
             out.cache[w * width..(w + 1) * width]
                 .iter()
-                .all(|&h| f16_nan(h))
+                .all(|&h| h != SENTINEL && gguf::quant::half_to_f32(h).is_nan())
         });
         let others = (0..geom.rows)
             .filter(|row| !written.contains(row))
@@ -1539,8 +1539,9 @@ mod gate {
 
     /// The index key with every projected value at 1e20: the norm's sum of
     /// squares is f32 inf, so there is no scale. The launch must raise the
-    /// product fault alone, every completed group's key row must be NaN, and
-    /// every other cache row must keep the sentinel.
+    /// product fault alone, every completed group's key row must be NaN (not
+    /// the sentinel, an f16 NaN too), and every other cache row must keep the
+    /// sentinel.
     fn idx_overflow(
         cx: &Cx,
         src: &Source,
@@ -1558,11 +1559,12 @@ mod gate {
         let got_rows = idx_run(cx, geom, words, &k, gain, cs)?;
         let got = cx.gpu.take_fault()?;
         let want = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
-        let f16_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
         let written: Vec<usize> = st.state_write.iter().map(|&x| x as usize).collect();
-        let rows_nan = written
-            .iter()
-            .all(|&r| got_rows[r * w..(r + 1) * w].iter().all(|&h| f16_nan(h)));
+        let rows_nan = written.iter().all(|&r| {
+            got_rows[r * w..(r + 1) * w]
+                .iter()
+                .all(|&h| h != SENTINEL && gguf::quant::half_to_f32(h).is_nan())
+        });
         let others = (0..geom.rows)
             .filter(|row| !written.contains(row))
             .all(|row| {

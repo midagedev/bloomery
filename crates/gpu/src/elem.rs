@@ -510,7 +510,7 @@ pub fn rms_scale(sum_sq: f32, k: u32, eps: f32) -> f32 {
 /// of `rope_neox`, `qsa`). The one owner of the refusal: `1 / sqrt(mean +
 /// eps)` where it is finite and positive, NaN everywhere else.
 #[inline(always)]
-pub fn rms_scale_of_mean(mean: f32, eps: f32) -> f32 {
+pub(crate) fn rms_scale_of_mean(mean: f32, eps: f32) -> f32 {
     let scale = 1.0 / (mean + eps).sqrt();
     if (scale > 0.0) & (scale < f32::INFINITY) {
         scale
@@ -533,7 +533,7 @@ pub fn rms_scale_checked(sum_sq: f32, k: u32, eps: f32, fault: FaultSink, lead: 
 /// [`rms_scale_of_mean`] for a kernel with a fault sink, as
 /// [`rms_scale_checked`] is to [`rms_scale`].
 #[inline(always)]
-pub fn rms_scale_of_mean_checked(mean: f32, eps: f32, fault: FaultSink, lead: bool) -> f32 {
+pub(crate) fn rms_scale_of_mean_checked(mean: f32, eps: f32, fault: FaultSink, lead: bool) -> f32 {
     let scale = rms_scale_of_mean(mean, eps);
     if lead & scale.is_nan() {
         fault.raise(FaultSite::F32Product);

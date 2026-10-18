@@ -164,14 +164,10 @@ mod gate {
         let exact = rope_gate::check::<HEAD, HEAD, HEAD>(gpu, &inp, &pos, shape, LAYER, |p, f| {
             rope_run(kern, gpu.stream(), &inp, p, f, heads)
         })?;
-        let overflow = rope_gate::check_overflow::<HEAD, HEAD, HEAD>(
-            gpu,
-            &inp,
-            &pos,
-            shape,
-            LAYER,
-            |i, p, f| rope_run(kern, gpu.stream(), i, p, f, heads),
-        )?;
+        let overflow =
+            rope_gate::check_overflow::<HEAD>(gpu, &inp, &pos, shape, LAYER, |i, p, f| {
+                rope_run(kern, gpu.stream(), i, p, f, heads)
+            })?;
         Ok(exact && overflow)
     }
 

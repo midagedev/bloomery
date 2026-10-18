@@ -4681,7 +4681,7 @@ mod tests {
         assert!(workstation::HostNeed::of(&plan, 0).check(u64::MAX).is_err());
     }
 
-    /// A host that holds every expert of `fat_layered(8, EXPERT)` with a
+    /// A host that holds eight layers of eight 1 TiB experts each, with a
     /// reserve of `u64::MAX − 5 W` beside them (`W`, a layer's bytes: 8
     /// experts): the host's need is `u64::MAX + 3 W` and a bit, past u64
     /// bytes, while the split's floor `base + 3 W` is `u64::MAX − 2 W`, under

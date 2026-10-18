@@ -20,7 +20,9 @@
 //! with the named `F32Product` fault and NaN in the latent half of every
 //! output, never zeros; then what only the fused append names: a rope tail
 //! pair past f32 (`F32Product`), and a finite value past f16 in the tail or
-//! under a large latent gain (`CacheValue`), each written as computed.
+//! under a large latent gain (`CacheValue`), each written as computed, and a
+//! tail pair with both (one output past f32, the other finite past f16) that
+//! names both sites.
 //! Printed, never asserted: `ik_rel` of
 //! y against dump `l_out-0`'s last column and of h against `ffn_up_gate-0`'s
 //! (the block-layer bands are pinned by the lead from these numbers, not
@@ -36,7 +38,7 @@ use bloomery_gpu_gates::{
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
 #[cfg(feature = "gpu")]
-use gguf::quant::GgmlType;
+use gguf::quant::{GgmlType, half_to_f32};
 
 /// A fault as a gate line prints it: its text, or `none`.
 #[cfg(feature = "gpu")]
@@ -832,7 +834,6 @@ fn run() -> Result<(), GateError> {
         // own, raised from a launch that was clean before.
         const TAIL_BIG: f32 = 3.0e38;
         const PAST_F16: f32 = 7.0e4;
-        let f16_class = |h: u16| (h & 0x7c00 == 0x7c00, h & 0x03ff != 0);
         let mut run_fused = |kv: &[f32],
                              gain: &[f32],
                              cs: &[f32]|
@@ -875,7 +876,7 @@ fn run() -> Result<(), GateError> {
             && !kv_s[latent].is_finite()
             && kv_s[..latent].iter().all(|v| v.is_finite())
             && kv_s[latent + 2..].iter().all(|v| v.is_finite())
-            && f16_class(row[0]) == (true, false);
+            && half_to_f32(row[0]).is_infinite();
         println!(
             "key tail overflow x0={TAIL_BIG:e} x1=-{TAIL_BIG:e} (c, s) = (1, 1): fault=\"{}\" \
              want=\"{}\" y0_not_finite={} rest_finite={} y0_f16_inf={} {}",
@@ -884,7 +885,7 @@ fn run() -> Result<(), GateError> {
             !kv_s[latent].is_finite(),
             kv_s[..latent].iter().all(|v| v.is_finite())
                 && kv_s[latent + 2..].iter().all(|v| v.is_finite()),
-            f16_class(row[0]) == (true, false),
+            half_to_f32(row[0]).is_infinite(),
             verdict(tail_pass)
         );
         if !tail_pass {
@@ -900,16 +901,49 @@ fn run() -> Result<(), GateError> {
         let (word, kv_s, row) = run_fused(&kv_f16, &kv_gain, &cs_identity)?;
         let want_cache = Some(Fault::at(LAYER_NONE, FaultSite::CacheValue));
         let f32_finite = kv_s.iter().all(|v| v.is_finite());
-        let tail_f16_pass = word == want_cache && f32_finite && f16_class(row[0]) == (true, false);
+        let tail_f16_pass = word == want_cache && f32_finite && half_to_f32(row[0]).is_infinite();
         println!(
             "key tail past f16 x0={PAST_F16:e}: fault=\"{}\" want=\"{}\" kv_s_finite={f32_finite} \
              y0_f16_inf={} {}",
             shown(word),
             shown(want_cache),
-            f16_class(row[0]) == (true, false),
+            half_to_f32(row[0]).is_infinite(),
             verdict(tail_f16_pass)
         );
         if !tail_f16_pass {
+            ok = false;
+        }
+
+        // One pair that is both: x0 = 3e38 and x1 = −2.9e38 under (c, s) =
+        // (1/√2, 1/√2) give y0 = x0·c − x1·s past f32 and y1 = x0·s + x1·c
+        // finite in f32 (7e36) and past f16, so the word names both sites.
+        let mut kv_mixed = kv_a.clone();
+        kv_mixed[latent] = TAIL_BIG;
+        kv_mixed[latent + 1] = -2.9e38;
+        let cs_diagonal = vec![std::f32::consts::FRAC_1_SQRT_2; rope];
+        let (word, kv_s, row) = run_fused(&kv_mixed, &kv_gain, &cs_diagonal)?;
+        let want_both = Some(Fault::of_sites(
+            LAYER_NONE,
+            &[FaultSite::F32Product, FaultSite::CacheValue],
+        ));
+        let mixed_pass = word == want_both
+            && !kv_s[latent].is_finite()
+            && kv_s[latent + 1].is_finite()
+            && kv_s[latent + 1] > PAST_F16
+            && kv_s[..latent].iter().all(|v| v.is_finite())
+            && kv_s[latent + 2..].iter().all(|v| v.is_finite())
+            && half_to_f32(row[0]).is_infinite()
+            && half_to_f32(row[1]).is_infinite();
+        println!(
+            "key tail mixed pair x0={TAIL_BIG:e} x1=-2.9e38 (c, s) = (1/sqrt2, 1/sqrt2): \
+             fault=\"{}\" want=\"{}\" y0_not_finite={} y1_finite_past_f16={} {}",
+            shown(word),
+            shown(want_both),
+            !kv_s[latent].is_finite(),
+            kv_s[latent + 1].is_finite() && kv_s[latent + 1] > PAST_F16,
+            verdict(mixed_pass)
+        );
+        if !mixed_pass {
             ok = false;
         }
 
@@ -920,12 +954,9 @@ fn run() -> Result<(), GateError> {
         let f32_finite = kv_s.iter().all(|v| v.is_finite());
         let infs = row[rope..width]
             .iter()
-            .filter(|&&h| f16_class(h) == (true, false))
+            .filter(|&&h| half_to_f32(h).is_infinite())
             .count();
-        let nans = row
-            .iter()
-            .filter(|&&h| f16_class(h) == (true, true))
-            .count();
+        let nans = row.iter().filter(|&&h| half_to_f32(h).is_nan()).count();
         let latent_pass = word == want_cache && f32_finite && infs > 0 && nans == 0;
         println!(
             "key latent past f16 gain=1e6: fault=\"{}\" want=\"{}\" kv_s_finite={f32_finite} \

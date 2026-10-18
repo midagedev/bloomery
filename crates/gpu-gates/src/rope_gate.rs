@@ -147,7 +147,7 @@ pub fn check<const H: usize, const R: usize, const Q: usize>(
 /// kernel raises the named `F32Product` fault, that head's outputs and its
 /// key row in the cache plane are NaN (never the zeros an infinite sum scales
 /// it to), and every other head, token and plane word is the clean run's.
-pub fn check_overflow<const H: usize, const R: usize, const Q: usize>(
+pub fn check_overflow<const H: usize>(
     gpu: &Gpu,
     inp: &RopeIn,
     pos: &[u32],
@@ -166,11 +166,12 @@ pub fn check_overflow<const H: usize, const R: usize, const Q: usize>(
     let r = run_at(&big, pos, gpu.layer_sink(layer)?)?;
     let word = gpu.take_fault()?;
     let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::F32Product));
-    let f16_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
     let heads_nan = r.q[..H].iter().all(|v| v.is_nan()) && r.k[..H].iter().all(|v| v.is_nan());
     let others = bits_equal(&r.q[H..], &clean.q[H..]) && bits_equal(&r.k[H..], &clean.k[H..]);
     let row = pos[0] as usize * H;
-    let key_row_nan = r.ck[row..row + H].iter().all(|&h| f16_nan(h));
+    let key_row_nan = r.ck[row..row + H]
+        .iter()
+        .all(|&h| gguf::quant::half_to_f32(h).is_nan());
     let mut ck_want = clean.ck.clone();
     ck_want[row..row + H].copy_from_slice(&r.ck[row..row + H]);
     let planes = r.ck == ck_want && r.cv == clean.cv;

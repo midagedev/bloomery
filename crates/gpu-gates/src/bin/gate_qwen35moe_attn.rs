@@ -119,8 +119,8 @@
 //!     first dropped pool), 4,097 and 8,193 and on the eight rows of a verify
 //!     at 8,186..=8,193; a tie of +0 scores across the cut, the lowest pools
 //!     taken; counts 0 and past the cache an empty list;
-//!     a NaN query raising `pool_select` with a defined list; nine rows
-//!     refused by name. The rule is the modeling code's (exllamav3
+//!     a NaN query, and a finite one whose square passes f32, raising
+//!     `pool_select` with a defined list; nine rows refused by name. The rule is the modeling code's (exllamav3
 //!     `qsa_indexer.py`, transformers): exactly 512 pools and the tail. ik and
 //!     mainline cut 2,051 cells instead, so past position 2,050, when `(p + 1)
 //!     % 4 != 3`, they also take `3 − t` cells of the 513th pool in ggml's tie
@@ -493,14 +493,10 @@ mod gate {
             rope_gate::check::<HEAD, ROT, { 2 * HEAD }>(gpu, &inp, &pos, shape, LAYER, |p, f| {
                 rope_run(kern, gpu.stream(), &inp, p, f)
             })?;
-        let overflow = rope_gate::check_overflow::<HEAD, ROT, { 2 * HEAD }>(
-            gpu,
-            &inp,
-            &pos,
-            shape,
-            LAYER,
-            |i, p, f| rope_run(kern, gpu.stream(), i, p, f),
-        )?;
+        let overflow =
+            rope_gate::check_overflow::<HEAD>(gpu, &inp, &pos, shape, LAYER, |i, p, f| {
+                rope_run(kern, gpu.stream(), i, p, f)
+            })?;
         Ok(exact && overflow)
     }
 
@@ -3099,39 +3095,42 @@ mod gate {
         );
         ok &= refused_ok;
 
-        // A NaN in row 1's head 2: the fault, a defined list for that row,
-        // row 0's the clean list.
+        // A NaN in row 1's head 2, and a finite 1e20 there whose square is
+        // past f32 (the head's norm has no scale): the fault, a defined list
+        // for that row, row 0's the clean list.
         let counts = [4097usize, SEL_N];
         let cu = to_u32(&counts)?;
         let q = idx_queries(2, 541);
         let clean = run_select(qk, stream, unl, &idx, &pooled, &q, &cu, &mut scratch)?;
-        let mut qn = q.clone();
-        qn[(IDX_HEADS + 2) * IDX_DIM + 40] = f32::NAN;
-        let before = gpu.fault()?;
-        let s = run_select(
-            qk,
-            stream,
-            gpu.layer_sink(LAYER)?,
-            &idx,
-            &pooled,
-            &qn,
-            &cu,
-            &mut scratch,
-        )?;
-        let raised = gpu.take_fault()?;
-        let want = Some(Fault::at(u32::try_from(LAYER)?, FaultSite::PoolSelect));
-        let row1 = row_list(&s, 1);
-        let defined = s.n_sel[1] as usize == qsa_shape().list_len(SEL_N)
-            && row1.windows(2).all(|w| w[0] < w[1])
-            && row1.iter().all(|&v| (v as usize) < SEL_N);
-        let row0 = row_list(&s, 0) == row_list(&clean, 0);
-        let nan_ok = before.is_none() && raised == want && defined && row0;
-        println!(
-            "qsa select fault: NaN in row 1's head 2, layer {LAYER}: word {raised:?} (want \
-             {want:?}), row 1's list defined {defined}, row 0 its clean list {row0} {}",
-            verdict(nan_ok)
-        );
-        ok &= nan_ok;
+        for (what, bad) in [("NaN", f32::NAN), ("1e20", 1.0e20)] {
+            let mut qn = q.clone();
+            qn[(IDX_HEADS + 2) * IDX_DIM + 40] = bad;
+            let before = gpu.fault()?;
+            let s = run_select(
+                qk,
+                stream,
+                gpu.layer_sink(LAYER)?,
+                &idx,
+                &pooled,
+                &qn,
+                &cu,
+                &mut scratch,
+            )?;
+            let raised = gpu.take_fault()?;
+            let want = Some(Fault::at(u32::try_from(LAYER)?, FaultSite::PoolSelect));
+            let row1 = row_list(&s, 1);
+            let defined = s.n_sel[1] as usize == qsa_shape().list_len(SEL_N)
+                && row1.windows(2).all(|w| w[0] < w[1])
+                && row1.iter().all(|&v| (v as usize) < SEL_N);
+            let row0 = row_list(&s, 0) == row_list(&clean, 0);
+            let fault_ok = before.is_none() && raised == want && defined && row0;
+            println!(
+                "qsa select fault: {what} in row 1's head 2, layer {LAYER}: word {raised:?} (want \
+                 {want:?}), row 1's list defined {defined}, row 0 its clean list {row0} {}",
+                verdict(fault_ok)
+            );
+            ok &= fault_ok;
+        }
 
         // Nine rows are past the scratch: refused by name.
         let q9 = idx_queries(9, 551);

@@ -672,7 +672,6 @@ mod gate {
             layer,
             &[FaultSite::F32Product, FaultSite::KvQuant],
         ));
-        let f16_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
         let row = rows.pos[0] as usize;
         let heads = |q: &[f32], kk: &[f32]| {
             q[..HEAD].iter().all(|v| v.is_nan()) && kk[..HEAD].iter().all(|v| v.is_nan())
@@ -687,7 +686,7 @@ mod gate {
             .copy_from_slice(&f16.cache_k[row * HEAD..(row + 1) * HEAD]);
         let f16_planes = f16.cache_k[row * HEAD..(row + 1) * HEAD]
             .iter()
-            .all(|&h| f16_nan(h))
+            .all(|&h| h != SENTINEL && gguf::quant::half_to_f32(h).is_nan())
             && f16.cache_k == ck_want
             && f16.cache_v == clean.cache_v;
         // The q8_0 planes: every block of that key row has a NaN scale and
