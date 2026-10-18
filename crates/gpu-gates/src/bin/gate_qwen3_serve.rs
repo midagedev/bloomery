@@ -462,6 +462,7 @@ mod gate {
     use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
     use bloomery_gpu_gates::{GateError, checks_failed, sha256};
     use gguf::{Gguf, Split};
+    use model::arch::qwen35moe::hparams::{Hparams, Kind};
     use model::placement::WholeLoad;
     use model::placement::workstation::{A6000, DeviceInfo, GRANULE, RTX_3090};
     use refset::arch::qwen35moe::vis::{self, CHATIDS, DECODE};
@@ -1386,7 +1387,9 @@ mod gate {
     /// allocator's shared granules are counted in: f16's `k` and `v` a
     /// plain-attention layer, a qwen35moe file's recurrent layers' `state`
     /// and `ring` (`LinearShape`'s lengths, one lane as `Body35` allocates
-    /// them), which no context moves.
+    /// them), which no context moves. A qwen35moe file's layers are the
+    /// reader's trunk (`Hparams::kinds`): a next-token layer past the trunk
+    /// holds no sequence plane.
     fn cache_planes(model: &Path, split: &Split, ctx: u64) -> Result<Vec<u64>, GateError> {
         let num = |key: &str| -> Result<u64, GateError> {
             split
@@ -1417,24 +1420,18 @@ mod gate {
                     // file's delta layers are the tiled ones.
                     map: KHeadMap::Tiled,
                 };
-                for l in 0..layers {
-                    // The layout's own rule (`hparams::kinds`): a layer with
-                    // the fused `attn_qkv` tensor is a delta layer, one with
-                    // `attn_q` a plain attention layer.
-                    let qkv = format!("blk.{l}.attn_qkv.weight");
-                    let q = format!("blk.{l}.attn_q.weight");
-                    if split.find(&qkv).is_some() {
-                        planes.push(4 * shape.state_len() as u64);
-                        planes.push(4 * shape.ring_len() as u64);
-                    } else if split.find(&q).is_some() {
-                        planes.push(plane);
-                        planes.push(plane);
-                    } else {
-                        return Err(format!(
-                            "{}: layer {l} holds neither attn_qkv.weight nor attn_q.weight",
-                            model.display()
-                        )
-                        .into());
+                let trunk =
+                    Hparams::read(split).map_err(|e| format!("{}: {e}", model.display()))?;
+                for kind in &trunk.kinds {
+                    match kind {
+                        Kind::DeltaRule => {
+                            planes.push(4 * shape.state_len() as u64);
+                            planes.push(4 * shape.ring_len() as u64);
+                        }
+                        Kind::Attention => {
+                            planes.push(plane);
+                            planes.push(plane);
+                        }
                     }
                 }
             }
