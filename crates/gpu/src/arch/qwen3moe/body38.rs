@@ -77,6 +77,19 @@
 //! a pass or a verify is refused by name while a verify waits for its
 //! commit.
 //!
+//! A load made a media load ([`GpuModel::enable_media`], once after the open)
+//! takes image rows ([`MediaBody`]): an image's M-RoPE positions shift the
+//! rows of its sequence, so each sequence holds a rotation table of its own
+//! ([`SeqRope`]), made before any graph is captured and exchanged with the
+//! sequence; every rope launch of the step, the passes, the verify and the
+//! ubatch walk — the selecting layers' keys, selection and q/k — reads the
+//! table of the sequence it runs, a pass of several slots each slot's own. A
+//! media call is eager and runs every unit as a ubatch ([`Prompt38::Gemm`]):
+//! each unit's first layer copies the rows of the spans inside it over the
+//! embeddings of their positions (`image::MediaRows`), and the PLE hash takes
+//! the image placeholder inside a span only. A load that carries the MTP
+//! draft is refused by name.
+//!
 //! The PLE rows are the host's: each position's n-gram hash
 //! (`engram::Hash::ple_rows_into`) names 16 rows of the IQ4_NL table, which
 //! stays in the file; they are decoded (`gguf::quant::dequant_row`) into the
@@ -97,6 +110,9 @@
 //! name until `reset`: a delta layer keeps no earlier state to cut back to.
 
 use super::card38::{Card38, MapCheck, Walk38};
+use super::image::{
+    MediaCarrier, MediaRows, imrope_sections, media_call, section_order, window_spans,
+};
 use super::mtp38::{
     DraftRows38, DraftSeq38, Held38, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode,
     MtpTaps, Target38, TargetRows,
@@ -135,6 +151,9 @@ use crate::host::tier::TierOpen;
 use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
+use crate::media::{
+    ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_outside_images, rope_table,
+};
 use crate::model::{
     ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRows, Slots,
 };
@@ -159,6 +178,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
+use vision::mrope::MropeSeq;
 
 const WHAT: &str = "qwen4exp Body38";
 
@@ -252,6 +272,8 @@ pub struct Slot38 {
     rows_step: DeviceBuffer<f32>,
     rows_pass: DeviceBuffer<f32>,
     draft: Option<DraftSeq38>,
+    /// The sequence's rotation table on a media load ([`Body38::seq_rope`]).
+    rope: Option<SeqRope>,
 }
 
 /// The host bytes a sequence state of `positions` positions holds on a load
@@ -626,6 +648,20 @@ impl PleHost {
     /// the vocabulary), a position other than the history's next, or a row
     /// past the table is refused by name.
     fn fill(&mut self, pos: u32, tokens: &[u32]) -> Result<History, GpuError> {
+        self.fill_spanned(pos, tokens, &[])
+    }
+
+    /// [`PleHost::fill`] for a unit that holds image positions: `spans` are
+    /// the unit's image spans as row ranges of `tokens`
+    /// ([`Hash::ple_rows_media`]), inside which the image placeholder
+    /// hashes like any id and the history takes it; outside them it is
+    /// refused as in `fill`.
+    fn fill_spanned(
+        &mut self,
+        pos: u32,
+        tokens: &[u32],
+        spans: &[Range<usize>],
+    ) -> Result<History, GpuError> {
         let n = tokens.len();
         let per_token = geo::HIDDEN / self.width;
         let ids = self
@@ -635,7 +671,7 @@ impl PleHost {
         let mut hist = self.hist.clone();
         self.named = 0;
         self.hash
-            .ple_rows_into(&mut hist, u64::from(pos), tokens, ids)
+            .ple_rows_media(&mut hist, u64::from(pos), tokens, spans, ids)
             .map_err(|e| GpuError::shape(WHAT, format!("PLE rows at position {pos}: {e}")))?;
         self.named = ids.len();
         if let Some(&r) = ids.iter().find(|&&r| r as usize >= self.rows) {
@@ -682,8 +718,16 @@ impl PleHost {
     /// the next ubatch's ([`PleRead::read`]). On the host nothing is read
     /// ahead: the fills decode pages the load populated. A call whose rows
     /// the hash refuses reads nothing ahead, and its first fill refuses it
-    /// by name.
-    fn prompt_start(&mut self, pos: u32, tokens: &[u32], rows: usize) -> Result<(), GpuError> {
+    /// by name. `spans` are the call's image spans as position ranges
+    /// ([`MediaRows::positions`]); each ubatch hashes its own part of them
+    /// ([`window_spans`]) as its fill will.
+    fn prompt_start(
+        &mut self,
+        pos: u32,
+        tokens: &[u32],
+        rows: usize,
+        spans: &[Range<usize>],
+    ) -> Result<(), GpuError> {
         let Some(read) = &mut self.nvme else {
             return Ok(());
         };
@@ -697,9 +741,16 @@ impl PleHost {
                 break;
             };
             let mut ids = vec![0u32; m * per_token];
+            let unit = window_spans(spans.iter().cloned(), &(p as usize..p as usize + m));
             if self
                 .hash
-                .ple_rows_into(&mut hist, u64::from(p), &tokens[at..at + m], &mut ids)
+                .ple_rows_media(
+                    &mut hist,
+                    u64::from(p),
+                    &tokens[at..at + m],
+                    &unit,
+                    &mut ids,
+                )
                 .is_err()
             {
                 read.ahead.clear();
@@ -745,16 +796,22 @@ impl PleHost {
 }
 
 /// Refused by name, `what` the caller: the first of `tokens` the raw-id PLE
-/// hash of `window` does not take (the image placeholder, an id past the
+/// hash of `window` does not take (the image placeholder outside `spans`,
+/// the call's image spans as row ranges of `tokens`, an id past the
 /// vocabulary), with its index in the call, or a hash that is not raw-id.
-/// The hash's own test ([`engram::hash::EosWindow::check`]), so a call's
+/// The hash's own test ([`engram::hash::EosWindow::check_at`]), so a call's
 /// check before its first launch and each fill refuse the same ids.
-fn ple_takes(what: &'static str, window: &Window, tokens: &[u32]) -> Result<(), GpuError> {
+fn ple_takes(
+    what: &'static str,
+    window: &Window,
+    tokens: &[u32],
+    spans: &[Range<usize>],
+) -> Result<(), GpuError> {
     let Window::Eos(w) = window else {
         return Err(GpuError::state(what, "a raw-id PLE hash"));
     };
     for (i, &t) in tokens.iter().enumerate() {
-        w.check(t)
+        w.check_at(t, spans.iter().any(|s| s.contains(&i)))
             .map_err(|e| GpuError::shape(what, format!("token {i}: {e}")))?;
     }
     Ok(())
@@ -960,6 +1017,20 @@ pub struct Body38 {
     ple_ring: DeviceBuffer<f32>,
     ple: PleHost,
     rope: RopeRows,
+    /// The live sequence's rotation table on a media load: the rope launches
+    /// of the sequence read it in place of `rope` ([`rope_table`]). `None`
+    /// on a text load ([`GpuModel::enable_media`]).
+    seq_rope: Option<SeqRope>,
+    /// What a media load makes each further sequence's table from
+    /// ([`Slots::new_seq`]); `None` on a text load.
+    rope_base: Option<RopeBase>,
+    /// The media call's rows on their way into the ubatch walk's first layer;
+    /// `Some` exactly when `seq_rope` is.
+    media: Option<MediaRows>,
+    /// The file's IMROPE sections and `rope.section_order`, read at load:
+    /// `None` when no attention layer rotates by sections, which a media
+    /// load refuses by name.
+    imrope: Option<([u32; 4], vision::mrope::SectionOrder)>,
     /// The step's one-row arena and record; an eager pass's arena, record
     /// and host sums.
     s: Arena38,
@@ -1650,6 +1721,10 @@ impl Body38 {
             ple_ring,
             ple,
             rope,
+            seq_rope: None,
+            rope_base: None,
+            media: None,
+            imrope: imrope_sections(spec).map(|s| (s, section_order(hp.rope_order))),
             s,
             sp,
             a,
@@ -2260,7 +2335,9 @@ impl Body38 {
     /// empty model at 0, or the nearest point at or below `n`, nothing
     /// (`Missed`) when none lies there — a delta layer keeps no earlier state
     /// but a copy. After a call failed past its launch the stores hold more
-    /// than `pos`, which is no longer kept. Never past `pos`. The rule
+    /// than `pos`, which is no longer kept. On a media load a point inside an
+    /// image grants nothing: the cut is asked again at the image's start.
+    /// Never past `pos`. The rule
     /// [`Body38::commit`] takes.
     #[must_use]
     pub fn kept(&self, n: u32, pos: u32) -> Kept {
@@ -2280,11 +2357,13 @@ impl Body38 {
                 why,
             };
         }
-        if self.held == pos {
-            self.ckpt.kept(n, pos)
-        } else {
-            self.ckpt.kept(n.min(pos), self.held)
-        }
+        kept_outside_images(self.seq_rope.as_ref(), n, |n| {
+            if self.held == pos {
+                self.ckpt.kept(n, pos)
+            } else {
+                self.ckpt.kept(n.min(pos), self.held)
+            }
+        })
     }
 
     /// The checkpoints: their positions, their slots, what they have done.
@@ -3066,6 +3145,7 @@ impl Body38 {
             stores,
             ple_ring,
             rope,
+            seq_rope,
             a,
             pass_hsum,
             k,
@@ -3083,7 +3163,7 @@ impl Body38 {
                     w,
                     k,
                     eps: *eps,
-                    table: &rope.table,
+                    table: rope_table(rope, seq_rope.as_ref()),
                     ctx: *ctx,
                 },
                 plans,
@@ -3161,7 +3241,9 @@ impl Body38 {
         }
         self.check_next(pos, n)?;
         self.settle(stream)?;
-        let hist = self.ple.fill(pos, tokens)?;
+        let unit = pos as usize..pos as usize + n;
+        let spans = window_spans(self.media.iter().flat_map(MediaRows::positions), &unit);
+        let hist = self.ple.fill_spanned(pos, tokens, &spans)?;
         self.last_walk = TargetRows::Ubatch;
         self.wr.write(stream, tokens, pos)?;
         // SAFETY: the ubatch arena holds `wide.rows · HIDDEN` values of `e`
@@ -3202,11 +3284,13 @@ impl Body38 {
             stores,
             ple_ring,
             rope,
+            seq_rope,
             wa,
             wide_hsum,
             wide,
             wide_timing,
             stream,
+            media,
             k,
             slots,
             card,
@@ -3223,7 +3307,7 @@ impl Body38 {
                     w,
                     k,
                     eps: *eps,
-                    table: &rope.table,
+                    table: rope_table(rope, seq_rope.as_ref()),
                     ctx: *ctx,
                 },
                 plans,
@@ -3240,6 +3324,7 @@ impl Body38 {
                 dense,
                 cur: 0,
                 stream,
+                media: media.as_mut(),
             },
         };
         let cap = prog.p.x.rows;
@@ -3476,15 +3561,52 @@ impl GpuModel<Body38> {
         path: Prompt38,
         sink: Option<&mut Prompt38Sink<'_>>,
     ) -> Result<u32, GpuError> {
+        let resolved = self.prompt38_checked(tokens, path)?;
+        // The steps feed is no pass of its own: each id is a step with its
+        // boundary and its kept row, so none is opened around them.
+        let one_pass = resolved != Prompt38::Step;
+        if one_pass {
+            self.pass_boundary()?;
+        }
+        let fed = self.prompt38_fed(tokens, resolved, sink);
+        let kept = match one_pass {
+            true => self.keep_rows(KeptRows::prefix(0), PassKind::Prompt),
+            false => Ok(()),
+        };
+        // The call's own error first: a keep refused after a failed call is
+        // its echo.
+        let next = fed?;
+        kept?;
+        Ok(next)
+    }
+
+    /// [`GpuModel::prompt38_with`] on [`Prompt38::Gemm`] inside the
+    /// residency pass its caller opened and keeps (`prompt_pass`: a media
+    /// call, which the session wraps as it wraps every body's prompt call):
+    /// the same checks and the same walk, with no boundary before it and no
+    /// kept count after it.
+    fn prompt38_in_pass(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
+        let resolved = self.prompt38_checked(tokens, Prompt38::Gemm)?;
+        self.prompt38_fed(tokens, resolved, None)
+    }
+
+    /// [`GpuModel::prompt38_with`]'s checks, all before any launch: the
+    /// model stays where it stood on a refusal. The path the call runs as.
+    fn prompt38_checked(&mut self, tokens: &[u32], path: Prompt38) -> Result<Prompt38, GpuError> {
         const WHAT_P: &str = "qwen4exp prompt";
         if tokens.is_empty() {
             return Err(GpuError::shape(WHAT_P, "empty token slice"));
         }
         self.refuse_if_poisoned(WHAT_P)?;
         let body = self.body(WHAT_P)?;
-        super::refuse_past_vocab(WHAT_P, tokens, body.vocab)?;
-        ple_takes(WHAT_P, body.ple.hash.window(), tokens)?;
         let (pos, ctx) = (self.pos() as usize, body.ctx());
+        body.refuse_inside_image(WHAT_P, self.pos())?;
+        super::refuse_past_vocab(WHAT_P, tokens, body.vocab)?;
+        let spans = window_spans(
+            body.media.iter().flat_map(MediaRows::positions),
+            &(pos..pos + tokens.len()),
+        );
+        ple_takes(WHAT_P, body.ple.hash.window(), tokens, &spans)?;
         if pos + tokens.len() > ctx {
             return Err(GpuError::shape(
                 WHAT_P,
@@ -3504,12 +3626,19 @@ impl GpuModel<Body38> {
                  path) or load with BLOOMERY_RESIDENCY=off",
             ));
         }
-        // The steps feed is no pass of its own: each id is a step with its
-        // boundary and its kept row, so none is opened around them.
-        let one_pass = resolved != Prompt38::Step;
-        if one_pass {
-            self.pass_boundary()?;
-        }
+        Ok(resolved)
+    }
+
+    /// The call's streaming and its units on the resolved `path`, after the
+    /// checks ([`GpuModel::prompt38_checked`]) and, for a path that is a
+    /// pass, the residency boundary: the argmax after the last id.
+    fn prompt38_fed(
+        &mut self,
+        tokens: &[u32],
+        resolved: Prompt38,
+        sink: Option<&mut Prompt38Sink<'_>>,
+    ) -> Result<u32, GpuError> {
+        const WHAT_P: &str = "qwen4exp prompt";
         // A successful call before a decode history ends with each layer
         // back at the set it started with: the decode has been routing
         // experts of its own, and the call's picks — the prompt's hottest —
@@ -3523,17 +3652,12 @@ impl GpuModel<Body38> {
         let r = self
             .stream_begin(resolved, tokens.len(), history)
             .and_then(|()| self.feed_marked(tokens, resolved, sink));
-        // The call's own error first: an end or a keep refused after a
-        // failed call is its echo. A failed call's streaming ends with each
-        // layer back at the set it started with too.
+        // The call's own error first: an end refused after a failed call is
+        // its echo. A failed call's streaming ends with each layer back at
+        // the set it started with too.
         let ended = self.stream_end(r.is_ok() && !history);
-        let kept = match one_pass {
-            true => self.keep_rows(KeptRows::prefix(0), PassKind::Prompt),
-            false => Ok(()),
-        };
         let next = r?;
         ended?;
-        kept?;
         Ok(next)
     }
 
@@ -3655,7 +3779,8 @@ impl GpuModel<Body38> {
                 let pos0 = self.pos();
                 {
                     let (_, _, body) = self.body_parts(WHAT_P)?;
-                    body.ple.prompt_start(pos0, tokens, rows)?;
+                    let spans: Vec<_> = body.media.iter().flat_map(MediaRows::positions).collect();
+                    body.ple.prompt_start(pos0, tokens, rows, &spans)?;
                 }
                 let (mut next, mut at) = (None, 0);
                 for m in ubatch_cut(tokens.len(), rows) {
@@ -4052,6 +4177,201 @@ impl GpuModel<Body38> {
     }
 }
 
+impl Body38 {
+    /// Whether the load takes media ([`GpuModel::enable_media`]): every
+    /// sequence holds a rotation table of its own.
+    #[must_use]
+    pub fn takes_media(&self) -> bool {
+        self.seq_rope.is_some()
+    }
+
+    /// Device bytes of the live sequence's rotation table; 0 on a text load.
+    #[must_use]
+    pub fn rope_bytes(&self) -> usize {
+        self.seq_rope.as_ref().map_or(0, |r| r.table().num_bytes())
+    }
+}
+
+impl MediaCarrier for Body38 {
+    const VIA: &'static str = "GpuModel::enable_media";
+
+    fn width(&self) -> usize {
+        geo::HIDDEN
+    }
+
+    fn seq_rope(&self) -> Option<&SeqRope> {
+        self.seq_rope.as_ref()
+    }
+
+    fn media_parts(&mut self) -> Option<(&mut SeqRope, &mut MediaRows)> {
+        self.seq_rope.as_mut().zip(self.media.as_mut())
+    }
+}
+
+impl GpuModel<Body38> {
+    /// Make the load a media load, once, after the open and before
+    /// [`GpuModel::add_slots`] and any capture: the live sequence and every
+    /// later slot hold a rotation table of their own, which an image's
+    /// positions rewrite ([`SeqRope`]), and the ubatch walk takes the rows
+    /// of a media call's spans in place of their positions' embeddings
+    /// ([`MediaBody::prefill_media`]). The tables start as the load's plain
+    /// one; a captured chain bakes the table's address, so the table is
+    /// made before the first capture. Refused by name: a second call, a
+    /// file with no attention layer rotating by IMROPE sections, a load
+    /// that carries the MTP draft (its walks read the load's plain table),
+    /// more than one slot, a captured chain, and a model that has run a
+    /// call.
+    pub fn enable_media(&mut self) -> Result<(), GpuError> {
+        const WHAT_E: &str = "qwen4exp enable_media";
+        let (slots, captured, pos) = (self.slots(), self.has_capture(), self.pos());
+        let (gpu, _, body) = self.body_parts(WHAT_E)?;
+        if body.seq_rope.is_some() {
+            return Err(GpuError::state(WHAT_E, "a load that takes no media yet"));
+        }
+        let Some((sections, order)) = body.imrope else {
+            return Err(GpuError::shape(
+                WHAT_E,
+                "a media load of a file with no IMROPE attention layer: an image's positions \
+                 have no sections to follow",
+            ));
+        };
+        if body.mtp.is_some() {
+            return Err(GpuError::shape(
+                WHAT_E,
+                "a media load that carries the MTP draft: the draft's walks read the load's plain \
+                 rotation table, which an image's positions shift",
+            ));
+        }
+        if slots != 1 {
+            return Err(GpuError::shape(
+                WHAT_E,
+                format!(
+                    "{slots} slots: every sequence's rotation table is made with its slot, so \
+                     media is enabled before GpuModel::add_slots"
+                ),
+            ));
+        }
+        if captured || pos != 0 || body.held != 0 {
+            return Err(GpuError::state(
+                WHAT_E,
+                "a model that has run no call and captured no chain: a captured chain bakes the \
+                 rotation table's address",
+            ));
+        }
+        let stream = gpu.stream();
+        let plain: Arc<[f32]> = body.rope.table.to_host_vec(stream)?.into();
+        let base = RopeBase::new(plain, sections, order);
+        body.seq_rope = Some(base.seq(stream, body.ctx)?);
+        body.rope_base = Some(base);
+        body.media = Some(MediaRows::new(stream, geo::HIDDEN)?);
+        Ok(())
+    }
+
+    /// The images the live sequence's rotation table holds, to keep beside a
+    /// save of the sequence's state; the empty record on a text load.
+    pub fn rope_saved(&self) -> Result<MropeSeq, GpuError> {
+        let body = self.body("qwen4exp rope_saved")?;
+        Ok(body
+            .seq_rope
+            .as_ref()
+            .map_or_else(MropeSeq::new, SeqRope::saved))
+    }
+
+    /// The rotation table the live sequence's rope launches read, `ctx` rows
+    /// of 64 values read back: a media load's own, else the load's. An
+    /// instrument; synchronizes.
+    pub fn rope_rows(&self) -> Result<Vec<f32>, GpuError> {
+        let body = self.body("qwen4exp rope_rows")?;
+        Ok(rope_table(&body.rope, body.seq_rope.as_ref()).to_host_vec(self.gpu().stream())?)
+    }
+
+    /// Keep (`on`) or stop keeping and drop what was kept of every unit's
+    /// rows as its first layer reads them: the embedding rows of the unit's
+    /// positions after a media call's rows replaced theirs, `(first
+    /// position, rows)` read back eagerly after each unit's copies, so the
+    /// unit's launches wait for the read. An instrument for gates; refused by
+    /// name on a text load.
+    pub fn set_media_tap(&mut self, on: bool) -> Result<(), GpuError> {
+        const WHAT_T: &str = "qwen4exp set_media_tap";
+        let (_, _, body) = self.body_parts(WHAT_T)?;
+        let rows = body.media.as_mut().ok_or(GpuError::state(
+            WHAT_T,
+            "a media load (GpuModel::enable_media)",
+        ))?;
+        rows.set_tap(on);
+        Ok(())
+    }
+
+    /// The rows the tap kept since the last call ([`GpuModel::set_media_tap`]),
+    /// in unit order, and the tap emptied.
+    pub fn take_media_tap(&mut self) -> Result<Vec<(usize, Vec<f32>)>, GpuError> {
+        const WHAT_T: &str = "qwen4exp take_media_tap";
+        let (_, _, body) = self.body_parts(WHAT_T)?;
+        body.media
+            .as_mut()
+            .and_then(MediaRows::take_tap)
+            .ok_or(GpuError::state(WHAT_T, "the tap armed on a media load"))
+    }
+
+    /// Take `seq` (from [`GpuModel::rope_saved`]) as the images of the live
+    /// sequence: the table's rows from the first image that differs are
+    /// rewritten. The record belongs to the state the sequence stands at, so
+    /// the caller restores it with that state. A record that holds an image
+    /// is refused by name on a text load, and one that reaches past the
+    /// cache by the table.
+    pub fn rope_restore(&mut self, seq: MropeSeq) -> Result<(), GpuError> {
+        const WHAT_S: &str = "qwen4exp rope_restore";
+        let (gpu, _, body) = self.body_parts(WHAT_S)?;
+        match body.seq_rope.as_mut() {
+            Some(rope) => rope.restore(gpu.stream(), seq),
+            None if seq.is_empty() => Ok(()),
+            None => Err(GpuError::shape(
+                WHAT_S,
+                "a record of images for a text load (GpuModel::enable_media): a text load's \
+                 sequence holds none",
+            )),
+        }
+    }
+}
+
+impl MediaBody for Body38 {
+    type Span<'a> = ImageSpan<'a>;
+
+    fn media_span<'s>(s: &'s ImageSpan<'_>) -> &'s MediaSpan<'s> {
+        &s.span
+    }
+
+    /// Image spans on a text load.
+    fn media_refusal(m: &GpuModel<Body38>, spans: usize) -> Option<String> {
+        let takes = m.body(WHAT).is_ok_and(Body38::takes_media);
+        (spans > 0 && !takes).then(|| {
+            format!(
+                "a prompt with {spans} image spans on a text load (GpuModel::enable_media makes \
+                 a media load)"
+            )
+        })
+    }
+
+    /// The ubatch walk of [`GpuModel::prompt38_with`] with the spans' rows in
+    /// place of their positions' embeddings and the sequence's rotation
+    /// table shifted by them, inside the residency pass the session opens
+    /// around a prompt call (`prompt_pass`). The argmax after the last id.
+    /// The hidden-tail call has no Body38 form and is refused by name.
+    fn prefill_media(
+        m: &mut GpuModel<Body38>,
+        ids: &[u32],
+        spans: &[ImageSpan<'_>],
+    ) -> Result<u32, GpuError> {
+        media_call(
+            m,
+            "qwen4exp prefill_media",
+            (ids, spans),
+            |_| Ok(()),
+            |m| m.prompt38_in_pass(ids),
+        )
+    }
+}
+
 impl ChainBody for Body38 {
     type Input = DecodeInput38;
     type Host = Body38;
@@ -4066,6 +4386,7 @@ impl ChainBody for Body38 {
     /// two replays of one capture), its PLE rows read from the file, staged
     /// for the refresh's launch.
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<DecodeInput38, GpuError> {
+        self.refuse_inside_image("qwen4exp step", pos)?;
         self.card_leg.refuse(Walk38::Step)?;
         self.check_next(pos, 1)?;
         let hist = self.ple.fill(pos, &[token])?;
@@ -4100,6 +4421,7 @@ impl ChainBody for Body38 {
             stores,
             ple_ring,
             rope,
+            seq_rope,
             s,
             k,
             slots,
@@ -4118,7 +4440,7 @@ impl ChainBody for Body38 {
                     w,
                     k,
                     eps: *eps,
-                    table: &rope.table,
+                    table: rope_table(rope, seq_rope.as_ref()),
                     ctx: *ctx,
                 },
                 plans,
@@ -4186,6 +4508,9 @@ impl ChainBody for Body38 {
         if let Some(d) = self.mtp.as_mut() {
             d.forget();
         }
+        if let Some(rope) = self.seq_rope.as_mut() {
+            rope.restore(stream, MropeSeq::new())?;
+        }
         self.wrote = Wrote38::default();
         self.held = 0;
         self.staged = None;
@@ -4213,6 +4538,7 @@ impl ChainBody for Body38 {
     fn resident_bytes(&self) -> usize {
         self.store_bytes()
             + self.rope.table.num_bytes()
+            + self.rope_bytes()
             + self.s.bytes()
             + self.sp.bytes()
             + self.a.bytes()
@@ -4299,6 +4625,11 @@ impl Slots for Body38 {
             None => None,
             Some(d) => Some(d.new_seq(stream)?),
         };
+        let rope = self
+            .rope_base
+            .as_ref()
+            .map(|b| b.seq(stream, self.ctx))
+            .transpose()?;
         let seq = Slot38 {
             stores,
             ple_ring: DeviceBuffer::zeroed(stream, ple::ring_len(geo::STREAMS))?,
@@ -4314,6 +4645,7 @@ impl Slots for Body38 {
             rows_step,
             rows_pass,
             draft,
+            rope,
         };
         // Last, so a sequence whose allocation failed is not counted.
         self.slots_made += 1;
@@ -4360,12 +4692,14 @@ impl Slots for Body38 {
     }
 
     /// Device bytes one sequence holds: its stores and PLE ring, its lane
-    /// word, its two arena-row buffers and the draft's store on a load with
-    /// one — the same terms [`seq38_bytes`] counts a host park's read of
-    /// them by.
+    /// word, its two arena-row buffers, the draft's store on a load with
+    /// one and its rotation table on a media load — the same terms
+    /// [`seq38_bytes`] counts a host park's read of them by, the table
+    /// aside (it is no part of a saved state).
     fn seq_bytes(&self) -> usize {
         let arenas = [&self.s, &self.a, &self.wa];
         self.stores.iter().map(Store38::bytes).sum::<usize>()
+            + self.rope_bytes()
             + self.ple_ring.num_bytes()
             + self.lane.bytes()
             + final_streams(&self.plans, arenas, TargetRows::Step).num_bytes()
@@ -4391,6 +4725,7 @@ impl Body38 {
         std::mem::swap(&mut self.ple.hist, &mut seq.ple_hist);
         std::mem::swap(&mut self.held, &mut seq.held);
         std::mem::swap(&mut self.wrote, &mut seq.wrote);
+        std::mem::swap(&mut self.seq_rope, &mut seq.rope);
         // The ubatch arena is the load's, not the sequence's: another
         // sequence's prompt call may have written it since this one's, so
         // the sequence brought live holds no position there. A draft parked
@@ -4463,6 +4798,7 @@ impl Body38 {
         pos: u32,
     ) -> Result<(), GpuError> {
         const WHAT_V: &str = "qwen4exp verify";
+        self.refuse_inside_image(WHAT_V, pos)?;
         self.card_leg.refuse(Walk38::Verify)?;
         let n = tokens.len();
         if !(2..=VERIFY_ROWS).contains(&n) {
@@ -4479,7 +4815,7 @@ impl Body38 {
         }
         self.check_next(pos, n)?;
         super::refuse_past_vocab(WHAT_V, tokens, self.vocab)?;
-        ple_takes(WHAT_V, self.ple.hash.window(), tokens)?;
+        ple_takes(WHAT_V, self.ple.hash.window(), tokens, &[])?;
         self.settle(stream)?;
         let hist = self.ple.fill(pos, tokens)?;
         self.last_walk = TargetRows::Pass;
@@ -4518,6 +4854,7 @@ impl Body38 {
             stores,
             ple_ring,
             rope,
+            seq_rope,
             a,
             k,
             slots,
@@ -4535,7 +4872,7 @@ impl Body38 {
                     w,
                     k,
                     eps: *eps,
-                    table: &rope.table,
+                    table: rope_table(rope, seq_rope.as_ref()),
                     ctx: *ctx,
                 },
                 plans,
@@ -4762,8 +5099,24 @@ impl Rollback for Body38 {
         ))
     }
 
+    /// The commit or the cut ([`Body38::commit`]) and, on a media load, the
+    /// rotation table's: the images from `pos` on go and the rows after
+    /// `pos` take the positions the kept images leave ([`SeqRope::cut`]). A
+    /// cut inside an image is refused by name before anything moves.
     fn rollback_on(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
-        self.commit(gpu, pos)
+        let row = pos as usize;
+        if let Some(rope) = &self.seq_rope {
+            rope.rows()
+                .seq()
+                .clone()
+                .cut(row)
+                .map_err(|e| GpuError::shape("qwen4exp commit", e.to_string()))?;
+        }
+        self.commit(gpu, pos)?;
+        if let Some(rope) = self.seq_rope.as_mut() {
+            rope.cut(gpu.stream(), row)?;
+        }
+        Ok(())
     }
 }
 
@@ -4856,9 +5209,11 @@ impl Body38 {
                 ),
             ));
         }
+        self.refuse_inside_image(WHAT_SLOTS, r.pos0)
+            .map_err(named)?;
         self.check_next(r.pos0, m).map_err(named)?;
         super::refuse_past_vocab(WHAT_SLOTS, tokens, self.vocab).map_err(named)?;
-        ple_takes(WHAT_SLOTS, self.ple.hash.window(), tokens).map_err(named)
+        ple_takes(WHAT_SLOTS, self.ple.hash.window(), tokens, &[]).map_err(named)
     }
 
     /// The live sequence's call as slot `r.slot` of a pass: its waiting cut
@@ -4917,6 +5272,7 @@ impl Body38 {
             ple_ring,
             lane,
             rope,
+            seq_rope,
             a,
             k,
             slots,
@@ -4936,12 +5292,17 @@ impl Body38 {
             .enumerate()
             .map(|(j, r)| ins.io(j, r))
             .collect::<Result<Vec<_>, GpuError>>()?;
-        let mut live = Some((stores.as_mut_slice(), ple_ring, &*lane));
+        let mut live = Some((
+            stores.as_mut_slice(),
+            ple_ring,
+            &*lane,
+            rope_table(rope, seq_rope.as_ref()),
+        ));
         let mut others = parked.iter_mut();
         let mut seqs = Vec::with_capacity(rows.len());
         let mut copies = Vec::new();
         for (r, rec) in rows.iter().zip(&recs) {
-            let (stores, ple_ring, lane) = if r.slot == 0 {
+            let (stores, ple_ring, lane, table) = if r.slot == 0 {
                 live.take().ok_or_else(|| slot_twice(r))?
             } else {
                 let Slot38 {
@@ -4949,13 +5310,19 @@ impl Body38 {
                     ple_ring,
                     lane,
                     rows_pass,
+                    rope: own,
                     ..
                 } = &mut **others.next().ok_or_else(|| no_parked(r))?;
                 copies.push(RowsCopy {
                     rows: r.rows.clone(),
                     to: rows_pass,
                 });
-                (stores.as_mut_slice(), ple_ring, &*lane)
+                (
+                    stores.as_mut_slice(),
+                    ple_ring,
+                    &*lane,
+                    rope_table(rope, own.as_ref()),
+                )
             };
             seqs.push(SlotSeq38 {
                 stores,
@@ -4965,6 +5332,7 @@ impl Body38 {
                     ..rec.io()
                 },
                 rows: r.rows.clone(),
+                table,
             });
         }
         let prog = Verify38 {
@@ -4974,7 +5342,7 @@ impl Body38 {
                     w,
                     k,
                     eps: *eps,
-                    table: &rope.table,
+                    table: rope_table(rope, seq_rope.as_ref()),
                     ctx: *ctx,
                 },
                 plans,
@@ -5222,9 +5590,10 @@ mod tests {
     }
 
     /// The call's check is the hash's: a text id passes; the image
-    /// placeholder and an id past the vocabulary are refused by name with
-    /// their index wherever they stand; a hash that is not raw-id is
-    /// refused.
+    /// placeholder outside the call's image spans and an id past the
+    /// vocabulary are refused by name with their index; the placeholder
+    /// passes inside a span, by its row in the call; a hash that is not
+    /// raw-id is refused.
     #[test]
     fn a_call_is_checked_by_the_hashs_own_test() {
         let w = Window::Eos(EosWindow {
@@ -5232,16 +5601,23 @@ mod tests {
             image: Some(9),
             n_vocab: 16,
         });
-        assert!(ple_takes("t", &w, &[0, 1, 15]).is_ok());
+        assert!(ple_takes("t", &w, &[0, 1, 15], &[]).is_ok());
         for (ids, at) in [([2, 3, 9], "token 2:"), ([15, 16, 2], "token 1:")] {
-            let e = ple_takes("t", &w, &ids).expect_err("the id is refused");
+            let e = ple_takes("t", &w, &ids, &[]).expect_err("the id is refused");
             assert!(e.to_string().contains(at), "{ids:?}: {e}");
         }
         let mapped = Window::Mapped {
             token_map: vec![0; 16],
             pad: 0,
         };
-        let e = ple_takes("t", &mapped, &[0]).expect_err("a mapped hash is refused");
+        let e = ple_takes("t", &mapped, &[0], &[]).expect_err("a mapped hash is refused");
         assert!(e.to_string().contains("a raw-id PLE hash"), "{e}");
+        let (both, first) = (1..3, 1..2);
+        let ids = [2, 9, 9, 3];
+        assert!(ple_takes("t", &w, &ids, std::slice::from_ref(&both)).is_ok());
+        let e = ple_takes("t", &w, &ids, std::slice::from_ref(&first)).expect_err("past the end");
+        assert!(e.to_string().contains("token 2:"), "{e}");
+        let e = ple_takes("t", &w, &[9, 2], std::slice::from_ref(&first)).expect_err("before it");
+        assert!(e.to_string().contains("token 0:"), "{e}");
     }
 }

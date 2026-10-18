@@ -30,10 +30,11 @@
 //! would need the state after a kept row, which no lane holds.
 
 use super::body::ATTN_SCALE_256;
-use super::body35::{Body35, Slot35, rope_table};
+use super::body35::{Body35, Slot35};
 use super::delta;
 use super::dispatch::{self, Ctx, PassCtx};
 use super::head_argmax::HeadArgmaxState;
+use super::image::MediaCarrier;
 use super::plan::LayerPlan;
 use super::plan::{DeltaPlan, GqaKind, GqaPlan, MixerPlan};
 use super::program::{self, Tail};
@@ -43,6 +44,7 @@ use crate::gated_quant::GateLayout;
 use crate::head::Head;
 use crate::hybrid::Chain;
 use crate::linear::{self, conv::ConvArgs, delta::DeltaArgs, norm_gate::NormGateArgs};
+use crate::media::rope_table;
 use crate::model::lookup::f32_gain;
 use crate::model::{MAX_PASS_ROWS, RowHeads, SlotRange, SlotRows};
 use crate::q38::OutGateArgs;
@@ -255,7 +257,7 @@ impl Body35 {
     /// Refused by name unless the live sequence takes `tokens` from `r.pos0`
     /// as slot `r.slot`'s rows of a pass: its stores stand there, the
     /// position is not inside an image its table holds
-    /// ([`Body35::refuse_inside_image`]), and every id is below the
+    /// ([`MediaCarrier::refuse_inside_image`]), and every id is below the
     /// vocabulary.
     fn check_slot(&self, r: &SlotRange, tokens: &[u32]) -> Result<(), GpuError> {
         let named = |e: GpuError| GpuError::shape(WHAT, format!("slot {}: {e}", r.slot));

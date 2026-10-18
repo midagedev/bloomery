@@ -15,13 +15,19 @@
 //! A media call's rows ride beside it ([`MediaRows`]): the rows of the call's
 //! spans, widened to f32 in pinned host memory once before its first unit,
 //! and per unit the runs of positions whose rows the unit's first layer
-//! copies over the embeddings it just wrote.
+//! copies over the embeddings it just wrote. The frame of such a call, one
+//! owner for the chain bodies that take media ([`MediaCarrier`]), is
+//! [`media_call`]: the spans checked, the rows staged and the sequence's
+//! rotation table shifted by the images before the body's own prompt walk
+//! runs, and taken back when it fails.
 
 use super::scratch::{IN_IDS, IN_POS0, Inbox, Io, LANE, param_view, put_input};
-use crate::media::ImageSpan;
+use crate::media::{ImageSpan, SeqRope, refuse_inside_image};
+use crate::model::{ChainBody, GpuModel};
 use crate::tensor::{Window, WindowMut};
 use crate::{GpuError, capturing};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
+use model::arch::models::{Mixer, ModelSpec, RopeMode};
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -226,6 +232,23 @@ fn runs_of<'a>(
     })
 }
 
+/// The parts of `spans` (the staged call's image spans as positions of the sequence, ascending
+/// and disjoint) inside the window of positions `window`, as row ranges of the window: what a
+/// unit's PLE rows are hashed with ([`engram::Hash::ple_rows_media`]). A span the window's
+/// boundary cuts gives each of its windows its own rows only; none inside is the plain unit.
+pub(super) fn window_spans(
+    spans: impl IntoIterator<Item = Range<usize>>,
+    window: &Range<usize>,
+) -> Vec<Range<usize>> {
+    spans
+        .into_iter()
+        .filter_map(|at| {
+            let (lo, hi) = (at.start.max(window.start), at.end.min(window.end));
+            (lo < hi).then(|| lo - window.start..hi - window.start)
+        })
+        .collect()
+}
+
 /// A media call's rows on their way into the unit arena (module doc). The
 /// staging buffer is pinned host memory, written once per call by
 /// [`MediaRows::begin`], every span's rows after the one before; each unit's
@@ -304,6 +327,11 @@ impl MediaRows {
         self.runs.clear();
     }
 
+    /// The staged call's spans as positions of the sequence, ascending; none outside a call.
+    pub(super) fn positions(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.spans.iter().map(|s| s.at.clone())
+    }
+
     /// The runs of a unit of the positions `unit`: each staged span's rows
     /// inside it, at their rows of the unit.
     pub(super) fn plan(&mut self, unit: Range<usize>) {
@@ -378,6 +406,130 @@ impl MediaRows {
     }
 }
 
+/// The IMROPE sections of the first attention layer of `spec` that rotates by them, `None` when
+/// no layer does: a file with no section split has no positions to shift an image by.
+pub(super) fn imrope_sections(spec: &ModelSpec) -> Option<[u32; 4]> {
+    spec.layers.iter().find_map(|s| match &s.mixer {
+        Mixer::Gqa(g) => match g.rope.mode {
+            RopeMode::Imrope { sections } => Some(sections),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// The order `order` (the file's `rope.section_order`) reads an image row's position slots in.
+pub(super) fn section_order(
+    order: model::arch::qwen35moe::hparams::SectionOrder,
+) -> vision::mrope::SectionOrder {
+    match order {
+        model::arch::qwen35moe::hparams::SectionOrder::Tyxz => vision::mrope::SectionOrder::Tyxz,
+        model::arch::qwen35moe::hparams::SectionOrder::Zyxt => vision::mrope::SectionOrder::Zyxt,
+    }
+}
+
+/// A chain body whose load can take media: the sequence's rotation table and the staging of a
+/// call's rows ([`media_call`]).
+pub(super) trait MediaCarrier: ChainBody {
+    /// What asks a load for media, in a refusal's words.
+    const VIA: &'static str;
+
+    /// Values of an embedding row: the width a span's rows must have.
+    fn width(&self) -> usize;
+
+    /// The live sequence's rotation table on a media load; `None` on a text load.
+    fn seq_rope(&self) -> Option<&SeqRope>;
+
+    /// The live sequence's rotation table and the staging of a call's rows; `None` on a text
+    /// load.
+    fn media_parts(&mut self) -> Option<(&mut SeqRope, &mut MediaRows)>;
+
+    /// [`refuse_inside_image`] over the live sequence's table.
+    fn refuse_inside_image(&self, what: &'static str, pos: u32) -> Result<(), GpuError> {
+        refuse_inside_image(self.seq_rope(), what, pos)
+    }
+}
+
+/// A media call of `spans` over `ids` (`call`) on `m`, as `run` feeds `ids` (the call is eager,
+/// every unit through the body's batch walk): the spans checked, `plan` asked whether the body
+/// can feed the call that way, the images' rows entered in the sequence's rotation table and
+/// their rows staged for the units, then `run`. No span is the plain call. A call that fails
+/// returns its own error, and takes back the images of the positions it did not feed: the model
+/// stands where its last unit left it, and the table holds the images that start before that
+/// position, so the next call reads the rows the cache holds. An image the fed positions cut
+/// cannot be taken back (a cut inside an image is refused) and stays whole in the table; a later
+/// call that starts inside it, a prompt or a step, is refused by name
+/// ([`MediaCarrier::refuse_inside_image`]), and a cut back or a reset takes it away. A take-back
+/// that fails on the card is named beside the call's error.
+pub(super) fn media_call<B: MediaCarrier, T>(
+    m: &mut GpuModel<B>,
+    what: &'static str,
+    (ids, spans): (&[u32], &[ImageSpan<'_>]),
+    plan: impl FnOnce(&GpuModel<B>) -> Result<(), GpuError>,
+    run: impl FnOnce(&mut GpuModel<B>) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    let pos = m.pos();
+    let first = pos as usize;
+    let width = m.body(what)?.width();
+    m.body(what)?.refuse_inside_image(what, pos)?;
+    ImageSpan::check(what, spans, ids.len(), width)?;
+    if spans.is_empty() {
+        return run(m);
+    }
+    {
+        let (gpu, _, body) = m.body_parts(what)?;
+        if body.seq_rope().is_none() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{} image spans on a load opened without media ({}): a text load's \
+                     sequences hold one rotation table",
+                    spans.len(),
+                    B::VIA
+                ),
+            ));
+        }
+        if capturing(gpu.stream())? {
+            return Err(GpuError::state(
+                what,
+                "an eager call: a captured unit would bake the staged rows' address",
+            ));
+        }
+    }
+    plan(m)?;
+    {
+        let (gpu, _, body) = m.body_parts(what)?;
+        let stream = gpu.stream();
+        let Some((rope, rows)) = body.media_parts() else {
+            return Err(GpuError::state(what, "the media load's table and staging"));
+        };
+        rows.begin(stream, first, spans)?;
+        if let Err(e) = rope.push_images(stream, first, spans) {
+            rows.end();
+            return Err(e);
+        }
+    }
+    let ran = run(m);
+    let stood = m.pos() as usize;
+    let (gpu, _, body) = m.body_parts(what)?;
+    let Some((rope, rows)) = body.media_parts() else {
+        return ran;
+    };
+    rows.end();
+    match ran {
+        Err(e) => match rope.cut(gpu.stream(), stood) {
+            // A cut inside an image is refused by the table and changes
+            // nothing: the call's own error stands.
+            Ok(()) | Err(GpuError::Shape { .. }) => Err(e),
+            Err(undo) => Err(GpuError::shape(
+                what,
+                format!("{e}; and the images past the fed positions were not taken back: {undo}"),
+            )),
+        },
+        ran => ran,
+    }
+}
+
 impl Drop for MediaRows {
     fn drop(&mut self) {
         // The pinned rows outlive any copy still reading them. A failure on
@@ -427,5 +579,33 @@ mod tests {
         assert!(runs(36..44).is_empty());
         // A unit that holds both spans' rows, in order.
         assert_eq!(runs(0..40), [(10, 20, 0), (34, 2, 80)]);
+    }
+
+    /// A unit's PLE spans are the staged spans cut to its window of positions, at the window's
+    /// own rows: a span cut by the window's end or start keeps its inside, two spans in one
+    /// window keep their order, and a window outside every span holds none.
+    #[test]
+    fn a_window_takes_the_part_of_each_span_inside_it() {
+        let spans = [10..30, 34..36];
+        let cut = |w: Range<usize>| -> Vec<(usize, usize)> {
+            window_spans(spans.iter().cloned(), &w)
+                .into_iter()
+                .map(|r| (r.start, r.end))
+                .collect()
+        };
+        // Ends inside the first span: its first 6 positions are rows 10..16.
+        assert_eq!(cut(0..16), [(10, 16)]);
+        // Starts inside it: the span's rest, from the window's row 0.
+        assert_eq!(cut(16..32), [(0, 14)]);
+        // Wholly inside the span.
+        assert_eq!(cut(12..14), [(0, 2)]);
+        // Both spans in one window, in order.
+        assert_eq!(cut(0..40), [(10, 30), (34, 36)]);
+        // Inside the second only.
+        assert_eq!(cut(32..40), [(2, 4)]);
+        // Outside both.
+        assert!(cut(30..34).is_empty());
+        assert!(cut(36..44).is_empty());
+        assert!(window_spans(std::iter::empty(), &(0..8)).is_empty());
     }
 }

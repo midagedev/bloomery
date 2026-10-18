@@ -400,13 +400,16 @@ pub(super) enum Seqs38<'a> {
 }
 
 /// One busy slot of a pass of several: its stores, its PLE ring, its input
-/// record (its first position, its ids and its lane word) and the rows of
-/// the pass it holds.
+/// record (its first position, its ids and its lane word), the rows of
+/// the pass it holds and the rotation table its rope launches read.
 pub(super) struct SlotSeq38<'a> {
     pub(super) stores: &'a mut [Store38],
     pub(super) ple_ring: &'a mut DeviceBuffer<f32>,
     pub(super) io: Io<'a>,
     pub(super) rows: Range<usize>,
+    /// The rotation table the slot's rope launches read: its own on a media
+    /// load, else the load's.
+    pub(super) table: &'a DeviceBuffer<f32>,
 }
 
 /// The launches one more sequence's rows add to a pass: its embedding,
@@ -1279,6 +1282,12 @@ fn qsa(
             } = &mut *s;
             for q in seqs {
                 let r = &q.rows;
+                // The slot's own rotation table: an image shifts one
+                // sequence's rows and no other's.
+                let c = &Ctx38 {
+                    table: q.table,
+                    ..*c
+                };
                 let (kv, raw, pooled) = qsa_of(q.stores, l)?;
                 let (pos, n_keys) = (rows_of(pos, r, 1)?, rows_of(n_keys, r, 1)?);
                 let keys = KeysIo {
