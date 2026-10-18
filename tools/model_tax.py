@@ -14,9 +14,11 @@ lower the entry in the same change.
 What is counted, per (file, family):
 
   file   crates/*/src/**/*.rs that is outside every model's own paths and outside the registry files.
-  line   a code line that matches the family's token (tools/model-tokens.tsv). Skipped: blank lines, comment lines,
-         string continuation lines (a doc string), every line from the first `#[cfg(test)]` of a file on, and every
-         line of a tests file (`tests.rs`, `*_tests.rs`, a `tests/` directory).
+  line   a code line that matches the family's token (tools/model-tokens.tsv), read after the Rust lexer
+         (tools/recipes.py rust_lex) has blanked every comment: a code line that starts with `*` counts, a comment
+         after code does not. Skipped: blank lines, string continuation lines (a doc string), every line from the
+         first `#[cfg(test)]` of a file on, and every line of a tests file (`tests.rs`, `*_tests.rs`, a `tests/`
+         directory).
   own    a path that matches any family's token, or starts with a family's extra own path. A model's own code may
          name its model. Another model's name inside it is rule 1 of tools/check-arch.sh.
   registry  a file in tools/model-registries.txt: a table keyed by a name (an arch string, a family, a projector, a
@@ -46,12 +48,12 @@ With `--base REV` it also holds the tables to what REV had, so a count cannot be
 tables are the argument, and an edit of them is what the check must not take on trust):
   - a row REV lacks must be a PIN, a baseline row never appears after REV, a PIN row REV had goes back to no baseline;
   - a baseline row keeps the baseline count it had at REV and does not rise above its count at REV;
-  - a PIN row that rises needs a PIN of another date or field than REV's row;
+  - a PIN row that rises needs a PIN of another date or field than REV's row (whitespace is no difference);
   - a family REV lacks joins with its date, and a family's `since` is not changed.
-A REV without tools/model-tax.tsv has nothing to compare (the table starts there). It also lists the registry files the
-tables gained since REV, because a file moved into the registries leaves the ratchet.
-A table that does not parse, a registry file that is not there, a source file it cannot read and a REV that is not a
-commit give no verdict (exit 2). It also prints, and never fails on: the registries' lines, per family the files outside its own paths and the
+A REV whose tree lacks tools/model-tax.tsv has nothing to compare (the table starts there). It also lists the registry
+files the tables gained since REV, because a file moved into the registries leaves the ratchet.
+A table that does not parse, a registry file that is not there, a source file it cannot read, a REV that is not a
+commit and a table REV's tree lists but git cannot read give no verdict (exit 2). It also prints, and never fails on: the registries' lines, per family the files outside its own paths and the
 registries that name it (the touch count), the gate bins per family, and the 8-line windows copied between families'
 own files (identifiers that name a model collapse to one word).
 
@@ -73,6 +75,9 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+from recipes import rust_lex  # noqa: E402  (the one Rust lexer: comments blanked, strings kept)
+
 TOKENS, REGISTRIES, TAX = "tools/model-tokens.tsv", "tools/model-registries.txt", "tools/model-tax.tsv"
 FATES = "APDSOTKR"
 WINDOW = 8
@@ -96,12 +101,14 @@ class Family:
         return bool(self.regex.search(path)) or any(path.startswith(p) for p in self.own)
 
 
-def read_text(root, rel):
+def read(root, rel):
     try:
         with open(os.path.join(root, rel), encoding="utf-8") as f:
             return f.read()
     except OSError as e:
         raise NoVerdict(f"{rel}: cannot read ({e.strerror})")
+    except UnicodeDecodeError:
+        raise NoVerdict(f"{rel}: cannot read (not UTF-8)")
 
 
 def parse_table(text, rel, cols):
@@ -118,7 +125,7 @@ def parse_table(text, rel, cols):
 
 
 def table(root, rel, cols):
-    return parse_table(read_text(root, rel), rel, cols)
+    return parse_table(read(root, rel), rel, cols)
 
 
 def load_tokens(root):
@@ -152,7 +159,7 @@ def load_tokens(root):
 
 
 def load_registries(root):
-    return load_registries_text(read_text(root, REGISTRIES))
+    return load_registries_text(read(root, REGISTRIES))
 
 
 def source_files(root):
@@ -177,26 +184,17 @@ def _walk_error(e):
     raise NoVerdict(f"{e.filename}: cannot list ({e.strerror})")
 
 
-def read(root, rel):
-    try:
-        with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except OSError as e:
-        raise NoVerdict(f"{rel}: cannot read ({e.strerror})")
-
-
 def classify(text, rel, union, quoted):
-    """The code lines of a file that match a token: (line number, class, stripped text). The class is test, doc,
-    dispatch, literal or ident; only the last three are code."""
+    """The code lines of a file that match a token: (line number, class, stripped text). The lexer blanks every comment
+    (line, block, doc), so a line that starts with `*` is code. The class is test, doc, dispatch, literal or ident; only
+    the last three are code."""
     out = []
     test_from = 0 if TESTS_FILE.search(rel) else None
-    for i, line in enumerate(text.split("\n"), 1):
+    for i, line in enumerate(rust_lex(text)[0].split("\n"), 1):
         s = line.strip()
         if test_from is None and s.startswith("#[cfg(test)]"):
             test_from = i
-        if not s or s.startswith("//") or s.startswith("*") or s.startswith("/*"):
-            continue
-        if not union.search(s):
+        if not s or not union.search(s):
             continue
         if test_from is not None and i >= test_from:
             cls = "test"
@@ -296,7 +294,7 @@ def model_dirs(root):
 
 
 def tax_rows(root):
-    return parse_tax(read_text(root, TAX), TAX)
+    return parse_tax(read(root, TAX), TAX)
 
 
 def parse_tax(text, rel):
@@ -351,7 +349,8 @@ def git(root, *args):
 
 
 def base_files(root, rev):
-    """The commit REV names and the text of the three tables at it (None for a table it lacks)."""
+    """The commit REV names and the text of the three tables at it. None is a table the commit's tree does not list; a
+    table it lists and git cannot read is no verdict."""
     if rev.startswith("-"):
         raise NoVerdict(f"--base {rev}: not a revision")
     p = git(root, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
@@ -361,7 +360,10 @@ def base_files(root, rev):
     sha = p.stdout.strip()
     texts = {}
     for rel in (TAX, TOKENS, REGISTRIES):
-        if git(root, "cat-file", "-e", f"{sha}:{rel}").returncode != 0:
+        q = git(root, "ls-tree", "--name-only", sha, "--", rel)
+        if q.returncode != 0:
+            raise NoVerdict(f"--base {rev}: cannot list {rel} at {sha[:9]} ({q.stderr.strip()})")
+        if not q.stdout.strip():
             texts[rel] = None
             continue
         q = git(root, "show", f"{sha}:{rel}")
@@ -396,7 +398,7 @@ def base_violations(rows, since, old_rows, old_since, rev):
             elif count > was_count:
                 bad.append(f"{where} is raised from {was_count} at {rev} to {count}: a count above {rev}'s is argued with "
                            f"PIN(YYYY-MM-DD) {family}: <the missing description field or program>")
-        elif count > was_count and why == was_why:
+        elif count > was_count and re.sub(r"\s+", "", why) == re.sub(r"\s+", "", was_why):
             bad.append(f"{where} is raised from {was_count} at {rev} to {count} under the same PIN: argue the rise with a "
                        "PIN of its own date or field")
     for name, joined in sorted(since.items()):
@@ -432,7 +434,7 @@ def against_base(root, rev, rows, families, out):
     for n, path, family, count, why in grown:
         print(f"check-model-tax:   {path} {family} {count}: {why}", file=out)
     if texts[REGISTRIES] is not None:
-        added = sorted(set(load_registries_text(read_text(root, REGISTRIES))) - set(load_registries_text(texts[REGISTRIES])))
+        added = sorted(set(load_registries_text(read(root, REGISTRIES))) - set(load_registries_text(texts[REGISTRIES])))
         if added:
             print(f"check-model-tax: registry files added since {rev}, their lines leave the ratchet: {' '.join(added)}", file=out)
     return bad
@@ -530,8 +532,8 @@ def copied_windows(scan, root):
     files = [r for r in source_files(root) + _tests_files(root) if own_family(scan, r)]
     for rel in sorted(set(files)):
         norm, in_test = [], False
-        for raw in read(root, rel).split("\n"):
-            s = raw.split("//")[0].strip()
+        for raw in rust_lex(read(root, rel))[0].split("\n"):
+            s = raw.strip()
             if s.startswith("#[cfg(test)]"):
                 in_test = True
             if in_test:
@@ -695,6 +697,18 @@ def self_test():
             "crates/gpu/src/other.rs": "// qwen here\n/// qwen doc\npub fn other() {}\n#[cfg(test)]\nmod t { fn qwen_t() {} }\n",
             "crates/gpu/src/tests.rs": "fn qwen_case() {}\n", "crates/gpu/src/b_tests.rs": "fn qwen_case() {}\n",
             "crates/gpu/tests/x.rs": "fn qwen_case() {}\n", "crates/gpu/src/tests/x.rs": "fn qwen_case() {}\n"}, 0)
+        other = "crates/gpu/src/other.rs"
+        for name, text, want in (
+            ("a block comment line with no star is not code", "/*\n qwen here\n*/\npub fn other() {}\n", 0),
+            ("a starred block comment line is not code", "/*\n * qwen here\n */\npub fn other() {}\n", 0),
+            ("a nested block comment is not code", "/* a /* b */\n qwen here\n*/\npub fn other() {}\n", 0),
+            ("a block comment after code is not code", "pub fn other() {} /* qwen */\n", 0),
+            ("a trailing line comment is not code", "pub fn other() {} // qwen\n", 0),
+            ("a double slash inside a string is code", 'pub fn other() { let u = "http://qwen/x"; }\n', 1),
+            ("a dereference assignment is code", "pub fn other(a: &mut Arch) {\n    *a = Arch::Qwen;\n}\n", 1),
+            ("a continued expression starting with a star is code", "pub fn other() -> u32 {\n    a\n        * qwen_scale\n}\n", 1),
+        ):
+            case("e: " + name, {other: text}, want, None if want == 0 else "other.rs: qwen has no row")
         case("f: a hit in a family's own path passes", {"crates/model/src/arch/qwen/mod.rs": "fn qwen_spec() { Arch::Qwen; }\n"}, 0)
         case("f: an extra own path passes", {"crates/glmdir/src/lib.rs": "fn x() { qwen_thing(); }\n"}, 0)
         case("g: a gpu-foo crate with no tokens row", {"crates/gpu-foo/src/lib.rs": "pub fn x() {}\n"}, 1,
@@ -745,6 +759,10 @@ def self_test():
             ("a baseline row gone", [], [row % (2, cut)], None),
             ("a PIN raised under the same PIN", [row % (3, "PIN(2026-10-18) qwen: a field")],
              [row % (2, "PIN(2026-10-18) qwen: a field")], "under the same PIN"),
+            ("a PIN raised with a space added to its why", [row % (3, "PIN(2026-10-18) qwen: a field ")],
+             [row % (2, "PIN(2026-10-18) qwen: a field")], "under the same PIN"),
+            ("a PIN raised with its spaces moved", [row % (3, "PIN(2026-10-18)  qwen:  a  field")],
+             [row % (2, "PIN(2026-10-18) qwen: a field")], "under the same PIN"),
             ("a PIN raised under a new date", [row % (3, "PIN(2026-10-19) qwen: a field")],
              [row % (2, "PIN(2026-10-18) qwen: a field")], None),
             ("a baseline row argued up by a PIN", [row % (6, "PIN(2026-10-18) qwen: a field")], [row % (2, cut)], None),
@@ -764,7 +782,7 @@ def self_test():
         # the same, against a revision of a repository
         def commit(d, msg):
             for a in (("init", "-q"), ("add", "-A"), ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
-                                                     "commit", "-q", "-m", msg)):
+                                                     "-c", "gc.auto=0", "-c", "maintenance.auto=false", "commit", "-q", "-m", msg)):
                 r = git(d, *a)
                 if r.returncode != 0:
                     fails.append(f"case base: git {' '.join(a)}: {r.stderr}")
@@ -809,6 +827,16 @@ def self_test():
         rc, out, err = run(g2, "HEAD")
         if rc != 0 or "has no tools/model-tax.tsv: the table starts here" not in out:
             fails.append(f"case base: a revision with no table has nothing to compare: {rc} {out}{err}")
+        # a table the base lists and git cannot read is no verdict, never "the table starts here"
+        for rel in (TAX, REGISTRIES):
+            g3 = tempfile.mkdtemp(dir=base)
+            fixture(g3)
+            commit(g3, "table")
+            blob = git(g3, "rev-parse", f"HEAD:{rel}").stdout.strip()
+            os.remove(os.path.join(g3, ".git", "objects", blob[:2], blob[2:]))
+            rc, out, err = run(g3, "HEAD")
+            if rc != 2 or f"cannot read {rel}" not in err or "starts here" in out:
+                fails.append(f"case base: the blob of {rel} gone from the base is no verdict: {rc} {out}{err}")
         # lower: counts fall, never rise, a row that reached 0 goes, and a second pass changes nothing
         d = tempfile.mkdtemp(dir=base)
         fixture(d, {"tools/model-tax.tsv": "# kept comment\ncrates/model/src/arch/mod.rs\tqwen\t5\tbaseline A 5: r\n"
@@ -841,6 +869,31 @@ def self_test():
         pairs = copied_windows(Scan(d), d)
         if sum(pairs.values()) < 1:
             fails.append(f"case copies: no shared window in {dict(pairs)}")
+        # only code is windowed: a copied block comment and a line cut at a `//` inside a string are no copy
+        d = tempfile.mkdtemp(dir=base)
+        fixture(d, {"crates/model/src/arch/qwen/a.rs": "/*\n" + body + "*/\n",
+                    "crates/glmdir/src/b.rs": "/*\n" + body.replace("qwen_state", "glm_state") + "*/\n"})
+        pairs = copied_windows(Scan(d), d)
+        if sum(pairs.values()) != 0:
+            fails.append(f"case copies: a block comment is no window: {dict(pairs)}")
+        d = tempfile.mkdtemp(dir=base)
+        fixture(d, {"crates/model/src/arch/qwen/a.rs": "".join(f'    let u{i} = "a//b{i}";\n' for i in range(10)),
+                    "crates/glmdir/src/b.rs": "".join(f'    let u{i} = "a//c{i}";\n' for i in range(10))})
+        pairs = copied_windows(Scan(d), d)
+        if sum(pairs.values()) != 0:
+            fails.append(f"case copies: a string with `//` is not cut: {dict(pairs)}")
+        # a file that is not UTF-8 is no verdict, whichever table or source it is
+        for rel in (TAX, "crates/gpu/src/other.rs"):
+            d = tempfile.mkdtemp(dir=base)
+            fixture(d)
+            with open(os.path.join(d, rel), "wb") as f:
+                f.write(b"pub fn x() { let _ = \"\xff\"; }\n")
+            try:
+                rc, out, err = run(d)
+            except UnicodeDecodeError as e:
+                rc, err = "crash", str(e)
+            if rc != 2 or f"{rel}: cannot read" not in err:
+                fails.append(f"case read: {rel} that is not UTF-8 is no verdict: {rc} {err}")
     finally:
         shutil.rmtree(base, ignore_errors=True)
     if fails:
