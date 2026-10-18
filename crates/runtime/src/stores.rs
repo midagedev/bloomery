@@ -51,7 +51,7 @@ pub const fn ple_ring_rows(taps: usize, dilation: usize) -> usize {
 pub const PROMPT_BATCH: u64 = 512;
 
 /// The rows a window ring's length is padded up to a multiple of.
-pub const RING_ALIGN: u64 = 256;
+const RING_ALIGN: u64 = 256;
 
 /// Rows a ring of `window` rows holds once `positions` positions have been
 /// appended: every position until it fills, `window` after. The rows of a
@@ -64,7 +64,7 @@ pub fn window_rows<T: Ord>(window: T, positions: T) -> T {
 }
 
 /// Rows a window layer's ring holds at `ctx_max`: the window plus one prompt
-/// batch ([`PROMPT_BATCH`]), padded up to a multiple of [`RING_ALIGN`], and
+/// batch ([`PROMPT_BATCH`]), padded up to a multiple of `RING_ALIGN`, and
 /// never past `ctx_max`. A pass of up to a batch appends its rows before it
 /// reads, so the window's oldest row survives it.
 #[must_use]
