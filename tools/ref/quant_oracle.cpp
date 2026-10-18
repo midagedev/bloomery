@@ -10,6 +10,10 @@
 //   <case>.dot.f32    vec_dot(weight row w, activation row a), one f32 per pair, w-major
 // <case> is "<ggml type name>.<K>". cases.tsv holds one row per case and files.txt the names written, both read by
 // tools/ref/quant-oracle.sh, which states the set's identity around them (QUANT.tsv; crates/refset/src/quant.rs reads it).
+// cases.tsv also holds one `type` row for every type ggml's own table names (an id below GGML_TYPE_COUNT whose traits state a
+// name and a block size), from the traits and never by hand: its name, id, block size and size, and either `dumped` (the
+// type has cases) or `skip` with the traits ggml leaves NULL. A type with a to_float and a vec_dot that is not in kTypes ends
+// the run, so the set never leaves a type out without ggml's reason.
 //
 // A K is used for a type when its block and its vec_dot_type's block divide it: 4096 for every type, 2688 too for the
 // 32-, 64- and 128-element block types. A type needing an imatrix gets a seeded one. Everything is deterministic: a rerun on the
@@ -19,7 +23,8 @@
 // dequantized or dotted value, or a commit that is not the pin stops the run with a line that names it.
 //
 // Build: bash tools/ref/quant-oracle.sh build   (links the mainline tree's libggml-base and libggml-cpu; no card is opened)
-// Run:   quant_oracle --pin <40-hex commit> --out DIR [type_name ...]
+// Run:   quant_oracle --pin <40-hex commit> --out DIR [type_name ...]   (named types alone write a partial set, which the reader
+//        refuses: its table states every other dumped type with no case)
 
 #include <algorithm>
 #include <cmath>
@@ -300,6 +305,44 @@ static void run_case(const std::string & dir, enum ggml_type type, int64_t k) {
                 c.type_size, row_bytes, ggml_type_name(vdt), c.imatrix ? 1 : 0, (long long)c.quant_rows, (long long)c.random_rows);
 }
 
+static bool is_dumped(enum ggml_type type) {
+    return std::find(std::begin(kTypes), std::end(kTypes), type) != std::end(kTypes);
+}
+
+// Why ggml has nothing to dump for a type kTypes leaves out: the traits it states NULL. A type with both a to_float and a
+// vec_dot could be dumped, so leaving it out is the harness's omission and stops the run.
+static std::string skip_reason(enum ggml_type type) {
+    const struct ggml_type_traits * tr = traits_of(type);
+    const struct ggml_type_traits_cpu * cpu = ggml_get_type_traits_cpu(type);
+    std::string reason;
+    if (!tr->to_float) reason += "to_float NULL";
+    if (!cpu || !cpu->vec_dot) reason += std::string(reason.empty() ? "" : "; ") + "vec_dot NULL";
+    if (reason.empty()) fail(std::string(ggml_type_name(type)) + " has a to_float and a vec_dot but is not in kTypes: add it to kTypes");
+    return reason;
+}
+
+// One `type` row for every type ggml's table names, in id order. An id whose traits state no name or no block size is one ggml
+// no longer names (its slot holds "DEPRECATED" or a "REMOVED" notice with no block).
+static std::string type_table() {
+    std::string out = "# type\tname\tid\tblck\tbytes\tstatus\treason\n";
+    for (int id = 0; id < GGML_TYPE_COUNT; ++id) {
+        const enum ggml_type type = (enum ggml_type)id;
+        const struct ggml_type_traits * tr = ggml_get_type_traits(type);
+        if (!tr || !tr->type_name || tr->blck_size <= 0) continue;
+        const bool dumped = is_dumped(type);
+        char line[256];
+        const int n = std::snprintf(line, sizeof line, "type\t%s\t%d\t%lld\t%zu\t%s\t%s\n", tr->type_name, id, (long long)tr->blck_size,
+                                    tr->type_size, dumped ? "dumped" : "skip", dumped ? "-" : skip_reason(type).c_str());
+        if (n < 0 || (size_t)n >= sizeof line) fail(std::string(tr->type_name) + ": the type row does not fit its buffer");
+        out += line;
+    }
+    for (const enum ggml_type type : kTypes) {
+        const struct ggml_type_traits * tr = traits_of(type);
+        if (tr->blck_size <= 0) fail(std::string(tr->type_name) + ": a type of kTypes has no block size in ggml's table");
+    }
+    return out;
+}
+
 // The commit the build states for itself against the pin: a tree rebuilt without a readable git says "unknown" and is refused.
 static void check_commit(const std::string & pin) {
     const std::string have = ggml_commit();
@@ -362,7 +405,8 @@ int main(int argc, char ** argv) {
     ggml_quantize_free();
 
     const std::string cpu = cpu_features();
-    write_file(out + "/cases.tsv", cases_tsv.data(), cases_tsv.size());
+    const std::string rows = type_table() + cases_tsv;
+    write_file(out + "/cases.tsv", rows.data(), rows.size());
     write_file(out + "/files.txt", files_written.data(), files_written.size());
     const std::string info = "ggml_commit\t" + std::string(ggml_commit()) + "\ncpu\t" + cpu + "\n";
     write_file(out + "/info.tsv", info.data(), info.size());
