@@ -47,13 +47,13 @@ mod tests {
     use super::LOGITS;
     use crate::family::Build;
 
-    /// The build pin is not the Nano's: `NEMOTRON_BUILD`'s tree loads no per-layer expert counts, so a set
+    /// The build pin is not the Nano's: the Nano's tree loads no per-layer expert counts, so a set
     /// pinned to it could not have been dumped from the Bolt file.
     #[test]
     fn the_bolt_build_is_not_the_nanos() {
         let Some(Build::Is(p)) = LOGITS.build else {
             panic!("no pin");
         };
-        assert_ne!(p, crate::arch::tokenizer::NEMOTRON_BUILD);
+        assert_ne!(p, crate::arch::nemotron_h::BUILD);
     }
 }

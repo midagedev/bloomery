@@ -6,7 +6,8 @@
 //! ```text
 //! # tokenizer    <path>  <md5>   the llama-tokenize executable
 //! # libllama     <path>  <md5>   the libllama.so it loads (the tokenizer lives there)
-//! # build        <commit>        the mainline commit both were built at (a set dumped from a pinned mainline tree)
+//! # build        <commit>[+<patch>]  the tree both were built from: its upstream commit's first 9 digits, and `+` and the
+//!                                    12 digits naming the tracked files against it for a tree with a local patch
 //! # vocabulary   <path>          the GGUF file whose vocabulary it read, first shard
 //! # text tree    <path>          where the corpus texts were gathered from
 //! # cases        <path>  <md5>   the hand-picked cases file the case texts came from
@@ -18,9 +19,10 @@
 //! Row `<name>` has its text in `<name>.txt`, its ids in `<name>.ids` (special
 //! tokens parsed, `llama-tokenize`'s default) and `<name>.nps.ids`
 //! (`--no-parse-special`), one id a line. [`TokenizerSet::open`] refuses by
-//! name a set dumped with another executable or library (or, when the family
-//! pins a mainline commit, another commit), from another vocabulary file,
-//! with a text that is not the one dumped, or that never finished.
+//! name a set dumped from another tree (a family pins the `# build` line; the
+//! executable's and the library's md5s are the dump's record, not an identity),
+//! from another vocabulary file, with a text that is not the one dumped, or
+//! that never finished.
 
 use crate::RefError;
 use crate::columns::{Columns, Row, parse_field};
@@ -109,8 +111,8 @@ pub struct TokenizerSet {
     pub binary: Option<(String, String)>,
     /// `# libllama`: the library it loads and its md5.
     pub library: Option<(String, String)>,
-    /// `# build`: the mainline commit the executable and the library were built at, which `oracle.sh` states only after the
-    /// tree's HEAD and the executable's own report name it.
+    /// `# build`: the tree the executable and the library were built from, `<commit>` or `<commit>+<patch>`, which `oracle.sh`
+    /// states only after the tree's commit, patch and build have been checked (`tools/ref/emb2/oracle-tree.sh`).
     pub commit: Option<String>,
     /// `# vocabulary`: the GGUF file the set was dumped from.
     pub vocabulary: Option<String>,
@@ -228,9 +230,10 @@ impl TokenizerSet {
     }
 
     /// The build the set names, as a family's `build` pin spells it: the
-    /// `# build` commit when the set states one, else the executable and the
+    /// `# build` tree when the set states one, else the executable and the
     /// library's md5s ([`build_id`]), `None` unless both lines are there. A
-    /// family pins one spelling, so a set of the other is refused by name.
+    /// family pins a tree, so a set that states only md5s (dumped before the
+    /// trees were pinned) is refused by name.
     #[must_use]
     pub fn build(&self) -> Option<String> {
         if let Some(commit) = &self.commit {

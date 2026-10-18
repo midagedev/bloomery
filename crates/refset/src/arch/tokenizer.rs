@@ -13,11 +13,13 @@
 //! with the tolower fix (`/home/user/ik-tokref`). Nemotron's file is
 //! `nemotron_h`, which that tree refuses, so its set is read by
 //! `/home/user/llama.cpp-mainline`, whose `pixtral` pre is the LLAMA3 regex
-//! with `ignore_merges`. A family pins the executable and the library it
-//! loads by md5 ([`crate::tokenizer::build_id`]): the tokenizer is the
-//! library's code, the executable only calls it. EmbeddingGemma v1's pins the
-//! mainline commit its set's `# build` line names instead: its oracle is a
-//! commit's build, and every machine's rebuild of that commit has other md5s.
+//! with `ignore_merges`. A family pins the tree its oracle is built from, the
+//! `# build` line its set states after `crates/tokenizer/tools/oracle.sh` has
+//! checked the tree (`tools/ref/emb2/oracle-tree.sh`): the upstream commit's
+//! first 9 digits, and for a tree with a local patch `+` and the 12 digits
+//! that name the patch (the tree's tracked files against that commit). The
+//! executable's and the library's md5s change with every rebuild of one tree
+//! and name no other machine's build, so no family pins them.
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
@@ -29,28 +31,24 @@ pub const ARCH: &str = "tokenizer";
 /// when set.
 pub const QWEN3MOE_MODEL: &str = "/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf";
 
-/// The executable and library of `/home/user/ik-tilde`: ik with `~` in the S
-/// class, whose `llama-tokenize` reads V4.1's vocabulary (`oracle.sh` refuses
-/// a tree whose `~/` is not one id).
-// PIN(2026-10-08): /home/user/ik-tilde's llama-tokenize and libllama.so.
-pub const TILDE_BUILD: &str = "llama-tokenize d03083b01a24f6a9e5c2190abf7d38c6 \
-                               libllama.so f855ad0b949f0b7d871973be1fcc419f";
+/// The tree `/home/user/ik-tilde`: ik main at `dad2cb3e5` plus the one line
+/// that puts `~` in the S class, whose `llama-tokenize` reads V4.1's
+/// vocabulary (`oracle.sh` refuses a tree whose `~/` is not one id).
+// PIN(2026-10-18): the commit and the patch, not one machine's llama-tokenize and libllama.so md5s, which no rebuild matched.
+pub const TILDE_BUILD: &str = "dad2cb3e5+0e498d9dab2a";
 
-/// The executable and library of `/home/user/ik-tokref`: the ik-idxkey commit
-/// plus the `unicode_tolower` fix the `(?i:'re)` contractions of the qwen2 and
-/// llama3 regexes need, whose `llama-tokenize` reads Qwen3-MoE, GLM-5.3-Flash
-/// and Qwen3.8.
-// PIN(2026-10-08): /home/user/ik-tokref's llama-tokenize and libllama.so.
-pub const TOKREF_BUILD: &str = "llama-tokenize 0128e83c5e71e5f2b72f3d5d2c2de6b2 \
-                                libllama.so 1674b0181160aba8599f5750cba1b30d";
+/// The tree `/home/user/ik-tokref`: the ik-idxkey commit `db517b690` plus the
+/// `unicode_tolower` fix the `(?i:'re)` contractions of the qwen2 and llama3
+/// regexes need, whose `llama-tokenize` reads Qwen3-MoE, GLM-5.3-Flash and
+/// Qwen3.8.
+// PIN(2026-10-18): the commit and the patch, not one machine's llama-tokenize and libllama.so md5s, which no rebuild matched.
+pub const TOKREF_BUILD: &str = "db517b690+29cabc43ed4d";
 
-/// The executable and library of `/home/user/llama.cpp-mainline`, whose
-/// `llama-tokenize` loads the Nemotron file. ik-tokref does not: it has no
-/// `nemotron_h` architecture. The soname is `libllama.so.0`; the pin's word
-/// is the one [`crate::tokenizer::build_id`] spells.
-// PIN(2026-10-14): /home/user/llama.cpp-mainline's llama-tokenize and libllama.so.0.
-pub(crate) const NEMOTRON_BUILD: &str = "llama-tokenize 5df95d3a942effc971ff170432d840fd \
-                                  libllama.so 3575b1f39e7773379fec011d39f32a77";
+/// The tree `/home/user/llama.cpp-mainline`, whose `llama-tokenize` loads the
+/// Nemotron file (ik-tokref has no `nemotron_h` architecture): the mainline
+/// commit the Qwen3.5 families name for the same tree, with no patch.
+// PIN(2026-10-18): the commit, not one machine's llama-tokenize and libllama.so.0 md5s, which no rebuild matched.
+pub(crate) const NEMOTRON_BUILD: &str = super::qwen35::LCPP_BUILD;
 
 /// V4.1's set (`deepseek-v3` pre-tokenizer), from the file the tree runs.
 pub static V41: Family = Family {
@@ -165,45 +163,49 @@ mod tests {
     };
     use crate::RefError;
     use crate::emb2::LCPP_BUILD;
-    use crate::family::Family;
-    use crate::md5::check_hex;
+    use crate::family::{Build, Family};
     use crate::tokenizer::tests::{CASES_MD5, RIGHT, Stated, set_dir, write_set};
     use std::path::Path;
 
-    /// The executable's and the library's md5 a pin names.
-    fn md5s(pin: &str) -> (&str, &str) {
-        let mut words = pin.split_whitespace();
-        (words.nth(1).unwrap_or(""), words.nth(1).unwrap_or(""))
+    /// A tree pin's two parts: the commit's 9 digits and, for a tree with a local patch, `+` and the patch's 12.
+    fn parts(pin: &str) -> (&str, Option<&str>) {
+        match pin.split_once('+') {
+            Some((commit, patch)) => (commit, Some(patch)),
+            None => (pin, None),
+        }
     }
 
-    /// Whether a pin is a mainline commit, which a set states in its `# build` line, and not the
-    /// executable's and the library's md5s.
-    fn is_commit(pin: &str) -> bool {
-        !pin.contains(' ')
+    fn is_hex(s: &str, digits: usize) -> bool {
+        s.len() == digits && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// `s` with its last digit changed: the same pin of another commit or patch.
+    fn flip(s: &str) -> String {
+        let (head, last) = s.split_at(s.len() - 1);
+        format!("{head}{}", if last == "0" { "1" } else { "0" })
+    }
+
+    /// The pin a family names.
+    fn pin(f: &Family) -> &'static str {
+        let Some(Build::Is(pin)) = f.build else {
+            panic!("{} pins no build", f.name);
+        };
+        pin
     }
 
     /// Write a set into `dir` as `f`'s dumper would for the vocabulary `file`,
-    /// stating the pin `build`.
-    fn write(dir: &Path, file: &str, build: &str) {
-        let stated = if is_commit(build) {
-            Stated {
-                commit: Some(build),
-                vocabulary: file,
-                ..RIGHT
-            }
-        } else {
-            let (binary, library) = md5s(build);
-            Stated {
-                binary,
-                library,
-                vocabulary: file,
-                ..RIGHT
-            }
+    /// stating the tree `build` its `# build` line names, or, with `None`, the
+    /// md5s of an executable and a library only: a set dumped before the trees were pinned.
+    fn write(dir: &Path, file: &str, build: Option<&str>) {
+        let stated = Stated {
+            commit: build,
+            vocabulary: file,
+            ..RIGHT
         };
         write_set(dir, &stated, CASES_MD5);
     }
 
-    fn check(f: &Family, what: &str, file: &str, build: &str) -> Result<(), RefError> {
+    fn check(f: &Family, what: &str, file: &str, build: Option<&str>) -> Result<(), RefError> {
         let dir = set_dir(what);
         write(&dir, file, build);
         let r = f.check_set(&dir).map(|_| ());
@@ -212,9 +214,10 @@ mod tests {
     }
 
     /// The table holds the vocabularies under one key, each its own row with
-    /// its own set directory and the recipe that writes it; a pin is two md5s
-    /// the reader's `build_id` spells, or the mainline commit of the one
-    /// vocabulary whose oracle is a pinned mainline tree.
+    /// its own set directory and the recipe that writes it, and each pins the
+    /// tree its oracle is built from: the commit's 9 digits, and for the two
+    /// ik side trees that carry local commits, the patch's 12. The trees
+    /// without a patch are mainline's, whose commit the pin states as it is.
     #[test]
     fn the_vocabularies_are_rows_of_the_table() {
         assert_eq!(crate::arch::families(ARCH).len(), 6);
@@ -227,33 +230,24 @@ mod tests {
             );
             assert_eq!(f.sets.len(), 1);
             assert_eq!(f.path(f.sets[0]), crate::data_dir().join(f.sets[0]));
-            let Some(crate::family::Build::Is(pin)) = f.build else {
-                panic!("{} pins no build", f.name);
-            };
-            if is_commit(pin) {
-                assert_eq!(pin, LCPP_BUILD, "{}", f.name);
-                continue;
-            }
-            let (binary, library) = md5s(pin);
-            assert_eq!(pin, crate::tokenizer::build_id(binary, library));
-            for md5 in [binary, library] {
-                check_hex(f.name, md5, &f.name).unwrap_or_else(|e| panic!("{e}"));
-            }
+            let (commit, patch) = parts(pin(f));
+            assert!(is_hex(commit, 9), "{}: commit {commit}", f.name);
+            assert!(patch.is_none_or(|p| is_hex(p, 12)), "{}: {patch:?}", f.name);
         }
-        for (f, pin) in [
-            (&V41, TILDE_BUILD),
-            (&QWEN3MOE, TOKREF_BUILD),
-            (&GLM5NEXT, TOKREF_BUILD),
-            (&QWEN38, TOKREF_BUILD),
-            (&NEMOTRON, NEMOTRON_BUILD),
-            (&super::super::gemma_embedding::TOKENIZER, LCPP_BUILD),
+        for (f, want, patched) in [
+            (&V41, TILDE_BUILD, true),
+            (&QWEN3MOE, TOKREF_BUILD, true),
+            (&GLM5NEXT, TOKREF_BUILD, true),
+            (&QWEN38, TOKREF_BUILD, true),
+            (&NEMOTRON, NEMOTRON_BUILD, false),
+            (&super::super::gemma_embedding::TOKENIZER, LCPP_BUILD, false),
         ] {
-            assert!(
-                matches!(f.build, Some(crate::family::Build::Is(p)) if p == pin),
-                "{} pins the wrong tree",
-                f.name
-            );
+            assert_eq!(pin(f), want, "{} pins the wrong tree", f.name);
+            assert_eq!(parts(want).1.is_some(), patched, "{}", f.name);
         }
+        // Nemotron's tree is the one the Qwen3.5 families name, and no other family's.
+        assert_eq!(NEMOTRON_BUILD, crate::arch::qwen35::LCPP_BUILD);
+        assert_ne!(parts(TILDE_BUILD).0, parts(TOKREF_BUILD).0);
         let sets: Vec<_> = FAMILIES.iter().map(|f| f.sets[0]).collect();
         assert_eq!(
             sets,
@@ -268,38 +262,61 @@ mod tests {
         );
     }
 
-    /// Each family takes a set dumped from its own vocabulary file with the
-    /// executable and library (or the mainline commit) it pins, and no other
-    /// pin: V4.1's set read by the tolower-fixed tree is as foreign as a Qwen
-    /// set read by the tilde tree, a set of another commit is foreign to the
-    /// commit's family, and a set in the other spelling is foreign to both kinds.
+    /// Each family takes a set dumped from its own vocabulary file by the tree
+    /// it pins, and no other: another commit, the same commit with another
+    /// patch, a patched tree's commit without its patch, an unpatched tree's
+    /// commit with one, another family's tree, and the md5s of a binary that
+    /// the set states without a `# build` line (the sets dumped before the
+    /// trees were pinned) are each refused by name, with what the set stated
+    /// and what the family wants.
     #[test]
-    fn each_family_takes_its_own_build_and_vocabulary_only() -> Result<(), RefError> {
+    fn each_family_takes_its_own_tree_and_vocabulary_only() -> Result<(), RefError> {
         for f in FAMILIES {
             let runs = f.runs()?;
-            let Some(crate::family::Build::Is(own)) = f.build else {
-                panic!("{} pins no build", f.name);
-            };
-            let others = if is_commit(own) {
-                ["0000000ff", TILDE_BUILD]
-            } else if own == TILDE_BUILD {
-                [TOKREF_BUILD, LCPP_BUILD]
-            } else {
-                [TILDE_BUILD, LCPP_BUILD]
-            };
-            check(f, &format!("{}-own", f.name), &runs, own)?;
-            for other in others {
-                match check(f, &format!("{}-other", f.name), &runs, other) {
-                    Err(RefError::Foreign { field: "build", .. }) => {}
-                    r => panic!("{}: a set of the other build {other}: {r:?}", f.name),
+            let own = pin(f);
+            let (commit, patch) = parts(own);
+            check(f, &format!("{}-own", f.name), &runs, Some(own))?;
+            let mut foreign = vec![flip(commit), format!("{commit}x")];
+            match patch {
+                Some(patch) => {
+                    foreign.push(format!("{}+{patch}", flip(commit)));
+                    foreign.push(format!("{commit}+{}", flip(patch)));
+                    foreign.push(commit.to_string());
                 }
+                None => foreign.push(format!("{commit}+000000000000")),
+            }
+            foreign.extend(
+                FAMILIES
+                    .iter()
+                    .map(|g| pin(g).to_string())
+                    .filter(|p| p != own),
+            );
+            for other in foreign {
+                match check(f, &format!("{}-other", f.name), &runs, Some(&other)) {
+                    Err(RefError::Foreign {
+                        field: "build",
+                        got,
+                        want,
+                        ..
+                    }) => assert_eq!((got.as_str(), want.as_str()), (other.as_str(), own)),
+                    r => panic!("{}: a set of the tree {other}: {r:?}", f.name),
+                }
+            }
+            let md5s = crate::tokenizer::build_id(RIGHT.binary, RIGHT.library);
+            match check(f, &format!("{}-md5", f.name), &runs, None) {
+                Err(RefError::Foreign {
+                    field: "build",
+                    got,
+                    ..
+                }) => assert_eq!(got, md5s),
+                r => panic!("{}: a set stating md5s only: {r:?}", f.name),
             }
         }
         Ok(())
     }
 
     /// A set of another vocabulary's file is stale under every family, though its
-    /// executable and library are the family's: the files differ.
+    /// tree is the family's: the files differ.
     #[test]
     fn a_set_of_another_vocabulary_file_is_stale_under_each_family() -> Result<(), RefError> {
         let files: Vec<String> = FAMILIES
@@ -307,11 +324,8 @@ mod tests {
             .map(|f| f.runs())
             .collect::<Result<_, _>>()?;
         for (f, own) in FAMILIES.iter().zip(&files) {
-            let Some(crate::family::Build::Is(pin)) = f.build else {
-                panic!("{} pins no build", f.name);
-            };
             for file in files.iter().filter(|x| *x != own) {
-                match check(f, &format!("{}-vocab", f.name), file, pin) {
+                match check(f, &format!("{}-vocab", f.name), file, Some(pin(f))) {
                     Err(RefError::Stale {
                         dumped_from, runs, ..
                     }) => {
