@@ -463,9 +463,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
     majflt_mark "$d/mark-none" '' <<< $'window-start\ntrailing' > /dev/null
     check marker-empty-re "$([ -e "$d/mark-none" ] && echo yes || echo no)" 'no'
   fi
-  # A failed forward must finish without waiting for upstream EOF.
+  # A failed forward must finish without waiting for upstream EOF. The marker runs in its own process:
+  # the Mac's bash 3.2 keeps a line printf failed to write and flushes it into the next redirect of the
+  # same process, which would put `forwarded` into forward.rc ahead of the rc.
   (
-    majflt_mark /dev/null '' < "$d/pipe" 1< /dev/null 2> /dev/null && r=0 || r=$?
+    bash -c 'source "$1" && majflt_mark /dev/null ""' _ "${BASH_SOURCE[0]}" < "$d/pipe" 1< /dev/null 2> /dev/null && r=0 || r=$?
     printf '%s\n' "$r" > "$d/forward.rc"
   ) &
   mp=$!
