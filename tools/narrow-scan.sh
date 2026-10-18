@@ -94,6 +94,8 @@
 # 143 TERM; the `affected` run's own code otherwise.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=tools/nightly/units.sh
+source "$ROOT/tools/nightly/units.sh" # tree_commit labels the head tree, archive_tree reads a base commit
 PKG=bloomery-gpu-gates # the package the ptx-scan recipe builds; tools/recipes.py SCAN_PACKAGE
 ARCH=sm_86 # the arch of the scans, the recipes' default (BLOOMERY_ARCH, tools/arch.sh); the pairs are built at no other
 USAGE="usage: narrow-scan.sh BASE [HEAD | --worktree] [--out DIR] [--dry-run] [--keep-ptx] [--scan-only] | --self-test"
@@ -461,9 +463,7 @@ run_side() {
     src=$out/src-$name
     rm -rf "$src" 9>&-
     mkdir -p "$src" 9>&-
-    { git -C "$ROOT" archive --format=tar "$rev" | tar -x -C "$src"; } 9>&-
-    rc=("${PIPESTATUS[@]}")
-    [ "${rc[0]}" = 0 ] && [ "${rc[1]}" = 0 ] || die 1 "git archive $rev failed (git ${rc[0]}, tar ${rc[1]})"
+    archive_tree "$ROOT" "$rev" "$src" 9>&- || die 1 "git archive $rev failed (git $ARCHIVE_GIT_RC, tar $ARCHIVE_TAR_RC)"
   fi
   ACTIVE_RPIDF=.narrow-scan-$name-$$.pid
   cmd=$(side_command "$bound" "$ACTIVE_RPIDF")
@@ -789,7 +789,7 @@ self_test() {
     './tools/box.sh "$cmd" < "$runner" 2>&1 > "$out/$name.scan.out"' \
     ') 9>&- > "$fifo" &' \
     '"$ROOT/tools/box.sh" "$(stop_command "$2")" < /dev/null >&2 2>&1 9>&- &' \
-    '{ git -C "$ROOT" archive --format=tar "$rev" | tar -x -C "$src"; } 9>&-' \
+    'archive_tree "$ROOT" "$rev" "$src" 9>&- ||' \
     'split_logs "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&-' \
     'split_ptx "$OUT/$side.scan.out" "$OUT/$side" "${BINS[@]}" 9>&-' \
     'WT_KEY1=$(worktree_key "$BASE_SHA" 9>&-)' \
@@ -1213,8 +1213,6 @@ if [ "$WORKTREE" = 1 ]; then
   HEAD_SRC=worktree
 else
   # The scans read the commits, so a work tree whose state is unknown changes no number: the note says it is unknown, and the run goes on.
-  # shellcheck source=tools/nightly/units.sh
-  source "$ROOT/tools/nightly/units.sh"
   lrc=0
   tree_commit "$ROOT" || lrc=$?
   case $lrc in

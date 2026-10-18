@@ -1866,13 +1866,18 @@ def git(*args: str, cwd: str = ROOT) -> str:
 
 
 def archive(rev: str, into: str, cwd: str = ROOT) -> str:
+    """REV's tree extracted into `into`. The archive goes through a file, not a pipe: a tar that stops at the end-of-archive marker
+    (bsdtar, the Mac's) exits while git is still writing the zero padding of its last block, and git dies of SIGPIPE on an archive
+    tar read whole."""
     os.makedirs(into, exist_ok=True)
-    arch = subprocess.Popen(["git", "archive", "--format=tar", rev], cwd=cwd, stdout=subprocess.PIPE)
-    tar = subprocess.run(["tar", "-x", "-C", into], stdin=arch.stdout, capture_output=True)
-    arch.stdout.close()
-    rc = arch.wait()
-    if rc != 0 or tar.returncode != 0:
-        raise RecipeError(f"git archive {rev} | tar failed (git {rc}, tar {tar.returncode}): {tar.stderr.decode(errors='replace')[-300:]}")
+    with tempfile.TemporaryDirectory(prefix="archive-") as tmp:
+        tarball = os.path.join(tmp, "tree.tar")
+        arch = subprocess.run(["git", "archive", "--format=tar", "-o", tarball, rev], cwd=cwd, capture_output=True)
+        if arch.returncode != 0:
+            raise RecipeError(f"git archive {rev} failed (git {arch.returncode}): {arch.stderr.decode(errors='replace')[-300:]}")
+        tar = subprocess.run(["tar", "-x", "-f", tarball, "-C", into], capture_output=True)
+        if tar.returncode != 0:
+            raise RecipeError(f"extracting git archive {rev} failed (git 0, tar {tar.returncode}): {tar.stderr.decode(errors='replace')[-300:]}")
     return into
 
 
@@ -8119,6 +8124,45 @@ def side_at(root: str, meta: dict) -> Side:
     return Side(tree, recipes, Graph(tree, recipes))
 
 
+def archive_self_test(expect) -> None:
+    """`archive()` against a git whose last write comes late and a tar that stops at the end-of-archive marker
+    (tools/nightly/archive-shim, the shims tools/nightly/selftest.sh holds archive_tree to): the tree comes back whole,
+    and a revision git refuses is a named error, never a half tree."""
+    shim = os.path.join(ROOT, "tools", "nightly", "archive-shim")
+    real_git, real_tar = shutil.which("git"), shutil.which("tar")
+    with tempfile.TemporaryDirectory(prefix="recipes-archive-") as tmp:
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+        for cmd in (["init", "-q", "."], ["config", "user.email", "t@t"], ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"]):
+            subprocess.run(["git", *cmd], cwd=repo, env=env, check=True, capture_output=True)
+        with open(os.path.join(repo, "f"), "w", encoding="utf-8") as fh:
+            fh.write("a\n")
+        subprocess.run(["git", "add", "f"], cwd=repo, env=env, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "one"], cwd=repo, env=env, check=True, capture_output=True)
+        saved = {k: os.environ.get(k) for k in ("PATH", "SHIM_REAL_GIT", "SHIM_REAL_TAR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")}
+        try:
+            os.environ.update({"PATH": shim + os.pathsep + os.environ["PATH"], "SHIM_REAL_GIT": real_git or "", "SHIM_REAL_TAR": real_tar or "",
+                               "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull})
+            try:
+                into = archive("HEAD", os.path.join(tmp, "out"), cwd=repo)
+                with open(os.path.join(into, "f"), encoding="utf-8") as fh:
+                    expect(fh.read() == "a\n", "archive: the tree came back with the commit's file")
+            except RecipeError as err:
+                expect(False, f"archive: a git whose last write is late and a tar that stops at the end marker end the call: {err}")
+            try:
+                archive("no-such-rev", os.path.join(tmp, "bad"), cwd=repo)
+                expect(False, "archive: a revision git refuses was accepted")
+            except RecipeError as err:
+                expect("no-such-rev" in str(err), f"archive: the refusal does not name the revision: {err}")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 def memo_self_test(expect) -> None:
     """`Tree.memo` on a scratch root: a second Tree gets the first one's walk and script closure without
     running them again, a file rewritten to the same size or a path that appears between two Trees makes
@@ -8824,7 +8868,7 @@ def key_self_test(expect, real: Side) -> None:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             if os.path.islink(src):
                 os.symlink(os.readlink(src), dst)
-            else:
+            elif stat.S_ISREG(os.lstat(src).st_mode):  # a pipe a killed run left in the tree (narrow-scan's build fifo) is no input
                 shutil.copyfile(src, dst)
         mf = os.path.join(tmp, "manifest.txt")
         manifest = [
@@ -11081,6 +11125,7 @@ def self_test(serial: bool = False) -> int:
         range_base_self_test(expect)  # A..B read against the merge base
         module_gate_self_test(expect)  # a module gated by a cargo feature
         memo_self_test(expect)  # the process-wide memo of walks and script closures
+        archive_self_test(expect)  # a base tree read through git archive, whatever tar does at the end marker
         static_self_test(expect)  # the static tier compiles every feature-gated bin
         ledger_self_test(expect)  # the green ledger's key, but for the key itself
         manifest_rows_self_test(expect)

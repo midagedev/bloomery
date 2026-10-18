@@ -830,6 +830,32 @@ PY
 # test their use in their own self-tests (blk_gatebatch, blk_ptxcompare, blk_narrowscan).
 blk_treecommit() { tool_selftest nightly/selftest.sh; }
 
+# A `git archive | tar` pipe fails now and then (rc 141, tar 0): a tar that stops at the end-of-archive marker (bsdtar, the Mac's)
+# exits while git is still writing the zero padding of its last block, and git dies of SIGPIPE. units.sh's archive_tree and
+# recipes.py's archive() are the one reader of a commit's tree, through a file; a script or tool that pipes again is red. The two
+# fixture lines are the FAIL-first (the pipe is found, the file form is not); tools/nightly/selftest.sh pipes on purpose, to
+# prove its shims lose the pipe.
+archive_pipes() { # archive_pipes DIR: file:line of each pipe from `git archive` into tar, in DIR's shell and Python
+  grep -rnE 'git[^|#]*archive[^|#]*\|[[:space:]]*tar|Popen\(\["git", "archive"' --include='*.sh' --include='*.py' "$1" || true
+}
+blk_archivepipe() {
+  local d hits
+  d=$(mktemp -d "$B/archive-pipe.XXXXXX") || return 1
+  printf '%s\n' 'git -C "$r" archive --format=tar "$rev" | tar -x -C "$d"' > "$d/pipe.sh"
+  printf '%s\n' 'git -C "$r" archive --format=tar -o "$f" "$rev" && tar -x -f "$f" -C "$d"' > "$d/file.sh"
+  if [ "$(archive_pipes "$d")" != "$d/pipe.sh:1:git -C \"\$r\" archive --format=tar \"\$rev\" | tar -x -C \"\$d\"" ]; then
+    echo "check-recipes: the archive-pipe scan does not tell a pipe from a file on its fixtures" >&2
+    return 1
+  fi
+  hits=$(archive_pipes "$(dirname "$0")" | grep -vE '/(check-recipes|nightly/selftest)\.sh:') || true
+  if [ -n "$hits" ]; then
+    printf '%s\n' "$hits" >&2
+    echo "check-recipes: a git archive piped into tar (the pipe loses to a tar that stops at the end marker): use archive_tree (tools/nightly/units.sh) or archive() (tools/recipes.py)" >&2
+    return 1
+  fi
+  echo "check-recipes: archive pipe ok (no git archive piped into tar in tools/)"
+}
+
 # A shell function has one owner in its file: a second definition at the same indent with the same body is dead weight
 # that reads as a second owner. The same name with another body is a stub or an override and stays. The fixtures are the
 # FAIL-first: the pair the rule forbids is red on its own copy, the shapes it must leave are green.
@@ -969,7 +995,7 @@ unset CPU_GUARD_PROC_LEG
 
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
-  refsetpublish orphan archowner treecommit fnowner wt)
+  refsetpublish orphan archowner treecommit archivepipe fnowner wt)
 for b in "${BLOCKS[@]}"; do
   ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done

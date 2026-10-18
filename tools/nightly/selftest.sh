@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # `bash tools/nightly/selftest.sh --self-test`: the commit label of tools/nightly/units.sh (`tree_commit`) and the two scripts
-# that print it, tools/contrib-check.sh and tools/nightly/run.sh, on temp repositories. No card, no box, no cargo, no network.
+# that print it, tools/contrib-check.sh and tools/nightly/run.sh, and `archive_tree`, on temp repositories. No card, no box, no cargo, no network.
 # One line per check, `ok <name>` or `FAIL <name>: got … want …`, the verdict last (bash 3.2 on the Mac).
 #
 # What it blocks: a `git status` that fails (a corrupt index, an unreadable tree) prints nothing, and a test of that output
@@ -141,6 +141,28 @@ git init -q --template= "$T/fx-n4"
 nightly_run n4 "$T/fx-n4"
 check nightly-no-head-rc "$NIGHTLY_RC|$(nightly_file status)" "2|RED"
 has nightly-no-head-named "$(nightly_file failed)" "HEAD of $NIGHTLY_CLONE cannot be read"
+
+# ---- archive_tree ----
+# The race: a tar that stops at the end-of-archive marker (bsdtar) exits while git still writes the zero padding of its last
+# block, and git dies of SIGPIPE. The shims in tools/nightly/archive-shim make it deterministic on any tar: `git archive` to a
+# pipe is late with its last 4096 bytes, `tar -x` from a pipe stops after the marker; a file operand and every other command
+# are the real ones.
+REAL_GIT=$(command -v git) REAL_TAR=$(command -v tar)
+SHIM=$HERE/archive-shim
+shimmed() { (PATH="$SHIM:$PATH" SHIM_REAL_GIT=$REAL_GIT SHIM_REAL_TAR=$REAL_TAR "$@"); }
+mkrepo "$T/arc"
+arc_sha=$(git -C "$T/arc" rev-parse HEAD)
+echo changed > "$T/arc/f"
+mkdir "$T/arc-pipe"
+shimmed bash -c 'git -C "$1" archive --format=tar "$2" | tar -x -C "$3"; echo "git ${PIPESTATUS[0]} tar ${PIPESTATUS[1]}"' _ "$T/arc" "$arc_sha" "$T/arc-pipe" > "$T/arc-pipe.out" 2>&1
+check archive-shims-lose-the-pipe "$(tail -n 1 "$T/arc-pipe.out")" "git 141 tar 0"
+mkdir "$T/arc-out" "$T/arc-tmp"
+r=$(shimmed env TMPDIR="$T/arc-tmp" bash -c 'source "$1"; archive_tree "$2" "$3" "$4"; echo "$?|$ARCHIVE_GIT_RC|$ARCHIVE_TAR_RC"' _ "$HERE/units.sh" "$T/arc" "$arc_sha" "$T/arc-out" 2> /dev/null)
+check archive-tree-survives-a-late-last-write "$r" "0|0|0"
+check archive-tree-is-the-commit "$(cat "$T/arc-out/f" 2> /dev/null)|$(ls "$T/arc-out")" "a|f"
+check archive-tree-leaves-no-temp-file "$(ls -A "$T/arc-tmp")" ""
+r=$(shimmed env TMPDIR="$T/arc-tmp" bash -c 'source "$1"; archive_tree "$2" "$3" "$4"; echo "$?|$ARCHIVE_GIT_RC|$ARCHIVE_TAR_RC"' _ "$HERE/units.sh" "$T/arc" no-such-rev "$T/arc-out" 2> /dev/null)
+check archive-tree-bad-rev-names-git "$r|$(ls -A "$T/arc-tmp")" "1|128|-|"
 
 echo "tree-commit self-test: $([ "$fails" = 0 ] && echo ok || echo FAILED) ($checks checks, $fails failures)"
 [ "$fails" = 0 ]

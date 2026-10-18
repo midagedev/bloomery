@@ -45,6 +45,9 @@ die() { # die <rc> <message>
   exit "$1"
 }
 
+# shellcheck source=tools/nightly/units.sh
+source "$ROOT/tools/nightly/units.sh" # tree_commit labels the head side, archive_tree reads the base commit
+
 md5_of() { # md5_of <file>: the Mac has md5, the box md5sum
   if command -v md5sum > /dev/null; then md5sum "$1" | cut -d' ' -f1; else md5 -q "$1"; fi
 }
@@ -90,7 +93,6 @@ valid_scan() {
 # run_compare <base rev> <bin> <features> <base only 0|1> <no cache 0|1>
 run_compare() {
   local rev=$1 bin=$2 feats=$3 baseonly=$4 nocache=$5 sha key dir track bremote src rc scanner hl lrc tmp
-  local arc=()
   sha=$(git -C "$ROOT" rev-parse --verify --quiet "$rev^{commit}") || die 64 "'$rev' names no commit of this repository"
   case $bin in '' | *[!A-Za-z0-9_-]* | -*) die 64 "'$bin' is no binary name" ;; esac
   case $feats in '' | *[!A-Za-z0-9_,/-]*) die 64 "--features '$feats' is no cargo feature list" ;; esac
@@ -107,11 +109,9 @@ run_compare() {
   else
     [ ! -e "$dir/base.scan" ] || echo "ptx-compare: base cache $dir/base.scan is $([ "$nocache" = 1 ] && echo 'bypassed (--no-cache)' || echo 'not a full scan'): scanning again" >&2
     src=$(mktemp -d "${TMPDIR:-/tmp}/ptx-compare-base.XXXXXX") || die 70 "no temporary directory"
-    git -C "$ROOT" archive --format=tar "$sha" | tar -x -C "$src"
-    arc=("${PIPESTATUS[@]}")
-    if [ "${arc[0]}" != 0 ] || [ "${arc[1]}" != 0 ]; then
+    if ! archive_tree "$ROOT" "$sha" "$src"; then
       rm -rf "$src"
-      die 1 "git archive ${sha:0:12} failed (git ${arc[0]}, tar ${arc[1]})"
+      die 1 "git archive ${sha:0:12} failed (git $ARCHIVE_GIT_RC, tar $ARCHIVE_TAR_RC)"
     fi
     # one scanner on both sides; -p keeps its mtime, so a second run's base tree has the id the first synced (box.sh's tree id)
     cp -p "$ROOT/tools/ptx-scan.sh" "$src/tools/ptx-scan.sh" || { rm -rf "$src"; die 70 "cannot lay tools/ptx-scan.sh over the base tree"; }
@@ -136,8 +136,6 @@ run_compare() {
     return 0
   fi
   # --- the head side: this tree as box.sh syncs it
-  # shellcheck source=tools/nightly/units.sh
-  source "$ROOT/tools/nightly/units.sh"
   lrc=0
   tree_commit "$ROOT" || lrc=$?
   case $lrc in

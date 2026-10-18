@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Test shim, the partner of git here: `tar -x` from a pipe stops after the end-of-archive marker, two zero blocks, and
+# leaves the rest of its input unread, as bsdtar (the Mac's tar) does. A file operand (-f) is the real tar, SHIM_REAL_TAR.
+for a in "$@"; do
+  case $a in -f | --file=*) exec "${SHIM_REAL_TAR:?}" "$@" ;; esac
+done
+python3 -I -c '
+import os, sys
+zero, run, out = bytes(512), 0, sys.stdout.buffer
+while run < 2:
+    blk = b""
+    while len(blk) < 512:
+        part = os.read(0, 512 - len(blk))
+        if not part:
+            break
+        blk += part
+    if not blk:
+        break
+    out.write(blk)
+    run = run + 1 if blk == zero else 0
+out.flush()
+' | "$SHIM_REAL_TAR" "$@"

@@ -30,10 +30,17 @@
 #       2  HEAD reads and `git status` fails (a corrupt index, an unreadable tree): whether the tree is clean is unknown, and a
 #          caller must stop and name the tree and TREE_GIT_RC
 #
+#   archive_tree REPO REV DEST
+#     extracts the tree of commit REV in REPO into the existing directory DEST, what `git archive` carries and never the working
+#     tree (tools/ptx-compare.sh and tools/narrow-scan.sh read their base commit this way). The archive goes through a file,
+#     not a pipe: a tar that stops reading at the end-of-archive marker (bsdtar, the Mac's) exits while git is still writing
+#     the zero padding of its last block, and git dies of SIGPIPE (rc 141) on an archive tar read whole. Sets ARCHIVE_GIT_RC
+#     and ARCHIVE_TAR_RC (`-` when tar did not run) and returns 0 when both are 0, else 1 (70 when it has no temporary file).
+#
 # The callers stay in step by sharing this code: a change to how a unit's counts or failures are read, or to how a tree is
-# labelled, lands here once.
+# labelled or archived, lands here once.
 
-# shellcheck disable=SC2034  # the UNIT_* and TREE_* variables are this library's result interface, read by the sourcing script
+# shellcheck disable=SC2034  # the UNIT_*, TREE_* and ARCHIVE_* variables are this library's result interface, read by the sourcing script
 UNIT_TIMEOUT=${UNIT_TIMEOUT-timeout}
 
 run_unit() {
@@ -90,4 +97,19 @@ tree_commit() {
     TREE_COMMIT=$TREE_COMMIT+local
   fi
   return 0
+}
+
+archive_tree() {
+  local repo=$1 rev=$2 dest=$3 f
+  ARCHIVE_GIT_RC=0 ARCHIVE_TAR_RC=-
+  f=$(mktemp "${TMPDIR:-/tmp}/archive-tree.XXXXXX") || return 70
+  git -C "$repo" archive --format=tar -o "$f" "$rev" || {
+    ARCHIVE_GIT_RC=$?
+    rm -f "$f"
+    return 1
+  }
+  tar -x -f "$f" -C "$dest"
+  ARCHIVE_TAR_RC=$?
+  rm -f "$f"
+  [ "$ARCHIVE_TAR_RC" = 0 ]
 }
