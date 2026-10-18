@@ -116,7 +116,7 @@
 set -uo pipefail
 # The bounded child's owner (bounded): --analyze and --self-test run before the lease is sourced.
 # shellcheck source=tools/gate-bound.sh
-source "${BASH_SOURCE[0]%/*}/../gate-bound.sh"
+source "${BASH_SOURCE[0]%/*}/../gate-bound.sh" || exit 70
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 

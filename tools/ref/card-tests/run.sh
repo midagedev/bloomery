@@ -1460,11 +1460,13 @@ else
 fi
 
 # The profiler keeps the timing-card checks around each arm and refuses broken trace boundaries.
-# Only the lease, freshness and profiler are stubs; the runner, card checks and analyzer are real.
+# Only the lease, freshness and profiler are stubs; the runner, card checks, analyzer and the bounded-child owner are real.
 if [ ! -e /root/bloomery-cpu.lock ]; then
   P=$tmp/profile
   mkdir -p "$P"
   cp "$ROOT/tools/ref/nsys-gpu.sh" "$P/"
+  # The runner reads the owner one directory up, as tools/ref/ reads tools/gate-bound.sh.
+  cp "$ROOT/tools/gate-bound.sh" "$P/../"
   printf 'MODEL_NAME=qwen35moe MODEL=/stub/model.gguf BLOOMERY_DATA=/stub\n' > "$P/ref-paths.sh"
   printf 'source %q\nassert_fresh_binary() { :; }\n' "$ROOT/tools/ref/timing-card.sh" > "$P/timing-card.sh"
   cat > "$P/lease.sh" << 'LEASE'
@@ -1473,7 +1475,6 @@ lease_take() {
   [ -z "${STUB_BEFORE:-}" ] || touch "$STUB_AFTER"
 }
 witness() { :; }
-lease_bounded() { shift; "$@"; }
 LEASE
   cat > "$P/nsys" << 'NSYS'
 #!/usr/bin/env bash
@@ -1528,6 +1529,26 @@ PY
   prof 'missing prefill marker refuses the table' 3 'MISMATCH' STUB_DB="$P/missing.sqlite" BLOOMERY_NSYS_FORM=prefill
   prof 'wrong prefill step count refuses the table' 3 'MISMATCH' STUB_DB="$P/count.sqlite" BLOOMERY_NSYS_FORM=prefill
 fi
+
+# A runner that sources the bounded-child owner (tools/gate-bound.sh) and finds it missing stops by name, 70 and the shell's own
+# "No such file" line, and never goes on with run_bounded and bounded undefined (set -uo pipefail does not stop a failed source).
+# Each runner is copied alone, beside the file it reads before the owner, into a tree that has no gate-bound.sh; a library
+# (lease.sh, load-groups.sh) is sourced from a shell that says if it got past the line.
+O=$tmp/owner
+mkdir -p "$O/tools/ref" "$O/tools/nightly"
+cp "$ROOT/tools/ref/lease-probe.sh" "$O/tools/ref/"
+cp "$ROOT/tools/nightly/units.sh" "$O/tools/nightly/"
+for rel in ref/nsys-gpu.sh ref/nsys-ds41.sh ref/stack-watch.sh nightly/run.sh; do
+  cp "$ROOT/tools/$rel" "$O/tools/$rel"
+  run "owner missing: $rel stops 70 by name" 70 'gate-bound\.sh: No such file or directory' \
+    env NIGHTLY_STATE="$O/no-state" bash "$O/tools/$rel"
+done
+for rel in ref/lease.sh ref/load-groups.sh; do
+  cp "$ROOT/tools/$rel" "$O/tools/$rel"
+  run "owner missing: $rel stops 70 by name" 70 'gate-bound\.sh: No such file or directory' \
+    bash -c 'source "$1"; echo "went on"' _ "$O/tools/$rel"
+  if grep -q '^went on$' "$tmp/out"; then fail "owner missing: $rel went on" "its output says so" "$tmp/out"; else pass "owner missing: $rel does not go on"; fi
+done
 
 # The t table: the four readers print the same t for df 1..40 (tdump.sh), and it is tdist.py's.
 if "$HERE/tdump.sh" "$ROOT" > "$tmp/tdump" 2>&1; then
