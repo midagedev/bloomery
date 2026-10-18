@@ -1550,6 +1550,21 @@ def diff_sets(label, mirror, source, where):
     return out
 
 
+def src_from_name(arch):
+    """Arch::from_name: {variant: [names]}."""
+    lo, hi = arch.one_body("from_name")
+    consts = arch.consts()
+    out = {}
+    for pat, (a, b) in arch.match_arms(lo, hi, r"\bmatch\s+name\b"):
+        if re.fullmatch(r"\s*[a-z_]\w*\s*", arch.m[pat[0]:pat[1]]):
+            continue
+        v = re.fullmatch(r"\s*Ok\(Arch::(\w+)\)\s*", arch.m[a:b])
+        if not v:
+            raise arch.err(a, f"a from_name arm this tool cannot read: {arch.m[a:b].strip()!r}")
+        out.setdefault(v.group(1), []).extend(names_of(arch, pat[0], pat[1], consts))
+    return out
+
+
 def diff_maps(label, mirror, source, where):
     """diff_sets over the keys, then over each key's value (a list of names)."""
     out = diff_sets(f"{label} keys", mirror, source, where)
@@ -1583,6 +1598,8 @@ def mirror_vs_source(read):
     out += diff_maps(f"{SERVE_RS}:Model::serves via Arch::from_name", SERVES_VIA_FROM_NAME, via, SERVE_RS)
     from_name, spec = registry_tables(read(REGISTRY_TSV))
     out += diff_maps(f"{REGISTRY_TSV}:Arch::from_name", FROM_NAME, from_name, REGISTRY_TSV)
+    # The registry's print and the enum's own match name the same strings: a name added to only one side is named.
+    out += diff_maps(f"{ARCH_RS}:Arch::from_name", from_name, src_from_name(arch), ARCH_RS)
     out += diff_sets(f"{REGISTRY_TSV}:spec", SPEC, spec, REGISTRY_TSV)
     # A seat serves only what the model reader takes, and `Arch::from_name` names the variants it reads through.
     for word, variants in via.items():
@@ -1735,6 +1752,8 @@ def self_test():
     for name, path, old, new, want in (
         ("a name added to the registry's glm row is named", REGISTRY_TSV,
          "glm5next,glm5-next\t", "glm5next,glm5-next,glm5-nxt\t", "glm5-nxt"),
+        ("a name added only to Arch::from_name is named", ARCH_RS,
+         '"glm5next" | GLM5_NEXT_LLAMA_CPP =>', '"glm5next" | GLM5_NEXT_LLAMA_CPP | "glm5-nxt" =>', "glm5-nxt"),
         ("a name added to a Model::serves arm is named", SERVE_RS,
          'Model::Qwen38 => arch == "qwen4exp",', 'Model::Qwen38 => matches!(arch, "qwen4exp" | "qwen4expx"),',
          "qwen4expx"),
