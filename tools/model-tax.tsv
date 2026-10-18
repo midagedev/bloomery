@@ -98,14 +98,14 @@ crates/gpu-gates/src/engine.rs	gemma	2	baseline R 2: MK1a one registry row per c
 crates/gpu-gates/src/engine.rs	glm	1	baseline R 1: MK1a one registry row per crate
 crates/gpu-gates/src/engine.rs	mimo	1	baseline R 1: MK1a one registry row per crate
 crates/gpu-gates/src/engine.rs	nemotron	2	baseline R 2: MK1a one registry row per crate
-crates/gpu-gates/src/engine.rs	qwen	12	baseline R 12: MK1a one registry row per crate
+crates/gpu-gates/src/engine.rs	qwen	11	baseline R 12: MK1a one registry row per crate
 crates/gpu-gates/src/iq_rows.rs	nemotron	1	baseline T 1: case-table row, a fixture label or default path
 crates/gpu-gates/src/oracle/mod.rs	deepseek	4	baseline R 4: MK1a one registry row per crate
-crates/gpu-gates/src/oracle/mod.rs	gemma	3	baseline R 3: MK1a one registry row per crate
-crates/gpu-gates/src/oracle/mod.rs	glm	2	baseline R 2: MK1a one registry row per crate
-crates/gpu-gates/src/oracle/mod.rs	mimo	2	baseline R 2: MK1a one registry row per crate
+crates/gpu-gates/src/oracle/mod.rs	gemma	2	baseline R 3: MK1a one registry row per crate
+crates/gpu-gates/src/oracle/mod.rs	glm	1	baseline R 2: MK1a one registry row per crate
+crates/gpu-gates/src/oracle/mod.rs	mimo	1	baseline R 2: MK1a one registry row per crate
 crates/gpu-gates/src/oracle/mod.rs	nemotron	2	baseline R 2: MK1a one registry row per crate
-crates/gpu-gates/src/oracle/mod.rs	qwen	4	baseline R 4: MK1a one registry row per crate
+crates/gpu-gates/src/oracle/mod.rs	qwen	3	baseline R 4: MK1a one registry row per crate
 crates/gpu-gates/src/record.rs	clef	3	baseline O 3: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	deepseek	6	baseline O 6: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	gemma	1	baseline O 1: MK12 per-bin Kind statics into record/<bin>.rs
@@ -138,23 +138,18 @@ crates/model/src/arch/coverage.rs	glm	21	baseline P 21: MK2 program by body
 crates/model/src/arch/coverage.rs	mimo	10	baseline P 10: MK2 program by body
 crates/model/src/arch/coverage.rs	nemotron	36	baseline P 36: MK2 program by body
 crates/model/src/arch/coverage.rs	qwen	63	baseline P 63: MK2 program by body
-crates/model/src/arch/draft.rs	mimo	4	baseline D 4: MK1a draft usability as an ArchRow row
-crates/model/src/arch/draft.rs	qwen	15	baseline D 15: MK1a draft usability as an ArchRow row
+crates/model/src/arch/draft.rs	mimo	3	baseline D 4: MK1a draft usability as an ArchRow row
+crates/model/src/arch/draft.rs	qwen	13	baseline D 15: MK1a draft usability as an ArchRow row
 crates/model/src/arch/dspark.rs	deepseek	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/model/src/arch/hybrid.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/model/src/arch/mod.rs	clef	1	baseline A 1: MK1a/MK1b ArchRow registry
-crates/model/src/arch/mod.rs	deepseek	15	baseline A 15: MK1a/MK1b ArchRow registry
-crates/model/src/arch/mod.rs	gemma	13	baseline A 13: MK1a/MK1b ArchRow registry
-crates/model/src/arch/mod.rs	glm	6	baseline A 6: MK1a/MK1b ArchRow registry
-crates/model/src/arch/mod.rs	mimo	5	baseline A 5: MK1a/MK1b ArchRow registry
-crates/model/src/arch/mod.rs	nemotron	10	baseline A 10: MK1a/MK1b ArchRow registry
-crates/model/src/arch/mod.rs	qwen	19	baseline A 19: MK1a/MK1b ArchRow registry
-crates/model/src/bin/bloomery-decode.rs	deepseek	4	baseline R 4: MK1a one registry row per crate
-crates/model/src/bin/bloomery-decode.rs	gemma	2	baseline R 2: MK1a one registry row per crate
-crates/model/src/bin/bloomery-decode.rs	glm	1	baseline R 1: MK1a one registry row per crate
-crates/model/src/bin/bloomery-decode.rs	mimo	1	baseline R 1: MK1a one registry row per crate
-crates/model/src/bin/bloomery-decode.rs	nemotron	2	baseline R 2: MK1a one registry row per crate
-crates/model/src/bin/bloomery-decode.rs	qwen	2	baseline R 2: MK1a one registry row per crate
+crates/model/src/arch/mod.rs	deepseek	14	baseline A 15: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	gemma	11	baseline A 13: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	glm	5	baseline A 6: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	mimo	4	baseline A 5: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	nemotron	8	baseline A 10: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	qwen	16	baseline A 19: MK1a/MK1b ArchRow registry
+crates/model/src/bin/bloomery-decode.rs	deepseek	3	baseline R 4: MK1a one registry row per crate
 crates/model/src/bin/r8conv.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
 crates/models/src/lib.rs	deepseek	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	gemma	4	baseline A 4: MK1a/MK1b ArchRow registry

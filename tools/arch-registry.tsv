@@ -1,0 +1,14 @@
+# the rows of model::arch::registry::ROWS, as `fixture registry` prints them
+names	variant	read	draft	fixture
+deepseek2	Deepseek2	no	no	-
+deepseek41,deepseek4	Deepseek41	yes	no	v41
+qwen3moe	Qwen3moe	yes	no	-
+qwen4exp	-	yes	yes	qwen38
+qwen35moe	Qwen35moe	yes	yes	qwen35moe
+qwen35,clef	-	yes	no	-
+glm5next,glm5-next	Glm5next	yes	no	glm5next
+mimo2	Mimo2	yes	yes	-
+nemotron_h	NemotronH	yes	no	nemotron
+nemotron_h_moe	NemotronHMoe	yes	no	nemotron-bolt
+gemma-embedding	GemmaEmbedding	yes	no	-
+gemma-embedding2	GemmaEmbedding2	yes	no	-

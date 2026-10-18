@@ -36,9 +36,12 @@ expires (`BOX_EXCEPTIONS`): while its expiry file on the box (`box-facts --grep`
 the two named sizes is `excepted: <reason>` and not a FAIL, counted on its own in `excepted=`, and the day the file holds the
 string it is a FAIL naming the exception.
 
---self-test greps the Rust sources the mirror copies (`Model::serves`, `Arch::from_name`, `spec`, the decide rows'
-constants, `GgmlType::from_u32`) and fails, naming every name that is in one and not the other, or a source it cannot
-parse; it also runs the checks on synthetic GGUF headers, the README parser and the hf crate's own `names` examples.
+--self-test greps the Rust sources the mirror copies (`Model::serves`, the decide rows' constants,
+`GgmlType::from_u32`) and fails, naming every name that is in one and not the other, or a source it cannot parse. The
+architecture strings of `Arch::from_name` and of the model reader are not mirrored: they are read from
+tools/arch-registry.tsv, the print of the model crate's registry (`fixture registry`, crates/model/src/arch/registry.rs),
+which a model test holds equal to the registry; the self-test fails where a seat serves a string the registry has no
+reader for. It also runs the checks on synthetic GGUF headers, the README parser and the hf crate's own `names` examples.
 
 Exit status: 0 every row green (and, with --box, no file FAIL); 1 a row red (every row is checked first) or a self-test failed; 64 a usage error;
 65 a README or a source this tool cannot read, by name; 69 the network or the hub (curl 5, 6, 7, 28, 35, 52, 55, 56,
@@ -62,6 +65,12 @@ import traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 README = "README.md"
+# The model crate's registry as it prints (crates/model/src/arch/registry.rs: print), committed.
+REGISTRY_TSV = "tools/arch-registry.tsv"
+
+
+class SourceError(Exception):
+    pass
 
 
 def load_by_path(name, *rel):
@@ -105,22 +114,45 @@ SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "nemotron": ("NemotronH", "Nemotro
 # the refusal of an unserved file lists them; crates/serve/src/decide.rs:WORD is the decide seat's word.
 SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2", "nemotron")
 DECIDE_WORD = "decide"
-# crates/model/src/arch/mod.rs:Arch::from_name — variant -> the strings that name it.
-FROM_NAME = {
-    "Deepseek2": ("deepseek2",),
-    "Deepseek41": ("deepseek41", "deepseek4"),
-    "Qwen3moe": ("qwen3moe",),
-    "Qwen35moe": ("qwen35moe",),
-    "Glm5next": ("glm5next", "glm5-next"),
-    "Mimo2": ("mimo2",),
-    "NemotronH": ("nemotron_h",),
-    "NemotronHMoe": ("nemotron_h_moe",),
-    "GemmaEmbedding": ("gemma-embedding",),
-    "GemmaEmbedding2": ("gemma-embedding2",),
-}
-# crates/model/src/arch/mod.rs:spec — the architectures the model reader takes (QWEN35_BODY is `qwen35` and `clef`).
-SPEC = ("deepseek41", "deepseek4", "qwen3moe", "qwen35moe", "qwen4exp", "qwen35", "clef", "glm5next", "glm5-next",
-        "mimo2", "nemotron_h", "nemotron_h_moe", "gemma-embedding", "gemma-embedding2")
+# tools/arch-registry.tsv, the registry's print: FROM_NAME is crates/model/src/arch/mod.rs:Arch::from_name — variant -> the
+# strings that name it; SPEC is crates/model/src/arch/mod.rs:spec — the architectures the model reader takes (the
+# registry's rows with a reader, QWEN35_BODY's `qwen35` and `clef` among them).
+REGISTRY_HEADER = ["names", "variant", "read", "draft", "fixture"]
+
+
+def registry_tables(text, where=REGISTRY_TSV):
+    """The registry print `text` -> ({variant: (names,)}, (names the reader takes,)); a SourceError names the row it
+    cannot read."""
+    lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    if not lines or lines[0].split("\t") != REGISTRY_HEADER:
+        raise SourceError(f"{where}: the first line is not the header {REGISTRY_HEADER}")
+    from_name, spec, seen = {}, [], []
+    for n, line in enumerate(lines[1:], 1):
+        f = line.split("\t")
+        if len(f) != len(REGISTRY_HEADER) or f[2] not in ("yes", "no") or f[3] not in ("yes", "no") or not f[0]:
+            raise SourceError(f"{where}: row {n} is not {', '.join(REGISTRY_HEADER)}: {line!r}")
+        names = tuple(f[0].split(","))
+        twice = [x for x in names if x in seen]
+        if twice:
+            raise SourceError(f"{where}: row {n} repeats {twice}, which another row has")
+        seen += names
+        if f[1] != "-":
+            from_name[f[1]] = names
+        if f[2] == "yes":
+            spec += names
+    return from_name, tuple(spec)
+
+
+def load_registry():
+    try:
+        with open(os.path.join(ROOT, REGISTRY_TSV), encoding="utf-8") as f:
+            return registry_tables(f.read())
+    except (OSError, SourceError) as e:
+        print(f"hf-arch-check: {e}", file=sys.stderr)
+        sys.exit(65)
+
+
+FROM_NAME, SPEC = load_registry()
 # crates/gpu-gates/src/bin/shared/serve_seats/decide.rs:ROWS with the constants of
 # crates/decision/src/release/{clef,lev}.rs.
 DECIDE_ROWS = (
@@ -1077,10 +1109,6 @@ SITE_RS = "crates/gpu/src/site.rs"
 RELEASE_RS = {"clef": "crates/decision/src/release/clef.rs", "lev": "crates/decision/src/release/lev.rs"}
 
 
-class SourceError(Exception):
-    pass
-
-
 def mask(src):
     """`src` with comments and the insides of string and char literals blanked, newlines and length kept, so an
     offset in it is an offset in `src`."""
@@ -1375,44 +1403,6 @@ def src_serves(serve, arch_consts, words):
     return direct, via
 
 
-def src_from_name(arch):
-    """Arch::from_name: {variant: [names]}."""
-    lo, hi = arch.one_body("from_name")
-    consts = arch.consts()
-    out = {}
-    for pat, (a, b) in arch.match_arms(lo, hi, r"\bmatch\s+name\b"):
-        if re.fullmatch(r"\s*[a-z_]\w*\s*", arch.m[pat[0]:pat[1]]):
-            continue
-        v = re.fullmatch(r"\s*Ok\(Arch::(\w+)\)\s*", arch.m[a:b])
-        if not v:
-            raise arch.err(a, f"a from_name arm this tool cannot read: {arch.m[a:b].strip()!r}")
-        out.setdefault(v.group(1), []).extend(names_of(arch, pat[0], pat[1], consts))
-    return out
-
-
-def src_spec(arch):
-    """spec: the architecture names its arms read, with `is_qwen35_body` resolved through QWEN35_BODY."""
-    lo, hi = arch.one_body("spec")
-    consts = arch.consts()
-    out = []
-    for pat, _ in arch.match_arms(lo, hi, r"\bmatch\s+split\.architecture\(\)"):
-        text = arch.m[pat[0]:pat[1]].strip()
-        some = re.fullmatch(r"Some\((.*)\)", text, re.S)
-        if re.fullmatch(r"[a-z_]\w*", text):
-            continue
-        if re.fullmatch(r"Some\(\w+\)\s+if\s+is_qwen35_body\(\w+\)", text):
-            body = consts.get("QWEN35_BODY")
-            if not isinstance(body, list):
-                raise arch.err(pat[0], "QWEN35_BODY is not a list of strings")
-            out.extend(body)
-        elif some:
-            open_at = arch.m.index("Some(", pat[0]) + len("Some")
-            out.extend(names_of(arch, open_at + 1, arch.close(open_at), consts))
-        else:
-            raise arch.err(pat[0], f"a spec arm this tool cannot read: {text!r}")
-    return out
-
-
 def src_decide_rows(seat, releases):
     """The decide rows: [{name, backbones, in_file_arch, in_file_decision, head_repo, quant_repo, unserved}]."""
     hit = re.search(r"\bconst\s+ROWS\b[^=]*=\s*&\[", seat.m)
@@ -1591,8 +1581,19 @@ def mirror_vs_source(read):
     direct, via = src_serves(serve, arch.consts(), words)
     out += diff_maps(f"{SERVE_RS}:Model::serves", SERVES, direct, SERVE_RS)
     out += diff_maps(f"{SERVE_RS}:Model::serves via Arch::from_name", SERVES_VIA_FROM_NAME, via, SERVE_RS)
-    out += diff_maps(f"{ARCH_RS}:Arch::from_name", FROM_NAME, src_from_name(arch), ARCH_RS)
-    out += diff_sets(f"{ARCH_RS}:spec", SPEC, src_spec(arch), ARCH_RS)
+    from_name, spec = registry_tables(read(REGISTRY_TSV))
+    out += diff_maps(f"{REGISTRY_TSV}:Arch::from_name", FROM_NAME, from_name, REGISTRY_TSV)
+    out += diff_sets(f"{REGISTRY_TSV}:spec", SPEC, spec, REGISTRY_TSV)
+    # A seat serves only what the model reader takes, and `Arch::from_name` names the variants it reads through.
+    for word, variants in via.items():
+        out += [f"{SERVE_RS}:Model::serves: the {word} seat reads Arch::{v}, which {REGISTRY_TSV} has no variant for"
+                for v in variants if v not in from_name]
+    for word, names in direct.items():
+        out += [f"{SERVE_RS}:Model::serves: the {word} seat serves {n!r}, which {REGISTRY_TSV} has no reader for"
+                for n in names if n not in spec]
+    for word, variants in via.items():
+        out += [f"{SERVE_RS}:Model::serves: the {word} seat serves {n!r}, which {REGISTRY_TSV} has no reader for"
+                for v in variants for n in from_name.get(v, ()) if n not in spec]
     rows = {r["name"]: r for r in src_decide_rows(seat, releases)}
     out += diff_sets("decide rows", [r["name"] for r in DECIDE_ROWS], list(rows), DECIDE_SEAT_RS)
     for mine in DECIDE_ROWS:
@@ -1607,6 +1608,8 @@ def mirror_vs_source(read):
                            f"{theirs[k]!r}")
     consts = arch.consts()
     out += diff_sets(f"{ARCH_RS}:QWEN35_BODY against BODY35_ARCHS", BODY35_ARCHS, consts.get("QWEN35_BODY", []), ARCH_RS)
+    out += [f"{ARCH_RS}:QWEN35_BODY: {n!r} has no reader in {REGISTRY_TSV}" for n in consts.get("QWEN35_BODY", [])
+            if n not in spec]
     out += diff_sets(f"{DECIDE_SEAT_RS}:BODIES predicates", DECIDE_BODY_PREDICATES, src_bodies(seat), DECIDE_SEAT_RS)
     _, calls = src_body35(Src(BODY35_RS, read(BODY35_RS)), Src(SITE_RS, read(SITE_RS)))
     mine = {}
@@ -1730,16 +1733,19 @@ def self_test():
         return read
 
     for name, path, old, new, want in (
-        ("a name added to Arch::from_name's glm arm is named", ARCH_RS,
-         '"glm5next" | GLM5_NEXT_LLAMA_CPP =>', '"glm5next" | GLM5_NEXT_LLAMA_CPP | "glm5-nxt" =>', "glm5-nxt"),
+        ("a name added to the registry's glm row is named", REGISTRY_TSV,
+         "glm5next,glm5-next\t", "glm5next,glm5-next,glm5-nxt\t", "glm5-nxt"),
         ("a name added to a Model::serves arm is named", SERVE_RS,
          'Model::Qwen38 => arch == "qwen4exp",', 'Model::Qwen38 => matches!(arch, "qwen4exp" | "qwen4expx"),',
          "qwen4expx"),
-        ("a name added to spec's arms is named", ARCH_RS, 'Some("mimo2") =>', 'Some("mimo2" | "mimo3") =>', "mimo3"),
+        ("a name added to a reading row of the registry is named", REGISTRY_TSV, "mimo2\tMimo2", "mimo2,mimo3\tMimo2",
+         "mimo3"),
+        ("a reader dropped from a row a seat serves is named", REGISTRY_TSV, "mimo2\tMimo2\tyes", "mimo2\tMimo2\tno",
+         "has no reader"),
         ("a name added to a decide row's backbones is named", RELEASE_RS["lev"],
          'pub const BACKBONES: &[&str] = &["qwen35"];', 'pub const BACKBONES: &[&str] = &["qwen35", "qwen36"];',
          "qwen36"),
-        ("a name dropped from the source is named", ARCH_RS, '"glm5next" | GLM5_NEXT_LLAMA_CPP =>', '"glm5next" =>',
+        ("a name dropped from the registry is named", REGISTRY_TSV, "glm5next,glm5-next\t", "glm5next\t",
          "glm5-next"),
         ("an id added to GgmlType::from_u32 is named", QUANT_RS, "            40 => GgmlType::NVFP4,\n",
          "            40 => GgmlType::NVFP4,\n            41 => GgmlType::Q1_0,\n", "'41'"),

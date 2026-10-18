@@ -10,6 +10,7 @@
 //!     fixture variant-rules <fixture first shard> --tag T [--table FILE]
 //!     fixture variant-check <variant first shard> --source <fixture first shard> --tag T
 //!                           [--table FILE]
+//!     fixture registry
 //!
 //! The spec is the family's whose architecture the first file declares (for `verify`, the
 //! fixture's, which is its source's); an architecture with no spec is refused by name.
@@ -28,7 +29,7 @@
 //! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
 //! file its family's source row names, when the row has one (a row can say its draft is not
 //! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `qwen35moe`, `glm5next`, `nemotron`, `nemotron-bolt`)
-//! reads its row of [`SOURCES`]: repo, quant and revision; a `<repo>:<quant>` takes `main`.
+//! reads its row of the registry (`model::arch::registry`): repo, quant and revision; a `<repo>:<quant>` takes `main`.
 //! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
 //! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
 //! It takes `generate`'s flags but `--draft`, and `--rev R` (a commit hash, tag or branch of the
@@ -41,7 +42,8 @@
 //! the fixture; it refuses a row that retypes nothing. `variant-check` holds a written variant to
 //! its source: the same header but for the tag, the same shards and shapes, the map's types, and
 //! every other tensor's bytes equal. The table is `--table`, else `tools/fixture-variants.tsv`
-//! under the working directory. A flag its verb does not take, a flag given twice,
+//! under the working directory. `registry` prints the architecture registry's rows (the text of
+//! `tools/arch-registry.tsv`). A flag its verb does not take, a flag given twice,
 //! `--draft-tensors` without `--draft` and `--draft-source` with no draft fixture are refused. One
 //! line per tensor, a summary line, and exit status 1 with the error on any failure.
 
@@ -58,6 +60,7 @@ use model::arch::nemotron_h::fixture as nemo;
 use model::arch::nemotron_h_moe::fixture as bolt;
 use model::arch::qwen35moe::fixture as qwen38;
 use model::arch::qwen35moe::fixture::qwen35moe as qwen36;
+use model::arch::registry::{self, DraftSource};
 use model::fixture::{
     self, DEFAULT_SEED, FilePlan, FixtureError, FixtureSpec, HeaderStat, Options, PlannedTensor,
     RemoteError, Sample, TensorStat, VARIANT_TABLE,
@@ -70,10 +73,13 @@ const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft
        fixture verify <fixture first shard> [--source <real first shard>] [--draft-source <real draft>]
        fixture variant-rules <fixture first shard> --tag T [--table FILE]
        fixture variant-check <variant first shard> --source <fixture first shard> --tag T [--table FILE]
+       fixture registry
 flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...
 flags of fetch: the same but --draft, and --rev R";
 
-/// Every family's spec, found by the architecture it declares.
+/// Every family's spec, found by the architecture it declares: the canonical string of its registry
+/// row, which holds the hub source and the draft ([`registry::fixture_of`]). The generators stay here,
+/// so the registry the engine reads reaches none of them.
 const SPECS: [fn() -> FixtureSpec; 6] = [
     v41::spec,
     qwen38::spec,
@@ -81,91 +87,6 @@ const SPECS: [fn() -> FixtureSpec; 6] = [
     glm5::spec,
     nemo::spec,
     bolt::spec,
-];
-
-/// Where a family's draft fixture comes from on the hub.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DraftSource {
-    /// The family has no draft file.
-    None,
-    /// The draft is this file name in the target's repo.
-    File(&'static str),
-    /// No public file is the draft's source; the reason, said when `fetch` skips it.
-    NotFetchable(&'static str),
-}
-
-/// The hub source a family's fixture is made from: `fixture fetch <family> <out dir>` reads
-/// the row, and an explicit `<repo>:<quant>` overrides it.
-struct Source {
-    spec: fn() -> FixtureSpec,
-    /// The name `fetch` takes: the family's directory under the fixture root.
-    family: &'static str,
-    repo: &'static str,
-    quant: &'static str,
-    /// The repo revision the fixture's source header is the header of (`main` when `None`).
-    rev: Option<&'static str>,
-    draft: DraftSource,
-}
-
-/// One row per entry of [`SPECS`].
-const SOURCES: [Source; 6] = [
-    Source {
-        spec: v41::spec,
-        family: "v41",
-        repo: "vcruz305/DeepSeek-V4.1-Flash-GGUF",
-        quant: "Q3_K_M",
-        rev: None,
-        draft: DraftSource::NotFetchable(
-            "the draft fixture is made from our own DSpark copy, and no public file has its header",
-        ),
-    },
-    Source {
-        spec: qwen38::spec,
-        family: "qwen38",
-        repo: "unsloth/Qwen3.8-Flash-Next-GGUF",
-        quant: "UD-Q4_K_XL",
-        rev: None,
-        draft: DraftSource::File("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
-    },
-    Source {
-        spec: qwen36::spec,
-        family: "qwen35moe",
-        repo: "lmstudio-community/Qwen3.6-35B-A3B-GGUF",
-        quant: "Q4_K_M",
-        // The commit whose header the spec's map was chosen from, pinned so a rewritten upstream
-        // file is a new fixture on purpose.
-        rev: Some("68a34855558af61cbef0324d31f411be8a506b08"),
-        draft: DraftSource::None,
-    },
-    Source {
-        spec: glm5::spec,
-        family: "glm5next",
-        repo: "unsloth/GLM-5.3-Flash-GGUF",
-        quant: "UD-Q4_K_XL",
-        // unsloth's later rewrite of shard 1 renamed `glm5next` to `glm5-next`; this is the
-        // commit before, whose header the fixture was made from.
-        rev: Some("621d456e93"),
-        draft: DraftSource::None,
-    },
-    Source {
-        spec: nemo::spec,
-        family: "nemotron",
-        repo: "nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF",
-        quant: "Q4_K_M",
-        // The commit the 2,837,072,864-byte file's header was read at.
-        rev: Some("ba223d14e45525f7fae81db77ea8cabeb2fc6c25"),
-        draft: DraftSource::None,
-    },
-    Source {
-        spec: bolt::spec,
-        family: "nemotron-bolt",
-        repo: "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
-        quant: "24GB",
-        // The repo's head commit when the row was written (the hub's API); the box's copy of
-        // the file was not compared with it.
-        rev: Some("e0fecb69cb3e5e4c5e8a056fa2aec98c78e91246"),
-        draft: DraftSource::None,
-    },
 ];
 
 /// The flags `plan` and `generate` take.
@@ -216,6 +137,7 @@ fn run(args: &[String]) -> Res<()> {
         "verify" => &VERIFY_FLAGS,
         "variant-rules" => &RULES_FLAGS,
         "variant-check" => &CHECK_FLAGS,
+        "registry" => &[],
         _ => return Err(USAGE.into()),
     };
     let a = Args::parse(cmd, takes, rest)?;
@@ -226,6 +148,10 @@ fn run(args: &[String]) -> Res<()> {
         ("verify", [first]) => verify(first, &a),
         ("variant-rules", [source]) => variant_rules(source, &a),
         ("variant-check", [variant]) => variant_check(variant, &a),
+        ("registry", []) => {
+            print!("{}", registry::print());
+            Ok(())
+        }
         _ => Err(USAGE.into()),
     }
 }
@@ -517,7 +443,7 @@ fn write_fixture(
 /// `generate` from the source `repo` (`<owner>/<name>[:<quant>]`) names, its headers read by
 /// range. The sources live in `<out>.fetch.<pid>`, removed whether or not the run succeeds.
 fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
-    let (r, rev) = match SOURCES.iter().find(|s| s.family == target) {
+    let (r, rev) = match registry::fixtures().find(|s| s.family == target) {
         Some(s) => (
             RepoRef {
                 repo: s.repo.to_string(),
@@ -582,10 +508,8 @@ fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()
         fixture::header_sha256(&split)
     );
     let spec = spec_of(&split, &first)?;
-    let row = SOURCES
-        .iter()
-        .find(|s| (s.spec)().arch == spec.arch)
-        .ok_or_else(|| format!("{first}: the {} family has no row in SOURCES", spec.arch))?;
+    let row = registry::fixture_of(spec.arch)
+        .ok_or_else(|| format!("{first}: the {} family has no fixture row", spec.arch))?;
     let mut draft_path: Option<String> = None;
     let draft = match row.draft {
         DraftSource::None => None,
@@ -820,12 +744,8 @@ mod tests {
     #[test]
     fn every_spec_has_one_source_row_and_v41s_draft_is_not_fetchable() {
         for spec in SPECS.iter().map(|f| f()) {
-            let rows: Vec<&Source> = SOURCES
-                .iter()
-                .filter(|s| (s.spec)().arch == spec.arch)
-                .collect();
-            assert_eq!(rows.len(), 1, "{}: {} source rows", spec.arch, rows.len());
-            let row = rows[0];
+            let row = registry::fixture_of(spec.arch)
+                .unwrap_or_else(|| panic!("{}: no fixture row", spec.arch));
             assert!(RepoRef::parse(&format!("{}:{}", row.repo, row.quant)).is_ok());
             // A family with a draft fixture says where the draft comes from, and one without
             // says there is none.
@@ -836,20 +756,23 @@ mod tests {
                 spec.arch
             );
         }
-        assert_eq!(SOURCES.len(), SPECS.len());
-        let names: std::collections::HashSet<_> = SOURCES.iter().map(|s| s.family).collect();
-        assert_eq!(names.len(), SOURCES.len(), "family names are unique");
-        let v41 = SOURCES.iter().find(|s| s.family == "v41").expect("v41 row");
-        assert!(matches!(v41.draft, DraftSource::NotFetchable(_)));
-        let glm = SOURCES
-            .iter()
-            .find(|s| s.family == "glm5next")
-            .expect("glm row");
-        assert_eq!(glm.rev, Some("621d456e93"));
-        let q36 = SOURCES
-            .iter()
-            .find(|s| s.family == "qwen35moe")
-            .expect("qwen35moe row");
+        // One spec to one row: each spec found its row above, the counts agree, and no two specs
+        // declare one architecture.
+        assert_eq!(registry::fixtures().count(), SPECS.len());
+        let archs: std::collections::HashSet<_> = SPECS.iter().map(|f| f().arch).collect();
+        assert_eq!(
+            archs.len(),
+            SPECS.len(),
+            "two specs declare one architecture"
+        );
+        let find = |family: &str| {
+            registry::fixtures()
+                .find(|s| s.family == family)
+                .unwrap_or_else(|| panic!("no {family} row"))
+        };
+        assert!(matches!(find("v41").draft, DraftSource::NotFetchable(_)));
+        assert_eq!(find("glm5next").rev, Some("621d456e93"));
+        let q36 = find("qwen35moe");
         assert_eq!(
             (q36.repo, q36.quant, q36.rev),
             (
@@ -875,8 +798,8 @@ mod tests {
 
         let root = PathBuf::from(refset::fixture::root().expect("the fixture root"));
         let (mut held, mut bad) = (Vec::new(), Vec::new());
-        for row in &SOURCES {
-            let spec = (row.spec)();
+        for spec in SPECS.iter().map(|f| f()) {
+            let row = registry::fixture_of(spec.arch).expect("a fixture row");
             let CardBudget::Planned(planner) = spec.card_budget else {
                 println!("{}: a fixed budget, nothing planned to check", row.family);
                 continue;

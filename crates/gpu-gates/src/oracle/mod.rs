@@ -112,29 +112,43 @@ impl Oracle {
     }
 }
 
-/// The table of architecture `a`. Every architecture the engine names has a
-/// row; one without reference sets would be an error naming it.
+/// The table of architecture `a`, its row in the registry below, keyed by the architecture string
+/// ([`Arch::name`]). An architecture with no table is an error naming it and why; one with no row
+/// is an error naming it.
 pub fn for_arch(a: Arch) -> Result<&'static Oracle, GateError> {
-    match a {
-        Arch::Deepseek2 => Ok(&deepseek2::ORACLE),
-        Arch::Deepseek41 => Ok(&deepseek41::ORACLE),
-        Arch::Qwen3moe => Ok(&qwen3moe::ORACLE),
-        Arch::Qwen35moe => Err(
-            "qwen35moe has no oracle row: its gate reads the sets through refset's family".into(),
+    /// One architecture's row: its table, or why it has none.
+    enum Row {
+        Table(&'static Oracle),
+        None(&'static str),
+    }
+    static ROWS: &[(&str, Row)] = &[
+        ("deepseek2", Row::Table(&deepseek2::ORACLE)),
+        ("deepseek41", Row::Table(&deepseek41::ORACLE)),
+        ("qwen3moe", Row::Table(&qwen3moe::ORACLE)),
+        (
+            "qwen35moe",
+            Row::None("its gate reads the sets through refset's family"),
         ),
-        Arch::Glm5next => Err(
-            "glm5next has no oracle row: its gate reads the sets through refset's family".into(),
+        (
+            "glm5next",
+            Row::None("its gate reads the sets through refset's family"),
         ),
-        Arch::Mimo2 => {
-            Err("mimo2 has no oracle row: its gate reads the sets through refset's family".into())
-        }
-        Arch::NemotronH => Err("nemotron_h has no oracle row: no program runs it".into()),
-        Arch::NemotronHMoe => Err("nemotron_h_moe has no oracle row: no program runs it".into()),
-        Arch::GemmaEmbedding => Err("gemma-embedding has no oracle row: no program runs it".into()),
-        Arch::GemmaEmbedding2 => Err(
-            "gemma-embedding2 has no oracle row: its gate reads mainline's sets by its family"
-                .into(),
+        (
+            "mimo2",
+            Row::None("its gate reads the sets through refset's family"),
         ),
+        ("nemotron_h", Row::None("no program runs it")),
+        ("nemotron_h_moe", Row::None("no program runs it")),
+        ("gemma-embedding", Row::None("no program runs it")),
+        (
+            "gemma-embedding2",
+            Row::None("its gate reads mainline's sets by its family"),
+        ),
+    ];
+    match ROWS.iter().find(|(name, _)| *name == a.name()) {
+        Some(&(_, Row::Table(oracle))) => Ok(oracle),
+        Some(&(name, Row::None(why))) => Err(format!("{name} has no oracle row: {why}").into()),
+        None => Err(format!("{} has no oracle row", a.name()).into()),
     }
 }
 

@@ -19,6 +19,18 @@ use gguf::Split;
 use model::arch::{self, Arch, coverage, models};
 use model::placement::PlacementError;
 
+/// The architectures whose program is a placed load of its own, or that no program runs: refused
+/// by name before any load. An architecture not listed here goes by its description.
+const OWN_LOAD: &[&str] = &[
+    "deepseek41",
+    "glm5next",
+    "mimo2",
+    "nemotron_h",
+    "nemotron_h_moe",
+    "gemma-embedding",
+    "gemma-embedding2",
+];
+
 /// The engine for whichever architecture a file declares, one arm per
 /// architecture this build can run. An architecture the model crate knows but
 /// this enum has no arm for is [`GpuError::UnsupportedArch`] from
@@ -52,18 +64,10 @@ impl AnyEngine {
             Ok(Arch::Deepseek2) => {
                 return Ok(AnyEngine::Deepseek2(Deepseek2Model::open(file, ctx)?));
             }
-            Ok(
-                a @ (Arch::Deepseek41
-                | Arch::Glm5next
-                | Arch::Mimo2
-                | Arch::NemotronH
-                | Arch::NemotronHMoe
-                | Arch::GemmaEmbedding
-                | Arch::GemmaEmbedding2),
-            ) => {
+            Ok(a) if OWN_LOAD.contains(&a.name()) => {
                 return Err(GpuError::UnsupportedArch(a.name().to_string()));
             }
-            Ok(Arch::Qwen3moe | Arch::Qwen35moe) | Err(_) => {}
+            Ok(_) | Err(_) => {}
         }
         let read = arch::spec(&file)?;
         let missing = coverage::check(&read.spec, &read.tensors);

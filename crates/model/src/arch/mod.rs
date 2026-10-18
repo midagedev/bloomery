@@ -27,34 +27,25 @@ pub mod nemotron_h;
 pub mod nemotron_h_moe;
 pub mod qwen35moe;
 pub mod qwen3moe;
+pub mod registry;
 mod stems;
 
 /// The typed model description, its readers' output: re-exported so a
 /// caller names one crate for the model and its description.
 pub use models;
 
-/// `split`'s [`ModelSpec`] by its family's reader, with every tensor's role:
+/// `split`'s [`ModelSpec`] by its family's reader ([`registry::ROWS`]), with every tensor's role:
 /// what the coverage check ([`coverage::check`]) and the programs read. An
 /// architecture no reader here reads is [`ModelError::UnknownArchitecture`]
 /// with the string the file held. `deepseek2` has no reader.
 pub fn spec(split: &Split) -> Result<Read, ModelError> {
-    Ok(match split.architecture() {
-        Some("deepseek41" | DEEPSEEK4) => deepseek41::spec::read(split)?,
-        Some("qwen3moe") => qwen3moe::spec::read(split)?,
-        Some("qwen35moe" | "qwen4exp") => qwen35moe::spec::read(split)?,
-        Some(a) if is_qwen35_body(a) => qwen35moe::spec::read(split)?,
-        Some("glm5next" | GLM5_NEXT_LLAMA_CPP) => glm5next::spec::read(split)?,
-        Some("mimo2") => mimo2::spec::read(split)?,
-        Some("nemotron_h") => nemotron_h::spec::read(split)?,
-        Some("nemotron_h_moe") => nemotron_h_moe::spec::read(split)?,
-        Some(GEMMA_EMBEDDING) => gemma_embedding::spec::read(split)?,
-        Some(GEMMA_EMBEDDING2) => gemma_embedding2::spec::read(split)?,
-        other => {
-            return Err(ModelError::UnknownArchitecture(
-                other.unwrap_or("<missing>").to_string(),
-            ));
-        }
-    })
+    let arch = split.architecture();
+    match arch.and_then(registry::row_of).and_then(|row| row.read) {
+        Some(read) => read(split).map_err(ModelError::from),
+        None => Err(ModelError::UnknownArchitecture(
+            arch.unwrap_or("<missing>").to_string(),
+        )),
+    }
 }
 
 /// A reader's output: the description, the roles, and the keys it took a
@@ -182,7 +173,8 @@ impl Arch {
     /// `deepseek4` (DeepSeek-V4-Flash) is read by the `deepseek41` module as
     /// one of its two models ([`deepseek41_model`]), and `glm5-next`
     /// ([`GLM5_NEXT_LLAMA_CPP`]) is `glm5next` under llama.cpp's spelling:
-    /// the variants whose name is not the only string they stand for.
+    /// the variants whose name is not the only string they stand for. The
+    /// registry's rows hold the same strings (the registry's test).
     pub fn from_name(name: &str) -> Result<Arch, ModelError> {
         match name {
             "deepseek2" => Ok(Arch::Deepseek2),

@@ -29,6 +29,9 @@ use model::arch::deepseek2::derived::Derived;
 use model::arch::deepseek2::forward::{argmax, forward, new_cache, step};
 use std::time::Instant;
 
+/// The architectures this binary runs; any other is refused by name.
+const RUNS: &[&str] = &["deepseek2"];
+
 fn main() {
     let mut model: Option<String> = None;
     let mut tokens: Vec<u32> = Vec::new();
@@ -104,18 +107,8 @@ fn main() {
             std::process::exit(1);
         });
         match Arch::detect(&probe) {
-            Ok(Arch::Deepseek2) => {}
-            Ok(
-                a @ (Arch::Deepseek41
-                | Arch::Qwen3moe
-                | Arch::Qwen35moe
-                | Arch::Glm5next
-                | Arch::Mimo2
-                | Arch::NemotronH
-                | Arch::NemotronHMoe
-                | Arch::GemmaEmbedding
-                | Arch::GemmaEmbedding2),
-            ) => {
+            Ok(a) if RUNS.contains(&a.name()) => {}
+            Ok(a) => {
                 eprintln!("bloomery-decode: unsupported architecture {:?}", a.name());
                 std::process::exit(1);
             }

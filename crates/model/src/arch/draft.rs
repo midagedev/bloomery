@@ -9,7 +9,7 @@
 use gguf::Split;
 use models::Borrows;
 
-use super::{metadata, mimo2, qwen35moe};
+use super::{metadata, mimo2, qwen35moe, registry};
 use crate::placement::PlacementError;
 
 /// The key that declares a file carries neither `token_embd` nor `output`.
@@ -135,24 +135,23 @@ pub enum DraftUsableError {
 
 /// One architecture's rule: the target's first shard, and the checkpoint the
 /// candidate draft file is made from (`None`: the family's file serves every
-/// checkpoint).
-type Rule = fn(&Split, Option<&str>) -> Result<(), DraftUsableError>;
+/// checkpoint). The rule of each architecture that has a draft is its
+/// registry row's ([`super::registry::ArchRow::draft`]); qwen35moe's draft is
+/// the target file's own next-token layer. An architecture with no rule has
+/// none in its row.
+pub type Rule = fn(&Split, Option<&str>) -> Result<(), DraftUsableError>;
 
-/// Each architecture that has a draft and its rule, keyed by the
-/// `general.architecture` its target declares. qwen35moe's draft is the
-/// target file's own next-token layer. An architecture with no row has no
-/// rule.
-const RULES: &[(&str, Rule)] = &[
-    ("qwen4exp", qwen4exp_usable),
-    ("mimo2", mimo2_usable),
-    ("qwen35moe", qwen35moe_usable),
-];
-
-fn qwen4exp_usable(target: &Split, checkpoint: Option<&str>) -> Result<(), DraftUsableError> {
+pub(super) fn qwen4exp_usable(
+    target: &Split,
+    checkpoint: Option<&str>,
+) -> Result<(), DraftUsableError> {
     qwen35moe::mtp::target_usable(target, checkpoint).map_err(DraftUsableError::from)
 }
 
-fn qwen35moe_usable(target: &Split, checkpoint: Option<&str>) -> Result<(), DraftUsableError> {
+pub(super) fn qwen35moe_usable(
+    target: &Split,
+    checkpoint: Option<&str>,
+) -> Result<(), DraftUsableError> {
     if let Some(name) = checkpoint {
         return Err(PlacementError::Metadata {
             key: "general.name".to_string(),
@@ -184,17 +183,20 @@ fn qwen35moe_usable(target: &Split, checkpoint: Option<&str>) -> Result<(), Draf
     }
 }
 
-fn mimo2_usable(target: &Split, checkpoint: Option<&str>) -> Result<(), DraftUsableError> {
+pub(super) fn mimo2_usable(
+    target: &Split,
+    checkpoint: Option<&str>,
+) -> Result<(), DraftUsableError> {
     mimo2::mtp::target_usable(target, checkpoint).map_err(DraftUsableError::from)
 }
 
 /// Whether the set whose first shard is `target` can run a draft file made
-/// from `checkpoint`: its architecture's rule, as [`RULES`] holds it. An
+/// from `checkpoint`: its architecture's rule, as its registry row holds it. An
 /// architecture with no rule is refused by name.
 pub fn draft_usable(target: &Split, checkpoint: Option<&str>) -> Result<(), DraftUsableError> {
     let arch = target.architecture().unwrap_or("<missing>");
-    match RULES.iter().find(|(a, _)| *a == arch) {
-        Some((_, rule)) => rule(target, checkpoint),
+    match registry::row_of(arch).and_then(|row| row.draft) {
+        Some(rule) => rule(target, checkpoint),
         None => Err(DraftUsableError::NoRule {
             arch: arch.to_string(),
         }),
