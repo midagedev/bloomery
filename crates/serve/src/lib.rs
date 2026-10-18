@@ -46,6 +46,7 @@ pub mod screen;
 mod slotfile;
 mod stop;
 mod swap;
+pub mod video;
 mod worker;
 
 pub use api::{

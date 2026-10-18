@@ -275,6 +275,15 @@ this server reads text only`). The Clef decide seat answers it with a 501 and ll
 supported - hint: if this is unexpected, you may need to provide the mmproj`). Lev takes no image: `--mmproj` beside
 it is refused, and a request with an image is a 501.
 
+**Video input.** A model with a video rule reads a clip when `ffmpeg` and `ffprobe` (5.1 or newer) are on `PATH`; the
+server looks once at start, prints one `video:` line, and answers `/props` with `modalities.video` true. A clip is an
+`input_video` part (`{"data": <base64>, "format": "mp4"}`) or a `video_url` part holding a `data:video/*;base64,` URL;
+any other URL is refused, not fetched, and so is a request body over 64 MiB. The server writes the clip to a temp file,
+probes it, plans the frames by the model's rule (rate, frame bounds, group size, token cap) under the context the
+request's text leaves, and has ffmpeg decode only the planned frames. Without ffmpeg, a clip is a 400 that names the
+fix. EmbeddingGemma 2's embeddings route takes the same parts and still takes decoded frames (a first text part
+`Video:`, then `image_url` frames).
+
 **The engines behind the server.** The release ships `bloomery-serve` alone. A source build also has
 `generate_ds41` (token ids in, greedy ids out), `bloomery-chat` (streams text) and the standalone V4.1 and Qwen3.8
 servers `bloomery-serve-ds41` and `bloomery-serve-qwen38` ([`BUILD.md`](BUILD.md)). Every seat and flag is its
