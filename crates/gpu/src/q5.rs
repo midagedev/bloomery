@@ -2,9 +2,10 @@
 //! q8_1 activations quantized on the device. Cores live here outside this
 //! file's `#[cuda_module]` (docs/gpu-design.md decision 6), the module holds
 //! the activation quantizers — every column, or the card's expert slots'
-//! columns alone (`q5_quantize_q8_sel`) — and the gemv wrappers, and the host
-//! side owns the load-time weight repack, the activation scratch and the
-//! enqueue API.
+//! columns alone (`q5_quantize_q8_sel`; `q5_quantize_q8_rep` for slots that
+//! share a source column, `q5_quantize_q8_sel_relu_sqr` over the squared ReLU
+//! of each value) — and the gemv wrappers, and the host side owns the
+//! load-time weight repack, the activation scratch and the enqueue API.
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE, quad_finite};
@@ -390,31 +391,70 @@ pub(crate) unsafe fn q5_row_dot(
     [f0, f1, f2, f3, f4, f5, f6, f7]
 }
 
-/// One warp's group of four 32-value quant blocks of column `col`: the body
-/// both [`q5_kernels::q5_quantize_q8`] and the merged pair kernel run, so
-/// neither can drift from the other. Lane ℓ owns the values of word ℓ
-/// (values `128g + 4ℓ .. +3`), its octet `ℓ>>3` is one 32-value block, and
-/// the block's scale and byte sum are 1-2-4 xor butterflies inside that
-/// octet — masks that never cross an octet, so a partial last group is safe.
-/// Lanes past the last block read the final block's values (full-warp
-/// shuffles, in bounds) and store nothing. A lane that reads a non-finite
-/// value raises [`FaultSite::Q5Quant`] on `fault`; the stores are unchanged.
+/// What a 32-value quantizer does to each f32 as it reads it, before the
+/// block's finiteness check, scale and codes. The quantizer is one body; the
+/// input it is handed is the rule's.
+pub(crate) trait Load {
+    /// The value the quantizer takes for the stored `v`.
+    fn value(v: f32) -> f32;
+}
+
+/// The stored values as they are: the plain quantizer.
+pub(crate) struct Plain;
+
+impl Load for Plain {
+    #[inline(always)]
+    fn value(v: f32) -> f32 {
+        v
+    }
+}
+
+/// `max(v, 0)²` for a finite `v`: the up rows of a relu² expert quantized
+/// without the f32 round trip through memory. A non-finite value passes
+/// through as it is, so its block is refused (`max` would turn a NaN or a
+/// negative infinity into 0 before the quantizer could see it) and the
+/// square of an infinity is not a code.
+pub(crate) struct ReluSqr;
+
+impl Load for ReluSqr {
+    #[inline(always)]
+    fn value(v: f32) -> f32 {
+        if !v.is_finite() {
+            v
+        } else {
+            let r = if v > 0.0 { v } else { 0.0 };
+            r * r
+        }
+    }
+}
+
+/// One warp's group of four 32-value quant blocks of column `col`, read from
+/// column `src` of `x` through `L`: the body every 32-value quantizer entry
+/// of this module runs, so none can drift from the others. Lane ℓ owns the
+/// values of word ℓ (values `128g + 4ℓ .. +3`), its octet `ℓ>>3` is one
+/// 32-value block, and the block's scale and byte sum are 1-2-4 xor
+/// butterflies inside that octet — masks that never cross an octet, so a
+/// partial last group is safe. Lanes past the last block read the final
+/// block's values (full-warp shuffles, in bounds) and store nothing. A lane
+/// whose values, after `L`, are not all finite raises [`FaultSite::Q5Quant`]
+/// on `fault`; the stores are unchanged.
 ///
 /// Lives outside the `#[cuda_module]` for the reason the cores above do: a
-/// device-callable body shared by two kernels. It takes the module's
+/// device-callable body shared by several kernels. It takes the module's
 /// `DisjointSlice` outputs, which no core does.
 ///
 /// SAFETY: the caller guarantees `col < m_cols`, `g < n_groups`, the launch
-/// contract's bounds on `x`, `q`, `s8` and `d8`, and that all 32 lanes of
-/// one warp enter with the same `(col, g)` — the shuffles below are
-/// warp-wide.
+/// contract's bounds on `x` (`src` a column of it), `q`, `s8` and `d8`, and
+/// that all 32 lanes of one warp enter with the same `(src, col, g)` — the
+/// shuffles below are warp-wide.
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub(crate) unsafe fn q5_quant_group(
+pub(crate) unsafe fn q5_quant_group<L: Load>(
     x: &[f32],
+    src: usize,
     col: usize,
     g: usize,
     k_blocks: u32,
@@ -432,15 +472,15 @@ pub(crate) unsafe fn q5_quant_group(
     // Inactive lanes of a partial last group read the LAST block's values
     // so every shuffle below runs on a full warp; they store nothing.
     let bread = if active { b } else { k_blocks as usize - 1 };
-    let base = col * k_blocks as usize * 32 + 32 * bread + 4 * i;
-    // SAFETY: base + 3 < (col+1)*32*k_blocks <= m_cols*k_blocks*32 <=
-    // x.len() by the caller's contract.
+    let base = src * k_blocks as usize * 32 + 32 * bread + 4 * i;
+    // SAFETY: base + 3 < (src+1)*32*k_blocks <= x.len() by the caller's
+    // contract (`src` a column of `x`).
     let (v0, v1, v2, v3) = unsafe {
         (
-            *x.get_unchecked(base),
-            *x.get_unchecked(base + 1),
-            *x.get_unchecked(base + 2),
-            *x.get_unchecked(base + 3),
+            L::value(*x.get_unchecked(base)),
+            L::value(*x.get_unchecked(base + 1)),
+            L::value(*x.get_unchecked(base + 2)),
+            L::value(*x.get_unchecked(base + 3)),
         )
     };
     if !quad_finite([v0, v1, v2, v3]) {
@@ -476,6 +516,67 @@ pub(crate) unsafe fn q5_quant_group(
                 *d8.get_unchecked_mut(col * k_blocks as usize + b) = d;
             }
         }
+    }
+}
+
+/// [`q5_quant_group`] for the card slot `j` of a launch: the group `g` of
+/// output column `col = c0 + j`, read from column `col / rep` of `x` through
+/// `L` when the slot's place `sel[j]` is below `n_card`, the card's experts,
+/// and a return before any load otherwise: a slot the host serves ([`HOST`])
+/// has no activation here and its column keeps what it held. A place in
+/// `[n_card, HOST)`, no expert either side serves, raises
+/// [`FaultSite::ExpertId`] on `fault` first. `rep` columns share one source
+/// column (a token's `rep` slots); `rep = 1` is a column of its own.
+///
+/// SAFETY: `q5_quant_group`'s, with `j < sel.len()`, `rep >= 1`, and all 32
+/// lanes of one warp entering with the same `(j, g)`, so the return is
+/// warp-uniform.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub(crate) unsafe fn q5_quant_slot<L: Load>(
+    x: &[f32],
+    sel: &[u32],
+    rep: usize,
+    c0: usize,
+    j: usize,
+    g: usize,
+    n_card: u32,
+    k_blocks: u32,
+    q_stride: u32,
+    lane: usize,
+    q: &mut DisjointSlice<u32>,
+    s8: &mut DisjointSlice<i32>,
+    d8: &mut DisjointSlice<f32>,
+    fault: FaultSink,
+) {
+    // SAFETY: j < sel.len() by the caller's contract.
+    let place = unsafe { *sel.get_unchecked(j) };
+    if place >= n_card {
+        if place != HOST && lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+        }
+        return;
+    }
+    let col = c0 + j;
+    // SAFETY: the caller's contract: column `col / rep` of `x`, column `col`
+    // of the outputs.
+    unsafe {
+        q5_quant_group::<L>(
+            x,
+            col / rep,
+            col,
+            g,
+            k_blocks,
+            q_stride,
+            lane,
+            q,
+            s8,
+            d8,
+            fault,
+        )
     }
 }
 
@@ -540,8 +641,8 @@ mod q5_kernels {
         // launch contract carries the rest of `q5_quant_group`'s
         // preconditions, and the group index is warp-uniform.
         unsafe {
-            q5_quant_group(
-                x, col, g, k_blocks, q_stride, lane, &mut q, &mut s8, &mut d8, fault,
+            q5_quant_group::<Plain>(
+                x, col, col, g, k_blocks, q_stride, lane, &mut q, &mut s8, &mut d8, fault,
             )
         }
     }
@@ -606,10 +707,150 @@ mod q5_kernels {
         // above; the launch contract bounds x, q, s8 and d8 at c0 + m_cols
         // columns, and the group index is warp-uniform.
         unsafe {
-            q5_quant_group(
+            q5_quant_group::<Plain>(
                 x,
                 c0 as usize + j,
+                c0 as usize + j,
                 g,
+                k_blocks,
+                q_stride,
+                lane,
+                &mut q,
+                &mut s8,
+                &mut d8,
+                fault,
+            )
+        }
+    }
+
+    /// [`q5_quantize_q8_sel`] with one source row for `rep` consecutive
+    /// columns: the 32-value q8_1 form of row `c / rep` of `x` into column
+    /// `c = c0 + j` of the outputs, for the slots `j < m_cols` whose place
+    /// `sel[j]` is below `n_card` ([`q5_quant_slot`]; the rest as that
+    /// kernel leaves them). A token's normed row, quantized once into each of
+    /// its `rep` routed slots' columns, is the input of an ungated up `_sel`
+    /// that reads column `s` for slot `s` like a down: no `_sel` entry needs a
+    /// second column rule.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            x.len() >= x_rows * k_blocks * 32,
+            c0 + m_cols <= x_rows * rep,
+            sel.len() >= m_cols,
+            q.len() >= (c0 + m_cols) * q_stride,
+            s8.len() >= (c0 + m_cols) * k_blocks,
+            d8.len() >= (c0 + m_cols) * k_blocks
+        )
+    )]
+    pub fn q5_quantize_q8_rep(
+        x: &[f32],
+        sel: &[u32],
+        rep: u32,
+        x_rows: u32,
+        c0: u32,
+        m_cols: u32,
+        n_card: u32,
+        n_groups: u32,
+        k_blocks: u32,
+        q_stride: u32,
+        mut q: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        let grp = thread::index_1d().get() / 32;
+        if grp >= m_cols as usize * n_groups as usize {
+            return;
+        }
+        let (j, g) = (grp / n_groups as usize, grp % n_groups as usize);
+        let lane = warp::lane_id() as usize;
+        // SAFETY: j < m_cols <= sel.len() and, `m_cols` being non-zero here,
+        // 1 <= rep by the launch contract's `c0 + m_cols <= x_rows * rep`;
+        // column (c0 + j) / rep < x_rows and the outputs' columns c0 + j <
+        // c0 + m_cols are inside the contract's bounds; the group index is
+        // warp-uniform.
+        unsafe {
+            q5_quant_slot::<Plain>(
+                x,
+                sel,
+                rep as usize,
+                c0 as usize,
+                j,
+                g,
+                n_card,
+                k_blocks,
+                q_stride,
+                lane,
+                &mut q,
+                &mut s8,
+                &mut d8,
+                fault,
+            )
+        }
+    }
+
+    /// [`q5_quantize_q8_sel`] over the squared ReLU of each value
+    /// ([`ReluSqr`]): the relu² expert's up rows quantized as the input of its
+    /// down `_sel`, the bytes `elem`'s `relu_sqr` then the plain quantizer
+    /// leave, without the squared rows in memory. A non-finite value is not
+    /// the rule's input: it raises [`FaultSite::Q5Quant`] on `fault` as the
+    /// plain quantizer raises it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            x.len() >= (c0 + m_cols) * k_blocks * 32,
+            sel.len() >= m_cols,
+            q.len() >= (c0 + m_cols) * q_stride,
+            s8.len() >= (c0 + m_cols) * k_blocks,
+            d8.len() >= (c0 + m_cols) * k_blocks
+        )
+    )]
+    pub fn q5_quantize_q8_sel_relu_sqr(
+        x: &[f32],
+        sel: &[u32],
+        c0: u32,
+        m_cols: u32,
+        n_card: u32,
+        n_groups: u32,
+        k_blocks: u32,
+        q_stride: u32,
+        mut q: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        let grp = thread::index_1d().get() / 32;
+        if grp >= m_cols as usize * n_groups as usize {
+            return;
+        }
+        let (j, g) = (grp / n_groups as usize, grp % n_groups as usize);
+        let lane = warp::lane_id() as usize;
+        // SAFETY: j < m_cols <= sel.len(), column c0 + j < c0 + m_cols of `x`
+        // and the outputs by the launch contract; the group index is
+        // warp-uniform.
+        unsafe {
+            q5_quant_slot::<ReluSqr>(
+                x,
+                sel,
+                1,
+                c0 as usize,
+                j,
+                g,
+                n_card,
                 k_blocks,
                 q_stride,
                 lane,
@@ -690,8 +931,8 @@ mod q5_kernels {
         unsafe {
             if blk < total_a {
                 let (col, g) = (blk / n_groups as usize, blk % n_groups as usize);
-                q5_quant_group(
-                    xa, col, g, k_blocks, q_stride, lane, &mut qa, &mut s8a, &mut d8a, fault,
+                q5_quant_group::<Plain>(
+                    xa, col, col, g, k_blocks, q_stride, lane, &mut qa, &mut s8a, &mut d8a, fault,
                 );
             } else {
                 let k = blk - total_a;
@@ -1265,6 +1506,36 @@ fn q5_blocks(
     Ok(k / 32)
 }
 
+/// What the card-slot quantizers check before they launch: the slots'
+/// columns `q.cols` non-empty and inside `act`, `q.x` holding `x_cols`
+/// columns of `act.k()` values, a place a slot and at least one card expert.
+/// Returns the launch's slot count.
+fn check_sel(
+    what: &'static str,
+    q: &QuantSel<'_>,
+    act: &Q8Blocks32,
+    x_cols: usize,
+) -> Result<usize, GpuError> {
+    let (k, m) = (act.k(), q.cols.len());
+    if m == 0 || q.cols.end > act.m() || q.x.len() < x_cols * k || q.sel.len() < m || q.n_card == 0
+    {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "columns {:?} of {k} values from {} values ({x_cols} source columns needed) \
+                 into {} columns, {} places, a card of {} experts: the columns non-empty and \
+                 inside both, a place a column, at least one expert",
+                q.cols,
+                q.x.len(),
+                act.m(),
+                q.sel.len(),
+                q.n_card
+            ),
+        ));
+    }
+    Ok(m)
+}
+
 /// The loaded q5 device module and its enqueue API. Every enqueue is
 /// asynchronous, allocation-free and capturable (the engine stream; never the
 /// null stream).
@@ -1352,34 +1623,108 @@ impl Q5Kernels {
         fault: FaultSink,
     ) -> Result<(), GpuError> {
         let what = "enqueue_quantize_q8_sel";
-        let (k, m) = (act.k(), q.cols.len());
-        if m == 0
-            || q.cols.end > act.m()
-            || q.x.len() < q.cols.end * k
-            || q.sel.len() < m
-            || q.n_card == 0
-        {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "columns {:?} of {k} values from {} into {} columns, {} places, a card of \
-                     {} experts: the columns non-empty and inside both, a place a column, at \
-                     least one expert",
-                    q.cols,
-                    q.x.len(),
-                    act.m(),
-                    q.sel.len(),
-                    q.n_card
-                ),
-            ));
-        }
-        let (k_blocks, q_stride) = (k / 32, act.q_stride());
+        let m = check_sel(what, q, act, q.cols.end)?;
+        let (k_blocks, q_stride) = (act.k() / 32, act.q_stride());
         let n_groups = k_blocks.div_ceil(4);
         let grid = launch_u32(what, "grid", m * n_groups)?;
         let prep = self
             .module
             .prepare_q5_quantize_q8_sel(LaunchConfig1D::new(grid, 32, 0))?;
         self.module.q5_quantize_q8_sel(
+            stream,
+            &prep,
+            q.x,
+            q.sel,
+            launch_u32(what, "c0", q.cols.start)?,
+            launch_u32(what, "m_cols", m)?,
+            launch_u32(what, "n_card", q.n_card)?,
+            launch_u32(what, "n_groups", n_groups)?,
+            launch_u32(what, "k_blocks", k_blocks)?,
+            launch_u32(what, "q_stride", q_stride)?,
+            &mut act.q,
+            &mut act.s8,
+            &mut act.d8,
+            fault,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`q5_kernels::q5_quantize_q8_rep`]: [`Self::
+    /// enqueue_quantize_q8_sel`] with `rep` consecutive columns sharing one
+    /// source column: column `c` of `q.cols` of `act` is the 32-value q8_1
+    /// form of column `c / rep` of `q.x` (`ceil(q.cols.end / rep)` columns of
+    /// `act.k()` values), for the slots the card serves; the other columns of
+    /// `act` and the faults are that launcher's. A token's normed row quantized
+    /// into the columns of its `rep` slots is the input of an ungated up `_sel`
+    /// over the card's slots. One launch. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_quantize_q8_rep(
+        &self,
+        stream: &CudaStream,
+        q: &QuantSel<'_>,
+        rep: usize,
+        act: &mut Q8Blocks32,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_quantize_q8_rep";
+        if rep == 0 {
+            return Err(GpuError::shape(
+                what,
+                "rep must be at least 1, the columns a source column fills".to_owned(),
+            ));
+        }
+        let x_rows = q.cols.end.div_ceil(rep);
+        let m = check_sel(what, q, act, x_rows)?;
+        let (k_blocks, q_stride) = (act.k() / 32, act.q_stride());
+        let n_groups = k_blocks.div_ceil(4);
+        let grid = launch_u32(what, "grid", m * n_groups)?;
+        let prep = self
+            .module
+            .prepare_q5_quantize_q8_rep(LaunchConfig1D::new(grid, 32, 0))?;
+        self.module.q5_quantize_q8_rep(
+            stream,
+            &prep,
+            q.x,
+            q.sel,
+            launch_u32(what, "rep", rep)?,
+            launch_u32(what, "x_rows", x_rows)?,
+            launch_u32(what, "c0", q.cols.start)?,
+            launch_u32(what, "m_cols", m)?,
+            launch_u32(what, "n_card", q.n_card)?,
+            launch_u32(what, "n_groups", n_groups)?,
+            launch_u32(what, "k_blocks", k_blocks)?,
+            launch_u32(what, "q_stride", q_stride)?,
+            &mut act.q,
+            &mut act.s8,
+            &mut act.d8,
+            fault,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`q5_kernels::q5_quantize_q8_sel_relu_sqr`]: [`Self::
+    /// enqueue_quantize_q8_sel`] over `max(v, 0)²` of each value, the up rows
+    /// of a relu² expert as the input of its down `_sel`. The bytes are
+    /// `ElemKernels::enqueue_relu_sqr` then `enqueue_quantize_q8_sel`'s; a
+    /// non-finite value of a card column refuses its block and raises
+    /// [`FaultSite::Q5Quant`] on `fault`. One launch. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_quantize_q8_sel_relu_sqr(
+        &self,
+        stream: &CudaStream,
+        q: &QuantSel<'_>,
+        act: &mut Q8Blocks32,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_quantize_q8_sel_relu_sqr";
+        let m = check_sel(what, q, act, q.cols.end)?;
+        let (k_blocks, q_stride) = (act.k() / 32, act.q_stride());
+        let n_groups = k_blocks.div_ceil(4);
+        let grid = launch_u32(what, "grid", m * n_groups)?;
+        let prep = self
+            .module
+            .prepare_q5_quantize_q8_sel_relu_sqr(LaunchConfig1D::new(grid, 32, 0))?;
+        self.module.q5_quantize_q8_sel_relu_sqr(
             stream,
             &prep,
             q.x,

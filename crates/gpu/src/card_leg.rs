@@ -21,6 +21,20 @@
 //! launches are slot-local and read their columns by slot, so a unit of a
 //! prompt batch and a decode step leave the same bits for the same slot.
 //!
+//! The relu² form ([`Relu2Leg`]) is the same four launches for an expert with
+//! no gate, `h = relu(up · x)²`, over the 32-value-block types
+//! ([`kernels::card_sel32_runs`]) alone:
+//! - the token's normed row in 32-value q8_1, once in the column of each of
+//!   its slots (`Q5Kernels::enqueue_quantize_q8_rep`), so the up is a
+//!   down-shaped `_sel` that reads column `s` for slot `s` ([`kernels::up`])
+//!   and no `_sel` entry has a column rule of its own;
+//! - the up `_sel`, writing `h` (`ff` rows a slot);
+//! - the q8_1 of the card slots' `max(h, 0)²` in the form the down reads
+//!   (`Q5Kernels::enqueue_quantize_q8_sel_relu_sqr`; a slot the run places
+//!   off the card is left alone);
+//! - the down `_sel` and, optionally, the card slots' weighted sum.
+//! The widths need not be multiples of 256: `n` and `ff` are multiples of 32.
+//!
 //! What stays with the caller, because it is the family's: the slots' places
 //! `sel` (the handoff's, or a batch's `CardSlotKernels::enqueue_places`), what
 //! the sum is combined with (a shared expert, the residual, the host tier's
@@ -41,6 +55,7 @@
 //! for is refused by name at the launch.
 
 use crate::card_slots::{CardAcc, CardSlotKernels, CardSlots};
+use crate::fault::FaultSink;
 use crate::iq_sel::{IqDown, IqGateUp, IqSelKernels};
 use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use crate::mxfp4_sel::Mxfp4SelKernels;
@@ -353,6 +368,15 @@ impl CardLeg {
         })
     }
 
+    /// The modules the 32-value-block `_sel`s run on.
+    fn sel32(&self) -> Sel32<'_> {
+        Sel32 {
+            q51: &self.q51,
+            q80: &self.q80,
+            iq: &self.iq,
+        }
+    }
+
     /// Enqueue on `gpu`'s stream the four launches (module doc) of `run` into
     /// `bufs`, and with `sum` the card slots' sum after them; `run.m` outside
     /// `1..=bufs.shape().cap`, a down entry that reads the other activation
@@ -374,15 +398,8 @@ impl CardLeg {
             down,
         } = bufs;
         let shape = *shape;
-        if sum.is_some() && CardSlots::of(shape.slots_per_col).is_none() {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "the card sum: {} routed slots a token: the sum's entries are built for 6, 8 \
-                     and 10",
-                    shape.slots_per_col
-                ),
-            });
+        if sum.is_some() {
+            check_sum(shape)?;
         }
         let scratch = Scratch {
             shape,
@@ -391,21 +408,17 @@ impl CardLeg {
             act_h,
         };
         self.launch(gpu, scratch, run, down)?;
-        let Some(LegSum { w, acc }) = sum else {
+        let Some(sum) = sum else {
             return Ok(());
         };
-        let a = CardAcc {
-            down,
-            w,
-            sel: run.sel,
-            n: shape.n,
-            m: run.m,
-            n_card: run.n_card,
-            n_used: shape.slots_per_col,
-            w_pitch: shape.slots_per_col,
-            fault: gpu.layer_sink(run.layer)?,
-        };
-        self.slots.enqueue_card_acc(gpu.stream(), &a, acc)
+        enqueue_sum(
+            &self.slots,
+            gpu,
+            shape,
+            (down, run.sel),
+            (run.layer, run.m, run.n_card),
+            sum,
+        )
     }
 
     /// [`CardLeg::enqueue`]'s four launches, the down rows written to `down`
@@ -556,25 +569,16 @@ impl CardLeg {
                 };
                 self.mxfp4.enqueue_down(stream, &d, fault, down)?;
             }
-            (Some((DownEntry::Q5_1, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
-                let d = Q51SelDown {
-                    w,
+            (Some((entry, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
+                let run = Sel32Run {
+                    entry,
+                    stack: &st.down,
                     act,
                     sel,
                     n_slots: slots,
                     rows_per_expert,
                 };
-                self.q51.enqueue_gemv_q5_1_sel(stream, &d, fault, down)?;
-            }
-            (Some((DownEntry::Q8_0, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
-                let d = Q80SelDown {
-                    w,
-                    act,
-                    sel,
-                    n_slots: slots,
-                    rows_per_expert,
-                };
-                self.q80.enqueue_gemv_q8_0_sel32(stream, &d, fault, down)?;
+                self.sel32().enqueue(stream, &run, fault, down)?;
             }
             (
                 Some((
@@ -593,19 +597,359 @@ impl CardLeg {
                 self.iq
                     .enqueue_gemv_sel(stream, st.down.ty, &d, fault, down)?;
             }
-            (Some((DownEntry::Iq4nl, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
+            _ => return Err(st.down.unrun()),
+        }
+        Ok(())
+    }
+}
+
+/// The sum a run ends with is over a slot count the sum has an entry for:
+/// refused by name before the run launches anything.
+fn check_sum(shape: LegShape) -> Result<(), GpuError> {
+    if CardSlots::of(shape.slots_per_col).is_none() {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "the card sum: {} routed slots a token: the sum's entries are built for 6, 8 \
+                 and 10",
+                shape.slots_per_col
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The card slots' weighted sum of `down` (the run's rows, `m` tokens of
+/// `shape.slots_per_col` slots) under the places `sel`, after the run's
+/// launches: [`LegSum`] says what it reads and writes. `(layer, m, n_card)` are
+/// the run's.
+fn enqueue_sum(
+    slots: &CardSlotKernels,
+    gpu: &Gpu,
+    shape: LegShape,
+    (down, sel): (&DeviceBuffer<f32>, &DeviceBuffer<u32>),
+    (layer, m, n_card): (usize, usize, usize),
+    sum: LegSum<'_>,
+) -> Result<(), GpuError> {
+    let LegSum { w, acc } = sum;
+    let a = CardAcc {
+        down,
+        w,
+        sel,
+        n: shape.n,
+        m,
+        n_card,
+        n_used: shape.slots_per_col,
+        w_pitch: shape.slots_per_col,
+        fault: gpu.layer_sink(layer)?,
+    };
+    slots.enqueue_card_acc(gpu.stream(), &a, acc)
+}
+
+/// The modules a 32-value-block `_sel` runs on, borrowed from a leg.
+struct Sel32<'a> {
+    q51: &'a Q51SelKernels,
+    q80: &'a Q80SelKernels,
+    iq: &'a IqSelKernels,
+}
+
+/// One 32-value-block `_sel` launch: slot `s` writes the `rows_per_expert`
+/// rows of expert `sel[s]` of `stack` dotted with column `s` of `act`, to
+/// `y[s · rows_per_expert ..]`. `entry` is the table's row for the stack's
+/// type, [`kernels::down`]'s for a down and [`kernels::up`]'s for an up (one
+/// entry: an up is a down-shaped `_sel`).
+#[derive(Clone, Copy)]
+struct Sel32Run<'a> {
+    entry: DownEntry,
+    stack: &'a LegStack<'a>,
+    act: &'a Q8Blocks32,
+    sel: &'a DeviceBuffer<u32>,
+    n_slots: usize,
+    rows_per_expert: usize,
+}
+
+impl Sel32<'_> {
+    /// Enqueue the launch of `run`; an entry the table names that has no arm
+    /// here is refused by name.
+    fn enqueue(
+        &self,
+        stream: &CudaStream,
+        run: &Sel32Run<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let Sel32Run {
+            entry,
+            stack,
+            act,
+            sel,
+            n_slots,
+            rows_per_expert,
+        } = *run;
+        let w = stack.w;
+        match entry {
+            DownEntry::Q5_1 => {
+                let d = Q51SelDown {
+                    w,
+                    act,
+                    sel,
+                    n_slots,
+                    rows_per_expert,
+                };
+                self.q51.enqueue_gemv_q5_1_sel(stream, &d, fault, y)
+            }
+            DownEntry::Q8_0 => {
+                let d = Q80SelDown {
+                    w,
+                    act,
+                    sel,
+                    n_slots,
+                    rows_per_expert,
+                };
+                self.q80.enqueue_gemv_q8_0_sel32(stream, &d, fault, y)
+            }
+            DownEntry::Iq4nl => {
                 let d = IqDown {
                     w,
                     act,
                     sel,
-                    n_slots: slots,
+                    n_slots,
                     rows_per_expert,
                 };
-                self.iq.enqueue_down(stream, &d, fault, down)?;
+                self.iq.enqueue_down(stream, &d, fault, y)
             }
-            _ => return Err(st.down.unrun()),
+            _ => Err(stack.unrun()),
+        }
+    }
+}
+
+/// A layer's two resident routed stacks of an expert with no gate: the up and
+/// the down, each of a type [`kernels::card_sel32_runs`] admits (not
+/// necessarily the same one).
+pub struct Relu2Stacks<'a> {
+    up: LegStack<'a>,
+    down: LegStack<'a>,
+}
+
+impl<'a> Relu2Stacks<'a> {
+    /// The stacks named `[up, down]` in `w`, each a resident
+    /// `DevWeight::KQuant` of a 32-value-block type the relu² form runs.
+    /// Allocation-free on success.
+    pub fn of(w: &'a Weights, names: [&'a str; 2]) -> Result<Relu2Stacks<'a>, GpuError> {
+        const UP: &str = "a resident routed up stack of a 32-value-block type the card leg runs (`kernels::card_sel32_runs`)";
+        const DOWN: &str = "a resident routed down stack of a 32-value-block type the card leg runs (`kernels::card_sel32_runs`)";
+        let [up, down] = names;
+        Ok(Relu2Stacks {
+            up: LegStack::of(w, up, kernels::card_sel32_runs, UP)?,
+            down: LegStack::of(w, down, kernels::card_sel32_runs, DOWN)?,
+        })
+    }
+
+    /// The stacks hold `n_card` experts of `shape` each: the up's `ff` rows of
+    /// `n` values, the down's `n` rows of `ff`.
+    pub fn check(&self, n_card: usize, shape: LegShape) -> Result<(), GpuError> {
+        let LegShape { n, ff, .. } = shape;
+        for (st, rows, k) in [(&self.up, ff, n), (&self.down, n, ff)] {
+            if st.w.rows() != n_card * rows || st.k != k {
+                return Err(GpuError::Tensor {
+                    what: WHAT,
+                    name: st.name.to_owned(),
+                    need: "the rows of the layer's card experts, of the shape's width",
+                });
+            }
         }
         Ok(())
+    }
+}
+
+/// One relu² run's buffers for up to `shape.cap` tokens: the normed row's
+/// 32-value q8_1 form once a slot, the up's rows, the card slots' q8_1 columns
+/// of `max(h, 0)²` and the down's rows. `shape.n` and `shape.ff` are
+/// multiples of 32.
+pub struct Relu2Bufs {
+    shape: LegShape,
+    act_x: Q8Blocks32,
+    h: DeviceBuffer<f32>,
+    act_h: Q8Blocks32,
+    down: DeviceBuffer<f32>,
+}
+
+impl Relu2Bufs {
+    /// The buffers for runs of `shape`. Load-time or first-prompt only.
+    pub fn new(stream: &CudaStream, shape: LegShape) -> Result<Relu2Bufs, GpuError> {
+        let slots = shape.slots();
+        Ok(Relu2Bufs {
+            shape,
+            act_x: Q8Blocks32::with_slots(stream, shape.n, slots)?,
+            h: DeviceBuffer::zeroed(stream, slots * shape.ff)?,
+            act_h: Q8Blocks32::with_slots(stream, shape.ff, slots)?,
+            down: DeviceBuffer::zeroed(stream, slots * shape.n)?,
+        })
+    }
+
+    /// The shape the buffers were made for.
+    #[must_use]
+    pub fn shape(&self) -> LegShape {
+        self.shape
+    }
+
+    /// Device bytes of the buffers: [`relu2_leg_bytes`] of their shape, as
+    /// allocated.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        let q8 = |a: &Q8Blocks32| a.q.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes();
+        q8(&self.act_x) + self.h.num_bytes() + q8(&self.act_h) + self.down.num_bytes()
+    }
+
+    /// The down rows of the last run: `n` values a slot, slot-major, the slots
+    /// the run placed on the card (the rest are as an earlier run left them).
+    #[must_use]
+    pub fn down(&self) -> &DeviceBuffer<f32> {
+        &self.down
+    }
+}
+
+/// Device bytes a [`Relu2Bufs::new`] of `shape` allocates, counted before it
+/// does: the normed row's q8_1 form and the card slots' (`cap · slots_per_col`
+/// columns of `n` and of `ff`), the up's rows and the down's rows.
+#[must_use]
+pub fn relu2_leg_bytes(shape: LegShape) -> usize {
+    let slots = shape.slots();
+    let f = size_of::<f32>();
+    q8_blocks32_bytes(slots, shape.n)
+        + f * slots * shape.ff
+        + q8_blocks32_bytes(slots, shape.ff)
+        + f * slots * shape.n
+}
+
+/// What [`Relu2Leg::enqueue`] reads: layer `layer`'s `stacks`, `m` tokens'
+/// normed rows `normed`, and the slots' places `sel` (`m · slots_per_col` ids;
+/// an id below `n_card` is a card expert, the rest are left alone).
+pub struct Relu2Run<'a> {
+    pub layer: usize,
+    pub stacks: &'a Relu2Stacks<'a>,
+    pub normed: &'a DeviceBuffer<f32>,
+    pub m: usize,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n_card: usize,
+}
+
+/// The modules the relu² form's launches run on, beside the quantizers of
+/// `Gpu::q5`.
+pub struct Relu2Leg {
+    q51: Q51SelKernels,
+    q80: Q80SelKernels,
+    iq: IqSelKernels,
+    slots: CardSlotKernels,
+}
+
+impl Relu2Leg {
+    /// The modules on `gpu`. Load-time only.
+    pub fn load(gpu: &Gpu) -> Result<Relu2Leg, GpuError> {
+        let (ctx, word) = (gpu.context(), gpu.fault_word());
+        Ok(Relu2Leg {
+            q51: Q51SelKernels::load(ctx, word)?,
+            q80: Q80SelKernels::load(ctx, word)?,
+            iq: IqSelKernels::load(ctx, word)?,
+            slots: CardSlotKernels::load(ctx)?,
+        })
+    }
+
+    /// The modules the 32-value-block `_sel`s run on.
+    fn sel32(&self) -> Sel32<'_> {
+        Sel32 {
+            q51: &self.q51,
+            q80: &self.q80,
+            iq: &self.iq,
+        }
+    }
+
+    /// Enqueue on `gpu`'s stream the four launches (module doc) of `run` into
+    /// `bufs`, and with `sum` the card slots' sum after them; `run.m` outside
+    /// `1..=bufs.shape().cap`, or a sum over a slot count the sum has no entry
+    /// for, is refused by name before the first launch. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue(
+        &self,
+        gpu: &Gpu,
+        bufs: &mut Relu2Bufs,
+        run: &Relu2Run<'_>,
+        sum: Option<LegSum<'_>>,
+    ) -> Result<(), GpuError> {
+        let Relu2Bufs {
+            shape,
+            act_x,
+            h,
+            act_h,
+            down,
+        } = bufs;
+        let LegShape {
+            cap,
+            slots_per_col,
+            n,
+            ff,
+        } = *shape;
+        if run.m == 0 || run.m > cap {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("a run of {} tokens in buffers of {cap}", run.m),
+            });
+        }
+        if sum.is_some() {
+            check_sum(*shape)?;
+        }
+        let st = run.stacks;
+        let entry = |stack: &LegStack<'_>| kernels::up(stack.ty).ok_or_else(|| stack.unrun());
+        let (up_entry, down_entry) = (entry(&st.up)?, entry(&st.down)?);
+        let stream = gpu.stream();
+        let fault = gpu.layer_sink(run.layer)?;
+        let slots = run.m * slots_per_col;
+        let sel32 = self.sel32();
+        let q = QuantSel {
+            x: run.normed,
+            cols: 0..slots,
+            sel: run.sel,
+            n_card: run.n_card,
+        };
+        gpu.q5()
+            .enqueue_quantize_q8_rep(stream, &q, slots_per_col, act_x, fault)?;
+        let up = Sel32Run {
+            entry: up_entry,
+            stack: &st.up,
+            act: act_x,
+            sel: run.sel,
+            n_slots: slots,
+            rows_per_expert: ff,
+        };
+        sel32.enqueue(stream, &up, fault, h)?;
+        let q = QuantSel {
+            x: h,
+            cols: 0..slots,
+            sel: run.sel,
+            n_card: run.n_card,
+        };
+        gpu.q5()
+            .enqueue_quantize_q8_sel_relu_sqr(stream, &q, act_h, fault)?;
+        let dn = Sel32Run {
+            entry: down_entry,
+            stack: &st.down,
+            act: act_h,
+            sel: run.sel,
+            n_slots: slots,
+            rows_per_expert: n,
+        };
+        sel32.enqueue(stream, &dn, fault, down)?;
+        let Some(sum) = sum else {
+            return Ok(());
+        };
+        enqueue_sum(
+            &self.slots,
+            gpu,
+            *shape,
+            (down, run.sel),
+            (run.layer, run.m, run.n_card),
+            sum,
+        )
     }
 }
 
@@ -726,17 +1070,31 @@ pub(crate) mod tests {
     /// them, so `tys` holds one; the other types' rows are the same word
     /// stream, filed as derived weights.
     fn weights(gpu: &Gpu, shape: LegShape, tys: &[GgmlType]) -> Weights {
+        weights_for(gpu, shape, tys, |role, ty| match role {
+            "down" => kernels::card_down_runs(ty),
+            _ => kernels::card_gate_up_runs(ty),
+        })
+    }
+
+    /// [`weights`] with the roles each type is filed in chosen by `admits`
+    /// (`"gate"`, `"up"` or `"down"`, and the type).
+    fn weights_for(
+        gpu: &Gpu,
+        shape: LegShape,
+        tys: &[GgmlType],
+        admits: impl Fn(&str, GgmlType) -> bool,
+    ) -> Weights {
         let LegShape { n, ff, .. } = shape;
         let mut decls = Vec::new();
         let mut data = Vec::new();
         let mut derived = Vec::new();
         for (i, &ty) in tys.iter().enumerate() {
-            for (role, rows, k, runs) in [
-                ("gate", N_CARD * ff, n, kernels::card_gate_up_runs(ty)),
-                ("up", N_CARD * ff, n, kernels::card_gate_up_runs(ty)),
-                ("down", N_CARD * n, ff, kernels::card_down_runs(ty)),
+            for (role, rows, k) in [
+                ("gate", N_CARD * ff, n),
+                ("up", N_CARD * ff, n),
+                ("down", N_CARD * n, ff),
             ] {
-                if !runs {
+                if !admits(role, ty) {
                     continue;
                 }
                 let seed = 0x9e37_79b9_7f4a_7c15 ^ ((i as u64) << 8 | role.len() as u64);
@@ -968,8 +1326,13 @@ pub(crate) mod tests {
     /// Token `t`'s normed row: a function of `t` alone, so a column holds the
     /// same values at every `m`.
     fn wide_row(t: usize) -> Vec<f32> {
+        row_of(t, WIDE_N)
+    }
+
+    /// Token `t`'s normed row of `n` values, a function of `t` alone.
+    fn row_of(t: usize, n: usize) -> Vec<f32> {
         let mut state = (t as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        (0..WIDE_N)
+        (0..n)
             .map(|_| ((next(&mut state) >> 33) % 2001) as f32 / 1000.0 - 1.0)
             .collect()
     }
@@ -979,8 +1342,13 @@ pub(crate) mod tests {
     /// not serve. A run of any `m` therefore mixes duplicates (seven expert
     /// slots of four experts a token), every card expert and host slots.
     fn wide_places(t: usize) -> [u32; SPC] {
+        places_of(t)
+    }
+
+    /// [`wide_places`] for tokens of `S` slots.
+    fn places_of<const S: usize>(t: usize) -> [u32; S] {
         std::array::from_fn(|j| {
-            if j == (3 * t + 1) % SPC {
+            if j == (3 * t + 1) % S {
                 HOST
             } else {
                 ((j + t) % N_CARD) as u32
@@ -1288,6 +1656,572 @@ pub(crate) mod tests {
         assert!(
             own_rows.iter().all(|v| *v == SENT),
             "enqueue_rows wrote the buffers' own rows"
+        );
+    }
+
+    /// The relu² tests' normed width and routed width: neither a multiple of
+    /// 256 (84 and 58 blocks of 32), the second with a partial last group of
+    /// four blocks in the quantizers.
+    const R2_N: usize = 2688;
+    /// See [`R2_N`].
+    const R2_FF: usize = 1856;
+    /// Slots a token carries in the relu² tests.
+    const R2_SPC: usize = 6;
+    /// Tokens the relu² buffers hold: 54 slot columns, more than a warp's 32.
+    const R2_CAP: usize = 9;
+    /// The shape of the relu² tests' buffers.
+    const R2_SHAPE: LegShape = LegShape {
+        cap: R2_CAP,
+        slots_per_col: R2_SPC,
+        n: R2_N,
+        ff: R2_FF,
+    };
+    /// The tokens of the relu² runs: one, a few, and the buffers' cap.
+    const R2_RUNS: [usize; 3] = [1, 4, R2_CAP];
+    /// The relu² cases, `(up type, down type)`: the three 32-value types
+    /// `kernels::card_sel32_runs` admits, each in both roles, with the mixes a
+    /// real file holds (an IQ4_NL up under an IQ4_NL, a Q8_0 and a Q5_1 down).
+    const R2_CASES: [(GgmlType, GgmlType); 5] = [
+        (GgmlType::IQ4_NL, GgmlType::IQ4_NL),
+        (GgmlType::IQ4_NL, GgmlType::Q8_0),
+        (GgmlType::IQ4_NL, GgmlType::Q5_1),
+        (GgmlType::Q8_0, GgmlType::Q8_0),
+        (GgmlType::Q5_1, GgmlType::Q5_1),
+    ];
+
+    /// The launches the relu² form is made of, run by hand on buffers of
+    /// exactly the run's slots: the plain quantizer over the rows repeated once
+    /// a slot, the up and down `_sel` entries of the type, `elem`'s `relu_sqr`
+    /// and the select quantizer.
+    struct Hand {
+        q51: Q51SelKernels,
+        q80: Q80SelKernels,
+        iq: IqSelKernels,
+    }
+
+    impl Hand {
+        fn load(gpu: &Gpu) -> Hand {
+            let (ctx, word) = (gpu.context(), gpu.fault_word());
+            Hand {
+                q51: Q51SelKernels::load(ctx, word).expect("the q5_1 module"),
+                q80: Q80SelKernels::load(ctx, word).expect("the q8_0 module"),
+                iq: IqSelKernels::load(ctx, word).expect("the iq module"),
+            }
+        }
+
+        /// The `_sel` of the 32-value type `ty` over `act`.
+        fn sel32(
+            &self,
+            gpu: &Gpu,
+            (ty, w): (GgmlType, &DeviceTensor<u32>),
+            (act, sel): (&Q8Blocks32, &DeviceBuffer<u32>),
+            (n_slots, rows_per_expert): (usize, usize),
+            y: &mut DeviceBuffer<f32>,
+        ) {
+            let (stream, sink) = (gpu.stream(), gpu.layer_sink(0).expect("a sink"));
+            match ty {
+                GgmlType::Q5_1 => {
+                    let d = Q51SelDown {
+                        w,
+                        act,
+                        sel,
+                        n_slots,
+                        rows_per_expert,
+                    };
+                    self.q51.enqueue_gemv_q5_1_sel(stream, &d, sink, y)
+                }
+                GgmlType::Q8_0 => {
+                    let d = Q80SelDown {
+                        w,
+                        act,
+                        sel,
+                        n_slots,
+                        rows_per_expert,
+                    };
+                    self.q80.enqueue_gemv_q8_0_sel32(stream, &d, sink, y)
+                }
+                GgmlType::IQ4_NL => {
+                    let d = IqDown {
+                        w,
+                        act,
+                        sel,
+                        n_slots,
+                        rows_per_expert,
+                    };
+                    self.iq.enqueue_down(stream, &d, sink, y)
+                }
+                other => panic!("no hand launch for {other}"),
+            }
+            .unwrap_or_else(|e| panic!("the hand {ty} launch: {e}"));
+        }
+
+        /// The first `m` tokens of `normed` (host values, `R2_N` a token)
+        /// through the whole form: `(act_x, act_h, rows)`, the rows of the
+        /// card slots written and the sentinel elsewhere.
+        fn run(
+            &self,
+            gpu: &Gpu,
+            w: &Weights,
+            names: [&str; 2],
+            (up_ty, dn_ty): (GgmlType, GgmlType),
+            (normed, sel): (&[f32], &DeviceBuffer<u32>),
+            m: usize,
+        ) -> (Q8Blocks32, Q8Blocks32, Vec<f32>) {
+            let (stream, sink) = (gpu.stream(), gpu.layer_sink(0).expect("a sink"));
+            let slots = m * R2_SPC;
+            let rep: Vec<f32> = (0..slots)
+                .flat_map(|s| normed[(s / R2_SPC) * R2_N..][..R2_N].to_vec())
+                .collect();
+            let x = DeviceBuffer::from_host(stream, &rep).expect("the repeated rows");
+            let mut act_x = Q8Blocks32::with_slots(stream, R2_N, slots).expect("act_x");
+            gpu.q5()
+                .enqueue_quantize_q8(stream, &x, &mut act_x, sink)
+                .expect("the plain quantizer");
+            let mut h = DeviceBuffer::<f32>::zeroed(stream, slots * R2_FF).expect("h");
+            self.sel32(
+                gpu,
+                (up_ty, words(w, names[0])),
+                (&act_x, sel),
+                (slots, R2_FF),
+                &mut h,
+            );
+            let mut sq = DeviceBuffer::<f32>::zeroed(stream, slots * R2_FF).expect("relu²");
+            gpu.elem()
+                .enqueue_relu_sqr(stream, &h, slots * R2_FF, &mut sq)
+                .expect("relu_sqr");
+            let mut act_h = Q8Blocks32::with_slots(stream, R2_FF, slots).expect("act_h");
+            let q = QuantSel {
+                x: &sq,
+                cols: 0..slots,
+                sel,
+                n_card: N_CARD,
+            };
+            gpu.q5()
+                .enqueue_quantize_q8_sel(stream, &q, &mut act_h, sink)
+                .expect("the select quantizer");
+            let mut down =
+                DeviceBuffer::from_host(stream, &vec![SENT; slots * R2_N]).expect("the rows");
+            self.sel32(
+                gpu,
+                (dn_ty, words(w, names[1])),
+                (&act_h, sel),
+                (slots, R2_N),
+                &mut down,
+            );
+            let rows = down.to_host_vec(stream).expect("the hand rows");
+            (act_x, act_h, rows)
+        }
+    }
+
+    /// The first difference between two quantized activations over the card
+    /// slots' columns, named by plane and column, or `None`.
+    fn blocks32_diff(
+        gpu: &Gpu,
+        (got, want): (&Q8Blocks32, &Q8Blocks32),
+        places: &[u32],
+    ) -> Option<String> {
+        let (g, w) = (
+            got.readback(gpu.stream()).expect("readback"),
+            want.readback(gpu.stream()).expect("readback"),
+        );
+        let (q_stride, k_blocks) = (got.q_stride(), got.k() / 32);
+        for (c, &place) in places.iter().enumerate() {
+            if place == HOST {
+                continue;
+            }
+            let q = c * q_stride..(c + 1) * q_stride;
+            let b = c * k_blocks..(c + 1) * k_blocks;
+            if g.q[q.clone()] != w.q[q] {
+                return Some(format!("column {c}: the codes differ"));
+            }
+            if g.s8[b.clone()] != w.s8[b.clone()] {
+                return Some(format!("column {c}: the block sums differ"));
+            }
+            if let Some(i) = b.clone().find(|&i| g.d8[i].to_bits() != w.d8[i].to_bits()) {
+                return Some(format!("column {c}: block {} scale differs", i - b.start));
+            }
+        }
+        None
+    }
+
+    /// The relu² form against the launches it is made of, run by hand on
+    /// buffers of exactly the run's slots, for every type of both roles
+    /// (`R2_CASES`) at Lightning's widths and `R2_RUNS` tokens of six slots
+    /// through buffers of `R2_CAP`: the q8_1 columns after the repeating
+    /// quantizer and after the squared-ReLU select quantizer are the plain
+    /// quantizer's of the repeated rows and the select quantizer's of
+    /// `elem`'s `relu_sqr`, bit for bit; the down rows are the hand launches'
+    /// bit for bit and, token by token, the rows a one-token run writes; a
+    /// host slot keeps its sentinel; the card sum is the sum entry's over the
+    /// leg's own rows; nothing past the run's slots is written.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_relu2_leg_runs_its_launches_as_the_hand_launches() {
+        let ids = |tys: Vec<GgmlType>| {
+            let mut ids: Vec<u32> = tys.into_iter().map(GgmlType::as_u32).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        let admitted = ids((0..64)
+            .map(GgmlType::from_u32)
+            .filter(|&ty| kernels::card_sel32_runs(ty))
+            .collect());
+        assert_eq!(
+            ids(R2_CASES.iter().map(|c| c.0).collect()),
+            admitted,
+            "the cases' up types are not the types the relu² form admits"
+        );
+        assert_eq!(
+            ids(R2_CASES.iter().map(|c| c.1).collect()),
+            admitted,
+            "the cases' down types are not the types the relu² form admits"
+        );
+        let sel_all: Vec<u32> = (0..R2_CAP).flat_map(places_of::<R2_SPC>).collect();
+        for m in R2_RUNS {
+            assert!(
+                mixes(&sel_all[..m * R2_SPC]),
+                "the places of {m} tokens must mix duplicates, every card expert and host slots"
+            );
+        }
+
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let (stream, sink) = (gpu.stream(), gpu.layer_sink(0).expect("a sink"));
+        let leg = Relu2Leg::load(&gpu).expect("the leg");
+        let hand = Hand::load(&gpu);
+        let slots_kernels = CardSlotKernels::load(gpu.context()).expect("the sum entries");
+        let mut tys: Vec<GgmlType> = R2_CASES.iter().flat_map(|&(u, d)| [u, d]).collect();
+        tys.sort_by_key(|ty| ty.as_u32());
+        tys.dedup();
+        let w = weights_for(&gpu, R2_SHAPE, &tys, |role, ty| {
+            role != "gate" && kernels::card_sel32_runs(ty)
+        });
+        let host_normed: Vec<f32> = (0..R2_CAP).flat_map(|t| row_of(t, R2_N)).collect();
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
+        let sel = DeviceBuffer::from_host(stream, &sel_all).expect("the places");
+        let route: Vec<f32> = (0..R2_CAP * R2_SPC)
+            .map(|i| 0.0625 + (i % 7) as f32 / 16.0)
+            .collect();
+        let route = DeviceBuffer::from_host(stream, &route).expect("the routing weights");
+        let one = LegShape { cap: 1, ..R2_SHAPE };
+
+        let mut failures = Vec::new();
+        for (up_ty, dn_ty) in R2_CASES {
+            let names = [stack_name("up", up_ty), stack_name("down", dn_ty)];
+            let stacks = Relu2Stacks::of(&w, [&names[0], &names[1]]).expect("the stacks");
+            stacks.check(N_CARD, R2_SHAPE).expect("the stacks' shape");
+            let mut one_bufs = Relu2Bufs::new(stream, one).expect("one token's buffers");
+            let oracle: Vec<Vec<f32>> = (0..R2_CAP)
+                .map(|t| {
+                    let row = DeviceBuffer::from_host(stream, &row_of(t, R2_N)).expect("a row");
+                    let sel_t = DeviceBuffer::from_host(stream, &places_of::<R2_SPC>(t))
+                        .expect("a token's places");
+                    one_bufs
+                        .down
+                        .copy_from_host(stream, &vec![SENT; R2_SPC * R2_N])
+                        .expect("the sentinel");
+                    let run = Relu2Run {
+                        layer: 0,
+                        stacks: &stacks,
+                        normed: &row,
+                        m: 1,
+                        sel: &sel_t,
+                        n_card: N_CARD,
+                    };
+                    leg.enqueue(&gpu, &mut one_bufs, &run, None)
+                        .unwrap_or_else(|e| panic!("{up_ty}/{dn_ty}: token {t}: {e}"));
+                    one_bufs.down.to_host_vec(stream).expect("the rows")
+                })
+                .collect();
+
+            for m in R2_RUNS {
+                let slots = m * R2_SPC;
+                let mut bufs = Relu2Bufs::new(stream, R2_SHAPE).expect("the buffers");
+                bufs.down
+                    .copy_from_host(stream, &vec![SENT; R2_CAP * R2_SPC * R2_N])
+                    .expect("the sentinel");
+                let mut acc = DeviceBuffer::from_host(stream, &vec![SENT; R2_CAP * R2_N])
+                    .expect("the sum's rows");
+                let run = Relu2Run {
+                    layer: 0,
+                    stacks: &stacks,
+                    normed: &normed,
+                    m,
+                    sel: &sel,
+                    n_card: N_CARD,
+                };
+                let sum = LegSum {
+                    w: &route,
+                    acc: &mut acc,
+                };
+                leg.enqueue(&gpu, &mut bufs, &run, Some(sum))
+                    .unwrap_or_else(|e| panic!("{up_ty}/{dn_ty}, m = {m}: the leg: {e}"));
+                let got = bufs.down.to_host_vec(stream).expect("the leg's rows");
+                let got_acc = acc.to_host_vec(stream).expect("the leg's sum");
+                let (hx, hh, want) = hand.run(
+                    &gpu,
+                    &w,
+                    [&names[0], &names[1]],
+                    (up_ty, dn_ty),
+                    (&host_normed, &sel),
+                    m,
+                );
+                let mut want_acc = DeviceBuffer::from_host(stream, &vec![SENT; R2_CAP * R2_N])
+                    .expect("the sum's rows");
+                let a = CardAcc {
+                    down: &bufs.down,
+                    w: &route,
+                    sel: &sel,
+                    n: R2_N,
+                    m,
+                    n_card: N_CARD,
+                    n_used: R2_SPC,
+                    w_pitch: R2_SPC,
+                    fault: sink,
+                };
+                slots_kernels
+                    .enqueue_card_acc(stream, &a, &mut want_acc)
+                    .expect("the hand sum");
+                let want_acc = want_acc.to_host_vec(stream).expect("the hand sum");
+                let faulted = gpu.take_fault().expect("the fault word");
+
+                let mut bad = Vec::new();
+                if let Some(f) = faulted {
+                    bad.push(format!("the run raised {f:?}"));
+                }
+                let places = &sel_all[..slots];
+                if let Some(d) = blocks32_diff(&gpu, (&bufs.act_x, &hx), places) {
+                    bad.push(format!("the repeated q8_1 columns: {d}"));
+                }
+                if let Some(d) = blocks32_diff(&gpu, (&bufs.act_h, &hh), places) {
+                    bad.push(format!("the relu² q8_1 columns: {d}"));
+                }
+                for (s, &place) in places.iter().enumerate() {
+                    let (token, j) = (s / R2_SPC, s % R2_SPC);
+                    let rows = s * R2_N..(s + 1) * R2_N;
+                    if let Err(why) = slot_state(&got[rows.clone()], place) {
+                        bad.push(format!("slot {s} (token {token}): {why}"));
+                        continue;
+                    }
+                    let one_token = &oracle[token][j * R2_N..(j + 1) * R2_N];
+                    for (what, other) in [
+                        ("the hand launches'", &want[rows.clone()]),
+                        ("the one-token run's", one_token),
+                    ] {
+                        if let Some(r) = (0..R2_N).find(|&r| {
+                            place != HOST && got[rows.start + r].to_bits() != other[r].to_bits()
+                        }) {
+                            bad.push(format!(
+                                "slot {s} (token {token}) row {r}: {:#010x}, {what} {:#010x}",
+                                got[rows.start + r].to_bits(),
+                                other[r].to_bits()
+                            ));
+                        }
+                    }
+                }
+                if got[slots * R2_N..].iter().any(|v| *v != SENT) {
+                    bad.push("the run wrote past its slots".to_string());
+                }
+                let sum_rows = m * R2_N;
+                if let Some(i) =
+                    (0..sum_rows).find(|&i| got_acc[i].to_bits() != want_acc[i].to_bits())
+                {
+                    bad.push(format!(
+                        "card sum value {i}: {:#010x}, the sum entry's {:#010x}",
+                        got_acc[i].to_bits(),
+                        want_acc[i].to_bits()
+                    ));
+                }
+                if got_acc[..sum_rows]
+                    .iter()
+                    .any(|v| !v.is_finite() || *v == SENT)
+                {
+                    bad.push("a card sum value is no finite value the run wrote".to_string());
+                }
+                if got_acc[sum_rows..].iter().any(|v| *v != SENT) {
+                    bad.push("the sum wrote past its tokens".to_string());
+                }
+                let verdict = if bad.is_empty() { "ok" } else { "FAIL" };
+                println!("leg_relu2[up {up_ty}, down {dn_ty}, m = {m}] {verdict}");
+                if let Some(first) = bad.first() {
+                    failures.push(format!(
+                        "up {up_ty}, down {dn_ty}, m = {m}: {} findings; first: {first}",
+                        bad.len()
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// The relu² form's buffers hold the bytes [`relu2_leg_bytes`] counts, and
+    /// its refusals are by name before the first launch: a stack of a type the
+    /// form has no launch for, stacks of another shape, a run of no tokens or
+    /// more than the buffers hold, a sum over seven slots, widths off the
+    /// 32-value block. A NaN in a card slot's normed row raises `Q5Quant` from
+    /// the repeating quantizer.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_relu2_leg_counts_its_bytes_and_refuses_by_name() {
+        use crate::fault::FaultSite;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let leg = Relu2Leg::load(&gpu).expect("the leg");
+        for shape in [
+            R2_SHAPE,
+            LegShape {
+                cap: 2,
+                slots_per_col: 7,
+                n: 96,
+                ff: 32,
+            },
+        ] {
+            let bufs = Relu2Bufs::new(stream, shape).expect("the buffers");
+            assert_eq!(bufs.bytes(), relu2_leg_bytes(shape), "{shape:?}");
+        }
+        for (n, ff) in [(R2_N - 16, R2_FF), (R2_N, R2_FF + 8)] {
+            let shape = LegShape { n, ff, ..R2_SHAPE };
+            let refused = Relu2Bufs::new(stream, shape);
+            assert!(
+                matches!(&refused, Err(GpuError::Shape { .. })),
+                "n = {n}, ff = {ff} are not multiples of 32: {:?}",
+                refused.map(|_| ())
+            );
+        }
+
+        // Q4_K is no 32-value type: refused when the stacks are read, in
+        // either role; the 32-value types come through.
+        let mixed = weights_for(
+            &gpu,
+            SHAPE,
+            &[GgmlType::Q4_K, GgmlType::IQ4_NL],
+            |role, ty| role != "gate" && (kernels::card_sel32_runs(ty) || ty == GgmlType::Q4_K),
+        );
+        let (k_up, k_down) = (
+            stack_name("up", GgmlType::Q4_K),
+            stack_name("down", GgmlType::Q4_K),
+        );
+        let (nl_up, nl_down) = (
+            stack_name("up", GgmlType::IQ4_NL),
+            stack_name("down", GgmlType::IQ4_NL),
+        );
+        for (role, names) in [("up", [&k_up, &nl_down]), ("down", [&nl_up, &k_down])] {
+            let refused = Relu2Stacks::of(&mixed, [names[0], names[1]]);
+            assert!(
+                matches!(&refused, Err(GpuError::Tensor { what: WHAT, .. })),
+                "a Q4_K {role} stack: {:?}",
+                refused.map(|_| ())
+            );
+        }
+        Relu2Stacks::of(&mixed, [&nl_up, &nl_down]).expect("IQ4_NL stacks");
+
+        let tys = [GgmlType::IQ4_NL, GgmlType::Q8_0];
+        let w = weights_for(&gpu, R2_SHAPE, &tys, |role, ty| {
+            role != "gate" && kernels::card_sel32_runs(ty)
+        });
+        let names = [
+            stack_name("up", GgmlType::IQ4_NL),
+            stack_name("down", GgmlType::Q8_0),
+        ];
+        let stacks = Relu2Stacks::of(&w, [&names[0], &names[1]]).expect("the stacks");
+        stacks.check(N_CARD, R2_SHAPE).expect("the stacks' shape");
+        for (n_card, shape) in [
+            (N_CARD + 1, R2_SHAPE),
+            (
+                N_CARD,
+                LegShape {
+                    ff: R2_FF - 32,
+                    ..R2_SHAPE
+                },
+            ),
+        ] {
+            let refused = stacks.check(n_card, shape);
+            assert!(
+                matches!(&refused, Err(GpuError::Tensor { what: WHAT, .. })),
+                "{n_card} experts of {shape:?}: {refused:?}"
+            );
+        }
+
+        let host_normed: Vec<f32> = (0..R2_CAP).flat_map(|t| row_of(t, R2_N)).collect();
+        let normed = DeviceBuffer::from_host(stream, &host_normed).expect("the normed rows");
+        let sel_all: Vec<u32> = (0..R2_CAP).flat_map(places_of::<R2_SPC>).collect();
+        let sel = DeviceBuffer::from_host(stream, &sel_all).expect("the places");
+        let sentinel = vec![SENT; R2_CAP * R2_SPC * R2_N];
+        let run = |m: usize| Relu2Run {
+            layer: 0,
+            stacks: &stacks,
+            normed: &normed,
+            m,
+            sel: &sel,
+            n_card: N_CARD,
+        };
+        let mut bufs = Relu2Bufs::new(stream, R2_SHAPE).expect("the buffers");
+        bufs.down
+            .copy_from_host(stream, &sentinel)
+            .expect("the sentinel");
+        for m in [0, R2_CAP + 1] {
+            let refused = leg.enqueue(&gpu, &mut bufs, &run(m), None);
+            assert!(
+                matches!(&refused, Err(GpuError::Shape { what: WHAT, .. })),
+                "a run of {m} tokens: {refused:?}"
+            );
+        }
+        let route = DeviceBuffer::from_host(stream, &vec![0.5f32; 2 * 7]).expect("the weights");
+        let mut acc = DeviceBuffer::<f32>::zeroed(stream, 2 * 96).expect("the sum");
+        let seven = LegShape {
+            cap: 2,
+            slots_per_col: 7,
+            n: 96,
+            ff: 32,
+        };
+        let mut small = Relu2Bufs::new(stream, seven).expect("the buffers");
+        let refused = leg.enqueue(
+            &gpu,
+            &mut small,
+            &Relu2Run { m: 1, ..run(1) },
+            Some(LegSum {
+                w: &route,
+                acc: &mut acc,
+            }),
+        );
+        assert!(
+            matches!(&refused, Err(GpuError::Shape { what: WHAT, .. })),
+            "a sum over seven slots: {refused:?}"
+        );
+        assert!(
+            bufs.down
+                .to_host_vec(stream)
+                .expect("the rows")
+                .iter()
+                .all(|v| *v == SENT),
+            "a refused run wrote rows"
+        );
+        assert!(
+            gpu.take_fault().expect("the fault word").is_none(),
+            "a refusal raised a fault"
+        );
+
+        // A NaN in token 1's row: the repeating quantizer refuses the blocks
+        // of its card slots' columns and raises Q5Quant.
+        let mut nan_normed = host_normed.clone();
+        nan_normed[R2_N + 5] = f32::NAN;
+        let nan_normed = DeviceBuffer::from_host(stream, &nan_normed).expect("the rows");
+        leg.enqueue(
+            &gpu,
+            &mut bufs,
+            &Relu2Run {
+                normed: &nan_normed,
+                ..run(2)
+            },
+            None,
+        )
+        .expect("the run");
+        let fault = gpu.take_fault().expect("the fault word");
+        assert!(
+            fault
+                .as_ref()
+                .is_some_and(|f| f.sites & (1 << FaultSite::Q5Quant as u32) != 0 && f.layer == 0),
+            "a NaN normed row raised {fault:?}"
         );
     }
 

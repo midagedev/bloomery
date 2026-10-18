@@ -11,6 +11,8 @@
 //! - [`down`]: one launch for every slot, one activation column a slot, in
 //!   the form [`DownAct`] names. Where two launchers run one type, the row
 //!   names the one a model body launches;
+//! - [`up`]: the up of an expert with no gate, which is a [`down`] entry of
+//!   the 32-value form over columns that repeat the token's row;
 //! - [`gemm`]: the prompt path's GEMM over a route table (`GemmWeight`,
 //!   `Gemm32Weight`);
 //! - [`dense`]: `crates/gpu/src/site.rs`'s dense gemv sites, named by the file
@@ -369,6 +371,20 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
     }
 }
 
+/// The common card `_sel` entry that runs an ungated up stack of type `ty`
+/// (an expert with no gate, `h = rule(up · x)`), which is the [`down`] entry
+/// of the stack's type whose activation is the 32-value [`DownAct::Q8Blocks32`]:
+/// an up is a down-shaped `_sel` that reads column `s` for slot `s`, over
+/// columns that repeat the token's row once per slot, so no entry needs a
+/// second column rule.
+#[must_use]
+pub const fn up(ty: GgmlType) -> Option<DownEntry> {
+    match down(ty) {
+        Some((entry, DownAct::Q8Blocks32)) => Some(entry),
+        _ => None,
+    }
+}
+
 /// The prompt-path GEMM entry that runs a stack of type `ty`.
 #[must_use]
 pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
@@ -577,6 +593,19 @@ pub const fn card_down_runs(ty: GgmlType) -> bool {
     )
 }
 
+/// Whether the common card leg's relu² form launches the 32-value-block `_sel`
+/// of a routed stack of type `ty`, in either role: the [`up`] entry of an
+/// ungated up stack, or the [`down`] entry of the same form (Q5_1, Q8_0 and
+/// IQ4_NL, the 32-value downs of [`card_down_runs`]). The Q5_0 row reads the
+/// packed layout, not the file's blocks.
+#[must_use]
+pub const fn card_sel32_runs(ty: GgmlType) -> bool {
+    matches!(
+        up(ty),
+        Some(DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl)
+    )
+}
+
 /// Whether the common card leg runs a routed stack of `ty` in any of the three
 /// roles: the gate·up and the down rows both have launches the leg runs
 /// ([`card_gate_up_runs`], [`card_down_runs`]). A plan reads a stack's type
@@ -679,10 +708,11 @@ mod tests {
     }
 
     /// Whether each operation has a row for `ty`, by the operation's name.
-    fn has_row_in(ty: GgmlType) -> [(&'static str, bool); 6] {
+    fn has_row_in(ty: GgmlType) -> [(&'static str, bool); 7] {
         [
             ("gate_up", gate_up(ty).is_some()),
             ("down", down(ty).is_some()),
+            ("up", up(ty).is_some()),
             ("gemm", gemm(ty).is_some()),
             ("dense", dense(ty).is_some()),
             ("head", head(ty).is_some()),
@@ -769,6 +799,34 @@ mod tests {
                 (GgmlType::IQ4_XS, DownAct::Q8Act),
             ]
         );
+    }
+
+    /// An ungated up runs the down entries of the 32-value form, and no other:
+    /// the same entry as the type's down, never one of the `Q8Act` entries.
+    #[test]
+    fn up_is_the_32_value_down_entry() {
+        assert_eq!(
+            rows(up),
+            [
+                (GgmlType::Q5_0, DownEntry::Q5_0),
+                (GgmlType::Q5_1, DownEntry::Q5_1),
+                (GgmlType::Q8_0, DownEntry::Q8_0),
+                (GgmlType::IQ4_NL, DownEntry::Iq4nl),
+            ]
+        );
+        for ty in ALL {
+            assert_eq!(
+                up(ty),
+                down(ty).and_then(|(e, act)| (act == DownAct::Q8Blocks32).then_some(e)),
+                "{ty:?}"
+            );
+        }
+        let runs: Vec<GgmlType> = ALL.into_iter().filter(|&ty| card_sel32_runs(ty)).collect();
+        assert_eq!(runs, [GgmlType::Q5_1, GgmlType::Q8_0, GgmlType::IQ4_NL]);
+        for ty in runs {
+            assert!(card_down_runs(ty), "{ty:?}");
+        }
+        assert!(up(GgmlType::Q5_0).is_some() && !card_sel32_runs(GgmlType::Q5_0));
     }
 
     #[test]
@@ -922,6 +980,7 @@ mod tests {
             let ty = GgmlType::Unknown(id);
             assert_eq!(gate_up(ty), None, "gate_up({ty:?})");
             assert_eq!(down(ty), None, "down({ty:?})");
+            assert_eq!(up(ty), None, "up({ty:?})");
             assert_eq!(gemm(ty), None, "gemm({ty:?})");
             assert_eq!(dense(ty), None, "dense({ty:?})");
             assert_eq!(head(ty), None, "head({ty:?})");

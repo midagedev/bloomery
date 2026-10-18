@@ -1,9 +1,11 @@
-//! The 32-value-block activations of the Q8_0 and Q5_1 GEMMs, and the four
+//! The 32-value-block activations of the Q8_0 and Q5_1 GEMMs, and the five
 //! launches that fill them: the quantizer (`quantize_gemm32`), the SwiGLU
 //! quantizer between a gate·up pair and its down (`swiglu_quant32`), its
-//! card-slots-only form over a remapped route (`swiglu_quant32_sel`), and
-//! its form under a gate·up rule of `kquant::act`, ik's clamped SwiGLU among
-//! them (`swiglu_act_quant32`). All entries are declared in `kernels32.rs`.
+//! card-slots-only form over a remapped route (`swiglu_quant32_sel`), its
+//! form under a gate·up rule of `kquant::act`, ik's clamped SwiGLU among
+//! them (`swiglu_act_quant32`), and the squared-ReLU quantizer between a
+//! relu² expert's up and its down (`relu_sqr_quant32`). All entries are
+//! declared in `kernels32.rs`.
 
 use super::kernels32::Gemm32Kernels;
 use super::{GEMM_MAX_SLOTS, GEMM32_STEP};
@@ -183,6 +185,39 @@ impl Gemm32Kernels {
             .module
             .prepare_quantize_gemm32(LaunchConfig1D::new(grid, 32, 0))?;
         self.module.quantize_gemm32(
+            stream, &prep, x, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s, fault,
+        )?;
+        act.filled = n_cols;
+        Ok(())
+    }
+
+    /// Enqueue the 32-value quantization of `max(v, 0)²` of the first
+    /// `n_cols` columns of `x` (`act.k()` f32 each, column after column) into
+    /// `act`: one launch, the bytes `ElemKernels::enqueue_relu_sqr` then
+    /// [`Gemm32Kernels::enqueue_quantize_gemm32`] leave, a non-finite block
+    /// refused and raised as that launch refuses and raises it (a NaN or a
+    /// negative infinity is not turned into 0 first). The input of a relu²
+    /// expert's down GEMM. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_quantize_gemm32_relu_sqr(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        n_cols: usize,
+        act: &mut GemmAct32,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_quantize_gemm32_relu_sqr";
+        let (grid, m, blocks, groups, steps) = act.quant_launch(what, n_cols)?;
+        if x.len() < n_cols * act.k {
+            return Err(GpuError::shape(
+                what,
+                format!("x.len() {} < n_cols*k = {n_cols}*{}", x.len(), act.k),
+            ));
+        }
+        let prep = self
+            .module
+            .prepare_relu_sqr_quant32(LaunchConfig1D::new(grid, 32, 0))?;
+        self.module.relu_sqr_quant32(
             stream, &prep, x, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s, fault,
         )?;
         act.filled = n_cols;

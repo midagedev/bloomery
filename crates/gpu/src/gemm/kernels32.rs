@@ -41,6 +41,7 @@ mod gemm32_kernels {
     use crate::elem::silu_mul;
     use crate::flash::half_bits_to_f32;
     use crate::kquant::act::apply;
+    use crate::q5::{Load, ReluSqr};
     use crate::q5_1_sel::q5_1_codes;
     use cuda_device::async_copy::{
         cp_async_ca_4, cp_async_cg_16, cp_async_commit_group, cp_async_wait_group,
@@ -102,6 +103,82 @@ mod gemm32_kernels {
                 *x.get_unchecked(base + 1),
                 *x.get_unchecked(base + 2),
                 *x.get_unchecked(base + 3),
+            ]
+        };
+        // SAFETY: the warp enters with one (col, g), col < n_cols and g <
+        // groups = ceil(blocks / 4); the planes' bounds are the launch
+        // contract's.
+        let refused = unsafe {
+            quant32_group(
+                v,
+                col,
+                g,
+                blocks,
+                steps as usize,
+                lane,
+                &mut q,
+                &mut d,
+                &mut s,
+            )
+        };
+        if refused && lane & 7 == 0 {
+            fault.raise(FaultSite::QuantColumn);
+        }
+    }
+
+    /// [`quantize_gemm32`] over `max(v, 0)²` of each value
+    /// ([`crate::q5::ReluSqr`]): the up GEMM's slot columns quantized into
+    /// the input of a relu² expert's down GEMM in one launch, the values
+    /// `elem::relu_sqr` stores and the bytes `quantize_gemm32` writes from
+    /// them. A non-finite value is not the rule's input: it refuses its block
+    /// as `quantize_gemm32` refuses it and raises [`FaultSite::QuantColumn`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            x.len() >= n_cols * 32 * blocks,
+            2 * steps >= blocks,
+            q.len() >= n_cols * 16 * steps,
+            d.len() >= n_cols * 2 * steps,
+            s.len() >= n_cols * 2 * steps
+        )
+    )]
+    pub fn relu_sqr_quant32(
+        x: &[f32],
+        n_cols: u32,
+        blocks: u32,
+        groups: u32,
+        steps: u32,
+        mut q: DisjointSlice<u32>,
+        mut d: DisjointSlice<f32>,
+        mut s: DisjointSlice<i32>,
+        fault: FaultSink,
+    ) {
+        let grp = thread::index_1d().get() / 32;
+        let groups = groups as usize;
+        if grp >= n_cols as usize * groups {
+            return; // warp-uniform: one warp per block
+        }
+        let col = grp / groups;
+        let g = grp - col * groups;
+        let lane = warp::lane_id() as usize;
+        let blocks = blocks as usize;
+        let b = (4 * g + (lane >> 3)).min(blocks - 1);
+        let base = col * 32 * blocks + 32 * b + 4 * (lane & 7);
+        // SAFETY: b < blocks, so base + 3 < (col + 1)·32·blocks <= x.len()
+        // by the launch contract.
+        let v = unsafe {
+            [
+                ReluSqr::value(*x.get_unchecked(base)),
+                ReluSqr::value(*x.get_unchecked(base + 1)),
+                ReluSqr::value(*x.get_unchecked(base + 2)),
+                ReluSqr::value(*x.get_unchecked(base + 3)),
             ]
         };
         // SAFETY: the warp enters with one (col, g), col < n_cols and g <

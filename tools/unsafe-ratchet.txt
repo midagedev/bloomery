@@ -320,7 +320,11 @@ gguf 9 2 0
 # macro's existing blocks.
 # Re-derived 1926 -> 1932 blocks, 208 -> 209 fns at the 2026-10-17 rebase onto main 814b24652: its 1905/207 plus
 # the Bolt stack's 27 blocks and 2 fns over its base 1899/206.
-gpu 1932 209 10
+# PIN(2026-10-18): gpu 1932 -> 1938 blocks, 209 -> 210 fns, new kernel entries, not old code relaxed: the relu² leg's
+# q5_quantize_q8_rep and q5_quantize_q8_sel_relu_sqr (q5.rs) add their entries' call blocks, the shared per-slot
+# core q5_quant_slot (the one unsafe fn) its place read and its group call, and relu_sqr_quant32 (gemm/kernels32.rs)
+# its column load and its group call, each with its SAFETY line.
+gpu 1938 210 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
