@@ -222,7 +222,7 @@ GATE_PREFIX = "gate-"
 # changed file matches one of its trigger rows in tools/gate-paths.tsv, or its own recipe text changed.
 WEEKLY_PREFIX = "weekly-"
 # The checks the lead's batches always run; the diff does not pick them.
-ALWAYS = ["check-recipes", "check-rustflags", "check-comments", "check-levers", "check-arch", "check", "fmt-check", "lint"]
+ALWAYS = ["check-recipes", "check-rustflags", "check-comments", "check-levers", "check-arch", "check-model-tax", "check", "fmt-check", "lint"]
 CARGO_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]
 # The workspace's root manifest: a cargo global every cargo recipe reads, narrowed by table (`root_moves`) where it is a
 # virtual manifest; as a package's own manifest it stays whole.
@@ -8844,7 +8844,7 @@ def key_detectors_self_test(expect, real: Side) -> None:
         tree_scoped <= never,
         f"skippable gate-* recipes keyed on the whole tree: {sorted(tree_scoped - never)} — a script in the closure walks the tree",
     )
-    for n in ("check", "fmt-check", "check-recipes", "check-comments", "check-levers", "check-arch", "check-rustflags"):
+    for n in ("check", "fmt-check", "check-recipes", "check-comments", "check-levers", "check-arch", "check-model-tax", "check-rustflags"):
         expect(ctx.scope(recipe_closure(real.recipes, n), real.graph.inputs(n))[0] == "tree", f"{n} is not keyed on the whole tree")
     expect(ctx.scope(["lint"], real.graph.inputs("lint"))[0] == "closure", "lint (clippy, modeled) is keyed on the whole tree")
     for s in ("tools/check-comments.sh", "tools/check-levers.sh", "tools/check-arch.sh", "crates/tokenizer/tools/oracle.sh"):

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The model-name ratchet (Mac, text only, no build): how many code lines in common code name a model.
 
-    tools/model_tax.py check  [--root DIR]
+    tools/model_tax.py check  [--base REV] [--root DIR]
     tools/model_tax.py rows   [--family F] [--root DIR]
     tools/model_tax.py lower  [--root DIR]
     tools/model_tax.py --self-test
@@ -42,8 +42,16 @@ The tables:
   - a `baseline` row of a family that joined after the baseline, or above its baseline count;
   - a model directory (`crates/*/src/arch/<d>/`, `crates/gpu-<x>/`, `tools/ref/models/<m>.sh`) that no tokens row
     names ("unknown model dir"): a new model starts with its tokens row.
-A table that does not parse, a registry file that is not there and a source file it cannot read give no verdict
-(exit 2). It also prints, and never fails on: the registries' lines, per family the files outside its own paths and the
+With `--base REV` it also holds the tables to what REV had, so a count cannot be raised by editing the table (the
+tables are the argument, and an edit of them is what the check must not take on trust):
+  - a row REV lacks must be a PIN, a baseline row never appears after REV, a PIN row REV had goes back to no baseline;
+  - a baseline row keeps the baseline count it had at REV and does not rise above its count at REV;
+  - a PIN row that rises needs a PIN of another date or field than REV's row;
+  - a family REV lacks joins with its date, and a family's `since` is not changed.
+A REV without tools/model-tax.tsv has nothing to compare (the table starts there). It also lists the registry files the
+tables gained since REV, because a file moved into the registries leaves the ratchet.
+A table that does not parse, a registry file that is not there, a source file it cannot read and a REV that is not a
+commit give no verdict (exit 2). It also prints, and never fails on: the registries' lines, per family the files outside its own paths and the
 registries that name it (the touch count), the gate bins per family, and the 8-line windows copied between families'
 own files (identifiers that name a model collapse to one word).
 
@@ -59,6 +67,7 @@ import io
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -87,16 +96,18 @@ class Family:
         return bool(self.regex.search(path)) or any(path.startswith(p) for p in self.own)
 
 
-def table(root, rel, cols):
-    """The rows of a tab-separated table: (line number, columns). A comment or blank line is skipped."""
-    path = os.path.join(root, rel)
+def read_text(root, rel):
     try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.read().split("\n")
+        with open(os.path.join(root, rel), encoding="utf-8") as f:
+            return f.read()
     except OSError as e:
         raise NoVerdict(f"{rel}: cannot read ({e.strerror})")
+
+
+def parse_table(text, rel, cols):
+    """The rows of a tab-separated table: (line number, columns). A comment or blank line is skipped."""
     rows = []
-    for n, line in enumerate(lines, 1):
+    for n, line in enumerate(text.split("\n"), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         c = line.split("\t")
@@ -104,6 +115,10 @@ def table(root, rel, cols):
             raise NoVerdict(f"{rel}:{n}: {len(c)} columns, want {cols}")
         rows.append((n, c))
     return rows
+
+
+def table(root, rel, cols):
+    return parse_table(read_text(root, rel), rel, cols)
 
 
 def load_tokens(root):
@@ -137,13 +152,7 @@ def load_tokens(root):
 
 
 def load_registries(root):
-    path = os.path.join(root, REGISTRIES)
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.read().split("\n")
-    except OSError as e:
-        raise NoVerdict(f"{REGISTRIES}: cannot read ({e.strerror})")
-    return [x.strip() for x in lines if x.strip() and not x.lstrip().startswith("#")]
+    return load_registries_text(read_text(root, REGISTRIES))
 
 
 def source_files(root):
@@ -287,9 +296,13 @@ def model_dirs(root):
 
 
 def tax_rows(root):
+    return parse_tax(read_text(root, TAX), TAX)
+
+
+def parse_tax(text, rel):
     rows, seen = [], {}
-    for n, (path, family, count, why) in table(root, TAX, 4):
-        where = f"{TAX}:{n}"
+    for n, (path, family, count, why) in parse_table(text, rel, 4):
+        where = f"{rel}:{n}"
         if not count.isdigit() or int(count) < 1:
             raise NoVerdict(f"{where}: the count {count!r} is not a positive integer")
         if (path, family) in seen:
@@ -329,8 +342,109 @@ def why_error(family, since, count, why):
             f"PIN(YYYY-MM-DD) {family}: <the missing field>")
 
 
-def check(root, out, err):
-    """Print the verdict. Returns 0 clean or 1 violation; raises NoVerdict."""
+def git(root, *args):
+    try:
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, LC_ALL="C")
+        return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, env=env)
+    except OSError as e:
+        raise NoVerdict(f"git: cannot run ({e.strerror})")
+
+
+def base_files(root, rev):
+    """The commit REV names and the text of the three tables at it (None for a table it lacks)."""
+    if rev.startswith("-"):
+        raise NoVerdict(f"--base {rev}: not a revision")
+    p = git(root, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
+    if p.returncode != 0:
+        raise NoVerdict(f"--base {rev}: not a commit of {root} (git rev-parse exit {p.returncode}: "
+                        f"{p.stderr.strip() or 'no such revision'})")
+    sha = p.stdout.strip()
+    texts = {}
+    for rel in (TAX, TOKENS, REGISTRIES):
+        if git(root, "cat-file", "-e", f"{sha}:{rel}").returncode != 0:
+            texts[rel] = None
+            continue
+        q = git(root, "show", f"{sha}:{rel}")
+        if q.returncode != 0:
+            raise NoVerdict(f"--base {rev}: cannot read {rel} at {sha[:9]} ({q.stderr.strip()})")
+        texts[rel] = q.stdout
+    return sha, texts
+
+
+def base_violations(rows, since, old_rows, old_since, rev):
+    """What the tables gained or raised since REV that no PIN argues. A row REV lacks is a PIN. A baseline row is the
+    cut's: the same baseline count it had, never higher than it was. A PIN row that rises needs a PIN that differs from the
+    one REV had. A family REV lacks has the date it joined."""
+    old = {(p, f): (c, w) for _, p, f, c, w in old_rows}
+    bad = []
+    for n, path, family, count, why in rows:
+        now = BASELINE.match(why)
+        was = old.get((path, family))
+        where = f"{TAX}:{n}: {path}: {family} row"
+        if was is None:
+            if now:
+                bad.append(f"{where} is new since {rev} and a baseline row: a row that {rev} lacks is a "
+                           f"PIN(YYYY-MM-DD) {family}: <the missing description field or program>")
+            continue
+        was_count, was_why = was
+        before = BASELINE.match(was_why)
+        if now:
+            if not before:
+                bad.append(f"{where} was a PIN at {rev} and is a baseline row: a row does not go back to the baseline")
+            elif now.group(2) != before.group(2):
+                bad.append(f"{where}: the baseline count changed from {before.group(2)} at {rev} to {now.group(2)}")
+            elif count > was_count:
+                bad.append(f"{where} is raised from {was_count} at {rev} to {count}: a count above {rev}'s is argued with "
+                           f"PIN(YYYY-MM-DD) {family}: <the missing description field or program>")
+        elif count > was_count and why == was_why:
+            bad.append(f"{where} is raised from {was_count} at {rev} to {count} under the same PIN: argue the rise with a "
+                       "PIN of its own date or field")
+    for name, joined in sorted(since.items()):
+        if name in old_since:
+            if joined != old_since[name]:
+                bad.append(f"{TOKENS}: {name} joined {old_since[name]} at {rev}, the row now says {joined}")
+        elif joined == "baseline":
+            bad.append(f"{TOKENS}: {name} is a new family since {rev} and joined at `baseline`: a family that {rev} lacks "
+                       "has the date it joined")
+    return bad
+
+
+def tokens_since(text, rel):
+    return {c[0]: c[3] for _, c in parse_table(text, rel, 4) if c[0] != "-"}
+
+
+def against_base(root, rev, rows, families, out):
+    """The violations against REV, and the lines that say what changed. A REV without the table has nothing to compare."""
+    sha, texts = base_files(root, rev)
+    if texts[TAX] is None:
+        print(f"check-model-tax: base {rev} ({sha[:9]}) has no {TAX}: the table starts here, nothing to compare", file=out)
+        return []
+    if texts[TOKENS] is None:
+        raise NoVerdict(f"--base {rev}: {rev} has {TAX} but not {TOKENS}")
+    old_rows = parse_tax(texts[TAX], f"{rev}:{TAX}")
+    since = {f.name: f.since for f in families}
+    bad = base_violations(rows, since, old_rows, tokens_since(texts[TOKENS], f"{rev}:{TOKENS}"), rev)
+    old = {(p, f): c for _, p, f, c, _ in old_rows}
+    now = {(p, f): c for _, p, f, c, _ in rows}
+    grown = [r for r in rows if (r[1], r[2]) not in old or r[3] > old[(r[1], r[2])]]
+    print(f"check-model-tax: rows against {rev} ({sha[:9]}): {len(old)} there, {len(now)} here, {len(grown)} new or raised, "
+          f"{sum(1 for k in old if k not in now)} gone, {sum(1 for k in now if k in old and now[k] < old[k])} lowered", file=out)
+    for n, path, family, count, why in grown:
+        print(f"check-model-tax:   {path} {family} {count}: {why}", file=out)
+    if texts[REGISTRIES] is not None:
+        added = sorted(set(load_registries_text(read_text(root, REGISTRIES))) - set(load_registries_text(texts[REGISTRIES])))
+        if added:
+            print(f"check-model-tax: registry files added since {rev}, their lines leave the ratchet: {' '.join(added)}", file=out)
+    return bad
+
+
+def load_registries_text(text):
+    return [x.strip() for x in text.split("\n") if x.strip() and not x.lstrip().startswith("#")]
+
+
+def check(root, out, err, base=None):
+    """Print the verdict. Returns 0 clean or 1 violation; raises NoVerdict. With BASE, the rows are also held to what that
+    revision had."""
     scan = Scan(root)
     fams = {f.name: f for f in scan.families}
     bad = []
@@ -373,6 +487,8 @@ def check(root, out, err):
     print(f"check-model-tax: {len(common)} common lines in {len(cfiles)} files (dispatch {cls['dispatch']}, literal "
           f"{cls['literal']}, ident {cls['ident']}); {len(rows)} rows allow {sum(r[3] for r in rows)} (file, family) lines; "
           f"registries {len(reg)} lines in {len(rfiles)} files, not ratcheted", file=out)
+    if base is not None:
+        bad += against_base(root, base, rows, scan.families, out)
     report(scan, root, out)
     if bad:
         for b in bad:
@@ -522,10 +638,10 @@ def fixture(root, edits=None):
             f.write(text)
 
 
-def run(root):
+def run(root, base=None):
     out, err = io.StringIO(), io.StringIO()
     try:
-        rc = check(root, out, err)
+        rc = check(root, out, err, base)
     except NoVerdict as e:
         return 2, out.getvalue(), f"check-model-tax: {e}, no verdict\n"
     return rc, out.getvalue(), err.getvalue()
@@ -610,6 +726,89 @@ def self_test():
         case("a tokens row that is no regex", {"tools/model-tokens.tsv": TOKENS_FIXTURE + "bad\t(\t-\tbaseline\n"}, 2, "is not a regex")
         case("a table with the wrong columns", {"tools/model-tax.tsv": "crates/a.rs\tqwen\t1\n"}, 2, "3 columns, want 4")
         case("no tax table", {}, 2, "tools/model-tax.tsv: cannot read", remove=("tools/model-tax.tsv",))
+        # --base: the tables held to what a revision had
+        def rows_of(*lines):
+            return parse_tax("\n".join(lines) + "\n", "t")
+
+        def vs(now, was, since=None, was_since=None):
+            return "\n".join(base_violations(rows_of(*now), since or {"qwen": "baseline"}, rows_of(*was),
+                                              was_since or {"qwen": "baseline"}, "REV"))
+
+        row = "a.rs\tqwen\t%d\t%s"
+        cut = "baseline A 4: r"
+        for name, now, was, want in (
+            ("a new baseline row", [row % (1, "baseline A 1: r")], [], "is new since REV and a baseline row"),
+            ("a new PIN row", [row % (1, "PIN(2026-10-18) qwen: a field")], [], None),
+            ("a baseline row raised", [row % (3, cut)], [row % (2, cut)], "raised from 2 at REV to 3"),
+            ("a baseline ceiling raised", [row % (2, "baseline A 5: r")], [row % (2, cut)], "baseline count changed from 4 at REV to 5"),
+            ("a baseline row lowered", [row % (1, cut)], [row % (2, cut)], None),
+            ("a baseline row gone", [], [row % (2, cut)], None),
+            ("a PIN raised under the same PIN", [row % (3, "PIN(2026-10-18) qwen: a field")],
+             [row % (2, "PIN(2026-10-18) qwen: a field")], "under the same PIN"),
+            ("a PIN raised under a new date", [row % (3, "PIN(2026-10-19) qwen: a field")],
+             [row % (2, "PIN(2026-10-18) qwen: a field")], None),
+            ("a baseline row argued up by a PIN", [row % (6, "PIN(2026-10-18) qwen: a field")], [row % (2, cut)], None),
+            ("a PIN back to the baseline", [row % (1, cut)], [row % (2, "PIN(2026-10-18) qwen: a field")], "does not go back"),
+        ):
+            got = vs(now, was)
+            if (want is None and got) or (want is not None and want not in got):
+                fails.append(f"case base: {name}: want {want!r}, got {got!r}")
+        for name, since, was_since, want in (
+            ("a family's date changed", {"qwen": "baseline"}, {"qwen": "2026-10-18"}, "joined 2026-10-18 at REV"),
+            ("a new family at the baseline", {"qwen": "baseline", "foo": "baseline"}, {"qwen": "baseline"}, "foo is a new family"),
+            ("a new family with its date", {"qwen": "baseline", "foo": "2026-10-18"}, {"qwen": "baseline"}, None),
+        ):
+            got = vs([], [], since, was_since)
+            if (want is None and got) or (want is not None and want not in got):
+                fails.append(f"case base: {name}: want {want!r}, got {got!r}")
+        # the same, against a revision of a repository
+        def commit(d, msg):
+            for a in (("init", "-q"), ("add", "-A"), ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                                                     "commit", "-q", "-m", msg)):
+                r = git(d, *a)
+                if r.returncode != 0:
+                    fails.append(f"case base: git {' '.join(a)}: {r.stderr}")
+
+        g = tempfile.mkdtemp(dir=base)
+        fixture(g)
+        commit(g, "table")
+        rc, out, err = run(g, "HEAD")
+        if rc != 0 or "rows against HEAD" not in out or "0 new or raised" not in out:
+            fails.append(f"case base: an unchanged table against its own commit: {rc} {out}{err}")
+        fixture(g, {"crates/gpu/src/other.rs": "pub fn qwen_x() {}\n",
+                    "tools/model-tax.tsv": FIXTURE["tools/model-tax.tsv"] + "crates/gpu/src/other.rs\tqwen\t1\tbaseline A 1: forged\n"})
+        rc, out, err = run(g)
+        if rc != 0:
+            fails.append(f"case base: the forged row passes without a base: {rc} {err}")
+        rc, out, err = run(g, "HEAD")
+        if rc != 1 or "other.rs: qwen row is new since HEAD and a baseline row" not in err:
+            fails.append(f"case base: a forged baseline row is refused against HEAD: {rc} {err}")
+        fixture(g, {"crates/gpu/src/other.rs": "pub fn qwen_x() {}\n",
+                    "tools/model-tax.tsv": FIXTURE["tools/model-tax.tsv"] + "crates/gpu/src/other.rs\tqwen\t1\tPIN(2026-10-18) qwen: a spec field\n"})
+        rc, out, err = run(g, "HEAD")
+        if rc != 0 or "1 new or raised" not in out or "other.rs qwen 1: PIN(2026-10-18)" not in out:
+            fails.append(f"case base: a new PIN row passes against HEAD and is listed: {rc} {out}{err}")
+        fixture(g, {"tools/model-registries.txt": FIXTURE["tools/model-registries.txt"] + "crates/gpu/src/other.rs\n"})
+        rc, out, err = run(g, "HEAD")
+        if "registry files added since HEAD, their lines leave the ratchet: crates/gpu/src/other.rs" not in out:
+            fails.append(f"case base: a file added to the registries is listed: {rc} {out}{err}")
+        fixture(g)
+        rc, out, err = run(g, "nosuchrev")
+        if rc != 2 or "not a commit" not in err:
+            fails.append(f"case base: a revision that is not a commit is no verdict: {rc} {err}")
+        rc, out, err = run(g, "--output=x")
+        if rc != 2 or "not a revision" not in err:
+            fails.append(f"case base: an option for a revision is refused: {rc} {err}")
+        g2 = tempfile.mkdtemp(dir=base)
+        fixture(g2, {"tools/model-tax.tsv": None, "tools/model-registries.txt": None, "tools/model-tokens.tsv": None})
+        commit(g2, "no table")
+        for rel in (TAX, TOKENS, REGISTRIES):
+            os.makedirs(os.path.join(g2, "tools"), exist_ok=True)
+            with open(os.path.join(g2, rel), "w") as f:
+                f.write(FIXTURE[rel])
+        rc, out, err = run(g2, "HEAD")
+        if rc != 0 or "has no tools/model-tax.tsv: the table starts here" not in out:
+            fails.append(f"case base: a revision with no table has nothing to compare: {rc} {out}{err}")
         # lower: counts fall, never rise, a row that reached 0 goes, and a second pass changes nothing
         d = tempfile.mkdtemp(dir=base)
         fixture(d, {"tools/model-tax.tsv": "# kept comment\ncrates/model/src/arch/mod.rs\tqwen\t5\tbaseline A 5: r\n"
@@ -654,13 +853,18 @@ def self_test():
 
 
 def main(argv):
-    root, family, args = REPO, None, []
+    root, family, base, args = REPO, None, None, []
     it = iter(argv)
     for a in it:
         if a == "--root":
             root = next(it, None)
         elif a == "--family":
             family = next(it, None)
+        elif a == "--base":
+            base = next(it, None)
+            if base is None:
+                print("check-model-tax: --base takes a revision", file=sys.stderr)
+                return 2
         else:
             args.append(a)
     if root is None or (family is None and "--family" in argv):
@@ -669,12 +873,13 @@ def main(argv):
     if args == ["--self-test"]:
         return self_test()
     cmd = args[0] if args else "check"
-    if len(args) > 1 or cmd not in ("check", "rows", "lower"):
-        print("check-model-tax: usage: check | rows [--family F] | lower | --self-test, each with --root DIR", file=sys.stderr)
+    if len(args) > 1 or cmd not in ("check", "rows", "lower") or (base is not None and cmd != "check"):
+        print("check-model-tax: usage: check [--base REV] | rows [--family F] | lower | --self-test, each with --root DIR",
+              file=sys.stderr)
         return 2
     try:
         if cmd == "check":
-            return check(root, sys.stdout, sys.stderr)
+            return check(root, sys.stdout, sys.stderr, base)
         if cmd == "rows":
             return rows_cmd(root, family, sys.stdout)
         return lower_cmd(root, sys.stdout)

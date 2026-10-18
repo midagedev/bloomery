@@ -53,6 +53,19 @@ combos_argv() {
   printf '%s\n' "${a[@]}"
 }
 
+# check_argv NAME BASE: the arguments of tools/check-NAME.sh. check-model-tax holds its rows to the revision BASE names (the
+# A of A..B; origin/main on a full run), so an edit of its tables cannot raise a count unargued.
+check_argv() {
+  case $1 in
+    model-tax) printf '%s\n' check --base "$(base_rev "$2")" ;;
+  esac
+}
+# base_rev BASE: the revision a base names, origin/main when there is none.
+base_rev() {
+  local b=${1%%..*}
+  printf '%s\n' "${b:-origin/main}"
+}
+
 # step_inner NAME D CMD…: one step, serial in its caller — its rc, wall and full output to D. Never
 # fails its caller: the rc is the file's, not the wrapper's.
 step_inner() {
@@ -74,8 +87,12 @@ run_steps() {
   : > "$d/pids"
   ( step_inner fmt-check "$d" "$HERE/tools/mac-check.sh" fmt-check ) & pids+=($!) && names+=(fmt-check)
   local s
+  local -a args
+  local w
   for s in "${SCRIPTS[@]}"; do
-    ( step_inner "check-$s" "$d" bash "$HERE/tools/check-$s.sh" ) & pids+=($!) && names+=(check-$s)
+    args=()
+    while IFS= read -r w; do args+=("$w"); done < <(check_argv "$s" "$base")
+    ( step_inner "check-$s" "$d" bash "$HERE/tools/check-$s.sh" ${args[@]+"${args[@]}"} ) & pids+=($!) && names+=(check-$s)
   done
   ( step_inner lint "$d" "$HERE/tools/mac-check.sh" lint
     step_inner combos "$d" "$HERE/tools/mac-check.sh" "${cargo[@]}" ) & pids+=($!) && names+=(cargo-lane)
@@ -137,6 +154,16 @@ self_test() {
   [ "$out" = "combos --base main " ] || fail "a base without a ledger derives '$out'"
   out=$(combos_argv 'HEAD~3..HEAD' "$HOME/x.tsv" | tr '\n' ' ')
   [ "$out" = "combos --base HEAD~3..HEAD --ledger $HOME/x.tsv " ] || fail "a base and a ledger derive '$out'"
+
+  # check_argv: only check-model-tax takes arguments, a base compares its rows with, origin/main when the run has none
+  out=$(check_argv model-tax '' | tr '\n' ' ')
+  [ "$out" = "check --base origin/main " ] || fail "a full run derives model-tax '$out'"
+  out=$(check_argv model-tax 0123abc | tr '\n' ' ')
+  [ "$out" = "check --base 0123abc " ] || fail "a base derives model-tax '$out'"
+  out=$(check_argv model-tax 'a1..b2' | tr '\n' ' ')
+  [ "$out" = "check --base a1 " ] || fail "a range derives model-tax '$out'"
+  out=$(check_argv arch main | tr '\n' ' ')
+  [ -z "$out" ] || fail "a check with no arguments derives '$out'"
 
   # every tools/check-*.sh is a step: a check script SCRIPTS leaves out never runs in the round loop
   local f name unlisted=''

@@ -184,10 +184,16 @@ check-rustflags:
 check-arch:
     bash tools/check-arch.sh
 
+# Defaults twins (Mac, text only): a lever a gate pins off its default needs a clause that runs the default, or a dated
+# reason in tools/defaults-twins.tsv (tools/check-defaults.py's header has the rules).
+check-defaults:
+    bash tools/check-defaults.sh
+
 # Model-name ratchet (Mac, text only): the code lines of common code that name a model, held two-sided per (file, family)
-# by tools/model-tax.tsv; tools/model_tax.py's header has the rules.
-check-model-tax:
-    bash tools/check-model-tax.sh
+# by tools/model-tax.tsv, and the tables held to the rows BASE had, so a count cannot be raised by editing them
+# (tools/model_tax.py's header has the rules).
+check-model-tax BASE='origin/main':
+    bash tools/check-model-tax.sh check --base {{BASE}}
 
 # 주석 규약(AGENTS.md Conventions): 엔진 크레이트 src/ 주석에 이슈 번호·날짜 금지, 예외는 `PIN(날짜):`.
 check-comments:
@@ -1638,7 +1644,7 @@ dump-ref-dequant:
     ./tools/box.sh 'bash tools/ref/dump-dequant.sh'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-rustflags check-arch check-comments check-levers check-unsafe check-waits check-loads check-ptx-names fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
+gate: check-recipes check-rustflags check-arch check-defaults check-model-tax check-comments check-levers check-unsafe check-waits check-loads check-ptx-names fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
 
 # The smoke tier (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
 # P = 512 alone, V2-Lite end to end — a subset run of unchanged gates, never the landing batch. Two lanes
