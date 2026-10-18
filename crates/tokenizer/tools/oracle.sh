@@ -122,23 +122,11 @@ TREE_FLAGS=()
 # The reference trees. ORACLE_TREE is the directory, BUILD_PIN the upstream commit it is built at (full hash), BUILD_PATCH the
 # hash of the local patch on that commit (empty: the tree is the commit), TREE_FLAGS the flags oracle_tree takes for it.
 # PIN(2026-10-18): each tree by its commit and patch, not by the md5s of one machine's binary and library.
-# ik-tilde: ik main at dad2cb3e5 plus one commit, the `~` in the S class (ik#2528).
-tree_tilde() {
-  ORACLE_TREE=/home/user/ik-tilde
-  BUILD_PIN=dad2cb3e55138cbdd7df988c66c0c3c54f6d34ad BUILD_PATCH=0e498d9dab2a
-  TREE_FLAGS=(--unversioned)
-}
 # ik-tokref: the ik-idxkey commit db517b690 plus the unicode_tolower fix (ik#2520).
 tree_tokref() {
   ORACLE_TREE=/home/user/ik-tokref
   BUILD_PIN=db517b690a8c0865fd8cf51565ae6b4a7295eb01 BUILD_PATCH=29cabc43ed4d
   TREE_FLAGS=(--unversioned)
-}
-# llama.cpp-mainline: mainline at 53ed051ce, no patch; the commit the qwen35 families (crates/refset/src/arch/qwen35) name.
-tree_mainline() {
-  ORACLE_TREE=/home/user/llama.cpp-mainline
-  BUILD_PIN=53ed051ce5e8193652e449f43216ca3859454f49 BUILD_PATCH=
-  TREE_FLAGS=()
 }
 
 profile() {
@@ -147,7 +135,10 @@ profile() {
     v41)
       # The V4.1 file set is the deepseek41 profile's choice, exported by tools/box.sh.
       local dir=${BLOOMERY_V41_DIR:?BLOOMERY_V41_DIR unset — run through tools/box.sh, which exports it from the deepseek41 profile}
-      tree_tilde
+      # ik-tilde: ik main at dad2cb3e5 plus one commit, the `~` in the S class (ik#2528).
+      ORACLE_TREE=/home/user/ik-tilde
+      BUILD_PIN=dad2cb3e55138cbdd7df988c66c0c3c54f6d34ad BUILD_PATCH=0e498d9dab2a
+      TREE_FLAGS=(--unversioned)
       SHARD=$(find "$dir" -maxdepth 1 -name '*-00001-of-*.gguf' | sort | head -1)
       [ -n "$SHARD" ] || { echo "oracle: no first shard under $dir" >&2; exit 66; }
       SET=ref-tokenizer-v41
@@ -171,7 +162,10 @@ profile() {
       # ik-tokref knows the pre name and refuses the file: its loader has no
       # nemotron_h architecture. This tree's binary loads it. The pre is the
       # same LLAMA3 regex with ignore_merges.
-      tree_mainline
+      # llama.cpp-mainline: mainline at 53ed051ce, no patch; the commit the qwen35 families (crates/refset/src/arch/qwen35) name.
+      ORACLE_TREE=/home/user/llama.cpp-mainline
+      BUILD_PIN=53ed051ce5e8193652e449f43216ca3859454f49 BUILD_PATCH=
+      TREE_FLAGS=()
       SHARD=/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf
       SET=ref-tokenizer-nemotron
       # The file sets add_bos_token, so llama-tokenize prepends BOS. The gate's
