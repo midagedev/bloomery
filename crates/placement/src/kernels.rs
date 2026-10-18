@@ -325,6 +325,9 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::Q1_0
+        | GgmlType::Q8_1
+        | GgmlType::Q8_K
         | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
@@ -366,6 +369,9 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::Q1_0
+        | GgmlType::Q8_1
+        | GgmlType::Q8_K
         | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
@@ -420,6 +426,9 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::Q1_0
+        | GgmlType::Q8_1
+        | GgmlType::Q8_K
         | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
@@ -461,6 +470,9 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::Q1_0
+        | GgmlType::Q8_1
+        | GgmlType::Q8_K
         | GgmlType::Unknown(_) => None,
     }
 }
@@ -500,6 +512,9 @@ pub const fn head(ty: GgmlType) -> Option<HeadEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::Q1_0
+        | GgmlType::Q8_1
+        | GgmlType::Q8_K
         | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
@@ -540,6 +555,9 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
         | GgmlType::Q2_0
+        | GgmlType::Q1_0
+        | GgmlType::Q8_1
+        | GgmlType::Q8_K
         | GgmlType::NVFP4
         | GgmlType::Unknown(_) => None,
     }
@@ -624,7 +642,7 @@ mod tests {
 
     /// Every `GgmlType` variant in declaration order, then one id the enum
     /// does not name.
-    const ALL: [GgmlType; 33] = [
+    const ALL: [GgmlType; 36] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::Q5_0,
@@ -657,6 +675,9 @@ mod tests {
         GgmlType::Q2_0,
         GgmlType::Q4_0,
         GgmlType::Q4_1,
+        GgmlType::Q1_0,
+        GgmlType::Q8_1,
+        GgmlType::Q8_K,
         GgmlType::Unknown(99),
     ];
 
@@ -696,7 +717,10 @@ mod tests {
             GgmlType::Q2_0 => 29,
             GgmlType::Q4_0 => 30,
             GgmlType::Q4_1 => 31,
-            GgmlType::Unknown(_) => 32,
+            GgmlType::Q1_0 => 32,
+            GgmlType::Q8_1 => 33,
+            GgmlType::Q8_K => 34,
+            GgmlType::Unknown(_) => 35,
         }
     }
 

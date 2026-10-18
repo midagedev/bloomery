@@ -65,14 +65,17 @@ use crate::qtype::HostAct;
 /// TQ1_0=34 and TQ2_0=35 are mainline ggml's (llama.cpp `930e2fa59`,
 /// ggml.h:424-425); the ik tree leaves 34 and 35 unassigned, so no id means
 /// two things. Q2_0=42 is mainline's too (llama.cpp `f2cc7282c`, ggml.h:432);
-/// ik has no Q2_0.
+/// ik has no Q2_0. Q1_0=41 is mainline's q1_0, which ik spells q1_0_g128 at the same id with
+/// the same 128-value, 18-byte block.
+///
+/// Q8_1=9 and Q8_K=15 are ggml's activation forms (ggml.h:399, :405): named so the table of
+/// ggml's types is whole, sized, and decoded by nothing here.
 ///
 /// A named type is one this build can size ([`GgmlType::blck_size`],
 /// [`GgmlType::type_size`]): it has a row in [`crate::QROWS`], the one owner
 /// of the facts a type has. Whether it can decode is a separate question
 /// ([`GgmlType::has_dequant`]), and Q4_0 and Q4_1 are named, sized and
-/// decoded by nothing here. `Unknown` carries every other tag: the ids
-/// the enum does not name (q8_1 and q8_K among them), the
+/// decoded by nothing here. `Unknown` carries every other tag: the
 /// slots ggml removed (4, 5, 31-33, 36-38) and the ids past the table. The
 /// loader accepts such tensors only far enough to name them, and every
 /// size/dequant entry point rejects them with an error.
@@ -113,6 +116,9 @@ pub enum GgmlType {
     Q2_0,
     Q4_0,
     Q4_1,
+    Q1_0,
+    Q8_1,
+    Q8_K,
     Unknown(u32),
 }
 
@@ -127,11 +133,13 @@ impl GgmlType {
             6 => GgmlType::Q5_0,
             7 => GgmlType::Q5_1,
             8 => GgmlType::Q8_0,
+            9 => GgmlType::Q8_1,
             10 => GgmlType::Q2_K,
             11 => GgmlType::Q3_K,
             12 => GgmlType::Q4_K,
             13 => GgmlType::Q5_K,
             14 => GgmlType::Q6_K,
+            15 => GgmlType::Q8_K,
             16 => GgmlType::IQ2_XXS,
             17 => GgmlType::IQ2_XS,
             18 => GgmlType::IQ3_XXS,
@@ -151,6 +159,7 @@ impl GgmlType {
             35 => GgmlType::TQ2_0,
             39 => GgmlType::MXFP4,
             40 => GgmlType::NVFP4,
+            41 => GgmlType::Q1_0,
             42 => GgmlType::Q2_0,
             other => GgmlType::Unknown(other),
         }
@@ -165,11 +174,13 @@ impl GgmlType {
             GgmlType::Q5_0 => 6,
             GgmlType::Q5_1 => 7,
             GgmlType::Q8_0 => 8,
+            GgmlType::Q8_1 => 9,
             GgmlType::Q2_K => 10,
             GgmlType::Q3_K => 11,
             GgmlType::Q4_K => 12,
             GgmlType::Q5_K => 13,
             GgmlType::Q6_K => 14,
+            GgmlType::Q8_K => 15,
             GgmlType::IQ2_XXS => 16,
             GgmlType::IQ2_XS => 17,
             GgmlType::IQ3_XXS => 18,
@@ -189,6 +200,7 @@ impl GgmlType {
             GgmlType::TQ2_0 => 35,
             GgmlType::MXFP4 => 39,
             GgmlType::NVFP4 => 40,
+            GgmlType::Q1_0 => 41,
             GgmlType::Q2_0 => 42,
             GgmlType::Unknown(v) => v,
         }
@@ -225,15 +237,11 @@ impl GgmlType {
     }
 }
 
-/// ggml's name for a type this enum names, or for an id ggml's table sizes
-/// ([`crate::ggml_type_info`]: q8_1, q8_K), so a refusal of such a
-/// tensor names its type; `ggml-type-<id>` for any other id.
+/// ggml's name for a type this enum names, so a refusal of such a tensor names its type;
+/// `ggml-type-<id>` for any other id.
 impl fmt::Display for GgmlType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self
-            .name()
-            .or_else(|| crate::ggml_type_info(self.as_u32()).map(|(n, _, _)| n))
-        {
+        match self.name() {
             Some(n) => write!(f, "{n}"),
             None => write!(f, "ggml-type-{}", self.as_u32()),
         }
@@ -346,6 +354,9 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         | GgmlType::IQ1_M
         | GgmlType::TQ1_0
         | GgmlType::TQ2_0
+        | GgmlType::Q1_0
+        | GgmlType::Q8_1
+        | GgmlType::Q8_K
         | GgmlType::Unknown(_) => return Err(QuantError::Unsupported(ty)),
     }
     Ok(())
@@ -1348,7 +1359,9 @@ mod tests {
     /// (`build/bin/libggml-base.so`), and for q2_0 mainline `f2cc7282c`. ik's
     /// and mainline's libraries agree on every other row here. nvfp4's row
     /// is read from llama.cpp-mainline's source (ggml.c:760-764,
-    /// ggml-common.h:221-227), not a compiled library.
+    /// ggml-common.h:221-227), not a compiled library; so are q1_0's, q8_1's and q8_K's
+    /// (llama.cpp `36a73916`: ggml-common.h:180-185, :258-269, :371-376). q8_K is mainline's
+    /// 292 B block; ik's is 296 (it adds `float sum`).
     const GGML_TABLE: &[(u32, &str, u64, u64)] = &[
         (0, "f32", 1, 4),
         (1, "f16", 1, 2),
@@ -1357,11 +1370,13 @@ mod tests {
         (6, "q5_0", 32, 22),
         (7, "q5_1", 32, 24),
         (8, "q8_0", 32, 34),
+        (9, "q8_1", 32, 36),
         (10, "q2_K", 256, 84),
         (11, "q3_K", 256, 110),
         (12, "q4_K", 256, 144),
         (13, "q5_K", 256, 176),
         (14, "q6_K", 256, 210),
+        (15, "q8_K", 256, 292),
         (16, "iq2_xxs", 256, 66),
         (17, "iq2_xs", 256, 74),
         (18, "iq3_xxs", 256, 98),
@@ -1381,12 +1396,12 @@ mod tests {
         (35, "tq2_0", 256, 66),
         (39, "mxfp4", 32, 17),
         (40, "nvfp4", 64, 36),
+        (41, "q1_0", 128, 18),
         (42, "q2_0", 64, 18),
     ];
 
-    /// Ids the enum leaves `Unknown`: types it does not name yet (q8_1, q8_K;
-    /// mainline's q1_0 at 41, ik's q1_0_g128 at 41 and q8_2_x4
-    /// at 99), slots ggml removed (4, 5, 31-33, 36-38; ik reuses 31-33 and
+    /// Ids the enum leaves `Unknown`: types it does not name yet (ik's q8_2_x4 at 99),
+    /// slots ggml removed (4, 5, 31-33, 36-38; ik reuses 31-33 and
     /// 36 for repacked and BitNet types mainline does not have), and 43, the
     /// first id past mainline's table.
     // PIN(2026-09-24): 10 (q2_K) left this list when the enum named it for the GLM-5.3 MTP layer.
@@ -1394,7 +1409,9 @@ mod tests {
     // PIN(2026-10-16): 40 (nvfp4) left this list when the enum named it for Nemotron 3.5 Bolt.
     // PIN(2026-10-18): 2 (q4_0) and 3 (q4_1) left this list when the enum named them, with a row each; both
     // are sized and refused by name.
-    const UNKNOWN_IDS: &[u32] = &[4, 5, 9, 15, 31, 32, 33, 36, 37, 38, 41, 43, 99];
+    // PIN(2026-10-19): 9 (q8_1), 15 (q8_K) and 41 (q1_0) left this list when the enum named them, with a row
+    // each, so every type in ggml's table has one; all three are sized and refused by name.
+    const UNKNOWN_IDS: &[u32] = &[4, 5, 31, 32, 33, 36, 37, 38, 43, 99];
 
     /// Every named id round-trips through the enum and carries ggml's name,
     /// block size and block bytes; every other id stays `Unknown` with no

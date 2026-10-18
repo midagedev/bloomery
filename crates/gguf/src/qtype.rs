@@ -65,6 +65,9 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::Q5_0, name: "q5_0", blck: 32, bytes: 22, dequant: true, host_act: H::Q8_2X4 },
     QRow { ty: T::Q5_1, name: "q5_1", blck: 32, bytes: 24, dequant: true, host_act: H::Q8_2X4 },
     QRow { ty: T::Q8_0, name: "q8_0", blck: 32, bytes: 34, dequant: true, host_act: H::Q8_2X4 },
+    // q8_1: ggml's activation form (llama.cpp 36a73916 ggml-common.h:258-269, ggml.c:745): two f16, d and s = d * sum(qs),
+    // then 32 int8 codes. ggml gives it neither to_float nor vec_dot, so every use here is refused by name.
+    QRow { ty: T::Q8_1, name: "q8_1", blck: 32, bytes: 36, dequant: false, host_act: H::None },
     // The K-quants, QK_K = 256 (ggml-common.h:79): block_q2_K :309-314, q3_K :327-332, q4_K :348-353,
     // q5_K :367-373, q6_K :388-393; ggml.c:912/938/998.
     QRow { ty: T::Q2_K, name: "q2_K", blck: 256, bytes: 84, dequant: true, host_act: H::Q8K },
@@ -72,6 +75,9 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::Q4_K, name: "q4_K", blck: 256, bytes: 144, dequant: true, host_act: H::Q8_2X4 },
     QRow { ty: T::Q5_K, name: "q5_K", blck: 256, bytes: 176, dequant: true, host_act: H::Q8_2X4 },
     QRow { ty: T::Q6_K, name: "q6_K", blck: 256, bytes: 210, dequant: true, host_act: H::Q8_2X4 },
+    // q8_K: ggml's activation form, mainline's block (llama.cpp 36a73916 ggml-common.h:371-376, ggml.c:880): float d, 256 int8
+    // codes, 16 int16 bsums = 292 B. ik's block adds a float sum, 296 B (c10fbbcc ggml-common.h:405-411): a divergence.
+    QRow { ty: T::Q8_K, name: "q8_K", blck: 256, bytes: 292, dequant: false, host_act: H::None },
     // The i-quants, QK_K = 256 (ggml.c:1055-1293): block_iq2_xxs ggml-common.h:443, iq2_xs :458, iq3_xxs :492,
     // iq1_s :526, iq3_s :510, iq2_s :474, iq4_xs :608. iq4_nl is QK4_NL = 32 (ggml.c:1276), :590.
     QRow { ty: T::IQ2_XXS, name: "iq2_xxs", blck: 256, bytes: 66, dequant: true, host_act: H::Q8K },
@@ -101,6 +107,9 @@ pub const QROWS: &[QRow] = &[
     // nvfp4: mainline's (llama.cpp-mainline ggml.c:760-764, ggml-common.h:221-227), four UE4M3 sub-block scales
     // then 32 bytes of 4-bit codes; it has a reference decode and no CPU matmul here.
     QRow { ty: T::NVFP4, name: "nvfp4", blck: 64, bytes: 36, dequant: true, host_act: H::None },
+    // q1_0: mainline's (llama.cpp 36a73916 ggml-common.h:180-185, ggml.c:677), one f16 d then 16 bytes of 1-bit codes; ik's
+    // q1_0_g128 is the same block at the same id (ggml-common.h:553-558). Its dot takes Q8_0 (ggml-cpu.c:228); sized only here.
+    QRow { ty: T::Q1_0, name: "q1_0", blck: 128, bytes: 18, dequant: false, host_act: H::None },
     // q2_0: mainline's (llama.cpp f2cc7282c, ggml.c:685-687, ggml-common.h:187-192), one f16 d then 16 bytes of
     // 2-bit codes; its dot takes Q8_0 (ggml-cpu.c:237).
     QRow { ty: T::Q2_0, name: "q2_0", blck: 64, bytes: 18, dequant: true, host_act: H::Q8_0 },
