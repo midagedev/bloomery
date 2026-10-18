@@ -516,6 +516,8 @@ impl CardFormat {
             GgmlType::F32 => Some(CardFormat::F32),
             GgmlType::BF16 => Some(CardFormat::Bf16AsF32),
             GgmlType::F16
+            | GgmlType::Q4_0
+            | GgmlType::Q4_1
             | GgmlType::MXFP4
             | GgmlType::Q2_K
             | GgmlType::IQ2_XS

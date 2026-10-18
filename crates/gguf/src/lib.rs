@@ -13,7 +13,9 @@
 //! numbers with ggml's size table, so files with types the engine cannot
 //! dequantize still inventory). A model split across shards opens as a
 //! [`Split`]: one strict reader per shard, validated as one model. The
-//! [`write`] module writes the files this reader opens.
+//! [`write`] module writes the files this reader opens. The [`qtype`] module
+//! holds one row of facts per ggml type (sizes, name, decode, activation),
+//! which `quant`, [`ggml_type_info`] and the other crates read.
 //!
 //! Format facts mirrored from the vendored ik_llama.cpp reader
 //! (`gguf_init_from_file`, ggml.c:31219-31475):
@@ -30,10 +32,12 @@
 //! truncated or hostile file yields [`LoadError`].
 
 pub mod iq_tables;
+pub mod qtype;
 pub mod quant;
 pub mod v41;
 pub mod write;
 
+pub use qtype::{HostAct, QROWS, QRow};
 pub use quant::{
     ActivationFormat, GgmlType, QuantError, activation_format, dequant_row, quantize_activations,
     quantize_row_q8_2_x4_roundtrip, quantize_row_q8_k_roundtrip,
@@ -710,8 +714,8 @@ fn check_place(g: &Gguf, path: &Path, place: u64) -> Result<(), LoadError> {
 /// requires. Placement, block alignment and dequantizability are NOT
 /// validated, and type ids the engine has no `GgmlType` for are carried as
 /// numbers with their size from ggml's table (or `None`). This is the
-/// inventory for files the strict reader refuses — e.g. i-quant or q4_0
-/// files — where the point is to know what is in the file, not to run it.
+/// inventory for files the strict reader refuses — e.g. a file holding a q8_K
+/// tensor — where the point is to know what is in the file, not to run it.
 pub struct Inventory {
     pub version: u32,
     pub meta: Vec<(String, Value)>,
@@ -753,16 +757,10 @@ pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
     })
 }
 
-/// ggml's `(type_name, blck_size, type_size)` for a type id: the engine's
-/// own numbers ([`GgmlType::blck_size`], [`GgmlType::type_size`], which cite
-/// their block structs) for every id [`GgmlType`] names, and a table here for
-/// the four ids ggml defines that the enum leaves [`GgmlType::Unknown`]. Ids
-/// are `enum ggml_type` values (ik_llama.cpp ggml.h:391-427); block sizes and
-/// byte sizes are the block structs' static_asserts in ggml-common.h (ik
-/// `c10fbbcc`), cited per entry from `typedef` to `static_assert`:
-///   * 2 `q4_0` 32/18 (ggml-common.h:167-171), 3 `q4_1` 32/20 (:174-178,
-///     `GGML_SCALE_TYPE1` = two halves, :16),
-///   * 9 `q8_1` 32/36 (:241-245),
+/// ggml's `(type_name, blck_size, type_size)` for a type id: the row of every id
+/// [`GgmlType`] names ([`QROWS`], which cite their block structs), and a table here for
+/// the two ids ggml defines as activation forms that the enum leaves [`GgmlType::Unknown`]:
+///   * 9 `q8_1` 32/36 (ik `c10fbbcc` ggml-common.h:241-245),
 ///   * 15 `q8_K` 256/296 — ik layout, `float d; float sum; int8_t qs[256];
 ///     int16_t bsums[16]` (:405-411); mainline ggml's block_q8_K is 264 B (no
 ///     sum/bsums), a divergence to remember if a q8_K file's byte sums ever
@@ -770,21 +768,14 @@ pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
 ///
 /// Every other id returns `None` and inventories with unknown size.
 pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
-    let ty = GgmlType::from_u32(id);
-    if let Some(name) = ty.name() {
-        return ty
-            .blck_size()
-            .zip(ty.type_size())
-            .map(|(b, t)| (name, b, t));
+    if let Some(row) = GgmlType::from_u32(id).row() {
+        return Some((row.name, row.blck, row.bytes));
     }
-    let (name, blck, tsz) = match id {
-        2 => ("q4_0", 32, 18),
-        3 => ("q4_1", 32, 20),
-        9 => ("q8_1", 32, 36),
-        15 => ("q8_K", 256, 296),
-        _ => return None,
-    };
-    Some((name, blck, tsz))
+    match id {
+        9 => Some(("q8_1", 32, 36)),
+        15 => Some(("q8_K", 256, 296)),
+        _ => None,
+    }
 }
 
 /// `type_size * (ne[0]/blck) * ne[1] * …`, the bytes of a tensor of `tsz`-byte
@@ -880,10 +871,7 @@ fn alignment_of(meta: &[(String, Value)]) -> Result<u64, LoadError> {
 /// or no bytes, an id listed twice.
 fn check_private(private: &[PrivateType]) -> Result<(), LoadError> {
     for (i, p) in private.iter().enumerate() {
-        let known = GgmlType::from_u32(p.id)
-            .name()
-            .or_else(|| ggml_type_info(p.id).map(|(name, _, _)| name));
-        if let Some(name) = known {
+        if let Some((name, _, _)) = ggml_type_info(p.id) {
             return Err(LoadError::KnownPrivateType { id: p.id, name });
         }
         let detail = if p.blck == 0 || p.size == 0 {
@@ -898,20 +886,13 @@ fn check_private(private: &[PrivateType]) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// The ids of [`ggml_type_info`]'s table that a file stores as tensors and the
-/// strict pass sizes from it: q4_0 and q4_1. Their tensors keep
-/// `ty = GgmlType::Unknown(id)`, so a reader that needs their values refuses
-/// them by name, while the file opens. q8_1 and q8_K are ggml's activation
-/// forms, which no quantizer writes to a file, and q8_K's size is ik's
-/// (mainline's block differs), so a tensor of either is still refused.
-const FILE_TABLE_IDS: [u32; 2] = [2, 3];
-
 /// The strict pass over a parsed header's tensors: every tensor must be sized
-/// by this engine's `GgmlType`, by ggml's table for the ids in
-/// [`FILE_TABLE_IDS`], or by its entry in `private`, its first dim must be
+/// by this engine's `GgmlType` or by its entry in `private`, its first dim must be
 /// block-aligned and its bytes must fit a u64; then every tensor must sit
 /// inside the `len`-byte file — the placement invariant the coverage gate
-/// re-checks per tensor.
+/// re-checks per tensor. A q8_1 or q8_K tensor is refused: they are ggml's
+/// activation forms, which no quantizer writes to a file, and q8_K's size is ik's
+/// (mainline's block differs).
 fn strict_tensors(
     raw: Vec<RawTensorInfo>,
     data_base: u64,
@@ -922,26 +903,20 @@ fn strict_tensors(
     for t in raw {
         let ty = GgmlType::from_u32(t.type_id);
         let own = private.iter().find(|p| p.id == t.type_id);
-        let table = FILE_TABLE_IDS
-            .contains(&t.type_id)
-            .then(|| ggml_type_info(t.type_id))
-            .flatten();
-        let blck = ty
-            .blck_size()
-            .or(table.map(|(_, b, _)| b))
-            .or(own.map(|p| p.blck))
-            .ok_or_else(|| LoadError::UnsupportedType {
-                name: t.name.clone(),
-                ty,
-            })?;
-        let tsz = ty
-            .type_size()
-            .or(table.map(|(_, _, s)| s))
-            .or(own.map(|p| p.size))
-            .ok_or_else(|| LoadError::UnsupportedType {
-                name: t.name.clone(),
-                ty,
-            })?;
+        let blck =
+            ty.blck_size()
+                .or(own.map(|p| p.blck))
+                .ok_or_else(|| LoadError::UnsupportedType {
+                    name: t.name.clone(),
+                    ty,
+                })?;
+        let tsz =
+            ty.type_size()
+                .or(own.map(|p| p.size))
+                .ok_or_else(|| LoadError::UnsupportedType {
+                    name: t.name.clone(),
+                    ty,
+                })?;
         if t.dims[0] % blck != 0 {
             return Err(LoadError::UnalignedRow {
                 name: t.name,
@@ -1430,13 +1405,12 @@ mod private_tests {
         q
     }
 
-    /// A q4_0 or q4_1 tensor opens, sized by ggml's table and kept as
-    /// `GgmlType::Unknown(id)`; a q8_K tensor (an activation form, its size
-    /// ik's) is still refused by name.
+    /// A q4_0 or q4_1 tensor opens, sized by its row and typed `GgmlType::Q4_0` or
+    /// `GgmlType::Q4_1`; a q8_K tensor (an activation form, its size ik's) is refused by name.
     #[test]
     fn q4_0_and_q4_1_open_and_q8_k_is_refused() {
         let d = set_dir("table");
-        for (id, bytes) in [(2u32, 72u64), (3, 80)] {
+        for (id, ty, bytes) in [(2u32, GgmlType::Q4_0, 72u64), (3, GgmlType::Q4_1, 80)] {
             let p = d.join(format!("t{id}.gguf"));
             let t = TensorDecl {
                 name: "q".to_string(),
@@ -1447,11 +1421,7 @@ mod private_tests {
             write_file(&p, &[], &[(t, vec![5; usize::try_from(bytes).unwrap()])]);
             let g = Gguf::open(&p).unwrap_or_else(|e| panic!("type {id} must open: {e}"));
             let q = g.tensor(0).unwrap();
-            assert_eq!(
-                (q.ty, q.nbytes),
-                (GgmlType::Unknown(id), bytes),
-                "type {id}"
-            );
+            assert_eq!((q.ty, q.nbytes), (ty, bytes), "type {id}");
         }
         let p = d.join("t15.gguf");
         let t = TensorDecl {

@@ -52,6 +52,7 @@ use std::fmt;
 use crate::iq_tables::{
     IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
+use crate::qtype::HostAct;
 
 /// GGUF v3 / ggml tensor type tags, values from `enum ggml_type`
 /// (ggml.h:391; F32=0 … Q6_K=14 at ggml.h:392-406, IQ2_XXS=16 … IQ4_XS=23
@@ -67,9 +68,11 @@ use crate::iq_tables::{
 /// ik has no Q2_0.
 ///
 /// A named type is one this build can size ([`GgmlType::blck_size`],
-/// [`GgmlType::type_size`]); whether it can decode it is a separate question
-/// ([`GgmlType::has_dequant`]). `Unknown` carries every other tag: the ids
-/// the enum does not name (q4_0, q4_1, q8_1, q8_K among them), the
+/// [`GgmlType::type_size`]): it has a row in [`crate::QROWS`], the one owner
+/// of the facts a type has. Whether it can decode is a separate question
+/// ([`GgmlType::has_dequant`]), and Q4_0 and Q4_1 are named, sized and
+/// decoded by nothing here. `Unknown` carries every other tag: the ids
+/// the enum does not name (q8_1 and q8_K among them), the
 /// slots ggml removed (4, 5, 31-33, 36-38) and the ids past the table. The
 /// loader accepts such tensors only far enough to name them, and every
 /// size/dequant entry point rejects them with an error.
@@ -108,15 +111,19 @@ pub enum GgmlType {
     TQ1_0,
     TQ2_0,
     Q2_0,
+    Q4_0,
+    Q4_1,
     Unknown(u32),
 }
 
 impl GgmlType {
     #[must_use]
-    pub fn from_u32(v: u32) -> Self {
+    pub const fn from_u32(v: u32) -> Self {
         match v {
             0 => GgmlType::F32,
             1 => GgmlType::F16,
+            2 => GgmlType::Q4_0,
+            3 => GgmlType::Q4_1,
             6 => GgmlType::Q5_0,
             7 => GgmlType::Q5_1,
             8 => GgmlType::Q8_0,
@@ -149,10 +156,12 @@ impl GgmlType {
         }
     }
 
-    pub fn as_u32(self) -> u32 {
+    pub const fn as_u32(self) -> u32 {
         match self {
             GgmlType::F32 => 0,
             GgmlType::F16 => 1,
+            GgmlType::Q4_0 => 2,
+            GgmlType::Q4_1 => 3,
             GgmlType::Q5_0 => 6,
             GgmlType::Q5_1 => 7,
             GgmlType::Q8_0 => 8,
@@ -185,152 +194,26 @@ impl GgmlType {
         }
     }
 
-    /// `ggml_type_name` string (type_traits table, ggml.c:620 — entries at
-    /// ggml.c:657/667/756/777/819/912/938/998/1485, mxfp4 at ggml.c:1307;
-    /// i8…f64 at ggml.c:621-649, the i-quants at ggml.c:1055-1293; tq1_0 and
-    /// tq2_0 from mainline's table, llama.cpp ggml.c:912/920, q2_0 from
-    /// `f2cc7282c`'s, ggml.c:685, and nvfp4 from llama.cpp-mainline's,
-    /// ggml.c:760-761).
-    /// Used to name the oracle
-    /// dumps `$BLOOMERY_DATA/ref/<name>.raw`.
+    /// `ggml_type_name`, from the type's row; `None` for [`GgmlType::Unknown`].
+    /// Names the oracle dumps `$BLOOMERY_DATA/ref/<name>.raw`.
+    #[must_use]
     pub fn name(self) -> Option<&'static str> {
-        match self {
-            GgmlType::F32 => Some("f32"),
-            GgmlType::F16 => Some("f16"),
-            GgmlType::Q5_0 => Some("q5_0"),
-            GgmlType::Q5_1 => Some("q5_1"),
-            GgmlType::Q8_0 => Some("q8_0"),
-            GgmlType::Q2_K => Some("q2_K"),
-            GgmlType::Q3_K => Some("q3_K"),
-            GgmlType::Q4_K => Some("q4_K"),
-            GgmlType::Q5_K => Some("q5_K"),
-            GgmlType::Q6_K => Some("q6_K"),
-            GgmlType::BF16 => Some("bf16"),
-            GgmlType::MXFP4 => Some("mxfp4"),
-            GgmlType::NVFP4 => Some("nvfp4"),
-            GgmlType::IQ2_XXS => Some("iq2_xxs"),
-            GgmlType::IQ2_XS => Some("iq2_xs"),
-            GgmlType::IQ3_XXS => Some("iq3_xxs"),
-            GgmlType::IQ1_S => Some("iq1_s"),
-            GgmlType::IQ4_NL => Some("iq4_nl"),
-            GgmlType::IQ3_S => Some("iq3_s"),
-            GgmlType::IQ2_S => Some("iq2_s"),
-            GgmlType::IQ4_XS => Some("iq4_xs"),
-            GgmlType::I8 => Some("i8"),
-            GgmlType::I16 => Some("i16"),
-            GgmlType::I32 => Some("i32"),
-            GgmlType::I64 => Some("i64"),
-            GgmlType::F64 => Some("f64"),
-            GgmlType::IQ1_M => Some("iq1_m"),
-            GgmlType::TQ1_0 => Some("tq1_0"),
-            GgmlType::TQ2_0 => Some("tq2_0"),
-            GgmlType::Q2_0 => Some("q2_0"),
-            GgmlType::Unknown(_) => None,
-        }
+        self.row().map(|r| r.name)
     }
 
-    /// `blck_size` from ggml's type_traits table (ggml.c:620): F32/F16/BF16 = 1
-    /// (ggml.c:657/667/1485), Q5_0/Q5_1/Q8_0 = QK5_0/QK5_1/QK8_0 = 32
-    /// (ggml.c:756/777/819, QK5_0/QK5_1/QK8_0 at ggml-common.h:195/210/233),
-    /// K-quants = QK_K = 256 (ggml.c:912/938/998, QK_K at ggml-common.h:79),
-    /// MXFP4 = QK_MXFP4 = 32 (ggml.c:1308, ggml-common.h:182); the integer
-    /// types and F64 = 1 (ggml.c:621-649), IQ4_NL = QK4_NL = 32 (ggml.c:1276),
-    /// the other i-quants and TQ1_0/TQ2_0 = QK_K = 256 (ggml.c:1055-1293,
-    /// mainline ggml.c:912/920), Q2_0 = QK2_0 = 64 (mainline `f2cc7282c`
-    /// ggml.c:687, ggml-common.h:187), NVFP4 = QK_NVFP4 = 64
-    /// (llama.cpp-mainline ggml.c:762, ggml-common.h:221).
-    ///
-    /// This match is the single owner of those numbers for the Rust side.
+    /// `blck_size` from ggml's type_traits table, as the type's row holds it (values per
+    /// block); `None` for [`GgmlType::Unknown`]. The row is the single owner of the number for
+    /// the Rust side, with the source lines of every type.
+    #[must_use]
     pub fn blck_size(self) -> Option<u64> {
-        match self {
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::BF16
-            | GgmlType::I8
-            | GgmlType::I16
-            | GgmlType::I32
-            | GgmlType::I64
-            | GgmlType::F64 => Some(1),
-            GgmlType::Q5_0
-            | GgmlType::Q5_1
-            | GgmlType::Q8_0
-            | GgmlType::MXFP4
-            | GgmlType::IQ4_NL => Some(32),
-            GgmlType::Q2_K
-            | GgmlType::Q3_K
-            | GgmlType::Q4_K
-            | GgmlType::Q5_K
-            | GgmlType::Q6_K
-            | GgmlType::IQ2_XXS
-            | GgmlType::IQ2_XS
-            | GgmlType::IQ3_XXS
-            | GgmlType::IQ1_S
-            | GgmlType::IQ3_S
-            | GgmlType::IQ2_S
-            | GgmlType::IQ4_XS
-            | GgmlType::IQ1_M
-            | GgmlType::TQ1_0
-            | GgmlType::TQ2_0 => Some(256),
-            GgmlType::Q2_0 | GgmlType::NVFP4 => Some(64),
-            GgmlType::Unknown(_) => None,
-        }
+        self.row().map(|r| r.blck)
     }
 
-    /// `type_size` (bytes per block) from the same type_traits table:
-    /// `sizeof(float)` = 4 (F32), `sizeof(ggml_fp16_t)` = 2 (F16),
-    /// `sizeof(ggml_bf16_t)` = 2 (BF16, one `uint16_t`, ggml.h:380),
-    /// `sizeof(block_q5_0)` = 22, `sizeof(block_q5_1)` = 24,
-    /// `sizeof(block_q8_0)` = 34, `sizeof(block_q2_K)` = 84, `sizeof(block_q3_K)` = 110,
-    /// `sizeof(block_q4_K)` = 144, `sizeof(block_q5_K)` = 176,
-    /// `sizeof(block_q6_K)` = 210 — block layouts and static_asserts in
-    /// ggml-common.h:309-314 (q2_K), 327-332 (q3_K), 348-353 (q4_K), 367-373 (q5_K),
-    /// 388-393 (q6_K), 196-216 (q5_0/q5_1), 233-238 (q8_0: one f16 `d` and
-    /// 32 int8 codes), `sizeof(block_mxfp4)` = 17 (ggml-common.h:183-187: one
-    /// E8M0 byte `e`, then 16 bytes of 4-bit codes); the block structs'
-    /// static_asserts in ggml-common.h give `sizeof(block_iq2_xxs)` = 66 (:443),
-    /// `block_iq2_xs` = 74 (:458), `block_iq2_s` = 82 (:474), `block_iq3_xxs`
-    /// = 98 (:492), `block_iq3_s` = 110 (:510), `block_iq1_s` = 50 (:526),
-    /// `block_iq1_m` = 56 (:540), `block_iq4_nl` = 18 (:590), `block_iq4_xs` =
-    /// 136 (:608), and mainline's `block_tq1_0` = 54 (:281), `block_tq2_0` =
-    /// 66 (:288), `block_q2_0` = 18 (`f2cc7282c` ggml-common.h:188-192: one
-    /// f16 `d`, then 16 bytes of 2-bit codes), `block_nvfp4` = 36
-    /// (llama.cpp-mainline ggml-common.h:223-227: four UE4M3 sub-block
-    /// scales, then 32 bytes of 4-bit codes); I8/I16/I32/I64/F64 are their C
-    /// scalars, 1/2/4/8/8.
+    /// `type_size` (bytes per block) from the same table, as the type's row holds it; `None`
+    /// for [`GgmlType::Unknown`].
+    #[must_use]
     pub fn type_size(self) -> Option<u64> {
-        match self {
-            GgmlType::F32 => Some(4),
-            GgmlType::F16 => Some(2),
-            GgmlType::BF16 => Some(2),
-            GgmlType::Q5_0 => Some(22),
-            GgmlType::Q5_1 => Some(24),
-            GgmlType::Q8_0 => Some(34),
-            GgmlType::Q2_K => Some(84),
-            GgmlType::Q3_K => Some(110),
-            GgmlType::Q4_K => Some(144),
-            GgmlType::Q5_K => Some(176),
-            GgmlType::Q6_K => Some(210),
-            GgmlType::MXFP4 => Some(17),
-            GgmlType::NVFP4 => Some(36),
-            GgmlType::IQ2_XXS => Some(66),
-            GgmlType::IQ2_XS => Some(74),
-            GgmlType::IQ3_XXS => Some(98),
-            GgmlType::IQ1_S => Some(50),
-            GgmlType::IQ4_NL => Some(18),
-            GgmlType::IQ3_S => Some(110),
-            GgmlType::IQ2_S => Some(82),
-            GgmlType::IQ4_XS => Some(136),
-            GgmlType::I8 => Some(1),
-            GgmlType::I16 => Some(2),
-            GgmlType::I32 => Some(4),
-            GgmlType::I64 => Some(8),
-            GgmlType::F64 => Some(8),
-            GgmlType::IQ1_M => Some(56),
-            GgmlType::TQ1_0 => Some(54),
-            GgmlType::TQ2_0 => Some(66),
-            GgmlType::Q2_0 => Some(18),
-            GgmlType::Unknown(_) => None,
-        }
+        self.row().map(|r| r.bytes)
     }
 
     /// Whether [`dequant_row`] decodes this type. A named type it does not
@@ -338,44 +221,12 @@ impl GgmlType {
     /// but every decode of it is [`QuantError::Unsupported`].
     #[must_use]
     pub fn has_dequant(self) -> bool {
-        match self {
-            GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::Q5_0
-            | GgmlType::Q5_1
-            | GgmlType::Q8_0
-            | GgmlType::Q2_K
-            | GgmlType::Q3_K
-            | GgmlType::Q4_K
-            | GgmlType::Q5_K
-            | GgmlType::Q6_K
-            | GgmlType::BF16
-            | GgmlType::MXFP4
-            | GgmlType::NVFP4
-            | GgmlType::IQ2_XXS
-            | GgmlType::IQ2_XS
-            | GgmlType::IQ3_XXS
-            | GgmlType::IQ3_S
-            | GgmlType::IQ4_NL
-            | GgmlType::IQ4_XS
-            | GgmlType::Q2_0 => true,
-            GgmlType::IQ1_S
-            | GgmlType::IQ2_S
-            | GgmlType::I8
-            | GgmlType::I16
-            | GgmlType::I32
-            | GgmlType::I64
-            | GgmlType::F64
-            | GgmlType::IQ1_M
-            | GgmlType::TQ1_0
-            | GgmlType::TQ2_0
-            | GgmlType::Unknown(_) => false,
-        }
+        self.row().is_some_and(|r| r.dequant)
     }
 }
 
 /// ggml's name for a type this enum names, or for an id ggml's table sizes
-/// ([`crate::ggml_type_info`]: q4_0, q4_1, q8_1, q8_K), so a refusal of such a
+/// ([`crate::ggml_type_info`]: q8_1, q8_K), so a refusal of such a
 /// tensor names its type; `ggml-type-<id>` for any other id.
 impl fmt::Display for GgmlType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -483,7 +334,9 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::IQ4_NL => dequant_iq4_nl(&src[..need], dst),
         GgmlType::IQ4_XS => dequant_iq4_xs(&src[..need], dst),
         GgmlType::Q2_0 => dequant_q2_0(&src[..need], dst),
-        GgmlType::IQ1_S
+        GgmlType::Q4_0
+        | GgmlType::Q4_1
+        | GgmlType::IQ1_S
         | GgmlType::IQ2_S
         | GgmlType::I8
         | GgmlType::I16
@@ -1401,7 +1254,7 @@ pub fn quantize_row_q8_0_roundtrip(x: &[f32], out: &mut [f32]) {
 /// The activation format ggml quantizes to before a dot with this weight type, as the
 /// type-traits table defines it. `Ok(None)` means the activations stay f32.
 ///
-/// This lives beside the two round-trip functions so the mapping has one owner: a caller
+/// The mapping is each type's row ([`crate::QRow::host_act`]) and has no other owner: a caller
 /// that picks the activation format itself will pick it differently somewhere else, and the
 /// difference shows up as a 1e-3 numeric drift nobody can place.
 ///
@@ -1424,37 +1277,12 @@ pub fn quantize_row_q8_0_roundtrip(x: &[f32], out: &mut [f32]) {
 /// ggml-cpu.c:340); the other i-quants take Q8_K too and have no CPU matmul here. Q2_0, mainline's alone, takes Q8_0 (`f2cc7282c` ggml-cpu.c:237), the column
 /// qdot's Q2_0 kernel reads. NVFP4 has a reference decode and no CPU matmul here.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
-    match weight {
-        GgmlType::Q2_K
-        | GgmlType::Q3_K
-        | GgmlType::IQ2_XXS
-        | GgmlType::IQ2_XS
-        | GgmlType::IQ3_XXS
-        | GgmlType::IQ3_S
-        | GgmlType::IQ4_XS => Ok(Some(ActivationFormat::Q8K)),
-        GgmlType::Q4_K
-        | GgmlType::Q5_K
-        | GgmlType::Q6_K
-        | GgmlType::Q5_0
-        | GgmlType::Q5_1
-        | GgmlType::Q8_0
-        | GgmlType::MXFP4
-        | GgmlType::IQ4_NL => Ok(Some(ActivationFormat::Q8_2X4)),
-        GgmlType::Q2_0 => Ok(Some(ActivationFormat::Q8_0)),
-        GgmlType::F32 | GgmlType::F16 => Ok(None),
-        GgmlType::BF16
-        | GgmlType::NVFP4
-        | GgmlType::IQ1_S
-        | GgmlType::IQ2_S
-        | GgmlType::I8
-        | GgmlType::I16
-        | GgmlType::I32
-        | GgmlType::I64
-        | GgmlType::F64
-        | GgmlType::IQ1_M
-        | GgmlType::TQ1_0
-        | GgmlType::TQ2_0
-        | GgmlType::Unknown(_) => Err(QuantError::NoActivationFormat(weight)),
+    match weight.row().map(|r| r.host_act) {
+        Some(HostAct::Q8K) => Ok(Some(ActivationFormat::Q8K)),
+        Some(HostAct::Q8_2X4) => Ok(Some(ActivationFormat::Q8_2X4)),
+        Some(HostAct::Q8_0) => Ok(Some(ActivationFormat::Q8_0)),
+        Some(HostAct::F32) => Ok(None),
+        Some(HostAct::None) | None => Err(QuantError::NoActivationFormat(weight)),
     }
 }
 
@@ -1511,6 +1339,7 @@ impl Q8Block {
 #[cfg(test)]
 mod tests {
     use super::{GgmlType, QuantError, activation_format, dequant_row};
+    use crate::qtype::{HostAct, QROWS};
 
     /// `(id, ggml_type_name, ggml_blck_size, ggml_type_size)` for every id
     /// [`GgmlType`] names, as the compiled libraries answer: ik_llama.cpp
@@ -1523,6 +1352,8 @@ mod tests {
     const GGML_TABLE: &[(u32, &str, u64, u64)] = &[
         (0, "f32", 1, 4),
         (1, "f16", 1, 2),
+        (2, "q4_0", 32, 18),
+        (3, "q4_1", 32, 20),
         (6, "q5_0", 32, 22),
         (7, "q5_1", 32, 24),
         (8, "q8_0", 32, 34),
@@ -1553,15 +1384,17 @@ mod tests {
         (42, "q2_0", 64, 18),
     ];
 
-    /// Ids the enum leaves `Unknown`: types it does not name yet (q4_0, q4_1,
-    /// q8_1, q8_K; mainline's q1_0 at 41, ik's q1_0_g128 at 41 and q8_2_x4
+    /// Ids the enum leaves `Unknown`: types it does not name yet (q8_1, q8_K;
+    /// mainline's q1_0 at 41, ik's q1_0_g128 at 41 and q8_2_x4
     /// at 99), slots ggml removed (4, 5, 31-33, 36-38; ik reuses 31-33 and
     /// 36 for repacked and BitNet types mainline does not have), and 43, the
     /// first id past mainline's table.
     // PIN(2026-09-24): 10 (q2_K) left this list when the enum named it for the GLM-5.3 MTP layer.
     // PIN(2026-10-12): 42 (q2_0) left this list when the enum named it.
     // PIN(2026-10-16): 40 (nvfp4) left this list when the enum named it for Nemotron 3.5 Bolt.
-    const UNKNOWN_IDS: &[u32] = &[2, 3, 4, 5, 9, 15, 31, 32, 33, 36, 37, 38, 41, 43, 99];
+    // PIN(2026-10-18): 2 (q4_0) and 3 (q4_1) left this list when the enum named them, with a row each; both
+    // are sized and refused by name.
+    const UNKNOWN_IDS: &[u32] = &[4, 5, 9, 15, 31, 32, 33, 36, 37, 38, 41, 43, 99];
 
     /// Every named id round-trips through the enum and carries ggml's name,
     /// block size and block bytes; every other id stays `Unknown` with no
@@ -1588,9 +1421,73 @@ mod tests {
                 (ty.name(), ty.blck_size(), ty.type_size()),
                 (None, None, None)
             );
+            assert!(ty.row().is_none(), "id {id}");
             let shown = crate::ggml_type_info(id)
                 .map_or_else(|| format!("ggml-type-{id}"), |(n, _, _)| n.to_owned());
             assert_eq!(ty.to_string(), shown, "id {id}: Display");
+        }
+    }
+
+    /// The rows are ggml's table and nothing else: one row for each id of the table, in tag
+    /// order, each with the table's name and sizes. A tag the enum does not name has no row,
+    /// whatever tag an `Unknown` holds.
+    #[test]
+    fn the_rows_are_ggmls_table() {
+        assert_eq!(
+            QROWS.len(),
+            GGML_TABLE.len(),
+            "a row for each id of the table and no other"
+        );
+        assert!(
+            QROWS
+                .windows(2)
+                .all(|w| w[0].ty.as_u32() < w[1].ty.as_u32()),
+            "rows are in tag order"
+        );
+        for &(id, name, blck, bytes) in GGML_TABLE {
+            let row = GgmlType::from_u32(id)
+                .row()
+                .unwrap_or_else(|| panic!("id {id} ({name}) has no row"));
+            assert_eq!(
+                (row.ty.as_u32(), row.name, row.blck, row.bytes),
+                (id, name, blck, bytes),
+                "id {id}"
+            );
+        }
+        for id in 0..128 {
+            let named = GGML_TABLE.iter().any(|t| t.0 == id);
+            assert_eq!(GgmlType::from_u32(id).row().is_some(), named, "id {id}");
+            assert!(GgmlType::Unknown(id).row().is_none(), "Unknown({id})");
+        }
+    }
+
+    /// A row is what the dispatchers it feeds do: `dequant` is whether `dequant_row` decodes one
+    /// zero block, a type a CPU matmul takes has a reference decode to be checked against, and
+    /// the tag and the name round-trip through the enum.
+    #[test]
+    fn a_row_is_what_its_dispatchers_do() {
+        for row in QROWS {
+            let (ty, name) = (row.ty, row.name);
+            assert_eq!(
+                GgmlType::from_u32(ty.as_u32()),
+                ty,
+                "{name}: tag round trip"
+            );
+            assert_eq!(ty.to_string(), name, "{name}: Display");
+            let zero_block = dequant_row(
+                ty,
+                &vec![0u8; row.bytes as usize],
+                &mut vec![0.0f32; row.blck as usize],
+            );
+            assert_eq!(
+                !matches!(zero_block, Err(QuantError::Unsupported(_))),
+                row.dequant,
+                "{name}: dequant"
+            );
+            assert!(
+                row.dequant || row.host_act == HostAct::None,
+                "{name}: a CPU matmul with no reference decode to check it"
+            );
         }
     }
 
@@ -1648,6 +1545,8 @@ mod tests {
             (GgmlType::Q8_0, Some(Q8_2X4)),
             (GgmlType::MXFP4, Some(Q8_2X4)),
             (GgmlType::Q2_0, Some(Q8_0)),
+            (GgmlType::IQ4_XS, Some(Q8K)),
+            (GgmlType::IQ4_NL, Some(Q8_2X4)),
             (GgmlType::F32, None),
             (GgmlType::F16, None),
         ] {

@@ -302,6 +302,8 @@ pub const fn gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         GgmlType::MXFP4 => Some(GateUpEntry::Mxfp4),
         GgmlType::F32
         | GgmlType::F16
+        | GgmlType::Q4_0
+        | GgmlType::Q4_1
         | GgmlType::Q5_0
         | GgmlType::Q5_1
         | GgmlType::Q2_K
@@ -345,6 +347,8 @@ pub const fn down(ty: GgmlType) -> Option<(DownEntry, DownAct)> {
         GgmlType::IQ4_XS => Some((DownEntry::Iq4xs, DownAct::Q8Act)),
         GgmlType::F32
         | GgmlType::F16
+        | GgmlType::Q4_0
+        | GgmlType::Q4_1
         | GgmlType::Q2_K
         | GgmlType::Q3_K
         | GgmlType::BF16
@@ -380,6 +384,8 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
         GgmlType::IQ4_NL => Some(GemmEntry::Iq4nl),
         GgmlType::F32
         | GgmlType::F16
+        | GgmlType::Q4_0
+        | GgmlType::Q4_1
         | GgmlType::Q5_0
         | GgmlType::Q2_K
         | GgmlType::BF16
@@ -416,6 +422,8 @@ pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
         GgmlType::F32 => Some(SiteEntry::F32),
         GgmlType::NVFP4 => Some(SiteEntry::Nvfp4),
         GgmlType::F16
+        | GgmlType::Q4_0
+        | GgmlType::Q4_1
         | GgmlType::Q5_1
         | GgmlType::Q2_K
         | GgmlType::BF16
@@ -450,6 +458,8 @@ pub const fn head(ty: GgmlType) -> Option<HeadEntry> {
         GgmlType::Q8_0 => Some(HeadEntry::Q8_0),
         GgmlType::F32
         | GgmlType::F16
+        | GgmlType::Q4_0
+        | GgmlType::Q4_1
         | GgmlType::Q5_0
         | GgmlType::Q5_1
         | GgmlType::Q2_K
@@ -490,6 +500,8 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
         GgmlType::Q8_0 => Some(EmbedEntry::Q8_0),
         GgmlType::F32
         | GgmlType::F16
+        | GgmlType::Q4_0
+        | GgmlType::Q4_1
         | GgmlType::Q5_0
         | GgmlType::Q5_1
         | GgmlType::Q2_K
@@ -583,7 +595,7 @@ mod tests {
 
     /// Every `GgmlType` variant in declaration order, then one id the enum
     /// does not name.
-    const ALL: [GgmlType; 31] = [
+    const ALL: [GgmlType; 33] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::Q5_0,
@@ -614,6 +626,8 @@ mod tests {
         GgmlType::TQ1_0,
         GgmlType::TQ2_0,
         GgmlType::Q2_0,
+        GgmlType::Q4_0,
+        GgmlType::Q4_1,
         GgmlType::Unknown(99),
     ];
 
@@ -651,7 +665,9 @@ mod tests {
             GgmlType::TQ1_0 => 27,
             GgmlType::TQ2_0 => 28,
             GgmlType::Q2_0 => 29,
-            GgmlType::Unknown(_) => 30,
+            GgmlType::Q4_0 => 30,
+            GgmlType::Q4_1 => 31,
+            GgmlType::Unknown(_) => 32,
         }
     }
 
