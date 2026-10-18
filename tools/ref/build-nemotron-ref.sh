@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Link nemotron_ref (tools/ref/nemotron_ref.cpp, with tools/ref/ref_io.h) against the existing mainline build of the
 # nemotron_h or nemotron_h_moe profile (each names its own LCPP; the binary takes the architecture as --arch). This does
-# not configure or rebuild that tree: a rebuild moves the md5s the tokenizer family pins. The .build record spells those
+# not configure or rebuild that tree: a rebuild moves the md5s the nemotron_h logits family pins. The .build record spells those
 # md5s as crate::tokenizer::build_id does (llama-tokenize <md5> libllama.so <md5>; the file on disk is libllama.so.0).
 # Output: $BLOOMERY_DATA/bin/<name> and <name>.build beside it; <name> is nemotron_ref under nemotron_h and nemotron_ref_moe under
 # nemotron_h_moe, because the two profiles name different mainline trees (dump-nemotron.sh derives the same name).

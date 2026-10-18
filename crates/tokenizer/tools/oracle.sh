@@ -2,7 +2,7 @@
 # oracle.sh — reference token ids for the tokenizer gate, written next to the exact text they came
 # from. The writer behind `just dump-ref-tokenizer`; `just gate-tokenizer` only reads the sets,
 # through refset's tokenizer families (crates/refset/src/arch/tokenizer.rs), which refuse a set that
-# this script did not finish or that another reference executable, library or vocabulary wrote.
+# this script did not finish or that another reference tree (commit or patch) or vocabulary wrote.
 #
 # Not a measurement: no lease, no timing, no GPU (CUDA_VISIBLE_DEVICES is emptied; llama-tokenize
 # loads the vocabulary only). The text sets are engram-corpus.sh's, gathered the same way from the
@@ -24,14 +24,15 @@
 #   <name>.ids           one id per line, special tokens parsed
 #   <name>.nps.ids       one id per line, --no-parse-special
 #   cases/<nn>.{txt,ids,nps.ids}
-#   MANIFEST.tsv         the executable and the libllama.so it loads (path, md5), the mainline commit
-#                        they were built at (`# build`, the pinned mainline vocabularies only), the
+#   MANIFEST.tsv         the executable and the libllama.so it loads (path, md5), the tree they were
+#                        built from (`# build`: its commit, and its patch where it has one), the
 #                        vocabulary file, the cases file (path, md5), one row per text (the corpus
 #                        names, then cases/<nn>: bytes, text md5, id counts), and the `# complete`
 #                        trailer
 #
 # The vocabularies, each with its reference tree and its set (`profile` below owns the table;
-# crates/refset/src/arch/tokenizer.rs pins the same executables and libraries by md5):
+# crates/refset/src/arch/tokenizer.rs pins the same trees, each as the commit it is built at, with the hash of its patch where
+# it has one):
 #
 #   v41       V4.1's first shard                  ik-tilde  (`~` is a symbol, as in mainline and HF)  ref-tokenizer-v41
 #   qwen3moe  the Qwen3-MoE file                  ik-tokref (the unicode_tolower fix)                  ref-tokenizer-qwen3moe
@@ -42,10 +43,16 @@
 #                                                 LCPP and MODEL, tools/ref/models/gemma-embedding2.sh)
 #   llama     EmbeddingGemma v1's Q8_0 file      the same mainline pin, gemma-embedding profile       ref-tokenizer-llama
 #
-# The two mainline vocabularies (gemma4, llama) are the commit's build, not an md5: before anything is read the tree's HEAD, its
-# tracked files and llama-tokenize's own `--version` must name the profile's LCPP_PIN (tools/ref/emb2/oracle-tree.sh), and the
-# manifest then states `# build <commit>`, which the refset family pins. The executable's and the library's md5s stay in the
-# manifest (tools/ref/emb2/emb2.sh holds the ids to this machine's binary) but change with every rebuild, so no family pins them.
+# Every vocabulary's reference is a tree's build, not one machine's md5s: before anything is read, the tree is checked against
+# the pin the profile names (tools/ref/emb2/oracle-tree.sh owns the check), and the manifest then states `# build <commit>` or
+# `# build <commit>+<patch>`, which the refset family pins. The commit is the first 9 digits of the tree's upstream commit
+# (BUILD_PIN); the patch is `oracle_patch_hash`, the 12 digits that name the tree's tracked files against that commit, for the
+# trees that carry local commits (ik-tilde, ik-tokref). A mainline tree has none: its HEAD is the commit, with no tracked change,
+# and llama-tokenize's own `--version` names it. ik's llama-tokenize has no `--version`: its build is held to be newer than every
+# source of the tree, and V4.1's `~` probe (below) shows the patch's effect in the binary. The executable's and the library's md5s
+# stay in the manifest (tools/ref/emb2/emb2.sh holds the ids to this machine's binary) but change with every rebuild, so no
+# family pins them. A tree that moved is a new pin, read off the tree: `source tools/ref/emb2/oracle-tree.sh; oracle_patch_hash
+# <tree> <commit>`.
 #
 # llama's corpora are cut into rows of at most CHUNK bytes, named <corpus>.<nnn> (a cut at a line end: `split -C`). That vocabulary's
 # SPM tokenizer partitions a text at its user-defined special tokens, the newline runs among them, and walks the fragment list once
@@ -109,30 +116,54 @@ source "$ROOT/tools/ref/emb2/oracle-tree.sh"
 # ik's does: `--no-bos` where the file would prepend a BOS (the gate compares the text's own ids),
 # `--no-escape` where it would turn a `\n` in the text into a newline.
 EXTRA=
-ORACLE_TREE= BUILD_PIN= CHUNK=0
+ORACLE_TREE='' BUILD_PIN='' BUILD_PATCH='' CHUNK=0
+TREE_FLAGS=()
+
+# The reference trees. ORACLE_TREE is the directory, BUILD_PIN the upstream commit it is built at (full hash), BUILD_PATCH the
+# hash of the local patch on that commit (empty: the tree is the commit), TREE_FLAGS the flags oracle_tree takes for it.
+# PIN(2026-10-18): each tree by its commit and patch, not by the md5s of one machine's binary and library.
+# ik-tilde: ik main at dad2cb3e5 plus one commit, the `~` in the S class (ik#2528).
+tree_tilde() {
+  ORACLE_TREE=/home/user/ik-tilde
+  BUILD_PIN=dad2cb3e55138cbdd7df988c66c0c3c54f6d34ad BUILD_PATCH=0e498d9dab2a
+  TREE_FLAGS=(--unversioned)
+}
+# ik-tokref: the ik-idxkey commit db517b690 plus the unicode_tolower fix (ik#2520).
+tree_tokref() {
+  ORACLE_TREE=/home/user/ik-tokref
+  BUILD_PIN=db517b690a8c0865fd8cf51565ae6b4a7295eb01 BUILD_PATCH=29cabc43ed4d
+  TREE_FLAGS=(--unversioned)
+}
+# llama.cpp-mainline: mainline at 53ed051ce, no patch; the commit the qwen35 families (crates/refset/src/arch/qwen35) name.
+tree_mainline() {
+  ORACLE_TREE=/home/user/llama.cpp-mainline
+  BUILD_PIN=53ed051ce5e8193652e449f43216ca3859454f49 BUILD_PATCH=
+  TREE_FLAGS=()
+}
+
 profile() {
   REF_FLAGS=()
   case $1 in
     v41)
       # The V4.1 file set is the deepseek41 profile's choice, exported by tools/box.sh.
       local dir=${BLOOMERY_V41_DIR:?BLOOMERY_V41_DIR unset — run through tools/box.sh, which exports it from the deepseek41 profile}
-      TOKENIZE=/home/user/ik-tilde/build/bin/llama-tokenize
+      tree_tilde
       SHARD=$(find "$dir" -maxdepth 1 -name '*-00001-of-*.gguf' | sort | head -1)
       [ -n "$SHARD" ] || { echo "oracle: no first shard under $dir" >&2; exit 66; }
       SET=ref-tokenizer-v41
       ;;
     qwen3moe)
-      TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize
+      tree_tokref
       SHARD=${BLOOMERY_QWEN3MOE_VOCAB:-/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf}
       SET=ref-tokenizer-qwen3moe
       ;;
     glm5next)
-      TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize
+      tree_tokref
       SHARD=/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf
       SET=ref-tokenizer-glm5next
       ;;
     qwen38)
-      TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize
+      tree_tokref
       SHARD=/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
       SET=ref-tokenizer-qwen38
       ;;
@@ -140,7 +171,7 @@ profile() {
       # ik-tokref knows the pre name and refuses the file: its loader has no
       # nemotron_h architecture. This tree's binary loads it. The pre is the
       # same LLAMA3 regex with ignore_merges.
-      TOKENIZE=/home/user/llama.cpp-mainline/build/bin/llama-tokenize
+      tree_mainline
       SHARD=/models/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf
       SET=ref-tokenizer-nemotron
       # The file sets add_bos_token, so llama-tokenize prepends BOS. The gate's
@@ -160,13 +191,13 @@ profile() {
       emb2=$(env -u BLOOMERY_REF_MODEL bash -c 'source "$1" && printf "%s\t%s\t%s\t%s" "$LCPP" "$MODEL" "${EMBED_CASES:?the profile names EMBED_CASES}" "${LCPP_PIN:?the profile names LCPP_PIN}"' _ \
         "$ROOT/tools/ref/models/$model_profile.sh")
       ORACLE_TREE=${emb2%%$'\t'*}
-      TOKENIZE=$ORACLE_TREE/build/bin/llama-tokenize
       emb2=${emb2#*$'\t'}
       SHARD=${emb2%%$'\t'*}
       emb2=${emb2#*$'\t'}
       SET=ref-tokenizer-$1
       EXTRA=$ROOT/crates/tokenizer/tests/${emb2%%$'\t'*}
       BUILD_PIN=${emb2#*$'\t'}
+      TREE_FLAGS=(--built-by 'just build-emb2-lcpp')
       # The SPM partition walk is quadratic in a text's size (header): llama's corpora go in rows of at most 1 MB.
       [ "$1" != llama ] || CHUNK=1000000
       # No --no-bos: the EmbeddingGemma sets run these ids as the model's
@@ -175,6 +206,7 @@ profile() {
       REF_FLAGS=(--no-escape)
       ;;
   esac
+  TOKENIZE=$ORACLE_TREE/build/bin/llama-tokenize
 }
 profile "$VOCAB_NAME"
 
@@ -183,7 +215,8 @@ profile "$VOCAB_NAME"
 # ik's binaries export libllama.so; the mainline build nemotron uses exports libllama.so.0.
 LIBLLAMA=$(ldd "$TOKENIZE" | awk '$1 == "libllama.so" || $1 == "libllama.so.0" { print $3; exit }')
 [ -f "$LIBLLAMA" ] || { echo "oracle: $TOKENIZE loads no libllama.so (ldd names '$LIBLLAMA')" >&2; exit 66; }
-[ -z "$ORACLE_TREE" ] || oracle_tree oracle "$ORACLE_TREE" "$BUILD_PIN" llama-tokenize
+oracle_tree "${TREE_FLAGS[@]}" ${BUILD_PATCH:+--patch "$BUILD_PATCH"} oracle "$ORACLE_TREE" "$BUILD_PIN" llama-tokenize
+BUILD_ID=${BUILD_PIN:0:9}${BUILD_PATCH:++$BUILD_PATCH}
 if [ "$VOCAB_NAME" = v41 ]; then
   # The reference's `~` is a symbol, so `~/` is one word and one id; a tree whose `~` is in neither
   # P nor S returns [96, 17].
@@ -252,7 +285,7 @@ extra_md5=
 {
   printf '# tokenizer\t%s\t%s\n' "$TOKENIZE" "$(md5sum < "$TOKENIZE" | cut -d' ' -f1)"
   printf '# libllama\t%s\t%s\n' "$LIBLLAMA" "$(md5sum < "$LIBLLAMA" | cut -d' ' -f1)"
-  [ -z "$BUILD_PIN" ] || printf '# build\t%s\n' "${BUILD_PIN:0:9}"
+  printf '# build\t%s\n' "$BUILD_ID"
   printf '# vocabulary\t%s\n' "$SHARD"
   printf '# text tree\t%s\n' "$IK"
   printf '# cases\t%s\t%s\n' "$CASES" "$(md5sum < "$CASES" | cut -d' ' -f1)"

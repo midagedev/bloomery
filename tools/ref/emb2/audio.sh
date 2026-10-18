@@ -7,7 +7,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 source tools/ref/models/gemma-embedding2.sh
 source tools/ref/emb2/oracle-tree.sh
 DATA=${BLOOMERY_DATA:-/root/bloomery-data}
-oracle_tree audio "$LCPP" "$LCPP_PIN"
+oracle_tree --built-by 'just build-emb2-lcpp' audio "$LCPP" "$LCPP_PIN"
 for lib in libmtmd.so libllama.so libggml.so libggml-base.so; do
     [ -e "$LCPP/build/bin/$lib" ] || { echo "audio: no $LCPP/build/bin/$lib (just build-emb2-lcpp)" >&2; exit 2; }
 done
