@@ -1522,7 +1522,7 @@ gate-engram:
 # crates/tokenizer/tests/cases.txt, in both parse modes, and the reference's ids decode back to the text, for
 # the five vocabularies the engine runs: V4.1 (deepseek-v3), Qwen3-MoE (qwen2), GLM-5.3-Flash (glm4),
 # Qwen3.8-Flash-Next (qwen35) and Nemotron 3 Nano 4B (pixtral). It only reads the sets: each opens through its refset family
-# (crates/refset/src/arch/tokenizer.rs), which refuses by name a set written by another executable or library, from
+# (crates/refset/src/arch/tokenizer.rs), which refuses by name a set written from another reference tree (commit or patch), from
 # another vocabulary file or other cases, with a text that is not the one dumped, or never finished.
 # `just dump-ref-tokenizer` writes them. EmbeddingGemma v1's llama SentencePiece cases also compare with
 # BOS/EOS, in both parse modes, against the pinned mainline set and its extra cases.
@@ -1533,9 +1533,11 @@ gate-tokenizer:
 # (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron, gemma4, llama or all, every one but
 # gemma4 and llama). No lease, no GPU. gemma4 (EmbeddingGemma 2) and llama (v1) use mainline 6868a52cb
 # (`just build-emb2-lcpp`), with their profile's EMBED_CASES after cases.txt. The EmbeddingGemma oracle sets read those ids.
-# A re-dump on a moved reference tree changes the md5 pins in crates/refset/src/arch/tokenizer.rs: the gate names which.
-# gemma4 and llama are held to the mainline commit instead (their manifest's `# build` line, checked against the tree before the
-# dump), which any rebuild of that commit keeps; llama's corpora go in rows of at most 1 MB, its tokenizer being quadratic in a text.
+# Every vocabulary is held to the tree it is read by: before the dump the tree's commit, its patch and its build are checked against
+# the pin crates/tokenizer/tools/oracle.sh names (tools/ref/emb2/oracle-tree.sh), and the manifest's `# build` line states it
+# (`<commit>`, or `<commit>+<patch>` for the two ik side trees) for the refset family to pin, which any rebuild of that tree keeps.
+# A re-dump on a moved tree changes that pin in oracle.sh and crates/refset/src/arch/tokenizer.rs: the gate names which.
+# llama's corpora go in rows of at most 1 MB, its tokenizer being quadratic in a text.
 # V4.1's reference is a side tree (/home/user/ik-tilde: ik main plus the one line that puts `~` in the S class,
 # ik#2528) and Qwen3-MoE, GLM-5.3-Flash and Qwen3.8 use /home/user/ik-tokref (the ik-idxkey commit plus the
 # unicode_tolower fix, ik#2520). Nemotron uses /home/user/llama.cpp-mainline: ik-tokref has no nemotron_h

@@ -11,7 +11,7 @@
 #                   BLOOMERY_REF_MODEL moves it; a caller's own MODEL= is ignored.
 #   LCPP            mainline llama.cpp. ik has no nemotron_h, so this tree is the oracle.
 #                   nemotron_ref links its existing build and does not rebuild it: a rebuild
-#                   moves the md5s the tokenizer family pins.
+#                   moves the md5s the nemotron_h logits family pins.
 #   IK              no ik oracle. The default is only so IKBIN can be formed; nothing here runs it.
 #   LCPPBIN         mainline llama-bench, the depth runner's reference arms (lcpp:, lcpppp:).
 #   LCPP_GPU_FLAGS  the whole model on the card the run holds, flash attention on.

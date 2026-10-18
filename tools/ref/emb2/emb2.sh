@@ -109,7 +109,7 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 # The tree, its build and the files, before every step.
 verify() {
   local want
-  oracle_tree emb2 "$ORACLE" "$LCPP_PIN" llama-server
+  oracle_tree --built-by 'just build-emb2-lcpp' emb2 "$ORACLE" "$LCPP_PIN" llama-server
   for want in "source_sha256 $(sha "$DUMPER")" "set_writer_sha256 $(sha tools/ref/clefvis/set_writer.h)" "lcpp_commit $BLOOMERY_REF_BUILD" "lcpp $(readlink -f "$ORACLE")"; do
     grep -Fqx "$want" "$BIN.build" 2> /dev/null || die "$BIN is not this tree's dump_emb2 at $BLOOMERY_REF_BUILD (no '$want' in $BIN.build; just build-emb2-ref)"
   done
