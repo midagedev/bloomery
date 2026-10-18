@@ -390,10 +390,19 @@ mod gate {
                 );
             }
         }
-        for ty in ["input_video", "video_url"] {
-            let body = json!({"input":{"content":[
-                {"type":ty, (ty):{"data":"data:video/mp4;base64,AA=="}}
-            ]}});
+        // A clip that is not a video is a named 400 from the decoder (ffprobe's refusal, or the
+        // absent ffmpeg's, which names the decoded-frames route).
+        for (ty, part) in [
+            (
+                "input_video",
+                json!({"type":"input_video","input_video":{"data":"AAAA","format":"mp4"}}),
+            ),
+            (
+                "video_url",
+                json!({"type":"video_url","video_url":{"url":"data:video/mp4;base64,AAAA"}}),
+            ),
+        ] {
+            let body = json!({"input":{"content":[part]}});
             let (status, text) = curl(&url("/v1/embeddings"), Some(&body), false)?;
             let value: Value = serde_json::from_str(&text)?;
             check(
@@ -402,7 +411,8 @@ mod gate {
                 status == 400
                     && value["error"]["type"] == "invalid_request_error"
                     && value["error"]["message"].as_str().is_some_and(|message| {
-                        message.contains("decoded one-FPS image_url frames")
+                        message.starts_with("ffprobe: ")
+                            || message.contains("decoded one-FPS image_url frames")
                     }),
             );
         }

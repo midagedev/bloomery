@@ -77,7 +77,7 @@ use crate::flag::ApiKeys;
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::ArgTypes;
 use crate::http::{self, EventStream, Request};
-use crate::media::{self, ExpandError, MediaError, Prompt, SharedMediaModel};
+use crate::media::{self, ExpandError, MediaError, Medium, Prompt, SharedMediaModel, VideoCtx};
 use crate::models::Listed;
 use crate::qwenxml::ParamKinds;
 use crate::reasoning::{ReasoningFormat, ThinkEntry};
@@ -85,6 +85,7 @@ use crate::sampling;
 use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
 use crate::swap::Park;
+use crate::video::{self, VideoSupport};
 use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
 
 /// Anthropic's Messages API, a child of this module so it runs the chat path's
@@ -336,6 +337,10 @@ impl Server {
         }
         let engine_props = engine_object(&engine.props_engine());
         let media = engine.media_model();
+        let (video, video_line) = VideoSupport::detect();
+        if media.as_ref().is_some_and(|m| m.video_rule().is_some()) {
+            eprintln!("bloomery-serve: {video_line}");
+        }
         let info = ModelInfo {
             n_vocab: tok.n_vocab(),
             ctx_max: engine.ctx_max(),
@@ -367,6 +372,7 @@ impl Server {
             model_path: config.model_path,
             engine_props,
             media,
+            video,
             slot_save_path: config.slot_save_path,
             side: None,
             api_keys: config.api_keys,
@@ -394,6 +400,18 @@ impl Server {
         Arc::get_mut(&mut self.state)
             .expect("the state is shared only once the server starts")
             .side = Some(embeddings::Side::new(embed));
+        self
+    }
+
+    /// The server with `video` as what decodes a clip, in place of the ffmpeg
+    /// and ffprobe it found on `PATH` when it bound: a seat names the threads
+    /// its engine's pool leaves ([`VideoSupport::threads`]), a test a decoder
+    /// that makes frames from their indices.
+    #[must_use]
+    pub fn with_video(mut self, video: VideoSupport) -> Server {
+        Arc::get_mut(&mut self.state)
+            .expect("the state is shared only once the server starts")
+            .video = video;
         self
     }
 
@@ -502,6 +520,10 @@ struct State {
     /// image part is rendered as the model's placeholder only when it exists,
     /// and refused by name otherwise. Read without the engine.
     media: Option<SharedMediaModel>,
+    /// What decodes a clip: ffmpeg found at startup, a decoder a caller set
+    /// ([`Server::with_video`]), or the reason there is none. A clip is taken
+    /// when this and the model's video rule are both there ([`State::takes_video`]).
+    video: VideoSupport,
     /// Where slot files live; `None` refuses slot actions.
     slot_save_path: Option<PathBuf>,
     /// The embedding model beside the engine ([`Server::with_side`]); `None`
@@ -581,6 +603,17 @@ impl SlotQueue {
 }
 
 impl State {
+    /// Whether a clip can be served: a decoder is there, and the chat model or
+    /// the embedding model has a video rule ([`MediaModel::video_rule`]). The
+    /// chat path also needs the model's video token, the embedding path its
+    /// delimiters; a model without them refuses a clip by name.
+    fn takes_video(&self) -> bool {
+        let rule = |m: &SharedMediaModel| m.video_rule().is_some();
+        self.video.is_ready()
+            && (self.media.as_ref().is_some_and(rule)
+                || self.side.as_ref().is_some_and(|s| s.takes_video()))
+    }
+
     fn next_id(&self) -> u64 {
         self.shared.next_id()
     }
@@ -1896,7 +1929,11 @@ fn props(state: &State) -> Value {
         "chat_template_caps": {},
         "bos_token": state.info.bos_text,
         "eos_token": state.info.eos_text,
-        "modalities": { "vision": state.media.is_some(), "audio": false },
+        "modalities": {
+            "vision": state.media.is_some(),
+            "audio": false,
+            "video": state.takes_video(),
+        },
         "n_ctx": state.info.ctx_max,
         "build_info": format!("bloomery-serve {VERSION}"),
         "engine": state.engine_props,
@@ -2328,17 +2365,20 @@ fn apply_template(state: &State, b: &Map<String, Value>) -> Result<Value, ApiErr
 }
 
 /// A chat template's render: its text, each image as the model's
-/// placeholder, and the images' URLs in the order of their placeholders.
+/// placeholder and each clip as its text with a placeholder a group, and the
+/// media in the order of their placeholders.
 struct Rendered {
     text: String,
-    images: Vec<String>,
+    media: Vec<Medium>,
 }
 
 /// Renders the chat template for an OpenAI `messages` body. An array content
 /// becomes one text: on an engine that takes images, its parts flattened by
 /// the model's rule ([`media::flatten`]), each image the model's placeholder,
 /// numbered by its place among the request's images, across messages
-/// (`images`, in the order of the placeholders, is the count); on one that
+/// (`media`, in the order of the placeholders, holds them), and each clip
+/// probed and planned under the context the request's text leaves
+/// ([`clip_budget`]); on one that
 /// takes none, its text parts joined, any other part refused by
 /// name ([`content_text`]); a content that is neither a string, an array nor
 /// `null` is refused too, as is a `tools` that is not an array. Nothing is
@@ -2354,7 +2394,15 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
     // named by the `<|channel|>` marker in its source.
     let gpt_oss = state.template.source().contains("<|channel|>");
     let mut messages = Vec::with_capacity(msgs.len());
-    let mut images = Vec::new();
+    let mut media: Vec<Medium> = Vec::new();
+    let video = VideoCtx::new(
+        state.video.clone(),
+        if carries_video(msgs) {
+            clip_budget(state, msgs)
+        } else {
+            0
+        },
+    );
     for (i, m) in msgs.iter().enumerate() {
         let Value::Object(m) = m else {
             return Err(invalid("each message must be an object"));
@@ -2379,9 +2427,13 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
                 let text = match &state.media {
                     None => content_text(parts)?,
                     Some(model) => {
-                        let f = media::flatten(role, parts, &**model, images.len())
+                        let first = media
+                            .iter()
+                            .filter(|m| matches!(m, Medium::Image(_)))
+                            .count();
+                        let f = media::flatten(role, parts, &**model, first, &video)
                             .map_err(|e| media_error(&e))?;
-                        images.extend(f.images.into_iter().map(str::to_owned));
+                        media.extend(f.media);
                         f.text
                     }
                 };
@@ -2429,7 +2481,41 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         kind: "server_error",
         message: e.to_string(),
     })?;
-    Ok(Rendered { text, images })
+    Ok(Rendered { text, media })
+}
+
+/// Whether a message of `msgs` carries a clip part.
+fn carries_video(msgs: &[Value]) -> bool {
+    msgs.iter()
+        .filter_map(|m| m.get("content")?.as_array())
+        .flatten()
+        .any(|p| {
+            matches!(
+                p.get("type").and_then(Value::as_str),
+                Some("input_video" | "video_url")
+            )
+        })
+}
+
+/// The positions of context the request's clips may take together: the engine's
+/// context less the tokens of the request's text parts and the template's own
+/// ([`video::clip_budget`]). The text is counted by the model's tokenizer, so a
+/// long prompt leaves a short clip its due.
+fn clip_budget(state: &State, msgs: &[Value]) -> usize {
+    let text_tokens: usize = msgs
+        .iter()
+        .map(|m| match m.get("content") {
+            Some(Value::String(s)) => state.tok.encode(s).len(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|p| p.get("text")?.as_str())
+                .map(|t| state.tok.encode(t).len())
+                .sum(),
+            _ => 0,
+        })
+        .sum();
+    video::clip_budget(state.info.ctx_max, text_tokens)
 }
 
 /// The argument a template's probe call carries.
@@ -2747,11 +2833,13 @@ fn engine_gone(state: &State, started: bool) -> ApiError {
 
 /// A refusal of the media part: the request's 400. An empty span is the model's
 /// 500, because message text that carries the marker is refused before the
-/// prompt is tokenized. A numbered placeholder whose ids are not its image's
+/// prompt is tokenized; the clip's temp file that cannot be written is the
+/// server's 500. A numbered placeholder whose ids are not its image's
 /// position is the request's 400, with the placeholder-count and image-last faults.
 fn media_error(e: &MediaError) -> ApiError {
     match e {
-        MediaError::Expand(ExpandError::EmptySpan(_)) => engine_error(e),
+        MediaError::Expand(ExpandError::EmptySpan(_))
+        | MediaError::Clip(video::VideoError::Temp(_)) => engine_error(e),
         _ => invalid(e.to_string()),
     }
 }
@@ -2764,8 +2852,7 @@ fn chat_prompt(state: &State, rendered: &Rendered) -> Result<Prompt, ApiError> {
     let Some(model) = &state.media else {
         return Ok(Prompt::from(ids));
     };
-    let urls: Vec<&str> = rendered.images.iter().map(String::as_str).collect();
-    media::expand_prompt(&ids, &urls, &**model).map_err(|e| media_error(&e))
+    media::expand_prompt(&ids, &rendered.media, &**model).map_err(|e| media_error(&e))
 }
 
 /// What the 400 for a prompt past the context adds to its two numbers: the
@@ -7242,17 +7329,18 @@ mod tests {
         }
     }
 
-    /// The mock engine behind a model that numbers its images
-    /// ([`crate::media::NumberedMedia`]); only the render is asked of it.
-    struct NumberedEngine(crate::MockEngine);
+    /// The mock engine behind a media model (a model that numbers its images,
+    /// [`crate::media::NumberedMedia`], or one that takes clips,
+    /// [`crate::media::ClipMedia`]); only the render is asked of it.
+    struct MediaEngine(crate::MockEngine, crate::media::SharedMediaModel);
 
-    impl Engine for NumberedEngine {
+    impl Engine for MediaEngine {
         fn tokenizer(&self) -> Arc<dyn crate::engine::Tokenizer> {
             self.0.tokenizer()
         }
 
         fn media_model(&self) -> Option<crate::media::SharedMediaModel> {
-            Some(Arc::new(crate::media::NumberedMedia))
+            Some(Arc::clone(&self.1))
         }
 
         fn prefill(&mut self, ids: &[u32]) -> Result<(), crate::engine::EngineError> {
@@ -7286,7 +7374,10 @@ mod tests {
     #[test]
     fn images_are_numbered_across_the_messages_of_a_request() {
         let (_addr, state, _ended) = super::testserve::spawn(
-            Box::new(NumberedEngine(crate::MockEngine::new(64))),
+            Box::new(MediaEngine(
+                crate::MockEngine::new(64),
+                Arc::new(crate::media::NumberedMedia),
+            )),
             super::testserve::mock_config(),
         );
         let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
@@ -7307,6 +7398,164 @@ mod tests {
              <user>\nand\n<image_id>1</image_id><image><unk>\
              <assistant>\n"
         );
-        assert_eq!(rendered.images, ["data:a", "data:b"]);
+        let urls: Vec<&str> = rendered
+            .media
+            .iter()
+            .filter_map(|m| match m {
+                super::Medium::Image(url) => Some(url.as_str()),
+                super::Medium::Video(_) => None,
+            })
+            .collect();
+        assert_eq!(urls, ["data:a", "data:b"]);
+    }
+
+    /// A server over `engine` whose video is `video`: the address, state and end channel.
+    fn spawn_video(
+        engine: Box<dyn Engine>,
+        video: crate::video::VideoSupport,
+    ) -> (
+        SocketAddr,
+        Arc<super::State>,
+        std::sync::mpsc::Receiver<End>,
+    ) {
+        let server = super::Server::bind("127.0.0.1:0", engine, super::testserve::mock_config())
+            .expect("bind")
+            .with_video(video);
+        let addr = server.local_addr().expect("addr");
+        let (state, ended) = server.start().expect("start");
+        (addr, state, ended)
+    }
+
+    fn clip_engine(ctx: usize) -> Box<dyn Engine> {
+        Box::new(MediaEngine(
+            crate::MockEngine::new(ctx),
+            Arc::new(crate::media::ClipMedia),
+        ))
+    }
+
+    /// `/props` names `modalities.video` only when a decoder and a video rule are both there: a
+    /// server whose ffmpeg is absent says false whatever its model takes, and so does a model
+    /// with no rule or none at all, while `vision` keeps its own meaning.
+    #[test]
+    fn props_names_video_only_when_a_decoder_and_a_rule_are_both_there() {
+        use crate::video::{MockClips, VideoSupport};
+        let mock = MockClips::new();
+        let numbered: Box<dyn Engine> = Box::new(MediaEngine(
+            crate::MockEngine::new(64),
+            Arc::new(crate::media::NumberedMedia),
+        ));
+        let cases: [(Box<dyn Engine>, VideoSupport, [bool; 2]); 4] = [
+            (clip_engine(64), mock.support(1), [true, true]),
+            (
+                clip_engine(64),
+                VideoSupport::absent("not found"),
+                [true, false],
+            ),
+            (numbered, mock.support(1), [true, false]),
+            (
+                Box::new(crate::MockEngine::new(64)),
+                mock.support(1),
+                [false, false],
+            ),
+        ];
+        for (engine, video, [vision, takes]) in cases {
+            let (addr, _state, _ended) = spawn_video(engine, video);
+            let (status, body) = super::testserve::roundtrip(addr, "GET", "/props", &[], "");
+            assert_eq!(status, 200, "{body}");
+            let props: Value = serde_json::from_str(&body).expect("JSON");
+            assert_eq!(
+                props["modalities"],
+                json!({"vision": vision, "audio": false, "video": takes}),
+                "{body}"
+            );
+        }
+    }
+
+    /// A chat's clip is probed and planned under the context its request's text leaves, before
+    /// the template renders: the group count follows the budget, the text holds a placeholder per
+    /// group, and `/apply-template` returns that text without decoding a frame.
+    #[test]
+    fn a_chat_clip_is_planned_under_the_context_its_text_leaves() {
+        use crate::video::{MockClips, PROMPT_FRAME_TOKENS};
+        let mock = MockClips::new();
+        let said = crate::MockEngine::new(8).tokenizer().encode("hi").len();
+        assert!(
+            said >= 2,
+            "the text must cost context for the budget to show it"
+        );
+        let clip = json!({"type": "input_video", "input_video": {
+            "data": crate::media::encode_base64(b"30 10/1 4x2"), "format": "mp4"
+        }});
+        let body = |ctx_text: &str| {
+            let Value::Object(b) = json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": ctx_text}, clip.clone()
+            ]}]}) else {
+                unreachable!("an object literal")
+            };
+            b
+        };
+        // Room for the whole clip (three groups of two tokens), then for four tokens, then none.
+        for (room, markers) in [(40, 3), (4, 2)] {
+            let (_addr, state, _ended) = spawn_video(
+                clip_engine(PROMPT_FRAME_TOKENS + said + room),
+                mock.support(2),
+            );
+            let rendered =
+                super::render_chat(&state, &body("hi")).unwrap_or_else(|e| panic!("{}", e.message));
+            assert_eq!(rendered.text.matches("<vid>").count(), markers, "{room}");
+            assert!(
+                rendered.text.starts_with("<user>\nhi\n["),
+                "{}",
+                rendered.text
+            );
+        }
+        let (_addr, state, _ended) =
+            spawn_video(clip_engine(PROMPT_FRAME_TOKENS + said + 1), mock.support(2));
+        let refused = super::render_chat(&state, &body("hi"))
+            .err()
+            .expect("no room");
+        assert_eq!(refused.code, 400);
+        assert!(
+            refused.message.starts_with("video: "),
+            "{}",
+            refused.message
+        );
+        // `/apply-template` renders the placeholders and decodes nothing.
+        let (addr, _state, _ended) = spawn_video(
+            clip_engine(PROMPT_FRAME_TOKENS + said + 40),
+            mock.support(2),
+        );
+        let request = Value::Object(body("hi")).to_string();
+        let (status, text) =
+            super::testserve::roundtrip(addr, "POST", "/apply-template", &[], &request);
+        assert_eq!(status, 200, "{text}");
+        let prompt: Value = serde_json::from_str(&text).expect("JSON");
+        assert_eq!(
+            prompt["prompt"],
+            "<user>\nhi\n[<vid>,<vid>,<vid>]<assistant>\n"
+        );
+        assert!(mock.calls.lock().unwrap().is_empty());
+    }
+
+    /// Where ffmpeg is absent a chat clip is the request's 400 with the named remedy, whatever
+    /// the model takes.
+    #[test]
+    fn a_chat_clip_without_ffmpeg_is_a_named_400() {
+        let (_addr, state, _ended) = spawn_video(
+            clip_engine(400),
+            crate::video::VideoSupport::absent("ffmpeg: not found"),
+        );
+        let Value::Object(body) = json!({"messages": [{"role": "user", "content": [
+            {"type": "video_url", "video_url": "data:video/mp4;base64,AAAA"}
+        ]}]}) else {
+            unreachable!("an object literal")
+        };
+        let e = super::render_chat(&state, &body).err().expect("no decoder");
+        assert_eq!(e.code, 400);
+        assert_eq!(
+            e.message,
+            "video input needs ffmpeg and ffprobe on PATH (ffmpeg: not found); install ffmpeg, \
+             or send the clip as decoded one-FPS image_url frames after a Video: text part"
+        );
     }
 }
