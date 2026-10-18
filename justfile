@@ -1594,8 +1594,19 @@ dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
 # Anthropic's Messages API on the chat path (anthropic). Qwen3.6's and Qwen3.8's XML tool calls, and every seat
 # template's tool-call markup mapped to its parser (qwenxml). The repetition, frequency and presence penalties as
 # llama-server takes them (penalty). A sampled request's drafted passes against its plain steps (sampdraft).
+# A chat clip and an embeddings clip against a mock decoder (src/media, src/api, src/arch/gemma4v): both part spellings, the
+# plan before the text, the placeholders paired by id and order, every named refusal, `/props` `modalities.video`.
 gate-serve:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test limits --test anthropic --test penalty --test sampdraft -- --include-ignored --nocapture'
+
+# The server's video decode against a real ffmpeg (crates/serve/tests/video.rs): a lossless clip whose every frame is one colour
+# naming its index, probed (its frame count from the duration where the container has none), planned by a tick rule and a
+# linspace rule and decoded at the plan's indices at one and four threads, the same frames; a decode past the file's end and
+# a file that is no video as named errors; a 60 s 1080p H.264 clip planned and decoded at four threads, its wall one
+# `stat video decode` line against docs/cards/vidcore-decode.card. Needs ffmpeg and ffprobe 5.1 or newer on PATH (the gate
+# fails by name without them). No card, no lease.
+gate-serve-video:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --test video -- --include-ignored --nocapture'
 
 # The template engine (crates/jinja, host only): its unit tests, the HF environment's whitespace control, scoping,
 # macros, filters and tests, Python's `str()` and slicing rules, and the V4.1 template rendered by hand. The engine's
@@ -2614,6 +2625,8 @@ dump-ref-jpeg:
 # V4.1 비전 호스트 게이트(V1): 리사이즈 플랜과 패드 기하, 패드된 u8 이미지와 bf16 패치(리샘플 유무 모두 비트 동일),
 # 스팬 id·타입을 그 세트와 대조하고, mmproj 헤더의 hparams와 모든 텐서의 이름을 검사한다.
 # It also runs tests/jpeg.rs: the JPEG decoder against Pillow on the fixtures of dump-ref-jpeg, within the pinned frontier.
+# The video planner (src/video.rs) on synthetic probes: numpy's linspace rounding, the tick counts, overflow, the tail, the stamps,
+# the budget's order (size first, then frames) and the named refusals; the temporal patch cut's frame order (src/preprocess.rs).
 gate-vision:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-vision --lib --test vision --test jpeg -- --include-ignored --nocapture'
 

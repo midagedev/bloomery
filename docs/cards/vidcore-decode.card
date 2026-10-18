@@ -1,0 +1,17 @@
+kind: profile
+question: Is ffmpeg's decode of a long 1080p H.264 clip, at the thread count the engine's pool leaves, a
+  serial cost the prompt waits on that the decode and encode overlap should hide?
+term: wall of one serve::video decode of the 120 planned frames (two a second, 60 pairs) of a 60 s 1920x1080
+  30 fps H.264 ultrafast clip, ffmpeg -threads 4 with the select filter, frames streamed to the host (s)
+unit: s
+predict: 3..6
+condition: Derived: 1800 source frames decode in full up to the last planned index, about 300-600 frames/s at
+  four decode threads for 1080p ultrafast H.264, so 3-6 s; the select filter converts only the 120 kept frames
+  to rgb24 (746 MB over the pipe, under 0.5 s). Not a timed lease run: the gate prints loadavg beside each of
+  its two decodes, and a decode whose loadavg first field is over 4 is read as a screen, not a number.
+decide-in: At 4 s or under the overlap stays backlog; over 4 s build the decode and encode overlap (groups
+  prepared and fed while ffmpeg decodes toward the next).
+decide-below: Under 3 s, and certainly at 2 s or under, the overlap stays backlog: the decode is not the term;
+  record the number in the triage.
+decide-above: Over 6 s build the decode and encode overlap first and re-measure the same clip; if the wall is
+  still over 6 s, price ffmpeg's decode threads against the engine pool's spin.
