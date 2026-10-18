@@ -1511,6 +1511,17 @@ gate-qwen3-plan:
 gate-qdot:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-qdot --test qdot -- --include-ignored --nocapture'
 
+# The quant gate: every gguf::QROWS row against llama.cpp mainline's quant oracle ($BLOOMERY_DATA/ref-quant, `just dump-ref-quant`):
+# (a) the sizes the harness wrote, (b) dequant_row bit-equal to to_float, (c) the host activation encoder bit-equal to from_float
+# of ggml's vec_dot_type where the row's host_act is ggml's, (d) qdot's scalar and AVX2 dots against vec_dot, bit-equal for the
+# types listed in BIT_EQUAL and within the band derived in crates/qdot/tests/quant_rows.rs for the rest. The set's table of ggml's
+# types is held both ways: a QROWS row ggml's table does not name, and a type it names with no QROWS row, are red by name; a type
+# the table states skipped (no to_float, no vec_dot) must be a row with no decoder and no CPU matmul. `just gate-quant q4_K` takes
+# one type's rows (ggml's type name, comma-separated for several) through QUANT_ONLY; a name that is neither a row nor a type of
+# the table ends the test with a named error. No model file, no card.
+gate-quant TYPE='':
+    ./tools/box.sh 'export QUANT_ONLY={{TYPE}} && bash tools/gate.sh --release -p bloomery-qdot --test quant_rows -- --include-ignored --nocapture'
+
 # B3 engram 게이트: V4.1의 NVMe 테이블에서 매핑으로 읽은 행이 같은 오프셋의 pread와
 # 바이트 동일이고(선행 읽기를 걸어도 같고), 행 간격이 텐서를 정확히 타일링하는가.
 # 정확성 실행이라 임대는 필요 없다 — 속도는 engram-rate가 임대 안에서 잰다. --lib은 prefetch의 helper 배치
