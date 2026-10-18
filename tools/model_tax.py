@@ -707,6 +707,7 @@ def self_test():
             ("a double slash inside a string is code", 'pub fn other() { let u = "http://qwen/x"; }\n', 1),
             ("a dereference assignment is code", "pub fn other(a: &mut Arch) {\n    *a = Arch::Qwen;\n}\n", 1),
             ("a continued expression starting with a star is code", "pub fn other() -> u32 {\n    a\n        * qwen_scale\n}\n", 1),
+            ("a raw C string keeps the code after it", 'pub fn other() {\n    let _ = cr#"" /*"#;\n    let _arch = Arch::Qwen;\n}\n', 1),
         ):
             case("e: " + name, {other: text}, want, None if want == 0 else "other.rs: qwen has no row")
         case("f: a hit in a family's own path passes", {"crates/model/src/arch/qwen/mod.rs": "fn qwen_spec() { Arch::Qwen; }\n"}, 0)

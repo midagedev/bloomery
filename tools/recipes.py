@@ -5169,7 +5169,7 @@ _NOT_ON_MAC = [
     (re.compile(r"\"/(?:proc|sys)/"), "a Linux /proc or /sys path"),
 ]
 _CFG_ATTR = re.compile(r"#(!?)\s*\[\s*cfg\s*\(")
-_RAW_STR = re.compile(r"b?r(#*)\"")
+_RAW_STR = re.compile(r"(?:b|c)?r(#*)\"")
 _IDENT_CH = re.compile(r"[A-Za-z0-9_]")
 
 
@@ -5209,7 +5209,7 @@ def rust_lex(text: str) -> tuple[str, str]:
             _blank(shape, i, j)
             i = j
             continue
-        if c in "br" and (i == 0 or not _IDENT_CH.match(text[i - 1])):
+        if c in "bcr" and (i == 0 or not _IDENT_CH.match(text[i - 1])):
             m = _RAW_STR.match(text, i)
             if m:
                 close = '"' + m.group(1)
