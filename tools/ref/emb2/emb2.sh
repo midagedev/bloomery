@@ -18,9 +18,9 @@
 #
 #   bash tools/ref/emb2/emb2.sh [STEP...]     (no step: the profile's EMBED_STEPS)
 #
-# Before every step the tree is checked, not trusted: LCPP at LCPP_PIN with no tracked change, its llama-server built from that
-# commit, the binary's .build record (tools/ref/clefvis/build-clefvis.sh) naming this tree's dump_emb2.cpp and set_writer.h and
-# that commit, the record's CUDA architectures covering the visible card, and the model file and projector of the sha256 the
+# Before every step the tree is checked, not trusted: LCPP at LCPP_PIN with no tracked change, its llama-server loading that
+# tree's libllama.so and built from that commit, the binary's .build record (tools/ref/clefvis/build-clefvis.sh) naming this
+# tree's dump_emb2.cpp and set_writer.h and that commit, the record's CUDA architectures covering the visible card, and the model file and projector of the sha256 the
 # profile pins. A step that reads the ids checks their manifest: complete, of this model, of this tree's llama-tokenize and the
 # libllama.so it loads, and of the two cases files as they are now. Each set is written to <set>.staging and moved over the
 # old set only when its writer exits 0, so a failed step leaves the old set whole: the old set waits as <set>.old while the
