@@ -16,7 +16,7 @@ use crate::rope_table::RopeRows;
 use crate::tensor::WindowMut;
 use crate::{GpuError, GpuModel};
 use cuda_core::{CudaStream, DeviceBuffer};
-use runtime::seqstate::Kept;
+use runtime::seqstate::{Kept, Why};
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
@@ -550,20 +550,47 @@ pub(crate) fn refuse_inside_image(
     }
 }
 
-/// What a cut to at most `n` positions keeps on a body whose own rule, `ask`, grants a position
-/// per asked one, held to the rotation table `own`: a grant strictly inside an image is asked
-/// again at the image's first row (a cut inside one is refused, [`SeqRope::cut`]), until the grant
-/// stands outside every image. The answer names `n` as asked. A text load (`own` is `None`)
-/// keeps `ask(n)`.
-pub(crate) fn kept_outside_images(
+/// What a cut to at most `n` positions keeps on a body that holds `held` positions, whose own
+/// rule without a verify or an image is `ask` (the checkpoints'), held to the rotation table
+/// `own`. With a verify waiting whose first row is at `verify`, a cut to `n` past it keeps `n`
+/// (`Rule`: its commit moves the lane word and copies nothing), every position when `n` reaches
+/// them (`Current`); else a grant strictly inside an image is asked again at the image's first
+/// row (a cut inside one is refused, [`SeqRope::cut`]), until the grant stands outside every
+/// image. The answer names `n` as asked. A text load (`own` is `None`) keeps `ask(n)`.
+pub(crate) fn kept_rule(
     own: Option<&SeqRope>,
+    verify: Option<u32>,
+    held: u32,
     n: u32,
     ask: impl Fn(u32) -> Kept,
 ) -> Kept {
-    kept_outside(own.map(|r| r.rows().seq()), n, ask)
+    kept_rule_over(own.map(|r| r.rows().seq()), verify, held, n, ask)
 }
 
-/// [`kept_outside_images`] over the images `seq` records.
+/// [`kept_rule`] over the images `seq` records.
+fn kept_rule_over(
+    seq: Option<&MropeSeq>,
+    verify: Option<u32>,
+    held: u32,
+    n: u32,
+    ask: impl Fn(u32) -> Kept,
+) -> Kept {
+    if let Some(first) = verify
+        && n > first
+    {
+        let at = n.min(held);
+        let why = if at == held { Why::Current } else { Why::Rule };
+        return Kept {
+            asked: n,
+            held,
+            at,
+            why,
+        };
+    }
+    kept_outside(seq, n, ask)
+}
+
+/// `ask`'s grant held outside the images `seq` records.
 fn kept_outside(seq: Option<&MropeSeq>, n: u32, ask: impl Fn(u32) -> Kept) -> Kept {
     let mut kept = ask(n);
     let Some(seq) = seq else {
@@ -595,7 +622,7 @@ fn shape(e: vision::mrope::MropeError) -> GpuError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::seqstate::Why;
+    use runtime::seqstate::{Ledger, marks};
 
     const SECTIONS: [u32; 4] = [11, 11, 10, 0];
 
@@ -660,6 +687,60 @@ mod tests {
             kept_outside(None, 270, ask).at,
             250,
             "a text load keeps the rule's"
+        );
+    }
+
+    /// A hybrid body that checkpoints every 512 positions (its ubatch) and took a prompt of
+    /// 1,024 ids holds points at 512 and 1,024; its image stands at rows 400..800. A cut to 700
+    /// or 900 is not granted the point at 512 inside the image: it is asked again at the image's
+    /// start, below every point, and keeps nothing; a cut to every position keeps them; a text
+    /// load, with no table, grants the 512. A verify waiting at 1,024 keeps its own rows by the
+    /// rule, whatever the table holds.
+    #[test]
+    fn a_media_load_grants_no_checkpoint_inside_its_image() {
+        let mut ledger = Ledger::new(4, 512).expect("a ledger of four slots");
+        for at in marks(0, 1_024, 512) {
+            ledger.take(at).expect("a take at a mark");
+        }
+        assert_eq!(ledger.positions(), [512, 1_024]);
+        let ask = |n: u32| ledger.keep(n, 1_024);
+        let mut seq = MropeSeq::new();
+        seq.push(400, 20, 20).expect("the image: rows 400..800");
+        let missed = |asked| Kept {
+            asked,
+            held: 1_024,
+            at: 0,
+            why: Why::Missed { lost: None },
+        };
+        assert_eq!(
+            kept_rule_over(Some(&seq), None, 1_024, 700, ask),
+            missed(700)
+        );
+        assert_eq!(
+            kept_rule_over(Some(&seq), None, 1_024, 900, ask),
+            missed(900)
+        );
+        assert_eq!(
+            kept_rule_over(Some(&seq), None, 1_024, 1_100, ask),
+            Kept {
+                asked: 1_100,
+                held: 1_024,
+                at: 1_024,
+                why: Why::Current,
+            },
+            "every position"
+        );
+        let text = kept_rule_over(None, None, 1_024, 700, ask);
+        assert_eq!(text.at, 512, "a text load keeps the rule's");
+        assert_eq!(
+            kept_rule_over(Some(&seq), Some(1_024), 1_028, 1_026, ask),
+            Kept::rule(1_026, 1_028, 1_026),
+            "inside the verify's rows"
+        );
+        assert_eq!(
+            kept_rule_over(Some(&seq), Some(1_024), 1_028, 2_000, ask).why,
+            Why::Current,
+            "past them"
         );
     }
 

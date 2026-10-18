@@ -112,7 +112,7 @@ use crate::host::xstream::{Costs, XLayer, XMode, XReport, XStreamBody};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Chain, SlotMap};
 use crate::linear::{self, LinearShape};
-use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, rope_table};
+use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::fit::{FIT_RESERVE, largest_fit};
 use crate::model::{
     ChainBody, GpuModel, HostServed, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
@@ -131,7 +131,7 @@ use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft};
 use model::placement::{Plan, WholeLoad, accepts};
-use runtime::seqstate::{Kept, Price, Why};
+use runtime::seqstate::{Kept, Price};
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -1847,32 +1847,21 @@ impl Body35 {
     /// else every position, the empty model at 0, or the nearest checkpoint
     /// at or below `n`, nothing (`Missed`) when none lies there — a delta
     /// layer keeps no earlier state but a copy. After a call failed past its
-    /// launch the stores hold more than `pos`, which is no longer kept.
-    /// Never past `pos`. The rule [`Body35::commit`] takes on a load that
-    /// verifies drafted rows, [`Body35::cut`] otherwise.
+    /// launch the stores hold more than `pos`, which is no longer kept. On a
+    /// media load a point inside an image grants nothing: the cut is asked
+    /// again at the image's start. Never past `pos`. The rule
+    /// [`Body35::commit`] takes on a load that verifies drafted rows,
+    /// [`Body35::cut`] otherwise.
     #[must_use]
     pub fn kept(&self, n: u32, pos: u32) -> Kept {
-        if let Some(p) = &self.pending
-            && n > p.pos0
-        {
-            let at = n.min(self.held);
-            let why = if at == self.held {
-                Why::Current
+        let verify = self.pending.map(|p| p.pos0);
+        kept_rule(self.seq_rope.as_ref(), verify, self.held, n, |n| {
+            if self.held == pos {
+                self.ckpt.kept(n, pos)
             } else {
-                Why::Rule
-            };
-            return Kept {
-                asked: n,
-                held: self.held,
-                at,
-                why,
-            };
-        }
-        if self.held == pos {
-            self.ckpt.kept(n, pos)
-        } else {
-            self.ckpt.kept(n.min(pos), self.held)
-        }
+                self.ckpt.kept(n.min(pos), self.held)
+            }
+        })
     }
 
     /// The checkpoints: their positions, their slots, what they have done.
