@@ -19,6 +19,7 @@ pub mod mimo2;
 pub mod minicpmv4_7;
 pub mod nemotron_h;
 pub mod nemotron_h_moe;
+pub mod quant;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen4exp;
@@ -38,6 +39,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (nemotron_h_moe::ARCH, nemotron_h_moe::FAMILIES),
     (tokenizer::ARCH, tokenizer::FAMILIES),
     (dequant::ARCH, dequant::FAMILIES),
+    (quant::ARCH, quant::FAMILIES),
     (gemma_embedding::ARCH, gemma_embedding::FAMILIES),
     (gemma_embedding2::ARCH, gemma_embedding2::FAMILIES),
 ];

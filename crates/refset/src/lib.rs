@@ -28,6 +28,8 @@
 //! - [`emb2`]: llama.cpp mainline's EmbeddingGemma 2 dumps and server
 //!   vectors (`tools/ref/emb2/emb2.sh`).
 //! - [`dequant`]: ggml's dequantized rows (`tools/ref/dump-dequant.sh`).
+//! - [`quant`]: mainline's quantization, activation conversion and dot products per weight
+//!   type (`tools/ref/quant-oracle.sh`).
 //! - [`nemotron`]: mainline's last-position logits of Nemotron 3 Nano and
 //!   3.5 Bolt (`tools/ref/nemotron_ref.cpp`).
 //! - [`census`]: the census stubs — header-only copies of many users' model
@@ -58,6 +60,7 @@ pub mod kld;
 mod md5;
 pub mod mtpref;
 pub mod nemotron;
+pub mod quant;
 pub mod tokenizer;
 pub mod vision;
 pub mod visref;

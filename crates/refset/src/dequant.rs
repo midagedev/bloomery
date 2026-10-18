@@ -134,7 +134,7 @@ impl DequantSet {
                     let c = cols.as_ref().ok_or_else(|| {
                         RefError::malformed(&at, "a file row before its `file` column line")
                     })?;
-                    let file = file_row(&c.row(line, &at)?, &at)?;
+                    let file = file_row(&c.row(line, &at)?, "file", &at)?;
                     if !seen.insert(file.name.clone()) {
                         return Err(RefError::malformed(
                             &at,
@@ -183,21 +183,32 @@ impl DequantSet {
     /// Every file against its row's length and md5: a file that is not the
     /// one dumped is `Malformed`, naming it and both digests.
     pub fn check_files(&self) -> Result<(), RefError> {
-        if self.files.is_empty() {
-            return Err(RefError::malformed(
-                self.dir.join(MANIFEST).display(),
-                "no file rows: the set names nothing to check",
-            ));
-        }
-        for f in &self.files {
-            check_file(&self.dir.join(&f.name), f.bytes, &f.md5)?;
-        }
-        Ok(())
+        check_files(&self.dir, MANIFEST, &self.files)
     }
 }
 
-fn file_row(r: &Row<'_>, at: &dyn fmt::Display) -> Result<SetFile, RefError> {
-    let name = r.text("file")?;
+/// Every file of `files` under `dir` against its row's length and md5 ([`DequantSet::check_files`]); `manifest` is the name of
+/// the identity file, which an empty set is refused in.
+pub(crate) fn check_files(dir: &Path, manifest: &str, files: &[SetFile]) -> Result<(), RefError> {
+    if files.is_empty() {
+        return Err(RefError::malformed(
+            dir.join(manifest).display(),
+            "no file rows: the set names nothing to check",
+        ));
+    }
+    for f in files {
+        check_file(&dir.join(&f.name), f.bytes, &f.md5)?;
+    }
+    Ok(())
+}
+
+/// A file row read by the names its column line gives: the file's name is column `name_col`.
+pub(crate) fn file_row(
+    r: &Row<'_>,
+    name_col: &str,
+    at: &dyn fmt::Display,
+) -> Result<SetFile, RefError> {
+    let name = r.text(name_col)?;
     crate::columns::file_name(name, at)?;
     let md5 = r.text("md5")?;
     check_hex("md5", md5, at)?;
