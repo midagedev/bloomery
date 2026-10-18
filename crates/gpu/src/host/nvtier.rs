@@ -1192,7 +1192,7 @@ impl CardHold {
     /// ([`NvTier::card_arena`]): the word offsets of its gate, up and down
     /// parts, as [`TierSlots::slot`] counts parts. Refused by name for an id
     /// the hold does not pin and for a part that does not start on a word.
-    pub fn offsets(&self, id: u32) -> Result<[u64; PARTS], GpuError> {
+    pub(crate) fn offsets(&self, id: u32) -> Result<[u64; PARTS], GpuError> {
         const WHAT: &str = "CardHold::offsets";
         let token = self
             .token
@@ -1229,7 +1229,7 @@ impl Drop for CardHold {
 /// read through. Dropped without a finish, the claim goes back when the fill
 /// has ended.
 #[must_use = "the claim lasts until the ticket is finished or dropped"]
-pub struct CardTicket<'a> {
+pub(crate) struct CardTicket<'a> {
     tier: &'a Arc<NvTier>,
     layer: usize,
     ids: &'a [u32],
@@ -1237,18 +1237,11 @@ pub struct CardTicket<'a> {
 }
 
 impl CardTicket<'_> {
-    /// Whether every id is filled already (a hit-only claim): a finish
-    /// returns at once and there is no fill to run work under.
-    #[must_use]
-    pub fn is_ready(&self) -> bool {
-        self.ticket.is_ready()
-    }
-
     /// Run `work`, which must read none of the claim's slots, and count its
     /// wall as host compute under a fill when the fill is still in flight at
     /// its start ([`NvTierStats::step_hits_under_read_ns`]). A ready ticket
     /// counts nothing.
-    pub fn under_fill<R>(&self, work: impl FnOnce() -> R) -> R {
+    pub(crate) fn under_fill<R>(&self, work: impl FnOnce() -> R) -> R {
         if self.ticket.is_ready() {
             return work();
         }
@@ -1263,7 +1256,7 @@ impl CardTicket<'_> {
     /// Join the fill and pin the ids: the hold, naming its ids in the order
     /// the claim asked them (the order the step port writes their offsets
     /// in). A failed fill, or an id left unfilled, is refused by name.
-    pub fn finish(self) -> Result<CardHold, GpuError> {
+    pub(crate) fn finish(self) -> Result<CardHold, GpuError> {
         const WHAT: &str = "NvTier::hold_for_card";
         let CardTicket {
             tier,
@@ -2625,7 +2618,7 @@ impl NvTier {
     /// never the ticket's. A ticket dropped without a finish gives its claim
     /// back once its fill has ended. `ids` are as for
     /// [`NvTier::hold_for_card`]; an invalid claim is refused by name.
-    pub fn issue_card_hold<'a>(
+    pub(crate) fn issue_card_hold<'a>(
         self: &'a Arc<Self>,
         layer: usize,
         ids: &'a [u32],
@@ -5191,7 +5184,7 @@ mod tests {
             !gate.expired(),
             "the claim waited for its fill: the readers were still held"
         );
-        assert!(!ticket.is_ready(), "two misses: a fill in flight");
+        assert!(!ticket.ticket.is_ready(), "two misses: a fill in flight");
         assert!(
             !tier.slot_filled(LAYER, 1) && !tier.slot_filled(LAYER, 2),
             "no slot is filled while the readers are held"
