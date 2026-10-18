@@ -80,7 +80,7 @@ def load_by_path(name, *rel):
 # tools/type-census.py reads the same way.
 hf = load_by_path("bloomery_hf", "tools", "bloomery", "hf.py")
 Refuse, Red, Entry, NeedMore = hf.Refuse, hf.Red, hf.Entry, hf.NeedMore
-GGML_TYPES, EXTRA_TYPES = hf.GGML_TYPES, hf.EXTRA_TYPES
+GGML_TYPES = hf.GGML_TYPES
 alnum, is_model, split_of, tag_of, gguf_sets = hf.alnum, hf.is_model, hf.split_of, hf.tag_of, hf.gguf_sets
 parse_listing, hex_of, next_link = hf.parse_listing, hf.hex_of, hf.next_link
 gguf_ranges, parse_header, read_header = hf.gguf_ranges, hf.parse_header, hf.read_header
@@ -463,7 +463,7 @@ ROLE_ORDER = ("gate", "up", "down", "gate_up")
 
 
 def type_name(ty):
-    return GGML_TYPES.get(ty) or EXTRA_TYPES.get(ty) or f"type{ty}"
+    return GGML_TYPES.get(ty) or f"type{ty}"
 
 
 def type_facts(tensors_by_shard):
@@ -1617,8 +1617,6 @@ def mirror_vs_source(read):
     ids = src_types(quant)
     out += diff_maps(f"{QUANT_RS}:GgmlType::from_u32", {str(k): v for k, v in GGML_TYPES.items()},
                      {str(k): v for k, v in ids.items()}, QUANT_RS)
-    out += [f"{QUANT_RS}:GgmlType::from_u32: the id {k} is named {ids[k]} there and is one of the mirror's "
-            "unnamed ids (EXTRA_TYPES)" for k in sorted(set(EXTRA_TYPES) & set(ids))]
     return out
 
 
@@ -1742,7 +1740,7 @@ def self_test():
         ("a name dropped from the source is named", ARCH_RS, '"glm5next" | GLM5_NEXT_LLAMA_CPP =>', '"glm5next" =>',
          "glm5-next"),
         ("an id added to GgmlType::from_u32 is named", QUANT_RS, "            40 => GgmlType::NVFP4,\n",
-         "            40 => GgmlType::NVFP4,\n            41 => GgmlType::Q1_0,\n", "'41'"),
+         "            40 => GgmlType::NVFP4,\n            43 => GgmlType::Q1_0,\n", "'43'"),
         ("a new site read against a body35 list is named", BODY35_RS,
          "v_ty: ty_of(file, &v, kv, h, PROJ)?,", "v_ty: ty_of(file, &v, kv, h, PROJ)?, x_ty: ty_of(file, &v, kv, h, PROJ)?,",
          "sites per list PROJ"),

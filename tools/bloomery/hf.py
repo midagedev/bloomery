@@ -50,23 +50,19 @@ class Red(Exception):
     """A row the router, the hub or the file refuses: one red line, not an end of the run."""
 
 
-# The ggml_type names (the spelling of ggml's enum, which the Rust side lower-cases in GgmlType::name). GGML_TYPES:
-# crates/gguf/src/quant.rs:GgmlType::from_u32, the ids the enum names. EXTRA_TYPES: ggml's names of the ids the enum
-# leaves Unknown (crates/gguf/src/lib.rs:ggml_type_info and the doc of GgmlType name them). An id in neither has no
-# name here.
+# The ggml_type names (the spelling of ggml's enum, which the Rust side lower-cases in GgmlType::name):
+# crates/gguf/src/quant.rs:GgmlType::from_u32, the ids the enum names. An id not in it has no name here.
 GGML_TYPES = {
-    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K",
-    13: "Q5_K", 14: "Q6_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S",
-    22: "IQ2_S", 23: "IQ4_XS", 24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64", 29: "IQ1_M", 30: "BF16",
-    34: "TQ1_0", 35: "TQ2_0", 39: "MXFP4", 40: "NVFP4", 42: "Q2_0",
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K",
+    12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S",
+    20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64",
+    29: "IQ1_M", 30: "BF16", 34: "TQ1_0", 35: "TQ2_0", 39: "MXFP4", 40: "NVFP4", 41: "Q1_0", 42: "Q2_0",
 }
-EXTRA_TYPES = {9: "Q8_1", 15: "Q8_K"}
-TYPE_NAMES = {**GGML_TYPES, **EXTRA_TYPES}
 
 
 def ggml_type_name(ty, file):
     """The ggml name of the tensor type id `ty` read from `file`; an id the table does not name is a Red."""
-    name = TYPE_NAMES.get(ty)
+    name = GGML_TYPES.get(ty)
     if name is None:
         raise Red(f"ggml type id {ty} in {file}: not in the type table")
     return name

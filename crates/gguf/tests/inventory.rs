@@ -150,8 +150,8 @@ fn the_alignment_is_a_nonzero_u32() {
 #[test]
 fn inventory_carries_what_the_strict_reader_refuses() {
     let p = tmp("q8_k.gguf");
-    // dims 256x4: one 296-byte block per row, four rows.
-    write_gguf(&p, &[("blk.0.attn_q.weight", &[256, 4], 15)], 1184);
+    // dims 256x4: one 292-byte block per row, four rows.
+    write_gguf(&p, &[("blk.0.attn_q.weight", &[256, 4], 15)], 1168);
 
     let inv = inventory_of(&p).expect("inventory");
     assert_eq!(inv.version, 3);
@@ -160,25 +160,25 @@ fn inventory_carries_what_the_strict_reader_refuses() {
     assert_eq!(t.name, "blk.0.attn_q.weight");
     assert_eq!(t.dims, vec![256, 4]);
     assert_eq!(t.type_id, 15);
-    assert_eq!(t.nbytes, Some(1184));
+    assert_eq!(t.nbytes, Some(1168));
 
     match Gguf::open(&p) {
-        Err(LoadError::UnsupportedType { ty, .. }) => assert_eq!(ty, GgmlType::Unknown(15)),
+        Err(LoadError::UnsupportedType { ty, .. }) => assert_eq!(ty, GgmlType::Q8_K),
         Err(other) => panic!("strict open refused with the wrong error: {other}"),
         Ok(_) => panic!("strict open must refuse q8_K"),
     }
 }
 
-/// A type id outside both the engine's table and ggml's (41, Bonsai
-/// Q1_0_G128) still inventories — with `None` bytes, never a rejection.
+/// A type id outside both the engine's table and ggml's (99, ik's q8_2_x4)
+/// still inventories — with `None` bytes, never a rejection.
 #[test]
 fn inventory_reports_none_for_types_outside_the_table() {
     let p = tmp("unknown.gguf");
-    write_gguf(&p, &[("blk.0.attn_v.weight", &[256, 8], 41)], 8);
+    write_gguf(&p, &[("blk.0.attn_v.weight", &[256, 8], 99)], 8);
 
     let inv = inventory_of(&p).expect("inventory");
     assert_eq!(inv.tensors.len(), 1);
-    assert_eq!(inv.tensors[0].type_id, 41);
+    assert_eq!(inv.tensors[0].type_id, 99);
     assert_eq!(inv.tensors[0].nbytes, None);
 }
 

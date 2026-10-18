@@ -55,7 +55,7 @@ import time
 
 # (block size in elements, bytes per block): gguf-py constants.py GGML_QUANT_SIZES, the type ids
 # mainline and ik share; TQ1_0/TQ2_0 (34/35), Q2_0 (42) and NVFP4 (40) are mainline's, ids ik
-# leaves unassigned (crates/gguf/src/quant.rs:62-66).
+# leaves unassigned (crates/gguf/src/quant.rs:62-66); Q1_0 (41) is ik's q1_0_g128, the same block.
 QUANT = {
     0: (1, 4),       # F32
     1: (1, 2),       # F16
@@ -90,6 +90,7 @@ QUANT = {
     35: (256, 66),   # TQ2_0
     39: (32, 17),    # MXFP4
     40: (64, 36),    # NVFP4
+    41: (128, 18),   # Q1_0
     42: (64, 18),    # Q2_0
 }
 # Metadata value types (GGUF v2/v3): scalar struct formats; 8 is a string, 9 an array.
