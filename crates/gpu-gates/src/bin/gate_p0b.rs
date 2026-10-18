@@ -834,10 +834,9 @@ fn run() -> Result<(), GateError> {
         // own, raised from a launch that was clean before.
         const TAIL_BIG: f32 = 3.0e38;
         const PAST_F16: f32 = 7.0e4;
-        let mut run_fused = |kv: &[f32],
-                             gain: &[f32],
-                             cs: &[f32]|
-         -> Result<(Option<Fault>, Vec<f32>, Vec<u16>), GateError> {
+        // The fault word, the rotated latent and the cache row of one launch.
+        type FusedRun = (Option<Fault>, Vec<f32>, Vec<u16>);
+        let mut run_fused = |kv: &[f32], gain: &[f32], cs: &[f32]| -> Result<FusedRun, GateError> {
             let kv_dev = DeviceBuffer::from_host(stream, kv)?;
             let gain_dev = DeviceBuffer::from_host(stream, gain)?;
             let cs_dev = DeviceBuffer::from_host(stream, cs)?;
