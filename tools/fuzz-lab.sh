@@ -11,9 +11,11 @@
 # Exit code: the first failing step's own (gate.sh's, a fuzz finding's, 124 or 137 a bound).
 set -euo pipefail
 cd "${BASH_SOURCE[0]%/*}/.."
+# shellcheck source=tools/ref/lease.sh
+source tools/ref/lease.sh
 bash tools/gate.sh --manifest-path fuzz/Cargo.toml
-timeout --kill-after=10 1500 cargo fuzz build
+lease_bounded 1500 cargo fuzz build
 for target in jinja_parse jinja_render glmxml qwenxml dsml hermes; do
-  timeout --kill-after=10 180 cargo fuzz run "$target" "fuzz/corpus/$target" -- \
+  lease_bounded 180 cargo fuzz run "$target" "fuzz/corpus/$target" -- \
     -max_total_time=60 -max_len=4096 -dict=fuzz/parsers.dict
 done

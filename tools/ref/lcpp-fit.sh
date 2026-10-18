@@ -42,6 +42,9 @@
 # an unbuffered write to the runner's pipe of a few µs: under 0.1 % of a Qwen3 step (~5 ms) and under
 # 0.4 % of a V4.1 step (~100 ms). The other debug lines of the decode path are load-time or commented
 # out (src/llama-context.cpp:1406); the scheduler's per-node dump needs GGML_SCHED_DEBUG.
+# The probe goes through the bounded child's owner (lease_capture); sourced once.
+# shellcheck source=tools/ref/lease.sh
+declare -F lease_capture > /dev/null || source "${BASH_SOURCE[0]%/*}/lease.sh"
 : "${LCPP_FIT_TARGET:=1024}"
 
 # lcpp_fit_eng <engine>: true for a fit arm's engine: lcppfit, lcppppfit, lcppppfit<U>.
@@ -85,7 +88,8 @@ lcpp_fit_flags() {
 # and no card is touched.
 lcpp_fit_probe() {
   local out rc=0
-  out=$(CUDA_VISIBLE_DEVICES=-1 timeout --kill-after=10 60 "$1" --help 2> /dev/null) || rc=$?
+  LEASE_BOUNDED_ERR=/dev/null lease_capture 60 env CUDA_VISIBLE_DEVICES=-1 "$1" --help || rc=$?
+  out=$LEASE_OUT
   if [ "$rc" != 0 ]; then
     FIT_WHY="$1 --help exited $rc"
     return 1

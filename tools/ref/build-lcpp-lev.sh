@@ -78,9 +78,9 @@ grep -E ':UNINITIALIZED=|^GGML_CUDA:BOOL=|^CMAKE_BUILD_TYPE:|^CMAKE_CUDA_COMPILE
 t0=$(date +%s)
 as_user cmake -S "$TREE" -B "$TREE/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_CURL=OFF \
   -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_COMPILER=$NVCC" || fail "cmake configure failed"
-timeout --kill-after=10 1740 taskset -c 0-31 nice -n 19 sudo -u user env HOME=/home/user "PATH=$USER_PATH" \
-  cmake --build "$TREE/build" --config Release -j 16 --target llama-server
-rc=$?
+rc=0
+lease_bounded 1740 taskset -c 0-31 nice -n 19 sudo -u user env HOME=/home/user "PATH=$USER_PATH" \
+  cmake --build "$TREE/build" --config Release -j 16 --target llama-server || rc=$?
 echo "build-lcpp-lev: build rc $rc in $(($(date +%s) - t0)) s, end $(now)"
 if [ "$rc" = 0 ]; then
   echo "lev-oracle commit $LEV_LCPP_COMMIT patch $patch_sha server $(md5sum "$TREE/build/bin/llama-server" | cut -d' ' -f1)"

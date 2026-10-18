@@ -47,6 +47,8 @@ as_user() { sudo -u user env HOME=/home/user "PATH=$USER_PATH" "$@"; }
 ugit() { as_user git -C "$TREE" "$@"; }
 
 if [ "$mode" = smoke ]; then
+  # shellcheck source=tools/ref/lease.sh
+  source "$HERE/lease.sh"
   # shellcheck source=tools/ref/ref-paths.sh
   source "$HERE/ref-paths.sh"
   [ "$MODEL_NAME" = glm5next ] || { echo "build-lcpp-pr.sh smoke: the profile is $MODEL_NAME, not glm5next" >&2; exit 64; }
@@ -62,9 +64,12 @@ if [ "$mode" = smoke ]; then
   # shellcheck disable=SC2086 # the profile keeps its flags and NAME=VALUE words as one string
   # stdin closed: a chat template in the file turns conversation mode on where -no-cnv is not taken,
   # and a completion waiting on stdin would hold the card until its bound
-  out=$(timeout --kill-after=10 300 env $envs "$TREE/build/bin/llama-completion" -m "$MODEL" -p "$prompt" -n 5 \
-    --temp 0 --seed 0 -no-cnv --no-warmup -c 512 $flags < /dev/null 2> "${TMPDIR:-/tmp}/lcpp-pr$pr-smoke.err")
-  rc=$?
+  lease_out_init || exit 70
+  rc=0
+  LEASE_BOUNDED_OUT=$LEASE_OUT_FILE LEASE_BOUNDED_ERR=${TMPDIR:-/tmp}/lcpp-pr$pr-smoke.err \
+    lease_bounded 300 env $envs "$TREE/build/bin/llama-completion" -m "$MODEL" -p "$prompt" -n 5 \
+    --temp 0 --seed 0 -no-cnv --no-warmup -c 512 $flags < /dev/null || rc=$?
+  out=$(< "$LEASE_OUT_FILE")
   echo "smoke: llama-completion rc $rc; its stderr: ${TMPDIR:-/tmp}/lcpp-pr$pr-smoke.err"
   grep -E 'load_tensors|model type|CUDA0 model buffer|CPU_Mapped model buffer|error' "${TMPDIR:-/tmp}/lcpp-pr$pr-smoke.err" | head -n 12 | sed 's/^/smoke: /'
   [ "$rc" = 0 ] || exit "$rc"
@@ -116,9 +121,9 @@ as_user cmake -S "$TREE" -B "$TREE/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTU
 echo "build-lcpp-pr: options that differ from mainline's cache:"
 comm -13 <(grep -E '^(GGML|LLAMA)_[A-Z0-9_]+:[A-Z]+=' "$MAINLINE/build/CMakeCache.txt" | sort) \
   <(grep -E '^(GGML|LLAMA)_[A-Z0-9_]+:[A-Z]+=' "$TREE/build/CMakeCache.txt" | sort) | sed 's/^/    /'
-timeout --kill-after=10 1800 taskset -c 0-31 nice -n 19 sudo -u user env HOME=/home/user "PATH=$USER_PATH" \
-  cmake --build "$TREE/build" --config Release -j 16 --target llama-bench llama-completion llama-tokenize llama-server
-rc=$?
+rc=0
+lease_bounded 1800 taskset -c 0-31 nice -n 19 sudo -u user env HOME=/home/user "PATH=$USER_PATH" \
+  cmake --build "$TREE/build" --config Release -j 16 --target llama-bench llama-completion llama-tokenize llama-server || rc=$?
 echo "build-lcpp-pr: build rc $rc in $(($(date +%s) - t0)) s, end $(now)"
 if [ "$rc" = 0 ]; then
   md5sum "$TREE/build/bin/llama-bench" "$TREE/build/bin/llama-completion" "$TREE/build/bin/llama-tokenize" "$TREE/build/bin/llama-server"

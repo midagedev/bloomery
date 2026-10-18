@@ -405,7 +405,10 @@ timing_cards_arms() {
 # count would read 0). Root reads every journal, so its empty answer passes.
 __xid_journal() {
   local out rc=0
-  out=$(timeout --kill-after=5 30 journalctl -k -n 1 -o short-unix --no-pager -q) || rc=$?
+  lease_out_init || return 70
+  LEASE_BOUNDED_ERR=$LEASE_OUT_DIR/err lease_capture 30 journalctl -k -n 1 -o short-unix --no-pager -q || rc=$?
+  out=$LEASE_OUT
+  [ ! -s "$LEASE_OUT_DIR/err" ] || cat "$LEASE_OUT_DIR/err" >&2
   if [ "$rc" != 0 ]; then
     TWOCARD_WHY="journalctl -k does not answer (rc $rc): no Xid reader for the witness"
     return 69
@@ -488,7 +491,8 @@ xid_read() {
     XID_ERR="no lease start instant (timing_cards_start not run)"
     return 1
   fi
-  out=$(timeout --kill-after=5 30 journalctl -k --since "@$XID_T0" -o short-unix --no-pager -q 2>&1) || rc=$?
+  lease_capture 30 journalctl -k --since "@$XID_T0" -o short-unix --no-pager -q || rc=$?
+  out=$LEASE_OUT
   if [ "$rc" != 0 ]; then
     XID_ERR="journalctl -k exited $rc: ${out##*$'\n'}"
     return 1

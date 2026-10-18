@@ -65,6 +65,9 @@
 #   bash tools/ref/nsys-gpu.sh --marker <file>                                  # the boundary entry of a file
 #   BLOOMERY_DRY=1 ...                                                          # command lines, no lease
 set -uo pipefail
+# The bounded child's owner (bounded): --analyze and --marker run before the lease is sourced.
+# shellcheck source=tools/gate-bound.sh
+source "${BASH_SOURCE[0]%/*}/../gate-bound.sh"
 # 데이터 디렉터리 기본값(BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
 # 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다 — tools/box.sh가 ref-paths.sh의 MODEL을 그 이름으로
 # export한다(generate 자신에게는 기본값이 없다).
@@ -98,7 +101,7 @@ TOP=${BLOOMERY_NSYS_TOP:-24}
 
 # The tables: sqlite, depth, n, top, form, the run's own output, the seed form's marker.
 analyze() {
-  local runner=(timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}")
+  local runner=(bounded "${BLOOMERY_ARM_BOUND:-900}")
   if declare -F lease_bounded > /dev/null; then runner=(lease_bounded "$BOUND"); fi
   "${runner[@]}" python3 - "$@" <<'PY'
 import re, sqlite3, sys
@@ -244,12 +247,13 @@ PY
 # the reader refuses keeps its code (2 unreadable, 65 malformed); a type with no gather is 65.
 # BLOOMERY_NSYS_MARKER wins over the file.
 embed_marker() {
-  local out
+  local out tmp rc=0
   if [ -n "${BLOOMERY_NSYS_MARKER:-}" ]; then
     MARKER=$BLOOMERY_NSYS_MARKER EMBD_TYPE=by-hand
     return 0
   fi
-  out=$(timeout --kill-after=10 "$BOUND" python3 -I - "$HERE/gguf-ranges.py" "$1" <<'PY'
+  tmp=$(mktemp "${TMPDIR:-/tmp}/nsys-marker.XXXXXX") || return 70
+  bounded "$BOUND" python3 -I - "$HERE/gguf-ranges.py" "$1" > "$tmp" <<'PY' || rc=$?
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("gguf_ranges", sys.argv[1])
 g = importlib.util.module_from_spec(spec)
@@ -273,7 +277,9 @@ except g.Refusal as e:
 name, entry = GATHER[ids[0]]
 print(entry, name)
 PY
-  ) || return $?
+  out=$(< "$tmp")
+  rm -f "$tmp"
+  [ "$rc" = 0 ] || return "$rc"
   MARKER=${out%% *} EMBD_TYPE=${out#* }
 }
 

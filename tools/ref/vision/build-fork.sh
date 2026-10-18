@@ -20,6 +20,8 @@
 # seconds for the CMake build, default 1800). It starts only while the timing lease is free (75): nvcc beside
 # a sitting would mark its rows [cpu-busy].
 set -uo pipefail
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/../lease.sh"
 FORK_URL=https://github.com/smalinin/llama.cpp
 FORK_SHA=cfd8adcf6fb86ca523ad72fe21e8d2ac3860cd8e
 HERE=$(cd "${BASH_SOURCE[0]%/*}" && pwd)
@@ -50,23 +52,23 @@ if [ -d "$SRC/.git" ]; then
 else
   rm -rf "$SRC"
   git init -q "$SRC" || fail "git init $SRC failed"
-  timeout --kill-after=10 600 git -C "$SRC" fetch -q --depth 1 "$FORK_URL" "$FORK_SHA" || fail "fetch of $FORK_SHA from $FORK_URL failed"
+  lease_bounded 600 git -C "$SRC" fetch -q --depth 1 "$FORK_URL" "$FORK_SHA" || fail "fetch of $FORK_SHA from $FORK_URL failed"
   git -C "$SRC" checkout -q --detach FETCH_HEAD || fail "checkout of $FORK_SHA failed"
 fi
 echo "build-fork.sh: HEAD $(git -C "$SRC" log -1 --format='%H %cI %s')"
-timeout --kill-after=10 600 cmake -S "$SRC" -B "$SRC/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+LEASE_BOUNDED_OUT=$ROOT/cmake.log lease_bounded 600 cmake -S "$SRC" -B "$SRC/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
   -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_COMPILER=$NVCC" -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
-  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF > "$ROOT/cmake.log" 2>&1 \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
   || { tail -n 30 "$ROOT/cmake.log"; fail "cmake configure failed (whole log: $ROOT/cmake.log)"; }
 t0=$SECONDS
-timeout --kill-after=10 "$BOUND" taskset -c 0-31 nice -n 19 cmake --build "$SRC/build" --config Release -j 16 \
-  --target llama llama-tokenize > "$ROOT/make.log" 2>&1
-rc=$?
+rc=0
+LEASE_BOUNDED_OUT=$ROOT/make.log lease_bounded "$BOUND" taskset -c 0-31 nice -n 19 cmake --build "$SRC/build" --config Release -j 16 \
+  --target llama llama-tokenize || rc=$?
 [ "$rc" = 0 ] || { tail -n 40 "$ROOT/make.log"; fail "cmake --build failed, rc $rc (whole log: $ROOT/make.log)" "$rc"; }
 echo "build-fork.sh: llama and llama-tokenize built in $((SECONDS - t0)) s"
 LIB=$SRC/build/bin
 [ -f "$LIB/libllama.so" ] || fail "no $LIB/libllama.so after the build"
-timeout --kill-after=10 300 g++ -std=c++17 -O2 -Wall -Wextra -o "$BIN/visref_fork.tmp" "$HERE/visref_fork.cpp" \
+lease_bounded 300 g++ -std=c++17 -O2 -Wall -Wextra -o "$BIN/visref_fork.tmp" "$HERE/visref_fork.cpp" \
   -I"$SRC/include" -I"$SRC/ggml/include" -L"$LIB" -lllama -lggml -lggml-base -Wl,-rpath,"$LIB" \
   || fail "the harness does not compile"
 mv "$BIN/visref_fork.tmp" "$BIN/visref_fork"

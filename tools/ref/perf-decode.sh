@@ -26,10 +26,9 @@ OUT=$(mktemp -d /tmp/perf-decode.XXXXXX)
 WITNESS=(head loadavg pressure-cpu threads model binary lock-holder busiest)
 lease_take
 witness pre
-# Bounded like every child under the lease (lease_bounded's bound); perf attaches to the decode binary
-# itself, the bound's child, whose pid is the main thread's tid in the tables below.
-bound_pid='' decode_exit=''
-trap 'rc=$?; trap "" TERM INT HUP; [ -z "$bound_pid" ] || lease_stop "$bound_pid" || rc=$?; lease_out_clean; exit "$rc"' EXIT
+# Bounded like every child under the lease (bounded_bg, tools/gate-bound.sh: the lease_bounded bound); perf attaches to the
+# decode binary itself, the bound's child, whose pid is the main thread's tid in the tables below.
+trap 'rc=$?; bounded_bg_stop || rc=$?; lease_out_clean; exit "$rc"' EXIT
 decode_failed() {
   local rc=$1 why=${2:-failed}
   case $rc in
@@ -41,18 +40,13 @@ decode_failed() {
   tail -n 20 "$OUT/decode.log" >&2
   exit "$rc"
 }
-for s in TERM:143 INT:130 HUP:129; do
-  # shellcheck disable=SC2064 # the signal's status now, the decoder PID when the trap runs
-  trap "decode_exit=${s#*:}; [ -z \"\$bound_pid\" ] || exit ${s#*:}" "${s%:*}"
-done
-timeout --kill-after=10 "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" > "$OUT/decode.log" 2>&1 &
-bound_pid=$!
-[ -z "$decode_exit" ] || exit "$decode_exit"
+BG_OUT=$OUT/decode.log bounded_bg "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N"
+bound_pid=$BG_PID
 pid=
 while [ -z "$pid" ]; do
   if ! kill -0 "$bound_pid" 2> /dev/null; then
     decode_rc=0
-    wait "$bound_pid" || decode_rc=$?
+    bounded_bg_wait || decode_rc=$?
     [ "$decode_rc" != 0 ] || decode_rc=1
     decode_failed "$decode_rc" 'ended before perf could attach'
   fi
@@ -63,7 +57,7 @@ done
 until grep -q '^step ' "$OUT/decode.log" 2> /dev/null; do
   if ! kill -0 "$pid" 2> /dev/null; then
     decode_rc=0
-    wait "$bound_pid" || decode_rc=$?
+    bounded_bg_wait || decode_rc=$?
     [ "$decode_rc" != 0 ] || decode_rc=1
     decode_failed "$decode_rc" 'ended before its step table'
   fi
@@ -79,11 +73,8 @@ fi
 lease_bounded "$LEASE_ARM_BOUND" perf record -q -e cpu-clock -F 10000 "${target[@]}" -o "$OUT/perf.data" -- sleep "$SECS" 2> "$OUT/perf.err" || echo "[perf] record rc=$?: $(tr '\n' ' ' < "$OUT/perf.err")"
 if kill -0 "$pid" 2> /dev/null; then inside=yes; else inside=no; fi
 decode_rc=0
-wait "$bound_pid" || decode_rc=$?
-bound_pid=''
-# Later profiling commands keep their normal signal handling once the decoder has been reaped.
-trap - TERM INT HUP
-[ -z "$decode_exit" ] || exit "$decode_exit"
+# The caller's signal handling is back once the decoder has been reaped, for the profiling commands after it.
+bounded_bg_wait || decode_rc=$?
 [ "$decode_rc" -eq 0 ] || decode_failed "$decode_rc"
 witness post
 steps_done=$(grep -cE '^ +[0-9]+ +[0-9]+ +[0-9.]+ ' "$OUT/decode.log")

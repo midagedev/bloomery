@@ -43,6 +43,8 @@ case ${REQUANT_BOUND:-1500} in '' | *[!0-9]* | 0*) die "REQUANT_BOUND is whole s
 
 # shellcheck source=tools/ref/ref-paths.sh
 source "$HERE/ref-paths.sh"
+# shellcheck source=tools/ref/lease.sh
+source "$HERE/lease.sh"
 [ -n "$FIXTURE_FILE" ] || die "the $FAMILY profile has no fixture file to requantize" 66
 SRC=$FIXTURE_FILE
 # The variant's directory, from the one owner of the path: the same file read for the tag, which also refuses a tag the table does
@@ -101,8 +103,8 @@ mkdir "$TMP"
 START=$(date +%s)
 echo "fixture-requant.sh: quantizing (log $LOG, ${REQUANT_THREADS:-24} threads, bound ${REQUANT_BOUND:-1500} s)"
 # The type argument is the quantizer's own and moves no tensor: every tensor has a rule. The output is the shards' prefix (--keep-split).
-timeout --kill-after=10 "${REQUANT_BOUND:-1500}" "$QUANT" --allow-requantize --keep-split --leave-output-tensor \
-  "${IMATRIX_ARGS[@]}" --custom-q "$CUSTOM_Q" --override-kv "$OVERRIDE_KV" "$SRC" "$TMP/$STEM-$TAG" Q4_K_M "${REQUANT_THREADS:-24}" > "$LOG" 2>&1 ||
+LEASE_BOUNDED_OUT=$LOG lease_bounded "${REQUANT_BOUND:-1500}" "$QUANT" --allow-requantize --keep-split --leave-output-tensor \
+  "${IMATRIX_ARGS[@]}" --custom-q "$CUSTOM_Q" --override-kv "$OVERRIDE_KV" "$SRC" "$TMP/$STEM-$TAG" Q4_K_M "${REQUANT_THREADS:-24}" ||
   { tail -20 "$LOG" >&2; die "llama-quantize failed (log $LOG)" 70; }
 echo "fixture-requant.sh: llama-quantize done in $(($(date +%s) - START)) s; log $LOG"
 grep -c 'converting to' "$LOG" | xargs echo "fixture-requant.sh: tensors the quantizer converted:"

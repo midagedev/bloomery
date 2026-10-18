@@ -1352,8 +1352,10 @@ if [ "$srv" = 1 ]; then
     if [ -z "$DRY" ]; then assert_fresh_binary "$BIN" || exit $?; fi
     srv_ctx_first='' srv_ctx_place=''
     for p in $SRV_PLACES; do
-      plan_out=$(timeout --kill-after=10 300 "$BIN" --plan --depth 512 --place "$p" 2>&1) || {
-        rc=$?
+      rc=0
+      lease_capture 300 "$BIN" --plan --depth 512 --place "$p" || rc=$?
+      plan_out=$LEASE_OUT
+      [ "$rc" = 0 ] || {
         echo "depth-ds41.sh: the server arms' -c is the plan's ctx_max, and $BIN --plan --depth 512 --place $p exited $rc: ${plan_out##*$'\n'}" >&2
         exit 2
       }

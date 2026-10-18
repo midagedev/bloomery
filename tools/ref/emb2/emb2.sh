@@ -94,10 +94,7 @@ die() { echo "emb2: $1" >&2; exit "${2:-2}"; }
 server_pid=
 publishing=
 cleanup() {
-  if [ -n "$server_pid" ]; then
-    kill "$server_pid" 2> /dev/null || true
-    wait "$server_pid" 2> /dev/null || true
-  fi
+  bounded_bg_stop || true
   if [ -n "$publishing" ] && [ ! -e "$publishing" ] && [ -e "$publishing.old" ]; then
     mv "$publishing.old" "$publishing"
   fi
@@ -230,20 +227,19 @@ server_step() {
     flags+=(-ngl 0 --no-mmproj-offload)
     cpu=(--cpu)
   fi
-  "$SERVER_BIN" "${flags[@]}" > "$log" 2>&1 &
-  server_pid=$!
+  BG_OUT=$log bounded_bg "$BOUND" "$SERVER_BIN" "${flags[@]}"
+  server_pid=$BG_PID
   for _ in $(seq 120); do
     kill -0 "$server_pid" 2> /dev/null || break
     curl -sf "http://127.0.0.1:$port/health" > /dev/null && { up=1; break; }
     sleep 1
   done
   [ -n "$up" ] || die "llama-server did not come up (log: $log)" 1
-  timeout --kill-after=10 "$BOUND" python3 tools/ref/emb2/server_vectors.py --url "http://127.0.0.1:$port" --pid "$server_pid" \
+  bounded "$BOUND" python3 tools/ref/emb2/server_vectors.py --url "http://127.0.0.1:$port" --pid "$server_pid" \
     "${cpu[@]}" --model "$MODEL" --arch "$MODEL_NAME" --model-sha256 "$MODEL_SHA256" --card "$card_name" \
     --build-record "$BIN.build" --ids-dir "$IDS" "${inputs[@]}" --out "$stage" "${media_args[@]}" \
     --server-flags "${flags[*]}"
-  kill "$server_pid"
-  wait "$server_pid" 2> /dev/null || true
+  bounded_bg_stop || die "llama-server outlived its cleanup budget (pid $server_pid)" 70
   server_pid=
 }
 
@@ -274,7 +270,7 @@ for s in "${ALL[@]}"; do
       else
         args=(tower -m "$MODEL" --mmproj "$MMPROJ" "${image_args[@]}")
       fi
-      "${run[@]}" timeout --kill-after=10 "$BOUND" "$BIN" "${args[@]}" "${where[@]}" -t "$THREADS" --build-record "$BIN.build" \
+      bounded "$BOUND" "${run[@]}" "$BIN" "${args[@]}" "${where[@]}" -t "$THREADS" --build-record "$BIN.build" \
         --out "$stage"
       ;;
     server | server.cpu | video | video.cpu)

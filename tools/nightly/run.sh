@@ -59,6 +59,8 @@ unset BLOOMERY_BOX_ENV BLOOMERY_DATA
 # The unit runner (run_unit, unit_failure) is shared with tools/contrib-check.sh; it is installed beside this file.
 # shellcheck source=tools/nightly/units.sh
 source "$(dirname "${BASH_SOURCE[0]}")/units.sh"
+# shellcheck source=tools/gate-bound.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../gate-bound.sh"
 
 # Atomic one-line file write, so mail.sh never reads half a file.
 put() { printf '%s\n' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"; }
@@ -120,7 +122,7 @@ else
   if [ ! -d "$CLONE/.git" ]; then
     git clone --quiet "$REPO_URL" "$CLONE" || { put "$RUN/failed" "run: git clone failed"; finish 2 RED "git clone failed"; }
   fi
-  timeout 300 git -C "$CLONE" fetch --quiet --prune origin main &&
+  bounded 300 git -C "$CLONE" fetch --quiet --prune origin main &&
     git -C "$CLONE" reset --quiet --hard origin/main || { put "$RUN/failed" "run: fetch or reset of $CLONE failed"; finish 2 RED "fetch failed"; }
   TREE_LABEL=origin/main
 fi
