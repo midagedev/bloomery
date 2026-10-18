@@ -32,10 +32,11 @@ use super::wide::{self, GEMV_COLS};
 use crate::elem::EmbedRowsArgs;
 use crate::gated_quant::GateLayout;
 use crate::head::Head;
-use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
+use crate::kquant::{Act, GateUpAct, SelDown};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q4k_sel::QuantSel;
 use crate::q38::{EmbedQ8Args, OutGateArgs};
+use crate::quant_sel::QuantSelKernels;
 use crate::site::{self, Order};
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
@@ -1275,7 +1276,7 @@ fn slots_down(
 /// [`crate::hybrid::HOST`] slot) and the combine with a host sum
 /// (`hostleg`), which adds a shared expert kept apart.
 pub(super) struct FfnKernels {
-    pub(super) kq: KquantKernels,
+    pub(super) kq: QuantSelKernels,
     pub(super) leg: HostLegKernels,
 }
 
@@ -1284,7 +1285,7 @@ impl FfnKernels {
     /// fault word. Load-time only.
     pub(super) fn load(gpu: &Gpu) -> Result<FfnKernels, GpuError> {
         Ok(FfnKernels {
-            kq: KquantKernels::load(gpu.context(), gpu.fault_word())?,
+            kq: QuantSelKernels::load(gpu.context(), gpu.fault_word())?,
             leg: HostLegKernels::load(gpu.context())?,
         })
     }

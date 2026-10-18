@@ -29,9 +29,10 @@
 
 use app::Session;
 use bloomery_gpu::hybrid::HOST;
-use bloomery_gpu::iq_sel::{IqGateUp, IqSelKernels};
-use bloomery_gpu::kquant::{Act, GateUpAct, KquantKernels, SelDown};
+use bloomery_gpu::iq_sel::IqGateUp;
+use bloomery_gpu::kquant::{Act, GateUpAct, SelDown};
 use bloomery_gpu::mxfp4_sel::Mxfp4SelKernels;
+use bloomery_gpu::quant_sel::QuantSelKernels;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 use bloomery_gpu_gates::tier;
@@ -48,8 +49,7 @@ use model::placement::kernels::{self, DownEntry, GateUpEntry};
 /// The modules of the card leg's one-slot entries, by the common rule's
 /// entry for a type ([`kernels::gate_up`], [`kernels::down`]).
 struct SelKernels {
-    kq: KquantKernels,
-    iq: IqSelKernels,
+    quant: QuantSelKernels,
     mx: Mxfp4SelKernels,
 }
 
@@ -318,10 +318,10 @@ fn gemv_pair(
                 rows_per_expert: rpe,
             };
             match entry {
-                Some(DownEntry::Q5k) => k.kq.enqueue_gemv_q5k_sel(stream, &a, sink, y)?,
+                Some(DownEntry::Q5k) => k.quant.enqueue_gemv_q5k_sel(stream, &a, sink, y)?,
                 Some(DownEntry::Mxfp4) => k.mx.enqueue_down(stream, &a, sink, y)?,
                 Some(DownEntry::Iq2xs | DownEntry::Iq3xxs | DownEntry::Iq3s | DownEntry::Iq4xs) => {
-                    k.iq.enqueue_gemv_sel(stream, ty, &a, sink, y)?
+                    k.quant.enqueue_gemv_sel(stream, ty, &a, sink, y)?
                 }
                 _ => return Err(format!("{ty} has no `_sel` gemv here").into()),
             }
@@ -365,8 +365,8 @@ fn gate_up_pair(
             rule: Act::SwigluClamp { limit },
         };
         match kernels::gate_up(ty) {
-            Some(GateUpEntry::Q4k) => k.kq.enqueue_gate_up_q4k(stream, &a, sink, h)?,
-            Some(GateUpEntry::Q5k) => k.kq.enqueue_gate_up_q5k(stream, &a, sink, h)?,
+            Some(GateUpEntry::Q4k) => k.quant.enqueue_gate_up_q4k(stream, &a, sink, h)?,
+            Some(GateUpEntry::Q5k) => k.quant.enqueue_gate_up_q5k(stream, &a, sink, h)?,
             Some(GateUpEntry::Mxfp4) => k.mx.enqueue_gate_up(stream, &a, sink, h)?,
             Some(
                 GateUpEntry::Iq2xs | GateUpEntry::Iq3xxs | GateUpEntry::Iq3s | GateUpEntry::Iq4xs,
@@ -382,7 +382,7 @@ fn gate_up_pair(
                     slots_per_col: a.slots_per_col,
                     rule: a.rule,
                 };
-                k.iq.enqueue_gate_up(stream, &iq, sink, h)?;
+                k.quant.enqueue_gate_up(stream, &iq, sink, h)?;
             }
             _ => return Err(format!("{ty} has no gate·up entry here").into()),
         }
@@ -402,8 +402,7 @@ fn check_slots(
 ) -> Result<bool, GateError> {
     let (ctx, word) = (gpu.context(), gpu.fault_word());
     let sk = SelKernels {
-        kq: KquantKernels::load(ctx, word)?,
-        iq: IqSelKernels::load(ctx, word)?,
+        quant: QuantSelKernels::load(ctx, word)?,
         mx: Mxfp4SelKernels::load(ctx, word)?,
     };
     let (mut pairs, mut layers, mut bad) = (0usize, 0usize, Vec::new());

@@ -56,13 +56,14 @@
 
 use crate::card_slots::{CardAcc, CardSlotKernels, CardSlots};
 use crate::fault::FaultSink;
-use crate::iq_sel::{IqDown, IqGateUp, IqSelKernels};
-use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
+use crate::iq_sel::{IqDown, IqGateUp};
+use crate::kquant::{Act, GateUpAct, SelDown};
 use crate::mxfp4_sel::Mxfp4SelKernels;
 use crate::q4k_sel::QuantSel;
 use crate::q5::Q8Blocks32;
 use crate::q5_1_sel::{Q51SelDown, Q51SelKernels};
 use crate::q8_0_sel32::{Q80SelDown, Q80SelKernels};
+use crate::quant_sel::QuantSelKernels;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -338,11 +339,10 @@ pub struct LegSum<'a> {
 
 /// The modules the leg's launches run on.
 pub struct CardLeg {
-    kquant: KquantKernels,
+    quant: QuantSelKernels,
     mxfp4: Mxfp4SelKernels,
     q51: Q51SelKernels,
     q80: Q80SelKernels,
-    iq: IqSelKernels,
     slots: CardSlotKernels,
 }
 
@@ -359,11 +359,10 @@ impl CardLeg {
     pub fn load(gpu: &Gpu) -> Result<CardLeg, GpuError> {
         let (ctx, word) = (gpu.context(), gpu.fault_word());
         Ok(CardLeg {
-            kquant: KquantKernels::load(ctx, word)?,
+            quant: QuantSelKernels::load(ctx, word)?,
             mxfp4: Mxfp4SelKernels::load(ctx, word)?,
             q51: Q51SelKernels::load(ctx, word)?,
             q80: Q80SelKernels::load(ctx, word)?,
-            iq: IqSelKernels::load(ctx, word)?,
             slots: CardSlotKernels::load(ctx)?,
         })
     }
@@ -373,7 +372,7 @@ impl CardLeg {
         Sel32 {
             q51: &self.q51,
             q80: &self.q80,
-            iq: &self.iq,
+            iq: &self.quant,
         }
     }
 
@@ -504,8 +503,8 @@ impl CardLeg {
             rule: run.rule,
         };
         match kernels::gate_up(st.gate.ty) {
-            Some(GateUpEntry::Q4k) => self.kquant.enqueue_gate_up_q4k(stream, &a, fault, h)?,
-            Some(GateUpEntry::Q5k) => self.kquant.enqueue_gate_up_q5k(stream, &a, fault, h)?,
+            Some(GateUpEntry::Q4k) => self.quant.enqueue_gate_up_q4k(stream, &a, fault, h)?,
+            Some(GateUpEntry::Q5k) => self.quant.enqueue_gate_up_q5k(stream, &a, fault, h)?,
             Some(GateUpEntry::Mxfp4) => self.mxfp4.enqueue_gate_up(stream, &a, fault, h)?,
             Some(
                 GateUpEntry::Iq2xs | GateUpEntry::Iq3xxs | GateUpEntry::Iq3s | GateUpEntry::Iq4xs,
@@ -521,7 +520,7 @@ impl CardLeg {
                     slots_per_col: a.slots_per_col,
                     rule: a.rule,
                 };
-                self.iq.enqueue_gate_up(stream, &iq, fault, h)?;
+                self.quant.enqueue_gate_up(stream, &iq, fault, h)?;
             }
             _ => return Err(st.gate.unrun()),
         }
@@ -557,7 +556,7 @@ impl CardLeg {
                     n_slots: slots,
                     rows_per_expert,
                 };
-                self.kquant.enqueue_gemv_q5k_sel(stream, &d, fault, down)?;
+                self.quant.enqueue_gemv_q5k_sel(stream, &d, fault, down)?;
             }
             (Some((DownEntry::Mxfp4, DownAct::Q8Act)), ActH::Q8Act(act)) => {
                 let d = SelDown {
@@ -594,7 +593,7 @@ impl CardLeg {
                     n_slots: slots,
                     rows_per_expert,
                 };
-                self.iq
+                self.quant
                     .enqueue_gemv_sel(stream, st.down.ty, &d, fault, down)?;
             }
             _ => return Err(st.down.unrun()),
@@ -650,7 +649,7 @@ fn enqueue_sum(
 struct Sel32<'a> {
     q51: &'a Q51SelKernels,
     q80: &'a Q80SelKernels,
-    iq: &'a IqSelKernels,
+    iq: &'a QuantSelKernels,
 }
 
 /// One 32-value-block `_sel` launch: slot `s` writes the `rows_per_expert`
@@ -839,7 +838,7 @@ pub struct Relu2Run<'a> {
 pub struct Relu2Leg {
     q51: Q51SelKernels,
     q80: Q80SelKernels,
-    iq: IqSelKernels,
+    iq: QuantSelKernels,
     slots: CardSlotKernels,
 }
 
@@ -850,7 +849,7 @@ impl Relu2Leg {
         Ok(Relu2Leg {
             q51: Q51SelKernels::load(ctx, word)?,
             q80: Q80SelKernels::load(ctx, word)?,
-            iq: IqSelKernels::load(ctx, word)?,
+            iq: QuantSelKernels::load(ctx, word)?,
             slots: CardSlotKernels::load(ctx)?,
         })
     }
@@ -1163,7 +1162,7 @@ pub(crate) mod tests {
         let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
         let stream = gpu.stream();
         let leg = CardLeg::load(&gpu).expect("the leg");
-        let kq = KquantKernels::load(gpu.context(), gpu.fault_word()).expect("the kquant module");
+        let kq = QuantSelKernels::load(gpu.context(), gpu.fault_word()).expect("the kquant module");
         let tys = [GgmlType::Q4_K, GgmlType::Q5_K];
         let w = weights(&gpu, SHAPE, &tys);
         let host_normed: Vec<f32> = (0..CAP * N)
@@ -1696,7 +1695,7 @@ pub(crate) mod tests {
     struct Hand {
         q51: Q51SelKernels,
         q80: Q80SelKernels,
-        iq: IqSelKernels,
+        iq: QuantSelKernels,
     }
 
     impl Hand {
@@ -1705,7 +1704,7 @@ pub(crate) mod tests {
             Hand {
                 q51: Q51SelKernels::load(ctx, word).expect("the q5_1 module"),
                 q80: Q80SelKernels::load(ctx, word).expect("the q8_0 module"),
-                iq: IqSelKernels::load(ctx, word).expect("the iq module"),
+                iq: QuantSelKernels::load(ctx, word).expect("the iq module"),
             }
         }
 
@@ -2251,7 +2250,7 @@ pub(crate) mod tests {
         use crate::q6k_sel::Q6kSelKernels;
         let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
         let (stream, ctx) = (gpu.stream(), gpu.context());
-        let kq = KquantKernels::load(ctx, gpu.fault_word()).expect("the kquant module");
+        let kq = QuantSelKernels::load(ctx, gpu.fault_word()).expect("the kquant module");
         let q6 = Q6kSelKernels::load(ctx, gpu.fault_word()).expect("the q6k module");
         let host_normed: Vec<f32> = (0..CAP * N)
             .map(|i| ((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)

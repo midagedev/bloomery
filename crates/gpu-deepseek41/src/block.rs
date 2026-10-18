@@ -22,7 +22,8 @@
 //! counts a graph's nodes; [`BlockPlan::column_launches`] counts a run over columns the same way.
 
 use bloomery_gpu::gemm::GemmKernels;
-use bloomery_gpu::kquant::{Act, GateUpAct, KquantKernels};
+use bloomery_gpu::kquant::{Act, GateUpAct};
+use bloomery_gpu::quant_sel::QuantSelKernels;
 use bloomery_gpu::site::{self, KGemvKernels, SiteTy};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
@@ -222,7 +223,7 @@ fn shapes(ff: usize, n: usize) -> [(usize, usize); 3] {
 /// the clamped SwiGLU's quantizer. Made at load for a file with a K-quant block only.
 pub struct KBlockKernels {
     gemv: KGemvKernels,
-    sel: KquantKernels,
+    sel: QuantSelKernels,
     swiglu: GemmKernels,
 }
 
@@ -240,7 +241,7 @@ impl KBlockKernels {
     pub fn load(gpu: &Gpu) -> Result<KBlockKernels, GpuError> {
         Ok(KBlockKernels {
             gemv: KGemvKernels::load(gpu)?,
-            sel: KquantKernels::load(gpu.context(), gpu.fault_word())?,
+            sel: QuantSelKernels::load(gpu.context(), gpu.fault_word())?,
             swiglu: GemmKernels::load(gpu.context())?,
         })
     }

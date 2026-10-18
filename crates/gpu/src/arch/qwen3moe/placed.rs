@@ -78,10 +78,11 @@ use crate::host::swap_source::{FileSwap, ResidencyGlue};
 use crate::host::xstream::{self, Costs, LAND_BATCHES, LandBatch, RingLayer, XCfg};
 use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid, SlotMap};
-use crate::kquant::{Act, GateUpAct, KquantKernels, SelDown};
+use crate::kquant::{Act, GateUpAct, SelDown};
 use crate::model::fit::{act_col_bytes, route_bytes};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q4k_sel::QuantSel;
+use crate::quant_sel::QuantSelKernels;
 use crate::site;
 use crate::tensor::{DeviceTensor, Q8Act, Window, WindowMut};
 use crate::weights::Weights;
@@ -356,7 +357,7 @@ impl PlacedRows {
 /// chain's kernel set does not hold.
 pub(super) struct PlacedKernels {
     handoff: HandoffKernels,
-    kquant: KquantKernels,
+    kquant: QuantSelKernels,
     leg: HostLegKernels,
     g32: Option<Gemm32Kernels>,
 }
@@ -568,7 +569,7 @@ impl Placed {
         let ctx = gpu.context();
         let k = PlacedKernels {
             handoff: HandoffKernels::load(ctx)?,
-            kquant: KquantKernels::load(ctx, gpu.fault_word())?,
+            kquant: QuantSelKernels::load(ctx, gpu.fault_word())?,
             leg: HostLegKernels::load(ctx)?,
             g32: (o.rows > GEMV_COLS)
                 .then(|| Gemm32Kernels::load(ctx))
@@ -1345,7 +1346,7 @@ fn shared_sites(
 /// skipping a [`HOST`] slot. The entries the family's FFN dispatch does not
 /// launch (`plan::gate_up_entry` admits none of them) are named, not run.
 fn gate_up_sel(
-    (stream, kq): (&CudaStream, &KquantKernels),
+    (stream, kq): (&CudaStream, &QuantSelKernels),
     entry: GateUpEntry,
     a: &GateUpAct<'_>,
     sink: FaultSink,
@@ -1430,7 +1431,7 @@ fn down_arm(ty: GgmlType) -> Result<DownArm, GpuError> {
     reason = "one launch's kernels, stack, columns, slots, width, fault sink and output (rust-quality R8)"
 )]
 fn down_sel(
-    (gpu, k, kq): (&Gpu, &Kernels, &KquantKernels),
+    (gpu, k, kq): (&Gpu, &Kernels, &QuantSelKernels),
     (ty, wd): (SiteTy, &DeviceTensor<u32>),
     (act, sel): (&Q8Act, &DeviceBuffer<u32>),
     n_slots: usize,

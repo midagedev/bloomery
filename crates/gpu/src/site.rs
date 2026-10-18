@@ -48,11 +48,12 @@ use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
     GemmRoute, GemmWeight,
 };
-use crate::kquant::{Act, KquantKernels, SelDown};
+use crate::kquant::{Act, SelDown};
 use crate::mxfp4::Nvfp4Kernels;
 use crate::q5::Q8Blocks32;
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
+use crate::quant_sel::QuantSelKernels;
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
@@ -345,7 +346,7 @@ const KGEMV_COLS: usize = 8;
 /// super-block count runs the same way, NVFP4's gemv, and that one expert's
 /// id for each of [`KGEMV_COLS`] slots.
 pub struct KGemvKernels {
-    kq: KquantKernels,
+    kq: QuantSelKernels,
     q6: Q6kSelKernels,
     nv: Nvfp4Kernels,
     one: DeviceBuffer<u32>,
@@ -362,7 +363,7 @@ impl KGemvKernels {
     /// word, and zero the ids. Load-time only.
     pub fn load(gpu: &Gpu) -> Result<KGemvKernels, GpuError> {
         Ok(KGemvKernels {
-            kq: KquantKernels::load(gpu.context(), gpu.fault_word())?,
+            kq: QuantSelKernels::load(gpu.context(), gpu.fault_word())?,
             q6: Q6kSelKernels::load(gpu.context(), gpu.fault_word())?,
             nv: Nvfp4Kernels::load(gpu.context())?,
             one: DeviceBuffer::zeroed(gpu.stream(), KGEMV_COLS)?,

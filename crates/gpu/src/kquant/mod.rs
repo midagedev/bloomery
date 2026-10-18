@@ -9,8 +9,8 @@
 //! - [`q8_0`]: Q8_0's decoder over the file's 34-byte blocks, eight to a
 //!   Walk A super-block.
 //! - [`sel`]: the down `_sel` and the gate·up with its rule as a launch
-//!   argument, generic bodies and their Q5_K and Q8_0 entries, and the Q4_K
-//!   gate·up.
+//!   argument, generic bodies and the launchers of their Q5_K and Q8_0
+//!   entries and the Q4_K gate·up; [`crate::quant_sel`] writes the entries.
 //! - [`tiles`]: the grouped entries over a slot table by tile items (an
 //!   expert, eight weight rows, up to eight slots), each slot its `_sel`
 //!   entry's bit for bit: the gather of the entries' planes, the Q4_K and
@@ -33,8 +33,8 @@ pub use act::Act;
 pub use q5k::Q5k;
 pub use q8_0::Q8_0;
 pub use sel::{
-    ARENA_PARTS, ARENA_SKIP, GateUpAct, GateUpAt, KquantKernels, PART_DOWN, PART_GATE, PART_UP,
-    SelDown, SelDownAt, walk_a_planes,
+    ARENA_PARTS, ARENA_SKIP, GateUpAct, GateUpAt, PART_DOWN, PART_GATE, PART_UP, SelDown,
+    SelDownAt, walk_a_planes,
 };
 pub use tiles::{
     EntryPlanes, KquantTileKernels, TileGather, TileScratch, TileTable, TiledDown, TiledGateUpAct,

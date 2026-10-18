@@ -181,13 +181,12 @@ mod gate {
     use bloomery_gpu::GpuError;
     use bloomery_gpu::fault::Fault;
     use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
-    use bloomery_gpu::iq_sel::{
-        IQ4_NL_BLOCK_BYTES, IqDown, IqGateUp, IqSelKernels, iq4_nl_row_dot32_host,
-    };
+    use bloomery_gpu::iq_sel::{IQ4_NL_BLOCK_BYTES, IqDown, IqGateUp, iq4_nl_row_dot32_host};
     use bloomery_gpu::kquant::act::{self, Act};
     use bloomery_gpu::kquant::{SelDown, walk_a_planes};
     use bloomery_gpu::q5::Q8Blocks32;
     use bloomery_gpu::q8_0_sel32::{Q80SelDown, Q80SelKernels};
+    use bloomery_gpu::quant_sel::QuantSelKernels;
     use bloomery_gpu::{DeviceTensor, Q8Act};
     use bloomery_gpu_gates::iq_rows::{
         Col, SYNTH_K, dot_host, dot_ref, seeded_blocks, synth_rows as synth_all,
@@ -633,7 +632,7 @@ mod gate {
 
     struct Ctx {
         gpu: Gpu,
-        iqsel: IqSelKernels,
+        iqsel: QuantSelKernels,
         iq: IqKernels,
         q80: Q80SelKernels,
     }
@@ -1828,7 +1827,7 @@ mod gate {
             let pass = matches!(
                 &e,
                 GpuError::Shape {
-                    what: "IqSelKernels::enqueue_gate_up",
+                    what: "QuantSelKernels::enqueue_gate_up",
                     ..
                 }
             );
@@ -1897,7 +1896,7 @@ mod gate {
             let pass = matches!(
                 &e,
                 GpuError::Shape {
-                    what: "IqSelKernels::enqueue_down",
+                    what: "QuantSelKernels::enqueue_down",
                     ..
                 }
             );
@@ -1981,7 +1980,7 @@ mod gate {
             let pass = matches!(
                 &e,
                 GpuError::Shape {
-                    what: "IqSelKernels::enqueue_gemv_sel",
+                    what: "QuantSelKernels::enqueue_gemv_sel",
                     ..
                 }
             );
@@ -2779,7 +2778,7 @@ mod gate {
             let pass = matches!(
                 &e,
                 Some(GpuError::Shape {
-                    what: "IqSelKernels::enqueue_gemv_sel_cols",
+                    what: "QuantSelKernels::enqueue_gemv_sel_cols",
                     ..
                 }) if case != "iq2_xs_slots_per_col_9"
                     || e.as_ref().is_some_and(|err| {
@@ -2808,7 +2807,7 @@ mod gate {
             return bench::run(&gpu);
         }
         let c = Ctx {
-            iqsel: IqSelKernels::load(gpu.context(), gpu.fault_word())?,
+            iqsel: QuantSelKernels::load(gpu.context(), gpu.fault_word())?,
             iq: IqKernels::load(gpu.context())?,
             q80: Q80SelKernels::load(gpu.context(), gpu.fault_word())?,
             gpu,
@@ -2943,8 +2942,8 @@ mod gate {
             GREPS, N, ROUNDS, burst, fill_pattern, fill_pattern_f32, print_arm, replay,
         };
         use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
-        use bloomery_gpu::iq_sel::IqSelKernels;
         use bloomery_gpu::kquant::{SelDown, walk_a_planes};
+        use bloomery_gpu::quant_sel::QuantSelKernels;
         use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
         use bloomery_gpu_gates::GateError;
         use bloomery_gpu_gates::iq_rows::{BOLT_SHARED, seeded_blocks};
@@ -3024,7 +3023,7 @@ mod gate {
                 })?;
             }
 
-            let iqsel = IqSelKernels::load(gpu.context(), gpu.fault_word())?;
+            let iqsel = QuantSelKernels::load(gpu.context(), gpu.fault_word())?;
             for (n, wd) in BOLT_PAIRS {
                 // The up: w rows an expert of K = 1,024, the nine slots on one
                 // column; the down: 1,024 rows of K = w, a column a slot.

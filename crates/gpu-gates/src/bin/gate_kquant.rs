@@ -167,14 +167,15 @@ mod gate {
     use bloomery_gpu::kquant::sel::{ROWS_PER_BLOCK, THREADS, gemv_sel_body};
     use bloomery_gpu::kquant::walk::{iter_term, row_dot, row_dot_1col};
     use bloomery_gpu::kquant::{
-        Act, EntryPlanes, GateUpAct, KquantKernels, KquantTileKernels, Q4k, Q5k, Q8_0, SbDecode,
-        SelDown, TileGather, TileTable, TiledDown, TiledGateUpAct, act, walk_a_planes,
+        Act, EntryPlanes, GateUpAct, KquantTileKernels, Q4k, Q5k, Q8_0, SbDecode, SelDown,
+        TileGather, TileTable, TiledDown, TiledGateUpAct, act, walk_a_planes,
     };
     use bloomery_gpu::q4k_sel::QuantSel;
     use bloomery_gpu::q5::{Q8Blocks32, Q8Blocks32Host, pack_q5_1};
     use bloomery_gpu::q5_1_sel::{BLOCK_WORDS, Q51SelDown, Q51SelKernels};
     use bloomery_gpu::q8_0_sel32::{Q80SelDown, Q80SelKernels, stream_cols};
     use bloomery_gpu::q38::{CardSharedAddArgs, Q38Kernels, SLOTS, W_PITCH};
+    use bloomery_gpu::quant_sel::QuantSelKernels;
     use bloomery_gpu::{
         DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_sums,
     };
@@ -507,7 +508,7 @@ mod gate {
     /// Everything the clauses share.
     struct Ctx {
         gpu: Gpu,
-        kq: KquantKernels,
+        kq: QuantSelKernels,
         q51: Q51SelKernels,
         q80: Q80SelKernels,
         tiles: KquantTileKernels,
@@ -924,7 +925,7 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
-        let kq = KquantKernels::load(gpu.context(), gpu.fault_word())?;
+        let kq = QuantSelKernels::load(gpu.context(), gpu.fault_word())?;
         // SAFETY: this binary owns the embedded bundle the module above produced;
         // every launch here passes the launch contract's check.
         let gm = unsafe { bloomery_gpu::shared_module!(gate_kernels, gpu.context())? };

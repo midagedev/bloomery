@@ -5252,10 +5252,10 @@ mod tests {
         use crate::card_leg::tests::{stack_bytes, words_of};
         use crate::graph::Graph;
         use crate::kquant::{
-            Act, GateUpAct, GateUpAt, KquantKernels, PART_DOWN, PART_GATE, PART_UP, SelDown,
-            SelDownAt,
+            Act, GateUpAct, GateUpAt, PART_DOWN, PART_GATE, PART_UP, SelDown, SelDownAt,
         };
         use crate::q4k_sel::QuantSel;
+        use crate::quant_sel::QuantSelKernels;
         use crate::tensor::{DeviceTensor, Q8Act, window};
         use cuda_core::DeviceBuffer;
         use engram::direct::DirectFile;
@@ -5289,7 +5289,7 @@ mod tests {
         let len: [usize; PARTS] = std::array::from_fn(|p| expert(0, p).len());
         let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
         let (stream, ctx) = (gpu.stream(), gpu.context());
-        let kq = KquantKernels::load(ctx, gpu.fault_word()).expect("the kquant module");
+        let kq = QuantSelKernels::load(ctx, gpu.fault_word()).expect("the kquant module");
         let sink = gpu.layer_sink(0).expect("a sink");
         let rule = Act::SwigluClamp { limit: 0.25 };
         let normed: Vec<f32> = (0..N)
@@ -5547,10 +5547,9 @@ mod tests {
         use crate::card_leg::tests::{stack_bytes, words_of};
         use crate::card_slots::{CardAcc, CardSlotKernels};
         use crate::elem::ElemKernels;
-        use crate::kquant::{
-            Act, GateUpAct, KquantKernels, PART_DOWN, PART_GATE, PART_UP, SelDown,
-        };
+        use crate::kquant::{Act, GateUpAct, PART_DOWN, PART_GATE, PART_UP, SelDown};
         use crate::q4k_sel::QuantSel;
+        use crate::quant_sel::QuantSelKernels;
         use crate::tensor::{DeviceTensor, Q8Act};
         use cuda_core::DeviceBuffer;
         use engram::direct::DirectFile;
@@ -5602,7 +5601,7 @@ mod tests {
 
         // The reference: every expert as a stack row, the stack launches.
         let (want, leg_bytes) = {
-            let kq = KquantKernels::load(ctx, gpu.fault_word()).expect("the kquant module");
+            let kq = QuantSelKernels::load(ctx, gpu.fault_word()).expect("the kquant module");
             let card = CardSlotKernels::load(ctx).expect("the card slot module");
             let elem = ElemKernels::load(ctx, gpu.fault_word()).expect("the elem module");
             let stacks: Vec<DeviceTensor<u32>> = (0..PARTS)

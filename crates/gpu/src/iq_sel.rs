@@ -32,7 +32,7 @@
 //! - `iq2_xxs_gemv_sel`: the down's body over IQ2_XXS with slot `s` reading
 //!   column `s / slots_per_col` — a routed up (a token's slots share its
 //!   column) and a down (`slots_per_col` 1) are the same entry
-//!   ([`IqSelKernels::enqueue_gemv_sel_cols`]). Its row equals
+//!   ([`QuantSelKernels::enqueue_gemv_sel_cols`]). Its row equals
 //!   `iq2_xxs_rows` over `IqFormat::repack` of the same row, bit for bit.
 //! - `iq4_nl_gemv_sel32`: [`crate::q8_0_sel32`]'s shape with IQ4_NL's
 //!   18-byte blocks — slot `s` dots the rows of expert `sel[s]` with column
@@ -90,40 +90,33 @@
 //! the down's a [`Q8Blocks32`]'s 32-value blocks, both quantized by the
 //! engine's own quantizers; a column a quantizer refused holds a NaN scale
 //! and NaNs every row that reads it.
+//!
+//! The kernel wrappers are written by [`crate::quant_sel`]'s `quant_sel_module!`,
+//! one line a format; this file holds the decoders ([`RawSb`]), the generic
+//! bodies, the IQ4_NL entry and the launchers.
 
 use crate::cores::half_to_f32;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::hybrid::HOST;
 use crate::iq::{
-    ActCols, IQ2XXS_TAB_WORDS, Iq2XxsTab, dp4_all, dp4_halves, iq2_group, iq2xxs_sub, iq3_group,
-    iq3s_group, iq4_word,
+    ActCols, Iq2XxsTab, dp4_all, dp4_halves, iq2_group, iq2xxs_sub, iq3_group, iq3s_group, iq4_word,
 };
 use crate::kquant::SelDown;
 use crate::kquant::act::{self, Act};
 use crate::kquant::q8_0::q8_0_code;
 use crate::q5::{Q8Blocks32, q5_a_chain};
+use crate::quant_sel::{QuantSelKernels, RawType};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::{GpuError, launch_u32};
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{
-    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
-};
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
 use gguf::iq_tables::KVALUES_IQ4NL;
 use gguf::quant::GgmlType;
 use runtime::words::stream_words;
-use std::sync::Arc;
 
-/// Threads per block of the entries, one warp per output row.
-pub const THREADS: u32 = 256;
-/// Output rows a block computes: one per warp.
-pub const ROWS_PER_BLOCK: usize = THREADS as usize / 32;
-
-// The entries' launch attributes spell the block as a literal and the
-// contracts the streams as whole words a block (98 B = 49 half-words, 136 B
-// = 34 words, 18 B = 9 half-words).
-const _: () = assert!(THREADS == 256);
+pub use crate::quant_sel::{ROWS_PER_BLOCK, THREADS};
 
 /// Bytes of one `block_iq4_nl` (32 values).
 pub const IQ4_NL_BLOCK_BYTES: usize = 18;
@@ -132,7 +125,7 @@ pub const IQ4_NL_BLOCK_BYTES: usize = 18;
 
 /// A format's raw super-block: its file bytes and one sub-block's decode into
 /// the plane rule's inputs, for the gate·up and the down entries alike.
-trait RawSb {
+pub(crate) trait RawSb {
     /// File bytes per 256-value super-block.
     const BB: usize;
     /// The integer factors a sub-block's `dp4a` sums are scaled by: one for a
@@ -159,7 +152,7 @@ trait RawSb {
 }
 
 /// IQ2_XS's raw super-block ([`RawSb`]).
-struct Iq2Xs;
+pub(crate) struct Iq2Xs;
 
 impl RawSb for Iq2Xs {
     const BB: usize = 74;
@@ -208,7 +201,7 @@ impl RawSb for Iq2Xs {
 
 /// IQ2_XXS's raw super-block ([`RawSb`]), decoded through the block's
 /// table ([`Iq2XxsTab`], which its entry fills).
-struct Iq2Xxs;
+pub(crate) struct Iq2Xxs;
 
 impl RawSb for Iq2Xxs {
     const BB: usize = 66;
@@ -244,7 +237,7 @@ impl RawSb for Iq2Xxs {
 }
 
 /// IQ3_XXS's raw super-block ([`RawSb`]).
-struct Iq3Xxs;
+pub(crate) struct Iq3Xxs;
 
 impl RawSb for Iq3Xxs {
     const BB: usize = 98;
@@ -294,7 +287,7 @@ impl RawSb for Iq3Xxs {
 }
 
 /// IQ3_S's raw super-block ([`RawSb`]).
-struct Iq3S;
+pub(crate) struct Iq3S;
 
 impl RawSb for Iq3S {
     const BB: usize = 110;
@@ -343,7 +336,7 @@ impl RawSb for Iq3S {
 }
 
 /// IQ4_XS's raw super-block ([`RawSb`]).
-struct Iq4Xs;
+pub(crate) struct Iq4Xs;
 
 impl RawSb for Iq4Xs {
     const BB: usize = 136;
@@ -406,7 +399,7 @@ impl RawSb for Iq4Xs {
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-fn gate_up_sel_body<D: RawSb<Tab = ()>>(
+pub(crate) fn gate_up_sel_body<D: RawSb<Tab = ()>>(
     wg: &[u32],
     wu: &[u32],
     q: &[u32],
@@ -506,7 +499,7 @@ fn gate_up_sel_body<D: RawSb<Tab = ()>>(
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-fn down_sel_body<D: RawSb>(
+pub(crate) fn down_sel_body<D: RawSb>(
     w: &[u32],
     q: &[u32],
     d8: &[f32],
@@ -644,610 +637,8 @@ pub(crate) fn iq4_nl_row_dot32(
 }
 
 #[cuda_module]
-mod iq_sel_kernels {
+pub(crate) mod blk32_kernels {
     use super::*;
-
-    /// The IQ2_XS gate·up over raw blocks ([`gate_up_sel_body`] over
-    /// [`Iq2Xs`]): 74-byte super-blocks at even byte offsets, read through the
-    /// parity windows of the module doc. `m_cols` only bounds the activation in
-    /// the launch contract.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            2 * wg.len() >= n_experts * rows_per_expert * 37 * n_sb,
-            2 * wu.len() >= n_experts * rows_per_expert * 37 * n_sb,
-            slots_per_col >= 1,
-            n_slots <= m_cols * slots_per_col,
-            q.len() >= m_cols * 256 * n_grp,
-            d8.len() >= m_cols * 2 * n_sb,
-            sel.len() >= n_slots,
-            h.len() >= n_slots * rows_per_expert
-        )
-    )]
-    pub fn iq2_xs_gate_up_sel(
-        wg: &[u32],
-        wu: &[u32],
-        q: &[u32],
-        d8: &[f32],
-        sel: &[u32],
-        n_experts: u32,
-        rows_per_expert: u32,
-        n_slots: u32,
-        m_cols: u32,
-        slots_per_col: u32,
-        n_sb: u32,
-        n_grp: u32,
-        act: u32,
-        limit: f32,
-        fault: FaultSink,
-        mut h: DisjointSlice<f32>,
-    ) {
-        // m_cols only bounds the activation in the launch contract.
-        let _ = m_cols;
-        let t = thread::index_1d().get() % THREADS as usize;
-        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
-        if row >= n_slots as usize * rows_per_expert as usize {
-            return;
-        }
-        // The launch contract is the body's (37 half-words a 74-byte
-        // super-block); the host passes n_grp = ceil(n_sb/4) and one of
-        // Act::code's codes; the return above is warp-uniform and keeps row
-        // in range.
-        gate_up_sel_body::<Iq2Xs>(
-            wg,
-            wu,
-            q,
-            d8,
-            sel,
-            n_experts,
-            rows_per_expert,
-            slots_per_col,
-            n_sb,
-            n_grp,
-            act,
-            limit,
-            fault,
-            row,
-            &mut h,
-        );
-    }
-
-    /// The IQ3_XXS gate·up over raw blocks ([`gate_up_sel_body`] over
-    /// [`Iq3Xxs`]): 98-byte super-blocks at even byte offsets, read through
-    /// the parity windows of the module doc. `m_cols` only bounds the
-    /// activation in the launch contract.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            2 * wg.len() >= n_experts * rows_per_expert * 49 * n_sb,
-            2 * wu.len() >= n_experts * rows_per_expert * 49 * n_sb,
-            slots_per_col >= 1,
-            n_slots <= m_cols * slots_per_col,
-            q.len() >= m_cols * 256 * n_grp,
-            d8.len() >= m_cols * 2 * n_sb,
-            sel.len() >= n_slots,
-            h.len() >= n_slots * rows_per_expert
-        )
-    )]
-    pub fn iq3_xxs_gate_up_sel(
-        wg: &[u32],
-        wu: &[u32],
-        q: &[u32],
-        d8: &[f32],
-        sel: &[u32],
-        n_experts: u32,
-        rows_per_expert: u32,
-        n_slots: u32,
-        m_cols: u32,
-        slots_per_col: u32,
-        n_sb: u32,
-        n_grp: u32,
-        act: u32,
-        limit: f32,
-        fault: FaultSink,
-        mut h: DisjointSlice<f32>,
-    ) {
-        // m_cols only bounds the activation in the launch contract.
-        let _ = m_cols;
-        let t = thread::index_1d().get() % THREADS as usize;
-        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
-        if row >= n_slots as usize * rows_per_expert as usize {
-            return;
-        }
-        // The launch contract is the body's (49 words two a 98-byte
-        // super-block); the host passes n_grp = ceil(n_sb/4) and one of
-        // Act::code's codes; the return above is warp-uniform (a warp's
-        // lanes share `row`) and keeps row in range.
-        gate_up_sel_body::<Iq3Xxs>(
-            wg,
-            wu,
-            q,
-            d8,
-            sel,
-            n_experts,
-            rows_per_expert,
-            slots_per_col,
-            n_sb,
-            n_grp,
-            act,
-            limit,
-            fault,
-            row,
-            &mut h,
-        );
-    }
-
-    /// The IQ3_S gate·up over raw blocks ([`gate_up_sel_body`] over
-    /// [`Iq3S`]): 110-byte super-blocks at even byte offsets, the index, sign,
-    /// high-bit and scale fields read through the windows of the module doc.
-    /// `m_cols` only bounds the activation in the launch contract.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            2 * wg.len() >= n_experts * rows_per_expert * 55 * n_sb,
-            2 * wu.len() >= n_experts * rows_per_expert * 55 * n_sb,
-            slots_per_col >= 1,
-            n_slots <= m_cols * slots_per_col,
-            q.len() >= m_cols * 256 * n_grp,
-            d8.len() >= m_cols * 2 * n_sb,
-            sel.len() >= n_slots,
-            h.len() >= n_slots * rows_per_expert
-        )
-    )]
-    pub fn iq3_s_gate_up_sel(
-        wg: &[u32],
-        wu: &[u32],
-        q: &[u32],
-        d8: &[f32],
-        sel: &[u32],
-        n_experts: u32,
-        rows_per_expert: u32,
-        n_slots: u32,
-        m_cols: u32,
-        slots_per_col: u32,
-        n_sb: u32,
-        n_grp: u32,
-        act: u32,
-        limit: f32,
-        fault: FaultSink,
-        mut h: DisjointSlice<f32>,
-    ) {
-        // m_cols only bounds the activation in the launch contract.
-        let _ = m_cols;
-        let t = thread::index_1d().get() % THREADS as usize;
-        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
-        if row >= n_slots as usize * rows_per_expert as usize {
-            return;
-        }
-        // The launch contract is the body's (55 half-words a 110-byte
-        // super-block); the host passes n_grp = ceil(n_sb/4) and one of
-        // Act::code's codes; the return above is warp-uniform (a warp's
-        // lanes share `row`) and keeps row in range.
-        gate_up_sel_body::<Iq3S>(
-            wg,
-            wu,
-            q,
-            d8,
-            sel,
-            n_experts,
-            rows_per_expert,
-            slots_per_col,
-            n_sb,
-            n_grp,
-            act,
-            limit,
-            fault,
-            row,
-            &mut h,
-        );
-    }
-
-    /// The IQ4_XS gate·up over raw blocks ([`gate_up_sel_body`] over
-    /// [`Iq4Xs`]): word-aligned 136-byte super-blocks. `m_cols` only bounds
-    /// the activation in the launch contract.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            wg.len() >= n_experts * rows_per_expert * 34 * n_sb,
-            wu.len() >= n_experts * rows_per_expert * 34 * n_sb,
-            slots_per_col >= 1,
-            n_slots <= m_cols * slots_per_col,
-            q.len() >= m_cols * 256 * n_grp,
-            d8.len() >= m_cols * 2 * n_sb,
-            sel.len() >= n_slots,
-            h.len() >= n_slots * rows_per_expert
-        )
-    )]
-    pub fn iq4_xs_gate_up_sel(
-        wg: &[u32],
-        wu: &[u32],
-        q: &[u32],
-        d8: &[f32],
-        sel: &[u32],
-        n_experts: u32,
-        rows_per_expert: u32,
-        n_slots: u32,
-        m_cols: u32,
-        slots_per_col: u32,
-        n_sb: u32,
-        n_grp: u32,
-        act: u32,
-        limit: f32,
-        fault: FaultSink,
-        mut h: DisjointSlice<f32>,
-    ) {
-        // m_cols only bounds the activation in the launch contract.
-        let _ = m_cols;
-        let t = thread::index_1d().get() % THREADS as usize;
-        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
-        if row >= n_slots as usize * rows_per_expert as usize {
-            return;
-        }
-        // The launch contract is the body's (34 words a 136-byte
-        // super-block); the host passes n_grp = ceil(n_sb/4) and one of
-        // Act::code's codes; the return above is warp-uniform and keeps row
-        // in range.
-        gate_up_sel_body::<Iq4Xs>(
-            wg,
-            wu,
-            q,
-            d8,
-            sel,
-            n_experts,
-            rows_per_expert,
-            slots_per_col,
-            n_sb,
-            n_grp,
-            act,
-            limit,
-            fault,
-            row,
-            &mut h,
-        );
-    }
-
-    /// The IQ2_XXS `_sel` over raw blocks ([`down_sel_body`] over
-    /// [`Iq2Xxs`]): 66-byte super-blocks at even byte offsets. One stack, one
-    /// warp per output row, eight rows per 256-thread block; thread row `n =
-    /// slot · rows_per_expert + r` stores `y[n]`, the dot of weight row
-    /// `sel[slot] · rows_per_expert + r` with column `slot / slots_per_col`
-    /// of the [`Q8Act`] — a routed up (a token's slots share a column) and a
-    /// down (`slots_per_col` 1). `m_cols` only bounds the activation in the
-    /// launch contract. Ids: module doc.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            2 * w.len() >= n_experts * rows_per_expert * 33 * n_sb,
-            slots_per_col >= 1,
-            n_slots <= m_cols * slots_per_col,
-            q.len() >= m_cols * 256 * n_grp,
-            d8.len() >= m_cols * 2 * n_sb,
-            sel.len() >= n_slots,
-            y.len() >= n_slots * rows_per_expert
-        )
-    )]
-    pub fn iq2_xxs_gemv_sel(
-        w: &[u32],
-        q: &[u32],
-        d8: &[f32],
-        sel: &[u32],
-        n_experts: u32,
-        rows_per_expert: u32,
-        n_slots: u32,
-        m_cols: u32,
-        slots_per_col: u32,
-        n_sb: u32,
-        n_grp: u32,
-        fault: FaultSink,
-        mut y: DisjointSlice<f32>,
-    ) {
-        static mut TAB: SharedArray<u32, IQ2XXS_TAB_WORDS> = SharedArray::UNINIT;
-        // SAFETY: TAB is this block's alone; every thread of the 256-thread
-        // block fills it here, before any return.
-        let tab = unsafe { Iq2XxsTab::fill(SharedArray::as_raw_mut_ptr(&raw mut TAB)) };
-        // m_cols only bounds the activation in the launch contract.
-        let _ = m_cols;
-        let t = thread::index_1d().get() % THREADS as usize;
-        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
-        if row >= n_slots as usize * rows_per_expert as usize {
-            return;
-        }
-        // The launch contract is the body's (33 half-words a 66-byte
-        // super-block; n_slots <= m_cols · slots_per_col, so every slot's
-        // column is below m_cols); the host passes n_grp = ceil(n_sb/4); the
-        // return above is warp-uniform and keeps row in range.
-        down_sel_body::<Iq2Xxs>(
-            w,
-            q,
-            d8,
-            sel,
-            n_experts,
-            rows_per_expert,
-            slots_per_col,
-            n_sb,
-            n_grp,
-            fault,
-            row,
-            &mut y,
-            tab,
-        );
-    }
-
-    /// The IQ2_XS down `_sel` over raw blocks ([`down_sel_body`] over
-    /// [`Iq2Xs`]): 74-byte super-blocks at even byte offsets. One warp per output row, eight rows per
-    /// 256-thread block; thread row `n = slot · rows_per_expert + r` stores
-    /// `y[n]`, the dot of weight row `sel[slot] · rows_per_expert + r` with
-    /// column `slot` of the [`Q8Act`]. Ids: module doc.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            2 * w.len() >= n_experts * rows_per_expert * 37 * n_sb,
-            q.len() >= n_slots * 256 * n_grp,
-            d8.len() >= n_slots * 2 * n_sb,
-            sel.len() >= n_slots,
-            y.len() >= n_slots * rows_per_expert
-        )
-    )]
-    pub fn iq2_xs_gemv_sel(
-        w: &[u32],
-        q: &[u32],
-        d8: &[f32],
-        sel: &[u32],
-        n_experts: u32,
-        rows_per_expert: u32,
-        n_slots: u32,
-        n_sb: u32,
-        n_grp: u32,
-        fault: FaultSink,
-        mut y: DisjointSlice<f32>,
-    ) {
-        let t = thread::index_1d().get() % THREADS as usize;
-        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
-        if row >= n_slots as usize * rows_per_expert as usize {
-            return;
-        }
-        // The launch contract is the body's; the host passes n_grp =
-        // ceil(n_sb/4); the return above is warp-uniform and keeps row in
-        // range.
-        down_sel_body::<Iq2Xs>(
-            w,
-            q,
-            d8,
-            sel,
-            n_experts,
-            rows_per_expert,
-            1,
-            n_sb,
-            n_grp,
-            fault,
-            row,
-            &mut y,
-            (),
-        );
-    }
-
-    /// The IQ3_XXS down `_sel` over raw blocks ([`down_sel_body`] over
-    /// [`Iq3Xxs`]): 98-byte super-blocks at even byte offsets. One warp per output row, eight rows per
-    /// 256-thread block; thread row `n = slot · rows_per_expert + r` stores
-    /// `y[n]`, the dot of weight row `sel[slot] · rows_per_expert + r` with
-    /// column `slot` of the [`Q8Act`]. Ids: module doc.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            2 * w.len() >= n_experts * rows_per_expert * 49 * n_sb,
-            q.len() >= n_slots * 256 * n_grp,
-            d8.len() >= n_slots * 2 * n_sb,
-            sel.len() >= n_slots,
-            y.len() >= n_slots * rows_per_expert
-        )
-    )]
-    pub fn iq3_xxs_gemv_sel(
-        w: &[u32],
-        q: &[u32],
-        d8: &[f32],
-        sel: &[u32],
-        n_experts: u32,
-        rows_per_expert: u32,
-        n_slots: u32,
-        n_sb: u32,
-        n_grp: u32,
-        fault: FaultSink,
-        mut y: DisjointSlice<f32>,
-    ) {
-        let t = thread::index_1d().get() % THREADS as usize;
-        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
-        if row >= n_slots as usize * rows_per_expert as usize {
-            return;
-        }
-        // The launch contract is the body's; the host passes n_grp =
-        // ceil(n_sb/4); the return above is warp-uniform and keeps row in
-        // range.
-        down_sel_body::<Iq3Xxs>(
-            w,
-            q,
-            d8,
-            sel,
-            n_experts,
-            rows_per_expert,
-            1,
-            n_sb,
-            n_grp,
-            fault,
-            row,
-            &mut y,
-            (),
-        );
-    }
-
-    /// The IQ3_S down `_sel` over raw blocks ([`down_sel_body`] over
-    /// [`Iq3S`]): 110-byte super-blocks at even byte offsets. One warp per
-    /// output row, eight rows per 256-thread block; thread row `n = slot ·
-    /// rows_per_expert + r` stores `y[n]`, the dot of weight row `sel[slot] ·
-    /// rows_per_expert + r` with column `slot` of the [`Q8Act`]. Ids: module
-    /// doc.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            2 * w.len() >= n_experts * rows_per_expert * 55 * n_sb,
-            q.len() >= n_slots * 256 * n_grp,
-            d8.len() >= n_slots * 2 * n_sb,
-            sel.len() >= n_slots,
-            y.len() >= n_slots * rows_per_expert
-        )
-    )]
-    pub fn iq3_s_gemv_sel(
-        w: &[u32],
-        q: &[u32],
-        d8: &[f32],
-        sel: &[u32],
-        n_experts: u32,
-        rows_per_expert: u32,
-        n_slots: u32,
-        n_sb: u32,
-        n_grp: u32,
-        fault: FaultSink,
-        mut y: DisjointSlice<f32>,
-    ) {
-        let t = thread::index_1d().get() % THREADS as usize;
-        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
-        if row >= n_slots as usize * rows_per_expert as usize {
-            return;
-        }
-        // The launch contract is the body's; the host passes n_grp =
-        // ceil(n_sb/4); the return above is warp-uniform and keeps row in
-        // range.
-        down_sel_body::<Iq3S>(
-            w,
-            q,
-            d8,
-            sel,
-            n_experts,
-            rows_per_expert,
-            1,
-            n_sb,
-            n_grp,
-            fault,
-            row,
-            &mut y,
-            (),
-        );
-    }
-
-    /// The IQ4_XS down `_sel` over raw blocks ([`down_sel_body`] over
-    /// [`Iq4Xs`]): word-aligned 136-byte super-blocks. One warp per output row, eight rows per
-    /// 256-thread block; thread row `n = slot · rows_per_expert + r` stores
-    /// `y[n]`, the dot of weight row `sel[slot] · rows_per_expert + r` with
-    /// column `slot` of the [`Q8Act`]. Ids: module doc.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            w.len() >= n_experts * rows_per_expert * 34 * n_sb,
-            q.len() >= n_slots * 256 * n_grp,
-            d8.len() >= n_slots * 2 * n_sb,
-            sel.len() >= n_slots,
-            y.len() >= n_slots * rows_per_expert
-        )
-    )]
-    pub fn iq4_xs_gemv_sel(
-        w: &[u32],
-        q: &[u32],
-        d8: &[f32],
-        sel: &[u32],
-        n_experts: u32,
-        rows_per_expert: u32,
-        n_slots: u32,
-        n_sb: u32,
-        n_grp: u32,
-        fault: FaultSink,
-        mut y: DisjointSlice<f32>,
-    ) {
-        let t = thread::index_1d().get() % THREADS as usize;
-        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
-        if row >= n_slots as usize * rows_per_expert as usize {
-            return;
-        }
-        // The launch contract is the body's; the host passes n_grp =
-        // ceil(n_sb/4); the return above is warp-uniform and keeps row in
-        // range.
-        down_sel_body::<Iq4Xs>(
-            w,
-            q,
-            d8,
-            sel,
-            n_experts,
-            rows_per_expert,
-            1,
-            n_sb,
-            n_grp,
-            fault,
-            row,
-            &mut y,
-            (),
-        );
-    }
 
     /// The IQ4_NL down `_sel` of 32-value blocks ([`iq4_nl_row_dot32`]): one
     /// warp per output row, eight rows per 256-thread block; thread row `n =
@@ -1383,7 +774,11 @@ pub fn iq4_nl_row_dot32_host(
 
 // -------------------------------------------------------------- launcher
 
-/// A gate·up launch ([`IqSelKernels::enqueue_gate_up`]).
+/// The name `QuantSelKernels` had here, before one struct held the raw-block and
+/// Walk A launchers; `arch::nemotron_h_moe` still spells it.
+pub type IqSelKernels = QuantSelKernels;
+
+/// A gate·up launch ([`QuantSelKernels::enqueue_gate_up`]).
 pub struct IqGateUp<'a> {
     /// The format of both stacks: IQ2_XS, IQ3_XXS, IQ3_S or IQ4_XS.
     pub ty: GgmlType,
@@ -1404,7 +799,7 @@ pub struct IqGateUp<'a> {
     pub rule: Act,
 }
 
-/// An IQ4_NL down `_sel` launch ([`IqSelKernels::enqueue_down`]).
+/// An IQ4_NL down `_sel` launch ([`QuantSelKernels::enqueue_down`]).
 pub struct IqDown<'a> {
     /// The resident stack: `n_experts · rows_per_expert` rows of the file's
     /// `block_iq4_nl` bytes as the KQuant word stream ([`stream_words`]
@@ -1420,14 +815,58 @@ pub struct IqDown<'a> {
     pub rows_per_expert: usize,
 }
 
-/// The loaded i-quant expert-select module and its launchers. Owns no
-/// stream: every enqueue takes the engine stream, so launches order with the
-/// step and are capturable.
-pub struct IqSelKernels {
-    module: iq_sel_kernels::LoadedModule,
-    /// The fault word of the `Gpu` that owns the context: the launches'
-    /// sinks point into it, and the module keeps it alive.
-    _fault: Arc<DeviceBuffer<u32>>,
+/// The scalars and buffers a raw-block gate·up entry takes, as the entry
+/// takes them ([`QuantSelKernels::launch_raw_gate_up`]).
+pub(crate) struct RawGateUpLaunch<'a> {
+    pub(crate) wg: &'a DeviceBuffer<u32>,
+    pub(crate) wu: &'a DeviceBuffer<u32>,
+    pub(crate) q: &'a DeviceBuffer<u32>,
+    pub(crate) d8: &'a DeviceBuffer<f32>,
+    pub(crate) sel: &'a DeviceBuffer<u32>,
+    pub(crate) n_experts: u32,
+    pub(crate) rows_per_expert: u32,
+    pub(crate) n_slots: u32,
+    pub(crate) m_cols: u32,
+    pub(crate) slots_per_col: u32,
+    pub(crate) n_sb: u32,
+    pub(crate) n_grp: u32,
+    pub(crate) act: u32,
+    pub(crate) limit: f32,
+}
+
+/// The scalars and buffers a raw-block down entry takes
+/// ([`QuantSelKernels::launch_raw_down`]); `m_cols` and `slots_per_col` are read by
+/// the entries of a format with a shared table only.
+pub(crate) struct RawDownLaunch<'a> {
+    pub(crate) w: &'a DeviceBuffer<u32>,
+    pub(crate) q: &'a DeviceBuffer<u32>,
+    pub(crate) d8: &'a DeviceBuffer<f32>,
+    pub(crate) sel: &'a DeviceBuffer<u32>,
+    pub(crate) n_experts: u32,
+    pub(crate) rows_per_expert: u32,
+    pub(crate) n_slots: u32,
+    pub(crate) m_cols: u32,
+    pub(crate) slots_per_col: u32,
+    pub(crate) n_sb: u32,
+    pub(crate) n_grp: u32,
+}
+
+/// The row of `ty` in the invocation if it has the entry `has` selects.
+fn raw_row(ty: GgmlType, has: fn(&RawType) -> bool) -> Option<&'static RawType> {
+    QuantSelKernels::RAW_TYPES
+        .iter()
+        .find(|t| t.ty == ty && has(t))
+}
+
+/// The names of the raw-block types that have the entry `has` selects, for a
+/// refusal.
+fn raw_names(has: fn(&RawType) -> bool) -> String {
+    QuantSelKernels::RAW_TYPES
+        .iter()
+        .filter(|t| has(t))
+        .map(|t| t.name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The experts of a raw stack of `bb`-byte super-blocks — the words a row
@@ -1469,25 +908,7 @@ fn stack_experts(
     Ok(rows / rows_per_expert)
 }
 
-impl IqSelKernels {
-    /// Load this file's device bundle into `ctx`, whose launches raise into
-    /// `word`, the fault word of the `Gpu` that owns `ctx`
-    /// ([`crate::Gpu::fault_word`]); a word of another context is refused.
-    /// Load-time only.
-    pub fn load(
-        ctx: &Arc<CudaContext>,
-        word: &Arc<DeviceBuffer<u32>>,
-    ) -> Result<IqSelKernels, GpuError> {
-        let fault = crate::module_fault_word(ctx, word, "IqSelKernels::load")?;
-        // SAFETY: this package owns the embedded device bundle produced for
-        // the module above; every launcher checks its launch contract.
-        let module = unsafe { crate::shared_module!(iq_sel_kernels, ctx)? };
-        Ok(IqSelKernels {
-            module,
-            _fault: fault,
-        })
-    }
-
+impl QuantSelKernels {
     /// Enqueue the i-quant gate·up of `a.ty` (IQ2_XS, IQ3_XXS, IQ3_S or
     /// IQ4_XS):
     /// slot `s` writes `h[s · rows_per_expert ..][..rows_per_expert]` as
@@ -1507,20 +928,16 @@ impl IqSelKernels {
         fault: FaultSink,
         h: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let what = "IqSelKernels::enqueue_gate_up";
-        let (name, bb) = match a.ty {
-            GgmlType::IQ2_XS => ("IQ2_XS", Iq2Xs::BB),
-            GgmlType::IQ3_XXS => ("IQ3_XXS", Iq3Xxs::BB),
-            GgmlType::IQ3_S => ("IQ3_S", Iq3S::BB),
-            GgmlType::IQ4_XS => ("IQ4_XS", Iq4Xs::BB),
-            other => {
-                return Err(GpuError::shape(
-                    what,
-                    format!(
-                        "the gate·up takes IQ2_XS, IQ3_XXS, IQ3_S or IQ4_XS stacks, got {other:?}"
-                    ),
-                ));
-            }
+        let what = "QuantSelKernels::enqueue_gate_up";
+        let Some(&RawType { name, bb, .. }) = raw_row(a.ty, |t| t.gate_up) else {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the gate·up takes {} stacks, got {:?}",
+                    raw_names(|t| t.gate_up),
+                    a.ty
+                ),
+            ));
         };
         let n_sb = a.act.n_sb();
         if !a.act.k().is_multiple_of(256) {
@@ -1565,115 +982,23 @@ impl IqSelKernels {
         launch_u32(what, "n_slots · rows_per_expert", n_slots * rpe)?;
         let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
         let (act, limit) = a.rule.code();
-        match a.ty {
-            GgmlType::IQ2_XS => {
-                let prep = self
-                    .module
-                    .prepare_iq2_xs_gate_up_sel(LaunchConfig1D::new(grid, THREADS, 0))?;
-                self.module.iq2_xs_gate_up_sel(
-                    stream,
-                    &prep,
-                    a.wg.buf(),
-                    a.wu.buf(),
-                    &a.act.q4,
-                    &a.act.d8,
-                    a.sel,
-                    launch_u32(what, "n_experts", n_experts)?,
-                    launch_u32(what, "rows_per_expert", rpe)?,
-                    launch_u32(what, "n_slots", n_slots)?,
-                    launch_u32(what, "m_cols", m)?,
-                    launch_u32(what, "slots_per_col", spc)?,
-                    launch_u32(what, "n_sb", n_sb)?,
-                    launch_u32(what, "n_grp", n_grp)?,
-                    act,
-                    limit,
-                    fault,
-                    h,
-                )?;
-            }
-            GgmlType::IQ3_XXS => {
-                let prep = self
-                    .module
-                    .prepare_iq3_xxs_gate_up_sel(LaunchConfig1D::new(grid, THREADS, 0))?;
-                self.module.iq3_xxs_gate_up_sel(
-                    stream,
-                    &prep,
-                    a.wg.buf(),
-                    a.wu.buf(),
-                    &a.act.q4,
-                    &a.act.d8,
-                    a.sel,
-                    launch_u32(what, "n_experts", n_experts)?,
-                    launch_u32(what, "rows_per_expert", rpe)?,
-                    launch_u32(what, "n_slots", n_slots)?,
-                    launch_u32(what, "m_cols", m)?,
-                    launch_u32(what, "slots_per_col", spc)?,
-                    launch_u32(what, "n_sb", n_sb)?,
-                    launch_u32(what, "n_grp", n_grp)?,
-                    act,
-                    limit,
-                    fault,
-                    h,
-                )?;
-            }
-            GgmlType::IQ3_S => {
-                let prep = self
-                    .module
-                    .prepare_iq3_s_gate_up_sel(LaunchConfig1D::new(grid, THREADS, 0))?;
-                self.module.iq3_s_gate_up_sel(
-                    stream,
-                    &prep,
-                    a.wg.buf(),
-                    a.wu.buf(),
-                    &a.act.q4,
-                    &a.act.d8,
-                    a.sel,
-                    launch_u32(what, "n_experts", n_experts)?,
-                    launch_u32(what, "rows_per_expert", rpe)?,
-                    launch_u32(what, "n_slots", n_slots)?,
-                    launch_u32(what, "m_cols", m)?,
-                    launch_u32(what, "slots_per_col", spc)?,
-                    launch_u32(what, "n_sb", n_sb)?,
-                    launch_u32(what, "n_grp", n_grp)?,
-                    act,
-                    limit,
-                    fault,
-                    h,
-                )?;
-            }
-            GgmlType::IQ4_XS => {
-                let prep = self
-                    .module
-                    .prepare_iq4_xs_gate_up_sel(LaunchConfig1D::new(grid, THREADS, 0))?;
-                self.module.iq4_xs_gate_up_sel(
-                    stream,
-                    &prep,
-                    a.wg.buf(),
-                    a.wu.buf(),
-                    &a.act.q4,
-                    &a.act.d8,
-                    a.sel,
-                    launch_u32(what, "n_experts", n_experts)?,
-                    launch_u32(what, "rows_per_expert", rpe)?,
-                    launch_u32(what, "n_slots", n_slots)?,
-                    launch_u32(what, "m_cols", m)?,
-                    launch_u32(what, "slots_per_col", spc)?,
-                    launch_u32(what, "n_sb", n_sb)?,
-                    launch_u32(what, "n_grp", n_grp)?,
-                    act,
-                    limit,
-                    fault,
-                    h,
-                )?;
-            }
-            other => {
-                return Err(GpuError::shape(
-                    what,
-                    format!("no gate·up entry for {other:?}"),
-                ));
-            }
-        }
-        Ok(())
+        let launch = RawGateUpLaunch {
+            wg: a.wg.buf(),
+            wu: a.wu.buf(),
+            q: &a.act.q4,
+            d8: &a.act.d8,
+            sel: a.sel,
+            n_experts: launch_u32(what, "n_experts", n_experts)?,
+            rows_per_expert: launch_u32(what, "rows_per_expert", rpe)?,
+            n_slots: launch_u32(what, "n_slots", n_slots)?,
+            m_cols: launch_u32(what, "m_cols", m)?,
+            slots_per_col: launch_u32(what, "slots_per_col", spc)?,
+            n_sb: launch_u32(what, "n_sb", n_sb)?,
+            n_grp: launch_u32(what, "n_grp", n_grp)?,
+            act,
+            limit,
+        };
+        self.launch_raw_gate_up(stream, a.ty, grid, &launch, fault, h)
     }
 
     /// Enqueue the i-quant down `_sel` of `ty` (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S or
@@ -1693,10 +1018,18 @@ impl IqSelKernels {
         fault: FaultSink,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        self.gemv_sel("IqSelKernels::enqueue_gemv_sel", stream, ty, a, 1, fault, y)
+        self.gemv_sel(
+            "QuantSelKernels::enqueue_gemv_sel",
+            stream,
+            ty,
+            a,
+            1,
+            fault,
+            y,
+        )
     }
 
-    /// [`IqSelKernels::enqueue_gemv_sel`] with slot `s` reading column `s /
+    /// [`QuantSelKernels::enqueue_gemv_sel`] with slot `s` reading column `s /
     /// slots_per_col` of `a.act`: the one-stack form of a routed expert
     /// without a gate, whose up reads one column a token's run of
     /// `slots_per_col` slots (and whose down is `slots_per_col` 1). `a.act`
@@ -1712,7 +1045,7 @@ impl IqSelKernels {
         fault: FaultSink,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let what = "IqSelKernels::enqueue_gemv_sel_cols";
+        let what = "QuantSelKernels::enqueue_gemv_sel_cols";
         self.gemv_sel(what, stream, ty, a, slots_per_col, fault, y)
     }
 
@@ -1731,28 +1064,27 @@ impl IqSelKernels {
         fault: FaultSink,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let (name, bb) = match ty {
-            GgmlType::IQ2_XXS => ("IQ2_XXS", Iq2Xxs::BB),
-            GgmlType::IQ2_XS => ("IQ2_XS", Iq2Xs::BB),
-            GgmlType::IQ3_XXS => ("IQ3_XXS", Iq3Xxs::BB),
-            GgmlType::IQ3_S => ("IQ3_S", Iq3S::BB),
-            GgmlType::IQ4_XS => ("IQ4_XS", Iq4Xs::BB),
-            other => {
-                return Err(GpuError::shape(
-                    what,
-                    format!(
-                        "the down takes IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S or IQ4_XS stacks, got \
-                         {other:?}"
-                    ),
-                ));
-            }
-        };
-        if spc == 0 || (spc != 1 && ty != GgmlType::IQ2_XXS) {
+        let Some(&RawType {
+            name,
+            bb,
+            down_cols,
+            ..
+        }) = raw_row(ty, |t| t.down)
+        else {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "{name} reads {spc} slots a column: IQ2_XXS's entry takes a positive \
-                     slots_per_col, every other format's down one column a slot (1)"
+                    "the down takes {} stacks, got {ty:?}",
+                    raw_names(|t| t.down)
+                ),
+            ));
+        };
+        if spc == 0 || (spc != 1 && !down_cols) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{name} reads {spc} slots a column: an entry with a shared table takes a \
+                     positive slots_per_col, every other format's down one column a slot (1)"
                 ),
             ));
         }
@@ -1776,60 +1108,20 @@ impl IqSelKernels {
         // The bodies divide thread rows in u32.
         launch_u32(what, "n_slots · rows_per_expert", n_slots * rpe)?;
         let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
-        let cfg = LaunchConfig1D::new(grid, THREADS, 0);
-        macro_rules! down {
-            ($prepare:ident, $entry:ident) => {{
-                let prep = self.module.$prepare(cfg)?;
-                self.module.$entry(
-                    stream,
-                    &prep,
-                    a.w.buf(),
-                    &a.act.q4,
-                    &a.act.d8,
-                    a.sel,
-                    launch_u32(what, "n_experts", n_experts)?,
-                    launch_u32(what, "rows_per_expert", rpe)?,
-                    launch_u32(what, "n_slots", n_slots)?,
-                    launch_u32(what, "n_sb", n_sb)?,
-                    launch_u32(what, "n_grp", n_grp)?,
-                    fault,
-                    y,
-                )?
-            }};
-        }
-        match ty {
-            GgmlType::IQ2_XXS => {
-                let prep = self.module.prepare_iq2_xxs_gemv_sel(cfg)?;
-                self.module.iq2_xxs_gemv_sel(
-                    stream,
-                    &prep,
-                    a.w.buf(),
-                    &a.act.q4,
-                    &a.act.d8,
-                    a.sel,
-                    launch_u32(what, "n_experts", n_experts)?,
-                    launch_u32(what, "rows_per_expert", rpe)?,
-                    launch_u32(what, "n_slots", n_slots)?,
-                    launch_u32(what, "m_cols", m)?,
-                    launch_u32(what, "slots_per_col", spc)?,
-                    launch_u32(what, "n_sb", n_sb)?,
-                    launch_u32(what, "n_grp", n_grp)?,
-                    fault,
-                    y,
-                )?;
-            }
-            GgmlType::IQ2_XS => down!(prepare_iq2_xs_gemv_sel, iq2_xs_gemv_sel),
-            GgmlType::IQ3_XXS => down!(prepare_iq3_xxs_gemv_sel, iq3_xxs_gemv_sel),
-            GgmlType::IQ3_S => down!(prepare_iq3_s_gemv_sel, iq3_s_gemv_sel),
-            GgmlType::IQ4_XS => down!(prepare_iq4_xs_gemv_sel, iq4_xs_gemv_sel),
-            other => {
-                return Err(GpuError::shape(
-                    what,
-                    format!("no down entry for {other:?}"),
-                ));
-            }
-        }
-        Ok(())
+        let launch = RawDownLaunch {
+            w: a.w.buf(),
+            q: &a.act.q4,
+            d8: &a.act.d8,
+            sel: a.sel,
+            n_experts: launch_u32(what, "n_experts", n_experts)?,
+            rows_per_expert: launch_u32(what, "rows_per_expert", rpe)?,
+            n_slots: launch_u32(what, "n_slots", n_slots)?,
+            m_cols: launch_u32(what, "m_cols", m)?,
+            slots_per_col: launch_u32(what, "slots_per_col", spc)?,
+            n_sb: launch_u32(what, "n_sb", n_sb)?,
+            n_grp: launch_u32(what, "n_grp", n_grp)?,
+        };
+        self.launch_raw_down(stream, ty, grid, &launch, fault, y)
     }
 
     /// Enqueue the IQ4_NL down `_sel`: slot `s` writes `y[s ·
@@ -1847,7 +1139,7 @@ impl IqSelKernels {
         fault: FaultSink,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let what = "IqSelKernels::enqueue_down";
+        let what = "QuantSelKernels::enqueue_down";
         let k = a.act.k();
         let k_blocks = k / 32;
         if k == 0 || !k.is_multiple_of(32) {
@@ -1899,9 +1191,9 @@ impl IqSelKernels {
         launch_u32(what, "n_slots · rows_per_expert", n_slots * rpe)?;
         let grid = launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?;
         let prep = self
-            .module
+            .hand
             .prepare_iq4_nl_gemv_sel32(LaunchConfig1D::new(grid, THREADS, 0))?;
-        self.module.iq4_nl_gemv_sel32(
+        self.hand.iq4_nl_gemv_sel32(
             stream,
             &prep,
             a.w.buf(),

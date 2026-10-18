@@ -46,10 +46,11 @@ use crate::card_slots::{CardAcc, CardSlotKernels};
 use crate::elem::ElemKernels;
 use crate::fault::FaultSink;
 use crate::graph::MappedHost;
+use crate::kquant::Act;
 use crate::kquant::sel::{ARENA_PARTS, ARENA_SKIP, GateUpAt, SelDownAt};
-use crate::kquant::{Act, KquantKernels};
 use crate::q4k_sel::{Q4kSelKernels, QuantSel};
 use crate::q6k_sel::Q6kSelKernels;
+use crate::quant_sel::QuantSelKernels;
 use crate::tensor::window;
 use crate::{Gpu, GpuError, Q8Act};
 
@@ -258,7 +259,7 @@ pub struct ArenaLeg {
     /// ([`Boundary::enqueue_back_of`]); one stream enqueues them, so the
     /// lock is never contended.
     scratch: Mutex<Scratch>,
-    kquant: KquantKernels,
+    kquant: QuantSelKernels,
     q6k: Q6kSelKernels,
     q4k: Q4kSelKernels,
     slots: CardSlotKernels,
@@ -400,7 +401,7 @@ impl ArenaLeg {
                 acc: DeviceBuffer::zeroed(stream, hidden)?,
                 sums,
             }),
-            kquant: KquantKernels::load(ctx, word)?,
+            kquant: QuantSelKernels::load(ctx, word)?,
             q6k: Q6kSelKernels::load(ctx, word)?,
             q4k: Q4kSelKernels::load(ctx, word)?,
             slots: CardSlotKernels::load(ctx)?,
