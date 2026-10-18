@@ -1,14 +1,53 @@
 //! Raster patches of the mtmd canvas.
 
-use super::{IMAGE_BEGIN, IMAGE_END};
+use super::{IMAGE_BEGIN, IMAGE_END, MERGE, VIDEO_FRAMES, VIDEO_TOKENS};
+use crate::media::Piece;
 use crate::size::SizeRule;
+use crate::video::{ClipMeta, ClipPlan, Overflow, Sampler, Sizer, Stamp, Tail, VideoRule, plan};
 use crate::{GridPlan, MediaModel, Patches, Prepared, Rgb8, VisionError};
 use std::borrow::Cow;
+
+/// The text before a clip's frames in an embedding input.
+pub(super) const VIDEO_PREFIX: &str = "Video:";
+
+/// Gemma4's video numbers: one frame a second, taken at the middle of each second, 1 to 32 of
+/// them, each frame its own group of at most [`VIDEO_TOKENS`] tokens, no stamp in the text.
+pub const VIDEO_RULE: VideoRule = VideoRule {
+    fps: (1, 1),
+    frames: (1, VIDEO_FRAMES),
+    sampler: Sampler::Ticks { centred: true },
+    overflow: Overflow::Refuse,
+    temporal: 1,
+    tail: Tail::RepeatLast,
+    group_tokens: VIDEO_TOKENS,
+    clip_tokens: VIDEO_TOKENS * VIDEO_FRAMES,
+    overhead: 0,
+    stamp: Stamp::None,
+};
+
+/// The size rule of a video frame: 70 to [`VIDEO_TOKENS`] tokens at the file's patch size.
+fn video_size_rule(patch: usize) -> Result<SizeRule, VisionError> {
+    SizeRule::new(
+        patch,
+        MERGE,
+        crate::arch::TokenLimits::new(70, VIDEO_TOKENS)?,
+    )
+}
 
 /// Resize onto the mtmd canvas and cut raster patches after the graph's `2*x - 1`.
 pub fn preprocess(image: &Rgb8, rule: &SizeRule) -> Result<Patches, VisionError> {
     image.check()?;
     let (best_w, best_h) = rule.aligned(image.width, image.height)?;
+    cut(image, rule, best_w, best_h)
+}
+
+/// Resize onto the canvas `best_w`×`best_h` and cut its patches.
+fn cut(
+    image: &Rgb8,
+    rule: &SizeRule,
+    best_w: usize,
+    best_h: usize,
+) -> Result<Patches, VisionError> {
     let (nx, ny) = rule.grid(best_w, best_h);
     if nx.checked_mul(ny).is_none_or(|n| n > rule.max_tokens()) {
         return Err(VisionError::Limits {
@@ -63,37 +102,28 @@ pub fn conv_pixels(encoded: &[u16]) -> Result<Vec<f32>, VisionError> {
 
 /// Sample a zero-based constant-rate RGB clip at one frame per second.
 /// Source FPS is a numerator and denominator. EOF is one source interval after the last frame.
-/// Timestamps round to the nearest output tick, with half ticks rounded up.
-/// The last source frame in each output tick wins; low-rate frames may repeat.
-/// Clips that yield zero or more than 32 output frames are refused, not truncated.
+/// The frames are the planner's ([`VIDEO_RULE`]): each second's frame is the last source frame
+/// before the second's midpoint, so low-rate clips may repeat a frame, and a clip that samples to
+/// zero or more than 32 frames is refused, not truncated. Each sampled frame is sized by its own
+/// shape.
 pub fn prepare_clip(
     frames: &[Rgb8],
     source_fps: (u32, u32),
     patch: usize,
 ) -> Result<(Vec<usize>, Vec<Prepared>), VisionError> {
-    let (num, den) = source_fps;
-    if frames.is_empty() || num == 0 || den == 0 {
+    let Some(first) = frames.first() else {
         return Err(VisionError::Limits {
             detail: "gemma4v clip needs decoded frames and positive source FPS".into(),
         });
-    }
-    let num = u128::from(num);
-    let den = u128::from(den);
-    let count = (2 * frames.len() as u128 * den + num) / (2 * num);
-    if count == 0 || count > super::VIDEO_FRAMES as u128 {
-        return Err(VisionError::Limits {
-            detail: format!(
-                "gemma4v clip samples to {count} frames; supported range is 1 to {}",
-                super::VIDEO_FRAMES
-            ),
-        });
-    }
-    let indices = (0..count)
-        .map(|tick| {
-            let next = ((2 * tick + 1) * num).div_ceil(2 * den);
-            (next - 1).min(frames.len() as u128 - 1) as usize
-        })
-        .collect::<Vec<_>>();
+    };
+    let meta = ClipMeta {
+        frames: frames.len(),
+        fps: source_fps,
+        width: first.width,
+        height: first.height,
+    };
+    let media = Media::new(video_size_rule(patch)?);
+    let indices = plan(&VIDEO_RULE, &meta, VIDEO_RULE.clip_tokens, &media)?.indices;
     let prepared = prepare_frames(indices.iter().map(|&i| &frames[i]), patch)?;
     Ok((indices, prepared))
 }
@@ -115,11 +145,7 @@ fn prepare_frames<'a>(
             ),
         });
     }
-    let media = Media::new(SizeRule::new(
-        patch,
-        super::MERGE,
-        crate::arch::TokenLimits::new(70, super::VIDEO_TOKENS)?,
-    )?);
+    let media = Media::new(video_size_rule(patch)?);
     frames.map(|frame| media.prepare(frame)).collect()
 }
 
@@ -137,12 +163,75 @@ impl Media {
     }
 }
 
+/// The sizer of a clip's frames: the 70-to-[`VIDEO_TOKENS`] canvas of the file's patch size, held
+/// to the tokens the loaded tower takes.
+impl Sizer for Media {
+    fn group_size(
+        &self,
+        _groups: usize,
+        width: usize,
+        height: usize,
+        cap: usize,
+    ) -> Result<((usize, usize), usize), VisionError> {
+        let rule = video_size_rule(self.rule.patch())?;
+        let (best_w, best_h) = rule.aligned(width, height)?;
+        let (nx, ny) = rule.grid(best_w, best_h);
+        let tokens = nx * ny;
+        if tokens > rule.max_tokens() {
+            return Err(VisionError::Limits {
+                detail: "gemma4v aligned canvas exceeds the image token budget".into(),
+            });
+        }
+        if tokens > self.rule.max_tokens() {
+            return Err(VisionError::Limits {
+                detail: "video frame exceeds the loaded projector token capacity".into(),
+            });
+        }
+        if tokens > cap {
+            return Err(VisionError::Video(format!(
+                "a frame of {width}x{height} takes {tokens} tokens, over the {cap} a group may"
+            )));
+        }
+        Ok(((best_w, best_h), tokens))
+    }
+}
+
 impl MediaModel for Media {
+    fn video_rule(&self) -> Option<&VideoRule> {
+        Some(&VIDEO_RULE)
+    }
+    fn video_sizer(&self) -> &dyn Sizer {
+        self
+    }
+    fn prepare_group(
+        &self,
+        frames: &[Rgb8],
+        size: (usize, usize),
+    ) -> Result<Prepared, VisionError> {
+        let [frame] = frames else {
+            return Err(VisionError::Video(format!(
+                "a gemma4v group is one frame, not {}",
+                frames.len()
+            )));
+        };
+        frame.check()?;
+        let rule = video_size_rule(self.rule.patch())?;
+        let patches = cut(frame, &rule, size.0, size.1)?;
+        Ok(Prepared::of_grid(
+            patches.plan.n_llm_h * patches.plan.n_llm_w,
+            patches,
+        ))
+    }
+    fn video_text(&self, plan: &ClipPlan) -> Result<Vec<Piece>, VisionError> {
+        Ok(std::iter::once(Piece::Text(VIDEO_PREFIX.into()))
+            .chain((0..plan.groups.len()).map(Piece::Group))
+            .collect())
+    }
     fn embedding_delimiters(&self) -> Option<(&str, &str)> {
         Some((IMAGE_BEGIN, IMAGE_END))
     }
     fn embedding_video(&self) -> Option<(&str, usize)> {
-        Some(("Video:", super::VIDEO_FRAMES))
+        Some((VIDEO_PREFIX, VIDEO_FRAMES))
     }
     fn prepare_video(&self, frames: &[Rgb8]) -> Result<Vec<Prepared>, VisionError> {
         let prepared = prepare_video(frames, self.rule.patch())?;

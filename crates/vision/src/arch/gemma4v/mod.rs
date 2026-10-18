@@ -7,7 +7,7 @@ mod media;
 pub mod tensors;
 
 pub use hparams::Hparams;
-pub use media::{Media, conv_pixels, prepare_clip, prepare_video, preprocess};
+pub use media::{Media, VIDEO_RULE, conv_pixels, prepare_clip, prepare_video, preprocess};
 
 /// The projector type of the vision half of a Gemma4 multimodal file.
 pub const PROJECTOR_TYPE: &str = "gemma4v";
