@@ -11,9 +11,9 @@ use crate::quant::SYNTHETIC;
 pub const ARCH: &str = "quant";
 
 /// The md5 of `tools/ref/quant_oracle.cpp`: the source the set's rows, sizes and seeds come from.
-// PIN(2026-10-19): the harness without the six case fields it never read (the md5 moved, the files it dumps did not);
-// `the_harness_pin_is_the_source_in_the_tree` holds it to the tree.
-pub const HARNESS: &str = "f87b4d310e51d9d80643fd0f735237cf";
+// PIN(2026-10-19): the harness that also writes a `type` row for every type ggml's table names (the md5 moved; the cases it
+// dumps did not); `the_harness_pin_is_the_source_in_the_tree` holds it to the tree.
+pub const HARNESS: &str = "c348e458d4f7b19fdb56b55ed1c15db4";
 
 /// The mainline commit the set names in its `# build` line.
 // PIN(2026-10-18): /home/user/llama.cpp-36a73916 at its HEAD 36a73916ee0c (ggml-org master, 2026-10-07), the Qwen image-input

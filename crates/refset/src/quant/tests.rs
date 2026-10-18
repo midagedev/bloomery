@@ -45,6 +45,11 @@ const RIGHT: Stated<'static> = Stated {
 const CASE: &str = "case\tq4_0.64\t2\t64\t32\t18\t36\t8\tq8_0\t68\t2\t1\t2\t0";
 const COLUMNS: &str = "# case\tname\ttype\tk\tblck\ttype_size\trow_bytes\tvdt\tvdt_name\tact_row_bytes\tquant_rows\trandom_rows\tact_rows\timatrix";
 
+/// The table of ggml's types a set states: q4_0, which CASE is of, and i8, which has no to_float and no vec_dot to dump.
+const TYPE_COLUMNS: &str = "# type\tname\tid\tblck\tbytes\tstatus\treason";
+const TYPE_Q4_0: &str = "type\tq4_0\t2\t32\t18\tdumped\t-";
+const TYPE_I8: &str = "type\ti8\t24\t1\t1\tskip\tto_float NULL; vec_dot NULL";
+
 /// The five files of CASE: name and bytes. The dots are 1.0 to 6.0.
 fn files() -> Vec<(String, Vec<u8>)> {
     let dots: Vec<u8> = (1..=6u8).flat_map(|v| f32::from(v).to_le_bytes()).collect();
@@ -67,6 +72,9 @@ fn write_set(dir: &Path, s: &Stated<'_>) {
         format!("# build\t{}", s.build),
         "# cpu\tavx2 fma".to_string(),
         format!("# model\t{}", s.model),
+        TYPE_COLUMNS.to_string(),
+        TYPE_Q4_0.to_string(),
+        TYPE_I8.to_string(),
         COLUMNS.to_string(),
         CASE.to_string(),
         "# file\tname\tbytes\tmd5".to_string(),
@@ -122,6 +130,18 @@ fn a_set_of_the_familys_harness_and_build_opens() {
         ("q4_0", 3, 64, "q8_0")
     );
     assert!(!c.imatrix);
+    assert_eq!(set.types.len(), 2);
+    let q4 = set.type_row("q4_0").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        (q4.id, q4.blck, q4.bytes, q4.skip.as_deref()),
+        (2, 32, 18, None)
+    );
+    let i8 = set.type_row("i8").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        (i8.id, i8.skip.as_deref()),
+        (24, Some("to_float NULL; vec_dot NULL"))
+    );
+    assert!(set.type_row("q8_0").is_err());
     assert_eq!(set.of_type("q4_0").count(), 1);
     assert_eq!(set.of_type("q8_0").count(), 0);
     assert!(set.case("q4_0.4096").is_err());
@@ -477,6 +497,105 @@ fn a_manifest_that_does_not_parse_is_refused() {
     edit(&dir, CASE, "");
     assert!(malformed_naming(&refusal(&dir), &["no case rows"]));
     remove(&dir);
+}
+
+/// The table of ggml's types against the cases: a set with none (a harness older than the table), a row before its column
+/// line, a case whose type has no row, is stated skipped or disagrees with its row about sizes, a dumped type with no case, a
+/// type named twice (by name or by id), a status or reason that is not the table's and a type of an empty block are each
+/// `Malformed`, naming what disagrees.
+#[test]
+fn types_that_disagree_with_the_cases_are_refused() {
+    let both = format!("{TYPE_COLUMNS}\n{TYPE_Q4_0}\n{TYPE_I8}\n");
+    for (what, from, to, words) in [
+        (
+            "none",
+            both.as_str(),
+            "",
+            &["no type rows", "older than"][..],
+        ),
+        (
+            "early",
+            TYPE_COLUMNS,
+            "",
+            &["type row before its `# type` column line"],
+        ),
+        (
+            "unnamed",
+            TYPE_Q4_0,
+            "type\tq4_1\t3\t32\t20\tdumped\t-",
+            &["case q4_0.64", "no type row for q4_0"],
+        ),
+        (
+            "skipped",
+            "q4_0\t2\t32\t18\tdumped\t-",
+            "q4_0\t2\t32\t18\tskip\tvec_dot NULL",
+            &["case q4_0.64", "stated skipped", "vec_dot NULL"],
+        ),
+        (
+            "size",
+            "q4_0\t2\t32\t18\tdumped",
+            "q4_0\t2\t32\t19\tdumped",
+            &["case q4_0.64", "size 18", "size 19"],
+        ),
+        (
+            "id",
+            "q4_0\t2\t32\t18\tdumped",
+            "q4_0\t3\t32\t18\tdumped",
+            &["case q4_0.64", "id 2", "id 3"],
+        ),
+        (
+            "caseless",
+            TYPE_I8,
+            "type\tq8_0\t8\t32\t34\tdumped\t-",
+            &["type q8_0", "stated dumped", "no case"],
+        ),
+        (
+            "twice-name",
+            TYPE_I8,
+            "type\tq4_0\t99\t1\t1\tskip\tvec_dot NULL",
+            &["type q4_0 (id 99) repeats type q4_0 (id 2)"],
+        ),
+        (
+            "twice-id",
+            TYPE_I8,
+            "type\tq8_0\t2\t32\t34\tskip\tvec_dot NULL",
+            &["type q8_0 (id 2) repeats type q4_0 (id 2)"],
+        ),
+        (
+            "status",
+            "dumped\t-",
+            "maybe\t-",
+            &["type q4_0", "\"maybe\"", "want `dumped`"],
+        ),
+        (
+            "reason",
+            "dumped\t-",
+            "dumped\tto_float NULL",
+            &["type q4_0", "\"to_float NULL\"", "want `dumped`"],
+        ),
+        (
+            "skip-no-reason",
+            "skip\tto_float NULL; vec_dot NULL",
+            "skip\t-",
+            &["type i8", "\"skip\"", "ggml's reason"],
+        ),
+        (
+            "empty-block",
+            "type\ti8\t24\t1\t1\t",
+            "type\ti8\t24\t0\t1\t",
+            &["type i8", "a block of 0 values"],
+        ),
+    ] {
+        let dir = set_dir(&format!("type-{what}"));
+        write_set(&dir, &RIGHT);
+        edit(&dir, from, to);
+        assert!(
+            malformed_naming(&refusal(&dir), words),
+            "{what}: {}",
+            refusal(&dir)
+        );
+        remove(&dir);
+    }
 }
 
 /// The sizes a case implies for each part, from the row alone.
