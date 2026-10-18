@@ -183,7 +183,7 @@ crates/vision/src/arch/glm5v/{card,hparams,mod,names,tensors}.rs	derive	the GLM-
 crates/vision/src/arch/glm5v/{media,size}.rs	derive	the GLM-5V media span and size rule the serve seats plan with
 crates/vision/src/arch/glm5v/rules.rs	derive	the GLM-5V preprocess rules the towers read
 crates/vision/src/{arch/deepseek41v/mod.rs,arch/deepseek41v/tensors.rs}	derive	the V4.1 vision family's constants and its tensors' card homes
-crates/vision/src/{image,preprocess}.rs	derive gate-gpu-routed-legs	the decoded image and its patch cut, which every image seat's prepare runs
+crates/vision/src/{image,preprocess,video}.rs	derive gate-gpu-routed-legs	the decoded image and its patch cut, which every image seat's prepare runs
 crates/vision/src/resample.rs	derive	the resize and pad an image seat's prepare runs
 crates/vision/src/arch/deepseek41v/grid.rs	derive	V4.1's grid plan, reached through the projector's arch dispatch
 crates/vision/src/mrope/mod.rs	derive	the M-RoPE module's error and the public paths of its positions and rows
