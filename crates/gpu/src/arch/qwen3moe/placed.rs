@@ -554,7 +554,7 @@ impl Placed {
             gpu.context(),
             o.plan,
             &o.file,
-            0,
+            0..n,
             o.host.r8,
             o.set.arena(),
             widths,
