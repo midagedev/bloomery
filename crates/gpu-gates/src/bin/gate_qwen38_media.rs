@@ -97,10 +97,12 @@ mod gate {
     use bloomery_gpu::{GpuError, capture_template};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::serve_client::{
-        self, Served, check, curl, json_of, serve_cmd, tokenized,
+        self, Served, answered, check, curl, greedy_chat, json_of, serve_cmd, tokenized,
     };
     use bloomery_gpu_gates::vision_seat::{self, Image, Opened, PleImage, TextFacts};
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, sha256, verdict};
+    use bloomery_gpu_gates::{
+        GateError, checks_failed, equal, first_diff, oracle_row, ref_model_path, sha256, verdict,
+    };
     use bloomery_gpu_vision::f32_bf16;
     use bloomery_levers::HostCfg;
     use gguf::Split;
@@ -321,30 +323,6 @@ mod gate {
 
     // ------------------------------------------------------------ helpers
 
-    /// The first index at which `a` and `b` differ in bits, or `None` when equal (a length that differs is
-    /// index 0).
-    fn first_diff(a: &[f32], b: &[f32]) -> Option<usize> {
-        if a.len() != b.len() {
-            return Some(0);
-        }
-        a.iter()
-            .zip(b)
-            .position(|(x, y)| x.to_bits() != y.to_bits())
-    }
-
-    fn equal(what: &str, a: &[f32], b: &[f32]) -> bool {
-        let d = first_diff(a, b);
-        println!(
-            "    {what}: {} values {}",
-            a.len(),
-            d.map_or_else(
-                || "equal bit for bit".to_string(),
-                |i| format!("differ from value {i}")
-            )
-        );
-        d.is_none()
-    }
-
     /// Where a model stands: its position, the rotation table its rope launches read and the images
     /// its record holds, each `(first row, nx, ny)`.
     type Stand<'a> = (usize, &'a [f32], &'a [(usize, usize, usize)]);
@@ -373,28 +351,6 @@ mod gate {
     }
 
     // ------------------------------------------------------------ the rotation table
-
-    /// The rotation row of the position triple `(t, h, w)` from the plain table `plain` (`ROT` values a
-    /// position, a cos and a sin per pair), by ggml's interleaved M-RoPE written out: pair `s` of sector
-    /// `s mod 32` takes the h position at sectors 1 mod 3 below 33, the w position at 2 mod 3 below 30 and the
-    /// t position at 0 mod 3 below 33.
-    fn oracle_row(plain: &[f32], (t, h, w): (usize, usize, usize)) -> [f32; ROT] {
-        let mut row = [0.0; ROT];
-        for s in 0..ROT / 2 {
-            let sector = s % 32;
-            let q = if sector % 3 == 1 && sector < 33 {
-                h
-            } else if sector % 3 == 2 && sector < 30 {
-                w
-            } else if sector % 3 == 0 && sector < 33 {
-                t
-            } else {
-                0
-            };
-            row[2 * s..2 * s + 2].copy_from_slice(&plain[q * ROT + 2 * s..q * ROT + 2 * s + 2]);
-        }
-        row
-    }
 
     /// The (t, h, w) of sequence row `r` of prompt `c` as set C feeds it: the dumped triple inside the
     /// prompt, the text position after it (the last row's position, advanced) beyond.
@@ -736,7 +692,7 @@ mod gate {
         let bad = (0..rows).find(|&r| {
             first_diff(
                 &table[r * ROT..(r + 1) * ROT],
-                &oracle_row(plain, feed_position(c, r)),
+                &oracle_row::<ROT>(plain, feed_position(c, r)),
             )
             .is_some()
         });
@@ -1149,7 +1105,7 @@ mod gate {
             let p = at(i) as usize;
             first_diff(
                 &table[(n + i) * ROT..(n + i + 1) * ROT],
-                &oracle_row(plain, (p, p, p)),
+                &oracle_row::<ROT>(plain, (p, p, p)),
             )
             .is_some()
         });
@@ -1242,75 +1198,6 @@ mod gate {
                 collapsed,
             })
         }
-
-        /// The body as a greedy chat of `n` tokens with each step's two best tokens returned, no prompt
-        /// cache.
-        fn ask(&self, n: usize) -> Value {
-            let mut b = self.body.clone();
-            b["max_tokens"] = json!(n);
-            b["temperature"] = json!(0);
-            b["cache_prompt"] = json!(false);
-            b["logprobs"] = json!(true);
-            b["top_logprobs"] = json!(2);
-            b
-        }
-    }
-
-    /// The ids a greedy chat answered, each with the runner-up of its step and the gap between the top two
-    /// logprobs (`None` where the answer carried one only), and the prompt's token count.
-    struct Reply {
-        ids: Vec<u32>,
-        second: Vec<Option<(u32, f64)>>,
-        prompt: u64,
-    }
-
-    impl Reply {
-        fn of(status: u16, text: &str) -> Result<Reply, GateError> {
-            let v = json_of("/v1/chat/completions", status, text)?;
-            let content = v["choices"][0]["logprobs"]["content"]
-                .as_array()
-                .ok_or("the chat answer carries no logprobs content")?;
-            let (mut ids, mut second) = (Vec::new(), Vec::new());
-            for e in content {
-                ids.push(u32::try_from(
-                    e["id"].as_u64().ok_or("a logprobs entry with no id")?,
-                )?);
-                second.push(e["top_logprobs"].as_array().and_then(|t| {
-                    let (a, b) = (t.first()?, t.get(1)?);
-                    Some((
-                        u32::try_from(b["id"].as_u64()?).ok()?,
-                        a["logprob"].as_f64()? - b["logprob"].as_f64()?,
-                    ))
-                }));
-            }
-            Ok(Reply {
-                ids,
-                second,
-                prompt: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-            })
-        }
-
-        /// Set F's rule over the prefix where the oracle's own CUDA and CPU runs agree (`want.agree`; past
-        /// it the oracle is two engines' roundings parting and holds nothing): the server's greedy ids equal
-        /// the oracle's CUDA ids, or at the first difference the oracle's id is the server's own runner-up
-        /// within [`NEAR_TIE`] of its top and nothing after it is held. The step the ids agreed up to, the
-        /// gap at the first difference when there is one, and whether the rule holds; an answer shorter
-        /// than the prefix fails.
-        fn follows(&self, want: &Decode) -> (usize, Option<f64>, bool) {
-            if self.ids.len() < want.agree {
-                return (self.ids.len(), None, false);
-            }
-            for k in 0..want.agree {
-                if self.ids[k] == want.ids[k] {
-                    continue;
-                }
-                let gap = self.second[k]
-                    .filter(|&(id, _)| id == want.ids[k])
-                    .map(|(_, g)| g);
-                return (k, gap, gap.is_some_and(|g| g < NEAR_TIE));
-            }
-            (want.agree, None, true)
-        }
     }
 
     /// A server on the Qwen3.8 seat of `bloomery-serve` with `extra` flags, its stderr and stdout under
@@ -1373,10 +1260,10 @@ mod gate {
             .ok_or("/apply-template: no prompt")?
             .to_owned();
         let rendered = tokenized(&url, &prompt)?;
-        let ask = chat.ask(f.ids.len());
+        let ask = greedy_chat(&chat.body, f.ids.len());
         let (st, text) = curl(&url("/v1/chat/completions"), Some(&ask), false)?;
         std::fs::write(with.join("chat.json"), &text)?;
-        let reply = Reply::of(st, &text)?;
+        let reply = answered(st, &text)?;
         println!(
             "G: the rendered prompt {} ids (set E {} collapsed); the server evaluated {} (set E {})",
             rendered.len(),
@@ -1391,7 +1278,7 @@ mod gate {
         );
 
         // The answer's ids are set F's over the prefix its CPU twin agrees on, or part at a near tie.
-        let (upto, gap, follows) = reply.follows(f);
+        let (upto, gap, follows) = reply.follows(&f.ids, f.agree, NEAR_TIE);
         println!(
             "G: {} ids answered {:?}; set F's {:?}; agreed up to step {upto} of the {} the twin holds, gap \
              at the first difference {gap:?} (near tie below {NEAR_TIE})",
