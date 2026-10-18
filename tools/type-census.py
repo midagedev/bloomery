@@ -745,8 +745,8 @@ def self_test():
               lambda: _raises(lambda: shard(bad_entry, h=FakeHub({"o/r": {"d/bad.gguf": bad}})), hf.Red,
                               "ggml type id 77 in d/bad.gguf: not in the type table"))
         check("the type table names every id gguf-ranges.py sizes, one name each",
-              set(g.QUANT) <= set(hf.TYPE_NAMES) and len(set(hf.TYPE_NAMES.values())) == len(hf.TYPE_NAMES),
-              str(sorted(set(g.QUANT) - set(hf.TYPE_NAMES))))
+              set(g.QUANT) <= set(hf.GGML_TYPES) and len(set(hf.GGML_TYPES.values())) == len(hf.GGML_TYPES),
+              str(sorted(set(g.QUANT) - set(hf.GGML_TYPES))))
 
         # -- the stub
         check("the stub head is the header up to the aligned tensor data, GGUF first",
