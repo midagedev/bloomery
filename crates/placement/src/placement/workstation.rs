@@ -766,8 +766,9 @@ impl HostNeed {
 
     /// The terms [`HostNeed::bytes`] sums, less the OS reserve, exact: no
     /// sum of u64 terms wraps in u128. `arena` says whether the NVMe tier's
-    /// arena is among them ([`HostNeed::plan_bytes`] leaves it out).
-    fn exact(&self, arena: bool) -> u128 {
+    /// arena is among them ([`HostNeed::plan_bytes`] leaves it out). The
+    /// split of the NVMe expert tier does its room arithmetic on this sum.
+    pub(super) fn exact(&self, arena: bool) -> u128 {
         [
             self.experts,
             self.tables,

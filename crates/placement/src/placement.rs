@@ -3470,7 +3470,9 @@ pub fn expert_nvme_tier(
 ) -> Result<(), PlacementError> {
     let model = plan.model;
     let need = workstation::HostNeed::of(plan, 0);
-    if need.bytes() <= room {
+    // The exact sum: a need past u64 bytes reads `u64::MAX` in `bytes()`,
+    // which a room of `u64::MAX` would hold.
+    if need.exact(true) <= u128::from(room) {
         return Ok(());
     }
     if let Some(r) = plan
@@ -3563,9 +3565,25 @@ pub fn expert_nvme_tier(
     // the split plan: the host keeps `keep` of its `held` expert bytes in
     // what the room leaves past the arena and the window, which the floor
     // keeps at least one layer's worth.
+    // The split's sums are exact (the need may pass u64 bytes with the floor
+    // under it): the reserve is checked, `keep` is computed in u128 from the
+    // exact need, which the room does not hold (the early return above), so
+    // `over` has no negative part. `3 W` fit u64 (the dial's floor).
+    let past = |what: &str| PlacementError::Metadata {
+        key: "the NVMe expert tier's split".to_string(),
+        detail: format!("{what} passes u64 bytes"),
+    };
     let window = 2 * heavy;
-    plan.host.reserve_bytes += window;
-    let keep = held - (need.bytes() + window - room);
+    plan.host.reserve_bytes = plan
+        .host
+        .reserve_bytes
+        .checked_add(window)
+        .ok_or_else(|| past("the host reserve beside the window"))?;
+    let over = need.exact(true) + u128::from(window) - u128::from(room);
+    let keep = u128::from(held)
+        .checked_sub(over)
+        .and_then(|keep| u64::try_from(keep).ok())
+        .ok_or_else(|| past("the bytes the host keeps"))?;
     let share = |l: &HostLayer| u128::from(keep) * u128::from(l.bytes()) / u128::from(held);
     let mut r: Vec<u64> = layers
         .iter()
@@ -4661,6 +4679,81 @@ mod tests {
             }]
         );
         assert!(workstation::HostNeed::of(&plan, 0).check(u64::MAX).is_err());
+    }
+
+    /// A host that holds every expert of `fat_layered(8, EXPERT)` with a
+    /// reserve of `u64::MAX − 5 W` beside them (`W`, a layer's bytes: 8
+    /// experts): the host's need is `u64::MAX + 3 W` and a bit, past u64
+    /// bytes, while the split's floor `base + 3 W` is `u64::MAX − 2 W`, under
+    /// it.
+    fn host_need_past_u64() -> (ModelTensors, Machine, u64) {
+        const BIG: u64 = 1 << 40;
+        let w = 8 * BIG;
+        let mut model = layered(8);
+        for t in model
+            .tensors
+            .iter_mut()
+            .filter(|t| t.role == Role::RoutedExperts)
+        {
+            t.file_bytes = 8 * BIG;
+        }
+        let machine = Machine {
+            cards: vec![bytes_card("stage", HEAD, 0..8)],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: Host {
+                    usable_bytes: u64::MAX,
+                    reserves: vec![("beside".into(), u64::MAX - 5 * w)],
+                },
+                unified: None,
+            }],
+        };
+        (model, machine, BIG)
+    }
+
+    /// The split's room arithmetic is exact where the host's need passes u64
+    /// bytes: the host keeps what the room leaves past the exact need and the
+    /// window, within one expert, and the rest moves to the NVMe tier. An
+    /// unchecked `need + window − room` wraps in release (a small, wrong
+    /// `keep`) and panics in debug.
+    #[test]
+    fn an_nvme_split_of_a_need_past_u64_is_exact() {
+        let (model, machine, expert) = host_need_past_u64();
+        let w = 8 * expert;
+        let mut plan = plan_with(&model, &machine, 4096, &NoKv, None).expect("the plan");
+        let held = plan.host.expert_bytes;
+        assert_eq!(held, 8 * w, "every expert is on the host");
+        let need = workstation::HostNeed::of(&plan, 0);
+        assert!(
+            need.exact(true) > u128::from(u64::MAX),
+            "the need passes u64"
+        );
+        let room = u64::MAX - w;
+        expert_nvme_tier(&mut plan, room, None).expect("the split");
+        let keep = u128::from(held) - (need.exact(true) + u128::from(2 * w) - u128::from(room));
+        let kept = u128::from(plan.host.expert_bytes);
+        assert!(
+            kept <= keep && kept + u128::from(expert) > keep,
+            "the host keeps {kept} B of {keep}"
+        );
+        assert_eq!(plan.host.nvme_expert_bytes, held - plan.host.expert_bytes);
+        assert_eq!(plan.nvme_bytes, plan.host.nvme_expert_bytes);
+    }
+
+    /// A room of `u64::MAX` does not hold a need past u64 bytes: the split
+    /// runs. `HostNeed::bytes` reads `u64::MAX` for that need, which compared
+    /// to the room would leave the plan whole.
+    #[test]
+    fn a_room_of_u64_max_does_not_hold_a_need_past_u64() {
+        let (model, machine, _) = host_need_past_u64();
+        let mut plan = plan_with(&model, &machine, 4096, &NoKv, None).expect("the plan");
+        let held = plan.host.expert_bytes;
+        assert_eq!(workstation::HostNeed::of(&plan, 0).bytes(), u64::MAX);
+        expert_nvme_tier(&mut plan, u64::MAX, None).expect("the split");
+        assert!(
+            plan.host.expert_bytes < held && plan.host.nvme_expert_bytes > 0,
+            "the split moved experts to the NVMe tier"
+        );
     }
 
     #[test]
