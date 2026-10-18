@@ -313,6 +313,10 @@ blk_seedtarget() { tool_selftest seed-target.sh; }
 # not run, and a mutant of each guard that does run it), the seed choice, the read-only seed, and the in-flight rule of
 # `retire`, on scratch git repos with stub seed-target and mac-disk, no cargo, no box.
 blk_wt() { tool_selftest wt.sh; }
+# check-bounded.sh: the scan reads the tree, its self-test reads fixtures (path composed, see blk_scancheck).
+blk_boundedscan() { local c=bounded; bash "$(dirname "$0")/check-$c.sh" > /dev/null && blk_scancheck "$c"; }
+# gate-bound.sh's own self-test: the owner's cancellation table on stub timeouts (no card, no lock).
+blk_gatebound() { tool_selftest gate-bound.sh; }
 # carry.sh is the release's carry check (tools/release/carry.tsv against the commit released): its carried, lacking,
 # pending, unknown-hash and malformed-row verdicts in a temp git repo, no box. The release-build recipe runs it before
 # its box command: a recipe that stops calling it ends the check silently, so the call is held here.
@@ -995,7 +999,7 @@ unset CPU_GUARD_PROC_LEG
 
 BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
-  refsetpublish orphan archowner treecommit archivepipe fnowner wt)
+  refsetpublish orphan archowner treecommit archivepipe fnowner wt boundedscan gatebound)
 for b in "${BLOCKS[@]}"; do
   ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc
 done
