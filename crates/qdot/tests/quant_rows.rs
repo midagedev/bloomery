@@ -7,7 +7,8 @@
 //! (`to_float NULL`, `vec_dot NULL`). A row is held to it by four clauses, one test each (`hw_quant_sizes`,
 //! `hw_quant_dequant`, `hw_quant_act`, `hw_quant_dot`), each over every row and ending red with every red row's message.
 //! `QUANT_ONLY=<ggml name>[,<name>...]` (`just gate-quant <name>`) takes those rows alone; a name that is neither a row nor a
-//! type of ggml's table is a named error. It is read here and named by the recipe, and is no `BLOOMERY_*` lever.
+//! type of ggml's table, and a value that is not UTF-8, are named errors. It is read here and named by the recipe, and is no
+//! `BLOOMERY_*` lever.
 //!
 //! - (a) the row's `blck`, `bytes`, name and tag are what the harness's table of ggml's types states for the type (every case
 //!   states what its type's row does, which the reader holds);
@@ -88,18 +89,16 @@ fn set() -> &'static QuantSet {
     })
 }
 
-/// The row's line in the set's table of ggml's types. A row ggml's table does not name is red by name, and the clause has
-/// nothing more to check.
+/// The row's line in the set's table of ggml's types, through the reader's own lookup. A row ggml's table does not name is red
+/// by the reader's message, and the clause has nothing more to check.
 fn ggml_type(row: &QRow, reds: &mut Reds) -> Option<&'static TypeRow> {
-    let t = set().types.iter().find(|t| t.name == row.name);
-    if t.is_none() {
-        reds.red_case(format!(
-            "{}: the set's table of ggml's types has no row of this name: ggml names no such type (the QROWS row's name is wrong, \
-             or the set is not the oracle of this table)",
-            row.name
-        ));
+    match set().type_row(row.name) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            reds.red_case(e.to_string());
+            None
+        }
     }
-    t
 }
 
 /// The cases of a row's type, one per row length: none for a type the table states `skip`, and at least one for any other
@@ -305,8 +304,9 @@ impl Form {
         }
     }
 
-    /// The `k` values of one oracle activation row, each as the f32 product of the scale and the code (the convention of the
-    /// engine's own round trip, `quantize_activations`), so two equal activations decode to equal values.
+    /// The `k` values of one activation row's bytes (the oracle's, or the engine's encoder's for `Q82X4`), each as the f32
+    /// product of the scale and the code (the convention of the engine's own round trip, `quantize_activations`), so two
+    /// equal activations decode to equal values.
     fn decode(self, bytes: &[u8], k: usize) -> Vec<f64> {
         let half = |b: &[u8]| half_to_f32(u16::from_le_bytes([b[0], b[1]]));
         let scaled = |d: f32, q: u8| f64::from(d * f32::from(q as i8));
@@ -344,7 +344,26 @@ impl Form {
                     b[4..260].iter().map(move |&q| scaled(d, q))
                 })
                 .collect(),
-            Form::Q82X4 => panic!("the oracle holds no q8_2_x4 row (mainline has no such type)"),
+            // `qdot::col_bytes`'s column: groups of four blocks (four bf16 scales at 0, four i16 code sums at 8, four runs of 32
+            // codes at 16; 144 bytes), then the 36-byte `block_q8_2` tails (bf16 scale at 0, i16 sum at 2, codes at 4). The
+            // oracle never holds one (mainline has no such type): it is the encoder's own bytes.
+            Form::Q82X4 => {
+                let bf16 =
+                    |b: &[u8]| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16);
+                let (groups, rest) = bytes.as_chunks::<144>();
+                let (tails, left) = rest.as_chunks::<36>();
+                assert!(left.is_empty(), "q8_2_x4 column of {} bytes", bytes.len());
+                let grouped = groups.iter().flat_map(|g| {
+                    (0..4).flat_map(move |ir| {
+                        let d = bf16(&g[2 * ir..]);
+                        g[16 + 32 * ir..][..32].iter().map(move |&q| scaled(d, q))
+                    })
+                });
+                let tailed = tails
+                    .iter()
+                    .flat_map(|b| b[4..].iter().map(move |&q| scaled(bf16(b), q)));
+                grouped.chain(tailed).collect()
+            }
         };
         assert_eq!(
             values.len(),
@@ -604,11 +623,13 @@ fn act(row: &QRow) -> Reds {
                         None => {
                             // Not ggml's: ik's block_q8_2 family (bf16 scale, i16 code sum, four-block interleave); mainline
                             // pairs this weight with `theirs`. The encoder is held to the half step of its own scale per
-                            // element, and the difference to ggml's values enters (d) as G.
-                            let rt = ours_values(row.ty, x);
+                            // element, and the difference to ggml's values enters (d) as G. The values are read back from the
+                            // bytes the AVX2 encoder wrote, so a defect both encoders share (the bf16 scale, the multiplier)
+                            // is seen here and not only in the round trip they are both checked against in (d).
+                            let rt = Form::Q82X4.decode(&avx, c.k);
                             let bound = Form::Q82X4.bounds(x);
                             for (j, ((r, v), b)) in rt.iter().zip(x).zip(&bound).enumerate() {
-                                if (r - f64::from(*v)).abs() > *b {
+                                if !r.is_finite() || (r - f64::from(*v)).abs() > *b {
                                     reds.red(format!("{at} act row {a}: element {j} is {r} for {v}, over the half step {b}"));
                                     break;
                                 }
@@ -783,6 +804,15 @@ fn dot(row: &QRow) -> Reds {
                 worst_g = worst_g.max(ratio(e_m, b_m));
                 worst_d = worst_d.max(ratio(e_d, b_o + b_m + gap));
                 let at = format!("{} w{w} a{a}", c.name);
+                // A NaN result makes every comparison below false, so it is refused by name first.
+                if ![e_o, e_m, e_d, b_o, b_m, gap]
+                    .into_iter()
+                    .all(f64::is_finite)
+                {
+                    reds.red(format!(
+                        "{at}: a non-finite dot error or band: ours {r}, ggml {g}, errors {e_o:e} {e_m:e} {e_d:e}, bands {b_o:e} {b_m:e}, activation gap G {gap:e}"
+                    ));
+                }
                 if e_o > b_o {
                     reds.red(format!(
                         "{at}: ours {r} is {e_o:e} from its own exact {v_o}, band {b_o:e}"
@@ -826,7 +856,7 @@ struct Selection {
 }
 
 /// Everything, or what `QUANT_ONLY` names (ggml's type names, comma-separated). A name that is neither a QROWS row nor a type
-/// of ggml's table in the set is a named error, never an empty run.
+/// of ggml's table in the set, and a value that is not UTF-8, are named errors, never an empty or a full run.
 fn selected() -> Selection {
     let uncovered: Vec<&'static TypeRow> = set()
         .types
@@ -835,11 +865,14 @@ fn selected() -> Selection {
         .collect();
     let only = match std::env::var("QUANT_ONLY") {
         Ok(only) if !only.is_empty() => only,
-        _ => {
+        Ok(_) | Err(std::env::VarError::NotPresent) => {
             return Selection {
                 rows: QROWS.iter().collect(),
                 uncovered,
             };
+        }
+        Err(e @ std::env::VarError::NotUnicode(_)) => {
+            panic!("QUANT_ONLY is not valid UTF-8, so it names no type of ggml's table: {e}")
         }
     };
     let mut sel = Selection {
