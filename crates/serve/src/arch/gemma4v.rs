@@ -160,11 +160,15 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
             assert_eq!(prepared[0].span_len, 121);
         }
     }
-    for ty in ["input_video", "video_url"] {
-        let body = json!({"content":[{"type":ty, (ty):{"data":"data:video/mp4;base64,AA=="}}]});
-        let error = inputs(&side, "input", &body)
+    // A clip of either spelling reaches the server's decoder, which a bare side has none of: the
+    // refusal names ffmpeg and the decoded-frames route.
+    for part in [
+        json!({"type":"input_video","input_video":{"data":"AAAA","format":"mp4"}}),
+        json!({"type":"video_url","video_url":{"url":"data:video/mp4;base64,AAAA"}}),
+    ] {
+        let error = inputs(&side, "input", &json!({"content":[part]}))
             .err()
-            .expect("encoded video refusal");
+            .expect("a clip with no decoder");
         assert_eq!(error.code, 400);
         assert!(error.message.contains("decoded one-FPS image_url frames"));
     }
@@ -197,4 +201,88 @@ fn image_parts_preserve_delimiters_and_place_spans_in_one_input() {
         )
         .is_err()
     );
+}
+
+/// A clip in an embedding input is decoded by the server and planned by the side model's rule:
+/// the model's `Video:` text, then one delimited span a group, each group the rows the
+/// decoded-frames route prepares for the same frame, decoded once at the plan's indices on the
+/// seat's threads. Without a decoder, or with a model that has no rule, it is a named 400.
+#[test]
+fn a_clip_in_an_embedding_input_is_planned_decoded_and_delimited() {
+    use crate::video::MockClips;
+    let mut side = Side::new(Box::new(MockEmbed::new(4096)));
+    let rule = vision::size::SizeRule::new(16, 3, vision::arch::TokenLimits::new(1, 280).unwrap())
+        .unwrap();
+    let model = Arc::new(vision::arch::gemma4v::Media::new(rule));
+    side.media = Some(Arc::clone(&model) as media::SharedMediaModel);
+    let mock = MockClips::new();
+    let clip = |spec: &str| {
+        json!({"type": "input_video", "input_video": {
+            "data": media::encode_base64(spec.as_bytes()), "format": "mp4"
+        }})
+    };
+    let got = inputs_with(
+        &side,
+        &mock.support(2),
+        "input",
+        &json!([{"content": [clip("3 1/1 64x64")]}]),
+    )
+    .unwrap_or_else(|e| panic!("{}", e.message));
+    let input = &got[0];
+    assert_eq!(input.images.len(), 3);
+    // Three seconds at one frame a second, each at the middle of its second.
+    assert_eq!(*mock.calls.lock().unwrap(), [(vec![0, 1, 2], 2)]);
+    let tok = &side.tok;
+    let text = tok.encode("Video:");
+    assert_eq!(input.ids[0], tok.bos());
+    assert_eq!(input.ids[1..=text.len()], text[..]);
+    let (begin, end) = (tok.encode("<|image>").len(), tok.encode("<image|>").len());
+    assert_eq!(input.images[0].at, 1 + text.len() + begin);
+    for pair in input.images.windows(2) {
+        assert_eq!(
+            pair[1].at,
+            pair[0].at + pair[0].prepared.span_len + end + begin
+        );
+    }
+    let frames: Vec<vision::Rgb8> = (0..3u8)
+        .map(|i| vision::Rgb8 {
+            width: 64,
+            height: 64,
+            data: vec![i; 64 * 64 * 3],
+        })
+        .collect();
+    let want = vision::MediaModel::prepare_video(&*model, &frames).unwrap();
+    for (feed, want) in input.images.iter().zip(&want) {
+        assert_eq!(feed.prepared.span_len, want.span_len);
+        assert_eq!(
+            feed.prepared.grid().unwrap().bf16,
+            want.grid().unwrap().bf16
+        );
+    }
+    let refused = |video: &crate::video::VideoSupport, side: &Side| {
+        inputs_with(
+            side,
+            video,
+            "input",
+            &json!([{"content": [clip("3 1/1 64x64")]}]),
+        )
+        .err()
+        .expect("a refusal")
+    };
+    let absent = refused(&crate::video::VideoSupport::absent("not found"), &side);
+    assert_eq!(absent.code, 400);
+    assert!(
+        absent
+            .message
+            .starts_with("video input needs ffmpeg and ffprobe on PATH (not found)")
+    );
+    side.media = None;
+    let no_model = refused(&mock.support(2), &side);
+    assert_eq!(no_model.message, "video input needs --embd-mmproj");
+    let over = {
+        let mut small = Side::new(Box::new(MockEmbed::new(100)));
+        small.media = Some(Arc::clone(&model) as media::SharedMediaModel);
+        refused(&mock.support(2), &small)
+    };
+    assert!(over.message.starts_with("video: "), "{}", over.message);
 }
