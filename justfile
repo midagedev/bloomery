@@ -1643,6 +1643,20 @@ gate-1-1:
 dump-ref-dequant:
     ./tools/box.sh 'bash tools/ref/dump-dequant.sh'
 
+# The quant oracle's harness (tools/ref/quant_oracle.cpp) linked against llama.cpp mainline's libggml-base and libggml-cpu in the
+# Qwen image-input oracle's tree (`just build-qvis-lcpp`; checked at its pin, never rebuilt here) into
+# $BLOOMERY_DATA/bin/quant_oracle (tools/ref/quant-oracle.sh). No lease, no card.
+build-quant-oracle:
+    ./tools/box.sh 'bash tools/ref/quant-oracle.sh build'
+
+# The quant oracle's set, once per change of quant_oracle.cpp or the mainline tree: for each ggml weight type and row length,
+# seeded weight rows (quantized by ggml and random-code rows), their to_float, activation rows in the type's vec_dot_type and
+# every vec_dot, under $BLOOMERY_DATA/ref-quant with its QUANT.tsv. The set opens through its refset family
+# (crates/refset/src/arch/quant.rs), which refuses by name a set of another harness or mainline commit, of a model file, with a
+# file that is not the one dumped, or never finished. Builds the harness first. No lease, no card; `just gate-refset` reads it.
+dump-ref-quant:
+    ./tools/box.sh 'bash tools/ref/quant-oracle.sh dump'
+
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
 gate: check-recipes check-rustflags check-arch check-defaults check-model-tax check-comments check-levers check-unsafe check-waits check-loads check-ptx-names fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
 
