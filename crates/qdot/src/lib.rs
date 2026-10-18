@@ -49,6 +49,9 @@
 //!   bits whichever tier runs it. Ours, not ik's: the host tier's other
 //!   columns keep the kernels above.
 //!
+//! - [`generic`]: a type with no hand kernel above runs its block decoder ([`generic::HostDecode`])
+//!   through one kernel per activation form (Q8_K, Q8_2_X4); the hand kernels are matched first.
+//!
 //! Super-block geometry (block_q3_K, 110 bytes / 256 values): hmask[32] @+0,
 //! qs[64] @+32, scales[12] @+96, f16 d @+108.
 //!
@@ -65,6 +68,8 @@ use gguf::iq_tables::{
     IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
 use gguf::quant::{KVALUES_MXFP4, e8m0_to_f32_half, f32_to_f16_bits, half_to_f32};
+
+pub mod generic;
 
 /// `sizeof(block_q3_K)` (ggml-common.h): 110 bytes / 256 values.
 const Q3K_BLOCK: usize = 110;
@@ -182,7 +187,8 @@ impl std::error::Error for QdotError {}
 // ------------------------------------------------------------ public API
 
 /// The weight types this crate has a kernel and an activation format for — the
-/// one list every entry point checks against.
+/// one list every entry point checks against: the hand kernels, then the types
+/// [`generic::ENTRIES`] decodes.
 fn has_kernel(w: GgmlType) -> bool {
     matches!(
         w,
@@ -202,7 +208,7 @@ fn has_kernel(w: GgmlType) -> bool {
             | GgmlType::IQ4_NL
             | GgmlType::IQ4_XS
             | GgmlType::Q2_0
-    )
+    ) || generic::entry(w).is_some()
 }
 
 /// Whether the fused path handles this weight type on this machine: the type
@@ -231,7 +237,7 @@ pub fn fuses(w: GgmlType, k: usize) -> bool {
 
 /// The per-type ISA table matching each fused kernel's `#[target_feature]` requirements.
 ///
-/// Q3_K needs avx2+f16c; MXFP4 needs avx2+fma; every other type avx2+fma+f16c.
+/// Q3_K needs avx2+f16c; MXFP4 and the generic decoders need avx2+fma; every other type avx2+fma+f16c.
 #[cfg(target_arch = "x86_64")]
 fn has_features(w: GgmlType) -> bool {
     // Per arm, so a call checks only the features its kernel needs: `dot_row`
@@ -262,7 +268,8 @@ fn has_features(w: GgmlType) -> bool {
         | GgmlType::IQ4_NL
         | GgmlType::IQ4_XS
         | GgmlType::Q2_0 => avx2() && fma() && f16c(),
-        _ => false,
+        // generic::dot_avx2: enable = "avx2", "fma"
+        other => generic::entry(other).is_some() && avx2() && fma(),
     }
 }
 
@@ -304,13 +311,13 @@ pub fn q4k_avx512() -> bool {
 
 /// The `k` contract: `k` must be a multiple of the weight format's block size
 /// (256 for K-quants, IQ2_XS, IQ2_XXS, IQ3_XXS, IQ3_S and IQ4_XS, 64 for Q2_0, 32 for Q5_0, Q5_1, Q8_0,
-/// MXFP4 and IQ4_NL). A type with no kernel here gets the K-quant contract: its callers outside this crate
-/// ask the size contract of weight types that never reach a kernel.
+/// MXFP4 and IQ4_NL), a generic decoder's block values. A type with no kernel here gets the K-quant contract: its
+/// callers outside this crate ask the size contract of weight types that never reach a kernel.
 pub fn k_granularity(w: GgmlType) -> usize {
     match w {
         GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::MXFP4 | GgmlType::IQ4_NL => 32,
         GgmlType::Q2_0 => 64,
-        _ => 256,
+        other => generic::entry(other).map_or(256, |e| e.values),
     }
 }
 
@@ -342,7 +349,17 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
         }
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (k / 128) * Q82X4_STRIDE,
         GgmlType::Q2_0 => (k / 32) * Q8F0_BLOCK,
-        _ => (k / 256) * Q8K_STRIDE,
+        GgmlType::Q2_K
+        | GgmlType::Q3_K
+        | GgmlType::IQ2_XS
+        | GgmlType::IQ2_XXS
+        | GgmlType::IQ3_XXS
+        | GgmlType::IQ3_S
+        | GgmlType::IQ4_XS => (k / 256) * Q8K_STRIDE,
+        // has_kernel above refused every other type but the generic ones.
+        other => generic::entry(other)
+            .expect("has_kernel named a type with neither a hand kernel nor an entry")
+            .col_bytes(k),
     }
 }
 
@@ -405,8 +422,8 @@ pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
                 quantize_q8f0_col(x, out);
             }
         }
-        // quantize_col_check refused every type without a kernel.
-        other => unreachable!("qdot has no activation format for {other:?}"),
+        // quantize_col_check refused every type without a kernel or an entry.
+        other => quantize_generic(other, x, out, avx2),
     }
 }
 
@@ -445,9 +462,16 @@ pub fn quantize_col_scalar(w: GgmlType, x: &[f32], out: &mut [u8]) {
             }
         }
         GgmlType::Q2_0 => quantize_q8f0_col(x, out),
-        // quantize_col_check refused every type without a kernel.
-        other => unreachable!("qdot has no activation format for {other:?}"),
+        // quantize_col_check refused every type without a kernel or an entry.
+        other => quantize_generic(other, x, out, false),
     }
+}
+
+/// The activation column of a type [`generic::ENTRIES`] decodes, in its entry's form.
+fn quantize_generic(w: GgmlType, x: &[f32], out: &mut [u8], avx2: bool) {
+    generic::entry(w)
+        .expect("quantize_col_check named a type with neither a hand kernel nor an entry")
+        .quantize(x, out, avx2);
 }
 
 /// The shape contract every `quantize_col` entry point enforces before encoding.
@@ -557,7 +581,11 @@ pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, Q
             let _ = q4k_avx512();
             Ok(dot_row_scalar_ty(w, wrow, acol, nb))
         }
-        _ => Ok(dot_row_scalar_ty(w, wrow, acol, nb)),
+        _ => match generic::entry(w) {
+            // SAFETY: has_features saw AVX2+FMA; lengths validated above.
+            Some(e) if hw => Ok(unsafe { e.dot_avx2(wrow, acol, nb) }),
+            _ => Ok(dot_row_scalar_ty(w, wrow, acol, nb)),
+        },
     }
 }
 
@@ -597,8 +625,10 @@ fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         GgmlType::IQ4_NL => dot_iq4nl_q82x4_emul(wrow, acol, nb),
         GgmlType::IQ4_XS => dot_iq4xs_q8k_emul(wrow, acol, nb),
         GgmlType::Q2_0 => dot_q2f0_q8f0_scalar(wrow, acol, nb),
-        // Every caller passed check_row, which refused a type with no kernel.
-        other => unreachable!("qdot has no kernel for {other:?}"),
+        // Every caller passed check_row, which refused a type with neither a kernel nor an entry.
+        other => generic::entry(other)
+            .expect("check_row named a type with neither a hand kernel nor an entry")
+            .dot_scalar(wrow, acol, nb),
     }
 }
 
@@ -678,8 +708,13 @@ pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f
             // SAFETY: asserted just above; lengths validated by check_row.
             Ok(unsafe { dot_q2f0_q8f0_avx2(wrow, acol, nb) })
         }
-        // check_row refused a type with no kernel.
-        other => unreachable!("qdot has no kernel for {other:?}"),
+        // check_row refused a type with neither a kernel nor an entry.
+        other => {
+            let e = generic::entry(other)
+                .expect("check_row named a type with neither a hand kernel nor an entry");
+            // SAFETY: asserted just above; lengths validated by check_row.
+            Ok(unsafe { e.dot_avx2(wrow, acol, nb) })
+        }
     }
 }
 
@@ -1370,8 +1405,12 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
         GgmlType::IQ4_NL => (k / 32, (k / 32) * IQ4NL_BLOCK),
         GgmlType::IQ4_XS => (k / 256, (k / 256) * IQ4XS_BLOCK),
         GgmlType::Q2_0 => (k / 64, (k / 64) * Q2F0_BLOCK),
-        // The has_kernel check above refused every other type.
-        other => unreachable!("qdot has no kernel for {other:?}"),
+        // The has_kernel check above refused every other type but the generic ones.
+        other => {
+            let e = generic::entry(other)
+                .expect("has_kernel named a type with neither a hand kernel nor an entry");
+            (k / e.values, (k / e.values) * e.bytes)
+        }
     };
     let need_a = col_bytes(w, k);
     if wrow_len < need_w {

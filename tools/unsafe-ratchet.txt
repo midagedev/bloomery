@@ -478,7 +478,12 @@ placement 0 0 0
 # bodies keep one block per load, store, pointer offset or unsafe call (7 and 12); each with its SAFETY line.
 # PIN(2026-10-16): qdot 172 -> 178 blocks, 80 -> 83 fns, new code: the IQ2_XXS x Q8_K AVX2 dot and column tile and the
 # lifted keven_signs_word (bolt-r1), each block with its SAFETY line.
-qdot 178 83 0
+# PIN(2026-10-19): qdot 178 -> 205 blocks, 83 -> 95 fns, new code, not old code relaxed: the generic host dot
+# (src/generic.rs: the HostDecode vector forms codes_avx2 and scales_avx2, the Entry's dot_avx2 and its two kernels
+# dot_q8k_avx2 and dot_q82x4_avx2, the decoders' codes_avx2 for Q2_K, IQ4_XS and IQ4_NL, and the loads those share,
+# 19 blocks and 11 unsafe fns), the two dispatch arms in lib.rs that call it (2 blocks), and the tests' register-only
+# calls (tests/generic.rs, 6 blocks and 1 fn), each block with its SAFETY line.
+qdot 205 95 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1
