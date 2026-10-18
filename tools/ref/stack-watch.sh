@@ -235,7 +235,7 @@ self_test() {
   # A TERM before the quiet time, to a command that prints every 0.2 s until its TERM and then takes five seconds to end (longer
   # than the quiet time): the watch starts no dump after the TERM, and returns when the command ends, with its code. The printing,
   # not the TERM's timing, keeps the quiet time from running out before the TERM.
-  # 2026-10-18: the wall band is 4 to 9 s. The command's trap sleeps 5 s, so no load ends the watch before 5 s, and a watch that went on
+  # PIN(2026-10-18): the wall band is 4 to 9 s. The command's trap sleeps 5 s, so no load ends the watch before 5 s, and a watch that went on
   # to the quiet path would end the trap's sleep early, under 4 s. The watch returns one 1 s poll after the command ends, 7 s at
   # most unloaded; 8 s was read on a loaded Mac with the command's own 5 s unchanged, so the ceiling takes a 2 s margin. A late return
   # past 9 s is the only mode it still tells apart (a dump is `dumped: yes`, an early return is under the floor).

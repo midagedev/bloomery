@@ -4,6 +4,7 @@
 for a in "$@"; do
   case $a in -f | --file=*) exec "${SHIM_REAL_TAR:?}" "$@" ;; esac
 done
+set -o pipefail
 python3 -I -c '
 import os, sys
 zero, run, out = bytes(512), 0, sys.stdout.buffer

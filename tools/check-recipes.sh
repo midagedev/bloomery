@@ -835,19 +835,18 @@ blk_treecommit() { tool_selftest nightly/selftest.sh; }
 # recipes.py's archive() are the one reader of a commit's tree, through a file; a script or tool that pipes again is red. The two
 # fixture lines are the FAIL-first (the pipe is found, the file form is not); tools/nightly/selftest.sh pipes on purpose, to
 # prove its shims lose the pipe.
-archive_pipes() { # archive_pipes DIR: file:line of each pipe from `git archive` into tar, in DIR's shell and Python
-  grep -rnE 'git[^|#]*archive[^|#]*\|[[:space:]]*tar|Popen\(\["git", "archive"' --include='*.sh' --include='*.py' "$1" || true
-}
 blk_archivepipe() {
-  local d hits
+  source "$(dirname "$0")/grep-answer.sh" || return $?
+  local d hits pattern='git[^|#]*archive[^|#]*\|[[:space:]]*tar|Popen\(\["git", "archive"'
   d=$(mktemp -d "$B/archive-pipe.XXXXXX") || return 1
   printf '%s\n' 'git -C "$r" archive --format=tar "$rev" | tar -x -C "$d"' > "$d/pipe.sh"
   printf '%s\n' 'git -C "$r" archive --format=tar -o "$f" "$rev" && tar -x -f "$f" -C "$d"' > "$d/file.sh"
-  if [ "$(archive_pipes "$d")" != "$d/pipe.sh:1:git -C \"\$r\" archive --format=tar \"\$rev\" | tar -x -C \"\$d\"" ]; then
+  hits=$(grep_answer check-recipes -rnE "$pattern" --include='*.sh' --include='*.py' "$d") || return $?
+  if [ "$hits" != "$d/pipe.sh:1:git -C \"\$r\" archive --format=tar \"\$rev\" | tar -x -C \"\$d\"" ]; then
     echo "check-recipes: the archive-pipe scan does not tell a pipe from a file on its fixtures" >&2
     return 1
   fi
-  hits=$(archive_pipes "$(dirname "$0")" | grep -vE '/(check-recipes|nightly/selftest)\.sh:') || true
+  hits=$(grep_answer check-recipes -rnE "$pattern" --include='*.sh' --include='*.py' "$(dirname "$0")" | grep_answer check-recipes -vE '/(check-recipes|nightly/selftest)\.sh:') || return $?
   if [ -n "$hits" ]; then
     printf '%s\n' "$hits" >&2
     echo "check-recipes: a git archive piped into tar (the pipe loses to a tar that stops at the end marker): use archive_tree (tools/nightly/units.sh) or archive() (tools/recipes.py)" >&2
