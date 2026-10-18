@@ -10,10 +10,14 @@
 //! [`Prompt`]: its held sequence and one [`MediaFeed`] per image for the engine.
 //!
 //! An image arrives only inside a `data:` URL holding a base64 PNG or JPEG, in either OpenAI form
-//! of an `image_url` part. Every refusal is one [`MediaError`] variant that names what it refused;
-//! nothing is skipped, repaired or fetched.
+//! of an `image_url` part. A clip arrives as an `input_video` part's base64 `data` and `format`, or
+//! a `video_url` part's `data:video/*;base64,` URL ([`Part::Video`]); [`flatten`] probes and plans
+//! it before it writes the message's text ([`crate::video`]), and [`expand_prompt`] decodes it and
+//! expands each of its groups' placeholders to the group's span. Every refusal is one
+//! [`MediaError`] variant that names what it refused; nothing is skipped, repaired or fetched.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fmt;
 use std::sync::Arc;
 
@@ -22,8 +26,10 @@ use sha2::{Digest, Sha256};
 
 pub use vision::media::ExpandError;
 pub use vision::media::PartJoin;
-use vision::media::expand_spans;
+use vision::media::{Piece, expand_marked};
 pub use vision::{FileKind, MediaModel, Prepared, Rgb8, VisionError};
+
+use crate::video::{Clip, PlannedClip, VideoError, VideoSupport, plan_clip};
 
 /// A [`MediaModel`] the server holds across its threads: the request threads prepare images on
 /// it while the engine runs elsewhere.
@@ -59,21 +65,202 @@ impl MediaModel for NumberedMedia {
     }
 }
 
+/// A model of data only that takes clips: an image token 7 that is one position, a video token 9
+/// that is two positions a group, a group one frame, and a rule of one to six frames within eight
+/// tokens. A group's prepared input carries its frame's first byte, so a test reads which source
+/// frame each group was cut from.
+#[cfg(test)]
+pub(crate) struct ClipMedia;
+
+#[cfg(test)]
+pub(crate) const CLIP_RULE: vision::video::VideoRule = vision::video::VideoRule {
+    fps: (1, 1),
+    frames: (1, 6),
+    sampler: vision::video::Sampler::Linspace,
+    overflow: vision::video::Overflow::Subsample,
+    temporal: 1,
+    tail: vision::video::Tail::RepeatLast,
+    group_tokens: 2,
+    clip_tokens: 8,
+    overhead: 0,
+    stamp: vision::video::Stamp::None,
+};
+
+#[cfg(test)]
+fn grid(first: u16, size: (usize, usize)) -> vision::Patches {
+    vision::Patches {
+        plan: vision::GridPlan {
+            n_llm_h: 1,
+            n_llm_w: 1,
+            best_h: size.1,
+            best_w: size.0,
+        },
+        n_vit_h: 0,
+        n_vit_w: 0,
+        patch_len: 0,
+        bf16: vec![first],
+    }
+}
+
+#[cfg(test)]
+impl vision::video::Sizer for ClipMedia {
+    fn group_size(
+        &self,
+        _groups: usize,
+        width: usize,
+        height: usize,
+        cap: usize,
+    ) -> Result<((usize, usize), usize), VisionError> {
+        if cap < 2 {
+            return Err(VisionError::Video(format!(
+                "a group takes 2 tokens, over the {cap} a group may"
+            )));
+        }
+        Ok(((width, height), 2))
+    }
+}
+
+#[cfg(test)]
+impl MediaModel for ClipMedia {
+    fn image_placeholder(&self, _index: usize) -> Cow<'_, str> {
+        Cow::Borrowed("<img>")
+    }
+
+    fn image_marker(&self) -> &str {
+        "<img>"
+    }
+
+    fn image_token(&self) -> Option<u32> {
+        Some(7)
+    }
+
+    fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
+        Ok(Prepared::of_grid(1, grid(0, (image.width, image.height))))
+    }
+
+    fn video_rule(&self) -> Option<&vision::video::VideoRule> {
+        Some(&CLIP_RULE)
+    }
+
+    fn video_sizer(&self) -> &dyn vision::video::Sizer {
+        self
+    }
+
+    fn prepare_group(
+        &self,
+        frames: &[Rgb8],
+        size: (usize, usize),
+    ) -> Result<Prepared, VisionError> {
+        let [frame] = frames else {
+            return Err(VisionError::Video("a group is one frame".into()));
+        };
+        Ok(Prepared::of_grid(2, grid(u16::from(frame.data[0]), size)))
+    }
+
+    fn video_text(&self, plan: &vision::video::ClipPlan) -> Result<Vec<Piece>, VisionError> {
+        let mut out = vec![Piece::Text("[".into())];
+        for g in 0..plan.groups.len() {
+            if g > 0 {
+                out.push(Piece::Text(",".into()));
+            }
+            out.push(Piece::Group(g));
+        }
+        out.push(Piece::Text("]".into()));
+        Ok(out)
+    }
+
+    fn video_marker(&self) -> Option<&str> {
+        Some("<vid>")
+    }
+
+    fn video_token(&self) -> Option<u32> {
+        Some(9)
+    }
+}
+
 /// One part of a message's `content` array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part<'a> {
     Text(&'a str),
     /// An `image_url` part's URL.
     Image(&'a str),
+    /// An `input_video` or `video_url` part's clip.
+    Video(VideoPart<'a>),
+}
+
+/// An encoded clip as a part carries it: its base64 text, and the container's name when the part
+/// gives one (`input_video`'s `format`, a `video_url`'s media subtype).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoPart<'a> {
+    pub data: &'a str,
+    pub format: Option<&'a str>,
+}
+
+/// One medium a request carries, in the order of its placeholders in the prompt.
+#[derive(Debug)]
+pub enum Medium {
+    /// An `image_url` part's URL.
+    Image(String),
+    /// A clip, probed and planned: one placeholder a group.
+    Video(Box<PlannedClip>),
+}
+
+impl Medium {
+    /// The media of `urls` as images.
+    #[must_use]
+    pub fn images(urls: &[&str]) -> Vec<Medium> {
+        urls.iter()
+            .map(|u| Medium::Image((*u).to_owned()))
+            .collect()
+    }
 }
 
 /// A message's content array flattened for the chat template.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Flat<'a> {
-    /// The parts in order, joined by the model's [`PartJoin`], each image as the model's placeholder.
+#[derive(Debug)]
+pub struct Flat {
+    /// The parts in order, joined by the model's [`PartJoin`], each image as the model's
+    /// placeholder and each clip as its text with one placeholder a group.
     pub text: String,
-    /// The images' URLs, in the order of their placeholders in `text`.
-    pub images: Vec<&'a str>,
+    /// The media, in the order of their placeholders in `text`.
+    pub media: Vec<Medium>,
+}
+
+impl Flat {
+    /// The images' URLs, in the order of their placeholders.
+    #[must_use]
+    pub fn images(&self) -> Vec<&str> {
+        self.media
+            .iter()
+            .filter_map(|m| match m {
+                Medium::Image(url) => Some(url.as_str()),
+                Medium::Video(_) => None,
+            })
+            .collect()
+    }
+}
+
+/// What a request's clips need beyond the model: the decoder and its threads, and the positions of
+/// context the clips may still take, which each planned clip spends.
+pub struct VideoCtx {
+    support: VideoSupport,
+    left: Cell<usize>,
+}
+
+impl VideoCtx {
+    /// A context for clips that may take `budget` positions together.
+    #[must_use]
+    pub fn new(support: VideoSupport, budget: usize) -> VideoCtx {
+        VideoCtx {
+            support,
+            left: Cell::new(budget),
+        }
+    }
+
+    /// A context for a request that carries no clip: a clip part is refused by name.
+    #[must_use]
+    pub fn none() -> VideoCtx {
+        VideoCtx::new(VideoSupport::default(), 0)
+    }
 }
 
 /// An image's cache key: the sha256 of its file bytes. It is known before the decode, so a request
@@ -251,13 +438,10 @@ pub enum MediaError {
     PartNotObject,
     /// A content part whose `type` is missing or not one this server takes (the JSON of the value,
     /// or `missing`).
-    #[error("content part type {0}: only \"text\" and \"image_url\" parts are accepted")]
-    PartType(String),
-    /// Encoded video requires a decoder; embedding inputs take sampled image parts instead.
     #[error(
-        "encoded video is not supported; send decoded one-FPS image_url frames after a Video: text part"
+        "content part type {0}: only \"text\", \"image_url\", \"input_video\" and \"video_url\" parts are accepted"
     )]
-    EncodedVideo,
+    PartType(String),
     /// A content part without the field its type needs.
     #[error("a {ty} part needs {need}")]
     PartField {
@@ -267,6 +451,48 @@ pub enum MediaError {
     /// An image part in a message whose role is not `user`.
     #[error("an image part in a {0} message: only user messages carry images")]
     ImageRole(String),
+    /// A video part in a message whose role is not `user`.
+    #[error("a video part in a {0} message: only user messages carry video")]
+    VideoRole(String),
+    /// Message text that carries the model's video marker.
+    #[error("the message text carries the video marker {0}; send a clip as an input_video part")]
+    VideoMarkerInText(String),
+    /// A `video_url` of a media type other than `video/*`.
+    #[error("media type {0:?}: a video_url takes a data: URL of video/*, such as video/mp4")]
+    VideoMime(String),
+    /// A clip for a model that declares no video rule.
+    #[error("this model takes no video: its projector declares no video rule")]
+    NoVideoRule,
+    /// The projector has no chat video token.
+    #[error("the projector has no chat video token; use its embedding input")]
+    NoChatVideoToken,
+    /// The server's refusal of the clip: no decoder, a file the decoder cannot read, a decode that
+    /// ended early ([`VideoError`]).
+    #[error(transparent)]
+    Clip(#[from] VideoError),
+    /// The planner's or the model's refusal of the clip: over its budget at its fewest frames, a
+    /// frame count it does not take, a group it cannot prepare ([`vision::video`]).
+    #[error(transparent)]
+    Video(VisionError),
+    /// The prompt's placeholders and the request's media do not pair up, with a clip among them.
+    #[error(
+        "{placeholders} media placeholder(s) in the prompt for {images} image(s) and {groups} \
+         video group(s)"
+    )]
+    MediaCount {
+        placeholders: usize,
+        images: usize,
+        groups: usize,
+    },
+    /// A placeholder of one kind where the request's media order has the other.
+    #[error(
+        "placeholder {index} of the prompt is {found}, where the request's media order has {want}"
+    )]
+    MediaOrder {
+        index: usize,
+        found: &'static str,
+        want: &'static str,
+    },
     /// Message text that carries the model's image placeholder.
     #[error(
         "the message text carries the image placeholder {0}; send an image as an image_url part"
@@ -342,7 +568,9 @@ impl fmt::Display for ImageKey {
 }
 
 /// One content part: `{"type":"text","text":…}`, or `{"type":"image_url","image_url":{"url":…}}`
-/// or `{"type":"image_url","image_url":…}`.
+/// or `{"type":"image_url","image_url":…}`, or a clip: `{"type":"input_video","input_video":
+/// {"data":<base64>,"format":<container>}}` or `{"type":"video_url","video_url":{"url":<data: URL
+/// of video/*>}}` (the URL also as the string itself).
 pub fn parse_part(part: &Value) -> Result<Part<'_>, MediaError> {
     let Value::Object(part) = part else {
         return Err(MediaError::PartNotObject);
@@ -369,8 +597,61 @@ pub fn parse_part(part: &Value) -> Result<Part<'_>, MediaError> {
                 need: "an 'image_url' object with a string 'url', or a string",
             }),
         },
-        Some(Value::String(t)) if t == "input_video" || t == "video_url" => {
-            Err(MediaError::EncodedVideo)
+        Some(Value::String(t)) if t == "input_video" => match part.get("input_video") {
+            Some(Value::Object(o)) => {
+                let Some(Value::String(data)) = o.get("data") else {
+                    return Err(MediaError::PartField {
+                        ty: "input_video",
+                        need: "a string 'input_video.data' of base64",
+                    });
+                };
+                let format = match o.get("format") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(f)) => Some(f.as_str()),
+                    Some(_) => {
+                        return Err(MediaError::PartField {
+                            ty: "input_video",
+                            need: "a string 'input_video.format', or none",
+                        });
+                    }
+                };
+                Ok(Part::Video(VideoPart { data, format }))
+            }
+            _ => Err(MediaError::PartField {
+                ty: "input_video",
+                need: "an 'input_video' object with a string 'data' and a 'format'",
+            }),
+        },
+        Some(Value::String(t)) if t == "video_url" => {
+            let url = match part.get("video_url") {
+                Some(Value::String(url)) => url,
+                Some(Value::Object(o)) => match o.get("url") {
+                    Some(Value::String(url)) => url,
+                    _ => {
+                        return Err(MediaError::PartField {
+                            ty: "video_url",
+                            need: "a string 'video_url.url'",
+                        });
+                    }
+                },
+                _ => {
+                    return Err(MediaError::PartField {
+                        ty: "video_url",
+                        need: "a 'video_url' object with a string 'url', or a string",
+                    });
+                }
+            };
+            let (mime, data) = split_data_url(url)?;
+            let Some((_, subtype)) = mime
+                .split_once('/')
+                .filter(|(kind, sub)| kind.eq_ignore_ascii_case("video") && !sub.is_empty())
+            else {
+                return Err(MediaError::VideoMime(short(mime)));
+            };
+            Ok(Part::Video(VideoPart {
+                data,
+                format: Some(subtype),
+            }))
         }
         Some(other) => Err(MediaError::PartType(short(&other.to_string()))),
         None => Err(MediaError::PartType("missing".into())),
@@ -378,55 +659,118 @@ pub fn parse_part(part: &Value) -> Result<Part<'_>, MediaError> {
 }
 
 /// A message's content array as the chat template's text: text parts as they are, each image as
-/// the model's placeholder, joined by the model's [`PartJoin`]: the same separator between every
-/// two parts, or llama-server's rule (a `\n` before a text part unless it is the first text or
-/// follows a placeholder, and none around a placeholder). Only a `user` message carries images:
-/// the template may move other roles' text (V4.1's gathers system messages first), and the i-th
-/// placeholder of the prompt must be the i-th image. `first_image` is the index of the first image
-/// this message places, the count of the images the messages before it placed; the model writes
-/// each image's index into its placeholder ([`MediaModel::image_placeholder`]).
-pub fn flatten<'a>(
+/// the model's placeholder and each clip as the model's text for it with one placeholder a group,
+/// joined by the model's [`PartJoin`]: the same separator between every two parts, or
+/// llama-server's rule (a `\n` before a text part unless it is the first text or follows a
+/// placeholder, and none around a placeholder). Only a `user` message carries media: the template
+/// may move other roles' text (V4.1's gathers system messages first), and the i-th placeholder of
+/// the prompt must be the i-th medium. `first_image` is the index of the first image this message
+/// places, the count of the images the messages before it placed; the model writes each image's
+/// index into its placeholder ([`MediaModel::image_placeholder`]). A clip is probed and planned
+/// here, before its text is written, because the text holds what the plan chose; its frames are
+/// decoded later, by [`expand_prompt`].
+pub fn flatten(
     role: &str,
-    parts: &'a [Value],
+    parts: &[Value],
     model: &dyn MediaModel,
     first_image: usize,
-) -> Result<Flat<'a>, MediaError> {
+    video: &VideoCtx,
+) -> Result<Flat, MediaError> {
     let join = model.part_join();
     let mut text = String::new();
-    let mut images = Vec::new();
-    let mut after_image = false;
+    let mut media = Vec::new();
+    let mut images = 0;
+    let mut after_media = false;
     for (i, part) in parts.iter().enumerate() {
-        let (piece, is_image) = match parse_part(part)? {
+        let (piece, is_media) = match parse_part(part)? {
             Part::Text(t) => {
                 check_text(t, model)?;
                 (Cow::Borrowed(t), false)
             }
             Part::Image(_) if role != "user" => return Err(MediaError::ImageRole(short(role))),
+            Part::Video(_) if role != "user" => return Err(MediaError::VideoRole(short(role))),
             Part::Image(url) => {
-                let piece = model.image_placeholder(first_image + images.len());
-                images.push(url);
+                let piece = model.image_placeholder(first_image + images);
+                images += 1;
+                media.push(Medium::Image(url.to_owned()));
                 (piece, true)
+            }
+            Part::Video(clip) => {
+                let (clip_text, planned) = plan_part(clip, model, video)?;
+                media.push(Medium::Video(Box::new(planned)));
+                (Cow::Owned(clip_text), true)
             }
         };
         match join {
             PartJoin::Uniform(sep) if i > 0 => text.push_str(sep),
-            PartJoin::LlamaServer if !is_image && !after_image && !text.is_empty() => {
+            PartJoin::LlamaServer if !is_media && !after_media && !text.is_empty() => {
                 text.push('\n');
             }
             _ => {}
         }
         text.push_str(&piece);
-        after_image = is_image;
+        after_media = is_media;
     }
-    Ok(Flat { text, images })
+    Ok(Flat { text, media })
+}
+
+/// One clip part, probed and planned under what the request's context has left: the clip's text
+/// with the model's video marker for each group's placeholder, and the plan. The decoder's absence,
+/// a model with no video rule and a base64 that is not one are refused before anything runs.
+fn plan_part(
+    clip: VideoPart<'_>,
+    model: &dyn MediaModel,
+    video: &VideoCtx,
+) -> Result<(String, PlannedClip), MediaError> {
+    model.video_rule().ok_or(MediaError::NoVideoRule)?;
+    let marker = model.video_marker().ok_or(MediaError::NoChatVideoToken)?;
+    model.video_token().ok_or(MediaError::NoChatVideoToken)?;
+    let decoder = video.support.decoder()?;
+    let bytes = base64(clip.data)?;
+    let left = video.left.get();
+    let planned = plan_clip(
+        model,
+        decoder,
+        Clip::new(bytes, clip.format),
+        left,
+        video.support.thread_count(),
+    )?;
+    video.left.set(left.saturating_sub(planned.tokens()));
+    let mut text = String::new();
+    let mut group = 0;
+    for piece in planned.pieces() {
+        match piece {
+            Piece::Text(t) => text.push_str(t),
+            Piece::Group(n) if *n == group => {
+                group += 1;
+                text.push_str(marker);
+            }
+            Piece::Group(n) => {
+                return Err(MediaError::Video(VisionError::Video(format!(
+                    "the model's clip text places group {n} where group {group} is next"
+                ))));
+            }
+        }
+    }
+    if group != planned.groups() {
+        return Err(MediaError::Video(VisionError::Video(format!(
+            "the model's clip text places {group} of the plan's {} groups",
+            planned.groups()
+        ))));
+    }
+    Ok((text, planned))
 }
 
 /// Refuse message text that carries the model's image marker ([`MediaModel::image_marker`]), the
-/// part of a placeholder that makes an image slot whatever its index: only an image part makes one.
+/// part of a placeholder that makes an image slot whatever its index, or its video marker: only a
+/// media part makes one.
 pub fn check_text(text: &str, model: &dyn MediaModel) -> Result<(), MediaError> {
     let marker = model.image_marker();
     if text.contains(marker) {
         return Err(MediaError::PlaceholderInText(marker.to_owned()));
+    }
+    if let Some(marker) = model.video_marker().filter(|m| text.contains(m)) {
+        return Err(MediaError::VideoMarkerInText(marker.to_owned()));
     }
     Ok(())
 }
@@ -470,18 +814,25 @@ fn prepare_with(
     prepare(&image).map_err(MediaError::Prepare)
 }
 
-/// Prepare a sampled video's image parts through the model's video rule.
+/// Prepare a decoded video's image parts through the model's video rule: the frames were sampled
+/// by the sender, so each is a group of its own, sized by the model's sizer at its own shape as a
+/// clip's frames are, and the count is held to the rule's frame bounds.
 pub(crate) fn prepare_video(
     parts: &[Value],
     model: &dyn MediaModel,
 ) -> Result<Vec<MediaFeed>, MediaError> {
-    let (_, limit) = model.embedding_video().ok_or(MediaError::PartField {
-        ty: "decoded video",
-        need: "a projector with a video rule",
-    })?;
-    if parts.is_empty() || parts.len() > limit {
+    let rule =
+        model
+            .video_rule()
+            .filter(|rule| rule.temporal == 1)
+            .ok_or(MediaError::PartField {
+                ty: "decoded video",
+                need: "a projector with a video rule of one-frame groups",
+            })?;
+    let (least, most) = rule.frames;
+    if parts.len() < least || parts.len() > most {
         return Err(MediaError::Prepare(VisionError::Limits {
-            detail: format!("decoded video takes 1 to {limit} sampled frames"),
+            detail: format!("decoded video takes {least} to {most} sampled frames"),
         }));
     }
     parts
@@ -495,13 +846,13 @@ pub(crate) fn prepare_video(
             };
             let file = load(url)?;
             let prepared = prepare_with(&file, |frame| {
-                let mut prepared = model.prepare_video(std::slice::from_ref(frame))?;
-                if prepared.len() != 1 {
-                    return Err(VisionError::Limits {
-                        detail: "the video preparer changed the sampled frame count".into(),
-                    });
-                }
-                Ok(prepared.remove(0))
+                let (size, _) = model.video_sizer().group_size(
+                    1,
+                    frame.width,
+                    frame.height,
+                    rule.group_tokens,
+                )?;
+                model.prepare_group(std::slice::from_ref(frame), size)
             })?;
             Ok(MediaFeed {
                 at: 0,
@@ -512,46 +863,98 @@ pub(crate) fn prepare_video(
         .collect()
 }
 
-/// The prompt of a rendered chat whose ids are `ids` and whose images are `urls`, in the order of
-/// their placeholders: each image loaded and prepared on the calling thread, its placeholder's
-/// token expanded to its span, and one feed per image. The placeholders are counted and the last
-/// position checked before any image is decoded, so a placeholder typed into the text, which
-/// pairs with no image, costs no decode.
+/// What a placeholder of the prompt is, for the refusal that names it.
+fn kind_name(is_image: bool) -> &'static str {
+    if is_image {
+        "an image placeholder"
+    } else {
+        "a video placeholder"
+    }
+}
+
+/// The prompt of a rendered chat whose ids are `ids` and whose media are `media`, in the order of
+/// their placeholders: each image loaded and prepared on the calling thread, each clip decoded and
+/// prepared by group, each placeholder's token expanded to its span, and one feed per image and per
+/// group. The placeholders are counted, their kinds and numbers checked and the last position
+/// checked before anything is decoded, so a placeholder typed into the text, which pairs with no
+/// medium, costs no decode.
 pub fn expand_prompt(
     ids: &[u32],
-    urls: &[&str],
+    media: &[Medium],
     model: &dyn MediaModel,
 ) -> Result<Prompt, MediaError> {
-    let token = model.image_token().ok_or(MediaError::NoChatImageToken)?;
-    let placeholders = ids.iter().filter(|&&t| t == token).count();
-    if placeholders != urls.len() {
-        return Err(MediaError::Expand(ExpandError::PlaceholderCount {
-            placeholders,
-            images: urls.len(),
-        }));
+    let image_token = model.image_token().ok_or(MediaError::NoChatImageToken)?;
+    let video_token = model.video_token();
+    let is_mark = |t: u32| t == image_token || Some(t) == video_token;
+    // Each placeholder the media want, in order: an image's index, or `None` for a group.
+    let mut want: Vec<Option<usize>> = Vec::new();
+    let mut images = 0;
+    for m in media {
+        match m {
+            Medium::Image(_) => {
+                want.push(Some(images));
+                images += 1;
+            }
+            Medium::Video(clip) => {
+                video_token.ok_or(MediaError::NoChatVideoToken)?;
+                want.extend(std::iter::repeat_n(None, clip.groups()));
+            }
+        }
     }
-    if ids.last() == Some(&token) {
+    let placeholders = ids.iter().filter(|&&t| is_mark(t)).count();
+    if placeholders != want.len() {
+        let groups = want.len() - images;
+        return Err(if groups == 0 {
+            MediaError::Expand(ExpandError::PlaceholderCount {
+                placeholders,
+                images,
+            })
+        } else {
+            MediaError::MediaCount {
+                placeholders,
+                images,
+                groups,
+            }
+        });
+    }
+    if ids.last().is_some_and(|&t| is_mark(t)) {
         return Err(MediaError::ImageLast);
     }
-    check_image_numbers(ids, token, model)?;
-    let files = urls
+    check_placeholders(ids, &want, image_token, model)?;
+    let files = media
         .iter()
-        .map(|url| load(url))
+        .filter_map(|m| match m {
+            Medium::Image(url) => Some(load(url)),
+            Medium::Video(_) => None,
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    let prepared = files
-        .iter()
-        .map(|f| prepare(f, model))
-        .collect::<Result<Vec<_>, _>>()?;
-    let lens: Vec<usize> = prepared.iter().map(|p| p.span_len).collect();
-    let expanded = expand_spans(ids, token, &lens)?;
+    let mut files = files.iter();
+    let mut ready: Vec<(ImageKey, Arc<Prepared>)> = Vec::with_capacity(want.len());
+    for m in media {
+        match m {
+            Medium::Image(_) => {
+                let file = files.next().expect("one file per image, loaded above");
+                ready.push((file.key, Arc::new(prepare(file, model)?)));
+            }
+            Medium::Video(clip) => {
+                ready.extend(
+                    clip.prepare(model)?
+                        .into_iter()
+                        .map(|g| (g.key, g.prepared)),
+                );
+            }
+        }
+    }
+    let lens: Vec<usize> = ready.iter().map(|(_, p)| p.span_len).collect();
+    let expanded = expand_marked(ids, is_mark, &lens)?;
     let feeds: Vec<MediaFeed> = expanded
         .spans
         .iter()
-        .zip(files.iter().zip(prepared))
-        .map(|(span, (file, prepared))| MediaFeed {
+        .zip(ready)
+        .map(|(span, (key, prepared))| MediaFeed {
             at: span.start,
-            key: file.key,
-            prepared: Arc::new(prepared),
+            key,
+            prepared,
         })
         .collect();
     Ok(Prompt {
@@ -563,25 +966,46 @@ pub fn expand_prompt(
     })
 }
 
-/// For a model whose placeholder numbers its images ([`MediaModel::image_head`]): the ids before
-/// the i-th image token end with the head of image `i`, so a template that numbered the images
-/// otherwise than by position is refused before any image is decoded.
-fn check_image_numbers(ids: &[u32], token: u32, model: &dyn MediaModel) -> Result<(), MediaError> {
-    let tokens = ids.iter().enumerate().filter(|&(_, &t)| t == token);
-    for (index, (at, _)) in tokens.enumerate() {
-        let Some(head) = model.image_head(index) else {
+/// The i-th placeholder of the prompt is the kind of the i-th medium wants, and for a model whose
+/// placeholder numbers its images ([`MediaModel::image_head`]) the ids before an image's token end
+/// with the head of that image, so a template that numbered the images otherwise than by position
+/// is refused before anything is decoded.
+fn check_placeholders(
+    ids: &[u32],
+    want: &[Option<usize>],
+    image_token: u32,
+    model: &dyn MediaModel,
+) -> Result<(), MediaError> {
+    let marks = ids
+        .iter()
+        .enumerate()
+        .filter(|&(_, &t)| t == image_token || Some(t) == model.video_token());
+    for (index, ((at, &token), want)) in marks.zip(want).enumerate() {
+        let is_image = token == image_token;
+        // One id for both kinds cannot tell them apart: the counts are the whole check.
+        if model.video_token() != Some(image_token) && is_image != want.is_some() {
+            return Err(MediaError::MediaOrder {
+                index,
+                found: kind_name(is_image),
+                want: kind_name(want.is_some()),
+            });
+        }
+        let Some(image) = *want else {
+            continue;
+        };
+        let Some(head) = model.image_head(image) else {
             continue;
         };
         if !ids[..at].ends_with(&head) {
-            return Err(MediaError::ImageNumber { index });
+            return Err(MediaError::ImageNumber { index: image });
         }
     }
     Ok(())
 }
 
-/// A `data:` URL's declared format and its data. Scheme and media type are matched without case
-/// (RFC 3986 §3.1, RFC 2045 §5.1); a media type with parameters is not one of the accepted.
-fn data_url(url: &str) -> Result<(FileKind, &str), MediaError> {
+/// A `data:` URL's media type and its base64 data. Scheme and `;base64` are matched without case
+/// (RFC 3986 §3.1, RFC 2045 §5.1); the media type is returned as written, parameters and all.
+fn split_data_url(url: &str) -> Result<(&str, &str), MediaError> {
     let scheme = url.split_once(':').map(|(s, _)| s).filter(|s| {
         s.bytes().next().is_some_and(|c| c.is_ascii_alphabetic())
             && s.bytes()
@@ -605,6 +1029,13 @@ fn data_url(url: &str) -> Result<(FileKind, &str), MediaError> {
     else {
         return Err(MediaError::NotBase64(short(header)));
     };
+    Ok((mime, payload))
+}
+
+/// A `data:` URL's declared image format and its data: the media type is one of the accepted, a
+/// media type with parameters is not.
+fn data_url(url: &str) -> Result<(FileKind, &str), MediaError> {
+    let (mime, payload) = split_data_url(url)?;
     let kind = if mime.eq_ignore_ascii_case("image/png") {
         FileKind::Png
     } else if mime.eq_ignore_ascii_case("image/jpeg") || mime.eq_ignore_ascii_case("image/jpg") {
@@ -702,9 +1133,9 @@ mod tests {
     use vision::{GridPlan, Patches};
 
     use super::{
-        ExpandError, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, NumberedMedia,
-        Part, PartJoin, Prepared, Rgb8, VisionError, common_prefix, encode_base64, expand_prompt,
-        flatten, keep_whole_spans, load, parse_part, prepare,
+        ExpandError, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, Medium,
+        NumberedMedia, Part, PartJoin, Prepared, Rgb8, VideoCtx, VisionError, common_prefix,
+        encode_base64, expand_prompt, flatten, keep_whole_spans, load, parse_part, prepare,
     };
 
     /// A 2×1 RGB PNG of the colour (200, 100, 50).
@@ -830,22 +1261,24 @@ mod tests {
             json!({"type": "text", "text": "and"}),
             json!({"type": "image_url", "image_url": "data:b"}),
         ];
-        let flat = flatten("user", &parts, &PLAIN, 0).unwrap();
+        let flat = flatten("user", &parts, &PLAIN, 0, &VideoCtx::none()).unwrap();
         assert_eq!(flat.text, "look\n<img>\nand\n<img>");
-        assert_eq!(flat.images, ["data:a", "data:b"]);
+        assert_eq!(flat.images(), ["data:a", "data:b"]);
         let wide = Stub {
             join: PartJoin::Uniform("\n\n"),
         };
         assert_eq!(
-            flatten("user", &parts, &wide, 0).unwrap().text,
+            flatten("user", &parts, &wide, 0, &VideoCtx::none())
+                .unwrap()
+                .text,
             "look\n\n<img>\n\nand\n\n<img>"
         );
         let text_only = [
             json!({"type": "text", "text": "a"}),
             json!({"type": "text", "text": "b"}),
         ];
-        let flat = flatten("system", &text_only, &PLAIN, 0).unwrap();
-        assert_eq!((flat.text.as_str(), flat.images.len()), ("a\nb", 0));
+        let flat = flatten("system", &text_only, &PLAIN, 0, &VideoCtx::none()).unwrap();
+        assert_eq!((flat.text.as_str(), flat.images().len()), ("a\nb", 0));
     }
 
     /// llama-server's join rule edge by edge (`concat_content_parts` in `common/chat.cpp`): a `\n`
@@ -871,10 +1304,10 @@ mod tests {
             (vec!["<img>", "", "b"], "<img>\nb"),
         ] {
             let json: Vec<Value> = parts.iter().map(|p| part(p)).collect();
-            let flat = flatten("user", &json, &LLAMA, 0).unwrap();
+            let flat = flatten("user", &json, &LLAMA, 0, &VideoCtx::none()).unwrap();
             assert_eq!(flat.text, want, "{parts:?}");
             let n = parts.iter().filter(|&&p| p == "<img>").count();
-            assert_eq!(flat.images.len(), n, "{parts:?}");
+            assert_eq!(flat.images().len(), n, "{parts:?}");
         }
     }
 
@@ -886,8 +1319,8 @@ mod tests {
             let body = match content {
                 Value::String(t) => t.clone(),
                 Value::Array(parts) => {
-                    let flat = flatten(role, parts, model, urls.len()).unwrap();
-                    urls.extend(flat.images.iter().map(|u| (*u).to_owned()));
+                    let flat = flatten(role, parts, model, urls.len(), &VideoCtx::none()).unwrap();
+                    urls.extend(flat.images().into_iter().map(str::to_owned));
                     flat.text
                 }
                 other => panic!("{other}"),
@@ -941,7 +1374,7 @@ mod tests {
             let (rendered, ids, urls) = chat(&messages, &LLAMA);
             assert_eq!(rendered, want);
             let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
-            let p = expand_prompt(&ids, &urls, &LLAMA).unwrap();
+            let p = expand_prompt(&ids, &Medium::images(&urls), &LLAMA).unwrap();
             let mut expect = Vec::new();
             for (i, chunk) in want.split("<img>").enumerate() {
                 if i > 0 {
@@ -964,27 +1397,27 @@ mod tests {
     fn flatten_refusals_are_named() {
         let image = [json!({"type": "image_url", "image_url": "data:a"})];
         for role in ["system", "assistant", "tool", "developer"] {
-            match err(flatten(role, &image, &PLAIN, 0)) {
+            match err(flatten(role, &image, &PLAIN, 0, &VideoCtx::none())) {
                 MediaError::ImageRole(r) => assert_eq!(r, role),
                 e => panic!("{role}: {e}"),
             }
         }
         let text = [json!({"type": "text", "text": "an <img> by hand"})];
         assert!(matches!(
-            err(flatten("user", &text, &PLAIN, 0)),
+            err(flatten("user", &text, &PLAIN, 0, &VideoCtx::none())),
             MediaError::PlaceholderInText(_)
         ));
         let bad = [
             json!({"type": "image_url", "image_url": "data:a"}),
             json!({"type": "video_url"}),
         ];
-        let error = err(flatten("user", &bad, &PLAIN, 0));
-        assert!(matches!(error, MediaError::EncodedVideo));
-        assert!(
-            error
-                .to_string()
-                .contains("decoded one-FPS image_url frames")
-        );
+        assert!(matches!(
+            err(flatten("user", &bad, &PLAIN, 0, &VideoCtx::none())),
+            MediaError::PartField {
+                ty: "video_url",
+                ..
+            }
+        ));
     }
 
     /// A model that numbers its images gets each placeholder's index from the images before it:
@@ -998,7 +1431,7 @@ mod tests {
             image("data:b"),
         ];
         for first in [0, 5] {
-            let flat = flatten("user", &parts, &NumberedMedia, first).unwrap();
+            let flat = flatten("user", &parts, &NumberedMedia, first, &VideoCtx::none()).unwrap();
             let (a, b) = (first, first + 1);
             assert_eq!(
                 flat.text,
@@ -1006,7 +1439,7 @@ mod tests {
                     "look\n<image_id>{a}</image_id><image><unk>\n<image_id>{b}</image_id><image><unk>"
                 )
             );
-            assert_eq!(flat.images, ["data:a", "data:b"]);
+            assert_eq!(flat.images(), ["data:a", "data:b"]);
         }
     }
 
@@ -1020,14 +1453,22 @@ mod tests {
             "an <image><unk> by hand",
         ] {
             let parts = [json!({"type": "text", "text": typed})];
-            match err(flatten("user", &parts, &NumberedMedia, 0)) {
+            match err(flatten(
+                "user",
+                &parts,
+                &NumberedMedia,
+                0,
+                &VideoCtx::none(),
+            )) {
                 MediaError::PlaceholderInText(m) => assert_eq!(m, "<image><unk>", "{typed}"),
                 e => panic!("{typed}: {e}"),
             }
         }
         let tag = [json!({"type": "text", "text": "the <image_id>0</image_id> tag"})];
         assert_eq!(
-            flatten("user", &tag, &NumberedMedia, 0).unwrap().text,
+            flatten("user", &tag, &NumberedMedia, 0, &VideoCtx::none())
+                .unwrap()
+                .text,
             "the <image_id>0</image_id> tag",
             "the index tag alone makes no slot"
         );
@@ -1382,7 +1823,7 @@ mod tests {
     #[test]
     fn a_prompt_expands_with_one_feed_per_image() {
         let png = data("image/png", PNG_B64);
-        let p = expand_prompt(&[1, 7, 2, 7, 3], &[&png, &png], &PLAIN).unwrap();
+        let p = expand_prompt(&[1, 7, 2, 7, 3], &Medium::images(&[&png, &png]), &PLAIN).unwrap();
         assert_eq!(p.held.ids, [1, 7, 7, 2, 7, 7, 3]);
         let key = load(&png).unwrap().key;
         assert_eq!(
@@ -1401,7 +1842,7 @@ mod tests {
             (&[1, 7, 7, 2][..], &[png.as_str()][..], (2, 1)),
             (&[1, 2][..], &[png.as_str()][..], (0, 1)),
         ] {
-            match err(expand_prompt(ids, urls, &PLAIN)) {
+            match err(expand_prompt(ids, &Medium::images(urls), &PLAIN)) {
                 MediaError::Expand(ExpandError::PlaceholderCount {
                     placeholders,
                     images,
@@ -1410,11 +1851,15 @@ mod tests {
             }
         }
         assert!(matches!(
-            err(expand_prompt(&[1, 7], &[&png], &PLAIN)),
+            err(expand_prompt(&[1, 7], &Medium::images(&[&png]), &PLAIN)),
             MediaError::ImageLast
         ));
         assert!(matches!(
-            err(expand_prompt(&[1, 7, 2], &["https://x/a.png"], &PLAIN)),
+            err(expand_prompt(
+                &[1, 7, 2],
+                &Medium::images(&["https://x/a.png"]),
+                &PLAIN
+            )),
             MediaError::Scheme(_)
         ));
     }
@@ -1430,14 +1875,336 @@ mod tests {
         let ids = |a: u32, b: u32| [&[1][..], &head(a), &[7, 2], &head(b), &[7, 3]].concat();
         for (ids, index) in [(ids(0, 0).to_vec(), 1), (vec![7, 2], 0)] {
             let urls = vec![png.as_str(); if index == 1 { 2 } else { 1 }];
-            match err(expand_prompt(&ids, &urls, &NumberedMedia)) {
+            match err(expand_prompt(&ids, &Medium::images(&urls), &NumberedMedia)) {
                 MediaError::ImageNumber { index: got } => assert_eq!(got, index, "{ids:?}"),
                 e => panic!("{ids:?}: {e}"),
             }
         }
         assert!(matches!(
-            err(expand_prompt(&ids(0, 1), &[&png, &png], &NumberedMedia)),
+            err(expand_prompt(
+                &ids(0, 1),
+                &Medium::images(&[&png, &png]),
+                &NumberedMedia
+            )),
             MediaError::Prepare(_)
         ));
+    }
+
+    // ---- clips
+
+    use super::{ClipMedia, MediaFeed};
+    use crate::video::{MockClips, VideoError};
+
+    /// An `input_video` part whose clip is the mock's `spec` (frames, rate, size).
+    fn clip_part(spec: &str) -> Value {
+        json!({"type": "input_video", "input_video": {
+            "data": encode_base64(spec.as_bytes()), "format": "mp4"
+        }})
+    }
+
+    /// The ids of `text` for the clip model: its two markers are the ids 7 and 9, any other
+    /// character its own id.
+    fn clip_ids(text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            if let Some(r) = rest.strip_prefix("<img>") {
+                out.push(7);
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix("<vid>") {
+                out.push(9);
+                rest = r;
+            } else {
+                let c = rest.chars().next().expect("a character");
+                out.push(c as u32);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+        out
+    }
+
+    /// A clip part comes in both spellings: `input_video`'s base64 and optional container name, and
+    /// a `video_url` of a `data:video/*;base64,` URL as an object or as the string. Each refusal
+    /// names what was wrong.
+    #[test]
+    fn a_clip_part_has_two_spellings_and_named_refusals() {
+        let video = |part: Value| match parse_part(&part) {
+            Ok(Part::Video(v)) => (v.data.to_owned(), v.format.map(str::to_owned)),
+            other => panic!("{part}: {other:?}"),
+        };
+        assert_eq!(
+            video(json!({"type": "input_video", "input_video": {"data": "AAAA", "format": "mkv"}})),
+            ("AAAA".into(), Some("mkv".into()))
+        );
+        assert_eq!(
+            video(json!({"type": "input_video", "input_video": {"data": "AAAA"}})),
+            ("AAAA".into(), None)
+        );
+        let url = "data:video/mp4;base64,AAAA";
+        for part in [
+            json!({"type": "video_url", "video_url": {"url": url}}),
+            json!({"type": "video_url", "video_url": url}),
+        ] {
+            assert_eq!(video(part), ("AAAA".into(), Some("mp4".into())));
+        }
+        let refused = |part: Value| parse_part(&part).unwrap_err();
+        for part in [
+            json!({"type": "input_video"}),
+            json!({"type": "input_video", "input_video": {"format": "mp4"}}),
+            json!({"type": "input_video", "input_video": {"data": 3}}),
+            json!({"type": "input_video", "input_video": {"data": "AAAA", "format": 3}}),
+            json!({"type": "video_url"}),
+            json!({"type": "video_url", "video_url": {"url": 3}}),
+        ] {
+            assert!(matches!(refused(part), MediaError::PartField { .. }));
+        }
+        assert!(matches!(
+            refused(json!({"type": "video_url", "video_url": "https://x/v.mp4"})),
+            MediaError::Scheme(s) if s == "https"
+        ));
+        assert!(matches!(
+            refused(json!({"type": "video_url", "video_url": "data:video/mp4,AAAA"})),
+            MediaError::NotBase64(_)
+        ));
+        assert!(matches!(
+            refused(json!({"type": "video_url", "video_url": "data:image/png;base64,AAAA"})),
+            MediaError::VideoMime(m) if m == "image/png"
+        ));
+        assert!(matches!(
+            refused(json!({"type": "video_url", "video_url": "data:video/;base64,AAAA"})),
+            MediaError::VideoMime(_)
+        ));
+        assert!(matches!(
+            refused(json!({"type": "video_url", "video_url": "AAAA"})),
+            MediaError::NotAUrl
+        ));
+        assert!(
+            refused(json!({"type": "audio"}))
+                .to_string()
+                .contains("\"input_video\" and \"video_url\"")
+        );
+    }
+
+    /// A clip is probed and planned before its text is written: the text holds one placeholder per
+    /// group the plan made, in order, the model's own text around them, joined as any part is, and
+    /// the clip's plan spends the request's context budget so a second clip gets what is left.
+    #[test]
+    fn a_clip_is_planned_before_its_text_is_written() {
+        let mock = MockClips::new();
+        let parts = [
+            json!({"type": "text", "text": "see"}),
+            clip_part("30 10/1 4x2"),
+            json!({"type": "text", "text": "and"}),
+            json!({"type": "image_url", "image_url": "data:a"}),
+        ];
+        let ctx = VideoCtx::new(mock.support(3), 100);
+        let flat = flatten("user", &parts, &ClipMedia, 0, &ctx).unwrap();
+        // 30 frames at 10 fps is 3 seconds: three frames, three groups of two tokens.
+        assert_eq!(flat.text, "see\n[<vid>,<vid>,<vid>]\nand\n<img>");
+        assert_eq!(flat.images(), ["data:a"]);
+        let [Medium::Video(clip), Medium::Image(_)] = &flat.media[..] else {
+            panic!("a clip then an image: {:?}", flat.media);
+        };
+        assert_eq!((clip.groups(), clip.tokens(), clip.frames()), (3, 6, 3));
+        assert!(
+            mock.calls.lock().unwrap().is_empty(),
+            "nothing decodes before the expansion"
+        );
+        // The plan spent 6 of the budget: a second clip may take what is left (two groups' worth
+        // would be 4; only 2 tokens remain, so one group).
+        let ctx = VideoCtx::new(mock.support(3), 8);
+        let two = [clip_part("30 10/1 4x2"), clip_part("30 10/1 4x2")];
+        let flat = flatten("user", &two, &ClipMedia, 0, &ctx).unwrap();
+        assert_eq!(flat.text, "[<vid>,<vid>,<vid>]\n[<vid>]");
+    }
+
+    /// Where a clip cannot be taken it is refused by name, before any text is written or frame
+    /// decoded: no decoder, a model with no video rule, another role, the marker typed into the
+    /// text, base64 that is not, a probe that fails, a clip over its budget at its fewest frames.
+    #[test]
+    fn a_clip_is_refused_by_name_where_it_cannot_be_taken() {
+        let mock = MockClips::new();
+        let on = |budget| VideoCtx::new(mock.support(2), budget);
+        let clip = [clip_part("30 10/1 4x2")];
+        let absent = err(flatten("user", &clip, &ClipMedia, 0, &VideoCtx::none()));
+        assert!(matches!(absent, MediaError::Clip(VideoError::Absent(_))));
+        assert_eq!(
+            absent.to_string(),
+            "video input needs ffmpeg and ffprobe on PATH (no decoder was set); install ffmpeg, \
+             or send the clip as decoded one-FPS image_url frames after a Video: text part"
+        );
+        assert!(matches!(
+            err(flatten("user", &clip, &NumberedMedia, 0, &on(100))),
+            MediaError::NoVideoRule
+        ));
+        assert!(matches!(
+            err(flatten(
+                "user",
+                &clip,
+                &Stub {
+                    join: PartJoin::Uniform("\n")
+                },
+                0,
+                &on(100)
+            )),
+            MediaError::NoVideoRule
+        ));
+        assert!(matches!(
+            err(flatten("assistant", &clip, &ClipMedia, 0, &on(100))),
+            MediaError::VideoRole(r) if r == "assistant"
+        ));
+        assert!(matches!(
+            err(flatten(
+                "user",
+                &[json!({"type": "text", "text": "a <vid> b"})],
+                &ClipMedia,
+                0,
+                &on(100)
+            )),
+            MediaError::VideoMarkerInText(m) if m == "<vid>"
+        ));
+        let bad64 = [json!({"type": "input_video", "input_video": {"data": "a b"}})];
+        assert!(matches!(
+            err(flatten("user", &bad64, &ClipMedia, 0, &on(100))),
+            MediaError::Base64Char { .. }
+        ));
+        let unreadable = [clip_part("not a clip")];
+        let e = err(flatten("user", &unreadable, &ClipMedia, 0, &on(100)));
+        assert!(matches!(e, MediaError::Clip(VideoError::Probe(_))), "{e}");
+        let e = err(flatten("user", &clip, &ClipMedia, 0, &on(1)));
+        assert!(matches!(e, MediaError::Video(_)), "{e}");
+        assert!(e.to_string().starts_with("video: "), "{e}");
+        assert!(mock.calls.lock().unwrap().is_empty());
+    }
+
+    /// The prompt's placeholders are matched to the request's media by id and order: each group's
+    /// token is expanded to its span and fed, the clip decoded once at the plan's indices on the
+    /// seat's threads, and every pairing fault is named before anything is decoded.
+    #[test]
+    fn clip_placeholders_are_matched_by_id_and_decoded_in_order() {
+        let mock = MockClips::new();
+        let png = data("image/png", PNG_B64);
+        let ctx = VideoCtx::new(mock.support(3), 100);
+        let parts = [
+            clip_part("30 10/1 4x2"),
+            json!({"type": "image_url", "image_url": png}),
+        ];
+        let flat = flatten("user", &parts, &ClipMedia, 0, &ctx).unwrap();
+        let ids = clip_ids(&format!("a{}z", flat.text));
+        let p = expand_prompt(&ids, &flat.media, &ClipMedia).unwrap();
+        // "a[", three groups of two video positions with commas, "]", the image's one, "z".
+        let want = clip_ids("a[<vid><vid>,<vid><vid>,<vid><vid>]\n<img>z");
+        assert_eq!(want.len(), 14);
+        assert_eq!(p.held.ids, want);
+        assert_eq!(p.feeds.len(), 4);
+        let at: Vec<usize> = p.feeds.iter().map(|f| f.at).collect();
+        assert_eq!(at, [2, 5, 8, 12]);
+        // Each group carries the source frame it was cut from; the image none.
+        let frames: Vec<u16> = p
+            .feeds
+            .iter()
+            .map(|f| f.prepared.grid().unwrap().bf16[0])
+            .collect();
+        assert_eq!(frames, [0, 14, 29, 0]);
+        let keys: std::collections::HashSet<_> = p.feeds.iter().map(|f| f.key).collect();
+        assert_eq!(keys.len(), 4, "each group is its own medium");
+        assert_eq!(
+            p.held.media,
+            p.feeds.iter().map(MediaFeed::span).collect::<Vec<_>>()
+        );
+        assert_eq!(*mock.calls.lock().unwrap(), [(vec![0, 14, 29], 3)]);
+    }
+
+    /// The same clip planned the same way keys the same, group for group: a prefix cache keeps its
+    /// spans across requests.
+    #[test]
+    fn a_clip_planned_the_same_way_keys_the_same() {
+        let mock = MockClips::new();
+        let ctx = VideoCtx::new(mock.support(3), 100);
+        let parts = [clip_part("30 10/1 4x2")];
+        let keys = || {
+            let flat = flatten("user", &parts, &ClipMedia, 0, &ctx).unwrap();
+            let ids = clip_ids(&flat.text);
+            let p = expand_prompt(&ids, &flat.media, &ClipMedia).unwrap();
+            p.feeds.iter().map(|f| f.key).collect::<Vec<_>>()
+        };
+        let (first, second) = (keys(), keys());
+        assert_eq!(first, second);
+        let distinct: std::collections::HashSet<_> = first.iter().collect();
+        assert_eq!(distinct.len(), 3);
+    }
+
+    /// A placeholder pairing fault is named, and nothing is decoded for it: too few or too many
+    /// placeholders for the media, an image's marker where the request has a clip's group (and
+    /// the reverse), a model with no video token, a prompt that ends in a group.
+    #[test]
+    fn a_clip_pairing_fault_is_named_before_any_decode() {
+        let mock = MockClips::new();
+        let png = data("image/png", PNG_B64);
+        let ctx = VideoCtx::new(mock.support(1), 100);
+        let parts = [
+            json!({"type": "image_url", "image_url": png}),
+            clip_part("30 10/1 4x2"),
+        ];
+        let flat = flatten("user", &parts, &ClipMedia, 0, &ctx).unwrap();
+        let run = |text: &str| err(expand_prompt(&clip_ids(text), &flat.media, &ClipMedia));
+        // An image, then three groups: the right ids pass the pairing (checked by the success
+        // above); each fault below is the same prompt altered.
+        assert!(matches!(
+            run("a<img>b<vid>,<vid>c"),
+            MediaError::MediaCount {
+                placeholders: 3,
+                images: 1,
+                groups: 3
+            }
+        ));
+        assert!(matches!(
+            run("a<img><vid><vid><vid><vid>"),
+            MediaError::MediaCount {
+                placeholders: 5,
+                images: 1,
+                groups: 3
+            }
+        ));
+        let swapped = run("a<vid><img><vid><vid>z");
+        assert!(
+            matches!(&swapped, MediaError::MediaOrder { index: 0, found, want }
+                if *found == "a video placeholder" && *want == "an image placeholder"),
+            "{swapped}"
+        );
+        assert!(
+            swapped
+                .to_string()
+                .contains("placeholder 0 of the prompt is a video placeholder")
+        );
+        let image_where_group = run("a<img><vid><img><vid>z");
+        assert!(matches!(
+            image_where_group,
+            MediaError::MediaOrder { index: 2, .. }
+        ));
+        assert!(matches!(
+            run("a<img><vid><vid><vid>"),
+            MediaError::ImageLast
+        ));
+        assert!(matches!(
+            err(expand_prompt(
+                &clip_ids("<img><vid><vid><vid>z"),
+                &flat.media,
+                &NumberedMedia
+            )),
+            MediaError::NoChatVideoToken
+        ));
+        // A typed marker with no clip behind it is the pairing's fault like any typed placeholder.
+        assert!(matches!(
+            err(expand_prompt(&clip_ids("a<vid>b"), &[], &ClipMedia)),
+            MediaError::Expand(ExpandError::PlaceholderCount {
+                placeholders: 1,
+                images: 0
+            })
+        ));
+        assert!(
+            mock.calls.lock().unwrap().is_empty(),
+            "no pairing fault decoded a frame"
+        );
     }
 }

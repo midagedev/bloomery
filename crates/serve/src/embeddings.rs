@@ -14,8 +14,10 @@
 //! top level, one vector each. Text is tokenized with the side model's vocabulary, the first text
 //! element of each input with its special tokens, as llama-server's `tokenize_mixed` puts them.
 //! An object with a `content` array prepares image parts through the side model's media rule
-//! and decoded f32 PCM through Gemma4a's preprocessor. Text and all media spans share one pass,
-//! with BOS and EOS around the whole input.
+//! and decoded f32 PCM through Gemma4a's preprocessor. A clip, an `input_video` or `video_url`
+//! part, is decoded by the server's ffmpeg and planned by the model's video rule
+//! ([`crate::video`]); each of its groups is a media span. Text and all media spans share one
+//! pass, with BOS and EOS around the whole input.
 //!
 //! The side model runs one request at a time. A failure in it ends the server as an engine's does:
 //! the request gets a 500, `/health` and every later request a 503, and the server exits after its
@@ -42,6 +44,8 @@ use crate::embed::{Norm, normalize};
 use crate::engine::Tokenizer;
 use crate::http::Request;
 use crate::media;
+use crate::video::{self, Clip, ReadyGroup, VideoSupport};
+use vision::media::Piece;
 
 /// What a server with no side model answers: llama-server's message, with the flags that seat one.
 pub(super) const NOT_SERVED: &str =
@@ -62,6 +66,14 @@ pub(super) struct Side {
 }
 
 impl Side {
+    /// Whether the side model takes a clip: its projector has a video rule and the delimiters its
+    /// groups go between.
+    pub(super) fn takes_video(&self) -> bool {
+        self.media
+            .as_ref()
+            .is_some_and(|m| m.video_rule().is_some() && m.embedding_delimiters().is_some())
+    }
+
     /// `embed`'s facts read once. A model that names no width is a defect of the model, refused
     /// by name.
     pub(super) fn new(embed: Box<dyn Embed>) -> Side {
@@ -111,7 +123,7 @@ fn answer(state: &State, req: &Request, oai: bool) -> Result<Value, ApiError> {
     let b = body(req)?;
     let request =
         request::Request::parse(&b, &side.name, &side.dims, oai).map_err(ApiError::from)?;
-    let inputs = prepare(side, &request)?;
+    let inputs = prepare(side, &state.video, &request)?;
     let pooled = run(state, side, &inputs)?;
     let n_tokens = inputs.iter().map(|i| i.ids.len()).sum();
     request.answer(&pooled, n_tokens).map_err(ApiError::from)
@@ -156,13 +168,18 @@ pub fn assemble<'a>(
     )
 }
 
+#[cfg(test)]
 fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
+    input_with(side, &VideoSupport::default(), key, v)
+}
+
+fn input_with(side: &Side, video: &VideoSupport, key: &str, v: &Value) -> Result<Input, ApiError> {
     if let Some(parts) = v
         .as_object()
         .and_then(|o| o.get("content"))
         .and_then(Value::as_array)
     {
-        let mut video = match (side.media.as_ref(), parts.first()) {
+        let mut decoded = match (side.media.as_ref(), parts.first()) {
             (Some(model), Some(first))
                 if matches!(media::parse_part(first), Ok(media::Part::Text(prefix))
                     if model.embedding_video().is_some_and(|(text, _)| text == prefix)) =>
@@ -178,7 +195,38 @@ fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
         let mut images = Vec::new();
         let mut audio = Vec::new();
         let mut order = Vec::new();
-        let ordered = parts.iter().map(|part| -> Result<InputPart<'_>, String> {
+        let clips = clips(side, video, parts)?;
+        let ordered = parts.iter().enumerate().flat_map(|(at, part)| {
+            if let Some(clip) = clips.get(&at) {
+                let (begin, end) = side
+                    .media
+                    .as_ref()
+                    .and_then(|m| m.embedding_delimiters())
+                    .expect("a clip was prepared only for a model with delimiters");
+                return clip
+                    .pieces
+                    .iter()
+                    .map(|piece| match piece {
+                        Piece::Text(text) => Ok(InputPart::Text(text)),
+                        Piece::Group(n) => {
+                            let group = &clip.groups[*n];
+                            order.push((false, images.len()));
+                            images.push(media::MediaFeed {
+                                at: 0,
+                                key: group.key,
+                                prepared: Arc::clone(&group.prepared),
+                            });
+                            Ok(InputPart::Media {
+                                begin,
+                                end,
+                                positions: group.prepared.span_len,
+                                kind: "image",
+                            })
+                        }
+                    })
+                    .collect::<Vec<_>>();
+            }
+            vec![(|| -> Result<InputPart<'_>, String> {
             if part.get("type").and_then(Value::as_str) == Some("input_audio") {
                 let a = part.get("input_audio").ok_or("input_audio needs an input_audio object")?;
                 if a.get("format").and_then(Value::as_str) != Some("f32") {
@@ -221,7 +269,7 @@ fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
                     let (begin, end) = model
                         .embedding_delimiters()
                         .ok_or("the side projector has no embedding delimiters")?;
-                    let feed = if let Some(frames) = &mut video {
+                    let feed = if let Some(frames) = &mut decoded {
                         frames
                             .next()
                             .ok_or("video frame count differs from input")?
@@ -245,7 +293,9 @@ fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
                         kind: "image",
                     })
                 }
+                media::Part::Video(_) => Err("a clip part was not prepared".to_owned()),
             }
+            })()]
         });
         let Assembled { ids, spans } = assemble(ordered, &*side.tok, side.ctx).map_err(invalid)?;
         for ((is_audio, index), span) in order.into_iter().zip(spans) {
@@ -265,7 +315,74 @@ fn input(side: &Side, key: &str, v: &Value) -> Result<Input, ApiError> {
     }
 }
 
-fn prepare(side: &Side, request: &request::Request<'_>) -> Result<Vec<Input>, ApiError> {
+/// A clip of an input, probed, planned, decoded and prepared: the side model's text for it and
+/// its groups' feeds.
+struct EmbedClip {
+    pieces: Vec<Piece>,
+    groups: Vec<ReadyGroup>,
+}
+
+/// The input's clips by their part's place, each planned under the context the input's text leaves
+/// and the clips before it, then decoded and prepared. Done before the input's text is tokenized,
+/// because the text the model writes for a clip holds what the plan chose.
+fn clips(
+    side: &Side,
+    video: &VideoSupport,
+    parts: &[Value],
+) -> Result<std::collections::BTreeMap<usize, EmbedClip>, ApiError> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut left: Option<usize> = None;
+    for (at, part) in parts.iter().enumerate() {
+        let Ok(media::Part::Video(clip)) = media::parse_part(part) else {
+            continue;
+        };
+        let model = side
+            .media
+            .as_ref()
+            .ok_or_else(|| invalid("video input needs --embd-mmproj"))?;
+        if model.video_rule().is_none() || model.embedding_delimiters().is_none() {
+            return Err(invalid(media::MediaError::NoVideoRule.to_string()));
+        }
+        let decoder = video.decoder().map_err(|e| invalid(e.to_string()))?;
+        let budget = *left.get_or_insert_with(|| {
+            let text: usize = parts
+                .iter()
+                .filter_map(|p| match media::parse_part(p) {
+                    Ok(media::Part::Text(t)) => Some(side.tok.encode(t).len()),
+                    _ => None,
+                })
+                .sum();
+            video::clip_budget(side.ctx, text)
+        });
+        let bytes = media::base64(clip.data).map_err(|e| invalid(e.to_string()))?;
+        let planned = video::plan_clip(
+            &**model,
+            decoder,
+            Clip::new(bytes, clip.format),
+            budget,
+            video.thread_count(),
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        left = Some(budget.saturating_sub(planned.tokens()));
+        let groups = planned
+            .prepare(&**model)
+            .map_err(|e| invalid(e.to_string()))?;
+        found.insert(
+            at,
+            EmbedClip {
+                pieces: planned.pieces().to_vec(),
+                groups,
+            },
+        );
+    }
+    Ok(found)
+}
+
+fn prepare(
+    side: &Side,
+    video: &VideoSupport,
+    request: &request::Request<'_>,
+) -> Result<Vec<Input>, ApiError> {
     let prefix = request
         .prompt_name
         .map(|name| {
@@ -285,9 +402,14 @@ fn prepare(side: &Side, request: &request::Request<'_>) -> Result<Vec<Input>, Ap
                 let text = v.as_str().ok_or_else(|| {
                     invalid("prompt_name requires text input (a string or an array of strings)")
                 })?;
-                input(side, request.key, &Value::String(format!("{prefix}{text}")))
+                input_with(
+                    side,
+                    video,
+                    request.key,
+                    &Value::String(format!("{prefix}{text}")),
+                )
             } else {
-                input(side, request.key, v)
+                input_with(side, video, request.key, v)
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -299,10 +421,20 @@ fn prepare(side: &Side, request: &request::Request<'_>) -> Result<Vec<Input>, Ap
 
 #[cfg(test)]
 fn inputs(side: &Side, key: &str, value: &Value) -> Result<Vec<Input>, ApiError> {
+    inputs_with(side, &VideoSupport::default(), key, value)
+}
+
+#[cfg(test)]
+fn inputs_with(
+    side: &Side,
+    video: &VideoSupport,
+    key: &str,
+    value: &Value,
+) -> Result<Vec<Input>, ApiError> {
     let body = serde_json::Map::from_iter([(key.to_owned(), value.clone())]);
     let request =
         request::Request::parse(&body, &side.name, &side.dims, true).map_err(ApiError::from)?;
-    prepare(side, &request)
+    prepare(side, video, &request)
 }
 
 /// Every input's pooled vector, through the side model under its lock, each pass after
