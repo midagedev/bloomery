@@ -1338,6 +1338,9 @@ mod iq_sel_kernels {
 /// transcription: the same words, windows, block order and term arithmetic,
 /// the nibbles read through `KVALUES_IQ4NL` instead of the register table
 /// (the integer sums are exact either way, so the two agree bit for bit).
+/// Past the first pass of a lane (more than 32 blocks a row) the device
+/// folds `(a·d)·e` into the running sum with one fused multiply-add, so the
+/// transcription does.
 /// `xq` is the column's int8 codes in value order, `d8` its block scales.
 #[allow(
     clippy::too_many_arguments,
@@ -1372,7 +1375,7 @@ pub fn iq4_nl_row_dot32_host(
             }
         }
         let e = d8[b];
-        f0 += (a as f32 * d) * e;
+        f0 = (a as f32 * d).mul_add(e, f0);
         b += 32;
     }
     f0
