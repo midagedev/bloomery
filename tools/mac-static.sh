@@ -5,10 +5,12 @@
 # recorded first (~/.cache/bloomery/static-times.tsv), combos after lint (one target directory, one cargo lock). Every
 # job at once oversubscribed the Mac and turned timing self-tests red under the load alone.
 #
-# A run with a BASE keys every job but combos (tools/recipes.py static-key: the content of the tree the job reads, the
-# commit of a revision its keyspec names, the command and the environment, the rustflags among it) and skips a job whose
-# key is green in the ledger; a skipped step or block is a summary line of its own. --fresh keys and records but skips
-# nothing (a proof run); a full run (no BASE) keys nothing.
+# A run with a BASE keys every job but lint and combos (tools/recipes.py static-key: the content of the tree the job
+# reads, the commit of a revision its keyspec names, the command and the environment, the rustflags among it) and skips
+# a job whose key is green in the ledger; a skipped step or block is a summary line of its own. Lint and combos source
+# $HOME/opt/bloomery-mac-env.sh (tools/mac-check.sh), which no key reads and which may export rustflags: a key green
+# under one setup would skip the lint under another. --fresh keys and records but skips nothing (a proof run); a full
+# run (no BASE) keys nothing.
 #
 # The cargo lane runs `lint`, not `check`: clippy is rustc plus lints, so every error `cargo check`
 # reports is a clippy error too (proved FAIL-first at birth: a type-error mutant is red under this
@@ -91,7 +93,7 @@ job_lines() {
   shift
   local -a args
   printf 'fmt-check\t-\ttree\ttools/mac-check.sh fmt-check\n'
-  printf 'lint\tcpus=%s\ttree\ttools/mac-check.sh lint\n' "$CARGO_CPUS"
+  printf 'lint\tcpus=%s\t-\ttools/mac-check.sh lint\n' "$CARGO_CPUS"
   printf -v cmdv '%q ' "$@"
   printf 'combos\tafter=lint,cpus=%s\t-\ttools/mac-check.sh %s\n' "$CARGO_CPUS" "${cmdv% }"
   for s in "${SCRIPTS[@]}"; do
@@ -218,6 +220,7 @@ self_test() {
   [ "$(printf '%s\n' "$out" | head -3 | cut -f1,2 | tr '\t\n' ' ')" = "fmt-check - lint cpus=$CARGO_CPUS combos after=lint,cpus=$CARGO_CPUS " ] \
     || fail "the cargo jobs' lines: $(printf '%s\n' "$out" | head -3)"
   grep -qx "combos	after=lint,cpus=$CARGO_CPUS	-	tools/mac-check.sh combos --base main" <<< "$out" || fail "the combos job is not the combos argv, unkeyed"
+  grep -qx "lint	cpus=$CARGO_CPUS	-	tools/mac-check.sh lint" <<< "$out" || fail "the lint job is not mac-check lint, unkeyed (it sources a setup script no key reads): $(printf '%s\n' "$out" | grep '^lint	')"
   for s in "${SCRIPTS[@]}"; do
     [ "$s" = recipes ] || grep -q "^check-$s	" <<< "$out" || fail "check-$s is not a job"
   done
