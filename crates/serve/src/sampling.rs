@@ -26,20 +26,19 @@ pub fn reference_factory() -> SamplerFactory {
 
 /// Index of the largest logit (first of equals). NaN sorts above every number
 /// under `total_cmp`, which surfaces a NaN logit instead of hiding it.
+///
+/// # Panics
+///
+/// On an empty row, which has no largest logit.
 #[must_use]
 pub fn argmax(logits: &[f32]) -> u32 {
-    let mut best = 0usize;
-    for (i, v) in logits.iter().enumerate() {
-        if v.total_cmp(&logits[best]).is_gt() {
-            best = i;
-        }
-    }
-    u32::try_from(best).expect("a vocabulary fits u32")
+    let n = u32::try_from(logits.len()).expect("a vocabulary fits u32");
+    argmax_in(logits, 0..n).expect("a model's vocabulary is non-empty")
 }
 
 /// The largest logit among `ids`, ties to the lowest id and NaN above every
-/// number: [`argmax`]'s rule over a subset, whatever order `ids` comes in.
-/// `None` for an empty set or an id past the row.
+/// number, whatever order `ids` comes in: the rule [`argmax`] applies to a whole
+/// row. `None` for an empty set or an id past the row.
 #[must_use]
 pub fn argmax_in(logits: &[f32], ids: impl IntoIterator<Item = u32>) -> Option<u32> {
     let mut best: Option<(u32, f32)> = None;
@@ -213,5 +212,39 @@ mod tests {
         });
         assert_eq!(greedy(&logits, &[]), 2);
         assert_eq!(greedy(&logits, &[2]), 1, "1.1 - 0.5 < 1.0");
+    }
+
+    /// Ties go to the lowest id, NaN is above every number, and `-0.0` is
+    /// below `0.0`: the order of `total_cmp`, the same over a whole row and
+    /// over a subset.
+    #[test]
+    fn argmax_follows_the_total_order() {
+        let nan = f32::NAN;
+        let neg_nan = f32::from_bits(0xFFC0_0000);
+        let rows: [(&[f32], u32); 10] = [
+            (&[1.0, 3.0, 3.0], 1),
+            (&[3.0, 3.0, 1.0], 0),
+            (&[nan, 1.0], 0),
+            (&[1.0, nan], 1),
+            (&[nan, nan], 0),
+            (&[0.0, -0.0], 0),
+            (&[-0.0, 0.0], 1),
+            (&[neg_nan, f32::NEG_INFINITY], 1),
+            (&[f32::NEG_INFINITY; 3], 0),
+            (&[5.0], 0),
+        ];
+        for (row, want) in rows {
+            assert_eq!(argmax(row), want, "{row:?}");
+            let n = u32::try_from(row.len()).expect("a short row");
+            assert_eq!(argmax_in(row, 0..n), Some(want), "{row:?}");
+            assert_eq!(argmax_in(row, (0..n).rev()), Some(want), "{row:?}");
+        }
+    }
+
+    /// An empty row has no largest logit: a named panic, not an id.
+    #[test]
+    #[should_panic(expected = "a model's vocabulary is non-empty")]
+    fn argmax_of_an_empty_row_is_a_named_panic() {
+        let _ = argmax(&[]);
     }
 }

@@ -34,16 +34,18 @@
 //! id's value goes to the request's log with the text it released
 //! ([`crate::api::logprobs`]). Its stream sends one event a token, the text possibly
 //! empty, and the end of generation's own; a request that asks for nothing
-//! meets one check of its fixed `None` where a row is read and one where a
-//! token's text goes out.
+//! meets one check of its fixed `None` where a step asks for a row, one where
+//! it is read and one where a token's text goes out.
 //!
-//! A request that follows a program ([`GenParams::constraint`]) reads the row
-//! every token too and takes one [`Engine::next`] a token, greedy: each token is
-//! the program's pick from that row ([`crate::constrain::Walk`]) — a forced id
-//! as it stands, otherwise the largest logit among the ids the program allows
-//! there — and once the program is spent the vocabulary's stop ids are the only
-//! ones left. A pick the program cannot make ends the request with a named
-//! error ([`GenError::Constrained`]).
+//! A request that follows a program ([`GenParams::constraint`]) takes one
+//! [`Engine::next`] a token, greedy: each token is the program's pick from the
+//! row ([`crate::constrain::Walk`]) — a forced id as it stands, otherwise the
+//! largest logit among the ids the program allows there — and once the program
+//! is spent the vocabulary's stop ids are the only ones left. The row is read
+//! only where the pick needs it: a token the program fixes (a forced id, the
+//! only child of a choice's node) asks the engine for none unless the request
+//! wants probabilities. A pick the program cannot make ends the request with a
+//! named error ([`GenError::Constrained`]).
 //!
 //! A request runs as a [`Gen`], one engine call at a time, so the engine
 //! thread can make one call of several slots' steps: each running request's
@@ -1645,8 +1647,12 @@ impl Gen {
         &mut self.kept
     }
 
-    /// The logits buffer a step writes, or `None` on a greedy request.
+    /// The logits buffer a step writes, or `None` on a greedy request and on
+    /// a step whose token the program fixes, unless probabilities were asked.
     pub(crate) fn logits_out(&mut self) -> Option<&mut [f32]> {
+        if self.walk.as_mut().is_some_and(Walk::fixed_next) && self.probs.is_none() {
+            return None;
+        }
         out(&mut self.logits)
     }
 
@@ -1877,7 +1883,7 @@ impl Gen {
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
     ) -> Result<(), GenError> {
         let n = self.n;
-        let greedy = slot.next(last, out(&mut self.logits))?;
+        let greedy = slot.next(last, self.logits_out())?;
         slot.prompts[slot.cur] = n;
         self.tim = Timings {
             prompt_n: n - kept.cache_n,
@@ -2115,7 +2121,7 @@ impl Gen {
             match self.pump(sink, tick)? {
                 Need::Done => return self.finish(sink),
                 Need::Step(t) => {
-                    let g = slot.next(t, out(&mut self.logits))?;
+                    let g = slot.next(t, self.logits_out())?;
                     self.stepped(g);
                 }
                 Need::Advance(t) => {

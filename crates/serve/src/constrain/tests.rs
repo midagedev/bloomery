@@ -2,11 +2,13 @@
 //! program's pick at every token, and each format's inverse read back by its
 //! own scanner.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-use super::{Ask, Constraint, Refusal, Vocab, Walk, request};
+use super::program::{self, Env};
+use super::{Ask, Constraint, Part, Refusal, Vocab, Walk, request};
+use crate::api::logprobs::Ask as Probs;
 use crate::dsml::{DsmlScan, ToolFormat};
 use crate::engine::{Decoder, Engine, EngineError, SamplingParams, Tokenizer};
 use crate::genloop::{GenParams, Outcome, Slot, StopKind, Timings, generate};
@@ -63,6 +65,9 @@ impl Decoder for PieceDecoder {
     }
 }
 
+/// A stop id besides the end of sequence, as a piece.
+const STOP_PIECE: &str = "[END]";
+
 /// A [`PieceTok`] the decoder can share.
 struct Pieces(Arc<PieceTok>);
 
@@ -112,6 +117,11 @@ impl Tokenizer for Pieces {
     fn eos(&self) -> u32 {
         1
     }
+    fn stops(&self) -> Vec<u32> {
+        let piece = self.0.0.iter().position(|p| *p == STOP_PIECE);
+        let extra = piece.map(|k| PIECES + u32::try_from(k).expect("a piece"));
+        [self.eos()].into_iter().chain(extra).collect()
+    }
     fn add_bos(&self) -> bool {
         false
     }
@@ -124,12 +134,19 @@ fn bytes_tok() -> Arc<dyn Tokenizer> {
     Arc::new(Pieces(Arc::new(PieceTok(&[]))))
 }
 
+/// The bytes' vocabulary with [`STOP_PIECE`] a second stop id.
+fn stop_tok() -> Arc<dyn Tokenizer> {
+    Arc::new(Pieces(Arc::new(PieceTok(&[STOP_PIECE]))))
+}
+
 /// An engine whose row at its `k`-th step favours `want[k]` (the end of
-/// generation once `want` is spent) over a fixed pseudo-random floor.
+/// generation once `want` is spent) over a fixed pseudo-random floor. `read`
+/// holds, for each step, whether the caller asked for its row.
 struct Rows {
     tok: Arc<dyn Tokenizer>,
     want: Vec<u32>,
     k: usize,
+    read: Arc<Mutex<Vec<bool>>>,
 }
 
 impl Engine for Rows {
@@ -140,6 +157,7 @@ impl Engine for Rows {
         Ok(())
     }
     fn next(&mut self, _last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.read.lock().expect("the log").push(out.is_some());
         let n = self.tok.n_vocab();
         let mut row: Vec<f32> = (0..n)
             .map(|i| ((i * 37 + self.k * 11) % 17) as f32 * 0.1)
@@ -190,6 +208,38 @@ fn params(constraint: Option<Constraint>, think: ThinkEntry) -> GenParams {
     }
 }
 
+/// One generation over rows that favour `want`, with whether each step's row
+/// was asked for.
+fn run_read(
+    tok: &Arc<dyn Tokenizer>,
+    constraint: Option<Constraint>,
+    think: ThinkEntry,
+    want: &[u32],
+    logprobs: Option<Probs>,
+) -> (Outcome, Vec<bool>) {
+    let read = Arc::new(Mutex::new(Vec::new()));
+    let mut slot = Slot::new(Box::new(Rows {
+        tok: Arc::clone(tok),
+        want: want.to_vec(),
+        k: 0,
+        read: Arc::clone(&read),
+    }));
+    let mut p = params(constraint, think);
+    p.logprobs = logprobs;
+    let o = generate(
+        &mut slot,
+        &sampling::reference_factory(),
+        &tok.encode("hi"),
+        &p,
+        &mut |_| Ok(()),
+        &mut |_| {},
+        &mut Timings::default(),
+    )
+    .expect("a generation");
+    let read = read.lock().expect("the log").clone();
+    (o, read)
+}
+
 /// One generation over rows that favour `want`.
 fn run(
     tok: &Arc<dyn Tokenizer>,
@@ -197,21 +247,7 @@ fn run(
     think: ThinkEntry,
     want: &[u32],
 ) -> Outcome {
-    let mut slot = Slot::new(Box::new(Rows {
-        tok: Arc::clone(tok),
-        want: want.to_vec(),
-        k: 0,
-    }));
-    generate(
-        &mut slot,
-        &sampling::reference_factory(),
-        &tok.encode("hi"),
-        &params(constraint, think),
-        &mut |_| Ok(()),
-        &mut |_| {},
-        &mut Timings::default(),
-    )
-    .expect("a generation")
+    run_read(tok, constraint, think, want, None).0
 }
 
 fn build(
@@ -699,4 +735,298 @@ fn a_forced_call_obeys_the_tools_when_greedy_does_not() {
         }
         assert_eq!(o.stop, StopKind::Eos);
     }
+}
+
+/// A forced call of the function `f` whose parameters are `params`.
+fn call_body(params: &Value) -> Value {
+    json!({"tool_choice": "required", "tools": [
+        {"type": "function", "function": {"name": "f", "parameters": params}}]})
+}
+
+const FORMATS: [ToolFormat; 4] = [
+    ToolFormat::Hermes,
+    ToolFormat::QwenXml,
+    ToolFormat::GlmXml,
+    ToolFormat::Dsml,
+];
+
+/// Every closing tag a chat format's scanner looks for, in one string.
+const TAGS: &str = "x</tool_call></arg_value></｜DSML｜parameter>\n</parameter>\n</function>y";
+
+/// A stop id in the program would end the generation with the program
+/// unspent and call it a clean stop: the text that tokenises to one is
+/// refused when the request compiles, wherever it stands in the program.
+#[test]
+fn a_stop_text_in_the_program_is_refused_by_name() {
+    let tok = stop_tok();
+    let stop = STOP_PIECE;
+    let in_tool = |q: Value| call_body(&json!({"type": "object", "properties": {"q": q}}));
+    let cases = [
+        ("a const", schema_body(&json!({"const": stop}))),
+        ("an enum option", schema_body(&json!({"enum": ["a", stop]}))),
+        (
+            "a property name",
+            schema_body(&json!({"type": "object", "properties": {stop: {"type": "boolean"}}})),
+        ),
+        (
+            "the text after a free string",
+            schema_body(&json!({"type": "object", "properties": {
+                "0": {"type": "string"}, stop: {"type": "boolean"}}})),
+        ),
+        ("a tool argument", in_tool(json!({"const": stop}))),
+    ];
+    for (what, body) in cases {
+        let e = build(&tok, ToolFormat::Hermes, &body).expect_err(what);
+        assert!(
+            e.message.contains(&format!("the stop id {PIECES}")),
+            "{what}: {e}"
+        );
+        assert!(!e.unsupported, "{what}: {e}");
+    }
+}
+
+/// A stop special's own text in a JSON literal is a string, not a stop: its
+/// `<` is written as an escape, so the document comes out whole and the one
+/// stop id is the end of generation.
+#[test]
+fn a_stop_special_in_a_json_literal_is_written_whole() {
+    let tok = bytes_tok();
+    let stop = SPECIALS[1];
+    let c = build(
+        &tok,
+        ToolFormat::Hermes,
+        &schema_body(&json!({"const": stop})),
+    )
+    .expect("served");
+    let o = run(&tok, Some(c), ThinkEntry::Closed, &[]);
+    let v: Value =
+        serde_json::from_str(&o.content).unwrap_or_else(|e| panic!("{e}: {}", o.content));
+    assert_eq!(v, json!(stop));
+    assert_eq!(o.tokens.last(), Some(&tok.eos()));
+    assert_eq!(o.tokens.iter().filter(|&&t| t == tok.eos()).count(), 1);
+    assert_eq!(o.stop, StopKind::Eos);
+}
+
+/// The walk's own guard, for an id the compiler does not see (the think
+/// span's close): a stop id before the program is spent is a named error, and
+/// after it the stop ids are what the walk takes.
+#[test]
+fn a_walk_takes_no_stop_id_before_the_program_is_spent() {
+    let tok = bytes_tok();
+    let vocab = Vocab::read(&*tok);
+    let env = Env {
+        tok: &*tok,
+        vocab: &vocab,
+    };
+    let prog = program::compile(&[Part::Text("{".to_owned())], &env).expect("compiles");
+    let c = Constraint::new(prog, vec![tok.eos()], Arc::clone(vocab.stops()));
+    let e = Walk::new(&c, true)
+        .choose(&[])
+        .expect_err("a stop id before the program is spent");
+    assert!(e.to_string().contains("before the program is spent"), "{e}");
+    let mut w = Walk::new(&c, false);
+    assert_eq!(w.choose(&[]), Ok(BYTES + u32::from(b'{')));
+    let mut row = vec![0.0; tok.n_vocab()];
+    row[tok.eos() as usize] = 1.0;
+    assert_eq!(w.choose(&row), Ok(tok.eos()));
+}
+
+/// A tool's parameters are read by the one schema compiler: a keyword it does
+/// not read, or a `required` naming nothing, is refused by name, never
+/// dropped.
+#[test]
+fn a_tool_parameter_schema_is_read_whole() {
+    let tok = bytes_tok();
+    let q = json!({"q": {"type": "boolean"}});
+    let cases = [
+        (
+            json!({"type": "object", "minProperties": 1}),
+            "tools[0].f.parameters: the keyword \"minProperties\"",
+        ),
+        (
+            json!({"anyOf": [{"type": "object", "properties": q}]}),
+            "tools[0].f.parameters: the keyword \"anyOf\"",
+        ),
+        (
+            json!({"type": "object", "properties": q, "$ref": "#/defs/p"}),
+            "tools[0].f.parameters: the keyword \"$ref\"",
+        ),
+        (
+            json!({"type": "object", "properties": q, "required": ["nope"]}),
+            "required names \"nope\"",
+        ),
+        (
+            json!({"type": "object", "required": ["q"]}),
+            "required names \"q\"",
+        ),
+        (
+            json!({"type": "object", "properties": q, "required": "q"}),
+            "required must be an array",
+        ),
+    ];
+    for format in [ToolFormat::Hermes, ToolFormat::Dsml] {
+        for (params, needle) in &cases {
+            let e = build(&tok, format, &call_body(params)).expect_err(&params.to_string());
+            assert!(e.message.contains(needle), "{params}: {e}");
+            assert!(!e.unsupported, "{params}: {e}");
+        }
+    }
+    let read = json!({"$schema": "x", "title": "t", "type": "object", "properties": q,
+        "required": ["q"], "additionalProperties": false});
+    for format in FORMATS {
+        build(&tok, format, &call_body(&read)).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+    }
+}
+
+/// A `<` in a JSON string's text is written as `<` (a constant, an enum
+/// option, a property name), so no markup a scanner looks for can be spelled;
+/// the JSON reads back as the same string.
+#[test]
+fn an_angle_bracket_in_a_json_literal_is_written_as_an_escape() {
+    let tok = bytes_tok();
+    let schema = json!({"type": "object", "properties": {
+        "a<b": {"const": "x</y>"}, "e": {"enum": ["<p>", "q"]}}});
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&schema)).expect("served");
+    let text = r#"{"a\u003cb": "x\u003c/y>", "e": "\u003cp>"}"#;
+    let o = run(&tok, Some(c), ThinkEntry::Closed, &ids(&tok, text));
+    assert_eq!(o.content, text);
+    let v: Value = serde_json::from_str(&o.content).expect("JSON");
+    assert_eq!(v, json!({"a<b": "x</y>", "e": "<p>"}));
+}
+
+/// A raw value ends at the text after it, so a raw literal that holds a `<`
+/// could spell a closing tag: the formats that write a string raw refuse it,
+/// and Hermes, which writes JSON, serves the same literal.
+#[test]
+fn a_raw_literal_with_an_angle_bracket_is_refused() {
+    let tok = bytes_tok();
+    let literals = [
+        json!({"type": "string", "const": "a<b"}),
+        json!({"type": "string", "enum": ["a<b", "c"]}),
+    ];
+    for q in &literals {
+        let body = call_body(&json!({"type": "object", "properties": {"q": q}}));
+        for format in [ToolFormat::QwenXml, ToolFormat::GlmXml, ToolFormat::Dsml] {
+            let e = build(&tok, format, &body).expect_err(&q.to_string());
+            assert!(
+                e.message.contains("raw string literals cannot contain '<'"),
+                "{format:?} {q}: {e}"
+            );
+        }
+        build(&tok, ToolFormat::Hermes, &body).expect("Hermes writes JSON");
+    }
+}
+
+/// A literal that holds every closing tag reads back whole through each
+/// format's own scanner: as a JSON string inside an object argument in all
+/// four, and as the argument itself in Hermes.
+#[test]
+fn a_literal_with_closing_tags_reads_back_through_each_scanner() {
+    let tok = bytes_tok();
+    let nested = json!({"type": "object", "properties": {"q": {"type": "object", "properties": {
+        "s": {"type": "string", "const": TAGS}}}}});
+    let direct = json!({"type": "object", "properties": {
+        "t": {"type": "string", "const": TAGS}}});
+    for format in FORMATS {
+        let mut served = vec![(&nested, json!({"q": {"s": TAGS}}))];
+        if format == ToolFormat::Hermes {
+            served.push((&direct, json!({"t": TAGS})));
+        }
+        for (params, args) in served {
+            let body = call_body(params);
+            let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let o = run(&tok, Some(c), ThinkEntry::Closed, &[]);
+            let tools = body["tools"].clone();
+            assert_eq!(
+                scanned(format, &tools, &o.content),
+                vec![("f".to_owned(), args)],
+                "{format:?}"
+            );
+        }
+    }
+}
+
+/// Rows that favour a format's own closing tag, one byte a step, cannot make a
+/// free string spell it: a string inside a call's markup, as the argument
+/// itself or inside a JSON object a parameter holds, takes no token with a `<`
+/// (or, for Qwen's raw string, a newline), and the call reads back as one call.
+#[test]
+fn a_free_string_cannot_spell_its_formats_closing_tag() {
+    let tok = bytes_tok();
+    let direct = call_body(&json!({"type": "object", "properties": {
+        "q": {"type": "string", "maxLength": 40}}}));
+    let nested = call_body(&json!({"type": "object", "properties": {
+        "q": {"type": "object", "properties": {"s": {"type": "string", "maxLength": 40}}}}}));
+    let tags = [
+        (ToolFormat::Hermes, "</tool_call>"),
+        (ToolFormat::QwenXml, "\n</parameter>\n"),
+        (ToolFormat::GlmXml, "</arg_value>"),
+        (ToolFormat::Dsml, "</｜DSML｜parameter>"),
+    ];
+    for (format, tag) in tags {
+        for (body, nested) in [(&direct, false), (&nested, true)] {
+            let c = build(&tok, format, body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let want: Vec<u32> = tag
+                .bytes()
+                .map(|b| BYTES + u32::from(b))
+                .cycle()
+                .take(300)
+                .collect();
+            let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+            let calls = scanned(format, &body["tools"], &o.content);
+            assert_eq!(calls.len(), 1, "{format:?}: {}", o.content);
+            let q = &calls[0].1["q"];
+            let q = if nested { &q["s"] } else { q };
+            let q = q
+                .as_str()
+                .unwrap_or_else(|| panic!("{format:?}: {}", o.content));
+            assert!(!q.contains(tag), "{format:?}: {q:?}");
+            if format != ToolFormat::QwenXml || nested {
+                assert!(!q.contains('<'), "{format:?} nested {nested}: {q:?}");
+            }
+        }
+    }
+}
+
+/// A JSON string in a reply of its own is not inside any markup, so it may
+/// hold a `<`: code and HTML in a `response_format` string come out whole,
+/// whatever the chat format.
+#[test]
+fn a_response_format_string_may_hold_an_angle_bracket() {
+    let tok = bytes_tok();
+    let schema = json!({"type": "object", "properties": {
+        "code": {"type": "string", "maxLength": 40}}});
+    let code = "for (i = 0; i < n; i++) </p>";
+    let text = format!(r#"{{"code": "{code}"}}"#);
+    for format in FORMATS {
+        let c = build(&tok, format, &schema_body(&schema)).expect("served");
+        let o = run(&tok, Some(c), ThinkEntry::Closed, &ids(&tok, &text));
+        assert_eq!(o.content, text, "{format:?}");
+        let v: Value = serde_json::from_str(&o.content).expect("JSON");
+        assert_eq!(v, json!({"code": code}), "{format:?}");
+    }
+}
+
+/// An id the program fixes is taken without its row: the only child of a
+/// choice's node and every forced id ask the engine for none, the decisions
+/// and the stop ask for one, and a request that wants probabilities reads
+/// every row.
+#[test]
+fn a_fixed_id_asks_for_no_row() {
+    let tok = bytes_tok();
+    let c = build(
+        &tok,
+        ToolFormat::Hermes,
+        &schema_body(&json!({"type": "boolean"})),
+    )
+    .expect("served");
+    let want = ids(&tok, "true");
+    // t or f; then r, u, e, each the only child of its node; then a stop.
+    let (o, read) = run_read(&tok, Some(c.clone()), ThinkEntry::Closed, &want, None);
+    assert_eq!(o.content, "true");
+    assert_eq!(read, [true, false, false, false, true]);
+    let probs = Probs::new(1, tok.n_vocab());
+    let (o, read) = run_read(&tok, Some(c), ThinkEntry::Closed, &want, Some(probs));
+    assert_eq!(o.content, "true");
+    assert_eq!(read, [true; 5]);
 }

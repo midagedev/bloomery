@@ -11,8 +11,15 @@
 //! - Any other keyword (`$ref`, `anyOf`, `items`, `pattern`, `minLength`,
 //!   `format`, a bare `type: integer`, ...) is a refusal naming it and its path.
 //!
-//! The JSON text is compact with one space after `:` and `,`. A tool call's
-//! arguments use the same subset, written in the style the chat format reads.
+//! The JSON text is compact with one space after `:` and `,`. A `<` in a JSON
+//! string's text (a constant, an enum option, a property name) is written as
+//! `\u003c`, and a free JSON string inside a tool call's markup takes no token
+//! with a `<` ([`Style::JsonInMarkup`]), so the text never spells a tag a chat
+//! format's scanner looks for; a free string in a reply of its own may hold
+//! one. A raw string literal (a tool argument in a format that writes strings
+//! unquoted) holding a `<` is a refusal. A tool call's arguments use the same
+//! subset, written in the style the chat format reads; its parameters are read
+//! as one object by [`value`].
 
 use serde_json::{Map, Value};
 
@@ -64,10 +71,10 @@ fn type_of(v: &Value) -> &'static str {
 }
 
 /// The text a JSON string body spells `s` as: the escapes of its characters,
-/// without the quotes.
+/// without the quotes, and a `<` as `\u003c`.
 fn json_inner(s: &str) -> String {
     let q = Value::String(s.to_owned()).to_string();
-    q[1..q.len() - 1].to_owned()
+    q[1..q.len() - 1].replace('<', "\\u003c")
 }
 
 /// A scalar a choice or a constant can take.
@@ -115,7 +122,7 @@ impl Scalar {
     /// text.
     fn body(&self, style: Style) -> String {
         match self {
-            Scalar::Str(s) if style == Style::Json => json_inner(s),
+            Scalar::Str(s) if style.is_json() => json_inner(s),
             Scalar::Str(s) => s.clone(),
             Scalar::Int(i) => i.to_string(),
             Scalar::Bool(b) => b.to_string(),
@@ -124,7 +131,7 @@ impl Scalar {
 
     /// Whether the value is written between quotes.
     fn quoted(&self, style: Style) -> bool {
-        matches!(self, Scalar::Str(_)) && style == Style::Json
+        matches!(self, Scalar::Str(_)) && style.is_json()
     }
 }
 
@@ -154,8 +161,8 @@ fn only(o: &Map<String, Value>, kind: &str, allowed: &[&str], path: &str) -> Res
 }
 
 /// `node` as the parts that write one value of it. `style` is how a string is
-/// written: quoted and escaped (JSON), or as the raw text a chat format's
-/// string argument holds.
+/// written: quoted and escaped (JSON, in a reply of its own or inside a chat
+/// format's markup), or as the raw text a chat format's string argument holds.
 pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>, Refusal> {
     let Some(o) = node.as_object() else {
         return Err(refuse(
@@ -185,11 +192,14 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
             ));
         }
     };
+    if style == Style::Raw {
+        raw_literals_hold_no_tag(o, path)?;
+    }
     if let Some(c) = o.get("const") {
         only(o, "const", &["const", "type"], path)?;
         let s = Scalar::of(c, &format!("{path}.const"))?;
         agree(ty, s.kind(), path)?;
-        return Ok(spell(&s, style, true));
+        return Ok(spell(&s, style));
     }
     if let Some(e) = o.get("enum") {
         only(o, "enum", &["enum", "type"], path)?;
@@ -203,7 +213,7 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
                 &["type", "properties", "required", "additionalProperties"],
                 path,
             )?;
-            object(o, path)
+            object(o, style.nested(), path)
         }
         Some("string") => {
             only(o, "type string", &["type", "maxLength"], path)?;
@@ -221,7 +231,7 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
                 ),
             };
             Ok(match style {
-                Style::Json => vec![
+                Style::Json | Style::JsonInMarkup => vec![
                     Part::Text("\"".to_owned()),
                     Part::Free { max, style },
                     Part::Text("\"".to_owned()),
@@ -254,6 +264,26 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
     }
 }
 
+/// Refuses a string literal (`const` or `enum`) with a `<` where the value is
+/// written raw: a raw value ends at the text after it, and a `<` is how that
+/// text begins.
+fn raw_literals_hold_no_tag(o: &Map<String, Value>, path: &str) -> Result<(), Refusal> {
+    let literals = o.get("const").into_iter().chain(
+        o.get("enum")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten(),
+    );
+    if literals.filter_map(Value::as_str).any(|s| s.contains('<')) {
+        return Err(refuse(
+            path,
+            "raw string literals cannot contain '<': the chat format reads the value up to its \
+             closing tag",
+        ));
+    }
+    Ok(())
+}
+
 /// A node's `type` against the kind of its values.
 fn agree(ty: Option<&str>, kind: &str, path: &str) -> Result<(), Refusal> {
     match ty {
@@ -266,10 +296,13 @@ fn agree(ty: Option<&str>, kind: &str, path: &str) -> Result<(), Refusal> {
 }
 
 /// One scalar written as parts: quoted when it is a JSON string.
-fn spell(s: &Scalar, style: Style, with_quotes: bool) -> Vec<Part> {
-    let q = with_quotes && s.quoted(style);
+fn spell(s: &Scalar, style: Style) -> Vec<Part> {
     let body = s.body(style);
-    vec![Part::Text(if q { format!("\"{body}\"") } else { body })]
+    vec![Part::Text(if s.quoted(style) {
+        format!("\"{body}\"")
+    } else {
+        body
+    })]
 }
 
 fn enumeration(
@@ -315,7 +348,7 @@ fn enumeration(
         }
     }
     if values.len() == 1 {
-        return Ok(spell(&values[0], style, true));
+        return Ok(spell(&values[0], style));
     }
     let quoted = values[0].quoted(style);
     let pick = Part::Pick(
@@ -338,8 +371,9 @@ fn enumeration(
     })
 }
 
-/// An object written as JSON: every property, in the schema's order.
-fn object(o: &Map<String, Value>, path: &str) -> Result<Vec<Part>, Refusal> {
+/// An object written as JSON: every property, in the schema's order, its
+/// strings in the style `inner`.
+fn object(o: &Map<String, Value>, inner: Style, path: &str) -> Result<Vec<Part>, Refusal> {
     let props = match o.get("properties") {
         None => None,
         Some(Value::Object(p)) => Some(p),
@@ -378,19 +412,17 @@ fn object(o: &Map<String, Value>, path: &str) -> Result<Vec<Part>, Refusal> {
             path: format!("{path}.properties.{key}"),
         })
         .collect();
-    object_of(&args)
+    object_of(&args, inner)
 }
 
-/// An object whose properties are `args`, as JSON.
-fn object_of(args: &[Arg<'_>]) -> Result<Vec<Part>, Refusal> {
+/// An object whose properties are `args`, as JSON with its strings in the
+/// style `inner`.
+fn object_of(args: &[Arg<'_>], inner: Style) -> Result<Vec<Part>, Refusal> {
     let mut parts = vec![Part::Text("{".to_owned())];
     for (i, a) in args.iter().enumerate() {
         let sep = if i == 0 { "" } else { ", " };
-        parts.push(Part::Text(format!(
-            "{sep}{}: ",
-            Value::String(a.key.to_owned())
-        )));
-        parts.extend(value(a.schema, Style::Json, &a.path)?);
+        parts.push(Part::Text(format!("{sep}\"{}\": ", json_inner(a.key))));
+        parts.extend(value(a.schema, inner, &a.path)?);
     }
     parts.push(Part::Text("}".to_owned()));
     Ok(parts)
@@ -410,9 +442,9 @@ pub(crate) struct Fun<'a> {
 }
 
 impl Fun<'_> {
-    /// The arguments as one JSON object.
+    /// The arguments as one JSON object inside the call's markup.
     pub(crate) fn object(&self) -> Result<Vec<Part>, Refusal> {
-        object_of(&self.args)
+        object_of(&self.args, Style::JsonInMarkup)
     }
 }
 
@@ -480,26 +512,25 @@ fn funs<'a>(tools: &'a Value) -> Result<Vec<Fun<'a>>, Refusal> {
                         format!("the parameters' type must be \"object\", not {t}"),
                     ));
                 }
-                match p.get("properties") {
-                    None => Vec::new(),
-                    Some(Value::Object(props)) => props
-                        .iter()
-                        .map(|(key, schema)| {
-                            plain_name("the parameter name", key, &here)?;
-                            Ok(Arg {
-                                key,
-                                schema,
-                                path: format!("{here}.properties.{key}"),
-                            })
+                // The schema compiler reads the whole object, so a keyword the
+                // subset does not read is a refusal here and never ignored.
+                let mut root = p.clone();
+                root.entry("type")
+                    .or_insert_with(|| Value::String("object".to_owned()));
+                value(&Value::Object(root), Style::JsonInMarkup, &here)?;
+                p.get("properties")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                    .map(|(key, schema)| {
+                        plain_name("the parameter name", key, &here)?;
+                        Ok(Arg {
+                            key,
+                            schema,
+                            path: format!("{here}.properties.{key}"),
                         })
-                        .collect::<Result<_, Refusal>>()?,
-                    Some(v) => {
-                        return Err(refuse(
-                            &here,
-                            format!("properties must be an object, not {}", type_of(v)),
-                        ));
-                    }
-                }
+                    })
+                    .collect::<Result<_, Refusal>>()?
             }
             Some(v) => {
                 return Err(refuse(

@@ -282,11 +282,18 @@ binary's `--help`.
   (every property written, in the schema's order), string, integer and boolean enums, `const`, booleans, and free
   strings with an optional `maxLength`. The request decodes greedily, one step a token (the largest logit among the ids
   the schema allows), so `temperature` defaults to 0.
-- Refused by name: any other schema keyword (`$ref`, `anyOf`, `items`, `pattern`, `minLength`, an `integer` with no
-  enum), `json_object`, a top-level `json_schema`, `grammar`, a schema beside a forced call, `temperature` above 0, the
-  penalties, `ignore_eos` and `reasoning_budget`. An enum whose options tokenise so that one is a prefix of another
-  (`[1, 10]` on a vocabulary that splits digits) is a 400. A free string in a tool call's XML markup is one line (Qwen) or
-  holds no `<` (GLM, DSML), since the value ends at the text after it.
+- Refused by name: any other schema keyword (`$ref`, `anyOf`, `items`, `pattern`, `minLength`, `minProperties`, an
+  `integer` with no enum; a forced tool's `parameters` are read whole by the same rules, so a root `anyOf`, a `$ref` or a
+  `required` name no property has is a 400), `json_object`, a top-level `json_schema`, `grammar`, a schema beside a
+  forced call, `temperature` above 0, the penalties, `ignore_eos` and `reasoning_budget`. An enum whose options tokenise
+  so that one is a prefix of another (`[1, 10]` on a vocabulary that splits digits) is a 400, and so is a constant, enum
+  option or property name whose text tokenises to a stop id.
+- A `<` never reaches a tool call's markup as data. A free JSON string inside a tool call (Hermes' arguments, or an
+  object that a Qwen, GLM or DSML parameter holds) takes no token with a `<`; a free string in a `response_format`
+  reply may hold one, so code and HTML come out whole. A `<` in a JSON constant, enum option or property name is
+  written as `\u003c` in both, which reads back as the same string. A string written raw in a tool call's XML markup is
+  one line (Qwen) or holds no `<` (GLM, DSML), since the value ends at the text after it, and a raw constant or enum
+  option with a `<` is a 400.
 - A pinned nightly with a pinned cuda-oxide revision from our fork ([`BUILD.md`](BUILD.md)).
 
 In progress: serving on N cards for every model; Clef from the IQ and Q2_K files; DeepSeek-V4-Flash-0731.

@@ -20,11 +20,14 @@
 //!   follows. The rest of that text is tokenised canonically from where the
 //!   end token stopped.
 //! - Once the program is spent the only allowed ids are the vocabulary's
-//!   stops.
+//!   stops. A stop id inside the program would end the generation with the
+//!   program unspent, so [`compile`] refuses any text that tokenises to one
+//!   and the walk refuses to take one before the program is spent.
 //!
 //! The pick at every decision is the largest logit among the allowed ids, ties
 //! to the lowest id ([`sampling::argmax_in`]): the engine's argmax rule over
-//! the allowed set. The walk reads no row at a forced id.
+//! the allowed set. The walk reads no row at a forced id, nor at the only
+//! child of a choice's node ([`Walk::fixed_next`]).
 
 use std::sync::Arc;
 
@@ -36,12 +39,33 @@ use crate::sampling;
 /// How a free string is quoted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Style {
-    /// A JSON string: its quotes are the surrounding text's, and its body takes
-    /// no `"`, no `\` and no control character.
+    /// A JSON string in a reply of its own: its quotes are the surrounding
+    /// text's, and its body takes no `"`, no `\` and no control character.
     Json,
+    /// A JSON string inside a chat format's markup: the body also takes no
+    /// `<`, since a closing tag begins with one and would end the markup's
+    /// value inside the string.
+    JsonInMarkup,
     /// Raw text that ends at the text after it: the body takes no token that
     /// holds that text's first byte.
     Raw,
+}
+
+impl Style {
+    /// Whether a string is written as JSON, quoted and escaped.
+    pub(crate) fn is_json(self) -> bool {
+        matches!(self, Style::Json | Style::JsonInMarkup)
+    }
+
+    /// The style of a JSON string inside an object written in this style: a
+    /// raw value is markup's, so the strings in an object it holds are in
+    /// markup.
+    pub(crate) fn nested(self) -> Style {
+        match self {
+            Style::Json => Style::Json,
+            Style::JsonInMarkup | Style::Raw => Style::JsonInMarkup,
+        }
+    }
 }
 
 /// A program as text.
@@ -86,6 +110,16 @@ struct Trie {
     subs: Vec<Option<Arc<Program>>>,
 }
 
+impl Trie {
+    /// The id and node of the only child of `node`, when it has one.
+    fn only_kid(&self, node: usize) -> Option<(u32, usize)> {
+        match self.nodes[node].kids.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Node {
     /// Child nodes by the id that reaches them, ascending.
@@ -114,6 +148,18 @@ fn refuse(message: String) -> Refusal {
     Refusal::invalid(message)
 }
 
+/// Refuses `ids`, the tokens of `text`, when one is a stop id: the generation
+/// would end there with the program unspent.
+fn no_stop(ids: &[u32], text: &str, env: &Env<'_>) -> Result<(), Refusal> {
+    match ids.iter().find(|id| env.vocab.stops().contains(id)) {
+        Some(id) => Err(refuse(format!(
+            "the text {text:?} tokenises to the stop id {id}: a stop id cannot occur before the \
+             program is spent"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Joins neighbouring forced texts, so each is tokenised whole.
 fn merged(parts: &[Part]) -> Vec<Part> {
     let mut out: Vec<Part> = Vec::new();
@@ -134,7 +180,11 @@ pub(crate) fn compile(parts: &[Part], env: &Env<'_>) -> Result<Program, Refusal>
     let mut i = 0;
     while i < parts.len() {
         match &parts[i] {
-            Part::Text(t) => steps.push(Step::Forced(env.tok.encode(t))),
+            Part::Text(t) => {
+                let ids = env.tok.encode(t);
+                no_stop(&ids, t, env)?;
+                steps.push(Step::Forced(ids));
+            }
             Part::Pick(alts) => {
                 if alts.iter().any(|a| !a.then.is_empty()) && i + 1 != parts.len() {
                     return Err(refuse(
@@ -173,6 +223,7 @@ fn trie(alts: &[Alt], env: &Env<'_>) -> Result<Trie, Refusal> {
                 alt.text
             )));
         }
+        no_stop(&ids, &alt.text, env)?;
         let clash = |other: usize| {
             refuse(format!(
                 "the options {:?} and {:?} tokenise so that one is a prefix of the other \
@@ -222,13 +273,17 @@ fn free_step(
 ) -> Result<FreeStep, Refusal> {
     let first = tail.as_bytes()[0];
     let class = match style {
-        Style::Json => {
+        Style::Json | Style::JsonInMarkup => {
             if first != b'"' {
                 return Err(refuse(
                     "internal: a JSON string's closing text does not begin with a quote".to_owned(),
                 ));
             }
-            env.vocab.json_class()
+            if style == Style::Json {
+                env.vocab.json_class()
+            } else {
+                env.vocab.json_class_in_markup()
+            }
         }
         Style::Raw => {
             if !first.is_ascii() {
@@ -239,12 +294,12 @@ fn free_step(
             env.vocab.raw_class(first)
         }
     };
-    let ends: Vec<(u32, Vec<u32>)> = env
-        .vocab
-        .prefixes_of(tail)
-        .into_iter()
-        .map(|(id, len)| (id, env.tok.encode(&tail[len..])))
-        .collect();
+    let mut ends: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (id, len) in env.vocab.prefixes_of(tail) {
+        let rest = env.tok.encode(&tail[len..]);
+        no_stop(&rest, tail, env)?;
+        ends.push((id, rest));
+    }
     if ends.is_empty() {
         return Err(refuse(format!(
             "no token of the vocabulary is a prefix of {tail:?}, so a free string before it \
@@ -387,8 +442,25 @@ impl Walk {
         }
     }
 
+    /// Whether the next id is the program's alone to give: a forced id, or the
+    /// only child of a choice's node. [`Walk::choose`] reads no row for it.
+    pub(crate) fn fixed_next(&mut self) -> bool {
+        self.settle();
+        if !self.forced.is_empty() {
+            return true;
+        }
+        match &self.ctx {
+            Ctx::Trie { prog, step, node } => match &prog.steps[*step] {
+                Step::Pick(t) => t.only_kid(*node).is_some(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// The next id: the forced one, or the largest logit of `row` among the
-    /// ids the program allows here; the walk then stands past it.
+    /// ids the program allows here; the walk then stands past it. A stop id
+    /// before the program is spent is an error.
     pub(crate) fn choose(&mut self, row: &[f32]) -> Result<u32, StepError> {
         self.settle();
         let id = match self.forced.pop() {
@@ -404,6 +476,9 @@ impl Walk {
                 Ctx::Idle => return Err(self.stuck("the walk stands between steps")),
             },
         };
+        if self.stops.contains(&id) && !matches!(self.ctx, Ctx::Done) {
+            return Err(self.stuck("a stop id occurs before the program is spent"));
+        }
         self.taken += 1;
         Ok(id)
     }
@@ -415,7 +490,8 @@ impl Walk {
         }
     }
 
-    /// One id of the choice at `node`: the largest logit among its children.
+    /// One id of the choice at `node`: its only child, else the largest logit
+    /// among its children.
     fn pick_option(
         &mut self,
         row: &[f32],
@@ -427,8 +503,10 @@ impl Walk {
             return Err(self.stuck("a choice context stands on another step"));
         };
         let kids = &t.nodes[node].kids;
-        let picked = sampling::argmax_in(row, kids.iter().map(|&(id, _)| id))
-            .and_then(|id| kids.iter().find(|&&(k, _)| k == id).map(|&(_, c)| (id, c)));
+        let picked = t.only_kid(node).or_else(|| {
+            sampling::argmax_in(row, kids.iter().map(|&(id, _)| id))
+                .and_then(|id| kids.iter().find(|&&(k, _)| k == id).map(|&(_, c)| (id, c)))
+        });
         let Some((id, child)) = picked else {
             self.ctx = Ctx::Trie { prog, step, node };
             return Err(self.stuck("the row holds none of the option ids"));

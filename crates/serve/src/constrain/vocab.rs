@@ -3,8 +3,8 @@
 //! A free string may take any token whose text its quoting lets through, so
 //! which tokens those are is a property of the vocabulary alone: one decode of
 //! every id at bind, not a scan a request or a step repeats. The class of a
-//! JSON string (no `"`, no `\`, no control character) is built here; the class
-//! of a raw value, which ends at a fixed text, depends on that text's first byte
+//! JSON string (no `"`, no `\`, no control character; and, inside a chat
+//! format's markup, no `<`) is built here; the class of a raw value, which ends at a fixed text, depends on that text's first byte
 //! and is built on first use for each byte (a handful of bytes ever occur).
 //! A token's text is its single-id decode: a byte-level token that is half a
 //! character decodes to the replacement character, which holds none of the
@@ -69,7 +69,7 @@ impl Class {
 }
 
 /// The vocabulary read once: every id's text, its length in characters, the
-/// stop ids, and the JSON-string class.
+/// stop ids, and the two JSON-string classes.
 pub(crate) struct Vocab {
     /// Every id's text, concatenated; id `i` is `text[at[i]..at[i + 1]]`.
     text: String,
@@ -79,6 +79,8 @@ pub(crate) struct Vocab {
     first: Vec<Vec<u32>>,
     stops: Arc<[u32]>,
     json: Class,
+    /// `json` without the tokens that hold a `<`.
+    json_in_markup: Class,
     /// The raw classes built so far, by the byte their value may not hold.
     raw: Mutex<HashMap<u8, Class>>,
 }
@@ -93,6 +95,7 @@ impl Vocab {
         let mut chars = Vec::with_capacity(n);
         let mut first: Vec<Vec<u32>> = vec![Vec::new(); 256];
         let mut json = Bits::new(n);
+        let mut json_in_markup = Bits::new(n);
         for id in 0..n {
             let id32 = u32::try_from(id).expect("a vocabulary fits u32");
             at.push(u32::try_from(text.len()).expect("the vocabulary's text fits u32"));
@@ -105,9 +108,12 @@ impl Vocab {
             let stop = stops.contains(&id32);
             let safe = !piece.is_empty()
                 && !stop
-                && !piece.bytes().any(|b| b == b'"' || b == b'\\' || b < 0x20);
+                && !piece.bytes().any(|b| matches!(b, b'"' | b'\\') || b < 0x20);
             if safe {
                 json.set(id);
+                if !piece.contains('<') {
+                    json_in_markup.set(id);
+                }
             }
             text.push_str(&piece);
         }
@@ -116,6 +122,10 @@ impl Vocab {
         Vocab {
             json: Class {
                 ok: Arc::new(json),
+                chars: Arc::clone(&chars),
+            },
+            json_in_markup: Class {
+                ok: Arc::new(json_in_markup),
                 chars: Arc::clone(&chars),
             },
             text,
@@ -138,6 +148,12 @@ impl Vocab {
     /// The tokens a JSON string's body may take.
     pub(crate) fn json_class(&self) -> Class {
         self.json.clone()
+    }
+
+    /// The tokens a JSON string's body may take inside a chat format's
+    /// markup: [`Vocab::json_class`] without a token that holds a `<`.
+    pub(crate) fn json_class_in_markup(&self) -> Class {
+        self.json_in_markup.clone()
     }
 
     /// The tokens whose text holds no `stop` byte: the body of a raw value
