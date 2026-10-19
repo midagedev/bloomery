@@ -3747,7 +3747,8 @@ EOS
     done < "$dir.left"
     echo 'probe done' # a probe that ended early on a failed command has no such line, and is not a pass
   }
-  mutant_of leak-noend 's|^    ! declare -F end_batches > /dev/null \|\| end_batches \|\| true$|    true # MUTANT leak-noend|' '# MUTANT leak-noend$'
+  # The mutant drops both halves of the cleanup: with the wait alone the part sits until its batch ends by itself.
+  mutant_of leak-noend 's|^    ! declare -F end_batches > /dev/null \|\| end_batches \|\| true$|    true # MUTANT leak-noend|; s|^    wait \|\| true # the part.s background jobs .*$|    true # MUTANT leak-noend wait|' '# MUTANT leak-noend wait$'
   ( leak_probe abort "$t/tools/gate-batch.sh" > "$t/leak-abort.res" ) &
   ( leak_probe term "$t/tools/gate-batch.sh" > "$t/leak-term.res" ) &
   ( leak_probe abort "$t/tools/gate-batch-leak-noend.sh" > "$t/leak-abort-m.res" ) &
@@ -3757,10 +3758,10 @@ EOS
   else fail 'part exit: a part that fails a command mid-case leaves no batch running' "$(cat "$t/leak-abort.res")"; fi
   if [ "$(cat "$t/leak-term.res")" = 'probe done' ]; then pass 'part exit: a part that is sent TERM mid-case leaves no batch running'
   else fail 'part exit: a part that is sent TERM mid-case leaves no batch running' "$(cat "$t/leak-term.res")"; fi
-  if grep -Eq '^ *[0-9]+ ' "$t/leak-abort-m.res" && [ "$(tail -n 1 "$t/leak-abort-m.res")" = 'probe done' ]; then pass 'part exit mutant: without the end of the batches a part that fails a command leaves its batch running'
-  else fail 'part exit mutant: without the end of the batches a part that fails a command leaves its batch running' "$(cat "$t/leak-abort-m.res")"; fi
-  if grep -Eq '^ *[0-9]+ ' "$t/leak-term-m.res" && [ "$(tail -n 1 "$t/leak-term-m.res")" = 'probe done' ]; then pass 'part exit mutant: without the end of the batches a part sent TERM leaves its batch running'
-  else fail 'part exit mutant: without the end of the batches a part sent TERM leaves its batch running' "$(cat "$t/leak-term-m.res")"; fi
+  if grep -Eq '^ *[0-9]+ ' "$t/leak-abort-m.res" && [ "$(tail -n 1 "$t/leak-abort-m.res")" = 'probe done' ]; then pass 'part exit mutant: without the end of the batches and the wait a part that fails a command leaves its batch running'
+  else fail 'part exit mutant: without the end of the batches and the wait a part that fails a command leaves its batch running' "$(cat "$t/leak-abort-m.res")"; fi
+  if grep -Eq '^ *[0-9]+ ' "$t/leak-term-m.res" && [ "$(tail -n 1 "$t/leak-term-m.res")" = 'probe done' ]; then pass 'part exit mutant: without the end of the batches and the wait a part sent TERM leaves its batch running'
+  else fail 'part exit mutant: without the end of the batches and the wait a part sent TERM leaves its batch running' "$(cat "$t/leak-term-m.res")"; fi
   fi
   fi
   # One row per case (seconds, then the name). A miss is a case the summary cannot name.
