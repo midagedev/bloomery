@@ -1619,7 +1619,8 @@ dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
 # request's drafted passes against its plain steps (sampdraft).
 # A chat clip and an embeddings clip against a mock decoder (src/media, src/api, src/arch/gemma4v): both part spellings, the
 # plan before the text, the placeholders paired by id and order, an embeddings input's images and audio charged before its clips
-# are planned, every named refusal, `/props` `modalities.video`.
+# are planned, every named refusal, `/props` `modalities.video`. The decoder's own subprocess rules (src/video): an ffprobe past
+# its limit and an ffmpeg that does not end after its last frame are killed and named; a decode is taken only when ffmpeg ended well.
 gate-serve:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test callstream --test limits --test anthropic --test penalty --test sampdraft -- --include-ignored --nocapture'
 
@@ -1627,7 +1628,8 @@ gate-serve:
 # naming its index, probed (its frame count counted by decoding where the container states none), planned by a tick rule
 # and a linspace rule and decoded at the plan's indices at one and four threads, the same frames; a clip with audio longer than
 # its video probes the video's frames; a decode past the file's end and a file that is no video as named errors; a two-stream
-# clip decodes the stream the probe measured; a 60 s 1080p H.264 clip's plan arrives whole and in order. Needs ffmpeg and
+# clip decodes the stream the probe measured; a clip with one damaged packet, its header intact, is a named error with no
+# frame handed on; a 60 s 1080p H.264 clip's plan arrives whole and in order. Needs ffmpeg and
 # ffprobe 5.1 or newer on PATH (the gate fails by name without them). No card, no lease.
 gate-serve-video:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --test video -- --include-ignored --nocapture'

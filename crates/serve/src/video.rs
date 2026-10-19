@@ -6,8 +6,8 @@
 //! count them, on the decoder's threads and within [`PROBE_LIMIT`]), planned by the one planner
 //! (`vision::video::plan`), and decoded by ffmpeg at its native size: only the planned frames,
 //! streamed one at a time, each handed on as soon as it arrives so the request thread resizes and
-//! patches a group while ffmpeg decodes toward the next ([`video_part`]). Memory is one group of
-//! frames and the patches. Both commands read the clip's file only through the demuxers of
+//! patches a group while ffmpeg decodes toward the next ([`PlannedClip::prepare`]). Memory is one
+//! group of frames and the patches. Both commands read the clip's file only through the demuxers of
 //! [`VIDEO_FORMATS`] and the `file` protocol, so a playlist inside the bytes cannot lead them to
 //! another file.
 //!
@@ -17,7 +17,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -287,6 +287,8 @@ pub struct FfmpegDecoder {
     ffprobe: PathBuf,
     /// The longest one ffprobe run may take.
     probe_limit: Duration,
+    /// The longest ffmpeg may take to end after the last planned frame.
+    exit_limit: Duration,
     /// The version text ffmpeg printed, for the startup line.
     pub version: String,
 }
@@ -326,6 +328,7 @@ impl FfmpegDecoder {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             probe_limit: PROBE_LIMIT,
+            exit_limit: EXIT_LIMIT,
             version,
         })
     }
@@ -510,6 +513,36 @@ const PROBE_LIMIT: Duration = Duration::from_secs(60);
 /// How often a process run under a limit is checked for its end.
 const LIMIT_POLL: Duration = Duration::from_millis(10);
 
+/// The longest ffmpeg may take to end once it has written every planned frame. It has nothing left
+/// to do but close its output, so a run past this is hung: it is killed and the decode refused.
+const EXIT_LIMIT: Duration = Duration::from_secs(10);
+
+/// `child` waited for until it ends or `limit` has passed: its status, or `None` once it ran past
+/// `limit` and was killed and reaped. A wait that fails kills it too.
+fn wait_within(child: &mut Child, limit: Duration) -> std::io::Result<Option<ExitStatus>> {
+    let end = Instant::now() + limit;
+    let stopped = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) if Instant::now() < end => std::thread::sleep(LIMIT_POLL),
+            Ok(None) => break Ok(None),
+            Err(e) => break Err(e),
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    stopped
+}
+
+/// How a process ended, for an error.
+fn ended(waited: std::io::Result<Option<ExitStatus>>) -> String {
+    match waited {
+        Ok(Some(status)) => status.to_string(),
+        Ok(None) => "killed past its limit".into(),
+        Err(e) => e.to_string(),
+    }
+}
+
 /// `cmd` run to its end, as [`Command::output`] runs it, but killed once it has run for `limit`:
 /// its output, or `None` when it was killed. The output goes to files beside `clip`'s, as
 /// ffmpeg's messages do in [`Decoder::decode`]: a pipe is read by a thread of its own, or stalls
@@ -533,22 +566,9 @@ fn output_within(
         .stderr(Stdio::from(err_file))
         .spawn()
         .map_err(|e| VideoError::Probe(e.to_string()))?;
-    let end = Instant::now() + limit;
-    let ended = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < end => std::thread::sleep(LIMIT_POLL),
-            Ok(None) => break None,
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(VideoError::Probe(e.to_string()));
-            }
-        }
-    };
-    let Some(status) = ended else {
-        let _ = child.kill();
-        let _ = child.wait();
+    let Some(status) =
+        wait_within(&mut child, limit).map_err(|e| VideoError::Probe(e.to_string()))?
+    else {
         return Ok(None);
     };
     let stdout = std::fs::read(&out.0)
@@ -630,7 +650,10 @@ impl Decoder for FfmpegDecoder {
     ) -> Result<(), VideoError> {
         let mut cmd = Command::new(&self.ffmpeg);
         restrict_input(&mut cmd);
-        cmd.args(["-nostdin", "-v", "error"]);
+        // A packet that fails to decode ends ffmpeg with an error. Left to its default it logs the
+        // packet, skips it and ends well, and `select` counts decoded frames, so every index after
+        // the lost one would name a frame further on.
+        cmd.args(["-nostdin", "-xerror", "-v", "error"]);
         if threads > 0 {
             cmd.arg("-threads").arg(threads.to_string());
         }
@@ -656,11 +679,14 @@ impl Decoder for FfmpegDecoder {
         let mut child = cmd.spawn().map_err(|e| VideoError::Decode(e.to_string()))?;
         let got = read_frames(&mut child, meta, indices, each);
         // A reader that stopped or failed is done with the process, whatever it was doing. One that
-        // took every planned frame lets ffmpeg end on its own, so its status is the decode's.
-        if !matches!(&got, Ok(Done::All)) {
+        // took every planned frame lets ffmpeg end on its own, within `exit_limit`, so its status
+        // is the decode's.
+        let waited = if matches!(&got, Ok(Done::All)) {
+            wait_within(&mut child, self.exit_limit)
+        } else {
             let _ = child.kill();
-        }
-        let waited = child.wait();
+            child.wait().map(Some)
+        };
         let mut stderr = Vec::new();
         if let Ok(f) = std::fs::File::open(&log.0) {
             let _ = f.take(STDERR_KEPT).read_to_end(&mut stderr);
@@ -668,9 +694,15 @@ impl Decoder for FfmpegDecoder {
         match got {
             Ok(Done::Stopped) => Ok(()),
             Ok(Done::All) => match waited {
-                Ok(status) if status.success() => Ok(()),
-                Ok(status) => Err(VideoError::Decode(format!(
+                Ok(Some(status)) if status.success() => Ok(()),
+                Ok(Some(status)) => Err(VideoError::Decode(format!(
                     "{status}: {}",
+                    first_lines(&stderr)
+                ))),
+                Ok(None) => Err(VideoError::Decode(format!(
+                    "every planned frame was written and ffmpeg had not ended {:?} later; it was \
+                     stopped ({})",
+                    self.exit_limit,
                     first_lines(&stderr)
                 ))),
                 Err(e) => Err(VideoError::Decode(format!("waiting for ffmpeg: {e}"))),
@@ -686,7 +718,7 @@ impl Decoder for FfmpegDecoder {
                     Err(VideoError::Decode(format!(
                         "{said} (after {got} of {} planned frames; {})",
                         indices.len(),
-                        waited.map_or_else(|e| e.to_string(), |s| s.to_string())
+                        ended(waited)
                     )))
                 }
             }
@@ -1331,6 +1363,7 @@ mod tests {
             ffmpeg: ffmpeg.0.clone(),
             ffprobe: ffprobe.0.clone(),
             probe_limit,
+            exit_limit: EXIT_LIMIT,
             version: String::new(),
         }
     }
@@ -1372,6 +1405,45 @@ mod tests {
             assert!(words.iter().all(|w| said.contains(w)), "{ending}: {said}");
             assert_eq!(seen, 3, "{ending}: every frame arrived before the ending");
         }
+    }
+
+    /// An ffmpeg that wrote every planned frame and then does not end is killed once it has run
+    /// past its exit limit and the decode refused by name, the frames it wrote having arrived; the
+    /// clip's log file is gone with the decode.
+    #[cfg(unix)]
+    #[test]
+    fn an_ffmpeg_that_does_not_end_after_its_frames_is_killed_and_named() {
+        let meta = ClipMeta {
+            frames: 3,
+            fps: (1, 1),
+            width: 2,
+            height: 1,
+        };
+        let clip = Clip::new(b"not read".to_vec(), None);
+        // `exec` leaves no child of the script holding ffmpeg's pipes open past the kill.
+        let ffmpeg = fake_tool("ffmpeg", "head -c 18 /dev/zero\nexec sleep 20");
+        let ffprobe = fake_tool("ffprobe", "exit 99");
+        let mut decoder = fake_decoder(&ffmpeg, &ffprobe, PROBE_LIMIT);
+        decoder.exit_limit = Duration::from_secs(1);
+        let mut seen = 0;
+        let started = Instant::now();
+        let r = decoder.decode(&clip, &meta, &[0, 1, 2], 0, &mut |_, _| {
+            seen += 1;
+            true
+        });
+        let took = started.elapsed();
+        let said = r.expect_err("a hung exit").to_string();
+        assert!(
+            said.starts_with(
+                "ffmpeg: every planned frame was written and ffmpeg had not ended 1s later; it \
+                 was stopped"
+            ),
+            "{said}"
+        );
+        assert_eq!(seen, 3, "every frame arrived before the wait");
+        assert!(took < Duration::from_secs(10), "stopped after {took:?}");
+        let left = clip.path().unwrap().with_extension("log");
+        assert!(!left.exists(), "{} is left behind", left.display());
     }
 
     /// An ffprobe that runs past its limit is killed and the clip refused by name, whether it was

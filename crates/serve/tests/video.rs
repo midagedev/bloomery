@@ -5,11 +5,13 @@
 //! the stream the probe measured, and a clip with audio longer than its video probes the video's
 //! own frame count. A decode past the file's end and a file that is no video are named errors. A
 //! playlist that names a local video is refused by both commands, and each container the server
-//! reads probes and decodes. A 60-second 1080p H.264 clip is planned and decoded at four threads;
+//! reads probes and decodes. A clip with one damaged packet, its header intact, is refused by name
+//! rather than decoded from shifted frames. A 60-second 1080p H.264 clip is planned and decoded at four threads;
 //! every planned frame arrives whole and in order. ffmpeg is a requirement of the gate, so its
 //! absence fails by name rather than skipping.
 
 use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -87,6 +89,19 @@ fn colour(i: usize) -> [u8; 3] {
     [(i & 255) as u8, ((i >> 8) & 255) as u8, 0xA5]
 }
 
+/// `raw` (rgb24 frames of `WIDTH`×`HEIGHT`) encoded at `rate` frames a second with `codec` into the
+/// file `name` of `dir`: the file's bytes.
+fn encode_rgb(dir: &Dir, name: &str, raw: &[u8], rate: &str, codec: &[&str]) -> Vec<u8> {
+    let path = dir.file(name);
+    let size = format!("{WIDTH}x{HEIGHT}");
+    let mut args = vec![
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &size, "-r", rate, "-i", "pipe:0",
+    ];
+    args.extend(codec);
+    ffmpeg(&args, Some(raw), &path);
+    std::fs::read(&path).expect("the clip")
+}
+
 /// The lossless clip: `FRAMES` frames, frame `i` every pixel `colour(i)`.
 fn index_clip(dir: &Dir) -> Clip {
     let mut raw = Vec::with_capacity(FRAMES * WIDTH * HEIGHT * 3);
@@ -95,26 +110,8 @@ fn index_clip(dir: &Dir) -> Clip {
             raw.extend(colour(i));
         }
     }
-    let path = dir.file("index.mkv");
-    ffmpeg(
-        &[
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            &format!("{WIDTH}x{HEIGHT}"),
-            "-r",
-            "10",
-            "-i",
-            "pipe:0",
-            "-c:v",
-            "ffv1",
-        ],
-        Some(&raw),
-        &path,
-    );
-    Clip::new(std::fs::read(&path).expect("the clip"), Some("mkv"))
+    let bytes = encode_rgb(dir, "index.mkv", &raw, "10", &["-c:v", "ffv1"]);
+    Clip::new(bytes, Some("mkv"))
 }
 
 /// One token a group at the clip's own size: the rule's numbers are all this gate reads.
@@ -353,6 +350,104 @@ fn hw_a_decode_past_the_end_and_a_non_video_are_named_errors() {
     match decoder.probe(&junk, DEFAULT_THREADS) {
         Err(VideoError::Probe(said)) => println!("gate video: a non-video probes as: {said}"),
         other => panic!("a non-video: {other:?}"),
+    }
+}
+
+/// Frames of the JPEG clip: two seconds at 30 a second.
+const JPEG_FRAMES: usize = 60;
+
+/// The JPEG clip: an MJPEG AVI of `JPEG_FRAMES` frames, frame `i` red `4 * i` over a fixed blue
+/// (a JPEG's noise stays under that step), as the file's bytes.
+fn jpeg_clip(dir: &Dir) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(JPEG_FRAMES * WIDTH * HEIGHT * 3);
+    for i in 0..JPEG_FRAMES {
+        for _ in 0..WIDTH * HEIGHT {
+            raw.extend([(4 * i) as u8, 0, 0xA5]);
+        }
+    }
+    encode_rgb(dir, "jpeg.avi", &raw, "30", &["-c:v", "mjpeg", "-q:v", "2"])
+}
+
+/// The byte ranges of `avi`'s JPEG pictures, one per video chunk, in stream order.
+fn jpeg_pictures(avi: &[u8]) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at + 10 <= avi.len() {
+        if avi[at..at + 4] == *b"00dc" && avi[at + 8..at + 10] == [0xFF, 0xD8] {
+            let size = u32::from_le_bytes(avi[at + 4..at + 8].try_into().expect("four bytes"));
+            let end = at + 8 + size as usize;
+            assert!(end <= avi.len(), "a chunk runs past the file");
+            found.push(at + 8..end);
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    found
+}
+
+/// A clip whose header states 60 frames and whose packet for frame 3 is damaged, its size and
+/// place kept: the probe reads the same frames as before. ffmpeg left to itself logs the packet,
+/// skips it and ends well, and `select` counts the frames it decoded, so Gemma's planned frames 14
+/// and 44 would arrive as source frames 15 and 45. The decode is refused by name and no frame
+/// arrives; the undamaged clip decodes the same plan to the frames of its own indices.
+#[test]
+#[ignore = "gate: just gate-serve-video"]
+fn hw_a_damaged_packet_is_a_named_error_not_shifted_frames() {
+    let decoder = decoder();
+    let dir = Dir::new("damaged");
+    let bytes = jpeg_clip(&dir);
+    let pictures = jpeg_pictures(&bytes);
+    assert_eq!(pictures.len(), JPEG_FRAMES, "the fixture's pictures");
+    let meta = ClipMeta {
+        frames: JPEG_FRAMES,
+        fps: (30, 1),
+        width: WIDTH,
+        height: HEIGHT,
+    };
+    let p = plan(&TICKS, &meta, 10_000, &Fixed).expect("the plan");
+    assert_eq!(p.indices, [14, 44], "the plan's indices");
+    let indices = p.decode_indices();
+    let reds = |clip: &Clip| {
+        let mut got = Vec::new();
+        let r = decoder.decode(clip, &meta, &indices, DEFAULT_THREADS, &mut |i, frame| {
+            got.push((i, frame.data[0]));
+            true
+        });
+        (r, got)
+    };
+
+    let whole = Clip::new(bytes.clone(), Some("avi"));
+    assert_eq!(decoder.probe(&whole, DEFAULT_THREADS).expect("probe"), meta);
+    let (r, got) = reds(&whole);
+    r.expect("the undamaged clip decodes");
+    assert_eq!(got.iter().map(|f| f.0).collect::<Vec<_>>(), indices);
+    for (i, red) in &got {
+        let want = (4 * i) as u8;
+        assert!(
+            red.abs_diff(want) <= 3,
+            "frame {i}: red {red}, wanted {want}"
+        );
+    }
+
+    let mut hurt = bytes;
+    hurt[pictures[3].clone()].fill(0);
+    let hurt = Clip::new(hurt, Some("avi"));
+    assert_eq!(
+        decoder.probe(&hurt, DEFAULT_THREADS).expect("probe"),
+        meta,
+        "the probe cannot see a damaged packet"
+    );
+    match reds(&hurt) {
+        (Err(VideoError::Decode(said)), got) => {
+            assert!(said.contains("of 2 planned frames"), "{said}");
+            assert!(
+                got.is_empty(),
+                "frames arrived from a damaged clip: {got:?}"
+            );
+            println!("gate video: a damaged packet is refused: {said}");
+        }
+        other => panic!("a clip with a damaged packet must be refused by name: {other:?}"),
     }
 }
 
