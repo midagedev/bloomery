@@ -289,8 +289,9 @@ binary's `--help`.
   so that one is a prefix of another (`[1, 10]` on a vocabulary that splits digits) is a 400, and so is a constant, enum
   option or property name whose text tokenises to a stop id.
 - A `<` never reaches a tool call's markup as data. A free JSON string inside a tool call (Hermes' arguments, or an
-  object that a Qwen, GLM or DSML parameter holds) takes no token with a `<`; a free string in a `response_format`
-  reply may hold one, so code and HTML come out whole. A `<` in a JSON constant, enum option or property name is
+  object that a Qwen, GLM or DSML parameter holds) takes no token with a `<`, and so does one in a `response_format` reply that comes with
+  tools (`tool_choice` other than `none`), since the reply is scanned for a call. A free string in a `response_format`
+  reply with no tools may hold one, so code and HTML come out whole. A `<` in a JSON constant, enum option or property name is
   written as `\u003c` in both, which reads back as the same string. A string written raw in a tool call's XML markup is
   one line (Qwen) or holds no `<` (GLM, DSML), since the value ends at the text after it, and a raw constant or enum
   option with a `<` is a 400.

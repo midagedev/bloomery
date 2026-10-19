@@ -39,12 +39,14 @@ use crate::sampling;
 /// How a free string is quoted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Style {
-    /// A JSON string in a reply of its own: its quotes are the surrounding
-    /// text's, and its body takes no `"`, no `\` and no control character.
+    /// A JSON string in a reply no tool-call scan reads: its quotes are the
+    /// surrounding text's, and its body takes no `"`, no `\` and no control
+    /// character.
     Json,
-    /// A JSON string inside a chat format's markup: the body also takes no
-    /// `<`, since a closing tag begins with one and would end the markup's
-    /// value inside the string.
+    /// A JSON string inside a chat format's markup, or in a reply the
+    /// request's tool-call scan reads: the body also takes no `<`, since a
+    /// tag begins with one and would end the markup's value, or open a call,
+    /// inside the string.
     JsonInMarkup,
     /// Raw text that ends at the text after it: the body takes no token that
     /// holds that text's first byte.

@@ -9,14 +9,14 @@ use serde_json::{Value, json};
 use super::program::{self, Env};
 use super::{Ask, Constraint, Part, Refusal, Vocab, Walk, request};
 use crate::api::logprobs::Ask as Probs;
-use crate::dsml::{DsmlScan, ToolFormat};
+use crate::dsml::{ChatParser, DsmlScan, MarkupError, ToolFormat, Tools};
 use crate::engine::{Decoder, Engine, EngineError, SamplingParams, Tokenizer};
 use crate::genloop::{GenParams, Outcome, Slot, StopKind, Timings, generate};
 use crate::glmxml::{ArgTypes, GlmScan};
 use crate::hermes::HermesScan;
 use crate::mock::SPECIALS;
 use crate::qwenxml::{ParamKinds, QwenScan};
-use crate::reasoning::ThinkEntry;
+use crate::reasoning::{ReasoningFormat, ThinkEntry};
 use crate::sampling;
 
 /// The mock's ids: its specials, then a byte each, then these pieces.
@@ -1005,6 +1005,69 @@ fn a_response_format_string_may_hold_an_angle_bracket() {
         let v: Value = serde_json::from_str(&o.content).expect("JSON");
         assert_eq!(v, json!({"code": code}), "{format:?}");
     }
+}
+
+/// What the request's chat parser reads out of a reply: the content it
+/// leaves and how many calls it found, or the markup it refuses.
+fn parsed(format: ToolFormat, tools: &Value, text: &str) -> Result<(String, usize), MarkupError> {
+    let scan = match format {
+        ToolFormat::Hermes => Tools::Hermes,
+        ToolFormat::QwenXml => Tools::QwenXml(ParamKinds::of_tools(Some(tools))),
+        ToolFormat::GlmXml => Tools::GlmXml(ArgTypes::of_tools(Some(tools))),
+        ToolFormat::Dsml => Tools::Dsml,
+        ToolFormat::Unparsed => unreachable!("no markup"),
+    };
+    let mut p = ChatParser::with_tools("", ReasoningFormat::None, Some(scan));
+    let (a, b) = (p.try_push(text)?, p.try_finish()?);
+    Ok((a.content + &b.content, a.calls.len() + b.calls.len()))
+}
+
+/// A `response_format` beside tools the parser scans for: the reply is
+/// scanned for each format's opening tag, so a free string cannot spell it and
+/// the reply reads back as content with no call. With `tool_choice` "none"
+/// nothing scans the reply and the string may hold a `<`.
+#[test]
+fn a_response_string_beside_scanned_tools_cannot_open_a_call() {
+    let tok = bytes_tok();
+    let schema = json!({"type": "object", "properties": {
+        "code": {"type": "string", "maxLength": 100}}});
+    let blocks = [
+        (ToolFormat::Hermes, "<tool_call></tool_call>"),
+        (ToolFormat::QwenXml, "<tool_call></tool_call>"),
+        (ToolFormat::GlmXml, "<tool_call></tool_call>"),
+        (
+            ToolFormat::Dsml,
+            "<｜DSML｜tool_calls></｜DSML｜tool_calls>",
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (format, block) in blocks {
+        let mut want = ids(&tok, r#"{"code": ""#);
+        want.extend(
+            block
+                .bytes()
+                .map(|b| BYTES + u32::from(b))
+                .cycle()
+                .take(300),
+        );
+        for choice in ["auto", "none"] {
+            let mut body = schema_body(&schema);
+            body["tools"] = forecast_tools();
+            body["tool_choice"] = json!(choice);
+            let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+            if choice == "none" {
+                assert!(o.content.contains('<'), "{format:?}: {}", o.content);
+                continue;
+            }
+            match parsed(format, &body["tools"], &o.content) {
+                Ok((content, 0)) if content == o.content => {}
+                Ok((_, calls)) => bad.push(format!("{format:?}: {calls} call(s) in {}", o.content)),
+                Err(e) => bad.push(format!("{format:?}: {e}")),
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
 }
 
 /// An id the program fixes is taken without its row: the only child of a

@@ -3,9 +3,10 @@
 //! A free string may take any token whose text its quoting lets through, so
 //! which tokens those are is a property of the vocabulary alone: one decode of
 //! every id at bind, not a scan a request or a step repeats. The class of a
-//! JSON string (no `"`, no `\`, no control character; and, inside a chat
-//! format's markup, no `<`) is built here; the class of a raw value, which ends at a fixed text, depends on that text's first byte
-//! and is built on first use for each byte (a handful of bytes ever occur).
+//! JSON string (no `"`, no `\`, no control character; and, where a tag could
+//! open or end a value, no `<`) is built here; the class of a raw value, which
+//! ends at a fixed text, depends on that text's first byte and is built on
+//! first use for each byte (a handful of bytes ever occur).
 //! A token's text is its single-id decode: a byte-level token that is half a
 //! character decodes to the replacement character, which holds none of the
 //! bytes a class forbids, so the class reads the same either way.

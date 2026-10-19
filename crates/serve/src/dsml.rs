@@ -26,7 +26,7 @@
 //! so a stream and a whole response parse to the same message.
 
 use jinja::ChatTemplate;
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
 use crate::glmxml::{self, ArgTypes, GlmScan, GlmXmlError};
@@ -263,6 +263,16 @@ impl Message {
     pub fn is_empty(&self) -> bool {
         self.reasoning.is_empty() && self.content.is_empty() && self.calls.is_empty()
     }
+}
+
+/// Whether a chat request's output is scanned for tool calls: non-empty
+/// `tools` and a `tool_choice` other than `"none"` (the template still sees
+/// the tools with `"none"`).
+pub(crate) fn parses_tools(b: &Map<String, Value>) -> bool {
+    b.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+        && b.get("tool_choice").and_then(Value::as_str) != Some("none")
 }
 
 /// The tool-call markup a chat template teaches its model.

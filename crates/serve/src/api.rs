@@ -67,7 +67,7 @@ use jinja::{ChatTemplate, TemplateError};
 use serde_json::{Map, Value, json};
 
 use crate::constrain;
-use crate::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
+use crate::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools, parses_tools};
 use crate::embed::Embed;
 use crate::engine::{
     DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps, SamplerFactory,
@@ -3550,16 +3550,6 @@ fn chat_finish_reason(o: &Outcome, m: &Message) -> &'static str {
         "stop" if !m.calls.is_empty() => "tool_calls",
         r => r,
     }
-}
-
-/// Whether the output is scanned for tool calls: non-empty `tools` and a
-/// `tool_choice` other than `"none"` (the template still sees the tools with
-/// `"none"`).
-fn parses_tools(b: &Map<String, Value>) -> bool {
-    b.get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty())
-        && b.get("tool_choice").and_then(Value::as_str) != Some("none")
 }
 
 /// The scan a chat request's output gets: none, or the markup of the

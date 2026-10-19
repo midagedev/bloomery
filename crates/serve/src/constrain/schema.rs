@@ -13,10 +13,11 @@
 //!
 //! The JSON text is compact with one space after `:` and `,`. A `<` in a JSON
 //! string's text (a constant, an enum option, a property name) is written as
-//! `\u003c`, and a free JSON string inside a tool call's markup takes no token
-//! with a `<` ([`Style::JsonInMarkup`]), so the text never spells a tag a chat
-//! format's scanner looks for; a free string in a reply of its own may hold
-//! one. A raw string literal (a tool argument in a format that writes strings
+//! `\u003c`, and a free JSON string inside a tool call's markup, or in a reply
+//! the request's tool-call scan reads, takes no token with a `<`
+//! ([`Style::JsonInMarkup`]), so the text never spells a tag a chat format's
+//! scanner looks for; a free string in a reply no scan reads may hold one. A
+//! raw string literal (a tool argument in a format that writes strings
 //! unquoted) holding a `<` is a refusal. A tool call's arguments use the same
 //! subset, written in the style the chat format reads; its parameters are read
 //! as one object by [`value`].
@@ -26,7 +27,7 @@ use serde_json::{Map, Value};
 use super::Refusal;
 use super::program::{self, Alt, Constraint, Env, Part, Style};
 use super::vocab::Vocab;
-use crate::dsml::ToolFormat;
+use crate::dsml::{ToolFormat, parses_tools};
 use crate::engine::Tokenizer;
 use crate::reasoning::THINK_CLOSE;
 
@@ -667,7 +668,16 @@ pub(crate) fn request(
                  server: a request has one program",
             ));
         }
-        (Some(s), None) => value(s, Style::Json, "response_format.json_schema.schema")?,
+        (Some(s), None) => {
+            // The reply is read for a call's markup when the request has tools
+            // to scan for, so its strings keep clear of a `<` then.
+            let style = if parses_tools(o) {
+                Style::JsonInMarkup
+            } else {
+                Style::Json
+            };
+            value(s, style, "response_format.json_schema.schema")?
+        }
         (None, Some(f)) => tool_parts(o, f, ask.format)?,
         (None, None) => return Ok(None),
     };
