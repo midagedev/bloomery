@@ -377,6 +377,10 @@ mod e2e;
 mod flash_grid;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/q35_clauses.rs"]
+mod q35_clauses;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/residency_clauses.rs"]
 #[allow(
     dead_code,
@@ -389,6 +393,10 @@ mod gate {
     use super::e2e::{argmax, normed, tap};
     use super::flash_grid::flash_grids;
     use super::q3place::{self, PlaceQ3};
+    use super::q35_clauses::{
+        self as q35, Geometry35, PathRun, Slots35, decode_run, fresh, lcg_ids, pass_head_nodes,
+        refed_after_cut, refused, same_run, same_store, stores, uncut_call,
+    };
     use super::residency_clauses;
     use app::Session;
     use bloomery_gpu::NodeInfo;
@@ -408,10 +416,9 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::q36_fixture::{Shape, Site};
-    use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
-        Fnv1a64, GREEDY_MARGIN, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed,
+        GREEDY_MARGIN, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed,
         data_dir, ik_q8_2, q8_1_dequant, record, ref_ints, ref_model_path, ref_tensor_logical_in,
         split_f32, topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
@@ -876,14 +883,6 @@ mod gate {
         Ok(Some((shape, ok)))
     }
 
-    /// The nodes of a pass's one head of `rows` rows over the file's Q6_K
-    /// lm_head: the copy of the rows into its input, then the fused head's
-    /// three at one row, or the norm, the quantizer, the gemv and the rows'
-    /// argmax past it.
-    fn pass_head_nodes(rows: usize) -> usize {
-        1 + if rows == 1 { 3 } else { 4 }
-    }
-
     /// PIN(2026-09-27): the teacher-forced bound on a tap's error ratio — its
     /// relative error over the relative distance between the two sides'
     /// 8-bit activations of the input that reaches it (ours q8_1 per 128
@@ -918,8 +917,7 @@ mod gate {
     /// each delta layer's state, `32 · 128 · 128` f32 (one lane), and conv
     /// ring, `RING_ROWS · 8192` f32.
     fn store_bytes() -> usize {
-        n_attn() * 2 * N_KV * CTX * HEAD * 2
-            + n_delta() * (N_V * HEAD_V * HEAD_V + RING_ROWS * C) * 4
+        geometry().store_bytes(CTX)
     }
 
     /// `‖a − b‖ / ‖base‖` over the zipped values in f64, the denominator's
@@ -1179,141 +1177,10 @@ mod gate {
 
     // ------------------------------------------------- (p) one layer body
 
-    /// Every layer's store, read back.
-    fn stores(m: &mut Qwen35moeModel) -> Result<Vec<StoreHost>, GateError> {
-        let n = m.layers().len();
-        let (gpu, _, body) = m.body_parts("stores")?;
-        Ok((0..n)
-            .map(|l| body.store(gpu, l))
-            .collect::<Result<_, GpuError>>()?)
-    }
-
-    fn same_store(a: &StoreHost, b: &StoreHost) -> bool {
-        match (a, b) {
-            (StoreHost::Kv { k: ka, v: va }, StoreHost::Kv { k: kb, v: vb }) => {
-                ka == kb && va == vb
-            }
-            (
-                StoreHost::Rec {
-                    state: sa,
-                    ring: ra,
-                },
-                StoreHost::Rec {
-                    state: sb,
-                    ring: rb,
-                },
-            ) => bits_equal(sa, sb) && bits_equal(ra, rb),
-            _ => false,
-        }
-    }
-
-    /// What a run of the batch tokens left: each position's logits and
-    /// token, and every layer's store.
-    struct PathRun {
-        logits: Vec<Vec<f32>>,
-        tokens: Vec<u32>,
-        stores: Vec<StoreHost>,
-    }
-
-    /// `reset`, then every layer's store written to zeros through
-    /// `set_store`: a start from zero state that does not rest on `reset`'s
-    /// own clearing, so only the clause that tests `reset` reads it.
-    fn fresh(m: &mut Qwen35moeModel) -> Result<(), GateError> {
-        m.reset()?;
-        let n = m.layers().len();
-        let (gpu, _, body) = m.body_parts("fresh")?;
-        for l in 0..n {
-            let zero = match body.store(gpu, l)? {
-                StoreHost::Kv { k, v } => StoreHost::Kv {
-                    k: vec![0; k.len()],
-                    v: vec![0; v.len()],
-                },
-                StoreHost::Rec { state, ring } => StoreHost::Rec {
-                    state: vec![0.0; state.len()],
-                    ring: vec![0.0; ring.len()],
-                },
-            };
-            body.set_store(gpu, l, &zero)?;
-        }
-        Ok(())
-    }
-
-    /// The batch tokens as decode steps from position 0: from [`fresh`]'s
-    /// zero stores, or (`by_reset`) from `reset` alone.
-    fn decode_run(
-        m: &mut Qwen35moeModel,
-        toks: &[u32],
-        by_reset: bool,
-    ) -> Result<PathRun, GateError> {
-        if by_reset {
-            m.reset()?;
-        } else {
-            fresh(m)?;
-        }
-        let (mut logits, mut tokens) = (Vec::new(), Vec::new());
-        for &t in toks {
-            tokens.push(m.step(&[t])?);
-            logits.push(m.logits()?);
-        }
-        Ok(PathRun {
-            logits,
-            tokens,
-            stores: stores(m)?,
-        })
-    }
-
-    fn same_run(label: &str, got: &PathRun, want: &PathRun) -> bool {
-        let logits = got.logits.len() == want.logits.len()
-            && got
-                .logits
-                .iter()
-                .zip(&want.logits)
-                .all(|(a, b)| bits_equal(a, b));
-        let stores_same = got.stores.len() == want.stores.len()
-            && got
-                .stores
-                .iter()
-                .zip(&want.stores)
-                .all(|(a, b)| same_store(a, b));
-        let differ: Vec<usize> = (0..got.stores.len().min(want.stores.len()))
-            .filter(|&l| !same_store(&got.stores[l], &want.stores[l]))
-            .collect();
-        let ok = logits && stores_same && got.tokens == want.tokens;
-        println!(
-            "paths {label}: tokens {:?} vs {:?}, every position's logits bit-identical={logits}, \
-             every store bit-identical={stores_same} (layers differing {differ:?}) {}",
-            got.tokens,
-            want.tokens,
-            verdict(ok)
-        );
-        ok
-    }
-
+    /// (p) (module doc): `q35_clauses::paths` under the self-consistency tag.
     fn paths(m: &mut Qwen35moeModel, toks: &[u32]) -> Result<(bool, PathRun), GateError> {
         tier::sc("(p) one layer body: pass = decode, eager = graph, reset clears")?;
-        let toks5: [u32; 5] = toks
-            .try_into()
-            .map_err(|_| format!("the batch set holds {} tokens, want 5", toks.len()))?;
-        m.set_mode(StepMode::Graph);
-        let decode = decode_run(m, toks, false)?;
-        // One pass of five rows.
-        fresh(m)?;
-        let tokens = m.step_rows::<5>(toks5)?.to_vec();
-        let pass = PathRun {
-            logits: m.rows_logits::<5>()?.to_vec(),
-            tokens,
-            stores: stores(m)?,
-        };
-        let mut ok = same_run("pass m=5 vs five decode steps (graph)", &pass, &decode);
-        m.set_mode(StepMode::Eager);
-        let eager = decode_run(m, toks, false)?;
-        ok &= same_run("five eager steps vs five graph replays", &eager, &decode);
-        m.set_mode(StepMode::Graph);
-        // The only run that starts from `reset` alone, after the eager run
-        // left its state: `reset` must clear it.
-        let again = decode_run(m, toks, true)?;
-        ok &= same_run("after reset alone, the same five steps", &again, &decode);
-        Ok((ok, decode))
+        q35::paths(m, toks)
     }
 
     // --------------------------------------------------- (c) free-running
@@ -2848,20 +2715,6 @@ mod gate {
     /// (k)'s cache: the prompt, and the marks' positions, with room.
     const KCTX: usize = 4352;
 
-    /// `n` ids of an lcg over the vocabulary: every id a row of the
-    /// embedding, the routing spread over the experts.
-    fn lcg_ids(n: usize, vocab: usize) -> Vec<u32> {
-        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
-        (0..n)
-            .map(|_| {
-                x = x
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                ((x >> 33) % vocab as u64) as u32
-            })
-            .collect()
-    }
-
     /// (k) (module doc): the checkpoints of a marked prompt call, the keep
     /// rule around them, the refused non-checkpoint cut, and the re-feed
     /// after a cut bit for bit. The model is dropped before the clause
@@ -2887,7 +2740,7 @@ mod gate {
         // call's end, under the copies 4 GiB fits. An exact pin, by the
         // budget's specification, not a relaxation.
         let c = m.body("gate_qwen35moe_e2e")?.checkpoints();
-        let want_bytes = n_delta() * (N_V * HEAD_V * HEAD_V + RING_ROWS * C) * 4;
+        let want_bytes = geometry().checkpoint_bytes();
         let every = m.ubatch()?;
         let fit = runtime::seqstate::capacity(runtime::seqstate::HOST_BUDGET, want_bytes as u64)
             .map_err(|e| e.to_string())?;
@@ -2908,10 +2761,8 @@ mod gate {
 
         // The fresh call: its marks, the walks it ran, and what a cut keeps
         // around them.
-        fresh(&mut m)?;
         let plan = m.prefill_plan(KP, PrefillPath::Wide)?;
-        let tok0 = m.prefill_with(&ids, PrefillPath::Wide)?;
-        let (logits0, stores0) = (m.logits()?, stores(&mut m)?);
+        let uncut = uncut_call(&mut m, &ids)?;
         // PIN(2026-10-04): the marks' spacing is the ubatch size the load was
         // asked for — the walk's most positions, the sibling body's rule —
         // re-derived here from the model's own size, where it was GLM's flat
@@ -2970,31 +2821,7 @@ mod gate {
 
         // The cut and the re-fed tail: the same bits the uncut call left.
         let cut_at = mark_below(4150);
-        m.rollback(cut_at)?;
-        let tail = &ids[cut_at as usize..];
-        let tok = m.prefill_with(tail, PrefillPath::Wide)?;
-        let (logits, st) = (m.logits()?, stores(&mut m)?);
-        let differ: Vec<usize> = (0..st.len())
-            .filter(|&l| !stores0.get(l).is_some_and(|w| same_store(&st[l], w)))
-            .collect();
-        let same_logits = bits_equal(&logits, &logits0);
-        let refed_walks = m.body("gate_qwen35moe_e2e")?.prompt_walks();
-        let refed_ok = tok == tok0
-            && same_logits
-            && differ.is_empty()
-            && st.len() == stores0.len()
-            && m.body("gate_qwen35moe_e2e")?.checkpoints().positions() == want_pts
-            // A cut lands on a mark, so the re-fed call's only run is the
-            // tail itself: one walk of its own plan.
-            && refed_walks == (tail.len() as u32).div_ceil(ub) as usize;
-        println!(
-            "checkpoints: cut to {cut_at} and {} ids re-fed: token {tok} vs {tok0}, last logits \
-             bit-identical={same_logits}, every store bit-identical (layers differing {differ:?}), \
-             the points back at {want_pts:?}, {refed_walks} walk {}",
-            tail.len(),
-            verdict(refed_ok)
-        );
-        ok &= refed_ok;
+        ok &= refed_after_cut(&mut m, &ids, cut_at, &uncut, &want_pts, ub)?;
 
         // A reset drops every point.
         fresh(&mut m)?;
@@ -3022,287 +2849,28 @@ mod gate {
 
     // ------------------------------------------------ (n) resident slots
 
-    /// (n)'s prompts, A and B: each past the load's first mark ([`U_GATE`])
-    /// by a run the mark keeps (`marked` drops a mark with a run of fewer
-    /// than `WIDE_FROM` = `GEMV_COLS + 1` = 9 rows beside it), of different
-    /// lengths so the slots stand at different positions, each with its
-    /// steps inside [`CTX`].
+    /// (n)'s prompts, A and B: each past the load's first mark ([`U_GATE`]) by a run the mark keeps (`marked` drops a
+    /// mark with a run of fewer than `WIDE_FROM` = `GEMV_COLS + 1` = 9 rows beside it), of different lengths so the
+    /// slots stand at different positions, each with its steps inside [`CTX`] (`Slots35::new` holds both).
     const SLOT_A: usize = 1040;
     const SLOT_B: usize = 1056;
 
-    /// Greedy steps a stream takes past its prompt in the interleave, and
-    /// of one continuation check: each solo run steps `SLOT_STEPS + 3 ·
-    /// SLOT_TAIL` (`slots_gate`'s `solo`), inside [`CTX`] for B.
-    const SLOT_STEPS: usize = 16;
-    // PIN(2026-10-05): 8 -> 5. The harness's solo run grew to STEPS + 3·TAIL
-    // (msp2's H2 tail); B's 1056 + 16 + 3·8 = 1096 stepped past the 1088-row
-    // cache ("GpuModel::step: pos 1088 + 1 exceeds"), and 1056 + 16 + 3·5 =
-    // 1087 fits. The checks keep their shape; each continuation reads 5 ids.
-    const SLOT_TAIL: usize = 5;
-
-    const _: () = assert!(
-        SLOT_A >= U_GATE + 9
-            && SLOT_B >= U_GATE + 9
-            && SLOT_A + SLOT_STEPS + 3 * SLOT_TAIL <= CTX
-            && SLOT_B + SLOT_STEPS + 3 * SLOT_TAIL <= CTX
-    );
-
-    /// Qwen3.6's adapter: the whole-card load at [`CTX`] with the
-    /// checkpoints armed, and two lcg prompts over the vocabulary.
-    struct Q35Slots {
-        /// Stream 0's ids (A), then stream 1's (B).
-        ids: Vec<u32>,
-    }
-
-    impl Q35Slots {
-        fn new(vocab: usize) -> Q35Slots {
-            Q35Slots {
-                ids: lcg_ids(SLOT_A + SLOT_B, vocab),
-            }
-        }
-
-        /// Stream `stream`'s ids, else refused by name.
-        fn ids(&self, stream: usize) -> Result<&[u32], GateError> {
-            let (a, b) = self.ids.split_at(SLOT_A);
-            match stream {
-                0 => Ok(a),
-                1 => Ok(b),
-                s => Err(format!("stream {s} of the adapter's two").into()),
-            }
+    /// This file's geometry as the derivations above state it.
+    fn geometry() -> Geometry35 {
+        Geometry35 {
+            n_attn: n_attn(),
+            n_delta: n_delta(),
+            n_kv: N_KV,
+            head: HEAD,
+            n_v: N_V,
+            head_v: HEAD_V,
+            conv_c: C,
         }
     }
 
-    impl SlotsAdapter for Q35Slots {
-        type Body = Body35;
-
-        const STEPS: usize = SLOT_STEPS;
-        const TAIL: usize = SLOT_TAIL;
-
-        /// The whole-card load at [`CTX`], the checkpoints armed as the seat
-        /// arms them. It is the same load at every slot count: its fit
-        /// check counts no slot, and each sequence's stores are allocated
-        /// by `add_slots`.
-        fn open(&self, _slots: usize) -> Result<Qwen35moeModel, GateError> {
-            let mut m = open(CTX, KvQ8::F16)?;
-            m.body_parts("slots")?.2.set_checkpoints(true);
-            Ok(m)
-        }
-
-        /// `reset`: every row `state_hash` reads is written by a call from
-        /// it.
-        fn rewind(&self, m: &mut Qwen35moeModel) -> Result<(), GateError> {
-            Ok(m.reset()?)
-        }
-
-        /// The session's schedule (`app::Prompt for Body35`): the wide walk
-        /// from `GEMM_FROM` ids on, passes below.
-        fn prompt(&self, m: &mut Qwen35moeModel, stream: usize) -> Result<u32, GateError> {
-            Ok(<Body35 as app::Prompt>::prompt(m, self.ids(stream)?)?)
-        }
-
-        /// Every attention layer's K and V rows below the model's position —
-        /// rows past it are no state: the flash never reads them, and a slot
-        /// rewound after a longer sequence still holds that sequence's there —
-        /// and every delta layer's whole state and conv ring.
-        fn state_hash(&self, m: &mut Qwen35moeModel) -> Result<u64, GateError> {
-            let body = m.body("slots")?;
-            let rows = usize::try_from(m.pos())? * HEAD;
-            let plane = body.ctx_rows() * HEAD;
-            let mut h = Fnv1a64::default();
-            for l in m.layers() {
-                h = match body.store(m.gpu(), l)? {
-                    StoreHost::Kv { k, v } => {
-                        k.chunks(plane)
-                            .chain(v.chunks(plane))
-                            .try_fold(h, |h, head| {
-                                let below =
-                                    head.get(..rows).ok_or("a position past the cache rows")?;
-                                Ok::<_, GateError>(
-                                    below.iter().fold(h, |h, w| h.bytes(&w.to_le_bytes())),
-                                )
-                            })?
-                    }
-                    StoreHost::Rec { state, ring } => h.f32s(&state).f32s(&ring),
-                };
-            }
-            Ok(h.value())
-        }
-
-        /// The stores' derivation from the header ([`store_bytes`]): each
-        /// attention layer's K and V planes, each delta layer's state and
-        /// conv ring.
-        fn seq_bytes_derived(&self, _m: &Qwen35moeModel) -> Result<Derived, GateError> {
-            Ok(Derived {
-                bytes: store_bytes(),
-                terms: format!(
-                    "{} x K/V planes of 2 x {N_KV} x {CTX} x {HEAD} f16 + {} x (state \
-                     {N_V} x {HEAD_V} x {HEAD_V} + ring {RING_ROWS} x {C}) f32",
-                    n_attn(),
-                    n_delta()
-                ),
-            })
-        }
-
-        /// H5's planter ([`SlotsAdapter::plant_refusal`]): the tier through
-        /// the body's placed side, the host service of this body; `false`
-        /// on a load with no placed side, which serves no host work.
-        fn plant_refusal(&self, m: &mut Qwen35moeModel) -> Result<bool, GateError> {
-            let Some(placed) = m.body_parts("gate_qwen35moe_e2e slots")?.2.host() else {
-                return Ok(false);
-            };
-            placed
-                .hybrid_mut()
-                .plant_refusal("a planted refusal (the slots harness's seam)");
-            Ok(true)
-        }
-
-        /// H5's window: the tier's own refusal, read through the body's
-        /// placed side.
-        fn tier_poisoned(&self, m: &mut Qwen35moeModel) -> Result<bool, GateError> {
-            let placed = m
-                .body_parts("gate_qwen35moe_e2e slots")?
-                .2
-                .host()
-                .ok_or("the placed side (the host tier)")?;
-            Ok(placed.hybrid().refuse_if_poisoned("slots H5").is_err())
-        }
-    }
-
-    impl PassAdapter for Q35Slots {
-        /// [`nodes_slot`].
-        fn added_slot_launches(&self, _m: &Qwen35moeModel) -> Result<Launches, GateError> {
-            Ok(Launches {
-                n: nodes_slot()?,
-                terms: format!(
-                    "the embedding 1 + {} delta layers' conv and delta 2 + {} \
-                     attention layers' rope-append and flash segment pass and merge 3",
-                    n_delta(),
-                    n_attn()
-                ),
-            })
-        }
-
-        /// The body's count without the head (`Body35::slots_launches`),
-        /// plus the pass's one head ([`pass_head_nodes`]).
-        fn slots_launches(
-            &self,
-            m: &Qwen35moeModel,
-            key: &[(usize, usize)],
-        ) -> Result<usize, GateError> {
-            let rows = key.iter().map(|&(_, r)| r).sum();
-            Ok(m.body("slots")?.slots_launches(key) + pass_head_nodes(rows))
-        }
-    }
-
-    /// `r`, a call that must be refused by `what` with a detail holding
-    /// `phrase`.
-    fn refused<T>(r: Result<T, GpuError>, what: &str, phrase: &str) -> bool {
-        match r {
-            Err(GpuError::Shape { what: w, detail }) => w == what && detail.contains(phrase),
-            Err(GpuError::State { what: w, missing }) => w == what && missing.contains(phrase),
-            _ => false,
-        }
-    }
-
-    /// (n)'s pass refusals (module doc): each pass refused by name before
-    /// anything runs, every slot's position kept and no slot poisoned.
-    /// `last` is each slot's last id, its next step's input.
-    fn pass_refusals(m: &mut Qwen35moeModel, last: [u32; 2]) -> Result<bool, GateError> {
-        const COMMON: &str = "GpuModel::step_slots";
-        const BODY: &str = "qwen35moe slots";
-        let positions = |m: &mut Qwen35moeModel| -> Result<Vec<u32>, GateError> {
-            (0..2)
-                .map(|s| {
-                    m.select_slot(s)?;
-                    Ok(m.pos())
-                })
-                .collect()
-        };
-        let before = positions(m)?;
-        let vocab = u32::try_from(m.body("slots")?.vocab())?;
-        let five = [last[0]; 5];
-        let four = [last[1]; 4];
-        let arms = [
-            (
-                "nine rows",
-                refused(
-                    m.step_slots(&[(0, &five[..]), (1, &four[..])]),
-                    COMMON,
-                    "9 rows in one pass",
-                ),
-            ),
-            (
-                "a slot twice",
-                refused(
-                    m.step_slots(&[(0, &[last[0]]), (0, &[last[0]])]),
-                    COMMON,
-                    "slot 0 twice",
-                ),
-            ),
-            (
-                "a slot out of range",
-                refused(
-                    m.step_slots(&[(2, &[last[0]])]),
-                    COMMON,
-                    "slot 2 of a model that serves 0..2",
-                ),
-            ),
-            (
-                "a slot of no token",
-                refused(m.step_slots(&[(1, &[])]), COMMON, "slot 1 with no token"),
-            ),
-            (
-                "an id past the vocabulary",
-                refused(
-                    m.step_slots(&[(0, &[last[0]]), (1, &[vocab])]),
-                    BODY,
-                    "slot 1:",
-                ),
-            ),
-        ];
-        let taps = {
-            m.set_layer_taps(true)?;
-            let named = refused(
-                m.step_slots(&[(0, &[last[0]]), (1, &[last[1]])]),
-                BODY,
-                "layer taps off",
-            );
-            m.set_layer_taps(false)?;
-            m.set_mode(StepMode::Graph);
-            named
-        };
-        let missed: Vec<&str> = arms
-            .iter()
-            .filter(|(_, named)| !named)
-            .map(|(arm, _)| *arm)
-            .chain((!taps).then_some("the layer taps armed"))
-            .collect();
-        let after = positions(m)?;
-        let kept = after == before;
-        let pass = missed.is_empty() && kept;
-        println!(
-            "slots pass refusals: nine rows, a slot twice, a slot out of range, a slot of no \
-             token, an id past the vocabulary and the layer taps armed each refused by name{}; \
-             positions {after:?} kept {kept} {}",
-            if missed.is_empty() {
-                String::new()
-            } else {
-                format!(" — not named: {}", missed.join(", "))
-            },
-            verdict(pass)
-        );
-        Ok(pass)
-    }
-
-    /// The selected slot's checkpoints' positions.
-    fn points(m: &Qwen35moeModel) -> Result<Vec<u32>, GateError> {
-        Ok(m.body("slots")?.checkpoints().positions())
-    }
-
-    /// (n) (module doc): the harness's contracts, and between its halves
-    /// each slot's checkpoints its own under a cut and a reset of the other
-    /// slot. The clause's model is dropped with its second sequence.
-    fn slots_two(a: &Q35Slots) -> Result<bool, GateError> {
+    /// (n) (module doc): the shared slots clause (`q35_clauses::slots_two`) over two lcg streams of the whole-card load
+    /// at [`CTX`] with the checkpoints armed.
+    fn slots_two(vocab: usize) -> Result<bool, GateError> {
         // A slot's node count reads every layer joined (`Shape::nodes_slot` refuses an apart one).
         let joined = !shape().apart().contains(&true);
         if !tier::layout_clause(
@@ -3311,85 +2879,14 @@ mod gate {
         )? {
             return Ok(true);
         }
-        let mut s = slots_gate::interleave(a)?;
-        s.one_pass();
-        let mark = u32::try_from(U_GATE)?;
-        let ends = [u32::try_from(SLOT_A)?, u32::try_from(SLOT_B)?];
-        let b_last = s.last(1)?;
-        let last = [s.last(0)?, b_last];
-        let refusals_ok = pass_refusals(s.model(), last)?;
-        let m = s.model();
-        // Each slot's points as its prompt in the interleave took them, and
-        // where each stands.
-        m.select_slot(0)?;
-        let a_held = (a.state_hash(m)?, points(m)?);
-        m.select_slot(1)?;
-        let b_held = (a.state_hash(m)?, points(m)?, m.pos());
-        let taken = a_held.1 == [mark, ends[0]] && b_held.1 == [mark, ends[1]];
-        println!(
-            "slots points: slot 0 {:?}, slot 1 {:?} (want [{mark}, {}] and [{mark}, {}]: the \
-             mark and each prompt's end) {}",
-            a_held.1,
-            b_held.1,
-            ends[0],
-            ends[1],
-            verdict(taken)
-        );
-        // Slot 1 cut back to the mark; slot 0 runs before slot 1 does again.
-        m.rollback(mark)?;
-        m.select_slot(0)?;
-        let a_now = (a.state_hash(m)?, points(m)?);
-        let cont = s.continues(0)?;
-        let held_ok = a_now == a_held && cont;
-        println!(
-            "slots cut: slot 1 cut back to {mark}; slot 0's points {:?} and state digest {} as it \
-             stood, its next {SLOT_TAIL} ids {} its solo run's continuation {}",
-            a_now.1,
-            if a_now.0 == a_held.0 {
-                "equal"
-            } else {
-                "differ from"
-            },
-            if cont { "equal" } else { "differ from" },
-            verdict(held_ok)
-        );
-        // Slot 1: the rest of B from the mark, then the interleave's steps.
-        let m = s.model();
-        m.select_slot(1)?;
-        let rest = a
-            .ids(1)?
-            .get(U_GATE..)
-            .ok_or("stream B shorter than the first mark")?;
-        let mut ids = vec![<Body35 as app::Prompt>::prompt(m, rest)?];
-        slots_gate::greedy(m, &mut ids, SLOT_STEPS + SLOT_TAIL)?;
-        let b_now = (a.state_hash(m)?, points(m)?, m.pos());
-        let last = ids.last().copied();
-        let refed_ok = last == Some(b_last) && b_now == b_held;
-        println!(
-            "slots cut: slot 1 re-fed {} ids from {mark} and stepped {} (the interleave's steps \
-             and H2's passes): last id {last:?} vs {b_last}, state digest equal={}, points {:?} vs \
-             {:?}, position {} vs {} {}",
-            rest.len(),
-            SLOT_STEPS + SLOT_TAIL,
-            b_now.0 == b_held.0,
-            b_now.1,
-            b_held.1,
-            b_now.2,
-            b_held.2,
-            verdict(refed_ok)
-        );
-        // A reset of slot 1 leaves slot 0's points.
-        a.rewind(m)?;
-        m.select_slot(0)?;
-        let kept = points(m)?;
-        let kept_ok = kept == a_held.1;
-        println!(
-            "slots cut: after slot 1's reset slot 0's points {kept:?} (want {:?}) {}",
-            a_held.1,
-            verdict(kept_ok)
-        );
-        let harness_ok = s.finish()?;
-        Ok(taken && held_ok && refed_ok && kept_ok && refusals_ok && harness_ok)
+        let slots = Slots35::new(
+            lcg_ids(SLOT_A + SLOT_B, vocab),
+            SLOT_A,
+            (U_GATE, CTX),
+            (geometry(), nodes_slot()?, pass_head_nodes),
+            Box::new(|| open(CTX, KvQ8::F16)),
+        )?;
+        q35::slots_two(&slots)
     }
 
     // ------------------------------------ (j) the unjoined shared expert
@@ -5087,10 +4584,10 @@ mod gate {
                  {GREEDY_FILE_BYTES} bytes, {name} has {bytes}"
             );
         }
-        let slots = Q35Slots::new(m.body("gate_qwen35moe_e2e")?.vocab());
+        let vocab = m.body("gate_qwen35moe_e2e")?.vocab();
         drop(m);
         ok &= checkpoints()?;
-        ok &= slots_two(&slots)?;
+        ok &= slots_two(vocab)?;
         ok &= q8_cache(&toks)?;
         for (letter, what) in SET_CLAUSES {
             println!("SKIPPED ({letter}) {what}: no ik reference set for {name}");
@@ -5344,11 +4841,11 @@ mod gate {
         ok &= ubatch_bits(&mut m)?;
         ok &= wide_plan(&mut m)?;
         ok &= refusals(&mut m)?;
-        let slots = Q35Slots::new(m.body("gate_qwen35moe_e2e")?.vocab());
+        let vocab = m.body("gate_qwen35moe_e2e")?.vocab();
         drop(m);
         ok &= unjoined(&toks)?;
         ok &= checkpoints()?;
-        ok &= slots_two(&slots)?;
+        ok &= slots_two(vocab)?;
         ok &= placed(&toks, host)?;
         ok &= placed_no_host(&toks, host)?;
         ok &= placed_unjoined(&toks, host)?;
