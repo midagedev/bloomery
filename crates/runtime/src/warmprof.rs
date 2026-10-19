@@ -236,9 +236,240 @@ impl WarmSection {
     }
 }
 
+const PROFILE_MAGIC: [u8; 4] = *b"BWUP";
+const PROFILE_VERSION: u16 = 1;
+/// Magic, version, then the key's length.
+const PROFILE_HEAD: usize = PROFILE_MAGIC.len() + size_of::<u16>() + size_of::<u32>();
+/// A count past this halves every count of the profile when usage folds in
+/// ([`WarmProfile::fold`]): the ranking stays, older use weighs less, and no
+/// cell nears `u32::MAX`.
+const HALVE_PAST: u32 = 1 << 30;
+
+/// What a usage profile is keyed to. A profile counted under another key is
+/// refused ([`ProfileError::Key`]), so it never seeds a model file or a
+/// placement it was not counted on.
+#[derive(Clone, Copy, Debug)]
+pub struct ProfileKey<'a> {
+    /// The model's first shard, as the load named it.
+    pub model: &'a str,
+    /// The first shard's length in bytes.
+    pub bytes: u64,
+    /// The first shard's modification time, nanoseconds since the epoch: a
+    /// file replaced under the same name moves it.
+    pub mtime_ns: u128,
+    /// The placement word the load ran (`a`, `bp`, …).
+    pub place: &'a str,
+    /// The cards the placement runs on, in its device order.
+    pub cards: &'a [&'a str],
+}
+
+impl ProfileKey<'_> {
+    /// The key as one line, what a profile file stores and compares.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!(
+            "model={} bytes={} mtime_ns={} place={} cards={}",
+            self.model,
+            self.bytes,
+            self.mtime_ns,
+            self.place,
+            self.cards.join(",")
+        )
+    }
+}
+
+/// A usage profile: what one user's own decode routed, per (layer, expert),
+/// under one key ([`ProfileKey`]), read back at the next load to seed each
+/// layer's card set from its most used experts ([`WarmProfile::ranking`]).
+/// The body is a [`WarmSection`] whose `long` holds the counts and whose
+/// `recent` is empty: a profile carries no stream's heat.
+///
+/// The encoding is little-endian: the magic `BWUP`, a `u16` version, the
+/// key's length as `u32` and its UTF-8 bytes, then the section's own
+/// encoding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WarmProfile {
+    /// [`ProfileKey::line`] of the load that counted it.
+    pub key: String,
+    pub section: WarmSection,
+}
+
+/// A profile [`WarmProfile::decode`] refuses, by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProfileError {
+    /// Fewer bytes than the header, or than the key the header counts.
+    Truncated { len: usize, need: u64 },
+    /// Not a usage profile.
+    BadMagic { got: [u8; 4] },
+    /// A version this reader does not know.
+    Version { got: u16 },
+    /// A key that is not UTF-8.
+    KeyUtf8,
+    /// A profile counted under another model file or placement.
+    Key { got: String, want: String },
+    /// A section carrying a stream's heat: no writer puts one in a profile.
+    Recent { len: usize },
+    /// The counts' section, refused by its own reader.
+    Section(WarmError),
+}
+
+impl fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProfileError::Truncated { len, need } => {
+                write!(
+                    f,
+                    "usage profile of {len} bytes, short of the {need} it needs"
+                )
+            }
+            ProfileError::BadMagic { got } => {
+                write!(
+                    f,
+                    "usage profile magic {got:02x?}, not {PROFILE_MAGIC:02x?}"
+                )
+            }
+            ProfileError::Version { got } => write!(
+                f,
+                "usage profile version {got}, this reader knows {PROFILE_VERSION}"
+            ),
+            ProfileError::KeyUtf8 => write!(f, "usage profile key is not UTF-8"),
+            ProfileError::Key { got, want } => write!(
+                f,
+                "usage profile counted under `{got}`, not this load's `{want}`"
+            ),
+            ProfileError::Recent { len } => write!(
+                f,
+                "usage profile carries {len} heat cells: a profile holds counts only"
+            ),
+            ProfileError::Section(e) => write!(f, "usage profile counts: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ProfileError {}
+
+impl WarmProfile {
+    /// An empty profile of shape `layers × experts` under `key`.
+    #[must_use]
+    pub fn empty(key: &ProfileKey<'_>, layers: u32, experts: u32) -> WarmProfile {
+        let cells = layers as usize * experts as usize;
+        WarmProfile {
+            key: key.line(),
+            section: WarmSection {
+                layers,
+                experts,
+                long: vec![0; cells],
+                recent: Vec::new(),
+            },
+        }
+    }
+
+    /// Append the encoding to `out`.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        let key_len = u32::try_from(self.key.len())
+            .expect("a key line is a path and a few numbers, far under 4 GiB");
+        out.reserve(PROFILE_HEAD + self.key.len() + self.section.n_bytes());
+        out.extend_from_slice(&PROFILE_MAGIC);
+        out.extend_from_slice(&PROFILE_VERSION.to_le_bytes());
+        out.extend_from_slice(&key_len.to_le_bytes());
+        out.extend_from_slice(self.key.as_bytes());
+        self.section.encode(out);
+    }
+
+    /// The profile `bytes` encode, counted under `key` with shape `layers ×
+    /// experts`. Refused by name: a truncated header or key, a bad magic,
+    /// another version, a key that is not UTF-8 or is not `key`'s line, a
+    /// section its reader refuses ([`WarmSection::decode`]) and one carrying
+    /// heat.
+    pub fn decode(
+        bytes: &[u8],
+        key: &ProfileKey<'_>,
+        layers: u32,
+        experts: u32,
+    ) -> Result<WarmProfile, ProfileError> {
+        if bytes.len() < PROFILE_HEAD {
+            return Err(ProfileError::Truncated {
+                len: bytes.len(),
+                need: PROFILE_HEAD as u64,
+            });
+        }
+        let got: [u8; 4] = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if got != PROFILE_MAGIC {
+            return Err(ProfileError::BadMagic { got });
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != PROFILE_VERSION {
+            return Err(ProfileError::Version { got: version });
+        }
+        let key_len = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
+        let body = PROFILE_HEAD as u64 + key_len as u64;
+        if (bytes.len() as u64) < body {
+            return Err(ProfileError::Truncated {
+                len: bytes.len(),
+                need: body,
+            });
+        }
+        let (head, rest) = bytes.split_at(PROFILE_HEAD + key_len);
+        let got = std::str::from_utf8(&head[PROFILE_HEAD..]).map_err(|_| ProfileError::KeyUtf8)?;
+        let want = key.line();
+        if got != want {
+            return Err(ProfileError::Key {
+                got: got.to_string(),
+                want,
+            });
+        }
+        let section = WarmSection::decode(rest, layers, experts).map_err(ProfileError::Section)?;
+        if !section.recent.is_empty() {
+            return Err(ProfileError::Recent {
+                len: section.recent.len(),
+            });
+        }
+        Ok(WarmProfile { key: want, section })
+    }
+
+    /// Layer `layer`'s experts, most used first, ties to the lower id; `None`
+    /// past the profile's layers.
+    #[must_use]
+    pub fn ranking(&self, layer: usize) -> Option<Vec<u32>> {
+        let e = self.section.experts as usize;
+        let counts = self.section.long.get(layer * e..(layer + 1) * e)?;
+        let mut ids: Vec<u32> = (0..self.section.experts).collect();
+        ids.sort_by_key(|&id| (std::cmp::Reverse(counts[id as usize]), id));
+        Some(ids)
+    }
+
+    /// Fold `usage` (`layers × experts` counts, as
+    /// [`crate::swaprule::SwapRule::usage`] holds them) into the profile:
+    /// each cell the sum, every sum halved as many times as it takes for the
+    /// largest to be at most 2^30, so the ranking stays and older use weighs
+    /// less. `usage` of another length is refused, the profile unchanged.
+    pub fn fold(&mut self, usage: &[u64]) -> Result<(), ProfileError> {
+        let long = &mut self.section.long;
+        if usage.len() != long.len() {
+            return Err(ProfileError::Section(WarmError::LongLength {
+                len: u32::try_from(usage.len()).unwrap_or(u32::MAX),
+                want: long.len() as u64,
+            }));
+        }
+        let sum = |c: u32, u: u64| u64::from(c).saturating_add(u);
+        let most = long.iter().zip(usage).map(|(&c, &u)| sum(c, u)).max();
+        let mut shift = 0;
+        while most.is_some_and(|m| m >> shift > u64::from(HALVE_PAST)) {
+            shift += 1;
+        }
+        for (c, &u) in long.iter_mut().zip(usage) {
+            *c = u32::try_from(sum(*c, u) >> shift)
+                .expect("a sum shifted to at most 2^30 fits a u32");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HEADER_BYTES, WarmError, WarmSection};
+    use super::{
+        HEADER_BYTES, PROFILE_HEAD, ProfileError, ProfileKey, WarmError, WarmProfile, WarmSection,
+    };
 
     // The section's codec and its refusals. Header offsets: magic 0, version
     // 4, layers 6, experts 10, `long.len()` 14, `recent.len()` 18.
@@ -463,5 +694,144 @@ mod tests {
                 need
             })
         );
+    }
+
+    const CARDS: [&str; 1] = ["NVIDIA RTX A6000"];
+
+    fn key(place: &str) -> ProfileKey<'_> {
+        ProfileKey {
+            model: "/models/v41/v41-00001-of-00010.gguf",
+            bytes: 49_000_000_000,
+            mtime_ns: 1_792_405_084_861_000_000,
+            place,
+            cards: &CARDS,
+        }
+    }
+
+    /// 3 layers × 4 experts of counts under the key of place `a`.
+    fn profile() -> WarmProfile {
+        let mut p = WarmProfile::empty(&key("a"), 3, 4);
+        p.section.long = vec![5, 9, 9, 0, 1, 2, 3, 4, 7, 7, 7, 7];
+        p
+    }
+
+    fn profile_bytes(p: &WarmProfile) -> Vec<u8> {
+        let mut out = Vec::new();
+        p.encode(&mut out);
+        out
+    }
+
+    /// A profile round-trips under its own key, and its ranking is most used
+    /// first, ties to the lower id.
+    #[test]
+    fn a_profile_round_trips_under_its_key() {
+        let p = profile();
+        assert_eq!(
+            WarmProfile::decode(&profile_bytes(&p), &key("a"), 3, 4),
+            Ok(p.clone())
+        );
+        assert_eq!(p.ranking(0), Some(vec![1, 2, 0, 3]));
+        assert_eq!(p.ranking(1), Some(vec![3, 2, 1, 0]));
+        assert_eq!(p.ranking(2), Some(vec![0, 1, 2, 3]));
+        assert_eq!(p.ranking(3), None);
+    }
+
+    /// A profile counted under another placement, card set or model file is
+    /// refused by name, both lines in the error.
+    #[test]
+    fn a_profile_under_another_key_is_refused() {
+        let bytes = profile_bytes(&profile());
+        let bp = key("bp");
+        let mut other_file = key("a");
+        other_file.mtime_ns += 1;
+        let three090 = ["NVIDIA GeForce RTX 3090"];
+        let mut other_card = key("a");
+        other_card.cards = &three090;
+        for want in [bp, other_file, other_card] {
+            assert_eq!(
+                WarmProfile::decode(&bytes, &want, 3, 4),
+                Err(ProfileError::Key {
+                    got: key("a").line(),
+                    want: want.line()
+                })
+            );
+        }
+    }
+
+    /// A profile cut anywhere is refused as truncated or by its section's
+    /// reader; a bad magic, another version, a key that is not UTF-8, another
+    /// shape and a section with heat are refused by name.
+    #[test]
+    fn a_corrupt_profile_is_refused_by_name() {
+        let p = profile();
+        let bytes = profile_bytes(&p);
+        let key_end = PROFILE_HEAD + p.key.len();
+        for cut in [0, PROFILE_HEAD - 1, key_end - 1] {
+            assert!(
+                matches!(
+                    WarmProfile::decode(&bytes[..cut], &key("a"), 3, 4),
+                    Err(ProfileError::Truncated { .. })
+                ),
+                "cut at {cut}"
+            );
+        }
+        assert!(matches!(
+            WarmProfile::decode(&bytes[..bytes.len() - 1], &key("a"), 3, 4),
+            Err(ProfileError::Section(WarmError::Truncated { .. }))
+        ));
+        let mut b = bytes.clone();
+        patch(&mut b, 0, b"BWRM");
+        assert_eq!(
+            WarmProfile::decode(&b, &key("a"), 3, 4),
+            Err(ProfileError::BadMagic { got: *b"BWRM" })
+        );
+        let mut b = bytes.clone();
+        patch(&mut b, 4, &2u16.to_le_bytes());
+        assert_eq!(
+            WarmProfile::decode(&b, &key("a"), 3, 4),
+            Err(ProfileError::Version { got: 2 })
+        );
+        let mut b = bytes.clone();
+        b[PROFILE_HEAD] = 0xff;
+        assert_eq!(
+            WarmProfile::decode(&b, &key("a"), 3, 4),
+            Err(ProfileError::KeyUtf8)
+        );
+        assert!(matches!(
+            WarmProfile::decode(&bytes, &key("a"), 3, 5),
+            Err(ProfileError::Section(WarmError::Shape { .. }))
+        ));
+        let mut heat = p.clone();
+        heat.section.recent = vec![1.0; 12];
+        assert_eq!(
+            WarmProfile::decode(&profile_bytes(&heat), &key("a"), 3, 4),
+            Err(ProfileError::Recent { len: 12 })
+        );
+    }
+
+    /// Usage folds in as a sum; past 2^30 every cell halves first, which
+    /// keeps the order; usage of another length is refused, the profile
+    /// unchanged.
+    #[test]
+    fn usage_folds_and_halves_past_the_bound() {
+        let mut p = profile();
+        p.fold(&[1; 12]).unwrap();
+        assert_eq!(p.section.long, vec![6, 10, 10, 1, 2, 3, 4, 5, 8, 8, 8, 8]);
+        p.section.long[0] = 1 << 30;
+        p.fold(&[2; 12]).unwrap();
+        assert_eq!(p.section.long[..4], [(1 << 29) + 1, 6, 6, 1]);
+        let mut huge = [0u64; 12];
+        huge[1] = 1 << 33;
+        p.fold(&huge).unwrap();
+        assert_eq!(p.section.long[..2], [1 << 26, 1 << 30]);
+        let before = p.clone();
+        assert!(matches!(
+            p.fold(&[1; 11]),
+            Err(ProfileError::Section(WarmError::LongLength {
+                len: 11,
+                want: 12
+            }))
+        ));
+        assert_eq!(p, before);
     }
 }

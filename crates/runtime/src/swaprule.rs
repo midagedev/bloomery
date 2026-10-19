@@ -550,6 +550,10 @@ pub struct SwapRule {
     counts: Vec<f64>,
     /// Per layer: no pass routes it ([`SwapRule::with_unrouted`]).
     unrouted: Vec<bool>,
+    /// `layer * experts + id`: the kept rows that routed the expert since
+    /// the rule was made, every stream's, undecayed; a reset keeps them
+    /// ([`SwapRule::usage`]).
+    usage: Vec<u64>,
     in_flight: Vec<usize>,
     pending: Vec<Flip>,
     /// `(row * layers + layer) * top_k`.
@@ -570,6 +574,8 @@ pub struct SwapRule {
 }
 
 impl PartialEq for SwapRule {
+    /// Every field but `usage`, which records the rule's past and decides no
+    /// plan.
     fn eq(&self, o: &Self) -> bool {
         self.params == o.params
             && self.shape == o.shape
@@ -817,6 +823,7 @@ impl SwapRule {
             expected: vec![1.0],
             counts: vec![0.0; layers * e],
             unrouted: vec![false; layers],
+            usage: vec![0; layers * e],
             in_flight: vec![0; layers],
             pending: Vec::with_capacity(most),
             rows: vec![0; shape.max_rows * layers * shape.top_k],
@@ -1090,6 +1097,61 @@ impl SwapRule {
         Ok(self.pinned[layer])
     }
 
+    /// `layer * experts + id`: the kept rows that routed each expert since
+    /// the rule was made, every stream's, undecayed and kept across resets:
+    /// what a persisted profile folds ([`crate::warmprof::WarmProfile::fold`]).
+    #[must_use]
+    pub fn usage(&self) -> &[u64] {
+        &self.usage
+    }
+
+    /// A new seed, `order[l]` layer `l`'s ranking (its first the most
+    /// wanted): each layer keeps its pinned experts, the first of its seed
+    /// list, and ranks after them `order[l]`'s experts that are neither pinned
+    /// nor away, in order. The card set stays until [`SwapRule::reset`],
+    /// which returns to the new seed. Refused by name, the rule unchanged: an
+    /// order of another length, an expert past the experts or named twice in
+    /// a layer's order, and a layer whose new list names fewer experts than
+    /// its card slots.
+    pub fn reseed(&mut self, order: &[&[u32]]) -> Result<(), SwapRuleError> {
+        if order.len() != self.layers {
+            return Err(SwapRuleError::Shape {
+                what: "a reseed must list one order per layer",
+                value: order.len(),
+            });
+        }
+        let e = self.shape.experts;
+        let mut rank = vec![UNRANKED; self.layers * e];
+        for (layer, &list) in order.iter().enumerate() {
+            let pinned = self.seed(layer)?;
+            let mut next = 0u32;
+            for &id in &pinned[..self.pinned[layer]] {
+                rank[layer * e + id as usize] = next;
+                next += 1;
+            }
+            let mut named = vec![false; e];
+            for &id in list {
+                let i = Self::index_of(layer, id, e)?;
+                if std::mem::replace(&mut named[id as usize], true) {
+                    return Err(SwapRuleError::SeedDuplicate { layer, id });
+                }
+                if rank[i] == UNRANKED && !self.away[i] {
+                    rank[i] = next;
+                    next += 1;
+                }
+            }
+            if (next as usize) < self.capacity[layer] {
+                return Err(SwapRuleError::SeedUnderCapacity {
+                    layer,
+                    seed: next as usize,
+                    capacity: self.capacity[layer],
+                });
+            }
+        }
+        self.rank = rank;
+        Ok(())
+    }
+
     /// Passes ended since the seed: the boundary the next pass starts at.
     #[must_use]
     pub fn passes(&self) -> u64 {
@@ -1246,6 +1308,7 @@ impl SwapRule {
                 let cell = row * l_n + layer;
                 for &id in &self.rows[cell * top_k..(cell + 1) * top_k] {
                     self.heat[heat + layer * e + id as usize] += 1.0;
+                    self.usage[layer * e + id as usize] += 1;
                 }
             }
         }
@@ -2043,6 +2106,51 @@ mod tests {
         a.reset();
         assert_eq!(a, history_rule());
         assert_eq!(history(&mut a, 200), first);
+    }
+
+    /// Two layers of 8 experts, 3 card slots each, the first pinned; layer
+    /// 1's expert 7 away.
+    fn placed(seed: [&[u32]; 2]) -> SwapRule {
+        let shape = Shape {
+            experts: 8,
+            top_k: 1,
+            max_rows: 4,
+        };
+        let p = params(100, 96, 1.5, 2.0, 0.9);
+        SwapRule::new_placed(p, shape, &seed, &[3, 3], &[1, 1], &[&[], &[7]]).expect("a valid rule")
+    }
+
+    /// The usage counts every kept row and a reset keeps it; a reseed keeps
+    /// each layer's pinned expert first, skips the away one, leaves the card
+    /// set until the reset, which lands the rule a fresh one from the new
+    /// lists would be. Each refusal leaves the rule unchanged.
+    #[test]
+    fn a_reseed_lands_at_the_reset_and_keeps_the_pinned() {
+        let mut r = placed([&[0, 1, 2, 3], &[0, 1, 2, 3]]);
+        replay(&mut r, &steps2(&[(5, 6), (5, 6), (4, 6)]));
+        let used = |r: &SwapRule, layer: usize, id: usize| r.usage()[layer * 8 + id];
+        assert_eq!((used(&r, 0, 5), used(&r, 0, 4), used(&r, 1, 6)), (2, 1, 3));
+        let before = r.clone();
+        for (order, want) in [
+            (vec![&[5u32, 4, 0, 3][..]], "Shape"),
+            (vec![&[5, 5, 0, 3][..], &[6, 1, 2]], "SeedDuplicate"),
+            (vec![&[5, 8][..], &[6, 1, 2]], "ExpertOutOfRange"),
+            (vec![&[5][..], &[6, 1, 2]], "SeedUnderCapacity"),
+            (vec![&[5, 4][..], &[6, 7]], "SeedUnderCapacity"),
+        ] {
+            let e = r.reseed(&order).unwrap_err();
+            assert!(format!("{e:?}").starts_with(want), "{e:?}");
+            assert_eq!(r, before);
+        }
+        r.reseed(&[&[5, 4, 0, 3], &[6, 7, 1, 2]]).unwrap();
+        assert!(r.is_live(0, 1).unwrap() && !r.is_live(0, 5).unwrap());
+        assert_eq!(
+            (r.seed(0).unwrap(), r.seed(1).unwrap()),
+            (vec![0, 5, 4], vec![0, 6, 1])
+        );
+        r.reset();
+        assert_eq!(r, placed([&[0, 5, 4, 3], &[0, 6, 1, 2]]));
+        assert_eq!(used(&r, 1, 6), 3);
     }
 
     /// Flips made at a boundary where earlier flips go live see the map after
