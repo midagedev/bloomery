@@ -15,8 +15,9 @@
 //!   drop on every path (a return, an error, an unwind);
 //! - "progress": bumped whenever the thread finishes a wait on the card
 //!   ([`wait_done`]), lands a residency boundary ([`boundary_landed`]) or
-//!   ends a guarded call. A long prompt call keeps making progress; only a
-//!   thread that sits in one place for the bound is wedged.
+//!   ends a guarded call, or finishes one token's pass inside a call that
+//!   runs a prompt as steps ([`pass_done`]). A long prompt call keeps making
+//!   progress; only a thread that sits in one place for the bound is wedged.
 //!
 //! While the thread is busy and its progress has not moved for
 //! [`crate::host::ENGINE_BOUND`], the watchdog prints one line to stderr
@@ -225,6 +226,14 @@ pub(crate) fn wait_done() {
     guarded(|w| w.progress.fetch_add(1, Ordering::Relaxed));
 }
 
+/// One token's pass inside a guarded call finished: a prompt run as steps
+/// ([`GpuModel::step`] over its ids) moves the thread token by token, and a
+/// load whose host leg never waits on the engine thread has no other word to
+/// move. Nothing outside a guarded call.
+pub(crate) fn pass_done() {
+    guarded(|w| w.progress.fetch_add(1, Ordering::Relaxed));
+}
+
 /// A residency boundary landed at `b`: the thread is moving, and the line
 /// names this boundary. Nothing outside a guarded call.
 pub(crate) fn boundary_landed(b: u64) {
@@ -394,6 +403,23 @@ mod tests {
         assert_eq!(w.busy_since.load(Ordering::Relaxed), 0);
         let p1 = w.progress.load(Ordering::Relaxed);
         wait_done();
+        assert_eq!(w.progress.load(Ordering::Relaxed), p1, "no watch guarded");
+    }
+
+    /// A prompt run as steps whose passes never wait on the engine thread
+    /// would read as wedged at the bound: each token's pass moves progress.
+    #[test]
+    fn a_token_pass_moves_progress_inside_a_guarded_call_only() {
+        let w = Arc::new(Watch::new());
+        {
+            let _b = busy(&w, TEST, 0).expect("the outer guard");
+            let p0 = w.progress.load(Ordering::Relaxed);
+            pass_done();
+            pass_done();
+            assert_eq!(w.progress.load(Ordering::Relaxed), p0 + 2);
+        }
+        let p1 = w.progress.load(Ordering::Relaxed);
+        pass_done();
         assert_eq!(w.progress.load(Ordering::Relaxed), p1, "no watch guarded");
     }
 
