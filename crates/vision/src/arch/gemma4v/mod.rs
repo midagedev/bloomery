@@ -60,6 +60,16 @@ mod tests {
         assert_eq!(prepare_clip(&long[..12], (24, 1), 16).unwrap().0, [11]);
         assert_eq!(prepare_clip(&long[..13], (25, 1), 16).unwrap().0, [12]);
         assert_eq!(prepare_clip(&[frame], (1, 2), 16).unwrap().0, [0, 0]);
+        let mut mixed = vec![Rgb8::filled(64, 64, [0; 3]); 10];
+        mixed[0] = Rgb8::filled(1000, 1, [0; 3]);
+        let (indices, prepared) = prepare_clip(&mixed, (10, 1), 16).unwrap();
+        assert_eq!(indices, [4]);
+        let rule = SizeRule::new(16, MERGE, TokenLimits::new(70, VIDEO_TOKENS).unwrap()).unwrap();
+        let (w, h) = rule.aligned(64, 64).unwrap();
+        let (nx, ny) = rule.grid(w, h);
+        assert_eq!(((w, h), nx * ny), ((432, 432), 81));
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].span_len, nx * ny);
     }
 
     /// A clip's frames are sized to the cap the planner gives, not only to the 140-token rule: a
@@ -72,15 +82,9 @@ mod tests {
         use crate::video::{ClipMeta, Sizer, plan};
         let rule = SizeRule::new(16, MERGE, TokenLimits::new(70, VIDEO_TOKENS).unwrap()).unwrap();
         let media = Media::new(rule);
-        assert_eq!(
-            media.group_size(1, 768, 768, 140).unwrap(),
-            ((528, 528), 121)
-        );
-        assert_eq!(
-            media.group_size(1, 768, 768, 100).unwrap(),
-            ((480, 480), 100)
-        );
-        let refused = media.group_size(1, 768, 768, 50).unwrap_err().to_string();
+        assert_eq!(media.group_size(768, 768, 140).unwrap(), ((528, 528), 121));
+        assert_eq!(media.group_size(768, 768, 100).unwrap(), ((480, 480), 100));
+        let refused = media.group_size(768, 768, 50).unwrap_err().to_string();
         assert!(refused.contains("over the 50 a group may"), "{refused}");
         let meta = ClipMeta {
             frames: 5,

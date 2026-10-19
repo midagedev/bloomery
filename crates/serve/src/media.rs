@@ -106,7 +106,6 @@ fn grid(first: u16, size: (usize, usize)) -> vision::Patches {
 impl vision::video::Sizer for ClipMedia {
     fn group_size(
         &self,
-        _groups: usize,
         width: usize,
         height: usize,
         cap: usize,
@@ -849,12 +848,10 @@ pub(crate) fn prepare_video(
             };
             let file = load(url)?;
             let prepared = prepare_with(&file, |frame| {
-                let (size, _) = model.video_sizer().group_size(
-                    1,
-                    frame.width,
-                    frame.height,
-                    rule.group_tokens,
-                )?;
+                let (size, _) =
+                    model
+                        .video_sizer()
+                        .group_size(frame.width, frame.height, rule.group_tokens)?;
                 model.prepare_group(std::slice::from_ref(frame), size)
             })?;
             Ok(MediaFeed {

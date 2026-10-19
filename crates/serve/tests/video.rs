@@ -122,7 +122,6 @@ struct Fixed;
 impl Sizer for Fixed {
     fn group_size(
         &self,
-        _groups: usize,
         width: usize,
         height: usize,
         _cap: usize,
