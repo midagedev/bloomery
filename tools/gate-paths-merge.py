@@ -28,6 +28,9 @@ import sys
 import tempfile
 
 OURS_M, BASE_M, SEP_M, THEIRS_M = "<<<<<<< ", "||||||| ", "=======", ">>>>>>> "
+# The token that opens the recipes column of a row whose gates the tree derives (tools/recipes.py DERIVE); merged as a gate
+# name, then put back in front, where the table's parser wants it.
+DERIVE = "derive"
 # The registered command. A checkout without this file (a branch from before it) merges the file as text, markers and all,
 # rather than failing the merge on a missing script.
 DRIVER = ("sh -c '[ -f tools/gate-paths-merge.py ] && exec python3 tools/gate-paths-merge.py \"$1\" \"$2\" \"$3\"; "
@@ -94,6 +97,9 @@ def merge_row(b, o, t):
     og, tg = o[1].split(), t[1].split()
     gates = [g for g in og if g in tg or g not in base_g]
     gates += [g for g in tg if g not in og and g not in base_g]
+    if DERIVE in gates:
+        gates.remove(DERIVE)
+        gates.insert(0, DERIVE)
     width = max(len(o), len(t), len(b) if b else 0)
     pad = lambda f: f + [""] * (width - len(f))
     bf, of, tf = pad(list(b) if b else [o[0]] + [None] * (width - 1)), pad(list(o)), pad(list(t))
@@ -324,7 +330,21 @@ def self_test():
     dup = head + "a/*.rs\tgate-x\twhy1\na/*.rs\tgate-y\twhy2\nb/*.rs\tgate-z\twhy b\n"
     ours_a = head + "a/*.rs\tgate-x gate-o\twhy1\na/*.rs\tgate-y\twhy2\nb/*.rs\tgate-z\twhy b\n"
     theirs_a = head + "a/*.rs\tgate-x\twhy1\na/*.rs\tgate-y gate-t\twhy2\nb/*.rs\tgate-z\twhy b\n"
+    # The recipes column of a row the tree derives gates for opens with `derive`; its hand names merge as gates do.
+    dbase = head + "a/*.rs\tderive gate-x\twhy a\nb/*.rs\tgate-z\twhy b\n"
+    hbase = head + "a/*.rs\tgate-x gate-y\twhy a\nb/*.rs\tgate-z\twhy b\n"
     extra = [
+        ("both add a hand name to a derive row",
+         dbase, dbase.replace("derive gate-x", "derive gate-x gate-o"), dbase.replace("derive gate-x", "derive gate-x gate-t"), 0,
+         dbase.replace("derive gate-x", "derive gate-x gate-o gate-t"), None),
+        ("one side writes derive over a hand row, the other adds a gate to it",
+         hbase, hbase.replace("gate-x gate-y", "derive"), hbase.replace("gate-x gate-y", "gate-x gate-y gate-t"), 0,
+         hbase.replace("gate-x gate-y", "derive gate-t"), None),
+        ("derive stays first when theirs adds it to a row ours added a gate to",
+         hbase, hbase.replace("gate-x gate-y", "gate-x gate-y gate-o"), hbase.replace("gate-x gate-y", "derive gate-x gate-y"), 0,
+         hbase.replace("gate-x gate-y", "derive gate-x gate-y gate-o"), None),
+        ("a glob rename against a derive row's new hand name still conflicts as before",
+         dbase, dbase.replace("a/*.rs", "a/**").replace("derive gate-x", "derive gate-x gate-o"), dbase.replace("derive gate-x", "derive gate-x gate-t"), 1, None, None),
         ("a duplicate glob outside the hunk still merges",
          dup,
          head + "a/*.rs\tgate-x\twhy1\na/*.rs\tgate-y\twhy2\nb/*.rs\tgate-z gate-o\twhy b\n",

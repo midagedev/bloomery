@@ -163,9 +163,12 @@ place. `cargo test -p bloomery-levers` is pure.
 Per family: a `gate-<fam>-meta` recipe, an e2e (or a weekly while there is no fixture), a `dump-ref-<fam>` recipe.
 Bookkeeping that turns a check red when missed (`just check-recipes`, A):
 
-- `tools/gate-paths.tsv` rows (e.g. `:85`, `:156-160`), and one glob row for the new reader,
-  `crates/model/src/arch/<arch>/**` with `gate-ops` and `gate-<arch>-meta` (then the gates `just check-recipes` names),
-  so `just narrow` bounds the next change to it instead of falling back to the full list; `tools/gate-batch-resources.tsv:36` for a solo recipe;
+- `tools/gate-paths.tsv`: one glob row for the new reader, `crates/model/src/arch/<arch>/**<TAB>derive<TAB>why`, so
+  `just narrow` bounds the next change to it instead of falling back to the full list. The table derives its gates: `derive`
+  stands for every gate whose target reaches a file of the glob or names its module, written out on read
+  (`python3 tools/recipes.py rows` prints them), so a new gate or a new edge needs no edit and there is nothing to fill
+  (`check --fill` is gone). Write gate names beside `derive` only for a gate that links the file and the derivation does not
+  reach; `tools/gate-batch-resources.tsv:36` for a solo recipe;
 - `tools/ref/ptx-shapes.tsv:200-202` for each PTX entry (the cc 12.1 tables in `tools/ref/ptx-shapes/` take the entry's row
   from a scan on a cc 12.1 card); `tools/unsafe-ratchet.txt:174` for a new crate;
 - the hard-coded device-crate list in `tools/recipes.py:8499`; `[[bin]] required-features` in

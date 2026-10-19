@@ -14,6 +14,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py ptx-compare BASE_LOG HEAD_LOG [--base-label L] [--head-label L]  # two full ptx-scan logs of one bin as one table: entries, added, removed, changed (tools/ptx-compare.sh); rc 0 nothing existing moved, 3 changed, 4 removed, 5 both
     python3 tools/recipes.py ship-bins [--rev REV]  # the shipped bins and the release features read from tools/release/build.sh: bin<TAB>features
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
+    python3 tools/recipes.py rows              # tools/gate-paths.tsv as narrow() reads it: each `derive` row's gates written out, line for line (cached by tree)
     python3 tools/recipes.py reach FILE... [--brief] [--row]  # the gates whose targets can run the file's code, each with a chain
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
@@ -194,6 +195,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import concurrent.futures
+import dataclasses
 import datetime
 import difflib
 import fcntl
@@ -2165,7 +2167,8 @@ def cmd_affected(args: argparse.Namespace) -> int:
         raise RecipeError("--scan needs --narrow")
     # Every scan log and the table are read before the diff: one the tool cannot vouch for is refused first.
     scans = [(read_scan(x), read_scan(y)) for x, y in args.scan or []]
-    rows = load_gate_paths() if args.narrow else []
+    if args.narrow:
+        load_gate_paths()  # a table this tool cannot read is refused before the diff is
     changed, a_rev, b_rev, a_label = changed_files(args.base)
     prefix = "" if args.all_recipes else GATE_PREFIX
     tmp = tempfile.mkdtemp(prefix="recipes-affected-")
@@ -2191,7 +2194,7 @@ def cmd_affected(args: argparse.Namespace) -> int:
         weekly = f", {len(trig)} of {n_weekly} weekly-recipes by a trigger" if prefix == GATE_PREFIX else ""
         total = sum(1 for n in b.recipes if n.startswith(prefix))
         rng = f"{a_label}..{b_rev[:9]}" if b_rev else f"{a_label}..(working tree)"
-        nar = narrow(changed, a, b, scans, rows, tables) if args.narrow else None
+        nar = narrow(changed, a, b, scans, expanded_table(notes=notes), tables) if args.narrow else None
         narrowed = nar is not None and not nar.full
         vitems = variant_items(list(nar.picks) if narrowed else [s.recipe for s in sels], a, b, changed, prefix) if prefix == GATE_PREFIX else []
         if narrowed:
@@ -2403,7 +2406,7 @@ def cmd_reach(args: argparse.Namespace) -> int:
     if args.row:
         names = [n for n in gates if n in union]
         glob = args.files[0] if len(args.files) == 1 else "{" + ",".join(_norm(f) for f in args.files) + "}"
-        print(f"{glob}\t{' '.join(names) if names else '-'}\t({len(names)} gates)")
+        print(f"{glob}\t{DERIVE}\t({len(names)} gates reach it through a dependency; the row derives them)")
     return 0
 
 
@@ -2484,7 +2487,8 @@ def cmd_expand(args: argparse.Namespace) -> int:
 #     script names, a path literal, the recipe's own text in the justfile;
 #   - when some gate reads it through a dependency edge (a workspace lib a target links, a crate
 #     manifest, a cargo global, box.sh's profile files): the recipes of the rows of
-#     tools/gate-paths.tsv whose glob matches it, all of them. No row: the full list, naming the file.
+#     tools/gate-paths.tsv whose glob matches it, all of them (a `derive` row's recipes are the gates the tree derives for
+#     it, written out on read by expanded_table). No row: the full list, naming the file.
 #     A row whose recipes are `*`: the full list, naming the row;
 #   - a file under docs/, a `.card` or a `*.md` needs no row (not a host path);
 #   - the gates of a kernel carrier no scan pair covers, whenever the change touches that carrier's
@@ -2701,13 +2705,21 @@ class PathRow:
     why: str
     pattern: re.Pattern
     exceptions: dict[str, str] = field(default_factory=dict)  # gate the derivation says reaches a file of the row -> why it is left out
+    derive: bool = False  # the recipes column opens with `derive`: expand_rows adds the gates the tree derives, before the hand names
 
     def every(self) -> bool:
         return self.recipes == ["*"]
 
-    def gates(self) -> list[str]:
-        """The names that map a file for narrow(): the row's gate-* recipes, or `*`."""
+    def hand_gates(self) -> list[str]:
+        """The gate-* names the table's text writes in the row (for a `derive` row, the extras beyond the derivation)."""
         return [n for n in self.recipes if not n.startswith(WEEKLY_PREFIX)]
+
+    def gates(self) -> list[str]:
+        """The names that map a file for narrow(): the row's gate-* recipes, or `*`. A `derive` row has them only once
+        expand_rows has run: reading its hand names alone would drop the derived gates without a word."""
+        if self.derive:
+            raise RecipeError(f"{GATE_PATHS}:{self.line}: the `derive` row {self.glob} is read before expand_rows names its gates")
+        return self.hand_gates()
 
     def weeklies(self) -> list[str]:
         """The row's triggers: weekly-* recipes it names by a change of a file it matches."""
@@ -2766,15 +2778,27 @@ def parse_exceptions(text: str) -> dict[str, str]:
     return out
 
 
-def load_gate_paths(root: str = ROOT) -> list[PathRow]:
-    """The table: `glob<TAB>recipes<TAB>why[<TAB>exceptions]`, recipes space-separated or the literal `*`, the
-    exceptions as parse_exceptions reads them; `#` lines and blank lines skipped. Anything else is a named error."""
+DERIVE = "derive"
+
+
+def read_gate_paths_text(root: str) -> str:
     path = os.path.join(root, GATE_PATHS)
     try:
         with open(path, encoding="utf-8") as fh:
-            text = fh.read()
+            return fh.read()
     except OSError as err:
         raise RecipeError(f"{GATE_PATHS}: {err.strerror}") from err
+
+
+def load_gate_paths(root: str = ROOT) -> list[PathRow]:
+    """The table as its text writes it: rows with `derive` still unexpanded (expanded_table reads them as narrow() needs)."""
+    return parse_gate_paths(read_gate_paths_text(root))
+
+
+def parse_gate_paths(text: str) -> list[PathRow]:
+    """`glob<TAB>recipes<TAB>why[<TAB>exceptions]`, recipes space-separated, the literal `*`, or `derive` first and then
+    the hand names beyond what the tree derives; the exceptions as parse_exceptions reads them; `#` lines and blank
+    lines skipped. Anything else is a named error."""
     rows: list[PathRow] = []
     for n, ln in enumerate(text.split("\n"), 1):
         if not ln.strip() or ln.startswith("#"):
@@ -2787,6 +2811,11 @@ def load_gate_paths(root: str = ROOT) -> list[PathRow]:
             raise RecipeError(f"{GATE_PATHS}:{n}: `*` stands alone — it means every gate")
         if len(set(names)) != len(names):
             raise RecipeError(f"{GATE_PATHS}:{n}: a recipe named twice")
+        derive = names[0] == DERIVE
+        if DERIVE in names[1:]:
+            raise RecipeError(f"{GATE_PATHS}:{n}: `{DERIVE}` opens the recipes column or is not in it")
+        if derive:
+            names = names[1:]
         if f[0].startswith("/") or ".." in f[0].split("/"):
             raise RecipeError(f"{GATE_PATHS}:{n}: the glob {f[0]} is not a path relative to the tree")
         try:
@@ -2799,7 +2828,7 @@ def load_gate_paths(root: str = ROOT) -> list[PathRow]:
             raise RecipeError(f"{GATE_PATHS}:{n}: {both[0]} is both in the row and left out of it")
         if exceptions and names == ["*"]:
             raise RecipeError(f"{GATE_PATHS}:{n}: a `*` row leaves no gate out")
-        rows.append(PathRow(n, f[0], names, f[2], pattern, exceptions))
+        rows.append(PathRow(n, f[0], names, f[2], pattern, exceptions, derive))
     if not rows:
         raise RecipeError(f"{GATE_PATHS}: no rows")
     return rows
@@ -3957,8 +3986,71 @@ def reach_chain(tree: Tree, graph: Graph, n: str, node: int) -> str:
     r = reach_of(tree)
     return r.chain(r.gate(graph, n), node)
 
+
+@dataclass
+class Derivation:
+    """What the tree holds for one row beyond its hand names (row_derivation)."""
+
+    # gate -> (a file of the row it reaches through a dependency, that file's unit); exceptions and held names left out
+    reach: dict[str, tuple[str, int]]
+    excepted: set[str]  # the row's exceptions that name a gate reaching a file of the row
+    # gate -> (target kind, target name, the file of that target that names the module, the module); held names left out
+    named: dict[str, tuple[str, str, str, str]]
+
+    def gates(self, order: list[str]) -> list[str]:
+        """The derived gates in `order` (the justfile's)."""
+        return [n for n in order if n in self.reach or n in self.named]
+
+
+def row_derivation(tree: Tree, graph: Graph, gates: list[str], matched: list[str], r: PathRow, held: set[str]) -> Derivation:
+    """The gates the tree says belong in row `r` over the files `matched`, `held` names left out: the gates whose reach
+    holds a file the glob matches through a dependency edge (dep_reach), less the row's exceptions, and the gates whose
+    own target names the module the glob stands for. gate-ptx-spill is never one: narrow() adds it on its own rule."""
+    held = held | set(NARROW_ALWAYS)
+    reach: dict[str, tuple[str, int]] = {}
+    excepted: set[str] = set()
+    for f in matched:
+        for n, node in dep_reach(tree, graph, gates, f).items():
+            if n in held:
+                continue
+            if n in r.exceptions:
+                excepted.add(n)
+                continue
+            reach.setdefault(n, (f, node))
+    named: dict[str, tuple[str, str, str, str]] = {}
+    mods = [m for m in (module_of(tree, alt) for alt in glob_alternatives(r.glob)) if m is not None]
+    paths = [((ident, *rest), kids) for pkg, rest, kids in mods for ident in sorted(crate_idents(tree, pkg))]
+    pkgs = {m[0] for m in mods}
+    if paths:
+        for n in gates:
+            if n in held:
+                continue
+            for pname, kind, tname, _ in graph.inputs(n).targets:
+                if pname in pkgs or kind in ("lib", "libtest", "doctest"):
+                    continue
+                t = tree.packages[pname].find(kind, tname or "")
+                if t is None:
+                    continue
+                own, _ = tree.tree_of(t.src, test=True)
+                hit = next((f for f in sorted(own) if any(names_module(named_paths(tree.read(f)), p, kids) for p, kids in paths)), None)
+                if hit:
+                    named[n] = (kind, tname or "", hit, "::".join(paths[0][0]))
+                    break
+    return Derivation(reach, excepted, named)
+
+
+def gate_order(recipes: dict[str, Recipe]) -> list[str]:
+    """The gate-* recipes in justfile order."""
+    return [n for n in sorted(recipes, key=lambda n: recipes[n].line) if n.startswith(GATE_PREFIX)]
+
+
+def expanded_row(r: PathRow, derived: list[str]) -> PathRow:
+    """`derive` row `r` with the derived gates first, then its hand names and triggers, each once."""
+    return dataclasses.replace(r, derive=False, recipes=list(dict.fromkeys([*derived, *r.recipes])))
+
+
 def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathRow] | None = None, stats: dict[str, int] | None = None,
-                        adds: dict[int, list[str]] | None = None) -> list[str]:
+                        derived: dict[int, list[str]] | None = None) -> list[str]:
     """The table against the tree: each row's recipes are gate recipes; its glob matches a file and a gate reads
     one of its files through a dependency edge (a row for files only own targets read maps nothing); each file it
     matches that a gate reads through a dependency edge is in the inputs of every recipe the row names
@@ -3966,21 +4058,23 @@ def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathR
     file the glob matches through a dependency edge is in the row or named by the row's exceptions, each
     exception naming such a gate (a gate that reaches the file through another lib's code is never left out
     silently); and every gate whose own target names the module the glob stands for is in the row (a gate
-    that calls into the module directly is never left out). `stats`, when given, gains the counts the
-    summary prints: rows held to the derivation, exceptions, the gates they name. `adds`, when given, gains per row line
-    the gates a problem says to add to that row (`check --fill` writes them)."""
+    that calls into the module directly is never left out). A `derive` row stands for exactly those gates, so it
+    holds the first two clauses for them, and a `derive` row the tree derives no gate for is refused. `stats`, when given, gains
+    the counts the summary prints: rows held to the derivation, exceptions, the gates they name. `derived`, when given,
+    gains per `derive` row line the gates the tree derives for it (expand_rows reads the same)."""
     try:
         rows = rows if rows is not None else load_gate_paths(tree.root)
     except RecipeError as err:
         return [str(err)]
     graph = Graph(tree, recipes)
-    gates = [n for n in sorted(recipes, key=lambda n: recipes[n].line) if n.startswith(GATE_PREFIX)]
+    gates = gate_order(recipes)
     files = shipped_files(tree.root)
     problems: list[str] = []
     for r in rows:
         at = f"{GATE_PATHS}:{r.line} {r.glob}"
+        hand = r.hand_gates()
         if not r.every():
-            for n in r.gates():
+            for n in hand:
                 if n not in recipes or not n.startswith(GATE_PREFIX):
                     problems.append(f"{at}: {n} is not a gate-* recipe in the justfile")
             for n in r.weeklies():
@@ -3999,67 +4093,206 @@ def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathR
         for n in r.weeklies():
             if n in recipes and not any(graph.inputs(n).match(f) for f in matched):
                 problems.append(f"{at}: {n} reads none of the {len(matched)} files the glob matches — a trigger off its gate")
-        if not r.gates():
+        if not (r.derive or hand):
             continue
-        named = [n for n in r.gates() if n in recipes]
         deps = [f for f in matched if any(not _own_origin(w) for w in (graph.inputs(n).match(f) for n in gates) if w)]
         if not deps:
             problems.append(f"{at}: no gate reads a file the glob matches through a dependency — an own target's read selects "
                             "its recipes without a row (narrow()) — take the row out")
             continue
+        # the derivation: a gate whose targets can run code of a file the glob matches, through another lib's code
+        d = row_derivation(tree, graph, gates, matched, r, set() if r.derive else set(hand))
+        got = d.gates(gates)
+        if r.derive:
+            if not got:
+                problems.append(f"{at}: `{DERIVE}` stands for no gate — no gate reaches a file the glob matches through a dependency and "
+                                "none has an own target naming its module — write the gates by hand, or take the row out")
+                continue
+            for n in sorted(set(r.exceptions) & set(d.named)):
+                problems.append(f"{at}: {n} runs {d.named[n][0]} {d.named[n][1]}, whose {d.named[n][2]} names {d.named[n][3]} — the exceptions "
+                                "cannot leave it out of the row")
+            derived_here = set(got)
+            if derived is not None:
+                derived[r.line] = got
+        else:
+            derived_here = set()
+        named = [n for n in dict.fromkeys([*got, *hand] if r.derive else hand) if n in recipes]
         unread: dict[str, list[str]] = {}
         for f in deps:
             for n in named:
                 if graph.inputs(n).match(f) is None:
                     unread.setdefault(n, []).append(f)
         for n, fs in unread.items():
+            fix = ("split the glob so the gate reads every file it matches, or name it in the row's exceptions" if n in derived_here
+                   else "take it out of the row")
             problems.append(f"{at}: {n} does not read {fs[0]}{f' and {len(fs) - 1} more files the glob matches' if len(fs) > 1 else ''} "
-                            "(its targets do not link them) — take it out of the row")
-        # the derivation: a gate whose targets can run code of a file the glob matches, through another lib's code
-        held = set(r.gates()) | set(NARROW_ALWAYS)
-        missing: dict[str, tuple[str, int]] = {}
-        used: set[str] = set()
-        for f in matched:
-            for n, node in dep_reach(tree, graph, gates, f).items():
-                if n in held:
-                    continue
-                if n in r.exceptions:
-                    used.add(n)
-                    continue
-                missing.setdefault(n, (f, node))
-        for n, (f, node) in missing.items():
-            problems.append(f"{at}: {n} reaches {f} — add it to the row, or name it in the row's exceptions with the reason; "
-                            f"the chain: {reach_chain(tree, graph, n, node)}")
-            if adds is not None:
-                adds.setdefault(r.line, []).append(n)
-        for n in sorted(set(r.exceptions) - used):
+                            f"(its targets do not link them) — {fix}")
+        if not r.derive:
+            for n, (f, node) in d.reach.items():
+                problems.append(f"{at}: {n} reaches {f} — add it to the row, or write `{DERIVE}`, or name it in the row's exceptions "
+                                f"with the reason; the chain: {reach_chain(tree, graph, n, node)}")
+        for n in sorted(set(r.exceptions) - d.excepted):
             problems.append(f"{at}: the exception names {n}, which reaches no file the glob matches through a dependency — take it out")
         if stats is not None:
             stats["rows"] = stats.get("rows", 0) + 1
             stats["exceptions"] = stats.get("exceptions", 0) + (1 if r.exceptions else 0)
             stats["excepted"] = stats.get("excepted", 0) + len(r.exceptions)
-        mods = [m for m in (module_of(tree, alt) for alt in glob_alternatives(r.glob)) if m is not None]
-        paths = [((ident, *rest), kids) for pkg, rest, kids in mods for ident in sorted(crate_idents(tree, pkg))]
-        pkgs = {m[0] for m in mods}
-        if not paths:
-            continue
-        for n in gates:
-            if n in r.recipes or n in NARROW_ALWAYS:
-                continue
-            for pname, kind, tname, _ in graph.inputs(n).targets:
-                if pname in pkgs or kind in ("lib", "libtest", "doctest"):
-                    continue
-                t = tree.packages[pname].find(kind, tname or "")
-                if t is None:
-                    continue
-                own, _ = tree.tree_of(t.src, test=True)
-                hit = next((f for f in sorted(own) if any(names_module(named_paths(tree.read(f)), p, kids) for p, kids in paths)), None)
-                if hit:
-                    problems.append(f"{at}: {n} runs {kind} {tname}, whose {hit} names {'::'.join(paths[0][0])} — add {n} to the row")
-                    if adds is not None:
-                        adds.setdefault(r.line, []).append(n)
-                    break
+        if not r.derive:
+            for n, (kind, tname, hit, mod) in d.named.items():
+                problems.append(f"{at}: {n} runs {kind} {tname}, whose {hit} names {mod} — add {n} to the row")
     return problems
+
+
+# ---- the table's `derive` rows: expanded on read, cached by tree ----
+#
+# A `derive` row commits the glob, the hand names and the reason; the gates the tree derives for it are not
+# in the file. Whoever reads a row for its gates (narrow(), `rows`) reads expanded_table: the file's text with
+# each derive row's gates in, from the cache of the tree when one exists. The check derives the same gates for
+# its own clauses and writes that cache.
+
+with open(os.path.abspath(__file__), "rb") as _fh:
+    _CODE_SHA = hashlib.sha256(_fh.read()).digest()  # the derivation's code as this process read it, not as the file is by the time a key is made
+GATE_PATHS_CACHE = "~/.cache/bloomery/gate-paths"
+GATE_PATHS_CACHE_KEEP = 16  # expanded tables kept, newest first: one per tree a landing or a check has seen
+_EXPANDED: dict[tuple[str, str], list[PathRow]] = {}
+
+
+def expand_rows(tree: Tree, recipes: dict[str, Recipe], rows: list[PathRow], graph: Graph | None = None) -> list[PathRow]:
+    """`rows` with each `derive` row replaced by the same row naming the gates the tree derives for it (row_derivation), then
+    its hand names. A `derive` row the tree derives no gate for, or whose exceptions leave out a gate the derivation
+    names, is a named error: the table is wrong, and a silent empty row would drop its files from every narrowed list."""
+    if not any(r.derive for r in rows):
+        return rows
+    graph = graph if graph is not None else Graph(tree, recipes)
+    gates = gate_order(recipes)
+    files = shipped_files(tree.root)
+    out: list[PathRow] = []
+    for r in rows:
+        if not r.derive:
+            out.append(r)
+            continue
+        at = f"{GATE_PATHS}:{r.line} {r.glob}"
+        d = row_derivation(tree, graph, gates, [f for f in files if r.pattern.match(f)], r, set())
+        got = d.gates(gates)
+        if not got:
+            raise RecipeError(f"{at}: `{DERIVE}` stands for no gate — nothing the tree reads reaches a file the glob matches through a "
+                              "dependency, and no gate has an own target naming its module")
+        clash = sorted(set(r.exceptions) & set(got))
+        if clash:
+            raise RecipeError(f"{at}: {clash[0]} is derived for the row and the exceptions leave it out")
+        out.append(expanded_row(r, got))
+    return out
+
+
+def expanded_text(text: str, rows: list[PathRow], expanded: list[PathRow]) -> str:
+    """The table's `text` with each `derive` row's recipes column written out: the same lines, so a row keeps its line number."""
+    lines = text.split("\n")
+    for raw, new in zip(rows, expanded):
+        if raw.derive:
+            f = lines[raw.line - 1].split("\t")
+            f[1] = " ".join(new.recipes)
+            lines[raw.line - 1] = "\t".join(f)
+    return "\n".join(lines)
+
+
+def gate_paths_key(root: str, text: str) -> str | None:
+    """The cache key of the expansion of the table `text` over the tree at `root`, or None when that tree has no identity this can
+    vouch for (not a git work tree of its own, as a `git archive` copy is not): the bytes of this file as it was read (the derivation's code), the
+    table's text, the tree HEAD holds, the tracked changes against it, and the name, size and mtime of each untracked file git does not
+    ignore. A file git ignores is not in the key: a gate's reach would have to read it."""
+    if not os.path.exists(os.path.join(root, ".git")):
+        return None
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+
+    def run(*args: str) -> bytes | None:
+        p = subprocess.run(["git", "-C", root, *args], capture_output=True, env=env)
+        return p.stdout if p.returncode == 0 else None
+
+    top, head, diff, others = (run("rev-parse", "--show-toplevel"), run("rev-parse", "HEAD^{tree}"), run("diff", "HEAD", "--binary"),
+                               run("ls-files", "--others", "--exclude-standard", "-z"))
+    if top is None or head is None or diff is None or others is None or os.path.realpath(top.decode().strip()) != os.path.realpath(root):
+        return None
+    h = hashlib.sha256()
+    h.update(_CODE_SHA)
+    h.update(hashlib.sha256(text.encode()).digest())
+    h.update(head.strip())
+    h.update(hashlib.sha256(diff).digest())
+    for name in sorted(x for x in others.split(b"\0") if x):
+        try:
+            st = os.stat(os.path.join(root, name.decode(errors="surrogateescape")))
+        except OSError:
+            return None
+        h.update(name + f"\0{st.st_size}\0{st.st_mtime_ns}\0".encode())
+    return h.hexdigest()
+
+
+def read_expanded_cache(path: str, rows: list[PathRow]) -> list[PathRow] | None:
+    """The cached expansion at `path` when it is the table `rows` reads and nothing else (every row's line, glob, reason, exceptions
+    and hand names, and no `derive` left); a missing, unreadable or foreign file is a miss."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            got = parse_gate_paths(fh.read())
+    except (OSError, RecipeError):
+        return None
+    if len(got) != len(rows) or any(g.derive or (g.line, g.glob, g.why, g.exceptions) != (r.line, r.glob, r.why, r.exceptions)
+                                    or not set(r.recipes) <= set(g.recipes) for g, r in zip(got, rows)):
+        return None
+    return got
+
+
+def store_expanded_cache(path: str, text: str) -> None:
+    """Writes the expanded table at `path` through a rename, then keeps the newest GATE_PATHS_CACHE_KEEP of its directory."""
+    d = os.path.dirname(path)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+        kept = sorted((e for e in os.scandir(d) if e.name.endswith(".tsv")), key=lambda e: e.stat().st_mtime, reverse=True)
+        for e in kept[GATE_PATHS_CACHE_KEEP:]:
+            os.unlink(e.path)
+    except OSError:
+        pass  # a cache: a home that cannot be written costs the next reader a derivation, never a wrong table
+
+
+def expanded_table(root: str = ROOT, side: Side | None = None, cache_dir: str = GATE_PATHS_CACHE, notes: list[str] | None = None) -> list[PathRow]:
+    """The table at `root` as narrow() reads it: each `derive` row expanded over the tree at `root`. `side`, when given, is that
+    tree read with no dep-info attached (a box's dep-info would change a bin's files and so the derivation). The expansion is
+    kept in-process and on disk by the tree's key (gate_paths_key); the check writes it, so a landing that ran the check reads it."""
+    text = read_gate_paths_text(root)
+    rows = parse_gate_paths(text)
+    if not any(r.derive for r in rows):
+        return rows
+    memo = (os.path.realpath(root), hashlib.sha256(text.encode()).hexdigest())
+    if memo in _EXPANDED:
+        return _EXPANDED[memo]
+    key = gate_paths_key(root, text)
+    path = os.path.join(os.path.expanduser(cache_dir), key + ".tsv") if key else None
+    n = sum(1 for r in rows if r.derive)
+    hit = read_expanded_cache(path, rows) if path else None
+    if hit is not None:
+        if notes is not None:
+            notes.append(f"{GATE_PATHS}: {n} derive rows read from the cache of this tree ({key[:12]})")
+        _EXPANDED[memo] = hit
+        return hit
+    if sys.stderr.isatty():  # `just affected 2>&1 > LIST` is what tools/gate-batch.sh --list reads: its first lines must stay the recipe line and `affected:`
+        print(f"recipes.py: deriving the gates of {n} rows of {GATE_PATHS} (no cache for this tree; the check writes one)", file=sys.stderr)
+    side = side if side is not None else make_side(root)
+    out = expand_rows(side.tree, side.recipes, rows, side.graph)
+    if path:
+        store_expanded_cache(path, expanded_text(text, rows, out))
+    if notes is not None:
+        notes.append(f"{GATE_PATHS}: {n} derive rows derived from the tree" + (f", cached as {key[:12]}" if key else " (a tree with no git identity: not cached)"))
+    _EXPANDED[memo] = out
+    return out
+
+
+def cmd_rows(args: argparse.Namespace) -> int:
+    """The table as narrow() reads it, `derive` rows expanded: the file's text, line for line."""
+    text = read_gate_paths_text(ROOT)
+    print(expanded_text(text, parse_gate_paths(text), expanded_table(ROOT)), end="")
+    return 0
 
 
 def weekly_problems(recipes: dict[str, Recipe], rows: list[PathRow] | None = None, root: str = ROOT) -> list[str]:
@@ -4666,42 +4899,38 @@ def static_problems(tree: Tree, recipes: dict[str, Recipe], names: tuple[str, ..
     return problems
 
 
-def fill_gate_paths(text: str, adds: dict[int, list[str]]) -> tuple[str, int]:
-    """The table's text with each row line of `adds` gaining those gates at the end of its recipes column, each once; and how
-    many gates went in. A line that is not a row of gates (a comment, `*`) is left as it is."""
-    lines, n = text.split("\n"), 0
-    for ln, names in adds.items():
-        f = lines[ln - 1].split("\t")
-        if len(f) < 3 or f[0].startswith("#") or f[1] == "*":
-            continue
-        have = f[1].split()
-        new = [g for g in dict.fromkeys(names) if g not in have]
-        f[1] = " ".join(have + new)
-        lines[ln - 1] = "\t".join(f)
-        n += len(new)
-    return "\n".join(lines), n
-
-
 def cmd_check(args: argparse.Namespace) -> int:
+    if args.fill:
+        raise RecipeError(f"--fill is gone: {GATE_PATHS} derives its gates (a row's `{DERIVE}` stands for them), so there is nothing to fill; "
+                          "write `derive` in the recipes column of a row that should hold what the tree derives")
     tree = Tree(ROOT)
     recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
-    if args.fill:
-        adds: dict[int, list[str]] = {}
-        gate_paths_problems(tree, recipes, adds=adds)
-        path = os.path.join(ROOT, GATE_PATHS)
-        text, n = fill_gate_paths(open(path).read(), adds)
-        if n:
-            with open(path, "w") as fh:
-                fh.write(text)
-        print(f"check-recipes: --fill put {n} gates into {len(adds)} rows of {GATE_PATHS}; the check below reads the filled table")
     held: dict[str, int] = {}
-    problems = (check(tree, recipes) + plan_problems(ROOT, recipes) + gate_paths_problems(tree, recipes, stats=held) + weekly_problems(recipes)
+    derived: dict[int, list[str]] = {}
+    gp = gate_paths_problems(tree, recipes, stats=held, derived=derived)
+    problems = (check(tree, recipes) + plan_problems(ROOT, recipes) + gp + weekly_problems(recipes)
                 + host_problems(tree, recipes) + static_problems(tree, recipes) + nightly_problems(tree, load_lock(tree.root)))
     for p in problems:
         print(f"check-recipes: {p}", file=sys.stderr)
     print(f"check-recipes: {GATE_PATHS}: {held.get('rows', 0)} gate rows held to the derivation, {held.get('exceptions', 0)} rows "
           f"with exceptions naming {held.get('excepted', 0)} gates")
+    if not gp and args.justfile is None:
+        store_checked_expansion(ROOT, derived)
     return 1 if problems else 0
+
+
+def store_checked_expansion(root: str, derived: dict[int, list[str]]) -> None:
+    """Writes the cache of the table the check just held to the tree: the derivation is already in hand, so a later `affected
+    --narrow` of this tree reads it instead of deriving."""
+    text = read_gate_paths_text(root)
+    rows = parse_gate_paths(text)
+    if not any(r.derive for r in rows):
+        return
+    key = gate_paths_key(root, text)
+    if key is None:
+        return
+    expanded = [expanded_row(r, derived[r.line]) if r.derive else r for r in rows]
+    store_expanded_cache(os.path.join(os.path.expanduser(GATE_PATHS_CACHE), key + ".tsv"), expanded_text(text, rows, expanded))
 
 
 # ----------------------------------------------------------------------------------------------
@@ -9883,14 +10112,45 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
         for f in ("base/data/list.txt", "tools/table.tsv"):
             got = gate_paths_problems(st, rs, [row(f, ["gate-app", "gate-mid"])])
             expect(not got, f"gate-paths: a row naming the gates that reach {f} by a literal is refused: {got[:2]}")
-            adds: dict[int, list[str]] = {}
-            got = gate_paths_problems(st, rs, [row(f, ["gate-mid"])], adds=adds)
-            text, n = fill_gate_paths("# t\n" + f + "\tgate-mid\twhy\n", {ln: names for ln, names in ((2, v) for v in adds.values())})
-            expect(list(adds.values()) == [["gate-app"]] and n == 1 and text == "# t\n" + f + "\tgate-mid gate-app\twhy\n",
-                   f"gate-paths: --fill puts the gate a row lacks at the end of its recipes, once: adds {adds}, {n} in, {text!r}")
-            expect(fill_gate_paths("# t\n*\t*\tw\n", {2: ["gate-app"]}) == ("# t\n*\t*\tw\n", 0), "gate-paths: --fill writes into a `*` row")
-            expect(any(p.endswith(f"gate-app reaches {f} — add it to the row, or name it in the row's exceptions with the reason; the chain: {reach_chain(st, sg, 'gate-app', dep_reach(st, sg, ['gate-app'], f)['gate-app'])}") for p in got),
+            got = gate_paths_problems(st, rs, [row(f, ["gate-mid"])])
+            expect(any(p.endswith(f"gate-app reaches {f} — add it to the row, or write `derive`, or name it in the row's exceptions with the reason; the chain: {reach_chain(st, sg, 'gate-app', dep_reach(st, sg, ['gate-app'], f)['gate-app'])}") for p in got),
                    f"gate-paths: a row leaving out the gate that reaches {f} by a literal is not refused with its chain: {got[:2]}")
+            # a `derive` row stands for the gates the tree derives: clean with none written, the gate the hand row lacked in it, and a
+            # hand name beside it once; expand_rows writes the same names, and the row is unreadable for its gates before that
+            drv: dict[int, list[str]] = {}
+            got = gate_paths_problems(st, rs, [row(f, [], derive=True)], derived=drv)
+            expect(not got and "gate-app" in drv.get(1, []), f"gate-paths: a `derive` row for {f} is refused, or derives no gate-app: {got[:2]} {drv}")
+            ex = expand_rows(st, rs, [row(f, ["gate-mid"], derive=True)])
+            expect(len(ex) == 1 and not ex[0].derive and ex[0].recipes == list(dict.fromkeys([*drv.get(1, []), "gate-mid"])) and ex[0].gates() == ex[0].recipes,
+                   f"gate-paths: expand_rows writes the derived gates then the hand names, once each: {[e.recipes for e in ex]} for {drv}")
+            expect(_raises(lambda: row(f, [], derive=True).gates(), "is read before expand_rows names its gates"),
+                   "gate-paths: a `derive` row's gates() read before expand_rows is not refused by name")
+        # a file a gate links through a dependency that no reached unit names: the tree derives no gate for it, so `derive` is refused
+        # and a hand row naming the gate stands
+        got = gate_paths_problems(st, rs, [row("base/data/idle.txt", [], derive=True)])
+        expect(len(got) == 1 and "`derive` stands for no gate" in got[0], f"gate-paths: a `derive` row with an empty derivation not refused by name: {got}")
+        expect(_raises(lambda: expand_rows(st, rs, [row("base/data/idle.txt", [], derive=True)]), "`derive` stands for no gate"),
+               "gate-paths: expand_rows on a `derive` row with an empty derivation not refused by name")
+        got = gate_paths_problems(st, rs, [row("base/data/idle.txt", ["gate-app"])])
+        expect(not got, f"gate-paths: a hand row for a file the tree derives no gate for is refused: {got[:2]}")
+        # the table read for narrow(): a miss derives, notes it, writes nothing to a stderr that is no terminal (gate-batch --list
+        # reads `just affected … 2>&1`, whose first lines must stay the recipe line and `affected:`), and keeps the result per table
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory(prefix="recipes-gp-table-") as tbl:
+            os.makedirs(os.path.join(tbl, "tools"))
+            with open(os.path.join(tbl, GATE_PATHS), "w", encoding="utf-8") as fh:
+                fh.write("# t\nbase/data/list.txt\tderive gate-mid\twhy\n")
+            notes: list[str] = []
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                table = expanded_table(tbl, Side(st, rs, sg), os.path.join(tbl, "cache"), notes)
+            expect(err.getvalue() == "", f"gate-paths: a derivation on a cache miss writes to a stderr that is no terminal: {err.getvalue()!r}")
+            expect(len(table) == 1 and table[0].line == 2 and not table[0].derive and "gate-app" in table[0].gates() and table[0].gates()[-1] == "gate-mid",
+                   f"gate-paths: expanded_table does not write the derived gates then the hand name: {[(t.line, t.recipes) for t in table]}")
+            expect(any("derived from the tree" in x for x in notes), f"gate-paths: a derivation leaves no note: {notes}")
+            expect(expanded_table(tbl, Side(st, rs, sg), os.path.join(tbl, "cache"), notes) is table, "gate-paths: a second read of one table derives again")
         # one label for a target's own read whether it names a file or a directory (origin_label): a test's own
         # directory literal is the test's own, a lib's is a dependency edge, as a file of either is
         own_dir, lib_dir = sg.inputs("gate-app").match("tools/own-held/a.ids"), sg.inputs("gate-app").match("tools/lib-held/b.ids")
@@ -10192,11 +10452,14 @@ def narrow_self_test(expect, side: Side) -> None:
         gates_all = [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if n.startswith(GATE_PREFIX)]
         every = tuple(sorted({c.bundle for c in kernel_carriers(side, gates_all)}))
         covering = [pair(f"cover-{b}", b, every) for b in ("gx", *sorted(c.bin for c in kernel_carriers(side, gates_all) if c.bin))]
-        table = load_gate_paths(side.tree.root)
         shipped = shipped_files(side.tree.root)
-        for what, glob, via_row in (("the shipped head list", "crates/model/data/mtp-head-rows-qwen38-*.txt", True),
-                                    ("a holdout file", "crates/models/tests/data/head-holdout/*.ids", False),
-                                    ("the fixture variants' table", "tools/fixture-variants.tsv", True)):
+        probe = (("the shipped head list", "crates/model/data/mtp-head-rows-qwen38-*.txt", True),
+                 ("a holdout file", "crates/models/tests/data/head-holdout/*.ids", False),
+                 ("the fixture variants' table", "tools/fixture-variants.tsv", True))
+        # the rows these files match, expanded over the tree: the table narrow() reads, less the rows no probe reaches
+        probed = [f for _, glob, _ in probe for f in shipped if glob_regex(glob).match(f)]
+        table = expand_rows(side.tree, side.recipes, [r for r in load_gate_paths(side.tree.root) if any(r.pattern.match(f) for f in probed)], side.graph)
+        for what, glob, via_row in probe:
             found = [f for f in shipped if glob_regex(glob).match(f)]
             expect(bool(found), f"narrow: {what} ({glob}) matches no file of the tree")
             if not found:
@@ -10250,8 +10513,8 @@ def narrow_self_test(expect, side: Side) -> None:
 def narrow_table_self_test(expect, side: Side) -> None:
     """The gate-paths table's checks and the host group's guard on the real tree."""
 
-    def row(glob: str, names: list[str], line: int = 1) -> PathRow:
-        return PathRow(line, glob, names, "why", glob_regex(glob))
+    def row(glob: str, names: list[str], line: int = 1, derive: bool = False) -> PathRow:
+        return PathRow(line, glob, names, "why", glob_regex(glob), derive=derive)
 
     # the table's checks: planted rows, each refused by name; the real table clean
     tree, recipes = side.tree, side.recipes
@@ -10284,8 +10547,9 @@ def narrow_table_self_test(expect, side: Side) -> None:
     expect(glob_regex("x/{a.rs,b/**}").match("x/b/c/d.rs") and not glob_regex("x/*.rs").match("x/b/c.rs"), "gate-paths: glob `**`, `*` and braces")
     stats: dict[str, int] = {}
     got = gate_paths_problems(tree, recipes, stats=stats)
-    expect(not got, f"gate-paths: the real table, {len(got)} problems (`python3 tools/recipes.py check --fill` adds the missing gates):\n"
+    expect(not got, f"gate-paths: the real table, {len(got)} problems (a row that holds the derivation writes `{DERIVE}` in its recipes column):\n"
            + "\n".join(got))
+    derive_self_test(expect, side, row)
     reach_self_test(expect, side, row, stats)
     # the host group: the real host recipes pass; gate-gpu-lib, whose hw_ tests use the card, is refused by name
     expect(not host_problems(tree, recipes), f"host: the real justfile: {host_problems(tree, recipes)[:2]}")
@@ -10302,6 +10566,84 @@ def narrow_table_self_test(expect, side: Side) -> None:
     got = host_problems(tree, planted)
     expect(any("gate-gpu-ds41-long" in p and "[group('solo')]" in p for p in got) and any("gate-gpu-ds41-long" in p and "runs a card gate" in p for p in got),
            f"host: a host recipe that is solo and runs a card gate not refused: {got}")
+
+
+def derive_self_test(expect, side: Side, row) -> None:
+    """The `derive` rows: both halves of the derivation on the real tree, the text form and its refusals, the expanded text, the
+    cache and its key, the named end of `--fill`."""
+    tree, recipes = side.tree, side.recipes
+    # the gate that reaches a file through another lib's code, and the gate whose bin names the module: the two halves of one derivation
+    drv: dict[int, list[str]] = {}
+    gate_paths_problems(tree, recipes, [row("crates/model/src/{ops.rs,moe.rs}", [], derive=True)], derived=drv)
+    expect("gate-gpu-ds41-step" in drv.get(1, []), f"derive: crates/model/src/{{ops.rs,moe.rs}} derives no gate-gpu-ds41-step, which reaches moe.rs through bloomery_gpu's host tier: {drv}")
+    drv = {}
+    gate_paths_problems(tree, recipes, [row("crates/gpu-deepseek41/src/{body.rs,body/**}", [], derive=True)], derived=drv)
+    expect("gate-gpu-ds41-long" in drv.get(1, []), f"derive: the body row derives no gate-gpu-ds41-long, whose bin names bloomery_gpu_deepseek41::body: {drv}")
+    # a gate the tree gives a row by either half is one of its gates, in the justfile's order
+    both = Derivation({"gate-b": ("f.rs", 1)}, set(), {"gate-c": ("bin", "t", "t.rs", "m::x")})
+    expect(both.gates(["gate-d", "gate-c", "gate-a", "gate-b"]) == ["gate-c", "gate-b"], f"derive: a gate only the module-naming half holds, or the order: {both.gates(['gate-d', 'gate-c', 'gate-a', 'gate-b'])}")
+    # the text form
+    text = "# t\ncrates/a/**\tderive gate-x weekly-y\twhy\ncrates/b/**\t*\twhy\n"
+    rows = parse_gate_paths(text)
+    expect([(r.line, r.derive, r.recipes) for r in rows] == [(2, True, ["gate-x", "weekly-y"]), (3, False, ["*"])], f"derive: the text form read as {[(r.line, r.derive, r.recipes) for r in rows]}")
+    expect(parse_gate_paths("# t\ncrates/a/**\tderive\twhy\n")[0].recipes == [], "derive: a row of `derive` alone")
+    for bad, why in [("gate-x derive", "opens the recipes column"), ("derive *", "`*` stands alone"), ("derive derive", "named twice")]:
+        expect(_raises(lambda: parse_gate_paths(f"crates/a/**\t{bad}\twhy\n"), why), f"derive: {bad!r} in the recipes column not refused as {why!r}")
+    expect(_raises(lambda: parse_gate_paths("crates/a/**\tderive gate-x\twhy\texcept gate-x: r\n"), "both in the row and left out of it"),
+           "derive: a hand name the exceptions leave out not refused")
+    wide = [expanded_row(rows[0], ["gate-d"]), rows[1]]
+    expect(expanded_text(text, rows, wide) == "# t\ncrates/a/**\tgate-d gate-x weekly-y\twhy\ncrates/b/**\t*\twhy\n",
+           f"derive: the expanded text keeps its lines: {expanded_text(text, rows, wide)!r}")
+    # the cache: a stored expansion reads back for its table only; the directory keeps the newest
+    with tempfile.TemporaryDirectory(prefix="recipes-gp-cache-") as tmp:
+        d = os.path.join(tmp, "c")
+        path = os.path.join(d, "k.tsv")
+        store_expanded_cache(path, expanded_text(text, rows, wide))
+        got = read_expanded_cache(path, rows)
+        expect(got is not None and [g.recipes for g in got] == [["gate-d", "gate-x", "weekly-y"], ["*"]] and not any(g.derive for g in got),
+               f"derive: a stored expansion does not read back: {got}")
+        for what, body in (("an unexpanded table", text), ("another table", expanded_text(text, rows, wide).replace("crates/a/**", "crates/z/**")),
+                           ("a table that lost a hand name", expanded_text(text, rows, wide).replace(" weekly-y", ""))):
+            store_expanded_cache(path, body)
+            expect(read_expanded_cache(path, rows) is None, f"derive: {what} read as the cache of this table")
+        expect(read_expanded_cache(os.path.join(d, "none.tsv"), rows) is None, "derive: a missing cache file read")
+        for i in range(GATE_PATHS_CACHE_KEEP + 3):
+            old = os.path.join(d, f"old{i:02d}.tsv")
+            with open(old, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.utime(old, (1000 + i, 1000 + i))
+        store_expanded_cache(path, expanded_text(text, rows, wide))
+        left = sorted(e.name for e in os.scandir(d) if e.name.endswith(".tsv"))
+        expect(len(left) == GATE_PATHS_CACHE_KEEP and "k.tsv" in left and "old00.tsv" not in left and f"old{GATE_PATHS_CACHE_KEEP + 2:02d}.tsv" in left,
+               f"derive: the cache directory does not keep the newest {GATE_PATHS_CACHE_KEEP}: {left}")
+        # the key: a directory with no .git has none; in a work tree it moves with the table, a tracked edit and an untracked file
+        plain = os.path.join(tmp, "plain")
+        os.makedirs(plain)
+        expect(gate_paths_key(plain, text) is None, "derive: a directory with no .git has a cache key")
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+
+        def git_in(*a: str) -> subprocess.CompletedProcess:
+            return subprocess.run(["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
+
+        with open(os.path.join(repo, "a.rs"), "w", encoding="utf-8") as fh:
+            fh.write("fn a() {}\n")
+        if git_in("init", "-q", "-b", "main").returncode == 0 and git_in("add", "-A").returncode == 0 and git_in("commit", "-q", "-m", "x").returncode == 0:
+            k0 = gate_paths_key(repo, text)
+            expect(k0 is not None and k0 == gate_paths_key(repo, text), "derive: a clean work tree has no stable cache key")
+            expect(gate_paths_key(repo, text + "# more\n") != k0, "derive: the cache key ignores the table's text")
+            with open(os.path.join(repo, "a.rs"), "w", encoding="utf-8") as fh:
+                fh.write("fn a() { 1; }\n")
+            expect(gate_paths_key(repo, text) != k0, "derive: the cache key ignores a tracked edit")
+            git_in("checkout", "-q", "--", "a.rs")
+            expect(gate_paths_key(repo, text) == k0, "derive: the cache key moves with a reverted edit")
+            with open(os.path.join(repo, "b.rs"), "w", encoding="utf-8") as fh:
+                fh.write("fn b() {}\n")
+            expect(gate_paths_key(repo, text) != k0, "derive: the cache key ignores an untracked file")
+        else:
+            expect(False, "derive: the key fixture's git repository could not be made")
+    expect(_raises(lambda: cmd_check(argparse.Namespace(fill=True, justfile=None)), "derives its gates"), "derive: `check --fill` not refused by name")
+
 
 
 def bin_feature_self_test(expect) -> None:
@@ -10401,6 +10743,15 @@ def bin_feature_self_test(expect) -> None:
     expect(problems(("a DIR", call("glm5next", flags="--release --target-dir {{DIR}}")), ("b DIR", call("glm5next,vision", flags="--release --target-dir {{DIR}}"))) == [], "bin features: a parameter's target dir refused")
     # no feature set differs for a bin built once
     expect(problems(("a", call("glm5next,vision"))) == [], "bin features: a lone build refused")
+
+
+def _raises(fn: Callable[[], object], why: str) -> bool:
+    """Whether `fn` raises a RecipeError that names `why`."""
+    try:
+        fn()
+    except RecipeError as err:
+        return why in str(err)
+    return False
 
 
 def _expecting(fails: list[str]) -> Callable[[bool, str], None]:
@@ -11172,7 +11523,8 @@ def main(argv: list[str]) -> int:
     sub = ap.add_subparsers(dest="cmd")
     c = sub.add_parser("check")
     c.add_argument("--justfile")
-    c.add_argument("--fill", action="store_true", help=f"first add to each row of {GATE_PATHS} the gates the derivation says it lacks")
+    c.add_argument("--fill", action="store_true", help=f"removed: {GATE_PATHS} derives its gates; the flag is a named error")
+    sub.add_parser("rows", help=f"{GATE_PATHS} as narrow() reads it: each `{DERIVE}` row's gates written out, line for line")
     t = sub.add_parser("targets")
     t.add_argument("recipes", nargs="*")
     a = sub.add_parser("affected")
@@ -11207,7 +11559,7 @@ def main(argv: list[str]) -> int:
                         f"{GATE_PATHS}'s rows are held to), each with one chain")
     rh.add_argument("files", nargs="+")
     rh.add_argument("--brief", action="store_true", help="the gates' names without their chains")
-    rh.add_argument("--row", action="store_true", help="last, the union of the files' gates as a row's first two columns")
+    rh.add_argument("--row", action="store_true", help="last, a `derive` row for the files as the table's first two columns")
     k = sub.add_parser("key", help="each ITEM's ledger key: key<TAB>item<TAB>status<TAB>detail")
     k.add_argument("items", nargs="+", metavar="ITEM", help="NAME[@K=V,…][:ARGS], as tools/gate-batch.sh runs it (its lane's card in the env)")
     k.add_argument("--manifest", help="the box manifest (box-manifest's output)")
@@ -11282,6 +11634,8 @@ def main(argv: list[str]) -> int:
             return cmd_opens(args)
         if args.cmd == "expand":
             return cmd_expand(args)
+        if args.cmd == "rows":
+            return cmd_rows(args)
         ap.print_help()
         return 64
     except RecipeError as err:
