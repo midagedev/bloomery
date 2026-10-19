@@ -479,7 +479,7 @@ mod gate {
 
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
-    use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
+    use bloomery_gpu::arch::qwen3moe::{KvQ8, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu_gates::beside;
     use bloomery_gpu_gates::ctx_ladder::{
@@ -945,7 +945,10 @@ mod gate {
             &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
             &["--parallel", "2", "--place", "a"],
         )?;
-        let budget = format!("on a card that holds {}:", 12_u64 << 30);
+        let budget = format!(
+            "on a card that holds {}:",
+            bloomery_levers::parse_bytes(PLACED_BUDGET).map_err(|e| format!("{e}"))?
+        );
         let named = run.said.contains("the least the default tries")
             && run.said.contains(&budget)
             && run.said.contains("ask fewer slots or a smaller model file");
@@ -1462,15 +1465,8 @@ mod gate {
             .ok_or_else(|| format!("the default arm's seat printed no whole-fit line at {n}"))?;
         let held = match qwen_seat::Family::from_name(arch) {
             Some(seat) if body35(seat) => {
-                // The decode flash the file's head shape selects, as the seat's open reads it.
-                let hp = Hparams::read(split).map_err(|e| format!("{e}"))?;
-                let o = Open35 {
-                    ctx: usize::try_from(n)?,
-                    mma: decode_mma(hp.head_dim, hp.n_head / hp.n_head_kv)?,
-                    ubatch: ubatch_size()?,
-                    kv: KvQ8::F16,
-                    media: false,
-                };
+                // The open the serve seat makes, from its one owner.
+                let o = q3place::serve_open35(split, usize::try_from(n)?, KvQ8::F16, false)?;
                 let WholeLoad::Checked { arena, reserve } = Qwen35moeModel::whole_load(split, o)?
                 else {
                     return Err(format!("a {arch} whole load carries no arena term").into());
