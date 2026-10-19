@@ -290,20 +290,6 @@ impl Placed {
             + self.hybrid.boundary().device_bytes()
     }
 
-    /// The host tier ([`crate::host::HostTier::stats`] and the rest).
-    #[must_use]
-    pub fn hybrid(&self) -> &Hybrid<HostRun> {
-        &self.hybrid
-    }
-
-    /// The layers the host serves a share of.
-    #[must_use]
-    pub fn hosted_layers(&self) -> Vec<usize> {
-        (0..self.side.hosted.len())
-            .filter(|&l| self.side.hosted[l])
-            .collect()
-    }
-
     /// The host tier's settling ([`crate::host::HostTier::settle`]).
     pub(super) fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         self.hybrid.settle(stream)
