@@ -5,16 +5,20 @@
 //! [`crate::qwenxml`]).
 //!
 //! The markup is the template's own (its `tools_header` and the assistant
-//! `tool_calls` branch):
+//! `tool_calls` branch), in one of two spellings ([`Spelling`]):
 //!
 //! ```text
-//! \n\n<｜DSML｜tool_calls>
-//! <｜DSML｜invoke name="NAME">
+//! \n\n<｜DSML｜tool_calls>                     spaced: <｜DSML｜ calls>
+//! <｜DSML｜invoke name="NAME">                 spaced: <｜DSML｜ invoke name="NAME">
 //! <｜DSML｜parameter name="KEY" string="true">RAW TEXT</｜DSML｜parameter>
 //! <｜DSML｜parameter name="KEY" string="false">JSON</｜DSML｜parameter>
 //! </｜DSML｜invoke>
 //! </｜DSML｜tool_calls>
 //! ```
+//!
+//! The spaced tags (V4.1's) carry a space after the DSML token (`parameter` likewise),
+//! and their block is `calls`, not `tool_calls`. A scan reads the one spelling it is
+//! given, never both.
 //!
 //! Only text after the think span is scanned: DSML inside reasoning is reasoning.
 //! A call is emitted when its `</｜DSML｜invoke>` arrives. Arguments become a JSON
@@ -25,7 +29,7 @@
 //! Every decision depends on the text only, never on how it was cut into pieces,
 //! so a stream and a whole response parse to the same message.
 
-use jinja::ChatTemplate;
+use jinja::{ChatTemplate, TemplateError};
 use serde_json::{Map, Value, json};
 
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
@@ -36,16 +40,102 @@ use crate::reasoning::{ReasoningFormat, Split, THINK_CLOSE, ThinkSplit, partial_
 
 /// The template's `dsml_token`.
 pub const DSML: &str = "｜DSML｜";
-/// Opens a tool-call block.
-pub const CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
-/// Closes a tool-call block.
-pub const CALLS_CLOSE: &str = "</｜DSML｜tool_calls>";
-const SEPARATED_OPEN: &str = "\n\n<｜DSML｜tool_calls>";
 const SEPARATOR: &str = "\n\n";
-const INVOKE_OPEN: &str = "<｜DSML｜invoke name=\"";
-const INVOKE_CLOSE: &str = "</｜DSML｜invoke>";
-const PARAM_OPEN: &str = "<｜DSML｜parameter name=\"";
-const PARAM_CLOSE: &str = "</｜DSML｜parameter>";
+
+/// How a DSML template spells its tags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spelling {
+    /// The word follows the token: `<｜DSML｜tool_calls>`, `<｜DSML｜invoke …>`,
+    /// `<｜DSML｜parameter …>` (DeepSeek-V4's).
+    Joined,
+    /// A space follows the token, and the block is `calls`: `<｜DSML｜ calls>`,
+    /// `<｜DSML｜ invoke …>`, `<｜DSML｜ parameter …>` (DeepSeek-V4.1's).
+    Spaced,
+}
+
+/// The tags of one [`Spelling`].
+#[derive(Debug)]
+struct Tags {
+    /// The block's opening with the blank line the template puts before it.
+    separated_open: &'static str,
+    calls_open: &'static str,
+    calls_close: &'static str,
+    invoke_open: &'static str,
+    invoke_close: &'static str,
+    param_open: &'static str,
+    param_close: &'static str,
+}
+
+/// The tags of the block, call and parameter words `$calls`, `$invoke` and `$param`.
+macro_rules! tags {
+    ($calls:literal, $invoke:literal, $param:literal) => {
+        Tags {
+            separated_open: concat!("\n\n<｜DSML｜", $calls, ">"),
+            calls_open: concat!("<｜DSML｜", $calls, ">"),
+            calls_close: concat!("</｜DSML｜", $calls, ">"),
+            invoke_open: concat!("<｜DSML｜", $invoke, " name=\""),
+            invoke_close: concat!("</｜DSML｜", $invoke, ">"),
+            param_open: concat!("<｜DSML｜", $param, " name=\""),
+            param_close: concat!("</｜DSML｜", $param, ">"),
+        }
+    };
+}
+
+static JOINED_TAGS: Tags = tags!("tool_calls", "invoke", "parameter");
+static SPACED_TAGS: Tags = tags!(" calls", " invoke", " parameter");
+
+impl Spelling {
+    fn tags(self) -> &'static Tags {
+        match self {
+            Spelling::Joined => &JOINED_TAGS,
+            Spelling::Spaced => &SPACED_TAGS,
+        }
+    }
+
+    /// The spelling a template `source` that spells the DSML token writes, as
+    /// llama.cpp reads it: spaced when the block's opener is built as
+    /// `… ' calls>` (single or double quotes), else joined.
+    #[must_use]
+    pub fn of_template(source: &str) -> Spelling {
+        if source.contains("' calls>") || source.contains("\" calls>") {
+            Spelling::Spaced
+        } else {
+            Spelling::Joined
+        }
+    }
+}
+
+/// What a template builds after `dsml_token + '`, joined and spaced.
+const RESPELL: [[&str; 2]; 3] = [
+    ["dsml_token + 'tool_calls", "dsml_token + ' calls"],
+    ["dsml_token + 'invoke", "dsml_token + ' invoke"],
+    ["dsml_token + 'parameter", "dsml_token + ' parameter"],
+];
+
+/// A chat template `source` with its DSML tags spelled as `to`, and nothing else
+/// changed: the way a model's own encoder writes them, which its GGUF's template may
+/// not (the V4.1 files carry V4's). `Ok(None)`: the template spells no DSML tag, or
+/// spells `to` already. An error: it spells the other spelling in a form this does
+/// not read.
+pub fn respell(source: &str, to: Spelling) -> Result<Option<String>, TemplateError> {
+    if !source.contains(DSML) || Spelling::of_template(source) == to {
+        return Ok(None);
+    }
+    let (from, into) = match to {
+        Spelling::Spaced => (0, 1),
+        Spelling::Joined => (1, 0),
+    };
+    let mut out = source.to_owned();
+    for pair in RESPELL {
+        out = out.replace(pair[from], pair[into]);
+    }
+    if out == source || Spelling::of_template(&out) != to {
+        return Err(TemplateError(format!(
+            "the chat template spells its DSML tags in a form this server cannot respell as {to:?}"
+        )));
+    }
+    Ok(Some(out))
+}
 
 /// One parsed call. `index` counts calls in the generation from 0.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,8 +154,9 @@ pub struct Scanned {
 }
 
 /// Streaming DSML scanner over the text after the think span.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DsmlScan {
+    tags: &'static Tags,
     /// Inside a block: the text consumed since it opened or since its last call,
     /// which becomes content if the rest does not parse.
     block: Option<String>,
@@ -84,6 +175,17 @@ enum Invoke {
 }
 
 impl DsmlScan {
+    /// A scan for a block in `spelling`.
+    #[must_use]
+    pub fn new(spelling: Spelling) -> Self {
+        DsmlScan {
+            tags: spelling.tags(),
+            block: None,
+            buf: String::new(),
+            calls: 0,
+        }
+    }
+
     /// Feeds text.
     pub fn push(&mut self, piece: &str) -> Scanned {
         self.buf.push_str(piece);
@@ -112,19 +214,20 @@ impl DsmlScan {
     /// Outside a block: sends text up to a block opening or a tail that could
     /// become one. Returns whether a block opened.
     fn text_step(&mut self, out: &mut Scanned) -> bool {
-        if let Some(at) = self.buf.find(CALLS_OPEN) {
+        let tags = self.tags;
+        if let Some(at) = self.buf.find(tags.calls_open) {
             let before = &self.buf[..at];
             let (text, sep) = match before.strip_suffix(SEPARATOR) {
                 Some(t) => (t, SEPARATOR),
                 None => (before, ""),
             };
             out.content.push_str(text);
-            self.block = Some(format!("{sep}{CALLS_OPEN}"));
-            self.buf.drain(..at + CALLS_OPEN.len());
+            self.block = Some(format!("{sep}{}", tags.calls_open));
+            self.buf.drain(..at + tags.calls_open.len());
             return true;
         }
-        let keep =
-            partial_suffix(&self.buf, SEPARATED_OPEN).max(partial_suffix(&self.buf, CALLS_OPEN));
+        let keep = partial_suffix(&self.buf, tags.separated_open)
+            .max(partial_suffix(&self.buf, tags.calls_open));
         let upto = self.buf.len() - keep;
         out.content.push_str(&self.buf[..upto]);
         self.buf.drain(..upto);
@@ -134,14 +237,15 @@ impl DsmlScan {
     /// Inside a block: takes one invoke or the block's close. Returns whether it
     /// consumed anything.
     fn block_step(&mut self, mut raw: String, out: &mut Scanned) -> bool {
+        let tags = self.tags;
         let lead = self.buf.len() - self.buf.trim_start().len();
         let rest = &self.buf[lead..];
-        if rest.starts_with(CALLS_CLOSE) {
-            self.buf.drain(..lead + CALLS_CLOSE.len());
+        if rest.starts_with(tags.calls_close) {
+            self.buf.drain(..lead + tags.calls_close.len());
             return true;
         }
-        if rest.starts_with(INVOKE_OPEN) {
-            match parse_invoke(rest) {
+        if rest.starts_with(tags.invoke_open) {
+            match parse_invoke(rest, tags) {
                 Invoke::Call(name, arguments, used) => {
                     out.calls.push(ToolCall {
                         index: self.calls,
@@ -159,7 +263,9 @@ impl DsmlScan {
                 }
                 Invoke::Malformed => {}
             }
-        } else if rest.is_empty() || CALLS_CLOSE.starts_with(rest) || INVOKE_OPEN.starts_with(rest)
+        } else if rest.is_empty()
+            || tags.calls_close.starts_with(rest)
+            || tags.invoke_open.starts_with(rest)
         {
             self.block = Some(raw);
             return false;
@@ -173,12 +279,13 @@ impl DsmlScan {
     }
 }
 
-/// Parses `<｜DSML｜invoke name="…">…</｜DSML｜invoke>` at the start of `s`.
-fn parse_invoke(s: &str) -> Invoke {
-    let Some(end) = s.find(INVOKE_CLOSE) else {
+/// Parses `<｜DSML｜invoke name="…">…</｜DSML｜invoke>` at the start of `s`, in
+/// `tags`' spelling.
+fn parse_invoke(s: &str, tags: &Tags) -> Invoke {
+    let Some(end) = s.find(tags.invoke_close) else {
         return Invoke::Wait;
     };
-    let body = &s[INVOKE_OPEN.len()..end];
+    let body = &s[tags.invoke_open.len()..end];
     let Some(name_end) = body.find("\">") else {
         return Invoke::Malformed;
     };
@@ -193,7 +300,7 @@ fn parse_invoke(s: &str) -> Invoke {
         if rest.is_empty() {
             break;
         }
-        let Some(p) = rest.strip_prefix(PARAM_OPEN) else {
+        let Some(p) = rest.strip_prefix(tags.param_open) else {
             return Invoke::Malformed;
         };
         let Some(key_end) = p.find('"') else {
@@ -208,7 +315,7 @@ fn parse_invoke(s: &str) -> Invoke {
         } else {
             return Invoke::Malformed;
         };
-        let Some(val_end) = p.find(PARAM_CLOSE) else {
+        let Some(val_end) = p.find(tags.param_close) else {
             return Invoke::Malformed;
         };
         let value = json_value(&p[..val_end], is_string);
@@ -216,7 +323,7 @@ fn parse_invoke(s: &str) -> Invoke {
             Some(slot) => slot.1 = value,
             None => params.push((key.to_owned(), value)),
         }
-        rest = &p[val_end + PARAM_CLOSE.len()..];
+        rest = &p[val_end + tags.param_close.len()..];
     }
     let fields: Vec<String> = params
         .iter()
@@ -225,7 +332,7 @@ fn parse_invoke(s: &str) -> Invoke {
     Invoke::Call(
         name.to_owned(),
         format!("{{{}}}", fields.join(",")),
-        end + INVOKE_CLOSE.len(),
+        end + tags.invoke_close.len(),
     )
 }
 
@@ -278,8 +385,9 @@ pub(crate) fn parses_tools(b: &Map<String, Value>) -> bool {
 /// The tool-call markup a chat template teaches its model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolFormat {
-    /// V4.1's `<｜DSML｜tool_calls>` blocks.
-    Dsml,
+    /// DSML blocks (`<｜DSML｜tool_calls>`; V4.1's `<｜DSML｜ calls>`), in the template's
+    /// [`Spelling`].
+    Dsml(Spelling),
     /// GLM's `<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value></tool_call>`.
     GlmXml,
     /// Hermes' `<tool_call>` around one JSON object naming `name` and
@@ -297,7 +405,8 @@ impl ToolFormat {
     /// The markup the template `source` spells for a call: GLM's when it
     /// spells `<tool_call>`, `<arg_key>` and `<arg_value>`, Qwen3-Coder's
     /// when it spells `<tool_call>`, `<function=` and `<parameter=` (llama.cpp
-    /// reads the three spellings), DSML's when it spells the DSML token, else
+    /// reads the three spellings), DSML's when it spells the DSML token (in the
+    /// spelling [`Spelling::of_template`] reads), else
     /// nothing the source alone can name — a `<tool_call>` template may carry
     /// Hermes' JSON body, which only a rendered call tells apart
     /// ([`ToolFormat::of_chat_template`]).
@@ -314,7 +423,7 @@ impl ToolFormat {
         } else if qwen.iter().all(|tag| source.contains(tag)) {
             ToolFormat::QwenXml
         } else if source.contains(DSML) {
-            ToolFormat::Dsml
+            ToolFormat::Dsml(Spelling::of_template(source))
         } else {
             ToolFormat::Unparsed
         }
@@ -390,7 +499,8 @@ fn hermes_markup(rendered: &str) -> bool {
 /// The tool-call scan a parser runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tools {
-    Dsml,
+    /// DSML's markup, in the given spelling.
+    Dsml(Spelling),
     /// GLM's markup, typing each argument by the request's tool schemas.
     GlmXml(ArgTypes),
     /// Hermes' markup.
@@ -448,10 +558,10 @@ pub struct ChatParser {
 
 impl ChatParser {
     /// A parser for a generation that follows `prompt` (the rendered template).
-    /// `tools` turns the DSML scan on.
+    /// `tools` turns the DSML scan on, in its spelling.
     #[must_use]
-    pub fn new(prompt: &str, format: ReasoningFormat, tools: bool) -> Self {
-        ChatParser::with_tools(prompt, format, tools.then_some(Tools::Dsml))
+    pub fn new(prompt: &str, format: ReasoningFormat, tools: Option<Spelling>) -> Self {
+        ChatParser::with_tools(prompt, format, tools.map(Tools::Dsml))
     }
 
     /// A parser for a generation that follows `prompt`, scanning for `tools`'
@@ -476,7 +586,7 @@ impl ChatParser {
                 }
             }),
             scan: tools.map(|t| match t {
-                Tools::Dsml => Scan::Dsml(DsmlScan::default()),
+                Tools::Dsml(spelling) => Scan::Dsml(DsmlScan::new(spelling)),
                 Tools::GlmXml(types) => Scan::Glm(GlmScan::new(types)),
                 Tools::Hermes => Scan::Hermes(HermesScan::default()),
                 Tools::QwenXml(kinds) => Scan::Qwen(QwenScan::new(kinds)),
@@ -499,7 +609,12 @@ impl ChatParser {
 
     /// Parses a whole generation.
     #[must_use]
-    pub fn parse(prompt: &str, format: ReasoningFormat, tools: bool, text: &str) -> Message {
+    pub fn parse(
+        prompt: &str,
+        format: ReasoningFormat,
+        tools: Option<Spelling>,
+        text: &str,
+    ) -> Message {
         let mut p = ChatParser::new(prompt, format, tools);
         let _ = p.push(text);
         let _ = p.finish();
@@ -605,7 +720,7 @@ impl ToolFormat {
             ToolFormat::Hermes => hermes::call_parts(funs),
             ToolFormat::QwenXml => qwenxml::call_parts(funs),
             ToolFormat::GlmXml => glmxml::call_parts(funs),
-            ToolFormat::Dsml => call_parts(funs),
+            ToolFormat::Dsml(spelling) => call_parts(spelling, funs),
             ToolFormat::Unparsed => Err(Refusal {
                 message: "the chat template's tool-call markup has no inverse in this server: \
                           send the request without tool_choice \"required\" or a named function"
@@ -619,24 +734,26 @@ impl ToolFormat {
 /// The call this markup spells, as the parts structured output forces: the
 /// inverse of [`DsmlScan`]. One `invoke` block with a `parameter` block per
 /// parameter in the schema's order, `string="true"` around a text value (raw)
-/// and `string="false"` around any other (JSON).
-pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+/// and `string="false"` around any other (JSON), in the template's spelling.
+pub(crate) fn call_parts(spelling: Spelling, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+    let t = spelling.tags();
     call(
         funs,
-        &format!("{CALLS_OPEN}\n{INVOKE_OPEN}"),
+        &format!("{}\n{}", t.calls_open, t.invoke_open),
         str::to_owned,
         |f| {
             let mut parts = vec![Part::Text("\">\n".to_owned())];
             for a in &f.args {
                 parts.push(Part::Text(format!(
-                    "{PARAM_OPEN}{}\" string=\"{}\">",
+                    "{}{}\" string=\"{}\">",
+                    t.param_open,
                     a.key,
                     is_text(a.schema)
                 )));
                 parts.extend(value(a.schema, Style::Raw, &a.path)?);
-                parts.push(Part::Text(format!("{PARAM_CLOSE}\n")));
+                parts.push(Part::Text(format!("{}\n", t.param_close)));
             }
-            parts.push(Part::Text(format!("{INVOKE_CLOSE}\n{CALLS_CLOSE}")));
+            parts.push(Part::Text(format!("{}\n{}", t.invoke_close, t.calls_close)));
             Ok(parts)
         },
     )

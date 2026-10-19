@@ -1,0 +1,10 @@
+Source of v41-dsml-spaced-chat-template.jinja (kept byte-exact; this file records it):
+
+models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja of the llama.cpp pull request
+https://github.com/ggml-org/llama.cpp/pull/28696 (MIT).
+sha256 7e22c97665b1c45ebcc31327373e8be4416262da35e9950bca5a24e3aee88976  v41-dsml-spaced-chat-template.jinja
+
+It is v41-chat-template.jinja (the `tokenizer.chat_template` of DeepSeek-V4.1-Flash-Q3_K_M, which
+spells V4's tags) with the DSML tags respelled the way the V4.1 release's encoding.py writes them:
+`<｜DSML｜ calls>`, `<｜DSML｜ invoke name=…>` and `<｜DSML｜ parameter name=…>`, a space after the token.
+Seven lines differ from that fixture, and `dsml::respell` reproduces them from it (a test holds the two equal).

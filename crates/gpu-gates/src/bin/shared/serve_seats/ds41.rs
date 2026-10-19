@@ -228,6 +228,7 @@ use bloomery_gpu_gates::vision_seat;
 use bloomery_gpu_gates::{GateError, ref_model_path, residency};
 use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
 use gguf::Split;
+use model::arch::deepseek41::hparams::Model as Hp41Model;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::dspark::DraftHparams;
 use model::placement::ctx_ask::DEFAULT_SLOTS;
@@ -236,6 +237,7 @@ use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
 use runtime::width::{Choosing, Mode as WidthMode};
 use runtime::{Lookup, Speculative, Target, Want};
+use serve::dsml::{Spelling, respell};
 use serve::flag::{CTX, number};
 use serve::{
     CacheNote, DraftProps, Drafted, EngineError, EngineProps, PlacementProps, ResidencyReset,
@@ -262,6 +264,12 @@ const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
                      [--slot-save-path DIR] [--mmproj FILE | --no-mmproj] \
                      [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
+
+/// What the server says when it serves the file's chat template with its DSML tags
+/// respelled ([`respell`]).
+const DSML_RESPELLED: &str = "bloomery-serve: chat template: this V4.1 file spells V4's DSML \
+    tags, but its model writes V4.1's (a space after the token: `<｜DSML｜ calls>`, \
+    `<｜DSML｜ invoke>`, `<｜DSML｜ parameter>`); serving the template respelled that way";
 
 /// The token V4.1's chat template opens every user and tool message with.
 pub const USER_START: &str = "<｜User｜>";
@@ -548,6 +556,18 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::read(&split)?;
+    // A V4.1 model writes the spaced DSML tags whatever its GGUF's template spells
+    // (the V4.1 files carry V4's): the template is served spelled as the model writes.
+    let template = match inputs.hp.model {
+        Hp41Model::Deepseek41 => match respell(&template, Spelling::Spaced)? {
+            Some(spaced) => {
+                eprintln!("{DSML_RESPELLED}");
+                spaced
+            }
+            None => template,
+        },
+        Hp41Model::Deepseek4 => template,
+    };
     let model = model_props(&split, &inputs.model);
     let tier_batch = place::tier_batch(a.place, &inputs.hp);
     // The context the load takes with the encoder's reserve `vision` and the side model's

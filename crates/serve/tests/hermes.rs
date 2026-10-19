@@ -19,7 +19,7 @@ mod common;
 
 use common::{V41_TEMPLATE, post, start_templated};
 use serde_json::{Value, json};
-use serve::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
+use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, ToolFormat, Tools};
 use serve::hermes::HermesError;
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
@@ -365,7 +365,7 @@ fn hw_detection_follows_the_template() {
     );
     assert_eq!(
         ToolFormat::of_chat_template(&parsed(V41_TEMPLATE)),
-        ToolFormat::Dsml
+        ToolFormat::Dsml(Spelling::Joined)
     );
     // The source spellings alone type none of the `<tool_call>` templates
     // left to the probe.

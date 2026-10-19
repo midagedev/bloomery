@@ -26,7 +26,7 @@ mod common;
 
 use common::{post, start_templated};
 use serde_json::{Value, json};
-use serve::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
+use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, ToolFormat, Tools};
 use serve::qwenxml::{ParamKinds, QwenXmlError};
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
@@ -564,7 +564,7 @@ fn hw_qwen_parse_does_not_depend_on_chunking() {
 /// whose markup has no parser refuses every chat request that carries tools.
 fn seat_format(name: &str) -> ToolFormat {
     match name {
-        "v41" => ToolFormat::Dsml,
+        "v41" => ToolFormat::Dsml(Spelling::Joined),
         "glm5" => ToolFormat::GlmXml,
         "qwen3" => ToolFormat::Hermes,
         "qwen36" | "qwen38" | "nemotron" | "nemotron-bolt" => ToolFormat::QwenXml,

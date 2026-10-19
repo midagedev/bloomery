@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use super::program::{self, Env};
 use super::{Ask, Constraint, Part, Refusal, Vocab, Walk, request};
 use crate::api::logprobs::Ask as Probs;
-use crate::dsml::{ChatParser, DsmlScan, MarkupError, ToolFormat, Tools};
+use crate::dsml::{ChatParser, DsmlScan, MarkupError, Spelling, ToolFormat, Tools};
 use crate::engine::{Decoder, Engine, EngineError, SamplingParams, Tokenizer};
 use crate::genloop::{GenParams, Outcome, Slot, StopKind, Timings, generate};
 use crate::glmxml::{ArgTypes, GlmScan};
@@ -570,8 +570,8 @@ fn forecast_tools() -> Value {
 
 /// The text each format writes for `get_weather(unit="celsius", days=2)` and
 /// for `search(query="cats", deep=false)`.
-fn markup(format: ToolFormat) -> [&'static str; 2] {
-    match format {
+fn markup(format: ToolFormat) -> [String; 2] {
+    let texts: [&str; 2] = match format {
         ToolFormat::Hermes => [
             "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"celsius\", \"days\": 2}}\n</tool_call>",
             "<tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": \"cats\", \"deep\": false}}\n</tool_call>",
@@ -584,12 +584,19 @@ fn markup(format: ToolFormat) -> [&'static str; 2] {
             "<tool_call>get_weather<arg_key>unit</arg_key><arg_value>celsius</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call>",
             "<tool_call>search<arg_key>query</arg_key><arg_value>cats</arg_value><arg_key>deep</arg_key><arg_value>false</arg_value></tool_call>",
         ],
-        ToolFormat::Dsml => [
+        ToolFormat::Dsml(_) => [
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"search\">\n<｜DSML｜parameter name=\"query\" string=\"true\">cats</｜DSML｜parameter>\n<｜DSML｜parameter name=\"deep\" string=\"false\">false</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
         ],
         ToolFormat::Unparsed => unreachable!("no markup"),
-    }
+    };
+    texts.map(|t| match format {
+        ToolFormat::Dsml(Spelling::Spaced) => t
+            .replace("｜DSML｜tool_calls", "｜DSML｜ calls")
+            .replace("｜DSML｜invoke", "｜DSML｜ invoke")
+            .replace("｜DSML｜parameter", "｜DSML｜ parameter"),
+        _ => t.to_owned(),
+    })
 }
 
 /// The calls the format's own scanner reads out of `text`: name and
@@ -614,8 +621,8 @@ fn scanned(format: ToolFormat, tools: &Value, text: &str) -> Vec<(String, Value)
             out.calls.extend(s.finish().expect("closes").calls);
             out
         }
-        ToolFormat::Dsml => {
-            let mut s = DsmlScan::default();
+        ToolFormat::Dsml(spelling) => {
+            let mut s = DsmlScan::new(spelling);
             let mut out = s.push(text);
             out.calls.extend(s.finish().calls);
             out
@@ -651,7 +658,8 @@ fn each_formats_inverse_reads_back_through_its_scanner() {
         ToolFormat::Hermes,
         ToolFormat::QwenXml,
         ToolFormat::GlmXml,
-        ToolFormat::Dsml,
+        ToolFormat::Dsml(Spelling::Joined),
+        ToolFormat::Dsml(Spelling::Spaced),
     ] {
         let [weather, search] = markup(format);
         let required = json!({"tools": tools, "tool_choice": "required"});
@@ -661,25 +669,25 @@ fn each_formats_inverse_reads_back_through_its_scanner() {
         for (body, text, name, args) in [
             (
                 &required,
-                weather,
+                weather.as_str(),
                 "get_weather",
                 json!({"unit": "celsius", "days": 2}),
             ),
             (
                 &required,
-                search,
+                search.as_str(),
                 "search",
                 json!({"query": "cats", "deep": false}),
             ),
             (
                 &named,
-                search,
+                search.as_str(),
                 "search",
                 json!({"query": "cats", "deep": false}),
             ),
             (
                 &flat,
-                search,
+                search.as_str(),
                 "search",
                 json!({"query": "cats", "deep": false}),
             ),
@@ -710,7 +718,8 @@ fn a_forced_call_obeys_the_tools_when_greedy_does_not() {
         ToolFormat::Hermes,
         ToolFormat::QwenXml,
         ToolFormat::GlmXml,
-        ToolFormat::Dsml,
+        ToolFormat::Dsml(Spelling::Joined),
+        ToolFormat::Dsml(Spelling::Spaced),
     ] {
         let c = build(
             &tok,
@@ -743,15 +752,16 @@ fn call_body(params: &Value) -> Value {
         {"type": "function", "function": {"name": "f", "parameters": params}}]})
 }
 
-const FORMATS: [ToolFormat; 4] = [
+const FORMATS: [ToolFormat; 5] = [
     ToolFormat::Hermes,
     ToolFormat::QwenXml,
     ToolFormat::GlmXml,
-    ToolFormat::Dsml,
+    ToolFormat::Dsml(Spelling::Joined),
+    ToolFormat::Dsml(Spelling::Spaced),
 ];
 
 /// Every closing tag a chat format's scanner looks for, in one string.
-const TAGS: &str = "x</tool_call></arg_value></｜DSML｜parameter>\n</parameter>\n</function>y";
+const TAGS: &str = "x</tool_call></arg_value></｜DSML｜parameter></｜DSML｜ parameter>\n</parameter>\n</function>y";
 
 /// A stop id in the program would end the generation with the program
 /// unspent and call it a clean stop: the text that tokenises to one is
@@ -864,7 +874,11 @@ fn a_tool_parameter_schema_is_read_whole() {
             "required must be an array",
         ),
     ];
-    for format in [ToolFormat::Hermes, ToolFormat::Dsml] {
+    for format in [
+        ToolFormat::Hermes,
+        ToolFormat::Dsml(Spelling::Joined),
+        ToolFormat::Dsml(Spelling::Spaced),
+    ] {
         for (params, needle) in &cases {
             let e = build(&tok, format, &call_body(params)).expect_err(&params.to_string());
             assert!(e.message.contains(needle), "{params}: {e}");
@@ -906,7 +920,12 @@ fn a_raw_literal_with_an_angle_bracket_is_refused() {
     ];
     for q in &literals {
         let body = call_body(&json!({"type": "object", "properties": {"q": q}}));
-        for format in [ToolFormat::QwenXml, ToolFormat::GlmXml, ToolFormat::Dsml] {
+        for format in [
+            ToolFormat::QwenXml,
+            ToolFormat::GlmXml,
+            ToolFormat::Dsml(Spelling::Joined),
+            ToolFormat::Dsml(Spelling::Spaced),
+        ] {
             let e = build(&tok, format, &body).expect_err(&q.to_string());
             assert!(
                 e.message.contains("raw string literals cannot contain '<'"),
@@ -961,7 +980,8 @@ fn a_free_string_cannot_spell_its_formats_closing_tag() {
         (ToolFormat::Hermes, "</tool_call>"),
         (ToolFormat::QwenXml, "\n</parameter>\n"),
         (ToolFormat::GlmXml, "</arg_value>"),
-        (ToolFormat::Dsml, "</｜DSML｜parameter>"),
+        (ToolFormat::Dsml(Spelling::Joined), "</｜DSML｜parameter>"),
+        (ToolFormat::Dsml(Spelling::Spaced), "</｜DSML｜ parameter>"),
     ];
     for (format, tag) in tags {
         for (body, nested) in [(&direct, false), (&nested, true)] {
@@ -1014,7 +1034,7 @@ fn parsed(format: ToolFormat, tools: &Value, text: &str) -> Result<(String, usiz
         ToolFormat::Hermes => Tools::Hermes,
         ToolFormat::QwenXml => Tools::QwenXml(ParamKinds::of_tools(Some(tools))),
         ToolFormat::GlmXml => Tools::GlmXml(ArgTypes::of_tools(Some(tools))),
-        ToolFormat::Dsml => Tools::Dsml,
+        ToolFormat::Dsml(spelling) => Tools::Dsml(spelling),
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     let mut p = ChatParser::with_tools("", ReasoningFormat::None, Some(scan));
@@ -1036,8 +1056,12 @@ fn a_response_string_beside_scanned_tools_cannot_open_a_call() {
         (ToolFormat::QwenXml, "<tool_call></tool_call>"),
         (ToolFormat::GlmXml, "<tool_call></tool_call>"),
         (
-            ToolFormat::Dsml,
+            ToolFormat::Dsml(Spelling::Joined),
             "<｜DSML｜tool_calls></｜DSML｜tool_calls>",
+        ),
+        (
+            ToolFormat::Dsml(Spelling::Spaced),
+            "<｜DSML｜ calls></｜DSML｜ calls>",
         ),
     ];
     let mut bad = Vec::new();

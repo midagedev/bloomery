@@ -56,6 +56,12 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **Tool calls on every generative model**: DeepSeek-V4.1-Flash (DSML), GLM-5.3-Flash (its XML), Qwen3-30B
   (Hermes JSON), Qwen3.6-35B and Qwen3.8-Flash-Next (the `<function=…><parameter=…>` markup) parse into
   `tool_calls` and `tool_use` blocks, so agent clients work against each of them.
+  DeepSeek-V4.1 writes its DSML tags with a space after the token (`<｜DSML｜ calls>`, `<｜DSML｜ invoke>`,
+  `<｜DSML｜ parameter>`), V4 without (`<｜DSML｜tool_calls>`). The V4.1 GGUFs carry V4's template, so a
+  `general.architecture` `deepseek41` file is served with that template respelled as V4.1's (the template llama.cpp
+  ships for it), and one line at start says so: the tools header teaches the tags the model writes, the parser
+  reads them, and an earlier call re-renders in the history as the model wrote it, so the slot's cached prefix
+  survives a tool turn. A `deepseek4` file keeps V4's tags; a parser reads the one spelling its template spells.
 - **Refused by name** (a 400 naming the field): `samplers` in an order other than llama-server's default list for the
   stages that are on, or naming a sampler this server lacks; typical_p, mirostat, `dry_*`, `xtc_*`, `top_n_sigma` and
   `dynatemp_*` when a request turns them on; `n_predict` or `max_tokens` outside -1..=i32::MAX (-2 does not mean "no
@@ -76,6 +82,15 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   effort, replacing a kwargs `reasoning_effort`; the server prints one line at start saying so. `/props` names which
   case the template is in: `thinking_off` is `"switch"`, `"low_effort"` or `"neither"` (neither knob changes the
   prompt, so `"none"` is `enable_thinking: false` as above).
+- **Any other `reasoning_effort`** (`low`, `medium`, `high`, `max`, as OpenAI's field and the Responses API's
+  `reasoning.effort` carry it) asks for reasoning and reaches the template as it came. A template whose thinking is
+  off until `enable_thinking` is set (V4.1's; `/props` `thinking_off` `"switch"`, found by comparing its renders at
+  start) gets `enable_thinking: true` from it, so `reasoning_content` is split out; `max` also adds that template's
+  maximum-effort header, and `low` to `high` are the template's default effort. A `chat_template_kwargs`
+  `enable_thinking` in the same request wins either way. A template that thinks by default is asked for nothing it
+  was not already doing. Unlike llama-server, which turns thinking on for any template that has the switch,
+  this server keeps the template's own default when a request names neither field (BUILD.md: thinking is off for
+  V4.1).
 - **The files**: the GGUF uploads as downloaded, the same quantizations, the chat template read from the file,
   and a tokenizer bit-identical to `llama-tokenize`.
 - **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched
@@ -89,6 +104,10 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the
   auto context nearly doubles on the same card; `--cache-type-v` does not exist, both planes quantize together),
   `--host/--port`, `--alias`, `--mmproj <file>` and `--no-mmproj` (image input, below).
+- **The model's name** (`/v1/models` `id`, the `model` of every answer, `/props` `model_alias`) is `--alias`, else the
+  GGUF's `general.name`, else the seat's own default. llama-server's default is the model file's name; this server
+  names the model as its file does, which stays the same when a file is renamed or split into shards. A file whose
+  `general.name` is a placeholder (a requantization script's) is named with `--alias`.
 - **No placement flag needed**: leave `--place` out on every model and the load picks for you — the largest
   visible card, a split onto the CPU when the file does not fit it, and on GLM-5.3 the second card as an expert
   tier when its plan puts enough experts there to pay for it (the GLM row of the

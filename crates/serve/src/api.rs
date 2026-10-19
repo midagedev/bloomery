@@ -2484,8 +2484,10 @@ fn needs_object_arguments(t: &ChatTemplate) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ThinkingOff {
     /// `enable_thinking` changes the generation prompt: `"none"` sets it
-    /// `false`, as llama-server does.
-    Switch,
+    /// `false`, as llama-server does. With `opt_in` the template renders no
+    /// thinking until it is `true` (V4.1's), so any other effort sets it
+    /// `true` unless the request set it.
+    Switch { opt_in: bool },
     /// The template has no switch but `reasoning_effort` changes the
     /// generation prompt: `"none"` is sent as the template's lowest effort,
     /// `"low"`, the closest to no thinking it has.
@@ -2499,7 +2501,7 @@ impl ThinkingOff {
     /// The word `/props`' `thinking_off` carries.
     fn word(self) -> &'static str {
         match self {
-            ThinkingOff::Switch => "switch",
+            ThinkingOff::Switch { .. } => "switch",
             ThinkingOff::LowEffort => "low_effort",
             ThinkingOff::Neither => "neither",
         }
@@ -2513,14 +2515,15 @@ impl ThinkingOff {
             ThinkingOff::LowEffort => Some(
                 "chat template: no thinking switch; reasoning_effort \"none\" is sent as \"low\"",
             ),
-            ThinkingOff::Switch | ThinkingOff::Neither => None,
+            ThinkingOff::Switch { .. } | ThinkingOff::Neither => None,
         }
     }
 }
 
 /// Reads the template's [`ThinkingOff`] from the generation prompt of one
 /// user message `"hi"`: a template where `enable_thinking: false` and `true`
-/// render differently has a [`Switch`](ThinkingOff::Switch); otherwise one
+/// render differently has a [`Switch`](ThinkingOff::Switch), opt-in when
+/// the prompt with no `enable_thinking` is not the `true` one; otherwise one
 /// where `reasoning_effort: "low"` renders differently from no effort is
 /// [`LowEffort`](ThinkingOff::LowEffort); otherwise
 /// [`Neither`](ThinkingOff::Neither). A render that fails is the bind's
@@ -2544,7 +2547,8 @@ fn probe_thinking_off(t: &ChatTemplate) -> Result<ThinkingOff, TemplateError> {
     let off = render(Some(("enable_thinking", json!(false))))?;
     let on = render(Some(("enable_thinking", json!(true))))?;
     if off != on {
-        return Ok(ThinkingOff::Switch);
+        let opt_in = render(None)? != on;
+        return Ok(ThinkingOff::Switch { opt_in });
     }
     let unset = render(None)?;
     let low = render(Some(("reasoning_effort", json!("low"))))?;
@@ -2590,6 +2594,13 @@ fn tool_call_arguments(at: usize, message: &mut Map<String, Value>) -> Result<()
 /// `true` (V4.1's takes its `thinking` from it) keeps its own default when
 /// nothing did.
 ///
+/// Any other effort asks for reasoning: it reaches the template as itself,
+/// and a template that renders no thinking until `enable_thinking` is `true`
+/// ([`ThinkingOff::Switch`] with `opt_in`) gets it `true` from the effort
+/// unless the kwargs set it, which wins either way. (llama-server's own
+/// default is thinking on for a template that has the switch; this server
+/// keeps the template's default, so the effort is what turns it on.)
+///
 /// A template with no thinking switch but an effort knob
 /// ([`ThinkingOff::LowEffort`]) has nothing `enable_thinking: false` could
 /// turn off, so there `"none"` is the effort `"low"`: it sets no
@@ -2626,10 +2637,16 @@ fn thinking_vars(
         (true, ThinkingOff::LowEffort) => {
             vars.insert("reasoning_effort".into(), Value::String("low".to_owned()));
         }
-        (true, ThinkingOff::Switch | ThinkingOff::Neither) => thinking = Some(false),
-        (false, _) => {
+        (true, ThinkingOff::Switch { .. } | ThinkingOff::Neither) => thinking = Some(false),
+        (false, how) => {
             if let Some(v) = effort {
                 vars.insert("reasoning_effort".into(), v.clone());
+                if thinking.is_none()
+                    && how == (ThinkingOff::Switch { opt_in: true })
+                    && v.as_str().is_some_and(|e| !e.is_empty())
+                {
+                    thinking = Some(true);
+                }
             }
         }
     }
@@ -3561,7 +3578,7 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
         return Ok(None);
     }
     Ok(Some(match state.tool_format {
-        ToolFormat::Dsml => Tools::Dsml,
+        ToolFormat::Dsml(spelling) => Tools::Dsml(spelling),
         ToolFormat::GlmXml => Tools::GlmXml(ArgTypes::of_tools(b.get("tools"))),
         ToolFormat::Hermes => Tools::Hermes,
         ToolFormat::QwenXml => Tools::QwenXml(ParamKinds::of_tools(b.get("tools"))),
@@ -4984,9 +5001,10 @@ mod tests {
     fn the_fixture_templates_name_how_they_turn_thinking_off() {
         let parsed = |source: &str| ChatTemplate::parse(source).expect("a template");
         let want = |name: &str| match name {
-            "qwen3" | "qwen36" | "qwen38" | "v41" | "nemotron" | "nemotron-bolt" => {
-                ThinkingOff::Switch
+            "qwen3" | "qwen36" | "qwen38" | "nemotron" | "nemotron-bolt" => {
+                ThinkingOff::Switch { opt_in: false }
             }
+            "v41" => ThinkingOff::Switch { opt_in: true },
             "glm5" => ThinkingOff::LowEffort,
             other => panic!("{other} is not in the thinking-off table"),
         };
@@ -7082,6 +7100,68 @@ mod tests {
             "another effort reaches the template: {p}"
         );
         assert!(p.ends_with("<think>\n"), "its span stays open: {p}");
+    }
+
+    /// Any `reasoning_effort` but `"none"` asks for reasoning: on V4.1's
+    /// template, which renders no thinking until `enable_thinking` is set,
+    /// `low`, `medium` and `high` open the span as the kwargs `true` does, `max`
+    /// adds the template's maximum-effort header, an explicit kwargs
+    /// `enable_thinking` wins either way, and `"none"` is the template's
+    /// default. A template that thinks by default (Qwen3's) renders as it did.
+    #[test]
+    fn reasoning_effort_asks_for_thinking_on_a_template_that_is_off_by_default() {
+        let prompt = |template: &str, extra: Value| {
+            let (addr, _state, _ended) =
+                super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(template));
+            let mut body = json!({ "messages": [{ "role": "user", "content": "Hi" }] });
+            body.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            let (status, answer) = applied(addr, &body);
+            assert_eq!(status, 200, "{answer}");
+            applied_prompt(&answer)
+        };
+        let v41 = include_str!("../tests/fixtures/v41-chat-template.jinja");
+        let off = prompt(v41, json!({}));
+        let on = prompt(
+            v41,
+            json!({ "chat_template_kwargs": { "enable_thinking": true } }),
+        );
+        assert!(
+            off.ends_with("<｜Assistant｜></think>"),
+            "off by default: {off}"
+        );
+        assert!(
+            on.ends_with("<｜Assistant｜><think>"),
+            "the switch opens the span: {on}"
+        );
+        for effort in ["low", "medium", "high"] {
+            let got = prompt(v41, json!({ "reasoning_effort": effort }));
+            assert_eq!(got, on, "{effort} is thinking at the default effort");
+        }
+        let max = prompt(v41, json!({ "reasoning_effort": "max" }));
+        assert!(max.ends_with("<｜Assistant｜><think>"), "max thinks: {max}");
+        assert!(
+            max.contains("Reasoning Effort: Absolute maximum"),
+            "max reaches the template: {max}"
+        );
+        assert_eq!(prompt(v41, json!({ "reasoning_effort": "none" })), off);
+        for effort in ["high", "max"] {
+            let got = prompt(
+                v41,
+                json!({
+                    "reasoning_effort": effort,
+                    "chat_template_kwargs": { "enable_thinking": false },
+                }),
+            );
+            assert_eq!(got, off, "{effort}: the explicit switch wins");
+        }
+        let qwen3 = include_str!("../tests/fixtures/qwen3-chat-template.jinja");
+        assert_eq!(
+            prompt(qwen3, json!({ "reasoning_effort": "high" })),
+            prompt(qwen3, json!({})),
+            "a template that thinks by default is asked for nothing"
+        );
     }
 
     /// `reasoning_effort: "none"` on GLM-5's template, which has no thinking

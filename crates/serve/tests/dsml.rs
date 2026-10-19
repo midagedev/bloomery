@@ -1,7 +1,9 @@
 //! Gate: the reasoning split and DSML tool calls of `/v1/chat/completions`.
 //!
-//! Fixtures are raw model output as the V4.1 template's own markup spells it
-//! (`tests/fixtures/v41-chat-template.jinja`, the GGUF's `tokenizer.chat_template`):
+//! Fixtures are raw model output as the V4 template's own markup spells it
+//! (`tests/fixtures/v41-chat-template.jinja`, the GGUF's `tokenizer.chat_template`);
+//! each runs a second time in V4.1's spelling, a space after the DSML token
+//! (`tests/fixtures/v41-dsml-spaced-chat-template.jinja`):
 //!
 //! ```text
 //! {{- '\n\n<' + dsml_token + 'tool_calls>\n' -}}
@@ -20,9 +22,9 @@
 
 mod common;
 
-use common::{V41_TEMPLATE, post, start, start_with};
+use common::{V41_SPACED_TEMPLATE, V41_TEMPLATE, post, start, start_templated, start_with};
 use serde_json::{Map, Value, json};
-use serve::dsml::{ChatParser, Message, ToolCall};
+use serve::dsml::{ChatParser, Message, Spelling, ToolCall, respell};
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
 
@@ -56,8 +58,9 @@ fn msg(reasoning: &str, content: &str, calls: Vec<ToolCall>) -> Message {
     }
 }
 
-/// `(name, prompt, format, tools, raw output, expected message)`.
-fn fixtures() -> Vec<(
+/// `(name, prompt, format, tools, raw output, expected message)`, the raw output in V4's
+/// tags.
+fn v4_fixtures() -> Vec<(
     &'static str,
     &'static str,
     ReasoningFormat,
@@ -188,7 +191,57 @@ fn fixtures() -> Vec<(
     ]
 }
 
-fn streamed(prompt: &str, format: ReasoningFormat, tools: bool, pieces: &[&str]) -> Message {
+/// `text`, written in V4's tags, in `spelling`'s.
+fn spelled(text: &str, spelling: Spelling) -> String {
+    match spelling {
+        Spelling::Joined => text.to_owned(),
+        Spelling::Spaced => text
+            .replace("｜DSML｜tool_calls", "｜DSML｜ calls")
+            .replace("｜DSML｜invoke", "｜DSML｜ invoke")
+            .replace("｜DSML｜parameter", "｜DSML｜ parameter"),
+    }
+}
+
+/// [`v4_fixtures`] in `spelling`: the raw output, and the expected reasoning and content
+/// where they hold the markup as text, respelled; `tools` carries the spelling.
+fn fixtures(
+    spelling: Spelling,
+) -> Vec<(
+    &'static str,
+    &'static str,
+    ReasoningFormat,
+    Option<Spelling>,
+    String,
+    Message,
+)> {
+    v4_fixtures()
+        .into_iter()
+        .map(|(name, prompt, format, tools, raw, want)| {
+            let want = Message {
+                reasoning: spelled(&want.reasoning, spelling),
+                content: spelled(&want.content, spelling),
+                calls: want.calls,
+            };
+            (
+                name,
+                prompt,
+                format,
+                tools.then_some(spelling),
+                spelled(raw, spelling),
+                want,
+            )
+        })
+        .collect()
+}
+
+const SPELLINGS: [Spelling; 2] = [Spelling::Joined, Spelling::Spaced];
+
+fn streamed(
+    prompt: &str,
+    format: ReasoningFormat,
+    tools: Option<Spelling>,
+    pieces: &[&str],
+) -> Message {
     let mut p = ChatParser::new(prompt, format, tools);
     let mut total = Message::default();
     for piece in pieces {
@@ -209,10 +262,12 @@ fn streamed(prompt: &str, format: ReasoningFormat, tools: bool, pieces: &[&str])
 #[ignore = "gate: just gate-serve"]
 fn hw_fixtures_parse_to_expected_messages() {
     let mut wrong = Vec::new();
-    for (name, prompt, format, tools, raw, want) in fixtures() {
-        let got = ChatParser::parse(prompt, format, tools, raw);
+    for (name, prompt, format, tools, raw, want) in SPELLINGS.into_iter().flat_map(fixtures) {
+        let got = ChatParser::parse(prompt, format, tools, &raw);
         if got != want {
-            wrong.push(format!("{name}:\n  got  {got:?}\n  want {want:?}"));
+            wrong.push(format!(
+                "{name} ({tools:?}):\n  got  {got:?}\n  want {want:?}"
+            ));
             continue;
         }
         if let Some(c) = got.calls.first() {
@@ -235,47 +290,76 @@ fn hw_fixtures_parse_to_expected_messages() {
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_parse_does_not_depend_on_chunking() {
-    for (name, prompt, format, tools, raw, want) in fixtures() {
+    for (name, prompt, format, tools, raw, want) in SPELLINGS.into_iter().flat_map(fixtures) {
         let chars: Vec<String> = raw.chars().map(String::from).collect();
         let pieces: Vec<&str> = chars.iter().map(String::as_str).collect();
         assert_eq!(
             streamed(prompt, format, tools, &pieces),
             want,
-            "{name}: char by char"
+            "{name} ({tools:?}): char by char"
         );
         for (at, _) in raw.char_indices().skip(1) {
             let (a, b) = raw.split_at(at);
             assert_eq!(
                 streamed(prompt, format, tools, &[a, b]),
                 want,
-                "{name}: split at {at}"
+                "{name} ({tools:?}): split at {at}"
             );
         }
+    }
+}
+
+/// A scan reads the one spelling it is given: the other spelling's block is content, as
+/// text, in both directions.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_scan_reads_only_its_own_spelling() {
+    for (reads, written) in [
+        (Spelling::Joined, Spelling::Spaced),
+        (Spelling::Spaced, Spelling::Joined),
+    ] {
+        let raw = spelled(TWO_CALLS, written);
+        let got = ChatParser::parse(OFF, ReasoningFormat::Deepseek, Some(reads), &raw);
+        assert!(
+            got.calls.is_empty(),
+            "{reads:?} read {written:?}'s calls: {got:?}"
+        );
+        assert_eq!(
+            got.content, raw,
+            "{reads:?} read {written:?}'s block as text"
+        );
     }
 }
 
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_fixtures_are_the_templates_markup() {
+    for (spelling, template) in [
+        (Spelling::Joined, V41_TEMPLATE),
+        (Spelling::Spaced, V41_SPACED_TEMPLATE),
+    ] {
+        let t = ChatTemplate::parse(template).expect("template");
+        let two_calls = spelled(TWO_CALLS, spelling);
+        let m = ChatParser::parse(OFF, ReasoningFormat::Deepseek, Some(spelling), &two_calls);
+        let calls: Vec<Value> = m
+            .calls
+            .iter()
+            .map(|c| json!({"id": "x", "type": "function", "function": {"name": c.name, "arguments": c.arguments}}))
+            .collect();
+        let mut vars = Map::new();
+        vars.insert(
+            "messages".into(),
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": m.content, "tool_calls": calls},
+            ]),
+        );
+        vars.insert("bos_token".into(), json!(""));
+        let rendered = t.render(&vars).expect("render");
+        let want = format!("<｜User｜>hi<｜Assistant｜></think>{two_calls}<｜end▁of▁sentence｜>");
+        assert_eq!(rendered, want, "{spelling:?}");
+    }
     let t = ChatTemplate::parse(V41_TEMPLATE).expect("template");
-    let m = ChatParser::parse(OFF, ReasoningFormat::Deepseek, true, TWO_CALLS);
-    let calls: Vec<Value> = m
-        .calls
-        .iter()
-        .map(|c| json!({"id": "x", "type": "function", "function": {"name": c.name, "arguments": c.arguments}}))
-        .collect();
-    let mut vars = Map::new();
-    vars.insert(
-        "messages".into(),
-        json!([
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": m.content, "tool_calls": calls},
-        ]),
-    );
-    vars.insert("bos_token".into(), json!(""));
-    let rendered = t.render(&vars).expect("render");
-    let want = format!("<｜User｜>hi<｜Assistant｜></think>{TWO_CALLS}<｜end▁of▁sentence｜>");
-    assert_eq!(rendered, want);
     let mut vars = Map::new();
     vars.insert(
         "messages".into(),
@@ -393,15 +477,32 @@ fn call_ids(m: &mut Value) -> Vec<String> {
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_chat_tool_calls_stream_and_non_stream() {
-    for (script, extra, reasoning) in [
-        (TWO_CALLS, json!({}), ""),
+    for (spelling, template, script, extra, reasoning) in [
+        (Spelling::Joined, V41_TEMPLATE, TWO_CALLS, json!({}), ""),
         (
+            Spelling::Joined,
+            V41_TEMPLATE,
+            ONE_CALL,
+            json!({"chat_template_kwargs": {"enable_thinking": true}}),
+            "Need the weather.",
+        ),
+        (
+            Spelling::Spaced,
+            V41_SPACED_TEMPLATE,
+            TWO_CALLS,
+            json!({}),
+            "",
+        ),
+        (
+            Spelling::Spaced,
+            V41_SPACED_TEMPLATE,
             ONE_CALL,
             json!({"chat_template_kwargs": {"enable_thinking": true}}),
             "Need the weather.",
         ),
     ] {
-        let addr = start_with(Box::new(ScriptedEngine::new(4096, script)));
+        let script = spelled(script, spelling);
+        let addr = start_templated(Box::new(ScriptedEngine::new(4096, &script)), template);
         let r = post(addr, "/v1/chat/completions", &tool_body(extra.clone()));
         assert_eq!(r.status, 200, "{}", r.body);
         let v = r.json();
@@ -544,4 +645,253 @@ fn hw_no_tools_format_none_is_byte_identical() {
         let r = post(start(4096), "/v1/chat/completions", &b);
         assert_eq!(mask(&r.body), GOLDEN_STREAM, "{format}");
     }
+}
+
+// ---------------------------------------------------------------- V4.1's spelling
+
+/// What DeepSeek-V4.1-Flash generated, byte for byte, for a request to write `hello.txt`
+/// with the `write` tool in the non-thinking mode: the tags carry a space after the DSML
+/// token, which the V4 spelling of the GGUF's own template does not.
+const V41_CALL: &str = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"write\">\n<｜DSML｜ parameter name=\"file_path\" string=\"true\">hello.txt</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"content\" string=\"true\">hi\n</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+
+const EOS: &str = "<｜end▁of▁sentence｜>";
+
+fn write_tools() -> Value {
+    json!([{"type": "function", "function": {"name": "write", "parameters": {"type": "object",
+        "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}}}}}])
+}
+
+fn write_user() -> Value {
+    json!({"role": "user", "content": "write hello.txt"})
+}
+
+/// A model-spelled call parses into `tool_calls`, streamed and whole, to the same message.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_v41_spelled_calls_parse_streamed_and_whole() {
+    let addr = start_templated(
+        Box::new(ScriptedEngine::new(4096, V41_CALL)),
+        V41_SPACED_TEMPLATE,
+    );
+    let body =
+        json!({"model": "m", "messages": [write_user()], "temperature": 0, "tools": write_tools()});
+    let r = post(addr, "/v1/chat/completions", &body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "tool_calls", "{v}");
+    let mut whole = c["message"].clone();
+    let calls = whole["tool_calls"].as_array().expect("tool_calls").clone();
+    assert_eq!(calls.len(), 1, "{v}");
+    assert_eq!(calls[0]["function"]["name"], "write");
+    let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().expect("s"))
+        .expect("arguments parse");
+    assert_eq!(args, json!({"file_path": "hello.txt", "content": "hi\n"}));
+    assert_eq!(whole["content"], "", "{v}");
+    call_ids(&mut whole);
+
+    let mut sb = body.clone();
+    sb["stream"] = json!(true);
+    let r = post(addr, "/v1/chat/completions", &sb);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let (finish, mut folded) = fold_stream(&r.body);
+    assert_eq!(finish, "tool_calls");
+    call_ids(&mut folded);
+    assert_eq!(folded, whole, "streamed == non-streamed");
+}
+
+/// `/apply-template`'s prompt for `messages` with `tools`.
+fn applied(addr: std::net::SocketAddr, messages: &Value, tools: &Value) -> String {
+    let r = post(
+        addr,
+        "/apply-template",
+        &json!({"messages": messages, "tools": tools}),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    r.json()["prompt"].as_str().expect("prompt").to_owned()
+}
+
+/// The server's ids of `text`.
+fn ids_of(addr: std::net::SocketAddr, text: &str) -> Vec<u64> {
+    let r = post(addr, "/tokenize", &json!({"content": text}));
+    assert_eq!(r.status, 200, "{}", r.body);
+    r.json()["tokens"]
+        .as_array()
+        .expect("tokens")
+        .iter()
+        .map(|t| t.as_u64().expect("an id"))
+        .collect()
+}
+
+/// Asserts the prompt of the history `[user, message, tool result]`, the turn `message`
+/// answered `write_user()` with, begins with what the engine was fed and generated for
+/// it (the first prompt, the model's text `generated`, end of sentence), as text and as
+/// the server's ids: the slot's prefix cache keeps the whole turn.
+fn assert_history_reuses(
+    what: &str,
+    addr: std::net::SocketAddr,
+    tools: &Value,
+    message: &Value,
+    generated: &str,
+) {
+    let first = json!([write_user()]);
+    let history = json!([
+        write_user(),
+        message,
+        {"role": "tool", "tool_call_id": message["tool_calls"][0]["id"], "content": "done"},
+    ]);
+    let p1 = applied(addr, &first, tools);
+    let p2 = applied(addr, &history, tools);
+    let fed = format!("{p1}{generated}{EOS}");
+    assert!(
+        p2.starts_with(&fed),
+        "{what}: the history re-renders the turn as the model wrote it:\n  fed  {fed:?}\n  next {p2:?}"
+    );
+    let want = ids_of(addr, &fed);
+    assert_eq!(
+        ids_of(addr, &p2)[..want.len()],
+        want[..],
+        "{what}: the ids of the turn are the next prompt's prefix"
+    );
+}
+
+/// The message a tool turn answered `write_user()` with, as the server returned it.
+fn answered(addr: std::net::SocketAddr, tools: &Value) -> Value {
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &json!({"model": "m", "messages": [write_user()], "temperature": 0, "tools": tools}),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    let message = v["choices"][0]["message"].clone();
+    assert!(
+        message["tool_calls"][0].is_object(),
+        "the turn made a call: {v}"
+    );
+    message
+}
+
+/// The V4 template the V4.1 GGUF carries, served spelled as its model writes
+/// ([`respell`], what the V4.1 seat does at bind).
+fn respelled_template() -> String {
+    respell(V41_TEMPLATE, Spelling::Spaced)
+        .expect("the V4 template respells")
+        .expect("it spells V4's tags")
+}
+
+/// A turn the model wrote, re-rendered into the history, is the prompt's prefix: the
+/// history's tags are the ones the model wrote, in the spaced spelling.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_history_renders_a_spaced_turn_as_the_model_wrote_it() {
+    let message = json!({"role": "assistant", "content": "", "tool_calls": [{
+        "id": "call_0", "type": "function", "function": {
+            "name": "write",
+            "arguments": r#"{"file_path":"hello.txt","content":"hi\n"}"#,
+        },
+    }]});
+    for (what, template) in [
+        ("the V4 template respelled", respelled_template()),
+        ("the V4.1 template", V41_SPACED_TEMPLATE.to_owned()),
+    ] {
+        let addr = start_templated(Box::new(ScriptedEngine::new(4096, "")), &template);
+        assert_history_reuses(what, addr, &write_tools(), &message, V41_CALL);
+    }
+}
+
+/// A V4.1 GGUF ships V4's template (its tags have no space) but the model writes the
+/// spaced tags: served respelled, a call parses and the history keeps the turn's ids.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_respelled_template_serves_the_models_spelling() {
+    let addr = start_templated(
+        Box::new(ScriptedEngine::new(4096, V41_CALL)),
+        &respelled_template(),
+    );
+    let tools = write_tools();
+    let message = answered(addr, &tools);
+    assert_history_reuses("served", addr, &tools, &message, V41_CALL);
+}
+
+/// A V4 file's template is served as it is: its calls parse and its history keeps the
+/// turn's ids in the joined spelling.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_joined_template_serves_joined_calls() {
+    let addr = start_templated(Box::new(ScriptedEngine::new(4096, TWO_CALLS)), V41_TEMPLATE);
+    let tools = tools();
+    assert_history_reuses("served", addr, &tools, &answered(addr, &tools), TWO_CALLS);
+}
+
+/// The spaced template is the joined one with the tags respelled and nothing else:
+/// `respell` writes, from the template the V4.1 GGUF carries, the one llama.cpp ships
+/// for V4.1, and back; a source that spells no tag, or the spelling asked for, is left
+/// alone; a form it does not read is refused by name.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_respell_is_the_released_template_and_back() {
+    assert_eq!(
+        respell(V41_TEMPLATE, Spelling::Spaced)
+            .expect("respells")
+            .as_deref(),
+        Some(V41_SPACED_TEMPLATE)
+    );
+    assert_eq!(
+        respell(V41_SPACED_TEMPLATE, Spelling::Joined)
+            .expect("respells")
+            .as_deref(),
+        Some(V41_TEMPLATE)
+    );
+    assert_eq!(Spelling::of_template(V41_TEMPLATE), Spelling::Joined);
+    assert_eq!(Spelling::of_template(V41_SPACED_TEMPLATE), Spelling::Spaced);
+    let untouched = |source: &str, to| respell(source, to).expect("reads").is_none();
+    assert!(untouched(V41_SPACED_TEMPLATE, Spelling::Spaced));
+    assert!(untouched(V41_TEMPLATE, Spelling::Joined));
+    assert!(untouched(
+        include_str!("fixtures/qwen3-chat-template.jinja"),
+        Spelling::Spaced
+    ));
+    assert!(untouched(common::NO_MARKUP_TEMPLATE, Spelling::Spaced));
+    // Joined tags built in a form the respelling does not read: a named refusal, never a
+    // template whose tags the model does not write served as if they were.
+    let odd = "{{- '<' ~ '｜DSML｜' ~ 'tool_calls>' }}";
+    let e = respell(odd, Spelling::Spaced).expect_err("refused");
+    assert!(e.0.contains("cannot respell"), "{}", e.0);
+}
+
+/// A request's `reasoning_effort` (what DeepSeek Harness sends) turns V4.1's thinking on, so
+/// the reply's reasoning is split out; without it, and with `"none"`, the template's
+/// default holds and the whole output is content.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_reasoning_effort_turns_thinking_on_for_the_split() {
+    let addr = start_with(Box::new(ScriptedEngine::new(4096, ANSWER)));
+    let reply = |extra: Value| {
+        let mut body = json!({"model": "m", "messages": [write_user()], "temperature": 0});
+        body.as_object_mut()
+            .expect("an object")
+            .extend(extra.as_object().expect("an object").clone());
+        let r = post(addr, "/v1/chat/completions", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()["choices"][0]["message"].clone()
+    };
+    for effort in ["low", "medium", "high", "max"] {
+        let m = reply(json!({"reasoning_effort": effort}));
+        assert_eq!(
+            m["reasoning_content"], "The user greets me.",
+            "{effort}: {m}"
+        );
+        assert_eq!(m["content"], "Hello!", "{effort}: {m}");
+    }
+    for extra in [json!({}), json!({"reasoning_effort": "none"})] {
+        let m = reply(extra.clone());
+        assert_eq!(m["content"], ANSWER, "{extra}: {m}");
+        assert!(m.get("reasoning_content").is_none(), "{extra}: {m}");
+    }
+    let m = reply(json!({
+        "reasoning_effort": "high",
+        "chat_template_kwargs": {"enable_thinking": false},
+    }));
+    assert_eq!(m["content"], ANSWER, "the explicit switch wins: {m}");
 }

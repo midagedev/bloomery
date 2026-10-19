@@ -13,6 +13,9 @@ use serde_json::Value;
 use serve::{Engine, FATAL_LINGER, MockEngine, Server, ServerConfig};
 
 pub const V41_TEMPLATE: &str = include_str!("../fixtures/v41-chat-template.jinja");
+/// The same template with the V4.1 release's DSML spelling (a space after the token).
+pub const V41_SPACED_TEMPLATE: &str =
+    include_str!("../fixtures/v41-dsml-spaced-chat-template.jinja");
 pub const FIELDS: &str = include_str!("../fixtures/llama-server-fields.json");
 
 /// A synthetic chat template that teaches no tool-call markup the server

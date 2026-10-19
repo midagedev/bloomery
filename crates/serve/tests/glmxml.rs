@@ -17,7 +17,7 @@ mod common;
 
 use common::post;
 use serde_json::{Map, Value, json};
-use serve::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
+use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, ToolFormat, Tools};
 use serve::glmxml::{ArgTypes, GlmXmlError};
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
@@ -467,7 +467,7 @@ fn hw_tool_format_follows_the_template() {
     assert_eq!(ToolFormat::of_template(TEMPLATE), ToolFormat::GlmXml);
     assert_eq!(
         ToolFormat::of_template(common::V41_TEMPLATE),
-        ToolFormat::Dsml
+        ToolFormat::Dsml(Spelling::Joined)
     );
     assert_eq!(
         ToolFormat::of_template(include_str!("fixtures/qwen3-chat-template.jinja")),
