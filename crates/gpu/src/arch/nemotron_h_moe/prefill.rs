@@ -711,7 +711,7 @@ fn moe_rows(
             let act = slot_form(&mut p.slots, sh.latent, m)?;
             gpu.quantize_q8_1_cols_at(&p.lat, 0, act, m, fault)?;
             let up = SelDown {
-                w: stack(w, &ml.up_exps)?,
+                w: stack(w, ml.up()?)?,
                 act,
                 sel: &p.ids,
                 n_slots: slots,
@@ -723,7 +723,7 @@ fn moe_rows(
             let act = slot_form(&mut p.slots, ml.ff, slots)?;
             gpu.quantize_q8_1_cols_at_relu_sqr(&p.up, 0, act, slots, fault)?;
             let down = SelDown {
-                w: stack(w, &ml.down_exps)?,
+                w: stack(w, ml.down()?)?,
                 act,
                 sel: &p.ids,
                 n_slots: slots,
@@ -833,7 +833,7 @@ fn experts_gemm(
             stream,
             GemmArgs {
                 ty,
-                w: stack(w, &ml.up_exps)?,
+                w: stack(w, ml.up()?)?,
                 rows_per_expert: ml.ff,
                 act: a,
                 route,
@@ -848,7 +848,7 @@ fn experts_gemm(
         stream,
         GemmArgs {
             ty,
-            w: stack(w, &ml.down_exps)?,
+            w: stack(w, ml.down()?)?,
             rows_per_expert: latent,
             act: a,
             route,
@@ -917,7 +917,10 @@ impl Body {
         let (sh, moe) = (self.sh, self.moe);
         let n_kv = sh.n_kv;
         let stream = gpu.stream();
-        let p = &mut self.prompt;
+        let p = self.prompt.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "the prompt pass's buffers (a placed load runs its prompt as steps)",
+        ))?;
         let q_width = p.q_width;
         if m == 0 || m > p.rows {
             return Err(GpuError::shape(
@@ -1141,13 +1144,13 @@ impl GpuModel<Body> {
     /// The rows one pass of [`GpuModel::prefill`] takes: the size the load
     /// chose from the card's room ([`choose_pass_rows`]).
     pub fn pass_rows(&self) -> Result<usize, GpuError> {
-        Ok(self.body(WHAT)?.prompt.rows())
+        Ok(self.body(WHAT)?.prompt()?.rows())
     }
 
     /// [`GpuModel::prefill_with`] in passes of the most ids the prompt
     /// buffers hold: the rows the load chose ([`pass_rows`]).
     pub fn prefill(&mut self, ids: &[u32]) -> Result<u32, GpuError> {
-        let rows = self.body(WHAT)?.prompt.rows();
+        let rows = self.body(WHAT)?.prompt()?.rows();
         self.prefill_with(ids, rows)
     }
 
@@ -1162,7 +1165,7 @@ impl GpuModel<Body> {
         if ids.is_empty() {
             return Err(GpuError::shape(WHAT, "empty token slice"));
         }
-        let cap = self.body(WHAT)?.prompt.rows();
+        let cap = self.body(WHAT)?.prompt()?.rows();
         if rows == 0 || rows > cap {
             return Err(GpuError::shape(
                 WHAT,

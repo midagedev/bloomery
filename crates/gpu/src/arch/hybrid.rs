@@ -654,8 +654,29 @@ const ZERO_CONV_BIAS: &str = "derived.nemotron_h.zero_conv_bias";
 pub(crate) struct Names<'a> {
     pub(crate) what: &'static str,
     pub(crate) file: &'a Split,
-    pub(crate) w: &'a mut Weights,
+    pub(crate) w: &'a Weights,
     pub(crate) types: &'static [SiteTy],
+}
+
+/// The zero conv bias of a file whose Mamba-2 layers `mamba_layers` hold none
+/// of, made once and filed into `w` before any name is resolved
+/// ([`Names::mamba`] reads it): one zero vector of `len` values every such
+/// layer shares. A file that holds every layer's bias adds nothing.
+pub(crate) fn derive_zero_conv_bias(
+    w: &mut Weights,
+    file: &Split,
+    mamba_layers: impl IntoIterator<Item = usize>,
+    len: usize,
+    stream: &CudaStream,
+) -> Result<(), GpuError> {
+    let lacks = mamba_layers
+        .into_iter()
+        .any(|l| file.find(&layer_name(l, SSM_CONV_BIAS)).is_none());
+    if lacks && w.get(ZERO_CONV_BIAS).is_none() {
+        let t = DeviceTensor::zeroed(stream, 1, len)?;
+        w.insert_derived(ZERO_CONV_BIAS.to_owned(), DevWeight::F32 { w: t, k: len })?;
+    }
+    Ok(())
 }
 
 impl Names<'_> {
@@ -687,19 +708,20 @@ impl Names<'_> {
     }
 
     /// Layer `l`'s conv bias of `len` values: the file's, or where the file
-    /// holds none (the bias is optional) one zero vector every such layer
-    /// reads, resident from load.
-    fn conv_bias(&mut self, l: usize, len: usize, stream: &CudaStream) -> Result<String, GpuError> {
+    /// holds none (the bias is optional) the zero vector every such layer
+    /// reads ([`derive_zero_conv_bias`], resident from load).
+    fn conv_bias(&self, l: usize, len: usize) -> Result<String, GpuError> {
         if self.file.find(&layer_name(l, SSM_CONV_BIAS)).is_some() {
             return self.vector(l, SSM_CONV_BIAS, len);
         }
-        let name = ZERO_CONV_BIAS.to_owned();
-        if self.w.get(&name).is_none() {
-            let w = DeviceTensor::zeroed(stream, 1, len)?;
-            self.w
-                .insert_derived(name.clone(), DevWeight::F32 { w, k: len })?;
+        let got = self.w.f32_buf(self.what, ZERO_CONV_BIAS)?.len();
+        if got != len {
+            return Err(GpuError::shape(
+                self.what,
+                format!("{ZERO_CONV_BIAS} holds {got} values, the layer reads {len}"),
+            ));
         }
-        Ok(name)
+        Ok(ZERO_CONV_BIAS.to_owned())
     }
 
     /// The f32 vector `stem` of layer `l`, `len` values: its name.
@@ -732,7 +754,7 @@ impl Names<'_> {
             d: self.vector(l, SSM_D, s.n_heads)?,
             dt_bias: self.vector(l, SSM_DT_BIAS, s.n_heads)?,
             conv_w: self.vector(l, SSM_CONV, s.d_conv * s.conv_dim)?,
-            conv_b: self.conv_bias(l, s.conv_dim, stream)?,
+            conv_b: self.conv_bias(l, s.conv_dim)?,
             ssm_norm: self.vector(l, SSM_NORM, s.d_inner)?,
             store: RecStore::new(stream, lens, 1)?,
             norm,
