@@ -1550,6 +1550,12 @@ impl UnionScratch {
         self.max_cols
     }
 
+    /// The feed-forward width the slabs were made for: a layer of that
+    /// width or less serves through them.
+    pub fn ff(&self) -> usize {
+        self.ff
+    }
+
     /// The most slots one call runs as a whole: a batch's scratch holds its
     /// columns' every slot, a tail's its budget.
     pub fn max_slots(&self) -> usize {

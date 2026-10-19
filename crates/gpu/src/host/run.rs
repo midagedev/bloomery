@@ -22,8 +22,9 @@ use super::nvtier::NvTier;
 
 /// The widths a host call serves: the model width, the routed experts'
 /// feed-forward width and the routed slots a token. A model whose layers
-/// differ in feed-forward width gives the widest: the step scratch is made
-/// per layer width, and the union's slabs and the arena leg serve that one.
+/// differ in feed-forward width gives the widest: the step scratch and the
+/// union's slabs are made per layer width, and the arena leg serves the
+/// widest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostWidths {
     pub embd: usize,
@@ -47,8 +48,10 @@ pub struct HostRun {
     /// at a layer with no host share.
     scratch_of: Vec<usize>,
     widths: HostWidths,
-    /// The union's slabs, once [`HostRun::prepare_union`] made them.
-    union: Option<UnionScratch>,
+    /// The union's slabs, once [`HostRun::prepare_union`] made them: one set
+    /// per feed-forward width, in the order of `scratch`, so a layer's slabs
+    /// are `union[scratch_of[layer]]`; empty until made.
+    union: Vec<UnionScratch>,
     /// The NVMe expert tier's arena, when the plan built one and
     /// [`HostRun::attach_tier`] gave it: every paged layer's ids outside
     /// its host segment read from it.
@@ -163,7 +166,7 @@ impl HostRun {
             scratch,
             scratch_of,
             widths,
-            union: None,
+            union: Vec::new(),
             tier: None,
             reads: HostReads::default(),
         })
@@ -210,45 +213,44 @@ impl HostRun {
         self.tier.as_ref()
     }
 
-    /// The union's slabs for batch calls of up to `cols` columns of the
-    /// run's routed width, made once: a load that never serves a batch never
-    /// holds them. Past [`UNION_MAX_COLS`] they are a group tail's
-    /// ([`UnionScratch::new_tail`]) over whole batches of that many columns,
-    /// with room for every slot, so a call of `cols` columns runs as one. A
-    /// later call for no more columns than they hold keeps them; one for more
-    /// is refused by name (the slabs are the load's size). Load-time only.
+    /// The union's slabs for batch calls of up to `cols` columns, one set per
+    /// feed-forward width the layers have (each over experts that map `embd
+    /// -> ff -> embd` at its own `ff`), made once: a load that never serves a
+    /// batch never holds them. Past [`UNION_MAX_COLS`] they are a group
+    /// tail's ([`UnionScratch::new_tail`]) over whole batches of that many
+    /// columns, with room for every slot, so a call of `cols` columns runs as
+    /// one. A later call for no more columns than they hold keeps them; one
+    /// for more is refused by name (the slabs are the load's size). Load-time
+    /// only.
     pub fn prepare_union(&mut self, cols: usize) -> Result<(), GpuError> {
-        if let Some(s) = self.scratch.iter().find(|s| s.ff() != self.widths.ff) {
-            return Err(GpuError::shape(
-                "HostRun::prepare_union",
-                format!(
-                    "slabs for the run's ff {}; a layer has ff {}",
-                    self.widths.ff,
-                    s.ff()
-                ),
-            ));
+        if let Some(have) = self.union.first() {
+            return if cols <= have.max_cols() {
+                Ok(())
+            } else {
+                Err(GpuError::shape(
+                    "HostRun::prepare_union",
+                    format!(
+                        "slabs for {cols} columns; the load made them for {}",
+                        have.max_cols()
+                    ),
+                ))
+            };
         }
-        match &self.union {
-            None => {
-                let w = self.widths;
-                self.union = Some(if cols <= UNION_MAX_COLS {
-                    UnionScratch::new_routed(w.embd, w.ff, cols, w.n_used)?
+        let (embd, n_used) = (self.widths.embd, self.widths.n_used);
+        self.union = self
+            .scratch
+            .iter()
+            .map(|s| {
+                if cols <= UNION_MAX_COLS {
+                    UnionScratch::new_routed(embd, s.ff(), cols, n_used)
                 } else {
                     let groups = cols.div_ceil(UNION_MAX_COLS);
-                    let slots = groups * UNION_MAX_COLS * w.n_used;
-                    UnionScratch::new_tail(w.embd, w.ff, groups, slots, w.n_used)?
-                });
-                Ok(())
-            }
-            Some(u) if cols <= u.max_cols() => Ok(()),
-            Some(u) => Err(GpuError::shape(
-                "HostRun::prepare_union",
-                format!(
-                    "slabs for {cols} columns; the load made them for {}",
-                    u.max_cols()
-                ),
-            )),
-        }
+                    let slots = groups * UNION_MAX_COLS * n_used;
+                    UnionScratch::new_tail(embd, s.ff(), groups, slots, n_used)
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(())
     }
 
     /// Layers that carry a host share.
@@ -301,8 +303,9 @@ fn view_of<'a>(
 
 impl HostRun {
     /// Layer `layer`'s host view, the run's byte source and the union's
-    /// slabs, for a union call refused by name as `what`: a layer with no
-    /// host share, and slabs never made ([`HostRun::prepare_union`]).
+    /// slabs of the layer's width, for a union call refused by name as
+    /// `what`: a layer with no host share, and slabs never made
+    /// ([`HostRun::prepare_union`]).
     fn union_of(
         &mut self,
         layer: usize,
@@ -311,11 +314,12 @@ impl HostRun {
         let HostRun {
             file,
             layers,
+            scratch_of,
             union,
             ..
         } = self;
         let view = view_of(layers, layer, what)?;
-        let scratch = union.as_mut().ok_or(GpuError::State {
+        let scratch = union.get_mut(scratch_of[layer]).ok_or(GpuError::State {
             what,
             missing: "the union's slabs (HostRun::prepare_union)",
         })?;
@@ -334,7 +338,7 @@ impl HostExperts for HostRun {
         // A tiered load prepares union slabs of at least one column. That
         // call is the resident path: hits compute while a miss fills. A load
         // with no slabs keeps today's fill-then-serve.
-        if self.tier.is_some() && self.union.is_some() {
+        if self.tier.is_some() && !self.union.is_empty() {
             let HostRun {
                 file,
                 layers,
@@ -352,7 +356,7 @@ impl HostExperts for HostRun {
                 experts,
                 out,
                 &mut scratch[scratch_of[layer]],
-                union.as_mut().expect("the branch found the slabs"),
+                &mut union[scratch_of[layer]],
             )?;
             reads.arena_or_file(tier.as_deref(), layer, experts.iter().map(|&(id, _)| id));
             return Ok(());
@@ -629,8 +633,9 @@ mod tests {
 
     /// A layer reading blocks made for another layer's width: a run whose
     /// layers differ in feed-forward width serves each through its own
-    /// scratch, a scratch of another width is refused by name, and the
-    /// union's one-width slabs are refused for the run.
+    /// scratch, a scratch of another width is refused by name, and its union
+    /// holds one set of slabs a width, each layer served through its own
+    /// width's, column for column the step's bits.
     #[test]
     fn layers_of_different_ff_each_serve_through_their_own_scratch() {
         const SET: [usize; 3] = [1, 3, 4];
@@ -661,8 +666,45 @@ mod tests {
                 e.contains("scratch must be made for the layer's widths"),
                 "{e}"
             );
-            let e = run.prepare_union(1).unwrap_err().to_string();
-            assert!(e.contains("a layer has ff 128"), "{e}");
+            let e = run.experts_union_into(1, x.view(), &[&[(0, 1.0)]], &mut out);
+            assert!(
+                e.unwrap_err()
+                    .to_string()
+                    .contains("HostRun::prepare_union"),
+                "a union before its slabs is refused by name"
+            );
+            run.prepare_union(2).unwrap();
+            let ffs: Vec<usize> = run.union.iter().map(UnionScratch::ff).collect();
+            assert_eq!(ffs, [WIDTH, WIDTH / 2], "one set of slabs a width");
+            let x2 = Tensor2 {
+                ne0: WIDTH,
+                ne1: 2,
+                data: (0..2 * WIDTH)
+                    .map(|i| 0.01 * (i % 13) as f32 - 0.05)
+                    .collect(),
+            };
+            let lists: [&[(u32, f32)]; 2] = [&[(0, 1.0), (1, 0.5)], &[(1, 0.25)]];
+            for l in SET {
+                let mut union = vec![7.0f32; 2 * WIDTH];
+                run.experts_union_into(l, x2.view(), &lists, &mut union)
+                    .unwrap();
+                for (j, list) in lists.iter().enumerate() {
+                    let col = Tensor2 {
+                        ne0: WIDTH,
+                        ne1: 1,
+                        data: x2.data[j * WIDTH..(j + 1) * WIDTH].to_vec(),
+                    };
+                    let mut one = vec![0.0f32; WIDTH];
+                    run.experts_into(l, &col, list, &mut one).unwrap();
+                    assert_eq!(
+                        &union[j * WIDTH..(j + 1) * WIDTH],
+                        &one[..],
+                        "layer {l} column {j}"
+                    );
+                }
+            }
+            let e = run.prepare_union(3).unwrap_err().to_string();
+            assert!(e.contains("slabs for 3 columns"), "{e}");
         });
     }
 }
