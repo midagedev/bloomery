@@ -82,7 +82,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu::{Gpu, GpuError, capture_template};
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, sha256, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, quantile, ref_model_path, sha256, verdict};
     use bloomery_gpu_vision::f32_bf16;
     use gguf::Split;
     use refset::arch::qwen35::MODEL_FLASH_Q8;
@@ -446,12 +446,6 @@ mod gate {
         }
         let rel = (num / den.max(f64::MIN_POSITIVE)).sqrt();
         if rel.is_nan() { f64::INFINITY } else { rel }
-    }
-
-    fn quantile(v: &[f64], q: f64) -> f64 {
-        let mut s = v.to_vec();
-        s.sort_by(f64::total_cmp);
-        s[(q * (s.len() - 1) as f64).round() as usize]
     }
 
     /// A region's statistics: the median, the 90th percentile and each quarter's median of the positions'

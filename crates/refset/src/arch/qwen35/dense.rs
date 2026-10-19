@@ -19,8 +19,8 @@
 //! `logits.0.f32` is `rows` rows of `vocab` f32, little-endian: row 0 follows the whole prompt and row `i` follows forced
 //! id `i - 1` (the last forced id is not fed). `prompt.ids` and `forced.ids` hold the ids, one decimal a line.
 //! [`ForcedLogits::open`] checks the set against the family, then each file against the manifest's digests and shape. The
-//! set's CPU twin (`<set>.cpu`, mainline with no card in view) is no family's set: it is the oracle's own floor, and
-//! `open` refuses it by its `# backend`.
+//! set's CPU twin (`<set>.cpu`, mainline with no card in view) is no family's set: it is the oracle's own floor.
+//! [`ForcedLogits::open_cpu`] reads it with the same checks, and each opener refuses the other's `# backend`.
 
 use super::{ARCH, LCPP_BUILD};
 use crate::RefError;
@@ -80,9 +80,20 @@ impl ForcedLogits {
     /// the one tensor row against `# rows` and `# vocab`, each ids file and the rows file against the digest the manifest
     /// states, every id inside the vocabulary and one forced id a row.
     pub fn open(dir: &Path) -> Result<ForcedLogits, RefError> {
+        Self::open_backend(dir, "cuda")
+    }
+
+    /// The CPU twin at `dir` (`<set>.cpu`) read with [`ForcedLogits::open`]'s checks, the `# backend` being `cpu`: a
+    /// CUDA set is refused.
+    pub fn open_cpu(dir: &Path) -> Result<ForcedLogits, RefError> {
+        Self::open_backend(dir, "cpu")
+    }
+
+    /// The set at `dir` whose manifest states the reference engine on `backend`, else as [`ForcedLogits::open`].
+    fn open_backend(dir: &Path, backend: &str) -> Result<ForcedLogits, RefError> {
         let man = RefManifest::open(dir, &LOGITS)?;
         let at = dir.join("MANIFEST.tsv");
-        for (key, want) in [("engine", "reference"), ("backend", "cuda")] {
+        for (key, want) in [("engine", "reference"), ("backend", backend)] {
             let got = stated::<String>(&man, key)?;
             if got != want {
                 return Err(RefError::malformed(
@@ -359,26 +370,58 @@ mod tests {
         Ok(())
     }
 
-    /// The CPU twin passes the family's check (same model, build, architecture, digests and shape) and is still no set
-    /// of this family: `open` refuses a manifest whose only change is `# backend cpu`, or a run that is not the reference
-    /// engine's.
-    #[test]
-    fn the_cpu_twin_and_a_native_run_are_refused_by_their_manifest_lines() {
-        let dir = write_set("twin", MODEL, LCPP_BUILD, ARCH, true);
+    fn refused_cpu(dir: &Path) -> String {
+        ForcedLogits::open_cpu(dir)
+            .expect_err("refused")
+            .to_string()
+    }
+
+    /// The manifest of the set at `dir` with `was` replaced by `now`.
+    fn restate(dir: &Path, was: &str, now: &str) {
         let text = std::fs::read_to_string(dir.join("MANIFEST.tsv")).expect("manifest");
-        for (was, now, want) in [
-            ("# backend\tcuda", "# backend\tcpu", "# backend \"cpu\""),
-            (
-                "# engine\treference",
-                "# engine\tnative",
-                "# engine \"native\"",
-            ),
-        ] {
-            assert!(text.contains(was), "the writer's shape: {was}");
-            std::fs::write(dir.join("MANIFEST.tsv"), text.replace(was, now)).expect("manifest");
-            let e = refused(&dir);
-            assert!(e.contains(want), "{now}: {e}");
-        }
+        assert!(text.contains(was), "the writer's shape: {was}");
+        std::fs::write(dir.join("MANIFEST.tsv"), text.replace(was, now)).expect("manifest");
+    }
+
+    /// A CUDA set opens as one and is refused as the CPU twin, by its `# backend`.
+    #[test]
+    fn a_cuda_set_is_refused_as_the_cpu_twin() {
+        let dir = write_set("cuda-as-cpu", MODEL, LCPP_BUILD, ARCH, true);
+        ForcedLogits::open(&dir).expect("the CUDA set opens as one");
+        let e = refused_cpu(&dir);
+        assert!(e.contains("# backend \"cuda\", want \"cpu\""), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The CPU twin passes the family's check and the digest and shape checks of `open`, so `open_cpu` reads it as its
+    /// ids and rows; `open` still refuses it, by its `# backend`.
+    #[test]
+    fn the_cpu_twin_opens_as_the_twin_and_is_refused_as_a_cuda_set() {
+        let dir = write_set("twin-as-cuda", MODEL, LCPP_BUILD, ARCH, true);
+        restate(&dir, "# backend\tcuda", "# backend\tcpu");
+        let twin = ForcedLogits::open_cpu(&dir).expect("the CPU twin opens as one");
+        assert_eq!(
+            (twin.prompt.as_slice(), twin.forced.as_slice()),
+            (&PROMPT[..], &FORCED[..])
+        );
+        assert_eq!((twin.vocab, twin.rows()), (VOCAB, 2));
+        assert_eq!(twin.row(1), &ROWS[VOCAB..]);
+        let e = refused(&dir);
+        assert!(e.contains("# backend \"cpu\", want \"cuda\""), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run that is not the reference engine's is refused by both openers, whichever backend it states.
+    #[test]
+    fn a_native_run_is_refused_by_both_openers() {
+        for (backend, name) in [("cuda", "native-cuda"), ("cpu", "native-cpu")] {
+            let dir = write_set(name, MODEL, LCPP_BUILD, ARCH, true);
+            restate(&dir, "# backend\tcuda", &format!("# backend\t{backend}"));
+            restate(&dir, "# engine\treference", "# engine\tnative");
+            for e in [refused(&dir), refused_cpu(&dir)] {
+                assert!(e.contains("# engine \"native\""), "{backend}: {e}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

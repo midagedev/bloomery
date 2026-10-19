@@ -394,8 +394,8 @@ mod gate {
     use super::flash_grid::flash_grids;
     use super::q3place::{self, PlaceQ3};
     use super::q35_clauses::{
-        self as q35, Geometry35, PathRun, Slots35, decode_run, fresh, lcg_ids, pass_head_nodes,
-        refed_after_cut, refused, same_run, same_store, stores, uncut_call,
+        self as q35, Geometry35, PathRun, Slots35, decode_run, fresh, lcg_ids, refed_after_cut,
+        refused, same_run, same_store, stores, uncut_call,
     };
     use super::residency_clauses;
     use app::Session;
@@ -2883,7 +2883,7 @@ mod gate {
             lcg_ids(SLOT_A + SLOT_B, vocab),
             SLOT_A,
             (U_GATE, CTX),
-            (geometry(), nodes_slot()?, pass_head_nodes),
+            (geometry(), nodes_slot()?),
             Box::new(|| open(CTX, KvQ8::F16)),
         )?;
         q35::slots_two(&slots)

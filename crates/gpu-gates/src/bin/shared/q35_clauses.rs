@@ -306,7 +306,7 @@ pub fn refed_after_cut(
 /// lm_head: the copy of the rows into its input, then the fused head's
 /// three at one row, or the norm, the quantizer, the gemv and the rows'
 /// argmax past it.
-pub fn pass_head_nodes(rows: usize) -> usize {
+fn pass_head_nodes(rows: usize) -> usize {
     1 + if rows == 1 { 3 } else { 4 }
 }
 
@@ -343,8 +343,6 @@ pub struct Slots35 {
     /// The sequence-bound launches one more busy slot adds to a captured pass (a delta layer's conv and delta, an
     /// attention layer's rope-append, flash segment pass and merge, and the embedding).
     pub nodes_slot: usize,
-    /// The nodes of a pass's one head of `rows` rows over the file's lm_head.
-    pub head_nodes: fn(usize) -> usize,
     pub load: Load,
 }
 
@@ -355,7 +353,7 @@ impl Slots35 {
         ids: Vec<u32>,
         a_len: usize,
         (mark, ctx): (usize, usize),
-        shape: (Geometry35, usize, fn(usize) -> usize),
+        shape: (Geometry35, usize),
         load: Load,
     ) -> Result<Slots35, GateError> {
         let b_len = ids.len().saturating_sub(a_len);
@@ -374,7 +372,6 @@ impl Slots35 {
             ctx,
             geom: shape.0,
             nodes_slot: shape.1,
-            head_nodes: shape.2,
             load,
         })
     }
@@ -494,7 +491,7 @@ impl PassAdapter for Slots35 {
         key: &[(usize, usize)],
     ) -> Result<usize, GateError> {
         let rows = key.iter().map(|&(_, r)| r).sum();
-        Ok(m.body("slots")?.slots_launches(key) + (self.head_nodes)(rows))
+        Ok(m.body("slots")?.slots_launches(key) + pass_head_nodes(rows))
     }
 }
 
