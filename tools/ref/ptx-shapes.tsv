@@ -651,6 +651,7 @@ gate_qwen3vl_tower   vis_add_f32                        0           0
 gate_qwen3vl_tower   vis_attn                           0           0
 gate_qwen3vl_tower   vis_attn_group                     0           0
 gate_qwen3vl_tower   vis_attn_h72                       0           0
+gate_qwen3vl_tower   vis_attn_h80                       0           0
 gate_qwen3vl_tower   vis_clamp_f32                      0           0
 gate_qwen3vl_tower   vis_gelu_erf                       0           0
 gate_qwen3vl_tower   vis_gelu_tanh                      0           0
@@ -661,7 +662,9 @@ gate_qwen3vl_tower   vis_layer_norm                     0           0
 gate_qwen3vl_tower   vis_mean_groups                    0           0
 gate_qwen3vl_tower   vis_pool_order_f32                 0           0
 gate_qwen3vl_tower   vis_pos_bilinear                   0           0
+gate_qwen3vl_tower   vis_pos_half                       0           0
 gate_qwen3vl_tower   vis_position_rows                  0           0
+gate_qwen3vl_tower   vis_relu_sq                        0           0
 gate_qwen3vl_tower   vis_rms_norm                       0           0
 gate_qwen3vl_tower   vis_rms_norm_f32                   0           0
 gate_qwen3vl_tower   vis_rope2d                         0           0

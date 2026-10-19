@@ -1,5 +1,5 @@
 //! bloomery-gpu-vision — the image encoders on the card: from the bf16 patch tensor of
-//! [`vision::arch`] to the bf16 rows the text model reads in place of an image's tokens. Four
+//! [`vision::arch`] to the bf16 rows the text model reads in place of an image's tokens. Six
 //! towers, one per projector type of the encoder file (an mmproj GGUF):
 //!
 //! * `deepseek41v` — DeepSeek-V4.1-Flash's ViT (32 blocks, 2D RoPE, full bidirectional
@@ -15,6 +15,10 @@
 //! * `minicpmv4_7` — MiniCPM-V 4.7's ViT (27 blocks of heads of 72, LayerNorm with bias, learned
 //!   70×70 positions gathered by nearest bucket, no RoPE) with a windowed-attention merger after
 //!   block 6 and a final merger, 16 patches to a token ([`minicpmv`]).
+//!
+//! * `nemotron_omni` — Nemotron 3.5 Bolt's RADIO ViT (32 blocks of heads of 80, LayerNorm with
+//!   bias, a GELU MLP, no RoPE, ten prefix rows, learned 128×128 positions resized to the grid)
+//!   with a pixel-shuffle projector ([`radio`]).
 //!
 //! [`open`] reads the file's projector type and loads the tower; [`Tower`] is what a seat holds.
 //!
@@ -33,6 +37,7 @@
 //!   residual add), every linear layer of both towers.
 //! * [`attn`] — non-causal multi-head attention over one image, online softmax: heads of 64
 //!   (`vis_attn`) and heads of 72 (`vis_attn_h72`).
+//! * [`attn_h80`] — heads of 80 (`vis_attn_h80`), the RADIO tower's attention.
 //! * [`attn_group`] — heads of 72 attending inside consecutive groups of rows only
 //!   (`vis_attn_group`), the vit_merger's windowed attention of MiniCPM-V's tower.
 //! * [`rope2d`] — the 2D rotary embedding of the query and key heads and its angle tables:
@@ -44,6 +49,8 @@
 //! * [`mlp`] — the SiLU gate between the ViT MLPs' linears, with an optional clamp.
 //! * [`gelu_tanh`] — the GELU of the Qwen3-VL tower (tanh) and the `glm5v` merger (erf), in place.
 //! * [`pos_bilinear`] — the Qwen3-VL tower's learned position rows resized to the image's grid.
+//! * [`pos_half`] — the RADIO tower's, resized with half-pixel centers (`vis_pos_half`).
+//! * [`relu_sq`] — ReLU squared in place, the RADIO projector's activation.
 //! * [`aligner`] — the 3×3 unfold of V4.1's ViT grid into the aligner's input rows.
 //! * [`chain`] — what both chains share: weight reading, taps, the rows an encode returns.
 //! * [`encoder`], [`qwen3vl`], [`glm5v`], [`minicpmv`] — each tower's weights on the card and whole chain.
@@ -53,6 +60,7 @@
 pub mod aligner;
 pub mod attn;
 pub mod attn_group;
+pub mod attn_h80;
 pub mod chain;
 pub mod encoder;
 pub mod gelu_tanh;
@@ -67,7 +75,10 @@ pub mod mlp;
 pub mod norm;
 pub(crate) mod pointwise;
 pub mod pos_bilinear;
+pub mod pos_half;
 pub mod qwen3vl;
+pub mod radio;
+pub mod relu_sq;
 pub mod rope2d;
 
 /// bf16 bits to the f32 they denote (exact).
@@ -94,6 +105,7 @@ use vision::Patches;
 use vision::arch::qwen3vl::TokenLimits;
 use vision::arch::{
     deepseek41v, glm5v as glm5v_host, minicpmv as minicpmv_host, qwen3vl as qwen3vl_host,
+    radio as radio_host,
 };
 
 /// One media tower on the card, whichever projector type its file declares. A call takes
@@ -179,14 +191,18 @@ pub fn open(
             file,
             minicpmv::PATCHES_PER_TOKEN * limits.max(),
         )?)),
+        Some(radio_host::PROJECTOR_TYPE) => {
+            Ok(Box::new(radio::Encoder::load(ctx, stream, file, limits)?))
+        }
         other => Err(GpuError::Shape {
             what: "gpu_vision::open",
             detail: format!(
-                "clip.projector_type is {other:?}; this build has a tower for \"{}\", \"{}\", \"{}\" and \"{}\"",
+                "clip.projector_type is {other:?}; this build has a tower for \"{}\", \"{}\", \"{}\", \"{}\" and \"{}\"",
                 deepseek41v::PROJECTOR_TYPE,
                 glm5v_host::PROJECTOR_TYPE,
                 qwen3vl_host::PROJECTOR_TYPE,
-                minicpmv_host::PROJECTOR_TYPE
+                minicpmv_host::PROJECTOR_TYPE,
+                radio_host::PROJECTOR_TYPE
             ),
         }),
     }

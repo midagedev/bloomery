@@ -409,7 +409,10 @@ gpu-mimo2 0 0 0
 # keep Gemma4 post norms in their graph precision; every raw read and disjoint store carries its SAFETY invariant.
 # PIN(2026-10-16): gpu-vision 116 -> 127 blocks: the same Gemma4 clamp, add, pool and F32 norm memory operations
 # now have narrower unsafe scopes, each with its own SAFETY invariant.
-gpu-vision 127 0 0
+# PIN(2026-10-18): gpu-vision 127 -> 148 blocks, new code, not old code relaxed: the RADIO tower's three new kernel entries read
+# and write their buffers through the same raw places as the others, each block with its SAFETY line — vis_attn_h80 16 (the
+# h72 entry's shape), vis_pos_half 3 (its loader and two reads), vis_relu_sq 2 (its loader and the in-place store).
+gpu-vision 148 0 0
 # PIN(2026-10-13): hf 0 -> 2 blocks, new code, not old code relaxed: the DSpark draft's 1.9 GB safetensors file is read
 # through a read-only mapping (Safetensors::open) instead of into memory, and a bf16 tensor's bytes are viewed as u16
 # (Safetensors::bf16, a misaligned file refused), each block with its SAFETY line.
