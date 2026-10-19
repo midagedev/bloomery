@@ -1176,6 +1176,13 @@ gate-gpu-minicpm-text:
 gate-gpu-clef-hidden:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_hidden'
 
+# The dense Qwen3.8-27B generation gate (qwen35, lmstudio's Q4_K_M, 16.5 GB, either card, both tiers): the load against the header
+# derivation without blk.64, the prompt call and forced decode steps' logits rows against mainline's (`just dump-logits-qwen38d`)
+# within the bands the oracle's own CPU twin gives, graph = eager = pass, reset, the checkpoint cut with its re-fed tail, and two
+# resident slots in one pass against each alone. The gate lock; no lease.
+gate-gpu-qwen38d:
+    BLOOMERY_MODEL=qwen38d ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35_dense && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dense'
+
 # Body35's image rows on Clef-Flash at bartowski's Q8_0 (9.5 GB, either card), against the clefvis sets (set B's tower rows
 # as the spans' rows; set C's three prompts, their CPU twins and the C'' runs): the unit rows and the text rows a media call
 # leaves (a span a unit boundary cuts, at the cut units and at one), set C's positions against ours and the rotation table

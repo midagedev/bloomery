@@ -607,6 +607,10 @@ name = "gate_clef_hidden"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_qwen35_dense"
+required-features = ["gpu"]
+
+[[bin]]
 name = "clef_hidden"
 required-features = ["gpu"]
 
