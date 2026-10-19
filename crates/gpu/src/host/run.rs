@@ -21,7 +21,9 @@ use crate::GpuError;
 use super::nvtier::NvTier;
 
 /// The widths a host call serves: the model width, the routed experts'
-/// feed-forward width and the routed slots a token.
+/// feed-forward width and the routed slots a token. A model whose layers
+/// differ in feed-forward width gives the widest: the step scratch is made
+/// per layer width, and the union's slabs and the arena leg serve that one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostWidths {
     pub embd: usize,
@@ -38,7 +40,12 @@ pub struct HostRun {
     /// Per model layer, its host view; `None` for a layer that carries no
     /// host share, which no call may read.
     layers: Vec<Option<HostLayer>>,
-    scratch: HostScratch,
+    /// One step scratch per feed-forward width the layers have, made for
+    /// that width and [`HostWidths::embd`]; every layer of one width shares.
+    scratch: Vec<HostScratch>,
+    /// Per model layer, the index in `scratch` of its width's blocks; unread
+    /// at a layer with no host share.
+    scratch_of: Vec<usize>,
     widths: HostWidths,
     /// The union's slabs, once [`HostRun::prepare_union`] made them.
     union: Option<UnionScratch>,
@@ -138,13 +145,23 @@ impl HostRun {
         }
         let mut layers = Vec::new();
         layers.resize_with(set.last().map_or(0, |&last| last + 1), || None);
+        let mut scratch: Vec<HostScratch> = Vec::new();
+        let mut scratch_of = vec![0; layers.len()];
         for (l, view) in set.into_iter().zip(views) {
+            scratch_of[l] = match scratch.iter().position(|s| s.ff() == view.ff()) {
+                Some(i) => i,
+                None => {
+                    scratch.push(HostScratch::new(widths.embd, view.ff(), widths.n_used)?);
+                    scratch.len() - 1
+                }
+            };
             layers[l] = Some(view);
         }
         Ok(HostRun {
             file,
             layers,
-            scratch: HostScratch::new(widths.embd, widths.ff, widths.n_used)?,
+            scratch,
+            scratch_of,
             widths,
             union: None,
             tier: None,
@@ -201,6 +218,16 @@ impl HostRun {
     /// later call for no more columns than they hold keeps them; one for more
     /// is refused by name (the slabs are the load's size). Load-time only.
     pub fn prepare_union(&mut self, cols: usize) -> Result<(), GpuError> {
+        if let Some(s) = self.scratch.iter().find(|s| s.ff() != self.widths.ff) {
+            return Err(GpuError::shape(
+                "HostRun::prepare_union",
+                format!(
+                    "slabs for the run's ff {}; a layer has ff {}",
+                    self.widths.ff,
+                    s.ff()
+                ),
+            ));
+        }
         match &self.union {
             None => {
                 let w = self.widths;
@@ -312,6 +339,7 @@ impl HostExperts for HostRun {
                 file,
                 layers,
                 scratch,
+                scratch_of,
                 union,
                 reads,
                 tier,
@@ -323,14 +351,20 @@ impl HostExperts for HostRun {
                 x,
                 experts,
                 out,
-                scratch,
+                &mut scratch[scratch_of[layer]],
                 union.as_mut().expect("the branch found the slabs"),
             )?;
             reads.arena_or_file(tier.as_deref(), layer, experts.iter().map(|&(id, _)| id));
             return Ok(());
         }
         let view = view_of(&self.layers, layer, "HostRun::experts_into")?;
-        view.experts_into(self.file.source(), x, experts, out, &mut self.scratch)?;
+        view.experts_into(
+            self.file.source(),
+            x,
+            experts,
+            out,
+            &mut self.scratch[self.scratch_of[layer]],
+        )?;
         self.reads.arena_or_file(
             self.tier.as_deref(),
             layer,
@@ -396,27 +430,40 @@ mod tests {
 
     const WIDTH: usize = 256;
     const EXPERTS: usize = 2;
-    const ROW_BYTES: usize = 34 * WIDTH / 32;
     const WIDTHS: HostWidths = HostWidths {
         embd: WIDTH,
         ff: WIDTH,
         n_used: 2,
     };
 
-    /// A model file holding the three routed stacks of each layer of `have`
-    /// and nothing else, in a directory of its own that the test removes.
-    fn file_with(have: &[usize], dir: &std::path::Path) -> Arc<Split> {
-        let bytes = ROW_BYTES * WIDTH * EXPERTS;
-        let names: Vec<String> = have.iter().flat_map(|&l| routed_stacks(l)).collect();
+    /// A model file holding the three routed stacks of each `(layer, ff)` of
+    /// `have` and nothing else, in a directory of its own that the test
+    /// removes.
+    fn file_with(have: &[(usize, usize)], dir: &std::path::Path) -> Arc<Split> {
+        // The stacks' bytes: q8_0 rows of `k` columns, `rows` rows an expert.
+        let bytes = |k: usize, rows: usize| 34 * (k / 32) * rows * EXPERTS;
+        let decls: Vec<(String, Vec<u64>, usize)> = have
+            .iter()
+            .flat_map(|&(l, ff)| {
+                let n = routed_stacks(l);
+                let gate_up = vec![WIDTH as u64, ff as u64, EXPERTS as u64];
+                let down = vec![ff as u64, WIDTH as u64, EXPERTS as u64];
+                [
+                    (n[0].clone(), gate_up.clone(), bytes(WIDTH, ff)),
+                    (n[1].clone(), gate_up, bytes(WIDTH, ff)),
+                    (n[2].clone(), down, bytes(ff, WIDTH)),
+                ]
+            })
+            .collect();
         let layout = Layout::new(
             &[],
-            names
+            decls
                 .iter()
-                .map(|name| TensorDecl {
+                .map(|(name, dims, nbytes)| TensorDecl {
                     name: name.clone(),
-                    dims: vec![WIDTH as u64, WIDTH as u64, EXPERTS as u64],
+                    dims: dims.clone(),
                     type_id: 8,
-                    nbytes: bytes as u64,
+                    nbytes: *nbytes as u64,
                 })
                 .collect(),
         )
@@ -424,18 +471,22 @@ mod tests {
         let path = dir.join("model.gguf");
         let mut writer = Writer::new(std::fs::File::create_new(&path).unwrap(), layout).unwrap();
         let block = [[0x00, 0x24].as_slice(), &[1u8; 32]].concat();
-        let data = block.repeat(WIDTH * EXPERTS * (WIDTH / 32));
-        assert_eq!(data.len(), bytes);
-        for name in &names {
+        for (name, _, nbytes) in &decls {
+            let data = block.repeat(nbytes / block.len());
+            assert_eq!(data.len(), *nbytes);
             writer.tensor(name, &data).unwrap();
         }
         writer.finish().unwrap();
         Arc::new(Split::open(&path).unwrap())
     }
 
-    /// `body` over a file of the layers `have`, its directory removed after,
-    /// a panic of `body` carried on.
-    fn with_file(have: &[usize], body: impl FnOnce(Arc<Split>) + std::panic::UnwindSafe) {
+    /// `body` over a file of the layers `have` at the widths `ff_of` gives,
+    /// its directory removed after, a panic of `body` carried on.
+    fn with_file_ff(
+        have: &[usize],
+        ff_of: fn(usize) -> usize,
+        body: impl FnOnce(Arc<Split>) + std::panic::UnwindSafe,
+    ) {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "bloomery-host-run-{}-{}",
@@ -443,7 +494,8 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&dir).unwrap();
-        let file = file_with(have, &dir);
+        let have: Vec<(usize, usize)> = have.iter().map(|&l| (l, ff_of(l))).collect();
+        let file = file_with(&have, &dir);
         let result = std::panic::catch_unwind(move || body(file));
         std::fs::remove_dir_all(&dir).unwrap();
         if let Err(panic) = result {
@@ -451,7 +503,19 @@ mod tests {
         }
     }
 
+    fn with_file(have: &[usize], body: impl FnOnce(Arc<Split>) + std::panic::UnwindSafe) {
+        with_file_ff(have, |_| WIDTH, body);
+    }
+
     fn views(src: R8Source<'_>, layers: &[usize]) -> Result<Vec<HostLayer>, model::ModelError> {
+        views_ff(src, layers, |_| WIDTH)
+    }
+
+    fn views_ff(
+        src: R8Source<'_>,
+        layers: &[usize],
+        ff_of: fn(usize) -> usize,
+    ) -> Result<Vec<HostLayer>, model::ModelError> {
         layers
             .iter()
             .map(|&l| {
@@ -464,7 +528,7 @@ mod tests {
                         down: &n[2],
                         n_expert: EXPERTS,
                         embd: WIDTH,
-                        ff: WIDTH,
+                        ff: ff_of(l),
                         swiglu_limit: 0.0,
                     },
                 )
@@ -560,6 +624,45 @@ mod tests {
             let e = build(&[1, 4, 5], &[1, 4]).unwrap();
             assert!(e.contains("2 host views for a set of 3 layers"), "{e}");
             assert!(build(&[1, 4], &[1, 4]).is_none());
+        });
+    }
+
+    /// A layer reading blocks made for another layer's width: a run whose
+    /// layers differ in feed-forward width serves each through its own
+    /// scratch, a scratch of another width is refused by name, and the
+    /// union's one-width slabs are refused for the run.
+    #[test]
+    fn layers_of_different_ff_each_serve_through_their_own_scratch() {
+        const SET: [usize; 3] = [1, 3, 4];
+        fn ff_of(l: usize) -> usize {
+            if l == 3 { WIDTH / 2 } else { WIDTH }
+        }
+        with_file_ff(&SET, ff_of, |file| {
+            let mut run =
+                HostRun::build_at(file, SET, false, WIDTHS, |src| views_ff(src, &SET, ff_of))
+                    .unwrap();
+            let x = Tensor2 {
+                ne0: WIDTH,
+                ne1: 1,
+                data: vec![0.5; WIDTH],
+            };
+            let mut out = vec![7.0f32; WIDTH];
+            for l in SET {
+                run.experts_into(l, &x, &[(0, 1.0)], &mut out).unwrap();
+            }
+            let mut wide = HostScratch::new(WIDTH, WIDTH, 2).unwrap();
+            let e = run
+                .layer(3)
+                .unwrap()
+                .experts_into(run.file.source(), &x, &[(0, 1.0)], &mut out, &mut wide)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("scratch must be made for the layer's widths"),
+                "{e}"
+            );
+            let e = run.prepare_union(1).unwrap_err().to_string();
+            assert!(e.contains("a layer has ff 128"), "{e}");
         });
     }
 }

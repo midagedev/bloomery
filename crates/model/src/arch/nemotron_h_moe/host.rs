@@ -43,3 +43,22 @@ pub fn layer(src: R8Source<'_>, hp: &Hparams, l: usize) -> Result<Option<HostLay
     )
     .map(Some)
 }
+
+/// The host views of the routed layers `set` (strictly ascending model layers
+/// that carry a host share), one per layer in the set's order: each through
+/// [`layer`], a layer that routes no expert refused by name as a missing
+/// routed stack.
+pub fn routed_layers(
+    src: R8Source<'_>,
+    hp: &Hparams,
+    set: &[usize],
+) -> Result<Vec<HostLayer>, ModelError> {
+    set.iter()
+        .map(|&l| {
+            layer(src, hp, l)?.ok_or_else(|| {
+                let [_, up, _] = routed_stacks(l);
+                ModelError::MissingTensor(up)
+            })
+        })
+        .collect()
+}
