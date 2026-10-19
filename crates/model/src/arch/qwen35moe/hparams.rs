@@ -1430,6 +1430,61 @@ pub(super) mod tests {
         assert_eq!(dense, 3 * KINDS.len());
     }
 
+    /// The chat surface is the family's on every variant the reader reads
+    /// (qwen35, qwen35moe, qwen4exp): the `<tool_call><function=…>` markup and
+    /// the `<think>` span are bound, so a file with a template lists no
+    /// tool-call parser item.
+    #[test]
+    fn every_variants_chat_surface_is_the_families() {
+        let global = [
+            ("tokenizer.ggml.pre", V::Str("qwen35")),
+            ("tokenizer.chat_template", V::Str("{{ messages }}")),
+        ];
+        let files = [
+            ("q35-chat", "qwen35", qwen35_keys(), qwen35_tensors()),
+            (
+                "q35m-chat",
+                "qwen35moe",
+                qwen35moe_keys(),
+                qwen35moe_tensors(),
+            ),
+            ("q4x-chat", "qwen4exp", keys(), tensors()),
+        ];
+        for (tag, arch, kv, mut t) in files {
+            // The query projection writes each of the 4 heads' 16 values and its gate beside
+            // them, as `qwen35_tensors` shapes it.
+            for (name, dims) in &mut t {
+                if name.ends_with(".attn_q.weight") {
+                    *dims = vec![64, 128];
+                }
+            }
+            let path = header_shaped(tag, arch, &kv, &global, &t);
+            let split = gguf::Split::open(&path).expect("the synthetic header opens");
+            let read = crate::arch::spec(&split);
+            let _ = std::fs::remove_file(&path);
+            let read = read.unwrap_or_else(|e| panic!("{arch}: {e}"));
+            assert_eq!(
+                read.spec.chat.tools,
+                Some(models::ToolFormat::QwenXml),
+                "{arch}"
+            );
+            assert_eq!(
+                read.spec.chat.reasoning,
+                Some(models::ReasoningFormat::ThinkSpan),
+                "{arch}"
+            );
+            let parser = "a tool-call parser for this template";
+            let items: Vec<String> = coverage::check(&read.spec, &read.tensors)
+                .into_iter()
+                .map(|u| u.feature)
+                .collect();
+            assert!(
+                !items.iter().any(|f| f == parser),
+                "{arch}: {parser:?} listed: {items:?}"
+            );
+        }
+    }
+
     /// A qwen35 layer that routes is refused by name: the architecture's
     /// builder asserts no router on any layer.
     #[test]

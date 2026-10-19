@@ -390,6 +390,39 @@
 //!   request decodes on the first answers the ids it answered alone, the text request too, and the
 //!   server ran rounds of both slots. FAIL-first: a media call that lands on the first slot.
 //!
+//! A dense `qwen35` file (the Qwen3.8-27B) is a third model. Its body is `Body35`, so the clauses
+//! above that name a qwen35moe file hold on it too — the checkpoint prefix clauses, the resident
+//! slots and their `checkpoints:` line, the planes and the arena of the whole-fit line, the late
+//! arrival, the rounds — and, comparing the engine with itself (the server against the CLI, the
+//! load against its own verdict), they read no reference set. The clauses that assume routed
+//! experts have no arm on it and print `n/a (dense: …)` with the reason, no verdict:
+//! `defaults_take_a_long_prompt_on_a_12gb_card`, the placed slots arms (`placed_…`),
+//! `placed_slots_hold_the_plan` and the images. `plan_flag_stops_before_the_load` plans it with
+//! no card budget, and `ctx_default`'s placed arm (`--place a`, no budget) is a plan record of
+//! no experts around the whole-card load. Beside them, on the clauses' own terms:
+//!
+//! - `records_name_the_files_architecture`, every file: the `load` and the `listening` record
+//!   name the header's architecture word. FAIL-first: a seat that prints `qwen35moe` for the
+//!   dense file leaves both records red.
+//! - `tool_call_is_parsed`, a `Body35` file: `/v1/chat/completions` of [`TOOL_ASK`] with one
+//!   function listed, at temperature 0 and thinking off, answers 200 with `finish_reason`
+//!   `tool_calls` and one call of the listed function whose `arguments` is a JSON object with a
+//!   non-empty string `city`: the markup the file's template teaches (`<tool_call><function=…>`)
+//!   is the format the reader binds (`qwen35moe::spec`) and the server parses. FAIL-first: a
+//!   server that parses no tool markup for the template refuses the request or answers the markup
+//!   as text.
+//! - `dense_below_its_floor_is_refused_by_name`, the dense file: `--plan` on `--place a` under
+//!   [`PLACED_BUDGET`] exits non-zero with the context ladder's refusal (the least the default
+//!   tries takes more bytes than the budget's, `ask fewer slots or a smaller model file`) and
+//!   opens nothing: a dense backbone has no routed expert to move to the host tier. FAIL-first:
+//!   a budget over the file's floor plans and exits 0.
+//! - `q8_cache_is_refused_on_the_scalar_pair_flash`, a `Body35` file whose head shape runs the
+//!   scalar pair flash (the 27B: 24 query heads over 4 key-value heads, `decode_mma` false): the
+//!   server of `--cache-type-k q8_0` at the default arm's context exits before it listens and its
+//!   stderr names the cache's flash; the q8_0 delta and cache-word clauses are `n/a` for it. When
+//!   the pass exists the clause is red and its owner swaps it for those two. FAIL-first: a server
+//!   that listens leaves it red.
+//!
 //! The spawn census, every server this gate starts and its `--parallel`:
 //! [`spawn`] and `ctx_default`'s q8 arm pin `--parallel 1` (the prefix and
 //! ctx clauses hold the one-slot path's keeps and defaults), its placed arm
@@ -453,6 +486,7 @@ mod gate {
         ctx_line, default_line_held, field as field_u64, rung_above, rungs, target_of,
     };
     use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::qwen_seat::{self, decode_mma};
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
         self, Answer, PrefixTurns, Served, agree, chat_is_those_ids, check, curl,
@@ -546,6 +580,38 @@ mod gate {
     /// (`app::arch::qwen3moe::GEMM_FROM`): the rows a kept prefix leaves
     /// behind are a whole fresh run's.
     const GEMM_FROM: usize = app::arch::qwen3moe::GEMM_FROM;
+
+    /// The seat's family of `model`, from the architecture its header names;
+    /// a file the Qwen seat takes none of is a named error.
+    fn seat_of(model: &Path) -> Result<qwen_seat::Family, GateError> {
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let arch = split.architecture().unwrap_or("<missing>");
+        qwen_seat::Family::from_name(arch).ok_or_else(|| {
+            format!("{}: the Qwen seat takes no {arch:?} file", model.display()).into()
+        })
+    }
+
+    /// Whether the family's body is `Body35`: GDN layers beside gated
+    /// attention, so recurrent state and checkpoints, on a routed file and a
+    /// dense one alike.
+    fn body35(seat: qwen_seat::Family) -> bool {
+        matches!(
+            seat,
+            qwen_seat::Family::Qwen35moe | qwen_seat::Family::Qwen35
+        )
+    }
+
+    /// Whether the family's files have routed experts: a host tier, and so a
+    /// placement under a card budget the weights alone overrun.
+    fn routed(seat: qwen_seat::Family) -> bool {
+        seat != qwen_seat::Family::Qwen35
+    }
+
+    /// The line of a clause a dense file has no arm of, with the reason: no
+    /// verdict, so the gate's result does not move.
+    fn not_for_dense(clause: &str, why: &str) {
+        println!("n/a {clause} (dense: {why})");
+    }
 
     struct Args {
         models: Vec<PathBuf>,
@@ -804,10 +870,18 @@ mod gate {
         /// `ctx_max`.
         fn stopped_with_its_plan(&self) -> bool {
             let total = self.ctx_field("total");
+            self.exited == Some(true)
+                && total.is_some()
+                && total == self.ctx_max()
+                && !self.opened()
+        }
+
+        /// Whether the run printed a `load` or `listening` record (a line that
+        /// opens one and does not read whole counts as one).
+        fn opened(&self) -> bool {
             let records = self.records();
-            let loaded = or_named(records.first(&record::LOAD_QWEN3)).is_none_or(|l| l.is_some())
-                || or_named(records.first(&record::LISTENING_QWEN3)).is_none_or(|l| l.is_some());
-            self.exited == Some(true) && total.is_some() && total == self.ctx_max() && !loaded
+            or_named(records.first(&record::LOAD_QWEN3)).is_none_or(|l| l.is_some())
+                || or_named(records.first(&record::LISTENING_QWEN3)).is_none_or(|l| l.is_some())
         }
     }
 
@@ -819,13 +893,22 @@ mod gate {
     /// red.
     fn plan_flag_stops_before_the_load(
         model: &Path,
+        seat: qwen_seat::Family,
         dir: &Path,
         ok: &mut bool,
     ) -> Result<(), GateError> {
+        // A dense file is planned on the card as it stands: under the budget a
+        // routed file's plan splits, its weights alone are over the floor
+        // ([`dense_is_refused_below_its_floor`]).
+        let env: &[(&str, &str)] = if routed(seat) {
+            &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)]
+        } else {
+            &[]
+        };
         let run = plan_run(
             "plan-only",
             (model, dir),
-            &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
+            env,
             &["--parallel", "2", "--place", "a"],
         )?;
         println!(
@@ -838,6 +921,43 @@ mod gate {
             ok,
             "plan_flag_stops_before_the_load",
             run.stopped_with_its_plan(),
+        );
+        Ok(())
+    }
+
+    /// `dense_below_its_floor_is_refused_by_name` (module header), on a dense
+    /// file alone: `--plan` of two slots under [`PLACED_BUDGET`] on `--place a`
+    /// exits non-zero with the context ladder's refusal (the least the default
+    /// tries, `… take N bytes on a card that holds` the budget's bytes, `ask
+    /// fewer slots or a smaller model file`) and prints no `load` or
+    /// `listening` record. A dense backbone has no routed expert to move to the
+    /// host tier, so a budget under its weights is a refusal, not a placement.
+    /// FAIL-first: a budget over the file's floor plans and exits 0, and the
+    /// clause is red.
+    fn dense_below_its_floor_is_refused_by_name(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let run = plan_run(
+            "plan-floor",
+            (model, dir),
+            &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
+            &["--parallel", "2", "--place", "a"],
+        )?;
+        let budget = format!("on a card that holds {}:", 12_u64 << 30);
+        let named = run.said.contains("the least the default tries")
+            && run.said.contains(&budget)
+            && run.said.contains("ask fewer slots or a smaller model file");
+        println!(
+            "floor arm: exit ok {:?}, names the refusal {named}, opened {}",
+            run.exited,
+            run.opened()
+        );
+        check(
+            ok,
+            "dense_below_its_floor_is_refused_by_name",
+            run.exited == Some(false) && named && !run.opened(),
         );
         Ok(())
     }
@@ -947,7 +1067,9 @@ mod gate {
     /// `ctx_default_is_the_highest_rung_held`): a load under `--place` takes
     /// the rung its plan holds, its two slots resident on either file
     /// (`placed_slots_are_resident`), and the q8_0 cache's load holds the
-    /// planes' derived delta against the main server's at the same context.
+    /// planes' derived delta against the main server's at the same context
+    /// (a file whose head shape has no q8_0 flash is refused instead,
+    /// [`q8_cache_is_refused_on_the_scalar_pair_flash`]).
     /// The choice itself — the target, the halving, the floor and the set
     /// share — is held by `bloomery_placement::placement::ctx_ask`'s tests.
     /// FAIL-first: a choice that keeps the target whatever the card makes
@@ -955,6 +1077,7 @@ mod gate {
     /// listens).
     fn ctx_default(
         model: &Path,
+        seat: qwen_seat::Family,
         dir: &Path,
         default_n: u64,
         ok: &mut bool,
@@ -1060,6 +1183,9 @@ mod gate {
             !runs.is_empty() && runs.iter().all(|&(p, c)| p >= 1 && c == 1),
         );
         println!("ctx arm placed: server stopped: {}", s.stop()?);
+        if body35(seat) && !flash_has_q8(&split)? {
+            return q8_cache_is_refused_on_the_scalar_pair_flash(model, dir, default_n, ok);
+        }
         let resident = |log: &str| -> Result<u64, GateError> {
             Ok(record::Log::of(log, record::BLOOMERY_SERVE_QWEN3)
                 .one(&record::LOAD_QWEN3)?
@@ -1134,6 +1260,70 @@ mod gate {
             .collect::<Result<Vec<_>, _>>()?;
         println!("ctx arm q8: the load records' cache {caches:?}");
         check(ok, "q8_load_names_its_cache", caches == ["q8_0"]);
+        Ok(())
+    }
+
+    /// Whether the file's decode flash has a q8_0 cache pass: `Body35`'s
+    /// tensor-core pass, the eight-head layout's (`decode_mma`), is the one that
+    /// reads a q8_0 K cache; the scalar pair pass of a group of six has none.
+    fn flash_has_q8(split: &Split) -> Result<bool, GateError> {
+        let hp = Hparams::read(split).map_err(|e| format!("{e}"))?;
+        decode_mma(hp.head_dim, hp.n_head / hp.n_head_kv)
+    }
+
+    /// `q8_cache_is_refused_on_the_scalar_pair_flash` (module header), on a
+    /// `Body35` file whose head shape runs the scalar pair flash (the dense
+    /// 27B: 24 query heads over 4 key-value heads): the server of
+    /// `--cache-type-k q8_0` at the default arm's context exits before it
+    /// listens, and its stderr names the cache's flash as the reason. The
+    /// q8_0 delta and cache-word clauses (`q8_resident_drops_by_the_planes`,
+    /// `q8_load_names_its_cache`) print `n/a` for it. FAIL-first: a server
+    /// that listens on this file (a pair pass for the q8_0 cache) leaves the
+    /// clause red; its owner then replaces the clause with those two.
+    fn q8_cache_is_refused_on_the_scalar_pair_flash(
+        model: &Path,
+        dir: &Path,
+        default_n: u64,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        not_for_dense(
+            "q8_resident_drops_by_the_planes, q8_load_names_its_cache",
+            "the q8_0 cache has no scalar pair flash",
+        );
+        let d = dir.join("ctx-q8-refused");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove("BLOOMERY_REF_MODEL");
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let ctx = default_n.to_string();
+        let args = [
+            "--model",
+            "qwen3",
+            "--port",
+            "0",
+            "-m",
+            m,
+            "--parallel",
+            "1",
+            "--cache-type-k",
+            "q8_0",
+            "--ctx",
+            ctx.as_str(),
+        ];
+        let mut s = Served::spawn_cmd(cmd, &args, &d)?;
+        let listened = s.address(&err_log, 600, Duration::from_secs(1)).is_ok();
+        if listened {
+            println!("q8 arm: server stopped: {}", s.stop()?);
+        }
+        let said = std::fs::read_to_string(&err_log)?;
+        let named = said.contains("a q8_0 cache's flash");
+        println!("q8 arm: listened {listened}, names the cache's flash {named}");
+        check(
+            ok,
+            "q8_cache_is_refused_on_the_scalar_pair_flash",
+            !listened && named,
+        );
         Ok(())
     }
 
@@ -1248,7 +1438,7 @@ mod gate {
     /// `default_load_counts_its_arena`, on the default arm's server (its
     /// stderr `log`, its default `n`, the load record's `arch`): the seat's
     /// whole-fit line at `n` counts the arena the load itself holds. A
-    /// qwen35moe file's line names `arena A B + reserve past it R B`, the
+    /// qwen35moe or qwen35 file's line names `arena A B + reserve past it R B`, the
     /// pair `Qwen35moeModel::whole_load` hands the verdict for this file at
     /// `n` rows and the load's own ubatch, read here from the file; a
     /// qwen3moe body allocates its arena with no fit check and has no
@@ -1270,18 +1460,20 @@ mod gate {
             .lines()
             .find(|l| l.starts_with(&head))
             .ok_or_else(|| format!("the default arm's seat printed no whole-fit line at {n}"))?;
-        let held = match arch {
-            "qwen35moe" => {
+        let held = match qwen_seat::Family::from_name(arch) {
+            Some(seat) if body35(seat) => {
+                // The decode flash the file's head shape selects, as the seat's open reads it.
+                let hp = Hparams::read(split).map_err(|e| format!("{e}"))?;
                 let o = Open35 {
                     ctx: usize::try_from(n)?,
-                    mma: true,
+                    mma: decode_mma(hp.head_dim, hp.n_head / hp.n_head_kv)?,
                     ubatch: ubatch_size()?,
                     kv: KvQ8::F16,
                     media: false,
                 };
                 let WholeLoad::Checked { arena, reserve } = Qwen35moeModel::whole_load(split, o)?
                 else {
-                    return Err("a qwen35moe whole load carries no arena term".into());
+                    return Err(format!("a {arch} whole load carries no arena term").into());
                 };
                 println!(
                     "default arm: the load's arena {arena} B + reserve {reserve} B at {n}; the \
@@ -1290,12 +1482,12 @@ mod gate {
                 );
                 arena_terms(line) == Some((arena, reserve))
             }
-            "qwen3moe" => {
+            Some(_) => {
                 println!("default arm: the qwen3moe line names the margin: {line}");
                 arena_terms(line).is_none() && line.contains("(the program's arena under it)")
             }
-            other => {
-                return Err(format!("the default arm's load names architecture {other:?}").into());
+            None => {
+                return Err(format!("the default arm's load names architecture {arch:?}").into());
             }
         };
         check(ok, "default_load_counts_its_arena", held);
@@ -1412,7 +1604,7 @@ mod gate {
                     planes.push(plane);
                 }
             }
-            Some("qwen35moe") => {
+            Some("qwen35moe" | "qwen35") => {
                 let shape = LinearShape {
                     n_k: num("ssm.group_count")? as usize,
                     n_v: num("ssm.time_step_rank")? as usize,
@@ -1437,7 +1629,7 @@ mod gate {
             }
             other => {
                 return Err(format!(
-                    "{} is a {other:?} file; the planes are listed for qwen3moe and qwen35moe",
+                    "{} is a {other:?} file; the planes are listed for qwen3moe, qwen35moe and qwen35",
                     model.display()
                 )
                 .into());
@@ -1624,6 +1816,75 @@ mod gate {
             ok,
             "qwen35_extension_keeps_every_held_position",
             resend.cache_n == held && !resend.tokens.is_empty(),
+        );
+        Ok(())
+    }
+
+    /// The turn the tool-call clause asks.
+    const TOOL_ASK: &str = "What is the weather in Seoul right now? Use the tool.";
+
+    /// The tokens the tool-call clause allows: a call is a few dozen.
+    const TOOL_TOKENS: usize = 256;
+
+    /// `tool_call_is_parsed` (module header), on the default server of a
+    /// `Body35` file: `/v1/chat/completions` of [`TOOL_ASK`] with one function
+    /// listed, at temperature 0 and thinking off, answers 200 with
+    /// `finish_reason` `tool_calls` and one call of the listed function whose
+    /// `arguments` is a JSON object with a non-empty string `city`. The markup
+    /// is the file's template's (`<tool_call><function=…>`), the format the
+    /// reader binds and the server parses. FAIL-first: a server that parses
+    /// no tool markup for this template refuses the request or answers the
+    /// markup as text, and the clause is red.
+    fn tool_call_is_parsed(
+        url: &dyn Fn(&str) -> String,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let body = json!({
+            "messages": [{ "role": "user", "content": TOOL_ASK }],
+            "tools": [{ "type": "function", "function": {
+                "name": "get_weather",
+                "description": "The current weather of a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string", "description": "the city's name" } },
+                    "required": ["city"],
+                },
+            } }],
+            "max_tokens": TOOL_TOKENS,
+            "temperature": 0,
+            "stream": false,
+            "chat_template_kwargs": { "enable_thinking": false },
+        });
+        let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
+        std::fs::write(dir.join("tools.json"), &text)?;
+        let answer: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let choice = &answer["choices"][0];
+        let calls = choice["message"]["tool_calls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let function = calls.first().map(|c| &c["function"]);
+        let name = function.and_then(|f| f["name"].as_str());
+        let arguments: Option<Value> = function
+            .and_then(|f| f["arguments"].as_str())
+            .and_then(|a| serde_json::from_str(a).ok());
+        let city = arguments.as_ref().and_then(|a| a["city"].as_str());
+        println!(
+            "tool call: HTTP {st}, finish {:?}, {} call(s), function {name:?}, city {city:?}; \
+             content {:?}",
+            choice["finish_reason"],
+            calls.len(),
+            choice["message"]["content"]
+        );
+        check(
+            ok,
+            "tool_call_is_parsed",
+            st == 200
+                && choice["finish_reason"] == "tool_calls"
+                && calls.len() == 1
+                && name == Some("get_weather")
+                && city.is_some_and(|c| !c.trim().is_empty()),
         );
         Ok(())
     }
@@ -2082,17 +2343,36 @@ mod gate {
         clippy::type_complexity,
         reason = "the arm tuple, one line a field (rust-quality R8)"
     )]
-    fn slots_rounds_run_one_pass(model: &Path, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
-        let arms: [(&str, &str, &[&str], &[(&str, &str)], bool); 2] = [
-            ("slots-rounds", "", &[], &[], true),
-            (
-                "slots-rounds-placed",
-                "placed_",
-                &["--place", "a"],
-                &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
-                false,
-            ),
-        ];
+    fn slots_rounds_run_one_pass(
+        model: &Path,
+        seat: qwen_seat::Family,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        type Arm<'a> = (
+            &'a str,
+            &'a str,
+            &'a [&'a str],
+            &'a [(&'a str, &'a str)],
+            bool,
+        );
+        let whole: Arm<'_> = ("slots-rounds", "", &[], &[], true);
+        let placed: Arm<'_> = (
+            "slots-rounds-placed",
+            "placed_",
+            &["--place", "a"],
+            &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
+            false,
+        );
+        let mut arms = vec![whole];
+        if routed(seat) {
+            arms.push(placed);
+        } else {
+            not_for_dense(
+                "placed_slots_rounds_*",
+                "no host tier: a budgeted placement is the floor refusal",
+            );
+        }
         for (dir_name, prefix, flags, env, one_pass) in arms {
             let named = |c: &str| format!("{prefix}{c}");
             let d = dir.join(dir_name);
@@ -2455,23 +2735,23 @@ mod gate {
     /// (`runtime::seqstate::HOST_BUDGET`) names the 4 GiB of the default.
     fn slots_count_their_checkpoints(
         model: &Path,
+        seat: qwen_seat::Family,
         dir: &Path,
         ok: &mut bool,
     ) -> Result<(), GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let takes = split.architecture() == Some("qwen35moe");
+        let takes = body35(seat);
         let spec = takes
             .then(|| model::arch::qwen35moe::spec::read(&split))
             .transpose()?
             .map(|read| read.spec);
         let mut held = true;
-        for (arm, counted_in) in [
-            ("slots", "of "),
-            (
-                PLACED_SLOTS.dir,
-                "counted in the placed plan's host reserves",
-            ),
-        ] {
+        // A dense file has no placed arm (its budgeted plan is a refusal).
+        let placed = routed(seat).then_some((
+            PLACED_SLOTS.dir,
+            "counted in the placed plan's host reserves",
+        ));
+        for (arm, counted_in) in [("slots", "of ")].into_iter().chain(placed) {
             let log = std::fs::read_to_string(dir.join(arm).join("server.err")).unwrap_or_default();
             let lines: Vec<&str> = log
                 .lines()
@@ -2723,9 +3003,10 @@ mod gate {
     /// printed — and the file's other clauses do not run.
     fn served(
         model: &Path,
+        seat: qwen_seat::Family,
         dir: &Path,
         ok: &mut bool,
-    ) -> Result<Option<(Vec<Answer>, String, u64)>, GateError> {
+    ) -> Result<Option<(Vec<Answer>, u64)>, GateError> {
         let err_log = dir.join("server.err");
         let mut s = spawn(model, dir)?;
         // The load reads the whole file: up to ten minutes from a cold cache.
@@ -2757,6 +3038,21 @@ mod gate {
             ok,
             "load_and_listen",
             matches!((&load, &listen), (Some(a), Some(b)) if a.at() < b.at()),
+        );
+        // Both records name the file's own architecture, the header's word
+        // (`qwen35` for a dense file, not its routed sibling's).
+        let listening_arch = match &listen {
+            Some(l) => l.word("arch")?.to_owned(),
+            None => String::new(),
+        };
+        println!(
+            "records name architecture {arch:?} and {listening_arch:?}, the file's {:?}",
+            seat.name()
+        );
+        check(
+            ok,
+            "records_name_the_files_architecture",
+            arch == seat.name() && listening_arch == seat.name(),
         );
         // The server ran with no `--place`: the default is exactly one of
         // two things — the whole-card load, printing no `plan` record (a
@@ -2891,16 +3187,17 @@ mod gate {
         // The qwen3moe arm's whole-call answer joins the CLI comparison: a
         // fresh run's ids for the two-message chat.
         let mut whole = None;
-        if arch == "qwen3moe" {
+        if seat == qwen_seat::Family::Qwen3moe {
             whole = Some(prefix(&url, dir, ok)?);
         }
-        if arch == "qwen35moe" {
+        if body35(seat) {
             prefix35(&url, dir, ok)?;
+            tool_call_is_parsed(&url, dir, ok)?;
         }
         println!("server stopped: {}", s.stop()?);
         let mut answers = vec![chat_ids, prose_ids];
         answers.extend(whole);
-        Ok(Some((answers, arch, default_n)))
+        Ok(Some((answers, default_n)))
     }
 
     /// `generate_qwen3moe --arm <prompt>/N … --last-step` on `model`, an arm
@@ -3960,6 +4257,13 @@ mod gate {
                 image_server(model, &img, &d, ok)?;
                 image_set_f(model, &img, &d, ok)
             }
+            Some("qwen35") => {
+                not_for_dense(
+                    "images",
+                    "the 27B's multimodal projector clauses are a later round",
+                );
+                Ok(())
+            }
             other => Err(format!("{}: images on a {other:?} file", model.display()).into()),
         }
     }
@@ -3973,11 +4277,12 @@ mod gate {
             let dir = a.dir.join(i.to_string());
             std::fs::create_dir_all(&dir)?;
             println!("== {}", model.display());
+            let seat = seat_of(model)?;
             if a.only_images {
                 images(model, &dir, &mut ok)?;
                 continue;
             }
-            let Some((answers, arch, default_n)) = served(model, &dir, &mut ok)? else {
+            let Some((answers, default_n)) = served(model, seat, &dir, &mut ok)? else {
                 continue;
             };
             let prompts: Vec<&[u32]> = answers.iter().map(|a| a.prompt.as_slice()).collect();
@@ -3988,13 +4293,24 @@ mod gate {
                 agree_all &= agree(&ans.tokens, &ans.stop, reference);
             }
             check(&mut ok, "completion_ids_are_the_cli_ids", agree_all);
-            ctx_default(model, &dir, default_n, &mut ok)?;
-            plan_flag_stops_before_the_load(model, &dir, &mut ok)?;
+            ctx_default(model, seat, &dir, default_n, &mut ok)?;
+            plan_flag_stops_before_the_load(model, seat, &dir, &mut ok)?;
             ctx_past_the_trained_is_refused_by_name(model, &dir, &mut ok)?;
-            if arch == "qwen35moe" {
-                // The Qwen3.6 file alone: the defaults on the 12 GB card it
-                // is served from.
-                defaults_take_a_long_prompt_on_a_12gb_card(model, &dir, &mut ok)?;
+            match seat {
+                qwen_seat::Family::Qwen35moe => {
+                    // The Qwen3.6 file alone: the defaults on the 12 GB card it
+                    // is served from.
+                    defaults_take_a_long_prompt_on_a_12gb_card(model, &dir, &mut ok)?;
+                }
+                qwen_seat::Family::Qwen35 => {
+                    // The dense file alone: its weights are over a 12 GB card's.
+                    not_for_dense(
+                        "defaults_take_a_long_prompt_on_a_12gb_card",
+                        "its weights alone are over a 12 GB card's budget",
+                    );
+                    dense_below_its_floor_is_refused_by_name(model, &dir, &mut ok)?;
+                }
+                qwen_seat::Family::Qwen3moe => {}
             }
             whole_fit_counts_the_planes_granules(model, &dir, &mut ok)?;
             cache_refusals(model, &dir, &mut ok)?;
@@ -4007,13 +4323,20 @@ mod gate {
             // the qwen35moe arm runs these slot clauses instead; `Park::Ids`
             // keeps its pure tests in `crates/serve/tests/slots`.
             slots_flow_together(model, &dir, &WHOLE_SLOTS, &mut ok)?;
-            slots_flow_together(model, &dir, &PLACED_SLOTS, &mut ok)?;
-            placed_slots_hold_the_plan(model, &dir, &mut ok)?;
-            slots_count_their_checkpoints(model, &dir, &mut ok)?;
+            if routed(seat) {
+                slots_flow_together(model, &dir, &PLACED_SLOTS, &mut ok)?;
+                placed_slots_hold_the_plan(model, &dir, &mut ok)?;
+            } else {
+                not_for_dense(
+                    "placed_slots_*",
+                    "no routed expert to place: a budgeted plan is the floor refusal",
+                );
+            }
+            slots_count_their_checkpoints(model, seat, &dir, &mut ok)?;
             slot_ctx_too_small_is_refused(model, &dir, &mut ok)?;
             slots_late_request_together_alone(model, &dir, &mut ok)?;
-            slots_rounds_run_one_pass(model, &dir, &mut ok)?;
-            if arch == "qwen3moe" {
+            slots_rounds_run_one_pass(model, seat, &dir, &mut ok)?;
+            if seat == qwen_seat::Family::Qwen3moe {
                 // The qwen3moe arm alone: the placed prompt past the GEMM
                 // walk.
                 placed_answers_a_prompt_past_the_gemm_walk(model, &dir, &mut ok)?;

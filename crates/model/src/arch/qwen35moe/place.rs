@@ -47,7 +47,6 @@ use models::{DraftSpec, Ffn, HcKind, Mixer, ModelSpec, MtpDraft, MtpSource, Role
 
 use super::hparams::{Hparams, Kind};
 use super::{mtp, names, roles, spec};
-use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::fileio::hex;
 use crate::placement::accepts::{Program, qwen38_down, qwen38_gate_up, routed_rule};
@@ -375,7 +374,7 @@ impl PlanInputs {
     ) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
-        let chat = chat_of(split, None, None)?;
+        let chat = spec::chat(split)?;
         let spec = spec::spec_of(&hp, &model, chat)?;
         let kv = KvLayout::of(&hp);
         let room = room()?;

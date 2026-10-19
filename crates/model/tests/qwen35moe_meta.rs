@@ -39,8 +39,15 @@ const VIEW: &[&str] = &[
 ];
 
 // PIN(2026-09-27): each file's chat line (its template's bytes differ).
-const CHAT_Q4KM: &str = "chat pre qwen35 template bytes 7764 tools None reasoning None";
-const CHAT_UD: &str = "chat pre qwen35 template bytes 8057 tools None reasoning None";
+// PIN(2026-10-19): both lines gained the family's bound parsers, `tools Some(QwenXml) reasoning
+// Some(ThinkSpan)` (`arch::qwen35moe::spec::chat`): both templates teach `<tool_call>` with
+// `<function=` and `<parameter=` and a `<think>` span, and `crates/serve` parses them from the
+// template. Re-pin by specification, not a relaxation: the line states the reader's binding, which
+// the coverage list below checks. FAIL-first: the binding removed leaves both lines at `None`.
+const CHAT_Q4KM: &str =
+    "chat pre qwen35 template bytes 7764 tools Some(QwenXml) reasoning Some(ThinkSpan)";
+const CHAT_UD: &str =
+    "chat pre qwen35 template bytes 8057 tools Some(QwenXml) reasoning Some(ThinkSpan)";
 
 // PIN(2026-09-27): the keys the reader took a default for, on both files.
 // PIN(2026-10-10): `nextn_predict_layers = 0` joined the list on both files: the key is absent from
@@ -64,9 +71,13 @@ const DEFAULTS: &[&str] = &[
 // (`moe_fits`), the QK norm and rope of head 256 (IMROPE sections covering the 64 turned values),
 // the output gate, the recurrent-state slot and the mixed trunk; gate-gpu-qwen35moe-e2e runs each.
 // The chat surface's two items stay: the program does not run them.
+// PIN(2026-10-19): the tool-call parser item left both lists with the reader's binding of the
+// family's markup (`arch::qwen35moe::spec::chat`); the coverage check lists it only for a template
+// whose `chat.tools` is `None` (`coverage.rs`, `Need::ToolParser`). Re-pin by specification, not a
+// relaxation. FAIL-first: the binding removed lists it again on both files.
 // PIN(2026-09-30): the pre-tokenizer item left both lists with the tokenizer's qwen35 pre-tokenizer
 // (`crates/tokenizer/src/pretok.rs`), which gate-tokenizer holds to the reference's split.
-const COVERAGE_Q4KM: &[&str] = &["a tool-call parser for this template"];
+const COVERAGE_Q4KM: &[&str] = &[];
 
 // PIN(2026-09-27): the same for the UD-Q4_K_XL file, with its Q8_0 and Q5_K format items, which
 // Body35 does not read.
@@ -85,7 +96,7 @@ const COVERAGE_Q4KM: &[&str] = &["a tool-call parser for this template"];
 // and down (`q5k_gemv_sel`) beside their grouped GEMM, and a shared expert of another type than its
 // stacks kept apart as its own dense FFN of its type (q8_0 here, on every layer), so the four format
 // items left; red on the tree before by exactly those four lines.
-const COVERAGE_UD: &[&str] = &["a tool-call parser for this template"];
+const COVERAGE_UD: &[&str] = &[];
 
 // PIN(2026-09-27): each shape-table row of AVAILABLE the files use, and the item it covers on
 // them — the coverage change's FAIL-first, on the Q4_K_M file; with them two of Body35's own rows.
@@ -156,6 +167,42 @@ fn hw_qwen35moe_spec() {
         let err = model::placement::PlacementError::Unimplemented(list);
         let _ = writeln!(o, "as the engine refuses it: {err}");
     }
+    println!("{o}");
+    assert!(
+        b.is_empty(),
+        "{} pin(s) differ:\n  {}",
+        b.len(),
+        b.join("\n  ")
+    );
+}
+
+/// The dense Qwen3.8-27B (`qwen35`, lmstudio's Q4_K_M): the same reader, no routed expert.
+const DENSE_27B: &str = "/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf";
+
+// PIN(2026-10-19): the dense file's chat line, as the Qwen3.6 files' above: the family's bound
+// parsers (`arch::qwen35moe::spec::chat`), the template's bytes this file's own.
+const CHAT_27B: &str =
+    "chat pre qwen35 template bytes 8952 tools Some(QwenXml) reasoning Some(ThinkSpan)";
+
+/// The dense file's chat surface and what the coverage check lists for it: the family's markup
+/// is bound, and no item is left (every tensor is Q4_K, Q6_K or F32, which Body35 serves). The
+/// description's other lines are the Qwen3.8-27B's own and `qwen35_admission` prints them.
+#[test]
+#[ignore = "needs the Qwen3.8-27B file on the box (just gate-qwen35moe-meta)"]
+fn hw_qwen35_dense_chat() {
+    let mut o = String::new();
+    let mut b = Vec::new();
+    let split = Split::open(DENSE_27B).unwrap_or_else(|e| panic!("open {DENSE_27B}: {e}"));
+    let read = model::arch::spec(&split).unwrap_or_else(|e| panic!("spec of {DENSE_27B}: {e}"));
+    let _ = writeln!(o, "file {DENSE_27B}");
+    assert_eq!(read.spec.arch, model::arch::models::Arch::Qwen35);
+    let chat: Vec<String> = spec_view::view(&read.spec)
+        .into_iter()
+        .filter(|l| l.starts_with("chat "))
+        .collect();
+    spec_view::compare(&mut o, &mut b, "chat", &chat, &[CHAT_27B]);
+    let list = model::arch::coverage::check(&read.spec, &read.tensors);
+    spec_view::compare(&mut o, &mut b, "coverage", &spec_view::items(&list), &[]);
     println!("{o}");
     assert!(
         b.is_empty(),

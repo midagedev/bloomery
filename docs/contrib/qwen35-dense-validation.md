@@ -87,9 +87,9 @@ revision `5a7da681f60570ab5b439a587e912d2e5eddb582`, file
 `Qwen3.8-27B-Q4_K_M.gguf`, 16,810,714,336 bytes, SHA-256
 `e00082f779fa385cee8c68a3ec8833a75778cc87272240b942f74e0b8243e520`.
 It is dense `qwen35`, with 64 trunk layers and vocabulary248320; the 15 unused
-next-token tensors do not enable MTP. The host coverage result still lists a
-missing tool-call parser. The initial lane is plain-text generation with draft
-off and F16 KV.
+next-token tensors do not enable MTP. The host coverage result lists nothing:
+the reader binds the family's tool markup. The initial lane is plain-text
+generation with draft off and F16 KV.
 
 The optional `--target qwen35-0.8b-candidate` is a different, explicitly selected
 file: [`notschmee/Qwen3.5-0.8B-GGUF`](https://huggingface.co/notschmee/Qwen3.5-0.8B-GGUF/blob/1870603ac8ab59c7ddb9d94cccf3b297e379538f/Qwen3.5-0.8B-Q4_K_M.gguf),

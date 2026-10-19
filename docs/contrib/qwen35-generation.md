@@ -50,12 +50,11 @@ RUSTFLAGS='-C target-cpu=native' cargo run --locked -p bloomery-gpu-gates \
   --example qwen35_admission -- /path/to/Qwen3.8-27B-Q4_K_M.gguf
 ```
 
-This file has no unsupported tensor-format/role entries. The complete coverage
-check still reports one missing tool-call parser for its chat template and
-returns nonzero. That is an optional chat-feature gap, not a tensor-format
-failure or a successful full admission. The example deliberately preserves
-that result; no coverage guard, parser row, numerical band or lint is relaxed.
-Text generation and structured tool calls must be validated separately.
+This file has no unsupported tensor-format/role entries. The reader binds the
+family's `<tool_call><function=…>` markup and `<think>` span, so the coverage
+check lists nothing for it and the example exits 0. That is host admission
+only: loading, generated tokens and structured tool calls are the serve gate's
+clauses (`gate-gpu-qwen3-serve`).
 
 Run contributor checks with `just contrib-check --tier t0`, plus host tests for
 `bloomery-gpu-gates --lib` and `bloomery-model --lib`. Static `cargo check` and
@@ -70,15 +69,16 @@ model loading, generated-token or serving evidence.
 Use the exact file and SHA above for both Bloomery and the independent reference.
 Build the native executables with `cargo oxide` and the repository's pinned
 CUDA toolchain, then run the generated affected gate list. Preserve the existing
-Qwen3/Qwen3.6 generation and decision gates. The existing `gate_qwen3_serve`
-expects routed reference sets; it is not a dense-27B correctness result.
+Qwen3/Qwen3.6 generation and decision gates. `gate_qwen3_serve` takes the dense
+file as a model of its own: its clauses compare the server with the CLI and the
+load with its own verdict and read no reference set, so they are not a
+correctness result against the reference.
 
 The dense clause still needs a reference dump from this file on the A6000 48GB,
 forced-ID logits against that reference on identical weight bits, eager versus
 graph checks, and HTTP versus native CLI `--last-step` at short and 4K prompts.
 Then check sampling, reset, prefix/checkpoint reuse and resident slots. Keep
-MTP, media and tool calls out of the first plain-text clause; the missing tool
-parser remains listed until it is implemented and verified. Only after these
+MTP and media out of the first plain-text clause. Only after these
 checks should the repository's timing runners compare native serving with
 llama.cpp or Strata under matched bits, context, placement and concurrency.
 

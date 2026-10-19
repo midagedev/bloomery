@@ -12,8 +12,8 @@
 //! A file whose key is absent, or whose key names a layer the file stripped,
 //! carries no draft layer, and neither does an unshaped role-table stub or a
 //! tail the draft refuses (`mtp::in_file` names that refusal).
-//! qwen35 and qwen4exp keep `mtp` empty. No chat parser is bound for this
-//! family.
+//! qwen35 and qwen4exp keep `mtp` empty. Every variant's chat surface is the
+//! family's: the tool calls are [`TOOLS`], the `<think>` span is read.
 //!
 //! What qwen4exp changes, by its architecture and not by a key (llama.cpp
 //! `src/models/qwen4exp.cpp`): the GDN output gate is a sigmoid (:476-486);
@@ -26,9 +26,9 @@ use std::collections::HashMap;
 
 use gguf::Split;
 use models::{
-    Act, Arch, DeltaKind, DeltaRule, EngramSpec, Extra, Ffn, GdnGate, Gqa, HcKind, HcSpec,
-    KHeadMap, LayerSpec, Mixer, ModelSpec, Moe, NgramRule, PoolRule, Residual, Rope, RopeMode,
-    Router, Score, Selector, Shared,
+    Act, Arch, ChatSpec, DeltaKind, DeltaRule, EngramSpec, Extra, Ffn, GdnGate, Gqa, HcKind,
+    HcSpec, KHeadMap, LayerSpec, Mixer, ModelSpec, Moe, NgramRule, PoolRule, ReasoningFormat,
+    Residual, Rope, RopeMode, Router, Score, Selector, Shared, ToolFormat,
 };
 
 use super::hparams::{FfnKind, Hparams, Kind, Variant};
@@ -36,11 +36,21 @@ use super::roles;
 use crate::arch::{Read, chat_of, spec_u32};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
+/// The tool-call markup the family's template teaches: `<tool_call>` with
+/// `<function=…>` and `<parameter=…>`, the parser `crates/serve` runs.
+const TOOLS: Option<ToolFormat> = Some(ToolFormat::QwenXml);
+
+/// The chat surface of `split`, for every variant: the pre-tokenizer and
+/// template it carries, the [`TOOLS`] and the `<think>` span.
+pub(super) fn chat(split: &Split) -> Result<ChatSpec, PlacementError> {
+    chat_of(split, TOOLS, Some(ReasoningFormat::ThinkSpan))
+}
+
 /// `split`'s description and roles, and the defaults the key read took.
 pub fn read(split: &Split) -> Result<Read, PlacementError> {
     let hp = Hparams::read(split)?;
     let tensors = roles::classify(split, &hp)?;
-    let chat = chat_of(split, None, None)?;
+    let chat = chat(split)?;
     let spec = spec_of(&hp, &tensors, chat)?;
     Ok(Read {
         spec,
@@ -53,7 +63,7 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
 pub fn spec_of(
     hp: &Hparams,
     tensors: &ModelTensors,
-    chat: models::ChatSpec,
+    chat: ChatSpec,
 ) -> Result<ModelSpec, PlacementError> {
     let by_name: HashMap<&str, &[u64]> = tensors
         .tensors
