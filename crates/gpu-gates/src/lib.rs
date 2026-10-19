@@ -589,6 +589,19 @@ pub fn comma_list(v: &[impl ToString]) -> String {
         .join(",")
 }
 
+/// The value at quantile `q` of `v` (the `⌊q · (n − 1)⌉`-th smallest), a NaN-free slice; the median is
+/// `quantile(v, 0.5)`. No values, or a `q` outside `[0, 1]`, is a named panic.
+pub fn quantile(v: &[f64], q: f64) -> f64 {
+    assert!(
+        !v.is_empty() && (0.0..=1.0).contains(&q),
+        "quantile {q} of {} values",
+        v.len()
+    );
+    let mut s = v.to_vec();
+    s.sort_by(f64::total_cmp);
+    s[(q * (s.len() - 1) as f64).round() as usize]
+}
+
 /// FNV-1a 64 over bytes fed in order: the digest a gate prints over a
 /// kernel's output bits, and `gate_p1` pins, so a change that must move no
 /// bit is read against one line. [`Default`] is the digest of no bytes.
@@ -885,7 +898,9 @@ pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, 
 
 #[cfg(test)]
 mod tests {
-    use super::{GateError, GgmlType, NAN_F16, dequant_row, first_ids, kquant_d_at, max_rel_err};
+    use super::{
+        GateError, GgmlType, NAN_F16, dequant_row, first_ids, kquant_d_at, max_rel_err, quantile,
+    };
 
     /// The corpus reader takes the first `n` ids and refuses a short file and a word that is no id
     /// by name. Mutant: a short file read as the ids it holds, or a bad word skipped.
@@ -896,6 +911,36 @@ mod tests {
         let short = first_ids(path, "7 8", 3).expect_err("short").to_string();
         assert!(short.contains("2 ids, the gate reads 3"), "{short}");
         assert!(first_ids(path, "7 x 9", 3).is_err());
+    }
+
+    /// The quantile is the `⌊q · (n − 1)⌉`-th smallest of the sorted values, a half rounding up: ten values read the
+    /// median at the 5th index and the 90th and 99th percentiles at the 8th and the last; an odd count reads the middle.
+    /// No values and a `q` that is no fraction are refused by name, not read as an index.
+    #[test]
+    fn the_quantile_is_the_rounded_rank_and_refuses_no_values() {
+        let ten = [5.0, 1.0, 4.0, 2.0, 3.0, 9.0, 7.0, 8.0, 6.0, 0.0];
+        let at = |q| quantile(&ten, q);
+        assert_eq!(
+            (at(0.0), at(0.5), at(0.9), at(0.99), at(1.0)),
+            (0.0, 5.0, 8.0, 9.0, 9.0)
+        );
+        assert_eq!(quantile(&[3.0, 1.0, 2.0, 5.0, 4.0], 0.5), 3.0);
+        assert_eq!(quantile(&[7.0], 0.9), 7.0);
+        let named = |r: std::thread::Result<f64>| {
+            r.is_err_and(|e| {
+                e.downcast_ref::<String>()
+                    .is_some_and(|m| m.starts_with("quantile "))
+            })
+        };
+        assert!(named(std::panic::catch_unwind(|| quantile(&[], 0.5))));
+        assert!(named(std::panic::catch_unwind(|| quantile(
+            &[1.0],
+            f64::NAN
+        ))));
+        assert!(named(std::panic::catch_unwind(|| quantile(
+            &[1.0, 2.0],
+            1.5
+        ))));
     }
 
     /// `f32::max` drops NaN, so a fold alone scores an all-NaN output as 0.

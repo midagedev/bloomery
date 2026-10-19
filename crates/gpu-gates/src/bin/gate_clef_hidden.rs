@@ -60,8 +60,8 @@ mod gate {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, PrefillPath, Qwen35moeModel};
     use bloomery_gpu_gates::{
-        GateError, RefManifest, checks_failed, data_dir, load_ref_in, ref_model_path, sha256,
-        verdict,
+        GateError, RefManifest, checks_failed, data_dir, load_ref_in, quantile, ref_model_path,
+        sha256, verdict,
     };
     use gguf::Split;
     use refset::arch::qwen35::{
@@ -221,15 +221,6 @@ mod gate {
         }
         let rel = (num / den.max(f64::MIN_POSITIVE)).sqrt();
         (if rel.is_nan() { f64::INFINITY } else { rel }, max)
-    }
-
-    /// The value at quantile `q` of `v` (the `⌊q · (n − 1)⌉`-th smallest), a
-    /// NaN-free slice; `median` is `quantile(v, 0.5)`.
-    fn quantile(v: &[f64], q: f64) -> f64 {
-        let mut s = v.to_vec();
-        s.sort_by(f64::total_cmp);
-        let at = (q * (s.len() - 1) as f64).round() as usize;
-        s[at]
     }
 
     fn median(v: &[f64]) -> f64 {

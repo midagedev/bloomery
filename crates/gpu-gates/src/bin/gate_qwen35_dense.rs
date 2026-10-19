@@ -52,7 +52,7 @@ mod gate {
     use bloomery_gpu::weights::resident_size;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{
-        GateError, checks_failed, data_dir, gpu_census, ref_model_path, verdict,
+        GateError, checks_failed, data_dir, gpu_census, kld, quantile, ref_model_path, verdict,
     };
     use gguf::{GgmlType, Split};
     use refset::arch::qwen35::dense::{ForcedLogits, MODEL, P64, P4096};
@@ -121,12 +121,6 @@ mod gate {
         qwen35_open::open(path, CTX, U_GATE)
     }
 
-    fn quantile(v: &[f64], q: f64) -> f64 {
-        let mut s = v.to_vec();
-        s.sort_by(f64::total_cmp);
-        s[(q * (s.len() - 1) as f64).round() as usize]
-    }
-
     /// `(‖a − b‖₂, max |a − b|, ‖b‖₂)` in f64; a NaN reads infinite.
     fn norms(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
         let (mut num, mut den, mut max) = (0.0f64, 0.0f64, 0.0f64);
@@ -146,20 +140,6 @@ mod gate {
             num.sqrt()
         };
         (l2, max, den.sqrt())
-    }
-
-    /// `(argmax, top-1 minus top-2)` of a row; ties are a margin of 0 and the lower id.
-    fn top2(row: &[f32]) -> (usize, f64) {
-        let (mut best, mut second) = (0usize, f32::NEG_INFINITY);
-        for (i, &v) in row.iter().enumerate().skip(1) {
-            if v > row[best] {
-                second = row[best];
-                best = i;
-            } else if v > second {
-                second = v;
-            }
-        }
-        (best, f64::from(row[best]) - f64::from(second))
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -238,12 +218,12 @@ mod gate {
 
         if want("f") {
             println!("(f) resident slots: the harness's contracts over two lcg streams");
-            let head = split_head(&path)?;
+            expect_q6k_head(&path)?;
             let slots = Slots35::new(
                 lcg_ids(SLOT_A + SLOT_B, vocab),
                 SLOT_A,
                 (U_GATE, CTX),
-                (geom, 1 + 2 * geom.n_delta + 3 * geom.n_attn, head),
+                (geom, 1 + 2 * geom.n_delta + 3 * geom.n_attn),
                 Box::new(move || load(&path).map(|(m, _)| m)),
             )?;
             ok &= q35::slots_two(&slots)?;
@@ -251,12 +231,12 @@ mod gate {
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 
-    /// The head's pass-node count by its type, else refused by name: the adapter's derivation is the Q6_K head's.
-    fn split_head(path: &Path) -> Result<fn(usize) -> usize, GateError> {
+    /// The head is Q6_K, else refused by name: the slots adapter's pass-node count is the Q6_K head's.
+    fn expect_q6k_head(path: &Path) -> Result<(), GateError> {
         let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let ty = split.find("output.weight").map(|(_, t)| t.ty);
         match ty {
-            Some(GgmlType::Q6_K) => Ok(q35::pass_head_nodes),
+            Some(GgmlType::Q6_K) => Ok(()),
             other => Err(format!(
                 "output.weight is {other:?}; the slots derivation is written for Q6_K"
             )
@@ -294,7 +274,8 @@ mod gate {
             .iter_tensors()
             .map(|(_, t)| {
                 let rows = t.dims[1..].iter().product::<u64>() as usize;
-                resident_size(t.ty, t.dims[0] as usize, rows).unwrap_or(0)
+                resident_size(t.ty, t.dims[0] as usize, rows)
+                    .unwrap_or_else(|| panic!("{}: no device format for {:?}", t.name, t.ty))
             })
             .sum();
         let kv = geom.store_bytes(CTX) as u64;
@@ -376,15 +357,8 @@ mod gate {
         other: usize,
     ) -> Result<bool, GateError> {
         let twin_dir = data_dir().join(format!("{name}.cpu"));
-        let twin = ForcedLogits::open(&twin_dir)?;
-        let manifest = std::fs::read_to_string(twin_dir.join("MANIFEST.tsv"))
-            .map_err(|e| format!("{}: {e}", twin_dir.display()))?;
-        let cpu = manifest.lines().any(|l| l == "# backend\tcpu");
-        if !cpu
-            || twin.prompt != set.prompt
-            || twin.forced != set.forced
-            || set.prompt.len() != prompt
-        {
+        let twin = ForcedLogits::open_cpu(&twin_dir)?;
+        if twin.prompt != set.prompt || twin.forced != set.forced || set.prompt.len() != prompt {
             return Err(format!(
                 "{name}: its twin is not the CPU run of the same prompt and forced ids"
             )
@@ -411,7 +385,9 @@ mod gate {
             }
             let (twin_l2, twin_max, _) = norms(twin.row(i), reference);
             let bound = STABLE_K * f64::min(2.0 * twin_max, std::f64::consts::SQRT_2 * twin_l2);
-            let ((ours_top, _), (ref_top, margin)) = (top2(row), top2(reference));
+            let (ours_top, _, _, _) = kld::top2(row);
+            let (ref_top, first, _, second) = kld::top2(reference);
+            let margin = f64::from(first) - f64::from(second);
             if margin > bound {
                 stable += 1;
                 flips_stable += usize::from(ours_top != ref_top);
