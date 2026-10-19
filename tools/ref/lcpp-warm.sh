@@ -33,7 +33,7 @@
 #                                  for its `listening on http://127.0.0.1:<port>` line — printed after the
 #                                  model loaded — and a 200 from /health. SRV_PID (the timeout's pid),
 #                                  SRV_PORT; 1 with SRV_WHY and SRV_RC when it exited first
-#                                  (its rc) or never listened (124)
+#                                  (its rc) or never listened: the bound ended it, or the wait ran out (124)
 #   lcpp_srv_request <ids> <n_predict> <bound>  one POST /completion: the comma-separated ids as the prompt,
 #                                  greedy (temperature 0, top_k 1), ignore_eos, cache_prompt off,
 #                                  return_tokens; pgmajfault read just before and after (SRV_F0, SRV_F1). Into
@@ -334,7 +334,13 @@ lcpp_srv_start() {
       SRV_RC=0
       bounded_bg_wait || SRV_RC=$?
       [ "$SRV_RC" != 0 ] || SRV_RC=70
-      SRV_WHY="llama-server exited $SRV_RC before it answered /health"
+      # timeout's 124: the bound ended the server, the verdict of a loop that ran out. Each pass takes longer than its
+      # sleep when forks are slow, so the bound can end the server before the count does.
+      if [ "$SRV_RC" = 124 ]; then
+        SRV_WHY="llama-server did not answer /health within ${bound} s"
+      else
+        SRV_WHY="llama-server exited $SRV_RC before it answered /health"
+      fi
       # The load's own reason, when the log names an allocation that failed (a -c or a ubatch the card
       # cannot hold): the first such line.
       a=$(grep -m 1 -iE 'failed to allocate|out of memory|cudaMalloc failed|unable to allocate|failed to create context' "$log")
@@ -868,11 +874,16 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
     trap 'exit 129' HUP
   }
   stub_guard top
+  # The stub servers' lifetime bound, a failsafe: lcpp_srv_stop and the EXIT trap end each one. A bound the requests
+  # must fit in makes a check read the machine's load: each request starts python3 for its body, its reading and (where
+  # the timeout is the stand-in) its bound, and the first server is asked three times.
+  sb=120
   # The stub server: --help lists the flags; otherwise it binds 127.0.0.1 at a kernel-picked port, prints
   # llama_context's n_ctx line (the -c it was given, STUB_SRV_NCTX in its place, none under STUB_SRV_NOCTX),
   # the listening line and answers /health and /completion with timings. STUB_SRV_BADN answers with one
   # predicted token too few, STUB_SRV_CACHED with cache_n 3, STUB_SRV_DRAFT with draft_n 7 and 5 accepted,
-  # STUB_SRV_EXIT exits 5 before it listens after an allocation failure line, STUB_SRV_PORT0 logs port 0.
+  # STUB_SRV_EXIT exits 5 before it listens after an allocation failure line, STUB_SRV_PORT0 logs port 0,
+  # STUB_SRV_HANG never listens (it ends on the TERM).
   cat > "$t/llama-server" << 'EOF'
 #!/usr/bin/env python3
 import http.server, json, os, signal, sys, time
@@ -890,6 +901,8 @@ if "--help" in sys.argv:
 if os.environ.get("STUB_SRV_EXIT"):
     print("ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1280.00 MiB on device 0: cudaMalloc failed: out of memory", flush=True)
     sys.exit(5)
+if os.environ.get("STUB_SRV_HANG"):
+    time.sleep(3600)
 ctx = sys.argv[sys.argv.index("-c") + 1] if "-c" in sys.argv else "0"
 if not os.environ.get("STUB_SRV_NOCTX"):
     print(f"llama_context: n_ctx                 = {os.environ.get('STUB_SRV_NCTX', ctx)}", flush=True)
@@ -930,7 +943,7 @@ EOF
   lcpp_srv_cmd "$t/llama-server" /m.gguf 256 -ngl 99 -fit off
   lcpp_srv_majflt() { echo 7; }
   saved_traps=$(trap -p TERM INT HUP)
-  if lcpp_srv_start 20 "$t/log"; then
+  if lcpp_srv_start "$sb" "$t/log"; then
     lcpp_srv_ctx_check "$t/log" 256 && r=0 || r=1
     check nctx "$r|$(lcpp_srv_nctx "$t/log")" "0|256"
     lcpp_srv_ctx_check "$t/log" 4352 && r=0 || r=1
@@ -949,31 +962,43 @@ EOF
   else
     check start "$SRV_WHY" ""
   fi
-  lcpp_srv_start 20 "$t/log" STUB_SRV_BADN=1 && {
+  lcpp_srv_start "$sb" "$t/log" STUB_SRV_BADN=1 && {
     lcpp_srv_arm 1,2,3 4 20 && r=0 || r=1
     check badn "$r|$SRV_WHY" "1|warm-up: predicted_n 3, not 4"
     lcpp_srv_stop
   }
-  lcpp_srv_start 20 "$t/log" STUB_SRV_CACHED=1 && {
+  lcpp_srv_start "$sb" "$t/log" STUB_SRV_CACHED=1 && {
     lcpp_srv_request 1,2,3 4 20 && r=0 || r=1
     check cached "$r|$SRV_WHY" "1|cache_n 3: the prompt was not processed whole"
     lcpp_srv_stop
   }
-  lcpp_srv_start 20 "$t/log" STUB_SRV_DRAFT=1 && {
+  lcpp_srv_start "$sb" "$t/log" STUB_SRV_DRAFT=1 && {
     lcpp_srv_request 1,2,3 4 20 && r=0 || r=1
     check draft "$r|$SRV_DRAFT_N|$SRV_DRAFT_ACC" "0|7|5"
     lcpp_srv_stop
   }
-  lcpp_srv_start 20 "$t/log" STUB_SRV_NOCTX=1 && {
+  lcpp_srv_start "$sb" "$t/log" STUB_SRV_NOCTX=1 && {
     lcpp_srv_ctx_check "$t/log" 256 && r=0 || r=1
     check nctx-none "$r|$SRV_WHY" "1|the server's log has no 'llama_context: n_ctx =' line: its context against -c 256 cannot be read"
     lcpp_srv_stop
   }
-  lcpp_srv_start 20 "$t/log" STUB_SRV_PORT0=1 && r=0 || r=1
+  lcpp_srv_start "$sb" "$t/log" STUB_SRV_PORT0=1 && r=0 || r=1
   check port0 "$r|$SRV_RC|$SRV_WHY" "1|70|llama-server logged 'listening on http://127.0.0.1:0': this tree does not print the port --port 0 bound"
   lcpp_srv_stop
-  lcpp_srv_start 20 "$t/log" STUB_SRV_EXIT=1 && r=0 || r=1
+  lcpp_srv_start "$sb" "$t/log" STUB_SRV_EXIT=1 && r=0 || r=1
   check exits "$r|$SRV_RC|$SRV_WHY" "1|5|llama-server exited 5 before it answered /health: ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1280.00 MiB on device 0: cudaMalloc failed: out of memory"
+  # hang-bound: a server that never listens, and a wait loop whose pass (a sed that takes 2 s, as a loaded machine's forks
+  # do) is longer than the bound: the bound ends the server before the loop counts to its end, and the verdict is the
+  # bound's, as when the loop runs out.
+  mkdir "$t/slow"
+  printf '#!/bin/sh\nsleep 2\nPATH=${PATH#*:}\nexec sed "$@"\n' > "$t/slow/sed"
+  chmod +x "$t/slow/sed"
+  saved_path=$PATH
+  PATH=$t/slow:$PATH
+  lcpp_srv_start 1 "$t/log" STUB_SRV_HANG=1 && r=0 || r=1
+  PATH=$saved_path
+  check hang-bound "$r|$SRV_RC|$SRV_WHY" "1|124|llama-server did not answer /health within 1 s"
+  lcpp_srv_stop
   # stale-log: the log holds a previous run's port line and the child's own truncation comes late (a shim
   # copy of lcpp_srv_spawn whose child sleeps before it opens the log with `>`). The parent must have emptied
   # the log before its first read, so the verdict is this run's, not the previous one's.
@@ -988,7 +1013,7 @@ EOF
     echo "$SRV_PID" >> "$t/stubs.pid"
   }
   echo 'main: listening on http://127.0.0.1:0' > "$t/log"
-  lcpp_srv_start 20 "$t/log" STUB_SRV_EXIT=1 && r=0 || r=1
+  lcpp_srv_start "$sb" "$t/log" STUB_SRV_EXIT=1 && r=0 || r=1
   check stale-log "$r|$SRV_RC|$SRV_WHY" "1|5|llama-server exited 5 before it answered /health: ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1280.00 MiB on device 0: cudaMalloc failed: out of memory"
   eval "$spawn_def"
   # A server row (srv_row, the runner's hooks stubbed): its decode value, its prompt rate as a prefill
@@ -1119,7 +1144,7 @@ EOF
   (
     STUB_PIDS=()
     stub_guard
-    lcpp_srv_start 20 "$t/log" || exit 3
+    lcpp_srv_start "$sb" "$t/log" || exit 3
     kill -0 "$SRV_PID" 2> /dev/null || exit 4
     exit 0
   )
