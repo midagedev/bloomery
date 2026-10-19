@@ -79,7 +79,6 @@ pub(crate) struct RawType {
     /// File bytes per 256-value super-block.
     pub(crate) bb: usize,
     pub(crate) gate_up: bool,
-    pub(crate) down: bool,
     /// The down reads a column a run of `slots_per_col` slots (`down_tab`).
     pub(crate) down_cols: bool,
 }
@@ -654,15 +653,12 @@ macro_rules! quant_sel_module {
             ) -> Result<$S, GpuError> {
                 let fault =
                     crate::module_fault_word(ctx, word, concat!(stringify!($S), "::load"))?;
-                // SAFETY: this package owns the embedded device bundle
-                // produced for the modules above; every launcher checks its
-                // launch contract.
-                let (module, hand) = unsafe {
-                    (
-                        crate::shared_module!($m, ctx)?,
-                        crate::shared_module!($hm, ctx)?,
-                    )
-                };
+                // SAFETY: this package owns $m's embedded bundle; its
+                // launchers check their launch contracts.
+                let module = unsafe { crate::shared_module!($m, ctx)? };
+                // SAFETY: this package owns $hm's embedded bundle; its
+                // launchers check their launch contracts.
+                let hand = unsafe { crate::shared_module!($hm, ctx)? };
                 Ok($S {
                     module,
                     hand,
@@ -678,9 +674,6 @@ macro_rules! quant_sel_module {
                         name: stringify!($rggml),
                         bb: $bb,
                         gate_up: <[&str]>::len(&[$( stringify!($gu) ),*]) == 1,
-                        down: <[&str]>::len(&[$( stringify!($dn) ),*])
-                            + <[&str]>::len(&[$( stringify!($dt) ),*])
-                            == 1,
                         down_cols: <[&str]>::len(&[$( stringify!($dt) ),*]) == 1,
                     },
                 )*

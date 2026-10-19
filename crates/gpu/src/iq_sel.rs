@@ -774,10 +774,6 @@ pub fn iq4_nl_row_dot32_host(
 
 // -------------------------------------------------------------- launcher
 
-/// The name `QuantSelKernels` had here, before one struct held the raw-block and
-/// Walk A launchers; `arch::nemotron_h_moe` still spells it.
-pub type IqSelKernels = QuantSelKernels;
-
 /// A gate·up launch ([`QuantSelKernels::enqueue_gate_up`]).
 pub struct IqGateUp<'a> {
     /// The format of both stacks: IQ2_XS, IQ3_XXS, IQ3_S or IQ4_XS.
@@ -1069,14 +1065,11 @@ impl QuantSelKernels {
             bb,
             down_cols,
             ..
-        }) = raw_row(ty, |t| t.down)
+        }) = raw_row(ty, |_| true)
         else {
             return Err(GpuError::shape(
                 what,
-                format!(
-                    "the down takes {} stacks, got {ty:?}",
-                    raw_names(|t| t.down)
-                ),
+                format!("the down takes {} stacks, got {ty:?}", raw_names(|_| true)),
             ));
         };
         if spc == 0 || (spc != 1 && !down_cols) {

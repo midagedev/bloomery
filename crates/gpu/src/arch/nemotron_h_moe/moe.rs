@@ -25,8 +25,8 @@
 
 use super::router::{RouteOut, Routers, TOP_K};
 use crate::arch::hybrid::{self, Acts, Cx, Names, Site, residual};
-use crate::iq_sel::IqSelKernels;
 use crate::kquant::SelDown;
+use crate::quant_sel::QuantSelKernels;
 use crate::site::SiteTy;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, GpuError};
@@ -73,7 +73,7 @@ pub(super) struct MoeShape {
 /// The kernels a MoE layer launches beyond the trunk's.
 pub(super) struct MoeKernels {
     pub(super) routers: Routers,
-    pub(super) iq: IqSelKernels,
+    pub(super) iq: QuantSelKernels,
 }
 
 /// The buffers a MoE layer runs over, m = 1.

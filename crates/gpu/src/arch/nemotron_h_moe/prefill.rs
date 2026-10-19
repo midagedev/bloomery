@@ -48,12 +48,12 @@ use crate::gemm::GEMM_MAX_SLOTS;
 use crate::gemm::Gemm32Kernels;
 use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::head::Head;
-use crate::iq_sel::IqSelKernels;
 use crate::kquant::SelDown;
 use crate::mamba2::{Mamba2PassScratch, PassScan};
 use crate::model::GpuModel;
 use crate::model::fit::{FIT_RESERVE, act_col_bytes, act32_col_bytes, largest_fit, route_bytes};
 use crate::q38::EmbedQ8Args;
+use crate::quant_sel::QuantSelKernels;
 use crate::site::{self, SiteTy};
 use crate::site::{KGemvKernels, SiteWeight, WideActs, WideKernels};
 use crate::tensor::{Pitched, WindowMut, dtod_2d};
@@ -543,7 +543,7 @@ struct Cx<'a> {
     g32: &'a Gemm32Kernels,
     kgemv: &'a KGemvKernels,
     routers: &'a Routers,
-    iq: &'a IqSelKernels,
+    iq: &'a QuantSelKernels,
     m: usize,
 }
 

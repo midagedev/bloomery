@@ -11,9 +11,9 @@ use crate::arch::hybrid::{
 use crate::flash_gqa::GROUP_16;
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::head::Head;
-use crate::iq_sel::IqSelKernels;
 use crate::model::{ChainBody, GpuModel, NoHost, block_count};
 use crate::q38::{EmbedQ8Args, Q38Kernels};
+use crate::quant_sel::QuantSelKernels;
 use crate::site::SiteTy;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Window};
@@ -222,7 +222,7 @@ impl Body {
             k: Kernels::load(gpu)?,
             mk: MoeKernels {
                 routers: Routers::load(ctx_)?,
-                iq: IqSelKernels::load(ctx_, gpu.fault_word())?,
+                iq: QuantSelKernels::load(ctx_, gpu.fault_word())?,
             },
             q38: Q38Kernels::load(ctx_)?,
             prefill: FlashGqaPrefill::load(ctx_)?,

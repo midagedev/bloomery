@@ -87,16 +87,16 @@ pub enum GateUpEntry {
     /// `KquantKernels::enqueue_gate_up_q8_0` (`kq_gate_up_act_q8_0`, the
     /// file's `block_q8_0` stream) in `crates/gpu/src/kquant/sel.rs`.
     Q8_0,
-    /// `IqSelKernels::enqueue_gate_up` (`iq2_xs_gate_up_sel`, the file's
+    /// `QuantSelKernels::enqueue_gate_up` (`iq2_xs_gate_up_sel`, the file's
     /// 74-byte `block_iq2_xs` stream) in `crates/gpu/src/iq_sel.rs`.
     Iq2xs,
-    /// `IqSelKernels::enqueue_gate_up` (`iq3_xxs_gate_up_sel`) in
+    /// `QuantSelKernels::enqueue_gate_up` (`iq3_xxs_gate_up_sel`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq3xxs,
-    /// `IqSelKernels::enqueue_gate_up` (`iq3_s_gate_up_sel`, the file's
+    /// `QuantSelKernels::enqueue_gate_up` (`iq3_s_gate_up_sel`, the file's
     /// 110-byte `block_iq3_s` stream) in `crates/gpu/src/iq_sel.rs`.
     Iq3s,
-    /// `IqSelKernels::enqueue_gate_up` (`iq4_xs_gate_up_sel`) in
+    /// `QuantSelKernels::enqueue_gate_up` (`iq4_xs_gate_up_sel`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq4xs,
     /// `Mxfp4SelKernels::enqueue_gate_up` (`mxfp4_gate_up_sel`, the file's
@@ -129,19 +129,19 @@ pub enum DownEntry {
     /// 256-value super-blocks, `Q8Act`) in `crates/gpu/src/kquant/sel.rs`,
     /// which no model body launches.
     Q8_0,
-    /// `IqSelKernels::enqueue_gemv_sel` (`iq2_xs_gemv_sel`, over `Q8Act`) in
+    /// `QuantSelKernels::enqueue_gemv_sel` (`iq2_xs_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq2xs,
-    /// `IqSelKernels::enqueue_gemv_sel` (`iq3_xxs_gemv_sel`, over `Q8Act`) in
+    /// `QuantSelKernels::enqueue_gemv_sel` (`iq3_xxs_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq3xxs,
-    /// `IqSelKernels::enqueue_gemv_sel` (`iq3_s_gemv_sel`, over `Q8Act`) in
+    /// `QuantSelKernels::enqueue_gemv_sel` (`iq3_s_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq3s,
-    /// `IqSelKernels::enqueue_gemv_sel` (`iq4_xs_gemv_sel`, over `Q8Act`) in
+    /// `QuantSelKernels::enqueue_gemv_sel` (`iq4_xs_gemv_sel`, over `Q8Act`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq4xs,
-    /// `IqSelKernels::enqueue_down` (`iq4_nl_gemv_sel32`) in
+    /// `QuantSelKernels::enqueue_down` (`iq4_nl_gemv_sel32`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq4nl,
     /// `Mxfp4SelKernels::enqueue_down` (`mxfp4_gemv_sel`, the file's 17-byte
