@@ -6265,7 +6265,13 @@ def static_job_key(name: str, command: str, env: list[str], files: list[str], re
     for rel in files:
         if rel not in memo:
             path = os.path.join(root, rel)
-            memo[rel] = f"link {os.readlink(path)}" if os.path.islink(path) else sha256_file(path) if os.path.isfile(path) else "missing"
+            if os.path.islink(path):
+                memo[rel] = f"link {os.readlink(path)}\t0"
+            elif os.path.isfile(path):
+                # the executable bits: git tracks them, and a job that runs the file directly reads them
+                memo[rel] = f"{sha256_file(path)}\t{os.stat(path).st_mode & 0o111}"
+            else:
+                memo[rel] = "missing\t0"
         h.update(f"{memo[rel]}\t{rel}\n".encode())
     return h.hexdigest()
 
@@ -9982,6 +9988,12 @@ def static_key_self_test(expect) -> None:
         expect(len({k0["t"], k0["r"], k0["b"]}) == 3, "static-key: jobs with one command and different scopes share a key")
         os.utime(os.path.join(d, "tools/a.sh"), (1, 1))
         expect(keys() == k0, "static-key: an mtime moved a key")
+        # git tracks the executable bit: a file's content unchanged and its mode flipped is another input of a job that runs it
+        os.chmod(os.path.join(d, "tools/a.sh"), 0o755)
+        kx = keys()
+        expect(kx["t"] != k0["t"] and kx["b"] != k0["b"] and kx["r"] == k0["r"], "static-key: a mode-only edit (chmod +x) must move the tree keys only")
+        os.chmod(os.path.join(d, "tools/a.sh"), 0o644)
+        expect(keys() == k0, "static-key: restoring a file's mode must restore the keys")
         put("crates/serve/src/lib.rs", "fn f() { }\n")
         k1 = keys()
         expect(k1["t"] != k0["t"] and k1["b"] != k0["b"] and k1["r"] == k0["r"], "static-key: a crates/serve edit must move the tree keys only")
