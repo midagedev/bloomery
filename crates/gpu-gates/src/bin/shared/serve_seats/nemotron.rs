@@ -280,7 +280,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         &path,
         split.value("tokenizer.chat_template"),
         split.value("general.name"),
-        a.template_file.as_deref(),
+        a.template_file.path(),
         "nemotron",
     )?;
     // The family's `place::read`, the first of the two branches the

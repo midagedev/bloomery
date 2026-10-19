@@ -247,6 +247,28 @@ pub fn sampler_factory() -> SamplerFactory {
     )
 }
 
+/// `--chat-template-file PATH`: the chat template read from a file in place of
+/// the model file's own ([`ChatSurface::read`]). The seats that take the flag take
+/// it through this type, so its spelling and its reading have one owner.
+#[derive(Debug, Default)]
+pub struct TemplateFile(Option<PathBuf>);
+
+impl TemplateFile {
+    /// The flag's spelling.
+    pub const FLAG: &'static str = "--chat-template-file";
+
+    /// Takes the file the flag named.
+    pub fn set(&mut self, value: &str) {
+        self.0 = Some(PathBuf::from(value));
+    }
+
+    /// The file, when the flag was given.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
 /// The chat surface a seat's file gives the server: the Jinja template and
 /// the model's name.
 pub struct ChatSurface {
@@ -438,7 +460,7 @@ pub struct SeatFlags {
     pub place: Option<crate::generate::Place>,
     pub alias: Option<String>,
     /// `--chat-template-file`, replacing the file's own template.
-    pub template_file: Option<PathBuf>,
+    pub template_file: TemplateFile,
     /// `--plan`: the records before the load, then exit.
     pub plan_only: bool,
     pub parallel: Option<usize>,
@@ -464,7 +486,7 @@ impl SeatFlags {
             ctx: None,
             place: None,
             alias: None,
-            template_file: None,
+            template_file: TemplateFile::default(),
             plan_only: false,
             parallel: None,
             queue_depth: None,
@@ -488,7 +510,7 @@ impl SeatFlags {
                 f if serve::flag::CTX.contains(&f) => a.ctx = Some(serve::flag::number(flag, v)?),
                 "--place" => a.place = Some(crate::generate::Place::parse(v)?),
                 "--alias" => a.alias = Some(v.to_owned()),
-                "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
+                TemplateFile::FLAG => a.template_file.set(v),
                 "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
                 "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
                 f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,

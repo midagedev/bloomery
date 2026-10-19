@@ -7,6 +7,7 @@
 //!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place PLACE]
 //!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
 //!                         [--parallel N] [--queue-depth Q] [--slot-save-path DIR]
+//!                         [--chat-template-file PATH]
 //!                         [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
 //!                         [--image-max-tokens N] [--plan]
 //!
@@ -217,8 +218,8 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, Vocab, arm_screen,
-    bind_server, model_props, parallel_line, placement_of,
+    CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, TemplateFile,
+    Vocab, arm_screen, bind_server, model_props, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
@@ -261,14 +262,14 @@ use crate::{dspark, place};
 const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C] [--alias NAME] \
                      [--cache-ram MIB] [--parallel N] [--queue-depth Q] [--plan] \
-                     [--slot-save-path DIR] [--mmproj FILE | --no-mmproj] \
-                     [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
+                     [--slot-save-path DIR] [--chat-template-file PATH] \
+                     [--mmproj FILE | --no-mmproj] [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
 
-/// What the server says when it serves the file's chat template with its DSML tags
-/// respelled ([`respell`]).
-const DSML_RESPELLED: &str = "bloomery-serve: chat template: this V4.1 file spells V4's DSML \
-    tags, but its model writes V4.1's (a space after the token: `<｜DSML｜ calls>`, \
+/// What the server says when it serves the chat template (the file's, or
+/// `--chat-template-file`'s) with its DSML tags respelled ([`respell`]).
+const DSML_RESPELLED: &str = "bloomery-serve: chat template: this V4.1 chat template spells \
+    V4's DSML tags, but its model writes V4.1's (a space after the token: `<｜DSML｜ calls>`, \
     `<｜DSML｜ invoke>`, `<｜DSML｜ parameter>`); serving the template respelled that way";
 
 /// The token V4.1's chat template opens every user and tool message with.
@@ -298,6 +299,9 @@ struct Args {
     /// `--slot-save-path`: the directory the slot actions answer from;
     /// `None` refuses every one, as llama-server does.
     slot_save_path: Option<PathBuf>,
+    /// `--chat-template-file`, replacing the file's own template; the respell
+    /// ([`respell`]) reads it as it reads the file's.
+    template_file: TemplateFile,
     /// The image-input flags: `--mmproj` is the V4.1 encoder file whose
     /// images the seat serves, none serves no image.
     vision: vision_seat::Flags,
@@ -320,6 +324,7 @@ fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
         parallel: None,
         queue_depth: None,
         slot_save_path: None,
+        template_file: TemplateFile::default(),
         vision: vision_seat::Flags::default(),
         api_keys: serve::flag::ApiKeys::default(),
         plan_only: false,
@@ -351,6 +356,7 @@ fn parse_args(args: &[String]) -> Result<(Args, PlaceWhy), GateError> {
             "--parallel" | "-np" => a.parallel = Some(number(flag, v)?),
             "--queue-depth" => a.queue_depth = Some(number(flag, v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
+            TemplateFile::FLAG => a.template_file.set(v),
             f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
             "--park-ram" => {
                 mib_bytes(flag, v)?;
@@ -549,7 +555,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &path,
         inv.value("tokenizer.chat_template"),
         inv.value("general.name"),
-        None,
+        a.template_file.path(),
         "deepseek-v4.1",
     )?;
     drop(inv);

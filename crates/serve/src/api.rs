@@ -66,6 +66,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use jinja::{ChatTemplate, TemplateError};
 use serde_json::{Map, Value, json};
 
+use crate::callstream::CallPiece;
 use crate::constrain;
 use crate::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools, parses_tools};
 use crate::embed::Embed;
@@ -2582,6 +2583,26 @@ fn tool_call_arguments(at: usize, message: &mut Map<String, Value>) -> Result<()
     Ok(())
 }
 
+/// The values OpenAI's `reasoning_effort` takes (the `ReasoningEffort` type of
+/// its SDK), and so the Responses API's `reasoning.effort`. A template takes
+/// the ones it knows; `max` is V4.1's maximum-effort header and `xhigh`,
+/// `minimal` and `none` are OpenAI's own words.
+const REASONING_EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// An effort that is none of [`REASONING_EFFORTS`] is a 400 naming the field,
+/// the value and the accepted ones: a template would render a word it does not
+/// know as itself, or not at all, and the request would run as if it had named
+/// none.
+fn check_effort(field: &str, effort: &str) -> Result<(), ApiError> {
+    if REASONING_EFFORTS.contains(&effort) {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "invalid value for \"{field}\": {effort:?} (expected one of {})",
+        REASONING_EFFORTS.join(", ")
+    )))
+}
+
 /// The thinking vars a chat body carries, in llama-server's order: the kwargs
 /// (`chat_template_kwargs`, an object) `enable_thinking` first — a bool sets
 /// it, a string is a 400 naming it —
@@ -2629,7 +2650,10 @@ fn thinking_vars(
     }
     let effort = match b.get("reasoning_effort") {
         None | Some(Value::Null) => None,
-        Some(v @ Value::String(_)) => Some(v),
+        Some(v @ Value::String(e)) => {
+            check_effort("reasoning_effort", e)?;
+            Some(v)
+        }
         Some(other) => return Err(wrong_type("reasoning_effort", "a string", other)),
     };
     let none = effort.and_then(Value::as_str) == Some("none");
@@ -2641,10 +2665,7 @@ fn thinking_vars(
         (false, how) => {
             if let Some(v) = effort {
                 vars.insert("reasoning_effort".into(), v.clone());
-                if thinking.is_none()
-                    && how == (ThinkingOff::Switch { opt_in: true })
-                    && v.as_str().is_some_and(|e| !e.is_empty())
-                {
+                if thinking.is_none() && how == (ThinkingOff::Switch { opt_in: true }) {
                     thinking = Some(true);
                 }
             }
@@ -3532,8 +3553,10 @@ impl ChatIds {
     }
 
     /// The stream deltas for one parser step, in llama-server's order: reasoning,
-    /// content, then one delta per tool call.
-    fn deltas(&self, d: &Message) -> Vec<Value> {
+    /// content, then the tool calls' pieces ([`CallPiece`]): a call's first
+    /// delta carries its `index`, `id`, `type` and `function.name`, the next
+    /// ones its `function.arguments` fragments.
+    fn deltas(&self, d: &Message, pieces: &[CallPiece]) -> Vec<Value> {
         let mut out = Vec::new();
         if !d.reasoning.is_empty() {
             out.push(json!({ "reasoning_content": d.reasoning }));
@@ -3541,9 +3564,19 @@ impl ChatIds {
         if !d.content.is_empty() {
             out.push(json!({ "content": d.content }));
         }
-        for c in &d.calls {
-            let mut call = self.tool_call(c);
-            call["index"] = json!(c.index);
+        for piece in pieces {
+            let call = match piece {
+                CallPiece::Open { index, name } => json!({
+                    "index": index,
+                    "id": self.call_id(*index),
+                    "type": "function",
+                    "function": { "name": name, "arguments": "" },
+                }),
+                CallPiece::Args { index, text } => json!({
+                    "index": index,
+                    "function": { "arguments": text },
+                }),
+            };
             out.push(json!({ "tool_calls": [call] }));
         }
         out
@@ -3688,6 +3721,9 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         prompt,
         mut parser,
     } = plan;
+    if p.stream {
+        parser = parser.streaming_calls();
+    }
     let ids_meta = ChatIds {
         id: format!("chatcmpl-{}", state.random_id()),
         created: unix_now(),
@@ -3765,7 +3801,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                             return Err(io::Error::other("tool-call markup does not parse"));
                         }
                     };
-                    let deltas = meta.deltas(&d);
+                    let deltas = meta.deltas(&d, &parser.take_pieces());
                     let n = deltas.len();
                     for (i, delta) in deltas.into_iter().enumerate() {
                         let mut v = meta.chunk(json!([{
@@ -3824,7 +3860,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             .as_ref()
             .map(|a| a.entries(sent, o.timings.predicted_n, vocab))
             .filter(|e| !e.is_empty());
-        let deltas = ids_meta.deltas(&d);
+        let deltas = ids_meta.deltas(&d, &parser.take_pieces());
         let n = deltas.len();
         for (i, delta) in deltas.into_iter().enumerate() {
             let mut v =
@@ -7162,6 +7198,55 @@ mod tests {
             prompt(qwen3, json!({})),
             "a template that thinks by default is asked for nothing"
         );
+    }
+
+    /// A `reasoning_effort` outside OpenAI's set is a 400 naming the field, the
+    /// value and the accepted ones, on every route that carries it (chat,
+    /// `/apply-template`, the Responses API's `reasoning.effort`); every
+    /// accepted word renders.
+    #[test]
+    fn reasoning_effort_outside_openais_set_is_a_named_400() {
+        let v41 = include_str!("../tests/fixtures/v41-chat-template.jinja");
+        let (addr, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(v41));
+        let accepted = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+        for effort in accepted {
+            let (status, answer) = applied(
+                addr,
+                &json!({ "messages": [{ "role": "user", "content": "Hi" }], "reasoning_effort": effort }),
+            );
+            assert_eq!(status, 200, "{effort}: {answer}");
+        }
+        for effort in ["banana", "", "HIGH", "extreme"] {
+            let chat = json!({ "messages": [{ "role": "user", "content": "Hi" }], "reasoning_effort": effort });
+            for path in ["/v1/chat/completions", "/apply-template"] {
+                let (status, answer) = roundtrip(addr, "POST", path, &chat.to_string());
+                assert_eq!(status, 400, "{path} {effort:?}: {answer}");
+                let message =
+                    serde_json::from_str::<Value>(&answer).expect("JSON")["error"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                assert!(
+                    message.contains("\"reasoning_effort\"")
+                        && message.contains(&format!("{effort:?}"))
+                        && message.contains(&accepted.join(", ")),
+                    "{path} {effort:?}: {message}"
+                );
+            }
+            let (status, answer) = roundtrip(
+                addr,
+                "POST",
+                "/v1/responses",
+                &json!({ "input": "Hi", "reasoning": { "effort": effort } }).to_string(),
+            );
+            assert_eq!(status, 400, "responses {effort:?}: {answer}");
+            let message = serde_json::from_str::<Value>(&answer).expect("JSON")["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            assert!(message.contains("\"reasoning.effort\""), "{message}");
+        }
     }
 
     /// `reasoning_effort: "none"` on GLM-5's template, which has no thinking

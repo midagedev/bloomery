@@ -468,7 +468,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &path,
         split.value("tokenizer.chat_template"),
         split.value("general.name"),
-        a.template_file.as_deref(),
+        a.template_file.path(),
         "mimo-v2.6-flash",
     )?;
     let inputs = PlanInputs::read(&split)?;

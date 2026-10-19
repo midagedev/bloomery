@@ -26,12 +26,20 @@
 //! is not valid JSON is kept as a JSON string. Markup that does not parse, and a
 //! block still open when the stream ends, go to `content` as the raw text.
 //!
+//! The call a scan has opened and not closed is reported as it is read
+//! ([`Scanned::open`]): its name once the opening tag is whole, and the arguments
+//! read so far, a prefix of the arguments the call closes with
+//! ([`crate::callstream`]).
+//!
 //! Every decision depends on the text only, never on how it was cut into pieces,
-//! so a stream and a whole response parse to the same message.
+//! so a stream and a whole response parse to the same message. A parser that
+//! streams its calls ([`ChatParser::streaming_calls`]) differs in one thing:
+//! DSML that stops being a call after its name went out is an error, not content.
 
 use jinja::{ChatTemplate, TemplateError};
 use serde_json::{Map, Value, json};
 
+use crate::callstream::{self, Args, CallPiece, Progress, Streamer};
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
 use crate::glmxml::{self, ArgTypes, GlmScan, GlmXmlError};
 use crate::hermes::{self, HermesError, HermesScan};
@@ -160,6 +168,9 @@ pub struct ToolCall {
 pub struct Scanned {
     pub content: String,
     pub calls: Vec<ToolCall>,
+    /// The call the scan has opened and not closed, once its name is read
+    /// ([`Progress`]).
+    pub open: Option<Progress>,
 }
 
 /// Streaming DSML scanner over the text after the think span.
@@ -216,7 +227,7 @@ impl DsmlScan {
         content.push_str(&std::mem::take(&mut self.buf));
         Scanned {
             content,
-            calls: Vec::new(),
+            ..Scanned::default()
         }
     }
 
@@ -267,6 +278,11 @@ impl DsmlScan {
                     return true;
                 }
                 Invoke::Wait => {
+                    out.open = partial_invoke(rest, tags).map(|(name, args)| Progress {
+                        index: self.calls,
+                        name,
+                        args,
+                    });
                     self.block = Some(raw);
                     return false;
                 }
@@ -343,6 +359,49 @@ fn parse_invoke(s: &str, tags: &Tags) -> Invoke {
         format!("{{{}}}", fields.join(",")),
         end + tags.invoke_close.len(),
     )
+}
+
+/// The call at the start of `s`, an `<｜DSML｜ invoke name="…">` whose close has
+/// not come, as far as `s` reads it: its name once the opening tag is whole,
+/// and the arguments [`parse_invoke`] will close with, as a prefix — each
+/// complete parameter, and the text of a `string="true"` parameter whose end
+/// has not come, up to the tail that could still become a tag that ends it.
+/// `None` until the name is read.
+fn partial_invoke(s: &str, tags: &Tags) -> Option<(String, String)> {
+    let body = s.strip_prefix(tags.invoke_open)?;
+    let name_end = body.find("\">")?;
+    let name = &body[..name_end];
+    if name.is_empty() || name.contains(['"', '\n', '<']) {
+        return None;
+    }
+    let mut args = Args::new();
+    let mut rest = &body[name_end + 2..];
+    loop {
+        rest = rest.trim_start();
+        let Some(p) = rest.strip_prefix(tags.param_open) else {
+            break;
+        };
+        let Some(key_end) = p.find('"') else { break };
+        let key = &p[..key_end];
+        let p = &p[key_end..];
+        let (is_string, v) = if let Some(v) = p.strip_prefix("\" string=\"true\">") {
+            (true, v)
+        } else if let Some(v) = p.strip_prefix("\" string=\"false\">") {
+            (false, v)
+        } else {
+            break;
+        };
+        let Some(val_end) = v.find(tags.param_close) else {
+            if is_string {
+                let text = callstream::released(v, &[tags.param_close, tags.invoke_close]);
+                return Some((name.to_owned(), args.text_so_far(key, text)));
+            }
+            break;
+        };
+        args.field(key, &json_value(&v[..val_end], is_string));
+        rest = &v[val_end + tags.param_close.len()..];
+    }
+    Some((name.to_owned(), args.so_far()))
 }
 
 fn json_string(s: &str) -> String {
@@ -540,6 +599,13 @@ pub enum MarkupError {
     /// The Qwen3-Coder scan's refusal.
     #[error("{0}")]
     Qwen(#[from] QwenXmlError),
+    /// A call's arguments were streamed as they were read and the markup does
+    /// not end them that way ([`crate::callstream`]).
+    #[error(
+        "tool call {index} ({name}): its arguments were streamed as read, and the markup does \
+         not end them that way (a parameter given twice, or text that stops being the call)"
+    )]
+    Diverged { index: usize, name: String },
 }
 
 impl PartialEq<GlmXmlError> for MarkupError {
@@ -562,6 +628,9 @@ pub struct ChatParser {
     /// `None` when neither a split nor a scan is asked for.
     think: Option<ThinkSplit>,
     scan: Option<Scan>,
+    /// `Some` for a stream that sends a call as it is read
+    /// ([`ChatParser::streaming_calls`]).
+    streamer: Option<Streamer>,
     total: Message,
 }
 
@@ -600,8 +669,31 @@ impl ChatParser {
                 Tools::Hermes => Scan::Hermes(HermesScan::default()),
                 Tools::QwenXml(kinds) => Scan::Qwen(QwenScan::new(kinds)),
             }),
+            streamer: None,
             total: Message::default(),
         }
+    }
+
+    /// The same parser, reporting each call as it is read: a push also yields
+    /// the [`CallPiece`]s of the calls it opened and extended
+    /// ([`ChatParser::take_pieces`]), which concatenate, per call, to the
+    /// `arguments` it closes with. A call is announced once its name is read, so
+    /// markup that then stops being that call is a [`MarkupError::Diverged`],
+    /// where a parser that does not stream gives the text back as content
+    /// (DSML) — the fragments already sent cannot be taken back.
+    #[must_use]
+    pub fn streaming_calls(mut self) -> Self {
+        self.streamer = Some(Streamer::default());
+        self
+    }
+
+    /// The pieces the pushes since the last call reported; empty for a parser
+    /// that does not stream its calls.
+    pub fn take_pieces(&mut self) -> Vec<CallPiece> {
+        self.streamer
+            .as_mut()
+            .map(Streamer::take)
+            .unwrap_or_default()
     }
 
     /// The same parser for a template whose markup is `format`: Qwen3-Coder's
@@ -631,12 +723,14 @@ impl ChatParser {
     }
 
     /// Feeds generated text; returns what may be sent now. For a parser with
-    /// no scan or the DSML scan, which cannot fail; a GLM, Hermes or Qwen
-    /// parser's caller uses [`ChatParser::try_push`].
+    /// no scan or the DSML scan, which cannot fail unless it streams its calls
+    /// ([`ChatParser::streaming_calls`]); a GLM, Hermes or Qwen parser's caller
+    /// uses [`ChatParser::try_push`].
     ///
     /// # Panics
     ///
-    /// On markup a GLM, Hermes or Qwen scan refuses, naming it.
+    /// On markup a GLM, Hermes or Qwen scan refuses, or a streamed call the
+    /// markup ends otherwise, naming it.
     pub fn push(&mut self, text: &str) -> Message {
         self.try_push(text)
             .unwrap_or_else(|e| panic!("ChatParser::push on a scan that failed: {e}"))
@@ -647,7 +741,8 @@ impl ChatParser {
     ///
     /// # Panics
     ///
-    /// On markup a GLM, Hermes or Qwen scan refuses, naming it.
+    /// On markup a GLM, Hermes or Qwen scan refuses, or a streamed call the
+    /// markup ends otherwise, naming it.
     pub fn finish(&mut self) -> Message {
         self.try_finish()
             .unwrap_or_else(|e| panic!("ChatParser::finish on a scan that failed: {e}"))
@@ -670,6 +765,7 @@ impl ChatParser {
             Some(Scan::Hermes(h)) => Some(h.push(&split.content)?),
             Some(Scan::Qwen(q)) => Some(q.push(&split.content)?),
         };
+        self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
     }
 
@@ -689,7 +785,16 @@ impl ChatParser {
             Some(Scan::Hermes(h)) => Some(h.finish()?),
             Some(Scan::Qwen(q)) => Some(q.finish()?),
         };
+        self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
+    }
+
+    /// Hands a scan step to the stream's pieces.
+    fn stream(&mut self, scanned: Option<&Scanned>) -> Result<(), MarkupError> {
+        match (&mut self.streamer, scanned) {
+            (Some(st), Some(s)) => st.step(&s.calls, s.open.as_ref()),
+            _ => Ok(()),
+        }
     }
 
     /// The message so far.

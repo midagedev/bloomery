@@ -431,11 +431,16 @@ fn fold_stream(body: &str) -> Result<(Value, Value), String> {
             content.push_str(s);
         }
         for tc in d["tool_calls"].as_array().into_iter().flatten() {
-            calls.push(tc["function"].clone());
+            common::fold_call_delta(&mut calls, tc);
         }
     }
     let mut m = json!({"content": content, "reasoning_content": reasoning});
-    m["calls"] = json!(calls);
+    m["calls"] = json!(
+        calls
+            .iter()
+            .map(|c| c["function"].clone())
+            .collect::<Vec<_>>()
+    );
     Ok((finish, m))
 }
 

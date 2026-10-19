@@ -147,9 +147,9 @@ use std::net::TcpStream;
 use serde_json::{Map, Value, json};
 
 use super::{
-    ApiError, ChatPlan, State, body, chat_input, chat_plan, error_body, finish_stream, get_i,
-    get_i_in, invalid, json_type, progress, run_gen, run_whole, send_error, send_json, sse,
-    tool_markup_error, unix_now,
+    ApiError, ChatPlan, State, body, chat_input, chat_plan, check_effort, error_body,
+    finish_stream, get_i, get_i_in, invalid, json_type, progress, run_gen, run_whole, send_error,
+    send_json, sse, tool_markup_error, unix_now,
 };
 use crate::dsml::{Message, ToolCall};
 use crate::genloop::{Event, Outcome, StopKind, Timings};
@@ -391,7 +391,10 @@ fn reasoning_effort(v: Option<&Value>) -> Result<Option<&Value>, ApiError> {
         None => Ok(None),
         Some(Value::Object(r)) => match set(r, "effort") {
             None => Ok(None),
-            Some(e @ Value::String(_)) => Ok(Some(e)),
+            Some(e @ Value::String(s)) => {
+                check_effort("reasoning.effort", s)?;
+                Ok(Some(e))
+            }
             Some(e) => Err(invalid(format!(
                 "reasoning.effort must be a string, not {}",
                 json_type(e)

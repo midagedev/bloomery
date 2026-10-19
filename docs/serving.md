@@ -62,6 +62,16 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   ships for it), and one line at start says so: the tools header teaches the tags the model writes, the parser
   reads them, and an earlier call re-renders in the history as the model wrote it, so the slot's cached prefix
   survives a tool turn. A `deepseek4` file keeps V4's tags; a parser reads the one spelling its template spells.
+  A template given by `--chat-template-file` (the V4.1, Qwen3.8, GLM, MiMo and Nemotron seats take it) is read the same
+  way, so a V4-spelled file on the V4.1 seat is respelled too.
+  A streamed `/v1/chat/completions` sends a call as the model writes it, in OpenAI's shape: the call's first delta carries
+  `index`, `id`, `type` and `function.name`, and `function.arguments` fragments follow that concatenate to the
+  `arguments` the non-streamed answer carries. A text parameter's value is released as it arrives, JSON-escaped, up to
+  a tail that could still become a closing tag; a number or JSON value is released when it is complete. Markup that
+  stops being the call after its name went out (a DSML parameter given twice, text that is not a parameter, a
+  generation that ends inside the call) ends the stream with an error event naming the call: the non-streamed answer
+  keeps DSML's raw text as content, and a stream cannot take its fragments back. `/v1/messages` and `/v1/responses`
+  streams send a call when it closes.
 - **Refused by name** (a 400 naming the field): `samplers` in an order other than llama-server's default list for the
   stages that are on, or naming a sampler this server lacks; typical_p, mirostat, `dry_*`, `xtc_*`, `top_n_sigma` and
   `dynatemp_*` when a request turns them on; `n_predict` or `max_tokens` outside -1..=i32::MAX (-2 does not mean "no
@@ -82,8 +92,10 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   effort, replacing a kwargs `reasoning_effort`; the server prints one line at start saying so. `/props` names which
   case the template is in: `thinking_off` is `"switch"`, `"low_effort"` or `"neither"` (neither knob changes the
   prompt, so `"none"` is `enable_thinking: false` as above).
-- **Any other `reasoning_effort`** (`low`, `medium`, `high`, `max`, as OpenAI's field and the Responses API's
-  `reasoning.effort` carry it) asks for reasoning and reaches the template as it came. A template whose thinking is
+- **`reasoning_effort`** takes OpenAI's words (its SDK's `ReasoningEffort`: `none`, `minimal`, `low`, `medium`,
+  `high`, `xhigh`) and `max` (V4.1's maximum-effort header), on `/v1/chat/completions`, `/apply-template` and the
+  Responses API's `reasoning.effort`; any other word, the empty string included, is a 400 naming the field, the value and
+  the accepted words. Every word but `none` asks for reasoning and reaches the template as it came. A template whose thinking is
   off until `enable_thinking` is set (V4.1's; `/props` `thinking_off` `"switch"`, found by comparing its renders at
   start) gets `enable_thinking: true` from it, so `reasoning_content` is split out; `max` also adds that template's
   maximum-effort header, and `low` to `high` are the template's default effort. A `chat_template_kwargs`

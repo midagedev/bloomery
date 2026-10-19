@@ -323,8 +323,8 @@ use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, SlotsFrom, Vocab, arm_screen, begin, bind_server, eprint_noted, model_props,
-    note_line, parallel_line, placement_of, put_back, slots_of,
+    SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted,
+    model_props, note_line, parallel_line, placement_of, put_back, slots_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -979,7 +979,7 @@ struct Args {
     /// `--cache-ram` in bytes; `None` takes the default.
     cache_ram: Option<u64>,
     /// `--chat-template-file`, replacing the file's own template.
-    template_file: Option<PathBuf>,
+    template_file: TemplateFile,
     /// `--slot-save-path`: the directory the slot actions answer from;
     /// `None` refuses every one, as llama-server does.
     slot_save_path: Option<PathBuf>,
@@ -1007,7 +1007,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: None,
         alias: None,
         cache_ram: None,
-        template_file: None,
+        template_file: TemplateFile::default(),
         slot_save_path: None,
         parallel: None,
         queue_depth: None,
@@ -1034,7 +1034,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             f if serve::flag::CTX.contains(&f) => a.ctx = Some(serve::flag::number(flag, v)?),
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
-            "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
+            TemplateFile::FLAG => a.template_file.set(v),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
             "--parallel" | "-np" => a.parallel = Some(serve::flag::number(flag, v)?),
             "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
@@ -1174,7 +1174,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &path,
         inv.value("tokenizer.chat_template"),
         inv.value("general.name"),
-        a.template_file.as_deref(),
+        a.template_file.path(),
         "qwen3.8",
     )?;
     drop(inv);

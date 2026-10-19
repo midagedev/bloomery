@@ -1614,10 +1614,11 @@ dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
 # HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙(정지 id 목록 전부), V4.1·GLM 채팅 템플릿 렌더링,
 # GLM 도구 호출 파서(glmxml), Qwen3의 헤르메스 호출·모델이 여는 생각 범위(hermes), 연결 상한·유휴 연결 종료·컨텍스트 끝의 정지(limits). 박스 자원 불필요.
 # Anthropic's Messages API on the chat path (anthropic). Qwen3.6's and Qwen3.8's XML tool calls, and every seat
-# template's tool-call markup mapped to its parser (qwenxml). The repetition, frequency and presence penalties as
-# llama-server takes them (penalty). A sampled request's drafted passes against its plain steps (sampdraft).
+# template's tool-call markup mapped to its parser (qwenxml). A tool call's streamed fragments in every markup
+# (callstream). The repetition, frequency and presence penalties as llama-server takes them (penalty). A sampled
+# request's drafted passes against its plain steps (sampdraft).
 gate-serve:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test limits --test anthropic --test penalty --test sampdraft -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test callstream --test limits --test anthropic --test penalty --test sampdraft -- --include-ignored --nocapture'
 
 # The template engine (crates/jinja, host only): its unit tests, the HF environment's whitespace control, scoping,
 # macros, filters and tests, Python's `str()` and slicing rules, and the V4.1 template rendered by hand. The engine's
@@ -2965,15 +2966,16 @@ weekly-gpu-glm5next-media-serve:
 # `-m <fixture>` with the serving defaults and one text chat; (s2) `--place a --mmproj <unsloth's mmproj-BF16.gguf>`, the tower's
 # `vision` record and one image chat (free-448x448.png) answered with its 16 x 16 + 2 positions; (s3) `--hf bloomery-fixture/glm5next:fixture`
 # offline from a cache of symlinks to the fixture and the projector, each beside a `.verified` marker holding the file's sha256; (s4) no
-# server stderr of the run holds "does not print this kind" or "panicked". Each start is preceded by a `--plan` run of its arguments.
-# It holds the image-flag starts at the fixture tier, which the real-tier seat gates do not. The bloomery-serve built is the release's
+# server stderr of the run holds "does not print this kind" or "panicked"; (s5) `--chat-template-file` with the fixture's own template behind
+# a marker: its call-carrying conversation renders the marker and then exactly what (s1) rendered. Each of (s1) to (s3) is preceded by a `--plan`
+# run of its arguments. It holds the image-flag starts at the fixture tier, which the real-tier seat gates do not. The bloomery-serve built is the release's
 # (--features glm5next,clef,vision,mimo2). Both cards in view
 # (BLOOMERY_CARD=both: both gate locks, alone in a batch): with `--place a` the other card is off the plan, so the tower sits there and no
 # fixture card budget has to hold its reserve; one card in view would drop the repo's projector or refuse the reserve. Fixture-only
 # (tools/ref/fixture-only.sh): the real tier would hash the real shards and start the real model three times, so a real-tier batch
 # defers the recipe by name. Predicted wall [derived from gate-times.tsv: glm5next-twocard at the fixture tier is 49 s median over eight
-# loads, qwen38-serve 89 s over ten-plus spawns]: three starts of about 8 s, three `--plan` runs of about 2 s, a warm build, the sha256 of the
-# 8.6 GB set and the 1.2 GB projector in threads beside the first two starts: 45 to 90 s warm; the bound is the runner's 900 s.
+# loads, qwen38-serve 89 s over ten-plus spawns]: four starts of about 8 s, three `--plan` runs of about 2 s, a warm build, the sha256 of the
+# 8.6 GB set and the 1.2 GB projector in threads beside the first two starts: 53 to 98 s warm; the bound is the runner's 900 s.
 [group('solo')]
 gate-gpu-serve-start-glm:
     BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2 --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/glm && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family glm --dir $D'
@@ -2981,8 +2983,10 @@ gate-gpu-serve-start-glm:
 # The same gate on the V4.1 fixture (the file's architecture picks the seat, which has no `--plan`, so its plan is read from each
 # start's own log). The projector is the `# mmproj` line of the V4.1 vision set ($BLOOMERY_DATA/ref-vision/deepseek41v, `just dump-ref-vision`),
 # the file the V4.1 image gates load. The serving defaults are the seat's own (context 32768, two slots), planned under the fixture's
-# card budget. Predicted wall [derived, as above]: three starts of about 12 s over the 15 GB host set, the sha256 of the set and the
-# projector in threads beside the first two starts, a warm build: 60 to 120 s warm; the bound is the runner's 900 s.
+# card budget. A fourth start takes `--chat-template-file` (the fixture's own template behind a marker): its call-carrying conversation
+# renders the marker and then exactly what the plain start rendered, so the seat's respell of V4's DSML spelling reached the file's text.
+# Predicted wall [derived, as above]: four starts of about 12 s over the 15 GB host set, the sha256 of the set and the projector in threads
+# beside the first two starts, a warm build: 72 to 132 s warm; the bound is the runner's 900 s.
 [group('solo')]
 gate-gpu-serve-start-ds41:
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2 --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/ds41 && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family ds41 --dir $D'

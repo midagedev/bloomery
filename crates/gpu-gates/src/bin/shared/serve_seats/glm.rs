@@ -250,8 +250,8 @@ use bloomery_gpu::model::{SlotRows, StepMode};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotPassRow,
-    SlotStep, Vocab, arm_screen, begin, bind_server, eprint_noted, model_props, note_line,
-    parallel_line, placement_of, put_back, slots_given,
+    SlotStep, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted, model_props,
+    note_line, parallel_line, placement_of, put_back, slots_given,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, lane_at, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -663,7 +663,7 @@ struct Args {
     /// `None` refuses every one, as llama-server does.
     slot_save_path: Option<PathBuf>,
     /// `--chat-template-file`, replacing the file's own template.
-    template_file: Option<PathBuf>,
+    template_file: TemplateFile,
     prefill: PrefillMode,
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
@@ -688,7 +688,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         alias: None,
         cache_ram: None,
         slot_save_path: None,
-        template_file: None,
+        template_file: TemplateFile::default(),
         prefill: PrefillMode::Batch,
         plan_only: false,
         parallel: None,
@@ -730,7 +730,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                 )
                 .into());
             }
-            "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
+            TemplateFile::FLAG => a.template_file.set(v),
             "--prefill" => {
                 a.prefill = PrefillMode::from_name(v)
                     .ok_or_else(|| format!("--prefill is batch or steps, not {v}"))?;
@@ -784,7 +784,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &path,
         inv.value("tokenizer.chat_template"),
         inv.value("general.name"),
-        a.template_file.as_deref(),
+        a.template_file.path(),
         "glm-5.3-flash",
     )?;
     drop(inv);

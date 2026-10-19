@@ -418,7 +418,7 @@ fn tool_body(extra: Value) -> Value {
 }
 
 /// A streamed chat body folded back into `(finish_reason, message)`: deltas
-/// concatenated, one entry per tool-call index.
+/// concatenated, one entry per tool call ([`common::fold_call_delta`]).
 fn fold_stream(body: &str) -> (Value, Value) {
     let mut reasoning = String::new();
     let mut content = String::new();
@@ -444,11 +444,7 @@ fn fold_stream(body: &str) -> (Value, Value) {
             content.push_str(s);
         }
         for tc in d["tool_calls"].as_array().into_iter().flatten() {
-            let i = usize::try_from(tc["index"].as_u64().expect("index")).expect("small");
-            assert_eq!(i, calls.len(), "each call streams once, in order");
-            let mut tc = tc.clone();
-            tc.as_object_mut().expect("object").remove("index");
-            calls.push(tc);
+            common::fold_call_delta(&mut calls, tc);
         }
     }
     let mut m = json!({"role": "assistant", "content": content});

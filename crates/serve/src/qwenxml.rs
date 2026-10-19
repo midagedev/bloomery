@@ -29,13 +29,17 @@
 //! function or a parameter the request's tools do not name, one parameter
 //! twice, a value its schema types JSON that is not JSON — and a call still
 //! open when the stream ends are a [`QwenXmlError`], never content and never
-//! dropped. Every decision depends on the text only, never on how it was cut
-//! into pieces.
+//! dropped. The call a scan has opened and not closed is reported as it is read
+//! ([`Scanned::open`]): its name once `<function=NAME>` is whole, and the
+//! arguments so far, a prefix of the arguments the call closes with, the text
+//! of a string parameter as it arrives. Every decision depends on the text
+//! only, never on how it was cut into pieces.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::callstream::{self, Args, Progress, released};
 use crate::constrain::{Fun, Part, Refusal, Style, call, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
@@ -285,6 +289,11 @@ impl QwenScan {
                 let Some((name, arguments, used)) =
                     parse_call(&self.buf, self.calls, &self.kinds, false)?
                 else {
+                    out.open = partial_call(&self.buf, &self.kinds).map(|(name, args)| Progress {
+                        index: self.calls,
+                        name,
+                        args,
+                    });
                     return Ok(out);
                 };
                 out.calls.push(ToolCall {
@@ -344,7 +353,7 @@ impl QwenScan {
         }
         Ok(Scanned {
             content: rest,
-            calls: Vec::new(),
+            ..Scanned::default()
         })
     }
 }
@@ -505,6 +514,56 @@ fn parse_call(
         format!("{{{}}}", fields.join(",")),
         at,
     )))
+}
+
+/// The call at the start of `s`, the text after `<tool_call>` whose close has
+/// not come, as far as `s` reads it: its name once `<function=NAME>` is whole
+/// and the request's tools name it, and the arguments [`parse_call`] will
+/// close with, as a prefix — each complete parameter, and the text of a
+/// parameter whose schema reads a string whose end has not come, up to the
+/// tail that could still become a tag that ends it. A fault ends the reading
+/// where it stands: [`parse_call`] names it.
+fn partial_call(s: &str, kinds: &ParamKinds) -> Option<(String, String)> {
+    let rest = s.trim_start().strip_prefix(FUNCTION_OPEN)?;
+    let name_end = rest.find('>')?;
+    let name = &rest[..name_end];
+    if name.is_empty() || name.contains(['<', '\n', '"']) || !kinds.names(name) {
+        return None;
+    }
+    let mut args = Args::new();
+    let mut tail = &rest[name_end + 1..];
+    loop {
+        tail = tail.trim_start();
+        let Some(p) = tail.strip_prefix(PARAM_OPEN) else {
+            break;
+        };
+        let Some(key_end) = p.find('>') else { break };
+        let key = &p[..key_end];
+        if key.is_empty() || key.contains(['<', '\n', '"']) {
+            break;
+        }
+        let Some(v) = p[key_end + 1..].strip_prefix('\n') else {
+            break;
+        };
+        let kind = kinds.kind(name, key);
+        let Some(val_end) = v.find(PARAM_VALUE_CLOSE) else {
+            if kind == Some(&Kind::String) {
+                let text = released(v, &[PARAM_VALUE_CLOSE, CALL_CLOSE]);
+                return Some((name.to_owned(), args.text_so_far(key, text)));
+            }
+            break;
+        };
+        let raw = &v[..val_end];
+        match kind {
+            Some(Kind::String) => args.field(key, &callstream::string(raw)),
+            Some(Kind::Json(_)) if serde_json::from_str::<Value>(raw).is_ok() => {
+                args.field(key, raw);
+            }
+            _ => break,
+        }
+        tail = &v[val_end + PARAM_VALUE_CLOSE.len()..];
+    }
+    Some((name.to_owned(), args.so_far()))
 }
 
 /// The call this markup spells, as the parts structured output forces: the

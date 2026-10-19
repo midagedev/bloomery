@@ -23,13 +23,17 @@
 //! name, text where a tag belongs, `<arg_value>` without its `<arg_key>`, a
 //! key given twice, a value its schema types as JSON that is not JSON) and a
 //! call still open when the stream ends are a [`GlmXmlError`], never content
-//! and never dropped. Every decision depends on the text only, never on how it
-//! was cut into pieces.
+//! and never dropped. The call a scan has opened and not closed is reported as
+//! it is read ([`Scanned::open`]): its name once a tag follows it, and the
+//! arguments so far, a prefix of the arguments the call closes with, the text
+//! of a `"string"` argument as it arrives. Every decision depends on the text
+//! only, never on how it was cut into pieces.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::callstream::{Args, Progress, released};
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
@@ -182,6 +186,11 @@ impl GlmScan {
         loop {
             if self.inside {
                 let Some(end) = self.buf.find(CALL_CLOSE) else {
+                    out.open = partial_call(&self.buf, &self.types).map(|(name, args)| Progress {
+                        index: self.calls,
+                        name,
+                        args,
+                    });
                     return Ok(out);
                 };
                 let (name, arguments) = parse_call(&self.buf[..end], self.calls, &self.types)?;
@@ -218,7 +227,7 @@ impl GlmScan {
         }
         Ok(Scanned {
             content: rest,
-            calls: Vec::new(),
+            ..Scanned::default()
         })
     }
 }
@@ -295,6 +304,57 @@ fn parse_call(body: &str, index: usize, types: &ArgTypes) -> Result<(String, Str
         .map(|(k, v)| format!("{}:{v}", Value::String(k.clone())))
         .collect();
     Ok((name.to_owned(), format!("{{{}}}", fields.join(","))))
+}
+
+/// The call at the start of `body`, the text after `<tool_call>` whose close
+/// has not come, as far as `body` reads it: its name once a tag follows it, and
+/// the arguments [`parse_call`] will close with, as a prefix — each complete
+/// argument, and the text of an argument the schema types `"string"` whose end
+/// has not come, up to the tail that could still become a tag that ends it. A
+/// fault ends the reading where it stands: [`parse_call`] names it when the
+/// call closes.
+fn partial_call(body: &str, types: &ArgTypes) -> Option<(String, String)> {
+    let name_end = body.find('<')?;
+    let name = body[..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = Args::new();
+    let mut rest = &body[name_end..];
+    loop {
+        rest = rest.trim_start();
+        let Some(k) = rest.strip_prefix(KEY_OPEN) else {
+            break;
+        };
+        let Some(key_end) = k.find(KEY_CLOSE) else {
+            break;
+        };
+        let key = &k[..key_end];
+        let v = k[key_end + KEY_CLOSE.len()..].trim_start();
+        let Some(v) = v.strip_prefix(VALUE_OPEN) else {
+            break;
+        };
+        let kind = types.kind(name, key);
+        let Some(value_end) = v.find(VALUE_CLOSE) else {
+            if kind == Some(&Kind::String) {
+                let text = released(v, &[VALUE_CLOSE, CALL_CLOSE]);
+                return Some((name.to_owned(), args.text_so_far(key, text)));
+            }
+            break;
+        };
+        let raw = &v[..value_end];
+        let value = match kind {
+            Some(Kind::String) => Value::String(raw.to_owned()),
+            Some(Kind::Json(_)) => match serde_json::from_str(raw) {
+                Ok(v) => v,
+                Err(_) => break,
+            },
+            None => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())),
+        };
+        args.field(key, &value.to_string());
+        rest = &v[value_end + VALUE_CLOSE.len()..];
+    }
+    Some((name.to_owned(), args.so_far()))
 }
 
 /// The call this markup spells, as the parts structured output forces: the

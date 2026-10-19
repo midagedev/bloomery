@@ -42,6 +42,12 @@
 //!   the 400 "image input is not supported". The cache is removed whatever the outcome.
 //! - (s4) no unregistered kind: across every server stderr of the run, `--plan` runs included, no line holds
 //!   "does not print this kind" or "panicked".
+//! - (s5) `--chat-template-file <file>` is a flag of every seat: a start on the fixture's own
+//!   `tokenizer.chat_template` behind a marker, and `/apply-template` of a call-carrying conversation renders
+//!   the marker and then exactly what (s1)'s plain start rendered of it. A seat that rewrites its template (the
+//!   V4.1 seat respells the DSML tags) rewrites the file's text the same way, so the two renders are equal only
+//!   if the file went through the seat's template path; a chat is a 200. (s5 runs before (s4), so (s4) reads its
+//!   log.)
 //!
 //! A clause's failure never ends the run: an error inside a clause (a server that exits before it listens,
 //! a kind the log is not read by) is that clause's FAIL line, and (s4) reads every log the run wrote.
@@ -52,6 +58,7 @@
 //! The fixture tier is the only tier with a file this gate may start a server on; the real tier ends by
 //! name before anything runs.
 
+use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
@@ -96,6 +103,8 @@ const GLM_IMAGE_EXTRA: u64 = 16 * 16 + 2;
 /// The quant tag of the fixture's set name (`<stem>-fixture`) and the directory the cache keeps its shards in.
 const QUANT: &str = "fixture";
 const SET_DIR: &str = "fixture";
+/// The text a template file starts with, which the rendered prompt starts with if the file is the template.
+const FILE_MARK: &str = "FILE-TEMPLATE|";
 /// What a server's log must never hold.
 const NEEDLES: [&str; 2] = ["does not print this kind", "panicked"];
 
@@ -376,6 +385,31 @@ fn text_messages() -> Value {
     json!([{"role": "user", "content": ASK}])
 }
 
+/// `messages` of a conversation whose assistant turn calls a function: the user's question, then the call with
+/// its `arguments` as the JSON string clients send.
+fn call_messages() -> Value {
+    json!([
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"Seoul\"}"},
+        }]},
+    ])
+}
+
+/// The prompt `/apply-template` renders of `messages`.
+fn applied(url: &dyn Fn(&str) -> String, messages: &Value) -> Result<String, GateError> {
+    let (st, body) = curl(
+        &url("/apply-template"),
+        Some(&json!({ "messages": messages })),
+        false,
+    )?;
+    Ok(json_of("/apply-template", st, &body)?["prompt"]
+        .as_str()
+        .ok_or("/apply-template: no prompt")?
+        .to_owned())
+}
+
 /// `messages` of the image chat: `images` copies of the image as `data:` URLs, a [`BETWEEN`] text part
 /// between each two, then the question.
 fn image_messages(png: &[u8], images: usize) -> Value {
@@ -435,6 +469,8 @@ struct Gate {
     /// The projector and the image; the error is the reason they could not be opened, which (s2) and
     /// (s3) report.
     images: Result<Images, String>,
+    /// `/apply-template` of [`call_messages`] on (s1)'s server, which (s5) compares its render with.
+    plain_render: OnceCell<String>,
 }
 
 impl Gate {
@@ -458,6 +494,7 @@ impl Gate {
             model,
             shards,
             images,
+            plain_render: OnceCell::new(),
         })
     }
 
@@ -564,6 +601,9 @@ impl Gate {
             "s1_props_names_no_image_input",
             props["modalities"]["vision"] == json!(false),
         );
+        let prompt = applied(&url, &call_messages())?;
+        println!("s1: call-carrying prompt {}", tail(&prompt, 160));
+        let _ = self.plain_render.set(prompt);
         let text = up.text()?;
         println!(
             "s1: {}\ns1: {}",
@@ -782,6 +822,42 @@ impl Gate {
         Ok(ok)
     }
 
+    /// (s5): the seat takes `--chat-template-file`, and the file's text is the template it serves.
+    fn template_file(&self) -> Result<bool, GateError> {
+        let Some(plain) = self.plain_render.get() else {
+            return Err("(s1) rendered no call-carrying prompt to compare with".into());
+        };
+        let split =
+            Split::open(&self.model).map_err(|e| format!("open {}: {e}", self.model.display()))?;
+        let template = split
+            .value("tokenizer.chat_template")
+            .and_then(gguf::Value::as_str)
+            .ok_or("the fixture has no tokenizer.chat_template")?;
+        let dir = self.dir.join("s5");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("template.jinja");
+        std::fs::write(&file, format!("{FILE_MARK}{template}"))?;
+        let mut args = self.file_args();
+        args.extend([
+            "--chat-template-file".to_owned(),
+            file.display().to_string(),
+        ]);
+        let mut up = self.start("s5", &args, None)?;
+        let addr = up.addr.clone();
+        let url = |p: &str| format!("http://{addr}{p}");
+        let mut ok = check("s5_health_ok", health(&url)?);
+        let prompt = applied(&url, &call_messages())?;
+        println!("s5: prompt {}", tail(&prompt, 160));
+        ok &= check(
+            "s5_prompt_is_the_files_template",
+            prompt.strip_prefix(FILE_MARK) == Some(plain.as_str()),
+        );
+        let (st, _) = chat(&url, &text_messages())?;
+        ok &= check("s5_text_chat_200", st == 200);
+        println!("s5: server stopped: {}", up.served.stop()?);
+        Ok(ok)
+    }
+
     /// (s4).
     fn no_unregistered_kind(&self) -> Result<bool, GateError> {
         let mut logs = Vec::new();
@@ -835,6 +911,8 @@ fn run() -> Result<(), GateError> {
     ok &= guarded("s2", gate.mmproj());
     tier::sc("s3_hf_offline_start")?;
     ok &= guarded("s3", gate.hf(hashed));
+    tier::sc("s5_template_file_start")?;
+    ok &= guarded("s5", gate.template_file());
     tier::sc("s4_no_unregistered_kind")?;
     ok &= guarded("s4", gate.no_unregistered_kind());
     println!("{}", tier::tally_line());

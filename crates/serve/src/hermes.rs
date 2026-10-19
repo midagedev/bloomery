@@ -18,11 +18,16 @@
 //! calls, where this parser keeps that text. A call that does not follow the
 //! markup — a body that is not one JSON object holding a `name` string and
 //! an `arguments` object, or a `<tool_call>` still open when the generation
-//! ends — is a [`HermesError`], never content and never dropped. Every
-//! decision depends on the text only, never on how it was cut into pieces.
+//! ends — is a [`HermesError`], never content and never dropped. The call a
+//! scan has opened and not closed is reported as it is read
+//! ([`Scanned::open`]): its name and `arguments` object once their start is
+//! read, and the compact JSON of the object so far, a prefix of the arguments
+//! the call closes with. Every decision depends on the text only, never on how
+//! it was cut into pieces.
 
 use serde_json::Value;
 
+use crate::callstream::{self, Progress};
 use crate::constrain::{Fun, Part, Refusal, call};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
@@ -87,6 +92,11 @@ impl HermesScan {
         loop {
             if self.inside {
                 let Some(end) = self.buf.find(CALL_CLOSE) else {
+                    out.open = partial_call(&self.buf).map(|(name, args)| Progress {
+                        index: self.calls,
+                        name,
+                        args,
+                    });
                     return Ok(out);
                 };
                 let (name, arguments) = parse_call(&self.buf[..end], self.calls)?;
@@ -143,7 +153,7 @@ impl HermesScan {
         }
         Ok(Scanned {
             content: rest,
-            calls: Vec::new(),
+            ..Scanned::default()
         })
     }
 }
@@ -204,6 +214,181 @@ fn parse_call(body: &str, index: usize) -> Result<(String, String), HermesError>
         });
     }
     Ok((name, arguments.to_string()))
+}
+
+/// The call at the start of `body`, the text after `<tool_call>` whose close
+/// has not come, as far as `body` reads it: the name once it and the opening
+/// brace of an `arguments` object that follows it are read (the template's
+/// order; any other shape, an `arguments` string included, is read when the
+/// call closes), and the arguments [`parse_call`] will close with, as a
+/// prefix — [`compact_prefix`]. A tail that could still become `</tool_call>`
+/// is not read.
+fn partial_call(body: &str) -> Option<(String, String)> {
+    let body = &body[..body.len() - partial_suffix(body, CALL_CLOSE)];
+    let t = body.trim_start().strip_prefix('{')?.trim_start();
+    let t = t
+        .strip_prefix("\"name\"")?
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let (name, t) = match string_prefix(t)? {
+        Str::Whole(name, used) => (name, &t[used..]),
+        Str::Open(_) => return None,
+    };
+    let t = t.trim_start().strip_prefix(',')?.trim_start();
+    let t = t
+        .strip_prefix("\"arguments\"")?
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    if name.is_empty() || !t.starts_with('{') {
+        return None;
+    }
+    Some((name, compact_prefix(t)))
+}
+
+/// A JSON string at the start of `s` (its opening quote there), read as far as
+/// `s` goes.
+enum Str {
+    /// The decoded text and the bytes of `s` it took, quotes included.
+    Whole(String, usize),
+    /// The text decoded so far; the closing quote has not come.
+    Open(String),
+}
+
+/// The string at the start of `s`: `None` when `s` does not start one or the
+/// string is not valid JSON (a raw control character, an escape JSON does not
+/// have, a lone surrogate).
+fn string_prefix(s: &str) -> Option<Str> {
+    let rest = s.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut at = 0;
+    while let Some(c) = rest[at..].chars().next() {
+        at += c.len_utf8();
+        match c {
+            '"' => return Some(Str::Whole(out, 1 + at)),
+            '\\' => {
+                let Some(e) = rest[at..].chars().next() else {
+                    return Some(Str::Open(out));
+                };
+                at += e.len_utf8();
+                out.push(match e {
+                    '"' | '\\' | '/' => e,
+                    'b' => '\u{8}',
+                    'f' => '\u{c}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'u' => match unit(&rest[at..])? {
+                        None => return Some(Str::Open(out)),
+                        Some(hi @ 0xD800..=0xDBFF) => {
+                            let after = &rest[at + 4..];
+                            let Some(low) = after.strip_prefix("\\u") else {
+                                return if after.len() < 2 && "\\u".starts_with(after) {
+                                    Some(Str::Open(out))
+                                } else {
+                                    None
+                                };
+                            };
+                            match unit(low)? {
+                                None => return Some(Str::Open(out)),
+                                Some(lo @ 0xDC00..=0xDFFF) => {
+                                    at += 4 + 2 + 4;
+                                    char::from_u32(
+                                        0x1_0000
+                                            + ((u32::from(hi) - 0xD800) << 10)
+                                            + (u32::from(lo) - 0xDC00),
+                                    )?
+                                }
+                                Some(_) => return None,
+                            }
+                        }
+                        Some(0xDC00..=0xDFFF) => return None,
+                        Some(n) => {
+                            at += 4;
+                            char::from_u32(u32::from(n))?
+                        }
+                    },
+                    _ => return None,
+                });
+            }
+            c if u32::from(c) < 0x20 => return None,
+            c => out.push(c),
+        }
+    }
+    Some(Str::Open(out))
+}
+
+/// The UTF-16 unit that four hex digits at the start of `s` spell: `Ok(None)`
+/// when fewer than four have come, `None` when they are not hex.
+fn unit(s: &str) -> Option<Option<u16>> {
+    if !s.bytes().take(4).all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    match s.get(..4) {
+        None => Some(None),
+        Some(d) => u16::from_str_radix(d, 16).ok().map(Some),
+    }
+}
+
+/// The compact JSON of the object at the start of `s` (a `{` there), as far as
+/// `s` determines it: structure as it comes, a string as it is decoded, in the
+/// escapes `serde_json` writes, and a number or literal once a delimiter ends
+/// it. It ends at the object's close, or where the text stops being JSON.
+/// What it returns is the prefix of the text [`parse_call`] closes with.
+fn compact_prefix(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    let mut at = 0;
+    while let Some(c) = s[at..].chars().next() {
+        match c {
+            c if c.is_ascii_whitespace() => at += 1,
+            '{' | '[' => {
+                out.push(c);
+                depth += 1;
+                at += 1;
+            }
+            '}' | ']' => {
+                out.push(c);
+                depth = depth.saturating_sub(1);
+                at += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            ',' | ':' => {
+                out.push(c);
+                at += 1;
+            }
+            '"' => match string_prefix(&s[at..]) {
+                Some(Str::Whole(text, used)) => {
+                    out.push_str(&callstream::string(&text));
+                    at += used;
+                }
+                Some(Str::Open(text)) => {
+                    out.push('"');
+                    out.push_str(&callstream::string_body(&text));
+                    break;
+                }
+                None => break,
+            },
+            _ => {
+                let Some(len) = s[at..]
+                    .find(|d: char| d.is_ascii_whitespace() || matches!(d, ',' | ':' | '}' | ']'))
+                else {
+                    break;
+                };
+                match serde_json::from_str::<Value>(&s[at..at + len]) {
+                    Ok(v @ (Value::Number(_) | Value::Bool(_) | Value::Null)) => {
+                        out.push_str(&v.to_string());
+                    }
+                    _ => break,
+                }
+                at += len;
+            }
+        }
+    }
+    out
 }
 
 /// The call this markup spells, as the parts structured output forces: the

@@ -21,6 +21,7 @@
 
 mod api;
 pub use api::embeddings;
+pub mod callstream;
 mod constrain;
 pub mod decide;
 pub mod dsml;

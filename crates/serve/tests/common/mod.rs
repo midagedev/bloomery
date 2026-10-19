@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use serve::{Engine, FATAL_LINGER, MockEngine, Server, ServerConfig};
 
 pub const V41_TEMPLATE: &str = include_str!("../fixtures/v41-chat-template.jinja");
@@ -197,4 +197,32 @@ pub fn start_sampling(
     let server = Server::bind_with("127.0.0.1:0", engine, config, slots)
         .unwrap_or_else(|e| panic!("bind: {e}"));
     server.spawn().expect("spawn")
+}
+
+/// Folds one streamed `tool_calls` delta into `calls`, one OpenAI tool call
+/// (`id`, `type`, `function`) each. The delta that names a call opens it, at
+/// the next index and with no arguments yet; every other delta is an
+/// `arguments` fragment of the call it indexes, the last one open.
+pub fn fold_call_delta(calls: &mut Vec<Value>, tc: &Value) {
+    let index = usize::try_from(tc["index"].as_u64().expect("index")).expect("small");
+    let args = tc["function"]["arguments"].as_str().expect("arguments");
+    if tc.get("id").is_some() {
+        assert_eq!(index, calls.len(), "each call opens once, in order: {tc}");
+        assert_eq!(tc["type"], "function", "{tc}");
+        assert_eq!(args, "", "the opening delta carries no arguments: {tc}");
+        calls.push(json!({
+            "id": tc["id"],
+            "type": "function",
+            "function": { "name": tc["function"]["name"], "arguments": "" },
+        }));
+    } else {
+        assert_eq!(
+            index + 1,
+            calls.len(),
+            "a fragment extends the open call: {tc}"
+        );
+        assert!(tc["function"].get("name").is_none(), "{tc}");
+        let open = &mut calls[index]["function"]["arguments"];
+        *open = json!(format!("{}{args}", open.as_str().expect("text")));
+    }
 }
