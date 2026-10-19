@@ -206,16 +206,19 @@ self_test() {
   case_ 'QUIET not a whole number: 64' 64 'usage' "$rc" "$t/d"
   # A TERM during a dump (a gdb that holds, and ends six seconds after its TERM) ends the dump and the command, and a second
   # TERM while the watch waits does not cut that wait short: the watch returns after both, with the command's code (7, two
-  # seconds after its TERM). The stub gdb marks the TERM that reaches it, and the case reads the mark before the second TERM:
-  # a gdb the watch's TERM does not reach gets its TERM from the dump's own bound, at 120 s, and the case waits 110 s for the
-  # mark, so a mark read says the watch's TERM, not the bound, ended the dump.
-  mkdir "$t/bin"
+  # seconds after its TERM). The stub gdb marks the TERM that reaches it, and the case reads the mark before the second TERM.
+  # A gdb the watch's TERM does not reach gets its TERM from the dump's own bound, at 120 s, which a loaded machine's polls
+  # (1100 of them) can outlast: a mark alone does not say who ended the dump. The dump's timeout is the stub with a note
+  # (STUB_TIMEOUT_BOUND_NOTE) it prints when its bound runs out; the note in the watch's output turns `reached` to no.
+  mkdir "$t/bin" "$t/mark-bin"
   printf '%s\n' '#!/bin/sh' "[ -z \"\${SW_HOLD:-}\" ] || trap ': > \"\$SW_GDB.term\"; sleep 6; exit 0' TERM" 'echo $$ > "$SW_GDB"' \
     '[ -n "${SW_HOLD:-}" ] || exit 0' 'while :; do sleep 1; done' > "$t/bin/gdb"
   printf '%s\n' 'echo $$ > "$SW_CMD"' "trap 'sleep 2; exit 7' TERM" 'sleep 30 &' 'wait' > "$t/cmd"
   chmod +x "$t/bin/gdb"
   command -v timeout > /dev/null || cp "${self%/*}/stub-timeout.py" "$t/bin/timeout"
-  SW_HOLD=1 SW_GDB=$t/gdb.pid SW_CMD=$t/cmd.pid PATH=$t/bin:$PATH bash "$self" 1 sleep -- sh "$t/cmd" > "$t/e" 2>&1 &
+  cp "${self%/*}/stub-timeout.py" "$t/mark-bin/timeout"
+  STUB_TIMEOUT_BOUND_NOTE=dump-bound-fired SW_HOLD=1 SW_GDB=$t/gdb.pid SW_CMD=$t/cmd.pid PATH=$t/mark-bin:$t/bin:$PATH \
+    bash "$self" 1 sleep -- sh "$t/cmd" > "$t/e" 2>&1 &
   w=$! k=0
   until [ -s "$t/gdb.pid" ] || ! alive "$w" || [ "$k" = "$failsafe" ]; do sleep 0.1; k=$((k + 1)); done
   kill -TERM "$w"
@@ -225,14 +228,15 @@ self_test() {
   [ ! -e "$t/gdb.pid.term" ] || reached=yes
   kill -TERM "$w"
   rc=0; wait "$w" || rc=$?
+  if grep -q 'dump-bound-fired' "$t/e"; then reached=no; fi
   left=
   alive "$(cat "$t/gdb.pid" 2> /dev/null)" && left="$left gdb"
   alive "$(cat "$t/cmd.pid")" && left="$left command"
   echo "dumping: $([ -s "$t/gdb.pid" ] && echo yes || echo no), the TERM reached the dump: $reached, left:${left:- none}" >> "$t/e"
   # PIN(2026-10-19): replaces the wall band `ended in 1?[0-9] s` (PIN(2026-10-15), was [0-7] s). The stub gdb ends six seconds
   # after its TERM, so a wall ceiling on the watch's return reads the load. The mark the stub writes when the TERM reaches it
-  # carries what the band told apart: a gdb the watch's TERM does not reach is ended by the dump's own bound at 120 s, after
-  # the case's 110 s wait for the mark, and reads `reached: no`.
+  # carries what the band told apart: a gdb the watch's TERM does not reach is ended by the dump's own bound at 120 s, whose
+  # note (dump-bound-fired) the stub timeout prints, and reads `reached: no` however long the case's polls took.
   case_ 'a TERM during the dump ends it and the command, their code kept' 7 'dumping: yes, the TERM reached the dump: yes, left: none$' "$rc" "$t/e"
   # A TERM while the watch waits for the command, after it has ended the command's quiet process (the command goes on after
   # it), ends the command, and the watch returns after it, with its code.

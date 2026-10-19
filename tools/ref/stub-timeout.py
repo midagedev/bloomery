@@ -5,7 +5,9 @@ coreutils' `timeout [--kill-after=K] S COMMAND...` and keeps its timing and exit
 S seconds COMMAND's process group gets a TERM, as it does when a TERM is sent here. K seconds after the first of the
 two the group gets a KILL if COMMAND is still there (K 0 or none: no KILL). The exit is 124 when S ran out, 137 when
 KILL ends the group, else COMMAND's status (128 + the signal). An ALRM sent here is S running out, as coreutils' timeout
-takes it. The monitor leads the group and ignores its own TERM while forwarding it. COMMAND inherits the monitor's open descriptors, including a lease held on descriptor 9."""
+takes it. The monitor leads the group and ignores its own TERM while forwarding it. COMMAND inherits the monitor's open descriptors, including a lease held on descriptor 9.
+STUB_TIMEOUT_BOUND_NOTE=TEXT (unset: nothing) prints TEXT and a newline on stdout when S runs out, so a self-test can tell a COMMAND
+that S ended from one a TERM sent here ended (the KILL that follows a TERM, after K seconds, prints nothing)."""
 import os
 import signal
 import subprocess
@@ -13,6 +15,7 @@ import sys
 import time
 
 kill_after = 0.0
+note = os.environ.get('STUB_TIMEOUT_BOUND_NOTE')
 args = []
 for a in sys.argv[1:]:
     if a.startswith('--kill-after='):
@@ -66,6 +69,8 @@ while True:
         break
     except subprocess.TimeoutExpired:
         if time.monotonic() >= deadline:
+            if note and term_signal == signal.SIGTERM:  # S ran out: after a TERM sent here the deadline is the KILL's
+                print(note, flush=True)
             timed_out, deadline = True, float('inf')
             cleanup(term_signal)
 if timed_out and rc == -signal.SIGKILL:

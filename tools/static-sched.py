@@ -23,13 +23,14 @@ appends `NAME<TAB>WALL<TAB>DATE` to --times.
 
 Per job DIR gets NAME.log, NAME.rc, NAME.wall (whole seconds) and, when skipped, NAME.skip; DIR/pids holds each started
 job's pid (its process group) at spawn; DIR/sched.tsv one row a job: name, start and end offsets in seconds, rc, how it
-ran (run or skip). A TERM, INT or HUP ends every running job's process group (a member that ignores the TERM gets a KILL
-once the job's shell is gone), and the scheduler then exits 128 + the signal. One that arrives while a job is being started
-waits until the job is registered; one that arrives during the cleanup is ignored. Nothing is printed on stdout: the callers
-report from DIR.
+ran (run or skip). A TERM, INT or HUP ends every running job's process group and the groups of the job's descendants (a job
+may run a scheduler of its own, whose jobs are in groups of their own); a member that ignores the TERM gets a KILL once the
+jobs' shells are gone, and the scheduler then exits 128 + the signal. An error that is no signal (a file it cannot write)
+ends the running jobs the same way before it propagates. A signal that arrives while a job is being started waits until the
+job is registered; one that arrives during the cleanup is ignored. Nothing is printed on stdout: the callers report from DIR.
 
-Exit: 0 every job ran (or skipped) and wrote its rc, whatever the rcs; 64 usage or a malformed JOBS or keys line (named);
-128+n a signal.
+Exit: 0 every job ran (or skipped) and wrote its rc, whatever the rcs; 64 usage or a malformed JOBS, keys or times line
+(named), or a negative --max; 128+n a signal.
 """
 
 import argparse
@@ -51,19 +52,24 @@ STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
 
 def read_times(path: str | None) -> dict[str, float]:
-    """name -> the median of its last three recorded walls."""
+    """name -> the median of its last three recorded walls. A row that is not NAME, a finite nonnegative WALL and DATE is
+    refused by its line: the order of the jobs reads these walls."""
     rows: dict[str, list[float]] = {}
     if not path:
         return {}
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for ln in fh:
+        with open(path, encoding="utf-8") as fh:
+            for n, ln in enumerate(fh, 1):
                 f = ln.rstrip("\n").split("\t")
-                if len(f) >= 2:
-                    try:
-                        rows.setdefault(f[0], []).append(float(f[1]))
-                    except ValueError:
-                        pass
+                try:
+                    if len(f) != 3 or not f[0]:
+                        raise ValueError("want NAME WALL DATE")
+                    wall = float(f[1])
+                    if not 0 <= wall < float("inf"):
+                        raise ValueError("wall must be finite and nonnegative")
+                except ValueError as err:
+                    raise ValueError(f"{path}:{n}: {err}") from err
+                rows.setdefault(f[0], []).append(wall)
     except FileNotFoundError:
         return {}
     return {k: statistics.median(v[-3:]) for k, v in rows.items()}
@@ -111,20 +117,70 @@ def signal_group(pgid: int, sig: int) -> None:
         pass
 
 
+def process_table() -> list[tuple[int, int, int]]:
+    """(pid, ppid, pgid) of every process."""
+    out = subprocess.check_output(["ps", "-eo", "pid=,ppid=,pgid="], text=True)
+    return [(int(a), int(b), int(c)) for a, b, c in (ln.split() for ln in out.splitlines())]
+
+
+def descendant_groups(roots: list[int], table: list[tuple[int, int, int]]) -> set[int]:
+    """The process groups of the roots (each leads a group of its own) and of every process below them: a child of a member, or a
+    member of a group found so far. A job that runs a scheduler of its own has jobs in groups its own group does not hold."""
+    groups = set(roots)
+    reach = set(groups)
+    grew = True
+    while grew:
+        grew = False
+        for pid, parent, group in table:
+            if pid not in reach and (parent in reach or group in groups):
+                reach.add(pid)
+                groups.add(group)
+                grew = True
+    return groups
+
+
+def end_jobs(running: dict[int, tuple[Job, subprocess.Popen, float]]) -> None:
+    """End the running jobs: a TERM to each job's group and to the groups of its descendants, read before the first signal. The
+    job's shell ends on the TERM at once while a member may ignore it, so once every leader has gone (or the 10 s are up) each
+    group gets a KILL: nothing of a cancelled job outlives the scheduler, a nested scheduler's jobs included."""
+    for s in STOP_SIGNALS:  # a second signal must not cut the cleanup short
+        signal.signal(s, signal.SIG_IGN)
+    try:
+        groups = descendant_groups(list(running), process_table())
+    except (OSError, ValueError, subprocess.CalledProcessError) as err:
+        print(f"static-sched: cannot read the process table ({err}): only the jobs' own groups are ended", file=sys.stderr)
+        groups = set(running)
+    for group in groups:
+        signal_group(group, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    for _, p, _ in running.values():
+        try:
+            p.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+    for group in groups:
+        signal_group(group, signal.SIGKILL)
+    for _, p, _ in running.values():
+        p.wait()
+
+
 def run(args: argparse.Namespace) -> int:
     try:
         jobs = read_jobs(args.jobs)
         keys = read_keys(args.keys)
+        times = read_times(args.times)
     except (OSError, ValueError) as err:
         print(f"static-sched: {err}", file=sys.stderr)
         return USAGE_RC
     if args.ledger and not args.keys:
         print("static-sched: --ledger reads the keys --keys names; give --keys too", file=sys.stderr)
         return USAGE_RC
+    if args.max < 0:
+        print("static-sched: --max must be nonnegative", file=sys.stderr)
+        return USAGE_RC
     slots = args.max or os.cpu_count() or 1
     for j in jobs:
         j.cpus = min(j.cpus, slots)
-    times = read_times(args.times)
     green = read_shape_ledger(args.ledger)[0] if args.ledger else {}
     out = args.out
     os.makedirs(out, exist_ok=True)
@@ -190,6 +246,7 @@ def run(args: argparse.Namespace) -> int:
         if deferred:
             raise Stop(deferred[0])
 
+    stopped = 0
     try:
         while pending or running:
             alone_running = any(j.alone for j, _, _ in running.values())
@@ -232,23 +289,12 @@ def run(args: argparse.Namespace) -> int:
             if rc == 0 and args.ledger and key != "-":
                 append_line(args.ledger, f"{key}\tgreen\t{date}\t{args.tree}\n")
     except Stop as stop:
-        for s in STOP_SIGNALS:  # a second signal must not cut the cleanup short
-            signal.signal(s, signal.SIG_IGN)
-        for pid in list(running):
-            signal_group(pid, signal.SIGTERM)
-        # The job's shell ends on the TERM at once while a child of its group may ignore it: once the leader has gone (or its
-        # 10 s are up) the group's survivors get a KILL, so nothing of a cancelled job outlives the scheduler.
-        for pid, (j, p, st) in list(running.items()):
-            try:
-                p.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass
-            signal_group(pid, signal.SIGKILL)
-            p.wait()
-        write(os.path.join(out, "sched.tsv"), "".join(sched_rows))
-        return 128 + stop.sig
+        stopped = stop.sig
+    finally:
+        if running:  # a signal, or an error of ours (a file it cannot write): no registered job outlives the scheduler
+            end_jobs(running)
     write(os.path.join(out, "sched.tsv"), "".join(sched_rows))
-    return 0
+    return 128 + stopped if stopped else 0
 
 
 def self_test() -> int:
@@ -277,6 +323,10 @@ def self_test() -> int:
 
         def sched(argv: list[str]) -> int:
             return subprocess.run([sys.executable, me, "run", *argv], capture_output=True, text=True).returncode
+
+        def sched_err(argv: list[str]) -> tuple[int, str]:
+            r = subprocess.run([sys.executable, me, "run", *argv], capture_output=True, text=True)
+            return r.returncode, r.stderr
 
         def seen(name: str) -> int:
             with open(os.path.join(d, f"seen.{name}")) as fh:
@@ -365,6 +415,17 @@ def self_test() -> int:
             expect(sched(["--out", os.path.join(d, "o7"), jf]) == USAGE_RC, f"{why} is refused, 64")
         jf = jobs_file(["x\t-\t-\ttrue"])
         expect(sched(["--out", os.path.join(d, "o7"), "--ledger", ledger, jf]) == USAGE_RC, "--ledger without --keys is refused, 64")
+        expect(sched(["--out", os.path.join(d, "o7"), "--max", "-1", jf]) == USAGE_RC, "a negative --max is refused, 64")
+        # a malformed timing row is named by its line and refused, 64: a good row and then a bad one for a job must not keep the
+        # old estimate, and a short row must not drop out of the history
+        tbad = os.path.join(d, "times-bad.tsv")
+        for rows, line, why in (("j0\t3\td\nj0\tfast\td\n", 2, "a wall that is not a number"), ("j0\t3\td\nj1\t4\n", 2, "a row of two fields"),
+                                ("j0\t3\td\nj1\t4\td\tx\n", 2, "a row of four fields"), ("j0\t3\td\n\t4\td\n", 2, "a row with no name"),
+                                ("j0\t3\td\n\n", 2, "a blank line"), ("j0\t-1\td\n", 1, "a negative wall"),
+                                ("j0\tnan\td\n", 1, "a wall of nan"), ("j0\tinf\td\n", 1, "an infinite wall")):
+            write(tbad, rows)
+            rc, err = sched_err(["--out", os.path.join(d, "o7"), "--times", tbad, jf])
+            expect(rc == USAGE_RC and f"times-bad.tsv:{line}:" in err, f"{why} is refused naming its line, 64 (got {rc}: {err.strip()})")
         # a TERM ends the running jobs' process groups, and their children, before the scheduler exits 143
         jf = jobs_file([f"long\t-\t-\tsleep 300 & echo $! > {d}/child; wait"])
         p = subprocess.Popen([sys.executable, me, "run", "--out", os.path.join(d, "o8"), jf])
@@ -483,6 +544,50 @@ def self_test() -> int:
             signal_group(leader, signal.SIGKILL)
         expect(rc == 143, f"a second TERM during the cleanup leaves the scheduler's exit 143 (got {rc})")
         expect(ended, "a second TERM during the cleanup leaves the KILL of the job's group to happen")
+        # a job that runs a scheduler of its own (check-recipes' pytools block runs this self-test, which does): the TERM ends the
+        # job's shell at once, and the nested scheduler's jobs are in groups of their own, so a stubborn one of them is ended only
+        # when the cleanup reads the job's descendants and signals their groups too
+        write(os.path.join(d, "nested.tsv"), f"inner\t-\t-\tsh -c 'trap \"\" TERM; echo $$ > \"$1\"; exec sleep 300' _ {shlex.quote(d)}/child5\n")
+        nest = f"{shlex.quote(sys.executable)} {shlex.quote(me)} run --out {shlex.quote(d)}/o12in {shlex.quote(d)}/nested.tsv & wait"
+        jf = jobs_file([f"outer\t-\t-\t{nest}"])
+        p = subprocess.Popen([sys.executable, me, "run", "--out", os.path.join(d, "o12"), jf])
+        wait_written(os.path.join(d, "child5"))
+        p.send_signal(signal.SIGTERM)
+        try:
+            rc = p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rc = p.wait()
+        child5 = int(rd("child5"))
+        ended = gone(child5)
+        if not ended:
+            os.kill(child5, signal.SIGKILL)  # the pid the job wrote: never leave the survivor behind a red run
+        expect(rc == 143, f"a TERM with a nested scheduler ends the scheduler 143 (got {rc})")
+        expect(ended, "a TERM ends the jobs of a nested scheduler, a stubborn one included")
+        # the groups the cleanup signals, from a table of (pid, ppid, pgid): the roots', every child's below them (its own group
+        # included), and the members of a group found, whose parent the table no longer shows below the root
+        table = [(10, 1, 10), (11, 10, 10), (12, 11, 12), (13, 12, 12), (14, 13, 14), (15, 1, 10), (16, 1, 20), (17, 15, 17), (20, 1, 20)]
+        got = descendant_groups([10], table)
+        expect(got == {10, 12, 14, 17}, f"the groups of a job and of its descendants, and no other (got {sorted(got)})")
+        expect(descendant_groups([10, 20], table) == {10, 12, 14, 17, 20}, "two roots: the groups of both")
+        # an error that is not a signal (the out directory gone as a job ends: it removes it once its own pid line is out, after
+        # which the scheduler writes nothing that would make it again) ends the running jobs' groups before it propagates: the
+        # scheduler exits 1 with the traceback, and no registered job outlives it
+        out13 = os.path.join(d, "o13")
+        jf = jobs_file([f"hold\t-\t-\tsh -c 'echo $$ > \"$1\"; exec sleep 300' _ {shlex.quote(d)}/child6",
+                        f"vanish\t-\t-\tuntil [ -s {shlex.quote(d)}/child6 ] && grep -q '^vanish ' {shlex.quote(out13)}/pids; do sleep 0.05; done; "
+                        f"rm -rf {shlex.quote(out13)}"])
+        p = subprocess.Popen([sys.executable, me, "run", "--out", out13, "--max", "4", jf], stderr=subprocess.DEVNULL)
+        try:
+            rc = p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rc = p.wait()
+        ended = gone(int(rd("child6")))
+        if not ended:
+            os.kill(int(rd("child6")), signal.SIGKILL)
+        expect(rc == 1, f"an error that is not a signal ends the scheduler 1 (got {rc})")
+        expect(ended, "an error that is not a signal ends the running jobs' groups")
         # a group holding only zombies (its leader ended and not yet reaped) is signalled without an error
         z = subprocess.Popen(["sh", "-c", "exit 0"], start_new_session=True)
         for _ in range(200):
