@@ -19,7 +19,8 @@
 //! `logits.0.f32` is `rows` rows of `vocab` f32, little-endian: row 0 follows the whole prompt and row `i` follows forced
 //! id `i - 1` (the last forced id is not fed). `prompt.ids` and `forced.ids` hold the ids, one decimal a line.
 //! [`ForcedLogits::open`] checks the set against the family, then each file against the manifest's digests and shape. The
-//! set's CPU twin (`<set>.cpu`, mainline with no card in view) is no family's set: it is the oracle's own floor.
+//! set's CPU twin (`<set>.cpu`, mainline with no card in view) is no family's set: it is the oracle's own floor, and
+//! `open` refuses it by its `# backend`.
 
 use super::{ARCH, LCPP_BUILD};
 use crate::RefError;
@@ -75,11 +76,21 @@ pub struct ForcedLogits {
 
 impl ForcedLogits {
     /// The set at `dir` read and checked: the family's check ([`RefManifest::open`]: the trailer, the model file, the
-    /// architecture and the build), the one tensor row against `# rows` and `# vocab`, each ids file and the rows file
-    /// against the digest the manifest states, every id inside the vocabulary and one forced id a row.
+    /// architecture and the build), the reference engine's CUDA rows (`# engine`, `# backend`: the CPU twin is refused),
+    /// the one tensor row against `# rows` and `# vocab`, each ids file and the rows file against the digest the manifest
+    /// states, every id inside the vocabulary and one forced id a row.
     pub fn open(dir: &Path) -> Result<ForcedLogits, RefError> {
         let man = RefManifest::open(dir, &LOGITS)?;
         let at = dir.join("MANIFEST.tsv");
+        for (key, want) in [("engine", "reference"), ("backend", "cuda")] {
+            let got = stated::<String>(&man, key)?;
+            if got != want {
+                return Err(RefError::malformed(
+                    at.display(),
+                    format!("# {key} {got:?}, want {want:?}"),
+                ));
+            }
+        }
         let (rows, vocab): (usize, usize) = (stated(&man, "rows")?, stated(&man, "vocab")?);
         let row = man.tensor("logits", 0)?;
         row.expect("logits rows", "f32", [vocab as u64, rows as u64, 1, 1], OP)?;
@@ -146,14 +157,19 @@ fn stated<T: std::str::FromStr>(man: &RefManifest, key: &str) -> Result<T, RefEr
     })
 }
 
+/// The sha256 of `bytes`, as lowercase hex.
+fn sha(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// The sha256 of the file at `path`, as lowercase hex.
 fn digest(path: &Path) -> Result<String, RefError> {
     let bytes = std::fs::read(path)
         .map_err(|e| RefError::missing(path, format!("{}: {e}", path.display())))?;
-    Ok(Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(sha(&bytes))
 }
 
 /// `name`, one decimal id a line, against the digest the manifest states; every id inside `vocab`.
@@ -191,23 +207,15 @@ fn ids(dir: &Path, name: &str, sha256: &str, vocab: usize) -> Result<Vec<u32>, R
 
 #[cfg(test)]
 mod tests {
-    use super::{ForcedLogits, LOGITS, MODEL, OP};
+    use super::{ForcedLogits, LOGITS, MODEL, OP, sha};
     use crate::RefError;
     use crate::arch::qwen35::{ARCH, HIDDEN, LCPP_BUILD};
-    use sha2::{Digest, Sha256};
     use std::path::{Path, PathBuf};
 
     const VOCAB: usize = 4;
     const PROMPT: [u32; 3] = [1, 2, 3];
     const FORCED: [u32; 2] = [0, 1];
     const ROWS: [f32; 8] = [0.5, 3.0, -1.0, 0.25, 1.0, 0.0, 2.0, -2.0];
-
-    fn sha(bytes: &[u8]) -> String {
-        Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    }
 
     fn ids_text(ids: &[u32]) -> String {
         ids.iter().map(|i| format!("{i}\n")).collect()
@@ -349,5 +357,28 @@ mod tests {
         assert!(refused(&dir).contains("inside the vocabulary of 4"), "id");
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    /// The CPU twin passes the family's check (same model, build, architecture, digests and shape) and is still no set
+    /// of this family: `open` refuses a manifest whose only change is `# backend cpu`, or a run that is not the reference
+    /// engine's.
+    #[test]
+    fn the_cpu_twin_and_a_native_run_are_refused_by_their_manifest_lines() {
+        let dir = write_set("twin", MODEL, LCPP_BUILD, ARCH, true);
+        let text = std::fs::read_to_string(dir.join("MANIFEST.tsv")).expect("manifest");
+        for (was, now, want) in [
+            ("# backend\tcuda", "# backend\tcpu", "# backend \"cpu\""),
+            (
+                "# engine\treference",
+                "# engine\tnative",
+                "# engine \"native\"",
+            ),
+        ] {
+            assert!(text.contains(was), "the writer's shape: {was}");
+            std::fs::write(dir.join("MANIFEST.tsv"), text.replace(was, now)).expect("manifest");
+            let e = refused(&dir);
+            assert!(e.contains(want), "{now}: {e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

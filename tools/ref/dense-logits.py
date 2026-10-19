@@ -131,6 +131,9 @@ def build(args):
     tree, folder = args.llama_tree.resolve(), args.llama_build.resolve()
     if args.pin and args.cached_libraries:
         raise ValueError("--pin proves the build itself; it does not combine with --cached-libraries")
+    if args.pin and folder != tree / "build":
+        # The proof reads <tree>/build; the link must read the same libraries, not a stale build elsewhere.
+        raise ValueError("--pin requires --llama-build <llama-tree>/build")
     commit = clean_head(tree)
     remote = git(tree, "remote", "get-url", "origin")
     if args.pin:
@@ -400,14 +403,16 @@ def run(args):
     model, binary, output = args.model.resolve(), args.binary.resolve(), args.out.resolve()
     corpus = {}
     if args.corpus:
-        if args.prompt or args.forced or not args.prompt_count or not args.forced_count or not args.corpus_sha256:
+        if (args.prompt or args.forced or not args.corpus_sha256
+                or (args.prompt_count or 0) < 1 or (args.forced_count or 0) < 1):
             raise ValueError("--corpus takes --corpus-sha256, --prompt-count and --forced-count, and no --prompt or --forced")
         ids = corpus_slice(args.corpus, args.corpus_sha256, args.prompt_count + args.forced_count, target["vocab"])
         prompt, forced = ids[:args.prompt_count], ids[args.prompt_count:]
         corpus = {"tokens_file": str(args.corpus.resolve()), "tokens_file_sha256": args.corpus_sha256,
                   "tokens_count": str(len(ids))}
     else:
-        if not args.prompt or not args.forced or args.prompt_count or args.forced_count or args.corpus_sha256:
+        if (not args.prompt or not args.forced or args.prompt_count is not None or args.forced_count is not None
+                or args.corpus_sha256):
             raise ValueError("a run takes --prompt and --forced, or --corpus with its digest and counts")
         prompt, forced = token_ids(args.prompt, target["vocab"]), token_ids(args.forced, target["vocab"])
     if len(forced) > 4096 or len(prompt) + len(forced) > args.ctx:
@@ -589,13 +594,13 @@ def compare(left, right, bitwise=False):
             "rows": output}, 1 if bitwise and not equal else 0
 
 
-def quantiles(values, points=(0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)):
-    """{point: value} of the sorted values, linear between ranks; an empty list has none."""
+def quantiles(values):
+    """{point: value} at 0, 10, 25, 50, 75, 90 and 100 % of the sorted values, linear between ranks; an empty list has none."""
     if not values:
         raise ValueError("quantiles of no values")
     ordered = sorted(values)
     found = {}
-    for q in points:
+    for q in (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0):
         position = q * (len(ordered) - 1)
         low = int(math.floor(position))
         high = min(low + 1, len(ordered) - 1)
@@ -603,7 +608,7 @@ def quantiles(values, points=(0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)):
     return found
 
 
-def top2(row, vocab):
+def top2(row):
     """(argmax, top-1 minus top-2) of one logits row; ties are a margin of 0."""
     (first, _), (second, _) = heapq.nlargest(2, enumerate(row), key=lambda pair: pair[1])
     return first, float(row[first]) - float(row[second])
@@ -641,8 +646,8 @@ def floor(references, twin_suffix=".cpu"):
             norm = math.sqrt(math.fsum(float(u) ** 2 for u in p))
             if not norm:
                 raise ValueError(f"{reference}: row {i} is all zero")
-            cuda_arg, cuda_margin = top2(p, vocab)
-            cpu_arg, cpu_margin = top2(q, vocab)
+            cuda_arg, cuda_margin = top2(p)
+            cpu_arg, cpu_margin = top2(q)
             largest = max(abs(float(u) - float(v)) for u, v in zip(p, q))
             rows.append({"row": i, "rel_l2": delta / norm, "l2": delta, "cuda_norm": norm, "max_abs": largest,
                          "stable_margin": stable_margin(delta, largest),
@@ -663,9 +668,9 @@ def floor(references, twin_suffix=".cpu"):
 
 
 def print_floor(report, stream=sys.stdout):
-    def q_line(label, found, unit=""):
+    def q_line(label, found):
         names = ("min", "p10", "p25", "median", "p75", "p90", "max")
-        print(f"  {label}: " + "  ".join(f"{name} {value:.6g}" for name, value in zip(names, found.values())) + unit, file=stream)
+        print(f"  {label}: " + "  ".join(f"{name} {value:.6g}" for name, value in zip(names, found.values())), file=stream)
 
     for s in report["sets"]:
         rows = s["rows"]
@@ -838,8 +843,13 @@ def self_test():
         for changes, want in (({"corpus": corpus_file, "prompt": root / "p", "prompt_count": 2, "forced_count": 1,
                                 "corpus_sha256": corpus_sha}, "--corpus takes"),
                               ({"corpus": corpus_file, "prompt_count": 2, "corpus_sha256": corpus_sha}, "--corpus takes"),
+                              ({"corpus": corpus_file, "prompt_count": -1, "forced_count": 33, "corpus_sha256": corpus_sha},
+                               "--corpus takes"),
+                              ({"corpus": corpus_file, "prompt_count": 3, "forced_count": -1, "corpus_sha256": corpus_sha},
+                               "--corpus takes"),
                               ({}, "a run takes --prompt and --forced"),
                               ({"prompt": root / "p", "forced": root / "f", "forced_count": 1}, "a run takes --prompt and --forced"),
+                              ({"prompt": root / "p", "forced": root / "f", "prompt_count": 0}, "a run takes --prompt and --forced"),
                               ({"corpus": corpus_file, "prompt_count": 3, "forced_count": 2, "corpus_sha256": corpus_sha, "ctx": 4},
                                "context does not hold")):
             try:
@@ -852,6 +862,11 @@ def self_test():
             raise AssertionError("accepted --pin with --cached-libraries")
         except ValueError as error:
             assert "does not combine" in str(error), error
+        try:
+            build(argparse.Namespace(pin="0" * 40, cached_libraries=False, llama_tree=root, llama_build=root / "elsewhere"))
+            raise AssertionError("accepted --pin with a build directory the proof did not read")
+        except ValueError as error:
+            assert "--pin requires --llama-build" in str(error), error
 
         # The floor: a reference CUDA set and the CPU twin beside it, per row rel_l2, the argmax and the top-2 margins.
         def make_set(folder, flat, backend):
