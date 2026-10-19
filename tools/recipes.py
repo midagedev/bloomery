@@ -217,6 +217,9 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # `python3 -I` drops the script's directory
+from bloomery.fixture_dirs import FAMILY_NAME, FIXTURE_DIRS, REF_PATHS, RecipeError, fixture_table  # noqa: E402,F401
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 GATE_PREFIX = "gate-"
@@ -235,10 +238,6 @@ DEFAULT_PROFILE = "deepseek2"
 # Runners that execute target/release/<first argument>.
 BIN_RUNNERS = ("tools/gpu-gate.sh", "tools/host-gate.sh", "tools/ref/time-gate.sh")
 BUILD_SUBS = {"build", "test", "run", "check", "clippy", "bench", "doc", "rustc"}
-
-
-class RecipeError(Exception):
-    """A recipe, a tree or a tool the parser cannot read: a named failure, never a guess."""
 
 
 # ----------------------------------------------------------------------------------------------
@@ -6810,38 +6809,7 @@ def own_variant_row(path: str, variant: str) -> bool:
 
 
 # The fixture tier's family table, tools/fixture-dirs.tsv (the one owner: tools/ref/ref-paths.sh and crates/refset/src/fixture.rs read
-# the same file), and the default profile, read from tools/ref/ref-paths.sh:
-#     # comment
-#     qwen4exp<TAB>qwen38
-#     deepseek2<TAB>self
-# A family the table does not name has no fixture (`none`, never a row).
-FIXTURE_DIRS = "tools/fixture-dirs.tsv"
-REF_PATHS = "tools/ref/ref-paths.sh"
-FIXTURE_DIR_NAME = re.compile(r"[a-z0-9-]+")
-PROFILE_DEFAULT_LINE = re.compile(r'^: "\$\{BLOOMERY_MODEL:=\$\{BLOOMERY_REF_MODEL_PROFILE:-([A-Za-z0-9_]+)\}\}"$', re.M)
-FAMILY_NAME = re.compile(r"[A-Za-z0-9_-]+")
-
-
-def fixture_table(dirs_text: str, ref_paths_text: str) -> tuple[dict[str, str], str]:
-    """({family: fixture directory}, default profile): the rows of the fixture directory table's text (`self` as it is; a family the table
-    does not name has `none`) and the profile tools/box.sh loads when BLOOMERY_MODEL is unset, from ref-paths.sh's text. A text this
-    reader does not understand is a named error, never a guess: a row of another shape would be read as a family and fall to `none`."""
-    rows: dict[str, str] = {}
-    for n, line in enumerate(dirs_text.splitlines(), 1):
-        if not line.strip() or line.startswith("#"):
-            continue
-        cols = line.split("\t")
-        if len(cols) != 2 or not FAMILY_NAME.fullmatch(cols[0]) or not (FIXTURE_DIR_NAME.fullmatch(cols[1]) and cols[1] != "none"):
-            raise RecipeError(f"{FIXTURE_DIRS}: line {n} ({line.strip()[:60]!r}) is not `<family><TAB><dir>`: a family name, then a directory of lower-case letters, digits and '-' (or `self`; never `none`)")
-        if cols[0] in rows:
-            raise RecipeError(f"{FIXTURE_DIRS}: line {n}: the family {cols[0]!r} is in the table twice")
-        rows[cols[0]] = cols[1]
-    if not rows:
-        raise RecipeError(f"{FIXTURE_DIRS}: no row (`<family><TAB><dir>`): an item's fixture directory is read there")
-    profile = PROFILE_DEFAULT_LINE.findall(ref_paths_text)
-    if len(profile) != 1:
-        raise RecipeError(f"{REF_PATHS} holds {len(profile)} default-profile lines, not one: an item with no BLOOMERY_MODEL runs under that default")
-    return rows, profile[0]
+# the same file), and ref-paths.sh's default profile are read by tools/bloomery/fixture_dirs.py, imported at the top.
 
 
 def own_fixture_row(path: str, dirs: set[str]) -> bool:
@@ -8932,6 +8900,9 @@ def range_base_self_test(expect) -> None:
             with open(os.path.join(repo, rel), "w", encoding="utf-8") as fh:
                 fh.write(text)
         shutil.copyfile(os.path.abspath(__file__), os.path.join(repo, "tools/recipes.py"))
+        os.makedirs(os.path.join(repo, "tools/bloomery"), exist_ok=True)
+        shutil.copyfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bloomery/fixture_dirs.py"),
+                        os.path.join(repo, "tools/bloomery/fixture_dirs.py"))  # the table reader recipes.py imports
         steps = [("git", "init", "-q", "-b", "main"), ("cargo", "generate-lockfile", "--offline", "-q"), ("git", "add", "-A"),
                  ("git", "commit", "-q", "-m", "base"), ("git", "tag", "base"), ("git", "branch", "feature")]
         for step in steps:

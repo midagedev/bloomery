@@ -2263,8 +2263,8 @@ gate-gpu-qwen38-nodes *ARGS='':
 
 # A refused replay on a separate tier node resets to its fresh history. Requires BLOOMERY_TIER_NODES
 # and BLOOMERY_TIER_LINK=rdma, with tier_server already serving the same model on that node. Without
-# BLOOMERY_TIER_NODES (in BLOOMERY_BOX_ENV or the item's NAME@K=V) a batch defers it by name (needs-env) and a run by
-# hand stops with exit 67 before a build.
+# BLOOMERY_TIER_NODES a batch defers it by name (needs-env); a run by hand exits 67 before a build.
+# Set it through BLOOMERY_BOX_ENV='BLOOMERY_TIER_NODES=192.0.2.10:9000'.
 [group('v41-load')]
 gate-gpu-qwen38-nodes-remote:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen38-nodes-remote BLOOMERY_TIER_NODES && export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes -- --ignored hw_a_refused_remote_replay_resets_to_its_fresh_history --nocapture'

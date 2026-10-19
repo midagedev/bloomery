@@ -46,7 +46,7 @@ pub const LINE_PREFIX: &str = "# fixture\t";
 const DIRS_TABLE: &str = include_str!("../../../tools/fixture-dirs.tsv");
 
 /// A row's `dir` for a family with no fixture file of its own: a command runs on the profile's file, and there is no directory.
-pub const SELF: &str = "self";
+const SELF: &str = "self";
 
 /// What the shell says of an architecture the table does not name; never a row's `dir`.
 const NONE: &str = "none";

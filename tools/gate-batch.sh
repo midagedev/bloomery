@@ -971,6 +971,7 @@ RT
   cp "$(dirname "$self")/ref/real-only.sh" "$t/tools/ref/real-only.sh"
   cp "$(dirname "$self")/ref/fixture-only.sh" "$t/tools/ref/fixture-only.sh"
   cp "$(dirname "$self")/ref/needs-env.sh" "$t/tools/ref/needs-env.sh"
+  cp -R "$(dirname "$self")/bloomery" "$t/tools/bloomery" # the python package the runner imports (fixture_dirs) and boxq.py imports (selftest)
   cat > "$t/tools/ref/ref-paths.sh" << 'RP'
 : "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deepseek2}}"
 RP
@@ -2670,11 +2671,11 @@ SH
   check 'no-fixture: no fixture table file: a named error' 65 'fixture-dirs.tsv cannot be read .*: the fixture tier.s family table is read there' "${gb[@]}" --tier fixture --classes
   check '  … the real tier never reads it' 0 '^x-glm	X	solo	' "${gb[@]}" --classes
   printf '# no rows\n' > "$t/tools/fixture-dirs.tsv"
-  check 'no-fixture: a table with no row: a named error' 65 'fixture-dirs.tsv: no row .* tools/gate-batch.sh reads which families have a fixture there' "${gb[@]}" --tier fixture --classes
+  check 'no-fixture: a table with no row: a named error' 65 'fixture-dirs.tsv: no row' "${gb[@]}" --tier fixture --classes
   { cat "$t/fixture-dirs.good"; printf '%s\t%s\n' glm5next none; } > "$t/tools/fixture-dirs.tsv"
-  check "no-fixture: a row whose directory is none: a named error" 65 'line 7 .*glm5next.* is not .<profile><TAB><dir>.: a profile name, then a directory' "${gb[@]}" --tier fixture --classes
+  check "no-fixture: a row whose directory is none: a named error" 65 'line 7 .*glm5next.* is not .<family><TAB><dir>.' "${gb[@]}" --tier fixture --classes
   { cat "$t/fixture-dirs.good"; printf '%s\t%s\n' qwen4exp v41x; } > "$t/tools/fixture-dirs.tsv"
-  check "no-fixture: a profile in the table twice: a named error" 65 'line 7: the profile .qwen4exp. is in the table twice' "${gb[@]}" --tier fixture --classes
+  check "no-fixture: a family in the table twice: a named error" 65 'line 7: the family .qwen4exp. is in the table twice' "${gb[@]}" --tier fixture --classes
   cp "$t/fixture-dirs.good" "$t/tools/fixture-dirs.tsv"
   # The real table: the tree's own tools/fixture-dirs.tsv parses, and the family it names runs (a converted V4.1 gate is balanced, not deferred).
   check "no-fixture: the tree's own tools/fixture-dirs.tsv is a table this runner reads" 0 '^gate-gpu-ds41-step	F	balanced	' bash "$self" --tier fixture --classes
@@ -4453,7 +4454,7 @@ def marked_of(kind, name):
 # neither the item's env nor the batch's BLOOMERY_BOX_ENV sets VAR to a value.
 ENV_GUARD = "tools/ref/needs-env.sh"
 ENV_CALL = re.compile(r"\bbash " + re.escape(ENV_GUARD) + r"\s+(\S+)\s+(\S+)")
-ENV_VAR = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+VAR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def env_calls(name):
@@ -4511,7 +4512,7 @@ for n in sorted(recipes):
     wrong = sorted({c for c, _ in calls if c != n})
     if wrong:
         env_bad.append(f"recipe {n}: its needs-env call names {', '.join(wrong)}, not itself — write `bash {ENV_GUARD} {n} <VAR>`")
-    novar = sorted({v for _, v in calls if not ENV_VAR.fullmatch(v)})
+    novar = sorted({v for _, v in calls if not VAR.fullmatch(v)})
     if novar:
         env_bad.append(f"recipe {n}: its needs-env call names {', '.join(novar)}, which is no variable name — write `bash {ENV_GUARD} {n} <VAR>`")
     first = f"bash {ENV_GUARD} {n} "
@@ -4753,7 +4754,6 @@ def solo_arm(name, argv):
 
 
 ITEM = re.compile(r"^([A-Za-z0-9_-]+)(?:@([^:]*))?(?::(.*))?$")
-VAR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TIMES_LANES, TIMES_CARDS = ("A", "B", "X"), ("3090", "a6000", "both", "none", "any")
 DEFAULT_S = int(default_s)
 
@@ -4888,30 +4888,21 @@ def fixture_table():
     """(have, own): the profiles with a row in the fixture tier's table, tools/fixture-dirs.tsv (`<profile><TAB><dir>`; the file
     tools/ref/ref-paths.sh and crates/refset/src/fixture.rs read too) — a fixture directory, or `self` — and those whose row is
     `self`. Every other profile has no row, where tools/box.sh exits 66 under the fixture tier. The table is that file's, read here
-    once; a table this reader does not understand is a named error."""
+    once by tools/bloomery/fixture_dirs.py; a table it does not understand is a named error."""
     if not FIXTURE_TABLE:
-        path = os.path.join(root, "tools/fixture-dirs.tsv")
+        sys.path.insert(0, os.path.join(root, "tools"))
+        from bloomery.fixture_dirs import FIXTURE_DIRS, REF_PATHS, RecipeError, fixture_table as read_table
         try:
-            with open(path, encoding="utf-8") as fh:
+            with open(os.path.join(root, FIXTURE_DIRS), encoding="utf-8") as fh:
                 text = fh.read()
+            with open(os.path.join(root, REF_PATHS), encoding="utf-8") as fh:
+                paths = fh.read()
+            rows, _ = read_table(text, paths)
         except OSError as e:
-            fail(f"{path} cannot be read ({e.strerror}): the fixture tier's family table is read there")
-        have, own = set(), set()
-        for n, line in enumerate(text.splitlines(), 1):
-            if not line.strip() or line.startswith("#"):
-                continue
-            cols = line.split("\t")
-            if len(cols) != 2 or not re.fullmatch(r"[A-Za-z0-9_-]+", cols[0]) or not re.fullmatch(r"[a-z0-9-]+", cols[1]) or cols[1] == "none":
-                fail(f"{path}: line {n} ({line.strip()[:60]!r}) is not `<profile><TAB><dir>`: a profile name, then a directory of lower-case "
-                     "letters, digits and '-' (or `self`; never `none`) — tools/gate-batch.sh reads which families have a fixture there")
-            if cols[0] in have:
-                fail(f"{path}: line {n}: the profile {cols[0]!r} is in the table twice")
-            have.add(cols[0])
-            if cols[1] == "self":
-                own.add(cols[0])
-        if not have:
-            fail(f"{path}: no row (`<profile><TAB><dir>`) — tools/gate-batch.sh reads which families have a fixture there")
-        FIXTURE_TABLE.append((have, own))
+            fail(f"{e.filename} cannot be read ({e.strerror}): the fixture tier's family table is read there")
+        except RecipeError as e:
+            fail(str(e))
+        FIXTURE_TABLE.append((set(rows), {a for a, d in rows.items() if d == "self"}))
     return FIXTURE_TABLE[0]
 
 
