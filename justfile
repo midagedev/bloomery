@@ -334,8 +334,8 @@ gate-gpu-nemotron-serve:
 
 # The same seat gate on the moe body (gate_nemotron_serve's doc, every clause one path over both
 # bodies): the Bolt fixture under the fixture tier (nemotron_h_moe, the fixture's four layers, any
-# card), the arch word and the layer count read from the file, the session stepped every id (the
-# body has no batched prefill). One card.
+# card), the arch word and the layer count read from the file, the session's prompt call the body's
+# batched `GpuModel::prefill` (several ids; one id is a step). One card.
 gate-gpu-nemotron-h-moe-serve:
     BLOOMERY_TIER=fixture BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision,gemma-embedding2,hf --release --bin bloomery-serve --bin gate_nemotron_serve && D=target/nemotron-h-moe-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_serve --dir $D'
 
