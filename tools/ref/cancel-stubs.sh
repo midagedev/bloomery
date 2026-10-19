@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Fixtures shared by the cancellation self-tests. Sourced, never executed.
 
-# CANCEL_TIMEOUT_FORWARD=1 forwards TERM once; unset, the monitor exits and leaves its child's group.
+# CANCEL_TIMEOUT_FORWARD=1 forwards TERM once; unset, the monitor exits and leaves its child's group. An ALRM is the bound
+# running out, as GNU timeout takes its own: a self-test fires the bound on an event instead of racing a short one.
 cancel_timeout() {
   cat > "$1" << 'PY'
 #!/usr/bin/env python3
@@ -25,15 +26,24 @@ def stop(*_):
         sys.exit(143)
 
 
+class Alarm(Exception):
+    pass
+
+
+def alarm(*_):
+    raise Alarm
+
+
 os.setpgid(0, 0)
 signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGALRM, alarm)
 args = [a for a in sys.argv[1:] if not a.startswith('--kill-after=')]
 child = subprocess.Popen(args[1:], close_fds=False)
 if pending_term:
     child.send_signal(signal.SIGTERM)
 try:
     rc = child.wait(timeout=float(args[0]))
-except subprocess.TimeoutExpired:
+except (subprocess.TimeoutExpired, Alarm):
     child.kill()
     child.wait()
     rc = 124

@@ -25,6 +25,9 @@ ROOT = Path.cwd()
 sys.path.insert(0, str(ROOT / "tools"))
 DUMPER = args.dumper.resolve() if args.dumper else None
 LDD = (ROOT / "tools/ref/emb2/ldd-stub.sh").read_text()
+# Every run below is waited on by its pid, and every wait for a writer's step by its file or its exit; this bound only
+# catches a hang: a bound a run must fit in reads the machine's load, not the contract.
+FAILSAFE = 120
 GGUF_STUB = ("#include <cstdint>\nstruct gguf_context;\nstruct gguf_init_params { bool no_alloc; void * ctx; };\n"
              "static gguf_context * gguf_init_from_file(const char *, gguf_init_params) { return nullptr; }\n"
              "static int64_t gguf_find_key(const gguf_context *, const char *) { return -1; }\n"
@@ -115,7 +118,7 @@ printf '%s:end\\n' "$FIXTURE_TAG" >> "$FIXTURE_EVENTS"
         ]
         write(self.root / "dump.build", "\n".join(record) + "\n")
         self.env = dict(os.environ, PATH=str(self.root / "bin") + os.pathsep + os.environ["PATH"],
-                        EMB2_BOUND="8", FIXTURE_ATTEMPT=str(self.root / "attempts"), FIXTURE_PIN=self.pin, FIXTURE_EVENTS=str(self.root / "events"))
+                        EMB2_BOUND=str(FAILSAFE), FIXTURE_ATTEMPT=str(self.root / "attempts"), FIXTURE_PIN=self.pin, FIXTURE_EVENTS=str(self.root / "events"))
         self.jobs = []
         self.addCleanup(self.stop_jobs)
 
@@ -123,7 +126,7 @@ printf '%s:end\\n' "$FIXTURE_TAG" >> "$FIXTURE_EVENTS"
         for process in self.jobs:
             if process.poll() is None:
                 process.terminate()
-            process.communicate(timeout=12)
+            process.communicate(timeout=FAILSAFE)
 
     def start(self, tag, **extra):
         env = dict(self.env, FIXTURE_TAG=tag, **extra)
@@ -134,23 +137,25 @@ printf '%s:end\\n' "$FIXTURE_TAG" >> "$FIXTURE_EVENTS"
         return process
 
     def finish(self, process, rc=0):
-        output, _ = process.communicate(timeout=12)
+        output, _ = process.communicate(timeout=FAILSAFE)
         self.assertEqual(process.returncode, rc, output)
         return output
 
-    def wait_attempt(self, tag):
-        for _ in range(200):
-            if (self.root / "attempts" / tag).exists():
-                return
+    def wait_for(self, path, process, what):
+        """Until PATH exists: a writer that ends first fails naming its rc and output, as does the failsafe."""
+        end = time.monotonic() + FAILSAFE
+        while not path.exists():
+            if process.poll() is not None:
+                self.fail(f"{what}: the writer ended rc {process.returncode} first\n{process.communicate()[0]}")
+            if time.monotonic() > end:
+                self.fail(f"{what}: not within the {FAILSAFE} s failsafe")
             time.sleep(0.02)
-        self.fail(f"{tag} did not attempt the set lock")
 
-    def wait_started(self):
-        for _ in range(200):
-            if (self.root / "events").exists():
-                return
-            time.sleep(0.02)
-        self.fail("the first writer did not reach generation")
+    def wait_attempt(self, tag, process):
+        self.wait_for(self.root / "attempts" / tag, process, f"{tag} did not attempt the set lock")
+
+    def wait_started(self, process):
+        self.wait_for(self.root / "events", process, "the first writer did not reach generation")
 
     def test_text_only_profile_refuses_tower_and_joined_steps_before_the_runner(self):
         env = os.environ.copy()
@@ -171,7 +176,7 @@ printf '%s:end\\n' "$FIXTURE_TAG" >> "$FIXTURE_EVENTS"
         with Path(str(self.final) + ".lock").open("w") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
             process = self.start("new")
-            self.wait_attempt("new")
+            self.wait_attempt("new", process)
             time.sleep(0.1)
             self.assertIsNone(process.poll())
             self.assertFalse(self.final.exists())
@@ -196,9 +201,9 @@ printf '%s:end\\n' "$FIXTURE_TAG" >> "$FIXTURE_EVENTS"
         write(self.final / "MANIFEST.tsv", "old\n")
         release = self.root / "release"
         first = self.start("first", FIXTURE_RELEASE=str(release))
-        self.wait_started()
+        self.wait_started(first)
         second = self.start("second")
-        self.wait_attempt("second")
+        self.wait_attempt("second", second)
         time.sleep(0.1)
         self.assertEqual((self.root / "events").read_text(), "first:start\n")
         self.assertEqual((self.final / "MANIFEST.tsv").read_text(), "old\n")
@@ -296,7 +301,7 @@ class Builders(unittest.TestCase):
                    BLOOMERY_DATA=str(root / "data"), CXX="c++", FIXTURE_ROOT=str(root),
                    FIXTURE_EVENTS=str(root / "events"), FIXTURE_FAIL=failure, **extra)
         result = subprocess.run(["bash", str(root / "tools/ref/emb2/audio.sh")], env=env, capture_output=True,
-                                text=True, timeout=10)
+                                text=True, timeout=FAILSAFE)
         events = (root / "events").read_text().splitlines() if (root / "events").exists() else []
         return result.returncode, result.stdout + result.stderr, events
 
@@ -429,7 +434,7 @@ class Builders(unittest.TestCase):
                            BASH_ENV=str(root / "shell-env"), VISREF_FORK_ROOT=str(root / "vision"),
                            DRAFT_IK=str(oracle))
                 result = subprocess.run(["bash", str(target)], cwd=root, env=env,
-                                        capture_output=True, text=True, timeout=10)
+                                        capture_output=True, text=True, timeout=FAILSAFE)
                 output = result.stdout + result.stderr
                 if script == "tools/ref/qvis/build-lcpp-qvis.sh":
                     output += (root / "run/log").read_text()
@@ -544,7 +549,7 @@ inline bool clip_image_batch_encode(clip_ctx * ctx, int, clip_image_f32_batch *,
                 env.update({"BLOOMERY_REF_BUILD": "6868a52cb", **extra})
                 inputs = [item for case in ([name] if isinstance(name, str) else name) for item in (case, str(mel))]
                 result = subprocess.run([str(self.bin), "projector", str(out), device, *inputs],
-                                        env=env, capture_output=True, text=True, timeout=5)
+                                        env=env, capture_output=True, text=True, timeout=FAILSAFE)
                 manifest = out / "MANIFEST.tsv"
                 if error:
                     self.assertNotEqual(result.returncode, 0)
@@ -557,7 +562,7 @@ inline bool clip_image_batch_encode(clip_ctx * ctx, int, clip_image_f32_batch *,
                     self.assertIn(f"# device\t{device}\n", manifest.read_text())
                     self.assertIn("# complete\t18\t0\n", manifest.read_text())
                     again = subprocess.run([str(self.bin), "projector", str(out), device, name, str(mel)],
-                                           env=env, capture_output=True, text=True, timeout=5)
+                                           env=env, capture_output=True, text=True, timeout=FAILSAFE)
                     self.assertNotEqual(again.returncode, 0)
                     self.assertIn("output path must be new", again.stderr)
 
@@ -573,7 +578,7 @@ class Options(unittest.TestCase):
             marker = tmp / "detached"
             write(tmp / "setsid", "#!/bin/bash\ntouch \"$FIXTURE_DETACHED\"\n", True)
             env = dict(os.environ, PATH=str(tmp) + os.pathsep + os.environ["PATH"], FIXTURE_DETACHED=str(marker))
-            result = subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True, timeout=5)
+            result = subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True, timeout=FAILSAFE)
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("build-emb2-lcpp: this recipe requires root", result.stderr)
             self.assertFalse(marker.exists())
@@ -582,12 +587,12 @@ class Options(unittest.TestCase):
     def test_thread_counts_are_checked_before_model_loading(self):
         for value in ("", "garbage", "16junk", "-1", "2147483648", "999999999999999999999999999999999"):
             with self.subTest(value=value):
-                result = subprocess.run([str(DUMPER), "text", "-t", value], capture_output=True, text=True, timeout=5)
+                result = subprocess.run([str(DUMPER), "text", "-t", value], capture_output=True, text=True, timeout=FAILSAFE)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("-t requires an integer from 0 to INT_MAX", result.stderr)
         for value in ("0", "1", "16", "2147483647"):
             with self.subTest(value=value):
-                result = subprocess.run([str(DUMPER), "text", "-t", value], capture_output=True, text=True, timeout=5)
+                result = subprocess.run([str(DUMPER), "text", "-t", value], capture_output=True, text=True, timeout=FAILSAFE)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("usage: dump_emb2", result.stderr)
                 self.assertNotIn("-t requires", result.stderr)
@@ -616,7 +621,7 @@ class Ids(unittest.TestCase):
     def read(self, data):
         path = self.tmp / "case.ids"
         path.write_bytes(data)
-        return path, subprocess.run([str(self.bin), str(path)], capture_output=True, timeout=5)
+        return path, subprocess.run([str(self.bin), str(path)], capture_output=True, timeout=FAILSAFE)
 
     def test_malformed_lines_name_the_file_and_line(self):
         for data in (b"7\n-1\n", b"7\n+1\n", b"7\n 1\n", b"7\n1 \n", b"7\n1\x002\n", b"7\n\n", b"7\n2147483648\n", b"7\n0x1\n"):

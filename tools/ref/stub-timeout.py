@@ -4,8 +4,8 @@ tools/ref/lease.sh and tools/ref/card-tests/run.sh where the host has none (the 
 coreutils' `timeout [--kill-after=K] S COMMAND...` and keeps its timing and exit codes: S 0 is no bound; otherwise at
 S seconds COMMAND's process group gets a TERM, as it does when a TERM is sent here. K seconds after the first of the
 two the group gets a KILL if COMMAND is still there (K 0 or none: no KILL). The exit is 124 when S ran out, 137 when
-KILL ends the group, else COMMAND's status (128 + the signal). The monitor leads the group and ignores its own TERM
-while forwarding it. COMMAND inherits the monitor's open descriptors, including a lease held on descriptor 9."""
+KILL ends the group, else COMMAND's status (128 + the signal). An ALRM sent here is S running out, as coreutils' timeout
+takes it. The monitor leads the group and ignores its own TERM while forwarding it. COMMAND inherits the monitor's open descriptors, including a lease held on descriptor 9."""
 import os
 import signal
 import subprocess
@@ -48,6 +48,14 @@ def on_term(*_):
 # Set before COMMAND starts, so a TERM that comes as it starts reaches its group.
 os.setpgid(0, 0)
 signal.signal(signal.SIGTERM, on_term)
+
+
+def on_alrm(*_):
+    global deadline
+    deadline = 0.0
+
+
+signal.signal(signal.SIGALRM, on_alrm)
 proc = subprocess.Popen(args[1:], close_fds=False)
 if pending:
     cleanup(signal.SIGTERM)

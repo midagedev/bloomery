@@ -355,7 +355,7 @@ bounded_bg_wait() {
 #   timeout-fork       fork-exit is the monitor that exits before it reached its command: monitor-exit; the real
 #                      timeout's own case is lease.sh's `fork` form and stack-watch.sh's fork-exit rows
 #   cleanup-status     cleanup-fail: a stop that fails is the runner's status (70), a signal's included
-#   cleanup-alive      a stop that fails with the monitor alive returns 70 within 2 s, with no wait on it
+#   cleanup-alive      a stop that fails with the monitor alive returns 70 while the monitor still lives: no wait on it
 #   stop-signal        a signal during an explicit stop's cleanup ends the runner on it once the cleanup is done
 #   output-setup       fifo-fail: a stdin or output file that cannot be opened ends the command, not the runner, and
 #                      starts nothing that outlives the call
@@ -433,7 +433,8 @@ EOF
     env GB="$gb" FORM="$form" HELD="$t/held" PIDF="$t/$tag.pid" HELD_MODE="$mode" TRAP_SH="$trp" LEASE_STOP_GRACE=4 \
       ${fwd:+CANCEL_TIMEOUT_FORWARD=$fwd} PATH="$t/bin:$PATH" bash "$runner" > "$t/$tag.out" 2>&1 &
     rp=$!
-    until { cancel_ready "$t/$tag.pid" && ready=yes; } || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
+    # Each wait for a runner's step ends on the step or on the runner's end; 1200 polls are a failsafe for a hang.
+    until { cancel_ready "$t/$tag.pid" && ready=yes; } || ! kill -0 "$rp" 2> /dev/null || [ "$i" = 1200 ]; do sleep 0.1; i=$((i + 1)); done
     check "$tag-ready" "$ready" yes
     s0=$SECONDS
     kill -TERM "$rp" 2> /dev/null
@@ -544,7 +545,7 @@ EOF
     rp=$!
     if [ "$mode" = signal ]; then
       n=0
-      until cancel_ready "$t/$tag.pid" || [ "$n" = 100 ]; do sleep 0.1; n=$((n + 1)); done
+      until cancel_ready "$t/$tag.pid" || ! kill -0 "$rp" 2> /dev/null || [ "$n" = 1200 ]; do sleep 0.1; n=$((n + 1)); done
       kill -TERM "$rp" 2> /dev/null
     fi
     RC=0
@@ -557,21 +558,23 @@ EOF
     check "$tag-left" "${left:-none}" none
     reap "$t/$tag.pid"
   done
-  # cleanup-alive: a stop that fails with the monitor still alive returns 70 within 2 s and never waits on it.
+  # cleanup-alive: a stop that fails with the monitor still alive returns 70 and never waits on it: the monitor (bound
+  # 60 s) still lives when the stop returns. A stop that waited on it would return only once it had ended; a clock on
+  # the stop would read the load (each process-table read is a fork).
   cat > "$t/alive-runner" << 'EOF'
 source "$GB"
 lease_stop() { return 70; }
 bounded_bg 60 "$HELD" "$PIDF"
 until [ -s "$PIDF" ]; do sleep 0.05; done
-s=$SECONDS rc=0
+mon=$BG_PID rc=0
 bounded_bg_stop || rc=$?
-echo "stop rc=$rc took=$((SECONDS - s))"
+echo "stop rc=$rc monitor=$(kill -0 "$mon" 2> /dev/null && echo alive || echo gone)"
 EOF
   rm -f "$t/cleanup-alive.pid" "$t/cleanup-alive.pid.gc"
   RC=0
   env GB="$self" HELD="$t/held" PIDF="$t/cleanup-alive.pid" HELD_MODE=zero LEASE_STOP_GRACE=4 CANCEL_TIMEOUT_FORWARD=1 \
     PATH="$t/bin:$PATH" bash "$t/alive-runner" > "$t/cleanup-alive.out" 2>&1 || RC=$?
-  check cleanup-alive-rc "$RC|$(grep -cE '^stop rc=70 took=[0-2]$' "$t/cleanup-alive.out")" '0|1'
+  check cleanup-alive-rc "$RC|$(grep -c '^stop rc=70 monitor=alive$' "$t/cleanup-alive.out")" '0|1'
   reap "$t/cleanup-alive.pid"
   # stop-signal: a signal that comes while an explicit stop cleans up is raised again once it is done (143, no after).
   cat > "$t/stopsig-runner" << 'EOF'
@@ -588,7 +591,7 @@ EOF
     CANCEL_TIMEOUT_FORWARD=1 PATH="$t/bin:$PATH" bash "$t/stopsig-runner" > "$t/stopsig.out" 2>&1 &
   rp=$!
   n=0
-  until [ -e "$t/stopsig.stopping" ] || [ "$n" = 100 ]; do sleep 0.1; n=$((n + 1)); done
+  until [ -e "$t/stopsig.stopping" ] || ! kill -0 "$rp" 2> /dev/null || [ "$n" = 1200 ]; do sleep 0.1; n=$((n + 1)); done
   kill -TERM "$rp" 2> /dev/null
   RC=0
   { wait "$rp" || RC=$?; } 2> /dev/null # the shell's "Terminated" notice for the killed runner
@@ -625,7 +628,7 @@ EOF
   env GB="$self" HELD="$t/held" PIDF="$t/$tag.pid" SENTINEL="$t/sentinel.pid" HELD_MODE=term LEASE_STOP_GRACE=4 bash "$t/nogroup-runner" > "$t/$tag.out" 2>&1 &
   rp=$!
   n=0
-  until [ -s "$t/$tag.pid" ] || [ "$n" = 100 ]; do sleep 0.1; n=$((n + 1)); done
+  until [ -s "$t/$tag.pid" ] || ! kill -0 "$rp" 2> /dev/null || [ "$n" = 1200 ]; do sleep 0.1; n=$((n + 1)); done
   sleep 0.2
   kill -TERM "$rp" 2> /dev/null
   RC=0

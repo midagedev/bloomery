@@ -473,7 +473,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   mp=$!
   exec 9> "$d/pipe"
   printf 'forwarded\n' >&9
-  for ((i = 0; i < 40; i++)); do [ -s "$d/forward.rc" ] && break; sleep 0.01; done
+  # The wait ends on the marker's end (its subshell writes forward.rc last); 1200 polls are a failsafe for a marker that
+  # waits on the EOF fd 9 still holds back, which then reads as waiting-or-success.
+  for ((i = 0; i < 1200; i++)); do [ -s "$d/forward.rc" ] && break; sleep 0.1; done
   r=$(cat "$d/forward.rc" 2> /dev/null)
   check marker-forward-failure "$([ -n "$r" ] && [ "$r" -ne 0 ] && echo failed || echo waiting-or-success)" failed
   exec 9>&-

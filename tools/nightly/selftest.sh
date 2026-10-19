@@ -169,13 +169,16 @@ check archive-tree-bad-rev-names-git "$r|$(ls -A "$T/arc-tmp")" "1|128|-|"
 # a child holding its output, a unit that ignores TERM), under each monitor and in both output forms. The runner holds
 # a lock on fd 9 as tools/nightly/run.sh does and traps TERM. Once the runner is done, nothing of the unit's process
 # group lives and the lock is free. The monitors: tools/ref/cancel-stubs.sh's forwarding stand-in for GNU timeout, none
-# (an empty UNIT_TIMEOUT, a host without timeout) and the host's own timeout when it has one. The bound path shortens
-# the bound and the KILL after it to 0.5 s each; with no monitor a unit has no bound.
+# (an empty UNIT_TIMEOUT, a host without timeout) and the host's own timeout when it has one. Every step is waited on by
+# an event, never a clock a loaded machine outruns: the term path TERMs the runner once the unit is ready, the bound path
+# runs out the monitor's bound then with an ALRM (GNU timeout's own; the stand-in's too) under a 60 s failsafe bound and
+# a KILL 0.5 s after, and a unit that nothing stopped ends by itself after 30 s, printing unit-survived (red); with no
+# monitor a unit has no bound.
 # shellcheck source=tools/ref/cancel-stubs.sh
 source "$ROOT/tools/ref/cancel-stubs.sh"
 mkdir "$T/ru-bin"
 cancel_timeout "$T/ru-bin/stub-timeout"
-printf '#!/bin/sh\nshift 2\nexec "$RU_MON" --kill-after=0.5 0.5 "$@"\n' > "$T/ru-bin/short"
+printf '#!/bin/sh\nshift 2\nexec "$RU_MON" --kill-after=0.5 60 "$@"\n' > "$T/ru-bin/short"
 mkdir "$T/ru-ps"
 printf '#!/bin/sh\nexit 1\n' > "$T/ru-ps/ps"
 chmod +x "$T/ru-bin/stub-timeout" "$T/ru-bin/short" "$T/ru-ps/ps"
@@ -203,19 +206,23 @@ for ru_mon in $ru_monitors; do
         unit='ps -o pgid= -p $$ > "$PIDF";'
         case $ru_left in child) unit="$unit sleep 1000 &" ;; deaf) unit="$unit trap '' TERM;" ;; esac
         unit="$unit echo unit-ready;"
-        case $ru_path in end) unit="$unit exit 3" ;; *) unit="$unit sleep 2; echo unit-survived" ;; esac
+        case $ru_path in end) unit="$unit exit 3" ;; *) unit="$unit sleep 30; echo unit-survived" ;; esac
         ru_timeout=$mon
         [ "$ru_path" != bound ] || ru_timeout=$T/ru-bin/short
         env UNITS="$HERE/units.sh" GB="$ROOT/tools/gate-bound.sh" UNIT_TIMEOUT="$ru_timeout" RU_MON="$mon" \
           CANCEL_TIMEOUT_FORWARD=1 LEASE_STOP_GRACE=3 UNIT="$unit" PIDF="$pidf" LOG="$T/$tag.log" LOCKF="$T/$tag.lock" \
           MODE="$([ "$ru_mode" = quiet ] && echo quiet)" bash "$T/ru-cell" > "$T/$tag.out" 2>&1 &
         rp=$! i=0
-        if [ "$ru_path" = term ]; then
-          until grep -qs unit-ready "$T/$tag.log" || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
-          kill -TERM "$rp"
+        if [ "$ru_path" != end ]; then
+          # ready: the unit's line in its log, or the runner gone (its output tells why); 1200 passes is the failsafe
+          until grep -qs unit-ready "$T/$tag.log" || ! cancel_alive "$rp" || [ "$i" = 1200 ]; do sleep 0.1; i=$((i + 1)); done
+          case $ru_path in
+            term) kill -TERM "$rp" ;;
+            bound) g=$(tr -d ' ' < "$pidf" 2> /dev/null) || g=''; [ -z "$g" ] || kill -ALRM "$g" 2> /dev/null ;;
+          esac
         fi
         i=0
-        while cancel_alive "$rp" && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+        while cancel_alive "$rp" && [ "$i" -lt 1200 ]; do sleep 0.1; i=$((i + 1)); done
         ! cancel_alive "$rp" || kill -KILL "$rp"
         wait "$rp"
         rc=$?
@@ -259,8 +266,9 @@ for ru_mon in $ru_monitors; do
       kill() { if [ "$1" = -KILL ]; then echo "kill: ($3) - Operation not permitted" >&2; return 1; fi; builtin kill "$@"; }
       for c in "exit 0" "exit 3"; do run_unit "sleep 1000 & echo \$! >> \"\$PIDF\"; echo x; $c" "$LOG" 60 $MODE; echo "rc=$UNIT_RC"; done' \
       > "$T/$tag.out" 2>&1 &
+    # run_unit returns at once: one that waited on the leftover child would take its 1000 s; 600 passes is the failsafe
     rp=$! i=0
-    while cancel_alive "$rp" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    while cancel_alive "$rp" && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
     r=returned
     ! cancel_alive "$rp" || { r=hung; kill -KILL "$rp"; }
     wait "$rp" 2> /dev/null

@@ -1244,12 +1244,20 @@ EOF
   # A runner that holds a lease (a temp file) runs a stub under lease_bounded and then its next arm; the
   # stub sets a trap that ends it one second after TERM, writes its pid and its parent's (its timeout) and holds.
   # A TERM to the runner's pid, sent after that PID file exists and its timeout sleeps, ends the stub, its timeout and
-  # then the runner, by the runner's own TERM trap when it set one, within seconds: the lease is free once
-  # the runner is gone and the next arm never starts. A stub still there once the checks are made is let
-  # go. Of the output only the runner's own two lines are read: the stub's /bin/sh may report its sleep
-  # ended by the group's TERM. The command reads the runner's stdin.
+  # then the runner, by the runner's own TERM trap when it set one, and not by the stub's bound (which would print its
+  # cut-off line): the lease is free once the runner is gone and the next arm never starts. A stub still there once the
+  # checks are made is let go. Of the output only the runner's own two lines are read: the stub's /bin/sh may report its
+  # sleep ended by the group's TERM. The command reads the runner's stdin.
+  # Every step below is waited on by its event (a pid file, a process state, an exit, a line), and every bound is a failsafe
+  # that catches a hang, FAILSAFE seconds: a bound a run must fit in would read the machine's load, not the contract. A
+  # bound that is itself the subject (an enclosing timeout's) runs out on an event: an ALRM to its monitor.
+  FAILSAFE=120
+  export FAILSAFE
   if command -v flock > /dev/null 2>&1; then
-    command -v timeout > /dev/null || cp "$LEASE_TREE/tools/ref/stub-timeout.py" "$t/tbin/timeout"
+    # Without a timeout the stand-in is the tree's (an ALRM to it is its bound running out, as with GNU timeout).
+    if ! command -v timeout > /dev/null; then
+      cp "$LEASE_TREE/tools/ref/stub-timeout.py" "$t/tbin/timeout" && chmod +x "$t/tbin/timeout" || exit 70
+    fi
     printf '%s\n' '#!/bin/sh' 'trap '\''trap "" TERM INT HUP; sleep 1; exit "${HELD_TERM:-7}"'\'' TERM' 'echo "$$ $PPID" > "${HELD_PID:-$1}"' 'while :; do sleep 1; done' > "$t/held"
     chmod +x "$t/held"
     printf '%s\n' '#!/bin/sh' 'trap "" TERM INT HUP' 'echo "$$ $PPID" > "$HELD_PID"' 'while :; do sleep 1; done' > "$t/held-profiler"
@@ -1326,17 +1334,19 @@ EOF
       source "$LEASE_TREE/tools/ref/cancel-stubs.sh"
       exec 9> "$2/restore-lock"
       flock -n 9 || exit 75
-      timeout --kill-after=10 60 "$2/held" "$2/restore-pid" &
+      timeout --kill-after=10 "$FAILSAFE" "$2/held" "$2/restore-pid" &
       server=$!
-      trap '\''trap "" TERM INT HUP; lease_stop "$server" || exit $?; echo server-stopped; exit 143'\'' TERM
-      # Readiness is the signal; the bound is only the hang guard: the 60 s bound of the held stub.
-      for ((i = 0; i < 600; i++)); do
+      # The handler stands for a runner whose cleanup budget is the failsafe: the stop ends when nothing of the server
+      # lives, and a machine too loaded for the root budget (9 s) must not decide whether the TERM was heard.
+      trap '\''trap "" TERM INT HUP; LEASE_STOP_GRACE=$FAILSAFE lease_stop "$server" || exit $?; echo server-stopped; exit 143'\'' TERM
+      # Readiness is the signal; the bound is only the hang guard: the failsafe bound of the held stub.
+      for ((i = 0; i < 10 * FAILSAFE; i++)); do
         cancel_ready "$2/restore-pid" && break
         sleep 0.1
       done
       cancel_ready "$2/restore-pid" || exit 70
       eval() { kill -TERM "$$"; builtin eval "$@"; }
-      run_bounded timeout --kill-after=10 60 true
+      run_bounded timeout --kill-after=10 "$FAILSAFE" true
       [ -z "$BIN_SIGNAL" ] || kill -s "$BIN_SIGNAL" "$$"
       echo next-arm
     ' _ "$LEASE_TREE/tools/ref/lease.sh" "$t" > "$t/restore-stream" 2>&1 &
@@ -1348,14 +1358,16 @@ EOF
     lease_free "$t/restore-lock" 2> /dev/null || lk=held
     check bounded-restore-lock "$lk" free
     read -r sp ip < "$t/restore-pid" || exit 70
-    check bounded-restore-server "$(kill -0 "$sp" 2> /dev/null && echo alive || echo gone)" gone
+    check bounded-restore-server "$(cancel_alive "$sp" && echo alive || echo gone)" gone
     i=0
-    until [ -s "$t/restore-eof" ] || [ "$i" = 10 ]; do sleep 0.1; i=$((i + 1)); done
+    until [ -s "$t/restore-eof" ] || [ "$i" = $((10 * FAILSAFE)) ]; do sleep 0.1; i=$((i + 1)); done
     check bounded-restore-eof "$([ -s "$t/restore-eof" ] && echo yes || echo no)" yes
     check bounded-restore-handler "$(grep -E '^(server-stopped|next-arm)$' "$t/restore-out")" server-stopped
     [ "$lk" = free ] || lease_stop "$ip" || exit 70
     wait "$reader" || exit 70
-    # An enclosing timeout must not KILL the shell before its inner group releases the lease and output.
+    # An enclosing timeout must not KILL the shell before its inner group releases the lease and output. Its bound runs out
+    # once the inner shell is ready (its trap set, its lines printed, its profiler stub waiting): the enclosing monitor, whose
+    # own bound is the failsafe, takes an ALRM as GNU timeout takes its bound running out.
     for enclosing in external owned; do
       mkdir "$t/nested-$enclosing" || exit 70
       mkfifo "$t/nested-$enclosing-stream" || exit 70
@@ -1365,8 +1377,9 @@ EOF
       bash -c '
         source "$1"
         enclosing=$2 dir=$3
-        set -- timeout --kill-after=10 3 bash -c '\''
+        set -- timeout --kill-after=10 "$FAILSAFE" bash -c '\''
           source "$1"
+          echo "$PPID" > "$2/enclosing"
           exec 9> "$2/lock"
           flock -n 9 || exit 75
           trap "echo outer-trap; exit 143" TERM
@@ -1381,19 +1394,26 @@ EOF
           }
           echo "grace=${LEASE_STOP_GRACE:-unset}"
           [ "$4" != owned ] || PATH="$2/../fork-bin:$PATH"
-          HELD_PID="$2/child" LEASE_BOUNDED_PIDFILE="$2/monitor" lease_bounded 60 "$3"
+          HELD_PID="$2/child" LEASE_BOUNDED_PIDFILE="$2/monitor" lease_bounded "$FAILSAFE" "$3"
           echo next-arm
         '\'' _ "$1" "$dir" "$4" "$enclosing"
         if [ "$enclosing" = owned ]; then run_bounded "$@"; else "$@"; fi
       ' _ "$LEASE_TREE/tools/ref/lease.sh" "$enclosing" "$t/nested-$enclosing" "$t/held-profiler" > "$t/nested-$enclosing-stream" 2>&1 &
       rp=$!
+      i=0 ready=no
+      until { cancel_ready "$t/nested-$enclosing/child" && [ -s "$t/nested-$enclosing/enclosing" ] && ready=yes; } || ! cancel_alive "$rp" || [ "$i" = $((10 * FAILSAFE)) ]; do
+        sleep 0.1
+        i=$((i + 1))
+      done
+      check "bounded-nested-$enclosing-ready" "$ready" yes
+      if [ "$ready" = yes ]; then read -r em < "$t/nested-$enclosing/enclosing" && kill -ALRM "$em"; fi
       wait "$rp" || RC=$?
       check "bounded-nested-$enclosing-rc" "$RC" 124
       lk=free
       lease_free "$t/nested-$enclosing/lock" 2> /dev/null || lk=held
       check "bounded-nested-$enclosing-lock" "$lk" free
       i=0
-      until [ -s "$t/nested-$enclosing-eof" ] || [ "$i" = 10 ]; do sleep 0.1; i=$((i + 1)); done
+      until [ -s "$t/nested-$enclosing-eof" ] || [ "$i" = $((10 * FAILSAFE)) ]; do sleep 0.1; i=$((i + 1)); done
       check "bounded-nested-$enclosing-eof" "$([ -s "$t/nested-$enclosing-eof" ] && echo yes || echo no)" yes
       check "bounded-nested-$enclosing-trap" "$(grep -E '^(outer-trap|next-arm)$' "$t/nested-$enclosing-out")" outer-trap
       check "bounded-nested-$enclosing-cleanup" "$(grep '^\[bound\].*cleanup budget' "$t/nested-$enclosing-out")" ''
@@ -1415,7 +1435,8 @@ EOF
       ' "$LEASE_TREE/tools/ref/clefvis/clefvis.sh" >> "$t/clefvis-$arm" || exit 70
       printf '%s\n' ':' 'fi' 'echo next arm' >> "$t/clefvis-$arm" || exit 70
     done
-    n=0 BOUND=20
+    # The stubs' bound is the failsafe: the TERM ends each one, and a bound that ended one is the line `bounded` prints.
+    n=0 BOUND=$FAILSAFE
     # form: the runner calls lease_bounded in its own shell (direct), or takes its output through the
     # capture helper (capture). A runner that captured it with `out=$(lease_bounded …)` is the form this
     # case was made to refuse: the stub and its timeout stay and hold the lease to their bound.
@@ -1463,46 +1484,37 @@ EOF
         rp=$!
         # Sleeping is a readiness observation, not a permanent process state.
         i=0 ready=no
-        until { cancel_ready "$t/held$n.pid" && { [ "$form" != startup ] || [ -s "$t/gap$n" ]; } && ready=yes; } || [ "$i" = 100 ]; do
+        until { cancel_ready "$t/held$n.pid" && { [ "$form" != startup ] || [ -s "$t/gap$n" ]; } && ready=yes; } || ! cancel_alive "$rp" || [ "$i" = $((10 * FAILSAFE)) ]; do
           sleep 0.1
           i=$((i + 1))
         done
         check "bounded-$form-ready${trp:+-trap}" "$ready" yes
-        s0=$SECONDS
         kill -TERM "$rp" 2> /dev/null
         [ "$form" != startup ] || { check "bounded-startup-gap${trp:+-trap}" "$(cat "$t/gap$n")" gap; touch "$t/go$n"; }
         RC=0
         wait "$rp" || RC=$?
-        ended=before
-        [ "$((SECONDS - s0))" -lt "$BOUND" ] || ended='at or after'
         left='' sp=''
         if [ -s "$t/held$n.pid" ]; then
           read -r sp ip < "$t/held$n.pid"
-          if kill -0 "$sp" 2> /dev/null; then
-            case $form in
-              *fork | profiler | clefvis-*)
-                state=$(ps -o stat= -p "$sp" 2> /dev/null) || state=''
-                case $state in '' | *Z*) ;; *) left="$left stub" ;; esac
-                ;;
-              *) left="$left stub" ;;
-            esac
-          fi
-          if kill -0 "$ip" 2> /dev/null; then left="$left timeout"; fi
+          # An ended process not yet reaped (a zombie) holds nothing.
+          ! cancel_alive "$sp" || left="$left stub"
+          ! cancel_alive "$ip" || left="$left timeout"
         fi
         [ "$form" != profiler ] || check "bounded-profiler-pid${trp:+-trap}" "$(cat "$t/held$n.pid.monitor")" "$ip"
         lk=free
         lease_free "$t/blease$n" 2> /dev/null || lk=held
         i=0
-        until [ -s "$t/beof$n" ] || [ "$i" = 10 ]; do sleep 0.1; i=$((i + 1)); done
+        until [ -s "$t/beof$n" ] || [ "$i" = $((10 * FAILSAFE)) ]; do sleep 0.1; i=$((i + 1)); done
         check "bounded-$form-eof${trp:+-trap}" "$([ -s "$t/beof$n" ] && echo yes || echo no)" yes
         cdir=$(sed -n 's/^capture dir //p' "$t/bout$n")
         logs=("$t/bout$n")
         [ "$form" != profiler ] || logs+=("$t/held$n.pid.txt")
-        OUT="stub ran: $([ -n "$sp" ] && echo yes || echo no), left:${left:- none}, lease: $lk, ended $ended the $BOUND s bound, out: [$(grep -hE '^(trap ran|next arm)$' "${logs[@]}" | tr '\n' ' ')]"
+        # The bound ending the stub is the line `bounded` prints for timeout's 124: the TERM, not the bound, ended it.
+        OUT="stub ran: $([ -n "$sp" ] && echo yes || echo no), left:${left:- none}, lease: $lk, bound: $(cat "${logs[@]}" 2> /dev/null | grep -q '^\[bound\] .* cut off at its ' && echo reached || echo not reached), out: [$(grep -hE '^(trap ran|next arm)$' "${logs[@]}" | tr '\n' ' ')]"
         cfix=''
         [ "$form" != capture ] || { cfix=', capture dir: removed'; [ -n "$cdir" ] && [ ! -e "$cdir" ] && OUT="$OUT, capture dir: removed" || OUT="$OUT, capture dir: left"; }
         check "bounded-$form-term${trp:+-trap}-rc" "$RC" 143
-        matches "bounded-$form-term${trp:+-trap}" "^stub ran: yes, left: none, lease: free, ended before the $BOUND s bound, out: \[${trp:+trap ran }\]${cfix}\$" "$OUT"
+        matches "bounded-$form-term${trp:+-trap}" "^stub ran: yes, left: none, lease: free, bound: not reached, out: \[${trp:+trap ran }\]${cfix}\$" "$OUT"
         if [ -n "$left" ]; then
           if kill -0 "$ip" 2> /dev/null; then lease_stop "$ip" || :; fi
           if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
@@ -1515,7 +1527,7 @@ EOF
     BOUND_LIB="$LEASE_TREE/tools/gate-bound.sh" HELD_PID="$t/scope.pid" bash -c "$MEM_SCOPE_SCRIPT" -- "$t/held" > "$t/scope.log" 2>&1 &
     rp=$!
     i=0 ready=no
-    until { cancel_ready "$t/scope.pid" && ready=yes; } || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
+    until { cancel_ready "$t/scope.pid" && ready=yes; } || ! cancel_alive "$rp" || [ "$i" = $((10 * FAILSAFE)) ]; do sleep 0.1; i=$((i + 1)); done
     check bounded-mem-scope-ready "$ready" yes
     kill -TERM "$rp"
     sleep 0.1
@@ -1524,7 +1536,7 @@ EOF
     wait "$rp" || RC=$?
     check bounded-mem-scope-rc "$RC" 7
     read -r sp ip < "$t/scope.pid"
-    check bounded-mem-scope-child-gone "$(kill -0 "$sp" 2> /dev/null && echo no || echo yes)" yes
+    check bounded-mem-scope-child-gone "$(cancel_alive "$sp" && echo no || echo yes)" yes
     if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
     # Cancel profiling during record, before the decoder PID is assigned and during annotate/callers;
     # failed decoders report their code and the last 20 log lines.
@@ -1641,7 +1653,7 @@ EOF
           [ "$ready" = yes ] || { cancel_ready "$pdir/record.pid" && ready=yes; }
           [ "$decoder_ready" = yes ] || { cancel_ready "$pdir/decoder.pid" && decoder_ready=yes; }
           [ "$ready" = yes ] && [ "$decoder_ready" = yes ];
-        } || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
+        } || ! cancel_alive "$rp" || [ "$i" = $((10 * FAILSAFE)) ]; do sleep 0.1; i=$((i + 1)); done
         check "bounded-perf-$phase-ready" "$ready" yes
         [ "$ready" = yes ] || sed 's/^/  err: /' "$pdir/err" >&2
         case $phase in record | fork)
@@ -1653,7 +1665,6 @@ EOF
         check "bounded-perf-$phase-lease-held" "$lk" held
         kill -TERM "$rp" 2> /dev/null
       fi
-      s0=$SECONDS
       RC=0
       wait "$rp" || RC=$?
       if [ "$decode_rc" != 0 ]; then
@@ -1665,23 +1676,20 @@ EOF
         continue
       fi
       check "bounded-perf-$phase-term-rc" "$RC" 143
-      ended=before
-      [ "$((SECONDS - s0))" -lt "$BOUND" ] || ended='at or after'
       left=''
       for child in decoder record; do
         if [ -s "$pdir/$child.pid" ]; then
           read -r sp ip < "$pdir/$child.pid"
-          if kill -0 "$sp" 2> /dev/null; then
-            state=$(ps -o stat= -p "$sp" 2> /dev/null) || state=''
-            if [ "$phase" != fork ] || [[ $state != *Z* && -n $state ]]; then left="$left $child"; fi
-          fi
-          if kill -0 "$ip" 2> /dev/null; then left="$left $child-timeout"; fi
+          # An ended process not yet reaped (a zombie) holds nothing.
+          ! cancel_alive "$sp" || left="$left $child"
+          ! cancel_alive "$ip" || left="$left $child-timeout"
         fi
       done
       lk=free
       lease_free "$pdir/lease" 2> /dev/null || lk=held
-      check "bounded-perf-$phase-term" "left:${left:- none}, lease: $lk, ended $ended the $BOUND s bound" \
-        "left: none, lease: free, ended before the $BOUND s bound"
+      # The bound ending a stub is the line `bounded` prints for timeout's 124: the TERM, not the bound, ended it.
+      check "bounded-perf-$phase-term" "left:${left:- none}, lease: $lk, bound: $(cat "$pdir/err" "$pdir/log" 2> /dev/null | grep -q '^\[bound\] .* cut off at its ' && echo reached || echo not reached)" \
+        "left: none, lease: free, bound: not reached"
       check "bounded-perf-$phase-stopped" "$(grep -c '^\[perf\] kept ' "$pdir/log")" 0
       [ "$phase" != startup ] || check bounded-perf-startup-no-perf "$([ -s "$pdir/calls" ] && echo called || echo none)" none
       # Signal only a survivor, after the assertions, including on an unfixed runner.
@@ -1696,7 +1704,7 @@ EOF
       fi
     done
     RC=0
-    lease_capture 10 sh -c 'echo out; echo err >&2; exit 3' || RC=$?
+    lease_capture "$FAILSAFE" sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-capture-rc "$RC" 3
     check bounded-capture-out "$LEASE_OUT" "$(printf 'out\nerr')"
     check bounded-capture-exit-trap "$(trap -p EXIT)" $'trap -- \'rm -rf "$t"\nlease_out_clean\' EXIT'
@@ -1731,12 +1739,12 @@ printf "%s\n" kept >> "$2"' EXIT
 RETURN_ARGS=$3.args
 set -T
 trap 'if [ "${FUNCNAME[0]}" = lease_out_init ]; then printf "%s\n" "$#" >> "$RETURN_ARGS"; fi' RETURN
-lease_capture 10 true
+lease_capture "$FAILSAFE" true
 lease_out_init
 echo "$LEASE_OUT_DIR" > "$3"
 EOF
     RC=0
-    lease_bounded 10 bash "$t/exit-trap-runner" "$LEASE_TREE/tools/ref/lease.sh" \
+    lease_bounded "$FAILSAFE" bash "$t/exit-trap-runner" "$LEASE_TREE/tools/ref/lease.sh" \
       "$t/exit-marker" "$t/exit-dir" > "$t/exit-log" 2>&1 || RC=$?
     check bounded-capture-quoted-exit-rc "$RC" 0
     check bounded-capture-quoted-exit-ran "$(cat "$t/exit-marker")" "$(printf "runner's trap\nkept")"
@@ -1747,41 +1755,41 @@ EOF
     cat > "$t/comment-exit-runner" << 'EOF'
 source "$1"
 trap 'echo runner > "$2" # trailing comment' EXIT
-lease_capture 10 true
+lease_capture "$FAILSAFE" true
 echo "$LEASE_OUT_DIR" > "$3"
 EOF
     RC=0
-    lease_bounded 10 bash "$t/comment-exit-runner" "$LEASE_TREE/tools/ref/lease.sh" \
+    lease_bounded "$FAILSAFE" bash "$t/comment-exit-runner" "$LEASE_TREE/tools/ref/lease.sh" \
       "$t/comment-marker" "$t/comment-dir" > "$t/comment-log" 2>&1 || RC=$?
     check bounded-capture-comment-exit-rc "$RC" 0
     check bounded-capture-comment-exit-ran "$(cat "$t/comment-marker")" runner
     cdir=$(cat "$t/comment-dir")
     check bounded-capture-comment-exit-clean "$([ -n "$cdir" ] && [ ! -e "$cdir" ] && echo removed || echo left)" removed
     RC=0
-    lease_capture 5 bash -c '
+    lease_capture "$FAILSAFE" bash -c '
       set -u
       source "$1"
       mktemp() { return 1; }
       rc=0
-      lease_capture 10 true || rc=$?
+      lease_capture "$FAILSAFE" true || rc=$?
       printf "rc=%s out=[%s]\n" "$rc" "$LEASE_OUT"
     ' _ "$LEASE_TREE/tools/ref/lease.sh" || RC=$?
     check bounded-capture-init-failure-rc "$RC" 0
     check bounded-capture-init-failure-output "$LEASE_OUT" 'rc=70 out=[]'
     RC=0
-    lease_filter 10 stdout "$t/filter-both" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
+    lease_filter "$FAILSAFE" stdout "$t/filter-both" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-filter-command-rc "$RC" 3
     check bounded-filter-combined-output "$(cat "$t/filter-both")" "$(printf 'out\nerr')"
     RC=0
-    lease_filter 10 stderr "$t/filter-stderr" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
+    lease_filter "$FAILSAFE" stderr "$t/filter-stderr" cat -- sh -c 'echo out; echo err >&2; exit 3' || RC=$?
     check bounded-filter-stderr-rc "$RC" 3
     check bounded-filter-stdout "$(cat "$LEASE_OUT_FILE")" out
     check bounded-filter-stderr "$(cat "$t/filter-stderr")" err
     RC=0
-    lease_filter 10 stdout "$t/filter-failed" sh -c 'cat; exit 4' -- echo out || RC=$?
+    lease_filter "$FAILSAFE" stdout "$t/filter-failed" sh -c 'cat; exit 4' -- echo out || RC=$?
     check bounded-filter-reader-rc "$RC" 4
     RC=0
-    lease_bounded 5 bash -c 'source "$1"; lease_filter 0600 stdout "$2" cat -- true' \
+    lease_bounded "$FAILSAFE" bash -c 'source "$1"; lease_filter 0600 stdout "$2" cat -- true' \
       _ "$LEASE_TREE/tools/ref/lease.sh" "$t/refused-filter" > "$t/refused-filter-log" 2>&1 || RC=$?
     check bounded-filter-refused-rc "$RC" 64
     check bounded-filter-refused-no-reader "$([ -e "$t/refused-filter" ] && echo created || echo absent)" absent
@@ -1807,13 +1815,13 @@ case $TEST_TRAP in
 esac
 saved=$(trap -p TERM)
 rc=0
-lease_filter 10 stdout "$3" cat -- true || rc=$?
+lease_filter "$FAILSAFE" stdout "$3" cat -- true || rc=$?
 echo "filter=$rc"
 [ "$(trap -p TERM)" != "$saved" ] || echo restored
 EOF
     for trp in none exit return; do
       RC=0
-      OUT=$(python3 - "$LEASE_TREE/tools/ref/lease.sh" "$t" "$trp" << 'PY'
+      OUT=$(python3 - "$LEASE_TREE/tools/ref/lease.sh" "$t" "$trp" "$FAILSAFE" << 'PY'
 import errno
 import os
 from pathlib import Path
@@ -1823,7 +1831,8 @@ import subprocess
 import sys
 import time
 
-source, root, mode = sys.argv[1:]
+source, root, mode, failsafe = sys.argv[1:]
+failsafe = float(failsafe)
 prefix = Path(root) / ("filter-" + mode)
 ready, release = Path(str(prefix) + ".ready"), Path(str(prefix) + ".release")
 fifo_link = str(prefix) + ".fifo"
@@ -1833,7 +1842,7 @@ with open(str(prefix) + ".out", "w") as output:
                                str(prefix) + ".lock", str(prefix) + ".filtered"],
                               stdout=output, stderr=subprocess.PIPE, env=env)
     try:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + failsafe
         while not ready.exists() or not ready.read_text().strip():
             if time.monotonic() >= deadline:
                 raise RuntimeError("filter reader did not reach its startup gap")
@@ -1845,7 +1854,7 @@ with open(str(prefix) + ".out", "w") as output:
         runner.send_signal(signal.SIGTERM)
         time.sleep(0.1)
         release.touch()
-        rc = runner.wait(timeout=5)
+        rc = runner.wait(timeout=failsafe)
         rc = 128 - rc if rc < 0 else rc
         try:
             os.kill(int(reader), 0)
@@ -1853,7 +1862,7 @@ with open(str(prefix) + ".out", "w") as output:
         except ProcessLookupError:
             state = "gone"
         eof = False
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + failsafe
         while time.monotonic() < deadline:
             if select.select([runner.stderr], [], [], max(0, deadline - time.monotonic()))[0]:
                 if not os.read(runner.stderr.fileno(), 4096):
@@ -1870,7 +1879,7 @@ with open(str(prefix) + ".out", "w") as output:
         release.touch()
         if runner.poll() is None:
             runner.terminate()
-            runner.wait(timeout=5)
+            runner.wait(timeout=failsafe)
         try:
             os.close(os.open(fifo_link, os.O_WRONLY | os.O_NONBLOCK))
         except OSError as error:
@@ -1900,7 +1909,7 @@ PY
               trap - DEBUG
               kill -s "$reaped_signal" $$
             fi'\'' DEBUG
-          lease_filter 5 stdout "$2" cat -- true
+          lease_filter "$FAILSAFE" stdout "$2" cat -- true
           echo NEXT_ARM_STARTED
         ' _ "$LEASE_TREE/tools/ref/lease.sh" "$t/reaped-filter" "$s" "$errexit" \
           > "$t/reaped-filter.log" 2>&1 || RC=$?
@@ -1927,14 +1936,14 @@ EOF
     chmod +x "$t/expert-bin"
     printf 'first\tstub\t1\nsecond\tstub\t2\nthird\tstub\t3\n' > "$t/expert-prompts"
     RC=0
-    lease_bounded 10 env STUB_EXPERT_BIN="$t/expert-bin" STUB_EXPERT_PROMPTS="$t/expert-prompts" \
+    lease_bounded "$FAILSAFE" env STUB_EXPERT_BIN="$t/expert-bin" STUB_EXPERT_PROMPTS="$t/expert-prompts" \
       STUB_EXPERT_CALLS="$t/expert-calls" bash "$t/expert-tree/tools/ref/$expert.sh" \
       "$t/expert-out" > "$t/expert-log" 2>&1 || RC=$?
     check expert-dump-failed-prompt-rc "$RC" 1
     check expert-dump-stops-at-failure "$(cat "$t/expert-calls")" "$(printf '1\n2')"
     check expert-dump-first-collected "$(cat "$t/expert-out/first.gen")" 'generated 7'
     matches expert-dump-names-failure '^prompt second failed$' "$(cat "$t/expert-log")"
-    check bounded-stdin "$(printf 'stdin reaches it\n' | lease_bounded 10 cat 2>&1)" 'stdin reaches it'
+    check bounded-stdin "$(printf 'stdin reaches it\n' | lease_bounded "$FAILSAFE" cat 2>&1)" 'stdin reaches it'
   else
     echo "skip lease_bounded: no flock(1) and no tools/ref/card-tests/bin/flock stand-in"
   fi
