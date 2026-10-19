@@ -1,7 +1,8 @@
 //! The server's video decode against a real ffmpeg (`just gate-serve-video`): a lossless clip whose
 //! every frame is one colour naming its index is probed, planned by two rules (a centred tick
 //! rule, a linspace rule) and decoded, and the frames that arrive are the plan's, each whole and
-//! uniform and in order, whatever the thread count. A decode past the file's end and a file that
+//! uniform and in order, whatever the thread count. A clip of two video streams decodes the first,
+//! the stream the probe measured. A decode past the file's end and a file that
 //! is no video are named errors. A 60-second 1080p H.264 clip is planned and decoded at four
 //! threads, its wall printed as a `stat` line (`docs/cards/vidcore-decode.card` predicts it).
 //! ffmpeg is a requirement of the gate, so its absence fails by name rather than skipping.
@@ -129,19 +130,8 @@ impl Sizer for Fixed {
     }
 }
 
-/// A tick rule as EmbeddingGemma 2's: one frame a second, at the middle of each second.
-const TICKS: VideoRule = VideoRule {
-    fps: (1, 1),
-    frames: (1, 32),
-    sampler: Sampler::Ticks { centred: true },
-    overflow: Overflow::Refuse,
-    temporal: 1,
-    tail: Tail::RepeatLast,
-    group_tokens: 140,
-    clip_tokens: 4480,
-    overhead: 0,
-    stamp: Stamp::None,
-};
+/// A tick rule: Gemma's, one frame a second at the middle of each second.
+const TICKS: VideoRule = vision::arch::gemma4v::VIDEO_RULE;
 
 /// A linspace rule: two frames a second spread over the clip, at most six here and 768 for the
 /// long clip, a pair of frames to a group.
@@ -235,6 +225,58 @@ fn hw_ffv1_frames_arrive_as_the_plans_indices() {
             p.indices
         );
     }
+}
+
+/// A clip with a 64×64 first video stream (red) and a 128×128 second (blue), neither flagged
+/// default, decodes the first, the stream the probe measured. ffmpeg left to itself takes the
+/// larger (a stream flagged default wins over size), and its frames, read 64×64 at a time, would
+/// be whole and uniform: only their colour tells.
+#[test]
+#[ignore = "gate: just gate-serve-video"]
+fn hw_the_decode_takes_the_stream_the_probe_measured() {
+    let decoder = decoder();
+    let dir = Dir::new("streams");
+    let path = dir.file("two.mkv");
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:size=64x64:rate=10:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:size=128x128:rate=10:duration=2",
+            "-map",
+            "0:v",
+            "-map",
+            "1:v",
+            "-c:v",
+            "ffv1",
+            "-disposition:v:0",
+            "0",
+            "-disposition:v:1",
+            "0",
+            "-default_mode",
+            "passthrough",
+        ],
+        None,
+        &path,
+    );
+    let clip = Clip::new(std::fs::read(&path).expect("the clip"), Some("mkv"));
+    let meta = decoder.probe(&clip).expect("the probe");
+    assert_eq!((meta.width, meta.height), (64, 64), "the probe's stream");
+    let frames = decode(&decoder, &clip, &meta, &[2, 9, 15], 1).expect("the decode");
+    assert_eq!(frames.len(), 3);
+    for (i, colour_seen, size) in &frames {
+        assert_eq!(size, &(64, 64), "frame {i}'s size");
+        let [r, _, b] = colour_seen.unwrap_or_else(|| panic!("frame {i} is not one colour"));
+        assert!(
+            r > 200 && b < 60,
+            "frame {i} is not the first stream's red: r {r}, b {b}"
+        );
+    }
+    println!("gate video: two streams decode the 64x64 first");
 }
 
 /// A decode that asks past the file's end is `Short`, naming the counts; a file that is no video
