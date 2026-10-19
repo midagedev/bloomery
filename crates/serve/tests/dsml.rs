@@ -780,38 +780,23 @@ fn respelled_template() -> String {
         .expect("it spells V4's tags")
 }
 
-/// A turn the model wrote, re-rendered into the history, is the prompt's prefix: the
-/// history's tags are the ones the model wrote, in the spaced spelling.
+/// A V4.1 GGUF ships V4's template (its tags have no space) but the model writes the
+/// spaced tags: served respelled, or under the V4.1 template, a call parses and the
+/// history re-renders the turn as the model wrote it, so it keeps the turn's ids.
+// PIN(2026-10-19): one gate for the spaced-history prefix; the history-only gate pinned the
+// same contract with a hand-made turn and is folded into this one.
 #[test]
 #[ignore = "gate: just gate-serve"]
-fn hw_history_renders_a_spaced_turn_as_the_model_wrote_it() {
-    let message = json!({"role": "assistant", "content": "", "tool_calls": [{
-        "id": "call_0", "type": "function", "function": {
-            "name": "write",
-            "arguments": r#"{"file_path":"hello.txt","content":"hi\n"}"#,
-        },
-    }]});
+fn hw_a_respelled_template_serves_the_models_spelling() {
     for (what, template) in [
         ("the V4 template respelled", respelled_template()),
         ("the V4.1 template", V41_SPACED_TEMPLATE.to_owned()),
     ] {
-        let addr = start_templated(Box::new(ScriptedEngine::new(4096, "")), &template);
-        assert_history_reuses(what, addr, &write_tools(), &message, V41_CALL);
+        let addr = start_templated(Box::new(ScriptedEngine::new(4096, V41_CALL)), &template);
+        let tools = write_tools();
+        let message = answered(addr, &tools);
+        assert_history_reuses(what, addr, &tools, &message, V41_CALL);
     }
-}
-
-/// A V4.1 GGUF ships V4's template (its tags have no space) but the model writes the
-/// spaced tags: served respelled, a call parses and the history keeps the turn's ids.
-#[test]
-#[ignore = "gate: just gate-serve"]
-fn hw_a_respelled_template_serves_the_models_spelling() {
-    let addr = start_templated(
-        Box::new(ScriptedEngine::new(4096, V41_CALL)),
-        &respelled_template(),
-    );
-    let tools = write_tools();
-    let message = answered(addr, &tools);
-    assert_history_reuses("served", addr, &tools, &message, V41_CALL);
 }
 
 /// A V4 file's template is served as it is: its calls parse and its history keeps the
@@ -857,6 +842,12 @@ fn hw_respell_is_the_released_template_and_back() {
     // template whose tags the model does not write served as if they were.
     let odd = "{{- '<' ~ '｜DSML｜' ~ 'tool_calls>' }}";
     let e = respell(odd, Spelling::Spaced).expect_err("refused");
+    assert!(e.0.contains("cannot respell"), "{}", e.0);
+    // One tag built in another form: the rest respells, and that tag would be left joined.
+    // Refused by name, not served half respelled.
+    let partial = V41_TEMPLATE.replace("dsml_token + 'invoke", "dsml_token ~ 'invoke");
+    assert_ne!(partial, V41_TEMPLATE, "the fixture builds invoke tags");
+    let e = respell(&partial, Spelling::Spaced).expect_err("a partial respelling is refused");
     assert!(e.0.contains("cannot respell"), "{}", e.0);
 }
 

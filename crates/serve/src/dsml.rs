@@ -125,11 +125,20 @@ pub fn respell(source: &str, to: Spelling) -> Result<Option<String>, TemplateErr
         Spelling::Spaced => (0, 1),
         Spelling::Joined => (1, 0),
     };
+    // Every use of the token must be one this rewrites: what is left once the token's
+    // definition and the rewritten forms are taken out names it nowhere, so no tag is left
+    // in the other spelling.
+    let mut unread = source.replace(format!("set dsml_token = '{DSML}'").as_str(), "");
     let mut out = source.to_owned();
     for pair in RESPELL {
+        unread = unread.replace(pair[from], "");
         out = out.replace(pair[from], pair[into]);
     }
-    if out == source || Spelling::of_template(&out) != to {
+    if unread.contains("dsml_token")
+        || unread.contains(DSML)
+        || out == source
+        || Spelling::of_template(&out) != to
+    {
         return Err(TemplateError(format!(
             "the chat template spells its DSML tags in a form this server cannot respell as {to:?}"
         )));
