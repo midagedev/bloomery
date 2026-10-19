@@ -8,7 +8,8 @@
 # 358a420e (`just build-mc47-lcpp`, the tree with `minicpmv4_7`) into dump_mtmd_mc47. EmbeddingGemma 2's seat (gemma-embedding2)
 # links the profile's DUMPER, tools/ref/emb2/dump_emb2.cpp, against mainline 6868a52cb (`just build-emb2-lcpp`) into dump_emb2. The
 # post-decode callback of the helper changed with that tree's header (mtmd_helper_embd_batch): the build defines
-# DUMP_MTMD_EMBD_BATCH when the header has it and the source reads it.
+# DUMP_MTMD_EMBD_BATCH when the header has it and the source reads it; the rendered prompt of the chat template became parts
+# (common_chat_prompt) in the MiMo tree (cd0a5b6a1): DUMP_MTMD_CHAT_PROMPT_PARTS.
 #
 # The tree is checked, not trusted: no tracked change (a hand edit there would reach the oracle under the commit's name). Its build
 # is the one the depth runners time; this links against it and builds nothing in it.
@@ -61,6 +62,9 @@ H_SHA=$(cat "$LCPP/tools/mtmd/mtmd.h" "$LCPP/tools/mtmd/mtmd-helper.h" | sha256s
 defs=()
 if grep -q DUMP_MTMD_EMBD_BATCH "$SRC" && grep -q 'struct mtmd_helper_embd_batch' "$LCPP/tools/mtmd/mtmd-helper.h"; then
   defs+=(-DDUMP_MTMD_EMBD_BATCH)
+fi
+if grep -q '^struct common_chat_prompt {' "$LCPP/common/chat.h" 2> /dev/null; then
+  defs+=(-DDUMP_MTMD_CHAT_PROMPT_PARTS)
 fi
 incs=(-I"$LCPP/include" -I"$LCPP/ggml/include" -I"$LCPP/tools/mtmd")
 links=(-lmtmd -lllama -lggml -lggml-base)

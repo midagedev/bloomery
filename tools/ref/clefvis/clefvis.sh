@@ -24,6 +24,8 @@
 # are the profile's CASES file.
 #
 #   clefvis.sh [--cpu-twin] [SET...]   the sets named by their base names (every set of the kind when none)
+#   clefvis.sh --cpu [SET...]          a CPU-only seat's sets (profile CPU_ONLY=1: the oracle tree has no CUDA backend, so the CPU run is
+#                                      the base set; no card lock, no twin)
 #   clefvis.sh --ids                   the ids of every request (CPU only, no card lock)
 #   clefvis.sh --ref-d [--reps N]      set D: the release's answers to the requests on the A6000 (Clef only; BLOOMERY_CARD=a6000)
 #
@@ -49,7 +51,7 @@ set -euo pipefail
 REAL=$(readlink -f "${BASH_SOURCE[0]}")
 HERE=$(cd "$(dirname "$REAL")/../../.." && pwd)
 cd "$HERE"
-if [ "$(basename "${BASH_SOURCE[0]}")" != clefvis_dump ] && [ "${1:-}" != --ids ] && [ "${1:-}" != --cpu-twin ]; then
+if [ "$(basename "${BASH_SOURCE[0]}")" != clefvis_dump ] && [ "${1:-}" != --ids ] && [ "${1:-}" != --cpu-twin ] && [ "${1:-}" != --cpu ]; then
   mkdir -p target/release
   ln -sf ../../tools/ref/clefvis/clefvis.sh target/release/clefvis_dump
   # box.sh's BLOOMERY_CARD=a6000|both names the card; under its 3090 pin the runner takes whichever card is idle
@@ -167,8 +169,18 @@ case ${1:-} in
   --ref-d) shift; ref_d "$@"; exit $? ;;
 esac
 
-twin=0
-if [ "${1:-}" = --cpu-twin ]; then twin=1; shift; fi
+twin=0 cpu_base=0
+case ${1:-} in
+  --cpu-twin) twin=1; shift ;;
+  --cpu) cpu_base=1; shift ;;
+esac
+if [ "$CPU_ONLY" = 1 ]; then
+  [ "$twin" = 0 ] || { echo "clefvis.sh: this seat's oracle tree has no CUDA backend: its base sets are the CPU run, there is no twin (use --cpu)" >&2; exit 64; }
+  [ "$cpu_base" = 1 ] || { echo "clefvis.sh: this seat's sets come from the CPU run: pass --cpu (just dump-ref-mimovis)" >&2; exit 64; }
+elif [ "$cpu_base" = 1 ]; then
+  echo "clefvis.sh: --cpu is the CPU-only seats' run (profile CPU_ONLY=1); this seat's CPU run is --cpu-twin" >&2
+  exit 64
+fi
 check_inputs
 fixture_args
 
@@ -191,11 +203,12 @@ if [ "${#SETS[@]}" -gt 0 ]; then
 fi
 
 export BLOOMERY_REF_BUILD=$BUILD_COMMIT
-if [ "$twin" = 1 ]; then
+if [ "$twin" = 1 ] || [ "$cpu_base" = 1 ]; then
   device=cpu
   where=(--cpu -t "$THREADS")
   run=(env CUDA_VISIBLE_DEVICES=)
-  suffix=.cpu
+  suffix=
+  [ "$twin" = 0 ] || suffix=.cpu
 else
   device=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "${CUDA_VISIBLE_DEVICES:-0}" | head -n 1)
   where=(-ngl 99)
@@ -224,7 +237,7 @@ if [ "$tower" = 1 ]; then
   rm -rf "$taps.staging" "$pre.staging"
   pre_args=() tap_args=()
   [ "$twin" = 1 ] || [ "$PREPROC" != 1 ] || pre_args=(--out-preproc "$pre.staging")
-  [ "$FAMILY" != qvis ] || tap_args=(--taps final) # mcvis: every tile's full taps
+  [ "$FAMILY" != qvis ] || tap_args=(--taps "$TAPS") # mcvis: every tile's full taps
   SECONDS=0
   if lease_bounded "$BOUND" "${run[@]}" "$BIN" tower --mmproj "$MMPROJ" -m "$TEXT" --mmproj-sha256 "$MMPROJ_SHA256" \
       --card "$device" "${img_args[@]}" "${pre_args[@]}" "${tap_args[@]}" "${tower_seat_args[@]}" --out-taps "$taps.staging" "${where[@]}"; then

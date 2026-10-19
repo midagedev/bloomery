@@ -1,0 +1,11 @@
+# name	w	h	branch of mtmd nemotron_omni preprocessing (align 32, 262144..3407872 pixels = 256..3328 tokens, a direct bicubic resize, no pad); the file is images/<name>.png
+# The nemotron_h_moe seat's tower arm follows this file. The sizes and token counts below are derived from the preprocess source (calc_size_preserved_ratio); the set's own `# image` lines are the measured ones.
+free-640x480	640	480	in the budget and a multiple of 32: 20x15 = 300 tokens, no resize (the image the tower gate's op rules run on)
+free-1024x768	1024	768	in the budget and a multiple of 32: 32x24 = 768 tokens, no resize
+free-448x448	448	448	below min_pixels (196 tokens): scaled up to 512x512, 16x16 = 256 tokens, bicubic up
+min-96x64	96	64	far below min_pixels: scaled up to 640x448, 20x14 = 280 tokens, bicubic up by 6.5 and 7
+small-200x200	200	200	below min_pixels at the edge of the float rule: 200 * sqrt(262144 / 40000) is 512 in the reals, the plan is the f32 rule's
+pad-1000x700	1000	700	aligns to 992x704, 31x22 = 682 tokens: stretched to the plan, nothing is padded
+pad-777x513	777	513	aligns to 768x512, 24x16 = 384 tokens: stretched to the plan, nothing is padded
+strip-1000x1	1000	1	below min_pixels, one row: scaled up to 16192x32, 506x1 = 506 tokens, the extreme aspect (2x1012 patches)
+max-2600x1800	2600	1800	above max_pixels: scaled down to 2208x1536, 69x48 = 3312 tokens (the budget's cap); embd only in the taps set

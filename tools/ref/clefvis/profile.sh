@@ -13,6 +13,8 @@
 #   minicpmv47 MiniCPM-V 4.7      sets ref_minicpmv47_vis_*      mainline 358a420ec (MC47_LCPP), the tower arm only
 #   gemma-embedding2  EmbeddingGemma 2  sets ref_gemma_embedding2_*  mainline 6868a52cb (the model profile's LCPP), dumped by
 #                                 tools/ref/emb2/emb2.sh; build-clefvis.sh builds its binary, clefvis.sh refuses the seat
+#   nemotron_h_moe  Nemotron 3.5 Bolt  sets ref_nemotron_h_moe_vis_*  mainline cd0a5b6a1 (L5_LCPP), a CPU build: the sets are the CPU run,
+#                                 the tower arm only (preproc and taps)
 #
 # The row is picked by BLOOMERY_MODEL, the model profile's name: MiniCPM-V 4.7's text profile (models/minicpmv47.sh) is a
 # qwen35moe file and says MODEL_NAME=qwen35moe, which is Qwen3.6's row. The Qwen seats and the GLM seat share the mainline tree
@@ -49,6 +51,9 @@
 #                   node: the graph node through cb_eval (Qwen3.8: qwen4exp's n_embd_out is hc * n_embd, so mainline's embedding
 #                   extraction reads past result_norm). A node-read set says `# rows_from node`; asking for a node splits the
 #                   scheduler's graph, so its rows differ from the embeddings' by rounding
+#   CPU_ONLY        1: the oracle tree has no CUDA backend, so the base sets are written by the CPU run (`clefvis.sh --cpu`, no
+#                   card lock, no twin); 0: the base sets are the card run and `--cpu-twin` writes the twin
+#   TAPS            the tower arm's taps of a qvis-family seat: final (the output end) or full (the seat's per-block nodes)
 #   THREADS         the CPU threads of a card run's host-side experts and of the twin
 #
 # SC2034: every name here is read by the files that source this one.
@@ -56,10 +61,13 @@
 : "${QVIS_LCPP:=/home/user/llama.cpp-36a73916}"
 # MiniCPM-V 4.7's tree: mainline at 358a420e (just build-mc47-lcpp), the first one this seat's sets were dumped from
 : "${MC47_LCPP:=/home/user/llama.cpp-358a420e}"
+# The nemotron_h_moe profile's tree: mainline at cd0a5b6a1 (a CPU build; its `nemotron_omni` projector, the RADIO tower of Nemotron
+# 3.5 Bolt, is in mainline from that commit)
+: "${L5_LCPP:=/home/user/llama.cpp-mainline-bolt}"
 DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 # CLEFVIS_OUT moves the binary's directory, as build-clefvis.sh reads it (a scratch build under test).
 BINDIR=${CLEFVIS_OUT:-$DATA/bin}
-NCMOE_A6000=0 NCMOE_3090=0 ROWS_FROM=embd THREADS=16 CASES=tools/ref/clefvis/cases.tsv REQUESTS=
+NCMOE_A6000=0 NCMOE_3090=0 ROWS_FROM=embd THREADS=16 CASES=tools/ref/clefvis/cases.tsv REQUESTS= CPU_ONLY=0 TAPS=final
 PREPROC=0 ARMS="hidden prose bf16rows" IMAGES_EXTRA="" IMAGE_PAD_ID="" RESPELL_SOURCE="" SEAT="" IMAGES_LIST=tools/ref/clefvis/images.tsv STAGE_NAME=""
 DUMPER=tools/ref/clefvis/dump_mtmd.cpp
 case ${BLOOMERY_MODEL:-} in
@@ -134,8 +142,21 @@ case ${BLOOMERY_MODEL:-} in
     # the model profile names the files, their digests, the tree and the steps; emb2.sh writes the sets
     FAMILY=emb2 SETPFX=ref_${MODEL_NAME//-/_} ORACLE=$LCPP BIN=$BINDIR/dump_emb2 DUMPER=tools/ref/emb2/dump_emb2.cpp
     ;;
+  nemotron_h_moe)
+    # The RADIO tower of Bolt's mmproj (mtmd's `nemotron_omni`: patch 16, merge 2, align 32, an image 262,144 to 3,407,872 pixels,
+    # normal positions, the image token `<image>`, id 18). The text model is read for its vocabulary only (the tower arm), so the
+    # 24 GB file is not loaded; the oracle tree is a CPU build, so the sets are the CPU run (CPU_ONLY) and the tower arm taps the
+    # per-block nodes (TAPS=full). The sets: preproc and taps; the prompt arms are the media round's.
+    FAMILY=qvis CPU_ONLY=1 TAPS=full PREPROC=1 ARMS="" SEAT=nemotron_omni SETPFX=ref_nemotron_h_moe_vis ORACLE=$L5_LCPP BIN=$BINDIR/dump_mtmd_l5
+    IMAGE_PAD_ID=18 STAGE_NAME=nemotron_h_moe REF=${BOLTVIS_REF:-$DATA/qvis/nemotron_h_moe}
+    MMPROJ=/models/nemotron-3.5-bolt/mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf
+    MMPROJ_SHA256=0ee891eadc7bf0cae6289b249c74eb1ef420534351f6ef8b64d49f0ca6a926b0
+    TEXT=$MODEL
+    IMAGES_LIST=${BOLTVIS_IMAGES:-tools/ref/clefvis/images-bolt.tsv}
+    THREADS=${BOLTVIS_THREADS:-16}
+    ;;
   *)
-    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${BLOOMERY_MODEL:-}' (qwen35, qwen35moe, qwen4exp, glm5next, minicpmv47 or gemma-embedding2)" >&2
+    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${BLOOMERY_MODEL:-}' (qwen35, qwen35moe, qwen4exp, glm5next, minicpmv47, nemotron_h_moe or gemma-embedding2)" >&2
     exit 2
     ;;
 esac

@@ -23,6 +23,11 @@
 //                   model's `<unk>`; `mrope_pos` is [4, ids], lanes t y x z, a text row fed [p p p 0] as llama_batch_allocr
 //                   expands it) and `chat` writes `canvas-chatids` (the template, then mtmd's `<image_id>N</image_id><image>`
 //                   text before each chunk). No prose, bf16 or decode arm.
+//   nemotron_omni   Nemotron 3.5 Bolt's RADIO tower: normal positions as glm5v (n_pos == n_tokens, the canvas read from `inp_raw`),
+//                   the image token `<image>`, the plan of mtmd's dyn_size (align patch_size * `clip.vision.projector.scale_factor`,
+//                   direct bicubic resize, no pad); the tower arm taps the `cb()` nodes of build_vit (`--taps full` only:
+//                   `inp_pos` and, for blocks 0, 1, 15 and 31, layer_inp_normed, Qcur, attn_out, ffn_inp, ffn_out and
+//                   layer_out, a node's rows the 10 class and register rows and then the patches).
 // A set of a Qwen seat is byte-identical to what this tool wrote before the glm5v seat existed.
 //
 //   dump_mtmd tower  --mmproj <gguf> -m <text gguf> --image <name>=<png> ... [--out-preproc <dir>] --out-taps <dir>
@@ -224,6 +229,7 @@ static const seat_t SEATS[] = {
     {"qwen3vl_merger", "<|image_pad|>", true,  false},
     {"glm5v",          "<|image|>",     false, false},
     {"minicpmv4_7",    "<unk>",         true,  true},
+    {"nemotron_omni",  "<image>",       false, false},
 };
 static const seat_t * g_seat  = nullptr;
 static int            g_align = 32;
@@ -268,16 +274,27 @@ static int64_t gguf_arr_first(const std::string & path, const std::string & key)
     return v;
 }
 
+// The side of the patch block a token merges: `clip.vision.spatial_merge_size`, or the key of a file with no such one
+// (the RADIO mmproj of nemotron_omni states it as `clip.vision.projector.scale_factor`).
+static uint32_t merge_size(const std::string & mmproj) {
+    const uint32_t m = gguf_u32_or(mmproj, "clip.vision.spatial_merge_size", 0);
+    return m ? m : gguf_u32(mmproj, "clip.vision.projector.scale_factor");
+}
+
 static void select_seat(const std::string & mmproj, const std::string & requested) {
     const std::string proj = gguf_str(mmproj, "clip.projector_type", true);
     for (const seat_t & s : SEATS) {
         if (proj == s.projector) g_seat = &s;
     }
-    if (!g_seat) DIE("%s: no seat for the projector '%s' (qwen3vl_merger, glm5v or minicpmv4_7)", mmproj.c_str(), proj.c_str());
+    if (!g_seat) {
+        std::string known;
+        for (const seat_t & s : SEATS) known += (known.empty() ? "" : ", ") + std::string(s.projector);
+        DIE("%s: no seat for the projector '%s' (%s)", mmproj.c_str(), proj.c_str(), known.c_str());
+    }
     if (!requested.empty() && requested != g_seat->projector) {
         DIE("%s: the projector is '%s', this run was handed the seat '%s'", mmproj.c_str(), proj.c_str(), requested.c_str());
     }
-    if (!g_seat->mrope) g_align = (int) (gguf_u32(mmproj, "clip.vision.patch_size") * gguf_u32(mmproj, "clip.vision.spatial_merge_size"));
+    if (!g_seat->mrope) g_align = (int) (gguf_u32(mmproj, "clip.vision.patch_size") * merge_size(mmproj));
 }
 
 // mtmd's position type comes from the text model's rope; it must be the one the seat's projector lays its rows out for.
@@ -455,7 +472,7 @@ static void seat_lines(set_writer & w, const std::string & text_model, const std
     }
     if (g_seat->mrope) return;
     w.line(std::string("# projector\t") + g_seat->projector + "\tpatch_size " + std::to_string(gguf_u32(mmproj, "clip.vision.patch_size")) +
-           "\tspatial_merge_size " + std::to_string(gguf_u32(mmproj, "clip.vision.spatial_merge_size")) + "\talign " + std::to_string(g_align) +
+           "\tspatial_merge_size " + std::to_string(merge_size(mmproj)) + "\talign " + std::to_string(g_align) +
            "\timage_min_pixels " + std::to_string(gguf_u32(mmproj, "clip.vision.image_min_pixels")) + "\timage_max_pixels " +
            std::to_string(gguf_u32(mmproj, "clip.vision.image_max_pixels")));
     if (!g_fixture_line.empty()) w.line(g_fixture_line);
@@ -509,6 +526,12 @@ static void image_lines(set_writer & w, const std::vector<image_info> & infos) {
 
 static const int TAP_BLOCKS[] = {0, 1, 13, 26};
 static const char * TAP_NODES[] = {"ln1", "Qcur_rope", "attn_out", "ffn_inp", "ffn_out", "layer_out"};
+// The nemotron_omni seat's nodes: `inp_pos` (the patch conv plus the resized position table, before the prefix rows join), and
+// of blocks 0, 1, 15 and 31 the `cb()` names build_vit gives every block (a block's carry `-<block>`; the stream is the 10
+// prefix rows followed by the patches).
+static const int BOLT_TAP_BLOCKS[] = {0, 1, 15, 31};
+static const char * BOLT_TAP_NODES[] = {"layer_inp_normed", "Qcur", "attn_out", "ffn_inp", "ffn_out", "layer_out"};
+static bool is_bolt() { return g_seat && strcmp(g_seat->projector, "nemotron_omni") == 0; }
 
 static int run_tower(const std::string & mmproj, const std::string & text_model, const std::vector<image_arg> & images,
                      const std::string & out_pre, const std::string & out_taps, bool cpu, int threads, int min_tokens,
@@ -537,7 +560,11 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
     std::vector<image_info> infos;
     std::string effect;
     std::vector<std::string> wanted;
-    if (g_seat->mrope) {
+    if (is_bolt()) {
+        if (taps_final) DIE("--taps final is the output-end taps of the Qwen and GLM seats; the %s seat taps its blocks: --taps full", g_seat->projector);
+        wanted.push_back("inp_pos");
+        for (int b : BOLT_TAP_BLOCKS) for (const char * n : BOLT_TAP_NODES) wanted.push_back(std::string(n) + "-" + std::to_string(b));
+    } else if (g_seat->mrope) {
         if (!taps_final) wanted.push_back("inp_pos_emb");
         wanted.push_back("norm_b-27");
         if (!taps_final) for (int b : TAP_BLOCKS) for (const char * n : TAP_NODES) wanted.push_back(std::string(n) + "-" + std::to_string(b));
@@ -626,7 +653,8 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
                               : "# taps\tvit_out after_fc_proj after_ffn_proj of every image; embd (the clean pass)");
     } else {
         tw.line("# tap_patches\t" + std::to_string(tap_patches));
-        tw.line("# taps\tblocks 0,1,13,26 of ln1 Qcur_rope attn_out ffn_inp ffn_out layer_out; inp_pos_emb; norm_b-27 (the post-LN output); embd (the clean pass)");
+        tw.line(is_bolt() ? "# taps\tinp_pos; blocks 0,1,15,31 of layer_inp_normed Qcur attn_out ffn_inp ffn_out layer_out (10 prefix rows, then the patches); embd (the clean pass)"
+                          : "# taps\tblocks 0,1,13,26 of ln1 Qcur_rope attn_out ffn_inp ffn_out layer_out; inp_pos_emb; norm_b-27 (the post-LN output); embd (the clean pass)");
     }
     image_lines(tw, infos);
     for (size_t p = 0, q; p < effect.size(); p = q + 1) {
@@ -1637,7 +1665,11 @@ static int run_chat(const std::string & mmproj, const std::string & text_model, 
             inputs.continue_final_message = COMMON_CHAT_CONTINUATION_AUTO;
             inputs.add_generation_prompt = false;
         }
+#ifdef DUMP_MTMD_CHAT_PROMPT_PARTS
+        const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt.str(); // the prompt is parts: template and user input
+#else
         const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+#endif
 
         std::vector<mtmd_bitmap *> bms;
         std::vector<std::string> rgb_sha, png_sha;

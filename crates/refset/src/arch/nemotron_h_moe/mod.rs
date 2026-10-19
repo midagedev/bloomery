@@ -4,6 +4,10 @@
 //! Nano's ids without the leading BOS. ik has no `nemotron_h_moe`. The fixture tier's mirror is in [`fixture`].
 
 pub mod fixture;
+pub mod vis;
+
+#[cfg(test)]
+mod vis_tests;
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
@@ -40,7 +44,7 @@ pub static LOGITS: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&LOGITS, &fixture::LOGITS];
+pub static FAMILIES: &[&Family] = &[&LOGITS, &fixture::LOGITS, &vis::PREPROC, &vis::TAPS];
 
 #[cfg(test)]
 mod tests {

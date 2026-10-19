@@ -112,6 +112,10 @@ pub enum ProjectorKind {
     /// mtmd's `glm5v`: patch-size times merge-size pixel tokens (the line states them), normal positions, the
     /// `vit_out` / `after_fc_proj` / `after_ffn_proj` output end.
     Glm5v,
+    /// mtmd's `nemotron_omni` (Nemotron 3.5 Bolt's RADIO tower): patch-size times merge-size pixel tokens, normal positions,
+    /// no output-end nodes but [`EMBD`]; a tower tapped in full holds [`RADIO_POS`] and the `cb()` nodes of
+    /// [`RADIO_TAP_BLOCKS`], whose rows are the class and register rows ([`RADIO_PREFIX_ROWS`]) and then the patches.
+    NemotronOmni,
 }
 
 /// How the decoder numbers the rows of a prompt.
@@ -140,6 +144,7 @@ impl ProjectorKind {
         match self {
             ProjectorKind::Qwen3vlMerger => "qwen3vl_merger",
             ProjectorKind::Glm5v => "glm5v",
+            ProjectorKind::NemotronOmni => "nemotron_omni",
         }
     }
 
@@ -148,7 +153,7 @@ impl ProjectorKind {
     pub fn positions(self) -> PositionKind {
         match self {
             ProjectorKind::Qwen3vlMerger => PositionKind::Mrope,
-            ProjectorKind::Glm5v => PositionKind::Normal,
+            ProjectorKind::Glm5v | ProjectorKind::NemotronOmni => PositionKind::Normal,
         }
     }
 
@@ -157,6 +162,7 @@ impl ProjectorKind {
         match self {
             ProjectorKind::Qwen3vlMerger => "<|image_pad|>",
             ProjectorKind::Glm5v => "<|image|>",
+            ProjectorKind::NemotronOmni => "<image>",
         }
     }
 
@@ -166,12 +172,27 @@ impl ProjectorKind {
         match self {
             ProjectorKind::Qwen3vlMerger => &[POST_LN],
             ProjectorKind::Glm5v => &[VIT_OUT, AFTER_FC_PROJ, AFTER_FFN_PROJ],
+            ProjectorKind::NemotronOmni => &[],
         }
     }
 
     /// Whether the layout's dump taps inside the tower ([`TapScope::Full`], [`TapScope::EmbdOnly`]) as well as its output end.
     fn taps_inside(self) -> bool {
-        self == ProjectorKind::Qwen3vlMerger
+        matches!(
+            self,
+            ProjectorKind::Qwen3vlMerger | ProjectorKind::NemotronOmni
+        )
+    }
+
+    /// The nodes of a tower tapped [`TapScope::Full`] besides [`EMBD`], in the order the dump writes them: [`tap_names`] for
+    /// the `qwen3vl_merger` layout, [`radio_tap_names`] for `nemotron_omni`; none for a layout tapped at its output end only.
+    #[must_use]
+    pub fn full_taps(self) -> Vec<String> {
+        match self {
+            ProjectorKind::Qwen3vlMerger => tap_names(),
+            ProjectorKind::NemotronOmni => radio_tap_names(),
+            ProjectorKind::Glm5v => Vec::new(),
+        }
     }
 }
 
@@ -267,6 +288,41 @@ pub fn tap_names() -> Vec<String> {
     let mut v = vec![POS_EMB.to_string(), POST_LN.to_string()];
     for b in TAP_BLOCKS {
         v.extend(TAP_NODES.iter().map(|n| format!("{n}-{b}")));
+    }
+    v
+}
+
+/// The blocks whose nodes the `nemotron_omni` layout's set B taps.
+pub const RADIO_TAP_BLOCKS: [u32; 4] = [0, 1, 15, 31];
+
+/// The nodes tapped in each of [`RADIO_TAP_BLOCKS`], the names `build_vit` gives them (`<node>-<block>`): the block's first norm,
+/// the query, the attention output (after the output projection, before the residual), the stream after the attention, the MLP
+/// output and the block's output.
+pub const RADIO_TAP_NODES: [&str; 6] = [
+    "layer_inp_normed",
+    "Qcur",
+    "attn_out",
+    "ffn_inp",
+    "ffn_out",
+    "layer_out",
+];
+
+/// The `nemotron_omni` tower's patch embedding plus the resized position table, before the class and register rows join.
+pub const RADIO_POS: &str = "inp_pos";
+
+/// The class and register rows the `nemotron_omni` tower puts before the patches; a block node holds them and the patches.
+pub const RADIO_PREFIX_ROWS: u64 = 10;
+
+/// The width of the `nemotron_omni` tower's rows (the encoder file's embedding length).
+pub const RADIO_WIDTH: u64 = 1280;
+
+/// The nodes set B holds for a `nemotron_omni` image tapped in full, in the order the dump wrote them: [`RADIO_POS`], then each
+/// block's [`RADIO_TAP_NODES`].
+#[must_use]
+pub fn radio_tap_names() -> Vec<String> {
+    let mut v = vec![RADIO_POS.to_string()];
+    for b in RADIO_TAP_BLOCKS {
+        v.extend(RADIO_TAP_NODES.iter().map(|n| format!("{n}-{b}")));
     }
     v
 }
@@ -926,6 +982,15 @@ impl ClefvisSet {
     /// layout tapped at its output end only refuses the other scopes by name.
     fn tap_nodes(&self, image: &str) -> Result<Vec<String>, RefError> {
         let scope = self.tap_effect_of(image)?.scope;
+        if scope == TapScope::Final && self.projector.kind.final_taps().is_empty() {
+            return Err(RefError::malformed(
+                At(&self.man.dir),
+                format!(
+                    "{image}: taps final, a {} tower has no output-end nodes: it is tapped in full or its embeddings only",
+                    self.projector.kind.as_str()
+                ),
+            ));
+        }
         if scope != TapScope::Final && !self.projector.kind.taps_inside() {
             let how = match scope {
                 TapScope::Full => "full",
@@ -942,7 +1007,7 @@ impl ClefvisSet {
             ));
         }
         Ok(match scope {
-            TapScope::Full => tap_names(),
+            TapScope::Full => self.projector.kind.full_taps(),
             TapScope::Final => self
                 .projector
                 .kind
@@ -972,6 +1037,17 @@ impl ClefvisSet {
             (ProjectorKind::Glm5v, _) => (
                 ne == [n_embd, tokens, 1, 1],
                 format!("want [{n_embd}, {tokens}, 1, 1]"),
+            ),
+            (ProjectorKind::NemotronOmni, RADIO_POS) => (
+                ne == [RADIO_WIDTH, patches, 1, 1],
+                format!("want [{RADIO_WIDTH}, {patches}, 1, 1]"),
+            ),
+            (ProjectorKind::NemotronOmni, _) => (
+                ne.iter().product::<u64>() == RADIO_WIDTH * (patches + RADIO_PREFIX_ROWS),
+                format!(
+                    "want {RADIO_WIDTH} values for each of the {} rows ({RADIO_PREFIX_ROWS} prefix rows and {patches} patches)",
+                    patches + RADIO_PREFIX_ROWS
+                ),
             ),
         };
         if ok {
@@ -1222,9 +1298,10 @@ fn read_projector(man: &RefManifest) -> Result<Option<Projector>, RefError> {
     let kind = match f[0] {
         "qwen3vl_merger" => ProjectorKind::Qwen3vlMerger,
         "glm5v" => ProjectorKind::Glm5v,
+        "nemotron_omni" => ProjectorKind::NemotronOmni,
         other => {
             return Err(bad(&format!(
-                "{other:?} is neither qwen3vl_merger nor glm5v"
+                "{other:?} is none of qwen3vl_merger, glm5v and nemotron_omni"
             )));
         }
     };
@@ -1562,7 +1639,8 @@ pub(crate) mod testkit;
 /// text model; the card's sets of each kind and the CPU twins the recipe writes sit in one family, the chat ids (no
 /// card, no twin) too. The invoking module names the seat's [`Profile`], architecture, mainline build and the two files
 /// as functions. A Qwen seat's invocation holds the six kinds its dumps write; a seat names its `kinds` when it holds
-/// others (`preproc`, `taps`, `hidden`, `prose`, `bf16rows`, `chatids`, `decode`). `recipe` is the command that
+/// others (`preproc`, `taps`, `hidden`, `prose`, `bf16rows`, `chatids`, `decode`; `taps_cpu_only` for a seat dumped by a CPU
+/// build, whose base set is the CPU run and has no twin). `recipe` is the command that
 /// writes the seat's sets, as a set's line of the recipe completes it.
 macro_rules! vis_families {
     (
@@ -1617,6 +1695,21 @@ macro_rules! vis_families {
                 $prefix,
                 "_taps"
             ),
+            identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::Taps, &$profile),
+            arch: Some($crate::clefvis::TOWER_ARCH),
+            build: Some($crate::family::Build::Is($build)),
+            runs: Some($mmproj),
+            draft_runs: None,
+            consumers: &[],
+        };
+    };
+    (@taps_cpu_only $recipe:literal, $prefix:literal, $name:literal, $profile:expr, $arch:expr, $build:expr, $mmproj:expr, $text:expr) => {
+        /// Set B of a seat whose oracle tree is a CPU build: the base set is the CPU run, so the family holds no `.cpu` twin.
+        pub static TAPS: $crate::family::Family = $crate::family::Family {
+            name: concat!($name, "-taps"),
+            sets: &[concat!($prefix, "_taps")],
+            resolve: None,
+            recipe: concat!($recipe, " ", $prefix, "_taps"),
             identity: $crate::family::Identity::Clefvis($crate::clefvis::Kind::Taps, &$profile),
             arch: Some($crate::clefvis::TOWER_ARCH),
             build: Some($crate::family::Build::Is($build)),
