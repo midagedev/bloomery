@@ -3,7 +3,7 @@
 use super::{IMAGE_BEGIN, IMAGE_END, MERGE, VIDEO_FRAMES, VIDEO_TOKENS};
 use crate::media::Piece;
 use crate::size::SizeRule;
-use crate::video::{ClipMeta, ClipPlan, Overflow, Sampler, Sizer, Stamp, Tail, VideoRule, plan};
+use crate::video::{ClipMeta, ClipPlan, Overflow, Sampler, Sizer, Stamp, Tail, VideoRule, sample};
 use crate::{GridPlan, MediaModel, Patches, Prepared, Rgb8, VisionError};
 use std::borrow::Cow;
 
@@ -135,8 +135,8 @@ pub fn prepare_clip(
         width: first.width,
         height: first.height,
     };
-    let media = Media::new(video_size_rule(patch)?);
-    let indices = plan(&VIDEO_RULE, &meta, VIDEO_RULE.clip_tokens, &media)?.indices;
+    let sampled = sample(&VIDEO_RULE, &meta)?;
+    let indices = sampled.pick(sampled.count);
     let prepared = prepare_frames(indices.iter().map(|&i| &frames[i]), patch)?;
     Ok((indices, prepared))
 }
@@ -182,7 +182,6 @@ impl Media {
 impl Sizer for Media {
     fn group_size(
         &self,
-        _groups: usize,
         width: usize,
         height: usize,
         cap: usize,

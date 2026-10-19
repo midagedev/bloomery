@@ -1048,9 +1048,17 @@ mod tests {
         }
         // `eq(` is a level of its own.
         assert!(deepest <= 1 + 1 + 8, "{deepest} levels of parentheses");
-        let longest = filter
+        let mut terms = String::new();
+        let mut calls = filter.split("eq(n,");
+        terms.push_str(calls.next().unwrap());
+        for call in calls {
+            terms.push('T');
+            terms.push_str(call.split_once(')').unwrap().1);
+        }
+        assert_eq!(terms.matches('T').count(), indices.len());
+        let longest = terms
             .split(['(', ')'])
-            .map(|run| run.matches("eq").count())
+            .map(|run| run.matches('T').count())
             .max()
             .unwrap();
         assert!(longest <= SELECT_RUN, "a flat run of {longest} terms");

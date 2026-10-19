@@ -135,11 +135,10 @@ impl ClipPlan {
 /// A model's own resize rule, numbers only.
 pub trait Sizer {
     /// The pixel size `(width, height)` one group's frames are brought to and the tokens that size
-    /// takes, for a clip of `width`×`height` frames cut into `groups` groups, each taking at most
-    /// `cap` tokens. The refusal names why even the model's smallest size is over `cap`.
+    /// takes, for a clip of `width`×`height` frames, each group taking at most `cap` tokens. The
+    /// refusal names why even the model's smallest size is over `cap`.
     fn group_size(
         &self,
-        groups: usize,
         width: usize,
         height: usize,
         cap: usize,
@@ -152,7 +151,6 @@ pub(crate) struct NoVideo;
 impl Sizer for NoVideo {
     fn group_size(
         &self,
-        _: usize,
         _: usize,
         _: usize,
         _: usize,
@@ -188,16 +186,16 @@ fn linspace(len: usize, count: usize) -> Vec<usize> {
 }
 
 /// The sampled frames before the fit: the count the rule takes of the clip, and how to pick fewer.
-struct Sampled {
+pub(crate) struct Sampled {
     /// `None`: every frame of the clip is a candidate. `Some`: the ticks are the candidates.
     ticks: Option<Vec<usize>>,
     frames: usize,
-    count: usize,
+    pub(crate) count: usize,
 }
 
 impl Sampled {
     /// `count` indices spread over the candidates.
-    fn pick(&self, count: usize) -> Vec<usize> {
+    pub(crate) fn pick(&self, count: usize) -> Vec<usize> {
         match &self.ticks {
             None => linspace(self.frames, count),
             Some(ticks) => linspace(ticks.len(), count)
@@ -231,7 +229,9 @@ fn check(rule: &VideoRule, meta: &ClipMeta) -> Result<(), VisionError> {
     Ok(())
 }
 
-fn sample(rule: &VideoRule, meta: &ClipMeta) -> Result<Sampled, VisionError> {
+/// The frames the rule takes of the clip, after the checks of the rule and of the clip's probe.
+pub(crate) fn sample(rule: &VideoRule, meta: &ClipMeta) -> Result<Sampled, VisionError> {
+    check(rule, meta)?;
     let (min, max) = rule.frames;
     let (a, b) = (u128::from(rule.fps.0), u128::from(rule.fps.1));
     let (num, den) = (u128::from(meta.fps.0), u128::from(meta.fps.1));
@@ -295,7 +295,6 @@ pub fn plan(
     budget: usize,
     sizer: &dyn Sizer,
 ) -> Result<ClipPlan, VisionError> {
-    check(rule, meta)?;
     let total = rule.clip_tokens.min(budget);
     let sampled = sample(rule, meta)?;
     let temporal = rule.temporal;
@@ -318,7 +317,7 @@ pub fn plan(
                 "the budget of {total} tokens leaves no room for {groups} groups of text"
             )));
         }
-        let (size, tokens) = sizer.group_size(groups, meta.width, meta.height, cap)?;
+        let (size, tokens) = sizer.group_size(meta.width, meta.height, cap)?;
         if tokens == 0 || tokens > cap {
             return Err(refuse(format!(
                 "the model sized a group at {tokens} tokens under a cap of {cap}"
@@ -418,7 +417,6 @@ mod tests {
     impl Sizer for Grid {
         fn group_size(
             &self,
-            _groups: usize,
             w: usize,
             h: usize,
             cap: usize,
