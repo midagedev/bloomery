@@ -247,6 +247,23 @@ pub trait HostServed {
         Ok(None)
     }
 
+    /// The residency to a new seed at a quiet boundary, on `stream`
+    /// ([`crate::host::swap::SwapMachine::reseed`]); `None` for a body with
+    /// no machine.
+    fn residency_reseed(
+        &mut self,
+        stream: &CudaStream,
+        order: &[&[u32]],
+    ) -> Result<Option<crate::host::swap::ResetReport>, GpuError> {
+        let _ = (stream, order);
+        Ok(None)
+    }
+
+    /// The residency machine's rule; `None` for a body with no machine.
+    fn residency_rule(&self) -> Option<&runtime::swaprule::SwapRule> {
+        None
+    }
+
     /// Stop the residency machine before anything of the model is freed
     /// ([`crate::host::HostTier::stop_swap`]): the model's drop calls it
     /// first. A body with no machine does nothing.
@@ -1205,6 +1222,28 @@ impl<B: ChainBody> GpuModel<B> {
             Some(host) => host.residency_reset(gpu.stream()),
             None => Ok(None),
         }
+    }
+
+    /// The residency to a new seed ([`HostServed::residency_reseed`]),
+    /// `order[i]` the ranking of the machine's `i`-th layer, what every later
+    /// [`GpuModel::residency_reset`] returns to; `None` for a body with no
+    /// machine.
+    pub fn residency_reseed(
+        &mut self,
+        order: &[&[u32]],
+    ) -> Result<Option<crate::host::swap::ResetReport>, GpuError> {
+        let _busy = watchdog::busy(&self.watch, watchdog::RESIDENCY_RESET, self.reads);
+        let GpuModel { body, gpu, .. } = self;
+        match body.host() {
+            Some(host) => host.residency_reseed(gpu.stream(), order),
+            None => Ok(None),
+        }
+    }
+
+    /// The residency machine's rule ([`HostServed::residency_rule`]): its
+    /// layers, seed and usage counts; `None` for a body with no machine.
+    pub fn residency_rule(&mut self) -> Option<&runtime::swaprule::SwapRule> {
+        self.body.host().and_then(|h| h.residency_rule())
     }
 
     /// A step's, pass's or prompt call's result, with a host refusal named:

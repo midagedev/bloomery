@@ -2990,6 +2990,30 @@ impl SwapMachine {
         out
     }
 
+    /// [`SwapMachine::reset`] to a new seed, `order[i]` the ranking of the
+    /// machine's `i`-th layer ([`SwapRule::reseed`]): the pinned experts stay
+    /// and the rest of each layer's card set becomes its order's first, which
+    /// every later reset returns to. Refused by name, the machine unchanged:
+    /// what the reset refuses and an order the rule refuses; the machine
+    /// broken as the reset's is.
+    pub fn reseed(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+        order: &[&[u32]],
+    ) -> Result<ResetReport, GpuError> {
+        const WHAT: &str = "SwapMachine::reseed";
+        self.refuse_if_broken(WHAT)?;
+        self.refuse_in_call(WHAT)?;
+        self.drain_copies(WHAT)?;
+        self.refuse_staging_failure(WHAT, None)?;
+        self.rule.reseed(order).map_err(|e| rule_err(WHAT, e))?;
+        let r = self.relayout(stream, slots);
+        let out = self.after_change(r, || "reseed".to_string());
+        self.mirror_landing();
+        out
+    }
+
     /// The reset's changes, the first on ([`SwapMachine::reset`]): the flips
     /// in flight cancelled, the admitted experts sent back to the host, the
     /// seed experts copied back onto the card, then the maps, the ledger and

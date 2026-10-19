@@ -1764,6 +1764,25 @@ impl<H: HostExperts> HostTier<H> {
         &mut self,
         stream: &CudaStream,
     ) -> Result<Option<swap::ResetReport>, GpuError> {
+        self.swap_relayout(stream, None)
+    }
+
+    /// [`HostTier::swap_reset`] to a new seed, `order[i]` the ranking of the
+    /// machine's `i`-th layer ([`swap::SwapMachine::reseed`]).
+    pub fn swap_reseed(
+        &mut self,
+        stream: &CudaStream,
+        order: &[&[u32]],
+    ) -> Result<Option<swap::ResetReport>, GpuError> {
+        self.swap_relayout(stream, Some(order))
+    }
+
+    /// The reset, or with `order` the reseed, between drains of `stream`.
+    fn swap_relayout(
+        &mut self,
+        stream: &CudaStream,
+        order: Option<&[&[u32]]>,
+    ) -> Result<Option<swap::ResetReport>, GpuError> {
         let Some(m) = self.swap.as_mut() else {
             self.call_open = OpenCall::Closed;
             return Ok(None);
@@ -1774,7 +1793,10 @@ impl<H: HostExperts> HostTier<H> {
             deadline,
             "HostTier::swap_reset: the engine stream before the reset",
         )?;
-        let r = m.reset(stream, &mut self.slots)?;
+        let r = match order {
+            None => m.reset(stream, &mut self.slots)?,
+            Some(order) => m.reseed(stream, &mut self.slots, order)?,
+        };
         drain_within(
             stream,
             deadline,

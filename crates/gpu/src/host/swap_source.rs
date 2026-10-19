@@ -1043,6 +1043,17 @@ impl ResidencyGlue {
         tier.swap_reset(stream)
     }
 
+    /// The residency to a new seed at a quiet boundary
+    /// ([`HostTier::swap_reseed`]); `None` without a machine.
+    pub fn reseed<H: HostExperts>(
+        &mut self,
+        tier: &mut HostTier<H>,
+        stream: &CudaStream,
+        order: &[&[u32]],
+    ) -> Result<Option<ResetReport>, GpuError> {
+        tier.swap_reseed(stream, order)
+    }
+
     /// Stop the machine before anything of the model is freed
     /// ([`HostTier::stop_swap`]); nothing without one.
     pub fn stop<H>(&mut self, tier: &mut HostTier<H>) {

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use cuda_core::CudaStream;
-use runtime::swaprule::KeptRows;
+use runtime::swaprule::{KeptRows, SwapRule};
 
 use crate::Gpu;
 use crate::GpuError;
@@ -119,6 +119,25 @@ impl<B: TierBody> HostServed for B {
             Some(ResidencyParts { glue, hybrid, .. }) => glue.reset(hybrid, stream),
             None => Ok(None),
         }
+    }
+
+    /// The machine to a new seed ([`ResidencyGlue::reseed`]).
+    fn residency_reseed(
+        &mut self,
+        stream: &CudaStream,
+        order: &[&[u32]],
+    ) -> Result<Option<ResetReport>, GpuError> {
+        match self.residency_parts() {
+            Some(ResidencyParts { glue, hybrid, .. }) => glue.reseed(hybrid, stream, order),
+            None => Ok(None),
+        }
+    }
+
+    /// The machine's rule ([`crate::host::HostTier::swap`]).
+    fn residency_rule(&self) -> Option<&SwapRule> {
+        self.hybrid()
+            .swap()
+            .map(crate::host::swap::SwapMachine::rule)
     }
 
     /// The machine stopped before anything of the body frees
