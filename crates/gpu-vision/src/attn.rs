@@ -64,24 +64,21 @@ pub struct QkvLayout {
     pub n_heads: usize,
 }
 
-/// One output of the exact attention: `o[d] = Σ_j p_j v_j[d]` in f64 for head `h`, query row `i`,
-/// with `p = softmax(scale · q_i · k_j)`, and per dim `Σ_j p_j |v_j[d]|` and the row's largest
-/// `scale · Σ_d |q_i[d] k_j[d]|` — the magnitudes [`attn_bound`] scales.
-#[must_use]
-pub fn attn_ref(
+/// One output of the exact attention for heads of `D` values: `o[d] = Σ_j p_j v_j[d]` in f64 for
+/// head `h`, query row `i`, with `p = softmax(scale · q_i · k_j)`, per dim `Σ_j p_j |v_j[d]|`,
+/// and the row's largest `scale · Σ_d |q_i[d] k_j[d]|` — the magnitudes [`attn_bound`] scales.
+pub(crate) fn exact<const D: usize>(
     qkv: &[u16],
     lay: QkvLayout,
     n: usize,
     scale: f64,
     h: usize,
     i: usize,
-) -> ([f64; HEAD_DIM], [f64; HEAD_DIM], f64) {
+) -> ([f64; D], [f64; D], f64) {
     let col = |r: usize, c0: usize, d: usize| {
-        f64::from(crate::bf16_f32(
-            qkv[r * lay.row_width + c0 + h * HEAD_DIM + d],
-        ))
+        f64::from(crate::bf16_f32(qkv[r * lay.row_width + c0 + h * D + d]))
     };
-    let q: Vec<f64> = (0..HEAD_DIM).map(|d| col(i, lay.q0, d)).collect();
+    let q: Vec<f64> = (0..D).map(|d| col(i, lay.q0, d)).collect();
     let mut s = Vec::with_capacity(n);
     let mut logit_mag = 0.0f64;
     for j in 0..n {
@@ -97,16 +94,31 @@ pub fn attn_ref(
     let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let w: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
     let l: f64 = w.iter().sum();
-    let (mut o, mut mag) = ([0.0f64; HEAD_DIM], [0.0f64; HEAD_DIM]);
+    let (mut o, mut mag) = ([0.0f64; D], [0.0f64; D]);
     for (j, wj) in w.iter().enumerate() {
         let p = wj / l;
-        for d in 0..HEAD_DIM {
+        for d in 0..D {
             let v = col(j, lay.v0, d);
             o[d] += p * v;
             mag[d] += p * v.abs();
         }
     }
     (o, mag, logit_mag)
+}
+
+/// One output of the exact attention: `o[d] = Σ_j p_j v_j[d]` in f64 for head `h`, query row `i`,
+/// with `p = softmax(scale · q_i · k_j)`, and per dim `Σ_j p_j |v_j[d]|` and the row's largest
+/// `scale · Σ_d |q_i[d] k_j[d]|` — the magnitudes [`attn_bound`] scales.
+#[must_use]
+pub fn attn_ref(
+    qkv: &[u16],
+    lay: QkvLayout,
+    n: usize,
+    scale: f64,
+    h: usize,
+    i: usize,
+) -> ([f64; HEAD_DIM], [f64; HEAD_DIM], f64) {
+    exact::<HEAD_DIM>(qkv, lay, n, scale, h, i)
 }
 
 /// The widest distance the kernel's f32 arithmetic can put between its output (before the bf16
@@ -586,37 +598,7 @@ pub fn attn_72_ref(
     h: usize,
     i: usize,
 ) -> ([f64; HEAD_DIM_72], [f64; HEAD_DIM_72], f64) {
-    let col = |r: usize, c0: usize, d: usize| {
-        f64::from(crate::bf16_f32(
-            qkv[r * lay.row_width + c0 + h * HEAD_DIM_72 + d],
-        ))
-    };
-    let q: Vec<f64> = (0..HEAD_DIM_72).map(|d| col(i, lay.q0, d)).collect();
-    let mut s = Vec::with_capacity(n);
-    let mut logit_mag = 0.0f64;
-    for j in 0..n {
-        let (mut dot, mut mag) = (0.0f64, 0.0f64);
-        for (d, qd) in q.iter().enumerate() {
-            let p = qd * col(j, lay.k0, d);
-            dot += p;
-            mag += p.abs();
-        }
-        s.push(dot * scale);
-        logit_mag = logit_mag.max(mag * scale);
-    }
-    let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let w: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
-    let l: f64 = w.iter().sum();
-    let (mut o, mut mag) = ([0.0f64; HEAD_DIM_72], [0.0f64; HEAD_DIM_72]);
-    for (j, wj) in w.iter().enumerate() {
-        let p = wj / l;
-        for d in 0..HEAD_DIM_72 {
-            let v = col(j, lay.v0, d);
-            o[d] += p * v;
-            mag[d] += p * v.abs();
-        }
-    }
-    (o, mag, logit_mag)
+    exact::<HEAD_DIM_72>(qkv, lay, n, scale, h, i)
 }
 
 #[cuda_module]

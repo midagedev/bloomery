@@ -37,49 +37,6 @@ const _: () = assert!(HEAD_DIM_80.is_multiple_of(16));
 const _: () = assert!(STAGE_PER_THREAD_80 * THREADS == KEY_TILE * (HEAD_DIM_80 / 2));
 const _: () = assert!((ROW_WORDS_80 * 4).is_multiple_of(16) && ((ROW_WORDS_80 * 4) / 16) % 2 == 1);
 
-/// One output of the exact attention for heads of `D` values: `o[d] = Σ_j p_j v_j[d]` in f64 for
-/// head `h`, query row `i`, with `p = softmax(scale · q_i · k_j)`, per dim `Σ_j p_j |v_j[d]|`,
-/// and the row's largest `scale · Σ_d |q_i[d] k_j[d]|` — the magnitudes
-/// [`crate::attn::attn_bound`] scales.
-fn exact<const D: usize>(
-    qkv: &[u16],
-    lay: QkvLayout,
-    n: usize,
-    scale: f64,
-    h: usize,
-    i: usize,
-) -> ([f64; D], [f64; D], f64) {
-    let col = |r: usize, c0: usize, d: usize| {
-        f64::from(crate::bf16_f32(qkv[r * lay.row_width + c0 + h * D + d]))
-    };
-    let q: Vec<f64> = (0..D).map(|d| col(i, lay.q0, d)).collect();
-    let mut s = Vec::with_capacity(n);
-    let mut logit_mag = 0.0f64;
-    for j in 0..n {
-        let (mut dot, mut mag) = (0.0f64, 0.0f64);
-        for (d, qd) in q.iter().enumerate() {
-            let p = qd * col(j, lay.k0, d);
-            dot += p;
-            mag += p.abs();
-        }
-        s.push(dot * scale);
-        logit_mag = logit_mag.max(mag * scale);
-    }
-    let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let w: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
-    let l: f64 = w.iter().sum();
-    let (mut o, mut mag) = ([0.0f64; D], [0.0f64; D]);
-    for (j, wj) in w.iter().enumerate() {
-        let p = wj / l;
-        for d in 0..D {
-            let v = col(j, lay.v0, d);
-            o[d] += p * v;
-            mag[d] += p * v.abs();
-        }
-    }
-    (o, mag, logit_mag)
-}
-
 /// [`crate::attn::attn_ref`] for heads of 80 values.
 #[must_use]
 pub fn attn_80_ref(
@@ -90,7 +47,7 @@ pub fn attn_80_ref(
     h: usize,
     i: usize,
 ) -> ([f64; HEAD_DIM_80], [f64; HEAD_DIM_80], f64) {
-    exact::<HEAD_DIM_80>(qkv, lay, n, scale, h, i)
+    crate::attn::exact::<HEAD_DIM_80>(qkv, lay, n, scale, h, i)
 }
 
 #[cuda_module]
@@ -403,7 +360,8 @@ mod attn_80_kernels {
                         o[2 * nd] =
                             cuda_device::wmma::mma_m16n8k16_f32_bf16(o[2 * nd], lo, [bf[0], bf[1]]);
                     }
-                    // SAFETY: as above.
+                    // SAFETY: the whole warp issues both MMA instructions with valid hi/lo and bf
+                    // fragments.
                     unsafe {
                         o[2 * nd + 1] = cuda_device::wmma::mma_m16n8k16_f32_bf16(
                             o[2 * nd + 1],
