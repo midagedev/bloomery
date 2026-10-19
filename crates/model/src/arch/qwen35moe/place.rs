@@ -1200,14 +1200,6 @@ pub const fn tier_route_scratch_bytes(cols: u64) -> u64 {
         + 2 * 4 * (ROUTE_EXPERTS_BOUND + 1)
 }
 
-/// The ubatch arena bytes a plan made on `card` counts: its scratch past the
-/// m = 1 scratch. The load of a ubatch whose arena holds more is refused by
-/// name.
-#[must_use]
-pub const fn counted_ubatch_bytes(card: &Card) -> u64 {
-    card.scratch_bytes.saturating_sub(SCRATCH)
-}
-
 /// The machine a qwen4exp plan runs on: `card` runs every one of `layers`,
 /// the head and the token embedding table whole (the file's q8_0 rows, which
 /// the card gathers), with this workstation's context and margin and the host
