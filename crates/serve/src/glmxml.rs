@@ -30,6 +30,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
 
@@ -294,4 +295,33 @@ fn parse_call(body: &str, index: usize, types: &ArgTypes) -> Result<(String, Str
         .map(|(k, v)| format!("{}:{v}", Value::String(k.clone())))
         .collect();
     Ok((name.to_owned(), format!("{{{}}}", fields.join(","))))
+}
+
+/// The call this markup spells, as the parts structured output forces: the
+/// inverse of [`GlmScan`]. `NAME` then an `<arg_key>`/`<arg_value>` pair per
+/// parameter in the schema's order. The scanner reads a value as text only
+/// where the schema says `"type": "string"`, so a text-valued parameter that
+/// does not say it is refused rather than written as something that could
+/// read back as JSON.
+pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+    call(funs, CALL_OPEN, str::to_owned, |f| {
+        let mut parts = Vec::new();
+        for a in &f.args {
+            if is_text(a.schema) && a.schema.get("type").and_then(Value::as_str) != Some("string") {
+                return Err(Refusal::invalid(format!(
+                    "{}: GLM's tool markup reads a text value as text only under \"type\": \
+                     \"string\"; add it",
+                    a.path
+                )));
+            }
+            parts.push(Part::Text(format!(
+                "{KEY_OPEN}{}{KEY_CLOSE}{VALUE_OPEN}",
+                a.key
+            )));
+            parts.extend(value(a.schema, Style::Raw, &a.path)?);
+            parts.push(Part::Text(VALUE_CLOSE.to_owned()));
+        }
+        parts.push(Part::Text(CALL_CLOSE.to_owned()));
+        Ok(parts)
+    })
 }

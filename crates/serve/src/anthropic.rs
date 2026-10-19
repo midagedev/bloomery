@@ -514,12 +514,23 @@ fn tool(t: &Value) -> Result<Value, ApiError> {
     }))
 }
 
-/// `tool_choice` as the chat path's: `auto` and `none` as they are, `any` and
-/// `tool` (a call forced) as `required`, which the chat path refuses by name.
+/// `tool_choice` as the chat path's: `auto` and `none` as they are, `any` as
+/// `required` and `tool` as the named function, which the chat path forces
+/// ([`crate::constrain`]).
 fn tool_choice(v: &Value) -> Result<Value, ApiError> {
     match v.get("type").and_then(Value::as_str) {
         Some(kind @ ("auto" | "none")) => Ok(json!(kind)),
-        Some("any" | "tool") => Ok(json!("required")),
+        Some("any") => Ok(json!("required")),
+        Some("tool") => {
+            let name = v
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| {
+                    invalid("tool_choice of type tool needs a non-empty string 'name'")
+                })?;
+            Ok(json!({"type": "function", "function": {"name": name}}))
+        }
         _ => Err(invalid(format!(
             "tool_choice must be an object whose type is auto, any, tool or none, not {v}"
         ))),

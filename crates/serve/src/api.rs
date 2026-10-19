@@ -66,6 +66,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use jinja::{ChatTemplate, TemplateError};
 use serde_json::{Map, Value, json};
 
+use crate::constrain;
 use crate::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
 use crate::embed::Embed;
 use crate::engine::{
@@ -351,10 +352,12 @@ impl Server {
         if let Some(note) = thinking_off.note() {
             eprintln!("bloomery-serve: {note}");
         }
+        let vocab = Arc::new(constrain::Vocab::read(&*tok));
         let state = State {
             shared: Arc::new(shared),
             parallel,
             tok,
+            vocab,
             fatal_linger: config.fatal_linger,
             tool_format: ToolFormat::of_chat_template(&template),
             object_arguments: needs_object_arguments(&template),
@@ -478,6 +481,9 @@ struct State {
     parallel: usize,
     /// The engine's vocabulary, read without the engine.
     tok: Arc<dyn Tokenizer>,
+    /// What structured output needs of the vocabulary, read once when the
+    /// server binds ([`crate::constrain::Vocab`]).
+    vocab: Arc<constrain::Vocab>,
     fatal_linger: Duration,
     template: ChatTemplate,
     /// The tool-call markup the template teaches, read from its source once.
@@ -1521,13 +1527,18 @@ fn sampler_order(o: &Map<String, Value>, sp: &SamplingParams) -> Result<(), ApiE
 /// engine's cache already holds; `false` resets it first.
 ///
 /// A field this server cannot honor is a 400 naming it, never a 200 that ignores it:
-/// `n_probs > 0`, `response_format` other than `{"type":"text"}`, `json_schema`, a
-/// non-empty `grammar`, `logprobs` other than `false` (a bool, or OpenAI's text
-/// completion count), `top_logprobs > 0`, `n > 1`, `tool_choice` other than
-/// `"none"` or `"auto"` (nothing forces a call without a grammar), a non-empty
+/// `n_probs > 0`, a non-empty `grammar`, `logprobs` other than `false` (a bool, or
+/// OpenAI's text completion count), `top_logprobs > 0`, `n > 1`, a non-empty
 /// `logit_bias`, the samplers [`unserved_samplers`] names, and a `samplers` other
 /// than this server's order ([`sampler_order`]). `null` counts as absent. Other
-/// unknown fields are ignored. The two routes whose answers render
+/// unknown fields are ignored.
+///
+/// Structured output ([`constrain::request`]) is served for a `response_format`
+/// of type `json_schema` in the subset it reads, and for `tool_choice`
+/// `"required"` or a named function over the request's tools; any other
+/// `response_format`, `json_schema`, `tool_choice` or schema keyword is a 400
+/// naming it. Such a request decodes greedily: `temperature` defaults to 0, a
+/// positive one, a penalty, `ignore_eos` and `reasoning_budget` are 400s. The two routes whose answers render
 /// probabilities take their fields out of the body before this runs
 /// ([`completion_plan_logprobs`], [`chat_plan_logprobs`]); every other route
 /// keeps the refusal.
@@ -1546,12 +1557,6 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
     let refused = [
         ("n_probs", get_i(o, "n_probs")?.is_some_and(|n| n > 0)),
         (
-            "response_format",
-            set("response_format")
-                .is_some_and(|v| v.get("type").and_then(Value::as_str) != Some("text")),
-        ),
-        ("json_schema", set("json_schema").is_some()),
-        (
             "grammar",
             set("grammar").is_some_and(|v| v.as_str() != Some("")),
         ),
@@ -1567,10 +1572,6 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         ),
         ("n", get_i(o, "n")?.is_some_and(|n| n > 1)),
         (
-            "tool_choice",
-            set("tool_choice").is_some_and(|v| !matches!(v.as_str(), Some("none" | "auto"))),
-        ),
-        (
             "logit_bias",
             set("logit_bias").is_some_and(|v| match v {
                 Value::Array(a) => !a.is_empty(),
@@ -1583,6 +1584,26 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         return Err(invalid(format!("{field} is not supported by this server")));
     }
     unserved_samplers(o)?;
+    let constraint = constrain::request(
+        o,
+        &constrain::Ask {
+            tok: &*state.tok,
+            vocab: &state.vocab,
+            format: state.tool_format,
+        },
+    )
+    .map_err(|r| {
+        if r.unsupported {
+            ApiError {
+                retry_after: false,
+                code: 501,
+                kind: "not_supported_error",
+                message: r.message,
+            }
+        } else {
+            invalid(r.message)
+        }
+    })?;
     let d = SamplingParams::default();
     let seed = match get_i(o, "seed")? {
         Some(s) if s >= 0 => s as u64,
@@ -1611,7 +1632,11 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         usize::try_from(n).expect("a count in 0..=i32::MAX fits usize")
     });
     let sampling = SamplingParams {
-        temperature: get_f32(o, "temperature")?.unwrap_or(d.temperature),
+        temperature: get_f32(o, "temperature")?.unwrap_or(if constraint.is_some() {
+            0.0
+        } else {
+            d.temperature
+        }),
         top_k: top_k.map_or(d.top_k, |k| i32::try_from(k).unwrap_or(i32::MAX)),
         top_p: get_f32(o, "top_p")?.unwrap_or(d.top_p),
         min_p: get_f32(o, "min_p")?.unwrap_or(d.min_p),
@@ -1637,11 +1662,16 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         seed,
     };
     sampler_order(o, &sampling)?;
+    let ignore_eos = get_b(o, "ignore_eos")?.unwrap_or(false);
+    let reasoning_budget = reasoning_budget(o)?;
+    if constraint.is_some() {
+        greedy_only(&sampling, ignore_eos, reasoning_budget)?;
+    }
     let p = GenParams {
         n_predict,
         sampling,
         stop: stop_list(o.get("stop"))?,
-        ignore_eos: get_b(o, "ignore_eos")?.unwrap_or(false),
+        ignore_eos,
         stream: get_b(o, "stream")?.unwrap_or(false),
         timings_per_token: get_b(o, "timings_per_token")?.unwrap_or(false),
         return_progress: get_b(o, "return_progress")?.unwrap_or(false),
@@ -1651,11 +1681,45 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             .and_then(Value::as_bool)
             .unwrap_or(false),
         cache_prompt: get_b(o, "cache_prompt")?.unwrap_or(true),
-        reasoning_budget: reasoning_budget(o)?,
+        reasoning_budget,
         think_entry: ThinkEntry::Closed,
         logprobs: None,
+        constraint,
     };
     Ok(p)
+}
+
+/// What a structured-output request leaves out: its pick is the largest
+/// allowed logit, so a draw (`temperature` above 0) and the penalties that move
+/// a logit have no place in it, `ignore_eos` would ban the id its program ends
+/// on, and a think budget would force a close the program writes itself.
+fn greedy_only(
+    sampling: &SamplingParams,
+    ignore_eos: bool,
+    budget: Option<usize>,
+) -> Result<(), ApiError> {
+    let why = if sampling.temperature > 0.0 {
+        format!(
+            "temperature {} is not supported with structured output, which decodes greedily \
+             (leave it out or send 0)",
+            sampling.temperature
+        )
+    } else if sampling.penalizes() {
+        "repeat_penalty, frequency_penalty and presence_penalty are not supported with \
+         structured output, which decodes greedily"
+            .to_owned()
+    } else if ignore_eos {
+        "ignore_eos is not supported with structured output: its program ends on an \
+         end-of-generation id"
+            .to_owned()
+    } else if budget.is_some() {
+        "reasoning_budget is not supported with structured output: the program starts after \
+         the think span and closes an open one itself"
+            .to_owned()
+    } else {
+        return Ok(());
+    };
+    Err(invalid(why))
 }
 
 /// `reasoning_budget`: absent or `null` unrestricted, `-1` unrestricted
@@ -1778,6 +1842,7 @@ fn default_params() -> GenParams {
         reasoning_budget: None,
         think_entry: ThinkEntry::Closed,
         logprobs: None,
+        constraint: None,
     }
 }
 

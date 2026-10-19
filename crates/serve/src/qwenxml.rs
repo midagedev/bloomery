@@ -36,6 +36,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::constrain::{Fun, Part, Refusal, Style, call, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
 
@@ -504,4 +505,26 @@ fn parse_call(
         format!("{{{}}}", fields.join(",")),
         at,
     )))
+}
+
+/// The call this markup spells, as the parts structured output forces: the
+/// inverse of [`QwenScan`]. `<function=NAME>` with a `<parameter=KEY>` block
+/// per parameter in the schema's order, each value written as the schema reads
+/// it: raw text for a string, JSON for the rest.
+pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+    call(
+        funs,
+        &format!("{CALL_OPEN}\n{FUNCTION_OPEN}"),
+        str::to_owned,
+        |f| {
+            let mut parts = vec![Part::Text(">\n".to_owned())];
+            for a in &f.args {
+                parts.push(Part::Text(format!("{PARAM_OPEN}{}>\n", a.key)));
+                parts.extend(value(a.schema, Style::Raw, &a.path)?);
+                parts.push(Part::Text(PARAM_VALUE_CLOSE.to_owned()));
+            }
+            parts.push(Part::Text(format!("{FUNCTION_CLOSE}\n{CALL_CLOSE}")));
+            Ok(parts)
+        },
+    )
 }

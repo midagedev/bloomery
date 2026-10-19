@@ -37,6 +37,14 @@
 //! meets one check of its fixed `None` where a row is read and one where a
 //! token's text goes out.
 //!
+//! A request that follows a program ([`GenParams::constraint`]) reads the row
+//! every token too and takes one [`Engine::next`] a token, greedy: each token is
+//! the program's pick from that row ([`crate::constrain::Walk`]) — a forced id
+//! as it stands, otherwise the largest logit among the ids the program allows
+//! there — and once the program is spent the vocabulary's stop ids are the only
+//! ones left. A pick the program cannot make ends the request with a named
+//! error ([`GenError::Constrained`]).
+//!
 //! A request runs as a [`Gen`], one engine call at a time, so the engine
 //! thread can make one call of several slots' steps: each running request's
 //! next step a row of one [`Engine::step_slots`], its next drafted pass a row
@@ -57,6 +65,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use crate::api::logprobs::{Ask, Collector, RowError};
+use crate::constrain::{Constraint, StepError, Walk};
 use crate::engine::{
     CacheNote, Decoder, Drafted, Engine, EngineError, Landed, Pending, Sampler, SamplerFactory,
     SamplerRefused, SamplingParams, SaveInFlight, Saved, SlotPass, SlotRow, StateError, Tokenizer,
@@ -97,6 +106,10 @@ pub(crate) struct GenParams {
     /// writes them to; `None` asks for none. Only the routes that render them
     /// set it.
     pub logprobs: Option<Ask>,
+    /// The program the output follows (structured output), `None` for free
+    /// text. Its request decodes greedily: every token is the largest logit
+    /// among the ids the program allows.
+    pub constraint: Option<Constraint>,
 }
 
 /// llama-server's `timings` object, as the server clocked it.
@@ -230,6 +243,9 @@ pub(crate) enum GenError {
     /// It ends the request, wherever in the generation it is met.
     #[error("the probabilities of generated token {token}: {error}")]
     Logprobs { token: usize, error: RowError },
+    /// The program of a constrained request allows no id at a step.
+    #[error(transparent)]
+    Constrained(#[from] StepError),
 }
 
 pub(crate) fn ms_since(t: Instant) -> f64 {
@@ -285,16 +301,18 @@ fn choose(
 }
 
 /// Whether a request takes its tokens after the first through the engine's
-/// passes when the engine drafts: one that bans no id and asks for no
-/// probabilities (`asks`), greedy ([`Engine::advance`]) or sampling on an
-/// engine that drafts sampled requests ([`Engine::advance_sampled`]).
+/// passes when the engine drafts: one that bans no id, asks for no
+/// probabilities (`asks`) and follows no program (`constrained`, whose every
+/// token is picked from its own row), greedy ([`Engine::advance`]) or sampling
+/// on an engine that drafts sampled requests ([`Engine::advance_sampled`]).
 fn takes_passes(
     sampler: Option<&Sampler>,
     banned: &[u32],
     asks: bool,
+    constrained: bool,
     engine: &dyn Engine,
 ) -> bool {
-    banned.is_empty() && !asks && (sampler.is_none() || engine.drafts_sampled())
+    banned.is_empty() && !asks && !constrained && (sampler.is_none() || engine.drafts_sampled())
 }
 
 /// The engine and its slots: what each slot's cache holds — the ids, one per
@@ -1530,6 +1548,10 @@ pub(crate) struct Gen {
     /// What reads each row and writes the request's probabilities, `None` on
     /// a request that asks for none.
     probs: Option<Collector>,
+    /// The request's position in its program, `None` for free text.
+    walk: Option<Walk>,
+    /// The program's refusal of a step, which the next [`Gen::pump`] returns.
+    refused: Option<StepError>,
 }
 
 /// The sampler a request of `p` draws with, `None` for a greedy one, or the
@@ -1556,11 +1578,13 @@ impl Gen {
             Vec::new()
         };
         let probs = p.logprobs.as_ref().map(Ask::collector);
-        // A greedy request reads the logits only to step past a banned argmax
-        // or for the probabilities it asked for.
+        // A greedy request reads the logits only to step past a banned argmax,
+        // for the probabilities it asked for, or to pick among the ids its
+        // program allows.
         let logits = vec![
             0.0f32;
-            if sampler.is_some() || !banned.is_empty() || probs.is_some() {
+            if sampler.is_some() || !banned.is_empty() || probs.is_some() || p.constraint.is_some()
+            {
                 slot.vocab.n_vocab()
             } else {
                 0
@@ -1570,6 +1594,7 @@ impl Gen {
             sampler.as_ref(),
             &banned,
             probs.is_some(),
+            p.constraint.is_some(),
             slot.engine.as_ref(),
         ) {
             slot.engine.advance_rows()
@@ -1602,6 +1627,11 @@ impl Gen {
                 .reasoning_budget
                 .map(|left| Think::new(p.think_entry, left, slot.vocab.encode(THINK_CLOSE))),
             probs,
+            walk: p
+                .constraint
+                .as_ref()
+                .map(|c| Walk::new(c, p.think_entry == ThinkEntry::Open)),
+            refused: None,
         }
     }
 
@@ -1631,6 +1661,15 @@ impl Gen {
         }
         if let Some(id) = self.think.as_mut().and_then(Think::next_forced) {
             return id;
+        }
+        if let Some(walk) = self.walk.as_mut() {
+            return match walk.choose(&self.logits) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.refused = Some(e);
+                    g
+                }
+            };
         }
         choose(
             &mut self.sampler,
@@ -1721,6 +1760,7 @@ impl Gen {
             self.sampler.as_ref(),
             &self.banned,
             self.probs.is_some(),
+            self.walk.is_some(),
             slot.engine.as_ref(),
         );
         slot.engine.will_reply(match usize::try_from(p.n_predict) {
@@ -1866,6 +1906,9 @@ impl Gen {
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
         tick: &mut dyn FnMut(&Timings),
     ) -> Result<Need, GenError> {
+        if let Some(e) = self.refused.take() {
+            return Err(e.into());
+        }
         while let Some(tok) = self.tok.take() {
             if self.banned.contains(&tok) {
                 return Err(GenError::Banned(tok));
@@ -2398,6 +2441,7 @@ mod cache_tests {
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
             logprobs: None,
+            constraint: None,
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
@@ -2524,6 +2568,7 @@ mod cache_tests {
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
             logprobs: None,
+            constraint: None,
         };
         let mut tim = Timings::default();
         let r = generate(
@@ -2624,6 +2669,7 @@ mod cache_tests {
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
             logprobs: None,
+            constraint: None,
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
@@ -2662,6 +2708,7 @@ mod cache_tests {
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
             logprobs: Some(Ask::new(2, MockTokenizer.n_vocab())),
+            constraint: None,
         };
         let mut tim = Timings::default();
         generate(
@@ -3171,6 +3218,7 @@ mod media_tests {
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
             logprobs: None,
+            constraint: None,
         };
         let factory = sampling::reference_factory();
         let sampler = sampler_of(&factory, &params).expect("the reference refuses none");
@@ -3475,6 +3523,7 @@ mod think_tests {
             reasoning_budget: budget,
             think_entry: ThinkEntry::of_prompt(prompt),
             logprobs: None,
+            constraint: None,
         };
         let mut tim = Timings::default();
         let o = generate(
@@ -3677,6 +3726,7 @@ mod sampled_tests {
                 reasoning_budget: None,
                 think_entry: ThinkEntry::Closed,
                 logprobs: None,
+                constraint: None,
             };
             let mut tim = Timings::default();
             generate(

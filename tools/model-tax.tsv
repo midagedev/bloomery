@@ -170,8 +170,8 @@ crates/refset/src/emb2.rs	clef	1	baseline O 1: own path: an alias row in tools/m
 crates/serve/src/api.rs	glm	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/api.rs	qwen	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/dsml.rs	deepseek	4	baseline D 4: MK7 tool format and reasoning from the template
-crates/serve/src/dsml.rs	glm	14	baseline D 14: MK7 tool format and reasoning from the template
-crates/serve/src/dsml.rs	qwen	17	baseline D 17: MK7 tool format and reasoning from the template
+crates/serve/src/dsml.rs	glm	15	PIN(2026-10-19) glm: MK7 tool format and reasoning from the template; +1 is ToolFormat::call_parts, the forced-call inverse of each format's scan (structured output)
+crates/serve/src/dsml.rs	qwen	18	PIN(2026-10-19) qwen: MK7 tool format and reasoning from the template; +1 is ToolFormat::call_parts, the forced-call inverse of each format's scan (structured output)
 crates/serve/src/lib.rs	glm	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/lib.rs	qwen	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/reasoning.rs	deepseek	4	baseline D 4: MK7 tool format and reasoning from the template

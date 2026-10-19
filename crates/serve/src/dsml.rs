@@ -28,6 +28,7 @@
 use jinja::ChatTemplate;
 use serde_json::{Map, json};
 
+use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
 use crate::glmxml::{self, ArgTypes, GlmScan, GlmXmlError};
 use crate::hermes::{self, HermesError, HermesScan};
 use crate::qwenxml::{self, ParamKinds, QwenScan, QwenXmlError};
@@ -584,4 +585,49 @@ impl ChatParser {
         self.total.append(&d);
         d
     }
+}
+
+impl ToolFormat {
+    /// The forced call in this format's markup: the inverse of the format's
+    /// scan, or a 501 refusal for markup no scan here reads.
+    pub(crate) fn call_parts(self, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+        match self {
+            ToolFormat::Hermes => hermes::call_parts(funs),
+            ToolFormat::QwenXml => qwenxml::call_parts(funs),
+            ToolFormat::GlmXml => glmxml::call_parts(funs),
+            ToolFormat::Dsml => call_parts(funs),
+            ToolFormat::Unparsed => Err(Refusal {
+                message: "the chat template's tool-call markup has no inverse in this server: \
+                          send the request without tool_choice \"required\" or a named function"
+                    .to_owned(),
+                unsupported: true,
+            }),
+        }
+    }
+}
+
+/// The call this markup spells, as the parts structured output forces: the
+/// inverse of [`DsmlScan`]. One `invoke` block with a `parameter` block per
+/// parameter in the schema's order, `string="true"` around a text value (raw)
+/// and `string="false"` around any other (JSON).
+pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+    call(
+        funs,
+        &format!("{CALLS_OPEN}\n{INVOKE_OPEN}"),
+        str::to_owned,
+        |f| {
+            let mut parts = vec![Part::Text("\">\n".to_owned())];
+            for a in &f.args {
+                parts.push(Part::Text(format!(
+                    "{PARAM_OPEN}{}\" string=\"{}\">",
+                    a.key,
+                    is_text(a.schema)
+                )));
+                parts.extend(value(a.schema, Style::Raw, &a.path)?);
+                parts.push(Part::Text(format!("{PARAM_CLOSE}\n")));
+            }
+            parts.push(Part::Text(format!("{INVOKE_CLOSE}\n{CALLS_CLOSE}")));
+            Ok(parts)
+        },
+    )
 }

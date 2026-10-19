@@ -760,6 +760,45 @@ fn hw_anthropic_tool_use_basic() {
     assert_eq!(none["stop_reason"], "end_turn", "{none}");
 }
 
+/// `tool_choice` `any` and `tool` force a call of the listed tools, whatever the rows favour (the
+/// scripted engine's tie at every choice goes to the lowest id): one `tool_use` block with the
+/// arguments an object, `stop_reason` `tool_use`, no text.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_anthropic_forced_tool_use() {
+    let addr = start_with(Box::new(ScriptedEngine::new(4096, "")));
+    let tools = json!([
+        {"name": "get_weather", "input_schema": {"type": "object", "properties": {
+            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}}}},
+        {"name": "set_flag", "input_schema": {"type": "object", "properties": {
+            "on": {"type": "boolean"}}}},
+    ]);
+    for (choice, name, input) in [
+        (
+            json!({"type": "any"}),
+            "get_weather",
+            json!({"unit": "celsius"}),
+        ),
+        (
+            json!({"type": "tool", "name": "set_flag"}),
+            "set_flag",
+            json!({"on": false}),
+        ),
+    ] {
+        let body = with(
+            turns(json!({"max_tokens": 600, "tools": tools, "tool_choice": choice})),
+            json!({}),
+        );
+        let v = post(addr, "/v1/messages", &body).json();
+        let content = v["content"].as_array().unwrap_or_else(|| panic!("{v}"));
+        assert_eq!(content.len(), 1, "{v}");
+        assert_eq!(content[0]["type"], "tool_use", "{v}");
+        assert_eq!(content[0]["name"], name, "{v}");
+        assert_eq!(content[0]["input"], input, "{v}");
+        assert_eq!(v["stop_reason"], "tool_use", "{v}");
+    }
+}
+
 /// Ports `test_anthropic_count_tokens`, `test_anthropic_count_tokens_with_system`,
 /// `test_anthropic_count_tokens_no_max_tokens` and `test_anthropic_thinking_history_in_count_tokens`:
 /// `input_tokens`, the one key, is the ids of the prompt `/v1/messages` runs for the same request
@@ -919,8 +958,12 @@ fn hw_anthropic_errors() {
             "tool_choice must be an object whose type is",
         ),
         (
-            turns(json!({"tools": [{"name": "f"}], "tool_choice": {"type": "any"}})),
-            "tool_choice is not supported by this server",
+            turns(json!({"tools": [{"name": "f"}], "tool_choice": {"type": "tool"}})),
+            "tool_choice of type tool needs a non-empty string 'name'",
+        ),
+        (
+            turns(json!({"tools": [{"name": "f"}], "tool_choice": {"type": "tool", "name": "g"}})),
+            "the function g is not among the request's tools",
         ),
         (
             turns(json!({"thinking": {"type": "enabled"}})),

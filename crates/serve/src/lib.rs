@@ -21,6 +21,7 @@
 
 mod api;
 pub use api::embeddings;
+mod constrain;
 pub mod decide;
 pub mod dsml;
 pub mod embed;

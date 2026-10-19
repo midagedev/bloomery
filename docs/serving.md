@@ -277,6 +277,16 @@ binary's `--help`.
   which move a probability by under 3e-4 against the release's bf16 head on the eight reference requests).
 - V4.1 decode is bound by host memory bandwidth in each step's expert part, and by the card's own serial work
   before it; a long V4.1 prompt (P = 4096) is bound by the card, since the prompt call streams host experts in.
+- Structured output is served for `response_format` of type `json_schema` and for `tool_choice` `"required"` or a named
+  function (Anthropic `any` and `tool`, Responses `text.format` `json_schema`), on every generative seat: an object
+  (every property written, in the schema's order), string, integer and boolean enums, `const`, booleans, and free
+  strings with an optional `maxLength`. The request decodes greedily, one step a token (the largest logit among the ids
+  the schema allows), so `temperature` defaults to 0.
+- Refused by name: any other schema keyword (`$ref`, `anyOf`, `items`, `pattern`, `minLength`, an `integer` with no
+  enum), `json_object`, a top-level `json_schema`, `grammar`, a schema beside a forced call, `temperature` above 0, the
+  penalties, `ignore_eos` and `reasoning_budget`. An enum whose options tokenise so that one is a prefix of another
+  (`[1, 10]` on a vocabulary that splits digits) is a 400. A free string in a tool call's XML markup is one line (Qwen) or
+  holds no `<` (GLM, DSML), since the value ends at the text after it.
 - A pinned nightly with a pinned cuda-oxide revision from our fork ([`BUILD.md`](BUILD.md)).
 
 In progress: serving on N cards for every model; Clef from the IQ and Q2_K files; DeepSeek-V4-Flash-0731.

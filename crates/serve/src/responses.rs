@@ -17,8 +17,8 @@
 //! chat path as it is (`temperature`, `top_p`, `stream`, `tool_choice`, `stop`,
 //! `seed`, `top_k`, `timings_per_token`, `return_progress`, `cache_prompt`,
 //! `chat_template_kwargs`, `reasoning_format`, …), and the chat path's own
-//! refusals answer them (`tool_choice` other than `auto` or `none`, a
-//! `response_format` other than text, …):
+//! refusals answer them (`tool_choice` other than `auto`, `none`, `required` or a
+//! named function, a `response_format` other than text or a JSON schema, …):
 //! - `instructions` (a string): a `system` message before the input's.
 //! - `input`: a string is one `user` message. A list holds items, each by its
 //!   `type` (`message` when absent):
@@ -110,7 +110,7 @@
 //! a stored `prompt` and an `item_reference` item (this server keeps no
 //! responses); `logprobs`, `top_logprobs` above 0 and `include` of
 //! `message.output_text.logprobs` (the answer carries no probabilities);
-//! `n` above 1; `text.format` other than `text`; `input_file`, an
+//! `n` above 1; `text.format` other than `text` or `json_schema`; `input_file`, an
 //! `input_image` by `file_id`, and an assistant's `refusal` part; a tool that
 //! is neither a function nor a web search; an item, a part or a role the
 //! conversion does not know; and a field of the wrong type. An error is the
@@ -269,6 +269,20 @@ fn to_chat(b: &Map<String, Value>) -> Result<Map<String, Value>, ApiError> {
     if let Some(effort) = reasoning_effort(set(b, "reasoning"))? {
         chat.insert("reasoning_effort".into(), effort.clone());
     }
+    // A JSON schema is the chat path's `response_format` of that type.
+    if let Some(f) = set(b, "text")
+        .and_then(|t| t.get("format"))
+        .filter(|f| f.get("type").and_then(Value::as_str) == Some("json_schema"))
+    {
+        chat.insert(
+            "response_format".into(),
+            json!({ "type": "json_schema", "json_schema": {
+                "name": f.get("name").cloned().unwrap_or(Value::Null),
+                "schema": f.get("schema").cloned().unwrap_or(Value::Null),
+                "strict": f.get("strict").cloned().unwrap_or(Value::Null),
+            } }),
+        );
+    }
     Ok(chat)
 }
 
@@ -350,9 +364,13 @@ fn unserved(b: &Map<String, Value>) -> Result<(), ApiError> {
             None => Ok(()),
             Some(f) => match f.get("type").and_then(Value::as_str) {
                 Some("text") => Ok(()),
+                Some("json_schema") if f.get("schema").is_some_and(Value::is_object) => Ok(()),
+                Some("json_schema") => Err(invalid(
+                    "text.format of type json_schema needs 'schema', an object",
+                )),
                 Some(kind) => Err(invalid(format!(
                     "text.format of type {kind} is not supported by this server: it answers in \
-                     plain text"
+                     plain text or a JSON schema"
                 ))),
                 None => Err(invalid(format!(
                     "text.format must be an object with a string 'type', not {f}"
@@ -1919,21 +1937,38 @@ mod tests {
         }
     }
 
-    /// `text.format` other than `text` (a JSON schema, a JSON object) asks for
-    /// structured output, which this server does not constrain: refused by
-    /// name. `text` passes.
+    /// `text.format` of type `json_schema` is the chat path's structured
+    /// output: the answer's text is a document of the schema, the pick the
+    /// largest allowed logit (the scripted rows tie, so the lowest id, `false`).
+    /// A `json_object`, a schema that is no object and a schema keyword the
+    /// subset does not read are refused by name; `text` passes.
     #[test]
-    fn structured_output_is_refused_by_name() {
+    fn text_format_json_schema_is_served_and_the_rest_refused_by_name() {
         let addr = scripted("ok");
-        for kind in ["json_schema", "json_object"] {
-            let body = json!({"input": "hi", "text": {"format": {"type": kind, "name": "x",
-                                                                  "schema": {}}}});
-            assert_refused(
-                addr,
-                "/v1/responses",
-                &body,
-                &format!("text.format of type {kind} is not supported"),
-            );
+        let format = |f: Value| json!({"input": "hi", "text": {"format": f}});
+        let v = answered(
+            addr,
+            "/v1/responses",
+            &format(json!({"type": "json_schema", "name": "x", "strict": true,
+                           "schema": {"type": "boolean"}})),
+        );
+        assert_eq!(v["output"][0]["content"][0]["text"], "false", "{v}");
+        for (f, part) in [
+            (
+                json!({"type": "json_object"}),
+                "text.format of type json_object is not supported",
+            ),
+            (
+                json!({"type": "json_schema", "name": "x"}),
+                "text.format of type json_schema needs 'schema'",
+            ),
+            (
+                json!({"type": "json_schema", "name": "x", "schema": {"type": "string",
+                                                                       "pattern": "a+"}}),
+                "the keyword \"pattern\" is not supported",
+            ),
+        ] {
+            assert_refused(addr, "/v1/responses", &format(f), part);
         }
         answered(
             addr,

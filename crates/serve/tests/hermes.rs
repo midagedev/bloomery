@@ -782,3 +782,73 @@ fn hw_a_prompt_ending_think_newline_opens_the_span() {
     assert_eq!(m["reasoning_content"], "The user greets me.", "{v}");
     assert_eq!(m["content"], "Hello!", "{v}");
 }
+
+/// A forced call on each template the server writes: `tool_choice` `required`
+/// or a named function answers one call of the listed tools, written in that
+/// template's markup and read back by its parser, whatever the rows favour
+/// (the scripted engine's rows tie at every choice, so the lowest id decides:
+/// `get_weather`, `celsius`, `1`, `false`).
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_forced_call_is_served_on_every_template() {
+    let tools = json!([
+        {"type": "function", "function": {"name": "get_weather", "parameters": {
+            "type": "object", "properties": {
+                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                "days": {"type": "integer", "enum": [1, 2, 3]}}}}},
+        {"type": "function", "function": {"name": "set_flag", "parameters": {
+            "type": "object", "properties": {"on": {"type": "boolean"}}}}},
+    ]);
+    let weather = json!({"unit": "celsius", "days": 1});
+    for (template, label) in [
+        (TEMPLATE, "hermes"),
+        (QWEN38, "qwen xml"),
+        (GLM5, "glm xml"),
+        (V41_TEMPLATE, "dsml"),
+    ] {
+        let addr = start_templated(Box::new(ScriptedEngine::new(4096, "")), template);
+        for (choice, name, args) in [
+            (json!("required"), "get_weather", weather.clone()),
+            (
+                json!({"type": "function", "function": {"name": "set_flag"}}),
+                "set_flag",
+                json!({"on": false}),
+            ),
+        ] {
+            for stream in [false, true] {
+                let r = post(
+                    addr,
+                    "/v1/chat/completions",
+                    &json!({
+                        "messages": [{"role": "user", "content": "go"}],
+                        "tools": tools, "tool_choice": choice, "stream": stream,
+                        "max_tokens": 600,
+                    }),
+                );
+                assert_eq!(r.status, 200, "{label}: {}", r.body);
+                let (finish, call) = if stream {
+                    let (finish, m) = fold_stream(&r.body).expect("no error event");
+                    assert_eq!(m["calls"].as_array().map(Vec::len), Some(1), "{label}: {m}");
+                    (finish, m["calls"][0].clone())
+                } else {
+                    let v = r.json();
+                    let c = &v["choices"][0];
+                    assert_eq!(
+                        c["message"]["tool_calls"].as_array().map(Vec::len),
+                        Some(1),
+                        "{label}: {v}"
+                    );
+                    (
+                        c["finish_reason"].clone(),
+                        c["message"]["tool_calls"][0]["function"].clone(),
+                    )
+                };
+                assert_eq!(finish, "tool_calls", "{label} {name} stream={stream}");
+                assert_eq!(call["name"], name, "{label}: {call}");
+                let got: Value = serde_json::from_str(call["arguments"].as_str().expect("text"))
+                    .expect("JSON arguments");
+                assert_eq!(got, args, "{label} {name} stream={stream}");
+            }
+        }
+    }
+}

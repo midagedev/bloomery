@@ -475,6 +475,96 @@ fn hw_unsupported_fields_are_refused() {
     }
 }
 
+/// Structured output on the mock: a `json_schema` answers a document of the
+/// schema on the chat path (whole and streamed) and on `/completion`, the same
+/// bytes each time because the request decodes greedily without a
+/// `temperature`; a draw, a penalty, `ignore_eos` and a think budget are
+/// refused by name.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_structured_output_is_served_greedily() {
+    let addr = start(4096);
+    let schema = json!({"type": "object", "properties": {
+        "id": {"type": "integer", "enum": [7, 8]}, "ok": {"type": "boolean"},
+        "tag": {"type": "string", "maxLength": 5}}});
+    let rf = json!({"type": "json_schema", "json_schema": {"name": "r", "schema": schema}});
+    let valid = |text: &str| {
+        let v: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert!([7, 8].contains(&v["id"].as_i64().expect("id")), "{v}");
+        assert!(v["ok"].is_boolean(), "{v}");
+        assert!(v["tag"].as_str().expect("tag").chars().count() <= 5, "{v}");
+    };
+    let chat = |extra: Value| {
+        let mut b = chat_body(json!({"response_format": rf, "max_tokens": 120}));
+        b.as_object_mut().expect("body").remove("temperature");
+        b.as_object_mut()
+            .expect("body")
+            .extend(extra.as_object().expect("extra").clone());
+        b
+    };
+    let whole = post(addr, "/v1/chat/completions", &chat(json!({})));
+    assert_eq!(whole.status, 200, "{}", whole.body);
+    let v = whole.json();
+    let text = v["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("content")
+        .to_owned();
+    valid(&text);
+    assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+    let again = post(addr, "/v1/chat/completions", &chat(json!({})));
+    assert_eq!(
+        again.json()["choices"][0]["message"]["content"],
+        text.as_str()
+    );
+    let streamed = post(addr, "/v1/chat/completions", &chat(json!({"stream": true})));
+    let folded: String = streamed
+        .body
+        .split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .filter(|e| *e != "[DONE]")
+        .filter_map(|e| serde_json::from_str::<Value>(e).ok())
+        .filter_map(|v| {
+            v["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(folded, text);
+    let c = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "ab", "response_format": rf, "n_predict": 120}),
+    );
+    assert_eq!(c.status, 200, "{}", c.body);
+    valid(c.json()["content"].as_str().expect("content"));
+    for (extra, part) in [
+        (
+            json!({"temperature": 0.7}),
+            "temperature 0.7 is not supported",
+        ),
+        (json!({"repeat_penalty": 1.3}), "repeat_penalty"),
+        (json!({"ignore_eos": true}), "ignore_eos is not supported"),
+        (
+            json!({"reasoning_budget": 4}),
+            "reasoning_budget is not supported",
+        ),
+    ] {
+        let r = post(addr, "/v1/chat/completions", &chat(extra.clone()));
+        assert_eq!(r.status, 400, "{extra}: {}", r.body);
+        let m = r.json()["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_owned();
+        assert!(m.contains(part), "{extra}: {m}");
+    }
+    let zero = post(
+        addr,
+        "/v1/chat/completions",
+        &chat(json!({"temperature": 0})),
+    );
+    assert_eq!(zero.status, 200, "{}", zero.body);
+}
+
 /// A chat content part this server cannot read is refused, never dropped: a
 /// media part by its kind, any other by its type, on both paths that render a
 /// chat, in llama-server's words; a `/completion` prompt object carrying media

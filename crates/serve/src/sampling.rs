@@ -37,6 +37,26 @@ pub fn argmax(logits: &[f32]) -> u32 {
     u32::try_from(best).expect("a vocabulary fits u32")
 }
 
+/// The largest logit among `ids`, ties to the lowest id and NaN above every
+/// number: [`argmax`]'s rule over a subset, whatever order `ids` comes in.
+/// `None` for an empty set or an id past the row.
+#[must_use]
+pub fn argmax_in(logits: &[f32], ids: impl IntoIterator<Item = u32>) -> Option<u32> {
+    let mut best: Option<(u32, f32)> = None;
+    for id in ids {
+        let v = *logits.get(usize::try_from(id).ok()?)?;
+        best = match best {
+            Some((b, bv)) => match v.total_cmp(&bv) {
+                std::cmp::Ordering::Greater => Some((id, v)),
+                std::cmp::Ordering::Equal if id < b => Some((id, v)),
+                _ => Some((b, bv)),
+            },
+            None => Some((id, v)),
+        };
+    }
+    best.map(|(id, _)| id)
+}
+
 fn sample(
     p: &SamplingParams,
     rng: &mut SplitMix64,
