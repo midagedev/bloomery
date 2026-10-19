@@ -176,3 +176,5 @@ crates/serve/src/lib.rs	glm	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/lib.rs	qwen	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/reasoning.rs	deepseek	4	baseline D 4: MK7 tool format and reasoning from the template
 crates/vision/src/media.rs	minicpm	1	baseline D 1: media design: VideoRule data per tower (vidcore)
+crates/gpu-gates/src/bin/gate_radio_tower.rs	clef	4	PIN(2026-10-20) clef: the image sets' reader every tower gate shares is still named after Clef (refset::clefvis)
+crates/gpu-gates/src/bin/gate_radio_tower.rs	nemotron	5	PIN(2026-10-20) nemotron: the RADIO tower is Bolt's mmproj; the gate bin names its model until the tower gates take the model from a profile row
