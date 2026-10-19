@@ -228,7 +228,7 @@ impl MoeLayer {
                 format!("{router} is not {n} f32 rows of {hidden} values"),
             ));
         }
-        let w = &*names.w;
+        let w = names.w;
         let layer = MoeLayer {
             router,
             bias: names.vector(l, EXP_PROBS_B, n)?,
