@@ -662,7 +662,7 @@ disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line,
 # builds on never split across parts), and runs the fixture, the helpers and the locals above and between them itself.
 # `--self-test` starts every part and sums their counts; `--self-test --part K` runs one (K, or `all`: the parts one
 # after another in this process, the serial form). The summary names the three slowest cases.
-SELFTEST_PARTS=17
+SELFTEST_PARTS=18
 self_test() {
   local self t h n=0 bad=0 out rc part=${1:-all} case_t0=$SECONDS
   gb_part() {
@@ -678,8 +678,18 @@ self_test() {
   # The fake HOMEs sit outside the tree copy, never under $t: the default OUT is $HOME/.cache/…, and a
   # HOME under the tree is an OUT the --out-inside-the-tree guard (rightly) refuses on a symlink-free host.
   h=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-home.XXXXXX") || { rm -rf "$t"; echo "gate-batch: self-test: no temporary directory for the fake HOMEs" >&2; return 70; }
+  # However the part ends — a failed command under set -e, a `return 70`, INT/TERM from a timeout (bash runs the EXIT trap on those) —
+  # the batches its cases started end before their fixture goes: a batch left running outlives $t and spins on a directory that is
+  # gone. part_exit is the one owner; end_batches (below, with stop_lanes) is what it calls once the part has started any.
+  # shellcheck disable=SC2329 # the EXIT trap below runs it
+  part_exit() { # <fixture dirs…>
+    local t=$1 h=$2 # the trap runs after self_test returned: its locals are gone, the dirs come as arguments
+    trap '' INT TERM # a second signal meanwhile must not cut the cleanup
+    ! declare -F end_batches > /dev/null || end_batches || true
+    rm -rf "$@"
+  }
   # shellcheck disable=SC2064 # the paths are fixed now
-  trap "rm -rf '$t' '$h'" EXIT
+  trap "part_exit '$t' '$h'" EXIT
   mkdir -p "$t/tools"
   cp "$self" "$t/tools/gate-batch.sh"
   # One justfile for every part. A recipe named by one part's cases can be appended inside that part
@@ -1315,24 +1325,18 @@ FP
       if call_alive "$p"; then kill -KILL "$p" 2> /dev/null || true; fi
     done < <(find "$t" "$h" -path '*/lane-*.box/*' -type f 2> /dev/null)
   }
-  stop_lanes() { # <case output dir>: no registered lane or item may write after this returns
-    local dir=$1 f p k live pids=''
-    for f in "$dir"/lane-*.pid "$dir"/lane-*.child; do
-      [ -f "$f" ] || continue
-      p=$(cat "$f")
-      # A completed case leaves pid files; never signal a pid reused outside this fixture.
-      case $(ps -o args= -p "$p" 2> /dev/null) in *"$t/"*) ;; *) continue ;; esac
-      pids="$pids $p"
-      kill -TERM "$p" 2> /dev/null || true
-    done
+  end_pids() { # <label> <pids…>: TERM each, wait until it is gone, KILL what is still up after 5 s; 70 naming what stays
+    local label=$1 p k live
+    shift
+    for p in "$@"; do kill -TERM "$p" 2> /dev/null || true; done
     for ((k = 0; k <= 100; k++)); do
       live=''
-      for p in $pids; do
+      for p in "$@"; do
         if call_alive "$p"; then live="$live $p"; fi
       done
-      [ -n "$live" ] || break
+      [ -n "$live" ] || return 0
       if [ "$k" = 100 ]; then
-        echo "gate-batch: self-test: fixture writers did not stop:$live ($dir)" >&2
+        echo "gate-batch: self-test: fixture writers did not stop:$live ($label)" >&2
         return 70
       fi
       if [ "$k" = 50 ]; then
@@ -1340,6 +1344,40 @@ FP
       fi
       sleep 0.1
     done
+  }
+  stop_lanes() { # <case output dir>: no registered lane or item may write after this returns
+    local dir=$1 f p pids=''
+    for f in "$dir"/lane-*.pid "$dir"/lane-*.child; do
+      [ -f "$f" ] || continue
+      p=$(cat "$f")
+      # A completed case leaves pid files; never signal a pid reused outside this fixture.
+      case $(ps -o args= -p "$p" 2> /dev/null) in *"$t/"*) ;; *) continue ;; esac
+      pids="$pids $p"
+    done
+    # shellcheck disable=SC2086 # the pids are words
+    end_pids "$dir" $pids || return $?
+    reap_calls
+  }
+  # shellcheck disable=SC2329 # part_exit runs it, from the trap
+  end_batches() { # the part's batches, then their lanes and items: what part_exit calls before it removes the fixture
+    local f p pids=''
+    # The part's own background jobs first: each case's batch is one, and its stop handler ends the lanes and the box calls under it.
+    jobs -rp > "$t/end.jobs"
+    while read -r p; do
+      case $(ps -o args= -p "$p" 2> /dev/null) in *"$t/"*) pids="$pids $p" ;; esac
+    done < "$t/end.jobs"
+    # shellcheck disable=SC2086 # the pids are words
+    end_pids "the part's batches" $pids || true
+    # Then every lane and item a pid file names, wherever the batch wrote it (a batch started where the part's job table cannot
+    # see it, such as a command substitution, ends by itself once its lanes are gone).
+    pids=''
+    while read -r f; do
+      p=$(cat "$f")
+      call_alive "$p" || continue
+      case $(ps -o args= -p "$p" 2> /dev/null) in *"$t/"*) pids="$pids $p" ;; esac
+    done < <(find "$t" "$h" \( -name 'lane-*.pid' -o -name 'lane-*.child' \) -type f 2> /dev/null)
+    # shellcheck disable=SC2086 # the pids are words
+    end_pids "the part's lanes" $pids || true
     reap_calls
   }
   fresh_state() { # <paths…>: the last case's box calls ended, then fake-state and the paths removed
@@ -3646,6 +3684,84 @@ EOS
   if [ "$rc" = 70 ]; then pass 'wait-hold: a lease that cannot be tested: rc 70'; else fail 'wait-hold: a lease that cannot be tested: rc 70' "rc=$rc"; fi
   want 'wait-hold: … named' "$t/out-wh-70.log" '^gate-batch: the wait probe through box.sh failed \(rc 70; '
   fi
+  if gb_part 18; then
+  # A part cut between starting a batch and ending it — a failed command under set -e, a TERM from a timeout — ends the batch too:
+  # an orphaned batch spins on a fixture directory that is gone. The inner run is a part of this script under a TMPDIR of its own,
+  # holding one batch with an item running; GATE_BATCH_LEAK_PROBE says how the part is cut (abort: the next command fails, term:
+  # the outer case sends TERM). The outer case then counts the processes still naming that part's fixture: none is the contract.
+  if [ -n "${GATE_BATCH_LEAK_PROBE:-}" ]; then
+    # The batch is the deaf-watch copy: once its fixture is gone it never ends by itself, so what the outer case finds is what the part
+    # left, not a race with a batch winding down.
+    mutant_of leak-deaf "s|^      \*) dead_now=\"\\\$dead_now \\\$lane\"; continue ;;\$|      *) continue ;; # MUTANT leak-deaf|" '# MUTANT leak-deaf$'
+    fresh_state "$t/target/c-leak"
+    BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-leak.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-leak.tsv \
+      bash "$t/tools/gate-batch-leak-deaf.sh" --out "$t/target/c-leak" --round-ledger 'plain-any@FAKE_SLEEP=20' > "$t/out-leak.log" 2>&1 &
+    sp=$!
+    k=0
+    # The item's own call reaching the fake box (the batch's earlier calls are another line) means the lane and its item are up.
+    while ! grep -q 'gpu-gate.sh other' "$t/fake-state/seen.log" 2> /dev/null && [ "$k" -lt 30 ]; do
+      sleep 1
+      k=$((k + 1))
+    done
+    if grep -q 'gpu-gate.sh other' "$t/fake-state/seen.log" 2> /dev/null; then echo 'leak probe: item running'; fi
+    if [ "$GATE_BATCH_LEAK_PROBE" = abort ]; then false; fi
+    wait "$sp" || true
+  else
+  # leak_probe <mode> <script>: one cut part of <script>. It prints a line for each process still naming that part's fixture, and for
+  # each way the probe itself went wrong, then `probe done`.
+  leak_probe() {
+    local mode=$1 script=$2 dir pid k=0 rc=0 f
+    dir=$(mktemp -d "$t/leak.XXXXXX")
+    GATE_BATCH_LEAK_PROBE=$mode GATE_BATCH_CASE_DIR='' TMPDIR=$dir bash "$script" --self-test --part 18 > "$dir.out" 2>&1 &
+    pid=$!
+    if [ "$mode" = term ]; then
+      while ! grep -q '^leak probe: item running$' "$dir.out" 2> /dev/null && kill -0 "$pid" 2> /dev/null && [ "$k" -lt 120 ]; do
+        sleep 0.5
+        k=$((k + 1))
+      done
+      kill -TERM "$pid" 2> /dev/null || true
+    fi
+    k=0
+    while kill -0 "$pid" 2> /dev/null && [ "$k" -lt 240 ]; do
+      sleep 0.5
+      k=$((k + 1))
+    done
+    if kill -0 "$pid" 2> /dev/null; then kill -KILL "$pid" 2> /dev/null || true; echo "the cut part was still running after $((k / 2)) s"; fi
+    wait "$pid" 2> /dev/null || rc=$?
+    grep -q '^leak probe: item running$' "$dir.out" || echo "no batch was running when the part was cut ($(tail -n 2 "$dir.out" | tr '\n' ' '))"
+    [ "$rc" != 0 ] || echo "the part was not cut (rc 0)"
+    ps -axo pid=,args= > "$dir.ps"
+    grep -F -- "$dir/gate-batch-test." "$dir.ps" > "$dir.left" || true
+    cut -c1-160 "$dir.left"
+    # A red probe ends what it found: only a pid whose args still name this probe's own directory is signalled.
+    while read -r f _; do
+      case $(ps -o args= -p "$f" 2> /dev/null) in *"$dir/gate-batch-test."*) ;; *) continue ;; esac
+      kill -TERM "$f" 2> /dev/null || true
+      k=0
+      while kill -0 "$f" 2> /dev/null && [ "$k" -lt 30 ]; do
+        sleep 0.1
+        k=$((k + 1))
+      done
+      if kill -0 "$f" 2> /dev/null; then kill -KILL "$f" 2> /dev/null || true; fi
+    done < "$dir.left"
+    echo 'probe done' # a probe that ended early on a failed command has no such line, and is not a pass
+  }
+  mutant_of leak-noend 's|^    ! declare -F end_batches > /dev/null \|\| end_batches \|\| true$|    true # MUTANT leak-noend|' '# MUTANT leak-noend$'
+  ( leak_probe abort "$t/tools/gate-batch.sh" > "$t/leak-abort.res" ) &
+  ( leak_probe term "$t/tools/gate-batch.sh" > "$t/leak-term.res" ) &
+  ( leak_probe abort "$t/tools/gate-batch-leak-noend.sh" > "$t/leak-abort-m.res" ) &
+  ( leak_probe term "$t/tools/gate-batch-leak-noend.sh" > "$t/leak-term-m.res" ) &
+  wait
+  if [ "$(cat "$t/leak-abort.res")" = 'probe done' ]; then pass 'part exit: a part that fails a command mid-case leaves no batch running'
+  else fail 'part exit: a part that fails a command mid-case leaves no batch running' "$(cat "$t/leak-abort.res")"; fi
+  if [ "$(cat "$t/leak-term.res")" = 'probe done' ]; then pass 'part exit: a part that is sent TERM mid-case leaves no batch running'
+  else fail 'part exit: a part that is sent TERM mid-case leaves no batch running' "$(cat "$t/leak-term.res")"; fi
+  if grep -Eq '^ *[0-9]+ ' "$t/leak-abort-m.res" && [ "$(tail -n 1 "$t/leak-abort-m.res")" = 'probe done' ]; then pass 'part exit mutant: without the end of the batches a part that fails a command leaves its batch running'
+  else fail 'part exit mutant: without the end of the batches a part that fails a command leaves its batch running' "$(cat "$t/leak-abort-m.res")"; fi
+  if grep -Eq '^ *[0-9]+ ' "$t/leak-term-m.res" && [ "$(tail -n 1 "$t/leak-term-m.res")" = 'probe done' ]; then pass 'part exit mutant: without the end of the batches a part sent TERM leaves its batch running'
+  else fail 'part exit mutant: without the end of the batches a part sent TERM leaves its batch running' "$(cat "$t/leak-term-m.res")"; fi
+  fi
+  fi
   # One row per case (seconds, then the name). A miss is a case the summary cannot name.
   [ -f "$t/case-times.tsv" ] || : > "$t/case-times.tsv"
   local times
@@ -3701,11 +3817,20 @@ except BlockingIOError:
 main_drop() { exec 9>&-; }
 
 
+# The parts still running get TERM, then this shell waits for them to end. $1 holds the list of running jobs.
+parts_end() {
+  local p
+  trap '' INT TERM # a second signal meanwhile must not cut the wait
+  jobs -rp > "$1/end.jobs" 2> /dev/null || return 0
+  while read -r p; do kill -TERM "$p" 2> /dev/null || true; done < "$1/end.jobs"
+  wait
+}
+
 # --self-test: every part in a process of its own, their lines in part order, one summary of the counts. The guards in this
 # file must name exactly parts 1..SELFTEST_PARTS: a part with no guard would run no case and a guard past the last part would
 # never run, each silently.
 self_test_parts() {
-  local self tmp k line a b ok=0 total=0 red=0 guards want='' slowest
+  local self tmp k line a b ok=0 total=0 red=0 guards want='' slowest rc pids=()
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   guards=$(grep -o 'gb_part [0-9][0-9]*; then' "$self" | grep -o '[0-9][0-9]*' | sort -un | tr '\n' ' ')
   for ((k = 1; k <= SELFTEST_PARTS; k++)); do want="$want$k "; done
@@ -3714,14 +3839,21 @@ self_test_parts() {
     return 70
   fi
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-parts.XXXXXX") || { echo "gate-batch: self-test: no temporary directory" >&2; return 70; }
+  # A cut self-test (INT/TERM from a timeout; bash runs the EXIT trap on those) hands the signal on to the parts still running and waits
+  # while each ends its own batches (self_test's part_exit): a part left running goes on writing into a directory that is gone.
   # shellcheck disable=SC2064 # the path is fixed now
-  trap "rm -rf '$tmp'" EXIT
+  trap "parts_end '$tmp'; rm -rf '$tmp'" EXIT
   # Each part copies its case rows out before its tree goes. Not a BLOOMERY_* name: every such name
-  # is a row of the lever registry.
+  # is a row of the lever registry. A part is this shell's own child, so parts_end reaches it.
   for ((k = 1; k <= SELFTEST_PARTS; k++)); do
-    ( set +e; GATE_BATCH_CASE_DIR=$tmp bash "$self" --self-test --part "$k" > "$tmp/$k.out" 2>&1; echo $? > "$tmp/$k.rc" ) &
+    GATE_BATCH_CASE_DIR=$tmp bash "$self" --self-test --part "$k" > "$tmp/$k.out" 2>&1 &
+    pids[k]=$!
   done
-  wait
+  for ((k = 1; k <= SELFTEST_PARTS; k++)); do
+    rc=0
+    wait "${pids[$k]}" || rc=$?
+    echo "$rc" > "$tmp/$k.rc"
+  done
   for ((k = 1; k <= SELFTEST_PARTS; k++)); do
     cat "$tmp/$k.out"
     line=$(tail -n 1 "$tmp/$k.out")
