@@ -23,6 +23,22 @@
 //!   shared expert as a one-expert `_sel` over the pass's `m` slots — the
 //!   step's launches at `m` rows, in the step's order.
 //!
+//! A placed load ([`super::placed`]) walks the same layers through the host
+//! tier's batch port ([`PlacedPass`], [`sched::walk`]): a layer with no host
+//! share runs as above; a hosted MoE layer runs three parts around the
+//! host's union over the pass's rows —
+//!
+//! - **front**: the norm, the router, the latent down, the download of the
+//!   rows, weights and ids, and each slot's place in the card's stacks
+//!   (`ds41_ffn_places`);
+//! - **shadow**, under the host's union: the card's slots over those places
+//!   (past [`COLS`] rows the grouped GEMMs over the layer's remapped route
+//!   table, `gemm_route_remap`; up to them the `_sel` launches, a
+//!   [`HOST`](crate::hybrid::HOST) slot's warps returning first) and the
+//!   shared expert, none of the card's when the layer holds no expert;
+//! - **back**: the card slots' weighted sum (`ds41_ffn_card_acc_9`) plus the
+//!   host's sums, the latent up, the shared expert, the residual.
+//!
 //! The head reads the last row of the prompt's last pass only.
 //!
 //! After [`GpuModel::prefill_with`] the stores (the scan states, the conv
@@ -37,19 +53,23 @@
 
 use super::body::{Body, Layer};
 use super::moe::{MoeLayer, MoeShape};
+use super::placed::{Placed, PlacedSide};
 use super::router::Routers;
 use super::router::{COUNTS, TOP_K};
 use crate::arch::hybrid::{RowBuffers, Shape, Site, norm_rows, residual_rows};
+use crate::card_slots::CardAcc;
 use crate::fault::FaultSink;
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{HEAD, partials_ms_len, partials_v_len};
-use crate::flash_gqa_prefill::{GqaPrefillArgs, SplitScratch};
+use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, SplitScratch};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::gemm::Gemm32Kernels;
 use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::head::Head;
+use crate::host::BatchLeg;
+use crate::host::run::HostRun;
 use crate::kquant::SelDown;
-use crate::mamba2::{Mamba2PassScratch, PassScan};
+use crate::mamba2::{Mamba2Kernels, Mamba2PassScratch, PassScan};
 use crate::model::GpuModel;
 use crate::model::fit::{FIT_RESERVE, act_col_bytes, act32_col_bytes, largest_fit, route_bytes};
 use crate::q38::EmbedQ8Args;
@@ -61,6 +81,7 @@ use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act, Window, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
+use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 const WHAT: &str = "nemotron_h_moe::prefill";
 
@@ -102,12 +123,20 @@ pub(super) struct PassSizes {
     run_k: Vec<usize>,
     /// The q8 blocks of 32 the wide GEMMs read, one a site width.
     wide_k: Vec<usize>,
+    /// Whether the pass runs on a placed load: its rows' places and the
+    /// host's sums are buffers of the pass.
+    placed: bool,
 }
 
 impl PassSizes {
     /// The sizes for `sh`, the MoE shape `moe`, `n_head` query heads and
-    /// `layers`' widths. Host-side only; allocates nothing on the card.
-    pub(super) fn of((sh, moe, n_head): (&Shape, MoeShape, usize), layers: &[Layer]) -> PassSizes {
+    /// `layers`' widths, for a placed load or not. Host-side only; allocates
+    /// nothing on the card.
+    pub(super) fn of(
+        (sh, moe, n_head): (&Shape, MoeShape, usize),
+        layers: &[Layer],
+        placed: bool,
+    ) -> PassSizes {
         let moes = || {
             layers.iter().filter_map(|l| match l {
                 Layer::Moe(m) => Some(m),
@@ -134,8 +163,10 @@ impl PassSizes {
             }
         };
         for m in moes() {
-            let n = m.route.n_expert();
-            if !route_n.contains(&n) {
+            // The table runs over the card's experts of the layer: every
+            // expert on a whole-card load, the plan's share on a placed one.
+            let n = m.n_card;
+            if n > 0 && !route_n.contains(&n) {
                 route_n.push(n);
             }
             for (k, per_row) in [
@@ -168,7 +199,14 @@ impl PassSizes {
             gemm_acts,
             run_k,
             wide_k,
+            placed,
         }
+    }
+
+    /// The width of a row of the host's sums: the latent on a placed load,
+    /// none on a whole-card one.
+    fn hsum_width(&self) -> usize {
+        if self.placed { self.moe.latent } else { 0 }
     }
 
     /// The device bytes the pass's buffers hold at `rows` rows — every
@@ -199,11 +237,13 @@ impl PassSizes {
             + 2 * z(self.n_head * HEAD) // q, attn
             + 2 * z(kv_width) // k, v
             + 2 * z(0) // RowBuffers' up, act (no MLP width)
+            + z(self.hsum_width()) // hsum
             + (partials_v_len(attn_rows, self.n_head)
                 + partials_ms_len(attn_rows, self.n_head))
                 * f;
         let u32s = (P_ROWS + sh.n_kv + rows // words
             + cut * TOP_K // ids
+            + cut * TOP_K // sel
             + cut // zero_ids
             + 2 * cut) // RowBuffers' pos, n_keys
             * size_of::<u32>();
@@ -242,8 +282,10 @@ impl PassSizes {
     }
 }
 
-/// The rows one pass takes on `free` card bytes. With `asked` unset, the
-/// largest multiple of 64 in `64..=min(PASS_ROWS_MAX, ctx)` — the whole `ctx`
+/// The rows one pass takes on `free` card bytes, at most `cap` (the load's
+/// most: [`PASS_ROWS_MAX`] on a whole-card load, the host union's columns on
+/// a placed one). With `asked` unset, the
+/// largest multiple of 64 in `64..=min(cap, ctx)` — the whole `ctx`
 /// where that is below 64 — whose buffers ([`Prompt::need`]) plus
 /// [`FIT_RESERVE`] fit ([`largest_fit`]), or a named refusal when not even
 /// the smallest does: a default the user did not set shrinks and never
@@ -255,9 +297,10 @@ pub(super) fn choose_pass_rows(
     sizes: &PassSizes,
     (ctx, asked): (usize, Option<usize>),
     free: usize,
+    cap: usize,
 ) -> Result<usize, GpuError> {
     const WHAT_FIT: &str = "nemotron_h_moe::pass_rows";
-    let hi = PASS_ROWS_MAX.min(ctx);
+    let hi = cap.min(ctx);
     if hi == 0 {
         return Err(GpuError::shape(
             WHAT_FIT,
@@ -292,7 +335,7 @@ pub(super) fn choose_pass_rows(
                 WHAT_FIT,
                 format!(
                     "a pass of {rows} rows; a pass holds 1..={hi} rows here (at most \
-                     {PASS_ROWS_MAX} and the context {ctx}), at 64 past it a multiple of 64"
+                     {cap} and the context {ctx}), at 64 past it a multiple of 64"
                 ),
             ))
         }
@@ -321,6 +364,9 @@ pub(super) struct Prompt {
     x: [DeviceBuffer<f32>; 2],
     /// Every other buffer of the pass.
     b: PassBufs,
+    /// The host's sums for the pass's rows, `latent` values a row: what the
+    /// host tier's batch port uploads into on a placed load.
+    hsum: DeviceBuffer<f32>,
     /// What the Mamba-2 pass precomputes: every token's conv outputs and
     /// per-head `σ`/`dA` ([`Mamba2PassScratch`]), sized to these `rows`.
     mamba2: Mamba2PassScratch,
@@ -342,6 +388,9 @@ struct PassBufs {
     probs: DeviceBuffer<f32>,
     ids: DeviceBuffer<u32>,
     weights: DeviceBuffer<f32>,
+    /// Each routed slot's place in the card's stacks (`TOP_K` a row), what a
+    /// placed load's card slots and sum read.
+    sel: DeviceBuffer<u32>,
     /// The latent down's rows; the slots' up rows (the widest expert); the
     /// slots' down rows; the rows' weighted sums.
     lat: DeviceBuffer<f32>,
@@ -454,6 +503,7 @@ impl Prompt {
                 probs: z(sizes.n_expert)?,
                 ids: DeviceBuffer::zeroed(stream, cut * TOP_K)?,
                 weights: z(TOP_K)?,
+                sel: DeviceBuffer::zeroed(stream, cut * TOP_K)?,
                 lat: z(moe.latent)?,
                 up: z(TOP_K * sizes.ff)?,
                 down: z(TOP_K * moe.latent)?,
@@ -471,6 +521,7 @@ impl Prompt {
                 },
                 split: SplitScratch::new(stream, rows, sh.n_kv)?,
             },
+            hsum: z(sizes.hsum_width())?,
             mamba2: Mamba2PassScratch::new(stream, sh.mamba, rows)?,
         };
         let need = Prompt::need(sizes, rows);
@@ -497,7 +548,7 @@ impl Prompt {
         let b = &self.b;
         let f = [
             &self.x[0], &self.x[1], &b.kh, &b.vh, &b.probs, &b.weights, &b.lat, &b.up, &b.down,
-            &b.moe, &b.sh_up, &b.sh, &b.sum,
+            &b.moe, &b.sh_up, &b.sh, &b.sum, &self.hsum,
         ]
         .iter()
         .map(|b| b.num_bytes())
@@ -505,6 +556,7 @@ impl Prompt {
         f + b.buf.bytes()
             + b.words.num_bytes()
             + b.ids.num_bytes()
+            + b.sel.num_bytes()
             + b.zero_ids.num_bytes()
             + b.slots.iter().map(|s| s.2.device_bytes()).sum::<usize>()
             + b.arms.runs.iter().map(Q8Act::device_bytes).sum::<usize>()
@@ -656,19 +708,29 @@ fn stack<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<u32>, GpuErr
     }
 }
 
-/// One latent MoE layer over the pass's `m` rows of `xn` (the layer's normed
-/// rows), the layer's delta into `p.sum`: the step's order (`moe.rs`'s module
-/// doc) at `m` rows.
-fn moe_rows(
+/// Where a layer's card slots read their experts from.
+#[derive(Clone, Copy)]
+enum Places<'a> {
+    /// Every expert of the layer is resident, in the router's id order: the
+    /// ids are the places.
+    Ids,
+    /// The plan's share of the layer is resident: `sel` holds each slot's
+    /// place in the stacks (or [`HOST`](crate::hybrid::HOST)), and `map` the
+    /// layer's expert to place, which the GEMMs' route table is built from.
+    Cut { map: &'a DeviceBuffer<u32> },
+}
+
+/// Layer `l`'s router over the pass's `m` rows of `xn` (the layer's normed
+/// rows): every expert's score, the kept ids and their weights, and the last
+/// row's kept in the layer's own results.
+fn moe_route(
     cx: &Cx<'_>,
     p: &mut PassBufs,
     (l, ml, sh): (usize, &mut MoeLayer, MoeShape),
-    hidden: usize,
 ) -> Result<(), GpuError> {
     let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
     let stream = gpu.stream();
     let fault = gpu.layer_sink(l)?;
-    let iq = cx.iq;
     cx.routers.enqueue_rows(
         stream,
         cx.gpu,
@@ -683,7 +745,128 @@ fn moe_rows(
         fault,
     )?;
     ml.route
-        .enqueue_row_from(stream, (&p.probs, &p.ids, &p.weights), m - 1)?;
+        .enqueue_row_from(stream, (&p.probs, &p.ids, &p.weights), m - 1)
+}
+
+/// Layer `l`'s routed experts over the pass's `TOP_K · m` slots into `p.up`
+/// and `p.down` (the up and the squared-ReLU'd down rows of every slot a card
+/// expert serves), from the latent rows `p.lat`: past [`COLS`] rows the
+/// grouped IQ2_XXS GEMMs, up to them the `_sel` launches. A slot the host
+/// serves ([`Places::Cut`]) is neither read nor written.
+fn moe_card_experts(
+    cx: &Cx<'_>,
+    p: &mut PassBufs,
+    (l, ml, sh): (usize, &MoeLayer, MoeShape),
+    places: Places<'_>,
+) -> Result<(), GpuError> {
+    let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
+    let stream = gpu.stream();
+    let fault = gpu.layer_sink(l)?;
+    let slots = TOP_K * m;
+    // The grouped GEMM's IQ2_XXS entry, where the build has one.
+    if let Some(ty) = GemmWeight::from_ggml(GgmlType::IQ2_XXS)
+        .ok()
+        .filter(|_| m > COLS)
+    {
+        return experts_gemm(
+            cx,
+            &mut p.ex,
+            (fault, ml, sh.latent, ty),
+            (&p.ids, places),
+            (&p.lat, &mut p.up, &mut p.down),
+        );
+    }
+    let sel = match places {
+        Places::Ids => &p.ids,
+        Places::Cut { .. } => &p.sel,
+    };
+    {
+        let act = slot_form(&mut p.slots, sh.latent, m)?;
+        gpu.quantize_q8_1_cols_at(&p.lat, 0, act, m, fault)?;
+        let up = SelDown {
+            w: stack(w, ml.up()?)?,
+            act,
+            sel,
+            n_slots: slots,
+            rows_per_expert: ml.ff,
+        };
+        cx.iq
+            .enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, TOP_K, fault, &mut p.up)?;
+    }
+    let act = slot_form(&mut p.slots, ml.ff, slots)?;
+    gpu.quantize_q8_1_cols_at_relu_sqr(&p.up, 0, act, slots, fault)?;
+    let down = SelDown {
+        w: stack(w, ml.down()?)?,
+        act,
+        sel,
+        n_slots: slots,
+        rows_per_expert: sh.latent,
+    };
+    cx.iq
+        .enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.down)
+}
+
+/// Layer `l`'s shared expert over the pass's `m` rows of `xn` into `p.sh`:
+/// past [`COLS`] rows its GEMMs, up to them the one-expert `_sel` launches.
+fn moe_shared(
+    cx: &Cx<'_>,
+    p: &mut PassBufs,
+    (l, ml, sh): (usize, &MoeLayer, MoeShape),
+    hidden: usize,
+) -> Result<(), GpuError> {
+    let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
+    let stream = gpu.stream();
+    let fault = gpu.layer_sink(l)?;
+    if let Some(ty) = GemmWeight::from_ggml(GgmlType::IQ2_XXS)
+        .ok()
+        .filter(|_| m > COLS)
+    {
+        return shared_gemm(
+            cx,
+            (&mut p.ex, &p.arms.route),
+            (fault, ml, sh.shared_ff, hidden, ty),
+            &p.buf.xn,
+            (&mut p.sh_up, &mut p.sh),
+        );
+    }
+    {
+        let act = slot_form(&mut p.slots, hidden, m)?;
+        gpu.quantize_q8_1_cols_at(&p.buf.xn, 0, act, m, fault)?;
+        let up = SelDown {
+            w: stack(w, &ml.up_shexp)?,
+            act,
+            sel: &p.zero_ids,
+            n_slots: m,
+            rows_per_expert: sh.shared_ff,
+        };
+        cx.iq
+            .enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &up, fault, &mut p.sh_up)?;
+    }
+    let act = slot_form(&mut p.slots, sh.shared_ff, m)?;
+    gpu.quantize_q8_1_cols_at_relu_sqr(&p.sh_up, 0, act, m, fault)?;
+    let down = SelDown {
+        w: stack(w, &ml.down_shexp)?,
+        act,
+        sel: &p.zero_ids,
+        n_slots: m,
+        rows_per_expert: hidden,
+    };
+    cx.iq
+        .enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.sh)
+}
+
+/// One latent MoE layer, every expert resident, over the pass's `m` rows of
+/// `xn` (the layer's normed rows), the layer's delta into `p.sum`: the step's
+/// order (`moe.rs`'s module doc) at `m` rows.
+fn moe_rows(
+    cx: &Cx<'_>,
+    p: &mut PassBufs,
+    (l, ml, sh): (usize, &mut MoeLayer, MoeShape),
+    hidden: usize,
+) -> Result<(), GpuError> {
+    let (gpu, m) = (cx.gpu, cx.m);
+    let stream = gpu.stream();
+    moe_route(cx, p, (l, ml, sh))?;
     project_rows(
         cx,
         &mut p.arms,
@@ -692,45 +875,7 @@ fn moe_rows(
         &p.buf.xn,
         &mut p.lat,
     )?;
-    let slots = TOP_K * m;
-    // The grouped GEMM's IQ2_XXS entry, where the build has one.
-    let gemm = GemmWeight::from_ggml(GgmlType::IQ2_XXS)
-        .ok()
-        .filter(|_| m > COLS);
-    if let Some(ty) = gemm {
-        experts_gemm(
-            cx,
-            &mut p.ex,
-            (fault, ml, sh.latent, ty),
-            &p.ids,
-            (&p.lat, &mut p.up, &mut p.down),
-        )?;
-    } else {
-        {
-            let act = slot_form(&mut p.slots, sh.latent, m)?;
-            gpu.quantize_q8_1_cols_at(&p.lat, 0, act, m, fault)?;
-            let up = SelDown {
-                w: stack(w, ml.up()?)?,
-                act,
-                sel: &p.ids,
-                n_slots: slots,
-                rows_per_expert: ml.ff,
-            };
-            iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, TOP_K, fault, &mut p.up)?;
-        }
-        {
-            let act = slot_form(&mut p.slots, ml.ff, slots)?;
-            gpu.quantize_q8_1_cols_at_relu_sqr(&p.up, 0, act, slots, fault)?;
-            let down = SelDown {
-                w: stack(w, ml.down()?)?,
-                act,
-                sel: &p.ids,
-                n_slots: slots,
-                rows_per_expert: sh.latent,
-            };
-            iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.down)?;
-        }
-    }
+    moe_card_experts(cx, p, (l, ml, sh), Places::Ids)?;
     gpu.elem().enqueue_weighted_sum(
         stream,
         &p.down,
@@ -748,40 +893,7 @@ fn moe_rows(
         &p.moe,
         &mut p.buf.delta,
     )?;
-    if let Some(ty) = gemm {
-        shared_gemm(
-            cx,
-            (&mut p.ex, &p.arms.route),
-            (fault, ml, sh.shared_ff, hidden, ty),
-            &p.buf.xn,
-            (&mut p.sh_up, &mut p.sh),
-        )?;
-    } else {
-        {
-            let act = slot_form(&mut p.slots, hidden, m)?;
-            gpu.quantize_q8_1_cols_at(&p.buf.xn, 0, act, m, fault)?;
-            let up = SelDown {
-                w: stack(w, &ml.up_shexp)?,
-                act,
-                sel: &p.zero_ids,
-                n_slots: m,
-                rows_per_expert: sh.shared_ff,
-            };
-            iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &up, fault, &mut p.sh_up)?;
-        }
-        {
-            let act = slot_form(&mut p.slots, sh.shared_ff, m)?;
-            gpu.quantize_q8_1_cols_at_relu_sqr(&p.sh_up, 0, act, m, fault)?;
-            let down = SelDown {
-                w: stack(w, &ml.down_shexp)?,
-                act,
-                sel: &p.zero_ids,
-                n_slots: m,
-                rows_per_expert: hidden,
-            };
-            iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.sh)?;
-        }
-    }
+    moe_shared(cx, p, (l, ml, sh), hidden)?;
     gpu.elem()
         .enqueue_add(stream, &p.buf.delta, &p.sh, m * hidden, &mut p.sum)
 }
@@ -799,14 +911,16 @@ fn gemm_form(
 }
 
 /// The routed experts over the pass's `TOP_K · m` slots past [`COLS`] rows:
-/// the slots' table from `ids`, the up as one grouped IQ2_XXS GEMM on the
-/// latent rows `lat` (each row's `TOP_K` slots reading its column), the
-/// squared ReLU, the down as one GEMM on each slot's own row.
+/// the slots' table from `ids` (through the layer's map to the card's places
+/// under [`Places::Cut`], a slot the host serves in no tile), the up as one
+/// grouped IQ2_XXS GEMM on the latent rows `lat` (each row's `TOP_K` slots
+/// reading its column), the squared ReLU, the down as one GEMM on each slot's
+/// own row.
 fn experts_gemm(
     cx: &Cx<'_>,
     ex: &mut ExpertArms,
     (fault, ml, latent, ty): (FaultSink, &MoeLayer, usize, GemmWeight),
-    ids: &DeviceBuffer<u32>,
+    (ids, places): (&DeviceBuffer<u32>, Places<'_>),
     (lat, up, down): (
         &DeviceBuffer<f32>,
         &mut DeviceBuffer<f32>,
@@ -816,14 +930,19 @@ fn experts_gemm(
     let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
     let stream = gpu.stream();
     let slots = TOP_K * m;
-    let n = ml.route.n_expert();
+    let n = ml.n_card;
     let route = ex
         .routes
         .iter_mut()
         .find(|r| r.0 == n)
         .map(|r| &mut r.1)
         .ok_or_else(|| GpuError::shape(WHAT, format!("no routed table of {n} experts")))?;
-    cx.wk.gemm.enqueue_route(stream, ids, slots, route, fault)?;
+    match places {
+        Places::Ids => cx.wk.gemm.enqueue_route(stream, ids, slots, route, fault)?,
+        Places::Cut { map } => cx
+            .g32
+            .enqueue_route_remap(stream, ids, map, slots, route, fault)?,
+    }
     let route = &*route;
     {
         let a = gemm_form(&mut ex.acts, latent, m)?;
@@ -901,10 +1020,384 @@ fn shared_gemm(
     )
 }
 
+/// A pass's layer walk: what every layer of the pass reads and writes. The
+/// residual stream alternates between the two buffers `x`, `cur` the one the
+/// next layer reads.
+struct PassWalk<'a> {
+    cx: Cx<'a>,
+    sh: Shape,
+    moe: MoeShape,
+    /// The query heads' width a row, `n_head · HEAD`.
+    q_width: usize,
+    layers: &'a mut [Layer],
+    x: &'a mut [DeviceBuffer<f32>; 2],
+    b: &'a mut PassBufs,
+    mamba: &'a Mamba2Kernels,
+    mamba2: &'a mut Mamba2PassScratch,
+    flash: &'a FlashGqaPrefill,
+    cur: usize,
+}
+
+impl PassWalk<'_> {
+    /// Layer `l` whole over the pass's rows, its residual into the next
+    /// stream: a Mamba-2 layer, an attention layer, or a MoE layer with every
+    /// expert resident.
+    fn layer(&mut self, l: usize) -> Result<(), GpuError> {
+        let PassWalk {
+            cx,
+            sh,
+            moe,
+            q_width,
+            layers,
+            x,
+            b,
+            mamba,
+            mamba2,
+            flash,
+            cur,
+        } = self;
+        let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
+        let (sh, moe, q_width) = (*sh, *moe, *q_width);
+        let n_kv = sh.n_kv;
+        let stream = gpu.stream();
+        let f = size_of::<f32>();
+        let [x0, x1] = &mut **x;
+        let (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>) =
+            if *cur == 0 { (x0, x1) } else { (x1, x0) };
+        let fault = gpu.layer_sink(l)?;
+        let b = &mut **b;
+        let delta = match &mut layers[l] {
+            Layer::Mamba(mm) => {
+                let g = sh.mamba.geom();
+                let (inner, conv_dim) = (g.d_inner, sh.mamba.conv_dim());
+                let ld = sh.mamba.in_proj_width();
+                let buf = &mut b.buf;
+                norm_rows((gpu, w), (sh.eps, sh.hidden, m), &mm.norm, src, &mut buf.xn)?;
+                project_rows(
+                    cx,
+                    &mut b.arms,
+                    l,
+                    (&mm.ssm_in, ld),
+                    &buf.xn,
+                    &mut buf.zxbcdt,
+                )?;
+                mamba.enqueue_pass(
+                    stream,
+                    crate::mamba2::StepsArgs {
+                        shape: sh.mamba,
+                        u: m,
+                        rows: &buf.zxbcdt,
+                        ld,
+                        z0: 0,
+                        x0: inner,
+                        dt0: inner + conv_dim,
+                        dt_bias: w.f32_buf(WHAT, &mm.dt_bias)?,
+                        a: w.f32_buf(WHAT, &mm.a)?,
+                        d: w.f32_buf(WHAT, &mm.d)?,
+                        conv_w: w.f32_buf(WHAT, &mm.conv_w)?,
+                        conv_b: w.f32_buf(WHAT, &mm.conv_b)?,
+                        norm: Some(w.f32_buf(WHAT, &mm.ssm_norm)?),
+                        eps: sh.eps,
+                        pos: &buf.pos,
+                        pos_at: 0,
+                        fault,
+                        y: &mut buf.y,
+                        ring: &mut mm.store.ring,
+                        state: &mut mm.store.state,
+                        scratch: mamba2,
+                    },
+                    PassScan::Ssd,
+                )?;
+                project_rows(
+                    cx,
+                    &mut b.arms,
+                    l,
+                    (&mm.ssm_out, sh.hidden),
+                    &buf.y,
+                    &mut buf.delta,
+                )?;
+                &buf.delta
+            }
+            Layer::Attn(a) => {
+                let kv_width = n_kv * HEAD;
+                let buf = &mut b.buf;
+                norm_rows((gpu, w), (sh.eps, sh.hidden, m), &a.norm, src, &mut buf.xn)?;
+                project_rows(cx, &mut b.arms, l, (&a.q, q_width), &buf.xn, &mut buf.q)?;
+                project_rows(cx, &mut b.arms, l, (&a.k, kv_width), &buf.xn, &mut buf.k)?;
+                project_rows(cx, &mut b.arms, l, (&a.v, kv_width), &buf.xn, &mut buf.v)?;
+                for h in 0..n_kv {
+                    let shape = Pitched {
+                        width: HEAD * f,
+                        rows: m,
+                        dev_pitch: kv_width * f,
+                        host_pitch: HEAD * f,
+                    };
+                    dtod_2d(
+                        stream,
+                        (&buf.k, h * HEAD * f),
+                        (&mut b.kh, h * m * HEAD * f),
+                        shape,
+                    )?;
+                    dtod_2d(
+                        stream,
+                        (&buf.v, h * HEAD * f),
+                        (&mut b.vh, h * m * HEAD * f),
+                        shape,
+                    )?;
+                }
+                let append = PlaneAppend {
+                    words: &b.words,
+                    first_word: P_ROWS,
+                    heads: n_kv,
+                    m,
+                    fault,
+                };
+                let attn = gpu.flash();
+                let (kh, vh) = (&b.kh, &b.vh);
+                attn.enqueue_kv_append_planes(
+                    stream,
+                    &append,
+                    |h| Window::<f32>::of(kh, h * m * HEAD * f, m * HEAD),
+                    &mut a.kc,
+                )?;
+                attn.enqueue_kv_append_planes(
+                    stream,
+                    &append,
+                    |h| Window::<f32>::of(vh, h * m * HEAD * f, m * HEAD),
+                    &mut a.vc,
+                )?;
+                flash.enqueue_split(
+                    stream,
+                    GqaPrefillArgs {
+                        q: &buf.q,
+                        kc: a.kc.buf(),
+                        vc: a.vc.buf(),
+                        n_keys: &buf.n_keys,
+                        scale: 1.0 / (HEAD as f32).sqrt(),
+                        n_head: q_width / HEAD,
+                        n_kv,
+                        ctx: sh.ctx,
+                        t: m,
+                        fault,
+                        y: &mut buf.attn,
+                    },
+                    &mut b.split,
+                )?;
+                project_rows(
+                    cx,
+                    &mut b.arms,
+                    l,
+                    (&a.o, sh.hidden),
+                    &buf.attn,
+                    &mut buf.delta,
+                )?;
+                &b.buf.delta
+            }
+            Layer::Moe(ml) => {
+                norm_rows(
+                    (gpu, w),
+                    (sh.eps, sh.hidden, m),
+                    &ml.norm,
+                    src,
+                    &mut b.buf.xn,
+                )?;
+                moe_rows(cx, b, (l, ml, moe), sh.hidden)?;
+                &b.sum
+            }
+        };
+        residual_rows(gpu, m * sh.hidden, src, delta, dst)?;
+        *cur = 1 - *cur;
+        Ok(())
+    }
+
+    /// Hosted layer `at.layer`'s front: the norm, the router, the latent down,
+    /// the download of the latent rows, the weights and the ids to the host
+    /// ([`BatchLeg::key`]'s exchange), and each routed slot's place in the
+    /// card's stacks (module doc).
+    fn hosted_front(
+        &mut self,
+        side: &PlacedSide,
+        leg: &mut BatchLeg<'_, HostRun>,
+        at: At,
+    ) -> Result<(), GpuError> {
+        let l = at.layer;
+        let PassWalk {
+            cx,
+            sh,
+            moe,
+            layers,
+            x,
+            b,
+            cur,
+            ..
+        } = self;
+        let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
+        let stream = gpu.stream();
+        let Layer::Moe(ml) = &mut layers[l] else {
+            return Err(GpuError::state(WHAT, "a hosted layer is a MoE layer"));
+        };
+        let b = &mut **b;
+        norm_rows(
+            (gpu, w),
+            (sh.eps, sh.hidden, m),
+            &ml.norm,
+            &x[*cur],
+            &mut b.buf.xn,
+        )?;
+        moe_route(cx, b, (l, ml, *moe))?;
+        project_rows(
+            cx,
+            &mut b.arms,
+            l,
+            (&ml.latent_down, moe.latent),
+            &b.buf.xn,
+            &mut b.lat,
+        )?;
+        let key = leg.key(at);
+        leg.hybrid()
+            .enqueue_download_pitched(stream, [&b.lat, &b.weights], &b.ids, TOP_K, key)?;
+        side.enqueue_places(
+            stream,
+            (l, ml.route.n_expert()),
+            (&b.ids, &mut b.sel, m),
+            gpu.layer_sink(l)?,
+        )
+    }
+
+    /// Hosted layer `l`'s shadow, the card's work under the host's union: the
+    /// card's slots over their places when the layer holds an expert there,
+    /// and the shared expert.
+    fn hosted_shadow(&mut self, side: &PlacedSide, l: usize) -> Result<(), GpuError> {
+        let PassWalk {
+            cx,
+            sh,
+            moe,
+            layers,
+            b,
+            ..
+        } = self;
+        let Layer::Moe(ml) = &layers[l] else {
+            return Err(GpuError::state(WHAT, "a hosted layer is a MoE layer"));
+        };
+        if ml.n_card > 0 {
+            let map = side.map_of(l)?;
+            moe_card_experts(cx, b, (l, ml, *moe), Places::Cut { map })?;
+        }
+        moe_shared(cx, b, (l, ml, *moe), sh.hidden)
+    }
+
+    /// Hosted layer `l`'s back: the card slots' weighted sum and the host's
+    /// sums, the latent up, the shared expert and the residual.
+    fn hosted_back(
+        &mut self,
+        side: &PlacedSide,
+        leg: &BatchLeg<'_, HostRun>,
+        l: usize,
+    ) -> Result<(), GpuError> {
+        let PassWalk {
+            cx,
+            sh,
+            moe,
+            layers,
+            x,
+            b,
+            cur,
+            ..
+        } = self;
+        let (gpu, m) = (cx.gpu, cx.m);
+        let stream = gpu.stream();
+        let Layer::Moe(ml) = &layers[l] else {
+            return Err(GpuError::state(WHAT, "a hosted layer is a MoE layer"));
+        };
+        let b = &mut **b;
+        let hsum = leg.hsum();
+        let merged: &DeviceBuffer<f32> = if ml.n_card > 0 {
+            side.acc().enqueue_card_acc(
+                stream,
+                &CardAcc {
+                    down: &b.down,
+                    w: &b.weights,
+                    sel: &b.sel,
+                    n: moe.latent,
+                    m,
+                    n_card: ml.n_card,
+                    n_used: TOP_K,
+                    w_pitch: TOP_K,
+                    fault: gpu.layer_sink(l)?,
+                },
+                &mut b.moe,
+            )?;
+            // The latent rows are spent once the card's slots ran: they take
+            // the card's sum and the host's.
+            gpu.elem()
+                .enqueue_add(stream, &b.moe, hsum, m * moe.latent, &mut b.lat)?;
+            &b.lat
+        } else {
+            hsum
+        };
+        project_rows(
+            cx,
+            &mut b.arms,
+            l,
+            (&ml.latent_up, sh.hidden),
+            merged,
+            &mut b.buf.delta,
+        )?;
+        gpu.elem()
+            .enqueue_add(stream, &b.buf.delta, &b.sh, m * sh.hidden, &mut b.sum)?;
+        let [x0, x1] = &mut **x;
+        let (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>) =
+            if *cur == 0 { (x0, x1) } else { (x1, x0) };
+        residual_rows(gpu, m * sh.hidden, src, &b.sum, dst)?;
+        *cur = 1 - *cur;
+        Ok(())
+    }
+}
+
+/// A placed load's pass `(1, m, Batch)` through the host tier's batch port
+/// (module doc): the layers with no host share run whole in their front, a
+/// hosted one in its three parts around the host's union.
+struct PlacedPass<'a, 'b> {
+    walk: PassWalk<'a>,
+    side: &'b PlacedSide,
+}
+
+impl<'a> LayerProgram for PlacedPass<'a, '_> {
+    type Port = BatchLeg<'a, HostRun>;
+
+    fn host_leg(&self, at: At) -> bool {
+        self.side.hosted(at.layer)
+    }
+
+    fn front(&mut self, leg: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        if self.side.hosted(at.layer) {
+            self.walk.hosted_front(self.side, leg, at)
+        } else {
+            self.walk.layer(at.layer)
+        }
+    }
+
+    fn shadow(&mut self, _: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        if self.side.hosted(at.layer) {
+            self.walk.hosted_shadow(self.side, at.layer)?;
+        }
+        Ok(())
+    }
+
+    fn back(&mut self, leg: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        if self.side.hosted(at.layer) {
+            self.walk.hosted_back(self.side, leg, at.layer)?;
+        }
+        Ok(())
+    }
+}
+
 impl Body {
     /// One pass of `ids` (at most the prompt buffers' rows) from position
     /// `pos`, layer-major; with `head`, the head over the pass's last row.
-    /// Each MoE layer's results ([`Body::routing`]) are its last row's.
+    /// Each MoE layer's results ([`Body::routing`]) are its last row's. A
+    /// placed load walks the layers through the host tier's batch port
+    /// ([`PlacedPass`]).
     pub(super) fn enqueue_pass(
         &mut self,
         gpu: &Gpu,
@@ -918,16 +1411,19 @@ impl Body {
         let stream = gpu.stream();
         let p = self.prompt.as_mut().ok_or(GpuError::state(
             WHAT,
-            "the prompt pass's buffers (a placed load runs its prompt as steps)",
+            "the prompt pass's buffers (a load that holds them)",
         ))?;
         let q_width = p.q_width;
-        if m == 0 || m > p.rows {
+        let rows = p.rows;
+        if m == 0 || m > rows {
             return Err(GpuError::shape(
                 WHAT,
-                format!("a pass of {m} ids; the prompt buffers hold 1..={}", p.rows),
+                format!("a pass of {m} ids; the prompt buffers hold 1..={rows}"),
             ));
         }
-        let b = &mut p.b;
+        let Prompt {
+            x, b, hsum, mamba2, ..
+        } = p;
         b.host_words[P_POS] = pos;
         for h in 0..n_kv {
             b.host_words[P_ROWS + h] = h
@@ -962,7 +1458,7 @@ impl Body {
                     pos0: &pos0,
                     first: 0,
                     fault: gpu.unlabelled_sink(),
-                    y: &mut p.x[0],
+                    y: &mut x[0],
                     pos: &mut b.buf.pos,
                     n_keys: &mut b.buf.n_keys,
                 },
@@ -981,156 +1477,41 @@ impl Body {
             iq: &self.mk.iq,
             m,
         };
-        let f = size_of::<f32>();
-        let mut cur = 0;
-        for (l, layer) in self.layers.iter_mut().enumerate() {
-            let [x0, x1] = &mut p.x;
-            let (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>) =
-                if cur == 0 { (x0, x1) } else { (x1, x0) };
-            let fault = gpu.layer_sink(l)?;
-            let delta = match layer {
-                Layer::Mamba(mm) => {
-                    let g = sh.mamba.geom();
-                    let (inner, conv_dim) = (g.d_inner, sh.mamba.conv_dim());
-                    let ld = sh.mamba.in_proj_width();
-                    let buf = &mut b.buf;
-                    norm_rows((gpu, w), (sh.eps, sh.hidden, m), &mm.norm, src, &mut buf.xn)?;
-                    project_rows(
-                        &cx,
-                        &mut b.arms,
-                        l,
-                        (&mm.ssm_in, ld),
-                        &buf.xn,
-                        &mut buf.zxbcdt,
-                    )?;
-                    self.k.mamba.enqueue_pass(
-                        stream,
-                        crate::mamba2::StepsArgs {
-                            shape: sh.mamba,
-                            u: m,
-                            rows: &buf.zxbcdt,
-                            ld,
-                            z0: 0,
-                            x0: inner,
-                            dt0: inner + conv_dim,
-                            dt_bias: w.f32_buf(WHAT, &mm.dt_bias)?,
-                            a: w.f32_buf(WHAT, &mm.a)?,
-                            d: w.f32_buf(WHAT, &mm.d)?,
-                            conv_w: w.f32_buf(WHAT, &mm.conv_w)?,
-                            conv_b: w.f32_buf(WHAT, &mm.conv_b)?,
-                            norm: Some(w.f32_buf(WHAT, &mm.ssm_norm)?),
-                            eps: sh.eps,
-                            pos: &buf.pos,
-                            pos_at: 0,
-                            fault,
-                            y: &mut buf.y,
-                            ring: &mut mm.store.ring,
-                            state: &mut mm.store.state,
-                            scratch: &mut p.mamba2,
-                        },
-                        PassScan::Ssd,
-                    )?;
-                    project_rows(
-                        &cx,
-                        &mut b.arms,
-                        l,
-                        (&mm.ssm_out, sh.hidden),
-                        &buf.y,
-                        &mut buf.delta,
-                    )?;
-                    &buf.delta
+        let n = self.layers.len();
+        let mut walk = PassWalk {
+            cx,
+            sh,
+            moe,
+            q_width,
+            layers: &mut self.layers,
+            x,
+            b,
+            mamba: &self.k.mamba,
+            mamba2,
+            flash: &self.prefill,
+            cur: 0,
+        };
+        match self.placed.as_mut() {
+            None => {
+                for l in 0..n {
+                    walk.layer(l)?;
                 }
-                Layer::Attn(a) => {
-                    let kv_width = n_kv * HEAD;
-                    let buf = &mut b.buf;
-                    norm_rows((gpu, w), (sh.eps, sh.hidden, m), &a.norm, src, &mut buf.xn)?;
-                    project_rows(&cx, &mut b.arms, l, (&a.q, q_width), &buf.xn, &mut buf.q)?;
-                    project_rows(&cx, &mut b.arms, l, (&a.k, kv_width), &buf.xn, &mut buf.k)?;
-                    project_rows(&cx, &mut b.arms, l, (&a.v, kv_width), &buf.xn, &mut buf.v)?;
-                    for h in 0..n_kv {
-                        let shape = Pitched {
-                            width: HEAD * f,
-                            rows: m,
-                            dev_pitch: kv_width * f,
-                            host_pitch: HEAD * f,
-                        };
-                        dtod_2d(
-                            stream,
-                            (&buf.k, h * HEAD * f),
-                            (&mut b.kh, h * m * HEAD * f),
-                            shape,
-                        )?;
-                        dtod_2d(
-                            stream,
-                            (&buf.v, h * HEAD * f),
-                            (&mut b.vh, h * m * HEAD * f),
-                            shape,
-                        )?;
-                    }
-                    let append = PlaneAppend {
-                        words: &b.words,
-                        first_word: P_ROWS,
-                        heads: n_kv,
-                        m,
-                        fault,
-                    };
-                    let flash = gpu.flash();
-                    let (kh, vh) = (&b.kh, &b.vh);
-                    flash.enqueue_kv_append_planes(
-                        stream,
-                        &append,
-                        |h| Window::<f32>::of(kh, h * m * HEAD * f, m * HEAD),
-                        &mut a.kc,
-                    )?;
-                    flash.enqueue_kv_append_planes(
-                        stream,
-                        &append,
-                        |h| Window::<f32>::of(vh, h * m * HEAD * f, m * HEAD),
-                        &mut a.vc,
-                    )?;
-                    self.prefill.enqueue_split(
-                        stream,
-                        GqaPrefillArgs {
-                            q: &buf.q,
-                            kc: a.kc.buf(),
-                            vc: a.vc.buf(),
-                            n_keys: &buf.n_keys,
-                            scale: 1.0 / (HEAD as f32).sqrt(),
-                            n_head: q_width / HEAD,
-                            n_kv,
-                            ctx: sh.ctx,
-                            t: m,
-                            fault,
-                            y: &mut buf.attn,
-                        },
-                        &mut b.split,
-                    )?;
-                    project_rows(
-                        &cx,
-                        &mut b.arms,
-                        l,
-                        (&a.o, sh.hidden),
-                        &buf.attn,
-                        &mut buf.delta,
-                    )?;
-                    &b.buf.delta
-                }
-                Layer::Moe(ml) => {
-                    norm_rows(
-                        (gpu, w),
-                        (sh.eps, sh.hidden, m),
-                        &ml.norm,
-                        src,
-                        &mut b.buf.xn,
-                    )?;
-                    moe_rows(&cx, b, (l, ml, moe), sh.hidden)?;
-                    &b.sum
-                }
-            };
-            residual_rows(gpu, m * sh.hidden, src, delta, dst)?;
-            cur = 1 - cur;
+            }
+            Some(Placed { hybrid, side }) => {
+                let mut leg = BatchLeg::new(stream, hybrid, hsum, rows);
+                let o = Overlap {
+                    units: 1,
+                    cols: m,
+                    port: PortKind::Batch,
+                };
+                let mut pass = PlacedPass { walk, side: &*side };
+                sched::walk(o, n, &mut leg, &mut pass)?;
+                walk = pass.walk;
+            }
         }
+        let cur = walk.cur;
         if let Some(head) = head {
+            let f = size_of::<f32>();
             let row = Window::<f32>::of(&p.x[cur], (m - 1) * sh.hidden * f, sh.hidden)?;
             head.input_mut().copy_from_device_async(&row, stream)?;
             head.enqueue(gpu, w)?;
