@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use serve::video::{Clip, Decoder, FfmpegDecoder, VIDEO_FORMATS, VideoError};
+use serve::video::{Clip, DEFAULT_THREADS, Decoder, FfmpegDecoder, VIDEO_FORMATS, VideoError};
 use vision::VisionError;
 use vision::video::{ClipMeta, Overflow, Sampler, Sizer, Stamp, Tail, VideoRule, plan};
 
@@ -174,24 +174,28 @@ fn decode(
 }
 
 /// The probe reads the lossless clip's size, rate and, with no `nb_frames` in a Matroska stream,
-/// its frame count from the duration; a plan's frames arrive in order, whole, each the colour of
-/// its own index, whatever the thread count.
+/// its frame count by decoding it, the same count on any thread bound the real ffprobe takes; a
+/// plan's frames arrive in order, whole, each the colour of its own index, whatever the thread
+/// count.
 #[test]
 #[ignore = "gate: just gate-serve-video"]
 fn hw_ffv1_frames_arrive_as_the_plans_indices() {
     let decoder = decoder();
     let dir = Dir::new("ffv1");
     let clip = index_clip(&dir);
-    let meta = decoder.probe(&clip).expect("the probe");
-    assert_eq!(
-        meta,
-        ClipMeta {
-            frames: FRAMES,
-            fps: (10, 1),
-            width: WIDTH,
-            height: HEIGHT
-        }
-    );
+    let want = ClipMeta {
+        frames: FRAMES,
+        fps: (10, 1),
+        width: WIDTH,
+        height: HEIGHT,
+    };
+    for threads in [0, 1, DEFAULT_THREADS] {
+        let meta = decoder
+            .probe(&clip, threads)
+            .unwrap_or_else(|e| panic!("the probe at {threads} threads: {e}"));
+        assert_eq!(meta, want, "the probe at {threads} threads");
+    }
+    let meta = want;
     // Ticks at the middle of seconds 0 to 3, the last source frame before each midpoint; and six
     // frames spread evenly over the 40, in three pairs.
     let cases: [(&str, VideoRule, &[usize]); 2] = [
@@ -265,7 +269,7 @@ fn hw_the_decode_takes_the_stream_the_probe_measured() {
         &path,
     );
     let clip = Clip::new(std::fs::read(&path).expect("the clip"), Some("mkv"));
-    let meta = decoder.probe(&clip).expect("the probe");
+    let meta = decoder.probe(&clip, DEFAULT_THREADS).expect("the probe");
     assert_eq!((meta.width, meta.height), (64, 64), "the probe's stream");
     let frames = decode(&decoder, &clip, &meta, &[2, 9, 15], 1).expect("the decode");
     assert_eq!(frames.len(), 3);
@@ -314,7 +318,7 @@ fn hw_audio_longer_than_the_video_does_not_stretch_its_frame_count() {
         &path,
     );
     let clip = Clip::new(std::fs::read(&path).expect("the clip"), Some("mkv"));
-    let meta = decoder.probe(&clip).expect("the probe");
+    let meta = decoder.probe(&clip, DEFAULT_THREADS).expect("the probe");
     assert_eq!(
         meta,
         ClipMeta {
@@ -340,13 +344,13 @@ fn hw_a_decode_past_the_end_and_a_non_video_are_named_errors() {
     let decoder = decoder();
     let dir = Dir::new("errors");
     let clip = index_clip(&dir);
-    let meta = decoder.probe(&clip).expect("the probe");
+    let meta = decoder.probe(&clip, DEFAULT_THREADS).expect("the probe");
     match decode(&decoder, &clip, &meta, &[38, 39, 45], 2) {
         Err(VideoError::Short { wanted: 3, got: 2 }) => {}
         other => panic!("a decode past the end: {other:?}"),
     }
     let junk = Clip::new(b"this is not a video".to_vec(), Some("mp4"));
-    match decoder.probe(&junk) {
+    match decoder.probe(&junk, DEFAULT_THREADS) {
         Err(VideoError::Probe(said)) => println!("gate video: a non-video probes as: {said}"),
         other => panic!("a non-video: {other:?}"),
     }
@@ -378,7 +382,7 @@ fn hw_h264_clip_decodes_its_plan() {
         &path,
     );
     let clip = Clip::new(std::fs::read(&path).expect("the clip"), Some("mp4"));
-    let meta = decoder.probe(&clip).expect("the probe");
+    let meta = decoder.probe(&clip, DEFAULT_THREADS).expect("the probe");
     assert_eq!(
         meta,
         ClipMeta {
@@ -459,7 +463,7 @@ fn hw_a_playlist_naming_a_local_file_is_refused() {
          without it this gate proves nothing"
     );
     let clip = Clip::new(playlist.into_bytes(), Some("m3u8"));
-    match decoder.probe(&clip) {
+    match decoder.probe(&clip, DEFAULT_THREADS) {
         Err(VideoError::Probe(said)) => {
             assert!(
                 said.contains("not on whitelist"),
@@ -535,7 +539,7 @@ fn hw_each_container_the_server_reads_probes_and_decodes() {
         );
         let clip = Clip::new(std::fs::read(&path).expect("the clip"), Some(suffix));
         let meta = decoder
-            .probe(&clip)
+            .probe(&clip, DEFAULT_THREADS)
             .unwrap_or_else(|e| panic!("{suffix}: the probe: {e}"));
         assert_eq!(
             meta,
