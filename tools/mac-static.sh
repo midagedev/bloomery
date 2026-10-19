@@ -32,7 +32,9 @@
 #                                       the justfile's check-scripts): one line a check in byte order of the name
 #                                       (rc, wall, the last line of its log), then every red check's log whole and the
 #                                       red names; every check runs, a red one stops no other, and the exit is the first
-#                                       red check's rc in that order. --skip leaves a check out; --no-base runs
+#                                       red check's rc in that order. Each run keeps its results in a directory of its own
+#                                       (target/mac-static/checks/run.XXXXXX, removed when the run ends), so runs that overlap
+#                                       read their own rcs. --skip leaves a check out; --no-base runs
 #                                       check-model-tax on its tables alone, with no revision to hold them to (a checkout
 #                                       with no origin/main: tools/contrib-check.sh); --list prints each name it would
 #                                       run with its arguments, one a line, and runs none
@@ -42,9 +44,11 @@
 # refused (64), so a stale entry cannot read as a script left out on purpose.
 #
 # Exit: the first red step's rc, or 0. 64: an argument this script does not take. 69: no cpu count (getconf, sysctl and
-# nproc all fail). A step that wrote no rc file (killed before its wrapper ran) is red, named `no rc`. Steps' full output
-# and their rc/wall land in target/mac-static/<step>.{log,rc,wall} (--checks: target/mac-static/checks/); the cargo lane's
-# steps also write the mac-check logs (target/mac-check-*.log) as they always did.
+# nproc all fail), or results that cannot be cleared, created or removed (named; a run that already ended red keeps its rc). A step
+# whose rc file is missing or empty (killed before its wrapper ran, or a result that could not be written) is red, named `no rc`,
+# never 0. Steps' full output and their rc/wall land in target/mac-static/<step>.{log,rc,wall} (--checks: a run directory under
+# target/mac-static/checks/, whose red logs come back whole on stderr); the cargo lane's steps also write the mac-check logs
+# (target/mac-check-*.log) as they always did.
 #
 # The environment is mac-check's (the pinned toolchain, $HOME/opt/bloomery-mac-env.sh for the cross
 # check): every cargo step calls tools/mac-check.sh, which owns that setup. The ledger is
@@ -122,14 +126,27 @@ ncpu() {
   printf '%s\n' "$n"
 }
 
-# step_inner NAME D CMD…: one step, serial in its caller — its rc, wall and full output to D. Never
-# fails its caller: the rc is the file's, not the wrapper's.
+# step_inner NAME D CMD…: one step, serial in its caller — its rc, wall and full output to D. The rc is the file's, never the
+# wrapper's; a result that cannot be written is named and ends 69 (the rc file, written last, is then missing: the summary reads
+# `no rc`).
 step_inner() {
   local name=$1 d=$2 t0=$SECONDS rc=0
   shift 2
   "$@" > "$d/$name.log" 2>&1 < /dev/null || rc=$?
-  echo "$rc" > "$d/$name.rc"
-  echo "$((SECONDS - t0))" > "$d/$name.wall"
+  { echo "$((SECONDS - t0))" > "$d/$name.wall" && echo "$rc" > "$d/$name.rc"; } \
+    || { say "mac-static.sh: cannot write $name's result in $d"; return 69; }
+}
+
+# clear_results D: D's rc, wall and pids files of an earlier run removed. One that stays would read as this run's result, so a
+# failure is named and ends 69.
+clear_results() {
+  rm -f "$1"/*.rc "$1"/*.wall "$1"/pids || { say "mac-static.sh: cannot clear the earlier results in $1"; return 69; }
+}
+
+# remove_run_dir DIR RC: the EXIT trap of a --checks run (RC is the status it ends with): DIR removed. One that stays is named and
+# ends the run 69, unless it ended red already.
+remove_run_dir() {
+  rm -rf "$1" || { say "mac-static.sh: cannot remove the results in $1"; [ "$2" != 0 ] || exit 69; }
 }
 
 # run_steps D CARGO_CMDV…: both lanes. The scripts lane: one background job a script (fmt-check and
@@ -165,7 +182,7 @@ run_check_jobs() {
   local dir=$1 base=$2 nobase=$3 jobs=$4 d=$5 n w i=0
   local -a pids=() args
   shift 5
-  : > "$d/pids"
+  : > "$d/pids" || { say "mac-static.sh: cannot write $d/pids"; return 69; }
   for n in "$@"; do
     [ $((${#pids[@]} - i)) -lt "$jobs" ] || { wait "${pids[$i]}" || true; i=$((i + 1)); }
     args=()
@@ -194,26 +211,29 @@ run_checks() {
     done
     return 0
   fi
-  mkdir -p "$d"
-  rm -f "$d"/*.rc "$d"/*.wall "$d"/pids 2> /dev/null || true
-  run_check_jobs "$dir" "$base" "$nobase" "$jobs" "$d" "${names[@]}"
+  mkdir -p "$d" || { say "mac-static.sh: cannot create $d"; return 69; }
+  clear_results "$d" || return $?
+  run_check_jobs "$dir" "$base" "$nobase" "$jobs" "$d" "${names[@]}" || return $?
   summarize_checks "$d" "$jobs" "${names[@]}"
 }
 
 # step_line D NAME: the step's summary line on stdout, `mac-static: <step> rc <n> in <s> s [— the step's own closing line]`: the
 # cargo steps' closing line comes from their log, a check's is its log's last non-empty line (cut at 160 characters). A step that
-# is red, or wrote no rc, joins REDS; FIRSTRC is the rc of the first red one (1 for no rc), 0 while none is.
+# is red, or whose rc file is missing, empty or not a number, joins REDS; FIRSTRC is the rc of the first red one (1 for no rc), 0
+# while none is.
 REDS=()
 FIRSTRC=0
 step_line() {
-  local d=$1 name=$2 rc wall extra=
-  if [ ! -f "$d/$name.rc" ]; then
-    echo "mac-static: $name rc ? no rc in $((SECONDS - T0)) s (killed before its wrapper ran)"
-    REDS+=("$name (no rc)")
-    [ "$FIRSTRC" != 0 ] || FIRSTRC=1
-    return 0
-  fi
-  rc=$(cat "$d/$name.rc")
+  local d=$1 name=$2 rc='' wall extra=
+  [ ! -f "$d/$name.rc" ] || rc=$(cat "$d/$name.rc" 2> /dev/null) || rc=
+  case $rc in
+    '' | *[!0-9]*)
+      echo "mac-static: $name rc ? no rc in $((SECONDS - T0)) s (no rc file: killed before its wrapper ran, or its result could not be written)"
+      REDS+=("$name (no rc)")
+      [ "$FIRSTRC" != 0 ] || FIRSTRC=1
+      return 0
+      ;;
+  esac
   wall=$(cat "$d/$name.wall")
   case $name in
     lint) extra=$(grep -E '^mac-check: (lint \^warning|lint rc)' "$d/$name.log" | tail -1 || true) ;;
@@ -236,7 +256,7 @@ summarize_checks() {
   REDS=()
   FIRSTRC=0
   for n in "$@"; do step_line "$d" "check-$n"; done
-  echo "mac-static: $# checks in $((SECONDS - T0)) s, at most $jobs at once, logs in $d"
+  echo "mac-static: $# checks in $((SECONDS - T0)) s, at most $jobs at once"
   if [ "${#REDS[@]}" != 0 ]; then
     for n in "$@"; do
       [ -f "$d/check-$n.rc" ] && [ "$(cat "$d/check-$n.rc")" != 0 ] || continue
@@ -397,6 +417,78 @@ self_test() {
   unset CHECK_MEET CHECK_LIVE CHECK_SEEN
   rm -rf "$cd_"
 
+  # a --checks run's results are its own. The fixture tree holds a copy of this script beside fixture checks (HERE is where the script
+  # lies), so the real entry runs: its mktemp and its trap. Run 1's model-tax is red and ends at once, its second check holds on a
+  # release file; run 2 (--no-base: model-tax green) runs whole while run 1 holds, then the release lets run 1 read its results. One
+  # directory for both lets run 2 clear run 1's red rc and write its own 0 over it: run 1 ends green.
+  local fx p1 rc1 rc2
+  fx=$(mktemp -d)
+  mkdir "$fx/tools" "$fx/sync"
+  cp "$HERE/tools/mac-static.sh" "$fx/tools/mac-static.sh"
+  printf '#!/usr/bin/env bash\n[ "$#" = 1 ] || exit 7\n' > "$fx/tools/check-model-tax.sh"
+  # shellcheck disable=SC2016 # the check's own shell expands them
+  printf '#!/usr/bin/env bash\n[ "$CHECK_ROLE" != slow ] || { n=0; until [ -e "$CHECK_SYNC/release" ]; do n=$((n + 1)); [ "$n" -le 600 ] || exit 9; sleep 0.1; done; }\n' > "$fx/tools/check-zlate.sh"
+  rc1=0; rc2=0
+  CHECK_SYNC=$fx/sync CHECK_ROLE=slow bash "$fx/tools/mac-static.sh" --checks > "$fx/out1" 2>&1 & p1=$!
+  k=0
+  until [ "$(cat "$fx"/target/mac-static/checks/check-model-tax.rc "$fx"/target/mac-static/checks/run.*/check-model-tax.rc 2> /dev/null)" = 7 ]; do
+    k=$((k + 1))
+    [ "$k" -le 600 ] || { fail "the first run's model-tax result did not land within 60 s"; break; }
+    sleep 0.1
+  done
+  out=$(CHECK_SYNC=$fx/sync bash "$fx/tools/mac-static.sh" --checks --no-base 2>&1) || rc2=$?
+  touch "$fx/sync/release"
+  wait "$p1" || rc1=$?
+  [ "$rc2" = 0 ] || fail "the overlapping green run ends rc $rc2: $out"
+  [ "$rc1" = 7 ] || fail "the red run ends rc $rc1 when a green run overlaps it, not its model-tax's 7: $(cat "$fx/out1")"
+  case $(cat "$fx/out1") in *"red checks: check-model-tax (rc 7)"*) ;; *) fail "the red run does not name model-tax: $(cat "$fx/out1")" ;; esac
+  [ -z "$(ls -A "$fx/target/mac-static/checks" 2> /dev/null)" ] || fail "a --checks run left its results behind: $(ls -A "$fx/target/mac-static/checks")"
+  rm -rf "$fx"
+
+  # earlier results that cannot be cleared are never this run's. Prior green results in a directory of mode 555 (a user who writes
+  # through a mode, root, skips this case by name): the run ends 69 naming the clearing and runs no check, where it read the old zeros.
+  # A prior result that is a directory (rm -f refuses it for every user) holds the same for the clearing alone. A result a step cannot
+  # write is named (69), a result file that is empty reads as no rc, and a run directory that cannot be removed is named (69 for a
+  # green run; a red one keeps its own status).
+  fx=$(mktemp -d)
+  mkdir "$fx/checks" "$fx/u1" "$fx/u2"
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\necho "$@" >> "%s/ran-aa"\n' "$fx" > "$fx/checks/check-aa.sh"
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\necho "$@" >> "%s/ran-red"\nexit 7\n' "$fx" > "$fx/checks/check-red.sh"
+  for name in aa red; do echo 0 > "$fx/u1/check-$name.rc"; echo 1 > "$fx/u1/check-$name.wall"; echo "stale $name" > "$fx/u1/check-$name.log"; done
+  chmod -R a-w "$fx/u1"
+  if { : > "$fx/u1/probe"; } 2> /dev/null; then
+    say "mac-static self-test: the unwritable-directory case is skipped (uid $(id -u) writes through mode 555)"
+  else
+    rc=0; out=$(run_checks "$fx/checks" '' '' '' 2 "$fx/u1" 2>&1) || rc=$?
+    [ "$rc" = 69 ] || fail "a run over prior green results in an unwritable directory ends rc $rc, not 69: $out"
+    case $out in *"cannot clear"*"$fx/u1"*) ;; *) fail "the results that could not be cleared are not named: $out" ;; esac
+    [ ! -e "$fx/ran-red" ] || fail "a check ran with the earlier results in place"
+  fi
+  chmod -R u+w "$fx/u1"
+  mkdir "$fx/u2/check-red.rc"
+  echo 0 > "$fx/u2/check-aa.rc"; echo 1 > "$fx/u2/check-aa.wall"
+  rc=0; out=$(run_checks "$fx/checks" '' '' '' 2 "$fx/u2" 2>&1) || rc=$?
+  [ "$rc" = 69 ] || fail "a run whose earlier result cannot be removed ends rc $rc, not 69: $out"
+  case $out in *"cannot clear"*"$fx/u2"*) ;; *) fail "the earlier result that stays is not named: $out" ;; esac
+  [ ! -e "$fx/ran-aa" ] || fail "a check ran with an earlier result it could not remove"
+  mkdir "$fx/u3" "$fx/u3/x.rc"
+  rc=0; out=$(step_inner x "$fx/u3" true 2>&1) || rc=$?
+  [ "$rc" = 69 ] || fail "a step that cannot write its rc ends rc $rc, not 69: $out"
+  case $out in *"cannot write"*"x"*) ;; *) fail "the result a step cannot write is not named: $out" ;; esac
+  : > "$fx/u3/check-aa.rc"; echo 1 > "$fx/u3/check-aa.wall"
+  rc=0; out=$(summarize_checks "$fx/u3" 1 aa 2>&1) || rc=$?
+  [ "$rc" = 1 ] || fail "an empty rc file ends rc $rc, not no rc's 1: $out"
+  case $out in *"check-aa rc ? no rc"*"red checks: check-aa (no rc)"*) ;; *) fail "an empty rc file is not read as no rc: $out" ;; esac
+  mkdir "$fx/u4"
+  rc=0; out=$(remove_run_dir "$fx/u4/." 0 2>&1) || rc=$?
+  [ "$rc" = 69 ] || fail "a run directory that cannot be removed ends a green run rc $rc, not 69: $out"
+  case $out in *"cannot remove the results in $fx/u4/."*) ;; *) fail "the run directory that stays is not named: $out" ;; esac
+  rc=0; out=$(remove_run_dir "$fx/u4/." 7 2>&1) || rc=$?
+  [ "$rc" = 0 ] && [ -n "$out" ] || fail "a run directory that cannot be removed changes a red run's status (rc $rc) or is not named: $out"
+  rm -rf "$fx"
+
   # --checks on this tree: its --list is every check script (SKIP is the round loop's, --skip is its own), its arguments are refused by name
   out=$(bash "$HERE/tools/mac-static.sh" --checks --list | awk '{ printf "%s ", $1 }')
   [ "$out" = "$(check_names "$HERE/tools" | tr '\n' ' ')" ] || fail "--checks --list prints '$out', not every tools/check-*.sh"
@@ -487,8 +579,14 @@ case ${1:-} in
       esac
     done
     [ -n "$list" ] || jobs=$(ncpu) || exit $?
+    check_dir=$HERE/target/mac-static/checks
+    if [ -z "$list" ]; then
+      mkdir -p "$check_dir" || { say "mac-static.sh: cannot create $check_dir"; exit 69; }
+      check_dir=$(mktemp -d "$check_dir/run.XXXXXX") || { say "mac-static.sh: cannot create a run directory in $check_dir"; exit 69; }
+      trap 'remove_run_dir "$check_dir" $?' EXIT
+    fi
     rc=0
-    run_checks "$HERE/tools" '' "$nobase" "$list" "$jobs" "$HERE/target/mac-static/checks" ${cskip[@]+"${cskip[@]}"} || rc=$?
+    run_checks "$HERE/tools" '' "$nobase" "$list" "$jobs" "$check_dir" ${cskip[@]+"${cskip[@]}"} || rc=$?
     exit "$rc"
     ;;
   --full) [ $# = 1 ] || { say "mac-static.sh: --full takes nothing"; exit 64; } ;;
@@ -499,7 +597,7 @@ esac
 
 D=$HERE/target/mac-static
 mkdir -p "$D"
-rm -f "$D"/*.rc "$D"/*.wall "$D"/pids 2> /dev/null || true
+clear_results "$D" || exit $?
 CARGO=()
 while IFS= read -r w; do CARGO+=("$w"); done < <(combos_argv "$BASE" "$LEDGER")
 run_steps "$D" "$BASE" "${CARGO[@]}"
