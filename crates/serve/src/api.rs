@@ -2395,7 +2395,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
     let gpt_oss = state.template.source().contains("<|channel|>");
     let mut messages = Vec::with_capacity(msgs.len());
     let mut media: Vec<Medium> = Vec::new();
-    let video = VideoCtx::new(
+    let mut video = VideoCtx::new(
         state.video.clone(),
         if carries_video(msgs) {
             clip_budget(state, msgs)
@@ -2431,7 +2431,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
                             .iter()
                             .filter(|m| matches!(m, Medium::Image(_)))
                             .count();
-                        let f = media::flatten(role, parts, &**model, first, &video)
+                        let f = media::flatten(role, parts, &**model, first, &mut video)
                             .map_err(|e| media_error(&e))?;
                         media.extend(f.media);
                         f.text

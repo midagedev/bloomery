@@ -17,7 +17,6 @@
 //! [`MediaError`] variant that names what it refused; nothing is skipped, repaired or fetched.
 
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::fmt;
 use std::sync::Arc;
 
@@ -244,7 +243,7 @@ impl Flat {
 /// context the clips may still take, which each planned clip spends.
 pub struct VideoCtx {
     support: VideoSupport,
-    left: Cell<usize>,
+    left: usize,
 }
 
 impl VideoCtx {
@@ -253,7 +252,7 @@ impl VideoCtx {
     pub fn new(support: VideoSupport, budget: usize) -> VideoCtx {
         VideoCtx {
             support,
-            left: Cell::new(budget),
+            left: budget,
         }
     }
 
@@ -676,7 +675,7 @@ pub fn flatten(
     parts: &[Value],
     model: &dyn MediaModel,
     first_image: usize,
-    video: &VideoCtx,
+    video: &mut VideoCtx,
 ) -> Result<Flat, MediaError> {
     let join = model.part_join();
     let mut text = String::new();
@@ -722,14 +721,14 @@ pub fn flatten(
 fn plan_part(
     clip: VideoPart<'_>,
     model: &dyn MediaModel,
-    video: &VideoCtx,
+    video: &mut VideoCtx,
 ) -> Result<(String, PlannedClip), MediaError> {
     model.video_rule().ok_or(MediaError::NoVideoRule)?;
     let marker = model.video_marker().ok_or(MediaError::NoChatVideoToken)?;
     model.video_token().ok_or(MediaError::NoChatVideoToken)?;
     let decoder = video.support.decoder()?;
     let bytes = base64(clip.data)?;
-    let left = video.left.get();
+    let left = video.left;
     let planned = plan_clip(
         model,
         decoder,
@@ -737,7 +736,7 @@ fn plan_part(
         left,
         video.support.thread_count(),
     )?;
-    video.left.set(left.saturating_sub(planned.tokens()));
+    video.left = left.saturating_sub(planned.tokens());
     let mut text = String::new();
     let mut group = 0;
     for piece in planned.pieces() {
@@ -1261,14 +1260,14 @@ mod tests {
             json!({"type": "text", "text": "and"}),
             json!({"type": "image_url", "image_url": "data:b"}),
         ];
-        let flat = flatten("user", &parts, &PLAIN, 0, &VideoCtx::none()).unwrap();
+        let flat = flatten("user", &parts, &PLAIN, 0, &mut VideoCtx::none()).unwrap();
         assert_eq!(flat.text, "look\n<img>\nand\n<img>");
         assert_eq!(flat.images(), ["data:a", "data:b"]);
         let wide = Stub {
             join: PartJoin::Uniform("\n\n"),
         };
         assert_eq!(
-            flatten("user", &parts, &wide, 0, &VideoCtx::none())
+            flatten("user", &parts, &wide, 0, &mut VideoCtx::none())
                 .unwrap()
                 .text,
             "look\n\n<img>\n\nand\n\n<img>"
@@ -1277,7 +1276,7 @@ mod tests {
             json!({"type": "text", "text": "a"}),
             json!({"type": "text", "text": "b"}),
         ];
-        let flat = flatten("system", &text_only, &PLAIN, 0, &VideoCtx::none()).unwrap();
+        let flat = flatten("system", &text_only, &PLAIN, 0, &mut VideoCtx::none()).unwrap();
         assert_eq!((flat.text.as_str(), flat.images().len()), ("a\nb", 0));
     }
 
@@ -1304,7 +1303,7 @@ mod tests {
             (vec!["<img>", "", "b"], "<img>\nb"),
         ] {
             let json: Vec<Value> = parts.iter().map(|p| part(p)).collect();
-            let flat = flatten("user", &json, &LLAMA, 0, &VideoCtx::none()).unwrap();
+            let flat = flatten("user", &json, &LLAMA, 0, &mut VideoCtx::none()).unwrap();
             assert_eq!(flat.text, want, "{parts:?}");
             let n = parts.iter().filter(|&&p| p == "<img>").count();
             assert_eq!(flat.images().len(), n, "{parts:?}");
@@ -1319,7 +1318,8 @@ mod tests {
             let body = match content {
                 Value::String(t) => t.clone(),
                 Value::Array(parts) => {
-                    let flat = flatten(role, parts, model, urls.len(), &VideoCtx::none()).unwrap();
+                    let flat =
+                        flatten(role, parts, model, urls.len(), &mut VideoCtx::none()).unwrap();
                     urls.extend(flat.images().into_iter().map(str::to_owned));
                     flat.text
                 }
@@ -1397,14 +1397,14 @@ mod tests {
     fn flatten_refusals_are_named() {
         let image = [json!({"type": "image_url", "image_url": "data:a"})];
         for role in ["system", "assistant", "tool", "developer"] {
-            match err(flatten(role, &image, &PLAIN, 0, &VideoCtx::none())) {
+            match err(flatten(role, &image, &PLAIN, 0, &mut VideoCtx::none())) {
                 MediaError::ImageRole(r) => assert_eq!(r, role),
                 e => panic!("{role}: {e}"),
             }
         }
         let text = [json!({"type": "text", "text": "an <img> by hand"})];
         assert!(matches!(
-            err(flatten("user", &text, &PLAIN, 0, &VideoCtx::none())),
+            err(flatten("user", &text, &PLAIN, 0, &mut VideoCtx::none())),
             MediaError::PlaceholderInText(_)
         ));
         let bad = [
@@ -1412,7 +1412,7 @@ mod tests {
             json!({"type": "video_url"}),
         ];
         assert!(matches!(
-            err(flatten("user", &bad, &PLAIN, 0, &VideoCtx::none())),
+            err(flatten("user", &bad, &PLAIN, 0, &mut VideoCtx::none())),
             MediaError::PartField {
                 ty: "video_url",
                 ..
@@ -1431,7 +1431,8 @@ mod tests {
             image("data:b"),
         ];
         for first in [0, 5] {
-            let flat = flatten("user", &parts, &NumberedMedia, first, &VideoCtx::none()).unwrap();
+            let flat =
+                flatten("user", &parts, &NumberedMedia, first, &mut VideoCtx::none()).unwrap();
             let (a, b) = (first, first + 1);
             assert_eq!(
                 flat.text,
@@ -1458,7 +1459,7 @@ mod tests {
                 &parts,
                 &NumberedMedia,
                 0,
-                &VideoCtx::none(),
+                &mut VideoCtx::none(),
             )) {
                 MediaError::PlaceholderInText(m) => assert_eq!(m, "<image><unk>", "{typed}"),
                 e => panic!("{typed}: {e}"),
@@ -1466,7 +1467,7 @@ mod tests {
         }
         let tag = [json!({"type": "text", "text": "the <image_id>0</image_id> tag"})];
         assert_eq!(
-            flatten("user", &tag, &NumberedMedia, 0, &VideoCtx::none())
+            flatten("user", &tag, &NumberedMedia, 0, &mut VideoCtx::none())
                 .unwrap()
                 .text,
             "the <image_id>0</image_id> tag",
@@ -1997,8 +1998,8 @@ mod tests {
             json!({"type": "text", "text": "and"}),
             json!({"type": "image_url", "image_url": "data:a"}),
         ];
-        let ctx = VideoCtx::new(mock.support(3), 100);
-        let flat = flatten("user", &parts, &ClipMedia, 0, &ctx).unwrap();
+        let mut ctx = VideoCtx::new(mock.support(3), 100);
+        let flat = flatten("user", &parts, &ClipMedia, 0, &mut ctx).unwrap();
         // 30 frames at 10 fps is 3 seconds: three frames, three groups of two tokens.
         assert_eq!(flat.text, "see\n[<vid>,<vid>,<vid>]\nand\n<img>");
         assert_eq!(flat.images(), ["data:a"]);
@@ -2012,9 +2013,9 @@ mod tests {
         );
         // The plan spent 6 of the budget: a second clip may take what is left (two groups' worth
         // would be 4; only 2 tokens remain, so one group).
-        let ctx = VideoCtx::new(mock.support(3), 8);
+        let mut ctx = VideoCtx::new(mock.support(3), 8);
         let two = [clip_part("30 10/1 4x2"), clip_part("30 10/1 4x2")];
-        let flat = flatten("user", &two, &ClipMedia, 0, &ctx).unwrap();
+        let flat = flatten("user", &two, &ClipMedia, 0, &mut ctx).unwrap();
         assert_eq!(flat.text, "[<vid>,<vid>,<vid>]\n[<vid>]");
     }
 
@@ -2026,7 +2027,7 @@ mod tests {
         let mock = MockClips::new();
         let on = |budget| VideoCtx::new(mock.support(2), budget);
         let clip = [clip_part("30 10/1 4x2")];
-        let absent = err(flatten("user", &clip, &ClipMedia, 0, &VideoCtx::none()));
+        let absent = err(flatten("user", &clip, &ClipMedia, 0, &mut VideoCtx::none()));
         assert!(matches!(absent, MediaError::Clip(VideoError::Absent(_))));
         assert_eq!(
             absent.to_string(),
@@ -2034,7 +2035,7 @@ mod tests {
              or send the clip as decoded one-FPS image_url frames after a Video: text part"
         );
         assert!(matches!(
-            err(flatten("user", &clip, &NumberedMedia, 0, &on(100))),
+            err(flatten("user", &clip, &NumberedMedia, 0, &mut on(100))),
             MediaError::NoVideoRule
         ));
         assert!(matches!(
@@ -2045,12 +2046,12 @@ mod tests {
                     join: PartJoin::Uniform("\n")
                 },
                 0,
-                &on(100)
+                &mut on(100)
             )),
             MediaError::NoVideoRule
         ));
         assert!(matches!(
-            err(flatten("assistant", &clip, &ClipMedia, 0, &on(100))),
+            err(flatten("assistant", &clip, &ClipMedia, 0, &mut on(100))),
             MediaError::VideoRole(r) if r == "assistant"
         ));
         assert!(matches!(
@@ -2059,19 +2060,19 @@ mod tests {
                 &[json!({"type": "text", "text": "a <vid> b"})],
                 &ClipMedia,
                 0,
-                &on(100)
+                &mut on(100)
             )),
             MediaError::VideoMarkerInText(m) if m == "<vid>"
         ));
         let bad64 = [json!({"type": "input_video", "input_video": {"data": "a b"}})];
         assert!(matches!(
-            err(flatten("user", &bad64, &ClipMedia, 0, &on(100))),
+            err(flatten("user", &bad64, &ClipMedia, 0, &mut on(100))),
             MediaError::Base64Char { .. }
         ));
         let unreadable = [clip_part("not a clip")];
-        let e = err(flatten("user", &unreadable, &ClipMedia, 0, &on(100)));
+        let e = err(flatten("user", &unreadable, &ClipMedia, 0, &mut on(100)));
         assert!(matches!(e, MediaError::Clip(VideoError::Probe(_))), "{e}");
-        let e = err(flatten("user", &clip, &ClipMedia, 0, &on(1)));
+        let e = err(flatten("user", &clip, &ClipMedia, 0, &mut on(1)));
         assert!(matches!(e, MediaError::Video(_)), "{e}");
         assert!(e.to_string().starts_with("video: "), "{e}");
         assert!(mock.calls.lock().unwrap().is_empty());
@@ -2084,12 +2085,12 @@ mod tests {
     fn clip_placeholders_are_matched_by_id_and_decoded_in_order() {
         let mock = MockClips::new();
         let png = data("image/png", PNG_B64);
-        let ctx = VideoCtx::new(mock.support(3), 100);
+        let mut ctx = VideoCtx::new(mock.support(3), 100);
         let parts = [
             clip_part("30 10/1 4x2"),
             json!({"type": "image_url", "image_url": png}),
         ];
-        let flat = flatten("user", &parts, &ClipMedia, 0, &ctx).unwrap();
+        let flat = flatten("user", &parts, &ClipMedia, 0, &mut ctx).unwrap();
         let ids = clip_ids(&format!("a{}z", flat.text));
         let p = expand_prompt(&ids, &flat.media, &ClipMedia).unwrap();
         // "a[", three groups of two video positions with commas, "]", the image's one, "z".
@@ -2121,9 +2122,9 @@ mod tests {
     #[test]
     fn a_clip_planned_the_same_way_keys_the_same() {
         let mock = MockClips::new();
-        let ctx = VideoCtx::new(mock.support(3), 100);
-        let keys = |parts: &[Value]| {
-            let flat = flatten("user", parts, &ClipMedia, 0, &ctx).unwrap();
+        let mut ctx = VideoCtx::new(mock.support(3), 100);
+        let mut keys = |parts: &[Value]| {
+            let flat = flatten("user", parts, &ClipMedia, 0, &mut ctx).unwrap();
             let ids = clip_ids(&flat.text);
             let p = expand_prompt(&ids, &flat.media, &ClipMedia).unwrap();
             p.feeds.iter().map(|f| f.key).collect::<Vec<_>>()
@@ -2151,12 +2152,12 @@ mod tests {
     fn a_clip_pairing_fault_is_named_before_any_decode() {
         let mock = MockClips::new();
         let png = data("image/png", PNG_B64);
-        let ctx = VideoCtx::new(mock.support(1), 100);
+        let mut ctx = VideoCtx::new(mock.support(1), 100);
         let parts = [
             json!({"type": "image_url", "image_url": png}),
             clip_part("30 10/1 4x2"),
         ];
-        let flat = flatten("user", &parts, &ClipMedia, 0, &ctx).unwrap();
+        let flat = flatten("user", &parts, &ClipMedia, 0, &mut ctx).unwrap();
         let run = |text: &str| err(expand_prompt(&clip_ids(text), &flat.media, &ClipMedia));
         // An image, then three groups: the right ids pass the pairing (checked by the success
         // above); each fault below is the same prompt altered.
