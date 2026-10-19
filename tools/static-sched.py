@@ -24,7 +24,8 @@ appends `NAME<TAB>WALL<TAB>DATE` to --times.
 Per job DIR gets NAME.log, NAME.rc, NAME.wall (whole seconds) and, when skipped, NAME.skip; DIR/pids holds each started
 job's pid (its process group) at spawn; DIR/sched.tsv one row a job: name, start and end offsets in seconds, rc, how it
 ran (run or skip). A TERM, INT or HUP ends every running job's process group (a member that ignores the TERM gets a KILL
-once the job's shell is gone), and the scheduler then exits 128 + the signal. Nothing is printed on stdout: the callers
+once the job's shell is gone), and the scheduler then exits 128 + the signal. One that arrives while a job is being started
+waits until the job is registered; one that arrives during the cleanup is ignored. Nothing is printed on stdout: the callers
 report from DIR.
 
 Exit: 0 every job ran (or skipped) and wrote its rc, whatever the rcs; 64 usage or a malformed JOBS or keys line (named);
@@ -46,6 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from recipes import Job, read_jobs, read_shape_ledger  # noqa: E402  (the one JOBS reader and the one ledger reader)
 
 USAGE_RC = 64
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
 
 def read_times(path: str | None) -> dict[str, float]:
@@ -162,7 +164,7 @@ def run(args: argparse.Namespace) -> int:
     def on_signal(sig, _frame):
         raise Stop(sig)
 
-    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    for s in STOP_SIGNALS:
         signal.signal(s, on_signal)
 
     def used() -> int:
@@ -172,14 +174,21 @@ def run(args: argparse.Namespace) -> int:
         return j.after is None or j.after in done
 
     def start(j: Job) -> None:
-        log = open(os.path.join(out, f"{j.name}.log"), "wb")
+        # A signal that arrives from the spawn to the registration waits until the job is in `running`, so the cleanup below
+        # reaches its group.
+        deferred: list[int] = []
+        handlers = {s: signal.signal(s, lambda sig, _frame: deferred.append(sig)) for s in STOP_SIGNALS}
         try:
-            p = subprocess.Popen(["bash", "-c", j.command], stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                 start_new_session=True)
+            with open(os.path.join(out, f"{j.name}.log"), "wb") as log:
+                p = subprocess.Popen(["bash", "-c", j.command], stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                     start_new_session=True)
+            running[p.pid] = (j, p, time.monotonic())
+            append_line(os.path.join(out, "pids"), f"{j.name} {p.pid}\n")
         finally:
-            log.close()
-        append_line(os.path.join(out, "pids"), f"{j.name} {p.pid}\n")
-        running[p.pid] = (j, p, time.monotonic())
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+        if deferred:
+            raise Stop(deferred[0])
 
     try:
         while pending or running:
@@ -223,6 +232,8 @@ def run(args: argparse.Namespace) -> int:
             if rc == 0 and args.ledger and key != "-":
                 append_line(args.ledger, f"{key}\tgreen\t{date}\t{args.tree}\n")
     except Stop as stop:
+        for s in STOP_SIGNALS:  # a second signal must not cut the cleanup short
+            signal.signal(s, signal.SIG_IGN)
         for pid in list(running):
             signal_group(pid, signal.SIGTERM)
         # The job's shell ends on the TERM at once while a child of its group may ignore it: once the leader has gone (or its
@@ -395,6 +406,83 @@ def self_test() -> int:
             os.kill(child2, signal.SIGKILL)  # the pid the job wrote: never leave the survivor behind a red run
         expect(rc == 143, f"a TERM with a stubborn child ends the scheduler 143 (got {rc})")
         expect(not alive, "a child that ignores TERM and outlives its group leader is ended by the scheduler")
+
+        def gone(pid: int) -> bool:
+            for _ in range(100):  # init reaps what the scheduler's end orphaned a moment later
+                try:
+                    os.kill(pid, 0)
+                except (ProcessLookupError, PermissionError):  # a zombie answers EPERM on Darwin
+                    return True
+                time.sleep(0.05)
+            return False
+
+        def wait_written(path: str) -> None:
+            for _ in range(200):
+                if os.path.exists(path) and os.path.getsize(path):
+                    return
+                time.sleep(0.05)
+
+        # a TERM while the job's pid line is being written: DIR/pids is a FIFO held full by its reader, so the write blocks with
+        # the job already spawned. The scheduler acts on the TERM once the job is registered: the job's pid line is out and its
+        # group is ended before the exit 143 (the 0.5 s is only the TERM's delivery margin)
+        o10 = os.path.join(d, "o10")
+        os.mkdir(o10)
+        fifo = os.path.join(o10, "pids")
+        os.mkfifo(fifo)
+        sink = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        filler = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        for size in (4096, 1):
+            try:
+                while True:
+                    os.write(filler, b"x" * size)
+            except BlockingIOError:
+                pass
+        os.close(filler)
+        jf = jobs_file([f"reg\t-\t-\tsleep 300 & echo $$ $! > {d}/child3; wait"])
+        p = subprocess.Popen([sys.executable, me, "run", "--out", o10, jf])
+        wait_written(os.path.join(d, "child3"))
+        p.send_signal(signal.SIGTERM)
+        time.sleep(0.5)
+        got = b""
+        stop_at = time.monotonic() + 30
+        while p.poll() is None and time.monotonic() < stop_at:  # reading the pipe frees the scheduler's write
+            try:
+                got += os.read(sink, 65536)
+            except BlockingIOError:
+                pass
+            time.sleep(0.02)
+        if p.poll() is None:
+            p.kill()
+        rc = p.wait()
+        while chunk := os.read(sink, 65536):
+            got += chunk
+        os.close(sink)
+        leader, child3 = (int(x) for x in rd("child3").split())
+        ended = gone(child3)
+        if not ended:
+            signal_group(leader, signal.SIGKILL)  # the group the job wrote: never leave a survivor behind a red run
+        expect(rc == 143, f"a TERM while a job's pid line is written ends the scheduler 143 (got {rc})")
+        expect(f"reg {leader}\n" in got.decode(errors="replace"), "a TERM while a job's pid line is written leaves the line out")
+        expect(ended, "a TERM while a job's pid line is written ends that job's group")
+        # a second TERM while the scheduler waits for a job's shell to end: the shell ignores TERM for 2 s and a child of its
+        # group outlives it, so the KILL after the wait is what ends the child, and the second TERM must not cut that short
+        jf = jobs_file([f'twice\t-\t-\ttrap "" TERM; sleep 300 & echo $$ $! > {d}/child4; sleep 2'])
+        p = subprocess.Popen([sys.executable, me, "run", "--out", os.path.join(d, "o11"), jf])
+        wait_written(os.path.join(d, "child4"))
+        p.send_signal(signal.SIGTERM)
+        time.sleep(0.5)
+        p.send_signal(signal.SIGTERM)
+        try:
+            rc = p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rc = p.wait()
+        leader, child4 = (int(x) for x in rd("child4").split())
+        ended = gone(child4)
+        if not ended:
+            signal_group(leader, signal.SIGKILL)
+        expect(rc == 143, f"a second TERM during the cleanup leaves the scheduler's exit 143 (got {rc})")
+        expect(ended, "a second TERM during the cleanup leaves the KILL of the job's group to happen")
         # a group holding only zombies (its leader ended and not yet reaped) is signalled without an error
         z = subprocess.Popen(["sh", "-c", "exit 0"], start_new_session=True)
         for _ in range(200):
