@@ -4,15 +4,16 @@
 //! uniform and in order, whatever the thread count. A clip of two video streams decodes the first,
 //! the stream the probe measured, and a clip with audio longer than its video probes the video's
 //! own frame count. A decode past the file's end and a file that is no video are named errors. A
-//! 60-second 1080p H.264 clip is planned and decoded at four threads; every planned frame arrives
-//! whole and in order. ffmpeg is a requirement of the gate, so its absence fails by name rather
-//! than skipping.
+//! playlist that names a local video is refused by both commands, and each container the server
+//! reads probes and decodes. A 60-second 1080p H.264 clip is planned and decoded at four threads;
+//! every planned frame arrives whole and in order. ffmpeg is a requirement of the gate, so its
+//! absence fails by name rather than skipping.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use serve::video::{Clip, Decoder, FfmpegDecoder, VideoError};
+use serve::video::{Clip, Decoder, FfmpegDecoder, VIDEO_FORMATS, VideoError};
 use vision::VisionError;
 use vision::video::{ClipMeta, Overflow, Sampler, Sizer, Stamp, Tail, VideoRule, plan};
 
@@ -403,4 +404,156 @@ fn hw_h264_clip_decodes_its_plan() {
         })
         .expect("the decode");
     assert_eq!(n, want.len());
+}
+
+/// What ffprobe, given no restriction, reads of a file's first video stream: `width,height`.
+fn unrestricted_probe(path: &Path) -> String {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "stream=width,height", "-of", "csv=p=0"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("ffprobe starts");
+    assert!(
+        out.status.success(),
+        "ffprobe {}: {}",
+        path.display(),
+        out.status
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// An HLS playlist in a clip's bytes that names a local video the client did not upload. ffprobe
+/// and ffmpeg, left to detect the format, follow the playlist and read that file; both are held to
+/// the container demuxers, so each refuses the playlist by name. The control first: with no
+/// restriction the playlist does reach the segment on this ffmpeg, so the refusal is the
+/// restriction's and not a fixture that never worked.
+#[test]
+#[ignore = "gate: just gate-serve-video"]
+fn hw_a_playlist_naming_a_local_file_is_refused() {
+    let decoder = decoder();
+    let dir = Dir::new("playlist");
+    let segment = dir.file("segment.ts");
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x48:rate=10:duration=2",
+        ],
+        None,
+        &segment,
+    );
+    let playlist = format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n\
+         #EXTINF:2.0,\n{}\n#EXT-X-ENDLIST\n",
+        segment.display()
+    );
+    let listed = dir.file("list.m3u8");
+    std::fs::write(&listed, &playlist).expect("the playlist");
+    let read = unrestricted_probe(&listed);
+    assert!(
+        read.contains("64,48"),
+        "the control: an unrestricted ffprobe must read the segment through the playlist ({read:?}); \
+         without it this gate proves nothing"
+    );
+    let clip = Clip::new(playlist.into_bytes(), Some("m3u8"));
+    match decoder.probe(&clip) {
+        Err(VideoError::Probe(said)) => {
+            assert!(
+                said.contains("not on whitelist"),
+                "the probe's refusal: {said}"
+            );
+            println!("gate video: a playlist's probe is refused: {said}");
+        }
+        other => panic!("a playlist naming a local file, probed: {other:?}"),
+    }
+    // The decode too, as if the probe had been skipped: the segment's own numbers.
+    let meta = ClipMeta {
+        frames: 20,
+        fps: (10, 1),
+        width: 64,
+        height: 48,
+    };
+    match decode(&decoder, &clip, &meta, &[0, 10], 1) {
+        Err(VideoError::Decode(said)) => {
+            assert!(
+                said.contains("not on whitelist"),
+                "the decode's refusal: {said}"
+            );
+            println!("gate video: a playlist's decode is refused: {said}");
+        }
+        other => panic!("a playlist naming a local file, decoded: {other:?}"),
+    }
+}
+
+/// Every name of the whitelist is a demuxer of this ffmpeg, and each container the server reads
+/// probes and decodes under it: a clip per demuxer that any build encodes (MPEG-4 in MP4 and AVI,
+/// FLV1, MPEG-1 in a program stream, MPEG-2 in a transport stream; Matroska is the other gates'),
+/// so a misspelt name, or a demuxer the list drops, fails here and not on a client's clip.
+#[test]
+#[ignore = "gate: just gate-serve-video"]
+fn hw_each_container_the_server_reads_probes_and_decodes() {
+    let decoder = decoder();
+    let dir = Dir::new("containers");
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-demuxers"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("ffmpeg starts");
+    let table = String::from_utf8_lossy(&out.stdout);
+    let known: Vec<&str> = table
+        .lines()
+        .filter(|l| l.trim_start().starts_with('D'))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .flat_map(|names| names.split(','))
+        .collect();
+    for name in VIDEO_FORMATS.split(',') {
+        assert!(known.contains(&name), "{name} is no demuxer of this ffmpeg");
+    }
+    let cases: [(&str, &str); 5] = [
+        ("mp4", "mpeg4"),
+        ("avi", "mpeg4"),
+        ("flv", "flv1"),
+        ("mpg", "mpeg1video"),
+        ("ts", "mpeg2video"),
+    ];
+    for (suffix, codec) in cases {
+        let path = dir.file(&format!("clip.{suffix}"));
+        ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x48:rate=25:duration=0.8",
+                "-c:v",
+                codec,
+            ],
+            None,
+            &path,
+        );
+        let clip = Clip::new(std::fs::read(&path).expect("the clip"), Some(suffix));
+        let meta = decoder
+            .probe(&clip)
+            .unwrap_or_else(|e| panic!("{suffix}: the probe: {e}"));
+        assert_eq!(
+            meta,
+            ClipMeta {
+                frames: 20,
+                fps: (25, 1),
+                width: 64,
+                height: 48
+            },
+            "{suffix}: the probe"
+        );
+        let frames = decode(&decoder, &clip, &meta, &[0, 10], 1)
+            .unwrap_or_else(|e| panic!("{suffix}: the decode: {e}"));
+        assert_eq!(
+            frames.iter().map(|f| f.0).collect::<Vec<_>>(),
+            [0, 10],
+            "{suffix}: the frames that arrive"
+        );
+        println!("gate video: a {suffix} ({codec}) clip probes and decodes");
+    }
 }

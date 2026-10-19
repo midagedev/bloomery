@@ -24,8 +24,8 @@ pub enum Sampler {
     /// count `floor(duration × fps)` held to the rule's frame bounds and to the clip's frames.
     Linspace,
     /// One frame a tick of the rule's rate, the count `round(duration × fps)` with halves up. A
-    /// `centred` tick takes the last source frame before the tick's midpoint, one that is not the
-    /// first frame at or after the tick's start.
+    /// `centred` tick takes the last source frame before the tick's midpoint; one that is not
+    /// takes the first frame at or after the tick's start.
     Ticks { centred: bool },
 }
 
@@ -270,7 +270,7 @@ pub(crate) fn sample(rule: &VideoRule, meta: &ClipMeta) -> Result<Sampled, Visio
                     let at = if centred {
                         ((2 * t + 1) * num * b).div_ceil(2 * den * a) - 1
                     } else {
-                        t * b * num / (a * den)
+                        (t * b * num).div_ceil(a * den)
                     };
                     at.min(last) as usize
                 })
@@ -598,7 +598,8 @@ mod tests {
     }
 
     /// Ticks: the centred tick of a 24 fps clip at one a second is the frame before the second's
-    /// midpoint (11, 35, …); an uncentred one is the second's first frame (0, 24, …); an index
+    /// midpoint (11, 35, …); an uncentred one is the second's first frame (0, 24, …), at a
+    /// fractional rate the first frame at or after the tick, not the one before it; an index
     /// never passes the last frame; a clip under half a tick, or past the rule's maximum under
     /// `Refuse`, is refused by name.
     #[test]
@@ -615,6 +616,10 @@ mod tests {
         };
         let p = plan(&plain, &clip(7 * 24, (24, 1)), usize::MAX, &sizer).unwrap();
         assert_eq!(p.indices, (0..7).map(|t| 24 * t).collect::<Vec<_>>());
+        // 30000/1001 is 29.97 fps: the second tick (1 s) falls between frames 29 (0.968 s) and 30
+        // (1.001 s), and an uncentred tick is the first frame at or after it.
+        let p = plan(&plain, &clip(60, (30_000, 1001)), usize::MAX, &sizer).unwrap();
+        assert_eq!(p.indices, [0, 30]);
         // One frame at half a frame a second: two ticks, both the one frame.
         let p = plan(&TICKS, &clip(1, (1, 2)), usize::MAX, &sizer).unwrap();
         assert_eq!(p.indices, [0, 0]);

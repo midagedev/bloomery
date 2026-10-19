@@ -6,7 +6,9 @@
 //! count them), planned by the one planner (`vision::video::plan`), and
 //! decoded by ffmpeg at its native size: only the planned frames, streamed one at a time, each
 //! handed on as soon as it arrives so the request thread resizes and patches a group while ffmpeg
-//! decodes toward the next ([`video_part`]). Memory is one group of frames and the patches.
+//! decodes toward the next ([`video_part`]). Memory is one group of frames and the patches. Both
+//! commands read the clip's file only through the demuxers of [`VIDEO_FORMATS`] and the `file`
+//! protocol, so a playlist inside the bytes cannot lead them to another file.
 //!
 //! ffmpeg and ffprobe come from `PATH`, found once at startup ([`FfmpegDecoder::detect`]); an absent
 //! or too old one is a named error that names both remedies, never a fallback. The decoder is a
@@ -28,6 +30,25 @@ use crate::media::{ImageKey, MediaError};
 
 /// How much of ffmpeg's stderr an error quotes.
 const STDERR_KEPT: u64 = 8 * 1024;
+
+/// The demuxers ffprobe and ffmpeg may open on a client's bytes. Left to detect the format, they
+/// open a playlist (HLS), a manifest (DASH) or a list (concat) that names other files, and read
+/// media the client never uploaded. None of these follows a reference: `mov` takes external tracks
+/// only under `enable_drefs` and `use_absolute_path`, both off by default, and the others have no
+/// option that opens a second file.
+pub const VIDEO_FORMATS: &str = "mov,matroska,webm,avi,flv,mpeg,mpegts,ogg";
+
+/// Limit `cmd`, an ffprobe or ffmpeg that reads a clip, to the demuxers of [`VIDEO_FORMATS`] and
+/// the `file` protocol, so the one file it is given is the only one it opens. These are input
+/// options: the command gives them before its `-i`.
+fn restrict_input(cmd: &mut Command) {
+    cmd.args([
+        "-protocol_whitelist",
+        "file",
+        "-format_whitelist",
+        VIDEO_FORMATS,
+    ]);
+}
 
 /// The oldest ffmpeg the decode takes: `-fps_mode` is from 5.1.
 pub const MIN_FFMPEG: (u32, u32) = (5, 1);
@@ -480,6 +501,7 @@ impl FfmpegDecoder {
     /// maps). With `count` ffprobe also decodes the stream and counts its frames.
     fn probe_stream(&self, clip: &Clip, count: bool) -> Result<Probed, VideoError> {
         let mut cmd = Command::new(&self.ffprobe);
+        restrict_input(&mut cmd);
         cmd.args(["-v", "error", "-select_streams", "v:0"]);
         if count {
             cmd.arg("-count_frames");
@@ -527,6 +549,7 @@ impl Decoder for FfmpegDecoder {
         each: &mut dyn FnMut(usize, Rgb8) -> bool,
     ) -> Result<(), VideoError> {
         let mut cmd = Command::new(&self.ffmpeg);
+        restrict_input(&mut cmd);
         cmd.args(["-nostdin", "-v", "error"]);
         if threads > 0 {
             cmd.arg("-threads").arg(threads.to_string());
