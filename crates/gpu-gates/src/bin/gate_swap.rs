@@ -63,6 +63,12 @@
 //!   the slot ledger's), releases the host pages of the seed experts it
 //!   copies back and of the cancelled flips' victims that stay on the card,
 //!   and the trace after it gives the fresh run's values.
+//! - reseed: with flips in flight, an order of another length is refused
+//!   by name and leaves the machine working; a reseed to every layer's ids
+//!   in descending order lands each card set on its pinned seed experts and
+//!   the order's first (`residency reset` diff=0, the live sets, the rule's
+//!   and the slot ledger's), and a reset after 40 more passes returns there
+//!   (its mutant: the machine relayouts without reseeding the rule).
 //! - tier: a map with tier entries runs with flips on every card layer, and
 //!   no flip admits or evicts a tier expert, though one of them is an expert
 //!   the stage-only run admits; every tier entry is unchanged after the run
@@ -2238,6 +2244,99 @@ mod gate {
             verdict(c7)
         );
         Ok(c7)
+    }
+
+    /// reseed: a fresh arm driven to the last boundary that made flips, a
+    /// refused order, the reseed, 40 passes, a reset.
+    fn reseed(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let &(b_last, _) = a.flips.last().ok_or("gate_swap: the run made no flip")?;
+        let mut r = plain(gpu, pm, Faults::default(), DELAY)?;
+        drive(
+            gpu,
+            &mut r,
+            trace,
+            0..b_last as usize + 1,
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        let driven = r.err.is_none();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let desc: Vec<u32> = (0..E as u32).rev().collect();
+        let mut want = Vec::with_capacity(L);
+        for (i, l) in LAYERS.enumerate() {
+            let pinned = m.rule().pinned(i).map_err(|e| e.to_string())?;
+            let seed = m.seed(l)?;
+            let mut set: Vec<u32> = seed[..pinned].to_vec();
+            set.extend(
+                desc.iter()
+                    .filter(|id| !set.contains(id))
+                    .take(seed.len() - pinned)
+                    .collect::<Vec<_>>(),
+            );
+            set.sort_unstable();
+            want.push(set);
+        }
+        let short = vec![&desc[..]; L - 1];
+        let refused = m
+            .reseed(gpu.stream(), &mut r.slots, &short)
+            .err()
+            .map(|e| e.to_string());
+        let named = refused.as_deref().is_some_and(|e| {
+            e.contains("SwapMachine::reseed") && e.contains("one order per layer")
+        });
+        let order = vec![&desc[..]; L];
+        let rep = match m.reseed(gpu.stream(), &mut r.slots, &order) {
+            Ok(rep) => rep,
+            Err(e) => {
+                println!("reseed after boundary {b_last}: {e} FAIL");
+                return Ok(false);
+            }
+        };
+        record::residency_reset(&rep).print();
+        let at_want = |m: &SwapMachine, slots: &SlotMap| -> Result<bool, GateError> {
+            let mut ok = card_sets(slots) == want;
+            for (i, l) in LAYERS.enumerate() {
+                let mut seed = m.seed(l)?;
+                seed.sort_unstable();
+                let live = m.rule().live(i).map_err(|e| e.to_string())?;
+                let row = m.ledger().row(l).unwrap_or(&[]);
+                let on = row
+                    .iter()
+                    .filter(|s| matches!(s, SlotState::Live(_)))
+                    .count();
+                let spare = row.iter().filter(|s| **s == SlotState::Spare).count();
+                ok &= seed == want[i]
+                    && live.collect::<Vec<_>>() == want[i]
+                    && on == want[i].len()
+                    && spare == row.len() - on;
+            }
+            Ok(ok)
+        };
+        let landed = rep.diff == 0 && rep.copies > 0 && at_want(m, &r.slots)?;
+        r.values.clear();
+        r.flips.clear();
+        drive(gpu, &mut r, trace, 0..40, Copies::Prompt, Hold::None)?;
+        let moved = !r.flips.is_empty();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let back = m.reset(gpu.stream(), &mut r.slots)?;
+        let returned = back.diff == 0 && at_want(m, &r.slots)?;
+        let ok = driven && named && landed && moved && returned;
+        println!(
+            "reseed after boundary {b_last}: an order short of a layer refused {refused:?} named \
+             {named}; to descending ids diff {} copies {} at the pinned and the order's first \
+             {landed}; 40 passes made flips {moved}; the reset after them diff {} back at the \
+             reseed {returned} {}",
+            rep.diff,
+            rep.copies,
+            back.diff,
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// `run` on this thread under a watchdog: past [`QUEUE_BOUND`] the
@@ -5122,6 +5221,7 @@ mod gate {
         ok &= priority(&gpu, &a)?;
         record::residency_pass(&a.reports.last().copied().unwrap_or_default()).print();
         ok &= c7(&gpu, &pm, &trace, &a)?;
+        ok &= reseed(&gpu, &pm, &trace, &a)?;
         ok &= tier(&gpu, &pm, &trace, &a)?;
         ok &= staging_failure(&gpu, &pm, &trace, &a)?;
         ok &= tally_clause(&gpu, &pm, &trace)?;

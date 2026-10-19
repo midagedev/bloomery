@@ -9,7 +9,7 @@
 //!                   [--card-table FILE]
 //!     generate_ds41 --arm SPEC [--arm SPEC ...] [--arm-sync] [-n N] [--ctx C]
 //!                   [--place PLACE] [--mode eager|graph] [--time [--warm W]]
-//!                   [--logits]
+//!                   [--logits] [--warm-save]
 //!     generate_ds41 --records-schema
 //!
 //! Defaults: prompt 0 (none when `--depth` is given), N 32, C the serving
@@ -326,9 +326,11 @@ mod state_back;
 mod drive {
     use std::num::NonZeroUsize;
     use std::ops::Range;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     use app::arch::deepseek41::Ds41Cfg;
+    use app::warm::{WarmFile, WarmLoad, WarmSave};
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::head::Head;
@@ -350,7 +352,7 @@ mod drive {
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LANES,
         HOST_LOCK, HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP,
-        R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS,
+        R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS, WARM_PROFILE,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -372,8 +374,8 @@ mod drive {
         format!(
             "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] [-n N] [--ctx C] \
              [--place a|gate|bp|<stage>[+<tier>…]] [--mode eager|graph] [--time [--warm W]] \
-             [--plan] [--logits] {}, or --arm SPEC [--arm SPEC ...] [--arm-sync] in place of \
-             the prompt flags",
+             [--plan] [--logits] [--warm-save] {}, or --arm SPEC [--arm SPEC ...] [--arm-sync] \
+             in place of the prompt flags",
             Diag::USAGE
         )
     }
@@ -462,6 +464,9 @@ mod drive {
         sync: bool,
         /// `--logits`: the `logits` record after the loop.
         logits: bool,
+        /// `--warm-save`: fold the run's residency usage into the
+        /// `BLOOMERY_WARM_PROFILE` file at its end.
+        warm_save: bool,
         /// The shared diagnosis flags ([`Diag`]).
         diag: Diag,
         /// Whether this run is the one `--dump-table` reads.
@@ -483,6 +488,7 @@ mod drive {
             arms: Vec::new(),
             sync: false,
             logits: false,
+            warm_save: false,
             diag: Diag::default(),
             dump_now: false,
         };
@@ -504,6 +510,10 @@ mod drive {
             }
             if flag == "--logits" {
                 a.logits = true;
+                continue;
+            }
+            if flag == "--warm-save" {
+                a.warm_save = true;
                 continue;
             }
             if a.diag.take(&flag, &mut it)? {
@@ -728,6 +738,7 @@ mod drive {
         RESIDENCY,
         HOSTSTREAM,
         GEN_SLOTS,
+        WARM_PROFILE,
     ];
 
     pub fn run() -> Result<(), GateError> {
@@ -949,6 +960,7 @@ mod drive {
         if let (Some(t), Some(p)) = (&table, &a.diag.card_table) {
             card_table(&residence(&s)?.table()?, t, p)?.print();
         }
+        let mut warm = warm_load(&mut s, &levers, &a, &path)?;
         if cfg.body.residency != Residency::Off {
             // An arm's boundaries: one a slot's prompt call, the first
             // pass's, then at most one a generated token.
@@ -989,6 +1001,7 @@ mod drive {
                 after_passes(s, ran)
             })
             .map_err(|f| Box::new(f) as GateError)?;
+            warm_save(&mut s, warm.as_mut())?;
             return print_nvtier(&s);
         }
         if draft == Draft::Off && !check_finite {
@@ -1043,6 +1056,7 @@ mod drive {
                 let t = r.table()?;
                 slot_table(&t, &r.check(&t)?, t.differ(&v)?).print();
             }
+            warm_save(&mut s, warm.as_mut())?;
             return print_nvtier(&s);
         }
         // One arm: the pair pass's capture comes before its prelude, so no
@@ -1088,8 +1102,69 @@ mod drive {
             }
             (Draft::Dspark, None, _) => Err("generate_ds41: the DSpark draft did not load".into()),
         };
+        if done.is_ok() {
+            warm_save(&mut s, warm.as_mut())?;
+        }
         print_nvtier(&s)?;
         done
+    }
+
+    /// `BLOOMERY_WARM_PROFILE` read at the load's end, before the first
+    /// prompt: the residency reseeded to the profile's rankings, a `warm
+    /// load` record either way; the file again under `--warm-save`, which
+    /// writes it at the end. Refused by name: the lever on a run with no
+    /// residency machine, `--warm-save` without the lever.
+    fn warm_load(
+        s: &mut Session<Body>,
+        levers: &Levers,
+        a: &Args,
+        model: &Path,
+    ) -> Result<Option<WarmFile>, GateError> {
+        let Some(p) = levers.warm_profile() else {
+            if a.warm_save {
+                return Err(
+                    format!("--warm-save writes the {WARM_PROFILE} file, and it is unset").into(),
+                );
+            }
+            return Ok(None);
+        };
+        let mut w = WarmFile::new(p, model, a.place.name(), &a.place.cards())?;
+        let r = Record::new(&record::WARM_LOAD);
+        match w.load(s)? {
+            WarmLoad::NoResidency => {
+                return Err(format!(
+                    "{WARM_PROFILE} seeds the residency, and this run has no residency machine"
+                )
+                .into());
+            }
+            WarmLoad::Missing => r.w("outcome", "missing").print(),
+            WarmLoad::Refused(why) => r.w("outcome", "refused").w("why", why).print(),
+            WarmLoad::Reseeded(c) => r
+                .w("outcome", "reseeded")
+                .u("copies", c.copies)
+                .u("diff", c.diff)
+                .print(),
+        }
+        Ok(a.warm_save.then_some(w))
+    }
+
+    /// Under `--warm-save`, the run's residency usage folded into the
+    /// profile ([`WarmFile::save`]) and a `warm save` record.
+    fn warm_save(s: &mut Session<Body>, w: Option<&mut WarmFile>) -> Result<(), GateError> {
+        let Some(w) = w else {
+            return Ok(());
+        };
+        match w.save(s)? {
+            WarmSave::NoResidency => Err("--warm-save: the residency machine is gone".into()),
+            WarmSave::Written { bytes, replaced } => {
+                let r = Record::new(&record::WARM_SAVE).u("bytes", bytes);
+                match replaced {
+                    Some(why) => r.w("replaced", why).print(),
+                    None => r.print(),
+                }
+                Ok(())
+            }
+        }
     }
 
     /// The load's `nvtier` record at the end of a run (counters since the

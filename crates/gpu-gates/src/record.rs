@@ -2184,6 +2184,35 @@ pub static RESIDENCY_RESET: Kind = Kind {
     ],
 };
 
+/// The residency's usage profile read at the load's end
+/// (`app::warm::WarmFile::load`).
+pub static WARM_LOAD: Kind = Kind {
+    name: "warm_load",
+    head: "warm load",
+    doc: "The residency's usage profile read at the load's end: `reseeded` (the card set moved \
+          to the profile's rankings: the experts copied onto the card, the live map's entries \
+          that differ from the new seed after it, 0 when it worked), `missing` (no file) or \
+          `refused` (the file is not this load's profile, `why` naming it); the last two keep \
+          the placement's seed.",
+    parts: &[
+        key("outcome", Word, ""),
+        opt("copies", U64, ""),
+        opt("diff", U64, ""),
+        opt("why", Text, ""),
+    ],
+};
+
+/// The residency's usage profile written at the run's end
+/// (`app::warm::WarmFile::save`).
+pub static WARM_SAVE: Kind = Kind {
+    name: "warm_save",
+    head: "warm save",
+    doc: "The residency's usage profile written at the run's end, the run's usage folded in: its \
+          bytes, and `replaced` naming why a file at the path was not folded into (another key, \
+          corrupt).",
+    parts: &[key("bytes", U64, "B"), opt("replaced", Text, "")],
+};
+
 /// A prompt call's pick at one (group, layer)
 /// ([`bloomery_gpu::host::swap::CallPick`]).
 pub static CALL_STREAM: Kind = Kind {
@@ -3481,6 +3510,8 @@ pub static GATE_GEMMA_EMBEDDING2_SERVE: &[&Kind] = kinds![
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
     &PLACE_UNSET,
+    &WARM_LOAD,
+    &WARM_SAVE,
     &PLAN,
     &CALL_PLAN,
     &CALL_GROUPS,
