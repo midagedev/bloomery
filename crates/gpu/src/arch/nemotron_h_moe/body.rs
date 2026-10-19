@@ -365,7 +365,9 @@ impl Body {
     }
 
     /// Device bytes the body holds past the weights and the stores: what the
-    /// plan sets aside as scratch.
+    /// plan sets aside as scratch, the one owner of the term
+    /// [`Body::resident_bytes`] adds the stores and the prompt pass's buffers
+    /// to (those are cut from the card's room, not from the plan's scratch).
     fn scratch_bytes(&self) -> usize {
         let routes: usize = self
             .layers
@@ -548,23 +550,16 @@ impl ChainBody for Body {
     }
 
     fn resident_bytes(&self) -> usize {
-        let layers: usize = self
+        let stores: usize = self
             .layers
             .iter()
             .map(|l| match l {
                 Layer::Mamba(m) => m.store.bytes(),
                 Layer::Attn(a) => a.bytes(),
-                Layer::Moe(m) => m.route.bytes(),
+                Layer::Moe(_) => 0,
             })
             .sum();
-        layers
-            + self.prompt.as_ref().map_or(0, Prompt::bytes)
-            + self.s.bytes()
-            + self.ms.bytes()
-            + self.acts.bytes()
-            + self.r.num_bytes()
-            + self.k.kgemv.device_bytes()
-            + self.placed.as_ref().map_or(0, Placed::device_bytes)
+        stores + self.prompt.as_ref().map_or(0, Prompt::bytes) + self.scratch_bytes()
     }
 
     fn layers(&self) -> Range<usize> {
