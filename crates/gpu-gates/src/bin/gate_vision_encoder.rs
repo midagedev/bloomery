@@ -39,6 +39,10 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "vision")]
 #[path = "shared/vision_rules.rs"]
+#[allow(
+    dead_code,
+    reason = "shared by the tower gates; each runs a part of it"
+)]
 mod vision_rules;
 
 #[cfg(feature = "vision")]

@@ -59,7 +59,7 @@ mod vision_taps;
 mod gate {
     use std::collections::{HashMap, HashSet};
 
-    use super::vision_rules::{Count, exact_check, gemm_check, par_rows};
+    use super::vision_rules::{Count, erf_check, exact_check, gemm_check, norm_rows, par_rows};
     use super::vision_taps::{
         Collect, HostFile, band_check, dist, eager_twice, floor, nudge, nudged, read_image,
         reuse_after_largest, sens as sensitivity, to_bf16, to_f32,
@@ -67,9 +67,7 @@ mod gate {
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_gpu_vision::attn::{QkvLayout, attn_bound};
     use bloomery_gpu_vision::attn_h80::{HEAD_DIM_80, attn_80_ref};
-    use bloomery_gpu_vision::gelu_tanh::gelu_erf_ref;
-    use bloomery_gpu_vision::gemm_bf16::{Epilogue, epilogue_ref, gelu_erf, within_order};
-    use bloomery_gpu_vision::layer_norm::layer_norm_ref;
+    use bloomery_gpu_vision::gemm_bf16::{Epilogue, epilogue_ref, within_order};
     use bloomery_gpu_vision::norm::rms_norm_ref;
     use bloomery_gpu_vision::pos_half::{PosHalfKernels, pos_half_ref};
     use bloomery_gpu_vision::radio::{Encoder, scratch_bytes_of, weight_bytes_of};
@@ -78,7 +76,7 @@ mod gate {
     use cuda_core::DeviceBuffer;
     use gguf::Gguf;
     use refset::arch::nemotron_h_moe::vis::{MMPROJ, PREPROC, TAPS};
-    use refset::clefvis::{ClefvisSet, EMBD, RADIO_POS, TapScope};
+    use refset::clefvis::{ClefvisSet, EMBD, RADIO_POS, RADIO_TAP_BLOCKS as TAP_BLOCKS, TapScope};
     use vision::Patches;
     use vision::arch::radio::{
         Hparams, POS_SIDE, PREFIX_ROWS, PROJECTOR_HIDDEN, TokenLimits, names as n, preprocess,
@@ -98,8 +96,6 @@ mod gate {
     /// 1,540 B more for the ten prefix rows of every stream).
     const WEIGHT_BYTES: u64 = 1_723_781_120;
     const SCRATCH_BYTES: u64 = 593_251_328;
-    /// The blocks whose nodes the set holds.
-    const TAP_BLOCKS: [usize; 4] = [0, 1, 15, 31];
     /// A tap passes when `rms(ours − ref) / rms(ref)` is at most this multiple of the larger of its
     /// controls.
     /// PIN(2026-10-18): fixed before the first run of this tower against its set: the Qwen3-VL
@@ -112,15 +108,6 @@ mod gate {
     const K_TAP: f64 = 4.0;
     /// The RMS norm epsilon of the projector, a constant of llama.cpp's graph (`build_norm(…, 1e-5)`).
     const MLP_NORM_EPS: f32 = 1e-5;
-    /// The erf GELU's allowed distance from the host rule's f32 value, in units of `|x|`: the glm5v
-    /// tower's derivation (`gate_glm5v_tower`'s `ERF_BOUND`). The device runs the host's rule step
-    /// for step (`z = x·√½`, `e = erf z`, `s = 1 + e`, `0.5·x·s`, each op rounded to f32), so the two
-    /// differ by the `erf` alone (the device's within 2 ulp, the host's within 0.5) and by how the
-    /// roundings fall: at most `2.125·2⁻²³·|x|` for x > 0 and `1.375·2⁻²³·|x|` for x < 0, where the
-    /// sum `1 + e` cancels toward a small result; `2⁻²¹` covers both. The bound follows `|x|`, not
-    /// the result: where `erf` is within an ulp of −1 a result of 1e-6 moves by several bf16 steps
-    /// of itself.
-    const ERF_BOUND: f64 = 1.0 / 2_097_152.0;
 
     // ------------------------------------------------------------ taps
 
@@ -291,12 +278,6 @@ mod gate {
             mm1: b16(n::mlp_up())?,
             mm3: b16(n::mlp_down())?,
         })
-    }
-
-    fn norm_rows(x: &[u16], g: &(Vec<f32>, Vec<f32>), eps: f32) -> Vec<u16> {
-        x.chunks_exact(g.0.len())
-            .flat_map(|r| layer_norm_ref(r, &g.0, &g.1, eps))
-            .collect()
     }
 
     // ------------------------------------------------------------ host half
@@ -535,26 +516,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// The erf GELU's results `got` for the bf16 inputs `xs` against the host rule inside
-    /// [`ERF_BOUND`]: no result outside the bound (not a rounding of a value within `|x|·ERF_BOUND`
-    /// of the rule's f32 value); the count that differ from the rule's own rounding is printed.
-    fn erf_check(name: &str, xs: &[u16], got: &[u16]) -> bool {
-        let (mut outside, mut differ) = (0usize, 0usize);
-        for (&x, &y) in xs.iter().zip(got) {
-            let xf = bf16_f32(x);
-            let centre = f64::from(gelu_erf(xf));
-            outside += usize::from(!within_order(y, centre, f64::from(xf).abs() * ERF_BOUND));
-            differ += usize::from(y != gelu_erf_ref(x));
-        }
-        let pass = xs.len() == got.len() && outside == 0;
-        println!(
-            "rule {name:<17} {outside} of {} outside the erf bound |x|·2⁻²¹, {differ} differ from the host rounding  {}",
-            xs.len(),
-            verdict(pass)
-        );
-        pass
-    }
-
     // ------------------------------------------------------------ once-per-run rules
 
     /// ReLU² on every bf16 value against the host rule: bit for bit, a NaN staying a NaN.
@@ -651,6 +612,8 @@ mod gate {
     )]
     pub fn run() -> Result<(), GateError> {
         let set = ClefvisSet::open(&TAPS.path(TAPS_SET), &TAPS)?;
+        // The op rules and the reuse-after-largest clause run on `FULL`: a set without it is refused.
+        set.image(FULL)?;
         let pre = ClefvisSet::open(&PREPROC.path(PREPROC_SET), &PREPROC)?;
         let file = Gguf::open(MMPROJ)?;
         let (ctx, stream) = bloomery_gpu::capsync::fresh_stream(0)?;

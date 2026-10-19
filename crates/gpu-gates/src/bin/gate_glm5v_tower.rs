@@ -43,6 +43,10 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "vision")]
 #[path = "shared/vision_rules.rs"]
+#[allow(
+    dead_code,
+    reason = "shared by the tower gates; each runs a part of it"
+)]
 mod vision_rules;
 
 #[cfg(feature = "vision")]
@@ -55,7 +59,9 @@ mod gate {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use super::vision_rules::{Count, exact_check, gemm_check, near_check, par_rows};
+    use super::vision_rules::{
+        Count, erf_check, erf_outside, exact_check, gemm_check, near_check, par_rows,
+    };
     use super::vision_taps::{
         Collect, HostFile, band_check, dist_f32, eager_twice, floor, ggml_table, nudge, nudged,
         read_image, reuse_after_largest, sens as sensitivity, to_bf16,
@@ -63,8 +69,8 @@ mod gate {
     use bloomery_gpu_gates::tier::Tier;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_gpu_vision::attn::{HEAD_DIM, QkvLayout, attn_bound, attn_ref};
-    use bloomery_gpu_vision::gelu_tanh::{GeluKind, GeluTanhKernels, gelu_erf_ref, gelu_tanh_ref};
-    use bloomery_gpu_vision::gemm_bf16::{Epilogue, epilogue_ref, gelu_erf, within_order};
+    use bloomery_gpu_vision::gelu_tanh::{GeluKind, GeluTanhKernels, gelu_tanh_ref};
+    use bloomery_gpu_vision::gemm_bf16::{Epilogue, epilogue_ref, within_order};
     use bloomery_gpu_vision::glm5v::Encoder;
     use bloomery_gpu_vision::layer_norm::layer_norm_ref;
     use bloomery_gpu_vision::mlp::MlpKernels;
@@ -109,18 +115,6 @@ mod gate {
     /// ratios lie in 0.92–3.78, the smallest image's `after_fc_proj` (a grid of 8×10 patches, whose
     /// controls are the smallest) the highest; the nine teacher-forced pairs in 1.45–1.72.
     const K_TAP: f64 = 4.0;
-    /// The erf GELU's allowed distance from the host rule's f32 value, in units of `|x|`. The
-    /// device runs the host's rule step for step (`z = x·√½`, `e = erf z`, `s = 1 + e`, `0.5·x·s`,
-    /// each op rounded to f32), so the two differ by the `erf` alone and by how the roundings fall:
-    /// the device's `erff` is within 2 ulp of the true value and the host's within 0.5, so
-    /// `|Δe| ≤ 2.5·2⁻²⁴` (the ulp of a magnitude below 1); the two roundings of `s` add at most
-    /// `2·2⁻²⁴` where `s ≥ 1` and `2·2⁻²⁵` below it; the two roundings of the product at most
-    /// `2·2⁻²⁴` of its magnitude. For x > 0 that is `0.5·|x|·4.5·2⁻²⁴ + 2·2⁻²⁴·|x| = 2.125·2⁻²³·|x|`;
-    /// for x < 0, where the sum `1 + e` cancels toward a small result and `s < 1`,
-    /// `0.5·|x|·3.5·2⁻²⁴ + 2⁻²⁴·|x| = 1.375·2⁻²³·|x|`. `2⁻²¹ = 4·2⁻²³` covers both. The bound follows
-    /// `|x|`, not the result: where `erf` is within an ulp of −1 the cancellation moves a result of
-    /// 1e-6 by several bf16 steps of itself, and a one-step band would call that a defect.
-    const ERF_BOUND: f64 = 1.0 / 2_097_152.0;
     /// Values of the clamped SwiGLU sweep that may differ from the f32 rule rounded once, each by
     /// one bf16 step at most: the device's `expf` (2 ulp) against the host's `exp` moves `silu` by
     /// at most 3.6e-7 relative, and a bf16 rounding boundary lies that close to a value with a
@@ -565,46 +559,6 @@ mod gate {
     /// rule for a sweep to tell the two apart: ten times its pinned count, at least ten.
     fn premise_floor(pin: usize) -> usize {
         10 * pin.max(1)
-    }
-
-    /// The erf GELU's results `got` for the bf16 inputs `xs` against the host rule inside
-    /// [`ERF_BOUND`]: how many are not a rounding of a value within `|x|·ERF_BOUND` of the rule's
-    /// f32 value, how many differ from the rule's own rounding, and the first outside input and
-    /// result.
-    fn erf_outside(xs: &[u16], got: &[u16]) -> (usize, usize, Option<(u16, u16)>) {
-        let (mut outside, mut differ, mut first) = (0usize, 0usize, None);
-        for (&x, &y) in xs.iter().zip(got) {
-            let xf = bf16_f32(x);
-            let centre = f64::from(gelu_erf(xf));
-            if !within_order(y, centre, f64::from(xf).abs() * ERF_BOUND) {
-                outside += 1;
-                first.get_or_insert((x, y));
-            }
-            differ += usize::from(y != gelu_erf_ref(x));
-        }
-        (outside, differ, first)
-    }
-
-    /// [`erf_outside`] as a clause: no result outside the bound.
-    fn erf_check(name: &str, xs: &[u16], got: &[u16]) -> bool {
-        let (outside, differ, first) = erf_outside(xs, got);
-        let pass = xs.len() == got.len() && outside == 0;
-        println!(
-            "rule {name:<17} {outside} of {} outside the erf bound |x|·2⁻²¹, {differ} differ from the host rounding  {}",
-            xs.len(),
-            verdict(pass)
-        );
-        if let Some((x, y)) = first {
-            println!(
-                "rule {name:<17} first outside: x {:#06x} ({:e}) gives {:#06x} ({:e}), the host rule {:#06x}",
-                x,
-                bf16_f32(x),
-                y,
-                bf16_f32(y),
-                gelu_erf_ref(x)
-            );
-        }
-        pass
     }
 
     /// The erf GELU on every normal bf16 value in [−8, 8] against the host rule inside the erf

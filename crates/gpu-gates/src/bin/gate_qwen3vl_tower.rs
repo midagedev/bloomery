@@ -41,6 +41,10 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "vision")]
 #[path = "shared/vision_rules.rs"]
+#[allow(
+    dead_code,
+    reason = "shared by the tower gates; each runs a part of it"
+)]
 mod vision_rules;
 
 #[cfg(feature = "vision")]
@@ -51,7 +55,7 @@ mod vision_taps;
 mod gate {
     use std::collections::{HashMap, HashSet};
 
-    use super::vision_rules::{Count, exact_check, gemm_check, near_check, par_rows};
+    use super::vision_rules::{Count, exact_check, gemm_check, near_check, norm_rows, par_rows};
     use super::vision_taps::{
         Collect, HostFile, band_check, dist, dist_f32, eager_twice, floor, ggml_table, nudge,
         nudged, read_image, reuse_after_largest, sens as sensitivity, to_bf16, to_f32,
@@ -60,7 +64,6 @@ mod gate {
     use bloomery_gpu_vision::attn::{QkvLayout, attn_72_ref, attn_bound};
     use bloomery_gpu_vision::gelu_tanh::{GeluTanhKernels, gelu_tanh_ref};
     use bloomery_gpu_vision::gemm_bf16::{Epilogue, epilogue_ref, within_order};
-    use bloomery_gpu_vision::layer_norm::layer_norm_ref;
     use bloomery_gpu_vision::pos_bilinear::{PosBilinearKernels, pos_bilinear_ref};
     use bloomery_gpu_vision::qwen3vl::{Encoder, scratch_bytes_of, weight_bytes_of};
     use bloomery_gpu_vision::rope2d::{HEAD_DIM_72, PAIRS_72, RopeTable, rope_72_ref};
@@ -221,12 +224,6 @@ mod gate {
             mm2_w: b16(n::mm2_weight())?,
             mm2_b: f32s(n::mm2_bias())?,
         })
-    }
-
-    fn norm_rows(x: &[u16], g: &(Vec<f32>, Vec<f32>), eps: f32) -> Vec<u16> {
-        x.chunks_exact(g.0.len())
-            .flat_map(|r| layer_norm_ref(r, &g.0, &g.1, eps))
-            .collect()
     }
 
     // ------------------------------------------------------------ op rules
