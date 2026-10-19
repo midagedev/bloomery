@@ -177,7 +177,7 @@ crates/hf/src/fetch.rs	derive	the fetch Event that model_file.rs reports; the fi
 crates/decision/src/lib.rs	derive	the decision crate's Error: the decision gates
 crates/vision/src/lib.rs	derive gate-gpu-routed-legs	VisionError, which the media and preprocess paths return
 crates/gpu/src/gelu.rs	derive	the shared tanh GELU rule: the registered elementwise module and image towers that use it
-crates/gpu-vision/src/{aligner,attn,attn_group,chain,encoder,gelu_tanh,gemm_bf16,glm5v,layer_norm,mean_groups,mlp,norm,pos_bilinear,qwen3vl,rope2d}.rs	derive	the image towers' card kernels: the tower, serve and media-seat gates that run them
+crates/gpu-vision/src/{aligner,attn,attn_group,attn_h80,chain,encoder,gelu_tanh,gemm_bf16,glm5v,layer_norm,mean_groups,mlp,norm,pos_bilinear,pos_half,qwen3vl,radio,relu_sq,rope2d}.rs	derive	the image towers' card kernels: the tower, serve and media-seat gates that run them
 crates/gpu-vision/src/lib.rs	derive	the tower crate's root, which the Qwen3.5 media gates also link
 crates/vision/src/arch/glm5v/{card,hparams,mod,names,tensors}.rs	derive	the GLM-5V family's hparams, tensor names and card homes
 crates/vision/src/arch/glm5v/{media,size}.rs	derive	the GLM-5V media span and size rule the serve seats plan with

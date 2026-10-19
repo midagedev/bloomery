@@ -857,6 +857,14 @@ dump-ref-embedding MODEL *STEPS:
 dump-ref-glmv *ARGS:
     case " {{ARGS}} " in *" --ids "*|*" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_TIER=fixture BLOOMERY_CARD=$card BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
 
+# Nemotron 3.5 Bolt image input, the oracle's binary: dump_mtmd (the tower arm) linked against the mainline tree cd0a5b6a1 (the nemotron_h_moe profile's, a CPU build) in /home/user/llama.cpp-mainline-bolt (tools/ref/clefvis/build-clefvis.sh, the nemotron_h_moe row of tools/ref/clefvis/profile.sh) into $BLOOMERY_DATA/bin/dump_mtmd_l5, the binary every seat of that tree shares; CLEFVIS_OUT=<dir> (in BLOOMERY_BOX_ENV) builds into another directory for a test, and a run of the sets then names it the same way.
+build-bolt-ref:
+    BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
+
+# Nemotron 3.5 Bolt image input (mtmd `nemotron_omni`, the RADIO tower), the oracle sets (tools/ref/clefvis/clefvis.sh, the nemotron_h_moe seat of profile.sh, images tools/ref/clefvis/images-bolt.tsv; refset families in crates/refset/src/arch/nemotron_h_moe/vis.rs): the preprocess (ref_nemotron_h_moe_vis_preproc) and the tower's per-block nodes (ref_nemotron_h_moe_vis_taps) into $BLOOMERY_DATA. The oracle tree has no CUDA backend, so a set is the CPU run (`--cpu`, the default of this recipe): no card lock, no twin, no lease; the 24 GB text file is read for its vocabulary only.
+dump-ref-boltvis *ARGS:
+    BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh "bash tools/ref/clefvis/clefvis.sh --cpu {{ARGS}}"
+
 # GLM-5.3-Flash(glm5next) 오라클: 같은 덤프 도구를 glm5next 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
 # $BLOOMERY_DATA/ref_glm5next/에 뜬다. VARIANT(step4, d1k, d3kdsa, d16kdsa와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
 # 제 세트로 뜬다 — models/glm5next.sh. d1k는 $BLOOMERY_DATA/glm5next/corpus-prose.ids의 첫 1,025개 id를 읽는다(sha256 핀).
@@ -2704,6 +2712,19 @@ gate-gpu-vision-hw:
 # call when a real-tier set exists.
 gate-gpu-glm5v-tower:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-glm5v-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_glm5v_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5v_tower'
+
+# The RADIO image tower on the card (the `nemotron_omni` mmproj of Nemotron 3.5 Bolt: 32 blocks of heads of 80, LayerNorm, erf GELU, a
+# learned 128x128 position table resized half-pixel, ten class and register rows that attend and are dropped, a 2x2 pixel-shuffle
+# projector with an RMS norm and a ReLU-squared MLP) against the Bolt vision seat's sets (ref_nemotron_h_moe_vis_preproc and
+# ref_nemotron_h_moe_vis_taps: mainline mtmd's graph nodes and `embd` of nine images; the oracle is a CPU build, so there is no card run
+# and no CPU twin). The host preprocess is held to set A bit for bit; a tap is held to K times the larger of the reference's
+# rounding floor and the network's sensitivity to 1-ulp input noise; block 0, block 1 and the projector are held teacher-forced on the
+# reference's own inputs. Block 0 and the projector are held to their host rules op by op (norms and epilogues bit for bit, GEMMs inside
+# the accumulation-order bound, attention inside its f32 bound, the erf GELU inside its libm bound, ReLU-squared bit for bit, the
+# position rows against the table and the rule). Also the card bytes (weights 1,723,781,120 B, scratch 593,251,328 B at 3,328 tokens),
+# 230 launches an image, and reuse after the largest image bit for bit. Real file only; the gate lock.
+gate-gpu-radio-tower:
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-radio-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_radio_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_radio_tower'
 
 # V4-Flash 인벤토리 게이트: deepseek41 모듈이 V4-Flash 파일(deepseek4)에서 읽은 모델 값·층 종류(비율 4는 자기 인덱스 키로
 # top-k, 비율 128은 전 행, 0–2층 해시 라우팅), 텐서 수·역할별·타입별 바이트, 설계 §5 (a)·(b)·게이트 배치의 카드·호스트 줄과
