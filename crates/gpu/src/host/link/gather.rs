@@ -46,6 +46,15 @@ pub struct GatherShape {
     pub width: usize,
 }
 
+/// One span set of one gather slot on a mapped page: `dev` is the device
+/// address of the page's first byte in the stream's context.
+#[derive(Clone, Copy, Debug)]
+pub struct GatherSet {
+    pub dev: sys::CUdeviceptr,
+    pub slot: usize,
+    pub set: usize,
+}
+
 /// One slot's place on the page.
 #[derive(Clone, Copy, Debug)]
 struct Slot {
@@ -259,41 +268,30 @@ impl Gathers {
         c
     }
 
-    /// The stream memory operations that post this rank's part of `set` of
-    /// `slot`, once its card has written it: a system-scope barrier, then one
-    /// more generation on its counter. `dev` is the device address of the
-    /// page's first byte in the stream's context.
+    /// The stream memory operations that post this rank's part of the set
+    /// `at`, once its card has written it: a system-scope barrier, then one
+    /// more generation on its counter.
     #[must_use]
-    pub fn post(
-        &self,
-        dev: sys::CUdeviceptr,
-        slot: usize,
-        set: usize,
-    ) -> [sys::CUstreamBatchMemOpParams; 2] {
-        let own = self.counter(slot, set, self.rank) as u64;
-        [op_barrier_sys(), op_add(dev + own, 1)]
+    pub fn post(&self, at: GatherSet) -> [sys::CUstreamBatchMemOpParams; 2] {
+        let own = self.counter(at.slot, at.set, self.rank) as u64;
+        [op_barrier_sys(), op_add(at.dev + own, 1)]
     }
 
     /// The stream memory operations that wait for every other rank's part of
-    /// `set` of `slot`: on each one's counter, a wait for at least one and
-    /// the take back of one.
+    /// the set `at`: on each one's counter, a wait for at least one and the
+    /// take back of one.
     #[must_use]
-    pub fn wait(
-        &self,
-        dev: sys::CUdeviceptr,
-        slot: usize,
-        set: usize,
-    ) -> Vec<sys::CUstreamBatchMemOpParams> {
+    pub fn wait(&self, at: GatherSet) -> Vec<sys::CUstreamBatchMemOpParams> {
         self.peers()
             .flat_map(|p| {
-                let at = dev + self.counter(slot, set, p) as u64;
-                [op_wait_geq(at, 1), op_add(at, u32::MAX)]
+                let counter = at.dev + self.counter(at.slot, at.set, p) as u64;
+                [op_wait_geq(counter, 1), op_add(counter, u32::MAX)]
             })
             .collect()
     }
 
     /// Enqueue `y = ((part_0 + part_1) + part_2) + …` over the first `rows`
-    /// rows of every rank's part of `set` of `slot`, in rank order: every
+    /// rows of every rank's part of the set `at`, in rank order: every
     /// rank adds the same values in the same order, so all hold the same
     /// bits. This order is the gate. More rows than the slot holds, a `y`
     /// shorter than them, or a `y` over the page's parts, counters or tail is
@@ -301,7 +299,7 @@ impl Gathers {
     ///
     /// # Safety
     ///
-    /// `dev` is the device address of the first byte of a page of this
+    /// `at.dev` is the device address of the first byte of a page of this
     /// layout, mapped in `stream`'s context, and the page stays allocated
     /// until the enqueued work has run, and for a captured sum until every
     /// launch of the graph has run.
@@ -309,13 +307,11 @@ impl Gathers {
         &self,
         elem: &ElemKernels,
         stream: &CudaStream,
-        dev: sys::CUdeviceptr,
-        slot: usize,
-        set: usize,
+        at: GatherSet,
         rows: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let s = self.checked(slot, set, 0);
+        let s = self.checked(at.slot, at.set, 0);
         if rows == 0 || rows > s.shape.rows || y.len() < rows * s.shape.width {
             return Err(GpuError::shape(
                 "Gathers::enqueue_sum",
@@ -329,8 +325,8 @@ impl Gathers {
         let n = rows * s.shape.width;
         let out = y.cu_deviceptr();
         let out_end = out + (n * size_of::<f32>()) as u64;
-        let first = dev + self.slots[0].parts as u64;
-        let end = dev + self.page_bytes() as u64;
+        let first = at.dev + self.slots[0].parts as u64;
+        let end = at.dev + self.page_bytes() as u64;
         if out < end && first < out_end {
             return Err(GpuError::shape(
                 "Gathers::enqueue_sum",
@@ -339,11 +335,11 @@ impl Gathers {
         }
         let ctx = stream.context();
         let part = |rank: usize| {
-            let at = dev + self.part(slot, set, rank).start as u64;
+            let start = at.dev + self.part(at.slot, at.set, rank).start as u64;
             // SAFETY: the part's first `n` values lie in the page (this
             // layout's, `n` within its rows), mapped in `stream`'s context and
             // alive for every launch that reads it: the caller's contract.
-            unsafe { WindowMut::<f32>::from_raw(at, n, ctx) }
+            unsafe { WindowMut::<f32>::from_raw(start, n, ctx) }
         };
         elem.enqueue_add(stream, &part(0), &part(1), n, y)?;
         for rank in 2..self.ranks {
@@ -366,7 +362,7 @@ mod tests {
     use super::super::pump::tests::Mem;
     use super::super::pump::{Half, Page, PostCols};
     use super::super::{End, Memory, Pump, Side, link_tail};
-    use super::{GatherShape, Gathers};
+    use super::{GatherSet, GatherShape, Gathers};
     use crate::Gpu;
     use crate::graph::{MappedHost, mem_batch};
     use crate::host::step::RELEASE;
@@ -619,7 +615,17 @@ mod tests {
             // SAFETY: `dev` is rank 0's page of this layout, mapped in this
             // context; the sum is refused before any launch.
             let refused = unsafe {
-                layouts[0].enqueue_sum(gpus[0].elem(), gpus[0].stream(), dev, 0, 0, ROWS, &mut over)
+                layouts[0].enqueue_sum(
+                    gpus[0].elem(),
+                    gpus[0].stream(),
+                    GatherSet {
+                        dev,
+                        slot: 0,
+                        set: 0,
+                    },
+                    ROWS,
+                    &mut over,
+                )
             };
             assert!(
                 refused.is_err(),
@@ -655,16 +661,15 @@ mod tests {
                         let mut part = unsafe { WindowMut::<f32>::from_raw(own, n, gpu.context()) };
                         gpu.elem()
                             .enqueue_add(s, &parts[r][g], &zero[r], n, &mut part)?;
-                        let mut ops = l.post(dev, 0, set).to_vec();
-                        ops.extend(l.wait(dev, 0, set));
+                        let at = GatherSet { dev, slot: 0, set };
+                        let mut ops = l.post(at).to_vec();
+                        ops.extend(l.wait(at));
                         // SAFETY: every counter lies in rank r's page, which
                         // outlives the graph.
                         unsafe { mem_batch(s, &mut ops, "the gather test's post and wait")? };
                         // SAFETY: `dev` is rank r's page of this layout, mapped
                         // in this context and outliving the graph.
-                        unsafe {
-                            l.enqueue_sum(gpu.elem(), s, dev, 0, set, ROWS, &mut sums[r][g])?
-                        };
+                        unsafe { l.enqueue_sum(gpu.elem(), s, at, ROWS, &mut sums[r][g])? };
                     }
                     Ok(())
                 });

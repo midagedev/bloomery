@@ -80,7 +80,7 @@ fn main() -> std::process::ExitCode {
 mod probe {
     use bloomery_gpu::host::step::RELEASE;
     use bloomery_gpu::host::{
-        Crossing, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, link_tail,
+        Crossing, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, link_tail,
     };
     use bloomery_gpu::{
         Gpu, MappedHost, WindowMut, mem_batch, op_add, op_barrier_sys, op_wait_geq, window,
@@ -326,7 +326,7 @@ mod probe {
             let bits = unsafe { *y.get_unchecked(i) }.to_bits();
             if let Some(d) = digest.get_mut(thread::index_1d()) {
                 let m = (*d ^ bits).wrapping_mul(0x9e37_79b1);
-                *d = (m << 13) | (m >> 19);
+                *d = m.rotate_left(13);
             }
         }
     }
@@ -1177,8 +1177,13 @@ mod probe {
                 let prep = kernels.prepare_part(cfg)?;
                 kernels.part(s, &prep, &seq, st.gather, rank, st.values, &mut part)?;
                 kernels.mark(s, &mark, &seq, st.gather, gathers, 0, &mut stamps)?;
-                let mut ops = g.post(dev, st.slot, st.set).to_vec();
-                ops.extend(g.wait(dev, st.slot, st.set));
+                let at = GatherSet {
+                    dev,
+                    slot: st.slot,
+                    set: st.set,
+                };
+                let mut ops = g.post(at).to_vec();
+                ops.extend(g.wait(at));
                 // SAFETY: every counter lies in the page, which outlives every
                 // replay as the part does.
                 unsafe { mem_batch(s, &mut ops, "link_probe: a gather's post and wait")? };
@@ -1201,7 +1206,7 @@ mod probe {
                 let sum = &mut sums[st.slot];
                 // SAFETY: `dev` is the page of this layout, mapped into this
                 // context and outliving every replay as the part does.
-                unsafe { g.enqueue_sum(gpu.elem(), s, dev, st.slot, st.set, rows, sum)? };
+                unsafe { g.enqueue_sum(gpu.elem(), s, at, rows, sum)? };
                 let prep = kernels.prepare_digest(cfg)?;
                 kernels.digest(s, &prep, &*sum, st.values, &mut digest)?;
             }

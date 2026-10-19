@@ -58,7 +58,7 @@ use threads::helper::{HelperError, Placement, spawn_helper};
 
 use crate::GpuError;
 use crate::graph::{MappedHost, SHARED_PAGE, cu};
-pub use gather::{GatherShape, Gathers};
+pub use gather::{GatherSet, GatherShape, Gathers};
 pub use pump::{Crossing, PostCols, Reader, Span};
 use pump::{Half, Move, Page, TAIL_LINE, Wire};
 pub use rdma::RdmaEnd;
