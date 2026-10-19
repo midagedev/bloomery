@@ -5,9 +5,9 @@
 # recorded first (~/.cache/bloomery/static-times.tsv), combos after lint (one target directory, one cargo lock). Every
 # job at once oversubscribed the Mac and turned timing self-tests red under the load alone.
 #
-# A run with a BASE keys every job but combos (tools/recipes.py static-key: the content of the files the job reads,
-# the tree or tools/ for a block whose keyspec says so, the command and the environment) and skips a job whose key is
-# green in the ledger; a skipped step or block is a summary line of its own. --fresh keys and records but skips
+# A run with a BASE keys every job but combos (tools/recipes.py static-key: the content of the tree the job reads, the
+# commit of a revision its keyspec names, the command and the environment, the rustflags among it) and skips a job whose
+# key is green in the ledger; a skipped step or block is a summary line of its own. --fresh keys and records but skips
 # nothing (a proof run); a full run (no BASE) keys nothing.
 #
 # The cargo lane runs `lint`, not `check`: clippy is rustc plus lints, so every error `cargo check`
@@ -84,14 +84,16 @@ step_keyspec() {
 }
 
 # job_lines BASE CARGO_CMDV…: every job of the run as tools/static-sched.py's JOBS lines, run from this tree's root:
-# fmt-check, lint, combos after lint, each check script, check-recipes as its blocks.
+# fmt-check, lint, combos after lint, each check script, check-recipes as its blocks. A command carries its arguments
+# quoted (%q) for the scheduler's `bash -c`: a ledger path or a revision with spaces stays one argument.
 job_lines() {
-  local base=$1 s w
+  local base=$1 s w cmdv
   shift
   local -a args
   printf 'fmt-check\t-\ttree\ttools/mac-check.sh fmt-check\n'
   printf 'lint\tcpus=%s\ttree\ttools/mac-check.sh lint\n' "$CARGO_CPUS"
-  printf 'combos\tafter=lint,cpus=%s\t-\ttools/mac-check.sh %s\n' "$CARGO_CPUS" "$*"
+  printf -v cmdv '%q ' "$@"
+  printf 'combos\tafter=lint,cpus=%s\t-\ttools/mac-check.sh %s\n' "$CARGO_CPUS" "${cmdv% }"
   for s in "${SCRIPTS[@]}"; do
     if [ "$s" = recipes ]; then
       bash "$HERE/tools/check-recipes.sh" --jobs
@@ -99,7 +101,8 @@ job_lines() {
     fi
     args=()
     while IFS= read -r w; do args+=("$w"); done < <(check_argv "$s" "$base")
-    printf 'check-%s\t-\t%s\tbash tools/check-%s.sh%s\n' "$s" "$(step_keyspec "$s" "$base")" "$s" "${args[*]+ ${args[*]}}"
+    printf -v cmdv '%q ' ${args[@]+"${args[@]}"}
+    printf 'check-%s\t-\t%s\tbash tools/check-%s.sh%s\n' "$s" "$(step_keyspec "$s" "$base")" "$s" "${args[*]+ ${cmdv% }}"
   done
 }
 
@@ -179,7 +182,7 @@ summarize() {
 }
 
 self_test() {
-  local fails=0 d out rc
+  local fails=0 d out rc sp cmd got
   fail() { say "mac-static self-test FAIL: $*"; fails=$((fails + 1)); }
 
   # combos_argv: the full form without a base, the scoped form with both, no ledger without a base
@@ -214,15 +217,26 @@ self_test() {
   out=$(job_lines '' combos --base main)
   [ "$(printf '%s\n' "$out" | head -3 | cut -f1,2 | tr '\t\n' ' ')" = "fmt-check - lint cpus=$CARGO_CPUS combos after=lint,cpus=$CARGO_CPUS " ] \
     || fail "the cargo jobs' lines: $(printf '%s\n' "$out" | head -3)"
-  printf '%s\n' "$out" | grep -qx "combos	after=lint,cpus=$CARGO_CPUS	-	tools/mac-check.sh combos --base main" || fail "the combos job is not the combos argv, unkeyed"
+  grep -qx "combos	after=lint,cpus=$CARGO_CPUS	-	tools/mac-check.sh combos --base main" <<< "$out" || fail "the combos job is not the combos argv, unkeyed"
   for s in "${SCRIPTS[@]}"; do
-    [ "$s" = recipes ] || printf '%s\n' "$out" | grep -q "^check-$s	" || fail "check-$s is not a job"
+    [ "$s" = recipes ] || grep -q "^check-$s	" <<< "$out" || fail "check-$s is not a job"
   done
-  printf '%s\n' "$out" | grep -q '^check-recipes	' && fail "check-recipes is a job of its own, not its blocks"
-  printf '%s\n' "$out" | grep -q '^check-recipes\.cardtests	' || fail "check-recipes' blocks are not jobs"
-  printf '%s\n' "$out" | grep -q '^check-recipes\.gatebatch\.1	' || fail "gate-batch's self-test parts are not jobs"
-  printf '%s\n' "$out" | grep -qx 'check-model-tax	-	tree,rev:origin/main	bash tools/check-model-tax.sh check --base origin/main' \
+  ! grep -q '^check-recipes	' <<< "$out" || fail "check-recipes is a job of its own, not its blocks"
+  grep -q '^check-recipes\.cardtests	' <<< "$out" || fail "check-recipes' blocks are not jobs"
+  grep -q '^check-recipes\.gatebatch\.1	' <<< "$out" || fail "gate-batch's self-test parts are not jobs"
+  grep -qx 'check-model-tax	-	tree,rev:origin/main	bash tools/check-model-tax.sh check --base origin/main' <<< "$out" \
     || fail "the model-tax job does not key the base revision: $(printf '%s\n' "$out" | grep '^check-model-tax')"
+  # a job's command keeps its argument boundaries as the scheduler's `bash -c` reads it: a ledger path with a space reaches
+  # mac-check as one argument, and so does a revision with spaces reach check-model-tax
+  sp='/tmp/x y/ledger.tsv'
+  out=$(job_lines '' combos --ledger "$sp")
+  cmd=$(printf '%s\n' "$out" | awk -F'\t' '$1 == "combos" { print $4 }')
+  got=$(bash -c "set -- $cmd; printf '%s|' \"\$@\"")
+  [ "$got" = "tools/mac-check.sh|combos|--ledger|$sp|" ] || fail "a ledger path with a space does not reach mac-check as one argument: $got"
+  out=$(job_lines 'main@{1 day ago}' combos)
+  cmd=$(printf '%s\n' "$out" | awk -F'\t' '$1 == "check-model-tax" { print $4 }')
+  got=$(bash -c "set -- $cmd; printf '%s|' \"\$@\"")
+  [ "$got" = "bash|tools/check-model-tax.sh|check|--base|main@{1 day ago}|" ] || fail "a revision with spaces does not reach check-model-tax as one argument: $got"
 
   # the scheduling, through tools/static-sched.py on stub jobs: two jobs that each mark their start and wait for the
   # other's mark ran at once (one after the other, the first waits out its bound, 120 s, and ends rc 9), whatever the

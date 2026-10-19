@@ -6163,16 +6163,75 @@ def shape_key(c: Combo, rels: set[str], memo: dict[str, str]) -> str:
 # ledger (read_shape_ledger's format) skips it only while all of them are unchanged; the header differs from a shape
 # key's, so the two kinds never share a key. KEYSPEC is `-` (never skipped) or a comma list of
 #   tree         every shipped file (shipped_files): a job that reads the tree at large
-#   dir:PATH     every shipped file under PATH/: a self-test that reads only its own directory's scripts and fixtures
-#   file:PATH    PATH alone (a missing file hashes as `missing`)
 #   rev:REF      the commit REF names in this checkout (`git rev-parse`): a job that reads a base revision
 STATIC_JOB_KIND = "mac-static-job-v1"
 STATIC_JOB_TOOLS = (("bash", ["bash", "--version"]), ("git", ["git", "--version"]))
 
 
+class Job:
+    def __init__(self, name: str, attrs: str, keyspec: str, command: str, where: str):
+        if not name or "/" in name or name.startswith("."):
+            raise ValueError(f"{where}: job name {name!r} is not a file name")
+        self.name, self.keyspec, self.command = name, keyspec, command
+        self.after: str | None = None
+        self.alone = False
+        self.cpus = 1
+        for a in [] if attrs == "-" else attrs.split(","):
+            if a.startswith("after="):
+                self.after = a[len("after=") :]
+            elif a == "alone":
+                self.alone = True
+            elif a.startswith("cpus="):
+                try:
+                    self.cpus = int(a[len("cpus=") :])
+                except ValueError:
+                    raise ValueError(f"{where}: {name}: cpus takes a whole number, not {a!r}")
+                if self.cpus < 1:
+                    raise ValueError(f"{where}: {name}: cpus must be 1 or more, not {self.cpus}")
+            else:
+                raise ValueError(f"{where}: {name}: attribute {a!r} is not after=NAME, alone or cpus=K")
+        if not command.strip():
+            raise ValueError(f"{where}: {name}: no command")
+
+
+def read_jobs(path: str) -> list[Job]:
+    """The jobs of a tools/static-sched.py JOBS file, in its order: the one reader, for the scheduler that runs them and
+    `static_keys` that keys them. A malformed line, a name given twice or an after= that names no job is a ValueError naming it."""
+    jobs: list[Job] = []
+    with open(path, encoding="utf-8") as fh:
+        for n, ln in enumerate(fh, 1):
+            ln = ln.rstrip("\n")
+            if not ln.strip() or ln.startswith("#"):
+                continue
+            f = ln.split("\t")
+            if len(f) != 4:
+                raise ValueError(f"{path}:{n}: {len(f)} fields, want 4 (NAME ATTRS KEYSPEC COMMAND)")
+            jobs.append(Job(*f, where=f"{path}:{n}"))
+    names = [j.name for j in jobs]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise ValueError(f"{path}: job names given twice: {' '.join(dup)}")
+    for j in jobs:
+        if j.after is not None and j.after not in names:
+            raise ValueError(f"{path}: {j.name}: after={j.after} names no job")
+    return jobs
+
+
+def _target_rustflags_var(triple: str) -> str:
+    return f"CARGO_TARGET_{triple.upper().replace('-', '_')}_RUSTFLAGS"
+
+
+# Every variable through which the caller's environment hands cargo rustflags, for the two triples the static tier builds
+# (the box's, which the cross check targets, and the Mac's own).
+STATIC_RUSTFLAGS_ENV = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "RUSTDOCFLAGS",
+                        *(_target_rustflags_var(t) for t in ("x86_64-unknown-linux-gnu", MAC_TARGET)))
+
+
 def static_job_env(environ: dict[str, str]) -> list[str]:
-    """The caller-environment lines every job key carries: MAC_ENV's values, and the tools the jobs run."""
-    rows = [f"mac-env\t{v}\t{environ.get(v, '<unset>')}" for v in MAC_ENV]
+    """The caller-environment lines every job key carries: MAC_ENV's values, the rustflags the caller's environment hands cargo
+    (they change what a lint or a check reports: `-A warnings` must not share a green row with the unset flags), and the
+    tools the jobs run."""
+    rows = [f"mac-env\t{v}\t{environ.get(v, '<unset>')}" for v in (*MAC_ENV, *STATIC_RUSTFLAGS_ENV)]
     rows += [f"mac-tool\tpython3\t{platform.python_version()}", f"mac-tool\tos\t{platform.system()} {platform.machine()}"]
     for name, argv in STATIC_JOB_TOOLS:
         try:
@@ -6185,28 +6244,20 @@ def static_job_env(environ: dict[str, str]) -> list[str]:
 
 def static_job_inputs(spec: str, root: str, shipped: list[str]) -> tuple[list[str], list[str]]:
     """(the files the KEYSPEC names, relative and sorted; the revisions it names as `rev\tREF\tsha` lines). Raises
-    RecipeError naming an item it does not take, or a REF this checkout cannot resolve."""
+    RecipeError naming an item it does not take (tree and rev:REF are the two), or a REF this checkout cannot resolve."""
     files: set[str] = set()
     revs: list[str] = []
     for item in spec.split(","):
         kind, _, arg = item.partition(":")
         if kind == "tree" and not arg:
             files |= set(shipped)
-        elif kind == "dir" and arg:
-            pre = arg.rstrip("/") + "/"
-            got = [f for f in shipped if f.startswith(pre)]
-            if not got:
-                raise RecipeError(f"static-key: {item}: no shipped file under {pre}")
-            files |= set(got)
-        elif kind == "file" and arg:
-            files.add(os.path.normpath(arg))
         elif kind == "rev" and arg:
             r = subprocess.run(["git", "-C", root, "rev-parse", "--verify", "--quiet", f"{arg}^{{commit}}"], capture_output=True, text=True)
             if r.returncode != 0:
                 raise RecipeError(f"static-key: {item}: this checkout has no commit {arg}")
             revs.append(f"rev\t{arg}\t{r.stdout.strip()}")
         else:
-            raise RecipeError(f"static-key: keyspec item {item!r} is not tree, dir:PATH, file:PATH or rev:REF")
+            raise RecipeError(f"static-key: keyspec item {item!r} is not tree or rev:REF")
     return sorted(files), revs
 
 
@@ -6229,20 +6280,16 @@ def static_keys(jobs_path: str, root: str, environ: dict[str, str]) -> list[tupl
     env = static_job_env(environ)
     memo: dict[str, str] = {}
     out = []
-    with open(jobs_path, encoding="utf-8") as fh:
-        for n, ln in enumerate(fh, 1):
-            ln = ln.rstrip("\n")
-            if not ln.strip() or ln.startswith("#"):
-                continue
-            f = ln.split("\t")
-            if len(f) != 4:
-                raise RecipeError(f"static-key: {jobs_path}:{n}: {len(f)} fields, want 4 (NAME ATTRS KEYSPEC COMMAND)")
-            name, _, spec, command = f
-            if spec == "-":
-                out.append((name, "-", "never skipped", []))
-                continue
-            files, revs = static_job_inputs(spec, root, shipped)
-            out.append((name, static_job_key(name, command, env, files, revs, root, memo), f"{spec}: {len(files)} files", files))
+    try:
+        jobs = read_jobs(jobs_path)
+    except ValueError as err:
+        raise RecipeError(f"static-key: {err}") from err
+    for j in jobs:
+        if j.keyspec == "-":
+            out.append((j.name, "-", "never skipped", []))
+            continue
+        files, revs = static_job_inputs(j.keyspec, root, shipped)
+        out.append((j.name, static_job_key(j.name, j.command, env, files, revs, root, memo), f"{j.keyspec}: {len(files)} files", files))
     return out
 
 
@@ -9905,45 +9952,60 @@ def ledger_self_test(expect) -> None:
 
 
 def static_key_self_test(expect) -> None:
-    """A job key moves with every file its KEYSPEC names and with its command, and with nothing else: a file outside a
-    dir: scope, a `-` job, an mtime. A malformed line, an unknown item or a dir with no file is a named error."""
+    """A job key moves with every shipped file a `tree` KEYSPEC reads, with the commit a `rev:REF` item resolves to, with its
+    command and with the caller's environment, and with nothing else: an mtime, a working-tree edit a `rev:` job does not
+    read, a `-` job. A malformed line, a KEYSPEC item it does not take (a dir: or file: scope among them) or a REF this
+    checkout cannot resolve is a named error, and so is what the scheduler's reader (read_jobs) refuses."""
     with tempfile.TemporaryDirectory() as d:
+        genv = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+
         def put(rel: str, text: str) -> None:
             os.makedirs(os.path.dirname(os.path.join(d, rel)) or d, exist_ok=True)
             with open(os.path.join(d, rel), "w") as fh:
                 fh.write(text)
 
+        def git_in(*argv: str) -> None:
+            subprocess.run(["git", *argv], cwd=d, env=genv, check=True, capture_output=True)
+
         put("tools/a.sh", "echo a\n")
-        put("tools/fx/case.txt", "x\n")
         put("crates/serve/src/lib.rs", "fn f() {}\n")
         put("justfile", "a:\n")
+        for argv in (("init", "-q", "-b", "main"), ("config", "user.email", "t@t"), ("config", "user.name", "t"), ("config", "commit.gpgsign", "false"),
+                     ("add", "-A"), ("commit", "-q", "-m", "one")):
+            git_in(*argv)
         jobs = os.path.join(d, "target", "jobs.tsv")
-        put("target/jobs.tsv", "t\t-\ttree\tbash tools/a.sh\nd\t-\tdir:tools\tbash tools/a.sh\n"
-                               "j\t-\tdir:tools,file:justfile\tbash tools/a.sh\nn\t-\t-\tbash tools/a.sh\n")
+        put("target/jobs.tsv", "t\t-\ttree\tbash tools/a.sh\nr\t-\trev:HEAD\tbash tools/a.sh\n"
+                               "b\t-\ttree,rev:HEAD\tbash tools/a.sh\nn\t-\t-\tbash tools/a.sh\n")
         env = {"BLOOMERY_TIER": "fixture"}
 
         def keys(environ=env) -> dict[str, str]:
             return {r[0]: r[1] for r in static_keys(jobs, d, environ)}
 
         k0 = keys()
-        expect(k0["n"] == "-" and all(HEX64.match(k0[x]) for x in "tdj"), f"static-key: the key shapes: {k0}")
-        expect(len({k0["t"], k0["d"], k0["j"]}) == 3, "static-key: jobs with one command and different scopes share a key")
+        expect(k0["n"] == "-" and all(HEX64.match(k0[x]) for x in "trb"), f"static-key: the key shapes: {k0}")
+        expect(len({k0["t"], k0["r"], k0["b"]}) == 3, "static-key: jobs with one command and different scopes share a key")
         os.utime(os.path.join(d, "tools/a.sh"), (1, 1))
         expect(keys() == k0, "static-key: an mtime moved a key")
         put("crates/serve/src/lib.rs", "fn f() { }\n")
         k1 = keys()
-        expect(k1["t"] != k0["t"] and k1["d"] == k0["d"] and k1["j"] == k0["j"], "static-key: a crates/serve edit must move tree only")
-        put("tools/fx/case.txt", "y\n")
+        expect(k1["t"] != k0["t"] and k1["b"] != k0["b"] and k1["r"] == k0["r"], "static-key: a crates/serve edit must move the tree keys only")
+        git_in("commit", "-q", "--allow-empty", "-m", "two")
         k2 = keys()
-        expect(k2["d"] != k1["d"] and k2["j"] != k1["j"] and k2["t"] != k1["t"], "static-key: a fixture edit under tools/ must move every tools scope")
-        put("justfile", "b:\n")
-        k3 = keys()
-        expect(k3["j"] != k2["j"] and k3["d"] == k2["d"], "static-key: a justfile edit moves file:justfile only")
-        expect(keys({"BLOOMERY_TIER": "real"})["d"] != k3["d"], "static-key: a MAC_ENV value must move the key")
-        put("target/jobs.tsv", "d\t-\tdir:tools\tbash tools/a.sh --other\n")
-        expect(keys()["d"] != k3["d"], "static-key: a job's command must move its key")
+        expect(k2["r"] != k1["r"] and k2["b"] != k1["b"] and k2["t"] == k1["t"], "static-key: a new commit must move the rev: keys only")
+        expect(keys({"BLOOMERY_TIER": "real"})["t"] != k2["t"], "static-key: a MAC_ENV value must move the key")
+        for spelled in ("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "RUSTDOCFLAGS"):
+            expect(spelled in STATIC_RUSTFLAGS_ENV, f"static-key: {spelled} is not among the variables the key carries")
+        for flag in STATIC_RUSTFLAGS_ENV:
+            expect(keys({**env, flag: "-A warnings"})["t"] != k2["t"], f"static-key: a caller's {flag} must move the key (cargo reads it into every lint)")
+        put("target/jobs.tsv", "t\t-\ttree\tbash tools/a.sh --other\n")
+        expect(keys()["t"] != k2["t"], "static-key: a job's command must move its key")
         expect(not any(f.startswith("target/") for f in static_keys(jobs, d, env)[0][3]), "static-key: target/ is not a shipped file")
-        for bad, why in (("x\t-\tdir:tools\n", "three fields"), ("x\t-\tbogus\tc\n", "an unknown item"), ("x\t-\tdir:nowhere\tc\n", "a dir with no file")):
+        # the scheduler's own reader (read_jobs) is the one that reads the file: what it refuses, static-key refuses
+        for bad, why in (("x\t-\ttree\n", "three fields"), ("x\t-\tbogus\tc\n", "an unknown item"), ("x\t-\ttree:tools\tc\n", "a tree with an argument"),
+                         ("x\t-\tdir:tools\tc\n", "a dir: scope"), ("x\t-\tfile:justfile\tc\n", "a file: scope"),
+                         ("x\t-\trev:no-such-rev\tc\n", "a rev: this checkout cannot resolve"), ("x\t-\trev:\tc\n", "a rev: with no REF"),
+                         ("x\t-\ttree\tc\nx\t-\ttree\tc\n", "a name twice"), ("x\tafter=y\ttree\tc\n", "an after= of no job"),
+                         ("x\tbogus\ttree\tc\n", "an unknown attribute"), ("x\tcpus=0\ttree\tc\n", "cpus=0")):
             put("target/jobs.tsv", bad)
             try:
                 static_keys(jobs, d, env)

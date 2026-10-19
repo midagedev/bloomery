@@ -4,7 +4,8 @@
   static-sched.py run --out DIR [--max N] [--times FILE] [--keys FILE --ledger FILE --tree NAME [--no-skip]] JOBS
   static-sched.py --self-test
 
-JOBS is a file of one job a line, four tab-separated fields: NAME, ATTRS, KEYSPEC, COMMAND. COMMAND runs under
+JOBS is a file of one job a line, four tab-separated fields: NAME, ATTRS, KEYSPEC, COMMAND (tools/recipes.py read_jobs reads
+it, here and for static-key). COMMAND runs under
 `bash -c` in the current directory, in a process group of its own, its stdout and stderr to DIR/NAME.log. ATTRS is `-` or
 a comma list of:
   after=NAME   the job starts only after NAME ended (whatever its rc)
@@ -22,8 +23,9 @@ appends `NAME<TAB>WALL<TAB>DATE` to --times.
 
 Per job DIR gets NAME.log, NAME.rc, NAME.wall (whole seconds) and, when skipped, NAME.skip; DIR/pids holds each started
 job's pid (its process group) at spawn; DIR/sched.tsv one row a job: name, start and end offsets in seconds, rc, how it
-ran (run or skip). A TERM, INT or HUP ends every running job's process group, and the scheduler then exits 128 + the
-signal. Nothing is printed on stdout: the callers report from DIR.
+ran (run or skip). A TERM, INT or HUP ends every running job's process group (a member that ignores the TERM gets a KILL
+once the job's shell is gone), and the scheduler then exits 128 + the signal. Nothing is printed on stdout: the callers
+report from DIR.
 
 Exit: 0 every job ran (or skipped) and wrote its rc, whatever the rcs; 64 usage or a malformed JOBS or keys line (named);
 128+n a signal.
@@ -40,54 +42,10 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from recipes import Job, read_jobs, read_shape_ledger  # noqa: E402  (the one JOBS reader and the one ledger reader)
+
 USAGE_RC = 64
-
-
-class Job:
-    def __init__(self, name: str, attrs: str, keyspec: str, command: str, where: str):
-        if not name or "/" in name or name.startswith("."):
-            raise ValueError(f"{where}: job name {name!r} is not a file name")
-        self.name, self.keyspec, self.command = name, keyspec, command
-        self.after: str | None = None
-        self.alone = False
-        self.cpus = 1
-        for a in [] if attrs == "-" else attrs.split(","):
-            if a.startswith("after="):
-                self.after = a[len("after=") :]
-            elif a == "alone":
-                self.alone = True
-            elif a.startswith("cpus="):
-                try:
-                    self.cpus = int(a[len("cpus=") :])
-                except ValueError:
-                    raise ValueError(f"{where}: {name}: cpus takes a whole number, not {a!r}")
-                if self.cpus < 1:
-                    raise ValueError(f"{where}: {name}: cpus must be 1 or more, not {self.cpus}")
-            else:
-                raise ValueError(f"{where}: {name}: attribute {a!r} is not after=NAME, alone or cpus=K")
-        if not command.strip():
-            raise ValueError(f"{where}: {name}: no command")
-
-
-def read_jobs(path: str) -> list[Job]:
-    jobs: list[Job] = []
-    with open(path, encoding="utf-8") as fh:
-        for n, ln in enumerate(fh, 1):
-            ln = ln.rstrip("\n")
-            if not ln.strip() or ln.startswith("#"):
-                continue
-            f = ln.split("\t")
-            if len(f) != 4:
-                raise ValueError(f"{path}:{n}: {len(f)} fields, want 4 (NAME ATTRS KEYSPEC COMMAND)")
-            jobs.append(Job(*f, where=f"{path}:{n}"))
-    names = [j.name for j in jobs]
-    dup = sorted({n for n in names if names.count(n) > 1})
-    if dup:
-        raise ValueError(f"{path}: job names given twice: {' '.join(dup)}")
-    for j in jobs:
-        if j.after is not None and j.after not in names:
-            raise ValueError(f"{path}: {j.name}: after={j.after} names no job")
-    return jobs
 
 
 def read_times(path: str | None) -> dict[str, float]:
@@ -123,22 +81,6 @@ def read_keys(path: str | None) -> dict[str, tuple[str, str]]:
     return keys
 
 
-def read_ledger(path: str | None) -> dict[str, tuple[str, str]]:
-    """key -> (date, tree) of every green four-field row (tools/recipes.py read_shape_ledger's rule)."""
-    green: dict[str, tuple[str, str]] = {}
-    if not path:
-        return green
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for ln in fh:
-                f = ln.rstrip("\n").split("\t")
-                if len(f) == 4 and len(f[0]) == 64 and all(c in "0123456789abcdef" for c in f[0]) and f[1] == "green":
-                    green[f[0]] = (f[2], f[3])
-    except FileNotFoundError:
-        pass
-    return green
-
-
 def append_line(path: str, line: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
@@ -158,6 +100,15 @@ class Stop(Exception):
         self.sig = sig
 
 
+def signal_group(pgid: int, sig: int) -> None:
+    """Signal a job's process group. A group with no live member is gone: ESRCH, and EPERM on Darwin while its members are
+    zombies."""
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def run(args: argparse.Namespace) -> int:
     try:
         jobs = read_jobs(args.jobs)
@@ -172,7 +123,7 @@ def run(args: argparse.Namespace) -> int:
     for j in jobs:
         j.cpus = min(j.cpus, slots)
     times = read_times(args.times)
-    green = read_ledger(args.ledger)
+    green = read_shape_ledger(args.ledger)[0] if args.ledger else {}
     out = args.out
     os.makedirs(out, exist_ok=True)
     for j in jobs:
@@ -273,19 +224,16 @@ def run(args: argparse.Namespace) -> int:
                 append_line(args.ledger, f"{key}\tgreen\t{date}\t{args.tree}\n")
     except Stop as stop:
         for pid in list(running):
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            signal_group(pid, signal.SIGTERM)
+        # The job's shell ends on the TERM at once while a child of its group may ignore it: once the leader has gone (or its
+        # 10 s are up) the group's survivors get a KILL, so nothing of a cancelled job outlives the scheduler.
         for pid, (j, p, st) in list(running.items()):
             try:
                 p.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                p.wait()
+                pass
+            signal_group(pid, signal.SIGKILL)
+            p.wait()
         write(os.path.join(out, "sched.tsv"), "".join(sched_rows))
         return 128 + stop.sig
     write(os.path.join(out, "sched.tsv"), "".join(sched_rows))
@@ -419,10 +367,47 @@ def self_test() -> int:
         try:
             os.kill(child, 0)
             alive = True
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):  # a zombie answers EPERM on Darwin
             alive = False
         expect(rc == 143, f"a TERM ends the scheduler 143 (got {rc})")
         expect(not alive, "a TERM ends a job's own children")
+        # a child that ignores TERM and outlives its group leader: the job's shell ends on the TERM at once, so the group's
+        # survivor must be ended by the scheduler (KILL) and not left behind a 143. The child writes its pid once it ignores TERM.
+        stubborn = f"sh -c 'trap \"\" TERM; echo $$ > \"$1\"; exec sleep 300' _ {shlex.quote(d)}/child2 & wait"
+        jf = jobs_file([f"stubborn\t-\t-\t{stubborn}"])
+        p = subprocess.Popen([sys.executable, me, "run", "--out", os.path.join(d, "o9"), jf])
+        for _ in range(200):
+            if os.path.exists(os.path.join(d, "child2")) and os.path.getsize(os.path.join(d, "child2")):
+                break
+            time.sleep(0.05)
+        p.send_signal(signal.SIGTERM)
+        rc = p.wait(timeout=60)
+        child2 = int(rd("child2"))
+        for _ in range(100):  # init reaps the killed child a moment after the scheduler is gone
+            try:
+                os.kill(child2, 0)
+            except (ProcessLookupError, PermissionError):
+                alive = False
+                break
+            alive = True
+            time.sleep(0.05)
+        if alive:
+            os.kill(child2, signal.SIGKILL)  # the pid the job wrote: never leave the survivor behind a red run
+        expect(rc == 143, f"a TERM with a stubborn child ends the scheduler 143 (got {rc})")
+        expect(not alive, "a child that ignores TERM and outlives its group leader is ended by the scheduler")
+        # a group holding only zombies (its leader ended and not yet reaped) is signalled without an error
+        z = subprocess.Popen(["sh", "-c", "exit 0"], start_new_session=True)
+        for _ in range(200):
+            if subprocess.run(["ps", "-o", "stat=", "-p", str(z.pid)], capture_output=True, text=True).stdout.strip().startswith("Z"):
+                break
+            time.sleep(0.05)
+        try:
+            signal_group(z.pid, signal.SIGKILL)
+            quiet = True
+        except OSError:
+            quiet = False
+        z.wait()
+        expect(quiet, "signalling a process group that holds only zombies is not an error")
     print(f"static-sched: self-test {'ok' if not fails else f'{len(fails)} failed'}")
     return 0 if not fails else 1
 
