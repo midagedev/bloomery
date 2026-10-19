@@ -6227,7 +6227,7 @@ def static_job_env(environ: dict[str, str]) -> list[str]:
     """The caller-environment lines every job key carries: MAC_ENV's values, the rustflags the caller's environment hands cargo
     (they change what a job that runs cargo reports: `-A warnings` must not share a green row with the unset flags),
     PYTHONOPTIMIZE (it strips the assertions of the python tools a job runs), and the tools the jobs run."""
-    rows = [f"mac-env\t{v}\t{environ.get(v, '<unset>')}" for v in (*MAC_ENV, *STATIC_RUSTFLAGS_ENV, "PYTHONOPTIMIZE")]
+    rows = [f"mac-env\t{v}\t{environ.get(v)!r}" for v in (*MAC_ENV, *STATIC_RUSTFLAGS_ENV, "PYTHONOPTIMIZE")]
     rows += [f"mac-tool\tpython3\t{platform.python_version()}", f"mac-tool\tos\t{platform.system()} {platform.machine()}"]
     for name, argv in STATIC_JOB_TOOLS:
         try:
@@ -10008,6 +10008,8 @@ def static_key_self_test(expect) -> None:
             expect(keys({**env, flag: "-A warnings"})["t"] != k2["t"], f"static-key: a caller's {flag} must move the key (cargo reads it into every build a job runs)")
         # PYTHONOPTIMIZE strips the assert statements of the python tools a keyed block runs: its green row proves nothing about a run with them
         expect(keys({**env, "PYTHONOPTIMIZE": "1"})["t"] != k2["t"], "static-key: PYTHONOPTIMIZE must move the key (assertions off in the tools a job runs)")
+        # a set variable whose value spells the absent one's still strips them (PYTHONOPTIMIZE=<unset> is level 1)
+        expect(keys({**env, "PYTHONOPTIMIZE": "<unset>"})["t"] != k2["t"], "static-key: a variable set to the absent one's spelling must move the key")
         put("target/jobs.tsv", "t\t-\ttree\tbash tools/a.sh --other\n")
         expect(keys()["t"] != k2["t"], "static-key: a job's command must move its key")
         expect(not any(f.startswith("target/") for f in static_keys(jobs, d, env)[0][3]), "static-key: target/ is not a shipped file")
