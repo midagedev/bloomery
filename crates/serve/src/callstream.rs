@@ -10,10 +10,11 @@
 //! (`Streamer`, held by [`crate::dsml::ChatParser`]) turns each report into
 //! the [`CallPiece`]s that extend what was sent, and holds the one rule every
 //! format shares: what was sent is never revised. A call that closes with
-//! arguments the sent text is not a prefix of, and a call announced that the
-//! markup then ends otherwise (its tag never comes, or the text stops being
-//! the template's markup), are a [`MarkupError::Diverged`], never a call whose
-//! earlier fragments are quietly wrong.
+//! arguments the sent text is not a prefix of or under another name than it
+//! was announced with, and a call announced that the markup then ends
+//! otherwise (its tag never comes, or the text stops being the template's
+//! markup), are a [`MarkupError::Diverged`], never a call whose earlier
+//! fragments are quietly wrong.
 //!
 //! Each format reads its arguments in the form its closed call writes them: a
 //! text parameter's value is released as it arrives, JSON-escaped, up to the
@@ -74,7 +75,7 @@ impl Streamer {
         let mut told = self.told.take();
         for c in calls {
             let sent = match told.take() {
-                Some(t) if t.index == c.index => t.sent,
+                Some(t) if t.index == c.index && t.name == c.name => t.sent,
                 Some(t) => return Err(diverged(&t.name, t.index)),
                 None => {
                     self.pieces.push(CallPiece::Open {
@@ -87,7 +88,7 @@ impl Streamer {
             self.extend(c.index, &c.name, &sent, &c.arguments)?;
         }
         match (open, told) {
-            (Some(p), Some(t)) if t.index == p.index => {
+            (Some(p), Some(t)) if t.index == p.index && t.name == p.name => {
                 self.extend(p.index, &p.name, &t.sent, &p.args)?;
                 self.told = Some(Told {
                     sent: p.args.clone(),
@@ -271,8 +272,8 @@ mod tests {
     }
 
     /// Fragments are never revised: arguments the sent text is not a prefix
-    /// of, an announced call the markup drops, and a call that closes under
-    /// another index are named errors.
+    /// of, an announced call the markup drops, and a call that closes or is
+    /// reported open under another index or name are named errors.
     #[test]
     fn what_was_sent_is_never_revised() {
         let mut s = Streamer::default();
@@ -299,6 +300,21 @@ mod tests {
             s.step(&[call(1, "f", "{}")], None),
             Err(MarkupError::Diverged { index: 0, .. })
         ));
+
+        let mut s = Streamer::default();
+        s.step(&[], Some(&progress(0, "{"))).unwrap();
+        assert_eq!(
+            s.step(&[call(0, "g", "{}")], None).unwrap_err(),
+            diverged("f", 0)
+        );
+
+        let mut s = Streamer::default();
+        s.step(&[], Some(&progress(0, "{"))).unwrap();
+        let renamed = Progress {
+            name: "g".to_owned(),
+            ..progress(0, "{")
+        };
+        assert_eq!(s.step(&[], Some(&renamed)).unwrap_err(), diverged("f", 0));
     }
 
     /// The escaped form is the one a closed call writes, and the held tail is

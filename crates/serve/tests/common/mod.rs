@@ -226,3 +226,35 @@ pub fn fold_call_delta(calls: &mut Vec<Value>, tc: &Value) {
         *open = json!(format!("{}{args}", open.as_str().expect("text")));
     }
 }
+
+/// The ways to feed `raw` to a streaming parser: the whole text at once, a
+/// character at a time, split in two at every character, and split in three
+/// at every pair of tag boundaries (the byte before a `<` and the byte after
+/// a `>`). `tag_stride` keeps every `tag_stride`th boundary, so 1 is every
+/// pair and a larger stride thins the pairs of a text with many tags.
+pub fn every_chunking(raw: &str, tag_stride: usize) -> Vec<Vec<&str>> {
+    let mut out = vec![vec![raw]];
+    out.push(
+        raw.char_indices()
+            .map(|(i, c)| &raw[i..i + c.len_utf8()])
+            .collect(),
+    );
+    for (at, _) in raw.char_indices().skip(1) {
+        out.push(vec![&raw[..at], &raw[at..]]);
+    }
+    let tags: Vec<usize> = raw
+        .char_indices()
+        .filter(|&(_, c)| c == '<' || c == '>')
+        .map(|(i, c)| if c == '>' { i + 1 } else { i })
+        .filter(|&i| i > 0 && i < raw.len())
+        .step_by(tag_stride)
+        .collect();
+    for (x, &a) in tags.iter().enumerate() {
+        for &b in &tags[x + 1..] {
+            if a < b {
+                out.push(vec![&raw[..a], &raw[a..b], &raw[b..]]);
+            }
+        }
+    }
+    out
+}

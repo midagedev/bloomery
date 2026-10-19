@@ -352,7 +352,7 @@ fn parse_invoke(s: &str, tags: &Tags) -> Invoke {
     }
     let fields: Vec<String> = params
         .iter()
-        .map(|(k, v)| format!("{}:{v}", json_string(k)))
+        .map(|(k, v)| format!("{}:{v}", callstream::string(k)))
         .collect();
     Invoke::Call(
         name.to_owned(),
@@ -404,17 +404,13 @@ fn partial_invoke(s: &str, tags: &Tags) -> Option<(String, String)> {
     Some((name.to_owned(), args.so_far()))
 }
 
-fn json_string(s: &str) -> String {
-    serde_json::Value::String(s.to_owned()).to_string()
-}
-
 /// A parameter value as JSON text: `string="true"` is the raw text, `string="false"`
 /// is JSON (kept as a string when it does not parse).
 fn json_value(raw: &str, is_string: bool) -> String {
     if !is_string && let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
         return v.to_string();
     }
-    json_string(raw)
+    callstream::string(raw)
 }
 
 /// One generation's message, or the part of it one push added.

@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{V41_SPACED_TEMPLATE, fold_call_delta, post, start_templated};
+use common::{V41_SPACED_TEMPLATE, every_chunking, fold_call_delta, post, start_templated};
 use serde_json::{Value, json};
 use serve::ScriptedEngine;
 use serve::callstream::CallPiece;
@@ -246,33 +246,6 @@ fn run(
     Ok((p.message().clone(), out))
 }
 
-/// The whole text at once, a character at a time, split in two at every
-/// character, and split in three at every pair of tag boundaries.
-fn every_chunking(raw: &str) -> Vec<Vec<&str>> {
-    let mut out = vec![vec![raw]];
-    out.push(
-        raw.char_indices()
-            .map(|(i, c)| &raw[i..i + c.len_utf8()])
-            .collect(),
-    );
-    for (at, _) in raw.char_indices().skip(1) {
-        out.push(vec![&raw[..at], &raw[at..]]);
-    }
-    let tags: Vec<usize> = raw
-        .char_indices()
-        .filter(|&(_, c)| c == '<' || c == '>')
-        .map(|(i, c)| if c == '>' { i + 1 } else { i })
-        .filter(|&i| i > 0 && i < raw.len())
-        .step_by(7)
-        .collect();
-    for (x, &a) in tags.iter().enumerate() {
-        for &b in &tags[x + 1..] {
-            out.push(vec![&raw[..a], &raw[a..b], &raw[b..]]);
-        }
-    }
-    out
-}
-
 /// Each call's pieces: announced once, then fragments; the call's name and its
 /// fragments' concatenation, by index.
 fn fold_pieces(pieces: &[CallPiece]) -> Vec<(String, String)> {
@@ -323,7 +296,7 @@ fn hw_every_cut_streams_the_arguments_the_call_closes_with() {
     for (label, tools, text) in &texts {
         let (want, _) = run(tools, false, &[text]).expect("the whole text parses");
         assert!(!want.calls.is_empty(), "{label}");
-        for pieces in every_chunking(text) {
+        for pieces in every_chunking(text, 7) {
             let (got, calls) = run(tools, true, &pieces).unwrap_or_else(|e| {
                 panic!(
                     "{label}: {e}: cut {:?}",
@@ -415,4 +388,37 @@ fn hw_a_call_announced_and_ended_otherwise_is_a_named_error() {
         }]
     );
     assert_eq!(fold_pieces(&p), closed(&m));
+}
+
+/// A call announced under one name and closed under another is a named error:
+/// Hermes' object may repeat `name`, and the last one wins when the call
+/// closes, so text after the arguments can rename a call the stream has
+/// already opened. A cut that has opened nothing yet reads the whole call, and
+/// the call it closes with is the one a client sees.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_call_closed_under_another_name_is_a_named_error() {
+    let tools = Tools::Hermes;
+    let text = r#"<tool_call>{"name":"f","arguments":{},"name":"g"}</tool_call>"#;
+    let (want, _) = run(&tools, false, &[text]).expect("the whole text parses");
+    assert_eq!(closed(&want), [("g".to_owned(), "{}".to_owned())]);
+    let renamed = MarkupError::Diverged {
+        index: 0,
+        name: "f".to_owned(),
+    };
+
+    let rename = text.find(r#","name":"g""#).expect("the second name");
+    let two = [&text[..rename], &text[rename..]];
+    assert_eq!(run(&tools, true, &two).unwrap_err(), renamed);
+
+    for pieces in every_chunking(text, 1) {
+        let lens: Vec<usize> = pieces.iter().map(|p| p.len()).collect();
+        match run(&tools, true, &pieces) {
+            Err(e) => assert_eq!(e, renamed, "cut {lens:?}"),
+            Ok((got, calls)) => {
+                assert_eq!(got, want, "cut {lens:?}");
+                assert_eq!(fold_pieces(&calls), closed(&want), "cut {lens:?}");
+            }
+        }
+    }
 }

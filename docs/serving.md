@@ -62,7 +62,7 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   ships for it), and one line at start says so: the tools header teaches the tags the model writes, the parser
   reads them, and an earlier call re-renders in the history as the model wrote it, so the slot's cached prefix
   survives a tool turn. A `deepseek4` file keeps V4's tags; a parser reads the one spelling its template spells.
-  A template given by `--chat-template-file` (the V4.1, Qwen3.8, GLM, MiMo and Nemotron seats take it) is read the same
+  A template given by `--chat-template-file` (the V4.1, Qwen3, Qwen3.8, GLM, MiMo and Nemotron seats take it) is read the same
   way, so a V4-spelled file on the V4.1 seat is respelled too.
   A streamed `/v1/chat/completions` sends a call as the model writes it, in OpenAI's shape: the call's first delta carries
   `index`, `id`, `type` and `function.name`, and `function.arguments` fragments follow that concatenate to the

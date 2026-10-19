@@ -479,7 +479,7 @@ fn parse_call(
             });
         }
         let value = match kinds.kind(name, key) {
-            Some(Kind::String) => Value::String(raw.to_owned()).to_string(),
+            Some(Kind::String) => callstream::string(raw),
             Some(Kind::Json(ty)) => match serde_json::from_str::<Value>(raw) {
                 // The value as the model wrote it, as llama-server writes a
                 // typed value back; a re-serialization would respell it.

@@ -246,34 +246,6 @@ fn streamed(
     Ok(total)
 }
 
-/// The whole text at once, the text a character at a time, split in two at
-/// every character, and split in three at every pair of tag boundaries.
-fn every_chunking(raw: &str) -> Vec<Vec<&str>> {
-    let mut out = vec![vec![raw]];
-    out.push(
-        raw.char_indices()
-            .map(|(i, c)| &raw[i..i + c.len_utf8()])
-            .collect(),
-    );
-    for (at, _) in raw.char_indices().skip(1) {
-        out.push(vec![&raw[..at], &raw[at..]]);
-    }
-    let tags: Vec<usize> = raw
-        .char_indices()
-        .filter(|&(_, c)| c == '<' || c == '>')
-        .map(|(i, c)| if c == '>' { i + 1 } else { i })
-        .filter(|&i| i > 0 && i < raw.len())
-        .collect();
-    for (x, &a) in tags.iter().enumerate() {
-        for &b in &tags[x + 1..] {
-            if a < b {
-                out.push(vec![&raw[..a], &raw[a..b], &raw[b..]]);
-            }
-        }
-    }
-    out
-}
-
 /// The fixtures parse to their messages, their arguments JSON objects.
 #[test]
 #[ignore = "gate: just gate-serve"]
@@ -337,7 +309,7 @@ fn hw_parse_does_not_depend_on_chunking() {
             )
         }));
     for (name, prompt, format, raw, want) in cases {
-        for pieces in every_chunking(raw) {
+        for pieces in common::every_chunking(raw, 1) {
             assert_eq!(
                 streamed(prompt, format, &pieces),
                 want,

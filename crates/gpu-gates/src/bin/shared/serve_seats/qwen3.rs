@@ -7,8 +7,8 @@
 //!     bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--place W]
 //!                    [--cache-type-k f16|q8_0] [--parallel N] [--queue-depth Q] [--plan]
-//!                    [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
-//!                    [--image-max-tokens N]
+//!                    [--chat-template-file PATH] [--mmproj FILE | --no-mmproj]
+//!                    [--image-min-tokens N] [--image-max-tokens N]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
 //! doc); `--ctx-size` and `-c` are `--ctx` under llama-server's spellings.
@@ -33,7 +33,8 @@
 //! GEMM, qwen35moe's wide, no unit under the gemv arm's cut — passes below)
 //! — then steps the last, which `generate_qwen3moe --last-step` does too.
 //! Its first shard gives the vocabulary, `tokenizer.chat_template` the chat
-//! template and `general.name` the alias. One slot unless `--parallel N`
+//! template (`--chat-template-file` replaces it) and `general.name` the
+//! alias. One slot unless `--parallel N`
 //! names more; `--plan` prints the
 //! records the decisions before the load make (the `ctx` line, the whole-fit
 //! verdict or the `plan` record, the `parallel` line) and exits 0 before the
@@ -182,8 +183,8 @@ use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::beside::Beside;
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, Vocab, arm_screen, bind_server,
-    note_line, parallel_line, placement_of, slots_given,
+    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, TemplateFile, Vocab, arm_screen,
+    bind_server, note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::qwen_seat::Family;
@@ -209,9 +210,9 @@ const NAME: &str = "bloomery-serve-qwen3";
 
 const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--place W] [--cache-type-k f16|q8_0] \
-                     [--parallel N] [--queue-depth Q] [--plan] [--mmproj FILE | --no-mmproj] \
-                     [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
-                     [--api-key-file FNAME]";
+                     [--parallel N] [--queue-depth Q] [--plan] [--chat-template-file PATH] \
+                     [--mmproj FILE | --no-mmproj] [--image-min-tokens N] \
+                     [--image-max-tokens N] [--api-key KEY] [--api-key-file FNAME]";
 
 /// What the plans and the open take of `--mmproj` ([`vision_of`]): the load's `media` flag
 /// ([`open35`]) and the bytes the image encoder reserves on the stage card, when its tower sits
@@ -287,6 +288,8 @@ struct Args {
     api_keys: serve::flag::ApiKeys,
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
+    /// `--chat-template-file`, replacing the file's own template.
+    template_file: TemplateFile,
 }
 
 /// The K/V planes' format this run loads: `--cache-type-k`'s word when given
@@ -318,6 +321,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         vision: vision_seat::Flags::default(),
         api_keys: serve::flag::ApiKeys::default(),
         plan_only: false,
+        template_file: TemplateFile::default(),
     };
     let mut it = args.iter().map(String::as_str);
     while let Some(flag) = it.next() {
@@ -348,6 +352,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             },
             "--place" => a.place = Some(Place::parse(v)?),
             "--cache-type-k" => a.cache_type_k = Some(v.to_owned()),
+            TemplateFile::FLAG => a.template_file.set(v),
             "--cache-type-v" => {
                 return Err(
                     "--cache-type-v does not exist: the qwen3 cache quantizes its K and V \
@@ -1365,7 +1370,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         &path,
         split.value("tokenizer.chat_template"),
         split.value("general.name"),
-        None,
+        a.template_file.path(),
         "qwen3",
     )?;
     // The slot count before the context it sizes: a set `--ctx` with no
