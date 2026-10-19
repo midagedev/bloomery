@@ -6217,19 +6217,15 @@ def read_jobs(path: str) -> list[Job]:
     return jobs
 
 
-def _target_rustflags_var(triple: str) -> str:
-    return f"CARGO_TARGET_{triple.upper().replace('-', '_')}_RUSTFLAGS"
-
-
 # Every variable through which the caller's environment hands cargo rustflags, for the two triples the static tier builds
 # (the box's, which the cross check targets, and the Mac's own).
 STATIC_RUSTFLAGS_ENV = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "RUSTDOCFLAGS",
-                        *(_target_rustflags_var(t) for t in ("x86_64-unknown-linux-gnu", MAC_TARGET)))
+                        *(f"CARGO_TARGET_{t.upper().replace('-', '_')}_RUSTFLAGS" for t in ("x86_64-unknown-linux-gnu", MAC_TARGET)))
 
 
 def static_job_env(environ: dict[str, str]) -> list[str]:
     """The caller-environment lines every job key carries: MAC_ENV's values, the rustflags the caller's environment hands cargo
-    (they change what a lint or a check reports: `-A warnings` must not share a green row with the unset flags), and the
+    (they change what a job that runs cargo reports: `-A warnings` must not share a green row with the unset flags), and the
     tools the jobs run."""
     rows = [f"mac-env\t{v}\t{environ.get(v, '<unset>')}" for v in (*MAC_ENV, *STATIC_RUSTFLAGS_ENV)]
     rows += [f"mac-tool\tpython3\t{platform.python_version()}", f"mac-tool\tos\t{platform.system()} {platform.machine()}"]
@@ -9993,10 +9989,11 @@ def static_key_self_test(expect) -> None:
         k2 = keys()
         expect(k2["r"] != k1["r"] and k2["b"] != k1["b"] and k2["t"] == k1["t"], "static-key: a new commit must move the rev: keys only")
         expect(keys({"BLOOMERY_TIER": "real"})["t"] != k2["t"], "static-key: a MAC_ENV value must move the key")
-        for spelled in ("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "RUSTDOCFLAGS"):
+        for spelled in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS",
+                        "CARGO_BUILD_RUSTFLAGS", "RUSTDOCFLAGS"):
             expect(spelled in STATIC_RUSTFLAGS_ENV, f"static-key: {spelled} is not among the variables the key carries")
         for flag in STATIC_RUSTFLAGS_ENV:
-            expect(keys({**env, flag: "-A warnings"})["t"] != k2["t"], f"static-key: a caller's {flag} must move the key (cargo reads it into every lint)")
+            expect(keys({**env, flag: "-A warnings"})["t"] != k2["t"], f"static-key: a caller's {flag} must move the key (cargo reads it into every build a job runs)")
         put("target/jobs.tsv", "t\t-\ttree\tbash tools/a.sh --other\n")
         expect(keys()["t"] != k2["t"], "static-key: a job's command must move its key")
         expect(not any(f.startswith("target/") for f in static_keys(jobs, d, env)[0][3]), "static-key: target/ is not a shipped file")
