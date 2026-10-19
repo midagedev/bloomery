@@ -322,9 +322,12 @@ struct EmbedClip {
     groups: Vec<ReadyGroup>,
 }
 
-/// The input's clips by their part's place, each planned under the context the input's text leaves
-/// and the clips before it, then decoded and prepared. Done before the input's text is tokenized,
-/// because the text the model writes for a clip holds what the plan chose.
+/// The input's clips by their part's place, each planned under the context the input leaves: the
+/// context less the input's text and its BOS and EOS, and less what the clips before it spent. A
+/// clip spends its tokens, its delimiters (a pair a group) and the model's text for it
+/// ([`video::plan_clip_within`]), the positions [`assemble`] charges it. Done before the input's
+/// text is tokenized, because the text the model writes for a clip holds what the plan chose; then
+/// decoded and prepared.
 fn clips(
     side: &Side,
     video: &VideoSupport,
@@ -340,11 +343,12 @@ fn clips(
             .media
             .as_ref()
             .ok_or_else(|| invalid("video input needs --embd-mmproj"))?;
-        if model.video_rule().is_none() || model.embedding_delimiters().is_none() {
+        let (Some(_), Some((begin, end))) = (model.video_rule(), model.embedding_delimiters())
+        else {
             return Err(invalid(media::MediaError::NoVideoRule.to_string()));
-        }
+        };
         let decoder = video.decoder().map_err(|e| invalid(e.to_string()))?;
-        let budget = *left.get_or_insert_with(|| {
+        let room = *left.get_or_insert_with(|| {
             let text: usize = parts
                 .iter()
                 .filter_map(|p| match media::parse_part(p) {
@@ -352,18 +356,21 @@ fn clips(
                     _ => None,
                 })
                 .sum();
-            video::clip_budget(side.ctx, text)
+            let marks = usize::from(side.tok.add_bos()) + usize::from(side.tok.add_eos());
+            side.ctx.saturating_sub(text + marks)
         });
         let bytes = media::base64(clip.data).map_err(|e| invalid(e.to_string()))?;
-        let planned = video::plan_clip(
+        let around = side.tok.encode(begin).len() + side.tok.encode(end).len();
+        let (planned, spent) = video::plan_clip_within(
             &**model,
             decoder,
             Clip::new(bytes, clip.format),
-            budget,
+            room,
             video.thread_count(),
+            |p| p.positions(|t| side.tok.encode(t).len(), around),
         )
         .map_err(|e| invalid(e.to_string()))?;
-        left = Some(budget.saturating_sub(planned.tokens()));
+        left = Some(room - spent);
         let groups = planned
             .prepare(&**model)
             .map_err(|e| invalid(e.to_string()))?;
