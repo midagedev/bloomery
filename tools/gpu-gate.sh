@@ -350,12 +350,15 @@ pace() {
 # is running, appends its STUB_ID to a marker file and holds until the test releases it. Concurrent runs are started with & and waited
 # for by their $!. One line per case;
 # exit 0 iff none failed.
-# The cases wait on real bounds and events, so they run as SELFTEST_PARTS processes at once: each part is the cases between its
-# `if gg_part K; then … fi` guards (contiguous in the file; the helpers and locals between them run in every part). `--self-test`
-# starts every part and sums their counts; `--self-test --part K` runs one (K, or `all`: the parts one after another here).
+# The cases wait on the runner's own bounds (the ones they judge: 4 s, 6 s) and on events (a line, a file, a pid that ends), so they
+# run as SELFTEST_PARTS processes at once: each part is the cases between its `if gg_part K; then … fi` guards (contiguous in the file;
+# the helpers and locals between them run in every part). `--self-test` starts every part and sums their counts; `--self-test --part K`
+# runs one (K, or `all`: the parts one after another here).
+# No verdict reads the machine's load: a wait that is not a judged bound ends on its event, and its clock (fs seconds for one wait, cap
+# seconds for a helper's whole life) only catches a hang. A run that is late is waited for while its process lives.
 SELFTEST_PARTS=3
 self_test() {
-  local self t n=0 bad=0 out rc rc1 p1 r1 r2 prc cap=50 part=${1:-all}
+  local self t n=0 bad=0 out rc rc1 p1 r1 r2 prc fs=300 cap=870 part=${1:-all}
   gg_part() { [ "$part" = all ] || [ "$part" = "$1" ]; }
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   # The cases pin the box's /root paths, so a lock directory from local mode is dropped; the local cases name their own.
@@ -425,12 +428,15 @@ PY
     -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S
     -u GATE_TEST_PACE -u STUB_ORDER -u STUB_ID -u STUB_COMPUTE_UUID -u STUB_COMPUTE_RC PATH="$t/bin:$PATH")
   # gate <out file> <BLOOMERY_GATE_CARD> <lease file> [K=V…]: one run of the runner, its rc (TL=<dir>: the dir its locks and its
-  # batch hold live in, default the test's own; GB=<s>: its own bound, default 60)
+  # batch hold live in, default the test's own; GB=<s>: its own bound, default the failsafe $fs s, and for a run that takes
+  # GATE_TEST_CAP (a helper waiter or a paced loader, which the test lets go by events) 30 s over its cap; GK=<s>: its kill-after,
+  # default 5)
   gate() {
-    local o=$1 c=$2 l=$3
+    local o=$1 c=$2 l=$3 gb=${GB:-$fs}
     shift 3
-    # Under a bound of its own: a runner that hangs ends the case red (124), it does not hang the check.
-    (cd "$t/tree" && timeout --kill-after=5 "${GB:-60}" "${gate_env[@]}" \
+    case " $* " in *" GATE_TEST_CAP="*) gb=${GB:-$((cap + 30))} ;; esac
+    # Under a failsafe bound: a runner that hangs ends the case red (124), it does not hang the check; a run that is only late ends itself.
+    (cd "$t/tree" && timeout --kill-after="${GK:-5}" "$gb" "${gate_env[@]}" \
       BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
       bash "$self" --test-locks "${TL:-$t}" "${GATE_BIN:-ok}") > "$o" 2>&1
   }
@@ -555,7 +561,8 @@ PY
   case_ 'a V4.1 load alone takes the V4.1 load lock and does not wait' 0 'ok on the 3090 \(asked 3090\), V4\.1 load lock' 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1
   case_ 'BLOOMERY_GATE_V41_LOAD other than 0 or 1: 64, named' 64 'BLOOMERY_GATE_V41_LOAD is 1' 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=yes
   case_ 'BLOOMERY_GATE_STACKS not whole seconds: 64, named' 64 'BLOOMERY_GATE_STACKS is whole seconds' 3090 "$t/lease" BLOOMERY_GATE_STACKS=soon
-  case_ 'BLOOMERY_GATE_STACKS set: the binary runs under the watch, its output through' 0 'ran on $' 3090 "$t/lease" BLOOMERY_GATE_STACKS=5
+  # The watch's quiet time only catches a hang here: the stub ends on its own.
+  case_ 'BLOOMERY_GATE_STACKS set: the binary runs under the watch, its output through' 0 'ran on $' 3090 "$t/lease" BLOOMERY_GATE_STACKS=$fs
   case_ "a run closes with its own wall and exit" 0 '^gpu-gate\.sh: ok ran [0-9]+ s \(exit 0\)$' 3090 "$t/lease"
   case_ 'BLOOMERY_GATE_GDB other than 0 or 1: 64, named' 64 'BLOOMERY_GATE_GDB is 1' 3090 "$t/lease" BLOOMERY_GATE_GDB=yes
   case_ 'BLOOMERY_GATE_GDB with BLOOMERY_GATE_STACKS: 64, named' 64 'set one' 3090 "$t/lease" BLOOMERY_GATE_GDB=1 BLOOMERY_GATE_STACKS=5
@@ -570,9 +577,10 @@ PY
   # the clock: the stub binary says `up` on STUB_READY once its run holds its locks and then blocks on STUB_HOLD until the test writes a
   # line; a waiting run's own output (read through a FIFO by relay) says it waits. The FIFOs are held open read-write by this shell
   # (descriptors 3: events, 4: the stub's release), so neither side blocks on opening one and a test that ends releases the stub by EOF.
-  # A helper waiter's two bounds are a safety cap of $cap s (GATE_TEST_CAP), under gate()'s own 60 s so a waiter that hits it ends 75,
-  # not 124: the test ends its life by an event, and one that hits the cap is a red by name (helper_cap). The cases that judge a bound
-  # keep the runner's own 4 s and 6 s.
+  # A helper waiter's two bounds are a safety cap of $cap s (GATE_TEST_CAP), under gate()'s own bound for it so a waiter that hits it
+  # ends 75, not 124: the test ends its life by an event, and one that hits the cap is a red by name (helper_cap). The cap is a life
+  # long enough for every event the test waits for beside it, each late on a loaded host. The cases that judge a bound keep the
+  # runner's own 4 s and 6 s.
   fi
   fifos() {
     exec 3>&- 4>&-
@@ -585,8 +593,8 @@ PY
     rm -f "$@"
     mkfifo "$@"
   }
-  # event <case>: blocks until one event is on descriptor 3; 60 s is gate()'s own bound on a run, so a run that never got there was killed.
-  event() { read -t 60 -r _ <&3 || { n=$((n + 1)); bad=$((bad + 1)); echo "FAIL $1: the event never came"; }; }
+  # event <case>: blocks until one event is on descriptor 3; a run that ends without it writes one itself (relay), and fs s of silence is a hang.
+  event() { read -t "$fs" -r _ <&3 || { n=$((n + 1)); bad=$((bad + 1)); echo "FAIL $1: the event never came"; }; }
   # relay <fifo> <out file> <string> <fd> [<string> <fd>]: reads a run's output from <fifo> into <out file> as it comes; the first line that
   # holds <string> writes one line to descriptor <fd>, and so does the end of the output when none did (a waiter never outlives its run).
   relay() {
@@ -639,20 +647,26 @@ PY
   judge 'a run that is not a V4.1 load does not wait for one' "$rc" 0 'ok on the 3090 \(asked 3090\)' 'V4\.1'
   # A run gate()'s own bound ends goes with its binary, under the watch too: when the bound returns 124 the stub and its timeout are
   # gone and the card lock is free, then the run's output reaches its end, and the runner's code is the stub's (it ends 7 a second after
-  # the TERM). The bound leaves the run room to start on a loaded host (a stub that never ran is a red by name); the stub then holds on
-  # STUB_HOLD, the runner's own bound (900 s) far off. A stub still there once the checks are made is let go.
-  local w ended left sp ip lk
-  for w in '' BLOOMERY_GATE_STACKS=30; do
-    fifos
-    streams "$t/s1"
-    rm -f "$t/stub.pid"
-    rc=0
-    # shellcheck disable=SC2086 # w is a K=V word or none
-    GB=10 gate "$t/s1" 3090 "$t/lease" STUB_PID="$t/stub.pid" STUB_TERM=7 STUB_HOLD="$t/hold" $w &
-    p1=$!
-    { cat "$t/s1" > "$t/first"; echo end >&3; } &
-    r1=$!
-    wait "$p1" || rc=$?
+  # the TERM). The stub holds on STUB_HOLD, the runner's own bound (900 s) far off. How long the run takes to start the stub is the
+  # host's: a bound that came before the stub's pid file says nothing of the contract, and the case is run again with more room, the
+  # last bound the failsafe (a stub that never ran then is a red by name). The kill-after is the failsafe too: a runner that ends on
+  # the TERM is waited for however late it is. A stub still there once the checks are made is let go.
+  local w gb ended left sp ip lk
+  for w in '' "BLOOMERY_GATE_STACKS=$((fs + 60))"; do
+    for gb in 10 40 "$fs"; do
+      fifos
+      streams "$t/s1"
+      rm -f "$t/stub.pid"
+      rc=0
+      # shellcheck disable=SC2086 # w is a K=V word or none
+      GB=$gb GK=$fs gate "$t/s1" 3090 "$t/lease" STUB_PID="$t/stub.pid" STUB_TERM=7 STUB_HOLD="$t/hold" $w &
+      p1=$!
+      { cat "$t/s1" > "$t/first"; echo end >&3; } &
+      r1=$!
+      wait "$p1" || rc=$?
+      [ ! -s "$t/stub.pid" ] || break
+      wait "$r1" || true
+    done
     left=
     if [ -s "$t/stub.pid" ]; then
       read -r sp ip < "$t/stub.pid"
@@ -662,7 +676,7 @@ PY
     lk=free
     flock -n "$t/gate.lock" true || lk=held
     ended=no
-    if read -t 5 -r _ <&3; then ended=yes; fi
+    if read -t "$fs" -r _ <&3; then ended=yes; fi
     echo go >&4
     wait "$r1" || true
     echo "stub ran: $([ -s "$t/stub.pid" ] && echo yes || echo no), left:${left:- none}, output ended: $ended, gate lock: $lk" > "$t/out"
@@ -701,13 +715,15 @@ SH
     exec 5>&1 || exit 70
     exec "${gate_env[@]}" PATH="$t/stack-bin:$t/bin:$PATH" \
       BLOOMERY_GATE_CARD=3090 BLOOMERY_LEASE_LOCK="$t/lease" BLOOMERY_LEASE_PROC="$t/proc" \
-      BLOOMERY_GATE_STACKS=60 BLOOMERY_GATE_BOUND=30 BLOOMERY_GATE_V41_LOAD=1 \
+      BLOOMERY_GATE_STACKS=60 BLOOMERY_GATE_BOUND=$((fs + 60)) BLOOMERY_GATE_V41_LOAD=1 \
       SW_CMD="$t/stack-command.pid" SW_SLEEP="$t/stack-sleep.pid" SW_HOLD="$t/hold" \
       bash "$self" --test-locks "$t" held
   ) > "$t/stack-output" 2>&1 &
   p1=$! ready=no
-  for ((child = 0; child < 100; child++)); do
+  # The runner is waited for while it lives, fs s at most: a run that ends before it is ready is the red below.
+  for ((child = SECONDS; SECONDS - child < fs; )); do
     if cancel_ready "$t/stack-command.pid" && cancel_ready "$t/stack-sleep.pid"; then ready=yes; break; fi
+    kill -0 "$p1" 2> /dev/null || break
     sleep 0.1
   done
   before=''
@@ -734,7 +750,7 @@ SH
     if flock -n "$t/$lock.lock" true; then lk="$lk $lock=free"; else lk="$lk $lock=held"; fi
   done
   ended=no
-  if read -t 1 -r _ <&3; then ended=yes; fi
+  if read -t "$fs" -r _ <&3; then ended=yes; fi
   echo "ready: $ready, TERM sent: $signalled, locks before:$before" > "$t/out" || return 70
   echo "left:${left:- none}, output ended: $ended, locks after:$lk" >> "$t/out" || return 70
   sed 's/^/run: /' "$t/first" >> "$t/out" || return 70
@@ -752,8 +768,8 @@ SH
     CANCEL_TIMEOUT_FORWARD=$forward PATH="$t/stack-bin:$PATH" bash -c '
       source "$1"
       export STOP_RUNNER=$$
-      run_bounded timeout --kill-after=10 30 python3 -
-    ' _ "${self%/*}/gate-bound.sh" > "$t/out" 2>&1 << 'PY' || rc=$?
+      run_bounded timeout --kill-after=10 "$2" python3 -
+    ' _ "${self%/*}/gate-bound.sh" "$fs" > "$t/out" 2>&1 << 'PY' || rc=$?
 import os
 import signal
 import sys
@@ -787,7 +803,7 @@ import signal
 import subprocess
 import sys
 
-fixture, phase = sys.argv[1:]
+fixture, phase, failsafe = sys.argv[1], sys.argv[2], float(sys.argv[3])
 read_fd, write_fd = os.pipe()
 os.set_inheritable(write_fd, True)
 spawned = []
@@ -803,7 +819,7 @@ def term():
 
 
 def read_state(expected):
-    assert select.select([read_fd], [], [], 5)[0], "child state timed out"
+    assert select.select([read_fd], [], [], failsafe)[0], "child state timed out"
     assert os.read(read_fd, 1) == expected, "unexpected child state"
 
 
@@ -836,7 +852,7 @@ class WindowChild(original):
 
 
 subprocess.Popen = WindowChild
-sys.argv = [fixture, "5", sys.executable, "-c", '''
+sys.argv = [fixture, str(int(failsafe)), sys.executable, "-c", '''
 import os, signal, sys, time
 fd = int(sys.argv[1])
 def abort(*_):
@@ -866,7 +882,7 @@ finally:
     for child in spawned:
         if child.poll() is None:
             child.kill()
-        original.wait(child, timeout=5)
+        original.wait(child, timeout=failsafe)
 PY
   for w in before-spawn before-handle before-wait during-wait after-wait second-term; do
     rc=0 want=0 state='^drained: exit 0$'
@@ -874,7 +890,7 @@ PY
       after-wait) want=7; state='^completed: exit 7$' ;;
       second-term) want=1; state='^second TERM: abort$' ;;
     esac
-    CANCEL_TIMEOUT_FORWARD=1 python3 "$t/term-window.py" "$t/stack-bin/timeout" "$w" > "$t/out" 2>&1 || rc=$?
+    CANCEL_TIMEOUT_FORWARD=1 python3 "$t/term-window.py" "$t/stack-bin/timeout" "$w" "$fs" > "$t/out" 2>&1 || rc=$?
     judge "monitor TERM at $w keeps the child's status" "$rc" "$want" "$state"
   done
   # A failed process read during cancellation stays an error even if the child ends successfully;
@@ -886,7 +902,7 @@ PY
       # shellcheck source=tools/gate-bound.sh
       source "${self%/*}/gate-bound.sh"
       ps() { sleep 0.1; return 1; }
-      run_bounded python3 - "$child_status" << 'PY'
+      run_bounded python3 - "$child_status" "$fs" << 'PY'
 import os
 import signal
 import sys
@@ -897,7 +913,7 @@ def stop(*_):
 
 os.setpgid(0, 0)
 signal.signal(signal.SIGTERM, stop)
-signal.alarm(5)
+signal.alarm(int(sys.argv[2]))
 os.kill(os.getppid(), signal.SIGTERM)
 while True:
     signal.pause()
@@ -1009,24 +1025,38 @@ PY
     local g=$((20 + 2 * $1)) a=$((21 + 2 * $1))
     eval "exec $g>&- $a>&-"
   }
-  # ack <k> <case>: ACK is loader k's next sign; 60 s is gate()'s own bound on a run, so a run that never signed was killed.
-  # A loader that has signed `exit` is gone: its next sign is `gone` at once, not a minute's wait for one that cannot come. The `exit`
-  # sign comes from the EXIT trap, before the process lets go of its locks (the V4.1 load lock, the card lock), so `exit` is taken as an end
-  # only once the run's pid is gone: a grant to the next loader right after it would find the lock still held, and that loader would
-  # poll instead of run (a sign short, then a grant it never gets, then gate()'s 60 s: rc 124).
+  # ack <k> <case>: ACK is loader k's next sign. The sign is an event: the wait goes on while the loader's run lives (a loader late to
+  # start on a loaded host is waited for), and ends in a red by name when the run is gone without a sign or has been silent for fs s (a
+  # hang). A loader that has signed `exit`, or has failed to sign, is gone: its next sign is `gone` at once, not a wait for one that
+  # cannot come. The `exit` sign comes from the EXIT trap, before the process lets go of its locks (the V4.1 load lock, the card lock),
+  # so `exit` is taken as an end only once the run's pid is gone: a grant to the next loader right after it would find the lock still
+  # held, and that loader would poll instead of run (a sign short, then a grant it never gets).
   ack() {
-    local w=0
+    local t0=$SECONDS why=
     ACK=
     if [ "${ENDED[$1]:-0}" = 1 ]; then
       ACK=gone
       return 0
     fi
-    read -t 60 -r ACK <&"$((21 + 2 * $1))" || { n=$((n + 1)); bad=$((bad + 1)); echo "FAIL $2: loader $1 gave no sign"; ACK=none; }
+    until read -t 5 -r ACK <&"$((21 + 2 * $1))"; do
+      if ! kill -0 "${LPID[$1]:-0}" 2> /dev/null; then
+        # The run is gone: a sign it wrote before it went is still in the FIFO.
+        read -t 5 -r ACK <&"$((21 + 2 * $1))" || why="its run ended without one"
+        break
+      fi
+      [ $((SECONDS - t0)) -lt "$fs" ] || { why="it was silent for $fs s"; break; }
+    done
+    if [ -n "$why" ]; then
+      n=$((n + 1)); bad=$((bad + 1)); echo "FAIL $2: loader $1 gave no sign ($why)"
+      ACK=none
+      ENDED[$1]=1
+      return 0
+    fi
     [ "$ACK" != exit ] || ENDED[$1]=1
     if [ "$ACK" = exit ] && [ -n "${LPID[$1]:-}" ]; then
+      t0=$SECONDS
       while kill -0 "${LPID[$1]}" 2> /dev/null; do
-        w=$((w + 1))
-        [ "$w" -lt 1200 ] || { n=$((n + 1)); bad=$((bad + 1)); echo "FAIL $2: loader $1 signed exit and was still there after 60 s"; break; }
+        [ $((SECONDS - t0)) -lt "$fs" ] || { n=$((n + 1)); bad=$((bad + 1)); echo "FAIL $2: loader $1 signed exit and was still there after $fs s"; break; }
         sleep 0.05
       done
     fi
@@ -1405,11 +1435,10 @@ PY
   TL="$t/d4" gate "$t/h7" 3090 "$t/lease" &
   p7=$!
   # d3's hold is released once its run is waiting on it (its first [batch-hold] line) and has polled once more — an event of the run's
-  # own clock, not a fixed time after the launch: the others wait out their 4 s bound beside it.
-  k=0
-  while ! grep -q 'batch-hold' "$t/h6" 2> /dev/null && [ "$k" -lt 50 ]; do
+  # own clock, not a fixed time after the launch: the others wait out their 4 s bound beside it. The run is waited for while it lives.
+  k=$SECONDS
+  while ! grep -q 'batch-hold' "$t/h6" 2> /dev/null && kill -0 "$p6" 2> /dev/null && [ $((SECONDS - k)) -lt "$fs" ]; do
     sleep 0.2
-    k=$((k + 1))
   done
   sleep 1
   rm -f "$t/d3/batch.gpuhold"
@@ -1425,7 +1454,7 @@ PY
   cp "$t/h1" "$t/out"
   judge_all 'a fresh hold of another owner: the run waits, 75 at the bound, a [batch-hold] line at once naming owner and age' "$rc" 75 \
     '\[batch-hold\] .* waits: a landing batch holds the GPUs \(.*batch\.gpuhold, owner other, up [0-9]+ s, refreshed [0-9]+ s ago\)' \
-    'the batch hold .*batch\.gpuhold \(owner other\) was still up after [4-9] s .*contention' '!ok on the'
+    'the batch hold .*batch\.gpuhold \(owner other\) was still up after ([4-9]|[1-9][0-9]+) s \(CARD_BOUND 4 s\) .*contention' '!ok on the'
   rc=0
   wait "$p2" || rc=$?
   cp "$t/h2" "$t/out"
@@ -1434,7 +1463,7 @@ PY
   wait "$p3" || rc=$?
   cp "$t/h3" "$t/out"
   judge_all '  … a V4.1 loader waits on the hold before its load lock: the hold'"'"'s bound, not the load lock'"'"'s' "$rc" 75 \
-    'the batch hold .* was still up after [4-9] s' '!V4\.1 load lock .* was not free'
+    'the batch hold .* was still up after ([4-9]|[1-9][0-9]+) s \(CARD_BOUND 4 s\)' '!V4\.1 load lock .* was not free'
   rc=0
   wait "$p4" || rc=$?
   cp "$t/h4" "$t/out"
@@ -1467,7 +1496,7 @@ PY
   echo "hold lines: $(grep -c 'batch-hold' "$t/out")" >> "$t/out"
   judge_all 'a stale hold (not refreshed for 400 s): the run goes ahead, and says so once, naming the hold and its age' "$rc" 0 \
     'ok on the 3090 \(asked 3090\)' '!waits' \
-    '\[batch-hold\] .*batch\.gpuhold \(owner other\) is stale — not refreshed for 4[0-9][0-9] s \(stale at 300 s\)' 'hold lines: 1$'
+    '\[batch-hold\] .*batch\.gpuhold \(owner other\) is stale — not refreshed for [4-9][0-9][0-9] s \(stale at 300 s\)' 'hold lines: 1$'
   case_ 'BLOOMERY_BATCH_OWNER with a character other than letters, digits, _: 64, named' 64 "BLOOMERY_BATCH_OWNER is the batch hold's owner .*got 'a-b'" 3090 "$t/lease" BLOOMERY_BATCH_OWNER=a-b
   # The writer: up, beat and down on the file, owner-checked; the wait above reads what it writes.
   hrun up batcha
@@ -1494,7 +1523,7 @@ PY
   judge_all '  … and is no error when it is already down' "$rc" 0 'is already down$' 'after: no hold$'
   hold other 400
   hrun up batcha
-  judge_all 'gpuhold up: takes over a stale hold, naming it' "$rc" 0 'owner other was not refreshed for 4[0-9][0-9] s: taking it over' 'after: owner=batcha since=[0-9]+ age=[0-9]+ fresh=yes$'
+  judge_all 'gpuhold up: takes over a stale hold, naming it' "$rc" 0 'owner other was not refreshed for [4-9][0-9][0-9] s: taking it over' 'after: owner=batcha since=[0-9]+ age=[0-9]+ fresh=yes$'
   rm -f "$t/batch.gpuhold"
   hrun up 'a b'
   judge_all 'gpuhold: an owner with a space: 64, named' "$rc" 64 "an owner is letters, digits and _, got 'a b'" 'after: no hold$'

@@ -75,8 +75,6 @@ import tempfile
 import threading
 import time
 
-from bloomery.selftest import load_cap
-
 USAGE = 64
 LANES = ("3090", "a6000", "both", "any", "none")
 CLASSES = ("lead", "round", "sitting", "fill")
@@ -793,20 +791,27 @@ def main(argv):
 
 # ---- self-test ----------------------------------------------------------------------------------------------------
 
+# Every wait in the cases is for an event: a pid or a request recorded, a process's exit, a connection the daemon refused.
+# This bound only catches a hang. A bound a run must fit in reads the machine's load, not the client: under load the client
+# is late, and a bound fires first.
+FAILSAFE = 120
+
+
 class Fake:
     """The daemon's side of the wire in a thread: it records each request and serves job j1 from a script of poll
     states, the last state repeating. `post` and `health` are (status, object) replies that override the defaults;
-    `cancel_to` is the status a cancelled job shows (None: the cancel is ignored); `slow` seconds pass before health
-    answers; `gate` (a callable) holds the job running until it is true; `late` is a pair of byte strings appended to
-    the out and err files 0.1 s after the first terminal poll was answered, the way a job's last output trails its
-    status."""
+    `cancel_to` is the status a cancelled job shows (None: the cancel is ignored); `hold` (an Event) keeps health's reply
+    back until it is set; `gate` (a callable) holds the job running until it is true; `late` is a pair of byte strings
+    appended to the out and err files 0.1 s after the first terminal poll was answered, the way a job's last output
+    trails its status. `down_until` is a monotonic time (inf: until the case lets go) before which every connection is
+    closed unanswered, and `refused` counts those connections, so a case waits for the client's own misses, not a clock."""
 
-    def __init__(self, files, states, health=(200, {"ok": True}), post=None, cancel_to="cancelled", slow=0.0, gate=None,
+    def __init__(self, files, states, health=(200, {"ok": True}), post=None, cancel_to="cancelled", hold=None, gate=None,
                  late=None, listing=None, job_reply=None):
-        self.requests, self.polls, self.cancelled, self.slow = [], 0, False, slow
+        self.requests, self.polls, self.cancelled, self.hold = [], 0, False, hold
         self.files, self.states, self.health, self.post, self.cancel_to = files, states, health, post, cancel_to
         self.gate, self.late, self.listing, self.job_reply = gate, late, listing, job_reply
-        self.down_until = 0.0  # until then every connection is closed unanswered
+        self.down_until, self.refused = 0.0, 0
         fake = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -815,6 +820,7 @@ class Fake:
 
             def serve(self):
                 if time.monotonic() < fake.down_until:
+                    fake.refused += 1
                     self.close_connection = True
                     with contextlib.suppress(OSError):
                         self.connection.shutdown(socket.SHUT_RDWR)
@@ -866,7 +872,8 @@ class Fake:
     def handle(self, method, path, body, ctype):
         self.requests.append((method, path, body, ctype))
         if (method, path) == ("GET", "/health"):
-            time.sleep(self.slow)
+            if self.hold is not None:
+                self.hold.wait(FAILSAFE)
             return self.health
         if (method, path) == ("POST", "/jobs"):
             return self.post or (201, self.job(**self.states[0]))
@@ -883,6 +890,8 @@ class Fake:
         return [r for r in self.requests if r[1] == "/jobs/j1/cancel"]
 
     def close(self):
+        if self.hold is not None:
+            self.hold.set()
         self.srv.shutdown()
         self.srv.server_close()
 
@@ -969,7 +978,7 @@ class Fix:
         self.stubs()
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("BOXQ_") and k != "BLOOMERY_BOX"}
-        env.update(BOXQ_SSH=self.ssh, BOXQ_HOST="testbox", BOXQ_POLL_S="0.2", BOXQ_CANCEL_WAIT_S="10",
+        env.update(BOXQ_SSH=self.ssh, BOXQ_HOST="testbox", BOXQ_POLL_S="0.2", BOXQ_CANCEL_WAIT_S=str(FAILSAFE),
                    BOXQ_RECONNECT_S="0")
         if self.fake:
             env["BOXQ_URL"] = self.fake.url
@@ -983,13 +992,13 @@ class Fix:
         self.procs.append(p)
         return p
 
-    def finish(self, p, secs=40):
+    def finish(self, p):
         try:
-            out, err = p.communicate(timeout=secs)
+            out, err = p.communicate(timeout=FAILSAFE)
         except subprocess.TimeoutExpired:
             p.kill()
             p.communicate()
-            raise AssertionError(f"the client did not end in {secs} s")
+            raise AssertionError(f"the client did not end within the {FAILSAFE} s failsafe")
         return p.returncode, out, err
 
     def client(self, *argv, **extra):
@@ -1016,36 +1025,42 @@ class Fix:
         except OSError:
             return []
 
-    def wait_pids(self, path, n, secs=10):
-        secs = load_cap(secs)
-        end = time.monotonic() + secs
-        while len(self.pids(path)) < n:
-            check(time.monotonic() < end,
-                  f"{n} pids did not appear in {os.path.basename(path)} within {secs:.0f} s")
+    def wait_for(self, cond, what, proc=None):
+        """Until cond() holds. A client PROC that ended before it did, or the failsafe, fails naming WHAT (a string, or a
+        callable that makes it); the client's end is a verdict at once, not a wait for the failsafe."""
+        end = time.monotonic() + FAILSAFE
+
+        def why():
+            return what() if callable(what) else what
+
+        while not cond():
+            if proc is not None and proc.poll() is not None and not cond():
+                out, err = proc.communicate()
+                raise AssertionError(f"{why()}: the client ended first, rc {proc.returncode}: {out[-200:]!r} {err[-400:]!r}")
+            if time.monotonic() >= end:
+                raise AssertionError(f"{why()}: not within the {FAILSAFE} s failsafe")
             time.sleep(0.02)
 
-    def gone(self, path, n=None, secs=3):
+    def wait_pids(self, path, n, proc=None):
+        self.wait_for(lambda: len(self.pids(path)) >= n, f"{n} pids did not appear in {os.path.basename(path)}", proc)
+
+    def gone(self, path, n=None):
         """The pids a stub recorded are all gone; the record restarts. For tail_pids, n counts the -F tails among them
         (each attach that ends also reads its files' rest with tail -c)."""
         pids = self.pids(path)
         counted = self.pids(self.follow_pids) if path == self.tail_pids else pids
         check(n is None or len(counted) == n, f"{os.path.basename(path)} holds {len(counted)} counted pids, {n} expected")
-        end = time.monotonic() + secs
-        while any(alive(p) for p in pids):
-            check(time.monotonic() < end, f"pids still alive {secs} s on: {[p for p in pids if alive(p)]}")
-            time.sleep(0.02)
+        self.wait_for(lambda: not any(alive(p) for p in pids), lambda: f"pids still alive on: {[p for p in pids if alive(p)]}")
         open(path, "w").close()
         if path == self.tail_pids:
             open(self.follow_pids, "w").close()
 
-    def wait_requests(self, fake, n, which=None, secs=10):
-        end = time.monotonic() + secs
-        while len(which() if which else fake.requests) < n:
-            check(time.monotonic() < end, f"the daemon saw fewer than {n} of the requests it waited for")
-            time.sleep(0.02)
+    def wait_requests(self, fake, n, which=None, proc=None):
+        self.wait_for(lambda: len(which() if which else fake.requests) >= n,
+                      f"the daemon saw fewer than {n} of the requests it waited for", proc)
 
-    def wait_polls(self, fake, n):
-        self.wait_requests(fake, n, lambda: [r for r in fake.requests if r[:2] == ("GET", "/jobs/j1")])
+    def wait_polls(self, fake, n, proc=None):
+        self.wait_requests(fake, n, lambda: [r for r in fake.requests if r[:2] == ("GET", "/jobs/j1")], proc)
 
     def cleanup(self):
         for p in self.procs:
@@ -1163,18 +1178,20 @@ def case_reconnect(fx):
     err_a, err_b = b"e1\n", b"warn-b\n"
     fx.files(prefix, err_a)
     fake = fx.serve([{"status": "running"}], gate=lambda: len(fx.pids(fx.tail_pids)) >= 2)
-    p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05", BOXQ_RECONNECT_S="3")
-    fx.wait_pids(fx.tail_pids, 2)
-    pre, end = b"", time.monotonic() + 5
+    p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05", BOXQ_RECONNECT_S=str(FAILSAFE))
+    fx.wait_pids(fx.tail_pids, 2, p)
+    pre, end = b"", time.monotonic() + FAILSAFE
     while prefix not in pre:
-        check(time.monotonic() < end, f"the prefix did not arrive before the blip: {pre!r}")
+        check(time.monotonic() < end, f"the prefix did not arrive before the blip, within the {FAILSAFE} s failsafe: {pre!r}")
         ready, _, _ = select.select([p.stdout], [], [], 0.05)
         if ready:
             chunk = os.read(p.stdout.fileno(), 65536)
             if not chunk:
                 break
             pre += chunk
-    fake.down_until = time.monotonic() + 0.8
+    # The daemon is gone until the client has missed it POLL_FAILS times and paused twice in its backoff: the blip is the
+    # client's own count of misses, whatever the pace of the machine, and the budget it backs off in is the failsafe.
+    fake.down_until = float("inf")
     for pid in fx.pids(fx.tail_pids):
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
@@ -1182,17 +1199,17 @@ def case_reconnect(fx):
         f.write(suffix)
     with open(fx.err, "ab") as f:
         f.write(err_b)
-    while time.monotonic() < fake.down_until:
-        time.sleep(0.02)
+    fx.wait_for(lambda: fake.refused >= POLL_FAILS + 2, f"the client missed the daemon fewer than {POLL_FAILS + 2} times", p)
     fake.states = [{"status": "failed", "rc": 3}]
     fake.polls = 0
     fake.gate = None
+    fake.down_until = 0.0
     try:
-        out, err = p.communicate(timeout=15)
+        out, err = p.communicate(timeout=FAILSAFE)
     except subprocess.TimeoutExpired:
         p.kill()
         p.communicate()
-        raise AssertionError("the client did not end in 15 s after the daemon returned")
+        raise AssertionError(f"the client did not end within the {FAILSAFE} s failsafe after the daemon returned")
     so = pre + out
     check(p.returncode == 3 and fx.rc_file() == "3\n",
           f"a blip ends with the job's rc: {p.returncode} {fx.rc_file()!r} {err!r}")
@@ -1214,12 +1231,12 @@ def case_reconnect(fx):
     # a signal while the daemon is down: a job last seen running is left running (no cancel to post)
     fx.files(b"o\n", b"e\n")
     fake = fx.serve([{"status": "running"}])
-    p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05", BOXQ_RECONNECT_S="5")
-    fx.wait_pids(fx.tail_pids, 2)
-    fake.down_until = time.monotonic() + 5
-    time.sleep(0.45)
+    p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05", BOXQ_RECONNECT_S=str(FAILSAFE))
+    fx.wait_pids(fx.tail_pids, 2, p)
+    fake.down_until = float("inf")
+    fx.wait_for(lambda: fake.refused >= POLL_FAILS, f"the client missed the daemon fewer than {POLL_FAILS} times", p)
     p.send_signal(signal.SIGINT)
-    got, so, se = fx.finish(p, 10)
+    got, so, se = fx.finish(p)
     check(got == 130 and b"left running" in se and fake.cancels() == [] and fx.rc_file() is None,
           f"INT while the daemon is down on a running job: left running, no cancel, no mirror: "
           f"{got} {se!r} {fake.cancels()} {fx.rc_file()!r}")
@@ -1227,15 +1244,18 @@ def case_reconnect(fx):
 
     # a job last seen queued is cancelled, the post waiting for the daemon to return
     fake = fx.serve([{"status": "queued", "wait_reason": "card-busy"}])
-    p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05", BOXQ_RECONNECT_S="5", BOXQ_CANCEL_WAIT_S="10")
-    fx.wait_polls(fake, 2)
-    fake.down_until = time.monotonic() + 5
-    time.sleep(0.45)
+    p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05", BOXQ_RECONNECT_S=str(FAILSAFE), BOXQ_CANCEL_WAIT_S=str(FAILSAFE))
+    fx.wait_polls(fake, 2, p)
+    fake.down_until = float("inf")
+    fx.wait_for(lambda: fake.refused >= POLL_FAILS, f"the client missed the daemon fewer than {POLL_FAILS} times", p)
     p.send_signal(signal.SIGINT)
-    time.sleep(0.3)
+    # each pass of the loop after the signal is a poll and a cancel post, both refused: two passes, so the cancel has been
+    # tried against the down daemon and kept waiting
+    seen = fake.refused
+    fx.wait_for(lambda: fake.refused >= seen + 4, "the client did not try the cancel against the down daemon", p)
     check(p.poll() is None and fake.cancels() == [], "the cancel waits while the daemon is down")
     fake.down_until = 0
-    got, so, se = fx.finish(p, 10)
+    got, so, se = fx.finish(p)
     check(got == 130 and b"elsewhere" not in se and len(fake.cancels()) == 1 and fx.rc_file() == "130\n",
           f"INT on a queued job while the daemon is down: one cancel once it returns: "
           f"{got} {se!r} {fake.cancels()} {fx.rc_file()!r}")
@@ -1298,7 +1318,7 @@ def case_int_cancel(fx):
         fx.files(b"o\n", b"e\n")
         fake = fx.serve([{"status": "running"}])
         p = fx.start(*fx.run_args())
-        fx.wait_pids(fx.tail_pids, 2)
+        fx.wait_pids(fx.tail_pids, 2, p)
         p.send_signal(sig)
         got, so, se = fx.finish(p)
         check(got == want and fake.cancels() == [] and b"left running" in se and b"boxq.py attach j1" in se,
@@ -1308,7 +1328,7 @@ def case_int_cancel(fx):
     for sig, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
         fake = fx.serve([{"status": "queued", "wait_reason": "card-busy"}])
         p = fx.start(*fx.run_args())
-        fx.wait_polls(fake, 2)
+        fx.wait_polls(fake, 2, p)
         p.send_signal(sig)
         got, so, se = fx.finish(p)
         cancels = fake.cancels()
@@ -1318,17 +1338,20 @@ def case_int_cancel(fx):
               f"one POST cancel with {{}}: {cancels}")
         check(fx.rc_file() == f"{want}\n", f"the mirror holds {want}: {fx.rc_file()!r}")
         fx.rm_rc()
-    fake = fx.serve([{"status": "running"}], slow=1.0)
+    # health's reply is held back until the signal has been sent: the client reads the answer after the signal is pending
+    release = threading.Event()
+    fake = fx.serve([{"status": "running"}], hold=release)
     p = fx.start(*fx.run_args())
-    fx.wait_requests(fake, 1)
+    fx.wait_requests(fake, 1, proc=p)
     p.send_signal(signal.SIGINT)
+    release.set()
     got, so, se = fx.finish(p)
     check(got == 130 and not [r for r in fake.requests if r[:2] == ("POST", "/jobs")] and b"interrupted" in se,
           f"a signal before the post posts nothing: {got} {se!r} {fake.requests}")
     fx.rm_rc()
     fake = fx.serve([{"status": "queued", "wait_reason": "card-busy"}], cancel_to=None)
     p = fx.start(*fx.run_args(), BOXQ_CANCEL_WAIT_S="1")
-    fx.wait_polls(fake, 2)
+    fx.wait_polls(fake, 2, p)
     t0 = time.monotonic()
     p.send_signal(signal.SIGINT)
     got, so, se = fx.finish(p)
@@ -1337,11 +1360,11 @@ def case_int_cancel(fx):
     check(fx.rc_file() is None, "a job that is not terminal gets no rc mirror")
     fake = fx.serve([{"status": "queued", "wait_reason": "card-busy"}], cancel_to=None)
     p = fx.start(*fx.run_args(), BOXQ_CANCEL_WAIT_S="100")
-    fx.wait_polls(fake, 2)
+    fx.wait_polls(fake, 2, p)
     p.send_signal(signal.SIGINT)
-    fx.wait_requests(fake, 1, fake.cancels)
+    fx.wait_requests(fake, 1, fake.cancels, p)
     p.send_signal(signal.SIGINT)
-    got, so, se = fx.finish(p, 10)
+    got, so, se = fx.finish(p)
     check(got == 81, f"a second signal ends the wait: {got} {se!r}")
 
 
@@ -1608,7 +1631,7 @@ def case_drain_full_pipe(fx):
 
     th = threading.Thread(target=fill, daemon=True)
     th.start()
-    th.join(3)
+    th.join(FAILSAFE)  # a drain that blocks never returns: the failsafe is its hang
     stalled = th.is_alive()
     if stalled:
         os.close(dst_r)  # frees the blocked write; the case is red below
@@ -1626,21 +1649,21 @@ def case_drain_full_pipe(fx):
         for fd in (dst_r, dst_w):
             os.close(fd)
     os.close(src_w)
-    check(not stalled, "a drain into a full pipe blocked for 3 s")
+    check(not stalled, f"a drain into a full pipe blocked for the {FAILSAFE} s failsafe")
     check(held > 0 and n_before == got,
           f"a full pipe leaves the bytes pending, counted only once written: held={held} n={n_before} read={got}")
     fx.files(b"o" * 3000000, b"e\n")
     fake = fx.serve([{"status": "running"}])
     p = fx.start(*fx.run_args())  # its stdout pipe is never read
-    fx.wait_pids(fx.tail_pids, 2)
-    time.sleep(1.0)
+    fx.wait_pids(fx.tail_pids, 2, p)
+    time.sleep(1.0)  # time for the 3 MB, unread, to fill the pipe: a slow host only makes the stall less likely, never the verdict
     p.send_signal(signal.SIGTERM)
     try:
-        rc = p.wait(timeout=10)
+        rc = p.wait(timeout=FAILSAFE)
     except subprocess.TimeoutExpired:
         p.kill()
         p.wait()
-        raise AssertionError("a SIGTERM did not end a client whose stdout pipe is full within 10 s")
+        raise AssertionError(f"a SIGTERM did not end a client whose stdout pipe is full within the {FAILSAFE} s failsafe")
     check(rc == 143 and fake.cancels() == [], f"SIGTERM with a full stdout pipe exits 143, no cancel: {rc}")
     fx.gone(fx.tail_pids, 2)
 
@@ -1652,16 +1675,15 @@ def case_pending_replay(fx):
     fx.serve([{"status": "running"}, {"status": "done", "rc": 0}],
              gate=lambda: len(fx.pids(fx.tail_pids)) >= 2)
     p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05")
-    fx.wait_pids(fx.tail_pids, 2)
-    end = time.monotonic() + 3
-    while time.monotonic() < end and p.poll() is None and fx.rc_file() is None:
-        time.sleep(0.05)
+    # the third pid is the replay tail: the job is terminal and the 1 MiB of its out, with stdout unread, is more than the
+    # pipe holds, so the client is replaying into a full pipe before anything reads it
+    fx.wait_pids(fx.tail_pids, 3, p)
     try:
-        out, err = p.communicate(timeout=20)
+        out, err = p.communicate(timeout=FAILSAFE)
     except subprocess.TimeoutExpired:
         p.kill()
         p.communicate()
-        raise AssertionError("the client did not finish replaying a full stdout pipe within 20 s")
+        raise AssertionError(f"the client did not finish replaying a full stdout pipe within the {FAILSAFE} s failsafe")
     check(p.returncode == 0 and out == body and fx.rc_file() == "0\n",
           f"pending bytes are replayed before the mirror: rc={p.returncode} got={len(out)} "
           f"want={len(body)} mirror={fx.rc_file()!r} err={err!r}")
@@ -1689,17 +1711,16 @@ def case_replay_ssh(fx):
     fx.serve([{"status": "running"}, {"status": "done", "rc": 0}],
              gate=lambda: len(fx.pids(fx.tail_pids)) >= 2)
     p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05")
-    fx.wait_pids(fx.tail_pids, 2)
-    # Leave stdout unread so the pipe fills and the replay ssh is the one that would finish the file.
-    end = time.monotonic() + 3
-    while time.monotonic() < end and p.poll() is None and fx.rc_file() is None:
-        time.sleep(0.05)
+    fx.wait_pids(fx.tail_pids, 2, p)
+    # Leave stdout unread so the pipe fills and the replay ssh is the one that would finish the file: the client ends by
+    # itself (84), whatever the pace of the machine, and nothing here reads its stdout before it has.
+    fx.wait_for(lambda: p.poll() is not None, "a replay whose ssh fails did not end the client")
     try:
-        out, err = p.communicate(timeout=20)
+        out, err = p.communicate(timeout=FAILSAFE)
     except subprocess.TimeoutExpired:
         p.kill()
         p.communicate()
-        raise AssertionError("a replay whose ssh fails did not end the client within 20 s")
+        raise AssertionError(f"a replay whose ssh fails did not end the client within the {FAILSAFE} s failsafe")
     check(p.returncode == 84 and fx.rc_file() is None and out != body
           and b"left as it is on the box" in err and b"attach j1" in err,
           f"a replay ssh exiting 255 exits 84 and mirrors nothing: rc={p.returncode} "
@@ -1714,15 +1735,15 @@ def case_replay_signal(fx):
     fx.serve([{"status": "running"}, {"status": "done", "rc": 0}],
              gate=lambda: len(fx.pids(fx.tail_pids)) >= 2)
     p = fx.start(*fx.run_args(), BOXQ_POLL_S="0.05")
-    fx.wait_pids(fx.tail_pids, 3)  # the third pid is the replay tail: the job is already terminal
+    fx.wait_pids(fx.tail_pids, 3, p)  # the third pid is the replay tail: the job is already terminal
     p.send_signal(signal.SIGTERM)
     # Do not read stdout yet: a full pipe is what holds the replay, so the signal is what ends it.
     try:
-        rc = p.wait(timeout=20)
+        rc = p.wait(timeout=FAILSAFE)
     except subprocess.TimeoutExpired:
         p.kill()
         p.wait()
-        raise AssertionError("a signal during replay did not end the client within 20 s")
+        raise AssertionError(f"a signal during replay did not end the client within the {FAILSAFE} s failsafe")
     out, err = p.communicate()
     check(rc == 143 and fx.rc_file() is None,
           f"a signal during replay exits 143 and mirrors nothing: rc={rc} mirror={fx.rc_file()!r} "
@@ -1731,34 +1752,38 @@ def case_replay_signal(fx):
 
 
 def case_queued_age(fx):
+    # An age is the stated seconds plus the time this run has spent since `now` (and under a second the stamp drops): the
+    # upper bound of each is read from the run's own clock, so a slow machine moves it and a wrong age does not hide in it.
+    t0 = time.monotonic()
     now, sec = datetime.datetime.now(), datetime.timedelta(seconds=1)
     kst = datetime.timezone(datetime.timedelta(hours=9))
-    for raw, lo, hi in (((now - 100 * sec).isoformat(timespec="seconds"), 100, 104),
-                        ((now - 50 * sec).astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), 50, 54),
-                        ((datetime.datetime.now(kst) - 30 * sec).isoformat(), 30, 34)):
+    for raw, lo in (((now - 100 * sec).isoformat(timespec="seconds"), 100),
+                    ((now - 50 * sec).astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), 50),
+                    ((datetime.datetime.now(kst) - 30 * sec).isoformat(), 30)):
         age = submitted_age({"submitted": raw})
+        hi = lo + 2 + (time.monotonic() - t0)
         check(age is not None and lo <= age <= hi, f"the age of {raw} is about {lo} s: {age}")
     for raw in (None, 7, "not a time", (now + 60 * sec).isoformat()):
         check(submitted_age({"submitted": raw}) is None, f"{raw!r} is no usable submitted time")
     check(submitted_age({}) is None, "a job without submitted has no age")
+    t1 = time.monotonic()
     submitted = (datetime.datetime.now() - 100 * sec).isoformat(timespec="seconds")
     fx.serve([{"status": "queued", "wait_reason": "card-busy", "submitted": submitted},
               {"status": "running", "submitted": submitted}, {"status": "running", "submitted": submitted},
               {"status": "done", "rc": 0, "submitted": submitted}])
     rc, so, se = fx.client(*fx.run_args())
     m = re.search(rb"queued (\d+) s \(wait_reason", se)
-    check(rc == 0 and m and 100 <= int(m.group(1)) <= 120, f"the queued seconds come from `submitted`: {rc} {se!r}")
+    check(rc == 0 and m and 100 <= int(m.group(1)) <= 100 + 2 + (time.monotonic() - t1),
+          f"the queued seconds come from `submitted`: {rc} {se!r}")
 
 
 def case_load_ready(fx):
-    """Pids that appear after the idle 10 s, inside the load cap, still satisfy wait_pids.
+    """Pids that appear late still satisfy wait_pids, which returns as they appear.
 
-    Load 80 on 10 cpus makes the cap 80 s. The pids land at 15 s of a fake clock, so a constant
-    cap of 10 s fails this case and the scaled cap returns as soon as they appear."""
+    The pids land at 15 s of a fake clock, past what a quiet machine needs: a wait with a bound of 10 s (the idle cap it
+    once had) fails this case, and one with the failsafe's 120 s returns as soon as they appear."""
     path = os.path.join(fx.tmp, "late.pids")
     open(path, "w").close()
-    os.environ["BLOOMERY_SELFTEST_LOAD"] = "80"
-    os.environ["BLOOMERY_SELFTEST_NCPU"] = "10"
     now = [0.0]
     real_mono, real_sleep = time.monotonic, time.sleep
 
@@ -1773,14 +1798,12 @@ def case_load_ready(fx):
 
     time.monotonic, time.sleep = mono, sleep
     try:
-        fx.wait_pids(path, 2, secs=10)
+        fx.wait_pids(path, 2)
     finally:
         time.monotonic, time.sleep = real_mono, real_sleep
-        os.environ.pop("BLOOMERY_SELFTEST_LOAD", None)
-        os.environ.pop("BLOOMERY_SELFTEST_NCPU", None)
     check(fx.pids(path) == [11, 22], f"the late pids were recorded: {fx.pids(path)}")
     check(now[0] >= 15, f"the wait did not see the late pids: t={now[0]}")
-    check(now[0] < 20, f"the wait sat out the scaled cap: t={now[0]}")
+    check(now[0] < 20, f"the wait went on after the pids appeared: t={now[0]}")
 
 
 def case_cancelled_elsewhere(fx):
@@ -1926,7 +1949,7 @@ def case_attach_leave(fx):
     for sig, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
         fake = fx.serve([{"status": "running"}])
         p = fx.start("attach", "j1", "--leave", "--rc-dir", fx.rc_dir)
-        fx.wait_pids(fx.tail_pids, 2)
+        fx.wait_pids(fx.tail_pids, 2, p)
         p.send_signal(sig)
         got, so, se = fx.finish(p)
         check(got == want and fake.cancels() == [] and b"leaving the job as it is" in se,

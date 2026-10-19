@@ -165,8 +165,12 @@ watch() {
 # command's code; after a TERM before the quiet time no dump starts; a TERM before or after the watch
 # reads the command's PID ends it.
 # One line a case, a failed one with the last line of what it read; exit 0 iff none failed.
+# Every step the watch or a stub makes is waited on by its event (a pid file, a marker a stub writes, a line the watch prints,
+# an exit) and each such wait ends at a failsafe of 120 s that catches a hang: a wall band a run must fit in reads the
+# machine's load, not the watch. What time still decides is a floor a case holds a stub for, which load only lengthens, and
+# the stubs' own 20 to 30 s ends, which are hang guards sized for the case.
 self_test() {
-  local self t bad=0 out rc w k s left phase quiet ready before lk f sp ip watcher child
+  local self t bad=0 out rc w k left phase quiet ready before lk f sp ip watcher child reached awaited returned failsafe=1200
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   # shellcheck source=tools/ref/cancel-stubs.sh
   source "${self%/*}/cancel-stubs.sh"
@@ -189,42 +193,50 @@ self_test() {
   rc=0; bash "$self" 2 sleep -- sh -c 'echo start; exec sleep 30' > "$t/b" 2>&1 || rc=$?
   case_ 'a quiet command: its sleep dumped and ended, TERM' 143 'no output for 2 s: the stacks of [0-9]+ \(sleep\), then TERM' "$rc" "$t/b"
   case_ '  … its output before the stop kept' 143 '^start$' "$rc" "$t/b"
-  rc=0; bash "$self" 1 nosuchcomm -- sh -c 'sleep 3; echo late' > "$t/c" 2>&1 || rc=$?
+  # The command finishes once the watch has named the missing process: a command that ends on a clock of its own could end
+  # before a loaded watch looked.
+  bash "$self" 1 nosuchcomm -- sh -c 'while [ ! -e "$1" ]; do sleep 0.1; done; echo late' _ "$t/c.go" > "$t/c" 2>&1 &
+  w=$! k=0
+  until grep -q 'no process named nosuchcomm' "$t/c" || ! alive "$w" || [ "$k" = "$failsafe" ]; do sleep 0.1; k=$((k + 1)); done
+  : > "$t/c.go"
+  rc=0; wait "$w" || rc=$?
   case_ 'a quiet command with no process of that comm: named, left to finish' 0 'no process named nosuchcomm' "$rc" "$t/c"
   case_ '  … and its later output kept' 0 '^late$' "$rc" "$t/c"
   rc=0; bash "$self" x sleep -- true > "$t/d" 2>&1 || rc=$?
   case_ 'QUIET not a whole number: 64' 64 'usage' "$rc" "$t/d"
   # A TERM during a dump (a gdb that holds, and ends six seconds after its TERM) ends the dump and the command, and a second
   # TERM while the watch waits does not cut that wait short: the watch returns after both, with the command's code (7, two
-  # seconds after its TERM).
+  # seconds after its TERM). The stub gdb marks the TERM that reaches it, and the case reads the mark before the second TERM:
+  # a gdb the watch's TERM does not reach gets its TERM from the dump's own bound, at 120 s, and the case waits 110 s for the
+  # mark, so a mark read says the watch's TERM, not the bound, ended the dump.
   mkdir "$t/bin"
-  printf '%s\n' '#!/bin/sh' "[ -z \"\${SW_HOLD:-}\" ] || trap 'sleep 6; exit 0' TERM" 'echo $$ > "$SW_GDB"' \
+  printf '%s\n' '#!/bin/sh' "[ -z \"\${SW_HOLD:-}\" ] || trap ': > \"\$SW_GDB.term\"; sleep 6; exit 0' TERM" 'echo $$ > "$SW_GDB"' \
     '[ -n "${SW_HOLD:-}" ] || exit 0' 'while :; do sleep 1; done' > "$t/bin/gdb"
   printf '%s\n' 'echo $$ > "$SW_CMD"' "trap 'sleep 2; exit 7' TERM" 'sleep 30 &' 'wait' > "$t/cmd"
   chmod +x "$t/bin/gdb"
   command -v timeout > /dev/null || cp "${self%/*}/stub-timeout.py" "$t/bin/timeout"
   SW_HOLD=1 SW_GDB=$t/gdb.pid SW_CMD=$t/cmd.pid PATH=$t/bin:$PATH bash "$self" 1 sleep -- sh "$t/cmd" > "$t/e" 2>&1 &
   w=$! k=0
-  until [ -s "$t/gdb.pid" ] || [ "$k" = 50 ]; do sleep 0.2; k=$((k + 1)); done
-  s=$SECONDS
+  until [ -s "$t/gdb.pid" ] || ! alive "$w" || [ "$k" = "$failsafe" ]; do sleep 0.1; k=$((k + 1)); done
   kill -TERM "$w"
-  sleep 1.5
+  k=0
+  until [ -e "$t/gdb.pid.term" ] || ! alive "$w" || [ "$k" = $((failsafe - 100)) ]; do sleep 0.1; k=$((k + 1)); done
+  reached=no
+  [ ! -e "$t/gdb.pid.term" ] || reached=yes
   kill -TERM "$w"
   rc=0; wait "$w" || rc=$?
   left=
   alive "$(cat "$t/gdb.pid" 2> /dev/null)" && left="$left gdb"
   alive "$(cat "$t/cmd.pid")" && left="$left command"
-  echo "dumping: $([ -s "$t/gdb.pid" ] && echo yes || echo no), ended in $((SECONDS - s)) s, left:${left:- none}" >> "$t/e"
-  # PIN(2026-10-15): was [0-7] s: the stub gdb ends six seconds after its TERM, so the watch returns about 6 s after the TERM;
-  # a gdb the TERM does not reach holds until the dump's bound (a TERM at 120 s), far past 19 s.
-  case_ 'a TERM during the dump ends it and the command, their code kept' 7 'dumping: yes, ended in 1?[0-9] s, left: none$' "$rc" "$t/e"
+  echo "dumping: $([ -s "$t/gdb.pid" ] && echo yes || echo no), the TERM reached the dump: $reached, left:${left:- none}" >> "$t/e"
+  case_ 'a TERM during the dump ends it and the command, their code kept' 7 'dumping: yes, the TERM reached the dump: yes, left: none$' "$rc" "$t/e"
   # A TERM while the watch waits for the command, after it has ended the command's quiet process (the command goes on after
   # it), ends the command, and the watch returns after it, with its code.
   printf '%s\n' 'echo $$ > "$SW_CMD"' "trap 'sleep 2; exit 7' TERM" 'sleep 30 &' 'wait' 'echo > "$SW_AFTER"' \
     'while :; do sleep 1; done' > "$t/cmd2"
   SW_GDB=$t/gdb2.pid SW_CMD=$t/cmd2.pid SW_AFTER=$t/after PATH=$t/bin:$PATH bash "$self" 1 sleep -- sh "$t/cmd2" > "$t/f" 2>&1 &
   w=$! k=0
-  until [ -e "$t/after" ] || [ "$k" = 50 ]; do sleep 0.2; k=$((k + 1)); done
+  until [ -e "$t/after" ] || ! alive "$w" || [ "$k" = "$failsafe" ]; do sleep 0.1; k=$((k + 1)); done
   sleep 2
   kill -TERM "$w"
   rc=0; wait "$w" || rc=$?
@@ -232,26 +244,38 @@ self_test() {
   alive "$(cat "$t/cmd2.pid")" && left=' command'
   echo "quiet process ended: $([ -e "$t/after" ] && echo yes || echo no), left:${left:- none}" >> "$t/f"
   case_ 'a TERM during the last wait ends the command, its code kept' 7 'quiet process ended: yes, left: none$' "$rc" "$t/f"
-  # A TERM before the quiet time, to a command that prints every 0.2 s until its TERM and then takes five seconds to end (longer
-  # than the quiet time): the watch starts no dump after the TERM, and returns when the command ends, with its code. The printing,
-  # not the TERM's timing, keeps the quiet time from running out before the TERM.
-  # PIN(2026-10-18): the wall band is 4 to 9 s. The command's trap sleeps 5 s, so no load ends the watch before 5 s, and a watch that went on
-  # to the quiet path would end the trap's sleep early, under 4 s. The watch returns one 1 s poll after the command ends, 7 s at
-  # most unloaded; 8 s was read on a loaded Mac with the command's own 5 s unchanged, so the ceiling takes a 2 s margin. A late return
-  # past 9 s is the only mode it still tells apart (a dump is `dumped: yes`, an early return is under the floor).
-  printf '%s\n' "trap 'sleep 5; exit 7' TERM" 'echo $$ > "$SW_CMD"' 'while :; do echo tick; sleep 0.2; done' > "$t/cmd3"
-  SW_GDB=$t/gdb3.pid SW_CMD=$t/cmd3.pid PATH=$t/bin:$PATH bash "$self" 2 sleep -- sh "$t/cmd3" > "$t/g" 2>&1 &
+  # A TERM before the quiet time, to a command that prints every 0.2 s until its TERM and then holds, silent, in a sleep the case
+  # ends (longer than the quiet time): the watch starts no dump after the TERM, and returns when the command ends, with its
+  # code. The printing, not the TERM's timing, keeps the quiet time from running out before the TERM. The case holds the
+  # command four seconds after its TERM reached it: a watch that went on to the quiet path dumps within three (two seconds of
+  # silence and a poll) and would end the hold's sleep, and one that returned early is gone before the release; load only
+  # lengthens either. The release comes from the case (it ends the hold's sleep), so no clock decides how long the command
+  # takes, and the failsafe polls catch a watch that never returns.
+  printf '%s\n' "trap 'sleep 120 & echo \$! > \"\$SW_HOLDPID\"; wait \$!; : > \"\$SW_ENDED\"; exit 7' TERM" \
+    'echo $$ > "$SW_CMD"' 'while :; do echo tick; sleep 0.2; done' > "$t/cmd3"
+  SW_GDB=$t/gdb3.pid SW_CMD=$t/cmd3.pid SW_HOLDPID=$t/hold.pid SW_ENDED=$t/ended PATH=$t/bin:$PATH \
+    bash "$self" 2 sleep -- sh "$t/cmd3" > "$t/g" 2>&1 &
   w=$! k=0
-  until [ -s "$t/cmd3.pid" ] || [ "$k" = 50 ]; do sleep 0.2; k=$((k + 1)); done
-  sleep 1
-  s=$SECONDS
+  until { [ -s "$t/cmd3.pid" ] && grep -q '^tick$' "$t/g"; } || ! alive "$w" || [ "$k" = "$failsafe" ]; do sleep 0.1; k=$((k + 1)); done
   kill -TERM "$w"
+  k=0
+  until [ -s "$t/hold.pid" ] || ! alive "$w" || [ "$k" = "$failsafe" ]; do sleep 0.1; k=$((k + 1)); done
+  sleep 4
+  awaited=no
+  ! alive "$w" || awaited=yes
+  # shellcheck disable=SC2046 # one pid, or none when the command never held
+  kill $(cat "$t/hold.pid" 2> /dev/null) 2> /dev/null || :
+  # A watch that does not return once the command has ended is a red by name at the failsafe, not a hang of the test.
+  k=0
+  until ! alive "$w" || [ "$k" = "$failsafe" ]; do sleep 0.1; k=$((k + 1)); done
+  returned=yes
+  alive "$w" && { returned=no; kill -KILL "$w" 2> /dev/null; }
   rc=0; wait "$w" || rc=$?
   left=
   alive "$(cat "$t/cmd3.pid")" && left=' command'
-  echo "dumped: $([ -e "$t/gdb3.pid" ] && echo yes || echo no), ended in $((SECONDS - s)) s, left:${left:- none}" >> "$t/g"
+  echo "dumped: $([ -e "$t/gdb3.pid" ] && echo yes || echo no), awaited: $awaited, command ended: $([ -e "$t/ended" ] && echo yes || echo no), returned: $returned, left:${left:- none}" >> "$t/g"
   case_ 'a TERM before the quiet time: no dump after it, the command awaited, its code kept' 7 \
-    'dumped: no, ended in [4-9] s, left: none$' "$rc" "$t/g"
+    'dumped: no, awaited: yes, command ended: yes, returned: yes, left: none$' "$rc" "$t/g"
   # The startup copy holds the PID-assignment window open until TERM has been sent.
   mkdir -p "$t/startup/ref" || return 70
   cp "${self%/*}/../gate-bound.sh" "$t/startup/gate-bound.sh" || return 70
@@ -274,11 +298,12 @@ self_test() {
     SW_CMD=$t/$phase.pid SW_CHILD=$t/$phase.child START_READY=$t/gap START_RELEASE=$t/go \
       bash "$watcher" 30 sleep -- sh "$t/cmd4" > "$t/h-$phase" 2>&1 &
     w=$! k=0 ready=no
-    until [ "$k" = 100 ]; do
+    until [ "$k" = "$failsafe" ]; do
       if cancel_ready "$t/$phase.pid" && [ -s "$t/$phase.child" ] && { [ "$phase" != startup ] || [ -s "$t/gap" ]; }; then
         ready=yes
         break
       fi
+      alive "$w" || break
       sleep 0.1
       k=$((k + 1))
     done
@@ -323,11 +348,12 @@ self_test() {
       bash -c 'exec 9> "$1" && flock -n 9 && exec bash "$2" "$3" sleep -- timeout --kill-after=10 30 "$4" "$5"' \
       _ "$t/fork-$phase.lock" "$self" "$quiet" "$t/fork-held" "$t/fork-$phase.cmd" > "$t/fork-$phase.log" 2>&1 &
     w=$! k=0 ready=no
-    until [ "$k" = 100 ]; do
+    until [ "$k" = "$failsafe" ]; do
       if cancel_ready "$t/fork-$phase.cmd" && { [ "$phase" != dump ] || cancel_ready "$t/fork-$phase.gdb"; }; then
         ready=yes
         break
       fi
+      alive "$w" || break
       sleep 0.1
       k=$((k + 1))
     done

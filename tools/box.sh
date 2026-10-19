@@ -388,13 +388,17 @@ default_lane() {
 # self_test [SCRIPT]: the hold's rules (the header) on a copy of SCRIPT (default: this file) in a scratch tree, under a fake HOME,
 # with ssh and rsync stubs ahead on PATH that record their arguments and reach nothing: a call the hold refuses leaves both logs empty.
 self_test() {
-  local script=${1:-$0} d t box hd fails=0 rc=0 out= n=0 lrc=0 lpid i
+  local script=${1:-$0} d t box bound bx= hd fails=0 rc=0 out= n=0 lrc=0 lpid stop
   [ -f "$script" ] || { echo "box.sh: --self-test: '$script' is no file" >&2; return 64; }
   d=$(mktemp -d "$(dirname "${TMPDIR:-/tmp}/x")/box-selftest.XXXXXX")
-  box=$d/tree/tools/box.sh hd=$d/home/.cache/bloomery/box-hold
+  box=$d/tree/tools/box.sh bound=$d/tree/tools/box-bound.sh hd=$d/home/.cache/bloomery/box-hold
   mkdir -p "$d/tree/tools" "$d/stub" "$d/home"
-  # The script under test, with the drop wait and the sync wait shrunk (the constants' lines at the top; the wait case below reads 2 s).
-  sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=2 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$script" > "$box"
+  # The script under test, with the drop wait and the sync poll shrunk (the constants' lines at the top). Its sync wait stays the real 120 s:
+  # the sync cases answer their probes from a script and end on the probe that settles them, so that bound is only a failsafe, and a bound
+  # the scripted answers must fit in reads the machine's load (each probe is a handful of forks). The one case that needs the bound to end
+  # the wait, a lock held with no tree id for good, runs the second copy, whose sync wait is 2 s and whose verdict is the bound's whatever the load.
+  sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$script" > "$box"
+  sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=2 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$script" > "$bound"
   printf '%s\n' 'cuda-device = { git = "x", rev = "0123456789ab" }' > "$d/tree/Cargo.toml"
   # The scratch tree is a git repo with a committed HEAD (the real case): the version commit reads here, and the corrupt-index
   # case at the end has a HEAD whose dirt would otherwise read clean. Identity and hooks are pinned so the commit asks for neither.
@@ -410,9 +414,10 @@ self_test() {
     chmod +x "$d/stub/$t"
   done
   # The ssh stub also writes what BLOOMERY_BOX_PIDDIR holds while the call runs, and its parent (the box.sh that runs it), into pid.log;
-  # STUB_SLEEP=<s> holds it there, its own pid in ssh.pid, for the TERM case.
+  # STUB_HOLD=1 holds it there, its own pid in ssh.pid, until the file release exists, for the TERM case (box.sh takes a TERM it receives
+  # while a command runs once that command ends: the test sends it, then lets the stub go); the 120 s is only the failsafe that frees a stub nobody released.
   printf '[ -z "${BLOOMERY_BOX_PIDDIR:-}" ] || echo "$PPID $(ls "$BLOOMERY_BOX_PIDDIR" 2> /dev/null | tr "\\n" " ")" >> "%s/pid.log"\n' "$d" >> "$d/stub/ssh"
-  printf '[ -z "${STUB_SLEEP:-}" ] || { echo $$ > "%s/ssh.pid"; sleep "$STUB_SLEEP"; }\n' "$d" >> "$d/stub/ssh"
+  printf '[ -z "${STUB_HOLD:-}" ] || { echo $$ > "%s/ssh.pid"; w=0; until [ -e "%s/release" ] || [ "$w" -ge 1200 ]; do w=$((w + 1)); sleep 0.1; done; }\n' "$d" "$d" >> "$d/stub/ssh"
   # Scripted answers (sc below): an rsync call takes its rc from rsync.script; an ssh call is a probe of the dir lock (answers
   # `rc lock [id]`, from probe.script: lock=<lock's rc> and the remote .sync-id), a read of the remote .sync-id (`rc [id]`, read.script) or any other
   # (an rc, ssh.script). The first line of a script is taken by a call unless it is the last, which repeats; no script: rc 0, no output.
@@ -452,7 +457,7 @@ STUB
     return 70
   fi
   fail() { echo "box.sh: self-test: $*" >&2; fails=$((fails + 1)); }
-  # call [VAR=value…] -- ARGS…: the scratch box.sh with ARGS, in an environment of PATH, HOME, TZ and the VARs only; rc and out are its result.
+  # call [VAR=value…] -- ARGS…: the scratch box.sh (the copy bx names, when set) with ARGS, in an environment of PATH, HOME, TZ and the VARs only; rc and out are its result.
   call() {
     local envs=()
     while [ "$1" != -- ]; do envs+=("$1"); shift; done
@@ -461,7 +466,7 @@ STUB
     : > "$d/rsync.log"
     : > "$d/boxq.log"
     rc=0
-    out=$(env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' ${envs[@]+"${envs[@]}"} bash "$box" "$@" 2>&1 < /dev/null) || rc=$?
+    out=$(env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' ${envs[@]+"${envs[@]}"} bash "${bx:-$box}" "$@" 2>&1 < /dev/null) || rc=$?
     rm -f "$d"/*.script "$d"/*.script.n "$d/boxq.rc"
   }
   # sc KIND LINE…: the stubs' script of KIND (rsync, probe, read, ssh) for the next call, one answer line per call of that kind.
@@ -473,6 +478,19 @@ STUB
   hasnt() { case $out in *"$1"*) fail "$2: '$1' in: $out" ;; esac; }
   untouched() { { [ ! -s "$d/ssh.log" ] && [ ! -s "$d/rsync.log" ]; } || fail "$1: ssh or rsync was reached: $(cat "$d/ssh.log" "$d/rsync.log" | head -c 160)"; }
   reached() { grep -q -- 'echo hi' "$d/ssh.log" || fail "$1: the command never reached ssh"; }
+  # wait_for WHAT CMD…: until CMD succeeds. Every wait below is for an event (a file, a line, a process's end); the 1200 passes of 0.1 s are only
+  # the failsafe that catches a hang, never a bound a run must fit in: under load the subject is late, and a bound would read the load as its verdict.
+  wait_for() {
+    local what=$1 w=0
+    shift
+    until "$@"; do
+      w=$((w + 1))
+      [ "$w" -lt 1200 ] || { fail "$what: not within the 120 s failsafe"; return 1; }
+      sleep 0.1
+    done
+  }
+  non_empty() { [ -s "$1" ]; }
+  loop_began() { grep -q 'echo hi' "$d/ssh.log" || [ -s "$d/loop" ]; }
 
   call -- 'echo hi'
   want 0 'no hold directory'; reached 'no hold directory'
@@ -545,10 +563,13 @@ STUB
   rm "$hd/.DS_Store"
   # a caller that loops on its command: the call after the hold goes up is the first one refused, and nothing runs after it
   : > "$d/ssh.log"
+  rm -f "$d/loop"
+  stop=$((SECONDS + 120))
   (
     n=0
     lrc=0
-    while [ "$n" -lt 15 ]; do
+    # runs until a call is refused; the clock is only the failsafe that ends a caller nothing refused
+    while [ "$SECONDS" -lt "$stop" ]; do
       env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' bash "$box" 'echo hi' > /dev/null 2>&1 || { lrc=$?; break; }
       n=$((n + 1))
       sleep 0.2
@@ -556,12 +577,7 @@ STUB
     echo "$lrc $n" > "$d/loop"
   ) &
   lpid=$!
-  i=0
-  until grep -q 'echo hi' "$d/ssh.log"; do
-    i=$((i + 1))
-    [ "$i" -lt 100 ] || break
-    sleep 0.1
-  done
+  wait_for 'a looping caller: its first call never reached ssh' loop_began || true
   printf '%s\n' 'loop' > "$hd/aa"
   wait "$lpid" || true
   read -r lrc n < "$d/loop" || { lrc=?; n=?; }
@@ -652,7 +668,9 @@ STUB
   [ "$(grep -c '' "$d/rsync.log")" = 2 ] || fail 'queue: another call'"'"'s sync ended with another tree: this call did not sync'
   sc rsync 12
   sc probe '0 1'
+  bx=$bound
   call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  bx=
   want 83 'queue: a lock held with no tree id for good'; has 'has had no tree id for 2 s' 'queue: a lock held with no tree id for good'
   # after the submit nothing is retried here: the queue client's own rc passes
   printf '%s\n' 255 > "$d/boxq.rc"
@@ -661,7 +679,7 @@ STUB
   [ "$(grep -c '' "$d/boxq.log")" = 1 ] || fail "queue: the queue client ran $(grep -c '' "$d/boxq.log") times, not once"
   # BLOOMERY_BOX_PIDDIR (tools/gate-batch.sh's reap): a call files its own pid there while it runs and removes it on exit, TERM included;
   # queue mode files nothing (it execs this shell away), and unset, nothing is filed anywhere.
-  local pd=$d/pids line bpid spid
+  local pd=$d/pids line bpid
   : > "$d/pid.log"
   call BLOOMERY_BOX_PIDDIR="$pd" -- 'echo hi'
   want 0 'a registered call'; reached 'a registered call'
@@ -672,21 +690,16 @@ STUB
   rm -rf "$pd"
   call BLOOMERY_BOX_PIDDIR="$pd" BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
   [ ! -e "$pd" ] || fail "a queued call filed a pid: $(ls "$pd")"
-  rm -f "$d/ssh.pid"
-  env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' BLOOMERY_BOX_PIDDIR="$pd" STUB_SLEEP=30 \
+  rm -f "$d/ssh.pid" "$d/release"
+  env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' BLOOMERY_BOX_PIDDIR="$pd" STUB_HOLD=1 \
     bash "$box" 'echo hi' > /dev/null 2>&1 &
   bpid=$!
-  i=0
-  until [ -s "$d/ssh.pid" ]; do
-    i=$((i + 1))
-    [ "$i" -lt 100 ] || break
-    sleep 0.1
-  done
+  wait_for 'a running call: the ssh stub never held it' non_empty "$d/ssh.pid" || true
   [ -e "$pd/$bpid" ] || fail "a running call: no pid file $pd/$bpid (the directory holds '$(ls "$pd" 2> /dev/null)')"
   kill -TERM "$bpid" 2> /dev/null || true
+  : > "$d/release"
   wait "$bpid" 2> /dev/null || true
   [ ! -e "$pd/$bpid" ] || fail "a call ended by TERM left its pid file $pd/$bpid"
-  spid=$(cat "$d/ssh.pid" 2> /dev/null) && kill "$spid" 2> /dev/null || true
   # Execute the actual remote command under a fake environment: query failures must stop
   # both A6000 selections before the command's side effect, even when a Bloomery lock is held.
   mkdir -p "$d/tree/tools/ref/models"
