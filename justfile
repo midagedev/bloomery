@@ -1723,14 +1723,16 @@ gate: \
     gate-sampler \
     gate-levers
 
-# `just gate`'s static checks (Mac, text only): every tools/check-*.sh one after another, but the ones --skip names, the first red
-# ending the run. The list is the files, so a new check script joins `just gate` by existing, with no line to add its name to
+# `just gate`'s static checks (Mac, text only): every tools/check-*.sh but the ones --skip names, in parallel (at most one a cpu),
+# each one's output in its own log, one line a check and every red check's log whole; the exit is the first red check's. The list is
+# the files, so a new check script joins `just gate` and `just smoke` by existing, with no line to add its name to
 # (tools/mac-static.sh --checks has the derivation and the arguments each check takes). emb2, oracle-tree and records have no
 # check-* recipe and `just gate` does not run them; delete a --skip to add one.
 check-scripts:
     bash tools/mac-static.sh --checks --skip emb2 --skip oracle-tree --skip records
 
-# The smoke tier (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
+# The smoke tier (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/gates-plan.md 3.1): the static checks (check-scripts, check,
+# fmt-check, lint), the V4.1 decode step, the V4.1 prompt batch at
 # P = 512 alone, V2-Lite end to end — a subset run of unchanged gates, never the landing batch. Two lanes
 # through tools/gate-batch.sh (its header: the list, lanes, logs, DONE line); ARGS go to it (--dry-run, --out DIR,
 # --lanes 1). It refuses to start while the timing lease is held.

@@ -437,8 +437,10 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 JUST=(just --justfile "$ROOT/justfile" --working-directory "$ROOT")
 
+# The static items are the justfile's `check-scripts` (every tools/check-*.sh but its --skips: the one static set) and the three
+# that are no check script; `just smoke` and the justfile's text for it name the same four.
 SMOKE=(
-  check-recipes check-rustflags check-comments check-levers check-arch check fmt-check lint gate-ptx-spill
+  check-scripts check fmt-check lint gate-ptx-spill
   gate-gpu-ds41-step
   "gate-gpu-ds41-prefill:--cases 512 --no-split --no-extra"
   gate-gpu-e2e
@@ -1023,6 +1025,20 @@ DF
   grep -q '^DIRLOCK_WAIT=30 ' "$t/tools/gate-batch-fast-dl.sh" || { echo "gate-batch: self-test: the long dir-lock copy did not patch (DIRLOCK_WAIT's line moved?)" >&2; return 70; }
   export BLOOMERY_GATE_TIMES=$t/times.tsv
   if gb_part 1; then
+  # --smoke's static items are the justfile's one static set (check-scripts: every tools/check-*.sh) and the three that are no check
+  # script (check, fmt-check, lint). A check-* recipe named by hand beside it is a second list of the scripts, which drifts from them.
+  local item hand=''
+  for item in "${SMOKE[@]}"; do
+    case ${item%%:*} in check-scripts) ;; check-*) hand="$hand ${item%%:*}" ;; esac
+  done
+  if [ -n "$hand" ]; then fail 'smoke: no check-* recipe is named by hand' "SMOKE names$hand beside check-scripts"
+  else pass 'smoke: no check-* recipe is named by hand'; fi
+  for item in check-scripts check fmt-check lint; do
+    case " ${SMOKE[*]} " in
+      *" $item "*) pass "smoke: the static item $item is in the list" ;;
+      *) fail "smoke: the static item $item is in the list" "SMOKE lacks it" ;;
+    esac
+  done
   check 'classes: an any-form v41-load recipe is a chain member over both cards' 0 \
     "^v41-any	C	chain	3090,a6000	v41-any: \[group\('v41-load'\)\]" "${gb[@]}" --classes
   check 'classes: an any-form recipe outside the group stays balanced' 0 '^plain-any	F	balanced	3090,a6000	' "${gb[@]}" --classes
