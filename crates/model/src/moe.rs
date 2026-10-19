@@ -922,6 +922,11 @@ impl HostScratch {
         (self.embd, self.ff) == (embd, ff)
     }
 
+    /// The feed-forward width the blocks were made for.
+    pub fn ff(&self) -> usize {
+        self.ff
+    }
+
     /// The most experts one call through this scratch takes.
     pub fn n_used(&self) -> usize {
         self.n_used
@@ -2551,6 +2556,9 @@ pub struct HostLayer {
     up: GateUp,
     down: ShardTensor,
     n_expert: usize,
+    /// This layer's own feed-forward width: the scratch its calls write is
+    /// made for it ([`HostScratch::new`]).
+    ff: usize,
     form: ExpertForm,
     tier: Option<LayerTier>,
 }
@@ -2667,6 +2675,7 @@ impl HostLayer {
             up,
             down: down_stack,
             n_expert,
+            ff,
             form,
             tier: None,
         })
@@ -2782,6 +2791,11 @@ impl HostLayer {
         self.n_expert
     }
 
+    /// This layer's routed experts' feed-forward width.
+    pub fn ff(&self) -> usize {
+        self.ff
+    }
+
     /// The routed experts' SwiGLU limit, a gated layer's; `0.0` for a relu²
     /// layer, which clamps nothing.
     pub fn swiglu_limit(&self) -> f32 {
@@ -2862,6 +2876,15 @@ impl HostLayer {
         self.read_beside(src)?;
         let split = src.split();
         check_host_call(x, experts, out, scratch.n_used)?;
+        if !scratch.fits(x.ne0, self.ff) {
+            return Err(ModelError::Shape {
+                what: "host experts: the scratch must be made for the layer's widths",
+                want_ne0: x.ne0,
+                want_ne1: self.ff,
+                got_ne0: scratch.embd,
+                got_ne1: scratch.ff,
+            });
+        }
         self.refuse_relu2_tier()?;
         if self.tier.is_some()
             && let Some(union) = union
