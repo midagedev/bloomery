@@ -85,6 +85,14 @@
 //!   row; the scan state, the conv ring and the K/V rows carry across
 //!   passes in memory). The sizes are the load's own choice
 //!   (`NemotronHMoeModel::pass_rows`), whatever the card's room gave it.
+//! - `watchdog_progress` (self-consistency): the walk's ids as one
+//!   `GpuModel::step` call under the prompt call's busy mark
+//!   (`GpuModel::prompt_busy`) move the engine watchdog's progress word
+//!   (`GpuModel::engine_progress`) at least once a token. The mark's holder is
+//!   the caller, so the call adds none of its own and the word moves by the
+//!   tokens' passes alone; without the pass-done call of `GpuModel::step`'s
+//!   token loop it does not move, and the watchdog would name a long prompt
+//!   run as steps wedged.
 //!
 //! - `host_tier_near_whole_card` (self-consistency, after the clauses above,
 //!   on loads of its own once the whole-card model is released): the routed
@@ -117,7 +125,10 @@
 //!   also keeps the floor and the argmax band against the arm's own decode
 //!   steps; the continuation does not run against the steps, because the
 //!   batch and the steps sum in another order and the fixture's near-tied
-//!   routers turn that into a different expert past the first position.
+//!   routers turn that into a different expert past the first position. A
+//!   launch of the whole-card load's walks or batches, or of an arm's, that
+//!   raises the fault word fails the clause, the whole-card load's too: the
+//!   arms are then held against nothing, and the clause is red, not skipped.
 //!
 //! A set absent from the box, dumped from another fixture or build, or
 //! unfinished ends the gate by name before the card loads.
@@ -151,6 +162,7 @@ mod gate {
     };
     use crate::gate_card;
     use bloomery_gpu::arch::nemotron_h_moe::Routing;
+    use bloomery_gpu::host::served::TierBody;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Gpu, NemotronHMoeModel};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -284,6 +296,7 @@ mod gate {
             Tag::SelfConsistency,
             prefill_pass_size_invariant,
         ),
+        ("watchdog_progress", Tag::SelfConsistency, watchdog_progress),
         ("fault_word_clean", Tag::SelfConsistency, fault_word_clean),
     ];
 
@@ -1171,6 +1184,8 @@ mod gate {
         ctx: usize,
     }
 
+    /// The whole-card load's walk and batches, or `None` after a line naming
+    /// the fault a launch raised.
     fn whole_card_run(m: &mut Model, case: &Case) -> Result<Option<Whole>, GateError> {
         m.set_mode(StepMode::Graph);
         let Some(run) = fresh(
@@ -1328,8 +1343,10 @@ mod gate {
                 && near
                 && batch
                 && (arm.name != "card" || hosted.is_empty());
+            let resident = m.resident_bytes();
             println!(
-                "{CLAUSE}: arm {}: graph_nodes={nodes} handoff_9={handoff}/{} card_acc_9={acc}/{} \
+                "{CLAUSE}: arm {}: graph_nodes={nodes} resident_bytes={resident} (runtime value) \
+                 handoff_9={handoff}/{} card_acc_9={acc}/{} \
                  weighted_sum={wsum}/{moe_whole}; eager == replay {} finite {} fault clean {clean}; \
                  last id {got_ids} vs whole-card {want_ids}, cosine {cos:.6}, max|Δ| {dmax:.3e}, \
                  whole-card top-1 margin {margin:.3e} (inside the band {in_band}) {}",
@@ -1493,6 +1510,35 @@ mod gate {
         Ok(pass)
     }
 
+    // --------------------------------------------------- watchdog_progress
+
+    /// The walk's ids as one `GpuModel::step` call under the prompt call's
+    /// busy mark (a prompt run as steps) move the engine watchdog's progress
+    /// word at least once a token, so a long prompt run that way is not read
+    /// as wedged. The mark's holder is the caller, so the step call adds no
+    /// mark of its own and the word moves by the tokens' passes alone.
+    fn watchdog_progress(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        const CLAUSE: &str = "watchdog_progress";
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let Some(_busy) = m.prompt_busy() else {
+            return Err("the busy mark is held by a call of the model".into());
+        };
+        let before = m.engine_progress();
+        if or_fault(CLAUSE, "the walk as steps", m.step(&case.walk))?.is_none() {
+            return Ok(false);
+        }
+        let moved = m.engine_progress() - before;
+        let pass = moved >= case.walk.len() as u64;
+        println!(
+            "{CLAUSE}: {} ids as one step call under the prompt busy mark moved the progress \
+             word {moved} times, at least one a token {}",
+            case.walk.len(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     fn fault_word_clean(m: &mut Model, _case: &Case) -> Result<bool, GateError> {
         let fault = m.gpu().fault()?;
         let pass = fault.is_none() && m.poisoned().is_none();
@@ -1577,15 +1623,21 @@ mod gate {
             ok &= pass;
         }
         // The host-tier arms open loads of their own beside nothing: the
-        // whole-card model is released first, its walk kept.
-        let held = if tier::run_clause(HOST_CLAUSE, Tag::SelfConsistency)? {
+        // whole-card model is released first, its walk kept. A walk that
+        // raised the fault word leaves the arms nothing to be held against,
+        // and the clause fails.
+        let host_clause = tier::run_clause(HOST_CLAUSE, Tag::SelfConsistency)?;
+        let held = if host_clause {
             whole_card_run(&mut m, &case)?
         } else {
             None
         };
         drop(m);
-        if let Some(whole) = held {
-            let pass = host_tier_near_whole_card(&case, &whole)?;
+        if host_clause {
+            let pass = match &held {
+                Some(whole) => host_tier_near_whole_card(&case, whole)?,
+                None => false,
+            };
             if !pass {
                 println!("clause {HOST_CLAUSE} FAIL");
             }
