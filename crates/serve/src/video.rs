@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use vision::media::{MediaModel, Piece};
-use vision::video::{ClipMeta, ClipPlan};
+use vision::video::{ClipMeta, ClipPlan, VideoRule};
 use vision::{Prepared, Rgb8, VisionError};
 
 use crate::media::{ImageKey, MediaError};
@@ -79,6 +79,20 @@ pub struct Clip {
 
 struct TempFile(PathBuf);
 
+/// A new file at `path` that only this user reads: made exclusively (a path that exists, a symlink
+/// among them, is refused, never followed or truncated) and, on Unix, with mode 0600 whatever the
+/// umask says. The clip and ffmpeg's log are made here, in a directory other users share.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 impl Drop for TempFile {
     fn drop(&mut self) {
         // A file that is already gone is the state wanted.
@@ -126,11 +140,8 @@ impl Clip {
                     self.suffix
                 );
                 let path = std::env::temp_dir().join(name);
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                let mut file =
+                    create_private(&path).map_err(|e| format!("{}: {e}", path.display()))?;
                 let guard = TempFile(path);
                 std::io::Write::write_all(&mut file, &self.bytes)
                     .map_err(|e| format!("{}: {e}", guard.0.display()))?;
@@ -471,8 +482,11 @@ impl Decoder for FfmpegDecoder {
         if threads > 0 {
             cmd.arg("-threads").arg(threads.to_string());
         }
+        // ffprobe measured `v:0`; without the map ffmpeg picks the largest video stream, which may
+        // be another one and has other frame sizes.
         cmd.arg("-i")
             .arg(clip.path()?)
+            .args(["-map", "0:v:0"])
             .arg("-vf")
             .arg(select_filter(indices))
             .args(["-fps_mode", "passthrough", "-frames:v"])
@@ -482,9 +496,10 @@ impl Decoder for FfmpegDecoder {
             .stdout(Stdio::piped());
         // ffmpeg's messages go to a file beside the clip's: a pipe nobody reads while stdout is
         // being read would stall the decoder once it held more than a pipe does.
-        let log = TempFile(clip.path()?.with_extension("log"));
-        let file = std::fs::File::create(&log.0)
-            .map_err(|e| VideoError::Temp(format!("{}: {e}", log.0.display())))?;
+        let log_path = clip.path()?.with_extension("log");
+        let file = create_private(&log_path)
+            .map_err(|e| VideoError::Temp(format!("{}: {e}", log_path.display())))?;
+        let log = TempFile(log_path);
         cmd.stderr(Stdio::from(file));
         let mut child = cmd.spawn().map_err(|e| VideoError::Decode(e.to_string()))?;
         let got = read_frames(&mut child, meta, indices, each);
@@ -642,9 +657,7 @@ pub fn plan_clip(
 ) -> Result<PlannedClip, MediaError> {
     let rule = model.video_rule().ok_or(MediaError::NoVideoRule)?;
     let meta = decoder.probe(&clip)?;
-    let plan =
-        vision::video::plan(rule, &meta, budget, model.video_sizer()).map_err(MediaError::Video)?;
-    let pieces = model.video_text(&plan).map_err(MediaError::Video)?;
+    let (plan, pieces) = plan_under(model, rule, &meta, budget).map_err(MediaError::Video)?;
     Ok(PlannedClip {
         clip,
         meta,
@@ -653,6 +666,70 @@ pub fn plan_clip(
         decoder,
         threads,
     })
+}
+
+/// The plan of a probed clip under `budget` positions and the text the model writes for it.
+fn plan_under(
+    model: &dyn MediaModel,
+    rule: &VideoRule,
+    meta: &ClipMeta,
+    budget: usize,
+) -> Result<(ClipPlan, Vec<Piece>), VisionError> {
+    let plan = vision::video::plan(rule, meta, budget, model.video_sizer())?;
+    let pieces = model.video_text(&plan)?;
+    Ok((plan, pieces))
+}
+
+/// [`plan_clip`] for an input that spends more on the clip than the plan's tokens: `spent` is what
+/// a plan takes of the input, its text and delimiters with its tokens, and the plan returned, with
+/// its `spent`, is the largest the planner makes that takes at most `room`. The clip is probed
+/// once. If the plan under `room` spends more, the caps below it are searched for the largest plan
+/// that does not (a plan grows with its cap): the interval of caps halves each round, so the search
+/// ends, and the plan is returned only after `spent` has read it. A clip whose least plan spends
+/// more than `room` is refused by name.
+pub fn plan_clip_within(
+    model: &dyn MediaModel,
+    decoder: Arc<dyn Decoder>,
+    clip: Clip,
+    room: usize,
+    threads: usize,
+    spent: impl Fn(&PlannedClip) -> usize,
+) -> Result<(PlannedClip, usize), MediaError> {
+    let mut planned = plan_clip(model, decoder, clip, room, threads)?;
+    let cost = spent(&planned);
+    if cost <= room {
+        return Ok((planned, cost));
+    }
+    let rule = model.video_rule().ok_or(MediaError::NoVideoRule)?;
+    // At cap `fits` the planner refuses or its plan spends at most `room`; at `over` its plan
+    // spends `least`, more. A cap of 0 is refused, and `room` is over.
+    let (mut fits, mut over, mut least) = (0, room, cost);
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        match plan_under(model, rule, &planned.meta, mid) {
+            Ok((plan, pieces)) => {
+                (planned.plan, planned.pieces) = (plan, pieces);
+                let cost = spent(&planned);
+                if cost > room {
+                    (over, least) = (mid, cost);
+                } else {
+                    fits = mid;
+                }
+            }
+            Err(_) => fits = mid,
+        }
+    }
+    if let Ok((plan, pieces)) = plan_under(model, rule, &planned.meta, fits) {
+        (planned.plan, planned.pieces) = (plan, pieces);
+        let cost = spent(&planned);
+        if cost <= room {
+            return Ok((planned, cost));
+        }
+    }
+    Err(MediaError::Video(VisionError::Video(format!(
+        "the clip's least plan takes {least} positions with its text and delimiters; the input \
+         leaves {room}"
+    ))))
 }
 
 impl PlannedClip {
@@ -679,6 +756,20 @@ impl PlannedClip {
     #[must_use]
     pub fn frames(&self) -> usize {
         self.plan.indices.len()
+    }
+
+    /// The positions the clip takes in an assembled input, counted over [`PlannedClip::pieces`] as
+    /// the assembly walks them: a text piece the `text` positions it tokenizes to, a group its
+    /// tokens and `around` positions of delimiters.
+    #[must_use]
+    pub fn positions(&self, text: impl Fn(&str) -> usize, around: usize) -> usize {
+        self.pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Text(t) => text(t),
+                Piece::Group(n) => around + self.plan.groups[*n].tokens,
+            })
+            .sum()
     }
 
     /// Decode the planned frames and prepare each group as its frames arrive, so the request thread
@@ -972,6 +1063,27 @@ mod tests {
         assert!(matches!(r, Err(ReadError::Short(2))));
         let r = frames_from(&mut &stream[..14], &meta, &[4, 6, 7], &mut |_, _| true);
         assert!(matches!(r, Err(ReadError::Size { got: 2, frame: 6 })));
+    }
+
+    /// The clip's temp file and ffmpeg's log are made private and exclusive: mode 0600 whatever the
+    /// umask says, and a path that exists, a symlink among them, is refused, neither followed nor
+    /// truncated.
+    #[cfg(unix)]
+    #[test]
+    fn temp_files_are_private_and_exclusive() {
+        use std::os::unix::fs::PermissionsExt;
+        let clip = Clip::new(b"abc".to_vec(), None);
+        let path = clip.path().unwrap().to_path_buf();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let link = path.with_extension("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        for taken in [&path, &link] {
+            let e = create_private(taken).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{taken:?}");
+        }
+        std::fs::remove_file(&link).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
     }
 
     /// A clip's temp file holds its bytes, suffixes by its container name when that is a short

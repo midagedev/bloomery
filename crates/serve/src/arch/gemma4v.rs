@@ -286,3 +286,62 @@ fn a_clip_in_an_embedding_input_is_planned_decoded_and_delimited() {
     };
     assert!(over.message.starts_with("video: "), "{}", over.message);
 }
+
+/// A clip is planned under what the assembled input charges it: BOS and EOS around the input, its
+/// `Video:` text once, and a delimiter pair and the tokens of each group. Six 64×64 groups take 81
+/// positions each and are charged 590 [derived: 2 + 6 + 6 × (16 + 81)], so at a context of 550 the
+/// clip is five groups, not six refused by the assembly. At each group count's charge the input
+/// assembles within the context with that many groups, and one position less it has one group
+/// fewer; under one group's charge the clip is refused by name.
+#[test]
+fn a_clips_markup_is_charged_to_its_budget() {
+    use crate::video::MockClips;
+    let rule = vision::size::SizeRule::new(16, 3, vision::arch::TokenLimits::new(1, 280).unwrap())
+        .unwrap();
+    let model = Arc::new(vision::arch::gemma4v::Media::new(rule));
+    let mock = MockClips::new();
+    let clip = json!({"type": "input_video", "input_video": {
+        "data": media::encode_base64(b"6 1/1 64x64"), "format": "mp4"
+    }});
+    let side_at = |ctx: usize| {
+        let mut side = Side::new(Box::new(MockEmbed::new(ctx)));
+        side.media = Some(Arc::clone(&model) as media::SharedMediaModel);
+        side
+    };
+    let tok = side_at(0).tok;
+    let frame = vision::Rgb8::filled(64, 64, [1, 2, 3]);
+    let tokens = vision::MediaModel::prepare_video(&*model, std::slice::from_ref(&frame)).unwrap()
+        [0]
+    .span_len;
+    let around = tok.encode("<|image>").len() + tok.encode("<image|>").len();
+    let fixed = 2 + tok.encode("Video:").len();
+    assert_eq!((tokens, around, fixed), (81, 16, 8));
+    let charge = |groups: usize| fixed + groups * (tokens + around);
+    let at = |ctx: usize| {
+        inputs_with(
+            &side_at(ctx),
+            &mock.support(1),
+            "input",
+            &json!([{"content": [clip.clone()]}]),
+        )
+    };
+    let mut cases = vec![(0, 0), (charge(1) - 1, 0), (550, 5), (charge(6) + 100, 6)];
+    for groups in 1..=6 {
+        cases.push((charge(groups), groups));
+        if groups > 1 {
+            cases.push((charge(groups) - 1, groups - 1));
+        }
+    }
+    for (ctx, groups) in cases {
+        match at(ctx) {
+            Ok(got) => {
+                assert_eq!(got[0].images.len(), groups, "context {ctx}");
+                assert_eq!(got[0].ids.len(), charge(groups), "context {ctx}");
+            }
+            Err(e) => {
+                assert_eq!(groups, 0, "context {ctx}: {}", e.message);
+                assert!(e.message.starts_with("video: "), "{}", e.message);
+            }
+        }
+    }
+}

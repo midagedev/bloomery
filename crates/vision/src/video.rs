@@ -452,17 +452,16 @@ mod tests {
         stamp: Stamp::GroupMean,
     };
 
-    const GEMMA_LIKE: VideoRule = VideoRule {
+    /// One centred tick a second, refusing a clip of more than 32 ticks: the tick sampler's own
+    /// rule, with the group numbers of [`QWEN_LIKE`]. The planner's tests hold it here, not by a
+    /// model's rule, so a model's retuning moves its own tests and not these.
+    const TICKS: VideoRule = VideoRule {
         fps: (1, 1),
         frames: (1, 32),
         sampler: Sampler::Ticks { centred: true },
         overflow: Overflow::Refuse,
         temporal: 1,
-        tail: Tail::RepeatLast,
-        group_tokens: 140,
-        clip_tokens: 4_480,
-        overhead: 0,
-        stamp: Stamp::None,
+        ..QWEN_LIKE
     };
 
     fn clip(frames: usize, fps: (u32, u32)) -> ClipMeta {
@@ -590,7 +589,7 @@ mod tests {
         let ticks = VideoRule {
             frames: (1, 4),
             overflow: Overflow::Subsample,
-            ..GEMMA_LIKE
+            ..TICKS
         };
         let p = plan(&ticks, &clip(10 * 24, (24, 1)), usize::MAX, &sizer).unwrap();
         let all: Vec<usize> = (0..10).map(|t| 24 * t + 11).collect();
@@ -610,24 +609,24 @@ mod tests {
             per_px: 16,
             floor: 1,
         };
-        let p = plan(&GEMMA_LIKE, &clip(7 * 24, (24, 1)), usize::MAX, &sizer).unwrap();
+        let p = plan(&TICKS, &clip(7 * 24, (24, 1)), usize::MAX, &sizer).unwrap();
         assert_eq!(p.indices, (0..7).map(|t| 24 * t + 11).collect::<Vec<_>>());
         let plain = VideoRule {
             sampler: Sampler::Ticks { centred: false },
-            ..GEMMA_LIKE
+            ..TICKS
         };
         let p = plan(&plain, &clip(7 * 24, (24, 1)), usize::MAX, &sizer).unwrap();
         assert_eq!(p.indices, (0..7).map(|t| 24 * t).collect::<Vec<_>>());
         // One frame at half a frame a second: two ticks, both the one frame.
-        let p = plan(&GEMMA_LIKE, &clip(1, (1, 2)), usize::MAX, &sizer).unwrap();
+        let p = plan(&TICKS, &clip(1, (1, 2)), usize::MAX, &sizer).unwrap();
         assert_eq!(p.indices, [0, 0]);
         assert_eq!(p.decode_indices(), [0]);
-        let e = plan(&GEMMA_LIKE, &clip(11, (24, 1)), usize::MAX, &sizer).unwrap_err();
+        let e = plan(&TICKS, &clip(11, (24, 1)), usize::MAX, &sizer).unwrap_err();
         assert_eq!(
             e.to_string(),
             "video: the clip samples to 0 frames; the rule takes at least 1"
         );
-        let e = plan(&GEMMA_LIKE, &clip(40 * 30, (30, 1)), usize::MAX, &sizer).unwrap_err();
+        let e = plan(&TICKS, &clip(40 * 30, (30, 1)), usize::MAX, &sizer).unwrap_err();
         assert!(e.to_string().contains("40 frames"), "{e}");
     }
 

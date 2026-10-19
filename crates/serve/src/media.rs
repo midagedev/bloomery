@@ -2116,22 +2116,32 @@ mod tests {
     }
 
     /// The same clip planned the same way keys the same, group for group: a prefix cache keeps its
-    /// spans across requests.
+    /// spans across requests. Other bytes planned the same way key differently, every group: the
+    /// plan alone does not name a medium.
     #[test]
     fn a_clip_planned_the_same_way_keys_the_same() {
         let mock = MockClips::new();
         let ctx = VideoCtx::new(mock.support(3), 100);
-        let parts = [clip_part("30 10/1 4x2")];
-        let keys = || {
-            let flat = flatten("user", &parts, &ClipMedia, 0, &ctx).unwrap();
+        let keys = |parts: &[Value]| {
+            let flat = flatten("user", parts, &ClipMedia, 0, &ctx).unwrap();
             let ids = clip_ids(&flat.text);
             let p = expand_prompt(&ids, &flat.media, &ClipMedia).unwrap();
             p.feeds.iter().map(|f| f.key).collect::<Vec<_>>()
         };
-        let (first, second) = (keys(), keys());
+        let parts = [clip_part("30 10/1 4x2")];
+        let (first, second) = (keys(&parts), keys(&parts));
         assert_eq!(first, second);
         let distinct: std::collections::HashSet<_> = first.iter().collect();
         assert_eq!(distinct.len(), 3);
+        // The mock reads a clip's first three words, so a fourth makes other bytes of the same clip.
+        let other = keys(&[clip_part("30 10/1 4x2 again")]);
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls[0], calls[2], "the same plan");
+        assert_eq!(other.len(), first.len());
+        assert!(
+            first.iter().all(|key| !other.contains(key)),
+            "other bytes keyed as the first clip"
+        );
     }
 
     /// A placeholder pairing fault is named, and nothing is decoded for it: too few or too many
