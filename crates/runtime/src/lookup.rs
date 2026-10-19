@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use crate::width::Rule;
 use crate::{Draft, TapNeed, Verify};
 
 /// The streamed lookup: the context so far and, per n, where each n-gram's
@@ -24,6 +25,19 @@ pub struct Lookup {
 }
 
 impl Lookup {
+    /// The width chooser's rule for the lookup: [`Rule::DEFAULT`], the
+    /// starting gain counted as one test ([`Rule::prior`]). The lookup
+    /// reports no probabilities, so its gain alone rates it, and the gain is
+    /// `(1 + kept) / (1 + tested)` while `1 / (1 + tested)` is above
+    /// [`Rule::calibrate`]. With the verify of two rows at `c` of the step
+    /// the gate closes once the gain is under `c / margin_close - 1`, which a
+    /// prompt whose proposals keep fewer reaches within a few tests; read
+    /// down from 1 by the fixed step it takes tens of them.
+    pub const RULE: Rule = Rule {
+        prior: Some(1.0),
+        ..Rule::DEFAULT
+    };
+
     /// An empty context.
     pub fn new() -> Lookup {
         Lookup::default()

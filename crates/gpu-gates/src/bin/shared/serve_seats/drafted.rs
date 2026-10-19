@@ -41,7 +41,7 @@ use bloomery_gpu::GpuModel;
 use bloomery_gpu::model::{Rollback, Rows};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
-use runtime::width::{Choosing, Chosen, Clock, Mode as WidthMode};
+use runtime::width::{Choosing, Chosen, Clock, Mode as WidthMode, Wall};
 use runtime::{
     Advance, Argmax, Committed, Draft, Lookup, Pick, Plain, RowLogits, Sample, Speculative, Target,
     Verify, Want, WidthError, Widths, Window,
@@ -202,7 +202,14 @@ impl<B: Prompt + Keep + Rows + Rollback> Lookups<Session<B>> {
         if slots == 0 {
             return Err("the lookup draft of no slot".into());
         }
-        let choosing = || <Lookup as Chosen<Session<B>>>::choosing(Lookup::new(), mode);
+        let choosing = || {
+            <Lookup as Chosen<Session<B>>>::choosing_by(
+                Lookup::new(),
+                mode,
+                Lookup::RULE,
+                Wall::new(),
+            )
+        };
         let mut windows: Vec<Box<dyn LookupWindow<Session<B>>>> = Vec::with_capacity(slots);
         windows.push(Box::new(s.with_draft::<_, LOOKUP_ROWS>(choosing()?, log)?));
         for _ in 1..slots {

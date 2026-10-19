@@ -356,7 +356,7 @@ mod drive {
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::{Machine, Plan, PlanLevers, workstation};
-    use runtime::width::{Choosing, Chosen, Mode as WidthMode};
+    use runtime::width::{Choosing, Chosen, Mode as WidthMode, Rule, Wall};
     use runtime::{
         Advance, Committed, GenOutcome, Lookup, PassSink, Speculative, Stop, StopReason, Target,
         Want,
@@ -1070,15 +1070,16 @@ mod drive {
                 })
             }
             (Draft::Lookup, ..) => {
-                let mut spec =
-                    s.with_draft::<_, PAIR_ROWS>(behind(Lookup::new(), width)?, &mut log)?;
+                let lookup = behind(Lookup::new(), width, Lookup::RULE)?;
+                let mut spec = s.with_draft::<_, PAIR_ROWS>(lookup, &mut log)?;
                 let view = pre.arm(0, r)?;
                 let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
                 let ran = decode_draft(&mut s, a, &fed, &mut spec, "steps", "lookup", |_| Ok(()));
                 after_passes(&mut s, ran)
             }
             (Draft::Dspark, Some(d), _) => {
-                let mut spec = s.with_draft::<_, PAIR_ROWS>(behind(d, width)?, &mut log)?;
+                let mut spec =
+                    s.with_draft::<_, PAIR_ROWS>(behind(d, width, Rule::DEFAULT)?, &mut log)?;
                 let view = pre.arm(0, r)?;
                 let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), &s)?;
                 let ran = decode_draft(&mut s, a, &fed, &mut spec, "dspark", "dspark", |d| {
@@ -1103,13 +1104,14 @@ mod drive {
         Ok(())
     }
 
-    /// `d` behind the width chooser of `mode` (`runtime::width`): this
-    /// binary's drafts are the chooser's, whatever their own width.
+    /// `d` behind the width chooser of `mode` by `rule` (`runtime::width`):
+    /// this binary's drafts are the chooser's, whatever their own width.
     fn behind<D: runtime::Draft<Session<Body>>>(
         d: D,
         mode: WidthMode,
+        rule: Rule,
     ) -> Result<Choosing<D>, SessionError> {
-        Ok(d.choosing(mode)?)
+        Ok(d.choosing_by(mode, rule, Wall::new())?)
     }
 
     /// The residency views of `s`'s body ([`Residence`]): its stage card's

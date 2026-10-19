@@ -12,11 +12,12 @@
 //!   `a_i = p_i · g_i`, `p_i` the draft's own probability of its id
 //!   ([`Draft::propose_p`]; a draft without probabilities reports 1) and
 //!   `g_i` a calibration kept online. Each position a pass tested moves its
-//!   `g_i` toward what happened, and a window whose ids were all kept pulls
-//!   the untested positions' toward the deepest tested one, so a width that
-//!   stopped being chosen can grow back. The mean profile is the running
-//!   mean of the windows' `p_i` times the current `g_i`, so a calibration
-//!   that moved moves it at once.
+//!   `g_i` toward what happened (by a fixed step, or under [`Rule::prior`]
+//!   by a running mean's until that is smaller), and a window whose ids were
+//!   all kept pulls the untested positions' toward the deepest tested one,
+//!   so a width that stopped being chosen can grow back. The mean profile
+//!   is the running mean of the windows' `p_i` times the current `g_i`, so
+//!   a calibration that moved moves it at once.
 //! - `cost(k)` is the median of the last [`Rule::timings`] walls of passes
 //!   that ran `k`: one clock reading a pass at its proposal, landed at the
 //!   next (the proposal, the target's call, the draft's update and whatever
@@ -192,6 +193,14 @@ pub struct Rule {
     /// The calibration's step: how far a tested position's `g_i` moves
     /// toward what happened.
     pub calibrate: f64,
+    /// The weight of a position's starting gain of 1, in tests: the `n`-th
+    /// test of a position moves its `g_i` by `1 / (prior + n)` of the way
+    /// while that is above [`Rule::calibrate`], so the gain starts as the
+    /// mean of what its tests kept with the start counted `prior` times;
+    /// `None` moves it by [`Rule::calibrate`] from the first test. A draft
+    /// that reports certainty ([`Draft::propose_p`]'s default) is rated by
+    /// its gains alone, and the start of 1 says it keeps every id.
+    pub prior: Option<f64>,
     /// Passes before the width read longest ago runs once, while open; and
     /// a closed chooser's first probe after it closed.
     pub probe_every: u32,
@@ -206,10 +215,11 @@ impl Rule {
     /// A rival must win by 3 %; costs as the median of the last 8 readings,
     /// from 4 on; the calibration moves 5 % of the way a window; a probe
     /// after 64 passes open, closed after 64, 128, then every 256; a shadow
-    /// every 16th closed pass. The periods price what they buy: a closed
-    /// chooser pays a shadow's whole chain and a probe's verify where its
-    /// plain pass is cheaper, and a draft that stays closed pays one verify
-    /// in 256 passes once its first two probes are spent.
+    /// every 16th closed pass; no prior, the fixed step from the first test.
+    /// The periods price what they buy: a closed chooser pays a shadow's
+    /// whole chain and a probe's verify where its plain pass is cheaper, and
+    /// a draft that stays closed pays one verify in 256 passes once its first
+    /// two probes are spent.
     pub const DEFAULT: Rule = Rule {
         margin: 1.03,
         margin_close: 1.05,
@@ -217,6 +227,7 @@ impl Rule {
         timings: 8,
         min_timings: 4,
         calibrate: 0.05,
+        prior: None,
         probe_every: 64,
         probe_closed: 256,
         shadow_every: 16,
@@ -242,6 +253,8 @@ impl Rule {
             "a dwell of more readings than a cost holds"
         } else if !(self.calibrate > 0.0 && self.calibrate <= 1.0) {
             "the calibration's step must be inside (0, 1]"
+        } else if self.prior.is_some_and(|w| !(w.is_finite() && w >= 0.0)) {
+            "the calibration's prior must be finite and not negative"
         } else if self.probe_every == 0 || self.probe_closed == 0 || self.shadow_every == 0 {
             "a period of zero passes"
         } else {
@@ -547,6 +560,8 @@ pub struct Choosing<D, C = Wall> {
     passes: u64,
     /// The calibration `g_i`, one a proposal index.
     gains: Vec<f64>,
+    /// The tests each `g_i` has taken.
+    tested: Vec<u64>,
     /// The running mean of the draft's `p_i` over its full proposals, and
     /// how many it has seen.
     mean: Vec<f64>,
@@ -625,6 +640,7 @@ where
             since_shadow: 0,
             passes: 0,
             gains: vec![1.0; D::WIDTH],
+            tested: vec![0; D::WIDTH],
             mean: vec![0.0; D::WIDTH],
             seen: 0,
             gated: vec![0.0; D::WIDTH],
@@ -947,6 +963,11 @@ impl<D, C: Clock> Choosing<D, C> {
         let step = self.rule.calibrate;
         let tested = (j + usize::from(j < k)).min(self.gains.len());
         for i in 0..tested {
+            self.tested[i] += 1;
+            let step = self
+                .rule
+                .prior
+                .map_or(step, |w| (1.0 / (w + self.tested[i] as f64)).max(step));
             let hit = if i < j { 1.0 } else { 0.0 };
             let a = (f64::from(self.p[i]) * self.gains[i]).clamp(0.0, 1.0);
             self.gains[i] += step * (hit - a);
@@ -1630,6 +1651,28 @@ mod tests {
             "closed at pass {close}: {first} verifies in its first 1024 passes (bound \
              {first_bound}), {steady} in the next {span} (bound {bound})"
         );
+    }
+
+    /// A draft with no probabilities is rated by its gain alone, and under
+    /// [`Rule::prior`] the gain is the mean of what its tests kept: a draft
+    /// of one id that keeps 0.18 of them, its pair pass 1.35 of the step,
+    /// closes by pass 12 under [`crate::Lookup::RULE`], where the fixed step
+    /// reads its gain down from 1 and holds it open past pass 40; one that
+    /// keeps 0.7 stays open.
+    #[test]
+    fn a_draft_with_no_probabilities_closes_on_what_it_kept() {
+        let close = |acc: f64, rule: Rule| {
+            let mut r = PairRig::with(acc, rule);
+            r.clock.verify.set(PLAIN_US * 135 / 100);
+            (1..=1_000u32).find(|_| r.pass().0 == 0)
+        };
+        let lookup = crate::Lookup::RULE;
+        let (fast, slow) = (close(0.18, lookup), close(0.18, Rule::DEFAULT));
+        assert!(
+            fast.is_some_and(|p| p <= 12) && slow.is_some_and(|p| p > 40),
+            "closed at pass {fast:?} by the prior, {slow:?} by the fixed step"
+        );
+        assert_eq!(close(0.7, lookup), None, "a draft that pays closed");
     }
 
     /// The chooser's stats are what it predicted and what it kept: over a
@@ -2364,6 +2407,20 @@ mod tests {
                     ..Rule::DEFAULT
                 },
                 "the calibration's step must be inside (0, 1]",
+            ),
+            (
+                Rule {
+                    prior: Some(-1.0),
+                    ..Rule::DEFAULT
+                },
+                "the calibration's prior must be finite and not negative",
+            ),
+            (
+                Rule {
+                    prior: Some(f64::INFINITY),
+                    ..Rule::DEFAULT
+                },
+                "the calibration's prior must be finite and not negative",
             ),
             (
                 Rule {

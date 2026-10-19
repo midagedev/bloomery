@@ -3177,9 +3177,11 @@ mod cli {
     ) -> Result<(), GateError> {
         let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
         let mut spec = s.with_draft::<Choosing<Lookup>, 2>(
-            <Lookup as runtime::width::Chosen<Session<Body38>>>::choosing(
+            <Lookup as runtime::width::Chosen<Session<Body38>>>::choosing_by(
                 Lookup::new(),
                 run.width,
+                Lookup::RULE,
+                runtime::width::Wall::new(),
             )?,
             &mut VerifyCaptures,
         )?;
