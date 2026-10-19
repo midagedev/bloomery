@@ -12,9 +12,11 @@
 #         recipes-self-test      python3 tools/recipes.py --self-test
 #         <tools/…/x.py>         each Python tool self-test tools/check-recipes.sh lists (read from its `selftests=(` array: the
 #                                one owner of that list), run as that script runs it
-#         check-<name>           every tools/check-*.sh. None is left out: each reads the tree and runs no cargo and no box
-#                                command, and `recipes.py host-nightly` runs the same set on a Linux host (all ran green on a
-#                                Mac). check-rustflags holds the two cargo files against each other, never this machine's CPU
+#         check-<name>           every tools/check-*.sh, as `tools/mac-static.sh --checks --list --no-base` lists them with
+#                                their arguments (check-model-tax with no base revision: its tables against the code alone).
+#                                None is left out: each reads the tree and runs no cargo and no box command, and
+#                                `recipes.py host-nightly` runs the same set on a Linux host (all ran green on a Mac).
+#                                check-rustflags holds the two cargo files against each other, never this machine's CPU
 #   T1  x86_64 or aarch64 Linux with no card: T0, then every unit of `python3 tools/recipes.py host-nightly` that T0 did
 #       not already run by name (the check scripts and recipes-self-test run once), each `bash tools/gate.sh --release
 #       --locked -p <crate>`. Needs what tools/nightly/install.sh lists: the CUDA headers (cuda.h, curand.h,
@@ -185,11 +187,14 @@ selftests=$(sed -n '/^  selftests=($/,/^  )$/p' tools/check-recipes.sh | sed -n 
 [ -n "$selftests" ] || { say "contrib-check: no Python self-test found in tools/check-recipes.sh's selftests=( array"; exit 70; }
 while IFS= read -r t; do add "${t%% *}" "python3 $t"; done <<< "$selftests"
 
-for c in tools/check-*.sh; do
-  [ -f "$c" ] || { say "contrib-check: no tools/check-*.sh"; exit 70; }
-  b=$(basename "$c" .sh)
-  add "$b" "bash $c"
-done
+# The check scripts and the arguments each takes come from tools/mac-static.sh, the one owner of that discovery; --no-base because a
+# contributor's checkout has no revision to hold check-model-tax's tables to (that unit's output says so).
+checks=$(bash tools/mac-static.sh --checks --list --no-base) || { say "contrib-check: tools/mac-static.sh --checks --list failed"; exit 70; }
+[ -n "$checks" ] || { say "contrib-check: tools/mac-static.sh --checks lists no check script"; exit 70; }
+while IFS= read -r line; do
+  b=check-${line%% *}
+  add "$b" "bash tools/$b.sh${line#"${line%% *}"}"
+done <<< "$checks"
 
 if [ "$TIER" = t1 ]; then
   nightly=$(python3 tools/recipes.py host-nightly) || { say "contrib-check: tools/recipes.py host-nightly failed"; exit 70; }

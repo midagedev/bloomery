@@ -102,6 +102,15 @@ check contrib-check-archive-runs "$rc" 1
 has contrib-check-archive-header "$out" "contrib-check tier=t0 commit=?"
 has contrib-check-archive-unit-ran "$out" "inject-fail rc=101"
 
+# The check units are tools/mac-static.sh's list (the one discovery of check scripts) under the names check-<name>: two of the cheap
+# ones run for real, so a loop of its own that names them otherwise, or none, ends this check red.
+out=$(cd "$ROOT" && bash tools/contrib-check.sh --tier t0 --only '^check-(rustflags|waits)$' 2> "$T/cc-units.err")
+rc=$?
+check contrib-check-check-units-run "$rc" 0
+has contrib-check-check-unit-rustflags "$out" "check-rustflags rc=0"
+has contrib-check-check-unit-waits "$out" "check-waits rc=0"
+has contrib-check-check-units-done "$out" "DONE tier=t0 total=2 red=0"
+
 # ---- tools/nightly/run.sh: a clone under a temp NIGHTLY_HOME, no fetch ----
 # nightly_run NAME CLONE: the files of the one run it leaves in $T/NAME/state/<date>/. flock is a stub on the nightly's PATH
 # ($HOME/bin comes first there), so a host without it (macOS) runs the same code. The clone has no rust-toolchain.toml, so a run
