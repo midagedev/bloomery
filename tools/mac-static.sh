@@ -24,8 +24,17 @@
 #                                       non-zero naming every red step; BASE scopes the combos step
 #                                       (a rev, or A..B); --full or no argument runs it unscoped
 #   tools/mac-static.sh --self-test     the lanes' orchestration, the rc/wall capture, the red-step
-#                                       naming and the argument plumbing, against /bin/true,
-# /bin/false and sleep stubs; runs no cargo and no check script (check-recipes runs it)
+#                                       naming, the check-script derivation and the argument plumbing, against
+# /bin/true, /bin/false and sleep stubs and fixture check scripts; runs no cargo and no check script (check-recipes runs it)
+#   tools/mac-static.sh --checks [--list] [--skip NAME]…
+#                                       the check scripts one after another in the foreground, the first red ends
+#                                       it with that script's rc (what `just gate` runs: the justfile's
+#                                       check-scripts); --skip leaves a check out, --list prints each name it
+#                                       would run with its arguments and runs none
+#
+# The check scripts are every tools/check-*.sh, in byte order of the name, but those SKIP names: a new script joins the
+# loop, `just gate` and tools/contrib-check.sh by existing, with no list to add its name to. A skip that names no script is
+# refused (64), so a stale entry cannot read as a script left out on purpose.
 #
 # Exit: the first red step's rc, or 0. 64: an argument this script does not take. A step that wrote
 # no rc file (killed before its wrapper ran) is red, named `no rc`. Steps' full output and their
@@ -40,9 +49,38 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 LEDGER=$HOME/.cache/bloomery/mac-static-ledger.tsv
-SCRIPTS=(arch bounded comments defaults emb2 levers loads model-tax oracle-tree ptx-names records recipes rustflags unsafe waits)
+# The check scripts the round loop leaves out, by name (tools/check-NAME.sh), the reason on the line above each. None today.
+SKIP=()
 
 say() { printf '%s\n' "$*" >&2; }
+
+# check_names DIR SKIP…: the NAMEs of DIR's check-NAME.sh in byte order, one a line, but SKIP's. A SKIP that names no script and
+# a DIR with no script are refused (64).
+check_names() {
+  local dir=$1 f n s hit
+  local -a all=()
+  shift
+  for f in "$dir"/check-*.sh; do
+    [ -e "$f" ] || { say "mac-static.sh: no check-*.sh in $dir"; return 64; }
+    n=${f##*/check-}
+    all+=("${n%.sh}")
+  done
+  for s in "$@"; do
+    hit=
+    for n in "${all[@]}"; do [ "$n" != "$s" ] || hit=1; done
+    [ -n "$hit" ] || { say "mac-static.sh: skip '$s' names no $dir/check-$s.sh"; return 64; }
+  done
+  for n in "${all[@]}"; do
+    hit=
+    for s in "$@"; do [ "$n" != "$s" ] || hit=1; done
+    [ -n "$hit" ] || printf '%s\n' "$n"
+  done | LC_ALL=C sort
+}
+
+names=$(check_names "$HERE/tools" ${SKIP[@]+"${SKIP[@]}"}) || exit $?
+SCRIPTS=()
+while IFS= read -r n; do SCRIPTS+=("$n"); done <<< "$names"
+unset names n
 
 # combos_argv BASE LEDGER: the mac-check combos argv for the combos step (the scoped form only when
 # BASE is non-empty — the full form is the lead's landing one).
@@ -64,6 +102,29 @@ check_argv() {
 base_rev() {
   local b=${1%%..*}
   printf '%s\n' "${b:-origin/main}"
+}
+
+# run_checks DIR BASE LIST SKIP…: DIR's check scripts (check_names: all but SKIP) one after another in the foreground, each under
+# its check_argv, a `mac-static: check-NAME` line before each. The first red ends it with that script's rc. LIST non-empty prints
+# each NAME and its arguments, one a line, and runs none.
+run_checks() {
+  local dir=$1 base=$2 list=$3 listed n rc w
+  local -a names=() args
+  shift 3
+  listed=$(check_names "$dir" "$@") || return $?
+  while IFS= read -r n; do names+=("$n"); done <<< "$listed"
+  for n in "${names[@]}"; do
+    args=()
+    while IFS= read -r w; do args+=("$w"); done < <(check_argv "$n" "$base")
+    if [ -n "$list" ]; then
+      printf '%s\n' "$n${args[*]+ ${args[*]}}"
+      continue
+    fi
+    say "mac-static: check-$n"
+    rc=0
+    bash "$dir/check-$n.sh" ${args[@]+"${args[@]}"} < /dev/null || rc=$?
+    [ "$rc" = 0 ] || { say "mac-static: check-$n rc $rc"; return "$rc"; }
+  done
 }
 
 # step_inner NAME D CMD…: one step, serial in its caller — its rc, wall and full output to D. Never
@@ -143,7 +204,7 @@ summarize() {
 }
 
 self_test() {
-  local fails=0 d out rc k
+  local fails=0 d out rc k in_scripts in_skip
   local -a pids=()
   fail() { say "mac-static self-test FAIL: $*"; fails=$((fails + 1)); }
 
@@ -165,14 +226,65 @@ self_test() {
   out=$(check_argv arch main | tr '\n' ' ')
   [ -z "$out" ] || fail "a check with no arguments derives '$out'"
 
-  # every tools/check-*.sh is a step: a check script SCRIPTS leaves out never runs in the round loop
-  local f name unlisted=''
+  # every tools/check-*.sh is a step or on SKIP, never both: a check script the loop leaves out for no reason never runs in it
+  local f name unlisted='' doubled=''
   for f in "$HERE"/tools/check-*.sh; do
     name=${f##*/check-}
     name=${name%.sh}
-    case " ${SCRIPTS[*]} " in *" $name "*) ;; *) unlisted="$unlisted $name" ;; esac
+    case " ${SCRIPTS[*]} " in *" $name "*) in_scripts=1 ;; *) in_scripts= ;; esac
+    case " ${SKIP[*]+${SKIP[*]}} " in *" $name "*) in_skip=1 ;; *) in_skip= ;; esac
+    [ -z "$in_scripts" ] || [ -z "$in_skip" ] || doubled="$doubled $name"
+    [ -n "$in_scripts" ] || [ -n "$in_skip" ] || unlisted="$unlisted $name"
   done
-  [ -z "$unlisted" ] || fail "tools/check-*.sh that SCRIPTS does not list:$unlisted"
+  [ -z "$unlisted" ] || fail "tools/check-*.sh that is neither a step nor on SKIP:$unlisted"
+  [ -z "$doubled" ] || fail "tools/check-*.sh that is a step and on SKIP:$doubled"
+
+  # check_names and run_checks on fixture check scripts: the derivation (byte order, the skip), the refusals (a skip that names
+  # no script, a directory with none), the arguments (model-tax's base), the first red ending the run, and --list running none
+  local cd_ lines
+  cd_=$(mktemp -d)
+  for name in aa modelsx model-tax red skipme zz; do
+    printf '#!/usr/bin/env bash\necho "$@" >> "%s/ran-%s"\n' "$cd_" "$name" > "$cd_/check-$name.sh"
+  done
+  printf '#!/usr/bin/env bash\necho "$@" >> "%s/ran-red"\nexit 7\n' "$cd_" > "$cd_/check-red.sh"
+  : > "$cd_/other.sh"
+  out=$(check_names "$cd_" | tr '\n' ' ')
+  [ "$out" = "aa model-tax modelsx red skipme zz " ] || fail "check_names derives '$out', not the scripts in byte order (model-tax before modelsx)"
+  out=$(check_names "$cd_" skipme zz | tr '\n' ' ')
+  [ "$out" = "aa model-tax modelsx red " ] || fail "check_names with a skip derives '$out'"
+  rc=0; out=$(check_names "$cd_" nosuch 2>&1) || rc=$?
+  [ "$rc" = 64 ] || fail "a skip that names no script ends rc $rc, not 64"
+  case $out in *"skip 'nosuch' names no"*) ;; *) fail "a stale skip is not named: $out" ;; esac
+  mkdir "$cd_/empty"
+  rc=0; out=$(check_names "$cd_/empty" 2>&1) || rc=$?
+  [ "$rc" = 64 ] || fail "a directory with no check script ends rc $rc, not 64"
+  case $out in *"no check-*.sh in"*) ;; *) fail "an empty directory is not named: $out" ;; esac
+  rc=0; out=$(run_checks "$cd_" '' 1 skipme zz 2>&1) || rc=$?
+  lines=$(printf '%s' "$out" | tr '\n' ' ')
+  [ "$rc" = 0 ] && [ "$lines" = "aa model-tax check --base origin/main modelsx red" ] || fail "--list ends rc $rc and prints '$lines'"
+  [ ! -e "$cd_/ran-aa" ] || fail "--list ran a check script"
+  rc=0; out=$(run_checks "$cd_" 'a1..b2' '' red skipme zz 2>&1) || rc=$?
+  [ "$rc" = 0 ] || fail "a run of green scripts ends rc $rc: $out"
+  [ "$(cat "$cd_/ran-model-tax")" = "check --base a1" ] || fail "model-tax ran with '$(cat "$cd_/ran-model-tax")', not 'check --base a1'"
+  [ -z "$(cat "$cd_/ran-aa")" ] || fail "a check with no arguments ran with '$(cat "$cd_/ran-aa")'"
+  [ ! -e "$cd_/ran-skipme" ] && [ ! -e "$cd_/ran-zz" ] || fail "a skipped check script ran"
+  rm -f "$cd_"/ran-*
+  rc=0; out=$(run_checks "$cd_" '' '' skipme 2>&1) || rc=$?
+  [ "$rc" = 7 ] || fail "a run with a red script ends rc $rc, not that script's 7"
+  case $out in *"mac-static: check-red rc 7"*) ;; *) fail "the red script is not named: $out" ;; esac
+  [ "$(cat "$cd_/ran-model-tax")" = "check --base origin/main" ] || fail "a run with no base ran model-tax with '$(cat "$cd_/ran-model-tax")'"
+  [ ! -e "$cd_/ran-zz" ] || fail "a script after the red one ran"
+  rm -rf "$cd_"
+
+  # --checks on this tree: its --list is every check script (SKIP is the round loop's, --skip is its own), its arguments are refused by name
+  out=$(bash "$HERE/tools/mac-static.sh" --checks --list | awk '{ printf "%s ", $1 }')
+  [ "$out" = "$(check_names "$HERE/tools" | tr '\n' ' ')" ] || fail "--checks --list prints '$out', not every tools/check-*.sh"
+  rc=0; out=$(bash "$HERE/tools/mac-static.sh" --checks --list --skip nosuch 2>&1) || rc=$?
+  [ "$rc" = 64 ] || fail "--checks --skip of no script ends rc $rc, not 64"
+  rc=0; out=$(bash "$HERE/tools/mac-static.sh" --checks --skip 2>&1) || rc=$?
+  [ "$rc" = 64 ] || fail "--checks --skip with no name ends rc $rc, not 64"
+  rc=0; out=$(bash "$HERE/tools/mac-static.sh" --checks --bogus 2>&1) || rc=$?
+  [ "$rc" = 64 ] || fail "--checks --bogus ends rc $rc, not 64"
 
   # the lanes: two steps that each mark their start and wait for the other's mark (they ran at once;
   # on serial lanes the first waits out its bound, 120 s, and ends rc 9), whatever the load delays
@@ -233,9 +345,24 @@ T0=$SECONDS
 BASE=
 case ${1:-} in
   --self-test) [ $# = 1 ] || { say "mac-static.sh: --self-test takes nothing"; exit 64; }; self_test; exit $? ;;
+  --checks)
+    shift
+    list=
+    cskip=()
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --list) list=1; shift ;;
+        --skip) [ $# -ge 2 ] || { say "mac-static.sh: --skip takes a check name"; exit 64; }; cskip+=("$2"); shift 2 ;;
+        *) say "usage: tools/mac-static.sh --checks [--list] [--skip NAME]… ('$1' is not one)"; exit 64 ;;
+      esac
+    done
+    rc=0
+    run_checks "$HERE/tools" '' "$list" ${cskip[@]+"${cskip[@]}"} || rc=$?
+    exit "$rc"
+    ;;
   --full) [ $# = 1 ] || { say "mac-static.sh: --full takes nothing"; exit 64; } ;;
   "") : ;;
-  -*) say "usage: tools/mac-static.sh [BASE|--full] | --self-test ('$1' is not one)"; exit 64 ;;
+  -*) say "usage: tools/mac-static.sh [BASE|--full] | --checks [--list] [--skip NAME]… | --self-test ('$1' is not one)"; exit 64 ;;
   *) BASE=$1; [ $# = 1 ] || { say "mac-static.sh: one optional BASE, got $#: $*"; exit 64; } ;;
 esac
 
