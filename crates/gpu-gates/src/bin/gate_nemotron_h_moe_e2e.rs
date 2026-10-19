@@ -102,7 +102,22 @@
 //!   graph holds one `ds41_ffn_handoff_9` a hosted layer and one
 //!   `ds41_ffn_card_acc_9` a hosted layer with card experts, its eager and
 //!   replayed runs are bit-identical, and its fault word stays clean. It
-//!   blocks a host share lost or counted twice in the latent sum.
+//!   blocks a host share lost or counted twice in the latent sum. Each arm
+//!   then runs the walk's first [`GEMV_ROWS`] ids and the whole walk as a
+//!   prompt batch (`GpuModel::prefill`: the gemv arm's `_sel` launches on the
+//!   places, the GEMM arm's grouped launches on the remapped route table):
+//!   the batch service of the host tier runs one serve a hosted layer over
+//!   the prompt's columns. The whole-card load's batch of the same ids is the
+//!   reference (the same kernels, so only the experts' placement differs): the
+//!   card arm's logits are bit-identical to it, a host arm's keep
+//!   [`COSINE_FLOOR`] with its argmax wherever its top-1 margin passes twice
+//!   the max |Δ|, and [`CONTINUE`] steps after the batch (fed the reference's
+//!   greedy ids) keep the same band at each position against the reference's
+//!   own, which holds the stores the batch leaves. The batch's last position
+//!   also keeps the floor and the argmax band against the arm's own decode
+//!   steps; the continuation does not run against the steps, because the
+//!   batch and the steps sum in another order and the fixture's near-tied
+//!   routers turn that into a different expert past the first position.
 //!
 //! A set absent from the box, dumped from another fixture or build, or
 //! unfinished ends the gate by name before the card loads.
@@ -164,6 +179,14 @@ mod gate {
 
     /// Tokens of the walk every own-contract clause runs.
     const PROMPT_LEN: usize = 16;
+
+    /// The most rows of a prompt that run the gemv arm (the pass's `_sel`
+    /// launches); a longer one runs the GEMM arm.
+    const GEMV_ROWS: usize = 8;
+
+    /// Steps after a prompt batch the host-tier clause compares with the
+    /// whole-card load's.
+    const CONTINUE: usize = 4;
 
     /// The fixture-oracle clauses the gate declares.
     const FIXTURE_ORACLE: usize = 5;
@@ -1144,6 +1167,7 @@ mod gate {
     /// model is released.
     struct Whole {
         run: Run,
+        batch: Vec<BatchRun>,
         ctx: usize,
     }
 
@@ -1158,8 +1182,12 @@ mod gate {
         else {
             return Ok(None);
         };
+        let Some(batch) = whole_batches(m, case)? else {
+            return Ok(None);
+        };
         Ok(Some(Whole {
             run,
+            batch,
             ctx: m.ctx_max(),
         }))
     }
@@ -1293,8 +1321,13 @@ mod gate {
             } else {
                 cos >= COSINE_FLOOR && (got_ids == want_ids || in_band)
             };
-            let arm_pass =
-                structure && fine && clean && near && (arm.name != "card" || hosted.is_empty());
+            let batch = batch_near_whole(&mut m, case, whole, (arm.name, &hosted))?;
+            let arm_pass = structure
+                && fine
+                && clean
+                && near
+                && batch
+                && (arm.name != "card" || hosted.is_empty());
             println!(
                 "{CLAUSE}: arm {}: graph_nodes={nodes} handoff_9={handoff}/{} card_acc_9={acc}/{} \
                  weighted_sum={wsum}/{moe_whole}; eager == replay {} finite {} fault clean {clean}; \
@@ -1305,6 +1338,154 @@ mod gate {
                 with_card,
                 same(&eager, &replay),
                 finite(&replay),
+                verdict(arm_pass)
+            );
+            pass &= arm_pass;
+        }
+        Ok(pass)
+    }
+
+    /// Whether `got` keeps [`COSINE_FLOOR`] against `want`, and its id is
+    /// `want`'s or `want`'s top-1 margin is within twice their max |Δ|: the
+    /// host arms' band. The cosine, the max |Δ| and whether the ids are equal
+    /// come back for the line.
+    fn in_band(want: (u32, &[f32]), got: (u32, &[f32])) -> (bool, f64, f64, bool) {
+        let ((want_id, want), (got_id, got)) = (want, got);
+        let (dmax, cos) = (max_delta(want, got), cosine(want, got));
+        let margin = f64::from(want[argmax(want) as usize])
+            - f64::from(want[second(want, argmax(want)) as usize]);
+        let same_id = want_id == got_id;
+        (
+            cos >= COSINE_FLOOR && (same_id || margin <= 2.0 * dmax),
+            cos,
+            dmax,
+            same_id,
+        )
+    }
+
+    /// A prompt run as one `GpuModel::prefill` batch from a reset: the id and
+    /// the logits after the prompt, then [`CONTINUE`] decode steps (each
+    /// step's id and logits).
+    struct BatchRun {
+        id: u32,
+        logits: Vec<f32>,
+        after: Vec<(u32, Vec<f32>)>,
+    }
+
+    /// `prompt` as a batch, then [`CONTINUE`] steps fed `forced`'s greedy ids
+    /// (its own where there is none). `None` when a launch raised the fault
+    /// word.
+    fn batch_run(
+        m: &mut Model,
+        prompt: &[u32],
+        forced: Option<&BatchRun>,
+    ) -> Result<Option<BatchRun>, GateError> {
+        const CLAUSE: &str = HOST_CLAUSE;
+        m.reset()?;
+        let Some(id) = or_fault(CLAUSE, "the prompt as a batch", m.prefill(prompt))? else {
+            return Ok(None);
+        };
+        let logits = m.logits()?;
+        let mut after = Vec::with_capacity(CONTINUE);
+        let mut tok = forced.map_or(id, |f| f.id);
+        for i in 0..CONTINUE {
+            let Some(next) = or_fault(CLAUSE, "a step after the batch", m.step(&[tok]))? else {
+                return Ok(None);
+            };
+            after.push((next, m.logits()?));
+            tok = forced.map_or(next, |f| f.after[i].0);
+        }
+        Ok(Some(BatchRun { id, logits, after }))
+    }
+
+    /// The whole-card load's batch of the walk's first [`GEMV_ROWS`] ids and
+    /// of the whole walk: what each arm's batches are held against.
+    fn whole_batches(m: &mut Model, case: &Case) -> Result<Option<Vec<BatchRun>>, GateError> {
+        let mut out = Vec::new();
+        for len in [GEMV_ROWS, case.walk.len()] {
+            let Some(run) = batch_run(m, &case.walk[..len], None)? else {
+                return Ok(None);
+            };
+            out.push(run);
+        }
+        Ok(Some(out))
+    }
+
+    /// One arm's prompt batches (module doc): the walk's first [`GEMV_ROWS`]
+    /// ids, then the whole walk, each as a batch against the whole-card
+    /// load's batch of the same ids (the same kernels: only the experts'
+    /// placement differs, so the card arm's bits are the whole-card's and a
+    /// host arm's differ by the host's rounding), and its last position
+    /// against the arm's own decode steps (the batch's reductions sit in
+    /// another order, so only the floor and the argmax band hold there).
+    fn batch_near_whole(
+        m: &mut Model,
+        case: &Case,
+        whole: &Whole,
+        (arm, hosted): (&str, &[usize]),
+    ) -> Result<bool, GateError> {
+        const CLAUSE: &str = HOST_CLAUSE;
+        let stats = |m: &Model| -> Result<_, GateError> {
+            Ok(m.body(NAME)?
+                .placed()
+                .ok_or("a placed load's host tier")?
+                .hybrid()
+                .stats())
+        };
+        let rows = m.pass_rows()?;
+        let mut pass = true;
+        for (len, want) in [GEMV_ROWS, case.walk.len()].into_iter().zip(&whole.batch) {
+            let prompt = &case.walk[..len];
+            let Some(steps) = fresh(CLAUSE, "the prompt as steps", m, prompt)? else {
+                pass = false;
+                continue;
+            };
+            let (Some(&steps_id), Some(steps_logits)) = (steps.ids.last(), steps.logits.last())
+            else {
+                return Err("the steps' prompt is empty".into());
+            };
+            let before = stats(m)?;
+            let Some(got) = batch_run(m, prompt, Some(want))? else {
+                pass = false;
+                continue;
+            };
+            let after = stats(m)?;
+            let passes = len.div_ceil(rows) as u64;
+            let served = after.batch_served - before.batch_served;
+            let cols = after.batch_cols - before.batch_cols;
+            let structure = served == hosted.len() as u64 * passes
+                && cols == (hosted.len() * len) as u64
+                && got.logits.iter().all(|v| v.is_finite());
+            let (near, cos, dmax, same_id) =
+                in_band((want.id, &want.logits), (got.id, &got.logits));
+            let (vs_steps, steps_cos, ..) =
+                in_band((steps_id, steps_logits), (got.id, &got.logits));
+            let mut held = 0;
+            let mut worst = 1.0f64;
+            let mut exact = same_bits(&want.logits, &got.logits);
+            for ((next_id, next), (id, logits)) in want.after.iter().zip(&got.after) {
+                let (ok, c, ..) = in_band((*next_id, next), (*id, logits));
+                held += usize::from(ok);
+                worst = worst.min(c);
+                exact &= same_bits(next, logits);
+            }
+            let arm_pass =
+                structure && near && vs_steps && held == CONTINUE && (arm != "card" || exact);
+            println!(
+                "{CLAUSE}: arm {arm} batch of {len} ids ({passes} pass of up to {rows} rows, {}): \
+                 batch_served {served}/{}, batch_cols {cols}/{}; last id {} vs the whole-card \
+                 batch's {} (equal {same_id}), cosine {cos:.6}, max|Δ| {dmax:.3e}; {held}/{CONTINUE} \
+                 steps after it in the band, worst cosine {worst:.6}, bit-identical {exact}; \
+                 against the arm's steps: id {steps_id}, cosine {steps_cos:.6} {}",
+                if len <= GEMV_ROWS {
+                    "gemv arm"
+                } else {
+                    "GEMM arm"
+                },
+                hosted.len() as u64 * passes,
+                hosted.len() * len,
+                got.id,
+                want.id,
                 verdict(arm_pass)
             );
             pass &= arm_pass;
