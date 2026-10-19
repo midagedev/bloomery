@@ -187,6 +187,8 @@ self_test() {
   mkdir -p "$t/repo/tools/ref" "$t/stub" "$t/home"
   cp "$0" "$t/repo/tools/ptx-compare.sh"
   cp "$ROOT/tools/recipes.py" "$t/repo/tools/recipes.py"
+  mkdir -p "$t/repo/tools/bloomery"
+  cp "$ROOT/tools/bloomery/fixture_dirs.py" "$t/repo/tools/bloomery/fixture_dirs.py" # the table reader recipes.py imports
   mkdir -p "$t/repo/tools/nightly"
   cp "$ROOT/tools/nightly/units.sh" "$t/repo/tools/nightly/units.sh"
   cp "$ROOT/tools/ref/ptx-canon.py" "$t/repo/tools/ref/ptx-canon.py"

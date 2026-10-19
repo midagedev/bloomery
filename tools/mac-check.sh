@@ -742,6 +742,8 @@ CARGO
     sc=$t/tree
     mkdir -p "$sc/tools"
     cp "$HERE/tools/mac-check.sh" "$HERE/tools/recipes.py" "$HERE/tools/lint-ratchet.txt" "$sc/tools/"
+    mkdir -p "$sc/tools/bloomery"
+    cp "$HERE/tools/bloomery/fixture_dirs.py" "$sc/tools/bloomery/" # the table reader recipes.py imports
     cp "$HERE/justfile" "$HERE/rust-toolchain.toml" "$HERE/Cargo.lock" "$sc/"
     git -C "$sc" init -q
     git -C "$sc" add -A
