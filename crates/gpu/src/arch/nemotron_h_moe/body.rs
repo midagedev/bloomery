@@ -4,7 +4,7 @@
 //! and the per-step record refreshed before every enqueue or replay.
 
 use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, Routing, moe_layer, routed};
-use super::placed::{Placed, PlacedOpen, StepWalk, plan_map};
+use super::placed::{PLACED_ROWS, Placed, PlacedOpen, StepWalk, plan_map};
 use crate::arch::hybrid::{
     self, Acts, AttnLayer, Cx, DecodeInput, Kernels, MambaLayer, Names, Site, WORD_POS, WORD_TOKEN,
     Words, attention_heads, attn_layer, derive_zero_conv_bias, mamba_layer, mamba_shape,
@@ -30,7 +30,7 @@ use model::placement::Plan;
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::prefill::{PassSizes, Prompt, choose_pass_rows};
+use super::prefill::{PASS_ROWS_MAX, PassSizes, Prompt, choose_pass_rows};
 use super::router::Routers;
 
 const WHAT: &str = "nemotron_h_moe::Body::load";
@@ -80,11 +80,10 @@ pub struct Body {
     zeros: Vec<f32>,
     /// The step record's host words, rewritten by every refresh.
     words: Words,
-    /// The prompt pass's buffers ([`Body::enqueue_pass`]); `None` on a
-    /// placed load, whose prompt runs as steps.
+    /// The prompt pass's buffers ([`Body::enqueue_pass`]).
     pub(super) prompt: Option<Prompt>,
     /// The host tier and the card's side of it; `None` on a whole-card load.
-    placed: Option<Placed>,
+    pub(super) placed: Option<Placed>,
 }
 
 /// How a load holds the routed experts.
@@ -130,8 +129,10 @@ impl GpuModel<Body> {
     /// (each routed stack's card experts, in the plan's order), the stores at
     /// the plan's `ctx_max` and the step's buffers, and the host tier over the
     /// layers whose experts the plan leaves on the host, in relu² through the
-    /// common host run ([`crate::host`]). The prompt runs as decode steps:
-    /// [`GpuModel::prefill`](GpuModel::<Body>::prefill) is refused by name.
+    /// common host run ([`crate::host`]). The prompt runs as passes of up to
+    /// [`PLACED_ROWS`] rows through the host tier's batch port
+    /// ([`GpuModel::prefill`](GpuModel::<Body>::prefill)), the pass's buffers
+    /// cut from the card's room as a whole-card load's are.
     /// Refused by name: a plan of other than one card holding every layer,
     /// with an expert tier, a layer whose card count the file's does not
     /// admit, and scratch past the plan's term for it.
@@ -312,16 +313,23 @@ impl Body {
         // A whole-card load's pass rows come from the card's room after the
         // weights, the stores and the acts are resident: the largest pass
         // whose buffers fit what is left, before anything after them
-        // allocates. A placed load runs its prompt as steps and holds none.
+        // allocates. A placed load's passes are at most the host union's
+        // columns ([`PLACED_ROWS`]); its host tier is made for them.
         let (prompt, placed) = match open {
             Open::Whole { pass_rows } => {
-                let sizes = PassSizes::of((&sh, moe, hp.n_head), &layers);
-                let rows = choose_pass_rows(&sizes, (ctx, pass_rows), gpu.alloc_room()?)?;
+                let sizes = PassSizes::of((&sh, moe, hp.n_head), &layers, false);
+                let free = gpu.alloc_room()?;
+                let rows = choose_pass_rows(&sizes, (ctx, pass_rows), free, PASS_ROWS_MAX)?;
                 (Some(Prompt::new(stream, &sizes, rows)?), None)
             }
             Open::Placed(o) => {
                 let map = map.ok_or(GpuError::state(WHAT, "a slot map for a placed load"))?;
-                (None, Some(Placed::new(gpu, &hp, &layers, map, *o)?))
+                let sizes = PassSizes::of((&sh, moe, hp.n_head), &layers, true);
+                let free = gpu.alloc_room()?;
+                let rows = choose_pass_rows(&sizes, (ctx, None), free, PLACED_ROWS)?;
+                let prompt = Prompt::new(stream, &sizes, rows)?;
+                let placed = Placed::new(gpu, &hp, &layers, map, (*o, rows))?;
+                (Some(prompt), Some(placed))
             }
         };
         let ctx_ = gpu.context();
@@ -348,12 +356,11 @@ impl Body {
         })
     }
 
-    /// The prompt pass's buffers; a placed load, which runs its prompt as
-    /// steps, has none and is refused by name.
+    /// The prompt pass's buffers.
     pub(super) fn prompt(&self) -> Result<&Prompt, GpuError> {
         self.prompt.as_ref().ok_or(GpuError::state(
             "nemotron_h_moe::Body::prompt",
-            "the prompt pass's buffers (a placed load runs its prompt as steps)",
+            "the prompt pass's buffers",
         ))
     }
 
@@ -375,6 +382,13 @@ impl Body {
             + self.r.num_bytes()
             + self.k.kgemv.device_bytes()
             + self.placed.as_ref().map_or(0, Placed::device_bytes)
+    }
+
+    /// The placed side of a placed load (the host tier and the card's side of
+    /// it), `None` on a whole-card load: a gate's instrument.
+    #[must_use]
+    pub fn placed(&self) -> Option<&Placed> {
+        self.placed.as_ref()
     }
 
     /// Layer `layer`'s scan state read back (a gate's instrument; it

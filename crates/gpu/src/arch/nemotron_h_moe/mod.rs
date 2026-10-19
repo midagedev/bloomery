@@ -21,7 +21,8 @@
 //! graph serves every position. The body holds one sequence in one slot; a
 //! prompt runs in passes of many rows ([`prefill`]). A load whose routed
 //! experts the card cannot all hold keeps the plan's share resident and serves
-//! the rest on the host tier ([`placed`]); its prompt runs as steps.
+//! the rest on the host tier ([`placed`]); its prompt runs in passes of up to
+//! the host union's columns through the tier's batch port.
 
 mod body;
 mod moe;
