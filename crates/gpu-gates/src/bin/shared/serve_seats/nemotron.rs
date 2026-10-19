@@ -183,19 +183,17 @@ fn prefill_nano(m: &mut NemotronHModel, ids: &[u32]) -> Result<u32, GpuError> {
 }
 
 /// The Bolt's prompt path, the Nano's split: several ids the batched
-/// [`GpuModel::prefill`], one id a step.
+/// [`GpuModel::prefill`], one id a step, as one prompt call of the host tier
+/// ([`prompt_pass`]: a placed load's passes run through the tier's batch
+/// port; a whole-card load has no tier and the call adds nothing).
 fn prefill_bolt(m: &mut NemotronHMoeModel, ids: &[u32]) -> Result<u32, GpuError> {
-    if ids.len() > 1 {
-        m.prefill(ids)
-    } else {
-        m.step(ids)
-    }
-}
-
-/// A placed Bolt load's prompt path: the Bolt's, the passes through the host
-/// tier's batch port, as one prompt call of the tier ([`prompt_pass`]).
-fn prefill_bolt_placed(m: &mut NemotronHMoeModel, ids: &[u32]) -> Result<u32, GpuError> {
-    prompt_pass(m, |m| prefill_bolt(m, ids))
+    prompt_pass(m, |m| {
+        if ids.len() > 1 {
+            m.prefill(ids)
+        } else {
+            m.step(ids)
+        }
+    })
 }
 
 impl<B: ChainBody> Nemotron<B> {
@@ -360,7 +358,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let placed =
         arch == Arch::NemotronHMoe && inputs.plan(&whole, SEAT_STEPS.floor, &plan_levers).is_err();
     let (machine, experts) = if placed {
-        (place.machine_placed(0)?(layers), Experts::Placed)
+        (place.machine_placed()?(layers), Experts::Placed)
     } else {
         (whole, Experts::Card)
     };
@@ -424,7 +422,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             SeatEngine::spawn(
                 move || {
                     let ctx = open.ctx;
-                    Nemotron::open(open, |file| seat.open(file, ctx), prefill_bolt_placed)
+                    Nemotron::open(open, |file| seat.open(file, ctx), prefill_bolt)
                 },
                 slot_ctx,
                 vocab,

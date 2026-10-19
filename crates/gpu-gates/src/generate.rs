@@ -721,14 +721,10 @@ impl Place {
     }
 
     /// The machine a placed load plans over, by layer count: the placement's
-    /// one card with the token embedding on it and `scratch` bytes of body
-    /// scratch beyond the plan's own `SCRATCH` ([`workstation::placed_on`]), no
-    /// tier card. A placement that names a tier card is refused by name: the
-    /// plan has no expert tier to give it.
-    pub fn machine_placed(
-        self,
-        scratch: u64,
-    ) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
+    /// one card with the token embedding on it and the plan's own `SCRATCH`
+    /// ([`workstation::placed_on`]), no tier card. A placement that names a
+    /// tier card is refused by name: the plan has no expert tier to give it.
+    pub fn machine_placed(self) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
         if !self.tier_cards().is_empty() {
             return Err(format!(
                 "--place {}: a placed load runs one card with the host tier beside it, and the \
@@ -739,7 +735,7 @@ impl Place {
             .into());
         }
         let stage = self.card_specs()?[0];
-        Ok(move |layers| workstation::placed_on(stage, layers, workstation::SCRATCH + scratch))
+        Ok(move |layers| workstation::placed_on(stage, layers, workstation::SCRATCH))
     }
 
     /// The machine the placement plans over, by layer count. `draft_bytes`
