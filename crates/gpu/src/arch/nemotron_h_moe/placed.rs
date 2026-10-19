@@ -17,19 +17,26 @@
 //!   the places below the layer's card count) plus the host's sum in the latent,
 //!   the latent up, the shared expert, the residual.
 //!
+//! The prompt runs as passes of up to [`PLACED_ROWS`] rows through the host
+//! tier's batch port ([`super::prefill`]): the same three parts over a pass,
+//! the host serving each hosted layer's slots of all the pass's rows as one
+//! union call under the card's own slots, which read their places from the
+//! slot map ([`PlacedSide::enqueue_places`]) and, past eight rows, through
+//! each layer's map to the card's stacks ([`PlacedSide::map_of`]).
+//!
 //! The card's share of a layer and the host's sum to the whole-card layer's
 //! weighted sum up to rounding: the host quantizes the latent with its own
 //! kernel and sums its slots in its own order. Bolt's own parts are what its
 //! architecture forces: ungated experts (one up and one down stack, relu²),
 //! the latent the experts run in, and the interleaved MoE layers (the slot
-//! map's rows cover every layer, only the MoE layers' hold experts). The
-//! prompt runs as decode steps on a placed load.
+//! map's rows cover every layer, only the MoE layers' hold experts).
 
 use super::body::Layer;
 use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, one_expert, stack};
 use super::router::TOP_K;
 use crate::arch::hybrid::{self, Acts, Cx, attn_layer, mamba_layer, residual};
-use crate::card_slots::{CardAcc, CardSlotKernels};
+use crate::card_slots::{CardAcc, CardSlotKernels, ColPlaces};
+use crate::fault::FaultSink;
 use crate::flash_gqa::GROUP_16;
 use crate::host::StepLeg;
 use crate::host::handoff::{Handoff, HandoffKernels};
@@ -44,11 +51,16 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::{GgmlType, Split};
 use model::arch::nemotron_h_moe::host::routed_layers;
 use model::arch::nemotron_h_moe::hparams::Hparams;
+use model::moe::UNION_MAX_COLS;
 use model::placement::Plan;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use std::sync::Arc;
 
 const WHAT: &str = "nemotron_h_moe placed load";
+
+/// The most rows a placed prompt pass takes: the host union's most columns,
+/// so each host expert is read once a pass.
+pub(super) const PLACED_ROWS: usize = UNION_MAX_COLS;
 
 /// The slot map the plan makes over every layer of the chain, one row of
 /// `stride` places a layer (the widest layer's expert count; a narrower
@@ -88,6 +100,10 @@ pub(super) fn plan_map(plan: &Plan<'_>, hp: &Hparams) -> Result<(SlotMap, usize)
 /// buffers of one layer's host leg.
 pub(super) struct PlacedSide {
     hosted: Vec<bool>,
+    /// Each hosted layer's expert to place in the card's stacks, a layer's own
+    /// `n_expert` words: the map the prompt pass's GEMM route is built from
+    /// (`None` where the layer is not hosted or holds no expert).
+    maps: Vec<Option<DeviceBuffer<u32>>>,
     slots: DeviceTensor<u32>,
     /// The places of a row of the card copy: the widest layer's expert count.
     stride: usize,
@@ -98,6 +114,57 @@ pub(super) struct PlacedSide {
     /// The card slots' weighted sum, then that and the host's sum, `latent`.
     acc: DeviceBuffer<f32>,
     sum: DeviceBuffer<f32>,
+}
+
+impl PlacedSide {
+    /// Whether the host serves a share of layer `l`.
+    pub(super) fn hosted(&self, l: usize) -> bool {
+        self.hosted[l]
+    }
+
+    /// The card's slot sums ([`CardSlotKernels`]).
+    pub(super) fn acc(&self) -> &CardSlotKernels {
+        &self.acc_k
+    }
+
+    /// Layer `l`'s map of the experts to their places in the card's stacks, for
+    /// a layer that holds an expert on the card; refused by name for any other.
+    pub(super) fn map_of(&self, l: usize) -> Result<&DeviceBuffer<u32>, GpuError> {
+        self.maps
+            .get(l)
+            .and_then(Option::as_ref)
+            .ok_or(GpuError::state(
+                WHAT,
+                "a map of the card's experts for a hosted layer that holds some",
+            ))
+    }
+
+    /// Layer `l`'s places for the `m` routed rows `ids` (`TOP_K` slots a
+    /// row, `n_expert` experts in the layer) into `sel`: each slot's place in
+    /// the card's stacks, or [`HOST`](crate::hybrid::HOST) for the host's.
+    pub(super) fn enqueue_places(
+        &self,
+        stream: &CudaStream,
+        (l, n_expert): (usize, usize),
+        (ids, sel, m): (&DeviceBuffer<u32>, &mut DeviceBuffer<u32>, usize),
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        self.acc_k.enqueue_places_cols(
+            stream,
+            &ColPlaces {
+                ids,
+                ids_pitch: TOP_K,
+                used: TOP_K,
+                sel_pitch: TOP_K,
+                m,
+                map: self.slots.buf(),
+                row_off: l * self.stride,
+                n_expert,
+            },
+            fault,
+            sel,
+        )
+    }
 }
 
 /// The placed side of a load: the host tier over the layers with a host
@@ -112,14 +179,15 @@ impl Placed {
     /// slot map is `map` at `stride` places a row: the host run over the
     /// layers whose card count is under their experts, the boundary at the
     /// latent's width, the tier watching the fault word and holding the host
-    /// set `set`. Refused by name: a layer whose card count the map and the
+    /// set `set`, its batch port and union slabs for prompt passes of up to
+    /// `rows` rows. Refused by name: a layer whose card count the map and the
     /// layer disagree on. Load-time only.
     pub(super) fn new(
         gpu: &Gpu,
         hp: &Hparams,
         layers: &[Layer],
         (map, stride): (SlotMap, usize),
-        open: PlacedOpen<'_>,
+        (open, rows): (PlacedOpen<'_>, usize),
     ) -> Result<Placed, GpuError> {
         let n = layers.len();
         let mut hosted = vec![false; n];
@@ -143,7 +211,24 @@ impl Placed {
         }
         let set: Vec<usize> = (0..n).filter(|&l| hosted[l]).collect();
         let stream = gpu.stream();
-        let slots = DeviceTensor::upload(stream, &map.stage_view(), n, stride)?;
+        let stage = map.stage_view();
+        let slots = DeviceTensor::upload(stream, &stage, n, stride)?;
+        // A hosted layer that holds an expert on the card: its row of the
+        // card copy, the layer's own `n_expert` places.
+        let maps = layers
+            .iter()
+            .enumerate()
+            .map(|(l, layer)| match layer {
+                Layer::Moe(m) if hosted[l] && m.n_card > 0 => {
+                    let n_expert = hp.experts[l].map_or(0, |x| x.n_expert);
+                    let row = stage
+                        .get(l * stride..l * stride + n_expert)
+                        .ok_or(GpuError::state(WHAT, "a row of the slot map per layer"))?;
+                    Ok(Some(DeviceBuffer::from_host(stream, row)?))
+                }
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>, GpuError>>()?;
         let boundary = Boundary::new(
             gpu.context(),
             stream,
@@ -152,7 +237,7 @@ impl Placed {
                 n_used: TOP_K,
             },
         )?;
-        let experts = crate::model::host_run(
+        let mut experts = crate::model::host_run(
             gpu.context(),
             open.plan,
             &open.file,
@@ -166,14 +251,17 @@ impl Placed {
             },
             |src| routed_layers(src, hp, &set),
         )?;
+        experts.prepare_union(rows)?;
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(open.set);
+        hybrid.prepare_batch(gpu.context(), rows)?;
         let z = |len: usize| DeviceBuffer::zeroed(stream, len.max(1));
         Ok(Placed {
             hybrid,
             side: PlacedSide {
                 hosted,
+                maps,
                 slots,
                 stride,
                 handoff: HandoffKernels::load(gpu.context())?,
@@ -185,12 +273,17 @@ impl Placed {
         })
     }
 
-    /// Device bytes the placed side holds: the slot map's card copy, the
-    /// places and the sums, and the boundary.
+    /// Device bytes the placed side holds: the slot map's card copy and the
+    /// layers' maps of it, the places and the sums, and the boundary.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
         let s = &self.side;
         s.slots.buf().num_bytes()
+            + s.maps
+                .iter()
+                .flatten()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>()
             + s.sel.num_bytes()
             + s.acc.num_bytes()
             + s.sum.num_bytes()

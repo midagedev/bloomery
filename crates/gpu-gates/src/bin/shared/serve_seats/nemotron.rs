@@ -48,8 +48,9 @@
 //! least context a seat asks, [`SEAT_STEPS`]) loads placed: the plan keeps the
 //! routed experts the card's room holds resident and puts the rest on the
 //! host tier (`Experts::Placed` over `Place::machine_placed`; the host set is
-//! read in and locked as the host levers say), the prompt runs as decode
-//! steps, and the card's room is the plan's, `BLOOMERY_CARD_BUDGET` included.
+//! read in and locked as the host levers say), the prompt runs in passes of
+//! up to the host union's columns through the tier's batch port, and the
+//! card's room is the plan's, `BLOOMERY_CARD_BUDGET` included.
 //! A file the card holds whole loads whole, as before.
 //!
 //! `--ctx` is the one slot's context (`--ctx 0` is refused). The context
@@ -80,6 +81,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{Gpu, GpuError, GpuModel, NemotronHModel, NemotronHMoeModel};
 use bloomery_gpu_gates::bind::{
@@ -190,10 +192,10 @@ fn prefill_bolt(m: &mut NemotronHMoeModel, ids: &[u32]) -> Result<u32, GpuError>
     }
 }
 
-/// A placed Bolt load's prompt path: its ids run as decode steps through the
-/// host tier's step port (the batched pass is the whole-card load's).
+/// A placed Bolt load's prompt path: the Bolt's, the passes through the host
+/// tier's batch port, as one prompt call of the tier ([`prompt_pass`]).
 fn prefill_bolt_placed(m: &mut NemotronHMoeModel, ids: &[u32]) -> Result<u32, GpuError> {
-    m.step(ids)
+    prompt_pass(m, |m| prefill_bolt(m, ids))
 }
 
 impl<B: ChainBody> Nemotron<B> {

@@ -283,8 +283,7 @@ impl MoeLayer {
 }
 
 /// A card stack's name, or the refusal of a layer that holds no expert on
-/// the card (a placed load's prompt runs as steps, which skip such a layer's
-/// card slots).
+/// the card (a placed load's walks skip such a layer's card slots).
 fn stack_name(name: &Option<String>) -> Result<&str, GpuError> {
     name.as_deref().ok_or(GpuError::state(
         "nemotron_h_moe::MoeLayer",
