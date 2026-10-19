@@ -5,6 +5,8 @@
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
+pub mod vis;
+
 /// The first shard of the split set every mimo2 set is dumped from and
 /// the tree runs: the identity each set's `# model` line states. The family
 /// owns the path until the model crate reads this architecture; a set of
@@ -61,7 +63,9 @@ pub static IK: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&IK];
+pub static FAMILIES: &[&Family] = &[&IK, &vis::PREPROC, &vis::TAPS, &vis::CHATIDS, &vis::HIDDEN];
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vis_tests;

@@ -1,8 +1,8 @@
 //! The image-input oracle sets of the seats whose tower llama.cpp mainline's mtmd runs
 //! (`tools/ref/clefvis/dump_mtmd.cpp`): the Qwen3-VL seats' `qwen3vl_merger` (Clef-Flash's qwen35 on
-//! its Q8_0 file, Qwen3.6's qwen35moe, Qwen3.8's qwen4exp) and GLM-5.3-Flash's `glm5v`, each with its
-//! text model, written in the node-dump set format (`tools/ref/dump_ref.cpp`), so a family's identity
-//! check ([`crate::arch::qwen35::clefvis`], [`crate::arch::qwen35moe::vis`],
+//! its Q8_0 file, Qwen3.6's qwen35moe, Qwen3.8's qwen4exp), GLM-5.3-Flash's `glm5v` and MiMo-V2.6-Flash's
+//! `mimovl` ([`crate::arch::mimo2::vis`]), each with its text model, written in the node-dump set format
+//! (`tools/ref/dump_ref.cpp`), so a family's identity check ([`crate::arch::qwen35::clefvis`], [`crate::arch::qwen35moe::vis`],
 //! [`crate::arch::qwen4exp::vis`], [`crate::arch::glm5next::vis`], through [`RefManifest::open`])
 //! already refuses a set of another file, another build or another architecture and
 //! a set without its trailer. This module reads what the format leaves to the
@@ -20,7 +20,8 @@
 //! - [`Kind::Preproc`] (set A): per image `<name>/inp_raw`, the f32 image after
 //!   mtmd's preprocess, channel-planar `[W, H, 3, 1]`, the tower's graph input.
 //! - [`Kind::Taps`] (set B): per image `<name>/<node>` for the nodes of
-//!   [`tap_names`], and `<name>/embd`, the final embeddings `[n_embd, tokens]`;
+//!   [`ProjectorKind::full_taps`] ([`tap_names`] for `qwen3vl_merger`, [`mimo_tap_names`] for `mimovl`), and
+//!   `<name>/embd`, the final embeddings `[n_embd, tokens]`;
 //!   a set tapped [`TapScope::Final`] holds `embd` and the layout's output-end nodes
 //!   ([`ProjectorKind::final_taps`]: [`POST_LN`], or [`VIT_OUT`], [`AFTER_FC_PROJ`] and
 //!   [`AFTER_FFN_PROJ`]) of every image.
@@ -112,6 +113,10 @@ pub enum ProjectorKind {
     /// mtmd's `glm5v`: patch-size times merge-size pixel tokens (the line states them), normal positions, the
     /// `vit_out` / `after_fc_proj` / `after_ffn_proj` output end.
     Glm5v,
+    /// mtmd's `mimovl` (MiMo-V2.6-Flash's tower): patch-size times merge-size pixel tokens, normal positions, the
+    /// [`MIMO_POST_LN`] / [`VIT_OUT`] output end, and a tower tapped in full holds [`MIMO_PATCH_EMBED`] and the nodes of
+    /// [`MIMO_TAP_BLOCKS`], whose rows are the patches in the merge-unit order of the graph's input.
+    Mimovl,
 }
 
 /// How the decoder numbers the rows of a prompt.
@@ -140,6 +145,7 @@ impl ProjectorKind {
         match self {
             ProjectorKind::Qwen3vlMerger => "qwen3vl_merger",
             ProjectorKind::Glm5v => "glm5v",
+            ProjectorKind::Mimovl => "mimovl",
         }
     }
 
@@ -148,14 +154,14 @@ impl ProjectorKind {
     pub fn positions(self) -> PositionKind {
         match self {
             ProjectorKind::Qwen3vlMerger => PositionKind::Mrope,
-            ProjectorKind::Glm5v => PositionKind::Normal,
+            ProjectorKind::Glm5v | ProjectorKind::Mimovl => PositionKind::Normal,
         }
     }
 
     /// The spelling of the image token in the text model's vocabulary.
     fn image_token(self) -> &'static str {
         match self {
-            ProjectorKind::Qwen3vlMerger => "<|image_pad|>",
+            ProjectorKind::Qwen3vlMerger | ProjectorKind::Mimovl => "<|image_pad|>",
             ProjectorKind::Glm5v => "<|image|>",
         }
     }
@@ -166,12 +172,24 @@ impl ProjectorKind {
         match self {
             ProjectorKind::Qwen3vlMerger => &[POST_LN],
             ProjectorKind::Glm5v => &[VIT_OUT, AFTER_FC_PROJ, AFTER_FFN_PROJ],
+            ProjectorKind::Mimovl => &[MIMO_POST_LN, VIT_OUT],
         }
     }
 
     /// Whether the layout's dump taps inside the tower ([`TapScope::Full`], [`TapScope::EmbdOnly`]) as well as its output end.
     fn taps_inside(self) -> bool {
-        self == ProjectorKind::Qwen3vlMerger
+        matches!(self, ProjectorKind::Qwen3vlMerger | ProjectorKind::Mimovl)
+    }
+
+    /// The nodes of a tower tapped [`TapScope::Full`] besides [`EMBD`], in the order the dump writes them: [`tap_names`] for
+    /// the `qwen3vl_merger` layout, [`mimo_tap_names`] for `mimovl`; none for a layout tapped at its output end only.
+    #[must_use]
+    pub fn full_taps(self) -> Vec<String> {
+        match self {
+            ProjectorKind::Qwen3vlMerger => tap_names(),
+            ProjectorKind::Mimovl => mimo_tap_names(),
+            ProjectorKind::Glm5v => Vec::new(),
+        }
     }
 }
 
@@ -268,6 +286,47 @@ pub fn tap_names() -> Vec<String> {
     for b in TAP_BLOCKS {
         v.extend(TAP_NODES.iter().map(|n| format!("{n}-{b}")));
     }
+    v
+}
+
+/// The blocks whose nodes the `mimovl` layout's set B taps: the first full block, the first row-window and column-window
+/// blocks, the first full block after a column run (its input is back in row order), and the last.
+pub const MIMO_TAP_BLOCKS: [u32; 5] = [0, 1, 5, 9, 27];
+
+/// The nodes tapped in each of [`MIMO_TAP_BLOCKS`], the names `clip_graph_mimovl::build` gives them (`<node>-<block>`).
+pub const MIMO_TAP_NODES: [&str; 6] = [
+    "ln1",
+    "Qcur_rope",
+    "attn_out",
+    "ffn_inp",
+    "ffn_out",
+    "layer_out",
+];
+
+/// The `mimovl` tower's patch embedding after the merge-unit reorder, before block 0.
+pub const MIMO_PATCH_EMBED: &str = "patch_embed";
+
+/// The `mimovl` tower's final LayerNorm output (the rows in row order), before the 2x2 merge.
+pub const MIMO_POST_LN: &str = "post_ln";
+
+/// The width of the `mimovl` tower's rows (the encoder file's embedding length).
+pub const MIMO_WIDTH: u64 = 1280;
+
+/// The query heads and their width: a `Qcur_rope` row holds `MIMO_HEADS` heads of `MIMO_HEAD_DIM` values, which is not
+/// [`MIMO_WIDTH`].
+pub const MIMO_HEADS: u64 = 32;
+pub const MIMO_HEAD_DIM: u64 = 64;
+
+/// The nodes set B holds for a `mimovl` image tapped in full, in the order the dump wrote them: [`MIMO_PATCH_EMBED`], each
+/// block's [`MIMO_TAP_NODES`], [`MIMO_POST_LN`] and [`VIT_OUT`].
+#[must_use]
+pub fn mimo_tap_names() -> Vec<String> {
+    let mut v = vec![MIMO_PATCH_EMBED.to_string()];
+    for b in MIMO_TAP_BLOCKS {
+        v.extend(MIMO_TAP_NODES.iter().map(|n| format!("{n}-{b}")));
+    }
+    v.push(MIMO_POST_LN.to_string());
+    v.push(VIT_OUT.to_string());
     v
 }
 
@@ -370,7 +429,7 @@ pub struct Span {
 /// Which nodes of the tower an image carries besides its final embeddings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TapScope {
-    /// Every node of [`tap_names`].
+    /// Every node of the layout's [`ProjectorKind::full_taps`].
     Full,
     /// The post-LN output [`POST_LN`] only: the tower's output end.
     Final,
@@ -942,7 +1001,7 @@ impl ClefvisSet {
             ));
         }
         Ok(match scope {
-            TapScope::Full => tap_names(),
+            TapScope::Full => self.projector.kind.full_taps(),
             TapScope::Final => self
                 .projector
                 .kind
@@ -954,8 +1013,9 @@ impl ClefvisSet {
         })
     }
 
-    /// Node `n` of image `i` has the shape its layout gives it: a whole row per patch in a `qwen3vl_merger` tower, and
-    /// in a `glm5v` one `merge * merge` rows a token for [`VIT_OUT`] and `[n_embd, tokens]` for the merged nodes.
+    /// Node `n` of image `i` has the shape its layout gives it: a whole row per patch in a `qwen3vl_merger` tower, in a
+    /// `glm5v` one `merge * merge` rows a token for [`VIT_OUT`] and `[n_embd, tokens]` for the merged nodes, and in a
+    /// `mimovl` one `[1280, patches]` for each node but `Qcur_rope` (`[64, 32, patches]`) and the merged [`VIT_OUT`].
     fn check_tap_shape(&self, i: &Image, n: &str, ne: [u64; 4]) -> Result<(), RefError> {
         let tokens = i.n_tokens as u64;
         let patches = (self.projector.merge as u64).pow(2) * tokens;
@@ -972,6 +1032,18 @@ impl ClefvisSet {
             (ProjectorKind::Glm5v, _) => (
                 ne == [n_embd, tokens, 1, 1],
                 format!("want [{n_embd}, {tokens}, 1, 1]"),
+            ),
+            (ProjectorKind::Mimovl, VIT_OUT) => (
+                ne == [n_embd, tokens, 1, 1],
+                format!("want [{n_embd}, {tokens}, 1, 1]"),
+            ),
+            (ProjectorKind::Mimovl, q) if q.starts_with("Qcur_rope") => (
+                ne == [MIMO_HEAD_DIM, MIMO_HEADS, patches, 1],
+                format!("want [{MIMO_HEAD_DIM}, {MIMO_HEADS}, {patches}, 1]"),
+            ),
+            (ProjectorKind::Mimovl, _) => (
+                ne == [MIMO_WIDTH, patches, 1, 1],
+                format!("want [{MIMO_WIDTH}, {patches}, 1, 1]"),
             ),
         };
         if ok {
@@ -1222,9 +1294,10 @@ fn read_projector(man: &RefManifest) -> Result<Option<Projector>, RefError> {
     let kind = match f[0] {
         "qwen3vl_merger" => ProjectorKind::Qwen3vlMerger,
         "glm5v" => ProjectorKind::Glm5v,
+        "mimovl" => ProjectorKind::Mimovl,
         other => {
             return Err(bad(&format!(
-                "{other:?} is neither qwen3vl_merger nor glm5v"
+                "{other:?} is none of qwen3vl_merger, glm5v and mimovl"
             )));
         }
     };
