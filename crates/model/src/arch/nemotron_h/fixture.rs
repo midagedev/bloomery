@@ -58,6 +58,7 @@ pub const D_MAX: f32 = 1.0 / 64.0;
 /// tries (4096 positions), about 2.4 GB in all, so the budget sits above that
 /// with room for the rungs above. The engine attach sets the value its
 /// placement reads.
+// PIN(2026-10-19): one Nano fixture slot at 4096 positions needs about 2.4 GB, above the old 1 GiB cap.
 pub const CARD_BUDGET: u64 = 3 << 30;
 
 /// The target file is `<STEM>-00001-of-00001.gguf`.
