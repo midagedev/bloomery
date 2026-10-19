@@ -36,9 +36,9 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.3.4)
+## Status (0.3.5)
 
-0.3.4 adds Nemotron 3.5 Bolt 74B-A9B on the `nemotron` seat ([#320](https://github.com/midagedev/bloomery/pull/320)), whose prompt runs in batched passes of up to 4,096 rows ([#328](https://github.com/midagedev/bloomery/pull/328), [#400](https://github.com/midagedev/bloomery/pull/400)), and Nemotron 3 Nano 4B now reads a prompt in passes instead of one step a token ([#305](https://github.com/midagedev/bloomery/pull/305)). EmbeddingGemma v1 joins EmbeddingGemma 2 beside a chat model ([#390](https://github.com/midagedev/bloomery/pull/390)), and EmbeddingGemma 2 embeds sampled video frames and audio ([#397](https://github.com/midagedev/bloomery/pull/397), [#405](https://github.com/midagedev/bloomery/pull/405)). Several DGX Sparks serve one model: a tier node on another Spark owns routed experts by id range and pages them from its own NVMe, for Qwen3.8, with the same output as on one Spark ([#358](https://github.com/midagedev/bloomery/pull/358), [#411](https://github.com/midagedev/bloomery/pull/411)), and for GLM-5.3-Flash and DeepSeek-V4.1-Flash ([#420](https://github.com/midagedev/bloomery/pull/420)), whose greedy output can part from one Spark's when experts move between card and host: the two quantize activations differently ([`docs/serving.md`](docs/serving.md)), as with any change of placement. The release pass for this tarball is in the [0.3.4 release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.4).
+0.3.5 serves DeepSeek V4.1 Flash 1017 to DeepSeek Harness (dsh) with no shim: V4.1 DSML tool calls are parsed in the spelling the model writes and thinking follows `reasoning_effort` ([#471](https://github.com/midagedev/bloomery/pull/471)); tool-call arguments stream as the model writes them, and `--chat-template-file` works on every seat ([#477](https://github.com/midagedev/bloomery/pull/477)). Structured output (`json_schema`, forced tool calls) is held by a program over the vocabulary ([#467](https://github.com/midagedev/bloomery/pull/467)), and Qwen3.8-27B dense generates with Qwen XML tool calls ([#472](https://github.com/midagedev/bloomery/pull/472), [#475](https://github.com/midagedev/bloomery/pull/475)). The release pass for this tarball is in the [0.3.5 release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.5); 0.3.4 added Nemotron 3.5 Bolt, embeddings beside a chat model and multi-Spark serving ([0.3.4 notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.4)).
 
 | Area | State |
 |---|---|
@@ -60,8 +60,9 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | Text embeddings | EmbeddingGemma v1 (300M) and EmbeddingGemma 2, Q8_0, beside a chat model: `--embd-model FILE` or `--embd-hf ggml-org/embeddinggemma-2-GGUF:Q8_0`. `/v1/embeddings` and `/embedding` return mean-pooled vectors; `dimensions` selects 128, 256, 512 or the full output width (768), normalized after the cut. V1 takes up to 2048 tokens per input; v2 takes up to 8192. The side seat reserves its bytes before the chat plan places experts. See [serving](docs/serving.md) |
 | Image input | V4.1, Qwen3.6, MiniCPM-V 4.7, GLM-5.3 and the Clef decide seat, with `--mmproj <file>` (llama-server's flag). Under `--hf` with no `--mmproj`, a seat takes the projector in the model's repo when it costs the text model no card experts or context; otherwise it prints the projector's bytes and serves text (`--no-mmproj` skips it). Images go in as base64 (`data:` URLs), not fetched URLs. A request with an image to a seat started without an encoder is refused by name |
 
-### Known issues and limits (0.3.4)
+### Known issues and limits (0.3.5)
 
+- **DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`).** Unset `--place` picks `a`.
 - **The Qwen3.6 real-tier e2e gate's `split` residency clause can fail on one run and pass on the next at the same commit** (on an RTX 3090, logits distance from the off run up to 4.879e-1 against its 0.26 band, then 1.6–1.8e-1 on a rerun). The experts it streams follow the lane rate measured at runtime, so the clause's distance moves from run to run. This is a developer gate, not a change in what a load serves.
 - **On Qwen3.8 loads that page experts through the NVMe tier, `gate-gpu-qwen38-serve`'s real tier was 70/72 on 0.3.2's
   baseline (`f382b474`), with two preexisting paged failures.** It was not re-run for this note, and the 0.3.4
@@ -97,12 +98,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.3.4-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.4-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.3.5-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.5-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.3.4](https://github.com/midagedev/bloomery/releases/tag/v0.3.4)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.3.5](https://github.com/midagedev/bloomery/releases/tag/v0.3.5)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
