@@ -686,6 +686,7 @@ self_test() {
     local t=$1 h=$2 # the trap runs after self_test returned: its locals are gone, the dirs come as arguments
     trap '' INT TERM # a second signal meanwhile must not cut the cleanup
     ! declare -F end_batches > /dev/null || end_batches || true
+    wait || true # the part's background jobs (part 18's probes) finish while their fixture still stands
     rm -rf "$@"
   }
   # shellcheck disable=SC2064 # the paths are fixed now
