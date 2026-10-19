@@ -52,10 +52,13 @@ pub const D_MIN: f32 = 1.0 / 16384.0;
 pub const D_MAX: f32 = 1.0 / 64.0;
 
 /// The card byte budget the fixture records. The model has no routed experts,
-/// so nothing in the file plans against it, and a budget above the fixture's
-/// tensor data (about 0.93 GB) keeps the whole model resident. The engine
-/// attach sets the value its placement reads.
-pub const CARD_BUDGET: u64 = 1 << 30;
+/// so nothing in the file plans against it; the serve seat plans its whole
+/// card residency against it. That plan takes the tensor data (about 0.93 GB)
+/// plus the scan state and scratch of one slot at the least context the seat
+/// tries (4096 positions), about 2.4 GB in all, so the budget sits above that
+/// with room for the rungs above. The engine attach sets the value its
+/// placement reads.
+pub const CARD_BUDGET: u64 = 3 << 30;
 
 /// The target file is `<STEM>-00001-of-00001.gguf`.
 pub const STEM: &str = "nemotron-nano-fixture";
