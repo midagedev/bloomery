@@ -5111,12 +5111,31 @@ mod tests {
         );
     }
 
+    /// How far the test has let the held reads go.
+    #[derive(Clone, Copy, PartialEq, PartialOrd)]
+    enum Phase {
+        Held,
+        /// Every held read but the first unit's may end.
+        Open,
+        /// The first unit's read may end too.
+        Ended,
+    }
+
+    /// What the held reads wait on: the phase, and whether a read waited past
+    /// its bound.
+    struct Latch {
+        phase: std::sync::Mutex<Phase>,
+        moved: std::sync::Condvar,
+        expired: std::sync::atomic::AtomicBool,
+    }
+
     /// Every reader thread of a tier held in a read the test lets go, so a
     /// step's misses queue behind them and none starts until [`Gate::open`].
+    /// The reads are one job whose books the test closes ([`Gate::end`]): the
+    /// tier's stop counts a job still open as a ticket that outlived the tier.
     struct Gate {
-        open: std::sync::Mutex<bool>,
-        opened: std::sync::Condvar,
-        expired: std::sync::atomic::AtomicBool,
+        latch: std::sync::Arc<Latch>,
+        job: std::sync::Arc<super::Job>,
     }
 
     impl Gate {
@@ -5124,21 +5143,22 @@ mod tests {
         /// has one. A read the gate holds past five seconds ends and marks the
         /// gate expired, so a caller that waited on its fill fails its test
         /// rather than hanging it.
-        fn close(tier: &super::NvTier) -> std::sync::Arc<Gate> {
+        fn close(tier: &super::NvTier) -> Gate {
             use super::{Job, Kind, NVTIER_FILL_THREADS};
-            let gate = std::sync::Arc::new(Gate {
-                open: std::sync::Mutex::new(false),
-                opened: std::sync::Condvar::new(),
+            let latch = std::sync::Arc::new(Latch {
+                phase: std::sync::Mutex::new(Phase::Held),
+                moved: std::sync::Condvar::new(),
                 expired: std::sync::atomic::AtomicBool::new(false),
             });
             let (taken_tx, taken) = std::sync::mpsc::channel();
-            let held = std::sync::Arc::clone(&gate);
-            let job = Job::new(Kind::Victim, NVTIER_FILL_THREADS, move |_| {
+            let held = std::sync::Arc::clone(&latch);
+            let job = Job::new(Kind::Victim, NVTIER_FILL_THREADS, move |unit| {
                 taken_tx.send(()).unwrap();
-                let open = held.open.lock().unwrap();
-                let (_open, wait) = held
-                    .opened
-                    .wait_timeout_while(open, std::time::Duration::from_secs(5), |open| !*open)
+                let until = if unit == 0 { Phase::Ended } else { Phase::Open };
+                let phase = held.phase.lock().unwrap();
+                let (_phase, wait) = held
+                    .moved
+                    .wait_timeout_while(phase, std::time::Duration::from_secs(5), |p| *p < until)
                     .unwrap();
                 if wait.timed_out() {
                     held.expired
@@ -5146,22 +5166,36 @@ mod tests {
                 }
                 Ok(())
             });
-            tier.reader.submit(job).expect("the gate's job");
+            let job = tier.reader.submit(job).expect("the gate's job");
             for _ in 0..NVTIER_FILL_THREADS {
                 taken
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .expect("every reader thread took a unit");
             }
-            gate
+            Gate { latch, job }
         }
 
+        fn move_to(&self, to: Phase) {
+            *self.latch.phase.lock().unwrap() = to;
+            self.latch.moved.notify_all();
+        }
+
+        /// Let go of every held read but one, which stays in its read until
+        /// [`Gate::end`]: the fill runs on the readers let go and ends while
+        /// that read is still in flight, as it can when the others wake late.
         fn open(&self) {
-            *self.open.lock().unwrap() = true;
-            self.opened.notify_all();
+            self.move_to(Phase::Open);
+        }
+
+        /// Let go of the last held read and wait for the gate's job to close:
+        /// no read of the gate is left when the test's tier stops.
+        fn end(&self, tier: &super::NvTier) {
+            self.move_to(Phase::Ended);
+            tier.reader.wait(&self.job).expect("the gate's reads ended");
         }
 
         fn expired(&self) -> bool {
-            self.expired.load(std::sync::atomic::Ordering::SeqCst)
+            self.latch.expired.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -5171,7 +5205,9 @@ mod tests {
     /// caller runs in between is counted as host compute under the fill, the
     /// ids count as the card's only at the finish, and the hold the finish
     /// returns names the ids in the order asked, hands the card the offsets
-    /// of exactly those, and refuses an id it does not pin.
+    /// of exactly those, and refuses an id it does not pin. The finish joins
+    /// the fill while one held read is still in flight, so the fill needs no
+    /// reader but the ones the test let go.
     #[test]
     fn a_card_ticket_hands_the_caller_back_before_its_fill() {
         const LAYER: usize = 1;
@@ -5210,6 +5246,8 @@ mod tests {
         let e = hold.offsets(3).unwrap_err().to_string();
         assert!(e.contains("the hold pins"), "{e}");
         assert_eq!(tier.stats().card_ids, 2, "the finish counts the card's ids");
+        gate.end(&tier);
+        assert!(!gate.expired(), "the last read was let go by the test");
     }
 
     /// A card ticket dropped without a finish (the host's work between the
