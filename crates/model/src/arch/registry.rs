@@ -344,6 +344,21 @@ mod tests {
         );
     }
 
+    /// A row's fixture family is the directory `tools/fixture-dirs.tsv` gives its architecture (refset
+    /// reads the table), and a row with no fixture has no directory there: the registry's literals are
+    /// held to the one table.
+    #[test]
+    fn a_fixture_family_is_the_tables_directory() {
+        for row in ROWS {
+            let canonical = row.canonical();
+            assert_eq!(
+                row.fixture.map(|fx| fx.family),
+                refset::fixture::dir_of(canonical),
+                "{canonical}: the row's fixture family and tools/fixture-dirs.tsv disagree"
+            );
+        }
+    }
+
     /// The draft rules are the old table's three keys, and an architecture the rows do not name
     /// has no reader row.
     #[test]

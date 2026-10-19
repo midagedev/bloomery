@@ -15,8 +15,8 @@
 #
 # The assignment. A set directory is a candidate when its name starts `fx_` under --data or --data/ref-mtp (refset's
 # naming of a fixture set, crates/refset/src/arch/*/fixture.rs). Its family is read from the set's own MANIFEST.tsv:
-# `# model` must be `<fixture root>/<dir>/<file>`, where the fixture root and the `(arch, dir)` rows are those of
-# crates/refset/src/fixture.rs (DEFAULT_ROOT, DIRS), `# arch` must be the arch of that dir, and `# fixture` must be
+# `# model` must be `<fixture root>/<dir>/<file>`, where the fixture root is crates/refset/src/fixture.rs's DEFAULT_ROOT and the
+# `(arch, dir)` rows are those of tools/fixture-dirs.tsv, `# arch` must be the arch of that dir, and `# fixture` must be
 # there; every set of a family must carry the same `# fixture` line. A name is never read for a family. A set dumped on a
 # respelled fixture copy (a `# respell` line, crates/refset/src/clefvis.rs `Respell`: an image-input seat's text model in
 # mainline's spelling, and its tower's sets beside it) is placed by the fixture the copy was cut from: the line's
@@ -64,15 +64,14 @@ rfield() { printf '%s\n' "$1" | tr '\t' '\n' | sed -n "s/^$2 //p" | head -1; }
 
 # The fixture root, the (arch, dir) rows and the variant tags, read from where the code owns them.
 read_rules() {
-  local rs=$ROOT/crates/refset/src/fixture.rs tags=$ROOT/tools/fixture-variants.tsv
-  [ -f "$rs" ] || die 66 "no $rs: the fixture root and the arch/dir rows are read from it"
+  local rs=$ROOT/crates/refset/src/fixture.rs dirs=$ROOT/tools/fixture-dirs.tsv tags=$ROOT/tools/fixture-variants.tsv
+  [ -f "$rs" ] || die 66 "no $rs: the fixture root is read from it"
+  [ -f "$dirs" ] || die 66 "no $dirs: the arch/dir rows are read from it"
   [ -f "$tags" ] || die 66 "no $tags: the variant tags are read from it"
   FIXTURE_ROOT=$(sed -n 's/^pub const DEFAULT_ROOT: &str = "\(.*\)";$/\1/p' "$rs")
   [ -n "$FIXTURE_ROOT" ] || die 66 "$rs has no DEFAULT_ROOT line of the form it was read by"
-  awk '/^const DIRS:/ { on = 1; next } on && /^\];/ { exit }
-       on && match($0, /\("[a-z0-9]+", "[a-z0-9]+"\)/) {
-         s = substr($0, RSTART, RLENGTH); gsub(/[()" ]/, "", s); split(s, p, ","); print p[1] "\t" p[2] }' "$rs" > "$W/dirs.tsv"
-  [ -s "$W/dirs.tsv" ] || die 66 "$rs has no DIRS rows of the form they were read by"
+  awk -F'\t' '$0 !~ /^#/ && NF && $2 != "self" { print $1 "\t" $2 }' "$dirs" > "$W/dirs.tsv"
+  [ -s "$W/dirs.tsv" ] || die 66 "$dirs has no arch/dir rows"
   grep -v '^#' "$tags" | cut -f1 | sed '/^$/d' > "$W/tags.txt"
 }
 
@@ -138,7 +137,7 @@ place() {
   esac
   family=$(awk -F'\t' -v d="$fdir" '$2 == d { print $1; exit }' "$W/dirs.tsv")
   if [ -z "$family" ]; then
-    unplaced "$set" "$what names the fixture dir '$fdir', which is no dir of crates/refset/src/fixture.rs DIRS"
+    unplaced "$set" "$what names the fixture dir '$fdir', which is no dir of tools/fixture-dirs.tsv"
     return 0
   fi
   if [ "$arch" != "$family" ]; then

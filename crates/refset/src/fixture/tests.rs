@@ -1,7 +1,7 @@
 use super::{
-    DEFAULT_ROOT, DIRS, KEY_SUBSET, KEY_VARIANT, KEY_VERSION, ROOT_ENV, VARIANT_ENV, first_shard,
-    first_shard_in, keys, line, render, root_of, selected_of, variant_of, variant_root,
-    variant_set_name, with_root, with_variant,
+    DEFAULT_ROOT, DIRS_TABLE, KEY_SUBSET, KEY_VARIANT, KEY_VERSION, ROOT_ENV, SELF, VARIANT_ENV,
+    dir_of, dirs, first_shard, first_shard_in, keys, line, parse_dirs, render, root_of,
+    selected_of, variant_of, variant_root, variant_set_name, with_root, with_variant,
 };
 use crate::RefError;
 use crate::arch::named;
@@ -10,7 +10,6 @@ use crate::ik::RefManifest;
 use crate::mtpref::MtpSet;
 use gguf::Value;
 use gguf::write::{Layout, Writer};
-use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -362,45 +361,90 @@ fn the_root_is_the_variable_or_the_default() {
     );
 }
 
-/// The directory table and the root default are `tools/ref/ref-paths.sh`'s:
-/// every `__fixture_dir=<dir>` row of its `case "$BLOOMERY_MODEL"` that names
-/// a directory (neither `self` nor `none`) is a row here and the reverse, the
-/// default of its `__fixture_root` is [`DEFAULT_ROOT`] under [`ROOT_ENV`], and
-/// the file glob and the join are the ones [`first_shard_in`] matches and forms.
+/// The directory table is one file, `tools/fixture-dirs.tsv`: the embedded text parses, names a directory for every architecture
+/// it lists but the `self` ones, and `dir_of` answers from it.
 #[test]
-fn the_table_is_the_shells() {
+fn the_embedded_table_parses_and_answers() {
+    let rows = parse_dirs(DIRS_TABLE).unwrap_or_else(|e| panic!("tools/fixture-dirs.tsv: {e}"));
+    let own = dirs();
+    assert!(!own.is_empty(), "the table names no fixture directory");
+    assert_eq!(
+        own.len(),
+        rows.iter().filter(|(_, d)| *d != SELF).count(),
+        "dirs() holds the rows with a directory and no other"
+    );
+    for (arch, dir) in own {
+        assert_eq!(dir_of(arch), Some(dir), "{arch}");
+    }
+    for (arch, _) in rows.iter().filter(|(_, d)| *d == SELF) {
+        assert_eq!(dir_of(arch), None, "{arch} is a self family: no directory");
+    }
+    assert_eq!(dir_of("no-such-architecture"), None);
+}
+
+/// Every architecture with a family of sets dumped on a fixture file has a directory in the table: the sets' `# model` names
+/// [`first_shard`] of it, so a row lost leaves a family no file to be stated against.
+#[test]
+fn every_architecture_with_fixture_sets_has_a_directory() {
+    let mut seen = 0;
+    for family in crate::arch::all().filter(|f| f.identity.on_fixture()) {
+        let arch = family
+            .arch
+            .unwrap_or_else(|| panic!("the fixture family {} states no arch", family.name));
+        assert!(
+            dir_of(arch).is_some(),
+            "the fixture family {} is of {arch}, which tools/fixture-dirs.tsv gives no directory",
+            family.name
+        );
+        seen += 1;
+    }
+    assert!(seen > 0, "no family dumped on a fixture file in the table");
+}
+
+/// A table text that breaks a rule is refused by name, each rule by its own text.
+#[test]
+fn a_table_that_breaks_a_rule_is_refused_by_name() {
+    let ok = "# c\n\na\tx\nb\ty-1\nc\tself\nd\tself\n";
+    assert_eq!(
+        parse_dirs(ok),
+        Ok(vec![("a", "x"), ("b", "y-1"), ("c", "self"), ("d", "self")]),
+        "comments and blank lines aside, the rows in file order, `self` shared"
+    );
+    for (text, want) in [
+        ("a\tx\tz\n", "line 1 has 3 columns"),
+        ("a\n", "line 1 has 1 columns"),
+        ("a\tx\na\ty\n", "line 2: the architecture \"a\""),
+        ("\tx\n", "line 1: the architecture \"\""),
+        ("a\tX\n", "line 1: the directory \"X\""),
+        ("a\t\n", "line 1: the directory \"\""),
+        ("a\tnone\n", "line 1: the directory \"none\" is what"),
+        ("a\tx\nb\tx\n", "line 2: the directory \"x\" is another"),
+    ] {
+        let e = parse_dirs(text).expect_err(text);
+        assert!(e.contains(want), "{text:?}: {e}");
+    }
+}
+
+/// What the shell keeps of its own is the root default and the file glob, and the directory table it reads from the file: its
+/// `__fixture_root` default is [`DEFAULT_ROOT`] under [`ROOT_ENV`], the glob and the join are the ones [`first_shard_in`]
+/// matches and forms, and `tools/ref/ref-paths.sh` holds no `case` row naming a directory.
+#[test]
+fn the_shell_reads_the_table_and_shares_the_root_and_glob() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/ref-paths.sh");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 
-    let mut shell: BTreeSet<(String, String)> = BTreeSet::new();
-    for l in text
+    assert!(
+        text.contains("$REF_PATHS_DIR/../fixture-dirs.tsv"),
+        "{} does not read tools/fixture-dirs.tsv",
+        path.display()
+    );
+    let copies: Vec<&str> = text
         .lines()
         .filter(|l| l.contains("__fixture_dir=") && l.contains(";;"))
-    {
-        let (arches, dir) = l
-            .split_once(')')
-            .and_then(|(a, rest)| {
-                let (_, after) = rest.split_once("__fixture_dir=")?;
-                let (dir, _) = after.split_once(";;")?;
-                Some((a.trim(), dir.trim()))
-            })
-            .unwrap_or_else(|| panic!("a `__fixture_dir=` row this test cannot read: {l:?}"));
-        if arches == "*" || matches!(dir, "self" | "none") {
-            continue;
-        }
-        for arch in arches.split('|').map(str::trim) {
-            assert!(!arch.is_empty(), "{l:?}");
-            shell.insert((arch.to_string(), dir.to_string()));
-        }
-    }
-    let ours: BTreeSet<(String, String)> = DIRS
-        .iter()
-        .map(|(a, d)| (a.to_string(), d.to_string()))
         .collect();
-    assert_eq!(
-        shell,
-        ours,
-        "refset's fixture directories and {}'s case rows differ",
+    assert!(
+        copies.is_empty(),
+        "{} keeps a copy of the directory table: {copies:?}",
         path.display()
     );
 
@@ -422,10 +466,7 @@ fn the_table_is_the_shells() {
 /// A fixture root holding `<dir>/f-00001-of-00001.gguf` of `kvs`, `<dir>`
 /// being `arch`'s fixture directory; its first shard.
 fn root_with(root: &Path, arch: &str, kvs: &[(String, Value)]) -> Result<String, RefError> {
-    let (_, dir) = DIRS
-        .iter()
-        .find(|(a, _)| *a == arch)
-        .unwrap_or_else(|| panic!("no fixture directory for {arch}"));
+    let dir = dir_of(arch).unwrap_or_else(|| panic!("no fixture directory for {arch}"));
     let d = root.join(dir);
     std::fs::create_dir_all(&d).map_err(|e| RefError::missing(&d, e.to_string()))?;
     write_gguf(&d.join("f-00001-of-00001.gguf"), kvs);

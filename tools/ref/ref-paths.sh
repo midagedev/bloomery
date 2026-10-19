@@ -33,7 +33,7 @@
 # The tier. BLOOMERY_TIER is `real` (unset is the same: every name here is as the profile defines it) or `fixture`: the
 # model file is the family's fixture — the small file `fixture generate` writes (crates/model/src/bin/fixture.rs), whose header
 # names the card budget that forces the plan to offload (`fixture_budget`, below; tools/box.sh exports it as BLOOMERY_CARD_BUDGET).
-# What the fixture tier does is the family's, one row of the table below:
+# What the fixture tier does is the family's, one row of tools/fixture-dirs.tsv:
 #   a fixture directory    the first shard `*-00001-of-*.gguf` of the one directory under $BLOOMERY_FIXTURE_ROOT
 #                          (default /models/fixtures), one a family; MODEL becomes it unless BLOOMERY_REF_MODEL names a file
 #                          already (a caller's own wins), and FIXTURE_FILE names it either way. Not one file there: 66.
@@ -92,17 +92,13 @@ case "${BLOOMERY_TIER:-real}" in
     fi
     ;;
   fixture)
-    case "$BLOOMERY_MODEL" in
-      qwen4exp) __fixture_dir=qwen38 ;;
-      deepseek41) __fixture_dir=v41 ;;
-      glm5next) __fixture_dir=glm5next ;;
-      nemotron_h) __fixture_dir=nemotron ;;
-      nemotron_h_moe) __fixture_dir=nemotron-bolt ;;
-      qwen35moe) __fixture_dir=qwen35moe ;;
-      qwen38d) __fixture_dir=self ;;
-      deepseek2 | qwen3moe | qwen35) __fixture_dir=self ;;
-      *) __fixture_dir=none ;;
-    esac
+    # The family's row of tools/fixture-dirs.tsv: a directory, `self`, or no row at all (`none`).
+    if [ ! -f "$REF_PATHS_DIR/../fixture-dirs.tsv" ]; then
+      echo "ref-paths.sh: BLOOMERY_TIER=fixture, but $REF_PATHS_DIR/../fixture-dirs.tsv, the table of the fixture directories, is not there (exit 66)" >&2
+      exit 66
+    fi
+    __fixture_dir=$(awk -F'\t' -v a="$BLOOMERY_MODEL" '$0 !~ /^#/ && $1 == a { print $2; exit }' "$REF_PATHS_DIR/../fixture-dirs.tsv")
+    : "${__fixture_dir:=none}"
     case "$__fixture_dir" in
       self)
         if [ -n "$FIXTURE_VARIANT" ]; then
@@ -111,7 +107,7 @@ case "${BLOOMERY_TIER:-real}" in
         fi
         ;;
       none)
-        echo "ref-paths.sh: BLOOMERY_TIER=fixture, but the family '$BLOOMERY_MODEL' has no fixture yet (the table in $REF_PATHS_DIR/ref-paths.sh): not running it on its real file (exit 66)" >&2
+        echo "ref-paths.sh: BLOOMERY_TIER=fixture, but the family '$BLOOMERY_MODEL' has no fixture yet (no row in $REF_PATHS_DIR/../fixture-dirs.tsv): not running it on its real file (exit 66)" >&2
         exit 66
         ;;
       *)

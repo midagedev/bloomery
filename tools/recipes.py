@@ -63,8 +63,8 @@ A recipe's inputs are:
   - the scripts the recipe text names (`tools/**`, `crates/*/tools/**`) and, transitively, the repository
     files those scripts name, and every file under a tree directory a shell script walks with `find`
     from its root variable (`find "$ROOT/docs" -name '*.md'`: the whole directory, whatever the filter);
-  - for a box recipe, tools/box.sh and what it sources on every command: tools/ref/ref-paths.sh,
-    tools/ref/models/deepseek41.sh and the recipe's profile (`BLOOMERY_MODEL=x` on the line, else
+  - for a box recipe, tools/box.sh and what it sources on every command: tools/ref/ref-paths.sh and the
+    fixture directory table it reads, tools/fixture-dirs.tsv, tools/ref/models/deepseek41.sh and the recipe's profile (`BLOOMERY_MODEL=x` on the line, else
     deepseek2);
   - for a cargo recipe, Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/config.toml, and
     .cargo/cuda-oxide.toml when the recipe runs `cargo oxide`. A virtual workspace's Cargo.toml is read by
@@ -230,7 +230,7 @@ CARGO_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/conf
 # virtual manifest; as a package's own manifest it stays whole.
 ROOT_MANIFEST = "Cargo.toml"
 OXIDE_GLOBALS = [".cargo/cuda-oxide.toml"]
-BOX_GLOBALS = ["tools/box.sh", "tools/ref/ref-paths.sh", "tools/ref/models/deepseek41.sh"]
+BOX_GLOBALS = ["tools/box.sh", "tools/ref/ref-paths.sh", "tools/fixture-dirs.tsv", "tools/ref/models/deepseek41.sh"]
 DEFAULT_PROFILE = "deepseek2"
 # Runners that execute target/release/<first argument>.
 BIN_RUNNERS = ("tools/gpu-gate.sh", "tools/host-gate.sh", "tools/ref/time-gate.sh")
@@ -6721,7 +6721,7 @@ MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_FIXTURE_V
 # items only, and of those to the items that open the directory: a real item must not rerun because a fixture was regenerated, and
 # a fixture item must when its family's fixture was, whatever a fixture file's directory is called — so the box manifest lists every
 # file under it, subdirectories included, and no file's literal brings it into a real item's key (KeyContext.literal_dirs). An item's
-# key holds its family's fixture directory only (KeyContext.fixture_dirs; the family's row of ref-paths.sh's fixture table, the one
+# key holds its family's fixture directory only (KeyContext.fixture_dirs; the family's row of tools/fixture-dirs.tsv, the one
 # owner), as a variant's below holds its tag's, so a fixture written for one family moves no other family's key. An item whose
 # family cannot be told keeps every row of FIXTURE_ROOT: never under-keyed.
 FIXTURE_ROOT = "/models/fixtures"
@@ -6809,44 +6809,36 @@ def own_variant_row(path: str, variant: str) -> bool:
     return path == VARIANT_ROOT or (path + "/").startswith(f"{VARIANT_ROOT}/{variant}/")
 
 
-# The fixture tier's family table and the default profile, read from tools/ref/ref-paths.sh (the one owner; the regexes are the ones
-# tools/gate-batch.sh's fixture_table() and default_profile() read the same text with):
-#     case "$BLOOMERY_MODEL" in
-#       qwen4exp) __fixture_dir=qwen38 ;;
-#       qwen35moe) __fixture_dir=qwen35moe ;;
-#       deepseek2 | qwen3moe | qwen35) __fixture_dir=self ;;
-#       *) __fixture_dir=none ;;
-#     esac
+# The fixture tier's family table, tools/fixture-dirs.tsv (the one owner: tools/ref/ref-paths.sh and crates/refset/src/fixture.rs read
+# the same file), and the default profile, read from tools/ref/ref-paths.sh:
+#     # comment
+#     qwen4exp<TAB>qwen38
+#     deepseek2<TAB>self
+# A family the table does not name has no fixture (`none`, never a row).
+FIXTURE_DIRS = "tools/fixture-dirs.tsv"
 REF_PATHS = "tools/ref/ref-paths.sh"
-FIXTURE_CASE = re.compile(r'^\s*case "\$BLOOMERY_MODEL" in\n((?:\s*[^\n]*\) __fixture_dir=[a-z0-9_-]+ ;;\n)+)\s*esac$', re.M)
-FIXTURE_ROW = re.compile(r"\s*(.*?)\) __fixture_dir=([a-z0-9_-]+) ;;")
+FIXTURE_DIR_NAME = re.compile(r"[a-z0-9-]+")
 PROFILE_DEFAULT_LINE = re.compile(r'^: "\$\{BLOOMERY_MODEL:=\$\{BLOOMERY_REF_MODEL_PROFILE:-([A-Za-z0-9_]+)\}\}"$', re.M)
 FAMILY_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 
-def fixture_table(text: str) -> tuple[dict[str, str], str]:
-    """({family: fixture directory}, default profile) of ref-paths.sh's text: the table's rows (`self` and `none` as they are; a family
-    the table does not name falls to its `*)` row, `none`) and the profile tools/box.sh loads when BLOOMERY_MODEL is unset. A text this
-    reader does not understand is a named error, never a guess: a glob in a row would be read as a family name and fall to `none`."""
-    m = FIXTURE_CASE.search(text)
-    if not m:
-        raise RecipeError(f"{REF_PATHS}: no fixture table (`case \"$BLOOMERY_MODEL\" in … ) __fixture_dir=<dir> ;; … esac`): an item's fixture directory is read there")
+def fixture_table(dirs_text: str, ref_paths_text: str) -> tuple[dict[str, str], str]:
+    """({family: fixture directory}, default profile): the rows of the fixture directory table's text (`self` as it is; a family the table
+    does not name has `none`) and the profile tools/box.sh loads when BLOOMERY_MODEL is unset, from ref-paths.sh's text. A text this
+    reader does not understand is a named error, never a guess: a row of another shape would be read as a family and fall to `none`."""
     rows: dict[str, str] = {}
-    default = None
-    for row in m.group(1).strip().split("\n"):
-        r = FIXTURE_ROW.fullmatch(row)
-        if not r:
-            raise RecipeError(f"{REF_PATHS}: the fixture table row {row.strip()[:60]!r} is not `<families> ) __fixture_dir=<dir> ;;`")
-        for pat in (x.strip() for x in r.group(1).split("|")):
-            if pat == "*":
-                default = r.group(2)
-            elif FAMILY_NAME.fullmatch(pat):
-                rows[pat] = r.group(2)
-            else:
-                raise RecipeError(f"{REF_PATHS}: the fixture table pattern {pat!r} is neither a family name nor a lone `*`: a glob would be read as a name, and its families would fall to none")
-    if default != "none":
-        raise RecipeError(f"{REF_PATHS}: the fixture table's `*)` row is {default!r}, not none: a family without a row must be one with no fixture")
-    profile = PROFILE_DEFAULT_LINE.findall(text)
+    for n, line in enumerate(dirs_text.splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.split("\t")
+        if len(cols) != 2 or not FAMILY_NAME.fullmatch(cols[0]) or not (FIXTURE_DIR_NAME.fullmatch(cols[1]) and cols[1] != "none"):
+            raise RecipeError(f"{FIXTURE_DIRS}: line {n} ({line.strip()[:60]!r}) is not `<family><TAB><dir>`: a family name, then a directory of lower-case letters, digits and '-' (or `self`; never `none`)")
+        if cols[0] in rows:
+            raise RecipeError(f"{FIXTURE_DIRS}: line {n}: the family {cols[0]!r} is in the table twice")
+        rows[cols[0]] = cols[1]
+    if not rows:
+        raise RecipeError(f"{FIXTURE_DIRS}: no row (`<family><TAB><dir>`): an item's fixture directory is read there")
+    profile = PROFILE_DEFAULT_LINE.findall(ref_paths_text)
     if len(profile) != 1:
         raise RecipeError(f"{REF_PATHS} holds {len(profile)} default-profile lines, not one: an item with no BLOOMERY_MODEL runs under that default")
     return rows, profile[0]
@@ -7659,7 +7651,7 @@ class KeyContext:
 
     def fixture_dirs(self, names: list[str], eff: list[str]) -> set[str] | None:
         """The directories under FIXTURE_ROOT an item in the fixture tier can open: the fixture directory of each family it runs under,
-        from the fixture table of ref-paths.sh (fixture_table; `self` and `none` have none: the set may be empty). Its families are
+        from the fixture directory table (fixture_table; `self` and `none` have none: the set may be empty). Its families are
         the BLOOMERY_MODEL of each tools/box.sh call of its recipes, else the Mac's, else ref-paths.sh's default: tools/box.sh picks the
         profile on the Mac side and a script on the box that picks another is refused (ref-paths.sh, exit 64), so the family names
         the only fixture directory a box command opens. None — every row of FIXTURE_ROOT, never under-keyed — when the family cannot
@@ -7678,7 +7670,7 @@ class KeyContext:
         if not calls:
             return set()
         if self._fixture_table is None:
-            self._fixture_table = fixture_table(self.side.tree.read(REF_PATHS))
+            self._fixture_table = fixture_table(self.side.tree.read(FIXTURE_DIRS), self.side.tree.read(REF_PATHS))
         rows, default = self._fixture_table
         mac = self.env.get("BLOOMERY_MODEL") or default
         dirs: set[str] = set()
@@ -9239,9 +9231,9 @@ def key_self_test(expect, real: Side) -> None:
         expect(all(keys(sa, environ=fx4)[k] != fix_file[k] for k in items), "a fixture file rewritten (its size) moved no fixture-tier key")
         write_manifest(manifest)
         expect(keys(sa) == base, "the base manifest, restored, keys another way")
-        # A fixture-tier item's key holds its family's fixture directory, from the family's row of ref-paths.sh's table (REF_PATHS, the
+        # A fixture-tier item's key holds its family's fixture directory, from the family's row of the fixture directory table (FIXTURE_DIRS, the
         # one owner), as a variant's below holds its tag's: a file in a directory no family of the item maps to moves nothing of it.
-        rows, default = fixture_table(sa.tree.read(REF_PATHS))
+        rows, default = fixture_table(sa.tree.read(FIXTURE_DIRS), sa.tree.read(REF_PATHS))
         expect(default == DEFAULT_PROFILE, f"ref-paths.sh's default profile {default} is not DEFAULT_PROFILE {DEFAULT_PROFILE}")
         expect([rows.get(f) for f in ("qwen4exp", "deepseek41", "glm5next", "qwen35moe", "deepseek2")] == ["qwen38", "v41", "glm5next", "qwen35moe", "self"]
                and "mimo2" not in rows and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
@@ -9312,28 +9304,30 @@ def key_self_test(expect, real: Side) -> None:
         write_manifest(fixture_free + fx_rows(sizes) + ["# end"])
         expect([fparts(fam[k], fx_env) for k in ("q4", "ds41", "q35", "envm")] == [["fixture\tdirs\tqwen38"], ["fixture\tdirs\tv41"], ["fixture\tdirs\tqwen35moe"], ["fixture\tdirs\t*"]]
                and fparts(fam["q4"], {}) == [], "the fixture key part does not name the directories the key holds")
-        # (f) the table is ref-paths.sh's. qwen35moe already names its own directory. Pointing that row back at
+        # (f) the table is tools/fixture-dirs.tsv's. qwen35moe already names its own directory. Pointing that row back at
         # `self` edits the file, so it moves the keys of the box items (the file is a key part of every one of
         # them). Against that table a file under the qwen35moe directory is a directory no family maps to.
-        rp = os.path.join(roots[0], REF_PATHS)
+        rp = os.path.join(roots[0], FIXTURE_DIRS)
         with open(rp, encoding="utf-8") as fh:
             rp_old = fh.read()
-        own = "qwen35moe) __fixture_dir=qwen35moe ;;"
-        split_self = "deepseek2 | qwen3moe | qwen35) __fixture_dir=self ;;"
-        joined = "deepseek2 | qwen3moe | qwen35moe | qwen35) __fixture_dir=self ;;"
+        own = "qwen35moe\tqwen35moe\n"
+        selfrow = "qwen35moe\tself\n"
         refused = [
-            (rp_old.replace("*) __fixture_dir=none ;;", "*) __fixture_dir=self ;;"), "not none"),
-            (rp_old.replace("qwen4exp) __fixture_dir=qwen38 ;;", "qwen4*) __fixture_dir=qwen38 ;;"), "neither a family name nor a lone `*`"),
-            (rp_old.replace('case "$BLOOMERY_MODEL" in', 'case "$M" in'), "no fixture table"),
+            (rp_old + "qwen35moe\tself\n", "in the table twice"),
+            (rp_old.replace("qwen4exp\tqwen38\n", "qwen4exp\tqwen38\tx\n"), "is not `<family><TAB><dir>`"),
+            (rp_old.replace("qwen4exp\tqwen38\n", "qwen4*\tqwen38\n"), "is not `<family><TAB><dir>`"),
+            (rp_old.replace("qwen4exp\tqwen38\n", "qwen4exp\tnone\n"), "never `none`"),
+            (rp_old.replace("qwen4exp\tqwen38\n", "qwen4exp\tQwen38\n"), "is not `<family><TAB><dir>`"),
+            ("# no rows\n", "no row"),
         ]
         try:
-            expect(own in rp_old and joined not in rp_old, "ref-paths.sh's qwen35moe row is not the one this clause edits")
-            edited = rp_old.replace("      " + own + "\n", "").replace(split_self, joined)
-            expect(edited != rp_old and joined in edited and own not in edited, "pointing qwen35moe back at self did not edit the table")
+            expect(own in rp_old and selfrow not in rp_old, f"{FIXTURE_DIRS}'s qwen35moe row is not the one this clause edits")
+            edited = rp_old.replace(own, selfrow)
+            expect(edited != rp_old and selfrow in edited and own not in edited, "pointing qwen35moe back at self did not edit the table")
             with open(rp, "w", encoding="utf-8") as fh:
                 fh.write(edited)
             kf_row = fam_keys(fx_rows(sizes))
-            expect(kf_row["q4"] != kf["q4"] and kf_row["q35"] != kf["q35"] and kf_row["glm"] != kf["glm"], "an edit of ref-paths.sh's table moved no key of a box item")
+            expect(kf_row["q4"] != kf["q4"] and kf_row["q35"] != kf["q35"] and kf_row["glm"] != kf["glm"], f"an edit of {FIXTURE_DIRS} moved no key of a box item")
             m = rewritten(bump("qwen35moe"), None, kf_row)
             expect(m == open_keys, f"qwen35moe pointed back at self: a file under its directory moved {sorted(m)}, not only the items whose family cannot be told {sorted(open_keys)}")
             for text, why in refused:
@@ -9344,7 +9338,7 @@ def key_self_test(expect, real: Side) -> None:
         finally:
             with open(rp, "w", encoding="utf-8") as fh:
                 fh.write(rp_old)
-        expect(fam_keys(fx_rows(sizes)) == kf, "ref-paths.sh restored keys another way")
+        expect(fam_keys(fx_rows(sizes)) == kf, f"{FIXTURE_DIRS} restored keys another way")
         write_manifest(manifest)
         expect(keys(sa) == base, "the base manifest, restored after the family clauses, keys another way")
         # A fixture variant's files (VARIANT_ROOT, beside FIXTURE_ROOT) belong to the keys of the items that run under its tag: no other
@@ -9843,6 +9837,7 @@ def ref_paths_self_test(expect) -> None:
         os.makedirs(os.path.join(tmp, "tools/ref/models"))
         for f in ("ref-paths.sh", "dspark-path.sh", "gguf-ranges.py"):
             shutil.copyfile(os.path.join(src, f), os.path.join(tmp, "tools/ref", f))
+        shutil.copyfile(os.path.join(ROOT, FIXTURE_DIRS), os.path.join(tmp, FIXTURE_DIRS))
         for fam in ("qwen4exp", "deepseek2", "glm5next", "mimo2", "newfam"):
             with open(os.path.join(tmp, f"tools/ref/models/{fam}.sh"), "w", encoding="utf-8") as fh:
                 fh.write(f"MODEL_NAME={fam}\nMODEL=${{BLOOMERY_REF_MODEL:-/models/real/{fam}.gguf}}\n")
