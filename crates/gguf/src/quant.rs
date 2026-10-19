@@ -2087,7 +2087,7 @@ mod tests {
         const SCALE: u32 = 0x3951_0000;
         let want: Vec<(u8, u32)> = e4m3_reference()
             .into_iter()
-            .filter_map(|(s, b, v)| Some((b, v?)).filter(|_| s == SCALE))
+            .filter_map(|(s, b, v)| (s == SCALE).then_some((b, v?)))
             .collect();
         let table: Vec<u8> = want.iter().map(|w| w.0).cycle().take(2 * 160).collect();
         let decl = |name: &str, dims: Vec<u64>, type_id, nbytes| TensorDecl {
@@ -2117,7 +2117,7 @@ mod tests {
         };
         let scale = f32::from_le_bytes(data("t.scale").try_into().unwrap());
         let rows = super::E4m3Rows::new(scale);
-        for (r, src) in data("t.weight").chunks_exact(160).enumerate() {
+        for (r, src) in data("t.weight").as_chunks::<160>().0.iter().enumerate() {
             let mut got = [0.0f32; 160];
             rows.decode(src, &mut got).unwrap();
             for (i, (g, &b)) in got.iter().zip(src).enumerate() {

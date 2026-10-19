@@ -539,7 +539,7 @@ impl PleRead {
 /// the table's scale.
 enum PleRows {
     Iq4Nl,
-    F8(E4m3Rows),
+    F8(Box<E4m3Rows>),
 }
 
 /// `rows`, rows of `width` values each, decoded into `e` in order.
@@ -605,7 +605,7 @@ impl PleHost {
                 Some((file.shard(s)?, t))
             })?
             .ok_or_else(|| refuse("a scale beside its F8 rows"))?;
-            PleRows::F8(E4m3Rows::new(scale))
+            PleRows::F8(Box::new(E4m3Rows::new(scale)))
         } else {
             return Err(refuse("IQ4_NL or F8 rows"));
         };

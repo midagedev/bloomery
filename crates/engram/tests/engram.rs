@@ -691,8 +691,8 @@ fn hw_engram_f8_rows_table_reads_rows_of_its_width() {
     let ids = [8u32, 0, 3];
     let mut copied = vec![0u8; ids.len() * 160];
     table.copy_rows(&ids, &mut copied).unwrap();
-    for (got, &r) in copied.chunks_exact(160).zip(&ids) {
-        assert_eq!(got, &source[r as usize * 160..][..160], "row {r}");
+    for (got, &r) in copied.as_chunks::<160>().0.iter().zip(&ids) {
+        assert_eq!(&got[..], &source[r as usize * 160..][..160], "row {r}");
     }
 }
 
