@@ -1711,7 +1711,24 @@ dump-ref-quant:
     ./tools/box.sh 'bash tools/ref/quant-oracle.sh dump'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-rustflags check-arch check-defaults check-model-tax check-comments check-levers check-unsafe check-waits check-bounded check-loads check-ptx-names fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
+# The static checks come from check-scripts, not from a name here. The other deps are one a line, so two additions do not touch one line.
+gate: \
+    check-scripts \
+    fmt-check \
+    lint \
+    gate-1-1 \
+    gate-vision \
+    gate-gpu-gates-lib \
+    gate-gpu-lib \
+    gate-sampler \
+    gate-levers
+
+# `just gate`'s static checks (Mac, text only): every tools/check-*.sh one after another, but the ones --skip names, the first red
+# ending the run. The list is the files, so a new check script joins `just gate` by existing, with no line to add its name to
+# (tools/mac-static.sh --checks has the derivation and the arguments each check takes). emb2, oracle-tree and records have no
+# check-* recipe and `just gate` does not run them; delete a --skip to add one.
+check-scripts:
+    bash tools/mac-static.sh --checks --skip emb2 --skip oracle-tree --skip records
 
 # The smoke tier (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
 # P = 512 alone, V2-Lite end to end — a subset run of unchanged gates, never the landing batch. Two lanes
