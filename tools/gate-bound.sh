@@ -561,6 +561,8 @@ EOF
   # cleanup-alive: a stop that fails with the monitor still alive returns 70 and never waits on it: the monitor (bound
   # 60 s) still lives when the stop returns. A stop that waited on it would return only once it had ended; a clock on
   # the stop would read the load (each process-table read is a fork).
+  # PIN(2026-10-19): replaces the wall band `took=[0-2]` (the stop returns within 2 s). `monitor=alive` is what the band
+  # stood for: a stop that waited on the monitor returns only once it is gone (`monitor=gone`, red), at any load.
   cat > "$t/alive-runner" << 'EOF'
 source "$GB"
 lease_stop() { return 70; }

@@ -1752,8 +1752,11 @@ def case_replay_signal(fx):
 
 
 def case_queued_age(fx):
-    # An age is the stated seconds plus the time this run has spent since `now` (and under a second the stamp drops): the
-    # upper bound of each is read from the run's own clock, so a slow machine moves it and a wrong age does not hide in it.
+    # PIN(2026-10-19): the ceilings were fixed walls, the stated seconds + 4 s and 120 s for the queued seconds: a loaded
+    # machine could run past the +4 s (a red with no fault in the age) and the 120 s let a wrong age of up to +20 s pass. An age
+    # is the stated seconds plus the time this run has spent since `now` (and under a second the stamp drops, the 2 s here): the
+    # upper bound of each is read from the run's own clock, so a slow machine moves it and a wrong age does not hide in it. The
+    # floors are unchanged.
     t0 = time.monotonic()
     now, sec = datetime.datetime.now(), datetime.timedelta(seconds=1)
     kst = datetime.timezone(datetime.timedelta(hours=9))
@@ -1773,6 +1776,7 @@ def case_queued_age(fx):
               {"status": "done", "rc": 0, "submitted": submitted}])
     rc, so, se = fx.client(*fx.run_args())
     m = re.search(rb"queued (\d+) s \(wait_reason", se)
+    # PIN(2026-10-19): the ceiling of the queued seconds is read from this run's clock (was 120), as above.
     check(rc == 0 and m and 100 <= int(m.group(1)) <= 100 + 2 + (time.monotonic() - t1),
           f"the queued seconds come from `submitted`: {rc} {se!r}")
 

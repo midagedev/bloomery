@@ -1452,6 +1452,9 @@ PY
   rc=0
   wait "$p1" || rc=$?
   cp "$t/h1" "$t/out"
+  # PIN(2026-10-19): the waited seconds were `[4-9]`. The runner prints the wait it measured, never under the 4 s bound it was
+  # given and longer on a loaded host, so a ceiling of 9 s read the load: the floor stays, and the line must name the bound
+  # it was given (CARD_BOUND 4 s). The same two bands below.
   judge_all 'a fresh hold of another owner: the run waits, 75 at the bound, a [batch-hold] line at once naming owner and age' "$rc" 75 \
     '\[batch-hold\] .* waits: a landing batch holds the GPUs \(.*batch\.gpuhold, owner other, up [0-9]+ s, refreshed [0-9]+ s ago\)' \
     'the batch hold .*batch\.gpuhold \(owner other\) was still up after ([4-9]|[1-9][0-9]+) s \(CARD_BOUND 4 s\) .*contention' '!ok on the'
@@ -1494,6 +1497,9 @@ PY
   rc=0
   gate "$t/out" 3090 "$t/lease" || rc=$?
   echo "hold lines: $(grep -c 'batch-hold' "$t/out")" >> "$t/out"
+  # PIN(2026-10-19): the age was `4[0-9][0-9]`. The hold is written 400 s old and its age grows by the time the case takes to
+  # reach it, which a loaded host can stretch past 499 s: the floor stays (past the 300 s a hold goes stale at), the ceiling
+  # is 999. The same band for the takeover below.
   judge_all 'a stale hold (not refreshed for 400 s): the run goes ahead, and says so once, naming the hold and its age' "$rc" 0 \
     'ok on the 3090 \(asked 3090\)' '!waits' \
     '\[batch-hold\] .*batch\.gpuhold \(owner other\) is stale — not refreshed for [4-9][0-9][0-9] s \(stale at 300 s\)' 'hold lines: 1$'

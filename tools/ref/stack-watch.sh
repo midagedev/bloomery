@@ -229,6 +229,10 @@ self_test() {
   alive "$(cat "$t/gdb.pid" 2> /dev/null)" && left="$left gdb"
   alive "$(cat "$t/cmd.pid")" && left="$left command"
   echo "dumping: $([ -s "$t/gdb.pid" ] && echo yes || echo no), the TERM reached the dump: $reached, left:${left:- none}" >> "$t/e"
+  # PIN(2026-10-19): replaces the wall band `ended in 1?[0-9] s` (PIN(2026-10-15), was [0-7] s). The stub gdb ends six seconds
+  # after its TERM, so a wall ceiling on the watch's return reads the load. The mark the stub writes when the TERM reaches it
+  # carries what the band told apart: a gdb the watch's TERM does not reach is ended by the dump's own bound at 120 s, after
+  # the case's 110 s wait for the mark, and reads `reached: no`.
   case_ 'a TERM during the dump ends it and the command, their code kept' 7 'dumping: yes, the TERM reached the dump: yes, left: none$' "$rc" "$t/e"
   # A TERM while the watch waits for the command, after it has ended the command's quiet process (the command goes on after
   # it), ends the command, and the watch returns after it, with its code.
@@ -274,6 +278,11 @@ self_test() {
   left=
   alive "$(cat "$t/cmd3.pid")" && left=' command'
   echo "dumped: $([ -e "$t/gdb3.pid" ] && echo yes || echo no), awaited: $awaited, command ended: $([ -e "$t/ended" ] && echo yes || echo no), returned: $returned, left:${left:- none}" >> "$t/g"
+  # PIN(2026-10-19): replaces the wall band `ended in [4-9] s` (PIN(2026-10-18)). The floor stays as the case's own four seconds
+  # of hold: a watch that returns early is gone before the release (`awaited: no`), and one that went on to the quiet path
+  # dumps (`dumped: yes`) and ends the hold's sleep, so it is gone too. The ceiling, which the loaded Mac read at 8 s, is the
+  # failsafe: the release comes from the case, so no wall decides when the command ends, and a watch that does not return after
+  # it reads `returned: no`.
   case_ 'a TERM before the quiet time: no dump after it, the command awaited, its code kept' 7 \
     'dumped: no, awaited: yes, command ended: yes, returned: yes, left: none$' "$rc" "$t/g"
   # The startup copy holds the PID-assignment window open until TERM has been sent.

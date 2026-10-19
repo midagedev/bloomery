@@ -1368,6 +1368,9 @@ EOF
     # An enclosing timeout must not KILL the shell before its inner group releases the lease and output. Its bound runs out
     # once the inner shell is ready (its trap set, its lines printed, its profiler stub waiting): the enclosing monitor, whose
     # own bound is the failsafe, takes an ALRM as GNU timeout takes its bound running out.
+    # PIN(2026-10-19): the enclosing bound was 3 s of wall clock, which a loaded host can run out before the inner shell is ready.
+    # The rc 124 and lock assertions are unchanged; the bound now runs out on the event, and `bounded-nested-*-ready` names an
+    # inner shell that never got ready.
     for enclosing in external owned; do
       mkdir "$t/nested-$enclosing" || exit 70
       mkfifo "$t/nested-$enclosing-stream" || exit 70
@@ -1510,6 +1513,9 @@ EOF
         logs=("$t/bout$n")
         [ "$form" != profiler ] || logs+=("$t/held$n.pid.txt")
         # The bound ending the stub is the line `bounded` prints for timeout's 124: the TERM, not the bound, ended it.
+        # PIN(2026-10-19): replaces `ended before the 20 s bound`, a wall reading that a loaded host fails with no fault in the
+        # runner. The bound is the failsafe now and the assertion is that its cut-off line is absent: a stub the bound ended
+        # prints it, so the TERM ended the stub at any load.
         OUT="stub ran: $([ -n "$sp" ] && echo yes || echo no), left:${left:- none}, lease: $lk, bound: $(cat "${logs[@]}" 2> /dev/null | grep -q '^\[bound\] .* cut off at its ' && echo reached || echo not reached), out: [$(grep -hE '^(trap ran|next arm)$' "${logs[@]}" | tr '\n' ' ')]"
         cfix=''
         [ "$form" != capture ] || { cfix=', capture dir: removed'; [ -n "$cdir" ] && [ ! -e "$cdir" ] && OUT="$OUT, capture dir: removed" || OUT="$OUT, capture dir: left"; }
@@ -1688,6 +1694,7 @@ EOF
       lk=free
       lease_free "$pdir/lease" 2> /dev/null || lk=held
       # The bound ending a stub is the line `bounded` prints for timeout's 124: the TERM, not the bound, ended it.
+      # PIN(2026-10-19): the same replacement as `bounded-$form-term` above (was `ended before the 20 s bound`).
       check "bounded-perf-$phase-term" "left:${left:- none}, lease: $lk, bound: $(cat "$pdir/err" "$pdir/log" 2> /dev/null | grep -q '^\[bound\] .* cut off at its ' && echo reached || echo not reached)" \
         "left: none, lease: free, bound: not reached"
       check "bounded-perf-$phase-stopped" "$(grep -c '^\[perf\] kept ' "$pdir/log")" 0

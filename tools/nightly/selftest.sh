@@ -174,6 +174,9 @@ check archive-tree-bad-rev-names-git "$r|$(ls -A "$T/arc-tmp")" "1|128|-|"
 # runs out the monitor's bound then with an ALRM (GNU timeout's own; the stand-in's too) under a 60 s failsafe bound and
 # a KILL 0.5 s after, and a unit that nothing stopped ends by itself after 30 s, printing unit-survived (red); with no
 # monitor a unit has no bound.
+# PIN(2026-10-19): the bound path's bound was 0.5 s of wall clock against a unit that ended itself after 2 s, so a loaded host
+# that ran the bound out late read as a surviving unit. The assertions are unchanged (the runner's code, nothing left, no
+# unit-survived); the bound now runs out on the event, once the unit is ready.
 # shellcheck source=tools/ref/cancel-stubs.sh
 source "$ROOT/tools/ref/cancel-stubs.sh"
 mkdir "$T/ru-bin"

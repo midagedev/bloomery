@@ -397,6 +397,8 @@ self_test() {
   # the sync cases answer their probes from a script and end on the probe that settles them, so that bound is only a failsafe, and a bound
   # the scripted answers must fit in reads the machine's load (each probe is a handful of forks). The one case that needs the bound to end
   # the wait, a lock held with no tree id for good, runs the second copy, whose sync wait is 2 s and whose verdict is the bound's whatever the load.
+  # PIN(2026-10-19): the sync wait was 2 s in every case, a ceiling the scripted probes had to fit in; it is the real 120 s in
+  # every case but the one that judges the bound.
   sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$script" > "$box"
   sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=2 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$script" > "$bound"
   printf '%s\n' 'cuda-device = { git = "x", rev = "0123456789ab" }' > "$d/tree/Cargo.toml"
