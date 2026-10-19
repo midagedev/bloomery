@@ -886,6 +886,15 @@ impl<B: ChainBody> GpuModel<B> {
         watchdog::busy(&self.watch, watchdog::PROMPT, self.reads)
     }
 
+    /// The engine watchdog's progress word ([`crate::watchdog`]): it moves
+    /// whenever the engine thread ends a wait on the card, lands a residency
+    /// boundary, finishes a token's pass inside a guarded call or ends a
+    /// guarded call. A gate's instrument.
+    #[must_use]
+    pub fn engine_progress(&self) -> u64 {
+        self.watch.progress()
+    }
+
     /// The step and pass readbacks begun since the load — one a
     /// [`GpuModel::step`] call, one a [`GpuModel::step_rows`] pass: a
     /// residency boundary's report carries the count it ran after

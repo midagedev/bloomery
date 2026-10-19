@@ -127,6 +127,12 @@ impl Watch {
         }
     }
 
+    /// The progress word: what the watchdog polls, and a gate's instrument
+    /// through [`GpuModel::engine_progress`].
+    pub(crate) fn progress(&self) -> u64 {
+        self.progress.load(Ordering::Relaxed)
+    }
+
     /// The busy word of a call entering now: name and read count first, the
     /// busy word last, so a reader gated on busy most likely sees them.
     fn enter(&self, call: Call, reads: u64) {
