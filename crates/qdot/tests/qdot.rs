@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::restore_q82x4;
+use common::{q82_blocks, restore_q82x4};
 use gguf::GgmlType;
 use gguf::quant::{
     dequant_row, half_to_f32, quantize_row_q8_0_roundtrip, quantize_row_q8_2_x4_roundtrip,
@@ -3979,32 +3979,6 @@ fn ik_q82_block(x: &[f32]) -> Option<([i8; 32], u16, i16)> {
         isum = isum.wrapping_add(q);
     }
     Some((codes, t, isum as i16))
-}
-
-/// The q8_2 encoders' bytes for one column, split per block: (codes, d bits,
-/// isum), the x4 groups' layout (d at 2i, isum at 8 + 2i, codes at 16 + 32i)
-/// then the 36-byte tail blocks'.
-fn q82_blocks(col: &[u8], n_blocks: usize) -> Vec<([i8; 32], u16, i16)> {
-    const STRIDE: usize = 144;
-    const TAIL: usize = 36;
-    let nb4 = 4 * (n_blocks / 4);
-    let le16 = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
-    let codes = |b: &[u8]| std::array::from_fn(|i| b[i] as i8);
-    (0..n_blocks)
-        .map(|b| {
-            if b < nb4 {
-                let (g, ir) = (&col[b / 4 * STRIDE..], b % 4);
-                (
-                    codes(&g[16 + 32 * ir..]),
-                    le16(&g[2 * ir..]),
-                    le16(&g[8 + 2 * ir..]) as i16,
-                )
-            } else {
-                let tb = &col[nb4 / 4 * STRIDE + (b - nb4) * TAIL..];
-                (codes(&tb[4..]), le16(tb), le16(&tb[2..]) as i16)
-            }
-        })
-        .collect()
 }
 
 /// The qdot gates' one q8_2_x4 reader (`common::restore_q82x4`) against the rule's round trip, on every shape of block count:
