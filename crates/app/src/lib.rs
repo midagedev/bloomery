@@ -32,6 +32,7 @@ pub mod arch;
 #[cfg(feature = "dspark")]
 pub mod dspark;
 pub mod mtp;
+pub mod warm;
 
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::served::prompt_pass;
@@ -42,7 +43,7 @@ use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Machine, Plan};
 use runtime::seqstate::Kept;
-use runtime::swaprule::KeptRows;
+use runtime::swaprule::{KeptRows, SwapRule};
 use runtime::{Draft, Out, RowLogits, Speculative, Target, Verify, Want, Width, Widths, Window};
 
 /// What a session call failed with. Its text is the failure's own: a card
@@ -470,6 +471,24 @@ impl<B: ChainBody> Session<B> {
     pub fn residency_reset(&mut self) -> Result<Option<ResetReport>, SessionError> {
         self.idle("residency reset")?;
         Ok(self.model.residency_reset()?)
+    }
+
+    /// The residency to a new seed ([`GpuModel::residency_reseed`]),
+    /// `order[i]` the ranking of the machine's `i`-th layer: what every later
+    /// reset, [`Session::clear`]'s included, returns to. `None` on a model
+    /// with no residency machine.
+    pub fn residency_reseed(
+        &mut self,
+        order: &[&[u32]],
+    ) -> Result<Option<ResetReport>, SessionError> {
+        self.idle("residency reseed")?;
+        Ok(self.model.residency_reseed(order)?)
+    }
+
+    /// The residency machine's rule ([`GpuModel::residency_rule`]); `None` on
+    /// a model with no residency machine.
+    pub fn residency_rule(&mut self) -> Option<&SwapRule> {
+        self.model.residency_rule()
     }
 
     /// The report of the residency reset the last [`Session::clear`] made,
