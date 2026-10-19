@@ -1920,17 +1920,25 @@ gate-ds41-bind:
 # the route trace takes only the step feed, no MTP draft, one slot and no residency word but off; the step feed takes
 # no MTP draft and no such word; a step-fed prompt is never cut at a message start; the one levers list the server and its
 # gate parse (shared/qwen38_levers.rs) holds exactly the levers the seat reads; the default slot count's floor fallback
-# answers the NVMe tier floor's refusal and a unified pool's PoolBudget, and no other. Host only, no card or gate lock.
+# answers the NVMe tier floor's refusal and a unified pool's PoolBudget, and no other. The shared serve client
+# holds the reply evidence. Host only, no card or gate lock.
 [group('host')]
 gate-q38-serve-rules:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --bin bloomery-serve-qwen38'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --lib -- serve_client:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,gemma-embedding2,hf --bin bloomery-serve-qwen38'
+
+# The shared draft's prompt boundaries and per-slot costs in the other serve targets that include it.
+# Host only, no card or gate lock.
+[group('host')]
+gate-serve-draft-rules:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,mimo2,gemma-embedding2,hf --bin bloomery-serve --bin bloomery-serve-ds41'
 
 # The V4.1 binaries' `--place` word (`generate::Place`, behind the deepseek41 feature like bind): each alias and its card
 # list (`a6000+3090` is `bp`) planning the machine its plan function makes, a list word planning its own cards, and every
-# refusal by name before any plan. Host only, no card or gate lock.
+# refusal by name before any plan. The GLM generator's TP plan holds rank order and bytes at N = 1, 2 and 4.
+# Host only, no card or gate lock.
 [group('host')]
 gate-ds41-place:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- generate::'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- generate:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next --bin generate_glm5next'
 
 # ik의 KLD 기준 파일(ik-ppl --kld-base)이 그것을 쓴 실행과 맞는지 본다: 헤더의 ctx·청크 수와 파일 크기가 실행의 결과
 # 줄과 같고, 기록마다 ik 양자화기가 쓸 수 있는 모양이며, 파일에서 다시 잰 PPL이 실행이 찍은 PPL과 양자화 밴드 안에서
@@ -2379,11 +2387,11 @@ gate-gpu-qwen38-nodes-remote:
 # the server surface it links (gpu-gates' bind, serve_client; the serve and sampler crates) sits behind
 # that feature today — `just affected` and the recipes.py pins scope it so.
 # Stays solo, reason: the host set (tools/gate-batch-resources.tsv) loads under the big-load lock, and the seat's unset residency pick reads MemAvailable against the churn pool, so a neighbour's load moves it.
-# Never solo-real: the generate call and the two main servers pass `--place gate` (the 3090's bytes on the smallest card with the room for them: the 3090 on the box), the unset-place servers plan on the one card in view, and the gate plans on RTX_3090 directly (no shared/gate_card.rs); its gpu-gate.sh calls are 3090-only, and solo-real balances on `any`.
+# Never solo-real: the generate call and the two main servers pass `--place gate` (the 3090's bytes on the smallest card with the room for them: the 3090 on the box), the unset-place servers plan on the one card in view, and the gate plans on RTX_3090 directly (no shared/gate_card.rs); its plain arm's gpu-gate.sh call is 3090-only, and solo-real balances on `any`.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-serve:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && . tools/ref/ref-paths.sh && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,gemma-embedding2,hf --release --bin bloomery-serve-qwen38 --bin gate_qwen38_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/q38-serve-gate && rm -rf $D && mkdir -p $D && T="The capital of France is" && I=$REF_TOKENS && echo "prompt: $T" && echo "ids: $I" && bash tools/gpu-gate.sh generate_qwen3moe --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_qwen38_serve --arm plain --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/plain && bash tools/gpu-gate.sh gate_qwen38_serve --arm drafted --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/drafted'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && . tools/ref/ref-paths.sh && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,gemma-embedding2,hf --release --bin bloomery-serve-qwen38 --bin gate_qwen38_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/q38-serve-gate && rm -rf $D && mkdir -p $D && T="The capital of France is" && I=$REF_TOKENS && echo "prompt: $T" && echo "ids: $I" && bash tools/gpu-gate.sh generate_qwen3moe --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_qwen38_serve --arm plain --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/plain && bash tools/gpu-gate.sh gate_qwen38_serve --arm drafted --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/drafted && bash tools/gpu-gate.sh gate_qwen38_serve --arm lookup --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/lookup'
 
 # The qwen3 seat of bloomery-serve (--model qwen3 -m <file>) against generate_qwen3moe, on the qwen3moe profile's file
 # (Qwen3-30B-A3B, the MODEL box.sh exports under BLOOMERY_MODEL=qwen3moe), the qwen35moe profile's (Qwen3.6-35B-A3B,

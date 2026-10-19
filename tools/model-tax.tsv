@@ -85,8 +85,6 @@ crates/gpu-gates/src/bin/shared/routed_legs.rs	nemotron	6	baseline P 6: MK2 prog
 crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	24	baseline P 24: MK2 program by body
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	clef	13	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	qwen	13	baseline S 13: MK9 seat by program
-crates/gpu-gates/src/bin/shared/serve_seats/drafted.rs	glm	1	baseline S 1: MK9 seat by program
-crates/gpu-gates/src/bin/shared/serve_seats/drafted.rs	qwen	1	baseline S 1: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/served.rs	qwen	1	baseline S 1: MK9 seat by program
 crates/gpu-gates/src/bin/shared/state_back.rs	deepseek	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/vision_taps.rs	clef	1	baseline D 1: media design: VideoRule data per tower (vidcore)

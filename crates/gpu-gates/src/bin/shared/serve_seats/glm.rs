@@ -408,7 +408,8 @@ fn draft_of(
         Some("off") => Ok(Some("BLOOMERY_DRAFT=off".to_owned())),
         Some(other) => Err(format!(
             "BLOOMERY_DRAFT={other}: on a glm5next file mtp drafts the window (the file's NextN \
-             layer); lookup and dspark are the V4.1 binaries'"
+             layer); lookup needs a load that verifies two rows, which a glm5next load holds \
+             (two KDA lanes) only with its NextN layer, and dspark is the V4.1 binaries'"
         )
         .into()),
         None => {

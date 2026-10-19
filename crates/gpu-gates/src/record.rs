@@ -3827,9 +3827,10 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 /// and, drafting nothing, why after the `load` line, drafting, its head
 /// after the `load draft=mtp` line; under `--dump-taps`,
 /// after its `load` line; under `--time`, a drafted arm's passes and a
-/// `BLOOMERY_GEN_SLOTS` arm's rounds as `time pass` records; a drafted arm's
-/// `mtp summary` and, under `BLOOMERY_MTP_WINDOWS`, its `mtp window` records
-/// after its lines; and under `BLOOMERY_STEP_STATS`, after a qwen4exp run's
+/// `BLOOMERY_GEN_SLOTS` arm's rounds as `time pass` records; an MTP-drafted
+/// arm's `mtp summary` and, under `BLOOMERY_MTP_WINDOWS`, its `mtp window`
+/// records after its lines, a lookup-drafted arm's `draft summary`; and
+/// under `BLOOMERY_STEP_STATS`, after a qwen4exp run's
 /// lines; the binary's other lines are its own.
 pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &PLAN38,
@@ -3844,6 +3845,7 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &TIME_PASS,
     &MTP_SUMMARY,
     &MTP_WINDOW,
+    &DRAFT_SUMMARY,
     &STAT_STEP_HOST,
     &STAT_SUMMARY_HOST,
     &STAT_PROMPT_SPLIT,
@@ -3889,6 +3891,40 @@ pub fn width_gate(r: Record, s: &runtime::width::GateState, closed: u64) -> Reco
         .csv("costs", costs)
         .csv("a", s.a.iter().map(|a| format!("{a:.3}")))
         .u("closed", closed)
+}
+
+/// The `draft summary` record of a drafted run's `passes`, each whether it
+/// verified a proposal, whether the target kept the proposal and the
+/// positions it kept: their counts, the kept passes' positions per second
+/// `rate`, the draft `kind`, and `chooser`'s mode and, under cost, its state
+/// and the passes it ran closed ([`width_gate`]), its count started over.
+#[cfg(feature = "gpu")]
+pub fn draft_summary<D, C: runtime::width::Clock>(
+    passes: impl Iterator<Item = (bool, bool, usize)>,
+    rate: f64,
+    kind: &str,
+    chooser: &mut runtime::width::Choosing<D, C>,
+) -> Record {
+    let (mut proposals, mut accepts, mut positions, mut count) = (0usize, 0usize, 0usize, 0usize);
+    for (proposed, accepted, kept) in passes {
+        proposals += usize::from(proposed);
+        accepts += usize::from(accepted);
+        positions += kept;
+        count += 1;
+    }
+    let r = Record::new(&DRAFT_SUMMARY)
+        .u("proposals", proposals)
+        .u("accepts", accepts)
+        .u("positions", positions)
+        .u("passes", count)
+        .f("tok/s(positions)", rate)
+        .w("kind", kind)
+        .w("width", chooser.mode().word());
+    let closed = chooser.take_tally().closed;
+    match chooser.mode() {
+        runtime::width::Mode::Fixed => r,
+        runtime::width::Mode::Cost => width_gate(r, &chooser.gate_state(), closed),
+    }
 }
 
 /// The width chooser's account of an arm on `r`, an `mtp summary`: its

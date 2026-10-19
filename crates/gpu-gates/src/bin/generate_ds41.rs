@@ -2537,29 +2537,18 @@ mod drive {
         chooser: &mut Choosing<D>,
     ) {
         let warm = a.warm.unwrap_or(0);
-        let proposals = passes.iter().filter(|p| p.0 != PassKind::Plain).count();
-        let accepts = passes.iter().filter(|p| p.0 == PassKind::Accept).count();
-        let positions: usize = passes.iter().map(|p| p.0.positions()).sum();
         let kept = &passes[warm..];
         let kept_positions: usize = kept.iter().map(|p| p.0.positions()).sum();
         let kept_ms: f64 = kept.iter().map(|p| p.1).sum();
         let rate = kept_positions as f64 * 1e3 / kept_ms;
-        let summary = Record::new(&record::DRAFT_SUMMARY)
-            .u("proposals", proposals)
-            .u("accepts", accepts)
-            .u("positions", positions)
-            .u("passes", passes.len())
-            .f("tok/s(positions)", rate)
-            .w("kind", kind)
-            .w("width", chooser.mode().word());
-        let summary = match chooser.mode() {
-            WidthMode::Fixed => summary,
-            WidthMode::Cost => {
-                let closed = chooser.take_tally().closed;
-                record::width_gate(summary, &chooser.gate_state(), closed)
-            }
-        };
-        summary.print();
+        let p = passes.iter().map(|p| {
+            (
+                p.0 != PassKind::Plain,
+                p.0 == PassKind::Accept,
+                p.0.positions(),
+            )
+        });
+        record::draft_summary(p, rate, kind, chooser).print();
         if a.timed {
             let mut sorted: Vec<f64> = kept.iter().map(|p| p.1).collect();
             sorted.sort_by(f64::total_cmp);

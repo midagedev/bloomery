@@ -11,9 +11,10 @@
 //! over its body and nothing else: a body that cannot verify rows (a
 //! qwen3moe file's) holds an owner that is only ever off.
 //!
-//! The lookup draft is not here: it rebuilds its tables from the target's token
-//! history, which only the V4.1 body keeps (`Body::history`), so it stays an
-//! arm of the V4.1 seat beside the owner.
+//! The lookup arm holds the serve seats' one owner of the lookup draft,
+//! [`Lookups`]: a context and a width chooser a resident slot, the context
+//! one the V4.1 seat rebuilds from its body's token history when it falls
+//! behind.
 //!
 //! The rule that a DSpark draft serves one slot is [`draft_slots`], and the
 //! qwen3 seat's draft word is [`word`].
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use app::{Keep, Prompt, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuError;
-use bloomery_gpu::model::{ChainBody, Rollback, Rows};
+use bloomery_gpu::model::{ChainBody, Rollback, Rows, Slots};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{SlotsFrom, nvidia_smi_index};
 use bloomery_levers::Levers;
@@ -31,6 +32,7 @@ use runtime::width::{Choosing, Chosen, Mode as WidthMode};
 use runtime::{Advance, Committed, Draft as RtDraft, Speculative, Widths, Window};
 use serve::{DeviceProps, DraftProps, Drafted, EngineProps, PlacementProps};
 
+use super::drafted::{History, LOOKUP_ROWS, Lookups, Taking, drafted, lookup_props};
 use crate::draft::Draft;
 
 /// The class `/props` files the draft's resident bytes under.
@@ -163,16 +165,44 @@ struct Dspark<B: ChainBody + 'static> {
     file: Option<PathBuf>,
 }
 
-/// The draft a seat serves besides its lookup: none, or the DSpark draft
+/// The draft a seat serves: none, the DSpark draft or the lookup, each
 /// verified by the session's pass behind the width chooser.
 pub struct ServedDraft<B: ChainBody + 'static> {
     dspark: Option<Dspark<B>>,
+    lookup: Option<Lookups<Session<B>>>,
 }
 
-impl<B: ChainBody + 'static> ServedDraft<B> {
+impl<B> ServedDraft<B>
+where
+    B: Prompt + Keep + Slots + 'static,
+    B::Seq: 'static,
+{
     /// No draft: every call is the seat's plain one.
     pub fn off() -> Self {
-        ServedDraft { dspark: None }
+        ServedDraft {
+            dspark: None,
+            lookup: None,
+        }
+    }
+
+    /// The lookup draft on each of `slots` resident slots of `s`
+    /// ([`Lookups::open`]), each behind a width chooser of `mode`, the verify
+    /// pass captured now (`log` told of it); `history` the body's token
+    /// history, where it keeps one.
+    pub fn lookup(
+        s: &mut Session<B>,
+        slots: usize,
+        mode: WidthMode,
+        log: &mut impl RowsLog,
+        history: Option<History<Session<B>>>,
+    ) -> Result<Self, GateError>
+    where
+        B: Rows + Rollback,
+    {
+        Ok(ServedDraft {
+            dspark: None,
+            lookup: Some(Lookups::open(s, slots, mode, log, history)?),
+        })
     }
 
     /// `draft` on `s`, behind the width chooser of `mode`, its verify pass of
@@ -196,39 +226,68 @@ impl<B: ChainBody + 'static> ServedDraft<B> {
                 window: Box::new(spec),
                 file,
             }),
+            lookup: None,
         })
     }
 
     /// The most rows [`Seat::pass`](bloomery_gpu_gates::bind::Seat::pass) runs.
     pub fn rows(&self) -> usize {
-        self.dspark.as_ref().map_or(1, |d| d.window.rows())
-    }
-
-    /// The prompt call of `ids`, when a draft takes it: the draft fed as the
-    /// call hands its features over, the argmax after the last id. `None`
-    /// without one: the seat's plain prompt call is the call.
-    pub fn prefill(&mut self, s: &mut Session<B>, ids: &[u32]) -> Result<Option<u32>, GateError> {
-        match &mut self.dspark {
-            None => Ok(None),
-            Some(d) => Ok(Some(d.window.prompt_call(s, ids)?)),
+        match (&self.dspark, &self.lookup) {
+            (Some(d), _) => d.window.rows(),
+            (None, Some(_)) => LOOKUP_ROWS,
+            (None, None) => 1,
         }
     }
 
-    /// An image in the prompt call is refused by name under the DSpark draft.
+    /// Whether the draft's state is per slot (`Seat::slot_drafts`): the
+    /// lookup's is, a context a slot.
+    pub fn slot_drafts(&self) -> bool {
+        self.lookup.is_some()
+    }
+
+    /// The prompt call of `ids`: under the DSpark draft the draft's own, fed
+    /// as the call hands its features over; else `plain`, the seat's own,
+    /// its ids fed to the lookup's context of the selected slot when the
+    /// lookup runs. The argmax after the last id.
+    pub fn prefill(
+        &mut self,
+        s: &mut Session<B>,
+        ids: &[u32],
+        plain: impl FnOnce(&mut Session<B>) -> Result<u32, GateError>,
+    ) -> Result<u32, GateError> {
+        match (&mut self.dspark, &mut self.lookup) {
+            (Some(d), _) => Ok(d.window.prompt_call(s, ids)?),
+            (None, Some(l)) => {
+                let slot = s.selected();
+                l.prompt_call(s, slot, ids, plain)
+            }
+            (None, None) => plain(s),
+        }
+    }
+
+    /// The prompt call of `ids` that holds an image, `call` the seat's own:
+    /// refused by name under the DSpark draft, its ids fed to the lookup's
+    /// context as [`ServedDraft::prefill`]'s.
     #[cfg(feature = "vision")]
-    pub fn refuse_media(&self) -> Result<(), GateError> {
-        match self.dspark {
-            None => Ok(()),
-            Some(_) => Err(MEDIA_UNDER_DSPARK.into()),
+    pub fn prefill_media(
+        &mut self,
+        s: &mut Session<B>,
+        ids: &[u32],
+        call: impl FnOnce(&mut Session<B>) -> Result<u32, GateError>,
+    ) -> Result<u32, GateError> {
+        if self.dspark.is_some() {
+            return Err(MEDIA_UNDER_DSPARK.into());
         }
+        self.prefill(s, ids, call)
     }
 
     /// The seat's plain step of `last` took `next`: the draft takes in the
     /// position.
     pub fn stepped(&mut self, s: &mut Session<B>, last: u32, next: u32) -> Result<(), GateError> {
-        match &mut self.dspark {
-            None => Ok(()),
-            Some(d) => Ok(d.window.stepped(s, last, next)?),
+        match (&mut self.dspark, &mut self.lookup) {
+            (Some(d), _) => Ok(d.window.stepped(s, last, next)?),
+            (None, Some(l)) => l.stepped(s, s.selected(), last, next),
+            (None, None) => Ok(()),
         }
     }
 
@@ -241,23 +300,44 @@ impl<B: ChainBody + 'static> ServedDraft<B> {
         last: u32,
         out: &mut Vec<u32>,
     ) -> Result<Option<Drafted>, GateError> {
-        match &mut self.dspark {
-            None => Ok(None),
-            Some(d) => Ok(Some(drafted(d.window.pass(s, last, out)?))),
+        match (&mut self.dspark, &mut self.lookup) {
+            (Some(d), _) => Ok(Some(drafted(d.window.pass(s, last, out)?))),
+            (None, Some(l)) => {
+                let slot = s.selected();
+                Ok(Some(l.pass(s, slot, last, Taking::Argmax, out)?))
+            }
+            (None, None) => Ok(None),
         }
     }
 
-    /// The target stands elsewhere than the draft was fed.
+    /// The target stands elsewhere than the draft was fed: another slot
+    /// selected, or a cut. The DSpark draft starts over at its next call;
+    /// the lookup's contexts follow their slots by position and need
+    /// nothing.
     pub fn moved(&mut self) {
         if let Some(d) = &mut self.dspark {
             d.window.forget();
         }
     }
 
-    /// The target was reset: the draft starts over with it.
-    pub fn reset(&mut self) -> Result<(), GateError> {
+    /// `slot`'s sequence was put back from a saved state: the DSpark draft
+    /// starts over at its next call, and the lookup's context of the slot
+    /// starts over (from the body's history where it keeps one).
+    pub fn replaced(&mut self, slot: usize) -> Result<(), GateError> {
+        self.moved();
+        if let Some(l) = &mut self.lookup {
+            l.forget(slot)?;
+        }
+        Ok(())
+    }
+
+    /// The target's `slot` was reset: the draft starts over with it.
+    pub fn reset(&mut self, slot: usize) -> Result<(), GateError> {
         if let Some(d) = &mut self.dspark {
             d.window.restart()?;
+        }
+        if let Some(l) = &mut self.lookup {
+            l.forget(slot)?;
         }
         Ok(())
     }
@@ -299,6 +379,9 @@ impl<B: ChainBody + 'static> ServedDraft<B> {
     /// row, the class `draft` (a row of its own when the target has no layer
     /// there). The card's index missing leaves the device out.
     pub fn props(&self, mut p: EngineProps) -> EngineProps {
+        if self.lookup.is_some() {
+            return lookup_props(p);
+        }
         let Some(Dspark { window, file }) = &self.dspark else {
             return p;
         };
@@ -333,18 +416,6 @@ where
     D: RtDraft<Session<B>>,
 {
     Ok(<D as Chosen<Session<B>>>::choosing(d, mode)?)
-}
-
-/// A pass's draft counts: the proposal's ids, the ones kept.
-pub fn drafted(c: Committed) -> Drafted {
-    if c.proposed {
-        Drafted {
-            proposed: c.rows - 1,
-            accepted: c.kept - 1,
-        }
-    } else {
-        Drafted::default()
-    }
 }
 
 /// `BLOOMERY_DRAFT` as the levers hold it for a seat that takes `off`: unset

@@ -1,21 +1,32 @@
 //! `gate_qwen38_serve` — `bloomery-serve-qwen38` on the 3090 (placement
 //! gate), driven over HTTP, as one process under the GPU gate lock.
 //!
-//!     gate_qwen38_serve --arm plain|drafted --gen <generate_qwen3moe log>
+//!     gate_qwen38_serve --arm plain|drafted|lookup --gen <generate_qwen3moe log>
 //!                       --prompt <text> --ids <a,b,…> --dir <out>
 //!
-//! Two arms, one a process, the recipe's two gate-lock holds: `plain`, the
-//! main server with the draft off and then every clause of its own below,
-//! and `drafted`, the main server with the draft on and its drafted clauses
-//! alone (the bullets that name it), stopped before any other server. The
-//! servers a run loads are those two mains, the slots clause's two, the
+//! Three arms, each a process under the recipe's gate lock. `lookup` runs
+//! two two-slot servers, draft off then lookup: their ids agree, including
+//! a seeded sampled request the lookup drafts, whose draws leave the greedy
+//! ids, and one with logprobs that steps; two-row capture nodes and draft
+//! counts prove that verifies keep both one and two positions (file-bound),
+//! and a completion whose draft counts are malformed, or one without the
+//! other, fails the arm. Both
+//! conversations restore their cached prefixes on different slots after
+//! the resident slots are erased. A third two-slot lookup server, under the
+//! width chooser's cost mode, runs the code and the prose requests
+//! together: their slots take turns at the passes, their ids are the
+//! draft-off server's, and each slot's chooser ends its warm-up
+//! ([`lookup_cost_turns`]). `plain` runs the main server with the
+//! draft off, then every clause of its own below. `drafted` runs the main
+//! server with MTP and its drafted clauses alone, stopped before any other
+//! server. These last two arms load their mains, the slots clause's two, the
 //! width chooser's one, the sampled rounds' one, the unhosted-pool clause's
 //! one and the draft share clause's unset-draft one (stopped at its `load
 //! draft=off` record); the `ctx` clause's three starts, the residency word's
 //! one and the unhosted-pool clause's plan-only one stop before the load.
-//! Each arm starts the server beside this binary (`--host 127.0.0.1
-//! --port 0 --place gate --ctx-size 4096`), reads its address from its
-//! stderr, waits for `/health`, then checks:
+//! The plain and drafted arms start the server beside this binary (`--host
+//! 127.0.0.1 --port 0 --place gate --ctx-size 4096`), read its address from
+//! stderr, wait for `/health`, then check:
 //!
 //! - `/props`' `engine` object, printed once, against this gate's own plan of
 //!   the file the server opens (the gate card, the server's default context,
@@ -476,7 +487,8 @@ mod gate {
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, rung_above};
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
-        PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore, server_log,
+        LookupCompletion, PrefixRestore, curl, ids_of, json_of, metric, parse_ids, prefix_restore,
+        server_log, slot_erased,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -494,7 +506,7 @@ mod gate {
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
 
-    const USAGE: &str = "usage: gate_qwen38_serve --arm plain|drafted --gen <generate_qwen3moe log> \
+    const USAGE: &str = "usage: gate_qwen38_serve --arm plain|drafted|lookup --gen <generate_qwen3moe log> \
                          --prompt <text> --ids <a,b,…> --dir <out>";
 
     /// The server's arguments after its path; `/props` must echo them. The
@@ -752,6 +764,7 @@ mod gate {
     enum Arm {
         Plain,
         Drafted,
+        Lookup,
     }
 
     impl Arm {
@@ -759,7 +772,8 @@ mod gate {
             match v {
                 "plain" => Ok(Arm::Plain),
                 "drafted" => Ok(Arm::Drafted),
-                other => Err(format!("--arm is plain or drafted, not {other}").into()),
+                "lookup" => Ok(Arm::Lookup),
+                other => Err(format!("--arm is plain, drafted or lookup, not {other}").into()),
             }
         }
     }
@@ -4868,6 +4882,278 @@ mod gate {
         Ok(ok)
     }
 
+    /// How a lookup arm request takes its tokens after the first.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Taken {
+        /// Greedy, through the draft's passes.
+        Greedy,
+        /// Drawn with [`SAMPLED_SEED`] from every token (`top_k` 0, `top_p`
+        /// 1, `min_p` 0) at temperature 1.5, through the draft's passes, each
+        /// kept id the sampler's draw from its verified row. The code
+        /// prompt's rows are confident enough that the default truncation
+        /// at [`SAMPLED_TEMPERATURE`] draws the greedy ids; these draws leave
+        /// them.
+        Sampled,
+        /// Drawn at [`SAMPLED_TEMPERATURE`] with [`SAMPLED_SEED`] and two
+        /// probabilities a token: plain steps, no draft.
+        Logprobs,
+    }
+
+    /// Two resident slots, then both conversations restored from the prompt
+    /// cache in reverse order: the lookup follows the sequence, not its slot.
+    /// The lookup server's ids are the draft-off server's, sampled requests
+    /// included: the lookup takes no card bytes, so both load one plan, and
+    /// a seeded draw from a verified row is the draw from that position's
+    /// step.
+    fn lookup_main(dir: &Path, prompt: &str, reference: &[u32]) -> Result<bool, GateError> {
+        let code = (0..12)
+            .map(|i| format!("def add_{i}(a, b):\n    return a + b + {i}\n\n"))
+            .collect::<String>()
+            + "def add_12(a, b):\n";
+        let prose = "Write the numbers from one to two hundred in English words, separated by \
+                     commas: one, two, three, four, five,";
+        let mut args = SERVER_ARGS.to_vec();
+        args[11] = "2";
+        let mut plain = Vec::<LookupCompletion>::new();
+        let mut ok = true;
+        for draft in ["off", "lookup"] {
+            let own = dir.join(draft);
+            std::fs::create_dir_all(&own)?;
+            let err_log = own.join("server.err");
+            let mut cmd = Command::new(Served38::exe()?);
+            cmd.env(bloomery_levers::DRAFT, draft)
+                .env(bloomery_levers::RESIDENCY, "off")
+                .env_remove(bloomery_levers::MTP_WIDTH);
+            if draft == "lookup" {
+                cmd.env(bloomery_levers::MTP_WIDTH, "fixed");
+            }
+            let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+            let addr = served.address(&err_log, POLLS, POLL)?;
+            let url = |p: &str| format!("http://{addr}{p}");
+            let mut answers = Vec::<LookupCompletion>::new();
+            let mut proposed = 0_u64;
+            let mut accepted = 0_u64;
+            for (i, (text, n, taken)) in [
+                (prompt, N_PREDICT, Taken::Greedy),
+                (code.as_str(), 64, Taken::Greedy),
+                (prose, 64, Taken::Greedy),
+                (prose, 64, Taken::Greedy),
+                (code.as_str(), 64, Taken::Greedy),
+                (code.as_str(), 64, Taken::Logprobs),
+                (code.as_str(), 64, Taken::Sampled),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if i == 1 || i == 3 {
+                    for slot in 0..2 {
+                        let (st, body) = curl(
+                            &url(&format!("/slots/{slot}?action=erase")),
+                            Some(&json!({})),
+                            false,
+                        )?;
+                        slot_erased(&json_of("lookup erase", st, &body)?, slot, CTX as u64)?;
+                    }
+                }
+                let mut request = json!({
+                    "prompt": text, "n_predict": n, "temperature": 0,
+                    "return_tokens": true, "cache_prompt": true,
+                });
+                match taken {
+                    Taken::Greedy => {}
+                    Taken::Sampled => {
+                        for (k, v) in [
+                            ("temperature", json!(1.5)),
+                            ("top_k", json!(0)),
+                            ("top_p", json!(1.0)),
+                            ("min_p", json!(0.0)),
+                            ("seed", json!(SAMPLED_SEED)),
+                        ] {
+                            request[k] = v;
+                        }
+                    }
+                    Taken::Logprobs => {
+                        request["temperature"] = json!(SAMPLED_TEMPERATURE);
+                        request["seed"] = json!(SAMPLED_SEED);
+                        request["n_probs"] = json!(2);
+                    }
+                }
+                let (st, body) = curl(&url("/completion"), Some(&request), false)?;
+                let answer = json_of("lookup completion", st, &body)?;
+                println!("lookup {draft} request={i} {answer}");
+                let answer = LookupCompletion::read(&answer, 2, CTX as u64)?;
+                check(
+                    &mut ok,
+                    &format!("lookup_{draft}_{i}_completes"),
+                    answer.tokens.len() == n,
+                );
+                if taken == Taken::Sampled {
+                    check(
+                        &mut ok,
+                        &format!("lookup_{draft}_{i}_draws_off_the_greedy_ids"),
+                        answer.tokens != answers[4].tokens,
+                    );
+                }
+                if i == 0 {
+                    check(
+                        &mut ok,
+                        &format!("lookup_{draft}_ids_are_generate_qwen3moe"),
+                        agree(&answer.tokens, &answer.stop, reference),
+                    );
+                }
+                let (d, a) = (answer.proposed, answer.accepted);
+                if draft == "lookup" {
+                    check(
+                        &mut ok,
+                        &format!("lookup_{i}_ids_are_draft_off"),
+                        answer.tokens == plain[i].tokens,
+                    );
+                    if taken == Taken::Logprobs {
+                        check(&mut ok, "lookup_logprobs_step_without_a_draft", d == 0);
+                    } else if i > 0 {
+                        check(&mut ok, &format!("lookup_{i}_verifies_proposals"), d > 0);
+                    }
+                    proposed = proposed
+                        .checked_add(d)
+                        .ok_or("lookup draft_n sum overflow")?;
+                    accepted = accepted
+                        .checked_add(a)
+                        .ok_or("lookup draft_n_accepted sum overflow")?;
+                }
+                answers.push(answer);
+            }
+            for (fresh, restored) in [(1, 4), (2, 3)] {
+                check(
+                    &mut ok,
+                    &format!("lookup_{draft}_{fresh}_moves_slots_with_its_cache"),
+                    answers[fresh].slot != answers[restored].slot
+                        && answers[restored].cache_n > 0
+                        && answers[fresh].tokens == answers[restored].tokens,
+                );
+            }
+            if draft == "lookup" {
+                let capture = record_line(&err_log, "capture verify")?
+                    .ok_or("lookup capture verify: missing record")?;
+                println!("lookup {capture}; proposed={proposed} accepted={accepted}");
+                check(
+                    &mut ok,
+                    "lookup_captures_two_verify_rows",
+                    word_of(&capture, "rows") == Some("2")
+                        && word_of(&capture, "nodes")
+                            .and_then(|n| n.parse::<u64>().ok())
+                            .is_some_and(|n| n > 0),
+                );
+                // A random-weight fixture need not produce both acceptance cases.
+                if tier::run_clause("lookup_verify_keeps_one_and_two_positions", Tag::FileBound)? {
+                    check(
+                        &mut ok,
+                        "lookup_verify_keeps_one_and_two_positions",
+                        accepted > 0 && proposed > accepted,
+                    );
+                }
+            } else {
+                plain = answers;
+            }
+            println!("lookup {draft} server stopped: {}", served.stop()?);
+        }
+        let texts = [code.as_str(), prose];
+        ok &= lookup_cost_turns(
+            dir,
+            texts,
+            [plain[1].tokens.as_slice(), plain[2].tokens.as_slice()],
+        )?;
+        Ok(ok)
+    }
+
+    /// The lookup under the width chooser's cost mode, on `--parallel 2` with
+    /// `BLOOMERY_STEP_STATS=1`, into `<dir>/cost`: the two `texts` (the arm's
+    /// code and prose requests) run together, so their slots take turns at
+    /// the passes (a `slots round` of two rows in two passes), and their ids
+    /// are `plain`, the draft-off server's. Each slot's chooser reads its own
+    /// passes, so both end their warm-up: erasing the two slots prints each
+    /// slot's `mtp width` record of its request, every width's cost read.
+    fn lookup_cost_turns(
+        dir: &Path,
+        texts: [&str; 2],
+        plain: [&[u32]; 2],
+    ) -> Result<bool, GateError> {
+        let own = dir.join("cost");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let mut args = SERVER_ARGS.to_vec();
+        args[11] = "2";
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::DRAFT, "lookup")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env(bloomery_levers::MTP_WIDTH, "cost")
+            .env(bloomery_levers::STEP_STATS, "1");
+        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let mut runs = Vec::new();
+        for text in texts {
+            runs.push(streamed_with(
+                &addr,
+                json!({
+                    "prompt": text, "n_predict": 64, "temperature": 0, "return_tokens": true,
+                    "cache_prompt": false, "stream": true,
+                }),
+            )?);
+        }
+        let mut ok = true;
+        for (i, ((h, rx), want)) in runs.into_iter().zip(plain).enumerate() {
+            h.join()
+                .map_err(|_| format!("lookup cost: request {i}'s thread panicked"))?;
+            let ran = rx
+                .recv()
+                .map_err(|_| format!("lookup cost: request {i}'s thread gave no answer"))??;
+            println!("lookup cost request={i} tokens {:?}", ran.tokens);
+            check(
+                &mut ok,
+                &format!("lookup_cost_{i}_ids_are_draft_off"),
+                ran.tokens == want,
+            );
+        }
+        let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
+        let turns = rounds
+            .iter()
+            .filter(|r| {
+                r.word("cmd") == Ok("pass") && r.u64("rows") == Ok(2) && r.u64("passes") == Ok(2)
+            })
+            .count();
+        println!(
+            "lookup cost: {turns} of {} rounds both slots' passes in turn",
+            rounds.len()
+        );
+        check(&mut ok, "lookup_cost_slots_take_turns", turns > 0);
+        let before = seat_log(&err_log)?.all(&record::MTP_WIDTH)?.len();
+        for slot in 0..2 {
+            let (st, body) = curl(
+                &format!("http://{addr}/slots/{slot}?action=erase"),
+                Some(&json!({})),
+                false,
+            )?;
+            slot_erased(&json_of("lookup cost erase", st, &body)?, slot, CTX as u64)?;
+        }
+        // Each erase prints its slot's record of the request. The warm-up's
+        // readings need a few proposals a slot, which a random-weight
+        // fixture need not make.
+        let widths = seat_log(&err_log)?.all(&record::MTP_WIDTH)?;
+        println!("lookup cost: width records {widths:?}, {before} before the erases");
+        if tier::run_clause("lookup_cost_warm_up_ends_on_both_slots", Tag::FileBound)? {
+            check(
+                &mut ok,
+                "lookup_cost_warm_up_ends_on_both_slots",
+                widths.len() == before + 2
+                    && widths[before..].iter().all(|r| {
+                        r.csv("costs")
+                            .is_ok_and(|c| c.len() == 2 && !c.contains(&"-"))
+                    }),
+            );
+        }
+        println!("lookup cost server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         if let Some(word) = levers.residency() {
@@ -4887,7 +5173,7 @@ mod gate {
         if let Some(word) = levers.draft() {
             return Err(format!(
                 "BLOOMERY_DRAFT={word}: the gate sets it on every server it starts (the plain \
-                 arm off, the drafted arm mtp)"
+                 arm off, the drafted arm mtp, the lookup arm off and lookup)"
             )
             .into());
         }
@@ -4902,6 +5188,7 @@ mod gate {
         let ok = match a.arm {
             Arm::Plain => plain(&a.dir, &levers, &a.prompt, &reference)?,
             Arm::Drafted => drafted_main(&a.dir, &levers, &a.prompt, &a.ids, &reference)?,
+            Arm::Lookup => lookup_main(&a.dir, &a.prompt, &reference)?,
         };
         if ok {
             println!("gate-gpu-qwen38-serve: PASS");

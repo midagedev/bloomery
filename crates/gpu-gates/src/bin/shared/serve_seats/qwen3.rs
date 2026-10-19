@@ -832,10 +832,9 @@ impl<B: Body3> Seat for Q3<B> {
     }
 
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        match self.draft.prefill(&mut self.s, ids)? {
-            Some(next) => Ok(next),
-            None => <B as Body3>::prompt(self.s.model_mut(), ids),
-        }
+        self.draft.prefill(&mut self.s, ids, |s| {
+            <B as Body3>::prompt(s.model_mut(), ids)
+        })
     }
 
     /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
@@ -851,45 +850,49 @@ impl<B: Body3> Seat for Q3<B> {
     /// [`vision_seat::Resident::encode`], [`Body3::prompt_media`]). A tile group is each tile's
     /// cells then its separator rows ([`vision_seat::Resident::group_rows`]), and the span's
     /// shape is that group's canvas ([`Body3::prompt_groups`]). A call is one shape or the other.
-    /// The draft's media refusal comes before any encode. The encode binds the model's card back
-    /// before the prompt call.
+    /// The draft's media refusal comes before any encode ([`ServedDraft::prefill_media`]). The
+    /// encode binds the model's card back before the prompt call.
     #[cfg(feature = "vision")]
     fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
-        let Some(v) = self.vision.as_mut() else {
+        let Q3 {
+            s, vision, draft, ..
+        } = self;
+        let Some(v) = vision.as_mut() else {
             return Err("no --mmproj: this seat serves no image".into());
         };
-        self.draft.refuse_media()?;
-        let inputs: Vec<&vision::media::EncoderInput> =
-            feeds.iter().map(|f| &f.prepared.input).collect();
-        let tiles = vision_seat::tile_group_count(&inputs)?;
-        if tiles != 0 {
-            let ctx = Arc::clone(self.s.model().gpu().context());
-            let mut groups = Vec::with_capacity(feeds.len());
-            for f in feeds {
-                let vision::media::EncoderInput::Tiles(group) = &f.prepared.input else {
-                    return Err("a tile group call holds a patch grid".into());
-                };
-                let (rows, canvas) = v.group_rows(&ctx, group)?;
-                if canvas.rows() != f.prepared.span_len {
-                    return Err(format!(
-                        "image at {}: the canvas holds {} rows, the prompt's span is {}",
-                        f.at,
-                        canvas.rows(),
-                        f.prepared.span_len
-                    )
-                    .into());
+        draft.prefill_media(s, ids, |s| {
+            let inputs: Vec<&vision::media::EncoderInput> =
+                feeds.iter().map(|f| &f.prepared.input).collect();
+            let tiles = vision_seat::tile_group_count(&inputs)?;
+            if tiles != 0 {
+                let ctx = Arc::clone(s.model().gpu().context());
+                let mut groups = Vec::with_capacity(feeds.len());
+                for f in feeds {
+                    let vision::media::EncoderInput::Tiles(group) = &f.prepared.input else {
+                        return Err("a tile group call holds a patch grid".into());
+                    };
+                    let (rows, canvas) = v.group_rows(&ctx, group)?;
+                    if canvas.rows() != f.prepared.span_len {
+                        return Err(format!(
+                            "image at {}: the canvas holds {} rows, the prompt's span is {}",
+                            f.at,
+                            canvas.rows(),
+                            f.prepared.span_len
+                        )
+                        .into());
+                    }
+                    groups.push((f.at, rows, canvas));
                 }
-                groups.push((f.at, rows, canvas));
+                return B::prompt_groups(s, ids, &groups);
             }
-            return B::prompt_groups(&mut self.s, ids, &groups);
-        }
-        let encoded = v.encode(
-            self.s.model().gpu().context(),
-            feeds
-                .iter()
-                .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
-        )?;
-        B::prompt_media(&mut self.s, ids, encoded)
+            let encoded = v.encode(
+                s.model().gpu().context(),
+                feeds
+                    .iter()
+                    .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
+            )?;
+            B::prompt_media(s, ids, encoded)
+        })
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
@@ -991,7 +994,7 @@ impl<B: Body3> Seat for Q3<B> {
     /// starting over with it.
     fn reset(&mut self) -> Result<(), GateError> {
         self.s.model_mut().reset()?;
-        self.draft.reset()
+        self.draft.reset(self.s.selected())
     }
 
     /// The session's cut (`app::Keep`), which takes only a position
@@ -1333,16 +1336,12 @@ fn dspark_refusal(placed: Option<(String, String)>) -> GateError {
 /// The draft `BLOOMERY_DRAFT` names for the `arch` file at `path`: unset and
 /// `off` are the plain path ([`served::word`]), `dspark` is the draft a
 /// qwen35moe file serves, refused by name on the other families, and `lookup`
-/// is refused on all (it reads the V4.1 body's token history).
+/// is refused on all, each family by why its load verifies no rows
+/// ([`lookup_refusal`]).
 fn draft_of(arch: Family, levers: &Levers, path: &Path) -> Result<Draft, GateError> {
     let draft = served::word(levers)?;
     match (draft, arch) {
-        (Draft::Lookup, _) => Err(
-            "BLOOMERY_DRAFT=lookup: the lookup draft reads the V4.1 body's token history, so \
-             it serves the V4.1 seat only; this seat serves the DSpark draft on a qwen35moe \
-             file, or none"
-                .into(),
-        ),
+        (Draft::Lookup, _) => Err(lookup_refusal(arch).into()),
         (Draft::Dspark, Family::Qwen3moe | Family::Qwen35) => Err(format!(
             "BLOOMERY_DRAFT=dspark: the DSpark draft serves a qwen35moe file (Qwen3.6-35B-A3B); \
              {} is a {} file",
@@ -1352,6 +1351,26 @@ fn draft_of(arch: Family, levers: &Levers, path: &Path) -> Result<Draft, GateErr
         .into()),
         (draft, _) => Ok(draft),
     }
+}
+
+/// Why `BLOOMERY_DRAFT=lookup` is refused on an `arch` file: the lookup
+/// draft needs a load whose session verifies several rows. The qwen3moe body
+/// has no multi-row pass; a qwen35moe or qwen35 body verifies only on a
+/// whole-card load of one slot with a lane of delta state a row
+/// (`GpuModel::<Body35>::open_verifying`), which this seat does not open.
+fn lookup_refusal(arch: Family) -> String {
+    let why = match arch {
+        Family::Qwen3moe => "the qwen3moe body runs no pass of several rows",
+        _ => {
+            "its body verifies rows only on a load with a lane of delta state a row, which this \
+             seat does not open"
+        }
+    };
+    format!(
+        "BLOOMERY_DRAFT=lookup on a {} file: the lookup draft needs a load that verifies \
+         several rows, and {why}; serve the plain path",
+        arch.name()
+    )
 }
 
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener

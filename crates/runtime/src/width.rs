@@ -22,8 +22,10 @@
 //!   next (the proposal, the target's call, the draft's update and whatever
 //!   the caller does before its next pass), kept only when exactly one
 //!   accept or step came between and the target stands where it left it. A
-//!   plain pass whose draft proposed (a shadow, a cut to 0) holds the draft's
-//!   walk and is no reading of the plain step.
+//!   caller that runs other sequences' passes between a sequence's own lands
+//!   each pass at its end instead ([`Choosing::finish_pass`]), so no other
+//!   call is read as its wall. A plain pass whose draft proposed (a shadow,
+//!   a cut to 0) holds the draft's walk and is no reading of the plain step.
 //!
 //! Until every width's cost holds [`Rule::min_timings`] readings the passes
 //! rotate the widths, widest first, and nothing is decided. Past that two
@@ -744,6 +746,18 @@ impl<D, C: Clock> Choosing<D, C> {
         }
         self.drop_flight();
         self.ran(rows.saturating_sub(1), kept);
+    }
+
+    /// The pass that just ran landed now, the target at `pos`: its wall is
+    /// read before the caller runs anything else, so a call between it and
+    /// this draft's next pass (another sequence's pass, a prompt call) is
+    /// neither read as its wall nor drops it. Nothing under [`Mode::Fixed`].
+    pub fn finish_pass(&mut self, pos: u32) -> Result<(), WidthError> {
+        if self.mode == Mode::Cost {
+            let now = self.clock.now();
+            self.land(now, pos)?;
+        }
+        Ok(())
     }
 
     /// Forget the pass in flight and a pending shadow: nothing before a new

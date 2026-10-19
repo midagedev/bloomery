@@ -132,7 +132,7 @@ Runtime levers are `BLOOMERY_*` environment variables, the rows of `crates/lever
 
 | Variable | Effect |
 |---|---|
-| `BLOOMERY_DRAFT=lookup` | V4.1: the n-gram lookup draft through the skewed two-row pass. The `tokens` line equals the plain run's. Needs `--ctx` to hold one extra position. Prints a `draft summary` line |
+| `BLOOMERY_DRAFT=lookup` | V4.1 and Qwen3.8 (`generate_ds41`, `generate_qwen3moe`, their servers): the n-gram lookup draft, no weights, verified by a two-row pass. The `tokens` line equals the plain run's. Needs `--ctx` to hold one extra position. Prints a `draft summary` line. Refused by name on a model whose load verifies no rows |
 | `BLOOMERY_STEP_STATS=1` | a `stat step` line per step. It slows each step by 2.5–3 ms, so compare instrumented runs only with instrumented runs |
 | `BLOOMERY_PIN_MAIN=0` | leave the main thread unpinned |
 

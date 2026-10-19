@@ -421,6 +421,7 @@ PY
     echo "FAIL: the self-test's stub cards did not resolve (CARDS_ERROR: ${CARDS_ERROR:-none})"
     return 1
   }
+  local gate_args=()
   local gate_env=(env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES
     -u BLOOMERY_TIER -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S
     -u GATE_TEST_PACE -u STUB_ORDER -u STUB_ID -u STUB_COMPUTE_UUID -u STUB_COMPUTE_RC PATH="$t/bin:$PATH")
@@ -432,7 +433,7 @@ PY
     # Under a bound of its own: a runner that hangs ends the case red (124), it does not hang the check.
     (cd "$t/tree" && timeout --kill-after=5 "${GB:-60}" "${gate_env[@]}" \
       BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
-      bash "$self" --test-locks "${TL:-$t}" "${GATE_BIN:-ok}") > "$o" 2>&1
+      bash "$self" --test-locks "${TL:-$t}" "${GATE_BIN:-ok}" "${gate_args[@]}") > "$o" 2>&1
   }
   # judge <name> <rc> <want rc> <ERE that must match> [ERE that must not]. The output is matched as a here-string, never piped into
   # grep -q: under pipefail a writer still writing when grep exits on its first match fails the pipeline (Broken pipe), which read a
@@ -566,6 +567,13 @@ PY
   TL="$t/pin-refusal" GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate forced to the A6000: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' a6000 "$t/lease"
   TL="$t/pin-refusal" GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate under any: 64, named' 64 'gate_qwen38_serve runs on the 3090 only' any "$t/lease"
   GATE_BIN=gate_qwen38_serve case_ 'a 3090-only gate on the 3090 runs' 0 'ran on ' 3090 "$t/lease"
+  for arm in lookup drafted; do
+    gate_args=(--arm "$arm")
+    GATE_BIN=gate_qwen38_serve case_ "the $arm arm runs on another card" 0 'ran on ' a6000 "$t/lease"
+    gate_args=(--arm "$arm" --arm plain)
+    GATE_BIN=gate_qwen38_serve case_ "plain after $arm still pins the paged clauses" 64 'gate_qwen38_serve runs on the 3090 only' a6000 "$t/lease"
+  done
+  gate_args=()
   # Events, not seconds. A run in the background is held by what it waits for and released by what the test saw it do, so no case reads
   # the clock: the stub binary says `up` on STUB_READY once its run holds its locks and then blocks on STUB_HOLD until the test writes a
   # line; a waiting run's own output (read through a FIFO by relay) says it waits. The FIFOs are held open read-write by this shell
@@ -1517,6 +1525,11 @@ PY
   cp "$t/tree/target/release/ok" "$t/tree/target/release/gate_qwen38_serve"
   GATE_BIN=gate_qwen38_serve case_ '  … a 3090-only gate on another local card: 64, named' 64 'local mode requires one RTX 3090' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller
   GATE_BIN=gate_qwen38_serve case_ '  … a 3090-only gate on the local 3090 by its UUID runs' 0 "gate_qwen38_serve on this machine's card\\(s\\), the local gate lock \\(asked any\\)$" any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES="$GPU_3090"
+  for arm in lookup drafted; do
+    gate_args=(--arm "$arm")
+    GATE_BIN=gate_qwen38_serve case_ "  … the $arm arm runs on another local card" 0 '^ran on GPU-caller$' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller
+  done
+  gate_args=()
   case_ '  … a V4.1 load takes the V4.1 load lock with it' 0 "$ON_LOCAL \\(asked any\\), V4\\.1 load lock$" any "$t/lease" "${LOC[@]}" BLOOMERY_GATE_V41_LOAD=1
   exec 5> "$t/gate.lock" 6> "$t/gate-a6000.lock"
   { flock -x 5 && flock -x 6; } || { echo "FAIL: the test cannot hold the two card locks"; return 1; }
@@ -1718,10 +1731,20 @@ esac
 PIN_3090=(
   "gate_qwen38_serve: its paged clause runs generate_qwen3moe at 27 GiB of host room on the card in view, and only the 3090's plan pages there (on the A6000 the experts fit and the draft stays on)"
 )
+# As in the gate's parser, every flag takes a value and the last --arm wins.
+qwen38_arm=''
+if [ "$NAME" = gate_qwen38_serve ]; then
+  arm_args=("$@")
+  for ((i = 0; i < ${#arm_args[@]}; i += 2)); do
+    [ "${arm_args[i]}" != --arm ] || qwen38_arm=${arm_args[i+1]:-}
+  done
+fi
 # In box.sh's local mode the run must see one RTX 3090 alone: CUDA_VISIBLE_DEVICES set to its full UUID, or, unset, a
 # machine whose one card is it (tools/ref/cards.sh, the card-name owner).
 for row in "${PIN_3090[@]}"; do
   [ "${row%%:*}" = "$NAME" ] || continue
+  # PIN(2026-10-20): Only plain runs paged(); lookup and drafted have no card-specific paged clause.
+  case "$qwen38_arm" in lookup|drafted) continue ;; esac
   if [ "$BOXC" = local ]; then
     # shellcheck source=tools/ref/cards.sh
     source "${BASH_SOURCE[0]%/*}/ref/cards.sh"

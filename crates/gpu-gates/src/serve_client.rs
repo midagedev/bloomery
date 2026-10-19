@@ -232,6 +232,88 @@ pub fn ids_of(v: &Value) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// A completion's draft counts, `timings.draft_n` and
+/// `draft_n_accepted`: both absent is a request that proposed nothing,
+/// as the server omits them then. Refused by name: no `timings` object,
+/// one count present without the other, a count that is no unsigned
+/// integer, no proposal, and more ids accepted than proposed.
+fn draft_counts(answer: &Value) -> Result<(u64, u64), GateError> {
+    let t = &answer["timings"];
+    if !t.is_object() {
+        return Err(format!("a completion with no timings object: {answer}").into());
+    }
+    let (d, a) = (&t["draft_n"], &t["draft_n_accepted"]);
+    if t.get("draft_n").is_none() && t.get("draft_n_accepted").is_none() {
+        return Ok((0, 0));
+    }
+    match (d.as_u64(), a.as_u64()) {
+        (Some(d), Some(a)) if d > 0 && a <= d => Ok((d, a)),
+        _ => Err(format!(
+            "timings draft_n={d} draft_n_accepted={a}: a completion that proposed carries \
+             both counts, at most every proposed id accepted"
+        )
+        .into()),
+    }
+}
+
+/// The completion evidence used by the lookup gate.
+pub struct LookupCompletion {
+    pub tokens: Vec<u32>,
+    pub stop: String,
+    pub slot: u64,
+    pub cache_n: u64,
+    pub proposed: u64,
+    pub accepted: u64,
+}
+
+impl LookupCompletion {
+    /// Read every required field before the gate compares completions.
+    pub fn read(answer: &Value, slots: u64, ctx: u64) -> Result<Self, GateError> {
+        let tokens: Vec<u32> = serde_json::from_value(answer["tokens"].clone())
+            .map_err(|e| format!("lookup completion: tokens: {e}"))?;
+        if tokens.is_empty() {
+            return Err("lookup completion: tokens is empty".into());
+        }
+        let stop = answer["stop_type"]
+            .as_str()
+            .ok_or("lookup completion: stop_type is missing or not a string")?;
+        if !matches!(stop, "eos" | "word" | "limit") {
+            return Err(format!("lookup completion: stop_type is unknown: {stop}").into());
+        }
+        let slot = answer["id_slot"]
+            .as_u64()
+            .filter(|&n| n < slots)
+            .ok_or("lookup completion: id_slot is missing, not unsigned or outside slots")?;
+        let cache_n = answer["timings"]["cache_n"]
+            .as_u64()
+            .filter(|&n| n <= ctx)
+            .ok_or("lookup completion: timings.cache_n is missing, not unsigned or exceeds ctx")?;
+        let (proposed, accepted) = draft_counts(answer)?;
+        Ok(Self {
+            tokens,
+            stop: stop.to_owned(),
+            slot,
+            cache_n,
+            proposed,
+            accepted,
+        })
+    }
+}
+
+/// An erase response names the requested slot and an unsigned count within its context.
+pub fn slot_erased(answer: &Value, slot: u64, ctx: u64) -> Result<(), GateError> {
+    if answer["id_slot"].as_u64() != Some(slot) {
+        return Err(
+            "lookup erase: id_slot is missing, not unsigned or not the requested slot".into(),
+        );
+    }
+    answer["n_erased"]
+        .as_u64()
+        .filter(|&n| n <= ctx)
+        .ok_or("lookup erase: n_erased is missing, not unsigned or exceeds ctx")?;
+    Ok(())
+}
+
 /// `a,b,c` or `[a, b, c]` as ids.
 pub fn parse_ids(s: &str) -> Result<Vec<u32>, GateError> {
     s.trim()
@@ -621,4 +703,130 @@ pub fn prefix_restore(
         !cold.tokens.is_empty() && shared.tokens == cold.tokens && cold.cache_n == 0,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LookupCompletion, draft_counts, slot_erased};
+    use serde_json::json;
+
+    /// A completion's draft counts: both or neither, unsigned, at least one
+    /// proposal and no more accepted than proposed.
+    #[test]
+    fn draft_counts_need_both_counts_of_a_proposal() {
+        let counts = |t| draft_counts(&json!({ "timings": t })).ok();
+        assert!(
+            draft_counts(&json!({})).is_err(),
+            "no timings object was taken"
+        );
+        assert_eq!(counts(json!({})), Some((0, 0)));
+        assert_eq!(
+            counts(json!({"draft_n": 10, "draft_n_accepted": 0})),
+            Some((10, 0))
+        );
+        assert_eq!(
+            counts(json!({"draft_n": 10, "draft_n_accepted": 4})),
+            Some((10, 4))
+        );
+        for bad in [
+            json!({"draft_n": null}),
+            json!({"draft_n_accepted": null}),
+            json!({"draft_n": null, "draft_n_accepted": null}),
+            json!({"draft_n": 10}),
+            json!({"draft_n": 10, "draft_n_accepted": null}),
+            json!({"draft_n": 10, "draft_n_accepted": "4"}),
+            json!({"draft_n": 10, "draft_n_accepted": -1}),
+            json!({"draft_n": 10, "draft_n_accepted": 11}),
+            json!({"draft_n_accepted": 0}),
+            json!({"draft_n": 0, "draft_n_accepted": 0}),
+            json!({"draft_n": 1.5, "draft_n_accepted": 1}),
+            json!({"draft_n": [], "draft_n_accepted": 0}),
+            json!({"draft_n": 1, "draft_n_accepted": {}}),
+            json!({"draft_n": true, "draft_n_accepted": 0}),
+        ] {
+            assert_eq!(counts(bad.clone()), None, "{bad} was taken");
+            let mut answer = json!({
+                "tokens": [1], "stop_type": "limit", "id_slot": 0, "timings": bad
+            });
+            answer["timings"]["cache_n"] = json!(0);
+            assert!(
+                LookupCompletion::read(&answer, 2, 4096).is_err(),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_completion_requires_evidence() {
+        let valid = json!({
+            "tokens": [1, 2], "stop_type": "limit", "id_slot": 0,
+            "timings": {"cache_n": 4096, "draft_n": 2, "draft_n_accepted": 1}
+        });
+        assert!(LookupCompletion::read(&valid, 2, 4096).is_ok());
+        for field in ["tokens", "stop_type", "id_slot", "timings"] {
+            let mut bad = valid.clone();
+            bad.as_object_mut().unwrap().remove(field);
+            assert!(
+                LookupCompletion::read(&bad, 2, 4096).is_err(),
+                "missing {field}"
+            );
+            for value in [json!(null), json!(false), json!({}), json!("0")] {
+                bad[field] = value;
+                assert!(LookupCompletion::read(&bad, 2, 4096).is_err(), "{bad}");
+            }
+        }
+        for (field, value) in [
+            ("tokens", json!([])),
+            ("tokens", json!([1, null, 2])),
+            ("tokens", json!([1, "2"])),
+            ("tokens", json!([1, -1])),
+            ("tokens", json!([1, 1.5])),
+            ("tokens", json!([1, 4294967296_u64])),
+            ("stop_type", json!(1)),
+            ("stop_type", json!("")),
+            ("stop_type", json!("unknown")),
+            ("id_slot", json!(2)),
+            ("id_slot", json!(-1)),
+            ("id_slot", json!(0.5)),
+        ] {
+            let mut bad = valid.clone();
+            bad[field] = value;
+            assert!(LookupCompletion::read(&bad, 2, 4096).is_err(), "{bad}");
+        }
+        let mut missing = valid.clone();
+        missing["timings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_n");
+        assert!(LookupCompletion::read(&missing, 2, 4096).is_err());
+        for value in [json!(null), json!("0"), json!(-1), json!(0.5), json!(4097)] {
+            let mut bad = valid.clone();
+            bad["timings"]["cache_n"] = value;
+            assert!(LookupCompletion::read(&bad, 2, 4096).is_err(), "{bad}");
+        }
+        for stop in ["eos", "word", "limit"] {
+            let mut valid = valid.clone();
+            valid["stop_type"] = json!(stop);
+            valid["id_slot"] = json!(1);
+            valid["timings"] = json!({"cache_n": 0});
+            assert!(LookupCompletion::read(&valid, 2, 4096).is_ok());
+        }
+    }
+
+    #[test]
+    fn slot_erased_requires_evidence() {
+        for n in [0, 4096] {
+            assert!(slot_erased(&json!({"id_slot": 1, "n_erased": n}), 1, 4096).is_ok());
+        }
+        for field in ["id_slot", "n_erased"] {
+            let mut bad = json!({"id_slot": 1, "n_erased": 0});
+            bad.as_object_mut().unwrap().remove(field);
+            assert!(slot_erased(&bad, 1, 4096).is_err(), "missing {field}");
+            for value in [json!(null), json!("1"), json!(-1), json!(0.5), json!(4097)] {
+                bad[field] = value;
+                assert!(slot_erased(&bad, 1, 4096).is_err(), "{bad}");
+            }
+        }
+        assert!(slot_erased(&json!({"id_slot": 0, "n_erased": 0}), 1, 4096).is_err());
+    }
 }

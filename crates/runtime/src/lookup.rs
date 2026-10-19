@@ -78,6 +78,41 @@ impl Lookup {
         self.idx1.clear();
         self.ctx.clear();
     }
+
+    /// The context `ctx`, the tables rebuilt over it.
+    pub fn rebuild(&mut self, ctx: &[u32]) {
+        self.reset();
+        for &tok in ctx {
+            self.push(tok);
+        }
+    }
+
+    /// The context's first `n` tokens, the tables rebuilt over them; nothing
+    /// when it holds `n` or fewer.
+    pub fn truncate(&mut self, n: usize) {
+        if n >= self.ctx.len() {
+            return;
+        }
+        let ctx = std::mem::take(&mut self.ctx);
+        self.rebuild(&ctx[..n]);
+    }
+
+    /// The context made what it holds of a target's positions before `pos`,
+    /// then `last`, the token at `pos`: what a target that stepped, passed or
+    /// cut back since the context last followed it stands at. A context that
+    /// stands there with another token (a sampled id where the argmax was
+    /// pushed) takes `last` in its place: the token a context ends with is
+    /// in no indexed n-gram yet, so the tables hold. One that holds fewer
+    /// than `pos` tokens (the target ran positions it was not fed) keeps
+    /// them all.
+    pub fn stand(&mut self, pos: usize, last: u32) {
+        if self.ctx.len() == pos + 1 {
+            self.ctx[pos] = last;
+            return;
+        }
+        self.truncate(pos);
+        self.push(last);
+    }
 }
 
 /// One id a proposal, from the token history alone.
@@ -87,10 +122,7 @@ impl<T: Verify> Draft<T> for Lookup {
 
     /// The context starts over: this prompt, then `first`.
     fn begin(&mut self, _t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error> {
-        self.reset();
-        for &id in prompt {
-            self.push(id);
-        }
+        self.rebuild(prompt);
         self.push(first);
         Ok(())
     }
@@ -166,6 +198,60 @@ mod tests {
             look.push(tok);
         }
         assert_eq!((positions, proposed, accepted), (3999, 3983, 1644));
+    }
+
+    /// A context that follows a target by [`Lookup::stand`] and its own
+    /// pushes holds what a context rebuilt from the target's token history
+    /// and the token it stands before holds, and proposes what that one
+    /// proposes: through a prompt call, steps, kept passes and cuts back.
+    #[test]
+    fn stand_follows_history() {
+        let t = stream(600);
+        let rebuilt = |history: &[u32], next: u32| {
+            let mut l = Lookup::new();
+            l.rebuild(history);
+            l.push(next);
+            l
+        };
+        let mut look = Lookup::new();
+        // The prompt call replaces an earlier request's context.
+        look.rebuild(&t[300..500]);
+        <Lookup as crate::Draft<crate::mock::Mock>>::begin(
+            &mut look,
+            &crate::mock::Mock::new(),
+            &t[..200],
+            t[200],
+        )
+        .unwrap();
+        assert_eq!(look.context(), &t[..201]);
+        assert_eq!(look.propose(), rebuilt(&t[..200], t[200]).propose());
+        let mut pos = 200;
+        // Steps and passes keeping 1 or 2 rows, a cut back every 25th.
+        for i in 1..150 {
+            let keep = 1 + pos % 2;
+            look.stand(pos, t[pos]);
+            t[pos + 1..=pos + keep].iter().for_each(|&id| look.push(id));
+            pos += keep;
+            if i % 25 == 0 {
+                pos -= 7;
+                look.stand(pos, t[pos]);
+            }
+            let r = rebuilt(&t[..pos], t[pos]);
+            assert_eq!(look.context(), r.context());
+            assert_eq!(look.propose(), r.propose());
+        }
+        // A sampled id where the argmax was pushed takes its place in the
+        // context, the tables kept.
+        let at = look.context().as_ptr();
+        look.stand(pos, t[pos] + 1);
+        let r = rebuilt(&t[..pos], t[pos] + 1);
+        assert_eq!(look.context(), r.context());
+        assert_eq!(look.propose(), r.propose());
+        assert_eq!(look.context().as_ptr(), at, "the context was rebuilt");
+        // A context behind the target keeps what it holds, then the token.
+        let mut behind = rebuilt(&t[..100], t[100]);
+        behind.stand(300, t[300]);
+        assert_eq!(behind.context().len(), 102);
     }
 
     /// The first pattern of `draft-accept.py --self-test`: seven distinct ids

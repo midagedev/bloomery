@@ -27,24 +27,344 @@
 //! ([`SlotDrafts::turn_off`]): every call on that slot is the session's own
 //! until the slot's next reset, and each prompt call (or the first step when
 //! the call is empty) prints an `mtp prompt` record that names why.
+//!
+//! The lookup draft (`runtime::Lookup`, `BLOOMERY_DRAFT=lookup`) has one
+//! owner too, [`Lookups`]: it needs no weights and no draft side in the
+//! body, only a body whose session verifies rows, so every seat whose body
+//! has a multi-row pass serves it through this one type, the MTP table
+//! ([`SlotDrafts::lookup`]) and the served draft (`served::ServedDraft`)
+//! alike.
 
 use app::mtp::{MtpBody, MtpDraft, Parked};
-use app::{RowsLog, Session, SessionError};
+use app::{Keep, Prompt, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::model::{Rollback, Rows};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
-use runtime::width::{Choosing, Chosen, Mode as WidthMode};
+use runtime::width::{Choosing, Chosen, Clock, Mode as WidthMode};
 use runtime::{
-    Advance, Argmax, Draft, Pick, Plain, Sample, Speculative, Target as _, Want, Widths, Window,
+    Advance, Argmax, Committed, Draft, Lookup, Pick, Plain, RowLogits, Sample, Speculative, Target,
+    Verify, Want, WidthError, Widths, Window,
 };
-use serve::{Drafted, Sampler};
+use serve::{DraftProps, Drafted, EngineProps, Sampler};
+
+/// The rows a lookup pass verifies: the token at the target's position and
+/// the lookup's one proposed id (its `WIDTH` + 1, which
+/// [`Session::with_draft`] holds it to).
+pub(crate) const LOOKUP_ROWS: usize = 2;
+
+/// The selected slot's token history, for a target that keeps one: the ids
+/// of the positions before the target's, in order.
+pub(crate) type History<T> = fn(&T) -> Option<&[u32]>;
+
+/// How a lookup pass takes each verified row's id.
+pub(crate) enum Taking<'a> {
+    /// The row's argmax.
+    Argmax,
+    /// Drawn from the row's logits.
+    Sample(&'a mut dyn FnMut(&[f32]) -> u32),
+}
+
+/// A slot's lookup window behind its width chooser, as [`Lookups`] drives
+/// it: a trait object, so the owner is generic over its target alone.
+trait LookupWindow<T> {
+    fn lookup(&self) -> &Lookup;
+    fn lookup_mut(&mut self) -> &mut Lookup;
+    /// The chooser's record of the request before printed
+    /// ([`print_widths`]), then its pass in flight discarded.
+    fn close(&mut self);
+    /// One pass from `last`, its wall landed at its end
+    /// ([`Choosing::finish_pass`]): another slot's call before this slot's
+    /// next pass is no part of it.
+    fn pass(
+        &mut self,
+        t: &mut T,
+        last: u32,
+        take: Taking<'_>,
+        out: &mut Vec<u32>,
+    ) -> Result<Committed, GateError>;
+    #[cfg(test)]
+    fn gate_state(&self) -> runtime::width::GateState;
+}
+
+impl<T, C> LookupWindow<T> for Speculative<Choosing<Lookup, C>, LOOKUP_ROWS>
+where
+    T: Verify + RowLogits,
+    T::Error: From<WidthError> + std::error::Error + 'static,
+    C: Clock,
+{
+    fn lookup(&self) -> &Lookup {
+        self.draft().draft()
+    }
+
+    fn lookup_mut(&mut self) -> &mut Lookup {
+        self.draft_mut().draft_mut()
+    }
+
+    fn close(&mut self) {
+        print_widths(self);
+        self.draft_mut().prompt_by(|_| ());
+    }
+
+    fn pass(
+        &mut self,
+        t: &mut T,
+        last: u32,
+        take: Taking<'_>,
+        out: &mut Vec<u32>,
+    ) -> Result<Committed, GateError> {
+        Ok(match take {
+            Taking::Argmax => pass_in_turn(self, t, last, &mut Argmax, out),
+            Taking::Sample(f) => {
+                pass_in_turn(self, t, last, &mut Sample(|row: &[f32]| f(row)), out)
+            }
+        }?)
+    }
+
+    #[cfg(test)]
+    fn gate_state(&self) -> runtime::width::GateState {
+        self.draft().gate_state()
+    }
+}
+
+/// A single slot's pass, completed before the caller runs another slot.
+fn pass_in_turn<T, D, C, P, const M: usize>(
+    spec: &mut Speculative<Choosing<D, C>, M>,
+    t: &mut T,
+    last: u32,
+    pick: &mut P,
+    out: &mut Vec<u32>,
+) -> Result<Committed, T::Error>
+where
+    T: Verify,
+    T::Error: From<WidthError>,
+    D: Draft<T>,
+    C: Clock,
+    P: Pick<T>,
+    Window<M>: Widths,
+{
+    let committed = spec.pass_picking(t, last, pick, out)?;
+    spec.draft_mut().finish_pass(t.pos())?;
+    Ok(committed)
+}
+
+/// A call on a slot's sequence, by what it closes of the slot's chooser
+/// ([`Lookups::at`]).
+#[derive(Clone, Copy)]
+enum Call {
+    /// The window's own pass: nothing closed. The slot's pass before landed
+    /// at its end ([`LookupWindow::pass`]), and every other slot's calls go
+    /// to their own chooser.
+    Pass,
+    /// Any other call that moves or replaces the slot's sequence (a prompt
+    /// call, a plain step, a reset, a state put back): the chooser's record
+    /// of the request before is printed and the pass in flight discarded,
+    /// so no wall that holds the call is read as a pass. Every request
+    /// opens with one, its prompt's last id stepped.
+    Moved,
+}
+
+/// The lookup draft a seat serves, its one owner: each resident slot's
+/// window over its own context behind its own width chooser, as each slot
+/// has its own MTP draft ([`SlotDrafts::open`]), verified by the target's
+/// pass of [`LOOKUP_ROWS`] rows. A chooser's acceptance, costs, pass in
+/// flight and request record are its slot's alone: slots that take turns
+/// neither drop nor mix each other's. Every call reaches a slot's context
+/// through [`Lookups::at`], which closes the slot's chooser for the call's
+/// kind ([`Call`]) first.
+/// A context follows its slot by the positions the calls stand at
+/// ([`Lookup::stand`]): a cut back needs nothing told, the next call keeps
+/// the context below its position. A slot whose sequence is put back from a
+/// saved state is forgotten ([`Lookups::forget`]) or given the context saved
+/// with it ([`Lookups::unpark`]). On a target that keeps its token history
+/// ([`History`]), a context behind the target's position is rebuilt from
+/// it, so the positions a round of plain steps ran without the draft come
+/// back too.
+pub(crate) struct Lookups<T> {
+    /// Each slot's window, by slot.
+    windows: Vec<Box<dyn LookupWindow<T>>>,
+    history: Option<History<T>>,
+}
+
+impl<B: Prompt + Keep + Rows + Rollback> Lookups<Session<B>> {
+    /// The lookup of `slots` resident slots on `s`, each behind a width
+    /// chooser of `mode`, the verify pass captured now (`log` told of it)
+    /// with slot 0's window and shared by every slot's. Load-time; refused by
+    /// name for no slot and a rule the chooser cannot run by.
+    pub(crate) fn open(
+        s: &mut Session<B>,
+        slots: usize,
+        mode: WidthMode,
+        log: &mut impl RowsLog,
+        history: Option<History<Session<B>>>,
+    ) -> Result<Self, GateError> {
+        record::require(record::groups::drafted::WIDTH, "drafted::Lookups::open");
+        if slots == 0 {
+            return Err("the lookup draft of no slot".into());
+        }
+        let choosing = || <Lookup as Chosen<Session<B>>>::choosing(Lookup::new(), mode);
+        let mut windows: Vec<Box<dyn LookupWindow<Session<B>>>> = Vec::with_capacity(slots);
+        windows.push(Box::new(s.with_draft::<_, LOOKUP_ROWS>(choosing()?, log)?));
+        for _ in 1..slots {
+            windows.push(Box::new(Speculative::<_, LOOKUP_ROWS>::new(choosing()?)));
+        }
+        Ok(Lookups { windows, history })
+    }
+}
+
+impl<T: Target> Lookups<T> {
+    /// `slot`'s context, the slot's chooser closed for `call` first: the one
+    /// way to a slot's context. Refused by name past the slots.
+    fn at(&mut self, slot: usize, call: Call) -> Result<&mut Lookup, GateError> {
+        let slots = self.windows.len();
+        let w = self
+            .windows
+            .get_mut(slot)
+            .ok_or_else(|| format!("slot {slot}: the lookup draft holds {slots} slots"))?;
+        if let Call::Moved = call {
+            w.close();
+        }
+        Ok(w.lookup_mut())
+    }
+
+    /// [`Lookups::at`], the context rebuilt from the target's history of the
+    /// positions before `pos` when it holds fewer and the target keeps one.
+    fn before(
+        &mut self,
+        t: &T,
+        slot: usize,
+        pos: usize,
+        call: Call,
+    ) -> Result<&mut Lookup, GateError> {
+        let history = self.history.and_then(|h| h(t)).filter(|h| h.len() >= pos);
+        let l = self.at(slot, call)?;
+        if l.context().len() < pos
+            && let Some(h) = history
+        {
+            l.rebuild(&h[..pos]);
+        }
+        Ok(l)
+    }
+
+    /// The prompt call of `ids` on `slot`, the target's selected one: the
+    /// chooser closed for it, then `call` (the seat's own prompt call), then
+    /// the call's ids and its argmax into the context, the context first
+    /// kept below the call's position: a continued prompt's first id takes
+    /// the place of the argmax pushed after the call before. Refused by name
+    /// for no id.
+    pub(crate) fn prompt_call(
+        &mut self,
+        t: &mut T,
+        slot: usize,
+        ids: &[u32],
+        call: impl FnOnce(&mut T) -> Result<u32, GateError>,
+    ) -> Result<u32, GateError> {
+        let Some((&first, rest)) = ids.split_first() else {
+            return Err(format!("slot {slot}: the lookup's prompt call of no id").into());
+        };
+        let pos = t.pos() as usize;
+        let l = self.before(t, slot, pos, Call::Moved)?;
+        let next = call(t)?;
+        l.stand(pos, first);
+        rest.iter().for_each(|&id| l.push(id));
+        l.push(next);
+        Ok(next)
+    }
+
+    /// The seat's plain step of `last` on `slot` took `next`.
+    pub(crate) fn stepped(
+        &mut self,
+        t: &T,
+        slot: usize,
+        last: u32,
+        next: u32,
+    ) -> Result<(), GateError> {
+        let pos = (t.pos() as usize).saturating_sub(1);
+        let l = self.before(t, slot, pos, Call::Moved)?;
+        l.stand(pos, last);
+        l.push(next);
+        Ok(())
+    }
+
+    /// One pass on `slot`, the target's selected one, from `last`: the
+    /// context stood at the target's position, then the slot's window's
+    /// pass ([`LookupWindow::pass`]), each row's id taken by `take`; the kept
+    /// ids into `out`.
+    pub(crate) fn pass(
+        &mut self,
+        t: &mut T,
+        slot: usize,
+        last: u32,
+        take: Taking<'_>,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, GateError> {
+        let pos = t.pos() as usize;
+        self.before(t, slot, pos, Call::Pass)?.stand(pos, last);
+        Ok(drafted(self.windows[slot].pass(t, last, take, out)?))
+    }
+
+    /// `slot`'s sequence is not the one its context followed (a reset, a
+    /// state put back): the context starts over, from the target's history
+    /// where it keeps one.
+    pub(crate) fn forget(&mut self, slot: usize) -> Result<(), GateError> {
+        self.at(slot, Call::Moved)?.reset();
+        Ok(())
+    }
+
+    /// `slot`'s context, for a state the seat saves of that slot.
+    pub(crate) fn park(&self, slot: usize) -> Result<Vec<u32>, GateError> {
+        match self.windows.get(slot) {
+            Some(w) => Ok(w.lookup().context().to_vec()),
+            None => Err(format!("slot {slot}: the lookup draft holds no such slot").into()),
+        }
+    }
+
+    /// `ctx`, which [`Lookups::park`] took with a state, as `slot`'s context
+    /// once that state is put back on the slot.
+    pub(crate) fn unpark(&mut self, slot: usize, ctx: &[u32]) -> Result<(), GateError> {
+        self.at(slot, Call::Moved)?.rebuild(ctx);
+        Ok(())
+    }
+}
+
+/// A pass's draft counts: the proposal's ids, the ones kept.
+pub(crate) fn drafted(c: Committed) -> Drafted {
+    if c.proposed {
+        Drafted {
+            proposed: c.rows - 1,
+            accepted: c.kept - 1,
+        }
+    } else {
+        Drafted::default()
+    }
+}
+
+/// `engine.draft` of the lookup draft ([`Lookups`]): no file, no device
+/// bytes.
+pub(crate) fn lookup_props(mut p: EngineProps) -> EngineProps {
+    p.draft = Some(DraftProps {
+        model: "lookup".to_owned(),
+        n_max: Some(LOOKUP_ROWS as u64 - 1),
+        kind: Some("lookup".to_owned()),
+        ..DraftProps::default()
+    });
+    p
+}
 
 /// A slot's draft side of a saved sequence ([`SlotDrafts::park`]): what the
 /// draft held of it, and why the seat had turned it off, if it had.
 #[derive(Clone, Debug)]
 pub(crate) struct ParkedDraft<A> {
-    draft: Parked<A>,
+    draft: Side<A>,
     off: Option<&'static str>,
+}
+
+/// What a slot's draft held of a sequence: the MTP draft's side, or the
+/// lookup's context.
+#[derive(Clone, Debug)]
+enum Side<A> {
+    Mtp(Parked<A>),
+    Lookup(Vec<u32>),
 }
 
 /// One slot's drafted window over its own [`MtpDraft`] behind the shared
@@ -66,6 +386,9 @@ where
     /// Why each slot's draft is off until the slot's next reset, and whether
     /// a record has said so since it was turned off; `None` while it drafts.
     off: Vec<Option<(&'static str, bool)>>,
+    /// The lookup draft of every slot, in place of the MTP draft
+    /// ([`SlotDrafts::lookup`]); `None` otherwise.
+    lookups: Option<Lookups<Session<B>>>,
 }
 
 impl<B: MtpBody, const M: usize> SlotDrafts<B, M>
@@ -77,7 +400,25 @@ where
         SlotDrafts {
             specs: Vec::new(),
             off: Vec::new(),
+            lookups: None,
         }
+    }
+
+    /// The lookup draft on each of `slots` resident slots ([`Lookups::open`]:
+    /// its verify pass captured now, `log` told of it, behind the width
+    /// chooser of `mode`) in place of the MTP draft: no slot's draft is ever
+    /// off, and a cut or a state put back needs no rejoin. Load-time.
+    pub(crate) fn lookup(
+        s: &mut Session<B>,
+        slots: usize,
+        mode: WidthMode,
+        log: &mut impl RowsLog,
+    ) -> Result<Self, GateError> {
+        Ok(SlotDrafts {
+            specs: Vec::new(),
+            off: Vec::new(),
+            lookups: Some(Lookups::open(s, slots, mode, log, None)?),
+        })
     }
 
     /// One draft a resident slot, `slots` of them, each opened by the seat's
@@ -113,12 +454,24 @@ where
         Ok(SlotDrafts {
             specs,
             off: vec![None; slots],
+            lookups: None,
         })
     }
 
-    /// Whether a draft runs.
+    /// Whether a draft runs, the MTP draft or the lookup.
     pub(crate) fn drafts(&self) -> bool {
+        !self.specs.is_empty() || self.lookups.is_some()
+    }
+
+    /// Whether the MTP draft runs: a cut or a state put back rejoins it or
+    /// turns it off ([`SlotDrafts::rejoin`], [`SlotDrafts::turn_off`]).
+    pub(crate) fn mtp(&self) -> bool {
         !self.specs.is_empty()
+    }
+
+    /// Whether the lookup draft runs ([`SlotDrafts::lookup`]).
+    pub(crate) fn looks_up(&self) -> bool {
+        self.lookups.is_some()
     }
 
     /// Whether `slot` drafts through a window of the table: false with no
@@ -215,6 +568,7 @@ where
         self.prefill_by(
             s,
             slot,
+            ids,
             |s| Ok(s.prompt(ids, Want::Argmax)?.argmax()),
             |spec, s| Ok(Advance::prompt(spec, s, ids)?),
         )
@@ -244,6 +598,7 @@ where
         self.prefill_by(
             s,
             slot,
+            ids,
             |s| Ok(s.prompt_media(ids, spans, Want::Argmax)?.argmax()),
             |spec, s| {
                 Ok(spec
@@ -253,17 +608,23 @@ where
         )
     }
 
-    /// The prompt call's order, the one owner of it: the off slot's record
-    /// and the session's own call, else under the draft the chooser's passes
-    /// closed out, `drafted` (the window's prompt call) and the join record,
-    /// else `plain`.
+    /// The prompt call's order, the one owner of it: under the lookup
+    /// `plain` with its ids fed to the slot's context
+    /// ([`Lookups::prompt_call`]); the off slot's record and the session's
+    /// own call, else under the draft the chooser's passes closed out,
+    /// `drafted` (the window's prompt call) and the join record, else
+    /// `plain`.
     fn prefill_by(
         &mut self,
         s: &mut Session<B>,
         slot: usize,
+        ids: &[u32],
         plain: impl FnOnce(&mut Session<B>) -> Result<u32, GateError>,
         drafted: impl FnOnce(&mut Spec<B, M>, &mut Session<B>) -> Result<u32, GateError>,
     ) -> Result<u32, GateError> {
+        if let Some(l) = &mut self.lookups {
+            return l.prompt_call(s, slot, ids, plain);
+        }
         if self.is_off(slot) {
             self.print_off(s, slot);
             return plain(s);
@@ -331,6 +692,9 @@ where
                 .logits_into(row)
                 .map_err(|e| format!("logits of the step: {e}"))?;
         }
+        if let Some(l) = &mut self.lookups {
+            l.stepped(s, slot, last, next)?;
+        }
         if let Some(spec) = self.spec_mut(slot)?.filter(|_| drafting) {
             Draft::stepped(spec.draft_mut(), s, last, next)?;
         }
@@ -346,6 +710,9 @@ where
         last: u32,
         out: &mut Vec<u32>,
     ) -> Result<Drafted, GateError> {
+        if let Some(l) = &mut self.lookups {
+            return l.pass(s, slot, last, Taking::Argmax, out);
+        }
         self.pass_taking(s, slot, last, &mut Argmax, out)
     }
 
@@ -364,12 +731,15 @@ where
         out: &mut Vec<u32>,
     ) -> Result<Drafted, GateError> {
         let from = history.len();
-        let mut pick = Sample(|row: &[f32]| {
+        let mut draw = |row: &[f32]| {
             let id = sampler(row, history);
             history.push(id);
             id
-        });
-        let d = self.pass_taking(s, slot, last, &mut pick, out);
+        };
+        let d = match &mut self.lookups {
+            Some(l) => l.pass(s, slot, last, Taking::Sample(&mut draw), out),
+            None => self.pass_taking(s, slot, last, &mut Sample(&mut draw), out),
+        };
         history.truncate(from);
         d
     }
@@ -389,13 +759,7 @@ where
     ) -> Result<Drafted, GateError> {
         let drafting = !self.is_off(slot);
         match self.spec_mut(slot)?.filter(|_| drafting) {
-            Some(spec) => {
-                let c = spec.pass_picking(s, last, pick, out)?;
-                Ok(Drafted {
-                    proposed: if c.proposed { c.rows - 1 } else { 0 },
-                    accepted: c.kept - 1,
-                })
-            }
+            Some(spec) => Ok(drafted(pass_in_turn(spec, s, last, pick, out)?)),
             None => {
                 let argmax = self.step(s, slot, last)?;
                 out.push(pick.pick(s, 0, argmax)?);
@@ -407,6 +771,9 @@ where
     /// The most positions one pass on `slot` runs: a window's rows while its
     /// draft runs, one step's without it or while it is off.
     pub(crate) fn pass_rows(&self, slot: usize) -> usize {
+        if self.lookups.is_some() {
+            return LOOKUP_ROWS;
+        }
         match (self.specs.get(slot), self.is_off(slot)) {
             (Some(Some(_)), false) => <Spec<B, M> as Advance<Session<B>>>::ROWS,
             _ => <Plain as Advance<Session<B>>>::ROWS,
@@ -420,6 +787,9 @@ where
     pub(crate) fn reset(&mut self, s: &mut Session<B>, slot: usize) -> Result<(), GateError> {
         let drafting = self.has(slot)?;
         s.reset()?;
+        if let Some(l) = &mut self.lookups {
+            l.forget(slot)?;
+        }
         if drafting {
             self.off[slot] = None;
             if let Some(spec) = self.specs[slot].as_mut() {
@@ -435,11 +805,17 @@ where
     /// `None` without a draft. The state keeps the draft's store and the
     /// arenas the waiting rows sit in. Refused as [`SlotDrafts::has`].
     pub(crate) fn park(&self, slot: usize) -> Result<Option<ParkedDraft<B::Arena>>, GateError> {
+        if let Some(l) = &self.lookups {
+            return Ok(Some(ParkedDraft {
+                draft: Side::Lookup(l.park(slot)?),
+                off: None,
+            }));
+        }
         if !self.has(slot)? {
             return Ok(None);
         }
         Ok(self.specs[slot].as_ref().map(|spec| ParkedDraft {
-            draft: spec.draft().draft().park(),
+            draft: Side::Mtp(spec.draft().draft().park()),
             off: self.off[slot].map(|(why, _)| why),
         }))
     }
@@ -469,11 +845,20 @@ where
         p: Option<&ParkedDraft<B::Arena>>,
     ) -> Result<(), GateError> {
         self.takes(p)?;
-        if let (Some(spec), Some(p)) = (self.spec_mut(slot)?, p) {
-            spec.draft_mut().draft_mut().unpark(&p.draft);
-            self.off[slot] = p.off.map(|why| (why, false));
+        let Some(p) = p else {
+            return Ok(());
+        };
+        match (&p.draft, &mut self.lookups) {
+            (Side::Lookup(ctx), Some(l)) => l.unpark(slot, ctx),
+            (Side::Mtp(d), None) => {
+                if let Some(spec) = self.spec_mut(slot)? {
+                    spec.draft_mut().draft_mut().unpark(d);
+                    self.off[slot] = p.off.map(|why| (why, false));
+                }
+                Ok(())
+            }
+            _ => Err("a state saved under one draft put back under the other".into()),
         }
-        Ok(())
     }
 
     /// Every slot's window, by slot, for a round that drives several slots'
@@ -507,7 +892,7 @@ pub(crate) fn serves_widths() {
 /// at the request's end, as its `mtp width` record: nothing under `fixed`,
 /// whose passes are the draft's own, and nothing for a request that ran no
 /// pass. The ds41 seat drains its own drafts the same way.
-pub(crate) fn print_widths<D, const M: usize>(spec: &mut Speculative<Choosing<D>, M>) {
+pub(crate) fn print_widths<D, C: Clock, const M: usize>(spec: &mut Speculative<Choosing<D, C>, M>) {
     record::require(record::groups::drafted::WIDTH, "drafted::print_widths");
     let choosing = spec.draft_mut();
     if choosing.mode() != WidthMode::Cost {
@@ -523,4 +908,320 @@ pub(crate) fn print_widths<D, const M: usize>(spec: &mut Speculative<Choosing<D>
         .csv("widths", &t.widths)
         .f("e", t.e());
     record::width_gate(r, &choosing.gate_state(), t.closed).eprint();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime::Out;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    /// The walls the target's calls take: a verify of the lookup's two rows
+    /// costs 1.35 of the plain step.
+    const STEP: Duration = Duration::from_millis(10);
+    const VERIFY: Duration = Duration::from_micros(13_500);
+    const PROMPT: Duration = Duration::from_millis(40);
+
+    /// A target that walks a fixed id stream, the id at position `i` its
+    /// `ids[i % len]` and each call's argmax the id at the position after
+    /// the call's last row, each call taking its wall of the clock every
+    /// slot's target shares.
+    struct Position {
+        pos: u32,
+        verified: u32,
+        verify_wall: Duration,
+        ids: Rc<[u32]>,
+        clock: Rc<Cell<Duration>>,
+    }
+
+    impl Position {
+        fn new(ids: &Rc<[u32]>, clock: &Rc<Cell<Duration>>) -> Position {
+            Position {
+                pos: 0,
+                verified: 0,
+                verify_wall: VERIFY,
+                ids: Rc::clone(ids),
+                clock: Rc::clone(clock),
+            }
+        }
+
+        fn id(&self, at: u32) -> u32 {
+            self.ids[at as usize % self.ids.len()]
+        }
+
+        fn took(&self, wall: Duration) {
+            self.clock.set(self.clock.get() + wall);
+        }
+
+        /// The lookup's prompt call on `slot` of the stream's id at the
+        /// target's position.
+        fn begin(&mut self, l: &mut Lookups<Position>, slot: usize) {
+            let id = self.id(self.pos);
+            l.prompt_call(self, slot, &[id], |t| {
+                Ok(t.prompt(&[id], Want::Argmax)?.argmax())
+            })
+            .unwrap();
+        }
+
+        /// The lookup's pass on `slot` from the stream's id at the target's
+        /// position.
+        fn pass(&mut self, l: &mut Lookups<Position>, slot: usize) {
+            let last = self.id(self.pos);
+            l.pass(self, slot, last, Taking::Argmax, &mut Vec::new())
+                .unwrap();
+        }
+    }
+
+    impl Target for Position {
+        type Error = WidthError;
+        fn pos(&self) -> u32 {
+            self.pos
+        }
+        fn ctx(&self) -> u32 {
+            1 << 16
+        }
+        fn prompt(&mut self, ids: &[u32], _: Want) -> Result<Out<'_>, WidthError> {
+            self.pos += u32::try_from(ids.len()).unwrap();
+            self.took(PROMPT);
+            Ok(Out::Argmax(self.id(self.pos)))
+        }
+        fn step(&mut self, _: u32, _: Want) -> Result<Out<'_>, WidthError> {
+            self.pos += 1;
+            self.took(STEP);
+            Ok(Out::Argmax(self.id(self.pos)))
+        }
+        fn keepable(&self, n: u32) -> u32 {
+            n.min(self.pos)
+        }
+        fn cut(&mut self, n: u32) -> Result<(), WidthError> {
+            self.pos = n;
+            Ok(())
+        }
+        fn reset(&mut self) -> Result<(), WidthError> {
+            self.pos = 0;
+            Ok(())
+        }
+    }
+
+    impl Verify for Position {
+        const MAX_ROWS: usize = LOOKUP_ROWS;
+        fn verify<const M: usize>(&mut self, _: [u32; M]) -> Result<[u32; M], WidthError> {
+            let at = self.pos;
+            self.verified = u32::try_from(M).unwrap();
+            self.pos += self.verified;
+            self.took(self.verify_wall);
+            Ok(std::array::from_fn(|r| {
+                self.id(at + 1 + u32::try_from(r).unwrap())
+            }))
+        }
+        fn commit(&mut self, accepted: usize) -> Result<(), WidthError> {
+            self.pos -= self.verified - u32::try_from(accepted).unwrap();
+            Ok(())
+        }
+    }
+
+    impl RowLogits for Position {
+        fn row_logits(&mut self, _: usize) -> Result<&[f32], WidthError> {
+            unreachable!()
+        }
+    }
+
+    /// The clock the targets' calls move.
+    struct Shared(Rc<Cell<Duration>>);
+    impl Clock for Shared {
+        fn now(&mut self) -> Duration {
+            self.0.get()
+        }
+    }
+
+    /// The lookup of `slots` slots under the cost mode, by `rule`, on
+    /// `clock`.
+    fn lookups(slots: usize, rule: runtime::Rule, clock: &Rc<Cell<Duration>>) -> Lookups<Position> {
+        let window = |_| -> Box<dyn LookupWindow<Position>> {
+            Box::new(Speculative::<_, LOOKUP_ROWS>::new(
+                <Lookup as Chosen<Position>>::choosing_by(
+                    Lookup::new(),
+                    WidthMode::Cost,
+                    rule,
+                    Shared(Rc::clone(clock)),
+                )
+                .unwrap(),
+            ))
+        };
+        Lookups {
+            windows: (0..slots).map(window).collect(),
+            history: None,
+        }
+    }
+
+    /// What `slot`'s chooser's gate stands on.
+    fn gate(l: &Lookups<Position>, slot: usize) -> runtime::width::GateState {
+        l.windows[slot].gate_state()
+    }
+
+    /// The medians of a plain step's and a verify's own walls.
+    fn walls() -> Vec<Option<f64>> {
+        [STEP, VERIFY].map(|w| Some(w.as_secs_f64() * 1e3)).to_vec()
+    }
+
+    #[test]
+    fn lookup_prompt_discards_the_prior_last_token() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let ids: Rc<[u32]> = Rc::new([1_u32, 2, 3, 4]);
+        let mut t = Position::new(&ids, &clock);
+        let mut l = lookups(1, Lookup::RULE, &clock);
+        t.begin(&mut l, 0);
+        t.begin(&mut l, 0);
+        assert_eq!(l.windows[0].lookup().context(), &ids[..3]);
+    }
+
+    #[test]
+    fn a_lookup_prompt_call_of_no_id_is_refused() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let ids: Rc<[u32]> = Rc::new([1_u32]);
+        let mut t = Position::new(&ids, &clock);
+        let mut l = lookups(1, Lookup::RULE, &clock);
+        let e = l.prompt_call(&mut t, 0, &[], |_| Ok(1)).unwrap_err();
+        assert_eq!(e.to_string(), "slot 0: the lookup's prompt call of no id");
+    }
+
+    #[test]
+    fn turns_land_each_slots_cost_before_the_other_slots_expensive_pass() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let ids: Rc<[u32]> = Rc::new([7_u32]);
+        let mut targets = [Position::new(&ids, &clock), Position::new(&ids, &clock)];
+        targets[1].verify_wall = Duration::from_millis(400);
+        let mut specs = std::array::from_fn::<_, 2, _>(|slot| {
+            let choosing = <Lookup as Chosen<Position>>::choosing_by(
+                Lookup::new(),
+                WidthMode::Cost,
+                runtime::Rule {
+                    min_timings: 1,
+                    ..Lookup::RULE
+                },
+                Shared(Rc::clone(&clock)),
+            )
+            .unwrap();
+            let mut spec = Speculative::<_, LOOKUP_ROWS>::new(choosing);
+            spec.prompt(&mut targets[slot], &[7]).unwrap();
+            spec
+        });
+        for _ in 0..12 {
+            for slot in 0..2 {
+                let t = &mut targets[slot];
+                pass_in_turn(&mut specs[slot], t, 7, &mut Argmax, &mut Vec::new()).unwrap();
+            }
+        }
+        for slot in 0..2 {
+            assert_eq!(
+                specs[slot].draft().gate_state().costs,
+                [STEP, targets[slot].verify_wall].map(|wall| Some(wall.as_secs_f64() * 1e3)),
+                "slot {slot}: only its own pass contributes to its cost"
+            );
+        }
+    }
+
+    /// A pass's wall is read as its width's cost, whatever a call between
+    /// it and its slot's next pass does ([`LookupWindow::pass`]), and no
+    /// such call's wall is: nothing, a plain step back to where the pass
+    /// ended after a cut (a request whose prompt the cache holds but its
+    /// last id), a prompt call back to it, a reset or a state put back of
+    /// the slot, and another slot's prompt call and pass. Each case's first
+    /// pass verifies the warm-up's width 1, its second steps the warm-up's
+    /// plain step.
+    #[test]
+    fn a_pass_reads_its_own_wall_alone() {
+        type Between = fn(&mut Lookups<Position>, &mut Position, &mut Position);
+        let cases: [(&str, Between); 6] = [
+            ("nothing", |_, _, _| {}),
+            ("a plain step", |l, t, _| {
+                let end = t.pos();
+                t.cut(end - 1).unwrap();
+                let last = t.id(end - 1);
+                let next = t.step(last, Want::Argmax).unwrap().argmax();
+                l.stepped(t, 0, last, next).unwrap();
+            }),
+            ("a prompt call", |l, t, _| {
+                let end = t.pos();
+                t.cut(end - 1).unwrap();
+                t.begin(l, 0);
+            }),
+            ("a reset", |l, _, _| l.forget(0).unwrap()),
+            ("a state put back", |l, _, _| {
+                let ctx = l.park(0).unwrap();
+                l.unpark(0, &ctx).unwrap();
+            }),
+            ("another slot's pass", |l, _, other| {
+                other.begin(l, 1);
+                other.pass(l, 1);
+            }),
+        ];
+        let ids: Rc<[u32]> = Rc::new([7_u32]);
+        let mut wrong = Vec::new();
+        for (what, between) in cases {
+            let clock = Rc::new(Cell::new(Duration::ZERO));
+            let rule = runtime::Rule {
+                min_timings: 1,
+                ..Lookup::RULE
+            };
+            let mut l = lookups(2, rule, &clock);
+            let mut t = Position::new(&ids, &clock);
+            let mut other = Position::new(&ids, &clock);
+            t.begin(&mut l, 0);
+            t.pass(&mut l, 0);
+            let end = t.pos();
+            between(&mut l, &mut t, &mut other);
+            assert_eq!(
+                t.pos(),
+                end,
+                "{what}: the target stands where the pass ended"
+            );
+            t.pass(&mut l, 0);
+            let costs = gate(&l, 0).costs;
+            if costs != walls() {
+                wrong.push((what, costs));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the costs read are not the passes' own walls {:?}: {wrong:?}",
+            walls()
+        );
+    }
+
+    /// Two slots that take turns, each a lookup whose proposals the target
+    /// keeps about one in eight while a verify costs 1.35 of the plain step:
+    /// each slot's chooser reads every pass at its own wall, so its warm-up
+    /// ends, and the gate closes on what the slot's proposals kept.
+    #[test]
+    fn slots_that_take_turns_each_close_a_lookup_that_does_not_pay() {
+        let mut x = 0x2545_f491_u32;
+        let ids: Rc<[u32]> = (0..4093)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x % 8
+            })
+            .collect();
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let mut l = lookups(2, Lookup::RULE, &clock);
+        let mut t = [Position::new(&ids, &clock), Position::new(&ids, &clock)];
+        for (slot, t) in t.iter_mut().enumerate() {
+            t.begin(&mut l, slot);
+        }
+        for i in 0..400 {
+            t[i % 2].pass(&mut l, i % 2);
+        }
+        for slot in 0..2 {
+            let state = gate(&l, slot);
+            assert_eq!(state.costs, walls(), "slot {slot}: the warm-up's costs");
+            assert_eq!(
+                state.width, 0,
+                "slot {slot}: the gate stays open, {state:?}"
+            );
+        }
+    }
 }

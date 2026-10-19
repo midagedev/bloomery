@@ -215,6 +215,16 @@
 //! how many the target kept (`tools/flow/q38width.py` replays them). A
 //! sampling request is a server matter; this CLI is greedy.
 //!
+//! `BLOOMERY_DRAFT=lookup` (a qwen4exp file under `--prefill auto`; on the
+//! other families refused by name, each by why its load verifies no rows)
+//! drafts on the plain load with the n-gram lookup (`runtime::Lookup`, no
+//! weights): windows of two rows, the target's verify of the one id the
+//! prompt and the kept tokens propose, behind the same width chooser. A
+//! `load draft=lookup` line follows the `load` line, the `capture` line the
+//! two-row verify pass; the passes print as the MTP draft's do, `kind=lookup`,
+//! and a `draft summary` record closes the arm. The greedy ids are the plain
+//! run's.
+//!
 //! `BLOOMERY_FORCE_IDS=<path>:<offset>` takes every generated id from a
 //! file of ids (one a line) from the line `offset` on, whatever the row's
 //! argmax: generated token 0 is the file's first id, the plain path
@@ -447,7 +457,8 @@ mod cli {
     use refset::arch::qwen4exp::mtp::{draft_file, draft_places};
     use runtime::width::{Choosing, Chosen as _, Mode as WidthMode, Stats};
     use runtime::{
-        Advance, Committed, Exhausted, Forced, PassSink, Picked, Speculative, Stop, Target,
+        Advance, Committed, Draft, Exhausted, Forced, Lookup, PassSink, Picked, Speculative, Stop,
+        Target, Widths, Window,
     };
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
@@ -1190,7 +1201,7 @@ mod cli {
             let inputs = PlanInputs::describe(file)?;
             let (draft, _) = draft38(levers, offer, logits, arms, ctx)?;
             let mtp = match draft {
-                Draft38::Off => None,
+                Draft38::Off | Draft38::Lookup => None,
                 Draft38::Mtp => Some(mtp_inputs38(levers, file, &inputs)?),
             };
             q38place::tier_experts(
@@ -1750,12 +1761,12 @@ mod cli {
                     &arms,
                 )?;
                 let (draft, off) = draft38(&levers, place, logits, &arms, ctx)?;
-                if slots > 1 && draft == Draft38::Mtp {
+                if slots > 1 && draft != Draft38::Off {
                     return Err(format!(
                         "BLOOMERY_GEN_SLOTS={slots} decodes several streams in one plain pass, \
-                         and this run drafts (BLOOMERY_DRAFT=mtp, or unset under --place a with \
-                         the draft file there): the MTP draft verifies one sequence's window; \
-                         set BLOOMERY_DRAFT=off"
+                         and this run drafts (BLOOMERY_DRAFT=mtp or lookup, or unset under \
+                         --place a with the draft file there): a draft verifies one sequence's \
+                         window; set BLOOMERY_DRAFT=off"
                     )
                     .into());
                 }
@@ -1781,6 +1792,16 @@ mod cli {
             | Chosen::NemotronH(_)
             | Chosen::NemotronHMoe(_) => Draft38::Off,
         };
+        if draft != Draft38::Off
+            && let Some(a) = arms.iter().find(|a| a.n_gen < 2)
+        {
+            return Err(format!(
+                "-n {} with BLOOMERY_DRAFT=mtp or lookup: the prompt call takes the first token, \
+                 so the run takes no pass for the draft to verify; drafting needs -n 2 or more",
+                a.n_gen
+            )
+            .into());
+        }
         if last_step
             && (!matches!(family, Family::Qwen3 | Family::Qwen35) || timed || seed_depth.is_some())
         {
@@ -1857,21 +1878,21 @@ mod cli {
             Some(why) => format!("the run drafts nothing ({why})"),
             None => format!("it needs {need}"),
         };
-        if family == Family::Qwen38 && draft == Draft38::Off && levers.mtp_head_rows().is_some() {
+        if family == Family::Qwen38 && draft != Draft38::Mtp && levers.mtp_head_rows().is_some() {
             return Err(format!(
                 "BLOOMERY_MTP_HEAD_ROWS picks the MTP draft's head; {}",
                 no_draft("BLOOMERY_DRAFT=mtp on a qwen4exp file")
             )
             .into());
         }
-        if draft == Draft38::Off && levers.mtp_draft().is_some() {
+        if draft != Draft38::Mtp && levers.mtp_draft().is_some() {
             return Err(format!(
                 "BLOOMERY_MTP_DRAFT names the MTP draft file; {}",
                 no_draft("BLOOMERY_DRAFT=mtp on a qwen4exp file")
             )
             .into());
         }
-        if draft == Draft38::Off && levers.mtp_windows() {
+        if draft != Draft38::Mtp && levers.mtp_windows() {
             return Err(format!(
                 "BLOOMERY_MTP_WINDOWS prints the MTP draft's windows; {}",
                 no_draft("BLOOMERY_DRAFT=mtp on a qwen4exp file")
@@ -1916,10 +1937,10 @@ mod cli {
                     .into(),
             );
         }
-        if matches!(chosen, Chosen::Qwen38(_, _, Draft38::Mtp, _)) && logits {
+        if draft != Draft38::Off && logits {
             return Err(
-                "--logits with BLOOMERY_DRAFT=mtp: the drafted run's last call is a verify of \
-                 several rows into one head, and --logits reads the step head's row"
+                "--logits with BLOOMERY_DRAFT=mtp or lookup: the drafted run's last call is a \
+                 verify of several rows into one head, and --logits reads the step head's row"
                     .into(),
             );
         }
@@ -2039,6 +2060,31 @@ mod cli {
                     m.set_prompt38_stats(run.stats)?;
                     drive38_mtp(m, cfg, &run, &arms, listed, sync)
                 }
+                Draft38::Lookup => {
+                    if levers.route_trace().is_some() {
+                        return Err(route_trace38::draft_refusal());
+                    }
+                    if path != Prompt38::Auto {
+                        return Err(
+                            "BLOOMERY_DRAFT=lookup feeds the prompt by the session's own call \
+                             (--prefill auto); another --prefill is the plain run's"
+                                .into(),
+                        );
+                    }
+                    let (mut m, residency) = open_qwen38(
+                        file,
+                        &levers,
+                        (ctx, mode, slots),
+                        (path, place, experts, room),
+                        (lever38, None),
+                        lane,
+                        t,
+                    )?;
+                    log38(&mut m, residency, &arms, run.slots)?;
+                    stream38(&mut m, &levers, place, residency)?;
+                    m.set_prompt38_stats(run.stats)?;
+                    drive38_lookup(m, &run, &arms, listed, sync)
+                }
             },
         }
     }
@@ -2063,6 +2109,10 @@ mod cli {
     const MTP_ROWS: usize =
         <Speculative<Choosing<MtpDraft<Body38>>, 4> as Advance<Session<Body38>>>::ROWS;
 
+    /// The window of the lookup draft's passes: its one id and the row
+    /// before it.
+    const LOOKUP_ROWS: usize = <Speculative<Choosing<Lookup>, 2> as Advance<Session<Body38>>>::ROWS;
+
     /// `BLOOMERY_FORCE_IDS`'s ids: the file's lines from the offset on, one
     /// id each. Refused by name: a line that is no id, and a file with fewer
     /// ids from the offset than the longest arm takes — its `-n`, and a
@@ -2082,11 +2132,7 @@ mod cli {
             .map_err(|e| format!("{name}: {} was not read: {e}", path.display()))?;
         let ids = runtime::ids_from(&text, offset)
             .map_err(|e| format!("{name}: {} {e}", path.display()))?;
-        let rows = if draft == Draft38::Mtp {
-            MTP_ROWS - 1
-        } else {
-            0
-        };
+        let rows = draft.rows() - 1;
         let need = arms.iter().map(|a| a.n_gen).max().unwrap_or(0) + rows;
         if ids.len() < need {
             return Err(format!(
@@ -2105,19 +2151,32 @@ mod cli {
         Ok(Some(ids))
     }
 
-    /// Whether `BLOOMERY_DRAFT` drafts this run: `mtp` on a qwen4exp file;
-    /// every other family and word is refused by name.
+    /// Whether `BLOOMERY_DRAFT` drafts this run: `mtp` or `lookup` on a
+    /// qwen4exp file; every other family and word is refused by name.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Draft38 {
         Off,
         Mtp,
+        Lookup,
+    }
+
+    impl Draft38 {
+        /// The most ids a pass takes: one a plain step.
+        fn rows(self) -> usize {
+            match self {
+                Draft38::Off => 1,
+                Draft38::Mtp => MTP_ROWS,
+                Draft38::Lookup => LOOKUP_ROWS,
+            }
+        }
     }
 
     /// `BLOOMERY_DRAFT` on a qwen4exp file run at `place` over `arms` with
-    /// `--ctx` `ctx`: `mtp` the MTP draft, `off` the plain path; unset, the
-    /// rule's (`bloomery_levers::draft38_unset`); and, drafting nothing, why
-    /// (the `load draft=off` record's). The V4.1 words and any other are
-    /// refused by name.
+    /// `--ctx` `ctx`: `mtp` the MTP draft, `lookup` the n-gram lookup on the
+    /// plain load, `off` the plain path; unset, the rule's
+    /// (`bloomery_levers::draft38_unset`); and, drafting nothing, why (the
+    /// `load draft=off` record's). `dspark` and any other word are refused by
+    /// name.
     fn draft38(
         levers: &Levers,
         place: Place,
@@ -2127,10 +2186,11 @@ mod cli {
     ) -> Result<(Draft38, Option<Draft38Off>), GateError> {
         match levers.draft() {
             Some("mtp") => Ok((Draft38::Mtp, None)),
+            Some("lookup") => Ok((Draft38::Lookup, None)),
             Some("off") => Ok((Draft38::Off, Some(Draft38Off::Set))),
             Some(other) => Err(format!(
-                "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window and off runs \
-                 the plain path; lookup and dspark are the V4.1 binaries'"
+                "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window, lookup the \
+                 n-gram lookup and off runs the plain path; dspark is the V4.1 binaries'"
             )
             .into()),
             None => {
@@ -2197,9 +2257,22 @@ mod cli {
                 family.name()
             )
             .into()),
+            Some("lookup") => Err(format!(
+                "BLOOMERY_DRAFT=lookup on a {} file: the lookup draft needs a load that verifies \
+                 several rows, and {}; serve the plain path",
+                family.name(),
+                match family {
+                    Family::Qwen35 => {
+                        "its body verifies rows only on a whole-card load with a lane of delta \
+                         state a row, which this run does not open"
+                    }
+                    _ => "its body runs no pass of several rows",
+                }
+            )
+            .into()),
             Some(word) => Err(format!(
-                "BLOOMERY_DRAFT={word}: only a qwen4exp file runs a draft (mtp); this is a {} \
-                 file",
+                "BLOOMERY_DRAFT={word}: only a qwen4exp file runs a draft (mtp or lookup); this \
+                 is a {} file",
                 family.name()
             )
             .into()),
@@ -3063,21 +3136,80 @@ mod cli {
             &mut VerifyCaptures,
         )?;
         let count = arms.len();
-        for (i, arm) in arms.iter().enumerate() {
+        s.arms(arms, |s, i, arm| {
             if i > 0 {
-                s.clear()?;
                 spec.draft_mut().draft_mut().restart();
-                if let Some(c) = s.take_cleared() {
-                    record::residency_reset(&c).print();
-                }
+            }
+            if let Some(c) = s.take_cleared() {
+                record::residency_reset(&c).print();
             }
             if listed {
                 arm_head(i, count, arm, sync)?;
             }
-            let ran = run_arm38_mtp(&mut s, &mut spec, path, run, arm);
-            end_arm(s.model_mut(), ran)?;
-        }
-        Ok(())
+            let ran = run_arm38(s, &mut spec, path, run, arm, "mtp", |spec, passes, rate| {
+                // The chooser outlives the arm: its account is read here and
+                // the count starts over for the next arm.
+                let stats = spec.draft().stats();
+                let _ = spec.draft_mut().take_tally();
+                mtp_summary(passes, rate, stats.as_ref())?;
+                if run.windows {
+                    mtp_windows(passes, &spec.draft_mut().draft_mut().take_windows())?;
+                }
+                Ok(())
+            });
+            end_arm(s.model_mut(), ran)
+        })
+        .map_err(|f| Box::new(f) as GateError)
+    }
+
+    /// Every arm on the loaded plain model through the n-gram lookup draft
+    /// (`runtime::Lookup`, no weights): the session over it, the two-row
+    /// verify pass captured in graph mode (its nodes printed), the lookup
+    /// behind the width chooser `BLOOMERY_MTP_WIDTH` names, each arm its
+    /// prompt — the lookup's context started over with it — and its windows;
+    /// each arm after the first from the session's clear.
+    fn drive38_lookup(
+        m: Qwen38Model,
+        run: &Run,
+        arms: &[Arm],
+        listed: bool,
+        sync: bool,
+    ) -> Result<(), GateError> {
+        let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
+        let mut spec = s.with_draft::<Choosing<Lookup>, 2>(
+            <Lookup as runtime::width::Chosen<Session<Body38>>>::choosing(
+                Lookup::new(),
+                run.width,
+            )?,
+            &mut VerifyCaptures,
+        )?;
+        println!("load draft=lookup (no weights)");
+        let count = arms.len();
+        s.arms(arms, |s, i, arm| {
+            if let Some(c) = s.take_cleared() {
+                record::residency_reset(&c).print();
+            }
+            if listed {
+                arm_head(i, count, arm, sync)?;
+            }
+            let ran = run_arm38(
+                s,
+                &mut spec,
+                Prompt38::Auto,
+                run,
+                arm,
+                "lookup",
+                |spec, passes, rate| {
+                    // The chooser outlives the arm: its count starts over
+                    // for the next arm.
+                    let p = passes.iter().map(|p| (p.0, p.0 && p.1 > 1, p.1));
+                    record::draft_summary(p, rate, "lookup", spec.draft_mut()).print();
+                    Ok(())
+                },
+            );
+            end_arm(s.model_mut(), ran)
+        })
+        .map_err(|f| Box::new(f) as GateError)
     }
 
     /// The end of an arm `ran`: its `residency pass` records
@@ -3181,17 +3313,31 @@ mod cli {
         }
     }
 
-    /// One arm through the draft: the prompt — the draft walked over its
-    /// units, its own lines as the plain run's — then the windows until `-n`
-    /// tokens are out, every kept token the target's own argmax (under
-    /// `BLOOMERY_FORCE_IDS`, the file's id at its position).
-    fn run_arm38_mtp(
+    /// What a drafted arm's passes were: each one's proposal, its kept rows,
+    /// its rows, its wall a kept position (ms) and its wall.
+    type Passes = [(bool, usize, usize, f64, Duration)];
+
+    /// One arm through the draft `spec`: the prompt — the MTP draft walked
+    /// over its units, its own lines as the plain run's — then the windows
+    /// until `-n` tokens are out, every kept token the target's own argmax
+    /// (under `BLOOMERY_FORCE_IDS`, the file's id at its position); a
+    /// drafted pass's `time pass` record names `kind`, and `summary` prints
+    /// the draft's own records of the arm's passes and the counted passes'
+    /// positions per second ([`counted_passes`]).
+    fn run_arm38<D, S, const M: usize>(
         s: &mut Session<Body38>,
-        spec: &mut Speculative<Choosing<MtpDraft<Body38>>, 4>,
+        spec: &mut Speculative<Choosing<D>, M>,
         path: Prompt38,
         run: &Run,
         arm: &Arm,
-    ) -> Result<(), GateError> {
+        kind: &str,
+        summary: S,
+    ) -> Result<(), GateError>
+    where
+        D: Draft<Session<Body38>>,
+        S: FnOnce(&mut Speculative<Choosing<D>, M>, &Passes, f64) -> Result<(), GateError>,
+        Window<M>: Widths,
+    {
         let (ids, n_gen, warm) = (&arm.ids, arm.n_gen, run.warm);
         let plan = <Body38 as Prompted>::plan(s.model(), ids.len(), path)?;
         let t = Instant::now();
@@ -3254,7 +3400,7 @@ mod cli {
                     .flag("warm", i < warm)
                     .f("ms", wall.as_secs_f64() * 1e3)
                     .u("positions", rows)
-                    .w("kind", if proposed { "mtp" } else { "plain" })
+                    .w("kind", if proposed { kind } else { "plain" })
                     .print();
                 for _ in 0..rows {
                     if at >= n_gen - 1 {
@@ -3273,33 +3419,22 @@ mod cli {
         if let Some(t) = &run.tok {
             println!("text {:?}", t.decode(&tokens));
         }
-        // The chooser outlives the arm: its account is read here and the
-        // count starts over for the next arm.
-        let stats = spec.draft().stats();
-        let _ = spec.draft_mut().take_tally();
-        mtp_summary(&sink.passes, warm, stats.as_ref())?;
-        if run.windows {
-            mtp_windows(&sink.passes, &spec.draft_mut().draft_mut().take_windows())?;
-        }
+        let counted = counted_passes(&sink.passes, warm)?;
+        summary(spec, &sink.passes, counted.rate())?;
         if run.timed {
-            let counted = &sink.passes[warm..];
-            let positions: usize = counted.iter().map(|&(_, k, ..)| k).sum();
-            let ms: f64 = counted
-                .iter()
-                .map(|&(_, _, _, _, w)| w.as_secs_f64() * 1e3)
-                .sum();
-            let mut per: Vec<f64> = counted.iter().map(|&(_, _, _, p, _)| p).collect();
+            let mut per: Vec<f64> = counted.passes.iter().map(|&(_, _, _, p, _)| p).collect();
             per.sort_by(f64::total_cmp);
             let p50 = per[per.len() / 2];
-            let mean = ms / positions as f64;
+            let mean = counted.ms / counted.positions as f64;
             println!(
                 "SMOKE mode={} prompt_tokens={} depth={} generated={n_gen} warm={warm} \
-                 steps={positions} passes={} p50_ms={p50:.4} mean_ms={mean:.4} \
+                 steps={} passes={} p50_ms={p50:.4} mean_ms={mean:.4} \
                  tok/s(p50)={:.2} tok/s(mean)={:.2} ctx={}",
                 mode_name(run.mode),
                 ids.len(),
                 ids.len(),
-                counted.len(),
+                counted.positions,
+                counted.passes.len(),
                 1e3 / p50,
                 1e3 / mean,
                 run.ctx
@@ -3309,15 +3444,45 @@ mod cli {
         Ok(())
     }
 
+    /// The passes an arm's rate is over: those past the first `--warm`, the
+    /// positions they kept and their wall.
+    struct Counted<'a> {
+        passes: &'a Passes,
+        positions: usize,
+        ms: f64,
+    }
+
+    impl Counted<'_> {
+        /// The counted passes' positions per second.
+        fn rate(&self) -> f64 {
+            self.positions as f64 * 1e3 / self.ms
+        }
+    }
+
+    /// [`Counted`] over `passes` past the first `warm`; refused by name when
+    /// none is left. A pass keeps up to a window's positions, so `-n` past
+    /// `--warm` still can end within the warm passes.
+    fn counted_passes(passes: &Passes, warm: usize) -> Result<Counted<'_>, GateError> {
+        let kept = passes.get(warm..).unwrap_or_default();
+        if kept.is_empty() {
+            return Err(format!(
+                "--warm {warm} leaves no counted pass of the {} this run took",
+                passes.len()
+            )
+            .into());
+        }
+        Ok(Counted {
+            passes: kept,
+            positions: kept.iter().map(|p| p.1).sum(),
+            ms: kept.iter().map(|p| p.4.as_secs_f64() * 1e3).sum(),
+        })
+    }
+
     /// The `mtp summary` record: the windows' proposals, the kept lengths'
-    /// and the verified widths' histograms, the positions and their rate
-    /// over the counted passes, and the width chooser's account of the arm
-    /// (`record::mtp_stats`).
-    fn mtp_summary(
-        passes: &[(bool, usize, usize, f64, Duration)],
-        warm: usize,
-        stats: Option<&Stats>,
-    ) -> Result<(), GateError> {
+    /// and the verified widths' histograms, the positions, the counted
+    /// passes' positions per second `rate`, and the width chooser's account
+    /// of the arm (`record::mtp_stats`).
+    fn mtp_summary(passes: &Passes, rate: f64, stats: Option<&Stats>) -> Result<(), GateError> {
         let mut kept = [0u64; 4];
         let mut widths = [0u64; 4];
         let mut positions = 0usize;
@@ -3330,12 +3495,6 @@ mod cli {
             widths[rows - 1] += 1;
             positions += k;
         }
-        let counted = &passes[warm..];
-        let counted_positions: usize = counted.iter().map(|&(_, k, ..)| k).sum();
-        let ms: f64 = counted
-            .iter()
-            .map(|&(_, _, _, _, w)| w.as_secs_f64() * 1e3)
-            .sum();
         record::mtp_stats(
             Record::new(&record::MTP_SUMMARY)
                 .u("proposals", proposals)
@@ -3343,7 +3502,7 @@ mod cli {
                 .list("widths", &widths)
                 .u("positions", positions)
                 .u("passes", passes.len())
-                .f("tok/s(positions)", counted_positions as f64 * 1e3 / ms),
+                .f("tok/s(positions)", rate),
             stats,
             proposals,
         )?
@@ -3356,10 +3515,7 @@ mod cli {
     /// one row past the ids it says the pass verified. A window the passes
     /// do not hold, or a pass the draft kept no window of, is refused by
     /// name.
-    fn mtp_windows(
-        passes: &[(bool, usize, usize, f64, Duration)],
-        windows: &[WindowDraft],
-    ) -> Result<(), GateError> {
+    fn mtp_windows(passes: &Passes, windows: &[WindowDraft]) -> Result<(), GateError> {
         let drafted: Vec<(usize, usize, usize)> = passes
             .iter()
             .enumerate()
@@ -3797,5 +3953,21 @@ mod cli {
     /// [`Probe::read`] of the qwen4exp body, which always has a host tier.
     fn probe38(m: &Qwen38Model, prev: Option<&Probe>) -> Result<Probe, GateError> {
         Probe::read(m.body("generate_qwen3moe")?.hybrid(), m.gpu(), prev)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Duration, counted_passes};
+
+        #[test]
+        fn a_rate_over_no_counted_pass_is_refused() {
+            let pass = (true, 2, 2, 5.0, Duration::from_millis(10));
+            let none = counted_passes(&[], 0).map(|c| c.rate());
+            assert!(none.is_err(), "a run of no pass gave {none:?}");
+            assert!(counted_passes(&[pass], 1).is_err());
+            let two = [pass, pass];
+            let c = counted_passes(&two, 1).unwrap();
+            assert_eq!((c.passes.len(), c.positions, c.rate()), (1, 2, 200.0));
+        }
     }
 }

@@ -44,7 +44,7 @@ pub mod rounds;
 mod tests {
     use bloomery_gpu::arch::qwen3moe::Prompt38;
 
-    use super::qwen38::{ACTS_ON, Feed38, prompt_cuts, refuse_feed};
+    use super::qwen38::{ACTS_ON, Feed38, prompt_cuts, refuse_feed, refuse_lookup_feed};
 
     const STEPS: Feed38 = Feed38 {
         prompt: Prompt38::Step,
@@ -101,6 +101,17 @@ mod tests {
             why.contains("BLOOMERY_RESIDENCY=mid-p40-s1 moves the slot map"),
             "{why}"
         );
+    }
+
+    #[test]
+    fn the_lookup_draft_takes_only_the_batched_feed_untraced() {
+        for feed in [STEPS, TRACED, BATCH_TRACED] {
+            let why = refuse_lookup_feed(feed)
+                .expect_err("the lookup beside a one-row feed")
+                .to_string();
+            assert!(why.contains("BLOOMERY_DRAFT=lookup verifies"), "{why}");
+        }
+        refuse_lookup_feed(BATCH).expect("the lookup on the batched feed");
     }
 
     #[test]

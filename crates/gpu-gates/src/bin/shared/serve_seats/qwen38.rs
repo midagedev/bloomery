@@ -358,7 +358,7 @@ use serve::{
 };
 use tokenizer::Tokenizer;
 
-use super::drafted::{ParkedDraft, SlotDrafts};
+use super::drafted::{ParkedDraft, SlotDrafts, lookup_props};
 
 #[path = "../qwen38_place.rs"]
 mod q38place;
@@ -663,6 +663,21 @@ impl Feed38 {
     }
 }
 
+/// The feed the lookup draft refuses: the route trace and the step feed run
+/// one-row steps, where the lookup verifies its proposal in a pass and takes
+/// its context from the prompt call's ids.
+pub(crate) fn refuse_lookup_feed(feed: Feed38) -> Result<(), GateError> {
+    if feed.traced || feed.stepped() {
+        return Err(
+            "BLOOMERY_DRAFT=lookup verifies its proposal in a pass and takes its context from \
+             the prompt call's ids; BLOOMERY_ROUTE_TRACE and BLOOMERY_PREFILL=steps run one-row \
+             steps: set BLOOMERY_DRAFT=off"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// What the feed and the trace refuse of the run, each by name before the
 /// load, with `slots` resident sequences, `mtp` the draft on and `residency`
 /// the set residency word when it is not `off`. The trace records one
@@ -722,6 +737,19 @@ pub(crate) fn refuse_feed(
     Ok(())
 }
 
+/// The MTP draft's own lever set, which the lookup draft does not read:
+/// its head and its file. `BLOOMERY_MTP_WIDTH` is the width chooser's,
+/// which both drafts run behind.
+fn mtp_only_lever(levers: &bloomery_levers::Levers) -> Option<&'static str> {
+    if levers.mtp_head_rows().is_some() {
+        Some(bloomery_levers::MTP_HEAD_ROWS)
+    } else if levers.mtp_draft().is_some() {
+        Some(bloomery_levers::MTP_DRAFT)
+    } else {
+        None
+    }
+}
+
 /// `BLOOMERY_DRAFT` on the seat at `place` with stores of `ctx` positions
 /// in all, split among `slots` resident sequences, `file` the MTP draft file
 /// the load would open, `inputs` the target's: `mtp` the draft, `off` the
@@ -729,10 +757,12 @@ pub(crate) fn refuse_feed(
 /// (`bloomery_levers::draft38_unset`), then `off` when the target's matrices
 /// the draft borrows are not its format (`PlanInputs::mtp_borrows`, which
 /// refuses a set `mtp` at `MtpInputs::read`); and, drafting nothing, why (the
-/// `load draft=off` record's). This is the rule before the plan: the unset
-/// draft's yield to the context (`bloomery_levers::RungCost::of`, the
-/// module doc) is decided after the context choice, at the caller. The V4.1
-/// words and any other are refused by name.
+/// `load draft=off` record's); `lookup` the lookup draft in its place
+/// (`drafted::Lookups`), the MTP draft off with no why. This is the rule
+/// before the plan: the unset draft's yield to the context
+/// (`bloomery_levers::RungCost::of`, the module doc) is decided after the
+/// context choice, at the caller. `dspark` and any other word are refused by
+/// name.
 ///
 /// The rule's run conditions as the seat meets them: no `--logits` (a
 /// request that reads the logits row steps plainly, the row the target's),
@@ -750,10 +780,11 @@ fn draft38(
 ) -> Result<(bool, Option<Draft38Off>), GateError> {
     match levers.draft() {
         Some("mtp") => Ok((true, None)),
+        Some("lookup") => Ok((false, None)),
         Some("off") => Ok((false, Some(Draft38Off::Set))),
         Some(other) => Err(format!(
-            "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window and off runs the \
-             plain path; lookup and dspark are the V4.1 binaries'"
+            "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window, lookup the n-gram \
+             lookup and off runs the plain path; dspark is the V4.1 binaries'"
         )
         .into()),
         None => {
@@ -1133,17 +1164,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // the plan turns off refuses them the same as one the rule did.
     let refuse_mtp_levers = |draft_off: &Option<Draft38Off>| -> Result<(), GateError> {
         if let Some(why) = draft_off {
-            if levers.mtp_head_rows().is_some() {
+            if let Some(lever) = mtp_only_lever(&levers) {
                 return Err(format!(
-                    "BLOOMERY_MTP_HEAD_ROWS picks the MTP draft's head; the server drafts \
-                     nothing ({why})"
-                )
-                .into());
-            }
-            if levers.mtp_draft().is_some() {
-                return Err(format!(
-                    "BLOOMERY_MTP_DRAFT names the MTP draft file; the server drafts nothing \
-                     ({why})"
+                    "{lever} is the MTP draft's; the server drafts nothing ({why})"
                 )
                 .into());
             }
@@ -1157,6 +1180,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         }
         Ok(())
     };
+    let lookup = levers.draft() == Some("lookup");
+    if lookup && let Some(lever) = mtp_only_lever(&levers) {
+        return Err(format!(
+            "{lever} is the MTP draft's; BLOOMERY_DRAFT=lookup serves the lookup draft"
+        )
+        .into());
+    }
     let width = WidthMode::of(levers.mtp_width())?;
     let experts = experts38(&levers)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
@@ -1392,6 +1422,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     refuse_mtp_levers(&draft_off)?;
     let residency_word = set.filter(|&(r, _)| r != Residency::Off).map(|(_, w)| w);
+    if lookup {
+        refuse_lookup_feed(feed)?;
+    }
     refuse_feed(feed, (slots, mtp), residency_word)?;
     // The prompt cache's budget, read from the host need at the chosen
     // context on one reading of the host's available bytes.
@@ -1575,6 +1608,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         pin_main: levers.pin_main(),
         path: path.clone(),
         mtp,
+        lookup,
         head,
         draft_path,
         draft_from,
@@ -1719,6 +1753,8 @@ struct SeatArgs {
     path: PathBuf,
     /// `BLOOMERY_DRAFT=mtp`, the MTP draft; unset the plain path.
     mtp: bool,
+    /// `BLOOMERY_DRAFT=lookup`, the lookup draft (`drafted::Lookups`).
+    lookup: bool,
     /// The draft's head under `mtp` (`head_list::head_rows_of`), which the
     /// load prints.
     head: Option<HeadPick>,
@@ -2004,24 +2040,23 @@ impl Q38 {
         }
         // One draft a resident slot ([`SlotDrafts`]): every busy slot's
         // draft reachable in one round with no select between.
-        let drafts = match a.mtp {
-            false => SlotDrafts::none(),
-            true => {
-                struct Captures;
-                impl app::RowsLog for Captures {
-                    fn capture_rows(
-                        &mut self,
-                        rows: usize,
-                        nodes: usize,
-                    ) -> Result<(), app::SessionError> {
-                        eprintln!("capture verify rows={rows} nodes={nodes}");
-                        Ok(())
-                    }
-                }
-                SlotDrafts::open(&mut s, a.slots, a.width, &mut Captures, |m| {
-                    MtpDraft::open(m, Prompt38::Auto, StepMode::Graph)
-                })?
+        struct Captures;
+        impl app::RowsLog for Captures {
+            fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), app::SessionError> {
+                eprintln!("capture verify rows={rows} nodes={nodes}");
+                Ok(())
             }
+        }
+        let drafts = match (a.mtp, a.lookup) {
+            (true, _) => SlotDrafts::open(&mut s, a.slots, a.width, &mut Captures, |m| {
+                MtpDraft::open(m, Prompt38::Auto, StepMode::Graph)
+            })?,
+            (false, true) => {
+                let drafts = SlotDrafts::lookup(&mut s, a.slots, a.width, &mut Captures)?;
+                eprintln!("load draft=lookup slots={} (no weights)", a.slots);
+                drafts
+            }
+            (false, false) => SlotDrafts::none(),
         };
         // The rounds of several slots, decided once (`SeatArgs::pass`): one
         // pass of the busy rows where the body runs one, the drafted rounds
@@ -2057,7 +2092,7 @@ impl Q38 {
             residency,
             break_even: a.mtp.then(|| break_even_of(a.place)),
             one_pass: pass_of_slots && a.mtp,
-            step_pass: pass_of_slots && !a.mtp,
+            step_pass: pass_of_slots && !a.mtp && !a.lookup,
             stats: a.stats,
             census,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
@@ -2537,7 +2572,7 @@ impl Seat for Q38 {
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
         let held = self.s.pos();
         self.s.model_mut().rollback(pos)?;
-        if self.drafts.drafts() && pos < held {
+        if self.drafts.mtp() && pos < held {
             let sel = self.s.selected();
             self.cut_line[sel] = None;
             if self.rejoins(sel, pos as usize)? {
@@ -2559,6 +2594,9 @@ impl Seat for Q38 {
     /// file, its width and its resident bytes as the card's `draft`
     /// class.
     fn props(&self, mut p: EngineProps) -> EngineProps {
+        if self.drafts.looks_up() {
+            return lookup_props(p);
+        }
         if !self.drafts.drafts() {
             return p;
         }
@@ -2642,7 +2680,7 @@ impl Seat for Q38 {
         let at = put_back(self, state, WHOSE, |q, body| {
             q.s.model_mut().seq_resume_prefix(body, n)
         })?;
-        if self.drafts.drafts() && at < state.n_tokens() {
+        if self.drafts.mtp() && at < state.n_tokens() {
             let sel = self.s.selected();
             let pos = u32::try_from(at).unwrap_or(u32::MAX);
             if self.rejoins(sel, at)? {
