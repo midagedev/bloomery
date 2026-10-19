@@ -1748,9 +1748,12 @@ gate-gpu-mcol:
 
 # bloomery-gpu's lib tests through tools/gate.sh --oxide (its bound, cargo's exit code), with no gate lock, so the
 # batch keeps them on the 3090 (lane A). The hw_ tests (graph.rs' capture, replay, host flags and node kinds;
-# checkpoint.rs; host/step.rs' boundary) run small kernels on device 0. A test that holds a stream shut (hw_held_,
-# checkpoint.rs' Hold) runs in a second pass, one at a time: beside another test it deadlocks. Then the lib tests of
-# bloomery-verbs, the RDMA link's verbs, which open no NIC. just gate runs it.
+# checkpoint.rs; host/step.rs' boundary) run small kernels on device 0. A test that holds a stream shut (checkpoint.rs'
+# Hold) or parks one on a wait it opens only after a driver call of its own (host/tier.rs' parking_work) is named
+# hw_held_ and runs in a second pass, one at a time: a device-wide sync in a parallel test (any cuMemFree) takes the
+# driver's lock while it waits for that stream, and the call that would open it queues behind it. hold::require_serial_pass
+# refuses by name anywhere else. Then the lib tests of bloomery-verbs, the RDMA link's verbs, which open no NIC. just gate
+# runs it.
 [group('canary')]
 gate-gpu-lib:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored --skip hw_held_ && RUST_TEST_THREADS=1 bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored hw_held_ && bash tools/gate.sh --release -p bloomery-verbs --lib'

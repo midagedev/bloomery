@@ -762,7 +762,8 @@ unsafe extern "C" fn copy_points(data: *mut c_void) {
 /// A stream held shut for a test: what is enqueued on it after [`hold::Hold::on`]
 /// does not start until the test opens the hold, so a copy behind it is in
 /// flight for as long as the test says, whatever else the device or the
-/// driver is doing.
+/// driver is doing. The one owner, too, of the rule every shut stream
+/// follows: the test runs alone ([`hold::require_serial_pass`]).
 #[cfg(test)]
 pub(crate) mod hold {
     use std::ffi::c_void;
@@ -785,28 +786,37 @@ pub(crate) mod hold {
         }
     }
 
+    /// Panics by name unless the tests run one at a time.
+    ///
+    /// A test whose stream is shut — held ([`Hold`]), or parked on a wait
+    /// that its own host stores release — and that makes a driver call before
+    /// it opens the stream must run alone: a device-wide sync in a parallel
+    /// test (`cuMemFree` is one) waits for the shut stream while holding the
+    /// driver's lock that this test's next call needs, and neither returns.
+    /// So such a test is named `hw_held_…`, the lib's parallel pass skips that
+    /// prefix, and a second pass runs it under `RUST_TEST_THREADS=1`
+    /// (`just gate-gpu-lib`); the helper that shuts the stream calls this and
+    /// refuses by name anywhere else. `what` names that helper.
+    pub(crate) fn require_serial_pass(what: &str) {
+        assert_eq!(
+            std::env::var("RUST_TEST_THREADS").as_deref(),
+            Ok("1"),
+            "{what}: a shut stream deadlocks a parallel test's device-wide sync: name the test \
+             hw_held_… so gate-gpu-lib runs it in its RUST_TEST_THREADS=1 pass"
+        );
+    }
+
     /// The hold; dropping it opens it, so a failed assert never leaves the
     /// stream shut. While it is shut the test must not wait for anything
     /// enqueued behind it: no land, no event or stream sync, no extent drop.
-    ///
-    /// No other test may run beside it: a device-wide sync in a parallel test
-    /// (`cuMemFree` is one) waits for the shut stream while holding the
-    /// driver's lock that this test's next launch needs, and neither returns.
-    /// So a test that holds is named `hw_held_…`, the lib's parallel pass
-    /// skips that prefix, and a second pass runs it under `RUST_TEST_THREADS=1`
-    /// (`just gate-gpu-lib`); [`Hold::on`] refuses by name anywhere else.
+    /// It runs alone ([`require_serial_pass`]).
     pub struct Hold(Arc<AtomicBool>);
 
     impl Hold {
         /// Shuts `stream` after the work it holds so far. Panics by name
         /// unless the tests run one at a time (see [`Hold`]).
         pub fn on(stream: &CudaStream) -> Result<Hold, GpuError> {
-            assert_eq!(
-                std::env::var("RUST_TEST_THREADS").as_deref(),
-                Ok("1"),
-                "a held stream deadlocks a parallel test's device sync: name the test hw_held_… so \
-                 gate-gpu-lib runs it in its RUST_TEST_THREADS=1 pass"
-            );
+            require_serial_pass("Hold::on");
             let flag = Arc::new(AtomicBool::new(false));
             let data = Arc::into_raw(Arc::clone(&flag)).cast_mut().cast::<c_void>();
             // SAFETY: `data` is a live `Arc` count that `wait_open` takes.

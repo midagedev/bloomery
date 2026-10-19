@@ -15,6 +15,19 @@
 //! captures on other devices are other locks: per-device contexts cannot
 //! break each other's captures.
 //!
+//! A synchronize of this module's, and the implicit one every free makes
+//! (`cuMemFree`), wait for every stream of the device, a stream parked on a
+//! wait that a host store opens included, and the driver's lock stays with
+//! the waiter: shared for a synchronize, which blocks a thread's next driver
+//! call once any writer queues, exclusive for a free, which blocks it at
+//! once. A thread that must make a driver call before it opens such a wait
+//! waits behind the waiter while the waiter waits for the wait: neither
+//! returns, and no bound of ours ends it. The engine makes its synchronizes
+//! and frees on the thread that drives the steps, at load and teardown, and
+//! its helper threads copy and store but neither free nor synchronize; a
+//! test that parks a stream runs alone
+//! (`checkpoint::hold::require_serial_pass`).
+//!
 //! A capture holds one device's shared side for its whole body; a body
 //! that also took a second device's exclusive side could meet another
 //! thread doing the two in the opposite order. No capture body of the

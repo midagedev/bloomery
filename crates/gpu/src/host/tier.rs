@@ -2541,11 +2541,20 @@ pub(super) mod tests {
         work
     }
 
+    /// [`remote_work`] for a test that parks the work's stream on a go wait
+    /// and makes driver calls before it releases the wait: the test runs
+    /// alone ([`crate::checkpoint::hold::require_serial_pass`]), named
+    /// `hw_held_…`.
+    fn parking_work(file: &gguf::Split) -> super::TierWork {
+        crate::checkpoint::hold::require_serial_pass("tier::tests::parking_work");
+        remote_work(file, Arc::new(AtomicBool::new(false)), false)
+    }
+
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
-    fn hw_remote_reset_releases_waits_before_its_drain() {
+    fn hw_held_remote_reset_releases_waits_before_its_drain() {
         let (path, file) = super::super::node::tests::empty_file("remote-reset");
-        let mut work = remote_work(&file, Arc::new(AtomicBool::new(false)), false);
+        let mut work = parking_work(&file);
         work.enqueue(0, 0, 1).expect("a go wait");
         let result = work.reset_remote(0);
         work.link
@@ -2564,9 +2573,9 @@ pub(super) mod tests {
     /// page's link posts of their dones, before the tier's stream runs them.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
-    fn hw_a_chain_sets_the_columns_its_dones_post() {
+    fn hw_held_a_chain_sets_the_columns_its_dones_post() {
         let (path, file) = super::super::node::tests::empty_file("post-cols");
-        let mut work = remote_work(&file, Arc::new(AtomicBool::new(false)), false);
+        let mut work = parking_work(&file);
         let posted = work.link.as_ref().expect("a page").post_cols();
         work.capture(Chain::Step, 1, &[(0, 0)])
             .expect("a step graph");
