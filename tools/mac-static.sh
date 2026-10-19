@@ -112,6 +112,7 @@ run_checks() {
   local -a names=() args
   shift 3
   listed=$(check_names "$dir" "$@") || return $?
+  [ -n "$listed" ] || return 0 # every check skipped: a here-string of nothing would still read one empty name
   while IFS= read -r n; do names+=("$n"); done <<< "$listed"
   for n in "${names[@]}"; do
     args=()
@@ -274,6 +275,10 @@ self_test() {
   case $out in *"mac-static: check-red rc 7"*) ;; *) fail "the red script is not named: $out" ;; esac
   [ "$(cat "$cd_/ran-model-tax")" = "check --base origin/main" ] || fail "a run with no base ran model-tax with '$(cat "$cd_/ran-model-tax")'"
   [ ! -e "$cd_/ran-zz" ] || fail "a script after the red one ran"
+  rc=0; out=$(run_checks "$cd_" '' '' aa model-tax modelsx red skipme zz 2>&1) || rc=$?
+  [ "$rc" = 0 ] && [ -z "$out" ] || fail "every check skipped: rc $rc, out '$out', not rc 0 and nothing run"
+  rc=0; out=$(run_checks "$cd_" '' 1 aa model-tax modelsx red skipme zz 2>&1) || rc=$?
+  [ "$rc" = 0 ] && [ -z "$out" ] || fail "every check skipped, --list: rc $rc, out '$out', not rc 0 and no line"
   rm -rf "$cd_"
 
   # --checks on this tree: its --list is every check script (SKIP is the round loop's, --skip is its own), its arguments are refused by name
