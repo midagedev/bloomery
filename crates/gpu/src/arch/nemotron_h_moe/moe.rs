@@ -53,9 +53,15 @@ pub(super) struct MoeLayer {
     pub(super) ff: usize,
     pub(super) latent_down: Site,
     pub(super) latent_up: Site,
-    /// The IQ2_XXS stacks, in the file's blocks.
-    pub(super) up_exps: String,
-    pub(super) down_exps: String,
+    /// The experts the card holds of the layer: the router's count on a
+    /// whole-card load, the plan's card segment on a placed one (a stack of
+    /// `n_card` experts' rows, in the plan's order: slot `s` is the `s`-th
+    /// expert the plan puts on the card).
+    pub(super) n_card: usize,
+    /// The IQ2_XXS stacks of those experts, in the file's blocks; `None`
+    /// where `n_card` is 0, which has no tensor.
+    up_exps: Option<String>,
+    down_exps: Option<String>,
     pub(super) up_shexp: String,
     pub(super) down_shexp: String,
     pub(super) route: RouteOut,
@@ -79,20 +85,20 @@ pub(super) struct MoeKernels {
 /// The buffers a MoE layer runs over, m = 1.
 pub(super) struct MoeScratch {
     /// The latent down's output, the experts' input.
-    lat: DeviceBuffer<f32>,
+    pub(super) lat: DeviceBuffer<f32>,
     /// The slots' up outputs, `TOP_K × w`.
-    up: DeviceBuffer<f32>,
+    pub(super) up: DeviceBuffer<f32>,
     /// The slots' down outputs, `TOP_K × latent`.
-    down: DeviceBuffer<f32>,
+    pub(super) down: DeviceBuffer<f32>,
     /// The weighted sum of the slots, `latent`.
-    moe: DeviceBuffer<f32>,
+    pub(super) moe: DeviceBuffer<f32>,
     /// The shared expert's up output, then its down.
-    sh_up: DeviceBuffer<f32>,
-    sh: DeviceBuffer<f32>,
+    pub(super) sh_up: DeviceBuffer<f32>,
+    pub(super) sh: DeviceBuffer<f32>,
     /// `moe_out + shared`, the layer's delta.
-    sum: DeviceBuffer<f32>,
+    pub(super) sum: DeviceBuffer<f32>,
     /// The one id of a one-expert stack (the shared expert's).
-    zero_id: DeviceBuffer<u32>,
+    pub(super) zero_id: DeviceBuffer<u32>,
 }
 
 impl MoeScratch {
@@ -161,7 +167,7 @@ fn iq2_xxs(
 }
 
 /// The resident stack `name` a launch reads.
-fn stack<'w>(
+pub(super) fn stack<'w>(
     w: &'w Weights,
     what: &'static str,
     name: &str,
@@ -177,15 +183,17 @@ fn stack<'w>(
 }
 
 impl MoeLayer {
-    /// Latent MoE layer `l` of `hp`, its pre-norm `norm` resolved by the
-    /// caller. A layer whose
-    /// count no router instance is built for, whose top-k is not
-    /// [`TOP_K`] or whose kept weights are not renormalized is refused by
-    /// name. Load-time only.
+    /// Latent MoE layer `l` of `hp` with `n_card` of its experts resident
+    /// (the router's count for the whole card), its pre-norm `norm` resolved
+    /// by the caller. A layer whose count no router instance is built for,
+    /// whose top-k is not [`TOP_K`], whose kept weights are not renormalized
+    /// or whose `n_card` is past its experts is refused by name.
+    /// Load-time only.
     pub(super) fn load(
         names: &Names<'_>,
         (l, norm): (usize, String),
         hp: &Hparams,
+        n_card: usize,
         stream: &CudaStream,
     ) -> Result<MoeLayer, GpuError> {
         let what = names.what;
@@ -206,6 +214,12 @@ impl MoeLayer {
             ));
         }
         let (hidden, lat, shf, n, ff) = (hp.n_embd, hp.latent, hp.shared_ff, x.n_expert, x.ff);
+        if n_card > n {
+            return Err(GpuError::shape(
+                what,
+                format!("layer {l}: {n_card} experts on the card of its {n}"),
+            ));
+        }
         let router = layer_name(l, FFN_GATE_INP);
         let rows = names.w.f32_tensor(what, &router)?;
         if (rows.rows(), rows.cols()) != (n, hidden) {
@@ -225,8 +239,13 @@ impl MoeLayer {
                 LATENT_TYPES,
             )?,
             latent_up: names.site(&layer_name(l, FFN_LATENT_UP), (hidden, lat), LATENT_TYPES)?,
-            up_exps: iq2_xxs(w, what, &layer_name(l, FFN_UP_EXPS), (n * ff, lat))?,
-            down_exps: iq2_xxs(w, what, &layer_name(l, FFN_DOWN_EXPS), (n * lat, ff))?,
+            n_card,
+            up_exps: (n_card > 0)
+                .then(|| iq2_xxs(w, what, &layer_name(l, FFN_UP_EXPS), (n_card * ff, lat)))
+                .transpose()?,
+            down_exps: (n_card > 0)
+                .then(|| iq2_xxs(w, what, &layer_name(l, FFN_DOWN_EXPS), (n_card * lat, ff)))
+                .transpose()?,
             up_shexp: iq2_xxs(w, what, &layer_name(l, FFN_UP_SHEXP), (shf, hidden))?,
             down_shexp: iq2_xxs(w, what, &layer_name(l, FFN_DOWN_SHEXP), (hidden, shf))?,
             route: RouteOut::new(what, stream, n)?,
@@ -249,6 +268,28 @@ impl MoeLayer {
     pub(super) fn sites(&self) -> [&Site; 2] {
         [&self.latent_down, &self.latent_up]
     }
+
+    /// The routed up stack of the layer's card experts; a layer with none is
+    /// refused by name.
+    pub(super) fn up(&self) -> Result<&str, GpuError> {
+        stack_name(&self.up_exps)
+    }
+
+    /// The routed down stack of the layer's card experts; a layer with none
+    /// is refused by name.
+    pub(super) fn down(&self) -> Result<&str, GpuError> {
+        stack_name(&self.down_exps)
+    }
+}
+
+/// A card stack's name, or the refusal of a layer that holds no expert on
+/// the card (a placed load's prompt runs as steps, which skip such a layer's
+/// card slots).
+fn stack_name(name: &Option<String>) -> Result<&str, GpuError> {
+    name.as_deref().ok_or(GpuError::state(
+        "nemotron_h_moe::MoeLayer",
+        "a routed stack on the card (a layer with no card expert holds none)",
+    ))
 }
 
 /// `y = W · col` for the one-expert IQ2_XXS stack `name` of `rows` rows: the
@@ -258,7 +299,7 @@ impl MoeLayer {
     clippy::too_many_arguments,
     reason = "the launch's stack, activation, id and output, and the layer it raises in"
 )]
-fn one_expert(
+pub(super) fn one_expert(
     cx: &Cx<'_>,
     k: &MoeKernels,
     l: usize,
@@ -340,7 +381,7 @@ pub(super) fn moe_layer(
         let act = acts.q8_1_at(what, sh.latent, 1)?;
         gpu.enqueue_quantize_q8_1_layer(&s.lat, act, l)?;
         let up = SelDown {
-            w: stack(cx.w, what, &m.up_exps)?,
+            w: stack(cx.w, what, m.up()?)?,
             act,
             sel: m.route.ids(),
             n_slots: TOP_K,
@@ -352,7 +393,7 @@ pub(super) fn moe_layer(
         let act = acts.q8_1_at(what, m.ff, TOP_K)?;
         gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.up, act, l)?;
         let down = SelDown {
-            w: stack(cx.w, what, &m.down_exps)?,
+            w: stack(cx.w, what, m.down()?)?,
             act,
             sel: m.route.ids(),
             n_slots: TOP_K,

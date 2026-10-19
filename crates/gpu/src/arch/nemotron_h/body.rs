@@ -72,6 +72,18 @@ impl Body {
             GROUP_5,
         )?;
         let hidden = hp.n_embd;
+        let stream = gpu.stream();
+        hybrid::derive_zero_conv_bias(
+            w,
+            file,
+            hp.kinds
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| **k == Kind::Mamba)
+                .map(|(l, _)| l),
+            ssm.conv_dim,
+            stream,
+        )?;
         let mut names = Names {
             what: WHAT,
             file,
@@ -80,7 +92,6 @@ impl Body {
         };
         let embed = names::token_embd();
         names.site(&embed, (hp.n_vocab, hidden), &[SiteTy::Q5_0])?;
-        let stream = gpu.stream();
         let layers = (0..hp.n_layer)
             .map(|l| layer(&mut names, &hp, l, ctx, stream))
             .collect::<Result<Vec<_>, _>>()?;
