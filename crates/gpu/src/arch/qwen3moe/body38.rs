@@ -1342,7 +1342,7 @@ impl Body38 {
             .get(card)
             .ok_or_else(|| GpuError::shape(WHAT, format!("the plan has no card {card}")))?;
         let layers = spec.layers.clone();
-        let counted = model::arch::qwen35moe::place::counted_ubatch_bytes(spec);
+        let counted = model::placement::workstation::counted_arena_bytes(spec);
         if plan.machine.cards.len() != 1 || layers != (0..n) {
             return Err(GpuError::shape(
                 WHAT,
