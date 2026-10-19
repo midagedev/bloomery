@@ -1,0 +1,24 @@
+# The b3d round's lease card: Bolt's placed prompt as batches (BatchLeg passes of up to 512 rows, the host union once a layer over the pass,
+# the card's slots under it) at a 12 GiB forced room. Derived before the code ran (b3d NOTES paper): one 512-row pass at the 12 GiB split is
+# 144.5 k hosted (slot, expert) pairs x 4.8 M MAC = 7.1e11 MAC on the host at rate R (the one unmeasured term: the relu2 IQ2_XXS union),
+# 13.43 GB of host experts read once (98..111 ms of DRAM, under the union's compute), 84 MB each way over PCIe (~7 ms), and the card's
+# front+back C_ns = 0.10..0.20 s serial with the host (the card's experts and the shared expert, 0.02..0.06 s, sit under the host's work).
+# Wall = C_ns + H + 7 ms with H = 7.1e11 / R; R = 0.50..0.75 TMAC/s gives 1.06..1.63 s a pass: pp512 315..485 (the plan's band 300..480
+# stands), pp4096 320..460 (8 attention layers read longer keys, +0.01..0.02 s a pass). The prompt as steps measured 68.4 tok/s (b3c).
+kind: baseline
+question: how fast does the placed Bolt prompt run as batches at a 12 GiB room - which host union rate R (TMAC/s) does the wall imply?
+term: pp tok/s @ P = 4096, Bolt placed, BLOOMERY_CARD_BUDGET=12G, ctx 262144, bloomery-serve at the serving defaults, RTX A6000
+unit: tok/s
+predict: 320..460
+condition: one lease, BLOOMERY_TIMING_GPU = the A6000, BLOOMERY_CARD_BUDGET=12G (the plan's split: 2985 card experts, 10839 host, n_l 74..75
+  on 40 MoE layers), the host set read in and locked as the serving defaults do, a warm file cache; the same lease reads the P = 512 row
+  (predicted 330..470) and a steps-feed row of the same build for the ratio; pp through llama-server's own timings (the b3c serve helper),
+  four rounds; every row prints the card line and no [other-busy]
+decide-in: the host union rate R sits at 0.5..0.75 TMAC/s as derived: record the rows, take the 2-unit group (BatchOrder::Ahead, hides the
+  card's serial 0.10..0.20 s) as the next lever (<= 9 %), and price more card experts per GiB (8 % of host time a GiB)
+decide-below: under 320: R is under 0.45 TMAC/s or a serial term the paper lacks; read the eager split by layer (card front/back, serve, upload)
+  before any lever, then the relu2 IQ2_XXS union's per-(expert, column) rate on its own
+decide-above: over 460: R is at or over ik's rate and the host stops being the bound; the card's serial 0.10..0.20 s is then the next term,
+  so open the 2-unit group first
+reason: the first measured pp row of the placed Bolt prompt batch; the plan's band (offload.md) is the pp512 edge, and this sets R, the one
+  term the paper cannot close, for every later placement or union change on Bolt
