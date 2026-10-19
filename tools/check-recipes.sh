@@ -8,46 +8,50 @@ set -euo pipefail
 # that runs this check passes its card there. A static check's verdict does not depend on the caller's box env.
 unset BLOOMERY_BOX_ENV
 JF="$(cd "$(dirname "$0")/.." && pwd)/justfile"
-bad=$(grep -nE '(cargo (oxide )?test|tools/gate\.sh).*\|\|' "$JF" || true)
-if [ -n "$bad" ]; then
-  echo "check-recipes: a test-running recipe line carries '||' — it swallows the gate's exit code:" >&2
-  echo "$bad" >&2
-  exit 1
-fi
-raw=$(grep -nE "box\.sh '.*cargo (oxide )?test" "$JF" || true)
-if [ -n "$raw" ]; then
-  echo "check-recipes: bare 'cargo test' in a box recipe — route it through tools/gate.sh (bound + exit code):" >&2
-  echo "$raw" >&2
-  exit 1
-fi
-# GPU 게이트 락의 소유자는 tools/gpu-gate.sh 하나다. 레시피가 락을 직접 잡으면 그 줄의 바이너리는 상한 없이 돈다
-# — 매달린 GPU 게이트 하나가 락을 쥐면 그 락을 기다리는 트랙이 전부 선다.
-lock=$(grep -nE '^[^#]*bloomery-gate\.lock' "$JF" || true)
-if [ -n "$lock" ]; then
-  echo "check-recipes: a recipe takes the GPU gate lock itself — run the binary through tools/gpu-gate.sh (lock + bound + exit code):" >&2
-  echo "$lock" >&2
-  exit 1
-fi
-# A host binary's bound and exit code belong to tools/host-gate.sh. A recipe that runs a
-# target/release binary behind its own `timeout` spells the bound and the timeout's exit code again,
-# and prints nothing when the bound is hit.
-bare=$(grep -nE '^[^#]*timeout[^#]*target/release/' "$JF" || true)
-if [ -n "$bare" ]; then
-  echo "check-recipes: a recipe runs a target/release binary behind its own timeout — run it through tools/host-gate.sh (bound + exit code):" >&2
-  echo "$bare" >&2
-  exit 1
-fi
-# A recipe that reads a draft's counts (`accepts=`) pins what the draft verifies: each drafted command
-# (`BLOOMERY_DRAFT=<draft>`) carries `BLOOMERY_MTP_WIDTH=` right before it. Unpinned, the width chooser's
-# `cost` mode decides on host wall time, and under load the run verifies only its warm-up passes while
-# the counts clause still passes.
-unpinned=$(grep -nE '^[^#]*accepts=' "$JF" | grep -E '(^|[^=_[:alnum:]])BLOOMERY_DRAFT=' |
-  sed -E 's/BLOOMERY_MTP_WIDTH=[^ ]+ BLOOMERY_DRAFT=//g' | grep -E 'BLOOMERY_DRAFT=' | cut -c1-160 || true)
-if [ -n "$unpinned" ]; then
-  echo "check-recipes: a recipe reads draft counts with a drafted command whose width is not pinned — put BLOOMERY_MTP_WIDTH=fixed right before its BLOOMERY_DRAFT=:" >&2
-  echo "$unpinned" >&2
-  exit 1
-fi
+# blk_prelude: the justfile's line rules, grep only.
+blk_prelude() {
+  local bad raw lock bare unpinned
+  bad=$(grep -nE '(cargo (oxide )?test|tools/gate\.sh).*\|\|' "$JF" || true)
+  if [ -n "$bad" ]; then
+    echo "check-recipes: a test-running recipe line carries '||' — it swallows the gate's exit code:" >&2
+    echo "$bad" >&2
+    return 1
+  fi
+  raw=$(grep -nE "box\.sh '.*cargo (oxide )?test" "$JF" || true)
+  if [ -n "$raw" ]; then
+    echo "check-recipes: bare 'cargo test' in a box recipe — route it through tools/gate.sh (bound + exit code):" >&2
+    echo "$raw" >&2
+    return 1
+  fi
+  # GPU 게이트 락의 소유자는 tools/gpu-gate.sh 하나다. 레시피가 락을 직접 잡으면 그 줄의 바이너리는 상한 없이 돈다
+  # — 매달린 GPU 게이트 하나가 락을 쥐면 그 락을 기다리는 트랙이 전부 선다.
+  lock=$(grep -nE '^[^#]*bloomery-gate\.lock' "$JF" || true)
+  if [ -n "$lock" ]; then
+    echo "check-recipes: a recipe takes the GPU gate lock itself — run the binary through tools/gpu-gate.sh (lock + bound + exit code):" >&2
+    echo "$lock" >&2
+    return 1
+  fi
+  # A host binary's bound and exit code belong to tools/host-gate.sh. A recipe that runs a
+  # target/release binary behind its own `timeout` spells the bound and the timeout's exit code again,
+  # and prints nothing when the bound is hit.
+  bare=$(grep -nE '^[^#]*timeout[^#]*target/release/' "$JF" || true)
+  if [ -n "$bare" ]; then
+    echo "check-recipes: a recipe runs a target/release binary behind its own timeout — run it through tools/host-gate.sh (bound + exit code):" >&2
+    echo "$bare" >&2
+    return 1
+  fi
+  # A recipe that reads a draft's counts (`accepts=`) pins what the draft verifies: each drafted command
+  # (`BLOOMERY_DRAFT=<draft>`) carries `BLOOMERY_MTP_WIDTH=` right before it. Unpinned, the width chooser's
+  # `cost` mode decides on host wall time, and under load the run verifies only its warm-up passes while
+  # the counts clause still passes.
+  unpinned=$(grep -nE '^[^#]*accepts=' "$JF" | grep -E '(^|[^=_[:alnum:]])BLOOMERY_DRAFT=' |
+    sed -E 's/BLOOMERY_MTP_WIDTH=[^ ]+ BLOOMERY_DRAFT=//g' | grep -E 'BLOOMERY_DRAFT=' | cut -c1-160 || true)
+  if [ -n "$unpinned" ]; then
+    echo "check-recipes: a recipe reads draft counts with a drafted command whose width is not pinned — put BLOOMERY_MTP_WIDTH=fixed right before its BLOOMERY_DRAFT=:" >&2
+    echo "$unpinned" >&2
+    return 1
+  fi
+}
 # Every recipe's cargo targets, features and runner binaries against the workspace (cargo metadata, no
 # build): a `--bin`, `--test` or `-p` that names nothing, a feature the package lacks, a gpu-gate.sh or
 # host-gate.sh name the recipe does not build, a named script that is not in the tree, a gate-* recipe
@@ -55,14 +59,12 @@ fi
 # but that file's. The parser is tools/recipes.py, the one tools/affected-gates.sh uses; its own
 # tests (--self-test) run here too, so the parser the lead's batch lists come from is tested wherever
 # this check runs.
-# The check of the recipes against the workspace is the first of the parallel blocks below (blk_recipescheck).
-# The blocks below are independent — each runs in its own subshell on fixtures in its own temp
-# directory — so they run as parallel background jobs and report in this file's order after a barrier:
-# each block's own output (its last line where the serial form printed only that), its full output and
-# its named error on failure, and the first red block's own rc ends the check. The wall is the slowest block's:
-# ~140 s with the Mac at load 65-100 (measured 2026-10-12; ~780 s there before the long self-tests, recipes.py
-# and gate-batch.sh, ran their sections as parallel processes). The barrier holds every assertion the serial
-# form held.
+# The check of the recipes against the workspace is the block blk_recipescheck. The blocks below are independent —
+# each runs on fixtures in its own temp directory, as its own process (`--block NAME`) — so tools/static-sched.py runs
+# them side by side, at most a cpu count at once, longest first, and they report in this file's order (`--report`):
+# each block's own output (its last line where a serial form printed only that), its full output and its named error
+# on failure, and the first red block's own rc ends the check. tools/mac-static.sh runs the same jobs in its own
+# schedule, each keyed by the files it reads (blk_keyspec), so a block whose input key is green is skipped and named.
 B=$(mktemp -d)
 trap 'rm -rf "$B"' EXIT
 
@@ -176,7 +178,7 @@ blk_cardtests() {
 # matches. A script that printed none leaves the pipeline empty: grep's miss is not a failure.
 tool_selftest() {
   local script=$1 pat=${2:-} out
-  if ! out=$(bash "$(dirname "$0")/$script" --self-test 2>&1); then
+  if ! out=$(bash "$(dirname "$0")/$script" --self-test "${@:3}" 2>&1); then
     printf '%s\n' "$out" >&2
     echo "check-recipes: the ${script%.sh} self-test failed" >&2
     return 1
@@ -246,12 +248,11 @@ blk_maccheck() { tool_selftest mac-check.sh; }
 # gate-batch.sh's placement rules (the v41-load lane, a batch or a solo recipe's arm as an item, a cold
 # build's times row) on a fixture justfile and fixture times rows, no box. The pattern is the
 # slowest-cases line: tool_selftest prints its last match, then the count, which stays the block's last line.
-blk_gatebatch() { tool_selftest gate-batch.sh '^[a-z-]+ self-test: slowest cases: '; }
+blk_gatebatch() { tool_selftest gate-batch.sh '^[a-z-]+ self-test: slowest cases: ' --part "$1"; }
 # gpu-gate.sh's card choice, its lease refusals and the V4.1 load lock, against lock files of its own and
 # a stub nvidia-smi (flock and timeout stand-ins where the host has none, as on the Mac), no card.
 blk_gpugate() {
-  # The full transcript stays for the proc-leg read after the barrier. The block's own line is still the
-  # last line, as the other blocks print.
+  # The full transcript is the proc-leg's input (proc_leg_gpu); the self-test's own last line comes first.
   local ggt rc=0
   ggt=$(bash "$(dirname "$0")/gpu-gate.sh" --self-test 2>&1) || rc=$?
   printf '%s\n' "$ggt" > "$B/gpugate.full"
@@ -261,6 +262,7 @@ blk_gpugate() {
     return 1
   fi
   echo "${ggt##*$'\n'}"
+  proc_leg_gpu
 }
 # stack-watch.sh (gpu-gate.sh's BLOOMERY_GATE_STACKS): output passed through, a quiet stub dumped and ended by
 # its comm among the spawned command's descendants only, a quiet command with no such process left alone, a
@@ -344,17 +346,15 @@ blk_carry() {
 # release check runs only on the box, so its scan is held here.
 blk_releasebuild() { tool_selftest release/build.sh; }
 # Every Python tool's own tests, on the Mac and the Linux host nightly (seconds in all): a self-test that no check runs rots. A tool
-# that grows one is listed here, and the comparison below fails on one that is not. The tools run as
-# parallel jobs (they are independent processes on their own temp fixtures); their failures land in one
-# file and are reported together.
-blk_pytools() {
-  local root t f arg out pf
+# that grows one is listed here, and the comparison (unit pytools.list) fails on one that is not. Each tool is a unit of its own
+# (pytools.K, the K-th line, run from the repository root), so the scheduler bounds them with every other unit.
+# tools/contrib-check.sh reads the same list by its `  selftests=(` and `  )` lines.
+pytools_list() {
   selftests=(
     "tools/bloomery/manifest.py --self-test"
     "tools/bloomery/records.py --self-test"
-    "tools/ref/tier-cost.py --self-test"
-    "tools/bloomery/rows.py --self-test"
     "tools/bloomery/route_trace.py --self-test"
+    "tools/bloomery/rows.py --self-test"
     "tools/bloomery/selftest.py --self-test"
     "tools/board/board.py --self-test"
     "tools/boxq-check.py --self-test"
@@ -380,9 +380,9 @@ blk_pytools() {
     "tools/ref/clef_ref.py --self-test"
     "tools/ref/clefvis/check_hidden.py --self-test"
     "tools/ref/clefvis/check_preproc.py --self-test"
-    "tools/ref/dma-dram-share.py --self-test"
     "tools/ref/dense-logits.py --self-test"
     "tools/ref/dense-serve.py --self-test"
+    "tools/ref/dma-dram-share.py --self-test"
     "tools/ref/draft-accept.py --self-test"
     "tools/ref/draft-vocab.py --self-test"
     "tools/ref/ds41copy.py --self-test"
@@ -396,11 +396,12 @@ blk_pytools() {
     "tools/ref/nsys-bridge.py --self-test"
     "tools/ref/ptx-canon.py --self-test"
     "tools/ref/qdot-rate-floors.py --self-test"
-    "tools/ref/source-inspection-test.py --self-test"
     "tools/ref/route-trace-chat.py --self-test"
     "tools/ref/router-coverage.py --self-test"
     "tools/ref/router-residency.py --self-test"
     "tools/ref/set-diff.py --self-test"
+    "tools/ref/source-inspection-test.py --self-test"
+    "tools/ref/tier-cost.py --self-test"
     "tools/ref/window-union.py --self-test"
     "tools/review/carry.py --self-test"
     "tools/review/diagnostics.py --self-test"
@@ -411,41 +412,42 @@ blk_pytools() {
     "tools/review/run.py --self-test"
     "tools/review/signals.py --self-test"
     "tools/review/usage.py --self-test"
+    "tools/static-sched.py --self-test"
     "tools/type-census.py --self-test"
     "tools/verdict-diff.py --self-test"
   )
+}
+# blk_pytools list|K: the list against the tools that have a self-test, or the K-th tool's self-test (a Python module this
+# host lacks is one named line, never the tool's traceback: the host nightly's install puts python3-numpy and python3-pil in
+# place for these, tools/nightly/install.sh).
+blk_pytools() {
+  local root f arg out m mod pkg listed found
   root="$(cd "$(dirname "$0")/.." && pwd)"
-  listed=$(printf '%s\n' "${selftests[@]}" | cut -d' ' -f1 | sort)
-  found=$(cd "$root" && grep -rlE -e '--self-test|"self-test"' --include='*.py' tools | grep -vx 'tools/recipes.py' | sort)
-  if [ "$listed" != "$found" ]; then
-    echo "check-recipes: the Python tools with a self-test and the list this check runs differ (< listed, > found):" >&2
-    diff <(echo "$listed") <(echo "$found") >&2 || true
-    return 1
+  pytools_list
+  if [ "$1" = list ]; then
+    listed=$(printf '%s\n' "${selftests[@]}" | cut -d' ' -f1 | sort)
+    found=$(cd "$root" && grep -rlE -e '--self-test|"self-test"' --include='*.py' tools | grep -vx 'tools/recipes.py' | sort)
+    if [ "$listed" != "$found" ]; then
+      echo "check-recipes: the Python tools with a self-test and the list this check runs differ (< listed, > found):" >&2
+      diff <(echo "$listed") <(echo "$found") >&2 || true
+      return 1
+    fi
+    echo "check-recipes: ${#selftests[@]} tool self-tests, one unit each"
+    return 0
   fi
-  pf=$B/pytools.fails
-  : > "$pf"
-  for t in "${selftests[@]}"; do
-    ( read -r f arg <<< "$t"
-      if ! out=$(cd "$root" && python3 "$f" "$arg" 2>&1); then
-        # A Python module this host lacks is one named line, never the tool's traceback: the host
-        # nightly's install puts python3-numpy and python3-pil in place for these (tools/nightly/install.sh).
-        if m=$(grep -m1 "ModuleNotFoundError: No module named" <<< "$out"); then
-          mod=$(printf '%s' "$m" | sed -n "s/.*No module named '\([^']*\)'.*/\1/p")
-          case ${mod%%.*} in numpy) pkg=python3-numpy ;; PIL) pkg=python3-pil ;; *) pkg= ;; esac
-          printf 'check-recipes: %s %s needs the Python module %s this host lacks%s\n' \
-            "$f" "$arg" "$mod" "${pkg:+ — the host nightly installs $pkg}" >> "$pf"
-        else
-          printf '%s\n%s\n' "$out" "check-recipes: $f $arg failed" >> "$pf"
-        fi
-      fi
-    ) &
-  done
-  wait
-  if [ -s "$pf" ]; then
-    cat "$pf" >&2
-    return 1
+  read -r f arg <<< "${selftests[$(($1 - 1))]}"
+  if out=$(cd "$root" && python3 "$f" "$arg" 2>&1); then
+    return 0
   fi
-  echo "check-recipes: ${#selftests[@]} tool self-tests ok"
+  if m=$(grep -m1 "ModuleNotFoundError: No module named" <<< "$out"); then
+    mod=$(printf '%s' "$m" | sed -n "s/.*No module named '\([^']*\)'.*/\1/p")
+    case ${mod%%.*} in numpy) pkg=python3-numpy ;; PIL) pkg=python3-pil ;; *) pkg= ;; esac
+    printf 'check-recipes: %s %s needs the Python module %s this host lacks%s\n' \
+      "$f" "$arg" "$mod" "${pkg:+ — the host nightly installs $pkg}" >&2
+  else
+    printf '%s\n%s\n' "$out" "check-recipes: $f $arg failed" >&2
+  fi
+  return 1
 }
 # The box queue's exit codes 80, 81 and 83-85 name one meaning each: no other tool, recipe or script produces one of them, and
 # they overlap none of the codes tools/ and the justfile already name (tools/boxq-check.py codes-check).
@@ -945,8 +947,8 @@ print(f"check-recipes: shell function owner ok ({scripts} scripts, {len(fixtures
 PY
 }
 
-# The cpu-guard live pair reads a real /proc. It runs here, before the blocks, so it does not share the
-# runner with them (on CI's two cores a foreign busy loop inside the 36-wide block can miss its window).
+# The cpu-guard live pair reads a real /proc. It runs alone (the scheduler's `alone` job), so it does not share the
+# runner with the blocks (on CI's two cores a foreign busy loop beside it can miss its window).
 # No /proc is a printed skip. The product cpu threshold stays 50 %; only the pair sets CPU_BUSY_PCT=1.
 # The wall is whole seconds, the same unit as the block times below.
 proc_leg() {
@@ -974,7 +976,7 @@ proc_leg() {
   echo "proc-leg: wall $((SECONDS - t0)) s"
 }
 
-# The holder judge already ran inside blk_gpugate. Linux: its success line, and not the /proc skip.
+# blk_gpugate's holder judge, read from its transcript at the block's end. Linux: its success line, and not the /proc skip.
 # A host with no /proc/self/stat: the skip line gpu-gate.sh prints (the judge name, then that echo).
 proc_leg_gpu() {
   local log=$B/gpugate.full
@@ -999,33 +1001,108 @@ proc_leg_gpu() {
   return 1
 }
 
-proc_leg
-unset CPU_GUARD_PROC_LEG
-
-BLOCKS=(recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
+BLOCKS=(prelude recipescheck selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt boundedscan gatebound dumpdequant tokoracle)
-for b in "${BLOCKS[@]}"; do
-  ( set +e; t0=$SECONDS; blk_$b > "$B/$b.out" 2>&1; brc=$?; echo $((SECONDS - t0)) > "$B/$b.t"; echo $brc > "$B/$b.rc" ) & # set +e: a red block writes its own rc
-done
-wait
-rc=0
-for b in "${BLOCKS[@]}"; do
-  brc=$(cat "$B/$b.rc" 2> /dev/null) || brc=255 # a block killed before its wrapper wrote the rc
-  if [ "$brc" != 0 ]; then
-    cat "$B/$b.out" >&2
-    [ "$rc" != 0 ] || rc=$brc
-  else
-    cat "$B/$b.out"
-  fi
-done
-if ! proc_leg_gpu; then
-  [ "$rc" != 0 ] || rc=1
-fi
-# The five slowest blocks, whole seconds each (the wall is the slowest block's own time under the load of
-# its siblings); a block killed before its wrapper wrote the time counts 0.
-slowest=$(for b in "${BLOCKS[@]}"; do echo "$(cat "$B/$b.t" 2> /dev/null || echo 0) $b"; done |
-  sort -rn | awk 'NR <= 5 {printf "%s%s %s s", (NR > 1 ? ", " : ""), $2, $1}')
-echo "check-recipes: slowest: $slowest"
-[ "$rc" = 0 ] || exit "$rc"
-echo "check-recipes: ok"
+# blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
+# narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are
+# missing or empty is no proof (a scan of the justfile or crates/ passes on empty input). procleg is never skipped.
+blk_keyspec() {
+  case $1 in
+    procleg) echo - ;;
+    *) echo tree ;;
+  esac
+}
+# units: the blocks as the scheduler runs them, one a line: gate-batch's self-test runs as its parts (`--part K`, the
+# count its SELFTEST_PARTS line holds) and pytools as its list check and one unit a tool, so the scheduler sees each one's
+# own wall and slot.
+units() {
+  local b k parts
+  for b in "${BLOCKS[@]}"; do
+    if [ "$b" = pytools ]; then
+      echo pytools.list
+      pytools_list
+      for ((k = 1; k <= ${#selftests[@]}; k++)); do echo "pytools.$k"; done
+    elif [ "$b" = gatebatch ]; then
+      parts=$(sed -n 's/^SELFTEST_PARTS=\([1-9][0-9]*\)$/\1/p' "$(dirname "$0")/gate-batch.sh")
+      [ -n "$parts" ] || { echo "check-recipes: tools/gate-batch.sh has no SELFTEST_PARTS line" >&2; return 70; }
+      for ((k = 1; k <= parts; k++)); do echo "gatebatch.$k"; done
+    else
+      echo "$b"
+    fi
+  done
+}
+# jobs: every unit as a line of tools/static-sched.py's JOBS, run from the repository root. procleg, the cpu-guard
+# live pair, runs alone.
+jobs() {
+  local u list
+  list=$(units) || return
+  printf 'check-recipes.procleg\talone\t-\tbash tools/check-recipes.sh --block procleg\n'
+  for u in $list; do
+    printf 'check-recipes.%s\t-\t%s\tbash tools/check-recipes.sh --block %s\n' "$u" "$(blk_keyspec "${u%%.*}")" "$u"
+  done
+}
+# report DIR: the blocks' verdict from a tools/static-sched.py run's DIR, in this file's order, procleg first: a green
+# block's output on stdout, a red one's on stderr, a block skipped by its green key as one line naming the green row;
+# then the five slowest blocks that ran, and the first red block's rc (255: a block that wrote no rc).
+report() {
+  local d=$1 b brc rc=0 ran=0 skipped=0 slowest list
+  list=$(units) || return
+  for b in procleg $list; do
+    if [ -f "$d/check-recipes.$b.skip" ]; then
+      echo "check-recipes: $b skipped, its input key is $(cat "$d/check-recipes.$b.skip")"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    ran=$((ran + 1))
+    brc=$(cat "$d/check-recipes.$b.rc" 2> /dev/null) || brc=255
+    if [ "$brc" != 0 ]; then
+      cat "$d/check-recipes.$b.log" >&2 2> /dev/null || true
+      [ "$brc" != 255 ] || echo "check-recipes: $b wrote no rc (ended before its scheduler reaped it)" >&2
+      [ "$rc" != 0 ] || rc=$brc
+    else
+      cat "$d/check-recipes.$b.log"
+    fi
+  done
+  slowest=$(for b in $list; do
+    [ -f "$d/check-recipes.$b.skip" ] || echo "$(cat "$d/check-recipes.$b.wall" 2> /dev/null || echo 0) $b"
+  done | sort -rn | awk 'NR <= 5 {printf "%s%s %s s", (NR > 1 ? ", " : ""), $2, $1}')
+  echo "check-recipes: slowest: $slowest"
+  echo "check-recipes: $ran blocks ran, $skipped skipped by a green input key"
+  [ "$rc" = 0 ] || return "$rc"
+  echo "check-recipes: ok"
+}
+
+case ${1:-} in
+  --jobs)
+    [ $# = 1 ] || { echo "check-recipes.sh: --jobs takes nothing" >&2; exit 64; }
+    jobs
+    exit 0
+    ;;
+  --block)
+    [ $# = 2 ] && [[ " $(units | tr '\n' ' ')procleg " == *" $2 "* ]] || { echo "check-recipes.sh: --block takes one of: procleg $(units | tr '\n' ' ')" >&2; exit 64; }
+    set +e
+    case $2 in
+      procleg) proc_leg ;;
+      *.*) "blk_${2%%.*}" "${2#*.}" ;;
+      *) "blk_$2" ;;
+    esac
+    exit $?
+    ;;
+  --report)
+    [ $# = 2 ] && [ -d "$2" ] || { echo "check-recipes.sh: --report takes a tools/static-sched.py run's DIR" >&2; exit 64; }
+    report "$2"
+    exit $?
+    ;;
+  '') ;;
+  *) echo "usage: tools/check-recipes.sh [--jobs | --block UNIT | --report DIR]" >&2; exit 64 ;;
+esac
+# Every block at once is ~60 processes, some of them parallel themselves: one scheduler, tools/static-sched.py, runs
+# them at most a cpu count at once, the longest recorded first (tools/mac-static.sh gives it this file's jobs beside its
+# own steps, keyed).
+cd "$(dirname "$0")/.."
+jobs > "$B/jobs.tsv"
+src=0
+python3 tools/static-sched.py run --out "$B/s" --times "$HOME/.cache/bloomery/static-times.tsv" "$B/jobs.tsv" || src=$?
+[ "$src" = 0 ] || { echo "check-recipes: tools/static-sched.py ended rc $src" >&2; exit "$src"; }
+report "$B/s"

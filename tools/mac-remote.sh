@@ -3,7 +3,8 @@
 # five Claude sessions (load 40-80, the disk 97 % full, a timing self-test inside check-recipes red from the
 # load alone); the second Mac is idle and runs the same step list on a tree sent to it.
 #
-#   tools/mac-remote.sh [--tree DIR] [BASE]   `just mac-static BASE` for the worktree DIR (default: the tree
+#   tools/mac-remote.sh [--tree DIR] [--fresh] [BASE]
+#                                             `just mac-static [--fresh] BASE` for the worktree DIR (default: the tree
 #                                             this script is in) on the second Mac; no BASE is the full run.
 #                                             The remote's output (stdout and stderr, in one stream) comes
 #                                             back on stdout, then the last 40 log lines of each red step; the exit
@@ -500,7 +501,7 @@ exit 0
 
 RUN='{
 exec < /dev/null
-track=$1 basearg=$2 channel=$3 slots=$4 say=$5 poll=$6
+track=$1 basearg=$2 channel=$3 slots=$4 say=$5 poll=$6 fresh=${7:-}
 export PATH=$HOME/opt/bloomery-bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin
 base=$HOME/'"$RBASE"'
 # From here on the lock belongs to this run: a heartbeat every 60 s while it lives, and the whole lock removed when it ends,
@@ -525,7 +526,9 @@ if [ "$rc" != 0 ]; then
   exit 69
 fi
 rm -f "$base/.fetch-$track.log"
-if [ -n "$basearg" ]; then cmd=(just mac-static "$basearg"); else cmd=(just mac-static); fi
+cmd=(just mac-static)
+[ -z "$fresh" ] || cmd+=(--fresh)
+[ -z "$basearg" ] || cmd+=("$basearg")
 # One slot of the pool: the command runs under the slot file lockf and writes its own rc to a file, so an rc 75 of
 # its own is not read as the lockf busy code (EX_TEMPFAIL, 75).
 slot_inner() {
@@ -763,7 +766,7 @@ remote_main() {
   scrub "$RHOME" "$RUSER" "$RHOST" < "$TMP/out" &
   SCPID=$!
   RUN_ACTIVE=1
-  ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs "$track" "$BASE_ARG" "$channel" "$SLOTS" "$SLOT_SAY" "$SLOT_POLL")" < "$TMP/run.sh" > "$TMP/out" 2>&1 &
+  ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs "$track" "$BASE_ARG" "$channel" "$SLOTS" "$SLOT_SAY" "$SLOT_POLL" "$FRESH")" < "$TMP/run.sh" > "$TMP/out" 2>&1 &
   SSHPID=$!
   ssh_rc=0
   wait "$SSHPID" || ssh_rc=$?
@@ -1076,6 +1079,9 @@ STUB
   case $out in *"ledger: 1 green shape line(s) this run, 1 appended here as tree-one@remote, 0 already green here"*) ;; *) fail "the ledger line did not come back: $out" ;; esac
   case $out in *"$rh"* | *stubuser*) fail "the flow's output printed the account: $out" ;; esac
   [ "$(cat "$rh/just.args")" = "mac-static $(git -C "$repo" rev-parse HEAD~1)" ] || fail "mac-static got '$(cat "$rh/just.args")', not HEAD~1's sha"
+  rc=0; out=$(run --fresh HEAD~1) || rc=$?
+  [ "$rc" = 0 ] && [ "$(cat "$rh/just.args")" = "mac-static --fresh $(git -C "$repo" rev-parse HEAD~1)" ] \
+    || fail "a --fresh run handed mac-static '$(cat "$rh/just.args")' (rc $rc), not --fresh and HEAD~1's sha"
   [ "$(git -C "$rt" rev-parse HEAD)" = "$(git -C "$repo" rev-parse HEAD)" ] || fail "the remote clone is not at HEAD"
   cmp -s "$repo/sub/f" "$rt/sub/f" || fail "the tree's content did not reach the remote"
   [ ! -e "$rt/target" ] || fail "target/ was synced"
@@ -1264,13 +1270,15 @@ STUB
 
 TREE_ARG=$HERE
 BASE_ARG_IN=
+FRESH=
 nb=0
 while [ $# -gt 0 ]; do
   case $1 in
     --self-test) [ $# = 1 ] || { say "mac-remote.sh: --self-test takes nothing"; exit 64; }; self_test; exit $? ;;
     --locks) case ${2:-} in '') locks_main 0; exit $? ;; --clean) locks_main 1; exit $? ;; *) say "mac-remote.sh: --locks takes only --clean"; exit 64 ;; esac ;;
     --tree) [ $# -ge 2 ] || { say "mac-remote.sh: --tree needs a directory"; exit 64; }; TREE_ARG=$2; shift 2 ;;
-    -*) say "usage: tools/mac-remote.sh [--tree DIR] [BASE] | --self-test ('$1' is not one)"; exit 64 ;;
+    --fresh) FRESH=--fresh; shift ;;
+    -*) say "usage: tools/mac-remote.sh [--tree DIR] [--fresh] [BASE] | --self-test ('$1' is not one)"; exit 64 ;;
     *) nb=$((nb + 1)); BASE_ARG_IN=$1; shift ;;
   esac
 done

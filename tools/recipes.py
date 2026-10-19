@@ -6158,6 +6158,107 @@ def shape_key(c: Combo, rels: set[str], memo: dict[str, str]) -> str:
     return h.hexdigest()
 
 
+# The Mac static tier's jobs (tools/static-sched.py's JOBS file: NAME, ATTRS, KEYSPEC, COMMAND a line). A job's key hashes
+# its command, the caller environment and the content of every file its KEYSPEC names, so a green row in the Mac static
+# ledger (read_shape_ledger's format) skips it only while all of them are unchanged; the header differs from a shape
+# key's, so the two kinds never share a key. KEYSPEC is `-` (never skipped) or a comma list of
+#   tree         every shipped file (shipped_files): a job that reads the tree at large
+#   dir:PATH     every shipped file under PATH/: a self-test that reads only its own directory's scripts and fixtures
+#   file:PATH    PATH alone (a missing file hashes as `missing`)
+#   rev:REF      the commit REF names in this checkout (`git rev-parse`): a job that reads a base revision
+STATIC_JOB_KIND = "mac-static-job-v1"
+STATIC_JOB_TOOLS = (("bash", ["bash", "--version"]), ("git", ["git", "--version"]))
+
+
+def static_job_env(environ: dict[str, str]) -> list[str]:
+    """The caller-environment lines every job key carries: MAC_ENV's values, and the tools the jobs run."""
+    rows = [f"mac-env\t{v}\t{environ.get(v, '<unset>')}" for v in MAC_ENV]
+    rows += [f"mac-tool\tpython3\t{platform.python_version()}", f"mac-tool\tos\t{platform.system()} {platform.machine()}"]
+    for name, argv in STATIC_JOB_TOOLS:
+        try:
+            out = subprocess.run(argv, capture_output=True, text=True).stdout.split("\n")[0].strip()
+        except OSError:
+            out = "missing"
+        rows.append(f"mac-tool\t{name}\t{out or 'unknown'}")
+    return rows
+
+
+def static_job_inputs(spec: str, root: str, shipped: list[str]) -> tuple[list[str], list[str]]:
+    """(the files the KEYSPEC names, relative and sorted; the revisions it names as `rev\tREF\tsha` lines). Raises
+    RecipeError naming an item it does not take, or a REF this checkout cannot resolve."""
+    files: set[str] = set()
+    revs: list[str] = []
+    for item in spec.split(","):
+        kind, _, arg = item.partition(":")
+        if kind == "tree" and not arg:
+            files |= set(shipped)
+        elif kind == "dir" and arg:
+            pre = arg.rstrip("/") + "/"
+            got = [f for f in shipped if f.startswith(pre)]
+            if not got:
+                raise RecipeError(f"static-key: {item}: no shipped file under {pre}")
+            files |= set(got)
+        elif kind == "file" and arg:
+            files.add(os.path.normpath(arg))
+        elif kind == "rev" and arg:
+            r = subprocess.run(["git", "-C", root, "rev-parse", "--verify", "--quiet", f"{arg}^{{commit}}"], capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RecipeError(f"static-key: {item}: this checkout has no commit {arg}")
+            revs.append(f"rev\t{arg}\t{r.stdout.strip()}")
+        else:
+            raise RecipeError(f"static-key: keyspec item {item!r} is not tree, dir:PATH, file:PATH or rev:REF")
+    return sorted(files), revs
+
+
+def static_job_key(name: str, command: str, env: list[str], files: list[str], revs: list[str], root: str, memo: dict[str, str]) -> str:
+    h = hashlib.sha256()
+    h.update(f"{STATIC_JOB_KIND}\n{name}\n{command}\n".encode())
+    for ln in env + revs:
+        h.update(f"{ln}\n".encode())
+    for rel in files:
+        if rel not in memo:
+            path = os.path.join(root, rel)
+            memo[rel] = f"link {os.readlink(path)}" if os.path.islink(path) else sha256_file(path) if os.path.isfile(path) else "missing"
+        h.update(f"{memo[rel]}\t{rel}\n".encode())
+    return h.hexdigest()
+
+
+def static_keys(jobs_path: str, root: str, environ: dict[str, str]) -> list[tuple[str, str, str, list[str]]]:
+    """(name, key, note, files) a job of the JOBS file, in its order; the key is `-` for a `-` KEYSPEC."""
+    shipped = shipped_files(root)
+    env = static_job_env(environ)
+    memo: dict[str, str] = {}
+    out = []
+    with open(jobs_path, encoding="utf-8") as fh:
+        for n, ln in enumerate(fh, 1):
+            ln = ln.rstrip("\n")
+            if not ln.strip() or ln.startswith("#"):
+                continue
+            f = ln.split("\t")
+            if len(f) != 4:
+                raise RecipeError(f"static-key: {jobs_path}:{n}: {len(f)} fields, want 4 (NAME ATTRS KEYSPEC COMMAND)")
+            name, _, spec, command = f
+            if spec == "-":
+                out.append((name, "-", "never skipped", []))
+                continue
+            files, revs = static_job_inputs(spec, root, shipped)
+            out.append((name, static_job_key(name, command, env, files, revs, root, memo), f"{spec}: {len(files)} files", files))
+    return out
+
+
+def cmd_static_key(args: argparse.Namespace) -> int:
+    rows = static_keys(args.jobs, ROOT, dict(os.environ))
+    if args.files:
+        hit = [r for r in rows if r[0] == args.files]
+        if not hit:
+            raise RecipeError(f"static-key: {args.jobs} has no job {args.files}")
+        print("\n".join(hit[0][3]))
+        return 0
+    for name, key, note, _ in rows:
+        print(f"{name}\t{key}\t{note}")
+    return 0
+
+
 def cmd_combos(args: argparse.Namespace) -> int:
     if args.ledger and args.base is None:
         raise RecipeError("combos --ledger reads keys the --base form prints; give --base too")
@@ -9803,6 +9904,54 @@ def ledger_self_test(expect) -> None:
         expect(st == "run" and det.endswith("(src=round)"), f"history from the rounds' ledger is labelled: {st} {det}")
 
 
+def static_key_self_test(expect) -> None:
+    """A job key moves with every file its KEYSPEC names and with its command, and with nothing else: a file outside a
+    dir: scope, a `-` job, an mtime. A malformed line, an unknown item or a dir with no file is a named error."""
+    with tempfile.TemporaryDirectory() as d:
+        def put(rel: str, text: str) -> None:
+            os.makedirs(os.path.dirname(os.path.join(d, rel)) or d, exist_ok=True)
+            with open(os.path.join(d, rel), "w") as fh:
+                fh.write(text)
+
+        put("tools/a.sh", "echo a\n")
+        put("tools/fx/case.txt", "x\n")
+        put("crates/serve/src/lib.rs", "fn f() {}\n")
+        put("justfile", "a:\n")
+        jobs = os.path.join(d, "target", "jobs.tsv")
+        put("target/jobs.tsv", "t\t-\ttree\tbash tools/a.sh\nd\t-\tdir:tools\tbash tools/a.sh\n"
+                               "j\t-\tdir:tools,file:justfile\tbash tools/a.sh\nn\t-\t-\tbash tools/a.sh\n")
+        env = {"BLOOMERY_TIER": "fixture"}
+
+        def keys(environ=env) -> dict[str, str]:
+            return {r[0]: r[1] for r in static_keys(jobs, d, environ)}
+
+        k0 = keys()
+        expect(k0["n"] == "-" and all(HEX64.match(k0[x]) for x in "tdj"), f"static-key: the key shapes: {k0}")
+        expect(len({k0["t"], k0["d"], k0["j"]}) == 3, "static-key: jobs with one command and different scopes share a key")
+        os.utime(os.path.join(d, "tools/a.sh"), (1, 1))
+        expect(keys() == k0, "static-key: an mtime moved a key")
+        put("crates/serve/src/lib.rs", "fn f() { }\n")
+        k1 = keys()
+        expect(k1["t"] != k0["t"] and k1["d"] == k0["d"] and k1["j"] == k0["j"], "static-key: a crates/serve edit must move tree only")
+        put("tools/fx/case.txt", "y\n")
+        k2 = keys()
+        expect(k2["d"] != k1["d"] and k2["j"] != k1["j"] and k2["t"] != k1["t"], "static-key: a fixture edit under tools/ must move every tools scope")
+        put("justfile", "b:\n")
+        k3 = keys()
+        expect(k3["j"] != k2["j"] and k3["d"] == k2["d"], "static-key: a justfile edit moves file:justfile only")
+        expect(keys({"BLOOMERY_TIER": "real"})["d"] != k3["d"], "static-key: a MAC_ENV value must move the key")
+        put("target/jobs.tsv", "d\t-\tdir:tools\tbash tools/a.sh --other\n")
+        expect(keys()["d"] != k3["d"], "static-key: a job's command must move its key")
+        expect(not any(f.startswith("target/") for f in static_keys(jobs, d, env)[0][3]), "static-key: target/ is not a shipped file")
+        for bad, why in (("x\t-\tdir:tools\n", "three fields"), ("x\t-\tbogus\tc\n", "an unknown item"), ("x\t-\tdir:nowhere\tc\n", "a dir with no file")):
+            put("target/jobs.tsv", bad)
+            try:
+                static_keys(jobs, d, env)
+                expect(False, f"static-key: {why} is not refused")
+            except RecipeError:
+                pass
+
+
 def manifest_rows_self_test(expect) -> None:
     """The fixture root's manifest rows reach below a family's directory: every file there has a row that moves when the file is
     rewritten; any other model directory lists its subdirectories as `dir` rows only, as before."""
@@ -11497,6 +11646,7 @@ def self_test(serial: bool = False) -> int:
         archive_self_test(expect)  # a base tree read through git archive, whatever tar does at the end marker
         static_self_test(expect)  # the static tier compiles every feature-gated bin
         ledger_self_test(expect)  # the green ledger's key, but for the key itself
+        static_key_self_test(expect)  # the static tier's job keys
         manifest_rows_self_test(expect)
         ref_paths_self_test(expect)
         box_tier_self_test(expect)
@@ -11600,6 +11750,9 @@ def main(argv: list[str]) -> int:
     cb.add_argument("--justfile")
     cb.add_argument("--base", help="a shape whose inputs hold no file changed since this BASE (or A..B) skips with why; with --ledger, a green key skips too")
     cb.add_argument("--ledger", help="with --base: the Mac static ledger (tools/mac-check.sh combos --ledger appends it) whose green keys skip")
+    sk = sub.add_parser("static-key", help="each job's input key of a tools/static-sched.py JOBS file: name<TAB>key<TAB>note (`-` for a job never skipped); --files NAME: the files one job's key reads, one a line")
+    sk.add_argument("jobs", metavar="JOBS")
+    sk.add_argument("--files", metavar="NAME")
     b = sub.add_parser("box-manifest", help="on the box, through tools/box.sh: the key's box part")
     b.add_argument("--lease", action="append", help="a timing lease lock; held, the manifest refuses (exit 75)")
     b.add_argument("--cache", default="~/.cache/bloomery/sha256-cache.tsv", help="the stat-keyed sha256 cache")
@@ -11645,6 +11798,8 @@ def main(argv: list[str]) -> int:
             return cmd_host_nightly(args)
         if args.cmd == "combos":
             return cmd_combos(args)
+        if args.cmd == "static-key":
+            return cmd_static_key(args)
         if args.cmd == "box-manifest":
             return cmd_box_manifest(args)
         if args.cmd == "opens":
