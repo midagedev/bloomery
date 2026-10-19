@@ -62,6 +62,42 @@ mod tests {
         assert_eq!(prepare_clip(&[frame], (1, 2), 16).unwrap().0, [0, 0]);
     }
 
+    /// A clip's frames are sized to the cap the planner gives, not only to the 140-token rule: a
+    /// 768x768 frame is 528x528 at 121 tokens under the rule and 480x480 at 100 under a cap of 100
+    /// [derived: align 48, sqrt(768² / (100 · 48²)) = 1.6, 768 / 1.6 = 480]. Five of them fill a
+    /// 500-token budget as five groups, where a refusal at 121 would have dropped one. A cap under
+    /// the least canvas is a refusal that names the cap.
+    #[test]
+    fn the_clip_sizer_resizes_to_the_cap() {
+        use crate::video::{ClipMeta, Sizer, plan};
+        let rule = SizeRule::new(16, MERGE, TokenLimits::new(70, VIDEO_TOKENS).unwrap()).unwrap();
+        let media = Media::new(rule);
+        assert_eq!(
+            media.group_size(1, 768, 768, 140).unwrap(),
+            ((528, 528), 121)
+        );
+        assert_eq!(
+            media.group_size(1, 768, 768, 100).unwrap(),
+            ((480, 480), 100)
+        );
+        let refused = media.group_size(1, 768, 768, 50).unwrap_err().to_string();
+        assert!(refused.contains("over the 50 a group may"), "{refused}");
+        let meta = ClipMeta {
+            frames: 5,
+            fps: (1, 1),
+            width: 768,
+            height: 768,
+        };
+        let planned = plan(&VIDEO_RULE, &meta, 500, &media).unwrap();
+        assert_eq!(planned.groups.len(), 5);
+        assert!(
+            planned
+                .groups
+                .iter()
+                .all(|g| (g.size, g.tokens) == ((480, 480), 100))
+        );
+    }
+
     #[test]
     fn decoded_video_preserves_frames_and_bounds_each_canvas() {
         let frames = [

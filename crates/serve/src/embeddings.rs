@@ -195,7 +195,30 @@ fn input_with(side: &Side, video: &VideoSupport, key: &str, v: &Value) -> Result
         let mut images = Vec::new();
         let mut audio = Vec::new();
         let mut order = Vec::new();
-        let clips = clips(side, video, parts)?;
+        // A clip is planned under the context the input's other media leave, so with a clip in the
+        // input they are prepared first. Without one each is prepared as the assembly reaches it,
+        // and an input past the context is refused before its later media are.
+        let mut fixed = std::collections::BTreeMap::new();
+        let mut spent = 0;
+        if parts
+            .iter()
+            .any(|p| matches!(media::parse_part(p), Ok(media::Part::Video(_))))
+        {
+            for (at, part) in parts.iter().enumerate() {
+                let Some(f) = prepare_fixed(side, part, &mut decoded).map_err(invalid)? else {
+                    continue;
+                };
+                spent += video::group_positions(f.positions, f.around(&*side.tok));
+                if spent > side.ctx {
+                    return Err(invalid(format!(
+                        "{} input exceeds the embedding context",
+                        f.kind()
+                    )));
+                }
+                fixed.insert(at, f);
+            }
+        }
+        let clips = clips(side, video, parts, spent)?;
         let ordered = parts.iter().enumerate().flat_map(|(at, part)| {
             if let Some(clip) = clips.get(&at) {
                 let (begin, end) = side
@@ -226,76 +249,36 @@ fn input_with(side: &Side, video: &VideoSupport, key: &str, v: &Value) -> Result
                     })
                     .collect::<Vec<_>>();
             }
-            vec![(|| -> Result<InputPart<'_>, String> {
-            if part.get("type").and_then(Value::as_str) == Some("input_audio") {
-                let a = part.get("input_audio").ok_or("input_audio needs an input_audio object")?;
-                if a.get("format").and_then(Value::as_str) != Some("f32") {
-                    return Err("encoded audio is not supported; send base64 little-endian f32 PCM with format=f32, sample_rate=16000 and channels=1".into());
-                }
-                let model = side.audio.as_ref().ok_or("audio input needs a gemma4a --embd-mmproj")?;
-                let (begin, end, sample_rate) = model.embedding_audio().ok_or("the side projector has no audio delimiters")?;
-                if a.get("sample_rate").and_then(Value::as_u64) != Some(sample_rate as u64)
-                    || a.get("channels").and_then(Value::as_u64) != Some(1)
-                {
-                    return Err("f32 PCM needs sample_rate=16000 and channels=1".into());
-                }
-                let data = a.get("data").and_then(Value::as_str).ok_or("f32 PCM needs base64 data")?;
-                if data.is_empty() {
-                    return Err("f32 PCM needs at least two samples".into());
-                }
-                let bytes = media::base64(data).map_err(|e| e.to_string())?;
-                if bytes.len() % 4 != 0 {
-                    return Err("f32 PCM byte count must be a multiple of four".into());
-                }
-                let pcm: Vec<_> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
-                let chunks = model.prepare_audio(&pcm).map_err(|e| e.to_string())?;
-                let positions = chunks.iter().map(|c| c.span_len).sum();
-                order.push((true, audio.len()));
-                audio.push(crate::embed::AudioFeed { at: 0, chunks: Arc::new(chunks) });
-                return Ok(InputPart::Media {
-                    begin,
-                    end,
-                    positions,
-                    kind: "audio",
-                });
-            }
-            match media::parse_part(part).map_err(|e| e.to_string())? {
-                media::Part::Text(text) => Ok(InputPart::Text(text)),
-                media::Part::Image(url) => {
-                    let model = side
-                        .media
-                        .as_ref()
-                        .ok_or("image input needs --embd-mmproj")?;
-                    let (begin, end) = model
-                        .embedding_delimiters()
-                        .ok_or("the side projector has no embedding delimiters")?;
-                    let feed = if let Some(frames) = &mut decoded {
-                        frames
-                            .next()
-                            .ok_or("video frame count differs from input")?
-                    } else {
-                        let file = media::load(url).map_err(|e| e.to_string())?;
-                        media::MediaFeed {
-                            at: 0,
-                            key: file.key,
-                            prepared: Arc::new(
-                                media::prepare(&file, &**model).map_err(|e| e.to_string())?,
-                            ),
+            let f = match fixed.remove(&at) {
+                Some(f) => Ok(Some(f)),
+                None => prepare_fixed(side, part, &mut decoded),
+            };
+            vec![match f {
+                Ok(Some(f)) => {
+                    match &f.feed {
+                        Feed::Image(feed) => {
+                            order.push((false, images.len()));
+                            images.push(feed.clone());
                         }
-                    };
-                    let positions = feed.prepared.span_len;
-                    order.push((false, images.len()));
-                    images.push(feed);
+                        Feed::Audio(feed) => {
+                            order.push((true, audio.len()));
+                            audio.push(feed.clone());
+                        }
+                    }
                     Ok(InputPart::Media {
-                        begin,
-                        end,
-                        positions,
-                        kind: "image",
+                        begin: f.begin,
+                        end: f.end,
+                        positions: f.positions,
+                        kind: f.kind(),
                     })
                 }
-                media::Part::Video(_) => Err("a clip part was not prepared".to_owned()),
-            }
-            })()]
+                Ok(None) => match media::parse_part(part) {
+                    Ok(media::Part::Text(text)) => Ok(InputPart::Text(text)),
+                    Ok(_) => Err("a clip part was not prepared".to_owned()),
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e),
+            }]
         });
         let Assembled { ids, spans } = assemble(ordered, &*side.tok, side.ctx).map_err(invalid)?;
         for ((is_audio, index), span) in order.into_iter().zip(spans) {
@@ -315,6 +298,119 @@ fn input_with(side: &Side, video: &VideoSupport, key: &str, v: &Value) -> Result
     }
 }
 
+/// A still image, a frame of a decoded video or an audio span of an input, prepared: the
+/// delimiters around it, the positions it takes and its feed. [`assemble`] charges it those
+/// positions and the delimiters, which a clip planned beside it must leave.
+struct Fixed<'a> {
+    begin: &'a str,
+    end: &'a str,
+    positions: usize,
+    feed: Feed,
+}
+
+enum Feed {
+    Image(media::MediaFeed),
+    Audio(crate::embed::AudioFeed),
+}
+
+impl Fixed<'_> {
+    /// The positions of the delimiters around the medium.
+    fn around(&self, tok: &dyn Tokenizer) -> usize {
+        tok.encode(self.begin).len() + tok.encode(self.end).len()
+    }
+
+    fn kind(&self) -> &'static str {
+        match self.feed {
+            Feed::Image(_) => "image",
+            Feed::Audio(_) => "audio",
+        }
+    }
+}
+
+/// The medium a part is, prepared: an audio span, or an image (the next frame of `decoded` when the
+/// input is a decoded video, else loaded and prepared). `None` for any other part.
+fn prepare_fixed<'a>(
+    side: &'a Side,
+    part: &Value,
+    decoded: &mut Option<std::vec::IntoIter<media::MediaFeed>>,
+) -> Result<Option<Fixed<'a>>, String> {
+    if part.get("type").and_then(Value::as_str) == Some("input_audio") {
+        let a = part
+            .get("input_audio")
+            .ok_or("input_audio needs an input_audio object")?;
+        if a.get("format").and_then(Value::as_str) != Some("f32") {
+            return Err("encoded audio is not supported; send base64 little-endian f32 PCM with format=f32, sample_rate=16000 and channels=1".into());
+        }
+        let model = side
+            .audio
+            .as_ref()
+            .ok_or("audio input needs a gemma4a --embd-mmproj")?;
+        let (begin, end, sample_rate) = model
+            .embedding_audio()
+            .ok_or("the side projector has no audio delimiters")?;
+        if a.get("sample_rate").and_then(Value::as_u64) != Some(sample_rate as u64)
+            || a.get("channels").and_then(Value::as_u64) != Some(1)
+        {
+            return Err("f32 PCM needs sample_rate=16000 and channels=1".into());
+        }
+        let data = a
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or("f32 PCM needs base64 data")?;
+        if data.is_empty() {
+            return Err("f32 PCM needs at least two samples".into());
+        }
+        let bytes = media::base64(data).map_err(|e| e.to_string())?;
+        if bytes.len() % 4 != 0 {
+            return Err("f32 PCM byte count must be a multiple of four".into());
+        }
+        let pcm: Vec<_> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let chunks = model.prepare_audio(&pcm).map_err(|e| e.to_string())?;
+        return Ok(Some(Fixed {
+            begin,
+            end,
+            positions: chunks.iter().map(|c| c.span_len).sum(),
+            feed: Feed::Audio(crate::embed::AudioFeed {
+                at: 0,
+                chunks: Arc::new(chunks),
+            }),
+        }));
+    }
+    let Ok(media::Part::Image(url)) = media::parse_part(part) else {
+        return Ok(None);
+    };
+    let model = side
+        .media
+        .as_ref()
+        .ok_or("image input needs --embd-mmproj")?;
+    let (begin, end) = model
+        .embedding_delimiters()
+        .ok_or("the side projector has no embedding delimiters")?;
+    let feed = if let Some(frames) = decoded {
+        frames
+            .next()
+            .ok_or("video frame count differs from input")?
+    } else {
+        let file = media::load(url).map_err(|e| e.to_string())?;
+        media::MediaFeed {
+            at: 0,
+            key: file.key,
+            prepared: Arc::new(media::prepare(&file, &**model).map_err(|e| e.to_string())?),
+        }
+    };
+    Ok(Some(Fixed {
+        begin,
+        end,
+        positions: feed.prepared.span_len,
+        feed: Feed::Image(feed),
+    }))
+}
+
 /// A clip of an input, probed, planned, decoded and prepared: the side model's text for it and
 /// its groups' feeds.
 struct EmbedClip {
@@ -323,15 +419,16 @@ struct EmbedClip {
 }
 
 /// The input's clips by their part's place, each planned under the context the input leaves: the
-/// context less the input's text and its BOS and EOS, and less what the clips before it spent. A
-/// clip spends its tokens, its delimiters (a pair a group) and the model's text for it
-/// ([`video::plan_clip_within`]), the positions [`assemble`] charges it. Done before the input's
-/// text is tokenized, because the text the model writes for a clip holds what the plan chose; then
-/// decoded and prepared.
+/// context less the input's text and its BOS and EOS, less the `spent` positions of its images and
+/// audio ([`Fixed`]), and less what the clips before it spent. A clip spends its tokens, its
+/// delimiters (a pair a group) and the model's text for it ([`video::plan_clip_within`]), the
+/// positions [`assemble`] charges it. Done before the input's text is tokenized, because the text
+/// the model writes for a clip holds what the plan chose; then decoded and prepared.
 fn clips(
     side: &Side,
     video: &VideoSupport,
     parts: &[Value],
+    spent: usize,
 ) -> Result<std::collections::BTreeMap<usize, EmbedClip>, ApiError> {
     let mut found = std::collections::BTreeMap::new();
     let mut left: Option<usize> = None;
@@ -357,7 +454,7 @@ fn clips(
                 })
                 .sum();
             let marks = usize::from(side.tok.add_bos()) + usize::from(side.tok.add_eos());
-            side.ctx.saturating_sub(text + marks)
+            side.ctx.saturating_sub(text + marks + spent)
         });
         let bytes = media::base64(clip.data).map_err(|e| invalid(e.to_string()))?;
         let around = side.tok.encode(begin).len() + side.tok.encode(end).len();

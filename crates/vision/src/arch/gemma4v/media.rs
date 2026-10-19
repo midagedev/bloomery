@@ -25,12 +25,25 @@ pub const VIDEO_RULE: VideoRule = VideoRule {
     stamp: Stamp::None,
 };
 
+/// The fewest tokens a video frame's canvas takes.
+const VIDEO_MIN_TOKENS: usize = 70;
+
 /// The size rule of a video frame: 70 to [`VIDEO_TOKENS`] tokens at the file's patch size.
 fn video_size_rule(patch: usize) -> Result<SizeRule, VisionError> {
+    video_size_rule_within(patch, VIDEO_TOKENS)
+}
+
+/// [`video_size_rule`] with the canvas held to `most` tokens: the frame is resized to fit, not
+/// refused for the size the full rule would give it. A `most` under the 70-token floor takes the
+/// floor, and the canvas that comes out is refused by its tokens against the cap.
+fn video_size_rule_within(patch: usize, most: usize) -> Result<SizeRule, VisionError> {
     SizeRule::new(
         patch,
         MERGE,
-        crate::arch::TokenLimits::new(70, VIDEO_TOKENS)?,
+        crate::arch::TokenLimits::new(
+            VIDEO_MIN_TOKENS,
+            most.clamp(VIDEO_MIN_TOKENS, VIDEO_TOKENS),
+        )?,
     )
 }
 
@@ -163,8 +176,9 @@ impl Media {
     }
 }
 
-/// The sizer of a clip's frames: the 70-to-[`VIDEO_TOKENS`] canvas of the file's patch size, held
-/// to the tokens the loaded tower takes.
+/// The sizer of a clip's frames: the canvas of the file's patch size the video rule gives, resized
+/// to the cap the planner allows a group and to the tokens the loaded tower takes; a cap under the
+/// rule's least canvas is a refusal that names it.
 impl Sizer for Media {
     fn group_size(
         &self,
@@ -173,11 +187,11 @@ impl Sizer for Media {
         height: usize,
         cap: usize,
     ) -> Result<((usize, usize), usize), VisionError> {
-        let rule = video_size_rule(self.rule.patch())?;
+        let rule = video_size_rule_within(self.rule.patch(), cap.min(self.rule.max_tokens()))?;
         let (best_w, best_h) = rule.aligned(width, height)?;
         let (nx, ny) = rule.grid(best_w, best_h);
         let tokens = nx * ny;
-        if tokens > rule.max_tokens() {
+        if tokens > VIDEO_TOKENS {
             return Err(VisionError::Limits {
                 detail: "gemma4v aligned canvas exceeds the image token budget".into(),
             });
