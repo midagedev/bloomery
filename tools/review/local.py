@@ -609,7 +609,8 @@ def self_test():
         sh("git", "config", "user.name", "t")
         here_root = os.path.normpath(os.path.join(HERE, "../.."))
         for rel in ("tools/review/post.py", "tools/review/ledger.py", "tools/review/usage.py",
-                    ".github/review/reviewer.md", "tools/recipes.py", "justfile", "Cargo.toml"):
+                    ".github/review/reviewer.md", "tools/recipes.py", "justfile", "Cargo.toml",
+                    "AGENTS.md", "CONTRIBUTING.md", "docs/rust-quality.md"):
             src = os.path.join(here_root, rel)
             if os.path.exists(src):
                 os.makedirs(os.path.dirname(os.path.join(repo, rel)), exist_ok=True)

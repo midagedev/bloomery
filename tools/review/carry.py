@@ -77,9 +77,9 @@ class Commit(NamedTuple):
     parents: int
 
 
-def run(cmd, cwd=None, stdin=None):
+def run(cmd, cwd=None):
     try:
-        p = subprocess.run(cmd, cwd=cwd, input=stdin, capture_output=True, text=True, timeout=NET_S)
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=NET_S)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Unavailable(f"{' '.join(cmd[:3])}: {e}")
     if p.returncode:
@@ -284,8 +284,10 @@ def decide(prev_body, prev_head, head, src, tools, ledger):
     try:
         old, old_base = src.series(prev_head)
         new, new_base = src.series(head)
-        if any(c.parents != 1 for c in old + new):
-            return out("full", "a series holds a merge commit; commits are compared one to one")
+        # A binary change the source sent only as a notice carries no blob: two different files read as one patch.
+        if any(c.parents != 1 or re.search(r"^Binary files ", c.patch, re.M) for c in old + new):
+            return out("full", "a series holds a merge commit or a binary change shown only as a notice; "
+                               "commits are compared one to one")
     except Unavailable as e:
         return out("full", f"the patches could not be read: {e}")
     entries = pair_up(old, new, [patch_id(c.patch) for c in old], [patch_id(c.patch) for c in new])
@@ -351,8 +353,12 @@ def supersedes(pr, repo, call=gh_text):
     return None, None, f"the bot has no review of #{n}"
 
 
+CONTRACTS = ("AGENTS.md", "CONTRIBUTING.md", "docs/rust-quality.md")
+
+
 def reviewer_id(root):
-    """A digest of what a review runs under that the PR cannot change: .github/review and tools/review."""
+    """A digest of what a review runs under that the PR cannot change: .github/review, tools/review and the
+    contracts the reviewer cites (AGENTS.md, CONTRIBUTING.md, docs/rust-quality.md)."""
     h = hashlib.sha256()
     for sub in (".github/review", "tools/review"):
         top = os.path.join(root, sub)
@@ -363,6 +369,9 @@ def reviewer_id(root):
             for name in sorted(x for x in files if not x.endswith(".pyc")):
                 path = os.path.join(dirpath, name)
                 h.update(os.path.relpath(path, root).encode() + b"\0" + open(path, "rb").read() + b"\0")
+    for sub in CONTRACTS:
+        with open(os.path.join(root, sub), "rb") as f:
+            h.update(sub.encode() + b"\0" + f.read() + b"\0")
     return h.hexdigest()[:16]
 
 
@@ -562,7 +571,7 @@ def self_test():
 
         # 15. through the API: patches arrive as mail (diffstat, signature), a replacement pull request's reviewed head
         # is a head no branch holds any more, a failed call is a named full review
-        def fake_call(fail=()):
+        def fake_call(fail=(), binary=True):
             def call(path, accept=None, paginate=False, jq=None):
                 if any(x in path for x in fail):
                     raise Unavailable(f"gh api {path} ended 1: HTTP 404")
@@ -577,7 +586,7 @@ def self_test():
                     return sh("diff", "--name-only", m.group(1), m.group(2)) + "\n"
                 m = re.match(r"repos/o/r/commits/([0-9a-f]+)$", path)
                 assert m and accept == "application/vnd.github.patch", path
-                return sh("format-patch", "-1", "--stdout", m.group(1)) + "\n"
+                return sh("format-patch", "-1", "--stdout", "--binary" if binary else "--no-binary", m.group(1)) + "\n"
             return call
 
         r = decide(prev(), P, H, GhSource("o/r", "main", fake_call()), TOOLS, LEDGER)
@@ -636,7 +645,8 @@ def self_test():
 
         # 17. the reviewer's identity moves with what a review runs under, and with nothing else
         root = os.path.join(d, "tree")
-        for rel, text in ((".github/review/reviewer.md", "a"), ("tools/review/post.py", "b")):
+        for rel, text in ((".github/review/reviewer.md", "a"), ("tools/review/post.py", "b"),
+                          *((c, "contract") for c in CONTRACTS)):
             os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
             open(os.path.join(root, rel), "w").write(text)
         a0 = reviewer_id(root)
@@ -648,12 +658,28 @@ def self_test():
         a1 = reviewer_id(root)
         open(os.path.join(root, ".github/review/reviewer.md"), "w").write("d")
         expect(a1 != a0 and reviewer_id(root) != a1, "reviewer-id moves with a tool and with an instruction file")
+        for c in CONTRACTS:
+            before = reviewer_id(root)
+            open(os.path.join(root, c), "a").write("a rule relaxed\n")
+            expect(reviewer_id(root) != before, f"reviewer-id moves with {c}")
         shutil.rmtree(os.path.join(root, ".github/review"))
         try:
             reviewer_id(root)
             expect(False, "reviewer-id of a tree without .github/review was accepted")
         except ValueError:
             expect(True, "reviewer-id of a tree without .github/review is a named error")
+
+        # 18. a binary change the API sends as a notice: two different blobs read as one patch, so the series is read whole
+        heads = []
+        for blob in (b"\0\1old", b"\0\1new"):
+            branch(f"bin-{len(heads)}", "topic")
+            open(os.path.join(repo, "b.bin"), "wb").write(blob)
+            heads.append(commit("b: a binary file"))
+        notice = GhSource("o/r", "main", fake_call(binary=False))
+        r = decide(prev(head=heads[0]), heads[0], heads[1], notice, TOOLS, LEDGER)
+        expect(r["mode"] == "full" and "binary" in r["why"], f"a binary notice is a full review: {r['mode']} {r['why']}")
+        r = decide(prev(head=heads[0]), heads[0], heads[1], GhSource("o/r", "main", fake_call()), TOOLS, LEDGER)
+        expect(r["mode"] != "carry", f"a binary change sent whole is compared by its blob: {r['mode']} {r['why']}")
 
     print(f"carry.py self-test: {'ok' if not fails else 'FAIL'} ({len(cases)} cases, {len(fails)} failed)")
     return 1 if fails else 0
