@@ -1,0 +1,29 @@
+# warmres (b): the residency reseeded at the load's end from a persisted usage profile
+# (BLOOMERY_WARM_PROFILE).
+# Derived from the dsh route-trace replay (3 sessions, 699 decode steps each, plan a model t = 15.3 + 0.12 x
+# host
+# slots ms): today W 1.5-1.9 s over the first 700 steps; a profile from the other sessions' decode rows W
+# 0.1-1.2 s;
+# the prompt picks (hoststream floor) put back part of the gap ((b)+(c) arm W 1.0-1.3 s). Saved 0.4-1.5 s on a
+# ~15.4 s decode = +2..+10 %. The runner prints bare / @-arm; the effect is its inverse.
+kind: ab
+question: does a persisted usage profile, read at the load's end, raise V4.1 decode over the first 600 steps
+  after a fresh load on plan (a), A6000, the 1017 file?
+term: decode tok/s @ n=600 after a code:4096 prompt (corpus-code.ids first 4096 ids), place a, A6000, the 1017
+  file; changed = code:4096@BLOOMERY_WARM_PROFILE=<one learn run's profile: corpus-code.ids[8192..12288) and
+  1000 decode steps, --warm-save>, base = code:4096, the same binary with the lever unset
+unit: %
+predict: 2..10 %
+rounds: 4
+condition: the profile is out of sample: learned on corpus-code.ids[8192..12288) and its 1000 decode steps,
+  measured on corpus-code.ids[0..4096) and its 600, two disjoint id ranges of the corpus;
+  BLOOMERY_AB_LOAD=arm: every arm its own process and load, so every arm's 600 steps follow a fresh
+  load; the profile is only read (no --warm-save), so every round reads the same file; the runner holds each
+  arm to its residency host record and prints its residency curve; the bin:<base tree> arm (the 0.3.5 engine
+  code) rides along for the 0.3.5 curve and the tree-vs-base check
+decide-in: land (b) at its common owner; the serve's wiring (a default cache path, a write at request end
+  every N steps and at shutdown, gates set off) is the next round
+decide-below: the prompt picks undo the seed: read the call stream records; next an A/B arm that skips the
+  floor picks when a profile seeded the card set
+decide-above: land (b); the profile also lifts the steady state past the replay's settle: re-fit t_fixed and
+  c_host on the arms' curves
