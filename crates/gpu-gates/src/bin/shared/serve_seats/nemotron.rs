@@ -44,6 +44,14 @@
 //! reading. A placement of more than one card or with a tier card is refused
 //! before any load by the plan's own refusal (`PlaceError`).
 //!
+//! A Bolt file the card cannot hold whole (the whole-card plan refused at the
+//! least context a seat asks, [`SEAT_STEPS`]) loads placed: the plan keeps the
+//! routed experts the card's room holds resident and puts the rest on the
+//! host tier (`Experts::Placed` over `Place::machine_placed`; the host set is
+//! read in and locked as the host levers say), the prompt runs as decode
+//! steps, and the card's room is the plan's, `BLOOMERY_CARD_BUDGET` included.
+//! A file the card holds whole loads whole, as before.
+//!
 //! `--ctx` is the one slot's context (`--ctx 0` is refused). The context
 //! comes first and the plan fills the machine around it
 //! (`generate::choose_ctx`, every seat's): a set value past the file's trained
@@ -78,16 +86,17 @@ use bloomery_gpu_gates::bind::{
     ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, model_props, note_line,
     parallel_line, placement_of, slots_of,
 };
-use bloomery_gpu_gates::generate::{Place, choose_ctx};
+use bloomery_gpu_gates::generate::{Place, SEAT_STEPS, choose_ctx};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
+use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::nemotron_h::place as nemotron_place;
-use model::arch::nemotron_h_moe::place as moe_place;
-use model::placement::PlanLevers;
+use model::arch::nemotron_h_moe::place::{self as moe_place, Experts, PlanInputs};
 use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::DeviceId;
+use model::placement::{Machine, PlanLevers};
 use serve::{CacheNote, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
@@ -98,8 +107,15 @@ const USAGE: &str = "usage: bloomery-serve --model nemotron [-m PATH | --hf <rep
                      [--place W] [--plan] [--queue-depth Q] [--api-key KEY] \
                      [--api-key-file FNAME]";
 
-/// The levers this seat acts on: the plan's card budget and the start screen.
-pub const ACTS_ON: &[&str] = &[bloomery_levers::CARD_BUDGET, bloomery_levers::SCREEN];
+/// The levers this seat acts on: the plan's card budget, the start screen and
+/// the host set's load a placed Bolt load reads (a whole-card load takes none).
+pub const ACTS_ON: &[&str] = &[
+    bloomery_levers::CARD_BUDGET,
+    bloomery_levers::SCREEN,
+    bloomery_levers::HOST_POPULATE,
+    bloomery_levers::HOST_LOCK,
+    bloomery_levers::CARD_DONTNEED,
+];
 
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the nemotron seat runs no prompt cache";
@@ -117,6 +133,34 @@ struct OpenSeat {
     path: PathBuf,
     /// The slot's positions the K/V planes are sized for.
     ctx: usize,
+}
+
+/// What a placed Bolt load is opened from on the engine thread: the plan's
+/// inputs, machine and levers, which make the plan again at the slot's
+/// context (the plan borrows them, so the seat's own is dropped before the
+/// spawn), and the host set's load.
+struct PlacedSeat {
+    inputs: PlanInputs,
+    machine: Machine,
+    levers: PlanLevers,
+    host: HostCfg,
+}
+
+impl PlacedSeat {
+    /// The placed load of `file` at `ctx` positions (the plan the seat
+    /// printed, made again here).
+    fn open(self, file: Split, ctx: usize) -> Result<NemotronHMoeModel, GpuError> {
+        let plan = self
+            .inputs
+            .plan_with(
+                &self.machine,
+                u64::try_from(ctx).unwrap_or(u64::MAX),
+                &self.levers,
+                Experts::Placed,
+            )
+            .map_err(|e| GpuError::plan("the nemotron seat's placed load", e))?;
+        NemotronHMoeModel::open_placed(file, &plan, 0, self.host)
+    }
 }
 
 /// The model on the engine thread: either family's body, the seat's one path
@@ -146,21 +190,27 @@ fn prefill_bolt(m: &mut NemotronHMoeModel, ids: &[u32]) -> Result<u32, GpuError>
     }
 }
 
+/// A placed Bolt load's prompt path: its ids run as decode steps through the
+/// host tier's step port (the batched pass is the whole-card load's).
+fn prefill_bolt_placed(m: &mut NemotronHMoeModel, ids: &[u32]) -> Result<u32, GpuError> {
+    m.step(ids)
+}
+
 impl<B: ChainBody> Nemotron<B> {
-    /// The model of the file at `a.path` on the planned card, built by `open`
-    /// (the family's `GpuModel::open`) and carrying its prompt path `prefill`,
+    /// The model of the file at `a.path`, built by `open` (the family's
+    /// `GpuModel::open` on the planned card, or a placed load, which opens
+    /// the card its plan names) and carrying its prompt path `prefill`,
     /// in graph mode with its step captured, the `load` record on stderr
     /// naming the body's architecture.
     fn open(
         a: OpenSeat,
-        open: fn(Gpu, Split, usize) -> Result<GpuModel<B>, GpuError>,
+        open: impl FnOnce(Split) -> Result<GpuModel<B>, GpuError>,
         prefill: fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError>,
     ) -> Result<Nemotron<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
         let opened = t.elapsed();
-        let gpu = Gpu::open_card(&a.card, a.device)?;
-        let mut m = open(gpu, file, a.ctx)?;
+        let mut m = open(file)?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         let ctx = m.ctx_max();
@@ -300,12 +350,23 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let chosen = Place::choose_untiered(a.place, &census, "nemotron")?;
     chosen.record().eprint();
     let place = chosen.place;
-    let machine = place.machine_untiered()?(inputs.model.layers);
+    let layers = inputs.model.layers;
+    // A Bolt file the card cannot hold whole at the least context a seat asks
+    // loads placed: the plan keeps the experts the card's room holds and the
+    // host tier serves the rest. Everything else loads whole, as before.
+    let whole = place.machine_untiered()?(layers);
+    let placed =
+        arch == Arch::NemotronHMoe && inputs.plan(&whole, SEAT_STEPS.floor, &plan_levers).is_err();
+    let (machine, experts) = if placed {
+        (place.machine_placed(0)?(layers), Experts::Placed)
+    } else {
+        (whole, Experts::Card)
+    };
     // The context, then the plan around it (`choose_ctx`, every seat's): a
     // tier card, a second card, a context the card cannot hold and a budget
     // that binds are refused here by name, before any load.
     let asked = choose_ctx(&split, (a.ctx, slots), (None, None), |c| {
-        probe_of(inputs.plan(&machine, c, &plan_levers))
+        probe_of(inputs.plan_with(&machine, c, &plan_levers, experts))
             .map_err(|e| format!("--place {}: {e}", place.name()))
     })?;
     eprintln!("{}", asked.line());
@@ -330,21 +391,55 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         ctx: slot_ctx,
     };
     let device = card.name.clone();
+    let host = levers.host();
     drop(plan);
     drop(split);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     // The family's `GpuModel::open` and prompt path, the engine thread's body.
     let engine = match arch {
         Arch::NemotronH => SeatEngine::spawn(
-            move || Nemotron::open(open, NemotronHModel::open, prefill_nano),
+            move || {
+                let (card, device, ctx) = (open.card.clone(), open.device, open.ctx);
+                Nemotron::open(
+                    open,
+                    |file| NemotronHModel::open(Gpu::open_card(&card, device)?, file, ctx),
+                    prefill_nano,
+                )
+            },
             slot_ctx,
             vocab,
             device,
             props,
             0,
         )?,
+        Arch::NemotronHMoe if placed => {
+            let seat = PlacedSeat {
+                inputs,
+                machine,
+                levers: plan_levers,
+                host,
+            };
+            SeatEngine::spawn(
+                move || {
+                    let ctx = open.ctx;
+                    Nemotron::open(open, |file| seat.open(file, ctx), prefill_bolt_placed)
+                },
+                slot_ctx,
+                vocab,
+                device,
+                props,
+                0,
+            )?
+        }
         Arch::NemotronHMoe => SeatEngine::spawn(
-            move || Nemotron::open(open, NemotronHMoeModel::open, prefill_bolt),
+            move || {
+                let (card, device, ctx) = (open.card.clone(), open.device, open.ctx);
+                Nemotron::open(
+                    open,
+                    |file| NemotronHMoeModel::open(Gpu::open_card(&card, device)?, file, ctx),
+                    prefill_bolt,
+                )
+            },
             slot_ctx,
             vocab,
             device,

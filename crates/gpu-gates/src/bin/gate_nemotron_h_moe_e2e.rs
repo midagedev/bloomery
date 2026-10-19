@@ -86,6 +86,24 @@
 //!   passes in memory). The sizes are the load's own choice
 //!   (`NemotronHMoeModel::pass_rows`), whatever the card's room gave it.
 //!
+//! - `host_tier_near_whole_card` (self-consistency, after the clauses above,
+//!   on loads of its own once the whole-card model is released): the routed
+//!   experts where the planner's three arms put them (`Experts::Placed`
+//!   under no budget — the card holds every expert, the placed load running
+//!   no host leg; under a budget of half the experts' bytes — each MoE layer
+//!   partly on the host; `Experts::Host` — every expert on the host; and in
+//!   the real tier the 12 GiB room), the walk run as decode steps through
+//!   `GpuModel::open_placed`. The card arm's logits are bit-identical to the
+//!   whole-card load's; a host arm's keep [`COSINE_FLOOR`] against them and
+//!   its argmax is the whole-card's wherever the whole-card's top-1 margin
+//!   passes twice the run's max |Δ| (the host quantizes the latent with its
+//!   own kernel and sums its slots in its own order, so the sums differ by
+//!   rounding: the two ids can swap only inside that band). Each host arm's
+//!   graph holds one `ds41_ffn_handoff_9` a hosted layer and one
+//!   `ds41_ffn_card_acc_9` a hosted layer with card experts, its eager and
+//!   replayed runs are bit-identical, and its fault word stays clean. It
+//!   blocks a host share lost or counted twice in the latent sum.
+//!
 //! A set absent from the box, dumped from another fixture or build, or
 //! unfinished ends the gate by name before the card loads.
 
@@ -103,10 +121,20 @@ fn main() -> std::process::ExitCode {
 mod e2e;
 
 #[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
+    reason = "the card the gate plans on; the host-tier arms read its spec"
+)]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use crate::e2e::{
-        argmax, feed, finite, fresh, histogram, or_fault, same, same_bits, top_ids, walk,
+        Run, argmax, cosine, feed, finite, fresh, histogram, max_delta, or_fault, same, same_bits,
+        second, top_ids, walk,
     };
+    use crate::gate_card;
     use bloomery_gpu::arch::nemotron_h_moe::Routing;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Gpu, NemotronHMoeModel};
@@ -116,6 +144,8 @@ mod gate {
     use cuda_core::sys;
     use model::arch::Arch;
     use model::arch::nemotron_h_moe::hparams::{Hparams, Kind};
+    use model::arch::nemotron_h_moe::place::{self as moe_place, Experts};
+    use model::placement::{PlanLevers, workstation};
     use refset::arch::nemotron_h_moe::fixture::{LOGITS, LOGITS_SET};
     use refset::arch::nemotron_h_moe::{LOGITS as REAL_LOGITS, LOGITS_SET as REAL_SET};
     use refset::nemotron::LogitsSet;
@@ -1093,6 +1123,195 @@ mod gate {
         Ok(pass)
     }
 
+    // ------------------------------------------- host_tier_near_whole_card
+
+    /// The host-tier clause's name.
+    const HOST_CLAUSE: &str = "host_tier_near_whole_card";
+
+    /// The 12 GiB room of the 3060 host, in bytes.
+    const ROOM_12G: u64 = 12 << 30;
+
+    /// One arm of the host split: its name, the levers it plans under and
+    /// where the planner puts the experts.
+    struct Arm {
+        name: &'static str,
+        levers: PlanLevers,
+        experts: Experts,
+    }
+
+    /// The whole-card load's run of the walk the host-tier arms are held
+    /// against: the ids and the last position's logits, kept before the
+    /// model is released.
+    struct Whole {
+        run: Run,
+        ctx: usize,
+    }
+
+    fn whole_card_run(m: &mut Model, case: &Case) -> Result<Option<Whole>, GateError> {
+        m.set_mode(StepMode::Graph);
+        let Some(run) = fresh(
+            "host_tier_near_whole_card",
+            "the whole-card walk",
+            m,
+            &case.walk,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Whole {
+            run,
+            ctx: m.ctx_max(),
+        }))
+    }
+
+    /// The host-tier clause (module doc): the whole-card load has been
+    /// released, each arm opens the file as a placed load of its plan.
+    fn host_tier_near_whole_card(case: &Case, whole: &Whole) -> Result<bool, GateError> {
+        const CLAUSE: &str = HOST_CLAUSE;
+        let file = open_split(Arch::NemotronHMoe, "gate-gpu-nemotron-h-moe-e2e")?;
+        let inputs = moe_place::read(&file)?;
+        let spec = gate_card::card()?;
+        let machine = workstation::placed_on(spec, case.hp.n_layer, workstation::SCRATCH);
+        let ctx = u64::try_from(whole.ctx)?;
+        // No lever is read: the clause plans and loads by its arms alone, so a
+        // lever left in the runner's environment cannot move it.
+        let host = bloomery_levers::HostCfg {
+            populate: false,
+            lock: false,
+            card_dontneed: false,
+            r8: false,
+            route_trace: false,
+        };
+        let all_card = inputs.plan_with(&machine, ctx, &PlanLevers::default(), Experts::Placed)?;
+        let c = &all_card.cards[0];
+        let half = c.dense_bytes
+            + c.rounding_bytes
+            + c.kv_bytes
+            + c.stage_rows_bytes
+            + c.expert_bytes / 2
+            + machine.cards[0]
+                .set_aside_bytes()
+                .ok_or("the card's set-aside is unbounded")?
+            + machine.cards[0].margin_bytes;
+        let mut arms = vec![
+            Arm {
+                name: "card",
+                levers: PlanLevers::default(),
+                experts: Experts::Placed,
+            },
+            Arm {
+                name: "mid",
+                levers: PlanLevers {
+                    card_budget_bytes: Some(half),
+                },
+                experts: Experts::Placed,
+            },
+            Arm {
+                name: "host",
+                levers: PlanLevers::default(),
+                experts: Experts::Host,
+            },
+        ];
+        if tier::Tier::from_env()? == tier::Tier::Real {
+            arms.push(Arm {
+                name: "room12g",
+                levers: PlanLevers {
+                    card_budget_bytes: Some(ROOM_12G),
+                },
+                experts: Experts::Placed,
+            });
+        }
+        let (Some(want_ids), Some(want)) = (whole.run.ids.last(), whole.run.logits.last()) else {
+            return Err("the whole-card walk is empty".into());
+        };
+        let mut pass = true;
+        for arm in &arms {
+            let plan = inputs.plan_with(&machine, ctx, &arm.levers, arm.experts)?;
+            // A layer is hosted when the card holds fewer than the model's
+            // experts of it; a layer with no routed stacks is neither.
+            let split: Vec<(usize, u64, u64)> = (0..case.hp.n_layer)
+                .filter_map(|l| {
+                    let x = case.hp.experts[l]?;
+                    Some((l, plan.n_l[l], x.n_expert as u64))
+                })
+                .collect();
+            let hosted: Vec<usize> = split
+                .iter()
+                .filter(|&&(_, on, of)| on < of)
+                .map(|&(l, _, _)| l)
+                .collect();
+            let with_card = split
+                .iter()
+                .filter(|&&(_, on, of)| 0 < on && on < of)
+                .count();
+            println!(
+                "{CLAUSE}: arm {} plan: {} experts on the host, card experts by layer \
+                 (layer, on card, of) {split:?}, hosted layers {hosted:?}",
+                arm.name, plan.host.experts
+            );
+            let mut m = Model::open_placed(
+                open_split(Arch::NemotronHMoe, "gate-gpu-nemotron-h-moe-e2e")?,
+                &plan,
+                0,
+                host,
+            )?;
+            m.set_mode(StepMode::Eager);
+            let eager = fresh(CLAUSE, "eager", &mut m, &case.walk)?;
+            m.set_mode(StepMode::Graph);
+            let nodes = m.capture_step()?;
+            let hist = histogram(&m.step_graph_nodes()?);
+            let replay = fresh(CLAUSE, "replay", &mut m, &case.walk)?;
+            let (Some(eager), Some(replay)) = (eager, replay) else {
+                pass = false;
+                continue;
+            };
+            let got = |name: &str| hist.get(name).copied().unwrap_or(0);
+            let moe_whole = case
+                .hp
+                .kinds
+                .iter()
+                .enumerate()
+                .filter(|&(l, &k)| k == Kind::Moe && !hosted.contains(&l))
+                .count();
+            let (handoff, acc, wsum) = (
+                got("ds41_ffn_handoff_9"),
+                got("ds41_ffn_card_acc_9"),
+                got("weighted_sum"),
+            );
+            let structure = handoff == hosted.len() && acc == with_card && wsum == moe_whole;
+            let (Some(got_ids), Some(logits)) = (replay.ids.last(), replay.logits.last()) else {
+                return Err("the placed walk is empty".into());
+            };
+            let (dmax, cos) = (max_delta(want, logits), cosine(want, logits));
+            let margin = f64::from(want[argmax(want) as usize])
+                - f64::from(want[second(want, argmax(want)) as usize]);
+            let in_band = margin <= 2.0 * dmax;
+            let clean = m.gpu().fault()?.is_none() && m.poisoned().is_none();
+            let fine = finite(&replay) && same(&eager, &replay);
+            let near = if arm.name == "card" {
+                same(&whole.run, &replay)
+            } else {
+                cos >= COSINE_FLOOR && (got_ids == want_ids || in_band)
+            };
+            let arm_pass =
+                structure && fine && clean && near && (arm.name != "card" || hosted.is_empty());
+            println!(
+                "{CLAUSE}: arm {}: graph_nodes={nodes} handoff_9={handoff}/{} card_acc_9={acc}/{} \
+                 weighted_sum={wsum}/{moe_whole}; eager == replay {} finite {} fault clean {clean}; \
+                 last id {got_ids} vs whole-card {want_ids}, cosine {cos:.6}, max|Δ| {dmax:.3e}, \
+                 whole-card top-1 margin {margin:.3e} (inside the band {in_band}) {}",
+                arm.name,
+                hosted.len(),
+                with_card,
+                same(&eager, &replay),
+                finite(&replay),
+                verdict(arm_pass)
+            );
+            pass &= arm_pass;
+        }
+        Ok(pass)
+    }
+
     fn fault_word_clean(m: &mut Model, _case: &Case) -> Result<bool, GateError> {
         let fault = m.gpu().fault()?;
         let pass = fault.is_none() && m.poisoned().is_none();
@@ -1173,6 +1392,21 @@ mod gate {
             let pass = clause(&mut m, &case)?;
             if !pass {
                 println!("clause {name} FAIL");
+            }
+            ok &= pass;
+        }
+        // The host-tier arms open loads of their own beside nothing: the
+        // whole-card model is released first, its walk kept.
+        let held = if tier::run_clause(HOST_CLAUSE, Tag::SelfConsistency)? {
+            whole_card_run(&mut m, &case)?
+        } else {
+            None
+        };
+        drop(m);
+        if let Some(whole) = held {
+            let pass = host_tier_near_whole_card(&case, &whole)?;
+            if !pass {
+                println!("clause {HOST_CLAUSE} FAIL");
             }
             ok &= pass;
         }
