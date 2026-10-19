@@ -4154,7 +4154,6 @@ with open(os.path.abspath(__file__), "rb") as _fh:
     _CODE_SHA = hashlib.sha256(_fh.read()).digest()  # the derivation's code as this process read it, not as the file is by the time a key is made
 GATE_PATHS_CACHE = "~/.cache/bloomery/gate-paths"
 GATE_PATHS_CACHE_KEEP = 16  # expanded tables kept, newest first: one per tree a landing or a check has seen
-_EXPANDED: dict[tuple[str, str], list[PathRow]] = {}
 
 
 def expand_rows(tree: Tree, recipes: dict[str, Recipe], rows: list[PathRow], graph: Graph | None = None) -> list[PathRow]:
@@ -4259,14 +4258,11 @@ def store_expanded_cache(path: str, text: str) -> None:
 def expanded_table(root: str = ROOT, side: Side | None = None, cache_dir: str = GATE_PATHS_CACHE, notes: list[str] | None = None) -> list[PathRow]:
     """The table at `root` as narrow() reads it: each `derive` row expanded over the tree at `root`. `side`, when given, is that
     tree read with no dep-info attached (a box's dep-info would change a bin's files and so the derivation). The expansion is
-    kept in-process and on disk by the tree's key (gate_paths_key); the check writes it, so a landing that ran the check reads it."""
+    kept on disk by the tree's key (gate_paths_key); the check writes it, so a landing that ran the check reads it."""
     text = read_gate_paths_text(root)
     rows = parse_gate_paths(text)
     if not any(r.derive for r in rows):
         return rows
-    memo = (os.path.realpath(root), hashlib.sha256(text.encode()).hexdigest())
-    if memo in _EXPANDED:
-        return _EXPANDED[memo]
     key = gate_paths_key(root, text)
     path = os.path.join(os.path.expanduser(cache_dir), key + ".tsv") if key else None
     n = sum(1 for r in rows if r.derive)
@@ -4274,18 +4270,25 @@ def expanded_table(root: str = ROOT, side: Side | None = None, cache_dir: str = 
     if hit is not None:
         if notes is not None:
             notes.append(f"{GATE_PATHS}: {n} derive rows read from the cache of this tree ({key[:12]})")
-        _EXPANDED[memo] = hit
         return hit
     if sys.stderr.isatty():  # `just affected 2>&1 > LIST` is what tools/gate-batch.sh --list reads: its first lines must stay the recipe line and `affected:`
         print(f"recipes.py: deriving the gates of {n} rows of {GATE_PATHS} (no cache for this tree; the check writes one)", file=sys.stderr)
     side = side if side is not None else make_side(root)
     out = expand_rows(side.tree, side.recipes, rows, side.graph)
-    if path:
-        store_expanded_cache(path, expanded_text(text, rows, out))
+    stored = store_expansion(root, key, cache_dir, text, rows, out)
     if notes is not None:
-        notes.append(f"{GATE_PATHS}: {n} derive rows derived from the tree" + (f", cached as {key[:12]}" if key else " (a tree with no git identity: not cached)"))
-    _EXPANDED[memo] = out
+        notes.append(f"{GATE_PATHS}: {n} derive rows derived from the tree" + (f", cached as {key[:12]}" if stored else
+                     " (a tree with no git identity, or one that moved while it was derived: not cached)"))
     return out
+
+
+def store_expansion(root: str, key: str | None, cache_dir: str, text: str, rows: list[PathRow], expanded: list[PathRow]) -> bool:
+    """Stores the expansion derived over the tree at `root` under `key`, the tree's key taken before the tree was read, and only
+    while the tree still has that key: a file edited during the derivation would otherwise file the old gates under the new tree."""
+    if key is None or gate_paths_key(root, read_gate_paths_text(root)) != key:
+        return False
+    store_expanded_cache(os.path.join(os.path.expanduser(cache_dir), key + ".tsv"), expanded_text(text, rows, expanded))
+    return True
 
 
 def cmd_rows(args: argparse.Namespace) -> int:
@@ -4903,6 +4906,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     if args.fill:
         raise RecipeError(f"--fill is gone: {GATE_PATHS} derives its gates (a row's `{DERIVE}` stands for them), so there is nothing to fill; "
                           "write `derive` in the recipes column of a row that should hold what the tree derives")
+    text = read_gate_paths_text(ROOT)
+    key = gate_paths_key(ROOT, text)  # before the tree is read: the derivation below is of this tree or of a later one
     tree = Tree(ROOT)
     recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
     held: dict[str, int] = {}
@@ -4915,22 +4920,17 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"check-recipes: {GATE_PATHS}: {held.get('rows', 0)} gate rows held to the derivation, {held.get('exceptions', 0)} rows "
           f"with exceptions naming {held.get('excepted', 0)} gates")
     if not gp and args.justfile is None:
-        store_checked_expansion(ROOT, derived)
+        store_checked_expansion(ROOT, key, text, derived)
     return 1 if problems else 0
 
 
-def store_checked_expansion(root: str, derived: dict[int, list[str]]) -> None:
+def store_checked_expansion(root: str, key: str | None, text: str, derived: dict[int, list[str]], cache_dir: str = GATE_PATHS_CACHE) -> bool:
     """Writes the cache of the table the check just held to the tree: the derivation is already in hand, so a later `affected
-    --narrow` of this tree reads it instead of deriving."""
-    text = read_gate_paths_text(root)
+    --narrow` of this tree reads it instead of deriving. `key` and `text` are the tree's as they were before the check read it."""
     rows = parse_gate_paths(text)
     if not any(r.derive for r in rows):
-        return
-    key = gate_paths_key(root, text)
-    if key is None:
-        return
-    expanded = [expanded_row(r, derived[r.line]) if r.derive else r for r in rows]
-    store_expanded_cache(os.path.join(os.path.expanduser(GATE_PATHS_CACHE), key + ".tsv"), expanded_text(text, rows, expanded))
+        return False
+    return store_expansion(root, key, cache_dir, text, rows, [expanded_row(r, derived[r.line]) if r.derive else r for r in rows])
 
 
 # ----------------------------------------------------------------------------------------------
@@ -10134,7 +10134,7 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
         got = gate_paths_problems(st, rs, [row("base/data/idle.txt", ["gate-app"])])
         expect(not got, f"gate-paths: a hand row for a file the tree derives no gate for is refused: {got[:2]}")
         # the table read for narrow(): a miss derives, notes it, writes nothing to a stderr that is no terminal (gate-batch --list
-        # reads `just affected … 2>&1`, whose first lines must stay the recipe line and `affected:`), and keeps the result per table
+        # reads `just affected … 2>&1`, whose first lines must stay the recipe line and `affected:`)
         import contextlib
         import io
 
@@ -10150,7 +10150,6 @@ def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
             expect(len(table) == 1 and table[0].line == 2 and not table[0].derive and "gate-app" in table[0].gates() and table[0].gates()[-1] == "gate-mid",
                    f"gate-paths: expanded_table does not write the derived gates then the hand name: {[(t.line, t.recipes) for t in table]}")
             expect(any("derived from the tree" in x for x in notes), f"gate-paths: a derivation leaves no note: {notes}")
-            expect(expanded_table(tbl, Side(st, rs, sg), os.path.join(tbl, "cache"), notes) is table, "gate-paths: a second read of one table derives again")
         # one label for a target's own read whether it names a file or a directory (origin_label): a test's own
         # directory literal is the test's own, a lib's is a dependency edge, as a file of either is
         own_dir, lib_dir = sg.inputs("gate-app").match("tools/own-held/a.ids"), sg.inputs("gate-app").match("tools/lib-held/b.ids")
@@ -10640,6 +10639,24 @@ def derive_self_test(expect, side: Side, row) -> None:
             with open(os.path.join(repo, "b.rs"), "w", encoding="utf-8") as fh:
                 fh.write("fn b() {}\n")
             expect(gate_paths_key(repo, text) != k0, "derive: the cache key ignores an untracked file")
+            # a store under the key taken before the derivation: kept while the tree holds it, refused once a file moved since
+            os.makedirs(os.path.join(repo, os.path.dirname(GATE_PATHS)), exist_ok=True)
+            with open(os.path.join(repo, GATE_PATHS), "w", encoding="utf-8") as fh:
+                fh.write(text)
+            git_in("add", "-A")
+            git_in("commit", "-q", "-m", "t")
+            cache = os.path.join(tmp, "store-cache")
+            k1 = gate_paths_key(repo, text)
+            derived = {r.line: ["gate-w"] for r in rows if r.derive}
+            expect(k1 is not None and store_checked_expansion(repo, k1, text, derived, cache) and os.path.exists(os.path.join(cache, k1 + ".tsv")),
+                   "derive: a store under the key of an unmoved tree is not written")
+            with open(os.path.join(repo, "a.rs"), "w", encoding="utf-8") as fh:
+                fh.write("fn a() { 2; }\n")
+            k2 = gate_paths_key(repo, text)
+            expect(not store_checked_expansion(repo, k1, text, derived, cache) and k2 is not None and not os.path.exists(os.path.join(cache, k2 + ".tsv")),
+                   "derive: an expansion derived before a tracked edit is stored for the edited tree")
+            expect(not store_expansion(repo, k1, cache, text, rows, rows) and not os.path.exists(os.path.join(cache, k2 + ".tsv")),
+                   "derive: a cold expansion derived before a tracked edit is stored for the edited tree")
         else:
             expect(False, "derive: the key fixture's git repository could not be made")
     expect(_raises(lambda: cmd_check(argparse.Namespace(fill=True, justfile=None)), "derives its gates"), "derive: `check --fill` not refused by name")
