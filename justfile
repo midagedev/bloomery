@@ -1617,16 +1617,17 @@ dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
 # template's tool-call markup mapped to its parser (qwenxml). The repetition, frequency and presence penalties as
 # llama-server takes them (penalty). A sampled request's drafted passes against its plain steps (sampdraft).
 # A chat clip and an embeddings clip against a mock decoder (src/media, src/api, src/arch/gemma4v): both part spellings, the
-# plan before the text, the placeholders paired by id and order, every named refusal, `/props` `modalities.video`.
+# plan before the text, the placeholders paired by id and order, an embeddings input's images and audio charged before its clips
+# are planned, every named refusal, `/props` `modalities.video`.
 gate-serve:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test limits --test anthropic --test penalty --test sampdraft -- --include-ignored --nocapture'
 
 # The server's video decode against a real ffmpeg (crates/serve/tests/video.rs): a lossless clip whose every frame is one colour
-# naming its index, probed (its frame count from the duration where the container has none), planned by a tick rule and a
-# linspace rule and decoded at the plan's indices at one and four threads, the same frames; a decode past the file's end and
-# a file that is no video as named errors; a two-stream clip decodes the stream the probe measured; a 60 s 1080p H.264 clip planned and decoded at four threads, its wall one
-# `stat video decode` line against docs/cards/vidcore-decode.card. Needs ffmpeg and ffprobe 5.1 or newer on PATH (the gate
-# fails by name without them). No card, no lease.
+# naming its index, probed (its frame count counted by decoding where the container states none), planned by a tick rule
+# and a linspace rule and decoded at the plan's indices at one and four threads, the same frames; a clip with audio longer than
+# its video probes the video's frames; a decode past the file's end and a file that is no video as named errors; a two-stream
+# clip decodes the stream the probe measured; a 60 s 1080p H.264 clip's plan arrives whole and in order. Needs ffmpeg and
+# ffprobe 5.1 or newer on PATH (the gate fails by name without them). No card, no lease.
 gate-serve-video:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --test video -- --include-ignored --nocapture'
 

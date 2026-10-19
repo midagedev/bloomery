@@ -2,10 +2,11 @@
 //! every frame is one colour naming its index is probed, planned by two rules (a centred tick
 //! rule, a linspace rule) and decoded, and the frames that arrive are the plan's, each whole and
 //! uniform and in order, whatever the thread count. A clip of two video streams decodes the first,
-//! the stream the probe measured. A decode past the file's end and a file that
-//! is no video are named errors. A 60-second 1080p H.264 clip is planned and decoded at four
-//! threads, its wall printed as a `stat` line (`docs/cards/vidcore-decode.card` predicts it).
-//! ffmpeg is a requirement of the gate, so its absence fails by name rather than skipping.
+//! the stream the probe measured, and a clip with audio longer than its video probes the video's
+//! own frame count. A decode past the file's end and a file that is no video are named errors. A
+//! 60-second 1080p H.264 clip is planned and decoded at four threads; every planned frame arrives
+//! whole and in order. ffmpeg is a requirement of the gate, so its absence fails by name rather
+//! than skipping.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -277,6 +278,58 @@ fn hw_the_decode_takes_the_stream_the_probe_measured() {
         );
     }
     println!("gate video: two streams decode the 64x64 first");
+}
+
+/// A Matroska clip of 2 s of video at 10 fps beside 10 s of audio has 20 frames: the container
+/// states neither a frame count nor the video stream's duration, and its own duration is the
+/// audio's. The probe counts the video stream's frames, so the tick rule plans two ticks (frames 4
+/// and 14) and both decode; the container's duration would make 100 frames, ten ticks, eight of
+/// them past the end.
+#[test]
+#[ignore = "gate: just gate-serve-video"]
+fn hw_audio_longer_than_the_video_does_not_stretch_its_frame_count() {
+    let decoder = decoder();
+    let dir = Dir::new("audio");
+    let path = dir.file("audio.mkv");
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:size=64x48:rate=10:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=10",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "ffv1",
+            "-c:a",
+            "pcm_s16le",
+        ],
+        None,
+        &path,
+    );
+    let clip = Clip::new(std::fs::read(&path).expect("the clip"), Some("mkv"));
+    let meta = decoder.probe(&clip).expect("the probe");
+    assert_eq!(
+        meta,
+        ClipMeta {
+            frames: 20,
+            fps: (10, 1),
+            width: WIDTH,
+            height: HEIGHT
+        },
+        "the probe counts the video stream, not the container's duration"
+    );
+    let p = plan(&TICKS, &meta, 10_000, &Fixed).expect("the plan");
+    assert_eq!(p.indices, [4, 14]);
+    let frames = decode(&decoder, &clip, &meta, &p.decode_indices(), 1).expect("the decode");
+    assert_eq!(frames.len(), 2);
+    println!("gate video: a 20-frame clip beside 10 s of audio probes 20 frames");
 }
 
 /// A decode that asks past the file's end is `Short`, naming the counts; a file that is no video

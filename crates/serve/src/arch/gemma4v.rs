@@ -345,3 +345,109 @@ fn a_clips_markup_is_charged_to_its_budget() {
         }
     }
 }
+
+/// The other media of an input are charged to its clips' budget as the assembly charges them: a
+/// delimiter pair and the tokens of each. A one-token still takes 17 positions and a one-token
+/// audio span 17 [derived: 8 + 8 delimiters + 1], so with the 64×64 clip of
+/// [`a_clips_markup_is_charged_to_its_budget`] (a group 97 positions, the fixed text 8) a context
+/// of 493, which five groups fill alone, leaves four groups beside the still or the audio, in
+/// either order; the fifth group comes at 17 positions more, and one position less it is four.
+#[test]
+fn a_still_and_an_audio_span_are_charged_before_the_clip_is_planned() {
+    use crate::video::MockClips;
+    let rule = vision::size::SizeRule::new(16, 3, vision::arch::TokenLimits::new(1, 280).unwrap())
+        .unwrap();
+    let model = Arc::new(vision::arch::gemma4v::Media::new(rule));
+    let mock = MockClips::new();
+    let clip = json!({"type": "input_video", "input_video": {
+        "data": media::encode_base64(b"6 1/1 64x64"), "format": "mp4"
+    }});
+    let still = json!({"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGM4kWIERAAKxQK9KV6Y1QAAAABJRU5ErkJggg=="}});
+    let audio = json!({"type":"input_audio","input_audio":{
+        "format":"f32","sample_rate":16000,"channels":1,"data":media::encode_base64(&[0; 8])
+    }});
+    let side_at = |ctx: usize| {
+        let mut side = Side::new(Box::new(MockEmbed::new(ctx)));
+        side.media = Some(Arc::clone(&model) as media::SharedMediaModel);
+        side.audio = Some(Arc::new(vision::arch::gemma4a::Preprocessor::default()));
+        side
+    };
+    let tok = side_at(0).tok;
+    let around = |begin: &str, end: &str| tok.encode(begin).len() + tok.encode(end).len();
+    let group = around("<|image>", "<image|>") + 81;
+    let fixed = 2 + tok.encode("Video:").len();
+    let charge = |groups: usize| fixed + groups * group;
+    let other = |kind: &str| {
+        if kind == "audio" {
+            around(vision::arch::gemma4a::BEGIN, vision::arch::gemma4a::END) + 1
+        } else {
+            around("<|image>", "<image|>") + 1
+        }
+    };
+    assert_eq!(
+        (group, fixed, other("image"), other("audio")),
+        (97, 8, 17, 17)
+    );
+    for (kind, medium) in [("image", &still), ("audio", &audio)] {
+        for clip_first in [false, true] {
+            let parts = if clip_first {
+                [clip.clone(), medium.clone()]
+            } else {
+                [medium.clone(), clip.clone()]
+            };
+            for (ctx, groups) in [
+                (charge(5), 4),
+                (charge(5) + other(kind) - 1, 4),
+                (charge(5) + other(kind), 5),
+            ] {
+                let got = inputs_with(
+                    &side_at(ctx),
+                    &mock.support(1),
+                    "input",
+                    &json!([{"content": parts}]),
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{kind} clip_first {clip_first}, context {ctx}: {}",
+                        e.message
+                    )
+                });
+                let input = &got[0];
+                let spans = input.images.len() + input.audio.len();
+                assert_eq!(
+                    spans,
+                    groups + 1,
+                    "{kind} clip_first {clip_first}, context {ctx}"
+                );
+                assert_eq!(
+                    input.ids.len(),
+                    charge(groups) + other(kind),
+                    "{kind} clip_first {clip_first}, context {ctx}"
+                );
+            }
+        }
+    }
+    // Images and audio past the context refuse the input before the clip is decoded.
+    let decoded = mock.calls.lock().unwrap().len();
+    let refused = inputs_with(
+        &side_at(30),
+        &mock.support(1),
+        "input",
+        &json!([{"content": [still.clone(), audio.clone(), clip.clone()]}]),
+    )
+    .err()
+    .expect("a refusal");
+    assert_eq!(refused.code, 400);
+    assert!(
+        refused
+            .message
+            .ends_with("input exceeds the embedding context"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        mock.calls.lock().unwrap().len(),
+        decoded,
+        "the clip was decoded"
+    );
+}
