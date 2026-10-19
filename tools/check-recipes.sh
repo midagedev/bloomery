@@ -402,6 +402,7 @@ blk_pytools() {
     "tools/ref/router-residency.py --self-test"
     "tools/ref/set-diff.py --self-test"
     "tools/ref/window-union.py --self-test"
+    "tools/review/carry.py --self-test"
     "tools/review/diagnostics.py --self-test"
     "tools/review/labels.py --self-test"
     "tools/review/ledger.py --self-test"

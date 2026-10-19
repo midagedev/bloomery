@@ -24,7 +24,7 @@ The workflow gives you these paths in the prompt's last section:
   `.github/review/escape-catalog.md` (read it before you decide; a pattern there applies as written).
 - `CTX`: `pr.json` (number, title, body, author, base and head sha), `diff.patch` (what to review), `files.txt`
   (changed paths with added and deleted line counts), and on a re-review `prev-review.md` (your last review) with
-  `mode=incremental` in `pr.json`.
+  `mode=incremental` or `mode=interdiff` in `pr.json`; with `mode=interdiff` also `interdiff.patch`.
 - `CTX/diagnostics.md`: what the deterministic tools found on this PR, or why a tool did not run. Read it before you
   start (see "Diagnostics" below).
 - `CTX/open-issues.txt`: the titles of open issues already filed by this bot.
@@ -303,3 +303,23 @@ last review": for each earlier must-fix and ⚠ item, one line saying fixed, sti
 author. Then review only the new commits. Code the earlier review already saw and the new commits do not change
 gets no new finding of any kind, except a kind A behavior bug. Duplication, element and missing-PIN findings on a re-review
 apply only to lines the new commits add.
+
+## Re-review after a rebase (`mode=interdiff`)
+
+The head is not a descendant of the head you last reviewed (a rebase, or a replacement pull request), and some of its
+commits are not the patches you saw. `prev-review.md` is your last review. `interdiff.patch` is what differs, and it is
+what you review; `diff.patch` is the whole pull request, for reading hunks in place and for the lines an inline
+comment may sit on. Its sections:
+- `changed`: a diff of the two patches of one commit. A line starting `+` or `-` is a patch line the new patch gained
+  or lost (the patch line itself follows the marker). The earlier patch of this commit was reviewed; the difference is
+  an edit, or a rebase conflict someone resolved by hand: review the resolution as new code.
+- `context` (the section says "context only"): the `+` and `-` lines of the patch are equal and the lines around them
+  moved, because the base changed within the hunk's context. Read the hunk in `PR_TREE` and flag it only when the base's change alters what the
+  hunk does (a renamed callee, a moved guard, a changed invariant). A moved comment or an unrelated edit is not a finding.
+- `added`: a new commit. Review it in full.
+- `dropped`: a commit that is gone. Review what its absence breaks.
+- `reworded`: the same patch under a new subject. Nothing to review.
+Commits the interdiff lists as unchanged are the patches you already reviewed: they get no new finding, except a
+kind A behavior bug, exactly as under "Re-review (`mode=incremental`)". Start the body with "Since the last review"
+and handle the earlier must-fix and ⚠ items as that section says.
+

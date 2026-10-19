@@ -13,7 +13,11 @@ keys; number 0 and the head's subject when the branch has no open pull request),
 with gh; an empty file and a named line when gh cannot), device-dirs.txt (post.py device), diagnostics.md (dryer and
 crapper at the commits review.yml pins, installed once where the workflow installs them; one line saying they did not
 run when they cannot be had). When the branch's pull request already has a Shingler review of an ancestor of HEAD, the run is incremental as the
-workflow's is: the diff since that head, and that review as prev-review.md.
+workflow's is: the diff since that head, and that review as prev-review.md. When HEAD is not a descendant of the
+reviewed head (a rebase), tools/review/carry.py decides as the workflow does: `carry` (every commit is a patch that
+review approved: no reviewer runs, and the approval's review is built by post.py carry), `interdiff` (the reviewer
+reads the commits that changed, CTX/interdiff.patch), or `full`; the decision and its reason are printed. A replacement
+pull request's first pre-review (`Supersedes #N`) is a full one here: the workflow resolves it, the local run does not.
 
 By default only the reviewer runs: the validator only removes findings, and here a false one costs a read, not a
 round trip. --full runs the validator after it, as the workflow does. Then `post.py check` reads the output as it
@@ -52,7 +56,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from post import MARKER, VERDICT_RE  # noqa: E402
+from carry import GitSource, decide, reviewer_id  # noqa: E402
+from post import MARKER, VERDICT_RE, carry_review, footer  # noqa: E402
 from run import MINUTES, TIMEOUT, launch, produced  # noqa: E402
 sys.path.insert(0, os.path.dirname(HERE))
 from recipes import RecipeError, archive  # noqa: E402
@@ -62,11 +67,12 @@ REPO = "midagedev/bloomery"
 PRE_CHECKS = (("tools/check-levers.sh", ("tools/", "justfile", ".cargo/", "crates/")),)
 NET_S = 60  # each gh or git fetch call: past it the step reads as unanswered, never as a hang
 MARKER_RE = re.compile(rf"<!-- {re.escape(MARKER)} head_sha=([0-9a-f]{{40}})")
-# The files the workflow's context step leaves in CTX (pr-full.json is removed there); prev-review.md only on a re-review.
+# The files the workflow's context step leaves in CTX (pr-full.json is removed there); the others only on a re-review.
 CTX_FILES = ("diff.patch", "files.txt", "pr.json", "open-issues.txt", "ledger.md", "device-dirs.txt", "diagnostics.md")
-CTX_RE_REVIEW = ("prev-review.md",)
+CTX_RE_REVIEW = ("prev-review.md", "carry.json", "interdiff.patch")
 TRANSIENT = ("pr-full.json",)
-PR_KEYS = ("number", "title", "body", "author", "repo", "base_sha", "head_sha", "tree_sha", "mode", "ledger", "run")
+PR_KEYS = ("number", "title", "body", "author", "repo", "base_sha", "head_sha", "tree_sha", "mode", "ledger", "run", "tools",
+           "carried_from")
 STATUS = {"A": "added", "D": "removed", "M": "modified", "R": "renamed", "C": "copied", "T": "changed"}
 NO_DIAG = "The diagnostics did not run on this machine (no dryer or crapper); no dryer or crapper results for this review."
 
@@ -165,13 +171,34 @@ def build_ctx(ctx, base_tree, base_sha, head, args, say):
     pr = gh_json("pr", "view", branch, "--repo", REPO, "--json", "number,title,body,author,headRefOid,state")
     if pr and pr.get("state") != "OPEN":
         pr = None
-    mode, diff_from = "full", merge_base
+    ledger = read_ledger(base_tree, os.path.join(ctx, "ledger.md"))
+    if ledger is None:
+        say("pre-review: the slag ledger could not be read (gh); ledger.md is empty")
+        open(os.path.join(ctx, "ledger.md"), "w").close()
+        ledger = ""
+    tools = reviewer_id(base_tree)
+    mode, diff_from, carried = "full", merge_base, ""
     if pr:
         prev = last_review(pr["number"])
-        if prev and prev[0] != head and is_ancestor(prev[0], head):
-            mode, diff_from = "incremental", prev[0]
-            with open(os.path.join(ctx, "prev-review.md"), "w") as f:
-                f.write(prev[1])
+        if prev and prev[0] != head:
+            if is_ancestor(prev[0], head):
+                mode, diff_from = "incremental", prev[0]
+                with open(os.path.join(ctx, "prev-review.md"), "w") as f:
+                    f.write(prev[1])
+            else:
+                d = decide(prev[1], prev[0], head, GitSource(base_sha), tools, ledger)
+                say(f"pre-review: {d['mode']}: {d['why']}")
+                mode = d["mode"]
+                if mode != "full":
+                    carried = prev[0] if mode == "carry" else ""
+                    with open(os.path.join(ctx, "prev-review.md"), "w") as f:
+                        f.write(prev[1])
+                    if mode == "interdiff":
+                        with open(os.path.join(ctx, "interdiff.patch"), "w") as f:
+                            f.write(d.pop("interdiff"))
+                    d["entries"] = [list(e) for e in d.get("entries", [])]
+                    with open(os.path.join(ctx, "carry.json"), "w") as f:
+                        json.dump(d, f, indent=1)
     with open(os.path.join(ctx, "diff.patch"), "w") as f:
         f.write(git("diff", diff_from, head) if mode == "incremental" else git("diff", f"{base_sha}...{head}"))
     with open(os.path.join(ctx, "files.txt"), "w") as f:
@@ -184,11 +211,6 @@ def build_ctx(ctx, base_tree, base_sha, head, args, say):
         else:
             say("pre-review: gh could not list the bot's open issues; open-issues.txt is empty")
     device_dirs(base_tree, os.path.join(ctx, "device-dirs.txt"))
-    ledger = read_ledger(base_tree, os.path.join(ctx, "ledger.md"))
-    if ledger is None:
-        say("pre-review: the slag ledger could not be read (gh); ledger.md is empty")
-        open(os.path.join(ctx, "ledger.md"), "w").close()
-        ledger = ""
     diag(ctx, base_tree, base_sha, head, say)
     subject = git("log", "-1", "--format=%s", head).strip()
     body = open(args.body).read() if args.body else ""
@@ -198,7 +220,7 @@ def build_ctx(ctx, base_tree, base_sha, head, args, say):
         "body": (pr.get("body") or "") if pr and not args.body else body,
         "author": ((pr or {}).get("author") or {}).get("login") or git("config", "user.name").strip(),
         "repo": REPO, "base_sha": merge_base, "head_sha": head, "tree_sha": base_sha,
-        "mode": mode, "ledger": ledger, "run": "local",
+        "mode": mode, "ledger": ledger, "run": "local", "tools": tools, "carried_from": carried,
     }
     with open(os.path.join(ctx, "pr.json"), "w") as f:
         json.dump(meta, f, indent=1)
@@ -392,6 +414,9 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
             meta = build_ctx(os.path.join(d, "ctx"), os.path.join(d, "base"), base_sha, head, args, say)
             t_ctx = time.time() - t0
             roles = ("reviewer", "validator") if args.full else ("reviewer",)
+            if meta["mode"] == "carry":  # every patch is one the bot approved: no model runs
+                roles = ()
+                carry_review(os.path.join(d, "ctx/carry.json"), os.path.join(d, "ctx/prev-review.md"), os.path.join(d, "out"))
             for role in roles:
                 rc = run_role(role, d, args.minutes, say)
                 if rc == TIMEOUT:
@@ -419,8 +444,10 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
     if not m:
         raise Stop(65, f"pre-review: the review has no verdict line; see {keep}/out/review.md")
     titles = must_fix_titles(body)
+    who = ("no reviewer: the approval of the reviewed head carries" if meta["mode"] == "carry"
+           else "reviewer + validator" if args.full else "reviewer")
     print(f"pre-review: {m.group(1)} — {meta['mode']} review of {head[:8]} against {args.base} "
-          f"({'reviewer + validator' if args.full else 'reviewer'}, {time.time() - t0:.0f} s of which context {t_ctx:.0f} s)")
+          f"({who}, {time.time() - t0:.0f} s of which context {t_ctx:.0f} s)")
     for t in titles[:12]:
         print(f"  must fix: {t}")
     print(f"  review: {keep}/out/review.md")
@@ -446,8 +473,8 @@ def self_test():
     expect(written == set(CTX_FILES) | set(CTX_RE_REVIEW),
            f"ctx files are review.yml's: workflow {sorted(written)}, here {sorted(set(CTX_FILES) | set(CTX_RE_REVIEW))}")
     m = re.search(r"'\{number, title, body, author: \.user\.login, repo: \$repo, base_sha: \.base\.sha, head_sha: \.head\.sha,"
-                  r"\s*tree_sha: \$tree, mode: \$mode, ledger: \$ledger, run: \$run\}'", step)
-    expect(m is not None, "pr.json's keys are the workflow's jq object (number … run)")
+                  r"\s*tree_sha: \$tree, mode: \$mode, ledger: \$ledger, run: \$run, tools: \$tools, carried_from: \$carried\}'", step)
+    expect(m is not None, "pr.json's keys are the workflow's jq object (number … carried_from)")
     # files.txt: GitHub's status words, a rename under its new path, binary counts 0
     with tempfile.TemporaryDirectory() as t:
         sh = lambda *c: subprocess.run(c, cwd=t, check=True, capture_output=True, text=True).stdout
@@ -582,7 +609,7 @@ def self_test():
         sh("git", "config", "user.name", "t")
         here_root = os.path.normpath(os.path.join(HERE, "../.."))
         for rel in ("tools/review/post.py", "tools/review/ledger.py", "tools/review/usage.py",
-                    "tools/recipes.py", "justfile", "Cargo.toml"):
+                    ".github/review/reviewer.md", "tools/recipes.py", "justfile", "Cargo.toml"):
             src = os.path.join(here_root, rel)
             if os.path.exists(src):
                 os.makedirs(os.path.dirname(os.path.join(repo, rel)), exist_ok=True)
@@ -698,6 +725,67 @@ def self_test():
                 expect(main(["--minutes", bad]) == 64, f"--minutes {bad} is refused 64 before any role")
             rc, msgs = go("no verdict here")
             expect(rc in (65,) , f"a review with no verdict ends 65: {rc} {msgs[-1:]}")
+            # a rebase: the earlier approval carries without a reviewer when every patch is the same; a changed patch is
+            # an interdiff the reviewer reads; a MUST_FIX never carries (tools/review/carry.py decides, post.py carry writes)
+            tools_id = json.load(open(os.path.join(keep, "ctx/pr.json")))["tools"]
+            topic_head = git("rev-parse", "topic").strip()
+            ran = os.path.join(t, "stub-ran")
+
+            def reviewed(verdict="CLEAN", event="APPROVE"):
+                return f"**Verdict: {verdict}**: x\n" + footer(topic_head, verdict, "", "full", "v0", "1", event, tools_id) + "\n"
+
+            def with_reviews(body):
+                def fake(*a):
+                    if a[:1] == ("pr",):
+                        return {"number": 7, "title": "t", "body": "b", "author": {"login": "me"}, "state": "OPEN"}
+                    if "--paginate" in a and a[-1].endswith("/reviews"):
+                        return [{"user": {"login": "github-actions[bot]"}, "body": body}]
+                    return None
+                return fake
+
+            def rebase_go(prev_body, amend=False):
+                sh("git", "checkout", "-q", "-B", "rebased", "topic")
+                sh("git", "rebase", "-q", "main")
+                if amend:
+                    open(os.path.join(repo, "a.txt"), "a").write("c\n")
+                    sh("git", "commit", "-qa", "--amend", "--no-edit")
+                sh("git", "update-ref", "refs/remotes/origin/main", "main")
+                if os.path.exists(ran):
+                    os.remove(ran)
+                open(stub, "w").write(f"#!/usr/bin/env bash\ntouch {ran}\nout=$5\ncat > \"$out/review.md\" <<'EOF'\n"
+                                      "**Verdict: CLEAN**: fine\nEOF\necho CLEAN > \"$out/decision.txt\"\n")
+                g["gh_json"] = with_reviews(prev_body)
+                a = argparse.Namespace(base="main", full=False, minutes=10, body=None)
+                buf = io.StringIO()
+                msgs = []
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        rc = review(a, stubbed=True, say=msgs.append)
+                except Stop as e:
+                    rc = e.code
+                k = os.path.join(t, "home/.cache/bloomery/pre-review/rebased-" + git("rev-parse", "HEAD").strip()[:8])
+                return rc, buf.getvalue(), msgs, k
+
+            rc, out, msgs, k = rebase_go(reviewed())
+            pj = json.load(open(os.path.join(k, "ctx/pr.json")))
+            expect(rc == 0 and not os.path.exists(ran) and pj["mode"] == "carry" and pj["carried_from"] == topic_head
+                   and "carry review of" in out and any("carry:" in m for m in msgs),
+                   f"a rebase that keeps every patch carries the approval and runs no reviewer: rc {rc}, mode {pj['mode']}, ran {os.path.exists(ran)}: {out!r} {msgs}")
+            expect({"carry.json", "prev-review.md"} <= set(os.listdir(os.path.join(k, "ctx"))) and "interdiff.patch" not in os.listdir(os.path.join(k, "ctx"))
+                   and "mode=carry carried_from=" + topic_head in open(os.path.join(k, "out/review.md")).read(),
+                   "a carry keeps carry.json and the earlier review, and its review's marker names the head it carries from")
+            rc, out, msgs, k = rebase_go(reviewed(), amend=True)
+            pj = json.load(open(os.path.join(k, "ctx/pr.json")))
+            expect(rc == 0 and os.path.exists(ran) and pj["mode"] == "interdiff" and pj["carried_from"] == ""
+                   and "interdiff.patch" in os.listdir(os.path.join(k, "ctx")),
+                   f"a changed patch is an interdiff the reviewer reads: rc {rc}, mode {pj['mode']}, ran {os.path.exists(ran)}: {msgs}")
+            rc, out, msgs, k = rebase_go(reviewed("MUST_FIX", "REQUEST_CHANGES"))
+            pj = json.load(open(os.path.join(k, "ctx/pr.json")))
+            expect(rc == 0 and os.path.exists(ran) and pj["mode"] == "full" and "prev-review.md" not in os.listdir(os.path.join(k, "ctx")),
+                   f"a MUST_FIX never carries: a full review runs: rc {rc}, mode {pj['mode']}, ran {os.path.exists(ran)}: {msgs}")
+            g["gh_json"] = lambda *a: None
+            sh("git", "checkout", "-q", "topic")
+            sh("git", "update-ref", "refs/remotes/origin/main", "basebr")
             # SIGTERM to local.py itself stops the role's process group (run.launch's cleanup runs on the exception)
             open(stub, "w").write(f"#!/usr/bin/env bash\n( sleep 30 & echo $! > {pidf}; wait )\n")
             os.unlink(pidf)

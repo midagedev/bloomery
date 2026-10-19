@@ -8,14 +8,16 @@
     tools/review/post.py issues --out DIR --repo OWNER/NAME --pr N
     tools/review/post.py post   --out DIR --repo OWNER/NAME --pr N
     tools/review/post.py labels --out DIR --repo OWNER/NAME --pr N
+    tools/review/post.py carry  --carry FILE --prev-review FILE --out DIR
     tools/review/post.py --self-test
 
 `check` reads what the reviewer wrote to DIR (review.md, decision.txt, optional comments.json) and rewrites it in
 place into the shape `post` sends: the decision follows the body's verdict line, inline comments that do not sit on a
 line the diff adds are dropped (GitHub refuses the whole review for one), at most MAX_COMMENTS remain, the body is cut
-to MAX_BODY characters, and the footer marker that the next run reads (head sha, verdict, counts) is appended, with a
-the slag ledger's version and the workflow run when pr.json carries them (`ledger=`, `run=`: the weekly
-learner reads the run's artifact back, tools/review/signals.py), and a
+to MAX_BODY characters, and the footer marker that the next run reads (head sha, verdict, counts, mode, the event posted) is appended, with
+the slag ledger's version, the workflow run and the reviewer's identity when pr.json carries them (`ledger=`, `run=`:
+the weekly learner reads the run's artifact back, tools/review/signals.py; `tools=`: tools/review/carry.py reviewer-id,
+which a later carry compares), and a
 second marker carrying each --usage file's accounting (tools/review/usage.py: turns, cost, context, tool calls) kept
 in DIR/usage.txt so a later check without the files keeps it. Issue candidates (issues.json: defects outside the
 diff) are kept when well formed, at most MAX_ISSUES, and with --base only when every evidence path exists there. It
@@ -39,6 +41,13 @@ OUT/labels.json: `gpu-evidence` when the reviewer's gpu.json says the pull reque
 as verified (CONTRIBUTING trusts it); `gpu-verified` is a maintainer's own run, and the bot never adds or removes it. While a release freeze is on (an open
 issue labelled FREEZE_LABEL opened by the owner; `freeze` writes its number to FILE), a `needs-gpu` pull request is
 not approved: a merge would change the tree under the release batch. `labels` applies OUT/labels.json.
+`carry` writes into DIR the review of a carried approval (tools/review/carry.py decided `carry`: the pull request's
+commits are the patches the bot approved at an earlier head, so no reviewer ran): the body, decision CLEAN, the card
+evidence the carried review had, no comments and no issues. It refuses by name unless the carried review's own marker
+says it approved (`verdict=CLEAN event=APPROVE`), so a MUST_FIX or a COMMENT never turns into an approval here. `check`
+then decides the event as for any review, with every guard recomputed on the current files and freeze; the one
+difference is that no validator line is expected (pr.json `mode` is `carry`, with the head it carries from in
+`carried_from`).
 `post` sends DIR as one pull request review with that event, using
 GH_TOKEN, with a line naming the issues `issues` filed. When GitHub refuses the inline comments (422), it posts the
 body alone and says so in the body.
@@ -211,11 +220,24 @@ def keep_issues(items, base):
     return kept[:MAX_ISSUES], dropped
 
 
-def footer(head, verdict, body, mode, ledger=None, run=None):
+def footer(head, verdict, body, mode, ledger=None, run=None, event=None, tools=None, carried_from=None):
+    """The marker the next run reads. `event` is what was posted (a carry needs an APPROVE), `tools` is carry.py's
+    reviewer-id, `carried_from` the reviewed head a `carry` review stands on."""
     must = len(re.findall(r"^#### \d+\.", body, re.M))
     warn = len(re.findall(r"^⚠", body, re.M))
-    tail = (f" ledger={ledger}" if ledger else "") + (f" run={run}" if run and str(run).isdigit() else "")
+    tail = (f" carried_from={carried_from}" if carried_from else "") + (f" event={event}" if event else "")
+    tail += (f" ledger={ledger}" if ledger else "") + (f" run={run}" if run and str(run).isdigit() else "")
+    tail += f" tools={tools}" if tools and re.fullmatch(r"[0-9a-f]{16}", str(tools)) else ""
     return f"<!-- {MARKER} head_sha={head} verdict={verdict} must_fix={must} warn={warn} mode={mode}{tail} -->"
+
+
+def parse_footer(text):
+    """{key: value} of the last `<!-- bloomery-review ... -->` marker in text, or None when there is none."""
+    found = re.findall(rf"<!-- {MARKER} ([^>]*?) -->", text or "")
+    if not found:
+        return None
+    f = dict(kv.split("=", 1) for kv in found[-1].split() if "=" in kv)
+    return f if f.get("head_sha") and f.get("verdict") else None
 
 
 def usage_marker(paths):
@@ -285,13 +307,14 @@ def card_label(paths, dirs, out):
                          "card (CONTRIBUTING's evidence list); a maintainer adds `gpu-verified` after one.")
 
 
-def event_for(verdict, decision, body, paths):
-    """("APPROVE" | "REQUEST_CHANGES" | "COMMENT", why a CLEAN review does not approve or None)."""
+def event_for(verdict, decision, body, paths, carried=False):
+    """("APPROVE" | "REQUEST_CHANGES" | "COMMENT", why a CLEAN review does not approve or None). A carried review
+    (`post.py carry`) had no model run, so it has no validator line; every other guard applies to it as to any."""
     if verdict == "MUST_FIX":
         return "REQUEST_CHANGES", None
     if decision != verdict:
         return "COMMENT", "decision.txt disagreed with the verdict line"
-    if VALIDATOR_LINE not in body:
+    if VALIDATOR_LINE not in body and not carried:
         return "COMMENT", "the validator did not finish"
     guarded = [p for p in paths if p.startswith(APPROVE_GUARD)]
     if guarded:
@@ -357,14 +380,17 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None, files_
     if notes:
         body += "\n\n<sub>" + " · ".join(notes) + "</sub>"
     usage_txt = os.path.join(out, "usage.txt")
-    marker = usage_marker(usage_paths)
+    carried = pr.get("mode") == "carry"
+    marker = "" if carried else usage_marker(usage_paths)  # a carry ran no model: it has no accounting to keep
     if marker:
         with open(usage_txt, "w", encoding="utf-8") as f:
             f.write(marker + "\n")
     elif os.path.exists(usage_txt):
         marker = open(usage_txt, encoding="utf-8").read().strip()
     paths = pr_paths(files_path, diff)
-    event, why = event_for(verdict, decision, body, paths)
+    if carried and not re.fullmatch(r"[0-9a-f]{40}", pr.get("carried_from") or ""):
+        raise Refused(65, "pr.json says mode carry without the head it carries from (carried_from)")
+    event, why = event_for(verdict, decision, body, paths, carried)
     dirs = open(device_path, encoding="utf-8").read().split() if device_path and os.path.exists(device_path) else []
     label, card_line = card_label(paths, dirs, out)
     with open(os.path.join(out, "labels.json"), "w", encoding="utf-8") as f:
@@ -384,7 +410,8 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None, files_
     if why:
         body += f"\n\n<sub>Not approved: {why}.</sub>"
     body += "\n\n" + SIGNATURE.format(repo=pr.get("repo") or "midagedev/bloomery")
-    body += "\n\n" + footer(pr["head_sha"], verdict, body, pr.get("mode", "full"), pr.get("ledger"), pr.get("run"))
+    body += "\n\n" + footer(pr["head_sha"], verdict, body, pr.get("mode", "full"), pr.get("ledger"), pr.get("run"),
+                            event, pr.get("tools"), pr.get("carried_from") if carried else None)
     if marker:
         body += "\n" + marker
     with open(os.path.join(out, "review.md"), "w", encoding="utf-8") as f:
@@ -403,6 +430,55 @@ def check(out, diff_path, pr_json, secret_env, usage_paths=(), base=None, files_
         # Issue evidence is verified in BASE_TREE, so its links point at the commit that tree was checked out at.
         f.write((pr.get("tree_sha") or pr.get("base_sha", "")) + "\n")
     return verdict, len(kept), notes
+
+
+CARD_LINE_RE = re.compile(r"<sub>Card check: `(needs-gpu|gpu-evidence)`")
+
+
+def carry_review(carry_path, prev_path, out):
+    """Write OUT for a carried approval: the files `check` reads from a reviewer, from carry.json (tools/review/carry.py
+    decide) and the review it carries. The carried review's own marker must say it approved; carry.py decides that
+    too, and this refusal keeps a wiring mistake from posting an approval that never was one."""
+    try:
+        carry = json.load(open(carry_path, encoding="utf-8"))
+        prev = open(prev_path, encoding="utf-8").read()
+    except (OSError, ValueError) as e:
+        raise Refused(65, f"unreadable input: {e}")
+    f = parse_footer(prev)
+    if carry.get("mode") != "carry":
+        raise Refused(65, f"carry.json says mode {carry.get('mode')!r}")
+    if not f or f.get("head_sha") != carry.get("prev_head"):
+        raise Refused(65, "the carried review has no marker for the head carry.json names")
+    if f.get("verdict") != "CLEAN" or f.get("event") != "APPROVE":
+        raise Refused(65, f"the carried review was {f.get('verdict')}/{f.get('event') or 'no event'}, not an "
+                          "approval; only an approval carries")
+    card = CARD_LINE_RE.search(prev)
+    prev8, head8, n = carry["prev_head"][:8], carry["head"][:8], carry.get("commits", 0)
+    moved = carry.get("main_files")
+    if carry.get("main_note"):
+        base_line = carry["main_note"]
+    elif moved:
+        base_line = ("The base moved and also changed " + ", ".join(f"`{x}`" for x in moved[:10])
+                     + (" …" if len(moved) > 10 else "") + ", which this pull request changes too. Each of its hunks "
+                     "still applies with the same context lines.")
+    elif moved is not None:
+        base_line = "The base moved, and changed none of the files this pull request changes."
+    else:
+        base_line = "The base did not move."
+    body = (f"**Verdict: CLEAN**: carried from `{prev8}`, not re-reviewed.\n\n"
+            f"The approval of `{prev8}` stands for `{head8}`. This pull request's {n} commit{'s' if n != 1 else ''} are "
+            "the same patches in the same order: `git patch-id --verbatim` (the changed lines, the lines around them "
+            "and whitespace) and the subject are equal for every commit. That review ran under the reviewer "
+            "instructions, tools and slag ledger that review this head, and it approved.\n\n"
+            f"{base_line}\n\n"
+            "A carry covers each patch's own lines and the lines around them. What the base changed elsewhere is "
+            "covered by CI on this head and by the landing gates.\n")
+    os.makedirs(out, exist_ok=True)
+    for name, text in (("review.md", body), ("decision.txt", "CLEAN\n"), ("comments.json", "[]"),
+                       ("issues.json", "[]"), ("gpu.json", json.dumps({"evidence": bool(card and card.group(1) == "gpu-evidence")}))):
+        with open(os.path.join(out, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+    return body
 
 
 def api(method, url, token, payload=None):
@@ -523,6 +599,14 @@ def self_test():
     assert footer("h", "CLEAN", "", "full", "0a1b2c").endswith("mode=full ledger=0a1b2c -->")
     assert footer("h", "CLEAN", "", "full", "0a1b2c", "123").endswith("ledger=0a1b2c run=123 -->")
     assert footer("h", "CLEAN", "", "full", None, "1 x").endswith("mode=full -->")
+    assert footer("h", "CLEAN", "", "carry", "L", "5", "APPROVE", "0123456789abcdef", "c" * 40).endswith(
+        f"mode=carry carried_from={'c' * 40} event=APPROVE ledger=L run=5 tools=0123456789abcdef -->")
+    assert "tools=" not in footer("h", "CLEAN", "", "full", tools="not-a-digest")
+    assert parse_footer("x\n" + footer("h" * 40, "CLEAN", "", "full", "L", "5", "APPROVE", "0123456789abcdef")) == {
+        "head_sha": "h" * 40, "verdict": "CLEAN", "must_fix": "0", "warn": "0", "mode": "full", "event": "APPROVE",
+        "ledger": "L", "run": "5", "tools": "0123456789abcdef"}
+    assert parse_footer("no marker") is None and parse_footer("<!-- bloomery-review-issue pr=5 -->") is None
+    assert "event" not in parse_footer("<!-- bloomery-review head_sha=ab verdict=CLEAN must_fix=0 warn=0 mode=full -->")
     diff = (
         "diff --git a/crates/x/src/a.rs b/crates/x/src/a.rs\n--- a/crates/x/src/a.rs\n+++ b/crates/x/src/a.rs\n"
         "@@ -10,3 +10,4 @@ fn f() {\n ctx\n-old\n+new1\n+new2\n ctx2\n"
@@ -585,7 +669,7 @@ def self_test():
         assert (verdict, n) == ("MUST_FIX", 1) and len(notes) == 2, (verdict, n, notes)
         posted = open(os.path.join(out, "review.md")).read()
         assert posted.rstrip().endswith(
-            "<!-- bloomery-review head_sha=abc123 verdict=MUST_FIX must_fix=1 warn=2 mode=full -->"), posted
+            "<!-- bloomery-review head_sha=abc123 verdict=MUST_FIX must_fix=1 warn=2 mode=full event=REQUEST_CHANGES -->"), posted
         assert open(os.path.join(out, "decision.txt")).read() == "MUST_FIX\n"
         # A second check (the post job repeats it) keeps one footer and one signature.
         check(out, dp, pj, [])
@@ -692,6 +776,81 @@ def self_test():
         assert posted.count("<!-- bloomery-review") == 1 and "tools=Read:20,Grep:9" in posted, posted
         assert "denied=0 engine=claude -->" in posted, posted
 
+        # A carried approval (tools/review/carry.py): no model ran, so there is no validator line; every other guard
+        # is recomputed on the current files and freeze, and only an approval carries.
+        ph, nh = "a" * 40, "b" * 40
+        cout = os.path.join(d, "cout")
+        cj, pv, cpr = os.path.join(d, "carry.json"), os.path.join(d, "prev.md"), os.path.join(d, "cpr.json")
+        cfreeze = os.path.join(d, "cfreeze.txt")
+
+        def prev_review(verdict="CLEAN", event="APPROVE", head=ph, card="gpu-evidence"):
+            return (f"**Verdict: {verdict}**: fine.\n\n<sub>Card check: `{card}`. x</sub>\n\n"
+                    + footer(head, verdict, "", "full", "0a1b2c", "9", event, "0123456789abcdef") + "\n")
+
+        def carry_json(**kw):
+            json.dump({"mode": "carry", "prev_head": ph, "head": nh, "commits": 3, "main_files": ["justfile"], **kw},
+                      open(cj, "w"))
+
+        def carried_pr(**kw):
+            json.dump({"head_sha": nh, "mode": "carry", "carried_from": ph, "ledger": "0a1b2c", "run": "10",
+                       "tools": "0123456789abcdef", **kw}, open(cpr, "w"))
+
+        open(pv, "w").write(prev_review())
+        carry_json()
+        carried_pr()
+        carry_review(cj, pv, cout)
+        assert open(os.path.join(cout, "decision.txt")).read() == "CLEAN\n"
+        assert json.load(open(os.path.join(cout, "gpu.json"))) == {"evidence": True}
+        assert json.load(open(os.path.join(cout, "comments.json"))) == [] == json.load(open(os.path.join(cout, "issues.json")))
+        for files, frz, want in (("modified\t+1\t-0\ttools/n.sh\n", "", "APPROVE"),
+                                 ("modified\t+1\t-0\ttools/n.sh\nmodified\t+1\t-0\t.github/review/reviewer.md\n", "", "COMMENT"),
+                                 ("modified\t+1\t-0\tcrates/gpu/src/a.rs\n", "#99", "APPROVE")):
+            open(fp, "w").write(files)
+            open(cfreeze, "w").write(frz)
+            for _ in range(2):  # the post job repeats the check
+                check(cout, dp, cpr, [], [os.path.join(d, "no-such.usage.json")], files_path=fp, device_path=dev, freeze_path=cfreeze)
+            text = open(os.path.join(cout, "review.md")).read()
+            assert "bloomery-usage" not in text, text
+            assert open(os.path.join(cout, "event.txt")).read().strip() == want, (files, text)
+            assert text.count("carried from `aaaaaaaa`") == 1 and "validator" not in text, text
+            assert text.rstrip().endswith(f"mode=carry carried_from={ph} event={want} ledger=0a1b2c run=10 "
+                                          "tools=0123456789abcdef -->"), text
+            os.remove(os.path.join(cout, "event.txt"))
+        # the carried review's card evidence is inherited, so a freeze holds only a needs-gpu one
+        open(pv, "w").write(prev_review(card="needs-gpu"))
+        carry_review(cj, pv, cout)
+        assert json.load(open(os.path.join(cout, "gpu.json"))) == {"evidence": False}
+        open(cfreeze, "w").write("#99")
+        check(cout, dp, cpr, [], files_path=fp, device_path=dev, freeze_path=cfreeze)
+        assert open(os.path.join(cout, "event.txt")).read().strip() == "COMMENT"
+        assert "release freeze is on (#99)" in open(os.path.join(cout, "review.md")).read()
+        for what, prev, kw in (("a MUST_FIX review", prev_review("MUST_FIX", "REQUEST_CHANGES"), {}),
+                               ("a CLEAN review that only commented", prev_review("CLEAN", "COMMENT"), {}),
+                               ("an old marker with no event", "**Verdict: CLEAN**\n<!-- bloomery-review head_sha=" + ph
+                                + " verdict=CLEAN must_fix=0 warn=0 mode=full -->\n", {}),
+                               ("a review of another head", prev_review(head="c" * 40), {}),
+                               ("no marker", "**Verdict: CLEAN**: fine.\n", {}),
+                               ("a decision that is not a carry", prev_review(), {"mode": "interdiff"})):
+            open(pv, "w").write(prev)
+            carry_json(**kw)
+            try:
+                carry_review(cj, pv, os.path.join(d, "cout2"))
+                raise AssertionError(f"{what} was carried")
+            except Refused as e:
+                assert e.code == 65, (what, e)
+        assert not os.path.exists(os.path.join(d, "cout2")), "a refused carry left output behind"
+        carried_pr(carried_from="")
+        try:
+            check(cout, dp, cpr, [], files_path=fp)
+            raise AssertionError("mode carry without carried_from was accepted")
+        except Refused as e:
+            assert e.code == 65
+        open(pv, "w").write(prev_review())
+        carry_json()
+        assert main(["post.py", "carry", "--carry", cj, "--prev-review", pv, "--out", os.path.join(d, "cout3")]) == 0
+        assert main(["post.py", "carry", "--carry", cj, "--prev-review", os.path.join(d, "nope.md"), "--out", d]) == 65
+        assert main(["post.py", "carry", "--carry", cj]) == 64
+
         base = os.path.join(d, "base")
         os.makedirs(os.path.join(base, "crates"))
         open(os.path.join(base, "crates", "a.rs"), "w").write("x")
@@ -789,7 +948,7 @@ def main(argv):
     if argv[1:] == ["--self-test"]:
         self_test()
         return 0
-    if len(argv) < 2 or argv[1] not in ("check", "device", "freeze", "issues", "post", "labels"):
+    if len(argv) < 2 or argv[1] not in ("check", "device", "freeze", "issues", "post", "labels", "carry"):
         print(__doc__, file=sys.stderr)
         return 64
     opts, secret_env, secret_files, usage, rest = {}, [], [], [], argv[2:]
@@ -820,6 +979,9 @@ def main(argv):
             dirs = device_dirs(opts["--root"])
             open(opts["--out"], "w", encoding="utf-8").write("\n".join(dirs) + "\n")
             print("device:", " ".join(dirs))
+        elif argv[1] == "carry":
+            carry_review(opts["--carry"], opts["--prev-review"], opts["--out"])
+            print(f"carry: wrote {opts['--out']}")
         else:
             token = os.environ.get("GH_TOKEN", "")
             if not token:

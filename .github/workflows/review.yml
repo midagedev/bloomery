@@ -15,6 +15,10 @@
 # - The engine: REVIEW_ENGINE (a repository variable; claude when unset) is tried first and the other engine is the
 #   fallback, each only when its login is there (tools/review/run.py). With no engine able to review, the run ends
 #   without a review and says why in the summary.
+# - A rebase does not make a new review of the same patches (tools/review/carry.py): when the new head's commits are the
+#   patches the bot approved, the approval carries and no model runs (mode=carry); when some changed, the reviewer reads
+#   only those (mode=interdiff). The reviewer's own tree ids and the ledger version in the earlier review's marker must
+#   equal today's, and only an approval carries. A replacement pull request names the one it replaces ("Supersedes #N").
 # - The logins and the write token never share a job: `review` holds ANTHROPIC_API_KEY and the Codex login
 #   (CODEX_AUTH_JSON, written to a file outside the trees) with a read-only token, `post` holds pull-requests and
 #   issues write and no login. post.py refuses to post output that carries a login or a token-shaped string, and
@@ -43,7 +47,7 @@ env:
   CODEX_VERSION: 0.160.0
   REVIEW_CODEX_MODEL: gpt-6.1-sol
   REVIEW_ENGINE: ${{ vars.REVIEW_ENGINE || 'claude' }}
-  # The automatic reviews a pull request gets before it needs a workflow_dispatch run.
+  # The automatic reviews a pull request gets before it needs a workflow_dispatch run (a carry is not one: no model ran).
   REVIEW_CAP: 5
 
 jobs:
@@ -83,7 +87,7 @@ jobs:
           # The bot's earlier reviews carry a footer marker with the head they reviewed.
           gh api --paginate "repos/$REPO/pulls/$PR/reviews" \
             --jq '.[] | select(.user.login == "github-actions[bot]") | .body' > prev-bodies.txt || true
-          count=$(grep -c '<!-- bloomery-review head_sha=' prev-bodies.txt || true)
+          count=$(grep '<!-- bloomery-review head_sha=' prev-bodies.txt | grep -vc ' mode=carry ' || true)
           prev=$(grep -o '<!-- bloomery-review head_sha=[0-9a-f]*' prev-bodies.txt | tail -1 | sed 's/.*head_sha=//' || true)
           run=true; why=""
           if [ "$state" != open ]; then run=false; why="the pull request is $state"; fi
@@ -217,6 +221,7 @@ jobs:
           name: diagnostics
           path: ctx-diag
       - name: Build the review context
+        id: ctx
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -224,6 +229,7 @@ jobs:
           HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
           PREV_SHA: ${{ needs.gate.outputs.prev_sha }}
           TREE_SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
           # tools/recipes.py reads the workspace with `cargo metadata --offline`, which stable does; without this,
           # rust-toolchain.toml would install the pinned nightly and its components first.
           RUSTUP_TOOLCHAIN: stable
@@ -231,38 +237,68 @@ jobs:
           set -euo pipefail
           mkdir -p ctx out trace
           gh api "repos/$REPO/pulls/$PR" > ctx/pr-full.json
+          base_ref=$(jq -r .base.ref ctx/pr-full.json)
+          # The slag ledger's lessons in force (tools/review/ledger.py); its version goes into the footer marker.
+          ledger=$(python3 base/tools/review/ledger.py accepted --repo "$REPO" --out ctx/ledger.md)
+          # What the review runs under that a PR cannot change (tools/review/carry.py); also in the footer marker.
+          tools=$(python3 base/tools/review/carry.py reviewer-id --root base)
+          # A replacement pull request ("Supersedes #N", the same author) starts from the last review of #N. A dispatched
+          # run is a full review and starts from nothing.
+          prev_pr=$PR
+          if [ -z "$PREV_SHA" ] && [ "$EVENT" != workflow_dispatch ]; then
+            sup=$(python3 base/tools/review/carry.py supersedes --repo "$REPO" --pr-json ctx/pr-full.json || echo "none carry.py supersedes failed")
+            if [ -n "$sup" ]; then echo "supersedes: $sup" | tee -a "$GITHUB_STEP_SUMMARY"; fi
+            case "$sup" in ok\ *) read -r _ PREV_SHA prev_pr <<< "$sup" ;; esac
+          fi
           mode=full
-          # An incremental review only when the last reviewed head is an ancestor of this one (a force-push is full).
+          carried=""
           if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$HEAD_SHA" ]; then
+            gh api --paginate "repos/$REPO/pulls/$prev_pr/reviews?per_page=100" \
+              --jq '[.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("<!-- bloomery-review head_sha='"$PREV_SHA"'"))] | last | .body' > prev-review.md
             status=$(gh api "repos/$REPO/compare/$PREV_SHA...$HEAD_SHA" --jq .status 2>/dev/null || echo error)
             if [ "$status" = ahead ]; then
+              # The last reviewed head is an ancestor of this one: only the commits since.
               gh api "repos/$REPO/compare/$PREV_SHA...$HEAD_SHA" -H 'Accept: application/vnd.github.diff' > ctx/diff.patch
-              gh api --paginate "repos/$REPO/pulls/$PR/reviews" \
-                --jq '[.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("<!-- bloomery-review head_sha='"$PREV_SHA"'"))] | last | .body' > ctx/prev-review.md
+              cp prev-review.md ctx/prev-review.md
               mode=incremental
+            else
+              # A rebase or a replacement: carry the approval, read the interdiff, or review it all (carry.py says why).
+              # It leaves ctx/carry.json, and ctx/prev-review.md and ctx/interdiff.patch for the modes that read them.
+              if ! line=$(python3 base/tools/review/carry.py decide --repo "$REPO" --head "$HEAD_SHA" --prev "$PREV_SHA" \
+                    --prev-pr "$prev_pr" --prev-review prev-review.md --base-ref "$base_ref" --ledger "$ledger" --tools "$tools" --out ctx); then
+                line="full: carry.py decide failed (see the log); a full review runs"
+              fi
+              echo "carry: $line" | tee -a "$GITHUB_STEP_SUMMARY"
+              mode=${line%%:*}
+              if [ "$mode" = carry ]; then carried=$PREV_SHA; fi
             fi
           fi
-          if [ "$mode" = full ]; then
+          if [ "$mode" != incremental ]; then
             gh api "repos/$REPO/pulls/$PR" -H 'Accept: application/vnd.github.diff' > ctx/diff.patch
           fi
           gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | "\(.status)\t+\(.additions)\t-\(.deletions)\t\(.filename)"' > ctx/files.txt
           gh api --paginate "repos/$REPO/issues?labels=review-bot&state=open&per_page=100" --jq '.[] | "#\(.number) \(.title)"' > ctx/open-issues.txt
           # The crates a card must check (tools/recipes.py pure-crates on the trusted tree), for the card label.
           python3 base/tools/review/post.py device --root base --out ctx/device-dirs.txt
-          # The slag ledger's lessons in force (tools/review/ledger.py); its version goes into the footer marker.
-          ledger=$(python3 base/tools/review/ledger.py accepted --repo "$REPO" --out ctx/ledger.md)
           # tree_sha: the commit BASE_TREE is checked out at, which issue evidence links point into.
           jq --arg mode "$mode" --arg repo "$REPO" --arg tree "$TREE_SHA" --arg ledger "$ledger" --arg run "$GITHUB_RUN_ID" \
+            --arg tools "$tools" --arg carried "$carried" \
             '{number, title, body, author: .user.login, repo: $repo, base_sha: .base.sha, head_sha: .head.sha,
-              tree_sha: $tree, mode: $mode, ledger: $ledger, run: $run}' ctx/pr-full.json > ctx/pr.json
+              tree_sha: $tree, mode: $mode, ledger: $ledger, run: $run, tools: $tools, carried_from: $carried}' ctx/pr-full.json > ctx/pr.json
           rm ctx/pr-full.json
+          # A carry has no reviewer: post.py writes its review, and the check below decides the event as for any review.
+          if [ "$mode" = carry ]; then
+            python3 base/tools/review/post.py carry --carry ctx/carry.json --prev-review ctx/prev-review.md --out out
+          fi
           if [ -f ctx-diag/diagnostics.md ]; then cp ctx-diag/diagnostics.md ctx/; else
             echo "The diagnostics job did not finish; no dryer or crapper results for this review." > ctx/diagnostics.md; fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "context: mode=$mode diff=$(wc -l < ctx/diff.patch) lines files=$(wc -l < ctx/files.txt)" | tee -a "$GITHUB_STEP_SUMMARY"
       # The logins: each secret is read in this step only. The Codex login becomes CODEX_HOME/auth.json, outside the
       # trees and OUT, and every long string in it is masked in the log; the cleanup step below deletes it.
       - name: Logins
         id: logins
+        if: steps.ctx.outputs.mode != 'carry'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
@@ -286,6 +322,7 @@ jobs:
           printf 'claude=%s\ncodex=%s\n' "$claude" "$codex" >> "$GITHUB_OUTPUT"
           echo "logins: claude=$claude codex=$codex; tried first: $REVIEW_ENGINE" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/cache@v4
+        if: steps.ctx.outputs.mode != 'carry'
         with:
           path: ~/.npm
           key: npm-claude-code-${{ env.CLAUDE_CODE_VERSION }}-codex-${{ env.CODEX_VERSION }}
@@ -312,6 +349,7 @@ jobs:
       # job without a review and with a warning instead of failing it.
       - name: Review
         id: review
+        if: steps.ctx.outputs.mode != 'carry'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
@@ -347,7 +385,7 @@ jobs:
           exit "$rc"
       - name: Check the output
         id: check
-        if: steps.validate.outputs.done == 'true'
+        if: steps.validate.outputs.done == 'true' || steps.ctx.outputs.mode == 'carry'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CODEX_HOME: ${{ runner.temp }}/codex-home
@@ -398,6 +436,8 @@ jobs:
             ctx/pr.json
             ctx/files.txt
             ctx/device-dirs.txt
+            ctx/carry.json
+            ctx/interdiff.patch
           retention-days: 90   # the learner reads removed.json, lessons.json and aims.json back (tools/review/signals.py)
 
   post:
