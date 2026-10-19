@@ -764,6 +764,21 @@ build-ref-hidden:
 dump-hidden-qwen35 *SETS:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/hidden.sh {{SETS}}'
 
+# The dense Qwen3.8-27B (qwen38d: general.architecture qwen35, lmstudio's Q4_K_M) logits oracle's binary: dense_logits_ref
+# (tools/ref/dense_logits_ref.cpp) linked against llama.cpp mainline's build in the qwen35 profile's tree, which
+# tools/ref/emb2/oracle-tree.sh proves is the pinned commit's build (nothing is built in the tree); into target/release of the
+# box's directory, where tools/gpu-gate.sh runs it (tools/ref/build-dense-logits.sh).
+build-dense-logits-ref:
+    BLOOMERY_MODEL=qwen38d ./tools/box.sh 'bash tools/ref/build-dense-logits.sh'
+
+# The qwen38d logits oracle sets (tools/ref/dense-logits.sh): mainline's logits after the first 64 and 4,096 prose ids and after
+# each of the 32 ids that follow them (teacher forced), into $BLOOMERY_DATA/ref_qwen38d_logits_p{64,4096}/ (refset family
+# logits-qwen38d). Each dump puts the whole file on the card (the A6000 unless BLOOMERY_CARD says otherwise; its gate lock); no
+# lease (a functional oracle). `--cpu-twin` writes each set's CPU twin into <set>.cpu/ instead (no card, 16 threads): the oracle's
+# own floor a gate's band is derived from (`python3 tools/ref/dense-logits.py floor <set>`).
+dump-logits-qwen38d *SETS:
+    case " {{SETS}} " in *" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL=qwen38d ./tools/box.sh 'bash tools/ref/dense-logits.sh {{SETS}}'
+
 # Clef-Flash image input, the oracle's binary: dump_mtmd (tools/ref/clefvis/dump_mtmd.cpp) linked against llama.cpp mainline's libmtmd in the qwen35 profile's tree (tools/ref/clefvis/build-clefvis.sh).
 build-clefvis-ref:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'

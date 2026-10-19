@@ -5,10 +5,12 @@ The native diagnostic extends the existing `generate_qwen3moe` loop over
 `app::Session<Body35>` server path. `tools/ref/dense_logits_ref.cpp` independently reads the
 same model with mainline llama.cpp. `dense-logits.py` builds the reference,
 captures immutable input/build identities, runs either binary with bounds, and
-compares completed raw rows. These are diagnostic tools. A registered dense
-reference family, numerical acceptance band and full A6000 serving gates remain
-separate work; a successful dump or a comparison without a band is not a model
-correctness gate.
+compares completed raw rows. A `--kind reference` run on the pinned mainline tree
+is the one writer of the registered reference family `logits-qwen38d`
+(`crates/refset/src/arch/qwen35/dense.rs`, `just dump-logits-qwen38d`); `floor`
+prints that oracle's own spread. The numerical acceptance band and the full A6000
+serving gates remain separate work; a successful dump or a comparison without a
+band is not a model correctness gate.
 
 ## Dependency and review boundary
 
@@ -107,8 +109,9 @@ tools. An out-of-vocabulary id is refused, not clamped.
 `logits.0.f32` is `[N,248320]` IEEE754 f32, little-endian, contiguous by row. The
 raw file's `.meta` sidecar is written after the last finite row and successful
 flush (native) or close (reference). The runner verifies the sidecar's ids/shape,
-then writes the diagnostic `MANIFEST.tsv` with model SHA, prompt/continuation SHA, native and reference
-commits, binary SHA, context, prefill, KV and the raw-file digest. Only a successful
+then writes the set's `MANIFEST.tsv` (format `bloomery-forced-logits-v2`: the node dumps' `# model`, `# build` and
+`# arch` lines and one `tensor` row, so a refset family reads it) with model SHA, prompt/continuation SHA, native and
+reference commits, binary SHA, context, prefill schedule, KV and the raw-file digest. Only a successful
 run publishes its files to an exclusively created output directory, with the
 complete manifest last; existing output is refused. Failed command output and
 exit status stay in the incomplete staging directory.
@@ -136,7 +139,10 @@ configured shared-library build. The harness has been compiled against commit
 CUDA build flags. If configuring a new build, use that checkout's documented
 CMake invocation with `GGML_CUDA=ON` and `BUILD_SHARED_LIBS=ON`. The helper runs
 the normal incremental `llama`/`ggml` build before linking, validates the source
-directory and build-info commit, and records every shared library's SHA:
+directory and build-info commit, and records the SHA of the `libllama` and `libggml*`
+libraries the harness loads. (The maintainers' box builds nothing in its oracle tree:
+`just build-dense-logits-ref` passes `--pin <full commit>`, which proves the existing build
+with `tools/ref/emb2/oracle-tree.sh` instead.)
 
 ```sh
 python3 tools/ref/dense-logits.py build \
@@ -226,6 +232,10 @@ then reports per-row max absolute error, relative L2 and argmax. It intentionall
 has no numeric pass band: derive one using the activation formats and reference
 backend spread before making it a correctness gate. Reference CPU versus CUDA
 is likewise a diagnostic floor, not equality. A zero norm is reported explicitly.
+`python3 tools/ref/dense-logits.py floor <reference CUDA set>...` prints that floor for the
+registered sets: per row the relative L2 of mainline's CUDA rows against the CPU twin
+beside the set (`<set>.cpu`, `just dump-logits-qwen38d --cpu-twin`), the argmax agreement, the
+top-2 margins and each row's derived stable margin, which a gate's band is derived from.
 
 ## Same-seat HTTP/CLI diagnostics
 
@@ -260,9 +270,10 @@ outside this fixed-id greedy diagnostic.
 
 ## Remaining acceptance work
 
-- Register a dedicated exact-file dense reference family and gate; keep the
-  existing Clef and routed Qwen sets intact. Preserve unsupported-tool-parser
-  coverage until that optional feature has its own implementation and gate.
+- The dedicated exact-file dense reference family `logits-qwen38d` is registered;
+  its gate and band are still to come. Keep the existing Clef and routed Qwen
+  sets intact. Preserve unsupported-tool-parser coverage until that optional
+  feature has its own implementation and gate.
 - Run the same-seat HTTP/CLI diagnostics at short and 4K prompts, then sampling,
   reset, recurrent checkpoint/prefix reuse and resident-slot isolation. The CLI
   comparison needs its existing `--last-step` cut.

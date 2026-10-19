@@ -6,11 +6,15 @@
 //! Q8_0 file [`MODEL_FLASH_Q8`], [`HIDDEN_LEV`] from lev's Q4_K_M file
 //! [`MODEL_LEV`] (Qwen3.5-4B, its head tied to the token embedding) — one
 //! family a file, so a set of one is refused by name where another is read.
+//! The dense Qwen3.8-27B is the same architecture with a file and a kind of set
+//! of its own: [`dense::LOGITS`], mainline's logits rows after a prompt and
+//! after each forced id.
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
 pub mod clefvis;
+pub mod dense;
 
 /// The file every qwen35 set is dumped from and the tree runs: Clef's text
 /// backbone through mainline's converter and `llama-quantize` Q4_K_M.
@@ -121,6 +125,7 @@ pub static FAMILIES: &[&Family] = &[
     &HIDDEN,
     &HIDDEN_FLASH_Q8,
     &HIDDEN_LEV,
+    &dense::LOGITS,
     &clefvis::PREPROC,
     &clefvis::TAPS,
     &clefvis::HIDDEN,

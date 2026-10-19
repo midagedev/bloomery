@@ -1,7 +1,8 @@
-// Diagnostic forced-prefix logits from mainline llama.cpp, one f32 row per requested continuation id.
+// Forced-prefix logits from mainline llama.cpp, one f32 row per requested continuation id.
 // Row 0 follows the whole prompt; row i > 0 follows forced[i-1]. The final forced id is not fed.
-// The Python runner verifies identities and installs the complete diagnostic bundle. This writer is
-// not a registered reference family or a numerical gate. --validate-inputs opens no model or device.
+// tools/ref/dense-logits.py verifies the identities and installs the complete set: with its manifest this is the
+// writer of the refset family logits-qwen38d (crates/refset/src/arch/qwen35/dense.rs). The raw rows and their
+// sidecar are not a set until that runner has written the manifest. --validate-inputs opens no model or device.
 
 #include "llama.h"
 #include "gguf.h"
@@ -79,6 +80,10 @@ static Options options(int argc, char ** argv) {
     if (o.prefill != "step" && o.prefill != "batch") throw std::runtime_error("--prefill is step or batch");
     return o;
 }
+
+// A named deleter: gcc rejects (-Werror=ignored-attributes) decltype(&std::fclose) as a template argument.
+struct Closer { void operator()(FILE * f) const { if (f) std::fclose(f); } };
+using File = std::unique_ptr<FILE, Closer>;
 
 struct Batch {
     llama_batch value;
@@ -164,7 +169,7 @@ static int run(int argc, char ** argv) {
         decode(ctx.get(), batch, prompt.data(), prefix, 0);
     }
     decode(ctx.get(), batch, &prompt.back(), 1, prefix);
-    std::unique_ptr<FILE, decltype(&std::fclose)> raw(std::fopen(o.out.c_str(), "wbx"), std::fclose);
+    File raw(std::fopen(o.out.c_str(), "wbx"));
     if (!raw) throw std::runtime_error("cannot create raw output");
     static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559, "requires IEEE754 f32");
     std::vector<unsigned char> bytes(size_t(vocab) * 4);
@@ -189,7 +194,7 @@ static int run(int argc, char ** argv) {
     put_ids(meta, "forced_ids", forced);
     meta << "complete\ttrue\n";
     const auto content = meta.str();
-    std::unique_ptr<FILE, decltype(&std::fclose)> metadata(std::fopen(temporary.c_str(), "wx"), std::fclose);
+    File metadata(std::fopen(temporary.c_str(), "wx"));
     if (!metadata || std::fwrite(content.data(), 1, content.size(), metadata.get()) != content.size()) throw std::runtime_error("cannot write metadata");
     if (std::fclose(metadata.release()) != 0 || ::link(temporary.c_str(), (o.out + ".meta").c_str()) != 0) throw std::runtime_error("cannot complete metadata without replacement");
     if (::unlink(temporary.c_str()) != 0) throw std::runtime_error("cannot remove metadata staging name");

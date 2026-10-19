@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""Build/run immutable dense-Qwen forced-logit diagnostics; compare without an invented accuracy band.
+"""Build/run immutable dense-Qwen forced-logit sets; compare them without an invented accuracy band.
 
-The bundles use the existing MANIFEST.tsv reader, but are diagnostic captures, not a registered
-reference family or a passing dense GPU gate. `compare --bitwise` checks native eager/graph equality
-only. `--self-test` checks malformed/incomplete inputs and comparison contracts without a GPU.
+A set is a node-dump `MANIFEST.tsv` (tools/bloomery/manifest.py here, crates/refset there) with the
+rows in `logits.0.f32` and the ids it was fed. A `--kind reference` run is the one writer of the
+refset family `logits-qwen38d` (crates/refset/src/arch/qwen35/dense.rs; `just dump-logits-qwen38d`
+drives it through tools/ref/dense-logits.sh): its `# model`, `# build` and `# arch` lines are what the
+family checks. A `--kind native` run is a comparison capture and is no family's set. `compare --bitwise`
+checks native eager/graph equality only; `floor` prints the oracle's own spread (mainline CUDA against
+its CPU twin) and the top-2 margins the gates' bands are derived from. `--self-test` checks the
+malformed/incomplete inputs and the comparison contracts without a GPU.
 """
 import argparse
 import array
 import hashlib
+import heapq
 import importlib.util
+import io
 import json
 import math
 import os
@@ -47,6 +54,15 @@ TARGETS = {
     },
 }
 
+# A set's MANIFEST.tsv format, and the raw rows' sidecar format the two writers (dense_logits_ref.cpp,
+# generate_qwen3moe --logit-rows) leave beside logits.0.f32; the runner turns the second into the first.
+MANIFEST_FORMAT = "bloomery-forced-logits-v2"
+RAW_FORMAT = "bloomery-forced-logits-v1"
+# The `op` the set's one tensor row carries: the rows are no graph node of any engine.
+LOGITS_OP = "FORCED_LOGITS"
+# What the library check of a pinned build and a run records of mainline's build directory: the libraries the harness loads.
+LIBRARY_GLOBS = ("libllama.so*", "libggml*.so*")
+
 
 def digest(path):
     with Path(path).open("rb") as src:
@@ -76,7 +92,8 @@ def command(args, **kwargs):
 
 
 def git(tree, *args):
-    return command(["git", "-C", tree, *args])
+    # safe.directory: a tree another account owns (the box's mainline checkouts) is read, never trusted blind.
+    return command(["git", "-c", f"safe.directory={tree}", "-C", tree, *args])
 
 
 def clean_head(tree):
@@ -99,11 +116,28 @@ def token_ids(path, vocab=248320):
     return [int(line) for line in lines]
 
 
+def oracle_tree_proof(tree, pin):
+    """tools/ref/emb2/oracle-tree.sh's check of a pinned oracle tree: HEAD is the pin, no tracked change, and the
+    libllama.so its llama-tokenize loads lies under the tree's build and is newer than every tracked source. It reads
+    the tree and builds nothing in it."""
+    script = ROOT / "tools/ref/emb2/oracle-tree.sh"
+    done = subprocess.run(["bash", "-c", 'source "$1" && oracle_tree dense-logits "$2" "$3" llama-tokenize', "_",
+                           str(script), str(tree), pin], capture_output=True, text=True, timeout=300)
+    if done.returncode:
+        raise ValueError(done.stderr.strip() or f"oracle_tree refused {tree} (rc {done.returncode})")
+
+
 def build(args):
     tree, folder = args.llama_tree.resolve(), args.llama_build.resolve()
+    if args.pin and args.cached_libraries:
+        raise ValueError("--pin proves the build itself; it does not combine with --cached-libraries")
     commit = clean_head(tree)
     remote = git(tree, "remote", "get-url", "origin")
-    if not re.fullmatch(r"(?:https://github.com/|git@github.com:)(?:ggml-org|ggerganov)/llama\.cpp(?:\.git)?", remote):
+    if args.pin:
+        # A pin is a full commit hash: the content, whatever the checkout's remote is called.
+        if not re.fullmatch(r"[0-9a-f]{40}", args.pin) or commit != args.pin:
+            raise ValueError(f"{tree} is at {commit}, the profile pins {args.pin}")
+    elif not re.fullmatch(r"(?:https://github.com/|git@github.com:)(?:ggml-org|ggerganov)/llama\.cpp(?:\.git)?", remote):
         raise ValueError("reference source origin is not the official llama.cpp repository")
     cache = (folder / "CMakeCache.txt").read_text()
     if f"CMAKE_HOME_DIRECTORY:INTERNAL={tree}" not in cache:
@@ -113,11 +147,14 @@ def build(args):
     if not built_commit or not commit.startswith(built_commit[1]):
         raise ValueError("llama build-info commit differs from the clean source tree")
     build_command = [args.cmake, "--build", str(folder), "--parallel", "2", "--target", "llama", "ggml"]
-    if not args.cached_libraries:
+    if args.pin:
+        # The pinned tree is the one the depth runners time: nothing is built in it, its build is proven.
+        oracle_tree_proof(tree, args.pin)
+    elif not args.cached_libraries:
         subprocess.run(build_command, check=True, timeout=args.build_bound)
         if clean_head(tree) != commit:
             raise ValueError("reference source changed during incremental build")
-    libs = sorted({p.resolve() for p in (folder / "bin").glob("lib*.so*") if p.is_file()})
+    libs = sorted({p.resolve() for pattern in LIBRARY_GLOBS for p in (folder / "bin").glob(pattern) if p.is_file()})
     if not libs:
         raise ValueError("no shared reference libraries in build/bin")
     output = args.out.resolve()
@@ -143,9 +180,12 @@ def build(args):
               "libraries": library_hashes,
               "cuda_build": "GGML_CUDA:BOOL=ON" in cache,
               "hip_build": "GGML_HIP:BOOL=ON" in cache,
-              "libraries_rebuilt": not args.cached_libraries,
-              "library_build_command": build_command if not args.cached_libraries else None,
-              "library_source_proof": ("successful_incremental_build" if not args.cached_libraries
+              "pin": args.pin,
+              "libraries_rebuilt": not (args.cached_libraries or args.pin),
+              "library_build_command": build_command if not (args.cached_libraries or args.pin) else None,
+              "library_source_proof": ("oracle_tree: HEAD is the pin, no tracked change, the loaded libllama.so newer than every source"
+                                       if args.pin else
+                                       "successful_incremental_build" if not args.cached_libraries
                                        else "cached_library_hashes_only_source_build_not_proven"),
               "cmake_cache_sha256": digest(folder / "CMakeCache.txt")}
     tmp.rename(output)
@@ -294,7 +334,7 @@ def read_meta(path):
         if len(pair) != 2 or pair[0] in fields:
             raise ValueError(f"{path}: duplicate or malformed metadata line")
         fields[pair[0]] = pair[1]
-    if fields.get("format") != "bloomery-forced-logits-v1" or fields.get("dtype") != "float32-le":
+    if fields.get("format") != RAW_FORMAT or fields.get("dtype") != "float32-le":
         raise ValueError(f"{path}: unsupported raw-logit format")
     if fields.get("complete") != "true" or fields.get("last_step") != "true":
         raise ValueError(f"{path}: incomplete rows or a different prompt cut")
@@ -316,64 +356,101 @@ def raw_rows(path, rows, vocab):
     return values
 
 
+def corpus_slice(path, sha256, count, vocab):
+    """The first `count` ids of a corpus file, one decimal id a line and any length; `sha256` is the file's pinned digest."""
+    if digest(path) != sha256:
+        raise ValueError(f"{path}: sha256 differs from the pinned corpus digest {sha256}")
+    ids = []
+    with Path(path).open() as stream:
+        for line in stream:
+            text = line.rstrip("\n")
+            if not re.fullmatch(r"[0-9]+", text) or int(text) >= vocab:
+                raise ValueError(f"{path}:{len(ids) + 1}: not one decimal id in [0,{vocab})")
+            ids.append(int(text))
+            if len(ids) == count:
+                return ids
+    raise ValueError(f"{path}: holds {len(ids)} ids, {count} wanted")
+
+
 def finish_bundle(stage, identity, meta):
+    """Write the set's MANIFEST.tsv last: the node dumps' header (`# model`, `# build`, `# arch` are what a family
+    checks), the one tensor row, and the `# complete` trailer."""
     raw = stage / "logits.0.f32"
     n, vocab = int(meta["rows"]), int(meta["vocab"])
-    raw_rows(raw, n, vocab)
+    values = raw_rows(raw, n, vocab)
     identity.update({"rows": str(n), "vocab": str(vocab), "raw_sha256": digest(raw),
-                     "mode": meta["mode"], "prefill": meta["prefill"], "last_step": "true"})
-    lines = ["# Dense forced-logit diagnostic; no numerical accuracy gate"]
+                     "mode": meta["mode"], "schedule": meta["prefill"], "last_step": "true"})
+    title = {"reference": "# dense_logits_ref - llama.cpp mainline logits after the prompt and after each forced id",
+             "native": "# generate_qwen3moe - bloomery logits after the prompt and after each forced id; a comparison capture, no family's set"}
+    lines = [title[identity["engine"]]]
     for key, value in identity.items():
         text = str(value)
         if any(c in text for c in "\r\n\t"):
             raise ValueError(f"metadata {key} contains a line separator")
         lines.append(f"# {key}\t{text}")
-    lines += ["# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\top",
-              f"tensor\tlogits\t0\tf32\t{vocab}\t{n}\t1\t1\t{n * vocab * 4}\tDIAGNOSTIC",
+    lines += ["# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1",
+              f"tensor\tlogits\t0\tf32\t{vocab}\t{n}\t1\t1\t{n * vocab * 4}\t{math.fsum(values)!r}\t{LOGITS_OP}\t1\t0\t-\t-",
               "# complete\t1\t0"]
     (stage / "MANIFEST.tsv").write_text("\n".join(lines) + "\n")
 
 
 def run(args):
     target = TARGETS[args.target]
+    native = args.kind == "native"
     model, binary, output = args.model.resolve(), args.binary.resolve(), args.out.resolve()
-    model_stat = immutable_model(model, target)
-    prompt, forced = token_ids(args.prompt), token_ids(args.forced)
+    corpus = {}
+    if args.corpus:
+        if args.prompt or args.forced or not args.prompt_count or not args.forced_count or not args.corpus_sha256:
+            raise ValueError("--corpus takes --corpus-sha256, --prompt-count and --forced-count, and no --prompt or --forced")
+        ids = corpus_slice(args.corpus, args.corpus_sha256, args.prompt_count + args.forced_count, target["vocab"])
+        prompt, forced = ids[:args.prompt_count], ids[args.prompt_count:]
+        corpus = {"tokens_file": str(args.corpus.resolve()), "tokens_file_sha256": args.corpus_sha256,
+                  "tokens_count": str(len(ids))}
+    else:
+        if not args.prompt or not args.forced or args.prompt_count or args.forced_count or args.corpus_sha256:
+            raise ValueError("a run takes --prompt and --forced, or --corpus with its digest and counts")
+        prompt, forced = token_ids(args.prompt, target["vocab"]), token_ids(args.forced, target["vocab"])
     if len(forced) > 4096 or len(prompt) + len(forced) > args.ctx:
         raise ValueError("context does not hold prompt plus continuation, or more than 4096 rows")
     if args.ctx < 1 or args.ubatch < 1:
         raise ValueError("context and ubatch must be positive")
+    model_stat = immutable_model(model, target)
     stage = Path(str(output) + ".staging")
     if output.exists() or stage.exists():
         raise ValueError("output or staging directory already exists; use a new output directory")
-    source_head = git(ROOT, "rev-parse", "HEAD")
-    source_dirty = bool(git(ROOT, "status", "--porcelain", "--untracked-files=normal"))
-    if args.kind == "native" and source_dirty:
+    # A native run is attributed to this checkout's commit; a reference run to mainline's, which its build record names
+    # (the box's copy of this tree carries no .git).
+    source_head = git(ROOT, "rev-parse", "HEAD") if native else None
+    source_dirty = bool(git(ROOT, "status", "--porcelain", "--untracked-files=normal")) if native else None
+    if native and source_dirty:
         raise ValueError("native source has tracked changes; commit and rebuild before attribution")
     driver_sha = digest(__file__)
     binary_sha = digest(binary)
-    build_info = (check_build(binary, args.backend) if args.kind == "reference"
-                  else check_native_build(binary, source_head))
-    if args.kind == "native" and args.backend != "cuda":
+    build_info = check_native_build(binary, source_head) if native else check_build(binary, args.backend)
+    if native and args.backend != "cuda":
         raise ValueError("the current native generator is CUDA only")
-    if args.kind == "reference" and args.prefill not in ("step", "batch"):
+    if not native and args.prefill not in ("step", "batch"):
         raise ValueError("reference prefill is step or batch")
-    if args.kind == "native" and args.prefill not in ("pass", "auto", "gemm"):
+    if native and args.prefill not in ("pass", "auto", "gemm"):
         raise ValueError("native prefill is pass, auto or gemm")
     if args.backend == "cuda" and binary.parent != (ROOT / "target/release").resolve():
         raise ValueError("CUDA binaries must be in this checkout's target/release for gpu-gate.sh")
     stage.mkdir(parents=True)
-    shutil.copyfile(args.prompt, stage / "prompt.ids")
-    shutil.copyfile(args.forced, stage / "forced.ids")
+    if corpus:
+        for name, values in (("prompt.ids", prompt), ("forced.ids", forced)):
+            (stage / name).write_text("".join(f"{i}\n" for i in values))
+    else:
+        shutil.copyfile(args.prompt, stage / "prompt.ids")
+        shutil.copyfile(args.forced, stage / "forced.ids")
     # Re-read the snapshots: the source files may have moved while the model digest was checked.
-    if token_ids(stage / "prompt.ids") != prompt or token_ids(stage / "forced.ids") != forced:
+    if token_ids(stage / "prompt.ids", target["vocab"]) != prompt or token_ids(stage / "forced.ids", target["vocab"]) != forced:
         raise ValueError("input ids changed before their snapshot")
     raw = stage / "logits.0.f32"
     env = os.environ.copy()
     env.update({"BLOOMERY_REF_MODEL": str(model), "BLOOMERY_DRAFT": "off",
                 "BLOOMERY_QWEN3_UBATCH": str(args.ubatch), "BLOOMERY_QWEN3_KV": "f16",
                 "BLOOMERY_GATE_BOUND": "900"})
-    if args.kind == "reference":
+    if not native:
         argv = [str(binary), "--model", str(model), "--prompt-file", str(stage / "prompt.ids"),
                 "--forced-file", str(stage / "forced.ids"), "--out", str(raw),
                 "--ctx", str(args.ctx), "--ubatch", str(args.ubatch), "--prefill", args.prefill,
@@ -400,9 +477,10 @@ def run(args):
                "effective_environment": {key: value for key, value in env.items() if key.startswith("BLOOMERY_")},
                "CUDA_VISIBLE_DEVICES_before_gate": env.get("CUDA_VISIBLE_DEVICES"),
                "BLOOMERY_GATE_CARD": env.get("BLOOMERY_GATE_CARD")})
+    bound = args.bound or (2800 if args.backend == "cuda" else 900)
     try:
         with (stage / "run.log").open("w") as log:
-            result = bounded_run(argv, env, log, 2800 if args.backend == "cuda" else 900)
+            result = bounded_run(argv, env, log, bound)
         write_json(stage / "exit.json", {"exit_code": result})
         if result:
             raise ValueError(f"diagnostic exited {result}; incomplete evidence retained at {stage}")
@@ -410,30 +488,31 @@ def run(args):
         write_json(stage / "exit.json", {"exit_code": 124, "timeout": True})
         raise ValueError(f"diagnostic timed out; incomplete evidence retained at {stage}") from None
     meta = read_meta(str(raw) + ".meta")
-    if meta["mode"] != (args.mode if args.kind == "native" else "reference") or meta["prefill"] != args.prefill:
+    if meta["mode"] != (args.mode if native else "reference") or meta["prefill"] != args.prefill:
         raise ValueError("writer returned a different mode or prefill schedule")
     if meta["prompt_ids"] != ",".join(map(str, prompt)) or meta["forced_ids"] != ",".join(map(str, forced)):
         raise ValueError("writer returned different prompt or forced ids")
     if int(meta["rows"]) != len(forced) or int(meta["vocab"]) != target["vocab"]:
         raise ValueError("writer returned wrong row count or vocabulary")
     model_unchanged(model, model_stat)
-    if git(ROOT, "rev-parse", "HEAD") != source_head or digest(binary) != binary_sha or digest(__file__) != driver_sha:
+    if (native and git(ROOT, "rev-parse", "HEAD") != source_head) or digest(binary) != binary_sha or digest(__file__) != driver_sha:
         raise ValueError("source or binary changed during diagnostic")
-    if args.kind == "reference":
-        check_build(binary, args.backend)
-    else:
+    if native:
         if clean_head(ROOT) != source_head:
             raise ValueError("native source became dirty during diagnostic")
         check_native_build(binary, source_head)
-    identity = {"format": "bloomery-forced-logits-v1", "model": str(model),
-                "model_sha256": target["sha256"], "model_revision": target["revision"],
-                "arch": "qwen35", "target": args.target, "engine": args.kind,
-                "backend": args.backend, "build": build_info["llama_commit"] if args.kind == "reference" else source_head,
-                "source_head": source_head, "binary_sha256": binary_sha,
-                "source_dirty": str(source_dirty).lower(), "driver_sha256": driver_sha,
-                "prompt_sha256": digest(stage / "prompt.ids"),
-                "forced_sha256": digest(stage / "forced.ids"), "ctx": str(args.ctx),
-                "ubatch": str(args.ubatch), "kv": "f16"}
+    else:
+        check_build(binary, args.backend)
+    identity = {"format": MANIFEST_FORMAT, "model": str(model),
+                # The family pins mainline's commit as the nine digits the qwen35 sets all name.
+                "build": source_head if native else build_info["llama_commit"][:9],
+                "arch": "qwen35", "model_sha256": target["sha256"], "model_revision": target["revision"],
+                "target": args.target, "engine": args.kind, "backend": args.backend,
+                "binary_sha256": binary_sha, "driver_sha256": driver_sha,
+                "prompt_sha256": digest(stage / "prompt.ids"), "forced_sha256": digest(stage / "forced.ids"),
+                "ctx": str(args.ctx), "ubatch": str(args.ubatch), "kv": "f16", **corpus}
+    if native:
+        identity.update({"source_head": source_head, "source_dirty": str(source_dirty).lower()})
     finish_bundle(stage, identity, meta)
     # mkdir is exclusive, unlike rename which can replace a concurrently created empty dir.
     # The existing manifest completion marker is published after all of its files.
@@ -443,19 +522,21 @@ def run(args):
             path.rename(output / path.name)
     (stage / "MANIFEST.tsv").rename(output / "MANIFEST.tsv")
     stage.rmdir()
-    print(f"complete diagnostic bundle: {output}; GPU correctness acceptance remains separate")
+    print(f"complete set: {output}; GPU correctness acceptance remains separate")
 
 
 def bundle(path):
     path = Path(path)
     m = manifest.read(str(path))
-    if m.complete != "1\t0" or m.header.get("format") != "bloomery-forced-logits-v1":
+    if m.complete != "1\t0":
         raise ValueError(f"{path}: incomplete or foreign diagnostic bundle")
+    if m.header.get("format") != MANIFEST_FORMAT:
+        raise ValueError(f"{path}: not a {MANIFEST_FORMAT} set (an older capture: dump it again)")
     target = TARGETS.get(m.header.get("target"))
     if target is None or m.header.get("model_sha256") != target["sha256"]:
         raise ValueError(f"{path}: wrong immutable model identity")
     rows = m.rows("tensor")
-    if len(rows) != 1 or rows[0]["name"] != "logits" or rows[0]["type"] != "f32":
+    if len(rows) != 1 or rows[0]["name"] != "logits" or rows[0]["type"] != "f32" or rows[0]["op"] != LOGITS_OP:
         raise ValueError(f"{path}: requires one f32 logits tensor")
     n, vocab = rows[0].int("ne1"), rows[0].int("ne0")
     if vocab != target["vocab"] or m.header.get("arch") != "qwen35":
@@ -471,7 +552,10 @@ def bundle(path):
     token_ids(path / "prompt.ids", vocab)
     if len(token_ids(path / "forced.ids", vocab)) != n:
         raise ValueError(f"{path}: forced-id count differs from rows")
-    return m.header, raw_rows(path / "logits.0.f32", n, vocab)
+    values = raw_rows(path / "logits.0.f32", n, vocab)
+    if repr(math.fsum(values)) != rows[0]["sum"]:
+        raise ValueError(f"{path}: the tensor row's sum differs from the rows")
+    return m.header, values
 
 
 def compare(left, right, bitwise=False):
@@ -483,7 +567,7 @@ def compare(left, right, bitwise=False):
     if bitwise:
         if a["engine"] != "native" or b["engine"] != "native":
             raise ValueError("bitwise acceptance is only defined for native eager/graph diagnostics")
-        for key in ("build", "binary_sha256", "prefill", "ubatch", "backend"):
+        for key in ("build", "binary_sha256", "schedule", "ubatch", "backend"):
             if a[key] != b[key]:
                 raise ValueError(f"bitwise comparison differs at {key}")
         if {a["mode"], b["mode"]} != {"eager", "graph"}:
@@ -503,6 +587,105 @@ def compare(left, right, bitwise=False):
     return {"finite_shape_identity_checks": "pass", "bitwise_equal": equal,
             "acceptance": ("pass" if equal else "fail") if bitwise else "diagnostic_only_no_numeric_band",
             "rows": output}, 1 if bitwise and not equal else 0
+
+
+def quantiles(values, points=(0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)):
+    """{point: value} of the sorted values, linear between ranks; an empty list has none."""
+    if not values:
+        raise ValueError("quantiles of no values")
+    ordered = sorted(values)
+    found = {}
+    for q in points:
+        position = q * (len(ordered) - 1)
+        low = int(math.floor(position))
+        high = min(low + 1, len(ordered) - 1)
+        found[q] = ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+    return found
+
+
+def top2(row, vocab):
+    """(argmax, top-1 minus top-2) of one logits row; ties are a margin of 0."""
+    (first, _), (second, _) = heapq.nlargest(2, enumerate(row), key=lambda pair: pair[1])
+    return first, float(row[first]) - float(row[second])
+
+
+def stable_margin(l2, max_abs):
+    """[derived] The margin above which a row's argmax cannot move when every logit moves by a vector of L2 norm `l2` and
+    largest component `max_abs`: two logits swap only if their margin is within the difference of their two moves, at most
+    2 * max_abs (each move is at most max_abs) and at most sqrt(2) * l2 (Cauchy-Schwarz on the pair); the smaller holds."""
+    return min(2.0 * max_abs, math.sqrt(2.0) * l2)
+
+
+def floor(references, twin_suffix=".cpu"):
+    """The oracle's own spread of each reference set: the CPU twin's rows beside it (`<set>.cpu`, one binary, one prompt,
+    one ubatch, no card in view) against mainline's CUDA rows, the set being the reference as in tools/ref/hidden-diff.py:
+    per row the relative L2 `|cpu - cuda| / |cuda|`, the largest absolute difference, whether the argmax agrees, and the
+    top-2 margin of both. A row's own [derived] bound (stable_margin) says which rows could flip: those whose CUDA margin
+    is at or under it."""
+    sets = []
+    for reference in references:
+        twin = Path(str(reference) + twin_suffix)
+        a, x = bundle(reference)
+        b, y = bundle(twin)
+        if (a["engine"], b["engine"]) != ("reference", "reference") or (a["backend"], b["backend"]) != ("cuda", "cpu"):
+            raise ValueError(f"{reference}: floor takes a reference CUDA set and its reference CPU twin")
+        for key in ("model_sha256", "build", "binary_sha256", "prompt_sha256", "forced_sha256", "rows", "vocab", "ctx",
+                    "ubatch", "schedule", "kv"):
+            if a[key] != b[key]:
+                raise ValueError(f"{reference} and its twin differ at {key}: {a[key]} versus {b[key]}")
+        n, vocab = int(a["rows"]), int(a["vocab"])
+        rows = []
+        for i in range(n):
+            p, q = x[i * vocab:(i + 1) * vocab], y[i * vocab:(i + 1) * vocab]
+            delta = math.sqrt(math.fsum((float(u) - float(v)) ** 2 for u, v in zip(p, q)))
+            norm = math.sqrt(math.fsum(float(u) ** 2 for u in p))
+            if not norm:
+                raise ValueError(f"{reference}: row {i} is all zero")
+            cuda_arg, cuda_margin = top2(p, vocab)
+            cpu_arg, cpu_margin = top2(q, vocab)
+            largest = max(abs(float(u) - float(v)) for u, v in zip(p, q))
+            rows.append({"row": i, "rel_l2": delta / norm, "l2": delta, "cuda_norm": norm, "max_abs": largest,
+                         "stable_margin": stable_margin(delta, largest),
+                         "argmax_cuda": cuda_arg, "argmax_cpu": cpu_arg,
+                         "margin_cuda": cuda_margin, "margin_cpu": cpu_margin})
+        sets.append({"set": str(reference), "twin": str(twin), "rows": rows,
+                     "prompt_len": len(token_ids(Path(reference) / "prompt.ids", vocab)),
+                     "backends": [a["backend"], b["backend"]]})
+    pooled = [r for s in sets for r in s["rows"]]
+    summary = {"rows": len(pooled), "rel_l2": quantiles([r["rel_l2"] for r in pooled]),
+               "max_abs": quantiles([r["max_abs"] for r in pooled]),
+               "margin_cuda": quantiles([r["margin_cuda"] for r in pooled]),
+               "margin_cpu": quantiles([r["margin_cpu"] for r in pooled]),
+               "argmax_equal": sum(r["argmax_cuda"] == r["argmax_cpu"] for r in pooled),
+               "stable_margin": quantiles([r["stable_margin"] for r in pooled]),
+               "rows_within_bound": sum(r["margin_cuda"] <= r["stable_margin"] for r in pooled)}
+    return {"sets": sets, "pooled": summary}
+
+
+def print_floor(report, stream=sys.stdout):
+    def q_line(label, found, unit=""):
+        names = ("min", "p10", "p25", "median", "p75", "p90", "max")
+        print(f"  {label}: " + "  ".join(f"{name} {value:.6g}" for name, value in zip(names, found.values())) + unit, file=stream)
+
+    for s in report["sets"]:
+        rows = s["rows"]
+        print(f"floor {s['set']}: {len(rows)} rows after a prompt of {s['prompt_len']} ids; cpu twin vs cuda", file=stream)
+        q_line("rel_l2 |cpu-cuda|/|cuda|", quantiles([r["rel_l2"] for r in rows]))
+        q_line("max_abs", quantiles([r["max_abs"] for r in rows]))
+        q_line("top-2 margin, cuda rows", quantiles([r["margin_cuda"] for r in rows]))
+        q_line("top-2 margin, cpu rows", quantiles([r["margin_cpu"] for r in rows]))
+        flips = [r for r in rows if r["argmax_cuda"] != r["argmax_cpu"]]
+        print(f"  argmax cuda == cpu: {len(rows) - len(flips)}/{len(rows)}"
+              + "".join(f"; row {r['row']} flips at margins {r['margin_cuda']:.6g}/{r['margin_cpu']:.6g}" for r in flips), file=stream)
+    p = report["pooled"]
+    print(f"floor pooled: {p['rows']} rows", file=stream)
+    q_line("rel_l2", p["rel_l2"])
+    q_line("max_abs", p["max_abs"])
+    q_line("top-2 margin, cuda rows", p["margin_cuda"])
+    q_line("top-2 margin, cpu rows", p["margin_cpu"])
+    q_line("[derived] stable margin min(2 max_abs, sqrt(2) l2)", p["stable_margin"])
+    print(f"  argmax cuda == cpu: {p['argmax_equal']}/{p['rows']}; {p['rows_within_bound']} of {p['rows']} rows have a cuda "
+          f"margin at or under their own stable margin (the only rows that could flip)", file=stream)
 
 
 def self_test():
@@ -542,8 +725,8 @@ def self_test():
             if sys.byteorder != "little":
                 values.byteswap()
             (folder / "logits.0.f32").write_bytes(values.tobytes())
-            identity = {"target": "_selftest", "model_sha256": TARGETS["_selftest"]["sha256"], "arch": "qwen35",
-                        "format": "bloomery-forced-logits-v1", "engine": "native", "build": "same",
+            identity = {"format": MANIFEST_FORMAT, "model": "/models/selftest.gguf", "build": "same", "arch": "qwen35",
+                        "target": "_selftest", "model_sha256": TARGETS["_selftest"]["sha256"], "engine": "native",
                         "binary_sha256": "same", "backend": "cuda", "ctx": "8", "kv": "f16", "ubatch": "8",
                         "prompt_sha256": digest(folder / "prompt.ids"), "forced_sha256": digest(folder / "forced.ids")}
             finish_bundle(folder, identity, {"rows": "1", "vocab": "2", "mode": mode, "prefill": "pass"})
@@ -558,7 +741,8 @@ def self_test():
             changed.byteswap()
         before = digest(raw_path)
         raw_path.write_bytes(changed.tobytes())
-        mp.write_text(complete.replace(before, digest(raw_path)))
+        # The digest and the row's sum both follow the rows, as a writer's would.
+        mp.write_text(complete.replace(before, digest(raw_path)).replace("\t-1.0\t", "\t-0.5\t"))
         result, code = compare(root / "a", root / "b", True)
         assert code == 1 and result["acceptance"] == "fail" and result["rows"][0]["max_abs"] == 0.5
         result, code = compare(root / "a", root / "b")
@@ -568,7 +752,9 @@ def self_test():
         for bad, want in ((complete.replace("# complete\t1\t0\n", ""), "incomplete"),
                           (complete.replace(TARGETS["_selftest"]["sha256"], "wrong"), "identity"),
                           (complete.replace("tensor\tlogits\t0\tf32\t2", "tensor\tlogits\t0\tf32\t3"), "vocabulary"),
-                          (complete.replace("\t1\t1\t8\tDIAGNOSTIC", "\t2\t1\t8\tDIAGNOSTIC"), "dimensions")):
+                          (complete.replace("\t1\t1\t8\t-1.0\t" + LOGITS_OP, "\t2\t1\t8\t-1.0\t" + LOGITS_OP), "dimensions"),
+                          (complete.replace("\t-1.0\t" + LOGITS_OP, "\t-1.5\t" + LOGITS_OP), "sum"),
+                          (complete.replace(MANIFEST_FORMAT, RAW_FORMAT), "older capture")):
             mp.write_text(bad)
             try:
                 bundle(root / "b")
@@ -618,8 +804,104 @@ def self_test():
             raise AssertionError("accepted duplicate metadata")
         except ValueError:
             pass
+        # The set a writer leaves is a node dump a refset family reads: the header names the file, the build and the
+        # architecture; no key is one refset types differently or takes for a column line; the row has the v2 columns;
+        # the trailer is the last line.
+        m = manifest.read(str(root / "a"))
+        assert m.complete == "1\t0" and (root / "a/MANIFEST.tsv").read_text().splitlines()[-1] == "# complete\t1\t0"
+        assert m.header["model"] == "/models/selftest.gguf" and m.header["build"] == "same" and m.header["arch"] == "qwen35"
+        assert not {"prefill", "kind", "input", "int", "flags", "tokens"} & set(m.header), sorted(m.header)
+        assert m.columns["tensor"] == ["kind", "name", "occurrence", "type", "ne0", "ne1", "ne2", "ne3", "bytes", "sum", "op",
+                                       "contig", "logical", "src0", "src1"]
+        row = m.rows("tensor")[0]
+        assert (row["sum"], row["op"], row["contig"], row["logical"], row["src0"]) == ("-1.0", LOGITS_OP, "1", "0", "-")
+        # A corpus slice is the file's first ids under its pinned digest; run() refuses a wrong call before the model is read.
+        corpus_file = root / "corpus"
+        corpus_file.write_text("0\n1\n0\n1\n0\n")
+        corpus_sha = digest(corpus_file)
+        assert corpus_slice(corpus_file, corpus_sha, 4, 2) == [0, 1, 0, 1]
+        for call, want in (((corpus_file, "0" * 64, 2, 2), "pinned corpus digest"), ((corpus_file, corpus_sha, 6, 2), "holds 5 ids"),
+                           ((corpus_file, corpus_sha, 4, 1), "not one decimal id")):
+            try:
+                corpus_slice(*call)
+                raise AssertionError(f"accepted a corpus slice {call}")
+            except ValueError as error:
+                assert want in str(error), error
+
+        def asked(**changes):
+            call = dict(target="_selftest", kind="reference", model=root / "model", binary=root / "none", out=root / "out",
+                        corpus=None, prompt=None, forced=None, prompt_count=None, forced_count=None, corpus_sha256=None,
+                        ctx=8, ubatch=8, backend="cpu", prefill="batch", mode="graph", bound=None)
+            call.update(changes)
+            run(argparse.Namespace(**call))
+
+        for changes, want in (({"corpus": corpus_file, "prompt": root / "p", "prompt_count": 2, "forced_count": 1,
+                                "corpus_sha256": corpus_sha}, "--corpus takes"),
+                              ({"corpus": corpus_file, "prompt_count": 2, "corpus_sha256": corpus_sha}, "--corpus takes"),
+                              ({}, "a run takes --prompt and --forced"),
+                              ({"prompt": root / "p", "forced": root / "f", "forced_count": 1}, "a run takes --prompt and --forced"),
+                              ({"corpus": corpus_file, "prompt_count": 3, "forced_count": 2, "corpus_sha256": corpus_sha, "ctx": 4},
+                               "context does not hold")):
+            try:
+                asked(**changes)
+                raise AssertionError(f"accepted a run call {changes}")
+            except ValueError as error:
+                assert want in str(error), error
+        try:
+            build(argparse.Namespace(pin="0" * 40, cached_libraries=True, llama_tree=root, llama_build=root))
+            raise AssertionError("accepted --pin with --cached-libraries")
+        except ValueError as error:
+            assert "does not combine" in str(error), error
+
+        # The floor: a reference CUDA set and the CPU twin beside it, per row rel_l2, the argmax and the top-2 margins.
+        def make_set(folder, flat, backend):
+            folder.mkdir()
+            (folder / "prompt.ids").write_text("1\n")
+            (folder / "forced.ids").write_text("0\n1\n")
+            rows = array.array("f", flat)
+            if sys.byteorder != "little":
+                rows.byteswap()
+            (folder / "logits.0.f32").write_bytes(rows.tobytes())
+            finish_bundle(folder, {"format": MANIFEST_FORMAT, "model": "/models/selftest.gguf", "build": "53ed051ce",
+                                   "arch": "qwen35", "target": "_selftest", "model_sha256": TARGETS["_selftest"]["sha256"],
+                                   "engine": "reference", "backend": backend, "binary_sha256": "same", "ctx": "8", "kv": "f16",
+                                   "ubatch": "8", "prompt_sha256": digest(folder / "prompt.ids"),
+                                   "forced_sha256": digest(folder / "forced.ids")},
+                          {"rows": "2", "vocab": "2", "mode": "reference", "prefill": "batch"})
+
+        make_set(root / "c", [3.0, 1.0, 0.5, 0.25], "cuda")
+        make_set(root / "c.cpu", [3.5, 1.0, 0.25, 0.5], "cpu")
+        report = floor([root / "c"])
+        first, second = report["sets"][0]["rows"]
+        assert abs(first["rel_l2"] - 0.5 / math.sqrt(3.0 ** 2 + 1.0)) < 1e-9 and first["max_abs"] == 0.5 and first["l2"] == 0.5
+        assert abs(second["rel_l2"] - math.sqrt(0.125) / math.sqrt(0.5 ** 2 + 0.25 ** 2)) < 1e-9
+        assert (first["argmax_cuda"], first["argmax_cpu"], second["argmax_cuda"], second["argmax_cpu"]) == (0, 0, 0, 1)
+        assert (first["margin_cuda"], first["margin_cpu"], second["margin_cuda"], second["margin_cpu"]) == (2.0, 2.5, 0.25, 0.25)
+        pooled = report["pooled"]
+        assert pooled["argmax_equal"] == 1 and pooled["rows_within_bound"] == 1 and report["sets"][0]["prompt_len"] == 1
+        assert abs(first["stable_margin"] - math.sqrt(2) * 0.5) < 1e-9 and abs(second["stable_margin"] - 0.5) < 1e-9
+        assert pooled["margin_cuda"][0.0] == 0.25 and abs(pooled["stable_margin"][1.0] - math.sqrt(2) * 0.5) < 1e-9
+        # Past two coordinates the max-component branch can be the smaller one.
+        assert stable_margin(3.0, 1.0) == 2.0 and abs(stable_margin(0.5, 0.5) - math.sqrt(2) * 0.5) < 1e-12
+        shown = io.StringIO()
+        print_floor(report, shown)
+        assert "argmax cuda == cpu: 1/2; row 1 flips" in shown.getvalue() and "at or under their own stable margin" in shown.getvalue()
+        for refused, want in ((root / "a", "cannot read"), ):
+            try:
+                floor([refused])
+                raise AssertionError("floor read a set with no twin")
+            except ValueError as error:
+                assert want in str(error), error
+        make_set(root / "d", [3.0, 1.0, 0.5, 0.25], "cuda")
+        make_set(root / "d.cpu", [3.5, 1.0, 0.25, 0.5], "cuda")
+        try:
+            floor([root / "d"])
+            raise AssertionError("floor took a twin that ran on the card")
+        except ValueError as error:
+            assert "floor takes a reference CUDA set" in str(error), error
     del TARGETS["_selftest"]
-    print("dense-logits self-test: malformed ids, provenance, incomplete/truncated/NaN rows, eager/graph and owned-session cleanup contracts passed")
+    print("dense-logits self-test: malformed ids, provenance, the set's family-shaped manifest, corpus slices, run and build refusals, "
+          "incomplete/truncated/NaN rows, eager/graph, the oracle floor and owned-session cleanup contracts passed")
     return 0
 
 
@@ -636,14 +918,21 @@ def main():
     b.add_argument("--cmake", default="cmake")
     b.add_argument("--build-bound", type=int, default=900)
     b.add_argument("--cached-libraries", action="store_true", help="explicit cached-library smoke only; source/build correspondence is not proven")
+    b.add_argument("--pin", help="the full commit hash the tree must be at: the build is proven by tools/ref/emb2/oracle-tree.sh and nothing is built in the tree")
     nb = sub.add_parser("build-native")
     nb.add_argument("--arch", default="sm_86")
     r = sub.add_parser("run")
     r.add_argument("--kind", choices=("reference", "native"), required=True)
     r.add_argument("--backend", choices=("cuda", "cpu"), default="cuda")
     r.add_argument("--target", choices=TARGETS, default="qwen38-27b")
-    for key in ("model", "binary", "prompt", "forced", "out"):
+    for key in ("model", "binary", "out"):
         r.add_argument("--" + key, type=Path, required=True)
+    for key in ("prompt", "forced", "corpus"):
+        r.add_argument("--" + key, type=Path)
+    r.add_argument("--corpus-sha256", help="the corpus file's pinned sha256, with --corpus")
+    r.add_argument("--prompt-count", type=int, help="with --corpus: the prompt is its first N ids")
+    r.add_argument("--forced-count", type=int, help="with --corpus: the M ids after the prompt are forced")
+    r.add_argument("--bound", type=int, help="seconds the whole call may take (default 2800 on the card, 900 on the CPU)")
     r.add_argument("--prefill", choices=("step", "batch", "pass", "auto", "gemm"), required=True)
     r.add_argument("--mode", choices=("eager", "graph"), default="graph")
     r.add_argument("--ctx", type=int, default=4352)
@@ -652,6 +941,10 @@ def main():
     c.add_argument("left", type=Path)
     c.add_argument("right", type=Path)
     c.add_argument("--bitwise", action="store_true")
+    f = sub.add_parser("floor", help="the oracle's own spread: each reference CUDA set against the CPU twin beside it")
+    f.add_argument("sets", type=Path, nargs="+", help="reference CUDA set directories; the twin of S is S.cpu")
+    f.add_argument("--twin-suffix", default=".cpu")
+    f.add_argument("--json", type=Path, help="also write the per-row numbers here")
     args = parser.parse_args()
     try:
         if args.action == "build":
@@ -660,6 +953,11 @@ def main():
             native_build(args)
         elif args.action == "run":
             run(args)
+        elif args.action == "floor":
+            report = floor(args.sets, args.twin_suffix)
+            print_floor(report)
+            if args.json:
+                write_json(args.json, report)
         else:
             result, code = compare(args.left, args.right, args.bitwise)
             print(json.dumps(result, indent=2, allow_nan=False))
