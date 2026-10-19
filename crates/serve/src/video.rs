@@ -1,8 +1,9 @@
 //! Encoded video in the server: ffmpeg and ffprobe, run as subprocesses the way llama-server does.
 //!
 //! A clip arrives as base64 inside a request ([`crate::media::Part::Video`]). It is written to a
-//! temp file (an mp4 with its index at the end needs to seek, which a pipe cannot), probed once
-//! with ffprobe ([`Decoder::probe`]), planned by the one planner (`vision::video::plan`), and
+//! temp file (an mp4 with its index at the end needs to seek, which a pipe cannot), probed with
+//! ffprobe ([`Decoder::probe`]; a stream whose container states no frame count is decoded once to
+//! count them), planned by the one planner (`vision::video::plan`), and
 //! decoded by ffmpeg at its native size: only the planned frames, streamed one at a time, each
 //! handed on as soon as it arrives so the request thread resizes and patches a group while ffmpeg
 //! decodes toward the next ([`video_part`]). Memory is one group of frames and the patches.
@@ -123,6 +124,7 @@ impl Clip {
         self.key
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -331,10 +333,23 @@ fn major_len(text: &str) -> usize {
     text.bytes().take_while(u8::is_ascii_digit).count()
 }
 
-/// The ffmpeg `select` filter that keeps the source frames `indices`.
+/// The most terms one flat sum of a `select` expression holds.
+const SELECT_RUN: usize = 16;
+
+/// The ffmpeg `select` filter that keeps the source frames `indices`. The terms are summed in a
+/// balanced tree of parentheses: ffmpeg's expression parser nests one level for each term of a
+/// flat sum and refuses a sum of more than 100, which a clip of hundreds of planned frames passes.
 fn select_filter(indices: &[usize]) -> String {
-    let terms: Vec<String> = indices.iter().map(|i| format!("eq(n,{i})")).collect();
-    format!("select='{}'", terms.join("+"))
+    format!("select='{}'", select_sum(indices))
+}
+
+fn select_sum(indices: &[usize]) -> String {
+    if indices.len() <= SELECT_RUN {
+        let terms: Vec<String> = indices.iter().map(|i| format!("eq(n,{i})")).collect();
+        return terms.join("+");
+    }
+    let (head, tail) = indices.split_at(indices.len() / 2);
+    format!("({})+({})", select_sum(head), select_sum(tail))
 }
 
 /// A frame rate text `num/den` of ffprobe, `None` for `0/0` or any other unreadable one.
@@ -347,11 +362,24 @@ fn ratio(text: &str) -> Option<(u32, u32)> {
     (num > 0 && den > 0).then_some((num, den))
 }
 
-/// The probe's JSON as a [`ClipMeta`]: the first video stream's size and average rate; the frame
-/// count its `nb_frames`, else its duration (the stream's, else the container's) times the rate. A
-/// clip with neither is refused by name rather than guessed. A stream rotated by a quarter turn
-/// decodes at the swapped size (ffmpeg applies the rotation), so the size is swapped here.
-fn parse_probe(json: &str) -> Result<ClipMeta, VideoError> {
+/// What ffprobe read of a clip's first video stream. The rate and the frame count are the
+/// stream's own, never the container's: a container's duration spans every stream, so an audio
+/// track longer than the video would stretch a count made from it.
+struct Probed {
+    width: usize,
+    height: usize,
+    rate: Option<(u32, u32)>,
+    /// The container's stated count, or the count of frames the stream decodes to.
+    frames: Option<usize>,
+    /// The stream's own duration in seconds.
+    duration: Option<f64>,
+}
+
+/// The probe's JSON as a [`Probed`]: the first video stream's size and average rate, its frame count
+/// (`nb_read_frames` when ffprobe counted by decoding, else the container's `nb_frames`) and its
+/// duration. A stream rotated by a quarter turn decodes at the swapped size (ffmpeg applies the
+/// rotation), so the size is swapped here.
+fn read_probe(json: &str) -> Result<Probed, VideoError> {
     let bad = |detail: &str| VideoError::Probe(detail.to_owned());
     let v: Value =
         serde_json::from_str(json).map_err(|e| VideoError::Probe(format!("not JSON: {e}")))?;
@@ -390,44 +418,45 @@ fn parse_probe(json: &str) -> Result<ClipMeta, VideoError> {
     if rotation.is_some_and(|r| (r.abs() % 180.0 - 90.0).abs() < 1.0) {
         std::mem::swap(&mut width, &mut height);
     }
-    let duration = number("duration").or_else(|| {
-        v.get("format")
-            .and_then(|f| f.get("duration"))
-            .and_then(|d| d.as_str()?.parse().ok())
-    });
-    let nb_frames = number("nb_frames")
-        .filter(|n| *n >= 1.0)
-        .map(|n| n as usize);
-    let fps = stream
-        .get("avg_frame_rate")
-        .and_then(Value::as_str)
-        .and_then(ratio)
-        .or_else(|| {
-            let (frames, seconds) = (nb_frames?, duration.filter(|d| *d > 0.0)?);
-            let millis = (seconds * 1000.0).round() as u64;
-            let num = u32::try_from(frames as u64 * 1000).ok()?;
-            Some((num, u32::try_from(millis).ok()?)).filter(|&(n, d)| n > 0 && d > 0)
-        })
-        .ok_or_else(|| bad("the stream has no frame rate and no frame count over a duration"))?;
-    let frames = match nb_frames {
-        Some(n) => n,
-        None => {
-            let seconds = duration.filter(|d| *d > 0.0).ok_or_else(|| {
-                bad("the stream has neither a frame count nor a duration; the clip cannot be sampled")
-            })?;
-            let n = (seconds * f64::from(fps.0) / f64::from(fps.1)).round();
-            if n < 1.0 {
-                return Err(bad("the clip's duration holds no frame"));
-            }
-            n as usize
-        }
-    };
-    Ok(ClipMeta {
-        frames,
-        fps,
+    Ok(Probed {
         width,
         height,
+        rate: stream
+            .get("avg_frame_rate")
+            .and_then(Value::as_str)
+            .and_then(ratio),
+        frames: number("nb_read_frames")
+            .or_else(|| number("nb_frames"))
+            .filter(|n| *n >= 1.0)
+            .map(|n| n as usize),
+        duration: number("duration").filter(|d| *d > 0.0),
     })
+}
+
+impl Probed {
+    /// The clip's [`ClipMeta`]. A stream that states no rate takes its frames over its own
+    /// duration; one with no count, or neither a rate nor a duration, is refused by name rather
+    /// than guessed.
+    fn meta(self) -> Result<ClipMeta, VideoError> {
+        let bad = |detail: &str| VideoError::Probe(detail.to_owned());
+        let frames = self
+            .frames
+            .ok_or_else(|| bad("the stream has no frame count and none could be counted"))?;
+        let fps = self
+            .rate
+            .or_else(|| {
+                let millis = (self.duration? * 1000.0).round() as u64;
+                let num = u32::try_from(frames as u64 * 1000).ok()?;
+                Some((num, u32::try_from(millis).ok()?)).filter(|&(n, d)| n > 0 && d > 0)
+            })
+            .ok_or_else(|| bad("the stream has no frame rate and no duration to take one from"))?;
+        Ok(ClipMeta {
+            frames,
+            fps,
+            width: self.width,
+            height: self.height,
+        })
+    }
 }
 
 /// The first lines of what a process wrote to stderr, for an error.
@@ -446,13 +475,20 @@ fn first_lines(text: &[u8]) -> String {
     }
 }
 
-impl Decoder for FfmpegDecoder {
-    fn probe(&self, clip: &Clip) -> Result<ClipMeta, VideoError> {
-        let out = Command::new(&self.ffprobe)
-            .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+impl FfmpegDecoder {
+    /// ffprobe's report of the clip's first video stream (`v:0`, the stream [`Decoder::decode`]
+    /// maps). With `count` ffprobe also decodes the stream and counts its frames.
+    fn probe_stream(&self, clip: &Clip, count: bool) -> Result<Probed, VideoError> {
+        let mut cmd = Command::new(&self.ffprobe);
+        cmd.args(["-v", "error", "-select_streams", "v:0"]);
+        if count {
+            cmd.arg("-count_frames");
+        }
+        let out = cmd
+            .arg("-show_entries")
             .arg(
-                "stream=width,height,avg_frame_rate,nb_frames,duration:stream_side_data=rotation:\
-                 stream_tags=rotate:format=duration",
+                "stream=width,height,avg_frame_rate,nb_frames,nb_read_frames,duration:\
+                 stream_side_data=rotation:stream_tags=rotate",
             )
             .args(["-of", "json"])
             .arg(clip.path()?)
@@ -466,7 +502,20 @@ impl Decoder for FfmpegDecoder {
                 first_lines(&out.stderr)
             )));
         }
-        parse_probe(&String::from_utf8_lossy(&out.stdout))
+        read_probe(&String::from_utf8_lossy(&out.stdout))
+    }
+}
+
+impl Decoder for FfmpegDecoder {
+    fn probe(&self, clip: &Clip) -> Result<ClipMeta, VideoError> {
+        let mut stream = self.probe_stream(clip, false)?;
+        if stream.frames.is_none() {
+            // The container states no count (Matroska, WebM). Its duration is no stand-in, since it
+            // spans every stream, so the stream is decoded and its frames counted, the number
+            // `select` indexes.
+            stream.frames = self.probe_stream(clip, true)?.frames;
+        }
+        stream.meta()
     }
 
     fn decode(
@@ -753,6 +802,7 @@ impl PlannedClip {
     }
 
     /// The source frames the plan takes.
+    #[cfg(test)]
     #[must_use]
     pub fn frames(&self) -> usize {
         self.plan.indices.len()
@@ -760,14 +810,14 @@ impl PlannedClip {
 
     /// The positions the clip takes in an assembled input, counted over [`PlannedClip::pieces`] as
     /// the assembly walks them: a text piece the `text` positions it tokenizes to, a group its
-    /// tokens and `around` positions of delimiters.
+    /// tokens and `around` positions of delimiters ([`group_positions`]).
     #[must_use]
     pub fn positions(&self, text: impl Fn(&str) -> usize, around: usize) -> usize {
         self.pieces
             .iter()
             .map(|piece| match piece {
                 Piece::Text(t) => text(t),
-                Piece::Group(n) => around + self.plan.groups[*n].tokens,
+                Piece::Group(n) => group_positions(self.plan.groups[*n].tokens, around),
             })
             .sum()
     }
@@ -843,6 +893,14 @@ impl PlannedClip {
         }
         Ok(groups)
     }
+}
+
+/// The positions a medium of `tokens` takes in an assembled embedding input between its delimiters,
+/// which are `around` positions together: a group of a clip, a still image or an audio span. The
+/// one rule the budget of an input's clips and the assembly both follow.
+#[must_use]
+pub fn group_positions(tokens: usize, around: usize) -> usize {
+    around + tokens
 }
 
 /// The positions of context a clip may take: the context less the prompt's own text and
@@ -967,11 +1025,44 @@ mod tests {
         );
     }
 
-    /// A probe with a frame count reads it; without one, the duration times the rate; with neither,
-    /// a named refusal. The size swaps under a quarter-turn rotation, both spellings of it.
+    /// A long plan names every frame once and in order, nested no deeper than ffmpeg's parser
+    /// takes: no run of flat terms past [`SELECT_RUN`] and parentheses a log of the count deep.
+    #[test]
+    fn a_long_select_filter_is_a_shallow_tree() {
+        let indices: Vec<usize> = (0..768).map(|i| i * 7 + 1).collect();
+        let filter = select_filter(&indices);
+        let named: Vec<usize> = filter
+            .split("eq(n,")
+            .skip(1)
+            .map(|t| t.split(')').next().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(named, indices);
+        let (mut depth, mut deepest) = (0usize, 0usize);
+        for c in filter.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            deepest = deepest.max(depth);
+        }
+        // `eq(` is a level of its own.
+        assert!(deepest <= 1 + 1 + 8, "{deepest} levels of parentheses");
+        let longest = filter
+            .split(['(', ')'])
+            .map(|run| run.matches("eq").count())
+            .max()
+            .unwrap();
+        assert!(longest <= SELECT_RUN, "a flat run of {longest} terms");
+    }
+
+    /// A probe reads the stream's frame count (a counted one over the container's) and its rate; a
+    /// container's duration is never read, since it spans every stream. A stream with no count, or
+    /// with neither a rate nor a duration of its own, is a named refusal. The size swaps under a
+    /// quarter-turn rotation, both spellings of it.
     #[test]
     fn the_probe_reads_frames_rate_and_size() {
-        let probe = |s: &str| parse_probe(s);
+        let probe = |s: &str| read_probe(s).and_then(Probed::meta);
         let ok = probe(
             r#"{"streams":[{"width":1920,"height":1080,"avg_frame_rate":"30000/1001","nb_frames":"1800","duration":"60.06"}],"format":{"duration":"60.06"}}"#,
         )
@@ -985,25 +1076,32 @@ mod tests {
                 height: 1080
             }
         );
-        // No nb_frames (webm, some mkv): the stream duration, else the container's, times the rate.
-        let by_duration = probe(
-            r#"{"streams":[{"width":640,"height":360,"avg_frame_rate":"25/1"}],"format":{"duration":"10.000000"}}"#,
+        // A counted stream (ffprobe -count_frames): the count of frames it decodes to, whatever
+        // the container says it holds and however long its audio runs.
+        let counted = probe(
+            r#"{"streams":[{"width":64,"height":48,"avg_frame_rate":"10/1","nb_read_frames":"20","nb_frames":"22"}],"format":{"duration":"10.000000"}}"#,
         )
         .unwrap();
-        assert_eq!((by_duration.frames, by_duration.fps), (250, (25, 1)));
-        // No frame rate either: nb_frames over the duration.
+        assert_eq!((counted.frames, counted.fps), (20, (10, 1)));
+        // No frame rate: the stream's frames over its own duration.
         let rate = probe(
             r#"{"streams":[{"width":64,"height":48,"avg_frame_rate":"0/0","nb_frames":"50","duration":"2.000000"}]}"#,
         )
         .unwrap();
         assert_eq!(rate.fps, (50_000, 2_000));
         for (json, words) in [
+            // No count to read, and the container's duration is no count.
             (
-                r#"{"streams":[{"width":64,"height":48,"avg_frame_rate":"25/1"}]}"#,
-                "neither a frame count nor a duration",
+                r#"{"streams":[{"width":64,"height":48,"avg_frame_rate":"25/1"}],"format":{"duration":"10.0"}}"#,
+                "no frame count",
             ),
             (
-                r#"{"streams":[{"width":64,"height":48,"avg_frame_rate":"0/0","duration":"2.0"}]}"#,
+                r#"{"streams":[{"width":64,"height":48,"avg_frame_rate":"25/1","duration":"2.0"}]}"#,
+                "no frame count",
+            ),
+            // No rate, and the container's duration is not the stream's.
+            (
+                r#"{"streams":[{"width":64,"height":48,"avg_frame_rate":"0/0","nb_frames":"20"}],"format":{"duration":"10.0"}}"#,
                 "no frame rate",
             ),
             (r#"{"streams":[]}"#, "no video stream"),

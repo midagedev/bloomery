@@ -207,6 +207,7 @@ pub enum Medium {
 
 impl Medium {
     /// The media of `urls` as images.
+    #[cfg(test)]
     #[must_use]
     pub fn images(urls: &[&str]) -> Vec<Medium> {
         urls.iter()
@@ -227,6 +228,7 @@ pub struct Flat {
 
 impl Flat {
     /// The images' URLs, in the order of their placeholders.
+    #[cfg(test)]
     #[must_use]
     pub fn images(&self) -> Vec<&str> {
         self.media
@@ -257,6 +259,7 @@ impl VideoCtx {
     }
 
     /// A context for a request that carries no clip: a clip part is refused by name.
+    #[cfg(test)]
     #[must_use]
     pub fn none() -> VideoCtx {
         VideoCtx::new(VideoSupport::default(), 0)

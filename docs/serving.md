@@ -248,8 +248,9 @@ it is refused, and a request with an image is a 501.
 server looks once at start, prints one `video:` line, and answers `/props` with `modalities.video` true. A clip is an
 `input_video` part (`{"data": <base64>, "format": "mp4"}`) or a `video_url` part holding a `data:video/*;base64,` URL;
 any other URL is refused, not fetched, and so is a request body over 64 MiB. The server writes the clip to a private (0600) temp file,
-probes it, plans the frames by the model's rule (rate, frame bounds, group size, token cap) under the context the
-request's text leaves, and has ffmpeg decode only the planned frames. Without ffmpeg, a clip is a 400 that names the
+probes it (a clip whose container states no frame count is decoded once to count its video stream's frames), plans the
+frames by the model's rule (rate, frame bounds, group size, token cap) under the context the request's text leaves (an
+embeddings input's images and audio too), and has ffmpeg decode only the planned frames. Without ffmpeg, a clip is a 400 that names the
 fix. EmbeddingGemma 2's embeddings route takes the same parts and still takes decoded frames (a first text part
 `Video:`, then `image_url` frames).
 
