@@ -34,6 +34,7 @@ pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const XSTREAM: &str = "BLOOMERY_XSTREAM";
 pub const SPLIT_WALK: &str = "BLOOMERY_SPLIT_WALK";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
+pub const WARM_PROFILE: &str = "BLOOMERY_WARM_PROFILE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
 pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
@@ -550,6 +551,28 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               server prints an `mtp width` record a request under `cost`. Refused by name on a \
               run that drafts nothing. Read once at `main`, the policy every window of the \
               process runs by; no setter changes it between calls.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: WARM_PROFILE,
+        class: Class::A,
+        kind: Kind::Path,
+        default: Unset::Means("no profile: the residency starts from its placement's seed"),
+        doc: "`generate_ds41`: the residency's persisted usage profile \
+              (`crates/runtime/src/warmprof.rs`, `crates/app/src/warm.rs`), keyed to the model's \
+              first shard (path, length, modification time), the placement word and the \
+              cards. Read at the load's end, before the first prompt: the residency is \
+              reseeded to the profile's rankings (each layer's pinned experts stay, then its \
+              most used), which every later reset returns to, and a `warm load` record names \
+              the outcome. A missing file, one counted under another key and a corrupt one \
+              leave the placement's seed, the record naming why; a file that cannot be read \
+              for another reason is refused by name. `--warm-save` also folds the run's \
+              usage into the profile at its end (a `warm save` record); without it the file \
+              is only read, so the arms of an A/B read one profile. Refused by name on a run \
+              with no residency machine.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

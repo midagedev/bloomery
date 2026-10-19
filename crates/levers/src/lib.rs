@@ -37,7 +37,7 @@ pub use registry::{
     LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS,
     NVTIER_BYTES, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
     PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN,
-    STEP_STATS, THREADS, TIER_LINK, TIER_NODES,
+    STEP_STATS, THREADS, TIER_LINK, TIER_NODES, WARM_PROFILE,
 };
 pub use registry::{SPLIT_WALK, XSTREAM};
 
@@ -972,6 +972,16 @@ impl Levers {
             None => None,
             Some(Value::Path(p)) => Some(p),
             v => panic!("{ROUTE_TRACE} holds {v:?}, not a path"),
+        }
+    }
+
+    /// `BLOOMERY_WARM_PROFILE`: the residency's usage profile; `None` unset.
+    #[must_use]
+    pub fn warm_profile(&self) -> Option<&Path> {
+        match &self.entry(WARM_PROFILE).value {
+            None => None,
+            Some(Value::Path(p)) => Some(p),
+            v => panic!("{WARM_PROFILE} holds {v:?}, not a path"),
         }
     }
 

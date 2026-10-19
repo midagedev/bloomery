@@ -422,6 +422,7 @@ fn accessors_read_their_rows() {
             (MTP_HEAD_ROWS, "/data/rows.txt"),
             (MTP_DRAFT, A_FILE),
             (MTP_WINDOWS, "1"),
+            (WARM_PROFILE, "/data/warm.bin"),
             (ROUTE_TRACE, "/data/trace"),
             (CHECK_FINITE, "1"),
             (HOST_POPULATE, "0"),
@@ -459,6 +460,7 @@ fn accessors_read_their_rows() {
     );
     assert_eq!(set.mtp_draft(), Some(Path::new(A_FILE)));
     assert!(set.mtp_windows());
+    assert_eq!(set.warm_profile(), Some(Path::new("/data/warm.bin")));
     assert_eq!(set.route_trace(), Some(Path::new("/data/trace")));
     assert!(set.check_finite());
     assert_eq!(set.residency(), Some("mid-p40-s1"));
@@ -523,6 +525,7 @@ fn accessors_read_their_rows() {
             MTP_DRAFT,
             MTP_WINDOWS,
             MTP_WIDTH,
+            WARM_PROFILE,
             ROUTE_TRACE,
             CHECK_FINITE,
             HOST_POPULATE,
