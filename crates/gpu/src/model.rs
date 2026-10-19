@@ -1134,6 +1134,7 @@ impl<B: ChainBody> GpuModel<B> {
             )?;
             self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;
             self.stand_at(pos + 1);
+            watchdog::pass_done();
         }
         self.reads += 1;
         self.heads
