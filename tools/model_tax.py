@@ -50,6 +50,8 @@ tables are the argument, and an edit of them is what the check must not take on 
   - a baseline row keeps the baseline count it had at REV and does not rise above its count at REV;
   - a PIN row that rises needs a PIN of another date or field than REV's row (whitespace is no difference);
   - a family REV lacks joins with its date, and a family's `since` is not changed.
+Without `--base` (a checkout that has no revision to compare with: tools/contrib-check.sh, the host nightly) it holds the rows
+to the code alone and prints one line saying so; a REV that is named and does not resolve is no verdict, never that mode.
 A REV whose tree lacks tools/model-tax.tsv has nothing to compare (the table starts there). It also lists the registry
 files the tables gained since REV, because a file moved into the registries leaves the ratchet.
 A table that does not parse, a registry file that is not there, a source file it cannot read, a REV that is not a
@@ -491,6 +493,8 @@ def check(root, out, err, base=None):
           f"registries {len(reg)} lines in {len(rfiles)} files, not ratcheted", file=out)
     if base is not None:
         bad += against_base(root, base, rows, scan.families, out)
+    else:
+        print("check-model-tax: no --base: the rows are held to the code alone, not to the rows a revision had", file=out)
     report(scan, root, out)
     if bad:
         for b in bad:
@@ -667,6 +671,7 @@ def self_test():
         tax = FIXTURE["tools/model-tax.tsv"]
         arch = FIXTURE["crates/model/src/arch/mod.rs"]
         case("clean fixture passes", {}, 0, "check-model-tax: 2 common lines in 1 files", "out")
+        case("no --base says the rows are held to the code alone", {}, 0, "no --base: the rows are held to the code alone", "out")
         case("a: a new Arch::Qwen arm", {"crates/model/src/arch/mod.rs": arch.replace(
             "        _ => other(),", "        Arch::QwenB => qwen_b(),\n        _ => other(),")}, 1, "qwen 3 lines, the row allows 2")
         case("b: a counted line removed", {"crates/model/src/arch/mod.rs": arch.replace("        Arch::Qwen => qwen_spec(),\n", "")},
@@ -794,6 +799,8 @@ def self_test():
         rc, out, err = run(g, "HEAD")
         if rc != 0 or "rows against HEAD" not in out or "0 new or raised" not in out:
             fails.append(f"case base: an unchanged table against its own commit: {rc} {out}{err}")
+        if "no --base" in out:
+            fails.append(f"case base: a run with a base says it has none: {out}")
         fixture(g, {"crates/gpu/src/other.rs": "pub fn qwen_x() {}\n",
                     "tools/model-tax.tsv": FIXTURE["tools/model-tax.tsv"] + "crates/gpu/src/other.rs\tqwen\t1\tbaseline A 1: forged\n"})
         rc, out, err = run(g)

@@ -4,7 +4,10 @@
 # load alone); the second Mac is idle and runs the same step list on a tree sent to it.
 #
 #   tools/mac-remote.sh [--tree DIR] [BASE]   `just mac-static BASE` for the worktree DIR (default: the tree
-#                                             this script is in) on the second Mac; no BASE is the full run.
+#                                             this script is in) on the second Mac; no BASE is the full run, which
+#                                             holds check-model-tax to origin/main: DIR's origin/main goes to the
+#                                             clone as that ref, and a DIR without one is refused (64), as its own
+#                                             mac-static would end rc 2 there.
 #                                             The remote's output (stdout and stderr, in one stream) comes
 #                                             back on stdout, then the last 40 log lines of each red step; the exit
 #                                             code is the remote run's.
@@ -18,11 +21,11 @@
 # One clone a track on the remote, ~/repo/bloomery-mr/<track>, <track> being DIR's directory name (two
 # worktrees of one name share it; the lock below keeps their runs apart). A run is: a probe, one preflight
 # (the toolchain, just, python, the env file), the lock, `git push` of HEAD and BASE to refs/mr/* of the
-# clone (objects only), `git checkout --detach HEAD` there, rsync of DIR's content over it, `cargo fetch
-# --locked`, `just mac-static BASE`, and the ledger lines the run appended copied back. The rsync compares by
-# checksum and keeps the receiver's mtimes: a file whose content changed gets the remote's "now" and cargo
-# rebuilds it, an unchanged one is left alone (the rule tools/box.sh syncs by). target/ stays on the remote,
-# one per track: a track's first run is a cold build, the next ones warm.
+# clone (objects only; with no BASE, DIR's origin/main too, as refs/remotes/origin/main), `git checkout --detach
+# HEAD` there, rsync of DIR's content over it, `cargo fetch --locked`, `just mac-static BASE`, and the ledger lines the run
+# appended copied back. The rsync compares by checksum and keeps the receiver's mtimes: a file whose content changed gets
+# the remote's "now" and cargo rebuilds it, an unchanged one is left alone (the rule tools/box.sh syncs by). target/ stays on
+# the remote, one per track: a track's first run is a cold build, the next ones warm.
 #
 # The ledger. A green shape's line (`<key> green <date> <tree>`) is appended to the local
 # ~/.cache/bloomery/mac-static-ledger.tsv with `<track>@remote` as its tree: the reader
@@ -53,7 +56,8 @@
 # three at once is not measured.
 #
 # Exit: the remote run's code (mac-static's: the first red step's), or 0. 64: an argument, the config file
-# (missing, or not one `user@host` line) or the tree this script does not take, or a BASE that is no commit.
+# (missing, or not one `user@host` line) or the tree this script does not take, or a BASE that is no commit, or no BASE in a
+# tree with no origin/main.
 # 65: the tree has a state rsync does not carry (a submodule, a symlink out of the tree, a tracked file under
 # target/). 69: a prerequisite is missing on the remote, named with where SETUP.md makes it. 75: the remote
 # is not reachable or the connection was lost mid-run (the remote run may still finish), or the track's
@@ -650,7 +654,7 @@ sync_tree() {
 
 # remote_main TREE BASE: the run; its return is the exit code.
 remote_main() {
-  local tree=$1 basearg=$2 r base_list n_pushed channel just_v owner ssh_rc t0=$SECONDS t_setup t_run
+  local tree=$1 basearg=$2 r base_list n_pushed om channel just_v owner ssh_rc t0=$SECONDS t_setup t_run
   local steal=0 tries=0 held running total appended tw0=$SECONDS twlast=-60
   local -a pushes=()
   TREE=$(cd "$tree" 2> /dev/null && pwd -P) || { say "mac-remote: --tree '$tree' is not a directory"; return 64; }
@@ -678,6 +682,12 @@ remote_main() {
       n_pushed=$((n_pushed + 1))
       pushes+=("$r:refs/mr/base$n_pushed")
     done
+  else
+    # No BASE: mac-static holds check-model-tax to origin/main (its base_rev), a ref the clone (a `git init` fed by these pushes)
+    # lacks, so the remote run would end rc 2 where this tree's own run ends 0. The commit goes along as that ref.
+    om=$(commit_of "$TREE" origin/main) ||
+      { say "mac-remote: a run with no BASE holds check-model-tax to origin/main, which $TREE lacks: name a BASE"; return 64; }
+    pushes+=("$om:refs/remotes/origin/main")
   fi
   dirt "$TREE" || return $?
   channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$TREE/rust-toolchain.toml" 2> /dev/null | head -1)
@@ -824,6 +834,7 @@ fake_remote() {
 #!/bin/sh
 [ "$1" != --version ] || { echo "just 9.9.9"; exit 0; }
 echo "$@" > "$HOME/just.args"
+git rev-parse --verify -q 'origin/main^{commit}' > "$HOME/just.originmain" 2> /dev/null || echo none > "$HOME/just.originmain"
 echo "stub just in $(basename "$PWD")"
 basename "$PWD" >> "$HOME/just.order"
 if [ "${STUB_JUST_RC:-0}" != 0 ]; then
@@ -994,6 +1005,7 @@ self_test() {
   git -C "$repo" -c user.name=t -c user.email=t@t commit -q -m one
   printf 'b\n' >> "$repo/sub/f"
   git -C "$repo" -c user.name=t -c user.email=t@t commit -q -am two
+  git -C "$repo" update-ref refs/remotes/origin/main HEAD~1
   out=$(dirt "$repo" 2>&1) || fail "a clean tree is refused: $out"
   [ "$(base_of "$repo" 'HEAD~1..HEAD' | wc -l | tr -d ' ')" = 3 ] || fail "an A..B base does not list its argument and both shas"
   rc=0; base_of "$repo" nosuchrev > /dev/null 2>&1 || rc=$?
@@ -1097,6 +1109,18 @@ STUB
   [ "$(stat -f %m "$rt/rust-toolchain.toml")" = "$rt0" ] || fail "an unchanged file was rewritten (cargo would rebuild it)"
   case $out in *"ledger: 1 green shape line(s) this run, 0 appended here as tree-one@remote, 1 already green here"*) ;; *) fail "a repeated key was appended again: $out" ;; esac
   [ "$(cat "$rh/just.args")" = "mac-static" ] || fail "a run with no BASE gave mac-static '$(cat "$rh/just.args")'"
+  # a run with no BASE holds check-model-tax to origin/main (mac-static's base_rev): the clone has that ref at this tree's commit,
+  # and a tree with no origin/main is refused (64) before anything is sent; a BASE needs no origin/main
+  [ "$(cat "$rh/just.originmain")" = "$(git -C "$repo" rev-parse origin/main)" ] ||
+    fail "the remote clone's origin/main is '$(cat "$rh/just.originmain")' on a run with no BASE, not this tree's $(git -C "$repo" rev-parse origin/main)"
+  git -C "$repo" update-ref -d refs/remotes/origin/main
+  rc=0; out=$(run) || rc=$?
+  [ "$rc" = 64 ] || fail "a run with no BASE in a tree with no origin/main ended rc $rc, not 64: $out"
+  case $out in *"holds check-model-tax to origin/main"*) ;; *) fail "the refusal does not say why: $out" ;; esac
+  case $out in *"stub just in"*) fail "a run with no BASE and no origin/main reached the remote: $out" ;; esac
+  rc=0; out=$(run HEAD~1) || rc=$?
+  [ "$rc" = 0 ] || fail "a run with a BASE in a tree with no origin/main ended rc $rc: $out"
+  git -C "$repo" update-ref refs/remotes/origin/main HEAD~1
   # rc passes through (a child's own 75 too); a live lock is waited for (TRACK_WAIT 0 in the copy: refused at once), a dead
   # owner's lock is taken over unless its remote run is going
   rc=0; out=$(STUB_JUST_RC=3 STUB_KEY=2 run) || rc=$?
