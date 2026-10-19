@@ -167,6 +167,22 @@ pub(crate) fn check_mean_std(m: &impl Meta, why: &str) -> Result<(), VisionError
     Ok(())
 }
 
+/// A per-channel key: three f32 values, each equal to `want`.
+pub(crate) fn channels(m: &impl Meta, key: &str, want: [f32; 3]) -> Result<[f32; 3], VisionError> {
+    let v = need(m, key)?;
+    let got = match v {
+        Value::Array(a) => a.iter().map(Value::as_f32).collect::<Option<Vec<f32>>>(),
+        _ => None,
+    };
+    if got.as_deref() != Some(&want[..]) {
+        return Err(refusal(
+            key,
+            format!("is {v:?}; the preprocessing normalizes with {want:?} per channel"),
+        ));
+    }
+    Ok(want)
+}
+
 /// A key table and the harness the projector modules' refusal tests share.
 #[cfg(test)]
 pub(crate) mod testing {

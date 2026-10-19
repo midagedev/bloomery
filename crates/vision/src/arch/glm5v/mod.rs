@@ -23,7 +23,7 @@ pub use hparams::Hparams;
 pub use media::{Media, preprocess};
 pub use size::{Canvas, SizeRule};
 
-use crate::preprocess::ChannelStats;
+pub use crate::preprocess::CLIP;
 
 /// `projector_type` of the files this module reads.
 pub const PROJECTOR_TYPE: &str = "glm5v";
@@ -44,18 +44,3 @@ pub const TEMPORAL_FRAMES: usize = 2;
 /// `mm.gate.weight`, `mm.up.weight` and `mm.down.weight`, which [`tensors::check`] holds the file
 /// to.
 pub const MERGER_FF: usize = 10_240;
-
-/// CLIP's per-channel statistics, the pair the file's `clip.vision.image_mean` and `image_std`
-/// hold and the preprocessing normalizes with.
-pub const CLIP: ChannelStats = ChannelStats {
-    mean: [
-        0.481_454_670_429_229_74_f64 as f32,
-        0.457_827_508_449_554_44_f64 as f32,
-        0.408_210_724_592_208_86_f64 as f32,
-    ],
-    std: [
-        0.268_629_550_933_837_9_f64 as f32,
-        0.261_302_590_370_178_2_f64 as f32,
-        0.275_777_101_516_723_63_f64 as f32,
-    ],
-};

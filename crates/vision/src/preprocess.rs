@@ -135,6 +135,21 @@ impl ChannelStats {
     }
 }
 
+/// CLIP's per-channel statistics, the pair the files of GLM-5 and Nemotron 3.5 Bolt hold in
+/// `clip.vision.image_mean` and `image_std` and the preprocessing normalizes with.
+pub const CLIP: ChannelStats = ChannelStats {
+    mean: [
+        0.481_454_670_429_229_74_f64 as f32,
+        0.457_827_508_449_554_44_f64 as f32,
+        0.408_210_724_592_208_86_f64 as f32,
+    ],
+    std: [
+        0.268_629_550_933_837_9_f64 as f32,
+        0.261_302_590_370_178_2_f64 as f32,
+        0.275_777_101_516_723_63_f64 as f32,
+    ],
+};
+
 /// Cut an image already at the plan's pixel size into normalized patches, in `layout`'s order, at
 /// [`ChannelStats::HALF`]. The size must be a multiple of `patch * merge` on both sides.
 pub fn patchify(image: &Rgb8, plan: GridPlan, layout: PatchLayout) -> Result<Patches, VisionError> {

@@ -5,18 +5,18 @@
 //! each count must hold exactly that value, and the error names the key, the value the file holds
 //! and the config entry the module runs. The image budget is two pixel counts, 1,024 and 13,312
 //! patches of 16² pixels: the limits a seat starts from ([`Hparams::default_limits`]). The
-//! projection width is the text model's ([`Hparams::check_text_width`]); the other values the file
-//! does not carry are the tensors' shapes ([`super::tensors`]).
+//! projection width is the text model's embedding width; the other values the file does not carry
+//! are the tensors' shapes ([`super::tensors`]).
 
 use gguf::Gguf;
 
 use super::PROJECTOR_TYPE;
 use crate::VisionError;
 use crate::arch::header::{
-    KEY_HAS_VISION, KEY_MEAN, KEY_STD, Meta, check_architecture, check_eps, check_projector,
-    check_true, count_multiple, counts, need, refusal,
+    KEY_HAS_VISION, KEY_MEAN, KEY_STD, Meta, channels, check_architecture, check_eps,
+    check_projector, check_true, count_multiple, counts,
 };
-use crate::preprocess::ChannelStats;
+use crate::preprocess::{CLIP, ChannelStats};
 use crate::size::{SizeRule, TokenLimits};
 
 const KEY_GELU: &str = "clip.use_gelu";
@@ -28,7 +28,7 @@ const KEY_PROJECTION_DIM: &str = "clip.vision.projection_dim";
 pub const TILE_N: u64 = 64;
 
 /// `(key, the value the module runs, where that value comes from)` for the counts. The projection
-/// width is not among them: it is the text model's width ([`Hparams::check_text_width`]).
+/// width is not among them: it is the text model's width.
 const COUNTS: [(&str, u64, &str); 9] = [
     (
         "clip.vision.block_count",
@@ -80,10 +80,6 @@ const COUNTS: [(&str, u64, &str); 9] = [
 /// The vision tower's `nn.LayerNorm(eps=1e-6)`, as the f32 the file stores.
 const EPS: f32 = 1e-6;
 
-/// config.json `norm_mean` and `norm_std`, as the f32 values the file stores.
-const MEAN: [f32; 3] = [0.481_454_67, 0.457_827_5, 0.408_210_72];
-const STD: [f32; 3] = [0.268_629_55, 0.261_302_6, 0.275_777_1];
-
 /// The hyperparameters of one `nemotron_omni` file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hparams {
@@ -112,22 +108,6 @@ impl Hparams {
     pub fn read(gguf: &Gguf) -> Result<Hparams, VisionError> {
         check_architecture(gguf)?;
         Hparams::from_meta(gguf)
-    }
-
-    /// The file pairs with a text model of embedding width `n_embd`: the projector's output rows
-    /// are that model's input rows, so any other width is refused by name.
-    pub fn check_text_width(&self, n_embd: usize) -> Result<(), VisionError> {
-        if self.out_dim == n_embd {
-            return Ok(());
-        }
-        Err(refusal(
-            KEY_PROJECTION_DIM,
-            format!(
-                "is {}; the text model's embedding width is {n_embd}, so this encoder file is \
-                 not its own",
-                self.out_dim
-            ),
-        ))
     }
 
     /// The image-token limits of the file's own pixel budget: 256 and 3,328 merged tokens of
@@ -170,8 +150,8 @@ impl Hparams {
         )?;
         let eps = check_eps(m, EPS, "the vision tower's LayerNorm")?;
         let stats = ChannelStats {
-            mean: channels(m, KEY_MEAN, MEAN)?,
-            std: channels(m, KEY_STD, STD)?,
+            mean: channels(m, KEY_MEAN, CLIP.mean)?,
+            std: channels(m, KEY_STD, CLIP.std)?,
         };
         Ok(Hparams {
             n_layer,
@@ -187,29 +167,11 @@ impl Hparams {
     }
 }
 
-/// A per-channel key: three f32 values, each equal to the config's.
-fn channels(m: &impl Meta, key: &str, want: [f32; 3]) -> Result<[f32; 3], VisionError> {
-    let v = need(m, key)?;
-    let got = match v {
-        gguf::Value::Array(a) => a
-            .iter()
-            .map(gguf::Value::as_f32)
-            .collect::<Option<Vec<f32>>>(),
-        _ => None,
-    };
-    if got.as_deref() != Some(&want[..]) {
-        return Err(refusal(
-            key,
-            format!("is {v:?}; the preprocessing normalizes with config.json's {want:?}"),
-        ));
-    }
-    Ok(want)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::Hparams;
     use crate::arch::header::testing::{Table, expect_refusals};
+    use crate::preprocess::CLIP;
     use gguf::Value;
 
     fn triple(v: [f32; 3]) -> Value {
@@ -234,8 +196,8 @@ pub(crate) mod tests {
             ("clip.vision.image_min_pixels", Value::U32(262_144)),
             ("clip.vision.image_max_pixels", Value::U32(3_407_872)),
             ("clip.vision.attention.layer_norm_epsilon", Value::F32(1e-6)),
-            ("clip.vision.image_mean", triple(super::MEAN)),
-            ("clip.vision.image_std", triple(super::STD)),
+            ("clip.vision.image_mean", triple(CLIP.mean)),
+            ("clip.vision.image_std", triple(CLIP.std)),
         ])
     }
 
@@ -258,28 +220,6 @@ pub(crate) mod tests {
     #[test]
     fn the_files_epsilon_is_the_f32_one() {
         assert_eq!(9.999_999_974_752_427e-7_f64 as f32, super::EPS);
-    }
-
-    /// The statistics are the f32 values the header prints as doubles.
-    #[test]
-    fn the_files_statistics_are_the_f32_ones() {
-        assert_eq!(0.481_454_670_429_229_74_f64 as f32, super::MEAN[0]);
-        assert_eq!(0.275_777_101_516_723_63_f64 as f32, super::STD[2]);
-        assert_eq!(super::MEAN[0], 0.481_454_66);
-        assert_eq!(super::STD[0], 0.268_629_54);
-    }
-
-    /// The projector's rows are the text model's input rows: a file whose width is not the
-    /// model's is refused by the key and both widths.
-    #[test]
-    fn the_text_models_width_is_the_check() {
-        let hp = Hparams::from_meta(&bolt()).expect("header reads");
-        assert_eq!(
-            hp.check_text_width(2048).unwrap_err().to_string(),
-            "metadata clip.vision.projection_dim: is 4096; the text model's embedding width is \
-             2048, so this encoder file is not its own"
-        );
-        hp.check_text_width(4096).expect("same width");
     }
 
     /// Every value this crate does not run is refused, and the error names the key and the value

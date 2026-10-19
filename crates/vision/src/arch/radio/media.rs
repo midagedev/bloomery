@@ -17,14 +17,9 @@ use crate::{Rgb8, VisionError};
 /// `img_end`.
 pub const IMAGE_PLACEHOLDER: &str = "<img><image></img>";
 
-/// `<img>`: the first id [`IMAGE_PLACEHOLDER`] tokenizes to, from the text model's vocabulary.
-pub const IMG_START_ID: u32 = 19;
-
-/// `</img>`: the last id [`IMAGE_PLACEHOLDER`] tokenizes to.
-pub const IMG_END_ID: u32 = 20;
-
-/// `<image>`, config.json's `img_context_token_id`: the id between the two, which
-/// [`crate::media::expand_spans`] expands to one copy per merged token ([`Prepared::span_len`]).
+/// `<image>`, config.json's `img_context_token_id`: the id between the delimiters of
+/// [`IMAGE_PLACEHOLDER`], which [`crate::media::expand_spans`] expands to one copy per merged
+/// token ([`Prepared::span_len`]).
 pub const IMAGE_TOKEN_ID: u32 = 18;
 
 /// An image to the encoder's input: planned to a multiple of `patch * merge` by the size rule,
@@ -105,21 +100,11 @@ impl MediaModel for Media {
 mod tests {
     use std::borrow::Cow;
 
-    use super::{IMAGE_PLACEHOLDER, IMAGE_TOKEN_ID, IMG_END_ID, IMG_START_ID, Media, preprocess};
+    use super::{IMAGE_PLACEHOLDER, Media, preprocess};
     use crate::Rgb8;
     use crate::media::{MediaModel, PartJoin};
-    use crate::preprocess::{ChannelStats, normalize_channel};
+    use crate::preprocess::{CLIP, normalize_channel};
     use crate::size::{SizeRule, TokenLimits};
-
-    const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
-    const STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
-
-    fn stats() -> ChannelStats {
-        ChannelStats {
-            mean: MEAN,
-            std: STD,
-        }
-    }
 
     /// The file's own budget: 256 to 3,328 tokens of 32×32 pixels.
     fn rule() -> SizeRule {
@@ -127,7 +112,7 @@ mod tests {
     }
 
     fn media() -> Media {
-        Media::new(rule(), stats())
+        Media::new(rule(), CLIP)
     }
 
     #[test]
@@ -141,7 +126,6 @@ mod tests {
         ));
         assert_eq!(m.image_marker(), IMAGE_PLACEHOLDER);
         assert_eq!(m.image_token(), Some(18));
-        assert_eq!((IMG_START_ID, IMAGE_TOKEN_ID, IMG_END_ID), (19, 18, 20));
         assert_eq!(m.part_join(), PartJoin::LlamaServer);
     }
 
@@ -161,7 +145,7 @@ mod tests {
         assert_eq!(patches.bf16.len(), 1024 * 768);
         for (c, v) in [(0, 10), (1, 200), (2, 30)] {
             let plane = &patches.bf16[c * 256..(c + 1) * 256];
-            let want = normalize_channel(v, MEAN[c], STD[c]);
+            let want = normalize_channel(v, CLIP.mean[c], CLIP.std[c]);
             assert!(plane.iter().all(|&x| x == want), "channel {c}");
         }
     }
@@ -183,7 +167,7 @@ mod tests {
         );
         assert_eq!(p.span_len, w * h / 1024);
         // A white image resized stays white everywhere, the corner patches included.
-        let white = normalize_channel(255, MEAN[0], STD[0]);
+        let white = normalize_channel(255, CLIP.mean[0], CLIP.std[0]);
         assert_eq!(patches.bf16[0], white);
         let last = patches.bf16.len() - 768;
         assert_eq!(patches.bf16[last], white);
@@ -211,8 +195,8 @@ mod tests {
     /// the preprocess of a plain image of that size gives exactly the patches the plan names.
     #[test]
     fn a_large_image_is_planned_into_the_budget() {
-        let patches = preprocess(&Rgb8::filled(4096, 4096, [1, 2, 3]), &rule(), &stats())
-            .expect("preprocess");
+        let patches =
+            preprocess(&Rgb8::filled(4096, 4096, [1, 2, 3]), &rule(), &CLIP).expect("preprocess");
         let tokens = patches.plan.n_llm_h * patches.plan.n_llm_w;
         assert!(tokens <= 3328, "{tokens} tokens");
         assert_eq!(patches.bf16.len(), tokens * 4 * 768);
