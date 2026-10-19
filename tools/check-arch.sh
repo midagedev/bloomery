@@ -71,13 +71,15 @@ report() { # report <번호> <설명> <위반 줄들>
 # The scans of rules ① to ⑤ below: each reads only the paths it is given, and a grep or find that fails ends the
 # check through nov.
 nov() { echo "check-arch: rule $*, no verdict" >&2; exit 2; }
-cross_one() { # cross_one <crates dir> <this architecture> <the name it must not use>: rule ①'s hits into cross
-  local dirs
-  dirs=$(find "$1" -type d \( -path "*/src/arch/$2" -o -path "$1/gpu-${2//_/-}/src" \)) ||
-    nov "1 cannot list the directories of $2 under $1 (find exit $?, above)"
+cross_one() { # cross_one <crates dir> <this architecture> <the names it must not use…>: rule ①'s hits into cross
+  local dirs root=$1 this=$2 alt
+  shift 2
+  dirs=$(find "$root" -type d \( -path "*/src/arch/$this" -o -path "$root/gpu-${this//_/-}/src" \)) ||
+    nov "1 cannot list the directories of $this under $root (find exit $?, above)"
   [ -n "$dirs" ] || return 0
+  alt=$(printf '%s|' "$@")
   # shellcheck disable=SC2086
-  cross_uses "$3" $dirs
+  cross_uses "(${alt%|})" $dirs
 }
 cross_uses() { # cross_uses <name> <dir…>
   local name=$1 hits
@@ -160,11 +162,14 @@ fi
 
 # ① 두 아키텍처 디렉터리가 서로를 use 하지 않는다. 한쪽 디렉터리가 없으면 그쪽은 grep 대상이 없어
 #    통과하고, 생기는 순간부터 값을 한다.
+#    한 아키텍처마다 디렉터리를 한 번 찾고, 다른 이름 전부를 한 grep으로 본다.
 cross=
 for a in $ARCHES; do
+  others=()
   for b in $ARCHES; do
-    [ "$a" = "$b" ] || cross_one crates "$a" "$b"
+    [ "$a" = "$b" ] || others+=("$b")
   done
+  [ "${#others[@]}" = 0 ] || cross_one crates "$a" "${others[@]}"
 done
 report 1 "arch dirs use each other" "$cross"
 
