@@ -93,7 +93,7 @@ enum Open<'a> {
     /// chooser's.
     Whole { pass_rows: Option<usize> },
     /// The plan's card segment resident and the rest on the host tier.
-    Placed(PlacedOpen<'a>),
+    Placed(Box<PlacedOpen<'a>>),
 }
 
 impl GpuModel<Body> {
@@ -159,7 +159,7 @@ impl GpuModel<Body> {
                     host,
                     set,
                 };
-                let body = Body::load(gpu, &file, w, ctx, Open::Placed(open))?;
+                let body = Body::load(gpu, &file, w, ctx, Open::Placed(Box::new(open)))?;
                 refuse_scratch_past(
                     WHAT,
                     plan,
@@ -321,7 +321,7 @@ impl Body {
             }
             Open::Placed(o) => {
                 let map = map.ok_or(GpuError::state(WHAT, "a slot map for a placed load"))?;
-                (None, Some(Placed::new(gpu, &hp, &layers, map, o)?))
+                (None, Some(Placed::new(gpu, &hp, &layers, map, *o)?))
             }
         };
         let ctx_ = gpu.context();
