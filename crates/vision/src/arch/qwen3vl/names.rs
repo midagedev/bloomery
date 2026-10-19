@@ -5,22 +5,15 @@
 //! Every norm and every linear layer has a bias here. The names every projector type holds are
 //! [`crate::arch::naming`]'s, re-exported here; the strings are built there.
 
-use crate::arch::naming::{FFN_DOWN, FFN_UP, LN1, LN2, PATCH_EMBD, POST_LN, Part, blk, mm, vit};
+use crate::arch::naming::{LN1, LN2, POST_LN, Part, blk, mm, vit};
 pub use crate::arch::naming::{
-    attn_out_bias, attn_out_weight, attn_qkv_bias, attn_qkv_weight, ffn_down_weight, ffn_up_weight,
-    ln1_weight, ln2_weight, mm2_bias, mm2_weight, patch_embd_bias, patch_embd_weight,
-    post_ln_weight,
+    attn_out_bias, attn_out_weight, attn_qkv_bias, attn_qkv_weight, ffn_down_bias, ffn_down_weight,
+    ffn_up_bias, ffn_up_weight, ln1_weight, ln2_weight, mm2_bias, mm2_weight, patch_embd_bias,
+    patch_embd_weight, patch_embd_weight_second_frame, post_ln_weight,
 };
 
 /// The learned position table's stem.
 const POSITION_EMBD: &str = "position_embd";
-
-/// `v.patch_embd.weight.1` — the kernel of the second temporal frame, the same shape as
-/// [`patch_embd_weight`]'s (the first frame's). A still image fills both frames with itself, so
-/// the two halves act as one `[dim, 2·3·p·p]` weight.
-pub fn patch_embd_weight_second_frame() -> String {
-    format!("{}.1", vit(PATCH_EMBD, Part::Weight))
-}
 
 /// `v.position_embd.weight` — the learned position table, one row per position of a square grid.
 pub fn position_embd() -> String {
@@ -35,16 +28,6 @@ pub fn ln1_bias(block: usize) -> String {
 /// `v.blk.{block}.ln2.bias`.
 pub fn ln2_bias(block: usize) -> String {
     blk(block, LN2, Part::Bias)
-}
-
-/// `v.blk.{block}.ffn_up.bias`.
-pub fn ffn_up_bias(block: usize) -> String {
-    blk(block, FFN_UP, Part::Bias)
-}
-
-/// `v.blk.{block}.ffn_down.bias`.
-pub fn ffn_down_bias(block: usize) -> String {
-    blk(block, FFN_DOWN, Part::Bias)
 }
 
 /// `v.post_ln.bias`.

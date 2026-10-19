@@ -7,10 +7,9 @@
 use std::borrow::Cow;
 
 use super::TEMPORAL_FRAMES;
-use crate::GridPlan;
+use crate::arch::dyn_size;
 use crate::media::{MediaModel, PartJoin, Prepared};
-use crate::preprocess::{PatchLayout, Patches, patchify};
-use crate::resample::pad_ceil;
+use crate::preprocess::{ChannelStats, Patches};
 use crate::size::SizeRule;
 use crate::{Rgb8, VisionError};
 
@@ -39,21 +38,7 @@ pub const PAD_BLACK: [u8; 3] = [0, 0, 0];
 /// patch repeated over the temporal frames. The plan carries the pixel size and the merged-token
 /// grid.
 pub fn preprocess(image: &Rgb8, rule: &SizeRule) -> Result<Patches, VisionError> {
-    let (w_bar, h_bar) = rule.aligned(image.width, image.height)?;
-    let canvas = pad_ceil(image, w_bar, h_bar, PAD_BLACK)?;
-    let (nx, ny) = rule.grid(w_bar, h_bar);
-    let plan = GridPlan {
-        n_llm_h: ny,
-        n_llm_w: nx,
-        best_h: h_bar,
-        best_w: w_bar,
-    };
-    let layout = PatchLayout {
-        patch: rule.patch(),
-        merge: rule.merge(),
-        frames: TEMPORAL_FRAMES,
-    };
-    patchify(&canvas, plan, layout)
+    dyn_size::preprocess(image, rule, PAD_BLACK, &ChannelStats::HALF, TEMPORAL_FRAMES)
 }
 
 /// Clef's [`MediaModel`]: the size rule of its encoder file, the rest constants.

@@ -27,6 +27,7 @@ pub(crate) const LN2: &str = "ln2";
 pub(crate) const ATTN_QKV: &str = "attn_qkv";
 pub(crate) const ATTN_OUT: &str = "attn_out";
 pub(crate) const FFN_UP: &str = "ffn_up";
+pub(crate) const FFN_GATE: &str = "ffn_gate";
 pub(crate) const FFN_DOWN: &str = "ffn_down";
 
 /// `v.blk.{block}.{stem}.{part}`.
@@ -95,6 +96,33 @@ pub fn ffn_down_weight(block: usize) -> String {
     blk(block, FFN_DOWN, Part::Weight)
 }
 
+/// `v.blk.{block}.ffn_up.bias`.
+pub fn ffn_up_bias(block: usize) -> String {
+    blk(block, FFN_UP, Part::Bias)
+}
+
+/// `v.blk.{block}.ffn_down.bias`.
+pub fn ffn_down_bias(block: usize) -> String {
+    blk(block, FFN_DOWN, Part::Bias)
+}
+
+/// `v.blk.{block}.ffn_gate.weight` — the gate of a SwiGLU MLP.
+pub fn ffn_gate_weight(block: usize) -> String {
+    blk(block, FFN_GATE, Part::Weight)
+}
+
+/// `v.blk.{block}.ffn_gate.bias`.
+pub fn ffn_gate_bias(block: usize) -> String {
+    blk(block, FFN_GATE, Part::Bias)
+}
+
+/// `v.patch_embd.weight.1` — the kernel of the second temporal frame, the same shape as
+/// [`patch_embd_weight`]'s (the first frame's). A still image fills both frames with itself, so
+/// the two halves act as one `[dim, 2·3·p·p]` weight.
+pub fn patch_embd_weight_second_frame() -> String {
+    format!("{}.1", vit(PATCH_EMBD, Part::Weight))
+}
+
 /// `v.post_ln.weight` — the norm gain after the last block.
 pub fn post_ln_weight() -> String {
     vit(POST_LN, Part::Weight)
@@ -134,6 +162,11 @@ mod tests {
         assert_eq!(ln2_weight(4), "v.blk.4.ln2.weight");
         assert_eq!(ffn_up_weight(6), "v.blk.6.ffn_up.weight");
         assert_eq!(ffn_down_weight(7), "v.blk.7.ffn_down.weight");
+        assert_eq!(ffn_up_bias(8), "v.blk.8.ffn_up.bias");
+        assert_eq!(ffn_down_bias(9), "v.blk.9.ffn_down.bias");
+        assert_eq!(ffn_gate_weight(10), "v.blk.10.ffn_gate.weight");
+        assert_eq!(ffn_gate_bias(11), "v.blk.11.ffn_gate.bias");
+        assert_eq!(patch_embd_weight_second_frame(), "v.patch_embd.weight.1");
         assert_eq!(post_ln_weight(), "v.post_ln.weight");
         assert_eq!(mm2_weight(), "mm.2.weight");
         assert_eq!(mm2_bias(), "mm.2.bias");

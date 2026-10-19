@@ -9,6 +9,7 @@
 use gguf::{Gguf, Value};
 
 use crate::VisionError;
+use crate::preprocess::ChannelStats;
 
 /// The `general.architecture` of every encoder file.
 pub(crate) const ARCHITECTURE: &str = "clip";
@@ -162,6 +163,29 @@ pub(crate) fn check_mean_std(m: &impl Meta, why: &str) -> Result<(), VisionError
         };
         if per_channel.as_deref() != Some(&[0.5f32; 3]) {
             return Err(refusal(key, format!("is {v:?}; {why}")));
+        }
+    }
+    Ok(())
+}
+
+/// Both channel keys hold `want`'s three values, the f32 pairs the preprocessing normalizes with;
+/// `what` names the statistics in the refusal ("CLIP's").
+pub(crate) fn check_channel_stats(
+    m: &impl Meta,
+    want: &ChannelStats,
+    what: &str,
+) -> Result<(), VisionError> {
+    for (key, want) in [(KEY_MEAN, want.mean), (KEY_STD, want.std)] {
+        let v = need(m, key)?;
+        let got = match v {
+            Value::Array(a) => a.iter().map(Value::as_f32).collect::<Option<Vec<f32>>>(),
+            _ => None,
+        };
+        if got.as_deref() != Some(&want[..]) {
+            return Err(refusal(
+                key,
+                format!("is {v:?}; the preprocessing normalizes with {what} {want:?} per channel"),
+            ));
         }
     }
     Ok(())

@@ -6,22 +6,15 @@
 //! the merger's linears have no bias, except the convolution. The names every projector type holds
 //! are [`crate::arch::naming`]'s, re-exported here; the strings are built there.
 
-use crate::arch::naming::{FFN_DOWN, FFN_UP, PATCH_EMBD, Part, blk, vit};
+use crate::arch::naming::{Part, blk};
 pub use crate::arch::naming::{
-    attn_out_bias, attn_out_weight, attn_qkv_bias, attn_qkv_weight, ffn_down_weight, ffn_up_weight,
-    ln1_weight, ln2_weight, patch_embd_bias, patch_embd_weight, post_ln_weight,
+    attn_out_bias, attn_out_weight, attn_qkv_bias, attn_qkv_weight, ffn_down_bias, ffn_down_weight,
+    ffn_gate_bias, ffn_gate_weight, ffn_up_bias, ffn_up_weight, ln1_weight, ln2_weight,
+    patch_embd_bias, patch_embd_weight, patch_embd_weight_second_frame, post_ln_weight,
 };
 
 const ATTN_Q_NORM: &str = "attn_q_norm";
 const ATTN_K_NORM: &str = "attn_k_norm";
-const FFN_GATE: &str = "ffn_gate";
-
-/// `v.patch_embd.weight.1` — the kernel of the second temporal frame, the same shape as
-/// [`patch_embd_weight`]'s (the first frame's). A still image fills both frames with itself, so
-/// the two halves act as one `[dim, 2·3·p²]` weight.
-pub fn patch_embd_weight_second_frame() -> String {
-    format!("{}.1", vit(PATCH_EMBD, Part::Weight))
-}
 
 /// `v.blk.{block}.attn_q_norm.weight` — the RMS gain of one query head (`[head]`, shared by every
 /// head).
@@ -32,26 +25,6 @@ pub fn attn_q_norm_weight(block: usize) -> String {
 /// `v.blk.{block}.attn_k_norm.weight`.
 pub fn attn_k_norm_weight(block: usize) -> String {
     blk(block, ATTN_K_NORM, Part::Weight)
-}
-
-/// `v.blk.{block}.ffn_gate.weight`.
-pub fn ffn_gate_weight(block: usize) -> String {
-    blk(block, FFN_GATE, Part::Weight)
-}
-
-/// `v.blk.{block}.ffn_gate.bias`.
-pub fn ffn_gate_bias(block: usize) -> String {
-    blk(block, FFN_GATE, Part::Bias)
-}
-
-/// `v.blk.{block}.ffn_up.bias`.
-pub fn ffn_up_bias(block: usize) -> String {
-    blk(block, FFN_UP, Part::Bias)
-}
-
-/// `v.blk.{block}.ffn_down.bias`.
-pub fn ffn_down_bias(block: usize) -> String {
-    blk(block, FFN_DOWN, Part::Bias)
 }
 
 /// `mm.patch_merger.weight` — the 2×2 convolution that folds a merge group's four patch rows into

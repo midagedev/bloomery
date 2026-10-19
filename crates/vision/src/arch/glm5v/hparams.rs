@@ -9,15 +9,15 @@
 //! as `image_size`, are the warm-up size mtmd never reads for planning. Values the file does not
 //! carry are the tensors' shapes ([`super::tensors`]).
 
-use gguf::{Gguf, Value};
+use gguf::Gguf;
 
 use super::size::SizeRule;
 use super::{CLIP, PROJECTOR_TYPE};
 use crate::VisionError;
 use crate::arch::TokenLimits;
 use crate::arch::header::{
-    KEY_HAS_VISION, KEY_MEAN, KEY_STD, Meta, check_architecture, check_eps, check_projector,
-    check_true, count_multiple, counts, need, need_f32, refusal,
+    KEY_HAS_VISION, Meta, check_architecture, check_channel_stats, check_eps, check_projector,
+    check_true, count_multiple, counts, need_f32, refusal,
 };
 
 const KEY_SILU: &str = "clip.use_silu";
@@ -201,7 +201,7 @@ impl Hparams {
                 ),
             ));
         }
-        check_clip_stats(m)?;
+        check_channel_stats(m, &CLIP, "CLIP's")?;
         Ok(Hparams {
             n_layer,
             dim,
@@ -228,25 +228,6 @@ fn check_not_gelu(m: &impl Meta) -> Result<(), VisionError> {
             format!("is {v:?}; the MLPs are SwiGLU, so {KEY_SILU} alone is set"),
         )),
     }
-}
-
-/// Both channel keys hold CLIP's three values ([`CLIP`]), the f32 pairs the preprocessing
-/// normalizes with.
-fn check_clip_stats(m: &impl Meta) -> Result<(), VisionError> {
-    for (key, want) in [(KEY_MEAN, CLIP.mean), (KEY_STD, CLIP.std)] {
-        let v = need(m, key)?;
-        let got = match v {
-            Value::Array(a) => a.iter().map(Value::as_f32).collect::<Option<Vec<f32>>>(),
-            _ => None,
-        };
-        if got.as_deref() != Some(&want[..]) {
-            return Err(refusal(
-                key,
-                format!("is {v:?}; the preprocessing normalizes with CLIP's {want:?} per channel"),
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
