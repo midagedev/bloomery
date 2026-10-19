@@ -1,0 +1,7 @@
+# name	w	h	branch of mtmd mimovl preprocessing (align 32, 8192..8388608 pixels, black PAD_CEIL; dyn_size, bicubic); the file is images/<name>.png
+free-448x448	448	448	resize-free
+free-640x480	640	480	resize-free
+free-1024x768	1024	768	resize-free
+min-96x64	96	64	below min_pixels (8,192): scaled up to 128x96
+pad-1000x700	1000	700	aligns to 992x704: resize and pad
+pad-777x513	777	513	aligns to 768x512: resize and pad

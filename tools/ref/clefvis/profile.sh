@@ -11,6 +11,7 @@
 #   qwen4exp   Qwen3.8-Flash-Next sets ref_qwen4exp_vis_*        mainline 36a73916e (QVIS_LCPP)
 #   glm5next   GLM-5.3-Flash      sets fx_ref_glm5next_vis_*     mainline 36a73916e (QVIS_LCPP), the fixture tier only
 #   minicpmv47 MiniCPM-V 4.7      sets ref_minicpmv47_vis_*      mainline 358a420ec (MC47_LCPP), the tower arm only
+#   mimo2      MiMo-V2.6-Flash    sets ref_mimo2_vis_*           mainline cd0a5b6a1 (L5_LCPP), a CPU build: the base sets are the CPU run
 #   gemma-embedding2  EmbeddingGemma 2  sets ref_gemma_embedding2_*  mainline 6868a52cb (the model profile's LCPP), dumped by
 #                                 tools/ref/emb2/emb2.sh; build-clefvis.sh builds its binary, clefvis.sh refuses the seat
 #
@@ -50,16 +51,22 @@
 #                   extraction reads past result_norm). A node-read set says `# rows_from node`; asking for a node splits the
 #                   scheduler's graph, so its rows differ from the embeddings' by rounding
 #   THREADS         the CPU threads of a card run's host-side experts and of the twin
+#   CPU_ONLY        1: the oracle tree has no CUDA backend, so the base sets are written by the CPU run (`clefvis.sh --cpu`, no
+#                   card lock, no twin); 0: the base sets are the card run and `--cpu-twin` writes the twin
+#   TAPS            the tower arm's taps of a qvis-family seat: final (the output end) or full (the seat's per-block nodes)
 #
 # SC2034: every name here is read by the files that source this one.
 # shellcheck disable=SC2034
 : "${QVIS_LCPP:=/home/user/llama.cpp-36a73916}"
 # MiniCPM-V 4.7's tree: mainline at 358a420e (just build-mc47-lcpp), the first one this seat's sets were dumped from
 : "${MC47_LCPP:=/home/user/llama.cpp-358a420e}"
+# MiMo-V2.6-Flash's tree: mainline at cd0a5b6a1, the nemotron_h_moe profile's tree (CPU build; its `mimovl` projector and `mimo2` text
+# architecture are in mainline from that commit)
+: "${L5_LCPP:=/home/user/llama.cpp-mainline-bolt}"
 DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 # CLEFVIS_OUT moves the binary's directory, as build-clefvis.sh reads it (a scratch build under test).
 BINDIR=${CLEFVIS_OUT:-$DATA/bin}
-NCMOE_A6000=0 NCMOE_3090=0 ROWS_FROM=embd THREADS=16 CASES=tools/ref/clefvis/cases.tsv REQUESTS=
+NCMOE_A6000=0 NCMOE_3090=0 ROWS_FROM=embd THREADS=16 CASES=tools/ref/clefvis/cases.tsv REQUESTS= CPU_ONLY=0 TAPS=final
 PREPROC=0 ARMS="hidden prose bf16rows" IMAGES_EXTRA="" IMAGE_PAD_ID="" RESPELL_SOURCE="" SEAT="" IMAGES_LIST=tools/ref/clefvis/images.tsv STAGE_NAME=""
 DUMPER=tools/ref/clefvis/dump_mtmd.cpp
 case ${BLOOMERY_MODEL:-} in
@@ -130,12 +137,26 @@ case ${BLOOMERY_MODEL:-} in
     CASES=tools/ref/clefvis/cases-minicpmv47.tsv REQUESTS=tools/ref/clefvis/requests-minicpmv47.jsonl
     THREADS=16
     ;;
+  mimo2)
+    # The text model is the MXFP4 split set of models/mimo2.sh ($MODEL, 167 GB), which only the host holds: the oracle tree is a CPU
+    # build, so the base sets are the CPU run (CPU_ONLY). The seat is mtmd's `mimovl` with normal positions, aligned to
+    # patch_size * spatial_merge_size = 32 pixels, an image 8,192 to 8,388,608 pixels (the file's keys); the tower arm taps the
+    # per-block nodes (TAPS=full). The sets: preproc and taps, chatids_m1..3 (--ids) and hidden_m1..3
+    FAMILY=qvis CPU_ONLY=1 TAPS=full PREPROC=1 ARMS=hidden SEAT=mimovl SETPFX=ref_mimo2_vis ORACLE=$L5_LCPP BIN=$BINDIR/dump_mtmd_l5
+    IMAGE_PAD_ID=151655 STAGE_NAME=mimo2 REF=${MIMOVIS_REF:-$DATA/qvis/mimo2}
+    MMPROJ=/models/mmproj/ggml-org--MiMo-V2.6-Flash-MOPD-GGUF/mmproj-MiMo-V2.6-Flash-MOPD-BF16.gguf
+    MMPROJ_SHA256=9b7d98d8afe2a6ae25635ecc490fb37883f912bf1d5648d1334fdc703e4a565e
+    TEXT=$MODEL
+    IMAGES_LIST=tools/ref/clefvis/images-mimo2.tsv
+    CASES=tools/ref/clefvis/cases-mimo2.tsv REQUESTS=tools/ref/clefvis/requests-mimo2.jsonl
+    THREADS=${MIMOVIS_THREADS:-32}
+    ;;
   gemma-embedding | gemma-embedding2)
     # the model profile names the files, their digests, the tree and the steps; emb2.sh writes the sets
     FAMILY=emb2 SETPFX=ref_${MODEL_NAME//-/_} ORACLE=$LCPP BIN=$BINDIR/dump_emb2 DUMPER=tools/ref/emb2/dump_emb2.cpp
     ;;
   *)
-    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${BLOOMERY_MODEL:-}' (qwen35, qwen35moe, qwen4exp, glm5next, minicpmv47 or gemma-embedding2)" >&2
+    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${BLOOMERY_MODEL:-}' (qwen35, qwen35moe, qwen4exp, glm5next, minicpmv47, mimo2 or gemma-embedding2)" >&2
     exit 2
     ;;
 esac

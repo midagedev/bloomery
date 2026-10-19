@@ -223,6 +223,7 @@ struct seat_t {
 static const seat_t SEATS[] = {
     {"qwen3vl_merger", "<|image_pad|>", true,  false},
     {"glm5v",          "<|image|>",     false, false},
+    {"mimovl",         "<|image_pad|>", false, false},
     {"minicpmv4_7",    "<unk>",         true,  true},
 };
 static const seat_t * g_seat  = nullptr;
@@ -269,11 +270,13 @@ static int64_t gguf_arr_first(const std::string & path, const std::string & key)
 }
 
 static void select_seat(const std::string & mmproj, const std::string & requested) {
-    const std::string proj = gguf_str(mmproj, "clip.projector_type", true);
+    // the common key, or the vision key of a multimodal file (the MiMo mmproj holds a vision and an audio tower)
+    std::string proj = gguf_str(mmproj, "clip.projector_type", false);
+    if (proj.empty()) proj = gguf_str(mmproj, "clip.vision.projector_type", true);
     for (const seat_t & s : SEATS) {
         if (proj == s.projector) g_seat = &s;
     }
-    if (!g_seat) DIE("%s: no seat for the projector '%s' (qwen3vl_merger, glm5v or minicpmv4_7)", mmproj.c_str(), proj.c_str());
+    if (!g_seat) DIE("%s: no seat for the projector '%s' (qwen3vl_merger, glm5v, mimovl or minicpmv4_7)", mmproj.c_str(), proj.c_str());
     if (!requested.empty() && requested != g_seat->projector) {
         DIE("%s: the projector is '%s', this run was handed the seat '%s'", mmproj.c_str(), proj.c_str(), requested.c_str());
     }
@@ -508,6 +511,11 @@ static void image_lines(set_writer & w, const std::vector<image_info> & infos) {
 // ---- tower ---------------------------------------------------------------------------------------------------------
 
 static const int TAP_BLOCKS[] = {0, 1, 13, 26};
+// The mimovl seat's blocks: the first full one, the first row-window one, the first column-window one, the first full one after
+// a column run (its input is un-permuted), and the last.
+static const int MIMO_TAP_BLOCKS[] = {0, 1, 5, 9, 27};
+static const char * MIMO_TAP_NODES[] = {"ln1", "Qcur_rope", "attn_out", "ffn_inp", "ffn_out", "layer_out"};
+static bool is_mimovl() { return g_seat && strcmp(g_seat->projector, "mimovl") == 0; }
 static const char * TAP_NODES[] = {"ln1", "Qcur_rope", "attn_out", "ffn_inp", "ffn_out", "layer_out"};
 
 static int run_tower(const std::string & mmproj, const std::string & text_model, const std::vector<image_arg> & images,
@@ -541,6 +549,14 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
         if (!taps_final) wanted.push_back("inp_pos_emb");
         wanted.push_back("norm_b-27");
         if (!taps_final) for (int b : TAP_BLOCKS) for (const char * n : TAP_NODES) wanted.push_back(std::string(n) + "-" + std::to_string(b));
+    } else if (is_mimovl()) {
+        // mimovl.cpp's nodes: the block nodes carry the block's suffix, `patch_embed`, `post_ln` and `vit_out` (cb(..., -1)) none
+        if (!taps_final) {
+            wanted.push_back("patch_embed");
+            for (int b : MIMO_TAP_BLOCKS) for (const char * n : MIMO_TAP_NODES) wanted.push_back(std::string(n) + "-" + std::to_string(b));
+        }
+        wanted.push_back("post_ln");
+        wanted.push_back("vit_out");
     } else {
         // glm4v.cpp's output nodes (cb(..., -1): no block suffix); the per-block taps of the Qwen graph are not this seat's
         if (!taps_final) DIE("--taps full is the Qwen seats' per-block taps; the %s seat taps its output nodes: --taps final", g_seat->projector);
@@ -623,7 +639,11 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
                   std::string("dump_mtmd tower — mtmd's ") + g_seat->projector + " graph nodes and final embeddings, raw f32, little-endian");
     if (taps_final) {
         tw.line(g_seat->mrope ? "# taps\tnorm_b-27 (the post-LN output) of every image; embd (the clean pass)"
-                              : "# taps\tvit_out after_fc_proj after_ffn_proj of every image; embd (the clean pass)");
+                              : is_mimovl() ? "# taps\tpost_ln vit_out of every image; embd (the clean pass)"
+                                            : "# taps\tvit_out after_fc_proj after_ffn_proj of every image; embd (the clean pass)");
+    } else if (is_mimovl()) {
+        tw.line("# tap_patches\t" + std::to_string(tap_patches));
+        tw.line("# taps\tpatch_embed; blocks 0,1,5,9,27 of ln1 Qcur_rope attn_out ffn_inp ffn_out layer_out; post_ln; vit_out; embd (the clean pass)");
     } else {
         tw.line("# tap_patches\t" + std::to_string(tap_patches));
         tw.line("# taps\tblocks 0,1,13,26 of ln1 Qcur_rope attn_out ffn_inp ffn_out layer_out; inp_pos_emb; norm_b-27 (the post-LN output); embd (the clean pass)");
@@ -1637,7 +1657,11 @@ static int run_chat(const std::string & mmproj, const std::string & text_model, 
             inputs.continue_final_message = COMMON_CHAT_CONTINUATION_AUTO;
             inputs.add_generation_prompt = false;
         }
+#ifdef DUMP_MTMD_CHAT_PROMPT_PARTS
+        const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt.str(); // the prompt is parts: template and user input
+#else
         const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+#endif
 
         std::vector<mtmd_bitmap *> bms;
         std::vector<std::string> rgb_sha, png_sha;

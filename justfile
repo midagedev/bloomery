@@ -778,6 +778,14 @@ build-mc47-ref:
 dump-ref-mcvis *ARGS:
     case " {{ARGS}} " in *" --ids "*|*" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL=minicpmv47 ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
 
+# MiMo-V2.6-Flash image input, the oracle's binary: dump_mtmd (tower, hidden and chat arms) linked against the mainline tree cd0a5b6a1 (the nemotron_h_moe profile's, a CPU build) in /home/user/llama.cpp-mainline-bolt (tools/ref/clefvis/build-clefvis.sh, the mimo2 row of tools/ref/clefvis/profile.sh) into $BLOOMERY_DATA/bin/dump_mtmd_l5; CLEFVIS_OUT=<dir> (in BLOOMERY_BOX_ENV) builds into another directory for a test.
+build-l5-ref:
+    BLOOMERY_MODEL=mimo2 ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
+
+# MiMo-V2.6-Flash image input, the oracle sets (tools/ref/clefvis/clefvis.sh, the mimo2 seat of profile.sh, images tools/ref/clefvis/images-mimo2.tsv, cases cases-mimo2.tsv, requests requests-mimo2.jsonl): the preprocess (ref_mimo2_vis_preproc), the tower's per-block nodes (ref_mimo2_vis_taps), hidden states of three chat prompts (ref_mimo2_vis_hidden_m1..3) and, with `--ids`, the ids llama-server's chat path gives each request (ref_mimo2_vis_chatids_m1..3) into $BLOOMERY_DATA. The oracle tree has no CUDA backend, so a set is the CPU run (`--cpu`, the default of this recipe): no card lock, no twin. The hidden arm populates the 167 GB text split into the page cache (docs/cards/mimoref-dump.card prices it); no lease.
+dump-ref-mimovis *ARGS:
+    case " {{ARGS}} " in *" --ids "*) a="{{ARGS}}" ;; *) a="--cpu {{ARGS}}" ;; esac; BLOOMERY_MODEL=mimo2 ./tools/box.sh "bash tools/ref/clefvis/clefvis.sh $a"
+
 # EmbeddingGemma 2 (gemma-embedding2, its tower gemma4v), the oracle's tree: llama.cpp mainline at 6868a52cb in /home/user/llama.cpp-6868a52c, the same script as the Qwen tree (tools/ref/qvis/build-lcpp-qvis.sh) with the pin, tree, sentinel directory and targets by environment (llama-server and llama-tokenize besides the libraries); detached, pid, log and rc under /root/lcpp-emb2.
 build-emb2-lcpp:
     BLOOMERY_BOX_ENV='LCPP_BUILD_PIN=6868a52cb337450658006ad2f9281c2eb63f1666 LCPP_BUILD_TREE=/home/user/llama.cpp-6868a52c LCPP_BUILD_DIR=/root/lcpp-emb2 LCPP_BUILD_TARGETS=llama,mtmd,llama-common,llama-server,llama-tokenize' ./tools/box.sh '[ "$(id -u)" = 0 ] || { echo "build-emb2-lcpp: this recipe requires root on the box (/root/lcpp-emb2 and /home/user); run build-lcpp-qvis.sh directly with writable LCPP_BUILD_DIR and LCPP_BUILD_TREE on a local machine" >&2; exit 2; }; setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
