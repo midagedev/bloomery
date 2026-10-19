@@ -161,6 +161,7 @@ crates/model/src/ops.rs	derive	DEFER_MAX_COLS (gpu's host/step.rs and host/tier.
 crates/model/src/embed.rs	derive	RowLayout and EmbedTable: the V4.1 glue, the draft and the GLM body
 crates/model/src/placement/workstation.rs	derive	host_available, which GpuModel's placement (gpu's model.rs) and the qwen35moe plan read
 crates/model/src/arch/qwen35moe/fixture.rs	derive	the Qwen3.8 fixture spec, which the fixture test reads
+crates/model/src/arch/qwen35moe/fixture/**	gate-gpu-gemma-embedding2-e2e gate-fixture gate-fixture-budget	the Qwen3.6 fixture spec: the generator's tests (gate-fixture), its recorded-budget test (gate-fixture-budget) and the embedding gate's fixture-tier plan read it through the model lib; the other gates that link the lib do not reach its items
 crates/model/data/mtp-head-rows-qwen38-*.txt	derive	Qwen3.8's shipped MTP head list, which arch/qwen35moe/head_list.rs includes (include_str!): the gates whose targets run its reader (head_rows_of, SHIPPED)
 tools/fixture-variants.tsv	derive	the fixture variants' table, which fixture/variant.rs reads by path at run time: the fixture test
 crates/models/src/lib.rs	derive	its re-exports (Role, Need: every placement path names models::Role through them) and ModelSpec and Score, which the arch readers and models::shape read
