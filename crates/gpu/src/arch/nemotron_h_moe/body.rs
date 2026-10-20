@@ -81,7 +81,7 @@ pub struct Body {
     /// The step record's host words, rewritten by every refresh.
     words: Words,
     /// The prompt pass's buffers ([`Body::enqueue_pass`]).
-    pub(super) prompt: Option<Prompt>,
+    pub(super) prompt: Prompt,
     /// The host tier and the card's side of it; `None` on a whole-card load.
     pub(super) placed: Option<Placed>,
 }
@@ -320,7 +320,7 @@ impl Body {
                 let sizes = PassSizes::of((&sh, moe, hp.n_head), &layers, false);
                 let free = gpu.alloc_room()?;
                 let rows = choose_pass_rows(&sizes, (ctx, pass_rows), free, PASS_ROWS_MAX)?;
-                (Some(Prompt::new(stream, &sizes, rows)?), None)
+                (Prompt::new(stream, &sizes, rows)?, None)
             }
             Open::Placed(o) => {
                 let map = map.ok_or(GpuError::state(WHAT, "a slot map for a placed load"))?;
@@ -329,7 +329,7 @@ impl Body {
                 let rows = choose_pass_rows(&sizes, (ctx, None), free, PLACED_ROWS)?;
                 let prompt = Prompt::new(stream, &sizes, rows)?;
                 let placed = Placed::new(gpu, &hp, &layers, map, (*o, rows))?;
-                (Some(prompt), Some(placed))
+                (prompt, Some(placed))
             }
         };
         let ctx_ = gpu.context();
@@ -354,14 +354,6 @@ impl Body {
             layers,
             embed,
         })
-    }
-
-    /// The prompt pass's buffers.
-    pub(super) fn prompt(&self) -> Result<&Prompt, GpuError> {
-        self.prompt.as_ref().ok_or(GpuError::state(
-            "nemotron_h_moe::Body::prompt",
-            "the prompt pass's buffers",
-        ))
     }
 
     /// Device bytes the body holds past the weights and the stores: what the
@@ -532,17 +524,23 @@ impl ChainBody for Body {
     /// Every scan state and conv ring back to zero. The K/V planes need
     /// nothing: the flash never reads a row at or past the live count, and
     /// every row below it is written by its own step first. The router's
-    /// results are written whole by every step before any read.
+    /// results are written whole by every step before any read. A placed
+    /// load's expert up rows are cleared too: the launch that fills them skips
+    /// the slots the host serves and the quantize after it reads every slot,
+    /// so the non-finite rows a faulted call left would fault the next valid
+    /// one.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         for layer in &mut self.layers {
             if let Layer::Mamba(m) = layer {
                 m.store.clear(gpu.stream(), &self.zeros)?;
             }
         }
-        match self.placed.as_mut() {
-            Some(p) => p.reset(gpu.stream()),
-            None => Ok(()),
+        if let Some(p) = self.placed.as_mut() {
+            self.ms.up.zero_async(gpu.stream())?;
+            self.prompt.clear_expert_up(gpu.stream())?;
+            p.reset(gpu.stream())?;
         }
+        Ok(())
     }
 
     fn head_eps(&self) -> f32 {
@@ -559,7 +557,7 @@ impl ChainBody for Body {
                 Layer::Moe(_) => 0,
             })
             .sum();
-        stores + self.prompt.as_ref().map_or(0, Prompt::bytes) + self.scratch_bytes()
+        stores + self.prompt.bytes() + self.scratch_bytes()
     }
 
     fn layers(&self) -> Range<usize> {
