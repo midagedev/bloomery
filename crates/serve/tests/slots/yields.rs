@@ -9,7 +9,8 @@
 //! one leaves; a client gone between the calls ends its request, the slot
 //! freed and the other stream on; `/slots` shows the prompt's positions as its
 //! calls run; and `prompt_ms` is the prompt's own engine time. A constrained
-//! request's run of fixed ids is a call of its own the same way.
+//! request's run of fixed ids is a call of its own the same way, and `/slots`
+//! shows its positions as its calls run.
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
@@ -652,4 +653,42 @@ fn hw_a_run_of_fixed_ids_is_a_call_a_round_beside_a_decoding_stream() {
             .count()
     };
     assert!(b_calls(jump) < b_calls(step), "{jump:?} | {step:?}");
+}
+
+/// `/slots` shows a run's positions as its calls run, as a prompt's: with the
+/// second call of B's first run in the engine, the view holds the positions
+/// the first call left, the ids the engine has been fed on B's slot.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_slots_shows_a_runs_positions_as_its_calls_run() {
+    let log = new_log();
+    let (mut engine, latch) = holding(0, 2, &log);
+    let second = Arc::new(Latch::default());
+    engine
+        .at
+        .push((Kind::Pre, 1, 3, Then::Hold(Arc::clone(&second))));
+    let (addr, log) = serve_jump(engine, true);
+    let a = post_bg(addr, completion(A, 60));
+    assert!(latch.wait_entered(BOUND), "A never decoded");
+    let b = std::thread::spawn(move || post(addr, "/completion", &document()));
+    wait_deferred(addr, 1, BOUND);
+    latch.release();
+    assert!(
+        second.wait_entered(BOUND),
+        "B's second call of the run never came: {:?}",
+        calls(&log)
+    );
+    let fed: usize = calls(&log)
+        .iter()
+        .map(|c| match *c {
+            Call::Pre { slot: 1, n } => n,
+            Call::Next { slot: 1 } => 1,
+            _ => 0,
+        })
+        .sum();
+    let view = get(addr, "/slots").json()[1].clone();
+    assert_eq!(view["n_past"], fed, "{view}");
+    second.release();
+    let (a, b) = (a.join().expect("a"), b.join().expect("b"));
+    assert_eq!((a.status, b.status), (200, 200), "{} | {}", a.body, b.body);
 }

@@ -2171,7 +2171,8 @@ impl Gen {
 
     /// One call of the run being fed ([`Need::Fill`]): its ids, or a
     /// `quantum` of them when other slots are busy, fed as one
-    /// [`Engine::prefill`] that books them. The call that ends the run puts
+    /// [`Engine::prefill`] that books them; the request's `n_past` is the
+    /// slot's positions after each call. The call that ends the run puts
     /// the run in hand as a pass's tokens are: the loop takes them one at a
     /// time, and the last is the id the next [`Need::Step`] feeds.
     ///
@@ -2189,6 +2190,7 @@ impl Gen {
         });
         slot.prefill_range(&span.feed[span.fed..end], slot.held.len(), &[])?;
         span.fed = end;
+        self.tim.n_past = slot.held.len();
         if let Some(j) = self.tim.jump.as_mut() {
             j.prefill_calls += 1;
         }
@@ -2198,7 +2200,6 @@ impl Gen {
         let Some(span) = self.span.take() else {
             return Ok(());
         };
-        self.tim.n_past = self.n + self.generated.len() + span.run.len() - 1;
         self.kept = span.run;
         self.tok = Some(self.kept[0]);
         self.taken = 1;

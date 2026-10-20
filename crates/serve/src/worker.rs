@@ -790,6 +790,8 @@ impl Worker {
                     if let Err(e) = called {
                         return Err(self.die(&e));
                     }
+                    // `/slots` shows the run's positions as its calls run.
+                    tick_of(&self.sh, a.slot)(a.job.timings());
                     needs.push(Need::Fill);
                     k += 1;
                 }

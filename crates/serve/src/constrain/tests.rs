@@ -1612,7 +1612,7 @@ fn a_run_fed_in_quanta_asks_the_sink_between_calls() {
         .schema_jump(true);
         let p = params(Some(c.clone()), ThinkEntry::Closed);
         let mut asked = 0;
-        let (r, _) = generate_in_quanta(
+        let (r, timings) = generate_in_quanta(
             &mut slot,
             &sampling::reference_factory(),
             &tok.encode(PROMPT),
@@ -1628,6 +1628,11 @@ fn a_run_fed_in_quanta_asks_the_sink_between_calls() {
                 Ok(())
             },
             &mut |_| {},
+        );
+        assert_eq!(
+            timings.n_past,
+            slot.held_of(0).len(),
+            "the positions the request reports are the cache's: gone_at {gone_at}"
         );
         let calls = seen.lock().expect("seen").calls.clone();
         let prompt_step = calls
