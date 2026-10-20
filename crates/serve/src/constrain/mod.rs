@@ -33,7 +33,7 @@ mod program;
 mod schema;
 mod vocab;
 
-pub(crate) use program::{Constraint, Part, StepError, Style, Walk};
+pub(crate) use program::{Constraint, Decision, Part, StepError, Style, Walk, Watch};
 pub(crate) use schema::{Ask, Fun, call, is_text, request, value};
 pub(crate) use vocab::Vocab;
 
