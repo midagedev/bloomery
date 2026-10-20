@@ -1545,22 +1545,45 @@ fn dump_ik_meta_check(file: &str, meta: &str, pin: &str) -> Result<(), String> {
     }
 }
 
-/// `iq4xs-ik-dot.txt`, refused by name unless its meta names the pinned ik commit.
-fn iq4xs_dump() -> QwenDump {
-    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+/// `iq4xs-ik-dot.txt` and its `.meta` under `<base>/ref`, read as a pair: the harness holds
+/// `iq4xs-ik-dot.lock` exclusive from before it drops the meta until after it writes the new one,
+/// so under the shared lock the meta names the commit the dump was made at. A missing lock file or
+/// meta, and a meta that names a commit other than `pin`, are refused by name.
+fn read_iq4xs_pair(base: &str, pin: &str) -> Result<QwenDump, String> {
+    let lock_path = format!("{base}/ref/iq4xs-ik-dot.lock");
+    let lock = std::fs::File::open(&lock_path)
+        .map_err(|e| format!("{lock_path}: {e} — run just build-ref-iq4xs first"))?;
+    lock.lock_shared()
+        .map_err(|e| format!("{lock_path}: the shared lock: {e}"))?;
     let meta_path = format!("{base}/ref/iq4xs-ik-dot.meta");
     let meta = std::fs::read_to_string(&meta_path)
-        .unwrap_or_else(|e| panic!("{meta_path}: {e} — run just build-ref-iq4xs first"));
-    if let Err(why) = dump_ik_meta_check("iq4xs-ik-dot", &meta, IQ4XS_IK_PIN.trim()) {
-        panic!("{why} — run just build-ref-iq4xs first");
-    }
-    qwen_dump("iq4xs-ik-dot.txt", GgmlType::IQ4_XS, 136, 256)
+        .map_err(|e| format!("{meta_path}: {e} — run just build-ref-iq4xs first"))?;
+    dump_ik_meta_check("iq4xs-ik-dot", &meta, pin)
+        .map_err(|why| format!("{why} — run just build-ref-iq4xs first"))?;
+    Ok(qwen_dump_in(
+        base,
+        "iq4xs-ik-dot.txt",
+        GgmlType::IQ4_XS,
+        136,
+        256,
+    ))
+}
+
+/// The IQ4_XS dump at the pinned ik commit, or a panic naming why not.
+fn iq4xs_dump() -> QwenDump {
+    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    read_iq4xs_pair(&base, IQ4XS_IK_PIN.trim()).unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// Reads `$BLOOMERY_DATA/ref/<file>`, every line by its tag; an untagged or unknown
 /// line is refused, and the shapes must match the type's column and row contracts.
 fn qwen_dump(file: &str, ty: GgmlType, block: usize, gran: usize) -> QwenDump {
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    qwen_dump_in(&base, file, ty, block, gran)
+}
+
+/// `qwen_dump` over `<base>/ref/<file>`.
+fn qwen_dump_in(base: &str, file: &str, ty: GgmlType, block: usize, gran: usize) -> QwenDump {
     let path = format!("{base}/ref/{file}");
     let dump = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{path}: {e} — run just build-ref first"));
@@ -1890,6 +1913,202 @@ fn iq4xs_dump_meta_names_the_pin() {
     assert!(dump_ik_meta_check("d", &format!("ik={}\n", &pin[..8]), pin).is_err());
     let err = dump_ik_meta_check("d", "built=2026-10-21T00:00:00Z\n", pin).unwrap_err();
     assert_eq!(err, "d.meta has no ik= line");
+}
+
+/// A scratch `$BLOOMERY_DATA` (`ref/` inside), removed on drop.
+struct ScratchData(std::path::PathBuf);
+
+impl ScratchData {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("qdot-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ref")).expect("scratch data dir");
+        Self(dir)
+    }
+
+    fn base(&self) -> &str {
+        self.0.to_str().expect("utf-8 temp dir")
+    }
+
+    fn file(&self, name: &str) -> String {
+        format!("{}/ref/{name}", self.base())
+    }
+}
+
+impl Drop for ScratchData {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A dump of the IQ4_XS contract's smallest shape (k = 256, 16 rows) with zero blocks.
+fn iq4xs_dump_text() -> String {
+    let mut s = format!(
+        "tensor t k 256\n{}\n",
+        "00".repeat(col_bytes(GgmlType::IQ4_XS, 256))
+    );
+    for r in 0..16 {
+        s += &format!("w {r} {}\n", "00".repeat(136));
+    }
+    for r in 0..16 {
+        s += &format!("row {r} 00000000\n");
+    }
+    s
+}
+
+/// The pair reader refuses by name, before it reads the dump: a missing lock file or meta, a meta
+/// without an `ik=` line, and a meta naming another commit. A pair at the pin loads.
+#[test]
+fn iq4xs_pair_reader_refuses_by_name() {
+    let pin = IQ4XS_IK_PIN.trim();
+    let s = ScratchData::new("pair-refuse");
+    let err = read_iq4xs_pair(s.base(), pin).err().expect("no lock file");
+    assert!(
+        err.contains("iq4xs-ik-dot.lock") && err.contains("just build-ref-iq4xs"),
+        "{err}"
+    );
+    std::fs::write(s.file("iq4xs-ik-dot.lock"), "").unwrap();
+    let err = read_iq4xs_pair(s.base(), pin).err().expect("no meta");
+    assert!(err.contains("iq4xs-ik-dot.meta"), "{err}");
+    std::fs::write(s.file("iq4xs-ik-dot.meta"), "built=2026-10-21T00:00:00Z\n").unwrap();
+    let err = read_iq4xs_pair(s.base(), pin).err().expect("no ik= line");
+    assert!(err.contains("has no ik= line"), "{err}");
+    let stale = "c10fbbcccd69cb1c66ddeb39601b0cd71701f7c3";
+    std::fs::write(s.file("iq4xs-ik-dot.meta"), format!("ik={stale}\n")).unwrap();
+    let err = read_iq4xs_pair(s.base(), pin).err().expect("stale meta");
+    assert!(err.contains(stale) && err.contains(pin), "{err}");
+    std::fs::write(s.file("iq4xs-ik-dot.meta"), format!("ik={pin}\n")).unwrap();
+    std::fs::write(s.file("iq4xs-ik-dot.txt"), iq4xs_dump_text()).unwrap();
+    let d = read_iq4xs_pair(s.base(), pin).expect("a pair at the pin");
+    assert_eq!((d.k, d.rows.len(), d.want.len()), (256, 16, 16));
+}
+
+/// The pair reader reads nothing while the harness holds the pair's lock, and reads the new pair
+/// once it lets go.
+#[test]
+fn iq4xs_pair_reader_waits_for_the_writer() {
+    use std::time::Duration;
+    let pin = IQ4XS_IK_PIN.trim().to_string();
+    let s = ScratchData::new("pair-wait");
+    let lock_path = s.file("iq4xs-ik-dot.lock");
+    std::fs::write(s.file("iq4xs-ik-dot.meta"), format!("ik={pin}\n")).unwrap();
+    std::fs::write(s.file("iq4xs-ik-dot.txt"), iq4xs_dump_text()).unwrap();
+    let writer = std::fs::File::create(&lock_path).unwrap();
+    writer.lock().unwrap();
+    let base = s.base().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        tx.send(read_iq4xs_pair(&base, &pin).map(|d| d.k)).unwrap();
+    });
+    let early = rx.recv_timeout(Duration::from_millis(500));
+    writer.unlock().unwrap();
+    let late = rx.recv_timeout(Duration::from_secs(30));
+    reader.join().unwrap();
+    assert!(
+        early.is_err(),
+        "the reader returned {early:?} while the writer held the lock"
+    );
+    assert_eq!(late.expect("the reader after the unlock"), Ok(256));
+}
+
+/// A scratch data dir for the built `iq4xs_ref` harness: the oracle's activation dump copied in,
+/// and the model path of a file that is not there, which makes the harness dump synthetic blocks.
+fn iq4xs_ref_scratch(tag: &str) -> (ScratchData, std::process::Command) {
+    let real = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    let bin = format!("{real}/bin/iq4xs_ref");
+    assert!(
+        std::path::Path::new(&bin).exists(),
+        "{bin}: run just build-ref-iq4xs first"
+    );
+    let s = ScratchData::new(tag);
+    let norm = "attn_norm-0.0.f32";
+    std::fs::copy(format!("{real}/ref/{norm}"), s.file(norm))
+        .expect("the oracle's activation dump");
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg(s.file("no-model.gguf"))
+        .env("BLOOMERY_DATA", s.base())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    (s, cmd)
+}
+
+/// The harness takes the pair's lock exclusive and drops the meta before it publishes the dump,
+/// so a meta write that fails leaves a dump with no meta, never a meta of an earlier commit
+/// beside a dump of this one. Its meta names the commit of `tools/ref/iq4xs-ik.pin`.
+#[test]
+#[ignore = "hw: needs the box and the built iq4xs_ref"]
+fn hw_iq4xs_ref_invalidates_the_meta_before_it_publishes() {
+    let pin = IQ4XS_IK_PIN.trim();
+    let (s, mut cmd) = iq4xs_ref_scratch("ref-invalidate");
+    assert!(cmd.status().unwrap().success(), "the harness run");
+    let meta = std::fs::read_to_string(s.file("iq4xs-ik-dot.meta")).expect("the harness's meta");
+    dump_ik_meta_check("iq4xs-ik-dot", &meta, pin)
+        .unwrap_or_else(|why| panic!("{why} — the harness binary is not the pin's: rebuild it"));
+    read_iq4xs_pair(s.base(), pin).expect("a pair at the pin");
+    // A meta of another commit stands; the next run's meta write fails (its temporary name is a
+    // directory: `sh` execs the harness, so the pid in the name is the harness's).
+    let earlier = "c10fbbcccd69cb1c66ddeb39601b0cd71701f7c3";
+    std::fs::write(s.file("iq4xs-ik-dot.meta"), format!("ik={earlier}\n")).unwrap();
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"mkdir "$1.tmp.$$" && exec "$2" "$3""#)
+        .args(["sh", &s.file("iq4xs-ik-dot.meta")])
+        .arg(cmd.get_program())
+        .arg(s.file("no-model.gguf"))
+        .env("BLOOMERY_DATA", s.base())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "the harness run with a failing meta write"
+    );
+    assert!(
+        !std::path::Path::new(&s.file("iq4xs-ik-dot.meta")).exists(),
+        "a meta of ik {earlier} is left beside the dump of the run that failed to write its own"
+    );
+    let err = read_iq4xs_pair(s.base(), pin)
+        .err()
+        .expect("a dump with no meta");
+    assert!(err.contains("iq4xs-ik-dot.meta"), "{err}");
+}
+
+/// The harness publishes nothing while a reader holds the pair's shared lock, and publishes once
+/// it lets go.
+#[test]
+#[ignore = "hw: needs the box and the built iq4xs_ref"]
+fn hw_iq4xs_ref_publishes_under_the_pair_lock() {
+    use std::time::{Duration, Instant};
+    let pin = IQ4XS_IK_PIN.trim();
+    let (s, mut cmd) = iq4xs_ref_scratch("ref-lock");
+    let reader = std::fs::File::create(s.file("iq4xs-ik-dot.lock")).unwrap();
+    reader.lock_shared().unwrap();
+    let mut child = cmd.spawn().unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    let waiting = child.try_wait().unwrap().is_none();
+    let published = ["iq4xs-ik-dot.txt", "iq4xs-ik-dot.meta"]
+        .iter()
+        .any(|f| std::path::Path::new(&s.file(f)).exists());
+    reader.unlock().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("the harness did not finish within 60 s of the unlock");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(waiting, "the harness finished while a reader held the lock");
+    assert!(
+        !published,
+        "the harness published while a reader held the lock"
+    );
+    assert!(status.success(), "the harness run after the unlock");
+    read_iq4xs_pair(s.base(), pin).expect("the pair the harness published");
 }
 
 /// IQ4_XS gate B: every dumped row within 1 ULP of ik's

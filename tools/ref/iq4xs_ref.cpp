@@ -8,10 +8,12 @@
 // the 6-bit scale split, and multiply_add_avx2's sign fold. Each block has one
 // float multiply-add and no bsums offset.
 //
-// The path is ik PR 2664's. This harness links the ik tree that tools/ref/iq4xs-ik.pin names
-// (tools/ref/ik-pin-tree.sh makes it), not the shared tree the other harnesses link, and
-// REF_IK_COMMIT is that commit. The dump's .meta (iq4xs-ik-dot.meta: ik=<commit>, built=<UTC>)
-// is written after the dump, and gate-qdot refuses a dump whose meta names another commit.
+// The signed path is the pinned commit's. This harness links the ik tree that tools/ref/iq4xs-ik.pin
+// names (tools/ref/ik-pin-tree.sh makes it), not the shared tree the other harnesses link, and
+// REF_IK_COMMIT is that commit. The dump's .meta (iq4xs-ik-dot.meta: ik=<commit>, built=<UTC>) and
+// the dump are published as a pair under iq4xs-ik-dot.lock, held exclusive from before the meta is
+// dropped until the new one is written; gate-qdot reads the pair under the shared lock and refuses
+// a dump whose meta is missing or names another commit.
 //
 // The GGUF is argv[1]: build-qdot-ref.sh passes the Qwen3.8 UD-Q3_K_XL second shard
 // (BLOOMERY_QWEN_Q3_MODEL), whose IQ4_XS tensors are the one layer's ffn_gate/up_exps.
@@ -28,6 +30,8 @@
 #include "iqk_gemm_kquants.h"
 
 #include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
@@ -180,13 +184,24 @@ int main(int argc, char **argv) {
         }
         dot += "\n";
     }
-    if (!write_atomic(std::string(kDataDir) + "/ref/iq4xs-ik-dot.txt", dot.data(), dot.size())) return 1;
-    // The meta goes last: a dump never sits beside a meta that vouches for a commit it was not made at.
+    // The pair's lock stays held until exit. The meta is dropped before the dump is published and written after it:
+    // a run that stops between leaves a dump with no meta, never a meta of an earlier commit beside this dump.
+    const std::string stem = std::string(kDataDir) + "/ref/iq4xs-ik-dot";
+    const int guard = open((stem + ".lock").c_str(), O_CREAT | O_RDWR, 0666);
+    if (guard < 0 || flock(guard, LOCK_EX) != 0) {
+        perror("iq4xs_ref: lock");
+        return 1;
+    }
+    if (unlink((stem + ".meta").c_str()) != 0 && errno != ENOENT) {
+        perror("iq4xs_ref: invalidate meta");
+        return 1;
+    }
+    if (!write_atomic(stem + ".txt", dot.data(), dot.size())) return 1;
     char stamp[32];
     const time_t now = time(nullptr);
     strftime(stamp, sizeof stamp, "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
     const std::string meta = std::string("ik=") + REF_IK_COMMIT + "\nbuilt=" + stamp + "\n";
-    if (!write_atomic(std::string(kDataDir) + "/ref/iq4xs-ik-dot.meta", meta.data(), meta.size())) return 1;
+    if (!write_atomic(stem + ".meta", meta.data(), meta.size())) return 1;
     printf("dumped %d rows of %s (q8_K pairing, ik %s)\n", dot_rows, tensor_name.c_str(), REF_IK_COMMIT);
     return 0;
 }
