@@ -7,12 +7,12 @@
 //! template, the answer the language-model head's logits at label tokens.
 //!
 //! [`json`] reads a request as Python does, [`render`] writes JSON as Python does, [`request`]
-//! validates (under the model's [`request::Rules`]), [`encode`] builds Clef's ids, [`head`] loads (through
-//! `hf::safetensors`) and runs Clef's head, [`gguf_head`] reads it from a model file that carries it
-//! (llama.cpp's Clef layout), [`rows`] gives either model its output embedding rows from a GGUF file,
-//! [`answer`] builds the shared parts of a body, [`label`] the label models', [`generative`] asks a
-//! generative model the request and reads its decisions as answers; [`release`] holds what a server
-//! needs to seat each model.
+//! validates (under the model's [`request::Rules`]), [`encode`] builds Clef's ids, [`head`] runs Clef's head
+//! (and, under the `safetensors` feature, loads the release's file through `hf::safetensors`), [`gguf_head`]
+//! reads it from a model file that carries it (llama.cpp's Clef layout), [`rows`] gives either model its
+//! output embedding rows from a GGUF file, [`answer`] builds the shared parts of a body, [`label`] the
+//! label models', [`generative`] asks a generative model the request and reads its decisions as answers;
+//! [`release`] holds what a server needs to seat each model.
 
 pub mod answer;
 pub mod encode;
@@ -125,6 +125,7 @@ pub enum Error {
     OutputHead { name: &'static str, what: String },
 }
 
+#[cfg(feature = "safetensors")]
 impl From<hf::safetensors::Error> for Error {
     fn from(e: hf::safetensors::Error) -> Error {
         use hf::safetensors::Error as E;

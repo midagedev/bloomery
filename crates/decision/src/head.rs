@@ -9,6 +9,7 @@
 //! a [`Weights`] source under those names: the release's safetensors file, or the decision tensors
 //! of a model file in llama.cpp's Clef layout ([`crate::gguf_head`]); one loader serves both.
 
+#[cfg(feature = "safetensors")]
 use std::path::Path;
 use std::time::Instant;
 
@@ -16,6 +17,7 @@ use crate::Error;
 use crate::encode::Encoded;
 use crate::json::{self, Json};
 use crate::ops::{self, Mha, dot, gelu, layer_norm, layer_normed, linear, normalized};
+#[cfg(feature = "safetensors")]
 use hf::safetensors::Safetensors;
 
 pub use crate::ops::LAYER_NORM_EPS;
@@ -216,6 +218,7 @@ pub trait Weights {
     fn scales(&self) -> Result<Scales, Error>;
 }
 
+#[cfg(feature = "safetensors")]
 impl Weights for Safetensors {
     fn names(&self) -> Vec<String> {
         Safetensors::names(self).map(str::to_string).collect()
@@ -307,6 +310,7 @@ pub type Rows<'a> = dyn FnMut(&[u32]) -> Result<Vec<f32>, String> + 'a;
 
 impl ClefHead {
     /// The head at `path` with its config: `config`, or [`CONFIG_FILE`] beside the file.
+    #[cfg(feature = "safetensors")]
     pub fn open(path: &Path, config: Option<&Path>) -> Result<ClefHead, Error> {
         let cfg_path = config.map_or_else(|| path.with_file_name(CONFIG_FILE), Path::to_path_buf);
         let text = std::fs::read_to_string(&cfg_path)
@@ -323,6 +327,7 @@ impl ClefHead {
     }
 
     /// The head from a parsed file: its names and shapes must be exactly `cfg.weights()`.
+    #[cfg(feature = "safetensors")]
     pub fn from_safetensors(st: &Safetensors, cfg: HeadConfig) -> Result<ClefHead, Error> {
         ClefHead::from_weights(st, cfg)
     }
@@ -762,9 +767,6 @@ fn check_spans(enc: &Encoded) -> Result<(), Error> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::encode::encode_with;
-    use crate::request::Request;
-    use hf::safetensors::write;
 
     pub(crate) const CFG: HeadConfig = HeadConfig {
         hidden_size: 16,
@@ -774,42 +776,6 @@ pub(crate) mod tests {
         heads: 2,
         feedforward: 12,
     };
-
-    pub(crate) fn bf16(n: usize, seed: u32) -> Vec<u8> {
-        let mut s = seed;
-        (0..n)
-            .flat_map(|_| {
-                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                let x = (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
-                ((x.to_bits() >> 16) as u16).to_le_bytes()
-            })
-            .collect()
-    }
-
-    fn file(skip: Option<&str>, extra: bool) -> Safetensors {
-        file_of(CFG, skip, extra)
-    }
-
-    /// A release-shaped head file of `cfg`: every weight bf16, seeded by its index.
-    pub(crate) fn file_of(cfg: HeadConfig, skip: Option<&str>, extra: bool) -> Safetensors {
-        let weights = cfg.weights();
-        let raw: Vec<Vec<u8>> = weights
-            .iter()
-            .enumerate()
-            .map(|(i, (_, s))| bf16(s.iter().product(), u32::try_from(i).unwrap()))
-            .collect();
-        let mut list: Vec<(&str, &str, &[usize], &[u8])> = weights
-            .iter()
-            .zip(&raw)
-            .filter(|((n, _), _)| Some(n.as_str()) != skip)
-            .map(|((n, s), r)| (n.as_str(), "BF16", s.as_slice(), r.as_slice()))
-            .collect();
-        let two = bf16(1, 99);
-        if extra {
-            list.push(("stray.weight", "BF16", &[], &two));
-        }
-        Safetensors::parse(write(&list)).unwrap()
-    }
 
     #[test]
     fn the_config_reads_and_refuses_by_name() {
@@ -855,6 +821,52 @@ pub(crate) mod tests {
             let e = HeadConfig::recognise(text).unwrap_err().to_string();
             assert!(e.contains(want), "{text}: {e}");
         }
+    }
+}
+
+/// The tests that build a head from a release-shaped safetensors file.
+#[cfg(all(test, feature = "safetensors"))]
+pub(crate) mod release_file {
+    use super::tests::CFG;
+    use super::*;
+    use crate::encode::encode_with;
+    use crate::request::Request;
+    use hf::safetensors::write;
+
+    pub(crate) fn bf16(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        (0..n)
+            .flat_map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let x = (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+                ((x.to_bits() >> 16) as u16).to_le_bytes()
+            })
+            .collect()
+    }
+
+    fn file(skip: Option<&str>, extra: bool) -> Safetensors {
+        file_of(CFG, skip, extra)
+    }
+
+    /// A release-shaped head file of `cfg`: every weight bf16, seeded by its index.
+    pub(crate) fn file_of(cfg: HeadConfig, skip: Option<&str>, extra: bool) -> Safetensors {
+        let weights = cfg.weights();
+        let raw: Vec<Vec<u8>> = weights
+            .iter()
+            .enumerate()
+            .map(|(i, (_, s))| bf16(s.iter().product(), u32::try_from(i).unwrap()))
+            .collect();
+        let mut list: Vec<(&str, &str, &[usize], &[u8])> = weights
+            .iter()
+            .zip(&raw)
+            .filter(|((n, _), _)| Some(n.as_str()) != skip)
+            .map(|((n, s), r)| (n.as_str(), "BF16", s.as_slice(), r.as_slice()))
+            .collect();
+        let two = bf16(1, 99);
+        if extra {
+            list.push(("stray.weight", "BF16", &[], &two));
+        }
+        Safetensors::parse(write(&list)).unwrap()
     }
 
     #[test]

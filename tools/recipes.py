@@ -2419,7 +2419,7 @@ def cmd_why(args: argparse.Namespace) -> int:
 # gap; a commit that touches the crate then re-runs every gate that merely links it.
 KEY_REACH_PINS = {
     "bloomery-hf": "a Hugging Face fetch or checkpoint reader: its commits move only the gates whose targets run its code (model-hf, "
-    "gpu-gates under the `hf` feature, decision)",
+    "gpu-gates under the `hf` feature, decision under its `safetensors` feature)",
     "bloomery-model-hf": "the fixture fetch and GLM's checkpoint map: gpu-gates links it under the `glm5next-hf` feature, for generate_glm5next alone",
 }
 
