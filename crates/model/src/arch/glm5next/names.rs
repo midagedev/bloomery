@@ -6,7 +6,9 @@
 
 use crate::arch::names::blk;
 
-pub use crate::arch::names::{output, output_norm, token_embd};
+pub use crate::arch::names::{
+    ffn_down_shexp, ffn_gate_shexp, ffn_up_shexp, indexer_k_norm, output, output_norm, token_embd,
+};
 
 /// The mixer's RMS gain, both kinds.
 pub fn attn_norm(l: usize) -> String {
@@ -114,10 +116,6 @@ pub fn indexer_attn_k(l: usize) -> String {
     blk(l, "indexer.attn_k.weight")
 }
 
-pub fn indexer_k_norm(l: usize) -> String {
-    blk(l, "indexer.k_norm.weight")
-}
-
 pub fn indexer_k_norm_bias(l: usize) -> String {
     blk(l, "indexer.k_norm.bias")
 }
@@ -180,18 +178,6 @@ pub fn ffn_up_exps(l: usize) -> String {
 
 pub fn ffn_down_exps(l: usize) -> String {
     blk(l, "ffn_down_exps.weight")
-}
-
-pub fn ffn_gate_shexp(l: usize) -> String {
-    blk(l, "ffn_gate_shexp.weight")
-}
-
-pub fn ffn_up_shexp(l: usize) -> String {
-    blk(l, "ffn_up_shexp.weight")
-}
-
-pub fn ffn_down_shexp(l: usize) -> String {
-    blk(l, "ffn_down_shexp.weight")
 }
 
 // ---------------------------------------------------- hyper-connections

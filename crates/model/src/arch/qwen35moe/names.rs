@@ -7,7 +7,10 @@
 
 use crate::arch::names::blk;
 
-pub use crate::arch::names::{output, token_embd};
+pub use crate::arch::names::{
+    ffn_down_shexp, ffn_gate_shexp, ffn_up_shexp, indexer_k_norm, indexer_k_proj, indexer_q_norm,
+    indexer_q_proj, output, token_embd,
+};
 
 /// The head's hyper-connection mix: the streams' grouped RMS gain, then the
 /// low-rank gate's down and up — the output norm of this architecture.
@@ -95,25 +98,6 @@ pub fn attn_output(l: usize) -> String {
     blk(l, "attn_output.weight")
 }
 
-/// The mean-pool indexer's query projection (bf16 in the file).
-pub fn indexer_q_proj(l: usize) -> String {
-    blk(l, "indexer.q_proj.weight")
-}
-
-/// The indexer's raw key projection: its output is cached unnormed and
-/// unturned, a position's row per position (bf16 in the file).
-pub fn indexer_k_proj(l: usize) -> String {
-    blk(l, "indexer.k_proj.weight")
-}
-
-pub fn indexer_q_norm(l: usize) -> String {
-    blk(l, "indexer.q_norm.weight")
-}
-
-pub fn indexer_k_norm(l: usize) -> String {
-    blk(l, "indexer.k_norm.weight")
-}
-
 // -------------------------------------------------------- feed-forward
 
 /// The router's f32 logits matrix; its input is the block's mix, no norm.
@@ -124,18 +108,6 @@ pub fn ffn_gate_inp(l: usize) -> String {
 /// The shared expert's scalar gate row: `σ(row · x)` scales its output.
 pub fn ffn_gate_inp_shexp(l: usize) -> String {
     blk(l, "ffn_gate_inp_shexp.weight")
-}
-
-pub fn ffn_gate_shexp(l: usize) -> String {
-    blk(l, "ffn_gate_shexp.weight")
-}
-
-pub fn ffn_up_shexp(l: usize) -> String {
-    blk(l, "ffn_up_shexp.weight")
-}
-
-pub fn ffn_down_shexp(l: usize) -> String {
-    blk(l, "ffn_down_shexp.weight")
 }
 
 pub fn ffn_gate_exps(l: usize) -> String {

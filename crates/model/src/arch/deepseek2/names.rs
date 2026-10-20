@@ -6,6 +6,8 @@
 //! formats a `blk.` literal elsewhere in `crates/model/src` is a name this
 //! table does not yet own.
 
+pub use crate::arch::names::{ffn_down_shexp, ffn_gate_shexp, ffn_up_shexp};
+
 /// `blk.{block}.attn_q.weight` — the query projection.
 pub fn attn_q(block: usize) -> String {
     format!("blk.{block}.attn_q.weight")
@@ -60,21 +62,6 @@ pub fn ffn_up(block: usize) -> String {
 /// `blk.{block}.ffn_down.weight` — the dense down projection.
 pub fn ffn_down(block: usize) -> String {
     format!("blk.{block}.ffn_down.weight")
-}
-
-/// `blk.{block}.ffn_gate_shexp.weight` — the shared expert's SwiGLU gate.
-pub fn ffn_gate_shexp(block: usize) -> String {
-    format!("blk.{block}.ffn_gate_shexp.weight")
-}
-
-/// `blk.{block}.ffn_up_shexp.weight` — the shared expert's up projection.
-pub fn ffn_up_shexp(block: usize) -> String {
-    format!("blk.{block}.ffn_up_shexp.weight")
-}
-
-/// `blk.{block}.ffn_down_shexp.weight` — the shared expert's down projection.
-pub fn ffn_down_shexp(block: usize) -> String {
-    format!("blk.{block}.ffn_down_shexp.weight")
 }
 
 /// `blk.{block}.ffn_gate_exps.weight` — the routed experts' gate stack.

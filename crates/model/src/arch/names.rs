@@ -145,6 +145,30 @@ pub fn ffn_down_shexp(l: usize) -> String {
     blk(l, "ffn_down_shexp.weight")
 }
 
+/// `blk.{l}.indexer.q_proj.weight` — the index-query projection.
+#[must_use]
+pub fn indexer_q_proj(l: usize) -> String {
+    blk(l, "indexer.q_proj.weight")
+}
+
+/// `blk.{l}.indexer.k_proj.weight` — the index-key projection.
+#[must_use]
+pub fn indexer_k_proj(l: usize) -> String {
+    blk(l, "indexer.k_proj.weight")
+}
+
+/// `blk.{l}.indexer.q_norm.weight` — the RMS gain on an index query.
+#[must_use]
+pub fn indexer_q_norm(l: usize) -> String {
+    blk(l, "indexer.q_norm.weight")
+}
+
+/// `blk.{l}.indexer.k_norm.weight` — the RMS gain on an index key.
+#[must_use]
+pub fn indexer_k_norm(l: usize) -> String {
+    blk(l, "indexer.k_norm.weight")
+}
+
 /// Layer `l`'s routed experts' gate, up and down stack names, in stack order:
 /// `blk.{l}.ffn_{gate,up,down}_exps.weight`, the GGUF convention of every MoE
 /// family here.
@@ -196,11 +220,12 @@ mod tests {
 
     /// Each shared per-layer name is the GGUF spelling of its tensor (llama.cpp's `tn()` table, the
     /// strings every file carries), on the layer it is asked for. Mutant: two stems swapped, say
-    /// `attn_k` and `attn_v`, or `exp_probs_b` spelled as a weight.
+    /// `attn_k` and `attn_v` or the indexer's query and key projections, or `exp_probs_b` spelled
+    /// as a weight.
     #[test]
     fn the_per_layer_names_are_the_gguf_spellings() {
         type Name = fn(usize) -> String;
-        let table: [(Name, &str); 18] = [
+        let table: [(Name, &str); 22] = [
             (attn_norm, "attn_norm.weight"),
             (attn_q, "attn_q.weight"),
             (attn_k, "attn_k.weight"),
@@ -219,6 +244,10 @@ mod tests {
             (ffn_down_exps, "ffn_down_exps.weight"),
             (ffn_gate_shexp, "ffn_gate_shexp.weight"),
             (ffn_up_shexp, "ffn_up_shexp.weight"),
+            (indexer_q_proj, "indexer.q_proj.weight"),
+            (indexer_k_proj, "indexer.k_proj.weight"),
+            (indexer_q_norm, "indexer.q_norm.weight"),
+            (indexer_k_norm, "indexer.k_norm.weight"),
         ];
         for (name, stem) in table {
             assert_eq!(name(7), format!("blk.7.{stem}"));

@@ -5,7 +5,9 @@
 //! names. Anything that formats a `blk.` literal elsewhere in `crates/model/src`
 //! is a name this table does not yet own.
 
-pub use crate::arch::names::{output, output_norm, token_embd};
+pub use crate::arch::names::{
+    ffn_down_shexp, ffn_gate_shexp, ffn_up_shexp, indexer_k_norm, output, output_norm, token_embd,
+};
 
 /// `output_hc_fn.weight` — the hyper-connection head's mix of the streams
 /// into one before the output norm; a V4 file carries it, a V4.1 file
@@ -153,21 +155,6 @@ pub fn ffn_down_exps(block: usize) -> String {
     format!("blk.{block}.ffn_down_exps.weight")
 }
 
-/// `blk.{block}.ffn_gate_shexp.weight` — the shared expert's SwiGLU gate.
-pub fn ffn_gate_shexp(block: usize) -> String {
-    format!("blk.{block}.ffn_gate_shexp.weight")
-}
-
-/// `blk.{block}.ffn_up_shexp.weight` — the shared expert's up projection.
-pub fn ffn_up_shexp(block: usize) -> String {
-    format!("blk.{block}.ffn_up_shexp.weight")
-}
-
-/// `blk.{block}.ffn_down_shexp.weight` — the shared expert's down projection.
-pub fn ffn_down_shexp(block: usize) -> String {
-    format!("blk.{block}.ffn_down_shexp.weight")
-}
-
 /// `blk.{block}.attn_compressor_kv.weight` — the compressor's latent
 /// projection. Its presence is what makes a block a compressed-stream source.
 pub fn attn_compressor_kv(block: usize) -> String {
@@ -219,11 +206,6 @@ pub fn indexer_compressor_ape(block: usize) -> String {
 /// row. Its presence is what makes a block an index-key owner.
 pub fn indexer_attn_k(block: usize) -> String {
     format!("blk.{block}.indexer.attn_k.weight")
-}
-
-/// `blk.{block}.indexer.k_norm.weight` — the RMS gain on an index key.
-pub fn indexer_k_norm(block: usize) -> String {
-    format!("blk.{block}.indexer.k_norm.weight")
 }
 
 /// `blk.{block}.indexer.attn_q_b.weight` — the indexer's query projection. Its

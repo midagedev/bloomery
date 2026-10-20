@@ -1,4 +1,4 @@
-//! Every `minimax-m3.*` key the description reads, and the tensors each layer is held to. A key
+//! Every `minimax-m3.*` key the description reads, and the tensors the file is held to. A key
 //! the loader requires is required here, and a value this reader does not run is refused by the
 //! key's name. Which layers are dense and which sparse (an indexer, routed experts and a shared
 //! expert) is `leading_dense_block_count`; the tensors a layer carries must be exactly its kind's
@@ -6,11 +6,11 @@
 
 use gguf::Split;
 
-use super::roles::{ATTENTION, DENSE, INDEXER, ROUTED, required};
+use super::roles::{ATTENTION, DENSE, INDEXER, ROUTED};
+use crate::arch::hybrid::layers_agree;
 use crate::arch::{
     dims_agree, expert_counts, finite_positive, meta_bool, meta_usize, metadata, mul, n_vocab,
-    one_expert_group, optional_usize, plain_rope, positive, refuse_tensor_set, sigmoid_gating,
-    unread_keys_of,
+    one_expert_group, optional_usize, plain_rope, positive, sigmoid_gating, unread_keys_of,
 };
 use crate::placement::PlacementError;
 
@@ -245,50 +245,19 @@ impl Hparams {
         self.n_head / self.n_head_kv
     }
 
-    /// Every layer carries its kind's required tensors, an indexer exactly where it is sparse, and
-    /// nothing of the other kind's: the first missing or misplaced name, with how many more there
-    /// are.
+    /// The model-level three and every layer's kind's required tensors are in the file, an
+    /// indexer exactly where a layer is sparse, and nothing of the other kind's: the first missing
+    /// or misplaced name, with how many more there are.
     fn tensors_agree(&self, split: &Split) -> Result<(), PlacementError> {
-        let has = |l: usize, stem: &str| split.find(&format!("blk.{l}.{stem}")).is_some();
-        let mut missing = Vec::new();
-        let mut misplaced = Vec::new();
-        for l in 0..self.n_layer {
-            let sparse = self.kind(l) == Kind::Sparse;
-            let (own, other) = if sparse {
-                (ROUTED, DENSE)
-            } else {
-                (DENSE, ROUTED)
-            };
-            let mut need: Vec<&str> = required(ATTENTION).collect();
-            need.extend(required(own));
-            if sparse {
-                need.extend(required(INDEXER));
-            }
-            missing.extend(
-                need.iter()
-                    .filter(|s| !has(l, s))
-                    .map(|s| format!("blk.{l}.{s}")),
-            );
-            let mut banned: Vec<&str> = other
-                .iter()
-                .map(|s| s.name)
-                .filter(|s| !need.contains(s))
-                .collect();
-            if !sparse {
-                banned.extend(INDEXER.iter().map(|s| s.name));
-            }
-            misplaced.extend(
-                banned
-                    .iter()
-                    .filter(|s| has(l, s))
-                    .map(|s| format!("blk.{l}.{s}")),
-            );
-        }
-        refuse_tensor_set(
-            &missing,
-            &misplaced,
-            "the layers' kinds need",
-            "its layer's kind carries none",
+        let kinds: Vec<Kind> = (0..self.n_layer).map(|l| self.kind(l)).collect();
+        layers_agree(
+            split,
+            &kinds,
+            |kind| match kind {
+                Kind::Dense => vec![ATTENTION, DENSE],
+                Kind::Sparse => vec![ATTENTION, ROUTED, INDEXER],
+            },
+            &[Kind::Dense, Kind::Sparse],
         )
     }
 
@@ -890,9 +859,10 @@ pub(super) mod tests {
         );
     }
 
-    /// A sparse layer needs its indexer, a dense layer carries none, and neither carries the other
-    /// kind's feed-forward block: the tensor set must be exactly the kind's. Mutant: the indexer
-    /// stems dropped from the sparse layers' required set, or from the dense layers' banned set.
+    /// The file carries the three model-level tensors, a sparse layer needs its indexer, a dense
+    /// layer carries none, and neither carries the other kind's feed-forward block: the tensor set
+    /// must be exactly the kind's. Mutant: the indexer stems dropped from the sparse layers'
+    /// required set, or from the dense layers' banned set; the model-level names left unchecked.
     #[test]
     fn a_layers_tensors_must_be_its_kinds() {
         let without = |name: &str| -> Vec<(String, Vec<u64>)> {
@@ -906,6 +876,24 @@ pub(super) mod tests {
         let missing = "is not in the file";
         let misplaced = "is in the file, and its layer's kind carries none";
         let cases = [
+            (
+                "no-embd",
+                without("token_embd.weight"),
+                "token_embd.weight",
+                missing,
+            ),
+            (
+                "no-final-norm",
+                without("output_norm.weight"),
+                "output_norm.weight",
+                missing,
+            ),
+            (
+                "no-head",
+                without("output.weight"),
+                "output.weight",
+                missing,
+            ),
             (
                 "no-indexer",
                 without("blk.3.indexer.k_proj.weight"),

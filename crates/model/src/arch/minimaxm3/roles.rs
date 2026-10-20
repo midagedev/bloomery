@@ -11,8 +11,6 @@ use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role}
 use crate::arch::stems::{Stem, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
-pub(super) use crate::arch::stems::required;
-
 /// Every layer's attention block: the norms, the split projections and the output projection.
 pub(super) const ATTENTION: &[Stem] = &[
     req("attn_norm.weight", Role::Attention),
