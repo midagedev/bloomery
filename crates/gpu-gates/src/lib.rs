@@ -65,6 +65,8 @@ pub mod serve_client;
 pub mod side_seat;
 #[cfg(feature = "gpu")]
 pub mod slots_gate;
+#[cfg(feature = "gpu")]
+pub mod swiglu_host;
 pub mod tap_dump;
 pub mod tier;
 // The image encoder's pieces the serve seats share; the tower itself is `bloomery-gpu-vision`'s, behind `vision`.

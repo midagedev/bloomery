@@ -1002,7 +1002,7 @@ pub fn gated(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwigluLaunch {
     /// `GemmKernels::enqueue_swiglu_act_quant` into q8_1 blocks of 128,
-    /// under either rule (`SiluMul` is the launch `enqueue_swiglu_quant`
+    /// under any rule (`SiluMul` is the launch `enqueue_swiglu_quant`
     /// makes).
     Q128,
     /// `Gemm32Kernels::enqueue_swiglu_quant32` into q8 blocks of 32 under
@@ -1019,17 +1019,26 @@ enum SwigluLaunch {
 /// `rule`; a rule the form's launch lacks is refused by name.
 fn swiglu_launch((ty, name): (SiteTy, &str), rule: Act) -> Result<SwigluLaunch, GpuError> {
     match (ty.reads(), rule) {
-        (Form::Q8x128, Act::SiluMul | Act::SwigluClamp { .. }) => Ok(SwigluLaunch::Q128),
+        (Form::Q8x128, Act::SiluMul | Act::SwigluClamp { .. } | Act::SwigluOai { .. }) => {
+            Ok(SwigluLaunch::Q128)
+        }
         // `SiluMul` keeps the plain entry, which carries no rule switch; the
         // rule's entry writes the same bytes under it.
         (Form::Q8x32, Act::SiluMul) => Ok(SwigluLaunch::Q32Plain),
-        (Form::Q8x32, Act::SwigluClamp { .. }) => Ok(SwigluLaunch::Q32Rule),
+        (Form::Q8x32, Act::SwigluClamp { .. } | Act::SwigluOai { .. }) => Ok(SwigluLaunch::Q32Rule),
         (Form::F32, Act::SiluMul) => Ok(SwigluLaunch::F32),
         (Form::F32, Act::SwigluClamp { limit }) => Err(GpuError::shape(
             "site::swiglu",
             format!(
                 "{name} is {ty}: its SwiGLU rows are f32 and only silu(gate) · up writes them, \
                  not the clamp at {limit}"
+            ),
+        )),
+        (Form::F32, Act::SwigluOai { limit, .. }) => Err(GpuError::shape(
+            "site::swiglu",
+            format!(
+                "{name} is {ty}: its SwiGLU rows are f32 and only silu(gate) · up writes them, \
+                 not swigluoai at {limit}"
             ),
         )),
         (Form::Q8Blocks32, _) => Err(GpuError::shape(
@@ -1189,14 +1198,19 @@ mod tests {
 
     /// The SwiGLU's launch is the down's form under the rule: every K-quant
     /// one launch into q8_1 blocks of 128, Q8_0 the plain 32-value entry
-    /// under `SiluMul` (the rule's entry for the clamp), F32 the f32 rows
-    /// under `SiluMul` alone, the clamp refused with the site's name.
+    /// under `SiluMul` (the rule's entry for the clamp and the OAI form), F32
+    /// the f32 rows under `SiluMul` alone, the other rules refused with the
+    /// site's name.
     #[test]
     fn the_swiglu_launch_is_the_downs_form_under_the_rule() {
         let clamp = Act::SwigluClamp { limit: 7.0 };
+        let oai = Act::SwigluOai {
+            alpha: crate::kquant::act::SWIGLU_OAI_ALPHA,
+            limit: 7.0,
+        };
         let launch = |ty, rule| swiglu_launch((ty, "down"), rule);
         for ty in [SiteTy::Q3K, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K] {
-            for rule in [Act::SiluMul, clamp] {
+            for rule in [Act::SiluMul, clamp, oai] {
                 assert_eq!(launch(ty, rule).ok(), Some(SwigluLaunch::Q128), "{ty}");
             }
         }
@@ -1204,25 +1218,23 @@ mod tests {
             launch(SiteTy::Q8_0, Act::SiluMul).ok(),
             Some(SwigluLaunch::Q32Plain)
         );
-        assert_eq!(
-            launch(SiteTy::Q8_0, clamp).ok(),
-            Some(SwigluLaunch::Q32Rule)
-        );
+        for rule in [clamp, oai] {
+            assert_eq!(launch(SiteTy::Q8_0, rule).ok(), Some(SwigluLaunch::Q32Rule));
+        }
         assert_eq!(
             launch(SiteTy::F32, Act::SiluMul).ok(),
             Some(SwigluLaunch::F32)
         );
-        match launch(SiteTy::F32, clamp) {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("down is F32") && msg.contains("clamp"),
-                    "{msg}"
-                );
+        for (rule, named) in [(clamp, "clamp"), (oai, "swigluoai")] {
+            match launch(SiteTy::F32, rule) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains("down is F32") && msg.contains(named), "{msg}");
+                }
+                Ok(l) => panic!("an F32 down under {named} launched {l:?}"),
             }
-            Ok(l) => panic!("an F32 down under the clamp launched {l:?}"),
         }
-        for rule in [Act::SiluMul, clamp] {
+        for rule in [Act::SiluMul, clamp, oai] {
             match launch(SiteTy::Q5_0, rule) {
                 Err(e) => {
                     let msg = e.to_string();

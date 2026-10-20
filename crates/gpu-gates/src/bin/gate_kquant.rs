@@ -33,7 +33,10 @@
 //! 5. act: the gate·up's rows are the rule on the down `_sel`'s sums of the same
 //!    rows and column, bit for bit: `silu_mul` against the engine's elementwise
 //!    swiglu (the same core), `swiglu_clamp` at two limits against the CPU
-//!    tier's ik-verified rule `qdot::swiglu_clamp`. The clamped rows are counted.
+//!    tier's ik-verified rule `qdot::swiglu_clamp`, and `swiglu_oai` at two
+//!    limits against its CPU twin `qdot::swiglu_oai` bit for bit and against
+//!    the formula in f64 within `swiglu_host::OAI_REL`. The clamped rows are
+//!    counted.
 //! 6. q4k_sibling: the gate binary's Walk A instance over `Q4k` is
 //!    `q4k_gemv_sel` bit for bit, `HOST` slot included, at K = 256, 768, 1280,
 //!    2048, 2304, 4096.
@@ -66,8 +69,8 @@
 //! 9. q4k_gate_up: the Q4_K gate·up (`kq_gate_up_act_q4k`, GLM-5.3-Flash's
 //!    routed gate and up) under clauses 5 and 4, its down sums from clause 6's
 //!    Walk A instance over `Q4k` (so `q4k_gemv_sel`'s bit for bit): the rows
-//!    are `silu_mul` and `swiglu_clamp` at two limits on the sums of the same
-//!    rows, an id past the stack raises `ExpertId` and NaNs its rows, `HOST`
+//!    are `silu_mul`, `swiglu_clamp` at two limits and `swiglu_oai` at two on
+//!    the sums of the same rows, an id past the stack raises `ExpertId` and NaNs its rows, `HOST`
 //!    leaves them, a NaN column NaNs every row.
 //! 10. q38_card: Qwen3.8's card leg over two tokens of ten slots, seven card
 //!     experts, three slots the host serves (their gate·up rows poisoned NaN):
@@ -124,7 +127,7 @@
 //!     on the host and its tiles `q4k_sel::grouped_tiles`'. The gathered
 //!     planes (`kq_card_gather`) are each entry's token column bit for bit;
 //!     the gate·up by tiles (`kq_gate_up_act_q4k_tiles`, `swiglu_clamp` at
-//!     GLM's limit 10 and at 0.5) is `kq_gate_up_act_q4k`'s row of the
+//!     GLM's limit 10 and at 0.5, `swiglu_oai` at 7) is `kq_gate_up_act_q4k`'s row of the
 //!     entry's slot bit for bit; the down by tiles (`q5k_gemv_tiles`) over the
 //!     entries' q8_1 (`q8_1_quantize_ord`) is `q5k_gemv_sel`'s rows of every
 //!     card slot bit for bit, `HOST` slots untouched; the Q5_K gate·up by
@@ -168,7 +171,7 @@ mod gate {
     use bloomery_gpu::kquant::walk::{iter_term, row_dot, row_dot_1col};
     use bloomery_gpu::kquant::{
         Act, EntryPlanes, GateUpAct, KquantTileKernels, Q4k, Q5k, Q8_0, SbDecode, SelDown,
-        TileGather, TileTable, TiledDown, TiledGateUpAct, act, walk_a_planes,
+        TileGather, TileTable, TiledDown, TiledGateUpAct, walk_a_planes,
     };
     use bloomery_gpu::q4k_sel::QuantSel;
     use bloomery_gpu::q5::{Q8Blocks32, Q8Blocks32Host, pack_q5_1};
@@ -179,6 +182,7 @@ mod gate {
     use bloomery_gpu::{
         DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_sums,
     };
+    use bloomery_gpu_gates::swiglu_host;
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, activations, bits_equal, max_rel_err, max_ulps, q8_1_dequant,
         ref_gemv, verdict,
@@ -1437,17 +1441,19 @@ mod gate {
             4,
             Act::SwigluClamp { limit: 10.0 },
         )?;
-        let all_nan = h.iter().chain(&hc).all(|v| v.is_nan());
+        let (ho, fo) = gate_up(c, &g, &u, &act1n, &CLEAN, 4, swiglu_host::oai(7.0))?;
+        let all_nan = h.iter().chain(&hc).chain(&ho).all(|v| v.is_nan());
         let product = Some(Fault::at(LAYER_NONE, FaultSite::F32Product));
-        let pass = qf == quant_column && fg == product && fc == product && all_nan;
+        let pass = qf == quant_column && fg == product && fc == product && fo == product && all_nan;
         ok &= pass;
         println!(
-            "{label}[gate_up:nan_column] quantizer_fault=\"{}\" want=\"{}\" gate_up_faults=\"{}\",\"{}\" \
-             every_row_nan_both_rules={all_nan} {}",
+            "{label}[gate_up:nan_column] quantizer_fault=\"{}\" want=\"{}\" gate_up_faults=\"{}\",\"{}\",\"{}\" \
+             every_row_nan_all_rules={all_nan} {}",
             shown(qf),
             shown(quant_column),
             shown(fg),
             shown(fc),
+            shown(fo),
             verdict(pass)
         );
         Ok(ok)
@@ -1487,30 +1493,28 @@ mod gate {
             ("silu_mul", Act::SiluMul),
             ("swiglu_clamp_10", Act::SwigluClamp { limit: 10.0 }),
             ("swiglu_clamp_0.5", Act::SwigluClamp { limit: 0.5 }),
+            ("swiglu_oai_7", swiglu_host::oai(7.0)),
+            ("swiglu_oai_0.5", swiglu_host::oai(0.5)),
         ];
         for (name, rule) in rules {
             let (h, f) = gate_up(c, &g, &u, &act1, &SEL, 4, rule)?;
-            let (want, clamped) = match rule {
-                Act::SiluMul => (want_silu.clone(), 0),
-                Act::SwigluClamp { limit } => {
-                    let mut want = vec![0.0f32; n];
-                    qdot::swiglu_clamp(&gs, &us, limit, &mut want);
-                    let clamped = gs
-                        .iter()
-                        .zip(&us)
-                        .filter(|&(&g, &u)| act::silu_ik(g) > limit || u.abs() > limit)
-                        .count();
-                    (want, clamped)
-                }
-            };
+            let (want, clamped) =
+                swiglu_host::combine(rule, &gs, &us).unwrap_or_else(|| (want_silu.clone(), 0));
             let same = bits_equal(&h, &want);
-            // A clamp rule must bite on some rows and not on others here.
+            // The OAI rule also stays within its band of the formula in f64.
+            let (misses, worst) = match rule {
+                Act::SwigluOai { alpha, limit } => {
+                    swiglu_host::oai_misses(&h, &gs, &us, alpha, limit)
+                }
+                _ => (0, 0.0),
+            };
+            // A clamping rule must bite on some rows and not on others here.
             let spread = matches!(rule, Act::SiluMul) || (clamped > 0 && clamped < n);
-            let pass = same && spread && f.is_none();
+            let pass = same && spread && misses == 0 && f.is_none();
             ok &= pass;
             println!(
                 "{label}[{name}] rows={n} rule_on_down_sums_bit_identical={same} clamped_rows={clamped} \
-                 fault=\"{}\" {}{}",
+                 outside_f64_band={misses} (max {worst:.3} bands) fault=\"{}\" {}{}",
                 shown(f),
                 verdict(pass),
                 mismatch("first_mismatch", &h, &want, rpe),
@@ -2975,8 +2979,11 @@ mod gate {
             verdict(shape_ok)
         );
         let mut ok_rules = true;
-        for (name, limit) in [("swiglu_clamp_10", 10.0f32), ("swiglu_clamp_0.5", 0.5)] {
-            let rule = Act::SwigluClamp { limit };
+        for (name, rule) in [
+            ("swiglu_clamp_10", Act::SwigluClamp { limit: 10.0 }),
+            ("swiglu_clamp_0.5", Act::SwigluClamp { limit: 0.5 }),
+            ("swiglu_oai_7", swiglu_host::oai(7.0)),
+        ] {
             let (h_ref, f_ref) = gate_up(c, &g, &u, &act_x, &sel, S12, rule)?;
             let mut h = DeviceBuffer::from_host(stream, &vec![SENT; slots * ff])?;
             let a = TiledGateUpAct {
@@ -3016,7 +3023,7 @@ mod gate {
                 verdict(pass),
                 mismatch("first_mismatch", got, &want, ff),
             );
-            if limit != 10.0 {
+            if name != "swiglu_clamp_10" {
                 continue;
             }
             // The down by tiles over the entries' q8_1 against the down `_sel` of

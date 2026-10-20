@@ -577,7 +577,7 @@ pub(crate) fn gate_up_dims(
         ));
     }
     let slot_rows = check_gate_up_slots(what, n_slots, rpe, m, spc, a.sel.len(), h_len)?;
-    let (act, limit) = a.rule.code();
+    let (act, limit) = a.rule.code(what)?;
     Ok(GateUpDims {
         grid: launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?,
         n_experts: launch_u32(what, "n_experts", n_experts)?,
@@ -699,7 +699,7 @@ pub(crate) fn gate_up_at_dims(
             ),
         ));
     }
-    let (act, limit) = a.rule.code();
+    let (act, limit) = a.rule.code(what)?;
     Ok(GateUpAtDims {
         grid: launch_u32(what, "grid", (n_slots * rpe).div_ceil(ROWS_PER_BLOCK))?,
         rows_per_expert: launch_u32(what, "rows_per_expert", rpe)?,
