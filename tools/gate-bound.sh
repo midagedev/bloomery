@@ -244,96 +244,154 @@ bounded() {
 #                                     BG_IN and BG_OUT (or BG_OUT_APPEND), when set for the call, are the command's
 #                                     stdin and its stdout and stderr, opened by the child, so a FIFO's open waits
 #                                     there and never in the runner; without BG_IN the command keeps the runner's stdin.
-#                                     Returns 64 for a bound that is no positive whole number, 70 when a command is
-#                                     already live (one at a time: the traps are one set) or LEASE_STOP_GRACE leaves
-#                                     no budget.
-#   bounded_bg_wait                   waits for the command to end by itself: its status in BG_RC and returned; a
+#                                     Returns 64 for a bound that is no positive whole number or a handle that is no
+#                                     name, 70 when the handle's command is already live (one at a time per handle) or
+#                                     LEASE_STOP_GRACE leaves no budget.
+#   bounded_bg_wait [handle]          waits for the command to end by itself: its status in BG_RC and returned; a
 #                                     cleanup failure of a signal stop is 70 and ends the runner.
-#   bounded_bg_stop                   TERM, then KILL, for the command and its group within the cleanup budget
+#   bounded_bg_stop [handle]          TERM, then KILL, for the command and its group within the cleanup budget
 #                                     (lease_stop): returns 0, or 70 when something outlived the budget; BG_RC is
 #                                     the command's status (143 after the TERM).
-# The traps on TERM, INT and HUP are set before the child starts. A signal while the command lives stops the command
-# and its group, restores the caller's traps and raises the signal again, so the runner ends as it would have without
-# the child (by its own trap, if it set one); one that comes before the pid is known is held and stops the command
-# the moment the pid is. The caller's own traps are back when the command has ended by either call. A runner whose
+#   bounded_bg_stop_all               bounded_bg_stop for every live command, what a signal does: 0, or the first
+#                                     failure. A runner whose EXIT trap leaves with commands up calls it.
+#   bounded_bg_get PID|RC [handle]    the handle's BG_PID or BG_RC, printed.
+# Handles. A runner that holds more than one command at once, two servers beside each other, names each: BG_NAME=<handle>
+# for the bounded_bg call (letters, digits and underscores), the same handle as the first argument of the wait, the stop
+# and the get. The default handle, no BG_NAME, keeps BG_PID, BG_RC and BG_LIVE; a named one keeps BG_PID_<handle>,
+# BG_RC_<handle> and BG_LIVE_<handle>. The commands share one set of traps: set when the first command goes up, the
+# caller's back when the last one is gone, and a signal stops every command that lives.
+# The traps on TERM, INT and HUP are set before the child starts. A signal while a command lives stops the commands
+# and their groups, restores the caller's traps and raises the signal again, so the runner ends as it would have without
+# the children (by its own trap, if it set one); one that comes before the pid is known is held and stops the command
+# the moment the pid is. The caller's own traps are back when the commands have ended by either call. A runner whose
 # EXIT trap or error path leaves while a command lives calls bounded_bg_stop first. These functions keep their locals
 # under a bg_ prefix: a caller's EXIT trap reads its own `rc` and runs beside them in the exiting function's scope.
-BG_PID='' BG_RC=0 BG_SIGNAL='' BG_TRAPS='' BG_LIVE='' BG_IN='' BG_OUT='' BG_OUT_APPEND=''
+# BG_HANDLES holds the live commands' handles in the order they started, the default handle as `@`; a command is live
+# while its BG_LIVE variable is set.
+# shellcheck disable=SC2034 # the callers read them, and the functions below by name
+BG_PID='' BG_RC=0 BG_SIGNAL='' BG_TRAPS='' BG_LIVE='' BG_IN='' BG_OUT='' BG_OUT_APPEND='' BG_NAME='' BG_HANDLES='' BG_FAIL=''
+
+# __bg_handle <handle>: 0 for the default handle (empty) or a name of letters, digits and underscores, else a named
+# refusal on stderr and 64.
+__bg_handle() {
+  case ${1:-} in
+    *[!A-Za-z0-9_]*)
+      echo "[bound] bounded_bg: a handle is letters, digits and underscores, got '$1'" >&2
+      return 64
+      ;;
+  esac
+}
+
+# __bg_arm: the traps of a live command, which stop every command; each names its signal now.
+__bg_arm() {
+  local bg_s
+  for bg_s in TERM INT HUP; do
+    # shellcheck disable=SC2064 # the signal's name now, the commands when the trap runs
+    trap "BG_SIGNAL=$bg_s; bounded_bg_stop_all" "$bg_s"
+  done
+}
+
 bounded_bg() {
-  local bg_bound=${1:-} bg_grace=${LEASE_STOP_GRACE:-9} bg_s bg_saved
+  local bg_bound=${1:-} bg_grace=${LEASE_STOP_GRACE:-9} bg_h=${BG_NAME:-} bg_sfx bg_s bg_saved bg_pid
   lease_bound "$bg_bound" || return $?
   shift
   case $bg_grace in
     [1-9]) ;;
     *) echo "[bound] no cleanup budget for a bounded command: '$bg_grace'" >&2; return 70 ;;
   esac
-  if [ -n "$BG_LIVE" ]; then
-    echo "[bound] bounded_bg: the command of pid ${BG_PID:-?} still runs; one background command at a time" >&2
+  __bg_handle "$bg_h" || return $?
+  bg_sfx=${bg_h:+_$bg_h}
+  bg_s=BG_LIVE$bg_sfx
+  if [ -n "${!bg_s:-}" ]; then
+    bg_s=BG_PID$bg_sfx
+    echo "[bound] bounded_bg: the command${bg_h:+ $bg_h} of pid ${!bg_s:-?} still runs; one background command at a time${bg_h:+ per handle}" >&2
     return 70
   fi
   if [ -n "$BG_OUT" ] && [ -n "$BG_OUT_APPEND" ]; then
     echo "[bound] bounded_bg: BG_OUT and BG_OUT_APPEND both set" >&2
     return 64
   fi
-  BG_TRAPS='' BG_PID='' BG_SIGNAL='' BG_RC=0 BG_LIVE=1
-  for bg_s in TERM INT HUP; do
-    bg_saved=$(trap -p "$bg_s")
-    BG_TRAPS+="${bg_saved:-trap - $bg_s}"$'\n'
-  done
-  for bg_s in TERM INT HUP; do
-    # shellcheck disable=SC2064 # the signal's name now, the pid when the trap runs
-    trap "BG_SIGNAL=$bg_s; [ -z \"\$BG_PID\" ] || bounded_bg_stop" "$bg_s"
-  done
+  if [ -z "$BG_HANDLES" ]; then
+    BG_TRAPS='' BG_SIGNAL='' BG_FAIL=''
+    for bg_s in TERM INT HUP; do
+      bg_saved=$(trap -p "$bg_s")
+      BG_TRAPS+="${bg_saved:-trap - $bg_s}"$'\n'
+    done
+    __bg_arm
+  fi
+  BG_HANDLES+="${BG_HANDLES:+ }${bg_h:-@}"
+  printf -v "BG_PID$bg_sfx" %s ''
+  printf -v "BG_RC$bg_sfx" %s 0
+  printf -v "BG_LIVE$bg_sfx" %s 1
   (
     [ -z "$BG_IN" ] || exec < "$BG_IN" || exit 70
     [ -z "$BG_OUT" ] || exec > "$BG_OUT" 2>&1 || exit 70
     [ -z "$BG_OUT_APPEND" ] || exec >> "$BG_OUT_APPEND" 2>&1 || exit 70
     LEASE_STOP_GRACE=$((bg_grace / 2)) exec timeout --kill-after="$bg_grace" "$bg_bound" "$@"
   ) <&0 &
-  BG_PID=$!
-  [ -z "$BG_SIGNAL" ] || bounded_bg_stop
+  bg_pid=$!
+  printf -v "BG_PID$bg_sfx" %s "$bg_pid"
+  [ -z "$BG_SIGNAL" ] || bounded_bg_stop_all
   return 0
 }
 
-# __bounded_bg_end <command's status> <cleanup status>: the command is gone — its pid cleared before the traps come
-# back (a late signal reaches no other process), its status kept, and a signal that came until the caller's traps are
-# back, the one that stopped the command included, raised again for the caller's handler; a cleanup failure ends the
-# runner first, which the signal would hide. The pending signal is read after the traps are back, so one that arrives
-# between the pid's clearing and the restore is not lost.
+# __bounded_bg_end <handle> <command's status> <cleanup status>: the command is gone — its pid cleared before the traps
+# come back (a late signal reaches no other process), its status kept, and a signal that came until the caller's traps
+# are back, the one that stopped the command included, raised again for the caller's handler; a cleanup failure ends
+# the runner first, which the signal would hide. The pending signal is read after the traps are back, so one that
+# arrives between the pid's clearing and the restore is not lost. While other commands live the traps stay (a cleanup's
+# own, which keep a signal, give way to the ones that stop), and a cleanup failure waits for the last command.
 __bounded_bg_end() {
-  local bg_sig
-  BG_PID='' BG_LIVE='' BG_RC=$1
+  local bg_h=$1 bg_sfx bg_sig bg_rest
+  bg_sfx=${bg_h:+_$bg_h}
+  printf -v "BG_PID$bg_sfx" %s ''
+  printf -v "BG_LIVE$bg_sfx" %s ''
+  printf -v "BG_RC$bg_sfx" %s "$2"
+  bg_rest=" $BG_HANDLES "
+  bg_rest=${bg_rest/ ${bg_h:-@} / }
+  bg_rest=${bg_rest# }
+  BG_HANDLES=${bg_rest% }
+  if [ -n "$BG_HANDLES" ]; then
+    [ "$3" = 0 ] || BG_FAIL=$3
+    __bg_arm
+    return 0
+  fi
   eval "$BG_TRAPS"
   BG_TRAPS=''
   bg_sig=$BG_SIGNAL
   if [ -n "$bg_sig" ]; then
-    [ "$2" = 0 ] || exit "$2"
+    [ "$3" = 0 ] || exit "$3"
+    [ -z "$BG_FAIL" ] || exit "$BG_FAIL"
     kill -s "$bg_sig" $$
   fi
 }
 
-bounded_bg_stop() {
-  local bg_rc=0 bg_status=0 bg_end bg_state bg_s
-  [ -n "$BG_LIVE" ] || return 0
+# __bounded_bg_stop_one <handle>: bounded_bg_stop's cleanup for one command, without the stop of the others.
+__bounded_bg_stop_one() {
+  local bg_h=$1 bg_rc=0 bg_status=0 bg_end bg_state bg_s bg_v bg_pid
+  bg_v=BG_LIVE${bg_h:+_$bg_h}
+  [ -n "${!bg_v:-}" ] || return 0
   # A signal during the cleanup does not cut it short: the first one is kept for __bounded_bg_end to raise again.
   for bg_s in TERM INT HUP; do
     # shellcheck disable=SC2064 # the signal's name now
     trap "BG_SIGNAL=\${BG_SIGNAL:-$bg_s}" "$bg_s"
   done
-  if [ -n "$BG_PID" ]; then
-    lease_stop "$BG_PID" || bg_rc=$?
+  bg_v=BG_PID${bg_h:+_$bg_h}
+  bg_pid=${!bg_v}
+  if [ -n "$bg_pid" ]; then
+    lease_stop "$bg_pid" || bg_rc=$?
     if [ "$bg_rc" = 0 ]; then
-      wait "$BG_PID" 2> /dev/null || bg_status=$?
+      wait "$bg_pid" 2> /dev/null || bg_status=$?
     else
       # A failed stop can leave a process no signal ends (uninterruptible I/O): its status is collected only once it
       # has ended, by a deadline on the shell's whole-second clock (at most 2 s, whatever each process-table read
       # costs), and one still alive then, or a process table that cannot be read, is left without a wait.
       bg_end=$((SECONDS + 1))
       while :; do
-        bg_state=$(set -o pipefail; ps -eo pid=,stat= | awk -v pid="$BG_PID" '$1 == pid { print $2 }') || break
+        bg_state=$(set -o pipefail; ps -eo pid=,stat= | awk -v pid="$bg_pid" '$1 == pid { print $2 }') || break
         case $bg_state in
           '' | Z*)
-            wait "$BG_PID" 2> /dev/null || bg_status=$?
+            wait "$bg_pid" 2> /dev/null || bg_status=$?
             break
             ;;
         esac
@@ -342,20 +400,59 @@ bounded_bg_stop() {
       done
     fi
   fi
-  __bounded_bg_end "$bg_status" "$bg_rc"
+  __bounded_bg_end "$bg_h" "$bg_status" "$bg_rc"
+  return "$bg_rc"
+}
+
+bounded_bg_stop() {
+  local bg_h=${1:-} bg_rc=0 bg_more=0
+  __bg_handle "$bg_h" || return $?
+  __bounded_bg_stop_one "$bg_h" || bg_rc=$?
+  # A signal that came during the cleanup stops the commands still up too; the last one raises it again.
+  if [ -n "$BG_HANDLES" ] && [ -n "$BG_SIGNAL" ]; then
+    bounded_bg_stop_all || bg_more=$?
+    [ "$bg_rc" != 0 ] || bg_rc=$bg_more
+  fi
+  return "$bg_rc"
+}
+
+bounded_bg_stop_all() {
+  local bg_rc=0 bg_one bg_h bg_v IFS=$' \t\n'
+  # A command whose pid is not known yet is stopped by its own bounded_bg, which reads the signal when it has the pid.
+  for bg_one in $BG_HANDLES; do
+    bg_h=${bg_one#@}
+    bg_v=BG_PID${bg_h:+_$bg_h}
+    [ -n "${!bg_v}" ] || continue
+    __bounded_bg_stop_one "$bg_h" || bg_rc=$?
+  done
   return "$bg_rc"
 }
 
 bounded_bg_wait() {
-  local bg_rc=0
-  [ -n "$BG_LIVE" ] || return "$BG_RC"
+  local bg_rc=0 bg_h=${1:-} bg_p bg_r bg_l
+  __bg_handle "$bg_h" || return $?
+  bg_p=BG_PID${bg_h:+_$bg_h}
+  bg_r=BG_RC${bg_h:+_$bg_h}
+  bg_l=BG_LIVE${bg_h:+_$bg_h}
+  [ -n "${!bg_l:-}" ] || return "${!bg_r:-0}"
   # A signal cuts a wait short and its trap stops the command: nothing is left to wait for then.
-  if [ -n "$BG_PID" ]; then
-    wait "$BG_PID" || bg_rc=$?
-    [ -n "$BG_PID" ] || return "$BG_RC"
+  if [ -n "${!bg_p}" ]; then
+    wait "${!bg_p}" || bg_rc=$?
+    [ -n "${!bg_p}" ] || return "${!bg_r}"
   fi
-  __bounded_bg_end "$bg_rc" 0
+  __bounded_bg_end "$bg_h" "$bg_rc" 0
   return "$bg_rc"
+}
+
+bounded_bg_get() {
+  local bg_v
+  case ${1:-} in
+    PID | RC) ;;
+    *) echo "[bound] bounded_bg_get: PID or RC, got '${1:-}'" >&2; return 64 ;;
+  esac
+  __bg_handle "${2:-}" || return $?
+  bg_v=BG_$1${2:+_$2}
+  printf '%s\n' "${!bg_v:-}"
 }
 
 # `bash tools/gate-bound.sh --self-test`: the cancellation table of the owner, one case per way a runner has
@@ -388,8 +485,14 @@ bounded_bg_wait() {
 #   ended-group        group_clear: a group of ended processes only (a zombie leader) is empty, not a refused KILL
 #   exit-handler       lease.sh --self-test, bounded-capture-exit-trap and bounded-out-clean: a runner's EXIT handler
 #                      that exits still runs the capture directory's cleanup
+#   stop-pid-guard     lease_stop and group_clear: a pid that is no number from 2 up (1, 0, 01, none, a word) is refused (70) with
+#                      nothing signalled; kill is a recorder in the case, since a pid of 1 reaches init and its group every process
+#   two-handles        BG_NAME: two commands up at once, the default handle beside a named one too. Each stops by its handle
+#                      and leaves the other up; bounded_bg_stop_all and a TERM to the runner stop both and give the caller's
+#                      traps back; a command cut at its bound leaves the other up; a TERM during one's explicit stop stops
+#                      the other too; a second command under one handle and a handle that is no name are refused
 gb_self_test() {
-  local self t bad=0 s0 form mode trp tag n left p path
+  local self t bad=0 s0 form mode trp tag n left p path ha
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   # shellcheck source=tools/ref/cancel-stubs.sh
   source "${self%/*}/ref/cancel-stubs.sh"
@@ -498,7 +601,7 @@ EOF
   done
   # trap-before-child: the TERM falls between the fork and the pid's assignment, delivered by the owner's own file with a
   # `kill -TERM $$` put there; the child must end all the same.
-  awk '$0 == "  BIN_PID=$!" || $0 == "  BG_PID=$!" { print "  kill -TERM $$" } { print }' "$self" > "$t/boundary-owner.sh"
+  awk '$0 == "  BIN_PID=$!" || $0 == "  bg_pid=$!" { print "  kill -TERM $$" } { print }' "$self" > "$t/boundary-owner.sh"
   check boundary-injected "$(grep -c '^  kill -TERM \$\$$' "$t/boundary-owner.sh")" 2
   cat > "$t/boundary-runner" << 'EOF'
 source "$GB"
@@ -617,6 +720,151 @@ EOF
   left=$(leftover "$t/stopsig.pid")
   check stop-signal-left "${left:-none}" none
   reap "$t/stopsig.pid"
+  # two-handles: two commands up at once, each under its handle (the default handle beside a named one in the "mixed"
+  # cases). Each stops by its handle and leaves the other up, bounded_bg_stop_all and a TERM to the runner stop both and
+  # give the caller's traps back, a command cut at its bound leaves the other up, and a TERM during one's explicit stop
+  # stops the other too.
+  cat > "$t/two-runner" << 'EOF'
+source "$GB"
+[ -z "${TRAP_SH:-}" ] || eval "$TRAP_SH"
+saved=$(trap -p TERM INT HUP)
+BG_NAME=$HA bounded_bg "${BOUND_A:-60}" "$HELD" "$PIDF.a"
+BG_NAME=b bounded_bg 60 "$HELD" "$PIDF.b"
+n=0
+until { [ -s "$PIDF.a" ] && [ -s "$PIDF.b" ]; } || [ "$n" = 100 ]; do sleep 0.1; n=$((n + 1)); done
+up() { kill -0 "$(bounded_bg_get PID "$1")" 2> /dev/null && echo up || echo down; }
+summary() { echo "end handles=[$BG_HANDLES] traps=$([ "$(trap -p TERM INT HUP)" = "$saved" ] && echo back || echo changed)"; }
+case $MODE in
+  stop)
+    ra=0 rb=0
+    bounded_bg_stop "$HA" || ra=$?
+    echo "a stopped rc=$ra a=$(up "$HA") b=$(up b) handles=[$BG_HANDLES]"
+    bounded_bg_stop b || rb=$?
+    echo "b stopped rc=$rb"
+    summary
+    ;;
+  all)
+    ra=0
+    bounded_bg_stop_all || ra=$?
+    echo "all stopped rc=$ra"
+    summary
+    ;;
+  bound)
+    ra=0
+    bounded_bg_wait "$HA" || ra=$?
+    echo "a ended rc=$ra b=$(up b) handles=[$BG_HANDLES]"
+    bounded_bg_stop b || :
+    summary
+    ;;
+  hold)
+    : > "$READY"
+    bounded_bg_wait "$HA"
+    echo after
+    ;;
+esac
+EOF
+  # run_two <tag> <mode> <handle of the first command, empty: the default> <caller trap> [<bound of the first>]: the
+  # runner of two commands, on its own until both are ready for the mode `hold`, which ends it with a TERM; RC, OUT, and
+  # the commands' leftovers in LEFT_A and LEFT_B.
+  run_two() {
+    local tag=$1 mode=$2 ha=$3 trp=$4 bound=${5:-60} rp i=0
+    rm -f "$t/$tag.a" "$t/$tag.a.gc" "$t/$tag.b" "$t/$tag.b.gc" "$t/$tag.ready"
+    env GB="$self" MODE="$mode" HA="$ha" HELD="$t/held" PIDF="$t/$tag" READY="$t/$tag.ready" HELD_MODE=term TRAP_SH="$trp" \
+      BOUND_A="$bound" LEASE_STOP_GRACE=4 CANCEL_TIMEOUT_FORWARD=1 PATH="$t/bin:$PATH" bash "$t/two-runner" > "$t/$tag.out" 2>&1 &
+    rp=$!
+    if [ "$mode" = hold ]; then
+      until { cancel_ready "$t/$tag.a" && cancel_ready "$t/$tag.b" && [ -e "$t/$tag.ready" ]; } || [ "$i" = 100 ]; do
+        sleep 0.1
+        i=$((i + 1))
+      done
+      kill -TERM "$rp" 2> /dev/null
+    fi
+    RC=0
+    { wait "$rp" || RC=$?; } 2> /dev/null # the shell's "Terminated" notice for the killed runner
+    OUT=$(cat "$t/$tag.out")
+    LEFT_A=$(leftover "$t/$tag.a")
+    LEFT_B=$(leftover "$t/$tag.b")
+  }
+  for form in named mixed; do
+    case $form in named) ha=a ;; mixed) ha='' ;; esac
+    tag=two-stop-$form
+    run_two "$tag" stop "$ha" ''
+    check "$tag" "$RC|$OUT|${LEFT_A:-none}|${LEFT_B:-none}" \
+      "0|a stopped rc=0 a=down b=up handles=[b]"$'\n'"b stopped rc=0"$'\n'"end handles=[] traps=back|none|none"
+    reap "$t/$tag.a"
+    reap "$t/$tag.b"
+    tag=two-all-$form
+    run_two "$tag" all "$ha" ''
+    check "$tag" "$RC|$OUT|${LEFT_A:-none}|${LEFT_B:-none}" "0|all stopped rc=0"$'\n'"end handles=[] traps=back|none|none"
+    reap "$t/$tag.a"
+    reap "$t/$tag.b"
+    for trp in '' "trap 'echo trap ran; exit 143' TERM"; do
+      tag=two-term-$form${trp:+-trap}
+      run_two "$tag" hold "$ha" "$trp"
+      check "$tag-rc" "$RC|$(grep -c '^after$' <<< "$OUT")|$(grep -c '^trap ran$' <<< "$OUT")" "143|0|$([ -n "$trp" ] && echo 1 || echo 0)"
+      check "$tag-left" "${LEFT_A:-none}|${LEFT_B:-none}" 'none|none'
+      reap "$t/$tag.a"
+      reap "$t/$tag.b"
+    done
+  done
+  # A command cut at its bound (the stand-in monitor kills its child; coreutils' timeout kills the group too) leaves
+  # the other up, and it is stopped by its own handle all the same.
+  tag=two-bound
+  run_two "$tag" bound a '' 2
+  check "$tag" "$RC|$OUT|${LEFT_A//grandchild/}|${LEFT_B:-none}" \
+    "0|a ended rc=124 b=up handles=[b]"$'\n'"end handles=[] traps=back||none"
+  reap "$t/$tag.a"
+  reap "$t/$tag.b"
+  # A signal during the explicit stop of one of two: kept, the other stopped too, and the runner ends on it (143).
+  cat > "$t/two-stopsig-runner" << 'EOF'
+source "$GB"
+eval "$(declare -f lease_stop | sed '1s/lease_stop/__real_lease_stop/')"
+lease_stop() { : > "$STOPPING"; sleep 1; __real_lease_stop "$@"; }
+BG_NAME=a bounded_bg 60 "$HELD" "$PIDF.a"
+BG_NAME=b bounded_bg 60 "$HELD" "$PIDF.b"
+n=0
+until { [ -s "$PIDF.a" ] && [ -s "$PIDF.b" ]; } || [ "$n" = 100 ]; do sleep 0.1; n=$((n + 1)); done
+bounded_bg_stop a
+echo after
+EOF
+  tag=two-stop-signal
+  rm -f "$t/$tag.a" "$t/$tag.a.gc" "$t/$tag.b" "$t/$tag.b.gc" "$t/$tag.stopping"
+  env GB="$self" HELD="$t/held" PIDF="$t/$tag" STOPPING="$t/$tag.stopping" HELD_MODE=zero LEASE_STOP_GRACE=4 \
+    CANCEL_TIMEOUT_FORWARD=1 PATH="$t/bin:$PATH" bash "$t/two-stopsig-runner" > "$t/$tag.out" 2>&1 &
+  rp=$!
+  n=0
+  until [ -e "$t/$tag.stopping" ] || [ "$n" = 100 ]; do sleep 0.1; n=$((n + 1)); done
+  kill -TERM "$rp" 2> /dev/null
+  RC=0
+  { wait "$rp" || RC=$?; } 2> /dev/null # the shell's "Terminated" notice for the killed runner
+  check "$tag-rc" "$RC|$(grep -c '^after$' "$t/$tag.out")" '143|0'
+  left=$(leftover "$t/$tag.a")
+  check "$tag-left-a" "${left:-none}" none
+  left=$(leftover "$t/$tag.b")
+  check "$tag-left-b" "${left:-none}" none
+  reap "$t/$tag.a"
+  reap "$t/$tag.b"
+  # A second command under one handle and a handle that is no name are refused by name, before anything starts.
+  cat > "$t/two-refuse-runner" << 'EOF'
+source "$GB"
+BG_NAME=a bounded_bg 60 "$HELD" "$PIDF"
+n=0
+until [ -s "$PIDF" ] || [ "$n" = 100 ]; do sleep 0.1; n=$((n + 1)); done
+rc1=0 rc2=0 rc3=0
+BG_NAME=a bounded_bg 60 "$HELD" "$PIDF.x" || rc1=$?
+BG_NAME='a b' bounded_bg 60 true || rc2=$?
+bounded_bg_stop 'x y' || rc3=$?
+bounded_bg_stop_all
+echo "rc=$rc1|$rc2|$rc3 handles=[$BG_HANDLES] second=$([ -e "$PIDF.x" ] && echo started || echo none)"
+EOF
+  tag=two-refuse
+  rm -f "$t/$tag.pid" "$t/$tag.pid.gc" "$t/$tag.pid.x"
+  env GB="$self" HELD="$t/held" PIDF="$t/$tag.pid" HELD_MODE=term LEASE_STOP_GRACE=4 CANCEL_TIMEOUT_FORWARD=1 \
+    PATH="$t/bin:$PATH" bash "$t/two-refuse-runner" > "$t/$tag.out" 2>&1 || :
+  check "$tag" "$(grep -c '^rc=70|64|64 handles=\[\] second=none$' "$t/$tag.out")|$(grep -c 'one background command at a time per handle' "$t/$tag.out")|$(grep -c 'a handle is letters, digits and underscores' "$t/$tag.out")" '1|1|2'
+  left=$(leftover "$t/$tag.pid")
+  check "$tag-left" "${left:-none}" none
+  reap "$t/$tag.pid"
   # output-setup: a stdin or output file that cannot be opened ends the command, not the runner, and starts nothing.
   RC=0
   env HELD="$t/held" PIDF="$t/fifo.pid" PATH="$t/bin:$PATH" NOPE="$t/no-such-dir" bash -c \

@@ -33,7 +33,10 @@
 #                                  for its `listening on http://127.0.0.1:<port>` line — printed after the
 #                                  model loaded — and a 200 from /health. SRV_PID (the timeout's pid),
 #                                  SRV_PORT; 1 with SRV_WHY and SRV_RC when it exited first
-#                                  (its rc) or never listened: the bound ended it, or the wait ran out (124)
+#                                  (its rc) or never listened: the bound ended it, or the wait ran out (124).
+#                                  SRV_HANDLE, set before the call, is the bounded_bg handle the server runs under
+#                                  (tools/gate-bound.sh; empty, the default handle): a runner with two servers up at
+#                                  once starts each under a handle of its own and stops each by it
 #   lcpp_srv_request <ids> <n_predict> <bound>  one POST /completion: the comma-separated ids as the prompt,
 #                                  greedy (temperature 0, top_k 1), ignore_eos, cache_prompt off,
 #                                  return_tokens; pgmajfault read just before and after (SRV_F0, SRV_F1). Into
@@ -52,8 +55,8 @@
 #                                  lcpp_srv_request, and the caller stops it
 #   lcpp_srv_same <a> <b>          `same` for two equal comma lists of ids, else `differs at <i>`: greedy
 #                                  decoding repeats its continuation, so the warm-up read the timed rows
-#   lcpp_srv_stop                  bounded_bg_stop ends SRV_PID and its group, then restores the caller's signal
-#                                  traps; SRV_EXIT the child's status or a cleanup failure
+#   lcpp_srv_stop                  bounded_bg_stop ends SRV_PID (the SRV_HANDLE's) and its group, then restores the
+#                                  caller's signal traps; SRV_EXIT the child's status or a cleanup failure
 #   lcpp_srv_build <log>, lcpp_srv_device <log>  the server's `build:` line and the card it opened
 #   lcpp_srv_nctx <log>            the n_ctx the server's context was made with (its `llama_context: n_ctx =`
 #                                  line, the first: an MTP draft's context prints its own after it)
@@ -302,14 +305,15 @@ lcpp_srv_probe() {
 
 lcpp_srv_majflt() { awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat; }
 
-# lcpp_srv_spawn <bound> <log> [NAME=VALUE...]: the background launch (bounded_bg, tools/gate-bound.sh), SRV_PID the
-# timeout's pid. The child appends to <log>; lcpp_srv_start has emptied it first (the self-test's seam).
+# lcpp_srv_spawn <bound> <log> [NAME=VALUE...]: the background launch (bounded_bg, tools/gate-bound.sh, under the
+# SRV_HANDLE), SRV_PID the timeout's pid. The child appends to <log>; lcpp_srv_start has emptied it first (the
+# self-test's seam).
 lcpp_srv_spawn() {
   local bound=$1 log=$2
   shift 2
   SRV_PID=''
-  BG_OUT_APPEND=$log bounded_bg "$bound" env "$@" "${SRV_CMD[@]}" || return $?
-  SRV_PID=$BG_PID
+  BG_NAME=${SRV_HANDLE:-} BG_OUT_APPEND=$log bounded_bg "$bound" env "$@" "${SRV_CMD[@]}" || return $?
+  SRV_PID=$(bounded_bg_get PID "${SRV_HANDLE:-}")
 }
 
 lcpp_srv_start() {
@@ -332,7 +336,7 @@ lcpp_srv_start() {
     fi
     if ! kill -0 "$SRV_PID" 2> /dev/null; then
       SRV_RC=0
-      bounded_bg_wait || SRV_RC=$?
+      bounded_bg_wait "${SRV_HANDLE:-}" || SRV_RC=$?
       [ "$SRV_RC" != 0 ] || SRV_RC=70
       # timeout's 124: the bound ended the server, the verdict of a loop that ran out. Each pass takes longer than its
       # sleep when forks are slow, so the bound can end the server before the count does.
@@ -430,8 +434,8 @@ lcpp_srv_same() {
 lcpp_srv_stop() {
   local cleanup_rc=0
   [ -n "${SRV_PID:-}" ] || return 0
-  bounded_bg_stop || cleanup_rc=$?
-  SRV_EXIT=$BG_RC
+  bounded_bg_stop "${SRV_HANDLE:-}" || cleanup_rc=$?
+  SRV_EXIT=$(bounded_bg_get RC "${SRV_HANDLE:-}")
   SRV_PID=''
   [ "$cleanup_rc" = 0 ] || { SRV_EXIT=$cleanup_rc; exit "$cleanup_rc"; }
   return 0
@@ -1065,7 +1069,7 @@ EOF
   mkdir -p "$t/tree/tools/ref"
   # The startup phase holds the runner between the owner's fork and its pid assignment.
   awk '
-    $0 == "  BG_PID=$!" {
+    $0 == "  bg_pid=$!" {
       print "  echo gap > \"$START_READY\""
       print "  while [ ! -e \"$START_RELEASE\" ]; do sleep 0.01 9>&-; done"
     }
