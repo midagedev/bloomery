@@ -76,6 +76,7 @@ dependencies = [
  "bloomery-gpu-deepseek41",
  "bloomery-gpu-glm5next",
  "bloomery-gpu-mimo2",
+ "bloomery-gpu-solar2",
  "bloomery-levers",
  "bloomery-model",
  "bloomery-runtime",
@@ -185,6 +186,7 @@ dependencies = [
  "bloomery-gpu-gemma4a",
  "bloomery-gpu-glm5next",
  "bloomery-gpu-mimo2",
+ "bloomery-gpu-solar2",
  "bloomery-gpu-vision",
  "bloomery-hf",
  "bloomery-levers",
@@ -249,6 +251,20 @@ dependencies = [
 
 [[package]]
 name = "bloomery-gpu-mimo2"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "bloomery-gpu-deepseek41",
+ "bloomery-levers",
+ "bloomery-model",
+ "bloomery-models",
+ "bloomery-runtime",
+ "cuda-core",
+]
+
+[[package]]
+name = "bloomery-gpu-solar2"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",

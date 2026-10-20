@@ -1,0 +1,24 @@
+[package]
+name = "bloomery-gpu-solar2"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+# The Solar-Open2 program: host code only, no `#[cuda_module]` of its own. It composes the common
+# owners of `bloomery-gpu` (the KDA mixer `linear::mixer_kda`, the NoPE GQA layer with its out gate
+# `arch::hybrid::gqa_layer`, the typed sites, the host tier and its shell `host::shell`) and of
+# `bloomery-gpu-deepseek41` (the gated block, the 320/8 sigmoid router); built with `cargo oxide`
+# because those crates are.
+[dependencies]
+cuda-core.workspace = true
+bloomery-gpu = { path = "../gpu" }
+bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41" }
+bloomery-gguf = { path = "../gguf" }
+bloomery-levers = { path = "../levers" }
+bloomery-model = { path = "../model" }
+bloomery-models = { path = "../models" }
+bloomery-runtime = { path = "../runtime" }
