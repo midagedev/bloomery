@@ -184,3 +184,4 @@ crates/model/src/arch/mod.rs	minimax	1	PIN(2026-10-20) minimax: the family's mod
 crates/models/src/lib.rs	minimax	2	PIN(2026-10-20) minimax: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
 crates/placement/src/accepts.rs	minimax	1	PIN(2026-10-20) minimax: program_of matches every models::Arch exhaustively, so the variant needs an arm; None until the family's body adds its Program
 crates/gpu-gates/src/bin/shared/routed_legs.rs	minimax	2	PIN(2026-10-20) minimax: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body exists
+crates/gpu-gates/src/bin/shared/systemone_clause.rs	clef	1	PIN(2026-10-20) clef: the suite of SystemOne requests the serve gates post (tools/ref/clef/suite.jsonl) has no neutral name; the decision release row owns the file

@@ -9,7 +9,7 @@ use crate::head::{CONFIG_FILE, HeadConfig};
 pub const NAME: &str = "clef";
 
 /// The routes a SystemOne request is posted to: the release's.
-pub const ROUTES: &[&str] = &["/v1/systemone"];
+pub const ROUTES: &[&str] = crate::request::ROUTES;
 
 /// The file architectures the head reads the hidden states of: Qwen3.5 dense, Clef's backbone,
 /// in the two layouts a GGUF of it comes in ([`IN_FILE`] is the one that holds its head).

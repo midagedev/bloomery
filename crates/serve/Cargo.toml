@@ -17,6 +17,9 @@ path = "src/bin/bloomery-serve.rs"
 workspace = true
 
 [dependencies]
+# The decision models' request reader and answer formulas, which a generative seat's `/v1/systemone`
+# shares with the decide seat. Host code only: its closure holds no device crate.
+bloomery-decision = { path = "../decision" }
 bloomery-embed = { path = "../embed" }
 # The HTTP layer is std::net on purpose: one slot, one engine mutex, and SSE needs a flush per
 # event. JSON is its only third-party need.

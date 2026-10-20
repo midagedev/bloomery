@@ -14,7 +14,7 @@
 use crate::Error;
 use crate::encode::Encoded;
 use crate::json::Json;
-use crate::request::{Kind, Request};
+use crate::request::{Kind, Question, Request};
 
 /// Python's `round(x, 4)` of a finite f64: the correctly rounded 4-decimal value (ties to even on the
 /// exact binary value), read back as the nearest f64.
@@ -173,94 +173,138 @@ pub fn answer(
                 eq.option_ids.len()
             )));
         }
-        let p32 = probabilities(l);
-        let p = |id: &str| -> f64 {
-            let i = eq
-                .option_ids
-                .iter()
-                .position(|o| o == id)
-                .expect("every option id has a logit");
-            f64::from(p32[i])
-        };
-        let body = match q.kind {
-            Kind::Noul => vec![
-                ("type".into(), Json::Str("noul".into())),
-                ("noul".into(), num(round4(p("true")))),
-            ],
-            Kind::Choice => {
-                let Some(Json::Object(criteria)) = &q.criteria else {
-                    unreachable!("a validated choice question has object criteria")
-                };
-                let order: Vec<&str> = criteria.iter().map(|(k, _)| k.as_str()).collect();
-                let mut best = order[0];
-                for &o in &order[1..] {
-                    if p(o) > p(best) {
-                        best = o;
-                    }
-                }
-                vec![
-                    ("type".into(), Json::Str("choice".into())),
-                    ("choice".into(), Json::Str(best.into())),
-                    (
-                        "confidence".into(),
-                        num(round4(confidence_choice(
-                            &order.iter().map(|&o| p(o)).collect::<Vec<_>>(),
-                        ))),
-                    ),
-                    (
-                        "probabilities".into(),
-                        Json::Object(
-                            order
-                                .iter()
-                                .map(|&o| (o.to_string(), num(round4(p(o)))))
-                                .collect(),
-                        ),
-                    ),
-                ]
-            }
-            Kind::Score => {
-                let Some(Json::Array(levels)) = &q.criteria else {
-                    unreachable!("a validated score question has array criteria")
-                };
-                let ids: Vec<String> = (0..levels.len()).map(|i| i.to_string()).collect();
-                let score = python_sum(ids.iter().enumerate().map(|(i, id)| i as f64 * p(id)));
-                vec![
-                    ("type".into(), Json::Str("score".into())),
-                    ("score".into(), num(round4(score))),
-                    (
-                        "confidence".into(),
-                        num(round4(confidence_score(
-                            &ids.iter().map(|id| p(id)).collect::<Vec<_>>(),
-                        ))),
-                    ),
-                    (
-                        "legend".into(),
-                        Json::Object(ids.iter().cloned().zip(levels.iter().cloned()).collect()),
-                    ),
-                    (
-                        "probabilities".into(),
-                        Json::Object(
-                            ids.iter()
-                                .map(|id| (id.clone(), num(round4(p(id)))))
-                                .collect(),
-                        ),
-                    ),
-                ]
-            }
-        };
-        answers.push((q.id.clone(), Json::Object(body)));
+        answers.push((
+            q.id.clone(),
+            question_answer(q, &eq.option_ids, &probabilities(l), None)?,
+        ));
     }
-    Ok(Json::Object(vec![
+    Ok(body(model, answers, enc.ids.len(), 0))
+}
+
+/// One question's answer object from `p32`, the probabilities of its options `option_ids` (in
+/// the order the options are scored), as [`answer`] and every model that answers in the release's
+/// shape write it. A `choice` is the first most probable option in the request's criteria order,
+/// or `picked`, an option id the model itself picked (a generative model's, whose pick is the
+/// greedy token and not a function of the printed probabilities alone).
+pub fn question_answer(
+    q: &Question,
+    option_ids: &[String],
+    p32: &[f32],
+    picked: Option<&str>,
+) -> Result<Json, Error> {
+    if p32.len() != option_ids.len() {
+        return Err(Error::Logits(format!(
+            "{}: {} probabilities for {} options",
+            q.id,
+            p32.len(),
+            option_ids.len()
+        )));
+    }
+    let p = |id: &str| -> f64 {
+        let i = option_ids
+            .iter()
+            .position(|o| o == id)
+            .expect("every option id has a probability");
+        f64::from(p32[i])
+    };
+    let body = match q.kind {
+        Kind::Noul => vec![
+            ("type".into(), Json::Str("noul".into())),
+            ("noul".into(), num(round4(p("true")))),
+        ],
+        Kind::Choice => {
+            let Some(Json::Object(criteria)) = &q.criteria else {
+                unreachable!("a validated choice question has object criteria")
+            };
+            let order: Vec<&str> = criteria.iter().map(|(k, _)| k.as_str()).collect();
+            let best = match picked {
+                Some(id) => *order.iter().find(|&&o| o == id).ok_or_else(|| {
+                    Error::Logits(format!("{}: the pick {id:?} is no option", q.id))
+                })?,
+                None => {
+                    let mut best = order[0];
+                    for &o in &order[1..] {
+                        if p(o) > p(best) {
+                            best = o;
+                        }
+                    }
+                    best
+                }
+            };
+            vec![
+                ("type".into(), Json::Str("choice".into())),
+                ("choice".into(), Json::Str(best.into())),
+                (
+                    "confidence".into(),
+                    num(round4(confidence_choice(
+                        &order.iter().map(|&o| p(o)).collect::<Vec<_>>(),
+                    ))),
+                ),
+                (
+                    "probabilities".into(),
+                    Json::Object(
+                        order
+                            .iter()
+                            .map(|&o| (o.to_string(), num(round4(p(o)))))
+                            .collect(),
+                    ),
+                ),
+            ]
+        }
+        Kind::Score => {
+            let Some(Json::Array(levels)) = &q.criteria else {
+                unreachable!("a validated score question has array criteria")
+            };
+            let ids: Vec<String> = (0..levels.len()).map(|i| i.to_string()).collect();
+            let score = python_sum(ids.iter().enumerate().map(|(i, id)| i as f64 * p(id)));
+            vec![
+                ("type".into(), Json::Str("score".into())),
+                ("score".into(), num(round4(score))),
+                (
+                    "confidence".into(),
+                    num(round4(confidence_score(
+                        &ids.iter().map(|id| p(id)).collect::<Vec<_>>(),
+                    ))),
+                ),
+                (
+                    "legend".into(),
+                    Json::Object(ids.iter().cloned().zip(levels.iter().cloned()).collect()),
+                ),
+                (
+                    "probabilities".into(),
+                    Json::Object(
+                        ids.iter()
+                            .map(|id| (id.clone(), num(round4(p(id)))))
+                            .collect(),
+                    ),
+                ),
+            ]
+        }
+    };
+    Ok(Json::Object(body))
+}
+
+/// The response body: the server's name for the model, the `answers` (one `(question id, answer)`
+/// pair each, in request order) and the token counts of the prompt and of what the model
+/// generated (a decision head generates none).
+#[must_use]
+pub fn body(
+    model: &str,
+    answers: Vec<(String, Json)>,
+    input_tokens: usize,
+    output_tokens: usize,
+) -> Json {
+    Json::Object(vec![
         ("model".into(), Json::Str(model.to_owned())),
         ("answers".into(), Json::Object(answers)),
         (
             "usage".into(),
             Json::Object(vec![
-                ("input_tokens".into(), Json::Int(enc.ids.len().to_string())),
-                ("output_tokens".into(), Json::Int("0".into())),
+                ("input_tokens".into(), Json::Int(input_tokens.to_string())),
+                ("output_tokens".into(), Json::Int(output_tokens.to_string())),
             ]),
         ),
-    ]))
+    ])
 }
 
 #[cfg(test)]

@@ -71,6 +71,9 @@ pub struct Opt {
     pub description: Option<Json>,
 }
 
+/// The routes a SystemOne request is posted to: every decision model's, and a generative server's.
+pub const ROUTES: &[&str] = &["/v1/systemone"];
+
 /// The images a request may carry, `images` and a state's image parts together: llama.cpp's
 /// `DECISION_MAX_IMAGES`.
 pub const MAX_IMAGES: usize = 8;

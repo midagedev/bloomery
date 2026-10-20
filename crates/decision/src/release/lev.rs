@@ -11,7 +11,7 @@ use crate::request::Rules;
 pub const NAME: &str = "lev";
 
 /// The routes a SystemOne request is posted to: llama.cpp's.
-pub const ROUTES: &[&str] = &["/v1/systemone"];
+pub const ROUTES: &[&str] = crate::request::ROUTES;
 
 /// The file architectures the label head reads: Qwen3.5 dense, lev's backbone.
 pub const BACKBONES: &[&str] = &["qwen35"];

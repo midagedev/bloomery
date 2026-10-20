@@ -76,6 +76,13 @@
 //!   a request of the prompt and the answer the jump arm fed, but its last
 //!   id, keeps the prompt call's end (`P + lead - 1`). FAIL-first: a run fed
 //!   with the body's marks on keeps its start, `P + lead`;
+//! - `systemone_is_the_schema_path` (`shared/systemone_clause.rs`, the clause
+//!   `gate_qwen38_serve` holds too): the rows of `tools/ref/clef/suite.jsonl`
+//!   POSTed to `/v1/systemone`, answered by this model through the
+//!   structured-output path, are 200s with the decision seats' keys, and
+//!   their picks are `/v1/chat/completions`' on the same request converted
+//!   with `response_format`. FAIL-first: a server without the route
+//!   answers every row 404;
 //! - on a qwen3moe file, whose seat keeps a prefix of what the slot holds,
 //!   the prefix clauses: the edit clause — the turn of [`EDIT_A`] answered,
 //!   then resent with its user message changed to [`EDIT_B`], which diverges
@@ -477,6 +484,10 @@
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen3_serve", gate::run())
 }
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/systemone_clause.rs"]
+mod systemone_clause;
 
 #[cfg(feature = "deepseek41")]
 #[path = "shared/qwen3moe_place.rs"]
@@ -3209,6 +3220,7 @@ mod gate {
             prefix35(&url, dir, ok)?;
             tool_call_is_parsed(&url, dir, ok)?;
         }
+        *ok &= crate::systemone_clause::is_the_schema_path(&url, dir)?;
         println!("server stopped: {}", s.stop()?);
         let mut answers = vec![chat_ids, prose_ids];
         answers.extend(whole);
