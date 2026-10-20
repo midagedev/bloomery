@@ -52,8 +52,9 @@
 //! - (s6) the need hook (`BLOOMERY_NEED_HOOK`): `-m <fixture>` with a hook that reads its standard input and
 //!   exits 75 with a line. The process ends 75 before it listens, its log holds the hook's line, and the hook's
 //!   input is the `need` record the server printed at plan time, byte for byte. A second start with a hook that
-//!   exits 0 listens, and that hook's input is its own `need` record. The hook is consulted by the placed load,
-//!   before any card is opened, so the refusal holds no card.
+//!   exits 0 listens, and that hook's input is its own `need` record. The hook is consulted by the placed load
+//!   before its own open of the card: that start's hook waits `HOOK_WAIT_S` seconds, and the load's `context_s`
+//!   phase (the open of the card) stays under half of them. A consult after the open puts the wait in that phase.
 //!
 //! A clause's failure never ends the run: an error inside a clause (a server that exits before it listens,
 //! a kind the log is not read by) is that clause's FAIL line, and (s4) reads every log the run wrote.
@@ -91,6 +92,8 @@ const USAGE: &str = "usage: gate_serve_start --family glm|ds41 --dir <out>";
 /// A server's polls for its `listening` line, 2 s apart: a fixture loads in a fraction of this.
 const POLLS: usize = 60;
 const POLL: Duration = Duration::from_secs(2);
+/// Seconds the go-ahead hook of (s6) waits before it answers: far longer than the card's open takes.
+const HOOK_WAIT_S: u32 = 4;
 /// The chat requests' length: the fixture's weights say nothing, the request only has to be served.
 const MAX_TOKENS: u64 = 8;
 /// The one question every chat asks.
@@ -320,13 +323,14 @@ fn command(cache: Option<&Path>) -> Result<Command, GateError> {
     Ok(cmd)
 }
 
-/// A hook script in `dir`: it writes its standard input to `<name>.saw`, prints `line` and exits `rc`. The
-/// script and the file it writes.
+/// A hook script in `dir`: it writes its standard input to `<name>.saw`, waits `wait` seconds, prints `line` and
+/// exits `rc`. The script and the file it writes.
 fn hook_script(
     dir: &Path,
     name: &str,
     line: &str,
     rc: u8,
+    wait: u32,
 ) -> Result<(PathBuf, PathBuf), GateError> {
     let saw = dir.join(format!("{name}.saw"));
     let script = dir.join(format!("{name}.sh"));
@@ -336,7 +340,7 @@ fn hook_script(
         .args(["-c", "printf '%s\\n' \"$2\" > \"$1\"", "hook-script"])
         .arg(&script)
         .arg(format!(
-            "#!/bin/sh\ncat > '{}'\necho '{line}'\nexit {rc}\n",
+            "#!/bin/sh\ncat > '{}'\nsleep {wait}\necho '{line}'\nexit {rc}\n",
             saw.display()
         ))
         .status()?;
@@ -916,7 +920,7 @@ impl Gate {
         // The refusal: the process ends 75 and never listens.
         let refuse = dir.join("refuse");
         std::fs::create_dir_all(&refuse)?;
-        let (hook, saw) = hook_script(&refuse, "hook", line, 75)?;
+        let (hook, saw) = hook_script(&refuse, "hook", line, 75, 0)?;
         let mut cmd = command(None)?;
         cmd.env("BLOOMERY_NEED_HOOK", &hook);
         println!(
@@ -943,10 +947,11 @@ impl Gate {
             .to_owned();
         let saw = std::fs::read_to_string(&saw)?;
         ok &= check("s6_the_hook_read_the_need_record", saw.trim_end() == need);
-        // The go-ahead: the same start with a hook that exits 0 listens.
+        // The go-ahead: the same start with a hook that exits 0 listens. It waits first, so where the wait
+        // lands in the load's phases tells whether the hook answered before the card was opened.
         let go = dir.join("go");
         std::fs::create_dir_all(&go)?;
-        let (hook, saw) = hook_script(&go, "hook", line, 0)?;
+        let (hook, saw) = hook_script(&go, "hook", line, 0, HOOK_WAIT_S)?;
         let mut cmd = command(None)?;
         cmd.env("BLOOMERY_NEED_HOOK", &hook);
         println!(
@@ -966,6 +971,16 @@ impl Gate {
         ok &= check(
             "s6_the_go_ahead_hook_read_its_need_record",
             saw.trim_end() == need,
+        );
+        let context = server_log(&up_err, self.family.kinds())?
+            .one(&record::LOAD_PHASES)?
+            .f64("context_s")?;
+        println!(
+            "s6: the open of the card took {context} s under a hook that waited {HOOK_WAIT_S} s"
+        );
+        ok &= check(
+            "s6_the_hook_answers_before_the_card_is_opened",
+            context < f64::from(HOOK_WAIT_S) / 2.0,
         );
         Ok(ok)
     }

@@ -326,10 +326,12 @@ stderr; a seat with a `--plan` flag prints both before it exits). It states what
 
 `BLOOMERY_NEED_HOOK=<executable>` calls a program once per placed load, after the plan and before a card is opened or a
 byte read in, with that line on its standard input. Exit 0 goes on. Exit 75 ends the process with 75, naming the hook's
-last line of output (the process holds no card, so a broker can queue the start and ask again). Any other status, or a
+last line of output (the load has opened no card of its own, so a broker can queue the start and ask again). Any other status, or a
 hook that cannot start, ends the load with a named error. A hook may wait as long as it likes; unset, nothing runs. A
-logger is a hook: `cat >> need.log` as a script. A load that opens a whole model on one card with no plan states no need
-and consults no hook.
+logger is a hook: `cat >> need.log` as a script. The hook is a program named by an absolute path (a relative name is
+refused at start). Every load that prints a `need` asks the hook before it opens its card, a whole model on the one
+card of a placed plan (`--place`) included. A load that opens a whole model on one card with no plan (`--place` unset
+and the model fits) states no need and consults no hook; a set hook is named on stderr as not asked.
 
 ## Limits
 
