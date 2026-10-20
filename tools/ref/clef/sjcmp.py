@@ -43,6 +43,18 @@ suite); a gold line that names a request the suite lacks, a question the request
 option of the question, a key other than those four, and a request with no gold line, is a named error
 (`check-suites` reads them all and the shell runs it before the lease).
 
+The bodies. Beside `rows.json` in the out dir, `bodies/<arm>/<suite>-<id>.json` holds each arm's answer to each
+request's first counted round (not the dropped one) exactly as the server sent it: the Clef arm's `/v1/systemone`
+body, a generative arm's chat completion; the row names its file under `body`. The files are written after the last
+round, from text kept in memory, so nothing but that bookkeeping sits between two timed POSTs. Then each generative
+arm whose `GET /props` lists `/v1/systemone` under `routes` is asked every request once more on that route, untimed
+(the Clef arm's body is already one), and the bodies go to `bodies/<arm>-systemone/<suite>-<id>.json`; a non-200
+answer is saved too, its status in `<that file>.status`, and `[bodies] <arm>: systemone n ok / m` counts the 200s. A
+server without the route (or with no readable `/props`) is a named line and no error; a server that stops answering
+ends its pass by name. The pass is made after `rows.json` is written, so a failure in it never costs the
+measurement. The directories are made before the first POST: an out dir that cannot hold them ends the run before
+the rounds.
+
 The tables (`table`). The client wall — the POST to the last byte, the user's time to answer — p50 and p95 per
 suite and per bucket (short: a prompt under 1,000 ids; long: the two long requests), beside the server's own
 split and the host-prep term (`wall - (prompt_ms + predicted_ms)`, `head_ms` for the Clef arm); the tops
@@ -56,8 +68,9 @@ self-test). The official rows are the box's `<data>/clef/flash/ref/reference.jso
 for `en` and `ko` alone.
 
 `--self-test` is pure: no server, no card, no clock. It covers the conversion of every question type of the
-four suites, the back-mapping, the rotation, the call plan and the count-mismatch refusal, and the stats on a
-fixed sample.
+four suites, the back-mapping, the rotation, the call plan and the count-mismatch refusal, the stats on a fixed
+sample, and the bodies (first counted round, the SystemOne pass's route test, order and failures) against servers
+that are objects logging their requests.
 """
 
 from __future__ import annotations
@@ -735,16 +748,15 @@ class Client:
                 pass
             self.conn = None
 
-    def post(self, path: str, body: dict) -> tuple[int, str, float]:
-        """The POST's answer: the status, the body's text and the wall in ms (the POST to the last byte)."""
-        data = json.dumps(body).encode()
-        headers = {"Content-Type": "application/json", "Content-Length": str(len(data))}
+    def _exchange(self, method: str, path: str, data: bytes | None, headers: dict) -> tuple[int, str, float]:
+        """One request and its answer: the status, the body's text and the wall in ms (the request to the last
+        byte)."""
         for attempt in (1, 2):
             if self.conn is None:
                 self._open()
             t0 = time.perf_counter()
             try:
-                self.conn.request("POST", self.base + path, body=data, headers=headers)
+                self.conn.request(method, self.base + path, body=data, headers=headers)
                 resp = self.conn.getresponse()
                 raw = resp.read().decode()
                 wall = (time.perf_counter() - t0) * 1000.0
@@ -754,6 +766,16 @@ class Client:
                 if attempt == 2:
                     fail(f"{self.name} at {self.url}: {path} failed: {e}")
         fail(f"{self.name} at {self.url}: {path} failed")
+
+    def post(self, path: str, body: dict) -> tuple[int, str, float]:
+        """The POST's answer: the status, the body's text and the wall in ms (the POST to the last byte)."""
+        data = json.dumps(body).encode()
+        return self._exchange("POST", path, data, {"Content-Type": "application/json", "Content-Length": str(len(data))})
+
+    def get(self, path: str) -> tuple[int, str]:
+        """The GET's answer: the status and the body's text. Only the untimed passes read with it."""
+        status, raw, _ = self._exchange("GET", path, None, {})
+        return status, raw
 
 
 class Arm:
@@ -959,7 +981,8 @@ def check_suites(argv: list[str]) -> int:
 
 
 def post_one(arm: Arm, suite: str, req: dict, rnd: int, dropped: bool, model: str | None) -> dict:
-    """One request to one arm: the wall, the server's own split, the tops and the call-count check."""
+    """One request to one arm: the wall, the server's own split, the tops and the call-count check. The row also
+    holds the answer's text as received under `_raw`, which `measure` takes out (`take_raw`) before the row is kept."""
     where = f"{suite}/{req['id']} on arm {arm.name}"
     if arm.kind == "clef":
         status, raw, wall = arm.client.post("/v1/systemone", clef_body(req))
@@ -1024,7 +1047,13 @@ def post_one(arm: Arm, suite: str, req: dict, rnd: int, dropped: bool, model: st
         "tops": tops,
         "picks": picks,
         **extra,
+        "_raw": raw,
     }
+
+
+def take_raw(row: dict) -> str:
+    """The answer's text a row of `post_one` carries, taken out: a row is kept without it."""
+    return row.pop("_raw")
 
 
 def bucket_of(rows: list[dict]) -> dict[tuple[str, str], str]:
@@ -1040,8 +1069,109 @@ def bucket_of(rows: list[dict]) -> dict[tuple[str, str], str]:
     return out
 
 
+# The route the Clef arm posts to and the generative arms' untimed SystemOne pass posts to.
+SYSTEMONE = "/v1/systemone"
+# A file name the bodies' paths are made of: an arm, a suite or a request id.
+FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def body_rel(arm: str, suite: str, rid: str, dir_suffix: str = "") -> str:
+    """A body's path relative to the out dir: `bodies/<arm><dir_suffix>/<suite>-<id>.json`."""
+    return f"bodies/{arm}{dir_suffix}/{suite}-{rid}.json"
+
+
+def check_body_names(arms: list[Arm], reqs: list[tuple[str, dict]]) -> None:
+    """The bodies' files are named from the arm, the suite and the request id, so each must be a plain file name,
+    no two directories may be one (an arm named like another's `-systemone` directory) and no two requests may
+    share a file. A named error before the first POST, never a file written over another."""
+    for arm in arms:
+        if not FILE_NAME.match(arm.name):
+            fail(f"the arm name '{arm.name}' is no plain file name: the bodies are saved under it")
+    dirs = [a.name for a in arms] + [f"{a.name}-systemone" for a in arms if a.kind != "clef"]
+    dup = sorted({d for d in dirs if dirs.count(d) > 1})
+    if dup:
+        fail(f"the bodies' directories {dup} are named twice (an arm named like another's '-systemone' directory)")
+    files = []
+    for suite, req in reqs:
+        for part in (suite, req["id"]):
+            if not FILE_NAME.match(str(part)):
+                fail(f"'{part}' ({suite}/{req['id']}) is no plain file name: the bodies are saved under it")
+        files.append(body_rel("x", suite, req["id"]))
+    dup = sorted({f for f in files if files.count(f) > 1})
+    if dup:
+        fail(f"two requests share a body file name: {[Path(d).name for d in dup]}")
+
+
+def make_dir(path: Path) -> None:
+    """A directory made, or a named error."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        fail(f"cannot make {path}: {e}")
+
+
+def save(path: Path, data: bytes) -> None:
+    """A file written exactly, or a named error."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    except OSError as e:
+        fail(f"cannot write {path}: {e}")
+
+
+def arm_routes(arm: Arm) -> tuple[list[str] | None, str]:
+    """The routes the arm's server lists in `GET /props` (`routes`, a list of paths; none for a server that has no
+    such key), or None and why `/props` could not be read."""
+    try:
+        status, raw = arm.client.get("/props")
+    except Stop as e:
+        return None, str(e).removeprefix("sjcmp: ")
+    if status != 200:
+        return None, f"GET /props answered {status}"
+    try:
+        props = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return None, f"GET /props is no JSON: {e}"
+    routes = props.get("routes", []) if isinstance(props, dict) else None
+    if not isinstance(routes, list) or not all(isinstance(r, str) for r in routes):
+        return None, "GET /props has no list of paths under routes"
+    return routes, ""
+
+
+def systemone_bodies(arm: Arm, reqs: list[tuple[str, dict]], out: Path) -> None:
+    """A generative arm's SystemOne bodies, untimed: when the server lists `/v1/systemone` in its `/props`' routes,
+    each request of each suite is posted once to it and the body saved as received under
+    `bodies/<arm>-systemone/<suite>-<id>.json`. A non-200 answer is saved too, its status in `<that file>.status`.
+    Only the 200s count as ok. A server without the route, or whose `/props` cannot be read, is a named line, not
+    an error; so is a server that stops answering (the pass ends there and the rest count as not ok). The pass
+    makes no row and touches none: it runs after the rounds, when the timed regions are over."""
+    routes, why = arm_routes(arm)
+    if routes is None:
+        print(f"[bodies] {arm.name}: the server lists no {SYSTEMONE}; skipped ({why})", flush=True)
+        return
+    if SYSTEMONE not in routes:
+        print(f"[bodies] {arm.name}: the server lists no {SYSTEMONE}; skipped", flush=True)
+        return
+    ok = 0
+    for suite, req in reqs:
+        where = f"{suite}/{req['id']}"
+        try:
+            status, raw, _ = arm.client.post(SYSTEMONE, clef_body(req))
+        except Stop as e:
+            print(f"[bodies] {arm.name}: {where}: {str(e).removeprefix('sjcmp: ')}; the pass ends here", flush=True)
+            break
+        path = out / body_rel(arm.name, suite, req["id"], "-systemone")
+        save(path, raw.encode())
+        if status == 200:
+            ok += 1
+        else:
+            save(path.with_name(path.name + ".status"), f"{status}\n".encode())
+            print(f"[bodies] {arm.name}: {where}: {SYSTEMONE} answered {status}", flush=True)
+    print(f"[bodies] {arm.name}: systemone {ok} ok / {len(reqs)}", flush=True)
+
+
 def run(argv: list[str]) -> int:
-    """The run: the arms, the rounds, the requests."""
+    """The run: the arms, the suites, then `measure`."""
     opts = parse_run_args(argv)
     arms = [Arm(name, url, kind) for kind, name, url in opts["arms"]]
     if not arms:
@@ -1049,14 +1179,29 @@ def run(argv: list[str]) -> int:
     names = [a.name for a in arms]
     if len(set(names)) != len(names):
         fail(f"the arms' names are not distinct: {names}")
-    suites = load_suites(opts["suites"])
+    return measure(arms, load_suites(opts["suites"]), opts)
+
+
+def measure(arms: list[Arm], suites: list[dict], opts: dict) -> int:
+    """The rounds, the requests, the rows and the bodies. The timed regions are `post_one`'s POSTs alone; between
+    them the loop only keeps the first counted round's answer text in memory. Past the last round: the rows, then
+    the kept bodies as files (`bodies/<arm>/<suite>-<id>.json`, the row naming its file under `body`), then each
+    generative arm's untimed SystemOne pass. The bodies' directories are made before the first POST."""
+    names = [a.name for a in arms]
     reqs = suite_requests(suites)
+    check_body_names(arms, reqs)
+    out = Path(opts["out"])
+    for arm in arms:
+        make_dir(out / "bodies" / arm.name)
     rows: list[dict] = []
+    held: dict[tuple[str, str, str], str] = {}
     # The first post of every request to every arm: the first-request state, dropped. It also says how long each
     # prompt is, so the buckets are known before the rounds.
     for suite, req in reqs:
         for arm in arms:
-            rows.append(post_one(arm, suite, req, 0, True, opts["model"]))
+            row = post_one(arm, suite, req, 0, True, opts["model"])
+            take_raw(row)
+            rows.append(row)
     buckets = bucket_of(rows)
     for suite, req in reqs:
         buckets.setdefault((suite, req["id"]), "short")
@@ -1073,7 +1218,12 @@ def run(argv: list[str]) -> int:
                 for k in range(len(arms)):
                     arm = arms[(k + rot) % len(arms)]
                     row = post_one(arm, suite, req, rot + 1, False, opts["model"])
+                    raw = take_raw(row)
                     row["bucket"] = bucket
+                    key = (arm.name, suite, req["id"])
+                    if key not in held:
+                        held[key] = raw
+                        row["body"] = body_rel(*key)
                     rows.append(row)
                     print(
                         f"r{row['round']} {arm.name} {suite} {req['id']} | wall {row['wall_ms']:.1f} ms | "
@@ -1084,11 +1234,16 @@ def run(argv: list[str]) -> int:
             rot += 1
     for arm in arms:
         arm.client.close()
-    out = Path(opts["out"])
-    out.mkdir(parents=True, exist_ok=True)
+    # The timed regions are over. The rows go first: they are the measurement.
     meta = {s["name"]: {"path": s["path"], "gold": s["gold"]} for s in suites}
     (out / "rows.json").write_text(json.dumps({"arms": names, "suites": meta, "rows": rows}, indent=1))
     print(f"[rows] {out / 'rows.json'}", flush=True)
+    for (arm_name, suite, rid), raw in held.items():
+        save(out / body_rel(arm_name, suite, rid), raw.encode())
+    print(f"[bodies] timed: {len(held)} bodies of {len(arms)} arms under {out / 'bodies'}", flush=True)
+    for arm in arms:
+        if arm.kind != "clef":
+            systemone_bodies(arm, reqs, out)
     return 0
 
 
@@ -1880,6 +2035,204 @@ def self_test() -> None:
             check("it lists the wrong picks", "arm A (clef) vs the gold of suite fix | 2/3 | wrong: fix/f-2/level (gold 1, ours 0)" in out, True)
 
     guarded("the table with gold", case_table_gold)
+
+    # --- the bodies: servers that log every request, in one list shared by the arms, in the order they came.
+    class RecClient:
+        """A server for `measure`: the answers of the real ones in their own text (indented, a trailing newline,
+        the request's nth answer), every request logged. `props` is the `/props` object (None: a 404);
+        `systemone` the status the SystemOne route answers a generative arm; `die_after` the SystemOne answers
+        before the server stops answering."""
+
+        def __init__(self, name, log, props=None, systemone=200, die_after=None):
+            self.name, self.log, self.props, self.systemone, self.die_after = name, log, props, systemone, die_after
+            self.nth: dict = {}
+            self.answers: dict = {}
+            self.passed = 0
+
+        def get(self, path):
+            self.log.append((self.name, "GET", path))
+            if self.props is None:
+                return 404, "not found\n"
+            return 200, json.dumps(self.props)
+
+        def close(self):
+            pass
+
+        def post(self, path, body):
+            self.log.append((self.name, "POST", path))
+            timed = path == "/v1/chat/completions" or (path == "/v1/systemone" and not self.log_pass_started())
+            if path == "/v1/systemone" and not timed:
+                if self.die_after is not None and self.passed >= self.die_after:
+                    fail("the server stopped answering")
+                self.passed += 1
+                if self.systemone != 200:
+                    return self.systemone, "no such route\n", 1.0
+            key = (path, body["messages"][1]["content"] if path == "/v1/chat/completions" else body["state"])
+            self.nth[key] = self.nth.get(key, 0) + 1
+            if path == "/v1/chat/completions":
+                props = body["response_format"]["json_schema"]["schema"]["properties"]
+                obj = {qid: (True if p["type"] == "boolean" else p["enum"][0]) for qid, p in props.items()}
+                resp = {"nth": self.nth[key], "choices": [{"message": {"role": "assistant", "content": json.dumps(obj)},
+                                                           "finish_reason": "stop"}],
+                        "timings": {"prompt_n": 1500 if "Fine." in key[1] else 260, "prompt_ms": 50.0, "predicted_ms": 25.0}}
+            else:
+                answers = {}
+                for qid, q in body["questions"].items():
+                    if q["type"] == "choice":
+                        keys = sorted(q["criteria"])
+                        answers[qid] = {"type": "choice", "choice": keys[0], "probabilities": {k: 0.5 for k in keys}}
+                    elif q["type"] == "score":
+                        answers[qid] = {"type": "score", "probabilities": {str(i): 0.5 for i in range(len(q["criteria"]))}}
+                    else:
+                        answers[qid] = {"type": "noul", "noul": 0.9}
+                resp = {"nth": self.nth[key], "model": "clef", "answers": answers,
+                        "timings": {"prompt_n": 1500 if "Fine." in key[1] else 300, "prompt_ms": 70.0, "head_ms": 20.0}}
+            raw = json.dumps(resp, indent=3, ensure_ascii=False) + "\n"
+            self.answers.setdefault(key, []).append(raw)
+            return 200, raw, 5.0
+
+        def log_pass_started(self):
+            # the arm's pass began when it read /props: every systemone POST after that GET is the pass's.
+            return any(e[:3] == (self.name, "GET", "/props") for e in self.log)
+
+    def measure_fix(tmp, arms_spec, rounds=2, rounds_long=1):
+        """`measure` over the fixture suite on RecClient arms: arms_spec is [(name, kind, RecClient kwargs)]."""
+        log: list = []
+        arms = []
+        for name, kind, kw in arms_spec:
+            arm = Arm(name, "http://127.0.0.1:1", kind)
+            arm.client = RecClient(name, log, **kw)
+            arms.append(arm)
+        suites = [{"name": "fix", "path": "x", "reqs": fix_rows, "gold": None}]
+        opts = {"rounds": rounds, "rounds_long": rounds_long, "out": str(tmp / "out"), "model": None}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = measure(arms, suites, opts)
+        return tmp / "out", log, arms, buf.getvalue(), rc
+
+    def case_bodies_timed():
+        with tempfile.TemporaryDirectory() as tmp:
+            out, log, arms, text, rc = measure_fix(Path(tmp), [("A", "clef", {}), ("jump", "qwen", {})])
+            check("a run with bodies ends clean", rc, 0)
+            data = json.loads((out / "rows.json").read_text())
+            rows = data["rows"]
+            check("a row holds no raw answer", any("_raw" in r for r in rows), False)
+            for arm in arms:
+                for rid, state in (("f-1", fix_rows[0]["state"]), ("f-2", fix_rows[1]["state"])):
+                    answers = next(v for k, v in arm.client.answers.items() if state in k[1] or k[1] == state)
+                    path = out / "bodies" / arm.name / f"fix-{rid}.json"
+                    got = path.read_text() if path.exists() else None
+                    # the 1st answer is the dropped round's, the 2nd the first counted round's: the file is the 2nd,
+                    # byte for byte.
+                    check(f"the first counted round's body of {arm.name}/{rid} is written as received", got, answers[1])
+                    check(f"it is not the dropped round's of {arm.name}/{rid}", got != answers[0], True)
+                    mine = [r for r in rows if r["arm"] == arm.name and r["id"] == rid]
+                    named = [r for r in mine if "body" in r]
+                    check(f"one row of {arm.name}/{rid} names a body", len(named), 1)
+                    check(f"it is the first counted round's of {arm.name}/{rid}",
+                          (named[0]["dropped"], named[0]["round"], named[0]["body"]),
+                          (False, min(r["round"] for r in mine if not r["dropped"]), f"bodies/{arm.name}/fix-{rid}.json"))
+                    check(f"the dropped row of {arm.name}/{rid} names none", any("body" in r for r in mine if r["dropped"]), False)
+            check("no more files than requests and arms", sorted(p.name for p in (out / "bodies").rglob("*.json")),
+                  ["fix-f-1.json", "fix-f-1.json", "fix-f-2.json", "fix-f-2.json"])
+            check("the timed bodies are counted in one line", "[bodies] timed: 4 bodies of 2 arms under " in text, True)
+
+    guarded("the timed bodies", case_bodies_timed)
+
+    def pass_start(log):
+        return next(i for i, e in enumerate(log) if e[1:] == ("GET", "/props"))
+
+    def case_bodies_pass():
+        props = {"routes": ["/v1/chat/completions", "/v1/systemone"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            out, log, arms, text, rc = measure_fix(Path(tmp), [("A", "clef", {}), ("jump", "qwen", {"props": props})])
+            first = pass_start(log)
+            tail = log[first:]
+            check("the pass starts with /props", tail[0], ("jump", "GET", "/props"))
+            check("only the pass's requests follow it", set(tail[1:]), {("jump", "POST", "/v1/systemone")})
+            check("after the rounds: every timed request is before the first /props",
+                  sum(1 for e in log[:first] if e[1] == "POST"), 10)
+            check("the arm's systemone POSTs are all after it", [i for i, e in enumerate(log[:first]) if e == ("jump", "POST", "/v1/systemone")], [])
+            check("the Clef arm is not asked for /props", [e for e in log if e[0] == "A" and e[1] == "GET"], [])
+            check("the pass posts each request once", len(tail) - 1, 2)
+            answers = [v[0] for k, v in arms[1].client.answers.items() if k[0] == "/v1/systemone"]
+            got = sorted(p.read_text() for p in (out / "bodies" / "jump-systemone").glob("*.json"))
+            check("the systemone bodies are saved as received", got, sorted(answers))
+            check("the systemone files are named by suite and id",
+                  sorted(p.name for p in (out / "bodies" / "jump-systemone").iterdir()), ["fix-f-1.json", "fix-f-2.json"])
+            check("the Clef arm has no systemone directory", (out / "bodies" / "A-systemone").exists(), False)
+            check("the summary line", "[bodies] jump: systemone 2 ok / 2" in text, True)
+            check("the pass is after the rows", text.index("[rows]") < text.index("[bodies] jump:"), True)
+            check("the rows hold no systemone body", any("systemone" in json.dumps(r) for r in json.loads((out / "rows.json").read_text())["rows"]), False)
+        for props, line in (
+            ({"routes": ["/v1/chat/completions"]}, "[bodies] jump: the server lists no /v1/systemone; skipped\n"),
+            ({"build_info": "x"}, "[bodies] jump: the server lists no /v1/systemone; skipped\n"),
+            (None, "[bodies] jump: the server lists no /v1/systemone; skipped (GET /props answered 404)\n"),
+            ({"routes": "/v1/systemone"}, "[bodies] jump: the server lists no /v1/systemone; skipped (GET /props has no list of paths under routes)\n"),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                out, log, arms, text, rc = measure_fix(Path(tmp), [("A", "clef", {}), ("jump", "qwen", {"props": props})])
+                check(f"props {props}: skipped by name, not an error", (rc, line in text), (0, True))
+                check(f"props {props}: no systemone POST of the generative arm",
+                      [e for e in log if e == ("jump", "POST", "/v1/systemone")], [])
+                check(f"props {props}: no systemone directory", (out / "bodies" / "jump-systemone").exists(), False)
+
+    guarded("the untimed SystemOne pass", case_bodies_pass)
+
+    def case_bodies_pass_failures():
+        props = {"routes": ["/v1/systemone"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            out, log, arms, text, rc = measure_fix(Path(tmp), [("A", "clef", {}), ("jump", "qwen", {"props": props, "systemone": 404})])
+            check("a 404 is not raised", rc, 0)
+            d = out / "bodies" / "jump-systemone"
+            check("a 404's body is saved", sorted(p.name for p in d.glob("*.json")), ["fix-f-1.json", "fix-f-2.json"])
+            check("a 404's body is as received", (d / "fix-f-1.json").read_text(), "no such route\n")
+            check("a 404's status is in its side file", (d / "fix-f-1.json.status").read_text(), "404\n")
+            check("the side files are the non-200s", sorted(p.name for p in d.glob("*.status")), ["fix-f-1.json.status", "fix-f-2.json.status"])
+            check("a 404 is counted", "[bodies] jump: systemone 0 ok / 2" in text, True)
+            check("a 404 is named", "[bodies] jump: fix/f-1: /v1/systemone answered 404" in text, True)
+            check("the rows are written", (out / "rows.json").is_file(), True)
+        with tempfile.TemporaryDirectory() as tmp:
+            out, log, arms, text, rc = measure_fix(Path(tmp), [("A", "clef", {}), ("jump", "qwen", {"props": props, "die_after": 1})])
+            check("a server that stops answering ends the pass, not the run", rc, 0)
+            check("and the pass says where", "[bodies] jump: fix/f-2: " in text and "the pass ends here" in text, True)
+            check("and counts what it got", "[bodies] jump: systemone 1 ok / 2" in text, True)
+            check("a body written before it stays", sorted(p.name for p in (out / "bodies" / "jump-systemone").iterdir()), ["fix-f-1.json"])
+            check("the timed rows and bodies are intact", ((out / "rows.json").is_file(), len(list((out / "bodies" / "jump").glob("*.json")))), (True, 2))
+        with tempfile.TemporaryDirectory() as tmp:
+            out, log, arms, text, rc = measure_fix(Path(tmp), [("jump", "qwen", {"props": props}), ("step", "qwen", {"props": props})])
+            check("each generative arm has its own pass line",
+                  ("[bodies] jump: systemone 2 ok / 2" in text, "[bodies] step: systemone 2 ok / 2" in text), (True, True))
+
+    guarded("the SystemOne pass's failures", case_bodies_pass_failures)
+
+    def case_bodies_names():
+        def arm(name, kind="qwen"):
+            return Arm(name, "http://127.0.0.1:1", kind)
+
+        reqs = [("fix", fix_rows[0])]
+        refused("an arm named with a slash is refused", "is no plain file name", lambda: check_body_names([arm("a/b")], reqs))
+        refused("an arm named .. is refused", "is no plain file name", lambda: check_body_names([arm("..")], reqs))
+        refused("an arm named like another's systemone directory is refused", "named twice",
+                lambda: check_body_names([arm("x"), arm("x-systemone")], reqs))
+        check("the Clef arm has no systemone directory to collide with", check_body_names([arm("x", "clef"), arm("x-systemone")], reqs), None)
+        refused("a request id with a slash is refused", "is no plain file name",
+                lambda: check_body_names([arm("a")], [("fix", dict(fix_rows[0], id="a/b"))]))
+        refused("two requests that share a file name are refused", "share a body file name",
+                lambda: check_body_names([arm("a")], [("a", dict(fix_rows[0], id="b-c")), ("a-b", dict(fix_rows[0], id="c"))]))
+        # the bodies' directories are made before the first POST: a run that cannot write them posts nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "out").write_text("a file where the out dir should be")
+            log: list = []
+            a = arm("a")
+            a.client = RecClient("a", log)
+            refused("an out dir that cannot be made ends the run by name", "cannot make",
+                    lambda: measure(
+                        [a], [{"name": "fix", "path": "x", "reqs": fix_rows, "gold": None}],
+                        {"rounds": 1, "rounds_long": 1, "out": str(Path(tmp) / "out"), "model": None}))
+            check("and it posted nothing", log, [])
+
+    guarded("the bodies' names", case_bodies_names)
 
     if fails:
         print(f"sjcmp self-test: {fails} of {n} checks FAILED")
