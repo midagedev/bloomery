@@ -1,0 +1,20 @@
+# Round mm3c1 adds Act::SwigluOai, a third arm in kquant::act::apply's runtime switch. 15 entries that take
+# the rule at
+# run time move md5 with equal regs, smem, spill, blocks/SM and jit columns: +9 fma a site (+72 tiles), never
+# taken
+# unless the code is 2, a warp-uniform branch [ptx-compare counted]. The kernels sit near their memory bound,
+# so the
+# model says 0 (AGENTS.md: instruction count on a kernel near ~700 GB/s). This run confirms it on the dispatch
+# path.
+kind: noninf
+question: does the third act arm leave the card decode path as fast as before?
+term: generate p50_ms @ the SMOKE line, Qwen3-30B-A3B-Instruct-2507 Q4_K_M (the generate bin times qwen3moe only; its MoE runs kq_gate_up_act_q4k, a moved entry), A6000 - (mm3c1 - qroute) /
+  qroute
+unit: %
+predict: -0.1..+0.1
+rounds: 6
+condition: qroute 0d8b25e0d and mm3c1 36242bc4e alternate in one lease through just gpu-ab
+  (time-gpu-generate), arm order rotated every round; no row carries [cpu-busy] or [other-busy]
+decide-in: land mm3c1 after #558 with this verdict in its PR
+decide-below: read the 15 entries' per-kernel times with nsys before landing: the branch is not free
+decide-above: land; read which kernel moved, the arm cannot make a kernel faster
