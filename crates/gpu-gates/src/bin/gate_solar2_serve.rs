@@ -32,7 +32,10 @@
 //!   assistant message, and the reference vocabulary counts it an end-of-generation id), so the
 //!   server stops there and leaves it out of the text. FAIL-first: a vocabulary that lists only the
 //!   file's `eos_token_id` (`<|endoftext|>`) lets the model run past its turn end, the token's text
-//!   is in the content and the clause is red.
+//!   is in the content and the clause is red. The clause reads the file's text behaviour
+//!   (`Tag::FileBound`): the fixture's weights never reach the turn end, so the fixture tier
+//!   leaves it to the real tier by name; the end id's place in the vocabulary is pinned on any machine
+//!   by `tokenizer`'s `a_familys_turn_end_token_ends_generation`.
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -46,6 +49,7 @@ mod gate {
 
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{SeatGate, Served, check, curl, json_of, server_log};
+    use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
     use gguf::Split;
     use model::arch::solar2::place::PlanInputs;
@@ -154,12 +158,16 @@ mod gate {
         match chat(&url, &d) {
             Ok((split, ended)) => {
                 check(&mut ok, CHAT, split);
-                check(&mut ok, ENDED, ended);
+                if tier::run_clause(ENDED, Tag::FileBound)? {
+                    check(&mut ok, ENDED, ended);
+                }
             }
             Err(e) => {
                 println!("{CHAT}: {e}");
                 check(&mut ok, CHAT, false);
-                check(&mut ok, ENDED, false);
+                if tier::run_clause(ENDED, Tag::FileBound)? {
+                    check(&mut ok, ENDED, false);
+                }
             }
         }
         println!("server stopped: {}", s.stop()?);

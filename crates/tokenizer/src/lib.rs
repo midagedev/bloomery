@@ -692,27 +692,29 @@ mod tests {
         }
     }
 
-    /// MiniMax-M3's end-of-generation token is `[e~[`, the reference's last EOG name: a
-    /// vocabulary holding it ends generation on it.
+    /// A family's turn-end token ends generation: a vocabulary holding it (and no other end name)
+    /// stops on it, as a control token. One row a family whose end token is not the file's
+    /// `eos_token_id`: MiniMax-M3's `[e~[` and Solar-Open2's `<|im:end|>` (the template writes it
+    /// after every assistant message; the file's `eos_token_id` is `<|endoftext|>`).
     ///
-    /// FAIL-first: a vocabulary that lists no end-of-generation name runs past the token.
+    /// FAIL-first: a vocabulary that lists the row's name as no end-of-generation name runs past
+    /// the token, and that row fails.
     #[test]
-    fn the_minimax_end_token_ends_generation() {
-        let header = vec![
-            ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
-            ("tokenizer.ggml.pre".into(), Value::String("qwen35".into())),
-            (
-                "tokenizer.ggml.tokens".into(),
-                Value::Array(vec![
-                    Value::String("a".into()),
-                    Value::String("[e~[".into()),
-                ]),
-            ),
-            ("tokenizer.ggml.merges".into(), Value::Array(vec![])),
-        ];
-        let tok = from_header(&header).unwrap();
-        assert_eq!(tok.eog(), &[1]);
-        assert!(tok.attr(1).is_some_and(|a| a & attr::CONTROL != 0));
+    fn a_familys_turn_end_token_ends_generation() {
+        for end in ["[e~[", "<|im:end|>"] {
+            let header = vec![
+                ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+                ("tokenizer.ggml.pre".into(), Value::String("qwen35".into())),
+                (
+                    "tokenizer.ggml.tokens".into(),
+                    Value::Array(vec![Value::String("a".into()), Value::String(end.into())]),
+                ),
+                ("tokenizer.ggml.merges".into(), Value::Array(vec![])),
+            ];
+            let tok = from_header(&header).unwrap();
+            assert_eq!(tok.eog(), &[1], "{end}");
+            assert!(tok.attr(1).is_some_and(|a| a & attr::CONTROL != 0), "{end}");
+        }
     }
 
     /// The explicit stop list selects Hugging Face's encoding, and only for a qwen35 BPE: its
