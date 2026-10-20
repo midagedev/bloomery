@@ -2,7 +2,8 @@
 """board.py — the status board: one Markdown body for one pinned GitHub issue, rewritten by a script, no LLM.
 
   board.py                       print the body (what --publish would send)
-  board.py --publish ISSUE       replace that issue's body (gh issue edit ISSUE --body-file -)
+  board.py --publish ISSUE       replace that issue's body (gh issue edit ISSUE --body-file -), then write the stamp
+  board.py --stamp-status SECS   how the last --publish went, as key=value lines (what a watcher reads: tools/board/README.md)
   board.py --self-test           the renderer, the privacy filter and the publish path on synthetic state, no network
 
 The body opens with a piece of ASCII art that follows the board's state, then the sections, each with its own "as of":
@@ -17,6 +18,10 @@ A missing state directory is an empty section. A source that fails (gh, git, an 
 a named line in its section and a non-zero exit after the rest is rendered and published: the board shows its own gaps.
 The body goes through the privacy filter (PRIVACY) line by line before it is printed or published, the same path for
 both, and ends with the count of lines it withheld.
+
+Every --publish attempt, green or red, ends by writing the stamp (publish.stamp in --dir): its time, exit code, problem
+count, how many attempts in a row failed, and the last failure's text. publish() is the one writer, --stamp-status the one
+reader; a watcher asks it whether the agent that runs --publish is still publishing.
 
 Exit: 0 ok; 1 a source failed, the body is over GitHub's size limit, or the publish failed; 64 usage.
 """
@@ -58,6 +63,9 @@ BODY_MAX = 60000  # GitHub's limit is 65536 characters
 DEFAULT_MAINTAINERS = ("midagedev",)
 GH_TIMEOUT_S = 60
 GH_LIMIT = 100  # gh's page for each list; a list that fills it may be cut
+STAMP = "publish.stamp"  # in --dir itself, which no WatchPaths entry of the plist names, so writing it starts no run
+STAMP_RED = 3  # this many failed attempts in a row make the stamp red
+STAMP_LAST_MAX = 200
 
 # The privacy filter: a rendered line matching any of these is dropped and counted. Blocking: the body is never
 # printed or published unfiltered. Addresses of the workstation's network, host names, home paths, tokens.
@@ -962,12 +970,88 @@ def finish(lines, patterns=PRIVACY_RES):
     return body, dropped
 
 
+def stamp_read(dirpath):
+    """(the stamp's fields, None); (None, None) when there is no stamp; (None, the reason) for one that cannot be read."""
+    try:
+        with open(os.path.join(dirpath, STAMP), encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None, None
+    except OSError as e:
+        return None, f"{STAMP}: {one_line(e)}"
+    kv = dict(ln.split("=", 1) for ln in text.splitlines() if "=" in ln)
+    try:
+        got = {k: int(kv[k]) for k in ("epoch", "rc", "problems", "streak")}
+    except (KeyError, ValueError):
+        return None, f"{STAMP}: no epoch, rc, problems and streak as whole numbers"
+    return {**got, "last": kv.get("last", "")}, None
+
+
+def stamp_write(dirpath, now, rc, problems, last):
+    """Record one --publish attempt, atomically; None, or the reason it could not be written."""
+    prev, _ = stamp_read(dirpath)
+    streak = ((prev["streak"] if prev else 0) + 1) if rc != 0 else 0
+    text = (f"time={now.isoformat(timespec='seconds')}\nepoch={int(now.timestamp())}\nrc={rc}\nproblems={problems}\n"
+            f"streak={streak}\nlast={cut(last, STAMP_LAST_MAX)}\n")
+    path = os.path.join(dirpath, STAMP)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(dirpath, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass  # the write itself failed first: there may be no temp file
+        return f"{STAMP} not written: {one_line(e)}"
+    return None
+
+
+def stamp_status(dirpath, now, max_age):
+    """The key=value lines --stamp-status prints. state: missing (no stamp), unreadable, stale (older than max_age seconds),
+    red (STAMP_RED attempts or more failed in a row), failing (the last failed), ok. A stamp from the future is stale: a clock
+    that moved back must not read as a fresh publish."""
+    got, why = stamp_read(dirpath)
+    if got is None:
+        return ["state=" + ("missing" if why is None else "unreadable"), "age=-", "rc=-", "problems=-", "streak=-", f"last={why or ''}"]
+    age = int(now.timestamp()) - got["epoch"]
+    state = ("stale" if age > max_age or age < 0 else "red" if got["streak"] >= STAMP_RED else "failing" if got["rc"] != 0 else "ok")
+    return [f"state={state}", f"age={age}", f"rc={got['rc']}", f"problems={got['problems']}", f"streak={got['streak']}", f"last={got['last']}"]
+
+
+def publish(a, body, rc, problems, fails, now):
+    """--publish: send the body, then write the stamp. The one place that does either, so no end of an attempt skips the
+    stamp. body is None when it could not be rendered; fails holds every failure line of the attempt, the stamp keeps the last."""
+    if body is not None:
+        repo = a.repo or repo_slug(a.tree)
+        msg = None
+        if repo is None:
+            msg = "--publish needs OWNER/NAME: the tree has no github origin remote and --repo is not given"
+        else:
+            prc, _, err = run([a.gh, "issue", "edit", a.publish, "--repo", repo, "--body-file", "-"], stdin=body)
+            if prc != 0:
+                msg = f"gh issue edit {a.publish} failed (exit {prc}): {one_line(err)[:200]}"
+        if msg:
+            print(f"board.py: {msg}", file=sys.stderr)
+            fails.append(msg)
+            rc = 1
+    werr = stamp_write(a.dir, now, rc, problems, fails[-1] if fails else "")
+    if werr:
+        print(f"board.py: {werr}", file=sys.stderr)
+        rc = 1
+    return rc
+
+
 # ----------------------------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------------------------
 def parser():
     ap = argparse.ArgumentParser(prog="board.py", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--publish", metavar="ISSUE", help="replace this issue's body instead of printing it")
+    ap.add_argument("--publish", metavar="ISSUE", help="replace this issue's body instead of printing it, then write the stamp")
+    ap.add_argument("--stamp-status", metavar="SECS", type=int,
+                    help="print how the last --publish went (key=value lines); a stamp older than SECS seconds is stale")
     ap.add_argument("--board-issue", metavar="ISSUE", help="the board's own issue, left out of the issue list (--publish implies it; "
                     "a preview names it to print what --publish would send)")
     ap.add_argument("--self-test", action="store_true")
@@ -994,38 +1078,53 @@ def parse(argv):
 
 def main(argv, now=None):
     a = parse(argv)
+    now = now or dt.datetime.now().astimezone()
+    try:
+        return run_once(a, now)
+    except Exception as e:  # a crash is an attempt too: the stamp says so, then the traceback goes on to the log
+        if a.publish is not None:
+            stamp_write(a.dir, now, 1, 0, f"crashed: {type(e).__name__}: {e}")
+        raise
+
+
+def run_once(a, now):
+    if a.stamp_status is not None:
+        print("\n".join(stamp_status(a.dir, now, a.stamp_status)))
+        return 0
     for flag, v in (("--publish", a.publish), ("--board-issue", a.board_issue)):
         if v is not None and not v.isdigit():
-            print(f"board.py: {flag} takes an issue number", file=sys.stderr)
+            msg = f"{flag} takes an issue number"
+            print(f"board.py: {msg}", file=sys.stderr)
+            if a.publish is not None:
+                stamp_write(a.dir, now, 64, 0, msg)
             return 64
-    now = now or dt.datetime.now().astimezone()
     board = collect(a, now)
     rc = 0
+    fails = []
     for ps in board.problems.values():
         for p in ps:
             print(f"board.py: {p}", file=sys.stderr)
+            fails.append(p)
             rc = 1
+    problems = len(fails)
+    body = None
     try:
         body, dropped = finish(render(board, now))
     except ValueError as e:
         print(f"board.py: {e}", file=sys.stderr)
+        fails.append(str(e))
+        rc = 1
+    else:
+        if dropped:
+            names = sorted({n for n, _ in dropped})
+            print(f"board.py: {len(dropped)} lines withheld ({', '.join(names)})", file=sys.stderr)
+            for n, ln in dropped if a.explain else ():
+                print(f"board.py: withheld ({n}): {ln}", file=sys.stderr)
+    if a.publish is not None:
+        return publish(a, body, rc, problems, fails, now)
+    if body is None:
         return 1
-    if dropped:
-        names = sorted({n for n, _ in dropped})
-        print(f"board.py: {len(dropped)} lines withheld ({', '.join(names)})", file=sys.stderr)
-        for n, ln in dropped if a.explain else ():
-            print(f"board.py: withheld ({n}): {ln}", file=sys.stderr)
-    if a.publish is None:
-        sys.stdout.write(body)
-        return rc
-    repo = a.repo or repo_slug(a.tree)
-    if repo is None:
-        print("board.py: --publish needs OWNER/NAME: the tree has no github origin remote and --repo is not given", file=sys.stderr)
-        return 1
-    prc, _, err = run([a.gh, "issue", "edit", a.publish, "--repo", repo, "--body-file", "-"], stdin=body)
-    if prc != 0:
-        print(f"board.py: gh issue edit {a.publish} failed (exit {prc}): {one_line(err)[:200]}", file=sys.stderr)
-        return 1
+    sys.stdout.write(body)
     return rc
 
 
@@ -1155,6 +1254,108 @@ def block(text, head):
         return ""
     m = re.search(r"\n#{1,%d} " % (len(head) - len(head.lstrip("#"))), text[i + 1:])
     return text[i: i + 1 + m.start()] if m else text[i:]
+
+
+def stamp_cases(c, tmp, tree, now):
+    """The stamp: one case per way an attempt can end, and the reader's states. gh is the stub of the publish cases above."""
+    gh = os.path.join(tmp, "gh")
+    gh_state = os.path.join(tmp, "gh-state")
+    sdir = os.path.join(tmp, "stamp-board")
+    base = ["--dir", sdir, "--tree", tree, "--repo", "o/n", "--gh", gh]
+    pub = base + ["--publish", "99"]
+
+    def stamp():
+        got, why = stamp_read(sdir)
+        return got if got else why
+
+    def fail_next(*subs):
+        write(os.path.join(gh_state, "fail"), " ".join(subs))
+
+    fail_next()
+    rc = capture(main, pub, now)[0]
+    got = stamp()
+    c.check("stamp: a green publish writes it: its time, rc 0, no problems, streak 0, no last failure",
+            rc == 0 and got == {"epoch": int(now.timestamp()), "rc": 0, "problems": 0, "streak": 0, "last": ""}, f"rc {rc} {got}")
+    c.check("stamp: the file holds the ISO time beside the epoch", f"time={now.isoformat(timespec='seconds')}\n" in open(os.path.join(sdir, STAMP)).read(), "no time line")
+    fail_next("pr-list")
+    rc = capture(main, pub, now)[0]
+    got = stamp()
+    c.check("stamp: a source that failed is rc 1, the problem count and the problem text, streak 1, and the body still went out",
+            rc == 1 and isinstance(got, dict) and got["rc"] == 1 and got["problems"] == 1 and got["streak"] == 1 and "gh pr list failed" in got["last"], f"rc {rc} {got}")
+    rc = capture(main, pub, now + dt.timedelta(seconds=10))[0]
+    c.check("stamp: a second failure in a row is streak 2", rc == 1 and stamp()["streak"] == 2, stamp())
+    fail_next()
+    rc = capture(main, pub, now + dt.timedelta(seconds=20))[0]
+    c.check("stamp: a green attempt after failures resets the streak and clears the last failure",
+            rc == 0 and stamp()["streak"] == 0 and stamp()["last"] == "" and stamp()["epoch"] == int(now.timestamp()) + 20, stamp())
+    fail_next("issue-edit")
+    rc, _, err = capture(main, pub, now)
+    c.check("stamp: a failed issue edit is rc 1 with no problem line and its own text as the last failure",
+            rc == 1 and stamp()["problems"] == 0 and stamp()["last"].startswith("gh issue edit 99 failed (exit 1)") and "gh issue edit 99 failed" in err, f"rc {rc} {stamp()} {err}")
+    fail_next()
+    rc = capture(main, ["--dir", sdir, "--tree", os.path.join(tmp, "no-such-tree"), "--no-gh", "--publish", "99"], now)[0]
+    c.check("stamp: no github remote to publish to is rc 1 and the stamp says so",
+            rc == 1 and "needs OWNER/NAME" in stamp()["last"], f"rc {rc} {stamp()}")
+    rc = capture(main, ["--dir", sdir, "--no-gh", "--publish", "abc"], now)[0]
+    c.check("stamp: a bad issue number is rc 64 and is an attempt too", rc == 64 and stamp()["rc"] == 64 and "takes an issue number" in stamp()["last"], f"rc {rc} {stamp()}")
+    global BODY_MAX
+    kept, BODY_MAX = BODY_MAX, 50
+    try:
+        rc = capture(main, pub, now)[0]
+    finally:
+        BODY_MAX = kept
+    c.check("stamp: a body over the limit publishes nothing and is rc 1 in the stamp", rc == 1 and "over the" in stamp()["last"], f"rc {rc} {stamp()}")
+    real_collect = globals()["collect"]
+
+    def boom(*_):
+        raise RuntimeError("a source nobody planned for")
+    globals()["collect"] = boom
+    try:
+        capture(main, pub, now)
+        raised = False
+    except RuntimeError:
+        raised = True
+    finally:
+        globals()["collect"] = real_collect
+    c.check("stamp: a crash is rc 1 in the stamp with its type and text, and still propagates to the log",
+            raised and stamp()["rc"] == 1 and stamp()["last"] == "crashed: RuntimeError: a source nobody planned for", f"raised {raised} {stamp()}")
+    before = open(os.path.join(sdir, STAMP)).read()
+    capture(main, base, now + dt.timedelta(seconds=99))
+    c.check("stamp: a preview is no attempt and leaves it alone", open(os.path.join(sdir, STAMP)).read() == before, "changed")
+    blocked = os.path.join(tmp, "stamp-blocked")
+    os.makedirs(os.path.join(blocked, STAMP))  # a directory where the stamp goes: the replace fails, as a full or read-only disk's does
+    rc, _, err = capture(main, ["--dir", blocked, "--tree", tree, "--repo", "o/n", "--gh", gh, "--publish", "99"], now)
+    c.check("stamp: a stamp that cannot be written is rc 1 and a stderr line naming it, not a silent publish", rc == 1 and f"{STAMP} not written" in err, f"rc {rc} {err}")
+    c.check("stamp: and the failed write leaves no temp file", os.listdir(blocked) == [STAMP], os.listdir(blocked))
+    c.check("stamp: no temp file is left beside it", sorted(os.listdir(sdir)) == [STAMP], os.listdir(sdir))
+
+    # the reader
+    def status(d, at=now, max_age=1800):
+        rc, out, _ = capture(main, ["--dir", d, "--stamp-status", str(max_age)], at)
+        return rc, dict(ln.split("=", 1) for ln in out.splitlines())
+
+    def put(d, epoch_off, rc, streak, last="why"):
+        write(os.path.join(d, STAMP), f"time=t\nepoch={int(now.timestamp()) + epoch_off}\nrc={rc}\nproblems=1\nstreak={streak}\nlast={last}\n")
+
+    d = os.path.join(tmp, "stamp-read")
+    rc, got = status(d)
+    c.check("stamp-status: no stamp is missing, with no age and rc 0", rc == 0 and got["state"] == "missing" and got["age"] == "-", got)
+    for name, off, prc, streak, want in (("a fresh green stamp is ok", -60, 0, 0, "ok"),
+                                         ("a fresh stamp whose last attempt failed is failing", -60, 1, 1, "failing"),
+                                         (f"{STAMP_RED - 1} failures in a row are still failing", -60, 1, STAMP_RED - 1, "failing"),
+                                         (f"{STAMP_RED} failures in a row are red", -60, 1, STAMP_RED, "red"),
+                                         ("a green stamp older than the limit is stale", -1801, 0, 0, "stale"),
+                                         ("a stamp exactly at the limit is not stale", -1800, 0, 0, "ok"),
+                                         ("a red stamp older than the limit is stale first (nothing has run since)", -1801, 1, STAMP_RED, "stale"),
+                                         ("a stamp from the future is stale", 120, 0, 0, "stale")):
+        put(d, off, prc, streak)
+        rc, got = status(d)
+        c.check(f"stamp-status: {name}", rc == 0 and got["state"] == want and got["rc"] == str(prc) and got["streak"] == str(streak) and got["last"] == "why", f"{rc} {got}")
+    put(d, -75, 0, 0)
+    c.check("stamp-status: the age is whole seconds", status(d)[1]["age"] == "75", status(d)[1])
+    write(os.path.join(d, STAMP), "time=t\nepoch=soon\n")
+    rc, got = status(d)
+    c.check("stamp-status: a stamp that is no stamp is unreadable and names why", rc == 0 and got["state"] == "unreadable" and "whole numbers" in got["last"], got)
 
 
 def auto_cases(c, tmp, now):
@@ -1560,6 +1761,7 @@ def run_cases():
         os.rename(origin + ".gone", origin)
         rc, out, err = capture(main, ["--dir", root, "--tree", os.path.join(tmp, "no-such-tree"), "--no-gh"], now)
         c.check("git failure: a tree with no origin/main is exit 1 and the body says so", rc == 1 and "- problem: git log origin/main failed" in out, f"rc {rc} {err}")
+        stamp_cases(c, tmp, tree, now)
 
         # The release plan (release.json): each group, the late flag, and the files that are wrong.
         rroot = os.path.join(tmp, "rel")

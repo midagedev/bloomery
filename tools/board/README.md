@@ -6,7 +6,8 @@ files in the state directory are the lead's and the sessions' optional notes and
 page: where a PR stands, what is landing.
 
     python3 tools/board/board.py                  # print the body
-    python3 tools/board/board.py --publish ISSUE  # replace the issue's body (what launchd runs)
+    python3 tools/board/board.py --publish ISSUE  # replace the issue's body, then write the stamp (what launchd runs)
+    python3 tools/board/board.py --stamp-status S # how the last --publish went (what a watcher reads, below)
     python3 tools/board/board.py --self-test      # synthetic state, a stub gh, temp git repos, no network
 
 The body opens with ASCII art and one caption line, then the sections, each with its own "as of": Release, Trains,
@@ -85,7 +86,10 @@ quiet 3 h reads "no DONE, last event HH:MM" (it died). A batch quiet 24 h drops 
 ~/.cache/bloomery/board/batch -mtime +14 -delete` does it.
 
 **`workers/<role>.md`**, optional, written by a session that has something to say beyond what the registry shows
-(the round, its ETA, what it waits on). The board needs no note: a session may write one, and none is overdue.
+(the round, its ETA, what it waits on). The board needs no note: a session may write one, and none is overdue. A writer
+should put the file there whole (a temp file in the state directory, then one rename into `workers/`, which launchd watches), so
+the agent runs once on a finished file. On the maintainer's Mac that is rig-log's `tools/board/board-note.sh ROLE`, which also
+runs the agent check (below).
 
 **The session registry** is the Workers section's source: `~/.claude/sessions/<pid>.json` (`--sessions`), one file per
 live Claude session, with `name`, `status` (`busy`, `idle`, `shell`, ...), `updatedAt` and `statusUpdatedAt` (epoch ms), `cwd`,
@@ -148,9 +152,40 @@ tags and `origin/main`. A worker's state and a landing therefore show within 10 
 a file in place (a batch's event log) also touches `~/.cache/bloomery/board/KICK`, since appending does not change the
 directory launchd watches.
 
+## The stamp
+
+Every `board.py --publish` attempt, green or red, ends by writing `publish.stamp` in the state directory (`--dir`; no
+`WatchPaths` entry names that directory itself, so writing it starts no run). `publish()` in `board.py` is the one writer and
+`--stamp-status SECS` the one reader; both hold the format:
+
+    time=2026-10-20T13:20:11+09:00     epoch=…     rc=0|1|64     problems=N     streak=N     last=<the last failure's text>
+
+`rc` is the attempt's exit code; `problems` the board's `problem:` lines in it; `streak` how many attempts in a row had
+`rc` ≠ 0 (0 after a green one); `last` the last failure line of the attempt (a problem, a failed `gh issue edit`, a body over
+the limit, a missing remote), empty when green. The file is replaced whole, so a reader never sees half of it. An attempt
+that never reaches `board.py` (the plist's `gh auth token` fails first, a wrong path to `board.py`) leaves no stamp, which is
+how a watcher tells a dead agent from a quiet one.
+
+`--stamp-status SECS` prints `state`, `age` (seconds), `rc`, `problems`, `streak` and `last` as `key=value` lines, and exits 0.
+`state` is one of: `missing` (no stamp), `unreadable`, `stale` (older than `SECS`, or from the future), `red` (3 or more
+failures in a row), `failing` (the last attempt failed, fewer than 3 in a row), `ok`; the first that applies, in that order.
+
+## Keeping the agent alive
+
+The agent is what keeps the board moving, and nothing in this repository checks it: an agent that is not loaded, a plist that fell
+behind its template, or a run that fails every time (a gh token that is gone) leaves the issue as it was while sessions go on
+writing notes. A watcher closes that with the stamp: `--stamp-status SECS` says `missing`, `unreadable`, `stale` or `red` when the
+agent is not publishing. The maintainer's Mac runs one, rig-log's `tools/board/ensure.sh`: it loads the agent when it is not
+loaded, installs a fresh render of the template when the installed plist or the definition launchd holds differs, and
+`kickstart -k`s an agent whose stamp is stale (older than 3 x `StartInterval`) or red (3 failed attempts in a row), with a
+warning that names the last problem line. It runs at each session note (`board-note.sh`) and at the start of each gate batch:
+`tools/gate-batch.sh` starts the command in `BLOOMERY_BATCH_START_HOOK`, if set, once in the background (its header says how
+the hook's output and exit code are kept). Nothing else in this repository knows what the hook is.
+
 ## Install
 
-The agent runs `board.py --publish` on those events, as the gh account that owns the repo (`gh auth token --user`, read from the
+rig-log's `tools/board/ensure.sh` does these steps on the maintainer's Mac (`--repo <this checkout>` and `BOARD_ISSUE=<the pinned
+issue's number>` the first time; it renders the same template with the same words). The agent runs `board.py --publish` on those events, as the gh account that owns the repo (`gh auth token --user`, read from the
 keyring at run time; launchd runs no shell hook, so it cannot rely on the active account).
 
     ISSUE=<the pinned issue's number>; REPO=$HOME/repo/bloomery
@@ -158,10 +193,11 @@ keyring at run time; launchd runs no shell hook, so it cannot rely on the active
     sed -e "s|@PYTHON@|$(command -v python3)|" -e "s|@REPO@|$REPO|g" -e "s|@ISSUE@|$ISSUE|" \
         -e "s|@GHUSER@|midagedev|" -e "s|@HOME@|$HOME|g" \
         $REPO/tools/board/com.bloomery.board.plist > ~/Library/LaunchAgents/com.bloomery.board.plist
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bloomery.board.plist
-    launchctl kickstart gui/$(id -u)/com.bloomery.board     # run now; the log is ~/.cache/bloomery/board/launchd.log
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bloomery.board.plist     # RunAtLoad runs it now; the log is ~/.cache/bloomery/board/launchd.log
 
 ## Uninstall
 
     launchctl bootout gui/$(id -u)/com.bloomery.board
     rm ~/Library/LaunchAgents/com.bloomery.board.plist
+
+A watcher (rig-log's `ensure.sh`) installs it again at its next call; to keep it off, stop calling it.

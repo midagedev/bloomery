@@ -1783,6 +1783,15 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          run waits.",
     ),
     runner(
+        "BLOOMERY_BATCH_START_HOOK",
+        Some("gate-batch.sh"),
+        "Mac side: a command line (split on blanks, no shell syntax) that `tools/gate-batch.sh` \
+         starts once in the background at the start of a real run; its output goes to \
+         `start-hook.log` and its exit code to `start-hook.rc` in the batch's out directory, and a \
+         code other than 0 is one stderr line at the end of the run. It never delays the batch or \
+         changes its code. Unset or empty: nothing runs.",
+    ),
+    runner(
         "BLOOMERY_BOX",
         Some("box.sh"),
         "Mac side: the box's ssh host.",

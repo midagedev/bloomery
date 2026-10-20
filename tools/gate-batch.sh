@@ -8,6 +8,13 @@
 #   tools/gate-batch.sh --self-test [--part K|all]   the placement rules on a fixture justfile and the disk floor
 #                                      against a fake df (check-recipes runs it: every part at once, see self_test)
 #
+# The status board (tools/board/README.md): a real run appends its events to the board directory beside the times file.
+# Start hook. BLOOMERY_BATCH_START_HOOK, a command line (split on blanks, no shell syntax), runs once in the background at the start of a
+# real run: it never delays the batch and changes no rc or stdout line. Its output goes to OUT/start-hook.log and its exit code to
+# OUT/start-hook.rc when it ends; one that ended with a code other than 0 adds one stderr line at the end of the run,
+# `gate-batch: start hook (rc=N): <its first output line>`. Unset or empty: nothing runs. A machine uses it for a check that should start with
+# a batch and never wait on one (the status board's agent check, for one); the batch knows nothing of what it runs.
+#
 # Items. `NAME[@K=V[,K=V…]][:ARGS]` — NAME a recipe in `just --dump`; `@K=V,…` added to
 # BLOOMERY_BOX_ENV for that item (values without spaces, commas or colons); `:ARGS` passed to the
 # recipe, word-split (shell quoting allowed). Env comes before ARGS, e.g.
@@ -563,6 +570,31 @@ board_event() {
   return 0
 }
 
+# start_hook: BLOOMERY_BATCH_START_HOOK (the header), once, in the background. A value that holds no command is one stderr line and no run.
+start_hook() {
+  local cmd=()
+  [ -n "${BLOOMERY_BATCH_START_HOOK:-}" ] || return 0
+  read -r -a cmd <<< "${BLOOMERY_BATCH_START_HOOK:-}"
+  if [ "${#cmd[@]}" = 0 ]; then
+    echo "gate-batch: start hook: BLOOMERY_BATCH_START_HOOK holds no command, none run" >&2
+    return 0
+  fi
+  # set +e: the hook's own code is the answer (bash 3.2 under -e reports a command that is not there as 1, not 127)
+  ( { set +e; "${cmd[@]}"; echo $? > "$OUT/start-hook.rc"; } > "$OUT/start-hook.log" 2>&1 < /dev/null & ) || true
+  return 0
+}
+
+# start_hook_say: at the end of the batch, a hook that ended with a code other than 0 is one stderr line. One still running, or one that
+# ended 0, adds nothing.
+start_hook_say() {
+  local rc l
+  rc=$(cat "$OUT/start-hook.rc" 2> /dev/null) || return 0
+  case $rc in '' | 0) return 0 ;; esac
+  l=$(head -n 1 "$OUT/start-hook.log" 2> /dev/null | cut -c1-200) || l=''
+  echo "gate-batch: start hook (rc=$rc): ${l:-no output}" >&2
+  return 0
+}
+
 # cold_of <log> <try>: 1 when the try's section of the item's log compiled a crate from outside the tree
 # (cargo's `Compiling <name> v<ver>` with no local ` (/path)`: a registry or git dependency), which a
 # build does only in a new remote directory or after the toolchain, the flags or a pinned dependency
@@ -687,6 +719,7 @@ self_test() {
     return 1
   }
   unset BLOOMERY_TIER # the tier of a case is the case's own
+  unset BLOOMERY_BATCH_START_HOOK # a case that wants a hook sets it; the caller's own must not run on the fixture
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   t=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-test.XXXXXX") || { echo "gate-batch: self-test: no temporary directory" >&2; return 70; }
   # The fake HOMEs sit outside the tree copy, never under $t: the default OUT is $HOME/.cache/…, and a
@@ -1974,6 +2007,66 @@ SH
   rc=$(MTAG=board-noitem steal_case board-m "plain-any	B	a6000	5	$d" -- plain-any)
   printf '%s' "$rc" > "$t/rc-board-m"
   want_count 'board mutant: without run_item'"'"'s event the run item leaves none' "$t/board/batch/c-board-m.jsonl" '"ev": "item"' 0
+  # The start hook (start_hook) runs once, in the background. The stub holds until the case has seen the batch end: a batch that waited
+  # for it ends only after the stub gave up (10 s), and the stub then writes `timeout`, not `released`.
+  mkdir -p "$t/hk"
+  cat > "$t/hk/stub.sh" << 'HK'
+#!/usr/bin/env bash
+echo "$$ $*" >> "$HK_DIR/calls"
+n=0
+while [ -z "${HK_NOWAIT:-}" ] && [ ! -e "$HK_DIR/release" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+if [ -e "$HK_DIR/release" ]; then echo released > "$HK_DIR/state"; else echo timeout > "$HK_DIR/state"; fi
+echo "${HK_LINE:-stub hook line}"
+exit "${HK_RC:-0}"
+HK
+  mkdir -p "$t/hk/n" "$t/hk/w" "$t/hk/s" "$t/hk/a"
+  rc=$(HK_DIR=$t/hk/n BLOOMERY_BATCH_START_HOOK="bash $t/hk/stub.sh one two" steal_case hook-n "plain-any	B	a6000	5	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-hook-n"
+  : > "$t/hk/n/release"
+  for _ in $(seq 1 50); do [ -f "$t/hk/n/state" ] && break; sleep 0.1; done
+  rc_ok 'start hook: the batch ends green while the hook is still running' hook-n 1
+  want 'start hook: the batch ended before the hook did (the hook saw the release)' "$t/hk/n/state" '^released$'
+  want_count 'start hook: the hook ran once, with the words after its name' "$t/hk/n/calls" '^[0-9]+ one two$' 1
+  want_count 'start hook: a hook that ends 0 adds no line to the batch'"'"'s output' "$t/out-hook-n.log" '^gate-batch: start hook' 0
+  for _ in $(seq 1 50); do [ -f "$t/target/c-hook-n/start-hook.rc" ] && break; sleep 0.1; done
+  want 'start hook: its output is in OUT/start-hook.log' "$t/target/c-hook-n/start-hook.log" '^stub hook line$'
+  want 'start hook: its exit code is in OUT/start-hook.rc' "$t/target/c-hook-n/start-hook.rc" '^0$'
+  rc=$(HK_DIR=$t/hk/w HK_NOWAIT=1 HK_RC=1 HK_LINE='the hook says no' BLOOMERY_BATCH_START_HOOK="bash $t/hk/stub.sh" \
+    steal_case hook-w "plain-any	B	a6000	5	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-hook-w"
+  rc_ok 'start hook: a hook that ended 1 leaves the batch green and its DONE line as it was' hook-w 1
+  want_count 'start hook: its code and first output line are one stderr line at the end' "$t/out-hook-w.log" '^gate-batch: start hook \(rc=1\): the hook says no$' 1
+  want_not 'start hook: the DONE line does not carry it' "$t/out-hook-w.log" '^DONE .*hook'
+  rc=$(BLOOMERY_BATCH_START_HOOK="$t/hk/no-such-hook" steal_case hook-m "plain-any	B	a6000	5	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-hook-m"
+  rc_ok 'start hook: a hook that is not there leaves the batch green' hook-m 1
+  want_count 'start hook: and is one stderr line with the shell'"'"'s 127' "$t/out-hook-m.log" '^gate-batch: start hook \(rc=127\): .*no-such-hook' 1
+  rc=$(BLOOMERY_BATCH_START_HOOK='   ' steal_case hook-b "plain-any	B	a6000	5	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-hook-b"
+  rc_ok 'start hook: a value of blanks leaves the batch green' hook-b 1
+  want_count 'start hook: and is named in one stderr line, no run' "$t/out-hook-b.log" '^gate-batch: start hook: BLOOMERY_BATCH_START_HOOK holds no command' 1
+  rc=$(steal_case hook-u "plain-any	B	a6000	5	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-hook-u"
+  rc_ok 'start hook: unset, the batch ends green' hook-u 1
+  want_count 'start hook: unset, it adds no line' "$t/out-hook-u.log" '^gate-batch: start hook' 0
+  want_absent 'start hook: unset, nothing runs and no log is made' "$t/target/c-hook-u/start-hook.log"
+  mutant_of hook-noguard 's|^  \[ -n "\${BLOOMERY_BATCH_START_HOOK:-}" \] \|\| return 0$|  true # MUTANT hook-noguard|' '# MUTANT hook-noguard$'
+  rc=$(MTAG=hook-noguard steal_case hook-ug "plain-any	B	a6000	5	$d" -- plain-any)
+  want_count 'start hook mutant: without the guard an unset hook is named as an empty one' "$t/out-hook-ug.log" '^gate-batch: start hook: BLOOMERY_BATCH_START_HOOK holds no command' 1
+  # FAIL-first: a synchronous call makes the batch wait out the stub (`timeout`); with no code written a failing hook is not said; with no end-of-run line neither.
+  mutant_of hook-sync 's|< /dev/null \& ) \|\| true$|< /dev/null ) \|\| true # MUTANT hook-sync|' '# MUTANT hook-sync$'
+  rc=$(MTAG=hook-sync HK_DIR=$t/hk/s BLOOMERY_BATCH_START_HOOK="bash $t/hk/stub.sh" steal_case hook-s "plain-any	B	a6000	5	$d" -- plain-any)
+  printf '%s' "$rc" > "$t/rc-hook-s"
+  : > "$t/hk/s/release"
+  for _ in $(seq 1 50); do [ -f "$t/hk/s/state" ] && break; sleep 0.1; done
+  want 'start hook mutant: a synchronous call makes the batch wait out the hook' "$t/hk/s/state" '^timeout$'
+  mutant_of hook-norc 's|echo \$? > "\$OUT/start-hook.rc"|: MUTANT-hook-norc|' ': MUTANT-hook-norc'
+  rc=$(MTAG=hook-norc HK_DIR=$t/hk/a HK_NOWAIT=1 HK_RC=1 BLOOMERY_BATCH_START_HOOK="bash $t/hk/stub.sh" steal_case hook-nr "plain-any	B	a6000	5	$d" -- plain-any)
+  want_count 'start hook mutant: without the exit code written a failing hook is not said' "$t/out-hook-nr.log" '^gate-batch: start hook \(rc=1\)' 0
+  mutant_of hook-nosay 's|^start_hook_say$|true # MUTANT hook-nosay|' '# MUTANT hook-nosay$'
+  rm -rf "$t/hk/w"; mkdir -p "$t/hk/w"
+  rc=$(MTAG=hook-nosay HK_DIR=$t/hk/w HK_NOWAIT=1 HK_RC=1 BLOOMERY_BATCH_START_HOOK="bash $t/hk/stub.sh" steal_case hook-ns "plain-any	B	a6000	5	$d" -- plain-any)
+  want_count 'start hook mutant: without the end-of-run line a failing hook is not said' "$t/out-hook-ns.log" '^gate-batch: start hook \(rc=1\)' 0
   rc=$(steal_case ch-only "v41-any@FAKE_SLEEP=1	A	3090	2	$d" -- 'v41-any@FAKE_SLEEP=1')
   printf '%s' "$rc" > "$t/rc-ch-only"
   rc_ok 'chain only: a list of one any-form member ends green' ch-only 1
@@ -6400,6 +6493,7 @@ echo "plan $PREDICTED defaults=$SUM_NDEF (predicted, derived from $TIMES_FILE)" 
 BOARD_FILE=$BOARD_DIR/batch/$(basename "$OUT").jsonl
 board_event start total="$NT" tier="$TIER" lanes="$LANES" mode="${LMODE:-none}" predicted_wall="$SUM_W" \
   tree="$(basename "$ROOT")" branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2> /dev/null || echo unknown)"
+start_hook
 echo "gate-batch: $N items$DEFER_NOTE, lanes $LANES, logs in $OUT"
 canary_say
 red_main_say
@@ -7114,6 +7208,7 @@ for ((i = 0; i < N; i++)); do
 done
 if has_lane X; then run_pack; fi
 trap - INT TERM
+start_hook_say
 
 recorded=$(grep -c ' rc=' "$RUNLOG" || true)
 [ "$recorded" -eq "$NT" ] || RC=70 die "$NT items planned, $recorded recorded in $RUNLOG"
