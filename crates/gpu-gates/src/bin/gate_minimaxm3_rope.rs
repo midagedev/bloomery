@@ -2,7 +2,7 @@
 //! `rope_neox::head_norm_neox_append_128_partial`, model-less at the model's
 //! shapes: 64 query heads over 4 key heads of 128 values, a NEOX rope over the
 //! first 64 values of each head (`rope.dimension_count`) at θ 5e6, RMS eps
-//! 1e-6. Inputs are seeded ([`activations`]); nothing is read from a model
+//! 1e-6. Inputs are seeded (`rope_gate::seeded_inputs`); nothing is read from a model
 //! file.
 //!
 //! One launch normalizes each head by its own gain (the per-head `attn_q_norm`
@@ -30,9 +30,8 @@ mod gate {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::fault::FaultSink;
     use bloomery_gpu::rope_neox::{HEAD, ROT_PARTIAL, RopeNeoxKernels};
-    use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu_gates::rope_gate::{self, RopeIn, RopeOut, RopeShape};
-    use bloomery_gpu_gates::{GateError, activations, checks_failed, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use cuda_core::CudaStream;
 
     /// The model's attention shape.
@@ -43,7 +42,6 @@ mod gate {
 
     /// The tokens, first position and cache height of a launch.
     const ROPE_M: usize = 9;
-    const ROPE_P0: usize = ROPE_CTX - ROPE_M;
     const ROPE_CTX: usize = 40;
     /// The layer the fault checks label their launches with.
     const LAYER: usize = 17;
@@ -75,33 +73,8 @@ mod gate {
         )
     }
 
-    fn rope_inputs((n_head, n_kv): (usize, usize)) -> Result<(RopeIn, Vec<u32>), GateError> {
-        let table_rt = RopeTable::new(&RopeSpec::window(THETA, ROT_PARTIAL))?;
-        let mut table = Vec::with_capacity(ROPE_CTX * ROT_PARTIAL);
-        for p in 0..ROPE_CTX {
-            table_rt.push(u32::try_from(p)?, Direction::Forward, &mut table);
-        }
-        let gain = |seed: u32, base: f32| -> Vec<f32> {
-            activations(HEAD, 1, seed)
-                .iter()
-                .map(|v| base + 0.5 * v)
-                .collect()
-        };
-        let inp = RopeIn {
-            qg: activations(HEAD, ROPE_M * n_head, 3),
-            k: activations(HEAD, ROPE_M * n_kv, 6)
-                .iter()
-                .map(|v| 4.0 * v)
-                .collect(),
-            v: activations(HEAD, ROPE_M * n_kv, 7),
-            gq: gain(4, 1.25),
-            gk: gain(5, 1.3),
-            table,
-        };
-        let pos: Vec<u32> = (0..ROPE_M)
-            .map(|t| u32::try_from(ROPE_P0 + t))
-            .collect::<Result<_, _>>()?;
-        Ok((inp, pos))
+    fn rope_inputs(heads: (usize, usize)) -> Result<(RopeIn, Vec<u32>), GateError> {
+        rope_gate::seeded_inputs(HEAD, ROT_PARTIAL, THETA, (ROPE_CTX, ROPE_M), heads)
     }
 
     fn rope_check(
