@@ -5011,7 +5011,12 @@ mod gate {
                     if taken == Taken::Logprobs {
                         check(&mut ok, "lookup_logprobs_step_without_a_draft", d == 0);
                     } else if i > 0 {
-                        check(&mut ok, &format!("lookup_{i}_verifies_proposals"), d > 0);
+                        // The draft proposes only where the text repeats an n-gram of its own: the
+                        // fixture's random-weight target writes none, so the file answers it.
+                        let name = format!("lookup_{i}_verifies_proposals");
+                        if tier::run_clause(&name, Tag::FileBound)? {
+                            check(&mut ok, &name, d > 0);
+                        }
                     }
                     proposed = proposed
                         .checked_add(d)
