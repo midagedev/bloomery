@@ -1,0 +1,21 @@
+[package]
+name = "bloomery-gpu-minimaxm3"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+# The MiniMax-M3 program on the card. It composes the common owners of `bloomery-gpu` (the head kernel with its
+# partial rope `rope_neox`, the selected flash `flash_gqa`, the typed sites) and holds what an MSA fact forces: the
+# block-max selector's two kernels (`attn`). Built with `cargo oxide` because `bloomery-gpu` is.
+[dependencies]
+cuda-device.workspace = true
+cuda-host.workspace = true
+cuda-core.workspace = true
+bloomery-gpu = { path = "../gpu" }
+# Host only: the file's hyperparameters the shape check reads, and the selection rule the gates follow.
+bloomery-model = { path = "../model" }
+bloomery-runtime = { path = "../runtime" }

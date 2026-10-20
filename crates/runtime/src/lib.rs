@@ -30,6 +30,7 @@ pub mod dspark;
 pub mod hc_gated;
 pub mod layer;
 mod lookup;
+pub mod msa;
 pub mod prompt;
 pub mod qsa;
 pub mod savemap;

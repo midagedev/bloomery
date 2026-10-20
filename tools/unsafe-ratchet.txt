@@ -366,7 +366,11 @@ gguf 9 2 0
 # PIN(2026-10-21): gpu 1984 -> 1985 blocks, 221 -> 222 fns, a new kernel entry, not old code relaxed:
 # head_norm_neox_append_128_partial (rope_neox.rs): its launcher is an unsafe fn (the positions are distinct, as the
 # 512 and whole-turn launchers state) and its kernel makes the one call into norm_partial_append, with its SAFETY line.
-gpu 1985 222 10
+# PIN(2026-10-21): gpu 1985 -> 1988 blocks, 222 -> 224 fns, a new kernel entry, not old code relaxed: the block walk
+# BlockListed (flash_gqa.rs) is the second KeyWalk next to Listed: its trait method is an unsafe fn (declaration and impl, the
+# Listed impl keeping the one it had), the impl reads the block id and the cache row in two blocks, and the
+# gqa_flash_seg_mma_p16_blocks entry makes the one call into seg_mma_ps. Each with its SAFETY line.
+gpu 1988 224 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -431,7 +435,9 @@ gpu-deepseek41 385 44 0
 # batch, the rank-order sum), each with its SAFETY line.
 # PIN(2026-10-21): gpu-gates 81 -> 82 blocks, new code, not old code relaxed: gate_minimaxm3_rope's launch of the
 # unsafe head-128 partial-turn launcher, whose positions rope_gate::run checks distinct, with its SAFETY line.
-gpu-gates 82 5 1
+# PIN(2026-10-21): gpu-gates 82 -> 83 blocks, new code, not old code relaxed: gate_minimaxm3_msa's launch of the index heads
+# (attn::enqueue_index, an unsafe fn: the positions are distinct, which rope_gate::run checks), with its SAFETY line.
+gpu-gates 83 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of
@@ -444,6 +450,10 @@ gpu-gemma-embedding2 2 0 0
 gpu-gemma4a 11 0 0
 gpu-glm5next 4 0 0
 gpu-mimo2 0 0 0
+# PIN(2026-10-21): gpu-minimaxm3 0 -> 19 blocks, 0 -> 1 fns, a new crate, not old code relaxed: the score and select kernels
+# (attn.rs) read and write their buffers through raw places and shared words, each block with its SAFETY line, and
+# enqueue_index is an unsafe fn, as the head kernel it calls (the positions are distinct).
+gpu-minimaxm3 19 1 0
 gpu-solar2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and
 # write their buffers through the same raw places as V4.1's, each block with its SAFETY line — vis_attn_h72 17, vis_rope2d_h72 4,

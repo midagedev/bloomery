@@ -186,6 +186,7 @@ dependencies = [
  "bloomery-gpu-gemma4a",
  "bloomery-gpu-glm5next",
  "bloomery-gpu-mimo2",
+ "bloomery-gpu-minimaxm3",
  "bloomery-gpu-solar2",
  "bloomery-gpu-vision",
  "bloomery-hf",
@@ -261,6 +262,18 @@ dependencies = [
  "bloomery-models",
  "bloomery-runtime",
  "cuda-core",
+]
+
+[[package]]
+name = "bloomery-gpu-minimaxm3"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gpu",
+ "bloomery-model",
+ "bloomery-runtime",
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
 ]
 
 [[package]]
