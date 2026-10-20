@@ -1,8 +1,9 @@
 //! The NeoX gates' host inputs, expected outputs, device launch and readback.
 
-use crate::{GateError, bits_equal, verdict};
+use crate::{GateError, activations, bits_equal, verdict};
 use bloomery_gpu::fault::{Fault, FaultSink, FaultSite};
 use bloomery_gpu::rope_neox::PartialNeoxArgs;
+use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
 use bloomery_gpu::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 
@@ -26,6 +27,45 @@ pub struct RopeIn {
     pub gq: Vec<f32>,
     pub gk: Vec<f32>,
     pub table: Vec<f32>,
+}
+
+/// The seeded inputs of a model-less head launch at `head` values a head, `rot` of them turned at
+/// base `theta`: `m` rows at the cache's last `m` positions of `ctx`, the queries and the keys (×4)
+/// of `n_head` and `n_kv` heads, the values, and the two gains around 1.25 and 1.3. Every gate
+/// that checks a head kernel against the host rule draws the same rows, so a seed lives here once.
+pub fn seeded_inputs(
+    head: usize,
+    rot: usize,
+    theta: f32,
+    (ctx, m): (usize, usize),
+    (n_head, n_kv): (usize, usize),
+) -> Result<(RopeIn, Vec<u32>), GateError> {
+    let table_rt = RopeTable::new(&RopeSpec::window(theta, rot))?;
+    let mut table = Vec::with_capacity(ctx * rot);
+    for p in 0..ctx {
+        table_rt.push(u32::try_from(p)?, Direction::Forward, &mut table);
+    }
+    let gain = |seed: u32, base: f32| -> Vec<f32> {
+        activations(head, 1, seed)
+            .iter()
+            .map(|v| base + 0.5 * v)
+            .collect()
+    };
+    let inp = RopeIn {
+        qg: activations(head, m * n_head, 3),
+        k: activations(head, m * n_kv, 6)
+            .iter()
+            .map(|v| 4.0 * v)
+            .collect(),
+        v: activations(head, m * n_kv, 7),
+        gq: gain(4, 1.25),
+        gk: gain(5, 1.3),
+        table,
+    };
+    let pos: Vec<u32> = (ctx - m..ctx)
+        .map(u32::try_from)
+        .collect::<Result<_, _>>()?;
+    Ok((inp, pos))
 }
 
 /// The head and cache geometry the launch reads, and its norm epsilon.
