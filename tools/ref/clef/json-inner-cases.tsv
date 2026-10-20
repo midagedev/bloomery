@@ -1,0 +1,31 @@
+# The JSON string escaper's cases: the text a string spells as between the quotes of a JSON string.
+# Two sides write it and both read this table: the server (crates/serve/src/constrain/tests.rs,
+# `a_json_literal_is_spelled_as_the_table_has_it`, which drives the schema compiler) and the Clef comparison
+# (tools/ref/clef/sjcmp.py `json_inner`, checked by its --self-test). A change to either side's escapes fails
+# its test; a row that is not JSON's reading of itself fails both.
+# Columns, tab-separated: name, input, body. The input and the body are JSON string literals: the input is the
+# string, the body is the text between the quotes. A line that starts with # is a comment.
+plain	"abc"	"abc"
+empty	""	""
+quote	"a\"b"	"a\\\"b"
+backslash	"a\\b"	"a\\\\b"
+slash-stays	"a/b"	"a/b"
+newline	"a\nb"	"a\\nb"
+carriage-return	"a\rb"	"a\\rb"
+tab	"a\tb"	"a\\tb"
+backspace	"a\bb"	"a\\bb"
+form-feed	"a\fb"	"a\\fb"
+control-00	"a\u0000b"	"a\\u0000b"
+control-01	"\u0001"	"\\u0001"
+control-0b	"\u000b"	"\\u000b"
+control-1f	"\u001f"	"\\u001f"
+delete-stays	"\u007f"	"\u007f"
+less-than	"a<b"	"a\\u003cb"
+closing-tag	"</think>"	"\\u003c/think>"
+html-others-stay	"a>b&c'd"	"a>b&c'd"
+hangul	"결제"	"결제"
+latin	"café"	"café"
+astral	"\ud83d\ude00"	"\ud83d\ude00"
+line-separator	"a\u2028b"	"a\u2028b"
+paragraph-separator	"a\u2029b"	"a\u2029b"
+mixed	"<a href=\"x\">\n</a>"	"\\u003ca href=\\\"x\\\">\\n\\u003c/a>"

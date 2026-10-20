@@ -69,8 +69,9 @@ for `en` and `ko` alone.
 
 `--self-test` is pure: no server, no card, no clock. It covers the conversion of every question type of the
 four suites, the back-mapping, the rotation, the call plan and the count-mismatch refusal, the stats on a fixed
-sample, and the bodies (first counted round, the SystemOne pass's route test, order and failures) against servers
-that are objects logging their requests.
+sample, the bodies (first counted round, the SystemOne pass's route test, order and failures) against servers
+that are objects logging their requests, and `json_inner` against `json-inner-cases.tsv`, the table the server's own
+test holds its Rust side to.
 """
 
 from __future__ import annotations
@@ -132,8 +133,34 @@ def fail(why: str) -> None:
 
 def json_inner(s: str) -> str:
     """A JSON string's body as the server writes it (`crates/serve/src/constrain/schema.rs`'s `json_inner`): the
-    string's escapes, a `<` as `\\u003c`."""
+    string's escapes, a `<` as `\\u003c`. `json-inner-cases.tsv` holds both sides to the same cases."""
     return json.dumps(s, ensure_ascii=False)[1:-1].replace("<", "\\u003c")
+
+
+JSON_INNER_CASES = HERE / "json-inner-cases.tsv"
+
+
+def json_inner_cases() -> list[tuple[str, str, str]]:
+    """The rows of the table the server's test holds `json_inner`'s Rust side to (`crates/serve/src/constrain/tests.rs`):
+    a case's name, the string, and the text between the quotes that spell it. A malformed row is a named error."""
+    cases = []
+    for lineno, line in enumerate(JSON_INNER_CASES.read_text(encoding="utf-8").splitlines(), 1):
+        if not line or line.startswith("#"):
+            continue
+        cells = line.split("\t")
+        if len(cells) != 3:
+            fail(f"{JSON_INNER_CASES.name}:{lineno}: {len(cells)} cells, want name, input and body")
+        name, *literals = cells
+        try:
+            text, body = (json.loads(c) for c in literals)
+        except json.JSONDecodeError as e:
+            fail(f"{JSON_INNER_CASES.name}:{lineno}: {name}: a cell is not a JSON string literal ({e})")
+        if not (isinstance(text, str) and isinstance(body, str)):
+            fail(f"{JSON_INNER_CASES.name}:{lineno}: {name}: a cell is not a JSON string literal")
+        cases.append((name, text, body))
+    if not cases:
+        fail(f"{JSON_INNER_CASES.name} holds no case")
+    return cases
 
 
 def check_request(req: dict, where: str) -> None:
@@ -2291,6 +2318,13 @@ def self_test() -> None:
             check("and it posted nothing", log, [])
 
     guarded("the bodies' names", case_bodies_names)
+
+    # --- the string escaper: the table the server's test holds its Rust side to, and the reading back of each body.
+    def case_json_inner() -> None:
+        for name, text, body in json_inner_cases():
+            check(f"json_inner spells {name}", (json_inner(text), json.loads(f'"{body}"')), (body, text))
+
+    guarded("the string escaper's table", case_json_inner)
 
     if fails:
         print(f"sjcmp self-test: {fails} of {n} checks FAILED")
