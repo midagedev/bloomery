@@ -52,6 +52,16 @@ jobs:
           tar -xzf "$RUNNER_TEMP/just.tgz" -C "$HOME/.local/bin" just
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # contrib-check builds with -C target-cpu=native, so a cached target/ holds code for the runner that built it. The
+      # key names the CPU (model and flags): a runner with another CPU never restores test binaries it cannot execute.
+      - name: Name the runner's CPU
+        id: cpu
+        shell: bash
+        run: |
+          lines=$(grep -E '^(model name|flags)' /proc/cpuinfo | sort -u)
+          test -n "$lines"
+          echo "id=$(printf '%s\n' "$lines" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       - name: Cache cargo downloads and build
         uses: actions/cache@v4
         with:
@@ -60,9 +70,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: pr-check-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: pr-check-${{ runner.os }}-${{ steps.cpu.outputs.id }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            pr-check-${{ runner.os }}-
+            pr-check-${{ runner.os }}-${{ steps.cpu.outputs.id }}-
 
       - name: Python packages the tool self-tests import
         run: sudo apt-get install -y --no-install-recommends python3-numpy python3-pil
