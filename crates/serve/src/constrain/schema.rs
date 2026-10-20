@@ -75,10 +75,10 @@ fn type_of(v: &Value) -> &'static str {
 }
 
 /// The text a JSON string body spells `s` as: the escapes of its characters,
-/// without the quotes, and a `<` as `\u003c`.
+/// without the quotes, and a `<` as `\u003c`. `/v1/systemone` cuts each option of a
+/// question with the same text, so one function owns it.
 fn json_inner(s: &str) -> String {
-    let q = Value::String(s.to_owned()).to_string();
-    q[1..q.len() - 1].replace('<', "\\u003c")
+    ::decision::generative::json_body(s)
 }
 
 /// A scalar a choice or a constant can take.

@@ -137,9 +137,11 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   and the body is written by the formulas the decision models' own are: `choice` is the model's pick, and
   `probabilities`, `confidence` and a score's `score` come from the softmax of those logits over the options
   alone. `usage.output_tokens` counts the generated ids and `timings.cache_n` the prompt ids a cache kept. A
-  request may add `cache_prompt` (a boolean, default `true`). A question whose options all start with the same
-  token as another's has no score of its own for each: the request is a 400 naming the question and the options.
-  `/props` lists the route in `routes`, and the 404 names it.
+  request may add `cache_prompt` (a boolean, default `true`). A choice whose options one token does not tell
+  apart (`ab`, `ac` and `d` start with the same token) is asked by label: the model is shown `A = ab`, `B = ac`,
+  `C = d` in the option order and picks a letter, whose logits are the options' scores, and the body names the
+  options, never a letter. A choice of more such options than there are single-token letters (26) is a 400 naming
+  the question. `/props` lists the route in `routes`, and the 404 names it.
 - **`--api-key`/`--api-key-file`**, llama-server's authentication: a comma-separated list (a quoted item may
   hold commas) and a file (one key per line, `#` lines comments), both flags adding to one set, carried by
   `Authorization: Bearer <key>` or `X-Api-Key: <key>`. `/health`, `/v1/health` and `OPTIONS` stay public;

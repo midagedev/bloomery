@@ -20,9 +20,13 @@
 //! - `timings`: `prompt_n` the prompt ids evaluated, `prompt_ms` the prompt call, `head_ms` the
 //!   rest of the generation, `cache_n` the prompt ids the cache kept.
 //!
-//! A question whose options start with the same token has no score per option: the model decides
-//! it past the token they share, in a row the other options never get. That request is refused by
-//! name, as is a score that is not finite.
+//! A question's options are scored by one pick when the tokens of their ids share a leading run
+//! and differ at the token after it. A `choice` whose options are not told apart so (two start
+//! with the same token and part there) is asked by label: [`generative::ask`] gives its enum the
+//! labels `A`, `B`, ... in the option order and the schema text shows each beside its option id,
+//! so the label row is the question's one pick and its scores are the options'. The answer names
+//! the options, never a label. What the labels cannot fix is refused by name: a choice of more
+//! options than single-token labels (a 400), a score that is not finite (a 500).
 //!
 //! Beside the decision models' fields the body takes `cache_prompt`, a boolean (default `true`,
 //! the chat path's), which a decision model ignores like any key it does not know.
@@ -85,7 +89,8 @@ fn plan(state: &State, body: &[u8]) -> Result<(Asked, ChatPlan, Watch), ApiError
             )));
         }
     };
-    let chat = generative::ask(&asked)
+    let tok = &*state.tok;
+    let chat = generative::ask(&asked, &mut |text| tok.encode(text))
         .map_err(refusal)?
         .chat_body(cache_prompt);
     let mut plan = chat_plan(state, &chat, None)?;
@@ -139,10 +144,8 @@ fn answered(
 }
 
 /// The decision of each question that needs one, from the picks the walk made in the reply's
-/// order. A question's pick is the first with more than one child; its children are the options
-/// when each leads to one option alone. Where two options start with the same token the walk
-/// decides again below it, so the first question that does not fit is the one refused, and the
-/// picks before it were one a question.
+/// order: one pick a question, since [`generative::ask`] asks only what one pick tells apart (a
+/// choice that one does not is asked by label). A question's pick has the options for children.
 fn decisions(asked: &Asked, picks: &[Picked]) -> Result<Vec<Decision>, ApiError> {
     let wanted: Vec<_> = asked
         .questions
@@ -172,14 +175,15 @@ fn decisions(asked: &Asked, picks: &[Picked]) -> Result<Vec<Decision>, ApiError>
     }
 }
 
-/// `q`'s decision from the pick its options were told apart at, or the refusal naming the
-/// options that start alike.
+/// `q`'s decision from the pick that told its options apart: each child of the pick leads to one
+/// option, so its logit is that option's score. A pick that does not is the server's fault, not
+/// the request's ([`generative::ask`] asks only what one pick tells apart).
 fn decided(q: &Question, pick: &Picked) -> Result<Decision, ApiError> {
-    let options: Vec<String> = q.options().into_iter().map(|o| o.id).collect();
-    let mut scores = vec![None; options.len()];
+    let options = q.options().len();
+    let mut scores = vec![None; options];
     let mut picked = None;
     for kid in &pick.kids {
-        if let Some(k) = kid.option.filter(|&k| k < options.len()) {
+        if let Some(k) = kid.option.filter(|&k| k < options) {
             scores[k] = Some(kid.logit);
             if kid.id == pick.picked {
                 picked = Some(k);
@@ -187,22 +191,15 @@ fn decided(q: &Question, pick: &Picked) -> Result<Decision, ApiError> {
         }
     }
     match (scores.iter().copied().collect::<Option<Vec<f32>>>(), picked) {
-        (Some(scores), Some(picked)) if pick.kids.len() == options.len() => {
+        (Some(scores), Some(picked)) if pick.kids.len() == options => {
             Ok(Decision { scores, picked })
         }
-        _ => {
-            let alone: Vec<&str> = options
-                .iter()
-                .zip(&scores)
-                .filter(|(_, s)| s.is_none())
-                .map(|(o, _)| o.as_str())
-                .collect();
-            Err(invalid(format!(
-                "question {}: the options {alone:?} start with the same token, so this model has \
-                 no score of its own for each; give each option an id whose first token differs",
-                q.id
-            )))
-        }
+        _ => Err(engine_error(&format!(
+            "question {}: the pick has {} children for {options} options, and not each leads \
+             to one option",
+            q.id,
+            pick.kids.len()
+        ))),
     }
 }
 
@@ -423,7 +420,9 @@ mod tests {
     fn the_picks_are_the_response_formats_picks() {
         let (_, got) = post_to(&rules(), "/v1/systemone", REQUEST);
         let req = Asked::from_json(&json::parse(REQUEST).unwrap()).unwrap();
-        let chat = generative::ask(&req).unwrap().chat_body(false);
+        let chat = generative::ask(&req, &mut |t| MockTokenizer.encode(t))
+            .unwrap()
+            .chat_body(false);
         let (status, reply) = post_to(
             &rules(),
             "/v1/chat/completions",
@@ -474,7 +473,9 @@ mod tests {
             ),
         ];
         let (_, got) = post_to(&flipped, "/v1/systemone", REQUEST);
-        let chat = generative::ask(&req).unwrap().chat_body(false);
+        let chat = generative::ask(&req, &mut |t| MockTokenizer.encode(t))
+            .unwrap()
+            .chat_body(false);
         let (_, reply) = post_to(
             &flipped,
             "/v1/chat/completions",
@@ -586,20 +587,143 @@ mod tests {
         );
     }
 
-    /// Options that start with the same token have no score of their own: the request is refused
-    /// naming the question and the options, never answered with a tie it made up.
+    /// A choice with options that start with the same token is asked by label and answered by
+    /// name: `ab`, `ac` and `d` are the labels `A`, `B`, `C` to the model, the label row's logits
+    /// are their scores, and the body is the decide seat's for those scores, with the options'
+    /// ids as `choice` and as the keys of `probabilities`, and no label in it.
     #[test]
-    fn options_that_start_alike_are_refused_by_name() {
-        let body = r#"{"state":"s","questions":{
-            "q":{"type":"choice","criteria":{"billing":"Pay","bank":"Bank","technical":"Bugs"}}}}"#;
-        let (status, got) = post_to(&rules(), "/v1/systemone", body);
+    fn options_that_start_alike_are_answered_by_name() {
+        let body = r#"{"state":"s","cache_prompt":false,"questions":{
+            "q":{"type":"choice","criteria":{"d":"Dee","ab":"Ab","ac":"Ac"}},
+            "urgency":{"type":"score","criteria":["Can wait","Today"]}}}"#;
+        let rows: Vec<Rule> = vec![
+            (
+                "\"q\": \"".into(),
+                vec![(first("A"), 0.5), (first("B"), 2.0), (first("C"), 0.0)],
+            ),
+            (
+                "\"urgency\": ".into(),
+                vec![(first("0"), 1.0), (first("1"), 0.0)],
+            ),
+        ];
+        let (status, got) = post_to(&rows, "/v1/systemone", body);
+        assert_eq!(status, 200, "{got}");
+        // Scores in the sorted option order (ab, ac, d); keys in the request's criteria order.
+        let want = clef_body(body, &[vec![0.5, 2.0, 0.0], vec![1.0, 0.0]]);
+        assert_eq!(shape(&got), shape(&want));
+        assert_eq!(got["answers"], want["answers"]);
+        let q = &got["answers"]["q"];
+        assert_eq!(q["choice"], "ac");
+        let keys: Vec<&str> = q["probabilities"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["d", "ab", "ac"]);
+        let p = decision::answer::probabilities(&[0.5, 2.0, 0.0]);
+        for (i, id) in ["ab", "ac", "d"].iter().enumerate() {
+            let x = q["probabilities"][id].as_f64().unwrap();
+            assert!(
+                (x - f64::from(p[i])).abs() < 1e-4,
+                "{id}: {x} against {}",
+                p[i]
+            );
+        }
+        let text = got.to_string();
+        for label in ["\"A\"", "\"B\"", "\"C\""] {
+            assert!(!text.contains(label), "{text}");
+        }
+        assert_eq!(
+            got["answers"]["urgency"]["score"],
+            want["answers"]["urgency"]["score"]
+        );
+    }
+
+    /// The label is the route's conversion only: the converted chat body on `/v1/chat/completions`
+    /// writes the label the walk picked, which is the option the answer names.
+    #[test]
+    fn the_label_is_the_chat_bodys_pick() {
+        let body = r#"{"state":"s","cache_prompt":false,"questions":{
+            "q":{"type":"choice","criteria":{"ab":"Ab","ac":"Ac","d":"Dee"}}}}"#;
+        let rows: Vec<Rule> = vec![(
+            "\"q\": \"".into(),
+            vec![(first("A"), 0.0), (first("B"), 1.0), (first("C"), 3.0)],
+        )];
+        let (_, got) = post_to(&rows, "/v1/systemone", body);
+        let req = Asked::from_json(&json::parse(body).unwrap()).unwrap();
+        let ask = generative::ask(&req, &mut |t| MockTokenizer.encode(t)).unwrap();
+        let (status, reply) = post_to(
+            &rows,
+            "/v1/chat/completions",
+            &Value::Object(ask.chat_body(false)).to_string(),
+        );
+        assert_eq!(status, 200, "{reply}");
+        let said: Value =
+            serde_json::from_str(reply["choices"][0]["message"]["content"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(said, json!({"q": "C"}));
+        let label = ask.labels[0].as_ref().unwrap();
+        let at = label.iter().position(|l| l == "C").unwrap();
+        assert_eq!(["ab", "ac", "d"][at], got["answers"]["q"]["choice"]);
+        assert_eq!(got["answers"]["q"]["choice"], "d");
+    }
+
+    /// The letters hold 26 labels: 26 options that start alike are answered, a 27th has none, and
+    /// that request is refused by name, the question and the counts in the message.
+    #[test]
+    fn more_options_than_labels_is_refused_by_name() {
+        let request = |n: usize| {
+            let options: Vec<String> = (0..n).map(|i| format!("\"p{i:02}\":\"d\"")).collect();
+            format!(
+                r#"{{"state":"s","cache_prompt":false,"questions":{{"q":{{"type":"choice","criteria":{{{}}}}}}}}}"#,
+                options.join(",")
+            )
+        };
+        let (status, got) = post_to(&[], "/v1/systemone", &request(26));
+        assert_eq!(status, 200, "{got}");
+        assert_eq!(
+            got["answers"]["q"]["probabilities"]
+                .as_object()
+                .unwrap()
+                .len(),
+            26
+        );
+        let (status, got) = post_to(&[], "/v1/systemone", &request(27));
         assert_eq!(status, 400, "{got}");
+        assert_eq!(got["error"]["type"], "invalid_request_error");
         let m = got["error"]["message"].as_str().unwrap();
         assert!(
-            m.contains("question q") && m.contains("\"bank\"") && m.contains("\"billing\""),
+            m.starts_with("q: ")
+                && m.contains("27 options")
+                && m.contains("26 single-token labels"),
             "{m}"
         );
-        assert!(!m.contains("technical"), "{m}");
+    }
+
+    /// A pick whose children do not each lead to one option is the server's fault, a 500 naming
+    /// the question, never a tie it made up.
+    #[test]
+    fn a_pick_that_does_not_separate_the_options_is_a_server_error() {
+        let req = Asked::from_json(
+            &json::parse(
+                r#"{"state":"s","questions":{"q":{"type":"choice","criteria":{"ab":"x","ac":"y","d":"z"}}}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let kid = |id, option| crate::constrain::Kid {
+            id,
+            logit: 0.0,
+            option,
+        };
+        let pick = Picked {
+            kids: vec![kid(1, None), kid(2, Some(2))],
+            picked: 1,
+        };
+        let e = decided(&req.questions[0], &pick).unwrap_err();
+        assert_eq!(e.code, 500);
+        assert!(e.message.contains("question q"), "{}", e.message);
     }
 
     /// Options that share a prefix are scored where they differ: the walk takes the shared ids

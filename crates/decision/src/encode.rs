@@ -128,6 +128,8 @@ struct Images<'a> {
 const SCHEMA_OPEN: &str = "\n\nSCHEMA FIELDS:\n";
 /// Between a field's instruction and its options.
 const OPTIONS_OPEN: &str = "\nALLOWED OPTIONS:\n";
+/// Between the instruction and the options of a field a generative model answers by label.
+const LABELLED_OPTIONS_OPEN: &str = "\nALLOWED OPTIONS (reply with the label before the =):\n";
 /// After each option.
 const OPTION_CLOSE: &str = "\n";
 /// After a field's last option.
@@ -139,6 +141,8 @@ struct FieldText {
     head: String,
     /// The instruction the model reads: the request's, rendered, else the field's id.
     instructions: String,
+    /// What opens the options: [`OPTIONS_OPEN`], or the labelled field's.
+    options_open: &'static str,
     options: Vec<OptionText>,
 }
 
@@ -151,41 +155,54 @@ struct OptionText {
     semantics: String,
 }
 
-/// The schema block's text for each question of `req`, in order.
-fn schema_questions(req: &Request) -> Vec<FieldText> {
+/// The schema block's text for each question of `req`, in order. `labels` holds, for a question
+/// the model answers by label, its options' labels in option order (`labels[qi]`; a question
+/// past the slice's end, or `None`, is answered by option id).
+fn schema_questions(req: &Request, labels: &[Option<Vec<String>>]) -> Vec<FieldText> {
     req.questions
         .iter()
         .enumerate()
-        .map(|(qi, q)| FieldText {
-            head: format!(
-                "\nFIELD {}\nID: {}\nTYPE: {}\nINSTRUCTION: ",
-                qi + 1,
-                q.id,
-                q.kind.word()
-            ),
-            instructions: match &q.instructions {
-                Some(v) if v.as_str() != Some("") => render(v),
-                _ => q.id.clone(),
-            },
-            options: q
-                .options()
-                .into_iter()
-                .enumerate()
-                .map(|(oi, opt)| {
-                    let mut semantics = vec![(
-                        "option_id".to_string(),
-                        crate::json::Json::Str(opt.id.clone()),
-                    )];
-                    if let Some(d) = opt.description {
-                        semantics.push(("description".to_string(), d));
-                    }
-                    OptionText {
-                        id: opt.id,
-                        label: format!("OPTION {}: ", oi + 1),
-                        semantics: render(&crate::json::Json::Object(semantics)),
-                    }
-                })
-                .collect(),
+        .map(|(qi, q)| {
+            let labelled = labels.get(qi).and_then(|l| l.as_deref());
+            FieldText {
+                head: format!(
+                    "\nFIELD {}\nID: {}\nTYPE: {}\nINSTRUCTION: ",
+                    qi + 1,
+                    q.id,
+                    q.kind.word()
+                ),
+                instructions: match &q.instructions {
+                    Some(v) if v.as_str() != Some("") => render(v),
+                    _ => q.id.clone(),
+                },
+                options_open: if labelled.is_some() {
+                    LABELLED_OPTIONS_OPEN
+                } else {
+                    OPTIONS_OPEN
+                },
+                options: q
+                    .options()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(oi, opt)| {
+                        let mut semantics = vec![(
+                            "option_id".to_string(),
+                            crate::json::Json::Str(opt.id.clone()),
+                        )];
+                        if let Some(d) = opt.description {
+                            semantics.push(("description".to_string(), d));
+                        }
+                        OptionText {
+                            id: opt.id,
+                            label: match labelled {
+                                Some(l) => format!("OPTION {}: {} = ", oi + 1, l[oi]),
+                                None => format!("OPTION {}: ", oi + 1),
+                            },
+                            semantics: render(&crate::json::Json::Object(semantics)),
+                        }
+                    })
+                    .collect(),
+            }
         })
         .collect()
 }
@@ -194,11 +211,19 @@ fn schema_questions(req: &Request) -> Vec<FieldText> {
 /// reads the schema as text (a generative one, whose tokenizer cuts the whole) takes this.
 #[must_use]
 pub fn schema_text(req: &Request) -> String {
+    schema_text_labelled(req, &[])
+}
+
+/// [`schema_text`] with the options of the questions that have `labels` (see
+/// [`schema_questions`]) shown as `OPTION n: <label> = {"option_id": ...}`, and the field's
+/// options opened by the line that tells the model to reply with the label.
+#[must_use]
+pub fn schema_text_labelled(req: &Request, labels: &[Option<Vec<String>>]) -> String {
     let mut out = String::from(SCHEMA_OPEN);
-    for field in schema_questions(req) {
+    for field in schema_questions(req, labels) {
         out.push_str(&field.head);
         out.push_str(&field.instructions);
-        out.push_str(OPTIONS_OPEN);
+        out.push_str(field.options_open);
         for opt in field.options {
             out.push_str(&opt.label);
             out.push_str(&opt.semantics);
@@ -217,7 +242,7 @@ fn encode_inner(
 ) -> Result<Encoded, Error> {
     let mut schema = tokens(SCHEMA_OPEN);
     let mut questions = Vec::with_capacity(req.questions.len());
-    for (q, text) in req.questions.iter().zip(schema_questions(req)) {
+    for (q, text) in req.questions.iter().zip(schema_questions(req, &[])) {
         schema.extend(tokens(&text.head));
         let q_start = schema.len();
         schema.extend(tokens(&text.instructions));
@@ -228,7 +253,7 @@ fn encode_inner(
                 what: "instructions",
             });
         }
-        schema.extend(tokens(OPTIONS_OPEN));
+        schema.extend(tokens(text.options_open));
         let mut option_spans = Vec::new();
         let mut option_ids = Vec::new();
         for opt in text.options {
