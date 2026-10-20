@@ -111,7 +111,10 @@ pub enum FaultSite {
     /// met an indexer key that is not finite after its f16 rounding
     /// (`q38::qsa_key_append`, the raw key), a pooled key or a head's score
     /// that is not finite, its top-k a refused live count, or its selected
-    /// flash a list entry at or past the cache.
+    /// flash a list entry at or past the cache. A block selector (MiniMax's
+    /// `msa`) raises it for a head's score that is not finite, a selection
+    /// that lost the query's own block, and its selected flash for a block
+    /// at or past the cache.
     PoolSelect = 18,
     /// A PLE site's gate or conv (`ple`) met a key, stream, gated value or
     /// conv input whose sum of squares, dot or value is not finite, or a

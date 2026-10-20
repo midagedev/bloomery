@@ -343,7 +343,8 @@ pub fn f32x2_to_f16x2_bits(lo: f32, hi: f32) -> u32 {
 /// `cores::half_to_f32`'s value for every finite and infinite input — one
 /// instruction instead of a decode whose subnormal branch is a loop.
 #[inline(always)]
-pub(crate) fn half_bits_to_f32(bits: u16) -> f32 {
+#[must_use]
+pub fn half_bits_to_f32(bits: u16) -> f32 {
     cvt_f32_f16x2_lo(bits as u32)
 }
 
