@@ -12,6 +12,7 @@ mod bpe;
 mod collapse_table;
 mod decode;
 mod encoder;
+mod guard;
 mod merge;
 mod pretok;
 mod spelling;
@@ -19,6 +20,7 @@ mod spm;
 mod unicode;
 mod vocab;
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use memchr::memmem::Finder;
@@ -89,6 +91,15 @@ fn names<T>(table: &[(&str, T)]) -> String {
     names.join(", ")
 }
 
+/// Whether one of the ascending `cuts` lies in `start..=end`: a cut stands beside the spelling it
+/// guards, and a match that holds the byte before it or the byte after it is that spelling or
+/// overlaps it. A cut is never at the start or the end of the client text it is in, where a token
+/// the template wrote would be beside it.
+fn spans_cut(cuts: &[usize], start: usize, end: usize) -> bool {
+    cuts.get(cuts.partition_point(|&c| c < start))
+        .is_some_and(|&c| c <= end)
+}
+
 /// A loaded vocabulary with its encoder and decoder tables.
 pub struct Tokenizer {
     vocab: Vocab,
@@ -96,6 +107,8 @@ pub struct Tokenizer {
     /// Partition order: longest text first.
     specials: Vec<u32>,
     finders: Vec<Finder<'static>>,
+    /// The special tokens' spellings, as [`Tokenizer::guard`] searches them.
+    spellings: guard::Spellings,
     pieces: Vec<Box<[u8]>>,
 }
 
@@ -118,6 +131,8 @@ impl Tokenizer {
             .iter()
             .map(|&id| Finder::new(vocab.texts[id as usize].as_bytes()).into_owned())
             .collect();
+        let spellings =
+            guard::Spellings::new(specials.iter().map(|&id| vocab.texts[id as usize].as_str()));
         let pieces = decode::pieces(&vocab.texts, &vocab.attrs, spelling);
         if let Some(texts) = hf_texts {
             decode::check_hf(&texts, &vocab.attrs, &pieces)?;
@@ -127,6 +142,7 @@ impl Tokenizer {
             encoder,
             specials,
             finders,
+            spellings,
             pieces,
         })
     }
@@ -147,7 +163,79 @@ impl Tokenizer {
         add_special: bool,
         parse_special: bool,
     ) -> Vec<u32> {
-        let text = text.as_ref();
+        self.encode_cut(text.as_ref(), &[], add_special, parse_special)
+    }
+
+    /// [`Tokenizer::encode`] of a text that carries `mark`s: each occurrence of the non-empty `mark`
+    /// is removed from the text, and no special token matches that holds the place one stood or
+    /// the byte on either side of it. The text between the marks is one text to the BPE, as if
+    /// the marks were not there, so the ids of a text with no mark are `encode`'s exactly.
+    /// [`Tokenizer::guard`] puts the marks beside the spellings of special tokens that are plain
+    /// text, and a mark any other way is cut out all the same.
+    ///
+    /// # Panics
+    ///
+    /// On an empty `mark`, and as [`Tokenizer::encode`] does.
+    pub fn encode_marked(
+        &self,
+        text: &str,
+        mark: &str,
+        add_special: bool,
+        parse_special: bool,
+    ) -> Vec<u32> {
+        assert!(!mark.is_empty(), "encode_marked: the mark is empty");
+        let mut clean = String::with_capacity(text.len());
+        let mut cuts = Vec::new();
+        for (i, piece) in text.split(mark).enumerate() {
+            if i > 0 {
+                cuts.push(clean.len());
+            }
+            clean.push_str(piece);
+        }
+        self.encode_cut(clean.as_bytes(), &cuts, add_special, parse_special)
+    }
+
+    /// `text` with `mark` spliced in beside every spelling of a special token it carries, and beside
+    /// the beginning or the end of one it ends or starts with, which what a template writes next to
+    /// the text could finish: before the spelling, after it when it starts the text (so a template's
+    /// `startswith` and `endswith` of a spelling see it where it was), and after the text's first
+    /// character when the text is no more than the spelling. The text with the marks cut out is
+    /// `text`, and no special token matches over a mark ([`Tokenizer::encode_marked`]). A spelling
+    /// of one character is left alone, which no mark could be beside without changing what the text
+    /// starts or ends with. What this finds is what `parse_special = true` would turn into a
+    /// token, CONTROL, USER_DEFINED and UNKNOWN alike; the text comes back borrowed when it carries
+    /// none. Spellings that overlap are each marked. What a template builds from its own pieces
+    /// around the text (`'<' ~ name ~ '>'`) is not found: no part of the text is a spelling.
+    ///
+    /// # Panics
+    ///
+    /// On an empty `mark`.
+    pub fn guard<'a>(&self, text: &'a str, mark: &str) -> Cow<'a, str> {
+        assert!(!mark.is_empty(), "guard: the mark is empty");
+        let at = self.spellings.cuts(text);
+        if at.is_empty() {
+            return Cow::Borrowed(text);
+        }
+        let mut out = String::with_capacity(text.len() + at.len() * mark.len());
+        let mut last = 0;
+        for cut in at {
+            out.push_str(&text[last..cut]);
+            out.push_str(mark);
+            last = cut;
+        }
+        out.push_str(&text[last..]);
+        Cow::Owned(out)
+    }
+
+    /// The body of [`Tokenizer::encode`]: `cuts` are ascending byte offsets in `text` that no
+    /// special token's match may span.
+    fn encode_cut(
+        &self,
+        text: &[u8],
+        cuts: &[usize],
+        add_special: bool,
+        parse_special: bool,
+    ) -> Vec<u32> {
         let mut out = Vec::with_capacity(text.len() / 3 + 2);
         if add_special
             && self.vocab.add_bos
@@ -157,7 +245,7 @@ impl Tokenizer {
         }
 
         let mut scratch = encoder::Scratch::default();
-        for frag in self.partition(text, parse_special) {
+        for frag in self.partition(text, cuts, parse_special) {
             match frag {
                 Frag::Token(id) => out.push(id),
                 Frag::Text { start, len } => {
@@ -181,8 +269,10 @@ impl Tokenizer {
     }
 
     /// `tokenizer_st_partition`: for each special token in order, cut every
-    /// occurrence out of every text fragment still unsplit.
-    fn partition(&self, text: &[u8], parse_special: bool) -> Vec<Frag> {
+    /// occurrence out of every text fragment still unsplit. An occurrence that
+    /// reaches one of the ascending `cuts` ([`spans_cut`]) is not one: the
+    /// search goes on from the next byte.
+    fn partition(&self, text: &[u8], cuts: &[usize], parse_special: bool) -> Vec<Frag> {
         let mut frags = Vec::new();
         if text.is_empty() {
             return frags;
@@ -207,14 +297,25 @@ impl Tokenizer {
                     continue;
                 };
                 let end = start + len;
+                // `at` starts the text not yet pushed, `from` the search.
                 let mut at = start;
-                while let Some(m) = finder.find(&text[at..end]) {
+                let mut from = start;
+                while let Some(m) = finder.find(&text[from..end]) {
+                    let found = from + m;
+                    if spans_cut(cuts, found, found + tlen) {
+                        from = found + 1;
+                        continue;
+                    }
                     changed = true;
-                    if m > 0 {
-                        next.push(Frag::Text { start: at, len: m });
+                    if found > at {
+                        next.push(Frag::Text {
+                            start: at,
+                            len: found - at,
+                        });
                     }
                     next.push(Frag::Token(id));
-                    at += m + tlen;
+                    at = found + tlen;
+                    from = at;
                 }
                 if at < end {
                     next.push(Frag::Text {
@@ -1058,5 +1159,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod guard_tests;
 #[cfg(test)]
 mod spm_tests;
