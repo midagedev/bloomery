@@ -10,7 +10,9 @@
 //! K-quants.
 //!
 //! A routed block runs around its host leg; the card computes the experts the
-//! slot map puts on it ([`bloomery_gpu::card_experts`]), the host tier the rest:
+//! slot map puts on it ([`bloomery_gpu::card_experts`]), the host tier the rest.
+//! The three parts are the common routed block's ([`bloomery_gpu::routed_block`])
+//! over MiMo's router instance and names:
 //! - [`front`]: `ffn_norm` RMS into the boundary's handoff region, the
 //!   sigmoid router over 256 experts with the selection bias (top 8, the
 //!   weights from the unbiased scores, normalized and scaled), the handoff
@@ -31,15 +33,12 @@
 
 use std::ops::Range;
 
-use bloomery_gpu::card_experts::Io;
-use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::{Boundary, Hybrid};
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockKernels, enqueue_block};
-use bloomery_gpu_deepseek41::router::mimo2::N_EXPERT;
 use cuda_core::DeviceBuffer;
 use model::ModelError;
 use model::arch::mimo2::host;
@@ -155,46 +154,8 @@ pub(crate) fn front(
     hybrid: &mut Hybrid<HostRun>,
     l: usize,
 ) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    let (d, c) = (*p.d, p.cfg[l]);
-    let fault = gpu.layer_sink(l)?;
-    let FfnNames::Moe { norm, router, bias } = &p.names[l].ffn else {
-        return Err(other_kind("routed block", l));
-    };
     let s = &mut *p.s;
-    gpu.elem().enqueue_rms_norm(
-        stream,
-        &s.x1,
-        w.f32_buf(WHAT, norm)?,
-        d.rms_eps,
-        d.embd,
-        1,
-        hybrid.boundary_mut().normed_mut(),
-    )?;
-    let bias = match bias {
-        Some(name) => w.f32_buf(WHAT, name)?,
-        None => &s.no_bias,
-    };
-    p.k.router.enqueue_router(
-        stream,
-        w.f32_tensor(WHAT, router)?,
-        hybrid.boundary().normed(),
-        bias,
-        d.scale,
-        &mut s.rout,
-        fault,
-    )?;
-    let h = Handoff {
-        ids: &s.rout.ids,
-        weights: &s.rout.weights,
-        map: p.slots.buf(),
-        row_off: c.row_off,
-        n_expert: N_EXPERT,
-    };
-    let target = hybrid.boundary_mut().handoff_target_of(0)?;
-    p.k.handoff
-        .enqueue_handoff(stream, &h, target, fault, &mut s.sel)?;
-    hybrid.boundary().enqueue_go_of(stream, l, 0)
+    p.routed.front((gpu, w), &mut s.route, &s.x1, (hybrid, l))
 }
 
 /// Enqueue layer `l`'s card experts, when it has any, in its host leg's
@@ -206,20 +167,12 @@ pub(crate) fn shadow(
     boundary: &Boundary,
     l: usize,
 ) -> Result<(), GpuError> {
-    if !p.card.has(l) {
-        return Ok(());
-    }
     let rule = Act::SwigluClamp {
         limit: p.cfg[l].ffn.limit,
     };
     let s = &*p.s;
-    let io = Io {
-        normed: boundary.normed(),
-        weights: &s.rout.weights,
-        x1: &s.x1,
-        m: 1,
-    };
-    p.card.enqueue_step(gpu, w, l, rule, &io, &s.sel)
+    p.routed
+        .shadow((gpu, w), p.card, &s.route, (boundary, l), (&s.x1, rule))
 }
 
 /// Enqueue layer `l`'s wait and the add of the host's routed sum to the
@@ -233,14 +186,9 @@ pub(crate) fn back(
     l: usize,
     dest: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    let boundary = hybrid.boundary();
     let s = &mut *p.s;
-    boundary.enqueue_back_of(stream, 0, l)?;
-    let shadowed = if p.card.has(l) { p.card.pre() } else { &s.x1 };
     let dest = dest.unwrap_or(&mut s.x);
-    gpu.elem()
-        .enqueue_add(stream, boundary.hsum_of(0)?, shadowed, p.d.embd, dest)
+    p.routed.back(gpu, hybrid, p.card, l, (&s.x1, dest))
 }
 
 /// The host views of the routed layers `run`, each from [`host::layer`]; a

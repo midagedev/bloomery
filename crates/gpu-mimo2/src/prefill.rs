@@ -53,7 +53,7 @@
 
 use std::ops::Range;
 
-use bloomery_gpu::card_experts::{CardBatch, CardExperts, Io};
+use bloomery_gpu::card_experts::{CardBatch, CardExperts};
 use bloomery_gpu::flash_gqa::{GqaK192Args, HEAD, HEAD_K192, window_segments};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
@@ -62,10 +62,11 @@ use bloomery_gpu::host::served::{prompt_pass, read_fault, refuse_steps_feed};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::rope_neox::K192Args;
+use bloomery_gpu::routed_block::{RouteBlock, RoutedRows};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
+use bloomery_gpu::{COL_GROUP, Gpu, GpuError};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockKernels, enqueue_block_cols};
-use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED};
+use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED, RouterKernels};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
 use model::moe::UNION_MAX_COLS;
@@ -661,11 +662,10 @@ impl Body {
                 names,
                 dims,
                 k,
-                s,
                 card,
                 stores,
                 ropes,
-                slots,
+                routed,
                 embd,
                 prompt,
                 ctx,
@@ -729,10 +729,9 @@ impl Body {
                 names,
                 stores,
                 ropes,
-                slots,
+                routed,
                 card,
                 card_batch: card_batch.as_mut(),
-                no_bias: &s.no_bias,
                 ctx: *ctx,
                 b: bufs,
                 u: &mut units[..g],
@@ -771,14 +770,12 @@ struct PromptProgram<'a> {
     names: &'a [LayerNames],
     stores: &'a mut [Store],
     ropes: &'a [RopeBase],
-    /// The slot map's card copy: each routed layer's row of places.
-    slots: &'a DeviceTensor<u32>,
+    /// The routed layers' router, handoff and slot-map rows.
+    routed: &'a RouteBlock<RouterKernels>,
     /// The card's routed experts and the batch's buffers they run in, on a
     /// load with card experts.
     card: &'a CardExperts,
     card_batch: Option<&'a mut CardBatch>,
-    /// The zero selection bias of a router the file gives none.
-    no_bias: &'a DeviceBuffer<f32>,
     ctx: usize,
     b: &'a mut Bufs,
     u: &'a mut [UnitBufs],
@@ -939,73 +936,17 @@ impl PromptProgram<'_> {
     fn route(&mut self, port: &mut BatchLeg<'_, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let (gpu, w, t) = (self.gpu, self.w, self.t[at.unit]);
-        let stream = gpu.stream();
-        let d = *self.d;
-        let fault = gpu.layer_sink(l)?;
-        let FfnNames::Moe { norm, router, bias } = &self.names[l].ffn else {
-            return Err(other_kind(l));
-        };
         let (b, ub) = (&mut *self.b, &self.u[at.unit]);
-        gpu.elem().enqueue_rms_norm(
-            stream,
-            &ub.x1,
-            w.f32_buf(WHAT, norm)?,
-            d.rms_eps,
-            d.embd,
-            t,
-            &mut b.normed,
-        )?;
-        let bias = match bias {
-            Some(name) => w.f32_buf(WHAT, name)?,
-            None => self.no_bias,
+        let rows = RoutedRows {
+            probs: &mut b.probs,
+            ids: &mut b.ids,
+            weights: &mut b.weights,
         };
-        self.k.router.enqueue_router_rows(
-            stream,
-            gpu,
-            &self.k.g32,
-            w.f32_tensor(WHAT, router)?,
-            &b.normed,
-            bias,
-            d.scale,
-            t,
-            &mut b.probs,
-            &mut b.ids,
-            &mut b.weights,
-            fault,
-        )?;
+        self.routed
+            .route_rows((gpu, w), (l, t), &ub.x1, (&mut b.normed, rows))?;
         let key = port.key(at);
         port.hybrid()
-            .enqueue_download(stream, [&b.normed, &b.weights], &b.ids, key)
-    }
-
-    /// Layer `l`'s card experts over unit `u`'s batch (`CardExperts::
-    /// enqueue_rows`) under its host leg: the batch's normed rows and routing
-    /// as `route` wrote them, into the card's sum plus the unit's `x1`.
-    fn card_experts(&mut self, l: usize, u: usize) -> Result<(), GpuError> {
-        let (gpu, w, t) = (self.gpu, self.w, self.t[u]);
-        let (b, ub) = (&*self.b, &self.u[u]);
-        let cb = self.card_batch.as_deref_mut().ok_or(GpuError::State {
-            what: WHAT,
-            missing: "the card experts' batch buffers",
-        })?;
-        let rule = Act::SwigluClamp {
-            limit: self.cfg[l].ffn.limit,
-        };
-        let io = Io {
-            normed: &b.normed,
-            weights: &b.weights,
-            x1: &ub.x1,
-            m: t,
-        };
-        self.card.enqueue_rows(
-            gpu,
-            w,
-            cb,
-            l,
-            rule,
-            &io,
-            (&b.ids, self.slots, self.cfg[l].row_off),
-        )
+            .enqueue_download(gpu.stream(), [&b.normed, &b.weights], &b.ids, key)
     }
 
     /// After the last layer: the group's last unit's last token's output
@@ -1054,10 +995,19 @@ impl<'a> LayerProgram for PromptProgram<'a> {
     /// A routed layer's card experts, where the slot map puts any, under its
     /// host leg.
     fn shadow(&mut self, _port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        if !self.card.has(at.layer) {
-            return Ok(());
-        }
-        self.card_experts(at.layer, at.unit)
+        let (l, u) = (at.layer, at.unit);
+        let (gpu, w, t) = (self.gpu, self.w, self.t[u]);
+        let (b, ub) = (&*self.b, &self.u[u]);
+        let rule = Act::SwigluClamp {
+            limit: self.cfg[l].ffn.limit,
+        };
+        self.routed.card_rows(
+            (gpu, w),
+            (self.card, self.card_batch.as_deref_mut()),
+            (l, t),
+            (&ub.x1, rule),
+            (&b.normed, &b.weights, &b.ids),
+        )
     }
 
     /// A routed layer's host sums (the walk's serve uploaded them) plus the

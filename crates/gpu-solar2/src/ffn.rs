@@ -7,16 +7,16 @@
 //! unit of [`GATED_FROM`] rows or more, which its GEMMs write.
 //!
 //! Every layer is a routed layer with one shared expert, so the block has no
-//! dense arm. Its parts around the host leg:
+//! dense arm. The router, the handoff, the go, the card experts' call and the
+//! wait and add around the host leg are the common routed block
+//! ([`bloomery_gpu::routed_block`]); this file holds the shared expert and the
+//! base the card sum is added to. Its parts around the host leg:
 //! - the front: `ffn_norm` RMS of the rows of the residual after the mixer
 //!   `x1`, and the router over them: the scores, the selection bias (the
 //!   choice only), the top 8, the weights from the unbiased scores
-//!   normalized and scaled. One row is `enqueue_router`, a unit's rows are
-//!   `enqueue_router_rows`, which writes what that many one-row launches
-//!   write. The step goes on to the handoff into the host-mapped image (each
-//!   slot's place in the card's stacks, or the host mark, from the layer's
-//!   slot-map row) and the go; four launches. The batch downloads the rows,
-//!   weights and ids to the host ([`Routed::download`]).
+//!   normalized and scaled. The step goes on to the handoff into the
+//!   host-mapped image and the go; four launches. The batch downloads the
+//!   rows, weights and ids to the host ([`Routed::download`]).
 //! - the shadow: while the host computes, the shared expert, its output
 //!   summed into `x1` (`x1s`), then the card experts the slot map puts on the
 //!   card with `x1s` as the base their sum is added to; none of the latter on
@@ -33,12 +33,12 @@
 
 use std::sync::Arc;
 
-use bloomery_gpu::card_experts::{CardBatch, CardExperts, CardFamily, Io};
+use bloomery_gpu::card_experts::{CardBatch, CardExperts, CardFamily};
 use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
-use bloomery_gpu::host::handoff::{Handoff, HandoffKernels};
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::{BatchKey, Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::Act;
+use bloomery_gpu::routed_block::{RouteBlock, RouteBufs, RouteDims, RouteLayer, RoutedRows};
 use bloomery_gpu::site::{self, Gated, GatedIo, SiteTy, SiteWeight, WideActs, WideKernels};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
@@ -47,7 +47,7 @@ use bloomery_gpu_deepseek41::block::{
     enqueue_block_cols,
 };
 use bloomery_gpu_deepseek41::experts::ExpertKernels;
-use bloomery_gpu_deepseek41::router::sigmoid_320_8::{N_EXPERT, N_USED, RouterKernels, RouterOut};
+use bloomery_gpu_deepseek41::router::sigmoid_320_8::{N_EXPERT, N_USED, RouterKernels};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -81,16 +81,11 @@ pub struct RoutedDims {
     pub batch_rows: usize,
 }
 
-/// One layer's tensors, named once at load, its shared expert's plan and its
-/// row in the slot map's card copy.
+/// One layer's shared expert: its tensors, named once at load, and its plan.
 struct LayerFfn {
-    norm: String,
-    router: String,
-    bias: String,
     /// The shared expert's gate, up and down.
     shared: [String; 3],
     plan: BlockPlan,
-    row_off: usize,
 }
 
 impl LayerFfn {
@@ -101,9 +96,9 @@ impl LayerFfn {
 
     /// Layer `l`'s tensors of a shared expert `ff` wide over `embd` values,
     /// the block plan read from the file's header and checked against the
-    /// resident weights, and its row in `map`.
+    /// resident weights.
     fn load(
-        (file, w, map): (&Split, &Weights, &SlotMap),
+        (file, w): (&Split, &Weights),
         l: usize,
         (ff, embd): (usize, usize),
     ) -> Result<LayerFfn, GpuError> {
@@ -115,29 +110,28 @@ impl LayerFfn {
         let tensors = shared.each_ref().map(String::as_str);
         let plan = BlockPlan::of_file(file, WHAT, tensors, (ff, embd))?;
         plan.check_resident(w, WHAT, tensors, (ff, embd))?;
-        let row_off = map
-            .row_offset(l)
-            .ok_or_else(|| GpuError::shape(WHAT, format!("layer {l}: no row in the slot map")))?;
-        let layer = LayerFfn {
-            norm: names::ffn_norm(l),
-            router: names::ffn_gate_inp(l),
-            bias: names::exp_probs_b(l),
-            shared,
-            plan,
-            row_off,
-        };
-        w.f32_buf(WHAT, &layer.norm)?;
-        w.f32_buf(WHAT, &layer.bias)?;
-        w.f32_tensor(WHAT, &layer.router)?;
-        Ok(layer)
+        Ok(LayerFfn { shared, plan })
     }
 }
 
-/// The kernels the routed block launches beyond the card experts' own.
+/// Layer `l`'s routed block for the common one: its norm, router and bias
+/// tensors (every layer has a bias) and its row in `map`.
+fn route_layer(map: &SlotMap, l: usize) -> Result<RouteLayer, GpuError> {
+    let row_off = map
+        .row_offset(l)
+        .ok_or_else(|| GpuError::shape(WHAT, format!("layer {l}: no row in the slot map")))?;
+    Ok(RouteLayer {
+        norm: names::ffn_norm(l),
+        router: names::ffn_gate_inp(l),
+        bias: Some(names::exp_probs_b(l)),
+        row_off,
+    })
+}
+
+/// The kernels the routed block launches beyond the common block's and the
+/// card experts' own.
 struct Kernels {
-    router: RouterKernels,
-    handoff: HandoffKernels,
-    /// The router's scores over a batch's rows run on the F32 tile GEMM.
+    /// The shared expert's wide quantize of a batch's rows.
     g32: Gemm32Kernels,
     /// The shared expert's pair.
     experts: ExpertKernels,
@@ -145,11 +139,10 @@ struct Kernels {
     block: Option<KBlockKernels>,
 }
 
-/// The step's buffers: the router's outputs, each slot's place, and the
+/// The step's buffers: the router's outputs and each slot's place, and the
 /// shared expert's output and the shadow's base.
 struct StepBufs {
-    rout: RouterOut,
-    sel: DeviceBuffer<u32>,
+    route: RouteBufs<RouterKernels>,
     sh_y: DeviceBuffer<f32>,
     x1s: DeviceBuffer<f32>,
 }
@@ -324,17 +317,16 @@ impl BatchBufs {
     }
 }
 
-/// The routed blocks of every layer: names and plans, the kernels, the card
-/// experts, and the step's and the batch's buffers.
+/// The routed blocks of every layer: the common block, the shared experts'
+/// plans, the kernels, the card experts, and the step's and the batch's
+/// buffers.
 pub struct Routed {
     d: RoutedDims,
     layers: Vec<LayerFfn>,
     k: Kernels,
+    /// The router, the handoff and the layers' tensors and slot-map rows.
+    route: RouteBlock<RouterKernels>,
     card: CardExperts,
-    /// The slot map's card copy, which the body's residency machine moves.
-    slots: Arc<DeviceTensor<u32>>,
-    /// `expert_weights_scale`.
-    scale: f32,
     /// The routed experts' and the shared expert's SwiGLU limits (0: plain).
     limits: (f32, f32),
     /// The shared expert's width.
@@ -466,13 +458,20 @@ impl Routed {
     ) -> Result<Routed, GpuError> {
         let desc = describe(layers)?;
         let per = (0..layers.len())
-            .map(|l| LayerFfn::load((file, w, map), l, (desc.shared_ff, d.embd)))
+            .map(|l| LayerFfn::load((file, w), l, (desc.shared_ff, d.embd)))
             .collect::<Result<Vec<_>, _>>()?;
+        let routes = (0..layers.len())
+            .map(|l| route_layer(map, l).map(Some))
+            .collect::<Result<Vec<_>, _>>()?;
+        let route_dims = RouteDims {
+            embd: d.embd,
+            rms_eps: d.rms_eps,
+            scale: desc.scale,
+        };
+        let route = RouteBlock::new(gpu, w, WHAT, (routes, slots), route_dims)?;
         let ctx = gpu.context();
         let stream = gpu.stream();
         let k = Kernels {
-            router: RouterKernels::load(ctx)?,
-            handoff: HandoffKernels::load(ctx)?,
             g32: Gemm32Kernels::load(ctx)?,
             experts: ExpertKernels::load(ctx)?,
             block: per
@@ -490,16 +489,14 @@ impl Routed {
         Ok(Routed {
             layers: per,
             k,
+            route,
             card,
-            slots: Arc::clone(slots),
-            scale: desc.scale,
             limits: desc.limits,
             shared_ff: desc.shared_ff,
             h: DeviceBuffer::zeroed(stream, desc.shared_ff)?,
             block,
             step: StepBufs {
-                rout: RouterOut::new(stream)?,
-                sel: DeviceBuffer::zeroed(stream, N_USED)?,
+                route: RouteBufs::new(stream, 1)?,
                 sh_y: DeviceBuffer::zeroed(stream, d.embd)?,
                 x1s: DeviceBuffer::zeroed(stream, d.embd)?,
             },
@@ -516,7 +513,8 @@ impl Routed {
             + self.block.as_ref().map_or(0, BlockScratch::bytes)
             + self.k.block.as_ref().map_or(0, KBlockKernels::device_bytes)
             + self.h.num_bytes()
-            + self.step.sel.num_bytes()
+            + self.route.bytes()
+            + self.step.route.bytes()
             + self.step.sh_y.num_bytes()
             + self.step.x1s.num_bytes()
     }
@@ -528,81 +526,11 @@ impl Routed {
     }
 }
 
-/// Layer `l`'s names and plan, or a named refusal.
+/// Layer `l`'s shared expert, or a named refusal.
 fn layer_of(layers: &[LayerFfn], l: usize) -> Result<&LayerFfn, GpuError> {
     layers
         .get(l)
         .ok_or_else(|| GpuError::shape(WHAT, format!("layer {l} of a program of {}", layers.len())))
-}
-
-/// Where the router leaves its picks: one row's in a [`RouterOut`], or a
-/// unit's rows' in the batch's buffers.
-enum RouteOut<'a> {
-    One(&'a mut RouterOut),
-    Rows {
-        probs: &'a mut DeviceBuffer<f32>,
-        ids: &'a mut DeviceBuffer<u32>,
-        weights: &'a mut DeviceBuffer<f32>,
-    },
-}
-
-/// What the norm and the router read besides their buffers.
-struct RouterCx<'a> {
-    layers: &'a [LayerFfn],
-    k: &'a Kernels,
-    scale: f32,
-    d: RoutedDims,
-}
-
-impl RouterCx<'_> {
-    /// Layer `l`'s `ffn_norm` of `m` rows of `x1` into `normed`, and the
-    /// router over them into `out`.
-    fn route(
-        &self,
-        (gpu, w): (&Gpu, &Weights),
-        (l, m): (usize, usize),
-        (x1, normed): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
-        out: RouteOut<'_>,
-    ) -> Result<(), GpuError> {
-        let layer = layer_of(self.layers, l)?;
-        let stream = gpu.stream();
-        let fault = gpu.layer_sink(l)?;
-        gpu.elem().enqueue_rms_norm(
-            stream,
-            x1,
-            w.f32_buf(WHAT, &layer.norm)?,
-            self.d.rms_eps,
-            self.d.embd,
-            m,
-            normed,
-        )?;
-        let weight = w.f32_tensor(WHAT, &layer.router)?;
-        let bias = w.f32_buf(WHAT, &layer.bias)?;
-        match out {
-            RouteOut::One(rout) => self
-                .k
-                .router
-                .enqueue_router(stream, weight, normed, bias, self.scale, rout, fault),
-            RouteOut::Rows {
-                probs,
-                ids,
-                weights,
-            } => self.k.router.enqueue_router_rows(
-                stream,
-                gpu,
-                &self.k.g32,
-                weight,
-                normed,
-                bias,
-                self.scale,
-                m,
-                probs,
-                ids,
-                weights,
-                fault,
-            ),
-        }
-    }
 }
 
 /// Enqueue layer `l`'s routed block of the step up to its go (module doc):
@@ -615,31 +543,7 @@ pub fn front(
     x1: &DeviceBuffer<f32>,
     (hybrid, l): (&mut Hybrid<HostRun>, usize),
 ) -> Result<(), GpuError> {
-    let rt = RouterCx {
-        layers: &r.layers,
-        k: &r.k,
-        scale: r.scale,
-        d: r.d,
-    };
-    let normed = hybrid.boundary_mut().normed_mut();
-    rt.route(
-        (gpu, w),
-        (l, 1),
-        (x1, normed),
-        RouteOut::One(&mut r.step.rout),
-    )?;
-    let stream = gpu.stream();
-    let h = Handoff {
-        ids: &r.step.rout.ids,
-        weights: &r.step.rout.weights,
-        map: r.slots.buf(),
-        row_off: layer_of(&r.layers, l)?.row_off,
-        n_expert: N_EXPERT,
-    };
-    let target = hybrid.boundary_mut().handoff_target_of(0)?;
-    r.k.handoff
-        .enqueue_handoff(stream, &h, target, gpu.layer_sink(l)?, &mut r.step.sel)?;
-    hybrid.boundary().enqueue_go_of(stream, l, 0)
+    r.route.front((gpu, w), &mut r.step.route, x1, (hybrid, l))
 }
 
 /// The shared expert's launch of layer `l`: the kernels and the block, whose
@@ -685,17 +589,14 @@ pub fn shadow(
     enqueue_block(gpu, w, &kernels, &mut r.block, &blk, io)?;
     gpu.elem()
         .enqueue_add(stream, x1, &r.step.sh_y, r.d.embd, &mut r.step.x1s)?;
-    if !r.card.has(l) {
-        return Ok(());
-    }
-    let io = Io {
-        normed: boundary.normed(),
-        weights: &r.step.rout.weights,
-        x1: &r.step.x1s,
-        m: 1,
-    };
     let rule = Act::SwigluClamp { limit: r.limits.0 };
-    r.card.enqueue_step(gpu, w, l, rule, &io, &r.step.sel)
+    r.route.shadow(
+        (gpu, w),
+        &mut r.card,
+        &r.step.route,
+        (boundary, l),
+        (&r.step.x1s, rule),
+    )
 }
 
 /// Enqueue layer `l`'s wait and the add of the host's routed sum to the
@@ -707,16 +608,7 @@ pub fn back(
     l: usize,
     dest: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    let boundary = hybrid.boundary();
-    boundary.enqueue_back_of(stream, 0, l)?;
-    let shadowed = if r.card.has(l) {
-        r.card.pre()
-    } else {
-        &r.step.x1s
-    };
-    gpu.elem()
-        .enqueue_add(stream, boundary.hsum_of(0)?, shadowed, r.d.embd, dest)
+    r.route.back(gpu, hybrid, &r.card, l, (&r.step.x1s, dest))
 }
 
 /// The batch: the parts of a unit of `m` rows, the step's launches over its
@@ -732,20 +624,15 @@ impl Routed {
         (l, m): (usize, usize),
         x1: &DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let rt = RouterCx {
-            layers: &self.layers,
-            k: &self.k,
-            scale: self.scale,
-            d: self.d,
-        };
         let b = self.batch.as_mut().ok_or_else(no_batch)?;
         b.check(l, m)?;
-        let out = RouteOut::Rows {
+        let rows = RoutedRows {
             probs: &mut b.probs,
             ids: &mut b.ids,
             weights: &mut b.weights,
         };
-        rt.route((gpu, w), (l, m), (x1, &mut b.normed), out)
+        self.route
+            .route_rows((gpu, w), (l, m), x1, (&mut b.normed, rows))
     }
 
     /// The copies of [`Routed::front_rows`]'s normed rows, weights and ids to
@@ -774,8 +661,8 @@ impl Routed {
         let Routed {
             layers,
             k,
+            route,
             card,
-            slots,
             limits,
             shared_ff,
             h,
@@ -807,21 +694,14 @@ impl Routed {
         }
         gpu.elem()
             .enqueue_add(gpu.stream(), x1, &b.sh, m * n, &mut b.x1s)?;
-        if !card.has(l) {
-            return Ok(());
-        }
-        let cb = b.card.as_mut().ok_or(GpuError::State {
-            what: WHAT,
-            missing: "the batch's card experts' buffers",
-        })?;
-        let io = Io {
-            normed: &b.normed,
-            weights: &b.weights,
-            x1: &b.x1s,
-            m,
-        };
         let rule = Act::SwigluClamp { limit: limits.0 };
-        card.enqueue_rows(gpu, w, cb, l, rule, &io, (&b.ids, slots, layer.row_off))
+        route.card_rows(
+            (gpu, w),
+            (card, b.card.as_mut()),
+            (l, m),
+            (&b.x1s, rule),
+            (&b.normed, &b.weights, &b.ids),
+        )
     }
 
     /// `x = hsum +` the shadow's rows (the card sum plus `x1s`, or `x1s` on a

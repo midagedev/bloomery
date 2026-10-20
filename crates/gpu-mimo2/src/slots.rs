@@ -38,10 +38,11 @@ use bloomery_gpu::hybrid::{Chain, HandoffTarget};
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::model::{ChainBody, RowHeads, SlotRange, SlotRows};
 use bloomery_gpu::rope_neox::K192Args;
+use bloomery_gpu::routed_block::{RouteBlock, RoutedRows};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
+use bloomery_gpu::{COL_GROUP, Gpu, GpuError};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockKernels, BlockPlan, enqueue_block_cols};
-use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED};
+use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED, RouterKernels};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::mimo2::program as facts;
@@ -377,7 +378,7 @@ impl Body {
                 card,
                 stores,
                 ropes,
-                slots,
+                routed,
                 ctx,
                 ..
             } = self;
@@ -413,7 +414,7 @@ impl Body {
                 b,
                 card,
                 ropes,
-                slots,
+                routed,
                 ctx: *ctx,
                 seqs,
                 head,
@@ -484,7 +485,7 @@ struct PassProgram<'s> {
     b: &'s mut PassBufs,
     card: &'s mut CardExperts,
     ropes: &'s [RopeBase],
-    slots: &'s DeviceTensor<u32>,
+    routed: &'s RouteBlock<RouterKernels>,
     ctx: usize,
     seqs: Vec<SlotStores<'s>>,
     head: &'s mut Head,
@@ -674,13 +675,8 @@ impl<'s> PassProgram<'s> {
         const W: &str = "mimo2 pass route";
         let (gpu, w, m) = (self.gpu, self.w, self.m);
         let stream = gpu.stream();
-        let (d, c) = (*self.d, self.cfg[l]);
+        let d = *self.d;
         let fault = gpu.layer_sink(l)?;
-        let FfnNames::Moe { norm, router, bias } = &self.names[l].ffn else {
-            return Err(shape(format!(
-                "layer {l}: the names of another block kind than the routed block"
-            )));
-        };
         let PassBufs {
             s,
             normed,
@@ -689,44 +685,25 @@ impl<'s> PassProgram<'s> {
             weights,
             ..
         } = &mut *self.b;
-        gpu.elem().enqueue_rms_norm(
-            stream,
-            &s.x1,
-            w.f32_buf(WHAT, norm)?,
-            d.rms_eps,
-            d.embd,
-            m,
-            normed,
-        )?;
-        let bias = match bias {
-            Some(name) => w.f32_buf(WHAT, name)?,
-            None => &s.no_bias,
-        };
-        self.k.router.enqueue_router_rows(
-            stream,
-            gpu,
-            &self.k.g32,
-            w.f32_tensor(WHAT, router)?,
-            normed,
-            bias,
-            d.scale,
-            m,
+        let rows = RoutedRows {
             probs,
-            ids,
-            weights,
-            fault,
-        )?;
+            ids: &mut *ids,
+            weights: &mut *weights,
+        };
+        self.routed
+            .route_rows((gpu, w), (l, m), &s.x1, (&mut *normed, rows))?;
+        let side = self.routed.handoff_of(l)?;
         for col in 0..m {
             let col_ids = span(W, ids, col * N_USED, N_USED)?;
             let col_weights = span(W, weights, col * N_USED, N_USED)?;
             let x = span(W, normed, col * d.embd, d.embd)?;
-            let mut sel = span_mut(W, &mut s.sel, col * N_USED, N_USED)?;
+            let mut sel = span_mut(W, s.route.sel_mut(), col * N_USED, N_USED)?;
             let h = Handoff {
                 ids: &col_ids,
                 weights: &col_weights,
-                map: self.slots.buf(),
-                row_off: c.row_off,
-                n_expert: N_EXPERT,
+                map: side.map,
+                row_off: side.row_off,
+                n_expert: side.n_expert,
             };
             let t = port.hybrid().boundary_mut().handoff_target_of(0)?;
             let mut layout = t.layout;
@@ -739,8 +716,7 @@ impl<'s> PassProgram<'s> {
                 image: t.image,
                 layout,
             };
-            self.k
-                .handoff
+            side.kernels
                 .enqueue_handoff(stream, &h, target, fault, &mut sel)?;
         }
         port.hybrid().boundary().enqueue_go_of(stream, l, 0)
@@ -784,7 +760,8 @@ impl<'s> LayerProgram for PassProgram<'s> {
             x1: &b.s.x1,
             m,
         };
-        self.card.enqueue_pass(gpu, w, l, rule, &io, &b.s.sel)
+        self.card
+            .enqueue_pass(gpu, w, l, rule, &io, b.s.route.sel())
     }
 
     /// A routed layer's wait and the add of the host's sums to the shadow's,

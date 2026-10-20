@@ -735,6 +735,72 @@ macro_rules! sigmoid_router_instance {
                 Ok(())
             }
         }
+
+        /// The instance as the common routed block (`routed_block`) takes it:
+        /// its counts, its results' buffers and the two launches.
+        impl $crate::routed_block::RouterEntry for RouterKernels {
+            const N_EXPERT: usize = N_EXPERT;
+            const N_USED: usize = N_USED;
+            type Out = RouterOut;
+
+            fn load(ctx: &Arc<CudaContext>) -> Result<RouterKernels, GpuError> {
+                RouterKernels::load(ctx)
+            }
+
+            fn new_out(stream: &CudaStream) -> Result<RouterOut, GpuError> {
+                RouterOut::new(stream)
+            }
+
+            fn out_ids(out: &RouterOut) -> &DeviceBuffer<u32> {
+                &out.ids
+            }
+
+            fn out_weights(out: &RouterOut) -> &DeviceBuffer<f32> {
+                &out.weights
+            }
+
+            fn out_bytes(out: &RouterOut) -> usize {
+                out.logits.num_bytes()
+                    + out.probs.num_bytes()
+                    + out.ids.num_bytes()
+                    + out.weights.num_bytes()
+                    + out.done.num_bytes()
+            }
+
+            fn route(
+                &self,
+                stream: &CudaStream,
+                x: &DeviceBuffer<f32>,
+                r: &$crate::routed_block::RouteIn<'_>,
+                out: &mut RouterOut,
+            ) -> Result<(), GpuError> {
+                self.enqueue_router(stream, r.w, x, r.bias, r.scale, out, r.fault)
+            }
+
+            fn route_rows(
+                &self,
+                (stream, gpu, wide): (&CudaStream, &Gpu, &Gemm32Kernels),
+                x: &DeviceBuffer<f32>,
+                r: &$crate::routed_block::RouteIn<'_>,
+                t: usize,
+                rows: $crate::routed_block::RoutedRows<'_>,
+            ) -> Result<(), GpuError> {
+                self.enqueue_router_rows(
+                    stream,
+                    gpu,
+                    wide,
+                    r.w,
+                    x,
+                    r.bias,
+                    r.scale,
+                    t,
+                    rows.probs,
+                    rows.ids,
+                    rows.weights,
+                    r.fault,
+                )
+            }
+        }
         }
     };
 }

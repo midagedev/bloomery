@@ -85,6 +85,7 @@ pub mod rope_neox;
 pub mod rope_table;
 pub mod route_body;
 pub mod route_core;
+pub mod routed_block;
 pub mod router;
 pub mod site;
 pub(crate) mod tensor;

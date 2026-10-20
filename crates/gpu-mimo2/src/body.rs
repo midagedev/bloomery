@@ -38,7 +38,6 @@ use bloomery_gpu::card_experts::CardExperts;
 use bloomery_gpu::flash_gqa::{self, FlashGqaKernels, HEAD, HEAD_K192};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
-use bloomery_gpu::host::handoff::HandoffKernels;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
@@ -48,11 +47,12 @@ use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid
 use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Slots, StepMode, refuse_scratch_past};
 use bloomery_gpu::rope_neox::{ROT_K192, RopeNeoxKernels};
 use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
+use bloomery_gpu::routed_block::{RouteBlock, RouteBufs, RouteDims, RouteLayer};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::block::{BlockPlan, BlockScratch, KBlockKernels};
 use bloomery_gpu_deepseek41::experts::ExpertKernels;
-use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED, RouterKernels, RouterOut};
+use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED, RouterKernels};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -89,10 +89,6 @@ pub(crate) struct Kernels {
     pub experts: ExpertKernels,
     /// The K-quant dense block's kernels: `None` on a file whose dense block is q8_0.
     pub block: Option<KBlockKernels>,
-    pub router: RouterKernels,
-    pub handoff: HandoffKernels,
-    /// The wide F32 tile GEMM the router's scores run on.
-    pub g32: bloomery_gpu::gemm::Gemm32Kernels,
 }
 
 impl Kernels {
@@ -103,9 +99,6 @@ impl Kernels {
             flash: FlashGqaKernels::load(ctx)?,
             experts: ExpertKernels::load(ctx)?,
             block: k_block.then(|| KBlockKernels::load(gpu)).transpose()?,
-            router: RouterKernels::load(ctx)?,
-            handoff: HandoffKernels::load(ctx)?,
-            g32: bloomery_gpu::gemm::Gemm32Kernels::load(gpu.context())?,
         })
     }
 }
@@ -247,10 +240,8 @@ pub(crate) struct Scratch {
     pub h: DeviceBuffer<f32>,
     /// The K-quant dense block's buffers: `None` on a file whose dense block is q8_0.
     pub block: Option<BlockScratch>,
-    pub rout: RouterOut,
-    pub sel: DeviceBuffer<u32>,
-    /// The zero selection bias of a router the file gives none.
-    pub no_bias: DeviceBuffer<f32>,
+    /// The routed block's buffers: the router's results and each slot's place.
+    pub route: RouteBufs<RouterKernels>,
     /// The step's position, and its live key count (`pos + 1`).
     pub pos: DeviceBuffer<u32>,
     pub n_keys: DeviceBuffer<u32>,
@@ -283,9 +274,7 @@ impl Scratch {
             y: z(rows * d.heads * HEAD)?,
             h: z((rows * ff).max(1))?,
             block: BlockScratch::new(stream, d.embd, blocks)?,
-            rout: RouterOut::new(stream)?,
-            sel: DeviceBuffer::zeroed(stream, rows * N_USED)?,
-            no_bias: z(N_EXPERT)?,
+            route: RouteBufs::new(stream, rows)?,
             pos: DeviceBuffer::zeroed(stream, rows)?,
             n_keys: DeviceBuffer::zeroed(stream, rows)?,
         })
@@ -303,15 +292,10 @@ impl Scratch {
             &self.part_ms,
             &self.y,
             &self.h,
-            &self.no_bias,
-            &self.rout.logits,
-            &self.rout.probs,
-            &self.rout.weights,
         ];
         f.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.block.as_ref().map_or(0, BlockScratch::bytes)
-            + self.rout.ids.num_bytes()
-            + self.sel.num_bytes()
+            + self.route.bytes()
             + self.pos.num_bytes()
             + self.n_keys.num_bytes()
     }
@@ -382,6 +366,8 @@ pub struct Body {
     /// host copy, and the residency machine, when the load runs one, moves
     /// both.
     slots: Arc<DeviceTensor<u32>>,
+    /// The routed layers' router, handoff and tensors, over `slots`.
+    routed: RouteBlock<RouterKernels>,
     embd: Embedding,
     /// The position bound: a step at or past it is refused. A ring layer's
     /// store is shorter; this stays the bound of the rope table and of the
@@ -421,7 +407,7 @@ pub(crate) struct Parts<'s> {
     pub card: &'s mut CardExperts,
     pub stores: &'s mut [Store],
     pub ropes: &'s [RopeBase],
-    pub slots: &'s DeviceTensor<u32>,
+    pub routed: &'s RouteBlock<RouterKernels>,
     pub taps: Option<&'s mut [DeviceBuffer<f32>]>,
     pub ctx: usize,
 }
@@ -801,6 +787,25 @@ impl Body {
             run.len(),
             N_EXPERT,
         )?);
+        let routes = cfg
+            .iter()
+            .zip(&names)
+            .map(|(c, n)| match &n.ffn {
+                FfnNames::Moe { norm, router, bias } => Some(RouteLayer {
+                    norm: norm.clone(),
+                    router: router.clone(),
+                    bias: bias.clone(),
+                    row_off: c.row_off,
+                }),
+                FfnNames::Dense { .. } => None,
+            })
+            .collect();
+        let route_dims = RouteDims {
+            embd: dims.embd,
+            rms_eps: dims.rms_eps,
+            scale: dims.scale,
+        };
+        let routed = RouteBlock::new(gpu, w, WHAT, (routes, &slots), route_dims)?;
         let boundary = Boundary::with_cols(
             gpu.context(),
             stream,
@@ -846,6 +851,7 @@ impl Body {
             stores,
             ropes,
             slots,
+            routed,
             embd,
             ctx,
             seq_rows,
@@ -1019,6 +1025,7 @@ impl Body {
                 .sum::<usize>()
             + self.shell.hybrid.boundary().device_bytes()
             + self.slots.buf().num_bytes()
+            + self.routed.bytes()
     }
 
     /// Every store's bits on the host, a layer's key plane then its value
@@ -1113,7 +1120,7 @@ impl Body {
                 card: &mut self.card,
                 stores: stores.unwrap_or(self.stores.as_mut_slice()),
                 ropes: &self.ropes,
-                slots: &self.slots,
+                routed: &self.routed,
                 taps: self.shell.taps.as_deref_mut(),
                 ctx: self.ctx,
             },
