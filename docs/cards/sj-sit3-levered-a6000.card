@@ -1,0 +1,21 @@
+# Sitting 3: the Qwen3.6 jump arm with L1-L3 and X1 (the lead in the prompt call, no tail, a span and its step
+# as one next_after, answer spans with no checkpoint marks) against the step arm, the same bloomery-serve binary
+# with BLOOMERY_SCHEMAJUMP unset (jump) and off (step), Clef-Flash anchoring both windows. sjlev's fit over 13
+# requests: S = 5.10 ms a next, a span F(m) = 11.05 + 1.30 m ms; the lever terms L1 -19.6, L2 -10.2, L3 -3.8 a
+# span, X1 -6 ms put the median request's jump arm at ~86 ms (82-90) against sitting 2's step arm 140.1 ms:
+# (86 - 140.1) / 140.1 = -39 % (-41..-36) [derived].
+kind: ab
+question: how much of the time to a complete answer does the levered jump arm take off the step arm on Qwen3.6?
+term: client-side wall p50 in ms of POST to a complete answer, short bucket, Qwen3.6-35B-A3B-Q4_K_M, cache_prompt
+  off, thinking off, RTX A6000 - (jump - step) / step, paired by round
+unit: %
+predict: -45..-33
+rounds: 8
+sd: 2.0 % assumption: as sj-jump-vs-step-a6000; the sitting's own scatter replaces it
+condition: each window holds one Qwen3.6 server beside the Clef-Flash server; on ko-06 the jump window's
+  timings.constrained shows next_calls 0, prefill_calls 0, next_after_calls 1, lead 4, tail 2 and the step
+  window's next_calls 13; the jump arm's text, finish and usage equal the step arm's on every request
+decide-in: the levers stay on by default; the film's Qwen row is this pair
+decide-below: the jump gains more than derived: F(m) or S is cheaper on this build; re-fit from this window
+decide-above: the jump gains less: a term not in the call list (host work a call, the row read) is the floor;
+  read client wall minus timings per request
