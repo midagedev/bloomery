@@ -39,7 +39,7 @@ const MIN_ROWS: usize = 7;
 /// The clause's own rows, in the suite's shape. `eye_left` and `eye_right` start with the same
 /// token in any BPE vocabulary (`eye`), so the `part` question is asked by label.
 const OWN_ROWS: &[&str] = &[
-    r#"{"id": "own-labels-01", "model": "clef-flash", "state": "The patient reports a sharp pain in the right eye and blurred vision.", "questions": {"part": {"type": "choice", "instructions": "Which body part is affected?", "criteria": {"ear": "Hearing or balance", "eye_left": "The left eye", "eye_right": "The right eye", "nerve": "A nerve"}}, "urgency": {"type": "score", "criteria": ["Can wait", "This week", "Today"]}, "pain": {"type": "noul", "instructions": "Is the patient in pain?"}}}"#,
+    r#"{"id": "own-labels-01", "model": "any", "state": "The patient reports a sharp pain in the right eye and blurred vision.", "questions": {"part": {"type": "choice", "instructions": "Which body part is affected?", "criteria": {"ear": "Hearing or balance", "eye_left": "The left eye", "eye_right": "The right eye", "nerve": "A nerve"}}, "urgency": {"type": "score", "criteria": ["Can wait", "This week", "Today"]}, "pain": {"type": "noul", "instructions": "Is the patient in pain?"}}}"#,
 ];
 
 /// The model's tokenizer through the server's `/tokenize`, each text asked once.
