@@ -7,9 +7,13 @@
 # greedy.tsv (the argmax tokens with their margins). Set names are the family's (crates/refset/src/arch/solar2); under
 # BLOOMERY_TIER=fixture each is the fixture file's, behind `fx_`, with its `# fixture` line.
 #
+# The harness is the shared one: tools/ref/cb_dump.cpp is the dumper, tools/ref/cb-dump.sh the build and the run (staging, lease,
+# install); this file is Solar's part of them, the tree, the taps and the prompts. `bash tools/ref/solar2-dump.sh --build` links
+# the dumper against the PAI tree (tools/ref/solar2-dump-build.sh is that call).
+#
 # The ids are tokens of the PAI build's llama-tokenize on the file (add_bos_token is false: no BOS), taken once and kept in
-# tools/ref/data/solar2 beside the texts' sha256 below; the dumper never tokenizes (a tokenizer difference would read as a
-# kernel bug). prompt a/b/c text: /home/user/stage/sorc/prompts/{a,b,c}.txt (sorc round, 2026-10-20); d is the first 1,536 ids of
+# tools/ref/data/solar2; the dumper never tokenizes (a tokenizer difference would read as a kernel bug). prompt a/b/c text:
+# /home/user/stage/sorc/prompts/{a,b,c}.txt (sorc round, 2026-10-20); d is the first 1,536 ids of
 # /home/user/eval/wikitext-2-raw/wiki.test.raw.
 #
 # CPU only: CUDA_VISIBLE_DEVICES is emptied and the dumper asks for no GPU layers, so the reference is a CPU reduction order, as
@@ -24,87 +28,29 @@ set -euo pipefail
 export BLOOMERY_MODEL=solar-open2
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
-# shellcheck source=tools/ref/lease.sh
-source "${BASH_SOURCE[0]%/*}/lease.sh"
-HERE=$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)
-fixture_dump_tier solar2-dump.sh
+# shellcheck source=tools/ref/cb-dump.sh
+source "${BASH_SOURCE[0]%/*}/cb-dump.sh"
 
-BIN="${SOLAR2_BIN:-$BLOOMERY_DATA/bin/solar2_dump}"
-REC="$BIN.build"
-[ -x "$BIN" ] || { echo "solar2-dump: no $BIN — run: bash tools/ref/solar2-dump-build.sh" >&2; exit 2; }
-want=$(cat "$HERE/tools/ref/solar2-dump.cpp" "$HERE/tools/ref/ref_io.h" | sha256sum | cut -d' ' -f1)
-rec() { awk -v k="$1" '$1 == k { print $2; exit }' "$REC"; }
-[ "$(rec source_sha256)" = "$want" ] || {
-  echo "[stale-binary] $BIN was linked from another solar2-dump.cpp or ref_io.h — run: bash tools/ref/solar2-dump-build.sh" >&2
-  exit 3
-}
-# The binary must still be the tree it was linked against: its commit, patch and library.
-COMMIT=$(git -c safe.directory='*' -C "$PAI" rev-parse --short=9 HEAD)
-PATCH_SHA=$(sha256sum "$PAI/solar_open2.patch" | cut -d' ' -f1)
-LIB_MD5=$(md5sum < "$(readlink -f "$PAI/build/bin/libllama.so")" | cut -d' ' -f1)
-[ "$(rec pai_commit) $(rec patch_sha256) $(rec libllama_md5)" = "$COMMIT $PATCH_SHA $LIB_MD5" ] || {
-  echo "[stale-binary] $BIN was linked against another PAI build than $PAI now holds ($(rec pai_commit) $(rec libllama_md5)): rebuild it" >&2
-  exit 3
-}
-BUILD="$COMMIT+pai-${PATCH_SHA:0:12}"
-
+CB_FAMILY=solar2
+CB_ENV=SOLAR2
+CB_SCRIPT=solar2-dump.sh
+CB_TREE=$PAI
+CB_PATCH=$PAI/solar_open2.patch
+CB_PATCH_TAG=pai
+CB_ARCH=solar-open2
+CB_TITLE="solar2-dump — the PAI tree's intermediate tensors, raw f32, little-endian"
+CB_IDS=solar2
 # name:ids:nodes:greedy — nodes joined by `+`; the names are the patch's cb() names.
 TAPS=model.embed_tokens+attn_norm+kda_g1+kda_beta_neg_eigval+kda_out+attn_out+attn_gate_sigmoid+attn_gated+attn_proj+ffn_inp+ffn_norm+ffn_moe_out+ffn_shexp+ffn_out+l_out+result_norm
-PROMPTS=("a:a:$TAPS:64" "b:b:l_out:64" "c:c:l_out:64" "d:d::0")
-STAGE="$BLOOMERY_DATA/ref-solar2.staging"
-FIXTURE_LINE=$(fixture_line solar2-dump.sh)
-ARGS=(-m "$MODEL" --out "$STAGE" --build "$BUILD" -c 4096 -ub 512 -t "${SOLAR2_THREADS:-32}")
-[ -z "$FIXTURE_LINE" ] || ARGS+=(--fixture-line "$FIXTURE_LINE")
-for p in "${PROMPTS[@]}"; do
-  IFS=: read -r name ids nodes greedy <<< "$p"
-  ARGS+=(--prompt "$name:$HERE/tools/ref/data/solar2/$ids.ids:$nodes:$greedy")
-done
+CB_PROMPTS=("a:a:$TAPS:64" "b:b:l_out:64" "c:c:l_out:64" "d:d::0")
+CB_FLAGS=()
 
-if [ "${DUMP_DRY:-0}" = 1 ]; then
-  printf '[dry] tier\t%s\tprofile %s\n' "${BLOOMERY_TIER:-real}" "$MODEL_NAME"
-  for p in "${PROMPTS[@]}"; do printf '[dry] set\t%sref_solar2_%s\n' "$SET_PREFIX" "${p%%:*}"; done
-  printf '[dry] # model\t%s\n[dry] # build\t%s\n[dry] dumper\t%s\n' "$MODEL" "$BUILD" "$BIN"
-  [ -z "$FIXTURE_LINE" ] || printf '[dry] %s\n' "$FIXTURE_LINE"
-  printf '[dry] argv\t%q' "$BIN"
-  printf ' %q' "${ARGS[@]}"
-  printf '\n[dry] lease\ttaken (a dry run takes none)\n'
-  exit 0
-fi
-
-DUMP_BOUND=${BLOOMERY_DUMP_BOUND:-1800}
-WITNESS=(head-epoch loadavg pressure-io mem pgmajfault read-sectors lock-holder model)
-if [ "${REF_DUMP_LEASE:-1}" = 1 ]; then
-  lease_take
-  witness pre-dump
-fi
-rm -rf "$STAGE"
-mkdir -p "$STAGE"
-# The staged sets are removed on every exit unless each carries its completion trailer: a dump that does not finish costs nothing.
-drop_incomplete_sets() {
-  local d
-  for d in "$STAGE"/*/; do
-    [ -d "$d" ] || continue
-    grep -qs '^# complete' "$d/MANIFEST.tsv" || { rm -rf "$d"; echo "[staging] removed the incomplete $d" >&2; }
-  done
-}
-trap drop_incomplete_sets EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-export CUDA_VISIBLE_DEVICES=""
-lease_bounded "$DUMP_BOUND" "$BIN" "${ARGS[@]}"
-if [ "${REF_DUMP_LEASE:-1}" = 1 ]; then witness post-dump; fi
-for p in "${PROMPTS[@]}"; do
-  name=${p%%:*}
-  grep -q '^# complete' "$STAGE/$name/MANIFEST.tsv" || { echo "solar2-dump: $name has no completion trailer — not installing it" >&2; exit 1; }
-done
-for p in "${PROMPTS[@]}"; do
-  name=${p%%:*}
-  SET="$BLOOMERY_DATA/${SET_PREFIX}ref_solar2_$name"
-  rm -rf "$SET.old"
-  if [ -d "$SET" ]; then mv "$SET" "$SET.old"; fi
-  mv "$STAGE/$name" "$SET"
-  rm -rf "$SET.old"
-  echo "installed $SET ($(grep -c '^tensor' "$SET/MANIFEST.tsv") tensors)"
-done
-rmdir "$STAGE"
-echo "build: $BUILD  model: $MODEL"
+case ${1:-} in
+  --build) cb_dump_build ;;
+  '')
+    # shellcheck source=tools/ref/lease.sh
+    source "${BASH_SOURCE[0]%/*}/lease.sh"
+    cb_dump_run
+    ;;
+  *) echo "solar2-dump.sh: no argument (the dump) or --build, got $1" >&2; exit 64 ;;
+esac

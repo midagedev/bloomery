@@ -1083,6 +1083,22 @@ build-ref-solar2:
 dump-ref-solar2:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=240 BLOOMERY_MODEL=solar-open2 ./tools/box.sh 'bash tools/ref/solar2-dump.sh'
 
+# MiniMax-M3-UD-IQ4_XS oracle: minimaxm3_dump (the shared tools/ref/cb_dump.cpp, the Solar-Open2 dumper's source) linked against the
+# existing mainline build (llama.cpp cd0a5b6a1, CPU, no patch, /home/user/llama.cpp-mainline-bolt, whose tracked files must be clean),
+# which this does not rebuild (tools/ref/minimaxm3-dump-build.sh); the binary and its build record land in $BLOOMERY_DATA/bin.
+build-ref-minimaxm3:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 BLOOMERY_MODEL=minimax-m3 ./tools/box.sh 'bash tools/ref/minimaxm3-dump-build.sh'
+
+# The MiniMax-M3 oracle sets (refset family lcpp-minimaxm3; tools/ref/minimaxm3-dump.sh has the layout and the taps): mainline on the
+# CPU over the five prompts of tools/ref/data/minimaxm3 from one load of the 208.5 GB UD-IQ4_XS file, into
+# $BLOOMERY_DATA/ref_minimaxm3_{a,b,c,d,e}: each layer's taps for a, each layer output and the router's expert ids for b and c, the last
+# logits row for d, the sparse attention's block scores and selection for e (the only context past 2,048 positions), the top-40 logprobs
+# and 64 greedy tokens for a, b and c. Predicted wall 3-10 min, under the CPU lease and its card
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/minimaxm3-dump.card'); DUMP_DRY=1 in that variable prints the dump and stops before
+# the lease. The file has no fixture yet: BLOOMERY_TIER=fixture is refused by name.
+dump-ref-minimaxm3:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=330 BLOOMERY_MODEL=minimax-m3 ./tools/box.sh 'bash tools/ref/minimaxm3-dump.sh'
+
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
 build-ref-dump-draft:

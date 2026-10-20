@@ -1,0 +1,32 @@
+# Round mm3ref: mainline llama.cpp's CPU node dumps of the MiniMax-M3-UD-IQ4_XS split set (six shards, 208.5 GB), `just dump-ref-minimaxm3`:
+# five prompts (41, 55, 116, 1,536 and 2,560 ids) from ONE load, the layer taps of the first, each layer output and router id of the
+# next two, the last logits row of the next, the sparse attention's block scores and selection of the last, and 64 greedy tokens of
+# the first three. The phases run one after the other on the same 32 threads: the wall is their sum.
+# Predicted wall [derived], seconds (MACs from the file's tensor shapes: non-routed 10.55 G a token, routed 12.91 G, head 1.23 G
+# read on the last row only; bytes: experts 26.2 MB each, ~190 GB, non-routed Q8_0 12.3 GB, Q6_K 7.0 GB):
+#   load      the CPU backend repacks only the types it has an interleave for on this CPU (AVX2, no AVX-512: Q4_0, Q4_K, IQ4_NL, MXFP4;
+#             Q6_K and Q8_0 only on ARM and RISC-V, Q2_K on AVX-512; ggml-cpu/repack.cpp of the tree), and this file holds Q8_0, Q6_K, IQ4_XS,
+#             IQ3_S and F32 only: nothing is repacked, no weight becomes anonymous memory, the load maps the six shards. RAM: 208.5 GB
+#             of page cache against the box's 251 GB (11 GB in use): it fits with ~28 GB to spare for the KV caches and compute
+#             buffers. 2-10 s
+#   cold read the first touch of every mapped page, if the file is not in the page cache: 208.5 GB at ~3 GB/s = 70 s, up to 150 s at
+#             demand-paged rates (the copy into /models may have left part of it warm). 0-150 s
+#   prefill   4,308 ids x 2 x 23.46 G MACs = 202 TFLOP: 91 TFLOP non-routed Q8_0 through the AVX2 dot (llamafile's tiled kernel for
+#             Q8_0 x Q8_0), 1.0-2.0 TFLOP/s: 45-91 s; and 111 TFLOP routed through the unrepacked IQ3_S/IQ4_XS dot products. THE ONE
+#             TERM derivation does not close: the 32-thread ggml rate on those rows, expected 0.5-1.0 TFLOP/s (Solar's repacked Q4_K ran
+#             0.94 TFLOP/s overall): 111-222 s. The three short prompts and each 512-row ubatch read every expert once (190 GB over
+#             ~120 GB/s = 1.6 s a ubatch, under the compute of 25-45 s a ubatch: the wall is the CPU's, the DRAM's time is shadowed).
+#             160-310 s
+#   greedy    192 tokens at 18.9 GB read a token (5.97 GB routed, 11.0 GB attention and shared, 0.9 GB indexer, 1.0 GB head) over
+#             ~120 GB/s = 0.157 s, 0.25 s with the compute of unrepacked rows: 30-48 s
+#   writes    ~1.4 GB of f32 node files through the callback's gather: 5 s
+#   total     3-10 min (warm 200-375 s, cold 265-525 s); central 280 s warm; bound 1800 s.
+# What the run guarantees: CUDA hidden, the CPU lease held, no peer on the box's cores (the lease), the staging set installed only
+# when each prompt's manifest carries its `# complete` trailer. The dumper prints its load, per-prompt and per-greedy walls: the
+# prefill rate of the unrepacked rows is read from the `prompt` seconds of d and e (4,096 ids of the 4,308 are those two).
+kind: exclusive
+reason: minimaxm3_dump runs mainline llama.cpp on 32 CPU threads and maps the whole 208.5 GB split set (nothing of it repacked: it all
+  sits in the page cache), evicting that much of the cache (the V4.1 and GLM host sets among it); beside a timed run or a gate batch
+  it would take their cores and their memory bandwidth, so it holds the lease; why now: the MiniMax-M3 oracle every body round
+  (the sparse-attention kernel, the decode step, the prefill) is judged against (round mm3ref)
+minutes: 3..10

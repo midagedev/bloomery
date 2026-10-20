@@ -1,0 +1,24 @@
+MiniMax-M3 oracle prompts (tools/ref/minimaxm3-dump.sh): token ids, one decimal id a line, no BOS (the file's add_bos_token is
+false, so llama-tokenize adds none). The dumper never tokenizes (tools/ref/cb_dump.cpp): a tokenizer difference would read as a
+kernel bug.
+
+Made once, on the box, by the tokenizer of the dump's own tree (mainline llama.cpp cd0a5b6a180dff0048e5fd993098b21c0b2c91b8,
+/home/user/llama.cpp-mainline-bolt, CPU build; llama-tokenize md5 f39e6d406cdb6232145cd30a85ca4fb0, libllama.so md5
+d846809bb9cd2cb8aa304ed4b9003fed) on the first shard of the UD-IQ4_XS file (vocabulary only):
+
+    llama-tokenize -m <first shard> -f <text> --ids --no-escape --log-disable     # "[id, id, ...]", written one id a line
+
+    a.ids  41    sha256 eb693cef4c06f16645688a451ff1e02221be2a7dc9e49e8664a233a926b3ed6c   text /home/user/stage/sorc/prompts/a.txt (English)
+    b.ids  55    sha256 cb916d322cbccfd951c4b43323648e08eee545f897431f2e6a4f575ae7676e42   text .../b.txt (Korean)
+    c.ids  116   sha256 5b389e7db3294fe644e6c2893e14a97641d1d181c5fb44d1ba834fefc08678d8   text .../c.txt (Rust)
+    d.ids  1536  sha256 55f00d1bec908e5ab0f1cfff08796f486991e24d7c223ffd92a02538adeab9c6   first 1,536 ids of /home/user/eval/wikitext-2-raw/wiki.test.raw
+    e.ids  2560  sha256 be3f8bd956051821567465bec05510f7f860d70148f551fda9a253b584bfa3ba   first 2,560 ids of the same text (d is its first 1,536)
+
+    text sha256: a.txt db8af4d074fa4fd7524f2f66948037726b262830039e371fd1e5c564ffbb0a20
+                 b.txt beb7baf53de0542cbe4cb938ff211676739faaebfb11026482d857e63cb2d0cc
+                 c.txt c7990d344e3e514b296d99b408425c14650a5909ae63e7d6d4fd75b7028cefb0
+                 wiki.test.raw 173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08 (282,984 ids)
+    The texts hold no backslash, so --no-escape and the default tokenize alike.
+
+The same texts as tools/ref/data/solar2 (a, b, c, d), tokenized by this file's vocabulary; e is the one prompt of this family
+with more than 2,048 positions, the only context in which the sparse attention's top-16 of 128-position blocks drops a block.

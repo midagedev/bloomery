@@ -1,0 +1,19 @@
+# Round mm3ref: the lifted node-dump harness (tools/ref/cb_dump.cpp, tools/ref/cb-dump.sh) against the Solar-Open2 fixture sets the
+# old solar2-dump wrote. The PAI tree's CPU node dumps of the Solar-Open2 gate fixture (four layers, 13.65 GB in four shards,
+# /models/fixtures/solar2), `BLOOMERY_TIER=fixture bash tools/ref/solar2-dump.sh`, into a scratch BLOOMERY_DATA, then `cmp` of every file
+# against the box's fx_ref_solar2_{a,b,c,d}, which are not touched: the same four prompts (41, 40, 114 and 1,536 ids) from ONE load.
+# The phases run one after the other: the wall is their sum.
+# Predicted wall [derived], seconds (the same dump as round qsolfx's, whose derivation this takes):
+#   load      13.65 GB from the page cache through the CPU backend's 8x8 repack, at the rate the real file's card measured
+#             (151.8 GB in 185 s = 0.82 GB/s): 17 s
+#   prefill   1,731 ids x 2 x 1.97 G MACs = 6.8 TFLOP at the real run's effective 0.94 TFLOP/s: 7 s
+#   greedy    192 tokens at about 1.3 GB read a token over ~120 GB/s: 2 s
+#   writes    the four sets' node files: 1 s
+#   total     27 s, bound 1800 s.
+# What the run guarantees: CUDA hidden, the CPU lease held, no peer on the box's cores (the lease), the staging set installed only
+# when each prompt's manifest carries its `# complete` trailer.
+kind: exclusive
+reason: solar2_dump runs the PAI tree on 32 CPU threads and maps the fixture through the CPU backend; beside a timed run or a gate batch
+  it would take their cores and their memory bandwidth, so it holds the lease; why now: the proof that the lifted harness writes the
+  Solar-Open2 sets byte for byte, before the MiniMax-M3 dump (the same harness) takes the lease for 3-10 minutes (round mm3ref)
+minutes: 1..2
