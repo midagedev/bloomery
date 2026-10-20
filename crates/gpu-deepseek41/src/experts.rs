@@ -527,6 +527,73 @@ impl ExpertKernels {
     }
 }
 
+/// A shared expert's gate and up q8_0 planes, checked to match: the same
+/// rows of the same `k`, a positive multiple of 32, with `k/4` code words and
+/// `k/32` scales a row.
+struct Q8Pair<'a> {
+    qs_g: &'a DeviceTensor<u32>,
+    d_g: &'a DeviceTensor<u16>,
+    qs_u: &'a DeviceTensor<u32>,
+    d_u: &'a DeviceTensor<u16>,
+    n_rows: usize,
+    k: usize,
+}
+
+/// `gate` and `up` as a [`Q8Pair`], refused by name (as `what`'s error)
+/// unless both are q8_0 file tensors of the same non-empty shape.
+fn q8_pair<'a>(
+    what: &'static str,
+    gate: &'a DevWeight,
+    up: &'a DevWeight,
+) -> Result<Q8Pair<'a>, GpuError> {
+    let shape = |detail: String| GpuError::Shape { what, detail };
+    let (
+        DevWeight::Q8_0 {
+            qs: qs_g,
+            d: d_g,
+            k,
+        },
+        DevWeight::Q8_0 {
+            qs: qs_u,
+            d: d_u,
+            k: k_u,
+        },
+    ) = (gate, up)
+    else {
+        return Err(shape("gate and up must both be q8_0 file tensors".into()));
+    };
+    let (n_rows, k) = (d_g.rows(), *k);
+    if *k_u != k
+        || d_u.rows() != n_rows
+        || k == 0
+        || !k.is_multiple_of(32)
+        || d_g.cols() * 32 != k
+        || d_u.cols() * 32 != k
+        || qs_g.rows() != n_rows
+        || qs_u.rows() != n_rows
+        || qs_g.cols() * 4 != k
+        || qs_u.cols() * 4 != k
+    {
+        return Err(shape(format!(
+            "gate {} rows x {k} and up {} rows x {k_u} must match, with k/4 code words \
+             and k/32 scales per row",
+            d_g.rows(),
+            d_u.rows()
+        )));
+    }
+    if n_rows == 0 {
+        return Err(shape(format!("{n_rows} rows: at least one")));
+    }
+    Ok(Q8Pair {
+        qs_g,
+        d_g,
+        qs_u,
+        d_u,
+        n_rows,
+        k,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,71 +719,4 @@ mod tests {
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
-}
-
-/// A shared expert's gate and up q8_0 planes, checked to match: the same
-/// rows of the same `k`, a positive multiple of 32, with `k/4` code words and
-/// `k/32` scales a row.
-struct Q8Pair<'a> {
-    qs_g: &'a DeviceTensor<u32>,
-    d_g: &'a DeviceTensor<u16>,
-    qs_u: &'a DeviceTensor<u32>,
-    d_u: &'a DeviceTensor<u16>,
-    n_rows: usize,
-    k: usize,
-}
-
-/// `gate` and `up` as a [`Q8Pair`], refused by name (as `what`'s error)
-/// unless both are q8_0 file tensors of the same non-empty shape.
-fn q8_pair<'a>(
-    what: &'static str,
-    gate: &'a DevWeight,
-    up: &'a DevWeight,
-) -> Result<Q8Pair<'a>, GpuError> {
-    let shape = |detail: String| GpuError::Shape { what, detail };
-    let (
-        DevWeight::Q8_0 {
-            qs: qs_g,
-            d: d_g,
-            k,
-        },
-        DevWeight::Q8_0 {
-            qs: qs_u,
-            d: d_u,
-            k: k_u,
-        },
-    ) = (gate, up)
-    else {
-        return Err(shape("gate and up must both be q8_0 file tensors".into()));
-    };
-    let (n_rows, k) = (d_g.rows(), *k);
-    if *k_u != k
-        || d_u.rows() != n_rows
-        || k == 0
-        || !k.is_multiple_of(32)
-        || d_g.cols() * 32 != k
-        || d_u.cols() * 32 != k
-        || qs_g.rows() != n_rows
-        || qs_u.rows() != n_rows
-        || qs_g.cols() * 4 != k
-        || qs_u.cols() * 4 != k
-    {
-        return Err(shape(format!(
-            "gate {} rows x {k} and up {} rows x {k_u} must match, with k/4 code words \
-             and k/32 scales per row",
-            d_g.rows(),
-            d_u.rows()
-        )));
-    }
-    if n_rows == 0 {
-        return Err(shape(format!("{n_rows} rows: at least one")));
-    }
-    Ok(Q8Pair {
-        qs_g,
-        d_g,
-        qs_u,
-        d_u,
-        n_rows,
-        k,
-    })
 }

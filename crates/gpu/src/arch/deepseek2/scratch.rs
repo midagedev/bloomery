@@ -750,6 +750,27 @@ impl ParamImage {
     }
 }
 
+/// The gather table that copies each rope slice of q (`q_rope_all`'s
+/// 64-value column holding head `h`'s rope span) into the rope span of
+/// flash row `h`, for the heads in `heads`. Load-time only.
+fn rope_gather(
+    stream: &CudaStream,
+    mla: &MlaParams,
+    kv_width: usize,
+    heads: std::ops::Range<usize>,
+    what: &'static str,
+) -> Result<Gather, GpuError> {
+    let (rope, nope, kq_head) = (mla.rope_dims, mla.nope, mla.kq_head);
+    Gather::new(
+        stream,
+        heads.flat_map(|h| {
+            let col = (h * kq_head + nope) / rope;
+            (0..rope).map(move |d| (col * rope + d, h * kv_width + d))
+        }),
+        what,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,25 +859,4 @@ mod tests {
         eprintln!("scratch allocation failure context handles: before {before} after {after}");
         assert_eq!(after, before, "a refused scratch leaves no context handle");
     }
-}
-
-/// The gather table that copies each rope slice of q (`q_rope_all`'s
-/// 64-value column holding head `h`'s rope span) into the rope span of
-/// flash row `h`, for the heads in `heads`. Load-time only.
-fn rope_gather(
-    stream: &CudaStream,
-    mla: &MlaParams,
-    kv_width: usize,
-    heads: std::ops::Range<usize>,
-    what: &'static str,
-) -> Result<Gather, GpuError> {
-    let (rope, nope, kq_head) = (mla.rope_dims, mla.nope, mla.kq_head);
-    Gather::new(
-        stream,
-        heads.flat_map(|h| {
-            let col = (h * kq_head + nope) / rope;
-            (0..rope).map(move |d| (col * rope + d, h * kv_width + d))
-        }),
-        what,
-    )
 }

@@ -202,18 +202,19 @@ fn spelled(text: &str, spelling: Spelling) -> String {
     }
 }
 
-/// [`v4_fixtures`] in `spelling`: the raw output, and the expected reasoning and content
-/// where they hold the markup as text, respelled; `tools` carries the spelling.
-fn fixtures(
-    spelling: Spelling,
-) -> Vec<(
+/// A [`v4_fixtures`] row with its tools flag turned into the spelling the markup is written in.
+type SpelledFixture = (
     &'static str,
     &'static str,
     ReasoningFormat,
     Option<Spelling>,
     String,
     Message,
-)> {
+);
+
+/// [`v4_fixtures`] in `spelling`: the raw output, and the expected reasoning and content
+/// where they hold the markup as text, respelled; `tools` carries the spelling.
+fn fixtures(spelling: Spelling) -> Vec<SpelledFixture> {
     v4_fixtures()
         .into_iter()
         .map(|(name, prompt, format, tools, raw, want)| {

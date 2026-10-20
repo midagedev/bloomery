@@ -75,7 +75,6 @@ use super::kernels32::Gemm32Kernels;
 use super::route::gemm_max_tiles;
 use super::{GEMM_BN, GEMM32_STEP, GemmInput, GemmRoute};
 use crate::iq::iq4_word;
-use crate::mxfp4::NV_BLOCK_VALUES;
 use crate::mxfp4_sel::Nvfp4Stack;
 use crate::q5::q5_0_row_words;
 use crate::tensor::DeviceTensor;

@@ -33,6 +33,7 @@
 //!   (`Q5Kernels::enqueue_quantize_q8_sel_relu_sqr`; a slot the run places
 //!   off the card is left alone);
 //! - the down `_sel` and, optionally, the card slots' weighted sum.
+//!
 //! The widths need not be multiples of 256: `n` and `ff` are multiples of 32.
 //!
 //! What stays with the caller, because it is the family's: the slots' places
@@ -1518,7 +1519,7 @@ pub(crate) mod tests {
     fn nvfp4_stack(gpu: &Gpu, w: &mut Weights, name: &str, rows: usize, k: usize, seed: u64) {
         let mut state = seed;
         let mut bytes = vec![0u8; N_CARD * rows * k / 64 * 36];
-        for b in bytes.chunks_exact_mut(36) {
+        for b in bytes.as_chunks_mut::<36>().0 {
             for (i, v) in b.iter_mut().enumerate() {
                 let r = u8::try_from(next(&mut state) & 0xff).expect("a byte");
                 *v = if i < 4 { 0x30 | (r & 0x0f) } else { r };
@@ -2537,7 +2538,7 @@ pub(crate) mod tests {
                 "a run of {m} tokens: {refused:?}"
             );
         }
-        let route = DeviceBuffer::from_host(stream, &vec![0.5f32; 2 * 7]).expect("the weights");
+        let route = DeviceBuffer::from_host(stream, &[0.5f32; 2 * 7]).expect("the weights");
         let mut acc = DeviceBuffer::<f32>::zeroed(stream, 2 * 96).expect("the sum");
         let seven = LegShape {
             cap: 2,

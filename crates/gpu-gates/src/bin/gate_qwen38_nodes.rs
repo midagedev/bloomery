@@ -174,7 +174,7 @@ mod gate {
                              <gib> <out> <server pid> | --hold0 <gib>) or --measure \
                              <local|node> <gib> or --decode0 <gib> <tokens> <out> or --history <gib> <out>";
         let host = args.first().is_some_and(|a| a == "--host");
-        let args = if host { &args[1..] } else { &args[..] };
+        let args = if host { &args[1..] } else { args };
         let gib = |s: &str, max: u64| -> Result<u64, GateError> {
             let n = s
                 .parse::<u64>()
