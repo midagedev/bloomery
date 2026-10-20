@@ -993,6 +993,18 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   }
   t=$(mktemp -d "${TMPDIR:-/tmp}/lease-self-test.XXXXXX") || exit 70
   trap 'rm -rf "$t"' EXIT
+  # perf_own_timeout <stub pid> <recorded parent>: 0 only when the parent is the stub's live timeout. A timeout (GNU's
+  # and both stand-ins) leads the process group its child runs in, so the stub's group is the timeout's pid. An orphan
+  # records whoever adopted it, 1 or a child subreaper above 1, and its group still names the timeout that ended. A
+  # stub that is gone cannot vouch for its parent, which is then not signalled; a timeout whose child is gone exits.
+  perf_own_timeout() {
+    local g
+    case ${2:-} in '' | *[!0-9]*) return 1 ;; esac
+    [ "$((10#$2))" -gt 1 ] && kill -0 "$2" 2> /dev/null || return 1
+    g=$(ps -o pgid= -p "$1" 2> /dev/null) || return 1
+    read -r g <<< "$g"
+    [ "$g" = "$((10#$2))" ]
+  }
   mkdir "$t/bin" "$t/nothing"
   # The stub nvidia-smi: rc $STUB_RC when set; its call count in $t/calls; the compute apps of
   # $STUB_APPS, suppressed once the count reaches $STUB_VANISH_AT.
@@ -1647,6 +1659,28 @@ fi
 exec /usr/bin/mktemp "$@"
 EOF
     chmod +x "$t/perf-bin/"*
+    # perf-own-timeout: the cleanup's identity check. A real timeout's child vouches for it; an orphan's recorded parent
+    # (1, or a live subreaper above 1, here a process outside the stub's group) and a gone stub do not.
+    tdir=$t/own-timeout
+    mkdir "$tdir"
+    PATH="$t/tbin:$PATH" timeout 30 sh -c 'echo "$$ $PPID" > "$1"; exec sleep 30' _ "$tdir/real" &
+    own_tp=$!
+    sleep 30 &
+    own_stub=$!
+    sleep 30 &
+    own_reaper=$!
+    i=0
+    until [ -s "$tdir/real" ] || [ "$i" = 100 ]; do sleep 0.1; i=$((i + 1)); done
+    read -r own_sp own_ip < "$tdir/real" || own_sp='' own_ip=''
+    got=''
+    for c in "real:$own_sp:$own_ip" "subreaper:$own_stub:$own_reaper" "init:$own_stub:1" "zero:$own_stub:0" \
+      "empty:$own_stub:" "gone:999999999:$own_tp"; do
+      IFS=: read -r name a b <<< "$c"
+      if perf_own_timeout "$a" "$b"; then got="$got $name=ours"; else got="$got $name=no"; fi
+    done
+    check perf-own-timeout "$got" " real=ours subreaper=no init=no zero=no empty=no gone=no"
+    kill "$own_tp" "$own_stub" "$own_reaper" 2> /dev/null
+    wait "$own_tp" "$own_stub" "$own_reaper" 2> /dev/null
     for phase in record fork startup annotate callers fail bound; do
       pdir=$t/perf-$phase
       mkdir "$pdir"
@@ -1709,8 +1743,7 @@ EOF
             state=$(ps -o stat= -p "$sp" 2> /dev/null) || state=''
             if [ "$phase" != fork ] || [[ $state != *Z* && -n $state ]]; then left="$left $child"; fi
           fi
-          # A stub whose timeout ended before it wrote its pids is an orphan: its parent is 1, alive and no timeout of ours.
-          if [ "$ip" -gt 1 ] && kill -0 "$ip" 2> /dev/null; then left="$left $child-timeout"; fi
+          if perf_own_timeout "$sp" "$ip"; then left="$left $child-timeout"; fi
         fi
       done
       lk=free
@@ -1724,7 +1757,7 @@ EOF
         for child in decoder record; do
           if [ -s "$pdir/$child.pid" ]; then
             read -r sp ip < "$pdir/$child.pid"
-            if [ "$ip" -gt 1 ] && kill -0 "$ip" 2> /dev/null; then lease_stop "$ip" || :; fi
+            if perf_own_timeout "$sp" "$ip"; then lease_stop "$ip" || :; fi
             if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
           fi
         done
