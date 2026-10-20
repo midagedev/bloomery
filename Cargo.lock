@@ -169,6 +169,7 @@ dependencies = [
  "bloomery-gpu",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-models",
  "bloomery-runtime",
  "cuda-core",
  "cuda-device",
@@ -271,8 +272,12 @@ dependencies = [
 name = "bloomery-gpu-minimaxm3"
 version = "0.1.0"
 dependencies = [
+ "bloomery-gguf",
  "bloomery-gpu",
+ "bloomery-gpu-deepseek41",
+ "bloomery-levers",
  "bloomery-model",
+ "bloomery-models",
  "bloomery-runtime",
  "cuda-core",
  "cuda-device",

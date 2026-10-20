@@ -54,6 +54,7 @@ generate_ds41   ds41_expert_gate_up                      0           0
 generate_ds41   ds41_expert_gate_up_tiles                0           0
 generate_ds41   ds41_ffn_card_acc                        0           0
 generate_ds41   ds41_ffn_card_acc_10                     0           0
+generate_ds41   ds41_ffn_card_acc_4                      0           0
 generate_ds41   ds41_ffn_card_acc_8                      0           0
 generate_ds41   ds41_ffn_card_acc_8_tier                 0           0
 generate_ds41   ds41_ffn_card_acc_9                      0           0
@@ -62,6 +63,7 @@ generate_ds41   ds41_ffn_handoff                         0           0
 generate_ds41   ds41_ffn_handoff_10                      0           0
 generate_ds41   ds41_ffn_handoff_10_cols                 0           0
 generate_ds41   ds41_ffn_handoff_10_cols_tier            0           0
+generate_ds41   ds41_ffn_handoff_4                       0           0
 generate_ds41   ds41_ffn_handoff_8                       0           0
 generate_ds41   ds41_ffn_handoff_8_tier                  0           0
 generate_ds41   ds41_ffn_handoff_9                       0           0

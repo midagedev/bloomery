@@ -1471,6 +1471,21 @@ gate-gpu-minimaxm3-rope:
 gate-gpu-minimaxm3-msa:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features minimaxm3 --release --bin gate_minimaxm3_msa && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minimaxm3_msa'
 
+# MiniMax-M3-UD-IQ4_XS end-to-end gate (gate_minimaxm3_e2e's doc): the whole decode chain (every layer GQA with a per-head q/k norm and a
+# partial rope, the sparse layers attending the blocks their indexer picks, the dense lead, the routed blocks with a shared expert), one
+# prompt a step, against mainline llama.cpp's CPU dump of the same file (refset family lcpp-minimaxm3, `just dump-ref-minimaxm3`): every
+# layer's output at the last position within the relative ceiling (the sets that hold it), the 40 top logprobs of each of five prompts
+# within the band derived from the family's sigma, and the greedy tokens of three prompts teacher-forced with the clear-margin
+# disagreements within the pin derived from their margins. The body has no prompt batch, so there is no prefill clause; the family has
+# no fixture file, so the recipe has no fixture tier. Loads the whole model once and feeds ~5,000 single-token steps: alone in a batch,
+# under the big-load lock. `--plan` (host only: the gate plan's experts a layer and its bytes by term), `--smoke` (load, a short
+# greedy decode, no pins) and `--route-trace DIR SET` (the host tier's route trace of prompt a, b or c into a new DIR, to hold against the set's
+# `ffn_moe_topk-*.logical.i32`) reach the same binary through ARGS.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-minimaxm3-e2e *ARGS:
+    BLOOMERY_MODEL=minimax-m3 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minimaxm3-e2e && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features minimaxm3 --release --bin gate_minimaxm3_e2e && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minimaxm3_e2e {{ARGS}}'
+
 # Head-256 pack-one prefill, whole inputs and symmetric windows, against the f64 attention band.
 gate-gpu-gemma-embedding-head256:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding_head256 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding_head256'

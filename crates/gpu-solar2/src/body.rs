@@ -44,13 +44,14 @@ use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{
-    DEADLINE, FileSwap, LIVE_DELAY, PlanStacks, ResidencyGlue, ResidencySpec, StackFacts,
+    DEADLINE, FileSwap, LIVE_DELAY, PlanStacks, ResidencyGlue, ResidencySpec, hosted_stacks,
 };
-use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
+use bloomery_gpu::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
 use bloomery_gpu::linear::mixer_kda::{KdaDecay, KdaDims, KdaRule};
 use bloomery_gpu::linear::{CONV_TAPS, HEAD, KHeadMap, LinearShape};
 use bloomery_gpu::model::{
-    ChainBody, HostServed, MAX_PASS_ROWS, Rollback, StepMode, host_run, refuse_scratch_past,
+    ChainBody, HostServed, MAX_PASS_ROWS, Rollback, StepMode, agreed, hosted_hybrid, one_card_run,
+    refuse_scratch_past,
 };
 use bloomery_gpu::site::{self, SiteTy, WideActs};
 use bloomery_gpu::weights::Weights;
@@ -68,7 +69,7 @@ use models::{Act, DeltaKind, Ffn, Gqa, KdaGate, LayerSpec, Mixer, ModelSpec, Out
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
 use runtime::seqstate::{Kept, Take};
 
-use crate::ffn::{Routed, RoutedDims};
+use crate::ffn::{CARD, Routed, RoutedDims};
 use crate::prefill::{self, Extra};
 use crate::step::Kernels;
 
@@ -370,31 +371,6 @@ const KQUANT: &[SiteTy] = &[SiteTy::Q3K, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K];
 /// K-quant).
 const LOW_RANK: &[SiteTy] = &[SiteTy::Q5_0, SiteTy::Q8_0, SiteTy::F32];
 
-/// Site `name` of `rows` rows of `k` values, its type from the file's header
-/// (one of `allowed`) checked against the resident weight.
-fn typed_site(
-    file: &Split,
-    w: &Weights,
-    name: String,
-    (rows, k): (usize, usize),
-    allowed: &[SiteTy],
-) -> Result<Site, GpuError> {
-    let ty = site::file_site(file, WHAT, &name, (rows, k), allowed)?;
-    site::site(w, WHAT, &name, (rows, k), ty)?;
-    Ok(Site::new(name, ty, k))
-}
-
-/// The resident f32 vector `name`, `len` values: its name.
-fn vector(w: &Weights, name: String, len: usize) -> Result<String, GpuError> {
-    let got = w.f32_buf(WHAT, &name)?.len();
-    if got != len {
-        return Err(shape(format!(
-            "{name} holds {got} values; the layer reads {len}"
-        )));
-    }
-    Ok(name)
-}
-
 /// The joined conv taps of KDA layer `l`'s q, k and v, in the conv's channel
 /// order: the one weight the mixer's conv reads, made at load.
 fn conv_joined(l: usize) -> String {
@@ -430,25 +406,6 @@ fn kda_rule(gate: KdaGate, beta_scale: f32) -> Result<KdaRule, GpuError> {
         KdaGate::Softplus => KdaDecay::Softplus,
     };
     KdaRule { decay, beta_scale }.check(WHAT)
-}
-
-/// What every layer of a kind agrees on: the first's `value`, every other
-/// layer's equal to it.
-fn agreed<T: PartialEq + std::fmt::Debug>(
-    what: &str,
-    l: usize,
-    first: &mut Option<T>,
-    value: T,
-) -> Result<(), GpuError> {
-    match first {
-        Some(f) if *f != value => Err(shape(format!(
-            "layer {l}: {what} is {value:?}, an earlier layer's {f:?}"
-        ))),
-        _ => {
-            first.get_or_insert(value);
-            Ok(())
-        }
-    }
 }
 
 /// A GQA layer's description held to what the kernels run: NoPE, no qk
@@ -516,7 +473,7 @@ fn dims_of(inputs: &PlanInputs, ctx: usize) -> Result<Dims, GpuError> {
                         g.heads, hp.n_head
                     )));
                 }
-                agreed("the key head count", l, &mut kv, g.kv_heads as usize)?;
+                agreed(WHAT, "the key head count", l, &mut kv, g.kv_heads as usize)?;
             }
             Mixer::DeltaRule(d) => {
                 let DeltaKind::Kda { gate, beta_scale } = d.kind else {
@@ -533,8 +490,20 @@ fn dims_of(inputs: &PlanInputs, ctx: usize) -> Result<Dims, GpuError> {
                         d.k_heads, d.v_heads, d.d, d.conv
                     )));
                 }
-                agreed("the KDA head count", l, &mut kda_heads, d.v_heads as usize)?;
-                agreed("the KDA rule", l, &mut rule, kda_rule(gate, beta_scale)?)?;
+                agreed(
+                    WHAT,
+                    "the KDA head count",
+                    l,
+                    &mut kda_heads,
+                    d.v_heads as usize,
+                )?;
+                agreed(
+                    WHAT,
+                    "the KDA rule",
+                    l,
+                    &mut rule,
+                    kda_rule(gate, beta_scale)?,
+                )?;
             }
             other => {
                 return Err(shape(format!(
@@ -588,17 +557,7 @@ fn routed_limit(spec: &ModelSpec, l: usize) -> Result<f32, GpuError> {
 /// but not all, and a description whose routed layers are not one run.
 fn stacks(inputs: &PlanInputs) -> Result<PlanStacks, GpuError> {
     let run = hosted(&inputs.spec.layers).map_err(|e| shape(format!("the routed layers: {e}")))?;
-    PlanStacks::of(
-        &inputs.model,
-        StackFacts {
-            what: "solar2 stacks",
-            names: names::routed_stacks,
-            check: None,
-            empty: false,
-            map_layers: Some(run.len()),
-            unrouted: Vec::new(),
-        },
-    )
+    hosted_stacks(&inputs.model, "solar2 stacks", (run.len(), false))
 }
 
 /// The f32s of each store one checkpoint copies, in the layers' order: every
@@ -720,35 +679,7 @@ impl Body {
     ) -> Result<Body, GpuError> {
         let (hp, spec) = (&inputs.hp, &inputs.spec);
         gpu.context().bind_to_thread()?;
-        if plan.machine.cards.len() != 1 || !plan.machine.tiers.is_empty() {
-            return Err(shape(format!(
-                "a plan of {} cards and {} expert tiers; the program runs every layer on one \
-                 card with no expert tier",
-                plan.machine.cards.len(),
-                plan.machine.tiers.len()
-            )));
-        }
-        let layers = plan
-            .machine
-            .cards
-            .get(card)
-            .map(|c| c.layers.clone())
-            .ok_or_else(|| shape(format!("the plan has no card {card}")))?;
-        if layers != (0..spec.layers.len()) {
-            return Err(shape(format!(
-                "card {card} runs layers {layers:?}; the program runs every layer (0..{})",
-                spec.layers.len()
-            )));
-        }
-        let ctx = usize::try_from(plan.ctx_max)
-            .ok()
-            .filter(|&c| c > 0 && u32::try_from(c).is_ok())
-            .ok_or_else(|| {
-                shape(format!(
-                    "ctx_max {}: at least 1 and at most the positions a u32 counts",
-                    plan.ctx_max
-                ))
-            })?;
+        let (layers, ctx) = one_card_run(WHAT, plan, card, spec.layers.len())?;
         let dims = dims_of(inputs, ctx)?;
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
         let map = SlotMap::of_plan(plan, card, None, run.clone(), hp.experts.n_expert)?;
@@ -794,46 +725,29 @@ impl Body {
                 rms_eps: dims.rms_eps,
                 batch_rows: T_MAX,
             },
-        )?;
-        let boundary = Boundary::with_rows(
-            gpu.context(),
-            stream,
-            BoundaryShape {
-                hidden: dims.embd,
-                n_used: hp.experts.n_used,
-            },
-            LOAD_ROWS,
+            CARD,
         )?;
         let limits = (0..spec.layers.len())
             .map(|l| routed_limit(spec, l))
             .collect::<Result<Vec<_>, _>>()?;
-        // The common host-run build: a paged plan's NVMe expert tier is
-        // attached before the run's first call.
-        let experts = host_run(
-            gpu.context(),
-            plan,
-            file,
-            run.clone(),
-            host.r8,
-            set.arena(),
-            HostWidths {
-                embd: hp.n_embd,
-                ff: hp.experts.ff,
-                n_used: hp.experts.n_used,
-            },
+        let mut hybrid = hosted_hybrid(
+            (gpu, file, plan),
+            (run.clone(), map),
+            (host, set, &glue),
+            (
+                HostWidths {
+                    embd: hp.n_embd,
+                    ff: hp.experts.ff,
+                    n_used: hp.experts.n_used,
+                },
+                LOAD_ROWS,
+            ),
             |src| {
                 run.clone()
                     .map(|l| solar_host::layer(src, hp, l, limits[l]))
                     .collect()
             },
         )?;
-        glue.attach_tier(experts.tier())?;
-        let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
-        hybrid.watch_fault(gpu.fault_word())?;
-        hybrid.keep_residency(set);
-        // The residency machine frees arena slots between passes, which a
-        // card hold keeps: a load that starts one keeps the host leg.
-        hybrid.attach_arena_leg(gpu, glue.source().is_some())?;
         let table = EmbedTable::new(Arc::clone(file), &names::token_embd(), dims.embd)?;
         if table.n_vocab() != hp.n_vocab {
             return Err(shape(format!(
@@ -1216,10 +1130,10 @@ fn store(
 ) -> Result<Store, GpuError> {
     let stream = gpu.stream();
     let site = |name: String, rows_k: (usize, usize), allowed: &[SiteTy]| {
-        typed_site(file, w, name, rows_k, allowed)
+        Site::of_file((file, w), WHAT, name, rows_k, allowed)
     };
     let embd = d.embd;
-    let norm = vector(w, names::attn_norm(l), embd)?;
+    let norm = site::vector(w, WHAT, names::attn_norm(l), embd)?;
     if matches!(inputs.spec.layers[l].mixer, Mixer::Gqa(_)) {
         let (q_rows, kv_rows) = (d.heads * HEAD, d.kv_heads * HEAD);
         return Ok(Store::Gqa(GqaLayer {
@@ -1253,10 +1167,10 @@ fn store(
         out: site(names::attn_output(l), (embd, v), KQUANT)?,
         vecs: [
             norm,
-            vector(w, conv_joined(l), lin.channels() * CONV_TAPS)?,
-            vector(w, names::ssm_dt_bias(l), v)?,
-            vector(w, names::ssm_a(l), lin.n_v)?,
-            vector(w, names::ssm_norm(l), HEAD)?,
+            site::vector(w, WHAT, conv_joined(l), lin.channels() * CONV_TAPS)?,
+            site::vector(w, WHAT, names::ssm_dt_bias(l), v)?,
+            site::vector(w, WHAT, names::ssm_a(l), lin.n_v)?,
+            site::vector(w, WHAT, names::ssm_norm(l), HEAD)?,
         ],
     };
     // Lane 0 stands at position 0.

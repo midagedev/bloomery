@@ -390,7 +390,10 @@ gguf 7 2 0
 # BlockListed (flash_gqa.rs) is the second KeyWalk next to Listed: its trait method is an unsafe fn (declaration and impl, the
 # Listed impl keeping the one it had), the impl reads the block id and the cache row in two blocks, and the
 # gqa_flash_seg_mma_p16_blocks entry makes the one call into seg_mma_ps. Each with its SAFETY line.
-gpu 2027 239 10
+# PIN(2026-10-21): gpu 2027 -> 2030 blocks, new code, not old code relaxed: two new kernel entries for the four-slot
+# routed counts (MiniMax-M3's), ds41_ffn_handoff_4's call into handoff_at and ds41_ffn_card_acc_4's call into
+# card_acc_at and its write, each block with its SAFETY line.
+gpu 2030 239 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -480,7 +483,9 @@ gpu-mimo2 0 0 0
 # PIN(2026-10-21): gpu-minimaxm3 0 -> 19 blocks, 0 -> 1 fns, a new crate, not old code relaxed: the score and select kernels
 # (attn.rs) read and write their buffers through raw places and shared words, each block with its SAFETY line, and
 # enqueue_index is an unsafe fn, as the head kernel it calls (the positions are distinct).
-gpu-minimaxm3 19 1 0
+# PIN(2026-10-21): gpu-minimaxm3 19 -> 21 blocks, new code, not old code relaxed: the step's two launches of those head
+# kernels (the index heads and the attention heads, one token, so the positions are distinct), each with its SAFETY line.
+gpu-minimaxm3 21 1 0
 gpu-solar2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and
 # write their buffers through the same raw places as V4.1's, each block with its SAFETY line — vis_attn_h72 17, vis_rope2d_h72 4,

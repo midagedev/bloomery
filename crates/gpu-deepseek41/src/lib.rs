@@ -35,6 +35,7 @@ pub mod markov;
 pub mod params;
 pub mod rope;
 pub mod router;
+pub mod shared_routed;
 pub mod span;
 pub mod swap;
 pub mod transpose;

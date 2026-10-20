@@ -1,20 +1,15 @@
-//! The seat the Solar-Open2 gates drive the body through (`gate_solar2_e2e`, `gate_solar2_prefill`): the load, a reset, a prompt
-//! call and a step, each answering the last position's logits row, and the three reads a gate holds the body to — the layer
-//! outputs of the last call, a digest of every store, the card's fault word. A gate includes it by `#[path]`.
+//! The seat the Solar-Open2 gates drive the body through (`gate_solar2_e2e`, `gate_solar2_prefill`): the load of the body on the
+//! gate card and the [`Seat`] calls over it ([`crate::lcpp_e2e`] holds the trait and its contract), and the tap ceilings of
+//! Solar's layers. A gate includes it by `#[path]` beside `shared/lcpp_e2e.rs` and `shared/gate_card.rs`.
 //!
-//! The contract of each call is the body's, fixed here so the gates and the body ([`bloomery_gpu_solar2`]) are written against
-//! one text:
-//! - [`Seat::prompt`] runs `ids` from the seat's position by the prompt batch (up to `bloomery_gpu_solar2::body::T_MAX` rows a unit) and answers the last
-//!   id's logits row; [`Seat::step`] runs one id by the captured step;
-//! - [`Seat::taps`] is `layers * embd` values, layer `l`'s output at the last position of the last call at `[l * embd..]`,
-//!   whichever path ran it;
-//! - [`Seat::stores`] names every store the written positions fill — each KDA layer's state, stamp and conv ring, each GQA
-//!   layer's K and V planes over the written positions — with a 64-bit digest of its bytes ([`fnv1a`]), in layer order;
-//! - [`Seat::fault`] is `Ok` while the fault word is clean and the model not poisoned.
+//! The prompt call and the stores are the body's own ([`bloomery_gpu_solar2`]): [`Seat::prompt`] runs `ids` from the seat's
+//! position by the prompt batch (up to `bloomery_gpu_solar2::body::T_MAX` rows a unit); [`Seat::stores`] names each KDA layer's
+//! state, stamp and conv ring and each GQA layer's K and V planes over the written positions.
 
+use crate::lcpp_e2e::{self, Arm, Dims, Seat, fnv1a};
 use bloomery_gpu::model::StepMode;
-use bloomery_gpu_gates::tier::{self, Tier};
-use bloomery_gpu_gates::{GateError, ref_model_path};
+use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::tier::Tier;
 use bloomery_gpu_solar2::{Body, Solar2Model, set_prefill_group, set_taps};
 use gguf::Split;
 use model::arch::solar2::place::PlanInputs;
@@ -22,14 +17,6 @@ use model::placement::PlanLevers;
 use model::placement::workstation::{HostRead, PLAN_ROOM};
 use refset::arch::solar2::ARCH;
 use std::path::{Path, PathBuf};
-
-/// What the loaded file's shape is: the layers a tap table has, the width of a layer's output and of a logits row.
-#[derive(Clone, Copy, Debug)]
-pub struct Dims {
-    pub layers: usize,
-    pub embd: usize,
-    pub vocab: usize,
-}
 
 /// The layers before the real file's stream carries its outlier channels: PAI's own CPU and GPU runs agree to a few percent there.
 pub const TAP_EARLY: usize = 4;
@@ -71,104 +58,9 @@ pub fn tap_ceils(tier: Tier) -> String {
     }
 }
 
-/// One loaded Solar-Open2 body on the gate card.
-pub trait Seat {
-    fn dims(&self) -> Dims;
-
-    /// Empty every store; the position is 0.
-    fn reset(&mut self) -> Result<(), GateError>;
-
-    /// The position the next id lands at.
-    fn pos(&self) -> u32;
-
-    /// Run `id` by the captured step; the logits row after it.
-    fn step(&mut self, id: u32) -> Result<Vec<f32>, GateError>;
-
-    /// Run `ids` by the prompt batch; the logits row after the last.
-    fn prompt(&mut self, ids: &[u32]) -> Result<Vec<f32>, GateError>;
-
-    /// Set the prompt group to `group` units a walk (`BLOOMERY_PREFILL_GROUP`'s meaning).
-    fn set_group(&mut self, group: usize) -> Result<(), GateError>;
-
-    /// Every layer's output at the last position of the last call.
-    fn taps(&mut self) -> Result<Vec<f32>, GateError>;
-
-    /// Every store's name and digest over the positions written so far.
-    fn stores(&mut self) -> Result<Vec<(String, u64)>, GateError>;
-
-    /// `Ok` while the card's fault word is clean and the model is not poisoned.
-    fn fault(&mut self) -> Result<(), GateError>;
-}
-
-/// The model file the profile names, checked before anything loads: a solar-open2 file, and under the fixture tier a whole
-/// fixture (`tier::Tier::check_file`). `recipe` is the `just` recipe that picks the profile.
+/// The model file the profile names, checked before anything loads ([`lcpp_e2e::model_path`]): a solar-open2 file.
 pub fn model_path(tier_now: Tier, recipe: &str) -> Result<PathBuf, GateError> {
-    let path = ref_model_path()?;
-    let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    if file.architecture() != Some(ARCH) {
-        return Err(format!(
-            "the model file is {:?}, want {ARCH} — run through `just {recipe}`, which picks the {ARCH} profile",
-            file.architecture()
-        )
-        .into());
-    }
-    let keys = [tier::VERSION_KEY, tier::SUBSET_KEY]
-        .into_iter()
-        .filter(|k| file.value(k).is_some());
-    tier_now.check_file(&path, keys)?;
-    Ok(path)
-}
-
-/// The placement arm a gate runs: plan (a), the largest card the stage with the experts that fit on it and the rest on the host,
-/// or plan (b′), the next-largest card an expert tier under the host tier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arm {
-    A,
-    Bp,
-}
-
-impl Arm {
-    /// The arm a `--arm` word names; any other word is refused by name.
-    pub fn parse(word: &str) -> Result<Arm, GateError> {
-        match word {
-            "a" => Ok(Arm::A),
-            "bp" => Ok(Arm::Bp),
-            _ => Err(format!("--arm is a or bp, got {word:?}").into()),
-        }
-    }
-
-    #[must_use]
-    pub fn word(self) -> &'static str {
-        match self {
-            Arm::A => "a",
-            Arm::Bp => "bp",
-        }
-    }
-}
-
-/// The arm the command line names: `--arm <a|bp>`, `a` without it. An argument it does not know is refused by name.
-pub fn arm_arg() -> Result<Arm, GateError> {
-    let mut args = std::env::args().skip(1);
-    let mut arm = Arm::A;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--arm" => arm = Arm::parse(&args.next().ok_or("--arm wants a or bp")?)?,
-            other => {
-                return Err(
-                    format!("unknown argument {other:?}: the gate takes --arm a|bp").into(),
-                );
-            }
-        }
-    }
-    Ok(arm)
-}
-
-/// FNV-1a over bytes: the digest a store is held to.
-#[must_use]
-pub fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    })
+    lcpp_e2e::model_path(tier_now, recipe, ARCH)
 }
 
 /// Open `file` on the gate card at `ctx` positions by the gate placement (`gate_card::plan_gate`) of `arm`: the body opened as

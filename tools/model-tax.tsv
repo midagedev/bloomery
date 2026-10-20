@@ -123,7 +123,7 @@ crates/gpu-gates/src/vision_seat.rs	minicpm	6	baseline D 6: media design: VideoR
 crates/gpu-gates/src/vision_seat.rs	qwen	7	baseline D 7: media design: VideoRule data per tower (vidcore)
 crates/gpu-vision/src/encoder.rs	deepseek	2	baseline D 2: media design: VideoRule data per tower (vidcore)
 crates/gpu/src/arch/hybrid.rs	nemotron	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
-crates/gpu/src/card_slots.rs	deepseek	20	baseline K 20: rename the kernel entries by what they compute (deferred)
+crates/gpu/src/card_slots.rs	deepseek	24	PIN(2026-10-21) deepseek: baseline K 20 + 4, the four-slot entry `ds41_ffn_card_acc_4` (MiniMax-M3 routes 4 a token): one more copy of the per-count entry, since a `#[kernel]` entry cannot be generic over the slot count; the deferred rename of the entries by what they compute absorbs it
 crates/gpu/src/dspark/head.rs	deepseek	3	baseline K 3: rename the kernel entries by what they compute (deferred)
 crates/gpu/src/fault.rs	deepseek	4	baseline P 4: MK1b per-program fault sites (after faultcov)
 crates/gpu/src/fault.rs	gemma	2	baseline P 2: MK1b per-program fault sites (after faultcov)
@@ -131,7 +131,7 @@ crates/gpu/src/fault.rs	glm	2	baseline P 2: MK1b per-program fault sites (after 
 crates/gpu/src/fault.rs	mimo	5	baseline P 5: MK1b per-program fault sites (after faultcov)
 crates/gpu/src/fault.rs	nemotron	4	baseline P 4: MK1b per-program fault sites (after faultcov)
 crates/gpu/src/fault.rs	qwen	4	baseline P 4: MK1b per-program fault sites (after faultcov)
-crates/gpu/src/host/handoff.rs	deepseek	31	baseline K 31: rename the kernel entries by what they compute (deferred)
+crates/gpu/src/host/handoff.rs	deepseek	35	PIN(2026-10-21) deepseek: baseline K 31 + 4, the four-slot entry `ds41_ffn_handoff_4` (MiniMax-M3 routes 4 a token): one more copy of the per-count entry, since a `#[kernel]` entry cannot be generic over the slot count; the deferred rename of the entries by what they compute absorbs it
 crates/hf/src/vocab.rs	qwen	5	PIN(2026-10-20) qwen: the qwen35 tokenizer pipeline name and regex; tokenizer programs are not yet described by ModelSpec
 crates/model/src/arch/coverage.rs	deepseek	13	baseline P 13: MK2 program by body
 crates/model/src/arch/coverage.rs	gemma	18	baseline P 18: MK2 program by body
@@ -180,10 +180,11 @@ crates/serve/src/lib.rs	deepseek	1	PIN(2026-10-21) deepseek: MK9/MK7 seat and to
 crates/vision/src/media.rs	minicpm	1	baseline D 1: media design: VideoRule data per tower (vidcore)
 crates/gpu-gates/src/bin/gate_radio_tower.rs	clef	4	PIN(2026-10-20) clef: the image sets' reader every tower gate shares is still named after Clef (refset::clefvis)
 crates/gpu-gates/src/bin/gate_radio_tower.rs	nemotron	5	PIN(2026-10-20) nemotron: the RADIO tower is Bolt's mmproj; the gate bin names its model until the tower gates take the model from a profile row
-crates/model/src/arch/mod.rs	minimax	1	PIN(2026-10-20) minimax: the family's module declaration (`pub mod minimaxm3;`); the module list is not a registry, so each family declares its directory here until the registry owns the modules
+crates/model/src/arch/mod.rs	minimax	4	PIN(2026-10-21) minimax: the family's module declaration (`pub mod minimaxm3;`), and its `model::arch::Arch` variant with the arms of `from_name` and `name`; the module list is not a registry and the enum lists the architectures a body runs, so each family adds its directory, variant and two arms here until the registry owns them
 crates/models/src/lib.rs	minimax	2	PIN(2026-10-20) minimax: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
-crates/placement/src/accepts.rs	minimax	1	PIN(2026-10-20) minimax: program_of matches every models::Arch exhaustively, so the variant needs an arm; None until the family's body adds its Program
-crates/gpu-gates/src/bin/shared/routed_legs.rs	minimax	2	PIN(2026-10-20) minimax: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body exists
+crates/placement/src/accepts.rs	minimax	4	PIN(2026-10-21) minimax: Program is the key of program_of, leg_arms and routed_rule, three exhaustive matches, so the family's variant has its line in each, and program_of's arm names it; the program would carry its own leg arms and routed rule
+crates/gpu-gates/src/bin/shared/routed_legs.rs	minimax	3	PIN(2026-10-21) minimax: family_of and skip_of match every models::Arch exhaustively, and family_name matches every placement Program for the count lines; the family has no routed-legs adapter until its body has one, and a Program name owner would take family_name's arms
+crates/model/src/arch/coverage.rs	minimax	1	PIN(2026-10-21) minimax: the expert-stack match in the coverage check is keyed by Program, so the minimax-m3 body's variant joins the common card leg's arm; the program would own its stack rule instead of the list naming programs
 crates/gpu-gates/src/bin/shared/systemone_clause.rs	clef	1	PIN(2026-10-20) clef: the suite of SystemOne requests the serve gates post (tools/ref/clef/suite.jsonl) has no neutral name; the decision release row owns the file
 crates/model/src/arch/mod.rs	solar	4	PIN(2026-10-20) solar: the family's module declaration (`pub mod solar_open2;`), and its `model::arch::Arch` variant with the arms of `from_name` and `name`; the module list is not a registry and the enum lists the architectures a body runs, so each family adds its directory, variant and two arms here until the registry owns them
 crates/models/src/lib.rs	solar	2	PIN(2026-10-20) solar: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
@@ -192,3 +193,4 @@ crates/model/src/arch/coverage.rs	solar	9	PIN(2026-10-20) solar: the coverage ro
 crates/gpu-gates/src/bin/shared/routed_legs.rs	solar	2	PIN(2026-10-21) solar: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body has one, and the count lines take the family's word from the common Program::name owner
 crates/gpu-gates/src/record.rs	solar	4	PIN(2026-10-20) solar: a seat's load and listening lines are one Kind each and its list another; the tiered seats' load lines share every field but the architecture word, so one Kind keyed by it replaces mimo2's and this one
 crates/gpu/src/fault.rs	solar	2	PIN(2026-10-20) solar: the fault table is per architecture by design: the `SOLAR2` step order and its `step_order::of` arm
+crates/gpu/src/fault.rs	minimax	2	PIN(2026-10-21) minimax: the fault table is per architecture by design: the `MINIMAXM3` step order and its `step_order::of` arm

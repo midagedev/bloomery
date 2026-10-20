@@ -434,6 +434,20 @@ impl Site {
         Site { name, ty, k }
     }
 
+    /// The site `name` of `rows` rows of `k` values in `file`: its type read from the header (one of `allowed`) and
+    /// checked against the resident weight, refused by name as `what`'s.
+    pub fn of_file(
+        (file, w): (&Split, &Weights),
+        what: &'static str,
+        name: String,
+        (rows, k): (usize, usize),
+        allowed: &[SiteTy],
+    ) -> Result<Site, GpuError> {
+        let ty = site::file_site(file, what, &name, (rows, k), allowed)?;
+        site::site(w, what, &name, (rows, k), ty)?;
+        Ok(Site::new(name, ty, k))
+    }
+
     /// The type that selects the launch.
     #[must_use]
     pub fn ty(&self) -> SiteTy {

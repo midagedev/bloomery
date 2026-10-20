@@ -250,6 +250,24 @@ pub fn file_site(
     }
 }
 
+/// The resident f32 vector `name` of `len` values, as its name: a vector of another length is refused by name as
+/// `what`'s.
+pub fn vector(
+    w: &Weights,
+    what: &'static str,
+    name: String,
+    len: usize,
+) -> Result<String, GpuError> {
+    let got = w.f32_buf(what, &name)?.len();
+    if got != len {
+        return Err(GpuError::shape(
+            what,
+            format!("{name} holds {got} values; the layer reads {len}"),
+        ));
+    }
+    Ok(name)
+}
+
 /// The resident weight of site `name`: of type `ty`, `rows` rows of `k`
 /// values — the type its file entry was read as ([`file_site`]); any other
 /// variant or shape is refused by name.

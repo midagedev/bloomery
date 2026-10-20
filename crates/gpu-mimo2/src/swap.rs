@@ -5,10 +5,10 @@
 //! ([`LIVE_DELAY`], [`DEADLINE`]) and the rows a pass runs ([`LOAD_ROWS`]).
 //!
 //! **Facts.**
-//! - The dense layer 0 holds none of the three stacks ([`StackFacts::empty`]);
+//! - The dense layer 0 holds none of the three stacks ([`bloomery_gpu::host::swap_source::StackFacts::empty`]);
 //!   every other trunk layer holds all three.
 //! - The slot map holds the routed run of the description
-//!   ([`runtime::layer::hosted`]): [`StackFacts::map_layers`] is that run's
+//!   ([`runtime::layer::hosted`]): [`bloomery_gpu::host::swap_source::StackFacts::map_layers`] is that run's
 //!   length.
 //! - No layer is unrouted: [`model::arch::mimo2::place::PlanInputs::read`]
 //!   refuses a file whose next-token layers carry tensors, so the load has
@@ -27,9 +27,8 @@
 //! its slot's bytes as it stands.
 
 use bloomery_gpu::GpuError;
-use bloomery_gpu::host::swap_source::{PlanStacks, StackFacts};
+use bloomery_gpu::host::swap_source::{PlanStacks, hosted_stacks};
 use model::arch::mimo2::place::PlanInputs;
-use model::arch::names::routed_stacks;
 use runtime::layer::hosted;
 
 use crate::body::slots::MAX_ROWS;
@@ -52,15 +51,5 @@ pub fn stacks(inputs: &PlanInputs) -> Result<PlanStacks, GpuError> {
         what: WHAT,
         detail: format!("the routed layers: {e}"),
     })?;
-    PlanStacks::of(
-        &inputs.model,
-        StackFacts {
-            what: WHAT,
-            names: routed_stacks,
-            check: None,
-            empty: true,
-            map_layers: Some(run.len()),
-            unrouted: Vec::new(),
-        },
-    )
+    hosted_stacks(&inputs.model, WHAT, (run.len(), true))
 }

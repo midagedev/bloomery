@@ -16,6 +16,11 @@ cuda-device.workspace = true
 cuda-host.workspace = true
 cuda-core.workspace = true
 bloomery-gpu = { path = "../gpu" }
+# The gated block and the routed block with its shared expert, and the 128/4 sigmoid router instance.
+bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41" }
+bloomery-gguf = { path = "../gguf" }
+bloomery-levers = { path = "../levers" }
+bloomery-models = { path = "../models" }
 # Host only: the file's hyperparameters the shape check reads, and the selection rule the gates follow.
 bloomery-model = { path = "../model" }
 bloomery-runtime = { path = "../runtime" }

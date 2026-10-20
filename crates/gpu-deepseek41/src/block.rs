@@ -396,16 +396,33 @@ pub fn enqueue_block(
     blk: &Block<'_>,
     io: BlockIo<'_>,
 ) -> Result<(), GpuError> {
+    let rule = Act::SwigluClamp { limit: blk.limit };
+    enqueue_block_act(gpu, w, k, s, (blk, rule), io)
+}
+
+/// [`enqueue_block`] under the activation `rule` (the block's `limit` is read by [`enqueue_block`] alone): a SwiGLU
+/// clamp as the block's limit says, or SwiGLU-OAI.
+///
+/// # Errors
+/// As [`enqueue_block`], and a rule the plan's kernels do not run.
+pub fn enqueue_block_act(
+    gpu: &Gpu,
+    w: &Weights,
+    k: &BlockKernels<'_>,
+    s: &mut Option<BlockScratch>,
+    (blk, rule): (&Block<'_>, Act),
+    io: BlockIo<'_>,
+) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let [gate, up, down] = blk.names;
     let BlockIo { x, h, y } = io;
     if blk.plan.gate_up == GateUp::Ds41 {
-        k.experts.enqueue_shexp_gate_up(
+        k.experts.enqueue_shexp_gate_up_act(
             stream,
             w.resident(BLOCK, gate)?,
             w.resident(BLOCK, up)?,
             x,
-            blk.limit,
+            rule,
             gpu.layer_sink(blk.layer)?,
             h,
         )?;
@@ -413,7 +430,6 @@ pub fn enqueue_block(
             return w.q8_gemv(gpu, BLOCK, down, h, y);
         }
     }
-    let rule = Act::SwigluClamp { limit: blk.limit };
     let fault = gpu.layer_sink(blk.layer)?;
     match blk.plan.gate_up {
         // The pair above wrote `h`.
@@ -463,6 +479,51 @@ pub fn enqueue_block(
     site::kgemv(gpu, &kk.gemv, (blk.plan.down, w, down), act, fault, y)
 }
 
+/// The buffers of [`enqueue_dense_layer`]: the residual after the mixer `x1` in, the normed row, the block's `h`
+/// and output, and the layer's output `dest`.
+pub struct DenseIo<'a> {
+    pub x1: &'a DeviceBuffer<f32>,
+    pub xn: &'a mut DeviceBuffer<f32>,
+    pub h: &'a mut DeviceBuffer<f32>,
+    pub out: &'a mut DeviceBuffer<f32>,
+    pub dest: &'a mut DeviceBuffer<f32>,
+}
+
+/// A dense layer's feed-forward sub-layer over one row: `dest = x1 + block(rms_norm(x1))` under `rule`, the
+/// block's launches as [`enqueue_block_act`] says and two more (the norm, the add). `norm` is the layer's
+/// `ffn_norm` gain and `eps` the model's RMS epsilon. Asynchronous, allocation-free, capturable.
+///
+/// # Errors
+/// As [`enqueue_block_act`].
+pub fn enqueue_dense_layer(
+    gpu: &Gpu,
+    w: &Weights,
+    k: &BlockKernels<'_>,
+    s: &mut Option<BlockScratch>,
+    (blk, rule): (&Block<'_>, Act),
+    (norm, eps): (&DeviceBuffer<f32>, f32),
+    io: DenseIo<'_>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let embd = io.x1.len();
+    let DenseIo {
+        x1,
+        xn,
+        h,
+        out,
+        dest,
+    } = io;
+    gpu.elem()
+        .enqueue_rms_norm(stream, x1, norm, eps, embd, 1, xn)?;
+    let io = BlockIo {
+        x: &*xn,
+        h,
+        y: &mut *out,
+    };
+    enqueue_block_act(gpu, w, k, s, (blk, rule), io)?;
+    gpu.elem().enqueue_add(stream, x1, out, embd, dest)
+}
+
 /// Enqueue the block over the first `cols` (1..=8) columns of `io.x`, token-major, each column's rows the
 /// one-row launch's bit for bit: a q8_0 block is the pair over the columns in one launch, then the q8_0 gemv
 /// over them; any other plan runs [`enqueue_block`] on each column's window of `io.x` and `io.y`, which hold
@@ -481,6 +542,23 @@ pub fn enqueue_block_cols(
     cols: usize,
     io: BlockIo<'_>,
 ) -> Result<(), GpuError> {
+    let rule = Act::SwigluClamp { limit: blk.limit };
+    enqueue_block_cols_act(gpu, w, k, s, (blk, rule), cols, io)
+}
+
+/// [`enqueue_block_cols`] under the activation `rule` (as [`enqueue_block_act`]).
+///
+/// # Errors
+/// As [`enqueue_block_cols`].
+pub fn enqueue_block_cols_act(
+    gpu: &Gpu,
+    w: &Weights,
+    k: &BlockKernels<'_>,
+    s: &mut Option<BlockScratch>,
+    (blk, rule): (&Block<'_>, Act),
+    cols: usize,
+    io: BlockIo<'_>,
+) -> Result<(), GpuError> {
     if !(1..=COLS_MAX).contains(&cols) {
         return Err(refuse(
             BLOCK,
@@ -491,13 +569,13 @@ pub fn enqueue_block_cols(
     match cols_launch(blk.plan) {
         ColsLaunch::Mcol => {
             let [gate, up, down] = blk.names;
-            k.experts.enqueue_shexp_gate_up_mcol(
+            k.experts.enqueue_shexp_gate_up_mcol_act(
                 gpu.stream(),
                 w.resident(BLOCK, gate)?,
                 w.resident(BLOCK, up)?,
                 x,
                 cols,
-                blk.limit,
+                rule,
                 gpu.layer_sink(blk.layer)?,
                 h,
             )?;
@@ -525,7 +603,7 @@ pub fn enqueue_block_cols(
                     h: &mut *h,
                     y: &mut yc,
                 };
-                enqueue_block(gpu, w, k, s, blk, io)?;
+                enqueue_block_act(gpu, w, k, s, (blk, rule), io)?;
             }
             Ok(())
         }

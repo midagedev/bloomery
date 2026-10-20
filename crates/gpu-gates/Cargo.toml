@@ -614,6 +614,10 @@ name = "gate_minimaxm3_msa"
 required-features = ["minimaxm3"]
 
 [[bin]]
+name = "gate_minimaxm3_e2e"
+required-features = ["minimaxm3"]
+
+[[bin]]
 name = "gate_gemma_embedding2_e2e"
 required-features = ["gemma-embedding2", "vision", "deepseek41"]
 

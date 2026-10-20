@@ -10,8 +10,8 @@
 //! [`FaultSite::ExpertId`] there.
 //!
 //! The entries are built per routed slot count a token — `ds41_ffn_handoff`
-//! for 6 (DeepSeek-V4.1), `_8` (GLM-5.3-Flash), `_9` (Bolt) and `_10`
-//! (Qwen3.8), the last three over one body ([`handoff_at`]) — and the
+//! for 6 (DeepSeek-V4.1), `_4` (MiniMax-M3), `_8` (GLM-5.3-Flash), `_9` (Bolt) and
+//! `_10` (Qwen3.8), all but the first over one body ([`handoff_at`]) — and the
 //! launcher picks the entry from the page's slot count ([`HandoffSlots::of`]),
 //! refusing any other by name.
 //! `ds41_ffn_handoff_10_cols` writes a row of several columns of ten slots in
@@ -46,14 +46,16 @@ const HANDOFF_THREADS: u32 = 256;
 /// Slots a token of the first entry, `ds41_ffn_handoff`, whose contract
 /// spells it as a literal.
 const N_USED: usize = 6;
-/// Slots a token of the `_8`, `_9` and `_10` entries, whose contracts spell
+/// Slots a token of the `_4`, `_8`, `_9` and `_10` entries, whose contracts spell
 /// them as literals.
+const SLOTS_4: usize = 4;
 const SLOTS_8: usize = 8;
 const SLOTS_9: usize = 9;
 const SLOTS_10: usize = 10;
 // The instance table's counts are the entries' own.
 const _: () = assert!(
-    HandoffSlots::Six.n() == N_USED
+    HandoffSlots::Four.n() == SLOTS_4
+        && HandoffSlots::Six.n() == N_USED
         && HandoffSlots::Eight.n() == SLOTS_8
         && HandoffSlots::Nine.n() == SLOTS_9
         && HandoffSlots::Ten.n() == SLOTS_10
@@ -63,6 +65,8 @@ const _: () = assert!(
 /// entry per count, picked at launch, and every other count refused by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandoffSlots {
+    /// `ds41_ffn_handoff_4`.
+    Four,
     /// `ds41_ffn_handoff`.
     Six,
     /// `ds41_ffn_handoff_8`.
@@ -83,7 +87,7 @@ impl fmt::Display for HandoffRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} routed slots a token: the handoff's entries are built for 6, 8, 9 and 10",
+            "{} routed slots a token: the handoff's entries are built for 4, 6, 8, 9 and 10",
             self.n_used
         )
     }
@@ -95,6 +99,7 @@ impl HandoffSlots {
     /// The entry for `n_used` slots a token, or the count refused.
     pub fn of(n_used: usize) -> Result<HandoffSlots, HandoffRefused> {
         match n_used {
+            4 => Ok(HandoffSlots::Four),
             6 => Ok(HandoffSlots::Six),
             8 => Ok(HandoffSlots::Eight),
             9 => Ok(HandoffSlots::Nine),
@@ -107,6 +112,7 @@ impl HandoffSlots {
     #[must_use]
     pub const fn n(self) -> usize {
         match self {
+            HandoffSlots::Four => 4,
             HandoffSlots::Six => 6,
             HandoffSlots::Eight => 8,
             HandoffSlots::Nine => 9,
@@ -361,6 +367,71 @@ mod handoff_kernels {
         // SAFETY: d < n, and the launch contract is `handoff_tier_at`'s at
         // SLOTS_8 slots; thread d is the launch's only thread at d.
         unsafe { handoff_tier_at::<SLOTS_8>(&a, &t, d, &mut timage, &mut tsel) };
+    }
+
+    /// [`ds41_ffn_handoff`] of four slots a token ([`handoff_at`]): threads
+    /// `s < 4` copy slot `s`'s id and weight and write its place.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            ids_in.len() >= 4,
+            w_in.len() >= 4,
+            map.len() >= row_off + n_expert,
+            x.len() >= n,
+            seq.len() >= 1,
+            n >= 4,
+            ids_at >= seq_at + 1,
+            wts_at >= ids_at + 4,
+            x_at >= wts_at + 4,
+            image.len() >= x_at + n,
+            sel.len() >= 4
+        )
+    )]
+    pub fn ds41_ffn_handoff_4(
+        ids_in: &[u32],
+        w_in: &[f32],
+        map: &[u32],
+        row_off: u32,
+        n_expert: u32,
+        x: &[f32],
+        seq: &[u32],
+        n: u32,
+        seq_at: u32,
+        ids_at: u32,
+        wts_at: u32,
+        x_at: u32,
+        fault: FaultSink,
+        mut image: DisjointSlice<u32>,
+        mut sel: DisjointSlice<u32>,
+    ) {
+        let d = thread::index_1d().get();
+        if d >= n as usize {
+            return;
+        }
+        let a = HandoffIn {
+            ids_in,
+            w_in,
+            map,
+            row_off,
+            n_expert,
+            x,
+            seq,
+            seq_at,
+            ids_at,
+            wts_at,
+            x_at,
+            fault,
+        };
+        // SAFETY: d < n, and the launch contract is `handoff_at`'s at
+        // SLOTS_4 slots; thread d is the launch's only thread at d.
+        unsafe { handoff_at::<SLOTS_4>(&a, d, &mut image, &mut sel) };
     }
 
     /// [`ds41_ffn_handoff`] of nine slots a token ([`handoff_at`]): threads
@@ -966,6 +1037,7 @@ impl HandoffKernels {
             detail: e.to_string(),
         })?;
         let what = match slots {
+            HandoffSlots::Four => "ds41_ffn_handoff_4",
             HandoffSlots::Six => "ds41_ffn_handoff",
             HandoffSlots::Eight => "ds41_ffn_handoff_8",
             HandoffSlots::Nine => "ds41_ffn_handoff_9",
@@ -1011,6 +1083,28 @@ impl HandoffKernels {
             HandoffSlots::Eight => {
                 let prep = self.module.prepare_ds41_ffn_handoff_8(cfg)?;
                 self.module.ds41_ffn_handoff_8(
+                    stream,
+                    &prep,
+                    h.ids,
+                    h.weights,
+                    h.map,
+                    row_off,
+                    n_expert,
+                    target.x,
+                    target.seq,
+                    at[0],
+                    at[1],
+                    at[2],
+                    at[3],
+                    at[4],
+                    fault,
+                    target.image,
+                    sel,
+                )?;
+            }
+            HandoffSlots::Four => {
+                let prep = self.module.prepare_ds41_ffn_handoff_4(cfg)?;
+                self.module.ds41_ffn_handoff_4(
                     stream,
                     &prep,
                     h.ids,
@@ -1421,18 +1515,16 @@ mod tests {
     }
 
     #[test]
-    fn slots_of_takes_six_eight_nine_and_ten_only() {
+    fn slots_of_takes_four_six_eight_nine_and_ten_only() {
+        const TAKEN: [usize; 5] = [4, 6, 8, 9, 10];
         for n in 0..=16 {
             match HandoffSlots::of(n) {
                 Ok(s) => {
-                    assert!(
-                        n == 6 || n == 8 || n == 9 || n == 10,
-                        "{n} slots picked an entry"
-                    );
+                    assert!(TAKEN.contains(&n), "{n} slots picked an entry");
                     assert_eq!(s.n(), n);
                 }
                 Err(e) => {
-                    assert!(n != 6 && n != 8 && n != 9 && n != 10, "{n} slots refused");
+                    assert!(!TAKEN.contains(&n), "{n} slots refused");
                     assert_eq!(e, HandoffRefused { n_used: n });
                     assert!(e.to_string().starts_with(&format!("{n} routed slots")));
                 }

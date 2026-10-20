@@ -56,6 +56,7 @@ use bloomery_levers::ChurnHosting;
 use cuda_core::{CudaContext, CudaStream, sys};
 use gguf::Split;
 use gguf::quant::GgmlType;
+use model::arch::names::routed_stacks;
 use model::placement::host_lock::{HostFile, HostSet, expert_run};
 use model::placement::{ModelTensor, ModelTensors, Plan};
 use model::r8file::R8Pair;
@@ -212,6 +213,28 @@ pub struct PlanStacks {
     types: Vec<Option<[GgmlType; 3]>>,
     map_layers: Option<usize>,
     unrouted: Vec<usize>,
+}
+
+/// The stacks of a hybrid family whose routed layers are one run of `run_len` layers: the common stack names
+/// ([`routed_stacks`]), no family check, the map holding the run's layers and none unrouted; `empty` whether a
+/// layer of the file may hold none of its stacks (a dense block). Refused by name as `what`'s, as [`PlanStacks::of`].
+/// Load-time only.
+pub fn hosted_stacks(
+    model: &ModelTensors,
+    what: &'static str,
+    (run_len, empty): (usize, bool),
+) -> Result<PlanStacks, GpuError> {
+    PlanStacks::of(
+        model,
+        StackFacts {
+            what,
+            names: routed_stacks,
+            check: None,
+            empty,
+            map_layers: Some(run_len),
+            unrouted: Vec::new(),
+        },
+    )
 }
 
 impl PlanStacks {

@@ -567,6 +567,12 @@ impl MsaScratch {
     pub fn rows(&self) -> usize {
         self.rows
     }
+
+    /// Device bytes of the three buffers.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.scores.num_bytes() + self.ids.num_bytes() + self.n_sel.num_bytes()
+    }
 }
 
 // --------------------------------------------------------------- launchers

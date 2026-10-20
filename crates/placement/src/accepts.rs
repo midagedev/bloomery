@@ -38,6 +38,11 @@ pub enum Program {
     /// on a card (the common pair) and the rest on the host tier, beside a
     /// shared expert; its KDA and NoPE GQA layers run the common owners.
     Solar2Body,
+    /// The minimax-m3 body (`crates/gpu-minimaxm3`): the routed experts the plan
+    /// puts on a card (the common pair) and the rest on the host tier, beside a
+    /// shared expert; its GQA layers select blocks by an index key
+    /// (`attention.indexer.*`) and its experts run `swigluoai`.
+    MiniMaxM3Body,
     /// The nemotron_h body (`crates/gpu/src/arch/nemotron_h`): whole-card,
     /// dense, its Mamba-2, NoPE GQA and squared-ReLU layers over the common
     /// kernels; no routed experts.
@@ -63,7 +68,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Glm5Next => Some(Program::Glm5nextBody),
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
         Arch::MiMo2 => Some(Program::Mimo2Body),
-        Arch::MiniMaxM3 => None,
+        Arch::MiniMaxM3 => Some(Program::MiniMaxM3Body),
         Arch::SolarOpen2 => Some(Program::Solar2Body),
         Arch::NemotronH => Some(Program::NemotronHBody),
         Arch::NemotronHMoe => Some(Program::NemotronHMoeBody),
@@ -85,6 +90,7 @@ impl Program {
             Self::Qwen38Body => "qwen38",
             Self::Mimo2Body => "mimo2",
             Self::Solar2Body => "solar2",
+            Self::MiniMaxM3Body => "minimaxm3",
             Self::NemotronHBody => "nemotron_h",
             Self::NemotronHMoeBody => "nemotron_h_moe",
             Self::GemmaEmbedding2Body => "gemma-embedding2",
@@ -268,7 +274,10 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: |ty| qwen38_gate_up(ty).is_some(),
             down: |ty| qwen38_down(ty).is_some(),
         }),
-        Program::Glm5nextBody | Program::Mimo2Body | Program::Solar2Body => Some(LegArms {
+        Program::Glm5nextBody
+        | Program::Mimo2Body
+        | Program::Solar2Body
+        | Program::MiniMaxM3Body => Some(LegArms {
             gate_up: kernels::card_gate_up_runs,
             down: kernels::card_down_runs,
         }),
@@ -311,7 +320,10 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             gate_up: |ty| qwen38_gate_up(ty).map(|_| leg_card_format(ty)),
             down: |ty| qwen38_down(ty).map(|_| leg_card_format(ty)),
         },
-        Program::Glm5nextBody | Program::Mimo2Body | Program::Solar2Body => RoutedRule::Leg {
+        Program::Glm5nextBody
+        | Program::Mimo2Body
+        | Program::Solar2Body
+        | Program::MiniMaxM3Body => RoutedRule::Leg {
             gate_up: common_leg_card,
             down: common_leg_card,
         },
@@ -343,7 +355,7 @@ mod tests {
     use super::*;
     use crate::placement::{ModelTensor, ModelTensors, Role};
 
-    const PROGRAMS: [Program; 9] = [
+    const PROGRAMS: [Program; 10] = [
         Program::Deepseek41Chain,
         Program::Qwen3moeBody,
         Program::Qwen35Body,
@@ -351,6 +363,7 @@ mod tests {
         Program::Qwen38Body,
         Program::Mimo2Body,
         Program::Solar2Body,
+        Program::MiniMaxM3Body,
         Program::NemotronHBody,
         Program::NemotronHMoeBody,
     ];

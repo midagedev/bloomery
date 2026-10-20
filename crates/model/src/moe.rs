@@ -1051,7 +1051,7 @@ fn serve_resolved(
     // and two reads of `x` an expert; a relu² leg's holds the ups alone, and
     // moves them to the up slots once the down has read them.
     let (first, up_site) = match run.form {
-        ExpertForm::Gated { .. } => (2 * n, "host_gate_up"),
+        ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } => (2 * n, "host_gate_up"),
         ExpertForm::Relu2 => (n, "host_up"),
     };
     let mut xl: Vec<&Tensor2> = relist(std::mem::take(xs));
@@ -1064,6 +1064,11 @@ fn serve_resolved(
         ExpertForm::Gated { limit } => {
             for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
                 sl.push(GroupInput::SwigluClamp(gate, up, limit));
+            }
+        }
+        ExpertForm::GatedOai { alpha, limit } => {
+            for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
+                sl.push(GroupInput::SwigluOai(gate, up, alpha, limit));
             }
         }
         ExpertForm::Relu2 => {
@@ -2066,8 +2071,10 @@ pub fn experts_union_into<'x>(
 /// What a host tier needs to serve one layer's routed experts, in the
 /// file's own terms: the three stacks' tensor names, the expert count, the
 /// widths and the routed experts' SwiGLU limit — the gated reading of a
-/// layer ([`ExpertForm::Gated`], which [`HostLayer::build`] serves it by);
-/// the relu² reading has its own spec ([`Relu2Spec`], [`HostLayer::build_relu2`]).
+/// layer ([`ExpertForm::Gated`], which [`HostLayer::build`] serves it by, or
+/// [`ExpertForm::GatedOai`], which [`HostLayer::build_oai`] serves it by, the
+/// spec's limit the OAI rule's); the relu² reading has its own spec
+/// ([`Relu2Spec`], [`HostLayer::build_relu2`]).
 /// The architecture fills it; this module reads no model's names or keys.
 pub struct HostLayerSpec<'a> {
     pub gate: &'a str,
@@ -2599,6 +2606,46 @@ impl HostLayer {
         )
     }
 
+    /// [`HostLayer::build`] for a SwiGLU-OAI layer ([`ExpertForm::GatedOai`]):
+    /// the same three stacks and the same checks, the spec's `swiglu_limit`
+    /// the OAI rule's `limit` and `alpha` beside it, like the relu² form, an
+    /// activation fact the load resolves. A non-finite or negative limit and
+    /// a non-finite or non-positive alpha are refused by name.
+    pub fn build_oai(
+        src: R8Source<'_>,
+        spec: &HostLayerSpec<'_>,
+        alpha: f32,
+    ) -> Result<HostLayer, ModelError> {
+        if !(spec.swiglu_limit.is_finite() && spec.swiglu_limit >= 0.0) {
+            return Err(ModelError::Metadata {
+                key: "swiglu_oai limit".to_string(),
+                detail: format!(
+                    "the limit must be finite and not negative, got {}",
+                    spec.swiglu_limit
+                ),
+            });
+        }
+        if !(alpha.is_finite() && alpha > 0.0) {
+            return Err(ModelError::Metadata {
+                key: "swiglu_oai alpha".to_string(),
+                detail: format!("the alpha must be finite and positive, got {alpha}"),
+            });
+        }
+        Self::build_form(
+            src,
+            StackNames {
+                gate: Some(spec.gate),
+                up: spec.up,
+                down: spec.down,
+            },
+            (spec.n_expert, spec.embd, spec.ff),
+            ExpertForm::GatedOai {
+                alpha,
+                limit: spec.swiglu_limit,
+            },
+        )
+    }
+
     /// [`HostLayer::build`] for a relu² layer ([`Relu2Spec`]): the up and the
     /// down checked as the gated build checks them, no gate stack looked for.
     /// The form rides beside the spec like the r8 sidecar does: an activation
@@ -2616,7 +2663,8 @@ impl HostLayer {
         )
     }
 
-    /// [`HostLayer::build`] and [`HostLayer::build_relu2`]'s one body over
+    /// [`HostLayer::build`], [`HostLayer::build_oai`] and
+    /// [`HostLayer::build_relu2`]'s one body over
     /// the named stacks: a gate name (`Some`) is a stack the layer holds, found,
     /// checked and served; `None`, one it does not.
     fn build_form(
@@ -2803,10 +2851,15 @@ impl HostLayer {
     }
 
     /// The routed experts' SwiGLU limit, a gated layer's; `0.0` for a relu²
-    /// layer, which clamps nothing.
+    /// layer, which clamps nothing. A SwiGLU-OAI layer has no SwiGLU clamp (its
+    /// limit is the OAI rule's, [`HostLayer::form`]), so it panics by name
+    /// instead of handing that number to a clamp.
     pub fn swiglu_limit(&self) -> f32 {
         match self.form {
             ExpertForm::Gated { limit } => limit,
+            ExpertForm::GatedOai { .. } => {
+                panic!("swigluoai has no SwiGLU clamp: read the OAI rule's limit from the form")
+            }
             ExpertForm::Relu2 => 0.0,
         }
     }
@@ -3221,7 +3274,7 @@ impl HostLayer {
         // A relu² layer warms its up and its down; the stacks' gate slot is
         // the up again.
         let warmed = match self.form {
-            ExpertForm::Gated { .. } => &stacks[..],
+            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } => &stacks[..],
             ExpertForm::Relu2 => &stacks[1..],
         };
         'ids: for &id in ids {
@@ -3612,6 +3665,230 @@ mod tests {
             "the refusal names the lever, got {e:?}"
         );
         println!("refusal: {e}");
+    }
+
+    /// The OAI form's layer over `split`: the spec of [`build_layer`] with
+    /// `limit` and `alpha`.
+    fn build_oai_layer(
+        split: &gguf::Split,
+        (embd, ff, n_expert): (usize, usize, usize),
+        (alpha, limit): (f32, f32),
+    ) -> Result<HostLayer, crate::ModelError> {
+        HostLayer::build_oai(
+            R8Source::rows(split),
+            &HostLayerSpec {
+                gate: "gate_exps",
+                up: "up_exps",
+                down: "down_exps",
+                n_expert,
+                embd,
+                ff,
+                swiglu_limit: limit,
+            },
+            alpha,
+        )
+    }
+
+    /// A SwiGLU-OAI layer's list call is the OAI rule on the same weights:
+    /// per expert the gate and up dots, [`qdot::swiglu_oai`] over them, the
+    /// down over that, summed in list order — bit for bit the composition of
+    /// the allocating group entry — and it differs from the clamped form's
+    /// result over the same stacks.
+    #[test]
+    fn host_layer_oai_matches_the_rule_and_differs_from_the_clamp() {
+        let (embd, ff, n_expert) = (256, 256, 3);
+        let (alpha, limit) = (1.702f32, 7.0f32);
+        let path = layer_file("oai", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let src = R8Source::rows(&split);
+        let oai = build_oai_layer(&split, (embd, ff, n_expert), (alpha, limit)).unwrap();
+        assert_eq!(
+            oai.form(),
+            ExpertForm::GatedOai { alpha, limit },
+            "the layer carries its form"
+        );
+        let clamp = HostLayer::build(
+            src,
+            &HostLayerSpec {
+                gate: "gate_exps",
+                up: "up_exps",
+                down: "down_exps",
+                n_expert,
+                embd,
+                ff,
+                swiglu_limit: limit,
+            },
+        )
+        .unwrap();
+        let x = Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        let list = [(2u32, 0.5f32), (0, 0.25)];
+        let run = |layer: &HostLayer| {
+            let mut host = HostScratch::new(embd, ff, list.len()).unwrap();
+            let mut out = vec![f32::NAN; embd];
+            layer
+                .experts_into(src, &x, &list, &mut out, &mut host)
+                .unwrap();
+            out
+        };
+
+        let g = gguf::Gguf::open(&path).unwrap();
+        let view = |name: &str, e: u32| {
+            super::expert_view(g.find(name).unwrap(), e as usize, n_expert).unwrap()
+        };
+        let mut want = vec![0.0f32; embd];
+        for &(e, w) in &list {
+            let [gate, up, down] = ["gate_exps", "up_exps", "down_exps"].map(|n| view(n, e));
+            let gu = ops::matmul_q_group(&g, &[&gate, &up], &[&x, &x]).unwrap();
+            let mut act = vec![0.0f32; ff];
+            assert!(qdot::swiglu_oai(
+                &gu[0].data,
+                &gu[1].data,
+                alpha,
+                limit,
+                &mut act
+            ));
+            let act = Tensor2::from_vec(ff, 1, act);
+            let d = ops::matmul_q_group(&g, &[&down], &[&act]).unwrap();
+            for (o, &dv) in want.iter_mut().zip(d[0].col(0)) {
+                *o += w * dv;
+            }
+        }
+        let got = run(&oai);
+        let diff = got
+            .iter()
+            .zip(&want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!("oai layer vs the rule: diff_cells={diff}");
+        assert_eq!(diff, 0, "the layer's result must be the OAI composition");
+
+        let clamped = run(&clamp);
+        let apart = got
+            .iter()
+            .zip(&clamped)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            apart > 0,
+            "the OAI form must not give the clamped form's result"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A SwiGLU-OAI layer has no SwiGLU clamp: `swiglu_limit` panics by name
+    /// instead of returning the OAI rule's limit, while a clamped layer still
+    /// returns its own.
+    #[test]
+    fn host_layer_oai_has_no_swiglu_clamp_limit() {
+        let (embd, ff, n_expert) = (256, 256, 2);
+        let path = layer_file("oailimit", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let oai = build_oai_layer(&split, (embd, ff, n_expert), (1.702, 7.0)).unwrap();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| oai.swiglu_limit()));
+        std::fs::remove_file(&path).unwrap();
+        let payload = caught.expect_err("an OAI layer has no SwiGLU clamp to return");
+        let text = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            text.contains("swigluoai has no SwiGLU clamp"),
+            "the panic must name the rule, got {text:?}"
+        );
+    }
+
+    /// [`HostLayer::build_oai`] refuses by name a NaN alpha, a zero or
+    /// negative alpha, a negative limit and a non-finite limit, before it looks
+    /// for a stack.
+    #[test]
+    fn host_layer_build_oai_refuses_by_name() {
+        let (embd, ff, n_expert) = (256, 256, 2);
+        let path = layer_file("oairefuse", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        for (alpha, limit, want) in [
+            (f32::NAN, 7.0, "swiglu_oai alpha"),
+            (0.0, 7.0, "swiglu_oai alpha"),
+            (-1.0, 7.0, "swiglu_oai alpha"),
+            (1.702, -7.0, "swiglu_oai limit"),
+            (1.702, f32::NAN, "swiglu_oai limit"),
+            (1.702, f32::INFINITY, "swiglu_oai limit"),
+        ] {
+            let e = build_oai_layer(&split, (embd, ff, n_expert), (alpha, limit))
+                .err()
+                .unwrap_or_else(|| panic!("alpha {alpha}, limit {limit} must be refused"))
+                .to_string();
+            assert!(
+                e.contains(want),
+                "alpha {alpha}, limit {limit}: the refusal must name {want:?}, got {e:?}"
+            );
+        }
+        build_oai_layer(&split, (embd, ff, n_expert), (1.702, 0.0))
+            .expect("a zero limit is the rule's, not a refusal");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A union call over a SwiGLU-OAI layer writes, column for column and bit
+    /// for bit, what the one-column call writes: narrow (3 columns) and wide
+    /// (12).
+    #[test]
+    fn union_call_on_an_oai_layer_matches_its_columns() {
+        let (embd, ff, n_expert) = (256, 256, 6);
+        let path = layer_file("oaiunion", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let layer = build_oai_layer(&split, (embd, ff, n_expert), (1.702, 7.0)).unwrap();
+        let mut us = UnionScratch::new_routed(embd, ff, 16, 3).unwrap();
+        let mut host = HostScratch::new(embd, ff, 3).unwrap();
+        for cols in [3, 12] {
+            let x = Tensor2::from_vec(
+                embd,
+                cols,
+                (0..embd * cols)
+                    .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                    .collect(),
+            );
+            let lists: Vec<Vec<(u32, f32)>> = (0..cols)
+                .map(|j| {
+                    [0, 1, 3]
+                        .map(|s| (((j + s) % n_expert) as u32, 0.25 + 0.125 * s as f32))
+                        .to_vec()
+                })
+                .collect();
+            let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+            let mut want = vec![f32::NAN; embd * cols];
+            for (j, list) in lists.iter().enumerate() {
+                let xj = Tensor2::from_vec(embd, 1, x.col(j).to_vec());
+                layer
+                    .experts_into(
+                        R8Source::rows(&split),
+                        &xj,
+                        list,
+                        &mut want[j * embd..][..embd],
+                        &mut host,
+                    )
+                    .unwrap();
+            }
+            let mut got = vec![f32::NAN; embd * cols];
+            layer
+                .experts_union_into(R8Source::rows(&split), &x, &slices, &mut got, &mut us)
+                .unwrap();
+            let diff = got
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                diff, 0,
+                "{cols} columns: the union differs from its columns"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// A union call whose up reads other bytes than its gate — a Q3_K gate

@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
 use model::moe::HostLayer;
-use model::ops::RowLayout;
+use model::ops::{ExpertForm, RowLayout};
 
 use super::nvtier::NvTier;
 use super::page::MAX_ROWS;
@@ -152,12 +152,16 @@ impl LegLayer {
             GgmlType::Q6_K => DownAtEntry::Q6k,
             _ => return None,
         };
+        let rule = match host.form() {
+            ExpertForm::GatedOai { alpha, limit } => Act::SwigluOai { alpha, limit },
+            ExpertForm::Gated { .. } | ExpertForm::Relu2 => Act::SwigluClamp {
+                limit: host.swiglu_limit(),
+            },
+        };
         Some(LegLayer {
             gate_up,
             down,
-            rule: Act::SwigluClamp {
-                limit: host.swiglu_limit(),
-            },
+            rule,
             fault,
         })
     }

@@ -57,6 +57,14 @@ mod e2e;
 #[cfg(feature = "solar2")]
 #[allow(
     dead_code,
+    reason = "the engine serves several gates; each takes the calls it reads"
+)]
+#[path = "shared/lcpp_e2e.rs"]
+mod lcpp_e2e;
+
+#[cfg(feature = "solar2")]
+#[allow(
+    dead_code,
     reason = "the seat serves two gates; each takes the calls it reads"
 )]
 #[path = "shared/solar2_seat.rs"]
@@ -65,7 +73,8 @@ mod seat;
 #[cfg(feature = "solar2")]
 mod gate {
     use crate::e2e::{rel, top_ids, walk};
-    use crate::seat::{self, Seat};
+    use crate::lcpp_e2e::{Seat, arm_arg};
+    use crate::seat;
     use bloomery_gpu_gates::prompts::{k_of, log_softmax, sigma_lp};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
@@ -321,7 +330,7 @@ mod gate {
         let path = seat::model_path(tier_now, "gate-gpu-solar2-prefill")?;
         let ctx = T_MAX + 1 + CTX_SPARE;
         let t = std::time::Instant::now();
-        let arm = seat::arm_arg()?;
+        let arm = arm_arg()?;
         let mut seat = seat::open(&path, ctx, arm)?;
         let dims = seat.dims();
         println!(

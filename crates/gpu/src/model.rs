@@ -45,7 +45,7 @@ use crate::host::nvtier::{ArenaKind, NvTier};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
-use crate::hybrid::{Chain, HostResidency, Refusal};
+use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::watchdog;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
@@ -1881,6 +1881,123 @@ where
     let mut run = HostRun::build_at(Arc::clone(file), set, r8, widths, layers)?;
     run.attach_tier(arena)?;
     Ok(run)
+}
+
+/// The layers and the context a body that runs every layer on one card with no expert tier loads at: card `card`'s
+/// layers of `plan`, which must be `0..n_layers`, and `ctx_max` as a positive `u32` count of positions. Refused by
+/// name as `what`'s: a plan of other cards or an expert tier, another layer range, a context of no position or past
+/// the `u32` the position words count.
+pub fn one_card_run(
+    what: &'static str,
+    plan: &Plan<'_>,
+    card: usize,
+    n_layers: usize,
+) -> Result<(Range<usize>, usize), GpuError> {
+    if plan.machine.cards.len() != 1 || !plan.machine.tiers.is_empty() {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "a plan of {} cards and {} expert tiers; the program runs every layer on one card with no expert tier",
+                plan.machine.cards.len(),
+                plan.machine.tiers.len()
+            ),
+        ));
+    }
+    let layers = plan
+        .machine
+        .cards
+        .get(card)
+        .map(|c| c.layers.clone())
+        .ok_or_else(|| GpuError::shape(what, format!("the plan has no card {card}")))?;
+    if layers != (0..n_layers) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "card {card} runs layers {layers:?}; the program runs every layer (0..{n_layers})"
+            ),
+        ));
+    }
+    let ctx = usize::try_from(plan.ctx_max)
+        .ok()
+        .filter(|&c| c > 0 && u32::try_from(c).is_ok())
+        .ok_or_else(|| {
+            GpuError::shape(
+                what,
+                format!(
+                    "ctx_max {}: at least 1 and at most the positions a u32 counts",
+                    plan.ctx_max
+                ),
+            )
+        })?;
+    Ok((layers, ctx))
+}
+
+/// What the layers of a description agree on: the first layer's `value` is kept in `first`, and every other layer's
+/// must equal it, or the layer is refused by name as `what`'s `owner`.
+pub fn agreed<T: PartialEq + std::fmt::Debug>(
+    owner: &'static str,
+    what: &str,
+    l: usize,
+    first: &mut Option<T>,
+    value: T,
+) -> Result<(), GpuError> {
+    match first {
+        Some(f) if *f != value => Err(GpuError::shape(
+            owner,
+            format!("layer {l}: {what} is {value:?}, an earlier layer's {f:?}"),
+        )),
+        _ => {
+            first.get_or_insert(value);
+            Ok(())
+        }
+    }
+}
+
+/// The host tier of a hybrid body's load: the boundary of `rows` rows, the host run over `run` built by `layers`
+/// ([`host_run`]) and attached to the residency `glue`, and the [`Hybrid`] over them and the slot `map`, watching the
+/// card's fault word and keeping the host set `set` ([`HostResidency`]); the arena leg is attached when the load
+/// starts a residency machine. The one owner of a body's hybrid assembly after its stores and card experts.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the card, file, plan, run and map, the host levers and set, the glue, widths and rows, and the layers' builder, each named"
+)]
+pub fn hosted_hybrid<E>(
+    (gpu, file, plan): (&Gpu, &Arc<Split>, &Plan<'_>),
+    (run, map): (Range<usize>, SlotMap),
+    (host, set, glue): (HostCfg, HostResidency, &ResidencyGlue),
+    (widths, rows): (HostWidths, usize),
+    layers: impl FnOnce(R8Source<'_>) -> Result<Vec<HostLayer>, E>,
+) -> Result<Hybrid<HostRun>, GpuError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let boundary = Boundary::with_rows(
+        gpu.context(),
+        gpu.stream(),
+        BoundaryShape {
+            hidden: widths.embd,
+            n_used: widths.n_used,
+        },
+        rows,
+    )?;
+    let experts = host_run(
+        gpu.context(),
+        plan,
+        file,
+        run.clone(),
+        host.r8,
+        set.arena(),
+        widths,
+        layers,
+    )?;
+    glue.attach_tier(experts.tier())?;
+    let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
+    hybrid.watch_fault(gpu.fault_word())?;
+    hybrid.keep_residency(set);
+    // The residency machine frees arena slots between passes, which a card hold keeps: a load that starts one keeps
+    // the host leg.
+    hybrid.attach_arena_leg(gpu, glue.source().is_some())?;
+    Ok(hybrid)
 }
 
 /// The steps of a placed load before its body: the plan's card and context

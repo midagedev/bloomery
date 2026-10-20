@@ -39,6 +39,7 @@
 
 use bloomery_gpu::cores::q3k_row_dot;
 use bloomery_gpu::fault::FaultSink;
+use bloomery_gpu::kquant::Act;
 use bloomery_gpu::kquant::act::{self, ACT_SWIGLU_CLAMP};
 pub use bloomery_gpu::kquant::act::{silu_ik, swiglu_clamp};
 use bloomery_gpu::q8f32::{q8_0_lane_partial_1col, q8_0_lane_partials_mcol};
@@ -179,7 +180,8 @@ mod experts_kernels {
             4 * qs_u.len() >= n_rows * k,
             32 * d_u.len() >= n_rows * k,
             x.len() >= k,
-            h.len() >= n_rows
+            h.len() >= n_rows,
+            act <= 2
         )
     )]
     pub fn ds41_shexp_gate_up(
@@ -190,6 +192,7 @@ mod experts_kernels {
         x: &[f32],
         n_rows: u32,
         k: u32,
+        act: u32,
         limit: f32,
         fault: FaultSink,
         mut h: DisjointSlice<f32>,
@@ -210,7 +213,7 @@ mod experts_kernels {
         let fu = unsafe { q8_0_lane_partial_1col(qs_u, d_u, x, k, row, 0, lane) };
         let u = warp::reduce_sum_f32(fu);
         if lane == 0 {
-            let v = act::apply_checked(ACT_SWIGLU_CLAMP, limit, g, u, fault);
+            let v = act::apply_checked(act, limit, g, u, fault);
             // SAFETY: row < n_rows <= h.len() by the launch contract; lane 0
             // of the row's warp is its only writer.
             unsafe { *h.get_unchecked_mut(row) = v };
@@ -241,7 +244,8 @@ mod experts_kernels {
             x.len() >= m_cols * k,
             h.len() >= m_cols * n_rows,
             m_cols >= 1,
-            m_cols <= 8
+            m_cols <= 8,
+            act <= 2
         )
     )]
     pub fn ds41_shexp_gate_up_q8_0_mcol(
@@ -253,6 +257,7 @@ mod experts_kernels {
         n_rows: u32,
         k: u32,
         m_cols: u32,
+        act: u32,
         limit: f32,
         fault: FaultSink,
         mut h: DisjointSlice<f32>,
@@ -285,14 +290,14 @@ mod experts_kernels {
         let u = col_sums(fu, m);
         if lane == 0 {
             let v = [
-                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[0], u[0], fault),
-                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[1], u[1], fault),
-                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[2], u[2], fault),
-                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[3], u[3], fault),
-                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[4], u[4], fault),
-                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[5], u[5], fault),
-                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[6], u[6], fault),
-                act::apply_checked(ACT_SWIGLU_CLAMP, limit, g[7], u[7], fault),
+                act::apply_checked(act, limit, g[0], u[0], fault),
+                act::apply_checked(act, limit, g[1], u[1], fault),
+                act::apply_checked(act, limit, g[2], u[2], fault),
+                act::apply_checked(act, limit, g[3], u[3], fault),
+                act::apply_checked(act, limit, g[4], u[4], fault),
+                act::apply_checked(act, limit, g[5], u[5], fault),
+                act::apply_checked(act, limit, g[6], u[6], fault),
+                act::apply_checked(act, limit, g[7], u[7], fault),
             ];
             // SAFETY: slots c·n_rows + row for c < m are inside h (h.len() >=
             // m·n_rows) and belong to this row's warp alone.
@@ -429,7 +434,28 @@ impl ExpertKernels {
         fault: FaultSink,
         h: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
+        let rule = Act::SwigluClamp { limit };
+        self.enqueue_shexp_gate_up_act(stream, gate, up, x, rule, fault, h)
+    }
+
+    /// [`ExpertKernels::enqueue_shexp_gate_up`] under the rule `rule` (a SwiGLU clamp or SwiGLU-OAI; `SiluMul`
+    /// writes the plain `silu(g) · u`).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared gate-up launch inputs and its fault sink (rust-quality R8)"
+    )]
+    pub fn enqueue_shexp_gate_up_act(
+        &self,
+        stream: &CudaStream,
+        gate: &DevWeight,
+        up: &DevWeight,
+        x: &DeviceBuffer<f32>,
+        rule: Act,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
         let what = "enqueue_shexp_gate_up";
+        let (act, limit) = rule.code(what)?;
         let p = q8_pair(what, gate, up)?;
         let (n_rows, k) = (p.n_rows, p.k);
         if x.len() < k || h.len() < n_rows {
@@ -458,6 +484,7 @@ impl ExpertKernels {
             x,
             n_rows,
             k,
+            act,
             limit,
             fault,
             h,
@@ -474,18 +501,19 @@ impl ExpertKernels {
         clippy::too_many_arguments,
         reason = "enqueue_shexp_gate_up's inputs and the token count (rust-quality R8)"
     )]
-    pub fn enqueue_shexp_gate_up_mcol(
+    pub fn enqueue_shexp_gate_up_mcol_act(
         &self,
         stream: &CudaStream,
         gate: &DevWeight,
         up: &DevWeight,
         x: &DeviceBuffer<f32>,
         m: usize,
-        limit: f32,
+        rule: Act,
         fault: FaultSink,
         h: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "enqueue_shexp_gate_up_mcol";
+        let (act, limit) = rule.code(what)?;
         let p = q8_pair(what, gate, up)?;
         let (n_rows, k) = (p.n_rows, p.k);
         if !(1..=8).contains(&m) || x.len() < m * k || h.len() < m * n_rows {
@@ -519,11 +547,32 @@ impl ExpertKernels {
             n_rows,
             k,
             m,
+            act,
             limit,
             fault,
             h,
         )?;
         Ok(())
+    }
+
+    /// [`ExpertKernels::enqueue_shexp_gate_up_mcol_act`] under the SwiGLU clamp at `limit`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "enqueue_shexp_gate_up's inputs and the token count (rust-quality R8)"
+    )]
+    pub fn enqueue_shexp_gate_up_mcol(
+        &self,
+        stream: &CudaStream,
+        gate: &DevWeight,
+        up: &DevWeight,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        limit: f32,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let rule = Act::SwigluClamp { limit };
+        self.enqueue_shexp_gate_up_mcol_act(stream, gate, up, x, m, rule, fault, h)
     }
 }
 

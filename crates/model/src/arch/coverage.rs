@@ -1508,11 +1508,11 @@ pub fn check_with(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
-                // The mimo2 and solar2 bodies' rule: the same — a stack passes
-                // when the common card leg runs its type (`kernels::card_runs`)
-                // or the host runs it by a qdot fused kernel at the stack's row
-                // width.
-                Some(Program::Mimo2Body | Program::Solar2Body) => {
+                // The mimo2, solar2 and minimax-m3 bodies' rule: the same — a
+                // stack passes when the common card leg runs its type
+                // (`kernels::card_runs`) or the host runs it by a qdot fused
+                // kernel at the stack's row width.
+                Some(Program::Mimo2Body | Program::Solar2Body | Program::MiniMaxM3Body) => {
                     if routed_unrun(t, crate::placement::kernels::card_runs) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }

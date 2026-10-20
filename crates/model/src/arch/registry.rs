@@ -180,8 +180,7 @@ pub static ROWS: &[ArchRow] = &[
         fixture: None,
     },
     ArchRow {
-        // No `Arch` variant until a body runs the file: llama.cpp's spelling is the only string.
-        arch: None,
+        arch: Some(Arch::MiniMaxM3),
         names: &["minimax-m3"],
         read: Some(minimaxm3::spec::read),
         draft: None,
