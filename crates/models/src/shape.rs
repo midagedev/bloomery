@@ -80,7 +80,7 @@ pub enum RouterBody {
     /// `gpu/src/route_body.rs` `sigmoid_router_instance!`: sigmoid scores,
     /// the bias added for the pick only ([`rules::BIASED_SIGMOID`]). Its
     /// instances: `gpu-deepseek41/src/router.rs` `glm5next_router*`,
-    /// `mimo2_router*`, `sigmoid_320_8_router*`;
+    /// `mimo2_router*`, `sigmoid_320_8_router*`, `sigmoid_128_4_router*`;
     /// `gpu/src/arch/nemotron_h_moe/router.rs` `nemotron_moe_router_*`.
     BiasedSigmoid,
 }
@@ -291,6 +291,15 @@ pub const ROUTERS: &[RouterInst] = &[
         top_k_min: 8,
         top_k_max: 8,
         at: "gpu-deepseek41/src/router.rs sigmoid_320_8_router*",
+    },
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 128,
+        top_k_min: 4,
+        top_k_max: 4,
+        at: "gpu-deepseek41/src/router.rs sigmoid_128_4_router*",
     },
 ];
 
@@ -845,19 +854,20 @@ mod tests {
                 r.at.contains("mimo2_router")
                     || r.at.contains("glm5next_router")
                     || r.at.contains("sigmoid_320_8_router")
+                    || r.at.contains("sigmoid_128_4_router")
                     || r.at.contains("nemotron_moe_router"),
                 "{}",
                 r.at
             );
         }
         // The rows that carry the body: GLM's and MiMo's, then Bolt's five, then
-        // the 320-expert instance's.
+        // the 320-expert instance's, then the 128-expert one's.
         let widths: Vec<u32> = ROUTERS
             .iter()
             .filter(|r| super::body_eq(r.body, super::RouterBody::BiasedSigmoid))
             .map(RouterInst::experts)
             .collect();
-        assert_eq!(widths, [288, 256, 240, 304, 368, 432, 496, 320]);
+        assert_eq!(widths, [288, 256, 240, 304, 368, 432, 496, 320, 128]);
         // Coverage's `routes(n, &[BiasedSigmoid])`: the rule's shapes pass at
         // both widths, and a width between them is refused.
         let routes = |s| select_router(s).is_ok_and(|r| r.body == super::RouterBody::BiasedSigmoid);
@@ -868,7 +878,7 @@ mod tests {
         assert_eq!(
             e.why,
             Refusal::RouterWidth {
-                served: vec![288, 256, 240, 304, 368, 432, 496, 320]
+                served: vec![288, 256, 240, 304, 368, 432, 496, 320, 128]
             }
         );
     }
@@ -887,6 +897,27 @@ mod tests {
         assert!(router_row_is(r, rule, false, (8, 8)));
         let x = select_router(moe(rule, 320, 9)).expect_err("320 at top 9");
         assert_eq!(x.why, Refusal::TopK { min: 8, max: 8 });
+    }
+
+    /// The 128-expert sigmoid router (MiniMax-M3: top 4, sigmoid with a
+    /// selection bias, renormalized) is the `BiasedSigmoid` row at 128: four
+    /// experts a lane, its pick range 4 only. The `Dflash` row also has 128
+    /// experts, under another rule and body: the rule picks the row.
+    #[test]
+    fn sigmoid_128_4_router_is_its_row() {
+        let rule = rules::BIASED_SIGMOID;
+        let r = select_router(moe(rule, 128, 4)).expect("no router row at 128");
+        assert_eq!(r.body, super::RouterBody::BiasedSigmoid);
+        assert_eq!((r.experts(), r.per_lane()), (128, 4));
+        assert!(r.at.contains("sigmoid_128_4_router"), "{}", r.at);
+        assert_eq!(router_row(super::RouterBody::BiasedSigmoid, 128), r);
+        assert!(router_row_is(r, rule, false, (4, 4)));
+        for top_k in [3, 5, 8, 9] {
+            let x = select_router(moe(rule, 128, top_k)).expect_err("128 at another top k");
+            assert_eq!(x.why, Refusal::TopK { min: 4, max: 4 }, "{top_k}");
+        }
+        let dflash = select_router(moe(rules::BIASED_SQRT_SOFTPLUS, 128, 3)).expect("dflash");
+        assert_eq!(dflash.body, super::RouterBody::Dflash);
     }
 
     /// Bolt's routers (top 9) select only Bolt's rows: GLM's and MiMo's

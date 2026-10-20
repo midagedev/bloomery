@@ -1415,6 +1415,11 @@ gate-gpu-qwen35moe-attn:
 gate-gpu-gemma-embedding2-head512:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding2_head512 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_head512'
 
+# MiniMax-M3's attention head kernel (head 128, the first 64 values turned: norm, partial NEOX rope, f16 append), model-less at
+# the model's shapes (64/4 and 8/2 heads, θ 5e6): bit for bit the shared host transcription, the cache-position and overflow faults.
+gate-gpu-minimaxm3-rope:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_minimaxm3_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minimaxm3_rope'
+
 # Head-256 pack-one prefill, whole inputs and symmetric windows, against the f64 attention band.
 gate-gpu-gemma-embedding-head256:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding_head256 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding_head256'

@@ -1,8 +1,10 @@
 //! GPU gate for the sigmoid routers of `bloomery_gpu_deepseek41::router`,
-//! GLM-5.3-Flash's (`glm5next`), MiMo-V2.6-Flash's (`mimo2`) and the 320-expert
-//! instance Solar-Open2 uses (`sigmoid_320_8`): the experts
+//! GLM-5.3-Flash's (`glm5next`), MiMo-V2.6-Flash's (`mimo2`), the 320-expert
+//! instance Solar-Open2 uses (`sigmoid_320_8`) and the 128-expert one
+//! MiniMax-M3 uses (`sigmoid_128_4`): the experts
 //! scored `sigmoid(logit)`, a selection bias for the selection only, the top
-//! 8 by (value descending, index descending), the unbiased scores summed in
+//! 8 (4 at `sigmoid_128_4`) by (value descending, index descending), the
+//! unbiased scores summed in
 //! f64 in slot order, narrowed, guarded (`renorm_divisor`), each divided by
 //! it and scaled by the file's `expert_weights_scale`. Model-free: the router
 //! weight, the activations and the bias are seeded, so the gate needs no file
@@ -11,10 +13,13 @@
 //! The clauses below run once per instance, as its own cases, over the same
 //! host rule: `glm5next` at 288 experts and a scale of 2.5, then `mimo2` at
 //! 256 experts and a scale of 1, then `sigmoid_320_8` at 320 experts and a
-//! scale of 1. A line names its instance by the entry in `ties case=` and
+//! scale of 1, then `sigmoid_128_4` at 128 experts, the top 4 and a scale of
+//! 2. A line names its instance by the entry in `ties case=` and
 //! `graph op=`; the instance's header line opens its clauses. The entry names
 //! below are `glm5next`'s; the other instances' are the same with the prefix
-//! `mimo2_` and `sigmoid_320_8_`.
+//! `mimo2_`, `sigmoid_320_8_` and `sigmoid_128_4_`. The planted indices of the
+//! tie cases are taken modulo the instance's expert count, and the boundary
+//! cases sit at its pick count.
 //!
 //! One clause per rule, each its own verdict line:
 //! - `logits`: [`TOKENS`] one-token launches (`glm5next_router`) at
@@ -68,7 +73,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::route_core::{renorm_divisor, sigmoid};
     use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE};
-    use bloomery_gpu_deepseek41::router::{glm5next, mimo2, sigmoid_320_8};
+    use bloomery_gpu_deepseek41::router::{glm5next, mimo2, sigmoid_128_4, sigmoid_320_8};
     use bloomery_gpu_gates::rounding::butterfly;
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
     use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -80,11 +85,6 @@ mod gate {
     /// Tokens of the seeded clauses: seven full tiles of the batch score
     /// launch and a partial eighth.
     const TOKENS: usize = 61;
-    /// Experts each token routes to: every instance keeps eight.
-    const N_USED: usize = 8;
-    const _: () = assert!(
-        glm5next::N_USED == N_USED && mimo2::N_USED == N_USED && sigmoid_320_8::N_USED == N_USED
-    );
     /// CUDA's `expf` (the libdevice body the kernel calls): at most 2 ulp
     /// (CUDA C++ Programming Guide, mathematical functions), and `1 + expf`
     /// may be fused into its last step and round once — 2.5 ulp of `e^-x`,
@@ -101,6 +101,8 @@ mod gate {
         const OP: &'static str;
         /// Experts the instance routes over.
         const E: usize;
+        /// Experts each token routes to.
+        const USED: usize;
         /// The instance's `expert_weights_scale`.
         const SCALE: f32;
         type Kernels;
@@ -152,6 +154,7 @@ mod gate {
             impl Inst for $ty {
                 const OP: &'static str = $op;
                 const E: usize = $m::N_EXPERT;
+                const USED: usize = $m::N_USED;
                 const SCALE: f32 = $scale;
                 type Kernels = $m::RouterKernels;
                 type Out = $m::RouterOut;
@@ -240,6 +243,8 @@ mod gate {
     instance!(Mimo, mimo2, "mimo2_router", 1.0);
     // The 320-expert instance (Solar-Open2): scale 1 (the file's).
     instance!(Wide, sigmoid_320_8, "sigmoid_320_8_router", 1.0);
+    // The 128-expert instance (MiniMax-M3): the top 4, scale 2 (the file's).
+    instance!(Narrow, sigmoid_128_4, "sigmoid_128_4_router", 2.0);
 
     /// One f32 ulp at `v`: the spacing of f32 values at `|v|`'s binade (the
     /// subnormal spacing below the normal range).
@@ -285,19 +290,23 @@ mod gate {
         f
     }
 
-    /// The top [`N_USED`] of `key`, descending, an equal key to the larger id.
-    fn top_by<T: Copy>(key: &[T], cmp: impl Fn(&T, &T) -> std::cmp::Ordering) -> Vec<u32> {
+    /// The top `used` of `key`, descending, an equal key to the larger id.
+    fn top_by<T: Copy>(
+        key: &[T],
+        used: usize,
+        cmp: impl Fn(&T, &T) -> std::cmp::Ordering,
+    ) -> Vec<u32> {
         let mut idx: Vec<u32> = (0..key.len() as u32).collect();
         idx.sort_by(|&a, &b| cmp(&key[b as usize], &key[a as usize]).then(b.cmp(&a)));
-        idx.truncate(N_USED);
+        idx.truncate(used);
         idx
     }
 
-    /// The host selection on scores `p` and `bias`: the top [`N_USED`] of
+    /// The host selection on scores `p` and `bias`: the top `used` of
     /// `p + bias` in f32.
-    fn select(p: &[f32], bias: &[f32]) -> Vec<u32> {
+    fn select(p: &[f32], bias: &[f32], used: usize) -> Vec<u32> {
         let v: Vec<f32> = p.iter().zip(bias).map(|(&p, &b)| p + b).collect();
-        top_by(&v, f32::total_cmp)
+        top_by(&v, used, f32::total_cmp)
     }
 
     /// The weights rule on scores `p` at `ids`: summed in f64 in slot order,
@@ -332,7 +341,7 @@ mod gate {
     }
 
     /// What one-token launches leave, token-major: logits and scores
-    /// the instance's expert count a token, ids and weights [`N_USED`] a token, and the
+    /// the instance's expert count a token, ids and weights its pick count a token, and the
     /// ticket count after each launch.
     struct Routed {
         logits: Vec<f32>,
@@ -386,8 +395,8 @@ mod gate {
         let t = x.len() / k;
         let xd = DeviceBuffer::from_host(s, x)?;
         let mut probs = DeviceBuffer::<f32>::zeroed(s, I::E * t)?;
-        let mut ids = DeviceBuffer::<u32>::zeroed(s, N_USED * t)?;
-        let mut weights = DeviceBuffer::<f32>::zeroed(s, N_USED * t)?;
+        let mut ids = DeviceBuffer::<u32>::zeroed(s, I::USED * t)?;
+        let mut weights = DeviceBuffer::<f32>::zeroed(s, I::USED * t)?;
         I::enqueue_rows(
             &cx.rk,
             s,
@@ -439,7 +448,7 @@ mod gate {
         for t in 0..TOKENS {
             let xt = &sd.x[t * K..(t + 1) * K];
             let e_rows = t * I::E..(t + 1) * I::E;
-            let s_rows = t * N_USED..(t + 1) * N_USED;
+            let s_rows = t * I::USED..(t + 1) * I::USED;
             let lh: Vec<f32> = (0..I::E)
                 .map(|e| {
                     butterfly(std::array::from_fn(|lane| {
@@ -456,7 +465,7 @@ mod gate {
                 worst = worst.max((f64::from(p) - f64::from(h)).abs() / band);
                 max_ulps = max_ulps.max(ulps(p, h));
             }
-            ids_ok += usize::from(select(pk, &sd.bias) == ik);
+            ids_ok += usize::from(select(pk, &sd.bias, I::USED) == ik);
             weights_ok += usize::from(bits_equal(wk, &weights_rule(pk, ik, I::SCALE)));
         }
         let tickets_ok = r.tickets.iter().all(|&c| c == 0);
@@ -476,8 +485,9 @@ mod gate {
         ok &= pass;
         let pass = ids_ok == TOKENS;
         println!(
-            "ids tokens={TOKENS} equal to the host top {N_USED} of score + bias (ties to the larger id): \
+            "ids tokens={TOKENS} equal to the host top {} of score + bias (ties to the larger id): \
              {ids_ok}/{TOKENS} {}",
+            I::USED,
             verdict(pass)
         );
         ok &= pass;
@@ -494,7 +504,7 @@ mod gate {
         let (pb2, ib2, wb2) = batch_run(cx, w, &sd.x, K, bias)?;
         let same = (0..TOKENS)
             .filter(|&t| {
-                let (e, s) = (t * I::E..(t + 1) * I::E, t * N_USED..(t + 1) * N_USED);
+                let (e, s) = (t * I::E..(t + 1) * I::E, t * I::USED..(t + 1) * I::USED);
                 bits_equal(&pb[e.clone()], &r.probs[e])
                     && ib[s.clone()] == r.ids[s.clone()]
                     && bits_equal(&wb[s.clone()], &r.weights[s])
@@ -530,52 +540,68 @@ mod gate {
     /// Clause `ties`: planted ties against the rule's statement.
     fn ties<I: Inst>(cx: &Cx<I>) -> Result<bool, GateError> {
         let base: Vec<f32> = (0..I::E).map(|e| -3.0 + 0.01 * e as f32).collect();
+        // The planted indices are those of the 288- to 320-expert instances, taken
+        // modulo the instance's expert count (themselves where they are below it).
+        let at = |i: usize| i % I::E;
         let plant = |pairs: &[(usize, f32)]| {
             let mut v = base.clone();
             for &(i, val) in pairs {
-                v[i] = val;
+                v[at(i)] = val;
             }
             v
         };
         let zero = vec![0.0f32; I::E];
         let mut bias_decides = zero.clone();
-        bias_decides[7] = 0.5;
-        bias_decides[77] = 0.5;
-        let cases: Vec<(&str, Vec<f32>, Vec<f32>)> = vec![
+        bias_decides[at(7)] = 0.5;
+        bias_decides[at(77)] = 0.5;
+        let used = I::USED;
+        // `used − 1` distinct scores above the boundary, and two tied at the
+        // `used`-th and `used + 1`-th places.
+        const ABOVE: [f32; 7] = [6.0, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6];
+        assert!(
+            used - 1 <= ABOVE.len(),
+            "the boundary case plants {} scores",
+            ABOVE.len()
+        );
+        let mut boundary: Vec<(usize, f32)> = ABOVE[..used - 1]
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| (200 + k, v))
+            .collect();
+        boundary.extend([(100, 5.0), (250, 5.0)]);
+        let cases: Vec<(String, Vec<f32>, Vec<f32>)> = vec![
             (
-                "one_lane_in_top8",
+                format!("one_lane_in_top{used}"),
                 plant(&[(10, 10.0), (42, 10.0)]),
                 zero.clone(),
             ),
             (
-                "boundary_8_9",
-                plant(&[
-                    (200, 6.0),
-                    (201, 6.1),
-                    (202, 6.2),
-                    (203, 6.3),
-                    (204, 6.4),
-                    (205, 6.5),
-                    (206, 6.6),
-                    (100, 5.0),
-                    (250, 5.0),
-                ]),
+                format!("boundary_{used}_{}", used + 1),
+                plant(&boundary),
                 zero.clone(),
             ),
             (
-                "adjacent_lanes",
+                "adjacent_lanes".to_string(),
                 plant(&[(64, 7.0), (65, 7.0)]),
                 zero.clone(),
             ),
-            ("ends", plant(&[(0, 7.0), (I::E - 1, 7.0)]), zero.clone()),
             (
-                "three_way",
+                "ends".to_string(),
+                plant(&[(0, 7.0), (I::E - 1, 7.0)]),
+                zero.clone(),
+            ),
+            (
+                "three_way".to_string(),
                 plant(&[(5, 7.0), (37, 7.0), (200, 7.0)]),
                 zero.clone(),
             ),
-            ("all_equal", vec![1.0; I::E], zero.clone()),
-            ("bias_decides", vec![1.0; I::E], bias_decides),
-            ("all_zero_scores", vec![-200.0; I::E], zero.clone()),
+            ("all_equal".to_string(), vec![1.0; I::E], zero.clone()),
+            ("bias_decides".to_string(), vec![1.0; I::E], bias_decides),
+            (
+                "all_zero_scores".to_string(),
+                vec![-200.0; I::E],
+                zero.clone(),
+            ),
         ];
         let mut all = true;
         for (name, logits, bias) in cases {
@@ -585,8 +611,8 @@ mod gate {
                 .zip(&bias)
                 .map(|(&l, &b)| sigmoid64(l) + f64::from(b))
                 .collect();
-            let stated = top_by(&key, f64::total_cmp);
-            let host = select(&r.probs, &bias);
+            let stated = top_by(&key, I::USED, f64::total_cmp);
+            let host = select(&r.probs, &bias, I::USED);
             let w_ok = bits_equal(&r.weights, &weights_rule(&r.probs, &r.ids, I::SCALE));
             let finite = r.weights.iter().all(|w| w.is_finite());
             let fault = cx.gpu.take_fault()?;
@@ -610,7 +636,7 @@ mod gate {
         Ok(all)
     }
 
-    /// Clause `guard`: every logit −40, eight scores summing below 2^-42.
+    /// Clause `guard`: every logit −40, the picked scores summing below 2^-42.
     fn guard<I: Inst>(cx: &Cx<I>) -> Result<bool, GateError> {
         let r = planted(cx, &vec![-40.0; I::E], &vec![0.0; I::E])?;
         let sum: f64 = r.ids.iter().map(|&i| f64::from(r.probs[i as usize])).sum();
@@ -627,8 +653,9 @@ mod gate {
         let pass = w_ok && finite && sum < 2f64.powi(-42) && fault.is_none() && r.tickets == [0];
         println!(
             "guard logits=-40 selected_sum={sum:.3e} (< 2^-42) weights_bit_identical_guarded_rule={w_ok} \
-             finite={finite} differ_from_bare_sum={differ}/{N_USED} (the named difference, printed) \
+             finite={finite} differ_from_bare_sum={differ}/{} (the named difference, printed) \
              fault={} {}",
+            I::USED,
             fault.map_or("none".to_string(), |f| f.to_string()),
             verdict(pass)
         );
@@ -650,8 +677,9 @@ mod gate {
         let mut nan_w = sd.w.clone();
         nan_w[17 * K + 5] = f32::NAN;
         let nan_w = DeviceTensor::upload(s, &nan_w, I::E, K)?;
+        let inf_at = 200 % I::E;
         let mut inf_b = sd.bias.clone();
-        inf_b[200] = f32::NEG_INFINITY;
+        inf_b[inf_at] = f32::NEG_INFINITY;
         let inf_b = DeviceBuffer::from_host(s, &inf_b)?;
         let mut got = Vec::new();
         for (w, b) in [(&nan_w, &clean_b), (&clean_w, &inf_b)] {
@@ -663,7 +691,7 @@ mod gate {
         let pass = clean.is_none() && got.iter().all(|&(f, c)| f == want && c == 0);
         let show = |f: Option<Fault>| f.map_or("none".to_string(), |f| f.to_string());
         println!(
-            "fault clean={} nan_row17: one-token={} batch={} | bias200=-inf: one-token={} batch={} \
+            "fault clean={} nan_row17: one-token={} batch={} | bias{inf_at}=-inf: one-token={} batch={} \
              (want router) tickets={:?} {}",
             show(clean),
             show(got[0].0),
@@ -720,9 +748,10 @@ mod gate {
     /// Every clause at instance `I`; whether all passed.
     fn run_instance<I: Inst>(gpu: Gpu) -> Result<(Gpu, bool), GateError> {
         println!(
-            "== {} ({} experts, top {N_USED}, sigmoid, x{}) ==",
+            "== {} ({} experts, top {}, sigmoid, x{}) ==",
             I::OP,
             I::E,
+            I::USED,
             I::SCALE
         );
         let rk = I::load(gpu.context())?;
@@ -749,21 +778,29 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let (gpu, glm_ok) = run_instance::<Glm>(Gpu::new()?)?;
         let (gpu, mimo_ok) = run_instance::<Mimo>(gpu)?;
-        let (_gpu, wide_ok) = run_instance::<Wide>(gpu)?;
-        if glm_ok && mimo_ok && wide_ok {
+        let (gpu, wide_ok) = run_instance::<Wide>(gpu)?;
+        let (_gpu, narrow_ok) = run_instance::<Narrow>(gpu)?;
+        if glm_ok && mimo_ok && wide_ok && narrow_ok {
             println!(
-                "PASSED: {NAME} — {} ({}/{N_USED}, sigmoid, x{}), {} ({}/{N_USED}, sigmoid, x{}) and {} ({}/{N_USED}, sigmoid, x{}), each with its batch \
+                "PASSED: {NAME} — {} ({}/{}, sigmoid, x{}), {} ({}/{}, sigmoid, x{}), {} ({}/{}, sigmoid, x{}) and {} ({}/{}, sigmoid, x{}), each with its batch \
                  pair: logits, ids and weights bit-identical to the host rule over {TOKENS} seeded tokens, \
                  scores in the sigmoid band, 8 tie cases, the guard, the fault, the graph",
                 Glm::OP,
                 Glm::E,
+                Glm::USED,
                 Glm::SCALE,
                 Mimo::OP,
                 Mimo::E,
+                Mimo::USED,
                 Mimo::SCALE,
                 Wide::OP,
                 Wide::E,
-                Wide::SCALE
+                Wide::USED,
+                Wide::SCALE,
+                Narrow::OP,
+                Narrow::E,
+                Narrow::USED,
+                Narrow::SCALE
             );
             Ok(())
         } else {
