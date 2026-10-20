@@ -60,12 +60,19 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: pr-check-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          # `x86-64-v3` names the CPU level the step below builds at; a cache built at another level is never restored.
+          key: pr-check-x86-64-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            pr-check-${{ runner.os }}-
+            pr-check-x86-64-v3-${{ runner.os }}-
 
       - name: Python packages the tool self-tests import
         run: sudo apt-get install -y --no-install-recommends python3-numpy python3-pil
 
+      # A fixed CPU level, not contrib-check's own `native`: runners differ in CPU (Zen 3 and Zen 4 EPYCs, AVX-512 on
+      # one only) and share the cache above, whose key does not name the CPU. Under `native` the flag string is the same
+      # on both, so cargo reuses a dependency built for one runner on the other, where its test stops with SIGILL. The
+      # nightly builds at the same level (tools/nightly/run.sh).
       - name: contrib-check t0
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3
         run: just contrib-check --tier t0
