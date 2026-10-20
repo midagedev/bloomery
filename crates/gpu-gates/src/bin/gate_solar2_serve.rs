@@ -41,13 +41,11 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::Duration;
 
-    use bloomery_gpu_gates::record::{self, Log};
-    use bloomery_gpu_gates::serve_client::{
-        Served, check, curl, json_of, plan_run, serve_cmd, server_log,
-    };
+    use bloomery_gpu_gates::record;
+    use bloomery_gpu_gates::serve_client::{SeatGate, Served, check, curl, json_of, server_log};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
     use gguf::Split;
     use model::arch::solar2::place::PlanInputs;
@@ -79,65 +77,16 @@ mod gate {
     /// The words of the refusal of a second slot.
     const ONE_SEQUENCE: &str = "holds one sequence";
 
-    fn utf8(p: &Path) -> Result<&str, GateError> {
-        Ok(p.to_str()
-            .ok_or_else(|| format!("{} is not UTF-8", p.display()))?)
-    }
-
-    fn parse_args() -> Result<PathBuf, GateError> {
-        let mut dir = None;
-        let mut it = std::env::args().skip(1);
-        while let Some(flag) = it.next() {
-            let v = it
-                .next()
-                .ok_or_else(|| format!("{flag} needs a value: {USAGE}"))?;
-            match flag.as_str() {
-                "--dir" => dir = Some(PathBuf::from(v)),
-                other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
-            }
-        }
-        Ok(dir.ok_or(USAGE)?)
-    }
-
-    /// `bloomery-serve --model solar2 -m <file>` beside this binary.
-    fn command(file: &Path) -> Result<(std::process::Command, Vec<String>), GateError> {
-        Ok((
-            serve_cmd()?,
-            vec![
-                "--model".to_owned(),
-                "solar2".to_owned(),
-                "-m".to_owned(),
-                utf8(file)?.to_owned(),
-            ],
-        ))
-    }
-
-    /// `--plan` of `args`: its exit status, the log of its records and its text.
-    fn plan(
-        dir: &Path,
-        name: &str,
-        file: &Path,
-        args: &[&str],
-    ) -> Result<(std::process::ExitStatus, Log, String), GateError> {
-        let d = dir.join(name);
-        std::fs::create_dir_all(&d)?;
-        let (cmd, mut all) = command(file)?;
-        all.extend(args.iter().map(|a| (*a).to_owned()));
-        let all: Vec<&str> = all.iter().map(String::as_str).collect();
-        let err = d.join("server.err");
-        let (status, lines) = plan_run(cmd, &all, &err)?;
-        println!("{name}: {} --plan: {status}", args.join(" "));
-        Ok((
-            status,
-            server_log(&err, record::BLOOMERY_SERVE_SOLAR2)?,
-            lines.join("\n"),
-        ))
-    }
+    /// This gate's seat: the one server's model word and the kinds it prints.
+    const SEAT: SeatGate = SeatGate {
+        model: "solar2",
+        kinds: record::BLOOMERY_SERVE_SOLAR2,
+    };
 
     /// `parallel_above_one_is_refused` (the module header).
     fn parallel_above_one_is_refused(dir: &Path, file: &Path) -> Result<bool, GateError> {
         let mut ok = true;
-        let (status, log, text) = plan(dir, "refuse-parallel", file, &["--parallel", "2"])?;
+        let (status, log, text) = SEAT.plan(dir, "refuse-parallel", file, &["--parallel", "2"])?;
         let named = text.contains(ONE_SEQUENCE);
         let no_plan = log.first(&record::PLAN)?.is_none();
         println!(
@@ -162,7 +111,7 @@ mod gate {
         let mut ok = true;
         let d = dir.join("serve");
         std::fs::create_dir_all(&d)?;
-        let (cmd, mut all) = command(file)?;
+        let (cmd, mut all) = SEAT.command(file)?;
         all.extend(
             ["--port", "0", "--ctx", &CTX.to_string()]
                 .iter()
@@ -261,7 +210,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let dir = parse_args()?;
+        let dir = SEAT.dir(USAGE)?;
         std::fs::create_dir_all(&dir)?;
         let file = ref_model_path()?;
         let split = Split::open(&file).map_err(|e| format!("open {}: {e}", file.display()))?;

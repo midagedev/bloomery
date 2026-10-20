@@ -64,16 +64,16 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::Duration;
 
     use bloomery_gpu::model::ChainBody;
     use bloomery_gpu::{Gpu, GpuError, GpuModel, NemotronHModel, NemotronHMoeModel};
     use bloomery_gpu_gates::ctx_ladder::{ctx_line, default_line_held, field, rung_above};
-    use bloomery_gpu_gates::record::{self, Log};
+    use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        Answer, Served, agree, chat_is_those_ids, check, greedy, plan_run, rendered, serve_cmd,
-        server_log, tokenized,
+        Answer, SeatGate, Served, agree, chat_is_those_ids, check, greedy, rendered, server_log,
+        tokenized,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, generate, ref_model_path};
     use gguf::Split;
@@ -106,61 +106,11 @@ mod gate {
     /// The words of the refusal of a second slot.
     const ONE_SEQUENCE: &str = "holds one sequence";
 
-    fn utf8(p: &Path) -> Result<&str, GateError> {
-        Ok(p.to_str()
-            .ok_or_else(|| format!("{} is not UTF-8", p.display()))?)
-    }
-
-    fn parse_args() -> Result<PathBuf, GateError> {
-        let mut dir = None;
-        let mut it = std::env::args().skip(1);
-        while let Some(flag) = it.next() {
-            let v = it
-                .next()
-                .ok_or_else(|| format!("{flag} needs a value: {USAGE}"))?;
-            match flag.as_str() {
-                "--dir" => dir = Some(PathBuf::from(v)),
-                other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
-            }
-        }
-        Ok(dir.ok_or(USAGE)?)
-    }
-
-    /// `bloomery-serve --model nemotron -m <file>` beside this binary.
-    fn command(file: &Path) -> Result<(std::process::Command, Vec<String>), GateError> {
-        Ok((
-            serve_cmd()?,
-            vec![
-                "--model".to_owned(),
-                "nemotron".to_owned(),
-                "-m".to_owned(),
-                utf8(file)?.to_owned(),
-            ],
-        ))
-    }
-
-    /// `--plan` of `args`: its exit status and stderr's lines, the log of its records and its
-    /// text.
-    fn plan(
-        dir: &Path,
-        name: &str,
-        file: &Path,
-        args: &[&str],
-    ) -> Result<(std::process::ExitStatus, Log, String), GateError> {
-        let d = dir.join(name);
-        std::fs::create_dir_all(&d)?;
-        let (cmd, mut all) = command(file)?;
-        all.extend(args.iter().map(|a| (*a).to_owned()));
-        let all: Vec<&str> = all.iter().map(String::as_str).collect();
-        let err = d.join("server.err");
-        let (status, lines) = plan_run(cmd, &all, &err)?;
-        println!("{name}: {} --plan: {status}", args.join(" "));
-        Ok((
-            status,
-            server_log(&err, record::BLOOMERY_SERVE_NEMOTRON)?,
-            lines.join("\n"),
-        ))
-    }
+    /// This gate's seat: the one server's model word and the kinds it prints.
+    const SEAT: SeatGate = SeatGate {
+        model: "nemotron",
+        kinds: record::BLOOMERY_SERVE_NEMOTRON,
+    };
 
     /// The file's trained context.
     fn trained_ctx(file: &Path) -> Result<u64, GateError> {
@@ -177,7 +127,7 @@ mod gate {
     ) -> Result<(Option<u64>, bool), GateError> {
         let mut ok = true;
         let limit = trained_ctx(file)?;
-        let (status, log, text) = plan(dir, "plan", file, &[])?;
+        let (status, log, text) = SEAT.plan(dir, "plan", file, &[])?;
         let place = log.first(&record::PLACE_UNSET)?;
         let planned = log.first(&record::PLAN)?;
         let parallel_at = text
@@ -219,7 +169,7 @@ mod gate {
             });
             println!("plan only: the ctx line {line:?} holds its word at {c} {held}");
             let c_arg = c.to_string();
-            let (st, at_log, _) = plan(dir, "plan-at-default", file, &["--ctx", &c_arg])?;
+            let (st, at_log, _) = SEAT.plan(dir, "plan-at-default", file, &["--ctx", &c_arg])?;
             let stands = st.success()
                 && match at_log.first(&record::PLAN)? {
                     Some(p) => p.u64("ctx_max")? == c,
@@ -233,7 +183,8 @@ mod gate {
                 }
                 Some(above) => {
                     let above_arg = above.to_string();
-                    let (st, _, _) = plan(dir, "plan-past-default", file, &["--ctx", &above_arg])?;
+                    let (st, _, _) =
+                        SEAT.plan(dir, "plan-past-default", file, &["--ctx", &above_arg])?;
                     println!(
                         "plan only: --ctx {above}, the rung above, is refused {}",
                         !st.success()
@@ -254,7 +205,7 @@ mod gate {
     /// `parallel_above_one_is_refused` (the module header).
     fn parallel_above_one_is_refused(dir: &Path, file: &Path) -> Result<bool, GateError> {
         let mut ok = true;
-        let (status, log, text) = plan(dir, "refuse-parallel", file, &["--parallel", "2"])?;
+        let (status, log, text) = SEAT.plan(dir, "refuse-parallel", file, &["--parallel", "2"])?;
         let named = text.contains(ONE_SEQUENCE);
         let no_plan = log.first(&record::PLAN)?.is_none();
         println!(
@@ -441,7 +392,7 @@ mod gate {
         let mut ok = true;
         let d = dir.join("serve");
         std::fs::create_dir_all(&d)?;
-        let (cmd, mut all) = command(file)?;
+        let (cmd, mut all) = SEAT.command(file)?;
         all.extend(["--port".to_owned(), "0".to_owned()]);
         let all: Vec<&str> = all.iter().map(String::as_str).collect();
         let mut s = Served::spawn_cmd(cmd, &all, &d)?;
@@ -597,7 +548,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let dir = parse_args()?;
+        let dir = SEAT.dir(USAGE)?;
         std::fs::create_dir_all(&dir)?;
         let file = ref_model_path()?;
         let split = Split::open(&file).map_err(|e| format!("open {}: {e}", file.display()))?;

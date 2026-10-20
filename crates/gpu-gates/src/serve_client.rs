@@ -371,6 +371,74 @@ pub fn serve_cmd() -> Result<Command, GateError> {
     Ok(cmd)
 }
 
+/// The file's path as UTF-8, the command line's `-m` value.
+pub fn utf8(p: &Path) -> Result<&str, GateError> {
+    Ok(p.to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", p.display()))?)
+}
+
+/// A serve gate's seat: the model word the one server binary takes and the
+/// record kinds its server prints. The gate bins' `--dir`, their server command
+/// and their `--plan` run are one path over it, whatever seat drives them.
+pub struct SeatGate {
+    /// `--model <word>`.
+    pub model: &'static str,
+    /// The kinds the server prints, as [`server_log`] reads them.
+    pub kinds: &'static [&'static Kind],
+}
+
+impl SeatGate {
+    /// The `--dir <dir>` flag every serve gate takes; `usage` names the
+    /// binary.
+    pub fn dir(&self, usage: &str) -> Result<PathBuf, GateError> {
+        let mut dir = None;
+        let mut it = std::env::args().skip(1);
+        while let Some(flag) = it.next() {
+            let v = it
+                .next()
+                .ok_or_else(|| format!("{flag} needs a value: {usage}"))?;
+            match flag.as_str() {
+                "--dir" => dir = Some(PathBuf::from(v)),
+                other => return Err(format!("unknown argument {other:?}: {usage}").into()),
+            }
+        }
+        Ok(dir.ok_or(usage)?)
+    }
+
+    /// `bloomery-serve --model <model> -m <file>` beside this binary.
+    pub fn command(&self, file: &Path) -> Result<(Command, Vec<String>), GateError> {
+        Ok((
+            serve_cmd()?,
+            vec![
+                "--model".to_owned(),
+                self.model.to_owned(),
+                "-m".to_owned(),
+                utf8(file)?.to_owned(),
+            ],
+        ))
+    }
+
+    /// `--plan` of `args`: its exit status, the log of its records and its
+    /// text, the server's logs in `<dir>/<name>/`.
+    pub fn plan(
+        &self,
+        dir: &Path,
+        name: &str,
+        file: &Path,
+        args: &[&str],
+    ) -> Result<(std::process::ExitStatus, Log, String), GateError> {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d)?;
+        let (cmd, mut all) = self.command(file)?;
+        all.extend(args.iter().map(|a| (*a).to_owned()));
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let err = d.join("server.err");
+        let (status, lines) = plan_run(cmd, &all, &err)?;
+        println!("{name}: {} --plan: {status}", args.join(" "));
+        Ok((status, server_log(&err, self.kinds)?, lines.join("\n")))
+    }
+}
+
 /// `ids` agree with `reference`, a run that did not stop at the
 /// end-of-generation id: all of them, or, when `stop` is `eos`, a prefix
 /// ending there.
