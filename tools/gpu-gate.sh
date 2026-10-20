@@ -433,7 +433,7 @@ PY
     # Under a bound of its own: a runner that hangs ends the case red (124), it does not hang the check.
     (cd "$t/tree" && timeout --kill-after=5 "${GB:-60}" "${gate_env[@]}" \
       BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
-      bash "$self" --test-locks "${TL:-$t}" "${GATE_BIN:-ok}" "${gate_args[@]}") > "$o" 2>&1
+      bash "$self" --test-locks "${TL:-$t}" "${GATE_BIN:-ok}" ${gate_args[@]+"${gate_args[@]}"}) > "$o" 2>&1
   }
   # judge <name> <rc> <want rc> <ERE that must match> [ERE that must not]. The output is matched as a here-string, never piped into
   # grep -q: under pipefail a writer still writing when grep exits on its first match fails the pipeline (Broken pipe), which read a
