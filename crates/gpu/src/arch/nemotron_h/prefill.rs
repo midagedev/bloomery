@@ -17,16 +17,18 @@
 
 use super::body::Body;
 use super::step::Layer;
-use crate::arch::hybrid::{RowBuffers, Shape, Site, norm_rows, residual_rows};
+use crate::arch::hybrid::{
+    RowBuffers, Shape, Site, WideCx, append_plane, norm_rows, project_wide, residual_rows,
+};
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
 use crate::flash_gqa::{GROUP_5, GqaArgs, HEAD};
-use crate::gemm::{GemmInput, GemmRoute};
+use crate::gemm::GemmRoute;
 use crate::head::Head;
 use crate::mamba2::{Mamba2PassScratch, StepsArgs};
 use crate::model::{GpuModel, MAX_PASS_ROWS};
-use crate::site::{self, SiteTy, SiteWeight, WideActs, WideKernels};
-use crate::tensor::{Pitched, WindowMut, dtod_2d};
+use crate::site::{WideActs, WideKernels};
+use crate::tensor::WindowMut;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, Window, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -145,14 +147,6 @@ impl Prompt {
     }
 }
 
-/// What every launch of a pass reads.
-struct Cx<'a> {
-    gpu: &'a Gpu,
-    w: &'a Weights,
-    wk: WideKernels<'a>,
-    m: usize,
-}
-
 /// The forms of width `k` in `acts`, or a named refusal.
 fn acts_at(acts: &mut [ActAt], k: usize) -> Result<&mut WideActs, GpuError> {
     acts.iter_mut()
@@ -163,10 +157,9 @@ fn acts_at(acts: &mut [ActAt], k: usize) -> Result<&mut WideActs, GpuError> {
         })
 }
 
-/// `y = W · x` for each of `sites` over the pass's `m` rows of `x`, `rows`
-/// output rows each: `x` quantized once into the forms the sites read.
+/// [`project_wide`] over the forms of the sites' width in `acts`.
 fn project(
-    cx: &Cx<'_>,
+    cx: &WideCx<'_>,
     (acts, route): (&mut [ActAt], &GemmRoute),
     layer: usize,
     x: &DeviceBuffer<f32>,
@@ -175,32 +168,7 @@ fn project(
     let Some(k) = sites.first().map(|s| s.0.k) else {
         return Ok(());
     };
-    if let Some(s) = sites.iter().find(|s| s.0.k != k) {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "sites of one input read one width: {} reads {}, not {k}",
-                s.0.name, s.0.k
-            ),
-        ));
-    }
-    let tys: Vec<SiteTy> = sites.iter().map(|s| s.0.ty).collect();
-    let a = acts_at(acts, k)?;
-    a.quantize(cx.gpu, &cx.wk, cx.gpu.layer_sink(layer)?, x, cx.m, &tys)?;
-    let input = a.input(x);
-    for (s, rows, y) in sites.iter_mut() {
-        site::gemm(
-            cx.gpu,
-            &cx.wk,
-            (s.ty, cx.w, SiteWeight::Resident(&s.name)),
-            *rows,
-            &input,
-            (route, GemmInput::PerSlot),
-            cx.m,
-            y,
-        )?;
-    }
-    Ok(())
+    project_wide(cx, (acts_at(acts, k)?, route), layer, x, sites)
 }
 
 impl Body {
@@ -265,7 +233,8 @@ impl Body {
         self.k
             .gemm
             .enqueue_route_dense(stream, m, &mut p.route, gpu.unlabelled_sink())?;
-        let cx = Cx {
+        let cx = WideCx {
+            what: WHAT,
             gpu,
             w,
             wk: WideKernels {
@@ -359,16 +328,6 @@ impl Body {
                         &mut [(&a.q, q_width, q), (&a.k, kv_width, k), (&a.v, kv_width, v)],
                     )?;
                     let f = size_of::<f32>();
-                    for h in 0..n_kv {
-                        let shape = Pitched {
-                            width: HEAD * f,
-                            rows: m,
-                            dev_pitch: kv_width * f,
-                            host_pitch: HEAD * f,
-                        };
-                        dtod_2d(stream, (k, h * HEAD * f), (kh, h * m * HEAD * f), shape)?;
-                        dtod_2d(stream, (v, h * HEAD * f), (vh, h * m * HEAD * f), shape)?;
-                    }
                     let append = PlaneAppend {
                         words,
                         first_word: P_ROWS,
@@ -376,20 +335,8 @@ impl Body {
                         m,
                         fault,
                     };
-                    let flash = gpu.flash();
-
-                    flash.enqueue_kv_append_planes(
-                        stream,
-                        &append,
-                        |h| Window::<f32>::of(kh, h * m * HEAD * f, m * HEAD),
-                        &mut a.kc,
-                    )?;
-                    flash.enqueue_kv_append_planes(
-                        stream,
-                        &append,
-                        |h| Window::<f32>::of(vh, h * m * HEAD * f, m * HEAD),
-                        &mut a.vc,
-                    )?;
+                    append_plane(gpu, &append, k, (kh, 0), &mut a.kc)?;
+                    append_plane(gpu, &append, v, (vh, 0), &mut a.vc)?;
                     let mut r0 = 0;
                     while r0 < m {
                         let mm = (m - r0).min(MAX_PASS_ROWS);

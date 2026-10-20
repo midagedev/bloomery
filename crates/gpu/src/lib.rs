@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub mod arch;
 pub mod cand;
 pub mod capsync;
+pub mod card_experts;
 pub mod card_leg;
 pub mod card_slots;
 pub mod checkpoint;
@@ -109,7 +110,9 @@ pub type NemotronHModel = GpuModel<arch::nemotron_h::Body>;
 
 /// The nemotron_h_moe engine: the whole model on one card.
 pub type NemotronHMoeModel = GpuModel<arch::nemotron_h_moe::Body>;
-pub use tensor::{DeviceTensor, PartedBuffer, Q8Act, TensorWindow, Window, WindowMut, window};
+pub use tensor::{
+    DeviceTensor, PartedBuffer, Pitched, Q8Act, TensorWindow, Window, WindowMut, dtod_2d, window,
+};
 
 /// Host-side failure: context creation, module loading, device allocation,
 /// launch, capture, or copy-back.

@@ -22,6 +22,7 @@ generate_ds41   argmax_finite_fault                      0           0
 generate_ds41   argmax_p_rows_fault                      0           0
 generate_ds41   argmax_rows_fault                        0           0
 generate_ds41   argmax_rows_finite_fault                 0           0
+generate_ds41   attn_out_gate_sigmoid                    0           0
 generate_ds41   cand_block_max                           0           0
 generate_ds41   cand_compact                             0           0
 generate_ds41   cand_remap                               0           0
@@ -215,6 +216,7 @@ generate_ds41   iq4_xs_gate_up_sel                       0           0
 generate_ds41   iq4_xs_gemv_sel                          0           0
 generate_ds41   iq4_xs_rows                              0           0
 generate_ds41   kda_conv_prep                            0           0
+generate_ds41   kda_conv_prep_sp2                        0           0
 generate_ds41   kda_delta                                0           0
 generate_ds41   kda_delta_lanes                          0           0
 generate_ds41   kpool_score                              0           0
@@ -358,6 +360,8 @@ generate_ds41   relu_sqr_quant32                         0           0
 generate_ds41   rms_norm                                 0           0
 generate_ds41   rope                                     0           0
 generate_ds41   router_topk                              0           0
+generate_ds41   sigmoid_320_8_router                     0           0
+generate_ds41   sigmoid_320_8_router_pick                0           0
 generate_ds41   swiglu                                   0           0
 generate_ds41   swiglu_act_quant32                       0           0
 generate_ds41   swiglu_quant32                           0           0
@@ -374,6 +378,7 @@ gate_e2e   argmax_finite_fault                      0           0
 gate_e2e   argmax_p_rows_fault                      0           0
 gate_e2e   argmax_rows_fault                        0           0
 gate_e2e   argmax_rows_finite_fault                 0           0
+gate_e2e   attn_out_gate_sigmoid                    0           0
 gate_e2e   cand_block_max                           0           0
 gate_e2e   cand_compact                             0           0
 gate_e2e   cand_remap                               0           0
@@ -505,6 +510,7 @@ gate_e2e   iq4_xs_gate_up_sel                       0           0
 gate_e2e   iq4_xs_gemv_sel                          0           0
 gate_e2e   iq4_xs_rows                              0           0
 gate_e2e   kda_conv_prep                            0           0
+gate_e2e   kda_conv_prep_sp2                        0           0
 gate_e2e   kda_delta                                0           0
 gate_e2e   kda_delta_lanes                          0           0
 gate_e2e   kpool_score                              0           0

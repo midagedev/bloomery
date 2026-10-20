@@ -10,7 +10,7 @@
 //! K-quants.
 //!
 //! A routed block runs around its host leg; the card computes the experts the
-//! slot map puts on it ([`crate::card`]), the host tier the rest:
+//! slot map puts on it ([`bloomery_gpu::card_experts`]), the host tier the rest:
 //! - [`front`]: `ffn_norm` RMS into the boundary's handoff region, the
 //!   sigmoid router over 256 experts with the selection bias (top 8, the
 //!   weights from the unbiased scores, normalized and scaled), the handoff
@@ -18,7 +18,7 @@
 //!   the host mark, from the layer's slot-map row — and the go. Three kernels
 //!   and the go.
 //! - [`shadow`]: while the host computes, the card's slots, six launches
-//!   ([`crate::card`]) ending in the card sum plus `x1`; none on a layer with
+//!   ([`bloomery_gpu::card_experts`]) ending in the card sum plus `x1`; none on a layer with
 //!   no card experts.
 //! - [`back`]: the wait, then the add of the host's routed sum and the
 //!   shadow's `acc + x1` (`x1` alone on a layer with no card experts). One
@@ -31,6 +31,7 @@
 
 use std::ops::Range;
 
+use bloomery_gpu::card_experts::Io;
 use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::{Boundary, Hybrid};
@@ -50,7 +51,6 @@ use model::r8file::R8Source;
 use runtime::layer::FfnKind;
 
 use crate::body::{Parts, WHAT, shape};
-use crate::card::Io;
 
 /// The block's tensors, named once at load.
 pub(crate) enum FfnNames {

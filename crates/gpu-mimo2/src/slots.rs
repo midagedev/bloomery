@@ -27,11 +27,13 @@
 
 use std::ops::Range;
 
+use bloomery_gpu::card_experts::{CardExperts, Io};
 use bloomery_gpu::flash_gqa::{GqaK192Args, HEAD, HEAD_K192};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::StepLeg;
 use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::run::HostRun;
+use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::hybrid::{Chain, HandoffTarget};
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::model::{ChainBody, RowHeads, SlotRange, SlotRows};
@@ -52,7 +54,6 @@ use super::{
     Body, Dims, Kernels, LayerCfg, LayerNames, RopeBase, Scratch, Seq, Store, WHAT, shape,
 };
 use crate::attn::{enqueue_append, enqueue_pass};
-use crate::card::{CardExperts, Io};
 use crate::ffn::FfnNames;
 use crate::program::walk_step;
 
@@ -248,13 +249,13 @@ impl Body {
                 format!("{} ids for a pass of {total} rows", ids.len()),
             ));
         }
-        if self.taps.is_some() {
+        if self.shell.taps.is_some() {
             return Err(state_in(
                 PASS,
                 "layer taps off (a pass of several slots writes none)",
             ));
         }
-        if self.hybrid.route_traced() {
+        if self.shell.hybrid.route_traced() {
             return Err(shape_in(
                 PASS,
                 "a pass of several slots with a route trace attached: the trace records one \
@@ -367,7 +368,7 @@ impl Body {
         });
         {
             let Body {
-                hybrid,
+                shell: TierShell { hybrid, .. },
                 cfg,
                 names,
                 dims,

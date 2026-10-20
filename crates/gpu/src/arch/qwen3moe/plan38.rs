@@ -20,7 +20,7 @@ use model::arch::coverage::turns_as_neox;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{
     Act, DeltaKind, Extra, Ffn, GdnGate, Gqa, HcKind, KHeadMap as SpecMap, Mixer, ModelSpec,
-    NgramRule, PoolRule, Residual, Score, Selector,
+    NgramRule, OutGate, PoolRule, Residual, Score, Selector,
 };
 
 /// What the plan's refusals name.
@@ -392,7 +392,7 @@ fn gqa_fits(g: &Gqa) -> bool {
     (g.heads as usize, g.kv_heads as usize, g.head_dim as usize)
         == (geo::N_HEAD, geo::N_KV, geo::HEAD)
         && g.qk_norm
-        && g.out_gate
+        && g.out_gate == OutGate::Packed
         && rope_ok(&g.rope)
         && select_ok
 }

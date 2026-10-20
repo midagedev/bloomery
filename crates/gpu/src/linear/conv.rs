@@ -2,10 +2,10 @@
 //! `m` tokens: the depthwise causal conv of every channel over its last
 //! [`CONV_TAPS`] inputs, SiLU, the L2 norm of each query and key head (the
 //! query also scaled by [`Q_SCALE`]), β and the decay, and the conv ring's
-//! new slots. Two entries run the same conv, norm and ring rule: the decay
+//! new slots. Three entries run the same conv, norm and ring rule: the decay
 //! of each value head (`gdn_conv_prep`, Gated DeltaNet), or of each (value
 //! head, key channel) (`kda_conv_prep`, Kimi Delta Attention as GLM-5.3-Flash
-//! runs it).
+//! runs it, and `kda_conv_prep_sp2`, as Solar-Open2 runs it).
 //!
 //! Positions: token `t` is position `pos[t]`, the words the embedding launch
 //! writes, `pos[t] = pos[0] + t`. Its predecessor at distance `d` (1 to
@@ -26,7 +26,7 @@
 //! whose predecessors are all the call's rows. The ring is touched by unit 0
 //! alone, each channel by one lane, its reads before its writes. A value
 //! head's lane 0 computes that head's β for its token, and its decay
-//! (`gdn_conv_prep`); in `kda_conv_prep` lane `l` computes the decay of key
+//! (`gdn_conv_prep`); in the KDA entries lane `l` computes the decay of key
 //! channels `l + 32·i` of the head.
 //!
 //! Numeric contract (the host rules [`conv_prep_host`] and
@@ -39,14 +39,18 @@
 //!   butterfly (16, 8, 4, 2, 1) in f64, the sum rounded to f32; `scale =
 //!   1 / max(√sum, eps)` in f32 (ggml's `l2_norm`), then `value·scale`, and
 //!   for a query that times [`Q_SCALE`];
-//! - β = [`sigmoid`]`(b)`;
+//! - β = [`sigmoid`]`(b)`, times 2 in `kda_conv_prep_sp2` (exact in f32);
 //! - `gdn_conv_prep`: decay = [`expf_ik`]`(`[`softplus`]`(a + dt)·ssm_a)` per
 //!   value head, `a` and `dt` of the head;
 //! - `kda_conv_prep`: per value head `h` and key channel `k`, `r = (f + dt)·
 //!   ssm_a_h` and decay = [`expf_ik`]`(lb·`[`sigmoid`]`(−r))`, `f` and `dt` of
 //!   channel `h·HEAD + k`, each product rounded — ik's `build_kda_beta_gate`
 //!   (`ssm_a = −e^A_log`, so `−r = e^A_log·(f + dt)`) with its delta op's exp.
-//!   `lb < 0` bounds the decay to `[e^lb, 1]`.
+//!   `lb < 0` bounds the decay to `[e^lb, 1]`;
+//! - `kda_conv_prep_sp2`: decay = [`expf_ik`]`(`[`softplus`]`(f + dt)·ssm_a)`
+//!   per (value head, key channel), `gdn_conv_prep`'s operations at key
+//!   granularity, unbounded (`ssm_a = −e^A_log`, so the decay is
+//!   `exp(−e^A_log·softplus(f + dt))`).
 //!
 //! No silent failure: a non-finite input, a conv sum that overflows, a norm
 //! sum that is not finite as f32 (the square of a finite value can be), a β
@@ -56,6 +60,7 @@
 //! zero head.
 
 use super::{BLOCK, CONV_ROWS, CONV_TAPS, HEAD, LinearShape, Q_SCALE, RING_ROWS, ring_input};
+use super::{KDA_BETA_X1, KDA_BETA_X2, KDA_GATE_SIGMOID, KDA_GATE_SOFTPLUS};
 use super::{expf_ik, sigmoid, silu, softplus};
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
@@ -340,9 +345,10 @@ unsafe fn conv_head(
     ok
 }
 
-/// The inputs one warp of [`kda_conv_prep`](conv_kernels) reads: the shared
+/// The inputs one warp of a KDA entry reads: the shared
 /// conv's, and the per-key decay's raw values `f` (`[m][n_v·HEAD]`), bias
-/// `dt_bias` (`[n_v·HEAD]`), `ssm_a` (`[n_v]`) and bound `lb`.
+/// `dt_bias` (`[n_v·HEAD]`), `ssm_a` (`[n_v]`) and bound `lb`, which only
+/// [`KDA_GATE_SIGMOID`] reads.
 #[derive(Clone, Copy)]
 struct KdaInputs<'a> {
     x: &'a [f32],
@@ -357,29 +363,45 @@ struct KdaInputs<'a> {
     n_v: usize,
 }
 
-/// One key channel's decay (module doc), each product rounded on its own;
-/// [`kda_decay_host`] is the same operations.
+/// One key channel's decay (module doc) under the gate `GATE`, each product
+/// rounded on its own; [`kda_decay_host`] is the same operations.
 #[inline(always)]
-fn kda_decay(f: f32, dt: f32, sa: f32, lb: f32) -> f32 {
-    let r = mul_rn_f32(f + dt, sa);
-    expf_ik(mul_rn_f32(lb, sigmoid(-r)))
+fn kda_decay<const GATE: u32>(f: f32, dt: f32, sa: f32, lb: f32) -> f32 {
+    const { assert!(GATE == KDA_GATE_SIGMOID || GATE == KDA_GATE_SOFTPLUS) };
+    if GATE == KDA_GATE_SIGMOID {
+        let r = mul_rn_f32(f + dt, sa);
+        expf_ik(mul_rn_f32(lb, sigmoid(-r)))
+    } else {
+        expf_ik(mul_rn_f32(softplus(f + dt), sa))
+    }
 }
 
-/// Token `t` of conv head `hp` for [`kda_conv_prep`](conv_kernels):
-/// [`conv_head`], then on a value head every lane's four key
-/// channels `lane + 32·i` of the head's decay, and lane 0's β. Whether every
-/// value stayed finite.
+/// One head's β (module doc) with the scale `BETA`.
+#[inline(always)]
+fn kda_beta<const BETA: u32>(b: f32) -> f32 {
+    const { assert!(BETA == KDA_BETA_X1 || BETA == KDA_BETA_X2) };
+    if BETA == KDA_BETA_X1 {
+        sigmoid(b)
+    } else {
+        mul_rn_f32(sigmoid(b), BETA as f32)
+    }
+}
+
+/// Token `t` of conv head `hp` for a KDA entry: [`conv_head`], then on a
+/// value head every lane's four key channels `lane + 32·i` of the head's
+/// decay under `GATE`, and lane 0's β scaled by `BETA`. Whether every value
+/// stayed finite.
 ///
 /// # Safety
 ///
 /// [`conv_head`]'s contract; the slices and `out` hold the lengths
-/// `kda_conv_prep`'s launch contract names.
+/// the KDA entries' launch contract names.
 #[allow(
     clippy::too_many_arguments,
     reason = "one token's coordinates and the warp's inputs and outputs, forwarded from the entry"
 )]
 #[inline(always)]
-unsafe fn kda_token(
+unsafe fn kda_token<const GATE: u32, const BETA: u32>(
     t: usize,
     p: usize,
     contiguous: bool,
@@ -409,7 +431,7 @@ unsafe fn kda_token(
             // (token, head, key channel).
             unsafe {
                 let (f, dt) = (*inp.f.get_unchecked(at), *inp.dt_bias.get_unchecked(k));
-                let dc = kda_decay(f, dt, sa, inp.lb);
+                let dc = kda_decay::<GATE>(f, dt, sa, inp.lb);
                 let ok_k = f.is_finite() & dt.is_finite() & dc.is_finite();
                 fin &= ok_k;
                 *out.decay.add(at) = if ok_k & sa.is_finite() { dc } else { f32::NAN };
@@ -421,7 +443,7 @@ unsafe fn kda_token(
             // (token, head).
             unsafe {
                 let b = *inp.b_raw.get_unchecked(at);
-                let bt = sigmoid(b);
+                let bt = kda_beta::<BETA>(b);
                 let ok_b = b.is_finite() & bt.is_finite();
                 fin &= ok_b;
                 *out.beta.add(at) = if ok_b { bt } else { f32::NAN };
@@ -434,7 +456,7 @@ unsafe fn kda_token(
 
 /// The call's inputs of the last `min(m, RING_ROWS)` tokens into their ring
 /// slots, this lane's four channels of head `hp`; after every read of the
-/// ring the call makes. `kda_conv_prep`'s; `gdn_conv_prep` keeps its inline
+/// ring the call makes. The KDA entries'; `gdn_conv_prep` keeps its inline
 /// store.
 ///
 /// # Safety
@@ -465,6 +487,113 @@ unsafe fn ring_store(
             unsafe { *ring.add(slot * ch + c) = *x.get_unchecked(t * ch + c) };
         }
         t += 1;
+    }
+}
+
+/// The KDA entries' body under the decay gate `GATE` and the β scale
+/// `BETA`, the entry's arguments forwarded flat: warp `4·block + warp` is
+/// unit `w / H` ([`units`]) and conv head `w % H`, `H = 2·n_k + n_v`;
+/// [`kda_token`] for each token of the unit, then unit 0 stores the ring. A
+/// value that was not finite raises [`FaultSite::LinearConv`]. `lb` is read
+/// by [`KDA_GATE_SIGMOID`] alone.
+///
+/// # Safety
+///
+/// The KDA entries' launch contract: the slices hold the lengths it names, `m
+/// >= 1`, `y`, `beta`, `decay` and `ring` hold the values it names and no
+/// other launch touches them; the block is 128 threads and the grid
+/// `⌈units(m)·H / 4⌉` blocks.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the kernel entry's arguments, forwarded flat"
+)]
+#[inline(always)]
+unsafe fn kda_conv_body<const GATE: u32, const BETA: u32>(
+    x: &[f32],
+    w: &[f32],
+    b_raw: &[f32],
+    f: &[f32],
+    dt_bias: &[f32],
+    ssm_a: &[f32],
+    pos: &[u32],
+    lb: f32,
+    eps: f32,
+    n_k: u32,
+    n_v: u32,
+    m: u32,
+    fault: FaultSink,
+    y: &mut DisjointSlice<f32>,
+    beta: &mut DisjointSlice<f32>,
+    decay: &mut DisjointSlice<f32>,
+    ring: &mut DisjointSlice<f32>,
+) {
+    let heads = (2 * n_k + n_v) as usize;
+    let ch = heads * HEAD;
+    let tid = thread::threadIdx_x() as usize;
+    let wi = thread::blockIdx_x() as usize * 4 + tid / 32;
+    let m = m as usize;
+    if wi >= units(m) * heads {
+        return; // warp-uniform
+    }
+    let lane = tid % 32;
+    let u = wi / heads;
+    let hp = wi - u * heads;
+    let inp = KdaInputs {
+        x,
+        w,
+        b_raw,
+        f,
+        dt_bias,
+        ssm_a,
+        lb,
+        eps,
+        n_k: n_k as usize,
+        n_v: n_v as usize,
+    };
+    let out = Outputs {
+        y: y.as_mut_ptr(),
+        beta: beta.as_mut_ptr(),
+        decay: decay.as_mut_ptr(),
+    };
+    let ring = ring.as_mut_ptr();
+    let (t0, t1) = if u == 0 {
+        (0, m.min(CONV_ROWS))
+    } else {
+        (u + CONV_ROWS - 1, u + CONV_ROWS)
+    };
+    // SAFETY: pos holds m >= 1 words by the contract.
+    let p0 = unsafe { *pos.get_unchecked(0) } as u64;
+    let mut ok = true;
+    let mut t = t0;
+    while t < t1 {
+        // SAFETY: t < m <= pos.len().
+        let p = unsafe { *pos.get_unchecked(t) };
+        // SAFETY: t < m and hp < heads by the guard, lane < 32; the
+        // contract's lengths, per key for f, dt_bias and decay; the ring
+        // is read only by unit 0, whose tokens these are when
+        // t < CONV_ROWS, and written below by the same lanes after these
+        // reads; (t, hp) is this warp's own.
+        ok &= unsafe {
+            kda_token::<GATE, BETA>(
+                t,
+                p as usize,
+                u64::from(p) == p0 + t as u64,
+                hp,
+                lane,
+                inp,
+                ring,
+                out,
+            )
+        };
+        t += 1;
+    }
+    if u == 0 {
+        // SAFETY: hp < heads and lane < 32; the contract's lengths; the
+        // ring's channels of head hp are this warp's, read above.
+        unsafe { ring_store(x, pos, m, ch, hp, lane, ring) };
+    }
+    if !ok {
+        fault.raise(FaultSite::LinearConv);
     }
 }
 
@@ -645,73 +774,67 @@ mod conv_kernels {
         mut decay: DisjointSlice<f32>,
         mut ring: DisjointSlice<f32>,
     ) {
-        let heads = (2 * n_k + n_v) as usize;
-        let ch = heads * HEAD;
-        let tid = thread::threadIdx_x() as usize;
-        let wi = thread::blockIdx_x() as usize * 4 + tid / 32;
-        let m = m as usize;
-        if wi >= units(m) * heads {
-            return; // warp-uniform
+        // SAFETY: the launch contract's lengths and block.
+        unsafe {
+            kda_conv_body::<KDA_GATE_SIGMOID, KDA_BETA_X1>(
+                x, w, b_raw, f, dt_bias, ssm_a, pos, lb, eps, n_k, n_v, m, fault, &mut y,
+                &mut beta, &mut decay, &mut ring,
+            );
         }
-        let lane = tid % 32;
-        let u = wi / heads;
-        let hp = wi - u * heads;
-        let inp = KdaInputs {
-            x,
-            w,
-            b_raw,
-            f,
-            dt_bias,
-            ssm_a,
-            lb,
-            eps,
-            n_k: n_k as usize,
-            n_v: n_v as usize,
-        };
-        let out = Outputs {
-            y: y.as_mut_ptr(),
-            beta: beta.as_mut_ptr(),
-            decay: decay.as_mut_ptr(),
-        };
-        let ring = ring.as_mut_ptr();
-        let (t0, t1) = if u == 0 {
-            (0, m.min(CONV_ROWS))
-        } else {
-            (u + CONV_ROWS - 1, u + CONV_ROWS)
-        };
-        // SAFETY: pos holds m >= 1 words by the contract.
-        let p0 = unsafe { *pos.get_unchecked(0) } as u64;
-        let mut ok = true;
-        let mut t = t0;
-        while t < t1 {
-            // SAFETY: t < m <= pos.len().
-            let p = unsafe { *pos.get_unchecked(t) };
-            // SAFETY: t < m and hp < heads by the guard, lane < 32; the
-            // contract's lengths, per key for f, dt_bias and decay; the ring
-            // is read only by unit 0, whose tokens these are when
-            // t < CONV_ROWS, and written below by the same lanes after these
-            // reads; (t, hp) is this warp's own.
-            ok &= unsafe {
-                kda_token(
-                    t,
-                    p as usize,
-                    u64::from(p) == p0 + t as u64,
-                    hp,
-                    lane,
-                    inp,
-                    ring,
-                    out,
-                )
-            };
-            t += 1;
-        }
-        if u == 0 {
-            // SAFETY: hp < heads and lane < 32; the contract's lengths; the
-            // ring's channels of head hp are this warp's, read above.
-            unsafe { ring_store(x, pos, m, ch, hp, lane, ring) };
-        }
-        if !ok {
-            fault.raise(FaultSite::LinearConv);
+    }
+
+    /// [`kda_conv_prep`] under Solar-Open2's rule (module doc): the decay
+    /// `exp(ssm_a · softplus(f + dt))`, no bound and so no `lb`, and `β =
+    /// 2·sigmoid(b)`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            x.len() >= m * (2 * n_k + n_v) * 128,
+            w.len() >= 4 * (2 * n_k + n_v) * 128,
+            b_raw.len() >= m * n_v,
+            f.len() >= m * n_v * 128,
+            dt_bias.len() >= n_v * 128,
+            ssm_a.len() >= n_v,
+            pos.len() >= m,
+            m >= 1,
+            y.len() >= m * (2 * n_k + n_v) * 128,
+            beta.len() >= m * n_v,
+            decay.len() >= m * n_v * 128,
+            ring.len() >= 11 * (2 * n_k + n_v) * 128
+        )
+    )]
+    pub fn kda_conv_prep_sp2(
+        x: &[f32],
+        w: &[f32],
+        b_raw: &[f32],
+        f: &[f32],
+        dt_bias: &[f32],
+        ssm_a: &[f32],
+        pos: &[u32],
+        eps: f32,
+        n_k: u32,
+        n_v: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        mut beta: DisjointSlice<f32>,
+        mut decay: DisjointSlice<f32>,
+        mut ring: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract's lengths and block. The bound is 0.0: the
+        // sigmoid gate alone reads it.
+        unsafe {
+            kda_conv_body::<KDA_GATE_SOFTPLUS, KDA_BETA_X2>(
+                x, w, b_raw, f, dt_bias, ssm_a, pos, 0.0, eps, n_k, n_v, m, fault, &mut y,
+                &mut beta, &mut decay, &mut ring,
+            );
         }
     }
 }
@@ -821,9 +944,10 @@ impl ConvKernels {
     }
 
     /// Enqueue the KDA conv and prep of `args.m` tokens: [`enqueue_conv_prep`]'s
-    /// grid, with one decay per (value head, key channel). Refuses `lb` that is
-    /// not below 0 by name (the decay's bound). Asynchronous, allocation-free,
-    /// capturable.
+    /// grid, with one decay per (value head, key channel) under `args.gate` and
+    /// β scaled by `args.beta_scale`. Refuses by name a gate and scale that no
+    /// entry runs together and a `Sigmoid` bound that is not below 0.
+    /// Asynchronous, allocation-free, capturable.
     ///
     /// [`enqueue_conv_prep`]: ConvKernels::enqueue_conv_prep
     pub fn enqueue_kda_conv_prep(
@@ -831,7 +955,7 @@ impl ConvKernels {
         stream: &CudaStream,
         args: KdaConvArgs<'_>,
     ) -> Result<(), GpuError> {
-        let what = "enqueue_kda_conv_prep";
+        const WHAT: &str = "enqueue_kda_conv_prep";
         let KdaConvArgs {
             x,
             b_raw,
@@ -841,7 +965,8 @@ impl ConvKernels {
             ssm_a,
             pos,
             shape,
-            lb,
+            gate,
+            beta_scale,
             eps,
             m,
             fault,
@@ -850,14 +975,16 @@ impl ConvKernels {
             decay,
             ring,
         } = args;
-        shape.check(what)?;
+        shape.check(WHAT)?;
         if m == 0 {
-            return Err(GpuError::shape(what, "need m >= 1, got m=0".to_owned()));
+            return Err(GpuError::shape(WHAT, "need m >= 1, got m=0".to_owned()));
         }
-        if lb.is_nan() || lb >= 0.0 {
+        if let KdaGateRule::Sigmoid { lower_bound } = gate
+            && (lower_bound.is_nan() || lower_bound >= 0.0)
+        {
             return Err(GpuError::shape(
-                what,
-                format!("lb={lb}: the decay's bound must be below 0"),
+                WHAT,
+                format!("lb={lower_bound}: the decay's bound must be below 0"),
             ));
         }
         let ch = shape.channels();
@@ -877,30 +1004,85 @@ impl ConvKernels {
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
             return Err(GpuError::shape(
-                what,
+                WHAT,
                 format!("{name}.len() {got} < {need}"),
             ));
         }
-        let grid = launch_u32(what, "grid", (units(m) * shape.conv_heads()).div_ceil(4))?;
-        let n_k = launch_u32(what, "n_k", shape.n_k)?;
-        let n_v = launch_u32(what, "n_v", nv)?;
-        let m = launch_u32(what, "m", m)?;
-        let prep = self
-            .module
-            .prepare_kda_conv_prep(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        self.module.kda_conv_prep(
-            stream, &prep, x, w, b_raw, f, dt_bias, ssm_a, pos, lb, eps, n_k, n_v, m, fault, y,
-            beta, decay, ring,
-        )?;
+        let grid = launch_u32(WHAT, "grid", (units(m) * shape.conv_heads()).div_ceil(4))?;
+        let n_k = launch_u32(WHAT, "n_k", shape.n_k)?;
+        let n_v = launch_u32(WHAT, "n_v", nv)?;
+        let m = launch_u32(WHAT, "m", m)?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        match (gate, beta_scale) {
+            (KdaGateRule::Sigmoid { lower_bound }, KdaBetaScale::X1) => {
+                let prep = self.module.prepare_kda_conv_prep(cfg)?;
+                self.module.kda_conv_prep(
+                    stream,
+                    &prep,
+                    x,
+                    w,
+                    b_raw,
+                    f,
+                    dt_bias,
+                    ssm_a,
+                    pos,
+                    lower_bound,
+                    eps,
+                    n_k,
+                    n_v,
+                    m,
+                    fault,
+                    y,
+                    beta,
+                    decay,
+                    ring,
+                )?;
+            }
+            (KdaGateRule::Softplus, KdaBetaScale::X2) => {
+                let prep = self.module.prepare_kda_conv_prep_sp2(cfg)?;
+                self.module.kda_conv_prep_sp2(
+                    stream, &prep, x, w, b_raw, f, dt_bias, ssm_a, pos, eps, n_k, n_v, m, fault, y,
+                    beta, decay, ring,
+                )?;
+            }
+            _ => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("no KDA entry runs gate {gate:?} with beta scale {beta_scale:?}"),
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+/// The KDA decay's rule: what each model's `A_log` and forget projection mean
+/// to the prep.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KdaGateRule {
+    /// Bounded sigmoid, `exp(lower_bound · sigmoid(−ssm_a·(f + dt)))` with
+    /// `lower_bound` below 0, bounding the decay to `[e^lower_bound, 1]`
+    /// (GLM-5.3-Flash; `kda_conv_prep`).
+    Sigmoid { lower_bound: f32 },
+    /// `exp(ssm_a · softplus(f + dt))`, no bound (Solar-Open2;
+    /// `kda_conv_prep_sp2`).
+    Softplus,
+}
+
+/// The scale on the KDA β = `sigmoid(b)`; `X2` is exact in f32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KdaBetaScale {
+    /// `sigmoid(b)` (`kda_conv_prep`).
+    X1,
+    /// `2 · sigmoid(b)` (`kda_conv_prep_sp2`).
+    X2,
 }
 
 /// [`ConvKernels::enqueue_kda_conv_prep`]'s arguments: [`ConvArgs`] with the
 /// per-key decay's inputs in place of `a_raw` — `f` (`[m][n_v·HEAD]`, the
 /// low-rank forget projection's output), `dt_bias` (`[n_v·HEAD]`), `ssm_a`
-/// (`[n_v]`, `−e^A_log`) and the bound `lb` (below 0) — and the decay written
-/// `[m][n_v][HEAD]`.
+/// (`[n_v]`, `−e^A_log`) and the rule `gate` — and the decay written
+/// `[m][n_v][HEAD]`, β `[m][n_v]` scaled by `beta_scale`.
 pub struct KdaConvArgs<'a> {
     pub x: &'a DeviceBuffer<f32>,
     pub b_raw: &'a DeviceBuffer<f32>,
@@ -910,7 +1092,8 @@ pub struct KdaConvArgs<'a> {
     pub ssm_a: &'a DeviceBuffer<f32>,
     pub pos: &'a DeviceBuffer<u32>,
     pub shape: LinearShape,
-    pub lb: f32,
+    pub gate: KdaGateRule,
+    pub beta_scale: KdaBetaScale,
     pub eps: f32,
     pub m: usize,
     pub fault: FaultSink,
@@ -920,8 +1103,7 @@ pub struct KdaConvArgs<'a> {
     pub ring: &'a mut DeviceBuffer<f32>,
 }
 
-/// What [`conv_prep_host`] and [`kda_conv_prep_host`] compute: the conv
-/// output, β, decay and the ring after the call, in the kernel's layouts.
+/// What [`conv_prep_host`] and [`kda_conv_prep_host`] compute: the conv output, β, decay and the ring after the call, in the kernel's layouts.
 pub struct ConvOut {
     pub y: Vec<f32>,
     pub beta: Vec<f32>,
@@ -1048,20 +1230,36 @@ pub fn conv_prep_host(
     }
 }
 
-/// The host twin of the KDA prep's per-key decay: `r = (f + dt)·ssm_a`,
-/// then `expf_ik(lb·sigmoid(−r))`, each product rounded, in ik's op order
-/// (`build_kda_beta_gate`: add, mul, scale by −1, sigmoid, scale by `lb`;
-/// the delta op's exp).
+/// The host twin of the KDA prep's per-key decay under `gate`. `Sigmoid`:
+/// `r = (f + dt)·ssm_a`, then `expf_ik(lower_bound·sigmoid(−r))`, each product
+/// rounded, in ik's op order (`build_kda_beta_gate`: add, mul, scale by −1,
+/// sigmoid, scale by the bound; the delta op's exp). `Softplus`:
+/// `expf_ik(softplus(f + dt)·ssm_a)`, the product rounded, the operations of
+/// `gdn_conv_prep`'s decay.
 #[must_use]
-pub fn kda_decay_host(f: f32, dt: f32, sa: f32, lb: f32) -> f32 {
-    let r = (f + dt) * sa;
-    expf_ik(lb * sigmoid(-r))
+pub fn kda_decay_host(f: f32, dt: f32, sa: f32, gate: KdaGateRule) -> f32 {
+    match gate {
+        KdaGateRule::Sigmoid { lower_bound } => {
+            let r = (f + dt) * sa;
+            expf_ik(lower_bound * sigmoid(-r))
+        }
+        KdaGateRule::Softplus => expf_ik(softplus(f + dt) * sa),
+    }
+}
+
+/// The host twin of the KDA prep's β: [`sigmoid`]`(b)` times the scale.
+#[must_use]
+pub fn kda_beta_host(b: f32, scale: KdaBetaScale) -> f32 {
+    match scale {
+        KdaBetaScale::X1 => sigmoid(b),
+        KdaBetaScale::X2 => sigmoid(b) * 2.0,
+    }
 }
 
 /// The host rule of [`ConvKernels::enqueue_kda_conv_prep`]: the conv part of
-/// [`conv_prep_host`], β as there, and the decay of every (token, value
-/// head, key channel) by [`kda_decay_host`]. Inputs as [`KdaConvArgs`] names
-/// them, host slices of the same lengths.
+/// [`conv_prep_host`], β by [`kda_beta_host`] and the decay of every (token,
+/// value head, key channel) by [`kda_decay_host`]. Inputs as [`KdaConvArgs`]
+/// names them, host slices of the same lengths.
 ///
 /// # Panics
 ///
@@ -1082,7 +1280,8 @@ pub fn kda_conv_prep_host(
     pos: &[u32],
     ring: &[f32],
     shape: LinearShape,
-    lb: f32,
+    gate: KdaGateRule,
+    beta_scale: KdaBetaScale,
     eps: f32,
     m: usize,
 ) -> ConvOut {
@@ -1094,7 +1293,7 @@ pub fn kda_conv_prep_host(
         for h in 0..nv {
             let at = t * nv + h;
             let b = b_raw[at];
-            let bt = sigmoid(b);
+            let bt = kda_beta_host(b, beta_scale);
             beta[at] = if b.is_finite() && bt.is_finite() {
                 bt
             } else {
@@ -1103,7 +1302,7 @@ pub fn kda_conv_prep_host(
             let sa = ssm_a[h];
             for k in 0..HEAD {
                 let (fk, dt) = (f[at * HEAD + k], dt_bias[h * HEAD + k]);
-                let dc = kda_decay_host(fk, dt, sa, lb);
+                let dc = kda_decay_host(fk, dt, sa, gate);
                 let fin = [fk, dt, sa, dc].iter().all(|v| v.is_finite());
                 decay[at * HEAD + k] = if fin { dc } else { f32::NAN };
             }
@@ -1119,7 +1318,7 @@ pub fn kda_conv_prep_host(
 
 #[cfg(test)]
 mod tests {
-    use super::{conv_prep_host, kda_conv_prep_host, kda_decay_host};
+    use super::{KdaBetaScale, KdaGateRule, conv_prep_host, kda_conv_prep_host, kda_decay_host};
     use crate::linear::{CONV_TAPS, HEAD, KHeadMap, LinearShape};
 
     /// Knuth's MMIX LCG, the high 24 bits as a float in `[lo, hi)`.
@@ -1162,7 +1361,19 @@ mod tests {
         let pos: Vec<u32> = (40..40 + m as u32).collect();
         let g = conv_prep_host(&x, &b, &a, &w, &dt_h, &sa, &pos, &ring, shape, 1e-5, m);
         let k = kda_conv_prep_host(
-            &x, &b, &f, &w, &dt_k, &sa, &pos, &ring, shape, -5.0, 1e-5, m,
+            &x,
+            &b,
+            &f,
+            &w,
+            &dt_k,
+            &sa,
+            &pos,
+            &ring,
+            shape,
+            KdaGateRule::Sigmoid { lower_bound: -5.0 },
+            KdaBetaScale::X1,
+            1e-5,
+            m,
         );
         assert_eq!(bits(&g.y), bits(&k.y));
         assert_eq!(bits(&g.beta), bits(&k.beta));
@@ -1177,6 +1388,7 @@ mod tests {
     fn kda_decay_is_the_bounded_sigmoid_rule() {
         let mut r = 0x6463_6179;
         let lb = -5.0f32;
+        let gate = KdaGateRule::Sigmoid { lower_bound: lb };
         let f = fill(&mut r, 1 << 16, -8.0, 8.0);
         let dt = fill(&mut r, 1 << 16, -1.0, 1.0);
         let sa: Vec<f32> = fill(&mut r, 1 << 16, -3.0, 3.0)
@@ -1185,7 +1397,7 @@ mod tests {
             .collect();
         let lo = f64::from(lb).exp();
         for i in 0..f.len() {
-            let d = kda_decay_host(f[i], dt[i], sa[i], lb);
+            let d = kda_decay_host(f[i], dt[i], sa[i], gate);
             let e = -f64::from(sa[i]) * (f64::from(f[i]) + f64::from(dt[i]));
             let want = (f64::from(lb) / (1.0 + (-e).exp())).exp();
             let rel = (f64::from(d) - want).abs() / want;
@@ -1194,6 +1406,71 @@ mod tests {
                 f64::from(d) >= lo * (1.0 - 4e-6) && d <= 1.0,
                 "i={i}: {d} outside [e^lb, 1]"
             );
+        }
+    }
+
+    /// The softplus prep shares the conv, the norm and the ring with the
+    /// bounded one and writes β doubled: on the same inputs `y` and the ring
+    /// are equal bit for bit, and each β is exactly twice the bounded prep's.
+    #[test]
+    fn kda_sp2_prep_is_the_bounded_conv_with_twice_beta() {
+        let shape = LinearShape {
+            n_k: 2,
+            n_v: 2,
+            map: KHeadMap::Tiled,
+        };
+        let (m, ch, nv) = (6, shape.channels(), shape.n_v);
+        let mut r = 0x7370_3201;
+        let x = fill(&mut r, m * ch, -1.0, 1.0);
+        let w = fill(&mut r, CONV_TAPS * ch, -0.5, 0.5);
+        let b = fill(&mut r, m * nv, -3.0, 3.0);
+        let f = fill(&mut r, m * nv * HEAD, -3.0, 3.0);
+        let dt = fill(&mut r, nv * HEAD, -1.0, 1.0);
+        let sa = fill(&mut r, nv, -5.0, -0.1);
+        let ring = fill(&mut r, shape.ring_len(), -1.0, 1.0);
+        let pos: Vec<u32> = (40..40 + m as u32).collect();
+        let run = |gate, beta_scale| {
+            kda_conv_prep_host(
+                &x, &b, &f, &w, &dt, &sa, &pos, &ring, shape, gate, beta_scale, 1e-5, m,
+            )
+        };
+        let g = run(KdaGateRule::Sigmoid { lower_bound: -5.0 }, KdaBetaScale::X1);
+        let s = run(KdaGateRule::Softplus, KdaBetaScale::X2);
+        assert_eq!(bits(&g.y), bits(&s.y));
+        assert_eq!(bits(&g.ring), bits(&s.ring));
+        let twice: Vec<f32> = g.beta.iter().map(|v| 2.0 * v).collect();
+        assert_eq!(bits(&twice), bits(&s.beta));
+        assert_eq!(s.decay.len(), m * nv * HEAD);
+    }
+
+    /// The per-key decay against `exp(ssm_a·ln(1 + e^(f + dt)))` in f64 on the
+    /// same f32 inputs, with `|ssm_a| <= e` and `|f + dt| <= 9` so the decay
+    /// stays a normal f32, `g` the exponent: the band is 4e-7 for the exp
+    /// polynomial and the final rounding, `1e-7·|ssm_a|` for the rounded
+    /// `1 + e^x` before the log (half an ulp) and ggml's zero below `x ≈
+    /// −17`, and `|g|·8e-7` for the rounded sum, the log polynomial and the
+    /// product; and the decay stays inside `[0, 1]`.
+    #[test]
+    fn kda_decay_is_the_softplus_rule() {
+        let mut r = 0x7370_6463;
+        let f = fill(&mut r, 1 << 16, -8.0, 8.0);
+        let dt = fill(&mut r, 1 << 16, -1.0, 1.0);
+        let sa: Vec<f32> = fill(&mut r, 1 << 16, -3.0, 1.0)
+            .iter()
+            .map(|&u| -u.exp())
+            .collect();
+        for (i, ((&f, &dt), &sa)) in f.iter().zip(&dt).zip(&sa).enumerate() {
+            let d = kda_decay_host(f, dt, sa, KdaGateRule::Softplus);
+            let x = f64::from(f) + f64::from(dt);
+            let g = f64::from(sa) * x.exp().ln_1p();
+            let want = g.exp();
+            let rel = (f64::from(d) - want).abs() / want;
+            let band = 4e-7 + 1e-7 * f64::from(sa).abs() + 8e-7 * g.abs();
+            assert!(
+                rel <= band,
+                "i={i}: {d} vs {want} rel {rel:e} band {band:e}"
+            );
+            assert!((0.0..=1.0).contains(&d), "i={i}: {d} outside [0, 1]");
         }
     }
 }

@@ -34,7 +34,7 @@
 use super::body::Layer;
 use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, one_expert, stack};
 use super::router::TOP_K;
-use crate::arch::hybrid::{self, Acts, Cx, attn_layer, mamba_layer, residual};
+use crate::arch::hybrid::{self, Acts, Cx, gqa_layer, mamba_layer, residual};
 use crate::card_slots::{CardAcc, CardSlotKernels, ColPlaces};
 use crate::fault::FaultSink;
 use crate::flash_gqa::GROUP_16;
@@ -359,8 +359,13 @@ fn front(
         fault,
     )?;
     let hy = leg.hybrid();
-    m.latent_down
-        .project(cx, acts, l, &t.buf.xn, hy.boundary_mut().normed_mut())?;
+    m.latent_down.project(
+        &cx.gqa(),
+        acts,
+        l,
+        &t.buf.xn,
+        hy.boundary_mut().normed_mut(),
+    )?;
     let h = Handoff {
         ids: m.route.ids(),
         weights: m.route.weights(),
@@ -475,7 +480,8 @@ fn back(
         } else {
             hsum
         };
-        m.latent_up.project(cx, acts, l, merged, &mut t.buf.delta)?;
+        m.latent_up
+            .project(&cx.gqa(), acts, l, merged, &mut t.buf.delta)?;
     }
     gpu.elem()
         .enqueue_add(stream, &t.buf.delta, &s.sh, cx.sh.hidden, &mut s.sum)?;
@@ -539,7 +545,9 @@ impl<'a> LayerProgram for StepWalk<'a> {
         let (t, acts) = (&mut *self.t, &mut *self.acts);
         match &mut self.layers[l] {
             Layer::Mamba(m) => mamba_layer(&self.cx, (l, m), (t, acts), (src, dst)),
-            Layer::Attn(a) => attn_layer::<GROUP_16>(&self.cx, (l, a), (t, acts), (src, dst)),
+            Layer::Attn(a) => {
+                gqa_layer::<GROUP_16>(&self.cx.gqa(), (l, a), (t.gqa(), acts), (src, dst))
+            }
             Layer::Moe(m) if !hosted => super::moe::moe_layer(
                 &self.cx,
                 (self.mk, self.moe),

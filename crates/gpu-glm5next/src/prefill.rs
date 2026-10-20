@@ -104,12 +104,12 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::{prompt_pass, read_fault};
+use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::kpool;
 use bloomery_gpu::kquant::act::swiglu_clamp;
 use bloomery_gpu::latent::{IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for};
-use bloomery_gpu::linear::conv::KdaConvArgs;
-use bloomery_gpu::linear::delta::{DeltaArgs, DeltaLanesArgs, KdaLanesArgs};
-use bloomery_gpu::linear::norm_gate::NormGateArgs;
+use bloomery_gpu::linear::HEAD;
+use bloomery_gpu::linear::mixer_kda::{self, KdaBufs, KdaIn, KdaProj};
 use bloomery_gpu::media::{CallRows, MediaBody, MediaSpan, check_spans};
 use bloomery_gpu::prompt_timing::{Mark, PromptStats, PromptTiming, nanos};
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
@@ -144,8 +144,9 @@ use super::nextn::GlmArena;
 use super::{Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape};
 use crate::ffn::{self, CardRows, CardTiles};
 use crate::gemm::{FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
+use crate::kda;
 use crate::mla::{self, Select};
-use crate::tensors::{FfnNames, MixerNames, other_kind};
+use crate::tensors::{FfnNames, KdaNames, MixerNames, other_kind};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAccTier, Places};
 
 /// What the prompt batch's errors name.
@@ -1438,7 +1439,7 @@ fn prefill_units(
     let from = m.pos();
     {
         let (gpu, _, body) = m.body_parts(WHAT)?;
-        if body.taps.is_some() {
+        if body.shell.taps.is_some() {
             return Err(shape(
                 "a prompt batch with the taps armed: a tap holds one step's streams".to_string(),
             ));
@@ -1820,8 +1821,8 @@ impl Body {
     /// NextN walk's host leg serves through.
     pub(super) fn prepare_port(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let cap = T_MAX.min(self.ctx);
-        self.hybrid.prepare_batch(gpu.context(), cap)?;
-        self.hybrid.host_mut().prepare_union(cap)
+        self.shell.hybrid.prepare_batch(gpu.context(), cap)?;
+        self.shell.hybrid.host_mut().prepare_union(cap)
     }
 
     /// The batch feed's buffers — the shared ones and a set for each unit a
@@ -1861,8 +1862,8 @@ impl Body {
             .collect::<Result<Vec<_>, _>>()?;
         let hsum = DeviceBuffer::zeroed(gpu.stream(), cap * self.dims.embd)?;
         let batch = Batch { bufs, units, hsum };
-        self.hybrid.prepare_batch(gpu.context(), cap)?;
-        self.hybrid.host_mut().prepare_union(cap)?;
+        self.shell.hybrid.prepare_batch(gpu.context(), cap)?;
+        self.shell.hybrid.host_mut().prepare_union(cap)?;
         gpu.stream().synchronize()?;
         self.prompt.batch = Some(Box::new(batch));
         Ok(())
@@ -1977,7 +1978,7 @@ impl Body {
             _ => None,
         };
         let Body {
-            hybrid,
+            shell: TierShell { hybrid, .. },
             cfg,
             names,
             dims,
@@ -2217,6 +2218,151 @@ struct Takes<'a> {
     store: &'a [Option<usize>],
 }
 
+/// The prompt batch's KDA projections of layer `l` ([`KdaProj`]): from
+/// [`GEMM_FROM`] tokens the front's GEMMs for the joined q·k·v, the gate's
+/// pair, β and the output, else the m-column gemvs by chunk; `f_a` and `f_b`
+/// are gemvs by chunk either way.
+struct KdaBatch<'a> {
+    w: &'a Weights,
+    nm: &'a KdaNames,
+    d: &'a Dims,
+    front: &'a mut GemmFront,
+}
+
+impl KdaProj for KdaBatch<'_> {
+    fn input(
+        &mut self,
+        gpu: &Gpu,
+        l: usize,
+        t: usize,
+        xn: &DeviceBuffer<f32>,
+        y: KdaIn<'_>,
+    ) -> Result<(), GpuError> {
+        const W: &str = "glm5next prefill kda";
+        let (w, nm) = (self.w, self.nm);
+        let (n, ch, nv) = (self.d.embd, self.d.kda.channels(), self.d.kda.n_v);
+        let v = nv * HEAD;
+        let KdaIn {
+            qkv,
+            fa,
+            ga,
+            beta_raw,
+            f,
+            z,
+        } = y;
+        let gemm = t >= GEMM_FROM;
+        if gemm {
+            self.front.kda_in(
+                gpu,
+                w,
+                l,
+                t,
+                xn,
+                KdaInNames {
+                    qkv: &nm.qkv,
+                    g_a: &nm.g_a,
+                    beta: &nm.beta,
+                    g_b: &nm.g_b,
+                },
+                KdaInRows {
+                    qkv: &mut *qkv,
+                    ga: &mut *ga,
+                    beta_raw: &mut *beta_raw,
+                    z: &mut *z,
+                },
+            )?;
+        }
+        for (c0, c) in chunks(t, CHUNK) {
+            let xs = span(W, xn, c0 * n, c * n)?;
+            if !gemm {
+                w.q8_gemv_mcol(
+                    gpu,
+                    BODY,
+                    &nm.qkv,
+                    &xs,
+                    c,
+                    &mut *span_mut(W, &mut *qkv, c0 * ch, c * ch)?,
+                )?;
+            }
+            w.q8_gemv_mcol(
+                gpu,
+                BODY,
+                &nm.f_a,
+                &xs,
+                c,
+                &mut *span_mut(W, &mut *fa, c0 * HEAD, c * HEAD)?,
+            )?;
+            if !gemm {
+                w.q8_gemv_mcol(
+                    gpu,
+                    BODY,
+                    &nm.g_a,
+                    &xs,
+                    c,
+                    &mut *span_mut(W, &mut *ga, c0 * HEAD, c * HEAD)?,
+                )?;
+                w.q8_gemv_mcol(
+                    gpu,
+                    BODY,
+                    &nm.beta,
+                    &xs,
+                    c,
+                    &mut *span_mut(W, &mut *beta_raw, c0 * nv, c * nv)?,
+                )?;
+            }
+            let fa_rows = span(W, &*fa, c0 * HEAD, c * HEAD)?;
+            w.q8_gemv_mcol(
+                gpu,
+                BODY,
+                &nm.f_b,
+                &fa_rows,
+                c,
+                &mut *span_mut(W, &mut *f, c0 * v, c * v)?,
+            )?;
+            if !gemm {
+                let ga_rows = span(W, &*ga, c0 * HEAD, c * HEAD)?;
+                w.q8_gemv_mcol(
+                    gpu,
+                    BODY,
+                    &nm.g_b,
+                    &ga_rows,
+                    c,
+                    &mut *span_mut(W, &mut *z, c0 * v, c * v)?,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn output(
+        &mut self,
+        gpu: &Gpu,
+        l: usize,
+        t: usize,
+        gated: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        const W: &str = "glm5next prefill kda";
+        let (w, nm) = (self.w, self.nm);
+        if t >= GEMM_FROM {
+            return self.front.kda_out(gpu, w, l, t, gated, &nm.out, out);
+        }
+        let (n, v) = (self.d.embd, self.d.kda.n_v * HEAD);
+        for (c0, c) in chunks(t, CHUNK) {
+            let gs = span(W, gated, c0 * v, c * v)?;
+            w.q8_gemv_mcol(
+                gpu,
+                BODY,
+                &nm.out,
+                &gs,
+                c,
+                &mut *span_mut(W, &mut *out, c0 * n, c * n)?,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl PromptProgram<'_> {
     /// Sub-layer `sub` of layer `l`'s input into `x` for unit `u`: its own
     /// mix of the unit's streams over its tokens (`hc_pre_q8_0` in its token
@@ -2290,187 +2436,42 @@ impl PromptProgram<'_> {
     fn kda(&mut self, l: usize, u: usize) -> Result<(), GpuError> {
         const W: &str = "glm5next prefill kda";
         let (gpu, w, t) = (self.gpu, self.w, self.t[u]);
-        let stream = gpu.stream();
         let d = *self.p.d;
-        let fault = gpu.layer_sink(l)?;
-        let Some(MixerNames::Kda(nm)) = self.p.names.get(l).map(|n| &n.mixer) else {
-            return Err(other_kind(W, l));
-        };
-        let Some(Store::Kda { state, stamp, ring }) = self.p.stores.get_mut(l) else {
-            return Err(GpuError::State {
-                what: W,
-                missing: "the layer's KDA store",
-            });
-        };
+        let nm = kda::names(W, self.p.names, l)?;
+        let st = kda::state(W, self.p.stores, l, self.p.lane, (false, 0))?;
         let b = &mut *self.b;
         let ub = &self.u[u];
-        let head = bloomery_gpu::linear::HEAD;
-        let (n, ch, nv) = (d.embd, d.kda.channels(), d.kda.n_v);
-        let v = nv * head;
-        gpu.elem().enqueue_rms_norm(
-            stream,
-            &b.x,
-            f32v(w, &nm.norm)?,
-            d.rms_eps,
-            n,
-            t,
-            &mut b.xn,
-        )?;
-        let gemm = t >= GEMM_FROM;
-        if gemm {
-            b.front.kda_in(
-                gpu,
+        mixer_kda::enqueue(
+            gpu,
+            gpu.stream(),
+            &self.p.k.linear,
+            &mut KdaBatch {
                 w,
-                l,
-                t,
-                &b.xn,
-                KdaInNames {
-                    qkv: &nm.qkv,
-                    g_a: &nm.g_a,
-                    beta: &nm.beta,
-                    g_b: &nm.g_b,
-                },
-                KdaInRows {
-                    qkv: &mut b.qkv,
-                    ga: &mut b.ga,
-                    beta_raw: &mut b.beta_raw,
-                    z: &mut b.z,
-                },
-            )?;
-        }
-        for (c0, c) in chunks(t, CHUNK) {
-            let xs = span(W, &b.xn, c0 * n, c * n)?;
-            if !gemm {
-                w.q8_gemv_mcol(
-                    gpu,
-                    BODY,
-                    &nm.qkv,
-                    &xs,
-                    c,
-                    &mut *span_mut(W, &mut b.qkv, c0 * ch, c * ch)?,
-                )?;
-            }
-            w.q8_gemv_mcol(
-                gpu,
-                BODY,
-                &nm.f_a,
-                &xs,
-                c,
-                &mut *span_mut(W, &mut b.fa, c0 * head, c * head)?,
-            )?;
-            if !gemm {
-                w.q8_gemv_mcol(
-                    gpu,
-                    BODY,
-                    &nm.g_a,
-                    &xs,
-                    c,
-                    &mut *span_mut(W, &mut b.ga, c0 * head, c * head)?,
-                )?;
-                w.q8_gemv_mcol(
-                    gpu,
-                    BODY,
-                    &nm.beta,
-                    &xs,
-                    c,
-                    &mut *span_mut(W, &mut b.beta_raw, c0 * nv, c * nv)?,
-                )?;
-            }
-            let fa = span(W, &b.fa, c0 * head, c * head)?;
-            w.q8_gemv_mcol(
-                gpu,
-                BODY,
-                &nm.f_b,
-                &fa,
-                c,
-                &mut *span_mut(W, &mut b.f, c0 * v, c * v)?,
-            )?;
-            if !gemm {
-                let ga = span(W, &b.ga, c0 * head, c * head)?;
-                w.q8_gemv_mcol(
-                    gpu,
-                    BODY,
-                    &nm.g_b,
-                    &ga,
-                    c,
-                    &mut *span_mut(W, &mut b.z, c0 * v, c * v)?,
-                )?;
-            }
-        }
-        let lin = &self.p.k.linear;
-        lin.conv.enqueue_kda_conv_prep(
-            stream,
-            KdaConvArgs {
-                x: &b.qkv,
-                b_raw: &b.beta_raw,
-                f: &b.f,
-                w: f32v(w, &nm.conv)?,
-                dt_bias: f32v(w, &nm.dt_bias)?,
-                ssm_a: f32v(w, &nm.a)?,
+                nm,
+                d: &d,
+                front: &mut b.front,
+            },
+            (l, t, &kda::dims(&d)),
+            &kda::vecs(w, nm)?,
+            st,
+            KdaBufs {
+                x: &b.x,
                 pos: &ub.pos,
-                shape: d.kda,
-                lb: d.lb,
-                eps: d.rms_eps,
-                m: t,
-                fault,
-                y: &mut b.conv,
+                xn: &mut b.xn,
+                qkv: &mut b.qkv,
+                fa: &mut b.fa,
+                ga: &mut b.ga,
+                beta_raw: &mut b.beta_raw,
+                f: &mut b.f,
+                z: &mut b.z,
+                conv: &mut b.conv,
                 beta: &mut b.beta,
                 decay: &mut b.decay,
-                ring,
+                o: &mut b.o,
+                gated: &mut b.gated,
+                out: &mut b.out,
             },
-        )?;
-        lin.delta.enqueue_kda_delta_lanes(
-            stream,
-            KdaLanesArgs {
-                lanes: DeltaLanesArgs {
-                    delta: DeltaArgs {
-                        qkv: &b.conv,
-                        beta: &b.beta,
-                        decay: &b.decay,
-                        lane: self.p.lane,
-                        lane_at: 0,
-                        lanes: state.lanes().count(),
-                        shape: d.kda,
-                        m: t,
-                        fault,
-                        o: &mut b.o,
-                        state: state.whole_mut(),
-                    },
-                    each: false,
-                    pos: &ub.pos,
-                    stamp,
-                },
-                row: 0,
-            },
-        )?;
-        lin.norm_gate.enqueue_norm_gate_sigmoid(
-            stream,
-            NormGateArgs {
-                o: &b.o,
-                z: &b.z,
-                w: f32v(w, &nm.gate_norm)?,
-                eps: d.rms_eps,
-                n_v: nv,
-                m: t,
-                fault,
-                y: &mut b.gated,
-            },
-        )?;
-        if gemm {
-            return b.front.kda_out(gpu, w, l, t, &b.gated, &nm.out, &mut b.out);
-        }
-        for (c0, c) in chunks(t, CHUNK) {
-            let gs = span(W, &b.gated, c0 * v, c * v)?;
-            w.q8_gemv_mcol(
-                gpu,
-                BODY,
-                &nm.out,
-                &gs,
-                c,
-                &mut *span_mut(W, &mut b.out, c0 * n, c * n)?,
-            )?;
-        }
-        Ok(())
+        )
     }
 
     /// Layer `l`'s latent mixer over unit `u`'s batch (`mla::mla`'s

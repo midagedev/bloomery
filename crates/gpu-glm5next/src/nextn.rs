@@ -53,6 +53,7 @@
 
 use bloomery_gpu::head::{Head, HeadNorm};
 use bloomery_gpu::host::BatchLeg;
+use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::latent::{
     INDEX_HEAD, INDEX_ROW, IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for,
 };
@@ -1007,7 +1008,7 @@ impl Body {
     ) -> Result<(), GpuError> {
         let layers = self.cfg.len();
         let Body {
-            hybrid,
+            shell: TierShell { hybrid, .. },
             dims,
             k,
             branch,

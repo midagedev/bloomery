@@ -20,7 +20,7 @@
 //!   the dense block whole, or the routed block's norm, its router over the
 //!   rows and the download of the rows, ids and weights to the host;
 //! - the shadow: the card experts, where the slot map puts any
-//!   ([`crate::card`]: every slot's place in one launch, then the common pair
+//!   ([`bloomery_gpu::card_experts`]: every slot's place in one launch, then the common pair
 //!   over the batch's `t · N_USED` slots, one launch each — the steps'
 //!   one-token launches' rows for each slot, so the sums are the steps'); the
 //!   routed block has no shared expert, so nothing else;
@@ -53,11 +53,13 @@
 
 use std::ops::Range;
 
+use bloomery_gpu::card_experts::{CardBatch, CardExperts, Io};
 use bloomery_gpu::flash_gqa::{GqaK192Args, HEAD, HEAD_K192, window_segments};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::{prompt_pass, read_fault, refuse_steps_feed};
+use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::rope_neox::K192Args;
 use bloomery_gpu::weights::Weights;
@@ -77,7 +79,6 @@ use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 use super::{Body, Dims, Kernels, LayerCfg, LayerNames, Mimo2Model, RopeBase, Store, WHAT, shape};
 use crate::attn::{enqueue_append, enqueue_pass};
-use crate::card::{CardBatch, CardExperts, Io, card_batch_bytes};
 use crate::ffn::FfnNames;
 
 /// Positions one batch runs at most: the host union's columns.
@@ -453,7 +454,7 @@ pub fn prefill(m: &mut Mimo2Model, ids: &[u32]) -> Result<u32, GpuError> {
     let from = m.pos();
     {
         let (gpu, _, body) = m.body_parts(WHAT)?;
-        if body.taps.is_some() {
+        if body.shell.taps.is_some() {
             return Err(shape(
                 "a prompt batch with the taps armed: a tap holds one step's layer outputs"
                     .to_string(),
@@ -575,10 +576,7 @@ impl Body {
         let n = self.dims.embd;
         let lens = Lens::of(&self.dims, &self.cfg, cap);
         let sets = group_sets(self.prompt.group);
-        let card = self
-            .card
-            .any()
-            .then(|| card_batch_bytes(n, self.card.ff(), cap));
+        let card = self.card.any().then(|| self.card.batch_bytes(cap));
         let shared = lens.bytes() + size_of::<f32>() * cap * n + card.unwrap_or(0);
         let planned = shared + sets * UnitBufs::planned(n, cap);
         self.refuse_unreserved(gpu, sets, shared)?;
@@ -587,9 +585,7 @@ impl Body {
             .map(|_| UnitBufs::new(gpu, n, cap))
             .collect::<Result<Vec<_>, _>>()?;
         let hsum = DeviceBuffer::zeroed(gpu.stream(), cap * n)?;
-        let card = card
-            .map(|_| CardBatch::new(gpu, n, self.card.ff(), cap))
-            .transpose()?;
+        let card = card.map(|_| self.card.batch(gpu, cap)).transpose()?;
         let batch = Batch {
             bufs,
             units,
@@ -602,8 +598,8 @@ impl Body {
                 batch.bytes()
             )));
         }
-        self.hybrid.prepare_batch(gpu.context(), cap)?;
-        self.hybrid.host_mut().prepare_union(cap)?;
+        self.shell.hybrid.prepare_batch(gpu.context(), cap)?;
+        self.shell.hybrid.host_mut().prepare_union(cap)?;
         gpu.stream().synchronize()?;
         self.prompt.batch = Some(Box::new(batch));
         Ok(())
@@ -660,7 +656,7 @@ impl Body {
             let n = self.dims.embd;
             let layers = self.cfg.len();
             let Body {
-                hybrid,
+                shell: TierShell { hybrid, .. },
                 cfg,
                 names,
                 dims,
@@ -982,7 +978,7 @@ impl PromptProgram<'_> {
             .enqueue_download(stream, [&b.normed, &b.weights], &b.ids, key)
     }
 
-    /// Layer `l`'s card experts over unit `u`'s batch (`card::CardExperts::
+    /// Layer `l`'s card experts over unit `u`'s batch (`CardExperts::
     /// enqueue_rows`) under its host leg: the batch's normed rows and routing
     /// as `route` wrote them, into the card's sum plus the unit's `x1`.
     fn card_experts(&mut self, l: usize, u: usize) -> Result<(), GpuError> {

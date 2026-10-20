@@ -6,7 +6,7 @@
 
 use super::body::Body;
 use crate::arch::hybrid::{
-    Acts, AttnLayer, Cx, MambaLayer, Scratch, Site, WORD_POS, WORD_TOKEN, attn_layer, mamba_layer,
+    Acts, Cx, GqaLayer, MambaLayer, Scratch, Site, WORD_POS, WORD_TOKEN, gqa_layer, mamba_layer,
     norm, residual,
 };
 use crate::elem::EmbedRowsArgs;
@@ -33,7 +33,7 @@ pub(super) struct MlpLayer {
 /// A layer, by the kind the file's per-layer arrays give it.
 pub(super) enum Layer {
     Mamba(MambaLayer),
-    Attn(AttnLayer),
+    Attn(GqaLayer),
     Mlp(MlpLayer),
 }
 
@@ -41,7 +41,7 @@ impl Layer {
     pub(super) fn sites(&self) -> Vec<&Site> {
         match self {
             Layer::Mamba(m) => m.sites().to_vec(),
-            Layer::Attn(a) => a.sites().to_vec(),
+            Layer::Attn(a) => a.sites(),
             Layer::Mlp(m) => vec![&m.up, &m.down],
         }
     }
@@ -55,12 +55,13 @@ fn mlp_layer(
     (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
 ) -> Result<(), GpuError> {
     let b = &mut s.buf;
+    let site_cx = cx.gqa();
     norm(cx, &m.norm, src, &mut b.xn)?;
-    m.up.project(cx, acts, l, &b.xn, &mut b.up)?;
+    m.up.project(&site_cx, acts, l, &b.xn, &mut b.up)?;
     cx.gpu
         .elem()
         .enqueue_relu_sqr(cx.gpu.stream(), &b.up, m.ff, &mut b.act)?;
-    m.down.project(cx, acts, l, &b.act, &mut b.delta)?;
+    m.down.project(&site_cx, acts, l, &b.act, &mut b.delta)?;
     residual(cx, src, &b.delta, dst)
 }
 
@@ -117,9 +118,12 @@ impl Body {
                 Layer::Mamba(m) => {
                     mamba_layer(&cx, (l, m), (&mut self.s, &mut self.acts), (src, dst))?;
                 }
-                Layer::Attn(a) => {
-                    attn_layer::<GROUP_5>(&cx, (l, a), (&mut self.s, &mut self.acts), (src, dst))?
-                }
+                Layer::Attn(a) => gqa_layer::<GROUP_5>(
+                    &cx.gqa(),
+                    (l, a),
+                    (self.s.gqa(), &mut self.acts),
+                    (src, dst),
+                )?,
                 Layer::Mlp(m) => mlp_layer(&cx, (l, m), (&mut self.s, &mut self.acts), (src, dst))?,
             }
             in_head = !in_head;

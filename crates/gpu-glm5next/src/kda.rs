@@ -7,126 +7,178 @@
 //! the row base, `Parts::base`). The store keeps no history past its
 //! lanes: an earlier position comes back only through a checkpoint.
 //!
-//! The launches, in order (ik `src/llama-kda.cpp`):
-//! 1. `attn_norm` RMS;
-//! 2. the joined q·k·v projection;
-//! 3. the forget and gate low-rank halves (`ssm_f_a`, `ssm_g_a`) and β's raw
-//!    projection, three q8_0 gemvs of the normed row, then `ssm_f_b` and
-//!    `ssm_g_b` on the halves' outputs;
-//! 4. the conv and prep with one decay per key channel
-//!    (`kda_conv_prep`: the conv over the ring by the token's position, SiLU,
-//!    the q and k L2 norms, σ(β), `exp(lb · σ(−ssm_a · (f + dt)))`);
-//! 5. the delta step (`kda_delta_lanes`) over the state's committed lane, its
-//!    stamp checked against the position;
-//! 6. the gated per-head RMS norm with the sigmoid gate;
-//! 7. the output projection.
+//! The launches are `mixer_kda::enqueue`'s (ik `src/llama-kda.cpp`; the
+//! module's doc lists them): this file is the model's part of them. [`Step`]
+//! is the q8_0 projections at one token, one gemv a weight; the prompt batch's
+//! (the chunked gemvs or the GEMM front) is `prefill`'s. [`dims`], [`vecs`],
+//! [`names`] and [`state`] are what both hand the mixer.
 //!
-//! Eleven launches. ik clamps the state to ±1e6 after every token; the
-//! delta step raises its fault site instead when the state stops being
+//! Eleven launches at a step. ik clamps the state to ±1e6 after every token;
+//! the delta step raises its fault site instead when the state stops being
 //! finite and never clamps: a named difference, reached only past that
 //! magnitude.
 
-use bloomery_gpu::linear::conv::KdaConvArgs;
-use bloomery_gpu::linear::delta::{DeltaArgs, DeltaLanesArgs, KdaLanesArgs};
-use bloomery_gpu::linear::norm_gate::NormGateArgs;
+use bloomery_gpu::linear::mixer_kda::{
+    self, CORE_LAUNCHES, KdaBufs, KdaDecay, KdaDims, KdaIn, KdaProj, KdaRule, KdaState, KdaVecs,
+};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
+use cuda_core::DeviceBuffer;
 
-use crate::body::{Parts, Store, f32v, gemv};
-use crate::tensors::{MixerNames, other_kind};
+use crate::body::{Dims, Parts, Store, f32v, gemv};
+use crate::tensors::{KdaNames, LayerNames, MixerNames, other_kind};
+
+/// The projections the step makes: the joined q·k·v, `f_a`, `g_a`, β, `f_b`,
+/// `g_b` and the output.
+const PROJ_LAUNCHES: usize = 7;
 
 /// The launches [`kda`] makes.
-pub(crate) const LAUNCHES: usize = 11;
+pub(crate) const LAUNCHES: usize = CORE_LAUNCHES + PROJ_LAUNCHES;
 
-/// Enqueue layer `l`'s KDA mixer on `p`'s buffers (module doc).
-pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    let d = *p.d;
-    let fault = gpu.layer_sink(l)?;
-    let Some(MixerNames::Kda(n)) = p.names.get(l).map(|n| &n.mixer) else {
-        return Err(other_kind("glm5next kda", l));
-    };
-    let base = p.base();
-    let s = &mut *p.s;
-    let Some(Store::Kda { state, stamp, ring }) = p.stores.get_mut(l) else {
+/// The mixer's widths, constants and rule: GLM-5.3-Flash's bounded sigmoid
+/// decay and plain `σ(β)`.
+pub(crate) fn dims(d: &Dims) -> KdaDims {
+    KdaDims {
+        embd: d.embd,
+        shape: d.kda,
+        rms_eps: d.rms_eps,
+        rule: KdaRule {
+            decay: KdaDecay::Sigmoid { lower_bound: d.lb },
+            beta_scale: 1.0,
+        },
+    }
+}
+
+/// A layer's resident f32 vectors.
+pub(crate) fn vecs<'w>(w: &'w Weights, n: &KdaNames) -> Result<KdaVecs<'w>, GpuError> {
+    Ok(KdaVecs {
+        norm: f32v(w, &n.norm)?,
+        conv: f32v(w, &n.conv)?,
+        dt_bias: f32v(w, &n.dt_bias)?,
+        a: f32v(w, &n.a)?,
+        gate_norm: f32v(w, &n.gate_norm)?,
+    })
+}
+
+/// Layer `l`'s KDA tensor names, refused by name for another kind's.
+pub(crate) fn names<'n>(
+    what: &'static str,
+    layers: &'n [LayerNames],
+    l: usize,
+) -> Result<&'n KdaNames, GpuError> {
+    match layers.get(l).map(|n| &n.mixer) {
+        Some(MixerNames::Kda(n)) => Ok(n),
+        _ => Err(other_kind(what, l)),
+    }
+}
+
+/// Layer `l`'s recurrent store as the mixer takes it: the committed `lane`
+/// word, and whether the rows write their own lane from the row base `row`.
+pub(crate) fn state<'s>(
+    what: &'static str,
+    stores: &'s mut [Store],
+    l: usize,
+    lane: &'s DeviceBuffer<u32>,
+    (each, row): (bool, usize),
+) -> Result<KdaState<'s>, GpuError> {
+    let Some(Store::Kda { state, stamp, ring }) = stores.get_mut(l) else {
         return Err(GpuError::State {
-            what: "glm5next kda",
+            what,
             missing: "the layer's KDA store",
         });
     };
-    gpu.elem().enqueue_rms_norm(
-        stream,
-        &s.x,
-        f32v(w, &n.norm)?,
-        d.rms_eps,
-        d.embd,
-        1,
-        &mut s.xn,
-    )?;
-    gemv(gpu, w, &n.qkv, &s.xn, &mut s.qkv)?;
-    gemv(gpu, w, &n.f_a, &s.xn, &mut s.fa)?;
-    gemv(gpu, w, &n.g_a, &s.xn, &mut s.ga)?;
-    gemv(gpu, w, &n.beta, &s.xn, &mut s.beta_raw)?;
-    gemv(gpu, w, &n.f_b, &s.fa, &mut s.f)?;
-    gemv(gpu, w, &n.g_b, &s.ga, &mut s.z)?;
-    let lin = &p.k.linear;
-    lin.conv.enqueue_kda_conv_prep(
-        stream,
-        KdaConvArgs {
-            x: &s.qkv,
-            b_raw: &s.beta_raw,
-            f: &s.f,
-            w: f32v(w, &n.conv)?,
-            dt_bias: f32v(w, &n.dt_bias)?,
-            ssm_a: f32v(w, &n.a)?,
+    Ok(KdaState {
+        lanes: state.lanes().count(),
+        state: state.whole_mut(),
+        stamp,
+        ring,
+        lane,
+        each,
+        row,
+    })
+}
+
+/// The step's q8_0 projections of layer `l`, one column.
+struct Step<'a> {
+    w: &'a Weights,
+    n: &'a KdaNames,
+}
+
+/// The step runs one row; the mixer asked for `m`.
+fn one_row(m: usize) -> Result<(), GpuError> {
+    if m == 1 {
+        return Ok(());
+    }
+    Err(GpuError::shape(
+        "glm5next kda",
+        format!("the step's projections are one column, asked for {m}"),
+    ))
+}
+
+impl KdaProj for Step<'_> {
+    fn input(
+        &mut self,
+        gpu: &Gpu,
+        _l: usize,
+        m: usize,
+        xn: &DeviceBuffer<f32>,
+        y: KdaIn<'_>,
+    ) -> Result<(), GpuError> {
+        one_row(m)?;
+        let (w, n) = (self.w, self.n);
+        gemv(gpu, w, &n.qkv, xn, y.qkv)?;
+        gemv(gpu, w, &n.f_a, xn, y.fa)?;
+        gemv(gpu, w, &n.g_a, xn, y.ga)?;
+        gemv(gpu, w, &n.beta, xn, y.beta_raw)?;
+        gemv(gpu, w, &n.f_b, y.fa, y.f)?;
+        gemv(gpu, w, &n.g_b, y.ga, y.z)
+    }
+
+    fn output(
+        &mut self,
+        gpu: &Gpu,
+        _l: usize,
+        m: usize,
+        gated: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        one_row(m)?;
+        gemv(gpu, self.w, &self.n.out, gated, out)
+    }
+}
+
+/// Enqueue layer `l`'s KDA mixer on `p`'s buffers (module doc).
+pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result<(), GpuError> {
+    const WHAT: &str = "glm5next kda";
+    let d = *p.d;
+    let n = names(WHAT, p.names, l)?;
+    let base = p.base();
+    let st = state(WHAT, p.stores, l, p.lane, (base > 0, base))?;
+    let s = &mut *p.s;
+    mixer_kda::enqueue(
+        gpu,
+        gpu.stream(),
+        &p.k.linear,
+        &mut Step { w, n },
+        (l, 1, &dims(&d)),
+        &vecs(w, n)?,
+        st,
+        KdaBufs {
+            x: &s.x,
             pos: &s.pos,
-            shape: d.kda,
-            lb: d.lb,
-            eps: d.rms_eps,
-            m: 1,
-            fault,
-            y: &mut s.conv,
+            xn: &mut s.xn,
+            qkv: &mut s.qkv,
+            fa: &mut s.fa,
+            ga: &mut s.ga,
+            beta_raw: &mut s.beta_raw,
+            f: &mut s.f,
+            z: &mut s.z,
+            conv: &mut s.conv,
             beta: &mut s.beta,
             decay: &mut s.decay,
-            ring,
+            o: &mut s.o,
+            gated: &mut s.gated,
+            out: &mut s.out,
         },
-    )?;
-    lin.delta.enqueue_kda_delta_lanes(
-        stream,
-        KdaLanesArgs {
-            lanes: DeltaLanesArgs {
-                delta: DeltaArgs {
-                    qkv: &s.conv,
-                    beta: &s.beta,
-                    decay: &s.decay,
-                    lane: p.lane,
-                    lane_at: 0,
-                    lanes: state.lanes().count(),
-                    shape: d.kda,
-                    m: 1,
-                    fault,
-                    o: &mut s.o,
-                    state: state.whole_mut(),
-                },
-                each: base > 0,
-                pos: &s.pos,
-                stamp,
-            },
-            row: base,
-        },
-    )?;
-    lin.norm_gate.enqueue_norm_gate_sigmoid(
-        stream,
-        NormGateArgs {
-            o: &s.o,
-            z: &s.z,
-            w: f32v(w, &n.gate_norm)?,
-            eps: d.rms_eps,
-            n_v: d.kda.n_v,
-            m: 1,
-            fault,
-            y: &mut s.gated,
-        },
-    )?;
-    gemv(gpu, w, &n.out, &s.gated, &mut s.out)
+    )
 }

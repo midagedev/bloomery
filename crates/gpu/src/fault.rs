@@ -541,6 +541,44 @@ pub mod step_order {
         Mamba2Scan,
     ];
 
+    /// Solar-Open2 (`gpu-solar2`): the token id checked on the host before
+    /// the step; a layer's norm and the q8_1 quantizer of its normed row, the
+    /// Q5_0 halves' 32-value quantizer, a KDA layer's conv, delta step (its
+    /// lane word and stamp right after it) and gated norm, a GQA layer's
+    /// cache append (position), flash (visible key count) and out gate's
+    /// product (the norm's [`F32Product`] already stands first); then the
+    /// router and the handoff's id check, and the head's logits last. The
+    /// order of the sites the step raises is the order a KDA layer's launches
+    /// meet them, then the sites only a GQA layer meets; the sites the step
+    /// never raises follow.
+    pub const SOLAR2: &[FaultSite] = &[
+        TokenId,
+        F32Product,
+        QuantColumn,
+        Q5Quant,
+        LinearConv,
+        LinearDelta,
+        DeltaLane,
+        DeltaStamp,
+        LinearGate,
+        CachePos,
+        KeyCount,
+        Router,
+        ExpertId,
+        Logit,
+        NormQuant,
+        HcQuant,
+        AttnCount,
+        AttnSel,
+        CacheValue,
+        KvQuant,
+        PoolSelect,
+        Ple,
+        HcMix,
+        CandMask,
+        Mamba2Scan,
+    ];
+
     /// The order of `arch`'s step.
     #[must_use]
     pub fn of(arch: model::arch::Arch) -> &'static [FaultSite] {
@@ -551,6 +589,7 @@ pub mod step_order {
             model::arch::Arch::Qwen35moe => QWEN35MOE,
             model::arch::Arch::Glm5next => GLM5NEXT,
             model::arch::Arch::Mimo2 => MIMO2,
+            model::arch::Arch::SolarOpen2 => SOLAR2,
             // No program runs nemotron_h. The listing is MiMo's so a fault
             // word still decodes; it is not a step this architecture runs.
             model::arch::Arch::NemotronH => NEMOTRON_H,
@@ -891,7 +930,7 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`step_order::of`] gives it a table).
-    fn every_arch() -> [Arch; 10] {
+    fn every_arch() -> [Arch; 11] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,
@@ -899,6 +938,7 @@ mod tests {
             Arch::Qwen35moe,
             Arch::Glm5next,
             Arch::Mimo2,
+            Arch::SolarOpen2,
             Arch::NemotronH,
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,
@@ -912,6 +952,7 @@ mod tests {
                 | Arch::Qwen35moe
                 | Arch::Glm5next
                 | Arch::Mimo2
+                | Arch::SolarOpen2
                 | Arch::NemotronH
                 | Arch::NemotronHMoe
                 | Arch::GemmaEmbedding
@@ -948,6 +989,34 @@ mod tests {
             step_order::of(Arch::Mimo2)[..6],
             [
                 FaultSite::TokenId,
+                FaultSite::CachePos,
+                FaultSite::KeyCount,
+                FaultSite::Router,
+                FaultSite::ExpertId,
+                FaultSite::Logit,
+            ]
+        );
+    }
+
+    /// Solar-Open2's order opens with the fourteen sites its step raises, in
+    /// the order a layer's launches meet them: the host's token check, the
+    /// norm, the quantizers, the KDA conv, delta step (lane word, then stamp)
+    /// and gated norm, the GQA append and flash, the router, the handoff, the
+    /// head. The out gate's product is the norm's site, standing first.
+    #[test]
+    fn the_solar2_order_leads_with_the_sites_its_step_raises() {
+        assert_eq!(
+            step_order::of(Arch::SolarOpen2)[..14],
+            [
+                FaultSite::TokenId,
+                FaultSite::F32Product,
+                FaultSite::QuantColumn,
+                FaultSite::Q5Quant,
+                FaultSite::LinearConv,
+                FaultSite::LinearDelta,
+                FaultSite::DeltaLane,
+                FaultSite::DeltaStamp,
+                FaultSite::LinearGate,
                 FaultSite::CachePos,
                 FaultSite::KeyCount,
                 FaultSite::Router,

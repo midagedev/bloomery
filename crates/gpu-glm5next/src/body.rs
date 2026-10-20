@@ -83,6 +83,7 @@ use bloomery_gpu::host::nvtier::NvTier;
 use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
+use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use bloomery_gpu::host::tier::TierOpen;
@@ -754,11 +755,15 @@ pub struct StepInput {
     pos: u32,
 }
 
-/// The GLM body. Field order is drop order: the host tier (its lock over
-/// the host set, its page windows, its residency machine) before the
-/// buffers.
+/// The GLM body. Field order is drop order: the shell, whose host tier (its
+/// lock over the host set, its page windows, its residency machine) comes
+/// first, before the buffers.
 pub struct Body {
-    hybrid: Hybrid<HostRun>,
+    /// The host tier, the residency glue and the taps ([`TierShell`]); a
+    /// tap holds a layer's streams. The glue holds the load's residency
+    /// side: the machine's source and shape, the boundaries' log, the
+    /// delegation to the host tier.
+    shell: TierShell<HostRun>,
     layers: Range<usize>,
     cfg: Vec<LayerCfg>,
     /// Each layer's tensor names, made at load.
@@ -777,8 +782,6 @@ pub struct Body {
     /// The routed experts the slot map puts on the card.
     card: CardExperts,
     embd: Embedding,
-    /// Each layer's streams after it, when a gate armed them.
-    taps: Option<Vec<DeviceBuffer<f32>>>,
     /// Positions the stores hold: a step's position counts once its inputs
     /// are on the card, before its chain is enqueued or replayed. The next
     /// position is the model's (`GpuModel::pos`); the two differ only after
@@ -801,9 +804,6 @@ pub struct Body {
     ckpt: Checkpoints,
     /// How a prompt is fed, and the batch feed's buffers.
     prompt: prefill::PromptState,
-    /// The load's residency side ([`ResidencyGlue`]): the machine's source
-    /// and shape, the boundaries' log, the delegation to the host tier.
-    residency_glue: ResidencyGlue,
     /// The NVMe expert tier's arena, on a load whose plan paged routed
     /// experts ([`Body::nvme_tier`]).
     nvme_tier: Option<Arc<NvTier>>,
@@ -1734,7 +1734,7 @@ impl Body {
         };
         let lane = [0u32];
         let mut body = Body {
-            hybrid,
+            shell: TierShell::new(hybrid, glue, HC_STREAMS * dims.embd, WHAT),
             layers,
             cfg,
             names,
@@ -1746,7 +1746,6 @@ impl Body {
             slots,
             card: experts_on_card,
             embd,
-            taps: None,
             held: 0,
             plant: None,
             ctx,
@@ -1755,7 +1754,6 @@ impl Body {
             dense,
             ckpt,
             prompt: prefill::PromptState::new(),
-            residency_glue: glue,
             nvme_tier,
             residency: lever,
             nextn: None,
@@ -1832,7 +1830,7 @@ impl Body {
     /// The layers the host tier serves.
     #[must_use]
     pub fn host_run(&self) -> Range<usize> {
-        self.hybrid.slots().layers()
+        self.shell.hybrid.slots().layers()
     }
 
     /// Device bytes of the layers' stores.
@@ -1850,7 +1848,7 @@ impl Body {
     pub fn scratch_bytes(&self) -> usize {
         self.s.bytes()
             + self.card.bytes()
-            + self.hybrid.boundary().device_bytes()
+            + self.shell.hybrid.boundary().device_bytes()
             + self.slots.buf().num_bytes()
     }
 
@@ -1865,12 +1863,12 @@ impl Body {
     /// The host tier.
     #[must_use]
     pub fn hybrid(&self) -> &Hybrid<HostRun> {
-        &self.hybrid
+        self.shell.hybrid()
     }
 
     /// The host tier, for a caller that attaches or marks its route trace.
     pub fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
-        &mut self.hybrid
+        self.shell.hybrid_mut()
     }
 
     /// Keep every residency boundary's report from now on, for
@@ -1879,19 +1877,19 @@ impl Body {
     /// two takes, `passes`, so a pass logs its report without growing the
     /// log. Nothing is kept until then.
     pub fn log_residency(&mut self, passes: usize) {
-        self.residency_glue.log_passes(passes);
+        self.shell.log_residency(passes);
     }
 
     /// The residency machine's source, when the load runs one.
     #[must_use]
     pub fn residency_source(&self) -> Option<&FileSwap> {
-        self.residency_glue.source()
+        self.shell.residency_source()
     }
 
     /// The residency boundaries' reports since the last take, in order,
     /// each with the kind of the pass it ended; the log keeps its capacity.
     pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
-        self.residency_glue.take_passes()
+        self.shell.take_residency_passes()
     }
 
     /// The slot map's card copy the handoff reads, a routed layer's row at
@@ -1906,33 +1904,14 @@ impl Body {
     /// Only through [`set_taps`], which drops the captured chains first: a
     /// capture holds the tap copies it was taken with.
     pub(crate) fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
-        self.taps = if on {
-            let n = HC_STREAMS * self.dims.embd;
-            Some(
-                self.cfg
-                    .iter()
-                    .map(|_| DeviceBuffer::zeroed(gpu.stream(), n))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-        } else {
-            None
-        };
-        Ok(())
+        self.shell.set_taps(gpu, self.cfg.len(), on)
     }
 
     /// Every layer's streams after the last step, `4 · n_embd` a layer:
     /// stream `s` of layer `l` at `l · 4n + s · n`. Blocking; refused when
     /// the taps are not armed.
     pub fn taps(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
-        let taps = self.taps.as_ref().ok_or(GpuError::State {
-            what: WHAT,
-            missing: "armed taps (Body::set_taps)",
-        })?;
-        let mut out = Vec::with_capacity(taps.len() * HC_STREAMS * self.dims.embd);
-        for t in taps {
-            out.extend(t.to_host_vec(gpu.stream())?);
-        }
-        Ok(out)
+        self.shell.taps(gpu)
     }
 
     /// The walk's parts, lent apart from the host tier.
@@ -1948,9 +1927,9 @@ impl Body {
                 &mut self.stores,
                 &self.slots,
                 &mut self.card,
-                self.taps.as_deref_mut(),
+                self.shell.taps.as_deref_mut(),
             ),
-            &mut self.hybrid,
+            &mut self.shell.hybrid,
         )
     }
 
@@ -2331,7 +2310,7 @@ impl ChainBody for Body {
     /// dropped.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
-        self.hybrid.settle(stream)?;
+        self.shell.hybrid.settle(stream)?;
         for s in &mut self.stores {
             s.zero(stream)?;
         }
@@ -2364,6 +2343,7 @@ impl ChainBody for Body {
             + self.scratch_bytes()
             + self.prompt.bytes()
             + self
+                .shell
                 .taps
                 .as_ref()
                 .map_or(0, |t| t.iter().map(DeviceBuffer::num_bytes).sum())
@@ -2553,23 +2533,19 @@ impl TierBody for Body {
     type Experts = HostRun;
 
     fn hybrid(&self) -> &Hybrid<HostRun> {
-        &self.hybrid
+        self.shell.hybrid()
     }
 
     fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
-        &mut self.hybrid
+        self.shell.hybrid_mut()
     }
 
     fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
-        Some(ResidencyParts {
-            glue: &mut self.residency_glue,
-            hybrid: &mut self.hybrid,
-            slots: &self.slots,
-        })
+        self.shell.residency_parts(&self.slots)
     }
 
     fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
-        self.hybrid.serve_captured_of(chain)?;
+        self.shell.hybrid.serve_captured_of(chain)?;
         self.planted(Plant::AfterLaunch)
     }
 }
@@ -2582,7 +2558,7 @@ impl Drop for Body {
     /// (a synchronize, a free) dropping ahead of the tier would hold that
     /// wait until the machine's own drop, which comes later.
     fn drop(&mut self) {
-        self.hybrid.stop_swap();
+        self.shell.hybrid.stop_swap();
     }
 }
 

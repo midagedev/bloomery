@@ -375,7 +375,8 @@ pub(super) fn moe_layer(
         &mut m.route,
         fault,
     )?;
-    m.latent_down.project(cx, acts, l, &t.buf.xn, &mut s.lat)?;
+    m.latent_down
+        .project(&cx.gqa(), acts, l, &t.buf.xn, &mut s.lat)?;
     {
         let act = acts.q8_1_at(what, sh.latent, 1)?;
         gpu.enqueue_quantize_q8_1_layer(&s.lat, act, l)?;
@@ -409,7 +410,8 @@ pub(super) fn moe_layer(
         1,
         &mut s.moe,
     )?;
-    m.latent_up.project(cx, acts, l, &s.moe, &mut t.buf.delta)?;
+    m.latent_up
+        .project(&cx.gqa(), acts, l, &s.moe, &mut t.buf.delta)?;
     {
         let act = acts.q8_1_at(what, sh.shared_ff, 1)?;
         gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.sh_up, act, l)?;

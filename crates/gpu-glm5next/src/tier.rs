@@ -1,4 +1,4 @@
-//! The GLM-5.3-Flash expert tier ([`bloomery_gpu::host::tier`]): a card
+//! The GLM-5.3-Flash expert tier ([`bloomery_gpu::host::leg_tier`]): a card
 //! beside the stage card that holds some of each routed layer's experts and
 //! computes the routed slots the slot map sends it, in the host leg's shadow.
 //!
@@ -6,43 +6,33 @@
 //! tier handoff (`ds41_ffn_handoff_8_tier`) reads each slot's tier place
 //! from, and each row's tier places, which the tier card sum
 //! (`ds41_ffn_card_acc_8_tier`) reads. The row's tier image carries the
-//! normed activation in f32 ([`TierAct::F32`]): GLM's `_sel` entries read
+//! normed activation in f32: GLM's `_sel` entries read
 //! the q8_1 planes of Walk A, which the stage card makes in the shadow,
 //! after the go; the tier quantizes the same values with the same kernel.
 //!
-//! The tier's own layer ([`GlmTier`], the architecture's [`TierExperts`]) is
-//! the card leg ([`CardLeg::enqueue_rows`]) over the tier's stacks: the q8_1
-//! of the activation, the gate·up `_sel` with the routed clamped SwiGLU, the
-//! q8_1 of the tier slots' columns and the down `_sel` into the tier's rows;
-//! over a prompt batch's block, the same run chunk by chunk of [`CHUNK`]
-//! tokens. Each slot's down output is the one the stage card would write for
-//! it, so the card sum over both cards' slots in slot order is the one-card
-//! sum over their union.
+//! The tier's own layer is the common [`LegTier`] over GLM's leg shape
+//! ([`leg_shape`]): [`N_USED`] slots a token, [`CHUNK`] tokens a run. What is
+//! GLM's here is the node family ([`NODE_FAMILY`]), which reads the file's
+//! description, and the open of the tier card ([`open_tier`]).
 
-use std::ops::Range;
 use std::sync::Arc;
 
-use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
+use bloomery_gpu::card_leg::LegShape;
+use bloomery_gpu::host::leg_tier::{self, LegOpen, LegTier};
 use bloomery_gpu::host::node::{NodeFamily, NodeOpen};
 use bloomery_gpu::host::run::{HostRun, HostWidths};
-use bloomery_gpu::host::tier::{
-    TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet, TierShape,
-};
+use bloomery_gpu::host::tier::{TierCard, TierExperts, TierOpen};
 use bloomery_gpu::hybrid::SlotMap;
-use bloomery_gpu::kquant::Act;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
-use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
 use gguf::Split;
 use model::arch::glm5next::place::PlanInputs;
-use model::arch::names::routed_stacks;
 use model::placement::{ModelTensors, Plan};
-use models::{Ffn, LayerSpec};
+use models::LayerSpec;
 
 use crate::body::prefill::CHUNK;
-use crate::ffn::CardStacks;
 
 /// What the tier's errors name.
 const WHAT: &str = "glm5next tier";
@@ -63,22 +53,14 @@ fn node_tensors(file: &Split) -> Result<ModelTensors, GpuError> {
 
 fn node_inputs(file: &Split, open: &NodeOpen) -> Result<PlanInputs, GpuError> {
     let inputs = PlanInputs::describe(file).map_err(|e| GpuError::plan(WHAT, e))?;
-    if open.shape
-        != (TierShape {
-            hidden: inputs.hp.n_embd,
-            n_used: inputs.hp.n_used,
-            rows: crate::LOAD_ROWS,
-            act: TierAct::F32,
-        })
-        || open.set.n_expert() != inputs.hp.n_expert
-        || open.layers != inputs.spec.layers.len()
-        || open.cols != 1
-    {
-        return Err(GpuError::shape(
-            WHAT,
-            "the node tier's shape is not this GLM file's",
-        ));
+    LegOpen {
+        n_expert: inputs.hp.n_expert,
+        layers: inputs.spec.layers.len(),
+        hidden: inputs.hp.n_embd,
+        n_used: inputs.hp.n_used,
+        rows: crate::LOAD_ROWS,
     }
+    .check(WHAT, open)?;
     Ok(inputs)
 }
 
@@ -90,13 +72,12 @@ fn node_experts(
     open: &NodeOpen,
 ) -> Result<Box<dyn TierExperts>, GpuError> {
     let inputs = node_inputs(file, open)?;
-    Ok(Box::new(GlmTier::new(
+    Ok(Box::new(LegTier::new(
         gpu,
         &inputs.spec.layers,
         &open.set,
         w,
-        inputs.hp.n_embd,
-        inputs.hp.expert_ff,
+        leg_shape(inputs.hp.n_embd, inputs.hp.expert_ff),
     )?))
 }
 
@@ -210,34 +191,6 @@ fn past_rows(n: usize, row: usize) -> GpuError {
     }
 }
 
-/// A tier layer's experts, its routed SwiGLU limit and its stacks' names.
-struct TierLayer {
-    k: usize,
-    limit: f32,
-    names: [String; 3],
-}
-
-impl TierLayer {
-    /// The stacks' names, as the card leg reads them.
-    fn names(&self) -> [&str; 3] {
-        self.names.each_ref().map(String::as_str)
-    }
-}
-
-/// The GLM tier card's computation ([`TierExperts`]): per tier layer the
-/// card leg over the tier's stacks into the tier's rows; over a prompt
-/// batch's block, the same chunk by chunk. Its scratch, one [`LegBufs`] for
-/// [`CHUNK`] tokens that a step's one token and each chunk share, is made at
-/// load.
-pub(crate) struct GlmTier {
-    leg: CardLeg,
-    bufs: LegBufs,
-    layers: Range<usize>,
-    /// Per layer of `layers`, `None` off the tier.
-    cfg: Vec<Option<TierLayer>>,
-    n_embd: usize,
-}
-
 /// The card leg's shape for the tier: up to [`CHUNK`] tokens of
 /// [`N_USED`] slots, `n_embd` wide, through experts `ff` wide.
 const fn leg_shape(n_embd: usize, ff: usize) -> LegShape {
@@ -249,167 +202,13 @@ const fn leg_shape(n_embd: usize, ff: usize) -> LegShape {
     }
 }
 
-impl GlmTier {
-    /// The tier's computation on `gpu` over `set`, whose stacks `w` holds,
-    /// for the description `layers`, `n_embd` wide with routed experts `ff`
-    /// wide. A tier layer whose three stacks are absent, of a type the card
-    /// experts do not read, or of other rows than its experts', and a layer
-    /// off the tier with resident stacks, are refused by name. Load-time
-    /// only.
-    pub(crate) fn new(
-        gpu: &Gpu,
-        layers: &[LayerSpec],
-        set: &TierSet,
-        w: &Weights,
-        n_embd: usize,
-        ff: usize,
-    ) -> Result<GlmTier, GpuError> {
-        let run = set.layers();
-        let shape = leg_shape(n_embd, ff);
-        let mut cfg = Vec::with_capacity(run.len());
-        for l in run.clone() {
-            let k = set.on_tier(l)?;
-            let names = routed_stacks(l);
-            if k == 0 {
-                if let Some(n) = names.iter().find(|n| w.get(n).is_some()) {
-                    return Err(GpuError::Tensor {
-                        what: WHAT,
-                        name: n.clone(),
-                        need: "no resident rows: the tier holds no expert of its layer",
-                    });
-                }
-                cfg.push(None);
-                continue;
-            }
-            let Some(Ffn::Moe(m)) = layers.get(l).map(|s| &s.ffn) else {
-                return Err(GpuError::Shape {
-                    what: WHAT,
-                    detail: format!("layer {l}: tier experts off a routed block"),
-                });
-            };
-            // The card leg's arms ([`accepts::leg_arms`]).
-            CardStacks::of(w, l)?;
-            let layer = TierLayer {
-                k,
-                limit: m.act.swiglu_limit(),
-                names,
-            };
-            LegStacks::of(w, layer.names())?.check(k, shape)?;
-            cfg.push(Some(layer));
-        }
-        Ok(GlmTier {
-            leg: CardLeg::load(gpu)?,
-            bufs: LegBufs::new(gpu.stream(), shape)?,
-            layers: run,
-            cfg,
-            n_embd,
-        })
-    }
-}
-
-/// Layer `layer`'s tier experts of `cfg` (the tier's layers from
-/// `layers.start`); a layer the tier holds none of is refused by name.
-fn layer_of<'a>(
-    layers: &Range<usize>,
-    cfg: &'a [Option<TierLayer>],
-    layer: usize,
-    what: &'static str,
-) -> Result<&'a TierLayer, GpuError> {
-    layer
-        .checked_sub(layers.start)
-        .and_then(|i| cfg.get(i))
-        .and_then(Option::as_ref)
-        .ok_or_else(|| GpuError::Shape {
-            what,
-            detail: format!("layer {layer} holds no tier expert"),
-        })
-}
-
-impl TierExperts for GlmTier {
-    /// The scratch of a run of [`CHUNK`] tokens: the leg's buffers.
-    fn block_bytes(&self) -> usize {
-        self.bufs.bytes()
-    }
-
-    /// Per chunk of up to [`CHUNK`] tokens, the card leg over the tier's
-    /// stacks into the chunk's slots of `io.down`.
-    fn enqueue_block(
-        &mut self,
-        gpu: &Gpu,
-        weights: &Weights,
-        layer: usize,
-        io: TierBlock<'_>,
-    ) -> Result<(), GpuError> {
-        const W: &str = "GlmTier::enqueue_block";
-        let GlmTier {
-            leg,
-            bufs,
-            layers,
-            cfg,
-            n_embd,
-        } = self;
-        let tl = layer_of(layers, cfg, layer, W)?;
-        let stacks = LegStacks::of(weights, tl.names())?;
-        let n = *n_embd;
-        for c0 in (0..io.cols).step_by(CHUNK) {
-            let cn = CHUNK.min(io.cols - c0);
-            let slots = cn * N_USED;
-            let x = span(W, io.x, c0 * n, cn * n)?;
-            let sel = span(W, io.sel, c0 * N_USED, slots)?;
-            let mut down = span_mut(W, &mut *io.down, c0 * N_USED * n, slots * n)?;
-            let run = LegRun {
-                layer,
-                stacks: &stacks,
-                normed: &x,
-                m: cn,
-                sel: &sel,
-                n_card: tl.k,
-                rule: Act::SwigluClamp { limit: tl.limit },
-            };
-            leg.enqueue_rows(gpu, bufs, &run, &mut down)?;
-        }
-        Ok(())
-    }
-
-    /// The card leg of one token over the tier's stacks into the row's
-    /// routed rows, from the staged activation.
-    fn enqueue_layer(
-        &mut self,
-        gpu: &Gpu,
-        weights: &Weights,
-        layer: usize,
-        io: TierIo<'_>,
-    ) -> Result<(), GpuError> {
-        const W: &str = "GlmTier::enqueue_layer";
-        let tl = layer_of(&self.layers, &self.cfg, layer, W)?;
-        let TierInput::F32(x) = io.act else {
-            return Err(GpuError::Shape {
-                what: W,
-                detail: "a q8_1 tier image: GLM's tier quantizes the f32 activation itself"
-                    .to_string(),
-            });
-        };
-        let stacks = LegStacks::of(weights, tl.names())?;
-        let run = LegRun {
-            layer,
-            stacks: &stacks,
-            normed: x,
-            m: 1,
-            sel: io.sel,
-            n_card: tl.k,
-            rule: Act::SwigluClamp { limit: tl.limit },
-        };
-        self.leg.enqueue_rows(gpu, &mut self.bufs, &run, io.rows)
-    }
-}
-
 /// The tier card `t` of `plan`, tier `tier` of `map`, for the stage card
 /// `stage`'s load, opened in this process or on its node through the common
-/// node owner ([`NodeOpen::open_tier`]): its set the map's rows of that
-/// tier, GLM's tier computation over them ([`NODE_FAMILY`], the description
-/// `layers`, `n_embd` wide), its page rows `rows`; `card_dontneed` as for
-/// the stage card's segments. The stage card's context is current again on
-/// return. Load-time only.
+/// owner ([`leg_tier::open_tier`], [`NODE_FAMILY`]): GLM's tier computation
+/// over the map's rows of that tier (the description `layers`, `n_embd`
+/// wide), its page rows `rows`; `card_dontneed` as for the stage card's
+/// segments. The stage card's context is current again on return.
+/// Load-time only.
 #[allow(
     clippy::too_many_arguments,
     reason = "the stage card, the file, the plan, the tier and its index, the description, the map, the width and rows, and the page lever (rust-quality R8)"
@@ -425,32 +224,20 @@ pub(crate) fn open_tier(
     [n_embd, rows]: [usize; 2],
     card_dontneed: bool,
 ) -> Result<TierCard, GpuError> {
-    if map.n_expert() != N_EXPERT {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!(
-                "a map of {} experts; the tier is built for {N_EXPERT}",
-                map.n_expert()
-            ),
-        });
-    }
-    NodeOpen {
-        nvme: None,
-        family: NODE_FAMILY.word.to_string(),
-        name: t.name.clone(),
-        device: t.device,
-        card: t.card,
-        rows: NodeOpen::rows_of(plan, file, t.card)?,
-        set: TierSet::of_map(map, tier)?,
-        shape: TierShape {
-            hidden: n_embd,
-            n_used: N_USED,
-            rows,
-            act: TierAct::F32,
-        },
-        cols: 1,
+    let open = LegOpen {
+        n_expert: N_EXPERT,
         layers: layers.len(),
-        block: (0, 0),
-    }
-    .open_tier(stage, file, plan, t.node, &NODE_FAMILY, card_dontneed)
+        hidden: n_embd,
+        n_used: N_USED,
+        rows,
+    };
+    leg_tier::open_tier(
+        stage,
+        file,
+        plan,
+        (t, tier),
+        map,
+        (&NODE_FAMILY, open),
+        card_dontneed,
+    )
 }

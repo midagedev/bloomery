@@ -44,6 +44,7 @@
 
 use bloomery_gpu::checkpoint::Checkpoints;
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::hybrid::Chain;
 use bloomery_gpu::linear::delta::row_lane;
 use bloomery_gpu::model::{ChainBody, Rows, SlotRange, SlotRows};
@@ -208,7 +209,7 @@ impl Body {
                 tokens.len()
             )));
         }
-        if self.taps.is_some() {
+        if self.shell.taps.is_some() {
             return Err(shape(
                 "a verify with the taps armed: a tap holds one row's streams".to_string(),
             ));
@@ -219,7 +220,7 @@ impl Body {
                 self.embd.n_vocab
             )));
         }
-        let carried = self.hybrid.boundary().rows();
+        let carried = self.shell.hybrid.boundary().rows();
         if carried < LANES {
             return Err(shape(format!(
                 "a verify of {LANES} rows on a host boundary of {carried}: the load makes the \
@@ -577,13 +578,13 @@ impl Body {
     /// refused by the plan, and by the enqueue unless it is the pass's own
     /// ([`SlotRows::enqueue_slots`]).
     fn refuse_slots(&self, parked: &[&mut GlmSlot], rows: &[SlotRange]) -> Result<(), GpuError> {
-        if self.taps.is_some() {
+        if self.shell.taps.is_some() {
             return Err(shape(
                 "a pass of several slots with the taps armed: a tap holds one row's streams"
                     .to_string(),
             ));
         }
-        if self.hybrid.route_traced() {
+        if self.shell.hybrid.route_traced() {
             return Err(shape(
                 "a pass of several slots with a route trace attached: the trace records one \
                  sequence's positions"
@@ -874,7 +875,7 @@ impl Body {
         rows: &[SlotRange],
     ) -> Result<(), GpuError> {
         let Body {
-            hybrid,
+            shell: TierShell { hybrid, .. },
             cfg,
             names,
             dims,

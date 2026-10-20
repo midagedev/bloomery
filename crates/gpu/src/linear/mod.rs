@@ -1,8 +1,9 @@
 //! The card kernels of a Gated DeltaNet layer (linear attention): the causal
 //! conv with SiLU, the q/k L2 norm and the β/decay prep ([`conv`]), the
 //! recurrent delta step over a run of tokens ([`delta`]), and the gated
-//! per-head RMS norm of its output ([`norm_gate`]). The projections around
-//! them (`W_qkv`, `w_β`, `w_α`, `W_gate`, `W_out`) are the tree's dense
+//! per-head RMS norm of its output ([`norm_gate`]), with the sigmoid output
+//! gate of a gated softmax-attention layer beside it ([`out_gate`]). The
+//! projections around them (`W_qkv`, `w_β`, `w_α`, `W_gate`, `W_out`) are the tree's dense
 //! gemv/GEMM and are not here.
 //!
 //! The rule, per token t and value head h (`n_v` value heads, `n_k` query/key
@@ -19,7 +20,10 @@
 //! Kimi Delta Attention (GLM-5.3-Flash) takes the same steps with one decay
 //! per key channel, `decay_hk = exp(lb · sigmoid(−ssm_a_h · (f_hk + dt_hk)))`
 //! from the low-rank forget projection `f`, scaling state key `k`, and the
-//! sigmoid gate.
+//! sigmoid gate. Solar-Open2 takes the same steps with
+//! `decay_hk = exp(ssm_a_h · softplus(f_hk + dt_hk))` and `β = 2·sigmoid(b)`
+//! (`kda_conv_prep_sp2`), and gates its attention output by
+//! `attn · sigmoid(g)` ([`out_gate`]).
 //!
 //! Layouts, all f32 and token-major:
 //! - channels `[m][C]`: q heads, then k heads, then v heads, [`HEAD`] each —
@@ -47,7 +51,9 @@
 
 pub mod conv;
 pub mod delta;
+pub mod mixer_kda;
 pub mod norm_gate;
+pub mod out_gate;
 
 use crate::GpuError;
 use cuda_core::CudaContext;
@@ -136,6 +142,18 @@ pub const DECAY_HEAD: u32 = 0;
 /// `kda_conv_prep` and `kda_delta`).
 pub const DECAY_KEY: u32 = 1;
 
+/// The KDA decay's gate, the prep body's const parameter: GLM-5.3-Flash's
+/// bounded sigmoid, `exp(lb · sigmoid(−ssm_a·(f + dt)))` (`kda_conv_prep`).
+pub const KDA_GATE_SIGMOID: u32 = 0;
+/// `exp(ssm_a · softplus(f + dt))`, no bound (`kda_conv_prep_sp2`).
+pub const KDA_GATE_SOFTPLUS: u32 = 1;
+
+/// The KDA β, the prep body's other const parameter: `sigmoid(b)`
+/// (`kda_conv_prep`); the value is the scale on the sigmoid.
+pub const KDA_BETA_X1: u32 = 1;
+/// `2 · sigmoid(b)` (`kda_conv_prep_sp2`); the scale is exact in f32.
+pub const KDA_BETA_X2: u32 = 2;
+
 /// The output gate's activation, the norm body's const parameter: SiLU
 /// (Qwen3.5/3.6, Qwen3-Next; `gdn_norm_gate`).
 pub const GATE_SILU: u32 = 0;
@@ -203,20 +221,22 @@ impl LinearShape {
     }
 }
 
-/// The three modules, loaded once.
+/// The four modules, loaded once.
 pub struct LinearKernels {
     pub conv: conv::ConvKernels,
     pub delta: delta::DeltaKernels,
     pub norm_gate: norm_gate::NormGateKernels,
+    pub out_gate: out_gate::OutGateKernels,
 }
 
 impl LinearKernels {
-    /// Load the three device bundles into `ctx`. Load-time only.
+    /// Load the four device bundles into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<LinearKernels, GpuError> {
         Ok(LinearKernels {
             conv: conv::ConvKernels::load(ctx)?,
             delta: delta::DeltaKernels::load(ctx)?,
             norm_gate: norm_gate::NormGateKernels::load(ctx)?,
+            out_gate: out_gate::OutGateKernels::load(ctx)?,
         })
     }
 }

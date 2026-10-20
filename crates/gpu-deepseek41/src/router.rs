@@ -827,3 +827,25 @@ bloomery_gpu::sigmoid_router_instance! {
         prepare: prepare_mimo2_router, prepare_mimo2_router_pick,
     }
 }
+
+bloomery_gpu::sigmoid_router_instance! {
+    /// The sigmoid router at 320 experts and the top 8 (Solar-Open2): the same
+    /// rule as [`glm5next`]'s at another width. Each expert scores
+    /// `sigmoid(logit)`; the selection bias steers the choice only; the kept
+    /// unbiased scores are summed in f64 in slot order, the sum narrowed to f32
+    /// and guarded ([`renorm_divisor`]), each score divided by it and multiplied
+    /// by `expert_weights_scale` (1 in the file), all in f32.
+    ///
+    /// The entries are [`glm5next`]'s three at this instance, from the generic
+    /// bodies: `sigmoid_320_8_router`, `sigmoid_320_8_router_scores` and
+    /// `sigmoid_320_8_router_pick`. The no-silent-selection rule is the module
+    /// doc's: a selection value or a weight that is not finite raises
+    /// [`FaultSite::Router`].
+    pub mod sigmoid_320_8 {
+        experts: 320,
+        used: 8,
+        kernels: sigmoid_320_8_router_kernels,
+        entries: sigmoid_320_8_router, sigmoid_320_8_router_pick,
+        prepare: prepare_sigmoid_320_8_router, prepare_sigmoid_320_8_router_pick,
+    }
+}

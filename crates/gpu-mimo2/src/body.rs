@@ -2,8 +2,8 @@
 //! [`Body`] behind `GpuModel`.
 //!
 //! All 48 layers are one card's chain: the dense layer 0 and 47 routed layers
-//! whose experts run on the card where the plan puts them ([`crate::card`]: the
-//! common per-slot pair, in the host leg's shadow) and on the host tier
+//! whose experts run on the card where the plan puts them ([`bloomery_gpu::card_experts`]:
+//! the common per-slot pair, in the host leg's shadow) and on the host tier
 //! otherwise. Each layer is a GQA attention over its store — a window layer a
 //! ring of the plan's rows, a full layer the plane of every position — and a
 //! block; the step is [`crate::program`]'s walk, one token at a time. A pass
@@ -34,12 +34,14 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 
+use bloomery_gpu::card_experts::CardExperts;
 use bloomery_gpu::flash_gqa::{self, FlashGqaKernels, HEAD, HEAD_K192};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::handoff::HandoffKernels;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
+use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
@@ -63,7 +65,7 @@ use model::placement::Plan;
 use runtime::layer::{FfnKind, Layer, ResidualKind, hosted};
 
 use crate::attn::{AttnNames, checked_sinks};
-use crate::card::CardExperts;
+use crate::card;
 use crate::ffn::{FfnNames, routed_layers};
 use crate::program;
 use crate::swap;
@@ -353,10 +355,15 @@ pub struct StepInput {
     pos: u32,
 }
 
-/// The MiMo body. Field order is drop order: the host tier (its lock over
-/// the host set and its page windows) before the buffers.
+/// The MiMo body. Field order is drop order: the shell, whose host tier (its
+/// lock over the host set and its page windows) comes first, before the
+/// buffers.
 pub struct Body {
-    hybrid: Hybrid<HostRun>,
+    /// The host tier, the residency glue and the taps ([`TierShell`]); the
+    /// glue holds the load's residency side: the machine's source and shape,
+    /// which [`HostServed::start_residency`] starts once the body's pieces
+    /// are sized, [`ResidencyGlue::off`] under [`Residency::Off`].
+    shell: TierShell<HostRun>,
     layers: Range<usize>,
     cfg: Vec<LayerCfg>,
     names: Vec<LayerNames>,
@@ -376,8 +383,6 @@ pub struct Body {
     /// both.
     slots: Arc<DeviceTensor<u32>>,
     embd: Embedding,
-    /// Each layer's output after the last step, when a gate armed them.
-    taps: Option<Vec<DeviceBuffer<f32>>>,
     /// The position bound: a step at or past it is refused. A ring layer's
     /// store is shorter; this stays the bound of the rope table and of the
     /// live key count.
@@ -401,10 +406,6 @@ pub struct Body {
     /// ([`Body::open_placed_slots`]), and the ones made so far.
     slots_planned: usize,
     slots_made: usize,
-    /// The load's residency side ([`ResidencyGlue`]): the machine's source and
-    /// shape, which [`HostServed::start_residency`] starts once the body's
-    /// pieces are sized; [`ResidencyGlue::off`] under [`Residency::Off`].
-    residency_glue: ResidencyGlue,
     /// The residency the body was loaded with: `off` keeps the load's slot map
     /// for the model's life.
     residency: Residency,
@@ -738,7 +739,7 @@ impl Body {
         // through the step port's columns; a load for one sequence the step.
         let rows = if seqs.get() > 1 { slots::MAX_ROWS } else { 1 };
         let card_experts =
-            CardExperts::new(gpu, w, &spec.layers, &map, dims.embd, hp.expert_ff, rows)?;
+            card::experts(gpu, w, &spec.layers, &map, dims.embd, hp.expert_ff, rows)?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         // MiMo fact: only the window layers carry sinks, one per query head, file constants.
@@ -833,7 +834,7 @@ impl Body {
             )));
         }
         let mut body = Body {
-            hybrid,
+            shell: TierShell::new(hybrid, glue, dims.embd, WHAT),
             layers,
             cfg,
             names,
@@ -846,7 +847,6 @@ impl Body {
             ropes,
             slots,
             embd,
-            taps: None,
             ctx,
             seq_rows,
             at: 0,
@@ -854,7 +854,6 @@ impl Body {
             prompt: PromptState::new(),
             slots_planned: seqs.get(),
             slots_made: 1,
-            residency_glue: glue,
             residency: lever,
         };
         refuse_scratch_past(
@@ -1018,7 +1017,7 @@ impl Body {
                 .iter()
                 .map(|r| r.rows.table.num_bytes())
                 .sum::<usize>()
-            + self.hybrid.boundary().device_bytes()
+            + self.shell.hybrid.boundary().device_bytes()
             + self.slots.buf().num_bytes()
     }
 
@@ -1051,12 +1050,12 @@ impl Body {
     /// The host tier.
     #[must_use]
     pub fn hybrid(&self) -> &Hybrid<HostRun> {
-        &self.hybrid
+        self.shell.hybrid()
     }
 
     /// The host tier, for a gate's instrument or test seam.
     pub fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
-        &mut self.hybrid
+        self.shell.hybrid_mut()
     }
 
     /// Keep every residency boundary's report from now on, for
@@ -1064,19 +1063,19 @@ impl Body {
     /// pass` records, or a gate that counts flips, asks once, with the
     /// boundaries it takes at most between two takes, `passes`.
     pub fn log_residency(&mut self, passes: usize) {
-        self.residency_glue.log_passes(passes);
+        self.shell.log_residency(passes);
     }
 
     /// The residency machine's source, when the load runs one.
     #[must_use]
     pub fn residency_source(&self) -> Option<&FileSwap> {
-        self.residency_glue.source()
+        self.shell.residency_source()
     }
 
     /// The residency boundaries' reports since the last take, in order, each
     /// with the kind of the pass it ended.
     pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
-        self.residency_glue.take_passes()
+        self.shell.take_residency_passes()
     }
 
     /// Arm (or disarm) the per-layer taps: after each layer the chain copies
@@ -1084,31 +1083,13 @@ impl Body {
     /// through [`set_taps`], which drops the captured chains first: a capture
     /// holds the tap copies it was taken with.
     pub(crate) fn set_taps(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
-        self.taps = if on {
-            Some(
-                self.cfg
-                    .iter()
-                    .map(|_| DeviceBuffer::zeroed(gpu.stream(), self.dims.embd))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-        } else {
-            None
-        };
-        Ok(())
+        self.shell.set_taps(gpu, self.cfg.len(), on)
     }
 
     /// Every layer's output after the last step, `n_embd` a layer: layer `l`
     /// at `l · n_embd`. Blocking; refused when the taps are not armed.
     pub fn taps(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
-        let taps = self.taps.as_ref().ok_or(GpuError::State {
-            what: WHAT,
-            missing: "armed taps (set_taps)",
-        })?;
-        let mut out = Vec::with_capacity(taps.len() * self.dims.embd);
-        for t in taps {
-            out.extend(t.to_host_vec(gpu.stream())?);
-        }
-        Ok(out)
+        self.shell.taps(gpu)
     }
 
     /// The walk's parts, lent apart from the host tier.
@@ -1133,10 +1114,10 @@ impl Body {
                 stores: stores.unwrap_or(self.stores.as_mut_slice()),
                 ropes: &self.ropes,
                 slots: &self.slots,
-                taps: self.taps.as_deref_mut(),
+                taps: self.shell.taps.as_deref_mut(),
                 ctx: self.ctx,
             },
-            &mut self.hybrid,
+            &mut self.shell.hybrid,
         )
     }
 }
@@ -1201,7 +1182,7 @@ impl ChainBody for Body {
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         self.at = 0;
         self.pending = None;
-        self.hybrid.settle(gpu.stream())
+        self.shell.hybrid.settle(gpu.stream())
     }
 
     /// `attention.layer_norm_rms_epsilon`: every RMS norm's, the head's
@@ -1215,6 +1196,7 @@ impl ChainBody for Body {
             + self.scratch_bytes()
             + self.prompt.bytes()
             + self
+                .shell
                 .taps
                 .as_ref()
                 .map_or(0, |t| t.iter().map(DeviceBuffer::num_bytes).sum())
@@ -1234,23 +1216,19 @@ impl TierBody for Body {
     type Experts = HostRun;
 
     fn hybrid(&self) -> &Hybrid<HostRun> {
-        &self.hybrid
+        self.shell.hybrid()
     }
 
     fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
-        &mut self.hybrid
+        self.shell.hybrid_mut()
     }
 
     fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
-        Some(ResidencyParts {
-            glue: &mut self.residency_glue,
-            hybrid: &mut self.hybrid,
-            slots: &self.slots,
-        })
+        self.shell.residency_parts(&self.slots)
     }
 
     fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
-        self.hybrid.serve_captured_of(chain)?;
+        self.shell.hybrid.serve_captured_of(chain)?;
         if chain == Chain::Step {
             self.commit_pending();
         }
@@ -1264,7 +1242,7 @@ impl Drop for Body {
     /// stops it in its own drop, and this holds that order as the machine's
     /// rule rather than the field list's.
     fn drop(&mut self) {
-        self.hybrid.stop_swap();
+        self.shell.hybrid.stop_swap();
     }
 }
 

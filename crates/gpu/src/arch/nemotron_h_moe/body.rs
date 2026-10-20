@@ -6,8 +6,8 @@
 use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, Routing, moe_layer, routed};
 use super::placed::{PLACED_ROWS, Placed, PlacedOpen, StepWalk, plan_map};
 use crate::arch::hybrid::{
-    self, Acts, AttnLayer, Cx, DecodeInput, Kernels, MambaLayer, Names, Site, WORD_POS, WORD_TOKEN,
-    Words, attention_heads, attn_layer, derive_zero_conv_bias, mamba_layer, mamba_shape,
+    self, Acts, Cx, DecodeInput, GqaLayer, Kernels, MambaLayer, Names, Site, WORD_POS, WORD_TOKEN,
+    Words, attention_heads, derive_zero_conv_bias, gqa_layer, mamba_layer, mamba_shape,
 };
 use crate::flash_gqa::GROUP_16;
 use crate::flash_gqa_prefill::FlashGqaPrefill;
@@ -43,7 +43,7 @@ const SITE_TYPES: &[SiteTy] = &[SiteTy::Nvfp4, SiteTy::Q8_0];
 /// A layer, by the kind the file's per-layer arrays give it.
 pub(super) enum Layer {
     Mamba(MambaLayer),
-    Attn(AttnLayer),
+    Attn(GqaLayer),
     Moe(MoeLayer),
 }
 
@@ -477,7 +477,12 @@ impl Body {
                     mamba_layer(&cx, (l, m), (&mut self.s, &mut self.acts), (src, dst))?;
                 }
                 Layer::Attn(a) => {
-                    attn_layer::<GROUP_16>(&cx, (l, a), (&mut self.s, &mut self.acts), (src, dst))?;
+                    gqa_layer::<GROUP_16>(
+                        &cx.gqa(),
+                        (l, a),
+                        (self.s.gqa(), &mut self.acts),
+                        (src, dst),
+                    )?;
                 }
                 Layer::Moe(m) => moe_layer(
                     &cx,

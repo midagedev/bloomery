@@ -38,7 +38,7 @@
 //!    names that layer and the kernel's site, the values the planted input
 //!    reaches are not finite, every other value is the clean launch's bit
 //!    for bit, and the word is clean before and after.
-//! 8. `shape`: the eight entries compile with no local depot.
+//! 8. `shape`: the ten entries compile with no local depot.
 //! 9. `kda` (Kimi Delta Attention at GLM-5.3-Flash's shape: 64 query/key and
 //!    64 value heads, ε 1e-5, bound −5): `kda_conv_prep` at 512 and 1 tokens
 //!    over a random ring against its host rule; its `y`, β and ring against
@@ -77,6 +77,17 @@
 //!     position raising `delta_stamp` with every value the clean launch's
 //!     (judged as clause 7); and the launcher's refusals of a row base at the
 //!     lanes, a later row in place and row mode past the lanes.
+//! 14. `sp2` (Solar-Open2's softplus rule at its shape: 64 query/key and 64
+//!     value heads, ε 1e-5, 64 attention heads of 128): `kda_conv_prep_sp2` at 512
+//!     and 1 tokens over a random ring against its host rule; its `y` and
+//!     ring equal to `kda_conv_prep`'s and its β exactly twice, on the same
+//!     inputs; its decay within the f64 `exp(ssm_a·ln(1 + e^(f + dt)))` band;
+//!     `attn_out_gate_sigmoid` at 512 and 1 tokens against its host rule; the
+//!     launchers' refusals of a per-head-length `f`, of a decay gate and a β scale no
+//!     entry runs together, and of a short gate.
+//! 15. `sp2 fault`: a NaN and an infinite forget value and an infinite β
+//!     projection in `kda_conv_prep_sp2`, a NaN gate and an infinite gate in the out gate,
+//!     judged as clause 7.
 //!
 //! One case runs only when named, `--case kda_ik`, and alone: per KDA layer of
 //! the `ref_glm5next` set, the KDA conv and prep on ik's own inputs against
@@ -94,12 +105,14 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::linear::conv::{
-        ConvArgs, ConvOut, KdaConvArgs, conv_prep_host, kda_conv_prep_host,
+        ConvArgs, ConvOut, KdaBetaScale, KdaConvArgs, KdaGateRule, conv_prep_host,
+        kda_conv_prep_host,
     };
     use bloomery_gpu::linear::delta::{
         DeltaArgs, DeltaLanesArgs, DeltaOut, KdaLanesArgs, delta_host, kda_delta_host,
     };
     use bloomery_gpu::linear::norm_gate::{NormGateArgs, norm_gate_host};
+    use bloomery_gpu::linear::out_gate::{OutGateArgs, out_gate_host};
     use bloomery_gpu::linear::{
         CONV_TAPS, GATE_SIGMOID, GATE_SILU, HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS,
         Q_SCALE, RING_ROWS, expf_ik, logf_poly, sigmoid,
@@ -641,6 +654,8 @@ mod gate {
             "gdn_norm_gate_sigmoid",
             "gdn_delta_lanes",
             "kda_delta_lanes",
+            "kda_conv_prep_sp2",
+            "attn_out_gate_sigmoid",
         ])?);
         for pass in kda_clauses(&cx)? {
             tally(pass);
@@ -655,6 +670,12 @@ mod gate {
             tally(pass);
         }
         for pass in kda_lanes_clauses(&cx)? {
+            tally(pass);
+        }
+        for pass in sp2_clauses(&cx)? {
+            tally(pass);
+        }
+        for pass in sp2_fault_clauses(&cx)? {
             tally(pass);
         }
         let pass = failed == 0;
@@ -1589,6 +1610,17 @@ mod gate {
         }
     }
 
+    /// The decay rule and the β scale a gate launch names.
+    type KdaRule = (KdaGateRule, KdaBetaScale);
+
+    /// GLM-5.3-Flash's rule with the decay's bound `lb` (`kda_conv_prep`).
+    const fn bounded(lb: f32) -> KdaRule {
+        (KdaGateRule::Sigmoid { lower_bound: lb }, KdaBetaScale::X1)
+    }
+
+    /// Solar-Open2's rule (`kda_conv_prep_sp2`).
+    const SP2: KdaRule = (KdaGateRule::Softplus, KdaBetaScale::X2);
+
     impl Ctx<'_> {
         /// One KDA conv launch of `m` tokens at `pos` over a ring holding
         /// `ring`, with the decay's bound `lb`; the outputs and the ring.
@@ -1606,6 +1638,37 @@ mod gate {
             lb: f32,
             m: usize,
         ) -> Result<ConvOut, GateError> {
+            self.kda_prep(bounded(lb), fault, l, tk, ring, pos, m)
+        }
+
+        /// [`Ctx::kda_conv`] under Solar-Open2's rule (`kda_conv_prep_sp2`).
+        fn kda_conv_sp2(
+            &self,
+            fault: FaultSink,
+            l: &KdaLayer,
+            tk: &KdaTokens,
+            ring: &[f32],
+            pos: &[u32],
+            m: usize,
+        ) -> Result<ConvOut, GateError> {
+            self.kda_prep(SP2, fault, l, tk, ring, pos, m)
+        }
+
+        /// One KDA conv launch under `rule`.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "one launch's inputs, each as the launch names it"
+        )]
+        fn kda_prep(
+            &self,
+            rule: KdaRule,
+            fault: FaultSink,
+            l: &KdaLayer,
+            tk: &KdaTokens,
+            ring: &[f32],
+            pos: &[u32],
+            m: usize,
+        ) -> Result<ConvOut, GateError> {
             let s = self.stream();
             let (ch, nv) = (KDA_SHAPE.channels(), KDA_SHAPE.n_v);
             let up = |v: &[f32]| DeviceBuffer::from_host(s, v);
@@ -1616,6 +1679,7 @@ mod gate {
             let mut beta = up(&vec![0.0f32; m * nv])?;
             let mut decay = up(&vec![0.0f32; m * nv * HEAD])?;
             let mut rd = up(ring)?;
+            let (gate, beta_scale) = rule;
             self.k.conv.enqueue_kda_conv_prep(
                 s,
                 KdaConvArgs {
@@ -1627,7 +1691,8 @@ mod gate {
                     ssm_a: &sa,
                     pos: &pd,
                     shape: KDA_SHAPE,
-                    lb,
+                    gate,
+                    beta_scale,
                     eps: KDA_EPS,
                     m,
                     fault,
@@ -1645,13 +1710,54 @@ mod gate {
                 ring: rd.to_host_vec(s)?,
             })
         }
+
+        /// One out-gate launch over `m` tokens of `n_head` heads.
+        fn out_gate(
+            &self,
+            fault: FaultSink,
+            (attn, gate): (&[f32], &[f32]),
+            n_head: usize,
+            m: usize,
+        ) -> Result<Vec<f32>, GateError> {
+            let s = self.stream();
+            let ad = DeviceBuffer::from_host(s, attn)?;
+            let gd = DeviceBuffer::from_host(s, gate)?;
+            let mut y = DeviceBuffer::from_host(s, &vec![0.0f32; attn.len()])?;
+            self.k.out_gate.enqueue_out_gate(
+                s,
+                OutGateArgs {
+                    attn: &ad,
+                    gate: &gd,
+                    n_head,
+                    m,
+                    fault,
+                    y: &mut y,
+                },
+            )?;
+            s.synchronize()?;
+            Ok(y.to_host_vec(s)?)
+        }
     }
 
-    /// The host rule's KDA conv outputs for `tk` at `pos` over `ring`.
-    fn kda_conv_host(l: &KdaLayer, tk: &KdaTokens, ring: &[f32], pos: &[u32], m: usize) -> ConvOut {
+    /// The host rule's KDA conv outputs for `tk` at `pos` over `ring` under `rule`.
+    fn kda_conv_host_under(
+        rule: KdaRule,
+        l: &KdaLayer,
+        tk: &KdaTokens,
+        ring: &[f32],
+        pos: &[u32],
+        m: usize,
+    ) -> ConvOut {
+        let (gate, beta_scale) = rule;
         kda_conv_prep_host(
-            &tk.x, &tk.b, &tk.f, &l.w, &l.dt, &l.sa, pos, ring, KDA_SHAPE, KDA_LB, KDA_EPS, m,
+            &tk.x, &tk.b, &tk.f, &l.w, &l.dt, &l.sa, pos, ring, KDA_SHAPE, gate, beta_scale,
+            KDA_EPS, m,
         )
+    }
+
+    /// [`kda_conv_host_under`] GLM-5.3-Flash's rule.
+    fn kda_conv_host(l: &KdaLayer, tk: &KdaTokens, ring: &[f32], pos: &[u32], m: usize) -> ConvOut {
+        kda_conv_host_under(bounded(KDA_LB), l, tk, ring, pos, m)
     }
 
     /// `m` tokens of KDA delta inputs from the host conv rule at the
@@ -2055,6 +2161,288 @@ mod gate {
             }
             .judge(),
         );
+        Ok(out)
+    }
+
+    /// The out gate clauses' attention heads (Solar-Open2's 64), each [`HEAD`] wide.
+    const GATE_N_HEAD: usize = 64;
+
+    /// [`kda_conv_host_under`] Solar-Open2's rule.
+    fn sp2_conv_host(l: &KdaLayer, tk: &KdaTokens, ring: &[f32], pos: &[u32], m: usize) -> ConvOut {
+        kda_conv_host_under(SP2, l, tk, ring, pos, m)
+    }
+
+    /// Clause 14 (Solar-Open2's rule): the softplus KDA prep and the out gate against
+    /// their host rules bit for bit, the prep against `kda_conv_prep` and the
+    /// f64 decay, the launchers' refusals.
+    fn sp2_clauses(cx: &Ctx<'_>) -> Result<Vec<bool>, GateError> {
+        let unl = cx.gpu.unlabelled_sink();
+        let nv = KDA_SHAPE.n_v;
+        let l = KdaLayer::new(0x7370_326c);
+        let tk = KdaTokens::new(PROMPT, 0x7370_746b);
+        let dirty = Lcg(0x7370_7269).fill(KDA_SHAPE.ring_len(), -1.0, 1.0);
+        let mut out = Vec::new();
+
+        for m in [PROMPT, 1] {
+            let t = tk.slice(0, m);
+            let pos = positions(P0, m);
+            let d = cx.kda_conv_sp2(unl, &l, &t, &dirty, &pos, m)?;
+            let h = sp2_conv_host(&l, &t, &dirty, &pos, m);
+            let (pass, line) = conv_same(&d, &h);
+            println!(
+                "sp2 conv m={m} at p0={P0} over a random ring: {line} {}",
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+
+        // The conv, the norm and the ring are kda_conv_prep's, β is twice its
+        // β: both entries on the same channels, taps, projections and ring.
+        let pos = positions(P0, PROMPT);
+        let sp = cx.kda_conv_sp2(unl, &l, &tk, &dirty, &pos, PROMPT)?;
+        let gl = cx.kda_conv(unl, &l, &tk, &dirty, &pos, KDA_LB, PROMPT)?;
+        let twice: Vec<f32> = gl.beta.iter().map(|v| 2.0 * v).collect();
+        let pass = bits_equal(&sp.y, &gl.y)
+            && bits_equal(&sp.ring, &gl.ring)
+            && bits_equal(&sp.beta, &twice);
+        println!(
+            "sp2 conv m={PROMPT} vs kda_conv_prep on the same inputs: y {} ring {} beta vs twice \
+             its beta {} {}",
+            cmp(&sp.y, &gl.y),
+            cmp(&sp.ring, &gl.ring),
+            cmp(&sp.beta, &twice),
+            verdict(pass)
+        );
+        out.push(pass);
+
+        // The decay against exp(ssm_a·ln(1 + e^(f + dt))) in f64 on the same
+        // f32 inputs, g the exponent. Band: 4e-7 for the exp polynomial and
+        // the final rounding, 1e-7·|ssm_a| for the rounded `1 + e^x` before the
+        // log (half an ulp) and ggml's zero below x ≈ −17, and |g|·8e-7 for
+        // the rounded sum, the log polynomial and the product.
+        let mut worst = 0.0f64;
+        let mut inside = true;
+        for t in 0..PROMPT {
+            for h in 0..nv {
+                for k in 0..HEAD {
+                    let at = (t * nv + h) * HEAD + k;
+                    let x = f64::from(tk.f[at]) + f64::from(l.dt[h * HEAD + k]);
+                    let g = f64::from(l.sa[h]) * x.exp().ln_1p();
+                    let want = g.exp();
+                    let rel = (f64::from(sp.decay[at]) - want).abs() / want;
+                    let band = 4e-7 + 1e-7 * f64::from(l.sa[h]).abs() + 8e-7 * g.abs();
+                    worst = worst.max(rel / band);
+                    inside &= rel <= band && (0.0..=1.0).contains(&sp.decay[at]);
+                }
+            }
+        }
+        println!(
+            "sp2 conv m={PROMPT} decay vs the f64 softplus rule: worst error {worst:.3} of the \
+             band, inside [0, 1] {}",
+            verdict(inside)
+        );
+        out.push(inside);
+
+        let mut r = Lcg(0x7367);
+        let n = PROMPT * GATE_N_HEAD * HEAD;
+        let attn = r.fill(n, -2.0, 2.0);
+        let gate = r.fill(n, -6.0, 6.0);
+        for m in [PROMPT, 1] {
+            let len = m * GATE_N_HEAD * HEAD;
+            let (a, g) = (&attn[..len], &gate[..len]);
+            let d = cx.out_gate(unl, (a, g), GATE_N_HEAD, m)?;
+            let h = out_gate_host(a, g);
+            let pass = bits_equal(&d, &h);
+            println!(
+                "out_gate n_head={GATE_N_HEAD} m={m} y {} {}",
+                cmp(&d, &h),
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+
+        out.push(sp2_refusals(cx, &l, &tk)?);
+        Ok(out)
+    }
+
+    /// The KDA and out gate launchers refuse by name: a per-head-length `f` to the
+    /// softplus prep, a gate and a β scale no entry runs together, a short gate to
+    /// the out gate.
+    fn sp2_refusals(cx: &Ctx<'_>, l: &KdaLayer, tk: &KdaTokens) -> Result<bool, GateError> {
+        let unl = cx.gpu.unlabelled_sink();
+        let nv = KDA_SHAPE.n_v;
+        let mut short = tk.slice(0, 1);
+        short.f.truncate(nv);
+        let f_said =
+            match cx.kda_conv_sp2(unl, l, &short, &vec![0.0; KDA_SHAPE.ring_len()], &[0], 1) {
+                Ok(_) => (false, "launched".to_owned()),
+                Err(e) => {
+                    let e = e.to_string();
+                    (e.contains(&format!("f.len() {nv} < {}", nv * HEAD)), e)
+                }
+            };
+        let ring = vec![0.0; KDA_SHAPE.ring_len()];
+        let mixes = [
+            (bounded(KDA_LB).0, KdaBetaScale::X2),
+            (KdaGateRule::Softplus, KdaBetaScale::X1),
+        ];
+        let mut mix_said = (true, String::new());
+        for rule in mixes {
+            match cx.kda_prep(rule, unl, l, &tk.slice(0, 1), &ring, &[0], 1) {
+                Ok(_) => mix_said = (false, "launched".to_owned()),
+                Err(e) => {
+                    let e = e.to_string();
+                    mix_said.0 &= e.contains("no KDA entry runs");
+                    mix_said.1 = e;
+                }
+            }
+        }
+        let n = GATE_N_HEAD * HEAD;
+        let a = vec![0.5f32; n];
+        let gate_said = match cx.out_gate(unl, (&a, &a[..n - 1]), GATE_N_HEAD, 1) {
+            Ok(_) => (false, "launched".to_owned()),
+            Err(e) => {
+                let e = e.to_string();
+                (e.contains(&format!("gate.len() {} < {n}", n - 1)), e)
+            }
+        };
+        let pass = f_said.0 && mix_said.0 && gate_said.0;
+        println!(
+            "sp2 launchers refuse a per-head f: \"{}\", a mixed gate and scale: \"{}\" and a short gate: \"{}\" {}",
+            f_said.1,
+            mix_said.1,
+            gate_said.1,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// Clause 15 (Solar-Open2's rule): a NaN forget value and an infinite β
+    /// projection in the softplus KDA prep, a NaN gate and an infinite gate
+    /// (finite `attn`) in the out gate, each judged as clause 7.
+    fn sp2_fault_clauses(cx: &Ctx<'_>) -> Result<Vec<bool>, GateError> {
+        let nv = KDA_SHAPE.n_v;
+        let unl = cx.gpu.unlabelled_sink();
+        let m = 16;
+        let mut out = Vec::new();
+
+        let l = KdaLayer::new(0x0073_7066);
+        let tk = KdaTokens::new(m, 0x0073_7074);
+        let ring = Lcg(0x0073_7072).fill(KDA_SHAPE.ring_len(), -1.0, 1.0);
+        let pos = positions(100, m);
+        let clean = cx.kda_conv_sp2(unl, &l, &tk, &ring, &pos, m)?;
+        let outs = |c: &ConvOut| vec![c.y.clone(), c.beta.clone(), c.decay.clone(), c.ring.clone()];
+
+        // A NaN forget value (token 3, head 5, key 40), then an infinite one
+        // (token 5, head 2, key 77), each reaches that decay alone: softplus(inf)
+        // times a negative `ssm_a` is −inf and its exponential the finite 0,
+        // which must not be written.
+        for (layer, what, at, bad_value) in [
+            (
+                33usize,
+                "sp2 conv NaN forget value",
+                (3 * nv + 5) * HEAD + 40,
+                f32::NAN,
+            ),
+            (
+                37usize,
+                "sp2 conv infinite forget value",
+                (5 * nv + 2) * HEAD + 77,
+                f32::INFINITY,
+            ),
+        ] {
+            let sink = cx.gpu.layer_sink(layer)?;
+            let before = cx.gpu.fault()?;
+            let mut bad_tk = tk.slice(0, m);
+            bad_tk.f[at] = bad_value;
+            let bad = cx.kda_conv_sp2(sink, &l, &bad_tk, &ring, &pos, m)?;
+            let word = cx.gpu.take_fault()?;
+            let _ = cx.kda_conv_sp2(sink, &l, &tk, &ring, &pos, m)?;
+            let after = cx.gpu.fault()?;
+            out.push(
+                Planted {
+                    what,
+                    want: Fault::at(u32::try_from(layer)?, FaultSite::LinearConv),
+                    before,
+                    word,
+                    after,
+                    hit: vec![vec![], vec![], vec![at], vec![]],
+                    clean: outs(&clean),
+                    bad: outs(&bad),
+                }
+                .judge(),
+            );
+        }
+
+        // An infinite β projection (token 7, head 9): sigmoid(inf) is 1, so
+        // β = 2 would be finite; it must be NaN and raise.
+        let layer = 34usize;
+        let sink = cx.gpu.layer_sink(layer)?;
+        let before = cx.gpu.fault()?;
+        let mut bad_tk = tk.slice(0, m);
+        let at = 7 * nv + 9;
+        bad_tk.b[at] = f32::INFINITY;
+        let bad = cx.kda_conv_sp2(sink, &l, &bad_tk, &ring, &pos, m)?;
+        let word = cx.gpu.take_fault()?;
+        let _ = cx.kda_conv_sp2(sink, &l, &tk, &ring, &pos, m)?;
+        let after = cx.gpu.fault()?;
+        out.push(
+            Planted {
+                what: "sp2 conv infinite beta projection",
+                want: Fault::at(u32::try_from(layer)?, FaultSite::LinearConv),
+                before,
+                word,
+                after,
+                hit: vec![vec![], vec![at], vec![], vec![]],
+                clean: outs(&clean),
+                bad: outs(&bad),
+            }
+            .judge(),
+        );
+
+        // Out gate: a NaN gate (token 3, head 7, value 40), then an infinite
+        // gate at another value, whose sigmoid is 1 and would pass `attn`.
+        let mut r = Lcg(0x0073_6766);
+        let n = m * GATE_N_HEAD * HEAD;
+        let attn = r.fill(n, -2.0, 2.0);
+        let gate = r.fill(n, -6.0, 6.0);
+        let clean = cx.out_gate(unl, (&attn, &gate), GATE_N_HEAD, m)?;
+        for (layer, what, at, bad_value) in [
+            (
+                35usize,
+                "out_gate NaN gate",
+                (3 * GATE_N_HEAD + 7) * HEAD + 40,
+                f32::NAN,
+            ),
+            (
+                36usize,
+                "out_gate infinite gate",
+                (5 * GATE_N_HEAD + 2) * HEAD + 99,
+                f32::INFINITY,
+            ),
+        ] {
+            let sink = cx.gpu.layer_sink(layer)?;
+            let before = cx.gpu.fault()?;
+            let mut bg = gate.clone();
+            bg[at] = bad_value;
+            let bad = cx.out_gate(sink, (&attn, &bg), GATE_N_HEAD, m)?;
+            let word = cx.gpu.take_fault()?;
+            let _ = cx.out_gate(sink, (&attn, &gate), GATE_N_HEAD, m)?;
+            let after = cx.gpu.fault()?;
+            out.push(
+                Planted {
+                    what,
+                    want: Fault::at(u32::try_from(layer)?, FaultSite::F32Product),
+                    before,
+                    word,
+                    after,
+                    hit: vec![vec![at]],
+                    clean: vec![clean.clone()],
+                    bad: vec![bad],
+                }
+                .judge(),
+            );
+        }
         Ok(out)
     }
 

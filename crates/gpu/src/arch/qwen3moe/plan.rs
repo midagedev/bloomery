@@ -26,7 +26,7 @@ pub(super) use model::arch::coverage::{DownEntry, GateUpEntry};
 use model::arch::coverage::{SiteEntry, qwen35_down, qwen35_gate_up, qwen35_shared, turns_as_neox};
 use model::arch::models::shape::{AttnShape, GroupRule, MoeShape, select_gqa};
 use model::arch::models::{
-    Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe,
+    Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, OutGate,
 };
 
 pub(super) use crate::site::{Form, SiteTy};
@@ -423,7 +423,7 @@ fn gqa_fits(g: &Gqa) -> Result<Flash, String> {
         && g.rope.yarn.is_none()
         && rope_ok
         && g.qk_norm
-        && g.out_gate
+        && g.out_gate == OutGate::Packed
         && g.select.is_none();
     if !fits {
         return Err(format!(
@@ -564,8 +564,8 @@ mod tests {
     use super::{Flash, Kind35, kinds35, q35};
     use crate::linear::{KHeadMap as LinearMap, LinearShape};
     use model::arch::models::{
-        Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, Residual,
-        Rope, RopeMode, Router, Score, Shared,
+        Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, OutGate,
+        Residual, Rope, RopeMode, Router, Score, Shared,
     };
 
     /// Qwen3.6's 16/2 heads.
@@ -588,7 +588,7 @@ mod tests {
                 yarn: None,
             },
             qk_norm: true,
-            out_gate: true,
+            out_gate: OutGate::Packed,
             select: None,
             window: None,
             sinks: false,
