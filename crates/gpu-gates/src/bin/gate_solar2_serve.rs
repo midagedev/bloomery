@@ -32,10 +32,11 @@
 //!   assistant message, and the reference vocabulary counts it an end-of-generation id), so the
 //!   server stops there and leaves it out of the text. FAIL-first: a vocabulary that lists only the
 //!   file's `eos_token_id` (`<|endoftext|>`) lets the model run past its turn end, the token's text
-//!   is in the content and the clause is red. The clause reads the file's text behaviour
-//!   (`Tag::FileBound`): the fixture's weights never reach the turn end, so the fixture tier
-//!   leaves it to the real tier by name; the end id's place in the vocabulary is pinned on any machine
-//!   by `tokenizer`'s `a_familys_turn_end_token_ends_generation`.
+//!   is in the content and the clause is red. The clause reads the file's text behaviour.
+//!   PIN(2026-10-21): the fixture's weights never reach the turn end, so the clause is
+//!   `Tag::FileBound` and the fixture tier leaves it to the real tier by name; the end id's place
+//!   in the vocabulary is pinned on any machine by `tokenizer`'s
+//!   `a_familys_turn_end_token_ends_generation`.
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
