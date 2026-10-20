@@ -753,8 +753,8 @@ mod tests {
     }
 
     /// The type ids V4.1's first shard carries that the crate decodes.
-    // PIN(2026-09-24): the public file's first shard: f32, q3_K, q5_K, q6_K, bf16.
-    const V41_PUBLIC_DECODABLE: usize = 5;
+    // PIN(2026-10-21): the default file's first shard holds q3_K, q4_K and q5_K tensors only (its header), and the crate decodes all three.
+    const V41_PUBLIC_DECODABLE: usize = 3;
 
     /// The `dequant` column is the dispatch's own answer: every id in ggml's
     /// range reads `yes` exactly when `dequant_row` decodes one block of it.

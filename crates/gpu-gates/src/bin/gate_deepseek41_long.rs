@@ -21,7 +21,9 @@
 //!   every expert the router selects at layer 34 scores `sqrt_softplus` 0
 //!   (their logits sit below −16.6, where `1 + e^x` rounds to 1), and ik's
 //!   CPU build divides the same zeros by their zero sum. The free arm's path
-//!   moves with the placement and the rounding; this one is fed.
+//!   moves with the placement and the rounding; this one is fed. The default
+//!   file's values are not known to take these ids to that edge: there the arm
+//!   holds streams finite and eager = graph only.
 //!
 //! - `--faults` (run first, the process's first steps after the load, so no
 //!   earlier arm has touched the host tier's pages): prompt row 0 from a

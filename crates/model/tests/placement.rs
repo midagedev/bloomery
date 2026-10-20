@@ -155,11 +155,11 @@ const PUBLIC: FilePins = FilePins {
     q8_0_card: (0, 0),
     // PIN(2026-09-24): ffn_down_shexp of layers 0 and 1, q5_K, on the card for the dense gemv.
     q5_k_card: (2, 16_220_160),
-    // PIN(2026-09-24): engram_{k,q} in q3_K, decoded to f32 on the cards: the mixed file's bf16 bytes, the same shapes.
+    // PIN(2026-10-21): engram_{k,q} are bf16 in the file, decoded to f32 on the cards: 4 × 20,480 values × 4 B, the same bytes as from q3_K.
     engram_gain: 327_680,
-    // PIN(2026-09-24): the public file's bytes one token reads: all, and dense.
-    read_total: 7_774_310_520,
-    read_dense: 3_731_061_720,
+    // PIN(2026-10-21): the default file's bytes one token reads: all, and dense. Each engram_{k,q} reads its file bytes, 40,960 (bf16) where the former file held 8,800 (q3_K): +4 × 32,160 = +128,640 on both.
+    read_total: 7_774_439_160,
+    read_dense: 3_731_190_360,
     // PIN(2026-09-24): the public file's gate placement keeps 1,146 experts; re-taken on top of the host ring shadow.
     gate_experts: 1_146,
 };
