@@ -692,6 +692,29 @@ mod tests {
         }
     }
 
+    /// MiniMax-M3's end-of-generation token is `[e~[`, the reference's last EOG name: a
+    /// vocabulary holding it ends generation on it.
+    ///
+    /// FAIL-first: a vocabulary that lists no end-of-generation name runs past the token.
+    #[test]
+    fn the_minimax_end_token_ends_generation() {
+        let header = vec![
+            ("tokenizer.ggml.model".into(), Value::String("gpt2".into())),
+            ("tokenizer.ggml.pre".into(), Value::String("qwen35".into())),
+            (
+                "tokenizer.ggml.tokens".into(),
+                Value::Array(vec![
+                    Value::String("a".into()),
+                    Value::String("[e~[".into()),
+                ]),
+            ),
+            ("tokenizer.ggml.merges".into(), Value::Array(vec![])),
+        ];
+        let tok = from_header(&header).unwrap();
+        assert_eq!(tok.eog(), &[1]);
+        assert!(tok.attr(1).is_some_and(|a| a & attr::CONTROL != 0));
+    }
+
     /// The explicit stop list selects Hugging Face's encoding, and only for a qwen35 BPE: its
     /// regex folds `ſ` to `s` in a contraction ("'ſx" is `'ſ` and `x`, ids 257 and 120 under
     /// the merges below, where qwen35 merges the one word to 258), and its BPE skips a byte its

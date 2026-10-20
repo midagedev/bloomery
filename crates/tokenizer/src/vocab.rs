@@ -110,6 +110,7 @@ const EOG_NAMES: &[&str] = &[
     "<turn|>",
     "<|tool_response>",
     "<｜end▁of▁sentence｜>",
+    "[e~[",
 ];
 const ALWAYS_RENDERED: &[&str] = &["<|channel|>", "<|message|>", "<|start|>", "<|constrain|>"];
 
