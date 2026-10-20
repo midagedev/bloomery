@@ -653,7 +653,7 @@ impl Worker {
             Err(e) => Err(GenError::Engine(e)),
         };
         let r = match kept {
-            Ok(kept) => match self.interleaves(n, kept.cache_n) {
+            Ok(kept) => match self.interleaves(n + job.lead_len(), kept.cache_n) {
                 Some(q) => job
                     .plan(
                         &self.slot,
@@ -706,10 +706,10 @@ impl Worker {
         }
     }
 
-    /// The quantum a prompt of `n` ids whose cache kept `cache_n` runs in,
-    /// one call a round: the engine names one, another slot is busy
-    /// generating, and more than one quantum of the prompt call
-    /// (`cache_n..n-1`) is left.
+    /// The quantum a prompt call of `n` ids (the prompt and the answer's lead
+    /// the call carries) whose cache kept `cache_n` runs in, one call a round:
+    /// the engine names one, another slot is busy generating, and more than
+    /// one quantum of the call (`cache_n..n-1`) is left.
     fn interleaves(&self, n: usize, cache_n: usize) -> Option<NonZeroUsize> {
         self.quantum
             .filter(|q| !self.active.is_empty() && n - 1 - cache_n > q.get())

@@ -183,7 +183,7 @@ use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::beside::Beside;
 use bloomery_gpu_gates::bind::{
-    ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, TemplateFile, Vocab, arm_screen,
+    self, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, TemplateFile, Vocab, arm_screen,
     bind_server, note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::Place;
@@ -419,6 +419,12 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
     /// `ids` from where the model stands by the body's schedule; the argmax
     /// after the last.
     fn prompt(m: &mut GpuModel<Self>, ids: &[u32]) -> Result<u32, GateError>;
+    /// Whether the body's prompt calls take checkpoints at their marks, set
+    /// to `on`; what it was. The default holds none to take: a body whose
+    /// caches are per-position keeps every position as it stands.
+    fn set_marks(_m: &mut GpuModel<Self>, _on: bool) -> Result<bool, GateError> {
+        Ok(false)
+    }
     /// Where to cut a prompt call of `first .. end` at `marks` so every run
     /// the cut makes still holds what the body's prompt schedule treats as
     /// one whole call; empty where the body cuts nowhere.
@@ -633,6 +639,14 @@ impl Body3 for Body35 {
     /// ubatch walk from [`GEMM_FROM`] rows on, passes below.
     fn prompt(m: &mut Qwen35moeModel, ids: &[u32]) -> Result<u32, GateError> {
         Ok(<Body35 as app::Prompt>::prompt(m, ids)?)
+    }
+
+    /// [`Body35::set_checkpoints`]: the recurrent stores' checkpoints.
+    fn set_marks(m: &mut Qwen35moeModel, on: bool) -> Result<bool, GateError> {
+        let (_, _, body) = m.body_parts(NAME)?;
+        let was = body.takes_checkpoints();
+        body.set_checkpoints(on);
+        Ok(was)
     }
 
     /// The marks inside the call where both runs hold at least
@@ -882,6 +896,33 @@ impl<B: Body3> Seat for Q3<B> {
         let next = self.s.model_mut().step(&[last])?;
         self.draft.stepped(&mut self.s, last, next)?;
         Ok(next)
+    }
+
+    /// An answer's run and the step of its last id. Answer positions are
+    /// decode positions, and decode positions take no checkpoints: the steps
+    /// the run replaces take none, so its prompt call is fed with the body's
+    /// marks off ([`Body3::set_marks`]) and the prompt calls keep theirs. A
+    /// run below [`GEMM_FROM`] ids is one prompt call whose head's row is
+    /// read: the call runs passes, bit for bit one step a row, so the row is
+    /// the one the step after a prefill gives, and the step is a call the row
+    /// does not need. A longer run, one id, or a run the DSpark draft takes
+    /// (its prompt call feeds the draft's rows besides the target's) is a
+    /// prefill and a step ([`bind::prefill_then_step`]): the wide walk's row
+    /// is not the step's.
+    fn prefill_row(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
+        let was = <B as Body3>::set_marks(self.s.model_mut(), false)?;
+        let r = if ids.len() < 2 || ids.len() >= GEMM_FROM || self.draft.rows() > 1 {
+            bind::prefill_then_step(self, ids, row)
+        } else {
+            <B as Body3>::prompt(self.s.model_mut(), ids).and_then(|next| {
+                if let Some(row) = row {
+                    self.logits_into(row)?;
+                }
+                Ok(next)
+            })
+        };
+        <B as Body3>::set_marks(self.s.model_mut(), was)?;
+        r
     }
 
     /// The draft's pass ([`ServedDraft::pass`]), else one plain step.

@@ -1115,6 +1115,12 @@ enum Cmd {
         last: u32,
         logits: Option<Vec<f32>>,
     },
+    /// `ids` and the step of the last ([`Seat::prefill_row`]), the logits
+    /// buffer lent as a `Next`'s.
+    NextAfter {
+        ids: Vec<u32>,
+        logits: Option<Vec<f32>>,
+    },
     /// A pass from `last`, its kept tokens into the caller's buffer.
     Pass {
         last: u32,
@@ -1299,6 +1305,15 @@ pub trait Seat: 'static {
         self.logits_into(row)
             .map_err(|e| format!("logits of the step: {e}"))?;
         Ok(arg)
+    }
+    /// `ids` (at least one) from `pos` and the step of the last
+    /// (`serve::Engine::next_after`): the argmax after the last and, into
+    /// `row`, that position's logits. The default is [`Seat::prefill`] of all
+    /// but the last id and [`Seat::step`] (or [`Seat::step_row`]) of the
+    /// last; a seat whose prefill already ran the head on its last row
+    /// overrides it to read that row.
+    fn prefill_row(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
+        prefill_then_step(self, ids, row)
     }
     /// One pass from `last` (`serve::Engine::advance`): the kept tokens into
     /// `out`, and what the draft proposed and kept. Without a draft, one step.
@@ -1936,6 +1951,33 @@ impl Link {
         Ok(arg)
     }
 
+    /// `ids` and the step of the last ([`Cmd::NextAfter`]); with
+    /// `logits_out`, the engine's buffer is lent as a step's is.
+    fn next_after(
+        &mut self,
+        ids: &[u32],
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
+        let lent = logits_out
+            .is_some()
+            .then(|| std::mem::take(&mut self.logits));
+        let arg = self.call(Cmd::NextAfter {
+            ids: ids.to_vec(),
+            logits: lent,
+        })?;
+        if let Some(out) = logits_out {
+            if out.len() != self.logits.len() {
+                return Err(EngineError(format!(
+                    "the caller's logits buffer holds {}, the engine's {}",
+                    out.len(),
+                    self.logits.len()
+                )));
+            }
+            out.copy_from_slice(&self.logits);
+        }
+        Ok(arg)
+    }
+
     /// A pass into the caller's `out`, which crosses to the engine thread and
     /// back; it holds the kept tokens on success.
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
@@ -2258,6 +2300,10 @@ fn serve_cmd<S: Seat>(
             let arg = next_row(g, last, logits.as_deref_mut(), n_vocab);
             return (arg, logits);
         }
+        Cmd::NextAfter { ids, mut logits } => {
+            let arg = prefill_row(g, &ids, logits.as_deref_mut(), n_vocab);
+            return (arg, logits);
+        }
         Cmd::Reset => g
             .reset()
             .map(|()| 0)
@@ -2315,6 +2361,59 @@ fn next_row<S: Seat>(
         ));
     }
     next_lent_row(g, last, row)
+}
+
+/// [`Seat::prefill_row`]'s default: [`Seat::prefill`] of all but the last of
+/// `ids` (none for one id) and [`Seat::step`], or [`Seat::step_row`] into
+/// `row`, of the last.
+pub fn prefill_then_step<S: Seat + ?Sized>(
+    g: &mut S,
+    ids: &[u32],
+    row: Option<&mut [f32]>,
+) -> Result<u32, GateError> {
+    let Some((&last, run)) = ids.split_last() else {
+        return Err("a prefill and its step of no ids".into());
+    };
+    if !run.is_empty() {
+        g.prefill(run)?;
+    }
+    match row {
+        Some(row) => g.step_row(last, row),
+        None => g.step(last),
+    }
+}
+
+/// `ids` and the step of the last ([`Seat::prefill_row`]), checked as a
+/// prefill's feed and a step's row are: a row of the wrong length or a feed
+/// past the context is refused before the call runs, and a row holding a NaN
+/// is the call's error.
+fn prefill_row<S: Seat>(
+    g: &mut S,
+    ids: &[u32],
+    row: Option<&mut [f32]>,
+    n_vocab: usize,
+) -> Result<u32, String> {
+    let at = g.pos();
+    let refuse = |e: String| format!("{} ids and a step from position {at}: {e}", ids.len());
+    if let Some(row) = row.as_ref()
+        && row.len() != n_vocab
+    {
+        return Err(refuse(format!(
+            "a logits buffer of {}, the vocabulary has {n_vocab}",
+            row.len()
+        )));
+    }
+    check_feed(g, ids.len()).map_err(refuse)?;
+    let Some(row) = row else {
+        return g.prefill_row(ids, None).map_err(|e| refuse(e.to_string()));
+    };
+    let arg = g
+        .prefill_row(ids, Some(&mut *row))
+        .map_err(|e| refuse(e.to_string()))?;
+    if let Some(i) = row.iter().position(|v| v.is_nan()) {
+        return Err(refuse(format!("logit {i} is NaN")));
+    }
+    Ok(arg)
 }
 
 /// [`next_row`] over a row the link already checked against the vocabulary
@@ -2915,6 +3014,18 @@ impl Engine for SeatEngine {
 
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         self.link.next(last, logits_out)
+    }
+
+    /// One command on the engine thread ([`Seat::prefill_row`]).
+    fn next_after(
+        &mut self,
+        ids: &[u32],
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
+        if ids.is_empty() {
+            return Err(EngineError("next_after of no ids".to_owned()));
+        }
+        self.link.next_after(ids, logits_out)
     }
 
     fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {

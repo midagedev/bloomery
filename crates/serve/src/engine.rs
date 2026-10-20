@@ -232,6 +232,28 @@ pub trait Engine: Send {
     /// With `Some(out)` (length `n_vocab`) it also writes those logits; a
     /// greedy request passes `None` and the engine may skip reading them.
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError>;
+    /// Evaluates `ids` (at least one) from the current position and returns
+    /// the argmax of the position after the last, writing its logits to
+    /// `logits_out` as [`Engine::next`] does: a run of an answer's ids and
+    /// the step that closes it as one call. The engine then stands past
+    /// every id. Answer positions are decode positions: the call takes no
+    /// prompt checkpoints, as the steps it replaces take none. The default is
+    /// [`Engine::prefill`] of all but the last id and [`Engine::next`] of the
+    /// last; an engine whose prefill already runs the head on its last row,
+    /// or whose prefill takes checkpoints, overrides it.
+    fn next_after(
+        &mut self,
+        ids: &[u32],
+        logits_out: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
+        let Some((&last, run)) = ids.split_last() else {
+            return Err(EngineError("next_after of no ids".to_owned()));
+        };
+        if !run.is_empty() {
+            self.prefill(run)?;
+        }
+        self.next(last, logits_out)
+    }
     /// One greedy pass from `last`: `last` and whatever the engine's draft
     /// proposes after it, evaluated together, and the tokens the pass keeps
     /// appended to `out` in position order — each the target's own argmax,

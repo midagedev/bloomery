@@ -1160,6 +1160,8 @@ const PROMPT: &str = "hi";
 enum Call {
     Prefill(usize),
     Next,
+    /// [`Engine::next_after`] of this many ids: one call.
+    NextAfter(usize),
 }
 
 /// What an engine was fed.
@@ -1221,17 +1223,12 @@ impl Engine for Scripted {
         Ok(())
     }
     fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
-        let row = {
-            let mut s = self.seen.lock().expect("seen");
-            s.fed.push(last);
-            s.calls.push(Call::Next);
-            self.row(&s.fed)
-        };
-        let best = sampling::argmax(&row);
-        if let Some(out) = out {
-            out.copy_from_slice(&row);
-        }
-        Ok(best)
+        self.fed_row(&[last], Call::Next, out)
+    }
+    /// One call whose row is the one `prefill` and `next` of the same ids
+    /// leave: the row is a function of the ids fed.
+    fn next_after(&mut self, ids: &[u32], out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.fed_row(ids, Call::NextAfter(ids.len()), out)
     }
     fn reset(&mut self) -> Result<(), EngineError> {
         self.seen.lock().expect("seen").fed.clear();
@@ -1245,12 +1242,46 @@ impl Engine for Scripted {
     }
 }
 
+impl Scripted {
+    /// `ids` fed as the one call `call`, and the row after them.
+    fn fed_row(
+        &mut self,
+        ids: &[u32],
+        call: Call,
+        out: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
+        let row = {
+            let mut s = self.seen.lock().expect("seen");
+            s.fed.extend_from_slice(ids);
+            s.calls.push(call);
+            self.row(&s.fed)
+        };
+        let best = sampling::argmax(&row);
+        if let Some(out) = out {
+            out.copy_from_slice(&row);
+        }
+        Ok(best)
+    }
+}
+
 /// One generation from [`PROMPT`] on a [`Scripted`] engine, the jump arm on or
-/// off, with the engine's calls after the prompt's step and the ids it was fed.
+/// off, with the engine's calls after the prompt's step, the prompt's own
+/// calls and the ids it was fed.
 struct Ran {
     out: Outcome,
     calls: Vec<Call>,
+    prompt: Vec<Call>,
     fed: Vec<u32>,
+}
+
+/// Where the prompt's calls end in `calls`: at its step, a `next` (the step
+/// arm's) or a `next_after` (the jump arm's, which carries the call).
+fn prompt_end(calls: &[Call]) -> usize {
+    calls
+        .iter()
+        .position(|c| matches!(c, Call::Next | Call::NextAfter(_)))
+        .expect("the prompt's step")
+        + 1
 }
 
 /// What the `Scripted` engine of `seed` is asked, the jump arm `jump`, and
@@ -1298,26 +1329,43 @@ fn scripted_in(
     )
     .expect("a generation");
     let s = seen.lock().expect("seen");
-    let first = s
-        .calls
-        .iter()
-        .position(|c| *c == Call::Next)
-        .expect("the prompt's step");
+    let end = prompt_end(&s.calls);
     Ran {
         out,
-        calls: s.calls[first + 1..].to_vec(),
+        calls: s.calls[end..].to_vec(),
+        prompt: s.calls[..end].to_vec(),
         fed: s.fed.clone(),
     }
 }
 
-/// The ids a generation fed are the prompt's and every id it generated but
-/// the stop: the prompt cache holds the answer.
+/// The ids a generation fed are the prompt's and every id it generated up to
+/// the last one an engine call took, which no call fed: the stop, or the
+/// last id under the bounds, or, past the program's last pick, the pick
+/// itself (the jump arm's tail, [`crate::genloop::Jump`]'s `tail`, takes the
+/// ids after it with no call). The prompt cache holds the answer up to there.
 fn assert_fed_the_answer(tok: &Arc<dyn Tokenizer>, r: &Ran) {
     let mut want = tok.encode(PROMPT);
-    let (stop, body) = r.out.tokens.split_last().expect("a stop");
-    assert!(tok.stops().contains(stop), "ends on {stop}");
+    let tail = r.out.timings.jump.map_or(0, |j| j.tail);
+    let body = &r.out.tokens[..r.out.tokens.len() - tail - 1];
     want.extend_from_slice(body);
-    assert_eq!(r.fed, want);
+    assert_eq!(r.fed, want, "tail {tail}");
+}
+
+/// The jump arm's ids against the step arm's: the same but for a stop the
+/// step arm picks from a row, which the jump arm's tail names (the
+/// vocabulary's end of sequence).
+fn assert_step_arms_ids(tok: &Arc<dyn Tokenizer>, jump: &Ran, step: &Ran, what: &str) {
+    assert_eq!(jump.out.stop, step.out.stop, "{what}");
+    assert_eq!(jump.out.content, step.out.content, "{what}");
+    let (j, s) = (&jump.out.tokens, &step.out.tokens);
+    assert_eq!(j.len(), s.len(), "{what}");
+    if jump.out.stop == StopKind::Eos {
+        assert_eq!(j[..j.len() - 1], s[..s.len() - 1], "{what}");
+        assert!(tok.stops().contains(&s[s.len() - 1]), "{what}");
+        assert_eq!(j[j.len() - 1], tok.eos(), "{what}: the tail names the stop");
+    } else {
+        assert_eq!(j, s, "{what}");
+    }
 }
 
 /// A program of text parts compiled on `tok`.
@@ -1365,9 +1413,7 @@ fn the_jump_arm_takes_the_step_arms_ids() {
         for seed in 0..8 {
             let step = scripted(&tok, &c, seed, Vec::new(), false, 400);
             let jump = scripted(&tok, &c, seed, Vec::new(), true, 400);
-            assert_eq!(jump.out.tokens, step.out.tokens, "{format:?} seed {seed}");
-            assert_eq!(jump.out.content, step.out.content, "{format:?} seed {seed}");
-            assert_eq!(jump.out.stop, step.out.stop, "{format:?} seed {seed}");
+            assert_step_arms_ids(&tok, &jump, &step, &format!("{format:?} seed {seed}"));
             assert_fed_the_answer(&tok, &step);
             assert_fed_the_answer(&tok, &jump);
             let (js, ss) = (
@@ -1376,7 +1422,7 @@ fn the_jump_arm_takes_the_step_arms_ids() {
             );
             assert_eq!((js.decisions, js.free_steps), (ss.decisions, ss.free_steps));
             assert!(
-                js.next_calls + js.prefill_calls < ss.next_calls,
+                js.next_calls + js.prefill_calls + js.next_after_calls < ss.next_calls,
                 "{format:?} seed {seed}"
             );
             spanned += js.spans;
@@ -1422,36 +1468,33 @@ fn a_lead_that_reverses_later_still_picks_greedy() {
         assert_fed_the_answer(&tok, &r);
         let j = r.out.timings.jump.expect("a constrained request");
         assert_eq!(j.decisions, 2);
-        assert_eq!(j.spans, usize::from(jump));
+        // The text after the second pick is the jump arm's tail: its four
+        // ids and the stop taken with no call, no span fed.
+        assert_eq!((j.spans, j.tail), (0, 5 * usize::from(jump)));
     }
 }
 
 /// A forced call with eight functions of two enum arguments each, whose
 /// options differ at their first byte (the shape of an agent's tool call),
-/// on a vocabulary of one id a byte. The jump arm is four spans, each a
-/// prefill of its run but the last id and a step of that id, whose row is the
-/// next decision's:
+/// on a vocabulary of one id a byte. With D the indices of the three
+/// decisions in the call's text of E ids, the jump arm makes four calls a
+/// request where the step arm makes E + 2 (a prefill of the prompt but its
+/// last id, its step, and a step for every id of the call):
 ///
-/// - span 0: the call's opening text, `<tool_call>\n<function=`, taken from
-///   the walk's first id; its step reads the function's decision;
-/// - span 1: the function's name but its first byte, and the markup up to the
-///   first argument's value; its step reads that value's decision;
-/// - span 2: the value but its first byte, and the markup up to the second
-///   value; its step reads that decision;
-/// - span 3: the second value but its first byte, and the closing text; its
-///   step reads the stop.
+/// - the prompt's call carries the call's opening text,
+///   `<tool_call>\n<function=` (D0 ids, the answer's lead): a prefill of the
+///   prompt's 2 ids and D0 but the last, whose step's row reads the
+///   function's decision;
+/// - span 1: the function's first byte, just picked, then its name and the
+///   markup up to the first argument's value, D1 - D0 ids, the last of them
+///   stepped in the call: one `next_after` whose row reads that value;
+/// - span 2: the value and the markup up to the second value, D2 - D1 ids,
+///   one `next_after` whose row reads it;
+/// - the tail: the E - D2 - 1 ids after the last decision and the stop,
+///   E - D2 ids, taken with no call (the stop named, the end of sequence).
 ///
-/// With D the indices of the three decisions in the call's text of E ids, the
-/// spans feed D0 - 1, D1 - D0 - 1, D2 - D1 - 1 and E - D2 - 1 ids: E - 4, one
-/// step each, against E steps: 4 prefills and 4 steps, a prefill and a step
-/// for each of the 3 decisions plus the closing text. Counting the opening
-/// text inside the prompt's call and the closing text as a free tail gives
-/// 3 steps and 2 prefills (one step a decision, one prefill a run between two
-/// decisions); neither holds. The prompt's call ends at the template's
-/// generation prompt, so the opening text is the program's first generated
-/// ids and costs span 0; the stop is picked from a row, so the closing text
-/// is fed and its step is the row the stop is read from (the cache holds the
-/// answer without the stop).
+/// The cache then holds the answer up to the last decision, which no call
+/// fed.
 #[test]
 fn a_forced_call_is_fed_in_the_planned_calls() {
     let tok = bytes_tok();
@@ -1496,12 +1539,13 @@ fn a_forced_call_is_fed_in_the_planned_calls() {
         assert_eq!(r.out.content, text);
         assert_fed_the_answer(&tok, r);
     }
+    assert_eq!(step.prompt, [Call::Prefill(1), Call::Next]);
     assert_eq!(step.calls, vec![Call::Next; e]);
-    let mut planned = Vec::new();
-    for len in [d[0] - 1, d[1] - d[0] - 1, d[2] - d[1] - 1, e - d[2] - 1] {
-        planned.extend([Call::Prefill(len), Call::Next]);
-    }
-    assert_eq!(jump.calls, planned);
+    assert_eq!(jump.prompt, [Call::Prefill(1 + d[0]), Call::Next]);
+    assert_eq!(
+        jump.calls,
+        [Call::NextAfter(d[1] - d[0]), Call::NextAfter(d[2] - d[1])]
+    );
     let (s, j) = (
         step.out.timings.jump.unwrap(),
         jump.out.timings.jump.unwrap(),
@@ -1511,16 +1555,23 @@ fn a_forced_call_is_fed_in_the_planned_calls() {
         (false, 0, 0, 0, e)
     );
     assert_eq!(
-        (j.arm, j.spans, j.span_ids, j.prefill_calls, j.next_calls),
-        (true, 4, e - 4, 4, 4)
+        (s.next_after_calls, s.lead, s.tail),
+        (0, 0, 0),
+        "the step arm"
     );
+    assert_eq!(
+        (j.arm, j.spans, j.span_ids, j.prefill_calls, j.next_calls),
+        (true, 2, d[2] - d[0], 0, 0)
+    );
+    assert_eq!((j.next_after_calls, j.lead, j.tail), (2, d[0], e - d[2]));
     assert_eq!(
         (s.decisions, s.free_steps, j.decisions, j.free_steps),
         (3, 0, 3, 0)
     );
     let t = jump.out.timings.to_json();
     assert_eq!(t["constrained"]["arm"], "jump");
-    assert_eq!(t["constrained"]["prefill_calls"], 4);
+    assert_eq!(t["constrained"]["next_after_calls"], 2);
+    assert_eq!(t["constrained"]["lead"], d[0]);
 }
 
 /// With the arm off a constrained request makes the step arm's calls and
@@ -1537,9 +1588,12 @@ fn the_jump_arm_off_makes_the_step_arms_calls() {
         (j.arm, j.spans, j.span_ids, j.prefill_calls, j.next_calls),
         (false, 0, 0, 0, fed)
     );
+    assert_eq!((j.next_after_calls, j.lead, j.tail), (0, 0, 0));
+    assert_eq!(r.prompt, [Call::Prefill(1), Call::Next]);
     let on = scripted(&tok, &c, 5, Vec::new(), true, 400);
     assert_eq!(on.out.tokens, r.out.tokens);
-    assert!(on.calls.iter().any(|c| matches!(c, Call::Prefill(_))));
+    assert!(matches!(on.prompt[..], [Call::Prefill(n), Call::Next] if n > 1));
+    assert!(on.calls.iter().any(|c| matches!(c, Call::NextAfter(_))));
     // Free text carries no counts.
     let plain = run(&tok, None, ThinkEntry::Closed, &ids(&tok, "ab"));
     assert!(plain.timings.jump.is_none());
@@ -1602,8 +1656,10 @@ fn a_run_is_cut_at_the_budget_and_the_context() {
         let jump = scripted(&tok, &c, 4, Vec::new(), true, n_predict);
         assert_eq!(jump.out.tokens, step.out.tokens, "n_predict {n_predict}");
         assert_eq!(jump.out.stop, StopKind::Limit);
-        assert_eq!(jump.fed, step.fed, "n_predict {n_predict}");
-        cut += jump.out.timings.jump.unwrap().spans;
+        assert_fed_the_answer(&tok, &step);
+        assert_fed_the_answer(&tok, &jump);
+        let j = jump.out.timings.jump.unwrap();
+        cut += j.spans + j.lead;
     }
     assert!(cut > 0);
     for ctx_max in [3, 4, 5, 9, 20, 41] {
@@ -1611,7 +1667,8 @@ fn a_run_is_cut_at_the_budget_and_the_context() {
         let jump = scripted_in(&tok, &c, 4, Vec::new(), true, 400, ctx_max);
         assert_eq!(jump.out.tokens, step.out.tokens, "ctx {ctx_max}");
         assert_eq!(jump.out.truncated, step.out.truncated, "ctx {ctx_max}");
-        assert_eq!(jump.fed, step.fed, "ctx {ctx_max}");
+        assert_fed_the_answer(&tok, &step);
+        assert_fed_the_answer(&tok, &jump);
         assert!(jump.fed.len() <= ctx_max);
     }
 }
@@ -1659,11 +1716,7 @@ fn a_run_fed_in_quanta_asks_the_sink_between_calls() {
             "the positions the request reports are the cache's: gone_at {gone_at}"
         );
         let calls = seen.lock().expect("seen").calls.clone();
-        let prompt_step = calls
-            .iter()
-            .position(|c| *c == Call::Next)
-            .expect("the prompt");
-        (r, asked, calls[prompt_step + 1..].to_vec())
+        (r, asked, calls[prompt_end(&calls)..].to_vec())
     };
     let (whole, asked, calls) = run(usize::MAX);
     whole.expect("a client that stays gets the answer");
@@ -1683,4 +1736,129 @@ fn a_run_fed_in_quanta_asks_the_sink_between_calls() {
         vec![Call::Prefill(2); 2],
         "no call after the failed one"
     );
+}
+
+/// The suite's median request (`ko-06`: an intent of four options and a
+/// boolean, Q = 2) as the program compiles it on Qwen's vocabulary,
+/// `F[4] P{4} F[6] P{2} F[1]` — `{"` `intent` `":` ` "`, the option, `",`
+/// ` "` `ang` `ry` `":` ` `, the boolean, `}` — on a vocabulary of those
+/// pieces, its rows raising `refund` and `true`. The two arms of one seed;
+/// the answer is 13 ids and the stop.
+///
+/// The engine calls a request, the prompt's included (prompt = 2 ids):
+///
+/// | arm | calls | count |
+/// |---|---|---|
+/// | step | `prefill(1)`, 14 `next` | 14 next + 1 prefill |
+/// | jump at b0705d908 | `prefill(1)`, `next`, `prefill(3)`, `next`, `prefill(6)`, `next`, `next`, `next` | 5 next + 3 prefill (2 spans) |
+/// | + L1 lead | `prefill(5)`, `next`, `prefill(6)`, `next`, `next`, `next` | 4 next + 2 prefill |
+/// | + L2 no tail | `prefill(5)`, `next`, `prefill(6)`, `next` | 2 next + 2 prefill |
+/// | + L3 `next_after` | `prefill(5)`, `next`, `next_after(7)` | 1 next + 1 prefill (the prompt's) + 1 next_after |
+fn ko06(jump: bool) -> Ran {
+    const PIECES_KO06: &[&str] = &[
+        "{\"", "intent", "\":", " \"", "cancel", "other", "refund", "tracking", "\",", "ang", "ry",
+        "true", "false", "}",
+    ];
+    let pieces = Arc::new(PieceTok(PIECES_KO06));
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::clone(&pieces)));
+    let alt = |text: &str| program::Alt {
+        text: text.to_owned(),
+        then: Vec::new(),
+    };
+    let con = compiled(
+        &tok,
+        &[
+            Part::Text("{\"intent\": \"".to_owned()),
+            Part::Pick(["cancel", "other", "refund", "tracking"].map(alt).to_vec()),
+            Part::Text("\", \"angry\": ".to_owned()),
+            Part::Pick(["true", "false"].map(alt).to_vec()),
+            Part::Text("}".to_owned()),
+        ],
+    );
+    let lead = ids(&tok, "{\"intent\": \"");
+    let mid = ids(&tok, "{\"intent\": \"refund\", \"angry\": ");
+    assert_eq!((lead.len(), mid.len()), (4, 11), "the program's shape");
+    let peaks = vec![
+        (lead, vec![(pieces.piece("refund"), 9.0)]),
+        (mid, vec![(pieces.piece("true"), 9.0)]),
+    ];
+    let r = scripted(&tok, &con, 6, peaks, jump, 400);
+    assert_eq!(r.out.content, "{\"intent\": \"refund\", \"angry\": true}");
+    assert_eq!(r.out.tokens.len(), 14);
+    assert_fed_the_answer(&tok, &r);
+    r
+}
+
+/// L1: the jump arm's prompt call carries the answer's lead, the four ids
+/// before the first pick, and the step of the lead's last id is the row the
+/// first pick reads: no call runs between the prompt's and the first pick,
+/// and the prompt's calls feed the prompt's 2 ids and the lead.
+/// FAIL-first: a `take_lead` that returns no id (b0705d908's prompt call)
+/// feeds 2 ids and spends a step and a span on the lead.
+#[test]
+fn the_prompt_call_carries_the_lead() {
+    let (step, jump) = (ko06(false), ko06(true));
+    assert_step_arms_ids(&bytes_tok(), &jump, &step, "ko-06");
+    let j = jump.out.timings.jump.expect("a constrained request");
+    assert_eq!(j.lead, 4);
+    let fed: usize = jump
+        .prompt
+        .iter()
+        .map(|c| match *c {
+            Call::Prefill(n) | Call::NextAfter(n) => n,
+            Call::Next => 1,
+        })
+        .sum();
+    assert_eq!(fed, 2 + 4, "{:?}", jump.prompt);
+    // The first call after the prompt's feeds the first pick, `refund`.
+    assert_eq!(jump.fed[2 + 4], step.out.tokens[4]);
+    assert_eq!(step.out.timings.jump.expect("constrained").lead, 0);
+}
+
+/// L2: after the last pick nothing is fed or stepped: `}` and the stop are
+/// the tail, taken with no call, the stop named (the end of sequence); the
+/// cache holds the answer up to the last pick, 2 + 11 ids. FAIL-first: a
+/// `tail_id` that never starts the tail (b0705d908) steps the pick and `}`,
+/// two `next` more.
+#[test]
+fn nothing_is_fed_after_the_last_pick() {
+    let jump = ko06(true);
+    let j = jump.out.timings.jump.expect("a constrained request");
+    assert_eq!(j.tail, 2);
+    assert_eq!(jump.fed.len(), 2 + 11);
+    assert_eq!(jump.out.tokens.last(), Some(&jump_eos()));
+    assert_eq!(jump.out.stop, StopKind::Eos);
+    assert_eq!(j.next_calls, 0, "{:?}", jump.calls);
+}
+
+/// The end of sequence of every vocabulary these tests build.
+fn jump_eos() -> u32 {
+    bytes_tok().eos()
+}
+
+/// L3: a span and the step that closes it are one `next_after`: the request
+/// is the prompt's call, `prefill(5)` and `next` (the prompt and the lead,
+/// whose step's row reads `refund`; a prompt call takes its checkpoints, so
+/// it stays a prefill), and `next_after(7)` (`refund` and the six ids up to
+/// the boolean, whose row reads `true`). The step arm is 15 calls.
+/// FAIL-first: a span that never closes (b0705d908) makes `prefill(6)` and
+/// `next` after the prompt's call.
+#[test]
+fn a_span_and_its_step_are_one_call() {
+    let (step, jump) = (ko06(false), ko06(true));
+    assert_eq!(step.prompt.len() + step.calls.len(), 15);
+    assert_eq!(jump.prompt, [Call::Prefill(5), Call::Next]);
+    assert_eq!(jump.calls, [Call::NextAfter(7)]);
+    let j = jump.out.timings.jump.expect("a constrained request");
+    assert_eq!(
+        (
+            j.spans,
+            j.span_ids,
+            j.next_calls,
+            j.prefill_calls,
+            j.next_after_calls
+        ),
+        (1, 7, 0, 0, 1)
+    );
+    assert_eq!(j.decisions, 2);
 }
