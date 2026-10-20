@@ -122,14 +122,8 @@ pub trait Tiered: Seat + Sized + 'static {
 
     /// After the plan's record: the room check, the host's pool and the load's word (the residency
     /// the seat opens with).
-    fn settle(_plan: &Plan<'_>, _pick: ResidencyPick) -> Result<Residency, GateError> {
-        Ok(Residency::Off)
-    }
-
-    /// The host bytes the load holds beside the plan with `residency` (a churn pool), which the
-    /// `need` record adds to the plan's.
-    fn beside_bytes(_plan: &Plan<'_>, _residency: Residency) -> Result<u64, GateError> {
-        Ok(0)
+    fn settle(_plan: &Plan<'_>, _pick: ResidencyPick) -> Result<(Residency, u64), GateError> {
+        Ok((Residency::Off, 0))
     }
 
     /// The seat on the engine thread: the session of the file at `a.path` on `a.place`, the step
@@ -226,11 +220,11 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     let plan = asked.plan;
     let pick = S::residency(&levers, &flags, place, &plan)?;
     record::plan(place.name(), &machine, &plan).eprint();
-    let residency = match pick {
+    let (residency, extra) = match pick {
         Some(pick) => S::settle(&plan, pick)?,
-        None => Residency::Off,
+        None => (Residency::Off, 0),
     };
-    need::print(&plan, S::beside_bytes(&plan, residency)?, 0, true)?;
+    need::print(&plan, extra, 0, true)?;
     parallel_line(slots, slot_ctx, from, Pass::of(slots, true));
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.

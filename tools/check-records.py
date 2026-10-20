@@ -85,6 +85,7 @@ EXCEPTIONS = {
 
 # The plan records and the record that goes beside each of them: a placed load's need, which the
 # owner `need::print` (or `need::staged`, for a plan listed apart from its print) renders.
+# PIN(2026-10-21): replaces record.rs's a_binary_that_prints_a_plan_prints_its_need; these rules cover every root and plan printer.
 PLAN_KINDS = {"PLAN", "PLAN38"}
 NEED_KIND = "NEED"
 NEED_CALL = re.compile(r"\bneed::(?:print|staged)\(")

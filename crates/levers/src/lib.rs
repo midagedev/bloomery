@@ -186,14 +186,16 @@ impl Kind {
                 None if !v.is_empty() => Ok(Value::Path(PathBuf::from(v))),
                 None => Err(refused(None)),
             },
-            Kind::File if Path::new(v).is_file() => Ok(Value::Path(PathBuf::from(v))),
-            Kind::File if !v.is_empty() => Err(refused(Some("no regular file is at that path"))),
             Kind::Program if !Path::new(v).is_absolute() && !v.is_empty() => Err(refused(Some(
                 "a program is named by an absolute path, since a relative name is searched in \
                  PATH or in the working directory of the moment it runs",
             ))),
-            Kind::Program if Path::new(v).is_file() => Ok(Value::Path(PathBuf::from(v))),
-            Kind::Program if !v.is_empty() => Err(refused(Some("no regular file is at that path"))),
+            Kind::File | Kind::Program if Path::new(v).is_file() => {
+                Ok(Value::Path(PathBuf::from(v)))
+            }
+            Kind::File | Kind::Program if !v.is_empty() => {
+                Err(refused(Some("no regular file is at that path")))
+            }
             Kind::FileAt => {
                 let (path, at) = v.rsplit_once(':').ok_or_else(|| refused(None))?;
                 if path.contains(':') {

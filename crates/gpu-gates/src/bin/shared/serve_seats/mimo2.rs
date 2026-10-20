@@ -483,7 +483,7 @@ impl Tiered for Mimo {
         Ok(Some(pick))
     }
 
-    fn settle(plan: &Plan<'_>, pick: ResidencyPick) -> Result<Residency, GateError> {
+    fn settle(plan: &Plan<'_>, pick: ResidencyPick) -> Result<(Residency, u64), GateError> {
         let residency = Residency::parse(pick.word)?;
         if pick.why == ResidencyWhy::Set {
             residency_room(plan, residency, pick.word)?;
@@ -497,12 +497,11 @@ impl Tiered for Mimo {
             0,
             Record::eprint,
         )?;
-        Ok(residency)
-    }
-
-    /// The hosted churn pool is host bytes the load holds beside the plan.
-    fn beside_bytes(plan: &Plan<'_>, residency: Residency) -> Result<u64, GateError> {
-        churn_bytes(plan, 0, (residency, ChurnHosting::Hosted))
+        // The hosted churn pool is host bytes the load holds beside the plan.
+        Ok((
+            residency,
+            churn_bytes(plan, 0, (residency, ChurnHosting::Hosted))?,
+        ))
     }
 
     fn open(a: tiered::Open<Flags>) -> Result<Mimo, GateError> {
