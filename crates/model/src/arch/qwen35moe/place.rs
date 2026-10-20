@@ -1008,15 +1008,7 @@ const MTP_HEAD_ROWS: u64 = 8;
 pub fn mtp_head_act_bytes(head: mtp::BorrowedHead, hidden: u64) -> u64 {
     match head {
         mtp::BorrowedHead::Q8_0 => 0,
-        mtp::BorrowedHead::Q6K => {
-            let n_sb = hidden / 256;
-            let per = 8 * 64 * n_sb.div_ceil(2)
-                + 4 * 256 * n_sb.div_ceil(4)
-                + 4 * 128 * n_sb.div_ceil(2)
-                + 4 * 8 * n_sb
-                + 4 * 2 * n_sb;
-            MTP_HEAD_ROWS * per
-        }
+        mtp::BorrowedHead::Q6K => crate::placement::kernels::q8_act_bytes(MTP_HEAD_ROWS, hidden),
     }
 }
 
