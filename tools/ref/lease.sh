@@ -1709,7 +1709,8 @@ EOF
             state=$(ps -o stat= -p "$sp" 2> /dev/null) || state=''
             if [ "$phase" != fork ] || [[ $state != *Z* && -n $state ]]; then left="$left $child"; fi
           fi
-          if kill -0 "$ip" 2> /dev/null; then left="$left $child-timeout"; fi
+          # A stub whose timeout ended before it wrote its pids is an orphan: its parent is 1, alive and no timeout of ours.
+          if [ "$ip" -gt 1 ] && kill -0 "$ip" 2> /dev/null; then left="$left $child-timeout"; fi
         fi
       done
       lk=free
@@ -1723,7 +1724,7 @@ EOF
         for child in decoder record; do
           if [ -s "$pdir/$child.pid" ]; then
             read -r sp ip < "$pdir/$child.pid"
-            if kill -0 "$ip" 2> /dev/null; then lease_stop "$ip" || :; fi
+            if [ "$ip" -gt 1 ] && kill -0 "$ip" 2> /dev/null; then lease_stop "$ip" || :; fi
             if kill -0 "$sp" 2> /dev/null; then lease_stop "$sp" || :; fi
           fi
         done

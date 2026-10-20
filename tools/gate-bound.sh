@@ -23,6 +23,16 @@ gate_bound() {
   BOUND=$v
 }
 
+# stop_pid_ok <caller> <pid>: 0 for a pid from 2 up, else a named refusal on stderr and 1, before anything is signalled.
+stop_pid_ok() {
+  case ${2:-} in
+    '' | *[!0-9]*) ;;
+    *) if [ "$((10#$2))" -gt 1 ]; then return 0; fi ;;
+  esac
+  printf '[bound] %s: %s is no process of ours to signal (a pid from 2 up), nothing signalled\n' "$1" "'${2:-}'" >&2
+  return 1
+}
+
 # lease_stop <timeout pid>: TERM the monitor, then its surviving group once the monitor exits,
 # within LEASE_STOP_GRACE seconds (9 by default), reserving up to 2 s for KILL and reap.
 # This leaves a margin before an enclosing timeout's 10 s KILL. run_bounded halves the budget
@@ -30,10 +40,13 @@ gate_bound() {
 # that exited without forwarding TERM can leave a live group behind. Zombies hold no descriptors;
 # only live processes keep cleanup waiting. The caller ignores further signals.
 # A failed process read skips its wait (KILL follows TERM without the grace) and returns 70 without
-# reaping the monitor.
+# reaping the monitor. A pid that is no number from 2 up is refused (70, nothing signalled): a caller that reads it from
+# a file may find 1 there, the parent of an orphan, and the stop signals the pid and its group, so `kill -- -1` would
+# reach every process the caller may signal.
 lease_stop() {
   local pid=$1 sig target err table p state live monitor failed=0 deadline limit term_deadline
   local grace=${LEASE_STOP_GRACE:-9}
+  if ! stop_pid_ok "lease_stop" "$pid"; then return 70; fi
   deadline=$((SECONDS + grace))
   term_deadline=$((SECONDS + (grace > 2 ? grace - 2 : 0)))
   for sig in TERM KILL; do
@@ -94,6 +107,7 @@ group_live() (
 # moment after the leader is reaped. A process that left the group (setsid) is not touched.
 group_clear() {
   local i=0 live err
+  if ! stop_pid_ok "group_clear" "$1"; then return 70; fi
   if ! err=$(LC_ALL=C kill -KILL -- "-$1" 2>&1); then
     case $err in
       *'No such process'*) return 0 ;;
@@ -698,6 +712,14 @@ time.sleep(60)' "$t/ended.pg" &
   kill "$p" 2> /dev/null
   wait "$p" 2> /dev/null
   check ended-group-is-empty "$RC" rc=0
+  # stop-pid-guard: lease_stop and group_clear refuse a pid that is no number from 2 up before they signal anything. kill is a
+  # recorder here: a pid of 1 is init, and its group `-1` is every process the caller may signal.
+  for p in 1 01 0 '' x 1x; do
+    out=$(LOG="$t/guard.log" bash -c 'source "$1"; : > "$LOG"; kill() { echo "kill $*" >> "$LOG"; return 0; }
+      LEASE_STOP_GRACE=2 lease_stop "$2" 2>&1; echo "stop rc=$?"; group_clear "$2" 2>&1; echo "clear rc=$?"
+      echo "signals=$(grep -c . "$LOG")"' _ "$self" "$p" 2>&1)
+    check "stop-pid-guard-[$p]" "$(grep -E '^(stop|clear) rc=|^signals=' <<< "$out" | tr '\n' ' ')" 'stop rc=70 clear rc=70 signals=0 '
+  done
   echo "gate-bound self-test: $([ "$bad" = 0 ] && echo ok || echo FAIL) ($bad failures)"
   [ "$bad" = 0 ]
 }
