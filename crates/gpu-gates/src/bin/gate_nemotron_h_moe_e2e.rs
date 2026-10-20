@@ -129,6 +129,12 @@
 //!   launch of the whole-card load's walks or batches, or of an arm's, that
 //!   raises the fault word fails the clause, the whole-card load's too: the
 //!   arms are then held against nothing, and the clause is red, not skipped.
+//!   Each arm also recovers from a fault on every path: a step, a gemv-arm
+//!   batch and a GEMM-arm batch whose first id is past the embedding table
+//!   raise the fault word, and after a reset the valid call that ran before
+//!   it runs clean with the same bits (a hosted layer's launches skip the
+//!   slots the host serves, so a reset must clear the rows the faulted call
+//!   left in them).
 //!
 //! A set absent from the box, dumped from another fixture or build, or
 //! unfinished ends the gate by name before the card loads.
@@ -164,7 +170,7 @@ mod gate {
     use bloomery_gpu::arch::nemotron_h_moe::Routing;
     use bloomery_gpu::host::served::TierBody;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Gpu, NemotronHMoeModel};
+    use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, open_split, verdict};
@@ -1325,31 +1331,30 @@ mod gate {
             let (Some(got_ids), Some(logits)) = (replay.ids.last(), replay.logits.last()) else {
                 return Err("the placed walk is empty".into());
             };
-            let (dmax, cos) = (max_delta(want, logits), cosine(want, logits));
-            let margin = f64::from(want[argmax(want) as usize])
-                - f64::from(want[second(want, argmax(want)) as usize]);
-            let in_band = margin <= 2.0 * dmax;
+            let (host_near, cos, dmax, _) = in_band((*want_ids, want), (*got_ids, logits));
             let clean = m.gpu().fault()?.is_none() && m.poisoned().is_none();
             let fine = finite(&replay) && same(&eager, &replay);
             let near = if arm.name == "card" {
                 same(&whole.run, &replay)
             } else {
-                cos >= COSINE_FLOOR && (got_ids == want_ids || in_band)
+                host_near
             };
             let batch = batch_near_whole(&mut m, case, whole, (arm.name, &hosted))?;
+            let recovers = fault_recovery(&mut m, case, arm.name)?;
             let arm_pass = structure
                 && fine
                 && clean
                 && near
                 && batch
+                && recovers
                 && (arm.name != "card" || hosted.is_empty());
             let resident = m.resident_bytes();
             println!(
                 "{CLAUSE}: arm {}: graph_nodes={nodes} resident_bytes={resident} (runtime value) \
                  handoff_9={handoff}/{} card_acc_9={acc}/{} \
                  weighted_sum={wsum}/{moe_whole}; eager == replay {} finite {} fault clean {clean}; \
-                 last id {got_ids} vs whole-card {want_ids}, cosine {cos:.6}, max|Δ| {dmax:.3e}, \
-                 whole-card top-1 margin {margin:.3e} (inside the band {in_band}) {}",
+                 last id {got_ids} vs whole-card {want_ids}, cosine {cos:.6}, max|Δ| {dmax:.3e}; \
+                 host band {host_near} {}",
                 arm.name,
                 hosted.len(),
                 with_card,
@@ -1507,6 +1512,69 @@ mod gate {
             );
             pass &= arm_pass;
         }
+        Ok(pass)
+    }
+
+    /// Whether `a` and `b` are the same batch run to the bit: the id and the
+    /// logits after the prompt and after each step.
+    fn same_batch(a: &BatchRun, b: &BatchRun) -> bool {
+        a.id == b.id
+            && same_bits(&a.logits, &b.logits)
+            && a.after.len() == b.after.len()
+            && a.after
+                .iter()
+                .zip(&b.after)
+                .all(|((x, lx), (y, ly))| x == y && same_bits(lx, ly))
+    }
+
+    /// One arm's fault recovery (module doc): on each path (the walk as
+    /// steps, the gemv arm's batch, the GEMM arm's batch) a call whose first
+    /// id is past the embedding table raises the fault word, and after a
+    /// reset the valid call that ran before it runs again clean with the same
+    /// bits. A hosted layer's launches skip the slots the host serves and the
+    /// quantize after them reads every slot's row, so a reset that left the
+    /// faulted call's non-finite rows would fault the valid call after it.
+    fn fault_recovery(m: &mut Model, case: &Case, arm: &str) -> Result<bool, GateError> {
+        const CLAUSE: &str = HOST_CLAUSE;
+        const BAD: u32 = u32::MAX;
+        fn raised<T>(r: Result<T, GpuError>) -> bool {
+            matches!(r, Err(GpuError::Fault { .. }))
+        }
+        // Per path: its name, whether the faulted call raised the fault word,
+        // and whether the valid call after the reset is the one before it.
+        let mut paths: Vec<(String, bool, bool)> = Vec::new();
+        let before = fresh(CLAUSE, "the walk before a fault", m, &case.walk)?;
+        m.reset()?;
+        let hit = raised(m.step(&[BAD]));
+        let after = fresh(CLAUSE, "the walk after a fault", m, &case.walk)?;
+        let bits = matches!((&before, &after), (Some(b), Some(a)) if same(b, a));
+        paths.push(("steps".into(), hit, bits));
+        for len in [GEMV_ROWS, case.walk.len()] {
+            let prompt = &case.walk[..len];
+            let before = batch_run(m, prompt, None)?;
+            let mut bad = prompt.to_vec();
+            bad[0] = BAD;
+            m.reset()?;
+            let hit = raised(m.prefill(&bad));
+            let after = batch_run(m, prompt, None)?;
+            let bits = matches!((&before, &after), (Some(b), Some(a)) if same_batch(b, a));
+            let name = if len <= GEMV_ROWS {
+                format!("gemv batch of {len}")
+            } else {
+                format!("GEMM batch of {len}")
+            };
+            paths.push((name, hit, bits));
+        }
+        let pass = paths.iter().all(|&(_, hit, bits)| hit && bits);
+        let listed: Vec<String> = paths
+            .iter()
+            .map(|(name, hit, bits)| format!("{name}: raised {hit}, then bit-identical {bits}"))
+            .collect();
+        println!(
+            "{CLAUSE}: arm {arm} fault recovery (id {BAD} first, reset, the valid call again): {} {}",
+            listed.join("; "),
+            verdict(pass)
+        );
         Ok(pass)
     }
 

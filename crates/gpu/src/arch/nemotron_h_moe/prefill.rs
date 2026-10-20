@@ -544,6 +544,14 @@ impl Prompt {
         self.rows
     }
 
+    /// The slots' up rows back to zero. A placed pass's up launch skips the
+    /// slots the host serves and the quantize after it reads every slot's
+    /// row, so rows a faulted pass left non-finite fault the next valid one.
+    pub(super) fn clear_expert_up(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.b.up.zero_async(stream)?;
+        Ok(())
+    }
+
     /// The device bytes the pass's buffers hold.
     pub(super) fn bytes(&self) -> usize {
         let b = &self.b;
@@ -1410,10 +1418,7 @@ impl Body {
         let (sh, moe) = (self.sh, self.moe);
         let n_kv = sh.n_kv;
         let stream = gpu.stream();
-        let p = self.prompt.as_mut().ok_or(GpuError::state(
-            WHAT,
-            "the prompt pass's buffers (a load that holds them)",
-        ))?;
+        let p = &mut self.prompt;
         let q_width = p.q_width;
         let rows = p.rows;
         if m == 0 || m > rows {
@@ -1525,13 +1530,13 @@ impl GpuModel<Body> {
     /// The rows one pass of [`GpuModel::prefill`] takes: the size the load
     /// chose from the card's room ([`choose_pass_rows`]).
     pub fn pass_rows(&self) -> Result<usize, GpuError> {
-        Ok(self.body(WHAT)?.prompt()?.rows())
+        Ok(self.body(WHAT)?.prompt.rows())
     }
 
     /// [`GpuModel::prefill_with`] in passes of the most ids the prompt
     /// buffers hold: the rows the load chose ([`pass_rows`]).
     pub fn prefill(&mut self, ids: &[u32]) -> Result<u32, GpuError> {
-        let rows = self.body(WHAT)?.prompt()?.rows();
+        let rows = self.body(WHAT)?.prompt.rows();
         self.prefill_with(ids, rows)
     }
 
@@ -1546,7 +1551,7 @@ impl GpuModel<Body> {
         if ids.is_empty() {
             return Err(GpuError::shape(WHAT, "empty token slice"));
         }
-        let cap = self.body(WHAT)?.prompt()?.rows();
+        let cap = self.body(WHAT)?.prompt.rows();
         if rows == 0 || rows > cap {
             return Err(GpuError::shape(
                 WHAT,
