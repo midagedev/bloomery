@@ -1095,15 +1095,7 @@ impl KquantTileKernels {
                 ),
             ));
         }
-        if let Act::SwigluClamp { limit } = a.rule
-            && !limit.is_finite()
-        {
-            return Err(GpuError::shape(
-                what,
-                format!("the clamp limit must be finite, got {limit}"),
-            ));
-        }
-        let (act, limit) = a.rule.code();
+        let (act, limit) = a.rule.code(what)?;
         let cfg = LaunchConfig1D::new(gr.blocks, THREADS, 0);
         let p = &a.act;
         macro_rules! launch {

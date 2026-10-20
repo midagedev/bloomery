@@ -370,7 +370,10 @@ gguf 9 2 0
 # q8_0_gemv_sel_f32's own body held) with each entry's one call (+2), and the planes test's scale read, 8 blocks;
 # fp8_b128_tile_gemm (gemm/kernels32.rs) its shared-memory view and its body call, 2 blocks. Each block has its
 # SAFETY line.
-gpu 1994 223 10
+# PIN(2026-10-21): gpu 1994 -> 1995 blocks, 223 -> 224 fns, a new kernel entry, not old code relaxed:
+# head_norm_neox_append_128_partial (rope_neox.rs): its launcher is an unsafe fn (the positions are distinct, as the
+# 512 and whole-turn launchers state) and its kernel makes the one call into norm_partial_append, with its SAFETY line.
+gpu 1995 224 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -436,7 +439,9 @@ gpu-deepseek41 385 44 0
 # PIN(2026-10-20): gpu-gates 81 -> 83 blocks, new refusal cases, not old code relaxed:
 # gate_mxfp8's plane_shapes makes two tensor windows over live allocations to test empty and
 # overflowing E4M3 shapes before launch. Each constructor has its own SAFETY line.
-gpu-gates 83 5 1
+# PIN(2026-10-21): gpu-gates 83 -> 84 blocks, new code, not old code relaxed: gate_minimaxm3_rope's launch of the
+# unsafe head-128 partial-turn launcher, whose positions rope_gate::run checks distinct, with its SAFETY line.
+gpu-gates 84 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of
@@ -546,7 +551,10 @@ placement 0 0 0
 # PIN(2026-10-20): qdot 205 -> 217 blocks, new code, not old code relaxed: swiglu_clamp_avx2 separates
 # its expf and checked clamp passes. Full vectors and the padded tail each have three expf blocks (load,
 # v_silu, store) and four clamp blocks (three loads, one store): 14 in place of 2, each with its SAFETY line.
-qdot 217 95 0
+# PIN(2026-10-21): qdot 217 -> 221 blocks, 95 -> 97 fns, new code, not old code relaxed: swiglu_oai's AVX2 rule, the
+# dispatch in swiglu_oai (1 block), v_swiglu_oai and its v_expf call (1 block), swiglu_oai_avx2's full-vector and
+# padded-tail blocks (2), each with its SAFETY line.
+qdot 221 97 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1

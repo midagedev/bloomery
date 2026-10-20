@@ -9631,6 +9631,125 @@ unsafe fn swiglu_clamp_avx2(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32
     _mm256_movemask_epi8(finite) == -1
 }
 
+/// The gpt-oss / MiniMax SwiGLU for one value, the rule the card runs
+/// (`bloomery_gpu::kquant::act::swiglu_oai`): `x = min(gate, limit)`, `y =
+/// clamp(up, -limit, limit)`, `x / (1 + e^(−alpha·x)) · (y + 1)` — llama.cpp's
+/// `ggml_compute_forward_swiglu_oai` (and ik's `MulMat::swiglu_oai`) term for
+/// term, with the exponential [`expf_ik_scalar`] where they call libm's. The
+/// `min` and the clamp are the `std::min` and `std::clamp` comparisons.
+#[inline]
+#[must_use]
+pub fn swiglu_oai_1(gate: f32, up: f32, alpha: f32, limit: f32) -> f32 {
+    let x = if limit < gate { limit } else { gate };
+    let y = if up < -limit {
+        -limit
+    } else if limit < up {
+        limit
+    } else {
+        up
+    };
+    x / (1.0 + expf_ik_scalar(alpha * (0.0 - x))) * (y + 1.0)
+}
+
+/// `out[i] = swiglu_oai_1(gate[i], up[i], alpha, limit)`, AVX2 where available:
+/// [`swiglu`]'s `v_expf` lanes (a tail shorter than eight goes through the
+/// same lanes on a zero-padded copy, so a value never depends on where in the
+/// block it sits) with the OAI rule's clamps, the same bits as the scalar
+/// [`swiglu_oai_1`]. `limit` must not be negative (the clamp of `up` would have
+/// its bounds reversed).
+///
+/// Returns `false` when `gate` or `up` holds a value that is not finite: the
+/// clamps would write some of those as finite values, so the caller refuses the
+/// block by name instead of using `out`.
+pub fn swiglu_oai(gate: &[f32], up: &[f32], alpha: f32, limit: f32, out: &mut [f32]) -> bool {
+    assert!(gate.len() == up.len() && gate.len() == out.len());
+    assert!(
+        limit >= 0.0 && limit.is_finite(),
+        "swiglu_oai: the limit must be finite and not negative, got {limit}"
+    );
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the features were just detected; the slices are equal length.
+        return unsafe { swiglu_oai_avx2(gate, up, alpha, limit, out) };
+    }
+    // Absolute f32 encodings put every finite value below infinity and NaN.
+    let mut max_bits = 0u32;
+    for (o, (&g, &u)) in out.iter_mut().zip(gate.iter().zip(up)) {
+        max_bits = max_bits
+            .max(g.to_bits() & 0x7fff_ffff)
+            .max(u.to_bits() & 0x7fff_ffff);
+        *o = swiglu_oai_1(g, u, alpha, limit);
+    }
+    max_bits < f32::INFINITY.to_bits()
+}
+
+/// [`swiglu_oai_1`] over eight lanes; `(alpha, limit, -limit)` broadcast. The
+/// `min` and `max` operand orders are the scalar rule's comparisons.
+///
+/// # Safety
+/// The CPU must support AVX2 and FMA. Register-only: no memory is touched.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[inline]
+unsafe fn v_swiglu_oai(g: __m256, u: __m256, (a, hi, lo): (__m256, __m256, __m256)) -> __m256 {
+    let x = _mm256_min_ps(hi, g);
+    let y = _mm256_max_ps(_mm256_min_ps(u, hi), lo);
+    // SAFETY: same target features as the caller.
+    let e = unsafe { v_expf(_mm256_mul_ps(a, _mm256_sub_ps(_mm256_setzero_ps(), x))) };
+    let s = _mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.0), e));
+    _mm256_mul_ps(s, _mm256_add_ps(y, _mm256_set1_ps(1.0)))
+}
+
+/// [`swiglu_oai`]'s vector body, with its flag.
+///
+/// # Safety
+/// The CPU must support AVX2 and FMA, and `gate`, `up` and `out` must all be
+/// the same length — the loads and the store share one index.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn swiglu_oai_avx2(
+    gate: &[f32],
+    up: &[f32],
+    alpha: f32,
+    limit: f32,
+    out: &mut [f32],
+) -> bool {
+    let n = gate.len();
+    let full = n / 8 * 8;
+    let (hi, lo, a) = (
+        _mm256_set1_ps(limit),
+        _mm256_set1_ps(-limit),
+        _mm256_set1_ps(alpha),
+    );
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i < full {
+        // SAFETY: i + 8 <= full <= gate.len(), up.len() and out.len().
+        unsafe {
+            let g = _mm256_loadu_ps(gate.as_ptr().add(i));
+            let u = _mm256_loadu_ps(up.as_ptr().add(i));
+            acc = max_abs_bits(acc, g, u);
+            _mm256_storeu_ps(out.as_mut_ptr().add(i), v_swiglu_oai(g, u, (a, hi, lo)));
+        }
+        i += 8;
+    }
+    if full < n {
+        let (mut gp, mut upad, mut op) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
+        gp[..n - full].copy_from_slice(&gate[full..]);
+        upad[..n - full].copy_from_slice(&up[full..]);
+        // SAFETY: the three arrays are eight f32 each.
+        unsafe {
+            let g = _mm256_loadu_ps(gp.as_ptr());
+            let u = _mm256_loadu_ps(upad.as_ptr());
+            acc = max_abs_bits(acc, g, u);
+            _mm256_storeu_ps(op.as_mut_ptr(), v_swiglu_oai(g, u, (a, hi, lo)));
+        }
+        out[full..].copy_from_slice(&op[..n - full]);
+    }
+    let finite = _mm256_cmpgt_epi32(_mm256_castps_si256(_mm256_set1_ps(f32::INFINITY)), acc);
+    _mm256_movemask_epi8(finite) == -1
+}
+
 /// # Safety
 /// The CPU must support AVX2 and FMA, and `gate`, `up` and `out` must all be
 /// the same length — the loads and the store share one index.

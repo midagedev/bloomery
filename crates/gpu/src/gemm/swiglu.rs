@@ -54,13 +54,13 @@ impl GemmKernels {
 
     /// Enqueue `act = q8_1(rule(g, u))` over the first `n_cols` slot columns
     /// of `act`: one launch of `gemm_swiglu_quant`, `rule` the gate·up rule
-    /// of the K-quant family (`kquant::act::apply`: `silu(g) · u` or ik's
-    /// clamped SwiGLU, the values of a fused `_sel` gate·up under the same
-    /// rule). A 128-value block holding a non-finite `g` or `u` value is
-    /// stored refused (NaN scale, zero codes) and raised on `fault` as
-    /// [`FaultSite::QuantColumn`] under either rule; a clamp limit that is
-    /// not finite is refused by name. Asynchronous, allocation-free,
-    /// capturable.
+    /// of the K-quant family (`kquant::act::apply`: `silu(g) · u`, ik's
+    /// clamped SwiGLU or the OAI SwiGLU, the values of a fused `_sel` gate·up
+    /// under the same rule). A 128-value block holding a non-finite `g` or
+    /// `u` value is stored refused (NaN scale, zero codes) and raised on
+    /// `fault` as [`FaultSite::QuantColumn`] under any rule; a rule
+    /// [`Act::code`] refuses is refused by name. Asynchronous,
+    /// allocation-free, capturable.
     ///
     /// [`FaultSite::QuantColumn`]: crate::FaultSite::QuantColumn
     #[allow(
@@ -142,14 +142,6 @@ impl GemmKernels {
                 format!("1 <= n_cols <= act cols = {cols}, got {n_cols}"),
             ));
         }
-        if let Act::SwigluClamp { limit } = rule
-            && !limit.is_finite()
-        {
-            return Err(GpuError::shape(
-                what,
-                format!("the clamp limit must be finite, got {limit}"),
-            ));
-        }
         if g.len() < n_cols * k || u.len() < n_cols * k {
             return Err(GpuError::shape(
                 what,
@@ -160,7 +152,7 @@ impl GemmKernels {
                 ),
             ));
         }
-        let (act_code, limit) = rule.code();
+        let (act_code, limit) = rule.code(what)?;
         let n_sb = k / 256;
         let grid = launch_u32(what, "grid", n_cols * n_sb * 2)?;
         let n_cols = launch_u32(what, "n_cols", n_cols)?;

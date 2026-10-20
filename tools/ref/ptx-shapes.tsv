@@ -197,6 +197,7 @@ generate_ds41   hc_gated_norm_4w                         0           0
 generate_ds41   hc_gated_up_mix_4x320                    0           0
 generate_ds41   hc_pre_q8_0                              0           0
 generate_ds41   head_norm_neox_append                    0           0
+generate_ds41   head_norm_neox_append_128_partial        0           0
 generate_ds41   head_norm_neox_append_256                0           0
 generate_ds41   head_norm_neox_append_256_q8             0           0
 # jit_local is ptxas 13.3.73's sm_86 stack frame, not read on a cc 8.6 card; for this entry the two agree here and in both cc 12.1 tables.
@@ -365,6 +366,8 @@ generate_ds41   relu_sqr_quant32                         0           0
 generate_ds41   rms_norm                                 0           0
 generate_ds41   rope                                     0           0
 generate_ds41   router_topk                              0           0
+generate_ds41   sigmoid_128_4_router                     0           0
+generate_ds41   sigmoid_128_4_router_pick                0           0
 generate_ds41   sigmoid_320_8_router                     0           0
 generate_ds41   sigmoid_320_8_router_pick                0           0
 generate_ds41   swiglu                                   0           0
@@ -496,6 +499,7 @@ gate_e2e   hc_gated_norm_4                          0           0
 gate_e2e   hc_gated_norm_4w                         0           0
 gate_e2e   hc_gated_up_mix_4x320                    0           0
 gate_e2e   head_norm_neox_append                    0           0
+gate_e2e   head_norm_neox_append_128_partial        0           0
 gate_e2e   head_norm_neox_append_256                0           0
 gate_e2e   head_norm_neox_append_256_q8             0           0
 # jit_local is ptxas 13.3.73's sm_86 stack frame, not read on a cc 8.6 card; for this entry the two agree here and in both cc 12.1 tables.

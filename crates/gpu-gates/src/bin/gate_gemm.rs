@@ -103,7 +103,10 @@
 //! `Gpu::enqueue_quantize_gemm`, a `Q8Act` fill (`enqueue_swiglu_act_quant_q8`)
 //! holding the `GemmAct`'s codes and scales, a NaN up value refused as
 //! `QuantColumn` where the clamp alone would make it the limit, a non-finite
-//! limit refused by name.
+//! limit refused by name. Case `swiglu_oai`: the same launch under the OAI
+//! SwiGLU (limits 7 and 0.5) bit for bit the CPU twin `qdot::swiglu_oai` then
+//! the same quantizer, a NaN up value refused as `QuantColumn`, and a NaN or
+//! negative limit and an `alpha` other than the references' refused by name.
 //!
 //! The squared-ReLU quantizer fold (`Gpu::enqueue_quantize_gemm_relu_sqr`,
 //! case `relu_sqr`) at K ∈ {768, 2048} for 1, 8, 64 and 4096 columns: its
@@ -149,7 +152,8 @@
 //!   limit, u past either side, neither); under the plain rule
 //!   `swiglu_quant32`'s bytes; a NaN or infinite `g` or `u` refusing its
 //!   block and raising `QuantColumn` where the clamp alone would make it
-//!   finite.
+//!   finite; the OAI SwiGLU (limits 7 and 0.5, K = 2048, 9 columns) bit for
+//!   bit the CPU twin `qdot::swiglu_oai` then the host quantizer.
 //! - `g32_relu_sqr`: `relu_sqr_quant32`, a relu² expert's up rows quantized
 //!   as its down GEMM's input, at K ∈ {96, 1856, 3712} (Lightning's routed
 //!   and shared down widths, neither a multiple of 256) for 1, 9 and 512
@@ -257,11 +261,12 @@ mod gate {
     };
     use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
-    use bloomery_gpu::kquant::{Act, act::silu_ik};
+    use bloomery_gpu::kquant::{Act, act::SWIGLU_OAI_ALPHA};
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::act_rule::q8_1_codes;
     use bloomery_gpu_gates::rounding::gamma;
+    use bloomery_gpu_gates::swiglu_host;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, activations, bits_equal, bytes_to_words, checks_failed, data_dir,
         open_model, verdict,
@@ -2061,6 +2066,8 @@ mod gate {
     /// 0.5, under the activations' scale, so both clamps (`silu(g)` above the
     /// limit, `u` outside ±limit) act on a share of the values.
     const SWIGLU_LIMITS: [f32; 2] = [10.0, 0.5];
+    /// The limits the OAI rule runs at: the references' 7, and 0.5, which bites on most values.
+    const SWIGLU_OAI_LIMITS: [f32; 2] = [7.0, 0.5];
 
     /// The squared-ReLU quantizer fold (`Gpu::enqueue_quantize_gemm_relu_sqr`)
     /// against the two-launch composition and the host transcription
@@ -2186,15 +2193,17 @@ mod gate {
             let mut plain = GemmAct::new(stream, n, k)?;
             dev.gk
                 .enqueue_swiglu_quant(stream, &g, &u, n, &mut plain, sink)?;
-            for limit in SWIGLU_LIMITS {
-                let rule = Act::SwigluClamp { limit };
-                let live = gh
-                    .iter()
-                    .zip(&uh)
-                    .filter(|&(&gv, &uv)| silu_ik(gv) > limit || uv.abs() > limit)
-                    .count();
-                let mut hh = vec![0.0f32; n * k];
-                qdot::swiglu_clamp(&gh, &uh, limit, &mut hh);
+            let rules = SWIGLU_LIMITS
+                .map(|limit| (Act::SwigluClamp { limit }, limit))
+                .into_iter()
+                .chain(SWIGLU_OAI_LIMITS.map(|limit| (swiglu_host::oai(limit), limit)));
+            for (rule, limit) in rules {
+                let kind = if matches!(rule, Act::SwigluOai { .. }) {
+                    "swiglu_oai"
+                } else {
+                    "swiglu_clamp"
+                };
+                let (hh, live) = swiglu_host::combine(rule, &gh, &uh).expect("a limited rule");
                 let h = DeviceBuffer::from_host(stream, &hh)?;
                 let mut fused = GemmAct::new(stream, n, k)?;
                 let mut split = GemmAct::new(stream, n, k)?;
@@ -2220,7 +2229,7 @@ mod gate {
                     && bits_equal(&gemv.d8().to_host_vec(stream)?, &pf.4);
                 let pass = eq_host_clamp && clamp_acts && q8_eq;
                 println!(
-                    "gemm case=swiglu_clamp K={k} cols={n} limit={limit} live_values={live} \
+                    "gemm case={kind} K={k} cols={n} limit={limit} live_values={live} \
                      planes_eq_host_clamp_bits={eq_host_clamp} differs_from_unclamped={clamp_acts} \
                      q8act_eq_gemmact={q8_eq} {}",
                     verdict(pass)
@@ -2231,40 +2240,67 @@ mod gate {
         // A NaN up value under the clamp: the clamp alone would make it the
         // limit; the block is refused and the fault named.
         let k = 768;
-        let rule = Act::SwigluClamp { limit: 0.5 };
-        let mut act = GemmAct::new(stream, 8, k)?;
         let gh = activations(k, 8, 77);
         let mut uh = activations(k, 8, 78);
         uh[3 * k + 5] = f32::NAN;
-        gpu.clear_fault()?;
         let (g, u) = (
             DeviceBuffer::from_host(stream, &gh)?,
             DeviceBuffer::from_host(stream, &uh)?,
         );
-        dev.gk
-            .enqueue_swiglu_act_quant(stream, &g, &u, rule, 8, &mut act, sink)?;
-        stream.synchronize()?;
-        let fault = gpu.take_fault()?;
-        let refused = act.d8().to_host_vec(stream)?[3 * (k / 128)].is_nan();
-        let nan_ok = fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn)) && refused;
-        println!(
-            "gemm case=swiglu_clamp fault=nan_up fault_raised={} block_refused={refused} {}",
-            fault.is_some(),
-            verdict(nan_ok)
-        );
-        ok &= nan_ok;
-        let inf_limit = Act::SwigluClamp {
-            limit: f32::INFINITY,
-        };
-        let bad_limit = dev
-            .gk
-            .enqueue_swiglu_act_quant(stream, &g, &u, inf_limit, 8, &mut act, sink)
-            .is_err();
-        println!(
-            "gemm case=swiglu_clamp refusal=non_finite_limit refused={bad_limit} {}",
-            verdict(bad_limit)
-        );
-        Ok(ok && nan_ok && bad_limit)
+        let mut act = GemmAct::new(stream, 8, k)?;
+        for (kind, rule) in [
+            ("swiglu_clamp", Act::SwigluClamp { limit: 0.5 }),
+            ("swiglu_oai", swiglu_host::oai(0.5)),
+        ] {
+            gpu.clear_fault()?;
+            dev.gk
+                .enqueue_swiglu_act_quant(stream, &g, &u, rule, 8, &mut act, sink)?;
+            stream.synchronize()?;
+            let fault = gpu.take_fault()?;
+            let refused = act.d8().to_host_vec(stream)?[3 * (k / 128)].is_nan();
+            let nan_ok = fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn)) && refused;
+            println!(
+                "gemm case={kind} fault=nan_up fault_raised={} block_refused={refused} {}",
+                fault.is_some(),
+                verdict(nan_ok)
+            );
+            ok &= nan_ok;
+        }
+        // A rule the device cannot run is refused by name, before any launch.
+        for (what, rule) in [
+            (
+                "clamp_inf_limit",
+                Act::SwigluClamp {
+                    limit: f32::INFINITY,
+                },
+            ),
+            (
+                "oai_nan_limit",
+                Act::SwigluOai {
+                    alpha: SWIGLU_OAI_ALPHA,
+                    limit: f32::NAN,
+                },
+            ),
+            ("oai_negative_limit", swiglu_host::oai(-1.0)),
+            (
+                "oai_alpha_1",
+                Act::SwigluOai {
+                    alpha: 1.0,
+                    limit: 7.0,
+                },
+            ),
+        ] {
+            let refused = dev
+                .gk
+                .enqueue_swiglu_act_quant(stream, &g, &u, rule, 8, &mut act, sink)
+                .is_err();
+            println!(
+                "gemm case=swiglu refusal={what} refused={refused} {}",
+                verdict(refused)
+            );
+            ok &= refused;
+        }
+        Ok(ok)
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -3194,6 +3230,7 @@ mod gate {
         use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE};
         use bloomery_gpu_gates::gemm32::{HostAct, Planes32, dot32, dot32_nv, host_act};
         use bloomery_gpu_gates::rounding::gamma;
+        use bloomery_gpu_gates::swiglu_host;
         use bloomery_gpu_gates::{
             Fnv1a64, GateError, activations, bits_equal, bytes_to_words, verdict,
         };
@@ -4199,6 +4236,41 @@ mod gate {
                 println!(
                     "gemm32 case=g32_swiglu_act sides limit={limit} silu_over={sg} up_over={up} \
                      up_under={dn} unclamped={free} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            // The OAI rule through the same quantizer: bit for bit the CPU twin
+            // `qdot::swiglu_oai` then the host quantizer, the limit biting on
+            // some values and not on others.
+            let (k, n) = (2048usize, 9usize);
+            let mut act = GemmAct32::new(stream, n, k)?;
+            let scaled = |seed: u32| -> Vec<f32> {
+                activations(k, n, seed)
+                    .into_iter()
+                    .map(|v| 12.0 * v)
+                    .collect()
+            };
+            let (gh, uh) = (scaled(9700 + (k + n) as u32), scaled(9800 + (k + n) as u32));
+            let (g, u) = (
+                DeviceBuffer::from_host(stream, &gh)?,
+                DeviceBuffer::from_host(stream, &uh)?,
+            );
+            for limit in [7.0f32, 0.5] {
+                let rule = swiglu_host::oai(limit);
+                dev.g32
+                    .enqueue_swiglu_act_quant32(stream, &g, &u, rule, n, &mut act, sink)?;
+                stream.synchronize()?;
+                let fault = gpu.take_fault()?;
+                let (h, bitten) = swiglu_host::combine(rule, &gh, &uh).expect("a limited rule");
+                let (_, want) = host_act(&h, k, n);
+                let same = planes_equal(&act, n, &want, stream)?;
+                let pass = same && fault.is_none() && bitten > 0 && bitten < n * k;
+                println!(
+                    "gemm32 case=g32_swiglu_act swiglu_oai K={k} cols={n} limit={limit} \
+                     bitten={bitten}/{} planes_eq_host_of_oai={same} fault={} {}",
+                    n * k,
+                    fault.map_or_else(|| "none".into(), |f| f.to_string()),
                     verdict(pass)
                 );
                 ok &= pass;

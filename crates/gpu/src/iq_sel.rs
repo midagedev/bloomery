@@ -970,7 +970,7 @@ impl QuantSelKernels {
         // The bodies divide thread rows in u32.
         launch_u32(what, "n_slots * rows_per_expert", slot_rows)?;
         let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
-        let (act, limit) = a.rule.code();
+        let (act, limit) = a.rule.code(what)?;
         let launch = RawGateUpLaunch {
             wg: a.wg.buf(),
             wu: a.wu.buf(),
