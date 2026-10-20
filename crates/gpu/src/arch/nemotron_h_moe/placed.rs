@@ -44,6 +44,7 @@ use crate::host::run::{HostRun, HostWidths};
 use crate::host::served::{ResidencyParts, TierBody};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
 use crate::kquant::SelDown;
+use crate::routed_block::handoff_go;
 use crate::tensor::DeviceTensor;
 use crate::{Gpu, GpuError};
 use bloomery_levers::HostCfg;
@@ -373,10 +374,7 @@ fn front(
         row_off: l * side.stride,
         n_expert: m.route.n_expert(),
     };
-    let target = hy.boundary_mut().handoff_target_of(0)?;
-    side.handoff
-        .enqueue_handoff(stream, &h, target, fault, &mut side.sel)?;
-    hy.boundary().enqueue_go_of(stream, l, 0)
+    handoff_go(gpu, &side.handoff, &h, hy, (l, 0), &mut side.sel)
 }
 
 /// Layer `l`'s shadow on a hosted layer: the module doc's second part.

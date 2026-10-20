@@ -56,6 +56,7 @@ use bloomery_gpu::hybrid::{Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::{
     Act, EntryPlanes, KquantTileKernels, TileGather, TileScratch, TiledGateUpAct,
 };
+use bloomery_gpu::routed_block::wait_add;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, enqueue_block};
@@ -898,8 +899,6 @@ pub(crate) fn back(
     if n_tier > 0 {
         return back_tier(gpu, p, hybrid, l, n_tier);
     }
-    let boundary = hybrid.boundary();
-    let stream = gpu.stream();
     let n = p.d.embd;
     let s = &mut *p.s;
     let shadowed = if p.card.has(l) {
@@ -907,9 +906,7 @@ pub(crate) fn back(
     } else {
         &s.sh_y
     };
-    boundary.enqueue_back_of(stream, p.row, l)?;
-    gpu.elem()
-        .enqueue_add(stream, boundary.hsum_of(p.row)?, shadowed, n, &mut s.out)
+    wait_add(gpu, hybrid, (l, p.row), (shadowed, n), &mut s.out)
 }
 
 /// [`back`] of a layer whose `n_tier` experts the expert tier holds.
