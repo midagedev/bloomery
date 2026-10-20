@@ -1531,6 +1531,32 @@ struct QwenDump {
     want: Vec<u32>,
 }
 
+/// The ik commit the IQ4_XS dump is made at: `tools/ref/iq4xs-ik.pin`, the file
+/// `tools/ref/build-qdot-ref.sh` builds the dump's ik tree from. The shared ik tree the other
+/// dumps come from predates the signed AVX2 path this kernel follows.
+const IQ4XS_IK_PIN: &str = include_str!("../../../tools/ref/iq4xs-ik.pin");
+
+/// Whether a dump's `.meta` (its harness writes `ik=<commit>` after the dump) names `pin`.
+fn dump_ik_meta_check(file: &str, meta: &str, pin: &str) -> Result<(), String> {
+    match meta.lines().find_map(|l| l.strip_prefix("ik=")) {
+        None => Err(format!("{file}.meta has no ik= line")),
+        Some(ik) if ik == pin => Ok(()),
+        Some(ik) => Err(format!("{file} was dumped by ik {ik}, the pin is {pin}")),
+    }
+}
+
+/// `iq4xs-ik-dot.txt`, refused by name unless its meta names the pinned ik commit.
+fn iq4xs_dump() -> QwenDump {
+    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    let meta_path = format!("{base}/ref/iq4xs-ik-dot.meta");
+    let meta = std::fs::read_to_string(&meta_path)
+        .unwrap_or_else(|e| panic!("{meta_path}: {e} — run just build-ref-iq4xs first"));
+    if let Err(why) = dump_ik_meta_check("iq4xs-ik-dot", &meta, IQ4XS_IK_PIN.trim()) {
+        panic!("{why} — run just build-ref-iq4xs first");
+    }
+    qwen_dump("iq4xs-ik-dot.txt", GgmlType::IQ4_XS, 136, 256)
+}
+
 /// Reads `$BLOOMERY_DATA/ref/<file>`, every line by its tag; an untagged or unknown
 /// line is refused, and the shapes must match the type's column and row contracts.
 fn qwen_dump(file: &str, ty: GgmlType, block: usize, gran: usize) -> QwenDump {
@@ -1761,7 +1787,7 @@ fn hw_iq4xs_kernel_matches_mirror() {
         supports(GgmlType::IQ4_XS),
         "gate A compares the AVX2 kernel against its mirror; this CPU lacks the kernel's ISA"
     );
-    let d = qwen_dump("iq4xs-ik-dot.txt", GgmlType::IQ4_XS, 136, 256);
+    let d = iq4xs_dump();
     for r in 0..d.rows.len() {
         let a = dot_row_avx2(GgmlType::IQ4_XS, &d.rows[r], &d.ik_acol, d.k).unwrap();
         let b = dot_row_scalar(GgmlType::IQ4_XS, &d.rows[r], &d.ik_acol, d.k).unwrap();
@@ -1840,12 +1866,38 @@ fn iq4xs_signed_dot_extremes() {
     }
 }
 
+/// The IQ4_XS dump is read only at the pinned ik commit: the pin file is one full commit, and a
+/// meta without an `ik=` line, naming another commit or only an abbreviation of the pin is
+/// refused by name.
+#[test]
+fn iq4xs_dump_meta_names_the_pin() {
+    let pin = IQ4XS_IK_PIN.trim();
+    assert!(
+        pin.len() == 40
+            && pin
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "tools/ref/iq4xs-ik.pin must hold one 40-digit lower-case commit, not {pin:?}"
+    );
+    let ours = format!("ik={pin}\nbuilt=2026-10-21T00:00:00Z\n");
+    assert_eq!(dump_ik_meta_check("d", &ours, pin), Ok(()));
+    let stale = "ik=c10fbbcccd69cb1c66ddeb39601b0cd71701f7c3\nbuilt=2026-10-20T00:00:00Z\n";
+    let err = dump_ik_meta_check("d", stale, pin).unwrap_err();
+    assert!(
+        err.contains("c10fbbcccd69cb1c66ddeb39601b0cd71701f7c3") && err.contains(pin),
+        "{err}"
+    );
+    assert!(dump_ik_meta_check("d", &format!("ik={}\n", &pin[..8]), pin).is_err());
+    let err = dump_ik_meta_check("d", "built=2026-10-21T00:00:00Z\n", pin).unwrap_err();
+    assert_eq!(err, "d.meta has no ik= line");
+}
+
 /// IQ4_XS gate B: every dumped row within 1 ULP of ik's
 /// `mul_mat_qX_K_q8_K_T<DequantizerIQ4XS, 1>` (the IQ3_XXS band).
 #[test]
 #[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
 fn hw_iq4xs_kernel_predicts_ik() {
-    let d = qwen_dump("iq4xs-ik-dot.txt", GgmlType::IQ4_XS, 136, 256);
+    let d = iq4xs_dump();
     let mut worst = 0i64;
     let mut exact = 0usize;
     for (r, (&bits, row)) in d.want.iter().zip(&d.rows).enumerate() {
