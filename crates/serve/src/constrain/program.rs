@@ -29,10 +29,11 @@
 //! the allowed set. The walk reads no row at a forced id, nor at the only
 //! child of a choice's node ([`Walk::fixed_next`]).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::Refusal;
 use super::vocab::{Class, Vocab};
+use crate::api::relock;
 use crate::engine::Tokenizer;
 use crate::sampling;
 
@@ -119,6 +120,20 @@ impl Trie {
             [only] => Some(*only),
             _ => None,
         }
+    }
+
+    /// The option every path from `node` completes, when it is one alone.
+    fn sole_option(&self, node: usize) -> Option<usize> {
+        let (mut found, mut open) = (None, vec![node]);
+        while let Some(n) = open.pop() {
+            if let Some(k) = self.nodes[n].leaf
+                && found.replace(k).is_some()
+            {
+                return None;
+            }
+            open.extend(self.nodes[n].kids.iter().map(|&(_, child)| child));
+        }
+        found
     }
 }
 
@@ -317,6 +332,39 @@ fn free_step(
     })
 }
 
+/// One child of a choice's node at a decision: its id, the logit the decision's
+/// row holds for it, and the option it leads to alone (`None` when more than
+/// one option lies below it).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Kid {
+    pub id: u32,
+    pub logit: f32,
+    pub option: Option<usize>,
+}
+
+/// A pick among the children of a choice's node (more than one), as the row
+/// held them.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Decision {
+    /// In ascending id order.
+    pub kids: Vec<Kid>,
+    /// The child taken.
+    pub picked: u32,
+}
+
+/// The decisions of the walk that follows a constraint, in order, for the
+/// route that reads them once the generation is done. A walk starts the record
+/// afresh.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Watch(Arc<Mutex<Vec<Decision>>>);
+
+impl Watch {
+    /// The decisions so far, taken out.
+    pub(crate) fn take(&self) -> Vec<Decision> {
+        std::mem::take(&mut *relock(&self.0))
+    }
+}
+
 /// A request's constraint, built once and shared by the walks that follow it.
 #[derive(Clone)]
 pub(crate) struct Constraint {
@@ -325,6 +373,9 @@ pub(crate) struct Constraint {
     /// leaves one open.
     close: Arc<[u32]>,
     stops: Arc<[u32]>,
+    /// Where its walks write their decisions, `None` for a request that reads
+    /// none.
+    watch: Option<Watch>,
 }
 
 impl std::fmt::Debug for Constraint {
@@ -341,7 +392,14 @@ impl Constraint {
             prog: Arc::new(prog),
             close: close.into(),
             stops,
+            watch: None,
         }
+    }
+
+    /// This constraint with its walks writing their decisions to `watch`.
+    pub(crate) fn watched(mut self, watch: &Watch) -> Constraint {
+        self.watch = Some(watch.clone());
+        self
     }
 }
 
@@ -396,12 +454,16 @@ pub(crate) struct Walk {
     stops: Arc<[u32]>,
     taken: usize,
     picks: Picks,
+    watch: Option<Watch>,
 }
 
 impl Walk {
     /// A walk at the start of `c`'s program; `close_think` forces the think
     /// span's close first (a prompt that left the span open).
     pub(crate) fn new(c: &Constraint, close_think: bool) -> Walk {
+        if let Some(w) = &c.watch {
+            relock(&w.0).clear();
+        }
         Walk {
             frames: vec![Frame {
                 prog: Arc::clone(&c.prog),
@@ -416,6 +478,7 @@ impl Walk {
             stops: Arc::clone(&c.stops),
             taken: 0,
             picks: Picks::default(),
+            watch: c.watch.clone(),
         }
     }
 
@@ -552,6 +615,19 @@ impl Walk {
             return Err(self.stuck("the row holds none of the option ids"));
         };
         self.picks.decisions += usize::from(several);
+        if several && let Some(w) = &self.watch {
+            relock(&w.0).push(Decision {
+                kids: kids
+                    .iter()
+                    .map(|&(kid, below)| Kid {
+                        id: kid,
+                        logit: row.get(kid as usize).copied().unwrap_or(f32::NAN),
+                        option: t.sole_option(below),
+                    })
+                    .collect(),
+                picked: id,
+            });
+        }
         match t.nodes[child].leaf {
             Some(alt) => {
                 if let Some(sub) = &t.subs[alt] {
