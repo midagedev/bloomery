@@ -13,7 +13,7 @@
 #                   same default): tools/box.sh sources this file in every box command, whatever profile
 #                   the command picked, and exports V41_MODEL and V41_DIR as BLOOMERY_V41_MODEL and
 #                   BLOOMERY_V41_DIR, so a script or a test under another profile opens the same file.
-#                   V41_PUBLIC, the public Q3_K_M set, is the default
+#                   V41_PUBLIC, the 1017 Q3_K_M set, is the default
 #   V41_DIR         the directory of V41_MODEL, where every shard lies
 #   V41_SET_SUFFIX  what the oracle set names below carry for the file V41_MODEL names: _plain for
 #                   V41_PUBLIC, nothing for any other file. A set
@@ -148,8 +148,8 @@
 #                   buffer overrides (src/llama-model.cpp: use_mmap_buffer is always true).
 #                   No --defer-experts twin either: the loader WILLNEEDs every non-lazy range
 #                   (src/llama-mmap.cpp:501-502, the complement of the lazy ranges over each
-#                   shard), 262,788,958,788 B of V41_PUBLIC [derived: the nine shards'
-#                   347,271,472,288 B, headers included, less the lazy engram_embd tables'
+#                   shard), 262,789,087,556 B of V41_PUBLIC [derived: the ten shards'
+#                   347,271,601,056 B, headers included, less the lazy engram_embd tables'
 #                   84,482,513,500 B from the headers], on a 270 GB machine whose file cache
 #                   peaks near 261.5 GB (the witness's Cached less Shmem) — the witness's page cache and
 #                   pgmajfault lines show what it costs. The lazy engram_embd rows it reads one
@@ -203,7 +203,7 @@ MODEL_NAME=deepseek41
 : "${IK:=/home/user/ik-idxkey}"
 # The candidate oracle tree (the `-sep` variants and d1c, below; tools/ref/build-ik-cand.sh builds it).
 CAND_IK=/home/user/ik-cand
-V41_PUBLIC=/models/DeepSeek-V4.1-Flash-Q3_K_M/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf
+V41_PUBLIC=/models/DeepSeek-V4.1-Flash-1017-Q3_K_M/DeepSeek-V4.1-Flash-1017-Q3_K_M-00001-of-00010.gguf
 V41_MODEL=${BLOOMERY_V41_MODEL:-$V41_PUBLIC}
 V41_DIR=${V41_MODEL%/*}
 V41_SET_SUFFIX=

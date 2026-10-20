@@ -671,8 +671,8 @@ fn verify_names_the_first_byte_that_differs() {
 fn the_sidecar_lives_in_a_directory_of_its_own() {
     let cases = [
         (
-            "/models/DeepSeek-V4.1-Flash-Q3_K_M/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf",
-            "/models/DeepSeek-V4.1-Flash-Q3_K_M-r8/DeepSeek-V4.1-Flash-Q3_K_M-r8.gguf",
+            "/models/DeepSeek-V4.1-Flash-1017-Q3_K_M/DeepSeek-V4.1-Flash-1017-Q3_K_M-00001-of-00010.gguf",
+            "/models/DeepSeek-V4.1-Flash-1017-Q3_K_M-r8/DeepSeek-V4.1-Flash-1017-Q3_K_M-r8.gguf",
         ),
         ("/a/b/model.gguf", "/a/b-r8/model-r8.gguf"),
         ("/a/m-1-of-2.gguf", "/a-r8/m-1-of-2-r8.gguf"),

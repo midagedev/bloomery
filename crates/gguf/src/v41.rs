@@ -21,7 +21,7 @@
 //! profile's command (Qwen3.8, GLM) names another family's file as
 //! `BLOOMERY_REF_MODEL`, and V4.1 readers under it keep the real file.
 //!
-//! The file is the public `Q3_K_M` set ([`PUBLIC`]), the default. The oracle
+//! The file is the `1017` `Q3_K_M` set ([`PUBLIC`]), the default. The oracle
 //! sets dumped from it carry the name suffix [`PUBLIC_SET_SUFFIX`]; a set of
 //! any other file carries none.
 
@@ -30,9 +30,9 @@ use std::path::PathBuf;
 /// The environment variable that names the file: shard 1 of a split set.
 pub const ENV: &str = "BLOOMERY_V41_MODEL";
 
-/// The public `Q3_K_M` file's first shard.
+/// The default `Q3_K_M` file's first shard.
 pub const PUBLIC: &str =
-    "/models/DeepSeek-V4.1-Flash-Q3_K_M/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
+    "/models/DeepSeek-V4.1-Flash-1017-Q3_K_M/DeepSeek-V4.1-Flash-1017-Q3_K_M-00001-of-00010.gguf";
 
 /// The file opened when [`ENV`] is unset or empty.
 pub const DEFAULT: &str = PUBLIC;

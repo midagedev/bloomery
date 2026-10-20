@@ -224,11 +224,11 @@ fn read_meta(dir: &Path, tname: &str) -> (String, usize, usize) {
 /// V4.1's first shard opens strictly, and each type it holds that this engine
 /// dequantizes on the host side reproduces ggml's `to_float` bit for bit:
 /// every one of these conversions is exact, so any difference is a bug, not
-/// rounding. Every type of the shard is checked (the public file's engram
-/// and embedding rows, its gains and scales are all decoded on the host),
-/// from the dump `ref-dequant-v41` + [`gguf::v41::set_suffix_of`]. Each type must be
-/// in the dump (a type the dump lacks fails here instead of passing with
-/// nothing compared), with ggml's tensor count for it equal to the loader's.
+/// rounding. Every type of the shard is checked (q3_K, q4_K and q5_K here,
+/// the routed experts' rows), from the dump `ref-dequant-v41` +
+/// [`gguf::v41::set_suffix_of`]. Each type must be in the dump (a type the
+/// dump lacks fails here instead of passing with nothing compared), with
+/// ggml's tensor count for it equal to the loader's.
 #[test]
 #[ignore = "hw: needs V4.1's first shard on the box plus the oracle dump in $BLOOMERY_DATA/ref-dequant-v41[_plain]"]
 fn hw_dequant_matches_ggml_v41() {

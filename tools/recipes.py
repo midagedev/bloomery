@@ -9558,9 +9558,9 @@ def key_self_test(expect, real: Side) -> None:
         model_scope_self_test(expect, roots[0], sa, settings, manifest, os.path.join(tmp, "scope-manifest.txt"))
         # New-code clauses (no base to fail on): a directory the item names with no manifest row is an
         # error; the manifest's union reaches a whole-tree item; every profile spells what it defines.
-        write_manifest([ln for ln in manifest if not ln.startswith("model-dir\t/models/DeepSeek-V4.1-Flash-Q3_K_M\t")])
+        write_manifest([ln for ln in manifest if not ln.startswith("model-dir\t/models/DeepSeek-V4.1-Flash-1017-Q3_K_M\t")])
         miss = keys(sa, only={"gpu": items["gpu"]})["gpu"]
-        expect(miss.startswith("error") and "/models/DeepSeek-V4.1-Flash-Q3_K_M" in miss, f"a directory the item opens, missing from the manifest, was keyed: {miss}")
+        expect(miss.startswith("error") and "/models/DeepSeek-V4.1-Flash-1017-Q3_K_M" in miss, f"a directory the item opens, missing from the manifest, was keyed: {miss}")
         write_manifest(manifest)
         c = KeyContext(sa, mf, "", {}, settings=settings)
         rows = [p for p in c.parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]

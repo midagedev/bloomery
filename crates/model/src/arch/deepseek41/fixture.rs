@@ -74,7 +74,7 @@ pub const FIXTURE_FF: u64 = 512;
 pub const BUDGET_CTX: u64 = workstation::CTX_MAX;
 
 /// The most tensor data a target shard holds. The fixture is about 15 GB, and
-/// the real file is a nine-shard split set: a cap of 4 GiB cuts it into
+/// the real file is a ten-shard split set: a cap of 4 GiB cuts it into
 /// shards with a layer across a boundary, so the engine reads a split set
 /// here too.
 pub const SHARD_BYTES: u64 = 4 << 30;

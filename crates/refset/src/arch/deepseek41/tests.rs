@@ -66,8 +66,11 @@ fn the_cand_family_takes_a_set_of_its_file_build_and_arch() -> Result<(), RefErr
 fn the_cand_family_refuses_a_set_of_another_file() -> Result<(), RefError> {
     let dir = set_dir("file")?;
     let (set, runs) = (dir.display().to_string(), gguf::v41::model());
-    let other = "/models/elsewhere/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
-    match check(&dir, other, CAND_BUILD, ARCH, true) {
+    let shard = Path::new(&runs)
+        .file_name()
+        .expect("the model path names a file");
+    let other = format!("/models/elsewhere/{}", shard.to_string_lossy());
+    match check(&dir, &other, CAND_BUILD, ARCH, true) {
         Err(e @ RefError::Stale { .. }) => {
             let e = e.to_string();
             assert!(

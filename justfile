@@ -1848,7 +1848,7 @@ weekly *ARGS:
 # 회수한 표는 OUT(기본 target/v41-inventory.md)에 놓인다. 문서 사본(https://github.com/midagedev/rig-log/blob/main/docs/bloomery/v41-inventory.md)은 rig-log docs/bloomery/에 있고
 # 이 트리에 쓰지 않는다.
 inventory-v41 OUT='target/v41-inventory.md':
-    ./tools/box.sh 'cargo run --release -p bloomery-gguf --bin gguf-inventory -- --markdown /tmp/v41-inventory.md "$BLOOMERY_V41_DIR"/*-0000*-of-00009.gguf'
+    ./tools/box.sh 'cargo run --release -p bloomery-gguf --bin gguf-inventory -- --markdown /tmp/v41-inventory.md "$BLOOMERY_V41_DIR"/*-of-*.gguf'
     mkdir -p "$(dirname {{OUT}})"
     scp "${BLOOMERY_BOX:-ws}:/tmp/v41-inventory.md" {{OUT}}
 

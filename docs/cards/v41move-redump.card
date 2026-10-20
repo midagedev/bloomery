@@ -1,0 +1,7 @@
+# v41move: the sitting that re-dumps the lease-bound V4.1 reference sets from /models/DeepSeek-V4.1-Flash-1017-Q3_K_M
+# (dump.sh x8 variants, ik-greedy x2, ik-ppl x2, dump-draft). One card for every job of the sitting. Nothing is timed.
+kind: exclusive
+reason: dump_ref, ik-greedy, ik-ppl and dump_draft run ik on 32 CPU threads and page the V4.1 split set in, so
+  each job holds the lease; why now: a reference set is bound to its first shard's full path, so the old
+  Q3_K_M file can be deleted (user approved, 2026-10-20) only after every set that names it is re-dumped
+minutes: 1..4
