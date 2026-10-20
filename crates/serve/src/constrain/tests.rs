@@ -1338,6 +1338,8 @@ fn scripted_in(
     }
 }
 
+// PIN(2026-10-20): the jump tail is not fed and names EOS;
+// compare the cached prefix and stop class instead of full equality.
 /// The ids a generation fed are the prompt's and every id it generated up to
 /// the last one an engine call took, which no call fed: the stop, or the
 /// last id under the bounds, or, past the program's last pick, the pick

@@ -88,20 +88,14 @@ from urllib.parse import urlsplit
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
+sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
 import e2e  # the suite table, `top` (a question's top), the official rows
+from clef_ref import question_options as options, render  # Clef's request conversion, pinned by its self-test
 
 SUITES = e2e.SUITES
 WIRE_SUITES = ("tools/ref/clef/suite-upstream.jsonl", "tools/ref/clef/edge.jsonl")
-
-# Clef's own words (crates/decision/src/encode.rs, crates/decision/src/request.rs).
-CLEF_SYSTEM_PROMPT = (
-    "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that "
-    "field's allowed options."
-)
-NOUL_TRUE = "The proposition is true or the answer is yes."
-NOUL_FALSE = "The proposition is false or the answer is no."
 
 # The instruction line the Qwen prompt carries beside Clef's schema text (the design's §2.1: the Clef schema
 # text re-used, the state alone in the user message, plus one instruction line).
@@ -136,34 +130,10 @@ def fail(why: str) -> None:
 # ---------------------------------------------------------------- the request conversion
 
 
-def render(v) -> str:
-    """Clef's text for one request value (`crates/decision/src/render.rs`): a string passes through, anything else
-    is Python's `json.dumps` with the compact separators and the keys sorted (the encoder's own writer)."""
-    if isinstance(v, str):
-        return v
-    return json.dumps(v, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
 def json_inner(s: str) -> str:
     """A JSON string's body as the server writes it (`crates/serve/src/constrain/schema.rs`'s `json_inner`): the
     string's escapes, a `<` as `\\u003c`."""
     return json.dumps(s, ensure_ascii=False)[1:-1].replace("<", "\\u003c")
-
-
-def options(q: dict) -> list[tuple[str, object]]:
-    """Clef's options of one question (`crates/decision/src/request.rs`'s `options_with`, `Rules::CLEF`): a noul's
-    `true` then `false` (the release's sentences, the criteria's when they give one), a choice's criteria sorted
-    by key (code point order), a score's levels by index."""
-    kind, crit = q["type"], q.get("criteria")
-    if kind == "noul":
-        over = crit if isinstance(crit, dict) else {}
-        out = []
-        for key, default in (("true", NOUL_TRUE), ("false", NOUL_FALSE)):
-            out.append((key, over[key] if key in over else default))
-        return out
-    if kind == "choice":
-        return sorted(crit.items(), key=lambda kv: kv[0])
-    return [(str(i), v) for i, v in enumerate(crit)]
 
 
 def check_request(req: dict, where: str) -> None:
@@ -262,17 +232,22 @@ def clef_body(req: dict) -> dict:
 
 def program_parts(req: dict) -> list[tuple[str, object]]:
     """The answer program as the server's compile sees it (`crates/serve/src/constrain/schema.rs`'s object and
-    enumeration): the forced texts and the picks, in order."""
+    enumeration): the forced texts and the picks, in order. A choice's options are spelled as JSON string bodies,
+    and a one-option enum is forced text, not a pick."""
     parts: list[tuple[str, object]] = [("T", "{")]
     for i, (qid, q) in enumerate(req["questions"].items()):
         sep = "" if i == 0 else ", "
         parts.append(("T", f'{sep}"{json_inner(qid)}": '))
-        if q["type"] == "choice":
-            parts += [("T", '"'), ("P", [k for k, _ in options(q)]), ("T", '"')]
-        elif q["type"] == "score":
-            parts += [("P", [str(n) for n in range(len(options(q)))])]
+        quoted = q["type"] == "choice"
+        vals = [json_inner(k) if quoted else k for k, _ in options(q)]
+        if len(vals) == 1:
+            parts.append(("T", f'"{vals[0]}"' if quoted else vals[0]))
         else:
-            parts += [("P", ["true", "false"])]
+            if quoted:
+                parts.append(("T", '"'))
+            parts.append(("P", vals))
+            if quoted:
+                parts.append(("T", '"'))
     parts.append(("T", "}"))
     return parts
 
@@ -824,7 +799,8 @@ def check_counts(arm: Arm, suite: str, req: dict, obj: dict, reported: dict) -> 
     kind = reported.get("arm")
     if kind not in ("jump", "step"):
         fail(f"{where}: the server reports the arm {kind!r}, not jump or step")
-    toks = stream(arm.program_ids(suite, req), picks_from_answer(req, obj))
+    picks = [k for q, k in zip(req["questions"].values(), picks_from_answer(req, obj)) if len(options(q)) > 1]
+    toks = stream(arm.program_ids(suite, req), picks)
     if "next_after_calls" in reported:
         want = plan_levers(toks) if kind == "jump" else step_levers(toks)
         for key in LEVER_KEYS:
@@ -1204,9 +1180,10 @@ def measure(arms: list[Arm], suites: list[dict], opts: dict) -> int:
             rows.append(row)
     buckets = bucket_of(rows)
     for suite, req in reqs:
-        buckets.setdefault((suite, req["id"]), "short")
+        if (suite, req["id"]) not in buckets:
+            fail(f"{suite}/{req['id']}: no prompt_n; cannot assign a bucket")
     for r in rows:
-        r.setdefault("bucket", buckets.get((r["suite"], r["id"]), "short"))
+        r["bucket"] = buckets[(r["suite"], r["id"])]
     short = [(s, r) for s, r in reqs if buckets[(s, r["id"])] == "short"]
     long = [(s, r) for s, r in reqs if buckets[(s, r["id"])] != "short"]
     print(f"[config] arms={names} rounds={opts['rounds']} rounds_long={opts['rounds_long']} "
@@ -1508,12 +1485,6 @@ def self_test() -> None:
     # words are one id. Was [1, 1, 1].
     check("the picks of an answer", picks_from_answer(req, {"zeta": "b", "level": 1, "flag": True}), [1, 1, 0])
 
-    # --- the rotation (ab-decode's rule: arm k of round r is arm (k + r - 1) mod n).
-    check("the rotation of round 1", [(k + 0) % 3 for k in range(3)], [0, 1, 2])
-    check("the rotation of round 2", [(k + 1) % 3 for k in range(3)], [1, 2, 0])
-    check("the rotation of round 3", [(k + 2) % 3 for k in range(3)], [2, 0, 1])
-    check("the rotation of two arms", [(k + 1) % 2 for k in range(2)], [1, 0])
-
     # --- the call plan and the count check (a byte tokenizer: one id a byte).
     def bytes_tok(text: str) -> list[int]:
         return [ord(c) for c in text]
@@ -1526,13 +1497,17 @@ def self_test() -> None:
             "angry": {"type": "noul"},
         },
     }
-    parts = merged(program_parts(ko))
-    ids = []
-    for kind, body in parts:
-        if kind == "T":
-            ids.append(("F", bytes_tok(str(body))))
-        else:
-            ids.append(("P", [bytes_tok(str(o)) for o in body]))
+    def program_ids_of(tok, req):
+        """The program's ids under a tokenizer: each forced text and each option tokenized on its own."""
+        out = []
+        for kind, body in merged(program_parts(req)):
+            if kind == "T":
+                out.append(("F", tok(str(body))))
+            else:
+                out.append(("P", [tok(str(o)) for o in body]))
+        return out
+
+    ids = program_ids_of(bytes_tok, ko)
     toks = stream(ids, [0, 0])  # "cancel" and "true"
     check("the program's ids", len(toks), 12 + 6 + 12 + 4 + 1)
     calls = plan_jump(toks)
@@ -1707,6 +1682,57 @@ def self_test() -> None:
             bad(what, f"{type(e).__name__}: {e}")
         else:
             bad(what, "it passed")
+
+    # --- the program the server compiles (`schema.rs`'s `enumeration`): a choice's options are spelled as JSON
+    # string bodies (a `<` as `\\u003c`), and a one-option enum is forced text, not a pick.
+    class ProgramArm:
+        name = "fake"
+
+        def __init__(self, tok):
+            self.tok = tok
+
+        def program_ids(self, suite, req):
+            return program_ids_of(self.tok, req)
+
+    def lever_row(lead, tail):
+        return {"arm": "jump", "next_calls": 0, "prefill_calls": 0, "next_after_calls": 0, "lead": lead, "spans": 0,
+                "tail": tail}
+
+    def pair_tok(text):
+        """A tokenizer that merges `x"` into one id, as a vocabulary merges a closing quote into a word."""
+        out, i = [], 0
+        while i < len(text):
+            if text[i:i + 2] == 'x"':
+                out.append(1000)
+                i += 2
+            else:
+                out.append(ord(text[i]))
+                i += 1
+        return out
+
+    def case_option_spelling():
+        esc = {"id": "esc", "state": "s", "questions": {"k": {"type": "choice", "criteria": {"<a": "A", "b": "B"}}}}
+        check("an option with a `<` is the server's spelling", program_ids_of(bytes_tok, esc),
+              [("F", bytes_tok('{"k": "')), ("P", [bytes_tok("\\u003ca"), bytes_tok("b")]), ("F", bytes_tok('"}'))])
+        # 7 forced ids, the decision, 6 more of `\\u003ca`, then `"}`: 16 ids, the tail from the decision is 9.
+        check("a `<` option's levers are the server's", check_counts(ProgramArm(bytes_tok), "en", esc, {"k": "<a"}, lever_row(7, 9)),
+              "the jump levers")
+
+    guarded("an option's spelling", case_option_spelling)
+
+    def case_one_option():
+        one = {"id": "one", "state": "s", "questions": {"only": {"type": "choice", "criteria": {"x": "X"}},
+                                                          "kind": {"type": "choice", "criteria": {"a": "A", "bcd": "B"}}}}
+        check("a one-option enum is forced text with its quotes", merged(program_parts(one)),
+              [("T", '{"only": "x", "kind": "'), ("P", ["a", "bcd"]), ("T", '"}')])
+        score = {"id": "sc", "state": "s", "questions": {"n": {"type": "score", "criteria": ["only"]}}}
+        check("a one-level score is forced text", merged(program_parts(score)), [("T", '{"n": 0}')])
+        # `x"` is one id: the forced text is tokenized whole, so the lead is 22 ids, not the 23 of `"`, `x`, `"`.
+        # The tail is `bcd"}` less its first id's row: the decision id, `c`, `d`, `"`, `}`.
+        check("a one-option enum's quotes merge into its token", check_counts(ProgramArm(pair_tok), "en", one,
+              {"only": "x", "kind": "bcd"}, lever_row(22, 5)), "the jump levers")
+
+    guarded("a one-option enum", case_one_option)
 
     # The fixture suite: two requests, a choice and a noul in the first, a score in the second.
     fix_rows = [
@@ -2114,6 +2140,11 @@ def self_test() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out, log, arms, text, rc = measure_fix(Path(tmp), [("A", "clef", {}), ("jump", "qwen", {})])
             check("a run with bodies ends clean", rc, 0)
+            # ab-decode's rule, `measure`'s own selection: the first posts in arm order, then round r's request
+            # starts at arm (r - 1) mod n: the short request twice (A jump, jump A), the long once (A jump).
+            check("the measured arm order",
+                  [a for a, method, path in log if method == "POST"],
+                  ["A", "jump", "A", "jump", "A", "jump", "jump", "A", "A", "jump"])
             data = json.loads((out / "rows.json").read_text())
             rows = data["rows"]
             check("a row holds no raw answer", any("_raw" in r for r in rows), False)
@@ -2138,6 +2169,33 @@ def self_test() -> None:
             check("the timed bodies are counted in one line", "[bodies] timed: 4 bodies of 2 arms under " in text, True)
 
     guarded("the timed bodies", case_bodies_timed)
+
+    def case_no_prompt_n():
+        class NoLength(RecClient):
+            """The arms answer the long request with its length and the short one without."""
+
+            def post(self, path, body):
+                status, raw, ms = super().post(path, body)
+                if "Fine." not in json.dumps(body):
+                    resp = json.loads(raw)
+                    del resp["timings"]["prompt_n"]
+                    raw = json.dumps(resp)
+                return status, raw, ms
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log: list = []
+            arms = []
+            for name, kind in (("A", "clef"), ("jump", "qwen")):
+                arm = Arm(name, "http://127.0.0.1:1", kind)
+                arm.client = NoLength(name, log)
+                arms.append(arm)
+            suites = [{"name": "fix", "path": "x", "reqs": fix_rows, "gold": None}]
+            opts = {"rounds": 2, "rounds_long": 1, "out": str(Path(tmp) / "out"), "model": None}
+            refused("a request no arm reported a length for is refused by name", "fix/f-1: no prompt_n",
+                    lambda: measure(arms, suites, opts))
+            check("and no counted round was posted", sum(1 for e in log if e[1] == "POST"), 4)
+
+    guarded("a missing prompt length", case_no_prompt_n)
 
     def pass_start(log):
         return next(i for i, e in enumerate(log) if e[1:] == ("GET", "/props"))

@@ -5,10 +5,8 @@
 #   bash tools/ref/sj-vs-clef.sh
 #   bash tools/ref/sj-vs-clef.sh --self-test
 #
-# What it is. The user's ask (2026-10-20): schemajump — any model answering a schema the way Clef-Flash does —
-# against Clef-Flash, on the time to a complete answer and on agreement. The design is
-# /Users/hckim/orca/briefs/w2300/par/sjfast-files/design.md §4; the cards are docs/cards/sj-{vs-clef,jump-vs-step,
-# levers,calib}-a6000.card.
+# Compare schemajump and Clef-Flash by complete-answer time and agreement.
+# Prediction cards: docs/cards/sj-*.card.
 #
 # The windows. Two 24 GB servers do not fit the A6000 beside Clef, so the Qwen3.6 server runs in two windows of
 # one lease, with Clef repeated in both as the anchor: window 1 is Clef + the Qwen3.6 jump arm (BLOOMERY_SCHEMAJUMP=on
