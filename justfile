@@ -33,7 +33,7 @@ default:
 # 빠른 루프: 타입 검사만, 커널은 안 만든다. 의존을 고친 뒤 cargo가 박스 쪽 Cargo.lock을 고쳐 쓰면 lock-back.sh가
 # 그것을 이 트리로 가져온다 — box.sh는 한 방향으로만 싣는다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-decision/safetensors'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-decision/safetensors'
     ./tools/lock-back.sh
 
 # check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
@@ -41,7 +41,7 @@ check:
 # V4.1 커널의 컴파일러 결함은 여기가 아니라 op 게이트 빌드에서 드러난다.
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-decision/safetensors'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-decision/safetensors'
 
 # The build without `vision` of the bins that refuse an image request by name — serve_seats/ds41.rs:444 and glm.rs:825 (--mmproj),
 # decide.rs:545 (the Qwen3.5 seat's encoder), gate_glm5next_e2e.rs:5146 (--only media-seat). One bin takes one feature set (tools/recipes.py's
@@ -1463,6 +1463,13 @@ gate-gpu-gemma-embedding2-head512:
 # the model's shapes (64/4 and 8/2 heads, θ 5e6): bit for bit the shared host transcription, the cache-position and overflow faults.
 gate-gpu-minimaxm3-rope:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_minimaxm3_rope && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minimaxm3_rope'
+
+# MiniMax-M3's sparse attention (MSA), model-less at the model's shapes (4 index heads, blocks of 128, 16 kept, 64/4 heads of 128):
+# the index heads, the block selection bit for bit against its host twin at the counts across the block boundaries up to 32k, the tie
+# rule, the forced own block, a NaN key; the selected flash against the dense pass at every block kept and within the f64 band past
+# it; the flash's faults.
+gate-gpu-minimaxm3-msa:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features minimaxm3 --release --bin gate_minimaxm3_msa && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minimaxm3_msa'
 
 # Head-256 pack-one prefill, whole inputs and symmetric windows, against the f64 attention band.
 gate-gpu-gemma-embedding-head256:

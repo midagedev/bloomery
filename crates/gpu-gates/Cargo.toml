@@ -52,6 +52,8 @@ bloomery-gpu-mimo2 = { path = "../gpu-mimo2", optional = true }
 # The Solar-Open2 program, reached only through the `solar2` feature (its end-to-end and prefill gates and the
 # `bloomery-serve` seat).
 bloomery-gpu-solar2 = { path = "../gpu-solar2", optional = true }
+# The MiniMax-M3 program, reached only through the `minimaxm3` feature (its sparse-attention gate).
+bloomery-gpu-minimaxm3 = { path = "../gpu-minimaxm3", optional = true }
 # The EmbeddingGemma 2 encoder, reached only through the `gemma-embedding2` feature (its end-to-end
 # gate).
 bloomery-gpu-gemma-embedding2 = { path = "../gpu-gemma-embedding2", optional = true }
@@ -139,6 +141,7 @@ clef = ["gpu", "dep:bloomery-decision", "bloomery-decision/safetensors", "dep:bl
 glm5next = ["deepseek41", "dep:bloomery-gpu-glm5next", "bloomery-app/glm5next"]
 mimo2 = ["gpu", "dep:bloomery-gpu-mimo2", "bloomery-app/mimo2"]
 solar2 = ["gpu", "dep:bloomery-gpu-solar2", "bloomery-app/solar2"]
+minimaxm3 = ["gpu", "dep:bloomery-gpu-minimaxm3"]
 gemma-embedding2 = ["gpu", "gemma4a", "dep:bloomery-gpu-vision", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
 gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
 
@@ -605,6 +608,10 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_minimaxm3_rope"
 required-features = ["gpu"]
+
+[[bin]]
+name = "gate_minimaxm3_msa"
+required-features = ["minimaxm3"]
 
 [[bin]]
 name = "gate_gemma_embedding2_e2e"
