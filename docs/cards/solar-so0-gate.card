@@ -1,0 +1,28 @@
+# Round so0 (Solar-Open2 SO0): which KDA decay-gate formula the Solar-Open2-250B checkpoint was trained with.
+# Upstage's own code carries three: (1) HF torch fallback clamp(-exp(A_log)*softplus(x+dt), min=-5), (2) HF with
+# fla-core lb*sigmoid(exp(A_log)*(x+dt)), lb = -5 (the GLM-5.3 gate our kernel and ik implement), (3) Upstage's vLLM
+# -exp(A_log)*softplus(x+dt), no bound (what the PAI patch ships). Two llama-perplexity builds of llama.cpp 6ea215d17 +
+# the PAI patch (sha256 d2906be2…a538): arm A as shipped = (3), arm B = A with the gate lines replaced by (2); one
+# IQ4_XS file (prometheusAIR, 4 shards in /home/user/stage), wikitext-2 test, n_ctx 512 x 40 chunks (the PAI README's
+# setting, IQ4_XS 4.159), both cards (-ts 2,1, the 2026-09-18 -ot placement), the same flags for both arms.
+# Prior [assumption, design solarread §3.2]: (3) ~80 %, (2) ~15 %, (1) ~5 %. (2) is a different function everywhere
+# (decay e^-2.5 at x = 0), so a wrong gate should move PPL far: B > 4.5 or non-finite [assumption: the gap's size is
+# not derivable]. Both llama-perplexity builds run before the lease. The lease holds only the two arms, ~4 min each
+# [derived]: 20,480 tokens at the 09-18 pp 176 tok/s = 116 s, plus the --no-mmap load of 136 GB.
+kind: profile
+question: is the Solar-Open2 KDA decay gate (3) -exp(A_log)*softplus(x+dt) as Upstage's vLLM and the PAI patch ship
+  it, or GLM-5.3's (2) lb*sigmoid(exp(A_log)*(x+dt))?
+term: PPL(B) - PPL(A), wikitext-2 test perplexity @ n_ctx 512, 40 chunks, Solar-Open2-250B IQ4_XS (prometheusAIR),
+  llama.cpp 6ea215d17 + PAI patch, A6000 + 3090 -ts 2,1
+unit: PPL
+predict: 0.3..50
+condition: both arms in one lease, the same file, flags, chunks and placement; the two trees differ by exactly the
+  gate lines of src/models/solar-open2.cpp (the diff is printed in the log); arm A must reproduce the PAI README's
+  4.159 within 0.05, or the sitting is void (wrong file or tree) and nothing is decided; a non-finite PPL(B) counts
+  as above the band
+decide-in: (3) is the trained gate: Solar's KDA takes the softplus decay as a description field (SO3 builds that
+  variant beside GLM's), and the PAI tree stays the real-weight oracle as shipped
+decide-below: below -0.1, (2) is the trained gate: Solar reuses GLM's gate kernel unchanged and SO3 drops the softplus
+  variant; from -0.1 to 0.3, keep (3) (vLLM is Upstage's production path) and file the gate as an open item in
+  plan-triage with both PPLs
+decide-above: same action as decide-in, and note the arm-B PPL (or its non-finite chunk) as the size of the gap
