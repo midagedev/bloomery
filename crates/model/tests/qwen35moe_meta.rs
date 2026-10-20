@@ -40,14 +40,16 @@ const VIEW: &[&str] = &[
 
 // PIN(2026-09-27): each file's chat line (its template's bytes differ).
 // PIN(2026-10-19): both lines gained the family's bound parsers, `tools Some(QwenXml) reasoning
-// Some(ThinkSpan)` (`arch::qwen35moe::spec::chat`): both templates teach `<tool_call>` with
+// Some(ThinkSpan { .. })` (`arch::qwen35moe::spec::chat`): both templates teach `<tool_call>` with
 // `<function=` and `<parameter=` and a `<think>` span, and `crates/serve` parses them from the
 // template. Re-pin by specification, not a relaxation: the line states the reader's binding, which
 // the coverage list below checks. FAIL-first: the binding removed leaves both lines at `None`.
-const CHAT_Q4KM: &str =
-    "chat pre qwen35 template bytes 7764 tools Some(QwenXml) reasoning Some(ThinkSpan)";
-const CHAT_UD: &str =
-    "chat pre qwen35 template bytes 8057 tools Some(QwenXml) reasoning Some(ThinkSpan)";
+// PIN(2026-10-20): the reasoning field prints its tags (`ReasoningFormat::ThinkSpan` carries
+// them); the values are the same.
+const CHAT_Q4KM: &str = "chat pre qwen35 template bytes 7764 tools Some(QwenXml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })";
+// PIN(2026-10-20): the reasoning field prints its tags (`ReasoningFormat::ThinkSpan` carries
+// them); the values are the same.
+const CHAT_UD: &str = "chat pre qwen35 template bytes 8057 tools Some(QwenXml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })";
 
 // PIN(2026-09-27): the keys the reader took a default for, on both files.
 // PIN(2026-10-10): `nextn_predict_layers = 0` joined the list on both files: the key is absent from
@@ -181,8 +183,9 @@ const DENSE_27B: &str = "/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf";
 
 // PIN(2026-10-19): the dense file's chat line, as the Qwen3.6 files' above: the family's bound
 // parsers (`arch::qwen35moe::spec::chat`), the template's bytes this file's own.
-const CHAT_27B: &str =
-    "chat pre qwen35 template bytes 8952 tools Some(QwenXml) reasoning Some(ThinkSpan)";
+// PIN(2026-10-20): the reasoning field prints its tags (`ReasoningFormat::ThinkSpan` carries
+// them); the values are the same.
+const CHAT_27B: &str = "chat pre qwen35 template bytes 8952 tools Some(QwenXml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })";
 
 /// The dense file's chat surface and what the coverage check lists for it: the family's markup
 /// is bound, and no item is left (every tensor is Q4_K, Q6_K or F32, which Body35 serves). The

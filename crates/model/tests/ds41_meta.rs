@@ -1026,7 +1026,9 @@ const V41_VIEW: &[&str] = &[
     "layers 40 mtp 0",
     "hc Some(HcSpec { streams: 4, kind: Mhc { sinkhorn: 20, eps: 1e-6, mix: Lagged, collapse: LastMix } })",
     "engram Some(EngramSpec { heads: 8, max_ngram: 4, key_length: 256, rule: Engram })",
-    "chat pre joyai-llm template bytes 6945 tools Some(Dsml) reasoning Some(ThinkSpan)",
+    // PIN(2026-10-20): the reasoning field prints its tags (`ReasoningFormat::ThinkSpan` carries
+    // them); the values are the same.
+    "chat pre joyai-llm template bytes 6945 tools Some(Dsml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })",
     "[0] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
     "[1] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc [Engram]",
     "[2,8] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r2 Own{g1 a0 o0} | sel 32x128 k512 keys Own list Own cand None || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",

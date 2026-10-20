@@ -78,7 +78,7 @@ fn hw_nemotron_h_header() {
         bad.push(format!("pre {}", s.chat.pre));
     }
     if s.chat.tools != Some(models::ToolFormat::QwenXml)
-        || s.chat.reasoning != Some(models::ReasoningFormat::ThinkSpan)
+        || s.chat.reasoning != Some(models::ReasoningFormat::THINK)
     {
         bad.push(format!(
             "chat tools {:?} reasoning {:?}",

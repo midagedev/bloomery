@@ -489,7 +489,7 @@ impl PlanInputs {
     ) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
-        let chat = chat_of(split, spec::TOOLS, Some(models::ReasoningFormat::ThinkSpan))?;
+        let chat = chat_of(split, spec::TOOLS, Some(models::ReasoningFormat::THINK))?;
         let spec = spec::spec_of(&hp, &model, chat)?;
         let kv = KvLayout::of(&hp);
         let room = room()?;

@@ -43,7 +43,7 @@ const TOOLS: Option<ToolFormat> = Some(ToolFormat::QwenXml);
 /// The chat surface of `split`, for every variant: the pre-tokenizer and
 /// template it carries, the [`TOOLS`] and the `<think>` span.
 pub(super) fn chat(split: &Split) -> Result<ChatSpec, PlacementError> {
-    chat_of(split, TOOLS, Some(ReasoningFormat::ThinkSpan))
+    chat_of(split, TOOLS, Some(ReasoningFormat::THINK))
 }
 
 /// `split`'s description and roles, and the defaults the key read took.

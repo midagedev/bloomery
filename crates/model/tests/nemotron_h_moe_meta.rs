@@ -174,7 +174,7 @@ fn hw_nemotron_h_moe_header() {
     }
     if s.chat.pre != "pixtral"
         || s.chat.tools != Some(ToolFormat::QwenXml)
-        || s.chat.reasoning != Some(models::ReasoningFormat::ThinkSpan)
+        || s.chat.reasoning != Some(models::ReasoningFormat::THINK)
     {
         bad.push(format!(
             "chat pre {} tools {:?} reasoning {:?}",

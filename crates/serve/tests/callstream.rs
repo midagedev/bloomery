@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use serve::ScriptedEngine;
 use serve::callstream::CallPiece;
 use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, Tools};
-use serve::glmxml::ArgTypes;
+use serve::glmxml::{ArgTypes, KvSpelling};
 use serve::qwenxml::ParamKinds;
 use serve::reasoning::ReasoningFormat;
 
@@ -102,7 +102,7 @@ fn cases() -> Vec<Case> {
                  <arg_key>mode</arg_key><arg_value>420</arg_value>\
                  <arg_key>content</arg_key><arg_value>{c}</arg_value></tool_call>"
             ),
-            tools: Tools::GlmXml(ArgTypes::of_tools(Some(&tools()))),
+            tools: Tools::KvMarkup(KvSpelling::Glm, ArgTypes::of_tools(Some(&tools()))),
         },
         Case {
             label: "qwen",

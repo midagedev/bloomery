@@ -526,7 +526,9 @@ const V4_VIEW: &[&str] = &[
     "layers 43 mtp 0",
     "hc Some(HcSpec { streams: 4, kind: Mhc { sinkhorn: 20, eps: 1e-6, mix: Own, collapse: Head } })",
     "engram None",
-    "chat pre joyai-llm template bytes 13772 tools Some(Dsml) reasoning Some(ThinkSpan)",
+    // PIN(2026-10-20): the reasoning field prints its tags (`ReasoningFormat::ThinkSpan` carries
+    // them); the values are the same.
+    "chat pre joyai-llm template bytes 13772 tools Some(Dsml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })",
     "[0-1] latent h 64 q 1024 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn true out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 256/6 ff 2048 swiglu Some(10.0) SqrtSoftplus bias false norm true x1.5 hash true shared 2048 swiglu Some(10.0) gate false || hc",
     "[2] latent h 64 q 1024 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn true out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r4 Own{g1 a1 o1} | sel 64x128 k512 keys Own{icmp Compressor { gated: true, ape: true, overlap: true }} list Own cand None || moe 256/6 ff 2048 swiglu Some(10.0) SqrtSoftplus bias false norm true x1.5 hash true shared 2048 swiglu Some(10.0) gate false || hc",
     "[3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39,41] latent h 64 q 1024 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn true out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r128 Own{g1 a1 o0} || moe 256/6 ff 2048 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2048 swiglu Some(10.0) gate false || hc",

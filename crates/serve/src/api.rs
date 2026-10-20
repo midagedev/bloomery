@@ -81,7 +81,7 @@ use crate::http::{self, EventStream, Request};
 use crate::media::{self, ExpandError, MediaError, Medium, Prompt, SharedMediaModel, VideoCtx};
 use crate::models::Listed;
 use crate::qwenxml::ParamKinds;
-use crate::reasoning::{ReasoningFormat, ThinkEntry};
+use crate::reasoning::{ReasoningFormat, ThinkEntry, ThinkTags};
 use crate::sampling;
 use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
@@ -368,6 +368,7 @@ impl Server {
             tool_format: ToolFormat::of_chat_template(&template),
             object_arguments: needs_object_arguments(&template),
             thinking_off,
+            think: ThinkTags::THINK,
             template,
             alias: config.model_alias,
             model_path: config.model_path,
@@ -413,6 +414,19 @@ impl Server {
         Arc::get_mut(&mut self.state)
             .expect("the state is shared only once the server starts")
             .video = video;
+        self
+    }
+
+    /// The server with `think` as the tags of the model's think span, in place
+    /// of `<think>` and `</think>`: a seat gives the pair its model's
+    /// description names (`models::ReasoningFormat::ThinkSpan`). The reasoning
+    /// split, the budget's start state and forced close, and the close a
+    /// structured-output request writes first read them.
+    #[must_use]
+    pub fn with_think_tags(mut self, think: ThinkTags) -> Server {
+        Arc::get_mut(&mut self.state)
+            .expect("the state is shared only once the server starts")
+            .think = think;
         self
     }
 
@@ -513,6 +527,9 @@ struct State {
     /// How the template answers `reasoning_effort: "none"`
     /// ([`probe_thinking_off`]), decided once.
     thinking_off: ThinkingOff,
+    /// The tags of the model's think span, `<think>` and `</think>` until a
+    /// seat names others ([`Server::with_think_tags`]).
+    think: ThinkTags,
     alias: String,
     model_path: String,
     /// `/props`' `engine` object, built when the server binds.
@@ -1624,6 +1641,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             tok: &*state.tok,
             vocab: &state.vocab,
             format: state.tool_format,
+            think: state.think,
         },
     )
     .map_err(|r| {
@@ -1717,6 +1735,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         cache_prompt: get_b(o, "cache_prompt")?.unwrap_or(true),
         reasoning_budget,
         think_entry: ThinkEntry::Closed,
+        think: state.think,
         logprobs: None,
         constraint,
     };
@@ -1789,8 +1808,8 @@ fn reasoning_budget(o: &Map<String, Value>) -> Result<Option<usize>, ApiError> {
 /// A JSON value's type, for a field's refusal naming what it got.
 use ::embed::request::json_type;
 
-/// The think-span budget lives only where a span can open: a prompt that
-/// ends with the start tag starts the model inside it, one that ends with
+/// The think-span budget lives only where a span can open, `p.think`'s span
+/// (the server's tags): a prompt that ends with the start tag starts the model inside it, one that ends with
 /// the closed span (the template with thinking off) has no reasoning to cap,
 /// so the budget is silently ignored there — llama-server ignores
 /// `--reasoning-budget` when thinking is already off by other means — and one
@@ -1800,7 +1819,7 @@ use ::embed::request::json_type;
 /// budget: the ids before a model-opened span spend nothing, and its close
 /// ids are not forced until the span opens.
 fn gate_reasoning_budget(p: &mut GenParams, prompt: &str) {
-    p.think_entry = ThinkEntry::of_prompt(prompt);
+    p.think_entry = ThinkEntry::of_prompt_with(prompt, p.think);
     if p.reasoning_budget.is_some() && p.think_entry == ThinkEntry::Closed {
         p.reasoning_budget = None;
     }
@@ -1862,7 +1881,7 @@ fn generation_settings(state: &State, p: &GenParams) -> Value {
 }
 
 /// The settings a request with an empty body would get (seed shown as llama-server's default).
-fn default_params() -> GenParams {
+fn default_params(state: &State) -> GenParams {
     GenParams {
         n_predict: -1,
         sampling: SamplingParams::default(),
@@ -1875,6 +1894,7 @@ fn default_params() -> GenParams {
         cache_prompt: true,
         reasoning_budget: None,
         think_entry: ThinkEntry::Closed,
+        think: state.think,
         logprobs: None,
         constraint: None,
     }
@@ -1923,7 +1943,7 @@ fn props(state: &State) -> Value {
         "model_alias": state.alias,
         "model_path": state.model_path,
         "model_name": state.alias,
-        "default_generation_settings": generation_settings(state, &default_params()),
+        "default_generation_settings": generation_settings(state, &default_params(state)),
         "total_slots": state.parallel,
         "chat_template": state.template.source(),
         "thinking_off": state.thinking_off.word(),
@@ -2083,7 +2103,7 @@ fn slots(state: &State) -> Value {
             };
             let mut v = match &s.settings {
                 Value::Object(_) => s.settings.clone(),
-                _ => generation_settings(state, &default_params()),
+                _ => generation_settings(state, &default_params(state)),
             };
             if let Value::Object(m) = &mut v {
                 m.insert("id".into(), json!(id));
@@ -3699,7 +3719,9 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
     }
     Ok(Some(match state.tool_format {
         ToolFormat::Dsml(spelling) => Tools::Dsml(spelling),
-        ToolFormat::GlmXml => Tools::GlmXml(ArgTypes::of_tools(b.get("tools"))),
+        ToolFormat::KvMarkup(spelling) => {
+            Tools::KvMarkup(spelling, ArgTypes::of_tools(b.get("tools")))
+        }
         ToolFormat::Hermes => Tools::Hermes,
         ToolFormat::QwenXml => Tools::QwenXml(ParamKinds::of_tools(b.get("tools"))),
         ToolFormat::Unparsed => {
@@ -3708,8 +3730,9 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
                 code: 501,
                 kind: "not_supported_error",
                 message: "the chat template's tool-call markup has no parser in this server \
-                          (DSML, GLM's, Hermes' and Qwen's XML are parsed): send the request \
-                          without tools or with tool_choice \"none\""
+                          (DSML, GLM's and Solar's key/value markup, Hermes' and Qwen's XML \
+                          are parsed): send the request without tools or with tool_choice \
+                          \"none\""
                     .to_owned(),
             });
         }
@@ -3772,7 +3795,8 @@ fn chat_plan(
     let (text, input) = chat_input(state, b)?;
     let tools = tool_scan(state, b)?;
     gate_reasoning_budget(&mut p, &text);
-    let parser = ChatParser::with_tools(&text, format, tools).for_template(state.tool_format);
+    let parser =
+        ChatParser::with_tags(&text, format, tools, state.think).for_template(state.tool_format);
     Ok(ChatPlan {
         p,
         input,
@@ -4018,13 +4042,14 @@ mod tests {
 
     use super::{
         ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, End, Engine, EngineProps, Park,
-        ServeError, SlotConfig, SlotQueue, Stop, ThinkingOff, after_accept_error, argv_redacted,
-        carries_media, check_slots, content_text, deny_line, engine_object, id_half, media_error,
-        needs_object_arguments, probe_thinking_off, shutdown_allowed,
+        ServeError, Server, SlotConfig, SlotQueue, Stop, ThinkingOff, after_accept_error,
+        argv_redacted, carries_media, check_slots, content_text, deny_line, engine_object, id_half,
+        media_error, needs_object_arguments, probe_thinking_off, shutdown_allowed,
     };
     use crate::engine::{DeviceProps, PlacementProps, SamplerRefused, SamplingParams};
     use crate::flag::ApiKeys;
     use crate::media::{ExpandError, MediaError};
+    use crate::reasoning::ThinkTags;
     use jinja::ChatTemplate;
     use serde_json::{Value, json};
     use std::io::{self, Read};
@@ -7463,6 +7488,120 @@ mod tests {
             Some(""),
             "thinking off: the output is content, its opening newlines dropped: {off}"
         );
+    }
+
+    /// Solar-Open2's template on `engine`, served on `tags` when a seat names
+    /// them ([`Server::with_think_tags`]) and on the default `<think>` tags
+    /// otherwise.
+    fn solar_template_server(
+        engine: Box<dyn crate::Engine>,
+        tags: Option<ThinkTags>,
+    ) -> SocketAddr {
+        let config = templated(include_str!("../tests/fixtures/solar-chat-template.jinja"));
+        let mut server = Server::bind("127.0.0.1:0", engine, config).expect("bind");
+        if let Some(tags) = tags {
+            server = server.with_think_tags(tags);
+        }
+        server.spawn().expect("spawn")
+    }
+
+    /// The `message` of a chat answer to `body` on `addr`.
+    fn chat_message(addr: SocketAddr, body: &str) -> Value {
+        let (status, text) = roundtrip(addr, "POST", "/v1/chat/completions", body);
+        assert_eq!(status, 200, "{text}");
+        serde_json::from_str::<Value>(&text).expect("JSON")["choices"][0]["message"].clone()
+    }
+
+    /// The split reads the tags a seat names ([`Server::with_think_tags`]).
+    /// Solar-Open2's template ends its generation prompt with `<|think:start|>`,
+    /// so the output starts inside the span and `<|think:end|>` ends it. A
+    /// server on the default `<think>` tags reads that prompt as one that leaves
+    /// the span to the model, and the whole output is content. With
+    /// `reasoning_effort: "low"` the prompt closes the span itself and nothing is
+    /// split, on either tags.
+    #[test]
+    fn a_seat_names_the_think_tags_the_split_reads() {
+        let message = |tags: Option<ThinkTags>, effort: &str| {
+            let engine = crate::ScriptedEngine::new(4096, "Add.<|think:end|>Four.");
+            let addr = solar_template_server(Box::new(engine), tags);
+            chat_message(
+                addr,
+                &format!(
+                    "{{\"messages\":[{{\"role\":\"user\",\"content\":\"2+2?\"}}],\
+                     \"temperature\":0,\"max_tokens\":64{effort}}}"
+                ),
+            )
+        };
+        let solar = message(Some(ThinkTags::SOLAR), "");
+        assert_eq!(solar["reasoning_content"], "Add.", "{solar}");
+        assert_eq!(solar["content"], "Four.", "{solar}");
+        let default = message(None, "");
+        assert!(default.get("reasoning_content").is_none(), "{default}");
+        assert_eq!(default["content"], "Add.<|think:end|>Four.", "{default}");
+        let off = message(Some(ThinkTags::SOLAR), ",\"reasoning_effort\":\"none\"");
+        assert!(off.get("reasoning_content").is_none(), "{off}");
+        assert_eq!(off["content"], "Add.<|think:end|>Four.", "{off}");
+    }
+
+    /// A structured-output request on a prompt that left the span open has it
+    /// closed first, with the seat's close: on Solar-Open2's tags the
+    /// generation opens with `<|think:end|>`, so the document is the content
+    /// and nothing is reasoning. A close on the default tags would stay inside
+    /// the seat's span and the document would be reasoning.
+    #[test]
+    fn a_seats_close_precedes_a_structured_output_program() {
+        let addr = solar_template_server(
+            Box::new(crate::MockEngine::new(4096)),
+            Some(ThinkTags::SOLAR),
+        );
+        let m = chat_message(
+            addr,
+            r#"{"messages":[{"role":"user","content":"ok?"}],"max_tokens":64,
+                "response_format":{"type":"json_schema",
+                "json_schema":{"name":"r","schema":{"type":"boolean"}}}}"#,
+        );
+        let content = m["content"].as_str().unwrap_or_default().trim();
+        assert!(["true", "false"].contains(&content), "{m}");
+        assert_eq!(
+            m["reasoning_content"].as_str().unwrap_or_default(),
+            "",
+            "{m}"
+        );
+    }
+
+    /// The think budget runs on the seat's tags. A script that never closes
+    /// its span, `reasoning_budget` 4: the first four ids are the reasoning
+    /// and `<|think:end|>` is forced in place of the next 13 (the mock spells
+    /// it a byte an id), so the content resumes after them. A script that
+    /// closes the span itself inside a budget it does not spend: the tracker
+    /// reads the seat's close, retires, and forces nothing.
+    #[test]
+    fn a_seats_tags_close_and_retire_the_reasoning_budget() {
+        const SCRIPT: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let budgeted = |script: &str, budget: usize| {
+            let addr = solar_template_server(
+                Box::new(crate::ScriptedEngine::new(4096, script)),
+                Some(ThinkTags::SOLAR),
+            );
+            chat_message(
+                addr,
+                &format!(
+                    "{{\"messages\":[{{\"role\":\"user\",\"content\":\"q\"}}],\
+                     \"temperature\":0,\"max_tokens\":64,\"reasoning_budget\":{budget}}}"
+                ),
+            )
+        };
+        let capped = budgeted(SCRIPT, 4);
+        assert_eq!(capped["reasoning_content"], "abcd", "{capped}");
+        assert_eq!(
+            capped["content"],
+            SCRIPT[4 + ThinkTags::SOLAR.close.len()..],
+            "{capped}"
+        );
+        let closed = format!("ab{}{}", ThinkTags::SOLAR.close, &SCRIPT[..24]);
+        let natural = budgeted(&closed, 20);
+        assert_eq!(natural["reasoning_content"], "ab", "{natural}");
+        assert_eq!(natural["content"], SCRIPT[..24], "{natural}");
     }
 
     /// The media part's refusals are the request's 400 with the error's own text. An empty span

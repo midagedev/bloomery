@@ -1,6 +1,6 @@
 //! The pre-tokenizers of the vocabularies this crate runs, as the reference
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
-//! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`), [`Pre::Glm4`] (`glm4`),
+//! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`), [`Pre::Glm4`] (`glm4`),
 //! [`Pre::Qwen35`] (`qwen35`), [`Pre::Pixtral`] (`pixtral`) and
 //! [`Pre::Gemma4`] (`gemma4`).
 //!
@@ -339,7 +339,8 @@ pub(crate) struct Scratch {
 pub(crate) enum Pre {
     /// `deepseek-v3`, `hunyuan-dense`, `joyai-llm`: three regexes in turn.
     DeepseekV3,
-    /// `qwen2`: the reference's hand-written splitter, one number a word.
+    /// `qwen2`, `solar-open`: the reference's hand-written splitter, one number
+    /// a word. Solar's `tokenizer.json` carries qwen2's regex verbatim.
     Qwen2,
     /// `glm4`: the reference's llama3 splitter, qwen2's with up to three
     /// numbers a word.
@@ -361,11 +362,12 @@ pub(crate) enum Pre {
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 8] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 9] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
         ("qwen2", Pre::Qwen2),
+        ("solar-open", Pre::Qwen2),
         ("glm4", Pre::Glm4),
         ("qwen35", Pre::Qwen35),
         ("pixtral", Pre::Pixtral),
@@ -603,6 +605,13 @@ mod tests {
             assert!(refusal.contains(name), "{name} not in: {refusal}");
         }
         assert!(!crate::runs_pre_tokenizer("gpt-4o"));
+    }
+
+    /// `solar-open` runs the qwen2 splitter: Solar-Open2's `tokenizer.json`
+    /// pre-tokenizer is qwen2's regex, character for character.
+    #[test]
+    fn solar_open_is_qwen2() {
+        assert_eq!(crate::named(&Pre::NAMES, "solar-open"), Some(Pre::Qwen2));
     }
 
     fn words(pre: Pre, text: &str) -> Vec<String> {

@@ -2725,7 +2725,7 @@ mod tests {
             pre: "qwen2".to_string(),
             template: Some("{{ messages }}".to_string()),
             tools: spec::TOOLS,
-            reasoning: Some(models::ReasoningFormat::ThinkSpan),
+            reasoning: Some(models::ReasoningFormat::THINK),
         };
         let spec = spec::spec_of(&hp, &model, chat).expect("the real shapes describe");
         (spec, model)

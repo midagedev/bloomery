@@ -44,7 +44,9 @@ const VIEW: &[&str] = &[
     "layers 48 mtp 0",
     "hc None",
     "engram None",
-    "chat pre qwen2 template bytes 3867 tools Some(QwenXml) reasoning Some(ThinkSpan)",
+    // PIN(2026-10-20): the reasoning field prints its tags (`ReasoningFormat::ThinkSpan` carries
+    // them); the values are the same.
+    "chat pre qwen2 template bytes 3867 tools Some(QwenXml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })",
     "[0] gqa 64/4 x 192 v 128 rope Neox 64 base 10000000 yarn - qk_norm false out_gate false vscale 0.707 || dense 16384 swiglu None || plain",
     "[5,11,17,23,29,35,41,47] gqa 64/4 x 192 v 128 rope Neox 64 base 10000000 yarn - qk_norm false out_gate false vscale 0.707 || moe 256/8 ff 2048 swiglu None Sigmoid bias true norm true x1 hash false || plain",
     "[1-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46] gqa 64/8 x 192 v 128 rope Neox 64 base 10000 yarn - qk_norm false out_gate false win 128 sinks vscale 0.707 || moe 256/8 ff 2048 swiglu None Sigmoid bias true norm true x1 hash false || plain",

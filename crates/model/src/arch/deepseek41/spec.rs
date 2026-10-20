@@ -43,11 +43,7 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
 /// `split`'s chat surface: V4.1's parsers, the DSML tool calls and the
 /// `<think>` span, for any template.
 pub fn chat(split: &Split) -> Result<models::ChatSpec, PlacementError> {
-    chat_of(
-        split,
-        Some(ToolFormat::Dsml),
-        Some(ReasoningFormat::ThinkSpan),
-    )
+    chat_of(split, Some(ToolFormat::Dsml), Some(ReasoningFormat::THINK))
 }
 
 /// The description of the file `hp` and `tensors` were read from, with the

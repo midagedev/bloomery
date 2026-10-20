@@ -722,8 +722,21 @@ pub enum ToolFormat {
 /// A reasoning span syntax.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningFormat {
-    /// `<think>…</think>`.
-    ThinkSpan,
+    /// The reasoning between two tags the model writes: `open` starts it and
+    /// `close` ends it. The tags are in the model's vocabulary, so the
+    /// description names them and the output parser reads them from it.
+    ThinkSpan {
+        open: &'static str,
+        close: &'static str,
+    },
+}
+
+impl ReasoningFormat {
+    /// `<think>…</think>`: V4.1's, GLM's, Qwen's, MiMo's and Nemotron's.
+    pub const THINK: ReasoningFormat = ReasoningFormat::ThinkSpan {
+        open: "<think>",
+        close: "</think>",
+    };
 }
 
 /// A draft, read to be paired with a target.

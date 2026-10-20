@@ -1447,7 +1447,7 @@ pub(super) mod tests {
             );
             assert_eq!(
                 read.spec.chat.reasoning,
-                Some(models::ReasoningFormat::ThinkSpan),
+                Some(models::ReasoningFormat::THINK),
                 "{arch}"
             );
             let parser = "a tool-call parser for this template";

@@ -16,12 +16,16 @@ use crate::engine::{Decoder, Engine, EngineError, SamplingParams, Tokenizer};
 use crate::genloop::{
     Event, GenError, GenParams, Outcome, Slot, StopKind, Timings, generate, generate_in_quanta,
 };
-use crate::glmxml::{ArgTypes, GlmScan};
+use crate::glmxml::{ArgTypes, KvScan, KvSpelling};
 use crate::hermes::HermesScan;
 use crate::mock::SPECIALS;
 use crate::qwenxml::{ParamKinds, QwenScan};
-use crate::reasoning::{ReasoningFormat, ThinkEntry};
+use crate::reasoning::{ReasoningFormat, ThinkEntry, ThinkTags};
 use crate::sampling;
+
+/// The key/value markup in each spelling.
+const GLM: ToolFormat = ToolFormat::KvMarkup(KvSpelling::Glm);
+const SOLAR: ToolFormat = ToolFormat::KvMarkup(KvSpelling::Solar);
 
 /// The mock's ids: its specials, then a byte each, then these pieces.
 const BYTES: u32 = SPECIALS.len() as u32;
@@ -207,6 +211,7 @@ fn params(constraint: Option<Constraint>, think: ThinkEntry) -> GenParams {
         cache_prompt: true,
         reasoning_budget: None,
         think_entry: think,
+        think: ThinkTags::THINK,
         logprobs: None,
         constraint,
     }
@@ -268,6 +273,7 @@ fn build(
             tok: &**tok,
             vocab: &vocab,
             format,
+            think: ThinkTags::THINK,
         },
     )
     .map(|c| c.expect("the body asks for a constraint"))
@@ -543,8 +549,14 @@ fn each_refusal_names_its_field() {
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "f", "parameters":
             {"type": "object", "properties": {"q": {"enum": ["a"]}}}}}]}),
-            ToolFormat::GlmXml,
+            GLM,
             "under \"type\": \"string\"",
+        ),
+        (
+            json!({"tool_choice": "required", "tools": [{"function": {"name": "f", "parameters":
+            {"type": "object", "properties": {"q": {"enum": ["a"]}}}}}]}),
+            SOLAR,
+            "Solar's tool markup reads a text value as text only under \"type\": \"string\"",
         ),
     ];
     for (body, format, needle) in cases {
@@ -586,9 +598,13 @@ fn markup(format: ToolFormat) -> [String; 2] {
             "<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>",
             "<tool_call>\n<function=search>\n<parameter=query>\ncats\n</parameter>\n<parameter=deep>\nfalse\n</parameter>\n</function>\n</tool_call>",
         ],
-        ToolFormat::GlmXml => [
+        GLM => [
             "<tool_call>get_weather<arg_key>unit</arg_key><arg_value>celsius</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call>",
             "<tool_call>search<arg_key>query</arg_key><arg_value>cats</arg_value><arg_key>deep</arg_key><arg_value>false</arg_value></tool_call>",
+        ],
+        SOLAR => [
+            "<|tool_call:start|>get_weather\n<|tool_arg:start|>unit<|tool_arg:value|>celsius<|tool_arg:end|>\n<|tool_arg:start|>days<|tool_arg:value|>2<|tool_arg:end|>\n<|tool_call:end|>",
+            "<|tool_call:start|>search\n<|tool_arg:start|>query<|tool_arg:value|>cats<|tool_arg:end|>\n<|tool_arg:start|>deep<|tool_arg:value|>false<|tool_arg:end|>\n<|tool_call:end|>",
         ],
         ToolFormat::Dsml(_) => [
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
@@ -621,8 +637,8 @@ fn scanned(format: ToolFormat, tools: &Value, text: &str) -> Vec<(String, Value)
             out.calls.extend(s.finish().expect("closes").calls);
             out
         }
-        ToolFormat::GlmXml => {
-            let mut s = GlmScan::new(ArgTypes::of_tools(Some(tools)));
+        ToolFormat::KvMarkup(spelling) => {
+            let mut s = KvScan::new(spelling, ArgTypes::of_tools(Some(tools)));
             let mut out = s.push(text).expect("parses");
             out.calls.extend(s.finish().expect("closes").calls);
             out
@@ -663,7 +679,8 @@ fn each_formats_inverse_reads_back_through_its_scanner() {
     for format in [
         ToolFormat::Hermes,
         ToolFormat::QwenXml,
-        ToolFormat::GlmXml,
+        GLM,
+        SOLAR,
         ToolFormat::Dsml(Spelling::Joined),
         ToolFormat::Dsml(Spelling::Spaced),
     ] {
@@ -723,7 +740,8 @@ fn a_forced_call_obeys_the_tools_when_greedy_does_not() {
     for format in [
         ToolFormat::Hermes,
         ToolFormat::QwenXml,
-        ToolFormat::GlmXml,
+        GLM,
+        SOLAR,
         ToolFormat::Dsml(Spelling::Joined),
         ToolFormat::Dsml(Spelling::Spaced),
     ] {
@@ -758,16 +776,17 @@ fn call_body(params: &Value) -> Value {
         {"type": "function", "function": {"name": "f", "parameters": params}}]})
 }
 
-const FORMATS: [ToolFormat; 5] = [
+const FORMATS: [ToolFormat; 6] = [
     ToolFormat::Hermes,
     ToolFormat::QwenXml,
-    ToolFormat::GlmXml,
+    GLM,
+    SOLAR,
     ToolFormat::Dsml(Spelling::Joined),
     ToolFormat::Dsml(Spelling::Spaced),
 ];
 
 /// Every closing tag a chat format's scanner looks for, in one string.
-const TAGS: &str = "x</tool_call></arg_value></｜DSML｜parameter></｜DSML｜ parameter>\n</parameter>\n</function>y";
+const TAGS: &str = "x</tool_call></arg_value><|tool_arg:end|><|tool_call:end|></｜DSML｜parameter></｜DSML｜ parameter>\n</parameter>\n</function>y";
 
 /// A stop id in the program would end the generation with the program
 /// unspent and call it a clean stop: the text that tokenises to one is
@@ -928,7 +947,8 @@ fn a_raw_literal_with_an_angle_bracket_is_refused() {
         let body = call_body(&json!({"type": "object", "properties": {"q": q}}));
         for format in [
             ToolFormat::QwenXml,
-            ToolFormat::GlmXml,
+            GLM,
+            SOLAR,
             ToolFormat::Dsml(Spelling::Joined),
             ToolFormat::Dsml(Spelling::Spaced),
         ] {
@@ -944,7 +964,7 @@ fn a_raw_literal_with_an_angle_bracket_is_refused() {
 
 /// A literal that holds every closing tag reads back whole through each
 /// format's own scanner: as a JSON string inside an object argument in all
-/// four, and as the argument itself in Hermes.
+/// but Hermes, and as the argument itself in Hermes.
 #[test]
 fn a_literal_with_closing_tags_reads_back_through_each_scanner() {
     let tok = bytes_tok();
@@ -985,7 +1005,8 @@ fn a_free_string_cannot_spell_its_formats_closing_tag() {
     let tags = [
         (ToolFormat::Hermes, "</tool_call>"),
         (ToolFormat::QwenXml, "\n</parameter>\n"),
-        (ToolFormat::GlmXml, "</arg_value>"),
+        (GLM, "</arg_value>"),
+        (SOLAR, "<|tool_arg:end|>"),
         (ToolFormat::Dsml(Spelling::Joined), "</｜DSML｜parameter>"),
         (ToolFormat::Dsml(Spelling::Spaced), "</｜DSML｜ parameter>"),
     ];
@@ -1039,7 +1060,9 @@ fn parsed(format: ToolFormat, tools: &Value, text: &str) -> Result<(String, usiz
     let scan = match format {
         ToolFormat::Hermes => Tools::Hermes,
         ToolFormat::QwenXml => Tools::QwenXml(ParamKinds::of_tools(Some(tools))),
-        ToolFormat::GlmXml => Tools::GlmXml(ArgTypes::of_tools(Some(tools))),
+        ToolFormat::KvMarkup(spelling) => {
+            Tools::KvMarkup(spelling, ArgTypes::of_tools(Some(tools)))
+        }
         ToolFormat::Dsml(spelling) => Tools::Dsml(spelling),
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
@@ -1060,7 +1083,8 @@ fn a_response_string_beside_scanned_tools_cannot_open_a_call() {
     let blocks = [
         (ToolFormat::Hermes, "<tool_call></tool_call>"),
         (ToolFormat::QwenXml, "<tool_call></tool_call>"),
-        (ToolFormat::GlmXml, "<tool_call></tool_call>"),
+        (GLM, "<tool_call></tool_call>"),
+        (SOLAR, "<|tool_call:start|><|tool_call:end|>"),
         (
             ToolFormat::Dsml(Spelling::Joined),
             "<｜DSML｜tool_calls></｜DSML｜tool_calls>",
@@ -1335,7 +1359,7 @@ fn the_jump_arm_takes_the_step_arms_ids() {
             schema_body(&schema),
         ),
         (bytes_tok(), ToolFormat::QwenXml, call.clone()),
-        (stop_tok(), ToolFormat::GlmXml, call.clone()),
+        (stop_tok(), GLM, call.clone()),
     ] {
         let c = build(&tok, format, &body).expect("served");
         for seed in 0..8 {
