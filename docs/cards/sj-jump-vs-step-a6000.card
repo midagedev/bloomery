@@ -1,0 +1,24 @@
+# sjfast, second window of the comparison lease: the jump arm against the step arm, the same Qwen3.6 binary
+# with BLOOMERY_SCHEMAJUMP unset (jump) and off (step), one server a window (two 24 GB loads do not fit the
+# A6000 beside Clef), the Clef arm repeated in both windows as the anchor. Step arm = N + 1 = 14 nexts on the
+# median request (ko-06, N = 13), the jump arm 5 nexts and 2 spans: 125.2 vs 94.3 ms at S1 4.89 (-25 %), 134.4 vs 98.7 at 5.5
+# (-27 %), 179.5 vs 120.6 at 8.51 (-33 %) [derived, sjmodel.py]. The prompt call (49.4 ms) is common to both
+# arms, which is why a 15 -> 8 call cut is -25 %, not -50 %.
+kind: ab
+question: how much of the time to a complete answer does the jump arm take off the step arm on Qwen3.6?
+term: client-side wall p50 in ms of POST to a complete answer, short bucket (13 requests), Qwen3.6-35B-A3B-Q4_K_M,
+  cache_prompt off, thinking off, RTX A6000 - (jump - step) / step, paired by round
+unit: %
+predict: -34..-23
+rounds: 8
+sd: 2.0 % assumption: the wall of a 100 ms HTTP request scatters wider than a decode step's 0.6 % of AGENTS.md
+  Know the ruler; the calibration sitting's own scatter replaces it
+condition: the jump arm window and the step arm window each hold one Qwen3.6 server beside the Clef-Flash
+  server; the rounds alternate request type by request type inside each window; the step window's
+  timings.constrained shows next_calls 14 and prefill_calls 0 on the median request
+decide-in: BLOOMERY_SCHEMAJUMP stays on by default; record the pair as the jump arm's measured gain (the
+  lever's docs/serving.md sentence names it)
+decide-below: the jump arm gains more than derived: the pass is cheaper than the bytes-and-rows model says;
+  re-fit pass(m) before pricing next_after
+decide-above: the jump arm gains less: a span costs more than a step, so the forced run is not free rows;
+  read the pass ladder before the lever order

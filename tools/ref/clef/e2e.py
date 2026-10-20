@@ -171,6 +171,16 @@ def row(s: dict) -> str:
             f"{misses or '—'} |")
 
 
+def official_rows(data: Path) -> dict:
+    """The official BF16 rows of every suite under `data`: (suite, id) -> the response."""
+    refs = {}
+    for suite, _, refp in SUITES:
+        for l in open(data / refp):
+            r = json.loads(l)
+            refs[(suite, r["id"])] = r["response"]
+    return refs
+
+
 def stop(p: subprocess.Popen, binp: str) -> None:
     """SIGTERM the server spawned as `p` from `binp` while its comm still names it; SIGKILL after 30 s."""
     try:
@@ -197,11 +207,7 @@ def run(argv: list[str]) -> int:
     port = int(a.get("--port", "8091"))
     binp = a.get("--bin", str(ROOT / "target/release/bloomery-serve"))
     data = Path(a.get("--data", os.environ.get("BLOOMERY_DATA", "/root/bloomery-data")))
-    refs = {}
-    for suite, _, refp in SUITES:
-        for l in open(data / refp):
-            r = json.loads(l)
-            refs[(suite, r["id"])] = r["response"]
+    refs = official_rows(data)
     log = open(out / "serve.log", "w")
     t0 = time.time()
     if "--model" in a:
@@ -317,6 +323,24 @@ def self_test() -> None:
             assert want in str(e), e
         else:
             raise AssertionError(f"same passed {bad}")
+    # The official rows of every suite, read from `<data>/<reference path>`; a suite without its file stops the run.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        for suite, _, refp in SUITES:
+            (Path(tmp) / refp).parent.mkdir(parents=True, exist_ok=True)
+            if suite == "en":
+                (Path(tmp) / refp).write_text(json.dumps({"id": "a-1", "response": {"answers": {"q1": 1}}}) + "\n")
+        try:
+            official_rows(Path(tmp))
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("official rows with a suite's file missing passed")
+        for suite, _, refp in SUITES:
+            if suite == "ko":
+                (Path(tmp) / refp).write_text(json.dumps({"id": "b-1", "response": {"answers": {"q2": 2}}}) + "\n")
+        assert official_rows(Path(tmp)) == {("en", "a-1"): {"answers": {"q1": 1}},
+                                            ("ko", "b-1"): {"answers": {"q2": 2}}}
     print("e2e self-test ok")
 
 

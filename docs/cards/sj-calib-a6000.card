@@ -1,0 +1,32 @@
+# sjfast calibration sitting: the engine-call costs every schemajump saving multiplies. Qwen3.6-35B-A3B
+# Q4_K_M through bloomery-serve on the A6000 at the serving defaults (--ctx-size 16384, thinking off), one
+# server, no Clef. The bench page's engine-level step is 4.89 ms (204.4 tok/s, generate_qwen3moe, d=6) and
+# the README's serve row is 8.51 ms (117.5 tok/s, UD-Q4_K_XL, 0.3.1 release check): 3.6 ms that nothing
+# attributes. Prediction: the serve loop adds under 1.5 ms to the engine's step on the same quant, so
+# S1 = 4.9..6.3 ms [derived: 4.89 + a channel hop, a 1 MB row read and the stats lock, bounded at 1.4 ms;
+# the README row differs by quant and release]. The same server also times a prompt call of 40..512 ids (the
+# wide-path ladder), constrained requests whose forced run is 3..8 ids (the pass ladder), and a system+user
+# prompt against the same ids as one user message (the cut at the user message).
+kind: calibration
+question: what does one decode step (one `next`, a 1 MB logits row read) cost through bloomery-serve on
+  Qwen3.6-35B-A3B Q4_K_M on the A6000, and is the README's 8.51 ms a quant effect or a per-call cost?
+term: S1, ms per decode step = timings.predicted_per_token_ms of a greedy 65-token /completion after a
+  40-id prompt, cache_prompt off, ignore_eos, Qwen3.6-35B-A3B-Q4_K_M, bloomery-serve at the serving
+  defaults, --ctx-size 16384, RTX A6000
+unit: ms
+predict: 4.9..6.3
+condition: one server (BLOOMERY_REF_MODEL removed from its environment), eight requests, the first dropped
+  as the first-request state; the witness blocks show no process on either card and no [cpu-busy] tag;
+  the same sitting then times (a) prompts of 40, 64, 128, 256, 512 ids as one user message
+  (timings.prompt_ms), (b) the same 256 ids as a system part of 214 and a user part of 42 (the cut),
+  (c) a json_schema request whose forced run before the decision is 3, 5 and 8 ids with
+  BLOOMERY_SCHEMAJUMP on and off (the pass ladder), and (d) UD-Q4_K_XL once, to attribute a miss
+reason: S1 sets every call-count prediction of sjfast/design.md (saving = dN x S1) and the pass and wide
+  ladders set the prompt and span terms; the two published steps differ by 3.6 ms with no attribution;
+  why now: the comparison sitting against Clef-Flash and the ranking of the schemajump levers read these
+  four constants
+decide-in: price the levers at S1 5.5 ms; launch the Clef-Flash comparison sitting as carded
+decide-below: S1 below the engine's own 4.89 ms is a measurement fault: read the witness block and the
+  server's graph mode before using any number
+decide-above: the serve loop adds a per-call cost: bisect with (d) quant against loop; if the loop, the
+  per-call cost is the first lever (it multiplies every call) ahead of fold, no-tail and next_after

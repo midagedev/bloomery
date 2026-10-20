@@ -1,0 +1,21 @@
+# sjfast post-lever sitting (after fold, no-tail and next_after land as one change on the sjr2 tree): the
+# Qwen3.6 jump arm with the three call-count levers against the jump arm as sitting 1 measured it, the same
+# lease, Clef-Flash anchoring both windows. Median request: 8 calls -> 2 (prompt call with the leading run, one
+# 7-row next_after), 94.3 -> 64.0 ms at S1 4.89, 98.7 -> 64.8 at 5.5, 120.6 -> 67.3 at 8.51: -32 %, -34 %,
+# -44 % [derived, sjmodel.py levers]. Call-count change class: dt = dN x S1 + the passes' rows.
+kind: ab
+question: do fold, no-tail and next_after take the Qwen3.6 jump arm's calls from 8 to 2 and its wall by a third?
+term: client-side wall p50 in ms of POST to a complete answer, short bucket (13 requests), Qwen3.6-35B-A3B-Q4_K_M
+  jump arm, cache_prompt off, thinking off, RTX A6000 - (levered - landed) / landed, paired by round
+unit: %
+predict: -45..-31
+rounds: 8
+sd: 2.0 % assumption: as sj-jump-vs-step-a6000
+condition: the two builds (the sjr2 tree and the lever tree) each as one Qwen3.6 server beside the Clef-Flash
+  server, one window each; the levered window's timings.constrained shows 0 nexts and one next_after call after
+  the prompt call on the median request (Q = 2); every answer equals the landed build's answer (SAME n/n over the 15 requests)
+decide-in: land the levers; the per-request table of sitting 1 gets the levered column
+decide-below: the calls cost more than derived: the saving is larger than the model; re-fit S1 and the pass
+  ladder from this window
+decide-above: the saving is smaller: a term not in the call list (the host's per-call work, the row read) is
+  the floor; read the window's client wall minus timings per request before the next lever

@@ -1,0 +1,33 @@
+# sjfast comparison sitting (baseline): time to a complete SystemOne answer. Clef-Flash (decide seat, Q5_K_M,
+# host joint head) against Qwen3.6-35B-A3B Q4_K_M through the schemajump jump arm as the sjr2 tree has it, both
+# bloomery-serve, one lease on the RTX A6000. The row predicted is the Qwen jump arm; Clef's is read beside it.
+# Short bucket = the 13 requests of suite.jsonl and suite-ko.jsonl under 1,000 prompt tokens (median P 260
+# Clef, 252 Qwen; counted with Clef's tokenizer.json, ko-long-07 = 4,067 as agreement.md). [derived,
+# design.md sections 2-3, sjmodel.py]
+#   Clef   = 2 http + 8 + 0.259 ms x P + 22.2 head = 99.5 ms (85..115; 0.259 ms/token is Q5_K_M 3,862 tok/s at
+#            n 4,067 of agreement.md [measured], the 8 ms and the http are assumptions);
+#   Qwen3.6 jump = one prompt call of 251 ids 49.4 ms (the bench page's fit 21 + 0.113 ms x P from 6,464 /
+#            7,475 / 8,311 tok/s at P 512 / 1024 / 4096; 30 ms if bytes-bound) + 5 nexts + 2 spans (3 and 6 ids) + 3.5 ms
+#            host prep = 94.3 ms at S1 4.89, 98.7 at 5.5, 104.6 at 6.3, 120.6 at 8.51; the step arm (14 nexts)
+#            125..180 ms. The median short request of the 13 is used (ko-06 is the Q = 2 representative).
+kind: baseline
+question: how long does Qwen3.6-35B-A3B take to a complete SystemOne answer through the schemajump jump arm,
+  and where is that against Clef-Flash on the same card?
+term: client-side wall p50 in ms of POST to a complete answer, Qwen3.6-35B-A3B-Q4_K_M jump arm, short bucket
+  (P < 1,000, 13 requests x 20 rounds), cache_prompt off, thinking off, one request at a time, RTX A6000
+unit: ms
+predict: 75..122
+condition: Clef-Flash Q5_K_M and Qwen3.6 Q4_K_M resident on the A6000 together (7 + 24 GB) in one lease, the
+  arms alternating request by request in an order rotated each round, the first request of each type per arm
+  dropped; no [cpu-busy] or [other-busy] tag on a counted round; the jump arm's timings.constrained shows
+  next_calls 5 and prefill_calls 2 on the median request (Q = 2, ko-06); the Clef arm's wall p50 is printed beside
+  (predicted 85..115)
+reason: the user's ask (2026-10-20): schemajump's point is the time to a complete answer, to be compared with
+  Clef-Flash on one model; this row is the baseline the levers (design.md section 4) are priced against and the
+  first same-card Clef row of the jump arm
+decide-in: the jump arm is within the derivation: land fold, no-tail and next_after (predicted 64..67 ms) and
+  re-sit with the ab card sj-levers-a6000
+decide-below: under 75 ms the prompt call is the bytes-bound 30 ms, not the linear fit: re-fit wide(m) from the
+  calibration ladder, then land the levers for the margin
+decide-above: over 122 ms the 3.6 ms the README's serve row shows over the engine's step is a per-call cost:
+  the calibration card's bisect names it and the per-call cost leads the lever order
