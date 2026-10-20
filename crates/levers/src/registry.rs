@@ -640,7 +640,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: NEED_HOOK,
         class: Class::C,
-        kind: Kind::File,
+        kind: Kind::Program,
         default: Unset::Means("no hook: nothing runs"),
         doc: "Placed load: an executable called once per load, after the plan and before the \
               card is opened or the host set read in, with the load's `need` record on its \
@@ -648,9 +648,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               class, the prompt cache, each card's bytes, the pool's threads and cpus). Exit \
               0 goes on; 75 ends the process with 75 naming the hook's last output line; any \
               other status or a hook that cannot start ends the load with a named error. A \
-              path with no regular file is refused at `main`. A load that opens a whole model \
-              on one card with no plan states no need and consults nothing. Read below every \
-              binary's `main`, like the host's room.",
+              path that is not absolute, or has no regular file, is refused at `main`. A load \
+              that opens a whole model on one card with no plan states no need and consults \
+              nothing, saying so on stderr. Read below every binary's `main`, like the host's \
+              room.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

@@ -9,9 +9,13 @@
 //!   hook's last line of output ([`refusal`] is what `exit_with` reads);
 //! * any other status, a signal, or a hook that cannot start: a named error.
 //!
-//! The hook may wait as long as it likes (a broker queue): the process holds
-//! no card and no lock while it does. Unset, nothing runs and nothing is
-//! staged for it to read.
+//! The hook may wait as long as it likes (a broker queue): the load has opened
+//! no card of its own, uploaded no weight and read no host set, and the
+//! process holds no lock, while it does. A lane probe before the plan may have
+//! made the process's primary context, which stays. Unset, nothing runs and
+//! the staged record is never read. The lever takes the hook as an absolute
+//! path only, so the program that runs is the file it checked and never one
+//! found in `PATH`.
 
 use std::fmt;
 use std::io::{self, Write as _};
@@ -104,7 +108,7 @@ fn last_line(bytes: &[u8]) -> String {
 /// Run `hook` with `record` and a newline on its standard input and wait for
 /// it. Its standard error is passed on to this process's, so what the hook
 /// says reaches the load's log whatever it exits.
-pub fn run(hook: &Path, record: &str) -> Result<(), HookError> {
+fn run(hook: &Path, record: &str) -> Result<(), HookError> {
     let run_err = |source| HookError::Run {
         hook: hook.to_path_buf(),
         source,

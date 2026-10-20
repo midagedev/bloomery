@@ -103,6 +103,11 @@ pub(crate) enum Kind {
     PathOr(&'static [&'static str]),
     /// The path of a regular file that exists when the value is read.
     File,
+    /// The absolute path of a regular file that exists when the value is
+    /// read, which the process runs: a name with no directory would be
+    /// searched in `PATH`, and a relative one means the working directory
+    /// of the moment it runs, so neither is taken.
+    Program,
     /// `<path>:<offset>`: the path of a regular file that exists when the
     /// value is read (holding no `:`), a `:` and a whole number.
     FileAt,
@@ -183,6 +188,12 @@ impl Kind {
             },
             Kind::File if Path::new(v).is_file() => Ok(Value::Path(PathBuf::from(v))),
             Kind::File if !v.is_empty() => Err(refused(Some("no regular file is at that path"))),
+            Kind::Program if !Path::new(v).is_absolute() && !v.is_empty() => Err(refused(Some(
+                "a program is named by an absolute path, since a relative name is searched in \
+                 PATH or in the working directory of the moment it runs",
+            ))),
+            Kind::Program if Path::new(v).is_file() => Ok(Value::Path(PathBuf::from(v))),
+            Kind::Program if !v.is_empty() => Err(refused(Some("no regular file is at that path"))),
             Kind::FileAt => {
                 let (path, at) = v.rsplit_once(':').ok_or_else(|| refused(None))?;
                 if path.contains(':') {
@@ -222,7 +233,7 @@ impl Kind {
                 }
                 Ok(Value::Addrs(addrs))
             }
-            Kind::Path | Kind::File | Kind::Text => Err(refused(None)),
+            Kind::Path | Kind::File | Kind::Program | Kind::Text => Err(refused(None)),
         }
     }
 
@@ -252,6 +263,7 @@ impl Kind {
             Kind::Path => "a non-empty path".to_string(),
             Kind::PathOr(words) => format!("{}, or a non-empty path", words.join(", ")),
             Kind::File => "the path of an existing regular file".to_string(),
+            Kind::Program => "the absolute path of an existing regular file".to_string(),
             Kind::FileAt => format!(
                 "<path>:<offset>, the path of an existing regular file holding no ':' and a \
                  whole number ({DIGITS})"
@@ -335,7 +347,7 @@ pub(crate) enum Value {
     Count(u64),
     /// A [`Kind::Bytes`] count.
     Bytes(u64),
-    /// A [`Kind::Path`], [`Kind::PathOr`] or [`Kind::File`] path.
+    /// A [`Kind::Path`], [`Kind::PathOr`], [`Kind::File`] or [`Kind::Program`] path.
     Path(PathBuf),
     /// A [`Kind::FileAt`] path and offset.
     PathAt(PathBuf, u64),

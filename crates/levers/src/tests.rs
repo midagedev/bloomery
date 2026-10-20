@@ -76,7 +76,7 @@ fn sample(kind: Kind) -> String {
         Kind::Bytes => "38G".into(),
         Kind::Path => "/data/set".into(),
         Kind::PathOr(words) => words[0].into(),
-        Kind::File => A_FILE.into(),
+        Kind::File | Kind::Program => A_FILE.into(),
         Kind::FileAt => format!("{A_FILE}:0"),
         Kind::Text => "text".into(),
         Kind::Residency => "mid-p33-s1".into(),
@@ -135,6 +135,13 @@ fn garbage(kind: Kind) -> Vec<String> {
         Kind::File => g.extend([
             "/no/such/file".to_string(),
             env!("CARGO_MANIFEST_DIR").to_string(),
+        ]),
+        Kind::Program => g.extend([
+            "/no/such/file".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
+            "Cargo.toml".to_string(),
+            "./Cargo.toml".to_string(),
+            "sh".to_string(),
         ]),
         Kind::FileAt => g.extend([
             A_FILE.to_string(),
@@ -602,6 +609,15 @@ fn the_need_hook_is_read_below_main() {
             panic!("{bad:?} is no regular file");
         };
         assert!(e.to_string().contains(NEED_HOOK), "{e}");
+    }
+    // A program is run by its absolute path: a name with no directory is
+    // searched in `PATH` and a relative one in the working directory of the
+    // moment, so a file the lever finds by either may not be the one that runs.
+    for relative in ["Cargo.toml", "./Cargo.toml", "src/../Cargo.toml"] {
+        let Err(e) = read(&env(&[(NEED_HOOK, relative)]), Scope::Need) else {
+            panic!("{relative:?} is a relative name");
+        };
+        assert!(e.to_string().contains("absolute path"), "{e}");
     }
     let Err(e) = read(&env(&[(HOST_LOCK, "yes")]), Scope::Need) else {
         panic!("a lock the flag does not take is refused");
