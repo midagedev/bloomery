@@ -317,7 +317,8 @@ impl Weights for GgufHead<'_> {
     }
 }
 
-#[cfg(test)]
+/// The layout's tests build the release's head as a safetensors file first and convert it.
+#[cfg(all(test, feature = "safetensors"))]
 mod tests {
     use std::path::PathBuf;
 
@@ -326,7 +327,8 @@ mod tests {
 
     use super::*;
     use crate::Error;
-    use crate::head::tests::{CFG, file_of};
+    use crate::head::release_file::file_of;
+    use crate::head::tests::CFG;
     use crate::head::{ClefHead, scales_of};
     use hf::safetensors::Safetensors;
 
