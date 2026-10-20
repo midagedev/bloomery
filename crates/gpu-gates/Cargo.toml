@@ -604,6 +604,10 @@ name = "gate_gemma_embedding2_head512"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_minimaxm3_rope"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_gemma_embedding2_e2e"
 required-features = ["gemma-embedding2", "vision", "deepseek41"]
 

@@ -849,3 +849,28 @@ bloomery_gpu::sigmoid_router_instance! {
         prepare: prepare_sigmoid_320_8_router, prepare_sigmoid_320_8_router_pick,
     }
 }
+
+bloomery_gpu::sigmoid_router_instance! {
+    /// The sigmoid router at 128 experts and the top 4 (MiniMax-M3): the same
+    /// rule as [`glm5next`]'s at another width and pick count. Each expert
+    /// scores `sigmoid(logit)`; the selection bias steers the choice only; the
+    /// kept unbiased scores are summed in f64 in slot order, the sum narrowed
+    /// to f32 and guarded ([`renorm_divisor`]), each score divided by it and
+    /// multiplied by `expert_weights_scale` (2 in the file), all in f32.
+    ///
+    /// The entries are [`glm5next`]'s at this instance, from the generic
+    /// bodies: `sigmoid_128_4_router` (one token, the logit gemv fused with
+    /// the selection) and `sigmoid_128_4_router_pick` (a batch's selection
+    /// over the scores the common tile GEMM and sigmoid wrote). The
+    /// no-silent-selection rule is the module doc's: a selection value or a
+    /// weight that is not finite raises [`FaultSite::Router`]. The instance is
+    /// named by its shape and lives with the other shape-named ones, as
+    /// `sigmoid_320_8` does: any family at 128/4 imports it.
+    pub mod sigmoid_128_4 {
+        experts: 128,
+        used: 4,
+        kernels: sigmoid_128_4_router_kernels,
+        entries: sigmoid_128_4_router, sigmoid_128_4_router_pick,
+        prepare: prepare_sigmoid_128_4_router, prepare_sigmoid_128_4_router_pick,
+    }
+}
