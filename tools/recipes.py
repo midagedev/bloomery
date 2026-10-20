@@ -1438,10 +1438,10 @@ class Tree:
         return out
 
     def closure(self, pkg: Package, features: list[str], dev: bool, default: bool = True, all_features: bool = False) -> dict[str, str]:
-        """Workspace packages a target of `pkg` links: name -> the edge that brought it in."""
+        """Workspace packages a target of `pkg` links: name -> its shortest dependency chain (breadth first)."""
         _, deps_on, _ = self.feature_closure(pkg, features, default, all_features)
         seen: dict[str, str] = {}
-        stack: list[tuple[str, list[str], bool, str]] = []
+        queue: collections.deque[tuple[str, list[str], bool, str]] = collections.deque()
         for d in pkg.deps:
             if d.pkg not in self.packages:
                 continue
@@ -1449,9 +1449,9 @@ class Tree:
                 continue
             if d.optional and d.key not in deps_on:
                 continue
-            stack.append((d.pkg, d.features, d.default, f"{pkg.name} -> {d.pkg}"))
-        while stack:
-            name, feats, dflt, why = stack.pop()
+            queue.append((d.pkg, d.features, d.default, f"{pkg.name} -> {d.pkg}"))
+        while queue:
+            name, feats, dflt, why = queue.popleft()
             if name in seen:
                 continue
             seen[name] = why
@@ -1462,7 +1462,7 @@ class Tree:
                     continue
                 if d.optional and d.key not in q_on:
                     continue
-                stack.append((d.pkg, d.features, d.default, f"{why} -> {d.pkg}"))
+                queue.append((d.pkg, d.features, d.default, f"{why} -> {d.pkg}"))
         return seen
 
     def target_files(self, pkg_name: str, kind: str, name: str | None, features: list[str], default: bool = True, all_features: bool = False, use: ManifestUse | None = None, by_features: bool = False) -> dict[str, str]:
@@ -2353,29 +2353,6 @@ def cmd_targets(args: argparse.Namespace) -> int:
     return 0
 
 
-def closure_chains(tree: Tree, pkg: Package, features: list[str], dev: bool, default: bool = True, all_features: bool = False) -> dict[str, str]:
-    """`Tree.closure`'s packages, each with its shortest chain (breadth first; `closure` itself keeps the first one it finds)."""
-    _, deps_on, _ = tree.feature_closure(pkg, features, default, all_features)
-    seen: dict[str, str] = {}
-    queue: collections.deque[tuple[str, list[str], bool, str]] = collections.deque()
-    for d in pkg.deps:
-        if d.pkg not in tree.packages or (d.kind == "dev" and not dev) or (d.optional and d.key not in deps_on):
-            continue
-        queue.append((d.pkg, d.features, d.default, f"{pkg.name} -> {d.pkg}"))
-    while queue:
-        name, feats, dflt, why = queue.popleft()
-        if name in seen:
-            continue
-        seen[name] = why
-        q = tree.packages[name]
-        _, q_on, _ = tree.feature_closure(q, feats, dflt)
-        for d in q.deps:
-            if d.pkg not in tree.packages or d.kind == "dev" or (d.optional and d.key not in q_on):
-                continue
-            queue.append((d.pkg, d.features, d.default, f"{why} -> {d.pkg}"))
-    return seen
-
-
 def why_chains(side: Side, name: str, f: str, _seen: frozenset[str] = frozenset()) -> list[str]:
     """How recipe `name` (and the recipes it depends on) links the package that owns `f`: one line per cargo target,
     its shortest dependency chain to that package, or `its own package` when the target sits in it. Empty when
@@ -2393,7 +2370,7 @@ def why_chains(side: Side, name: str, f: str, _seen: frozenset[str] = frozenset(
                 out.add(f"{label}: its own package")
                 continue
             dev = kind in ("test", "bench", "doctest", "libtest", "example")
-            chains = closure_chains(tree, tree.packages[pname], feats, dev, not inv.no_default, inv.all_features)
+            chains = tree.closure(tree.packages[pname], feats, dev, not inv.no_default, inv.all_features)
             if owner.name in chains:
                 out.add(f"{label}: {chains[owner.name]}")
     for dep in side.recipes[name].deps:

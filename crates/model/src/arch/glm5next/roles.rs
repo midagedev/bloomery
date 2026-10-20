@@ -59,8 +59,8 @@ pub const LATENT: &[Stem] = &[
 ];
 
 /// A dense layer's gate and down stems, which the front's forms read ([`DENSE`]).
-pub const DENSE_GATE: &str = "ffn_gate.weight";
-pub const DENSE_DOWN: &str = "ffn_down.weight";
+pub(super) const DENSE_GATE: &str = "ffn_gate.weight";
+pub(super) const DENSE_DOWN: &str = "ffn_down.weight";
 
 /// A dense layer's feed-forward block.
 pub const DENSE: &[Stem] = &[
