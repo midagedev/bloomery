@@ -1303,6 +1303,10 @@ pub(super) mod tests {
     use bloomery_gpu_gates::generate::choose_ctx_of;
     use model::placement::ModelTensor;
 
+    #[allow(
+        dead_code,
+        reason = "`generate_qwen3moe`'s test calls it; every other bin that includes this file leaves it unused"
+    )]
     pub(crate) fn dense_shortage_halves_the_default_context() {
         const TARGET: u64 = 16_384;
         let model = ModelTensors {

@@ -436,6 +436,10 @@ mod gate_card;
 
 #[cfg(feature = "glm5next")]
 #[path = "shared/e2e.rs"]
+#[allow(
+    dead_code,
+    reason = "the shared runner serves several gates; each takes the helpers it reads"
+)]
 mod e2e;
 
 #[cfg(feature = "glm5next")]

@@ -1793,7 +1793,7 @@ fn iq4xs_signed_dot_extremes() {
             let mut col = vec![0; col_bytes(ty, 256)];
             col[..4].copy_from_slice(&1.0f32.to_le_bytes());
             col[8..264].fill(q as u8);
-            for sum in col[264..].chunks_exact_mut(2) {
+            for sum in col[264..].as_chunks_mut::<2>().0 {
                 sum.copy_from_slice(&(16 * i16::from(q)).to_le_bytes());
             }
             col

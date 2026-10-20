@@ -583,7 +583,7 @@ impl Weights {
         stream: &CudaStream,
         (parts, joint): (&[&str], String),
         scale_values: usize,
-        planes: fn(&DevWeight) -> Option<(&DeviceTensor<u32>, &DeviceTensor<S>, usize)>,
+        planes: PartPlanes<S>,
         wrap: fn(DeviceTensor<u32>, DeviceTensor<S>, usize) -> DevWeight,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Weights::join_rows";
@@ -882,6 +882,10 @@ const PLACED: &str = "Weights::load_placed";
 /// The file bytes a segment's upload may release once its bytes are staged:
 /// each entry the shard and the bytes within its mapping.
 type PendingRelease = Vec<(usize, Range<u64>)>;
+
+/// Reads a part's `qs` words, its scales and its width, `None` for another format.
+type PartPlanes<S> =
+    for<'a> fn(&'a DevWeight) -> Option<(&'a DeviceTensor<u32>, &'a DeviceTensor<S>, usize)>;
 
 /// `load_placed`'s refusal of tensor `t`.
 fn placed_refusal(t: &ModelTensor, detail: String) -> GpuError {
