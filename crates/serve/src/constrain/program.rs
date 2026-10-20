@@ -444,6 +444,17 @@ pub(crate) struct Picks {
     pub free: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    static AHEADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The copies [`Walk::ahead`] has made on this thread.
+#[cfg(test)]
+pub(crate) fn aheads() -> usize {
+    AHEADS.with(std::cell::Cell::get)
+}
+
 /// One request's position in its program.
 #[derive(Clone, Debug)]
 pub(crate) struct Walk {
@@ -485,6 +496,13 @@ impl Walk {
     /// The ids picked from a row so far, by kind.
     pub(crate) fn picks(&self) -> Picks {
         self.picks
+    }
+
+    /// A copy to run ahead on; this walk stays where it stands.
+    pub(crate) fn ahead(&self) -> Walk {
+        #[cfg(test)]
+        AHEADS.with(|n| n.set(n.get() + 1));
+        self.clone()
     }
 
     /// Moves to the next decision, or to the next forced id.

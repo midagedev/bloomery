@@ -933,6 +933,49 @@ fn an_angle_bracket_in_a_json_literal_is_written_as_an_escape() {
     assert_eq!(v, json!({"a<b": "x</y>", "e": "<p>"}));
 }
 
+/// The rows of `tools/ref/clef/json-inner-cases.tsv`: a case's name, the
+/// string, and the text between the quotes that spell it.
+fn json_inner_cases() -> Vec<(String, String, String)> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/ref/clef/json-inner-cases.tsv");
+    let table =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let literal = |name: &str, cell: &str| -> String {
+        serde_json::from_str(cell)
+            .unwrap_or_else(|e| panic!("{name}: {cell} is not a JSON string: {e}"))
+    };
+    let cases: Vec<_> = table
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let cells: Vec<&str> = l.split('\t').collect();
+            let [name, input, body] = cells[..] else {
+                panic!("{l:?} is not three tab-separated cells");
+            };
+            (name.to_owned(), literal(name, input), literal(name, body))
+        })
+        .collect();
+    assert!(!cases.is_empty(), "{} holds no case", path.display());
+    cases
+}
+
+/// A string in a JSON literal is spelled between its quotes as the table has
+/// it, and the table's spelling reads back as the string. The Clef
+/// comparison's `json_inner` (`tools/ref/clef/sjcmp.py`) is held to the same
+/// table by its self-test, so neither side can change an escape alone.
+#[test]
+fn a_json_literal_is_spelled_as_the_table_has_it() {
+    let tok = bytes_tok();
+    for (name, input, body) in json_inner_cases() {
+        let schema = schema_body(&json!({"const": input}));
+        let c = build(&tok, ToolFormat::Hermes, &schema).expect("served");
+        let o = run(&tok, Some(c), ThinkEntry::Closed, &[]);
+        assert_eq!(o.content, format!("\"{body}\""), "{name}");
+        let back: String = serde_json::from_str(&o.content).expect("a JSON string");
+        assert_eq!(back, input, "{name}");
+    }
+}
+
 /// A raw value ends at the text after it, so a raw literal that holds a `<`
 /// could spell a closing tag: the formats that write a string raw refuse it,
 /// and Hermes, which writes JSON, serves the same literal.
@@ -1474,6 +1517,29 @@ fn a_lead_that_reverses_later_still_picks_greedy() {
         // ids and the stop taken with no call, no span fed.
         assert_eq!((j.spans, j.tail), (0, 5 * usize::from(jump)));
     }
+}
+
+/// A free string's decode steps copy no walk: the jump arm looks along the
+/// program for its tail only where an id is fixed or the program is spent, so
+/// the copies a request makes do not grow with the string's length.
+#[test]
+fn a_free_strings_steps_copy_no_walk() {
+    let tok = bytes_tok();
+    let mut ran = Vec::new();
+    for max in [4, 24] {
+        let schema = json!({"type": "object", "properties": {
+            "note": {"type": "string", "maxLength": max}}});
+        let c = build(&tok, ToolFormat::Hermes, &schema_body(&schema)).expect("served");
+        let before = program::aheads();
+        let r = scripted(&tok, &c, 1, Vec::new(), true, 400);
+        let j = r.out.timings.jump.expect("a constrained request");
+        ran.push((j.free_steps, program::aheads() - before));
+    }
+    let [(short, short_copies), (long, long_copies)] = ran[..] else {
+        unreachable!("two lengths")
+    };
+    assert!(long >= short + 16, "free steps {short} and {long}");
+    assert_eq!(long_copies, short_copies, "free steps {short} and {long}");
 }
 
 /// A forced call with eight functions of two enum arguments each, whose

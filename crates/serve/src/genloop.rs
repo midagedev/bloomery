@@ -1992,7 +1992,7 @@ impl Gen {
         let Some(walk) = self.walk.as_mut() else {
             return;
         };
-        let mut ahead = walk.clone();
+        let mut ahead = walk.ahead();
         let Ok(run) = ahead.forced_run(room) else {
             return;
         };
@@ -2287,7 +2287,12 @@ impl Gen {
             return Ok(None);
         };
         if !self.tail {
-            let mut ahead = walk.clone();
+            // A walk with no id fixed ahead that is not spent stands at a
+            // pick or inside a free string: it has no run to look along.
+            if !walk.fixed_next() && !walk.spent() {
+                return Ok(None);
+            }
+            let mut ahead = walk.ahead();
             if !ahead.forced_run(usize::MAX).is_ok_and(|_| ahead.spent()) {
                 return Ok(None);
             }
@@ -2326,7 +2331,7 @@ impl Gen {
         // The run's last id is fed by the step that follows, which must find
         // its position: the call's ids take positions n + len - 1 on.
         let room = (self.budget - len).min(self.ctx_max + 1 - n - len);
-        let mut ahead = walk.clone();
+        let mut ahead = walk.ahead();
         let Ok(run) = ahead.forced_run(room) else {
             return false;
         };
