@@ -295,7 +295,18 @@ impl<H> PlanInputs<H> {
         let plan = checked_beside(plan, self.prompt_reserve).map_err(PlaceError::Broken)?;
         for (card, totals) in machine.cards.iter().zip(&plan.cards) {
             let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
-            refuse_reserve(card, card_terms(totals), limit, self.prompt_reserve)?;
+            refuse_reserve(
+                card,
+                card_terms(totals),
+                limit,
+                self.prompt_reserve,
+                |card, reserve, left, short| PlaceError::PromptOver {
+                    card,
+                    reserve,
+                    left,
+                    short,
+                },
+            )?;
         }
         Ok(plan)
     }
@@ -309,21 +320,24 @@ impl<H> PlanInputs<H> {
 
 /// The prompt batch's `reserve` beside `total` bytes of a plan's terms on `card`, `limit` its
 /// usable bytes less its margin: refused by name when the terms fit alone and the reserve does not
-/// fit beside them (terms past the limit are the plan's own violation).
-fn refuse_reserve(card: &Card, total: u64, limit: u64, reserve: u64) -> Result<(), PlaceError> {
+/// fit beside them (terms past the limit are the plan's own violation). `over` is the family's
+/// own refusal of those bytes: the rule is one, the variant each family names is its own (a
+/// family's prompt batch's front and another's prompt batch's reserve are named apart).
+pub(crate) fn refuse_reserve<E>(
+    card: &Card,
+    total: u64,
+    limit: u64,
+    reserve: u64,
+    over: impl FnOnce(String, u64, u64, u64) -> E,
+) -> Result<(), E> {
     match limit.checked_sub(total) {
-        Some(left) if reserve > left => Err(PlaceError::PromptOver {
-            card: card.name.clone(),
-            reserve,
-            left,
-            short: reserve - left,
-        }),
+        Some(left) if reserve > left => Err(over(card.name.clone(), reserve, left, reserve - left)),
         _ => Ok(()),
     }
 }
 
 /// A plan's terms on a card: its granules, cache, scratch, context and reserves.
-fn card_terms(t: &CardTotals) -> u64 {
+pub(crate) fn card_terms(t: &CardTotals) -> u64 {
     t.dense_bytes
         + t.expert_bytes
         + t.rounding_bytes

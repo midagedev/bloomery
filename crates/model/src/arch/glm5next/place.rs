@@ -19,8 +19,10 @@ use super::hparams::{Hparams, Kind};
 use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
+use crate::arch::place_hybrid;
 use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
+use crate::placement::kernels::q8_act_bytes;
 use crate::placement::workstation::{self, GRANULE, HostRead, TierBatchBytes};
 use crate::placement::{
     self, Card, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine, ModelTensor,
@@ -213,20 +215,20 @@ pub struct FrontWidths {
 /// KDA gate's low-rank and gated rows, the latent query's low rank, the
 /// latent heads' outputs and, for a Q8_0 down, the dense block's SwiGLU rows;
 /// the dense block's K-quant forms ([`DenseForms`]) in q8_1 blocks of 128
-/// values, a column's [`FRONT_SUPER`]-value super-block holding 256 words of
-/// codes at the q3 permutation's pairs and 256 at the q4 permutation's quads
-/// and 10 of sums and scales, over the normed input and a K-quant down's
-/// SwiGLU rows; and the f32 rows the front holds whole, a word a value: the
-/// latent query heads, the heads' outputs, and the dense block's gate and up
-/// rows. A width of 0 makes nothing (the dense block's forms none at an `ff` of 0). The one formula of those
+/// values, the q8_1 planes' own bytes ([`q8_act_bytes`], over the width's
+/// whole super-blocks) over the normed input and a K-quant down's SwiGLU
+/// rows; and the f32 rows the front holds whole, a word a value: the latent
+/// query heads, the heads' outputs, and the dense block's gate and up rows. A width of 0 makes nothing (the dense block's forms none at an `ff` of 0). The one formula of those
 /// bytes: the card body's front checks its made bytes against it.
 #[must_use]
 pub fn front_bytes(cols: usize, w: FrontWidths) -> usize {
     let table = 2 * cols + 2 * (cols / FRONT_TILE_COLS + 1) + 2;
     let act = |k: usize| 20 * cols * k.div_ceil(FRONT_STEP);
+    // The q8_1 planes of the K-quant forms, the common owner's count at the width's whole
+    // super-blocks: a width that is not a whole number of them holds a padded last one.
     let act128 = |k: usize| {
-        let sb = k.div_ceil(FRONT_SUPER);
-        cols * (256 * sb.div_ceil(2) + 256 * sb.div_ceil(4) + 10 * sb)
+        let padded = k.div_ceil(FRONT_SUPER) * FRONT_SUPER;
+        q8_act_bytes(cols as u64, padded as u64)
     };
     let forms = if w.ff == 0 { DenseForms::NONE } else { w.forms };
     let rows32 = if forms.rows32 { w.ff } else { 0 };
@@ -236,9 +238,10 @@ pub fn front_bytes(cols: usize, w: FrontWidths) -> usize {
         .sum();
     let in128 = if forms.in128 { w.embd } else { 0 };
     let rows128 = if forms.rows128 { w.ff } else { 0 };
-    let acts128: usize = [in128, rows128].into_iter().map(act128).sum();
+    let acts128: u64 = [in128, rows128].into_iter().map(act128).sum();
     let rows = cols * (w.q + w.heads_v + 2 * w.ff);
-    4 * (table + acts + acts128 + rows)
+    usize::try_from(4 * (table + acts + rows) as u64 + acts128)
+        .expect("the front's bytes fit a usize")
 }
 
 /// The bytes of the GEMM front a prompt batch of a load `inputs` describes at
@@ -395,34 +398,6 @@ impl PlanRefusal for PlaceError {
             _ => None,
         }
     }
-}
-
-/// The prompt batch's reserve `front` ([`prompt_reserve_bytes`]) beside
-/// `total` bytes of a plan's terms on `card`, `limit` its usable bytes less
-/// its margin: refused by name when the terms fit alone and the reserve does
-/// not fit beside them (terms past the limit are the plan's own violation).
-fn refuse_front(card: &Card, total: u64, limit: u64, front: u64) -> Result<(), PlaceError> {
-    match limit.checked_sub(total) {
-        Some(left) if front > left => Err(PlaceError::FrontOver {
-            card: card.name.clone(),
-            front,
-            left,
-            short: front - left,
-        }),
-        _ => Ok(()),
-    }
-}
-
-/// A plan's terms on a card: its granules, cache, scratch, context and
-/// reserves.
-fn card_terms(t: &CardTotals) -> u64 {
-    t.dense_bytes
-        + t.expert_bytes
-        + t.rounding_bytes
-        + t.kv_bytes
-        + t.scratch_bytes
-        + t.context_bytes
-        + t.reserve_bytes
 }
 
 /// The deepest context the plan serves: ik's `--dsa` step set at position
@@ -657,12 +632,23 @@ impl PlanInputs {
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             Ok(plan)
         })?;
-        // The front stays beside the plan's terms (`refuse_front` holds it to
+        // The front stays beside the plan's terms (`refuse_reserve` holds it to
         // the card), so a unified pool counts it beside them.
         let plan = checked_beside(plan, front).map_err(PlaceError::Broken)?;
         if let (Some(card), Some(t)) = (machine.cards.first(), plan.cards.first()) {
             let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
-            refuse_front(card, card_terms(t), limit, front)?;
+            place_hybrid::refuse_reserve(
+                card,
+                place_hybrid::card_terms(t),
+                limit,
+                front,
+                |card, front, left, short| PlaceError::FrontOver {
+                    card,
+                    front,
+                    left,
+                    short,
+                },
+            )?;
         }
         Ok(plan)
     }
@@ -1015,7 +1001,7 @@ impl PlanInputs {
             }
             Ok(plan)
         })?;
-        let total = card_terms(&plan.cards[0]) + nextn_card + arena;
+        let total = place_hybrid::card_terms(&plan.cards[0]) + nextn_card + arena;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let host_headroom = plan.host.headroom_bytes - i128::from(draft_host);
@@ -1052,7 +1038,14 @@ impl PlanInputs {
         if !broken.is_empty() {
             return Err(PlaceError::Broken(broken));
         }
-        refuse_front(card, total, limit, front)?;
+        place_hybrid::refuse_reserve(card, total, limit, front, |card, front, left, short| {
+            PlaceError::FrontOver {
+                card,
+                front,
+                left,
+                short,
+            }
+        })?;
         Ok(NextnPlan {
             headroom_bytes: i128::from(usable) - i128::from(total) - i128::from(front),
             host_headroom_bytes: host_headroom,
