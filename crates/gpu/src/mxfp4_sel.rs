@@ -1660,7 +1660,7 @@ mod tests {
             k: 256,
         });
         let mut bytes = [0; 8 * mxfp4::BLOCK_BYTES];
-        for block in bytes.chunks_exact_mut(mxfp4::BLOCK_BYTES) {
+        for block in bytes.as_chunks_mut::<{ mxfp4::BLOCK_BYTES }>().0 {
             block[0] = 127;
         }
         let aligned = MxStack::upload(stream, &bytes, 1, 1, 256).expect("aligned stack");
