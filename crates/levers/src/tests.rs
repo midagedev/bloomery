@@ -1936,7 +1936,7 @@ fn tp_nodes_take_the_tier_rules_and_never_sit_beside_tier_nodes() {
     };
     let set = read(
         &env(&[
-            (TP_NODES, "198.18.4.1:7340,198.18.5.1:7340"),
+            (TP_NODES, "198.18.4.1:7340,198.18.5.1:7340,198.18.6.1:7340"),
             (TIER_LINK, "rdma"),
         ]),
         main,
@@ -1945,6 +1945,7 @@ fn tp_nodes_take_the_tier_rules_and_never_sit_beside_tier_nodes() {
     let want: Vec<SocketAddr> = vec![
         "198.18.4.1:7340".parse().unwrap(),
         "198.18.5.1:7340".parse().unwrap(),
+        "198.18.6.1:7340".parse().unwrap(),
     ];
     assert_eq!(set.tp_nodes(), want.as_slice());
     assert!(read(&env::<&str>(&[]), main).unwrap().tp_nodes().is_empty());

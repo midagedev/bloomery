@@ -211,6 +211,7 @@ mod gen_slots;
 
 #[cfg(feature = "glm5next")]
 mod cli {
+    use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -240,8 +241,8 @@ mod cli {
     };
     use gguf::Split;
     use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
-    use model::placement::tp::{RankPool, plan_tp};
-    use model::placement::workstation::spec_of_device;
+    use model::placement::tp::{Rank, RankPool, TpTensor, plan_tp};
+    use model::placement::workstation::{CardSpec, spec_of_device};
     use model::placement::{Machine, Plan, PlanLevers};
     use runtime::layer::hosted;
     use runtime::width::{Choosing, Chosen as _, Mode as WidthMode};
@@ -437,9 +438,6 @@ mod cli {
             );
         }
         let nodes = levers.tp_nodes();
-        if nodes.is_empty() {
-            return Err("--place tp: BLOOMERY_TP_NODES names no other rank's node".into());
-        }
         let census = gpu_census::census()?;
         let [here] = census.as_slice() else {
             return Err(format!(
@@ -448,12 +446,14 @@ mod cli {
             )
             .into());
         };
-        let mut pools = vec![RankPool::of("local".into(), &spec_of_device(here))];
-        for (addr, (_, spec)) in nodes.iter().zip(node_cards(nodes)?) {
-            pools.push(RankPool::of(addr.to_string(), &spec));
-        }
-        let ranks = plan_tp(
-            &pools,
+        let cards: Vec<(SocketAddr, CardSpec)> = nodes
+            .iter()
+            .zip(node_cards(nodes)?)
+            .map(|(&addr, (_, spec))| (addr, spec))
+            .collect();
+        let ranks = tp_ranks(
+            &spec_of_device(here),
+            &cards,
             &model_hf::arch::glm5next::read_tp(&ref_model_path()?)?,
         )?;
         for r in &ranks {
@@ -466,6 +466,27 @@ mod cli {
             "--place tp: the tensor-parallel load is not built; --plan prints each rank's plan"
                 .into(),
         )
+    }
+
+    /// The plan of `tensors` over N ranks: rank 0 on `here`, this process's one card, then one
+    /// rank on each node of `nodes`, its address and its one card, in rank order. Refused by name
+    /// when `nodes` is empty: the plan is of at least two ranks.
+    fn tp_ranks(
+        here: &CardSpec,
+        nodes: &[(SocketAddr, CardSpec)],
+        tensors: &[TpTensor],
+    ) -> Result<Vec<Rank>, GateError> {
+        if nodes.is_empty() {
+            return Err("--place tp: BLOOMERY_TP_NODES names no other rank's node".into());
+        }
+        let pools: Vec<RankPool> = std::iter::once(RankPool::of("local".into(), here))
+            .chain(
+                nodes
+                    .iter()
+                    .map(|(addr, spec)| RankPool::of(addr.to_string(), spec)),
+            )
+            .collect();
+        Ok(plan_tp(&pools, tensors)?)
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -1641,5 +1662,76 @@ mod cli {
             ],
         };
         Ok(Some(RouteTrace::create(dir, header)?))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{CardSpec, SocketAddr, TpTensor, record, tp_ranks};
+        use model::placement::tp::Cut;
+
+        /// `--place tp`'s ranks at N = 1, 2 and 4, N - 1 nodes of `BLOOMERY_TP_NODES` beside this
+        /// process's card: N = 1 is refused by name; past it rank 0 is local and rank `i` the
+        /// `i`-th address, each holding 1 / N of the split rows and all of the whole tensor, and
+        /// each `tp rank` line counts the N ranks.
+        #[test]
+        fn tp_ranks_are_this_card_then_each_node_in_order() {
+            const ROWS: u64 = 8;
+            const ROW_BYTES: u64 = 128;
+            const WHOLE: u64 = 100;
+            let card = CardSpec {
+                name: "GB10",
+                total_bytes: 128 << 30,
+                driver_reserve_bytes: 0,
+                device: None,
+                free_bytes: Some(100 << 30),
+                held_by: None,
+                integrated: true,
+            };
+            let tensors = [
+                TpTensor {
+                    name: "split".into(),
+                    dims: vec![64, ROWS],
+                    bytes: ROWS * ROW_BYTES,
+                    whole_bytes: 0,
+                    block: [64, 1],
+                    cut: Some(Cut { dim: 1, unit: 1 }),
+                },
+                TpTensor {
+                    name: "whole".into(),
+                    dims: vec![64],
+                    bytes: WHOLE,
+                    whole_bytes: 0,
+                    block: [64, 1],
+                    cut: None,
+                },
+            ];
+            for n in [1_u16, 2, 4] {
+                let nodes: Vec<(SocketAddr, CardSpec)> = (1..n)
+                    .map(|i| (SocketAddr::from(([127, 0, 0, 1], 7340 + i)), card))
+                    .collect();
+                let ranks = tp_ranks(&card, &nodes, &tensors);
+                if n == 1 {
+                    let e = ranks.unwrap_err().to_string();
+                    assert!(e.contains("names no other rank's node"), "{e}");
+                    continue;
+                }
+                let ranks = ranks.unwrap_or_else(|e| panic!("N = {n}: {e}"));
+                assert_eq!(ranks.len(), usize::from(n));
+                for (i, r) in ranks.iter().enumerate() {
+                    let node = match i {
+                        0 => "local".to_string(),
+                        _ => nodes[i - 1].0.to_string(),
+                    };
+                    let split = ROWS * ROW_BYTES / u64::from(n);
+                    assert_eq!(
+                        (r.rank, r.node.as_str(), r.split_bytes, r.whole_bytes),
+                        (i, node.as_str(), split, WHOLE),
+                        "N = {n}"
+                    );
+                    let line = record::tp_rank(r, ranks.len()).line();
+                    assert!(line.starts_with(&format!("tp rank={i}/{n} ")), "{line}");
+                }
+            }
+        }
     }
 }
