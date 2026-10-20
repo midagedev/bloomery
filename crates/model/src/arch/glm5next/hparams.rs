@@ -8,7 +8,7 @@ use gguf::{Split, Value};
 
 use super::roles::{DENSE, HC, KDA, LATENT, MOE, NEXTN, SHARED, required};
 use crate::arch::{
-    expert_counts, meta_arr, meta_bool, meta_f32, meta_usize, metadata, n_vocab, nextn_layers,
+    expert_counts, kda, meta_arr, meta_bool, meta_f32, meta_usize, metadata, n_vocab, nextn_layers,
     one_expert_group, optional_usize, positive, refuse_tensor_set, sigmoid_gating, unread_keys_of,
 };
 use crate::placement::PlacementError;
@@ -213,27 +213,9 @@ impl Hparams {
                 ));
             }
         }
-        let conv = positive(split, "ssm.conv_kernel")?;
-        let kda_head_dim = match optional_usize(split, "kda.head_dim")? {
-            Some(v) => v,
-            None => {
-                let v = meta_usize(split, "ssm.state_size")?;
-                defaults.push(format!("kda.head_dim = {v} (ssm.state_size, :2370-2374)"));
-                v
-            }
-        };
-        if kda_head_dim == 0 {
-            return Err(metadata(split, "kda.head_dim", "is 0"));
-        }
-        if let Some(g) = optional_usize(split, "ssm.group_count")?
-            && g != n_head
-        {
-            return Err(metadata(
-                split,
-                "ssm.group_count",
-                format!("is {g}; ik's KDA layer takes attention.head_count {n_head} key heads"),
-            ));
-        }
+        let kda = kda::read(split, n_head, &mut defaults)?;
+        let conv = kda.conv;
+        let kda_head_dim = kda.head_dim;
         let gate_lower_bound = or_default(
             "kda.gate_lower_bound",
             optional_f32(split, "kda.gate_lower_bound")?,
@@ -409,79 +391,22 @@ impl Hparams {
         )
     }
 
-    /// A KDA layer's tensors by stem and the dims ik creates them with
-    /// (`create_glm5next_tensors`), ggml order: `d_state` is `kda.head_dim`,
-    /// `d_inner` that times the heads.
-    pub(super) fn kda_dims(&self) -> [(&'static str, Vec<u64>); 16] {
-        let (e, h, st) = (
-            self.n_embd as u64,
-            self.n_head as u64,
-            self.kda_head_dim as u64,
-        );
-        let inner = st * h;
-        let conv = self.conv as u64;
-        [
-            ("attn_norm.weight", vec![e]),
-            ("attn_q.weight", vec![e, inner]),
-            ("attn_k.weight", vec![e, inner]),
-            ("attn_v.weight", vec![e, inner]),
-            ("ssm_conv1d_q.weight", vec![conv, 1, inner]),
-            ("ssm_conv1d_k.weight", vec![conv, 1, inner]),
-            ("ssm_conv1d_v.weight", vec![conv, 1, inner]),
-            ("ssm_f_a.weight", vec![e, st]),
-            ("ssm_f_b.weight", vec![st, inner]),
-            ("ssm_g_a.weight", vec![e, st]),
-            ("ssm_g_b.weight", vec![st, inner]),
-            ("ssm_beta.weight", vec![e, h]),
-            ("ssm_a", vec![h]),
-            ("ssm_dt.bias", vec![inner]),
-            ("ssm_norm.weight", vec![st]),
-            ("attn_output.weight", vec![inner, e]),
-        ]
-    }
-
-    /// Every trunk KDA layer's tensors hold exactly [`Hparams::kda_dims`], as
-    /// ik requires: the kernels check their buffers' lengths only from below,
-    /// so a short tensor would leave the shared scratch's tail to the last
-    /// layer and a long one would be read in part. The first tensor of other
-    /// dims, by name, with how many more there are.
+    /// Every trunk KDA layer's tensors hold exactly the KDA dims, as ik
+    /// requires: the kernels check their buffers' lengths only from below, so
+    /// a short tensor would leave the shared scratch's tail to the last layer
+    /// and a long one would be read in part. The first tensor of other dims,
+    /// by name, with how many more there are.
     fn kda_dims_agree(&self, split: &Split) -> Result<(), PlacementError> {
-        let pad = |d: &[u64]| {
-            let mut d = d.to_vec();
-            while d.last() == Some(&1) {
-                d.pop();
-            }
-            d
-        };
-        let want = self.kda_dims();
-        let mut off = Vec::new();
-        for (l, &kind) in self.kinds.iter().enumerate().take(self.n_trunk) {
-            if kind != Kind::Kda {
-                continue;
-            }
-            for (stem, dims) in &want {
-                let name = format!("blk.{l}.{stem}");
-                if let Some((_, info)) = split.find(&name)
-                    && pad(&info.dims) != pad(dims)
-                {
-                    off.push((name, format!("{:?} (want {dims:?})", info.dims)));
-                }
-            }
-        }
-        match off.first() {
-            None => Ok(()),
-            Some((name, _)) => Err(PlacementError::Tensor {
-                name: name.clone(),
-                detail: format!(
-                    "has other dims than ik creates the KDA tensor with ({} such: {})",
-                    off.len(),
-                    off.iter()
-                        .map(|(n, d)| format!("{n} {d}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            }),
-        }
+        let layers: Vec<usize> = self
+            .kinds
+            .iter()
+            .enumerate()
+            .take(self.n_trunk)
+            .filter(|(_, kind)| **kind == Kind::Kda)
+            .map(|(l, _)| l)
+            .collect();
+        let want = kda::dims(self.n_embd, self.n_head, self.kda_head_dim, self.conv);
+        kda::dims_agree(split, &layers, &want)
     }
 }
 

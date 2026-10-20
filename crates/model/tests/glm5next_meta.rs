@@ -45,9 +45,9 @@ const VIEW: &[&str] = &[
     "hc Some(HcSpec { streams: 4, kind: Mhc { sinkhorn: 20, eps: 1e-6, mix: Own, collapse: Mean } })",
     "engram None",
     "chat pre glm4 template bytes 10648 tools Some(GlmXml) reasoning Some(ThinkSpan)",
-    "[0-2] delta Kda { gate_lower_bound: -5.0 } k 64 v 64 d 128 conv 4 || dense 12288 swiglu Some(10.0) || hc",
+    "[0-2] delta Kda { gate: Sigmoid { lower_bound: -5.0 }, beta_scale: 1.0 } k 64 v 64 d 128 conv 4 || dense 12288 swiglu Some(10.0) || hc",
     "[3,7,11,15,19,23,27,31,35,39,43] latent h 64 q 1536 kv 512 Absorbed { qk: 256, v: 256 } rope - qhn false out Plain win None sinks false | TokenPool { heads: 32, d: 128, top_k: 2048, pool: 4, rule: Learned { key_eps: 1e-6 } } || moe 288/8 ff 2048 swiglu Some(10.0) Sigmoid bias true norm true x2.5 hash false shared 2048 swiglu Some(10.0) gate false || hc",
-    "[4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38,40-42,44] delta Kda { gate_lower_bound: -5.0 } k 64 v 64 d 128 conv 4 || moe 288/8 ff 2048 swiglu Some(10.0) Sigmoid bias true norm true x2.5 hash false shared 2048 swiglu Some(10.0) gate false || hc",
+    "[4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38,40-42,44] delta Kda { gate: Sigmoid { lower_bound: -5.0 }, beta_scale: 1.0 } k 64 v 64 d 128 conv 4 || moe 288/8 ff 2048 swiglu Some(10.0) Sigmoid bias true norm true x2.5 hash false shared 2048 swiglu Some(10.0) gate false || hc",
 ];
 
 // PIN(2026-09-27): the next-token layer, carried and not run: ik numbers it 45, the first past the
