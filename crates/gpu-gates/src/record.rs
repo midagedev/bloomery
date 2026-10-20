@@ -3460,10 +3460,10 @@ macro_rules! kinds {
 pub mod groups {
     /// `serve_seats/tiered.rs` (the gate bins' shared seat module).
     pub mod tiered {
-        use crate::record::{Kind, PLAN};
+        use crate::record::{Kind, NEED, PLAN};
 
-        /// A tiered seat's run: the plan it loads (`tiered::run`).
-        pub const RUN: &[&Kind] = &[&PLAN];
+        /// A tiered seat's run: the plan it loads and its need (`tiered::run`).
+        pub const RUN: &[&Kind] = &[&PLAN, &NEED];
     }
 
     /// `side_seat.rs`.
@@ -3799,7 +3799,6 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
     groups::side_seat::SEAT,
     &[&RESIDENCY_LEVER, &PLACE_UNSET],
     groups::tiered::RUN,
-    &[&NEED],
     groups::residency38::HOST,
     groups::fetch::FETCH,
     groups::fetch::SET,
@@ -6115,33 +6114,6 @@ mod tests {
                 assert_eq!(fields.u64("host_usable"), Ok(machine.host().usable_bytes));
                 assert_eq!(fields.i64("headroom"), Ok(i64::try_from(before).unwrap()));
             }
-        }
-    }
-
-    /// A binary that prints a plan record prints the need record beside it:
-    /// its list registers both, so a plan site added to a binary that left the
-    /// need out is caught here and not by a record the binary refuses to print.
-    #[test]
-    fn a_binary_that_prints_a_plan_prints_its_need() {
-        let lists: [(&str, &[&Kind]); 10] = [
-            ("generate_ds41", GENERATE_DS41),
-            ("bloomery-chat", BLOOMERY_CHAT),
-            ("bloomery-serve-ds41", BLOOMERY_SERVE_DS41),
-            ("bloomery-serve-qwen38", BLOOMERY_SERVE_QWEN38),
-            ("bloomery-serve qwen3", BLOOMERY_SERVE_QWEN3),
-            ("bloomery-serve mimo2", BLOOMERY_SERVE_MIMO2),
-            ("bloomery-serve nemotron", BLOOMERY_SERVE_NEMOTRON),
-            ("bloomery-serve glm", BLOOMERY_SERVE_GLM),
-            ("generate_glm5next", GENERATE_GLM5NEXT),
-            ("generate_qwen3moe", GENERATE_QWEN3MOE),
-        ];
-        for (bin, kinds) in lists {
-            let holds = |kind: &Kind| kinds.iter().any(|k| std::ptr::eq(*k, kind));
-            assert!(
-                holds(&PLAN) || holds(&PLAN38),
-                "{bin} prints no plan record"
-            );
-            assert!(holds(&NEED), "{bin} prints a plan and not its need");
         }
     }
 

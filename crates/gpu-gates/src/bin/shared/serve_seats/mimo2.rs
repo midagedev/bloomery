@@ -122,7 +122,6 @@ use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{Seat, SlotStep, note_line};
 use bloomery_gpu_gates::generate::{Lane, Place};
-use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{churn_bytes, residency_room, residency_set};
 use bloomery_gpu_gates::side_seat;
@@ -498,14 +497,12 @@ impl Tiered for Mimo {
             0,
             Record::eprint,
         )?;
-        // The hosted churn pool is host bytes the load holds beside the plan.
-        need::print(
-            plan,
-            churn_bytes(plan, 0, (residency, ChurnHosting::Hosted))?,
-            0,
-            true,
-        )?;
         Ok(residency)
+    }
+
+    /// The hosted churn pool is host bytes the load holds beside the plan.
+    fn beside_bytes(plan: &Plan<'_>, residency: Residency) -> Result<u64, GateError> {
+        churn_bytes(plan, 0, (residency, ChurnHosting::Hosted))
     }
 
     fn open(a: tiered::Open<Flags>) -> Result<Mimo, GateError> {

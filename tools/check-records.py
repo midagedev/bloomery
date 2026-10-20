@@ -40,6 +40,10 @@ The rule this check holds, with `record::require` (the runtime half) beside it:
       - a file reached by exactly one root: its kinds are in that root's list.
       - a file reached by two or more roots and no group: red, "make it a group".
       - EXCEPTIONS holds the one file kept outside the rule, with its reason.
+  * A list that holds a plan record holds the `need` record beside it (PLAN_KINDS, NEED_KIND), and a
+    file that prints a plan record calls the need owner (NEED_CALL): the need hook reads that line, so
+    a binary that loads placed and prints a plan alone fails every start that sets the hook. Every
+    root and every printing file is read, so a new binary or seat is held without being listed.
   * `schema` prints, for each checked-in tools/bloomery/schema/*.jsonl, whether the kind names
     of the composed list are the file's, in its order. `--strict` makes a difference an exit 1;
     tools/check-records.sh runs it so. The kinds' fields are the box test's
@@ -78,6 +82,12 @@ EXCEPTIONS = {
     SRC + "/generate.rs": "its kinds stay in the generate/chat lists by hand: tools/ref/cold-blocks.sh:535-542 and "
     "tools/ref/depth-glm5next.sh:63-68 read those schemas as exact print sets, and its printers run on every generate start",
 }
+
+# The plan records and the record that goes beside each of them: a placed load's need, which the
+# owner `need::print` (or `need::staged`, for a plan listed apart from its print) renders.
+PLAN_KINDS = {"PLAN", "PLAN38"}
+NEED_KIND = "NEED"
+NEED_CALL = re.compile(r"\bneed::(?:print|staged)\(")
 
 # A module name no reference leads to a file by.
 SKIP = {"record", "lib", "main", "mod", "tests", "common"}
@@ -474,6 +484,11 @@ def check_tree(tree):
                 lists.setdefault(f, []).append((name, set(kinds)))
     reach = {f: g.reach(f) for f in roots}
 
+    for f, ls in sorted(lists.items()):
+        for lname, have in ls:
+            if have & PLAN_KINDS and NEED_KIND not in have:
+                problems.append(f"{f}: list {lname} holds a plan record and not {NEED_KIND}: a placed load prints its need beside its plan, which the need hook reads")
+
     printing = {}
     for f in sorted(g.files - {RECORD}):
         ks, bad = g.prints(f)
@@ -481,6 +496,10 @@ def check_tree(tree):
             problems.append(f"{f}: `Record::new({b})` is not `Record::new(&KIND)` of a record.rs kind, which this check cannot read")
         if ks:
             printing[f] = ks
+
+    for f, ks in sorted(printing.items()):
+        if ks & PLAN_KINDS and not NEED_CALL.search(g.src.code(f)):
+            problems.append(f"{f}: prints a plan record and calls neither need::print nor need::staged: a placed load's need goes beside its plan, which the need hook reads")
 
     by_stem = {}
     for f in g.files:
@@ -798,6 +817,25 @@ def self_test():
 
     # a group module whose file does not require it nor exist
     expect("group module without a file", fixture(record_text=KINDS_FIX + GROUPS_FIX.replace("pub mod shared", "pub mod nowhere") + LISTS_GROUPED.replace("groups::shared", "groups::nowhere")), "files named nowhere.rs")
+
+    # a list with a plan record and no need record beside it is named; with it, or with the other
+    # plan kind and its need, it is green
+    plan_kinds = KINDS_FIX + "pub static PLAN: Kind = Kind { name: \"plan\", head: \"plan\", parts: &[], doc: \"\" };\n" \
+        "pub static PLAN38: Kind = Kind { name: \"plan38\", head: \"plan38\", parts: &[], doc: \"\" };\n" \
+        "pub static NEED: Kind = Kind { name: \"need\", head: \"need\", parts: &[], doc: \"\" };\n"
+    plan_lists = "pub static ROOT1: &[&Kind] = &[&PLAN, &NEED, &C];\npub static ROOT2: &[&Kind] = &[&C];\n"
+    no_items = "pub struct Item;\n"
+    expect("a plan list holding its need", fixture(grouped=False, shared=no_items, record_text=plan_kinds + plan_lists), None)
+    expect("a plan list without its need", fixture(grouped=False, shared=no_items, record_text=plan_kinds + plan_lists.replace("&PLAN, &NEED", "&PLAN")), "list ROOT1 holds a plan record and not NEED")
+    expect("a plan38 list without its need", fixture(grouped=False, shared=no_items, record_text=plan_kinds + plan_lists.replace("&PLAN, &NEED", "&PLAN38")), "list ROOT1 holds a plan record and not NEED")
+
+    # a file that prints a plan record calls the need owner: without the call it is named, with it
+    # (print, or staged for the plan that is listed apart) it is green
+    plan_file = "use crate::record::{{self, Record}};\npub struct Item;\npub fn enter() {{\n    Record::new(&crate::record::PLAN).print();\n{call}}}\n"
+    plan_tree = dict(record_text=plan_kinds + plan_lists, two="let _ = 1;", grouped=False)
+    expect("a plan printer without a need call", fixture(shared=plan_file.format(call=""), **plan_tree), "calls neither need::print nor need::staged")
+    expect("a plan printer that prints its need", fixture(shared=plan_file.format(call="    bloomery_gpu_gates::need::print(&plan, 0, 0, true);\n"), **plan_tree), None)
+    expect("a plan printer that stages its need", fixture(shared=plan_file.format(call="    let n = bloomery_gpu_gates::need::staged(&plan, 0, 0);\n"), **plan_tree), None)
 
     # the real tree: green, then red with a kind added to a group file
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

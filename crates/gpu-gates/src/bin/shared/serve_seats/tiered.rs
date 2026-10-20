@@ -19,6 +19,7 @@ use bloomery_gpu_gates::bind::{
     placement_of, slots_given, slots_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, choose_ctx, lane_at};
+use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
@@ -125,6 +126,12 @@ pub trait Tiered: Seat + Sized + 'static {
         Ok(Residency::Off)
     }
 
+    /// The host bytes the load holds beside the plan with `residency` (a churn pool), which the
+    /// `need` record adds to the plan's.
+    fn beside_bytes(_plan: &Plan<'_>, _residency: Residency) -> Result<u64, GateError> {
+        Ok(0)
+    }
+
     /// The seat on the engine thread: the session of the file at `a.path` on `a.place`, the step
     /// captured, its slots resident where the family has them, the `load` record on stderr.
     fn open(a: Open<Self::Flags>) -> Result<Self, GateError>;
@@ -223,6 +230,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         Some(pick) => S::settle(&plan, pick)?,
         None => Residency::Off,
     };
+    need::print(&plan, S::beside_bytes(&plan, residency)?, 0, true)?;
     parallel_line(slots, slot_ctx, from, Pass::of(slots, true));
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
