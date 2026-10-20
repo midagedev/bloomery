@@ -825,7 +825,8 @@ pub(crate) mod tests {
 }
 
 /// The tests that build a head from a release-shaped safetensors file.
-#[cfg(all(test, feature = "safetensors"))]
+#[cfg(test)]
+#[cfg(feature = "safetensors")]
 pub(crate) mod release_file {
     use super::tests::CFG;
     use super::*;

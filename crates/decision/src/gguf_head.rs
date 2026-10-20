@@ -318,7 +318,8 @@ impl Weights for GgufHead<'_> {
 }
 
 /// The layout's tests build the release's head as a safetensors file first and convert it.
-#[cfg(all(test, feature = "safetensors"))]
+#[cfg(test)]
+#[cfg(feature = "safetensors")]
 mod tests {
     use std::path::PathBuf;
 
