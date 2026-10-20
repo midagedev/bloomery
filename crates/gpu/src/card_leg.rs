@@ -1484,14 +1484,20 @@ pub(crate) mod tests {
                 GgmlType::Q5_K => &["sel", "arena", "tiles"],
                 _ => &["sel"],
             };
-            for &mode in modes {
+            let rules = [
+                Act::SwigluClamp { limit: 7.0 },
+                Act::SwigluOai {
+                    alpha: crate::kquant::act::SWIGLU_OAI_ALPHA,
+                    limit: 7.0,
+                },
+            ];
+            for (&mode, rule) in modes.iter().flat_map(|m| rules.map(|r| (m, r))) {
                 let (gate, up) = if mode == "sel_gate" {
                     (&wu, &wg)
                 } else {
                     (&wg, &wu)
                 };
                 let mut h = DeviceBuffer::zeroed(stream, ROWS).expect("h");
-                let rule = Act::SwigluClamp { limit: 7.0 };
                 let a = GateUpAct {
                     wg: gate,
                     wu: up,
@@ -1562,11 +1568,11 @@ pub(crate) mod tests {
                 let ok = fault == Some(Fault::at(LAYER_NONE, FaultSite::F32Product))
                     && rows.iter().all(|v| v.is_nan());
                 println!(
-                    "{ty:?} {mode}: fault={fault:?} nan={} {ok}",
+                    "{ty:?} {mode} {rule:?}: fault={fault:?} nan={} {ok}",
                     rows.iter().filter(|v| v.is_nan()).count()
                 );
                 if !ok {
-                    failures.push(format!("{ty:?} {mode}: {fault:?} {rows:?}"));
+                    failures.push(format!("{ty:?} {mode} {rule:?}: {fault:?} {rows:?}"));
                 }
             }
         }

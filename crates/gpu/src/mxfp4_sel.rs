@@ -1116,7 +1116,7 @@ impl Mxfp4SelKernels {
         let prep = self
             .module
             .prepare_mxfp4_gate_up_sel(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        let (act, limit) = a.rule.code();
+        let (act, limit) = a.rule.code(what)?;
         self.module.mxfp4_gate_up_sel(
             stream,
             &prep,

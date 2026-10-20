@@ -541,7 +541,7 @@ mod gate {
     /// The gate·up's host rule over `sel`: `SENT` for `HOST` slots and ids
     /// past the stack, `act::apply` of the two host-rule dots elsewhere.
     fn gu_host(st: &GuStack, cols: &[Col], sel: &[u32], rule: Act) -> Vec<f32> {
-        let (act, limit) = rule.code();
+        let (act, limit) = rule.code("gate_iq_sel").expect("a rule the device runs");
         let mut h = vec![SENT; sel.len() * st.rpe];
         for (s, &id) in sel.iter().enumerate() {
             if id == u32::MAX || id as usize >= st.experts {
@@ -1160,7 +1160,10 @@ mod gate {
                     let col = si / SLOTS;
                     for r in 0..st.rpe {
                         want[si * st.rpe + r] = act::apply(
-                            CLAMP0.code().0,
+                            CLAMP0
+                                .code("gate_iq_sel")
+                                .expect("a rule the device runs")
+                                .0,
                             0.0,
                             yg[col * st.rpe + r],
                             yu[col * st.rpe + r],
