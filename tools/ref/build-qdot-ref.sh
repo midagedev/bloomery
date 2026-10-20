@@ -4,7 +4,9 @@
 # sourced).
 #
 #   bash tools/ref/build-qdot-ref.sh              all of them, and the rate harnesses
-#   bash tools/ref/build-qdot-ref.sh NAME…        only those dumpers (iq4xs_ref: just build-ref-iq4xs)
+#   bash tools/ref/build-qdot-ref.sh NAME…        only those dumpers (iq4xs_ref: just build-ref-iq4xs); a NAME that is
+#                                                 not one dumper, or holds a space, is exit 64 and nothing built
+#   bash tools/ref/build-qdot-ref.sh --self-test  the NAME rules on a stand-in compiler, no ik, no box
 #
 # These link ik's own kernel tables, not just libggml: each one calls the
 # entry the oracle dispatches (iqk_set_kernels_kquants /
@@ -30,9 +32,10 @@
 # which holds the one IQ4_XS layer's experts) — until that file's .done sentinel
 # exists iq4xs_ref dumps synthetic blocks under the name synthetic-iq4_xs and
 # says so. iq4xs_ref alone links its own ik tree, the commit tools/ref/iq4xs-ik.pin names
-# (tools/ref/ik-pin-tree.sh makes it): the shared tree predates the signed AVX2 path of ik PR
-# 2664 that qdot's IQ4_XS kernel follows. Its dump has an iq4xs-ik-dot.meta naming that commit,
-# and gate-qdot refuses a dump whose meta names another. (iq4xs_rate stays on the shared tree:
+# (tools/ref/ik-pin-tree.sh makes it): the shared tree predates the signed AVX2 path that qdot's
+# IQ4_XS kernel follows. Its dump has an iq4xs-ik-dot.meta naming that commit, published with the
+# dump under iq4xs-ik-dot.lock, and gate-qdot refuses a dump whose meta is missing or names
+# another. (iq4xs_rate stays on the shared tree:
 # qdot-rate-floors.tsv's IQ4_XS floor was derived against it.) q8f0_ref reads no model: its
 # synthetic block set is written into its own dump. iq3s_ref reads no model either: there is
 # no IQ3_S file on the box, so it quantizes seeded random rows through ggml and adds
@@ -62,6 +65,51 @@
 # visible; -mavx2 -mfma -mf16c is the ISA those kernels are written for (a
 # build without them does not compile).
 set -euo pipefail
+if [ "${1:-}" = --self-test ]; then
+  set +e
+  t=$(mktemp -d "${TMPDIR:-/tmp}/build-qdot-ref-test.XXXXXX") || exit 70
+  trap 'rm -rf "$t"' EXIT
+  bad=0
+  check() { # NAME GOT WANT
+    [ "$2" = "$3" ] && return 0
+    echo "build-qdot-ref self-test FAIL $1: got '$2', want '$3'" >&2
+    bad=$((bad + 1))
+  }
+  # A g++ that writes an executable no-op at its -o path: the selection is what the run built, no ik.
+  mkdir "$t/stub"
+  cat > "$t/stub/g++" << 'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done
+printf '#!/bin/sh\n' > "$out"
+chmod +x "$out"
+EOF
+  chmod +x "$t/stub/g++"
+  # run ARGS…: the script with those arguments in a fresh output directory; RC and BUILT (what it built there).
+  run() {
+    rm -rf "${t:?}/bin" "${t:?}/data"
+    PATH=$t/stub:$PATH BLOOMERY_V41_MODEL=x BLOOMERY_DATA=$t/data Q3K_OUT=$t/bin bash "${BASH_SOURCE[0]}" "$@" > "$t/out" 2>&1
+    RC=$?
+    BUILT=$(find "$t/bin" -type f -exec basename {} \; 2> /dev/null | sort | tr '\n' ' ')
+  }
+  run q4k_x4_ref
+  check one-rc "$RC" 0
+  check one-built "$BUILT" 'q4k_x4_ref '
+  run q4k_x4_ref q6k_x4_ref
+  check two-rc "$RC" 0
+  check two-built "$BUILT" 'q4k_x4_ref q6k_x4_ref '
+  # Not one dumper: refused by name before anything is built. Two names in one argument are not one dumper.
+  for a in 'q4k_x4_ref q6k_x4_ref' 'q4k_x4_ref ' ' q4k_x4_ref' q4k bogus ''; do
+    run "$a"
+    check "refused-rc '$a'" "$RC" 64
+    check "refused-built '$a'" "$BUILT" ''
+  done
+  run q4k_x4_ref bogus
+  check late-bad-rc "$RC" 64
+  check late-bad-built "$BUILT" ''
+  echo "build-qdot-ref self-test: $([ "$bad" = 0 ] && echo ok || echo FAIL) ($bad failures)"
+  [ "$bad" = 0 ]
+  exit
+fi
 # shellcheck source=tools/ref/ref-build-common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-build-common.sh"
 OUT=${Q3K_OUT:-$REF_BIN}
@@ -82,10 +130,10 @@ RATES="q4k_x4_rate q6k_x4_rate q5f0_rate q5f1_rate q5k_x4_rate iq3xxs_rate mxfp4
 # NAME… selects dumpers; iq4xs_ref is one (below). No name: every dumper, every rate harness and mxfp4_ref.
 ONLY=("$@")
 for name in "${ONLY[@]}"; do
-  case " $DUMPERS iq4xs_ref " in
-    *" $name "*) ;;
-    *) echo "build-qdot-ref: '$name' is not a dumper ($DUMPERS iq4xs_ref)" >&2; exit 64 ;;
-  esac
+  if [[ $name == *[[:space:]]* || " $DUMPERS iq4xs_ref " != *" $name "* ]]; then
+    echo "build-qdot-ref: '$name' is not one dumper ($DUMPERS iq4xs_ref)" >&2
+    exit 64
+  fi
 done
 want() {
   [ ${#ONLY[@]} -eq 0 ] && return 0
