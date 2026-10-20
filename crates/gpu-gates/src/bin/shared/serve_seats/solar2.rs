@@ -86,7 +86,6 @@
 //! surface it binds through (`bind`, the `serve` and `sampler` crates) is
 //! scoped to `deepseek41`; it runs no V4.1 code.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -104,9 +103,8 @@ use bloomery_gpu_solar2::Body;
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::ReasoningFormat;
-use model::arch::place_hybrid::PlaceError;
 use model::arch::solar2::place::PlanInputs;
-use model::placement::{Machine, PlacementError, Plan, PlanLevers};
+use model::placement::{Machine, PlacementError, Plan};
 use runtime::Target as _;
 use serve::reasoning::ThinkTags;
 use serve::{CacheNote, Saved, ServeError};
@@ -361,17 +359,6 @@ impl Tiered for Solar {
 
     fn flags(_flag: &str, _value: &str, _out: &mut ()) -> Result<bool, GateError> {
         Ok(false)
-    }
-
-    /// One sequence: the plan of a load at one slot (`PlanInputs::plan`).
-    fn plan<'a>(
-        inputs: &'a PlanInputs,
-        machine: &'a Machine,
-        ctx: u64,
-        levers: &'a PlanLevers,
-        _slots: NonZeroUsize,
-    ) -> Result<Plan<'a>, PlaceError> {
-        inputs.plan(machine, ctx, levers)
     }
 
     fn think(inputs: &PlanInputs) -> Result<Option<ThinkTags>, GateError> {

@@ -25,9 +25,9 @@ use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{HostCfg, Levers, ResidencyPick};
 use gguf::Split;
 use model::arch::Arch;
-use model::arch::place_hybrid::{PlaceError, PlanInputs};
+use model::arch::place_hybrid::PlanInputs;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
-use model::placement::{Machine, PlacementError, Plan, PlanLevers};
+use model::placement::{PlacementError, Plan, PlanLevers};
 use serve::reasoning::ThinkTags;
 use serve::{EngineProps, ServeError};
 use tokenizer::Tokenizer;
@@ -97,15 +97,6 @@ pub trait Tiered: Seat + Sized + 'static {
 
     /// One of the seat's own flags (`SeatFlags::parse`'s `own`): `Ok(true)` took it.
     fn flags(flag: &str, value: &str, out: &mut Self::Flags) -> Result<bool, GateError>;
-
-    /// The plan of a load serving `slots` resident sequences of `ctx` positions each.
-    fn plan<'a>(
-        inputs: &'a PlanInputs<Self::H>,
-        machine: &'a Machine,
-        ctx: u64,
-        levers: &'a PlanLevers,
-        slots: NonZeroUsize,
-    ) -> Result<Plan<'a>, PlaceError>;
 
     /// The think tags the model's description names, if the family splits its reasoning on them.
     fn think(_inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
@@ -216,7 +207,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     // experts and a budget that binds are refused here by name, before any load; the load plans
     // the same.
     let asked = choose_ctx(&split, (a.ctx, slots), (None, None), |c| {
-        probe_of(S::plan(&inputs, &machine, c, &plan_levers, n))
+        probe_of(inputs.plan_with_slots(&machine, c, &plan_levers, n))
             .map_err(|e| format!("--place {}: {e}", place.name()))
     })?;
     eprintln!("{}", asked.line());

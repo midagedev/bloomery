@@ -261,7 +261,7 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::serve_client::{
         Answer, PrefixTurns, Served, agree, chat_is_those_ids, check, curl, edit_and_extension,
-        greedy, json_of, metric, rendered, serve_cmd, server_log, tokenized,
+        greedy, json_of, metric, rendered, serve_cmd, server_log, tokenized, utf8,
     };
     use bloomery_gpu_gates::slots_gate;
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, ref_model_path};
@@ -422,11 +422,6 @@ mod gate {
             dir: dir.ok_or(USAGE)?,
             after_refusals,
         })
-    }
-
-    fn utf8(p: &Path) -> Result<&str, GateError> {
-        Ok(p.to_str()
-            .ok_or_else(|| format!("{} is not UTF-8", p.display()))?)
     }
 
     /// The chat turn the file answers.

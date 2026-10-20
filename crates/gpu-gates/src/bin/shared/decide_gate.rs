@@ -22,10 +22,7 @@ pub fn check(ok: &mut bool, name: &str, pass: bool) {
     *ok &= pass;
 }
 
-pub fn utf8(p: &Path) -> Result<&str, GateError> {
-    Ok(p.to_str()
-        .ok_or_else(|| format!("{} is not UTF-8", p.display()))?)
-}
+pub use bloomery_gpu_gates::serve_client::utf8;
 
 /// `bloomery-serve` beside this binary with `args`, `BLOOMERY_REF_MODEL`
 /// removed, its logs in `<dir>/<name>/`.

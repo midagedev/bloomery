@@ -112,7 +112,6 @@
 //! binds through (`bind`, the `serve` and `sampler` crates) is scoped to
 //! `deepseek41`; it runs no V4.1 code.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -133,8 +132,7 @@ use bloomery_levers::{ChurnHosting, Levers, ResidencyAt, ResidencyPick, Residenc
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::place::PlanInputs;
-use model::arch::place_hybrid::PlaceError;
-use model::placement::{Machine, PlacementError, Plan, PlanLevers};
+use model::placement::{Machine, PlacementError, Plan};
 use runtime::Target as _;
 use serve::{CacheNote, Saved, ServeError};
 
@@ -439,17 +437,6 @@ impl Tiered for Mimo {
             }
             _ => Ok(false),
         }
-    }
-
-    /// Every slot's stores at a slot's positions (`PlanInputs::plan_with_slots`).
-    fn plan<'a>(
-        inputs: &'a PlanInputs,
-        machine: &'a Machine,
-        ctx: u64,
-        levers: &'a PlanLevers,
-        slots: NonZeroUsize,
-    ) -> Result<Plan<'a>, PlaceError> {
-        inputs.plan_with_slots(machine, ctx, levers, slots)
     }
 
     /// `BLOOMERY_RESIDENCY`: set as given, else the serving word on a serving placement, which
