@@ -10,7 +10,7 @@ term: client-side wall p50 in ms of POST to a complete answer, short bucket, Qwe
   off, thinking off, RTX A6000 - (jump - step) / step, paired by round
 unit: %
 predict: -45..-33
-rounds: 8
+rounds: 6
 sd: 2.0 % assumption: as sj-jump-vs-step-a6000; the sitting's own scatter replaces it
 condition: each window holds one Qwen3.6 server beside the Clef-Flash server; on ko-06 the jump window's
   timings.constrained shows next_calls 0, prefill_calls 0, next_after_calls 1, lead 4, tail 2 and the step
