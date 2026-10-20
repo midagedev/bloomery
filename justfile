@@ -1852,7 +1852,7 @@ gate-prepare:
 
 # The served tokenizer against the pinned HF corpus; BLOOMERY_QWEN38_HF names its checkpoint folder.
 gate-prepare-corpus:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model-hf --bin prepare hw_the_served_tokenizer_encodes_the_corpus_as_hf -- --ignored --nocapture'
+    ./tools/box.sh 'bash tools/ref/needs-env.sh gate-prepare-corpus BLOOMERY_QWEN38_HF && bash tools/gate.sh --release -p bloomery-model-hf --bin prepare hw_the_served_tokenizer_encodes_the_corpus_as_hf -- --ignored --nocapture'
 
 # What the model description does with the hub (crates/model-hf, host only): the fixture fetch's header reads by range
 # into sparse files, the refusal of a header that outruns its listing or a short range, and GLM-5.3-Flash's checkpoint
