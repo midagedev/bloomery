@@ -16,6 +16,8 @@ workspace = true
 bloomery-gguf = { path = "../gguf" }
 bloomery-hf = { path = "../hf" }
 bloomery-model = { path = "../model" }
+# The `prepare` bin builds serving's tokenizer from the GGUF header it wrote and checks its split.
+bloomery-tokenizer = { path = "../tokenizer" }
 # The `fixture` bin reads its own page faults (`getrusage`).
 libc = { workspace = true }
 # The GLM name map reads a Hugging Face checkpoint's config.json.

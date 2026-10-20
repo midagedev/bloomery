@@ -1,4 +1,4 @@
-"""The Hugging Face encode corpus for crates/model/src/bin/prepare.rs's served-tokenizer test.
+"""The Hugging Face encode corpus for crates/model-hf/src/bin/prepare.rs's served-tokenizer test.
 
 usage (Python 3 with tokenizers==0.21.0 from PyPI):
     python3 hf_encode.py <folder> | gzip -9n > qwen3.8-hf-encode.json.gz

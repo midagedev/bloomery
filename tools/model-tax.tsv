@@ -151,7 +151,7 @@ crates/model/src/arch/mod.rs	mimo	4	baseline A 5: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	nemotron	8	baseline A 10: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	qwen	16	baseline A 19: MK1a/MK1b ArchRow registry
 crates/model/src/bin/bloomery-decode.rs	deepseek	3	baseline R 4: MK1a one registry row per crate
-crates/model/src/bin/prepare.rs	qwen	1	PIN(2026-10-20) qwen: the checkpoint architecture selected by the converter
+crates/model-hf/src/bin/prepare.rs	qwen	1	PIN(2026-10-20) qwen: the checkpoint architecture selected by the converter
 crates/model/src/bin/r8conv.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
 crates/models/src/lib.rs	deepseek	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	gemma	4	baseline A 4: MK1a/MK1b ArchRow registry

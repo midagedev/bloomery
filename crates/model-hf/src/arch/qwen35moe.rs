@@ -20,7 +20,8 @@ use hf::safetensors::{self, Raw};
 use hf::schema::{self, Fields, Rule::*, Type};
 use serde_json::Value as Json;
 
-use super::names::{self, Sub};
+use model::arch::qwen35moe::hparams::{MAX_PLE_HEADS, MAX_PLE_NGRAM};
+use model::arch::qwen35moe::names::{self, Sub};
 
 /// Why the checkpoint was refused.
 #[derive(Debug, thiserror::Error)]
@@ -554,8 +555,8 @@ impl Checkpoint {
             let per = c.count("heads_per_ngram")?;
             let heads = (ngram - 1)
                 .checked_mul(per)
-                .filter(|&h| h > 0 && h as usize <= super::hparams::MAX_PLE_HEADS)
-                .filter(|_| ngram >= 2 && ngram as usize <= super::hparams::MAX_PLE_NGRAM)
+                .filter(|&h| h > 0 && h as usize <= MAX_PLE_HEADS)
+                .filter(|_| ngram >= 2 && ngram as usize <= MAX_PLE_NGRAM)
                 .ok_or_else(|| {
                     c.bad(
                         "ngram_size",

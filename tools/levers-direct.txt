@@ -19,7 +19,7 @@ crates/gpu/src/flash.rs	BLOOMERY_FLASH_SEG,BLOOMERY_FLASH_MMA	v2fence
 crates/gpu-gates/src/bin/shared/ds41_dspark.rs	BLOOMERY_DSPARK_CARD	session
 crates/qdot/src/lib.rs	BLOOMERY_QDOT_AVX512	isa-owner
 # Paths and profile facts (audit TL-6).
-crates/model/src/bin/prepare.rs	BLOOMERY_QWEN38_HF	test harness checkpoint folder, not a serving lever
+crates/model-hf/src/bin/prepare.rs	BLOOMERY_QWEN38_HF	test harness checkpoint folder, not a serving lever
 crates/gguf/src/v41.rs	BLOOMERY_V41_MODEL,BLOOMERY_REF_MODEL,BLOOMERY_REF_MODEL_PROFILE,BLOOMERY_FIXTURE_MODEL	gatestoml
 crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/refset/src/lib.rs	BLOOMERY_DATA	gatestoml

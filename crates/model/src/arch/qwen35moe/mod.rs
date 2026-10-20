@@ -5,8 +5,8 @@
 //! every tensor's role (`roles`) and the typed description (`spec`), which
 //! the coverage check lists what a program has to run from; for qwen4exp the
 //! tensor names its program reads (`names`), the plan from the headers
-//! (`place`), the host tier's view of a routed layer (`host`) and the Hugging Face
-//! checkpoint's tensors and keys in those names (`hf`).
+//! (`place`) and the host tier's view of a routed layer (`host`); `model-hf`
+//! maps the Hugging Face checkpoint's tensors and keys onto those names.
 //!
 //! The trunk interleaves gated delta-rule (GDN) layers with gated GQA layers;
 //! every qwen35moe layer routes to experts and runs a sigmoid-gated shared
@@ -23,7 +23,6 @@
 
 pub mod fixture;
 pub mod head_list;
-pub mod hf;
 pub mod host;
 pub mod hparams;
 pub mod mtp;

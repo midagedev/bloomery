@@ -1,7 +1,7 @@
 //! prepare — a Hugging Face checkpoint folder as a GGUF split the server opens as it opens any
 //! (`gguf::Split`). The folder's quantization config places each tensor in a format
 //! (`hf::quant_config`), the model's map names it, says how its role reads it and moves it into
-//! the program's layout (`model::arch::qwen35moe::hf::Checkpoint`, qwen4exp's reader), and one table writes each
+//! the program's layout (`model_hf::arch::qwen35moe::Checkpoint`, qwen4exp's reader), and one table writes each
 //! format as its GGUF type (`hf::modelopt::normalize`).
 //!
 //!     prepare <folder> <out prefix> [--shard-gib <n>]
@@ -27,7 +27,7 @@ use gguf::{GgmlType, Value};
 use hf::modelopt::{self, Normal, Use};
 use hf::quant_config::{self, Config, Format};
 use hf::safetensors::{Dtype, Folder};
-use model::arch::qwen35moe::hf::{Checkpoint, Mapped};
+use model_hf::arch::qwen35moe::{Checkpoint, Mapped};
 
 const USAGE: &str = "usage: prepare <folder> <out prefix> [--shard-gib <n>]";
 

@@ -328,6 +328,7 @@ dependencies = [
  "bloomery-hf",
  "bloomery-model",
  "bloomery-refset",
+ "bloomery-tokenizer",
  "flate2",
  "libc",
  "serde_json",

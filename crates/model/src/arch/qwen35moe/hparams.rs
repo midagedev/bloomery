@@ -23,8 +23,8 @@ const SOFTMAX: u64 = 1;
 
 /// llama.cpp's `LLAMA_MAX_PLE_NGRAM` and `LLAMA_MAX_PLE_HEADS`
 /// (`src/llama-hparams.h`).
-pub(super) const MAX_PLE_NGRAM: usize = 8;
-pub(super) const MAX_PLE_HEADS: usize = 64;
+pub const MAX_PLE_NGRAM: usize = 8;
+pub const MAX_PLE_HEADS: usize = 64;
 
 /// The family member a file is, by its `general.architecture`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
