@@ -31,6 +31,46 @@ pub struct Dims {
     pub vocab: usize,
 }
 
+/// The layers before the real file's stream carries its outlier channels: PAI's own CPU and GPU runs agree to a few percent there.
+pub const TAP_EARLY: usize = 4;
+
+/// The two ceilings of a layer output's relative distance between two implementations of the model, in the real file:
+/// `TAP_EARLY_CEIL` over the first [`TAP_EARLY`] layers, `TAP_CEIL` after.
+///
+/// [derived]: PAI's CPU dump against its hybrid GPU run of the same prompt (the oracle round's per-tensor last-row sums of
+/// squares and first 8 values) gives the norm distance at most 0.024 and, from the 8 values, an estimate of
+/// `‖Δ‖ / ‖ref‖` (the rms-normalised error, if the error is spread evenly) of 0.008-0.022 at layers 0-3 and 0.034-0.158
+/// from layer 4 on (median 0.106): the stream grows its outlier channels there and the same roundings weigh more. Ours
+/// against PAI is a third implementation of that kind, so each ceiling is about twice its stretch's worst. A beta that is
+/// not doubled, or a decay of another form, moves layer 1 by the order of its own contribution, past the early ceiling.
+// PIN(2026-10-20): provisional until the first body runs on the box; the first run prints every layer's distance and the
+// ceilings are re-pinned there with the full-row distances.
+pub const TAP_EARLY_CEIL: f64 = 0.05;
+pub const TAP_CEIL: f64 = 0.3;
+
+/// The ceiling of layer `layer`'s output distance in `tier`'s file.
+///
+/// The fixture has no early stretch: its four layers hold random weights, so nothing damps the q8 re-rounding of each layer's
+/// input and it compounds from the first layer on. Ours against PAI reads 0.030 at layer 0 and 0.105-0.136 at layer 3 over the
+/// fixture's three prompts with layer outputs; the prompt batch against the steps reads 0.010-0.016 at layer 0 and 0.045-0.163
+/// at layer 3 over the prefill gate's prompts. [`TAP_EARLY_CEIL`] is under both from layer 1 on. Every fixture layer takes
+/// [`TAP_CEIL`], 1.8 times the larger worst: the margin the real ceilings have over their own stretch's worst.
+// PIN(2026-10-21): new for the fixture tier, not a relaxation (the real tier's two ceilings are as they were); derived above.
+pub fn tap_ceil(tier: Tier, layer: usize) -> f64 {
+    match tier {
+        Tier::Real if layer < TAP_EARLY => TAP_EARLY_CEIL,
+        Tier::Real | Tier::Fixture => TAP_CEIL,
+    }
+}
+
+/// The ceilings of [`tap_ceil`] as a gate's line prints them.
+pub fn tap_ceils(tier: Tier) -> String {
+    match tier {
+        Tier::Real => format!("ceilings {TAP_EARLY_CEIL} (layers < {TAP_EARLY}) and {TAP_CEIL}"),
+        Tier::Fixture => format!("ceiling {TAP_CEIL} (every layer)"),
+    }
+}
+
 /// One loaded Solar-Open2 body on the gate card.
 pub trait Seat {
     fn dims(&self) -> Dims;

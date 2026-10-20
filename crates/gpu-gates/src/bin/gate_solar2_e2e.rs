@@ -16,9 +16,10 @@
 //! - `reset_rewinds` (self-consistency): after a reset prompt a gives the same logits and layer outputs bit for bit.
 //! - `layer_outputs_near_pai` (oracle) and its fixture twin `layer_outputs_near_pai_fx` (fixture-oracle, the `fx_` sets
 //!   dumped on the fixture file): each layer's output at the last position of sets a, b and c against PAI's `l_out-L`, by the
-//!   relative distance `‖ours − pai‖ / ‖pai‖`, every layer within [`tap_ceil`] (tight over the first [`TAP_EARLY`] layers, wide
-//!   after). The first layer past it is named: a beta that is not doubled, or a decay of another form, moves layer 1's output
-//!   (the first KDA layer) by the order of its own contribution.
+//!   relative distance `‖ours − pai‖ / ‖pai‖`, every layer within [`seat::tap_ceil`] (real: tight over the first
+//!   [`seat::TAP_EARLY`] layers, wide after; fixture: wide on every layer). The first layer past it is named: a beta that is
+//!   not doubled, or a decay of another form, moves layer 1's output (the first KDA layer) by the order of its own
+//!   contribution.
 //! - `top_logprobs_in_band` (oracle): on each prompt, over the ids both our top 40 and PAI's top 40 hold, the log-softmax of
 //!   the logits row within the error model's band of PAI's logprob ([`sigma_lp`] an id, the worst of the ids within
 //!   [`k_of`]), and our top 10 sharing at least [`overlap_floor`] ids with PAI's. Both are two implementations' difference
@@ -146,31 +147,6 @@ mod gate {
         (mean, floor)
     }
 
-    /// The layers before the stream carries its outlier channels: PAI's own CPU and GPU runs agree to a few percent there.
-    const TAP_EARLY: usize = 4;
-
-    /// The ceiling of a layer output's relative distance from PAI's: [`TAP_EARLY_CEIL`] over the first [`TAP_EARLY`] layers,
-    /// [`TAP_CEIL`] after.
-    ///
-    /// [derived]: PAI's CPU dump against its hybrid GPU run of the same prompt (the oracle round's per-tensor last-row sums of
-    /// squares and first 8 values) gives the norm distance at most 0.024 and, from the 8 values, an estimate of
-    /// `‖Δ‖ / ‖ref‖` (the rms-normalised error, if the error is spread evenly) of 0.008-0.022 at layers 0-3 and 0.034-0.158
-    /// from layer 4 on (median 0.106): the stream grows its outlier channels there and the same roundings weigh more. Ours
-    /// against PAI is a third implementation of that kind, so each ceiling is about twice its stretch's worst. A beta that is
-    /// not doubled, or a decay of another form, moves layer 1 by the order of its own contribution, past the early ceiling.
-    // PIN(2026-10-20): provisional until the first body runs on the box; the first run prints every layer's distance and the
-    // ceilings are re-pinned there with the full-row distances.
-    const TAP_EARLY_CEIL: f64 = 0.05;
-    const TAP_CEIL: f64 = 0.3;
-
-    fn tap_ceil(layer: usize) -> f64 {
-        if layer < TAP_EARLY {
-            TAP_EARLY_CEIL
-        } else {
-            TAP_CEIL
-        }
-    }
-
     /// One prompt's oracle: its set, ids, PAI's last logits row, top table and greedy continuation.
     struct Oracle {
         name: &'static str,
@@ -190,6 +166,7 @@ mod gate {
     }
 
     struct Case {
+        tier: Tier,
         dims: Dims,
         oracles: Vec<Oracle>,
         runs: Vec<Run>,
@@ -377,13 +354,16 @@ mod gate {
                     (0.0f64, 0usize),
                     |w, (l, &d)| if d > w.0 { (d, l) } else { w },
                 );
-            let first = table.iter().enumerate().position(|(l, &d)| d > tap_ceil(l));
+            let first = table
+                .iter()
+                .enumerate()
+                .position(|(l, &d)| d > seat::tap_ceil(case.tier, l));
             let pass = first.is_none();
             println!(
-                "{label}: prompt {} ({} ids): worst {worst:.4} at layer {at}, ceilings {TAP_EARLY_CEIL} (layers < {TAP_EARLY}) and {TAP_CEIL}, first past \
-                 it {first:?} {}",
+                "{label}: prompt {} ({} ids): worst {worst:.4} at layer {at}, {}, first past it {first:?} {}",
                 o.name,
                 o.ids.len(),
+                seat::tap_ceils(case.tier),
                 verdict(pass)
             );
             println!(
@@ -574,6 +554,7 @@ mod gate {
             runs.push(run_of(seat.as_mut(), &o.ids)?);
         }
         let case = Case {
+            tier: tier_now,
             dims,
             oracles,
             runs,
@@ -596,8 +577,9 @@ mod gate {
         }
         println!(
             "PASSED: {NAME} the logits and layer outputs are finite with the fault word clean; a reset rewinds them bit for bit; \
-             every layer's output stays within {TAP_EARLY_CEIL} (first {TAP_EARLY} layers) or {TAP_CEIL} of PAI's; in the real tier the shared top logprobs of each prompt stay within \
-             two implementations' band of PAI's with the top-10 overlap held, and the teacher-forced greedy disagreements at a clear margin stay within the pin"
+             every layer's output stays within its tier's ({}) distance of PAI's; in the real tier the shared top logprobs of each prompt stay within \
+             two implementations' band of PAI's with the top-10 overlap held, and the teacher-forced greedy disagreements at a clear margin stay within the pin",
+            seat::tap_ceils(tier_now)
         );
         Ok(())
     }
