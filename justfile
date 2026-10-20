@@ -751,6 +751,12 @@ perf-decode *ARGS: build-decode
 build-ref:
     ./tools/box.sh 'bash tools/ref/build-qdot-ref.sh'
 
+# The IQ4_XS reference alone: its own ik tree at the commit of tools/ref/iq4xs-ik.pin (made once by
+# tools/ref/ik-pin-tree.sh, CPU only), iq4xs_ref linked to it, and the dump with the meta that names the commit.
+# gate-qdot's two IQ4_XS clauses read them; no other dump is touched.
+build-ref-iq4xs:
+    ./tools/box.sh 'bash tools/ref/build-qdot-ref.sh iq4xs_ref'
+
 # The V4.1 file's r8 sidecar (model::r8file): builds r8conv, then tools/ref/r8-sidecar.sh converts and
 # verifies it under the CPU lease — 155.7 GB written beside the source on /models. A tool run, not a
 # gate; the user decides when. ARGS: `verify` checks an existing sidecar again without converting.

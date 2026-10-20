@@ -8,6 +8,11 @@
 // the 6-bit scale split, and multiply_add_avx2's sign fold. Each block has one
 // float multiply-add and no bsums offset.
 //
+// The path is ik PR 2664's. This harness links the ik tree that tools/ref/iq4xs-ik.pin names
+// (tools/ref/ik-pin-tree.sh makes it), not the shared tree the other harnesses link, and
+// REF_IK_COMMIT is that commit. The dump's .meta (iq4xs-ik-dot.meta: ik=<commit>, built=<UTC>)
+// is written after the dump, and gate-qdot refuses a dump whose meta names another commit.
+//
 // The GGUF is argv[1]: build-qdot-ref.sh passes the Qwen3.8 UD-Q3_K_XL second shard
 // (BLOOMERY_QWEN_Q3_MODEL), whose IQ4_XS tensors are the one layer's ffn_gate/up_exps.
 // That file downloads beside this round: until `<argv[1]>.done` exists the harness dumps
@@ -27,9 +32,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 #include "ref_paths.h"
+
+#ifndef REF_IK_COMMIT
+#error "REF_IK_COMMIT must name the ik commit (tools/ref/build-qdot-ref.sh defines it from tools/ref/iq4xs-ik.pin)"
+#endif
 
 static const char *kDataDir = ref_data_dir();
 static const int kDotRows = 64;
@@ -171,6 +181,12 @@ int main(int argc, char **argv) {
         dot += "\n";
     }
     if (!write_atomic(std::string(kDataDir) + "/ref/iq4xs-ik-dot.txt", dot.data(), dot.size())) return 1;
-    printf("dumped %d rows of %s (q8_K pairing)\n", dot_rows, tensor_name.c_str());
+    // The meta goes last: a dump never sits beside a meta that vouches for a commit it was not made at.
+    char stamp[32];
+    const time_t now = time(nullptr);
+    strftime(stamp, sizeof stamp, "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+    const std::string meta = std::string("ik=") + REF_IK_COMMIT + "\nbuilt=" + stamp + "\n";
+    if (!write_atomic(std::string(kDataDir) + "/ref/iq4xs-ik-dot.meta", meta.data(), meta.size())) return 1;
+    printf("dumped %d rows of %s (q8_K pairing, ik %s)\n", dot_rows, tensor_name.c_str(), REF_IK_COMMIT);
     return 0;
 }

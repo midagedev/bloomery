@@ -3,6 +3,9 @@
 # reference ones (on the box). Runs under tools/box.sh (toolchain env already
 # sourced).
 #
+#   bash tools/ref/build-qdot-ref.sh              all of them, and the rate harnesses
+#   bash tools/ref/build-qdot-ref.sh NAME…        only those dumpers (iq4xs_ref: just build-ref-iq4xs)
+#
 # These link ik's own kernel tables, not just libggml: each one calls the
 # entry the oracle dispatches (iqk_set_kernels_kquants /
 # iqk_set_kernels_legacy_quants / iqk_set_kernels_iquants).
@@ -26,10 +29,15 @@
 # named by BLOOMERY_QWEN_Q3_MODEL (default: the Qwen3.8 UD-Q3_K_XL second shard,
 # which holds the one IQ4_XS layer's experts) — until that file's .done sentinel
 # exists iq4xs_ref dumps synthetic blocks under the name synthetic-iq4_xs and
-# says so. q8f0_ref reads no model: its synthetic block set is written into its
-# own dump. iq3s_ref reads no model either: there is no IQ3_S file on the box, so it
-# quantizes seeded random rows through ggml and adds random-code rows (every grid index
-# and sign byte), and dumps them under the name synthetic-iq3_s. q2k_ref and iq2xs_ref read
+# says so. iq4xs_ref alone links its own ik tree, the commit tools/ref/iq4xs-ik.pin names
+# (tools/ref/ik-pin-tree.sh makes it): the shared tree predates the signed AVX2 path of ik PR
+# 2664 that qdot's IQ4_XS kernel follows. Its dump has an iq4xs-ik-dot.meta naming that commit,
+# and gate-qdot refuses a dump whose meta names another. (iq4xs_rate stays on the shared tree:
+# qdot-rate-floors.tsv's IQ4_XS floor was derived against it.) q8f0_ref reads no model: its
+# synthetic block set is written into its own dump. iq3s_ref reads no model either: there is
+# no IQ3_S file on the box, so it quantizes seeded random rows through ggml and adds
+# random-code rows (every grid index and sign byte), and dumps them under the name
+# synthetic-iq3_s. q2k_ref and iq2xs_ref read
 # the GLM-5.3-Flash UD-Q2_K_XL file: iq2xs_ref the file named by GLM_Q2_IQ2XS_MODEL (default its
 # second shard, which holds the first IQ2_XS routed stack) and q2k_ref the file named by
 # GLM_Q2_Q2K_MODEL (default its fourth shard, whose first Q2_K tensor is the NextN layer's
@@ -68,12 +76,28 @@ GLM_Q2_IQ2XS_MODEL=${GLM_Q2_IQ2XS_MODEL:-/models/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.
 GLM_Q2_Q2K_MODEL=${GLM_Q2_Q2K_MODEL:-/models/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00004-of-00004.gguf}
 mkdir -p "$OUT" "$BLOOMERY_DATA/ref"
 
-DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref iq3xxs_ref mxfp4_x4_ref q8f0_ref iq4nl_ref iq4xs_ref iq3s_ref q2k_ref iq2xs_ref"
+DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref iq3xxs_ref mxfp4_x4_ref q8f0_ref iq4nl_ref iq3s_ref q2k_ref iq2xs_ref"
 RATES="q4k_x4_rate q6k_x4_rate q5f0_rate q5f1_rate q5k_x4_rate iq3xxs_rate mxfp4_x4_rate iq4nl_rate iq4xs_rate iq3s_rate q2k_rate iq2xs_rate"
+
+# NAME… selects dumpers; iq4xs_ref is one (below). No name: every dumper, every rate harness and mxfp4_ref.
+ONLY=("$@")
+for name in "${ONLY[@]}"; do
+  case " $DUMPERS iq4xs_ref " in
+    *" $name "*) ;;
+    *) echo "build-qdot-ref: '$name' is not a dumper ($DUMPERS iq4xs_ref)" >&2; exit 64 ;;
+  esac
+done
+want() {
+  [ ${#ONLY[@]} -eq 0 ] && return 0
+  local n
+  for n in "${ONLY[@]}"; do [ "$n" = "$1" ] && return 0; done
+  return 1
+}
 
 # Same flags for both sets: the rate harnesses include the same ik headers under
 # the same IQK_IMPLEMENT as their _ref twins.
 for name in $DUMPERS $RATES; do
+  want "$name" || continue
   ref_cxx -mavx2 -mfma -mf16c -o "$OUT/$name" "$HERE/tools/ref/$name.cpp" \
     "${REF_GGML_INC[@]}" -I"$IK/ggml/src" -I"$IK/ggml/src/iqk" "${REF_GGML_LINK[@]}"
   echo "built $OUT/$name"
@@ -81,16 +105,30 @@ done
 
 # The dumps are the output of THIS ik build: rerun this script when ik moves.
 for name in $DUMPERS; do
+  want "$name" || continue
   case $name in
     q5k_x4_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$Q5K_MODEL" ;;
     iq3xxs_ref|mxfp4_x4_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$V4_MODEL" ;;
     iq4nl_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$QWEN_Q4_MODEL" ;;
-    iq4xs_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$QWEN_Q3_MODEL" ;;
     iq2xs_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$GLM_Q2_IQ2XS_MODEL" ;;
     q2k_ref) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" "$GLM_Q2_Q2K_MODEL" ;;
     *) BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/$name" ;;
   esac
 done
+
+# iq4xs_ref links the tree of tools/ref/iq4xs-ik.pin, never $IK: the include roots and the
+# libggml are that tree's, and the harness carries its commit into the dump's .meta.
+if want iq4xs_ref; then
+  IQ4XS_PIN_FILE=$HERE/tools/ref/iq4xs-ik.pin
+  IQ4XS_IK=$(bash "$HERE/tools/ref/ik-pin-tree.sh" "$IQ4XS_PIN_FILE")
+  read -r IQ4XS_COMMIT < "$IQ4XS_PIN_FILE"
+  ref_cxx -mavx2 -mfma -mf16c -DREF_IK_COMMIT="\"$IQ4XS_COMMIT\"" -o "$OUT/iq4xs_ref" "$HERE/tools/ref/iq4xs_ref.cpp" \
+    -I"$IQ4XS_IK/ggml/include" -I"$IQ4XS_IK/ggml/src" -I"$IQ4XS_IK/ggml/src/iqk" \
+    -L"$IQ4XS_IK/build/ggml/src" -lggml -Wl,-rpath,"$IQ4XS_IK/build/ggml/src"
+  echo "built $OUT/iq4xs_ref"
+  BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/iq4xs_ref" "$QWEN_Q3_MODEL"
+fi
+[ ${#ONLY[@]} -eq 0 ] || exit 0
 
 GGML_BUILD="$IK@$(git -c safe.directory='*' -C "$IK" rev-parse --short=8 HEAD 2>/dev/null || echo unknown-commit)"
 ref_cxx -DREF_GGML_BUILD="\"$GGML_BUILD\"" -o "$OUT/mxfp4_ref" "$HERE/tools/ref/mxfp4_ref.cpp" \
@@ -104,6 +142,7 @@ ls -l "$BLOOMERY_DATA"/ref/q4k-x4-ik-dot.txt "$BLOOMERY_DATA"/ref/q6k-x4-ik-dot.
       "$BLOOMERY_DATA"/ref/iq3xxs-ik-dot.txt "$BLOOMERY_DATA"/ref/mxfp4-x4-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q8f0-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/iq4nl-ik-dot.txt "$BLOOMERY_DATA"/ref/iq4xs-ik-dot.txt \
+      "$BLOOMERY_DATA"/ref/iq4xs-ik-dot.meta \
       "$BLOOMERY_DATA"/ref/iq3s-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q2k-ik-dot.txt "$BLOOMERY_DATA"/ref/iq2xs-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q5k-v41-dequant.meta \
