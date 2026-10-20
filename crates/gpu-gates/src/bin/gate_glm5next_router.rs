@@ -1,5 +1,6 @@
 //! GPU gate for the sigmoid routers of `bloomery_gpu_deepseek41::router`,
-//! GLM-5.3-Flash's (`glm5next`) and MiMo-V2.6-Flash's (`mimo2`): the experts
+//! GLM-5.3-Flash's (`glm5next`), MiMo-V2.6-Flash's (`mimo2`) and the 320-expert
+//! instance Solar-Open2 uses (`sigmoid_320_8`): the experts
 //! scored `sigmoid(logit)`, a selection bias for the selection only, the top
 //! 8 by (value descending, index descending), the unbiased scores summed in
 //! f64 in slot order, narrowed, guarded (`renorm_divisor`), each divided by
@@ -9,10 +10,11 @@
 //!
 //! The clauses below run once per instance, as its own cases, over the same
 //! host rule: `glm5next` at 288 experts and a scale of 2.5, then `mimo2` at
-//! 256 experts and a scale of 1. A line names its instance by the entry in
-//! `ties case=` and `graph op=`; the instance's header line opens its
-//! clauses. The entry names below are `glm5next`'s; `mimo2`'s are the
-//! same with the prefix `mimo2_`.
+//! 256 experts and a scale of 1, then `sigmoid_320_8` at 320 experts and a
+//! scale of 1. A line names its instance by the entry in `ties case=` and
+//! `graph op=`; the instance's header line opens its clauses. The entry names
+//! below are `glm5next`'s; the other instances' are the same with the prefix
+//! `mimo2_` and `sigmoid_320_8_`.
 //!
 //! One clause per rule, each its own verdict line:
 //! - `logits`: [`TOKENS`] one-token launches (`glm5next_router`) at
@@ -66,7 +68,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::route_core::{renorm_divisor, sigmoid};
     use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE};
-    use bloomery_gpu_deepseek41::router::{glm5next, mimo2};
+    use bloomery_gpu_deepseek41::router::{glm5next, mimo2, sigmoid_320_8};
     use bloomery_gpu_gates::rounding::butterfly;
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
     use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -78,9 +80,11 @@ mod gate {
     /// Tokens of the seeded clauses: seven full tiles of the batch score
     /// launch and a partial eighth.
     const TOKENS: usize = 61;
-    /// Experts each token routes to: both instances keep eight.
+    /// Experts each token routes to: every instance keeps eight.
     const N_USED: usize = 8;
-    const _: () = assert!(glm5next::N_USED == N_USED && mimo2::N_USED == N_USED);
+    const _: () = assert!(
+        glm5next::N_USED == N_USED && mimo2::N_USED == N_USED && sigmoid_320_8::N_USED == N_USED
+    );
     /// CUDA's `expf` (the libdevice body the kernel calls): at most 2 ulp
     /// (CUDA C++ Programming Guide, mathematical functions), and `1 + expf`
     /// may be fused into its last step and round once — 2.5 ulp of `e^-x`,
@@ -234,6 +238,8 @@ mod gate {
     instance!(Glm, glm5next, "glm5next_router", 2.5);
     // MiMo-V2.6-Flash: 256 experts, the file's scale 1.
     instance!(Mimo, mimo2, "mimo2_router", 1.0);
+    // The 320-expert instance (Solar-Open2): scale 1 (the file's).
+    instance!(Wide, sigmoid_320_8, "sigmoid_320_8_router", 1.0);
 
     /// One f32 ulp at `v`: the spacing of f32 values at `|v|`'s binade (the
     /// subnormal spacing below the normal range).
@@ -742,10 +748,11 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let (gpu, glm_ok) = run_instance::<Glm>(Gpu::new()?)?;
-        let (_gpu, mimo_ok) = run_instance::<Mimo>(gpu)?;
-        if glm_ok && mimo_ok {
+        let (gpu, mimo_ok) = run_instance::<Mimo>(gpu)?;
+        let (_gpu, wide_ok) = run_instance::<Wide>(gpu)?;
+        if glm_ok && mimo_ok && wide_ok {
             println!(
-                "PASSED: {NAME} — {} ({}/{N_USED}, sigmoid, x{}) and {} ({}/{N_USED}, sigmoid, x{}), each with its batch \
+                "PASSED: {NAME} — {} ({}/{N_USED}, sigmoid, x{}), {} ({}/{N_USED}, sigmoid, x{}) and {} ({}/{N_USED}, sigmoid, x{}), each with its batch \
                  pair: logits, ids and weights bit-identical to the host rule over {TOKENS} seeded tokens, \
                  scores in the sigmoid band, 8 tie cases, the guard, the fault, the graph",
                 Glm::OP,
@@ -753,7 +760,10 @@ mod gate {
                 Glm::SCALE,
                 Mimo::OP,
                 Mimo::E,
-                Mimo::SCALE
+                Mimo::SCALE,
+                Wide::OP,
+                Wide::E,
+                Wide::SCALE
             );
             Ok(())
         } else {

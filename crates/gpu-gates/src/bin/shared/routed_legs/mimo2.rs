@@ -119,13 +119,18 @@ fn place_gate(e: &GateError) -> Outcome {
 
 /// A plan refusal as an outcome: the placement's own are named by
 /// [`refused_of`], a room that pages experts to the NVMe tier the body does
-/// not serve is named here; a tier card, a context of no position or an
-/// invariant break is red.
+/// not serve and a card that cannot hold the prompt batch's reserve are named
+/// here; a tier card, a context of no position or an invariant break is red.
 fn place_of(p: &PlaceError) -> Outcome {
     match p {
         PlaceError::Placement(e) => refused_of(e),
         PlaceError::NoNvmeTier { .. } => Outcome::Refused(Refusal {
             kind: "no-nvme-tier",
+            floor: None,
+            text: p.to_string(),
+        }),
+        PlaceError::PromptOver { .. } => Outcome::Refused(Refusal {
+            kind: "prompt-over",
             floor: None,
             text: p.to_string(),
         }),

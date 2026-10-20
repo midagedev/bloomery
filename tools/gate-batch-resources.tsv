@@ -16,6 +16,10 @@
 #   mimo2      --place gate: every routed expert on the host — host routed 160,859,947,008 B (mimo2_meta's pin) + the
 #              host embedding 664,010,752 B, rounded up to 161.6e9 [derived]; the serve gate loads twice, one after the
 #              other, never both.
+#   solar2     --place gate (the 3090's 24 GiB = 25.77e9 B): Q4_K_M 151.81e9 B less the card's share — non-routed 5.08e9 B (embedding
+#              0.45e9 B stays on the host), KV and scratch 5e9 B, so 25.77e9 − 4.63e9 − 5e9 = 16.1e9 B of routed experts — is
+#              146.28e9 − 16.1e9 = 130.2e9 B routed on the host, plus the embedding 0.45e9 B, rounded up to 131e9 [derived]; read
+#              the plan line of the first run and replace it.
 gate-gpu-ds41-callstream	-	237600000000
 gate-gpu-ds41-long	m	237600000000
 gate-gpu-ds41-twocard	-	237600000000
@@ -28,6 +32,9 @@ gate-gpu-qwen38-twocard	-	92054154240
 gate-gpu-qwen4exp-e2e	m	92054154240
 gate-gpu-qwen4exp-iqleg	-	184108308480
 gate-gpu-qwen4exp-mtp	m	92054154240
+gate-gpu-solar2-e2e	-	131000000000
+gate-gpu-solar2-prefill	-	131000000000
+gate-gpu-solar2-serve	-	131000000000
 soak-ds41	-	237600000000
 stage-gpu-load-v41	-	237600000000
 stage-gpu-load-v41-lock	-	237600000000

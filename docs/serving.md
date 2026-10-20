@@ -401,7 +401,7 @@ In progress: serving on N cards for every model; Clef from the IQ and Q2_K files
 ## EmbeddingGemma 2 images
 
 A side seat serves the `gemma-embedding2` encoder beside a generative model. Build `bloomery-serve` with
-`--features glm5next,clef,mimo2,gemma-embedding2,vision` through `cargo oxide`, and add these flags to the chat
+`--features glm5next,clef,mimo2,solar2,gemma-embedding2,vision` through `cargo oxide`, and add these flags to the chat
 model's command:
 
 ```text

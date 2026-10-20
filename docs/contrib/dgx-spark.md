@@ -56,7 +56,7 @@ the tested toolkit, answer 7) with LLVM 21.1.8's ARM64 release `llc` named by `C
 for example:
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2,hf --release --bin bloomery-serve
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,gemma-embedding2,hf --release --bin bloomery-serve
 ```
 
 The binary carries `sm_86` PTX, and the driver compiles it for cc 12.1 at the first start, about 6.5 s on the Arm cores

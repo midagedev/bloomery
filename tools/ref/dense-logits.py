@@ -234,7 +234,7 @@ def native_build(args):
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(ROOT / "target")
     argv = ["cargo", "oxide", "build", "--arch", args.arch, "--", "-p", "bloomery-gpu-gates",
-            "--features", "glm5next,clef,vision,mimo2,gemma-embedding2,hf", "--release",
+            "--features", "glm5next,clef,vision,mimo2,solar2,gemma-embedding2,hf", "--release",
             "--bin", "generate_qwen3moe", "--bin", "bloomery-serve"]
     subprocess.run(argv, cwd=ROOT, env=env, check=True, timeout=1800)
     if clean_head(ROOT) != head:

@@ -109,10 +109,10 @@ SERVES = {
     "qwen3": ("qwen3moe", "qwen35moe", "qwen35"),
     "mimo2": ("mimo2",),
 }
-SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "nemotron": ("NemotronH", "NemotronHMoe")}
+SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "solar2": ("SolarOpen2",), "nemotron": ("NemotronH", "NemotronHMoe")}
 # crates/gpu-gates/src/bin/bloomery_serve.rs:Model::ALL and Model::word — the generative seats in the order
 # the refusal of an unserved file lists them; crates/serve/src/decide.rs:WORD is the decide seat's word.
-SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2", "nemotron")
+SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2", "solar2", "nemotron")
 DECIDE_WORD = "decide"
 # tools/arch-registry.tsv, the registry's print: FROM_NAME is crates/model/src/arch/mod.rs:Arch::from_name — variant -> the
 # strings that name it; SPEC is crates/model/src/arch/mod.rs:spec — the architectures the model reader takes (the
@@ -201,7 +201,7 @@ TYPE_PLACES = {
              ("crates/gpu-deepseek41/src/chain/glue.rs", "let embd_ok = matches!(embd.ty()"),
              ("crates/placement/src/placement.rs", "pub fn of(ty: GgmlType) -> Option<CardFormat>"),
              ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
-    "glm": (("crates/model/src/arch/glm5next/place.rs", "pub fn card_routed(ty: GgmlType)"),
+    "glm": (("crates/model/src/arch/place_hybrid.rs", "pub fn card_routed(ty: GgmlType)"),
             ("crates/gpu/src/card_leg.rs", "match kernels::gate_up(st.gate.ty)"),
             ("crates/model/src/embed.rs", "if !layout.ty().has_dequant()"),
             ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
@@ -216,7 +216,7 @@ TYPE_PLACES = {
               ("crates/placement/src/accepts.rs", "pub const fn qwen35_gate_up(ty: GgmlType)"),
               ("crates/placement/src/accepts.rs", "pub const fn qwen35_down(ty: GgmlType)"),
               ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
-    "mimo2": (("crates/model/src/arch/mimo2/place.rs", "pub fn card_routed(ty: GgmlType)"),
+    "mimo2": (("crates/model/src/arch/place_hybrid.rs", "pub fn card_routed(ty: GgmlType)"),
               ("crates/placement/src/kernels.rs", "pub const fn card_runs(ty: GgmlType) -> bool"),
               ("crates/model/src/embed.rs", "if !layout.ty().has_dequant()"),
               ("crates/qdot/src/lib.rs", "pub fn supports(w: GgmlType) -> bool")),
@@ -1826,7 +1826,7 @@ def self_test():
         line, green, _ = row_line("glm", "glm5nextx", small)
         check("a glm5nextx file is refused by name",
               not green and "arch=glm5nextx route=REFUSED: a glm5nextx file, which no seat serves; the seats are "
-              "--model ds41, qwen38, glm, qwen3, mimo2, nemotron, decide" in line, line)
+              "--model ds41, qwen38, glm, qwen3, mimo2, solar2, nemotron, decide" in line, line)
         line, green, _ = row_line("glm", "deepseek41", small)
         check("a file the router seats elsewhere is refused for the row's seat",
               not green and "in the ds41 seat, and the README row says glm" in line, line)

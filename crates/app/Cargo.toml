@@ -25,6 +25,8 @@ bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41", optional = true }
 bloomery-gpu-glm5next = { path = "../gpu-glm5next", optional = true }
 # The MiMo-V2.6-Flash session (`arch::mimo2`).
 bloomery-gpu-mimo2 = { path = "../gpu-mimo2", optional = true }
+# The Solar-Open2 session (`arch::solar2`).
+bloomery-gpu-solar2 = { path = "../gpu-solar2", optional = true }
 bloomery-levers = { path = "../levers", optional = true }
 cuda-core = { workspace = true, optional = true }
 
@@ -33,3 +35,4 @@ dspark = ["dep:cuda-core"]
 deepseek41 = ["dep:bloomery-gpu-deepseek41", "dspark"]
 glm5next = ["dep:bloomery-gpu-glm5next", "dep:bloomery-levers"]
 mimo2 = ["dep:bloomery-gpu-mimo2", "dep:bloomery-levers"]
+solar2 = ["dep:bloomery-gpu-solar2", "dep:bloomery-levers"]

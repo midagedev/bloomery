@@ -9,6 +9,7 @@ qwen35,clef	-	yes	no	-
 glm5next,glm5-next	Glm5next	yes	no	glm5next
 mimo2	Mimo2	yes	yes	-
 minimax-m3	-	yes	no	-
+solar-open2	SolarOpen2	yes	no	-
 nemotron_h	NemotronH	yes	no	nemotron
 nemotron_h_moe	NemotronHMoe	yes	no	nemotron-bolt
 gemma-embedding	GemmaEmbedding	yes	no	-

@@ -714,6 +714,64 @@ pub fn std_normal_cdf(z: f64) -> f64 {
     if z >= 0.0 { 1.0 - tail } else { tail }
 }
 
+/// The standard deviation, in logit units, of one id's logit between two
+/// independent implementations of one quantized model.
+///
+/// [derived]: the family's σ of an engine's top1-top2 margin against the
+/// exact one is 0.35 (the exact-forced diagnostic of `gate-gpu-e2e`, rig-log
+/// plan 「모델」: 0.35 scalar, 0.36 MMA); a margin is the difference of two
+/// logits, so one logit's error is σ/√2 and two implementations' difference
+/// of it is σ again.
+pub const SIGMA_LOGIT: f64 = 0.35;
+
+/// The f64 log-softmax of a logits row.
+#[must_use]
+pub fn log_softmax(row: &[f32]) -> Vec<f64> {
+    let mx = row
+        .iter()
+        .fold(f64::NEG_INFINITY, |m, &v| m.max(f64::from(v)));
+    let lse = mx
+        + row
+            .iter()
+            .map(|&v| (f64::from(v) - mx).exp())
+            .sum::<f64>()
+            .ln();
+    row.iter().map(|&v| f64::from(v) - lse).collect()
+}
+
+/// The standard deviation of one id's log-probability between two
+/// implementations, by its probability `p` in the row compared against and
+/// that row's `Σ p²` (`sq`).
+///
+/// [derived]: `Δlp_i = Δl_i − Σ_j p_j·Δl_j` (the log-sum-exp moves by the
+/// probability-weighted logit moves); with each logit's difference
+/// independent at [`SIGMA_LOGIT`], `Var = σ²·(1 − 2·p_i + Σ_j p_j²)`, at most
+/// `2σ²`. A common shift of every logit cancels in the log-softmax, so
+/// correlated logit errors only lower it.
+#[must_use]
+pub fn sigma_lp(p: f64, sq: f64) -> f64 {
+    SIGMA_LOGIT * (1.0 - 2.0 * p + sq).max(0.0).sqrt()
+}
+
+/// The bound on the worst |z| of `n` ids: the `k` at which `n` two-sided
+/// Gaussian tails keep the rate one has past three standard deviations,
+/// `2n·Φ(−k) = 2·Φ(−3)` (a union bound, so the ids' correlation only lowers
+/// the rate): 3.97 at 37 ids, 3.99 at 40.
+#[must_use]
+pub fn k_of(n: usize) -> f64 {
+    let rate = std_normal_cdf(-3.0) / n.max(1) as f64;
+    let (mut lo, mut hi) = (0.0f64, 9.0f64);
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if std_normal_cdf(-mid) > rate {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

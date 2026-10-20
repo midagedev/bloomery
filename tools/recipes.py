@@ -11223,10 +11223,11 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-16): the embedding serve gate also builds bloomery-serve, including its V4.1 seat.
     # PIN(2026-10-17): the v1 embedding serve gate builds the same server and its V4.1 seat.
     # PIN(2026-10-20): gate-serve-draft-rules tests both serve bins, including their V4.1 draft.
+    # PIN(2026-10-20): gate-gpu-solar2-serve joins them; its recipe builds bloomery-serve beside its own bin.
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
                       "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding-serve", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
                       "gate-gpu-lev-serve", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
-                      "gate-gpu-qwen3-serve", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-ptx-spill", "gate-serve-draft-rules"},
+                      "gate-gpu-qwen3-serve", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
     hybrid = sel("crates/gpu/src/hybrid.rs")
     expect("gate-gpu-e2e" in hybrid and "gate-ops" not in hybrid and len(hybrid) < len(gates) - 20,
@@ -11514,7 +11515,7 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
         f"host nightly: the real tree's set is {host_now} — a new member of the set is proven by a nightly run before this list takes it",
     )
     left = [n for n, _ in host_left_out(tree, lock_now)]
-    expect(left == ["bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-gates", "bloomery-gpu-gemma-embedding2", "bloomery-gpu-gemma4a", "bloomery-gpu-glm5next", "bloomery-gpu-mimo2", "bloomery-gpu-vision"], f"host nightly: left out {left}")
+    expect(left == ["bloomery-gpu", "bloomery-gpu-deepseek41", "bloomery-gpu-gates", "bloomery-gpu-gemma-embedding2", "bloomery-gpu-gemma4a", "bloomery-gpu-glm5next", "bloomery-gpu-mimo2", "bloomery-gpu-solar2", "bloomery-gpu-vision"], f"host nightly: left out {left}")
     expect(not nightly_problems(tree, lock_now), f"host nightly: {nightly_problems(tree, lock_now)}")
     ran = {u for u, _ in host_units(tree, lock_now)}
     expect(

@@ -2920,6 +2920,43 @@ pub static LISTENING_MIMO2: Kind = Kind {
     ],
 };
 
+/// The Solar seat's load.
+pub static LOAD_SOLAR2: Kind = Kind {
+    name: "load_solar2",
+    head: "load",
+    doc: "The Solar seat's model on its card: its architecture, resident bytes, the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`: one, the body has no more), layers, the routed experts the plan keeps on the host and on the card, the step graph's nodes, the batches a prompt group runs layer by layer (`group`: `BLOOMERY_PREFILL_GROUP`, the row's default when unset), `BLOOMERY_PIN_MAIN`'s ask (`pin_main`) and whether the engine thread's pin took (`pinned`), and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        key("host_experts", U64, "experts"),
+        key("card_experts", U64, "experts"),
+        key("graph_nodes", U64, ""),
+        key("group", U64, "batches"),
+        key("pin_main", Word, ""),
+        key("pinned", Bool, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The Solar seat's address.
+pub static LISTENING_SOLAR2: Kind = Kind {
+    name: "listening_solar2",
+    head: "bloomery-serve-solar2:",
+    doc: "The Solar seat's placement, the context its slot serves, the slots it serves and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The nemotron_h seat's load.
 pub static LOAD_NEMOTRON: Kind = Kind {
     name: "load_nemotron",
@@ -3757,6 +3794,21 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LANE, &LOAD_MIMO2, &LOAD_PHASES, &LISTENING_MIMO2],
+    groups::bind::CACHE,
+];
+
+/// What the Solar seat of `bloomery-serve` prints, all on stderr: the
+/// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
+/// the server before the seat registers), the plan, the load and its phases,
+/// the address and each request's note of the prefix it kept less of than it
+/// shared (the KDA state keeps a prefix only where the sequence stands or at a
+/// checkpoint).
+pub static BLOOMERY_SERVE_SOLAR2: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
+    &[&PLACE_UNSET, &PLAN],
+    groups::fetch::FETCH,
+    groups::fetch::SET,
+    &[&LANE, &LOAD_SOLAR2, &LOAD_PHASES, &LISTENING_SOLAR2],
     groups::bind::CACHE,
 ];
 
@@ -4950,7 +5002,7 @@ mod tests {
             qwen3moe_place, residency38, serve_client, side_seat, vision_seat,
         };
         type Group = &'static [&'static Kind];
-        let table: [(&str, Group, &[Group]); 13] = [
+        let table: [(&str, Group, &[Group]); 14] = [
             (
                 "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
                 BLOOMERY_SERVE_DS41,
@@ -5003,6 +5055,11 @@ mod tests {
                     residency38::HOST,
                     bind::CACHE,
                 ],
+            ),
+            (
+                "solar2 seat: bind::spawn",
+                BLOOMERY_SERVE_SOLAR2,
+                &[side_seat::SEAT, fetch::FETCH, fetch::SET, bind::CACHE],
             ),
             (
                 "nemotron seat: bind::spawn",
@@ -5085,6 +5142,11 @@ mod tests {
                 );
             }
         }
+        // The Solar seat serves one slot: no slot record in its list.
+        assert_eq!(
+            missing(BLOOMERY_SERVE_SOLAR2, bind::SLOTS),
+            ["slots round", "slot call"]
+        );
         // The nemotron_h seat counts no round (`Seat::step_stats` is its default) and has one slot.
         assert_eq!(
             missing(BLOOMERY_SERVE_NEMOTRON, bind::SLOTS),

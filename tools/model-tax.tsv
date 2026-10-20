@@ -32,6 +32,7 @@ crates/gpu-gates/src/bin/bloomery_serve.rs	glm	16	baseline S 16: MK9 seat by pro
 crates/gpu-gates/src/bin/bloomery_serve.rs	mimo	11	baseline S 11: MK9 seat by program
 crates/gpu-gates/src/bin/bloomery_serve.rs	nemotron	15	baseline S 15: MK9 seat by program
 crates/gpu-gates/src/bin/bloomery_serve.rs	qwen	21	baseline S 21: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	solar	11	PIN(2026-10-20) solar: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
 crates/gpu-gates/src/bin/exact_ref.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/forced_probe.rs	deepseek	4	baseline T 4: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_block.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
@@ -182,3 +183,10 @@ crates/models/src/lib.rs	minimax	2	PIN(2026-10-20) minimax: ModelSpec.arch names
 crates/placement/src/accepts.rs	minimax	1	PIN(2026-10-20) minimax: program_of matches every models::Arch exhaustively, so the variant needs an arm; None until the family's body adds its Program
 crates/gpu-gates/src/bin/shared/routed_legs.rs	minimax	2	PIN(2026-10-20) minimax: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body exists
 crates/gpu-gates/src/bin/shared/systemone_clause.rs	clef	1	PIN(2026-10-20) clef: the suite of SystemOne requests the serve gates post (tools/ref/clef/suite.jsonl) has no neutral name; the decision release row owns the file
+crates/model/src/arch/mod.rs	solar	4	PIN(2026-10-20) solar: the family's module declaration (`pub mod solar_open2;`), and its `model::arch::Arch` variant with the arms of `from_name` and `name`; the module list is not a registry and the enum lists the architectures a body runs, so each family adds its directory, variant and two arms here until the registry owns them
+crates/models/src/lib.rs	solar	2	PIN(2026-10-20) solar: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
+crates/placement/src/accepts.rs	solar	4	PIN(2026-10-20) solar: Program is the key of program_of, leg_arms and routed_rule, three exhaustive matches, so the family's variant has its line in each; the program would carry its own leg arms and routed rule
+crates/model/src/arch/coverage.rs	solar	9	PIN(2026-10-20) solar: the coverage rows, the token-embedding pin and the expert-stack match are keyed by Program, so each row the solar2 body runs lists its variant; the program would own its rows instead of the list naming programs
+crates/gpu-gates/src/bin/shared/routed_legs.rs	solar	3	PIN(2026-10-20) solar: family_of and skip_of match every models::Arch exhaustively, and family_name matches every placement Program for the count lines; the family has no routed-legs adapter until its body has one, and a Program name owner would take family_name's arms
+crates/gpu-gates/src/record.rs	solar	4	PIN(2026-10-20) solar: a seat's load and listening lines are one Kind each and its list another; the tiered seats' load lines share every field but the architecture word, so one Kind keyed by it replaces mimo2's and this one
+crates/gpu/src/fault.rs	solar	2	PIN(2026-10-20) solar: the fault table is per architecture by design: the `SOLAR2` step order and its `step_order::of` arm
