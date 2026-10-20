@@ -458,7 +458,10 @@ levers 0 0 0
 # compute call (ops.rs dispatch_ccd, over each run of a block) and the warm walk's prefetch (ops.rs warm_touch), each
 # with its SAFETY line, and the cut test's RowSet double (ccd_tests::Pairs, whose `unsafe fn compute` the trait
 # makes unsafe).
-model 119 31 13
+model 115 31 13
+# model-hf: the four blocks that left model (119 -> 115) with the fixture bin and its test, the page-fault reads (`getrusage`),
+# each with its SAFETY line; no new unsafe.
+model-hf 4 0 0
 models 0 0 0
 placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row

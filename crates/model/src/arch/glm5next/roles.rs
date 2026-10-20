@@ -12,12 +12,12 @@ use crate::arch::classify::{Counts, classify_with};
 use crate::arch::stems::{opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
-pub(super) use crate::arch::stems::{Stem, required};
+pub use crate::arch::stems::{Stem, required};
 
 /// A KDA delta-rule layer's mixer; `ssm_f_b` and `ssm_g_b` are required
 /// because without them ik takes another decay rule (`src/llama-kda.cpp`,
 /// `build_kda_beta_gate`).
-pub(super) const KDA: &[Stem] = &[
+pub const KDA: &[Stem] = &[
     req("attn_norm.weight", Role::Attention),
     req("attn_q.weight", Role::Attention),
     req("attn_k.weight", Role::Attention),
@@ -39,7 +39,7 @@ pub(super) const KDA: &[Stem] = &[
 /// A latent attention layer's mixer with its indexer, which is required
 /// because without it ik runs dense attention (`src/llama-load-tensors.cpp`,
 /// `create_glm5next_tensors`).
-pub(super) const LATENT: &[Stem] = &[
+pub const LATENT: &[Stem] = &[
     req("attn_norm.weight", Role::Attention),
     req("attn_q_a.weight", Role::Attention),
     req("attn_q_a_norm.weight", Role::Attention),
@@ -59,11 +59,11 @@ pub(super) const LATENT: &[Stem] = &[
 ];
 
 /// A dense layer's gate and down stems, which the front's forms read ([`DENSE`]).
-pub(super) const DENSE_GATE: &str = "ffn_gate.weight";
-pub(super) const DENSE_DOWN: &str = "ffn_down.weight";
+pub const DENSE_GATE: &str = "ffn_gate.weight";
+pub const DENSE_DOWN: &str = "ffn_down.weight";
 
 /// A dense layer's feed-forward block.
-pub(super) const DENSE: &[Stem] = &[
+pub const DENSE: &[Stem] = &[
     req("ffn_norm.weight", Role::FfnNorm),
     req(DENSE_GATE, Role::DenseFfn),
     req("ffn_up.weight", Role::DenseFfn),
@@ -72,11 +72,11 @@ pub(super) const DENSE: &[Stem] = &[
 
 /// The router's selection bias, which ik loads when present: the spec's
 /// `Router::bias` is its presence.
-pub(super) const SELECTION_BIAS: &str = "exp_probs_b.bias";
+pub const SELECTION_BIAS: &str = "exp_probs_b.bias";
 
 /// A routed layer's feed-forward block: the router with its selection bias,
 /// and the routed stacks.
-pub(super) const MOE: &[Stem] = &[
+pub const MOE: &[Stem] = &[
     req("ffn_norm.weight", Role::FfnNorm),
     req("ffn_gate_inp.weight", Role::Router),
     opt(SELECTION_BIAS, Role::Router),
@@ -86,14 +86,14 @@ pub(super) const MOE: &[Stem] = &[
 ];
 
 /// A routed layer's shared expert, when the file has one.
-pub(super) const SHARED: &[Stem] = &[
+pub const SHARED: &[Stem] = &[
     req("ffn_gate_shexp.weight", Role::SharedExpert),
     req("ffn_up_shexp.weight", Role::SharedExpert),
     req("ffn_down_shexp.weight", Role::SharedExpert),
 ];
 
 /// The hyper-connection tensors: every trunk layer's, no next-token layer's.
-pub(super) const HC: &[Stem] = &[
+pub const HC: &[Stem] = &[
     req("hc_attn_fn.weight", Role::HyperConnection),
     req("hc_attn_base.weight", Role::HyperConnection),
     req("hc_attn_scale.weight", Role::HyperConnection),
@@ -104,7 +104,7 @@ pub(super) const HC: &[Stem] = &[
 
 /// A next-token layer's own stems, beside the trunk's; `shared_head_norm` is
 /// optional (the block shares the trunk's embedding and head).
-pub(super) const NEXTN: &[Stem] = &[
+pub const NEXTN: &[Stem] = &[
     req("nextn.eh_proj.weight", Role::Unused),
     req("nextn.enorm.weight", Role::Unused),
     req("nextn.hnorm.weight", Role::Unused),

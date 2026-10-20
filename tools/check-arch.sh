@@ -241,7 +241,7 @@ dispatch=(
   # The ModelOpt converter: Checkpoint::parse refuses another architecture by name before mapping qwen4exp's tensors.
   'crates/model/src/bin/prepare.rs use'
   # The gate fixture tool: its SPECS table maps an architecture to that family's fixture spec, and refuses one with no spec by name.
-  'crates/model/src/bin/fixture.rs use'
+  'crates/model-hf/src/bin/fixture.rs use'
   # 호스트 union 벤치: 파일의 아키텍처가 qwen4exp 일 때만 qwen35moe 의 Hparams·텐서 이름·host::layers 로 routed 층을 연다.
   'crates/model/src/bin/bench_v41_host.rs use'
   # 오라클 표의 디스패치: for_arch 가 Arch 를 그 아키텍처의 표로 잇는다.

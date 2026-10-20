@@ -131,6 +131,7 @@ forced_exact count pin, the reference gates).
     crates/threads/     resident pinned worker pool (spin, then park)
     crates/qdot/        fused quantized dot kernels, AVX2
     crates/model/       the CPU engine (ops, attn, ffn, moe, head, forward, kv, derived, profile); tests/ are the gates
+    crates/model-hf/    what the CPU model description does with the hub: the fixture fetch (bin fixture), GLM's checkpoint map
     crates/tokenizer/   byte-level BPE from the GGUF header, bit-identical to llama-tokenize
     crates/sampler/     the sampling chain in the reference's order
     crates/runtime/     the generation loop, host only: Target/Verify/Draft, plain and speculative advances

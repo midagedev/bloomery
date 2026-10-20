@@ -31,7 +31,7 @@
 # the second profile's set name, tokens and lease would be applied to the first profile's file.
 #
 # The tier. BLOOMERY_TIER is `real` (unset is the same: every name here is as the profile defines it) or `fixture`: the
-# model file is the family's fixture — the small file `fixture generate` writes (crates/model/src/bin/fixture.rs), whose header
+# model file is the family's fixture — the small file `fixture generate` writes (crates/model-hf/src/bin/fixture.rs), whose header
 # names the card budget that forces the plan to offload (`fixture_budget`, below; tools/box.sh exports it as BLOOMERY_CARD_BUDGET).
 # What the fixture tier does is the family's, one row of tools/fixture-dirs.tsv:
 #   a fixture directory    the first shard `*-00001-of-*.gguf` of the one directory under $BLOOMERY_FIXTURE_ROOT

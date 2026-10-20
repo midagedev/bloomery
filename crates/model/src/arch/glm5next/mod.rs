@@ -3,9 +3,9 @@
 //! under the file's own string. The file's keys (`hparams`), every tensor's
 //! role (`roles`), the typed description (`spec`), the tensor names the
 //! program reads (`names`), the host tier's view of a routed layer (`host`),
-//! the plan from the headers (`place`), the Hugging Face checkpoint's names
-//! and how tensor parallel splits its tensors (`hf`); the program is
-//! `gpu-glm5next`.
+//! the plan from the headers (`place`); the program is `gpu-glm5next`. The Hugging
+//! Face checkpoint's names and how tensor parallel splits its tensors are
+//! `model_hf::arch::glm5next`.
 //!
 //! The trunk interleaves KDA delta-rule layers with absorbed, rope-free
 //! latent attention layers that pick their positions by a token-pool
@@ -16,7 +16,6 @@
 //! `src/llama-hparams.cpp` unless another file is named.
 
 pub mod fixture;
-pub mod hf;
 pub mod host;
 pub mod hparams;
 pub mod names;

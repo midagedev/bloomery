@@ -27,7 +27,7 @@
 //!   `BLOOMERY_TP_NODES` names the other ranks' nodes, each running a
 //!   `tier_server` that answers its census. `--plan` prints one `tp rank=`
 //!   line a rank, each rank's split and whole bytes against its own node's
-//!   pool (`model::arch::glm5next::hf::read_tp`); the load is refused by name, as
+//!   pool (`model_hf::arch::glm5next::read_tp`); the load is refused by name, as
 //!   is `BLOOMERY_DRAFT=mtp`.
 //!   Unset, the common rule every serving seat takes (`generate::Place::choose`,
 //!   by the GLM family's `glm_place::TIER_RULE`): the cards' offer, `bp` on
@@ -420,7 +420,7 @@ mod cli {
     }
 
     /// `--place tp`: the plan of each rank of the checkpoint folder `BLOOMERY_REF_MODEL` names,
-    /// one line a rank (`model::arch::glm5next::hf::read_tp`, `placement::tp::plan_tp`): rank 0 this
+    /// one line a rank (`model_hf::arch::glm5next::read_tp`, `placement::tp::plan_tp`): rank 0 this
     /// process's one card, the others the nodes of `BLOOMERY_TP_NODES` in order, each against its
     /// own node's pool as its census reads it. The tensor-parallel load is not built, so a run
     /// without `--plan` is refused after the plan.
@@ -454,7 +454,7 @@ mod cli {
         }
         let ranks = plan_tp(
             &pools,
-            &model::arch::glm5next::hf::read_tp(&ref_model_path()?)?,
+            &model_hf::arch::glm5next::read_tp(&ref_model_path()?)?,
         )?;
         for r in &ranks {
             record::tp_rank(r, ranks.len()).print();

@@ -56,7 +56,7 @@ the tested toolkit, answer 7) with LLVM 21.1.8's ARM64 release `llc` named by `C
 for example:
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2 --release --bin bloomery-serve
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2,hf --release --bin bloomery-serve
 ```
 
 The binary carries `sm_86` PTX, and the driver compiles it for cc 12.1 at the first start, about 6.5 s on the Arm cores
@@ -150,7 +150,7 @@ BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_BOUND
 **Fixtures.** A fixture is "a model file much smaller than the real one that keeps every
 per-layer shape" (`crates/model/src/fixture/mod.rs:1-4`) and "its bytes are a function of the seed and the source header
 alone" (`:29-32`), pinned by per-type digests (`fixture/digest.rs:1-10`). `fixture generate <real first shard> <out dir>`
-writes it (`crates/model/src/bin/fixture.rs:4-5`). Three families have fixtures (`crates/refset/src/fixture.rs:33-37`:
+writes it (`crates/model-hf/src/bin/fixture.rs:4-5`). Three families have fixtures (`crates/refset/src/fixture.rs:33-37`:
 `qwen4exp`, `deepseek41`, `glm5next`); every other family is `self` in the table (`ref-paths.sh:75-79`) and its
 gates are deferred by name as real-file. So "P1 fixture gates" means those three families plus the host gates whose
 inputs are in process or published, not every `gate-*` recipe. A text classification of the `justfile` (not the batch

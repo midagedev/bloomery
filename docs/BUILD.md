@@ -69,7 +69,7 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 |---|---|---|
 | `generate_ds41`, `bloomery-chat` | `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin <bin>` | DeepSeek-V4.1-Flash |
 | `bloomery-serve-ds41`, `bloomery-serve-qwen38` | the same, `--features deepseek41,gemma-embedding2` (`gemma-embedding2` attaches the optional embedding side seat) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next |
-| `bloomery-serve` | `… --features glm5next,clef,vision,mimo2,gemma-embedding2 --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|mimo2\|nemotron\|decide`; the ds41 and qwen38 seats are the two binaries above; `vision` adds V4.1's `--mmproj`) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, Nemotron 3 Nano 4B, Clef-Flash, lev |
+| `bloomery-serve` | `… --features glm5next,clef,vision,mimo2,gemma-embedding2,hf --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|mimo2\|nemotron\|decide`; the ds41 and qwen38 seats are the two binaries above; `vision` adds V4.1's `--mmproj`) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, Nemotron 3 Nano 4B, Clef-Flash, lev |
 | `generate_qwen3moe` | `… --features gpu --release --bin generate_qwen3moe` | Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B |
 | `generate_glm5next` | `… --features glm5next --release --bin generate_glm5next` | GLM-5.3-Flash |
 | `r8conv` | `cargo build --release -p bloomery-model --bin r8conv` | the V4.1 sidecar |
@@ -294,7 +294,7 @@ The same binary opens the Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` file (`unsloth/Qw
 [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) is Cloudflare's decision model: a Qwen3.5 backbone and a small joint schema head that scores every allowed option of every question in one prompt pass. bartowski's current GGUF upload is llama.cpp's `clef` layout, which carries the head inside the file; an older `qwen35`-layout file takes the release's own head file.
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2 --release --bin bloomery-serve
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,gemma-embedding2,hf --release --bin bloomery-serve
 
 # the backbone on one card (see Picking the card), the head (in the file) on the host
 target/release/bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q8_0 --port 8091

@@ -189,6 +189,7 @@ dependencies = [
  "bloomery-hf",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-model-hf",
  "bloomery-qdot",
  "bloomery-refset",
  "bloomery-runtime",
@@ -205,6 +206,7 @@ dependencies = [
  "memmap2",
  "oxide-artifacts",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -303,7 +305,6 @@ name = "bloomery-model"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
- "bloomery-hf",
  "bloomery-levers",
  "bloomery-models",
  "bloomery-placement",
@@ -312,6 +313,19 @@ dependencies = [
  "bloomery-runtime",
  "bloomery-threads",
  "bloomery-tokenizer",
+ "libc",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "bloomery-model-hf"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-hf",
+ "bloomery-model",
+ "bloomery-refset",
  "flate2",
  "libc",
  "serde_json",

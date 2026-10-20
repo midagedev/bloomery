@@ -10,7 +10,7 @@ use crate::placement::Role;
 /// the file must carry it (llama.cpp creates it without
 /// `TENSOR_NOT_REQUIRED`).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Stem {
+pub struct Stem {
     pub(crate) name: &'static str,
     pub(crate) role: Role,
     pub(crate) required: bool,
@@ -35,6 +35,6 @@ pub(crate) const fn opt(name: &'static str, role: Role) -> Stem {
 }
 
 /// The names of `stems` the file must carry.
-pub(crate) fn required(stems: &[Stem]) -> impl Iterator<Item = &'static str> + '_ {
+pub fn required(stems: &[Stem]) -> impl Iterator<Item = &'static str> + '_ {
     stems.iter().filter(|s| s.required).map(|s| s.name)
 }

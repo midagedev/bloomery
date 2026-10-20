@@ -10,7 +10,8 @@ crates/gpu/src/lib.rs
 crates/levers/src/lib.rs
 crates/levers/src/registry.rs
 crates/model/src/arch/registry.rs
-crates/model/src/bin/fixture.rs
+crates/model-hf/src/bin/fixture.rs
+crates/model-hf/src/arch/mod.rs
 crates/models/src/shape.rs
 crates/refset/src/arch/dequant.rs
 crates/refset/src/arch/draft.rs

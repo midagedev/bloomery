@@ -44,7 +44,7 @@ dumps, real-file gates, timed runs).
 | 1 | GGUF arch reading | `crates/model/src/arch/<arch>/{hparams,names,roles,spec,place}.rs`; arms in `arch/mod.rs` (`spec`), `crates/models/src/lib.rs` (`Arch`), `crates/placement/src/accepts.rs` (`program_of`, re-exported from `coverage`) | L; header meta test needs the real file's headers |
 | 2 | Tokenizer, chat template | `crates/tokenizer/src/pretok.rs:350`, `ChatSpec` `crates/models/src/lib.rs:589`, `chat_of` `arch/mod.rs:256`, tool parsers `crates/serve/src/{glmxml,qwenxml,dsml,hermes}.rs` | A for the code; the id oracle is B |
 | 3 | Refset family and its dump | `crates/refset/src/arch/<arch>/mod.rs` and the table `arch/mod.rs:17-28`; `tools/ref/models/<arch>.sh`, `tools/ref/build-ik-<arch>.sh`, `justfile:667` (`dump-ref-mimo2`) | A for the row's tests; the dump is B |
-| 4 | Fixture row | `crates/model/src/arch/<arch>/fixture.rs`, `crates/model/src/bin/fixture.rs:44`, `crates/refset/src/fixture.rs:33`, `tools/ref/ref-paths.sh:73-79` | generate L; its `fx_` oracle sets B |
+| 4 | Fixture row | `crates/model/src/arch/<arch>/fixture.rs`, `crates/model-hf/src/bin/fixture.rs:44`, `crates/refset/src/fixture.rs:33`, `tools/ref/ref-paths.sh:73-79` | generate L; its `fx_` oracle sets B |
 | 5 | Card body | `crates/gpu-<arch>/` (or `crates/gpu/src/arch/...` for a variant); root `Cargo.toml:3`, `crates/gpu-gates/Cargo.toml` | G to build and run |
 | 6 | App session | `crates/app/src/arch/<arch>/mod.rs`, feature in `crates/app/Cargo.toml` | G (feature-gated); L for default-feature tests |
 | 7 | Serve seat | `crates/gpu-gates/src/bin/shared/serve_seats/<seat>.rs`, `serve_seats/mod.rs`, `bloomery_serve.rs:206-226` | G, then B for the seat gates |

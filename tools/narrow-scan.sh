@@ -13,11 +13,15 @@
 #      (the working tree against the merge base) reads the change the two scans compare; a fingerprint of the tree
 #      (tracked diff against BASE plus each untracked file's md5) is taken before the scans and again before the
 #      affected run, and a tree that moved in between ends the run (rc 1) instead of narrowing on mixed content.
-#   2. Derives the scan set from HEAD's tree (`tools/recipes.py scan-set`; with `--worktree`, this tree as it is): the
-#      fewest bins of bloomery-gpu-gates whose scans cover every kernel carrier (each device lib, and each bin with
-#      kernels of its own), each with the cargo features it builds under.
+#   2. Derives each side's scan set from that side's own tree (`tools/recipes.py scan-set [REV]`: BASE's commit for the
+#      base side; HEAD's commit, or with `--worktree` this tree as it is, for the head side): the fewest bins of
+#      bloomery-gpu-gates whose scans cover every kernel carrier (each device lib, and each bin with kernels of its own),
+#      each with the cargo features it builds under on that side. A feature one side's tree lacks (a change that adds or
+#      moves a cargo feature) is thus never asked of the other: the bin whose features differ is printed by name with
+#      both sets, and each side builds its own. The two sides must scan the same bins, since a pair compares one bin's
+#      scan on both: a bin in only one side's set ends the run (rc 2) naming it, with both sets, before any box call.
 #   3. For each side in turn, BASE then HEAD: extracts the commit into DIR/src-<side>, syncs it to that side's remote
-#      dir with its own tools/box.sh, builds the set there (`cargo oxide build`, as the ptx-scan recipe does) and runs
+#      dir with its own tools/box.sh, builds that side's set there (`cargo oxide build`, as the ptx-scan recipe does) and runs
 #      `ptx-scan.sh --no-jit` on each bin. This tree's tools/ptx-scan.sh is the scanner on both sides (the commit's
 #      own may predate --no-jit), shipped over stdin; the extractor (oxart_ptx) is the commit's.
 #   4. Splits the box's output into DIR/<side>/<bin>.log and runs
@@ -36,7 +40,8 @@
 #
 # The base side's cache. BASE is a commit, so its side (the scan logs and, with --keep-ptx, the PTX modules) is the same
 # whenever its inputs are: the BASE sha, the md5 of this tree's tools/ptx-scan.sh (the scanner both sides run), the scan set
-# (scan-set.tsv's md5), the runner's md5 (the build lines), the arch and whether --keep-ptx is set. A run whose key has an
+# (the base side's scan-set tsv's md5, so a head-only feature change leaves it), the base runner's md5 (the build lines), the
+# arch and whether --keep-ptx is set. A run whose key has an
 # entry under ~/.cache/bloomery/narrow-base/<base8>-<key16>/ prints `narrow-scan: base <sha> from cache <dir>`, copies
 # <dir>/base/ into DIR/base/ as a fresh run lays it out and makes no box call for the base side (the head side runs as
 # always). Any key part different is a miss. An entry is written whole (a temp dir and a rename) only after the side
@@ -83,15 +88,16 @@
 # A runner that arrives empty ends the side 65 by name, never an empty scan read as rc 0. The scans are sm_86's: a BLOOMERY_ARCH naming another
 # arch is refused (64) before anything runs.
 #
-# DIR (default ~/.cache/bloomery/narrow/<tree>/<base8>-<head8>, <base8>-worktree under `--worktree`) keeps: scan-set.tsv, runner.sh (the script each side
-# runs), <side>.build.log (the box's stderr: the builds), <side>.scan.out, <side>/<bin>.log (the scan logs a landing
+# DIR (default ~/.cache/bloomery/narrow/<tree>/<base8>-<head8>, <base8>-worktree under `--worktree`) keeps: scan-set.tsv (the head
+# side's), scan-set-base.tsv, runner.sh (the script the head side runs; the base side runs it too when the two sets are equal, else
+# runner-base.sh, built from scan-set-base.tsv), <side>.build.log (the box's stderr: the builds), <side>.scan.out, <side>/<bin>.log (the scan logs a landing
 # cites), narrowed.txt and MANIFEST; <side>.box.pid while the side runs. Under --keep-ptx also <side>/<bin>.ptx/mod<N>.ptx; a
 # cached base side has no base.build.log and no base.scan.out; base-cache.key holds the cache key's parts.
 #
 # NARROW_BOUND (default 7200 s, a hang guard: no box-job length needs approval) bounds the whole run: each side's box command runs under `timeout` with what
 # is left. A cut build keeps its compiled crates, so running again continues it. Exit codes: 0 done; 64 usage; 75
-# contention (the box guard, or the lock); 70 the box's toolchain; 1 a build or scan failed; 124 the bound; 130 INT and
-# 143 TERM; the `affected` run's own code otherwise.
+# contention (the box guard, or the lock); 70 the box's toolchain; 1 a build or scan failed; 2 a scan set could not be derived or
+# the sides' sets name different bins; 124 the bound; 130 INT and 143 TERM; the `affected` run's own code otherwise.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=tools/nightly/units.sh
@@ -184,6 +190,25 @@ make_runner() {
     echo 'rm -f "$P"'
     [ "$keep" != 1 ] || echo 'rm -rf "$K"'
   } > "$out"
+}
+
+# scan_set_diff <base scan-set.tsv> <head scan-set.tsv>: the two sides' sets compared by bin name. A bin in both whose features
+# differ prints `narrow-scan: bin B: features differ between the sides: base F, head G` (each side builds its own). A bin in one set
+# only prints which side has it, and the function returns 1: a pair needs the bin scanned on both sides.
+scan_set_diff() {
+  awk -F'\t' '
+    NR == FNR { if ($1 != "") { bf[$1] = $2; bo[++nb] = $1 }; next }
+    $1 != "" { hf[$1] = $2; ho[++nh] = $1 }
+    END {
+      bad = 0
+      for (i = 1; i <= nh; i++) {
+        b = ho[i]
+        if (!(b in bf)) { print "narrow-scan: bin " b ": in the head scan set only (features " hf[b] ")"; bad = 1 }
+        else if (bf[b] != hf[b]) print "narrow-scan: bin " b ": features differ between the sides: base " bf[b] ", head " hf[b]
+      }
+      for (i = 1; i <= nb; i++) if (!(bo[i] in hf)) { print "narrow-scan: bin " bo[i] ": in the base scan set only (features " bf[bo[i]] ")"; bad = 1 }
+      exit bad
+    }' "$1" "$2"
 }
 
 # split_logs <scan.out> <dir> <bin>...: cuts the box's stdout into <dir>/<bin>.log. Non-zero when a block is missing,
@@ -825,8 +850,13 @@ self_test() {
   w=$t/bloomery-wt
   mkdir -p "$w/tools" "$t/home"
   cp "$0" "$w/tools/narrow-scan.sh"
+  # the scan set per tree: STUB_FEATS_<rev> sets gate_x's features (rev: the commit, or `tree` for the working tree), STUB_EXTRA_<rev>
+  # adds a second bin, as a tree whose change adds a cargo feature or a kernel carrier would print
   printf '%s\n' 'import os, sys' 'open(os.environ["STUB_LOG"], "a").write("recipes " + " ".join(sys.argv[1:]) + "\n")' \
-    'print("gate_x\tgpu\tbin gate_x")' > "$w/tools/recipes.py"
+    'rev = sys.argv[2] if len(sys.argv) > 2 else "tree"' \
+    'print("gate_x\t" + os.environ.get("STUB_FEATS_" + rev, "gpu") + "\tbin gate_x")' \
+    'extra = os.environ.get("STUB_EXTRA_" + rev)' \
+    'if extra:' '    print(extra + "\tgpu\tbin " + extra)' > "$w/tools/recipes.py"
   printf '#!/usr/bin/env bash\necho scan\n' > "$w/tools/ptx-scan.sh"
   printf '#!/usr/bin/env bash\necho "affected $*" >> "$STUB_LOG"\necho "affected stub"\n' > "$w/tools/affected-gates.sh"
   cat > "$w/tools/box.sh" <<'NARROW_STUB_EOF'
@@ -869,6 +899,7 @@ cat > "$rf"
 new=no
 [ -e "$here/new.txt" ] && new=yes
 echo "$side $BLOOMERY_REMOTE marker=$(cat "$here/marker.txt") new=$new" >> "$STUB_LOG"
+echo "runner $side $(grep -o -- '--features [^ ]*' "$rf" | cut -d' ' -f2 | tr '\n' ' ' | sed 's/ $//')" >> "$STUB_LOG"
 [ "$side" = head ] && [ -n "${STUB_EDIT:-}" ] && echo more >> "$here/marker.txt"
 echo '=== narrow-scan begin gate_x'
 echo 'ptx-scan: mod0 bundle=b bytes=1'
@@ -912,6 +943,18 @@ NARROW_STUB_EOF
   [ "$rc" = 0 ] && grep -qx "head rh marker=base new=no" "$t/cm.log" && grep -qx "recipes scan-set $wb" "$t/cm.log" && grep -qx "affected $wb..$wb --narrow --scan $t/cm-out/base/gate_x.log $t/cm-out/head/gate_x.log" "$t/cm.log"
   ok "worktree: a commit head side still reads the commit, not the edit (the contrast)" $?
   grep -qF "narrow-scan: note: this tree has uncommitted changes; the scans read the commits" <<< "$got"; ok "note: a dirty tree is named when the head side is a commit" $?
+  # Each side's scan set is its own tree's. A change that adds a cargo feature has a head scan set that names it; BASE cannot build it.
+  # Mutant: both sides take the head tree's set, the base side then asks its tree for a feature it lacks.
+  grep -qx "runner base gpu" "$t/wt.log" && grep -qx "runner head gpu" "$t/wt.log" && grep -qx "recipes scan-set $wb" "$t/wt.log"; ok "scan set: equal sets build the same features on both sides, and the base set is read from BASE's tree" $?
+  STUB_FEATS_tree=gpu,hf wt_run "$t/fd.log" "$wb" --worktree --scan-only --out "$t/fd-out"
+  [ "$rc" = 0 ] && grep -qx "runner base gpu" "$t/fd.log" && grep -qx "runner head gpu,hf" "$t/fd.log"; ok "scan set: a feature only the head tree has is built on the head side, never asked of the base side" $?
+  grep -qF "narrow-scan: bin gate_x: features differ between the sides: base gpu, head gpu,hf" <<< "$got" && grep -qx 'scan_set_differs=1' "$t/fd-out/MANIFEST" && [ -s "$t/fd-out/runner-base.sh" ]; ok "scan set: the bin whose features differ is named with both sets, in the output and the MANIFEST" $?
+  STUB_EXTRA_tree=gate_y wt_run "$t/fe.log" "$wb" --worktree --scan-only --out "$t/fe-out"
+  [ "$rc" = 2 ] && grep -qF "narrow-scan: bin gate_y: in the head scan set only" <<< "$got" && ! grep -qE '^(base|head) ' "$t/fe.log"; ok "scan set: a bin only one side scans ends rc 2 by name before any box call" $?
+  STUB_EXTRA_tree=gate_y wt_run "$t/fe2.log" "$wb" --worktree --dry-run --out "$t/fe2-out"
+  [ "$rc" = 2 ] && grep -qF "the sides' scan sets name different bins" <<< "$got"; ok "scan set: --dry-run refuses the same way" $?
+  STUB_FEATS_tree=gpu,hf wt_run "$t/fdd.log" "$wb" --worktree --dry-run --out "$t/fdd-out"
+  [ "$rc" = 0 ] && grep -qF "the base side runs $t/fdd-out/runner-base.sh, the head side $t/fdd-out/runner.sh" <<< "$got" && ! grep -qE '^(base|head) ' "$t/fdd.log"; ok "scan set: --dry-run names the runner each side runs when they differ" $?
   # A `git status` that fails (a corrupt index, HEAD readable) prints nothing, which reads as a clean tree. The note names it unknown and
   # does not claim a dirty or a clean tree; the run goes on, since its scans read commits. Mutant: the failed status read as a clean tree,
   # no note at all.
@@ -976,6 +1019,9 @@ NARROW_STUB_EOF
   [ "$rc" = 0 ] && ! grep -q '^base rb ' "$t/c2.log" && grep -q '^head rh ' "$t/c2.log" && grep -qxF "narrow-scan: base $wb from cache $ent" <<< "$got"; ok "cache: the same key hits: one line names the cache dir, no box call for the base side, the head side still runs" $?
   grep -q '^narrow-scan: done: base side from cache, head side [0-9]*s' <<< "$got"; ok "cache: the done line says the base side came from the cache, not a wall" $?
   cmp -s "$t/c1-out/base/gate_x.log" "$t/c2-out/base/gate_x.log" && cmp -s "$t/c1-out/base/gate_x.ptx/mod1.ptx" "$t/c2-out/base/gate_x.ptx/mod1.ptx" && grep -qx 'base_cache=hit' "$t/c2-out/MANIFEST"; ok "cache: a hit lays DIR/base/ out as the fresh run did, and the MANIFEST says hit" $?
+  # the key holds the base side's set: a feature only the head tree has leaves it, so the base side still comes from the cache
+  STUB_FEATS_tree=gpu,hf cache_run "$ch" "$t/c2b.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c2b-out"
+  [ "$rc" = 0 ] && ! grep -q '^base rb ' "$t/c2b.log" && grep -q '^head rh ' "$t/c2b.log" && grep -qxF "narrow-scan: base $wb from cache $ent" <<< "$got" && [ "$(nent "$cr")" = 1 ]; ok "cache: a feature only the head tree has still hits (the key holds the base side's scan set)" $?
   cp "$w/tools/ptx-scan.sh" "$t/ptx-scan.orig"
   echo '# the scanner changed' >> "$w/tools/ptx-scan.sh"
   cache_run "$ch" "$t/c3.log" "$wb" --worktree --keep-ptx --scan-only --out "$t/c3-out"
@@ -1232,13 +1278,37 @@ python3 "$ROOT/tools/recipes.py" scan-set ${SCAN_SET_REV[@]+"${SCAN_SET_REV[@]}"
   die 2 "the scan set could not be derived from $HEAD_LABEL"
 }
 cat "$OUT/scan-set.err" >&2
+# The base side's set comes from BASE's own tree: a feature this change adds is not one BASE can build.
+python3 "$ROOT/tools/recipes.py" scan-set "$BASE_SHA" > "$OUT/scan-set-base.tsv" 2> "$OUT/scan-set-base.err" || {
+  cat "$OUT/scan-set-base.err" >&2
+  die 2 "the scan set could not be derived from BASE ${BASE_SHA:0:8}"
+}
+[ -s "$OUT/scan-set-base.tsv" ] || die 2 "BASE ${BASE_SHA:0:8} has an empty scan set: nothing to compare the head side against"
 BINS=()
 while IFS=$'\t' read -r b _; do [ -z "$b" ] || BINS[${#BINS[@]}]=$b; done < "$OUT/scan-set.tsv"
 make_runner "$OUT/scan-set.tsv" "$ROOT/tools/ptx-scan.sh" "$OUT/runner.sh" "$KEEP" || die 2 "the runner could not be written"
+BASE_SET=$OUT/scan-set.tsv BASE_RUNNER=$OUT/runner.sh SET_DIFF=''
+if ! cmp -s "$OUT/scan-set-base.tsv" "$OUT/scan-set.tsv"; then
+  SET_DIFF=$(scan_set_diff "$OUT/scan-set-base.tsv" "$OUT/scan-set.tsv") || {
+    echo "$SET_DIFF" >&2
+    echo "narrow-scan: the base side's scan set (BASE ${BASE_SHA:0:8}):" >&2
+    sed 's/^/  /' "$OUT/scan-set-base.tsv" >&2
+    echo "narrow-scan: the head side's scan set ($HEAD_LABEL):" >&2
+    sed 's/^/  /' "$OUT/scan-set.tsv" >&2
+    die 2 "the sides' scan sets name different bins: a pair compares one bin's scan on both sides, so every bin must be in both"
+  }
+  BASE_SET=$OUT/scan-set-base.tsv BASE_RUNNER=$OUT/runner-base.sh
+  make_runner "$BASE_SET" "$ROOT/tools/ptx-scan.sh" "$BASE_RUNNER" "$KEEP" || die 2 "the base runner could not be written"
+  echo "$SET_DIFF"
+fi
 echo "narrow-scan: scan set (bin, features, carriers it covers):"
 sed 's/^/  /' "$OUT/scan-set.tsv"
 if [ "$DRY" = 1 ]; then
-  echo "narrow-scan: --dry-run: base dir $BASE_DIR, head dir $HEAD_DIR, bound ${BOUND}s; the runner each side runs is $OUT/runner.sh"
+  if [ "$BASE_RUNNER" = "$OUT/runner.sh" ]; then
+    echo "narrow-scan: --dry-run: base dir $BASE_DIR, head dir $HEAD_DIR, bound ${BOUND}s; the runner each side runs is $OUT/runner.sh"
+  else
+    echo "narrow-scan: --dry-run: base dir $BASE_DIR, head dir $HEAD_DIR, bound ${BOUND}s; the base side runs $BASE_RUNNER, the head side $OUT/runner.sh"
+  fi
   exit 0
 fi
 
@@ -1255,7 +1325,7 @@ trap 'stop_run 143' TERM
 # The base side's cache: BASE is always a commit, so its side is reusable; the head side never is. The key's parts are in
 # $OUT/base-cache.key, the entry's dir is named by their md5.
 CACHE_ROOT=$HOME/.cache/bloomery/narrow-base
-cache_parts "$ROOT/tools/ptx-scan.sh" "$OUT/scan-set.tsv" "$OUT/runner.sh" > "$OUT/base-cache.key"
+cache_parts "$ROOT/tools/ptx-scan.sh" "$BASE_SET" "$BASE_RUNNER" > "$OUT/base-cache.key"
 CACHE_ENTRY=$CACHE_ROOT/${BASE_SHA:0:8}-$(md5_of "$OUT/base-cache.key" 9>&- | cut -c1-16)
 BASE_CACHE=miss RETRIED=''
 if [ "${NARROW_NO_CACHE:-0}" != 1 ] && [ -d "$CACHE_ENTRY" ]; then
@@ -1278,10 +1348,10 @@ for side in base head; do
     WALL_BASE=cache
     continue
   fi
-  if [ "$side" = base ]; then rev=$BASE_SHA dir=$BASE_DIR; else rev=$HEAD_SRC dir=$HEAD_DIR; fi
+  if [ "$side" = base ]; then rev=$BASE_SHA dir=$BASE_DIR runner=$BASE_RUNNER; else rev=$HEAD_SRC dir=$HEAD_DIR runner=$OUT/runner.sh; fi
   left=$((BOUND - (SECONDS - T0)))
   [ "$left" -ge 60 ] || die 124 "the bound of ${BOUND}s is spent before the $side side (the base side took ${WALL_BASE}s): run again, the dirs keep their compiled crates"
-  run_side "$side" "$rev" "$dir" "$OUT/runner.sh" "$OUT" "$left" "${BINS[@]}"
+  run_side "$side" "$rev" "$dir" "$runner" "$OUT" "$left" "${BINS[@]}"
   rc=$?
   if [ "$rc" = 255 ]; then
     # ssh lost the box: the remote runner it started may still run, so it is ended by its recorded pid first; then the side runs
@@ -1291,7 +1361,7 @@ for side in base head; do
     RETRIED=${RETRIED:+$RETRIED,}$side
     left=$((BOUND - (SECONDS - T0)))
     [ "$left" -ge 60 ] || die 124 "the bound of ${BOUND}s is spent before the $side side's retry: run again, the dirs keep their compiled crates"
-    run_side "$side" "$rev" "$dir" "$OUT/runner.sh" "$OUT" "$left" "${BINS[@]}"
+    run_side "$side" "$rev" "$dir" "$runner" "$OUT" "$left" "${BINS[@]}"
     rc=$?
     [ "$rc" != 255 ] || echo "narrow-scan: $side: ssh lost the box again (rc 255): retried once, not again" >&2
   fi
@@ -1343,6 +1413,7 @@ fi
   echo "affected_rc=$arc"
   echo "base_cache=$BASE_CACHE"
   [ -z "$RETRIED" ] || echo "retried=$RETRIED"
+  [ -z "$SET_DIFF" ] || echo "scan_set_differs=1"
   [ "$KEEP" = 0 ] || echo "keep_ptx=1"
 } > "$OUT/MANIFEST"
 BASE_WALL_TXT=${WALL_BASE}s

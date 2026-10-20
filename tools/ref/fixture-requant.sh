@@ -7,7 +7,7 @@
 # named <fixture stem>-TAG-0000N-of-0000M.gguf, with the header key bloomery.fixture.variant = TAG and every other
 # bloomery.fixture.* key of the fixture.
 #
-#   1. `fixture variant-rules` (crates/model/src/bin/fixture.rs) expands the row's map over the fixture's tensor names and prints
+#   1. `fixture variant-rules` (crates/model-hf/src/bin/fixture.rs) expands the row's map over the fixture's tensor names and prints
 #      the quantizer's --custom-q argument, which names every tensor of the fixture at the type it takes (the map's at the new type,
 #      each other at its own, which the quantizer copies) and the --override-kv that stamps the tag. A row that names no tensor, or
 #      one already at the map's type, is refused there by name.
@@ -79,7 +79,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 echo "fixture-requant.sh: $FAMILY $TAG: $SRC -> $OUT (source $NEED bytes, $FREE free)"
-(cd "$REPO" && cargo build --release -p bloomery-model --bin fixture >&2)
+(cd "$REPO" && cargo build --release -p bloomery-model-hf --bin fixture >&2)
 FIXTURE_BIN=$REPO/target/release/fixture
 TABLE=$REPO/tools/fixture-variants.tsv
 RULES=$("$FIXTURE_BIN" variant-rules "$SRC" --tag "$TAG" --table "$TABLE") || die "fixture variant-rules refused $TAG" 65

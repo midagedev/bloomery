@@ -62,10 +62,11 @@ use model::arch::qwen35moe::fixture as qwen38;
 use model::arch::qwen35moe::fixture::qwen35moe as qwen36;
 use model::arch::registry::{self, DraftSource};
 use model::fixture::{
-    self, DEFAULT_SEED, FilePlan, FixtureError, FixtureSpec, HeaderStat, Options, PlannedTensor,
-    RemoteError, Sample, TensorStat, VARIANT_TABLE,
+    self, DEFAULT_SEED, FilePlan, FixtureError, FixtureSpec, Options, PlannedTensor, Sample,
+    TensorStat, VARIANT_TABLE,
 };
 use model::placement::card_budget;
+use model_hf::remote::{self, HeaderStat, RemoteError};
 
 const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft>] [flags]
        fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
@@ -498,7 +499,7 @@ fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()
             e.path, e.size, s.header, s.reads
         );
     };
-    let first = fixture::sparse_set(&client, &r.repo, rev, &set.files, &dir, &mut note)?
+    let first = remote::sparse_set(&client, &r.repo, rev, &set.files, &dir, &mut note)?
         .swap_remove(0)
         .to_string_lossy()
         .into_owned();
@@ -520,8 +521,8 @@ fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()
         DraftSource::File(name) => match hf::mtp_draft(&r.repo, &entries, name)? {
             Some(e) => {
                 let one = std::slice::from_ref(e);
-                let p = fixture::sparse_set(&client, &r.repo, rev, one, &dir, &mut note)?
-                    .swap_remove(0);
+                let p =
+                    remote::sparse_set(&client, &r.repo, rev, one, &dir, &mut note)?.swap_remove(0);
                 println!("fixture: fetch draft {}", e.path);
                 draft_path = Some(p.to_string_lossy().into_owned());
                 Some(open(&p.to_string_lossy())?)
@@ -566,7 +567,7 @@ fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()
                 (Some(_), Ok(f)) => fixture::sidecar_path(&f).ok(),
                 _ => None,
             };
-            match fixture::remove_fixture(Path::new(out), sidecar.as_deref()) {
+            match remote::remove_fixture(Path::new(out), sidecar.as_deref()) {
                 Ok(()) => Err(e),
                 Err(c) => Err(format!("{e}; and removing the fixture failed: {c}").into()),
             }

@@ -1,5 +1,5 @@
 # The model and licence of each fixture family, for the dataset README. Where `fixture fetch` reads a family's files from (repo, quant,
-# revision) is the fixture table in crates/model/src/bin/fixture.rs (SPECS) and is not copied here. Every family that
+# revision) is the fixture table in crates/model-hf/src/bin/fixture.rs (SPECS) and is not copied here. Every family that
 # tools/refset-publish.sh publishes needs a row; the family names are the architectures of tools/fixture-dirs.tsv.
 # The licence text is the base model's LICENSE file at a fixed revision, copied with its line ends as LF into
 # tools/refset-publish/licences/<arch>.txt and published as LICENCES/<arch>.txt; the sha256 column is that file's, and the

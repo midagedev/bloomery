@@ -16,8 +16,12 @@ bloomery-gguf = { path = "../gguf" }
 # node dumps' manifest (re-exported from `lib.rs`), the draft sets, greedy files, KLD bases and
 # the vision set.
 bloomery-refset = { path = "../refset" }
-# Host only: a server's `--hf <repo>[:<quant>]`, the repo's GGUF set fetched into a local cache.
-bloomery-hf = { path = "../hf" }
+# Host only, through the `hf` feature: a server's `--hf <repo>[:<quant>]`, the repo's GGUF set fetched into a
+# local cache, and the checkpoint folders the hf crate reads (a DSpark draft's, Clef's head). The gates that
+# read no such thing do not link it.
+bloomery-hf = { path = "../hf", optional = true }
+# Host only, through the `glm5next-hf` feature: GLM-5.3-Flash's checkpoint map (`generate_glm5next`'s tensor-parallel read).
+bloomery-model-hf = { path = "../model-hf", optional = true }
 # Host only: the lever registry, which the binaries parse once at `main`.
 bloomery-levers = { path = "../levers" }
 # Host-only edge, live with the `gpu` feature off: the oracle table's `Arch`, and the
@@ -32,6 +36,8 @@ oxide-artifacts = { workspace = true, features = ["object-read"] }
 # The KLD base reader (`kld.rs`) maps ik's base file, a gigabyte at the stock size, instead of
 # reading it into memory: the workspace's memmap2, the copy gguf maps the model file with.
 memmap2.workspace = true
+# `sha256`: the digest of a model or image file a gate holds to its recorded one.
+sha2 = { workspace = true }
 # Optional on purpose: with the feature off this package has no edge to the
 # device crate at all, so plain `cargo build`/`cargo test` never resolve the
 # embedded-bundle anchor symbol (which only the cargo-oxide backend defines).
@@ -88,6 +94,10 @@ bloomery-gpu-vision = { path = "../gpu-vision", optional = true }
 bloomery-vision = { path = "../vision", optional = true }
 
 [features]
+# The hub: `--hf` fetches, and the checkpoint folders the hf crate reads. A bin that uses either requires it.
+hf = ["dep:bloomery-hf"]
+# GLM-5.3-Flash read from its Hugging Face checkpoint folder: `generate_glm5next --place tp`.
+glm5next-hf = ["glm5next", "hf", "dep:bloomery-model-hf"]
 gpu = [
     "dep:bloomery-gpu",
     "dep:bloomery-verbs",
@@ -142,17 +152,17 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "bloomery-serve"
 path = "src/bin/bloomery_serve.rs"
-required-features = ["glm5next", "clef", "mimo2", "gemma-embedding2"]
+required-features = ["glm5next", "clef", "mimo2", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "bloomery-serve-ds41"
 path = "src/bin/bloomery_serve_ds41.rs"
-required-features = ["deepseek41", "gemma-embedding2"]
+required-features = ["deepseek41", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "bloomery-serve-qwen38"
 path = "src/bin/bloomery_serve_qwen38.rs"
-required-features = ["deepseek41", "gemma-embedding2"]
+required-features = ["deepseek41", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "gate_qwen38_serve"
@@ -164,7 +174,7 @@ required-features = ["deepseek41"]
 
 [[bin]]
 name = "gate_clef_serve"
-required-features = ["deepseek41", "clef"]
+required-features = ["deepseek41", "clef", "hf"]
 
 [[bin]]
 name = "gate_lev_serve"
@@ -312,7 +322,7 @@ required-features = ["deepseek41"]
 
 [[bin]]
 name = "generate_glm5next"
-required-features = ["glm5next"]
+required-features = ["glm5next-hf"]
 
 [[bin]]
 name = "gate_glm5next_e2e"
@@ -552,7 +562,7 @@ required-features = ["gpu"]
 
 [[bin]]
 name = "gate_qwen35_dspark"
-required-features = ["gpu"]
+required-features = ["gpu", "hf"]
 
 [[bin]]
 name = "gate_qwen35moe_attn"
@@ -572,7 +582,7 @@ required-features = ["gemma-embedding2", "vision", "deepseek41"]
 
 [[bin]]
 name = "gate_gemma_embedding2_serve"
-required-features = ["deepseek41", "gemma-embedding2", "vision"]
+required-features = ["deepseek41", "gemma-embedding2", "vision", "hf"]
 
 [[bin]]
 name = "gate_gemma4v_tower"
@@ -673,3 +683,7 @@ required-features = ["vision"]
 [[bin]]
 name = "gate_qwen35_media"
 required-features = ["vision"]
+
+[[test]]
+name = "sentence_prompts"
+required-features = ["hf"]

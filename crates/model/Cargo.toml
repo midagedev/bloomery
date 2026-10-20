@@ -13,8 +13,6 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
-# The fixture fetch reads a source's headers from the hub by range through the hf crate's curl client.
-bloomery-hf = { path = "../hf" }
 bloomery-levers = { path = "../levers" }
 bloomery-models = { path = "../models" }
 # The placement planner, as a pure crate so its tests run on the Mac; this

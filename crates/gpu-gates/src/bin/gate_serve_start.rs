@@ -221,8 +221,7 @@ fn read_image() -> Result<Vec<u8>, GateError> {
         .join("../..")
         .join(IMAGE);
     let png = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let got = hf::fetch::digest(&path, hf::Check::Sha256, u64::try_from(png.len())?)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let got = bloomery_gpu_gates::sha256(&path)?;
     if got != IMAGE_SHA256 {
         return Err(format!(
             "{}: sha256 {got}, the gate's image is {IMAGE_SHA256}",

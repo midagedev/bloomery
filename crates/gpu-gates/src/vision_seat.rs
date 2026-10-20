@@ -158,10 +158,7 @@ impl Flags {
             record::groups::vision_seat::RECORDS,
             "vision_seat::Flags::encoder",
         );
-        record::require(
-            record::groups::model_file::FETCH,
-            "vision_seat::Flags::encoder",
-        );
+        record::require(record::groups::fetch::FETCH, "vision_seat::Flags::encoder");
         match self.mmproj()? {
             Some(file) => Ok(Some(file.to_owned())),
             None if takes && self.may_pick() => crate::model_file::hf_projector(),

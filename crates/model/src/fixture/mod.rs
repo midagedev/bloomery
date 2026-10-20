@@ -64,7 +64,6 @@ mod digest;
 mod fill;
 pub(crate) mod hybrid;
 mod plan;
-mod remote;
 mod sidecar;
 mod spec;
 mod variant;
@@ -75,10 +74,6 @@ pub use budget::check as check_budget;
 pub use fill::{Band, CHUNK_TARGET, FloatTy, NVFP4_TENSOR_SCALE, Rule, Window, rule_for};
 pub use plan::{FilePlan, Kvs, Plan, PlannedTensor, header_sha256, plan};
 pub(crate) use plan::{int_like, items, split_layer, unsigned};
-pub use remote::{
-    FIRST_RANGE, HeaderStat, MAX_HEADER, ReadRange, RemoteError, remove_fixture, sparse_set,
-    sparse_shard,
-};
 pub use sidecar::{SidecarStat, path_of as sidecar_path};
 pub(crate) use spec::NoTables;
 pub use spec::{

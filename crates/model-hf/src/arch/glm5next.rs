@@ -14,7 +14,7 @@
 //! Tensor parallel splits each mapped tensor ([`tp_cut`]) along the dim and by the unit a rank's
 //! part holds whole there, or keeps it whole on every rank; the bytes and the blocks a cut keeps
 //! are its format's ([`Format::held`]), and the plan is
-//! [`plan_tp`](crate::placement::tp::plan_tp)'s. KDA and latent attention
+//! [`plan_tp`](model::placement::tp::plan_tp)'s. KDA and latent attention
 //! split by head: their q, k, v, gate and beta rows, the conv channels, the decay and the latent
 //! heads' `q_b`, `k_b` and `v_b`, and the output projection along its input. Dense blocks, the
 //! shared expert and every routed expert split by inner width: gate and up by row, down along
@@ -25,12 +25,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use ::hf::quant_config::{self, Config, Format};
-use ::hf::safetensors::{Dtype, Folder};
+use hf::quant_config::{self, Config, Format};
+use hf::safetensors::{Dtype, Folder};
+use model::arch::glm5next::names::{self, Sub};
+use model::placement::tp::{Cut, TpTensor};
 use serde_json::Value;
-
-use super::names::{self, Sub};
-use crate::placement::tp::{Cut, TpTensor};
 
 /// Why the checkpoint was refused.
 #[derive(Debug, thiserror::Error)]
@@ -40,7 +39,7 @@ pub enum Error {
     #[error("glm5next hf: {name}: {what}")]
     Tensor { name: String, what: String },
     #[error("glm5next hf: {0}")]
-    Folder(#[from] ::hf::safetensors::Error),
+    Folder(#[from] hf::safetensors::Error),
     #[error("glm5next hf: {0}")]
     Quant(#[from] quant_config::Error),
 }
@@ -216,7 +215,7 @@ pub fn map<'a>(
 
 /// A group's exclusive stems detect it in layer `l`; every required role in it must then be present.
 fn parts(l: usize) -> [(Vec<String>, Vec<String>); 6] {
-    use super::roles;
+    use model::arch::glm5next::roles;
     let group = |stems: &[roles::Stem], trigger: fn(&str) -> bool| {
         let names = |keep: fn(&str) -> bool| -> Vec<String> {
             roles::required(stems)
@@ -489,7 +488,7 @@ fn required(
     g: Geometry,
     tensors: usize,
 ) -> Result<(Geometry, BTreeSet<String>), Error> {
-    use super::roles;
+    use model::arch::glm5next::roles;
     let c = config.get("text_config").unwrap_or(config);
     let count = |key: &str| {
         c.get(key).map_or(Ok(0), |v| {
@@ -600,14 +599,14 @@ pub fn read_tp(dir: &Path) -> Result<Vec<TpTensor>, Error> {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/common/glm_hf.rs"]
+#[path = "../../tests/common/glm_hf.rs"]
 mod test_support;
 
 #[cfg(test)]
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::placement::tp::{RankPool, TpError, plan_tp};
+    use model::placement::tp::{RankPool, TpError, plan_tp};
 
     /// Layers 0 (KDA, dense) and 3 (latent attention, 288 experts) and the unlayered tensors of
     /// nvidia/GLM-5.3-Flash-NVFP4 map to exactly the names and ggml dims of unsloth's
@@ -641,7 +640,7 @@ mod tests {
         }
         let got: BTreeMap<String, Vec<usize>> = got.into_iter().map(|(n, m)| (n, m.dims)).collect();
         let want = gguf_table(
-            include_str!("../../../../hf/tests/fixtures/glm-5.3-flash-ud-q4_k_xl-layers-0-3.tsv"),
+            include_str!("../../../hf/tests/fixtures/glm-5.3-flash-ud-q4_k_xl-layers-0-3.tsv"),
             |_| true,
         );
         assert_eq!(got, want);
@@ -821,7 +820,10 @@ mod tests {
         assert_eq!(ts.len() - without_bias.len(), 2);
         let bias_bytes: u64 = ts
             .iter()
-            .filter(|t| t.name.ends_with(super::super::roles::SELECTION_BIAS))
+            .filter(|t| {
+                t.name
+                    .ends_with(model::arch::glm5next::roles::SELECTION_BIAS)
+            })
             .map(|t| t.bytes)
             .sum();
         assert_ne!(bias_bytes, 0);
@@ -942,7 +944,7 @@ mod tests {
                 .collect();
             std::fs::write(
                 dir.join("model.safetensors"),
-                ::hf::safetensors::write(&entries),
+                hf::safetensors::write(&entries),
             )
             .unwrap();
             let weights: BTreeMap<_, _> = kept

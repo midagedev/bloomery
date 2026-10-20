@@ -13,7 +13,8 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py ship-scan [--rev REV] BASE_LOG HEAD_LOG...  # the shipped bins' ptx-scan pairs: a verdict line each; exit 0 only when every shipped bin has a pair and all are identical
     python3 tools/recipes.py ptx-compare BASE_LOG HEAD_LOG [--base-label L] [--head-label L]  # two full ptx-scan logs of one bin as one table: entries, added, removed, changed (tools/ptx-compare.sh); rc 0 nothing existing moved, 3 changed, 4 removed, 5 both
     python3 tools/recipes.py ship-bins [--rev REV]  # the shipped bins and the release features read from tools/release/build.sh: bin<TAB>features
-    python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
+    python3 tools/recipes.py why FILE... [--recipe R]...  # every recipe a file selects, with the chain; --recipe R: whether R's key holds it and R's shortest dependency chain to the file's crate
+    python3 tools/recipes.py gaps [CRATE...] [--rev REV] [--list]  # per crate: recipes whose key holds a file of it, recipes whose targets reach code of it, the gap; exit 1 on a gap of a pinned crate (KEY_REACH_PINS)
     python3 tools/recipes.py rows              # tools/gate-paths.tsv as narrow() reads it: each `derive` row's gates written out, line for line (cached by tree)
     python3 tools/recipes.py reach FILE... [--brief] [--row]  # the gates whose targets can run the file's code, each with a chain
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
@@ -194,6 +195,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import collections
 import concurrent.futures
 import dataclasses
 import datetime
@@ -2351,12 +2353,74 @@ def cmd_targets(args: argparse.Namespace) -> int:
     return 0
 
 
+def closure_chains(tree: Tree, pkg: Package, features: list[str], dev: bool, default: bool = True, all_features: bool = False) -> dict[str, str]:
+    """`Tree.closure`'s packages, each with its shortest chain (breadth first; `closure` itself keeps the first one it finds)."""
+    _, deps_on, _ = tree.feature_closure(pkg, features, default, all_features)
+    seen: dict[str, str] = {}
+    queue: collections.deque[tuple[str, list[str], bool, str]] = collections.deque()
+    for d in pkg.deps:
+        if d.pkg not in tree.packages or (d.kind == "dev" and not dev) or (d.optional and d.key not in deps_on):
+            continue
+        queue.append((d.pkg, d.features, d.default, f"{pkg.name} -> {d.pkg}"))
+    while queue:
+        name, feats, dflt, why = queue.popleft()
+        if name in seen:
+            continue
+        seen[name] = why
+        q = tree.packages[name]
+        _, q_on, _ = tree.feature_closure(q, feats, dflt)
+        for d in q.deps:
+            if d.pkg not in tree.packages or d.kind == "dev" or (d.optional and d.key not in q_on):
+                continue
+            queue.append((d.pkg, d.features, d.default, f"{why} -> {d.pkg}"))
+    return seen
+
+
+def why_chains(side: Side, name: str, f: str, _seen: frozenset[str] = frozenset()) -> list[str]:
+    """How recipe `name` (and the recipes it depends on) links the package that owns `f`: one line per cargo target,
+    its shortest dependency chain to that package, or `its own package` when the target sits in it. Empty when
+    no target links the package (`f` is a script, a global, a manifest read by table)."""
+    tree = side.tree
+    owner = next((p for p in tree.packages.values() if f.startswith(p.dir.rstrip("/") + "/")), None)
+    if owner is None or name in _seen:
+        return []
+    out: set[str] = set()
+    for inv in side.graph.inputs(name).commands.invocations:
+        targets, _ = tree.resolve(inv)
+        for pname, kind, tname, feats in targets:
+            label = f"{pname} {kind} {tname}" if tname else f"{pname} {kind}"
+            if pname == owner.name:
+                out.add(f"{label}: its own package")
+                continue
+            dev = kind in ("test", "bench", "doctest", "libtest", "example")
+            chains = closure_chains(tree, tree.packages[pname], feats, dev, not inv.no_default, inv.all_features)
+            if owner.name in chains:
+                out.add(f"{label}: {chains[owner.name]}")
+    for dep in side.recipes[name].deps:
+        if dep in side.recipes:
+            out.update(why_chains(side, dep, f, _seen | {name}))
+    return sorted(out)
+
+
 def cmd_why(args: argparse.Namespace) -> int:
+    """The recipes whose key holds each FILE, each with the edge that brought it in. With `--recipe R` only R's, and
+    for a file of a workspace crate R's shortest dependency chain to the crate, per cargo target."""
     side = make_side(ROOT)
     names = [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if args.all_recipes or n.startswith(GATE_PREFIX)]
+    if args.recipe:
+        unknown = [r for r in args.recipe if r not in side.recipes]
+        if unknown:
+            raise RecipeError(f"why --recipe: not a recipe: {' '.join(unknown)}")
+        names = list(args.recipe)
     for f in args.files:
         f = _norm(f)
         hits = [(n, side.graph.inputs(n).match(f)) for n in names]
+        if args.recipe:
+            for n, w in hits:
+                print(f"{f} in the key of {n}: " + (f"yes [{w}]" if w else "no"))
+                for c in why_chains(side, n, f) if w else []:
+                    print(f"  {c}")
+            continue
         hits = [(n, w) for n, w in hits if w]
         print(f"{f}: {len(hits)} recipes")
         for n, w in hits:
@@ -2366,6 +2430,94 @@ def cmd_why(args: argparse.Namespace) -> int:
             if hint:
                 print(f"  ({hint})")
     return 0
+
+
+# ----------------------------------------------------------------------------------------------
+# key against reach: a crate a gate's targets never run code of must not move that gate's key
+# ----------------------------------------------------------------------------------------------
+
+# The crates held to it, each with why: the gates whose key closure (Graph.inputs) holds a file of the crate are
+# the gates whose targets reach a unit of it (Reach). A crate edge that no target of a gate uses (an optional
+# dependency a feature turns on only for the binaries that need it, a crate the common code does not name) is the
+# gap; a commit that touches the crate then re-runs every gate that merely links it.
+KEY_REACH_PINS = {
+    "bloomery-hf": "a Hugging Face fetch or checkpoint reader: its commits move only the gates whose targets run its code (model-hf, "
+    "gpu-gates under the `hf` feature, decision)",
+    "bloomery-model-hf": "the fixture fetch and GLM's checkpoint map: gpu-gates links it under the `glm5next-hf` feature, for generate_glm5next alone",
+}
+
+
+def _gate_recipes(side: Side) -> list[str]:
+    return [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if n.startswith((GATE_PREFIX, WEEKLY_PREFIX))]
+
+
+def _linked_origin(why: str) -> bool:
+    """Whether a recipe input came from a cargo target's crate graph, not from a script it runs, a directory it walks or
+    a global (Graph.inputs words those `script …`, `find in …`, `named directory`, `cargo …`, `tools/box.sh …`, `profile …`)."""
+    return not why.startswith(("script", "find in", "named directory", "cargo", "tools/box.sh", "profile "))
+
+
+def key_holders(side: Side, crate: str, names: list[str]) -> list[str]:
+    """The recipes of `names` whose key closure holds a file of workspace package `crate` through a cargo target's
+    crate graph. A script's closure that names a file in prose is another class (`why FILE` lists it)."""
+    pre = side.tree.packages[crate].dir.rstrip("/") + "/"
+    out = []
+    for n in names:
+        ri = side.graph.inputs(n)
+        if any(f.startswith(pre) and _linked_origin(w) for f, w in ri.files.items()) or any(
+            (p.startswith(pre) or pre.startswith(p)) and _linked_origin(w) for p, w in ri.prefixes.items()
+        ):
+            out.append(n)
+    return out
+
+
+def reach_holders(side: Side, crate: str, names: list[str]) -> list[str]:
+    """The recipes of `names` with a cargo target whose reach (Reach.gate_files) holds a file of package `crate`."""
+    pre = side.tree.packages[crate].dir.rstrip("/") + "/"
+    r = reach_of(side.tree)
+    return [n for n in names if side.graph.inputs(n).targets and any(f.startswith(pre) for f in r.gate_files(side.graph, n))]
+
+
+def key_reach_gap(side: Side, crate: str, names: list[str] | None = None) -> list[str]:
+    """The recipes whose key holds a file of `crate` while none of their targets reaches code of it. A recipe that
+    builds no cargo target (a script that walks the tree) has no target to ask and is not counted."""
+    held = [n for n in key_holders(side, crate, names if names is not None else _gate_recipes(side)) if side.graph.inputs(n).targets]
+    got = set(reach_holders(side, crate, held))
+    return [n for n in held if n not in got]
+
+
+def cmd_gaps(args: argparse.Namespace) -> int:
+    """Per workspace crate, N(key): the gate-* and weekly-* recipes whose key holds a file of it, N(reach): those whose targets
+    reach code of it, and the gap between them, largest first. A crate of KEY_REACH_PINS with a gap ends 1 (the pin)."""
+    tmp = tempfile.mkdtemp(prefix="recipes-gaps-") if args.rev else ""
+    try:
+        side = make_side(archive(args.rev, os.path.join(tmp, "tree")) if args.rev else ROOT)
+        names = [n for n in _gate_recipes(side) if side.graph.inputs(n).targets]
+        crates = args.crates or sorted(side.tree.packages)
+        unknown = [c for c in crates if c not in side.tree.packages]
+        if unknown:
+            raise RecipeError(f"gaps: not a workspace package: {' '.join(unknown)}")
+        rows = []
+        for c in crates:
+            held = key_holders(side, c, names)
+            got = set(reach_holders(side, c, held))
+            rows.append((len(held) - len(got), c, len(held), len(got), [n for n in held if n not in got]))
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    print(f"gaps: {len(names)} gate-* and weekly-* recipes with cargo targets ({args.rev or 'working tree'})")
+    print("crate\tkey\treach\tgap")
+    bad = 0
+    for gap, c, nk, nr, gaps in rows:
+        if nk or nr:
+            print(f"{c}\t{nk}\t{nr}\t{gap}")
+        if args.list and gaps:
+            print("  " + " ".join(gaps))
+        if gap and c in KEY_REACH_PINS:
+            bad += 1
+            print(f"gaps: {c} is pinned to no gap ({KEY_REACH_PINS[c]}): {gap} recipes key it without reaching it", file=sys.stderr)
+    return 1 if bad else 0
 
 
 def cmd_reach(args: argparse.Namespace) -> int:
@@ -9703,7 +9855,8 @@ def orphan_self_test(expect, real: Side) -> None:
         text = fh.read()
     with tempfile.TemporaryDirectory(prefix="recipes-orphan-ff-") as tmp:
         p = os.path.join(tmp, "justfile")
-        # (a) the recipe removed: every bind test red, each naming the cfg the plain lib run lacks
+        # (a) the recipe removed: every bind test red, each naming the cfg the lib run lacks (that run carries the hf feature, which only
+        # the fetch tests need; the deepseek41 cfg it still lacks is the point)
         m = re.search(r"^(?:\[[^\n]*\]\n)*gate-ds41-bind:\n(?:    .*\n)+", text, re.M)  # its attributes go with it
         if m is None:
             expect(False, "orphan FAIL-first: no gate-ds41-bind recipe to remove")
@@ -9712,7 +9865,7 @@ def orphan_self_test(expect, real: Side) -> None:
                 fh.write(text[: m.start()] + text[m.end() :])
             got = set(orphan_tests(real.tree, load_justfile(p))[0]) - base
             bind = [o for o in got if " bind::tests::" in o]
-            expect(len(bind) == n_bind and len(got) == n_bind + n_seats and all('cfg(feature = "deepseek41") at crates/gpu-gates/src/lib.rs:' in o and "gate-gpu-gates-lib (no feature)" in o for o in bind), f"orphan FAIL-first (a): {sorted(got)}")
+            expect(len(bind) == n_bind and len(got) == n_bind + n_seats and all('cfg(feature = "deepseek41") at crates/gpu-gates/src/lib.rs:' in o and "gate-gpu-gates-lib (features hf)" in o for o in bind), f"orphan FAIL-first (a): {sorted(got)}")
         # (c) a filter that matches nothing of its module: the tests only that filter reached go red
         for pat in (r"--lib -- (bind::)'", r"--ignored (hw_ds41_oracle) "):
             m = re.search(pat, text)
@@ -9977,6 +10130,34 @@ def oxide_rev_self_test(expect) -> None:
         m = re.search(r"cuda-oxide-bloomery/([0-9a-f]+)/librustc_codegen_cuda\.so", sent)
         expect(r.returncode == 0 and m is not None and m.group(1) == want,
                f"oxide-rev: tools/box.sh exports the backend of {m.group(1) if m else None}, the cuda-device [patch] rev is {want}: {r.returncode} {r.stderr!r}")
+
+
+def key_reach_self_test(expect, side: Side) -> None:
+    """The pins of KEY_REACH_PINS on the real tree, FAIL-first on a copy of it whose gpu-gates links hf for every binary,
+    and the chains `why --recipe` prints."""
+    import copy
+
+    for crate, reason in KEY_REACH_PINS.items():
+        gap = key_reach_gap(side, crate)
+        expect(not gap, f"{crate} ({reason}): {len(gap)} recipes key it without reaching it: {' '.join(gap[:8])}")
+    # FAIL-first: gpu-gates' optional hf dependency made plain is the edge the `hf` feature cuts. Every recipe that builds a
+    # gate binary then keys hf (gate-gpu-p1 and gate-gpu-ds41-attn call neither the fetch nor a checkpoint reader), and the
+    # measure names them.
+    tree2 = copy.copy(side.tree)
+    packages = dict(side.tree.packages)
+    gates = copy.copy(packages["bloomery-gpu-gates"])
+    gates.deps = [dataclasses.replace(d, optional=False) if d.pkg == "bloomery-hf" else d for d in gates.deps]
+    packages["bloomery-gpu-gates"] = gates
+    tree2.packages = packages
+    side2 = Side(tree2, side.recipes, Graph(tree2, side.recipes))
+    probe = ["gate-gpu-p1", "gate-gpu-ds41-attn", "gate-hf"]
+    expect(sorted(key_holders(side2, "bloomery-hf", probe)) == sorted(probe), f"FAIL-first: hf is not in every probe's key with a plain gpu-gates edge: {key_holders(side2, 'bloomery-hf', probe)}")
+    expect(key_reach_gap(side2, "bloomery-hf", probe) == ["gate-gpu-p1", "gate-gpu-ds41-attn"], f"FAIL-first: the gap of a plain gpu-gates edge is {key_reach_gap(side2, 'bloomery-hf', probe)}")
+    # why --recipe: a recipe that links the crate names the chain from its target, one that does not names none
+    expect(why_chains(side, "gate-gpu-p1", "crates/hf/src/lib.rs") == [], f"why: gate-gpu-p1 links hf: {why_chains(side, 'gate-gpu-p1', 'crates/hf/src/lib.rs')}")
+    chain = why_chains(side, "gate-gpu-glm5next-twocard", "crates/hf/src/lib.rs")
+    expect(any(c.endswith("generate_glm5next: bloomery-gpu-gates -> bloomery-hf") for c in chain), f"why: gate-gpu-glm5next-twocard's chain to hf is {chain}")
+    expect(why_chains(side, "gate-hf", "crates/hf/src/lib.rs") == ["bloomery-hf libtest: its own package"], f"why: gate-hf's chain to hf is {why_chains(side, 'gate-hf', 'crates/hf/src/lib.rs')}")
 
 
 def reach_self_test(expect, side: Side, row, stats: dict[str, int]) -> None:
@@ -11341,11 +11522,13 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # by its chain; every check script is a unit or an excluded one; the tables hold no stale entry
     lock_now = load_lock(tree.root)
     host_now = [n for n, _ in host_crates(tree, lock_now)]
+    # PIN(2026-10-20): bloomery-model-hf joined with the tests it took out of bloomery-model (the fixture fetch's, the GLM checkpoint
+    # map's), which the nightly ran as part of that crate.
     expect(
         host_now
         == [
             "bloomery-app", "bloomery-decision", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf", "bloomery-jinja",
-            "bloomery-levers", "bloomery-model", "bloomery-models", "bloomery-placement", "bloomery-qdot", "bloomery-refset", "bloomery-runtime",
+            "bloomery-levers", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-placement", "bloomery-qdot", "bloomery-refset", "bloomery-runtime",
             "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
             "bloomery-vision",
         ],
@@ -11490,6 +11673,7 @@ def self_test(serial: bool = False) -> int:
         ("small tools", small),
         ("key detectors", lambda f: key_detectors_self_test(_expecting(f), side)),
         ("key", lambda f: key_self_test(_expecting(f), side)),
+        ("key reach", lambda f: key_reach_self_test(_expecting(f), side)),
     ]
     fails, times = _forked(jobs, serial)
     for f in fails:
@@ -11535,9 +11719,14 @@ def main(argv: list[str]) -> int:
     pcm.add_argument("--head-label", default="head")
     sb = sub.add_parser("ship-bins", help="the shipped bins and the release features: bin<TAB>features (tools/release/build.sh)")
     sb.add_argument("--rev", help="read build.sh at this commit; default the working tree")
-    w = sub.add_parser("why")
+    w = sub.add_parser("why", help="the gate-* recipes whose key holds each FILE and the edge that brought it in; --recipe R: R's shortest dependency chain to the file's crate, per cargo target")
     w.add_argument("files", nargs="+")
     w.add_argument("--all-recipes", action="store_true")
+    w.add_argument("--recipe", action="append", help="only this recipe (repeatable), with its chains")
+    gp = sub.add_parser("gaps", help="per workspace crate: the gate-* and weekly-* recipes whose key holds a file of it, those whose targets reach code of it, the gap (exit 1 on a gap of a KEY_REACH_PINS crate)")
+    gp.add_argument("crates", nargs="*", metavar="CRATE")
+    gp.add_argument("--rev", help="read the tree at this commit (a git archive of it); default the working tree")
+    gp.add_argument("--list", action="store_true", help="name the recipes in each gap")
     rh = sub.add_parser("reach", help="the gate-* recipes whose targets can run code of each FILE through a dependency (the derivation "
                         f"{GATE_PATHS}'s rows are held to), each with one chain")
     rh.add_argument("files", nargs="+")
@@ -11599,6 +11788,8 @@ def main(argv: list[str]) -> int:
             return cmd_why(args)
         if args.cmd == "reach":
             return cmd_reach(args)
+        if args.cmd == "gaps":
+            return cmd_gaps(args)
         if args.cmd == "key":
             return cmd_key(args)
         if args.cmd == "box-command":

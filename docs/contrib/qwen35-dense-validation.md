@@ -48,7 +48,7 @@ and the context regression:
 
 ```sh
 cargo check --locked -p bloomery-gpu-gates \
-  --features glm5next,clef,vision,mimo2,gemma-embedding2 \
+  --features glm5next,clef,vision,mimo2,gemma-embedding2,hf \
   --bin generate_qwen3moe --bin bloomery-serve
 cargo oxide test --arch sm_86 -- -p bloomery-gpu-gates --features gpu \
   --bin generate_qwen3moe dense_shortage_halves_the_default_context

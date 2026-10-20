@@ -81,10 +81,6 @@ pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<Source>, HfErr
     }
 }
 
-/// The refusal when nothing names the model.
-pub const NONE: &str = "no model file: pass -m PATH (the first shard) or --hf <repo>[:<quant>], \
-                        or set BLOOMERY_REF_MODEL";
-
 #[cfg(test)]
 mod tests {
     use super::*;

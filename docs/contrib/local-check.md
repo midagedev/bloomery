@@ -244,9 +244,9 @@ A fixture-tier gate reads two inputs: the family's fixture and the `fx_` referen
 2. **Make the fixture of each family** with the `fixture` binary of `bloomery-model`, one command a family. It runs
    `curl`, which must be on `PATH`, and on x86_64 that is not Zen 3 it needs the `RUSTFLAGS` of section 3:
 
-       cargo run --release -p bloomery-model --bin fixture -- fetch qwen38 /models/fixtures/qwen38
-       cargo run --release -p bloomery-model --bin fixture -- fetch v41 /models/fixtures/v41
-       cargo run --release -p bloomery-model --bin fixture -- fetch glm5next /models/fixtures/glm5next
+       cargo run --release -p bloomery-model-hf --bin fixture -- fetch qwen38 /models/fixtures/qwen38
+       cargo run --release -p bloomery-model-hf --bin fixture -- fetch v41 /models/fixtures/v41
+       cargo run --release -p bloomery-model-hf --bin fixture -- fetch glm5next /models/fixtures/glm5next
 
    The word after `fetch` is the family's name in the registry (`crates/model/src/arch/registry.rs`, a row's fixture `family`), whose row gives the
    source repo, quant and revision. The directory is the one `tools/fixture-dirs.tsv` maps the family's architecture to (`qwen4exp` to
@@ -285,7 +285,7 @@ directory, since `fetch` refuses an existing one, and keep the old fixture until
 
 ```sh
 mkdir -p /models/fixtures-refresh
-cargo run --release -p bloomery-model --bin fixture -- fetch qwen38 /models/fixtures-refresh/qwen38
+cargo run --release -p bloomery-model-hf --bin fixture -- fetch qwen38 /models/fixtures-refresh/qwen38
 BLOOMERY_FIXTURE_ROOT=/models/fixtures-refresh BLOOMERY_BOX_LOCAL=1 just gate-fixture-budget
 ```
 

@@ -1,0 +1,31 @@
+[package]
+name = "bloomery-model-hf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "What the CPU model description does with the Hugging Face hub and its checkpoints: the fixture generator's fetch of a repo's headers, and GLM-5.3-Flash's checkpoint read in the glm5next names"
+
+[lib]
+name = "model_hf"
+
+[lints]
+workspace = true
+
+[dependencies]
+bloomery-gguf = { path = "../gguf" }
+bloomery-hf = { path = "../hf" }
+bloomery-model = { path = "../model" }
+# The `fixture` bin reads its own page faults (`getrusage`).
+libc = { workspace = true }
+# The GLM name map reads a Hugging Face checkpoint's config.json.
+serde_json = "=1.0.151"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The GLM name map's tests read the hf crate's gzipped checkpoint fixtures.
+flate2 = "1.1.10"
+# The fixture test holds a written file to the digest of its bytes.
+sha2 = { workspace = true }
+# The `fixture` bin's budget gate reads the fixture root through the reference-set reader.
+bloomery-refset = { path = "../refset" }

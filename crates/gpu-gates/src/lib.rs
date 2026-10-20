@@ -163,10 +163,21 @@ pub fn bench_arm(
 
 /// The SHA-256 of the file at `path`, lowercase hex; an error names the file.
 pub fn sha256(path: &Path) -> Result<String, GateError> {
-    let size = std::fs::metadata(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?
-        .len();
-    Ok(hf::fetch::digest(path, hf::Check::Sha256, size)?)
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let named = |e: std::io::Error| format!("{}: {e}", path.display());
+    let mut file = std::fs::File::open(path).map_err(named)?;
+    let mut sha = Sha256::new();
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let n = file.read(&mut buf).map_err(named)?;
+        if n == 0 {
+            break;
+        }
+        sha.update(&buf[..n]);
+    }
+    Ok(sha.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The model file every gate and server opens: the one a server named on
@@ -195,7 +206,7 @@ pub fn ref_model_path() -> Result<PathBuf, GateError> {
                 }
                 PathBuf::from(p)
             }
-            _ => return Err(hf::source::NONE.into()),
+            _ => return Err(model_file::NONE.into()),
         }
     };
     let tier = tier::Tier::from_env()?;

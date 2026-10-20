@@ -54,7 +54,7 @@ crates/model/tests/attn.rs	BLOOMERY_FLASH_SIMD_CHILD_DUMP,BLOOMERY_KV_PREFETCH_C
 crates/model/tests/common/model_path.rs	BLOOMERY_MODEL	stays: the model file the harnesses open
 crates/model/tests/deepseek4_meta.rs	BLOOMERY_REF_MODEL	stays: the model file the harness opens
 crates/model/tests/ds41_meta.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
-crates/model/tests/fixture.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
+crates/model-hf/tests/fixture.rs	BLOOMERY_DSPARK_MODEL	stays: the DSpark draft file
 crates/model/tests/gemma_embedding_meta.rs	BLOOMERY_MODEL	stays: the model file the harness opens
 crates/model/tests/gemma_embedding2_meta.rs	BLOOMERY_MODEL	stays: the model file the harness opens
 crates/model/tests/mt.rs	BLOOMERY_MT_CHILD_DUMP	stays: the gate's handshake with the child it runs
@@ -71,5 +71,5 @@ crates/decision/tests/clef.rs	BLOOMERY_DATA	stays: the data directory
 crates/decision/tests/lev.rs	BLOOMERY_DATA	stays: the data directory
 crates/vision/tests/common/mod.rs	BLOOMERY_VISION_SET	stays: the vision reference set
 crates/gpu-gates/src/tier.rs	BLOOMERY_TIER	stays: the tier a gate runs in, read once here and checked against the file it opens
-crates/gpu-gates/src/model_file.rs	BLOOMERY_CACHE,BLOOMERY_REF_MODEL,HOME	stays: a server's --hf cache, and the model named once beside the gates' variable
+crates/gpu-gates/src/model_file/fetch.rs	BLOOMERY_CACHE,BLOOMERY_REF_MODEL,HOME	stays: a server's --hf cache, and the model named once beside the gates' variable
 crates/hf/src/fetch.rs	HF_TOKEN,HOME,HF_HUB_OFFLINE	stays: the hub token for a gated repo, and its file; the hub's own switch to stay offline
