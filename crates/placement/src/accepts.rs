@@ -69,6 +69,27 @@ pub fn program_of(arch: Arch) -> Option<Program> {
     }
 }
 
+impl Program {
+    /// The family's word: what a line that speaks of the program names the
+    /// family by (a gate's counts and check lines). One owner, so every line
+    /// that names the family names it the same way.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Deepseek41Chain => "deepseek41",
+            Self::Qwen3moeBody => "qwen3moe",
+            Self::Qwen35Body => "qwen35moe",
+            Self::Glm5nextBody => "glm5next",
+            Self::Qwen38Body => "qwen38",
+            Self::Mimo2Body => "mimo2",
+            Self::Solar2Body => "solar2",
+            Self::NemotronHBody => "nemotron_h",
+            Self::NemotronHMoeBody => "nemotron_h_moe",
+            Self::GemmaEmbedding2Body => "gemma-embedding2",
+        }
+    }
+}
+
 /// The card gate·up entry `Body35` runs a routed stack of `ty` with: the
 /// card kernel table's row ([`kernels::gate_up`], the decode `_sel`) when
 /// the table names the type's prompt GEMM too ([`kernels::gemm`]), among

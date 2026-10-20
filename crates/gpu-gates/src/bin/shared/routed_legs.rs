@@ -762,7 +762,7 @@ pub(super) fn run() -> Result<(), GateError> {
         );
     }
     for family in families.values() {
-        let name = family_name(family.who.program);
+        let name = family.who.program.name();
         let traps = trap_count(family.who.program, &family.swept);
         if traps == 0 {
             println!("legs: {name}: the sweep has no trap {}", verdict(false));
@@ -1058,23 +1058,6 @@ fn trap_count(program: Program, triples: &[[GgmlType; 3]]) -> usize {
                 && leg_runs(program, [g, u, d]) == Some(false)
         })
         .count()
-}
-
-/// The family word of `program`, for the lines the adapter's own name does
-/// not reach (the counts and the check lines).
-fn family_name(program: Program) -> &'static str {
-    match program {
-        Program::Qwen3moeBody => "qwen3moe",
-        Program::Qwen35Body => "qwen35moe",
-        Program::Qwen38Body => "qwen38",
-        Program::Glm5nextBody => "glm5next",
-        Program::Mimo2Body => "mimo2",
-        Program::Solar2Body => "solar2",
-        Program::Deepseek41Chain => "deepseek41",
-        Program::NemotronHBody => "nemotron_h",
-        Program::NemotronHMoeBody => "nemotron_h_moe",
-        Program::GemmaEmbedding2Body => "gemma-embedding2",
-    }
 }
 
 /// The file's routed stacks, by layer: each layer's `[gate, up, down]` types

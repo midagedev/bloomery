@@ -78,12 +78,12 @@ crates/gpu-gates/src/bin/probe_nvread.rs	qwen	1	baseline T 1: case-table rows, t
 crates/gpu-gates/src/bin/shared/dspark_hf.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/emb2_image.rs	gemma	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/route_trace38.rs	qwen	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
-crates/gpu-gates/src/bin/shared/routed_legs.rs	deepseek	9	baseline P 9: MK2 program by body
-crates/gpu-gates/src/bin/shared/routed_legs.rs	gemma	5	baseline P 5: MK2 program by body
-crates/gpu-gates/src/bin/shared/routed_legs.rs	glm	8	baseline P 8: MK2 program by body
-crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	5	baseline P 5: MK2 program by body
-crates/gpu-gates/src/bin/shared/routed_legs.rs	nemotron	6	baseline P 6: MK2 program by body
-crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	24	baseline P 24: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	deepseek	8	baseline P 9: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	gemma	4	baseline P 5: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	glm	7	baseline P 8: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	4	baseline P 5: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	nemotron	4	baseline P 6: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	21	baseline P 24: MK2 program by body
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	clef	13	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	qwen	13	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/served.rs	qwen	1	baseline S 1: MK9 seat by program
@@ -158,12 +158,12 @@ crates/models/src/lib.rs	glm	3	baseline A 3: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	mimo	2	baseline A 2: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	nemotron	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	qwen	9	baseline A 9: MK1a/MK1b ArchRow registry
-crates/placement/src/accepts.rs	deepseek	9	baseline P 9: MK2 program by body
-crates/placement/src/accepts.rs	gemma	4	baseline P 4: MK2 program by body
-crates/placement/src/accepts.rs	glm	4	baseline P 4: MK2 program by body
-crates/placement/src/accepts.rs	mimo	4	baseline P 4: MK2 program by body
-crates/placement/src/accepts.rs	nemotron	15	baseline P 15: MK2 program by body
-crates/placement/src/accepts.rs	qwen	23	baseline P 23: MK2 program by body
+crates/placement/src/accepts.rs	deepseek	10	PIN(2026-10-21) deepseek: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
+crates/placement/src/accepts.rs	gemma	5	PIN(2026-10-21) gemma: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
+crates/placement/src/accepts.rs	glm	5	PIN(2026-10-21) glm: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
+crates/placement/src/accepts.rs	mimo	5	PIN(2026-10-21) mimo: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
+crates/placement/src/accepts.rs	nemotron	17	PIN(2026-10-21) nemotron: MK2 program by body; +2 is the family's word in the common Program::name owner, which the model's own code does not carry yet
+crates/placement/src/accepts.rs	qwen	26	PIN(2026-10-21) qwen: MK2 program by body; +3 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/placement/nodes_scale.rs	deepseek	10	baseline D 10: shapes read from the fixture ModelSpec rows (deferred)
 crates/placement/src/placement/nodes_scale.rs	glm	2	baseline D 2: shapes read from the fixture ModelSpec rows (deferred)
 crates/placement/src/placement/nodes_scale.rs	qwen	32	baseline D 32: shapes read from the fixture ModelSpec rows (deferred)
@@ -185,8 +185,8 @@ crates/gpu-gates/src/bin/shared/routed_legs.rs	minimax	2	PIN(2026-10-20) minimax
 crates/gpu-gates/src/bin/shared/systemone_clause.rs	clef	1	PIN(2026-10-20) clef: the suite of SystemOne requests the serve gates post (tools/ref/clef/suite.jsonl) has no neutral name; the decision release row owns the file
 crates/model/src/arch/mod.rs	solar	4	PIN(2026-10-20) solar: the family's module declaration (`pub mod solar_open2;`), and its `model::arch::Arch` variant with the arms of `from_name` and `name`; the module list is not a registry and the enum lists the architectures a body runs, so each family adds its directory, variant and two arms here until the registry owns them
 crates/models/src/lib.rs	solar	2	PIN(2026-10-20) solar: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
-crates/placement/src/accepts.rs	solar	4	PIN(2026-10-20) solar: Program is the key of program_of, leg_arms and routed_rule, three exhaustive matches, so the family's variant has its line in each; the program would carry its own leg arms and routed rule
+crates/placement/src/accepts.rs	solar	5	PIN(2026-10-21) solar: Program is the key of program_of, leg_arms and routed_rule, three exhaustive matches, so the family's variant has its line in each; the program would carry its own leg arms and routed rule; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/model/src/arch/coverage.rs	solar	9	PIN(2026-10-20) solar: the coverage rows, the token-embedding pin and the expert-stack match are keyed by Program, so each row the solar2 body runs lists its variant; the program would own its rows instead of the list naming programs
-crates/gpu-gates/src/bin/shared/routed_legs.rs	solar	3	PIN(2026-10-20) solar: family_of and skip_of match every models::Arch exhaustively, and family_name matches every placement Program for the count lines; the family has no routed-legs adapter until its body has one, and a Program name owner would take family_name's arms
+crates/gpu-gates/src/bin/shared/routed_legs.rs	solar	2	PIN(2026-10-21) solar: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body has one, and the count lines take the family's word from the common Program::name owner
 crates/gpu-gates/src/record.rs	solar	4	PIN(2026-10-20) solar: a seat's load and listening lines are one Kind each and its list another; the tiered seats' load lines share every field but the architecture word, so one Kind keyed by it replaces mimo2's and this one
 crates/gpu/src/fault.rs	solar	2	PIN(2026-10-20) solar: the fault table is per architecture by design: the `SOLAR2` step order and its `step_order::of` arm
