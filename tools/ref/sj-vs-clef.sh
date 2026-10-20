@@ -38,6 +38,13 @@
 # is dropped (the first-request state), and the short bucket (a prompt under 1,000 ids) runs SJ_ROUNDS rounds and
 # the long bucket (the two long requests) SJ_ROUNDS_LONG. The client wall is the POST to the last byte.
 #
+# The bodies. A window's directory (SJ_OUT/window<n>) holds, beside rows.json, `bodies/<arm>/<suite>-<id>.json`: each
+# arm's answer to each request's first counted round, as received (the Clef arm's /v1/systemone body, a generative
+# arm's chat completion), the row naming it under `body`. After the last round, a generative arm whose server lists
+# /v1/systemone in its /props `routes` is asked each request once more there, untimed, and the bodies go to
+# `bodies/<arm>-systemone/<suite>-<id>.json` (a non-200 answer is kept with its status in `<that file>.status`); a
+# server without the route is a named line, not an error. The extra requests come after every timed region.
+#
 # The tables. sjcmp.py's `table` prints the wall (p50, p95 per suite and per bucket) beside the server's own
 # split, and the agreements (the tops against the official BF16 rows, against the Clef arm served, and the jump
 # arm against the step arm). This file's own table adds the ab card's row: the jump arm's wall p50 against the
@@ -616,7 +623,8 @@ sj_main() {
   [ "$rc" = 0 ] || sj_refuse 64 "the suites do not load (rc $rc): $LEASE_OUT"
   SUITE_NOTE=$(tr '\n' ';' <<< "$LEASE_OUT")
   if [ -z "$OUT" ]; then
-    OUT=$(mktemp -d "${TMPDIR:-/tmp}/sj-vs-clef.XXXXXX") || sj_refuse 2 "no temporary directory"
+    tmp=${TMPDIR:-/tmp}
+    OUT=$(mktemp -d "${tmp%/}/sj-vs-clef.XXXXXX") || sj_refuse 2 "no temporary directory"
   fi
   mkdir -p "$OUT" || sj_refuse 2 "no output directory at $OUT"
   if [ -z "$LOGDIR" ]; then
@@ -678,7 +686,9 @@ sj_selftest() {
   unset BLOOMERY_TIMING_GPU BLOOMERY_TIMING_CARDS BLOOMERY_BOX_CARD BLOOMERY_DRAFT BLOOMERY_OTHER_STRICT BLOOMERY_DRY \
     BLOOMERY_LEASE_CARD CUDA_VISIBLE_DEVICES
   command -v python3 > /dev/null || { echo "sj-vs-clef.sh --self-test: python3 is not on PATH" >&2; exit 2; }
-  T=$(mktemp -d "${TMPDIR:-/tmp}/sj-vs-clef-self-test.XXXXXX") || exit 2
+  tmp=${TMPDIR:-/tmp}
+  # The temporary root without a trailing slash, so the paths the cases expect are the paths printed.
+  T=$(mktemp -d "${tmp%/}/sj-vs-clef-self-test.XXXXXX") || exit 2
   # st_reap <case dir>: KILL what the case's stub servers left, only a pid it logged whose command is still the stub.
   st_reap() {
     local p
@@ -736,6 +746,9 @@ CONSTRAINED = os.environ.get("STUB_CONSTRAINED", "")
 # the Clef (decide) seat's log names no card.
 CARD = {"plan": "A6000", "other": "3090"}.get(MODEL.split(".")[0], "")
 SLOW = float(os.environ.get("STUB_SLOW", "0"))
+# STUB_ROUTES: unset, /props answers 404; `none`, /props lists no routes; `yes`, it lists /v1/systemone.
+ROUTES = os.environ.get("STUB_ROUTES", "")
+LOG = os.path.join(os.environ["STUB_DIR"], "stub-requests") if os.environ.get("STUB_DIR") else ""
 if MODEL.startswith("fail"):
     sys.exit(5)
 if MODEL.startswith("hang"):
@@ -748,6 +761,12 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def note(self, method):
+        # The requests the bodies pass is ordered by, one line each in the order they came: port, method, path.
+        if LOG:
+            with open(LOG, "a") as f:
+                f.write(f"{PORT} {method} {self.path}\n")
+
     def send_body(self, body):
         raw = json.dumps(body).encode()
         self.send_response(200)
@@ -757,14 +776,20 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self):
+        if self.path == "/props":
+            self.note("GET")
         if self.path in ("/health", "/v1/health"):
             self.send_body({"status": "ok"})
+        elif self.path == "/props" and ROUTES:
+            self.send_body({"build_info": "stub", **({"routes": ["/v1/systemone"]} if ROUTES == "yes" else {})})
         else:
             self.send_error(404)
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(n) or b"{}")
+        if self.path in ("/v1/systemone", "/v1/chat/completions"):
+            self.note("POST")
         if self.path == "/tokenize":
             self.send_body({"tokens": [ord(c) for c in body.get("content", "")]})
         elif self.path == "/v1/systemone":
@@ -945,6 +970,79 @@ SMI
     awk -v c="$CP" '{ for (i = 1; i <= NF; i++) if ($i == "--port") printf "%s=%s ", ($(i + 1) == c ? "clef" : "qwen"), $1 }' \
       "$C/stub-levers"
   }
+  # st_bodies <name> <window dir> <arm>...: each arm's first counted round's answer of every request is a file the row
+  # names (the dropped round's row names none, no other row does), and the directory holds those files and no more.
+  st_bodies() {
+    local name=$1 dir=$2 msg
+    shift 2
+    if msg=$(python3 -I - "$dir" "$@" 2>&1 << 'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+rows = json.loads((root / "rows.json").read_text())["rows"]
+for arm in sys.argv[2:]:
+    mine = [r for r in rows if r["arm"] == arm]
+    keys = sorted({(r["suite"], r["id"]) for r in mine})
+    for suite, rid in keys:
+        rs = [r for r in mine if r["suite"] == suite and r["id"] == rid]
+        named = [r for r in rs if "body" in r]
+        first = min(r["round"] for r in rs if not r["dropped"])
+        if len(named) != 1 or named[0]["dropped"] or named[0]["round"] != first:
+            sys.exit(f"{arm} {suite}/{rid}: the rows naming a body are {[(r['round'], r['dropped']) for r in named]}, want round {first}")
+        if named[0]["body"] != f"bodies/{arm}/{suite}-{rid}.json":
+            sys.exit(f"{arm} {suite}/{rid}: the row names {named[0]['body']}")
+        json.loads((root / named[0]["body"]).read_text())
+    files = sorted(p.name for p in (root / "bodies" / arm).iterdir())
+    if files != sorted(f"{s}-{i}.json" for s, i in keys):
+        sys.exit(f"{arm}: the directory holds {len(files)} files, want one per request ({len(keys)})")
+print(f"{len(sys.argv) - 2} arms, {len(keys)} requests each")
+PY
+    ); then ok "$name"; else bad "$name" "$msg"; fi
+  }
+  # st_systemone <name> <window dir> <arm> <n>: the arm's SystemOne bodies are <n> files, each a SystemOne answer.
+  st_systemone() {
+    local name=$1 dir=$2 msg
+    if msg=$(python3 -I - "$dir" "$3" "$4" 2>&1 << 'PY'
+import json
+import sys
+from pathlib import Path
+
+d = Path(sys.argv[1]) / "bodies" / f"{sys.argv[2]}-systemone"
+files = sorted(d.glob("*.json")) if d.is_dir() else []
+if len(files) != int(sys.argv[3]):
+    sys.exit(f"{d} holds {len(files)} bodies, want {sys.argv[3]}")
+for f in files:
+    if "answers" not in json.loads(f.read_text()):
+        sys.exit(f"{f.name} is no SystemOne answer")
+if list(d.glob("*.status")):
+    sys.exit("a 200 answer has a status file")
+PY
+    ); then ok "$name"; else bad "$name" "$msg"; fi
+  }
+  # st_order <name> <qwen pattern>: the requests of the stub servers in the order they came (the stub's log, one token a
+  # request: C a chat POST, S a SystemOne POST, G a GET /props): the Clef server's are all S and none G, the generative
+  # server's match the pattern (a regular expression over those tokens).
+  st_order() {
+    local name=$1 msg
+    if msg=$(python3 -I - "$C/stub-requests" "$CP" "$QP" "$2" 2>&1 << 'PY'
+import re
+import sys
+
+log, clef, qwen, pattern = sys.argv[1:5]
+tok = {"POST /v1/chat/completions": "C", "POST /v1/systemone": "S", "GET /props": "G"}
+seen = {clef: "", qwen: ""}
+for line in open(log):
+    port, rest = line.rstrip("\n").split(" ", 1)
+    seen[port] += tok[rest]
+if not re.fullmatch("S+", seen[clef]):
+    sys.exit(f"the Clef server saw {seen[clef]}, want S only")
+if not re.fullmatch(pattern, seen[qwen]):
+    sys.exit(f"the generative server saw {seen[qwen]}, want {pattern}")
+PY
+    ); then ok "$name"; else bad "$name" "$msg"; fi
+  }
   MODELS=("SJ_CLEF_MODEL=$T/model.gguf" "SJ_QWEN_MODEL=$T/model.gguf")
 
   # --- the refusals before the lease.
@@ -1005,6 +1103,32 @@ SMI
   st_servers run-servers-stopped 4
   # The lever: on in window 1, off in window 2, on the Qwen3.6 server only.
   [ "$(st_levers)" = "clef=unset qwen=on clef=unset qwen=off " ] && ok run-levers || bad run-levers "got [$(st_levers)]"
+  # The bodies. The stub answers /props with 404, so each generative arm's SystemOne pass is skipped by name; the timed
+  # bodies are there for both arms of the window (2 arms x 15 requests).
+  st_check run-bodies-skipped 0 "[bodies] timed: 30 bodies of 2 arms under $C/out-dir/window1/bodies" \
+    "[bodies] jump: the server lists no /v1/systemone; skipped (GET /props answered 404)" \
+    "[bodies] step: the server lists no /v1/systemone; skipped (GET /props answered 404)"
+  st_bodies run-bodies-window1 "$C/out-dir/window1" A jump
+  st_bodies run-bodies-window2 "$C/out-dir/window2" A step
+  [ ! -e "$C/out-dir/window1/bodies/jump-systemone" ] && ok run-bodies-no-systemone-dir || bad run-bodies-no-systemone-dir "a directory of SystemOne bodies stands"
+  # The server lists the route: after the rounds each generative arm is asked for /props once and for each request's
+  # SystemOne body once, nothing else comes after; the Clef arm is never asked for /props and has no pass.
+  ST_ENV=("${MODELS[@]}" "STUB_ROUTES=yes")
+  st_run
+  st_check run-systemone-pass 0 "[bodies] jump: systemone 15 ok / 15" "[bodies] step: systemone 15 ok / 15"
+  st_absent run-systemone-skips-none "the server lists no /v1/systemone"
+  st_systemone run-systemone-bodies-jump "$C/out-dir/window1" jump 15
+  st_systemone run-systemone-bodies-step "$C/out-dir/window2" step 15
+  st_bodies run-systemone-timed-bodies "$C/out-dir/window1" A jump
+  [ ! -e "$C/out-dir/window1/bodies/A-systemone" ] && ok run-systemone-clef-has-none || bad run-systemone-clef-has-none "the Clef arm has a pass"
+  st_order run-systemone-order 'C+GS{15}C+GS{15}'
+  # A /props that lists no routes: skipped by name (no suffix), no POST of the route.
+  ST_ENV=("${MODELS[@]}" "STUB_ROUTES=none" "SJ_WINDOWS=qwen:on")
+  st_run
+  st_check run-no-routes 0 "[bodies] jump: the server lists no /v1/systemone; skipped"
+  grep -qxF -- "[bodies] jump: the server lists no /v1/systemone; skipped" "$C/out" && ok run-no-routes-no-suffix ||
+    bad run-no-routes-no-suffix "no line is exactly the skipped line"
+  st_order run-no-routes-order 'C+G'
   # A value in the caller's environment picks no arm.
   ST_ENV=("${MODELS[@]}" "BLOOMERY_SCHEMAJUMP=off")
   st_run
