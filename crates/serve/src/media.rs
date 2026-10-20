@@ -677,6 +677,21 @@ pub fn flatten(
     first_image: usize,
     video: &mut VideoCtx,
 ) -> Result<Flat, MediaError> {
+    flatten_with(role, parts, model, first_image, video, &|t| {
+        Cow::Borrowed(t)
+    })
+}
+
+/// [`flatten`] with `text` applied to each text part after the marker check: the text the template
+/// gets for it. The placeholders and a clip's text are the server's and are not passed through it.
+pub fn flatten_with(
+    role: &str,
+    parts: &[Value],
+    model: &dyn MediaModel,
+    first_image: usize,
+    video: &mut VideoCtx,
+    text_of: &dyn for<'t> Fn(&'t str) -> Cow<'t, str>,
+) -> Result<Flat, MediaError> {
     let join = model.part_join();
     let mut text = String::new();
     let mut media = Vec::new();
@@ -686,7 +701,7 @@ pub fn flatten(
         let (piece, is_media) = match parse_part(part)? {
             Part::Text(t) => {
                 check_text(t, model)?;
-                (Cow::Borrowed(t), false)
+                (text_of(t), false)
             }
             Part::Image(_) if role != "user" => return Err(MediaError::ImageRole(short(role))),
             Part::Video(_) if role != "user" => return Err(MediaError::VideoRole(short(role))),

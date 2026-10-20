@@ -54,6 +54,7 @@
 //! one stderr line naming the cause; a second signal terminates at once. The
 //! stop's one owner is [`End::Shutdown`]'s path through [`wait_end`].
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -77,6 +78,7 @@ use crate::engine::{
 use crate::flag::ApiKeys;
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::ArgTypes;
+use crate::guard::{Guard, GuardError, Guarded};
 use crate::http::{self, EventStream, Request};
 use crate::media::{self, ExpandError, MediaError, Medium, Prompt, SharedMediaModel, VideoCtx};
 use crate::models::Listed;
@@ -2397,9 +2399,12 @@ fn apply_template(state: &State, b: &Map<String, Value>) -> Result<Value, ApiErr
 
 /// A chat template's render: its text, each image as the model's
 /// placeholder and each clip as its text with a placeholder a group, and the
-/// media in the order of their placeholders.
+/// media in the order of their placeholders. The text is what the client sent
+/// and the template wrote; `guarded` is the render the tokenizer reads when a
+/// client string carried a special-token spelling ([`crate::guard`]).
 struct Rendered {
     text: String,
+    guarded: Option<Guarded>,
     media: Vec<Medium>,
 }
 
@@ -2416,11 +2421,32 @@ struct Rendered {
 /// dropped. A `developer` message reaches the template as `system`, as
 /// llama-server maps it, a tool call's string `arguments` reach a template
 /// that reads them as an object parsed ([`tool_call_arguments`]), and the
-/// thinking vars ([`thinking_vars`]) reach it in llama-server's order.
+/// thinking vars ([`thinking_vars`]) reach it in llama-server's order. A
+/// special-token spelling in the client's text (a message, a tool call, a tool,
+/// a `chat_template_kwargs` value; not an assistant message's content or
+/// reasoning, which the model wrote) reaches the template marked
+/// ([`crate::guard`]) and is text in the prompt.
 fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiError> {
     let Some(Value::Array(msgs)) = b.get("messages") else {
         return Err(invalid("'messages' is required and must be an array"));
     };
+    // The media part refuses a typed placeholder by name; the guard leaves such a string to it.
+    let markers: Vec<&str> = state
+        .media
+        .iter()
+        .flat_map(|m| std::iter::once(m.image_marker()).chain(m.video_marker()))
+        .collect();
+    let guard = Guard::new(
+        &*state.tok,
+        b,
+        &[
+            state.template.source(),
+            &state.info.bos_text,
+            &state.info.eos_text,
+        ],
+    )
+    .map_err(guard_error)?
+    .except(&markers);
     // GPT-OSS's template is the one that renders the `developer` role itself,
     // named by the `<|channel|>` marker in its source.
     let gpt_oss = state.template.source().contains("<|channel|>");
@@ -2453,16 +2479,22 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         };
         let mut flat = m.clone();
         flat.insert("role".into(), Value::String(role.to_owned()));
+        // An assistant message's content is the model's own output, sent back as it came: its
+        // special tokens' spellings are their tokens.
+        let client = role != "assistant";
         match m.get("content") {
             Some(Value::Array(parts)) => {
                 let text = match &state.media {
-                    None => content_text(parts)?,
+                    None => guard.text_if(client, &content_text(parts)?).into_owned(),
                     Some(model) => {
                         let first = media
                             .iter()
                             .filter(|m| matches!(m, Medium::Image(_)))
                             .count();
-                        let f = media::flatten(role, parts, &**model, first, &mut video)
+                        let f =
+                            media::flatten_with(role, parts, &**model, first, &mut video, &|t| {
+                                guard.text_if(client, t)
+                            })
                             .map_err(|e| media_error(&e))?;
                         media.extend(f.media);
                         f.text
@@ -2470,7 +2502,12 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
                 };
                 flat.insert("content".into(), Value::String(text));
             }
-            None | Some(Value::Null | Value::String(_)) => {}
+            Some(Value::String(text)) => {
+                if let Cow::Owned(g) = guard.text_if(client, text) {
+                    flat.insert("content".into(), Value::String(g));
+                }
+            }
+            None | Some(Value::Null) => {}
             Some(other) => {
                 return Err(wrong_type(
                     &format!("messages[{i}].content"),
@@ -2482,6 +2519,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         if state.object_arguments {
             tool_call_arguments(i, &mut flat)?;
         }
+        guard.message(role, &mut flat);
         messages.push(Value::Object(flat));
     }
     let mut vars = Map::new();
@@ -2501,18 +2539,41 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
     match b.get("tools") {
         None | Some(Value::Null) => {}
         Some(v @ Value::Array(_)) => {
-            vars.insert("tools".into(), v.clone());
+            let mut tools = v.clone();
+            guard.value(&mut tools);
+            vars.insert("tools".into(), tools);
         }
         Some(other) => return Err(wrong_type("tools", "an array", other)),
     }
     thinking_vars(b, &mut vars, state.thinking_off)?;
-    let text = state.template.render(&vars).map_err(|e| ApiError {
+    if let Some(Value::Object(kwargs)) = b.get("chat_template_kwargs") {
+        // What the kwargs put into the vars as they came is the client's text.
+        for (k, v) in kwargs {
+            if let Some(var) = vars.get_mut(k)
+                && var == v
+            {
+                guard.value(var);
+            }
+        }
+    }
+    let marked = state.template.render(&vars).map_err(|e| ApiError {
         retry_after: false,
         code: 500,
         kind: "server_error",
         message: e.to_string(),
     })?;
-    Ok(Rendered { text, media })
+    let (text, guarded) = guard.finish(marked).map_err(guard_error)?;
+    Ok(Rendered {
+        text,
+        guarded,
+        media,
+    })
+}
+
+/// A request whose strings cannot be guarded, or a template that cut a guarded text apart, is
+/// the request's 400 naming it.
+fn guard_error(e: GuardError) -> ApiError {
+    invalid(e.to_string())
 }
 
 /// Whether a message of `msgs` carries a clip part.
@@ -2916,7 +2977,10 @@ fn media_error(e: &MediaError) -> ApiError {
 /// each image expanded to its span with its feed ([`media::expand_prompt`]),
 /// which also refuses a placeholder no image part made.
 fn chat_prompt(state: &State, rendered: &Rendered) -> Result<Prompt, ApiError> {
-    let ids = state.tok.encode(&rendered.text);
+    let ids = match &rendered.guarded {
+        Some(guarded) => guarded.encode(&*state.tok),
+        None => state.tok.encode(&rendered.text),
+    };
     let Some(model) = &state.media else {
         return Ok(Prompt::from(ids));
     };
@@ -4044,6 +4108,11 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message, probs: Option<Value>) ->
 #[cfg(test)]
 #[path = "../tests/common/fixture_templates.rs"]
 mod fixture_templates;
+
+/// The chat path's control-string gates: client text tokenizes as text on every fixture family.
+#[cfg(test)]
+#[path = "ctl_tests.rs"]
+mod ctl_tests;
 
 #[cfg(test)]
 mod tests {

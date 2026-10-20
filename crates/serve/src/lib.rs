@@ -31,6 +31,7 @@ pub mod engine;
 pub mod flag;
 mod genloop;
 pub mod glmxml;
+mod guard;
 pub mod hermes;
 mod http;
 pub mod media;

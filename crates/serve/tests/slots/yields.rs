@@ -47,6 +47,12 @@ impl Tokenizer for Marked {
     fn encode(&self, text: &str) -> Vec<u32> {
         MockTokenizer.encode(text)
     }
+    fn guard<'a>(&self, text: &'a str, mark: &str) -> std::borrow::Cow<'a, str> {
+        MockTokenizer.guard(text, mark)
+    }
+    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
+        MockTokenizer.encode_marked(text, mark)
+    }
     fn decode(&self, ids: &[u32]) -> String {
         MockTokenizer.decode(ids)
     }

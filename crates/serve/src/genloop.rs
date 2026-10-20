@@ -2646,6 +2646,12 @@ mod cache_tests {
         fn encode(&self, text: &str) -> Vec<u32> {
             self.0.encode(text)
         }
+        fn guard<'a>(&self, text: &'a str, mark: &str) -> std::borrow::Cow<'a, str> {
+            self.0.guard(text, mark)
+        }
+        fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
+            self.0.encode_marked(text, mark)
+        }
         fn decode(&self, ids: &[u32]) -> String {
             self.0.decode(ids)
         }

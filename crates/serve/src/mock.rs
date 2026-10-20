@@ -427,6 +427,15 @@ fn token_bytes(id: u32) -> Vec<u8> {
     }
 }
 
+/// The ids of `text` read piece by piece between its `mark`s, which a special token cannot span:
+/// the mocks encode a byte at a time, so the pieces' ids are the text's. The mocks mark nothing
+/// ([`MockTokenizer`]), so a mark in a text is one a test wrote.
+fn encode_pieces(tok: &dyn Tokenizer, text: &str, mark: &str) -> Vec<u32> {
+    text.split(mark)
+        .flat_map(|piece| tok.encode(piece))
+        .collect()
+}
+
 /// The mock's vocabulary (see the module header).
 pub struct MockTokenizer;
 
@@ -453,6 +462,19 @@ impl Tokenizer for MockTokenizer {
             }
         }
         out
+    }
+
+    /// Marks nothing: a spelling typed into a message is its token here, which is how a gate
+    /// scripts the mock's greedy reply (the keep-the-prompt gates type `</think>` and the
+    /// end-of-sequence string into a user message). A vocabulary that follows the chat path's
+    /// rule keeps client text text ([`Tokenizer::guard`]); `api::ctl_tests` holds the rule on the
+    /// real tokenizer.
+    fn guard<'a>(&self, text: &'a str, _mark: &str) -> Cow<'a, str> {
+        Cow::Borrowed(text)
+    }
+
+    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
+        encode_pieces(self, text, mark)
     }
 
     fn decode(&self, ids: &[u32]) -> String {
@@ -782,6 +804,14 @@ impl Tokenizer for BosTokenizer {
         MockTokenizer.encode(text)
     }
 
+    fn guard<'a>(&self, text: &'a str, mark: &str) -> Cow<'a, str> {
+        MockTokenizer.guard(text, mark)
+    }
+
+    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
+        MockTokenizer.encode_marked(text, mark)
+    }
+
     fn decode(&self, ids: &[u32]) -> String {
         MockTokenizer.decode(ids)
     }
@@ -816,6 +846,14 @@ struct EmbedTokenizer;
 impl Tokenizer for EmbedTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
         MockTokenizer.encode(text)
+    }
+
+    fn guard<'a>(&self, text: &'a str, mark: &str) -> Cow<'a, str> {
+        MockTokenizer.guard(text, mark)
+    }
+
+    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
+        MockTokenizer.encode_marked(text, mark)
     }
 
     fn decode(&self, ids: &[u32]) -> String {
@@ -949,6 +987,14 @@ impl Tokenizer for MediaTokenizer {
             out.extend(MockTokenizer.encode(piece));
         }
         out
+    }
+
+    fn guard<'a>(&self, text: &'a str, _mark: &str) -> Cow<'a, str> {
+        Cow::Borrowed(text)
+    }
+
+    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
+        encode_pieces(self, text, mark)
     }
 
     fn decode(&self, ids: &[u32]) -> String {
@@ -1472,6 +1518,14 @@ impl StopsTokenizer {
 impl Tokenizer for StopsTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
         MockTokenizer.encode(text)
+    }
+
+    fn guard<'a>(&self, text: &'a str, mark: &str) -> Cow<'a, str> {
+        MockTokenizer.guard(text, mark)
+    }
+
+    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
+        MockTokenizer.encode_marked(text, mark)
     }
 
     fn decode(&self, ids: &[u32]) -> String {

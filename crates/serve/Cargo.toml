@@ -37,3 +37,8 @@ thiserror.workspace = true
 # The orderly stop's signal handlers: `sigaction`, a `write` a handler makes,
 # a `read` the reader thread blocks on. The workspace's pinned version.
 libc.workspace = true
+
+[dev-dependencies]
+# The chat-path gates tokenize with the real byte-level BPE over a synthetic vocabulary: a control
+# string in client text must come out as ordinary tokens, which only the tokenizer can say.
+bloomery-tokenizer = { path = "../tokenizer" }

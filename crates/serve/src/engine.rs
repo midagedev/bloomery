@@ -61,6 +61,7 @@
 //! reaches the same rows is [`SaveInFlight`], never an overwrite.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
@@ -168,10 +169,25 @@ pub trait Decoder: Send {
 ///
 /// `encode` must parse special-token strings the way llama.cpp does with
 /// `parse_special = true`: a rendered chat prompt carries the BOS string, the role
-/// markers and the think tags as text, and a plain BPE pass would split them.
+/// markers and the think tags as text, and a plain BPE pass would split them. The text a
+/// client sent is in that string too, and its special-token spellings must stay text:
+/// [`Tokenizer::guard`] marks them before the render and [`Tokenizer::encode_marked`] reads
+/// the marked render.
 pub trait Tokenizer: Send + Sync {
     /// Text to token ids, special-token strings mapped to their ids. Adds no BOS.
     fn encode(&self, text: &str) -> Vec<u32>;
+    /// `text` with the non-empty `mark` spliced in beside every spelling of a special token it
+    /// carries (CONTROL and USER_DEFINED alike, and not a one-character token) and beside the
+    /// beginning or the end of one that it ends or starts with; the spelling stays whole in the
+    /// text, and no mark is at the start or the end of the text. The text with the marks cut out is
+    /// `text`, and it comes back borrowed when there is nothing to mark. A chat template renders
+    /// the marked text as it would the text, and [`Tokenizer::encode_marked`] reads the render.
+    fn guard<'a>(&self, text: &'a str, mark: &str) -> Cow<'a, str>;
+    /// [`Tokenizer::encode`] of a text that carries `mark`s: each is cut out of the text and no
+    /// special token matches that holds the place of one or the byte on either side of it, so a
+    /// text [`Tokenizer::guard`] marked is its characters' ids where it carried a spelling. The
+    /// text between marks is read as one text, and a text with no mark gives the ids `encode` does.
+    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32>;
     /// Token ids to text, special tokens rendered as their strings.
     fn decode(&self, ids: &[u32]) -> String;
     /// A fresh streaming decoder.

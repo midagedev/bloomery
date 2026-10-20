@@ -126,6 +126,14 @@ impl Tokenizer for Vocab {
         self.tok.encode(text, false, true)
     }
 
+    fn guard<'a>(&self, text: &'a str, mark: &str) -> std::borrow::Cow<'a, str> {
+        self.tok.guard(text, mark)
+    }
+
+    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
+        self.tok.encode_marked(text, mark, false, true)
+    }
+
     fn decode(&self, ids: &[u32]) -> String {
         self.tok.decode(ids)
     }

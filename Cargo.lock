@@ -406,6 +406,7 @@ dependencies = [
  "bloomery-embed",
  "bloomery-gguf",
  "bloomery-jinja",
+ "bloomery-tokenizer",
  "bloomery-vision",
  "libc",
  "serde_json",

@@ -19,6 +19,19 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **Chat token counts**: `POST /chat/completions/input_tokens` (and its `/v1/` spelling) answers
   `{"input_tokens": N}` with the same chat request's prompt ids — the chat template's render, an image as its span;
   `max_tokens` is not needed.
+- **Special-token spellings in client text are text.** llama-server tokenizes the chat template's render with special
+  tokens parsed (`tools/server/server-context.cpp`, `tokenize_input_prompts(…, true, true, …)`), so a message that
+  spells `<|im_start|>` or `<｜User｜>` writes a turn marker there. This server keeps what a client sends as text: a
+  special-token spelling in a user, system or tool message, a message's role or name, a tool call's name or arguments,
+  a tool's description or schema, or a `chat_template_kwargs` value tokenizes as its characters, and the tokens the
+  template writes stay tokens. An assistant message's content and reasoning are the model's own past output and still
+  carry the special ids it printed. The spellings (and the beginning or end of one a client's text stops at, which
+  the template's next characters could finish) are marked before the render and the marks cut out after it
+  (`crates/serve/src/guard.rs`), so a template sees the text it was sent; a template that slices a marked text through
+  its mark is a 400 naming it, and an image or video placeholder typed into a message keeps its own refusal. Not
+  covered: a template that builds a spelling from its own pieces around a client string (`'<' ~ key ~ '>'`, as
+  Nemotron's does for the extra keys of a tool parameter's schema). A `/completion` prompt is the client's own
+  tokenization and still parses special tokens.
 - **Embeddings**: `POST /v1/embeddings` (OpenAI's shape: `encoding_format` `float` or `base64`, `dimensions`
   for a width the model cuts its vectors to) and `/embedding` or `/embeddings` (llama-server's own array) read
   `input`, or `content`, as llama-server does: a string, a list of ids, a list of strings and ids, or a list of

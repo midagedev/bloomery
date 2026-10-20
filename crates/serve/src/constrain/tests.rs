@@ -109,6 +109,12 @@ impl Tokenizer for Pieces {
         }
         out
     }
+    fn guard<'a>(&self, _text: &'a str, _mark: &str) -> std::borrow::Cow<'a, str> {
+        unreachable!("the constrain tests render no chat prompt")
+    }
+    fn encode_marked(&self, _text: &str, _mark: &str) -> Vec<u32> {
+        unreachable!("the constrain tests render no chat prompt")
+    }
     fn decode(&self, ids: &[u32]) -> String {
         let bytes: Vec<u8> = ids.iter().flat_map(|&i| self.0.bytes_of(i)).collect();
         String::from_utf8_lossy(&bytes).into_owned()
