@@ -10,8 +10,9 @@ use gguf::GgmlType;
 
 use crate::shape::MoeShape;
 use crate::{
-    Act, Collapse, DeltaKind, EngramSpec, Extra, Ffn, GdnGate, HcKind, HcMix, IndexKeys, LatentUp,
-    LayerIdx, Mixer, ModelSpec, NgramRule, PoolRule, Residual, RopeMode, Score, Selector, Source,
+    Act, Collapse, DeltaKind, EngramSpec, Extra, Ffn, GdnGate, HcKind, HcMix, IndexKeys, KdaGate,
+    LatentUp, LayerIdx, Mixer, ModelSpec, NgramRule, PoolRule, Residual, RopeMode, Score, Selector,
+    Source,
 };
 
 /// A feature of a file the engine does not run yet: what it is, and the layer
@@ -305,8 +306,18 @@ impl fmt::Display for Need {
                         GdnGate::Sigmoid => f.write_str(", sigmoid output gate"),
                     }
                 }
-                DeltaKind::Kda { .. } => {
-                    write!(f, "delta rule KDA: d {d}, {v_heads} heads, conv {conv}")
+                DeltaKind::Kda { gate, beta_scale } => {
+                    write!(f, "delta rule KDA: d {d}, {v_heads} heads, conv {conv}")?;
+                    match gate {
+                        KdaGate::Sigmoid { lower_bound } => {
+                            write!(f, ", sigmoid gate bounded below by {lower_bound}")?;
+                        }
+                        KdaGate::Softplus => f.write_str(", softplus gate")?,
+                    }
+                    if *beta_scale != 1.0 {
+                        write!(f, ", beta scaled by {beta_scale}")?;
+                    }
+                    Ok(())
                 }
             },
             Need::Router(MoeShape {

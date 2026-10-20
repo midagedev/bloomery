@@ -21,6 +21,7 @@ pub mod gemma_embedding2;
 mod gemma_encoder;
 pub mod glm5next;
 pub mod hybrid;
+pub mod kda;
 pub mod mimo2;
 pub mod minimaxm3;
 pub mod names;

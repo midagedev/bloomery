@@ -129,8 +129,8 @@ mod tests {
     use crate::sched::{self, At, Item, LayerProgram, Overlap, Port, PortKind, Refused};
     use crate::state::{Store, StoreRule, every_position, stores};
     use models::{
-        Act, DeltaKind, DeltaRule, Latent, LatentOut, LatentUp, Moe, PoolRule, Router, Score,
-        Selector, Shared,
+        Act, DeltaKind, DeltaRule, KdaGate, Latent, LatentOut, LatentUp, Moe, PoolRule, Router,
+        Score, Selector, Shared,
     };
 
     /// GLM-5.3-Flash's 45 trunk layers as `glm5next_meta.rs`'s `VIEW` pins
@@ -164,7 +164,8 @@ mod tests {
                 } else {
                     Mixer::DeltaRule(DeltaRule {
                         kind: DeltaKind::Kda {
-                            gate_lower_bound: -5.0,
+                            gate: KdaGate::Sigmoid { lower_bound: -5.0 },
+                            beta_scale: 1.0,
                         },
                         k_heads: 64,
                         v_heads: 64,

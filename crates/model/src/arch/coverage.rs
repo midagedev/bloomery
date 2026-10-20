@@ -23,8 +23,8 @@ pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
 use gguf::GgmlType;
 use models::shape::{RouterBody, gqa_row, gqa_row_v, select_router};
 use models::{
-    Collapse, DeltaKind, Extra, GdnGate, HcMix, KHeadMap, LatentUp, ModelSpec, Need, RopeMode,
-    needs,
+    Collapse, DeltaKind, Extra, GdnGate, HcMix, KHeadMap, KdaGate, LatentUp, ModelSpec, Need,
+    RopeMode, needs,
 };
 
 use crate::placement::{CardFormat, ModelTensor, ModelTensors, Role, Unimplemented};
@@ -347,11 +347,14 @@ pub const AVAILABLE: &[Available] = &[
             matches!(
                 n,
                 Need::DeltaRule {
-                    kind: DeltaKind::Kda { .. },
+                    kind: DeltaKind::Kda {
+                        gate: KdaGate::Sigmoid { .. },
+                        beta_scale,
+                    },
                     d: 128,
                     conv: 4,
                     ..
-                }
+                } if *beta_scale == 1.0
             )
         },
     },

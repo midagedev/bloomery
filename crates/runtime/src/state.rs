@@ -162,7 +162,8 @@ mod tests {
     use super::*;
     use models::{
         Act, Candidates, Compress, Compressor, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap,
-        Latent, LatentOut, LatentUp, Moe, PoolRule, Residual, Rope, RopeMode, Router, Score,
+        KdaGate, Latent, LatentOut, LatentUp, Moe, PoolRule, Residual, Rope, RopeMode, Router,
+        Score,
     };
 
     fn moe() -> Ffn {
@@ -436,7 +437,8 @@ mod tests {
                     layer(
                         Mixer::DeltaRule(DeltaRule {
                             kind: DeltaKind::Kda {
-                                gate_lower_bound: -5.0,
+                                gate: KdaGate::Sigmoid { lower_bound: -5.0 },
+                                beta_scale: 1.0,
                             },
                             k_heads: 64,
                             v_heads: 64,

@@ -432,8 +432,19 @@ pub struct DeltaRule {
 pub enum DeltaKind {
     /// A scalar decay per value head, one conv over q|k|v, the output gated by z.
     Gdn { khead_map: KHeadMap, gate: GdnGate },
-    /// A per-channel decay bounded below, a conv per q, k and v, the output gated.
-    Kda { gate_lower_bound: f32 },
+    /// A per-channel decay, a conv per q, k and v, the output gated. `gate` is
+    /// how the decay is made, `beta_scale` the scale on `sigmoid(b_proj x)`.
+    Kda { gate: KdaGate, beta_scale: f32 },
+}
+
+/// How a KDA layer's decay gate is made.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KdaGate {
+    /// `g = lower_bound * sigmoid(exp(A_log) * (x + dt_bias))`, `lower_bound`
+    /// below 0 (GLM-5.3-Flash).
+    Sigmoid { lower_bound: f32 },
+    /// `g = -exp(A_log) * softplus(x + dt_bias)`, unbounded (Solar-Open2).
+    Softplus,
 }
 
 /// The activation of z that gates a GDN layer's normed output.

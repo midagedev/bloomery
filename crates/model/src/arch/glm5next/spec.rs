@@ -12,9 +12,9 @@
 
 use gguf::Split;
 use models::{
-    Act, Arch, Collapse, DeltaKind, DeltaRule, Ffn, HcKind, HcMix, HcSpec, Latent, LatentOut,
-    LatentUp, LayerSpec, Mixer, ModelSpec, Moe, PoolRule, ReasoningFormat, Residual, Router, Score,
-    Selector, Shared, ToolFormat,
+    Act, Arch, Collapse, DeltaKind, DeltaRule, Ffn, HcKind, HcMix, HcSpec, KdaGate, Latent,
+    LatentOut, LatentUp, LayerSpec, Mixer, ModelSpec, Moe, PoolRule, ReasoningFormat, Residual,
+    Router, Score, Selector, Shared, ToolFormat,
 };
 
 use super::hparams::{Hparams, Kind};
@@ -53,7 +53,10 @@ pub fn spec_of(
         let mixer = match hp.kinds[l] {
             Kind::Kda => Mixer::DeltaRule(DeltaRule {
                 kind: DeltaKind::Kda {
-                    gate_lower_bound: hp.gate_lower_bound,
+                    gate: KdaGate::Sigmoid {
+                        lower_bound: hp.gate_lower_bound,
+                    },
+                    beta_scale: 1.0,
                 },
                 k_heads: spec_u32("attention.head_count", hp.n_head)?,
                 v_heads: spec_u32("attention.head_count", hp.n_head)?,

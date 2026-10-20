@@ -1,40 +1,24 @@
 //! The role of every tensor in a glm5next file, by exact name: the three
 //! model-level names, then the per-layer stems — one table, by the group a
-//! layer's kind carries ([`KDA`] … [`NEXTN`]), which the header reader's
-//! tensor check reads too. Every tensor of a next-token layer is
-//! [`Role::Unused`]: carried, never loaded. A name the table does not hold
-//! fails the file with every such name listed.
+//! layer's kind carries (the KDA mixer's stems are the common
+//! [`kda`](crate::arch::kda) module's, the rest this family's), which the
+//! header reader's tensor check reads too. Every tensor of a next-token
+//! layer is [`Role::Unused`]: carried, never loaded. A name the table does
+//! not hold fails the file with every such name listed.
 
 use gguf::Split;
 
 use super::hparams::Hparams;
 use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role};
+use crate::arch::kda;
 use crate::arch::stems::{opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
 pub use crate::arch::stems::{Stem, required};
 
-/// A KDA delta-rule layer's mixer; `ssm_f_b` and `ssm_g_b` are required
-/// because without them ik takes another decay rule (`src/llama-kda.cpp`,
-/// `build_kda_beta_gate`).
-pub const KDA: &[Stem] = &[
-    req("attn_norm.weight", Role::Attention),
-    req("attn_q.weight", Role::Attention),
-    req("attn_k.weight", Role::Attention),
-    req("attn_v.weight", Role::Attention),
-    req("ssm_conv1d_q.weight", Role::Attention),
-    req("ssm_conv1d_k.weight", Role::Attention),
-    req("ssm_conv1d_v.weight", Role::Attention),
-    req("ssm_f_a.weight", Role::Attention),
-    req("ssm_f_b.weight", Role::Attention),
-    req("ssm_g_a.weight", Role::Attention),
-    req("ssm_g_b.weight", Role::Attention),
-    req("ssm_beta.weight", Role::Attention),
-    req("ssm_a", Role::Attention),
-    req("ssm_dt.bias", Role::Attention),
-    req("ssm_norm.weight", Role::Attention),
-    req("attn_output.weight", Role::Attention),
-];
+/// The KDA mixer's stems: the common [`kda`] module's table, which every
+/// family with a KDA layer reads.
+pub use kda::STEMS as KDA;
 
 /// A latent attention layer's mixer with its indexer, which is required
 /// because without it ik runs dense attention (`src/llama-load-tensors.cpp`,
