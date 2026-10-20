@@ -12,8 +12,9 @@
 //!                         [--image-max-tokens N] [--plan]
 //!
 //! `--plan` prints the lines the decisions before the load make (the `ctx`
-//! line, the `parallel` line) and exits 0 before the model is opened on a
-//! card.
+//! line, the `parallel` line) and the plan's own (the `plan` and `need`
+//! records, the `residency` records beside them) and exits 0 before the model
+//! is opened on a card.
 //!
 //! `--ctx` is also spelled `--ctx-size` and `-c`, as llama-server spells it
 //! (`serve::flag::CTX`); a number flag's value that is not a number is
@@ -224,6 +225,7 @@ use bloomery_gpu_gates::bind::{
     Vocab, arm_screen, bind_server, model_props, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
+use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
 use bloomery_gpu_gates::side_seat;
@@ -657,8 +659,23 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     drop(split);
     eprintln!("{ctx_line}");
     parallel_line(slots.get(), ctx, from, pass);
+    let plan_args = (
+        (reserve, tier_batch, seated, embedding),
+        (ctx, slots),
+        &cfg.place,
+    );
     if a.plan_only {
-        // The lines before the load are out; nothing was opened on a card.
+        // The plan's records and its need are out, as the load would print
+        // them; nothing was opened on a card.
+        print_plan(
+            &inputs,
+            a.place,
+            plan_args.0,
+            plan_args.1,
+            plan_args.2,
+            residency,
+            a.cache_ram,
+        )?;
         std::process::exit(0);
     }
     let trace = route_trace(
@@ -673,9 +690,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let (card, placement, cache, residency) = print_plan(
         &inputs,
         a.place,
-        (reserve, tier_batch, seated, embedding),
-        (ctx, slots),
-        &cfg.place,
+        plan_args.0,
+        plan_args.1,
+        plan_args.2,
         residency,
         a.cache_ram,
     )?;
@@ -838,7 +855,8 @@ fn route_trace(
 /// names, the plan's placement for `/props` (`None`, and a line saying why,
 /// when a card's nvidia-smi index cannot be found), the prompt cache's
 /// budget of the real host's room
-/// ([`CacheRam::of`]) and the residency word the load runs by. A plan the
+/// ([`CacheRam::of`]) and the residency word the load runs by. The `need`
+/// record follows the prompt cache's budget it states. A plan the
 /// vision reserve or the side model's `embedding` reserve does not fit is the
 /// plan's own refusal with the reserves named before its terms.
 fn print_plan(
@@ -896,6 +914,7 @@ fn print_plan(
         pool_bytes,
         checkpoints_reserved(plan.machine),
     )?;
+    need::print(&plan, pool_bytes, cache.ram, true)?;
     let placement = placement_of("bloomery-serve-ds41", &machine, &plan);
     let cards: Vec<&str> = machine.all_cards().map(|c| c.name.as_str()).collect();
     Ok((cards.join("+"), placement, cache, pick))

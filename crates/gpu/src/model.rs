@@ -55,6 +55,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::moe::HostLayer;
 use model::placement::churn::ChurnPool;
+use model::placement::need_hook;
 use model::placement::workstation::{self, ArenaGrant, HostNeed};
 use model::placement::{ArenaFloor, ExpertList, Plan};
 use model::r8file::R8Source;
@@ -1851,7 +1852,8 @@ where
 /// bytes) beside it and `known`'s runs known, neither read in nor locked nor
 /// counted ([`HostResidency::at_load_with`]). The pieces, and the host set.
 /// Every placed load passes
-/// here, so the two refusals before any upload are made once: a plan's card
+/// here, so the refusals before any upload are made once: the need hook's
+/// (`BLOOMERY_NEED_HOOK`, first, while the load holds no card), a plan's card
 /// that is not one visible device ([`Gpu::open_card`]), and a
 /// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
 fn placed_pre(
@@ -1875,6 +1877,9 @@ fn placed_pre(
         .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
     let layers = spec.layers.clone();
     let (extra, extra_bytes) = extra;
+    // The hook answers before a card is opened or a byte read in: a broker
+    // that refuses the load holds nothing of the process's.
+    need_hook::consult().map_err(|e| GpuError::plan(what, e))?;
     let t = Instant::now();
     let gpu = Gpu::open_card(&spec.name, spec.device)?;
     let context = t.elapsed();

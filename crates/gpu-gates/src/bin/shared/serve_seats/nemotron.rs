@@ -89,6 +89,7 @@ use bloomery_gpu_gates::bind::{
     parallel_line, placement_of, slots_of,
 };
 use bloomery_gpu_gates::generate::{Place, SEAT_STEPS, choose_ctx};
+use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::HostCfg;
@@ -375,6 +376,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let slot_ctx = usize::try_from(asked.slot_ctx)?;
     let plan = asked.plan;
     record::plan(place.name(), &machine, &plan).eprint();
+    need::print(&plan, 0, 0, true)?;
     parallel_line(slots, slot_ctx, from, Pass::One);
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.

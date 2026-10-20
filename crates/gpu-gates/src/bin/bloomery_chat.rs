@@ -92,6 +92,7 @@ mod drive {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model};
     use bloomery_gpu_gates::generate::{Generator, OpenArgs, Place, PlaceWhy};
+    use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_levers::{
@@ -455,6 +456,7 @@ mod drive {
         let machine = place.machine(None, tier_batch)?(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
         record::plan(place.name(), &machine, &plan).eprint();
+        need::print(&plan, 0, 0, true)?;
         Ok(())
     }
 

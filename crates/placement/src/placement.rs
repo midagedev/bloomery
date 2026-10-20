@@ -38,6 +38,7 @@ pub mod churn;
 pub mod ctx;
 pub mod ctx_ask;
 pub mod devices;
+pub mod need_hook;
 pub mod nodes;
 pub mod paged_drop;
 pub mod tp;
@@ -1083,6 +1084,28 @@ pub struct CardTotals {
 }
 
 impl CardTotals {
+    /// The bytes the plan puts on the card: every term it counts against the
+    /// card's usable bytes but the headroom, whose margin stays free. A sum
+    /// past u64 bytes reads `u64::MAX`, as [`workstation::HostNeed::bytes`]
+    /// does.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        let sum: u128 = [
+            self.dense_bytes,
+            self.expert_bytes,
+            self.rounding_bytes,
+            self.kv_bytes,
+            self.stage_rows_bytes,
+            self.scratch_bytes,
+            self.context_bytes,
+            self.reserve_bytes,
+        ]
+        .into_iter()
+        .map(u128::from)
+        .sum();
+        u64::try_from(sum).unwrap_or(u64::MAX)
+    }
+
     /// `bytes` more in the card's KV class, out of its headroom: the one way
     /// a model's plan adds a term to a card after the totals (the bytes its
     /// resident sequences hold beside their stores, reserved out of the
@@ -5638,6 +5661,187 @@ mod tests {
         let census_free = machine(None);
         let plan = plan_with(&model, &census_free, 4096, &NoKv, None).expect("plans");
         assert_eq!(plan.n_l.iter().sum::<u64>(), 24);
+    }
+
+    /// The host's need by page class: every addend of the need in the class
+    /// the one table gives it, the OS reserve out, so the classes sum to
+    /// [`workstation::HostNeed::bytes`] under each way of holding the set. The
+    /// lock moves the host set, the tables and the churn pool to the locked
+    /// class and leaves the row cache and the run-ahead window in the page
+    /// cache; a pinned arena moves from the anonymous class to the pinned one.
+    /// A reserve with no class, a need whose OS reserve is not the host's and
+    /// one whose reserves are under the host's own are refused by name.
+    #[test]
+    fn a_host_need_is_held_by_page_class() {
+        use workstation::{
+            CHECKPOINTS_RESERVE, HostNeed, Hosting, NeedClassError, NeedClasses, NeedTerm,
+            OS_RESERVE, POINT_ROWS_RESERVE, PageClass, TIER_BATCH_HOST_RESERVE,
+        };
+        let model = layered(3);
+        let machine_with = |reserves: Vec<(String, u64)>| Machine {
+            cards: vec![bytes_card("c", HEAD + 6 * EXPERT, 0..3)],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: Host {
+                    usable_bytes: 1 << 40,
+                    reserves,
+                },
+                unified: None,
+            }],
+        };
+        let machine = machine_with(vec![
+            (OS_RESERVE.to_string(), 100),
+            (TIER_BATCH_HOST_RESERVE.to_string(), 40),
+            (CHECKPOINTS_RESERVE.to_string(), 30),
+            (POINT_ROWS_RESERVE.to_string(), 20),
+        ]);
+        let mut plan = plan_with(&model, &machine, 4096, &NoKv, None).expect("plans");
+        assert!(plan.host.experts > 0, "the host holds experts");
+        // The NVMe split's arena and run-ahead window, the row cache, the
+        // tables and a unified pool's share, none of which the plan above has.
+        let (rows, window, arena, cards, tables, shadows, extra) = (8, 5, 7, 11, 13, 17, 6);
+        plan.host.row_reserve_bytes = rows;
+        plan.host.reserve_bytes += rows + window;
+        plan.host.nvme_arena_bytes = arena;
+        plan.host.pool_card_bytes = cards;
+        plan.host.table_bytes = tables;
+        plan.host.shadow_bytes = shadows;
+        let need = HostNeed::of(&plan, extra);
+        let experts = need.experts;
+        assert_eq!(need.reserves, 100 + 40 + 30 + 20 + rows + window);
+        let files = experts + tables + extra;
+        let cases = [
+            (
+                Hosting {
+                    lock: false,
+                    arena_pinned: false,
+                },
+                NeedClasses {
+                    pinned: shadows + 40 + 30 + 20,
+                    anon: arena,
+                    cache: files + rows + window,
+                    locked: 0,
+                    unified: cards,
+                },
+            ),
+            (
+                Hosting {
+                    lock: true,
+                    arena_pinned: false,
+                },
+                NeedClasses {
+                    pinned: shadows + 40 + 30 + 20,
+                    anon: arena,
+                    cache: rows + window,
+                    locked: files,
+                    unified: cards,
+                },
+            ),
+            (
+                Hosting {
+                    lock: false,
+                    arena_pinned: true,
+                },
+                NeedClasses {
+                    pinned: shadows + 40 + 30 + 20 + arena,
+                    anon: 0,
+                    cache: files + rows + window,
+                    locked: 0,
+                    unified: cards,
+                },
+            ),
+        ];
+        for (how, want) in cases {
+            let got = need.classes(&plan, how).expect("a need of this plan");
+            assert_eq!(got, want, "{how:?}");
+            assert_eq!(
+                got.bytes(),
+                need.bytes(),
+                "{how:?}: the classes sum to the need"
+            );
+        }
+        // The table: each term's class under both holdings.
+        let locked = Hosting {
+            lock: true,
+            arena_pinned: true,
+        };
+        let loose = Hosting {
+            lock: false,
+            arena_pinned: false,
+        };
+        let class = |t: NeedTerm| (t.class(loose), t.class(locked));
+        assert_eq!(
+            NeedTerm::ALL.map(class),
+            [
+                (PageClass::Cache, PageClass::Locked),
+                (PageClass::Cache, PageClass::Locked),
+                (PageClass::Pinned, PageClass::Pinned),
+                (PageClass::Pinned, PageClass::Pinned),
+                (PageClass::Pinned, PageClass::Pinned),
+                (PageClass::Pinned, PageClass::Pinned),
+                (PageClass::Cache, PageClass::Cache),
+                (PageClass::Cache, PageClass::Cache),
+                (PageClass::Cache, PageClass::Locked),
+                (PageClass::Anon, PageClass::Pinned),
+                (PageClass::Unified, PageClass::Unified),
+            ]
+        );
+        // A reserve nobody classed is refused by name, not counted nowhere.
+        let odd = machine_with(vec![
+            (OS_RESERVE.to_string(), 100),
+            ("a new reserve".to_string(), 3),
+        ]);
+        let odd_plan = plan_with(&model, &odd, 4096, &NoKv, None).expect("plans");
+        assert_eq!(
+            HostNeed::of(&odd_plan, 0).classes(&odd_plan, loose),
+            Err(NeedClassError::Reserve("a new reserve".to_string()))
+        );
+        // A need that is not the plan's.
+        let other_os = HostNeed { os: 1, ..need };
+        assert!(matches!(
+            other_os.classes(&plan, loose),
+            Err(NeedClassError::NotThePlans { .. })
+        ));
+        let thin = HostNeed {
+            reserves: 100 + 40 + 30 + 20 + rows - 1,
+            ..need
+        };
+        assert!(matches!(
+            thin.classes(&plan, loose),
+            Err(NeedClassError::NotThePlans { .. })
+        ));
+    }
+
+    /// A card's bytes are every term the plan counts on it but the headroom.
+    #[test]
+    fn a_cards_bytes_sum_its_terms() {
+        let model = layered(3);
+        let machine = Machine {
+            cards: vec![bytes_card("c", HEAD + 24 * EXPERT + 100_000, 0..3)],
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: host(),
+                unified: None,
+            }],
+        };
+        let plan = plan_with(&model, &machine, 4096, &NoKv, None).expect("plans");
+        let c = &plan.cards[0];
+        assert_eq!(
+            c.bytes(),
+            c.dense_bytes
+                + c.expert_bytes
+                + c.rounding_bytes
+                + c.kv_bytes
+                + c.stage_rows_bytes
+                + c.scratch_bytes
+                + c.context_bytes
+                + c.reserve_bytes
+        );
+        assert!(c.bytes() > 0);
+        let mut huge = c.clone();
+        huge.dense_bytes = u64::MAX;
+        huge.expert_bytes = 1;
+        assert_eq!(huge.bytes(), u64::MAX, "a sum past u64 reads u64::MAX");
     }
 
     /// A unified machine's pool holds the card and the host together: the

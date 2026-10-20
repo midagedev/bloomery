@@ -502,7 +502,10 @@ impl PlaceQ3 {
             Inputs::Qwen3(_) => Program::Qwen3moeBody,
             Inputs::Qwen35(_) => Program::Qwen35Body,
         };
-        Ok(std::iter::once(r).chain(record::host_only(plan.model, Some(routed_rule(program)))?))
+        let need = bloomery_gpu_gates::need::staged(plan, 0, 0)?;
+        Ok(std::iter::once(r)
+            .chain(std::iter::once(need))
+            .chain(record::host_only(plan.model, Some(routed_rule(program)))?))
     }
 }
 

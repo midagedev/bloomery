@@ -2,7 +2,8 @@
 place unset place=a why=set
 residency lever residency=mid-p3-s1 why=pool_shrunk
 plan place=a card=A6000 ctx_max=32768 card_experts=2668 (44750684160 B) host_experts=12692 (214016901120 B) host_shadow=1342177280 B n_l=70..71 on 38 layers card_budget=none paged=0 arena=0 arena_slots=0 room=263376371712 plan_room=263376371712 card_free=50668240896 devices=[stage:A6000:cuda0:50952404992] cuda_order=unset(FASTEST_FIRST)
-residency host residency=mid-p3-s1 hosted=hosted pinned=3 churn_experts=2554 churn_bytes=42838548480 headroom=43437910016 headroom_after=599361536
+residency host residency=mid-p3-s1 hosted=hosted pinned=3 churn_experts=2554 churn_bytes=42838548480 headroom=43437910016 headroom_after=599361536 host_figure=nominal-A6000-workstation host_usable=270071001088
+need bytes=262777010176 pinned=1342177280 anon=0 cache=261434832896 locked=0 unified=0 os=6694629376 cache_ram=0 lock=false cards=[A6000:49871347712] threads=32 cpus=[0,8,16,24,1,9,17,25,2,10,18,26,3,11,19,27,4,12,20,28,5,13,21,29,6,14,22,30,7,15,23] caller=31 allowed=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63]
 call plan first=0 end=512 batches=1 group=2 groups=1 t_max=512 chunk=8 sub_chunks=16 ring=128 layers=40 ced=on
 call groups g=1 sizes=[1]
 call groups g=2 sizes=[1]

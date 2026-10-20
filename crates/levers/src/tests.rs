@@ -42,12 +42,13 @@ fn retired() -> impl Iterator<Item = &'static LeverSpec> {
 /// Whether the pool reads it: it is on every binary's list.
 /// The rows read below every binary's `main` (the pool's two, the host's
 /// room, the NVMe tier's three, [`nvtier_levers`], the tier link,
-/// [`tier_link`], and the tiers' nodes, [`tier_nodes`]), which no `at_main`
-/// list refuses.
+/// [`tier_link`], the tiers' nodes, [`tier_nodes`], and the need hook,
+/// [`need_levers`]), which no `at_main` list refuses.
 fn pool(r: &LeverSpec) -> bool {
     r.name == THREADS
         || r.name == SPIN
         || r.name == HOST_ROOM
+        || r.name == NEED_HOOK
         || r.name == NVTIER_BYTES
         || r.name == NVTIER_READ
         || r.name == NVTIER_MEM
@@ -528,6 +529,7 @@ fn accessors_read_their_rows() {
             CHECK_FINITE,
             HOST_POPULATE,
             HOST_LOCK,
+            NEED_HOOK,
             CARD_DONTNEED,
             R8,
             RESIDENCY,
@@ -576,6 +578,47 @@ fn mtp_width_takes_cost_and_fixed() {
         panic!("a word the row does not take is refused");
     };
     assert!(other.to_string().contains("BLOOMERY_MTP_WIDTH"), "{other}");
+}
+
+/// The need hook and the lock the need record states, read below every
+/// binary's `main` ([`Scope::Need`]): unset is no hook and no lock, a regular
+/// file is the hook, a path with no regular file is refused by name, and the
+/// lock is the host-lock flag as its kind takes it. A binary's `main` takes
+/// the hook without naming it and refuses the lock it does not act on.
+#[test]
+fn the_need_hook_is_read_below_main() {
+    let unset = read(&env::<&str>(&[]), Scope::Need).expect("nothing is set");
+    assert_eq!(unset.entry(NEED_HOOK).value, None);
+    assert!(!unset.flag(HOST_LOCK));
+    let set = read(&env(&[(NEED_HOOK, A_FILE), (HOST_LOCK, "1")]), Scope::Need)
+        .expect("a regular file and a flag");
+    assert_eq!(
+        set.entry(NEED_HOOK).value,
+        Some(Value::Path(PathBuf::from(A_FILE)))
+    );
+    assert!(set.flag(HOST_LOCK));
+    for bad in ["/no/such/file", env!("CARGO_MANIFEST_DIR"), ""] {
+        let Err(e) = read(&env(&[(NEED_HOOK, bad)]), Scope::Need) else {
+            panic!("{bad:?} is no regular file");
+        };
+        assert!(e.to_string().contains(NEED_HOOK), "{e}");
+    }
+    let Err(e) = read(&env(&[(HOST_LOCK, "yes")]), Scope::Need) else {
+        panic!("a lock the flag does not take is refused");
+    };
+    assert!(e.to_string().contains(HOST_LOCK), "{e}");
+    // Only the two names are in this scope: a bad value of another is not read.
+    assert!(read(&env(&[(HOST_ROOM, "not bytes")]), Scope::Need).is_ok());
+    // A binary that acts on nothing still takes the hook, and refuses the lock.
+    let main = Scope::Main {
+        bin: "b",
+        acts_on: &[],
+    };
+    assert!(read(&env(&[(NEED_HOOK, A_FILE)]), main).is_ok());
+    let Err(e) = read(&env(&[(HOST_LOCK, "1")]), main) else {
+        panic!("a binary that leaves the lock out refuses it");
+    };
+    assert!(e.to_string().contains(HOST_LOCK), "{e}");
 }
 
 /// `BLOOMERY_HOST_ROOM` takes bytes (`M` and `G` binary units) where the

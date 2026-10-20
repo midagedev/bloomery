@@ -44,7 +44,9 @@ use bloomery_gpu::hybrid::HostResidency;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::prompt_timing::PromptStats;
 use bloomery_levers::ChurnHosting;
-use model::placement::workstation::{self, DeviceInfo, HostRead, plan_room, spec_of_device};
+use model::placement::workstation::{
+    self, DeviceInfo, HostRead, NeedClasses, plan_room, spec_of_device,
+};
 use model::placement::{Machine, Plan, arena_slots};
 
 use crate::GateError;
@@ -552,16 +554,27 @@ impl Record {
 
     /// The line on stdout.
     pub fn print(self) {
-        println!("{}", self.line());
+        self.emit(false);
     }
 
     /// The line on stderr, and to the [`tee`] when one is set.
     pub fn eprint(self) {
+        self.emit(true);
+    }
+
+    /// The line on stderr (`err`, and to the [`tee`] when one is set) or on
+    /// stdout, handed back for a caller that keeps what it printed.
+    pub fn emit(self, err: bool) -> String {
         let line = self.line();
-        eprintln!("{line}");
-        if let Some(tee) = TEE.get() {
-            tee(&line);
+        if err {
+            eprintln!("{line}");
+            if let Some(tee) = TEE.get() {
+                tee(&line);
+            }
+        } else {
+            println!("{line}");
         }
+        line
     }
 }
 
@@ -1230,6 +1243,29 @@ pub static HOST_ONLY: Kind = Kind {
         key("layer", U64, ""),
         key("tensor", Word, ""),
         key("why", Text, ""),
+    ],
+};
+
+/// What a placed load needs, as its plan states it.
+pub static NEED: Kind = Kind {
+    name: "need",
+    head: "need",
+    doc: "What the load about to start needs of this machine, printed with the plan: bytes, the host need the load checks against MemAvailable (the plan's host terms, the churn pool and the bytes held beside the plan, less the OS reserve), by page class (pinned: driver-pinned shadows, tier rows and a pinned arena; anon: an anonymous NVMe-tier arena; cache: file pages the kernel may reclaim; locked: file pages mlocked under BLOOMERY_HOST_LOCK, in place of the cache ones; unified: the cards' share of an integrated device's pool; they sum to bytes), os (the OS reserve left out of bytes), cache_ram (the serve's prompt cache budget in anonymous pages, beside bytes, 0 where there is none), lock (BLOOMERY_HOST_LOCK), cards (each plan card's name and the bytes the plan puts on it, stage cards then tiers), and the worker pool's placement: threads (participants, the calling thread among them), cpus (the cpu each of the threads - 1 workers is pinned to, empty for a pool whose pins failed), caller (the cpu the dispatcher's slot pins to under pin_caller, which only a binary that asks for it does) and allowed (every cpu the process may run on: the caller, the engine's threads and the helpers float over it). The line BLOOMERY_NEED_HOOK reads.",
+    parts: &[
+        key("bytes", U64, "B"),
+        key("pinned", U64, "B"),
+        key("anon", U64, "B"),
+        key("cache", U64, "B"),
+        key("locked", U64, "B"),
+        key("unified", U64, "B"),
+        key("os", U64, "B"),
+        key("cache_ram", U64, "B"),
+        key("lock", Bool, ""),
+        key("cards", Csv, "name:B"),
+        key("threads", U64, "participants"),
+        key("cpus", Csv, "cpu ids"),
+        key("caller", U64, "cpu id"),
+        key("allowed", Csv, "cpu ids"),
     ],
 };
 
@@ -3501,10 +3537,19 @@ pub mod groups {
 
     /// `bin/shared/qwen3moe_place.rs`.
     pub mod qwen3moe_place {
-        use crate::record::{HOST_ONLY, Kind, PLAN38};
+        use crate::record::{HOST_ONLY, Kind, NEED, PLAN38};
 
         /// The placed plan and its host-only causes: `PlaceQ3::records`.
-        pub const PLAN: &[&Kind] = &[&PLAN38, &HOST_ONLY];
+        pub const PLAN: &[&Kind] = &[&PLAN38, &NEED, &HOST_ONLY];
+    }
+
+    /// `need.rs`.
+    pub mod need {
+        use crate::record::{Kind, NEED};
+
+        /// The `need` record of a placed load: `print` and `staged` write it
+        /// beside the plan record.
+        pub const PRINT: &[&Kind] = &[&NEED];
     }
 
     /// `serve_client.rs`.
@@ -3530,6 +3575,7 @@ pub static GATE_GEMMA_EMBEDDING2_SERVE: &[&Kind] = kinds![
 pub static GENERATE_DS41: &[&Kind] = &[
     &PLACE_UNSET,
     &PLAN,
+    &NEED,
     &CALL_PLAN,
     &CALL_GROUPS,
     &CALL_BATCH,
@@ -3590,6 +3636,7 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
     &PLACE_UNSET,
     &PROMPT_IDS,
     &PLAN,
+    &NEED,
     &LANE,
     &LOAD_GENERATOR,
     &LOAD_PHASES,
@@ -3614,6 +3661,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = kinds![
     &[
         &PLACE_UNSET,
         &PLAN,
+        &NEED,
         &CACHE_CONFIG,
         &LANE,
         &LOAD_GENERATOR,
@@ -3652,7 +3700,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
     groups::side_seat::SEAT,
     groups::fetch::FETCH,
     groups::fetch::SET,
-    &[&PLAN38, &HOST_ONLY, &LISTENING38],
+    &[&PLAN38, &NEED, &HOST_ONLY, &LISTENING38],
     groups::bind::CACHE,
     groups::drafted::PROMPT,
     &[
@@ -3704,7 +3752,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
 /// than it shared.
 pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
     groups::side_seat::SEAT,
-    &[&RESIDENCY_LEVER, &PLACE_UNSET, &PLAN],
+    &[&RESIDENCY_LEVER, &PLACE_UNSET, &PLAN, &NEED],
     groups::residency38::HOST,
     groups::fetch::FETCH,
     groups::fetch::SET,
@@ -3718,7 +3766,7 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
 /// the address and each request's note of the prefix it kept less of than it
 /// shared (the Mamba-2 state keeps a prefix only at the position it stands).
 pub static BLOOMERY_SERVE_NEMOTRON: &[&Kind] = kinds![
-    &[&PLACE_UNSET, &PLAN],
+    &[&PLACE_UNSET, &PLAN, &NEED],
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LOAD_NEMOTRON, &LOAD_PHASES, &LISTENING_NEMOTRON],
@@ -3739,7 +3787,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = kinds![
     &[&RESIDENCY_LEVER, &DRAFT_UNSET_GLM, &DRAFT_YIELD],
     groups::fetch::FETCH,
     groups::fetch::SET,
-    &[&PLACE_UNSET, &PLAN, &RESIDENCY_UNSET_GLM],
+    &[&PLACE_UNSET, &PLAN, &NEED, &RESIDENCY_UNSET_GLM],
     groups::residency38::HOST,
     &[
         &LANE,
@@ -3781,6 +3829,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &PLACE_UNSET,
     &TP_RANK,
     &PLAN,
+    &NEED,
     &RESIDENCY_HOST,
     &LANE,
     &LOAD_GENERATOR,
@@ -3834,6 +3883,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 /// lines; the binary's other lines are its own.
 pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &PLAN38,
+    &NEED,
     &HOST_ONLY,
     &LANE,
     &LOAD_NEMOTRON,
@@ -4077,6 +4127,63 @@ pub fn plan_devices(machine: &Machine) -> Vec<String> {
             format!("{}:{}:{at}:{}", role(i), c.name, c.usable_bytes)
         })
         .collect()
+}
+
+/// A placed load's need as the `need` record states it: the numbers
+/// ([`crate::need`] gathers them from a plan, the levers and the pool).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Need {
+    /// The host need ([`workstation::HostNeed::bytes`]) and its page classes.
+    pub bytes: u64,
+    pub classes: NeedClasses,
+    /// The OS reserve the need leaves out.
+    pub os: u64,
+    /// The serve's prompt cache budget, beside `bytes`.
+    pub cache_ram: u64,
+    /// `BLOOMERY_HOST_LOCK`.
+    pub lock: bool,
+    /// Each plan card's name and the bytes the plan puts on it.
+    pub cards: Vec<(String, u64)>,
+    /// The worker pool's placement.
+    pub pool: PoolPlace,
+}
+
+/// Where the worker pool places its threads, as the `need` record states it
+/// (`threads::PoolPlan`, whose crate this one links only with the card).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolPlace {
+    /// The participants, the calling thread among them.
+    pub threads: usize,
+    /// The cpu each of the `threads - 1` workers is pinned to.
+    pub cpus: Vec<u32>,
+    /// The cpu of the dispatcher's slot.
+    pub caller: u32,
+    /// Every cpu the process may run on.
+    pub allowed: Vec<u32>,
+}
+
+/// The `need` record of `n`.
+pub fn need(n: &Need) -> Record {
+    Record::new(&NEED)
+        .u("bytes", n.bytes)
+        .u("pinned", n.classes.pinned)
+        .u("anon", n.classes.anon)
+        .u("cache", n.classes.cache)
+        .u("locked", n.classes.locked)
+        .u("unified", n.classes.unified)
+        .u("os", n.os)
+        .u("cache_ram", n.cache_ram)
+        .w("lock", n.lock)
+        .csv(
+            "cards",
+            n.cards
+                .iter()
+                .map(|(name, bytes)| format!("{name}:{bytes}")),
+        )
+        .u("threads", n.pool.threads)
+        .csv("cpus", &n.pool.cpus)
+        .u("caller", n.pool.caller)
+        .csv("allowed", &n.pool.allowed)
 }
 
 /// The most a census device's free reading may be, inclusive: its usable
@@ -5935,6 +6042,33 @@ mod tests {
                 assert_eq!(fields.u64("host_usable"), Ok(machine.host().usable_bytes));
                 assert_eq!(fields.i64("headroom"), Ok(i64::try_from(before).unwrap()));
             }
+        }
+    }
+
+    /// A binary that prints a plan record prints the need record beside it:
+    /// its list registers both, so a plan site added to a binary that left the
+    /// need out is caught here and not by a record the binary refuses to print.
+    #[test]
+    fn a_binary_that_prints_a_plan_prints_its_need() {
+        let lists: [(&str, &[&Kind]); 10] = [
+            ("generate_ds41", GENERATE_DS41),
+            ("bloomery-chat", BLOOMERY_CHAT),
+            ("bloomery-serve-ds41", BLOOMERY_SERVE_DS41),
+            ("bloomery-serve-qwen38", BLOOMERY_SERVE_QWEN38),
+            ("bloomery-serve qwen3", BLOOMERY_SERVE_QWEN3),
+            ("bloomery-serve mimo2", BLOOMERY_SERVE_MIMO2),
+            ("bloomery-serve nemotron", BLOOMERY_SERVE_NEMOTRON),
+            ("bloomery-serve glm", BLOOMERY_SERVE_GLM),
+            ("generate_glm5next", GENERATE_GLM5NEXT),
+            ("generate_qwen3moe", GENERATE_QWEN3MOE),
+        ];
+        for (bin, kinds) in lists {
+            let holds = |kind: &Kind| kinds.iter().any(|k| std::ptr::eq(*k, kind));
+            assert!(
+                holds(&PLAN) || holds(&PLAN38),
+                "{bin} prints no plan record"
+            );
+            assert!(holds(&NEED), "{bin} prints a plan and not its need");
         }
     }
 

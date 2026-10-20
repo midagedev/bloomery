@@ -345,6 +345,7 @@ mod drive {
         dump_table, lane_at, mode_name, place_table, read_table, repeat_runs, seed_path,
         slot_table, write_table,
     };
+    use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency};
     use bloomery_levers::{
@@ -1857,9 +1858,12 @@ mod drive {
                 )));
             }
             let residency = self.cfg.body.residency;
+            let mut pool_bytes = 0;
             if let Some(pool) = swap::churn(plan, 0, residency)? {
                 record::residency_host(self.residency.word, &pool, plan).print();
+                pool_bytes = pool.bytes;
             }
+            need::print(plan, pool_bytes, 0, false).map_err(SessionError::Caller)?;
             // The caches hold the plan's ctx_max positions, the value the
             // model is loaded with; --ctx only asks for it.
             let ctx_max = usize::try_from(plan.ctx_max).map_err(|_| {

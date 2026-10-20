@@ -230,8 +230,11 @@ mod cli {
         with_cards, write_table,
     };
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
+    use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record::{self, Record};
-    use bloomery_gpu_gates::residency38::{GLM_CARD, glm_machine, residency_room, residency_set};
+    use bloomery_gpu_gates::residency38::{
+        GLM_CARD, churn_bytes, glm_machine, residency_room, residency_set,
+    };
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, checkpoint_price, prompt_bytes};
     use bloomery_levers::{
@@ -364,6 +367,14 @@ mod cli {
                 )
                 .map_err(SessionError::Caller)?;
             }
+            let pool = match self.residency {
+                Some((r, _)) => {
+                    churn_bytes(plan, GLM_CARD, (r, bloomery_levers::ChurnHosting::Hosted))
+                        .map_err(SessionError::Caller)?
+                }
+                None => 0,
+            };
+            need::print(plan, self.beside + pool, 0, false).map_err(SessionError::Caller)?;
             Ok(!self.stop_at_plan)
         }
 

@@ -305,6 +305,32 @@ fix. EmbeddingGemma 2's embeddings route takes the same parts and still takes de
 servers `bloomery-serve-ds41` and `bloomery-serve-qwen38` ([`BUILD.md`](BUILD.md)). Every seat and flag is its
 binary's `--help`.
 
+## Starting under a broker
+
+A placed load prints a `need` record beside its `plan` record (a generator on stdout, a server and `bloomery-chat` on
+stderr; a seat with a `--plan` flag prints both before it exits). It states what the load asks of the machine:
+
+    need bytes=… pinned=… anon=… cache=… locked=… unified=… os=… cache_ram=… lock=false cards=[A6000:…] threads=… cpus=[…] caller=… allowed=[…]
+
+- `bytes` is the host need the load checks against `MemAvailable` (the plan's host terms, the churn pool and what the
+  load keeps beside them, less the OS reserve `os`). `pinned`, `anon`, `cache`, `locked` and `unified` split it by what
+  can take a page back and sum to it: driver-pinned memory (ring shadows, the tier's rows, a pinned arena), anonymous
+  pages (the NVMe tier's arena), file pages the kernel may reclaim, file pages `mlock`ed under `BLOOMERY_HOST_LOCK`
+  (in place of the reclaimable ones), and an integrated device's share of its pool. `cache_ram` is the prompt cache of a
+  server, beside `bytes`.
+- `cards` is the bytes the plan puts on each card. `threads` counts the worker pool's participants, `cpus` the cpu each
+  worker is pinned to, `caller` the cpu `BLOOMERY_PIN_MAIN` pins the dispatching thread to, and `allowed` every cpu the
+  process may run on. The pool places its threads inside that mask (`sched_getaffinity`: `taskset`, a container's cpuset,
+  a unit's `AllowedCPUs`) and says so in one line when the mask cuts the machine's cpus. The caller and the helper
+  threads the engine spawns are not pinned by the pool: they float over `allowed`.
+
+`BLOOMERY_NEED_HOOK=<executable>` calls a program once per placed load, after the plan and before a card is opened or a
+byte read in, with that line on its standard input. Exit 0 goes on. Exit 75 ends the process with 75, naming the hook's
+last line of output (the process holds no card, so a broker can queue the start and ask again). Any other status, or a
+hook that cannot start, ends the load with a named error. A hook may wait as long as it likes; unset, nothing runs. A
+logger is a hook: `cat >> need.log` as a script. A load that opens a whole model on one card with no plan states no need
+and consults no hook.
+
 ## Limits
 
 - **sm_86+** GPUs and NVIDIA driver R580+ (CUDA 13); the prebuilt archive carries sm_86 PTX, compiled for the card

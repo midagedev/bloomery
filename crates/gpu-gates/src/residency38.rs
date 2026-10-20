@@ -65,8 +65,9 @@ impl Seqs {
 }
 
 /// The host reserve row ([`Machine::host`]'s `reserves`) that carries a
-/// load's checkpoints ([`reserve_checkpoints`]).
-pub const CHECKPOINTS_RESERVE: &str = "checkpoints";
+/// load's checkpoints ([`reserve_checkpoints`]); the need's page class for it
+/// is beside the name.
+pub use model::placement::workstation::CHECKPOINTS_RESERVE;
 
 /// The host bytes `seqs` pin at most when each sequence's load is of
 /// `slot_ctx` positions: `slots` sequences of the price's budget at that
@@ -339,6 +340,23 @@ pub fn residency_set(
         word, hosting, &pool, plan, beside,
     ));
     Ok(residency)
+}
+
+/// The bytes of the churn pool `residency` adds to the host set of a load of
+/// `plan` on card `card` (the `extra` of its host need, `HostNeed::extra`): 0
+/// for `off` and for a pool the load only knows (`hosting`), which takes no
+/// host bytes.
+pub fn churn_bytes(
+    plan: &Plan<'_>,
+    card: usize,
+    (residency, hosting): (Residency, ChurnHosting),
+) -> Result<u64, GateError> {
+    let (Residency::Mid { pinned, .. }, ChurnHosting::Hosted) = (residency, hosting) else {
+        return Ok(0);
+    };
+    Ok(ChurnPool::of(plan, card, pinned)
+        .map_err(|e| format!("the churn pool: {e}"))?
+        .bytes)
 }
 
 /// `word`'s pinned experts, its spares and one that moves fit every layer's

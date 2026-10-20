@@ -16,12 +16,21 @@
 //! Threading shape: with `threads()` = T there are T-1 resident workers,
 //! pinned across CCDs, and the calling thread runs the last chunk itself —
 //! one fewer wake per call, same as the bench binary's "main is the last
-//! participant". The pool never pins the caller on its own: it is process-wide
-//! and must not hijack an arbitrary caller's affinity (`pin_caller` opts in). `BLOOMERY_THREADS=1`
-//! spawns nothing at all and the caller runs the whole range inline, so the
-//! single-threaded path pays no barrier cost.
+//! participant". The cpus are those the process may run on: the sysfs
+//! topology is cut to the calling thread's `sched_getaffinity` mask when the
+//! pool is built, a mask that cuts it is said in a line, and [`plan_pool`] /
+//! [`report`] state the placement (threads, pinned cpus, the mask) before any
+//! thread exists, for the plan that prints it. The pool never pins the caller
+//! on its own: it is process-wide and must not hijack an arbitrary caller's
+//! affinity (`pin_caller` opts in). `BLOOMERY_THREADS=1` spawns nothing at all
+//! and the caller runs the whole range inline, so the single-threaded path
+//! pays no barrier cost.
 
 pub mod helper;
+mod topology;
+
+pub use topology::{Cut, PoolPlan};
+use topology::{Shape, ccd_slot, detect_topology};
 
 use std::any::Any;
 use std::cell::UnsafeCell;
@@ -91,12 +100,9 @@ pub fn pool() -> &'static Pool {
 pub struct Pool {
     nthreads: usize,
     spin: u64,
-    /// One Vec per CCD (shared L3), logical cpu ids, primaries before
-    /// siblings — as detected, see `detect_topology`.
-    topo: Vec<Vec<u32>>,
-    /// Each CCD's L3 in bytes, parallel to `topo`; 0 where sysfs does not
-    /// say.
-    l3: Vec<u64>,
+    /// Where the threads can sit: the topology as detected, cut to the
+    /// process's cpu mask — see [`Shape::of`].
+    shape: Shape,
     pin_failed: AtomicBool,
     /// Whether [`Pool::pin_caller`] pinned its thread.
     caller_pinned: AtomicBool,
@@ -222,7 +228,20 @@ impl Pool {
     /// Topology as detected: one Vec per CCD, logical cpu ids, primaries
     /// before siblings.
     pub fn topology(&self) -> &[Vec<u32>] {
-        &self.topo
+        &self.shape.topo
+    }
+
+    /// Where the pool's threads sit ([`PoolPlan`]): what a plan prints
+    /// before the pool is built ([`plan_pool`]), from the pool itself. A pool
+    /// whose pins failed lists no pinned worker: it floats over the process's
+    /// cpus.
+    #[must_use]
+    pub fn plan(&self) -> PoolPlan {
+        let mut plan = self.shape.plan();
+        if self.pin_failed() {
+            plan.workers.clear();
+        }
+        plan
     }
 
     /// True if `sched_setaffinity` failed for at least one worker (containers
@@ -250,7 +269,7 @@ impl Pool {
     /// owns its main thread calls it once. Unpinned, the dispatcher floats onto
     /// an SMT sibling of a spinning worker and every barrier waits for it.
     pub fn pin_caller(&self) -> bool {
-        let pinned = pin(self.cpu_for(self.nthreads - 1));
+        let pinned = pin(self.cpu_for(self.nthreads - 1)).is_ok();
         if pinned {
             self.caller_pinned.store(true, Ordering::Relaxed);
         }
@@ -274,8 +293,8 @@ impl Pool {
         if self.pin_failed() || !self.caller_pinned() {
             return None;
         }
-        let map = CcdMap::new(self.nthreads, self.topo.len(), 0);
-        let l3_bytes = self.l3.iter().take(map.active()).sum();
+        let map = CcdMap::new(self.nthreads, self.shape.topo.len(), 0);
+        let l3_bytes = self.shape.l3.iter().take(map.active()).sum();
         Some(CcdMap { l3_bytes, ..map })
     }
 
@@ -398,34 +417,27 @@ impl Pool {
     }
 
     fn build() -> Pool {
-        let groups = detect_topology();
-        let mut topo = Vec::with_capacity(groups.len());
-        let mut l3 = Vec::with_capacity(groups.len());
-        let mut physical = 0;
-        for g in &groups {
-            physical += g.primaries.len();
-            let mut full = g.primaries.clone();
-            full.extend_from_slice(&g.siblings);
-            topo.push(full);
-            l3.push(g.l3_bytes);
-        }
         // The pool is process-wide, so it reads its own two levers
         // (`bloomery_levers::pool_levers`: a binary that parses at `main`
         // refused a bad value there first). BLOOMERY_THREADS overrides the
-        // count, unset is the physical core count; a value the lever does not
-        // take — zero, a word — or a retired lever that is set panics by name.
-        // SMT siblings are a deliberate opt-in, not the default: this tier is
-        // bandwidth-bound. BLOOMERY_SPIN is the spin before a waiting thread
-        // parks.
+        // count, unset is the physical core count the process's cpu mask
+        // leaves; a value the lever does not take — zero, a word — or a
+        // retired lever that is set panics by name. SMT siblings are a
+        // deliberate opt-in, not the default: this tier is bandwidth-bound.
+        // BLOOMERY_SPIN is the spin before a waiting thread parks.
         let levers =
             bloomery_levers::pool_levers().unwrap_or_else(|e| panic!("the worker pool: {e}"));
-        let nthreads = levers.threads.unwrap_or(physical);
-        let spin = levers.spin;
+        let shape = shape_now(levers.threads)
+            .unwrap_or_else(|e| panic!("the worker pool: sched_getaffinity: {e}"));
+        // What the process is cut from is said once, where the cut is made.
+        for line in shape.lines() {
+            eprintln!("{line}");
+        }
+        let nthreads = shape.threads;
         Pool {
-            nthreads: nthreads.max(1),
-            spin,
-            topo,
-            l3,
+            nthreads,
+            spin: levers.spin,
+            shape,
             pin_failed: AtomicBool::new(false),
             caller_pinned: AtomicBool::new(false),
             dispatch: Mutex::new(()),
@@ -471,12 +483,26 @@ impl Pool {
     }
 
     /// Worker `t` is spread across CCDs ([`ccd_slot`]): slot `t / nccd` of
-    /// its CCD's cpu list (physical cores first). Beyond the detected cpu
+    /// its CCD's cpu list (physical cores first). Beyond the allowed cpu
     /// count the last slot is shared rather than panicking.
     fn cpu_for(&self, t: usize) -> u32 {
-        let (ccd, slot) = ccd_slot(t, self.topo.len());
-        let g = &self.topo[ccd];
-        g[slot.min(g.len() - 1)]
+        self.shape.cpu_for(t)
+    }
+
+    /// Record that worker `t` could not pin to `cpu`, and the line that says
+    /// so for the first failure of the pool (`None` for the later ones). The
+    /// mask was cut to before any pin, so a refusal is the kernel's (a seccomp
+    /// filter, a cpu gone offline), not a cpuset the topology missed. The pool
+    /// can still run, floating, with the same results, so this is a line and
+    /// the pool goes on: [`Pool::pin_failed`] and a plan's empty worker list
+    /// ([`Pool::plan`]) carry it to whoever reads the placement.
+    fn note_pin_failure(&self, t: usize, cpu: u32, e: &std::io::Error) -> Option<String> {
+        (!self.pin_failed.swap(true, Ordering::Relaxed)).then(|| {
+            format!(
+                "bloomery-threads: worker {t} could not pin to cpu {cpu}: {e}; the pool \
+                 floats over the process's cpus"
+            )
+        })
     }
 
     /// Every worker's mark equals `cur`: `remaining == 0`.
@@ -485,9 +511,11 @@ impl Pool {
     }
 
     fn worker_main(&'static self, t: usize) {
-        if !pin(self.cpu_for(t)) {
-            // Not fatal: containers cannot pin. Recorded, pool continues.
-            self.pin_failed.store(true, Ordering::Relaxed);
+        let cpu = self.cpu_for(t);
+        if let Err(e) = pin(cpu)
+            && let Some(line) = self.note_pin_failure(t, cpu, &e)
+        {
+            eprintln!("{line}");
         }
         let mut seen = self.seq.load(Ordering::Acquire);
         // Publish readiness only after the snapshot above, so the ordering
@@ -559,13 +587,6 @@ impl Pool {
 /// One worker's completion mark on its own cache line.
 #[repr(align(64))]
 struct DoneMark(AtomicUsize);
-
-/// Participant `t`'s place when the pool spreads over `nccd` CCDs: its CCD
-/// `t % nccd` and its slot `t / nccd` in that CCD's cpu list. The one owner of
-/// the rule: the pool pins by it ([`Pool`]) and [`CcdMap`] answers by it.
-const fn ccd_slot(t: usize, nccd: usize) -> (usize, usize) {
-    (t % nccd, t / nccd)
-}
 
 /// How the pool's participants sit on the CCDs, for the work that places
 /// itself by CCD — a row dispatch visiting a matrix CCD-major, a warm routine
@@ -721,193 +742,200 @@ pub fn chunk_bounds(n: usize, threads: usize, t: usize) -> (usize, usize) {
     (start, start + len)
 }
 
-// ---------------------------------------------------------------- topology
+// --------------------------------------------------------------------- mask
 
-fn parse_cpu_list(s: &str) -> Vec<u32> {
-    let mut out = Vec::new();
-    for part in s.trim().split(',') {
-        if let Some((a, b)) = part.split_once('-') {
-            for c in a.trim().parse::<u32>().unwrap()..=b.trim().parse::<u32>().unwrap() {
-                out.push(c);
-            }
-        } else {
-            out.push(part.trim().parse().unwrap());
+/// The cpus the calling thread may run on (`sched_getaffinity`), ascending.
+/// The buffer grows until the kernel's mask fits, so a machine of more than
+/// 1024 cpus reads whole.
+fn mask_cpus() -> std::io::Result<Vec<u32>> {
+    let mut words = 16usize;
+    loop {
+        let mut set = vec![0u64; words];
+        let bytes = words * std::mem::size_of::<u64>();
+        // SAFETY: `set` is `bytes` writable bytes, and `sched_getaffinity`
+        // writes at most that many.
+        let rc = unsafe { libc::sched_getaffinity(0, bytes, set.as_mut_ptr().cast()) };
+        if rc == 0 {
+            return Ok(set
+                .iter()
+                .enumerate()
+                .flat_map(|(w, &bits)| {
+                    (0..64u32)
+                        .filter(move |b| bits >> b & 1 == 1)
+                        .map(move |b| w as u32 * 64 + b)
+                })
+                .collect());
         }
-    }
-    out
-}
-
-fn read_sys(path: &str) -> Option<String> {
-    std::fs::read_to_string(path).ok()
-}
-
-/// One shared L3 as the topology reads it.
-struct CcdGroup {
-    primaries: Vec<u32>,
-    siblings: Vec<u32>,
-    /// The L3's size in bytes; 0 where sysfs does not say.
-    l3_bytes: u64,
-}
-
-/// `cache/index3/size` as bytes: `32768K`, `32M`, `1G` or a bare count;
-/// `None` for anything else.
-fn parse_cache_size(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let (digits, unit) = match s.char_indices().last()? {
-        (i, 'K' | 'k') => (&s[..i], 1u64 << 10),
-        (i, 'M' | 'm') => (&s[..i], 1 << 20),
-        (i, 'G' | 'g') => (&s[..i], 1 << 30),
-        (_, c) if c.is_ascii_digit() => (s, 1),
-        _ => return None,
-    };
-    digits.parse::<u64>().ok()?.checked_mul(unit)
-}
-
-/// The L3 size `read` found at `path`, a `cache/index3/size`: 0 where there is
-/// no such file (the topology does not say — a container, a VM). A file that is
-/// there and holds no size, or cannot be read, panics by name: a cap taken from
-/// it must not be a 0 that looks like an absent L3.
-fn l3_size(path: &str, read: std::io::Result<String>) -> u64 {
-    match read {
-        Ok(text) => parse_cache_size(&text).unwrap_or_else(|| {
-            panic!("{path} holds {text:?}, not a cache size (K, M, G or a byte count)")
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => panic!("{path}: {e}"),
-    }
-}
-
-/// Detect the L3 (CCD) topology: one group per shared L3 — its primaries,
-/// siblings and size — sorted by primary core id. The primary hyperthread of
-/// each core is its lowest sibling id. Ported from
-/// `crates/q3k-cpu/src/main.rs:324` (`ccd_topology`), restructured so the
-/// physical-core count is recoverable — the bench binary's return shape
-/// (primaries then siblings, flat) cannot say where the split is.
-fn detect_topology() -> Vec<CcdGroup> {
-    let mut groups: Vec<(String, Vec<u32>)> = Vec::new(); // (l3 key, primaries)
-    let mut cpu = 0u32;
-    while let Some(sib) = read_sys(&format!(
-        "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
-    )) {
-        let siblings = parse_cpu_list(&sib);
-        let primary = *siblings.iter().min().unwrap();
-        if primary == cpu {
-            let l3 = read_sys(&format!(
-                "/sys/devices/system/cpu/cpu{cpu}/cache/index3/shared_cpu_list"
-            ))
-            .unwrap_or_default();
-            match groups.iter_mut().find(|(k, _)| *k == l3) {
-                Some((_, v)) => v.push(cpu),
-                None => groups.push((l3, vec![cpu])),
-            }
+        let e = std::io::Error::last_os_error();
+        // EINVAL: the mask is wider than the buffer.
+        if e.raw_os_error() != Some(libc::EINVAL) || words >= 1 << 14 {
+            return Err(e);
         }
-        cpu += 1;
+        words *= 2;
     }
-    if groups.is_empty() {
-        // No sysfs topology (container?): one group of everything found, so
-        // the pool still has a nonzero default thread count.
-        let cpus: Vec<u32> = if cpu == 0 {
-            vec![0]
-        } else {
-            (0..cpu).collect()
-        };
-        return vec![CcdGroup {
-            primaries: cpus,
-            siblings: Vec::new(),
-            l3_bytes: 0,
-        }];
+}
+
+/// The pool's shape from this machine: its sysfs topology cut to the calling
+/// thread's cpu mask, with `threads` participants or one a core.
+fn shape_now(threads: Option<usize>) -> std::io::Result<Shape> {
+    Ok(Shape::of(detect_topology(), &mask_cpus()?, threads))
+}
+
+/// Where the pool's threads would sit if it were built now — the sysfs
+/// topology cut to the calling thread's cpu mask, the thread count the pool
+/// levers give — read without spawning a thread: what a plan prints
+/// ([`report`]) before a load builds the pool.
+pub fn plan_pool() -> Result<PoolPlan, String> {
+    let levers = bloomery_levers::pool_levers().map_err(|e| e.to_string())?;
+    shape_now(levers.threads)
+        .map(|s| s.plan())
+        .map_err(|e| format!("sched_getaffinity: {e}"))
+}
+
+/// The pool's placement now: the built pool's own ([`Pool::plan`]), else
+/// what building it would give ([`plan_pool`]).
+pub fn report() -> Result<PoolPlan, String> {
+    match built() {
+        Some(p) => Ok(p.plan()),
+        None => plan_pool(),
     }
-    groups.sort_by_key(|(_, v)| v[0]);
-    groups
-        .into_iter()
-        .map(|(_, primaries)| {
-            let path = format!(
-                "/sys/devices/system/cpu/cpu{}/cache/index3/size",
-                primaries[0]
-            );
-            let l3_bytes = l3_size(&path, std::fs::read_to_string(&path));
-            let mut siblings = Vec::new();
-            for &p in &primaries {
-                let sib = parse_cpu_list(
-                    &read_sys(&format!(
-                        "/sys/devices/system/cpu/cpu{p}/topology/thread_siblings_list"
-                    ))
-                    .unwrap_or_default(),
-                );
-                for s in sib {
-                    if s != p {
-                        siblings.push(s);
-                    }
-                }
-            }
-            CcdGroup {
-                primaries,
-                siblings,
-                l3_bytes,
-            }
-        })
-        .collect()
 }
 
 // --------------------------------------------------------------------- pin
 
-/// Pin the calling thread to one logical cpu. Returns false instead of
-/// panicking — containers and cgroup-restricted processes legitimately
-/// cannot pin, and the pool must keep running unpinned.
-fn pin(cpu: u32) -> bool {
-    // SAFETY: `set` is a zeroed cpu_set_t bitmask only written through
-    // CPU_SET, and sched_setaffinity reads it with the matching size.
-    unsafe {
+/// Pin the calling thread to one logical cpu. Returns the kernel's refusal
+/// instead of panicking — a seccomp filter or a cpu outside the process's mask
+/// cannot be pinned, and the pool must keep running, floating.
+fn pin(cpu: u32) -> std::io::Result<()> {
+    let named = 8 * std::mem::size_of::<libc::cpu_set_t>();
+    if cpu as usize >= named {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cpu {cpu} is past the {named} a cpu_set_t names"),
+        ));
+    }
+    // SAFETY: `set` is a zeroed cpu_set_t only written through CPU_SET with
+    // an index inside it, and sched_setaffinity reads it with the matching
+    // size.
+    let rc = unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(cpu as usize, &mut set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Pool, l3_size, parse_cache_size};
+    use super::Pool;
     use std::sync::atomic::Ordering;
 
-    /// `cache/index3/size` reads K, M and G suffixes and a bare count, and
-    /// refuses a unit or digits it does not know.
-    #[test]
-    fn cache_sizes_parse() {
-        assert_eq!(parse_cache_size("32768K\n"), Some(32 << 20));
-        assert_eq!(parse_cache_size("32M"), Some(32 << 20));
-        assert_eq!(parse_cache_size("1G"), Some(1 << 30));
-        assert_eq!(parse_cache_size("4096"), Some(4096));
-        for bad in ["", "K", "12T", "x32M", "-1K", "1.5M"] {
-            assert_eq!(parse_cache_size(bad), None, "{bad:?}");
-        }
-        assert_eq!(parse_cache_size("18446744073709551615K"), None);
+    /// Run `f` on a thread pinned to `cpus`, so the kernel's mask for it is
+    /// theirs: a test of the real `sched_getaffinity` read.
+    fn on_cpus<T: Send + 'static>(cpus: Vec<u32>, f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(move || {
+            // SAFETY: `set` is a zeroed cpu_set_t only written through
+            // CPU_SET, and sched_setaffinity reads it with the matching size.
+            let rc = unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                for &c in &cpus {
+                    libc::CPU_SET(c as usize, &mut set);
+                }
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+            };
+            assert_eq!(rc, 0, "the test thread pins to {cpus:?}");
+            f()
+        })
+        .join()
+        .expect("the test thread ends")
     }
 
-    /// An L3 size reads as written, is 0 only where the file is absent, and
-    /// a file that is there and holds no size or cannot be read is refused by
-    /// name.
+    /// The pool reads the calling thread's mask and cuts its topology by
+    /// it: on a thread of one cpu it plans a one-participant pool of that cpu
+    /// and says the mask cut the topology (when the process had more), on a
+    /// thread of two the pool takes two cores or one with its sibling, and a
+    /// thread count the lever gave stands over it. The unpinned process sees
+    /// the whole mask, the topology whole and no cut.
     #[test]
-    fn an_l3_size_is_absent_or_read_or_refused() {
-        let no_file = || Err(std::io::ErrorKind::NotFound.into());
-        assert_eq!(l3_size("p", Ok("32768K\n".into())), 32 << 20);
-        assert_eq!(l3_size("p", no_file()), 0);
-        for (read, named) in [
-            (Ok("lots\n".to_string()), "\"lots\\n\""),
-            (Ok(String::new()), "\"\""),
-            (Err(std::io::ErrorKind::PermissionDenied.into()), "denied"),
-        ] {
-            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                l3_size("sys/index3/size", read)
-            }));
-            let msg = caught
-                .expect_err("a size that is not one is refused")
-                .downcast::<String>()
-                .expect("a formatted panic");
+    fn the_pool_plans_inside_the_threads_mask() {
+        let whole = super::mask_cpus().expect("the mask reads");
+        assert!(!whole.is_empty());
+        let levers = bloomery_levers::pool_levers().expect("the pool levers");
+        let plan = super::plan_pool().expect("a plan");
+        assert_eq!(plan.allowed, whole);
+        let first = whole[0];
+        let one = on_cpus(vec![first], || super::plan_pool().expect("a plan"));
+        assert_eq!(one.allowed, vec![first]);
+        assert_eq!(
+            one.threads,
+            levers.threads.unwrap_or(1),
+            "a thread of one cpu is one core"
+        );
+        assert!(one.workers.iter().all(|&w| w == first), "{one:?}");
+        assert_eq!(one.caller, first);
+        assert_eq!(
+            one.cut.is_some(),
+            whole.len() > 1,
+            "the mask cuts the topology unless it was one cpu already"
+        );
+        if whole.len() >= 2 {
+            let pair = vec![whole[0], whole[1]];
+            let two = on_cpus(pair.clone(), || super::plan_pool().expect("a plan"));
+            assert_eq!(two.allowed, pair);
             assert!(
-                msg.contains("sys/index3/size") && msg.contains(named),
-                "{msg}"
+                two.workers
+                    .iter()
+                    .chain([&two.caller])
+                    .all(|c| pair.contains(c))
+                    || levers.threads.is_some_and(|n| n > 2),
+                "{two:?}"
             );
+            assert!(two.cut.is_some(), "{two:?}");
         }
+    }
+
+    /// The built pool and the plan before it are one placement, and a pool
+    /// built on a one-cpu thread pins its workers inside that mask.
+    #[test]
+    fn a_built_pool_is_the_plan() {
+        let planned = super::plan_pool().expect("a plan");
+        let p = Pool::build();
+        assert_eq!(p.plan(), planned);
+        let first = super::mask_cpus().expect("the mask reads")[0];
+        let (threads, plan) = on_cpus(vec![first], || {
+            let p = Pool::build();
+            (p.threads(), p.plan())
+        });
+        assert_eq!(plan.allowed, vec![first]);
+        assert!(plan.workers.iter().all(|&w| w == first));
+        assert_eq!(plan.threads, threads);
+    }
+
+    /// A pin the kernel refuses is a named line once, the pool records it,
+    /// and its plan lists no pinned worker; a cpu the set cannot hold is the
+    /// kernel's refusal.
+    #[test]
+    fn a_refused_pin_is_named_once() {
+        let p = Pool::build();
+        assert!(!p.pin_failed());
+        let e = std::io::Error::from_raw_os_error(libc::EPERM);
+        let line = p
+            .note_pin_failure(3, 17, &e)
+            .expect("the first failure is said");
+        assert!(
+            line.contains("worker 3") && line.contains("cpu 17") && line.contains("floats"),
+            "{line}"
+        );
+        assert!(p.note_pin_failure(4, 18, &e).is_none(), "said once");
+        assert!(p.pin_failed());
+        assert!(p.plan().workers.is_empty());
+        let refused = super::pin(1 << 20).expect_err("no cpu_set_t holds that cpu");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(refused.to_string().contains("1048576"), "{refused}");
     }
 
     /// A pool has a CCD map only once every participant is pinned: the

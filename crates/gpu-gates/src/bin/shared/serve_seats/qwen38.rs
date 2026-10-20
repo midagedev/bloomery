@@ -327,10 +327,12 @@ use bloomery_gpu_gates::bind::{
     model_props, note_line, parallel_line, placement_of, put_back, slots_of,
 };
 use bloomery_gpu_gates::generate::{BreakEven, Lane, Place, lane_of};
+use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{
-    CARD38, Lever38, Seqs, check_reserve, checkpoints_reserved, reserve_checkpoints, residency38,
+    CARD38, Lever38, Seqs, check_reserve, checkpoints_reserved, churn_bytes, reserve_checkpoints,
+    residency38,
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, side_seat, vision_seat};
 use bloomery_levers::{
@@ -346,7 +348,9 @@ use model::arch::qwen35moe::place::{
 };
 use model::placement::churn::ChurnPool;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule};
-use model::placement::workstation::{CardSpec, HostNeed, HostRead, host_available_read};
+use model::placement::workstation::{
+    CardSpec, HostNeed, HostRead, POINT_ROWS_RESERVE, host_available_read,
+};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file, draft_places};
@@ -530,7 +534,7 @@ impl Place38 {
     /// `plan_mtp_with_slots`. The host reserves every slot's checkpoints
     /// ([`seqs38`] through [`reserve_checkpoints`], priced at `ctx` positions
     /// a slot) and, under the draft, every slot's checkpoint hidden rows
-    /// ([`POINT_ROWS_RESERVE`]), which the plan's host need, the NVMe tier's
+    /// ([`POINT_ROWS_RESERVE`], one row a point, [`point_row_budget38`]), which the plan's host need, the NVMe tier's
     /// floor and its arena then count. The stage card carries the side model's reserve.
     fn machine(
         self,
@@ -566,11 +570,6 @@ impl Place38 {
         Ok(machine)
     }
 }
-
-/// The host reserve row of a load with the MTP draft that carries its
-/// checkpoints' hidden rows: each slot's points at most, one row each
-/// ([`point_row_budget38`]), beside the checkpoints themselves.
-const POINT_ROWS_RESERVE: &str = "mtp point rows";
 
 /// What the seat's load of `slots` resident sequences of the file `inputs`
 /// describes declares ([`reserve_checkpoints`]): every slot takes checkpoints,
@@ -1565,6 +1564,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         line.eprint();
     }
     let (residency, pool) = residency38_at(&plan, (a.place, feed), set)?;
+    need::print(
+        &plan,
+        churn_bytes(&plan, CARD38, (residency, pool))?,
+        cache.ram,
+        true,
+    )?;
     if a.plan_only {
         // The records before the load are out; nothing was loaded and the
         // route trace's directory is not made.

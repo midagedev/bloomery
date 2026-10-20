@@ -39,6 +39,7 @@ pub mod iq_rows;
 pub mod kld;
 pub mod logit_rows;
 pub mod model_file;
+pub mod need;
 #[cfg(feature = "gpu")]
 pub mod nodes;
 pub mod oracle;
@@ -73,6 +74,7 @@ pub mod vision_seat;
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
 use model::arch::Arch;
+use model::placement::need_hook;
 use std::path::{Path, PathBuf};
 
 /// Kernel gate band against the quantized-input reference.
@@ -116,8 +118,20 @@ pub fn die_with_parent(cmd: &mut std::process::Command) {
 /// The exit of every gate binary's `main`: `Ok` is success; an `Err` prints
 /// `<name>: <error>` (the Display, not the Debug a `Result` main prints) and
 /// each `source()` beneath it as `  caused by: ...` to stderr, then fails.
-/// A message that already opens with `<name>: ` is not prefixed twice.
+/// A message that already opens with `<name>: ` is not prefixed twice. A
+/// process whose load the need hook refused ([`need_hook::refusal`]) ends 75
+/// by it, whichever error carried the refusal up, with the hook's line named
+/// if the error lost it.
 pub fn exit_with(name: &str, r: Result<(), GateError>) -> std::process::ExitCode {
+    exit_status(name, r, need_hook::refusal())
+}
+
+/// [`exit_with`] for a process whose need hook refusal (if any) is `refusal`.
+fn exit_status(
+    name: &str,
+    r: Result<(), GateError>,
+    refusal: Option<String>,
+) -> std::process::ExitCode {
     let Err(e) = r else {
         return std::process::ExitCode::SUCCESS;
     };
@@ -132,7 +146,21 @@ pub fn exit_with(name: &str, r: Result<(), GateError>) -> std::process::ExitCode
         eprintln!("  caused by: {c}");
         cause = c.source();
     }
-    std::process::ExitCode::FAILURE
+    if let Some(why) = refusal.as_deref().filter(|why| !msg.contains(why)) {
+        eprintln!("{name}: {why}");
+    }
+    failure_status(refusal.is_some())
+}
+
+/// The status of a failed run: [`need_hook::REFUSED`] when the need hook
+/// refused its load (`EX_TEMPFAIL`: the box could not take it now, ask
+/// again), else 1.
+fn failure_status(refused: bool) -> std::process::ExitCode {
+    if refused {
+        std::process::ExitCode::from(need_hook::REFUSED)
+    } else {
+        std::process::ExitCode::FAILURE
+    }
 }
 
 /// The error a gate returns when its `ok` accumulator came out false. Every
@@ -955,9 +983,25 @@ pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        GateError, GgmlType, NAN_F16, bench_arm, dequant_row, first_ids, kquant_d_at, max_rel_err,
-        quantile,
+        GateError, GgmlType, NAN_F16, bench_arm, dequant_row, exit_status, failure_status,
+        first_ids, kquant_d_at, max_rel_err, quantile,
     };
+
+    /// A failed run ends 1, and 75 when the need hook refused its load,
+    /// whatever error carried the refusal up (a message that lost the hook's
+    /// line too); a run that did not fail ends 0.
+    #[test]
+    fn a_refused_load_ends_75() {
+        use std::process::ExitCode;
+        let boom = || -> Result<(), GateError> { Err("the load failed".into()) };
+        assert_eq!(exit_status("t", Ok(()), None), ExitCode::SUCCESS);
+        assert_eq!(exit_status("t", boom(), None), ExitCode::FAILURE);
+        let refusal =
+            Some("the need hook /h refused the load (exit 75); it said: busy".to_string());
+        assert_eq!(exit_status("t", boom(), refusal), ExitCode::from(75));
+        assert_eq!(failure_status(false), ExitCode::FAILURE);
+        assert_eq!(failure_status(true), ExitCode::from(75));
+    }
 
     #[test]
     fn a_bench_arm_must_select_an_existing_op() {

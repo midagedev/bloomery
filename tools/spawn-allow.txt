@@ -4,7 +4,7 @@
 # it holds, and why they may stay plain. The count is exact: a file with more fails, and so
 # does an entry above its file's count.
 crates/threads/src/helper.rs 1 the owner: spawn_helper itself
-crates/threads/src/lib.rs 1 the pool's workers: each pins itself, and pool() builds them before pin_caller pins its caller
+crates/threads/src/lib.rs 2 the pool's workers: each pins itself, and pool() builds them before pin_caller pins its caller; a test's thread that sets its own cpu mask before reading it
 crates/gpu-gates/src/bind.rs 3 the engine thread, spawned by the serve main, which is never pinned (the engine thread pins itself); a test's echo thread; a test's file thread (the seat's state commands)
 crates/gpu-gates/src/side_seat.rs 1 the embedding model's thread, which owns its card, spawned by the serve main, never pinned
 crates/gpu-gates/src/bin/gate_gemma_embedding2_serve.rs 1 the gate's concurrent chat request, from the gate main, never pinned

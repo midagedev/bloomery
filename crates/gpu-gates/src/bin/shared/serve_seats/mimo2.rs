@@ -127,8 +127,9 @@ use bloomery_gpu_gates::bind::{
     note_line, parallel_line, placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, choose_ctx, lane_at};
+use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_gpu_gates::residency38::{residency_room, residency_set};
+use bloomery_gpu_gates::residency38::{churn_bytes, residency_room, residency_set};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, residency};
 use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode};
@@ -552,6 +553,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         pick.word,
         0,
         Record::eprint,
+    )?;
+    // The hosted churn pool is host bytes the load holds beside the plan.
+    need::print(
+        &plan,
+        churn_bytes(&plan, 0, (residency, ChurnHosting::Hosted))?,
+        0,
+        true,
     )?;
     parallel_line(slots, slot_ctx, from, Pass::of(slots, ONE_PASS));
     if a.plan_only {

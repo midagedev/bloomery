@@ -49,6 +49,12 @@
 //!   if the file went through the seat's template path; a chat is a 200. (s5 runs before (s4), so (s4) reads its
 //!   log.)
 //!
+//! - (s6) the need hook (`BLOOMERY_NEED_HOOK`): `-m <fixture>` with a hook that reads its standard input and
+//!   exits 75 with a line. The process ends 75 before it listens, its log holds the hook's line, and the hook's
+//!   input is the `need` record the server printed at plan time, byte for byte. A second start with a hook that
+//!   exits 0 listens, and that hook's input is its own `need` record. The hook is consulted by the placed load,
+//!   before any card is opened, so the refusal holds no card.
+//!
 //! A clause's failure never ends the run: an error inside a clause (a server that exits before it listens,
 //! a kind the log is not read by) is that clause's FAIL line, and (s4) reads every log the run wrote.
 //!
@@ -59,10 +65,11 @@
 //! name before anything runs.
 
 use std::cell::OnceCell;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Fields, Kind};
@@ -311,6 +318,41 @@ fn command(cache: Option<&Path>) -> Result<Command, GateError> {
         }
     }
     Ok(cmd)
+}
+
+/// A hook script in `dir`: it writes its standard input to `<name>.saw`, prints `line` and exits `rc`. The
+/// script and the file it writes.
+fn hook_script(
+    dir: &Path,
+    name: &str,
+    line: &str,
+    rc: u8,
+) -> Result<(PathBuf, PathBuf), GateError> {
+    let saw = dir.join(format!("{name}.saw"));
+    let script = dir.join(format!("{name}.sh"));
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncat > '{}'\necho '{line}'\nexit {rc}\n",
+            saw.display()
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    Ok((script, saw))
+}
+
+/// The child's end status, `None` if it is still running after `bound`.
+fn ended(child: &mut Child, bound: Duration) -> Result<Option<ExitStatus>, GateError> {
+    let until = Instant::now() + bound;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= until {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// A running server: its handle, the address it printed and its stderr file.
@@ -857,6 +899,71 @@ impl Gate {
         Ok(ok)
     }
 
+    /// (s6): the need hook refuses a load with 75 before the server listens, and the hook reads the
+    /// `need` record the server printed.
+    fn need_hook(&self) -> Result<bool, GateError> {
+        let dir = self.dir.join("s6");
+        let args = self.file_args();
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let line = "the box is held for a sitting";
+        let mut ok = true;
+        // The refusal: the process ends 75 and never listens.
+        let refuse = dir.join("refuse");
+        std::fs::create_dir_all(&refuse)?;
+        let (hook, saw) = hook_script(&refuse, "hook", line, 75)?;
+        let mut cmd = command(None)?;
+        cmd.env("BLOOMERY_NEED_HOOK", &hook);
+        println!(
+            "s6: bloomery-serve {} with a hook that exits 75",
+            argv.join(" ")
+        );
+        let mut served = Served::spawn_cmd(cmd, &argv, &refuse)?;
+        let status = ended(&mut served.child, POLL * u32::try_from(POLLS)?)?;
+        let err = refuse.join("server.err");
+        let text = String::from_utf8_lossy(&std::fs::read(&err)?).into_owned();
+        println!("s6: refused run ended {status:?}; {}", tail(&text, 400));
+        ok &= check(
+            "s6_a_refused_load_ends_75",
+            status.is_some_and(|s| s.code() == Some(75)),
+        );
+        ok &= check("s6_the_log_names_the_hooks_line", text.contains(line));
+        ok &= check(
+            "s6_a_refused_load_never_listens",
+            !text.contains("listening on http://"),
+        );
+        let need = server_log(&err, self.family.kinds())?
+            .one(&record::NEED)?
+            .line()
+            .to_owned();
+        let saw = std::fs::read_to_string(&saw)?;
+        ok &= check("s6_the_hook_read_the_need_record", saw.trim_end() == need);
+        // The go-ahead: the same start with a hook that exits 0 listens.
+        let go = dir.join("go");
+        std::fs::create_dir_all(&go)?;
+        let (hook, saw) = hook_script(&go, "hook", line, 0)?;
+        let mut cmd = command(None)?;
+        cmd.env("BLOOMERY_NEED_HOOK", &hook);
+        println!(
+            "s6: bloomery-serve {} with a hook that exits 0",
+            argv.join(" ")
+        );
+        let mut served = Served::spawn_cmd(cmd, &argv, &go)?;
+        let up_err = go.join("server.err");
+        let listening = served.address(&up_err, POLLS, POLL).is_ok();
+        ok &= check("s6_a_hook_that_exits_0_goes_on", listening);
+        println!("s6: server stopped: {}", served.stop()?);
+        let need = server_log(&up_err, self.family.kinds())?
+            .one(&record::NEED)?
+            .line()
+            .to_owned();
+        let saw = std::fs::read_to_string(&saw)?;
+        ok &= check(
+            "s6_the_go_ahead_hook_read_its_need_record",
+            saw.trim_end() == need,
+        );
+        Ok(ok)
+    }
+
     /// (s4).
     fn no_unregistered_kind(&self) -> Result<bool, GateError> {
         let mut logs = Vec::new();
@@ -912,6 +1019,8 @@ fn run() -> Result<(), GateError> {
     ok &= guarded("s3", gate.hf(hashed));
     tier::sc("s5_template_file_start")?;
     ok &= guarded("s5", gate.template_file());
+    tier::sc("s6_need_hook_start")?;
+    ok &= guarded("s6", gate.need_hook());
     tier::sc("s4_no_unregistered_kind")?;
     ok &= guarded("s4", gate.no_unregistered_kind());
     println!("{}", tier::tally_line());

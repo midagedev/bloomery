@@ -23,6 +23,7 @@ pub const DRAFT: &str = "BLOOMERY_DRAFT";
 pub const CHECK_FINITE: &str = "BLOOMERY_CHECK_FINITE";
 pub const HOST_POPULATE: &str = "BLOOMERY_HOST_POPULATE";
 pub const HOST_LOCK: &str = "BLOOMERY_HOST_LOCK";
+pub const NEED_HOOK: &str = "BLOOMERY_NEED_HOOK";
 pub const CARD_DONTNEED: &str = "BLOOMERY_CARD_DONTNEED";
 pub const R8: &str = "BLOOMERY_R8";
 pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
@@ -631,6 +632,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Is("0"),
         doc: "Placed load: after populating, `mlock` the host set for the model's life; an \
               `RLIMIT_MEMLOCK` refusal is an error that names the limit.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: NEED_HOOK,
+        class: Class::C,
+        kind: Kind::File,
+        default: Unset::Means("no hook: nothing runs"),
+        doc: "Placed load: an executable called once per load, after the plan and before the \
+              card is opened or the host set read in, with the load's `need` record on its \
+              standard input: the line the process printed at plan time (host bytes by page \
+              class, the prompt cache, each card's bytes, the pool's threads and cpus). Exit \
+              0 goes on; 75 ends the process with 75 naming the hook's last output line; any \
+              other status or a hook that cannot start ends the load with a named error. A \
+              path with no regular file is refused at `main`. A load that opens a whole model \
+              on one card with no plan states no need and consults nothing. Read below every \
+              binary's `main`, like the host's room.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

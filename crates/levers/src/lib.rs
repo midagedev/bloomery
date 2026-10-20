@@ -35,9 +35,9 @@ pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, FORCE_IDS, GEN_SLOTS,
     GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM,
     LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS,
-    NVTIER_BYTES, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
-    PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN,
-    STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
+    NEED_HOOK, NVTIER_BYTES, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_GROUP,
+    PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE,
+    SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
 };
 pub use registry::{SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 
@@ -652,6 +652,12 @@ pub(crate) enum Scope<'a> {
     /// placement dial and the tier's build, all below every binary's `main`
     /// — like the pool's two.
     NvTier,
+    /// The load's need hook ([`NEED_HOOK`]) and the lock it states
+    /// ([`HOST_LOCK`]), read where a plan prints its need record and a placed
+    /// load consults the hook ([`need_levers`]), below every binary's `main`.
+    /// Only the hook is acted on by every binary; the lock stays on each
+    /// binary's `acts_on` list.
+    Need,
     /// How the tier page crosses ([`tier_link`]), read where the host tier
     /// takes its tier cards, below every binary's `main`.
     TierLink,
@@ -680,6 +686,7 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
     };
     let link = |name: &str| name == TIER_LINK;
     let nodes = |name: &str| name == TIER_NODES;
+    let hook = |name: &str| name == NEED_HOOK;
     let mut entries = Vec::new();
     let mut refused = Vec::new();
     for row in REGISTRY {
@@ -691,6 +698,7 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
                             || nvtier(row.name)
                             || link(row.name)
                             || nodes(row.name)
+                            || hook(row.name)
                             || acts_on.contains(&row.name)
                     }
                     Scope::Every => true,
@@ -698,6 +706,8 @@ pub(crate) fn read(env: &[(OsString, OsString)], scope: Scope<'_>) -> Result<Lev
                     Scope::Pool => continue,
                     Scope::NvTier if nvtier(row.name) => true,
                     Scope::NvTier => continue,
+                    Scope::Need if hook(row.name) || row.name == HOST_LOCK => true,
+                    Scope::Need => continue,
                     Scope::TierLink if link(row.name) => true,
                     Scope::TierLink => continue,
                     Scope::TierNodes if nodes(row.name) || link(row.name) => true,
@@ -2611,6 +2621,40 @@ pub fn nvtier_levers() -> Result<NvTierLevers, LeverError> {
         bytes,
         direct,
         mem: levers.nvtier_mem(),
+    })
+}
+
+/// What a load states of how it holds its host set, read where its plan
+/// prints the need record and where the placed load consults the hook
+/// ([`need_levers`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NeedLevers {
+    /// [`NEED_HOOK`]: the executable a placed load calls before it opens a
+    /// card; `None` unset, when nothing runs.
+    pub hook: Option<PathBuf>,
+    /// [`HOST_LOCK`]: the host set is mlocked for the model's life, which
+    /// moves its pages from the cache class to the locked class in the
+    /// need record.
+    pub host_lock: bool,
+}
+
+/// [`NEED_HOOK`] and [`HOST_LOCK`] from the process environment, parsed as
+/// [`at_main`] parses them, and refused, with every refusal at once, when one
+/// is set to a value its kind does not take and when a retired name is set.
+/// Nothing else: which levers a binary acts on, and which names it knows, is
+/// its `main`'s reading, which refuses `HOST_LOCK` in a binary that does not
+/// act on it, so the flag here is false there.
+pub fn need_levers() -> Result<NeedLevers, LeverError> {
+    let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let levers = read(&env, Scope::Need)?;
+    let hook = match &levers.entry(NEED_HOOK).value {
+        None => None,
+        Some(Value::Path(p)) => Some(p.clone()),
+        v => panic!("{NEED_HOOK} holds {v:?}, not a path"),
+    };
+    Ok(NeedLevers {
+        hook,
+        host_lock: levers.flag(HOST_LOCK),
     })
 }
 

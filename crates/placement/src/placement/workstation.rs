@@ -335,6 +335,15 @@ pub const DRAFT_RESERVE: &str = "DSpark draft";
 pub const TIER_BATCH_RESERVE: &str = "tier prompt batch";
 pub const TIER_BATCH_HOST_RESERVE: &str = "tier prompt batch rows";
 
+/// The host reserve that carries a load's checkpoint slots: the pinned host
+/// buffers its sequences copy their recurrent state to.
+pub const CHECKPOINTS_RESERVE: &str = "checkpoints";
+
+/// The host reserve of a load with the MTP draft that carries its
+/// checkpoints' hidden rows: each slot's points at most, one row each,
+/// beside the checkpoints themselves.
+pub const POINT_ROWS_RESERVE: &str = "mtp point rows";
+
 /// The expert tier's prompt-batch service in bytes ([`tier_batch_bytes`]):
 /// on the tier card, the staging a block is copied into — the activations,
 /// the tier places, their q8_1 form, the down outputs by slot — and the tile
@@ -1009,6 +1018,245 @@ impl fmt::Display for HostShort {
 }
 
 impl std::error::Error for HostShort {}
+
+/// What can take a page of the host's need back: the class a broker reads a
+/// load's need by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageClass {
+    /// Pinned by the driver (`cuMemAllocHost`, `cuMemHostAlloc`): resident
+    /// for the process's life.
+    Pinned,
+    /// Anonymous pages: the kernel can only swap them.
+    Anon,
+    /// File pages in the page cache: reclaimed under pressure and read back
+    /// from the file.
+    Cache,
+    /// File pages `mlock`ed for the model's life (`BLOOMERY_HOST_LOCK`): no
+    /// reader of the page cache evicts them.
+    Locked,
+    /// The cards' share of an integrated device's pool, which is the host's
+    /// own memory ([`HostNeed::cards`]).
+    Unified,
+}
+
+/// How a load holds its host set: the two choices that move a term of the
+/// need between page classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hosting {
+    /// `BLOOMERY_HOST_LOCK`: the host set is `mlock`ed after the populate.
+    pub lock: bool,
+    /// The NVMe tier's arena is pinned memory (`BLOOMERY_NVTIER_MEM` on the
+    /// plan's device), not anonymous.
+    pub arena_pinned: bool,
+}
+
+/// An addend of [`HostNeed::bytes`], the reserves split by what they set
+/// aside. [`NeedTerm::class`] is the one table of which page class holds
+/// each: a term added to the need is added here, and the match is exhaustive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NeedTerm {
+    /// The routed experts the host keeps ([`HostNeed::experts`]): file pages
+    /// of the shards, or of the r8 sidecar.
+    Experts,
+    /// The row-gathered tables the host holds ([`HostNeed::tables`]): the
+    /// same mapping as the experts.
+    Tables,
+    /// The cards' ring shadows ([`HostNeed::shadows`]).
+    Shadows,
+    /// The expert tier's prompt batch rows and places
+    /// ([`TIER_BATCH_HOST_RESERVE`]), allocated with `cuMemAllocHost`.
+    TierRows,
+    /// The checkpoint slots a load's sequences keep
+    /// ([`CHECKPOINTS_RESERVE`]), pinned host buffers.
+    Checkpoints,
+    /// The hidden rows of those checkpoints under the MTP draft
+    /// ([`POINT_ROWS_RESERVE`]), pinned host buffers.
+    PointRows,
+    /// The page cache the row-gathered tables on the NVMe tier are read
+    /// through (`HostTotals::row_reserve_bytes`).
+    RowCache,
+    /// The page-cache window of the prompt run-ahead of the NVMe tier
+    /// (what [`HostNeed::reserves`] holds past the named reserves and the
+    /// row cache).
+    RunAhead,
+    /// The residency churn pool ([`HostNeed::extra`]): runs of the host set,
+    /// read in and locked with it.
+    Extra,
+    /// The NVMe tier's RAM arena ([`HostNeed::arena`]).
+    Arena,
+    /// The cards' share of a unified pool ([`HostNeed::cards`]).
+    Cards,
+}
+
+impl NeedTerm {
+    /// Every term, in the order [`HostNeed::classes`] adds them.
+    pub const ALL: [NeedTerm; 11] = [
+        NeedTerm::Experts,
+        NeedTerm::Tables,
+        NeedTerm::Shadows,
+        NeedTerm::TierRows,
+        NeedTerm::Checkpoints,
+        NeedTerm::PointRows,
+        NeedTerm::RowCache,
+        NeedTerm::RunAhead,
+        NeedTerm::Extra,
+        NeedTerm::Arena,
+        NeedTerm::Cards,
+    ];
+
+    /// The page class of the term under `how`.
+    #[must_use]
+    pub const fn class(self, how: Hosting) -> PageClass {
+        match self {
+            NeedTerm::Experts | NeedTerm::Tables | NeedTerm::Extra => {
+                if how.lock {
+                    PageClass::Locked
+                } else {
+                    PageClass::Cache
+                }
+            }
+            NeedTerm::Shadows
+            | NeedTerm::TierRows
+            | NeedTerm::Checkpoints
+            | NeedTerm::PointRows => PageClass::Pinned,
+            NeedTerm::RowCache | NeedTerm::RunAhead => PageClass::Cache,
+            NeedTerm::Arena => {
+                if how.arena_pinned {
+                    PageClass::Pinned
+                } else {
+                    PageClass::Anon
+                }
+            }
+            NeedTerm::Cards => PageClass::Unified,
+        }
+    }
+}
+
+/// The term a host reserve named `name` is; `None` for [`OS_RESERVE`], which
+/// the need leaves out. A name with no row is refused by [`HostNeed::classes`]:
+/// a reserve nobody classed would be counted in no class.
+fn reserve_term(name: &str) -> Result<Option<NeedTerm>, NeedClassError> {
+    match name {
+        OS_RESERVE => Ok(None),
+        TIER_BATCH_HOST_RESERVE => Ok(Some(NeedTerm::TierRows)),
+        CHECKPOINTS_RESERVE => Ok(Some(NeedTerm::Checkpoints)),
+        POINT_ROWS_RESERVE => Ok(Some(NeedTerm::PointRows)),
+        other => Err(NeedClassError::Reserve(other.to_string())),
+    }
+}
+
+/// [`HostNeed::bytes`] by page class: the classes sum to it, the OS reserve
+/// being out of both. A class past u64 bytes reads `u64::MAX`, as the sum
+/// does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NeedClasses {
+    pub pinned: u64,
+    pub anon: u64,
+    pub cache: u64,
+    pub locked: u64,
+    pub unified: u64,
+}
+
+impl NeedClasses {
+    fn add(&mut self, class: PageClass, bytes: u64) {
+        let slot = match class {
+            PageClass::Pinned => &mut self.pinned,
+            PageClass::Anon => &mut self.anon,
+            PageClass::Cache => &mut self.cache,
+            PageClass::Locked => &mut self.locked,
+            PageClass::Unified => &mut self.unified,
+        };
+        *slot = slot.saturating_add(bytes);
+    }
+
+    /// The classes' sum, [`HostNeed::bytes`] of the need they were made from.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        let sum: u128 = [
+            self.pinned,
+            self.anon,
+            self.cache,
+            self.locked,
+            self.unified,
+        ]
+        .into_iter()
+        .map(u128::from)
+        .sum();
+        u64::try_from(sum).unwrap_or(u64::MAX)
+    }
+}
+
+/// Why a need could not be put in classes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NeedClassError {
+    /// A host reserve with no page class ([`reserve_term`]).
+    Reserve(String),
+    /// The need's reserves hold less than the machine's named reserves and
+    /// the plan's row cache, or its OS reserve is not the host's: the need
+    /// was not made from this plan.
+    NotThePlans { why: String },
+}
+
+impl fmt::Display for NeedClassError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NeedClassError::Reserve(name) => write!(
+                f,
+                "the host reserve {name:?} has no page class: add it to workstation::reserve_term"
+            ),
+            NeedClassError::NotThePlans { why } => {
+                write!(f, "the host need is not this plan's: {why}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NeedClassError {}
+
+impl HostNeed {
+    /// The need by page class under `how`: each addend of [`HostNeed::bytes`]
+    /// in the class [`NeedTerm::class`] gives it, the OS reserve out. `self`
+    /// is [`HostNeed::of`] of `plan`; a need made of another plan, or edited
+    /// since, is refused by name.
+    pub fn classes(&self, plan: &Plan<'_>, how: Hosting) -> Result<NeedClasses, NeedClassError> {
+        let host = plan.machine.host();
+        let os = os_reserve(host);
+        if self.os != os {
+            return Err(NeedClassError::NotThePlans {
+                why: format!("its OS reserve is {} B, the host's {os} B", self.os),
+            });
+        }
+        let mut classes = NeedClasses::default();
+        let mut add = |term: NeedTerm, bytes: u64| classes.add(term.class(how), bytes);
+        let mut named: u128 = 0;
+        for (name, bytes) in &host.reserves {
+            named += u128::from(*bytes);
+            if let Some(term) = reserve_term(name)? {
+                add(term, *bytes);
+            }
+        }
+        let rows = plan.host.row_reserve_bytes;
+        let window = u128::from(self.reserves)
+            .checked_sub(named + u128::from(rows))
+            .and_then(|w| u64::try_from(w).ok())
+            .ok_or_else(|| NeedClassError::NotThePlans {
+                why: format!(
+                    "its reserves hold {} B, under the host's named reserves {named} B and the \
+                     row cache {rows} B",
+                    self.reserves
+                ),
+            })?;
+        add(NeedTerm::Experts, self.experts);
+        add(NeedTerm::Tables, self.tables);
+        add(NeedTerm::Shadows, self.shadows);
+        add(NeedTerm::RowCache, rows);
+        add(NeedTerm::RunAhead, window);
+        add(NeedTerm::Extra, self.extra);
+        add(NeedTerm::Arena, self.arena);
+        add(NeedTerm::Cards, self.cards);
+        Ok(classes)
+    }
+}
 
 /// `MemAvailable` of a `/proc/meminfo` text, in bytes. A text with no such
 /// line (a kernel before 3.14), or one whose value is not a whole number of

@@ -182,20 +182,9 @@ pub fn sibling_of(cpu: usize) -> Option<usize> {
 
 /// The cpus of the calling thread's mask.
 pub fn mask() -> Result<Vec<usize>, HelperError> {
-    // SAFETY: `set` is a zeroed cpu_set_t that `sched_getaffinity` fills with
-    // the matching size.
-    let set = unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
-            return Err(HelperError::ReadMask);
-        }
-        set
-    };
-    let max = 8 * std::mem::size_of::<libc::cpu_set_t>();
-    // SAFETY: `c < max`, the set's own bit count; `CPU_ISSET` only reads.
-    Ok((0..max)
-        .filter(|&c| unsafe { libc::CPU_ISSET(c, &set) })
-        .collect())
+    crate::mask_cpus()
+        .map(|cpus| cpus.into_iter().map(|c| c as usize).collect())
+        .map_err(|_| HelperError::ReadMask)
 }
 
 /// The one cpu the calling thread's mask holds; `None` for a mask of more

@@ -436,9 +436,10 @@ mod cli {
     use bloomery_gpu_gates::generate::{Place, card_words, lane_at};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::logit_rows::{ForcedFacts, ForcedRows};
+    use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
-    use bloomery_gpu_gates::residency38::{CARD38, Lever38, Seqs, residency38};
+    use bloomery_gpu_gates::residency38::{CARD38, Lever38, Seqs, churn_bytes, residency38};
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
     use bloomery_levers::{
         Draft38At, Draft38Off, Levers, PagedAt, Residency38At, ResidencyPick, ResidencyWhy,
@@ -2791,6 +2792,12 @@ mod cli {
             lever,
             Record::print,
         )?;
+        need::print(
+            &plan,
+            churn_bytes(&plan, CARD38, (residency, pool))?,
+            0,
+            false,
+        )?;
         let mut m = Body38::open_placed_residency(
             file,
             &plan,
@@ -2906,6 +2913,12 @@ mod cli {
             &plan.plan,
             lever,
             Record::print,
+        )?;
+        need::print(
+            &plan.plan,
+            churn_bytes(&plan.plan, CARD38, (residency, pool))?,
+            0,
+            false,
         )?;
         let mut m = Body38::open_placed_mtp_residency(
             file,
