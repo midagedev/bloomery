@@ -1,0 +1,21 @@
+# sjhard, the hard suite on DeepSeek-V4.1-Flash: the jump arm against the step arm, the same bloomery-serve-ds41
+# binary with BLOOMERY_SCHEMAJUMP unset (jump) and off (step), one server a window on the cards it picks (the
+# 3090 and the A6000, no --place), Clef-Flash and Qwen3.6's jump arm repeated as the anchors. The hard suite is
+# 12 requests of 29 questions (2.4 a request). The step arm runs N + 1 nexts on an answer of N ~ 15 tokens; the
+# jump arm folds the lead into the prompt call and pays one next_after a decision row (~3.4 a request). With a
+# decode step t ~ 45 ms on the two cards and a prompt call P of 1-2 s, (jump - step) / step = -(16 - 3.4) t /
+# (P + 16 t) = -15..-36 % [derived; t and P are not measured on this suite, the sitting measures both].
+kind: ab
+question: how much of the time to a complete answer does the jump arm take off the step arm on V4.1-Flash?
+term: client-side wall p50 in ms of POST to a complete answer, the hard suite (12 requests), DeepSeek-V4.1-Flash
+  Q3_K_M on the RTX 3090 + RTX A6000, cache_prompt off, thinking off - (jump - step) / step, paired by round
+unit: %
+predict: -40..-12
+rounds: 5
+sd: 2.0 % assumption: the wall of a 1-3 s HTTP request; the sitting's own scatter replaces it
+condition: each window holds one V4.1 server beside the Clef-Flash server; the step window's timings.constrained
+  shows prefill_calls 0 and next_calls = the answer's tokens + 1; both windows score correct/29 on the gold
+decide-in: BLOOMERY_SCHEMAJUMP stays on by default for V4.1; the film's V4.1 row is this pair
+decide-below: the jump arm gains more than derived: V4.1's decode step is dearer than 45 ms or its prompt call
+  cheaper; read the server's step and prompt timings
+decide-above: the jump arm gains less: the prompt call dominates the wall; the film states the prompt share
