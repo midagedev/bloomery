@@ -1598,13 +1598,13 @@ EOF
     cp "$LEASE_TREE/tools/ref/$perf.sh" "$t/perf-tree/tools/ref/"
     printf '%s\n' 'MODEL=unused REF_TOKENS=0' > "$t/perf-tree/tools/ref/ref-paths.sh"
     # The startup phase delivers TERM with the owner's traps set but before the decoder's pid is assigned: the owner's launch
-    # with a TERM to its own shell between the fork and `BG_PID=$!`.
+    # with a TERM to its own shell between the fork and `bg_pid=$!`.
     cat > "$t/perf-tree/tools/ref/lease.sh" << 'EOF'
 source "$STUB_PERF_LEASE"
 lease_take() { exec 9> "$STUB_PERF_LOCK"; flock -n 9; }
 witness() { :; }
 if [ "${STUB_PERF_PHASE:-}" = startup ]; then
-  eval "$(declare -f bounded_bg | sed 's/BG_PID=\$!/kill -TERM $$; BG_PID=$!/')"
+  eval "$(declare -f bounded_bg | sed 's/bg_pid=\$!/kill -TERM $$; bg_pid=$!/')"
 fi
 EOF
     cat > "$t/perf-bin/decoder" << 'EOF'
