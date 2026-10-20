@@ -52,6 +52,12 @@
 //! at [`HEAD_256`] (EmbeddingGemma 2's sliding layers: NEOX pairs `(i, i +
 //! 128)`), 128 threads a head, the four warps' sums in warp order.
 //!
+//! [`RopeNeoxKernels::enqueue_head_norm_neox_append_128_partial`] is that body
+//! at [`HEAD`] with the first [`ROT_PARTIAL`] values turned (MiniMax-M3: NEOX
+//! pairs `(i, i + 32)`, the other 64 values passed through normalized), 64
+//! threads a head, the two warps' sums in warp order, the query read from
+//! plain query rows at head stride [`HEAD`] and written to its own rows.
+//!
 //! The `_q8` entries ([`RopeNeoxKernels::enqueue_head_norm_neox_append_q8`],
 //! [`RopeNeoxKernels::enqueue_head_norm_neox_append_256_q8`]) are the same two
 //! launches with the cache append quantized: the norm, the turn and the
@@ -137,6 +143,16 @@ const WARPS_256: usize = THREADS_256 / 32;
 const _: () = assert!(THREADS_256_U32 as usize == THREADS_256 && THREADS_256 == 128);
 // The entry's launch contract spells HEAD_256 and ROT_256 out as 256 and 64.
 const _: () = assert!(HEAD_256 == 256 && ROT_256 == 64);
+
+/// The values at the head of each [`HEAD`]-value row that turn in the
+/// partial instance of the head-128 launch (MiniMax-M3's `rope.dimension_count`):
+/// NEOX pairs `(i, i + ROT_PARTIAL/2)` for `i < ROT_PARTIAL/2`, every other
+/// value passed through normalized. The rope table's row is `ROT_PARTIAL` f32.
+pub const ROT_PARTIAL: usize = 64;
+/// Warps of the head-128 block, `THREADS / 32`.
+const WARPS_128: usize = THREADS / 32;
+// The entry's launch contract spells HEAD and ROT_PARTIAL out as 128 and 64.
+const _: () = assert!(HEAD == 128 && ROT_PARTIAL == 64 && WARPS_128 == 2);
 
 /// Values per head of the whole-turn instance (EmbeddingGemma 2's global
 /// layers): every value turns, NEOX pairs `(i, i + HEAD_512/2)`, and the rope
@@ -1249,6 +1265,83 @@ mod rope_neox_kernels {
         };
     }
 
+    /// The norm, partial NEOX turn and append over heads of [`HEAD`] values,
+    /// the first [`ROT_PARTIAL`] turned (`norm_partial_append` at `HEAD =
+    /// 128`, `ROT = 64`): the query heads read from plain query rows `qs`
+    /// (`128` values a head) and written to `q`, the key heads normalized and
+    /// turned in place in `k` and appended with `v`. The rope table holds
+    /// [`ROT_PARTIAL`] f32 per position.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(64)]
+    #[launch_contract(
+        domain = 1,
+        block = (64, 1, 1),
+        requires = (
+            qs.len() >= m * n_head * 128,
+            q.len() >= m * n_head * 128,
+            k.len() >= m * n_kv * 128,
+            v.len() >= m * n_kv * 128,
+            gq.len() >= 128,
+            gk.len() >= 128,
+            table.len() >= ctx * 64,
+            pos.len() >= m,
+            cache_k.len() >= n_kv * ctx * 128,
+            cache_v.len() >= n_kv * ctx * 128
+        )
+    )]
+    pub fn head_norm_neox_append_128_partial(
+        gq: &[f32],
+        gk: &[f32],
+        table: &[f32],
+        pos: &[u32],
+        qs: &[f32],
+        v: &[f32],
+        eps: f32,
+        n_head: u32,
+        n_kv: u32,
+        ctx: u32,
+        m: u32,
+        fault: FaultSink,
+        q: DisjointSlice<f32>,
+        k: DisjointSlice<f32>,
+        cache_k: DisjointSlice<u16>,
+        cache_v: DisjointSlice<u16>,
+    ) {
+        static mut WSUM2P: SharedArray<f64, WARPS_128> = SharedArray::UNINIT;
+
+        // SAFETY: WSUM2P is this block's own shared allocation of WARPS_128
+        // slots; the raw form reaches it without a reference. The launch
+        // contract is `norm_partial_append`'s at (HEAD, ROT_PARTIAL) with
+        // plain query rows over the f16 planes.
+        unsafe {
+            norm_partial_append::<HEAD, ROT_PARTIAL, WARPS_128, HEAD, _>(
+                gq,
+                gk,
+                table,
+                pos,
+                qs,
+                v,
+                eps,
+                n_head,
+                n_kv,
+                ctx,
+                m,
+                fault,
+                q,
+                k,
+                F16Sink {
+                    k: cache_k,
+                    v: cache_v,
+                },
+                SharedArray::as_raw_mut_ptr(&raw mut WSUM2P),
+            )
+        };
+    }
+
     /// [`head_norm_neox_append`] with the append quantized to Q8_0 (the
     /// module doc's `_q8` paragraph): the norm, the turn and the in-place
     /// query and key writes are that entry's bit for bit, and each key and
@@ -1753,14 +1846,15 @@ pub struct NeoxArgs<'a> {
 
 /// The arguments of [`RopeNeoxKernels::enqueue_head_norm_neox_append_256`]
 /// and [`RopeNeoxKernels::enqueue_head_norm_neox_append_512`] at heads of
-/// `HEAD` values ([`HEAD_256`] or [`HEAD_512`]), and of
+/// `HEAD` values ([`HEAD_256`] or [`HEAD_512`]), of
 /// [`RopeNeoxKernels::enqueue_head_norm_neox_append_256_whole`] at
-/// [`HEAD_256`]: `m` tokens' query source rows `qg` (`n_head` heads a token;
+/// [`HEAD_256`] and of [`RopeNeoxKernels::enqueue_head_norm_neox_append_128_partial`]
+/// at [`HEAD`]: `m` tokens' query source rows `qg` (`n_head` heads a token;
 /// for the 256 entry a head is its `2·HEAD` q+gate values, the query first,
-/// for the 512 and whole-turn entries its `HEAD` query values), the query
+/// for the other entries its `HEAD` query values), the query
 /// output `q` (`n_head` heads of `HEAD`), the `n_kv` key heads in `k` (turned
 /// in place) and value heads in `v`, the gains, the rope table (at least
-/// `ctx` rows of [`ROT_256`], or of `HEAD` f32 for a whole turn), the
+/// `ctx` rows of [`ROT_256`] or [`ROT_PARTIAL`], or of `HEAD` f32 for a whole turn), the
 /// positions, the sink, and the layer's two cache planes of `n_kv · ctx` rows
 /// of `HEAD` f16.
 pub struct PartialNeoxArgs<'a> {
@@ -2236,6 +2330,77 @@ impl RopeNeoxKernels {
                 0,
             ))?;
         self.module.head_norm_neox_append_256_whole(
+            stream, &prep, gq, gk, table, pos, qg, v, eps, n_head, n_kv, ctx, m, fault, q, k,
+            cache_k, cache_v,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the norm, partial turn and append of `args.m` tokens with
+    /// heads of [`HEAD`] values, the first [`ROT_PARTIAL`] turned: one block
+    /// per (token, head), `m·(n_head + n_kv)` blocks of 64 threads. The query
+    /// heads come from `args.qg` (plain query rows, `m·n_head·128` f32, head
+    /// `h` of token `t` at `(t·n_head + h)·128`) and go to `args.q` (the same
+    /// layout); `args.table` holds [`ROT_PARTIAL`] f32 for each of at least
+    /// `ctx` positions (`RopeTable::push` over a [`ROT_PARTIAL`]-wide spec),
+    /// the planes are `n_kv·ctx·128` f16. Positions as in
+    /// [`RopeNeoxKernels::enqueue_head_norm_neox_append`]: distinct, below
+    /// `ctx`; one at or past it raises [`FaultSite::CachePos`] on
+    /// `args.fault`, leaves the token's heads NaN and is not appended.
+    /// Asynchronous, allocation-free, capturable.
+    ///
+    /// # Safety
+    ///
+    /// The `m` positions of `args.pos` are distinct: two tokens at one
+    /// position write the same cache rows from two blocks at once.
+    pub unsafe fn enqueue_head_norm_neox_append_128_partial(
+        &self,
+        stream: &CudaStream,
+        args: PartialNeoxArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_head_norm_neox_append_128_partial";
+        let PartialNeoxArgs {
+            qg,
+            q,
+            k,
+            v,
+            gq,
+            gk,
+            table,
+            pos,
+            eps,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+            cache_k,
+            cache_v,
+        } = args;
+        let plane = n_kv * ctx * HEAD;
+        let [grid, n_head, n_kv, ctx, m] = partial_launch(
+            what,
+            (HEAD, HEAD, ROT_PARTIAL),
+            [n_head, n_kv, ctx, m],
+            [
+                qg.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                gq.len(),
+                gk.len(),
+                table.len(),
+                pos.len(),
+            ],
+            &[
+                ("cache_k", cache_k.len(), plane),
+                ("cache_v", cache_v.len(), plane),
+            ],
+        )?;
+        let prep = self
+            .module
+            .prepare_head_norm_neox_append_128_partial(LaunchConfig1D::new(grid, THREADS_U32, 0))?;
+        self.module.head_norm_neox_append_128_partial(
             stream, &prep, gq, gk, table, pos, qg, v, eps, n_head, n_kv, ctx, m, fault, q, k,
             cache_k, cache_v,
         )?;
