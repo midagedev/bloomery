@@ -1317,24 +1317,48 @@ EOF
     mkdir "$t/fork-bin"
     cancel_timeout "$t/fork-bin/timeout"
     chmod +x "$t/fork-bin/timeout"
-    # Cancellation at trap restoration must still stop the server holding the lease.
+    # Cancellation at trap restoration must still stop the server holding the lease. A sample of cancel_ready is a
+    # state, which the polling monitor leaves again at once: the shim reads the first sample that finds the monitor
+    # waiting as it is and every later one as running, as a loaded machine can at any moment.
+    mkdir "$t/flip-bin"
+    cat > "$t/flip-bin/ps" << 'EOF'
+#!/bin/sh
+case "$*" in
+  "-o stat= -p "*)
+    st=$("$FLIP_PS" "$@") || exit $?
+    if [ -e "$FLIP_SEEN" ]; then
+      echo RN
+      exit 0
+    fi
+    case $st in *S*) : > "$FLIP_SEEN" ;; esac
+    echo "$st"
+    ;;
+  *) exec "$FLIP_PS" "$@" ;;
+esac
+EOF
+    chmod +x "$t/flip-bin/ps"
     mkfifo "$t/restore-stream" || exit 70
     { cat "$t/restore-stream" > "$t/restore-out" && echo eof > "$t/restore-eof"; } &
     reader=$!
     bash -c '
       source "$1"
       source "$LEASE_TREE/tools/ref/cancel-stubs.sh"
+      FLIP_PS=$(command -v ps) FLIP_SEEN=$2/flip-seen
+      export FLIP_PS FLIP_SEEN
+      PATH="$2/flip-bin:$PATH"
       exec 9> "$2/restore-lock"
       flock -n 9 || exit 75
       timeout --kill-after=10 60 "$2/held" "$2/restore-pid" &
       server=$!
       trap '\''trap "" TERM INT HUP; lease_stop "$server" || exit $?; echo server-stopped; exit 143'\'' TERM
-      # Readiness is the signal; the bound is only the hang guard: the 60 s bound of the held stub.
+      # Readiness is the signal; the bound is only the hang guard: the 60 s bound of the held stub. The first sample
+      # that holds is kept: a second one is another state.
+      ready=''
       for ((i = 0; i < 600; i++)); do
-        cancel_ready "$2/restore-pid" && break
+        if cancel_ready "$2/restore-pid"; then ready=yes; break; fi
         sleep 0.1
       done
-      cancel_ready "$2/restore-pid" || exit 70
+      [ -n "$ready" ] || exit 70
       eval() { kill -TERM "$$"; builtin eval "$@"; }
       run_bounded timeout --kill-after=10 60 true
       [ -z "$BIN_SIGNAL" ] || kill -s "$BIN_SIGNAL" "$$"
@@ -1365,11 +1389,21 @@ EOF
       bash -c '
         source "$1"
         enclosing=$2 dir=$3
-        set -- timeout --kill-after=10 3 bash -c '\''
+        set -- timeout --kill-after=10 60 bash -c '\''
           source "$1"
+          source "${1%/*}/cancel-stubs.sh"
           exec 9> "$2/lock"
           flock -n 9 || exit 75
+          # A slow start, as a loaded machine has: the bound does not run from the spawn.
+          [ "$4" != external ] || sleep 4
           trap "echo outer-trap; exit 143" TERM
+          # The enclosing bound runs out when the held command is up, not at a time after the spawn: its own 60 s
+          # timer is only the hang guard, and the SIGALRM is what that timer raises.
+          outer=$PPID
+          ( for ((i = 0; i < 600; i++)); do
+              ! cancel_ready "$2/child" || { kill -ALRM "$outer"; break; }
+              sleep 0.1
+            done ) 9>&- > /dev/null 2>&1 &
           # Leave a scheduling gap before delivering KILL to the surviving group.
           kill() {
             case "$*" in
@@ -1824,6 +1858,8 @@ import sys
 import time
 
 source, root, mode = sys.argv[1:]
+# Every wait below ends when its event does; this is only the hang guard, which a loaded machine's slow start must not reach.
+HANG = 60
 prefix = Path(root) / ("filter-" + mode)
 ready, release = Path(str(prefix) + ".ready"), Path(str(prefix) + ".release")
 fifo_link = str(prefix) + ".fifo"
@@ -1833,7 +1869,7 @@ with open(str(prefix) + ".out", "w") as output:
                                str(prefix) + ".lock", str(prefix) + ".filtered"],
                               stdout=output, stderr=subprocess.PIPE, env=env)
     try:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + HANG
         while not ready.exists() or not ready.read_text().strip():
             if time.monotonic() >= deadline:
                 raise RuntimeError("filter reader did not reach its startup gap")
@@ -1845,7 +1881,7 @@ with open(str(prefix) + ".out", "w") as output:
         runner.send_signal(signal.SIGTERM)
         time.sleep(0.1)
         release.touch()
-        rc = runner.wait(timeout=5)
+        rc = runner.wait(timeout=HANG)
         rc = 128 - rc if rc < 0 else rc
         try:
             os.kill(int(reader), 0)
@@ -1853,7 +1889,7 @@ with open(str(prefix) + ".out", "w") as output:
         except ProcessLookupError:
             state = "gone"
         eof = False
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + HANG
         while time.monotonic() < deadline:
             if select.select([runner.stderr], [], [], max(0, deadline - time.monotonic()))[0]:
                 if not os.read(runner.stderr.fileno(), 4096):
@@ -1870,7 +1906,7 @@ with open(str(prefix) + ".out", "w") as output:
         release.touch()
         if runner.poll() is None:
             runner.terminate()
-            runner.wait(timeout=5)
+            runner.wait(timeout=HANG)
         try:
             os.close(os.open(fifo_link, os.O_WRONLY | os.O_NONBLOCK))
         except OSError as error:

@@ -5,6 +5,8 @@ for a in "$@"; do
   case $a in -f | --file=*) exec "${SHIM_REAL_TAR:?}" "$@" ;; esac
 done
 set -o pipefail
+d=${TMPDIR:-/tmp}/shim-sync.$PPID
+mkdir -p "$d" && echo "$$" > "$d/tar.pid.tmp" && mv "$d/tar.pid.tmp" "$d/tar.pid" || exit 70
 python3 -I -c '
 import os, sys
 zero, run, out = bytes(512), 0, sys.stdout.buffer

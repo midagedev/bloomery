@@ -81,22 +81,28 @@ lease_stop() {
   return "$failed"
 }
 
+# group_live <pgid>: the live (not zombie) processes of the group, one ps line each; fails when ps does.
+group_live() (
+  set -o pipefail
+  ps -eo pgid=,stat= | awk -v g="$1" '$1 == g && $2 !~ /^Z/'
+)
+
 # group_clear <pgid>: KILL what is left of a process group whose leader has ended and wait, up to 2 s, until none of
 # it lives (zombies hold no descriptors). An empty group costs one kill. Returns 70 with a message when the KILL is
-# refused (as lease_stop, any error but a missing group), something outlives it, or the processes cannot be read. A
-# process that left the group (setsid) is not touched.
+# refused for a group that has a live process, something outlives it, or the processes cannot be read. A group of ended
+# processes only is empty: macOS answers a KILL to it with EPERM, not ESRCH, while its leader is a zombie and for a
+# moment after the leader is reaped. A process that left the group (setsid) is not touched.
 group_clear() {
   local i=0 live err
   if ! err=$(LC_ALL=C kill -KILL -- "-$1" 2>&1); then
     case $err in
       *'No such process'*) return 0 ;;
-      *) printf '[bound] cannot clear process group %s: %s\n' "$1" "$err" >&2; return 70 ;;
+      *'Operation not permitted'*) if live=$(group_live "$1") && [ -z "$live" ]; then return 0; fi ;;
     esac
+    printf '[bound] cannot clear process group %s: %s\n' "$1" "$err" >&2
+    return 70
   fi
-  while live=$(
-    set -o pipefail
-    ps -eo pgid=,stat= | awk -v g="$1" '$1 == g && $2 !~ /^Z/'
-  ); do
+  while live=$(group_live "$1"); do
     [ -n "$live" ] || return 0
     if [ "$i" = 20 ]; then
       echo "[bound] process group $1 still alive after its KILL" >&2
@@ -365,6 +371,7 @@ bounded_bg_wait() {
 #   natural-end        --clear: a command that ends by itself and leaves a process in its group: gone when
 #                      run_bounded returns (70 when the process table cannot be read then, or the KILL is refused);
 #                      an empty group is no error
+#   ended-group        group_clear: a group of ended processes only (a zombie leader) is empty, not a refused KILL
 #   exit-handler       lease.sh --self-test, bounded-capture-exit-trap and bounded-out-clean: a runner's EXIT handler
 #                      that exits still runs the capture directory's cleanup
 gb_self_test() {
@@ -671,6 +678,26 @@ EOF
     [ -z "$p" ] || ! cancel_alive "$p" || { left=alive; kill -KILL "$p"; }
     check "$tag" "$RC|$left|$(grep -c '^\[bound\] cannot' "$t/$tag.err")" "$want"
   done
+  # A group whose only member has ended and is not reaped: macOS answers a KILL to it with EPERM and Linux with success;
+  # either way there is nothing to clear. The parent holds the zombie until the case has run.
+  rm -f "$t/ended.pg"
+  python3 -c 'import os, sys, time
+pid = os.fork()
+if pid == 0:
+    os.setpgid(0, 0)
+    os._exit(0)
+os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+with open(sys.argv[1] + ".tmp", "w") as f:
+    f.write(str(pid))
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+time.sleep(60)' "$t/ended.pg" &
+  p=$!
+  n=0
+  until [ -s "$t/ended.pg" ] || [ "$n" = 100 ]; do sleep 0.1; n=$((n + 1)); done
+  RC=$(group_clear "$(cat "$t/ended.pg" 2> /dev/null)" 2>&1; echo "rc=$?")
+  kill "$p" 2> /dev/null
+  wait "$p" 2> /dev/null
+  check ended-group-is-empty "$RC" rc=0
   echo "gate-bound self-test: $([ "$bad" = 0 ] && echo ok || echo FAIL) ($bad failures)"
   [ "$bad" = 0 ]
 }

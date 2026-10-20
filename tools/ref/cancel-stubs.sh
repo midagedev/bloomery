@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Fixtures shared by the cancellation self-tests. Sourced, never executed.
 
-# CANCEL_TIMEOUT_FORWARD=1 forwards TERM once; unset, the monitor exits and leaves its child's group.
+# CANCEL_TIMEOUT_FORWARD=1 forwards TERM once; unset, the monitor exits and leaves its child's group. SIGALRM is the
+# bound running out, as coreutils' timeout takes it from its own timer: the child is killed and the exit is 124, so a
+# case can end the bound at the moment its unit is ready instead of at a time after the spawn.
 cancel_timeout() {
   cat > "$1" << 'PY'
 #!/usr/bin/env python3
@@ -9,9 +11,11 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 child = None
 pending_term = False
+alarmed = False
 
 
 def stop(*_):
@@ -25,18 +29,29 @@ def stop(*_):
         sys.exit(143)
 
 
+def alarm(*_):
+    global alarmed
+    alarmed = True
+
+
 os.setpgid(0, 0)
 signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGALRM, alarm)
 args = [a for a in sys.argv[1:] if not a.startswith('--kill-after=')]
 child = subprocess.Popen(args[1:], close_fds=False)
 if pending_term:
     child.send_signal(signal.SIGTERM)
-try:
-    rc = child.wait(timeout=float(args[0]))
-except subprocess.TimeoutExpired:
-    child.kill()
-    child.wait()
-    rc = 124
+deadline = time.monotonic() + float(args[0])
+while True:
+    try:
+        rc = child.wait(timeout=0.05)
+        break
+    except subprocess.TimeoutExpired:
+        if alarmed or time.monotonic() >= deadline:
+            child.kill()
+            child.wait()
+            rc = 124
+            break
 sys.exit(128 - rc if rc < 0 else rc)
 PY
 }

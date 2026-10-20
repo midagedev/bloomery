@@ -178,13 +178,17 @@ check archive-tree-bad-rev-names-git "$r|$(ls -A "$T/arc-tmp")" "1|128|-|"
 # a child holding its output, a unit that ignores TERM), under each monitor and in both output forms. The runner holds
 # a lock on fd 9 as tools/nightly/run.sh does and traps TERM. Once the runner is done, nothing of the unit's process
 # group lives and the lock is free. The monitors: tools/ref/cancel-stubs.sh's forwarding stand-in for GNU timeout, none
-# (an empty UNIT_TIMEOUT, a host without timeout) and the host's own timeout when it has one. The bound path shortens
-# the bound and the KILL after it to 0.5 s each; with no monitor a unit has no bound.
+# (an empty UNIT_TIMEOUT, a host without timeout) and the host's own timeout when it has one. With no monitor a unit has
+# no bound. The bound path counts the bound from the unit's readiness, not from its spawn: the unit writes its pid file
+# and its ready line, then sends SIGALRM to its monitor, which is what the monitor's own timer raises when the bound runs
+# out; the monitor's timer (60 s) is only the hang guard, and the KILL after the bound is 0.5 s. A unit never ends by
+# itself in the term and bound paths (its 60 s dwell is also a hang guard): what ends it is the path under test. A slow
+# unit (bound path only) is ready a second after its spawn, as on a loaded machine: the bound still comes from readiness.
 # shellcheck source=tools/ref/cancel-stubs.sh
 source "$ROOT/tools/ref/cancel-stubs.sh"
 mkdir "$T/ru-bin"
 cancel_timeout "$T/ru-bin/stub-timeout"
-printf '#!/bin/sh\nshift 2\nexec "$RU_MON" --kill-after=0.5 0.5 "$@"\n' > "$T/ru-bin/short"
+printf '#!/bin/sh\nshift 2\nexec "$RU_MON" --kill-after=0.5 60 "$@"\n' > "$T/ru-bin/short"
 mkdir "$T/ru-ps"
 printf '#!/bin/sh\nexit 1\n' > "$T/ru-ps/ps"
 chmod +x "$T/ru-bin/stub-timeout" "$T/ru-bin/short" "$T/ru-ps/ps"
@@ -207,12 +211,14 @@ for ru_mon in $ru_monitors; do
   for ru_mode in stream quiet; do
     for ru_path in end bound term; do
       [ -n "$mon" ] || [ "$ru_path" != bound ] || continue
-      for ru_left in none child deaf; do
+      for ru_left in none child deaf slow; do
+        [ "$ru_left" != slow ] || [ "$ru_path" = bound ] || continue
         tag=run-unit-$ru_path-$ru_left-${ru_mon%%:*}-$ru_mode pidf=$T/$tag.pid
         unit='ps -o pgid= -p $$ > "$PIDF";'
-        case $ru_left in child) unit="$unit sleep 1000 &" ;; deaf) unit="$unit trap '' TERM;" ;; esac
+        case $ru_left in child) unit="$unit sleep 1000 &" ;; deaf) unit="$unit trap '' TERM;" ;; slow) unit="sleep 1; $unit" ;; esac
         unit="$unit echo unit-ready;"
-        case $ru_path in end) unit="$unit exit 3" ;; *) unit="$unit sleep 2; echo unit-survived" ;; esac
+        [ "$ru_path" != bound ] || unit="$unit kill -ALRM \$PPID;"
+        case $ru_path in end) unit="$unit exit 3" ;; *) unit="$unit sleep 60; echo unit-survived" ;; esac
         ru_timeout=$mon
         [ "$ru_path" != bound ] || ru_timeout=$T/ru-bin/short
         env UNITS="$HERE/units.sh" GB="$ROOT/tools/gate-bound.sh" UNIT_TIMEOUT="$ru_timeout" RU_MON="$mon" \

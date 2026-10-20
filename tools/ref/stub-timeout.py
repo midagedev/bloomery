@@ -5,7 +5,9 @@ coreutils' `timeout [--kill-after=K] S COMMAND...` and keeps its timing and exit
 S seconds COMMAND's process group gets a TERM, as it does when a TERM is sent here. K seconds after the first of the
 two the group gets a KILL if COMMAND is still there (K 0 or none: no KILL). The exit is 124 when S ran out, 137 when
 KILL ends the group, else COMMAND's status (128 + the signal). The monitor leads the group and ignores its own TERM
-while forwarding it. COMMAND inherits the monitor's open descriptors, including a lease held on descriptor 9."""
+while forwarding it. A SIGALRM is the bound running out, as coreutils' timeout takes it from its own timer, so a case
+can end the bound at the moment its command is ready instead of at a time after the spawn. COMMAND inherits the
+monitor's open descriptors, including a lease held on descriptor 9."""
 import os
 import signal
 import subprocess
@@ -45,9 +47,15 @@ def on_term(*_):
         cleanup(signal.SIGTERM)
 
 
+def on_alarm(*_):
+    global deadline
+    deadline = 0.0
+
+
 # Set before COMMAND starts, so a TERM that comes as it starts reaches its group.
 os.setpgid(0, 0)
 signal.signal(signal.SIGTERM, on_term)
+signal.signal(signal.SIGALRM, on_alarm)
 proc = subprocess.Popen(args[1:], close_fds=False)
 if pending:
     cleanup(signal.SIGTERM)

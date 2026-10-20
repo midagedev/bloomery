@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Test shim, first on PATH in the self-tests of archive_tree (tools/nightly/selftest.sh) and recipes.py's archive():
-# `git archive` to a pipe delivers all but the last 4096 bytes, waits, then delivers the rest, the zero padding past the
-# end-of-archive marker (a tar that stops at the marker has left by then). `git archive -o FILE` and every other command
-# are the real git, SHIM_REAL_GIT.
+# `git archive` to a pipe delivers all but the last 4096 bytes, waits until the tar shim reading the pipe is gone, then
+# delivers the rest, the zero padding past the end-of-archive marker (a tar that stops at the marker has left by then).
+# The tar shim names itself in a file below the pipeline's shell (a parent they share); the waits are hang guards of
+# 30 s. `git archive -o FILE` and every other command are the real git, SHIM_REAL_GIT.
 is_archive=0 to_file=0
 for a in "$@"; do
   case $a in archive) is_archive=1 ;; -o | --output | --output=*) to_file=1 ;; esac
@@ -12,7 +13,17 @@ f=$(mktemp "${TMPDIR:-/tmp}/shim-archive.XXXXXX") || exit 70
 "$SHIM_REAL_GIT" "$@" > "$f" || { rc=$?; rm -f "$f"; exit "$rc"; }
 n=$(($(wc -c < "$f")))
 head -c $((n - 4096)) "$f"
-sleep 0.4
+d=${TMPDIR:-/tmp}/shim-sync.$PPID
+for ((i = 0; i < 3000; i++)); do
+  [ -s "$d/tar.pid" ] && break
+  sleep 0.01
+done
+tp=$(cat "$d/tar.pid" 2> /dev/null)
+for ((i = 0; i < 3000; i++)); do
+  kill -0 "$tp" 2> /dev/null || break
+  sleep 0.01
+done
+rm -rf "$d"
 tail -c 4096 "$f"
 rc=$?
 rm -f "$f"
