@@ -48,6 +48,7 @@ pub const TIER_LINK: &str = "BLOOMERY_TIER_LINK";
 pub const TIER_NODES: &str = "BLOOMERY_TIER_NODES";
 pub const TP_NODES: &str = "BLOOMERY_TP_NODES";
 pub const SCREEN: &str = "BLOOMERY_SCREEN";
+pub const SCHEMAJUMP: &str = "BLOOMERY_SCHEMAJUMP";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -1003,6 +1004,26 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               variable of `LC_ALL`, `LC_CTYPE` and `LANG` names no UTF-8 draws it in plain \
               ASCII. Every seat of `bloomery-serve` acts on it, and so do the per-model \
               binaries that are its seats.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: SCHEMAJUMP,
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("on"),
+        doc: "Structured output (`response_format` `json_schema`, a forced `tool_choice`) on a \
+              server: `on` feeds each run of ids the program fixes (forced text, the rest of a \
+              chosen option) as one prompt call, the jump arm, and reads the next decision from \
+              the row of the step that closes the run; `off` is the step arm, one `next` an id. \
+              Both arms pick the largest allowed logit at every decision and feed every id they \
+              take, so they differ in the engine calls and, by the engine's batch rounding, \
+              possibly in the bits of a decision's row. A request that asks for probabilities \
+              takes the step arm whatever this says. A request's `timings.constrained` counts \
+              the calls of the arm it took. A server takes it as \
+              `serve::SlotConfig::schema_jump`.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

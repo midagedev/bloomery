@@ -8,7 +8,8 @@
 //! the load; the slot holds after an interleaved prompt what an uninterrupted
 //! one leaves; a client gone between the calls ends its request, the slot
 //! freed and the other stream on; `/slots` shows the prompt's positions as its
-//! calls run; and `prompt_ms` is the prompt's own engine time.
+//! calls run; and `prompt_ms` is the prompt's own engine time. A constrained
+//! request's run of fixed ids is a call of its own the same way.
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
@@ -560,4 +561,95 @@ fn hw_prompt_ms_is_the_prompts_own_engine_time() {
         ms < SLOW.as_secs_f64() * 1e3,
         "prompt_ms {ms} counts the rounds between B's calls ({wall:?} in all)"
     );
+}
+
+/// A two-slot server on `engine` whose requests that follow a program take
+/// the jump arm, or the step arm alone.
+fn serve_jump(engine: Yielding, jump: bool) -> (SocketAddr, Arc<Mutex<Vec<Call>>>) {
+    let log = Arc::clone(&engine.log);
+    let slots = serve::SlotConfig {
+        parallel: 2,
+        schema_jump: jump,
+        ..serve::SlotConfig::default()
+    };
+    let server =
+        serve::Server::bind_with("127.0.0.1:0", Box::new(engine), super::config(None), slots)
+            .unwrap_or_else(|e| panic!("bind: {e}"));
+    (server.spawn().expect("spawn"), log)
+}
+
+/// A request for a document whose first run of fixed ids, `{"` and a property
+/// name of 24 bytes, is six quanta.
+fn document() -> Value {
+    let schema = json!({"type": "object", "properties": {
+        "abcdefghijklmnopqrstuvwx": {"type": "boolean"}}});
+    json!({"prompt": "ab", "n_predict": 100, "return_tokens": true,
+        "response_format": {"type": "json_schema",
+            "json_schema": {"name": "r", "schema": schema}}})
+}
+
+/// A constrained request that takes a slot while the other decodes runs each
+/// run of fixed ids as prefill calls of a quantum, a decode round of the
+/// other slot between each two, then the step whose row is the decision's: on
+/// the jump arm it gives the ids it gives on the step arm, in fewer calls.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_run_of_fixed_ids_is_a_call_a_round_beside_a_decoding_stream() {
+    let mut ran = Vec::new();
+    for jump in [true, false] {
+        let log = new_log();
+        let (engine, latch) = holding(0, 2, &log);
+        let (addr, log) = serve_jump(engine, jump);
+        let a = post_bg(addr, completion(A, 60));
+        assert!(latch.wait_entered(BOUND), "A never decoded");
+        let b = std::thread::spawn(move || post(addr, "/completion", &document()));
+        wait_deferred(addr, 1, BOUND);
+        latch.release();
+        let (a, b) = (a.join().expect("a"), b.join().expect("b"));
+        assert_eq!((a.status, b.status), (200, 200), "{} | {}", a.body, b.body);
+        ran.push((a, b, calls(&log)));
+    }
+    let ((a_jump, b_jump, jump), (a_step, b_step, step)) = (&ran[0], &ran[1]);
+    assert_eq!(a_jump.json()["tokens"], a_step.json()["tokens"], "A");
+    assert_eq!(b_jump.json()["tokens"], b_step.json()["tokens"], "B");
+    // B's prompt is the first call on its slot; the calls after it feed runs.
+    let runs: Vec<usize> = pieces(jump, 1)[1..].to_vec();
+    assert!(runs.iter().all(|&n| n <= Q), "{jump:?}");
+    assert!(runs.len() > 2, "the first run is six quanta: {jump:?}");
+    let at: Vec<usize> = (0..jump.len())
+        .filter(|&i| matches!(jump[i], Call::Pre { slot: 1, .. }))
+        .skip(1)
+        .collect();
+    for w in at.windows(2) {
+        assert!(
+            jump[w[0]..w[1]].contains(&Call::Next { slot: 0 }),
+            "no decode round of A between B's calls at {} and {}: {jump:?}",
+            w[0],
+            w[1]
+        );
+    }
+    let on = b_jump.json()["timings"]["constrained"].clone();
+    let off = b_step.json()["timings"]["constrained"].clone();
+    assert_eq!(on["arm"], "jump");
+    assert_eq!(on["prefill_calls"], runs.len());
+    assert_eq!(on["span_ids"], runs.iter().sum::<usize>());
+    assert_eq!(on["decisions"], off["decisions"]);
+    assert_eq!(
+        (
+            off["arm"].as_str(),
+            off["spans"].as_u64(),
+            off["prefill_calls"].as_u64()
+        ),
+        (Some("step"), Some(0), Some(0))
+    );
+    assert!(
+        pieces(step, 1).len() == 1,
+        "the step arm prefills the prompt alone: {step:?}"
+    );
+    let b_calls = |c: &[Call]| {
+        c.iter()
+            .filter(|c| matches!(c, Call::Pre { slot: 1, .. } | Call::Next { slot: 1 }))
+            .count()
+    };
+    assert!(b_calls(jump) < b_calls(step), "{jump:?} | {step:?}");
 }

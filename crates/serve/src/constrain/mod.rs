@@ -19,10 +19,15 @@
 //!
 //! The generation loop ([`crate::genloop`]) asks the walk for each token
 //! through the same logits-row path a banned id takes, and feeds the chosen
-//! id like any other. A constrained request decodes greedily: the pick is the
-//! largest allowed logit, so its answer is plain greedy decoding wherever
-//! greedy already obeys the program. A request that asks for sampling is
-//! refused by name.
+//! id like any other: the step arm. A constrained request decodes greedily:
+//! the pick is the largest allowed logit, so its answer is plain greedy
+//! decoding wherever greedy already obeys the program. A request that asks
+//! for sampling is refused by name.
+//!
+//! The jump arm feeds a run of ids the program fixes ([`Walk::forced_run`])
+//! as one prompt call instead of one step each, and reads the next decision
+//! from the row of the step that closes the run. It takes the same picks as
+//! the step arm from the same rows: nothing is taken back.
 
 mod program;
 mod schema;

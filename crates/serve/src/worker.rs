@@ -778,6 +778,21 @@ impl Worker {
                     let r = a.job.finish(&mut sink_of(&a.events));
                     self.end_request(a, r);
                 }
+                Ok(Need::Fill) => {
+                    // A call of its own, like a prompt's: a quantum of ids
+                    // beside other busy slots. The request steps next round.
+                    let quantum = self.quantum.filter(|_| self.active.len() > 1);
+                    let a = &mut self.active[k];
+                    let called = self
+                        .slot
+                        .select(a.slot)
+                        .and_then(|()| a.job.fill(&mut self.slot, quantum));
+                    if let Err(e) = called {
+                        return Err(self.die(&e));
+                    }
+                    needs.push(Need::Fill);
+                    k += 1;
+                }
                 Ok(need) => {
                     needs.push(need);
                     k += 1;
@@ -788,10 +803,10 @@ impl Worker {
                 }
             }
         }
-        if self.active.is_empty() {
+        let width = needs.iter().filter(|n| !matches!(n, Need::Fill)).count() as u64;
+        if width == 0 {
             return Ok(());
         }
-        let width = self.active.len() as u64;
         {
             let mut s = relock(&self.sh.stats);
             s.n_decode_total += 1;
@@ -813,6 +828,7 @@ impl Worker {
                     .slot
                     .select(a.slot)
                     .and_then(|()| a.job.advance_sampled(&mut self.slot, t)),
+                Need::Fill => unreachable!("a round of fills alone makes no decode call"),
                 Need::Done => unreachable!("a finished request left the running ones"),
             }
         } else {
@@ -848,6 +864,7 @@ impl Worker {
                             drafted: Drafted::default(),
                         });
                     }
+                    Need::Fill => {}
                     Need::Done => unreachable!("a finished request left the running ones"),
                 }
             }
@@ -1189,6 +1206,12 @@ impl Worker {
                 None => return Ok(()),
             },
         };
+        if matches!(need, Need::Fill) {
+            return match self.active[i].job.fill(&mut self.slot, None) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(self.die(&e)),
+            };
+        }
         {
             let mut s = relock(&self.sh.stats);
             s.n_decode_total += 1;
@@ -1205,7 +1228,7 @@ impl Worker {
                 .advance(t, a.job.kept_mut())
                 .map(|d| a.job.advanced(d)),
             Need::Sampled(t) => a.job.advance_sampled(&mut self.slot, t),
-            Need::Done => unreachable!("a finished request left the running ones"),
+            Need::Fill | Need::Done => unreachable!("a fill is run above, a finished request left"),
         };
         match called {
             Ok(()) => Ok(()),

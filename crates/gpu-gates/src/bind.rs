@@ -322,6 +322,9 @@ pub struct Listen<'a> {
     /// The slots the engine made at its open, which the server steps together.
     pub parallel: usize,
     pub queue_depth: Option<usize>,
+    /// Whether a request that follows a program feeds each run of ids the program fixes as one
+    /// prompt call (`Levers::schema_jump`).
+    pub schema_jump: bool,
     /// The embedding model the server holds beside the engine (`--embd-model`), which its
     /// embeddings routes answer from; `None` answers them with a 501.
     pub side: Option<SideEngine>,
@@ -332,6 +335,7 @@ pub struct Listen<'a> {
 /// model beside it. The seat prints its own `listening` record from the bound
 /// server and runs it.
 pub fn bind_server(engine: SeatEngine, l: Listen<'_>) -> Result<Server, ServeError> {
+    let slots = slot_config(&l);
     let config = ServerConfig {
         model_alias: l.alias,
         model_path: l.path.display().to_string(),
@@ -341,16 +345,23 @@ pub fn bind_server(engine: SeatEngine, l: Listen<'_>) -> Result<Server, ServeErr
         slot_save_path: l.slot_save_path,
         api_keys: l.api_keys,
     };
-    let slots = SlotConfig {
-        parallel: l.parallel,
-        queue_depth: l.queue_depth,
-        ..SlotConfig::default()
-    };
     let server = Server::bind_with((l.host, l.port), Box::new(engine), config, slots)?;
     Ok(match l.side {
         Some(side) => server.with_side(Box::new(side)),
         None => server,
     })
+}
+
+/// The server's slots over a seat's [`Listen`]: its count and queue depth, and
+/// whether a request that follows a program feeds each run of ids the program
+/// fixes as one prompt call (`BLOOMERY_SCHEMAJUMP`).
+fn slot_config(l: &Listen<'_>) -> SlotConfig {
+    SlotConfig {
+        parallel: l.parallel,
+        queue_depth: l.queue_depth,
+        schema_jump: l.schema_jump,
+        ..SlotConfig::default()
+    }
 }
 
 /// What set a seat's slot count, the word its `parallel` line's `from=` names:
@@ -532,13 +543,15 @@ impl SeatFlags {
 
     /// [`bind_server`] over `engine` with these flags: the alias the flag
     /// gave or `chat`'s, `chat`'s template, no slot file path, `slots`
-    /// slots the seat made at its open, and the side model beside it.
+    /// slots the seat made at its open, `schema_jump` as the seat's lever
+    /// read it, and the side model beside it.
     pub fn bind(
         self,
         engine: SeatEngine,
         chat: ChatSurface,
         path: &Path,
         slots: usize,
+        schema_jump: bool,
         side: Option<SideEngine>,
     ) -> Result<Server, ServeError> {
         let SeatFlags {
@@ -561,6 +574,7 @@ impl SeatFlags {
                 api_keys,
                 parallel: slots,
                 queue_depth,
+                schema_jump,
                 side,
             },
         )
@@ -3126,10 +3140,84 @@ impl Drop for SeatEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, Link, Reply};
+    use super::{Cmd, Link, Listen, Reply, slot_config};
+    use std::path::Path;
     use std::sync::mpsc;
 
     const N_VOCAB: usize = 8;
+
+    /// A seat's `Listen` over a model file.
+    fn listen(schema_jump: bool) -> Listen<'static> {
+        Listen {
+            host: "127.0.0.1",
+            port: 0,
+            alias: "m".to_owned(),
+            path: Path::new("m.gguf"),
+            template: String::new(),
+            slot_save_path: None,
+            api_keys: serve::flag::ApiKeys::default(),
+            parallel: 2,
+            queue_depth: Some(3),
+            schema_jump,
+            side: None,
+        }
+    }
+
+    /// `BLOOMERY_SCHEMAJUMP` reaches the slots a seat binds: the slots take
+    /// what the seat's `Listen` says whichever way it says it, and every seat
+    /// that binds a server reads the lever for its `Listen` and lists it among
+    /// the levers it acts on (a seat that reads an unlisted lever panics at its
+    /// bind).
+    #[test]
+    fn schemajump_reaches_the_slots_a_seat_binds() {
+        for on in [true, false] {
+            let slots = slot_config(&listen(on));
+            assert_eq!(slots.schema_jump, on);
+            assert_eq!((slots.parallel, slots.queue_depth), (2, Some(3)));
+        }
+        const SEATS: &[(&str, &str, &str)] = &[
+            (
+                "glm",
+                include_str!("bin/shared/serve_seats/glm.rs"),
+                include_str!("bin/shared/serve_seats/glm.rs"),
+            ),
+            (
+                "qwen3",
+                include_str!("bin/shared/serve_seats/qwen3.rs"),
+                include_str!("bin/shared/serve_seats/qwen3.rs"),
+            ),
+            (
+                "ds41",
+                include_str!("bin/shared/serve_seats/ds41.rs"),
+                include_str!("bin/shared/ds41_serve_levers.rs"),
+            ),
+            (
+                "qwen38",
+                include_str!("bin/shared/serve_seats/qwen38.rs"),
+                include_str!("bin/shared/qwen38_levers.rs"),
+            ),
+            (
+                "mimo2",
+                include_str!("bin/shared/serve_seats/mimo2.rs"),
+                include_str!("bin/shared/serve_seats/mimo2.rs"),
+            ),
+            (
+                "nemotron",
+                include_str!("bin/shared/serve_seats/nemotron.rs"),
+                include_str!("bin/shared/serve_seats/nemotron.rs"),
+            ),
+        ];
+        for (seat, source, levers) in SEATS {
+            assert!(
+                source.contains("levers.schema_jump()"),
+                "the {seat} seat binds a server without reading BLOOMERY_SCHEMAJUMP"
+            );
+            assert!(
+                levers.contains("SCHEMAJUMP"),
+                "the {seat} seat reads BLOOMERY_SCHEMAJUMP but does not list it among its levers"
+            );
+        }
+    }
 
     /// The factory's sampler is the sampler crate's chain over the request's
     /// parameters, and a parameter the chain refuses (a non-finite

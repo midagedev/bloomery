@@ -98,8 +98,13 @@ const USAGE: &str = "usage: bloomery-serve --model nemotron [-m PATH | --hf <rep
                      [--place W] [--plan] [--queue-depth Q] [--api-key KEY] \
                      [--api-key-file FNAME]";
 
-/// The levers this seat acts on: the plan's card budget and the start screen.
-pub const ACTS_ON: &[&str] = &[bloomery_levers::CARD_BUDGET, bloomery_levers::SCREEN];
+/// The levers this seat acts on: the plan's card budget, the start screen and how a
+/// structured-output request's fixed runs are fed.
+pub const ACTS_ON: &[&str] = &[
+    bloomery_levers::CARD_BUDGET,
+    bloomery_levers::SCREEN,
+    bloomery_levers::SCHEMAJUMP,
+];
 
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the nemotron seat runs no prompt cache";
@@ -353,7 +358,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         )?,
         _ => unreachable!("the arch check above refused every other architecture"),
     };
-    let server = a.bind(engine, chat, &path, slots, None)?;
+    let server = a.bind(engine, chat, &path, slots, levers.schema_jump(), None)?;
     Record::new(&record::LISTENING_NEMOTRON)
         .w("place", place.name())
         .u("ctx", slot_ctx)

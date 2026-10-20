@@ -352,13 +352,13 @@ pub(crate) enum StepError {
     NoAllowed { taken: usize, why: String },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Frame {
     prog: Arc<Program>,
     at: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Ctx {
     /// Between steps.
     Idle,
@@ -376,8 +376,18 @@ enum Ctx {
     Done,
 }
 
+/// How many ids a walk picked from a row, by kind (the ids the program fixes
+/// and the stop pick are in neither).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Picks {
+    /// Among the children of a choice's node, which has more than one.
+    pub decisions: usize,
+    /// Inside a free string, its end token included.
+    pub free: usize,
+}
+
 /// One request's position in its program.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Walk {
     frames: Vec<Frame>,
     ctx: Ctx,
@@ -385,6 +395,7 @@ pub(crate) struct Walk {
     forced: Vec<u32>,
     stops: Arc<[u32]>,
     taken: usize,
+    picks: Picks,
 }
 
 impl Walk {
@@ -404,7 +415,13 @@ impl Walk {
             },
             stops: Arc::clone(&c.stops),
             taken: 0,
+            picks: Picks::default(),
         }
+    }
+
+    /// The ids picked from a row so far, by kind.
+    pub(crate) fn picks(&self) -> Picks {
+        self.picks
     }
 
     /// Moves to the next decision, or to the next forced id.
@@ -460,6 +477,20 @@ impl Walk {
         }
     }
 
+    /// The run of ids the program fixes from here: forced ids and the only
+    /// children of a choice's nodes, up to the next decision, the next free
+    /// string or the program's end, and at most `max` of them. The walk stands
+    /// past them, as [`Walk::choose`] would leave it after each; a run is
+    /// what `choose` gives for as long as [`Walk::fixed_next`] holds, so it
+    /// reads no row.
+    pub(crate) fn forced_run(&mut self, max: usize) -> Result<Vec<u32>, StepError> {
+        let mut run = Vec::new();
+        while run.len() < max && self.fixed_next() {
+            run.push(self.choose(&[])?);
+        }
+        Ok(run)
+    }
+
     /// The next id: the forced one, or the largest logit of `row` among the
     /// ids the program allows here; the walk then stands past it. A stop id
     /// before the program is spent is an error.
@@ -505,6 +536,7 @@ impl Walk {
             return Err(self.stuck("a choice context stands on another step"));
         };
         let kids = &t.nodes[node].kids;
+        let several = kids.len() > 1;
         let picked = t.only_kid(node).or_else(|| {
             sampling::argmax_in(row, kids.iter().map(|&(id, _)| id))
                 .and_then(|id| kids.iter().find(|&&(k, _)| k == id).map(|&(_, c)| (id, c)))
@@ -513,6 +545,7 @@ impl Walk {
             self.ctx = Ctx::Trie { prog, step, node };
             return Err(self.stuck("the row holds none of the option ids"));
         };
+        self.picks.decisions += usize::from(several);
         match t.nodes[child].leaf {
             Some(alt) => {
                 if let Some(sub) = &t.subs[alt] {
@@ -570,6 +603,7 @@ impl Walk {
                 "the row holds no token a free string may take"
             }));
         };
+        self.picks.free += 1;
         match f.end_ids.binary_search(&id) {
             Ok(p) => self.forced = f.ends[p].1.iter().rev().copied().collect(),
             Err(_) => {

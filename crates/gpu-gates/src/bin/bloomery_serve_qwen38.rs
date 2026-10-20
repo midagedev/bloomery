@@ -156,6 +156,7 @@ mod tests {
         ("qwen38_experts", &[bloomery_levers::QWEN38_EXPERTS]),
         ("residency", &[bloomery_levers::RESIDENCY]),
         ("route_trace", &[bloomery_levers::ROUTE_TRACE]),
+        ("schema_jump", &[bloomery_levers::SCHEMAJUMP]),
         ("screen", &[bloomery_levers::SCREEN]),
         ("step_stats", &[bloomery_levers::STEP_STATS]),
         ("xstream", &[bloomery_levers::XSTREAM]),

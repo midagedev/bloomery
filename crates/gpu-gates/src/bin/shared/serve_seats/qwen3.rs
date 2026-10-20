@@ -1324,6 +1324,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         bloomery_levers::QWEN3_KV,
         bloomery_levers::STEP_STATS,
         bloomery_levers::SCREEN,
+        bloomery_levers::SCHEMAJUMP,
     ];
     if placed {
         acts_on.extend(q3place::PLACED_LEVERS);
@@ -1486,6 +1487,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         Q3Load::Placed { q, .. } => q.name(),
     }
     .to_owned();
+    let schema_jump = levers.schema_jump();
     let engine = match arch {
         Family::Qwen3moe => SeatEngine::spawn(
             move || Q3::<Body>::open(&open, slot_ctx, slots, pass, load, &levers, (kv, vision)),
@@ -1519,6 +1521,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             api_keys: a.api_keys,
             parallel: slots,
             queue_depth: a.queue_depth,
+            schema_jump,
             side,
         },
     )?;

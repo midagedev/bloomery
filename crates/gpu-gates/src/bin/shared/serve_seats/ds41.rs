@@ -734,6 +734,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             api_keys: a.api_keys,
             parallel: slots.get(),
             queue_depth: a.queue_depth,
+            schema_jump: levers.schema_jump(),
             side,
         },
     )?;

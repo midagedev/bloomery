@@ -2,6 +2,8 @@
 //! program's pick at every token, and each format's inverse read back by its
 //! own scanner.
 
+use std::io;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -11,7 +13,9 @@ use super::{Ask, Constraint, Part, Refusal, Vocab, Walk, request};
 use crate::api::logprobs::Ask as Probs;
 use crate::dsml::{ChatParser, DsmlScan, MarkupError, Spelling, ToolFormat, Tools};
 use crate::engine::{Decoder, Engine, EngineError, SamplingParams, Tokenizer};
-use crate::genloop::{GenParams, Outcome, Slot, StopKind, Timings, generate};
+use crate::genloop::{
+    Event, GenError, GenParams, Outcome, Slot, StopKind, Timings, generate, generate_in_quanta,
+};
 use crate::glmxml::{ArgTypes, GlmScan};
 use crate::hermes::HermesScan;
 use crate::mock::SPECIALS;
@@ -218,12 +222,14 @@ fn run_read(
     logprobs: Option<Probs>,
 ) -> (Outcome, Vec<bool>) {
     let read = Arc::new(Mutex::new(Vec::new()));
+    // The rows follow the engine's step count, which is the step arm's.
     let mut slot = Slot::new(Box::new(Rows {
         tok: Arc::clone(tok),
         want: want.to_vec(),
         k: 0,
         read: Arc::clone(&read),
-    }));
+    }))
+    .schema_jump(false);
     let mut p = params(constraint, think);
     p.logprobs = logprobs;
     let o = generate(
@@ -1116,4 +1122,536 @@ fn a_fixed_id_asks_for_no_row() {
     let (o, read) = run_read(&tok, Some(c), ThinkEntry::Closed, &want, Some(probs));
     assert_eq!(o.content, "true");
     assert_eq!(read, [true; 5]);
+}
+
+// The jump arm: a run of ids the program fixes is one prefill call, the step
+// that closes it gives the next decision's row.
+
+/// The prompt every jump test generates from: two ids, the first fed by the
+/// prompt's call and the last by its step.
+const PROMPT: &str = "hi";
+
+/// An engine call after the prompt's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Call {
+    Prefill(usize),
+    Next,
+}
+
+/// What an engine was fed.
+#[derive(Default)]
+struct Seen {
+    /// Every id fed since the last reset, in order.
+    fed: Vec<u32>,
+    calls: Vec<Call>,
+}
+
+/// Ids to raise in a row, by the ids generated so far where they are raised.
+type Peaks = Vec<(Vec<u32>, Vec<(u32, f32)>)>;
+
+/// An engine whose row is a function of the ids it has been fed and nothing
+/// else: a pseudo-random floor of the whole context, and the `peaks` that name
+/// ids to raise at an exact context (the ids generated so far). The same
+/// context gives the same row whichever calls fed it, so the two arms meet the
+/// same rows at the same decisions.
+struct Scripted {
+    tok: Arc<dyn Tokenizer>,
+    seed: u64,
+    peaks: Peaks,
+    ctx_max: usize,
+    seen: Arc<Mutex<Seen>>,
+}
+
+impl Scripted {
+    fn row(&self, fed: &[u32]) -> Vec<f32> {
+        let hash = fed.iter().fold(self.seed ^ 0xcbf2_9ce4_8422_2325, |h, &i| {
+            (h ^ u64::from(i)).wrapping_mul(0x0100_0000_01b3)
+        });
+        let mut row: Vec<f32> = (0..self.tok.n_vocab() as u64)
+            .map(|i| {
+                let x = (hash ^ i.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                    .wrapping_mul(0xff51_afd7_ed55_8ccd);
+                ((x >> 40) % 1000) as f32 * 0.004 - 2.0
+            })
+            .collect();
+        let made = &fed[self.tok.encode(PROMPT).len()..];
+        for (at, peaks) in &self.peaks {
+            if at == made {
+                for &(id, v) in peaks {
+                    row[id as usize] = v;
+                }
+            }
+        }
+        row
+    }
+}
+
+impl Engine for Scripted {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        Arc::clone(&self.tok)
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        let mut s = self.seen.lock().expect("seen");
+        s.fed.extend_from_slice(ids);
+        s.calls.push(Call::Prefill(ids.len()));
+        Ok(())
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        let row = {
+            let mut s = self.seen.lock().expect("seen");
+            s.fed.push(last);
+            s.calls.push(Call::Next);
+            self.row(&s.fed)
+        };
+        let best = sampling::argmax(&row);
+        if let Some(out) = out {
+            out.copy_from_slice(&row);
+        }
+        Ok(best)
+    }
+    fn reset(&mut self) -> Result<(), EngineError> {
+        self.seen.lock().expect("seen").fed.clear();
+        Ok(())
+    }
+    fn ctx_max(&self) -> usize {
+        self.ctx_max
+    }
+    fn describe(&self) -> String {
+        "scripted".to_owned()
+    }
+}
+
+/// One generation from [`PROMPT`] on a [`Scripted`] engine, the jump arm on or
+/// off, with the engine's calls after the prompt's step and the ids it was fed.
+struct Ran {
+    out: Outcome,
+    calls: Vec<Call>,
+    fed: Vec<u32>,
+}
+
+/// What the `Scripted` engine of `seed` is asked, the jump arm `jump`, and
+/// the request's `n_predict`.
+fn scripted(
+    tok: &Arc<dyn Tokenizer>,
+    c: &Constraint,
+    seed: u64,
+    peaks: Peaks,
+    jump: bool,
+    n_predict: i64,
+) -> Ran {
+    scripted_in(tok, c, seed, peaks, jump, n_predict, 4096)
+}
+
+/// [`scripted`] on an engine whose context holds `ctx_max` positions.
+fn scripted_in(
+    tok: &Arc<dyn Tokenizer>,
+    c: &Constraint,
+    seed: u64,
+    peaks: Peaks,
+    jump: bool,
+    n_predict: i64,
+    ctx_max: usize,
+) -> Ran {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let mut slot = Slot::new(Box::new(Scripted {
+        tok: Arc::clone(tok),
+        seed,
+        peaks,
+        ctx_max,
+        seen: Arc::clone(&seen),
+    }))
+    .schema_jump(jump);
+    let mut p = params(Some(c.clone()), ThinkEntry::Closed);
+    p.n_predict = n_predict;
+    let out = generate(
+        &mut slot,
+        &sampling::reference_factory(),
+        &tok.encode(PROMPT),
+        &p,
+        &mut |_| Ok(()),
+        &mut |_| {},
+        &mut Timings::default(),
+    )
+    .expect("a generation");
+    let s = seen.lock().expect("seen");
+    let first = s
+        .calls
+        .iter()
+        .position(|c| *c == Call::Next)
+        .expect("the prompt's step");
+    Ran {
+        out,
+        calls: s.calls[first + 1..].to_vec(),
+        fed: s.fed.clone(),
+    }
+}
+
+/// The ids a generation fed are the prompt's and every id it generated but
+/// the stop: the prompt cache holds the answer.
+fn assert_fed_the_answer(tok: &Arc<dyn Tokenizer>, r: &Ran) {
+    let mut want = tok.encode(PROMPT);
+    let (stop, body) = r.out.tokens.split_last().expect("a stop");
+    assert!(tok.stops().contains(stop), "ends on {stop}");
+    want.extend_from_slice(body);
+    assert_eq!(r.fed, want);
+}
+
+/// A program of text parts compiled on `tok`.
+fn compiled(tok: &Arc<dyn Tokenizer>, parts: &[Part]) -> Constraint {
+    let vocab = Vocab::read(&**tok);
+    let prog = program::compile(
+        parts,
+        &Env {
+            tok: &**tok,
+            vocab: &vocab,
+        },
+    )
+    .expect("a program");
+    Constraint::new(prog, tok.encode("</think>\n\n"), Arc::clone(vocab.stops()))
+}
+
+/// The jump arm takes the ids the step arm takes, over programs that mix
+/// forced text, choices (one-token and many-token options), free strings whose
+/// end token absorbs the front of the text after it, and a tool call, on rows
+/// that differ by seed; both feed the prompt cache the same ids.
+#[test]
+fn the_jump_arm_takes_the_step_arms_ids() {
+    let merged: Arc<dyn Tokenizer> =
+        Arc::new(Pieces(Arc::new(PieceTok(&["\", \"", "\"}", "\","]))));
+    let schema = json!({"type": "object", "properties": {
+        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+        "tag": {"type": "string", "maxLength": 6},
+        "day": {"type": "integer", "enum": [1, 2, 3]},
+        "ok": {"type": "boolean"},
+        "kind": {"const": "weather"},
+        "note": {"type": "string", "maxLength": 5}}});
+    let call = json!({"tools": forecast_tools(), "tool_choice": "required"});
+    let mut spanned = 0;
+    for (tok, format, body) in [
+        (bytes_tok(), ToolFormat::Hermes, schema_body(&schema)),
+        (
+            Arc::clone(&merged),
+            ToolFormat::Hermes,
+            schema_body(&schema),
+        ),
+        (bytes_tok(), ToolFormat::QwenXml, call.clone()),
+        (stop_tok(), ToolFormat::GlmXml, call.clone()),
+    ] {
+        let c = build(&tok, format, &body).expect("served");
+        for seed in 0..8 {
+            let step = scripted(&tok, &c, seed, Vec::new(), false, 400);
+            let jump = scripted(&tok, &c, seed, Vec::new(), true, 400);
+            assert_eq!(jump.out.tokens, step.out.tokens, "{format:?} seed {seed}");
+            assert_eq!(jump.out.content, step.out.content, "{format:?} seed {seed}");
+            assert_eq!(jump.out.stop, step.out.stop, "{format:?} seed {seed}");
+            assert_fed_the_answer(&tok, &step);
+            assert_fed_the_answer(&tok, &jump);
+            let (js, ss) = (
+                jump.out.timings.jump.unwrap(),
+                step.out.timings.jump.unwrap(),
+            );
+            assert_eq!((js.decisions, js.free_steps), (ss.decisions, ss.free_steps));
+            assert!(
+                js.next_calls + js.prefill_calls < ss.next_calls,
+                "{format:?} seed {seed}"
+            );
+            spanned += js.spans;
+        }
+    }
+    assert!(spanned > 0);
+}
+
+/// A first step's lead that a later step reverses: with p(a) = .6, p(b|a) =
+/// p(d|a) = .5 and p(c) = .4, and a forced end after every option, greedy
+/// takes a then b (the lowest id of a tie), a path of .3 against c's .4. The
+/// pick is the masked argmax at each node, in both arms, not the option with
+/// the largest probability.
+#[test]
+fn a_lead_that_reverses_later_still_picks_greedy() {
+    let tok = bytes_tok();
+    let at = |ch: char| BYTES + u32::from(u8::try_from(ch).expect("ascii"));
+    let (a, b, c, d) = (at('a'), at('b'), at('c'), at('d'));
+    let alt = |text: &str| program::Alt {
+        text: text.to_owned(),
+        then: Vec::new(),
+    };
+    let con = compiled(
+        &tok,
+        &[
+            Part::Pick(vec![alt("ab"), alt("ad"), alt("c")]),
+            Part::Text("xyz!".to_owned()),
+        ],
+    );
+    let low = -20.0;
+    let peaks = vec![
+        (
+            vec![],
+            vec![(a, 0.6f32.ln()), (c, 0.4f32.ln()), (b, low), (d, low)],
+        ),
+        (vec![a], vec![(b, 0.5f32.ln()), (d, 0.5f32.ln())]),
+    ];
+    let want = with_eos(&tok, [vec![a, b], ids(&tok, "xyz!")].concat());
+    for jump in [false, true] {
+        let r = scripted(&tok, &con, 3, peaks.clone(), jump, 400);
+        assert_eq!(r.out.tokens, want, "jump {jump}");
+        assert_eq!(r.out.content, "abxyz!");
+        assert_fed_the_answer(&tok, &r);
+        let j = r.out.timings.jump.expect("a constrained request");
+        assert_eq!(j.decisions, 2);
+        assert_eq!(j.spans, usize::from(jump));
+    }
+}
+
+/// A forced call with eight functions of two enum arguments each, whose
+/// options differ at their first byte (the shape of an agent's tool call),
+/// on a vocabulary of one id a byte. The jump arm is four spans, each a
+/// prefill of its run but the last id and a step of that id, whose row is the
+/// next decision's:
+///
+/// - span 0: the call's opening text, `<tool_call>\n<function=`, taken from
+///   the walk's first id; its step reads the function's decision;
+/// - span 1: the function's name but its first byte, and the markup up to the
+///   first argument's value; its step reads that value's decision;
+/// - span 2: the value but its first byte, and the markup up to the second
+///   value; its step reads that decision;
+/// - span 3: the second value but its first byte, and the closing text; its
+///   step reads the stop.
+///
+/// With D the indices of the three decisions in the call's text of E ids, the
+/// spans feed D0 - 1, D1 - D0 - 1, D2 - D1 - 1 and E - D2 - 1 ids: E - 4, one
+/// step each, against E steps: 4 prefills and 4 steps, a prefill and a step
+/// for each of the 3 decisions plus the closing text. Counting the opening
+/// text inside the prompt's call and the closing text as a free tail gives
+/// 3 steps and 2 prefills (one step a decision, one prefill a run between two
+/// decisions); neither holds. The prompt's call ends at the template's
+/// generation prompt, so the opening text is the program's first generated
+/// ids and costs span 0; the stop is picked from a row, so the closing text
+/// is fed and its step is the row the stop is read from (the cache holds the
+/// answer without the stop).
+#[test]
+fn a_forced_call_is_fed_in_the_planned_calls() {
+    let tok = bytes_tok();
+    let fun = |name: &str| {
+        json!({"type": "function", "function": {"name": name, "parameters": {
+            "type": "object", "properties": {
+                "color": {"type": "string", "enum": ["red", "green", "blue"]},
+                "mode": {"type": "string", "enum": ["yes", "no"]}}}}})
+    };
+    let tools: Vec<Value> = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+    ]
+    .iter()
+    .map(|n| fun(n))
+    .collect();
+    let c = build(
+        &tok,
+        ToolFormat::QwenXml,
+        &json!({"tools": tools, "tool_choice": "required"}),
+    )
+    .expect("served");
+    let text = "<tool_call>\n<function=bravo>\n<parameter=color>\ngreen\n</parameter>\n\
+                <parameter=mode>\nno\n</parameter>\n</function>\n</tool_call>";
+    let want = ids(&tok, text);
+    let e = want.len();
+    // The decisions: the function's first byte, then each value's.
+    let d = [
+        text.find("bravo").unwrap(),
+        text.find("green").unwrap(),
+        text.find("no\n").unwrap(),
+    ];
+    // Rows that favour the call on its decisions (every other id is forced
+    // or masked).
+    let peaks: Vec<_> = d
+        .iter()
+        .map(|&at| (want[..at].to_vec(), vec![(want[at], 9.0)]))
+        .collect();
+    let step = scripted(&tok, &c, 1, peaks.clone(), false, 400);
+    let jump = scripted(&tok, &c, 1, peaks, true, 400);
+    for r in [&step, &jump] {
+        assert_eq!(r.out.tokens, with_eos(&tok, want.clone()));
+        assert_eq!(r.out.content, text);
+        assert_fed_the_answer(&tok, r);
+    }
+    assert_eq!(step.calls, vec![Call::Next; e]);
+    let mut planned = Vec::new();
+    for len in [d[0] - 1, d[1] - d[0] - 1, d[2] - d[1] - 1, e - d[2] - 1] {
+        planned.extend([Call::Prefill(len), Call::Next]);
+    }
+    assert_eq!(jump.calls, planned);
+    let (s, j) = (
+        step.out.timings.jump.unwrap(),
+        jump.out.timings.jump.unwrap(),
+    );
+    assert_eq!(
+        (s.arm, s.spans, s.span_ids, s.prefill_calls, s.next_calls),
+        (false, 0, 0, 0, e)
+    );
+    assert_eq!(
+        (j.arm, j.spans, j.span_ids, j.prefill_calls, j.next_calls),
+        (true, 4, e - 4, 4, 4)
+    );
+    assert_eq!(
+        (s.decisions, s.free_steps, j.decisions, j.free_steps),
+        (3, 0, 3, 0)
+    );
+    let t = jump.out.timings.to_json();
+    assert_eq!(t["constrained"]["arm"], "jump");
+    assert_eq!(t["constrained"]["prefill_calls"], 4);
+}
+
+/// With the arm off a constrained request makes the step arm's calls and
+/// only those: one step for every id it feeds, no prefill.
+#[test]
+fn the_jump_arm_off_makes_the_step_arms_calls() {
+    let tok = bytes_tok();
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&weather_schema())).expect("served");
+    let r = scripted(&tok, &c, 5, Vec::new(), false, 400);
+    let fed = r.out.tokens.len() - 1;
+    assert_eq!(r.calls, vec![Call::Next; fed]);
+    let j = r.out.timings.jump.expect("a constrained request");
+    assert_eq!(
+        (j.arm, j.spans, j.span_ids, j.prefill_calls, j.next_calls),
+        (false, 0, 0, 0, fed)
+    );
+    let on = scripted(&tok, &c, 5, Vec::new(), true, 400);
+    assert_eq!(on.out.tokens, r.out.tokens);
+    assert!(on.calls.iter().any(|c| matches!(c, Call::Prefill(_))));
+    // Free text carries no counts.
+    let plain = run(&tok, None, ThinkEntry::Closed, &ids(&tok, "ab"));
+    assert!(plain.timings.jump.is_none());
+    assert!(plain.timings.to_json().get("constrained").is_none());
+}
+
+/// A free string's end token takes the front of the text after it, and the
+/// rest of that text is the next run's: the ids are those the text spells,
+/// with the end token merged, none dropped and none repeated.
+#[test]
+fn a_free_strings_end_hands_the_rest_to_the_run() {
+    const PIECE: &str = "\", \"";
+    let pieces = Arc::new(PieceTok(&[PIECE, "\"}", "\","]));
+    let merged = pieces.piece(PIECE);
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(pieces));
+    let schema = json!({"type": "object", "properties": {
+        "a": {"type": "string"}, "bb": {"type": "boolean"}, "c": {"type": "string"}}});
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&schema)).expect("served");
+    let x = BYTES + u32::from(b'x');
+    // The first string says `x` and ends on the merged piece; the rest of
+    // `", "bb": ` is forced; the boolean says true; the second string ends at
+    // once on `"}`.
+    let mut made = ids(&tok, "{\"a\": \"");
+    let at_free = made.len();
+    made.push(x);
+    made.push(merged);
+    made.extend(ids(&tok, "bb\": "));
+    let at_bool = made.len();
+    made.extend(ids(&tok, "true, \"c\": \""));
+    let at_end = made.len();
+    let close = tok.encode("\"}")[0];
+    let peaks = vec![
+        (made[..at_free].to_vec(), vec![(x, 9.0)]),
+        (made[..=at_free].to_vec(), vec![(merged, 9.0)]),
+        (made[..at_bool].to_vec(), vec![(made[at_bool], 9.0)]),
+        (made[..at_end].to_vec(), vec![(close, 9.0)]),
+    ];
+    let mut want = made.clone();
+    want.push(close);
+    for jump in [false, true] {
+        let r = scripted(&tok, &c, 2, peaks.clone(), jump, 400);
+        assert_eq!(
+            r.out.content, "{\"a\": \"x\", \"bb\": true, \"c\": \"\"}",
+            "jump {jump}"
+        );
+        assert_eq!(r.out.tokens, with_eos(&tok, want.clone()), "jump {jump}");
+        assert_fed_the_answer(&tok, &r);
+    }
+}
+
+/// The ids a request may still generate and the positions the cache has left
+/// bound a run: the jump arm stops where the step arm does, on the same ids.
+#[test]
+fn a_run_is_cut_at_the_budget_and_the_context() {
+    let tok = bytes_tok();
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&weather_schema())).expect("served");
+    let mut cut = 0;
+    for n_predict in [1, 2, 3, 4, 7, 12, 33] {
+        let step = scripted(&tok, &c, 4, Vec::new(), false, n_predict);
+        let jump = scripted(&tok, &c, 4, Vec::new(), true, n_predict);
+        assert_eq!(jump.out.tokens, step.out.tokens, "n_predict {n_predict}");
+        assert_eq!(jump.out.stop, StopKind::Limit);
+        assert_eq!(jump.fed, step.fed, "n_predict {n_predict}");
+        cut += jump.out.timings.jump.unwrap().spans;
+    }
+    assert!(cut > 0);
+    for ctx_max in [3, 4, 5, 9, 20, 41] {
+        let step = scripted_in(&tok, &c, 4, Vec::new(), false, 400, ctx_max);
+        let jump = scripted_in(&tok, &c, 4, Vec::new(), true, 400, ctx_max);
+        assert_eq!(jump.out.tokens, step.out.tokens, "ctx {ctx_max}");
+        assert_eq!(jump.out.truncated, step.out.truncated, "ctx {ctx_max}");
+        assert_eq!(jump.fed, step.fed, "ctx {ctx_max}");
+        assert!(jump.fed.len() <= ctx_max);
+    }
+}
+
+/// A run of fixed ids fed in calls of a quantum asks the sink between the
+/// calls, as a prompt's calls do: a client that went away ends the generation
+/// at the next call with the rest of the run unfed, and one that stays gets
+/// the whole run.
+#[test]
+fn a_run_fed_in_quanta_asks_the_sink_between_calls() {
+    let tok = bytes_tok();
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&weather_schema())).expect("served");
+    let run = |gone_at: usize| {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let mut slot = Slot::new(Box::new(Scripted {
+            tok: Arc::clone(&tok),
+            seed: 4,
+            peaks: Vec::new(),
+            ctx_max: 4096,
+            seen: Arc::clone(&seen),
+        }))
+        .schema_jump(true);
+        let p = params(Some(c.clone()), ThinkEntry::Closed);
+        let mut asked = 0;
+        let (r, _) = generate_in_quanta(
+            &mut slot,
+            &sampling::reference_factory(),
+            &tok.encode(PROMPT),
+            &p,
+            NonZeroUsize::new(2),
+            &mut |ev| {
+                if matches!(ev, Event::Text("", _)) {
+                    asked += 1;
+                    if asked == gone_at {
+                        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "gone"));
+                    }
+                }
+                Ok(())
+            },
+            &mut |_| {},
+        );
+        let calls = seen.lock().expect("seen").calls.clone();
+        let prompt_step = calls
+            .iter()
+            .position(|c| *c == Call::Next)
+            .expect("the prompt");
+        (r, asked, calls[prompt_step + 1..].to_vec())
+    };
+    let (whole, asked, calls) = run(usize::MAX);
+    whole.expect("a client that stays gets the answer");
+    assert!(
+        asked > 2,
+        "the first run is fed in several calls: asked {asked}"
+    );
+    assert!(calls.len() > 2);
+    let (gone, asked, calls) = run(2);
+    assert!(
+        matches!(gone, Err(GenError::Client(_))),
+        "a failed sink ends the generation"
+    );
+    assert_eq!(asked, 2);
+    assert_eq!(
+        calls,
+        vec![Call::Prefill(2); 2],
+        "no call after the failed one"
+    );
 }

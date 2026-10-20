@@ -335,6 +335,7 @@ mod gate {
         bloomery_levers::RESIDENCY,
         bloomery_levers::STEP_STATS,
         bloomery_levers::SCREEN,
+        bloomery_levers::SCHEMAJUMP,
     ];
 
     const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted|slots|unset|prefix \

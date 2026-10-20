@@ -540,9 +540,26 @@ fn accessors_read_their_rows() {
             HOST_LANES,
             GEN_SLOTS,
             FORCE_IDS,
-            SCREEN
+            SCREEN,
+            SCHEMAJUMP
         ]
     );
+}
+
+/// `BLOOMERY_SCHEMAJUMP` is on unset, `off` is the step arm, and a word that is
+/// neither is refused by name.
+#[test]
+fn schemajump_is_on_unless_off() {
+    let set = read(&env::<&str>(&[]), Scope::Every).unwrap();
+    assert!(set.schema_jump());
+    let set = read(&env(&[(SCHEMAJUMP, "on")]), Scope::Every).unwrap();
+    assert!(set.schema_jump());
+    let set = read(&env(&[(SCHEMAJUMP, "off")]), Scope::Every).unwrap();
+    assert!(!set.schema_jump());
+    let Err(e) = read(&env(&[(SCHEMAJUMP, "0")]), Scope::Every) else {
+        panic!("a word the row does not take is refused");
+    };
+    assert!(e.to_string().contains("BLOOMERY_SCHEMAJUMP"), "{e}");
 }
 
 /// `BLOOMERY_MTP_WIDTH` takes its two words, unset is no word (a run that

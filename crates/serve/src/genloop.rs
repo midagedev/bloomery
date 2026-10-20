@@ -47,6 +47,20 @@
 //! wants probabilities. A pick the program cannot make ends the request with a
 //! named error ([`GenError::Constrained`]).
 //!
+//! That is the step arm. The jump arm (on by default, [`Slot::schema_jump`])
+//! feeds a run of ids the program fixes as one [`Engine::prefill`] instead of a
+//! step each ([`Need::Fill`]): the id just taken and the run but its last id
+//! are the call's, and the run's last id is the step that follows, whose row
+//! is the next decision's. The call is the engine thread's, run like a
+//! prompt's call (a quantum of ids a round beside other busy slots), never
+//! inside a step. Every id fed is an id of the answer, so nothing is taken
+//! back, the closing text after the last decision included: it is fed so that
+//! the stop id is picked from a row as the step arm picks it, and the prompt
+//! cache holds every id of the answer but the stop. A request that asks for
+//! probabilities reads every row, so it takes the step arm. A run shorter than
+//! [`MIN_FILL`] ids is stepped: a call of one id is no cheaper than the step
+//! it replaces.
+//!
 //! A request runs as a [`Gen`], one engine call at a time, so the engine
 //! thread can make one call of several slots' steps: each running request's
 //! next step a row of one [`Engine::step_slots`], its next drafted pass a row
@@ -144,13 +158,35 @@ pub(crate) struct Timings {
     /// The passes that verified a proposal (llama-server's
     /// `n_draft_verif_steps`; not a `timings` field).
     pub draft_passes: usize,
+    /// What a request that follows a program asked of the engine after its
+    /// prompt (ours; `None` for free text).
+    pub jump: Option<Jump>,
+}
+
+/// The engine calls and picks of a request that follows a program, after its
+/// prompt: the prompt's own calls and the step of its last id are
+/// `prompt_ms`'s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Jump {
+    /// Whether the request took the jump arm.
+    pub arm: bool,
+    /// The runs fed as calls, and the ids in them.
+    pub spans: usize,
+    pub span_ids: usize,
+    /// The ids picked among a choice's options, and inside free strings.
+    pub decisions: usize,
+    pub free_steps: usize,
+    /// The engine's [`Engine::next`] and [`Engine::prefill`] calls.
+    pub next_calls: usize,
+    pub prefill_calls: usize,
 }
 
 impl Timings {
     /// The JSON llama-server emits, and `cache_ms`. A zero count gives NaN
     /// per-token fields, which serialize as `null` exactly as nlohmann writes
     /// them. The draft's two counts are there once a pass proposed, as
-    /// llama-server's are.
+    /// llama-server's are; a request that follows a program adds
+    /// `constrained`, its [`Jump`] counts.
     pub(crate) fn to_json(&self) -> Value {
         let (pn, dn) = (self.prompt_n as f64, self.predicted_n as f64);
         let mut v = json!({
@@ -170,6 +206,17 @@ impl Timings {
         if self.draft_n > 0 {
             v["draft_n"] = json!(self.draft_n);
             v["draft_n_accepted"] = json!(self.draft_n_accepted);
+        }
+        if let Some(j) = &self.jump {
+            v["constrained"] = json!({
+                "arm": if j.arm { "jump" } else { "step" },
+                "spans": j.spans,
+                "span_ids": j.span_ids,
+                "decisions": j.decisions,
+                "free_steps": j.free_steps,
+                "next_calls": j.next_calls,
+                "prefill_calls": j.prefill_calls,
+            });
         }
         v
     }
@@ -223,9 +270,10 @@ pub(crate) struct Outcome {
 pub(crate) enum Event<'a> {
     /// The prompt is evaluated (llama-server's `prompt_progress`, sent once, complete).
     Prompt(&'a Timings),
-    /// Text safe to stream. Empty between the calls of a prompt run a call a
-    /// round ([`Prompt`]): the event a client gone fails on, as a token's
-    /// text does, its timings the prompt's so far.
+    /// Text safe to stream. Empty between the calls of a prompt or of a run
+    /// of fixed ids ([`Need::Fill`]) run a call a round ([`Prompt`]): the
+    /// event a client gone fails on, as a token's text does, its timings the
+    /// request's so far.
     Text(&'a str, &'a Timings),
 }
 
@@ -350,6 +398,8 @@ pub(crate) struct Slot {
     /// Each slot's state copy while it may still run ([`Slot::seal`]): its
     /// rows are not cut, reset or replaced before it has landed.
     saving: Vec<Option<Pending>>,
+    /// Whether a request that follows a program takes the jump arm.
+    jump: bool,
 }
 
 /// What a cache hit put back ([`Slot::load`]).
@@ -382,7 +432,15 @@ impl Slot {
             away: None,
             off: false,
             saving: vec![None; n],
+            jump: true,
         }
+    }
+
+    /// Whether a request that follows a program takes the jump arm (the
+    /// default) or the step arm alone (`BLOOMERY_SCHEMAJUMP=off`).
+    pub(crate) fn schema_jump(mut self, on: bool) -> Slot {
+        self.jump = on;
+        self
     }
 
     /// Makes `slot` the selected one, on the engine too when it changes.
@@ -1453,8 +1511,26 @@ pub(crate) enum Need {
     /// ([`Gen::advance_sampled`]) when its slot is the round's only busy
     /// one; beside another, a [`Need::Step`] from it.
     Sampled(u32),
+    /// A run of ids the program fixes, fed as a call of [`Engine::prefill`]
+    /// ([`Gen::fill`]): the engine thread runs it like a prompt's call, and
+    /// the request's [`Need::Step`] follows. It is never part of a step.
+    Fill,
     /// Nothing more: [`Gen::finish`] ends it.
     Done,
+}
+
+/// The fewest ids a run is fed as a call: below it the steps cost the same,
+/// and a seat may route one id to its step path.
+pub(crate) const MIN_FILL: usize = 2;
+
+/// A run of fixed ids being fed ([`Need::Fill`]).
+struct Span {
+    /// The ids the calls feed: the id just taken, then the run but its last
+    /// id, which the step that follows feeds.
+    feed: Vec<u32>,
+    fed: usize,
+    /// The run: the ids the loop takes next.
+    run: Vec<u32>,
 }
 
 /// The think-span budget's state in [`Gen`]: the budget left while the span is
@@ -1554,6 +1630,12 @@ pub(crate) struct Gen {
     walk: Option<Walk>,
     /// The program's refusal of a step, which the next [`Gen::pump`] returns.
     refused: Option<StepError>,
+    /// Whether the request takes the jump arm: it follows a program, asks for
+    /// no probabilities and has no think budget, and the server has the arm
+    /// on.
+    jump: bool,
+    /// The run being fed, `None` between runs.
+    span: Option<Span>,
 }
 
 /// The sampler a request of `p` draws with, `None` for a greedy one, or the
@@ -1634,6 +1716,13 @@ impl Gen {
                 .as_ref()
                 .map(|c| Walk::new(c, p.think_entry == ThinkEntry::Open)),
             refused: None,
+            // A think budget's forced close would compete with a run for the
+            // ids after it, so a request with one steps.
+            jump: slot.jump
+                && p.constraint.is_some()
+                && p.logprobs.is_none()
+                && p.reasoning_budget.is_none(),
+            span: None,
         }
     }
 
@@ -1669,7 +1758,13 @@ impl Gen {
             return id;
         }
         if let Some(walk) = self.walk.as_mut() {
-            return match walk.choose(&self.logits) {
+            let picked = walk.choose(&self.logits);
+            let picks = walk.picks();
+            if let Some(j) = self.tim.jump.as_mut() {
+                j.decisions = picks.decisions;
+                j.free_steps = picks.free;
+            }
+            return match picked {
                 Ok(id) => id,
                 Err(e) => {
                     self.refused = Some(e);
@@ -1893,6 +1988,10 @@ impl Gen {
             cache_n: kept.cache_n,
             cache_ms: kept.cache_ms,
             n_prompt: n,
+            jump: self.walk.is_some().then(|| Jump {
+                arm: self.jump,
+                ..Jump::default()
+            }),
             ..Timings::default()
         };
         self.t1 = Instant::now();
@@ -1914,6 +2013,15 @@ impl Gen {
     ) -> Result<Need, GenError> {
         if let Some(e) = self.refused.take() {
             return Err(e.into());
+        }
+        if let Some(span) = &self.span {
+            // A run fed in calls of a quantum asks the sink between them, as
+            // a prompt's calls do: a client that went away ends the
+            // generation, not the run.
+            if span.fed > 0 {
+                sink(Event::Text("", &self.tim))?;
+            }
+            return Ok(Need::Fill);
         }
         while let Some(tok) = self.tok.take() {
             if self.banned.contains(&tok) {
@@ -1994,6 +2102,9 @@ impl Gen {
                 self.truncated = true;
                 break;
             }
+            if self.plan_span(tok) {
+                return Ok(Need::Fill);
+            }
             // A pass takes `rows` positions from there, and every token it
             // keeps spends the think budget: it starts only while the budget
             // holds them all, so no kept token spends past the cap.
@@ -2015,7 +2126,83 @@ impl Gen {
     /// The engine's answer `g` to a [`Need::Step`].
     pub(crate) fn stepped(&mut self, g: u32) {
         self.tim.n_past = self.n + self.generated.len();
+        if let Some(j) = self.tim.jump.as_mut() {
+            j.next_calls += 1;
+        }
         self.tok = Some(self.answer(g));
+    }
+
+    /// Whether the ids the program fixes after `tok`, just taken, are fed as
+    /// a call: [`MIN_FILL`] of them at least, and no more than the ids the
+    /// request may still generate and the positions the cache has left. The
+    /// run's ids are then taken from the walk and held in [`Gen::span`].
+    fn plan_span(&mut self, tok: u32) -> bool {
+        if !self.jump {
+            return false;
+        }
+        let Some(walk) = self.walk.as_mut() else {
+            return false;
+        };
+        if !walk.fixed_next() {
+            return false;
+        }
+        let (n, len) = (self.n, self.generated.len());
+        // The run's last id is fed by the step that follows, which must find
+        // its position: the call's ids take positions n + len - 1 on.
+        let room = (self.budget - len).min(self.ctx_max + 1 - n - len);
+        let mut ahead = walk.clone();
+        let Ok(run) = ahead.forced_run(room) else {
+            return false;
+        };
+        if run.len() < MIN_FILL {
+            return false;
+        }
+        *walk = ahead;
+        let mut feed = Vec::with_capacity(run.len());
+        feed.push(tok);
+        feed.extend_from_slice(&run[..run.len() - 1]);
+        if let Some(j) = self.tim.jump.as_mut() {
+            j.spans += 1;
+            j.span_ids += feed.len();
+        }
+        self.span = Some(Span { feed, fed: 0, run });
+        true
+    }
+
+    /// One call of the run being fed ([`Need::Fill`]): its ids, or a
+    /// `quantum` of them when other slots are busy, fed as one
+    /// [`Engine::prefill`] that books them. The call that ends the run puts
+    /// the run in hand as a pass's tokens are: the loop takes them one at a
+    /// time, and the last is the id the next [`Need::Step`] feeds.
+    ///
+    /// # Panics
+    ///
+    /// When no run is being fed: [`Gen::pump`] asks for this call only then.
+    pub(crate) fn fill(
+        &mut self,
+        slot: &mut Slot,
+        quantum: Option<NonZeroUsize>,
+    ) -> Result<(), EngineError> {
+        let span = self.span.as_mut().expect("a run being fed");
+        let end = quantum.map_or(span.feed.len(), |q| {
+            (span.fed + q.get()).min(span.feed.len())
+        });
+        slot.prefill_range(&span.feed[span.fed..end], slot.held.len(), &[])?;
+        span.fed = end;
+        if let Some(j) = self.tim.jump.as_mut() {
+            j.prefill_calls += 1;
+        }
+        if end < span.feed.len() {
+            return Ok(());
+        }
+        let Some(span) = self.span.take() else {
+            return Ok(());
+        };
+        self.tim.n_past = self.n + self.generated.len() + span.run.len() - 1;
+        self.kept = span.run;
+        self.tok = Some(self.kept[0]);
+        self.taken = 1;
+        Ok(())
     }
 
     /// What a [`Need::Advance`] drafted; its tokens are in [`Gen::kept_mut`].
@@ -2105,7 +2292,8 @@ impl Gen {
         })
     }
 
-    /// The whole generation on `slot` alone, its calls one at a time.
+    /// The whole generation on `slot` alone, its calls one at a time; a run
+    /// of fixed ids is fed in calls of `quantum` ids, or whole.
     #[cfg(test)]
     fn run(
         &mut self,
@@ -2113,6 +2301,7 @@ impl Gen {
         held: &Held,
         media: &[MediaFeed],
         p: &GenParams,
+        quantum: Option<NonZeroUsize>,
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
         tick: &mut dyn FnMut(&Timings),
     ) -> Result<Outcome, GenError> {
@@ -2129,6 +2318,7 @@ impl Gen {
                     self.advanced(d);
                 }
                 Need::Sampled(t) => self.advance_sampled(slot, t)?,
+                Need::Fill => self.fill(slot, quantum)?,
             }
         }
     }
@@ -2146,11 +2336,27 @@ pub(crate) fn generate(
     tick: &mut dyn FnMut(&Timings),
     timings_out: &mut Timings,
 ) -> Result<Outcome, GenError> {
+    let (r, timings) = generate_in_quanta(slot, factory, ids, p, None, sink, tick);
+    *timings_out = timings;
+    r
+}
+
+/// [`generate`] with a run of fixed ids fed in calls of `quantum` ids, as the
+/// worker feeds one beside other busy slots; the timings come with the result.
+#[cfg(test)]
+pub(crate) fn generate_in_quanta(
+    slot: &mut Slot,
+    factory: &SamplerFactory,
+    ids: &[u32],
+    p: &GenParams,
+    quantum: Option<NonZeroUsize>,
+    sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+    tick: &mut dyn FnMut(&Timings),
+) -> (Result<Outcome, GenError>, Timings) {
     let sampler = sampler_of(factory, p).expect("the test's factory takes the request");
     let mut g = Gen::new(slot, sampler, ids.len(), p);
-    let r = g.run(slot, &Held::from(ids.to_vec()), &[], p, sink, tick);
-    timings_out.clone_from(g.timings());
-    r
+    let r = g.run(slot, &Held::from(ids.to_vec()), &[], p, quantum, sink, tick);
+    (r, g.timings().clone())
 }
 
 #[cfg(test)]
@@ -3235,6 +3441,7 @@ mod media_tests {
                 &p.held,
                 &p.feeds,
                 &params,
+                None,
                 &mut |_| Ok(()),
                 &mut |_| {},
             )

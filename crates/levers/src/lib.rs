@@ -39,7 +39,7 @@ pub use registry::{
     PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN,
     STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
 };
-pub use registry::{SPLIT_WALK, XSTREAM};
+pub use registry::{SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 
 #[cfg(test)]
 mod tests;
@@ -1144,6 +1144,13 @@ impl Levers {
     #[must_use]
     pub fn screen(&self) -> bool {
         self.flag(SCREEN)
+    }
+
+    /// `BLOOMERY_SCHEMAJUMP`: a server runs a request that follows a program
+    /// on the jump arm (the default), or on the step arm alone.
+    #[must_use]
+    pub fn schema_jump(&self) -> bool {
+        self.flag(SCHEMAJUMP)
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],

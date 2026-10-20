@@ -91,6 +91,10 @@ pub struct SlotConfig {
     /// [`crate::MAX_CONNECTIONS`]: `MAX_CONNECTIONS - parallel`.
     pub queue_depth: Option<usize>,
     pub picker: Box<dyn SlotPicker>,
+    /// Whether a request that follows a program takes the jump arm: the ids
+    /// the program fixes fed as one call ([`crate::genloop`]). `false` is the
+    /// step arm alone (`BLOOMERY_SCHEMAJUMP=off`).
+    pub schema_jump: bool,
 }
 
 impl Default for SlotConfig {
@@ -99,6 +103,7 @@ impl Default for SlotConfig {
             parallel: 1,
             queue_depth: None,
             picker: Box::new(FifoPicker),
+            schema_jump: true,
         }
     }
 }

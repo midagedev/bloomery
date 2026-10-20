@@ -316,8 +316,9 @@ const CTX: usize = 2048;
 /// refused by name at `main`, with `BLOOMERY_PIN_MAIN` for the engine
 /// thread's cpu slot, as every serving seat reads it, and `BLOOMERY_HOST_LANES`
 /// for the lanes of the host tier's legs on that thread's CCD map, and
-/// `BLOOMERY_SCREEN` for the start screen; `gate_glm5next_serve` holds the
-/// same list.
+/// `BLOOMERY_SCREEN` for the start screen, and `BLOOMERY_SCHEMAJUMP` for how a
+/// structured-output request's fixed runs are fed; `gate_glm5next_serve` holds
+/// the same list.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::HOST_POPULATE,
@@ -331,6 +332,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::RESIDENCY,
     bloomery_levers::STEP_STATS,
     bloomery_levers::SCREEN,
+    bloomery_levers::SCHEMAJUMP,
 ];
 
 /// The drafted window's verify: the target's next token and the draft's one
@@ -1076,6 +1078,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             api_keys: a.api_keys,
             parallel: slots,
             queue_depth: a.queue_depth,
+            schema_jump: levers.schema_jump(),
             side,
         },
     )?;

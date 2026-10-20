@@ -384,7 +384,7 @@ impl Server {
             listener,
             state: Arc::new(state),
             ended,
-            slot: Slot::with_slots(engine, parallel),
+            slot: Slot::with_slots(engine, parallel).schema_jump(slots.schema_jump),
         })
     }
 

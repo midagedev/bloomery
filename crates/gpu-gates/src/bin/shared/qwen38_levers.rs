@@ -24,4 +24,5 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::ROUTE_TRACE,
     bloomery_levers::STEP_STATS,
     bloomery_levers::SCREEN,
+    bloomery_levers::SCHEMAJUMP,
 ];

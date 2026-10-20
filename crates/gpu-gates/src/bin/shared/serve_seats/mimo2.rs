@@ -154,8 +154,8 @@ const USAGE: &str = "usage: bloomery-serve --model mimo2 [-m PATH | --hf <repo>[
 /// The levers this seat acts on: the plan's card budget and the host set's
 /// load settings, which the open reads (`PlanLevers::from_levers`,
 /// `Levers::host`), the residency machine's word, the batches a prompt group
-/// runs, the engine thread's pin, the host legs' lane rule and the start
-/// screen.
+/// runs, the engine thread's pin, the host legs' lane rule, the start
+/// screen and how a structured-output request's fixed runs are fed.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::RESIDENCY,
@@ -167,6 +167,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::PIN_MAIN,
     bloomery_levers::HOST_LANES,
     bloomery_levers::SCREEN,
+    bloomery_levers::SCHEMAJUMP,
 ];
 
 /// Whether a round of several slots runs as one pass of the busy rows
@@ -582,7 +583,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let engine = SeatEngine::spawn(move || Mimo::open(open), slot_ctx, vocab, card, props, 0)?;
     let side = side_seat::Side::start(side.zip(side_seat))?;
-    let server = a.bind(engine, chat, &path, slots, side)?;
+    let server = a.bind(engine, chat, &path, slots, levers.schema_jump(), side)?;
     Record::new(&record::LISTENING_MIMO2)
         .w("place", place.name())
         .u("ctx", slot_ctx)
