@@ -86,36 +86,32 @@
 //! surface it binds through (`bind`, the `serve` and `sampler` crates) is
 //! scoped to `deepseek41`; it runs no V4.1 code.
 
-use std::path::PathBuf;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use app::arch::solar2::Solar2Cfg;
 use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
-use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{ChainBody, StepMode};
+use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
-use bloomery_gpu_gates::bind::{
-    ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, model_props, note_line,
-    parallel_line, placement_of, slots_of,
-};
-use bloomery_gpu_gates::generate::{Lane, Place, choose_ctx, lane_at};
+use bloomery_gpu_gates::bind::{Seat, note_line};
+use bloomery_gpu_gates::generate::Lane;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
-use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_solar2::Body;
-use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::ReasoningFormat;
+use model::arch::place_hybrid::PlaceError;
 use model::arch::solar2::place::PlanInputs;
-use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
-use model::placement::{Machine, Plan, PlanLevers};
+use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use runtime::Target as _;
 use serve::reasoning::ThinkTags;
-use serve::{CacheNote, EngineProps, Saved, ServeError};
-use tokenizer::Tokenizer;
+use serve::{CacheNote, Saved, ServeError};
+
+use super::tiered::{self, Tiered};
 
 const NAME: &str = "bloomery-serve-solar2";
 
@@ -149,25 +145,6 @@ const NO_CACHE: &str = "the solar2 seat runs no prompt cache";
 struct Solar {
     s: Session<Body>,
     ctx: usize,
-}
-
-/// What the engine thread opens the seat with.
-struct OpenSeat {
-    place: Place,
-    /// The lane's rate probed before the plan, and the card it ran on: the
-    /// `lane` line beside the `load` record. `None` under `--plan-only`.
-    lane: Option<Lane>,
-    /// The slot's positions: the model loads its stores at it.
-    ctx: usize,
-    path: PathBuf,
-    plan: PlanLevers,
-    host: HostCfg,
-    pin_main: bool,
-    /// The batches a prompt group runs layer by layer
-    /// (`BLOOMERY_PREFILL_GROUP`, the row's default when unset).
-    group: usize,
-    /// The side model's reserve on the stage card, which the plan counted.
-    embedding: Option<u64>,
 }
 
 /// The open's records: the plan's expert counts are kept until the step is
@@ -248,7 +225,7 @@ impl Solar {
     /// The session of the file at `a.path` on `a.place`, the step captured,
     /// the `load` record on stderr, on the calling thread, pinned to the
     /// dispatcher's cpu slot when asked.
-    fn open(a: OpenSeat) -> Result<Solar, GateError> {
+    fn open(a: tiered::Open<()>) -> Result<Solar, GateError> {
         let pinned = a.pin_main && threads::pool().pin_caller();
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
         let mut log = Log {
@@ -277,7 +254,7 @@ impl Solar {
             cfg: Solar2Cfg {
                 place: a.plan,
                 host: a.host,
-                residency: Residency::Off,
+                residency: a.residency,
                 group: a.group,
             },
         };
@@ -360,118 +337,54 @@ fn think_tags(inputs: &PlanInputs) -> Result<ThinkTags, GateError> {
     }
 }
 
+impl Tiered for Solar {
+    type H = model::arch::solar2::hparams::Hparams;
+    type Flags = ();
+
+    const NAME: &'static str = NAME;
+    const USAGE: &'static str = USAGE;
+    const ACTS_ON: &'static [&'static str] = ACTS_ON;
+    const KINDS: &'static [&'static record::Kind] = record::BLOOMERY_SERVE_SOLAR2;
+    const LISTENING: &'static record::Kind = &record::LISTENING_SOLAR2;
+    const ALIAS: &'static str = "solar-open2";
+    const FAMILY: &'static str = "solar2";
+    const SERVES: &'static str = "solar-open2";
+    const RESIDENT: bool = false;
+
+    fn accepts(arch: Arch) -> bool {
+        matches!(arch, Arch::SolarOpen2)
+    }
+
+    fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
+        PlanInputs::read(split)
+    }
+
+    fn flags(_flag: &str, _value: &str, _out: &mut ()) -> Result<bool, GateError> {
+        Ok(false)
+    }
+
+    /// One sequence: the plan of a load at one slot (`PlanInputs::plan`).
+    fn plan<'a>(
+        inputs: &'a PlanInputs,
+        machine: &'a Machine,
+        ctx: u64,
+        levers: &'a PlanLevers,
+        _slots: NonZeroUsize,
+    ) -> Result<Plan<'a>, PlaceError> {
+        inputs.plan(machine, ctx, levers)
+    }
+
+    fn think(inputs: &PlanInputs) -> Result<Option<ThinkTags>, GateError> {
+        think_tags(inputs).map(Some)
+    }
+
+    fn open(a: tiered::Open<()>) -> Result<Solar, GateError> {
+        Solar::open(a)
+    }
+}
+
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
-    let levers = bloomery_levers::at_main(ACTS_ON)?;
-    model::ops::set_host_lanes(levers.host_lanes());
-    record::at_main(NAME, record::BLOOMERY_SERVE_SOLAR2);
-    arm_screen(levers.screen());
-    let a = SeatFlags::parse(args, USAGE, |_, _| Ok(false))?;
-    if let Some(n) = a.parallel.filter(|&n| n > 1) {
-        return Err(format!(
-            "--parallel {n}: the solar2 body holds one sequence and no resident slots; the seat \
-             serves --parallel 1"
-        )
-        .into());
-    }
-    let side = side.read()?;
-    let path = ref_model_path()?;
-    let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let first = split
-        .shard(0)
-        .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
-    let arch = Arch::detect(first).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !matches!(arch, Arch::SolarOpen2) {
-        return Err(format!(
-            "{} is a {} file; the solar2 seat serves solar-open2 files",
-            path.display(),
-            arch.name()
-        )
-        .into());
-    }
-    let chat = ChatSurface::read(
-        &path,
-        split.value("tokenizer.chat_template"),
-        split.value("general.name"),
-        a.template_file.path(),
-        "solar-open2",
-    )?;
-    let inputs = PlanInputs::read(&split)?;
-    let think = think_tags(&inputs)?;
-    let plan_levers = PlanLevers::from_levers(&levers)?;
-    // The one slot, and what named it (`from` on the `parallel` line); the
-    // start's note that `--ctx` is one request's context is left out, since
-    // `--parallel` has no larger count to offer.
-    let (slots, from) = slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?;
-    // The common unset rule, once, on one census reading.
-    let census = gpu_census::census()?;
-    let chosen = Place::choose_untiered(a.place, &census, "solar2")?;
-    chosen.record().eprint();
-    let place = chosen.place;
-    // The side model's seat before the plan, which holds its bytes when it sits on the stage card.
-    let side_seat = side.as_ref().map(|s| s.seat(place)).transpose()?;
-    let embedding = side_seat.as_ref().and_then(|s| s.reserve);
-    // The lane's rate, taken before the plan reads the room (`lane_of`).
-    let lane = if a.plan_only {
-        None
-    } else {
-        Some(lane_at(place)?)
-    };
-    let machine = beside::with_reserve(
-        place.machine_untiered()?,
-        Beside {
-            image: None,
-            embedding,
-        },
-    )(inputs.model.layers);
-    // The context, then the plan around it (`choose_ctx`, every seat's): a
-    // tier card, a second card, a context the card cannot hold, a host room
-    // that cannot hold the host experts and a budget that binds are refused
-    // here by name, before any load; the load plans the same.
-    let asked = choose_ctx(&split, (a.ctx, slots), (None, None), |c| {
-        probe_of(inputs.plan(&machine, c, &plan_levers))
-            .map_err(|e| format!("--place {}: {e}", place.name()))
-    })?;
-    eprintln!("{}", asked.line());
-    let slot_ctx = usize::try_from(asked.slot_ctx)?;
-    let plan = asked.plan;
-    record::plan(place.name(), &machine, &plan).eprint();
-    parallel_line(slots, slot_ctx, from, Pass::One);
-    if a.plan_only {
-        // The records before the load are out; nothing was opened on a card.
-        std::process::exit(0);
-    }
-    let props = EngineProps {
-        model: Some(model_props(&split, &inputs.model)),
-        placement: placement_of(NAME, &machine, &plan),
-        ..EngineProps::default()
-    };
-    let card = machine.cards[0].name.clone();
-    drop(plan);
-    drop(split);
-    let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
-    let open = OpenSeat {
-        place,
-        lane,
-        ctx: slot_ctx,
-        path: path.clone(),
-        plan: plan_levers,
-        host: levers.host(),
-        pin_main: levers.pin_main(),
-        group: levers.prefill_group(),
-        embedding,
-    };
-    let engine = SeatEngine::spawn(move || Solar::open(open), slot_ctx, vocab, card, props, 0)?;
-    let side = side_seat::Side::start(side.zip(side_seat))?;
-    let server = a
-        .bind(engine, chat, &path, slots, levers.schema_jump(), side)?
-        .with_think_tags(think);
-    Record::new(&record::LISTENING_SOLAR2)
-        .w("place", place.name())
-        .u("ctx", slot_ctx)
-        .u("slots", slots)
-        .w("addr", server.local_addr()?)
-        .eprint();
-    Ok(server.run())
+    tiered::run::<Solar>(args, side)
 }

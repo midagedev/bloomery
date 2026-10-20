@@ -59,6 +59,10 @@ pub mod nemotron;
 // The seats' one owner of a round run as passes (`step_rows_one_pass`).
 #[cfg(feature = "deepseek41")]
 pub mod rounds;
+// The tiered seats' one run (`solar2`, `mimo2`): the flags, the placement, the context, the plan
+// and the engine thread behind one owner, each seat giving its family's facts.
+#[cfg(all(feature = "deepseek41", any(feature = "mimo2", feature = "solar2")))]
+pub mod tiered;
 // The decide seat: a decision model's backbone on the card, its head on the host.
 #[cfg(feature = "clef")]
 pub mod decide;

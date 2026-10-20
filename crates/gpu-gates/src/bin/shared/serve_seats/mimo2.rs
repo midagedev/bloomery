@@ -113,7 +113,6 @@
 //! `deepseek41`; it runs no V4.1 code.
 
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -122,28 +121,25 @@ use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::beside::{self, Beside};
-use bloomery_gpu_gates::bind::{
-    ChatSurface, Pass, Seat, SeatEngine, SeatFlags, SlotStep, Vocab, arm_screen, model_props,
-    note_line, parallel_line, placement_of, slots_given,
-};
-use bloomery_gpu_gates::generate::{Lane, Place, choose_ctx, lane_at};
+use bloomery_gpu_gates::bind::{Seat, SlotStep, note_line};
+use bloomery_gpu_gates::generate::{Lane, Place};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{churn_bytes, residency_room, residency_set};
 use bloomery_gpu_gates::side_seat;
-use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, residency};
+use bloomery_gpu_gates::{GateError, residency};
 use bloomery_gpu_mimo2::{Body, Mimo2Model, PrefillMode};
-use bloomery_levers::{ChurnHosting, HostCfg, ResidencyAt, ResidencyWhy};
+use bloomery_levers::{ChurnHosting, Levers, ResidencyAt, ResidencyPick, ResidencyWhy};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::mimo2::place::PlanInputs;
-use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
-use model::placement::{Machine, Plan, PlanLevers};
+use model::arch::place_hybrid::PlaceError;
+use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use runtime::Target as _;
-use serve::{CacheNote, EngineProps, Saved, ServeError};
-use tokenizer::Tokenizer;
+use serve::{CacheNote, Saved, ServeError};
 
 use super::rounds;
+use super::tiered::{self, Tiered};
 
 const NAME: &str = "bloomery-serve-mimo2";
 
@@ -180,23 +176,17 @@ const ONE_PASS: bool = true;
 const NO_CACHE: &str = "the mimo2 seat runs no prompt cache";
 
 /// The flags this seat takes beside the common ones ([`SeatFlags`]).
-struct Args {
-    common: SeatFlags,
+struct Flags {
     /// `--prefill`: how a prompt call is fed.
     prefill: PrefillMode,
 }
 
-fn parse_args(args: &[String]) -> Result<Args, GateError> {
-    let mut prefill = PrefillMode::Batch;
-    let common = SeatFlags::parse(args, USAGE, |flag, v| match flag {
-        "--prefill" => {
-            prefill = PrefillMode::from_name(v)
-                .ok_or_else(|| format!("--prefill is batch or steps, not {v}"))?;
-            Ok(true)
+impl Default for Flags {
+    fn default() -> Self {
+        Flags {
+            prefill: PrefillMode::Batch,
         }
-        _ => Ok(false),
-    })?;
-    Ok(Args { common, prefill })
+    }
 }
 
 /// The MiMo session on the engine thread and the positions each slot's
@@ -204,31 +194,6 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 struct Mimo {
     s: Session<Body>,
     ctx: usize,
-}
-
-/// What the engine thread opens the seat with.
-struct OpenSeat {
-    place: Place,
-    /// The lane's rate probed before the plan, and the card it ran on: the
-    /// `lane` line beside the `load` record. `None` under `--plan-only`.
-    lane: Option<Lane>,
-    /// A slot's positions: the model loads one slot's stores at it.
-    ctx: usize,
-    /// The resident slots the plan counts: the model parks `slots − 1` more
-    /// after its capture.
-    slots: NonZeroUsize,
-    path: PathBuf,
-    plan: PlanLevers,
-    host: HostCfg,
-    pin_main: bool,
-    prefill: PrefillMode,
-    /// The residency the load runs, resolved against the plan.
-    residency: Residency,
-    /// The batches a prompt group runs layer by layer
-    /// (`BLOOMERY_PREFILL_GROUP`, the row's default when unset).
-    group: usize,
-    /// The side model's reserve on the stage card, which the plan counted.
-    embedding: Option<u64>,
 }
 
 /// The open's records: the plan's expert counts are kept until the slots are
@@ -312,7 +277,7 @@ impl Mimo {
     /// `a.slots` resident sequences parked after it (each capturing on its
     /// first use), the `load` record on stderr, on the calling thread, pinned
     /// to the dispatcher's cpu slot when asked.
-    fn open(a: OpenSeat) -> Result<Mimo, GateError> {
+    fn open(a: tiered::Open<Flags>) -> Result<Mimo, GateError> {
         let pinned = a.pin_main && threads::pool().pin_caller();
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
         let mut log = Log {
@@ -341,7 +306,7 @@ impl Mimo {
             cfg: Mimo2Cfg {
                 place: a.plan,
                 host: a.host,
-                prefill: a.prefill,
+                prefill: a.flags.prefill,
                 residency: a.residency,
                 group: a.group,
                 slots: a.slots,
@@ -443,160 +408,116 @@ impl Seat for Mimo {
     }
 }
 
+impl Tiered for Mimo {
+    type H = model::arch::mimo2::hparams::Hparams;
+    type Flags = Flags;
+
+    const NAME: &'static str = NAME;
+    const USAGE: &'static str = USAGE;
+    const ACTS_ON: &'static [&'static str] = ACTS_ON;
+    const KINDS: &'static [&'static record::Kind] = record::BLOOMERY_SERVE_MIMO2;
+    const LISTENING: &'static record::Kind = &record::LISTENING_MIMO2;
+    const ALIAS: &'static str = "mimo-v2.6-flash";
+    const FAMILY: &'static str = "mimo2";
+    const SERVES: &'static str = "mimo2";
+    const RESIDENT: bool = true;
+
+    fn accepts(arch: Arch) -> bool {
+        matches!(arch, Arch::Mimo2)
+    }
+
+    fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
+        PlanInputs::read(split)
+    }
+
+    fn flags(flag: &str, value: &str, out: &mut Flags) -> Result<bool, GateError> {
+        match flag {
+            "--prefill" => {
+                out.prefill = PrefillMode::from_name(value)
+                    .ok_or_else(|| format!("--prefill is batch or steps, not {value}"))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Every slot's stores at a slot's positions (`PlanInputs::plan_with_slots`).
+    fn plan<'a>(
+        inputs: &'a PlanInputs,
+        machine: &'a Machine,
+        ctx: u64,
+        levers: &'a PlanLevers,
+        slots: NonZeroUsize,
+    ) -> Result<Plan<'a>, PlaceError> {
+        inputs.plan_with_slots(machine, ctx, levers, slots)
+    }
+
+    /// `BLOOMERY_RESIDENCY`: set as given, else the serving word on a serving placement, which
+    /// the plan keeps, moves or turns off. The steps feed ends a decode pass per prompt id, which
+    /// the machine's rule counts.
+    fn residency(
+        levers: &Levers,
+        flags: &Flags,
+        place: Place,
+        plan: &Plan<'_>,
+    ) -> Result<Option<ResidencyPick>, GateError> {
+        let pick = levers.residency_at(ResidencyAt {
+            serving_place: place != Place::Gate,
+            check_finite: false,
+            route_trace: false,
+            prefill_steps: flags.prefill == PrefillMode::Steps,
+        });
+        if pick.why == ResidencyWhy::Set
+            && pick.word != "off"
+            && flags.prefill == PrefillMode::Steps
+        {
+            return Err(format!(
+                "BLOOMERY_RESIDENCY={} is refused beside --prefill steps (each prompt id would \
+                 end a pass the rule counts)",
+                pick.word
+            )
+            .into());
+        }
+        let pick = residency::at_plan(
+            <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+            plan,
+            0,
+            pick,
+        )?;
+        Ok(Some(pick))
+    }
+
+    fn settle(plan: &Plan<'_>, pick: ResidencyPick) -> Result<Residency, GateError> {
+        let residency = Residency::parse(pick.word)?;
+        if pick.why == ResidencyWhy::Set {
+            residency_room(plan, residency, pick.word)?;
+        }
+        residency_set(
+            plan,
+            0,
+            residency,
+            ChurnHosting::Hosted,
+            pick.word,
+            0,
+            Record::eprint,
+        )?;
+        // The hosted churn pool is host bytes the load holds beside the plan.
+        need::print(
+            plan,
+            churn_bytes(plan, 0, (residency, ChurnHosting::Hosted))?,
+            0,
+            true,
+        )?;
+        Ok(residency)
+    }
+
+    fn open(a: tiered::Open<Flags>) -> Result<Mimo, GateError> {
+        Mimo::open(a)
+    }
+}
+
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
 /// or the engine fails; `Ok` carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
-    let levers = bloomery_levers::at_main(ACTS_ON)?;
-    model::ops::set_host_lanes(levers.host_lanes());
-    record::at_main(NAME, record::BLOOMERY_SERVE_MIMO2);
-    arm_screen(levers.screen());
-    let Args { common: a, prefill } = parse_args(args)?;
-    let side = side.read()?;
-    let path = ref_model_path()?;
-    let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let first = split
-        .shard(0)
-        .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
-    let arch = Arch::detect(first).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !matches!(arch, Arch::Mimo2) {
-        return Err(format!(
-            "{} is a {} file; the mimo2 seat serves mimo2 files",
-            path.display(),
-            arch.name()
-        )
-        .into());
-    }
-    let chat = ChatSurface::read(
-        &path,
-        split.value("tokenizer.chat_template"),
-        split.value("general.name"),
-        a.template_file.path(),
-        "mimo-v2.6-flash",
-    )?;
-    let inputs = PlanInputs::read(&split)?;
-    let plan_levers = PlanLevers::from_levers(&levers)?;
-    // The slot count before the context it splits: a set `--ctx` with no
-    // `--parallel` is one request's context, one slot at the whole of it
-    // (`bind::slots_of`).
-    let (slots, from) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
-    // The common unset rule, once, on one census reading.
-    let census = gpu_census::census()?;
-    let chosen = Place::choose_untiered(a.place, &census, "mimo2")?;
-    chosen.record().eprint();
-    let place = chosen.place;
-    // The side model's seat before the plan, which holds its bytes when it sits on the stage card.
-    let side_seat = side.as_ref().map(|s| s.seat(place)).transpose()?;
-    let embedding = side_seat.as_ref().and_then(|s| s.reserve);
-    // The lane's rate, taken before the plan reads the room (`lane_of`).
-    let lane = if a.plan_only {
-        None
-    } else {
-        Some(lane_at(place)?)
-    };
-    // `BLOOMERY_RESIDENCY`: set as given, else the serving word on a serving
-    // placement, which the plan below keeps, moves or turns off. The steps
-    // feed ends a decode pass per prompt id, which the machine's rule counts.
-    let pick = levers.residency_at(ResidencyAt {
-        serving_place: place != Place::Gate,
-        check_finite: false,
-        route_trace: false,
-        prefill_steps: prefill == PrefillMode::Steps,
-    });
-    if pick.why == ResidencyWhy::Set && pick.word != "off" && prefill == PrefillMode::Steps {
-        return Err(format!(
-            "BLOOMERY_RESIDENCY={} is refused beside --prefill steps (each prompt id would end \
-             a pass the rule counts)",
-            pick.word
-        )
-        .into());
-    }
-    let machine = beside::with_reserve(
-        place.machine_untiered()?,
-        Beside {
-            image: None,
-            embedding,
-        },
-    )(inputs.model.layers);
-    // The context, then the plan of every slot around it, each layer's
-    // stores `slots` times at a slot's positions (`choose_ctx`, every seat's).
-    // A tier card, a total the machine cannot hold and a budget that binds
-    // are refused here by name, before any load; the load plans the same. A
-    // count is never lowered: the default is one slot.
-    let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
-    let asked = choose_ctx(&split, (a.ctx, slots), (None, None), |c| {
-        probe_of(inputs.plan_with_slots(&machine, c, &plan_levers, n))
-            .map_err(|e| format!("--place {}: {e}", place.name()))
-    })?;
-    eprintln!("{}", asked.line());
-    let slot_ctx = usize::try_from(asked.slot_ctx)?;
-    let plan = asked.plan;
-    let pick = residency::at_plan(
-        <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
-        &plan,
-        0,
-        pick,
-    )?;
-    record::residency_lever(pick).eprint();
-    if let Some(d) = pick.why.detail() {
-        eprintln!("{d}");
-    }
-    record::plan(place.name(), &machine, &plan).eprint();
-    let residency = Residency::parse(pick.word)?;
-    if pick.why == ResidencyWhy::Set {
-        residency_room(&plan, residency, pick.word)?;
-    }
-    residency_set(
-        &plan,
-        0,
-        residency,
-        ChurnHosting::Hosted,
-        pick.word,
-        0,
-        Record::eprint,
-    )?;
-    // The hosted churn pool is host bytes the load holds beside the plan.
-    need::print(
-        &plan,
-        churn_bytes(&plan, 0, (residency, ChurnHosting::Hosted))?,
-        0,
-        true,
-    )?;
-    parallel_line(slots, slot_ctx, from, Pass::of(slots, ONE_PASS));
-    if a.plan_only {
-        // The records before the load are out; nothing was opened on a card.
-        std::process::exit(0);
-    }
-    let props = EngineProps {
-        model: Some(model_props(&split, &inputs.model)),
-        placement: placement_of(NAME, &machine, &plan),
-        ..EngineProps::default()
-    };
-    let card = machine.cards[0].name.clone();
-    drop(plan);
-    drop(split);
-    let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
-    let open = OpenSeat {
-        place,
-        lane,
-        ctx: slot_ctx,
-        slots: n,
-        path: path.clone(),
-        plan: plan_levers,
-        host: levers.host(),
-        pin_main: levers.pin_main(),
-        prefill,
-        residency,
-        group: levers.prefill_group(),
-        embedding,
-    };
-    let engine = SeatEngine::spawn(move || Mimo::open(open), slot_ctx, vocab, card, props, 0)?;
-    let side = side_seat::Side::start(side.zip(side_seat))?;
-    let server = a.bind(engine, chat, &path, slots, levers.schema_jump(), side)?;
-    Record::new(&record::LISTENING_MIMO2)
-        .w("place", place.name())
-        .u("ctx", slot_ctx)
-        .u("slots", slots)
-        .w("addr", server.local_addr()?)
-        .eprint();
-    Ok(server.run())
+    tiered::run::<Mimo>(args, side)
 }
