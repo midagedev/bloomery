@@ -8,8 +8,8 @@ use std::collections::HashSet;
 
 use gguf::Split;
 use models::{
-    Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, Moe, ReasoningFormat, Residual,
-    Rope, RopeMode, Router, Score, ToolFormat,
+    Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, Moe, OutGate, ReasoningFormat,
+    Residual, Rope, RopeMode, Router, Score, ToolFormat,
 };
 
 use super::hparams::{Hparams, RopeMode as HpRopeMode, Score as HpScore};
@@ -62,7 +62,7 @@ pub fn spec_of(
                     rope,
                     qk_norm: has.contains(names::attn_q_norm(l).as_str())
                         && has.contains(names::attn_k_norm(l).as_str()),
-                    out_gate: false,
+                    out_gate: OutGate::None,
                     select: None,
                     window: None,
                     sinks: false,

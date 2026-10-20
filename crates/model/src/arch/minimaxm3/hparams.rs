@@ -9,8 +9,8 @@ use gguf::Split;
 use super::roles::{ATTENTION, DENSE, INDEXER, ROUTED};
 use crate::arch::hybrid::layers_agree;
 use crate::arch::{
-    dims_agree, expert_counts, finite_positive, meta_bool, meta_usize, metadata, mul, n_vocab,
-    one_expert_group, optional_usize, plain_rope, positive, sigmoid_gating, unread_keys_of,
+    dims_agree, finite_positive, meta_usize, metadata, n_vocab, noaux, optional_usize, plain_rope,
+    positive, unread_keys_of,
 };
 use crate::placement::PlacementError;
 
@@ -74,30 +74,8 @@ pub struct Rope {
     pub base: f32,
 }
 
-/// The sparse layers' sigmoid noaux_tc router and `swigluoai` experts.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Experts {
-    /// `expert_count`.
-    pub n_expert: usize,
-    /// `expert_used_count`.
-    pub n_used: usize,
-    /// `expert_feed_forward_length`: one routed expert's width, and one shared expert's.
-    pub ff: usize,
-    /// `expert_shared_count`: shared experts, run as one block of `ff · n_shared` values.
-    pub n_shared: usize,
-    /// `expert_weights_scale`: the factor on the kept weights.
-    pub weights_scale: f32,
-    /// `expert_weights_norm`: the kept weights are renormalized to sum to one.
-    pub weights_norm: bool,
-}
-
-impl Experts {
-    /// The shared block's width.
-    #[must_use]
-    pub fn shared_ff(&self) -> usize {
-        self.ff * self.n_shared
-    }
-}
+/// The sparse layers' sigmoid noaux_tc router and `swigluoai` experts: the common owner's.
+pub use crate::arch::noaux::Experts;
 
 /// The sparse layers' selection of position blocks (MiniMax Sparse Attention).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,7 +92,8 @@ pub struct Msa {
     pub local: usize,
 }
 
-/// Every `minimax-m3.` key [`Hparams::read`] reads, by suffix.
+/// Every `minimax-m3.` key [`Hparams::read`] reads but the routed block's ([`noaux::KEYS`]), by
+/// suffix.
 const READ: &[&str] = &[
     "block_count",
     "nextn_predict_layers",
@@ -137,22 +116,13 @@ const READ: &[&str] = &[
     "rope.freq_base",
     "rope.scaling.type",
     "rope.scaling.factor",
-    "expert_count",
-    "expert_used_count",
-    "expert_feed_forward_length",
-    "expert_shared_count",
-    "expert_gating_func",
-    "expert_weights_scale",
-    "expert_weights_norm",
-    "expert_group_count",
-    "expert_group_used_count",
 ];
 
 /// The architecture keys and `general.sampling.*` keys of `split` that [`Hparams::read`] does not
 /// read: listed, not refused.
 #[must_use]
 pub fn unread_keys(split: &Split) -> Vec<String> {
-    unread_keys_of(split, READ)
+    unread_keys_of(split, &[READ, noaux::KEYS].concat())
 }
 
 impl Hparams {
@@ -215,7 +185,7 @@ impl Hparams {
             n_ctx_train: positive(split, "context_length")?,
             dense_lead,
             dense_ff,
-            experts: Experts::read(split, &mut defaults)?,
+            experts: Experts::read(split, "the minimax-m3 router", &mut defaults)?,
             msa: Msa::read(split, n_head_kv, &rope)?,
             defaults,
         };
@@ -290,19 +260,10 @@ impl Hparams {
                 ]);
             }
             Kind::Sparse => {
-                let x = &self.experts;
-                let (n, eff, shared) = (x.n_expert as u64, x.ff as u64, x.shared_ff() as u64);
                 let m = &self.msa;
                 let (ih, id) = (m.heads as u64, m.d as u64);
+                dims.extend(self.experts.dims(e));
                 dims.extend([
-                    ("ffn_gate_inp.weight", vec![e, n]),
-                    ("exp_probs_b.bias", vec![n]),
-                    ("ffn_gate_exps.weight", vec![e, eff, n]),
-                    ("ffn_up_exps.weight", vec![e, eff, n]),
-                    ("ffn_down_exps.weight", vec![eff, e, n]),
-                    ("ffn_gate_shexp.weight", vec![e, shared]),
-                    ("ffn_up_shexp.weight", vec![e, shared]),
-                    ("ffn_down_shexp.weight", vec![shared, e]),
                     ("indexer.q_proj.weight", vec![e, ih * id]),
                     ("indexer.k_proj.weight", vec![e, id]),
                     ("indexer.q_norm.weight", vec![id]),
@@ -373,25 +334,6 @@ impl Rope {
         Ok(Rope {
             dims,
             base: finite_positive(split, "rope.freq_base")?,
-        })
-    }
-}
-
-impl Experts {
-    fn read(split: &Split, defaults: &mut Vec<String>) -> Result<Experts, PlacementError> {
-        let (n_expert, n_used) = expert_counts(split)?;
-        let ff = positive(split, "expert_feed_forward_length")?;
-        let n_shared = positive(split, "expert_shared_count")?;
-        mul(split, "expert_shared_count", ff, n_shared)?;
-        sigmoid_gating(split, None, defaults)?;
-        one_expert_group(split, "the minimax-m3 router")?;
-        Ok(Experts {
-            n_expert,
-            n_used,
-            ff,
-            n_shared,
-            weights_scale: finite_positive(split, "expert_weights_scale")?,
-            weights_norm: meta_bool(split, "expert_weights_norm")?,
         })
     }
 }

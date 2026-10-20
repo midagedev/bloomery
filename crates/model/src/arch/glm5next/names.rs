@@ -7,7 +7,8 @@
 use crate::arch::names::blk;
 
 pub use crate::arch::names::{
-    ffn_down_shexp, ffn_gate_shexp, ffn_up_shexp, indexer_k_norm, output, output_norm, token_embd,
+    ffn_down_shexp, ffn_gate_shexp, ffn_up_shexp, indexer_k_norm, output, output_norm, ssm_a,
+    ssm_beta, ssm_conv1d, ssm_dt_bias, ssm_f_a, ssm_f_b, ssm_g_a, ssm_g_b, ssm_norm, token_embd,
 };
 
 /// The mixer's RMS gain, both kinds.
@@ -40,46 +41,9 @@ pub fn attn_qkv(l: usize) -> String {
     format!("derived.blk.{l}.attn_qkv")
 }
 
-/// The conv taps of the q, k or v channels, `conv` per channel.
-pub fn ssm_conv1d(l: usize, part: char) -> String {
-    blk(l, &format!("ssm_conv1d_{part}.weight"))
-}
-
 /// The three conv tap sets joined at load in the q, k, v channel order.
 pub fn ssm_conv1d_qkv(l: usize) -> String {
     format!("derived.blk.{l}.ssm_conv1d_qkv")
-}
-
-pub fn ssm_f_a(l: usize) -> String {
-    blk(l, "ssm_f_a.weight")
-}
-
-pub fn ssm_f_b(l: usize) -> String {
-    blk(l, "ssm_f_b.weight")
-}
-
-pub fn ssm_g_a(l: usize) -> String {
-    blk(l, "ssm_g_a.weight")
-}
-
-pub fn ssm_g_b(l: usize) -> String {
-    blk(l, "ssm_g_b.weight")
-}
-
-pub fn ssm_beta(l: usize) -> String {
-    blk(l, "ssm_beta.weight")
-}
-
-pub fn ssm_a(l: usize) -> String {
-    blk(l, "ssm_a")
-}
-
-pub fn ssm_dt_bias(l: usize) -> String {
-    blk(l, "ssm_dt.bias")
-}
-
-pub fn ssm_norm(l: usize) -> String {
-    blk(l, "ssm_norm.weight")
 }
 
 // ------------------------------------------------------------- latent

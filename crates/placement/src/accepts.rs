@@ -32,6 +32,10 @@ pub enum Program {
     /// on a card (MXFP4 stacks, the common pair) and the rest on the host
     /// tier.
     Mimo2Body,
+    /// The solar2 body (`crates/gpu-solar2`): the routed experts the plan puts
+    /// on a card (the common pair) and the rest on the host tier, beside a
+    /// shared expert; its KDA and NoPE GQA layers run the common owners.
+    Solar2Body,
     /// The nemotron_h body (`crates/gpu/src/arch/nemotron_h`): whole-card,
     /// dense, its Mamba-2, NoPE GQA and squared-ReLU layers over the common
     /// kernels; no routed experts.
@@ -58,6 +62,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
         Arch::MiMo2 => Some(Program::Mimo2Body),
         Arch::MiniMaxM3 => None,
+        Arch::SolarOpen2 => Some(Program::Solar2Body),
         Arch::NemotronH => Some(Program::NemotronHBody),
         Arch::NemotronHMoe => Some(Program::NemotronHMoeBody),
         Arch::GemmaEmbedding | Arch::GemmaEmbedding2 => Some(Program::GemmaEmbedding2Body),
@@ -198,7 +203,7 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: |ty| qwen38_gate_up(ty).is_some(),
             down: |ty| qwen38_down(ty).is_some(),
         }),
-        Program::Glm5nextBody | Program::Mimo2Body => Some(LegArms {
+        Program::Glm5nextBody | Program::Mimo2Body | Program::Solar2Body => Some(LegArms {
             gate_up: kernels::card_gate_up_runs,
             down: kernels::card_down_runs,
         }),
@@ -241,7 +246,7 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             gate_up: |ty| qwen38_gate_up(ty).map(|_| CardFormat::KQuant),
             down: |ty| qwen38_down(ty).map(|_| CardFormat::KQuant),
         },
-        Program::Glm5nextBody | Program::Mimo2Body => RoutedRule::Leg {
+        Program::Glm5nextBody | Program::Mimo2Body | Program::Solar2Body => RoutedRule::Leg {
             gate_up: common_leg_card,
             down: common_leg_card,
         },
@@ -273,13 +278,14 @@ mod tests {
     use super::*;
     use crate::placement::{ModelTensor, ModelTensors, Role};
 
-    const PROGRAMS: [Program; 8] = [
+    const PROGRAMS: [Program; 9] = [
         Program::Deepseek41Chain,
         Program::Qwen3moeBody,
         Program::Qwen35Body,
         Program::Glm5nextBody,
         Program::Qwen38Body,
         Program::Mimo2Body,
+        Program::Solar2Body,
         Program::NemotronHBody,
         Program::NemotronHMoeBody,
     ];

@@ -13,7 +13,7 @@
 //! the routed block has no shared expert and no clamp, so a layer's card
 //! shadow is its card experts alone; layer 0's block is dense.
 
-use models::{Act, Ffn, LayerSpec, Mixer, RopeMode, Score};
+use models::{Act, Ffn, LayerSpec, Mixer, OutGate, RopeMode, Score};
 use runtime::layer::FfnKind;
 
 /// A layer the program has no launch for, named by its layer.
@@ -91,7 +91,7 @@ pub fn attn_args(l: usize, s: &LayerSpec, built: AttnBuilt) -> Result<AttnArgs, 
     if g.rope.mode != RopeMode::Neox
         || g.rope.yarn.is_some()
         || g.qk_norm
-        || g.out_gate
+        || g.out_gate != OutGate::None
         || g.select.is_some()
     {
         return Err(refuse(
@@ -305,7 +305,8 @@ pub fn step_memops(ffns: &[FfnKind]) -> usize {
 #[cfg(test)]
 mod tests {
     use models::{
-        Act, Ffn, Gqa, LayerSpec, Mixer, Moe, Residual, Rope, RopeMode, Router, Score, Shared,
+        Act, Ffn, Gqa, LayerSpec, Mixer, Moe, OutGate, Residual, Rope, RopeMode, Router, Score,
+        Shared,
     };
     use runtime::layer::FfnKind;
 
@@ -343,7 +344,7 @@ mod tests {
                 yarn: None,
             },
             qk_norm: false,
-            out_gate: false,
+            out_gate: OutGate::None,
             select: None,
             window,
             sinks: window.is_some(),

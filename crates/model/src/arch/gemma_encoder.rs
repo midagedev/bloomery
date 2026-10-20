@@ -1,7 +1,7 @@
 //! The shared Gemma encoder trunk: header checks, tensor shapes and GQA layers.
 
 use gguf::Split;
-use models::{Act, Ffn, Gqa, LayerSpec, Mixer, Residual, Rope, RopeMode};
+use models::{Act, Ffn, Gqa, LayerSpec, Mixer, OutGate, Residual, Rope, RopeMode};
 
 use crate::arch::stems::{Stem, req};
 use crate::arch::{finite_positive, meta_bool, metadata, mul, optional_usize, positive};
@@ -233,7 +233,7 @@ pub(crate) fn layer_spec(
                 yarn: None,
             },
             qk_norm: true,
-            out_gate: false,
+            out_gate: OutGate::None,
             select: None,
             window: None,
             sinks: false,

@@ -37,6 +37,7 @@ const RL_MTP_STUB: &str = "/models/census-stubs-a134239f/ggml-org/MiMo-V2.6-Flas
 // values checked against the shard-0 header dump and llama.cpp's mimo2 loader, src/models/mimo2.
 // cpp). The value head is narrower than the key head (192/128), the KV-head count and the rope
 // base are the layer's own (4 and 1e7 on the nine full layers, 8 and 1e4 on the window ones).
+// PIN(2026-10-20): `out_gate false` -> `out_gate None`: `Gqa.out_gate` became the `OutGate` enum, which the view renders with Debug; the values are the same.
 const VIEW: &[&str] = &[
     "arch MiMo2",
     "hidden 4096 vocab 152576 ctx_train 1048576",
@@ -47,9 +48,9 @@ const VIEW: &[&str] = &[
     // PIN(2026-10-20): the reasoning field prints its tags (`ReasoningFormat::ThinkSpan` carries
     // them); the values are the same.
     "chat pre qwen2 template bytes 3867 tools Some(QwenXml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })",
-    "[0] gqa 64/4 x 192 v 128 rope Neox 64 base 10000000 yarn - qk_norm false out_gate false vscale 0.707 || dense 16384 swiglu None || plain",
-    "[5,11,17,23,29,35,41,47] gqa 64/4 x 192 v 128 rope Neox 64 base 10000000 yarn - qk_norm false out_gate false vscale 0.707 || moe 256/8 ff 2048 swiglu None Sigmoid bias true norm true x1 hash false || plain",
-    "[1-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46] gqa 64/8 x 192 v 128 rope Neox 64 base 10000 yarn - qk_norm false out_gate false win 128 sinks vscale 0.707 || moe 256/8 ff 2048 swiglu None Sigmoid bias true norm true x1 hash false || plain",
+    "[0] gqa 64/4 x 192 v 128 rope Neox 64 base 10000000 yarn - qk_norm false out_gate None vscale 0.707 || dense 16384 swiglu None || plain",
+    "[5,11,17,23,29,35,41,47] gqa 64/4 x 192 v 128 rope Neox 64 base 10000000 yarn - qk_norm false out_gate None vscale 0.707 || moe 256/8 ff 2048 swiglu None Sigmoid bias true norm true x1 hash false || plain",
+    "[1-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46] gqa 64/8 x 192 v 128 rope Neox 64 base 10000 yarn - qk_norm false out_gate None win 128 sinks vscale 0.707 || moe 256/8 ff 2048 swiglu None Sigmoid bias true norm true x1 hash false || plain",
 ];
 
 // PIN(2026-10-07): the RL file carries no next-token layer; the separate `mtp-` file does.
@@ -256,10 +257,10 @@ fn hw_mimo2_plan() {
         249_200_640,
     );
     let mut plane = inputs.clone();
-    plane.kv = model::arch::mimo2::place::KvLayout::with_rows(
-        &inputs.hp,
-        model::arch::mimo2::place::Rows::Plane,
-    );
+    plane.kv = inputs
+        .kv
+        .clone()
+        .with_rows(model::arch::mimo2::place::Rows::Plane);
     row(
         &mut o,
         &mut b,

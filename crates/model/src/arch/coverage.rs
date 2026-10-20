@@ -359,12 +359,56 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Glm5nextBody, Program::Mimo2Body],
-        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body (gpu-deepseek41 router: glm5next at 288 experts, mimo2 at 256)",
+        programs: &[Program::Solar2Body],
+        at: "gpu/src/linear/mixer_kda.rs (kda_conv_prep, kda_delta with the softplus decay and the β scale)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::DeltaRule {
+                    kind: DeltaKind::Kda {
+                        gate: KdaGate::Softplus,
+                        beta_scale,
+                    },
+                    d: 128,
+                    conv: 4,
+                    ..
+                } if *beta_scale == 2.0
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Solar2Body],
+        at: "gpu/src/arch/hybrid.rs gqa_layer (the NoPE layer over flash_gqa.rs HEAD, GROUP: head 128, group 8)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Gqa {
+                    head: 128,
+                    value: 128,
+                    group: 8,
+                    window: None,
+                    sinks: false,
+                    scaled: false,
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Solar2Body],
+        at: "gpu/src/arch/hybrid.rs GqaGate::Proj (the out gate of the layer's own projection)",
+        runs: |n| matches!(n, Need::OutGateProj),
+    },
+    Available {
+        programs: &[
+            Program::Glm5nextBody,
+            Program::Mimo2Body,
+            Program::Solar2Body,
+        ],
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body (gpu-deepseek41 router: glm5next at 288 experts, mimo2 at 256, solar2 at 320)",
         runs: |n| routes(n, &[RouterBody::BiasedSigmoid]),
     },
     Available {
-        programs: &[Program::Glm5nextBody],
+        programs: &[Program::Glm5nextBody, Program::Solar2Body],
         at: "gpu-glm5next/src/ffn.rs (the shared expert)",
         runs: |n| {
             matches!(
@@ -400,12 +444,12 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Glm5nextBody],
+        programs: &[Program::Glm5nextBody, Program::Solar2Body],
         at: "gpu-glm5next/src/kda.rs (the state and the conv ring, one lane)",
         runs: |n| matches!(n, Need::RecurrentState),
     },
     Available {
-        programs: &[Program::Glm5nextBody],
+        programs: &[Program::Glm5nextBody, Program::Solar2Body],
         at: "gpu-glm5next/src/program.rs (a mixer program per layer)",
         runs: |n| matches!(n, Need::MixedTrunk),
     },
@@ -1188,6 +1232,14 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
+        program: Program::Solar2Body,
+        role: Role::TokenEmbedding,
+        matrices: true,
+        names: None,
+        what: "token embedding (the host's rows: the types dequant_row decodes)",
+        row: GgmlType::has_dequant,
+    },
+    RowPin {
         program: Program::GemmaEmbedding2Body,
         role: Role::TokenEmbedding,
         matrices: true,
@@ -1449,10 +1501,11 @@ pub fn check_with(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
-                // The mimo2 body's rule: the same — a stack passes when the
-                // common card leg runs its type (`kernels::card_runs`) or the
-                // host runs it by a qdot fused kernel at the stack's row width.
-                Some(Program::Mimo2Body) => {
+                // The mimo2 and solar2 bodies' rule: the same — a stack passes
+                // when the common card leg runs its type (`kernels::card_runs`)
+                // or the host runs it by a qdot fused kernel at the stack's row
+                // width.
+                Some(Program::Mimo2Body | Program::Solar2Body) => {
                     if routed_unrun(t, crate::placement::kernels::card_runs) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
@@ -2481,6 +2534,7 @@ mod tests {
         for program in [
             Program::Glm5nextBody,
             Program::Mimo2Body,
+            Program::Solar2Body,
             Program::GemmaEmbedding2Body,
         ] {
             for ty in [

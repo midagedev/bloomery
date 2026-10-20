@@ -398,6 +398,7 @@ mod spec_fail_first;
 
 // PIN(2026-09-27): the file's description as `arch::qwen3moe::spec` reads it, line by line —
 // docs/research/modelspec-design.md §3 is the table these lines were checked against.
+// PIN(2026-10-20): `out_gate false` -> `out_gate None`: `Gqa.out_gate` became the `OutGate` enum, which the view renders with Debug; the values are the same.
 const Q3_VIEW: &[&str] = &[
     "arch Qwen3Moe",
     "hidden 2048 vocab 151936 ctx_train 262144",
@@ -408,7 +409,7 @@ const Q3_VIEW: &[&str] = &[
     // PIN(2026-10-20): the reasoning field prints its tags (`ReasoningFormat::ThinkSpan` carries
     // them); the values are the same.
     "chat pre qwen2 template bytes 4040 tools Some(Dsml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })",
-    "[0-47] gqa 32/4 x 128 rope Neox 128 base 10000000 yarn - qk_norm true out_gate false || moe 128/8 ff 768 swiglu None Softmax bias false norm true x1 hash false || plain",
+    "[0-47] gqa 32/4 x 128 rope Neox 128 base 10000000 yarn - qk_norm true out_gate None || moe 128/8 ff 768 swiglu None Softmax bias false norm true x1 hash false || plain",
 ];
 
 /// 3. `hw_qwen3moe_spec` — the typed description: (a) every field pinned;

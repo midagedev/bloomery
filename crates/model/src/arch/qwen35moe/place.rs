@@ -43,7 +43,7 @@
 use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::{GgmlType, Split};
 use models::headpick::{HeadRowsError, HeadSet, vocab_sha256};
-use models::{DraftSpec, Ffn, HcKind, Mixer, ModelSpec, MtpDraft, MtpSource, Role};
+use models::{DraftSpec, Ffn, HcKind, Mixer, ModelSpec, MtpDraft, MtpSource, OutGate, Role};
 
 use super::hparams::{Hparams, Kind};
 use super::{mtp, names, roles, spec};
@@ -1622,7 +1622,7 @@ pub fn mtp_tensors(d: &MtpDraft) -> Result<Vec<MtpTensor>, PlacementError> {
     };
     let u = u64::from;
     let (h, hd) = (u(d.hidden), u(g.head_dim));
-    let q = u(g.heads) * hd * if g.out_gate { 2 } else { 1 };
+    let q = u(g.heads) * hd * if g.out_gate == OutGate::Packed { 2 } else { 1 };
     let (kv, attn, wide) = (
         u(g.kv_heads) * hd,
         u(g.heads) * hd,
@@ -2647,7 +2647,7 @@ mod tests {
         use models::headpick::{HeadSet, vocab_sha256};
         use models::{
             Act, Borrows, Ffn, Gqa, HcKind, HcSpec, LayerSpec, Mixer, Moe, MtpDraft, MtpHeadNorm,
-            MtpInput, MtpSource, Residual, Rope, RopeMode, Router, Score, Shared,
+            MtpInput, MtpSource, OutGate, Residual, Rope, RopeMode, Router, Score, Shared,
         };
 
         use super::super::{
@@ -2703,7 +2703,7 @@ mod tests {
                             yarn: None,
                         },
                         qk_norm: true,
-                        out_gate: true,
+                        out_gate: OutGate::Packed,
                         select: None,
                         window: None,
                         sinks: false,

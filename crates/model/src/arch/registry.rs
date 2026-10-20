@@ -17,7 +17,7 @@ use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
     deepseek41, draft, gemma_embedding, gemma_embedding2, glm5next, mimo2, minimaxm3, nemotron_h,
-    nemotron_h_moe, qwen3moe, qwen35moe,
+    nemotron_h_moe, qwen3moe, qwen35moe, solar2,
 };
 use crate::placement::PlacementError;
 
@@ -168,6 +168,13 @@ pub static ROWS: &[ArchRow] = &[
         fixture: None,
     },
     ArchRow {
+        arch: Some(Arch::SolarOpen2),
+        names: &["solar-open2"],
+        read: Some(solar2::spec::read),
+        draft: None,
+        fixture: None,
+    },
+    ArchRow {
         arch: Some(Arch::NemotronH),
         names: &["nemotron_h"],
         read: Some(nemotron_h::spec::read),
@@ -269,6 +276,7 @@ mod tests {
             "glm5next" | GLM5_NEXT_LLAMA_CPP => glm5next::spec::read,
             "mimo2" => mimo2::spec::read,
             "minimax-m3" => minimaxm3::spec::read,
+            "solar-open2" => solar2::spec::read,
             "nemotron_h" => nemotron_h::spec::read,
             "nemotron_h_moe" => nemotron_h_moe::spec::read,
             GEMMA_EMBEDDING => gemma_embedding::spec::read,
@@ -310,6 +318,7 @@ mod tests {
             Arch::Qwen35moe,
             Arch::Glm5next,
             Arch::Mimo2,
+            Arch::SolarOpen2,
             Arch::NemotronH,
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,

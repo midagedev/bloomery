@@ -27,8 +27,8 @@ use std::collections::HashMap;
 use gguf::Split;
 use models::{
     Act, Arch, ChatSpec, DeltaKind, DeltaRule, EngramSpec, Extra, Ffn, GdnGate, Gqa, HcKind,
-    HcSpec, KHeadMap, LayerSpec, Mixer, ModelSpec, Moe, NgramRule, PoolRule, ReasoningFormat,
-    Residual, Rope, RopeMode, Router, Score, Selector, Shared, ToolFormat,
+    HcSpec, KHeadMap, LayerSpec, Mixer, ModelSpec, Moe, NgramRule, OutGate, PoolRule,
+    ReasoningFormat, Residual, Rope, RopeMode, Router, Score, Selector, Shared, ToolFormat,
 };
 
 use super::hparams::{FfnKind, Hparams, Kind, Variant};
@@ -263,18 +263,18 @@ pub(super) fn routed_at(
 }
 
 /// Whether an attention layer's `attn_q` (`q`, writing `rows`) writes a
-/// per-head gate beside the query: twice the query's width with it, once
-/// without, any other width refused.
+/// per-head gate beside the query ([`OutGate::Packed`]): twice the query's
+/// width with it, once without, any other width refused.
 pub(super) fn out_gate(
     q: String,
     rows: Option<u64>,
     heads: u32,
     head_dim: u32,
-) -> Result<bool, PlacementError> {
+) -> Result<OutGate, PlacementError> {
     let width = u64::from(heads) * u64::from(head_dim);
     match rows {
-        Some(r) if r == 2 * width => Ok(true),
-        Some(r) if r == width => Ok(false),
+        Some(r) if r == 2 * width => Ok(OutGate::Packed),
+        Some(r) if r == width => Ok(OutGate::None),
         _ => Err(PlacementError::Tensor {
             name: q,
             detail: format!(

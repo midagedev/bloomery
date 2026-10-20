@@ -95,6 +95,7 @@ const EOG_NAMES: &[&str] = &[
     "<|call|>",
     "<|flush|>",
     "<|calls|>",
+    "<|im:end|>",
     "<end_of_turn>",
     "<|endoftext|>",
     "</s>",

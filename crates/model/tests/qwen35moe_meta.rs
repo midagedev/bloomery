@@ -27,6 +27,7 @@ const UD: &str = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
 // the chat line — docs/research/modelspec-design.md §2b and §5 are what these were checked against.
 // PIN(2026-09-27): the delta line re-pinned when the GDN kind gained its output gate's activation
 // (SiLU here); the coverage lists below are unchanged.
+// PIN(2026-10-20): `out_gate true` -> `out_gate Packed`: `Gqa.out_gate` became the `OutGate` enum, which the view renders with Debug; the values are the same.
 const VIEW: &[&str] = &[
     "arch Qwen35Moe",
     "hidden 2048 vocab 248320 ctx_train 262144",
@@ -35,7 +36,7 @@ const VIEW: &[&str] = &[
     "hc None",
     "engram None",
     "[0-2,4-6,8-10,12-14,16-18,20-22,24-26,28-30,32-34,36-38] delta Gdn { khead_map: Tiled, gate: Silu } k 16 v 32 d 128 conv 4 || moe 256/8 ff 512 swiglu None Softmax bias false norm true x1 hash false shared 512 swiglu None gate true || plain",
-    "[3,7,11,15,19,23,27,31,35,39] gqa 16/2 x 256 rope Imrope { sections: [11, 11, 10, 0] } 64 base 10000000 yarn - qk_norm true out_gate true || moe 256/8 ff 512 swiglu None Softmax bias false norm true x1 hash false shared 512 swiglu None gate true || plain",
+    "[3,7,11,15,19,23,27,31,35,39] gqa 16/2 x 256 rope Imrope { sections: [11, 11, 10, 0] } 64 base 10000000 yarn - qk_norm true out_gate Packed || moe 256/8 ff 512 swiglu None Softmax bias false norm true x1 hash false shared 512 swiglu None gate true || plain",
 ];
 
 // PIN(2026-09-27): each file's chat line (its template's bytes differ).
@@ -225,7 +226,7 @@ const A4_Q4KM: &str = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
 #[test]
 #[ignore = "needs the Qwen3.6 and MiniCPM headers on the box (just gate-qwen35moe-meta)"]
 fn hw_qwen35moe_nextn_draft() {
-    use model::arch::models::{Ffn, Mixer, MtpHeadNorm, MtpInput, MtpSource, Residual};
+    use model::arch::models::{Ffn, Mixer, MtpHeadNorm, MtpInput, MtpSource, OutGate, Residual};
     use model::arch::qwen35moe::mtp::{self, InFile};
 
     let split = Split::open(A1_UNSLOTH_MTP).unwrap_or_else(|e| panic!("open A1: {e}"));
@@ -246,7 +247,7 @@ fn hw_qwen35moe_nextn_draft() {
     let Mixer::Gqa(g) = &draft.layer.mixer else {
         panic!("A1 mixer {:?}", draft.layer.mixer);
     };
-    assert!(g.out_gate && g.qk_norm && g.select.is_none());
+    assert!(g.out_gate == OutGate::Packed && g.qk_norm && g.select.is_none());
     let Ffn::Moe(moe) = &draft.layer.ffn else {
         panic!("A1 feed-forward {:?}", draft.layer.ffn);
     };

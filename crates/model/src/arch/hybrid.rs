@@ -8,7 +8,7 @@
 //! llama.cpp's `src/models/nemotron-h.cpp`, which loads both.
 
 use gguf::Split;
-use models::{Act, Ffn, Gqa, Mamba2, ModelSpec, Rope, RopeMode, ToolFormat};
+use models::{Act, Ffn, Gqa, Mamba2, ModelSpec, OutGate, Rope, RopeMode, ToolFormat};
 use runtime::stores::{dense_kv_bytes, mamba2_bytes};
 
 use crate::arch::coverage;
@@ -420,7 +420,7 @@ pub(in crate::arch) fn nope_gqa(a: &Attn, kv: usize) -> Result<Gqa, PlacementErr
             yarn: None,
         },
         qk_norm: false,
-        out_gate: false,
+        out_gate: OutGate::None,
         select: None,
         window: None,
         sinks: false,

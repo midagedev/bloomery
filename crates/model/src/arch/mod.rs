@@ -27,9 +27,12 @@ pub mod minimaxm3;
 pub mod names;
 pub mod nemotron_h;
 pub mod nemotron_h_moe;
+pub mod noaux;
+pub mod place_hybrid;
 pub mod qwen35moe;
 pub mod qwen3moe;
 pub mod registry;
+pub mod solar2;
 mod stems;
 
 /// The typed model description, its readers' output: re-exported so a
@@ -155,6 +158,7 @@ pub enum Arch {
     Qwen35moe,
     Glm5next,
     Mimo2,
+    SolarOpen2,
     NemotronH,
     NemotronHMoe,
     GemmaEmbedding,
@@ -185,6 +189,7 @@ impl Arch {
             "qwen35moe" => Ok(Arch::Qwen35moe),
             "glm5next" | GLM5_NEXT_LLAMA_CPP => Ok(Arch::Glm5next),
             "mimo2" => Ok(Arch::Mimo2),
+            "solar-open2" => Ok(Arch::SolarOpen2),
             "nemotron_h" => Ok(Arch::NemotronH),
             "nemotron_h_moe" => Ok(Arch::NemotronHMoe),
             GEMMA_EMBEDDING => Ok(Arch::GemmaEmbedding),
@@ -208,6 +213,7 @@ impl Arch {
             Arch::Qwen35moe => "qwen35moe",
             Arch::Glm5next => "glm5next",
             Arch::Mimo2 => "mimo2",
+            Arch::SolarOpen2 => "solar-open2",
             Arch::NemotronH => "nemotron_h",
             Arch::NemotronHMoe => "nemotron_h_moe",
             Arch::GemmaEmbedding => GEMMA_EMBEDDING,
@@ -1013,6 +1019,24 @@ pub(crate) mod synthetic {
         std::fs::write(&path, b).expect("write the synthetic header");
         path
     }
+
+    /// What `read` makes of a shaped header of architecture `arch` with the keys `kv` and
+    /// `global`: its value, or its error as text. The file is removed.
+    pub(crate) fn verdict<T>(
+        tag: &str,
+        arch: &str,
+        kv: &[(&str, V)],
+        global: &[(&str, V)],
+        tensors: &[(String, Vec<u64>)],
+        read: impl FnOnce(&gguf::Split) -> Result<T, crate::placement::PlacementError>,
+    ) -> Result<T, String> {
+        let path = header_shaped(tag, arch, kv, global, tensors);
+        let got = gguf::Split::open(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|split| read(&split).map_err(|e| e.to_string()));
+        let _ = std::fs::remove_file(&path);
+        got
+    }
 }
 
 #[cfg(test)]
@@ -1060,6 +1084,7 @@ mod tests {
             Arch::Qwen35moe,
             Arch::Glm5next,
             Arch::Mimo2,
+            Arch::SolarOpen2,
             Arch::NemotronH,
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,

@@ -6,6 +6,7 @@
 
 use gguf::Split;
 
+use crate::arch::stems::Stem;
 use crate::placement::{ModelTensor, ModelTensors, PlacementError, Role};
 
 /// The model-level counts a family reports, as [`ModelTensors`] takes them:
@@ -34,6 +35,25 @@ pub(crate) fn block_stem(name: &str, n_layer: usize) -> Option<(usize, &str)> {
     let (layer, stem) = name.strip_prefix("blk.")?.split_once('.')?;
     let layer: usize = layer.parse().ok().filter(|&l| l < n_layer)?;
     Some((layer, stem))
+}
+
+/// The role and layer of `name` in a family whose layers' stems sit in `groups`: the model-level
+/// three, else a `blk.{layer}.{stem}` below `n_layer` whose stem a group holds; `None` for any other
+/// name.
+pub(crate) fn role_in(
+    groups: &[&[Stem]],
+    name: &str,
+    n_layer: usize,
+) -> Option<(Role, Option<usize>)> {
+    if let Some(model_level) = model_level_role(name) {
+        return Some(model_level);
+    }
+    let (layer, stem) = block_stem(name, n_layer)?;
+    groups
+        .iter()
+        .flat_map(|g| g.iter())
+        .find(|s| s.name == stem)
+        .map(|s| (s.role, Some(layer)))
 }
 
 /// Every tensor of `split` with the role `role_of` gives its name, refusing
@@ -115,6 +135,37 @@ mod tests {
         assert_eq!(block_stem("blk.x.attn_q.weight", 48), None);
         assert_eq!(block_stem("blk.3", 48), None);
         assert_eq!(block_stem("token_embd.weight", 48), None);
+    }
+
+    /// The grouped walk gives a model-level name its role, a stem of any group its role on its
+    /// layer, and every other name — a stem no group holds, a layer past the model — none. Mutant:
+    /// the layer bound `<=`, or the first group only searched.
+    #[test]
+    fn the_grouped_walk_finds_a_stem_in_any_group() {
+        use super::role_in;
+        use crate::arch::stems::req;
+        const A: &[crate::arch::stems::Stem] = &[req("attn_q.weight", Role::Attention)];
+        const B: &[crate::arch::stems::Stem] = &[req("ffn_gate_inp.weight", Role::Router)];
+        let groups = [A, B];
+        assert_eq!(
+            role_in(&groups, "output.weight", 4),
+            Some((Role::Head, None))
+        );
+        assert_eq!(
+            role_in(&groups, "blk.3.attn_q.weight", 4),
+            Some((Role::Attention, Some(3)))
+        );
+        assert_eq!(
+            role_in(&groups, "blk.0.ffn_gate_inp.weight", 4),
+            Some((Role::Router, Some(0)))
+        );
+        for name in [
+            "blk.4.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "rope_freqs.weight",
+        ] {
+            assert_eq!(role_in(&groups, name, 4), None, "{name}");
+        }
     }
 
     /// A name no role claims fails the file with every such name listed, in

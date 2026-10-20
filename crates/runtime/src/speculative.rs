@@ -1583,7 +1583,7 @@ mod tests {
         use models::headpick::HeadSet;
         use models::{
             Act, BlockDraft, DraftSpec, Ffn, Gqa, HcKind, HcSpec, LayerSpec, Mixer, MtpDraft,
-            MtpHeadNorm, MtpInput, MtpSource, Residual, Rope, RopeMode,
+            MtpHeadNorm, MtpInput, MtpSource, OutGate, Residual, Rope, RopeMode,
         };
         let block = BlockDraft {
             hidden: 64,
@@ -1614,7 +1614,7 @@ mod tests {
                     yarn: None,
                 },
                 qk_norm: true,
-                out_gate: true,
+                out_gate: OutGate::Packed,
                 select: None,
                 window: None,
                 sinks: false,

@@ -23,9 +23,9 @@ use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{self, GRANULE, HostRead, TierBatchBytes};
 use crate::placement::{
-    self, Card, CardFormat, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine,
-    ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers, Role, Unimplemented,
-    Violation, checked_beside, joined,
+    self, Card, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine, ModelTensor,
+    ModelTensors, Node, PlacementError, Plan, PlanLevers, Role, Unimplemented, Violation,
+    checked_beside, joined,
 };
 
 const F16_BYTES: u64 = 2;
@@ -70,15 +70,9 @@ fn is_kquant(ty: GgmlType) -> bool {
     )
 }
 
-/// The routed stacks the card experts read, each as the file stores it
-/// ([`CardFormat::KQuant`]): the types the common card leg runs
-/// ([`placement::kernels::card_runs`]). The rule reads a stack's type alone; a
-/// layer with a stack of any other type — the Q6_K downs — keeps its experts
-/// on the host.
-#[must_use]
-pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    placement::kernels::card_runs(ty).then_some(CardFormat::KQuant)
-}
+// The routed stacks the card experts read: the common card leg's types, so a layer with a stack
+// of any other type — the Q6_K downs — keeps its experts on the host.
+pub use crate::arch::place_hybrid::card_routed;
 
 /// Whether a card layer of gate·up type `gate` and down type `down` runs a
 /// prompt batch on the grouped tile kernels (Q4_K and Q5_K, either role); a

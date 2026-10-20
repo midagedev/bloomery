@@ -7,7 +7,7 @@
 use gguf::Split;
 
 use super::hparams::Hparams;
-use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role};
+use crate::arch::classify::{Counts, classify_with, role_in};
 use crate::arch::stems::{Stem, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
@@ -30,19 +30,8 @@ pub(super) const DENSE: &[Stem] = &[
     req("ffn_down.weight", Role::DenseFfn),
 ];
 
-/// A routed layer's feed-forward block: the router with its selection bias, the routed stacks and
-/// the shared expert.
-pub(super) const ROUTED: &[Stem] = &[
-    req("ffn_norm.weight", Role::FfnNorm),
-    req("ffn_gate_inp.weight", Role::Router),
-    req("exp_probs_b.bias", Role::Router),
-    req("ffn_gate_exps.weight", Role::RoutedExperts),
-    req("ffn_up_exps.weight", Role::RoutedExperts),
-    req("ffn_down_exps.weight", Role::RoutedExperts),
-    req("ffn_gate_shexp.weight", Role::SharedExpert),
-    req("ffn_up_shexp.weight", Role::SharedExpert),
-    req("ffn_down_shexp.weight", Role::SharedExpert),
-];
+/// A routed layer's feed-forward block, the common noaux owner's.
+pub(super) use crate::arch::noaux::BLOCK as ROUTED;
 
 /// A sparse layer's indexer.
 pub(super) const INDEXER: &[Stem] = &[
@@ -55,23 +44,10 @@ pub(super) const INDEXER: &[Stem] = &[
 /// Every stem a layer may carry, by group.
 const GROUPS: [&[Stem]; 4] = [ATTENTION, DENSE, ROUTED, INDEXER];
 
-/// The role of a layer's stem.
-fn layer_role(stem: &str) -> Option<Role> {
-    GROUPS
-        .iter()
-        .flat_map(|g| g.iter())
-        .find(|s| s.name == stem)
-        .map(|s| s.role)
-}
-
 /// A tensor's role and layer by its name; `None` when the table does not hold it or its layer is
 /// past the file's.
 fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
-    if let Some(model_level) = model_level_role(name) {
-        return Some(model_level);
-    }
-    let (layer, stem) = block_stem(name, n_layer)?;
-    layer_role(stem).map(|r| (r, Some(layer)))
+    role_in(&GROUPS, name, n_layer)
 }
 
 /// Every tensor of `split` with its role and header facts.
@@ -89,7 +65,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
 
 #[cfg(test)]
 mod tests {
-    use super::{GROUPS, layer_role, role};
+    use super::{GROUPS, role};
     use crate::placement::Role;
 
     /// A stem in two groups names one role, and no group lists a stem twice. Mutant: `ffn_norm`
@@ -98,7 +74,12 @@ mod tests {
     fn a_stem_has_one_role() {
         for (g, group) in GROUPS.iter().enumerate() {
             for (i, s) in group.iter().enumerate() {
-                assert_eq!(layer_role(s.name), Some(s.role), "{}", s.name);
+                assert_eq!(
+                    role(&format!("blk.0.{}", s.name), 1),
+                    Some((s.role, Some(0))),
+                    "{}",
+                    s.name
+                );
                 assert!(
                     !group[..i].iter().any(|t| t.name == s.name),
                     "{} twice",

@@ -78,7 +78,7 @@ pub fn layer_line(layer: &LayerSpec) -> String {
             };
             let _ = write!(
                 o,
-                "gqa {}/{} x {}{v} rope {} qk_norm {} out_gate {}",
+                "gqa {}/{} x {}{v} rope {} qk_norm {} out_gate {:?}",
                 g.heads,
                 g.kv_heads,
                 g.head_dim,

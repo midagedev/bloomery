@@ -162,8 +162,8 @@ mod tests {
     use super::*;
     use models::{
         Act, Candidates, Compress, Compressor, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap,
-        KdaGate, Latent, LatentOut, LatentUp, Moe, PoolRule, Residual, Rope, RopeMode, Router,
-        Score,
+        KdaGate, Latent, LatentOut, LatentUp, Moe, OutGate, PoolRule, Residual, Rope, RopeMode,
+        Router, Score,
     };
 
     fn moe() -> Ffn {
@@ -313,7 +313,7 @@ mod tests {
                             64,
                         ),
                         qk_norm: true,
-                        out_gate: true,
+                        out_gate: OutGate::Packed,
                         select: None,
                         window: None,
                         sinks: false,

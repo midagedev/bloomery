@@ -1,162 +1,29 @@
-//! A mimo2 file planned onto a machine: the one path from the file's headers
-//! to a plan that keeps its invariants, as `glm5next::place` is for GLM. The
-//! hyperparameters, every tensor's role, the typed description and each
-//! layer's KV bytes ([`KvLayout`]) are read once ([`PlanInputs::read`], which
-//! refuses a file whose next-token layers carry tensors — the draft that
-//! reads them is a later round's — and one with a feature no program runs,
-//! every one listed); then the placement ([`PlanInputs::plan`]) runs the
-//! expert rule on the routed layers whose stacks the card experts read
-//! ([`card_routed`]) and keeps the rest of every layer's experts on the host
-//! ([`placement::plan_routed`], the path the other hybrid families plan by),
-//! a window layer's KV a ring of [`runtime::stores::ring_rows`] under
-//! [`Rows::Ring`] and a full plane under [`Rows::Plane`], a full layer a
-//! plane either way, and
-//! refuses by name a
-//! machine that hangs an expert tier card, a context of no position and a
-//! host room that cannot hold the host experts: the body serves no NVMe
-//! expert tier, so a plan that pages one ([`PlaceError::NoNvmeTier`]) would
-//! load experts nothing serves.
+//! A mimo2 file planned onto a machine: the common hybrid owner's plan
+//! ([`place_hybrid`]) over this family's reading, as `glm5next::place` is for
+//! GLM. The hyperparameters, every tensor's role and the typed description are
+//! read here ([`PlanInputs::read`], which refuses a file whose next-token
+//! layers carry tensors — the draft that reads them is a later round's — and
+//! one with a feature no program runs, every one listed); what each layer
+//! holds, the expert rule and the refusals are the owner's.
 
-use std::num::NonZeroUsize;
+use gguf::Split;
 
-use bloomery_placement::slots::{SeqTerms, Stores};
-use gguf::{GgmlType, Split};
-use models::ModelSpec;
-
-use super::hparams::{Hparams, Kind};
+use super::hparams::Hparams;
 use super::{roles, spec};
 use crate::arch::chat_of;
-use crate::arch::coverage;
-use crate::placement::accepts::{Program, routed_rule};
-use crate::placement::ctx_ask::{PlanRefusal, Short, Side};
-use crate::placement::workstation::{self, HostNeed, HostRead};
-use crate::placement::{
-    self, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
-    Unimplemented, Violation, checked, joined,
-};
+use crate::arch::place_hybrid;
+use crate::placement::PlacementError;
 
 // The ring rule's owner is `runtime::stores`; these names stay on this path for
 // `gpu-mimo2` and the gates, which import them from here.
+pub use place_hybrid::{KvLayout, PlaceError, card_routed};
 pub use runtime::stores::{Rows, cut_depth_keeps};
 
-// The prompt batch a window ring keeps room for is the batch the card walks
-// the prompt in.
-const _: () = assert!(runtime::stores::PROMPT_BATCH == crate::moe::UNION_MAX_COLS as u64);
-
-const F16_BYTES: u64 = 2;
-/// Bytes of an f32: a rope row's value.
-const F32_BYTES: u64 = 4;
-
-/// The routed stacks the card experts read, each as the file stores it
-/// ([`CardFormat::KQuant`]): the types the common card leg runs
-/// ([`placement::kernels::card_runs`]). The rule reads a stack's type alone; a
-/// layer with a stack of any other type keeps its experts on the host.
-#[must_use]
-pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
-    placement::kernels::card_runs(ty).then_some(CardFormat::KQuant)
-}
-
 /// What a plan of a mimo2 file is made from, read from its headers.
-#[derive(Clone, Debug)]
-pub struct PlanInputs {
-    /// The file's hyperparameters.
-    pub hp: Hparams,
-    /// Every tensor with its role, and the model's layer and expert counts.
-    pub model: ModelTensors,
-    /// The typed model description the coverage check reads.
-    pub spec: ModelSpec,
-    /// Each trunk layer's KV bytes.
-    pub kv: KvLayout,
-    /// The host's available bytes when the inputs were read, with the
-    /// reading that decided ([`workstation::host_available_read`]): the
-    /// routed experts the room cannot hold follow it to the NVMe tier
-    /// ([`placement::expert_nvme_tier`]), which the body does not serve, so
-    /// such a plan is refused ([`PlaceError::NoNvmeTier`]). A gate that
-    /// plans an arm by a room of its own sets it, read [`HostRead::Given`].
-    ///
-    /// The plan is made at [`workstation::plan_room`]: a read room less
-    /// [`workstation::HOST_DRIFT`], a given room as given.
-    pub room: (u64, HostRead),
-    /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
-    /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
-    /// as its `given`. A gate that plans an arm by an arena of its own sets it.
-    pub arena: Option<u64>,
-}
+pub type PlanInputs = place_hybrid::PlanInputs<Hparams>;
 
-/// Why a plan was refused.
-#[derive(Debug, thiserror::Error)]
-pub enum PlaceError {
-    /// The placement could not be built.
-    #[error(transparent)]
-    Placement(#[from] PlacementError),
-    /// A machine with an expert tier card: this program hangs no expert tier
-    /// on its card experts.
-    #[error(
-        "the machine has the expert tier card {card} (tier {tier}); the program this plan is \
-         for hangs no expert tier"
-    )]
-    Tier {
-        /// The tier card's name.
-        card: String,
-        /// Its index among the machine's tiers.
-        tier: usize,
-    },
-    /// The plan was built and breaks these invariants, every one of them.
-    #[error("the plan breaks its invariants: {}", joined(.0))]
-    Broken(Vec<Violation>),
-    /// A context of no position: no plane, nothing to serve.
-    #[error("ctx_max 0: a plan serves at least one position")]
-    CtxZero,
-    /// The host room cannot hold the host experts, so the plan pages some to
-    /// the NVMe expert tier. The body builds its host run without that tier
-    /// (`HostRun::build`, not the common `host_run` that attaches it), so the
-    /// paged experts would load into nothing that serves them.
-    #[error(
-        "the host need {need} B passes the room, so the plan pages {paged} B of routed experts \
-         to the NVMe expert tier{room}, and the MiMo engine serves no NVMe expert tier; free \
-         host memory (the room is the host's available bytes, or BLOOMERY_HOST_ROOM where set)"
-    )]
-    NoNvmeTier {
-        /// The routed-expert bytes the plan leaves on the NVMe tier.
-        paged: u64,
-        /// The host need before any expert is paged ([`HostNeed::bytes`]).
-        need: u64,
-        /// The room the plan was made at, as the plan names it
-        /// ([`placement::HostTotals::room_clause`]).
-        room: String,
-    },
-}
-
-impl PlanRefusal for PlaceError {
-    fn placement(&self) -> Option<&PlacementError> {
-        match self {
-            Self::Placement(e) => Some(e),
-            _ => None,
-        }
-    }
-
-    fn violations(&self) -> Option<&[Violation]> {
-        match self {
-            Self::Broken(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    /// The card's reading, and the host's: a longer context leaves more
-    /// routed experts to the host, and the body serves no NVMe tier past it
-    /// ([`PlaceError::NoNvmeTier`]), so a smaller context is what that
-    /// refusal asks for. The host held its need less the bytes it paged.
-    fn short(&self) -> Option<Short> {
-        match self {
-            Self::NoNvmeTier { paged, need, .. } => Some(Short {
-                on: Side::Host,
-                need: *need,
-                room: need.saturating_sub(*paged),
-            }),
-            _ => self.card_short(),
-        }
-    }
-}
+/// The engine the plan's refusals name.
+const ENGINE: &str = "MiMo";
 
 impl PlanInputs {
     /// `split`'s hyperparameters, then its tensors' roles, then its
@@ -177,331 +44,30 @@ impl PlanInputs {
                 ),
             });
         }
-        let missing = inputs.unimplemented();
-        if missing.is_empty() {
-            Ok(inputs)
-        } else {
-            Err(PlacementError::Unimplemented(missing))
-        }
+        inputs.runnable()
     }
 
     /// [`PlanInputs::read`] without the refusals: the file as it is, for a
     /// gate that plans or describes a file whatever the coverage list holds,
-    /// and the host's room ([`workstation::host_available_read`]) and the
-    /// arena's given bytes, a room that cannot be read refused by name.
+    /// and the host's room and the arena's given bytes, a room that cannot be
+    /// read refused by name.
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
         let chat = chat_of(split, spec::TOOLS, Some(models::ReasoningFormat::THINK))?;
         let spec = spec::spec_of(&hp, &model, chat)?;
-        let kv = KvLayout::of(&hp);
-        let room = workstation::host_available_read().map_err(PlacementError::HostRoom)?;
-        let arena = workstation::nvtier_arena_given().map_err(PlacementError::HostRoom)?;
-        Ok(PlanInputs {
-            hp,
-            model,
-            spec,
-            kv,
-            room,
-            arena,
-        })
-    }
-
-    /// Every feature of the file the engine does not run, as
-    /// [`coverage::check`] lists them. Empty for a file the program runs.
-    pub fn unimplemented(&self) -> Vec<Unimplemented> {
-        coverage::check(&self.spec, &self.model)
-    }
-
-    /// The placement of the file on `machine` at `ctx_max` positions under
-    /// the placement's `levers`: the expert rule on the layers whose routed
-    /// stacks [`card_routed`] runs, each such layer's id prefix on the card
-    /// as far as its budget holds them, the rest on the host; refused by name
-    /// a context of no position, a machine that hangs an expert tier card,
-    /// a context whose KV planes do not fit the card and a host room under the
-    /// host experts' need ([`PlanInputs::plan_with_slots`]).
-    pub fn plan<'a>(
-        &'a self,
-        machine: &'a Machine,
-        ctx_max: u64,
-        levers: &PlanLevers,
-    ) -> Result<Plan<'a>, PlaceError> {
-        self.plan_with_slots(machine, ctx_max, levers, NonZeroUsize::MIN)
-    }
-
-    /// The placement of a load that serves `slots` resident sequences of
-    /// `ctx_max` positions each: every layer's KV planes counted `slots`
-    /// times on the card ([`SeqTerms::slots_of`] over
-    /// [`PlanInputs::seq_terms`]), refused as [`PlanInputs::plan`] refuses.
-    /// A sequence holds nothing beside its stores, so the card's kv class is
-    /// `slots` sequences' stores.
-    ///
-    /// The host experts are held to the room the inputs name
-    /// ([`PlanInputs::room`]): a room under the host need runs the common
-    /// NVMe tier split ([`placement::expert_nvme_tier`], which refuses a room
-    /// under the tier's floor by name), and a plan that comes out paging any
-    /// routed expert is refused ([`PlaceError::NoNvmeTier`]), for the body
-    /// serves no such tier.
-    pub fn plan_with_slots<'a>(
-        &'a self,
-        machine: &'a Machine,
-        ctx_max: u64,
-        levers: &PlanLevers,
-        slots: NonZeroUsize,
-    ) -> Result<Plan<'a>, PlaceError> {
-        if ctx_max == 0 {
-            return Err(PlaceError::CtxZero);
-        }
-        if let Some((tier, card)) = machine.tiers.iter().enumerate().next() {
-            return Err(PlaceError::Tier {
-                card: card.name.clone(),
-                tier,
-            });
-        }
-        let kv = self.seq_terms().slots_of(slots.get() as u64);
-        let mut plan = placement::plan_routed(
-            &self.model,
-            machine,
-            ctx_max,
-            &kv,
-            levers,
-            routed_rule(Program::Mimo2Body),
-        )?;
-        let need = HostNeed::of(&plan, 0).bytes();
-        let room = plan.plan_at(&self.room);
-        placement::expert_nvme_tier(&mut plan, room, self.arena)?;
-        if plan.host.nvme_expert_bytes > 0 {
-            return Err(PlaceError::NoNvmeTier {
-                paged: plan.host.nvme_expert_bytes,
-                need,
-                room: plan.host.room_clause(),
-            });
-        }
-        checked(plan).map_err(PlaceError::Broken)
-    }
-
-    /// What one resident sequence of a load of the file holds on its card
-    /// ([`SeqTerms`]): its stores over the trunk's layers ([`KvLayout`]), no
-    /// draft and nothing beside them — the body's sequence is its layers'
-    /// KV planes alone.
-    #[must_use]
-    pub fn seq_terms(&self) -> SeqTerms<'_> {
-        SeqTerms {
-            layers: Stores {
-                kv: &self.kv,
-                count: self.hp.n_trunk,
-            },
-            draft: None,
-            beside: 0,
-        }
-    }
-}
-
-/// One file's per-layer KV bytes. A full layer holds a plane of every
-/// position. A window layer holds that plane under [`Rows::Plane`], and
-/// [`runtime::stores::ring_rows`] rows under [`Rows::Ring`]. Each row is the layer's KV-head
-/// count's key and value rows in f16.
-#[derive(Clone, Debug)]
-pub struct KvLayout {
-    /// Per trunk layer: its KV-head count (`attention.head_count_kv`).
-    kv_heads: Vec<usize>,
-    /// Per trunk layer: the sliding window, or none for a full layer.
-    windows: Vec<Option<u64>>,
-    /// One KV head's key and value rows a position, in bytes: the key and
-    /// value head widths (`attention.key_length`,
-    /// `attention.value_length`) in f16.
-    row: u64,
-    /// Which row count a window layer uses.
-    rows: Rows,
-    /// The rope rows the body copies to its card, in bytes a position: one
-    /// table of `rope.dimension_count` f32 values a position for each
-    /// distinct rope base the trunk's layers turn by (the full layers' and,
-    /// when it differs, the window layers'), as `gpu-mimo2`'s body builds
-    /// them (`RopeBase`, deduplicated by base).
-    rope_row: u64,
-}
-
-impl KvLayout {
-    /// The layout `hp` describes, window layers on the ring.
-    #[must_use]
-    pub fn of(hp: &Hparams) -> KvLayout {
-        KvLayout::with_rows(hp, Rows::Ring)
-    }
-
-    /// [`KvLayout::of`] with the window layers on `rows`.
-    #[must_use]
-    pub fn with_rows(hp: &Hparams, rows: Rows) -> KvLayout {
-        let n = hp.n_trunk;
-        KvLayout {
-            kv_heads: hp.kv_heads[..n].to_vec(),
-            windows: hp.kinds[..n]
-                .iter()
-                .map(|k| match k {
-                    Kind::Swa => Some(hp.window as u64),
-                    Kind::Full => None,
-                })
-                .collect(),
-            row: (hp.head_k + hp.head_v) as u64 * F16_BYTES,
-            rows,
-            rope_row: rope_bases(hp) * hp.rope_dims as u64 * F32_BYTES,
-        }
-    }
-
-    /// The bytes of layers `layers` at `ctx_max` positions: what a card that
-    /// runs them holds beside its weights ([`KvBytes::layer_bytes`] summed).
-    #[must_use]
-    pub fn bytes(&self, layers: std::ops::Range<usize>, ctx_max: u64) -> u64 {
-        layers.map(|l| self.layer_bytes(l, ctx_max)).sum()
-    }
-
-    /// The rows layer `layer` holds at `ctx_max`. A layer past the trunk
-    /// holds none.
-    #[must_use]
-    pub fn rows_at(&self, layer: usize, ctx_max: u64) -> u64 {
-        if self.kv_heads.get(layer).is_none() {
-            return 0;
-        }
-        self.rows
-            .count(self.windows.get(layer).copied().flatten(), ctx_max)
-    }
-}
-
-/// The distinct rope bases the trunk's layers turn by: the full layers'
-/// base when a full layer is in the trunk, the window layers' when a window
-/// layer is and it differs.
-fn rope_bases(hp: &Hparams) -> u64 {
-    let mut bases: Vec<u32> = Vec::new();
-    for k in &hp.kinds[..hp.n_trunk] {
-        let base = match k {
-            Kind::Full => hp.rope_base,
-            Kind::Swa => hp.rope_base_swa,
-        };
-        if !bases.contains(&base.to_bits()) {
-            bases.push(base.to_bits());
-        }
-    }
-    bases.len() as u64
-}
-
-impl KvBytes for KvLayout {
-    fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-        self.kv_heads
-            .get(layer)
-            .map_or(0, |&kv| self.rows_at(layer, ctx_max) * kv as u64 * self.row)
-    }
-
-    fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
-        self.rope_row * ctx_max
+        PlanInputs::new(ENGINE, hp, model, spec)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use gguf::{GgmlType, Split};
+    use gguf::Split;
 
     use super::super::hparams::tests::{keys, tensors};
-    use runtime::stores::ring_rows;
-
-    use super::{
-        CardFormat, F16_BYTES, KvBytes, KvLayout, PlaceError, PlanInputs, PlanLevers, Rows,
-        SeqTerms, Stores, card_routed,
-    };
+    use super::{PlaceError, PlanInputs};
     use crate::arch::synthetic::{V, header_shaped};
-    use crate::placement::workstation;
-
-    /// A layer's rows: its own KV-head count's key and value rows in f16 a
-    /// position. Layers 1 and 2 are a window of 8; 0 and 3 are full. At 9
-    /// positions the ring still holds every position, because
-    /// [`ring_rows`] pads the window plus one prompt batch past 9.
-    /// Past that pad the ring stays at the pad and the plane grows with the
-    /// context. A layer past the trunk holds nothing. The widths are the
-    /// `hparams` tests' small header's: key 16 and value 8 values, 2 KV heads
-    /// on a full layer and 1 on a window one.
-    fn layout(rows: Rows) -> KvLayout {
-        KvLayout {
-            kv_heads: vec![2, 1, 1, 2],
-            windows: vec![None, Some(8), Some(8), None],
-            row: (16 + 8) as u64 * F16_BYTES,
-            rows,
-            rope_row: 2 * 64 * 4,
-        }
-    }
-
-    #[test]
-    fn layer_bytes() {
-        let pad = ring_rows(8, u64::MAX);
-        assert!(pad > 9, "the ring pad is past the 9-position case");
-        for rows in [Rows::Ring, Rows::Plane] {
-            let kv = layout(rows);
-            assert_eq!(kv.row, 48);
-            assert_eq!(kv.layer_bytes(0, 9), 9 * 2 * 48);
-            assert_eq!(kv.layer_bytes(1, 9), 9 * 48);
-            assert_eq!(kv.layer_bytes(4, 9), 0);
-            assert_eq!(kv.bytes(0..4, 1), 6 * 48);
-            assert_eq!(kv.bytes(0..4, 9), 9 * 6 * 48);
-        }
-        let ring = layout(Rows::Ring);
-        let plane = layout(Rows::Plane);
-        let past = pad + 32;
-        assert_eq!(ring.rows_at(1, past), pad);
-        assert_eq!(plane.rows_at(1, past), past);
-        assert_eq!(ring.layer_bytes(1, past), pad * 48);
-        assert_eq!(plane.layer_bytes(1, past), past * 48);
-        assert_eq!(ring.layer_bytes(0, past), past * 2 * 48);
-        assert_eq!(plane.layer_bytes(0, past), past * 2 * 48);
-    }
-
-    /// The published MiMo trunk: nine full layers of 4 KV heads and thirty-nine
-    /// window layers of 8, each value 320 f16 bytes a head. A position is
-    /// 222,720 B on either term, because the ring is the context. At the gate
-    /// context the plane is that figure times 4,160 and the ring is the full
-    /// layers' plane plus 768 window rows.
-    #[test]
-    fn the_ring_bytes_at_the_gate_context() {
-        let full = [0usize, 5, 11, 17, 23, 29, 35, 41, 47];
-        let mut kv_heads = vec![8usize; 48];
-        let mut windows = vec![Some(128u64); 48];
-        for &layer in &full {
-            kv_heads[layer] = 4;
-            windows[layer] = None;
-        }
-        let row = (192 + 128) as u64 * super::F16_BYTES;
-        let layout = |rows: Rows| KvLayout {
-            kv_heads: kv_heads.clone(),
-            windows: windows.clone(),
-            row,
-            rows,
-            rope_row: 0,
-        };
-        let plane = layout(Rows::Plane);
-        let ring = layout(Rows::Ring);
-        assert_eq!(plane.bytes(0..48, 1), 222_720);
-        assert_eq!(ring.bytes(0..48, 1), 222_720);
-        assert_eq!(plane.bytes(0..48, 4_160), 4_160 * 222_720);
-        assert_eq!(ring.bytes(0..48, 4_160), 249_200_640);
-        assert_eq!(ring_rows(128, 4_160), 768);
-    }
-
-    /// One sequence's terms are the layout's stores over the trunk with
-    /// nothing beside them, and `slots` sequences count each layer `slots`
-    /// times — the card's kv class of a load that serves them.
-    #[test]
-    fn seq_terms_count_every_sequence() {
-        let kv = layout(Rows::Ring);
-        let terms = SeqTerms {
-            layers: Stores { kv: &kv, count: 4 },
-            draft: None,
-            beside: 0,
-        };
-        assert_eq!(terms.bytes(9, 1), kv.bytes(0..4, 9));
-        assert_eq!(terms.bytes(9, 3), 3 * kv.bytes(0..4, 9));
-        assert_eq!(terms.plan_kv(9, 3), 3 * kv.bytes(0..4, 9));
-        let three = terms.slots_of(3);
-        for l in 0..4 {
-            assert_eq!(three.layer_bytes(l, 9), 3 * kv.layer_bytes(l, 9));
-        }
-        assert_eq!(three.layer_bytes(4, 9), 0);
-    }
+    use crate::placement::{KvBytes, PlanLevers, workstation};
 
     /// A file whose next-token layers carry tensors is refused at
     /// [`PlanInputs::read`] by the next-token count's name — the draft that
@@ -528,41 +94,6 @@ mod tests {
             err.contains("feature(s) of this file are not implemented"),
             "{err}"
         );
-    }
-
-    /// A stack is card-routed when the common kernel table gives its type the
-    /// entries this program's leg launches, and not otherwise: the types the
-    /// table runs on the card for other families (Q8_0 and IQ4_NL) and the
-    /// ones it has no row for (Q2_K, the floats) keep their layer's experts on
-    /// the host.
-    // PIN(2026-10-11): card_runs now runs Q4_K/Q5_K through the common leg.
-    // PIN(2026-10-11): the leg also runs IQ2_XS, IQ3_XXS and IQ4_XS (the
-    // raw-block entries of `iq_sel.rs`), so those three are card-routed too.
-    // PIN(2026-10-12): the leg also runs IQ3_S (`iq3_s_gate_up_sel`,
-    // `iq3_s_gemv_sel`), so it is card-routed too.
-    #[test]
-    fn only_the_stacks_the_leg_runs_are_card_routed() {
-        for ty in [
-            GgmlType::MXFP4,
-            GgmlType::Q4_K,
-            GgmlType::Q5_K,
-            GgmlType::IQ2_XS,
-            GgmlType::IQ3_XXS,
-            GgmlType::IQ3_S,
-            GgmlType::IQ4_XS,
-        ] {
-            assert_eq!(card_routed(ty), Some(CardFormat::KQuant), "{ty}");
-        }
-        for ty in [
-            GgmlType::Q8_0,
-            GgmlType::IQ4_NL,
-            GgmlType::Q2_K,
-            GgmlType::Q3_K,
-            GgmlType::F32,
-            GgmlType::BF16,
-        ] {
-            assert_eq!(card_routed(ty), None, "{ty}");
-        }
     }
 
     /// A machine that hangs an expert tier card is refused by name, before
@@ -602,28 +133,6 @@ mod tests {
             inputs.plan(&machine, 0, &levers),
             Err(PlaceError::CtxZero)
         ));
-    }
-
-    /// A host room under the host experts' need is refused by name: the need,
-    /// the bytes the plan pages, the room the plan was made at, and that the
-    /// engine serves no NVMe expert tier. The serve gate holds the fixed words
-    /// (`gate_mimo2_serve`'s `NO_TIER_REFUSAL`).
-    #[test]
-    fn a_room_under_the_host_need_is_refused_by_name() {
-        let err = PlaceError::NoNvmeTier {
-            paged: 1_073_741_824,
-            need: 150_000_000_000,
-            room: "; the plan was made at a reading of 149000000000 B (plan room 149000000000 B)"
-                .to_owned(),
-        };
-        assert_eq!(
-            err.to_string(),
-            "the host need 150000000000 B passes the room, so the plan pages 1073741824 B of \
-             routed experts to the NVMe expert tier; the plan was made at a reading of \
-             149000000000 B (plan room 149000000000 B), and the MiMo engine serves no NVMe \
-             expert tier; free host memory (the room is the host's available bytes, or \
-             BLOOMERY_HOST_ROOM where set)"
-        );
     }
 
     /// The small header of the `hparams` tests' keys with its next-token
@@ -666,10 +175,7 @@ mod tests {
             inputs
         };
         let two = describe("mimo2-rope-two", &keys());
-        assert_eq!(
-            KvLayout::of(&two.hp).stage_position_bytes(10),
-            2 * 4 * 4 * 10
-        );
+        assert_eq!(two.kv.stage_position_bytes(10), 2 * 4 * 4 * 10);
         let one_base: Vec<_> = keys()
             .into_iter()
             .map(|(k, v)| match k {
@@ -678,7 +184,7 @@ mod tests {
             })
             .collect();
         let one = describe("mimo2-rope-one", &one_base);
-        assert_eq!(KvLayout::of(&one.hp).stage_position_bytes(10), 4 * 4 * 10);
+        assert_eq!(one.kv.stage_position_bytes(10), 4 * 4 * 10);
         let machine = workstation::plan_gate(two.hp.n_trunk);
         let plan = two
             .plan(&machine, 1024, &PlanLevers::default())

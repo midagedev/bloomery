@@ -74,6 +74,9 @@ pub enum Arch {
     /// Nemotron-H with latent mixture-of-experts layers in place of the
     /// dense MLP ones.
     NemotronHMoe,
+    /// Solar-Open2: Kimi delta attention layers with a NoPE GQA layer every fourth, routed
+    /// experts with a shared one in every layer.
+    SolarOpen2,
     GemmaEmbedding,
     GemmaEmbedding2,
 }
@@ -96,6 +99,7 @@ impl Arch {
             Arch::MiniMaxM3 => "minimax-m3",
             Arch::NemotronH => "nemotron_h",
             Arch::NemotronHMoe => "nemotron_h_moe",
+            Arch::SolarOpen2 => "solar-open2",
             Arch::GemmaEmbedding => "gemma-embedding",
             Arch::GemmaEmbedding2 => "gemma-embedding2",
         }
@@ -229,8 +233,8 @@ pub struct Gqa {
     pub rope: Rope,
     /// A per-head RMS gain on q and k before the rope.
     pub qk_norm: bool,
-    /// `attn_q` also writes a per-head gate; the output is multiplied by its sigmoid.
-    pub out_gate: bool,
+    /// The gate on the attention output; [`OutGate::None`]: the output is not gated.
+    pub out_gate: OutGate,
     /// `None`: every position is attended.
     pub select: Option<Selector>,
     /// The raw positions attended; `None`: every position. An encoder's
@@ -240,6 +244,17 @@ pub struct Gqa {
     pub sinks: bool,
     /// A multiplier on the attention's value rows; `None`: 1.
     pub value_scale: Option<f32>,
+}
+
+/// Where a GQA layer's output gate comes from; the attention output is multiplied by its sigmoid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutGate {
+    /// No gate.
+    None,
+    /// `attn_q` also writes a per-head gate beside the query, interleaved with it.
+    Packed,
+    /// A projection of the layer input of its own (`attn_gate`).
+    Proj,
 }
 
 impl Gqa {
@@ -728,6 +743,9 @@ pub enum ToolFormat {
     /// Qwen's `<tool_call><function=NAME><parameter=KEY>…</parameter>
     /// </function></tool_call>`, which MiMo-V2's template teaches.
     QwenXml,
+    /// A call on tagged lines: `<|tool_call:start|>NAME`, one `<|tool_arg:start|>KEY<|tool_arg:value|>VALUE
+    /// <|tool_arg:end|>` per argument, `<|tool_call:end|>`, which Solar-Open's template teaches.
+    TagKv,
 }
 
 /// A reasoning span syntax.

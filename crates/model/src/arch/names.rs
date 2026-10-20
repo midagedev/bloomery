@@ -169,6 +169,63 @@ pub fn indexer_k_norm(l: usize) -> String {
     blk(l, "indexer.k_norm.weight")
 }
 
+// ----------------------------------------------------- the KDA mixer's names ([`crate::arch::kda`])
+
+/// `blk.{l}.ssm_conv1d_{part}.weight` — the conv taps of the `q`, `k` or `v` channels, one set per
+/// channel.
+#[must_use]
+pub fn ssm_conv1d(l: usize, part: char) -> String {
+    blk(l, &format!("ssm_conv1d_{part}.weight"))
+}
+
+/// `blk.{l}.ssm_f_a.weight` — the forget gate's down projection.
+#[must_use]
+pub fn ssm_f_a(l: usize) -> String {
+    blk(l, "ssm_f_a.weight")
+}
+
+/// `blk.{l}.ssm_f_b.weight` — the forget gate's up projection.
+#[must_use]
+pub fn ssm_f_b(l: usize) -> String {
+    blk(l, "ssm_f_b.weight")
+}
+
+/// `blk.{l}.ssm_g_a.weight` — the output gate's down projection.
+#[must_use]
+pub fn ssm_g_a(l: usize) -> String {
+    blk(l, "ssm_g_a.weight")
+}
+
+/// `blk.{l}.ssm_g_b.weight` — the output gate's up projection.
+#[must_use]
+pub fn ssm_g_b(l: usize) -> String {
+    blk(l, "ssm_g_b.weight")
+}
+
+/// `blk.{l}.ssm_beta.weight` — the delta rule's write strength, one per head.
+#[must_use]
+pub fn ssm_beta(l: usize) -> String {
+    blk(l, "ssm_beta.weight")
+}
+
+/// `blk.{l}.ssm_a` — the decay's rate per head.
+#[must_use]
+pub fn ssm_a(l: usize) -> String {
+    blk(l, "ssm_a")
+}
+
+/// `blk.{l}.ssm_dt.bias` — the decay's bias per channel.
+#[must_use]
+pub fn ssm_dt_bias(l: usize) -> String {
+    blk(l, "ssm_dt.bias")
+}
+
+/// `blk.{l}.ssm_norm.weight` — the RMS gain of the gated output norm, one head wide.
+#[must_use]
+pub fn ssm_norm(l: usize) -> String {
+    blk(l, "ssm_norm.weight")
+}
+
 /// Layer `l`'s routed experts' gate, up and down stack names, in stack order:
 /// `blk.{l}.ffn_{gate,up,down}_exps.weight`, the GGUF convention of every MoE
 /// family here.
@@ -225,7 +282,7 @@ mod tests {
     #[test]
     fn the_per_layer_names_are_the_gguf_spellings() {
         type Name = fn(usize) -> String;
-        let table: [(Name, &str); 22] = [
+        let table: [(Name, &str); 30] = [
             (attn_norm, "attn_norm.weight"),
             (attn_q, "attn_q.weight"),
             (attn_k, "attn_k.weight"),
@@ -248,11 +305,21 @@ mod tests {
             (indexer_k_proj, "indexer.k_proj.weight"),
             (indexer_q_norm, "indexer.q_norm.weight"),
             (indexer_k_norm, "indexer.k_norm.weight"),
+            (ssm_f_a, "ssm_f_a.weight"),
+            (ssm_f_b, "ssm_f_b.weight"),
+            (ssm_g_a, "ssm_g_a.weight"),
+            (ssm_g_b, "ssm_g_b.weight"),
+            (ssm_beta, "ssm_beta.weight"),
+            (ssm_a, "ssm_a"),
+            (ssm_dt_bias, "ssm_dt.bias"),
+            (ssm_norm, "ssm_norm.weight"),
         ];
         for (name, stem) in table {
             assert_eq!(name(7), format!("blk.7.{stem}"));
         }
         assert_eq!(ffn_down_shexp(7), "blk.7.ffn_down_shexp.weight");
+        assert_eq!(ssm_conv1d(7, 'q'), "blk.7.ssm_conv1d_q.weight");
+        assert_eq!(ssm_conv1d(7, 'v'), "blk.7.ssm_conv1d_v.weight");
     }
 
     /// The three model-level names and the block spelling are one function

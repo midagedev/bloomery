@@ -23,6 +23,7 @@ pub mod quant;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen4exp;
+pub mod solar2;
 pub mod tokenizer;
 
 /// Each architecture's families, by the architecture's name.
@@ -33,6 +34,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (qwen35::ARCH, qwen35::FAMILIES),
     (glm5next::ARCH, glm5next::FAMILIES),
     (mimo2::ARCH, mimo2::FAMILIES),
+    (solar2::ARCH, solar2::FAMILIES),
     (minicpmv4_7::ARCH, minicpmv4_7::FAMILIES),
     (qwen4exp::ARCH, qwen4exp::FAMILIES),
     (nemotron_h::ARCH, nemotron_h::FAMILIES),

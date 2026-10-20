@@ -20,7 +20,7 @@ use gguf::{GgmlType, Split, TensorInfo};
 use models::headpick::HeadSet;
 use models::{
     Arch, DraftSpec, Ffn, Gqa, HcKind, LayerSpec, Mixer, ModelSpec, MtpDraft, MtpHeadNorm,
-    MtpInput, MtpSource, Residual, Rope, RopeMode,
+    MtpInput, MtpSource, OutGate, Residual, Rope, RopeMode,
 };
 
 use super::hparams::{
@@ -795,7 +795,7 @@ fn layer_of(
     let q = blk(index, "attn_q.weight");
     let rows = named(tensors, &q)?.dims.get(1).copied();
     let gate = out_gate(q.clone(), rows, heads, head_dim)?;
-    if !gate {
+    if gate != OutGate::Packed {
         return Err(PlacementError::Tensor {
             name: q,
             detail: "writes the query without the per-head gate".to_string(),
@@ -836,7 +836,7 @@ fn layer_of(
                 yarn: None,
             },
             qk_norm: true,
-            out_gate: true,
+            out_gate: OutGate::Packed,
             select: None,
             window: None,
             sinks: false,
@@ -861,7 +861,7 @@ fn named<'a>(tensors: &'a ModelTensors, name: &str) -> Result<&'a ModelTensor, P
 
 #[cfg(test)]
 mod tests {
-    use models::{Borrows, DraftSpec, Mixer, ModelSpec, MtpDraft, MtpSource};
+    use models::{Borrows, DraftSpec, Mixer, ModelSpec, MtpDraft, MtpSource, OutGate};
 
     use super::super::hparams::tests::{keys, tensors};
     use super::super::hparams::{ATTN_STEMS, EXP_LAYER_STEMS};
@@ -1087,7 +1087,7 @@ mod tests {
     }
 
     fn dense(m: &MtpDraft) -> bool {
-        matches!(&m.layer.mixer, Mixer::Gqa(g) if g.select.is_none() && g.out_gate && g.qk_norm)
+        matches!(&m.layer.mixer, Mixer::Gqa(g) if g.select.is_none() && g.out_gate == OutGate::Packed && g.qk_norm)
     }
 
     #[test]
@@ -1435,7 +1435,7 @@ mod tests {
 // PIN(2026-10-14): card-byte tests removed with the unused sizing API.
 #[cfg(test)]
 mod in_file_tests {
-    use models::{Ffn, Mixer, MtpHeadNorm, MtpInput, MtpSource, Residual};
+    use models::{Ffn, Mixer, MtpHeadNorm, MtpInput, MtpSource, OutGate, Residual};
 
     use super::{EH_JOIN, InFile, in_file};
     use crate::arch::Read;
@@ -1582,7 +1582,7 @@ mod in_file_tests {
         let Mixer::Gqa(g) = &d.layer.mixer else {
             panic!("the mixer is not full attention: {:?}", d.layer.mixer);
         };
-        assert!(g.out_gate && g.qk_norm && g.select.is_none());
+        assert!(g.out_gate == OutGate::Packed && g.qk_norm && g.select.is_none());
         let Ffn::Moe(moe) = &d.layer.ffn else {
             panic!("the feed-forward block is not routed");
         };

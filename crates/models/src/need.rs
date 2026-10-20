@@ -11,8 +11,8 @@ use gguf::GgmlType;
 use crate::shape::MoeShape;
 use crate::{
     Act, Collapse, DeltaKind, EngramSpec, Extra, Ffn, GdnGate, HcKind, HcMix, IndexKeys, KdaGate,
-    LatentUp, LayerIdx, Mixer, ModelSpec, NgramRule, PoolRule, Residual, RopeMode, Score, Selector,
-    Source,
+    LatentUp, LayerIdx, Mixer, ModelSpec, NgramRule, OutGate, PoolRule, Residual, RopeMode, Score,
+    Selector, Source,
 };
 
 /// A feature of a file the engine does not run yet: what it is, and the layer
@@ -59,6 +59,9 @@ pub enum Need {
     },
     /// The GQA output multiplied by a per-head sigmoid gate `attn_q` writes.
     OutGate,
+    /// The GQA output multiplied by a sigmoid gate a projection of the layer input of its own
+    /// writes.
+    OutGateProj,
     /// Latent attention over `latent`-value rows with `rope` rotated values.
     Latent {
         latent: u32,
@@ -249,6 +252,9 @@ impl fmt::Display for Need {
                 )
             }
             Need::OutGate => f.write_str("attention output gate: sigmoid, interleaved with q"),
+            Need::OutGateProj => {
+                f.write_str("attention output gate: sigmoid of its own projection")
+            }
             Need::Latent { latent, rope, up } => match up {
                 LatentUp::KeqV => write!(f, "latent attention {latent} x rope {rope}, K = V"),
                 LatentUp::Absorbed { qk, v } => write!(
@@ -488,8 +494,10 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                         dims: g.rope.dims,
                     });
                 }
-                if g.out_gate {
-                    at(Need::OutGate);
+                match g.out_gate {
+                    OutGate::None => {}
+                    OutGate::Packed => at(Need::OutGate),
+                    OutGate::Proj => at(Need::OutGateProj),
                 }
                 if let Some(e) = &spec.encoder
                     && e.value_norm

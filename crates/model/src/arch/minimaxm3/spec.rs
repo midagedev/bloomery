@@ -7,8 +7,8 @@
 
 use gguf::Split;
 use models::{
-    Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, Moe, Residual, Rope, RopeMode,
-    Router, Score, Selector, Shared,
+    Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate, Residual, Rope, RopeMode,
+    Selector,
 };
 
 use super::hparams::{Hparams, Kind, SWIGLU_ALPHA, SWIGLU_LIMIT};
@@ -66,7 +66,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
             value_dim: spec_u32("attention.key_length", hp.head_dim)?,
             rope,
             qk_norm: true,
-            out_gate: false,
+            out_gate: OutGate::None,
             select,
             window: None,
             sinks: false,
@@ -84,28 +84,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
                     act: ACT,
                 }
             }
-            Kind::Sparse => {
-                let x = &hp.experts;
-                Ffn::Moe(Moe {
-                    experts: spec_u32("expert_count", x.n_expert)?,
-                    top_k: spec_u32("expert_used_count", x.n_used)?,
-                    expert_ff: spec_u32("expert_feed_forward_length", x.ff)?,
-                    latent: None,
-                    act: ACT,
-                    router: Router {
-                        score: Score::Sigmoid,
-                        bias: true,
-                        norm: x.weights_norm,
-                        scale: x.weights_scale,
-                        hash: false,
-                    },
-                    shared: Some(Shared {
-                        ff: spec_u32("expert_shared_count", x.shared_ff())?,
-                        act: ACT,
-                        sigmoid_gate: false,
-                    }),
-                })
-            }
+            Kind::Sparse => hp.experts.ffn(ACT)?,
         };
         Ok(LayerSpec {
             mixer,
@@ -131,7 +110,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
 
 #[cfg(test)]
 mod tests {
-    use models::{Act, Ffn, Mixer, Score, Selector};
+    use models::{Act, Ffn, Mixer, OutGate, Score, Selector};
 
     use super::super::hparams::tests::{keys, tensors};
     use super::{SWIGLU_ALPHA, SWIGLU_LIMIT};
@@ -184,7 +163,7 @@ mod tests {
                 (8, 2, 16, 16)
             );
             assert_eq!((g.rope.dims, g.rope.base), (8, 5_000_000.0));
-            assert!(g.qk_norm && !g.out_gate && g.window.is_none() && !g.sinks);
+            assert!(g.qk_norm && g.out_gate == OutGate::None && g.window.is_none() && !g.sinks);
             assert!(g.value_scale.is_none());
             if l < 2 {
                 assert_eq!(g.select, None, "layer {l} attends every position");

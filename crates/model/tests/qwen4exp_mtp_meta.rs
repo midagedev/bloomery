@@ -28,10 +28,11 @@ const OWN: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-Q8_0.gguf";
 // PIN(2026-09-28): the draft's description, both files alike but for the source line [the header
 // dump: block_count 49, nextn_predict_layers 1, compress_ratios[48] = 0 of 49 values, blk.48 GQA
 // 24/2 x 256 with the gate in attn_q, 512/10 experts of 640 with a gated shared expert of 640].
+// PIN(2026-10-20): `out_gate true` -> `out_gate Packed`: `Gqa.out_gate` became the `OutGate` enum, which the view renders with Debug; the values are the same.
 const VIEW: &[&str] = &[
     "index 48 hidden 2560 vocab 248320 rms_eps bits 0x358637bd",
     "hc Some(HcSpec { streams: 4, kind: Gated { rank: 320 } }) input Streams head_norm HcHead head_rows Full",
-    "gqa 24/2 x 256 rope Imrope { sections: [11, 11, 10, 0] } 64 base 10000000 yarn - qk_norm true out_gate true || moe 512/10 ff 640 swiglu None Softmax bias false norm true x1 hash false shared 640 swiglu None gate true || hc",
+    "gqa 24/2 x 256 rope Imrope { sections: [11, 11, 10, 0] } 64 base 10000000 yarn - qk_norm true out_gate Packed || moe 512/10 ff 640 swiglu None Softmax bias false norm true x1 hash false shared 640 swiglu None gate true || hc",
 ];
 
 // PIN(2026-09-28): each file's tensor bytes, the header excluded [the header dump's TOTAL lines:

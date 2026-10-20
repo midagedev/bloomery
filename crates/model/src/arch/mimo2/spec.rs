@@ -11,8 +11,8 @@
 
 use gguf::Split;
 use models::{
-    Act, Arch, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, Moe, ReasoningFormat, Residual, Rope,
-    RopeMode, Router, Score, ToolFormat,
+    Act, Arch, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, Moe, OutGate, ReasoningFormat, Residual,
+    Rope, RopeMode, Router, Score, ToolFormat,
 };
 
 use super::hparams::{Hparams, Kind};
@@ -64,7 +64,7 @@ pub fn spec_of(
                 yarn: None,
             },
             qk_norm: false,
-            out_gate: false,
+            out_gate: OutGate::None,
             select: None,
             // The window layers attend the last `sliding_window` positions;
             // their sinks are the `attn_sinks` tensor where the file has it.
