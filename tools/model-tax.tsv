@@ -180,3 +180,7 @@ crates/serve/src/reasoning.rs	deepseek	4	baseline D 4: MK7 tool format and reaso
 crates/vision/src/media.rs	minicpm	1	baseline D 1: media design: VideoRule data per tower (vidcore)
 crates/gpu-gates/src/bin/gate_radio_tower.rs	clef	4	PIN(2026-10-20) clef: the image sets' reader every tower gate shares is still named after Clef (refset::clefvis)
 crates/gpu-gates/src/bin/gate_radio_tower.rs	nemotron	5	PIN(2026-10-20) nemotron: the RADIO tower is Bolt's mmproj; the gate bin names its model until the tower gates take the model from a profile row
+crates/model/src/arch/mod.rs	minimax	1	PIN(2026-10-20) minimax: the family's module declaration (`pub mod minimaxm3;`); the module list is not a registry, so each family declares its directory here until the registry owns the modules
+crates/models/src/lib.rs	minimax	2	PIN(2026-10-20) minimax: ModelSpec.arch names the family by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
+crates/placement/src/accepts.rs	minimax	1	PIN(2026-10-20) minimax: program_of matches every models::Arch exhaustively, so the variant needs an arm; None until the family's body adds its Program
+crates/gpu-gates/src/bin/shared/routed_legs.rs	minimax	2	PIN(2026-10-20) minimax: family_of and skip_of match every models::Arch exhaustively; the family has no routed-legs adapter until its body exists

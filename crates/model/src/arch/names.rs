@@ -26,17 +26,136 @@ pub fn output() -> String {
     "output.weight".to_string()
 }
 
+// ------------------------------------------------ the per-layer names families share
+//
+// Every family that carries one of these tensors spells it alike (llama.cpp's `tn()` table), so
+// a family re-exports the ones it reads and defines only the names its architecture adds.
+
+/// `blk.{l}.attn_norm.weight` — the pre-attention RMS gain.
+#[must_use]
+pub fn attn_norm(l: usize) -> String {
+    blk(l, "attn_norm.weight")
+}
+
+/// `blk.{l}.attn_q.weight` — the query projection, every head.
+#[must_use]
+pub fn attn_q(l: usize) -> String {
+    blk(l, "attn_q.weight")
+}
+
+/// `blk.{l}.attn_k.weight` — the key projection, every key head.
+#[must_use]
+pub fn attn_k(l: usize) -> String {
+    blk(l, "attn_k.weight")
+}
+
+/// `blk.{l}.attn_v.weight` — the value projection, every value head.
+#[must_use]
+pub fn attn_v(l: usize) -> String {
+    blk(l, "attn_v.weight")
+}
+
+/// `blk.{l}.attn_q_norm.weight` — the RMS gain every query head is normed with, one head wide.
+#[must_use]
+pub fn attn_q_norm(l: usize) -> String {
+    blk(l, "attn_q_norm.weight")
+}
+
+/// `blk.{l}.attn_k_norm.weight` — the RMS gain every key head is normed with, one head wide.
+#[must_use]
+pub fn attn_k_norm(l: usize) -> String {
+    blk(l, "attn_k_norm.weight")
+}
+
+/// `blk.{l}.attn_output.weight` — the projection from the heads' outputs back to the residual.
+#[must_use]
+pub fn attn_output(l: usize) -> String {
+    blk(l, "attn_output.weight")
+}
+
+/// `blk.{l}.ffn_norm.weight` — the pre-FFN RMS gain.
+#[must_use]
+pub fn ffn_norm(l: usize) -> String {
+    blk(l, "ffn_norm.weight")
+}
+
+/// `blk.{l}.ffn_gate.weight` — a dense FFN's gate.
+#[must_use]
+pub fn ffn_gate(l: usize) -> String {
+    blk(l, "ffn_gate.weight")
+}
+
+/// `blk.{l}.ffn_up.weight` — a dense FFN's up.
+#[must_use]
+pub fn ffn_up(l: usize) -> String {
+    blk(l, "ffn_up.weight")
+}
+
+/// `blk.{l}.ffn_down.weight` — a dense FFN's down.
+#[must_use]
+pub fn ffn_down(l: usize) -> String {
+    blk(l, "ffn_down.weight")
+}
+
+/// `blk.{l}.ffn_gate_inp.weight` — the router, one logit per expert.
+#[must_use]
+pub fn ffn_gate_inp(l: usize) -> String {
+    blk(l, "ffn_gate_inp.weight")
+}
+
+/// `blk.{l}.exp_probs_b.bias` — the router's selection bias, which steers the choice only.
+#[must_use]
+pub fn exp_probs_b(l: usize) -> String {
+    blk(l, "exp_probs_b.bias")
+}
+
+/// `blk.{l}.ffn_gate_exps.weight` — the routed experts' gate stack.
+#[must_use]
+pub fn ffn_gate_exps(l: usize) -> String {
+    blk(l, "ffn_gate_exps.weight")
+}
+
+/// `blk.{l}.ffn_up_exps.weight` — the routed experts' up stack.
+#[must_use]
+pub fn ffn_up_exps(l: usize) -> String {
+    blk(l, "ffn_up_exps.weight")
+}
+
+/// `blk.{l}.ffn_down_exps.weight` — the routed experts' down stack.
+#[must_use]
+pub fn ffn_down_exps(l: usize) -> String {
+    blk(l, "ffn_down_exps.weight")
+}
+
+/// `blk.{l}.ffn_gate_shexp.weight` — the shared expert's gate.
+#[must_use]
+pub fn ffn_gate_shexp(l: usize) -> String {
+    blk(l, "ffn_gate_shexp.weight")
+}
+
+/// `blk.{l}.ffn_up_shexp.weight` — the shared expert's up.
+#[must_use]
+pub fn ffn_up_shexp(l: usize) -> String {
+    blk(l, "ffn_up_shexp.weight")
+}
+
+/// `blk.{l}.ffn_down_shexp.weight` — the shared expert's down.
+#[must_use]
+pub fn ffn_down_shexp(l: usize) -> String {
+    blk(l, "ffn_down_shexp.weight")
+}
+
 /// Layer `l`'s routed experts' gate, up and down stack names, in stack order:
 /// `blk.{l}.ffn_{gate,up,down}_exps.weight`, the GGUF convention of every MoE
 /// family here.
 #[must_use]
 pub fn routed_stacks(l: usize) -> [String; 3] {
-    ["gate", "up", "down"].map(|part| format!("blk.{l}.ffn_{part}_exps.weight"))
+    [ffn_gate_exps(l), ffn_up_exps(l), ffn_down_exps(l)]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{blk, output, output_norm, routed_stacks, token_embd};
+    use super::*;
     use crate::arch::{deepseek2, deepseek41, glm5next, mimo2, qwen3moe, qwen35moe};
 
     /// A family's own gate, up and down stack names of layer `l`.
@@ -73,6 +192,38 @@ mod tests {
                 "blk.3.ffn_down_exps.weight"
             ]
         );
+    }
+
+    /// Each shared per-layer name is the GGUF spelling of its tensor (llama.cpp's `tn()` table, the
+    /// strings every file carries), on the layer it is asked for. Mutant: two stems swapped, say
+    /// `attn_k` and `attn_v`, or `exp_probs_b` spelled as a weight.
+    #[test]
+    fn the_per_layer_names_are_the_gguf_spellings() {
+        type Name = fn(usize) -> String;
+        let table: [(Name, &str); 18] = [
+            (attn_norm, "attn_norm.weight"),
+            (attn_q, "attn_q.weight"),
+            (attn_k, "attn_k.weight"),
+            (attn_v, "attn_v.weight"),
+            (attn_q_norm, "attn_q_norm.weight"),
+            (attn_k_norm, "attn_k_norm.weight"),
+            (attn_output, "attn_output.weight"),
+            (ffn_norm, "ffn_norm.weight"),
+            (ffn_gate, "ffn_gate.weight"),
+            (ffn_up, "ffn_up.weight"),
+            (ffn_down, "ffn_down.weight"),
+            (ffn_gate_inp, "ffn_gate_inp.weight"),
+            (exp_probs_b, "exp_probs_b.bias"),
+            (ffn_gate_exps, "ffn_gate_exps.weight"),
+            (ffn_up_exps, "ffn_up_exps.weight"),
+            (ffn_down_exps, "ffn_down_exps.weight"),
+            (ffn_gate_shexp, "ffn_gate_shexp.weight"),
+            (ffn_up_shexp, "ffn_up_shexp.weight"),
+        ];
+        for (name, stem) in table {
+            assert_eq!(name(7), format!("blk.7.{stem}"));
+        }
+        assert_eq!(ffn_down_shexp(7), "blk.7.ffn_down_shexp.weight");
     }
 
     /// The three model-level names and the block spelling are one function

@@ -22,6 +22,7 @@ mod gemma_encoder;
 pub mod glm5next;
 pub mod hybrid;
 pub mod mimo2;
+pub mod minimaxm3;
 pub mod names;
 pub mod nemotron_h;
 pub mod nemotron_h_moe;
@@ -418,6 +419,48 @@ pub(crate) fn sigmoid_gating(
     Ok(())
 }
 
+/// The rope scaling keys, held to the plain rope: `rope.scaling.type` absent or `none`, and
+/// `rope.scaling.factor` absent, 0 or 1. Another value is refused by name.
+pub(crate) fn plain_rope(split: &Split) -> Result<(), PlacementError> {
+    let scaling = "rope.scaling.type";
+    if split.value(&split.arch_key(scaling)).is_some() {
+        let kind = meta_str(split, scaling)?;
+        if kind != "none" {
+            return Err(metadata(
+                split,
+                scaling,
+                format!("is {kind:?}; this chain runs the plain rope, no scaling"),
+            ));
+        }
+    }
+    let factor = "rope.scaling.factor";
+    if split.value(&split.arch_key(factor)).is_some() {
+        let f = meta_f32(split, factor)?;
+        if f != 0.0 && f != 1.0 {
+            return Err(metadata(
+                split,
+                factor,
+                format!("is {f}; this chain runs the rope at frequency scale 1"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `expert_count` and `expert_used_count`: both above 0, the used count within the routed count.
+pub(crate) fn expert_counts(split: &Split) -> Result<(usize, usize), PlacementError> {
+    let n_expert = meta_usize(split, "expert_count")?;
+    let n_used = meta_usize(split, "expert_used_count")?;
+    if n_expert == 0 || n_used == 0 || n_used > n_expert {
+        return Err(metadata(
+            split,
+            "expert_used_count",
+            format!("is {n_used} of expert_count {n_expert}"),
+        ));
+    }
+    Ok((n_expert, n_used))
+}
+
 /// `expert_group_count` and `expert_group_used_count`: absent or 1. The group
 /// stage runs only past one group (llama-graph.cpp `build_moe_ffn`'s
 /// `n_expert_groups > 1`), which `router` — the router that refuses it, as
@@ -471,6 +514,65 @@ fn tensors_agree(split: &Split, want: Vec<(String, Vec<u64>)>) -> Result<(), Pla
                     .map(|(_, d)| d.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The tensors whose dims the keys name hold exactly those dims: the three
+/// model-level tensors and each layer's `layers` entries, ggml order. A
+/// tensor the file does not carry is skipped: `layers_agree` already named a
+/// required one. Every tensor of other dims, the first by name.
+pub(crate) fn dims_agree(
+    split: &Split,
+    hidden: usize,
+    vocab: usize,
+    layers: impl Iterator<Item = Vec<(&'static str, Vec<u64>)>>,
+) -> Result<(), PlacementError> {
+    let (e, v) = (hidden as u64, vocab as u64);
+    let mut want = vec![
+        (names::token_embd(), vec![e, v]),
+        (names::output(), vec![e, v]),
+        (names::output_norm(), vec![e]),
+    ];
+    for (l, layer) in layers.enumerate() {
+        want.extend(
+            layer
+                .into_iter()
+                .map(|(stem, dims)| (format!("blk.{l}.{stem}"), dims)),
+        );
+    }
+    want.retain(|(name, _)| split.find(name).is_some());
+    tensors_agree(split, want)
+}
+
+/// The verdict of a tensor-set check: the first name the layers need and the file lacks, with how
+/// many more there are; else the first name the file carries where no layer's block does. `need`
+/// completes "the … tensor(s) … need are missing", `none_of` the sentence "is in the file, and …".
+pub(crate) fn refuse_tensor_set(
+    missing: &[String],
+    misplaced: &[String],
+    need: &str,
+    none_of: &str,
+) -> Result<(), PlacementError> {
+    if let Some(name) = missing.first() {
+        return Err(PlacementError::Tensor {
+            name: name.clone(),
+            detail: format!(
+                "is not in the file ({} tensor(s) {need} are missing: {})",
+                missing.len(),
+                missing.join(", ")
+            ),
+        });
+    }
+    if let Some(name) = misplaced.first() {
+        return Err(PlacementError::Tensor {
+            name: name.clone(),
+            detail: format!(
+                "is in the file, and {none_of} ({} such: {})",
+                misplaced.len(),
+                misplaced.join(", ")
             ),
         });
     }
@@ -1195,5 +1297,74 @@ mod tests {
             &with(&["blk.4.attn_norm.weight", "blk.4.nextn.enorm.weight"]),
             "blk.4: 2 tensors, 1 of them nextn.*",
         );
+    }
+
+    /// The routed and used expert counts read as one pair: each above 0 and the used count within the
+    /// routed count, the refusal naming `expert_used_count` and both values. Mutant: `>` loosened
+    /// to `>=`, or the zero checks dropped.
+    #[test]
+    fn expert_counts_are_a_used_within_routed_pair() {
+        let read = |tag: &str, routed: u32, used: u32| {
+            let path = header_shaped(
+                tag,
+                "qwen3moe",
+                &[
+                    ("expert_count", V::U32(routed)),
+                    ("expert_used_count", V::U32(used)),
+                ],
+                &[],
+                &[],
+            );
+            let split = gguf::Split::open(&path).expect("the synthetic header opens");
+            let got = super::expert_counts(&split).map_err(|e| e.to_string());
+            let _ = std::fs::remove_file(&path);
+            got
+        };
+        assert_eq!(read("ec-ok", 128, 8), Ok((128, 8)));
+        assert_eq!(read("ec-all", 8, 8), Ok((8, 8)));
+        for (tag, routed, used) in [("ec-over", 8, 9), ("ec-zero-used", 8, 0), ("ec-zero", 0, 0)] {
+            let want =
+                format!("metadata qwen3moe.expert_used_count: is {used} of expert_count {routed}");
+            assert_eq!(read(tag, routed, used), Err(want), "{tag}");
+        }
+    }
+
+    /// A tensor set that disagrees with the file names the first missing tensor with the count of
+    /// the others, before any misplaced one; with none missing it names the first misplaced one;
+    /// an agreeing set passes. Mutant: the misplaced check ahead of the missing one, or the count
+    /// dropped.
+    #[test]
+    fn a_tensor_set_refusal_names_the_first_missing_before_the_misplaced() {
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let refuse = |missing: &[&str], misplaced: &[&str]| {
+            super::refuse_tensor_set(
+                &names(missing),
+                &names(misplaced),
+                "the layers' kinds need",
+                "its layer's kind carries none",
+            )
+        };
+        assert!(refuse(&[], &[]).is_ok());
+        match refuse(&["blk.1.a", "blk.2.a"], &["blk.0.b"]) {
+            Err(crate::placement::PlacementError::Tensor { name, detail }) => {
+                assert_eq!(name, "blk.1.a");
+                assert_eq!(
+                    detail,
+                    "is not in the file (2 tensor(s) the layers' kinds need are missing: \
+                     blk.1.a, blk.2.a)"
+                );
+            }
+            other => panic!("the first missing name: {other:?}"),
+        }
+        match refuse(&[], &["blk.0.b", "blk.3.b"]) {
+            Err(crate::placement::PlacementError::Tensor { name, detail }) => {
+                assert_eq!(name, "blk.0.b");
+                assert_eq!(
+                    detail,
+                    "is in the file, and its layer's kind carries none (2 such: blk.0.b, blk.3.b)"
+                );
+            }
+            other => panic!("the first misplaced name: {other:?}"),
+        }
     }
 }

@@ -195,6 +195,17 @@ pub const fn kv_q8_row_bytes(kv_heads: usize, head_dim: usize) -> u64 {
     2 * (kv_heads * head_dim) as u64 * 17 / 16
 }
 
+/// A GQA layer's K and V over `ctx` positions: [`kv_q8_row_bytes`] a position when `q8`, else
+/// [`kv_row_bytes`].
+#[must_use]
+pub const fn kv_plane_bytes(kv_heads: usize, head_dim: usize, q8: bool, ctx: u64) -> u64 {
+    ctx * if q8 {
+        kv_q8_row_bytes(kv_heads, head_dim)
+    } else {
+        kv_row_bytes(kv_heads, head_dim)
+    }
+}
+
 /// A dense attention layer's bytes at `ctx` positions: each position's K and
 /// V ([`kv_row_bytes`]) and nothing else — the MTP draft layer's store, which
 /// attends to every position it holds.
@@ -223,9 +234,19 @@ pub const fn selecting_bytes(
 mod tests {
     use super::{
         DELTA_LANES, PROMPT_BATCH, RING_ALIGN, Rows, conv_ring_rows, cut_depth_keeps,
-        delta_lane_bytes, dense_kv_bytes, kv_row_bytes, mamba2_bytes, mamba2_lens, ple_ring_bytes,
-        ple_ring_rows, pooled_rows, recurrent_bytes, ring_rows, selecting_bytes, window_rows,
+        delta_lane_bytes, dense_kv_bytes, kv_plane_bytes, kv_row_bytes, mamba2_bytes, mamba2_lens,
+        ple_ring_bytes, ple_ring_rows, pooled_rows, recurrent_bytes, ring_rows, selecting_bytes,
+        window_rows,
     };
+
+    /// A GQA layer's planes over `ctx` positions are `ctx` rows of the layout asked for: f16 K and V,
+    /// or q8_0's 17/16 byte a value. Mutant: the two layouts swapped, or `ctx` not applied.
+    #[test]
+    fn a_gqa_layers_planes_are_ctx_rows_of_its_layout() {
+        assert_eq!(kv_plane_bytes(4, 128, false, 32_768), 32_768 * 2048);
+        assert_eq!(kv_plane_bytes(4, 128, true, 32_768), 32_768 * 1088);
+        assert_eq!(kv_plane_bytes(4, 128, false, 0), 0);
+    }
 
     /// A Mamba-2 layer of 32 channels at state 128 with a 4-tap conv over
     /// 1,056 conv channels: 4,096 f32 of scan state and eleven conv rows.

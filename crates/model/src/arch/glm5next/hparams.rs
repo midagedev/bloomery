@@ -8,8 +8,8 @@ use gguf::{Split, Value};
 
 use super::roles::{DENSE, HC, KDA, LATENT, MOE, NEXTN, SHARED, required};
 use crate::arch::{
-    meta_arr, meta_bool, meta_f32, meta_usize, metadata, n_vocab, nextn_layers, one_expert_group,
-    optional_usize, positive, sigmoid_gating, unread_keys_of,
+    expert_counts, meta_arr, meta_bool, meta_f32, meta_usize, metadata, n_vocab, nextn_layers,
+    one_expert_group, optional_usize, positive, refuse_tensor_set, sigmoid_gating, unread_keys_of,
 };
 use crate::placement::PlacementError;
 
@@ -265,15 +265,7 @@ impl Hparams {
                 &mut defaults,
             ),
         };
-        let n_expert = meta_usize(split, "expert_count")?;
-        let n_used = meta_usize(split, "expert_used_count")?;
-        if n_expert == 0 || n_used == 0 || n_used > n_expert {
-            return Err(metadata(
-                split,
-                "expert_used_count",
-                format!("is {n_used} of expert_count {n_expert}"),
-            ));
-        }
+        let (n_expert, n_used) = expert_counts(split)?;
         one_expert_group(split, "ik's glm5next router")?;
         sigmoid_gating(split, Some(":2330-2333"), &mut defaults)?;
         // ik divides the picks' weights by their sum only `if (norm_w)`
@@ -409,27 +401,12 @@ impl Hparams {
                     .map(|s| format!("blk.{l}.{s}")),
             );
         }
-        if let Some(name) = missing.first() {
-            return Err(PlacementError::Tensor {
-                name: name.clone(),
-                detail: format!(
-                    "is not in the file ({} tensor(s) the layers' kinds need are missing: {})",
-                    missing.len(),
-                    missing.join(", ")
-                ),
-            });
-        }
-        if let Some(name) = misplaced.first() {
-            return Err(PlacementError::Tensor {
-                name: name.clone(),
-                detail: format!(
-                    "is in the file, and its layer's kind carries none ({} such: {})",
-                    misplaced.len(),
-                    misplaced.join(", ")
-                ),
-            });
-        }
-        Ok(())
+        refuse_tensor_set(
+            &missing,
+            &misplaced,
+            "the layers' kinds need",
+            "its layer's kind carries none",
+        )
     }
 
     /// A KDA layer's tensors by stem and the dims ik creates them with

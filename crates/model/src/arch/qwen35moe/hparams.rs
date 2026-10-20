@@ -13,8 +13,8 @@
 use gguf::{Split, Value};
 
 use crate::arch::{
-    meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab, nextn_layers, optional_usize,
-    positive, qwen35moe_variant,
+    expert_counts, meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab, nextn_layers,
+    optional_usize, positive, qwen35moe_variant, refuse_tensor_set,
 };
 use crate::placement::PlacementError;
 
@@ -312,15 +312,7 @@ impl Hparams {
         let kinds = kinds(split, n_trunk, n_layer, interval)?;
         let ffns = ffn_kinds(split, n_trunk, variant)?;
         let (n_expert, n_used, expert_ff) = if ffns.contains(&FfnKind::Routed) {
-            let n_expert = meta_usize(split, "expert_count")?;
-            let n_used = meta_usize(split, "expert_used_count")?;
-            if n_expert == 0 || n_used == 0 || n_used > n_expert {
-                return Err(metadata(
-                    split,
-                    "expert_used_count",
-                    format!("is {n_used} of expert_count {n_expert}"),
-                ));
-            }
+            let (n_expert, n_used) = expert_counts(split)?;
             let expert_ff = expert_ff(split)?;
             refuse_unless(split, "expert_gating_func", |v| v.as_u64() == Some(SOFTMAX))?;
             refuse_unless(split, "expert_weights_norm", |v| v.as_bool() == Some(true))?;
@@ -822,27 +814,12 @@ fn exp_tensors_agree(split: &Split, kinds: &[Kind], exp: &Exp) -> Result<(), Pla
                 .filter(|n| has(n)),
         );
     }
-    if let Some(name) = missing.first() {
-        return Err(PlacementError::Tensor {
-            name: name.clone(),
-            detail: format!(
-                "is not in the file ({} tensor(s) the layers' kinds need are missing: {})",
-                missing.len(),
-                missing.join(", ")
-            ),
-        });
-    }
-    if let Some(name) = misplaced.first() {
-        return Err(PlacementError::Tensor {
-            name: name.clone(),
-            detail: format!(
-                "is in the file, and qwen4exp carries none there ({} such: {})",
-                misplaced.len(),
-                misplaced.join(", ")
-            ),
-        });
-    }
-    Ok(())
+    refuse_tensor_set(
+        &missing,
+        &misplaced,
+        "the layers' kinds need",
+        "qwen4exp carries none there",
+    )
 }
 
 /// `rope.dimension_sections`, required (qwen35moe.cpp:8): four counts.

@@ -62,8 +62,8 @@ use crate::placement::{
 };
 
 use runtime::stores::{
-    DELTA_LANES, F32_BYTES, delta_lane_bytes, dense_kv_bytes, kv_q8_row_bytes, kv_row_bytes,
-    ple_ring_bytes, recurrent_bytes, selecting_bytes,
+    DELTA_LANES, F32_BYTES, delta_lane_bytes, dense_kv_bytes, kv_plane_bytes, ple_ring_bytes,
+    recurrent_bytes, selecting_bytes,
 };
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
@@ -1520,14 +1520,7 @@ impl KvLayout {
                 let ctx = usize::try_from(ctx_max).expect("KvLayout: a context of usize");
                 selecting_bytes(self.kv_heads, self.head_dim, *idx_dim, pool, ctx)
             }
-            None => {
-                let row = if self.q8 {
-                    kv_q8_row_bytes(self.kv_heads, self.head_dim)
-                } else {
-                    kv_row_bytes(self.kv_heads, self.head_dim)
-                };
-                ctx_max * row
-            }
+            None => kv_plane_bytes(self.kv_heads, self.head_dim, self.q8, ctx_max),
         }
     }
 

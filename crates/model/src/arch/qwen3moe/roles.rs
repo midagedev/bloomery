@@ -7,8 +7,7 @@
 use gguf::Split;
 
 use super::hparams::Hparams;
-use super::names;
-use crate::arch::classify::{Counts, classify_with};
+use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
 /// The role of a per-layer stem of [`names::LAYER`].
@@ -30,14 +29,10 @@ fn layer_role(stem: &str) -> Option<Role> {
 /// A tensor's role and layer by its name; `None` when the table does not
 /// hold it, or its layer is past `n_layer`.
 fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
-    if name == names::token_embd() {
-        return Some((Role::TokenEmbedding, None));
+    if let Some(model_level) = model_level_role(name) {
+        return Some(model_level);
     }
-    if name == names::output_norm() || name == names::output() {
-        return Some((Role::Head, None));
-    }
-    let (layer, stem) = name.strip_prefix("blk.")?.split_once('.')?;
-    let layer: usize = layer.parse().ok().filter(|&l| l < n_layer)?;
+    let (layer, stem) = block_stem(name, n_layer)?;
     layer_role(stem).map(|r| (r, Some(layer)))
 }
 

@@ -14,8 +14,8 @@ use super::roles::{
     DENSE, MIXER, MOE, NEXTN, QKV_FUSED, QKV_SPLIT, SELECTION_BIAS, Stem, required,
 };
 use crate::arch::{
-    meta_f32, meta_usize, metadata, n_vocab, one_expert_group, optional_usize, per_layer_count,
-    per_layer_items, positive, sigmoid_gating, unread_keys_of,
+    expert_counts, meta_f32, meta_usize, metadata, n_vocab, one_expert_group, optional_usize,
+    per_layer_count, per_layer_items, positive, refuse_tensor_set, sigmoid_gating, unread_keys_of,
 };
 use crate::placement::PlacementError;
 
@@ -171,15 +171,7 @@ impl Hparams {
             .count();
         let dense = n_trunk - routed;
         let (n_expert, n_used, expert_ff) = if routed > 0 {
-            let n_expert = meta_usize(split, "expert_count")?;
-            let n_used = meta_usize(split, "expert_used_count")?;
-            if n_expert == 0 || n_used == 0 || n_used > n_expert {
-                return Err(metadata(
-                    split,
-                    "expert_used_count",
-                    format!("is {n_used} of expert_count {n_expert}"),
-                ));
-            }
+            let (n_expert, n_used) = expert_counts(split)?;
             // The builder passes the sigmoid router as a constant (:220).
             sigmoid_gating(split, Some(":220"), &mut defaults)?;
             one_expert_group(split, "the mimo2 router")?;
@@ -297,27 +289,12 @@ impl Hparams {
                     .map(|s| format!("blk.{l}.{s}")),
             );
         }
-        if let Some(name) = missing.first() {
-            return Err(PlacementError::Tensor {
-                name: name.clone(),
-                detail: format!(
-                    "is not in the file ({} tensor(s) the layers' blocks need are missing: {})",
-                    missing.len(),
-                    missing.join(", ")
-                ),
-            });
-        }
-        if let Some(name) = misplaced.first() {
-            return Err(PlacementError::Tensor {
-                name: name.clone(),
-                detail: format!(
-                    "is in the file, and its layer's block carries none ({} such: {})",
-                    misplaced.len(),
-                    misplaced.join(", ")
-                ),
-            });
-        }
-        Ok(())
+        refuse_tensor_set(
+            &missing,
+            &misplaced,
+            "the layers' blocks need",
+            "its layer's block carries none",
+        )
     }
 
     /// The tensors whose dims the arrays name — the projections a layer's

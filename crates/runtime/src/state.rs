@@ -64,11 +64,17 @@ pub enum Store {
 pub fn stores(layer: &LayerSpec) -> Vec<(Store, StoreRule)> {
     let mut v = Vec::new();
     match &layer.mixer {
-        Mixer::Gqa(g) => v.push((
-            Store::Kv,
-            g.window
-                .map_or(StoreRule::Positional, |slots| StoreRule::Window { slots }),
-        )),
+        Mixer::Gqa(g) => {
+            v.push((
+                Store::Kv,
+                g.window
+                    .map_or(StoreRule::Positional, |slots| StoreRule::Window { slots }),
+            ));
+            // A block-max selector scores every position, so each one keeps an index key.
+            if matches!(g.select, Some(Selector::BlockMax { .. })) {
+                v.push((Store::IndexKeys, StoreRule::Positional));
+            }
+        }
         Mixer::DeltaRule(models::DeltaRule { conv, .. })
         | Mixer::Mamba2(models::Mamba2 { d_conv: conv, .. }) => {
             v.push((
@@ -110,7 +116,7 @@ pub fn stores(layer: &LayerSpec) -> Vec<(Store, StoreRule)> {
                 Some(Selector::TokenPool { .. }) => {
                     v.push((Store::PooledKeys, StoreRule::Positional));
                 }
-                Some(Selector::StreamTopK { .. }) | None => {}
+                Some(Selector::StreamTopK { .. } | Selector::BlockMax { .. }) | None => {}
             }
         }
         Mixer::None => {}
@@ -460,6 +466,35 @@ mod tests {
             }
         }
         q
+    }
+
+    /// A GQA layer keeps one plane of K and V; one selecting by a block-max index also keeps an
+    /// index key a position. Mutant: the arm for the selector dropped.
+    #[test]
+    fn a_block_max_gqa_layer_keeps_an_index_key_a_position() {
+        let mut q = qwen36();
+        let gqa = q
+            .iter_mut()
+            .find(|s| matches!(s.mixer, Mixer::Gqa(_)))
+            .expect("Qwen3.6 has GQA layers");
+        assert_eq!(stores(gqa), [(Store::Kv, StoreRule::Positional)]);
+        if let Mixer::Gqa(g) = &mut gqa.mixer {
+            g.select = Some(Selector::BlockMax {
+                heads: 4,
+                d: 128,
+                top_k: 16,
+                block: 128,
+                local: 1,
+                rope: rope(RopeMode::Neox, 64),
+            });
+        }
+        assert_eq!(
+            stores(gqa),
+            [
+                (Store::Kv, StoreRule::Positional),
+                (Store::IndexKeys, StoreRule::Positional),
+            ]
+        );
     }
 
     /// The checkpoint copies a recurrent store whatever the shadow, and a

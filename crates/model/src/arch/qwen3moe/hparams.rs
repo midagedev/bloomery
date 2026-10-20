@@ -12,7 +12,9 @@
 use gguf::{Split, Value};
 
 use super::names;
-use crate::arch::{meta_f32, meta_str, meta_usize, metadata, n_vocab, optional_usize};
+use crate::arch::{
+    expert_counts, meta_f32, meta_usize, metadata, n_vocab, optional_usize, plain_rope,
+};
 use crate::placement::PlacementError;
 
 /// ik's `LLM_EXPERT_GATING_FUNC_SOFTMAX` (llama-hparams.h:15).
@@ -156,28 +158,7 @@ impl Rope {
                 format!("is {dims}, the head {head_dim}; this chain rotates whole heads"),
             ));
         }
-        let scaling = "rope.scaling.type";
-        if split.value(&split.arch_key(scaling)).is_some() {
-            let kind = meta_str(split, scaling)?;
-            if kind != "none" {
-                return Err(metadata(
-                    split,
-                    scaling,
-                    format!("is {kind:?}; this chain runs the plain rope, no scaling"),
-                ));
-            }
-        }
-        let factor = "rope.scaling.factor";
-        if split.value(&split.arch_key(factor)).is_some() {
-            let f = meta_f32(split, factor)?;
-            if f != 0.0 && f != 1.0 {
-                return Err(metadata(
-                    split,
-                    factor,
-                    format!("is {f}; this chain runs the rope at frequency scale 1"),
-                ));
-            }
-        }
+        plain_rope(split)?;
         Ok(Rope {
             mode: RopeMode::Neox,
             base: meta_f32(split, "rope.freq_base")?,
@@ -188,15 +169,7 @@ impl Rope {
 
 impl Experts {
     fn read(split: &Split, n_layer: usize) -> Result<Experts, PlacementError> {
-        let n_expert = meta_usize(split, "expert_count")?;
-        let n_used = meta_usize(split, "expert_used_count")?;
-        if n_expert == 0 || n_used == 0 || n_used > n_expert {
-            return Err(metadata(
-                split,
-                "expert_used_count",
-                format!("is {n_used} of expert_count {n_expert}"),
-            ));
-        }
+        let (n_expert, n_used) = expert_counts(split)?;
         // ik reads it as optional and leaves 0 (llama-hparams.cpp:557); a
         // 0 would make every expert empty.
         let ff = meta_usize(split, "expert_feed_forward_length")?;

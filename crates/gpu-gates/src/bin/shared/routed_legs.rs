@@ -86,6 +86,7 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
         Arch::MiMo2 => Some(&mimo2::Row),
         Arch::Deepseek41 | Arch::Deepseek4 => Some(&deepseek41::Row),
         Arch::Qwen35
+        | Arch::MiniMaxM3
         | Arch::NemotronH
         | Arch::NemotronHMoe
         | Arch::GemmaEmbedding
@@ -105,6 +106,7 @@ fn skip_of(arch: Arch) -> &'static str {
         | Arch::Qwen4Exp
         | Arch::Glm5Next
         | Arch::MiMo2
+        | Arch::MiniMaxM3
         | Arch::Deepseek41
         | Arch::Deepseek4
         | Arch::NemotronH

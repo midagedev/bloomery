@@ -18,6 +18,24 @@ pub(crate) struct Counts {
     pub(crate) experts_used: u64,
 }
 
+/// The role of a model-level tensor every family names alike: the token embedding, and the output
+/// norm and matrix (the head); `None` for any other name.
+pub(crate) fn model_level_role(name: &str) -> Option<(Role, Option<usize>)> {
+    match name {
+        "token_embd.weight" => Some((Role::TokenEmbedding, None)),
+        "output_norm.weight" | "output.weight" => Some((Role::Head, None)),
+        _ => None,
+    }
+}
+
+/// A `blk.{layer}.{stem}` name as its layer and stem; `None` for any other name and for a layer
+/// not below `n_layer`.
+pub(crate) fn block_stem(name: &str, n_layer: usize) -> Option<(usize, &str)> {
+    let (layer, stem) = name.strip_prefix("blk.")?.split_once('.')?;
+    let layer: usize = layer.parse().ok().filter(|&l| l < n_layer)?;
+    Some((layer, stem))
+}
+
 /// Every tensor of `split` with the role `role_of` gives its name, refusing
 /// the file with every name no role claims listed ([`PlacementError::Unclassified`]
 /// — no catch-all role exists). The token embedding reads one gathered row; a
@@ -72,6 +90,31 @@ mod tests {
             "blk.0.attn_q.weight" => Some((Role::Attention, Some(0))),
             _ => None,
         }
+    }
+
+    /// The model-level names are the three the GGUF convention gives every family, and a block name
+    /// splits into its layer and stem only below the layer count. Mutant: the head's role on the
+    /// token embedding, or the bound `<=`.
+    #[test]
+    fn the_shared_name_walk_reads_the_gguf_convention() {
+        use super::{block_stem, model_level_role};
+        assert_eq!(
+            model_level_role("token_embd.weight"),
+            Some((Role::TokenEmbedding, None))
+        );
+        for head in ["output_norm.weight", "output.weight"] {
+            assert_eq!(model_level_role(head), Some((Role::Head, None)), "{head}");
+        }
+        assert_eq!(model_level_role("blk.0.attn_q.weight"), None);
+        assert_eq!(model_level_role("rope_freqs.weight"), None);
+        assert_eq!(
+            block_stem("blk.47.attn_q.weight", 48),
+            Some((47, "attn_q.weight"))
+        );
+        assert_eq!(block_stem("blk.48.attn_q.weight", 48), None);
+        assert_eq!(block_stem("blk.x.attn_q.weight", 48), None);
+        assert_eq!(block_stem("blk.3", 48), None);
+        assert_eq!(block_stem("token_embd.weight", 48), None);
     }
 
     /// A name no role claims fails the file with every such name listed, in

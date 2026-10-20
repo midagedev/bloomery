@@ -32,6 +32,7 @@ fn act(a: &Act) -> String {
         Act::SwiGlu { limit } => format!("swiglu {limit:?}"),
         Act::ReluSqr => "relusqr".to_string(),
         Act::GeGlu => "geglu".to_string(),
+        Act::SwigluOai { alpha, limit } => format!("swigluoai {alpha}/{limit}"),
     }
 }
 
@@ -56,7 +57,7 @@ fn select(o: &mut String, select: Option<&Selector>) {
                 src(list, |()| String::new())
             );
         }
-        Some(t @ Selector::TokenPool { .. }) => {
+        Some(t @ (Selector::TokenPool { .. } | Selector::BlockMax { .. })) => {
             let _ = write!(o, " | {t:?}");
         }
         None => {}

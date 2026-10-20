@@ -247,7 +247,7 @@ impl Hparams {
             weights_scale,
             defaults,
         };
-        crate::arch::hybrid::dims_agree(
+        crate::arch::dims_agree(
             split,
             hp.n_embd,
             hp.n_vocab,

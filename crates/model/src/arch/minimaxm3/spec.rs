@@ -1,0 +1,242 @@
+//! The minimax-m3 reader's [`ModelSpec`]. Every layer is GQA with the per-head q/k norm and a
+//! partial NeoX rope on a plain residual. A dense layer runs a `swigluoai` block and attends every
+//! position. A sparse layer attends the blocks its indexer picks ([`Selector::BlockMax`]) and runs
+//! the sigmoid noaux_tc router over `swigluoai` experts beside an ungated shared one: the
+//! selection bias steers the choice only, the kept scores are renormalized and scaled by
+//! `expert_weights_scale`. The chat surface carries no tool-call or reasoning parser yet.
+
+use gguf::Split;
+use models::{
+    Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, Moe, Residual, Rope, RopeMode,
+    Router, Score, Selector, Shared,
+};
+
+use super::hparams::{Hparams, Kind, SWIGLU_ALPHA, SWIGLU_LIMIT};
+use super::roles;
+use crate::arch::{Read, chat_of, spec_u32};
+use crate::placement::PlacementError;
+
+/// The activation of every dense, routed and shared block.
+const ACT: Act = Act::SwigluOai {
+    alpha: SWIGLU_ALPHA,
+    limit: SWIGLU_LIMIT,
+};
+
+/// `split`'s description and roles, and the defaults the key read took.
+pub fn read(split: &Split) -> Result<Read, PlacementError> {
+    let hp = Hparams::read(split)?;
+    let tensors = roles::classify(split, &hp)?;
+    let chat = chat_of(split, None, None)?;
+    let spec = spec_of(&hp, chat)?;
+    Ok(Read {
+        spec,
+        tensors,
+        defaults: hp.defaults,
+    })
+}
+
+/// The description of the file `hp` was read from, with the chat surface `chat`.
+pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError> {
+    let rope = Rope {
+        mode: RopeMode::Neox,
+        dims: spec_u32("rope.dimension_count", hp.rope.dims)?,
+        base: hp.rope.base,
+        yarn: None,
+    };
+    let layer = |l: usize| -> Result<LayerSpec, PlacementError> {
+        let sparse = hp.kind(l) == Kind::Sparse;
+        let select = if sparse {
+            let m = &hp.msa;
+            Some(Selector::BlockMax {
+                heads: spec_u32("attention.indexer.head_count", m.heads)?,
+                d: spec_u32("attention.indexer.key_length", m.d)?,
+                top_k: spec_u32("attention.indexer.top_k", m.top_k)?,
+                block: spec_u32("attention.indexer.block_size", m.block)?,
+                local: spec_u32("attention.indexer.local_blocks", m.local)?,
+                rope,
+            })
+        } else {
+            None
+        };
+        let mixer = Mixer::Gqa(Gqa {
+            heads: spec_u32("attention.head_count", hp.n_head)?,
+            kv_heads: spec_u32("attention.head_count_kv", hp.n_head_kv)?,
+            head_dim: spec_u32("attention.key_length", hp.head_dim)?,
+            // The reader holds the file to one width for q, k and v.
+            value_dim: spec_u32("attention.key_length", hp.head_dim)?,
+            rope,
+            qk_norm: true,
+            out_gate: false,
+            select,
+            window: None,
+            sinks: false,
+            value_scale: None,
+        });
+        let ffn = match hp.kind(l) {
+            Kind::Dense => {
+                // The reader read the dense width whenever a layer is dense.
+                let ff = hp.dense_ff.ok_or_else(|| PlacementError::Metadata {
+                    key: "feed_forward_length".to_string(),
+                    detail: format!("is absent, and layer {l} is a dense block"),
+                })?;
+                Ffn::Dense {
+                    ff: spec_u32("feed_forward_length", ff)?,
+                    act: ACT,
+                }
+            }
+            Kind::Sparse => {
+                let x = &hp.experts;
+                Ffn::Moe(Moe {
+                    experts: spec_u32("expert_count", x.n_expert)?,
+                    top_k: spec_u32("expert_used_count", x.n_used)?,
+                    expert_ff: spec_u32("expert_feed_forward_length", x.ff)?,
+                    latent: None,
+                    act: ACT,
+                    router: Router {
+                        score: Score::Sigmoid,
+                        bias: true,
+                        norm: x.weights_norm,
+                        scale: x.weights_scale,
+                        hash: false,
+                    },
+                    shared: Some(Shared {
+                        ff: spec_u32("expert_shared_count", x.shared_ff())?,
+                        act: ACT,
+                        sigmoid_gate: false,
+                    }),
+                })
+            }
+        };
+        Ok(LayerSpec {
+            mixer,
+            ffn,
+            residual: Residual::Plain,
+            extras: Vec::new(),
+        })
+    };
+    Ok(ModelSpec {
+        arch: Arch::MiniMaxM3,
+        hidden: spec_u32("embedding_length", hp.n_embd)?,
+        vocab: spec_u32("vocab", hp.n_vocab)?,
+        ctx_train: spec_u32("context_length", hp.n_ctx_train)?,
+        rms_eps: hp.rms_eps,
+        layers: (0..hp.n_layer).map(layer).collect::<Result<Vec<_>, _>>()?,
+        mtp: Vec::new(),
+        hc: None,
+        engram: None,
+        encoder: None,
+        chat,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use models::{Act, Ffn, Mixer, Score, Selector};
+
+    use super::super::hparams::tests::{keys, tensors};
+    use super::{SWIGLU_ALPHA, SWIGLU_LIMIT};
+    use crate::arch::coverage;
+    use crate::arch::synthetic::{V, header_shaped};
+
+    /// The small header of the `hparams` tests with `tokenizer.ggml.pre` `minimax-m2` and a chat
+    /// template: its read and the coverage check's items.
+    fn read(tag: &str) -> (super::Read, Vec<String>) {
+        let global = [
+            ("tokenizer.ggml.pre", V::Str("minimax-m2")),
+            ("tokenizer.chat_template", V::Str("{{ messages }}")),
+        ];
+        let path = header_shaped(tag, "minimax-m3", &keys(), &global, &tensors());
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let read = super::read(&split).map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&path);
+        let read = read.expect("the header reads");
+        let items = coverage::check(&read.spec, &read.tensors)
+            .into_iter()
+            .map(|u| u.feature)
+            .collect();
+        (read, items)
+    }
+
+    /// The description is the table's: GQA 8/2 x 16 with the q/k norm and the partial NeoX rope
+    /// on every layer; the first two dense, the rest sparse with a block-max selector of the
+    /// indexer's keys, the sigmoid router with its bias and an ungated shared expert, and
+    /// `swigluoai` in every block. Mutant: the selector on a dense layer, the router bias off, or
+    /// the activation's constants swapped.
+    #[test]
+    fn the_description_is_the_tables() {
+        let (read, _) = read("mm3-spec");
+        let spec = &read.spec;
+        assert_eq!(spec.arch, models::Arch::MiniMaxM3);
+        assert_eq!((spec.hidden, spec.vocab, spec.ctx_train), (64, 2, 4096));
+        assert!(spec.mtp.is_empty());
+        let act = Act::SwigluOai {
+            alpha: SWIGLU_ALPHA,
+            limit: SWIGLU_LIMIT,
+        };
+        assert_eq!((SWIGLU_ALPHA, SWIGLU_LIMIT), (1.702, 7.0));
+        assert_eq!(spec.layers.len(), 5);
+        for (l, layer) in spec.layers.iter().enumerate() {
+            let Mixer::Gqa(g) = &layer.mixer else {
+                panic!("layer {l} is not GQA");
+            };
+            assert_eq!(
+                (g.heads, g.kv_heads, g.head_dim, g.value_dim),
+                (8, 2, 16, 16)
+            );
+            assert_eq!((g.rope.dims, g.rope.base), (8, 5_000_000.0));
+            assert!(g.qk_norm && !g.out_gate && g.window.is_none() && !g.sinks);
+            assert!(g.value_scale.is_none());
+            if l < 2 {
+                assert_eq!(g.select, None, "layer {l} attends every position");
+                assert_eq!(layer.ffn, Ffn::Dense { ff: 48, act });
+                continue;
+            }
+            let Some(Selector::BlockMax {
+                heads,
+                d,
+                top_k,
+                block,
+                local,
+                rope,
+            }) = g.select.clone()
+            else {
+                panic!("layer {l} has no block-max selector");
+            };
+            assert_eq!((heads, d, top_k, block, local), (2, 16, 3, 4, 1));
+            assert_eq!(rope, g.rope);
+            let Ffn::Moe(m) = &layer.ffn else {
+                panic!("layer {l} is not routed");
+            };
+            assert_eq!(
+                (m.experts, m.top_k, m.expert_ff, m.latent),
+                (8, 2, 24, None)
+            );
+            assert_eq!(m.act, act);
+            assert_eq!(m.router.score, Score::Sigmoid);
+            assert!(m.router.bias && m.router.norm && !m.router.hash);
+            assert_eq!(m.router.scale, 2.0);
+            let shared = m.shared.expect("a shared expert");
+            assert_eq!(
+                (shared.ff, shared.act, shared.sigmoid_gate),
+                (24, act, false)
+            );
+        }
+    }
+
+    /// Only the features no program runs are listed: the swigluoai blocks, the block-max
+    /// indexer, the sigmoid router and the program itself — and the chat surface: the `minimax-m2`
+    /// pre-tokenizer and the template's tool-call parser. Each is a coverage item, so a load
+    /// refuses the file by name rather than running it wrong.
+    #[test]
+    fn what_no_program_runs_is_listed() {
+        let (_, items) = read("mm3-coverage");
+        let listed = |needle: &str| items.iter().any(|f| f.contains(needle));
+        for needle in [
+            "swigluoai",
+            "block-max indexer: 2 heads x 16, blocks of 4 keep 3 (1 local)",
+            "pre-tokenizer minimax-m2",
+        ] {
+            assert!(listed(needle), "{needle:?} not listed: {items:#?}");
+        }
+    }
+}

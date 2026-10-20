@@ -112,7 +112,7 @@ impl Hparams {
             |kind| vec![roles::stems_of(kind)],
             &[Kind::Mamba, Kind::Attention, Kind::Mlp],
         )?;
-        crate::arch::hybrid::dims_agree(
+        crate::arch::dims_agree(
             split,
             hp.n_embd,
             hp.n_vocab,

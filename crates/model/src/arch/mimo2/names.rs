@@ -6,12 +6,10 @@
 
 use crate::arch::names::blk;
 
-pub use crate::arch::names::{output, output_norm, token_embd};
-
-/// The mixer's RMS gain.
-pub fn attn_norm(l: usize) -> String {
-    blk(l, "attn_norm.weight")
-}
+pub use crate::arch::names::{
+    attn_k, attn_norm, attn_output, attn_q, attn_v, exp_probs_b, ffn_down, ffn_down_exps, ffn_gate,
+    ffn_gate_exps, ffn_gate_inp, ffn_norm, ffn_up, ffn_up_exps, output, output_norm, token_embd,
+};
 
 /// The fused q, k and v projections, `[q heads · key + kv heads · (key +
 /// value)]` rows in that order.
@@ -19,69 +17,10 @@ pub fn attn_qkv(l: usize) -> String {
     blk(l, "attn_qkv.weight")
 }
 
-/// The split query projection, the split form's (`attn_q.weight`).
-pub fn attn_q(l: usize) -> String {
-    blk(l, "attn_q.weight")
-}
-
-/// The split key projection (`attn_k.weight`).
-pub fn attn_k(l: usize) -> String {
-    blk(l, "attn_k.weight")
-}
-
-/// The split value projection (`attn_v.weight`), the narrow head's rows.
-pub fn attn_v(l: usize) -> String {
-    blk(l, "attn_v.weight")
-}
-
-/// The mixer's output projection, over the value head's width.
-pub fn attn_output(l: usize) -> String {
-    blk(l, "attn_output.weight")
-}
-
 /// A sliding-window layer's per-head softmax sinks; absent, the graph runs
 /// without them.
 pub fn attn_sinks(l: usize) -> String {
     blk(l, "attn_sinks.weight")
-}
-
-// -------------------------------------------------------- feed-forward
-
-pub fn ffn_norm(l: usize) -> String {
-    blk(l, "ffn_norm.weight")
-}
-
-pub fn ffn_gate(l: usize) -> String {
-    blk(l, "ffn_gate.weight")
-}
-
-pub fn ffn_up(l: usize) -> String {
-    blk(l, "ffn_up.weight")
-}
-
-pub fn ffn_down(l: usize) -> String {
-    blk(l, "ffn_down.weight")
-}
-
-pub fn ffn_gate_inp(l: usize) -> String {
-    blk(l, "ffn_gate_inp.weight")
-}
-
-/// The router's selection bias, which the graph adds for the choice only.
-pub fn exp_probs_b(l: usize) -> String {
-    blk(l, "exp_probs_b.bias")
-}
-
-pub fn ffn_gate_exps(l: usize) -> String {
-    blk(l, "ffn_gate_exps.weight")
-}
-
-pub fn ffn_up_exps(l: usize) -> String {
-    blk(l, "ffn_up_exps.weight")
-}
-
-pub fn ffn_down_exps(l: usize) -> String {
-    blk(l, "ffn_down_exps.weight")
 }
 
 // ------------------------------------------------------- the next-token block

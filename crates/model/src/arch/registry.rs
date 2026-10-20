@@ -16,7 +16,7 @@ use gguf::Split;
 use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
-    deepseek41, draft, gemma_embedding, gemma_embedding2, glm5next, mimo2, nemotron_h,
+    deepseek41, draft, gemma_embedding, gemma_embedding2, glm5next, mimo2, minimaxm3, nemotron_h,
     nemotron_h_moe, qwen3moe, qwen35moe,
 };
 use crate::placement::PlacementError;
@@ -160,6 +160,14 @@ pub static ROWS: &[ArchRow] = &[
         fixture: None,
     },
     ArchRow {
+        // No `Arch` variant until a body runs the file: llama.cpp's spelling is the only string.
+        arch: None,
+        names: &["minimax-m3"],
+        read: Some(minimaxm3::spec::read),
+        draft: None,
+        fixture: None,
+    },
+    ArchRow {
         arch: Some(Arch::NemotronH),
         names: &["nemotron_h"],
         read: Some(nemotron_h::spec::read),
@@ -260,6 +268,7 @@ mod tests {
             a if QWEN35_BODY.contains(&a) => qwen35moe::spec::read,
             "glm5next" | GLM5_NEXT_LLAMA_CPP => glm5next::spec::read,
             "mimo2" => mimo2::spec::read,
+            "minimax-m3" => minimaxm3::spec::read,
             "nemotron_h" => nemotron_h::spec::read,
             "nemotron_h_moe" => nemotron_h_moe::spec::read,
             GEMMA_EMBEDDING => gemma_embedding::spec::read,

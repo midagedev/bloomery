@@ -90,6 +90,18 @@ pub enum Need {
         pool: u32,
         rope: u32,
     },
+    /// A top-k of position blocks scored by the largest index score in them,
+    /// the query's own block kept inside the k: `heads` heads x `d`, blocks of
+    /// `block` positions, `top_k` kept (`local` forced), keys RMS-normed and
+    /// rotated (`rope` values).
+    BlockMax {
+        heads: u32,
+        d: u32,
+        top_k: u32,
+        block: u32,
+        local: u32,
+        rope: u32,
+    },
     /// A delta-rule layer.
     DeltaRule {
         kind: DeltaKind,
@@ -120,6 +132,9 @@ pub enum Need {
     ReluSqr { ff: u32 },
     /// A dense GELU GLU layer of `ff` values.
     GeGlu { ff: u32 },
+    /// A dense layer of `ff` values of an activation with a clamped gate and
+    /// an offset up path (`swigluoai`).
+    SwigluOai { ff: u32 },
     /// An encoder's value rows RMS-normed per head of `head` values, with no
     /// gain.
     ValueNorm { head: u32 },
@@ -262,6 +277,17 @@ impl fmt::Display for Need {
                 f,
                 "mean-pool indexer: {heads} heads x {d}, pool {pool}, RMS-normed keys roped ({rope} dims) at the pool start, heads summed"
             ),
+            Need::BlockMax {
+                heads,
+                d,
+                top_k,
+                block,
+                local,
+                rope,
+            } => write!(
+                f,
+                "block-max indexer: {heads} heads x {d}, blocks of {block} keep {top_k} ({local} local), keys RMS-normed and roped ({rope} dims), each key head on its own"
+            ),
             Need::DeltaRule {
                 kind,
                 k_heads,
@@ -336,6 +362,7 @@ impl fmt::Display for Need {
             Need::DenseFfn { ff } => write!(f, "dense SwiGLU layer: ff {ff}"),
             Need::ReluSqr { ff } => write!(f, "squared-ReLU dense layer: ff {ff}"),
             Need::GeGlu { ff } => write!(f, "dense GELU GLU layer: ff {ff}"),
+            Need::SwigluOai { ff } => write!(f, "dense swigluoai layer: ff {ff}"),
             Need::ValueNorm { head } => {
                 write!(f, "a gainless per-head RMS norm on the values: head {head}")
             }
@@ -537,6 +564,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 Act::ReluSqr if *ff > 0 => at(Need::ReluSqr { ff: *ff }),
                 Act::ReluSqr => {}
                 Act::GeGlu => at(Need::GeGlu { ff: *ff }),
+                Act::SwigluOai { .. } => at(Need::SwigluOai { ff: *ff }),
             },
         }
         if layer.residual == Residual::Hc
@@ -674,6 +702,21 @@ fn select_needs(select: &Selector, at: &mut impl FnMut(Need)) {
             heads: *heads,
             d: *d,
             pool: *pool,
+            rope: rope.dims,
+        }),
+        Selector::BlockMax {
+            heads,
+            d,
+            top_k,
+            block,
+            local,
+            rope,
+        } => at(Need::BlockMax {
+            heads: *heads,
+            d: *d,
+            top_k: *top_k,
+            block: *block,
+            local: *local,
             rope: rope.dims,
         }),
     }

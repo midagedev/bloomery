@@ -23,7 +23,7 @@ use crate::placement::{
     self, Card, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Violation,
     checked, joined,
 };
-use runtime::stores::{F32_BYTES, kv_q8_row_bytes, kv_row_bytes};
+use runtime::stores::{F32_BYTES, kv_plane_bytes};
 
 /// The qwen3moe program, whose card experts read the routed stacks
 /// ([`routed_rule`] of it): by part, a gate and an up
@@ -86,12 +86,7 @@ impl KvLayout {
 impl KvBytes for KvLayout {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         if layer < self.layers {
-            let row = if self.q8 {
-                kv_q8_row_bytes(self.kv_heads, self.head_dim)
-            } else {
-                kv_row_bytes(self.kv_heads, self.head_dim)
-            };
-            ctx_max * row
+            kv_plane_bytes(self.kv_heads, self.head_dim, self.q8, ctx_max)
         } else {
             0
         }

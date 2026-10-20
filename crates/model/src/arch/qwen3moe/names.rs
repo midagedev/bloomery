@@ -4,71 +4,15 @@
 //! a routed FFN. [`LAYER`] lists the per-layer stems, which the classifier
 //! (`roles`) and the metadata gate walk.
 
-pub use crate::arch::names::{output, output_norm, token_embd};
-
-/// `blk.{block}.attn_norm.weight` — the pre-attention RMS gain.
-pub fn attn_norm(block: usize) -> String {
-    format!("blk.{block}.attn_norm.weight")
-}
-
-/// `blk.{block}.attn_q.weight` — the query projection, every head.
-pub fn attn_q(block: usize) -> String {
-    format!("blk.{block}.attn_q.weight")
-}
-
-/// `blk.{block}.attn_k.weight` — the key projection, every key head.
-pub fn attn_k(block: usize) -> String {
-    format!("blk.{block}.attn_k.weight")
-}
-
-/// `blk.{block}.attn_v.weight` — the value projection, every value head.
-pub fn attn_v(block: usize) -> String {
-    format!("blk.{block}.attn_v.weight")
-}
-
-/// `blk.{block}.attn_q_norm.weight` — the RMS gain every query head is normed with, one head wide.
-pub fn attn_q_norm(block: usize) -> String {
-    format!("blk.{block}.attn_q_norm.weight")
-}
-
-/// `blk.{block}.attn_k_norm.weight` — the RMS gain every key head is normed with, one head wide.
-pub fn attn_k_norm(block: usize) -> String {
-    format!("blk.{block}.attn_k_norm.weight")
-}
-
-/// `blk.{block}.attn_output.weight` — the projection from the heads' outputs back to the residual.
-pub fn attn_output(block: usize) -> String {
-    format!("blk.{block}.attn_output.weight")
-}
-
-/// `blk.{block}.ffn_norm.weight` — the pre-FFN RMS gain.
-pub fn ffn_norm(block: usize) -> String {
-    format!("blk.{block}.ffn_norm.weight")
-}
-
-/// `blk.{block}.ffn_gate_inp.weight` — the router, one logit per expert. Every layer carries it: this
-/// architecture has no dense FFN (`Hparams` refuses a layer without it).
-pub fn ffn_gate_inp(block: usize) -> String {
-    format!("blk.{block}.ffn_gate_inp.weight")
-}
-
-/// `blk.{block}.ffn_gate_exps.weight` — the routed experts' gate stack.
-pub fn ffn_gate_exps(block: usize) -> String {
-    format!("blk.{block}.ffn_gate_exps.weight")
-}
-
-/// `blk.{block}.ffn_up_exps.weight` — the routed experts' up stack.
-pub fn ffn_up_exps(block: usize) -> String {
-    format!("blk.{block}.ffn_up_exps.weight")
-}
-
-/// `blk.{block}.ffn_down_exps.weight` — the routed experts' down stack.
-pub fn ffn_down_exps(block: usize) -> String {
-    format!("blk.{block}.ffn_down_exps.weight")
-}
+pub use crate::arch::names::{
+    attn_k, attn_k_norm, attn_norm, attn_output, attn_q, attn_q_norm, attn_v, ffn_down_exps,
+    ffn_gate_exps, ffn_gate_inp, ffn_norm, ffn_up_exps, output, output_norm, token_embd,
+};
 
 /// The part after `blk.{N}.` of every per-layer name above, in the order
-/// above. Each layer carries all of them and nothing else.
+/// above. Each layer carries all of them and nothing else; the router
+/// (`ffn_gate_inp`) is on every layer, for this architecture has no dense FFN
+/// (`Hparams` refuses a layer without it).
 pub const LAYER: [&str; 12] = [
     "attn_norm.weight",
     "attn_q.weight",

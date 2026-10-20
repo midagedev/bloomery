@@ -8,7 +8,7 @@
 use gguf::Split;
 
 use super::hparams::Hparams;
-use crate::arch::classify::{Counts, classify_with};
+use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role};
 use crate::arch::stems::{opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
@@ -157,13 +157,10 @@ fn nextn_stem(stem: &str) -> bool {
 /// hold it, its layer is past the file's, or a trunk layer carries a
 /// next-token stem.
 fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
-    match name {
-        "token_embd.weight" => return Some((Role::TokenEmbedding, None)),
-        "output_norm.weight" | "output.weight" => return Some((Role::Head, None)),
-        _ => {}
+    if let Some(model_level) = model_level_role(name) {
+        return Some(model_level);
     }
-    let (layer, stem) = name.strip_prefix("blk.")?.split_once('.')?;
-    let layer: usize = layer.parse().ok().filter(|&l| l < hp.n_layer)?;
+    let (layer, stem) = block_stem(name, hp.n_layer)?;
     if layer >= hp.n_trunk {
         return (layer_role(stem).is_some() || nextn_stem(stem))
             .then_some((Role::Unused, Some(layer)));

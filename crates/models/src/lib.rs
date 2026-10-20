@@ -67,6 +67,9 @@ pub enum Arch {
     Qwen4Exp,
     Glm5Next,
     MiMo2,
+    /// MiniMax-M3: GQA layers with a block-max sparse selector over a dense
+    /// lead, routed experts with a shared one, `swigluoai` everywhere.
+    MiniMaxM3,
     NemotronH,
     /// Nemotron-H with latent mixture-of-experts layers in place of the
     /// dense MLP ones.
@@ -90,6 +93,7 @@ impl Arch {
             Arch::Qwen4Exp => "qwen4exp",
             Arch::Glm5Next => "glm5next",
             Arch::MiMo2 => "mimo2",
+            Arch::MiniMaxM3 => "minimax-m3",
             Arch::NemotronH => "nemotron_h",
             Arch::NemotronHMoe => "nemotron_h_moe",
             Arch::GemmaEmbedding => "gemma-embedding",
@@ -357,6 +361,25 @@ pub enum Selector {
         pool: u32,
         rule: PoolRule,
     },
+    /// A top-k of blocks of the raw positions: every position's key is scored
+    /// against each index head, a block scores the largest of its positions'
+    /// scores, and the query's own block is kept inside the `top_k`. Each key
+    /// head selects on its own, and the keys are RMS-normed and rotated.
+    BlockMax {
+        /// `attention.indexer.head_count`: index heads, one for each key head.
+        heads: u32,
+        /// `attention.indexer.key_length`: values per index head and key.
+        d: u32,
+        /// `attention.indexer.top_k`: blocks kept, the query's own among them.
+        top_k: u32,
+        /// `attention.indexer.block_size`: positions a block holds.
+        block: u32,
+        /// `attention.indexer.local_blocks`: blocks, the query's own first,
+        /// kept whatever they score.
+        local: u32,
+        /// The rotation of the index query and key.
+        rope: Rope,
+    },
 }
 
 /// How a token-pool selector makes a pool's key and scores it.
@@ -536,6 +559,10 @@ pub enum Act {
     ReluSqr,
     /// `gelu(g)·u`, GELU in its tanh form.
     GeGlu,
+    /// `swigluoai`: with `x = min(g, limit)` and `y = clamp(u, ±limit)`,
+    /// `x·sigmoid(alpha·x)·(y + 1)`. The gate is clamped from above only,
+    /// before the sigmoid, and the up path carries a unit offset.
+    SwigluOai { alpha: f32, limit: f32 },
 }
 
 impl Act {
@@ -546,6 +573,7 @@ impl Act {
             Act::SwiGlu { .. } => "SwiGLU",
             Act::ReluSqr => "squared ReLU",
             Act::GeGlu => "GELU GLU",
+            Act::SwigluOai { .. } => "swigluoai",
         }
     }
 
@@ -941,6 +969,18 @@ mod tests {
     fn swiglu_limit_is_zero_without_a_limit_and_the_limit_with_one() {
         assert_eq!(Act::SwiGlu { limit: None }.swiglu_limit(), 0.0);
         assert_eq!(Act::SwiGlu { limit: Some(7.0) }.swiglu_limit(), 7.0);
+    }
+
+    /// `swigluoai` is not the SwiGLU clamp: its limit clamps the gate from above and the up path on
+    /// both sides, so a caller asking it for the SwiGLU limit is refused by the activation's name.
+    #[test]
+    #[should_panic(expected = "swigluoai has no SwiGLU clamp")]
+    fn swiglu_limit_on_swigluoai_names_the_activation() {
+        let _ = Act::SwigluOai {
+            alpha: 1.702,
+            limit: 7.0,
+        }
+        .swiglu_limit();
     }
 
     /// A squared ReLU has no SwiGLU clamp. Calling the clamp on it is the
