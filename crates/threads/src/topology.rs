@@ -21,10 +21,6 @@ fn parse_cpu_list(s: &str) -> Vec<u32> {
     out
 }
 
-fn read_sys(path: &str) -> Option<String> {
-    std::fs::read_to_string(path).ok()
-}
-
 /// One shared L3 as the topology reads it: its cores, each core's logical
 /// cpus (the lowest first), and its size.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,8 +34,9 @@ pub(crate) struct CcdGroup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Topology {
     pub(crate) groups: Vec<CcdGroup>,
-    /// Sysfs listed the cpus' siblings. `false`: the groups are the one
-    /// stand-in a machine with no topology files gets.
+    /// Sysfs listed the cpus' siblings. `false`: a machine with no topology
+    /// files, whose `groups` are empty; [`Shape::of`] takes the cpus of the
+    /// process's mask as the cores of one group.
     pub(crate) read: bool,
 }
 
@@ -77,6 +74,12 @@ fn l3_size(path: &str, read: std::io::Result<String>) -> u64 {
 /// (`ccd_topology`), restructured so the physical-core count is recoverable
 /// and a core's cpus stay together.
 pub(crate) fn detect_topology() -> Topology {
+    detect_with(&|path| std::fs::read_to_string(path))
+}
+
+/// [`detect_topology`] over `read`, the reader of a sysfs file.
+fn detect_with(read: &dyn Fn(&str) -> std::io::Result<String>) -> Topology {
+    let read_sys = |path: &str| read(path).ok();
     let mut groups: Vec<(String, Vec<u32>)> = Vec::new(); // (l3 key, primaries)
     let mut cpu = 0u32;
     while let Some(sib) = read_sys(&format!(
@@ -97,18 +100,11 @@ pub(crate) fn detect_topology() -> Topology {
         cpu += 1;
     }
     if groups.is_empty() {
-        // No sysfs topology (container?): one group of everything found, so
-        // the pool still has a nonzero default thread count.
-        let cpus: Vec<u32> = if cpu == 0 {
-            vec![0]
-        } else {
-            (0..cpu).collect()
-        };
+        // No sysfs topology (container?): no groups. The mask's cpus stand in
+        // for them ([`Shape::of`]), so the pool still has a default thread
+        // count of the cpus there are.
         return Topology {
-            groups: vec![CcdGroup {
-                cores: cpus.into_iter().map(|c| vec![c]).collect(),
-                l3_bytes: 0,
-            }],
+            groups: Vec::new(),
             read: false,
         };
     }
@@ -120,7 +116,7 @@ pub(crate) fn detect_topology() -> Topology {
                 "/sys/devices/system/cpu/cpu{}/cache/index3/size",
                 primaries[0]
             );
-            let l3_bytes = l3_size(&path, std::fs::read_to_string(&path));
+            let l3_bytes = l3_size(&path, read(&path));
             let cores = primaries
                 .into_iter()
                 .map(|p| {
@@ -219,7 +215,8 @@ impl Shape {
     /// one, so a mask of siblings alone still places one thread a core; a
     /// core with no allowed cpu, and a group with no allowed core, are out.
     /// A mask that shares no cpu with the topology takes its own cpus as one
-    /// group of one-cpu cores.
+    /// group of one-cpu cores, and so does a topology sysfs did not list
+    /// (`read` false), which has no cpus to cut and so no cut to name.
     pub(crate) fn of(topology: Topology, mask: &[u32], threads: Option<usize>) -> Shape {
         let mut allowed = mask.to_vec();
         allowed.sort_unstable();
@@ -268,16 +265,17 @@ impl Shape {
             l3.push(0);
         }
         let physical = kept_cores;
-        let cut = (from_mask || kept_cpus < listed || unlisted > 0).then_some(Cut {
-            topology_cpus: listed,
-            kept_cpus: if from_mask { 0 } else { kept_cpus },
-            cores,
-            kept_cores: if from_mask { 0 } else { kept_cores },
-            ccds,
-            kept_ccds: if from_mask { 0 } else { topo.len() },
-            unlisted,
-            from_mask,
-        });
+        let cut =
+            (topology.read && (from_mask || kept_cpus < listed || unlisted > 0)).then_some(Cut {
+                topology_cpus: listed,
+                kept_cpus: if from_mask { 0 } else { kept_cpus },
+                cores,
+                kept_cores: if from_mask { 0 } else { kept_cores },
+                ccds,
+                kept_ccds: if from_mask { 0 } else { topo.len() },
+                unlisted,
+                from_mask,
+            });
         Shape {
             topo,
             l3,
@@ -521,20 +519,61 @@ mod tests {
         assert_eq!(s.cut.as_ref().map(|c| c.unlisted), Some(1));
     }
 
-    /// The stand-in of a machine with no topology files is one core a cpu,
-    /// and it is flagged for the pool's line.
+    /// A machine with no topology files runs the cpus of the process's mask
+    /// as the cores of one group, whichever cpus they are, and says so in the
+    /// pool's line instead of naming a cut.
     #[test]
-    fn a_standin_topology_is_flagged() {
-        let standin = Topology {
-            groups: vec![CcdGroup {
-                cores: vec![vec![0]],
-                l3_bytes: 0,
-            }],
-            read: false,
-        };
-        let s = Shape::of(standin, &[0, 1, 2], None);
+    fn a_machine_with_no_topology_files_runs_the_masks_cpus() {
+        let none = |_: &str| Err(std::io::ErrorKind::NotFound.into());
+        let standin = detect_with(&none);
+        assert!(!standin.read && standin.groups.is_empty());
+        // PIN(2026-10-21): three threads for a mask of three cpus holding cpu
+        // 0 (was one: the stand-in was the single cpu 0 cut by the mask).
+        let s = Shape::of(standin.clone(), &[0, 1, 2], None);
         assert!(!s.topology_read);
-        assert_eq!((s.physical, s.threads), (1, 1));
+        assert_eq!((s.physical, s.threads), (3, 3));
+        assert_eq!(s.topo, vec![vec![0, 1, 2]]);
+        assert_eq!(s.cut, None);
+        let lines = s.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("as cores of one group (3 threads)"),
+            "{lines:?}"
+        );
+        // A mask without cpu 0 follows the same rule.
+        let s = Shape::of(standin, &(8..16).collect::<Vec<u32>>(), None);
+        assert_eq!((s.physical, s.threads), (8, 8));
+        assert_eq!(s.topo, vec![(8..16).collect::<Vec<u32>>()]);
+        assert_eq!(s.cut, None);
+    }
+
+    /// A sysfs that lists its cpus is read whole: one L3 group of two cores
+    /// of two cpus each, the lowest cpu of a core first.
+    #[test]
+    fn a_listed_topology_is_read_as_listed() {
+        let sysfs = |path: &str| -> std::io::Result<String> {
+            let file = path.rsplit('/').next().unwrap_or_default();
+            let cpu = path
+                .split("/cpu/cpu")
+                .nth(1)
+                .and_then(|r| r.split('/').next())
+                .and_then(|n| n.parse::<u32>().ok());
+            match (cpu, file) {
+                (Some(c @ 0..=3), "thread_siblings_list") => Ok(if c % 2 == 0 {
+                    format!("{c},{}", c + 1)
+                } else {
+                    format!("{},{c}", c - 1)
+                }),
+                (Some(0..=3), "shared_cpu_list") => Ok("0-3".to_string()),
+                (Some(0..=3), "size") => Ok("32M\n".to_string()),
+                _ => Err(std::io::ErrorKind::NotFound.into()),
+            }
+        };
+        let t = detect_with(&sysfs);
+        assert!(t.read);
+        assert_eq!(t.groups.len(), 1);
+        assert_eq!(t.groups[0].cores, vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(t.groups[0].l3_bytes, 32 << 20);
     }
 
     /// A pool says nothing when the mask leaves the topology whole, and one
