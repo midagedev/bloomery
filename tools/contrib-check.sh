@@ -8,6 +8,10 @@
 #
 #   T0  any OS with the pinned nightly:
 #         fmt                    cargo fmt --all -- --check
+#         lab-<name>-lock        cargo metadata --locked on each labs/<name>/Cargo.toml: a lab is a workspace of its own, so a
+#                                root crate's new dependency leaves its lock stale until the change that added it refreshes it
+#         lab-<name>-fmt         cargo fmt --check on that lab (the root fmt does not reach it). Building and running a lab is
+#                                its contributor's verify script on their card (CONTRIBUTING.md)
 #         test-<crate>           cargo test -p <crate>, for each crate `recipes.py pure-crates` lists
 #         recipes-self-test      python3 tools/recipes.py --self-test
 #         <tools/…/x.py>         each Python tool self-test tools/check-recipes.sh lists (read from its `selftests=(` array: the
@@ -175,6 +179,13 @@ PLAN=$LOGDIR/plan.tsv
 add() { printf '%s\t%s\n' "$1" "$2" >> "$PLAN"; }
 
 add fmt 'cargo fmt --all -- --check'
+
+for m in labs/*/Cargo.toml; do
+  [ -f "$m" ] || continue
+  lab=$(basename "$(dirname "$m")")
+  add "lab-$lab-lock" "cargo metadata --locked --format-version 1 --manifest-path $m > /dev/null"
+  add "lab-$lab-fmt" "cargo fmt --all --manifest-path $m -- --check"
+done
 
 crates=$(python3 tools/recipes.py pure-crates --names) || { say "contrib-check: tools/recipes.py pure-crates failed"; exit 70; }
 [ -n "$crates" ] || { say "contrib-check: recipes.py pure-crates lists no crate"; exit 70; }

@@ -90,7 +90,8 @@ machine reports rather than a flag only you would set.
 so the CUDA build, the gates and the release do not change. Your card is its gate. The lab carries a `verify.sh` that
 runs its checks and writes a result JSON: the source tree hash, the binary hashes, the card, the runtime version, and
 each case's result. Every PR to the lab attaches that JSON from its head commit. We check that the hash matches the
-PR, and run the format, lint and comment checks on our side. The lab's owner is the contributor who opened it.
+PR. `just contrib-check` (CI's t0) holds the lab's lock and format against the tree on every pull request, so a root
+change that moves the lab's lock refreshes it in the same change. The lab's owner is the contributor who opened it.
 
 ## Code shape
 
