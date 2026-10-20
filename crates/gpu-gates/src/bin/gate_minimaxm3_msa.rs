@@ -49,7 +49,6 @@ mod gate {
         partials_v_len,
     };
     use bloomery_gpu::rope_neox::{HEAD, PartialNeoxArgs, ROT_PARTIAL, RopeNeoxKernels};
-    use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::flash_band::{ExactAttn, exact_attn};
     use bloomery_gpu_gates::prefill_gate::{HostCache, cache};
@@ -337,32 +336,12 @@ mod gate {
 
     // ----------------------------------------------------- 1. the index heads
 
+    /// The index heads' rows: the shared seeded head inputs at one key head, with no value row (the
+    /// index cache holds keys only).
     fn index_inputs() -> Result<(RopeIn, Vec<u32>), GateError> {
-        let table_rt = RopeTable::new(&RopeSpec::window(THETA, ROT_PARTIAL))?;
-        let mut table = Vec::with_capacity(ROPE_CTX * ROT_PARTIAL);
-        for p in 0..ROPE_CTX {
-            table_rt.push(u32::try_from(p)?, Direction::Forward, &mut table);
-        }
-        let gain = |seed: u32, base: f32| -> Vec<f32> {
-            activations(HEAD, 1, seed)
-                .iter()
-                .map(|v| base + 0.5 * v)
-                .collect()
-        };
-        let inp = RopeIn {
-            qg: activations(HEAD, ROPE_M * HEADS, 13),
-            k: activations(HEAD, ROPE_M, 16)
-                .iter()
-                .map(|v| 4.0 * v)
-                .collect(),
-            v: vec![0.0; ROPE_M * HEAD],
-            gq: gain(14, 1.25),
-            gk: gain(15, 1.3),
-            table,
-        };
-        let pos: Vec<u32> = (0..ROPE_M)
-            .map(|t| u32::try_from(ROPE_CTX - ROPE_M + t))
-            .collect::<Result<_, _>>()?;
+        let (mut inp, pos) =
+            rope_gate::seeded_inputs(HEAD, ROT_PARTIAL, THETA, (ROPE_CTX, ROPE_M), (HEADS, 1))?;
+        inp.v = vec![0.0; ROPE_M * HEAD];
         Ok((inp, pos))
     }
 
