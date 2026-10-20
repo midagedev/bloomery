@@ -111,6 +111,7 @@ gate-gpu-mcol	common		kernel	quant_q4k+quant_q6k
 gate-gpu-mimo2-flash	family	mimo2	kernel	attn_gqa
 gate-gpu-minicpm-text	family	minicpmv47	e2e	attn_linear_gdn_kda
 gate-gpu-minicpmv-tower	family	minicpmv47	media	serve_media
+gate-gpu-minimaxm3-msa	family	minimax-m3	kernel	attn_gqa
 gate-gpu-minimaxm3-rope	family	minimax-m3	kernel	attn_gqa
 gate-gpu-moe	family	deepseek2	e2e	graph_fault+moe_route+weights_load
 gate-gpu-mxfp8	common		kernel	quant_q8
