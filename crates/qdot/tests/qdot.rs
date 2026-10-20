@@ -3338,6 +3338,162 @@ fn swiglu_clamp_matches_ik_rule() {
     }
 }
 
+// ------------------------------------------------- SwiGLU-OAI (MiniMax-M3)
+// The reference below is llama.cpp's `ggml_compute_forward_swiglu_oai_f32`
+// (`ggml/src/ggml-cpu/ops.cpp`) written out again in scalar f32 with ik's
+// exponential in place of libm's `expf`, not a call into qdot: a `+ 1` or an
+// `alpha` deleted from `swiglu_oai` cannot be deleted from this too.
+
+const OAI_ALPHA: f32 = 1.702;
+
+/// `x = std::min(g, limit)`, `y = std::clamp(u, -limit, limit)`, `out_glu = x
+/// / (1 + expf(alpha * (-x)))`, `out_glu * (y + 1)`. `std::min(a, b)` is `b <
+/// a ? b : a`; `std::clamp(v, lo, hi)` is `v < lo ? lo : hi < v ? hi : v`.
+fn ref_swiglu_oai(g: f32, u: f32, alpha: f32, limit: f32) -> f32 {
+    let x = if limit < g { limit } else { g };
+    let y = if u < -limit {
+        -limit
+    } else if limit < u {
+        limit
+    } else {
+        u
+    };
+    let out_glu = x / (1.0 + ik_expf(alpha * -x));
+    out_glu * (y + 1.0)
+}
+
+/// `swiglu_oai` against the transcription, bit for bit, on inputs past the
+/// limit on every side (the gate above it, the up above and below its
+/// bounds, the edges themselves, both zeros, a gate whose exponential
+/// overflows), in a vector whose length leaves an eight-lane tail; every
+/// value alone must equal its value in the block. And against the formula in
+/// f64 — `x / (1 + e^z) · (y + 1)` at the f32 argument `z = alpha · (-x)` the
+/// reference's `expf` takes — within the band the rounding sources give:
+/// the exponential's 2 ulp (`ik_expf` sweeps to 1.84), the sum `1 + e`, the
+/// quotient and the product half an ulp each, 3.5 · 2^-23 of the result,
+/// beside the smallest normal for the values that underflow and the cliff where
+/// the exponential overflows (`88.73 / alpha · (limit + 1) / f32::MAX`: the exact
+/// value at the first `x` whose `e^z` is past `f32::MAX`, which both the vector
+/// exponential and libm's flush to 0).
+#[test]
+fn swiglu_oai_matches_the_reference_rule() {
+    // -52.1286 is the first gate whose exponential, `alpha · 52.1286` = 88.7232, is past f32::MAX.
+    let gates = [
+        -200.0f32, -60.0, -52.1286, -20.0, -10.5, -1.2785, -0.0, 0.0, 0.5, 2.4, 6.99, 7.0, 7.001,
+        9.99, 30.0,
+    ];
+    let ups = [
+        -1000.0f32, -10.001, -7.001, -7.0, -6.99, -1.0, -0.0, 0.0, 3.0, 6.99, 7.0, 7.001, 50.0,
+    ];
+    let (gate, up): (Vec<f32>, Vec<f32>) = gates
+        .iter()
+        .flat_map(|&g| ups.iter().map(move |&u| (g, u)))
+        .unzip();
+    let n = gate.len();
+    assert_ne!(n % 8, 0, "the set must leave a tail");
+    for limit in [7.0f32, 2.5, 0.0] {
+        let mut out = vec![0.0f32; n];
+        assert!(qdot::swiglu_oai(&gate, &up, OAI_ALPHA, limit, &mut out));
+        let (mut gate_hi, mut up_hi, mut up_lo, mut worst) = (0, 0, 0, 0.0f64);
+        for i in 0..n {
+            let want = ref_swiglu_oai(gate[i], up[i], OAI_ALPHA, limit);
+            assert_eq!(
+                out[i].to_bits(),
+                want.to_bits(),
+                "limit {limit}: gate {} up {}: got {} ({:#x}), the reference rule {want} ({:#x})",
+                gate[i],
+                up[i],
+                out[i],
+                out[i].to_bits(),
+                want.to_bits()
+            );
+            assert_eq!(
+                qdot::swiglu_oai_1(gate[i], up[i], OAI_ALPHA, limit).to_bits(),
+                want.to_bits()
+            );
+            let mut one = [0.0f32];
+            assert!(qdot::swiglu_oai(
+                &gate[i..=i],
+                &up[i..=i],
+                OAI_ALPHA,
+                limit,
+                &mut one
+            ));
+            assert_eq!(
+                one[0].to_bits(),
+                out[i].to_bits(),
+                "limit {limit}: i={i} moves with its position"
+            );
+            gate_hi += usize::from(gate[i] > limit);
+            up_hi += usize::from(up[i] > limit);
+            up_lo += usize::from(up[i] < -limit);
+            // The f64 twin of the formula at the f32 argument.
+            let x = f64::from(gate[i].min(limit));
+            let z = f64::from(OAI_ALPHA * -gate[i].min(limit));
+            let y = f64::from(up[i]).clamp(-f64::from(limit), f64::from(limit));
+            let exact = x / (1.0 + z.exp()) * (y + 1.0);
+            let flush =
+                88.73 / f64::from(OAI_ALPHA) * (f64::from(limit) + 1.0) / f64::from(f32::MAX);
+            let band = 3.5 * 2f64.powi(-23) * exact.abs() + flush + f64::from(f32::MIN_POSITIVE);
+            let d = (f64::from(out[i]) - exact).abs();
+            worst = worst.max(d / band);
+            assert!(
+                d <= band,
+                "limit {limit}: gate {} up {}: {} vs exact {exact}",
+                gate[i],
+                up[i],
+                out[i]
+            );
+        }
+        assert!(
+            (limit == 0.0 || gate_hi > 0) && up_hi > 0 && up_lo > 0 && worst > 0.0,
+            "limit {limit}: the set must cross every side (g > L {gate_hi}, u > L {up_hi}, u < -L {up_lo})"
+        );
+        eprintln!(
+            "swiglu_oai limit {limit}: {n} values bit-identical to the reference rule, \
+             max |d|/band {worst:.3} against the f64 formula"
+        );
+    }
+}
+
+/// The OAI combine reports a NaN or an infinity in `gate` or `up` at every
+/// position (each lane of both vectors and the padded tail), which the clamps
+/// would write as a finite value, and reports finite inputs as finite.
+#[test]
+fn swiglu_oai_flags_a_non_finite_input_at_every_position() {
+    let n = 19;
+    let mut out = vec![0.0f32; n];
+    let base = vec![f32::MAX; n];
+    assert!(qdot::swiglu_oai(&base, &base, OAI_ALPHA, 7.0, &mut out));
+    for i in 0..n {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut v = base.clone();
+            v[i] = bad;
+            assert!(
+                !qdot::swiglu_oai(&v, &base, OAI_ALPHA, 7.0, &mut out),
+                "gate[{i}] = {bad}"
+            );
+            assert!(
+                !qdot::swiglu_oai(&base, &v, OAI_ALPHA, 7.0, &mut out),
+                "up[{i}] = {bad}"
+            );
+        }
+    }
+}
+
+/// A limit the clamp of `up` cannot take (negative, NaN, infinite) is refused
+/// by name, never run.
+#[test]
+fn swiglu_oai_refuses_a_limit_without_bounds() {
+    for limit in [-1.0f32, f32::NAN, f32::INFINITY] {
+        let r = std::panic::catch_unwind(|| {
+            let mut out = [0.0f32];
+            qdot::swiglu_oai(&[1.0], &[1.0], OAI_ALPHA, limit, &mut out)
+        });
+        assert!(r.is_err(), "limit {limit} was run");
+    }
+}
+
 // --------------------------------------------------------- sum_sq_f64
 // The laned f64 sum against the left-to-right one: equal to f64 rounding, and
 // equal exactly once narrowed to f32 — the only form the norm consumes.

@@ -27,8 +27,7 @@ use std::sync::Arc;
 
 // `gemm_swiglu_quant`'s contract spells the largest gate·up rule code as a
 // literal.
-const _: () =
-    assert!(crate::kquant::act::ACT_SILU_MUL == 0 && crate::kquant::act::ACT_SWIGLU_CLAMP == 1);
+const _: () = assert!(crate::kquant::act::ACT_MAX == 2);
 
 #[cuda_module]
 mod gemm_kernels {
@@ -723,15 +722,16 @@ mod gemm_kernels {
     /// q8_1 in one launch, one 32-thread block per 128-value block: lane `l`
     /// of block `(col, b)` takes values `128·b + 4·l .. +3` of column `col` of
     /// `g` and `u`, forms the gate·up rule `kquant::act::apply(act, limit, ..)`
-    /// of each pair — `elem::silu_mul` (`ACT_SILU_MUL`) or ik's clamped SwiGLU
-    /// at `limit` (`ACT_SWIGLU_CLAMP`), the contract admits those two codes
-    /// alone — and hands the four to `q8_1_quant_vals`: the values
+    /// of each pair — `elem::silu_mul` (`ACT_SILU_MUL`), ik's clamped SwiGLU
+    /// at `limit` (`ACT_SWIGLU_CLAMP`) or the OAI SwiGLU at `limit`
+    /// (`ACT_SWIGLU_OAI`), the contract admits those three codes alone —
+    /// and hands the four to `q8_1_quant_vals`: the values
     /// `elem::swiglu` stores under the first rule and the bytes
     /// `q3k_quantize_q8_1` writes from them, since both run the same bodies
     /// on the same geometry. A block holding a non-finite `g` or `u` value is
     /// refused as the quantizer refuses it (NaN scale, zero codes) and raises
-    /// [`FaultSite::QuantColumn`] under either rule: the clamp would carry it
-    /// to a finite value the quantizer's own test cannot see.
+    /// [`FaultSite::QuantColumn`] under any rule: a clamp would carry it to a
+    /// finite value the quantizer's own test cannot see.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -742,7 +742,7 @@ mod gemm_kernels {
         domain = 1,
         block = (32, 1, 1),
         requires = (
-            act <= 1,
+            act <= 2,
             g.len() >= n_cols * 256 * n_sb,
             u.len() >= n_cols * 256 * n_sb,
             q3.len() >= n_cols * 64 * half_it,

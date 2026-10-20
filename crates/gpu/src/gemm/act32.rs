@@ -267,12 +267,12 @@ impl Gemm32Kernels {
     /// columns (`swiglu_act_quant32`, declared in `kernels32.rs`):
     /// [`Gemm32Kernels::enqueue_swiglu_quant32`] with the gate·up rule
     /// `rule` (`kquant::act::apply`) in place of `silu(g) · u` — ik's
-    /// clamped SwiGLU for a feed-forward block its model clamps. A
-    /// non-finite `g` or `u` value refuses its block and raises
-    /// [`FaultSite::QuantColumn`] under either rule (the clamp would carry it
-    /// to a finite value); [`Act::SiluMul`] writes
-    /// `enqueue_swiglu_quant32`'s bytes. A clamp limit that is not finite is
-    /// refused by name. Asynchronous, allocation-free, capturable.
+    /// clamped SwiGLU or the OAI SwiGLU for a feed-forward block its model
+    /// clamps. A non-finite `g` or `u` value refuses its block and raises
+    /// [`FaultSite::QuantColumn`] under any rule (a clamp would carry it to a
+    /// finite value); [`Act::SiluMul`] writes `enqueue_swiglu_quant32`'s
+    /// bytes. A rule [`Act::code`] refuses is refused by name. Asynchronous,
+    /// allocation-free, capturable.
     ///
     /// [`FaultSite::QuantColumn`]: crate::FaultSite::QuantColumn
     #[allow(
@@ -290,14 +290,6 @@ impl Gemm32Kernels {
         fault: FaultSink,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_swiglu_act_quant32";
-        if let Act::SwigluClamp { limit } = rule
-            && !limit.is_finite()
-        {
-            return Err(GpuError::shape(
-                what,
-                format!("the clamp limit must be finite, got {limit}"),
-            ));
-        }
         let (grid, m, blocks, groups, steps) = act.quant_launch(what, n_cols)?;
         if g.len() < n_cols * act.k || u.len() < n_cols * act.k {
             return Err(GpuError::shape(
@@ -310,7 +302,7 @@ impl Gemm32Kernels {
                 ),
             ));
         }
-        let (code, limit) = rule.code();
+        let (code, limit) = rule.code(what)?;
         let prep = self
             .module
             .prepare_swiglu_act_quant32(LaunchConfig1D::new(grid, 32, 0))?;
