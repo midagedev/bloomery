@@ -1,6 +1,6 @@
 //! `solar-open2` — Solar-Open2. The file's keys (`hparams`), every tensor's role (`roles`), the
-//! typed description (`spec`), the tensor names a step reads (`names`) and the host tier's view of a
-//! routed layer (`host`).
+//! typed description (`spec`), the tensor names a step reads (`names`), the host tier's view of a
+//! routed layer (`host`) and the gate fixture's spec (`fixture`).
 //!
 //! The trunk is Kimi delta attention (KDA) layers with a NoPE GQA layer between them, the GQA
 //! layers being those whose `attention.head_count_kv` is not 0. A GQA layer multiplies its
@@ -9,6 +9,7 @@
 //! residual. The dialect's authority is llama.cpp's `solar-open2` loader: the file is converted
 //! with its tensor layout, which differs from ik's KDA layout in `ssm_a`'s dims.
 
+pub mod fixture;
 pub mod host;
 pub mod hparams;
 pub mod names;

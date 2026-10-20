@@ -1553,7 +1553,11 @@ gate-r8:
 # spec (model::arch::nemotron_h_moe::fixture) against the Bolt file's header: the four-layer plan read back by the engine's
 # hparams (kinds, the two MoE layers' expert shapes, expert_count the map's largest router, every stem and type pair of the
 # source), the written fixture (about 2.16 GB) verified against it, and the maps that lose a kind or the two shapes refused
-# by name; and a toy family's r8 sidecar written, checked and refused when absent, other or flipped.
+# by name; the Solar-Open2-250B spec (model::arch::solar2::fixture) against the Solar file's header: the four-layer plan read
+# back by the engine's hparams (kinds, KV heads, every stem and type pair of the source), the planned budget (half the
+# experts on each card-eligible layer, none on the Q6_K-down layers), and on a small synthetic source the written fixture's
+# constants and the maps that lose a mixer or a pair refused by name; and a toy family's r8 sidecar written, checked and
+# refused when absent, other or flipped.
 # Reads headers only; writes only under this tree's target/tmp (the Nemotron clause writes its one 0.93 GB file there).
 gate-fixture:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-fixture && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model-hf --test fixture --bin fixture -- --include-ignored --nocapture --test-threads=1'
@@ -1570,7 +1574,7 @@ gate-fixture-budget:
 # The architecture registry (crates/model/src/arch/registry.rs): every architecture string is in one row and every `Arch`
 # in one row, a fixture row declares its row's architecture, the draft rules are the three rows that have one,
 # tools/arch-registry.tsv (which tools/hf-arch-check.py reads) is the registry's print, and each family's written fixture
-# (the six under /models/fixtures, BLOOMERY_FIXTURE_ROOT) reads through the registry exactly as its family's own reader
+# (the seven under /models/fixtures, BLOOMERY_FIXTURE_ROOT) reads through the registry exactly as its family's own reader
 # does. Headers only, no card. Either tier: it reads the fixtures as they are.
 gate-arch-registry:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::registry --include-ignored --nocapture'

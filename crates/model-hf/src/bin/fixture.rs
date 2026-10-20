@@ -28,7 +28,7 @@
 //! listed size with its header (fetched through the hf crate's client) at the front, in a
 //! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
 //! file its family's source row names, when the row has one (a row can say its draft is not
-//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `qwen35moe`, `glm5next`, `nemotron`, `nemotron-bolt`)
+//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen38`, `qwen35moe`, `glm5next`, `solar2`, `nemotron`, `nemotron-bolt`)
 //! reads its row of the registry (`model::arch::registry`): repo, quant and revision; a `<repo>:<quant>` takes `main`.
 //! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
 //! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
@@ -61,6 +61,7 @@ use model::arch::nemotron_h_moe::fixture as bolt;
 use model::arch::qwen35moe::fixture as qwen38;
 use model::arch::qwen35moe::fixture::qwen35moe as qwen36;
 use model::arch::registry::{self, DraftSource};
+use model::arch::solar2::fixture as solar;
 use model::fixture::{
     self, DEFAULT_SEED, FilePlan, FixtureError, FixtureSpec, Options, PlannedTensor, Sample,
     TensorStat, VARIANT_TABLE,
@@ -81,11 +82,12 @@ flags of fetch: the same but --draft, and --rev R";
 /// Every family's spec, found by the architecture it declares: the canonical string of its registry
 /// row, which holds the hub source and the draft ([`registry::fixture_of`]). The generators stay here,
 /// so the registry the engine reads reaches none of them.
-const SPECS: [fn() -> FixtureSpec; 6] = [
+const SPECS: [fn() -> FixtureSpec; 7] = [
     v41::spec,
     qwen38::spec,
     qwen36::spec,
     glm5::spec,
+    solar::spec,
     nemo::spec,
     bolt::spec,
 ];

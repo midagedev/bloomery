@@ -3,7 +3,9 @@
 //! rules and F32 constants, the layer-map checks that keep the source's
 //! kinds and every (tensor stem, type) pair, and the comparison of a written
 //! fixture's trunk with the source's. A family's own file holds what its
-//! architecture forces on top (its feed-forward kind, its experts).
+//! architecture forces on top (its feed-forward kind, its experts). The map
+//! check serves any family whose layers have kinds (`solar-open2`'s KDA and
+//! GQA layers use it without the Mamba-2 trunk).
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;

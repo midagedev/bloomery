@@ -172,7 +172,16 @@ pub static ROWS: &[ArchRow] = &[
         names: &["solar-open2"],
         read: Some(solar2::spec::read),
         draft: None,
-        fixture: None,
+        fixture: Some(FixtureRow {
+            family: "solar2",
+            repo: "llamaraspberryrabbit/Solar-Open2-250B-GGUF",
+            quant: "Q4_K_M",
+            // The repo's head commit when the row was written (the hub's API): its four Q4_K_M
+            // shards list the byte sizes of the box's four files, and `fixture fetch solar2` at
+            // it writes the same shards as `fixture generate` from the box's first shard.
+            rev: Some("6e78cf22866264a9e3052c2f02ca056bf79c9ac9"),
+            draft: DraftSource::None,
+        }),
     },
     ArchRow {
         arch: Some(Arch::NemotronH),
@@ -356,6 +365,7 @@ mod tests {
                 "qwen4exp",
                 "qwen35moe",
                 "glm5next",
+                "solar-open2",
                 "nemotron_h",
                 "nemotron_h_moe"
             ]

@@ -128,6 +128,28 @@
 //! 30. the real header: the plan of the four layers `[0, 3, 7, 48]`, the written file verified
 //!     against the source, and the maps that lose a kind or the two shapes refused.
 //!
+//! The Solar-Open2-250B spec (`model::arch::solar2::fixture`), the first KDA and GQA hybrid, whose
+//! layers all route 320 experts beside a shared one and whose source is a split set. The synthetic
+//! clauses plan a small `solar-open2` source of eight layers (the Q6_K and Q4_K projection sets the
+//! real file's layers hold one or the other of) through the family's own rules; the real header on
+//! the box:
+//!
+//! 32. the written fixture of the synthetic source verifies, the engine's reader reads its kinds,
+//!     KV head counts and routed block, and the family's constants land: the norms' gains, the
+//!     KDA decay's `ssm_a` and `ssm_dt.bias`, a spread router bias, the conv taps and the router
+//!     as matrix draws;
+//! 33. a layer map that loses a mixer or a (stem, type) pair is refused by name at the plan,
+//!     beside a control map that plans; a written fixture read against a map of other kinds is
+//!     refused by name by the family's kinds check;
+//! 34. the real header: the plan of the four layers `[0, 1, 6, 12]` (every tensor at its source's
+//!     dims and type, every (stem, type) pair of the source, the bytes of the layers and the
+//!     globals, four shards with a layer across a boundary) read back by the engine's reader, and
+//!     the fixture planned as the source is;
+//! 35. the card budget: the plan of the written file under its recorded budget holds half of the
+//!     experts (160 of 320) on every card-eligible layer (the Q4_K set's two) and none on the Q6_K-down
+//!     layers, its budgetless plan all of them on the eligible ones; a budget 64 MiB below and 1 GiB
+//!     above and an edited record are refused by name.
+//!
 //! Files go under this crate's `CARGO_TARGET_TMPDIR` and are removed.
 
 use std::collections::{BTreeMap, HashMap};
@@ -154,6 +176,9 @@ use model::arch::qwen35moe::fixture as q38;
 use model::arch::qwen35moe::fixture::qwen35moe as q36;
 use model::arch::qwen35moe::hparams::{Hparams, Kind};
 use model::arch::qwen35moe::place::{Experts, PlanInputs, UBATCH_PLANNED, machine_for_experts};
+use model::arch::solar2::fixture as solar;
+use model::arch::solar2::hparams::{Hparams as SolarHparams, Kind as SolarKind};
+use model::arch::solar2::place::PlanInputs as SolarInputs;
 use model::fileio;
 use model::fixture::{
     self, CHUNK_TARGET, CardBudget, DEFAULT_SHARD_BYTES, Family, FilePlan, FixtureError,
@@ -162,7 +187,7 @@ use model::fixture::{
     Window, rule_for,
 };
 use model::placement::PlanLevers;
-use model::placement::workstation::{self, RTX_3090};
+use model::placement::workstation::{self, HostRead, RTX_3090};
 use sha2::{Digest, Sha256};
 
 const ARCH: &str = "deepseek41";
@@ -4806,5 +4831,458 @@ fn hw_fixture_bolt_refusals() {
             (Some(_), Ok(_)) => bad.push(format!("{what}: planned")),
         }
     }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+// ------------------------------------------------------------------ Solar-Open2-250B
+
+/// A synthetic `solar-open2` source of eight layers at small widths, one unsplit file: GQA layers
+/// at 0 and 4 (2 key heads of 64), KDA layers between, every layer routing 128 experts of 256
+/// beside a shared one (enough elements in the router's bias for its RMS to hold the check). `attn_v`, `ffn_down_exps` and `ffn_down_shexp` are Q6_K on layers 0, 1, 2 and 5 and
+/// Q4_K on 3, 4, 6 and 7, one set or the other as the real file's layers hold. The tensors are
+/// zeros: the generator reads the header alone.
+fn solar_source(path: &Path) -> Split {
+    use GgmlType::{F32, Q4_K, Q5_0, Q6_K};
+    const E: u64 = 256;
+    const INNER: u64 = 256;
+    const KV: u64 = 128;
+    const FF: u64 = 256;
+    const N: u64 = 128;
+    let mut tensors: Vec<(String, Vec<u64>, GgmlType)> = vec![
+        ("token_embd.weight".into(), vec![E, 64], Q4_K),
+        ("output_norm.weight".into(), vec![E], F32),
+        ("output.weight".into(), vec![E, 64], Q6_K),
+    ];
+    for l in 0..8usize {
+        let gqa = l == 0 || l == 4;
+        let proj = if [0, 1, 2, 5].contains(&l) {
+            Q6_K
+        } else {
+            Q4_K
+        };
+        let kv = if gqa { KV } else { INNER };
+        let mut layer: Vec<(&str, Vec<u64>, GgmlType)> = vec![
+            ("attn_norm.weight", vec![E], F32),
+            ("attn_q.weight", vec![E, INNER], Q4_K),
+            ("attn_k.weight", vec![E, kv], Q4_K),
+            ("attn_v.weight", vec![E, kv], proj),
+            ("attn_output.weight", vec![INNER, E], Q4_K),
+        ];
+        if gqa {
+            layer.push(("attn_gate.weight", vec![E, INNER], Q4_K));
+        } else {
+            layer.extend([
+                ("ssm_conv1d_q.weight", vec![4, 1, INNER], F32),
+                ("ssm_conv1d_k.weight", vec![4, 1, INNER], F32),
+                ("ssm_conv1d_v.weight", vec![4, 1, INNER], F32),
+                ("ssm_f_a.weight", vec![E, 64], Q4_K),
+                ("ssm_f_b.weight", vec![64, INNER], Q5_0),
+                ("ssm_g_a.weight", vec![E, 64], Q4_K),
+                ("ssm_g_b.weight", vec![64, INNER], Q5_0),
+                ("ssm_beta.weight", vec![E, 4], Q4_K),
+                ("ssm_a", vec![1, 4], F32),
+                ("ssm_dt.bias", vec![INNER], F32),
+                ("ssm_norm.weight", vec![64], F32),
+            ]);
+        }
+        layer.extend([
+            ("ffn_norm.weight", vec![E], F32),
+            ("ffn_gate_inp.weight", vec![E, N], F32),
+            ("exp_probs_b.bias", vec![N], F32),
+            ("ffn_gate_exps.weight", vec![E, FF, N], Q4_K),
+            ("ffn_up_exps.weight", vec![E, FF, N], Q4_K),
+            ("ffn_down_exps.weight", vec![FF, E, N], proj),
+            ("ffn_gate_shexp.weight", vec![E, FF], Q4_K),
+            ("ffn_up_shexp.weight", vec![E, FF], Q4_K),
+            ("ffn_down_shexp.weight", vec![FF, E], proj),
+        ]);
+        tensors.extend(
+            layer
+                .into_iter()
+                .map(|(stem, dims, ty)| (format!("blk.{l}.{stem}"), dims, ty)),
+        );
+    }
+    let u32v = |k: &str, v: u32| (format!("solar-open2.{k}"), Value::U32(v));
+    let kvs: Vec<(String, Value)> = vec![
+        (
+            gguf::GENERAL_ARCHITECTURE.to_string(),
+            Value::String("solar-open2".into()),
+        ),
+        (
+            "general.name".to_string(),
+            Value::String("synthetic".into()),
+        ),
+        u32v("block_count", 8),
+        u32v("context_length", 4096),
+        u32v("embedding_length", E as u32),
+        u32v("feed_forward_length", 512),
+        u32v("leading_dense_block_count", 0),
+        u32v("attention.head_count", 4),
+        (
+            "solar-open2.attention.head_count_kv".into(),
+            Value::Array([2, 0, 0, 0, 2, 0, 0, 0].map(Value::I32).to_vec()),
+        ),
+        u32v("attention.key_length", 64),
+        u32v("attention.value_length", 64),
+        (
+            "solar-open2.attention.layer_norm_rms_epsilon".into(),
+            Value::F32(1e-5),
+        ),
+        ("solar-open2.rope.freq_base".into(), Value::F32(10_000.0)),
+        u32v("vocab_size", 64),
+        u32v("ssm.conv_kernel", 4),
+        u32v("kda.head_dim", 64),
+        u32v("expert_count", N as u32),
+        u32v("expert_used_count", 2),
+        u32v("expert_feed_forward_length", FF as u32),
+        u32v("expert_shared_count", 1),
+        u32v("expert_gating_func", 2),
+        ("solar-open2.expert_weights_scale".into(), Value::F32(1.0)),
+        ("solar-open2.expert_weights_norm".into(), Value::Bool(true)),
+    ];
+    zero_source(path, &kvs, &tensors)
+}
+
+/// The production family on the synthetic source's layers: a GQA and a KDA layer of the Q6_K set,
+/// then a KDA and a GQA layer of the Q4_K set, as the spec's map is, with a fixed budget (the
+/// planned one needs the real header's room).
+fn solar_spec() -> FixtureSpec {
+    FixtureSpec {
+        layers: vec![0, 1, 6, 4],
+        card_budget: CardBudget::Fixed(1 << 30),
+        ..solar::spec()
+    }
+}
+
+/// Contract 32: the synthetic source's fixture is written and verified (Q4_K, Q5_0, Q6_K blocks
+/// and the F32 tensors), read by the engine's reader as [GQA, KDA, KDA, GQA] with the KV head
+/// counts of the map's layers and the source's routed block, and the family's constants land: the
+/// norms' gains 1, `ssm_a` and `ssm_dt.bias` at the family's constants, the router's selection
+/// bias a spread (never a constant: a constant moves no pick), the conv taps drawn at `1/√4` and
+/// the router at `1/√K`.
+#[test]
+fn fixture_solar_round_trip() {
+    let guard = dir("solar-round-trip");
+    let d = &guard.0;
+    let src = solar_source(&d.join("src.gguf"));
+    let spec = solar_spec();
+    let plan = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    for (f, leaf, want) in [
+        (0, "attn_norm.weight", 1.0),
+        (0, "ffn_norm.weight", 1.0),
+        (1, "ssm_norm.weight", 1.0),
+        (1, "ssm_a", -1.49),
+        (1, "ssm_dt.bias", -0.84),
+        (2, "ssm_a", -1.49),
+        (2, "ssm_dt.bias", -0.84),
+    ] {
+        match rule_at(&plan, f, leaf) {
+            Rule::Const { value } if *value == want => {}
+            other => panic!(
+                "layer {f} {leaf}: {}, want constant {want}",
+                other.describe()
+            ),
+        }
+    }
+    let output_norm = plan
+        .target
+        .tensors
+        .iter()
+        .find(|t| t.name == "output_norm.weight")
+        .expect("the global output_norm");
+    assert!(
+        matches!(output_norm.rule, Rule::Const { value } if value == 1.0),
+        "output_norm: {}",
+        output_norm.rule.describe()
+    );
+    for f in 0..4 {
+        match rule_at(&plan, f, "exp_probs_b.bias") {
+            Rule::Uniform { half_width, .. } if *half_width == solar::BIAS_HALF_WIDTH => {}
+            other => panic!(
+                "layer {f} exp_probs_b.bias: {}, want a spread of ±{}",
+                other.describe(),
+                solar::BIAS_HALF_WIDTH
+            ),
+        }
+    }
+    for (f, leaf, k) in [
+        (1, "ssm_conv1d_q.weight", 4.0f64),
+        (1, "ssm_conv1d_v.weight", 4.0),
+        (0, "ffn_gate_inp.weight", 256.0),
+    ] {
+        match rule_at(&plan, f, leaf) {
+            Rule::Uniform { half_width, .. } => {
+                let want = (3.0f64.sqrt() / k.sqrt()) as f32;
+                assert!((half_width - want).abs() < 1e-6, "{leaf}: {half_width}");
+            }
+            other => panic!("layer {f} {leaf}: {}", other.describe()),
+        }
+    }
+    let ints = |k: &str| unsigned_items(&header_value(&plan.target, &format!("solar-open2.{k}")));
+    assert_eq!(ints("attention.head_count_kv"), [2, 0, 0, 2]);
+    assert_eq!(
+        header_value(&plan.target, "solar-open2.block_count").as_unsigned(),
+        Some(4)
+    );
+    let out = d.join("fx");
+    fixture::generate(&spec, &src, None, &out, &spec.options(), &mut |_| {}).unwrap();
+    let fx = Split::open(out.join("solar2-fixture-00001-of-00001.gguf")).unwrap();
+    assert_eq!(fx.shard_count(), 1);
+    fixture::verify(&spec, &fx, &src, None, &mut |_, _| {}).unwrap();
+    let hp = SolarHparams::read(&fx).unwrap();
+    let kinds: Vec<SolarKind> = (0..hp.n_layer).map(|l| hp.kind(l)).collect();
+    assert_eq!(
+        kinds,
+        [
+            SolarKind::Gqa,
+            SolarKind::Kda,
+            SolarKind::Kda,
+            SolarKind::Gqa
+        ]
+    );
+    assert_eq!(hp.kv_heads, [2, 0, 0, 2]);
+    assert_eq!(
+        (
+            hp.experts.n_expert,
+            hp.experts.n_used,
+            hp.experts.ff,
+            hp.experts.n_shared
+        ),
+        (128, 2, 256, 1)
+    );
+    solar::check_kinds(&spec, &fx, &src).unwrap();
+}
+
+/// Contract 33: a layer map that loses a mixer or a (stem, type) pair of the source is refused by
+/// name at the plan, each beside the control map, which plans; a written fixture read against a map
+/// of other kinds is refused by name by the family's kinds check, and passes it against its own.
+#[test]
+fn fixture_solar_refuses_a_map_that_loses_a_kind_or_a_pair() {
+    let guard = dir("solar-map");
+    let d = &guard.0;
+    let src = solar_source(&d.join("src.gguf"));
+    let (q6, q4) = (GgmlType::Q6_K.to_string(), GgmlType::Q4_K.to_string());
+    let mut bad = Vec::new();
+    let control = solar_spec();
+    if let Err(e) = fixture::plan(&control, &src, None, &control.options()) {
+        bad.push(format!("the control map: {e}"));
+    }
+    for (what, layers, want) in [
+        ("no GQA layer", vec![1, 2, 3], vec!["Gqa".to_string()]),
+        ("no KDA layer", vec![0, 4], vec!["Kda".to_string()]),
+        (
+            "the Q6_K set dropped (layer 0 the first)",
+            vec![3, 4, 6, 7],
+            vec!["attn_v.weight".into(), q6, "source layer 0".into()],
+        ),
+        (
+            "the Q4_K set dropped (layer 3 the first)",
+            vec![0, 1, 2, 5],
+            vec!["attn_v.weight".into(), q4, "source layer 3".into()],
+        ),
+    ] {
+        let s = FixtureSpec {
+            layers,
+            ..solar_spec()
+        };
+        let want: Vec<&str> = want.iter().map(String::as_str).collect();
+        refused_with(
+            &mut bad,
+            "solar map",
+            what,
+            fixture::plan(&s, &src, None, &s.options()),
+            &want,
+        );
+    }
+    let out = d.join("fx");
+    fixture::generate(&control, &src, None, &out, &control.options(), &mut |_| {}).unwrap();
+    let fx = Split::open(out.join("solar2-fixture-00001-of-00001.gguf")).unwrap();
+    if let Err(e) = solar::check_kinds(&control, &fx, &src) {
+        bad.push(format!("the kinds check against its own map: {e}"));
+    }
+    // Source layer 1 is a KDA layer where the fixture's layer 0 is a GQA one.
+    let swapped = FixtureSpec {
+        layers: vec![1, 0, 6, 4],
+        ..solar_spec()
+    };
+    refused_with(
+        &mut bad,
+        "solar map",
+        "a swapped map",
+        solar::check_kinds(&swapped, &fx, &src),
+        &["layer 0 (source 1)", "kind"],
+    );
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
+fn solar_real() -> Split {
+    Split::open(solar::DEFAULT_MODEL)
+        .unwrap_or_else(|e| panic!("open the Solar-Open2 file {}: {e}", solar::DEFAULT_MODEL))
+}
+
+/// Contract 34: the plan of the Solar-Open2 fixture on the real header, and the engine's reader
+/// reading it back: four layers from source layers 0, 1, 6 and 12, kinds [GQA, KDA, KDA, GQA] with
+/// 8 key heads on the GQA layers, every tensor its source's in the source's type and dims (no expert
+/// dropped, no ff override), every (stem, type) pair of the source's layers kept, the bytes the
+/// four layers and the globals hold, and four shards with a layer across a boundary. The engine
+/// plans the fixture as it plans the source: the same features unimplemented.
+#[test]
+#[ignore = "needs the box and the Solar-Open2 Q4_K_M file (just gate-fixture)"]
+fn hw_fixture_solar_plan() {
+    let src = solar_real();
+    let spec = solar::spec();
+    let p = fixture::plan(&spec, &src, None, &spec.options()).expect("the plan of the real file");
+    let t = &p.target;
+    let get = |k: &str| header_value(t, k);
+    assert_eq!(unsigned_items(&get(KEY_SOURCE_LAYERS)), [0, 1, 6, 12]);
+    assert_eq!(get("solar-open2.block_count").as_unsigned(), Some(4));
+    assert_eq!(
+        unsigned_items(&get("solar-open2.attention.head_count_kv")),
+        [8, 0, 0, 8]
+    );
+    for key in [
+        "expert_count",
+        "expert_used_count",
+        "expert_feed_forward_length",
+    ] {
+        assert_eq!(
+            get(&format!("solar-open2.{key}")).as_unsigned(),
+            src.arch_get_u64(key),
+            "{key} is the source's"
+        );
+    }
+
+    // Each tensor is its source's, renamed through the map.
+    let mut want_bytes = 0u64;
+    for pt in &t.tensors {
+        let (_, info) = src
+            .find(&pt.source)
+            .unwrap_or_else(|| panic!("no source tensor {}", pt.source));
+        assert_eq!((pt.ty, &pt.dims), (info.ty, &info.dims), "{}", pt.name);
+        want_bytes += info.nbytes;
+        if let Some(f) = pt.layer {
+            assert!(pt.name.starts_with(&format!("blk.{f}.")), "{}", pt.name);
+            let l = solar::LAYER_MAP[f];
+            assert!(pt.source.starts_with(&format!("blk.{l}.")), "{}", pt.source);
+        }
+    }
+    let kept: u64 = src
+        .iter_tensors()
+        .filter(|(_, t)| keeps(&solar::LAYER_MAP, &t.name))
+        .map(|(_, t)| t.nbytes)
+        .sum();
+    assert_eq!(
+        want_bytes, kept,
+        "the plan holds the map's layers and the globals"
+    );
+    let pair = |name: &str, ty: GgmlType| (leaf_of(name).to_string(), ty.to_string());
+    let held: std::collections::BTreeSet<_> = t
+        .tensors
+        .iter()
+        .filter(|pt| pt.layer.is_some())
+        .map(|pt| pair(&pt.name, pt.ty))
+        .collect();
+    let all: std::collections::BTreeSet<_> = src
+        .iter_tensors()
+        .filter(|(_, t)| t.name.starts_with("blk."))
+        .map(|(_, t)| pair(&t.name, t.ty))
+        .collect();
+    assert_eq!(held, all, "every (stem, type) pair of the source's layers");
+
+    let guard = dir("solarplan");
+    let first = header_only(t, &guard.0);
+    let fx = Split::open(&first).unwrap();
+    let hp = solar::check_kinds(&spec, &fx, &src).unwrap();
+    assert_eq!(hp.n_layer, 4);
+    let kinds: Vec<SolarKind> = (0..hp.n_layer).map(|l| hp.kind(l)).collect();
+    assert_eq!(
+        kinds,
+        [
+            SolarKind::Gqa,
+            SolarKind::Kda,
+            SolarKind::Kda,
+            SolarKind::Gqa
+        ]
+    );
+    assert_eq!(
+        (hp.experts.n_expert, hp.experts.n_used, hp.experts.ff),
+        (320, 8, 1280)
+    );
+    let features = |split: &Split| {
+        format!(
+            "{:?}",
+            SolarInputs::describe(split).unwrap().unimplemented()
+        )
+    };
+    assert_eq!(
+        features(&fx),
+        features(&src),
+        "the engine's coverage list of the fixture is the source's"
+    );
+
+    let layouts = t.layouts().unwrap();
+    let total: u64 = layouts.iter().map(|(_, l)| l.file_len()).sum();
+    let spans = t.spanning_layers();
+    assert!(
+        layouts.len() >= 2 && !spans.is_empty(),
+        "a layer spans a shard boundary"
+    );
+    println!(
+        "solar plan: {} layers kinds {kinds:?}; tensors {want_bytes} B, total {total} B ({:.2} GB), {} shards, layers {spans:?} span",
+        hp.n_layer,
+        total as f64 / 1e9,
+        layouts.len()
+    );
+}
+
+/// Contract 35: the recorded card budget makes the plan of the written file, at the end-to-end
+/// gate's context, hold half of the experts (160 of 320) on every card-eligible layer (f2 and f3,
+/// the Q4_K set) and none on the Q6_K-down layers (f0 and f1: no card kernel runs that stack), as
+/// `verify` re-plans it; the budgetless plan holds all of them on the eligible layers. A budget
+/// 64 MiB below and 1 GiB above and an edited record are refused by name ([`budget_round_trip`]).
+#[test]
+#[ignore = "needs the box and the Solar-Open2 Q4_K_M file (just gate-fixture)"]
+fn hw_fixture_solar_budget() {
+    let src = solar_real();
+    let spec = solar::spec();
+    let p = fixture::plan(&spec, &src, None, &spec.options()).unwrap();
+    let recorded = p.card_budget;
+    let guard = dir("solarbudget");
+    let fx = Split::open(header_only(&p.target, &guard.0)).unwrap();
+    let mut inputs = SolarInputs::describe(&fx).unwrap();
+    inputs.room = (workstation::PLAN_ROOM, HostRead::Given);
+    let (layers, experts) = (inputs.model.layers, inputs.model.experts);
+    assert_eq!((layers, experts), (4, 320));
+    let machine = workstation::plan_gate(layers);
+    let ctx = solar::BUDGET_CTX;
+    let counts = |budget: Option<u64>| -> Vec<u64> {
+        let levers = PlanLevers {
+            card_budget_bytes: budget,
+        };
+        inputs
+            .plan(&machine, ctx, &levers)
+            .unwrap_or_else(|e| panic!("the plan under {budget:?}: {e}"))
+            .n_l
+            .clone()
+    };
+    // The Q6_K-down layers (f0, f1) keep every expert on the host: no card kernel runs that stack.
+    let want = |n: u64| vec![0, 0, n, n];
+    assert_eq!(
+        counts(None),
+        want(experts),
+        "the budgetless plan holds every expert it can"
+    );
+    assert_eq!(
+        counts(Some(recorded)),
+        want(experts / 2),
+        "the plan under {recorded}"
+    );
+    let bad = budget_round_trip("solar", &spec, &src, &p, &fx);
+    println!(
+        "solar budget: recorded {recorded} B ({} MiB) at ctx {ctx}, plan_gate({layers}); budgetless {:?}; recorded {:?}",
+        recorded / (1 << 20),
+        counts(None),
+        counts(Some(recorded)),
+    );
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }
