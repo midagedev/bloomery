@@ -33,6 +33,8 @@ mod program;
 mod schema;
 mod vocab;
 
+#[cfg(test)]
+pub(crate) use program::Kid;
 pub(crate) use program::{Constraint, Decision, Part, StepError, Style, Walk, Watch};
 pub(crate) use schema::{Ask, Fun, call, is_text, request, value};
 pub(crate) use vocab::Vocab;
