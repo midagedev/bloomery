@@ -3,7 +3,7 @@
 # stays here is text that must spell `timeout`, never a child a runner supervises itself. Each line: a file, the exact
 # count of such lines in it, and why they may stay. A file with more fails, and so does an entry above its file's count.
 tools/gpu-gate.sh 1 the self-test's fixture: a gate command under a timeout of its own, the case of a gate that outlives the runner's stop
-tools/ref/lease.sh 2 the witness's nvidia-smi query, a substitution beside its `command -v timeout` branch (a Mac has none), cut at 30 s, the runner's signal waits for it; the self-test's restore-pid stub
+tools/ref/lease.sh 3 the witness's nvidia-smi query, a substitution beside its `command -v timeout` branch (a Mac has none), cut at 30 s, the runner's signal waits for it; the self-test's restore-pid stub; the perf-own-timeout case's real `timeout`, the parent whose identity the case checks
 tools/ref/ncu-gpu.sh 3 CMD, the printed command line of an arm: its first words are a display prefix that `${CMD[@]:3}` drops before lease_bounded runs the rest
 tools/ref/nsys-gpu.sh 3 the same display prefix, dropped by the slice before lease_bounded
 tools/ref/nsys-ds41.sh 1 the same display prefix, dropped by the slice before lease_bounded
