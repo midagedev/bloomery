@@ -4,6 +4,9 @@
 //! is pure and cannot link the card code: an entry is a variant whose doc
 //! names the launcher and its file.
 //!
+//! The card bytes of an activation form are here too ([`q8_act_bytes`]): the
+//! q8_1 form every card leg, plan and family sizes, in one place.
+//!
 //! A type has a row for an operation only if a `pub` launcher of `crates/gpu`
 //! that any family can call runs it, in the operation's shape:
 //! - [`gate_up`]: one launch for every slot, the activation rule (`Act`) a
@@ -597,6 +600,23 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
         | GgmlType::MXFP8
         | GgmlType::Unknown(_) => None,
     }
+}
+
+/// The card bytes of the q8_1 activation of `cols` columns of `k` values
+/// ([`DownAct::Q8Act`], [`SiteAct::Q8x128`]): the five planes at `n_sb = k / 256`
+/// super-blocks a column — the codes at the q3 (`8 · 64 · ceil(n_sb / 2)`
+/// bytes), q4 (`4 · 256 · ceil(n_sb / 4)`) and q6 (`4 · 128 · ceil(n_sb / 2)`)
+/// permutations, the sums (`4 · 8 · n_sb`) and the scales (`4 · 2 · n_sb`).
+/// A width that is not a whole number of super-blocks counts the super-blocks
+/// it holds; a form whose last super-block is padded passes the padded width.
+#[must_use]
+pub const fn q8_act_bytes(cols: u64, k: u64) -> u64 {
+    let n_sb = k / 256;
+    8 * cols * 64 * n_sb.div_ceil(2)
+        + 4 * cols * 256 * n_sb.div_ceil(4)
+        + 4 * cols * 128 * n_sb.div_ceil(2)
+        + 4 * cols * 8 * n_sb
+        + 4 * cols * 2 * n_sb
 }
 
 /// Whether the common card leg (`crates/gpu/src/card_leg.rs`) launches the

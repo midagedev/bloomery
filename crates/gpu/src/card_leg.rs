@@ -69,7 +69,7 @@ use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
-use model::placement::kernels::{self, DownAct, DownEntry, GateUpEntry};
+use model::placement::kernels::{self, DownAct, DownEntry, GateUpEntry, q8_act_bytes};
 
 /// What the leg's errors name.
 const WHAT: &str = "CardLeg";
@@ -194,10 +194,15 @@ pub fn leg_bytes_for(shape: LegShape, act: DownAct) -> usize {
     let slots = shape.slots();
     let f = size_of::<f32>();
     let act_h = match act {
-        DownAct::Q8Act => q8_act_bytes(slots, shape.ff),
+        DownAct::Q8Act => usize::try_from(q8_act_bytes(slots as u64, shape.ff as u64))
+            .expect("the q8_1 activation's bytes fit a usize"),
         DownAct::Q8Blocks32 => q8_blocks32_bytes(slots, shape.ff),
     };
-    q8_act_bytes(shape.cap, shape.n) + f * slots * shape.ff + act_h + f * slots * shape.n
+    usize::try_from(q8_act_bytes(shape.cap as u64, shape.n as u64))
+        .expect("the q8_1 activation's bytes fit a usize")
+        + f * slots * shape.ff
+        + act_h
+        + f * slots * shape.n
 }
 
 /// Device bytes of a [`Q8Blocks32`] of `cols` columns of `k` values (a multiple
@@ -206,19 +211,6 @@ pub fn leg_bytes_for(shape: LegShape, act: DownAct) -> usize {
 const fn q8_blocks32_bytes(cols: usize, k: usize) -> usize {
     let k_blocks = k / 32;
     cols * 4 * (256 * k_blocks.div_ceil(32) + 2 * k_blocks)
-}
-
-/// Device bytes of a [`Q8Act`] of `cols` columns of `k` values (a multiple of
-/// 256): the five planes at `n_sb = k / 256` super-blocks a column: q3 `64 ·
-/// ceil(n_sb / 2)` words of 8 bytes, q4 `256 · ceil(n_sb / 4)` and q6 `128 ·
-/// ceil(n_sb / 2)` words of 4, s8 `8 · n_sb` and d8 `2 · n_sb` values of 4.
-const fn q8_act_bytes(cols: usize, k: usize) -> usize {
-    let n_sb = k / 256;
-    cols * (8 * 64 * n_sb.div_ceil(2)
-        + 4 * 256 * n_sb.div_ceil(4)
-        + 4 * 128 * n_sb.div_ceil(2)
-        + 4 * 8 * n_sb
-        + 4 * 2 * n_sb)
 }
 
 /// A resident routed stack's device form: the file's blocks as words

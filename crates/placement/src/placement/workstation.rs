@@ -17,6 +17,7 @@ pub use super::devices::{
 #[cfg(test)]
 use super::nodes::{Fabric, Nodes};
 use super::{Card, Host, HostTotals, Machine, Node, PlacementError, Plan, UnifiedPool};
+use crate::kernels::q8_act_bytes;
 
 pub const MIB: u64 = 1 << 20;
 
@@ -373,17 +374,6 @@ impl TierBatchBytes {
 /// columns a tile holds: the tile path's shapes, which size its scratch.
 const TILE_BUCKET_EXPERTS: u64 = 1024;
 const TILE_COLS: u64 = 8;
-
-/// The q8_1 activation of `m` columns of `k` values as the card lays it out:
-/// its Q3_K, Q4_K and Q6_K codes, its sums and its scales.
-const fn q8_act_bytes(m: u64, k: u64) -> u64 {
-    let n_sb = k / 256;
-    8 * m * 64 * n_sb.div_ceil(2)
-        + 4 * m * 256 * n_sb.div_ceil(4)
-        + 4 * m * 128 * n_sb.div_ceil(2)
-        + 4 * m * 8 * n_sb
-        + 4 * m * 2 * n_sb
-}
 
 /// The tier card's staging of the tier's prompt-batch service for blocks of
 /// up to `cols` tokens of rows of `n_embd`, `n_used` slots a token: the

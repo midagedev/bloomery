@@ -13,6 +13,7 @@ use super::hparams::Hparams;
 use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::place_hybrid;
+use crate::placement::kernels::q8_act_bytes;
 use crate::placement::{PlacementError, workstation};
 
 pub use place_hybrid::{KvLayout, PlaceError, card_routed};
@@ -37,15 +38,6 @@ pub const GEMM_TILE_COLS: usize = 64;
 /// See [`GEMM_TILE_COLS`].
 pub const GEMM32_STEP: usize = 64;
 
-/// Card bytes of the q8_1 form of `cols` columns of `k` values, K-quant sites' input: five planes
-/// at `k / 256` super-blocks a column (the codes in the q3, q4 and q6 permutations, the 32-value
-/// sums, the 128-value scales). A `GemmAct` and a `Q8Act` lay out the same planes.
-const fn act128_bytes(cols: usize, k: usize) -> usize {
-    let sb = k / 256;
-    4 * cols
-        * (128 * sb.div_ceil(2) + 256 * sb.div_ceil(4) + 128 * sb.div_ceil(2) + 8 * sb + 2 * sb)
-}
-
 /// Card bytes of the q8 blocks of 32 of `cols` columns of `k` values (Q8_0 and Q5_0 sites' input,
 /// `GemmAct32`): per column `16 + 2 + 2` words a step of [`GEMM32_STEP`] values.
 const fn act32_bytes(cols: usize, k: usize) -> usize {
@@ -56,7 +48,7 @@ const fn act32_bytes(cols: usize, k: usize) -> usize {
 /// where the width allows them. The load makes the ones its sites' types read.
 const fn wide_bytes(cols: usize, k: usize) -> usize {
     let q128 = if k.is_multiple_of(256) {
-        act128_bytes(cols, k)
+        q8_act_bytes(cols as u64, k as u64) as usize
     } else {
         0
     };
@@ -78,7 +70,7 @@ const fn route_bytes(cols: usize) -> usize {
 /// form of the K-quants and the q8 blocks of 32 of the Q8_0 and Q5_0 sites.
 const fn acts_bytes(k: usize) -> usize {
     let blocks = k / 32;
-    act128_bytes(1, k) + 4 * (256 * blocks.div_ceil(32) + 2 * blocks)
+    q8_act_bytes(1, k as u64) as usize + 4 * (256 * blocks.div_ceil(32) + 2 * blocks)
 }
 
 /// The card bytes the body's prompt batch makes beside the plan's terms for a file described by `hp`
