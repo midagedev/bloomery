@@ -2518,6 +2518,27 @@ depth-serve *ARMS:
     @[ -n "${BLOOMERY_MODEL:-}" ] || { echo "depth-serve: BLOOMERY_MODEL is unset: name the model profile (tools/ref/models/<name>.sh), e.g. BLOOMERY_MODEL=mimo2 just depth-serve <tree>:<D>" >&2; exit 64; }
     ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { here=$(basename "$PWD"); ours=; for a in {{ARMS}}; do t=${a#env=*:}; [ "${t%%:*}" != "$here" ] || ours=1; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision,gemma-embedding2,hf --release --bin bloomery-serve; fi; } && bash tools/ref/depth-serve.sh {{ARMS}}'
 
+# The schemajump against Clef-Flash sitting: the Clef decide seat and a Qwen3.6 seat, both bloomery-serve, one lease on
+# the A6000, the arms alternating request by request (the design's §4; the cards are docs/cards/sj-*.card). Two windows
+# of one lease: window 1 is Clef + the Qwen3.6 jump arm, window 2 is Clef + the same binary with the jump
+# arm's lever off (the step arm; the runner names the lever), the Clef arm repeated in both as the anchor. The runner is
+# tools/ref/sj-vs-clef.sh (its header has the windows, the requests and the tables); the requests are the SystemOne
+# suites' converted to the Qwen seat's response_format, and the tables are the client wall (p50, p95 per suite and
+# per bucket) beside the server's own split, the agreement against the official BF16 rows and against the Clef arm
+# served, and the jump arm against the step arm. The knobs (the two model files, the ports, the rounds) ride
+# BLOOMERY_BOX_ENV as SJ_CLEF_MODEL, SJ_QWEN_MODEL, SJ_CLEF_PORT, SJ_QWEN_PORT, SJ_ROUNDS and SJ_ROUNDS_LONG (the bounds
+# of the servers and the request run, SJ_SERVER_BOUND and SJ_RUN_BOUND, are in the runner's header); the
+# card is BLOOMERY_LEASE_CARD (docs/cards/sj-vs-clef-a6000.card for the baseline sitting, sj-jump-vs-step-a6000.card
+# for the ab one) and the lease's card check reads the rounds from BLOOMERY_AB_ROUNDS. Under
+# BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built, no lease is taken: the plan, with the card pick. Both servers run
+# on the timing card (the A6000; BLOOMERY_TIMING_GPU names another, tools/ref/timing-card.sh): the runner pins it, waits out
+# a compute process on it before each window, and reads it and the servers' logs after. SJ_WINDOWS names other windows
+# (`ds41:on` and `ds41:off`: the V4.1-Flash server alone with the jump lever on or off, on the cards and placement
+# bloomery-serve-ds41 picks, with SJ_DS41_MODEL; this recipe builds that binary when the windows name it) and SJ_SUITES
+# other suite files (`tools/ref/clef/suite-hard.jsonl`, scored against its `.gold.jsonl`); the header of the runner has both.
+sj-vs-clef:
+    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then case " $(printf %s "${SJ_WINDOWS:-qwen:on qwen:off}" | tr , " ") " in *" qwen:"*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,vision,gemma-embedding2 --release --bin bloomery-serve;; esac && case " $(printf %s "${SJ_WINDOWS:-}" | tr , " ") " in *" ds41:"*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,vision,gemma-embedding2 --release --bin bloomery-serve-ds41;; esac; fi && bash tools/ref/sj-vs-clef.sh'
+
 # Qwen3-30B-A3B decode-step kernel timeline (nsys, A6000, under the lease, lead-only): generate_qwen3moe's seed form at each
 # depth (default 6 4096), one prefill pass + BLOOMERY_NSYS_N - 1 replays, the cache height depth-qwen3moe.sh uses. The
 # header of tools/ref/nsys-gpu.sh has the boundary and the windows. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.

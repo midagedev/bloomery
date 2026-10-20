@@ -377,6 +377,7 @@ blk_pytools() {
     "tools/ref/asm-census.py --self-test"
     "tools/ref/check-int-twins.py --self-test"
     "tools/ref/clef/e2e.py --self-test"
+    "tools/ref/clef/sjcmp.py --self-test"
     "tools/ref/clef_ref.py --self-test"
     "tools/ref/clefvis/check_hidden.py --self-test"
     "tools/ref/clefvis/check_preproc.py --self-test"

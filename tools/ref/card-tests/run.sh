@@ -51,6 +51,10 @@ cp "$ROOT/tools/ref/card.py" "$ROOT/tools/ref/tdist.py" "$tmp/nocard/tools/ref/"
 # lease_take, so gate-batch's walker refuses check-recipes for naming it; a *-tests directory is the harness the walker does not read.
 bash "$ROOT/tools/ref/depth-serve.sh" --self-test > "$tmp/depth-serve.out" 2>&1 &
 depth_pid=$!
+# The schemajump against Clef-Flash runner's stub tests (the refusals, the windows' servers and their lever, a server that does not
+# start or never listens, a TERM mid-window, the ruler's math) are the same kind of process: a stub server, no lease.
+bash "$ROOT/tools/ref/sj-vs-clef.sh" --self-test > "$tmp/sj-vs-clef.out" 2>&1 &
+sj_pid=$!
 
 pass() { n=$((n + 1)); echo "ok $1"; }
 fail() {
@@ -1676,6 +1680,17 @@ elif ! grep -Eq -- '^depth-serve\.sh self-test: [0-9]+ checks ok$' "$tmp/depth-s
   fail "the depth-serve runner's stub tests (depth-serve.sh --self-test)" 'no line matches /^depth-serve\.sh self-test: [0-9]+ checks ok$/' "$tmp/depth-serve.out"
 else
   pass "the depth-serve runner's stub tests (depth-serve.sh --self-test)"
+fi
+
+# The sj-vs-clef runner's stub tests, started with the depth-serve runner's.
+wait "$sj_pid"
+src=$?
+if [ "$src" != 0 ]; then
+  fail "the sj-vs-clef runner's stub tests (sj-vs-clef.sh --self-test)" "rc $src, want 0" "$tmp/sj-vs-clef.out"
+elif ! grep -Eq -- '^sj-vs-clef\.sh self-test: [0-9]+ checks ok$' "$tmp/sj-vs-clef.out"; then
+  fail "the sj-vs-clef runner's stub tests (sj-vs-clef.sh --self-test)" 'no line matches /^sj-vs-clef\.sh self-test: [0-9]+ checks ok$/' "$tmp/sj-vs-clef.out"
+else
+  pass "the sj-vs-clef runner's stub tests (sj-vs-clef.sh --self-test)"
 fi
 
 echo "card-tests: $n tests, $failed failed"
