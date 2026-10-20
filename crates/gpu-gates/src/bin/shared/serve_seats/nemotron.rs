@@ -406,7 +406,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 let (card, device, ctx) = (open.card.clone(), open.device, open.ctx);
                 Nemotron::open(
                     open,
-                    |file| NemotronHModel::open(Gpu::open_card(&card, device)?, file, ctx),
+                    |file| {
+                        NemotronHModel::open(Gpu::open_card_after_hook(&card, device)?, file, ctx)
+                    },
                     prefill_nano,
                 )
             },
@@ -440,7 +442,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 let (card, device, ctx) = (open.card.clone(), open.device, open.ctx);
                 Nemotron::open(
                     open,
-                    |file| NemotronHMoeModel::open(Gpu::open_card(&card, device)?, file, ctx),
+                    |file| {
+                        NemotronHMoeModel::open(
+                            Gpu::open_card_after_hook(&card, device)?,
+                            file,
+                            ctx,
+                        )
+                    },
                     prefill_bolt,
                 )
             },

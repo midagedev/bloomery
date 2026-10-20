@@ -1056,6 +1056,24 @@ pub enum Unplaced {
     Placed(Box<PlaceQ3>),
 }
 
+/// The card of a whole-card load with no plan, opened by [`Gpu::open_card`]:
+/// such a load prints no `need` record, so the need hook has nothing to be
+/// asked about and is not (a load that does print one opens through
+/// [`Gpu::open_card_after_hook`]). A hook that is set says so on stderr.
+#[allow(
+    dead_code,
+    reason = "generate_qwen3moe and the serve seat open their unset whole loads through it; the e2e gates include the planner without it"
+)]
+pub fn open_unplanned_card(card: CardSpec) -> Result<Gpu, GateError> {
+    if let Some(hook) = bloomery_levers::need_levers()?.hook {
+        eprintln!(
+            "need hook {} is not asked: a whole model on one card with no plan states no need",
+            hook.display()
+        );
+    }
+    Ok(Gpu::open_card(card.name, card.device)?)
+}
+
 /// What a run with `--place` unset loads: the whole model on `a`'s card —
 /// no plan, no record — while the whole-fit verdict takes it
 /// ([`unplaced_qwen3`]); else the placed plan on that card, its `plan`
@@ -1073,11 +1091,7 @@ pub fn open_unplaced_qwen3(
     emit: fn(Record),
 ) -> Result<Qwen3moeModel, GateError> {
     match unplaced_qwen3(&file, ctx, opts.kv)? {
-        Unplaced::Whole(card) => Ok(Qwen3moeModel::open(
-            Gpu::open_card(card.name, card.device)?,
-            file,
-            opts,
-        )?),
+        Unplaced::Whole(card) => Ok(Qwen3moeModel::open(open_unplanned_card(card)?, file, opts)?),
         Unplaced::Placed(q) => {
             let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
             for line in q.records(&plan, Some(WHY_NOT_WHOLE))? {
@@ -1101,11 +1115,7 @@ pub fn open_unplaced_qwen35(
     emit: fn(Record),
 ) -> Result<Qwen35moeModel, GateError> {
     match unplaced_qwen35(&file, &o)? {
-        Unplaced::Whole(card) => Ok(Qwen35moeModel::open(
-            Gpu::open_card(card.name, card.device)?,
-            file,
-            o,
-        )?),
+        Unplaced::Whole(card) => Ok(Qwen35moeModel::open(open_unplanned_card(card)?, file, o)?),
         Unplaced::Placed(q) => {
             let plan = q.plan(o.ctx, &PlanLevers::from_levers(levers)?)?;
             for line in q.records(&plan, Some(WHY_NOT_WHOLE))? {

@@ -1853,7 +1853,7 @@ where
 /// counted ([`HostResidency::at_load_with`]). The pieces, and the host set.
 /// Every placed load passes
 /// here, so the refusals before any upload are made once: the need hook's
-/// (`BLOOMERY_NEED_HOOK`, first, while the load holds no card), a plan's card
+/// (`BLOOMERY_NEED_HOOK`, first, before the load's own open of the card), a plan's card
 /// that is not one visible device ([`Gpu::open_card`]), and a
 /// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
 fn placed_pre(
@@ -1877,8 +1877,8 @@ fn placed_pre(
         .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
     let layers = spec.layers.clone();
     let (extra, extra_bytes) = extra;
-    // The hook answers before a card is opened or a byte read in: a broker
-    // that refuses the load holds nothing of the process's.
+    // The hook answers before the load opens its card or reads a byte in: a
+    // broker that refuses the load holds nothing of the load's.
     need_hook::consult().map_err(|e| GpuError::plan(what, e))?;
     let t = Instant::now();
     let gpu = Gpu::open_card(&spec.name, spec.device)?;

@@ -2637,6 +2637,22 @@ impl Gpu {
         Gpu::with_device(usize::try_from(ordinal).expect("a u32 ordinal fits usize"))
     }
 
+    /// [`Gpu::open_card`] for a load whose plan printed its `need` record:
+    /// the need hook (`BLOOMERY_NEED_HOOK`) answers first, so a load it
+    /// refuses opens no card of its own. A load that prints a `need` and opens its card
+    /// itself, a whole model on the one card of a placed plan, opens it here;
+    /// `GpuModel::load_placed` consults the same hook before its own open and
+    /// times that open apart from the hook's wait. A load with no plan states
+    /// no need and opens through [`Gpu::open_card`].
+    pub fn open_card_after_hook(
+        name: &str,
+        device: Option<::model::placement::workstation::DeviceId>,
+    ) -> Result<Gpu, GpuError> {
+        ::model::placement::need_hook::consult()
+            .map_err(|e| GpuError::plan("Gpu::open_card_after_hook", e))?;
+        Gpu::open_card(name, device)
+    }
+
     /// Open the visible device a plan's card is ([`Gpu::open_card`]) and
     /// drop the handle, before the host's room is read for the plan: what a
     /// device's first open takes of the host — its primary context, held as
@@ -3425,6 +3441,43 @@ mod context_tests {
             c.context().cu_ctx(),
             raw,
             "a Gpu after the first two dropped got another driver context"
+        );
+    }
+
+    /// A whole model opened on the one card of a placed plan asks the need
+    /// hook before it looks for its card: with the hook set and no plan
+    /// having staged a record, the error is the hook's although the card named
+    /// is not there. It runs in a process of its own, whose environment names
+    /// the hook.
+    #[test]
+    #[ignore = "needs a CUDA device in view; `just gate-gpu-lib` runs it on the box"]
+    fn hw_open_card_after_hook_asks_the_hook_before_it_looks_for_the_card() {
+        const NAME: &str =
+            "context_tests::hw_open_card_after_hook_asks_the_hook_before_it_looks_for_the_card";
+        // The fresh process's own argument: a filter no test's name is.
+        const FRESH: &str = "a-fresh-process-for-the-hook-order";
+        let exe = std::env::current_exe().expect("the test binary");
+        if !std::env::args().any(|a| a == FRESH) {
+            let out = std::process::Command::new(&exe)
+                .args(["--exact", NAME, FRESH, "--include-ignored", "--nocapture"])
+                .env("BLOOMERY_NEED_HOOK", &exe)
+                .output()
+                .expect("the fresh process");
+            assert!(
+                out.status.success(),
+                "the fresh process: {}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout)
+            );
+            return;
+        }
+        let Err(e) = Gpu::open_card_after_hook("no such card", None) else {
+            panic!("a card that is not there opened");
+        };
+        let said = e.to_string();
+        assert!(
+            said.contains("BLOOMERY_NEED_HOOK"),
+            "the open looked for the card before it asked the hook: {said}"
         );
     }
 

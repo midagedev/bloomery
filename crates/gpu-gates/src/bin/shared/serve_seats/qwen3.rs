@@ -505,7 +505,7 @@ impl Body3 for Body {
         let opts = Qwen3moeModel::lever_opts(ctx, kv)?;
         match load {
             Q3Load::Whole(card) => Ok(Qwen3moeModel::open(
-                Gpu::open_card(card.name, card.device)?,
+                q3place::open_unplanned_card(card)?,
                 file,
                 opts,
             )?),
@@ -521,7 +521,7 @@ impl Body3 for Body {
                 }
                 match whole {
                     Some(card) => Ok(Qwen3moeModel::open(
-                        Gpu::open_card(card.name, card.device)?,
+                        Gpu::open_card_after_hook(card.name, card.device)?,
                         file,
                         opts,
                     )?),
@@ -588,7 +588,7 @@ impl Body3 for Body35 {
         let mut m = match load {
             Q3Load::Whole(card) => {
                 print_seat(vision);
-                Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
+                Qwen35moeModel::open(q3place::open_unplanned_card(card)?, file, o)?
             }
             Q3Load::Placed {
                 q,
@@ -602,9 +602,11 @@ impl Body3 for Body35 {
                 }
                 print_seat(vision);
                 match whole {
-                    Some(card) => {
-                        Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
-                    }
+                    Some(card) => Qwen35moeModel::open(
+                        Gpu::open_card_after_hook(card.name, card.device)?,
+                        file,
+                        o,
+                    )?,
                     None => q3place::open_qwen35_slots(file, &plan, slots, o, levers.host())?,
                 }
             }

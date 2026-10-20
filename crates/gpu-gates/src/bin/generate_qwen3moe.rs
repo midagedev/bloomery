@@ -2469,9 +2469,11 @@ mod cli {
                     line.print();
                 }
                 match q.whole_card_qwen3(&file, &plan, (ctx, 1))? {
-                    Some(card) => {
-                        Qwen3moeModel::open(Gpu::open_card(card.name, card.device)?, file, opts)?
-                    }
+                    Some(card) => Qwen3moeModel::open(
+                        Gpu::open_card_after_hook(card.name, card.device)?,
+                        file,
+                        opts,
+                    )?,
                     None => q3place::open_qwen3(file, &plan, opts, levers.host())?,
                 }
             }
@@ -2607,7 +2609,11 @@ mod cli {
                         if dspark {
                             return Err(dspark_refusal(None));
                         }
-                        Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?
+                        Qwen35moeModel::open(
+                            Gpu::open_card_after_hook(card.name, card.device)?,
+                            file,
+                            o,
+                        )?
                     }
                     None => {
                         if dspark {
