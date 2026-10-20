@@ -7,6 +7,8 @@
 # lane (lint, then the scoped combos, serial — they share the tree's target directory, and two cargos
 # on one directory serialize on its lock anyway).
 #
+# On a Linux host, `--native` (below) runs these lanes directly there, which is the faster path when such a host is up.
+#
 # The cargo lane runs `lint`, not `check`: clippy is rustc plus lints, so every error `cargo check`
 # reports is a clippy error too (proved FAIL-first at birth: a type-error mutant is red under this
 # loop's lint step), and the two keep separate artifacts — a `check` pass after `lint` rebuilds the
@@ -23,6 +25,17 @@
 #   tools/mac-static.sh [BASE|--full]   one line a step (rc, wall, the step's own summary), exits
 #                                       non-zero naming every red step; BASE scopes the combos step
 #                                       (a rev, or A..B); --full or no argument runs it unscoped
+#   tools/mac-static.sh --native [--slice NAME.slice] [BASE|--full]
+#                                       the same two lanes run directly on a Linux host, where the recipes' own cargo lines are the
+#                                       cargo lane: fmt-check and clippy as the fmt-check and lint recipes spell them
+#                                       (tools/recipes.py box-command), and the combos step's shapes as `cargo check` with no
+#                                       --target. The lint is held to tools/lint-ratchet.txt as mac-check.sh holds it. The combos
+#                                       ledger is the host's own file (~/.cache/bloomery/native-static-ledger.tsv, keyed as the
+#                                       Mac's is). BLOOMERY_GIT_COMMIT is fixed for the cargo steps (as mac-check.sh fixes it), so a
+#                                       HEAD move rebuilds nothing. Linux only (64 elsewhere). The lanes run plain unless --slice
+#                                       is given: then the run goes in that systemd slice (systemd-run --scope) under a bound of
+#                                       NATIVE_BOUND seconds (killed with rc 124). A slice whose unit file the host has not installed
+#                                       is refused (69), since systemd-run would make one with no limits.
 #   tools/mac-static.sh --self-test     the lanes' orchestration, the rc/wall capture, the red-step
 #                                       naming, the check-script derivation, the parallel check runner and the
 #                                       argument plumbing, against /bin/true, /bin/false and sleep stubs and fixture
@@ -38,6 +51,9 @@
 #                                       check-model-tax on its tables alone, with no revision to hold them to (a checkout
 #                                       with no origin/main: tools/contrib-check.sh); --list prints each name it would
 #                                       run with its arguments, one a line, and runs none
+#
+# `tools/mac-check.sh` stays the Mac's: the cross check, the Mac's toolchain and its disk floor. The native lane has none of them and
+# repeats only mac-check.sh's lint ratchet and ledger line, each in a few lines, because that script cannot run on Linux.
 #
 # The check scripts are every tools/check-*.sh, in byte order of the name, but those SKIP names: a new script joins the
 # loop, `just gate` and tools/contrib-check.sh by existing, with no list to add its name to. A skip that names no script is
@@ -60,6 +76,10 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 LEDGER=$HOME/.cache/bloomery/mac-static-ledger.tsv
 # The check scripts the round loop leaves out, by name (tools/check-NAME.sh), the reason on the line above each. None today.
 SKIP=()
+# The native lane (the header's --native): its combos ledger and the bound in seconds of a run in a slice.
+NATIVE_LEDGER=$HOME/.cache/bloomery/native-static-ledger.tsv
+NATIVE_BOUND=1500
+NATIVE=
 
 say() { printf '%s\n' "$*" >&2; }
 
@@ -149,6 +169,154 @@ remove_run_dir() {
   rm -rf "$1" || { say "mac-static.sh: cannot remove the results in $1"; [ "$2" != 0 ] || exit 69; }
 }
 
+# native_words RECIPE VERB: the recipe's box command (tools/recipes.py box-command) as one word a line. It must be one plain
+# `cargo VERB …` with no shell syntax (the character set mac-check.sh's derive holds a command to), since it runs as words, never
+# through a shell. Anything else is refused (64) naming why.
+native_words() {
+  local cmd
+  local -a w
+  cmd=$(python3 "$HERE/tools/recipes.py" box-command "$1") || return $?
+  if [[ ! $cmd =~ ^[A-Za-z0-9_,./=:+\ -]+$ ]]; then
+    say "mac-static.sh: the $1 box command has shell syntax (a character outside [A-Za-z0-9_,./=:+ -]), which --native does not run: $cmd"
+    return 64
+  fi
+  read -ra w <<< "$cmd"
+  if [ "${w[0]}" != cargo ] || [ "${w[1]:-}" != "$2" ]; then
+    say "mac-static.sh: the $1 box command is not \`cargo $2 …\`: $cmd"
+    return 64
+  fi
+  printf '%s\n' "${w[@]}"
+}
+
+# native_cargo WORD…: cargo in this tree with the version commit fixed (a serve build script reads it: a HEAD move would rebuild its
+# dependents), no stdin.
+native_cargo() {
+  (cd "$HERE" && BLOOMERY_GIT_COMMIT=static-check "$@") < /dev/null
+}
+
+# native_fmt: the fmt-check recipe's cargo line.
+native_fmt() {
+  local line
+  local -a w=()
+  while IFS= read -r line; do w+=("$line"); done <<< "$(native_words fmt-check fmt)"
+  native_cargo "${w[@]}"
+}
+
+# native_ratchet FILE: the one number line of FILE (tools/lint-ratchet.txt; `#` lines are its rule), or 70.
+native_ratchet() {
+  local lines
+  if [ ! -f "$1" ]; then
+    say "mac-static.sh: no ratchet file $1 to hold the lint to"
+    return 70
+  fi
+  lines=$(grep -vE '^[[:space:]]*(#|$)' "$1" || true)
+  if ! [[ $lines =~ ^[0-9]+$ ]]; then
+    say "mac-static.sh: $1 must hold exactly one line with the warning count, a bare number; it holds: ${lines:-nothing}"
+    return 70
+  fi
+  echo "$lines"
+}
+
+# native_lint: the lint recipe's cargo line, its `^warning:` count held to the ratchet; the last line says which way it stands.
+native_lint() {
+  local line out count ratchet rc=0 vrc=0
+  local -a w=()
+  while IFS= read -r line; do w+=("$line"); done <<< "$(native_words lint clippy)"
+  ratchet=$(native_ratchet "$HERE/tools/lint-ratchet.txt") || return $?
+  out=$(mktemp)
+  native_cargo "${w[@]}" > "$out" 2>&1 || rc=$?
+  cat "$out"
+  count=$(grep -c '^warning:' "$out" || true)
+  rm -f "$out"
+  if [ "$rc" != 0 ]; then
+    echo "native: lint rc $rc (^warning: $count, the ratchet $ratchet in tools/lint-ratchet.txt)"
+    return "$rc"
+  fi
+  if [ "$count" -gt "$ratchet" ]; then
+    echo "native: lint ^warning: $count, above the ratchet $ratchet in tools/lint-ratchet.txt — red"
+    vrc=1
+  elif [ "$count" -lt "$ratchet" ]; then
+    echo "native: lint ^warning: $count, below the ratchet $ratchet in tools/lint-ratchet.txt — the recorded value can come down"
+  else
+    echo "native: lint ^warning: $count = the ratchet $ratchet in tools/lint-ratchet.txt"
+  fi
+  return "$vrc"
+}
+
+# native_combos BASE LEDGER: `cargo check` for each shape tools/recipes.py combos lists (scoped to BASE and held to LEDGER when BASE is
+# given: a green shape is appended to LEDGER as `<key>\tgreen\t<date>\t<tree>`). Every shape runs, a red one too; the last line counts
+# them. The first red shape's rc is the result.
+native_combos() {
+  local base=$1 ledger=$2 list kind label cmd key n=0 rc=0 crc t0=$SECONDS t1 skips=0 total= r
+  local -a ra=(combos) w reds=()
+  [ -z "$base" ] || ra+=(--base "$base")
+  [ -z "$ledger" ] || [ -z "$base" ] || ra+=(--ledger "$ledger")
+  list=$(python3 "$HERE/tools/recipes.py" "${ra[@]}") || return $?
+  while IFS=$'\t' read -r kind label cmd key; do
+    case $kind in
+      skip) skips=$((skips + 1)) ;;
+      total) total=$label ;;
+      combo)
+        if [[ ! $cmd =~ ^[A-Za-z0-9_,./=:+\ -]+$ ]]; then
+          say "mac-static.sh: the shape '$label' has shell syntax in its command, which --native does not run: $cmd"
+          return 64
+        fi
+        read -ra w <<< "$cmd"
+        if [ "${w[0]}" != cargo ] || [ "${w[1]:-}" != check ]; then
+          say "mac-static.sh: the shape '$label' is not \`cargo check …\`: $cmd"
+          return 64
+        fi
+        echo "native: shape $label: $cmd"
+        t1=$SECONDS
+        crc=0
+        native_cargo "${w[@]}" || crc=$?
+        echo "native: shape rc $crc in $((SECONDS - t1)) s: $label"
+        n=$((n + 1))
+        if [ "$crc" != 0 ]; then
+          reds+=("$label: $cmd")
+          [ "$rc" != 0 ] || rc=$crc
+        elif [ -n "$ledger" ] && [ -n "$base" ]; then
+          mkdir -p "$(dirname "$ledger")"
+          printf '%s\tgreen\t%s\t%s\n' "$key" "$(date '+%Y-%m-%d %H:%M')" "${HERE##*/}" >> "$ledger"
+        fi
+        ;;
+      *)
+        say "mac-static.sh: recipes.py combos printed a line that is no combo, skip or total: $kind"
+        return 64
+        ;;
+    esac
+  done <<< "$list"
+  if [ "$n" = 0 ] && [ -z "$base" ]; then
+    say "mac-static.sh: recipes.py combos lists no build shape"
+    return 70
+  fi
+  for r in "${!reds[@]}"; do echo "native: red shape ${reds[$r]}"; done
+  echo "native: combos rc $rc; $n shapes run, ${#reds[@]} red${base:+, $skips skipped (scoped)}, in $((SECONDS - t0)) s (recipes.py combos: $total)"
+  return "$rc"
+}
+
+# native_host UNAME: 0 on Linux, else 64 naming where the Mac's tier is.
+native_host() {
+  [ "$1" = Linux ] || { say "mac-static.sh: --native runs on a Linux host; this is $1: a Mac runs just mac-static"; return 64; }
+}
+
+# enter_slice SLICE ARGS…: this script again as --native, inside the slice and under the bound; its rc is the result. A slice whose
+# unit file the host has not installed is 69 (systemd-run would make one with no limits).
+enter_slice() {
+  local slice=$1 lm fp rc=0
+  shift
+  command -v systemd-run > /dev/null || { say "mac-static.sh: --slice needs systemd-run"; exit 69; }
+  lm=$(systemctl show -p LoadState --value "$slice" 2> /dev/null) || lm=
+  fp=$(systemctl show -p FragmentPath --value "$slice" 2> /dev/null) || fp=
+  if [ "$lm" != loaded ] || [ -z "$fp" ]; then
+    say "mac-static.sh: $slice is not installed on this host (LoadState '${lm:-unknown}', FragmentPath '${fp:-none}'): systemd-run would make a slice with no limits; install its unit file first"
+    exit 69
+  fi
+  systemd-run --scope --quiet --slice="$slice" -- env STATIC_IN_SLICE=1 timeout --kill-after=10 "$NATIVE_BOUND" bash "$0" --native --slice "$slice" "$@" || rc=$?
+  [ "$rc" != 124 ] || say "mac-static.sh: --native ran past its bound of $NATIVE_BOUND s in $slice and was killed (rc 124)"
+  exit "$rc"
+}
+
 # run_steps D CARGO_CMDV…: both lanes. The scripts lane: one background job a script (fmt-check and
 # every tools/check-*.sh). The cargo lane: one background job running lint then the combos step
 # serially (one target directory, one lock). Every job's pid is captured at start, written to
@@ -158,7 +326,11 @@ run_steps() {
   shift 2
   local -a cargo=("$@") pids=() names=()
   : > "$d/pids"
-  ( step_inner fmt-check "$d" "$HERE/tools/mac-check.sh" fmt-check ) & pids+=($!) && names+=(fmt-check)
+  if [ -n "$NATIVE" ]; then
+    ( step_inner fmt-check "$d" native_fmt ) & pids+=($!) && names+=(fmt-check)
+  else
+    ( step_inner fmt-check "$d" "$HERE/tools/mac-check.sh" fmt-check ) & pids+=($!) && names+=(fmt-check)
+  fi
   local s
   local -a args
   local w
@@ -167,8 +339,13 @@ run_steps() {
     while IFS= read -r w; do args+=("$w"); done < <(check_argv "$s" "$base")
     ( step_inner "check-$s" "$d" bash "$HERE/tools/check-$s.sh" ${args[@]+"${args[@]}"} ) & pids+=($!) && names+=(check-$s)
   done
-  ( step_inner lint "$d" "$HERE/tools/mac-check.sh" lint
-    step_inner combos "$d" "$HERE/tools/mac-check.sh" "${cargo[@]}" ) & pids+=($!) && names+=(cargo-lane)
+  if [ -n "$NATIVE" ]; then
+    ( step_inner lint "$d" native_lint
+      step_inner combos "$d" native_combos "$base" "${base:+$LEDGER}" ) & pids+=($!) && names+=(cargo-lane)
+  else
+    ( step_inner lint "$d" "$HERE/tools/mac-check.sh" lint
+      step_inner combos "$d" "$HERE/tools/mac-check.sh" "${cargo[@]}" ) & pids+=($!) && names+=(cargo-lane)
+  fi
   local i
   for i in "${!pids[@]}"; do echo "${names[$i]} ${pids[$i]}" >> "$d/pids"; done
   wait "${pids[@]}" || true # a killed wrapper is the summary's `no rc` case, not this script's end
@@ -236,8 +413,8 @@ step_line() {
   esac
   wall=$(cat "$d/$name.wall")
   case $name in
-    lint) extra=$(grep -E '^mac-check: (lint \^warning|lint rc)' "$d/$name.log" | tail -1 || true) ;;
-    combos) extra=$(grep -E '^mac-check: combos rc' "$d/$name.log" | tail -1 || true) ;;
+    lint) extra=$(grep -E '^(mac-check|native): (lint \^warning|lint rc)' "$d/$name.log" | tail -1 || true) ;;
+    combos) extra=$(grep -E '^(mac-check|native): combos rc' "$d/$name.log" | tail -1 || true) ;;
     fmt-check) extra="rustfmt diff blocks: $(grep -cE '^diff' "$d/$name.log" || true)" ;;
     check-*) extra=$(grep -v '^[[:space:]]*$' "$d/$name.log" | tail -1 | cut -c1-160 || true) ;;
   esac
@@ -558,6 +735,148 @@ self_test() {
   case $out in *"mac-static: ok"*) ;; *) fail "a green loop does not end ok: $out" ;; esac
   rm -rf "$d"
 
+  # --native (the header): the host refusal, the recipes' command shapes, the lint ratchet, the combos run and its ledger, and the
+  # whole run in a fixture tree with a fake cargo and recipes.py. No cargo runs.
+  fx=$(mktemp -d)
+  mkdir "$fx/tools" "$fx/bin" "$fx/home"
+  rc=0; native_host Darwin 2> /dev/null || rc=$?
+  [ "$rc" = 64 ] || fail "--native on Darwin ends rc $rc, not 64"
+  native_host Linux || fail "--native on Linux is refused"
+  # the recipes' commands as words: one plain cargo line of the right verb, nothing else
+  cat > "$fx/tools/recipes.py" << 'PY'
+import os, sys
+here = os.path.dirname(os.path.abspath(__file__))
+open(os.path.join(here, "recipes.log"), "a").write(" ".join(sys.argv[1:]) + "\n")
+if sys.argv[1] == "box-command":
+    print(open(os.path.join(here, "cmd." + sys.argv[2])).read().strip())
+elif sys.argv[1] == "combos":
+    sys.stdout.write(open(os.path.join(here, "combos.out")).read())
+PY
+  printf '%s\n' 'cargo clippy --workspace --all-targets --features gpu,x/y' > "$fx/tools/cmd.lint"
+  printf '%s\n' 'cargo fmt --all -- --check' > "$fx/tools/cmd.fmt-check"
+  out=$(HERE=$fx native_words lint clippy | tr '\n' ' ')
+  [ "$out" = "cargo clippy --workspace --all-targets --features gpu,x/y " ] || fail "native_words derives '$out'"
+  printf '%s\n' 'cargo clippy --workspace | tee /tmp/x' > "$fx/tools/cmd.lint"
+  rc=0; out=$(HERE=$fx native_words lint clippy 2>&1) || rc=$?
+  [ "$rc" = 64 ] && case $out in *"has shell syntax"*) true ;; *) false ;; esac || fail "a piped box command ends rc $rc: $out"
+  printf '%s\n' 'cargo check --workspace' > "$fx/tools/cmd.lint"
+  rc=0; out=$(HERE=$fx native_words lint clippy 2>&1) || rc=$?
+  [ "$rc" = 64 ] && case $out in *"is not \`cargo clippy"*) true ;; *) false ;; esac || fail "a box command of another verb ends rc $rc: $out"
+  # the ratchet
+  printf '# rule\n\n7\n' > "$fx/tools/lint-ratchet.txt"
+  [ "$(native_ratchet "$fx/tools/lint-ratchet.txt")" = 7 ] || fail "native_ratchet does not read 7 past comments and blanks"
+  printf '1\n2\n' > "$fx/tools/two-numbers.txt"
+  rc=0; native_ratchet "$fx/tools/two-numbers.txt" > /dev/null 2>&1 || rc=$?
+  [ "$rc" = 70 ] || fail "a ratchet file with two numbers ends rc $rc, not 70"
+  rc=0; native_ratchet "$fx/tools/none.txt" > /dev/null 2>&1 || rc=$?
+  [ "$rc" = 70 ] || fail "a missing ratchet file ends rc $rc, not 70"
+  # a cargo that prints $WARN warnings and ends $CARGO_RC (or 101 for a package named redpkg), and logs its argument words and the commit word
+  cat > "$fx/bin/cargo" << 'SH'
+#!/bin/sh
+echo "$BLOOMERY_GIT_COMMIT $*" >> "$FX/cargo.log"
+case "$*" in *redpkg*) echo "error: red" >&2; exit 101 ;; esac
+n=0
+while [ "$n" -lt "${WARN:-0}" ]; do echo "warning: w$n"; n=$((n + 1)); done
+exit "${CARGO_RC:-0}"
+SH
+  chmod +x "$fx/bin/cargo"
+  export FX=$fx
+  printf '%s\n' 'cargo clippy --workspace --all-targets' > "$fx/tools/cmd.lint"
+  out=$(PATH="$fx/bin:$PATH" WARN=7 HERE=$fx native_lint 2>&1) && rc=0 || rc=$?
+  [ "$rc" = 0 ] && case $out in *"native: lint ^warning: 7 = the ratchet 7 in tools/lint-ratchet.txt"*) true ;; *) false ;; esac || fail "lint at the ratchet: rc $rc: $out"
+  out=$(PATH="$fx/bin:$PATH" WARN=8 HERE=$fx native_lint 2>&1) && rc=0 || rc=$?
+  [ "$rc" = 1 ] && case $out in *"native: lint ^warning: 8, above the ratchet 7"*"— red") true ;; *) false ;; esac || fail "lint above the ratchet: rc $rc: $out"
+  out=$(PATH="$fx/bin:$PATH" WARN=5 HERE=$fx native_lint 2>&1) && rc=0 || rc=$?
+  [ "$rc" = 0 ] && case $out in *"native: lint ^warning: 5, below the ratchet 7"*) true ;; *) false ;; esac || fail "lint below the ratchet: rc $rc: $out"
+  out=$(PATH="$fx/bin:$PATH" WARN=2 CARGO_RC=101 HERE=$fx native_lint 2>&1) && rc=0 || rc=$?
+  [ "$rc" = 101 ] && case $out in *"native: lint rc 101 (^warning: 2, the ratchet 7"*) true ;; *) false ;; esac || fail "a red clippy: rc $rc: $out"
+  grep -q '^static-check clippy --workspace --all-targets$' "$fx/cargo.log" || fail "the lint did not run the recipe's words under the fixed commit word: $(cat "$fx/cargo.log")"
+  # the combos: every shape runs, a red one too; a green one joins the ledger only in the scoped form; the counts close the step
+  printf 'combo\tapp test\tcargo check -p okpkg\tkeyone\ncombo\tbad\tcargo check -p redpkg\tkeytwo\ncombo\tlast\tcargo check -p lastpkg --features a,b\tkeythree\nskip\tx\twhy\ntotal\t3 commands\n' > "$fx/tools/combos.out"
+  : > "$fx/cargo.log"; : > "$fx/tools/recipes.log"; rm -f "$fx/ledger.tsv"
+  out=$(PATH="$fx/bin:$PATH" HERE=$fx native_combos main "$fx/ledger.tsv" 2>&1) && rc=0 || rc=$?
+  [ "$rc" = 101 ] || fail "a red shape ends combos rc $rc, not its 101"
+  case $out in *"native: red shape bad: cargo check -p redpkg"*"native: combos rc 101; 3 shapes run, 1 red, 1 skipped (scoped), in "*" s (recipes.py combos: 3 commands)"*) ;; *) fail "the combos closing lines are wrong: $out" ;; esac
+  [ "$(grep -c '' "$fx/cargo.log")" = 3 ] || fail "combos ran $(grep -c '' "$fx/cargo.log") shapes, not all three after a red one"
+  [ "$(cut -f1,2 "$fx/ledger.tsv" | tr '\t\n' ' _')" = "keyone green_keythree green_" ] || fail "the ledger holds '$(cut -f1,2 "$fx/ledger.tsv" 2> /dev/null | tr '\t\n' ' _')', not the two green shapes"
+  [ "$(cat "$fx/tools/recipes.log")" = "combos --base main --ledger $fx/ledger.tsv" ] || fail "recipes.py got '$(cat "$fx/tools/recipes.log")'"
+  rm -f "$fx/ledger.tsv"; : > "$fx/tools/recipes.log"
+  out=$(PATH="$fx/bin:$PATH" HERE=$fx native_combos '' '' 2>&1) && rc=0 || rc=$?
+  [ ! -e "$fx/ledger.tsv" ] && [ "$(cat "$fx/tools/recipes.log")" = combos ] || fail "the full form wrote a ledger or passed flags: $(cat "$fx/tools/recipes.log")"
+  printf 'combo\tp\tcargo check -p a && rm -rf x\tk\ntotal\t1\n' > "$fx/tools/combos.out"
+  rc=0; out=$(PATH="$fx/bin:$PATH" HERE=$fx native_combos '' '' 2>&1) || rc=$?
+  [ "$rc" = 64 ] || fail "a shape with shell syntax ends rc $rc, not 64: $out"
+  printf 'total\t0\n' > "$fx/tools/combos.out"
+  rc=0; out=$(PATH="$fx/bin:$PATH" HERE=$fx native_combos '' '' 2>&1) || rc=$?
+  [ "$rc" = 70 ] || fail "a full run with no shape ends rc $rc, not 70: $out"
+  rc=0; out=$(PATH="$fx/bin:$PATH" HERE=$fx native_combos main "$fx/ledger.tsv" 2>&1) || rc=$?
+  [ "$rc" = 0 ] || fail "a scoped run with every shape skipped ends rc $rc, not 0: $out"
+  # enter_slice: a slice with no unit file is refused, an installed one runs this script again inside it, under the bound
+  cat > "$fx/bin/systemctl" << 'SH'
+#!/bin/sh
+case "$*" in
+  *LoadState*) echo "${LOAD:-loaded}" ;;
+  *FragmentPath*) echo "${FRAG-/etc/systemd/system/x.slice}" ;;
+esac
+SH
+  cat > "$fx/bin/systemd-run" << 'SH'
+#!/bin/sh
+echo "$*" >> "$FX/systemd-run.log"
+exit "${RUN_RC:-0}"
+SH
+  chmod +x "$fx/bin/systemctl" "$fx/bin/systemd-run"
+  rc=0; out=$(PATH="$fx/bin:$PATH" FX=$fx LOAD=not-found enter_slice x.slice 2>&1) || rc=$?
+  [ "$rc" = 69 ] && case $out in *"x.slice is not installed"*"no limits"*) true ;; *) false ;; esac || fail "a slice with no unit ends rc $rc: $out"
+  rc=0; out=$(PATH="$fx/bin:$PATH" FX=$fx FRAG='' enter_slice x.slice 2>&1) || rc=$?
+  [ "$rc" = 69 ] || fail "a slice with no unit file ends rc $rc, not 69 (systemd-run would make a transient one with no limits): $out"
+  [ ! -e "$fx/systemd-run.log" ] || fail "a refused slice still ran systemd-run"
+  rc=0; out=$(PATH="$fx/bin:$PATH" FX=$fx RUN_RC=3 enter_slice x.slice origin/main 2>&1) || rc=$?
+  [ "$rc" = 3 ] || fail "the run's rc 3 ends enter_slice rc $rc"
+  [ "$(cat "$fx/systemd-run.log")" = "--scope --quiet --slice=x.slice -- env STATIC_IN_SLICE=1 timeout --kill-after=10 $NATIVE_BOUND bash $0 --native --slice x.slice origin/main" ] ||
+    fail "systemd-run got '$(cat "$fx/systemd-run.log")'"
+  rc=0; out=$(PATH="$fx/bin:$PATH" FX=$fx RUN_RC=124 enter_slice x.slice 2>&1) || rc=$?
+  [ "$rc" = 124 ] && case $out in *"past its bound of $NATIVE_BOUND s"*) true ;; *) false ;; esac || fail "a run killed at the bound ends rc $rc: $out"
+  rm -f "$fx/systemd-run.log"
+  # the whole run in a fixture tree: Linux (a uname stub), the fake cargo, recipes.py and one check script
+  cp "$HERE/tools/mac-static.sh" "$fx/tools/mac-static.sh"
+  printf '#!/usr/bin/env bash\necho "aa out"\n' > "$fx/tools/check-aa.sh"
+  printf '#!/bin/sh\necho Linux\n' > "$fx/bin/uname"
+  chmod +x "$fx/bin/uname"
+  printf 'combo\tapp test\tcargo check -p okpkg\tkeyone\ntotal\t1 commands\n' > "$fx/tools/combos.out"
+  printf '%s\n' 'cargo clippy --workspace --all-targets' > "$fx/tools/cmd.lint"
+  : > "$fx/cargo.log"; : > "$fx/tools/recipes.log"
+  rc=0
+  out=$(env -i PATH="$fx/bin:/usr/bin:/bin" HOME="$fx/home" FX="$fx" WARN=7 bash "$fx/tools/mac-static.sh" --native origin/main 2>&1) || rc=$?
+  [ "$rc" = 0 ] || fail "the native run in the fixture tree ends rc $rc: $out"
+  for k in "mac-static: native lane, combos ledger $fx/home/.cache/bloomery/native-static-ledger.tsv" \
+    "mac-static: fmt-check rc 0 in " "mac-static: lint rc 0 in " "native: lint ^warning: 7 = the ratchet 7" "mac-static: combos rc 0 in " "native: combos rc 0; 1 shapes run, 0 red, 0 skipped (scoped)" \
+    "mac-static: check-aa rc 0 in " "aa out" "mac-static: total " "base origin/main, ledger $fx/home/.cache/bloomery/native-static-ledger.tsv" "mac-static: ok"; do
+    case $out in *"$k"*) ;; *) fail "the native run's output lacks '$k': $out" ;; esac
+  done
+  case $out in *", slice "*) fail "a native run with no --slice names a slice: $out" ;; esac
+  [ ! -e "$fx/systemd-run.log" ] || fail "a native run with no --slice ran systemd-run: $(cat "$fx/systemd-run.log")"
+  [ "$(cut -f1,2 "$fx/home/.cache/bloomery/native-static-ledger.tsv")" = "$(printf 'keyone\tgreen')" ] || fail "the native run's ledger is '$(cat "$fx/home/.cache/bloomery/native-static-ledger.tsv" 2>&1)'"
+  grep -q '^combos --base origin/main --ledger '"$fx"'/home/.cache/bloomery/native-static-ledger.tsv$' "$fx/tools/recipes.log" || fail "recipes.py combos got: $(cat "$fx/tools/recipes.log")"
+  grep -q '^static-check fmt --all -- --check$' "$fx/cargo.log" || fail "fmt-check ran '$(cat "$fx/cargo.log")'"
+  rc=0
+  out=$(env -i PATH="$fx/bin:/usr/bin:/bin" HOME="$fx/home" FX="$fx" WARN=9 bash "$fx/tools/mac-static.sh" --native 2>&1) || rc=$?
+  [ "$rc" = 1 ] && case $out in *"mac-static: lint rc 1 in "*"above the ratchet 7"*"base none (full run), ledger "*"red steps: lint (rc 1)"*) true ;; *) false ;; esac || fail "an over-ratchet native run ends rc $rc: $out"
+  rc=0; out=$(env -i PATH="$fx/bin:/usr/bin:/bin" HOME="$fx/home" FX="$fx" bash "$fx/tools/mac-static.sh" --native --bogus 2>&1) || rc=$?
+  [ "$rc" = 64 ] || fail "--native --bogus ends rc $rc, not 64"
+  # the same run in a slice: the fake systemd-run execs what follows its --, the fake timeout drops its flags
+  printf '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done; shift\nexec "$@"\n' > "$fx/bin/systemd-run"
+  printf '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do case "$1" in -*|[0-9]*) shift ;; *) break ;; esac; done\nexec "$@"\n' > "$fx/bin/timeout"
+  chmod +x "$fx/bin/systemd-run" "$fx/bin/timeout"
+  rc=0; out=$(env -i PATH="$fx/bin:/usr/bin:/bin" HOME="$fx/home" FX="$fx" WARN=7 bash "$fx/tools/mac-static.sh" --native --slice x.slice origin/main 2>&1) || rc=$?
+  [ "$rc" = 0 ] || fail "the native run in a slice ends rc $rc: $out"
+  case $out in *"mac-static: native lane, combos ledger $fx/home/.cache/bloomery/native-static-ledger.tsv, slice x.slice, bound $NATIVE_BOUND s"*"mac-static: ok"*) ;; *) fail "the native run in a slice does not say so: $out" ;; esac
+  for a in '--slice' '--slice --full' '--slice x' '--slice a/b.slice'; do
+    rc=0; out=$(env -i PATH="$fx/bin:/usr/bin:/bin" HOME="$fx/home" FX="$fx" bash "$fx/tools/mac-static.sh" --native $a 2>&1) || rc=$?
+    [ "$rc" = 64 ] && case $out in *"--slice takes a slice unit name"*) true ;; *) false ;; esac || fail "--native $a ends rc $rc, not 64: $out"
+  done
+  unset FX
+  rm -rf "$fx"
+
   if [ "$fails" != 0 ]; then
     say "mac-static: self-test $fails failed"
     return 1
@@ -594,9 +913,31 @@ case ${1:-} in
     run_checks "$HERE/tools" '' "$nobase" "$list" "$jobs" "$check_dir" ${cskip[@]+"${cskip[@]}"} || rc=$?
     exit "$rc"
     ;;
+  --native)
+    native_host "$(uname -s)" || exit $?
+    shift
+    slice=
+    if [ "${1:-}" = --slice ]; then
+      case ${2:-} in
+        -* | '' | */*) say "mac-static.sh: --slice takes a slice unit name, NAME.slice"; exit 64 ;;
+        *.slice) slice=$2 ;;
+        *) say "mac-static.sh: --slice takes a slice unit name, NAME.slice, got '$2'"; exit 64 ;;
+      esac
+      shift 2
+    fi
+    case ${1:-} in
+      --full) [ $# = 1 ] || { say "mac-static.sh: --full takes nothing"; exit 64; } ;;
+      "") : ;;
+      -*) say "usage: tools/mac-static.sh --native [--slice NAME.slice] [BASE|--full] ('$1' is not one)"; exit 64 ;;
+      *) BASE=$1; [ $# = 1 ] || { say "mac-static.sh: one optional BASE, got $#: $*"; exit 64; } ;;
+    esac
+    [ -z "$slice" ] || [ -n "${STATIC_IN_SLICE:-}" ] || enter_slice "$slice" ${BASE:+"$BASE"}
+    NATIVE=1
+    LEDGER=$NATIVE_LEDGER
+    ;;
   --full) [ $# = 1 ] || { say "mac-static.sh: --full takes nothing"; exit 64; } ;;
   "") : ;;
-  -*) say "usage: tools/mac-static.sh [BASE|--full] | --checks [--list] [--no-base] [--skip NAME]… | --self-test ('$1' is not one)"; exit 64 ;;
+  -*) say "usage: tools/mac-static.sh [BASE|--full] | --native [--slice NAME.slice] [BASE|--full] | --checks [--list] [--no-base] [--skip NAME]… | --self-test ('$1' is not one)"; exit 64 ;;
   *) BASE=$1; [ $# = 1 ] || { say "mac-static.sh: one optional BASE, got $#: $*"; exit 64; } ;;
 esac
 
@@ -604,6 +945,7 @@ D=$HERE/target/mac-static
 mkdir -p "$D" || { say "mac-static.sh: cannot create $D"; exit 69; }
 D=$(mktemp -d "$D/run.XXXXXX") || { say "mac-static.sh: cannot create a run directory in $D"; exit 69; }
 echo "mac-static: results ${D#"$HERE/"}"
+[ -z "$NATIVE" ] || echo "mac-static: native lane, combos ledger $LEDGER${slice:+, slice $slice, bound $NATIVE_BOUND s}"
 CARGO=()
 while IFS= read -r w; do CARGO+=("$w"); done < <(combos_argv "$BASE" "$LEDGER")
 run_steps "$D" "$BASE" "${CARGO[@]}"

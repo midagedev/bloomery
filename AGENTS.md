@@ -21,7 +21,8 @@ change is checked and merged is in `CONTRIBUTING.md`. A maintainer's machine may
   `just mac-lint` (check and clippy as an x86_64-linux cross check, no linker), `just mac-fmt-check`,
   `just mac-static [BASE]` (fmt-check, lint, the feature combos scoped to BASE's changed files and every check script,
   in parallel; `tools/mac-static.sh`) and the pure crates' native tests (`just mac-test`, the crates
-  `tools/recipes.py pure-crates` selects). A static result is development-loop evidence, not a gate's.
+  `tools/recipes.py pure-crates` selects). On a Linux host the same lanes run natively (`tools/mac-static.sh --native`),
+  faster than a remote Mac. A static result is development-loop evidence, not a gate's.
 - **Never time by hand.** The project's numbers come from the runners in `tools/ref/` (`decode-measure.sh`,
   `ab-decode.sh`, `depth-gpu.sh`, `depth-ds41.sh`, `nsys-gpu.sh`, `ncu-gpu.sh` and their recipes), each taking the
   timing lease through `lease_take`: a machine-wide lock, a GPU-idle wait, and witness blocks around every timed

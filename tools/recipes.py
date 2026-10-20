@@ -6819,9 +6819,9 @@ def own_fixture_row(path: str, dirs: set[str]) -> bool:
 
 
 KEY_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".cargo/cuda-oxide.toml"]
-# tools/box.sh's rsync excludes (target/ and .git/ at any depth; *.ptx, *.ll, .oxide-artifacts/ at the
-# root), plus per-checkout noise no gate reads that would split the key by checkout: a worktree's .git
-# file, .DS_Store, __pycache__/.
+# tools/box.sh's rsync excludes (target/ and any .git, a directory or a file, at any depth; *.ptx, *.ll,
+# .oxide-artifacts/ at the root), plus per-checkout noise no gate reads that would split the key by checkout:
+# .DS_Store, __pycache__/.
 TREE_SKIP_DIRS = frozenset({"target", ".git", "__pycache__"})
 TREE_SKIP_FILES = frozenset({".git", ".DS_Store"})
 SCRIPT_EXTS = (".sh", ".py", ".bash")
@@ -6849,7 +6849,8 @@ CARGO_PARAM = re.compile(r"(?:--features|--bin|--test|--example|--package|-p|-F)
 # A reference tree (ik, llama.cpp, mistral.rs) is outside the manifest: a recipe that reads one is
 # never skipped. The profiles and ref-paths.sh only define these names for every box command. The home
 # path is spelled with a class so that this file, which check-recipes runs, does not match itself.
-IK_READ = re.compile(r"\$\{?(?:IK|IKBIN|LCPP|LCPPBIN|MRS|MRSBIN)\b|/home/[u]ser/")
+# The default of the lever BLOOMERY_BOX_GIT (the bare repository tools/box.sh pushes to) is the box's own path, not a reference tree.
+IK_READ = re.compile(r"\$\{?(?:IK|IKBIN|LCPP|LCPPBIN|MRS|MRSBIN)\b|(?<!\$\{BLOOMERY_BOX_GIT:-)/home/[u]ser/")
 IK_DEFINERS = ("tools/ref/ref-paths.sh", "tools/ref/models/")
 HOME_LITERAL = re.compile(r"\"/home/")
 # A walk of the tree, which no closure bounds: the recipe is keyed on the whole tree.
@@ -9395,6 +9396,11 @@ def key_self_test(expect, real: Side) -> None:
         # The cancellation fixtures name Clefvis and the tokenizer oracle's self-test runs oracle.sh: both scripts read a
         # reference tree, so check-recipes is never skipped (the reason names the first one the closure reaches).
         expect("reads a reference tree" in (c.parts("check-recipes")[2] or ""), f"check-recipes did not name a reference-tree read: {c.parts('check-recipes')[2]}")
+        # The default of the lever BLOOMERY_BOX_GIT is the box's own bare repository, not a reference tree; the same path read any other way is.
+        home = "/home/" + "user/"
+        expect(IK_READ.search("BARE=${BLOOMERY_BOX_GIT:-" + home + "bloomery.git}") is None, "the default of BLOOMERY_BOX_GIT read as a reference tree")
+        expect(IK_READ.search("BARE=" + home + "bloomery.git") is not None, "the bare path outside the lever's default was exempt")
+        expect(IK_READ.search("x=$" + "{IK}/y") is not None, "a read of $IK was exempt")
         expect(c.parts("gate-gpu-e2e")[2] is not None, "an `any`-card recipe with no card forced was skippable")
         expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in /root/x.bin")[2] is not None, "an absolute path in ARGS was skippable")
         argpath = "gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in docs/HARDWARE.md"

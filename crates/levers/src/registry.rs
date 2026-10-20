@@ -1799,6 +1799,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          lever reaches a binary through an unchanged recipe.",
     ),
     runner(
+        "BLOOMERY_BOX_GIT",
+        Some("box.sh"),
+        "Mac side: the path on the box of the bare git repository `tools/box.sh` pushes each remote \
+         directory's HEAD to and makes the directory a worktree of; unset, the box's own path.",
+    ),
+    runner(
         "BLOOMERY_BOX_LOCAL",
         Some("box.sh"),
         "`1`: `tools/box.sh` runs the command in this tree on this machine, with no ssh and \

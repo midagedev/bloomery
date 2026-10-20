@@ -133,6 +133,22 @@
 #   BLOOMERY_Q_PRED_S=<s>     the job's predicted wall, whole seconds >= 1; unset prints `predicted unknown`
 #                             and the job goes without one. The queue line `box.sh: queue <class> card=<lane>
 #                             predicted <s> remote=<dir>` goes to stderr before the submit
+#
+# The git worktree. A remote directory is a git worktree of one bare repository on the box (BARE below, made on first use; BLOOMERY_BOX_GIT names its path there), detached at
+# this tree's HEAD, so git on the box reads the commit the Mac's tree stands on and, in `git status`, the round's uncommitted diff (the
+# static checks that read git, tools/check-comments.sh and the check-recipes self-tests, need a work tree). A call that syncs does, before
+# the rsync and under the bare repository's lock: it pushes HEAD to the box over the same ssh as `refs/tracks/<the remote directory's name>`
+# (and the Mac's refs/remotes/origin/main as the same name there, so `origin/main` as a BASE resolves on the box; incremental, so a call
+# after the first sends a few objects), sets the bare repository's info/exclude to the Mac's (the repository's and the global ignore file,
+# so `git status` and `git grep --untracked` there skip what the Mac skips), then makes the directory a worktree at that commit or moves
+# it there. It moves HEAD and the index and never checks a file out, so the files rsync writes are the only files in the tree. A
+# directory made before this was a plain one: it converts once, with a line naming it. Neither side sends its `.git` — a directory or a
+# file (a worktree's, naming a path of the Mac) — and tree_id leaves it out too. rsync keeps no owner: the files are root's, since git
+# on the box refuses a worktree whose directory the Mac's uid owns. A tree with no HEAD commit is synced as it is, with a line saying so.
+# In queue mode a HEAD that has to move while a job of the directory runs ends the call 83, as a tree that would be replaced under the
+# job does. A step that fails ends the call with a line naming it and its rc: 70 for the box's own refusal (a `.git` directory, or one
+# naming another repository) and for a push that failed twice, 83 above, 64 for a remote directory name that is no ref name, the ssh's
+# own rc otherwise; nothing falls back to a plain-directory sync.
 set -euo pipefail
 # The hold on this side (the header): one file a holder.
 BOX_HOLD_DIR=$HOME/.cache/bloomery/box-hold
@@ -141,6 +157,7 @@ BOX_HOLD_DIR=$HOME/.cache/bloomery/box-hold
 DROP_WAIT=5  # between a dropped rsync or ssh and its one retry
 SYNC_WAIT=120 # how long a queued call waits on another call's sync of this remote directory (its lock held, its tree id not there)
 SYNC_POLL=2  # between two looks at that sync
+BARE=${BLOOMERY_BOX_GIT:-/home/user/bloomery.git} # the bare repository on the box that every remote directory is a worktree of (the header's «The git worktree»)
 
 # hold_stamp <epoch>: the UTC stamp of an epoch second (BSD date -r on the Mac, GNU date -d elsewhere).
 hold_stamp() {
@@ -232,7 +249,7 @@ hold_cmd() {
 
 # tree_id DIR: the id of the tree rsync sends from DIR (the queue's .sync-id), 16 hex digits: a sha256 over every path it
 # sends, sorted, with its type and mode, a file's size, mtime and bytes and a link's target, under rsync's excludes (a
-# directory named target or .git anywhere, and at the top /*.ptx, /*.ll and /.oxide-artifacts/). Equal ids mean equal
+# directory named target and anything named .git, a directory or a file, anywhere; at the top /*.ptx, /*.ll and /.oxide-artifacts/). Equal ids mean equal
 # trees; an edit of the bytes or of the mtime, a new or removed file each give another id. A same-length edit whose
 # mtime is put back still moves the id, because the bytes are in it.
 tree_id() {
@@ -252,7 +269,7 @@ def walk(rel):
         full = os.path.join(root, p)
         st = os.lstat(full)
         isdir = stat.S_ISDIR(st.st_mode)
-        if isdir and name in ("target", ".git"):
+        if name == ".git" or (isdir and name == "target"):
             continue
         if not rel and (name == ".oxide-artifacts" if isdir else name.endswith((".ptx", ".ll"))):
             continue
@@ -297,6 +314,137 @@ pre_ssh() {
 sync_bail() {
   [ -z "${SYNC_TMP:-}" ] || rm -rf "$SYNC_TMP"
   exit "$1"
+}
+
+# The box's half of the git worktree (the header's «The git worktree»), run there as `bash -s -- box-git MODE ARGS…` with this text on
+# stdin. init BARE EXCLUDES: the bare repository made when it is not there, and its info/exclude set to EXCLUDES (base64, `-`: left as it
+# is), so the box ignores the files the Mac's git does; calls that start together take turns on BARE.lock. attach BARE NAME SHA DIR [QLOCK]: DIR (made when missing) is a
+# worktree of BARE detached at SHA, under BARE's lock. A plain DIR gets its `.git` file from a worktree added with no checkout; the index
+# is then read from SHA. Only HEAD and the index move, never a file.
+read -r -d '' GITWT << 'GITWT_SCRIPT' || true
+set -eu
+mode=$2 bare=$3
+case $mode in
+  init)
+    command -v flock > /dev/null || { echo "box.sh: flock is not installed on the box" >&2; exit 69; }
+    exec 6>> "$bare.lock"
+    flock 6
+    [ -d "$bare/objects" ] || git -c init.defaultBranch=main init -q --bare "$bare"
+    if [ "${4:--}" != - ]; then
+      mkdir -p "$bare/info"
+      printf %s "$4" | base64 -d > "$bare/info/exclude.new"
+      mv -f "$bare/info/exclude.new" "$bare/info/exclude"
+    fi
+    ;;
+  attach)
+    name=$4 sha=$5 dir=$6 qlock=${7:-}
+    command -v flock > /dev/null || { echo "box.sh: flock is not installed on the box" >&2; exit 69; }
+    mkdir -p "$dir"
+    [ "$(stat -c %u "$dir" 2> /dev/null || stat -f %u "$dir")" = "$(id -u)" ] || chown "$(id -u):$(id -g)" "$dir"
+    exec 8>> "$bare/box-wt.lock"
+    flock 8
+    if [ -d "$dir/.git" ]; then
+      echo "box.sh: $dir/.git is a directory; a remote directory is a worktree of $bare and box.sh sends no .git: remove it, and call again" >&2
+      exit 70
+    fi
+    cur= fresh=
+    if [ -f "$dir/.git" ]; then
+      if common=$(git -C "$dir" rev-parse --git-common-dir 2> /dev/null); then
+        common=$(cd "$dir" && cd "$common" && pwd -P)
+        [ "$common" = "$(cd "$bare" && pwd -P)" ] || {
+          echo "box.sh: $dir/.git belongs to $common, not to $bare: remove it, and call again" >&2
+          exit 70
+        }
+        cur=$(git -C "$dir" rev-parse -q --verify HEAD 2> /dev/null) || cur=
+      else
+        echo "box.sh: $dir/.git ($(head -c 200 "$dir/.git")) names no repository on this machine (a box.sh from before the worktree sent the Mac's, or its repository is gone): replacing it" >&2
+        rm -f "$dir/.git"
+      fi
+    fi
+    if [ ! -e "$dir/.git" ]; then
+      echo "box.sh: $dir is a plain directory: making it a git worktree of $bare (once)" >&2
+      new=$(mktemp -d "$bare/wt-new.XXXXXX")
+      git --git-dir="$bare" worktree prune
+      git --git-dir="$bare" worktree add -q --no-checkout --detach "$new/$name" "$sha"
+      mv "$new/$name/.git" "$dir/.git"
+      rmdir "$new/$name" "$new"
+      out=$(git --git-dir="$bare" worktree repair "$dir" 2>&1) || { echo "$out" >&2; exit 70; }
+      cur=$sha fresh=1
+    fi
+    if [ "$cur" != "$sha" ] || [ -n "$fresh" ] || [ ! -e "$(git -C "$dir" rev-parse --absolute-git-dir)/index" ]; then
+      if [ -n "$qlock" ]; then
+        mkdir -p "${qlock%/*}"
+        exec 7>> "$qlock"
+        flock -n -x 7 || {
+          echo "box.sh: a job of $dir is running ($qlock is held) and its git HEAD is ${cur:0:8}, not ${sha:0:8}: HEAD cannot move under it; wait for it, or use another BLOOMERY_REMOTE" >&2
+          exit 83
+        }
+      fi
+      git -C "$dir" reset -q --mixed "$sha"
+      note=
+      if [ -n "$fresh" ]; then note=" (a new worktree)"; elif [ -n "$cur" ]; then note=" (was ${cur:0:8})"; fi
+      echo "box.sh: $dir is at ${sha:0:8}$note" >&2
+    fi
+    ;;
+esac
+GITWT_SCRIPT
+
+# git_ssh MODE ARGS…: GITWT on the box (ssh $HOST bash -s), its rc the result; a dropped ssh (255) is retried once after drop_note.
+git_ssh() {
+  local r=0
+  # shellcheck disable=SC2029 # the arguments expand here, on purpose
+  ssh "$HOST" "bash -s -- box-git $*" <<< "$GITWT" || r=$?
+  if [ "$r" = 255 ]; then
+    drop_note "$r"
+    r=0
+    # shellcheck disable=SC2029
+    ssh "$HOST" "bash -s -- box-git $*" <<< "$GITWT" || r=$?
+  fi
+  return "$r"
+}
+
+# git_excludes: what git ignores in this tree besides its .gitignore files — the repository's info/exclude, then the global ignore file —
+# as base64 on one line (empty when there is none). The box's bare repository gets it, and `git status` there reads like the Mac's.
+git_excludes() {
+  (
+    cd "$HERE" || exit 0
+    f=$(git rev-parse --git-path info/exclude 2> /dev/null) || f=
+    if [ -f "$f" ]; then cat "$f"; fi
+    g=$(git config --path --get core.excludesFile 2> /dev/null) || g=${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore
+    if [ -f "$g" ]; then cat "$g"; fi
+  ) | base64 | tr -d '\n'
+}
+
+# git_phase: the remote directory is a git worktree of BARE at this tree's HEAD (the header's «The git worktree»). The push takes the
+# bare repository's lock on the box (git's --receive-pack), so calls that start together send one after another and the later ones find
+# the refs up to date. A push that fails is retried once after drop_note; a second failure ends the call 70 with git's code.
+git_phase() {
+  local sha name r=0 refs excl
+  sha=$(git -C "$HERE" rev-parse -q --verify 'HEAD^{commit}' 2> /dev/null) || sha=
+  if [ -z "$sha" ]; then
+    echo "box.sh: $HERE has no HEAD commit: $REMOTE is synced as it is and is not made a git worktree (one that already is stays at its commit)" >&2
+    return 0
+  fi
+  name=$(basename "$REMOTE")
+  case $name in
+    '' | . | .. | *[!A-Za-z0-9._-]*) echo "box.sh: the remote directory's name is its worktree's name and its ref name under refs/tracks/, [A-Za-z0-9._-]+, got '$name' (BLOOMERY_REMOTE=$REMOTE)" >&2; exit 64 ;;
+  esac
+  excl=$(git_excludes)
+  git_ssh init "$BARE" "${excl:--}" || { r=$?; echo "box.sh: making the bare repository $BARE on $HOST failed (rc $r)" >&2; exit "$r"; }
+  refs=("+$sha:refs/tracks/$name")
+  if git -C "$HERE" rev-parse -q --verify refs/remotes/origin/main > /dev/null 2>&1; then
+    refs+=("+refs/remotes/origin/main:refs/remotes/origin/main")
+  fi
+  r=0
+  git -C "$HERE" push -q --no-verify "--receive-pack=flock $BARE/box-push.lock git-receive-pack" "$HOST:$BARE" "${refs[@]}" || r=$?
+  if [ "$r" != 0 ]; then
+    echo "box.sh: git push of ${sha:0:8} to $HOST:$BARE failed (git exit $r); retrying once" >&2
+    sleep "$DROP_WAIT"
+    r=0
+    git -C "$HERE" push -q --no-verify "--receive-pack=flock $BARE/box-push.lock git-receive-pack" "$HOST:$BARE" "${refs[@]}" || r=$?
+    [ "$r" = 0 ] || { echo "box.sh: git push of ${sha:0:8} to $HOST:$BARE failed twice (git exit $r): $REMOTE was not made a worktree and nothing was synced" >&2; exit 70; }
+  fi
+  git_ssh attach "$BARE" "$name" "$sha" "$REMOTE" ${QLOCK:+"$QLOCK"} || { r=$?; echo "box.sh: making $REMOTE a git worktree of $BARE at ${sha:0:8} on $HOST failed (rc $r)" >&2; exit "$r"; }
 }
 
 # sync_refused RC: a queued rsync ended RC (not 0). The remote directory's lock and its .sync-id, read in one ssh, say why. Sets SYNC_NEXT:
@@ -394,7 +542,8 @@ self_test() {
   box=$d/tree/tools/box.sh hd=$d/home/.cache/bloomery/box-hold
   mkdir -p "$d/tree/tools" "$d/stub" "$d/home"
   # The script under test, with the drop wait and the sync wait shrunk (the constants' lines at the top; the wait case below reads 2 s).
-  sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=2 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$script" > "$box"
+  sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=2 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' \
+    -e "s|^BARE=\${BLOOMERY_BOX_GIT:-[^}]*}|BARE=\${BLOOMERY_BOX_GIT:-$d/bare.git}|" -e "s|^QLOCK_DIR=/root/bloomery-queue\$|QLOCK_DIR=$d/q|" "$script" > "$box"
   printf '%s\n' 'cuda-device = { git = "x", rev = "0123456789ab" }' > "$d/tree/Cargo.toml"
   # The scratch tree is a git repo with a committed HEAD (the real case): the version commit reads here, and the corrupt-index
   # case at the end has a HEAD whose dirt would otherwise read clean. Identity and hooks are pinned so the commit asks for neither.
@@ -409,6 +558,32 @@ self_test() {
     printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/%s.log"\n' "$d" "$t" > "$d/stub/$t"
     chmod +x "$d/stub/$t"
   done
+  # git is the real one but for a push, which a script answers (push.script, default rc 0) unless the remote is real (STUB_EXEC_REMOTE=1).
+  # The git stub logs only pushes; flock (a Mac has none) takes `flock FD` and `flock FILE CMD…` and, with STUB_FLOCK_BUSY=1, refuses `-n`.
+  printf '#!/bin/sh\nD=%s\nREAL=%s\n' "$d" "$(command -v git)" > "$d/stub/git"
+  cat >> "$d/stub/git" << 'STUB'
+pop() {
+  [ -s "$1" ] || { echo "$2"; return; }
+  head -n 1 "$1"
+  if [ "$(grep -c '' "$1")" -gt 1 ]; then sed '1d' "$1" > "$1.n" && mv "$1.n" "$1"; fi
+}
+case " $* " in
+  *' push '*)
+    printf '%s\n' "$*" >> "$D/git.log"
+    echo push >> "$D/seq.log"
+    [ "${STUB_EXEC_REMOTE:-0}" = 1 ] || exit "$(pop "$D/push.script" 0)" ;;
+esac
+exec "$REAL" "$@"
+STUB
+  cat > "$d/stub/flock" << 'STUB'
+#!/bin/sh
+case " $* " in *' -n '*) [ "${STUB_FLOCK_BUSY:-0}" = 0 ] || exit 1 ;; esac
+while [ $# -gt 0 ]; do case $1 in -*) shift ;; *) break ;; esac; done
+[ $# -gt 1 ] || exit 0
+shift
+exec "$@"
+STUB
+  chmod +x "$d/stub/flock" "$d/stub/git"
   # The ssh stub also writes what BLOOMERY_BOX_PIDDIR holds while the call runs, and its parent (the box.sh that runs it), into pid.log;
   # STUB_SLEEP=<s> holds it there, its own pid in ssh.pid, for the TERM case.
   printf '[ -z "${BLOOMERY_BOX_PIDDIR:-}" ] || echo "$PPID $(ls "$BLOOMERY_BOX_PIDDIR" 2> /dev/null | tr "\\n" " ")" >> "%s/pid.log"\n' "$d" >> "$d/stub/ssh"
@@ -426,15 +601,28 @@ pop() {
 }
 STUB
   done
+  printf 'RSYNC=%s\n' "$(command -v rsync)" >> "$d/stub/rsync"
   cat >> "$d/stub/rsync" << 'STUB'
+echo rsync >> "$D/seq.log"
+if [ "${STUB_RSYNC_REAL:-0}" = 1 ]; then # the box is a directory here: the destination HOST:PATH is PATH
+  n=$#
+  for a do
+    n=$((n - 1))
+    if [ "$n" = 0 ]; then set -- "$@" "${a#stub:}"; else set -- "$@" "$a"; fi
+  done
+  shift $(($# / 2))
+  exec "$RSYNC" "$@"
+fi
 exit "$(pop "$D/rsync.script" 0)"
 STUB
   cat >> "$d/stub/ssh" << 'STUB'
+case "$*" in *'box-git init'*) echo init ;; *'box-git attach'*) echo attach ;; *) echo ssh ;; esac >> "$D/seq.log"
 if [ "${STUB_EXEC_REMOTE:-0}" = 1 ]; then
   for command do :; done
   exec bash -c "$command"
 fi
 case "$*" in
+  *'box-git '*) exit "$(pop "$D/gitstep.script" 0)" ;;
   *flock*)
     set -- $(pop "$D/probe.script" '0 0')
     [ "$1" != 0 ] || { echo "lock=$2"; [ -z "${3:-}" ] || echo "$3"; }
@@ -460,6 +648,8 @@ STUB
     : > "$d/ssh.log"
     : > "$d/rsync.log"
     : > "$d/boxq.log"
+    : > "$d/git.log"
+    : > "$d/seq.log"
     rc=0
     out=$(env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE='~/repo/x' ${envs[@]+"${envs[@]}"} bash "$box" "$@" 2>&1 < /dev/null) || rc=$?
     rm -f "$d"/*.script "$d"/*.script.n "$d/boxq.rc"
@@ -687,6 +877,178 @@ STUB
   wait "$bpid" 2> /dev/null || true
   [ ! -e "$pd/$bpid" ] || fail "a call ended by TERM left its pid file $pd/$bpid"
   spid=$(cat "$d/ssh.pid" 2> /dev/null) && kill "$spid" 2> /dev/null || true
+  # The git worktree (the header). Stub cases first: the order of the calls, what is pushed and where, the failures and their rcs; then a run
+  # against a real bare repository, git and rsync on this machine, for what a stub cannot say.
+  local h1 h2 seqs
+  h1=$(git -C "$d/tree" rev-parse HEAD)
+  call -- 'echo hi'
+  want 0 'worktree: the first call'; reached 'worktree: the first call'
+  seqs=$(tr '\n' ' ' < "$d/seq.log")
+  [ "$seqs" = 'init push attach ssh rsync ssh ' ] || fail "worktree: the calls ran as '$seqs', not init push attach ssh rsync ssh"
+  [ "$(count "$d/git.log" ' push ')" = 1 ] || fail "worktree: $(count "$d/git.log" ' push ') pushes, not one"
+  grep -qF -- "--no-verify" "$d/git.log" && grep -qF -- "--receive-pack=flock $d/bare.git/box-push.lock git-receive-pack stub:$d/bare.git +$h1:refs/tracks/x" "$d/git.log" ||
+    fail "worktree: the push is not HEAD to refs/tracks/x of the bare repository under its lock: $(cat "$d/git.log")"
+  grep -qF -- 'origin/main' "$d/git.log" && fail 'worktree: a tree with no origin/main pushed one'
+  grep -qF -- "bash -s -- box-git init $d/bare.git" "$d/ssh.log" || fail "worktree: no bare repository made: $(cat "$d/ssh.log")"
+  grep -qF -- "bash -s -- box-git attach $d/bare.git x $h1 ~/repo/x" "$d/ssh.log" || fail "worktree: the attach does not name the bare repository, the name x, HEAD and the directory: $(cat "$d/ssh.log")"
+  grep -q -- '^-rlpDcz --delete ' "$d/rsync.log" || fail "worktree: rsync keeps the Mac's owner (-o or -g): git on the box refuses a directory the Mac's uid owns: $(cat "$d/rsync.log")"
+  grep -qF -- '--exclude .git ' "$d/rsync.log" || fail "worktree: rsync does not exclude .git (a directory or a file): $(cat "$d/rsync.log")"
+  grep -qF -- '.git/' "$d/rsync.log" && fail "worktree: rsync still excludes .git/ (a directory only): $(cat "$d/rsync.log")"
+  # a new commit moves what is pushed and attached
+  printf 'two\n' > "$d/tree/note.txt"
+  git -C "$d/tree" add note.txt
+  git -C "$d/tree" -c user.name=box -c user.email=box@local -c core.hooksPath=/dev/null commit -q --no-gpg-sign -m two
+  h2=$(git -C "$d/tree" rev-parse HEAD)
+  call -- 'echo hi'
+  want 0 'worktree: HEAD moved'
+  grep -qF -- "+$h2:refs/tracks/x" "$d/git.log" && grep -qF -- "box-git attach $d/bare.git x $h2 " "$d/ssh.log" || fail "worktree: a moved HEAD is not pushed and attached: $(cat "$d/git.log" "$d/ssh.log")"
+  # BLOOMERY_BOX_GIT names the bare repository: the init, the push and the attach all use it
+  call BLOOMERY_BOX_GIT=/other/bare.git -- 'echo hi'
+  want 0 'worktree: BLOOMERY_BOX_GIT'
+  grep -qF -- "git-receive-pack stub:/other/bare.git +$h2:refs/tracks/x" "$d/git.log" && grep -qF -- "bash -s -- box-git init /other/bare.git" "$d/ssh.log" &&
+    grep -qF -- "bash -s -- box-git attach /other/bare.git x $h2 " "$d/ssh.log" || fail "worktree: BLOOMERY_BOX_GIT is not the bare repository of the init, the push and the attach: $(cat "$d/git.log" "$d/ssh.log")"
+  # origin/main goes along when the tree has one
+  git -C "$d/tree" update-ref refs/remotes/origin/main "$h1"
+  call -- 'echo hi'
+  want 0 'worktree: origin/main'
+  grep -qF -- "+$h2:refs/tracks/x +refs/remotes/origin/main:refs/remotes/origin/main" "$d/git.log" || fail "worktree: origin/main is not pushed beside HEAD: $(cat "$d/git.log")"
+  git -C "$d/tree" update-ref -d refs/remotes/origin/main
+  # a queued call hands the box the dir lock to test before it moves HEAD; a direct one does not
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 0 'worktree: a queued call'
+  grep -qF -- "box-git attach $d/bare.git x $h2 ~/repo/x $d/q/dir-x.lock" "$d/ssh.log" || fail "worktree: a queued attach does not name the dir lock: $(cat "$d/ssh.log")"
+  # a push that fails once is retried once; twice ends the call 70 with git's code, before anything is attached or synced
+  sc push 1 0
+  call -- 'echo hi'
+  want 0 'worktree: one push failure'; has 'git push of' 'worktree: one push failure'; has '(git exit 1); retrying once' 'worktree: one push failure'
+  [ "$(count "$d/git.log" ' push ')" = 2 ] || fail 'worktree: one push failure: not two pushes'
+  sc push 3 3
+  call -- 'echo hi'
+  want 70 'worktree: two push failures'; has 'failed twice (git exit 3)' 'worktree: two push failures'; has 'nothing was synced' 'worktree: two push failures'
+  [ ! -s "$d/rsync.log" ] || fail 'worktree: two push failures: rsync ran'
+  grep -q -- 'attach' "$d/ssh.log" && fail 'worktree: two push failures: the directory was attached'
+  # the box's own refusal passes with its rc and a line naming the step; an ssh that dropped is retried once
+  sc gitstep 0 70
+  call -- 'echo hi'
+  want 70 'worktree: the box refuses'; has 'a git worktree of' 'worktree: the box refuses'; has '(rc 70)' 'worktree: the box refuses'
+  [ ! -s "$d/rsync.log" ] || fail 'worktree: the box refuses: rsync ran'
+  sc gitstep 0 83
+  call BLOOMERY_BOX_QUEUE=1 -- 'echo hi'
+  want 83 'worktree: a job holds HEAD'; [ ! -s "$d/boxq.log" ] || fail 'worktree: a job holds HEAD: a job was queued'
+  sc gitstep 0 255 0
+  call -- 'echo hi'
+  want 0 'worktree: the attach ssh dropped'; has "${drops}255) before submit; retrying once" 'worktree: the attach ssh dropped'
+  sc gitstep 255 255
+  call -- 'echo hi'
+  want 255 'worktree: the init ssh dropped twice'; [ ! -s "$d/git.log" ] || fail 'worktree: the init ssh dropped twice: pushed'
+  # a remote directory name that is no ref name, and a tree with no HEAD commit
+  call BLOOMERY_REMOTE='~/repo/a b' -- 'echo hi'
+  want 64 'worktree: a name with a space'; untouched 'worktree: a name with a space'; has "is its worktree's name and its ref name" 'worktree: a name with a space'
+  mv "$d/tree/.git" "$d/tree.git"
+  call -- 'echo hi'
+  want 0 'worktree: no HEAD'; reached 'worktree: no HEAD'; has 'has no HEAD commit' 'worktree: no HEAD'; has 'not made a git worktree' 'worktree: no HEAD'
+  [ ! -s "$d/git.log" ] && ! grep -q 'box-git' "$d/ssh.log" || fail 'worktree: no HEAD: a push or an attach was made'
+  mv "$d/tree.git" "$d/tree/.git"
+  # tree_id leaves out a .git of either kind: a worktree's file names a path of the Mac and rsync sends neither
+  local idd idf
+  idd=$(env -i PATH=/usr/bin:/bin HOME="$d/home" bash "$box" --tree-id "$d/tree") || idd=
+  mv "$d/tree/.git" "$d/tree.git"
+  printf 'gitdir: /somewhere/else/.git/worktrees/x\n' > "$d/tree/.git"
+  idf=$(env -i PATH=/usr/bin:/bin HOME="$d/home" bash "$box" --tree-id "$d/tree") || idf=
+  rm -f "$d/tree/.git"
+  mv "$d/tree.git" "$d/tree/.git"
+  [ -n "$idd" ] && [ "$idd" = "$idf" ] || fail "worktree: a .git file moves the tree id ($idf), a .git directory does not ($idd)"
+  # The same on this machine: the box is a directory, ssh runs its command here, rsync is the real one, the bare repository and the pushes are
+  # git's own. First use, HEAD moving, a plain directory made before the worktree existed, and a source whose .git is a file.
+  mkdir -p "$d/tree/tools/ref/models"
+  printf 'lease_guard() { :; }\n' > "$d/tree/tools/ref/lease-probe.sh"
+  printf ':\n' > "$d/home/bloomery-env.sh"
+  printf 'BLOOMERY_MODEL=stub\nMODEL=/unused\nBLOOMERY_DATA=/unused\n' > "$d/tree/tools/ref/ref-paths.sh"
+  printf 'V41_MODEL=/unused\n' > "$d/tree/tools/ref/models/deepseek41.sh"
+  # a file the Mac's git ignores through the repository's info/exclude is ignored on the box too
+  printf 'ignored.txt\n' >> "$d/tree/.git/info/exclude"
+  printf 'x\n' > "$d/tree/ignored.txt"
+  local e2e=$d/box/e2e st_mac st_box
+  e2e_call() { call BLOOMERY_REMOTE="$e2e" STUB_EXEC_REMOTE=1 STUB_RSYNC_REAL=1 "$@" -- 'echo hi'; }
+  local dp
+  dp=$(cd "$d" && pwd -P)
+  e2e_state() { # HEAD and status of the remote directory against the Mac tree's; $2 non-empty: HEAD only (a queued call leaves its .sync-id.new)
+    [ "$(git -C "$e2e" rev-parse HEAD 2> /dev/null)" = "$(git -C "$d/tree" rev-parse HEAD)" ] || fail "$1: HEAD of $e2e is '$(git -C "$e2e" rev-parse HEAD 2>&1)', not the tree's"
+    [ -f "$e2e/.git" ] || fail "$1: $e2e/.git is not a file"
+    grep -q "^gitdir: $dp/bare.git/worktrees/${e2e##*/}\$" "$e2e/.git" || fail "$1: $e2e/.git is '$(cat "$e2e/.git" 2>&1)', not the bare repository's worktree ${e2e##*/}"
+    [ -z "${2:-}" ] || return 0
+    st_mac=$(git -C "$d/tree" status --porcelain)
+    st_box=$(git -C "$e2e" status --porcelain 2>&1)
+    [ "$st_mac" = "$st_box" ] || fail "$1: git status differs: Mac '$st_mac', box '$st_box'"
+  }
+  e2e_call
+  want 0 'worktree e2e: first use'; has 'is a plain directory: making it a git worktree' 'worktree e2e: first use'; has "e2e is at ${h2:0:8} (a new worktree)" 'worktree e2e: first use'
+  e2e_state 'worktree e2e: first use'
+  [ -f "$e2e/note.txt" ] && [ -f "$e2e/ignored.txt" ] && [ "$(git -C "$d/bare.git" rev-parse refs/tracks/e2e)" = "$h2" ] || fail 'worktree e2e: first use: the files or the ref are not there'
+  git -C "$e2e" status --porcelain --ignored | grep -q '^!! ignored.txt$' || fail "worktree e2e: first use: ignored.txt is not ignored on the box: $(git -C "$e2e" status --porcelain --ignored)"
+  # the files rsync wrote are the Mac's, an edit shows as the round's diff, and the bare repository holds no checkout
+  printf 'edited\n' > "$d/tree/note.txt"
+  e2e_call
+  want 0 'worktree e2e: an edit'; hasnt 'making it a git worktree' 'worktree e2e: an edit'; hasnt 'is at ' 'worktree e2e: an edit'
+  [ "$(git -C "$e2e" status --porcelain | head -1)" = ' M note.txt' ] || fail "worktree e2e: an edit: the box's git status is '$(git -C "$e2e" status --porcelain)'"
+  e2e_state 'worktree e2e: an edit'
+  git -C "$d/tree" add note.txt
+  git -C "$d/tree" -c user.name=box -c user.email=box@local -c core.hooksPath=/dev/null commit -q --no-gpg-sign -m three
+  e2e_call
+  want 0 'worktree e2e: HEAD moved'; has "e2e is at $(git -C "$d/tree" rev-parse --short=8 HEAD) (was ${h2:0:8})" 'worktree e2e: HEAD moved'
+  e2e_state 'worktree e2e: HEAD moved'
+  [ -z "$(git -C "$e2e" status --porcelain | grep note.txt)" ] || fail 'worktree e2e: HEAD moved: the committed edit still reads as a change'
+  # a directory made before the worktree existed is plain: it converts once, by name
+  rm -f "$e2e/.git"
+  e2e_call
+  want 0 'worktree e2e: a plain directory'; has "$e2e is a plain directory: making it a git worktree of $d/bare.git (once)" 'worktree e2e: a plain directory'
+  e2e_state 'worktree e2e: a plain directory'
+  e2e_call
+  hasnt 'making it a git worktree' 'worktree e2e: converted once'
+  # a .git directory in the box is refused, and so is one naming another repository; neither is overwritten
+  mv "$e2e/.git" "$d/e2e.git.keep"
+  mkdir "$e2e/.git"
+  e2e_call
+  want 70 'worktree e2e: a .git directory'; has '/.git is a directory' 'worktree e2e: a .git directory'
+  rmdir "$e2e/.git"
+  printf 'gitdir: %s\n' "$d/tree/.git" > "$e2e/.git"
+  e2e_call
+  want 70 'worktree e2e: a .git of another repository'; has 'belongs to' 'worktree e2e: a .git of another repository'
+  rm -f "$e2e/.git"
+  mv "$d/e2e.git.keep" "$e2e/.git"
+  e2e_call
+  want 0 'worktree e2e: restored'
+  # a .git file that names a path this machine lacks (the Mac's, sent by a box.sh from before the worktree) is replaced, by name
+  printf 'gitdir: /nowhere/on/the/box/.git/worktrees/e2e\n' > "$e2e/.git"
+  e2e_call
+  want 0 'worktree e2e: a .git file naming no repository'; has 'names no repository on this machine' 'worktree e2e: a .git file naming no repository'
+  e2e_state 'worktree e2e: a .git file naming no repository'
+  # a job running in the directory holds HEAD where it is: a queued call whose HEAD differs ends 83, one whose HEAD is there goes on
+  printf 'four\n' > "$d/tree/note.txt"
+  git -C "$d/tree" -c user.name=box -c user.email=box@local -c core.hooksPath=/dev/null commit -q --no-gpg-sign -am four
+  e2e_call BLOOMERY_BOX_QUEUE=1 STUB_FLOCK_BUSY=1
+  want 83 'worktree e2e: a job holds a HEAD that differs'; has 'HEAD cannot move under it' 'worktree e2e: a job holds a HEAD that differs'
+  [ "$(git -C "$e2e" rev-parse HEAD)" != "$(git -C "$d/tree" rev-parse HEAD)" ] || fail 'worktree e2e: a job holds a HEAD that differs: HEAD moved'
+  e2e_call BLOOMERY_BOX_QUEUE=1
+  want 0 'worktree e2e: a queued call moves HEAD'
+  e2e_state 'worktree e2e: a queued call moves HEAD' headonly
+  e2e_call BLOOMERY_BOX_QUEUE=1 STUB_FLOCK_BUSY=1
+  want 0 'worktree e2e: a job holds the HEAD that is there'; hasnt 'cannot move' 'worktree e2e: a job holds the HEAD that is there'
+  # the source is itself a linked worktree: its .git file names a path of the Mac and must reach nothing
+  local wt=$d/wt
+  git -C "$d/tree" worktree add -q --detach "$wt" HEAD
+  mkdir -p "$wt/tools/ref/models"
+  cp "$d/tree/tools/ref/lease-probe.sh" "$d/tree/tools/ref/ref-paths.sh" "$wt/tools/ref/"
+  cp "$d/tree/tools/ref/models/deepseek41.sh" "$wt/tools/ref/models/"
+  [ -f "$wt/.git" ] || fail 'worktree e2e: the source worktree has no .git file'
+  e2e=$d/box/e2e-wt
+  : > "$d/ssh.log"
+  out=$(env -i PATH="$d/stub:/usr/bin:/bin" HOME="$d/home" TZ=UTC BLOOMERY_BOX=stub BLOOMERY_REMOTE="$e2e" STUB_EXEC_REMOTE=1 STUB_RSYNC_REAL=1 bash "$wt/tools/box.sh" 'echo hi' 2>&1 < /dev/null) && rc=0 || rc=$?
+  want 0 'worktree e2e: a source whose .git is a file'
+  grep -q "^gitdir: $dp/bare.git/worktrees/e2e-wt\$" "$e2e/.git" || fail "worktree e2e: a source whose .git is a file: the box's .git is '$(cat "$e2e/.git" 2>&1)'"
+  [ "$(git -C "$e2e" rev-parse HEAD)" = "$(git -C "$wt" rev-parse HEAD)" ] || fail 'worktree e2e: a source whose .git is a file: HEAD'
+  git -C "$d/tree" worktree remove --force "$wt"
+  rm -rf "$d/box"
   # Execute the actual remote command under a fake environment: query failures must stop
   # both A6000 selections before the command's side effect, even when a Bloomery lock is held.
   mkdir -p "$d/tree/tools/ref/models"
@@ -986,7 +1348,10 @@ else
   # 삭제 대상에서 뺀다.
   # A queued call syncs behind the remote directory's lock and ships the tree's id with it, put in place only after rsync ends 0
   # (the header); the direct call adds neither.
+  # No -o and no -g: the files belong to the user the box's rsync runs as, root. With the Mac's uid on the directory, git on the box
+  # refuses the worktree as dubious ownership.
   [ "$QUEUE" = 0 ] || SYNC_ID=$(tree_id "$HERE") || { echo "box.sh: the tree's id (tree_id $HERE) could not be read" >&2; exit 70; }
+  git_phase
   SYNC_TMP= SYNC_PATH=() SYNC_ID_SRC=() DROPS=0 SYNC_TRIES=0 PRE_OUT=
   while :; do
     HAVE_ID=
@@ -1009,7 +1374,7 @@ else
       SYNC_ID_SRC=("$SYNC_TMP/.sync-id.new")
     fi
     rc=0
-    rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' ${SYNC_PATH[@]+"${SYNC_PATH[@]}"} "$HERE"/ ${SYNC_ID_SRC[@]+"${SYNC_ID_SRC[@]}"} "$HOST:$REMOTE/" || rc=$?
+    rsync -rlpDcz --delete --exclude target/ --exclude .git --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' ${SYNC_PATH[@]+"${SYNC_PATH[@]}"} "$HERE"/ ${SYNC_ID_SRC[@]+"${SYNC_ID_SRC[@]}"} "$HOST:$REMOTE/" || rc=$?
     [ "$rc" != 0 ] || break
     # rsync's rc is 12 for a held lock and for a dead ssh alike: the lock and the remote tree's id decide (sync_refused).
     SYNC_NEXT=again
