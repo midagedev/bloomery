@@ -128,6 +128,18 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   as an expert tier, or a list (`0+1`) by CUDA index (not on the qwen38 seat, which takes `a`, `gate` or `bp`).
 - **Clef-Flash's `/v1/systemone`** follows llama.cpp's decision server wire (`model` optional, `/v1/models`,
   501 for video, and for an image when the seat has no encoder, upstream's `confidence` formula).
+- **`/v1/systemone` on a generative seat**: the same route, request and body as the decision models', answered by
+  the seated general model. The request is read by the decision models' own reader (the same refusals), asked as
+  the schema text in the system message and the state alone in the user message, and the reply is held to a JSON
+  object (one key a question; a choice a string of its options, a score an integer level, a noul a boolean) by the
+  structured-output path of `/v1/chat/completions`, schema jump included. Each question's scores are the logits
+  of the token its options start with, read where the model picks (the first token that tells the options apart),
+  and the body is written by the formulas the decision models' own are: `choice` is the model's pick, and
+  `probabilities`, `confidence` and a score's `score` come from the softmax of those logits over the options
+  alone. `usage.output_tokens` counts the generated ids and `timings.cache_n` the prompt ids a cache kept. A
+  request may add `cache_prompt` (a boolean, default `true`). A question whose options all start with the same
+  token as another's has no score of its own for each: the request is a 400 naming the question and the options.
+  `/props` lists the route in `routes`, and the 404 names it.
 - **`--api-key`/`--api-key-file`**, llama-server's authentication: a comma-separated list (a quoted item may
   hold commas) and a file (one key per line, `#` lines comments), both flags adding to one set, carried by
   `Authorization: Bearer <key>` or `X-Api-Key: <key>`. `/health`, `/v1/health` and `OPTIONS` stay public;

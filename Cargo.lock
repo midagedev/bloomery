@@ -388,6 +388,7 @@ version = "0.1.0"
 name = "bloomery-serve"
 version = "0.3.5"
 dependencies = [
+ "bloomery-decision",
  "bloomery-embed",
  "bloomery-gguf",
  "bloomery-jinja",

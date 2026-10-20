@@ -124,27 +124,103 @@ struct Images<'a> {
     counts: &'a [usize],
 }
 
+/// Where the schema block opens.
+const SCHEMA_OPEN: &str = "\n\nSCHEMA FIELDS:\n";
+/// Between a field's instruction and its options.
+const OPTIONS_OPEN: &str = "\nALLOWED OPTIONS:\n";
+/// After each option.
+const OPTION_CLOSE: &str = "\n";
+/// After a field's last option.
+const FIELD_CLOSE: &str = "END FIELD\n";
+
+/// One field of the schema block, as the pieces the encoder tokenizes on their own.
+struct FieldText {
+    /// From the field's number to the instruction.
+    head: String,
+    /// The instruction the model reads: the request's, rendered, else the field's id.
+    instructions: String,
+    options: Vec<OptionText>,
+}
+
+/// One option of a field.
+struct OptionText {
+    id: String,
+    /// `OPTION n: `, before the semantics.
+    label: String,
+    /// The option's id and description as the release renders them.
+    semantics: String,
+}
+
+/// The schema block's text for each question of `req`, in order.
+fn schema_questions(req: &Request) -> Vec<FieldText> {
+    req.questions
+        .iter()
+        .enumerate()
+        .map(|(qi, q)| FieldText {
+            head: format!(
+                "\nFIELD {}\nID: {}\nTYPE: {}\nINSTRUCTION: ",
+                qi + 1,
+                q.id,
+                q.kind.word()
+            ),
+            instructions: match &q.instructions {
+                Some(v) if v.as_str() != Some("") => render(v),
+                _ => q.id.clone(),
+            },
+            options: q
+                .options()
+                .into_iter()
+                .enumerate()
+                .map(|(oi, opt)| {
+                    let mut semantics = vec![(
+                        "option_id".to_string(),
+                        crate::json::Json::Str(opt.id.clone()),
+                    )];
+                    if let Some(d) = opt.description {
+                        semantics.push(("description".to_string(), d));
+                    }
+                    OptionText {
+                        id: opt.id,
+                        label: format!("OPTION {}: ", oi + 1),
+                        semantics: render(&crate::json::Json::Object(semantics)),
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// The schema block as one text: what [`encode`] tokenizes piece by piece, joined. A model that
+/// reads the schema as text (a generative one, whose tokenizer cuts the whole) takes this.
+#[must_use]
+pub fn schema_text(req: &Request) -> String {
+    let mut out = String::from(SCHEMA_OPEN);
+    for field in schema_questions(req) {
+        out.push_str(&field.head);
+        out.push_str(&field.instructions);
+        out.push_str(OPTIONS_OPEN);
+        for opt in field.options {
+            out.push_str(&opt.label);
+            out.push_str(&opt.semantics);
+            out.push_str(OPTION_CLOSE);
+        }
+        out.push_str(FIELD_CLOSE);
+    }
+    out
+}
+
 fn encode_inner(
     tokens: &mut dyn FnMut(&str) -> Vec<u32>,
     req: &Request,
     images: Option<Images<'_>>,
     max_length: usize,
 ) -> Result<Encoded, Error> {
-    let mut schema = tokens("\n\nSCHEMA FIELDS:\n");
+    let mut schema = tokens(SCHEMA_OPEN);
     let mut questions = Vec::with_capacity(req.questions.len());
-    for (qi, q) in req.questions.iter().enumerate() {
-        schema.extend(tokens(&format!(
-            "\nFIELD {}\nID: {}\nTYPE: {}\nINSTRUCTION: ",
-            qi + 1,
-            q.id,
-            q.kind.word()
-        )));
+    for (q, text) in req.questions.iter().zip(schema_questions(req)) {
+        schema.extend(tokens(&text.head));
         let q_start = schema.len();
-        let instructions = match &q.instructions {
-            Some(v) if v.as_str() != Some("") => render(v),
-            _ => q.id.clone(),
-        };
-        schema.extend(tokens(&instructions));
+        schema.extend(tokens(&text.instructions));
         let q_end = schema.len();
         if q_end == q_start {
             return Err(Error::EmptySpan {
@@ -152,25 +228,18 @@ fn encode_inner(
                 what: "instructions",
             });
         }
-        schema.extend(tokens("\nALLOWED OPTIONS:\n"));
+        schema.extend(tokens(OPTIONS_OPEN));
         let mut option_spans = Vec::new();
         let mut option_ids = Vec::new();
-        for (oi, opt) in q.options().into_iter().enumerate() {
-            schema.extend(tokens(&format!("OPTION {}: ", oi + 1)));
+        for opt in text.options {
+            schema.extend(tokens(&opt.label));
             let start = schema.len();
-            let mut semantics = vec![(
-                "option_id".to_string(),
-                crate::json::Json::Str(opt.id.clone()),
-            )];
-            if let Some(d) = opt.description {
-                semantics.push(("description".to_string(), d));
-            }
-            schema.extend(tokens(&render(&crate::json::Json::Object(semantics))));
+            schema.extend(tokens(&opt.semantics));
             option_spans.push((start, schema.len()));
             option_ids.push(opt.id);
-            schema.extend(tokens("\n"));
+            schema.extend(tokens(OPTION_CLOSE));
         }
-        schema.extend(tokens("END FIELD\n"));
+        schema.extend(tokens(FIELD_CLOSE));
         questions.push(EncodedQuestion {
             id: q.id.clone(),
             kind: q.kind,
@@ -289,6 +358,29 @@ mod tests {
 
     fn request(body: &str) -> Request {
         Request::from_json(&parse(body).unwrap()).unwrap()
+    }
+
+    /// The schema text is the schema block the encoder tokenizes piece by piece: with one id a
+    /// byte the ids hold it whole, and the question and option spans lie inside it.
+    #[test]
+    fn the_schema_text_is_the_encoders_block() {
+        let r = request(
+            r#"{"model":"m","state":"s","questions":{
+            "dept":{"type":"choice","instructions":"Which?","criteria":{"tech":"Bugs","billing":null}},
+            "up":{"type":"noul","instructions":{"a":1}},
+            "lvl":{"type":"score","criteria":["lo","hi"]}}}"#,
+        );
+        let enc = encode_with(&mut bytes, &r, MAX_LENGTH).unwrap();
+        let all = text(&enc.ids, (0, enc.ids.len()));
+        let block = schema_text(&r);
+        assert!(all.contains(&block), "{all}");
+        let at = all.find(&block).unwrap();
+        for q in &enc.questions {
+            assert!(q.question_span.0 >= at && q.question_span.1 <= at + block.len());
+            for s in &q.option_spans {
+                assert!(s.0 >= at && s.1 <= at + block.len());
+            }
+        }
     }
 
     #[test]

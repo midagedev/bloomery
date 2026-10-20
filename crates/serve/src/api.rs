@@ -109,6 +109,11 @@ mod oaicompl;
 /// own steps.
 #[path = "responses.rs"]
 mod responses;
+/// The decision models' `POST /v1/systemone`, answered by the generative model
+/// through the chat path's structured output, a child of this module so it runs
+/// the chat path's own steps.
+#[path = "systemone.rs"]
+mod systemone;
 #[cfg(test)]
 #[path = "testserve.rs"]
 mod testserve;
@@ -1300,6 +1305,7 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         ("POST", "/v1/chat/completions/input_tokens" | "/chat/completions/input_tokens") => {
             return oaicompl::count_tokens(state, req, w);
         }
+        ("POST", p) if systemone::ROUTES.contains(&p) => return systemone::post(state, req, w),
         ("POST", "/v1/messages") => return anthropic::messages(state, req, w),
         ("POST", "/v1/messages/count_tokens") => return anthropic::count_tokens(state, req, w),
         ("POST", "/v1/responses" | "/responses") => return responses::create(state, req, w),
@@ -1319,7 +1325,10 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             retry_after: false,
             code: 404,
             kind: "not_found_error",
-            message: "File Not Found".to_owned(),
+            message: format!(
+                "File Not Found: POST {} answers a SystemOne decision request",
+                systemone::ROUTES.join(", POST ")
+            ),
         }),
     };
     match r {
@@ -1956,6 +1965,7 @@ fn props(state: &State) -> Value {
             "video": state.takes_video(),
         },
         "n_ctx": state.info.ctx_max,
+        "routes": systemone::ROUTES,
         "build_info": format!("bloomery-serve {VERSION}"),
         "engine": state.engine_props,
     });

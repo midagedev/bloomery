@@ -10,11 +10,13 @@
 //! validates (under the model's [`request::Rules`]), [`encode`] builds Clef's ids, [`head`] loads (through
 //! `hf::safetensors`) and runs Clef's head, [`gguf_head`] reads it from a model file that carries it
 //! (llama.cpp's Clef layout), [`rows`] gives either model its output embedding rows from a GGUF file,
-//! [`answer`] builds the shared parts of a body, [`label`] the label models'; [`release`] holds what a
-//! server needs to seat each model.
+//! [`answer`] builds the shared parts of a body, [`label`] the label models', [`generative`] asks a
+//! generative model the request and reads its decisions as answers; [`release`] holds what a server
+//! needs to seat each model.
 
 pub mod answer;
 pub mod encode;
+pub mod generative;
 pub mod gguf_head;
 pub mod head;
 pub mod json;

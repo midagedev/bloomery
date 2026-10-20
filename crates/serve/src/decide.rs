@@ -456,9 +456,10 @@ impl Reply {
     }
 }
 
-/// `d`'s body with `timings` appended as its last key; a body that is not a JSON object is an
-/// engine fault. The body's own text is kept byte for byte.
-fn with_timings(d: &Decided) -> Result<String, DecideError> {
+/// `d`'s body with `timings` appended as its last key, `cache_n` the prompt ids a cache kept (a
+/// decider with no cache gives 0); a body that is not a JSON object is an engine fault. The
+/// body's own text is kept byte for byte.
+pub(crate) fn with_timings(d: &Decided, cache_n: usize) -> Result<String, DecideError> {
     let not_object = || DecideError::Engine("the decider's answer is not a JSON object".to_owned());
     let parsed: Value = serde_json::from_str(&d.body)
         .map_err(|e| DecideError::Engine(format!("the decider's answer is not JSON: {e}")))?;
@@ -470,7 +471,7 @@ fn with_timings(d: &Decided) -> Result<String, DecideError> {
         "prompt_n": d.prompt_n,
         "prompt_ms": d.prompt_ms,
         "head_ms": d.head_ms,
-        "cache_n": 0,
+        "cache_n": cache_n,
     });
     let comma = if map.is_empty() { "" } else { "," };
     Ok(format!("{open}{comma}\"timings\":{timings}}}"))
@@ -601,7 +602,7 @@ fn decide(s: &Shared, body: &str) -> Reply {
             .fail("the decider's lock is poisoned: a request panicked while it held it".into());
     };
     let decided = panic::catch_unwind(AssertUnwindSafe(|| d.decide(body)));
-    match decided.map(|r| r.and_then(|a| with_timings(&a))) {
+    match decided.map(|r| r.and_then(|a| with_timings(&a, 0))) {
         Ok(Ok(text)) => Reply {
             status: 200,
             ctype: JSON,

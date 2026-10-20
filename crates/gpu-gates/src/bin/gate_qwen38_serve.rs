@@ -50,6 +50,14 @@
 //!   or no residency, prints `off` on the second, red there;
 //! - the positions the server serves: `/props`' `n_ctx` is the context it
 //!   was started at ([`props_ctx`]);
+//! - `systemone_is_the_schema_path` (`shared/systemone_clause.rs`, the clause
+//!   `gate_qwen3_serve` holds too; the plain arm's main server, after
+//!   `cache`): the rows of `tools/ref/clef/suite.jsonl` that fit the
+//!   server's context, POSTed to `/v1/systemone` and answered by this model
+//!   through the structured-output path, are 200s with the decision seats'
+//!   keys, and their picks are `/v1/chat/completions`' on the same request
+//!   converted with `response_format`. FAIL-first: a server without the
+//!   route answers every row 404;
 //! - `cache` ([`cache`]): two sessions' requests through the prompt cache —
 //!   a verbatim resend after the other session keeps every held position
 //!   (under the draft the turn's prompt end, its last window having fed
@@ -443,6 +451,11 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 #[path = "shared/qwen38_levers.rs"]
 mod qwen38_levers;
+
+// The `/v1/systemone` clause the generative serve gates share.
+#[cfg(feature = "gpu")]
+#[path = "shared/systemone_clause.rs"]
+mod systemone_clause;
 
 #[cfg(feature = "gpu")]
 mod gate {
@@ -4706,6 +4719,8 @@ mod gate {
 
         ok &= props_ctx(&url)?;
         ok &= cache(&url, &err_log, false, "plain")?;
+        // Last on the main server: its requests leave the slot another conversation's.
+        ok &= crate::systemone_clause::is_the_schema_path(&url, dir)?;
 
         println!("server stopped: {}", served.stop()?);
         ok &= prefix(dir)?;
