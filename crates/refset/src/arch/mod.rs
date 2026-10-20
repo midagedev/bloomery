@@ -17,8 +17,10 @@ pub mod gemma_embedding2;
 pub mod glm5next;
 pub mod mimo2;
 pub mod minicpmv4_7;
+pub mod minimaxm3;
 pub mod nemotron_h;
 pub mod nemotron_h_moe;
+pub mod prompt_tables;
 pub mod quant;
 pub mod qwen35;
 pub mod qwen35moe;
@@ -34,6 +36,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (qwen35::ARCH, qwen35::FAMILIES),
     (glm5next::ARCH, glm5next::FAMILIES),
     (mimo2::ARCH, mimo2::FAMILIES),
+    (minimaxm3::ARCH, minimaxm3::FAMILIES),
     (solar2::ARCH, solar2::FAMILIES),
     (minicpmv4_7::ARCH, minicpmv4_7::FAMILIES),
     (qwen4exp::ARCH, qwen4exp::FAMILIES),
@@ -77,6 +80,10 @@ pub fn named(name: &str) -> Option<&'static Family> {
     all().find(|f| f.name == name)
 }
 
+#[cfg(test)]
+mod node_dump_contract;
+#[cfg(test)]
+mod prompt_tables_tests;
 #[cfg(test)]
 mod qwen_vis_tests;
 

@@ -1,12 +1,14 @@
 //! The Solar-Open2-250B families. The node dumps are dumped from the Q4_K_M split set, [`MODEL`], by prometheusAIR's
 //! solar_open2 patch on llama.cpp ([`PAI_BUILD`]), the only faithful implementation of the architecture (it applies
 //! beta = 2 sigmoid; mainline has no such architecture and no pull request, ik has none). `tools/ref/solar2-dump.sh` is
-//! the writer: one set a prompt of `tools/ref/data/solar2`, each a dump_ref-format set (`MANIFEST.tsv`, one f32 file a node and
-//! occurrence) that also holds `topk.tsv` (the last position's 40 largest logits) and `greedy.tsv` (64 argmax tokens and their
-//! margins), read by [`read`]. The fixture tier's mirror is in [`fixture`].
+//! the writer (the shared dumper, `tools/ref/cb_dump.cpp`): one set a prompt of `tools/ref/data/solar2`, each a dump_ref-format
+//! set (`MANIFEST.tsv`, one f32 file a node and occurrence) that also holds `topk.tsv` (the last position's 40 largest logits) and
+//! `greedy.tsv` (64 argmax tokens and their margins), read by [`read`]. The fixture tier's mirror is in [`fixture`].
 
 pub mod fixture;
-pub mod read;
+/// The tables beside the node dumps are every mainline-API family's ([`super::prompt_tables`]); the path stays Solar's for its
+/// gate.
+pub use super::prompt_tables as read;
 
 #[cfg(test)]
 mod tests;

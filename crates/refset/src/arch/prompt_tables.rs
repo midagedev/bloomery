@@ -1,7 +1,8 @@
-//! A Solar-Open2 prompt set's own files beside the node dumps (`tools/ref/solar2-dump.cpp`): the prompt's ids from the
-//! manifest's `# tokens` line, `topk.tsv` (the last position's 40 largest logits with their f64 log-softmax) and `greedy.tsv`
-//! (the argmax tokens continued from the prompt, each with its margin to the runner-up). The node files and the last logits row
-//! are the manifest's ([`crate::ik`]); these are the two tables the dumper writes next to them.
+//! A prompt set's own files beside the node dumps (`tools/ref/cb_dump.cpp`, the mainline-API dumper of every family whose
+//! oracle is a llama.cpp tree): the prompt's ids from the manifest's `# tokens` line, `topk.tsv` (the last position's 40 largest
+//! logits with their f64 log-softmax) and `greedy.tsv` (the argmax tokens continued from the prompt, each with its margin to the
+//! runner-up). The node files and the last logits row are the manifest's ([`crate::ik`]); these are the two tables the dumper
+//! writes next to them.
 //!
 //! Each reader checks the table against what the manifest states of it (`# topk\ttopk.tsv\t<k>`, `# greedy\tgreedy.tsv\t<n>`)
 //! and against the other table: the greedy continuation's first token is the top-k table's first id.
