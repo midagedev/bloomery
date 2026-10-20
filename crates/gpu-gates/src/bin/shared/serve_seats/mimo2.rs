@@ -413,8 +413,6 @@ impl Tiered for Mimo {
     const NAME: &'static str = NAME;
     const USAGE: &'static str = USAGE;
     const ACTS_ON: &'static [&'static str] = ACTS_ON;
-    const KINDS: &'static [&'static record::Kind] = record::BLOOMERY_SERVE_MIMO2;
-    const LISTENING: &'static record::Kind = &record::LISTENING_MIMO2;
     const ALIAS: &'static str = "mimo-v2.6-flash";
     const FAMILY: &'static str = "mimo2";
     const SERVES: &'static str = "mimo2";
@@ -422,6 +420,14 @@ impl Tiered for Mimo {
 
     fn accepts(arch: Arch) -> bool {
         matches!(arch, Arch::Mimo2)
+    }
+
+    fn register() {
+        record::at_main(NAME, record::BLOOMERY_SERVE_MIMO2);
+    }
+
+    fn listening() -> Record {
+        Record::new(&record::LISTENING_MIMO2)
     }
 
     fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
@@ -471,6 +477,10 @@ impl Tiered for Mimo {
             0,
             pick,
         )?;
+        record::residency_lever(pick).eprint();
+        if let Some(d) = pick.why.detail() {
+            eprintln!("{d}");
+        }
         Ok(Some(pick))
     }
 

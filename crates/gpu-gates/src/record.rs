@@ -3458,6 +3458,14 @@ macro_rules! kinds {
 /// in the generate and chat lists by hand, which `tools/ref/cold-blocks.sh`
 /// and `tools/ref/depth-glm5next.sh` read as exact print sets.
 pub mod groups {
+    /// `serve_seats/tiered.rs` (the gate bins' shared seat module).
+    pub mod tiered {
+        use crate::record::{Kind, PLAN};
+
+        /// A tiered seat's run: the plan it loads (`tiered::run`).
+        pub const RUN: &[&Kind] = &[&PLAN];
+    }
+
     /// `side_seat.rs`.
     pub mod side_seat {
         use crate::record::{EMBEDDING_SEAT, Kind};
@@ -3789,7 +3797,9 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
 /// than it shared.
 pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
     groups::side_seat::SEAT,
-    &[&RESIDENCY_LEVER, &PLACE_UNSET, &PLAN, &NEED],
+    &[&RESIDENCY_LEVER, &PLACE_UNSET],
+    groups::tiered::RUN,
+    &[&NEED],
     groups::residency38::HOST,
     groups::fetch::FETCH,
     groups::fetch::SET,
@@ -3805,7 +3815,8 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
 /// checkpoint).
 pub static BLOOMERY_SERVE_SOLAR2: &[&Kind] = kinds![
     groups::side_seat::SEAT,
-    &[&PLACE_UNSET, &PLAN],
+    &[&PLACE_UNSET],
+    groups::tiered::RUN,
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LANE, &LOAD_SOLAR2, &LOAD_PHASES, &LISTENING_SOLAR2],

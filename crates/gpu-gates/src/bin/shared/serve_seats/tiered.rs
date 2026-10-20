@@ -19,7 +19,7 @@ use bloomery_gpu_gates::bind::{
     placement_of, slots_given, slots_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, choose_ctx, lane_at};
-use bloomery_gpu_gates::record::{self, Kind, Record};
+use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{HostCfg, Levers, ResidencyPick};
@@ -74,11 +74,6 @@ pub trait Tiered: Seat + Sized + 'static {
     /// The levers this seat acts on, parsed once at `main`.
     const ACTS_ON: &'static [&'static str];
 
-    /// The record kinds its server prints (`record::BLOOMERY_SERVE_*`).
-    const KINDS: &'static [&'static Kind];
-    /// The `listening` record, once the port is bound.
-    const LISTENING: &'static Kind;
-
     /// The alias a file that names none serves under.
     const ALIAS: &'static str;
     /// The seat word a foreign file's refusal names, and the files it serves.
@@ -107,6 +102,14 @@ pub trait Tiered: Seat + Sized + 'static {
     /// `None` where the body keeps the experts where the plan put them, which records nothing.
     /// The run prints the pick between the lane and the plan, then asks [`Tiered::settle`] for the
     /// load's word.
+    /// Registers the record kinds the seat's server prints (`record::at_main` with its
+    /// `record::BLOOMERY_SERVE_*` list), first thing after the levers.
+    fn register();
+
+    /// The seat's `listening` record, which the run fills once the port is bound.
+    fn listening() -> Record;
+
+    /// The residency the seat opens with, its `residency_lever` record and detail printed here.
     fn residency(
         _levers: &Levers,
         _flags: &Self::Flags,
@@ -132,7 +135,8 @@ pub trait Tiered: Seat + Sized + 'static {
 pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(S::ACTS_ON)?;
     model::ops::set_host_lanes(levers.host_lanes());
-    record::at_main(S::NAME, S::KINDS);
+    S::register();
+    record::require(record::groups::tiered::RUN, "tiered::run");
     arm_screen(levers.screen());
     let mut flags = S::Flags::default();
     let a = SeatFlags::parse(args, S::USAGE, |f, v| S::flags(f, v, &mut flags))?;
@@ -214,12 +218,6 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     let slot_ctx = usize::try_from(asked.slot_ctx)?;
     let plan = asked.plan;
     let pick = S::residency(&levers, &flags, place, &plan)?;
-    if let Some(pick) = pick {
-        record::residency_lever(pick).eprint();
-        if let Some(d) = pick.why.detail() {
-            eprintln!("{d}");
-        }
-    }
     record::plan(place.name(), &machine, &plan).eprint();
     let residency = match pick {
         Some(pick) => S::settle(&plan, pick)?,
@@ -260,7 +258,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         Some(tags) => server.with_think_tags(tags),
         None => server,
     };
-    Record::new(S::LISTENING)
+    S::listening()
         .w("place", place.name())
         .u("ctx", slot_ctx)
         .u("slots", slots)

@@ -342,8 +342,6 @@ impl Tiered for Solar {
     const NAME: &'static str = NAME;
     const USAGE: &'static str = USAGE;
     const ACTS_ON: &'static [&'static str] = ACTS_ON;
-    const KINDS: &'static [&'static record::Kind] = record::BLOOMERY_SERVE_SOLAR2;
-    const LISTENING: &'static record::Kind = &record::LISTENING_SOLAR2;
     const ALIAS: &'static str = "solar-open2";
     const FAMILY: &'static str = "solar2";
     const SERVES: &'static str = "solar-open2";
@@ -351,6 +349,14 @@ impl Tiered for Solar {
 
     fn accepts(arch: Arch) -> bool {
         matches!(arch, Arch::SolarOpen2)
+    }
+
+    fn register() {
+        record::at_main(NAME, record::BLOOMERY_SERVE_SOLAR2);
+    }
+
+    fn listening() -> Record {
+        Record::new(&record::LISTENING_SOLAR2)
     }
 
     fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
