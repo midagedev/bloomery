@@ -818,6 +818,9 @@ sr-v41:
 x-glm:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/gpu-gate.sh xg'
 
+x-hy:
+    BLOOMERY_MODEL=no-fx-model ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_hy'
+
 [group('solo')]
 x-q:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/gpu-gate.sh xq'
@@ -2580,6 +2583,8 @@ HK
   # in the fixture tier, never run and never red; the table is read from that file, so a family it names runs.
   check 'no-fixture: in the real tier a recipe of a family with no fixture is placed as usual' 0 '^x-glm	X	solo	' "${gb[@]}" --classes
   check '  … in the fixture tier it is deferred, named by its family' 0 '^x-glm	D	no-fixture	-	.*family glm5next: no row in the fixture table, tools/fixture-dirs.tsv \(box.sh exits 66\)' \
+    "${gb[@]}" --tier fixture --classes
+  check '  … a profile name with a hyphen is told, not read as the default (no-fx-model)' 0 '^x-hy	D	no-fixture	-	.*family no-fx-model: no row in the fixture table, tools/fixture-dirs.tsv \(box.sh exits 66\)' \
     "${gb[@]}" --tier fixture --classes
   check '  … a family with a fixture directory runs (qwen4exp)' 0 '^x-q	X	solo	' "${gb[@]}" --tier fixture --classes
   check '  … a family whose real file stands runs (the default profile)' 0 '^x-none	X	solo	' "${gb[@]}" --tier fixture --classes
@@ -5072,7 +5077,7 @@ for kv in caller_env.split():
 # lane A's last loads are V4.1's (the v41-load group), so its host set is still in the page cache when lane
 # X starts, and every family switch after that refetches a host set once.
 FIRST_FAMILY = "deepseek41"
-PROFILE_SET = re.compile(r"\bBLOOMERY_MODEL=([A-Za-z0-9_]+)\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*\./tools/box\.sh\b")
+PROFILE_SET = re.compile(r"\bBLOOMERY_MODEL=([A-Za-z0-9_-]+)\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*\./tools/box\.sh\b")
 DEFAULT_PROFILE = []
 
 
