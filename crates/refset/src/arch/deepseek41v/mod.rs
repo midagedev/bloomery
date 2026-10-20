@@ -39,7 +39,9 @@ pub const VISREF_SET: &str = "ref-visref/deepseek41-scenes";
 pub const FORK_BUILD: &str = "cfd8adcf6fb86ca523ad72fe21e8d2ac3860cd8e";
 
 /// The fork's answers and logits on the V4.1 file the tree runs, fed the
-/// vision oracle's rows.
+/// vision oracle's rows. It is not in [`FAMILIES`], so `refset-check` holds no
+/// set of it; the driver opens a set through this family's check.
+// PIN(2026-10-21): out of FAMILIES when the V4.1 file moved: no gate reads the set and its driver has no recipe, so a re-dump (the 3090, the V4.1 load lock, the fork build) serves nothing.
 pub static VISREF: Family = Family {
     name: "visref-deepseek41",
     sets: &[VISREF_SET],
@@ -58,4 +60,4 @@ pub static VISREF: Family = Family {
 };
 
 /// The architecture's families.
-pub static FAMILIES: &[&Family] = &[&VISION, &VISREF];
+pub static FAMILIES: &[&Family] = &[&VISION];
