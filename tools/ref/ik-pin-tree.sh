@@ -18,14 +18,13 @@
 #
 # No lease: the build is niced and bounded, and tools/box.sh's guard has already waited out a sitting. Rate
 # harnesses and timed runs never link a tree made here without their own lease.
-#   BLOOMERY_BUILD_JOBS=<n>   the build's -j, default 24 (the box has 64 threads and other rounds run on it)
 #   BLOOMERY_BUILD_BOUND=<s>  the build's timeout, default 1800
 set -euo pipefail
 # shellcheck source=tools/gate-bound.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../gate-bound.sh" || exit 70 # bounded, the one owner of a bounded child
 pin_file=${1:?usage: ik-pin-tree.sh <pin file>}
 SRC_TREE=/home/user/ik_llama.cpp
-JOBS=${BLOOMERY_BUILD_JOBS:-24}
+JOBS=24 # of the box's 64 threads: other rounds build beside it
 BOUND=${BLOOMERY_BUILD_BOUND:-1800}
 
 read -r PIN < "$pin_file" || { echo "ik-pin-tree: cannot read $pin_file" >&2; exit 64; }
