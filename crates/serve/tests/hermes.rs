@@ -20,6 +20,7 @@ mod common;
 use common::{V41_TEMPLATE, post, start_templated};
 use serde_json::{Value, json};
 use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, ToolFormat, Tools};
+use serve::glmxml::KvSpelling;
 use serve::hermes::HermesError;
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
@@ -333,7 +334,7 @@ fn hw_detection_follows_the_template() {
     assert_eq!(ToolFormat::of_chat_template(&qwen3), ToolFormat::Hermes);
     assert_eq!(
         ToolFormat::of_chat_template(&parsed(GLM5)),
-        ToolFormat::GlmXml
+        ToolFormat::KvMarkup(KvSpelling::Glm)
     );
     assert_eq!(
         ToolFormat::of_chat_template(&parsed(V41_TEMPLATE)),

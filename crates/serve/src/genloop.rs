@@ -88,7 +88,7 @@ use crate::engine::{
 };
 use crate::media::{Held, MediaFeed, MediaSpan, common_prefix, keep_whole_spans};
 use crate::promptcache::{PromptCache, Taken};
-use crate::reasoning::{THINK_CLOSE, ThinkEntry, ThinkSplit};
+use crate::reasoning::{ThinkEntry, ThinkSplit, ThinkTags};
 use crate::sampling;
 use crate::slotfile::{self, Counting};
 use crate::stop::{Pushed, StopScan};
@@ -118,6 +118,9 @@ pub(crate) struct GenParams {
     /// ids before a model-opened span spends nothing, and its close ids are
     /// not forced until the span opens.
     pub think_entry: ThinkEntry,
+    /// The tags of the model's think span, the server's: the budget's tracker
+    /// reads the span's close in them and forces `think.close` when it is spent.
+    pub think: ThinkTags,
     /// The probabilities the request asked for and the log its generation
     /// writes them to; `None` asks for none. Only the routes that render them
     /// set it.
@@ -1548,14 +1551,15 @@ struct Think {
 }
 
 impl Think {
-    /// A budget of `left` generated ids over a span the prompt left at
-    /// `entry`; at 0 the close is forced from the first taken id inside the
-    /// span, which for a model-opened span is the first after its `<think>`.
-    fn new(entry: ThinkEntry, left: usize, close: Vec<u32>) -> Think {
+    /// A budget of `left` generated ids over a span of `tags` the prompt left
+    /// at `entry`, `close` the ids of `tags.close`; at 0 the close is forced
+    /// from the first taken id inside the span, which for a model-opened span
+    /// is the first after its start tag.
+    fn new(entry: ThinkEntry, tags: ThinkTags, left: usize, close: Vec<u32>) -> Think {
         let n = close.len();
         Think {
             left,
-            split: ThinkSplit::for_entry(entry),
+            split: ThinkSplit::for_entry_with(entry, tags),
             close,
             at: if left == 0 { 0 } else { n },
         }
@@ -1707,9 +1711,14 @@ impl Gen {
             taken: 0,
             lent: Vec::new(),
             tok: None,
-            think: p
-                .reasoning_budget
-                .map(|left| Think::new(p.think_entry, left, slot.vocab.encode(THINK_CLOSE))),
+            think: p.reasoning_budget.map(|left| {
+                Think::new(
+                    p.think_entry,
+                    p.think,
+                    left,
+                    slot.vocab.encode(p.think.close),
+                )
+            }),
             probs,
             walk: p
                 .constraint
@@ -2425,7 +2434,7 @@ mod cache_tests {
     };
     use crate::media::Held;
     use crate::mock::{MockEngine, MockTokenizer, SaveStats};
-    use crate::reasoning::ThinkEntry;
+    use crate::reasoning::{ThinkEntry, ThinkTags};
     use crate::sampling;
 
     /// The mock vocabulary, whose `<｜User｜>` (id 2) opens a message.
@@ -2653,6 +2662,7 @@ mod cache_tests {
             cache_prompt: true,
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
+            think: ThinkTags::THINK,
             logprobs: None,
             constraint: None,
         };
@@ -2780,6 +2790,7 @@ mod cache_tests {
             cache_prompt: true,
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
+            think: ThinkTags::THINK,
             logprobs: None,
             constraint: None,
         };
@@ -2881,6 +2892,7 @@ mod cache_tests {
             cache_prompt: true,
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
+            think: ThinkTags::THINK,
             logprobs: None,
             constraint: None,
         };
@@ -2920,6 +2932,7 @@ mod cache_tests {
             cache_prompt: true,
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
+            think: ThinkTags::THINK,
             logprobs: Some(Ask::new(2, MockTokenizer.n_vocab())),
             constraint: None,
         };
@@ -3375,7 +3388,7 @@ mod media_tests {
     use crate::engine::{Engine, EngineError, SamplingParams, Tokenizer};
     use crate::media::{Held, ImageKey, MediaFeed, MediaSpan, Prepared, Prompt};
     use crate::mock::{IMAGE_ID, MediaCall, MediaTokenizer, MockEngine};
-    use crate::reasoning::ThinkEntry;
+    use crate::reasoning::{ThinkEntry, ThinkTags};
     use crate::sampling;
 
     /// `before`, an image of `len` positions and key `[key; 32]`, `after`.
@@ -3430,6 +3443,7 @@ mod media_tests {
             cache_prompt: true,
             reasoning_budget: None,
             think_entry: ThinkEntry::Closed,
+            think: ThinkTags::THINK,
             logprobs: None,
             constraint: None,
         };
@@ -3662,7 +3676,7 @@ mod think_tests {
     use super::{GenParams, Outcome, Slot, StopKind, Timings, generate};
     use crate::engine::{Drafted, Engine, EngineError, SamplingParams, Tokenizer};
     use crate::mock::{DraftMock, MockEngine, MockTokenizer};
-    use crate::reasoning::ThinkEntry;
+    use crate::reasoning::{ThinkEntry, ThinkTags};
     use crate::sampling;
 
     /// An engine behind a log of every id fed to it: `prefill`'s, every
@@ -3736,6 +3750,7 @@ mod think_tests {
             cache_prompt: true,
             reasoning_budget: budget,
             think_entry: ThinkEntry::of_prompt(prompt),
+            think: ThinkTags::THINK,
             logprobs: None,
             constraint: None,
         };
@@ -3856,7 +3871,7 @@ mod sampled_tests {
     use super::{GenParams, Slot, Timings, generate};
     use crate::engine::{Drafted, Engine, EngineError, Sampler, SamplingParams, Tokenizer};
     use crate::mock::{DraftMock, MockTokenizer};
-    use crate::reasoning::ThinkEntry;
+    use crate::reasoning::{ThinkEntry, ThinkTags};
     use crate::sampling;
 
     /// [`DraftMock`] that logs what each request tells [`Engine::will_reply`].
@@ -3939,6 +3954,7 @@ mod sampled_tests {
                 cache_prompt: true,
                 reasoning_budget: None,
                 think_entry: ThinkEntry::Closed,
+                think: ThinkTags::THINK,
                 logprobs: None,
                 constraint: None,
             };

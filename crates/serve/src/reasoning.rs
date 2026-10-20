@@ -1,5 +1,10 @@
 //! The think-span splitter for chat templates that tag their reasoning.
 //!
+//! The tags are the model's ([`ThinkTags`]): `<think>` and `</think>` for most
+//! families, the seat's own pair for one that writes others
+//! ([`crate::Server::with_think_tags`]). The text below says `<think>` for
+//! either.
+//!
 //! What the prompt ends with decides the start state, not a request flag. A
 //! template ends its generation prompt with `<think>` when it opens the span
 //! itself (V4.1's, GLM's, Qwen3.8's `<think>\n`) and with the closed span
@@ -17,10 +22,40 @@
 
 use serde_json::Value;
 
-/// The template's `thinking_start_token`.
-pub const THINK_OPEN: &str = "<think>";
-/// The template's `thinking_end_token`.
-pub const THINK_CLOSE: &str = "</think>";
+/// The two tags of a think span: the text the model writes to open its
+/// reasoning and to end it. Both are in the model's vocabulary, and the chat
+/// template writes the same pair around the history's reasoning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThinkTags {
+    /// The template's `thinking_start_token`.
+    pub open: &'static str,
+    /// The template's `thinking_end_token`.
+    pub close: &'static str,
+}
+
+impl ThinkTags {
+    /// `<think>` and `</think>`: what a server without a seat's tags
+    /// ([`crate::Server::with_think_tags`]) splits on.
+    pub const THINK: ThinkTags = ThinkTags {
+        open: "<think>",
+        close: "</think>",
+    };
+}
+
+#[cfg(test)]
+impl ThinkTags {
+    /// A pair that is not `<think>`, Solar-Open2's, for the tests that give a
+    /// seat its own tags.
+    pub(crate) const SOLAR: ThinkTags = ThinkTags {
+        open: "<|think:start|>",
+        close: "<|think:end|>",
+    };
+}
+
+/// [`ThinkTags::THINK`]'s end tag, for a caller that serves a model on the
+/// default tags. Code that writes the close takes the server's tags
+/// (`State.think`), never this.
+pub const THINK_CLOSE: &str = ThinkTags::THINK.close;
 
 /// The request's `reasoning_format` (llama-server's field and names).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,16 +105,23 @@ pub enum ThinkEntry {
 }
 
 impl ThinkEntry {
-    /// Where `prompt` leaves the span. The tags are matched at the prompt's
-    /// end with the whitespace around them, as llama-server's parser anchors
-    /// its generated prompt at the start tag and reads the whitespace around
-    /// the tags as neither reasoning nor content.
+    /// Where `prompt` leaves a `<think>` span ([`ThinkEntry::of_prompt_with`]
+    /// with [`ThinkTags::THINK`]).
     #[must_use]
     pub fn of_prompt(prompt: &str) -> ThinkEntry {
+        ThinkEntry::of_prompt_with(prompt, ThinkTags::THINK)
+    }
+
+    /// Where `prompt` leaves the span `tags` name. The tags are matched at
+    /// the prompt's end with the whitespace around them, as llama-server's
+    /// parser anchors its generated prompt at the start tag and reads the
+    /// whitespace around the tags as neither reasoning nor content.
+    #[must_use]
+    pub fn of_prompt_with(prompt: &str, tags: ThinkTags) -> ThinkEntry {
         let end = prompt.trim_end();
-        if end.ends_with(THINK_OPEN) {
+        if end.ends_with(tags.open) {
             ThinkEntry::Open
-        } else if end.ends_with(THINK_CLOSE) {
+        } else if end.ends_with(tags.close) {
             ThinkEntry::Closed
         } else {
             ThinkEntry::MayOpen
@@ -106,6 +148,7 @@ pub struct Split {
 /// that is neither the tag nor leading whitespace.
 #[derive(Debug)]
 pub struct ThinkSplit {
+    tags: ThinkTags,
     inside: bool,
     /// The model may still open the span on a leading `<think>`: true until
     /// the output names the tag, or names any other text first.
@@ -125,16 +168,23 @@ pub struct ThinkSplit {
 }
 
 impl ThinkSplit {
-    /// The start state for a rendered prompt.
+    /// The start state for a rendered prompt, on `<think>` tags.
     #[must_use]
     pub fn for_prompt(prompt: &str) -> Self {
-        Self::for_entry(ThinkEntry::of_prompt(prompt))
+        Self::for_prompt_with(prompt, ThinkTags::THINK)
     }
 
-    /// The start state for where the prompt left the span.
+    /// The start state for a rendered prompt, on `tags`.
     #[must_use]
-    pub fn for_entry(entry: ThinkEntry) -> Self {
+    pub fn for_prompt_with(prompt: &str, tags: ThinkTags) -> Self {
+        Self::for_entry_with(ThinkEntry::of_prompt_with(prompt, tags), tags)
+    }
+
+    /// The start state for where the prompt left the span `tags` name.
+    #[must_use]
+    pub fn for_entry_with(entry: ThinkEntry, tags: ThinkTags) -> Self {
         ThinkSplit {
+            tags,
             inside: entry == ThinkEntry::Open,
             may_open: entry == ThinkEntry::MayOpen,
             held: String::new(),
@@ -215,7 +265,7 @@ impl ThinkSplit {
         self.held.push_str(piece);
         let ws = self.held.len() - self.held.trim_start().len();
         let rest = &self.held[ws..];
-        if let Some(tail) = rest.strip_prefix(THINK_OPEN).map(str::to_owned) {
+        if let Some(tail) = rest.strip_prefix(self.tags.open).map(str::to_owned) {
             self.may_open = false;
             self.inside = true;
             self.trim_content |= self.trim_after_opened;
@@ -224,7 +274,7 @@ impl ThinkSplit {
             s.opened = true;
             return s;
         }
-        if rest.is_empty() || THINK_OPEN.starts_with(rest) {
+        if rest.is_empty() || self.tags.open.starts_with(rest) {
             return Split::default();
         }
         self.may_open = false;
@@ -241,7 +291,7 @@ impl ThinkSplit {
     /// either held back.
     fn in_span_step(&mut self, piece: &str) -> Split {
         self.held.push_str(piece);
-        let close = self.held.find(THINK_CLOSE);
+        let close = self.held.find(self.tags.close);
         let call = self.ends_too.and_then(|tag| self.held.find(tag));
         if let Some(at) = call.filter(|&c| close.is_none_or(|t| c < t)) {
             self.inside = false;
@@ -255,7 +305,7 @@ impl ThinkSplit {
         if let Some(at) = close {
             self.inside = false;
             self.trimming = self.trim_content;
-            let after = self.held[at + THINK_CLOSE.len()..].to_owned();
+            let after = self.held[at + self.tags.close.len()..].to_owned();
             let content = self.past_span(&after);
             self.held.truncate(at);
             return Split {
@@ -268,7 +318,7 @@ impl ThinkSplit {
         let keep = self
             .ends_too
             .map_or(0, |tag| partial_suffix(&self.held, tag))
-            .max(partial_suffix(&self.held, THINK_CLOSE));
+            .max(partial_suffix(&self.held, self.tags.close));
         let rest = self.held.split_off(self.held.len() - keep);
         Split {
             reasoning: std::mem::replace(&mut self.held, rest),
@@ -399,6 +449,51 @@ mod tests {
         let mut s = ThinkSplit::for_prompt("<|im_start|>assistant\n");
         assert_eq!(s.push("<thi"), Split::default());
         assert_eq!(s.push("nk>ok").reasoning, "ok");
+    }
+
+    /// The splitter reads the tags it is given and no others: with Solar's
+    /// pair a prompt ends in the open span at `<|think:start|>` and in the
+    /// closed one at `<|think:end|>`, the output splits at `<|think:end|>`
+    /// (a tag cut across pushes held until it is whole), `<think>` is text in
+    /// the reasoning, and a model that opens the span itself opens it with
+    /// `<|think:start|>`. On `<think>` tags the same prompts leave the span to
+    /// the model.
+    #[test]
+    fn a_splitter_reads_the_tags_it_is_given() {
+        const SOLAR: ThinkTags = ThinkTags {
+            open: "<|think:start|>",
+            close: "<|think:end|>",
+        };
+        let open = "<|im:start|>assistant<|im:content|><|think:start|>";
+        let closed = "<|im:start|>assistant<|im:content|><|think:start|><|think:end|>";
+        assert_eq!(ThinkEntry::of_prompt_with(open, SOLAR), ThinkEntry::Open);
+        assert_eq!(
+            ThinkEntry::of_prompt_with(closed, SOLAR),
+            ThinkEntry::Closed
+        );
+        assert_eq!(ThinkEntry::of_prompt(open), ThinkEntry::MayOpen);
+        assert_eq!(ThinkEntry::of_prompt(closed), ThinkEntry::MayOpen);
+
+        let mut s = ThinkSplit::for_prompt_with(open, SOLAR);
+        assert_eq!(s.push("why <think>").reasoning, "why <think>");
+        assert_eq!(s.push("x<|think:en").reasoning, "x");
+        let p = s.push("d|>ans");
+        assert_eq!(
+            (p.reasoning.as_str(), p.closed, p.content.as_str()),
+            ("", true, "ans")
+        );
+        assert_eq!(s.push("<|think:end|>").content, "<|think:end|>");
+
+        let mut s = ThinkSplit::for_prompt_with("<|im:start|>assistant<|im:content|>", SOLAR);
+        assert_eq!(s.push("<|think:sta"), Split::default());
+        let p = s.push("rt|>why<|think:end|>ok");
+        assert_eq!(
+            (p.reasoning.as_str(), p.opened, p.closed, p.content.as_str()),
+            ("why", true, true, "ok")
+        );
+
+        let mut s = ThinkSplit::for_prompt(open);
+        assert_eq!(s.push("a<|think:end|>b").content, "a<|think:end|>b");
     }
 
     /// The opening whitespace dropped is C's `isspace` over bytes, as

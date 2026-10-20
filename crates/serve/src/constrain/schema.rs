@@ -29,7 +29,7 @@ use super::program::{self, Alt, Constraint, Env, Part, Style};
 use super::vocab::Vocab;
 use crate::dsml::{ToolFormat, parses_tools};
 use crate::engine::Tokenizer;
-use crate::reasoning::THINK_CLOSE;
+use crate::reasoning::ThinkTags;
 
 /// Keywords the subset reads, besides the annotations.
 const READ: [&str; 7] = [
@@ -61,6 +61,9 @@ pub(crate) struct Ask<'a> {
     pub tok: &'a dyn Tokenizer,
     pub vocab: &'a Vocab,
     pub format: ToolFormat,
+    /// The tags of the model's think span: a prompt that left the span open
+    /// has it closed with `think.close` before the program.
+    pub think: ThinkTags,
 }
 
 fn refuse(path: &str, message: impl std::fmt::Display) -> Refusal {
@@ -688,7 +691,7 @@ pub(crate) fn request(
     let prog = program::compile(&parts, &env)?;
     Ok(Some(Constraint::new(
         prog,
-        ask.tok.encode(&format!("{THINK_CLOSE}\n\n")),
+        ask.tok.encode(&format!("{}\n\n", ask.think.close)),
         ask.vocab.stops().clone(),
     )))
 }

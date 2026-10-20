@@ -1902,6 +1902,61 @@ fn hw_qwen38_template_renders_as_jinja2() {
     }
 }
 
+/// Solar-Open2's chat template renders as jinja2 does: every case of the
+/// fixture through `/apply-template` equals its reference render byte for
+/// byte. The case jinja2 refuses for want of an object (tool-call `arguments`
+/// given as a JSON string, which the template walks with `|items`) renders as
+/// the same body with the string parsed does, and the two the template
+/// refuses itself (`raise_exception`) are refused naming its message. The
+/// cases reach `namespace(items=[])` read back as `tool_ns.items`, namespaces
+/// set inside macros, `|items` in the arguments' written order,
+/// `tojson | safe`, the tool results' reordering by call id, `reasoning` over
+/// `reasoning_content`, and the template's two knobs: `reasoning_effort`
+/// (top-level, `"none"` sent as `"low"`, and in `chat_template_kwargs`) and
+/// `think_render_option`.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_solar_template_renders_as_jinja2() {
+    let addr = common::start_templated(
+        Box::new(serve::MockEngine::new(4096)),
+        include_str!("fixtures/solar-chat-template.jinja"),
+    );
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/solar-renders.json")).expect("fixture JSON");
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert_eq!(cases.len(), 37, "{fixture}");
+    for case in cases {
+        let r = post(addr, "/apply-template", &case["body"]);
+        if let Some(error) = case["error"].as_str() {
+            if let Some(refused) = error.strip_prefix("TemplateError: ") {
+                assert_ne!(r.status, 200, "{}: {}", case["name"], r.body);
+                assert!(r.body.contains(refused), "{}: {}", case["name"], r.body);
+                continue;
+            }
+            assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+            let parsed = post(addr, "/apply-template", &arguments_parsed(&case["body"]));
+            assert_eq!(parsed.status, 200, "{}: {}", case["name"], parsed.body);
+            assert_eq!(
+                r.json()["prompt"],
+                parsed.json()["prompt"],
+                "{}",
+                case["name"]
+            );
+            assert!(
+                r.json()["prompt"]
+                    .as_str()
+                    .is_some_and(|p| p.contains("get_time")),
+                "{}: {}",
+                case["name"],
+                r.body
+            );
+            continue;
+        }
+        assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+        assert_eq!(r.json()["prompt"], case["prompt"], "{}", case["name"]);
+    }
+}
+
 /// Every id the vocabulary names as a stop ends a generation, not only its
 /// EOS: with GLM-5.3-Flash's three (the header's eos, eot and eom), a
 /// generation that emits any one of them stops there, reports `stopped_eos`,

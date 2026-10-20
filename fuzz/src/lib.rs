@@ -3,7 +3,7 @@
 use jinja::{ChatTemplate, Floats};
 use serde_json::{Value, json};
 use serve::dsml::{DsmlScan, Scanned};
-use serve::glmxml::{ArgTypes, GlmScan};
+use serve::glmxml::{ArgTypes, KvScan, KvSpelling};
 use serve::hermes::HermesScan;
 use serve::qwenxml::{ParamKinds, QwenScan};
 
@@ -16,7 +16,7 @@ pub enum Format {
 }
 
 enum Scan {
-    Glm(GlmScan),
+    Glm(KvScan),
     Qwen(QwenScan),
     Dsml(DsmlScan),
     Hermes(HermesScan),
@@ -25,7 +25,7 @@ enum Scan {
 impl Scan {
     fn new(format: Format, tools: Option<&Value>) -> Self {
         match format {
-            Format::Glm => Self::Glm(GlmScan::new(ArgTypes::of_tools(tools))),
+            Format::Glm => Self::Glm(KvScan::new(KvSpelling::Glm, ArgTypes::of_tools(tools))),
             Format::Qwen => Self::Qwen(QwenScan::new(ParamKinds::of_tools(tools))),
             Format::Dsml => Self::Dsml(DsmlScan::default()),
             Format::Hermes => Self::Hermes(HermesScan::default()),

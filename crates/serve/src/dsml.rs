@@ -1,7 +1,7 @@
 //! DSML tool calls for the V4.1 chat template, and the parser that turns one
 //! generation into `reasoning_content`, `content` and `tool_calls` under the
-//! tool-call markup its template teaches ([`ToolFormat`]: DSML here, GLM's in
-//! [`crate::glmxml`], Hermes' in [`crate::hermes`], Qwen3-Coder's in
+//! tool-call markup its template teaches ([`ToolFormat`]: DSML here, GLM's and
+//! Solar-Open's in [`crate::glmxml`], Hermes' in [`crate::hermes`], Qwen3-Coder's in
 //! [`crate::qwenxml`]).
 //!
 //! The markup is the template's own (its `tools_header` and the assistant
@@ -41,10 +41,10 @@ use serde_json::{Map, Value, json};
 
 use crate::callstream::{self, Args, CallPiece, Progress, Streamer};
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
-use crate::glmxml::{self, ArgTypes, GlmScan, GlmXmlError};
+use crate::glmxml::{self, ArgTypes, KvError, KvScan, KvSpelling};
 use crate::hermes::{self, HermesError, HermesScan};
 use crate::qwenxml::{self, ParamKinds, QwenScan, QwenXmlError};
-use crate::reasoning::{ReasoningFormat, Split, THINK_CLOSE, ThinkSplit, partial_suffix};
+use crate::reasoning::{ReasoningFormat, Split, ThinkSplit, ThinkTags, partial_suffix};
 
 /// The template's `dsml_token`.
 pub const DSML: &str = "｜DSML｜";
@@ -452,8 +452,11 @@ pub enum ToolFormat {
     /// DSML blocks (`<｜DSML｜tool_calls>`; V4.1's `<｜DSML｜ calls>`), in the template's
     /// [`Spelling`].
     Dsml(Spelling),
-    /// GLM's `<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value></tool_call>`.
-    GlmXml,
+    /// Key/value calls: GLM's `<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value>
+    /// </tool_call>`, Solar-Open's `<|tool_call:start|>NAME` and
+    /// `<|tool_arg:start|>…<|tool_arg:value|>…<|tool_arg:end|>` lines, in the template's
+    /// [`KvSpelling`].
+    KvMarkup(KvSpelling),
     /// Hermes' `<tool_call>` around one JSON object naming `name` and
     /// `arguments` (Qwen3's markup).
     Hermes,
@@ -466,8 +469,9 @@ pub enum ToolFormat {
 }
 
 impl ToolFormat {
-    /// The markup the template `source` spells for a call: GLM's when it
-    /// spells `<tool_call>`, `<arg_key>` and `<arg_value>`, Qwen3-Coder's
+    /// The markup the template `source` spells for a call: the key/value
+    /// markup's when it spells a [`KvSpelling`]'s call, name and value
+    /// openers (GLM's `<tool_call>`, `<arg_key>` and `<arg_value>`), Qwen3-Coder's
     /// when it spells `<tool_call>`, `<function=` and `<parameter=` (llama.cpp
     /// reads the three spellings), DSML's when it spells the DSML token (in the
     /// spelling [`Spelling::of_template`] reads), else
@@ -476,14 +480,13 @@ impl ToolFormat {
     /// ([`ToolFormat::of_chat_template`]).
     #[must_use]
     pub fn of_template(source: &str) -> ToolFormat {
-        let glm = [glmxml::CALL_OPEN, glmxml::KEY_OPEN, glmxml::VALUE_OPEN];
         let qwen = [
             qwenxml::CALL_OPEN,
             qwenxml::FUNCTION_OPEN,
             qwenxml::PARAM_OPEN,
         ];
-        if glm.iter().all(|tag| source.contains(tag)) {
-            ToolFormat::GlmXml
+        if let Some(spelling) = KvSpelling::of_template(source) {
+            ToolFormat::KvMarkup(spelling)
         } else if qwen.iter().all(|tag| source.contains(tag)) {
             ToolFormat::QwenXml
         } else if source.contains(DSML) {
@@ -494,7 +497,7 @@ impl ToolFormat {
     }
 
     /// The markup a chat template teaches, read the way llama.cpp's
-    /// autoparser reads it: the source's own spellings first (GLM's tags,
+    /// autoparser reads it: the source's own spellings first (the key/value tags,
     /// Qwen3-Coder's, the DSML token), then a rendered assistant call for a
     /// `<tool_call>` template the source cannot type by spelling — Hermes'
     /// when some rendered `<tool_call>`…`</tool_call>` holds a JSON body
@@ -565,8 +568,9 @@ fn hermes_markup(rendered: &str) -> bool {
 pub enum Tools {
     /// DSML's markup, in the given spelling.
     Dsml(Spelling),
-    /// GLM's markup, typing each argument by the request's tool schemas.
-    GlmXml(ArgTypes),
+    /// The key/value markup in the given spelling, typing each argument by the
+    /// request's tool schemas.
+    KvMarkup(KvSpelling, ArgTypes),
     /// Hermes' markup.
     Hermes,
     /// Qwen3-Coder's markup, typing each parameter by the request's tool
@@ -577,7 +581,7 @@ pub enum Tools {
 #[derive(Debug)]
 enum Scan {
     Dsml(DsmlScan),
-    Glm(GlmScan),
+    Kv(KvScan),
     Hermes(HermesScan),
     Qwen(QwenScan),
 }
@@ -586,9 +590,9 @@ enum Scan {
 /// and its refusal.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MarkupError {
-    /// The GLM scan's refusal.
+    /// The key/value scan's refusal.
     #[error("{0}")]
-    Glm(#[from] GlmXmlError),
+    Kv(#[from] KvError),
     /// The Hermes scan's refusal.
     #[error("{0}")]
     Hermes(#[from] HermesError),
@@ -604,11 +608,11 @@ pub enum MarkupError {
     Diverged { index: usize, name: String },
 }
 
-impl PartialEq<GlmXmlError> for MarkupError {
-    /// A GLM refusal equals its own form, so a caller holding the scan's
-    /// error and one GLM refusal compares them directly.
-    fn eq(&self, other: &GlmXmlError) -> bool {
-        matches!(self, MarkupError::Glm(e) if e == other)
+impl PartialEq<KvError> for MarkupError {
+    /// A key/value refusal equals its own form, so a caller holding the scan's
+    /// error and one key/value refusal compares them directly.
+    fn eq(&self, other: &KvError) -> bool {
+        matches!(self, MarkupError::Kv(e) if e == other)
     }
 }
 
@@ -621,6 +625,9 @@ impl PartialEq<GlmXmlError> for MarkupError {
 #[derive(Debug)]
 pub struct ChatParser {
     format: ReasoningFormat,
+    /// The tags the span is split on, and that [`ReasoningFormat::None`]
+    /// writes back around the reasoning.
+    tags: ThinkTags,
     /// `None` when neither a split nor a scan is asked for.
     think: Option<ThinkSplit>,
     scan: Option<Scan>,
@@ -639,17 +646,29 @@ impl ChatParser {
     }
 
     /// A parser for a generation that follows `prompt`, scanning for `tools`'
-    /// markup when it is `Some`.
+    /// markup when it is `Some`, on `<think>` tags.
     #[must_use]
     pub fn with_tools(prompt: &str, format: ReasoningFormat, tools: Option<Tools>) -> Self {
+        ChatParser::with_tags(prompt, format, tools, ThinkTags::THINK)
+    }
+
+    /// [`ChatParser::with_tools`] on the span `tags` name.
+    #[must_use]
+    pub fn with_tags(
+        prompt: &str,
+        format: ReasoningFormat,
+        tools: Option<Tools>,
+        tags: ThinkTags,
+    ) -> Self {
         let split = format == ReasoningFormat::Deepseek || tools.is_some();
         // Qwen3-Coder's call ends an open span without `</think>`, as
         // llama.cpp's parser for the markup reads it.
         let call_ends_span = matches!(tools, Some(Tools::QwenXml(_)));
         ChatParser {
             format,
+            tags,
             think: split.then(|| {
-                let mut t = ThinkSplit::for_prompt(prompt);
+                let mut t = ThinkSplit::for_prompt_with(prompt, tags);
                 if format == ReasoningFormat::Deepseek {
                     t = t.trimming_after_opened();
                 }
@@ -661,7 +680,7 @@ impl ChatParser {
             }),
             scan: tools.map(|t| match t {
                 Tools::Dsml(spelling) => Scan::Dsml(DsmlScan::new(spelling)),
-                Tools::GlmXml(types) => Scan::Glm(GlmScan::new(types)),
+                Tools::KvMarkup(spelling, types) => Scan::Kv(KvScan::new(spelling, types)),
                 Tools::Hermes => Scan::Hermes(HermesScan::default()),
                 Tools::QwenXml(kinds) => Scan::Qwen(QwenScan::new(kinds)),
             }),
@@ -720,12 +739,12 @@ impl ChatParser {
 
     /// Feeds generated text; returns what may be sent now. For a parser with
     /// no scan or the DSML scan, which cannot fail unless it streams its calls
-    /// ([`ChatParser::streaming_calls`]); a GLM, Hermes or Qwen parser's caller
+    /// ([`ChatParser::streaming_calls`]); a key/value, Hermes or Qwen parser's caller
     /// uses [`ChatParser::try_push`].
     ///
     /// # Panics
     ///
-    /// On markup a GLM, Hermes or Qwen scan refuses, or a streamed call the
+    /// On markup a key/value, Hermes or Qwen scan refuses, or a streamed call the
     /// markup ends otherwise, naming it.
     pub fn push(&mut self, text: &str) -> Message {
         self.try_push(text)
@@ -737,7 +756,7 @@ impl ChatParser {
     ///
     /// # Panics
     ///
-    /// On markup a GLM, Hermes or Qwen scan refuses, or a streamed call the
+    /// On markup a key/value, Hermes or Qwen scan refuses, or a streamed call the
     /// markup ends otherwise, naming it.
     pub fn finish(&mut self) -> Message {
         self.try_finish()
@@ -757,7 +776,7 @@ impl ChatParser {
         let scanned = match &mut self.scan {
             None => None,
             Some(Scan::Dsml(d)) => Some(d.push(&split.content)),
-            Some(Scan::Glm(g)) => Some(g.push(&split.content)?),
+            Some(Scan::Kv(k)) => Some(k.push(&split.content)?),
             Some(Scan::Hermes(h)) => Some(h.push(&split.content)?),
             Some(Scan::Qwen(q)) => Some(q.push(&split.content)?),
         };
@@ -777,7 +796,7 @@ impl ChatParser {
         let scanned = match &mut self.scan {
             None => None,
             Some(Scan::Dsml(d)) => Some(d.finish()),
-            Some(Scan::Glm(g)) => Some(g.finish()?),
+            Some(Scan::Kv(k)) => Some(k.finish()?),
             Some(Scan::Hermes(h)) => Some(h.finish()?),
             Some(Scan::Qwen(q)) => Some(q.finish()?),
         };
@@ -806,7 +825,7 @@ impl ChatParser {
             ReasoningFormat::None => {
                 d.content = split.reasoning;
                 if split.closed {
-                    d.content.push_str(THINK_CLOSE);
+                    d.content.push_str(self.tags.close);
                 }
             }
         }
@@ -829,7 +848,7 @@ impl ToolFormat {
         match self {
             ToolFormat::Hermes => hermes::call_parts(funs),
             ToolFormat::QwenXml => qwenxml::call_parts(funs),
-            ToolFormat::GlmXml => glmxml::call_parts(funs),
+            ToolFormat::KvMarkup(spelling) => glmxml::call_parts(spelling, funs),
             ToolFormat::Dsml(spelling) => call_parts(spelling, funs),
             ToolFormat::Unparsed => Err(Refusal {
                 message: "the chat template's tool-call markup has no inverse in this server: \

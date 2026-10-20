@@ -24,11 +24,7 @@ use crate::placement::{ModelTensors, PlacementError};
 pub fn read(split: &Split) -> Result<Read, PlacementError> {
     let hp = Hparams::read(split)?;
     let tensors = roles::classify(split, &hp)?;
-    let chat = chat_of(
-        split,
-        Some(ToolFormat::Dsml),
-        Some(ReasoningFormat::ThinkSpan),
-    )?;
+    let chat = chat_of(split, Some(ToolFormat::Dsml), Some(ReasoningFormat::THINK))?;
     let spec = spec_of(&hp, &tensors, chat)?;
     Ok(Read {
         spec,

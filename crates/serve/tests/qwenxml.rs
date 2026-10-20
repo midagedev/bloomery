@@ -27,6 +27,7 @@ mod common;
 use common::{post, start_templated};
 use serde_json::{Value, json};
 use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, ToolFormat, Tools};
+use serve::glmxml::KvSpelling;
 use serve::qwenxml::{ParamKinds, QwenXmlError};
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
@@ -537,7 +538,7 @@ fn hw_qwen_parse_does_not_depend_on_chunking() {
 fn seat_format(name: &str) -> ToolFormat {
     match name {
         "v41" => ToolFormat::Dsml(Spelling::Joined),
-        "glm5" => ToolFormat::GlmXml,
+        "glm5" => ToolFormat::KvMarkup(KvSpelling::Glm),
         "qwen3" => ToolFormat::Hermes,
         "qwen36" | "qwen38" | "nemotron" | "nemotron-bolt" => ToolFormat::QwenXml,
         other => panic!("{other} is not in the seat table"),
@@ -576,7 +577,7 @@ fn hw_detection_follows_the_spelling() {
         ToolFormat::of_template(
             "<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value><function=F><parameter=P>"
         ),
-        ToolFormat::GlmXml
+        ToolFormat::KvMarkup(KvSpelling::Glm)
     );
 }
 

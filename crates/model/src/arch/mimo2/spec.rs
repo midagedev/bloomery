@@ -28,7 +28,7 @@ pub const TOOLS: Option<ToolFormat> = Some(ToolFormat::QwenXml);
 pub fn read(split: &Split) -> Result<Read, PlacementError> {
     let hp = Hparams::read(split)?;
     let tensors = roles::classify(split, &hp)?;
-    let chat = chat_of(split, TOOLS, Some(ReasoningFormat::ThinkSpan))?;
+    let chat = chat_of(split, TOOLS, Some(ReasoningFormat::THINK))?;
     let spec = spec_of(&hp, &tensors, chat)?;
     Ok(Read {
         spec,
@@ -261,7 +261,7 @@ mod tests {
         let mut hp = super::super::hparams::Hparams::read(&split).expect("the header reads");
         hp.dense_ff = None;
         let tensors = super::roles::classify(&split, &hp).expect("the tensors classify");
-        let chat = crate::arch::chat_of(&split, super::TOOLS, Some(ReasoningFormat::ThinkSpan))
+        let chat = crate::arch::chat_of(&split, super::TOOLS, Some(ReasoningFormat::THINK))
             .expect("the chat surface reads");
         let err = super::spec_of(&hp, &tensors, chat)
             .expect_err("a dense layer without feed_forward_length is refused");

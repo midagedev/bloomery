@@ -405,7 +405,9 @@ const Q3_VIEW: &[&str] = &[
     "layers 48 mtp 0",
     "hc None",
     "engram None",
-    "chat pre qwen2 template bytes 4040 tools Some(Dsml) reasoning Some(ThinkSpan)",
+    // PIN(2026-10-20): the reasoning field prints its tags (`ReasoningFormat::ThinkSpan` carries
+    // them); the values are the same.
+    "chat pre qwen2 template bytes 4040 tools Some(Dsml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })",
     "[0-47] gqa 32/4 x 128 rope Neox 128 base 10000000 yarn - qk_norm true out_gate false || moe 128/8 ff 768 swiglu None Softmax bias false norm true x1 hash false || plain",
 ];
 

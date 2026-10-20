@@ -1,0 +1,1129 @@
+{
+  "template": "solar-chat-template.jinja",
+  "reference": "jinja2 3.1.6 (Python 3.14.7), the HF chat-template environment of ik_llama.cpp tests/test-jinja.cpp (SandboxedEnvironment with trim_blocks, lstrip_blocks and the loopcontrols extension; tojson = json.dumps with ensure_ascii=False, indent=None, separators=None, sort_keys=False as defaults; globals strftime_now and raise_exception); each case rendered with the variables bloomery-serve's /apply-template passes (messages with a content array flattened to its text parts, add_generation_prompt default true, the mock's bos_token and eos_token, tools and reasoning_effort when not null, chat_template_kwargs merged; reasoning_effort none sent as low); a body keeps its keys in written order; a case jinja2 refused carries its error in place of a prompt. Script: crates/serve/tests/fixtures/render_solar.py, run as `python3 render_solar.py solar-chat-template.jinja > solar-renders.json`",
+  "cases": [
+    {
+      "name": "system and user",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are terse."
+          },
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## System Prompt\n\nYou are terse.<|im:end|>\n<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "a user turn alone",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ]
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "two system messages",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are terse."
+          },
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "system",
+            "content": "Answer in Korean."
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## System Prompt\n\nYou are terse.\n\nAnswer in Korean.<|im:end|>\n<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "content parts flattened",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "Be brief."
+              },
+              {
+                "type": "text",
+                "text": "No lists."
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "서울 날씨? ☃ \"quoted\" <b>"
+              }
+            ]
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## System Prompt\n\nBe brief.\nNo lists.<|im:end|>\n<|im:start|>user<|im:content|>서울 날씨? ☃ \"quoted\" <b><|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "three turns, past reasoning dropped",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello!",
+            "reasoning_content": "The user greets."
+          },
+          {
+            "role": "user",
+            "content": "Again?"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello again.",
+            "reasoning_content": "The user repeats."
+          },
+          {
+            "role": "user",
+            "content": "One more."
+          }
+        ]
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>Hello!<|im:end|>\n<|im:start|>user<|im:content|>Again?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>Hello again.<|im:end|>\n<|im:start|>user<|im:content|>One more.<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "three turns, interleaved named",
+      "body": {
+        "chat_template_kwargs": {
+          "think_render_option": "interleaved"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello!",
+            "reasoning_content": "The user greets."
+          },
+          {
+            "role": "user",
+            "content": "Again?"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello again.",
+            "reasoning_content": "The user repeats."
+          },
+          {
+            "role": "user",
+            "content": "One more."
+          }
+        ]
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>Hello!<|im:end|>\n<|im:start|>user<|im:content|>Again?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>Hello again.<|im:end|>\n<|im:start|>user<|im:content|>One more.<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "three turns, preserved",
+      "body": {
+        "chat_template_kwargs": {
+          "think_render_option": "preserved"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello!",
+            "reasoning_content": "The user greets."
+          },
+          {
+            "role": "user",
+            "content": "Again?"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello again.",
+            "reasoning_content": "The user repeats."
+          },
+          {
+            "role": "user",
+            "content": "One more."
+          }
+        ]
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>The user greets.<|think:end|>Hello!<|im:end|>\n<|im:start|>user<|im:content|>Again?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>The user repeats.<|think:end|>Hello again.<|im:end|>\n<|im:start|>user<|im:content|>One more.<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "an unknown think_render_option renders no span",
+      "body": {
+        "chat_template_kwargs": {
+          "think_render_option": "off"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello!",
+            "reasoning_content": "The user greets."
+          },
+          {
+            "role": "user",
+            "content": "Again?"
+          },
+          {
+            "role": "assistant",
+            "content": "Hello again.",
+            "reasoning_content": "The user repeats."
+          },
+          {
+            "role": "user",
+            "content": "One more."
+          }
+        ]
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|>Hello!<|im:end|>\n<|im:start|>user<|im:content|>Again?<|im:end|>\n<|im:start|>assistant<|im:content|>Hello again.<|im:end|>\n<|im:start|>user<|im:content|>One more.<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "reasoning after the last user turn is kept",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "2+2?"
+          },
+          {
+            "role": "assistant",
+            "content": "4",
+            "reasoning_content": "Add them."
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im:start|>user<|im:content|>2+2?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>Add them.<|think:end|>4<|im:end|>\n"
+    },
+    {
+      "name": "reasoning field wins over reasoning_content",
+      "body": {
+        "chat_template_kwargs": {
+          "think_render_option": "preserved"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "2+2?"
+          },
+          {
+            "role": "assistant",
+            "content": "4",
+            "reasoning": "first",
+            "reasoning_content": "second"
+          },
+          {
+            "role": "user",
+            "content": "3+3?"
+          }
+        ]
+      },
+      "prompt": "<|im:start|>user<|im:content|>2+2?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>first<|think:end|>4<|im:end|>\n<|im:start|>user<|im:content|>3+3?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "empty and null reasoning, preserved",
+      "body": {
+        "chat_template_kwargs": {
+          "think_render_option": "preserved"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "a"
+          },
+          {
+            "role": "assistant",
+            "content": "b",
+            "reasoning_content": ""
+          },
+          {
+            "role": "user",
+            "content": "c"
+          },
+          {
+            "role": "assistant",
+            "content": "d",
+            "reasoning_content": null
+          },
+          {
+            "role": "user",
+            "content": "e"
+          },
+          {
+            "role": "assistant",
+            "content": "f"
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im:start|>user<|im:content|>a<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>b<|im:end|>\n<|im:start|>user<|im:content|>c<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>d<|im:end|>\n<|im:start|>user<|im:content|>e<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>f<|im:end|>\n"
+    },
+    {
+      "name": "assistant first, no user turn",
+      "body": {
+        "messages": [
+          {
+            "role": "assistant",
+            "content": "Hello",
+            "reasoning_content": "Greet."
+          },
+          {
+            "role": "assistant",
+            "content": "Again",
+            "reasoning_content": "Repeat."
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im:start|>assistant<|im:content|><|think:start|>Greet.<|think:end|>Hello<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>Repeat.<|think:end|>Again<|im:end|>\n"
+    },
+    {
+      "name": "no generation prompt",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n"
+    },
+    {
+      "name": "reasoning_effort low",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "low"
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>"
+    },
+    {
+      "name": "reasoning_effort minimal",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "minimal"
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>"
+    },
+    {
+      "name": "reasoning_effort medium",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "medium"
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "reasoning_effort high",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "high"
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "reasoning_effort xhigh",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "xhigh"
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "reasoning_effort max",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "max"
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>"
+    },
+    {
+      "name": "reasoning_effort none is sent as low",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "reasoning_effort": "none"
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>"
+    },
+    {
+      "name": "kwargs reasoning_effort medium",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "chat_template_kwargs": {
+          "reasoning_effort": "medium"
+        }
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "kwargs reasoning_effort low",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "chat_template_kwargs": {
+          "reasoning_effort": "low"
+        }
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>"
+    },
+    {
+      "name": "kwargs reasoning_effort unknown",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "chat_template_kwargs": {
+          "reasoning_effort": "turbo"
+        }
+      },
+      "prompt": "<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>"
+    },
+    {
+      "name": "tools and a user turn",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Weather in Seoul?"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "City name, e.g. Seoul."
+                  },
+                  "days": {
+                    "type": "integer",
+                    "description": "How many days ahead."
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## Tools\n- You may invoke one or more tools to assist with the user's query.\n\n### Available Tools\n<|tool:start|>{\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name, e.g. Seoul.\"}, \"days\": {\"type\": \"integer\", \"description\": \"How many days ahead.\"}}, \"required\": [\"location\"]}}<|tool:end|>\n<|tool:start|>{\"name\": \"get_time\", \"description\": \"The time now.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}<|tool:end|>\n\n### Tool Call Instruction\n- If using a tool, any reasoning must strictly precede the call. Do not append any text after the tool call.\n- If no tool is required, answer directly from your knowledge without ever mentioning the availability or absence of tools.\n- Each tool call MUST use this following format: <|tool_call:start|>{example-tool-name}\n<|tool_arg:start|>{example-key-name-1}<|tool_arg:value|>{example-value-1}<|tool_arg:end|>\n<|tool_arg:start|>{example-key-name-2}<|tool_arg:value|>{example-value-2}<|tool_arg:end|>\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>user<|im:content|>Weather in Seoul?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "system, tools and a user turn",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are terse."
+          },
+          {
+            "role": "user",
+            "content": "Weather in Seoul?"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "City name, e.g. Seoul."
+                  },
+                  "days": {
+                    "type": "integer",
+                    "description": "How many days ahead."
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## System Prompt\n\nYou are terse.\n\n## Tools\n- You may invoke one or more tools to assist with the user's query.\n\n### Available Tools\n<|tool:start|>{\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name, e.g. Seoul.\"}, \"days\": {\"type\": \"integer\", \"description\": \"How many days ahead.\"}}, \"required\": [\"location\"]}}<|tool:end|>\n\n### Tool Call Instruction\n- If using a tool, any reasoning must strictly precede the call. Do not append any text after the tool call.\n- If no tool is required, answer directly from your knowledge without ever mentioning the availability or absence of tools.\n- Each tool call MUST use this following format: <|tool_call:start|>{example-tool-name}\n<|tool_arg:start|>{example-key-name-1}<|tool_arg:value|>{example-value-1}<|tool_arg:end|>\n<|tool_arg:start|>{example-key-name-2}<|tool_arg:value|>{example-value-2}<|tool_arg:end|>\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>user<|im:content|>Weather in Seoul?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "tools and a json_schema response_format",
+      "body": {
+        "chat_template_kwargs": {
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "name": "answer",
+              "strict": true,
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "temp": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              }
+            }
+          }
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "Weather in Seoul?"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "City name, e.g. Seoul."
+                  },
+                  "days": {
+                    "type": "integer",
+                    "description": "How many days ahead."
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## Tools\n- You may invoke one or more tools to assist with the user's query.\n\n### Available Tools\n<|tool:start|>{\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name, e.g. Seoul.\"}, \"days\": {\"type\": \"integer\", \"description\": \"How many days ahead.\"}}, \"required\": [\"location\"]}}<|tool:end|>\n\n### Tool Call Instruction\n- If using a tool, any reasoning must strictly precede the call. Do not append any text after the tool call.\n- If no tool is required, answer directly from your knowledge without ever mentioning the availability or absence of tools.\n- Each tool call MUST use this following format: <|tool_call:start|>{example-tool-name}\n<|tool_arg:start|>{example-key-name-1}<|tool_arg:value|>{example-value-1}<|tool_arg:end|>\n<|tool_arg:start|>{example-key-name-2}<|tool_arg:value|>{example-value-2}<|tool_arg:end|>\n<|tool_call:end|>\n\n\n## Output Format Constraint\n\n- Your final response should follow the JSON schema:\n```json\n{\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"temp\": {\"type\": \"number\"}}, \"required\": [\"city\"]}\n```\n- Please ensure your answers adhere to this format and do not contain any unnecessary text.<|im:end|>\n<|im:start|>user<|im:content|>Weather in Seoul?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "a json_object response_format alone",
+      "body": {
+        "chat_template_kwargs": {
+          "response_format": {
+            "type": "json_object"
+          }
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## Output Format Constraint\n\n- Your final response must be a valid JSON object.\n- Do not include any text outside the JSON object.<|im:end|>\n<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "a json_schema response_format alone",
+      "body": {
+        "chat_template_kwargs": {
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "name": "answer",
+              "strict": true,
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "temp": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              }
+            }
+          }
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## Output Format Constraint\n\n- Your final response should follow the JSON schema:\n```json\n{\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"temp\": {\"type\": \"number\"}}, \"required\": [\"city\"]}\n```\n- Please ensure your answers adhere to this format and do not contain any unnecessary text.<|im:end|>\n<|im:start|>user<|im:content|>Hi<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "two calls, their results in the other order",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Weather and time in Seoul?"
+          },
+          {
+            "role": "assistant",
+            "content": "Checking both.",
+            "reasoning_content": "Two lookups.",
+            "tool_calls": [
+              {
+                "id": "call_a",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": {
+                    "location": "Seoul",
+                    "days": 3
+                  }
+                }
+              },
+              {
+                "id": "call_b",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_b",
+            "content": "12:00"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_a",
+            "content": "{\"temp\": 21}"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "City name, e.g. Seoul."
+                  },
+                  "days": {
+                    "type": "integer",
+                    "description": "How many days ahead."
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## Tools\n- You may invoke one or more tools to assist with the user's query.\n\n### Available Tools\n<|tool:start|>{\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name, e.g. Seoul.\"}, \"days\": {\"type\": \"integer\", \"description\": \"How many days ahead.\"}}, \"required\": [\"location\"]}}<|tool:end|>\n<|tool:start|>{\"name\": \"get_time\", \"description\": \"The time now.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}<|tool:end|>\n\n### Tool Call Instruction\n- If using a tool, any reasoning must strictly precede the call. Do not append any text after the tool call.\n- If no tool is required, answer directly from your knowledge without ever mentioning the availability or absence of tools.\n- Each tool call MUST use this following format: <|tool_call:start|>{example-tool-name}\n<|tool_arg:start|>{example-key-name-1}<|tool_arg:value|>{example-value-1}<|tool_arg:end|>\n<|tool_arg:start|>{example-key-name-2}<|tool_arg:value|>{example-value-2}<|tool_arg:end|>\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>user<|im:content|>Weather and time in Seoul?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>Two lookups.<|think:end|>Checking both.<|tool_call:start|>get_weather\n<|tool_arg:start|>location<|tool_arg:value|>Seoul<|tool_arg:end|>\n<|tool_arg:start|>days<|tool_arg:value|>3<|tool_arg:end|>\n<|tool_call:end|>\n<|tool_call:start|>get_time\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>tool<|im:content|><|tool_response:start|>{\"temp\": 21}<|tool_response:end|>\n<|tool_response:start|>12:00<|tool_response:end|>\n<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "a tool result with no matching call",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Time?"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_a",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_zzz",
+            "content": "orphan"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_a",
+            "content": "12:00"
+          },
+          {
+            "role": "user",
+            "content": "Thanks."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## Tools\n- You may invoke one or more tools to assist with the user's query.\n\n### Available Tools\n<|tool:start|>{\"name\": \"get_time\", \"description\": \"The time now.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}<|tool:end|>\n\n### Tool Call Instruction\n- If using a tool, any reasoning must strictly precede the call. Do not append any text after the tool call.\n- If no tool is required, answer directly from your knowledge without ever mentioning the availability or absence of tools.\n- Each tool call MUST use this following format: <|tool_call:start|>{example-tool-name}\n<|tool_arg:start|>{example-key-name-1}<|tool_arg:value|>{example-value-1}<|tool_arg:end|>\n<|tool_arg:start|>{example-key-name-2}<|tool_arg:value|>{example-value-2}<|tool_arg:end|>\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>user<|im:content|>Time?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|><|tool_call:start|>get_time\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>tool<|im:content|><|tool_response:start|>12:00<|tool_response:end|>\n<|tool_response:start|>orphan<|tool_response:end|>\n<|im:end|>\n<|im:start|>user<|im:content|>Thanks.<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "tool results after no assistant call",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Time?"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "x1",
+            "content": "one"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "x2",
+            "content": "two"
+          },
+          {
+            "role": "user",
+            "content": "Thanks."
+          }
+        ]
+      },
+      "prompt": "<|im:start|>user<|im:content|>Time?<|im:end|>\n<|im:start|>tool<|im:content|><|tool_response:start|>one<|tool_response:end|>\n<|tool_response:start|>two<|tool_response:end|>\n<|im:end|>\n<|im:start|>user<|im:content|>Thanks.<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "two tool blocks",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Go."
+          },
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "c1",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": "12:00"
+          },
+          {
+            "role": "assistant",
+            "content": "ok",
+            "tool_calls": [
+              {
+                "id": "c2",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              },
+              {
+                "id": "c3",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "c3",
+            "content": "13:00"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "c2",
+            "content": "12:30"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ]
+      },
+      "prompt": "<|im:start|>system<|im:content|>## Tools\n- You may invoke one or more tools to assist with the user's query.\n\n### Available Tools\n<|tool:start|>{\"name\": \"get_time\", \"description\": \"The time now.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}<|tool:end|>\n\n### Tool Call Instruction\n- If using a tool, any reasoning must strictly precede the call. Do not append any text after the tool call.\n- If no tool is required, answer directly from your knowledge without ever mentioning the availability or absence of tools.\n- Each tool call MUST use this following format: <|tool_call:start|>{example-tool-name}\n<|tool_arg:start|>{example-key-name-1}<|tool_arg:value|>{example-value-1}<|tool_arg:end|>\n<|tool_arg:start|>{example-key-name-2}<|tool_arg:value|>{example-value-2}<|tool_arg:end|>\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>user<|im:content|>Go.<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|><|tool_call:start|>get_time\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>tool<|im:content|><|tool_response:start|>12:00<|tool_response:end|>\n<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|>ok<|tool_call:start|>get_time\n<|tool_call:end|>\n<|tool_call:start|>get_time\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>tool<|im:content|><|tool_response:start|>12:30<|tool_response:end|>\n<|tool_response:start|>13:00<|tool_response:end|>\n<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|>"
+    },
+    {
+      "name": "arguments of every kind, in written order",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Note it."
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_d",
+                "type": "function",
+                "function": {
+                  "name": "save_note",
+                  "arguments": {
+                    "text": "a<b & \"c\"\n서울 ☃",
+                    "filter": {
+                      "q": "서울 ☃",
+                      "n": [
+                        1,
+                        2.5,
+                        null,
+                        true
+                      ]
+                    },
+                    "count": 3,
+                    "ratio": 0.5,
+                    "flag": false,
+                    "nothing": null,
+                    "list": [
+                      "x",
+                      {
+                        "y": 1
+                      }
+                    ],
+                    "alpha": "bare"
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "save_note",
+              "description": "Save a note.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "text": {
+                    "type": "string"
+                  },
+                  "filter": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im:start|>system<|im:content|>## Tools\n- You may invoke one or more tools to assist with the user's query.\n\n### Available Tools\n<|tool:start|>{\"name\": \"save_note\", \"description\": \"Save a note.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": \"string\"}, \"filter\": {\"type\": \"object\"}}}}<|tool:end|>\n\n### Tool Call Instruction\n- If using a tool, any reasoning must strictly precede the call. Do not append any text after the tool call.\n- If no tool is required, answer directly from your knowledge without ever mentioning the availability or absence of tools.\n- Each tool call MUST use this following format: <|tool_call:start|>{example-tool-name}\n<|tool_arg:start|>{example-key-name-1}<|tool_arg:value|>{example-value-1}<|tool_arg:end|>\n<|tool_arg:start|>{example-key-name-2}<|tool_arg:value|>{example-value-2}<|tool_arg:end|>\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>user<|im:content|>Note it.<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|><|tool_call:start|>save_note\n<|tool_arg:start|>text<|tool_arg:value|>a<b & \"c\"\n서울 ☃<|tool_arg:end|>\n<|tool_arg:start|>filter<|tool_arg:value|>{\"q\": \"서울 ☃\", \"n\": [1, 2.5, null, true]}<|tool_arg:end|>\n<|tool_arg:start|>count<|tool_arg:value|>3<|tool_arg:end|>\n<|tool_arg:start|>ratio<|tool_arg:value|>0.5<|tool_arg:end|>\n<|tool_arg:start|>flag<|tool_arg:value|>false<|tool_arg:end|>\n<|tool_arg:start|>nothing<|tool_arg:value|>null<|tool_arg:end|>\n<|tool_arg:start|>list<|tool_arg:value|>[\"x\", {\"y\": 1}]<|tool_arg:end|>\n<|tool_arg:start|>alpha<|tool_arg:value|>bare<|tool_arg:end|>\n<|tool_call:end|>\n<|im:end|>\n"
+    },
+    {
+      "name": "a call with no arguments",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Time?"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "c1",
+                "type": "function",
+                "function": {
+                  "name": "get_time"
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im:start|>system<|im:content|>## Tools\n- You may invoke one or more tools to assist with the user's query.\n\n### Available Tools\n<|tool:start|>{\"name\": \"get_time\", \"description\": \"The time now.\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}<|tool:end|>\n\n### Tool Call Instruction\n- If using a tool, any reasoning must strictly precede the call. Do not append any text after the tool call.\n- If no tool is required, answer directly from your knowledge without ever mentioning the availability or absence of tools.\n- Each tool call MUST use this following format: <|tool_call:start|>{example-tool-name}\n<|tool_arg:start|>{example-key-name-1}<|tool_arg:value|>{example-value-1}<|tool_arg:end|>\n<|tool_arg:start|>{example-key-name-2}<|tool_arg:value|>{example-value-2}<|tool_arg:end|>\n<|tool_call:end|>\n<|im:end|>\n<|im:start|>user<|im:content|>Time?<|im:end|>\n<|im:start|>assistant<|im:content|><|think:start|><|think:end|><|tool_call:start|>get_time\n<|tool_call:end|>\n<|im:end|>\n"
+    },
+    {
+      "name": "string arguments",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Time?"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_e",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ]
+      },
+      "error": "TypeError: Can only get item pairs from a mapping."
+    },
+    {
+      "name": "a tool result without an id",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Time?"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_c",
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "12:00"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ]
+      },
+      "error": "TemplateError: tool message is missing required 'tool_call_id' field"
+    },
+    {
+      "name": "a call without an id",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Time?"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_time",
+                  "arguments": {}
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "description": "The time now.",
+              "parameters": {
+                "type": "object",
+                "properties": {}
+              }
+            }
+          }
+        ]
+      },
+      "error": "TemplateError: assistant tool_call is missing required 'id' field"
+    }
+  ]
+}

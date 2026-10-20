@@ -1,33 +1,38 @@
-//! GLM tool calls: the markup the GLM-5.3-Flash chat template teaches (its
-//! `tools` header and the assistant `tool_calls` branch), parsed out of the
-//! text after the think span.
+//! Key/value tool calls: the markup the GLM-5.3-Flash and Solar-Open2 chat
+//! templates teach (their `tools` header and the assistant `tool_calls`
+//! branch), parsed out of the text after the think span. Both spell one
+//! grammar, each under its own markers ([`KvSpelling`]):
 //!
 //! ```text
-//! <tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>…</tool_call>
+//! CALL_OPEN NAME (KEY_OPEN KEY KEY_CLOSE [VALUE_OPEN] VALUE VALUE_CLOSE)* CALL_CLOSE
+//!
+//! GLM    <tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>…</tool_call>
+//! Solar  <|tool_call:start|>NAME\n<|tool_arg:start|>KEY<|tool_arg:value|>VALUE<|tool_arg:end|>\n…<|tool_call:end|>
 //! ```
 //!
-//! The template writes a value `v | tojson(ensure_ascii=False) if v is not
-//! string else v`: a string raw, anything else as JSON. The request's tool
+//! Solar's key close is also what opens its value. The templates write a value
+//! as JSON unless it is a string, which they write raw. The request's tool
 //! schema says which a value is: an argument whose schema `type` is
 //! `"string"` is the raw text, byte for byte; one whose `type` names other
 //! types only must be JSON; for any other argument (no schema, no `type`, or
 //! a `type` list with `"string"` among others) a value that parses as JSON is
-//! that JSON and anything else is the raw text, the only thing the template
-//! writes unquoted. Whitespace between tags is skipped (GLM-4.6's template
-//! writes newlines there); a value is everything up to its `</arg_value>`,
-//! a `<` included.
+//! that JSON and anything else is the raw text, the only thing the templates
+//! write unquoted. Whitespace between tags is skipped (GLM-4.6's template
+//! writes newlines there, Solar's one after the name and after each
+//! argument); a value is everything up to its close, a `<` included.
 //!
-//! A call is emitted when its `</tool_call>` arrives; the arguments become a
-//! JSON object in argument order, serialized to a string. Text before, between
-//! and after calls is content. A call that does not follow the markup (no
-//! name, text where a tag belongs, `<arg_value>` without its `<arg_key>`, a
-//! key given twice, a value its schema types as JSON that is not JSON) and a
-//! call still open when the stream ends are a [`GlmXmlError`], never content
-//! and never dropped. The call a scan has opened and not closed is reported as
-//! it is read ([`Scanned::open`]): its name once a tag follows it, and the
-//! arguments so far, a prefix of the arguments the call closes with, the text
-//! of a `"string"` argument as it arrives. Every decision depends on the text
-//! only, never on how it was cut into pieces.
+//! A call is emitted when its close arrives; the arguments become a JSON
+//! object in argument order, serialized to a string. Text before, between and
+//! after calls is content, except the line feed a spelling writes after a
+//! call. A call that does not follow the markup (no name, text where a tag
+//! belongs, a value without its key, a key given twice, a value its schema
+//! types as JSON that is not JSON) and a call still open when the stream ends
+//! are a [`KvError`], never content and never dropped. The call a scan has
+//! opened and not closed is reported as it is read ([`Scanned::open`]): its
+//! name once a tag follows it, and the arguments so far, a prefix of the
+//! arguments the call closes with, the text of a `"string"` argument as it
+//! arrives. Every decision depends on the text only, never on how it was cut
+//! into pieces.
 
 use std::collections::HashMap;
 
@@ -38,18 +43,117 @@ use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
 
-/// Opens a call.
-pub const CALL_OPEN: &str = "<tool_call>";
-/// Closes a call.
-pub const CALL_CLOSE: &str = "</tool_call>";
-/// Opens an argument's name.
-pub const KEY_OPEN: &str = "<arg_key>";
-/// Closes an argument's name.
-pub const KEY_CLOSE: &str = "</arg_key>";
-/// Opens an argument's value.
-pub const VALUE_OPEN: &str = "<arg_value>";
-/// Closes an argument's value.
-pub const VALUE_CLOSE: &str = "</arg_value>";
+/// How a template spells the key/value markup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvSpelling {
+    /// GLM's: `<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value></tool_call>`.
+    Glm,
+    /// Solar-Open's: `<|tool_call:start|>NAME` and a line feed, then
+    /// `<|tool_arg:start|>KEY<|tool_arg:value|>VALUE<|tool_arg:end|>` and a line
+    /// feed per argument, then `<|tool_call:end|>`.
+    Solar,
+}
+
+/// The markers of one [`KvSpelling`].
+#[derive(Debug)]
+struct Markers {
+    /// The family a refusal names.
+    family: &'static str,
+    /// Opens a call.
+    call_open: &'static str,
+    /// Closes a call.
+    call_close: &'static str,
+    /// Opens an argument's name.
+    key_open: &'static str,
+    /// Closes an argument's name.
+    key_close: &'static str,
+    /// Opens an argument's value after the name's close; empty when the
+    /// name's close opens it.
+    value_open: &'static str,
+    /// Closes an argument's value.
+    value_close: &'static str,
+    /// Whether the template writes a line feed after the name, after each
+    /// argument and after the call.
+    newline: bool,
+}
+
+static GLM: Markers = Markers {
+    family: "GLM",
+    call_open: "<tool_call>",
+    call_close: "</tool_call>",
+    key_open: "<arg_key>",
+    key_close: "</arg_key>",
+    value_open: "<arg_value>",
+    value_close: "</arg_value>",
+    newline: false,
+};
+
+static SOLAR: Markers = Markers {
+    family: "Solar",
+    call_open: "<|tool_call:start|>",
+    call_close: "<|tool_call:end|>",
+    key_open: "<|tool_arg:start|>",
+    key_close: "<|tool_arg:value|>",
+    value_open: "",
+    value_close: "<|tool_arg:end|>",
+    newline: true,
+};
+
+impl Markers {
+    /// The line break the template writes where [`Markers::newline`] says.
+    fn line(&self) -> &'static str {
+        if self.newline { "\n" } else { "" }
+    }
+
+    /// The tags a template spells to open a call, an argument's name and its
+    /// value.
+    fn openers(&self) -> [&'static str; 3] {
+        let value = if self.value_open.is_empty() {
+            self.key_close
+        } else {
+            self.value_open
+        };
+        [self.call_open, self.key_open, value]
+    }
+
+    /// An argument's name and the text after its close, from `k`, the text
+    /// after the name's opening; `None` when the close is missing or a tag
+    /// opens before it.
+    fn split_key<'a>(&self, k: &'a str) -> Option<(&'a str, &'a str)> {
+        let (key, after) = k.split_once(self.key_close)?;
+        (!key.contains('<')).then_some((key, after))
+    }
+
+    /// The text from an argument's value on, `after` being the text after its
+    /// name's close; `None` when the value's opening is missing.
+    fn value_start<'a>(&self, after: &'a str) -> Option<&'a str> {
+        if self.value_open.is_empty() {
+            Some(after)
+        } else {
+            after.trim_start().strip_prefix(self.value_open)
+        }
+    }
+}
+
+impl KvSpelling {
+    const ALL: [KvSpelling; 2] = [KvSpelling::Glm, KvSpelling::Solar];
+
+    fn markers(self) -> &'static Markers {
+        match self {
+            KvSpelling::Glm => &GLM,
+            KvSpelling::Solar => &SOLAR,
+        }
+    }
+
+    /// The spelling a template `source` writes: the one whose call, name and
+    /// value openers it all spells; `None` when it spells none.
+    #[must_use]
+    pub fn of_template(source: &str) -> Option<KvSpelling> {
+        KvSpelling::ALL
+            .into_iter()
+            .find(|s| s.markers().openers().iter().all(|tag| source.contains(tag)))
+    }
+}
 
 /// How much of the offending text an error quotes.
 const QUOTE: usize = 40;
@@ -57,11 +161,15 @@ const QUOTE: usize = 40;
 /// A generation whose tool-call markup does not parse. `index` counts calls
 /// in the generation from 0.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum GlmXmlError {
+pub enum KvError {
     /// The stream ended inside a call.
-    #[error("tool call {index} is not closed by {CALL_CLOSE} when the generation ends: {text:?}")]
-    Unterminated { index: usize, text: String },
-    /// `<tool_call>` not followed by a function name.
+    #[error("tool call {index} is not closed by {close} when the generation ends: {text:?}")]
+    Unterminated {
+        index: usize,
+        close: &'static str,
+        text: String,
+    },
+    /// A call's opening not followed by a function name.
     #[error("tool call {index} names no function before {found:?}")]
     NoName { index: usize, found: String },
     /// Something else where the markup has a tag.
@@ -69,7 +177,7 @@ pub enum GlmXmlError {
     Unexpected {
         index: usize,
         name: String,
-        expected: &'static str,
+        expected: String,
         found: String,
     },
     /// One argument name twice in a call.
@@ -157,22 +265,28 @@ fn kind_of(ty: &Value) -> Option<Kind> {
 
 /// Streaming scanner over the text after the think span.
 #[derive(Debug)]
-pub struct GlmScan {
+pub struct KvScan {
+    markers: &'static Markers,
     types: ArgTypes,
-    /// Inside a call (its `<tool_call>` consumed).
+    /// Inside a call (its opening consumed).
     inside: bool,
+    /// A call has just closed and the line feed its spelling writes after it
+    /// has not been settled.
+    line_due: bool,
     /// Text not yet decided.
     buf: String,
     calls: usize,
 }
 
-impl GlmScan {
-    /// A scanner that types arguments by `types`.
+impl KvScan {
+    /// A scanner for `spelling`'s markup that types arguments by `types`.
     #[must_use]
-    pub fn new(types: ArgTypes) -> Self {
-        GlmScan {
+    pub fn new(spelling: KvSpelling, types: ArgTypes) -> Self {
+        KvScan {
+            markers: spelling.markers(),
             types,
             inside: false,
+            line_due: false,
             buf: String::new(),
             calls: 0,
         }
@@ -180,34 +294,39 @@ impl GlmScan {
 
     /// Feeds text; returns the content that may be sent and the calls that
     /// closed.
-    pub fn push(&mut self, piece: &str) -> Result<Scanned, GlmXmlError> {
+    pub fn push(&mut self, piece: &str) -> Result<Scanned, KvError> {
+        let m = self.markers;
         self.buf.push_str(piece);
         let mut out = Scanned::default();
         loop {
             if self.inside {
-                let Some(end) = self.buf.find(CALL_CLOSE) else {
-                    out.open = partial_call(&self.buf, &self.types).map(|(name, args)| Progress {
-                        index: self.calls,
-                        name,
-                        args,
-                    });
+                let Some(end) = self.buf.find(m.call_close) else {
+                    out.open =
+                        partial_call(m, &self.buf, &self.types).map(|(name, args)| Progress {
+                            index: self.calls,
+                            name,
+                            args,
+                        });
                     return Ok(out);
                 };
-                let (name, arguments) = parse_call(&self.buf[..end], self.calls, &self.types)?;
+                let (name, arguments) = parse_call(m, &self.buf[..end], self.calls, &self.types)?;
                 out.calls.push(ToolCall {
                     index: self.calls,
                     name,
                     arguments,
                 });
                 self.calls += 1;
-                self.buf.drain(..end + CALL_CLOSE.len());
+                self.buf.drain(..end + m.call_close.len());
                 self.inside = false;
-            } else if let Some(at) = self.buf.find(CALL_OPEN) {
+                self.line_due = m.newline;
+            } else if self.line_due && !self.settle_line() {
+                return Ok(out);
+            } else if let Some(at) = self.buf.find(m.call_open) {
                 out.content.push_str(&self.buf[..at]);
-                self.buf.drain(..at + CALL_OPEN.len());
+                self.buf.drain(..at + m.call_open.len());
                 self.inside = true;
             } else {
-                let upto = self.buf.len() - partial_suffix(&self.buf, CALL_OPEN);
+                let upto = self.buf.len() - partial_suffix(&self.buf, m.call_open);
                 out.content.push_str(&self.buf[..upto]);
                 self.buf.drain(..upto);
                 return Ok(out);
@@ -215,14 +334,30 @@ impl GlmScan {
         }
     }
 
+    /// Settles the line feed after a call: dropped when the text starts with
+    /// it, content when it starts with anything else. `false` while nothing
+    /// is buffered to tell.
+    fn settle_line(&mut self) -> bool {
+        match self.buf.chars().next() {
+            None => return false,
+            Some('\n') => {
+                self.buf.drain(..1);
+            }
+            Some(_) => {}
+        }
+        self.line_due = false;
+        true
+    }
+
     /// Releases what is held at the end of the stream; a call still open is
     /// an error.
-    pub fn finish(&mut self) -> Result<Scanned, GlmXmlError> {
+    pub fn finish(&mut self) -> Result<Scanned, KvError> {
         let rest = std::mem::take(&mut self.buf);
         if self.inside {
-            return Err(GlmXmlError::Unterminated {
+            return Err(KvError::Unterminated {
                 index: self.calls,
-                text: format!("{CALL_OPEN}{rest}"),
+                close: self.markers.call_close,
+                text: format!("{}{rest}", self.markers.call_open),
             });
         }
         Ok(Scanned {
@@ -237,21 +372,26 @@ fn quote(s: &str) -> String {
     s.chars().take(QUOTE).collect()
 }
 
-/// One call's body, the text between `<tool_call>` and `</tool_call>`: its
+/// One call's body, the text between a call's opening and its close: its
 /// function name and its arguments as a JSON object's text.
-fn parse_call(body: &str, index: usize, types: &ArgTypes) -> Result<(String, String), GlmXmlError> {
+fn parse_call(
+    m: &Markers,
+    body: &str,
+    index: usize,
+    types: &ArgTypes,
+) -> Result<(String, String), KvError> {
     let name_end = body.find('<').unwrap_or(body.len());
     let name = body[..name_end].trim();
     if name.is_empty() {
-        return Err(GlmXmlError::NoName {
+        return Err(KvError::NoName {
             index,
             found: quote(body),
         });
     }
-    let unexpected = |expected, found: &str| GlmXmlError::Unexpected {
+    let unexpected = |expected: &str, found: &str| KvError::Unexpected {
         index,
         name: name.to_owned(),
-        expected,
+        expected: expected.to_owned(),
         found: quote(found),
     };
     let mut args: Vec<(String, Value)> = Vec::new();
@@ -261,22 +401,23 @@ fn parse_call(body: &str, index: usize, types: &ArgTypes) -> Result<(String, Str
         if rest.is_empty() {
             break;
         }
-        let Some(k) = rest.strip_prefix(KEY_OPEN) else {
-            return Err(unexpected("<arg_key> or </tool_call>", rest));
+        let Some(k) = rest.strip_prefix(m.key_open) else {
+            return Err(unexpected(
+                &format!("{} or {}", m.key_open, m.call_close),
+                rest,
+            ));
         };
-        let Some(key_end) = k.find(KEY_CLOSE) else {
-            return Err(unexpected("</arg_key>", k));
+        let Some((key, after)) = m.split_key(k) else {
+            return Err(unexpected(m.key_close, k));
         };
-        let key = &k[..key_end];
-        let v = k[key_end + KEY_CLOSE.len()..].trim_start();
-        let Some(v) = v.strip_prefix(VALUE_OPEN) else {
-            return Err(unexpected("<arg_value>", v));
+        let Some(v) = m.value_start(after) else {
+            return Err(unexpected(m.value_open, after.trim_start()));
         };
-        let Some(value_end) = v.find(VALUE_CLOSE) else {
-            return Err(unexpected("</arg_value>", v));
+        let Some(value_end) = v.find(m.value_close) else {
+            return Err(unexpected(m.value_close, v));
         };
         if args.iter().any(|(a, _)| a == key) {
-            return Err(GlmXmlError::DuplicateKey {
+            return Err(KvError::DuplicateKey {
                 index,
                 name: name.to_owned(),
                 key: key.to_owned(),
@@ -285,19 +426,17 @@ fn parse_call(body: &str, index: usize, types: &ArgTypes) -> Result<(String, Str
         let raw = &v[..value_end];
         let value = match types.kind(name, key) {
             Some(Kind::String) => Value::String(raw.to_owned()),
-            Some(Kind::Json(ty)) => {
-                serde_json::from_str(raw).map_err(|_| GlmXmlError::NotJson {
-                    index,
-                    name: name.to_owned(),
-                    key: key.to_owned(),
-                    ty: ty.clone(),
-                    value: quote(raw),
-                })?
-            }
+            Some(Kind::Json(ty)) => serde_json::from_str(raw).map_err(|_| KvError::NotJson {
+                index,
+                name: name.to_owned(),
+                key: key.to_owned(),
+                ty: ty.clone(),
+                value: quote(raw),
+            })?,
             None => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())),
         };
         args.push((key.to_owned(), value));
-        rest = &v[value_end + VALUE_CLOSE.len()..];
+        rest = &v[value_end + m.value_close.len()..];
     }
     let fields: Vec<String> = args
         .iter()
@@ -306,14 +445,14 @@ fn parse_call(body: &str, index: usize, types: &ArgTypes) -> Result<(String, Str
     Ok((name.to_owned(), format!("{{{}}}", fields.join(","))))
 }
 
-/// The call at the start of `body`, the text after `<tool_call>` whose close
-/// has not come, as far as `body` reads it: its name once a tag follows it, and
-/// the arguments [`parse_call`] will close with, as a prefix — each complete
-/// argument, and the text of an argument the schema types `"string"` whose end
-/// has not come, up to the tail that could still become a tag that ends it. A
-/// fault ends the reading where it stands: [`parse_call`] names it when the
-/// call closes.
-fn partial_call(body: &str, types: &ArgTypes) -> Option<(String, String)> {
+/// The call at the start of `body`, the text after a call's opening whose
+/// close has not come, as far as `body` reads it: its name once a tag follows
+/// it, and the arguments [`parse_call`] will close with, as a prefix — each
+/// complete argument, and the text of an argument the schema types `"string"`
+/// whose end has not come, up to the tail that could still become a tag that
+/// ends it. A fault ends the reading where it stands: [`parse_call`] names it
+/// when the call closes.
+fn partial_call(m: &Markers, body: &str, types: &ArgTypes) -> Option<(String, String)> {
     let name_end = body.find('<')?;
     let name = body[..name_end].trim();
     if name.is_empty() {
@@ -323,21 +462,19 @@ fn partial_call(body: &str, types: &ArgTypes) -> Option<(String, String)> {
     let mut rest = &body[name_end..];
     loop {
         rest = rest.trim_start();
-        let Some(k) = rest.strip_prefix(KEY_OPEN) else {
+        let Some(k) = rest.strip_prefix(m.key_open) else {
             break;
         };
-        let Some(key_end) = k.find(KEY_CLOSE) else {
+        let Some((key, after)) = m.split_key(k) else {
             break;
         };
-        let key = &k[..key_end];
-        let v = k[key_end + KEY_CLOSE.len()..].trim_start();
-        let Some(v) = v.strip_prefix(VALUE_OPEN) else {
+        let Some(v) = m.value_start(after) else {
             break;
         };
         let kind = types.kind(name, key);
-        let Some(value_end) = v.find(VALUE_CLOSE) else {
+        let Some(value_end) = v.find(m.value_close) else {
             if kind == Some(&Kind::String) {
-                let text = released(v, &[VALUE_CLOSE, CALL_CLOSE]);
+                let text = released(v, &[m.value_close, m.call_close]);
                 return Some((name.to_owned(), args.text_so_far(key, text)));
             }
             break;
@@ -352,36 +489,44 @@ fn partial_call(body: &str, types: &ArgTypes) -> Option<(String, String)> {
             None => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())),
         };
         args.field(key, &value.to_string());
-        rest = &v[value_end + VALUE_CLOSE.len()..];
+        rest = &v[value_end + m.value_close.len()..];
     }
     Some((name.to_owned(), args.so_far()))
 }
 
-/// The call this markup spells, as the parts structured output forces: the
-/// inverse of [`GlmScan`]. `NAME` then an `<arg_key>`/`<arg_value>` pair per
-/// parameter in the schema's order. The scanner reads a value as text only
-/// where the schema says `"type": "string"`, so a text-valued parameter that
-/// does not say it is refused rather than written as something that could
-/// read back as JSON.
-pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
-    call(funs, CALL_OPEN, str::to_owned, |f| {
-        let mut parts = Vec::new();
-        for a in &f.args {
-            if is_text(a.schema) && a.schema.get("type").and_then(Value::as_str) != Some("string") {
-                return Err(Refusal::invalid(format!(
-                    "{}: GLM's tool markup reads a text value as text only under \"type\": \
-                     \"string\"; add it",
-                    a.path
+/// The call `spelling` spells, as the parts structured output forces: the
+/// inverse of [`KvScan`]. The name, then the key, value and closing markers
+/// per parameter in the schema's order, as the template writes them. The
+/// scanner reads a value as text only where the schema says `"type":
+/// "string"`, so a text-valued parameter that does not say it is refused
+/// rather than written as something that could read back as JSON.
+pub(crate) fn call_parts(spelling: KvSpelling, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+    let m = spelling.markers();
+    call(
+        funs,
+        m.call_open,
+        |name| format!("{name}{}", m.line()),
+        |f| {
+            let mut parts = Vec::new();
+            for a in &f.args {
+                if is_text(a.schema)
+                    && a.schema.get("type").and_then(Value::as_str) != Some("string")
+                {
+                    return Err(Refusal::invalid(format!(
+                        "{}: {}'s tool markup reads a text value as text only under \"type\": \
+                         \"string\"; add it",
+                        a.path, m.family
+                    )));
+                }
+                parts.push(Part::Text(format!(
+                    "{}{}{}{}",
+                    m.key_open, a.key, m.key_close, m.value_open
                 )));
+                parts.extend(value(a.schema, Style::Raw, &a.path)?);
+                parts.push(Part::Text(format!("{}{}", m.value_close, m.line())));
             }
-            parts.push(Part::Text(format!(
-                "{KEY_OPEN}{}{KEY_CLOSE}{VALUE_OPEN}",
-                a.key
-            )));
-            parts.extend(value(a.schema, Style::Raw, &a.path)?);
-            parts.push(Part::Text(VALUE_CLOSE.to_owned()));
-        }
-        parts.push(Part::Text(CALL_CLOSE.to_owned()));
-        Ok(parts)
-    })
+            parts.push(Part::Text(m.call_close.to_owned()));
+            Ok(parts)
+        },
+    )
 }
