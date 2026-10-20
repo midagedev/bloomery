@@ -356,7 +356,11 @@ gguf 9 2 0
 # the one unsafe fn both KDA entries call, holds the position word, the token loop, the ring store and the token call (4 blocks,
 # the blocks kda_conv_prep's own body held) and each of the two entries makes one call (+2); attn_out_gate_sigmoid
 # (linear/out_gate.rs): the two element accesses and the module load, 3 blocks. Each with its SAFETY line.
-gpu 1986 222 10
+# PIN(2026-10-21): gpu 1986 -> 1979 blocks, 222 -> 221 fns, the move below: gdn_conv_prep runs conv_body (linear/conv.rs)
+# like the KDA entries, so its own conv_token (5 blocks, 1 unsafe fn: the copy of conv_head's conv and norm plus its
+# lane-0 beta and decay) and its entry's inline position reads, token call and ring store (5 blocks) are gone; the beta
+# and decay tail it kept is two blocks in prep_token and its entry makes one call (+3).
+gpu 1979 221 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

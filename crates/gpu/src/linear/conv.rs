@@ -60,7 +60,7 @@
 //! zero head.
 
 use super::{BLOCK, CONV_ROWS, CONV_TAPS, HEAD, LinearShape, Q_SCALE, RING_ROWS, ring_input};
-use super::{KDA_BETA_X1, KDA_BETA_X2, KDA_GATE_SIGMOID, KDA_GATE_SOFTPLUS};
+use super::{DECAY_HEAD, DECAY_KEY, KDA_BETA_X1, KDA_BETA_X2, KDA_GATE_SIGMOID, KDA_GATE_SOFTPLUS};
 use super::{expf_ik, sigmoid, silu, softplus};
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
@@ -81,20 +81,6 @@ pub fn units(m: usize) -> usize {
     m.max(CONV_ROWS) - (CONV_ROWS - 1)
 }
 
-/// The inputs one warp reads.
-#[derive(Clone, Copy)]
-struct Inputs<'a> {
-    x: &'a [f32],
-    w: &'a [f32],
-    b_raw: &'a [f32],
-    a_raw: &'a [f32],
-    dt_bias: &'a [f32],
-    ssm_a: &'a [f32],
-    eps: f32,
-    n_k: usize,
-    n_v: usize,
-}
-
 /// Where one warp writes: the call's outputs.
 #[derive(Clone, Copy)]
 struct Outputs {
@@ -104,140 +90,9 @@ struct Outputs {
 }
 
 /// Token `t` (position `p`, `contiguous` whether `p = pos[0] + t`) of conv
-/// head `hp` on this lane's four channels: the conv, the norm, `y`, and for
-/// a value head's lane 0 β and decay. Whether every value stayed finite.
-///
-/// # Safety
-///
-/// `t < m`, `hp < 2·n_k + n_v`, `lane < 32`; the slices and `out` hold the
-/// lengths `gdn_conv_prep`'s launch contract names; `ring` addresses
-/// `RING_ROWS·C` f32s that no other warp touches while this one runs (it is
-/// read only when `t < CONV_ROWS`, unit 0's tokens); the (t, hp) outputs are
-/// this warp's own. Called by all 32 lanes of the warp together.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one token's coordinates and the warp's inputs and outputs, forwarded from the entry"
-)]
-#[inline(always)]
-#[allow(
-    clippy::needless_range_loop,
-    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
-)]
-unsafe fn conv_token(
-    t: usize,
-    p: usize,
-    contiguous: bool,
-    hp: usize,
-    lane: usize,
-    inp: Inputs<'_>,
-    ring: *const f32,
-    out: Outputs,
-) -> bool {
-    let heads = 2 * inp.n_k + inp.n_v;
-    let ch = heads * HEAD;
-    let mut vals = [0.0f32; 4];
-    let mut sumsq = 0.0f64;
-    let mut ok = contiguous;
-    for i in 0usize..4 {
-        cuda_device::thread::__unroll_config::<0>();
-        let c = hp * HEAD + lane + 32 * i;
-        // Tap j reads the predecessor at distance d = CONV_ROWS − j.
-        let mut xs = [0.0f32; 4];
-        for j in 0..CONV_TAPS {
-            cuda_device::thread::__unroll_config::<0>();
-            let d = CONV_ROWS - j;
-            // SAFETY: c < ch; for d <= t the row t − d < m, inside x (m·ch
-            // values by the contract); else the slot (p − d) mod RING_ROWS
-            // (p >= d) is a row of the ring (RING_ROWS·ch values).
-            xs[j] = unsafe {
-                if d <= t {
-                    *inp.x.get_unchecked((t - d) * ch + c)
-                } else {
-                    ring_input(ring, p, d, ch, c)
-                }
-            };
-        }
-        // SAFETY: 4c + 3 < 4·ch <= w.len() by the contract.
-        let wv = unsafe {
-            [
-                *inp.w.get_unchecked(4 * c),
-                *inp.w.get_unchecked(4 * c + 1),
-                *inp.w.get_unchecked(4 * c + 2),
-                *inp.w.get_unchecked(4 * c + 3),
-            ]
-        };
-        let mut acc = mul_rn_f32(xs[0], wv[0]);
-        acc = fma_rn_f32(xs[1], wv[1], acc);
-        acc = fma_rn_f32(xs[2], wv[2], acc);
-        acc = fma_rn_f32(xs[3], wv[3], acc);
-        ok &= crate::fault::quad_finite(xs) & acc.is_finite();
-        let s = silu(acc);
-        vals[i] = s;
-        sumsq += f64::from(mul_rn_f32(s, s));
-    }
-
-    if hp < 2 * inp.n_k {
-        let mut acc = sumsq;
-        acc += warp::shuffle_xor_f64(acc, 16);
-        acc += warp::shuffle_xor_f64(acc, 8);
-        acc += warp::shuffle_xor_f64(acc, 4);
-        acc += warp::shuffle_xor_f64(acc, 2);
-        acc += warp::shuffle_xor_f64(acc, 1);
-        let sum = acc as f32;
-        let fin = sum.is_finite();
-        ok &= fin;
-        let scale = if fin {
-            1.0 / sum.sqrt().max(inp.eps)
-        } else {
-            f32::NAN
-        };
-        for i in 0usize..4 {
-            cuda_device::thread::__unroll_config::<0>();
-            vals[i] = mul_rn_f32(vals[i], scale);
-            if hp < inp.n_k {
-                vals[i] = mul_rn_f32(vals[i], Q_SCALE);
-            }
-        }
-    }
-    for i in 0usize..4 {
-        cuda_device::thread::__unroll_config::<0>();
-        let v = if contiguous { vals[i] } else { f32::NAN };
-        // SAFETY: t < m and c < ch, inside y (m·ch values by the contract);
-        // one lane per channel.
-        unsafe { *out.y.add(t * ch + hp * HEAD + lane + 32 * i) = v };
-    }
-
-    if hp >= 2 * inp.n_k && lane == 0 {
-        let h = hp - 2 * inp.n_k;
-        let at = t * inp.n_v + h;
-        // SAFETY: h < n_v and t < m: `at` < m·n_v <= b_raw, a_raw, beta,
-        // decay lengths; h < n_v <= dt_bias, ssm_a lengths.
-        let (b, a, dt, sa) = unsafe {
-            (
-                *inp.b_raw.get_unchecked(at),
-                *inp.a_raw.get_unchecked(at),
-                *inp.dt_bias.get_unchecked(h),
-                *inp.ssm_a.get_unchecked(h),
-            )
-        };
-        let bt = sigmoid(b);
-        let dc = expf_ik(mul_rn_f32(softplus(a + dt), sa));
-        let fin = crate::fault::quad_finite([b, a, dt, sa]) & bt.is_finite() & dc.is_finite();
-        ok &= fin;
-        // SAFETY: as the reads above; one lane per (token, head).
-        unsafe {
-            *out.beta.add(at) = if fin { bt } else { f32::NAN };
-            *out.decay.add(at) = if fin { dc } else { f32::NAN };
-        }
-    }
-    ok
-}
-
-/// Token `t` (position `p`, `contiguous` whether `p = pos[0] + t`) of conv
 /// head `hp` on this lane's four channels: the conv, SiLU, the norm of a
-/// query or key head, and `y`. Whether every value stayed finite. The KDA
-/// entry's copy of [`conv_token`]'s conv and norm; `gdn_conv_prep` keeps its
-/// own body.
+/// query or key head, and `y`. Whether every value stayed finite. The conv
+/// and norm every entry runs.
 ///
 /// # Safety
 ///
@@ -345,16 +200,17 @@ unsafe fn conv_head(
     ok
 }
 
-/// The inputs one warp of a KDA entry reads: the shared
-/// conv's, and the per-key decay's raw values `f` (`[m][n_v·HEAD]`), bias
-/// `dt_bias` (`[n_v·HEAD]`), `ssm_a` (`[n_v]`) and bound `lb`, which only
+/// The inputs one warp reads: the conv's, and the decay's raw values
+/// `decay_raw` — `a` (`[m][n_v]`) with bias `dt_bias` (`[n_v]`) under
+/// [`DECAY_HEAD`], `f` (`[m][n_v·HEAD]`) with `dt_bias` (`[n_v·HEAD]`) under
+/// [`DECAY_KEY`] — `ssm_a` (`[n_v]`) and bound `lb`, which only
 /// [`KDA_GATE_SIGMOID`] reads.
 #[derive(Clone, Copy)]
-struct KdaInputs<'a> {
+struct PrepInputs<'a> {
     x: &'a [f32],
     w: &'a [f32],
     b_raw: &'a [f32],
-    f: &'a [f32],
+    decay_raw: &'a [f32],
     dt_bias: &'a [f32],
     ssm_a: &'a [f32],
     lb: f32,
@@ -363,8 +219,8 @@ struct KdaInputs<'a> {
     n_v: usize,
 }
 
-/// One key channel's decay (module doc) under the gate `GATE`, each product
-/// rounded on its own; [`kda_decay_host`] is the same operations.
+/// One decay (module doc) under the gate `GATE`, each product rounded on its
+/// own; [`kda_decay_host`] is the same operations.
 #[inline(always)]
 fn kda_decay<const GATE: u32>(f: f32, dt: f32, sa: f32, lb: f32) -> f32 {
     const { assert!(GATE == KDA_GATE_SIGMOID || GATE == KDA_GATE_SOFTPLUS) };
@@ -387,37 +243,65 @@ fn kda_beta<const BETA: u32>(b: f32) -> f32 {
     }
 }
 
-/// Token `t` of conv head `hp` for a KDA entry: [`conv_head`], then on a
-/// value head every lane's four key channels `lane + 32·i` of the head's
-/// decay under `GATE`, and lane 0's β scaled by `BETA`. Whether every value
-/// stayed finite.
+/// Token `t` of conv head `hp`: [`conv_head`], then on a value head the
+/// decay under `GATE` and β scaled by `BETA`. Under [`DECAY_HEAD`] lane 0
+/// writes both of the head; under [`DECAY_KEY`] every lane writes the decay of
+/// its four key channels `lane + 32·i` of the head and lane 0 the β. Whether
+/// every value stayed finite.
 ///
 /// # Safety
 ///
-/// [`conv_head`]'s contract; the slices and `out` hold the lengths
-/// the KDA entries' launch contract names.
+/// [`conv_head`]'s contract; the slices and `out` hold the lengths the
+/// entries' launch contract names.
 #[allow(
     clippy::too_many_arguments,
     reason = "one token's coordinates and the warp's inputs and outputs, forwarded from the entry"
 )]
 #[inline(always)]
-unsafe fn kda_token<const GATE: u32, const BETA: u32>(
+unsafe fn prep_token<const DECAY: u32, const GATE: u32, const BETA: u32>(
     t: usize,
     p: usize,
     contiguous: bool,
     hp: usize,
     lane: usize,
-    inp: KdaInputs<'_>,
+    inp: PrepInputs<'_>,
     ring: *const f32,
     out: Outputs,
 ) -> bool {
+    const { assert!(DECAY == DECAY_HEAD || DECAY == DECAY_KEY) };
     // SAFETY: the fn's contract.
     let mut ok = unsafe {
         conv_head(
             t, p, contiguous, hp, lane, inp.x, inp.w, inp.eps, inp.n_k, inp.n_v, ring, out.y,
         )
     };
-    if hp >= 2 * inp.n_k {
+    if DECAY == DECAY_HEAD {
+        // One condition, not nested `if`s: the nested form changes the entry's
+        // register allocation.
+        if hp >= 2 * inp.n_k && lane == 0 {
+            let h = hp - 2 * inp.n_k;
+            let at = t * inp.n_v + h;
+            // SAFETY: h < n_v and t < m: `at` < m·n_v <= b_raw, decay_raw,
+            // beta, decay lengths; h < n_v <= dt_bias, ssm_a lengths.
+            let (b, a, dt, sa) = unsafe {
+                (
+                    *inp.b_raw.get_unchecked(at),
+                    *inp.decay_raw.get_unchecked(at),
+                    *inp.dt_bias.get_unchecked(h),
+                    *inp.ssm_a.get_unchecked(h),
+                )
+            };
+            let bt = kda_beta::<BETA>(b);
+            let dc = kda_decay::<GATE>(a, dt, sa, inp.lb);
+            let fin = crate::fault::quad_finite([b, a, dt, sa]) & bt.is_finite() & dc.is_finite();
+            ok &= fin;
+            // SAFETY: as the reads above; one lane per (token, head).
+            unsafe {
+                *out.beta.add(at) = if fin { bt } else { f32::NAN };
+                *out.decay.add(at) = if fin { dc } else { f32::NAN };
+            }
+        }
+    } else if hp >= 2 * inp.n_k {
         let h = hp - 2 * inp.n_k;
         // SAFETY: h < n_v <= ssm_a.len().
         let sa = unsafe { *inp.ssm_a.get_unchecked(h) };
@@ -427,10 +311,13 @@ unsafe fn kda_token<const GATE: u32, const BETA: u32>(
             let k = h * HEAD + lane + 32 * i;
             let at = t * inp.n_v * HEAD + k;
             // SAFETY: k < n_v·HEAD <= dt_bias.len() and t < m: `at` <
-            // m·n_v·HEAD, inside f and decay by the contract; one lane per
-            // (token, head, key channel).
+            // m·n_v·HEAD, inside decay_raw and decay by the contract; one
+            // lane per (token, head, key channel).
             unsafe {
-                let (f, dt) = (*inp.f.get_unchecked(at), *inp.dt_bias.get_unchecked(k));
+                let (f, dt) = (
+                    *inp.decay_raw.get_unchecked(at),
+                    *inp.dt_bias.get_unchecked(k),
+                );
                 let dc = kda_decay::<GATE>(f, dt, sa, inp.lb);
                 let ok_k = f.is_finite() & dt.is_finite() & dc.is_finite();
                 fin &= ok_k;
@@ -456,8 +343,7 @@ unsafe fn kda_token<const GATE: u32, const BETA: u32>(
 
 /// The call's inputs of the last `min(m, RING_ROWS)` tokens into their ring
 /// slots, this lane's four channels of head `hp`; after every read of the
-/// ring the call makes. The KDA entries'; `gdn_conv_prep` keeps its inline
-/// store.
+/// ring the call makes.
 ///
 /// # Safety
 ///
@@ -490,29 +376,31 @@ unsafe fn ring_store(
     }
 }
 
-/// The KDA entries' body under the decay gate `GATE` and the β scale
-/// `BETA`, the entry's arguments forwarded flat: warp `4·block + warp` is
-/// unit `w / H` ([`units`]) and conv head `w % H`, `H = 2·n_k + n_v`;
-/// [`kda_token`] for each token of the unit, then unit 0 stores the ring. A
-/// value that was not finite raises [`FaultSite::LinearConv`]. `lb` is read
-/// by [`KDA_GATE_SIGMOID`] alone.
+/// The entries' body under the decay granularity `DECAY`, the decay gate
+/// `GATE` and the β scale `BETA`, the entry's arguments forwarded flat: warp
+/// `4·block + warp` is unit `w / H` ([`units`]) and conv head `w % H`, `H =
+/// 2·n_k + n_v`; [`prep_token`] for each token of the unit, then unit 0 stores
+/// the ring. A value that was not finite raises [`FaultSite::LinearConv`].
+/// `gdn_conv_prep` is [`DECAY_HEAD`] under [`KDA_GATE_SOFTPLUS`] and
+/// [`KDA_BETA_X1`], the KDA entries [`DECAY_KEY`]. `lb` is read by
+/// [`KDA_GATE_SIGMOID`] alone.
 ///
 /// # Safety
 ///
-/// The KDA entries' launch contract: the slices hold the lengths it names, `m
-/// >= 1`, `y`, `beta`, `decay` and `ring` hold the values it names and no
-/// other launch touches them; the block is 128 threads and the grid
-/// `⌈units(m)·H / 4⌉` blocks.
+/// The entries' launch contract: the slices hold the lengths it names, `m >=
+/// 1`, `y`, `beta`, `decay` and `ring` hold the values it names and no other
+/// launch touches them; the block is 128 threads and the grid `⌈units(m)·H /
+/// 4⌉` blocks.
 #[allow(
     clippy::too_many_arguments,
     reason = "the kernel entry's arguments, forwarded flat"
 )]
 #[inline(always)]
-unsafe fn kda_conv_body<const GATE: u32, const BETA: u32>(
+unsafe fn conv_body<const DECAY: u32, const GATE: u32, const BETA: u32>(
     x: &[f32],
     w: &[f32],
     b_raw: &[f32],
-    f: &[f32],
+    decay_raw: &[f32],
     dt_bias: &[f32],
     ssm_a: &[f32],
     pos: &[u32],
@@ -538,11 +426,11 @@ unsafe fn kda_conv_body<const GATE: u32, const BETA: u32>(
     let lane = tid % 32;
     let u = wi / heads;
     let hp = wi - u * heads;
-    let inp = KdaInputs {
+    let inp = PrepInputs {
         x,
         w,
         b_raw,
-        f,
+        decay_raw,
         dt_bias,
         ssm_a,
         lb,
@@ -569,12 +457,12 @@ unsafe fn kda_conv_body<const GATE: u32, const BETA: u32>(
         // SAFETY: t < m <= pos.len().
         let p = unsafe { *pos.get_unchecked(t) };
         // SAFETY: t < m and hp < heads by the guard, lane < 32; the
-        // contract's lengths, per key for f, dt_bias and decay; the ring
-        // is read only by unit 0, whose tokens these are when
-        // t < CONV_ROWS, and written below by the same lanes after these
-        // reads; (t, hp) is this warp's own.
+        // contract's lengths, per key under DECAY_KEY for decay_raw,
+        // dt_bias and decay; the ring is read only by unit 0, whose tokens
+        // these are when t < CONV_ROWS, and written below by the same lanes
+        // after these reads; (t, hp) is this warp's own.
         ok &= unsafe {
-            kda_token::<GATE, BETA>(
+            prep_token::<DECAY, GATE, BETA>(
                 t,
                 p as usize,
                 u64::from(p) == p0 + t as u64,
@@ -647,84 +535,13 @@ mod conv_kernels {
         mut decay: DisjointSlice<f32>,
         mut ring: DisjointSlice<f32>,
     ) {
-        let heads = (2 * n_k + n_v) as usize;
-        let ch = heads * HEAD;
-        let tid = thread::threadIdx_x() as usize;
-        let wi = thread::blockIdx_x() as usize * 4 + tid / 32;
-        let m = m as usize;
-        if wi >= units(m) * heads {
-            return; // warp-uniform
-        }
-        let lane = tid % 32;
-        let u = wi / heads;
-        let hp = wi - u * heads;
-        let inp = Inputs {
-            x,
-            w,
-            b_raw,
-            a_raw,
-            dt_bias,
-            ssm_a,
-            eps,
-            n_k: n_k as usize,
-            n_v: n_v as usize,
-        };
-        let out = Outputs {
-            y: y.as_mut_ptr(),
-            beta: beta.as_mut_ptr(),
-            decay: decay.as_mut_ptr(),
-        };
-        let ring = ring.as_mut_ptr();
-        let (t0, t1) = if u == 0 {
-            (0, m.min(CONV_ROWS))
-        } else {
-            (u + CONV_ROWS - 1, u + CONV_ROWS)
-        };
-        // SAFETY: pos holds m >= 1 words by the contract.
-        let p0 = unsafe { *pos.get_unchecked(0) } as u64;
-        let mut ok = true;
-        let mut t = t0;
-        while t < t1 {
-            // SAFETY: t < m <= pos.len().
-            let p = unsafe { *pos.get_unchecked(t) };
-            // SAFETY: t < m and hp < heads by the guard, lane < 32; the
-            // contract's lengths; the ring is read only by unit 0, whose
-            // tokens these are when t < CONV_ROWS, and written below by the
-            // same lanes after these reads; (t, hp) is this warp's own.
-            ok &= unsafe {
-                conv_token(
-                    t,
-                    p as usize,
-                    u64::from(p) == p0 + t as u64,
-                    hp,
-                    lane,
-                    inp,
-                    ring,
-                    out,
-                )
-            };
-            t += 1;
-        }
-        if u == 0 {
-            // The inputs of the last min(m, RING_ROWS) tokens into their
-            // slots, after every read of the ring above.
-            let mut t = m.saturating_sub(RING_ROWS);
-            while t < m {
-                // SAFETY: t < m <= pos.len().
-                let slot = unsafe { *pos.get_unchecked(t) } as usize % RING_ROWS;
-                #[unroll]
-                for i in 0usize..4 {
-                    let c = hp * HEAD + lane + 32 * i;
-                    // SAFETY: slot < RING_ROWS and c < ch: inside the ring
-                    // (RING_ROWS·ch values) and row t of x (m·ch values);
-                    // channel c of the ring is this lane's alone.
-                    unsafe { *ring.add(slot * ch + c) = *x.get_unchecked(t * ch + c) };
-                }
-                t += 1;
-            }
-        }
-        if !ok {
-            fault.raise(FaultSite::LinearConv);
+        // SAFETY: the launch contract's lengths and block. The bound is 0.0: the
+        // sigmoid gate alone reads it, and this entry's gate is softplus.
+        unsafe {
+            conv_body::<DECAY_HEAD, KDA_GATE_SOFTPLUS, KDA_BETA_X1>(
+                x, w, b_raw, a_raw, dt_bias, ssm_a, pos, 0.0, eps, n_k, n_v, m, fault, &mut y,
+                &mut beta, &mut decay, &mut ring,
+            );
         }
     }
 
@@ -776,7 +593,7 @@ mod conv_kernels {
     ) {
         // SAFETY: the launch contract's lengths and block.
         unsafe {
-            kda_conv_body::<KDA_GATE_SIGMOID, KDA_BETA_X1>(
+            conv_body::<DECAY_KEY, KDA_GATE_SIGMOID, KDA_BETA_X1>(
                 x, w, b_raw, f, dt_bias, ssm_a, pos, lb, eps, n_k, n_v, m, fault, &mut y,
                 &mut beta, &mut decay, &mut ring,
             );
@@ -831,7 +648,7 @@ mod conv_kernels {
         // SAFETY: the launch contract's lengths and block. The bound is 0.0: the
         // sigmoid gate alone reads it.
         unsafe {
-            kda_conv_body::<KDA_GATE_SOFTPLUS, KDA_BETA_X2>(
+            conv_body::<DECAY_KEY, KDA_GATE_SOFTPLUS, KDA_BETA_X2>(
                 x, w, b_raw, f, dt_bias, ssm_a, pos, 0.0, eps, n_k, n_v, m, fault, &mut y,
                 &mut beta, &mut decay, &mut ring,
             );
