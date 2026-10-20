@@ -477,6 +477,12 @@ impl Walk {
         }
     }
 
+    /// Whether the program is spent: nothing is left but the stop.
+    pub(crate) fn spent(&mut self) -> bool {
+        self.settle();
+        self.forced.is_empty() && matches!(self.ctx, Ctx::Done)
+    }
+
     /// The run of ids the program fixes from here: forced ids and the only
     /// children of a choice's nodes, up to the next decision, the next free
     /// string or the program's end, and at most `max` of them. The walk stands

@@ -324,18 +324,23 @@ binary's `--help`.
   (every property written, in the schema's order), string, integer and boolean enums, `const`, booleans, and free
   strings with an optional `maxLength`. The request decodes greedily (the largest logit among the ids the schema
   allows), so `temperature` defaults to 0.
-- Two arms follow the schema. The step arm is one `next` an id. The jump arm is the default: each run of ids the schema
-  fixes (forced text, the rest of a chosen option) is fed as one prompt call, and the next decision is read from the row
-  of the step that closes the run. Free strings step token by token on both arms. Both arms pick the largest allowed
-  logit at every decision, ties to the lowest id, and feed every id they take, so a run of fixed ids costs the engine one
-  call instead of one step each. The text after the last decision is fed too: the stop id is picked from a row, and the
-  prompt cache then holds every id of the answer but the stop. A run under two ids is stepped, and a request that asks
-  for `logprobs` takes the step arm. `BLOOMERY_SCHEMAJUMP=off` is the way back to the step arm until the jump arm's
-  gain is measured on each seat. A prompt call can round a row differently from the steps it replaces (a Qwen3.8 tier
-  load runs a prompt call on the batch path), so a decision inside a rounding of a tie can differ between the arms.
-  A request's `timings.constrained` counts its arm's work after the prompt: `spans` and `span_ids` (the runs fed and
-  their ids), `decisions`, `free_steps`, `next_calls` and `prefill_calls`. With `--parallel`, a run is a call of its own
-  that the engine thread makes like a prompt's: a quantum of ids a round beside other busy slots, never inside a step.
+- Two arms follow the schema. The step arm is one `next` an id. The jump arm is the default: the fixed text that opens
+  the answer rides the prompt's call, and each later run of ids the schema fixes (forced text, the rest of a chosen
+  option) is fed as one call that also steps its last id, so the next decision is read from that call's row. Free
+  strings step token by token on both arms. Both arms pick the largest allowed logit at every decision, ties to the
+  lowest id, so a run of fixed ids costs the engine one call instead of one step each. Nothing is fed after the last
+  decision: the closing text and the stop are written with no call, the stop being the vocabulary's end of sequence,
+  and the prompt cache holds the answer up to its last decision. The step arm picks its stop from a row, so the two
+  arms' token lists can differ in that last id alone; the text and the finish reason are the same. A run under two ids
+  is stepped, and a request that asks for `logprobs` takes the step arm. `BLOOMERY_SCHEMAJUMP=off` is the way back to
+  the step arm until the jump arm's gain is measured on each seat. A prompt call can round a row differently from the
+  steps it replaces (a Qwen3.8 tier load runs a prompt call on the batch path; the Qwen3 seats' prompt call of more
+  than eight ids runs the wide walk), so a decision inside a rounding of a tie can differ between the arms. A request's
+  `timings.constrained` counts its arm's work after the prompt: `spans` and `span_ids` (the runs fed and their ids),
+  `decisions`, `free_steps`, `next_calls`, `prefill_calls`, `next_after_calls` (the calls that fed a run and stepped
+  it), `lead` (the ids the prompt's call carried) and `tail` (the ids taken after the last decision with no call). With
+  `--parallel`, a run, and a prompt call with its lead, are calls the engine thread makes one quantum of ids a round
+  beside other busy slots, never inside a step.
 - Refused by name: any other schema keyword (`$ref`, `anyOf`, `items`, `pattern`, `minLength`, `minProperties`, an
   `integer` with no enum; a forced tool's `parameters` are read whole by the same rules, so a root `anyOf`, a `$ref` or a
   `required` name no property has is a 400), `json_object`, a top-level `json_schema`, `grammar`, a schema beside a

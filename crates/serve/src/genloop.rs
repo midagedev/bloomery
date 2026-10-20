@@ -48,18 +48,26 @@
 //! named error ([`GenError::Constrained`]).
 //!
 //! That is the step arm. The jump arm (on by default, [`Slot::schema_jump`])
-//! feeds a run of ids the program fixes as one [`Engine::prefill`] instead of a
-//! step each ([`Need::Fill`]): the id just taken and the run but its last id
-//! are the call's, and the run's last id is the step that follows, whose row
-//! is the next decision's. The call is the engine thread's, run like a
-//! prompt's call (a quantum of ids a round beside other busy slots), never
-//! inside a step. Every id fed is an id of the answer, so nothing is taken
-//! back, the closing text after the last decision included: it is fed so that
-//! the stop id is picked from a row as the step arm picks it, and the prompt
-//! cache holds every id of the answer but the stop. A request that asks for
-//! probabilities reads every row, so it takes the step arm. A run shorter than
-//! [`MIN_FILL`] ids is stepped: a call of one id is no cheaper than the step
-//! it replaces.
+//! feeds the ids the program fixes in the calls that read the decisions'
+//! rows. The run that opens the answer, the lead, rides the prompt's call
+//! ([`Gen::take_lead`]), so the step that closes the prompt's call reads the
+//! first decision's row. Each run after a
+//! decision is fed as one call ([`Need::Fill`]): the id just taken and the
+//! run, the call's last id stepped with it ([`Engine::next_after`]), so its
+//! row is the next decision's; a run the bounds cut (the request's budget,
+//! the cache's positions) is fed without its last id, which the loop then
+//! takes as the step arm does. The call is the engine thread's, run like a
+//! prompt's call (a quantum of ids a round beside other busy slots, the last
+//! quantum the `next_after`), never inside a step. Every id fed is an id of
+//! the answer, so nothing is taken back. After the last decision nothing is
+//! fed or stepped: the closing text and the stop are the tail, taken with no
+//! call, the stop the vocabulary's end of sequence ([`Gen::end`]; a request
+//! whose stops lack it feeds its closing text as a run and picks its stop
+//! from the row). The answer is the step arm's but for that stop id, and the
+//! prompt cache holds the answer up to its last decision. A request that
+//! asks for probabilities reads every row, so it takes the step arm. A run
+//! shorter than [`MIN_FILL`] ids is stepped: a call of one id is no cheaper
+//! than the step it replaces.
 //!
 //! A request runs as a [`Gen`], one engine call at a time, so the engine
 //! thread can make one call of several slots' steps: each running request's
@@ -70,6 +78,7 @@
 //! that names a prompt quantum ([`Engine::prompt_quantum`]) calls the engine
 //! thread runs one a round ([`Prompt`]).
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::num::NonZeroUsize;
@@ -179,9 +188,17 @@ pub(crate) struct Jump {
     /// The ids picked among a choice's options, and inside free strings.
     pub decisions: usize,
     pub free_steps: usize,
-    /// The engine's [`Engine::next`] and [`Engine::prefill`] calls.
+    /// The engine's [`Engine::next`], [`Engine::prefill`] and
+    /// [`Engine::next_after`] calls.
     pub next_calls: usize,
     pub prefill_calls: usize,
+    pub next_after_calls: usize,
+    /// The fixed ids that open the answer, fed by the prompt's call
+    /// ([`Gen::take_lead`]).
+    pub lead: usize,
+    /// The ids taken after the program's last pick with no engine call, the
+    /// stop included ([`Gen::tail_id`]).
+    pub tail: usize,
 }
 
 impl Timings {
@@ -219,6 +236,9 @@ impl Timings {
                 "free_steps": j.free_steps,
                 "next_calls": j.next_calls,
                 "prefill_calls": j.prefill_calls,
+                "next_after_calls": j.next_after_calls,
+                "lead": j.lead,
+                "tail": j.tail,
             });
         }
         v
@@ -1126,27 +1146,6 @@ impl Slot {
         Ok(at)
     }
 
-    /// Feeds `ids[from..to]`, cut into calls where the engine asks
-    /// ([`Slot::marked_cuts`]). Each of the prompt's images (`media`) rides
-    /// the call that holds its span.
-    fn prefill_marked(
-        &mut self,
-        ids: &[u32],
-        from: usize,
-        to: usize,
-        media: &[MediaFeed],
-    ) -> Result<(), EngineError> {
-        let at = self.marked_cuts(ids, from, to)?;
-        let mut first = from;
-        for &u in &at {
-            self.prefill_range(&ids[first..u], first, media)?;
-            first = u;
-        }
-        self.prefill_range(&ids[first..to], first, media)?;
-        self.note_split(from, to, at);
-        Ok(())
-    }
-
     /// The note of a prompt call `first..end` the engine cut at its marks
     /// `at`; none when it cut nowhere.
     fn note_split(&self, first: usize, end: usize, at: Vec<usize>) {
@@ -1212,6 +1211,36 @@ impl Slot {
         self.held = held;
         self.held.push(last);
         Ok(g)
+    }
+
+    /// [`Engine::next_after`] that books what it fed: `ids`, at least one.
+    pub(crate) fn next_after(
+        &mut self,
+        ids: &[u32],
+        logits: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
+        let held = std::mem::take(&mut self.held);
+        let g = self.engine.next_after(ids, logits)?;
+        self.held = held;
+        self.held.ids.extend_from_slice(ids);
+        Ok(g)
+    }
+
+    /// The prompt call's last call `ids` at the prompt's positions `at..`
+    /// (`media`, the prompt's feeds) and the step of its last id, booked:
+    /// [`Slot::prefill_range`] of all but the last id and [`Slot::next`] of
+    /// the last. A prompt call takes the checkpoints of its marks, so it is
+    /// never an answer run's [`Engine::next_after`].
+    fn close_call(
+        &mut self,
+        ids: &[u32],
+        at: usize,
+        media: &[MediaFeed],
+        logits: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
+        let (&last, run) = ids.split_last().expect("the prompt's last id");
+        self.prefill_range(run, at, media)?;
+        self.next(last, logits)
     }
 
     /// `advance` that books what it fed: `last` and every kept token but the
@@ -1534,6 +1563,10 @@ struct Span {
     fed: usize,
     /// The run: the ids the loop takes next.
     run: Vec<u32>,
+    /// Whether the span's last call steps the run's last id too
+    /// ([`Engine::next_after`]): `feed` then holds the whole run after the id
+    /// just taken.
+    close: bool,
 }
 
 /// The think-span budget's state in [`Gen`]: the budget left while the span is
@@ -1640,6 +1673,16 @@ pub(crate) struct Gen {
     jump: bool,
     /// The run being fed, `None` between runs.
     span: Option<Span>,
+    /// The answer's lead the prompt call carried ([`Gen::take_lead`]).
+    lead: Vec<u32>,
+    /// The stop id a jump-arm answer ends with once the program is spent
+    /// and nothing it fixes is left ([`Gen::tail_id`]): the vocabulary's end
+    /// of sequence, `None` when its stops do not hold it (the stop is then
+    /// picked from a row).
+    end: Option<u32>,
+    /// Whether the answer is in its tail: every id left is the program's or
+    /// [`Gen::end`], taken without an engine call.
+    tail: bool,
 }
 
 /// The sampler a request of `p` draws with, `None` for a greedy one, or the
@@ -1660,6 +1703,7 @@ impl Gen {
     /// with `sampler` ([`sampler_of`]); nothing runs yet.
     pub(crate) fn new(slot: &Slot, sampler: Option<Sampler>, n: usize, p: &GenParams) -> Gen {
         let stops = slot.vocab.stops();
+        let end = Some(slot.vocab.eos()).filter(|e| stops.contains(e));
         let banned = if p.ignore_eos {
             stops.clone()
         } else {
@@ -1732,6 +1776,9 @@ impl Gen {
                 && p.logprobs.is_none()
                 && p.reasoning_budget.is_none(),
             span: None,
+            lead: Vec::new(),
+            end,
+            tail: false,
         }
     }
 
@@ -1850,8 +1897,9 @@ impl Gen {
 
     /// The prompt's opening on the selected slot: the engine told the reply
     /// the request may make, the cache brought to the longest prefix of
-    /// `held` it keeps, and a request that draws seeds its sampler's history
-    /// with the prompt's tail. No id of the prompt is fed yet.
+    /// `held` it keeps, a request that draws seeds its sampler's history
+    /// with the prompt's tail, and on the jump arm the answer's lead taken
+    /// from the walk ([`Gen::take_lead`]). No id of the prompt is fed yet.
     pub(crate) fn open(
         &mut self,
         slot: &mut Slot,
@@ -1878,6 +1926,7 @@ impl Gen {
             Err(_) if passes => None,
             _ => Some(0),
         });
+        self.take_lead();
         let t = Instant::now();
         let cache_n = slot.reuse(held, p.cache_prompt)?;
         Ok(Kept {
@@ -1888,7 +1937,8 @@ impl Gen {
 
     /// The prompt after its opening in one go: `ids[cache_n..n-1]` fed as one
     /// call, cut where the engine asks at its messages, and the last id
-    /// stepped.
+    /// stepped. On the jump arm the call carries the answer's lead
+    /// ([`Gen::take_lead`]).
     pub(crate) fn prompt_whole(
         &mut self,
         slot: &mut Slot,
@@ -1899,26 +1949,84 @@ impl Gen {
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
     ) -> Result<(), GenError> {
         let t0 = Instant::now();
-        slot.prefill_marked(ids, kept.cache_n, self.n - 1, media)?;
-        self.close(slot, ids[self.n - 1], kept, t0, p.return_progress, sink)
+        let ids = if self.lead.is_empty() {
+            Cow::Borrowed(ids)
+        } else {
+            Cow::Owned([ids, &self.lead].concat())
+        };
+        let to = ids.len() - 1;
+        let at = slot.marked_cuts(&ids, kept.cache_n, to)?;
+        let mut first = kept.cache_n;
+        for &u in &at {
+            slot.prefill_range(&ids[first..u], first, media)?;
+            first = u;
+        }
+        slot.note_split(kept.cache_n, to, at);
+        self.close(
+            slot,
+            (&ids[first..], first, media),
+            kept,
+            t0,
+            p.return_progress,
+            sink,
+        )
+    }
+
+    /// The fixed ids that open the answer, which the jump arm's prompt call
+    /// carries: the walk's run from its start, at most the ids the request
+    /// may generate but one and the positions the cache holds past the
+    /// prompt (the step arm feeds the run's `i`-th id at position `n + i`
+    /// while it has generated `i + 1 < n_predict` ids and `n + i + 1 <=
+    /// ctx_max`), and only when the program goes on past it: the close's
+    /// step of its last id gives the row the next pick reads. Empty
+    /// otherwise. The lead is held in [`Gen::lead`]; the walk stands past it.
+    fn take_lead(&mut self) {
+        self.lead.clear();
+        if !self.jump {
+            return;
+        }
+        let room = self
+            .budget
+            .saturating_sub(1)
+            .min(self.ctx_max.saturating_sub(self.n));
+        let Some(walk) = self.walk.as_mut() else {
+            return;
+        };
+        let mut ahead = walk.clone();
+        let Ok(run) = ahead.forced_run(room) else {
+            return;
+        };
+        if run.is_empty() || ahead.spent() {
+            return;
+        }
+        *walk = ahead;
+        self.lead = run;
+    }
+
+    /// How many ids of the answer's lead the prompt call carries
+    /// ([`Gen::take_lead`], taken at [`Gen::open`]).
+    pub(crate) fn lead_len(&self) -> usize {
+        self.lead.len()
     }
 
     /// The prompt after its opening as calls the engine thread runs one a
     /// round ([`Gen::prompt_call`]), its prompt call cut where the engine asks
     /// at its messages and each of those calls every `q` ids from its start
     /// ([`Prompt`]). No call runs here; from here the timings carry the prompt
-    /// so far.
+    /// so far. On the jump arm the calls carry the answer's lead
+    /// ([`Gen::take_lead`]), as [`Gen::prompt_whole`]'s do.
     pub(crate) fn plan(
         &mut self,
         slot: &Slot,
-        ids: Vec<u32>,
+        mut ids: Vec<u32>,
         media: Vec<MediaFeed>,
         kept: Kept,
         q: NonZeroUsize,
         progress: bool,
     ) -> Result<Prompt, GenError> {
         let t = Instant::now();
-        let to = self.n - 1;
+        ids.extend_from_slice(&self.lead);
+        let to = ids.len() - 1;
         let marks = slot.marked_cuts(&ids, kept.cache_n, to)?;
         let ends = quantum_ends(kept.cache_n, to, &marks, &media, q.get());
         self.tim = Timings {
@@ -1946,7 +2054,7 @@ impl Gen {
     /// token's text does once the client is gone, so a request whose client
     /// left ends between its calls. The last call notes the engine's cuts at
     /// the messages, as the prompt run in one go does, and steps the prompt's
-    /// last id.
+    /// last id ([`Gen::close`]).
     pub(crate) fn prompt_call(
         &mut self,
         slot: &mut Slot,
@@ -1959,46 +2067,56 @@ impl Gen {
         let from = p.ran.checked_sub(1).map_or(p.kept.cache_n, |i| p.ends[i]);
         let to = p.ends[p.ran];
         let t = Instant::now();
-        slot.prefill_range(&p.ids[from..to], from, &p.media)?;
         p.ran += 1;
-        self.tim.prompt_ms += ms_since(t);
-        self.tim.prompt_n = to - p.kept.cache_n;
-        self.tim.n_past = to;
         if p.ran < p.ends.len() {
+            slot.prefill_range(&p.ids[from..to], from, &p.media)?;
+            self.tim.prompt_ms += ms_since(t);
+            self.tim.prompt_n = to.min(self.n) - p.kept.cache_n;
+            self.tim.n_past = to;
             return Ok(true);
         }
-        let t = Instant::now();
         slot.note_split(p.kept.cache_n, to, std::mem::take(&mut p.marks));
-        self.close(slot, p.ids[self.n - 1], p.kept, t, p.progress, sink)?;
+        self.close(
+            slot,
+            (&p.ids[from..], from, &p.media),
+            p.kept,
+            t,
+            p.progress,
+            sink,
+        )?;
         Ok(false)
     }
 
-    /// The prompt's end: its last id stepped and the first token's logits
-    /// read, its timings, its event and the first token in hand. Its engine
-    /// time is what the timings hold of it (nothing for a prompt run in one
-    /// go) and the time since `t`.
+    /// The prompt's end: its last call `call` (the ids, their first position
+    /// and the prompt's feeds) fed and its last id stepped
+    /// ([`Slot::close_call`]), and the first token's logits read, its timings, its event and the first token
+    /// in hand: the lead the call carried ([`Gen::take_lead`]) then the pick
+    /// from that row, in hand as a pass's tokens are. Its engine time is what
+    /// the timings hold of it (nothing for a prompt run in one go) and the
+    /// time since `t`.
     fn close(
         &mut self,
         slot: &mut Slot,
-        last: u32,
+        (ids, at, media): (&[u32], usize, &[MediaFeed]),
         kept: Kept,
         t: Instant,
         progress: bool,
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
     ) -> Result<(), GenError> {
         let n = self.n;
-        let greedy = slot.next(last, self.logits_out())?;
+        let greedy = slot.close_call(ids, at, media, self.logits_out())?;
         slot.prompts[slot.cur] = n;
         self.tim = Timings {
             prompt_n: n - kept.cache_n,
             prompt_ms: self.tim.prompt_ms + ms_since(t),
             n_ctx: self.ctx_max,
-            n_past: n,
+            n_past: slot.held.len(),
             cache_n: kept.cache_n,
             cache_ms: kept.cache_ms,
             n_prompt: n,
             jump: self.walk.is_some().then(|| Jump {
                 arm: self.jump,
+                lead: self.lead.len(),
                 ..Jump::default()
             }),
             ..Timings::default()
@@ -2008,7 +2126,15 @@ impl Gen {
             sink(Event::Prompt(&self.tim))?;
         }
         if self.budget > 0 {
-            self.tok = Some(self.answer(greedy));
+            let first = self.answer(greedy);
+            if self.lead.is_empty() {
+                self.tok = Some(first);
+            } else {
+                self.kept.clone_from(&self.lead);
+                self.kept.push(first);
+                self.tok = Some(self.kept[0]);
+                self.taken = 1;
+            }
         }
         Ok(())
     }
@@ -2111,6 +2237,12 @@ impl Gen {
                 self.truncated = true;
                 break;
             }
+            // Where the step arm feeds `tok`, the jump arm's tail feeds
+            // nothing: no row is read after the program's last pick.
+            if let Some(next) = self.tail_id()? {
+                self.tok = Some(next);
+                continue;
+            }
             if self.plan_span(tok) {
                 return Ok(Need::Fill);
             }
@@ -2141,10 +2273,45 @@ impl Gen {
         self.tok = Some(self.answer(g));
     }
 
+    /// The next id of a jump-arm answer whose every id left is the
+    /// program's: the walk's fixed id, or [`Gen::end`] once the program is
+    /// spent. The tail starts where no pick is left ahead (the walk fixes
+    /// every id to the program's end) and the vocabulary names its stop;
+    /// `None` before it, on the step arm and for free text. Every id of the
+    /// tail is taken where the step arm would step the one before it, with
+    /// the same bounds, so the answer is the step arm's but for the stop id:
+    /// the step arm picks it from a row, the tail names it. A fixed id the
+    /// walk refuses is the request's error, as a pick's is.
+    fn tail_id(&mut self) -> Result<Option<u32>, StepError> {
+        let (true, Some(end), Some(walk)) = (self.jump, self.end, self.walk.as_mut()) else {
+            return Ok(None);
+        };
+        if !self.tail {
+            let mut ahead = walk.clone();
+            if !ahead.forced_run(usize::MAX).is_ok_and(|_| ahead.spent()) {
+                return Ok(None);
+            }
+            self.tail = true;
+        }
+        let id = if walk.fixed_next() {
+            walk.choose(&[])?
+        } else {
+            end
+        };
+        if let Some(j) = self.tim.jump.as_mut() {
+            j.tail += 1;
+        }
+        Ok(Some(id))
+    }
+
     /// Whether the ids the program fixes after `tok`, just taken, are fed as
     /// a call: [`MIN_FILL`] of them at least, and no more than the ids the
     /// request may still generate and the positions the cache has left. The
-    /// run's ids are then taken from the walk and held in [`Gen::span`].
+    /// run's ids are then taken from the walk and held in [`Gen::span`]. When
+    /// the step arm would step the run's last id too (the request may
+    /// generate past the run and the cache holds its position), the span's
+    /// last call steps it: one [`Engine::next_after`] whose row is the next
+    /// pick's.
     fn plan_span(&mut self, tok: u32) -> bool {
         if !self.jump {
             return false;
@@ -2167,23 +2334,33 @@ impl Gen {
             return false;
         }
         *walk = ahead;
-        let mut feed = Vec::with_capacity(run.len());
+        let after = len + run.len();
+        let close = after < self.budget && n + after <= self.ctx_max;
+        let mut feed = Vec::with_capacity(run.len() + 1);
         feed.push(tok);
-        feed.extend_from_slice(&run[..run.len() - 1]);
+        feed.extend_from_slice(&run[..run.len() - usize::from(!close)]);
         if let Some(j) = self.tim.jump.as_mut() {
             j.spans += 1;
             j.span_ids += feed.len();
         }
-        self.span = Some(Span { feed, fed: 0, run });
+        self.span = Some(Span {
+            feed,
+            fed: 0,
+            run,
+            close,
+        });
         true
     }
 
     /// One call of the run being fed ([`Need::Fill`]): its ids, or a
     /// `quantum` of them when other slots are busy, fed as one
-    /// [`Engine::prefill`] that books them; the request's `n_past` is the
-    /// slot's positions after each call. The call that ends the run puts
-    /// the run in hand as a pass's tokens are: the loop takes them one at a
-    /// time, and the last is the id the next [`Need::Step`] feeds.
+    /// [`Engine::prefill`] that books them, or as the [`Engine::next_after`]
+    /// that steps the run's last id when it is the span's last call and the
+    /// span closes ([`Gen::plan_span`]); the request's `n_past` is the slot's
+    /// positions after each call. The call that ends the run puts the run in
+    /// hand as a pass's tokens are: the loop takes them one at a time, then
+    /// the pick from the closing row, or else the run's last id is the one
+    /// the next [`Need::Step`] feeds.
     ///
     /// # Panics
     ///
@@ -2197,11 +2374,27 @@ impl Gen {
         let end = quantum.map_or(span.feed.len(), |q| {
             (span.fed + q.get()).min(span.feed.len())
         });
-        slot.prefill_range(&span.feed[span.fed..end], slot.held.len(), &[])?;
+        let closing = span.close && end == span.feed.len();
+        let ids = &span.feed[span.fed..end];
+        let greedy = if closing {
+            let logits = if self.walk.as_mut().is_some_and(Walk::fixed_next) {
+                None
+            } else {
+                out(&mut self.logits)
+            };
+            Some(slot.next_after(ids, logits)?)
+        } else {
+            slot.prefill_range(ids, slot.held.len(), &[])?;
+            None
+        };
         span.fed = end;
         self.tim.n_past = slot.held.len();
         if let Some(j) = self.tim.jump.as_mut() {
-            j.prefill_calls += 1;
+            if closing {
+                j.next_after_calls += 1;
+            } else {
+                j.prefill_calls += 1;
+            }
         }
         if end < span.feed.len() {
             return Ok(());
@@ -2210,6 +2403,10 @@ impl Gen {
             return Ok(());
         };
         self.kept = span.run;
+        if let Some(g) = greedy {
+            let picked = self.answer(g);
+            self.kept.push(picked);
+        }
         self.tok = Some(self.kept[0]);
         self.taken = 1;
         Ok(())

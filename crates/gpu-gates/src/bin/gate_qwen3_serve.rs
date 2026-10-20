@@ -58,6 +58,24 @@
 //!   prompt's ids and the completion's tokens, and whose message text (the
 //!   reasoning and the content) is inside the text of those ids
 //!   (`/detokenize`);
+//! - `schema_jump_is_the_step_arms`: `/completion` of [`JUMP_ASK`]'s turn
+//!   under [`jump_schema`] (an intent of four options and a boolean, the
+//!   suites' median request) on the jump arm gives the step arm's text,
+//!   stop and token count, and its ids but the last (the jump arm names
+//!   its stop) — the step arm the same request asking `n_probs`, which
+//!   reads every row; thinking off. The jump arm's counts are the design's: the lead rode
+//!   the prompt's call, the run between the two picks was one
+//!   `next_after` (the seat's prompt call of the run and its last id, its
+//!   head's row the second pick's: below `GEMM_FROM` ids the pass path,
+//!   whose rows the e2e gates pin to the steps' bit for bit), no `next`,
+//!   no `prefill`, and the closing text a tail. FAIL-first: the jump arm
+//!   off (`BLOOMERY_SCHEMAJUMP=off`) reads `arm` `step` and no
+//!   `next_after`;
+//! - `answer_spans_take_no_marks`, a `Body35` file, between the two arms: the
+//!   answer's run took no checkpoint, as the steps it replaces take none —
+//!   a request of the prompt and the answer the jump arm fed, but its last
+//!   id, keeps the prompt call's end (`P + lead - 1`). FAIL-first: a run fed
+//!   with the body's marks on keeps its start, `P + lead`;
 //! - on a qwen3moe file, whose seat keeps a prefix of what the slot holds,
 //!   the prefix clauses: the edit clause — the turn of [`EDIT_A`] answered,
 //!   then resent with its user message changed to [`EDIT_B`], which diverges
@@ -3180,6 +3198,7 @@ mod gate {
 
         let chat_ok = chat_is_those_ids(&url, dir, messages(), N, (&chat_ids, &v))?;
         check(ok, "chat_is_those_ids", chat_ok);
+        schema_jump_is_the_step_arms(&url, dir, body35(seat), ok)?;
         // The qwen3moe arm's whole-call answer joins the CLI comparison: a
         // fresh run's ids for the two-message chat.
         let mut whole = None;
@@ -3194,6 +3213,150 @@ mod gate {
         let mut answers = vec![chat_ids, prose_ids];
         answers.extend(whole);
         Ok(Some((answers, default_n)))
+    }
+
+    /// The turn the jump clause asks: a support message to classify.
+    const JUMP_ASK: &str = "Classify this support message. Message: \"I was charged twice for my \
+        order and I want my money back now!\" Give its intent and whether the customer is angry.";
+
+    /// The jump clause's schema: the suites' median request, an intent of
+    /// four options and a boolean.
+    fn jump_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "intent": { "type": "string", "enum": ["cancel", "other", "refund", "tracking"] },
+                "angry": { "type": "boolean" },
+            },
+            "required": ["intent", "angry"],
+            "additionalProperties": false,
+        })
+    }
+
+    /// `schema_jump_is_the_step_arms` (module header): [`JUMP_ASK`]'s turn
+    /// under [`jump_schema`] on the jump arm and on the step arm (the same
+    /// request asking `n_probs`), each body in `<dir>/jump-<arm>.json`; on a
+    /// `Body35` file (`marks`), between them, `answer_spans_take_no_marks`.
+    fn schema_jump_is_the_step_arms(
+        url: &dyn Fn(&str) -> String,
+        dir: &Path,
+        marks: bool,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        // Thinking off: the answer opens on the schema's text, the lead.
+        let (st, text) = curl(
+            &url("/apply-template"),
+            Some(&json!({
+                "messages": [{ "role": "user", "content": JUMP_ASK }],
+                "chat_template_kwargs": { "enable_thinking": false },
+            })),
+            false,
+        )?;
+        let text = json_of("/apply-template", st, &text)?["prompt"]
+            .as_str()
+            .ok_or("/apply-template: no prompt")?
+            .to_owned();
+        let prompt = tokenized(url, &text)?;
+        let ask = |probs: bool| -> Result<Value, GateError> {
+            let mut body = json!({
+                "prompt": prompt, "n_predict": 64, "temperature": 0, "return_tokens": true,
+                "cache_prompt": false,
+                "response_format": { "type": "json_schema",
+                    "json_schema": { "name": "ticket", "schema": jump_schema() } },
+            });
+            if probs {
+                body["n_probs"] = json!(1);
+            }
+            let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+            let name = if probs {
+                "jump-step.json"
+            } else {
+                "jump-jump.json"
+            };
+            std::fs::write(dir.join(name), &text)?;
+            json_of("/completion", st, &text)
+        };
+        let jump = ask(false)?;
+        let jt = ids_of(&jump["tokens"]);
+        let j = &jump["timings"]["constrained"];
+        let count = |v: &Value, k: &str| v[k].as_u64().unwrap_or(u64::MAX);
+        if marks {
+            answer_spans_take_no_marks(url, dir, &prompt, &jt, j, ok)?;
+        }
+        let step = ask(true)?;
+        let st = ids_of(&step["tokens"]);
+        let s = &step["timings"]["constrained"];
+        println!(
+            "schema jump: content {:?} / {:?}, stop {:?} / {:?}, {} / {} ids; jump {j}; step {s}",
+            jump["content"],
+            step["content"],
+            jump["stop_type"],
+            step["stop_type"],
+            jt.len(),
+            st.len(),
+        );
+        let same_answer = jump["content"] == step["content"]
+            && jump["stop_type"] == step["stop_type"]
+            && jt.len() == st.len()
+            && !jt.is_empty()
+            && jt[..jt.len() - 1] == st[..st.len() - 1];
+        let designed = j["arm"] == "jump"
+            && s["arm"] == "step"
+            && count(j, "lead") > 0
+            && count(j, "next_after_calls") == 1
+            && count(j, "next_calls") == 0
+            && count(j, "prefill_calls") == 0
+            && count(j, "tail") > 0
+            && count(j, "decisions") == count(s, "decisions");
+        check(ok, "schema_jump_is_the_step_arms", same_answer && designed);
+        Ok(())
+    }
+
+    /// `answer_spans_take_no_marks` (module header), on the slot the jump
+    /// arm's request `jt` (counts `j`) left: the slot holds the prompt, the
+    /// lead and the run up to the last pick, and a request of the prompt and
+    /// all of that but its last id keeps the last checkpoint below — the
+    /// prompt call's end, `P + lead - 1` (the call fed the prompt and the
+    /// lead but its last id, which the call's step fed). The run's call took
+    /// none; one that took marks keeps the run's start, `P + lead`.
+    fn answer_spans_take_no_marks(
+        url: &dyn Fn(&str) -> String,
+        dir: &Path,
+        prompt: &[u32],
+        jt: &[u32],
+        j: &Value,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let count = |k: &str| j[k].as_u64().and_then(|n| usize::try_from(n).ok());
+        let (lead, fed) = match (count("lead"), count("span_ids")) {
+            (Some(lead), Some(span)) => (lead, lead + span),
+            _ => (0, 0),
+        };
+        if lead == 0 || fed < lead + 2 || fed > jt.len() {
+            println!(
+                "answer marks: lead {lead}, {fed} answer ids fed of {}: no run",
+                jt.len()
+            );
+            check(ok, "answer_spans_take_no_marks", false);
+            return Ok(());
+        }
+        let ids: Vec<u32> = prompt.iter().chain(&jt[..fed - 1]).copied().collect();
+        let body = json!({
+            "prompt": ids, "n_predict": 1, "temperature": 0, "cache_prompt": true,
+        });
+        let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+        std::fs::write(dir.join("jump-marks.json"), &text)?;
+        let v = json_of("/completion", st, &text)?;
+        let cache_n = v["timings"]["cache_n"].as_u64();
+        let want = u64::try_from(prompt.len() + lead - 1)?;
+        println!(
+            "answer marks: the slot held {} ids, a request of {} keeps {cache_n:?}; the prompt \
+             call's end is {want}",
+            prompt.len() + fed,
+            ids.len()
+        );
+        check(ok, "answer_spans_take_no_marks", cache_n == Some(want));
+        Ok(())
     }
 
     /// `generate_qwen3moe --arm <prompt>/N … --last-step` on `model`, an arm

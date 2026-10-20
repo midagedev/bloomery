@@ -579,20 +579,41 @@ fn serve_jump(engine: Yielding, jump: bool) -> (SocketAddr, Arc<Mutex<Vec<Call>>
     (server.spawn().expect("spawn"), log)
 }
 
-/// A request for a document whose first run of fixed ids, `{"` and a property
-/// name of 24 bytes, is six quanta.
+/// A request for a document of two booleans. Its answer opens with `{"a": `,
+/// the answer's lead the jump arm's prompt call carries, and the run after
+/// the first boolean's pick, the rest of the boolean, `, "`, a property name
+/// of 24 bytes and `": `, is more than six quanta.
 fn document() -> Value {
     let schema = json!({"type": "object", "properties": {
+        "a": {"type": "boolean"},
         "abcdefghijklmnopqrstuvwx": {"type": "boolean"}}});
     json!({"prompt": "ab", "n_predict": 100, "return_tokens": true,
         "response_format": {"type": "json_schema",
             "json_schema": {"name": "r", "schema": schema}}})
 }
 
+/// B's calls on slot 1 in `calls`, cut after each of its steps: the prompt's
+/// calls, then a run's (the trait's `next_after` is a prefill and a step).
+fn b_rounds(calls: &[Call]) -> Vec<Vec<Call>> {
+    let mut out = vec![Vec::new()];
+    for c in calls {
+        if !matches!(c, Call::Pre { slot: 1, .. } | Call::Next { slot: 1 }) {
+            continue;
+        }
+        out.last_mut().expect("a round").push(c.clone());
+        if matches!(c, Call::Next { slot: 1 }) {
+            out.push(Vec::new());
+        }
+    }
+    out
+}
+
 /// A constrained request that takes a slot while the other decodes runs each
-/// run of fixed ids as prefill calls of a quantum, a decode round of the
-/// other slot between each two, then the step whose row is the decision's: on
-/// the jump arm it gives the ids it gives on the step arm, in fewer calls.
+/// run of fixed ids as calls of a quantum, a decode round of the other slot
+/// between each two, the last of them stepping the run's last id; the answer's
+/// lead rides the prompt's calls, cut in quanta as the prompt is. On the jump
+/// arm it gives the step arm's ids in fewer calls, and nothing after the last
+/// pick: B makes the prompt's calls and one run's.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_a_run_of_fixed_ids_is_a_call_a_round_beside_a_decoding_stream() {
@@ -613,15 +634,41 @@ fn hw_a_run_of_fixed_ids_is_a_call_a_round_beside_a_decoding_stream() {
     let ((a_jump, b_jump, jump), (a_step, b_step, step)) = (&ran[0], &ran[1]);
     assert_eq!(a_jump.json()["tokens"], a_step.json()["tokens"], "A");
     assert_eq!(b_jump.json()["tokens"], b_step.json()["tokens"], "B");
-    // B's prompt is the first call on its slot; the calls after it feed runs.
-    let runs: Vec<usize> = pieces(jump, 1)[1..].to_vec();
-    assert!(runs.iter().all(|&n| n <= Q), "{jump:?}");
-    assert!(runs.len() > 2, "the first run is six quanta: {jump:?}");
-    let at: Vec<usize> = (0..jump.len())
-        .filter(|&i| matches!(jump[i], Call::Pre { slot: 1, .. }))
-        .skip(1)
-        .collect();
-    for w in at.windows(2) {
+    assert_eq!(b_jump.json()["content"], b_step.json()["content"], "B");
+    let rounds = b_rounds(jump);
+    assert_eq!(
+        rounds.len(),
+        3,
+        "the prompt's calls, one run's, none after: {jump:?}"
+    );
+    assert!(rounds[2].is_empty(), "a call after the last pick: {jump:?}");
+    let pieces_of = |r: &[Call]| -> Vec<usize> {
+        r.iter()
+            .filter_map(|c| match *c {
+                Call::Pre { n, .. } => Some(n),
+                _ => None,
+            })
+            .collect()
+    };
+    let lead = pieces_of(&rounds[0]);
+    let run = pieces_of(&rounds[1]);
+    assert!(
+        lead.len() > 1,
+        "the prompt and its lead are two quanta: {jump:?}"
+    );
+    assert!(run.len() > 6, "the run is more than six quanta: {jump:?}");
+    assert!(lead.iter().chain(&run).all(|&n| n <= Q), "{jump:?}");
+    // Inside the prompt's calls and inside the run's; the run's first call
+    // is the round the prompt's last call joins the running requests in.
+    let mut at: Vec<Vec<usize>> = vec![Vec::new()];
+    for (i, c) in jump.iter().enumerate() {
+        match c {
+            Call::Pre { slot: 1, .. } => at.last_mut().expect("a round").push(i),
+            Call::Next { slot: 1 } => at.push(Vec::new()),
+            _ => {}
+        }
+    }
+    for w in at.iter().flat_map(|r| r.windows(2)) {
         assert!(
             jump[w[0]..w[1]].contains(&Call::Next { slot: 0 }),
             "no decode round of A between B's calls at {} and {}: {jump:?}",
@@ -632,8 +679,18 @@ fn hw_a_run_of_fixed_ids_is_a_call_a_round_beside_a_decoding_stream() {
     let on = b_jump.json()["timings"]["constrained"].clone();
     let off = b_step.json()["timings"]["constrained"].clone();
     assert_eq!(on["arm"], "jump");
-    assert_eq!(on["prefill_calls"], runs.len());
-    assert_eq!(on["span_ids"], runs.iter().sum::<usize>());
+    assert_eq!(on["lead"], 6, "{on}");
+    assert_eq!(
+        (
+            on["spans"].as_u64(),
+            on["next_after_calls"].as_u64(),
+            on["next_calls"].as_u64()
+        ),
+        (Some(1), Some(1), Some(0)),
+        "{on}"
+    );
+    assert_eq!(on["prefill_calls"], run.len() - 1, "{on}");
+    assert_eq!(on["span_ids"], run.iter().sum::<usize>() + 1, "{on}");
     assert_eq!(on["decisions"], off["decisions"]);
     assert_eq!(
         (
@@ -656,8 +713,10 @@ fn hw_a_run_of_fixed_ids_is_a_call_a_round_beside_a_decoding_stream() {
 }
 
 /// `/slots` shows a run's positions as its calls run, as a prompt's: with the
-/// second call of B's first run in the engine, the view holds the positions
-/// the first call left, the ids the engine has been fed on B's slot.
+/// second call of B's run in the engine (B's fourth prefill: the prompt and
+/// its lead are two calls, then the run's first), the view holds the
+/// positions the calls before it left, the ids the engine has been fed on B's
+/// slot.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_slots_shows_a_runs_positions_as_its_calls_run() {
@@ -666,7 +725,7 @@ fn hw_slots_shows_a_runs_positions_as_its_calls_run() {
     let second = Arc::new(Latch::default());
     engine
         .at
-        .push((Kind::Pre, 1, 3, Then::Hold(Arc::clone(&second))));
+        .push((Kind::Pre, 1, 4, Then::Hold(Arc::clone(&second))));
     let (addr, log) = serve_jump(engine, true);
     let a = post_bg(addr, completion(A, 60));
     assert!(latch.wait_entered(BOUND), "A never decoded");
@@ -686,6 +745,7 @@ fn hw_slots_shows_a_runs_positions_as_its_calls_run() {
             _ => 0,
         })
         .sum();
+    assert_eq!(b_rounds(&calls(&log)).len(), 2, "{:?}", calls(&log));
     let view = get(addr, "/slots").json()[1].clone();
     assert_eq!(view["n_past"], fed, "{view}");
     second.release();
