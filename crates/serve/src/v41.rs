@@ -10,8 +10,8 @@
 //!
 //! Two rules of the encoding are not the template's to write: the tool
 //! results of a turn answer the calls in the order the model asked them
-//! ([`order_tool_results`]), and a tool call's arguments are read as the
-//! object of the call's parameters ([`tool_arguments`]). The server applies
+//! (`order_tool_results`), and a tool call's arguments are read as the
+//! object of the call's parameters (`tool_arguments`). The server applies
 //! both to the request before the template renders it, through the family's
 //! request preparation ([`prepare`]).
 
@@ -29,8 +29,11 @@ pub const TEMPLATE: &str = include_str!("templates/v41-official.jinja");
 /// them, a tool call's arguments are the object of the call's parameters, and
 /// the request's tool choice and response format reach the template, which
 /// writes them into the prompt.
+///
+/// A tool call the encoding cannot read is refused by name: the field and
+/// the message it is in.
 pub fn prepare(request: &mut ChatRequest<'_>) -> Result<(), String> {
-    tool_arguments(request.messages);
+    tool_arguments(request.messages)?;
     order_tool_results(request.messages);
     for (name, value) in request_vars(request.body) {
         let Some(value) = value else {
@@ -61,15 +64,24 @@ fn request_vars(body: &Map<String, Value>) -> [(&'static str, Option<&Value>); 2
 ///
 /// The official encoding parses a call's arguments as a JSON object; text
 /// that is not one becomes a single `arguments` parameter holding the text.
-pub fn tool_arguments(messages: &mut [Value]) {
-    for message in messages {
-        let Some(Value::Array(calls)) = message.get_mut("tool_calls") else {
-            continue;
+///
+/// A `tool_calls` that is not an array, and a call whose `function` is not
+/// an object, are refused by name: the encoding reads neither, and the
+/// template would walk them.
+fn tool_arguments(messages: &mut [Value]) -> Result<(), String> {
+    for (i, message) in messages.iter_mut().enumerate() {
+        let calls = match message.get_mut("tool_calls") {
+            None | Some(Value::Null) => continue,
+            Some(Value::Array(calls)) => calls,
+            Some(_) => return Err(format!("messages[{i}].tool_calls must be an array")),
         };
-        for call in calls {
-            let Some(function) = call.get_mut("function") else {
-                continue;
-            };
+        for (j, call) in calls.iter_mut().enumerate() {
+            let function = call
+                .get_mut("function")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    format!("messages[{i}].tool_calls[{j}].function must be an object")
+                })?;
             let text = match function.get("arguments") {
                 Some(Value::String(text)) => text.clone(),
                 // An object is the object of the parameters already.
@@ -78,16 +90,16 @@ pub fn tool_arguments(messages: &mut [Value]) {
                 None => String::new(),
             };
             let arguments = match serde_json::from_str::<Map<String, Value>>(&text) {
-                Ok(object) => Value::Object(object).to_string(),
+                Ok(object) => Value::Object(object),
                 Err(_) => Value::Object(Map::from_iter([(
                     "arguments".to_owned(),
                     Value::String(text),
-                )]))
-                .to_string(),
+                )])),
             };
-            function["arguments"] = Value::String(arguments);
+            function.insert("arguments".into(), Value::String(arguments.to_string()));
         }
     }
+    Ok(())
 }
 
 /// The tool results of `messages`, ordered the way the official encoding
@@ -96,7 +108,7 @@ pub fn tool_arguments(messages: &mut [Value]) {
 ///
 /// A result that answers no call of that message sorts first, and a result
 /// without a call id keeps its place.
-pub fn order_tool_results(messages: &mut [Value]) {
+fn order_tool_results(messages: &mut [Value]) {
     let mut call_ids: Vec<String> = Vec::new();
     let mut index = 0;
     while index < messages.len() {

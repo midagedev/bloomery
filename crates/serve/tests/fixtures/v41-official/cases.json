@@ -465,6 +465,100 @@
     "note": "the tool results are ordered by the order of the calls they answer"
   },
   {
+    "name": "tool-call-arguments-not-json",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the weather in Seoul?"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "reasoning_content": "Call the tool.",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "Seoul"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "sunny",
+          "tool_call_id": "call_1"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "The weather of a city.",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto"
+    },
+    "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"The weather of a city.\", \"parameters\": {\"type\": \"object\"}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>What is the weather in Seoul?<｜Assistant｜><think>Call the tool.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"arguments\" string=\"true\">Seoul</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>sunny</tool_result><｜Assistant｜><think>",
+    "expressible": true,
+    "note": "the arguments are not a JSON object; the official encoding holds the text in one `arguments` parameter"
+  },
+  {
+    "name": "tool-call-arguments-a-json-scalar",
+    "request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the weather in Seoul?"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "reasoning_content": "Call the tool.",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "3"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "sunny",
+          "tool_call_id": "call_1"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "The weather of a city.",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto"
+    },
+    "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"The weather of a city.\", \"parameters\": {\"type\": \"object\"}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>What is the weather in Seoul?<｜Assistant｜><think>Call the tool.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"arguments\" string=\"true\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>sunny</tool_result><｜Assistant｜><think>",
+    "expressible": true,
+    "note": "the arguments are a JSON scalar; the official encoding holds the text in one `arguments` parameter"
+  },
+  {
     "name": "second-system",
     "request": {
       "messages": [

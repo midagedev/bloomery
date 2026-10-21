@@ -24,7 +24,6 @@ use crate::{Engine, MockEngine};
 const SOLAR_TEMPLATE: &str = include_str!("../tests/fixtures/solar-chat-template.jinja");
 const V41_SPACED_TEMPLATE: &str =
     include_str!("../tests/fixtures/v41-dsml-spaced-chat-template.jinja");
-const V41_OFFICIAL_TEMPLATE: &str = include_str!("templates/v41-official.jinja");
 
 /// `(text, is_control)`: a family's special tokens.
 type Specials = &'static [(&'static str, bool)];
@@ -127,7 +126,7 @@ fn templates() -> Vec<(&'static str, &'static str)> {
     let mut all: Vec<_> = FIXTURE_TEMPLATES.to_vec();
     all.push(("solar", SOLAR_TEMPLATE));
     all.push(("v41-spaced", V41_SPACED_TEMPLATE));
-    all.push(("v41-official", V41_OFFICIAL_TEMPLATE));
+    all.push(("v41-official", crate::v41::TEMPLATE));
     all
 }
 

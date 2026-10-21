@@ -1,6 +1,7 @@
 {#- DeepSeek's official V4.1 prompt encoding. The text is byte-equal to the recipe's
     `DeepseekV41Encoding` for every conversation the chat API can express. The request preparation
-    (`serve::v41::prepare`) gives the template the tool call arguments it parses. -#}
+    (`serve::v41::prepare`) gives the template the tool call arguments it parses. A role the
+    encoding does not have is refused by name. -#}
 {%- if not add_generation_prompt is defined -%}
   {%- set add_generation_prompt = false -%}
 {%- endif -%}
@@ -140,6 +141,8 @@
   {%- elif role == 'latest_reminder' -%}
     {{- reminder_token + (message['content'] or '') -}}
     {%- set ns.prev = 'other' -%}
+  {%- else -%}
+    {{- raise_exception('unsupported message role: ' + role) -}}
   {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}

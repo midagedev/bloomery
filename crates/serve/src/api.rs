@@ -2611,12 +2611,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
             }
         }
     }
-    let marked = state.template.render(&vars).map_err(|e| ApiError {
-        retry_after: false,
-        code: 500,
-        kind: "server_error",
-        message: e.to_string(),
-    })?;
+    let marked = state.template.render(&vars).map_err(template_error)?;
     let (text, guarded) = guard
         .finish(marked, &state.template, &vars)
         .map_err(guard_error)?;
@@ -2625,6 +2620,21 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         guarded,
         media,
     })
+}
+
+/// A template that refused the request (`raise_exception`) names the client's
+/// request, which is a 400; any other render error is the template's own,
+/// which is a 500.
+fn template_error(e: TemplateError) -> ApiError {
+    match e.refusal() {
+        Some(refusal) => invalid(refusal.to_owned()),
+        None => ApiError {
+            retry_after: false,
+            code: 500,
+            kind: "server_error",
+            message: e.to_string(),
+        },
+    }
 }
 
 /// A request whose strings cannot be guarded, or a template that cut a guarded text apart, is
@@ -7446,6 +7456,55 @@ mod tests {
             }
         }
         assert_eq!(not_expressible, ["prefix-continuation"]);
+    }
+
+    /// The V4.1 preparation refuses a malformed tool call by name: a
+    /// `tool_calls` that is not an array and a call whose `function` is not
+    /// an object. The client gets a 400 that names the field, on the render
+    /// path and on the chat path alike.
+    #[test]
+    fn the_v41_preparation_refuses_a_malformed_tool_call_by_name() {
+        let mut config = templated(crate::v41::TEMPLATE);
+        config.chat_preparation = Some(crate::v41::prepare);
+        let (addr, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), config);
+        let cases = [
+            (
+                json!({"messages": [{"role": "assistant", "tool_calls": [{"function": 1}]}]}),
+                "messages[0].tool_calls[0].function",
+            ),
+            (
+                json!({"messages": [{"role": "assistant", "tool_calls": {"function": {}}}]}),
+                "messages[0].tool_calls",
+            ),
+        ];
+        for (body, named) in cases {
+            for path in ["/apply-template", "/v1/chat/completions"] {
+                let (status, answer) = roundtrip(addr, "POST", path, &body.to_string());
+                assert_eq!(status, 400, "{path}: {answer}");
+                assert!(answer.contains(named), "{path}: {answer}");
+            }
+        }
+    }
+
+    /// The official V4.1 template refuses a role it does not encode, by
+    /// name: the client gets a 400 that names the role, not a prompt that
+    /// silently drops the message.
+    #[test]
+    fn the_v41_template_refuses_a_role_it_cannot_encode() {
+        let mut config = templated(crate::v41::TEMPLATE);
+        config.chat_preparation = Some(crate::v41::prepare);
+        let (addr, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), config);
+        let body = json!({"messages": [{"role": "critic", "content": "Tighten it."}]});
+        for path in ["/apply-template", "/v1/chat/completions"] {
+            let (status, answer) = roundtrip(addr, "POST", path, &body.to_string());
+            assert_eq!(status, 400, "{path}: {answer}");
+            assert!(
+                answer.contains("unsupported message role: critic"),
+                "{path}: {answer}"
+            );
+        }
     }
 
     /// A server with no request preparation renders a request that carries a
