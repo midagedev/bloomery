@@ -44,6 +44,7 @@ fn config(dir: Option<&Path>) -> ServerConfig {
         model_alias: "mock".to_owned(),
         model_path: "mock.gguf".to_owned(),
         chat_template: V41_TEMPLATE.to_owned(),
+        chat_preparation: None,
         sampler: None,
         fatal_linger: FATAL_LINGER,
         slot_save_path: dir.map(Path::to_path_buf),

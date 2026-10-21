@@ -24,6 +24,7 @@ use crate::{Engine, MockEngine};
 const SOLAR_TEMPLATE: &str = include_str!("../tests/fixtures/solar-chat-template.jinja");
 const V41_SPACED_TEMPLATE: &str =
     include_str!("../tests/fixtures/v41-dsml-spaced-chat-template.jinja");
+const V41_OFFICIAL_TEMPLATE: &str = include_str!("templates/v41-official.jinja");
 
 /// `(text, is_control)`: a family's special tokens.
 type Specials = &'static [(&'static str, bool)];
@@ -67,8 +68,10 @@ const GLM: Specials = &[
 const V41: Specials = &[
     ("<｜begin▁of▁sentence｜>", true),
     ("<｜end▁of▁sentence｜>", true),
+    ("<｜System｜>", false),
     ("<｜User｜>", false),
     ("<｜Assistant｜>", false),
+    ("<｜latest_reminder｜>", false),
     ("<think>", false),
     ("</think>", false),
     ("｜DSML｜", false),
@@ -111,7 +114,7 @@ fn specials_of(name: &str) -> Specials {
     match name {
         "qwen3" | "qwen36" | "qwen38" => QWEN,
         "glm5" => GLM,
-        "v41" | "v41-spaced" => V41,
+        "v41" | "v41-spaced" | "v41-official" => V41,
         "nemotron" | "nemotron-bolt" => NEMOTRON,
         "solar" => SOLAR,
         other => panic!("{other} has no special-token table here"),
@@ -124,6 +127,7 @@ fn templates() -> Vec<(&'static str, &'static str)> {
     let mut all: Vec<_> = FIXTURE_TEMPLATES.to_vec();
     all.push(("solar", SOLAR_TEMPLATE));
     all.push(("v41-spaced", V41_SPACED_TEMPLATE));
+    all.push(("v41-official", V41_OFFICIAL_TEMPLATE));
     all
 }
 
@@ -251,6 +255,15 @@ fn object(body: &Value) -> &Map<String, Value> {
     map
 }
 
+/// The request preparation the family's template needs: the official V4.1
+/// encoding's own, the other families' none.
+fn preparation_of(name: &str) -> Option<crate::ChatPreparation> {
+    match name {
+        "v41-official" => Some(crate::v41::prepare),
+        _ => None,
+    }
+}
+
 /// One family's server: its template over its vocabulary.
 struct Family {
     state: Arc<State>,
@@ -259,11 +272,16 @@ struct Family {
 }
 
 fn family(name: &str, template: &str) -> Family {
-    served(specials_of(name), template, None)
+    served(specials_of(name), template, None, preparation_of(name))
 }
 
 /// A server on `template` over a vocabulary of `specials`, taking images when `media` is a model.
-fn served(specials: Specials, template: &str, media: Option<SharedMediaModel>) -> Family {
+fn served(
+    specials: Specials,
+    template: &str,
+    media: Option<SharedMediaModel>,
+    preparation: Option<crate::ChatPreparation>,
+) -> Family {
     let tok = Arc::new(vocabulary(specials));
     let engine = Served(
         MockEngine::new(8192),
@@ -272,6 +290,7 @@ fn served(specials: Specials, template: &str, media: Option<SharedMediaModel>) -
     );
     let config = super::ServerConfig {
         chat_template: template.to_owned(),
+        chat_preparation: preparation,
         ..testserve::mock_config()
     };
     let (_addr, state, _ended) = testserve::spawn(Box::new(engine), config);
@@ -572,7 +591,7 @@ fn the_fixture_conversations_keep_their_ids() {
 fn a_template_that_cuts_a_guarded_text_apart_is_refused_by_name() {
     let slicing = |n: usize| {
         let template = format!("{{%- for m in messages %}}{{{{ m.content[:{n}] }}}}{{% endfor %}}");
-        served(QWEN, &template, None)
+        served(QWEN, &template, None, None)
     };
     let body = |text: &str| json!({"messages": [{"role": "user", "content": text}]});
     let spelled = body("x<think>y");
@@ -696,6 +715,7 @@ fn kwargs_are_client_text_and_the_bos_stays_a_token() {
         QWEN,
         "{{ bos_token }}{{ note }}|{% for m in messages %}{{ m.content }}{% endfor %}",
         None,
+        None,
     );
     let bos = fam.tok.specials().bos.expect("a BOS");
     let body = json!({
@@ -715,7 +735,7 @@ fn kwargs_are_client_text_and_the_bos_stays_a_token() {
 fn a_typed_placeholder_is_left_to_the_media_refusal() {
     const MEDIA: Specials = &[("<image>", true), ("<unk>", true), ("<think>", false)];
     let model: SharedMediaModel = Arc::new(crate::media::NumberedMedia);
-    let fam = served(MEDIA, testserve::TEMPLATE, Some(model));
+    let fam = served(MEDIA, testserve::TEMPLATE, Some(model), None);
     let rendered = |text: &str| {
         let body = json!({"messages": [{"role": "user", "content": text}]});
         render_chat(&fam.state, object(&body)).unwrap_or_else(|e| panic!("{}", e.message))
@@ -731,6 +751,7 @@ fn a_role_or_name_with_a_spelling_in_it_is_text() {
     let fam = served(
         QWEN,
         "{%- for m in messages %}<|im_start|>{{ m.role }}{{ m.name }}\\n{{ m.content }}<|im_end|>{% endfor %}",
+        None,
         None,
     );
     let body = |role: &str, name: &str| json!({"messages": [{"role": role, "name": name, "content": "c"}]});
@@ -751,7 +772,7 @@ fn a_template_that_finishes_a_spelling_with_client_text_makes_no_token() {
     ];
     for (body, text) in cases {
         let template = format!("{{%- for m in messages %}}{body}{{% endfor %}}");
-        let fam = served(QWEN, &template, None);
+        let fam = served(QWEN, &template, None, None);
         let request = json!({"messages": [{"role": "user", "content": text}]});
         let (rendered, ids) = fam.prompt(body, &request);
         assert!(

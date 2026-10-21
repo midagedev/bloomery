@@ -25,6 +25,7 @@ pub(super) fn mock_config() -> ServerConfig {
         model_alias: "mock".to_owned(),
         model_path: "mock.gguf".to_owned(),
         chat_template: TEMPLATE.to_owned(),
+        chat_preparation: None,
         sampler: None,
         fatal_linger: FATAL_LINGER,
         slot_save_path: None,

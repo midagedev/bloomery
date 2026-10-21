@@ -1,0 +1,155 @@
+{#- DeepSeek's official V4.1 prompt encoding. The text is byte-equal to the recipe's
+    `DeepseekV41Encoding` for every conversation the chat API can express. The request preparation
+    (`serve::v41::prepare`) gives the template the tool call arguments it parses. -#}
+{%- if not add_generation_prompt is defined -%}
+  {%- set add_generation_prompt = false -%}
+{%- endif -%}
+{%- if not thinking is defined -%}
+  {%- if enable_thinking is defined -%}
+    {%- set thinking = enable_thinking -%}
+  {%- else -%}
+    {%- set thinking = true -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set dsml = '｜DSML｜' -%}
+{%- set system_token = '<｜System｜>' -%}
+{%- set user_token = '<｜User｜>' -%}
+{%- set assistant_token = '<｜Assistant｜>' -%}
+{%- set reminder_token = '<｜latest_reminder｜>' -%}
+{%- set think_start = '<think>' -%}
+{%- set think_end = '</think>' -%}
+{%- set eos = '<｜end▁of▁sentence｜>' -%}
+{%- set tools_header = '## Tools\n\nYou have access to a set of tools to help answer the user\'s question. You can invoke tools by writing a "<' + dsml + ' calls>" block like the following:\n\n<' + dsml + ' calls>\n<' + dsml + ' invoke name="$TOOL_NAME">\n<' + dsml + ' parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</' + dsml + ' parameter>\n...\n</' + dsml + ' invoke>\n<' + dsml + ' invoke name="$TOOL_NAME2">\n...\n</' + dsml + ' invoke>\n</' + dsml + ' calls>\n\nString parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.\n\nIf thinking_mode is enabled (triggered by ' + think_start + '), you MUST output your complete reasoning inside ' + think_start + '...' + think_end + ' BEFORE any tool calls or final response.\n\nOtherwise, output directly after ' + think_end + ' with tool calls or final response.\n\n### Available Tool Schemas\n\n' -%}
+{%- set tools_footer = '\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n' -%}
+{%- set response_format_header = '## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n' -%}
+{%- set has_messages = messages | length > 0 -%}
+{%- set has_tools = tools is defined and tools | length > 0 -%}
+{%- set choice = tool_choice if tool_choice is defined else 'auto' -%}
+{%- set renders_tools = has_tools and choice != 'none' -%}
+{%- set named = none -%}
+{%- if choice is not none and choice is not string and choice['type'] == 'function' -%}
+  {%- set named = choice['function']['name'] -%}
+{%- endif -%}
+{%- set forces_call = renders_tools and (choice == 'required' or named is not none) -%}
+{%- set rf = response_format if response_format is defined else none -%}
+{%- set rf_schema = none -%}
+{%- if rf is not none and rf is mapping -%}
+  {%- if rf['type'] == 'json_object' -%}
+    {%- set rf_schema = '{"type": "json_object"}' -%}
+  {%- elif rf['type'] == 'json_schema' and rf['json_schema'] is defined and rf['json_schema']['schema'] is defined -%}
+    {%- set rf_schema = rf['json_schema']['schema'] | tojson -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set schemas = namespace(text='') -%}
+{%- if renders_tools -%}
+  {%- for tool in tools -%}
+    {%- if named is none or tool['function']['name'] == named -%}
+      {%- set function = tool['function'] -%}
+      {%- set description = function['description'] if function['description'] is defined and function['description'] is not none else '' -%}
+      {%- set parameters = '{}' -%}
+      {%- if function['parameters'] is defined and function['parameters'] is not none -%}
+        {%- set parameters = function['parameters'] | tojson -%}
+      {%- endif -%}
+      {%- if schemas.text -%}{%- set schemas.text = schemas.text + '\n' -%}{%- endif -%}
+      {%- set schemas.text = schemas.text + '{"name": ' + (function['name'] | tojson) + ', "description": ' + (description | tojson) + ', "parameters": ' + parameters + '}' -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- set first_is_system = has_messages and (messages[0]['role'] == 'system' or messages[0]['role'] == 'developer') -%}
+{%- set writes_system = has_messages and (first_is_system or renders_tools or rf_schema is not none) -%}
+{%- set score = '75' -%}
+{%- if reasoning_effort is defined -%}
+  {%- if reasoning_effort == 'max' -%}
+    {%- set score = '100' -%}
+  {%- elif reasoning_effort == 'low' or reasoning_effort == 'minimal' -%}
+    {%- set score = '50' -%}
+  {%- endif -%}
+{%- endif -%}
+{{- bos_token -}}
+{%- if thinking and has_messages -%}
+  {{- system_token -}}
+  {{- 'Reasoning Effort: ' + score + ' (range 1-100, the higher the value, the more thorough the reasoning)\n\n' -}}
+{%- elif writes_system -%}
+  {{- system_token -}}
+{%- endif -%}
+{%- if first_is_system -%}
+  {{- messages[0]['content'] or '' -}}
+{%- endif -%}
+{%- if renders_tools -%}
+  {{- '\n\n' + tools_header + schemas.text + tools_footer -}}
+{%- endif -%}
+{%- if rf_schema is not none -%}
+  {{- '\n\n' + response_format_header + rf_schema -}}
+{%- endif -%}
+{%- set ns = namespace(prev='') -%}
+{%- for message in messages -%}
+  {%- set role = message['role'] -%}
+  {%- if loop.index0 == 0 and first_is_system -%}
+  {%- elif role == 'user' -%}
+    {%- if ns.prev == 'user' or ns.prev == 'tool' -%}
+      {{- '\n\n' -}}
+    {%- else -%}
+      {{- user_token -}}
+    {%- endif -%}
+    {{- message['content'] or '' -}}
+    {%- set ns.prev = 'user' -%}
+  {%- elif role == 'tool' -%}
+    {%- if ns.prev == 'user' or ns.prev == 'tool' -%}
+      {{- '\n\n' -}}
+    {%- else -%}
+      {{- user_token -}}
+    {%- endif -%}
+    {{- '<tool_result>' + (message['content'] or '') + '</tool_result>' -}}
+    {%- set ns.prev = 'tool' -%}
+  {%- elif role == 'assistant' -%}
+    {{- assistant_token -}}
+    {%- if thinking and loop.index0 > 0 and renders_tools -%}
+      {{- think_start -}}
+      {%- if message['reasoning_content'] is defined and message['reasoning_content'] -%}
+        {{- message['reasoning_content'] -}}
+      {%- endif -%}
+      {{- think_end -}}
+    {%- else -%}
+      {{- think_end -}}
+    {%- endif -%}
+    {{- message['content'] or '' -}}
+    {%- if message['tool_calls'] is defined and message['tool_calls'] | length > 0 -%}
+      {{- '\n\n<' + dsml + ' calls>\n' -}}
+      {%- for call in message['tool_calls'] -%}
+        {%- if loop.index0 > 0 -%}{{- '\n' -}}{%- endif -%}
+        {{- '<' + dsml + ' invoke name="' + call['function']['name'] + '">\n' -}}
+        {%- set args = call['function']['arguments'] -%}
+        {%- if args is string -%}{%- set args = args | from_json -%}{%- endif -%}
+        {%- for key, value in args.items() -%}
+          {%- if loop.index0 > 0 -%}{{- '\n' -}}{%- endif -%}
+          {%- if value is string -%}
+            {{- '<' + dsml + ' parameter name="' + key + '" string="true">' + value + '</' + dsml + ' parameter>' -}}
+          {%- else -%}
+            {{- '<' + dsml + ' parameter name="' + key + '" string="false">' + (value | tojson) + '</' + dsml + ' parameter>' -}}
+          {%- endif -%}
+        {%- endfor -%}
+        {{- '\n</' + dsml + ' invoke>' -}}
+      {%- endfor -%}
+      {{- '\n</' + dsml + ' calls>' -}}
+    {%- endif -%}
+    {{- eos -}}
+    {%- set ns.prev = 'other' -%}
+  {%- elif role == 'system' or role == 'developer' -%}
+    {{- system_token + (message['content'] or '') -}}
+    {%- set ns.prev = 'other' -%}
+  {%- elif role == 'latest_reminder' -%}
+    {{- reminder_token + (message['content'] or '') -}}
+    {%- set ns.prev = 'other' -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+  {{- assistant_token -}}
+  {%- if thinking -%}
+    {{- think_start -}}
+  {%- else -%}
+    {{- think_end -}}
+  {%- endif -%}
+{%- endif -%}
+{%- if forces_call -%}
+  {{- '\n\n<' + dsml + ' calls>\n' -}}
+{%- endif -%}

@@ -1,0 +1,34 @@
+Source of the expected prompts in `cases.json`
+==============================================
+
+Every `expected` text in `cases.json` is what DeepSeek's own V4.1 prompt
+encoder writes for the case's request: the recipe's `DeepseekV41Encoding`,
+rendered with the default special tokens, which are V4.1's.
+
+  recipe:  /Users/hckim/orca/briefs/w2300/night/deepinfer/src/deepseek-recipe
+  commit:  935817c66f5d6e64838f419692545f06787e485f
+            ("docs: update build-python-wheel.md")
+  encoder: deepseek-recipe-encoding/src/v4/dsv41.rs (`DeepseekV41Encoding`)
+
+The generator is a small program outside both repositories, at
+
+  /Users/hckim/orca/briefs/w2300/night/v41enc/oracle
+
+It reads its own case file, `cases.json` (the same folder), maps each case's
+`request` — the chat request bloomery's API would carry — into the recipe's
+`Conversation` the way bloomery's V4.1 seat maps it (the mapping is
+`oracle/src/main.rs`), renders it, and writes this fixture.
+
+Regenerate with:
+
+  cd /Users/hckim/orca/briefs/w2300/night/v41enc/oracle
+  cargo run --release -- cases.json \
+    /Users/hckim/repo/bloomery-v41enc/crates/serve/tests/fixtures/v41-official/cases.json
+
+The gate that reads it is `the_official_v41_template_renders_the_recipe_prompts`
+in `crates/serve/src/api.rs`: it renders every case through the server's
+`/apply-template` and holds the prompt byte-equal to the `expected` text.
+
+A case the chat API cannot express carries `"expressible": false` and a note
+saying why; the gate holds that its text is one the official encoding writes
+and ours does not.

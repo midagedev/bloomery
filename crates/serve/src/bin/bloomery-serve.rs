@@ -143,6 +143,7 @@ fn main() -> ExitCode {
         model_alias: args.alias.unwrap_or(alias),
         model_path: args.model.clone().unwrap_or_else(|| "mock".to_owned()),
         chat_template: template,
+        chat_preparation: None,
         sampler: None,
         fatal_linger: FATAL_LINGER,
         slot_save_path: args.slot_save_path,

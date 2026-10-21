@@ -128,6 +128,10 @@ pub struct ServerConfig {
     pub model_path: String,
     /// Jinja chat template source (GGUF `tokenizer.chat_template`).
     pub chat_template: String,
+    /// The family's request preparation, which shapes a request before the
+    /// template renders it; `None` renders the request as the template reads
+    /// it.
+    pub chat_preparation: Option<ChatPreparation>,
     /// Per-request sampler builder; `None` uses [`sampling::reference_factory`].
     pub sampler: Option<SamplerFactory>,
     /// How long `/health` keeps answering 503 after an engine error before
@@ -140,6 +144,36 @@ pub struct ServerConfig {
     /// The API keys the request check asks for (`--api-key`,
     /// `--api-key-file`); an empty set checks nothing.
     pub api_keys: ApiKeys,
+}
+
+/// A family's request preparation: it shapes a request before the template
+/// renders it, and refuses it by name when it cannot.
+///
+/// The family supplies one with its chat template; `None` renders the request
+/// as the template reads it.
+pub type ChatPreparation = fn(&mut ChatRequest<'_>) -> Result<(), String>;
+
+/// What a request preparation reads and writes: the messages as the template
+/// will see them, the request body, the template's variables, and the guard
+/// that marks client text.
+pub struct ChatRequest<'a> {
+    /// The messages, flattened, as the template will see them.
+    pub messages: &'a mut Vec<Value>,
+    /// The request body.
+    pub body: &'a Map<String, Value>,
+    /// The template's variables; the preparation adds the ones the template
+    /// reads and the request body holds.
+    pub vars: &'a mut Map<String, Value>,
+    /// Marks a client text the way the request's other texts are marked.
+    marker: &'a dyn Fn(&mut Value),
+}
+
+impl ChatRequest<'_> {
+    /// Mark a client text: a special token's spelling in it stays text in the
+    /// prompt, as in every other text the client sends.
+    pub fn mark(&self, value: &mut Value) {
+        (self.marker)(value);
+    }
 }
 
 /// Connections served at once, each on a thread of its own. Past the requests
@@ -375,6 +409,7 @@ impl Server {
             tool_format: ToolFormat::of_chat_template(&template),
             object_arguments: needs_object_arguments(&template),
             thinking_off,
+            preparation: config.chat_preparation,
             think: ThinkTags::THINK,
             template,
             alias: config.model_alias,
@@ -534,6 +569,10 @@ struct State {
     /// How the template answers `reasoning_effort: "none"`
     /// ([`probe_thinking_off`]), decided once.
     thinking_off: ThinkingOff,
+    /// The family's request preparation, which shapes a request before the
+    /// template renders it; `None` renders the request as the template reads
+    /// it.
+    preparation: Option<ChatPreparation>,
     /// The tags of the model's think span, `<think>` and `</think>` until a
     /// seat names others ([`Server::with_think_tags`]).
     think: ThinkTags,
@@ -2526,7 +2565,6 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         messages.push(Value::Object(flat));
     }
     let mut vars = Map::new();
-    vars.insert("messages".into(), Value::Array(messages));
     vars.insert(
         "add_generation_prompt".into(),
         Value::Bool(get_b(b, "add_generation_prompt")?.unwrap_or(true)),
@@ -2549,6 +2587,20 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         Some(other) => return Err(wrong_type("tools", "an array", other)),
     }
     thinking_vars(b, &mut vars, state.thinking_off)?;
+    if let Some(preparation) = state.preparation {
+        // The family's preparation shapes the request before the template
+        // renders it: it rewrites the messages and adds the variables its
+        // template reads.
+        let mut request = ChatRequest {
+            messages: &mut messages,
+            body: b,
+            vars: &mut vars,
+            marker: &|value| guard.value(value),
+        };
+        preparation(&mut request).map_err(invalid)?;
+    }
+    // The messages go in last: a preparation may have rewritten them.
+    vars.insert("messages".into(), Value::Array(messages));
     if let Some(Value::Object(kwargs)) = b.get("chat_template_kwargs") {
         // What the kwargs put into the vars as they came is the client's text.
         for (k, v) in kwargs {
@@ -6358,6 +6410,7 @@ mod tests {
             let config = ServerConfig {
                 model_alias: "mock".to_owned(),
                 model_path: "mock.gguf".to_owned(),
+                chat_preparation: None,
                 chat_template: concat!(
                     "{%- for message in messages %}",
                     "{{- '<' + message.role + '>\\n' + message.content }}",
@@ -7332,6 +7385,116 @@ mod tests {
             "another effort reaches the template: {p}"
         );
         assert!(p.ends_with("<think>\n"), "its span stays open: {p}");
+    }
+
+    /// The official V4.1 encoding's prompts: DeepSeek's own encoder renders
+    /// them (the fixture's `expected` text, generated by the recipe's
+    /// `DeepseekV41Encoding`), and the official template renders the same
+    /// text for the same request.
+    ///
+    /// A case the chat API cannot express is named in the fixture as such,
+    /// and the test holds that its text is one the official encoding writes
+    /// and ours does not.
+    #[test]
+    fn the_official_v41_template_renders_the_recipe_prompts() {
+        /// The first byte at which two prompts differ, and the line each
+        /// holds there.
+        fn difference(expected: &str, got: &str) -> String {
+            let at = expected
+                .char_indices()
+                .zip(got.chars())
+                .find(|((_, a), b)| a != b)
+                .map_or_else(|| expected.len().min(got.len()), |((at, _), _)| at);
+            fn line(text: &str, at: usize) -> &str {
+                let start = text[..at].rfind('\n').map_or(0, |at| at + 1);
+                let end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+                &text[start..end]
+            }
+            format!(
+                "first difference at byte {at}\n  expected: {}\n  got:      {}",
+                line(expected, at),
+                line(got, at)
+            )
+        }
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/v41-official/cases.json"))
+                .expect("the fixture is JSON");
+        let mut config = templated(crate::v41::TEMPLATE);
+        config.chat_preparation = Some(crate::v41::prepare);
+        let (addr, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), config);
+        let mut not_expressible = Vec::new();
+        for case in &cases {
+            let name = case["name"].as_str().expect("a case has a name");
+            let expected = case["expected"].as_str().expect("a case has its text");
+            let (status, answer) = applied(addr, &case["request"]);
+            assert_eq!(status, 200, "{name}: {answer}");
+            let prompt = applied_prompt(&answer);
+            if case["expressible"].as_bool().unwrap_or(true) {
+                assert_eq!(
+                    prompt,
+                    expected,
+                    "{name}: {}",
+                    difference(expected, &prompt)
+                );
+            } else {
+                assert_ne!(
+                    prompt, expected,
+                    "{name}: the case is not expressible, and renders the official text"
+                );
+                not_expressible.push(name);
+            }
+        }
+        assert_eq!(not_expressible, ["prefix-continuation"]);
+    }
+
+    /// A server with no request preparation renders a request that carries a
+    /// tool choice and a response format as it did before the official
+    /// encoding: the two reach no template, so the response format is not
+    /// written and no tool call is forced. The tools themselves reach the
+    /// template, which every family's does.
+    #[test]
+    fn a_server_without_a_preparation_ignores_the_tool_choice_and_the_response_format() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            templated(crate::v41::TEMPLATE),
+        );
+        let body = json!({
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "f", "parameters": { "type": "object" } },
+            }],
+            "tool_choice": "required",
+            "response_format": { "type": "json_object" },
+        });
+        let (status, answer) = applied(addr, &body);
+        assert_eq!(status, 200, "{answer}");
+        let prompt = applied_prompt(&answer);
+        assert!(
+            prompt.contains("### Available Tool Schemas"),
+            "the tools reach the template: {prompt}"
+        );
+        assert!(
+            !prompt.contains("## Response Format:"),
+            "the response format is not written: {prompt}"
+        );
+        assert!(
+            !prompt.ends_with("\n\n<｜DSML｜ calls>\n"),
+            "no tool call is forced: {prompt}"
+        );
+    }
+
+    /// The official V4.1 template teaches the spaced DSML markup, the one a
+    /// V4.1 model writes: the block is ` calls`, the call is ` invoke` and the
+    /// parameter is ` parameter`.
+    #[test]
+    fn the_official_v41_template_teaches_the_spaced_dsml_markup() {
+        let parsed = ChatTemplate::parse(crate::v41::TEMPLATE).expect("the template parses");
+        assert_eq!(
+            crate::dsml::ToolFormat::of_chat_template(&parsed),
+            crate::dsml::ToolFormat::Dsml(crate::dsml::Spelling::Spaced)
+        );
     }
 
     /// Any `reasoning_effort` but `"none"` asks for reasoning: on V4.1's

@@ -47,12 +47,13 @@ pub mod screen;
 mod slotfile;
 mod stop;
 mod swap;
+pub mod v41;
 pub mod video;
 mod worker;
 
 pub use api::{
-    COMMIT, EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE, MAX_CONNECTIONS, ServeError, Server,
-    ServerConfig, VERSION, panic_text,
+    COMMIT, ChatPreparation, ChatRequest, EngineFailure, FATAL_LINGER, KEEP_ALIVE_IDLE,
+    MAX_CONNECTIONS, ServeError, Server, ServerConfig, VERSION, panic_text,
 };
 pub use engine::{
     CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine, EngineError, EngineProps, Flight,
