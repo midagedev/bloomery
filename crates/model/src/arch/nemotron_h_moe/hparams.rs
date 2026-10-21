@@ -53,6 +53,9 @@ impl Kind {
     }
 }
 
+/// Every kind a layer of the file may be.
+const KINDS: [Kind; 3] = [Kind::Mamba, Kind::Attention, Kind::Moe];
+
 /// One MoE layer's routed experts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Experts {
@@ -201,12 +204,7 @@ impl Hparams {
             }
             routed_arrays_agree(split, l, kind, expert_ff[l], top_k[l])?;
         }
-        layers_agree(
-            split,
-            &kinds,
-            roles::stems_of,
-            &[Kind::Mamba, Kind::Attention, Kind::Moe],
-        )?;
+        layers_agree(split, &kinds, roles::stems_of, &KINDS)?;
         let experts = kinds
             .iter()
             .enumerate()

@@ -83,11 +83,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
     let mut model = classify_with(
         split,
         |name| role(name, hp.n_layer),
-        Counts {
-            layers: hp.n_layer,
-            experts: hp.experts.n_expert as u64,
-            experts_used: hp.experts.n_used as u64,
-        },
+        Counts::new(hp.n_layer, hp.experts.n_expert, hp.experts.n_used),
     )?;
     for t in &mut model.tensors {
         t.gathered_rows = gathered_rows(split, t)?;

@@ -35,13 +35,5 @@ fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
 
 /// Every tensor of `split` with its role and header facts.
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
-    classify_with(
-        split,
-        |name| role(name, hp),
-        Counts {
-            layers: hp.n_layer,
-            experts: 0,
-            experts_used: 0,
-        },
-    )
+    classify_with(split, |name| role(name, hp), Counts::new(hp.n_layer, 0, 0))
 }

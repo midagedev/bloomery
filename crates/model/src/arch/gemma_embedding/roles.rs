@@ -16,10 +16,6 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
             "output_norm.weight" | "output.weight" | DENSE_2 | DENSE_3 => Some((Role::Head, None)),
             _ => crate::arch::gemma_encoder::layer_role(name, hp.n_layer, &[]),
         },
-        Counts {
-            layers: hp.n_layer,
-            experts: 0,
-            experts_used: 0,
-        },
+        Counts::new(hp.n_layer, 0, 0),
     )
 }

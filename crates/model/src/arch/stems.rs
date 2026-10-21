@@ -86,13 +86,29 @@ pub const DENSE: &[Stem] = &[
 /// when the file carries it.
 pub const SELECTION_BIAS: &str = "exp_probs_b.bias";
 
-/// A routed layer's feed-forward block: the pre-FFN norm, the router with its optional selection
-/// bias, and the routed stacks.
-pub const MOE: &[Stem] = &[
+/// A routed layer's router: the pre-FFN norm and the router itself.
+pub(crate) const MOE_ROUTER: &[Stem] = &[
     req("ffn_norm.weight", Role::FfnNorm),
     req("ffn_gate_inp.weight", Role::Router),
-    opt(SELECTION_BIAS, Role::Router),
+];
+
+/// A routed layer's routed stacks.
+pub(crate) const MOE_STACKS: &[Stem] = &[
     req("ffn_gate_exps.weight", Role::RoutedExperts),
     req("ffn_up_exps.weight", Role::RoutedExperts),
     req("ffn_down_exps.weight", Role::RoutedExperts),
+];
+
+/// The router's selection bias, which the file may carry.
+const BIAS_OPTIONAL: &[Stem] = &[opt(SELECTION_BIAS, Role::Router)];
+
+/// A routed layer's feed-forward block: the pre-FFN norm, the router with its optional selection
+/// bias, and the routed stacks.
+pub const MOE: &[Stem] = &join::<6>(&[MOE_ROUTER, BIAS_OPTIONAL, MOE_STACKS]);
+
+/// A routed layer's shared expert, when the file has one.
+pub const SHARED: &[Stem] = &[
+    req("ffn_gate_shexp.weight", Role::SharedExpert),
+    req("ffn_up_shexp.weight", Role::SharedExpert),
+    req("ffn_down_shexp.weight", Role::SharedExpert),
 ];

@@ -6,26 +6,19 @@
 use gguf::Split;
 use models::{Act, Ffn, Moe, Router, Score, Shared};
 
-use crate::arch::stems::{Stem, req};
+use crate::arch::stems::{MOE_ROUTER, MOE_STACKS, SELECTION_BIAS, SHARED, Stem, join, req};
 use crate::arch::{
     expert_counts, finite_positive, meta_bool, mul, one_expert_group, positive, sigmoid_gating,
     spec_u32,
 };
 use crate::placement::{PlacementError, Role};
 
+/// The router's selection bias, which this family's file always carries.
+const BIAS: &[Stem] = &[req(SELECTION_BIAS, Role::Router)];
+
 /// A routed layer's feed-forward block: the router with its selection bias, the routed stacks and
 /// the shared expert.
-pub(in crate::arch) const BLOCK: &[Stem] = &[
-    req("ffn_norm.weight", Role::FfnNorm),
-    req("ffn_gate_inp.weight", Role::Router),
-    req("exp_probs_b.bias", Role::Router),
-    req("ffn_gate_exps.weight", Role::RoutedExperts),
-    req("ffn_up_exps.weight", Role::RoutedExperts),
-    req("ffn_down_exps.weight", Role::RoutedExperts),
-    req("ffn_gate_shexp.weight", Role::SharedExpert),
-    req("ffn_up_shexp.weight", Role::SharedExpert),
-    req("ffn_down_shexp.weight", Role::SharedExpert),
-];
+pub(in crate::arch) const BLOCK: &[Stem] = &join::<9>(&[MOE_ROUTER, BIAS, MOE_STACKS, SHARED]);
 
 /// Every key [`Experts::read`] reads, by suffix.
 pub(in crate::arch) const KEYS: &[&str] = &[

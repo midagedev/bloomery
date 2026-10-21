@@ -14,7 +14,7 @@ use crate::arch::kda;
 use crate::arch::stems::{opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
-pub use crate::arch::stems::{DENSE, MOE, SELECTION_BIAS, Stem, required};
+pub use crate::arch::stems::{DENSE, MOE, SELECTION_BIAS, SHARED, Stem, required};
 pub(super) use crate::arch::stems::{DENSE_DOWN, DENSE_GATE};
 
 /// The KDA mixer's stems: the common [`kda`] module's table, which every
@@ -41,13 +41,6 @@ pub const LATENT: &[Stem] = &[
     req("indexer.proj.weight", Role::Attention),
     req("indexer_compressor_gate.weight", Role::Attention),
     req("indexer_compressor_ape.weight", Role::Attention),
-];
-
-/// A routed layer's shared expert, when the file has one.
-pub const SHARED: &[Stem] = &[
-    req("ffn_gate_shexp.weight", Role::SharedExpert),
-    req("ffn_up_shexp.weight", Role::SharedExpert),
-    req("ffn_down_shexp.weight", Role::SharedExpert),
 ];
 
 /// The hyper-connection tensors: every trunk layer's, no next-token layer's.

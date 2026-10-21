@@ -12,21 +12,25 @@ pub use crate::arch::names::{
 /// The part after `blk.{N}.` of every per-layer name above, in the order
 /// above. Each layer carries all of them and nothing else; the router
 /// (`ffn_gate_inp`) is on every layer, for this architecture has no dense FFN
-/// (`Hparams` refuses a layer without it).
-pub const LAYER: [&str; 12] = [
-    "attn_norm.weight",
-    "attn_q.weight",
-    "attn_k.weight",
-    "attn_v.weight",
-    "attn_q_norm.weight",
-    "attn_k_norm.weight",
-    "attn_output.weight",
-    "ffn_norm.weight",
-    "ffn_gate_inp.weight",
-    "ffn_gate_exps.weight",
-    "ffn_up_exps.weight",
-    "ffn_down_exps.weight",
-];
+/// (`Hparams` refuses a layer without it). The table the classifier walks
+/// (`roles::STEMS`) holds them, in this order.
+pub const LAYER: [&str; 12] = layer_stems();
+
+/// The classifier's table's stems, in order, as the names above.
+const fn layer_stems() -> [&'static str; 12] {
+    let stems = super::roles::STEMS;
+    assert!(
+        stems.len() == 12,
+        "the classifier's table's stems are not the twelve the names hold"
+    );
+    let mut out = [""; 12];
+    let mut i = 0;
+    while i < out.len() {
+        out[i] = stems[i].name;
+        i += 1;
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {

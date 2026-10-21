@@ -13,7 +13,7 @@ use crate::placement::{ModelTensors, PlacementError, Role};
 
 /// The stems every layer carries and nothing else: the attention block with its per-head norms, the
 /// pre-FFN norm, the router and the routed stacks ([`names::LAYER`], in its order).
-const STEMS: &[Stem] = &[
+pub(super) const STEMS: &[Stem] = &[
     req("attn_norm.weight", Role::Attention),
     req("attn_q.weight", Role::Attention),
     req("attn_k.weight", Role::Attention),

@@ -14,7 +14,7 @@
 use gguf::Split;
 
 use super::hparams::{Hparams, Variant};
-use crate::arch::classify::{Counts, block_role_with_nextn, classify_with};
+use crate::arch::classify::{Counts, block_role_with_nextn, block_stem, classify_with};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
 /// The role of a stem qwen35moe and qwen35 share: the GDN layers' mixer, the
@@ -205,11 +205,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
     // body reads none in its words.
     model.bf16_words = if hp.variant == Variant::Qwen4Exp {
         |t| {
-            let stem = t
-                .name
-                .strip_prefix("blk.")
-                .and_then(|name| name.split_once('.'))
-                .map_or(t.name.as_str(), |(_, stem)| stem);
+            let stem = block_stem(&t.name, usize::MAX).map_or(t.name.as_str(), |(_, stem)| stem);
             matches!(
                 stem,
                 "output.weight"
