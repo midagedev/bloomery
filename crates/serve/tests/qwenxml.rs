@@ -28,13 +28,16 @@ use common::{post, start_templated};
 use serde_json::{Value, json};
 use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, ToolFormat, Tools};
 use serve::glmxml::KvSpelling;
-use serve::qwenxml::{ParamKinds, QwenXmlError};
+use serve::qwenxml::{Framing, ParamKinds, QwenXmlError};
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
 
 const TEMPLATE: &str = include_str!("fixtures/qwen38-chat-template.jinja");
 const QWEN36: &str = include_str!("fixtures/qwen36-chat-template.jinja");
 const QWEN3: &str = include_str!("fixtures/qwen3-chat-template.jinja");
+/// MiMo-V2.6's template (the RL and MOPD checkpoints' are byte-identical): it
+/// renders a call compactly, `<parameter=KEY>VALUE</parameter>`.
+const MIMO: &str = include_str!("fixtures/mimo-chat-template.jinja");
 
 #[path = "common/fixture_templates.rs"]
 mod fixture_templates;
@@ -104,8 +107,11 @@ fn tools() -> Value {
     ])
 }
 
-fn qwen() -> Option<Tools> {
-    Some(Tools::QwenXml(ParamKinds::of_tools(Some(&tools()))))
+fn qwen(framing: Framing) -> Option<Tools> {
+    Some(Tools::QwenXml(
+        framing,
+        ParamKinds::of_tools(Some(&tools())),
+    ))
 }
 
 fn call(index: usize, name: &str, arguments: &str) -> ToolCall {
@@ -440,11 +446,12 @@ fn malformed() -> Vec<(&'static str, &'static str, QwenXmlError)> {
 
 /// Feeds `pieces` one by one; the deltas' sum, checked against the message.
 fn streamed(
+    framing: Framing,
     prompt: &str,
     format: ReasoningFormat,
     pieces: &[&str],
 ) -> Result<Message, MarkupError> {
-    let mut p = ChatParser::with_tools(prompt, format, qwen());
+    let mut p = ChatParser::with_tools(prompt, format, qwen(framing));
     let mut total = Message::default();
     let mut add = |d: Message| {
         total.reasoning.push_str(&d.reasoning);
@@ -465,7 +472,7 @@ fn streamed(
 fn hw_qwen_fixtures_parse_to_expected_messages() {
     let mut wrong = Vec::new();
     for (name, prompt, format, raw, want) in fixtures() {
-        match streamed(prompt, format, &[raw]) {
+        match streamed(Framing::Lines, prompt, format, &[raw]) {
             Ok(got) if got == want => {
                 for c in &got.calls {
                     let v: Value = serde_json::from_str(&c.arguments).expect("arguments are JSON");
@@ -490,7 +497,7 @@ fn hw_qwen_fixtures_parse_to_expected_messages() {
 fn hw_qwen_malformed_calls_are_named_errors() {
     let mut wrong = Vec::new();
     for (name, raw, want) in malformed() {
-        match streamed(ON, ReasoningFormat::Deepseek, &[raw]) {
+        match streamed(Framing::Lines, ON, ReasoningFormat::Deepseek, &[raw]) {
             Err(e) if e == MarkupError::Qwen(want.clone()) => {}
             got => wrong.push(format!("{name}:\n  got  {got:?}\n  want Err({want:?})")),
         }
@@ -524,12 +531,375 @@ fn hw_qwen_parse_does_not_depend_on_chunking() {
     for (name, prompt, format, raw, want) in cases {
         for pieces in common::every_chunking(raw, 1) {
             assert_eq!(
-                streamed(prompt, format, &pieces),
+                streamed(Framing::Lines, prompt, format, &pieces),
                 want,
                 "{name}: {pieces:?}"
             );
         }
     }
+}
+
+// ------------------------------------------------------- the compact framing
+
+/// The framing the server reads from the MiMo template's rendered call; any
+/// other format is a named failure.
+fn mimo_framing() -> Framing {
+    let t = ChatTemplate::parse(MIMO).expect("template parses");
+    match ToolFormat::of_chat_template(&t) {
+        ToolFormat::QwenXml(framing) => framing,
+        other => panic!("MiMo's template types to {other:?}, not Qwen3-Coder's markup"),
+    }
+}
+
+/// The MiMo template's prompt after one user turn, thinking off.
+fn mimo_prompt() -> String {
+    let t = ChatTemplate::parse(MIMO).expect("template parses");
+    let Value::Object(vars) = json!({
+        "messages": [{"role": "user", "content": "q"}],
+        "add_generation_prompt": true,
+        "enable_thinking": false,
+    }) else {
+        panic!("vars")
+    };
+    t.render(&vars).expect("render")
+}
+
+/// `get_weather(city: string)`, the one tool of the llama.cpp reference's run.
+fn weather_tools() -> Value {
+    json!([{"type": "function", "function": {"name": "get_weather", "parameters": {
+        "type": "object", "properties": {"city": {"type": "string"}}}}}])
+}
+
+/// A template types its markup's framing from the call it renders, not from
+/// its name or from its source's spelling alone: MiMo's compact call is
+/// [`Framing::Compact`], the Qwen3.6, Qwen3.8 and Nemotron calls (a value on a
+/// line of its own) are [`Framing::Lines`], and so are two small templates
+/// that differ in nothing but how they write a value. A template that spells
+/// the tags and renders no call keeps the spelled markup's own framing.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_framing_follows_the_rendered_call() {
+    let compact = ToolFormat::QwenXml(Framing::Compact);
+    let lines = ToolFormat::QwenXml(Framing::Lines);
+    let t = ChatTemplate::parse(MIMO).expect("template parses");
+    assert_eq!(ToolFormat::of_chat_template(&t), compact);
+    assert_eq!(ToolFormat::of_template(MIMO), compact);
+    for name in ["qwen36", "qwen38", "nemotron", "nemotron-bolt"] {
+        let source = template_named(name);
+        let t = ChatTemplate::parse(source).expect("template parses");
+        assert_eq!(ToolFormat::of_chat_template(&t), lines, "{name}");
+        assert_eq!(ToolFormat::of_template(source), lines, "{name}");
+    }
+    let small = |value: &str| {
+        format!(
+            "{{%- for m in messages -%}}{{%- if m.tool_calls -%}}{{%- for c in m.tool_calls -%}}\
+             <tool_call><function={{{{ c.function.name }}}}>\
+             {{%- for k, v in c.function.arguments.items() -%}}\
+             <parameter={{{{ k }}}}>{value}</parameter>\
+             {{%- endfor -%}}</function></tool_call>\
+             {{%- endfor -%}}{{%- endif -%}}{{%- endfor -%}}"
+        )
+    };
+    assert_eq!(ToolFormat::of_template(&small("{{ v }}")), compact);
+    assert_eq!(ToolFormat::of_template(&small("\n{{ v }}\n")), lines);
+    let no_call = "{{- raise_exception('nothing renders') }}<tool_call><function=f><parameter=p>";
+    assert_eq!(ToolFormat::of_template(no_call), lines);
+}
+
+/// The two outputs the llama.cpp reference's autoparser (mainline,
+/// `tools/ref/chat_parse_ref`, MiMo's template, thinking off, one
+/// `get_weather(city: string)`) parses, to the arguments it reads: `peg-native`
+/// format, `{"city":"Seoul"}` for a value bare between its tags, and
+/// `{"city":"\nSeoul\n"}` for one the model wrote on lines of its own — under
+/// the compact framing the newlines are the value's bytes. The same text under
+/// every cut yields the same call.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_compact_calls_parse_as_the_reference_reads_them() {
+    let framing = mimo_framing();
+    assert_eq!(framing, Framing::Compact);
+    let prompt = mimo_prompt();
+    let cases = [
+        (
+            "a value bare between its tags",
+            "<tool_call>\n<function=get_weather>\n<parameter=city>Seoul</parameter></function>\n</tool_call>",
+            r#"{"city":"Seoul"}"#,
+        ),
+        (
+            "a value on lines of its own",
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nSeoul\n</parameter>\n</function>\n</tool_call>",
+            r#"{"city":"\nSeoul\n"}"#,
+        ),
+    ];
+    for (name, raw, arguments) in cases {
+        let want = msg("", "", vec![call(0, "get_weather", arguments)]);
+        for pieces in common::every_chunking(raw, 1) {
+            let mut p = ChatParser::with_tools(
+                &prompt,
+                ReasoningFormat::Deepseek,
+                Some(Tools::QwenXml(
+                    framing,
+                    ParamKinds::of_tools(Some(&weather_tools())),
+                )),
+            );
+            for piece in &pieces {
+                p.try_push(piece)
+                    .unwrap_or_else(|e| panic!("{name}: {e}: {pieces:?}"));
+            }
+            p.try_finish()
+                .unwrap_or_else(|e| panic!("{name}: {e}: {pieces:?}"));
+            assert_eq!(p.message(), &want, "{name}: {pieces:?}");
+        }
+    }
+}
+
+/// `(name, raw output, expected message)` under [`Framing::Compact`]: a value
+/// is the bytes between `<parameter=KEY>` and `</parameter>`, and whitespace
+/// between tags is skipped, as the reference's parser reads the markup. The
+/// parameter's schema types the value as it does under the lines framing.
+fn compact_fixtures() -> Vec<(&'static str, &'static str, Message)> {
+    vec![
+        (
+            "the template's own call, no whitespace at all",
+            "<tool_call><function=get_weather><parameter=location>Seoul</parameter><parameter=days>3</parameter></function></tool_call>",
+            msg(
+                "",
+                "",
+                vec![call(0, "get_weather", r#"{"location":"Seoul","days":3}"#)],
+            ),
+        ),
+        (
+            "newlines between the tags are skipped",
+            "<tool_call>\n<function=get_weather>\n<parameter=location>Seoul</parameter>\n<parameter=days>3</parameter>\n</function>\n</tool_call>",
+            msg(
+                "",
+                "",
+                vec![call(0, "get_weather", r#"{"location":"Seoul","days":3}"#)],
+            ),
+        ),
+        (
+            "a value's own newlines are its bytes",
+            "<tool_call><function=get_weather><parameter=location>\nSeoul\n</parameter></function></tool_call>",
+            msg(
+                "",
+                "",
+                vec![call(0, "get_weather", r#"{"location":"\nSeoul\n"}"#)],
+            ),
+        ),
+        (
+            "the lines framing's value is a value with a newline before the close",
+            "<tool_call><function=get_weather><parameter=location>Seoul\n</parameter></function></tool_call>",
+            msg(
+                "",
+                "",
+                vec![call(0, "get_weather", r#"{"location":"Seoul\n"}"#)],
+            ),
+        ),
+        (
+            "indentation and trailing newlines are kept",
+            "<tool_call><function=run_python><parameter=code>    print(\"hi\")\n\n</parameter></function></tool_call>",
+            msg(
+                "",
+                "",
+                vec![call(0, "run_python", r#"{"code":"    print(\"hi\")\n\n"}"#)],
+            ),
+        ),
+        (
+            "an empty value",
+            "<tool_call><function=run_python><parameter=code></parameter></function></tool_call>",
+            msg("", "", vec![call(0, "run_python", r#"{"code":""}"#)]),
+        ),
+        (
+            "object, array and boolean values typed by the schema",
+            "<tool_call><function=save_note><parameter=filter>{\"n\": [1, 2], \"q\": \"서울 ☃\"}</parameter><parameter=tags>[\"a\", \"b\"]</parameter><parameter=pinned>true</parameter><parameter=text>a<b & \"c\"</parameter></function></tool_call>",
+            msg(
+                "",
+                "",
+                vec![call(
+                    0,
+                    "save_note",
+                    r#"{"filter":{"n": [1, 2], "q": "서울 ☃"},"tags":["a", "b"],"pinned":true,"text":"a<b & \"c\""}"#,
+                )],
+            ),
+        ),
+        (
+            "near-tags in a value, and a function close inside it",
+            "<tool_call><function=run_python><parameter=code>a </parameter x> </tool_ca x> </function></parameter></function></tool_call>",
+            msg(
+                "",
+                "",
+                vec![call(
+                    0,
+                    "run_python",
+                    r#"{"code":"a </parameter x> </tool_ca x> </function>"}"#,
+                )],
+            ),
+        ),
+        (
+            "text before the first call, two calls",
+            "Let me check.<tool_call><function=get_time></function></tool_call><tool_call><function=get_weather><parameter=location>Busan</parameter></function></tool_call>",
+            msg(
+                "",
+                "Let me check.",
+                vec![
+                    call(0, "get_time", "{}"),
+                    call(1, "get_weather", r#"{"location":"Busan"}"#),
+                ],
+            ),
+        ),
+    ]
+}
+
+/// Markup that does not parse under [`Framing::Compact`] is still a named
+/// error: the schema's typing, the tags and the unclosed value.
+fn compact_malformed() -> Vec<(&'static str, &'static str, QwenXmlError)> {
+    vec![
+        (
+            "an unclosed value at the end",
+            "<tool_call><function=get_weather><parameter=location>Seoul",
+            QwenXmlError::Unterminated {
+                index: 0,
+                text: "<tool_call><function=get_weather><parameter=location>Seoul".to_owned(),
+            },
+        ),
+        (
+            "an integer parameter that is not JSON",
+            "<tool_call><function=get_weather><parameter=days>three</parameter></function></tool_call>",
+            QwenXmlError::NotJson {
+                index: 0,
+                name: "get_weather".to_owned(),
+                key: "days".to_owned(),
+                ty: "integer".to_owned(),
+                value: "three".to_owned(),
+            },
+        ),
+        (
+            "a parameter the schema lacks",
+            "<tool_call><function=get_weather><parameter=unit>C</parameter></function></tool_call>",
+            QwenXmlError::UnknownParameter {
+                index: 0,
+                name: "get_weather".to_owned(),
+                key: "unit".to_owned(),
+            },
+        ),
+        (
+            "a parameter given twice",
+            "<tool_call><function=get_weather><parameter=location>Seoul</parameter><parameter=location>Busan</parameter></function></tool_call>",
+            QwenXmlError::DuplicateParameter {
+                index: 0,
+                name: "get_weather".to_owned(),
+                key: "location".to_owned(),
+            },
+        ),
+        (
+            "text between the parameters",
+            "<tool_call><function=get_time>junk</function></tool_call>",
+            QwenXmlError::Unexpected {
+                index: 0,
+                name: "get_time".to_owned(),
+                expected: "a parameter or the function's close",
+                found: "junk</function></tool_call>".to_owned(),
+            },
+        ),
+        (
+            "the function's close not followed by the call's",
+            "<tool_call><function=get_time></function>done",
+            QwenXmlError::Unexpected {
+                index: 0,
+                name: "get_time".to_owned(),
+                expected: "</tool_call>",
+                found: "done".to_owned(),
+            },
+        ),
+    ]
+}
+
+/// The compact tables parse to their messages and errors, whole and under
+/// every cut, in the framing the MiMo template's call types to.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_compact_framing_parses_and_names_its_errors_under_every_cut() {
+    let framing = mimo_framing();
+    assert_eq!(framing, Framing::Compact);
+    let prompt = mimo_prompt();
+    let cases = compact_fixtures()
+        .into_iter()
+        .map(|(name, raw, want)| (name, raw, Ok(want)))
+        .chain(
+            compact_malformed()
+                .into_iter()
+                .map(|(name, raw, e)| (name, raw, Err(MarkupError::from(e)))),
+        );
+    for (name, raw, want) in cases {
+        for pieces in common::every_chunking(raw, 1) {
+            assert_eq!(
+                streamed(framing, &prompt, ReasoningFormat::Deepseek, &pieces),
+                want,
+                "{name}: {pieces:?}"
+            );
+        }
+    }
+}
+
+/// The calls the MiMo template writes, parsed and rendered back through the
+/// template, are the template's markup byte for byte.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_compact_calls_are_the_mimo_templates_markup() {
+    let t = ChatTemplate::parse(MIMO).expect("template");
+    let render = |calls: Value| {
+        let Value::Object(vars) = json!({
+            "messages": [
+                {"role": "user", "content": "Note it."},
+                {"role": "assistant", "content": "", "tool_calls": calls},
+            ],
+            "tools": [],
+            "add_generation_prompt": false,
+        }) else {
+            panic!("vars")
+        };
+        t.render(&vars).expect("render")
+    };
+    let first = render(json!([
+        {"type": "function", "function": {"name": "save_note", "arguments": {
+            "filter": {"n": [1, 2], "q": "서울 ☃"}, "text": "a<b & \"c\""}}},
+        {"type": "function", "function": {"name": "run_python", "arguments": {
+            "code": "def f():\n    return 1\n"}}},
+    ]));
+    // The prompt through the assistant's closed span, the script the calls.
+    let (head, script) = first
+        .split_once("<think></think>")
+        .expect("the assistant's closed span");
+    let prompt = format!("{head}<think></think>");
+    let script = script
+        .strip_suffix("<|im_end|>")
+        .expect("the assistant turn's end");
+    let mut p = ChatParser::with_tools(&prompt, ReasoningFormat::Deepseek, qwen(mimo_framing()));
+    let _ = p.try_push(script).expect("the markup parses");
+    let _ = p.try_finish().expect("the markup finishes");
+    let m = p.message().clone();
+    assert_eq!(m.content, "", "{m:?}");
+    assert_eq!(
+        m.calls,
+        vec![
+            call(
+                0,
+                "save_note",
+                r#"{"filter":{"n": [1, 2], "q": "서울 ☃"},"text":"a<b & \"c\""}"#,
+            ),
+            call(1, "run_python", r#"{"code":"def f():\n    return 1\n"}"#),
+        ],
+        "{m:?}"
+    );
+    let calls: Vec<Value> = m
+        .calls
+        .iter()
+        .map(|c| {
+            let args: Value = serde_json::from_str(&c.arguments).expect("JSON");
+            json!({"type": "function", "function": {"name": c.name, "arguments": args}})
+        })
+        .collect();
+    assert_eq!(render(json!(calls)), first);
 }
 
 /// Every generative seat's markup, the parser the server reads from it
@@ -540,7 +910,7 @@ fn seat_format(name: &str) -> ToolFormat {
         "v41" => ToolFormat::Dsml(Spelling::Joined),
         "glm5" => ToolFormat::KvMarkup(KvSpelling::Glm),
         "qwen3" => ToolFormat::Hermes,
-        "qwen36" | "qwen38" | "nemotron" | "nemotron-bolt" => ToolFormat::QwenXml,
+        "qwen36" | "qwen38" | "nemotron" | "nemotron-bolt" => ToolFormat::QwenXml(Framing::Lines),
         other => panic!("{other} is not in the seat table"),
     }
 }
@@ -570,8 +940,14 @@ fn hw_every_seat_template_has_a_parser() {
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_detection_follows_the_spelling() {
-    assert_eq!(ToolFormat::of_template(TEMPLATE), ToolFormat::QwenXml);
-    assert_eq!(ToolFormat::of_template(QWEN36), ToolFormat::QwenXml);
+    assert_eq!(
+        ToolFormat::of_template(TEMPLATE),
+        ToolFormat::QwenXml(Framing::Lines)
+    );
+    assert_eq!(
+        ToolFormat::of_template(QWEN36),
+        ToolFormat::QwenXml(Framing::Lines)
+    );
     assert_eq!(ToolFormat::of_template(QWEN3), ToolFormat::Unparsed);
     assert_eq!(
         ToolFormat::of_template(
@@ -620,7 +996,7 @@ fn hw_qwen_fixtures_are_the_templates_markup() {
     let script = script
         .strip_suffix("<|im_end|>\n")
         .expect("the assistant turn's end");
-    let mut p = ChatParser::with_tools(&prompt, ReasoningFormat::Deepseek, qwen());
+    let mut p = ChatParser::with_tools(&prompt, ReasoningFormat::Deepseek, qwen(Framing::Lines));
     let _ = p.try_push(script).expect("the markup parses");
     let _ = p.try_finish().expect("the markup finishes");
     let m = p.message().clone();
@@ -747,6 +1123,40 @@ fn hw_qwen_chat_tool_calls_stream_and_non_stream() {
     assert_eq!(folded["reasoning_content"], "Need the weather.");
     assert_eq!(folded["content"], "", "streamed == non-streamed");
     assert_eq!(folded["calls"], json!(calls), "streamed == non-streamed");
+}
+
+/// A server on MiMo's template answers a compact call, streamed and not: the
+/// request that answered `500` ("expected a newline after <parameter=KEY>")
+/// when every Qwen3-Coder template was read as the lines framing is a `200`
+/// with the call the reference reads, `get_weather {"city":"Seoul"}`.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_server_on_mimos_template_answers_a_compact_call() {
+    let script = "<tool_call>\n<function=get_weather>\n<parameter=city>Seoul</parameter></function>\n</tool_call>";
+    let addr = start_templated(Box::new(ScriptedEngine::new(4096, script)), MIMO);
+    let body = |stream: bool| {
+        json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "weather in Seoul?"}],
+            "temperature": 0,
+            "tools": weather_tools(),
+            "stream": stream,
+        })
+    };
+    let want = json!({"name": "get_weather", "arguments": r#"{"city":"Seoul"}"#});
+    let r = post(addr, "/v1/chat/completions", &body(false));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "tool_calls", "{v}");
+    assert_eq!(c["message"]["content"], "", "{v}");
+    assert_eq!(c["message"]["tool_calls"][0]["function"], want, "{v}");
+    let r = post(addr, "/v1/chat/completions", &body(true));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let (finish, folded) = fold_stream(&r.body).expect("no error event");
+    assert_eq!(finish, "tool_calls");
+    assert_eq!(folded["content"], "");
+    assert_eq!(folded["calls"], json!([want]), "streamed == non-streamed");
 }
 
 /// `/v1/messages` answers a generation with `tool_use` blocks and

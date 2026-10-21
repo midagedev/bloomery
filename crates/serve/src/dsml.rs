@@ -43,7 +43,7 @@ use crate::callstream::{self, Args, CallPiece, Progress, Streamer};
 use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
 use crate::glmxml::{self, ArgTypes, KvError, KvScan, KvSpelling};
 use crate::hermes::{self, HermesError, HermesScan};
-use crate::qwenxml::{self, ParamKinds, QwenScan, QwenXmlError};
+use crate::qwenxml::{self, Framing, ParamKinds, QwenScan, QwenXmlError};
 use crate::reasoning::{ReasoningFormat, Split, ThinkSplit, ThinkTags, partial_suffix};
 
 /// The template's `dsml_token`.
@@ -461,8 +461,9 @@ pub enum ToolFormat {
     /// `arguments` (Qwen3's markup).
     Hermes,
     /// Qwen3-Coder's `<tool_call>` around `<function=NAME>` and
-    /// `<parameter=KEY>` blocks (Qwen3.6's and Qwen3.8's markup).
-    QwenXml,
+    /// `<parameter=KEY>` blocks (Qwen3.6's and Qwen3.8's markup), its values
+    /// framed as the template renders a call ([`Framing`]).
+    QwenXml(Framing),
     /// None the server parses: a chat request that asks for tool calls is
     /// refused.
     Unparsed,
@@ -477,9 +478,44 @@ impl ToolFormat {
     /// spelling [`Spelling::of_template`] reads), else
     /// nothing the source alone can name — a `<tool_call>` template may carry
     /// Hermes' JSON body, which only a rendered call tells apart
-    /// ([`ToolFormat::of_chat_template`]).
+    /// ([`ToolFormat::of_chat_template`]). Qwen3-Coder's framing is read from
+    /// that rendered call too: the source is parsed and probed here, and a
+    /// source that does not render one is [`Framing::Lines`], the spelled
+    /// markup's own.
     #[must_use]
     pub fn of_template(source: &str) -> ToolFormat {
+        ToolFormat::spelled(source, || {
+            ChatTemplate::parse(source)
+                .ok()
+                .and_then(|t| qwen_framing(&t))
+        })
+    }
+
+    /// The markup a chat template teaches, read the way llama.cpp's
+    /// autoparser reads it: the source's own spellings first (the key/value tags,
+    /// Qwen3-Coder's with the framing its rendered call shows, the DSML token),
+    /// then a rendered assistant call for a
+    /// `<tool_call>` template the source cannot type by spelling — Hermes'
+    /// when some rendered `<tool_call>`…`</tool_call>` holds a JSON body
+    /// naming `name` and `arguments`. A template whose probe render fails
+    /// teaches nothing this server parses, except Qwen3-Coder's spelled markup,
+    /// which stays [`Framing::Lines`].
+    #[must_use]
+    pub fn of_chat_template(t: &ChatTemplate) -> ToolFormat {
+        let spelled = ToolFormat::spelled(t.source(), || qwen_framing(t));
+        if spelled != ToolFormat::Unparsed {
+            return spelled;
+        }
+        if probe_render(t).is_some_and(|p| hermes_markup(&p)) {
+            ToolFormat::Hermes
+        } else {
+            spelled
+        }
+    }
+
+    /// The source's own spelling, `framing` read (only when the source
+    /// spells Qwen3-Coder's markup) from a rendered call.
+    fn spelled(source: &str, framing: impl FnOnce() -> Option<Framing>) -> ToolFormat {
         let qwen = [
             qwenxml::CALL_OPEN,
             qwenxml::FUNCTION_OPEN,
@@ -488,53 +524,50 @@ impl ToolFormat {
         if let Some(spelling) = KvSpelling::of_template(source) {
             ToolFormat::KvMarkup(spelling)
         } else if qwen.iter().all(|tag| source.contains(tag)) {
-            ToolFormat::QwenXml
+            ToolFormat::QwenXml(framing().unwrap_or(Framing::Lines))
         } else if source.contains(DSML) {
             ToolFormat::Dsml(Spelling::of_template(source))
         } else {
             ToolFormat::Unparsed
         }
     }
+}
 
-    /// The markup a chat template teaches, read the way llama.cpp's
-    /// autoparser reads it: the source's own spellings first (the key/value tags,
-    /// Qwen3-Coder's, the DSML token), then a rendered assistant call for a
-    /// `<tool_call>` template the source cannot type by spelling — Hermes'
-    /// when some rendered `<tool_call>`…`</tool_call>` holds a JSON body
-    /// naming `name` and `arguments`. A template whose probe render fails
-    /// teaches nothing this server parses.
-    #[must_use]
-    pub fn of_chat_template(t: &ChatTemplate) -> ToolFormat {
-        let spelled = ToolFormat::of_template(t.source());
-        if spelled != ToolFormat::Unparsed {
-            return spelled;
-        }
-        let mut vars = Map::new();
-        vars.insert(
-            "messages".into(),
-            json!([
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "", "tool_calls": [
-                    {"type": "function", "function": {
-                        "name": "get_weather", "arguments": {"location": "Seoul"},
-                    }},
-                ]},
-            ]),
-        );
-        vars.insert("add_generation_prompt".into(), json!(false));
-        vars.insert(
-            "tools".into(),
-            json!([{"type": "function", "function": {
-                "name": "get_weather", "parameters": {"type": "object"},
-            }}]),
-        );
-        vars.insert("enable_thinking".into(), json!(true));
-        if t.render(&vars).is_ok_and(|p| hermes_markup(&p)) {
-            ToolFormat::Hermes
-        } else {
-            spelled
-        }
-    }
+/// The parameter and string value of the assistant call the probe renders.
+const PROBE_KEY: &str = "location";
+const PROBE_VALUE: &str = "Seoul";
+
+/// What `t` renders for a conversation whose last turn is an assistant call
+/// of `get_weather` with one string argument; `None` when it does not render.
+fn probe_render(t: &ChatTemplate) -> Option<String> {
+    let mut vars = Map::new();
+    vars.insert(
+        "messages".into(),
+        json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"type": "function", "function": {
+                    "name": "get_weather", "arguments": {PROBE_KEY: PROBE_VALUE},
+                }},
+            ]},
+        ]),
+    );
+    vars.insert("add_generation_prompt".into(), json!(false));
+    vars.insert(
+        "tools".into(),
+        json!([{"type": "function", "function": {
+            "name": "get_weather", "parameters": {"type": "object"},
+        }}]),
+    );
+    vars.insert("enable_thinking".into(), json!(true));
+    t.render(&vars).ok()
+}
+
+/// How a Qwen3-Coder template frames a value, read from the call it renders
+/// ([`probe_render`]); `None` when it renders no call, or one in neither
+/// framing.
+fn qwen_framing(t: &ChatTemplate) -> Option<Framing> {
+    Framing::of_rendered(&probe_render(t)?, PROBE_KEY, PROBE_VALUE)
 }
 
 /// Whether a rendered template spells the Hermes call markup: some
@@ -573,9 +606,9 @@ pub enum Tools {
     KvMarkup(KvSpelling, ArgTypes),
     /// Hermes' markup.
     Hermes,
-    /// Qwen3-Coder's markup, typing each parameter by the request's tool
-    /// schemas.
-    QwenXml(ParamKinds),
+    /// Qwen3-Coder's markup, its values framed as the template renders them,
+    /// typing each parameter by the request's tool schemas.
+    QwenXml(Framing, ParamKinds),
 }
 
 #[derive(Debug)]
@@ -663,7 +696,7 @@ impl ChatParser {
         let split = format == ReasoningFormat::Deepseek || tools.is_some();
         // Qwen3-Coder's call ends an open span without `</think>`, as
         // llama.cpp's parser for the markup reads it.
-        let call_ends_span = matches!(tools, Some(Tools::QwenXml(_)));
+        let call_ends_span = matches!(tools, Some(Tools::QwenXml(..)));
         ChatParser {
             format,
             tags,
@@ -682,7 +715,7 @@ impl ChatParser {
                 Tools::Dsml(spelling) => Scan::Dsml(DsmlScan::new(spelling)),
                 Tools::KvMarkup(spelling, types) => Scan::Kv(KvScan::new(spelling, types)),
                 Tools::Hermes => Scan::Hermes(HermesScan::default()),
-                Tools::QwenXml(kinds) => Scan::Qwen(QwenScan::new(kinds)),
+                Tools::QwenXml(framing, kinds) => Scan::Qwen(QwenScan::new(kinds, framing)),
             }),
             streamer: None,
             total: Message::default(),
@@ -717,7 +750,7 @@ impl ChatParser {
     /// the markup reads it ([`ThinkSplit::trimming_content`]).
     #[must_use]
     pub fn for_template(mut self, format: ToolFormat) -> Self {
-        if format == ToolFormat::QwenXml && self.format == ReasoningFormat::Deepseek {
+        if matches!(format, ToolFormat::QwenXml(_)) && self.format == ReasoningFormat::Deepseek {
             self.think = self.think.take().map(ThinkSplit::trimming_content);
         }
         self
@@ -847,7 +880,7 @@ impl ToolFormat {
     pub(crate) fn call_parts(self, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
         match self {
             ToolFormat::Hermes => hermes::call_parts(funs),
-            ToolFormat::QwenXml => qwenxml::call_parts(funs),
+            ToolFormat::QwenXml(framing) => qwenxml::call_parts(framing, funs),
             ToolFormat::KvMarkup(spelling) => glmxml::call_parts(spelling, funs),
             ToolFormat::Dsml(spelling) => call_parts(spelling, funs),
             ToolFormat::Unparsed => Err(Refusal {

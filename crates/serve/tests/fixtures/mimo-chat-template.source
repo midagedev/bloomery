@@ -1,0 +1,10 @@
+Source of mimo-chat-template.jinja (kept byte-exact; this file records it):
+
+The `tokenizer.chat_template` value of the MiMo-V2.6-Flash-RL GGUF the mimo2 gates load (3867 bytes, the
+`template bytes` `crates/model/tests/mimo2_meta.rs` pins); the MOPD checkpoint's template is byte-identical.
+sha256 11ea52e156de38a458e6b7720ad45915d65b97d4ec979a09f55e3c9bd1b4d059  mimo-chat-template.jinja
+
+Its tool-call branch spells the Qwen3-Coder tags (`<tool_call>` around `<function=` and `<parameter=`) in the
+compact framing: `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`, a value
+the bytes between its tags with no newline either side. A turn with tools carries no usage instruction, only
+the `<tools>` JSON. Not in `FIXTURE_TEMPLATES`: only the framing gate reads it.

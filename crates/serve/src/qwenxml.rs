@@ -14,8 +14,12 @@
 //!
 //! A value is the text between `<parameter=KEY>\n` and `\n</parameter>\n`,
 //! byte for byte: a source file that starts indented or ends in a newline
-//! keeps it. What the value is read as the request's tool schema says, the
-//! way llama.cpp's parser reads it: a parameter whose schema can resolve to a
+//! keeps it. That is the [`Framing::Lines`] spelling, Qwen3.6's and Qwen3.8's;
+//! a template that renders a call compactly (MiMo's,
+//! `<parameter=KEY>VALUE</parameter>`) is [`Framing::Compact`]: the value is the
+//! bytes between the two tags, a newline in it its own. What the value is read
+//! as the request's tool schema says, the way llama.cpp's parser reads it: a
+//! parameter whose schema can resolve to a
 //! string ([`resolves_to_string`]) is the raw text; every other parameter
 //! (another `type`, a `type` list without `string`, or no `type` at all) is
 //! JSON, spelled in `arguments` as the model wrote it.
@@ -54,9 +58,62 @@ pub const FUNCTION_OPEN: &str = "<function=";
 pub const FUNCTION_CLOSE: &str = "</function>";
 /// Opens a parameter, its name to the `>` (`<parameter=KEY>`).
 pub const PARAM_OPEN: &str = "<parameter=";
-/// Ends a value: the newline before the tag and the one after it are the
-/// markup's own.
+/// Closes a parameter.
+pub const PARAM_CLOSE: &str = "</parameter>";
+/// Ends a [`Framing::Lines`] value: the newline before the tag and the one
+/// after it are the markup's own.
 const PARAM_VALUE_CLOSE: &str = "\n</parameter>\n";
+
+/// How a template frames a parameter's value, a fact of the template that its
+/// rendered call shows ([`Framing::of_rendered`]): one parser reads both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    /// `<parameter=KEY>\nVALUE\n</parameter>`: the newline after the opener and
+    /// the one before the closer (with the one after it) are the markup's own.
+    Lines,
+    /// `<parameter=KEY>VALUE</parameter>`: the value is the bytes between the
+    /// tags, whatever whitespace they hold.
+    Compact,
+}
+
+impl Framing {
+    /// What follows `<parameter=KEY>` before the value's first byte.
+    const fn value_open(self) -> &'static str {
+        match self {
+            Framing::Lines => "\n",
+            Framing::Compact => "",
+        }
+    }
+
+    /// The text that ends a value, and is consumed with it.
+    const fn value_close(self) -> &'static str {
+        match self {
+            Framing::Lines => PARAM_VALUE_CLOSE,
+            Framing::Compact => PARAM_CLOSE,
+        }
+    }
+
+    /// The framing a rendered assistant call shows: the text a template wrote
+    /// for `<parameter=key>` holding the string `value`, which sits between the
+    /// tags bare ([`Framing::Compact`]) or on a line of its own
+    /// ([`Framing::Lines`]). `None` when no such parameter is rendered, or in a
+    /// spelling that is neither.
+    pub(crate) fn of_rendered(rendered: &str, key: &str, value: &str) -> Option<Framing> {
+        let opener = format!("{PARAM_OPEN}{key}>");
+        let compact = format!("{value}{PARAM_CLOSE}");
+        let lines = format!("\n{value}\n{PARAM_CLOSE}");
+        rendered.match_indices(&opener).find_map(|(at, _)| {
+            let after = &rendered[at + opener.len()..];
+            if after.starts_with(&compact) {
+                Some(Framing::Compact)
+            } else if after.starts_with(&lines) {
+                Some(Framing::Lines)
+            } else {
+                None
+            }
+        })
+    }
+}
 
 /// How much of the offending text an error quotes.
 const QUOTE: usize = 40;
@@ -255,6 +312,7 @@ fn kind_of(schema: &Value, root: &Value) -> Kind {
 #[derive(Debug)]
 pub struct QwenScan {
     kinds: ParamKinds,
+    framing: Framing,
     /// Inside a call (its `<tool_call>` consumed).
     inside: bool,
     /// A call closed: only the layout between calls may follow, and it is
@@ -267,11 +325,13 @@ pub struct QwenScan {
 }
 
 impl QwenScan {
-    /// A scanner that types parameters by `kinds`.
+    /// A scanner that types parameters by `kinds` and reads values framed as
+    /// `framing` says.
     #[must_use]
-    pub fn new(kinds: ParamKinds) -> Self {
+    pub fn new(kinds: ParamKinds, framing: Framing) -> Self {
         QwenScan {
             kinds,
+            framing,
             inside: false,
             after_call: false,
             buf: String::new(),
@@ -287,13 +347,16 @@ impl QwenScan {
         loop {
             if self.inside {
                 let Some((name, arguments, used)) =
-                    parse_call(&self.buf, self.calls, &self.kinds, false)?
+                    parse_call(&self.buf, self.calls, &self.kinds, self.framing, false)?
                 else {
-                    out.open = partial_call(&self.buf, &self.kinds).map(|(name, args)| Progress {
-                        index: self.calls,
-                        name,
-                        args,
-                    });
+                    out.open =
+                        partial_call(&self.buf, &self.kinds, self.framing).map(|(name, args)| {
+                            Progress {
+                                index: self.calls,
+                                name,
+                                args,
+                            }
+                        });
                     return Ok(out);
                 };
                 out.calls.push(ToolCall {
@@ -339,7 +402,7 @@ impl QwenScan {
     /// and the whitespace a closed call's layout left is nothing.
     pub fn finish(&mut self) -> Result<Scanned, QwenXmlError> {
         if self.inside {
-            parse_call(&self.buf, self.calls, &self.kinds, true)?;
+            parse_call(&self.buf, self.calls, &self.kinds, self.framing, true)?;
         }
         let rest = std::mem::take(&mut self.buf);
         if self.inside {
@@ -375,12 +438,15 @@ fn held(tag: &str, rest: &str) -> bool {
 /// start of a call. An error that quotes the text after the fault waits for
 /// a full quote, or for the stream's `end`, so its message does not depend
 /// on where the stream was cut. Whitespace between the tags is skipped (the template
-/// writes a newline after each); the newline that opens a value is not
-/// whitespace between tags but the value's own boundary.
+/// writes a newline after each); where a value starts and ends is the
+/// `framing`'s: under [`Framing::Lines`] the newline that opens a value is not
+/// whitespace between tags but the value's own boundary, under
+/// [`Framing::Compact`] the value is the bytes between its tags.
 fn parse_call(
     s: &str,
     index: usize,
     kinds: &ParamKinds,
+    framing: Framing,
     end: bool,
 ) -> Result<Option<(String, String, usize)>, QwenXmlError> {
     let settled = |found: &str| end || found.chars().nth(QUOTE - 1).is_some();
@@ -461,13 +527,13 @@ fn parse_call(
             ));
         }
         let open = &p[key_end + 1..];
-        let Some(v) = open.strip_prefix('\n') else {
+        let Some(v) = open.strip_prefix(framing.value_open()) else {
             if open.is_empty() || !settled(rest) {
                 return Ok(None);
             }
             return Err(unexpected("a newline after <parameter=KEY>", rest));
         };
-        let Some(val_end) = v.find(PARAM_VALUE_CLOSE) else {
+        let Some(val_end) = v.find(framing.value_close()) else {
             return Ok(None);
         };
         let raw = &v[..val_end];
@@ -503,7 +569,13 @@ fn parse_call(
             }
         };
         params.push((key, value));
-        at += ws + PARAM_OPEN.len() + key_end + 1 + 1 + val_end + PARAM_VALUE_CLOSE.len();
+        at += ws
+            + PARAM_OPEN.len()
+            + key_end
+            + 1
+            + framing.value_open().len()
+            + val_end
+            + framing.value_close().len();
     }
     let fields: Vec<String> = params
         .iter()
@@ -523,7 +595,7 @@ fn parse_call(
 /// parameter whose schema reads a string whose end has not come, up to the
 /// tail that could still become a tag that ends it. A fault ends the reading
 /// where it stands: [`parse_call`] names it.
-fn partial_call(s: &str, kinds: &ParamKinds) -> Option<(String, String)> {
+fn partial_call(s: &str, kinds: &ParamKinds, framing: Framing) -> Option<(String, String)> {
     let rest = s.trim_start().strip_prefix(FUNCTION_OPEN)?;
     let name_end = rest.find('>')?;
     let name = &rest[..name_end];
@@ -542,13 +614,14 @@ fn partial_call(s: &str, kinds: &ParamKinds) -> Option<(String, String)> {
         if key.is_empty() || key.contains(['<', '\n', '"']) {
             break;
         }
-        let Some(v) = p[key_end + 1..].strip_prefix('\n') else {
+        let Some(v) = p[key_end + 1..].strip_prefix(framing.value_open()) else {
             break;
         };
         let kind = kinds.kind(name, key);
-        let Some(val_end) = v.find(PARAM_VALUE_CLOSE) else {
+        let close = framing.value_close();
+        let Some(val_end) = v.find(close) else {
             if kind == Some(&Kind::String) {
-                let text = released(v, &[PARAM_VALUE_CLOSE, CALL_CLOSE]);
+                let text = released(v, &[close, CALL_CLOSE]);
                 return Some((name.to_owned(), args.text_so_far(key, text)));
             }
             break;
@@ -561,7 +634,7 @@ fn partial_call(s: &str, kinds: &ParamKinds) -> Option<(String, String)> {
             }
             _ => break,
         }
-        tail = &v[val_end + PARAM_VALUE_CLOSE.len()..];
+        tail = &v[val_end + close.len()..];
     }
     Some((name.to_owned(), args.so_far()))
 }
@@ -569,8 +642,9 @@ fn partial_call(s: &str, kinds: &ParamKinds) -> Option<(String, String)> {
 /// The call this markup spells, as the parts structured output forces: the
 /// inverse of [`QwenScan`]. `<function=NAME>` with a `<parameter=KEY>` block
 /// per parameter in the schema's order, each value written as the schema reads
-/// it: raw text for a string, JSON for the rest.
-pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+/// it (raw text for a string, JSON for the rest) and framed as `framing` says;
+/// the whitespace between the tags is a newline in both framings.
+pub(crate) fn call_parts(framing: Framing, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
     call(
         funs,
         &format!("{CALL_OPEN}\n{FUNCTION_OPEN}"),
@@ -578,9 +652,16 @@ pub(crate) fn call_parts(funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
         |f| {
             let mut parts = vec![Part::Text(">\n".to_owned())];
             for a in &f.args {
-                parts.push(Part::Text(format!("{PARAM_OPEN}{}>\n", a.key)));
+                parts.push(Part::Text(format!(
+                    "{PARAM_OPEN}{}>{}",
+                    a.key,
+                    framing.value_open()
+                )));
                 parts.extend(value(a.schema, Style::Raw, &a.path)?);
-                parts.push(Part::Text(PARAM_VALUE_CLOSE.to_owned()));
+                parts.push(Part::Text(match framing {
+                    Framing::Lines => PARAM_VALUE_CLOSE.to_owned(),
+                    Framing::Compact => format!("{PARAM_CLOSE}\n"),
+                }));
             }
             parts.push(Part::Text(format!("{FUNCTION_CLOSE}\n{CALL_CLOSE}")));
             Ok(parts)

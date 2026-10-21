@@ -74,8 +74,11 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   past it with a 500; this server has no batch limit there. An object with a `content` array takes text and image
   parts as described below. An object with `prompt_string` is a 400.
 - **Tool calls on every generative model**: DeepSeek-V4.1-Flash (DSML), GLM-5.3-Flash (its XML), Qwen3-30B
-  (Hermes JSON), Qwen3.6-35B and Qwen3.8-Flash-Next (the `<function=…><parameter=…>` markup) parse into
-  `tool_calls` and `tool_use` blocks, so agent clients work against each of them.
+  (Hermes JSON), Qwen3.6-35B and Qwen3.8-Flash-Next (the `<function=…><parameter=…>` markup, a value on lines of
+  its own) and MiMo-V2.6 (the same tags, a value bare between them: `<parameter=KEY>VALUE</parameter>`) parse into
+  `tool_calls` and `tool_use` blocks, so agent clients work against each of them. Which of the two framings a
+  template uses is read from the call it renders, not from its name, and a `tool_choice` that forces a call writes
+  it in that framing.
   DeepSeek-V4.1 writes its DSML tags with a space after the token (`<｜DSML｜ calls>`, `<｜DSML｜ invoke>`,
   `<｜DSML｜ parameter>`), V4 without (`<｜DSML｜tool_calls>`). The V4.1 GGUFs carry V4's template, so a
   `general.architecture` `deepseek41` file is served with that template respelled as V4.1's (the template llama.cpp

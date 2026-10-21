@@ -3889,7 +3889,9 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
             Tools::KvMarkup(spelling, ArgTypes::of_tools(b.get("tools")))
         }
         ToolFormat::Hermes => Tools::Hermes,
-        ToolFormat::QwenXml => Tools::QwenXml(ParamKinds::of_tools(b.get("tools"))),
+        ToolFormat::QwenXml(framing) => {
+            Tools::QwenXml(framing, ParamKinds::of_tools(b.get("tools")))
+        }
         ToolFormat::Unparsed => {
             return Err(ApiError {
                 retry_after: false,

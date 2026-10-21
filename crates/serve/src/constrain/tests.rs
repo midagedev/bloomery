@@ -19,13 +19,16 @@ use crate::genloop::{
 use crate::glmxml::{ArgTypes, KvScan, KvSpelling};
 use crate::hermes::HermesScan;
 use crate::mock::SPECIALS;
-use crate::qwenxml::{ParamKinds, QwenScan};
+use crate::qwenxml::{Framing, ParamKinds, QwenScan};
 use crate::reasoning::{ReasoningFormat, ThinkEntry, ThinkTags};
 use crate::sampling;
 
 /// The key/value markup in each spelling.
 const GLM: ToolFormat = ToolFormat::KvMarkup(KvSpelling::Glm);
 const SOLAR: ToolFormat = ToolFormat::KvMarkup(KvSpelling::Solar);
+/// Qwen3-Coder's markup in each framing of a value.
+const QWEN: ToolFormat = ToolFormat::QwenXml(Framing::Lines);
+const QWEN_COMPACT: ToolFormat = ToolFormat::QwenXml(Framing::Compact);
 
 /// The mock's ids: its specials, then a byte each, then these pieces.
 const BYTES: u32 = SPECIALS.len() as u32;
@@ -600,9 +603,13 @@ fn markup(format: ToolFormat) -> [String; 2] {
             "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"celsius\", \"days\": 2}}\n</tool_call>",
             "<tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": \"cats\", \"deep\": false}}\n</tool_call>",
         ],
-        ToolFormat::QwenXml => [
+        QWEN => [
             "<tool_call>\n<function=get_weather>\n<parameter=unit>\ncelsius\n</parameter>\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>",
             "<tool_call>\n<function=search>\n<parameter=query>\ncats\n</parameter>\n<parameter=deep>\nfalse\n</parameter>\n</function>\n</tool_call>",
+        ],
+        QWEN_COMPACT => [
+            "<tool_call>\n<function=get_weather>\n<parameter=unit>celsius</parameter>\n<parameter=days>2</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=search>\n<parameter=query>cats</parameter>\n<parameter=deep>false</parameter>\n</function>\n</tool_call>",
         ],
         GLM => [
             "<tool_call>get_weather<arg_key>unit</arg_key><arg_value>celsius</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call>",
@@ -637,8 +644,8 @@ fn scanned(format: ToolFormat, tools: &Value, text: &str) -> Vec<(String, Value)
             out.calls.extend(s.finish().expect("closes").calls);
             out
         }
-        ToolFormat::QwenXml => {
-            let mut s = QwenScan::new(ParamKinds::of_tools(Some(tools)));
+        ToolFormat::QwenXml(framing) => {
+            let mut s = QwenScan::new(ParamKinds::of_tools(Some(tools)), framing);
             let mut out = s.push(text).expect("parses");
             out.calls.extend(s.finish().expect("closes").calls);
             out
@@ -684,7 +691,8 @@ fn each_formats_inverse_reads_back_through_its_scanner() {
     let tools = forecast_tools();
     for format in [
         ToolFormat::Hermes,
-        ToolFormat::QwenXml,
+        QWEN,
+        QWEN_COMPACT,
         GLM,
         SOLAR,
         ToolFormat::Dsml(Spelling::Joined),
@@ -745,7 +753,8 @@ fn a_forced_call_obeys_the_tools_when_greedy_does_not() {
     let wrong = vec![BYTES + u32::from(b'Z'); 300];
     for format in [
         ToolFormat::Hermes,
-        ToolFormat::QwenXml,
+        QWEN,
+        QWEN_COMPACT,
         GLM,
         SOLAR,
         ToolFormat::Dsml(Spelling::Joined),
@@ -782,9 +791,10 @@ fn call_body(params: &Value) -> Value {
         {"type": "function", "function": {"name": "f", "parameters": params}}]})
 }
 
-const FORMATS: [ToolFormat; 6] = [
+const FORMATS: [ToolFormat; 7] = [
     ToolFormat::Hermes,
-    ToolFormat::QwenXml,
+    QWEN,
+    QWEN_COMPACT,
     GLM,
     SOLAR,
     ToolFormat::Dsml(Spelling::Joined),
@@ -995,7 +1005,8 @@ fn a_raw_literal_with_an_angle_bracket_is_refused() {
     for q in &literals {
         let body = call_body(&json!({"type": "object", "properties": {"q": q}}));
         for format in [
-            ToolFormat::QwenXml,
+            QWEN,
+            QWEN_COMPACT,
             GLM,
             SOLAR,
             ToolFormat::Dsml(Spelling::Joined),
@@ -1053,7 +1064,8 @@ fn a_free_string_cannot_spell_its_formats_closing_tag() {
         "q": {"type": "object", "properties": {"s": {"type": "string", "maxLength": 40}}}}}));
     let tags = [
         (ToolFormat::Hermes, "</tool_call>"),
-        (ToolFormat::QwenXml, "\n</parameter>\n"),
+        (QWEN, "\n</parameter>\n"),
+        (QWEN_COMPACT, "</parameter>"),
         (GLM, "</arg_value>"),
         (SOLAR, "<|tool_arg:end|>"),
         (ToolFormat::Dsml(Spelling::Joined), "</｜DSML｜parameter>"),
@@ -1077,7 +1089,7 @@ fn a_free_string_cannot_spell_its_formats_closing_tag() {
                 .as_str()
                 .unwrap_or_else(|| panic!("{format:?}: {}", o.content));
             assert!(!q.contains(tag), "{format:?}: {q:?}");
-            if format != ToolFormat::QwenXml || nested {
+            if format != QWEN || nested {
                 assert!(!q.contains('<'), "{format:?} nested {nested}: {q:?}");
             }
         }
@@ -1108,7 +1120,7 @@ fn a_response_format_string_may_hold_an_angle_bracket() {
 fn parsed(format: ToolFormat, tools: &Value, text: &str) -> Result<(String, usize), MarkupError> {
     let scan = match format {
         ToolFormat::Hermes => Tools::Hermes,
-        ToolFormat::QwenXml => Tools::QwenXml(ParamKinds::of_tools(Some(tools))),
+        ToolFormat::QwenXml(framing) => Tools::QwenXml(framing, ParamKinds::of_tools(Some(tools))),
         ToolFormat::KvMarkup(spelling) => {
             Tools::KvMarkup(spelling, ArgTypes::of_tools(Some(tools)))
         }
@@ -1131,7 +1143,8 @@ fn a_response_string_beside_scanned_tools_cannot_open_a_call() {
         "code": {"type": "string", "maxLength": 100}}});
     let blocks = [
         (ToolFormat::Hermes, "<tool_call></tool_call>"),
-        (ToolFormat::QwenXml, "<tool_call></tool_call>"),
+        (QWEN, "<tool_call></tool_call>"),
+        (QWEN_COMPACT, "<tool_call></tool_call>"),
         (GLM, "<tool_call></tool_call>"),
         (SOLAR, "<|tool_call:start|><|tool_call:end|>"),
         (
@@ -1457,7 +1470,8 @@ fn the_jump_arm_takes_the_step_arms_ids() {
             ToolFormat::Hermes,
             schema_body(&schema),
         ),
-        (bytes_tok(), ToolFormat::QwenXml, call.clone()),
+        (bytes_tok(), QWEN, call.clone()),
+        (bytes_tok(), QWEN_COMPACT, call.clone()),
         (stop_tok(), GLM, call.clone()),
     ] {
         let c = build(&tok, format, &body).expect("served");
@@ -1586,7 +1600,7 @@ fn a_forced_call_is_fed_in_the_planned_calls() {
     .collect();
     let c = build(
         &tok,
-        ToolFormat::QwenXml,
+        QWEN,
         &json!({"tools": tools, "tool_choice": "required"}),
     )
     .expect("served");

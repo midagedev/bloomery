@@ -23,11 +23,12 @@ use serve::ScriptedEngine;
 use serve::callstream::CallPiece;
 use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, Tools};
 use serve::glmxml::{ArgTypes, KvSpelling};
-use serve::qwenxml::ParamKinds;
+use serve::qwenxml::{Framing, ParamKinds};
 use serve::reasoning::ReasoningFormat;
 
 const QWEN3: &str = include_str!("fixtures/qwen3-chat-template.jinja");
 const QWEN38: &str = include_str!("fixtures/qwen38-chat-template.jinja");
+const MIMO: &str = include_str!("fixtures/mimo-chat-template.jinja");
 const GLM5: &str = include_str!("fixtures/glm5-chat-template.jinja");
 
 /// The long text of `content`: twelve lines, each with quotes, a backslash, a
@@ -113,7 +114,20 @@ fn cases() -> Vec<Case> {
                  <parameter=mode>\n420\n</parameter>\n<parameter=content>\n{c}\n</parameter>\n\
                  </function>\n</tool_call>"
             ),
-            tools: Tools::QwenXml(ParamKinds::of_tools(Some(&tools()))),
+            tools: Tools::QwenXml(Framing::Lines, ParamKinds::of_tools(Some(&tools()))),
+        },
+        // The compact framing: the long text is the bytes between its tags,
+        // its newlines its own, the last one with it.
+        Case {
+            label: "qwen-compact",
+            template: MIMO,
+            lead: "",
+            call: format!(
+                "<tool_call>\n<function=write>\n<parameter=path>/a.txt</parameter>\n\
+                 <parameter=mode>420</parameter>\n<parameter=content>{c}</parameter>\n\
+                 </function>\n</tool_call>"
+            ),
+            tools: Tools::QwenXml(Framing::Compact, ParamKinds::of_tools(Some(&tools()))),
         },
     ]
 }
