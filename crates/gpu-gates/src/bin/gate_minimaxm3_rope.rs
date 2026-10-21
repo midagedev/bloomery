@@ -73,16 +73,13 @@ mod gate {
         )
     }
 
-    fn rope_inputs(heads: (usize, usize)) -> Result<(RopeIn, Vec<u32>), GateError> {
-        rope_gate::seeded_inputs(HEAD, ROT_PARTIAL, THETA, (ROPE_CTX, ROPE_M), heads)
-    }
-
     fn rope_check(
         gpu: &Gpu,
         kern: &RopeNeoxKernels,
         heads: (usize, usize),
     ) -> Result<bool, GateError> {
-        let (inp, pos) = rope_inputs(heads)?;
+        let (inp, pos) =
+            rope_gate::seeded_inputs(HEAD, ROT_PARTIAL, THETA, (ROPE_CTX, ROPE_M), heads)?;
         let shape = RopeShape {
             head: HEAD,
             n_head: heads.0,
