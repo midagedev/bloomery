@@ -49,7 +49,7 @@ mod tests {
     use gguf::Split;
 
     use super::super::hparams::Kind;
-    use super::super::hparams::tests::{LAYERS, keys, tensors};
+    use super::super::hparams::tests::{IDX_D, LAYERS, keys, tensors};
     use super::{PlaceError, PlanInputs};
     use crate::arch::synthetic::{V, header_shaped};
     use crate::placement::{PlacementError, PlanLevers, workstation};
@@ -133,7 +133,9 @@ mod tests {
             let want = n as u64 * 47_104;
             assert_eq!(plan.cards[0].kv_bytes, want, "{n} slots");
             assert_eq!(want, n as u64 * inputs.kv.bytes(0..LAYERS, 64), "{n} slots");
-            assert_eq!(plan.cards[0].stage_rows_bytes, 8 * 4 * 64, "{n} slots");
+            // The rope table and the index selector's sink row, a position each.
+            let rows = 8 * 4 + IDX_D * 2;
+            assert_eq!(plan.cards[0].stage_rows_bytes, rows * 64, "{n} slots");
         }
         let mut tiered = workstation::plan_gate(LAYERS);
         let mut tier = tiered.cards[0].clone();

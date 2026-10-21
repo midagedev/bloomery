@@ -380,6 +380,10 @@ pub struct KvLayout {
     /// The rope rows the body copies to its card, in bytes a position: one table of `dims` f32
     /// values a position for each distinct rope (base and dims) the rotating layers turn by.
     rope_row: u64,
+    /// The block selector's sink row, in bytes a position: the index head kernel appends a value
+    /// row beside each index key, to a plane of the widest selector's key nothing reads and every
+    /// selecting layer shares; 0 for a trunk that selects nothing.
+    sink_row: u64,
 }
 
 impl KvLayout {
@@ -389,6 +393,7 @@ impl KvLayout {
     pub fn of<'a>(mixers: impl IntoIterator<Item = &'a Mixer>) -> Result<KvLayout, PlacementError> {
         let mut holds = Vec::new();
         let mut ropes: Vec<(u32, u32)> = Vec::new();
+        let mut sink_row = 0;
         let mut note = |rope: &models::Rope| {
             if rope.mode != RopeMode::None {
                 let rope = (rope.base.to_bits(), rope.dims);
@@ -405,6 +410,7 @@ impl KvLayout {
                         Err(what) => return Err(unsized_store(layer, what)),
                     };
                     note(&g.rope);
+                    sink_row = sink_row.max(index);
                     if let Some(Selector::BlockMax { rope, .. }) = &g.select {
                         note(rope);
                     }
@@ -428,6 +434,7 @@ impl KvLayout {
                 .iter()
                 .map(|&(_, dims)| u64::from(dims) * stores::F32_BYTES)
                 .sum(),
+            sink_row,
         })
     }
 
@@ -517,7 +524,7 @@ impl KvBytes for KvLayout {
     }
 
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
-        self.rope_row * ctx_max
+        (self.rope_row + self.sink_row) * ctx_max
     }
 }
 
@@ -734,8 +741,9 @@ mod tests {
     /// and 1,912,602,624 B [derived: 122,880 and 14,592 times the positions]. A dense layer keeps no
     /// index keys, and a layer past the model nothing. The stage keeps one rope table of the 64
     /// rotated values in f32 (256 B) a position, though the sparse layers' indexer rotates by the
-    /// same rope. Mutant: the index keys on the dense layers, the index key at the plane's width,
-    /// or the indexer's rope a second table.
+    /// same rope, and one sink row of the index key's 128 f16 values (256 B) a position, which the
+    /// 57 selecting layers share: 512 B. Mutant: the index keys on the dense layers, the index key
+    /// at the plane's width, the indexer's rope a second table, or a sink row a selecting layer.
     #[test]
     fn the_m3_cache_is_the_released_files_bytes() {
         let rope = Some((5_000_000.0, 64));
@@ -758,7 +766,7 @@ mod tests {
         assert_eq!(total(1), 122_880 + 14_592);
         assert_eq!(total(32_768), 4_026_531_840 + 478_150_656);
         assert_eq!(total(131_072), 16_106_127_360 + 1_912_602_624);
-        assert_eq!(kv.stage_position_bytes(10), 64 * 4 * 10);
+        assert_eq!(kv.stage_position_bytes(10), (64 * 4 + 128 * 2) * 10);
     }
 
     /// An index rotation of its own is one more table beside the layer's: the stage copies a table a
@@ -775,8 +783,27 @@ mod tests {
         };
         rope.base = 1e7;
         let own = KvLayout::of([&Mixer::Gqa(g)]).expect("sized");
-        assert_eq!(same.stage_position_bytes(10), 4 * 4 * 10);
-        assert_eq!(own.stage_position_bytes(10), 2 * 4 * 4 * 10);
+        // Beside the tables, the selector's sink row: 12 f16 values a position.
+        assert_eq!(same.stage_position_bytes(10), (4 * 4 + 12 * 2) * 10);
+        assert_eq!(own.stage_position_bytes(10), (2 * 4 * 4 + 12 * 2) * 10);
+    }
+
+    /// The selector's sink: the head kernel appends a value row beside each index key to one
+    /// plane every selecting layer shares, so the stage keeps the widest selector's key a position
+    /// once, whatever the selecting layers' count, and a trunk that selects nothing keeps none.
+    #[test]
+    fn the_selectors_share_one_sink_row() {
+        let rows = |mixers: &[Mixer]| {
+            KvLayout::of(mixers)
+                .expect("GQA layers are sized")
+                .stage_position_bytes(10)
+        };
+        let plain = gqa(1, (16, 8), None, None);
+        assert_eq!(rows(&[plain.clone(), plain.clone()]), 0);
+        let one = [selecting(plain.clone(), 12), plain.clone()];
+        assert_eq!(rows(&one), 12 * 2 * 10);
+        let two = [selecting(plain.clone(), 12), selecting(plain, 16)];
+        assert_eq!(rows(&two), 16 * 2 * 10);
     }
 
     /// A GQA layer whose selector this owner does not size (a pooled-token or a stream selector) or
