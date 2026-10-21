@@ -15,7 +15,8 @@
 //! needs all of a token's logits — and stays in its wrapper's own pass.
 //! A router body generic over its score ([`crate::route_body`]) takes one of
 //! them as a type parameter (`gpu-deepseek41`'s `router::glm5next` routes with
-//! [`Sigmoid`]).
+//! [`Sigmoid`]). What a router stores is [`router_score`] of the logit, never
+//! the score alone.
 //!
 //! A weight stage that renormalizes its selected scores divides by
 //! [`renorm_divisor`] of their sum: the one guard every such stage and its
@@ -55,6 +56,25 @@ pub fn sqrt_softplus(x: f32) -> f32 {
 #[inline(always)]
 pub fn renorm_divisor(sum: f32) -> f32 {
     sum + 1e-20
+}
+
+/// The score a router stores for `logit`: `S::score(logit)`, or NaN for a
+/// logit that is not finite. A logit overflows to ±infinity when a row's
+/// finite products sum past f32, and the scores give that a finite value
+/// ([`sigmoid`]: 1 and 0; [`sqrt_softplus`] at −infinity: 0), which the
+/// selection would route as an ordinary expert. The NaN is what the picker's
+/// finite ballot ([`crate::route_body::publish_n`], and its twin in
+/// `gpu-deepseek41`'s router) refuses with
+/// [`FaultSite::Router`](crate::FaultSite::Router) before any round runs.
+/// Every router that scores a logit element-wise stores this, on the
+/// one-token path and on the batch's score pass alike.
+#[inline(always)]
+pub fn router_score<S: Score>(logit: f32) -> f32 {
+    if logit.is_finite() {
+        S::score(logit)
+    } else {
+        f32::NAN
+    }
 }
 
 /// `1 / (1 + e^-x)` in f32, the scalar form of ggml's `ggml_vec_sigmoid_f32`.

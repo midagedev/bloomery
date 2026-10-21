@@ -12,12 +12,12 @@
 //! `f32_lane_partial_1col_w32` (`f32_lane_partial_1col`'s sum with 32
 //! chunks' loads in flight) and the fixed butterfly — so the logits are bit
 //! for bit that kernel's. The warp that owns a row also scores it
-//! ([`sqrt_softplus`]). The selection needs every expert's score, so it runs
-//! in the block that finishes last: each block publishes its rows (a fence,
-//! then one atomic ticket per block), and the block that draws the last
-//! ticket reads all scores back, adds the selection bias, picks the top six,
-//! writes the weights, and puts the ticket count back to zero for the next
-//! launch or graph replay.
+//! ([`router_score`] of [`sqrt_softplus`]). The selection needs every
+//! expert's score, so it runs in the block that finishes last: each block
+//! publishes its rows (a fence, then one atomic ticket per block), and the
+//! block that draws the last ticket reads all scores back, adds the
+//! selection bias, picks the top six, writes the weights, and puts the
+//! ticket count back to zero for the next launch or graph replay.
 //!
 //! Numeric contract — ik's CPU rule for this architecture, node for node
 //! (`SQRT_SOFTPLUS`, `ADD`, `ARGSORT`, `GET_ROWS`, `SUM_ROWS`, `DIV`,
@@ -37,7 +37,9 @@
 //! No silent selection: every expert's selection value must be finite — a
 //! NaN or infinite score or bias has no rank, and dropping it while six
 //! finite candidates remain would route the token as if the expert did not
-//! exist — and a weight that is not finite has no meaning either. Both raise
+//! exist — and a weight that is not finite has no meaning either. A logit
+//! that is not finite is scored NaN ([`router_score`]): one that overflowed
+//! to −infinity would score a finite 0 and rank as an expert. Both raise
 //! [`FaultSite::Router`] on the launch's fault sink; the ids and weights
 //! written stay what the rounds left, and the step that reads the fault back
 //! is refused before anything uses them.
@@ -56,7 +58,7 @@ use bloomery_gpu::q8f32::f32_lane_partial_1col_w32;
 use bloomery_gpu::route_body::{ROUTER_THREADS, ROUTER_THREADS_U32, ROWS_PER_BLOCK};
 /// ik's expert score in f32; the gates' host side simulates the device with it.
 pub use bloomery_gpu::route_core::sqrt_softplus;
-use bloomery_gpu::route_core::{renorm_divisor, take};
+use bloomery_gpu::route_core::{SqrtSoftplus, renorm_divisor, router_score, take};
 use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
@@ -162,7 +164,7 @@ mod router_kernels {
                 // SAFETY: row < n_expert <= logits.len() by the launch
                 // contract; lane 0 of the row's warp is the slot's only writer.
                 unsafe { *logits.get_unchecked_mut(row) = logit };
-                let score = sqrt_softplus(logit);
+                let score = router_score::<SqrtSoftplus>(logit);
                 // SAFETY: row < n_expert <= probs.len() by the launch
                 // contract; lane 0 of the row's warp is the slot's only writer.
                 unsafe { *probs.get_unchecked_mut(row) = score };

@@ -1232,8 +1232,10 @@ mod elem_kernels {
         }
     }
 
-    /// `y[i] = sigmoid(y[i])` over `n` values, in place — the router score's
-    /// scalar ([`crate::route_core::sigmoid`]) over a tile GEMM's logits.
+    /// `y[i] = sigmoid(y[i])` over `n` values, in place — the router score
+    /// ([`crate::route_core::router_score`] of
+    /// [`Sigmoid`](crate::route_core::Sigmoid)) over a tile GEMM's logits: a
+    /// logit that is not finite becomes NaN.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -1250,13 +1252,15 @@ mod elem_kernels {
         // entry i.
         unsafe {
             let v = *y.get_unchecked_mut(i);
-            *y.get_unchecked_mut(i) = crate::route_core::sigmoid(v);
+            *y.get_unchecked_mut(i) =
+                crate::route_core::router_score::<crate::route_core::Sigmoid>(v);
         }
     }
 
     /// `y[i] = sqrt_softplus(y[i])` over `n` values, in place — the router
-    /// score's scalar ([`crate::route_core::sqrt_softplus`]) over a tile
-    /// GEMM's logits.
+    /// score ([`crate::route_core::router_score`] of
+    /// [`SqrtSoftplus`](crate::route_core::SqrtSoftplus)) over a tile GEMM's
+    /// logits: a logit that is not finite becomes NaN.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -1273,7 +1277,8 @@ mod elem_kernels {
         // entry i.
         unsafe {
             let v = *y.get_unchecked_mut(i);
-            *y.get_unchecked_mut(i) = crate::route_core::sqrt_softplus(v);
+            *y.get_unchecked_mut(i) =
+                crate::route_core::router_score::<crate::route_core::SqrtSoftplus>(v);
         }
     }
 

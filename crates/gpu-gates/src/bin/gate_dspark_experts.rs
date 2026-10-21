@@ -22,7 +22,10 @@
 //!    scores themselves are CUDA's `expf`/`logf` against the host libm and
 //!    are printed in ulps), the tickets return to zero. Then planted ties,
 //!    where the larger id must win, and a row whose every score is 0, whose
-//!    weights must still be finite.
+//!    weights must still be finite; then a router row that is not finite —
+//!    a NaN weight, or a logit overflowing to +inf or to −inf (finite inputs
+//!    whose products sum past f32) — which raises `Router` where a clean row
+//!    raises nothing.
 //! 4. **The common table's per-slot pair** (`bloomery_gpu::mxfp4_sel::
 //!    Mxfp4SelKernels`, the file's 17-byte blocks as the KQuant word stream
 //!    and a `Q8Act`): for each plan of item 1, per (slot, token) the pair's
@@ -1230,7 +1233,48 @@ mod gate {
             r.norm,
             verdict(pass)
         );
-        Ok(pass && check_ties(cx, r)?)
+        Ok(pass && check_ties(cx, r)? && check_nonfinite(cx, r)?)
+    }
+
+    /// A router row that is not finite raises `Router`, a clean one nothing.
+    /// A K = 32 weight against two activations: the planted row's weight is
+    /// 1 (clean: its logit is the first activation), a NaN, or ±1 in two
+    /// columns against `f32::MAX` (the logit overflows to ±inf with every
+    /// input finite); every other row's weight is 0.
+    fn check_nonfinite(cx: &Ctx<'_>, r: &Router) -> Result<bool, GateError> {
+        const K: usize = 32;
+        const ROW: usize = 17;
+        let s = cx.gpu.stream();
+        let bd = DeviceBuffer::from_host(s, &vec![0.0f32; N_EXPERT])?;
+        let cases: [(&str, [(usize, f32); 2], [f32; 2], bool); 4] = [
+            ("clean", [(0, 1.0), (1, 0.0)], [1.0, 0.0], false),
+            ("nan_weight", [(0, f32::NAN), (1, 0.0)], [1.0, 0.0], true),
+            ("overflow_+inf", [(0, 1.0), (1, 1.0)], [f32::MAX; 2], true),
+            ("overflow_-inf", [(0, -1.0), (1, -1.0)], [f32::MAX; 2], true),
+        ];
+        let mut all = true;
+        for (name, cols, acts, raises) in cases {
+            let mut w = vec![0.0f32; N_EXPERT * K];
+            for (col, v) in cols {
+                w[ROW * K + col] = v;
+            }
+            let mut x = vec![0.0f32; K];
+            x[..2].copy_from_slice(&acts);
+            let wd = DeviceTensor::upload(s, &w, N_EXPERT, K)?;
+            cx.gpu.clear_fault()?;
+            let (_, _, _, _, tickets) = run_router(cx, r, &wd, &bd, &x, 1)?;
+            let fault = cx.gpu.take_fault()?;
+            let want = raises.then(|| Fault::at(LAYER_NONE, FaultSite::Router));
+            let pass = fault == want && tickets == 0;
+            println!(
+                "nonfinite case={name} row={ROW} fault={} (want {}) tickets={tickets} {}",
+                fault.map_or("none".to_string(), |f| f.to_string()),
+                if raises { "router" } else { "none" },
+                verdict(pass)
+            );
+            all &= pass;
+        }
+        Ok(all)
     }
 
     /// `ln(1 + e^x)` in f64 (the exact key of a planted logit).

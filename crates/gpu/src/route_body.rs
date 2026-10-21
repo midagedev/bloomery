@@ -27,7 +27,7 @@
 //! ones.
 
 use crate::q8f32::f32_lane_partial_1col_w32;
-use crate::route_core::{Score, renorm_divisor, take};
+use crate::route_core::{Score, renorm_divisor, router_score, take};
 use crate::{FaultSink, FaultSite};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{DisjointSlice, thread, threadfence, warp};
@@ -188,10 +188,10 @@ pub unsafe fn select_n<const E: usize, const U: usize>(
 }
 
 /// `ds41_router`'s body (`gpu-deepseek41`) over `E` experts, `U` slots and the score `S`: the
-/// row walk (`f32_gemv`'s m = 1 row, the logit into `logits`, `S::score` of
-/// it into `probs`), the fence and the block's ticket, and in the block that
-/// draws the last ticket [`publish_n`] and [`select_n`] into `ids` and
-/// `weights` from 0, then the ticket count back to zero.
+/// row walk (`f32_gemv`'s m = 1 row, the logit into `logits`, its
+/// [`router_score`] into `probs`), the fence and the block's ticket, and in
+/// the block that draws the last ticket [`publish_n`] and [`select_n`] into
+/// `ids` and `weights` from 0, then the ticket count back to zero.
 ///
 /// # Safety
 ///
@@ -240,7 +240,7 @@ pub unsafe fn router_body<S: Score, const E: usize, const U: usize>(
             unsafe { *logits.get_unchecked_mut(row) = logit };
             // SAFETY: row < n_expert <= probs.len() by this fn's contract;
             // lane 0 of the row's warp is the slot's only writer.
-            unsafe { *probs.get_unchecked_mut(row) = S::score(logit) };
+            unsafe { *probs.get_unchecked_mut(row) = router_score::<S>(logit) };
         }
     }
     threadfence();

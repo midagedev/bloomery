@@ -56,6 +56,12 @@
 //!   through the one-token launch and through the batch pair: every launch
 //!   raises `FaultSite::Router` (the unlabelled layer), and a clean launch
 //!   raises nothing.
+//! - `overflow`: a router row whose finite products sum past f32 (a K = 64
+//!   weight of ±1 against activations of `f32::MAX`), so its logit is ±inf
+//!   while every other logit is 0: through the one-token launch and through
+//!   the batch pair, every launch raises `FaultSite::Router` (the unlabelled
+//!   layer) — the score of an infinite logit is a finite 1 or 0, which the
+//!   selection would otherwise route as an ordinary expert.
 //! - `graph`: the one-token launch captured as a graph: one node, two
 //!   replays bit-identical to the eager launch, the ticket count zero after
 //!   each.
@@ -704,6 +710,52 @@ mod gate {
         Ok(pass)
     }
 
+    /// Clause `overflow`: one router row whose logit overflows to +inf and then
+    /// to −inf, through both shapes, raises `Router`. The row's weight is ±1 in
+    /// the two columns of lane 0 (K = 64, the batch's tile GEMM takes a
+    /// multiple of 64), the activations `f32::MAX` there and 0 elsewhere, so
+    /// every input is finite, the other rows' logits are 0, and the row's
+    /// logit is the lane's two products summed past f32.
+    fn overflow<I: Inst>(cx: &Cx<I>) -> Result<bool, GateError> {
+        const PK: usize = 64;
+        let s = cx.gpu.stream();
+        let row = 17 % I::E;
+        let mut x = vec![0.0f32; PK];
+        x[0] = f32::MAX;
+        x[32] = f32::MAX;
+        let bias = DeviceBuffer::from_host(s, &vec![0.0f32; I::E])?;
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::Router));
+        let show = |f: Option<Fault>| f.map_or("none".to_string(), |f| f.to_string());
+        let mut all = true;
+        for (what, sign) in [("+inf", 1.0f32), ("-inf", -1.0)] {
+            let mut w = vec![0.0f32; I::E * PK];
+            w[row * PK] = sign;
+            w[row * PK + 32] = sign;
+            let w = DeviceTensor::upload(s, &w, I::E, PK)?;
+            cx.gpu.take_fault()?;
+            let r = one_token_runs(cx, &w, &x, PK, &bias)?;
+            let one = cx.gpu.take_fault()?;
+            batch_run(cx, &w, &x, PK, &bias)?;
+            let batch = cx.gpu.take_fault()?;
+            let planted = r.logits[row] == sign * f32::INFINITY
+                && r.logits
+                    .iter()
+                    .enumerate()
+                    .all(|(e, &l)| e == row || l == 0.0);
+            let pass = planted && one == want && batch == want && r.tickets == [0];
+            println!(
+                "overflow row={row} logit={what} (planted={planted}): one-token={} batch={} \
+                 (want router) tickets={:?} {}",
+                show(one),
+                show(batch),
+                r.tickets,
+                verdict(pass)
+            );
+            all &= pass;
+        }
+        Ok(all)
+    }
+
     /// Clause `graph`: the one-token launch as a captured graph.
     fn graph<I: Inst>(
         cx: &Cx<I>,
@@ -771,6 +823,7 @@ mod gate {
         ok &= ties(&cx)?;
         ok &= guard(&cx)?;
         ok &= fault(&cx, &sd)?;
+        ok &= overflow(&cx)?;
         ok &= graph(&cx, &sd, &w, &bias)?;
         Ok((cx.gpu, ok))
     }
@@ -784,7 +837,7 @@ mod gate {
             println!(
                 "PASSED: {NAME} — {} ({}/{}, sigmoid, x{}), {} ({}/{}, sigmoid, x{}), {} ({}/{}, sigmoid, x{}) and {} ({}/{}, sigmoid, x{}), each with its batch \
                  pair: logits, ids and weights bit-identical to the host rule over {TOKENS} seeded tokens, \
-                 scores in the sigmoid band, 8 tie cases, the guard, the fault, the graph",
+                 scores in the sigmoid band, 8 tie cases, the guard, the fault, the overflow, the graph",
                 Glm::OP,
                 Glm::E,
                 Glm::USED,

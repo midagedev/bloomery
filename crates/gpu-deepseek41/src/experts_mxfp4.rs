@@ -4,17 +4,20 @@
 //!
 //! `dflash_router`: `ds41_router`'s body with this model's constants — the
 //! `f32_gemv` m = 1 row per expert in its accumulation order (the lane walk
-//! `f32_lane_partial_1col_w32`), [`sqrt_softplus`], the selection bias,
-//! three rounds of the butterfly argmax under `take::<true>` (an equal
-//! value goes to the larger id), the weights from the unbiased scores. One
-//! token per launch; token `tok` reads `x[tok·k ..]` and writes its logits,
-//! scores, ids and weights at `tok`'s rows of a [`DraftRouterOut`], so `m`
-//! launches fill one plan.
+//! `f32_lane_partial_1col_w32`), [`sqrt_softplus`] of a finite logit (NaN of
+//! one that is not), the selection bias with the common finite ballot
+//! (`route_body::publish_n`: a selection value that is not finite raises
+//! [`FaultSite::Router`]), three rounds of the butterfly argmax under
+//! `take::<true>` (an equal value goes to the larger id), the weights from
+//! the unbiased scores. One token per launch; token `tok` reads `x[tok·k ..]`
+//! and writes its logits, scores, ids and weights at `tok`'s rows of a
+//! [`DraftRouterOut`], so `m` launches fill one plan.
 
 use bloomery_gpu::q8f32::f32_lane_partial_1col_w32;
+use bloomery_gpu::route_body::publish_n;
 /// ik's expert score in f32; the gate's host side simulates the device with it.
 pub use bloomery_gpu::route_core::sqrt_softplus;
-use bloomery_gpu::route_core::{renorm_divisor, take};
+use bloomery_gpu::route_core::{SqrtSoftplus, renorm_divisor, router_score, take};
 use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
@@ -53,6 +56,8 @@ const ROWS_PER_BLOCK: usize = ROUTER_THREADS / 32;
 const PER_LANE: usize = N_EXPERT / 32;
 
 const _: () = assert!(ROUTER_THREADS_U32 as usize == ROUTER_THREADS);
+// `publish_n` strides the block's threads by the common constant.
+const _: () = assert!(ROUTER_THREADS == bloomery_gpu::route_body::ROUTER_THREADS);
 // The router entry's `launch_bounds` and `launch_contract` block are literals.
 const _: () = assert!(ROUTER_THREADS == 128);
 const _: () = assert!(N_EXPERT.is_multiple_of(32) && N_EXPERT.is_multiple_of(ROWS_PER_BLOCK));
@@ -134,7 +139,7 @@ mod dflash_kernels {
                 // SAFETY: e0 + row < tok·n_expert + n_expert <= logits.len()
                 // by the launch contract; lane 0 of the row's warp is the only writer.
                 unsafe { *logits.get_unchecked_mut(e0 + row) = logit };
-                let score = sqrt_softplus(logit);
+                let score = router_score::<SqrtSoftplus>(logit);
                 // SAFETY: e0 + row < tok·n_expert + n_expert <= probs.len()
                 // by the launch contract; lane 0 of the row's warp is the only writer.
                 unsafe { *probs.get_unchecked_mut(e0 + row) = score };
@@ -173,25 +178,11 @@ mod dflash_kernels {
         // SAFETY: block-shared, N_USED entries; the raw form reaches the
         // `static mut` without a reference.
         let slot_p = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SLOT_P) };
-        let probs_ptr = probs.as_mut_ptr();
-        let mut e = tid;
-        while e < N_EXPERT {
-            // SAFETY: e0 + e < tok·N_EXPERT + N_EXPERT <= probs.len() by the
-            // launch contract; the volatile load reads the row where its block left it.
-            let p = unsafe { core::ptr::read_volatile(probs_ptr.add(e0 + e)) };
-            // SAFETY: e < N_EXPERT = n_expert <= bias.len() by the launch
-            // contract.
-            let b = unsafe { *bias.get_unchecked(e) };
-            // SAFETY: block-shared, e < N_EXPERT; thread `tid` writes entries
-            // tid + ROUTER_THREADS·i only, before the barrier that publishes
-            // them.
-            unsafe { *score.add(e) = p };
-            // SAFETY: block-shared, e < N_EXPERT; thread `tid` writes entries
-            // tid + ROUTER_THREADS·i only, before the barrier that publishes
-            // them.
-            unsafe { *sel_v.add(e) = p + b };
-            e += ROUTER_THREADS;
-        }
+        // SAFETY: e0 + N_EXPERT <= tok·N_EXPERT + N_EXPERT <= probs.len() and
+        // N_EXPERT = n_expert <= bias.len() by the launch contract; score and
+        // sel_v are block-shared arrays of N_EXPERT entries; the barrier below
+        // publishes them.
+        unsafe { publish_n::<N_EXPERT>(probs.as_mut_ptr(), bias, e0, score, sel_v, tid, fault) };
         thread::sync_threads();
 
         if tid < 32 {

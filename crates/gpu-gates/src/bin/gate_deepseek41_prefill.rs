@@ -42,8 +42,10 @@
 //!   at `attn_count`; a launch within the rows raises nothing.
 //! - **Router.** On synthetic rows (384 experts of 256 values, 11 tokens):
 //!   the decode shape one token at a time and the batch shape over all
-//!   eleven give the same ids and weights bit for bit, and a −inf bias or a
-//!   NaN in one expert's row raises the fault word at `router` in both.
+//!   eleven give the same ids and weights bit for bit, and a −inf bias, a
+//!   NaN in one expert's row, or one expert's logit overflowing to +inf or
+//!   to −inf (the finite weight 1 against activations of `f32::MAX`) raises
+//!   the fault word at `router` in both.
 //! - **Raise sites.** Launched alone on synthetic inputs, where no route can
 //!   send them: `ds41_ffn_places` and `ds41_ffn_handoff` with ids at and
 //!   past the stack raise `expert_id` and give those slots HOST (the handoff
@@ -1032,21 +1034,40 @@ mod gate {
         let w0: Vec<f32> = (0..N_EXPERT * K).map(|_| rnd()).collect();
         let x: Vec<f32> = (0..T * K).map(|_| rnd()).collect();
         let bias0: Vec<f32> = (0..N_EXPERT).map(|_| 0.1 * rnd()).collect();
-        let x_dev = DeviceBuffer::from_host(stream, &x)?;
+        // The overflow cases' activations: `f32::MAX` in two columns of lane 0
+        // of every token, 0 elsewhere.
+        let x_max: Vec<f32> = (0..T * K)
+            .map(|i| {
+                if i % K == 0 || i % K == 32 {
+                    f32::MAX
+                } else {
+                    0.0
+                }
+            })
+            .collect();
         let mut out = RouterOut::new(stream)?;
         let mut probs = DeviceBuffer::<f32>::zeroed(stream, N_EXPERT * T)?;
         let mut ids = DeviceBuffer::<u32>::zeroed(stream, N_USED * T)?;
         let mut wts = DeviceBuffer::<f32>::zeroed(stream, N_USED * T)?;
         let mut ok = true;
         // (what, expert whose bias is replaced and by what, expert whose row
-        // is poisoned)
-        type RouterCase = (&'static str, Option<(usize, f32)>, Option<usize>);
-        let cases: [RouterCase; 3] = [
-            ("finite", None, None),
-            ("a -inf bias", Some((77, f32::NEG_INFINITY)), None),
-            ("a NaN router row", None, Some(201)),
+        // is poisoned, expert whose logit overflows and its sign: its weight
+        // is that sign in the two columns `x_max` holds `f32::MAX` in, every
+        // other expert's weight 0)
+        type RouterCase = (
+            &'static str,
+            Option<(usize, f32)>,
+            Option<usize>,
+            Option<(usize, f32)>,
+        );
+        let cases: [RouterCase; 5] = [
+            ("finite", None, None, None),
+            ("a -inf bias", Some((77, f32::NEG_INFINITY)), None, None),
+            ("a NaN router row", None, Some(201), None),
+            ("a logit overflowing to +inf", None, None, Some((310, 1.0))),
+            ("a logit overflowing to -inf", None, None, Some((310, -1.0))),
         ];
-        for (what, bias_at, nan_row) in cases {
+        for (what, bias_at, nan_row, overflow_at) in cases {
             let (mut w, mut bias) = (w0.clone(), bias0.clone());
             if let Some((e, v)) = bias_at {
                 bias[e] = v;
@@ -1054,9 +1075,17 @@ mod gate {
             if let Some(e) = nan_row {
                 w[e * K + 3] = f32::NAN;
             }
+            if let Some((e, sign)) = overflow_at {
+                w.fill(0.0);
+                w[e * K] = sign;
+                w[e * K + 32] = sign;
+            }
+            let x = if overflow_at.is_some() { &x_max } else { &x };
+            let x_dev = DeviceBuffer::from_host(stream, x)?;
             let w_dev = DeviceTensor::upload(stream, &w, N_EXPERT, K)?;
             let bias_dev = DeviceBuffer::from_host(stream, &bias)?;
-            let want = (bias_at.is_some() || nan_row.is_some()).then_some(FaultSite::Router);
+            let want = (bias_at.is_some() || nan_row.is_some() || overflow_at.is_some())
+                .then_some(FaultSite::Router);
             gpu.clear_fault()?;
             let (mut step_ids, mut step_wts) = (Vec::new(), Vec::new());
             for t in 0..T {
