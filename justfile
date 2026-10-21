@@ -89,6 +89,17 @@ mac-fmt-check:
 mac-test:
     ./tools/mac-check.sh test
 
+# The Metal backend's gate, on an Apple Silicon Mac: the device contract's clauses on this Mac's Metal device, run by
+# tools/mac-gate.sh (the Metal lock, the bound, the refusals). crates/metal links no cuda-oxide, so plain cargo builds it.
+# The backend's own unit tests run first. A lab-* recipe, not a gate-* one: the box has no Metal device, so no landing
+# batch selects it.
+lab-metal:
+    cargo test -p bloomery-metal --lib && cargo build --release -p bloomery-metal --bin gate_metal_device && ./tools/mac-gate.sh gate_metal_device
+
+# clippy on the Metal backend's macOS body, which the static tier's x86_64-linux cross check compiles as an empty crate.
+mac-metal-lint:
+    cargo clippy -p bloomery-device -p bloomery-metal --all-targets
+
 # 라운드 루프의 맥 정적 계층 한 줄(≤180 s 목표): fmt-check와 check 스크립트 여덟은 병렬 레인, cargo 레인은 lint(clippy가
 # type-check를 겸한다 — check를 따로 돌리면 멤버 크레이트를 두 번 짓는다) 다음 BASE 범위 combos. BASE를 주면 그 base
 # 이후 바뀐 파일을 입력에 갖는 모양만 돌고 초록이 레저(~/.cache/bloomery/mac-static-ledger.tsv)에 남는다; 인자 없이 전체.
@@ -1717,6 +1728,11 @@ gate-threads:
 # refusals run on a Mac through `just mac-test`.
 gate-os:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-os --lib -- --nocapture'
+
+# The device contract's pure arithmetic and its compile-fail doc tests: window ranges and split_at, Elems against Bytes, the fault word's
+# rules on a host model of the word. No card.
+gate-device:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-device'
 
 # 레버 레지스트리 게이트(crates/levers, 호스트만): 모든 행이 형식에 맞는가, 종류가 받지 않는 값과 은퇴한 이름을
 # 이름을 대고 거부하는가, 제자리 행과 tools/levers-direct.txt가 서로 맞는가. 레지스트리를 마크다운 표로 찍는다.

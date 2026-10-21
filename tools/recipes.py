@@ -12293,9 +12293,11 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # the real tree: the rule's selection is the set whose native `cargo test` passes (`just mac-test`), and a
     # rejected crate names a device root or a source line
     real = dict(pure_crates(tree, load_lock(tree.root)))
+    # PIN(2026-10-21): bloomery-device (the device contract, std and placement only) and bloomery-metal (the Metal backend,
+    # empty off macOS) joined; `just mac-test` runs both natively.
     pure_now = sorted(n for n, w in real.items() if not w)
     expect(
-        pure_now == ["bloomery-decision", "bloomery-embed", "bloomery-gguf", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
+        pure_now == ["bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-gguf", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-metal", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
     # the host chain's Linux-only items are the one owner's now, behind its own cfg, so a crate that holds
@@ -12313,11 +12315,12 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # PIN(2026-10-21): safetensors keeps the mapped reader's fixture tests previously run by bloomery-hf.
     # PIN(2026-10-21): bloomery-os joined with the OS calls the host chain now makes through it, which the nightly runs as part of
     # that crate.
+    # PIN(2026-10-21): bloomery-device joined with the device contract's pure tests; bloomery-metal is an empty library off macOS.
     expect(
         host_now
         == [
-            "bloomery-app", "bloomery-decision", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf", "bloomery-jinja",
-            "bloomery-levers", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-refset",
+            "bloomery-app", "bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf",
+            "bloomery-jinja", "bloomery-levers", "bloomery-metal", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-refset",
             "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
             "bloomery-vision",
         ],

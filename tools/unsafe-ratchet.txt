@@ -10,6 +10,10 @@ app 0 0 0
 # (bounds asserted before it) and pool.rs's lifetime erasure of a task the caller joins before returning, each with
 # its SAFETY line.
 decision 2 0 0
+# PIN(2026-10-22): device 3 blocks, 6 fns, 5 impls, a new crate, not old code relaxed: the contract's `Elem` impls for
+# the five plain types, the two `from_raw` constructors and the two `Shared` accessors that state their invariant in
+# `# Safety`, and the mock's zeroed element, each with its SAFETY line.
+device 3 6 5
 embed 0 0 0
 # PIN(2026-10-07): engram 6 -> 7 blocks, new code, not old code relaxed: the row reads over a table's bytes in a
 # mapping the reader does not own (TableBytes, which a split's table, Qwen3.8's PLE, and a site share) advise its
@@ -528,6 +532,11 @@ gpu-vision 148 0 0
 hf 0 0 0
 jinja 0 0 0
 levers 0 0 0
+# PIN(2026-10-22): metal 21 blocks, 6 fns, 13 impls, a new crate, not old code relaxed: the Objective-C bindings declare
+# no Metal protocol thread-safe, so the thread-safe handles and the window's raw carry `unsafe impl Send/Sync` with Apple's
+# list as their invariant; the shared pages' one owner (`HostPages`) holds every access through the contents pointer; the
+# window raw's buffer dereference and the encoder's two argument calls each carry their SAFETY line.
+metal 21 6 13
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.
