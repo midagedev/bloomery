@@ -11,8 +11,9 @@
 //! The model file is `-m`'s, else `$BLOOMERY_REF_MODEL`: this node's own
 //! copy, which must hold the rows node 0's plan gives the tier with node 0's
 //! headers and bytes (each row's sha256). It serves Qwen3.8's tier family,
-//! and V4.1's and GLM's when built with the `deepseek41` or `glm5next`
-//! feature; an open of another family is refused by name. The explicit
+//! and V4.1's, GLM's and Solar-Open2's when built with the `deepseek41`,
+//! `glm5next` or `solar2` feature; an open of another family is refused by
+//! name. The explicit
 //! listen address is loopback, private or 198.18.0.0/15 IPv4. Off-host nodes bind their
 //! own RDMA pages over this control channel, which has no authentication and belongs on a trusted network.
 //! A port of 0 takes a free
@@ -83,6 +84,8 @@ mod server {
                 bloomery_gpu_deepseek41::NODE_FAMILY,
                 #[cfg(feature = "glm5next")]
                 bloomery_gpu_glm5next::NODE_FAMILY,
+                #[cfg(feature = "solar2")]
+                bloomery_gpu_solar2::NODE_FAMILY,
             ],
         )?;
         println!("node 0 closed the load");

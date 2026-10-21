@@ -22,9 +22,12 @@
 //! launches write for it, whatever `m`, so the two feeds leave the same bits.
 //!
 //! What a family fixes is a [`CardFamily`]: the slot map's row width, the
-//! slots a token picks, the stacks' names and what the errors name. No expert
-//! tier hangs on these experts: a plan that puts routed experts on one is
-//! refused by name.
+//! slots a token picks, the stacks' names and what the errors name. A load
+//! whose map names an expert tier card builds them with [`CardExperts::tiered`]:
+//! a layer the tier holds experts of runs the card leg without its sum, the
+//! stage card's slots' downs stay in the leg's rows ([`TierJoin`]) and the
+//! layer's join sums them with the tier's rows in one slot order. [`CardExperts::new`]
+//! refuses a map that names a tier by name: those experts hang none.
 
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::models::{Ffn, LayerSpec};
@@ -99,6 +102,17 @@ impl CardBufs {
         self.leg.shape().cap
     }
 
+    /// The buffers a tier layer's join reads and writes, the slots' places
+    /// `sel` as the run read them.
+    fn join<'a>(&'a mut self, sel: &'a DeviceBuffer<u32>) -> TierJoin<'a> {
+        TierJoin {
+            down: self.leg.down(),
+            sel,
+            acc: &mut self.acc,
+            pre: &mut self.pre,
+        }
+    }
+
     /// Device bytes of the buffers.
     fn bytes(&self) -> usize {
         self.leg.bytes() + self.acc.num_bytes() + self.pre.num_bytes()
@@ -125,6 +139,23 @@ impl CardBatch {
     pub fn pre(&self) -> &DeviceBuffer<f32> {
         &self.bufs.pre
     }
+
+    /// The buffers a tier layer's join reads and writes over the batch.
+    pub fn join(&mut self) -> TierJoin<'_> {
+        self.bufs.join(&self.sel)
+    }
+}
+
+/// A tier layer's join over one run's buffers: the stage card's slots' down
+/// rows (slot-major, `n` values a slot, left by the run that did not sum
+/// them) and each slot's place in the card's stacks, the card sum the join
+/// writes and the sum plus the base it then writes
+/// ([`CardExperts::step_join`], [`CardBatch::join`]).
+pub struct TierJoin<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub acc: &'a mut DeviceBuffer<f32>,
+    pub pre: &'a mut DeviceBuffer<f32>,
 }
 
 /// What [`CardExperts::enqueue_step`], [`CardExperts::enqueue_pass`] and
@@ -179,6 +210,9 @@ pub struct CardExperts {
     k: CardKernels,
     /// Per layer of the description, its card experts; `None` without.
     layers: Vec<Option<CardLayer>>,
+    /// Per layer of the description, the experts the expert tier holds: 0
+    /// off the tier, and on every layer of a load with no tier.
+    tier: Vec<usize>,
     /// Routed expert width: a gate·up slot's rows.
     ff: usize,
     /// The model's width.
@@ -192,8 +226,40 @@ pub struct CardExperts {
 impl CardExperts {
     /// The card experts of `layers` (the description) as `map` places them and
     /// `w` holds them, `n` wide with routed experts `ff` wide, with buffers
-    /// for a pass of `rows` rows when `rows` is more than one. Load-time only.
+    /// for a pass of `rows` rows when `rows` is more than one. A map that names
+    /// an expert tier is refused by name ([`CardExperts::tiered`]). Load-time
+    /// only.
     pub fn new(
+        gpu: &Gpu,
+        w: &Weights,
+        family: CardFamily,
+        layers: &[LayerSpec],
+        map: &SlotMap,
+        dims: (usize, usize),
+        rows: usize,
+    ) -> Result<CardExperts, GpuError> {
+        Self::build(gpu, w, family, layers, map, dims, rows, false)
+    }
+
+    /// [`CardExperts::new`] for a load that hangs the map's expert tier card:
+    /// a layer the tier holds experts of runs as a tier layer (module doc).
+    pub fn tiered(
+        gpu: &Gpu,
+        w: &Weights,
+        family: CardFamily,
+        layers: &[LayerSpec],
+        map: &SlotMap,
+        dims: (usize, usize),
+        rows: usize,
+    ) -> Result<CardExperts, GpuError> {
+        Self::build(gpu, w, family, layers, map, dims, rows, true)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructors' arguments and whether a tier hangs (rust-quality R8)"
+    )]
+    fn build(
         gpu: &Gpu,
         w: &Weights,
         family: CardFamily,
@@ -201,18 +267,20 @@ impl CardExperts {
         map: &SlotMap,
         (n, ff): (usize, usize),
         rows: usize,
+        tiers: bool,
     ) -> Result<CardExperts, GpuError> {
         let what = family.what;
         let mut per = Vec::with_capacity(layers.len());
+        let mut tier_k = Vec::with_capacity(layers.len());
         for (l, spec) in layers.iter().enumerate() {
             // A dense block is outside the host run and has no row: no card
             // experts, which the resident-rows check below holds it to. A
             // routed layer the map has no row for is refused by name.
-            let n_card = match spec.ffn {
-                Ffn::Dense { .. } => 0,
+            let (n_card, on_tier) = match spec.ffn {
+                Ffn::Dense { .. } => (0, 0),
                 Ffn::Moe(_) => {
                     let (card, tier) = (map.on_card(l)?, map.on_tier(l)?);
-                    if tier > 0 {
+                    if tier > 0 && !tiers {
                         return Err(GpuError::Shape {
                             what,
                             detail: format!(
@@ -221,9 +289,10 @@ impl CardExperts {
                             ),
                         });
                     }
-                    card
+                    (card, tier)
                 }
             };
+            tier_k.push(on_tier);
             let layer = CardLayer {
                 n_card,
                 names: (family.stacks)(l),
@@ -250,6 +319,7 @@ impl CardExperts {
                 places: CardSlotKernels::load(gpu.context())?,
             },
             layers: per,
+            tier: tier_k,
             ff,
             n,
             step: CardBufs::new(gpu.stream(), &family, n, ff, 1)?,
@@ -271,6 +341,31 @@ impl CardExperts {
         self.layers.iter().any(Option::is_some)
     }
 
+    /// The experts of layer `l` the expert tier holds: 0 off the tier, and on
+    /// every layer of a load with none.
+    #[must_use]
+    pub fn tier_k(&self, l: usize) -> usize {
+        self.tier.get(l).copied().unwrap_or(0)
+    }
+
+    /// Layer `l` has a card sum: card experts on the stage card or the tier.
+    #[must_use]
+    pub fn sums(&self, l: usize) -> bool {
+        self.has(l) || self.tier_k(l) > 0
+    }
+
+    /// Some layer holds experts on the expert tier.
+    #[must_use]
+    pub fn any_tier(&self) -> bool {
+        self.tier.iter().any(|&k| k > 0)
+    }
+
+    /// The stage card's experts of layer `l`: 0 off the card.
+    #[must_use]
+    pub fn n_card(&self, l: usize) -> usize {
+        layer_of(self.family.what, &self.layers, l).map_or(0, |c| c.n_card)
+    }
+
     /// The layers that compute experts on the card.
     #[must_use]
     pub fn card_layers(&self) -> Vec<bool> {
@@ -287,6 +382,12 @@ impl CardExperts {
     #[must_use]
     pub fn pre(&self) -> &DeviceBuffer<f32> {
         &self.step.pre
+    }
+
+    /// The buffers a tier layer's join reads and writes over the step's row,
+    /// the slots' places `sel` as the handoff wrote them.
+    pub fn step_join<'a>(&'a mut self, sel: &'a DeviceBuffer<u32>) -> TierJoin<'a> {
+        self.step.join(sel)
     }
 
     /// The sum plus the base of the last card layer a pass enqueued, one row
@@ -336,8 +437,16 @@ impl CardExperts {
         sel: &DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
         let layer = layer_of(self.family.what, &self.layers, l)?;
-        self.k
-            .enqueue(gpu, w, &mut self.step, (l, layer, self.n), rule, io, sel)
+        let tiered = self.tier_k(l) > 0;
+        self.k.enqueue(
+            gpu,
+            w,
+            &mut self.step,
+            (l, layer, self.n),
+            (rule, tiered),
+            io,
+            sel,
+        )
     }
 
     /// Layer `l`'s card slots of a pass of `io.m` rows (module doc), the
@@ -365,8 +474,9 @@ impl CardExperts {
                 detail: format!("a pass of {} rows in buffers of {}", io.m, bufs.cap()),
             });
         }
+        let tiered = self.tier.get(l).is_some_and(|&k| k > 0);
         self.k
-            .enqueue(gpu, w, bufs, (l, layer, self.n), rule, io, sel)
+            .enqueue(gpu, w, bufs, (l, layer, self.n), (rule, tiered), io, sel)
     }
 
     /// Layer `l`'s card slots over a prompt batch of `io.m` tokens (module
@@ -407,14 +517,24 @@ impl CardExperts {
             gpu.layer_sink(l)?,
             &mut cb.sel,
         )?;
-        self.k
-            .enqueue(gpu, w, &mut cb.bufs, (l, layer, self.n), rule, io, &cb.sel)
+        let tiered = self.tier.get(l).is_some_and(|&k| k > 0);
+        self.k.enqueue(
+            gpu,
+            w,
+            &mut cb.bufs,
+            (l, layer, self.n),
+            (rule, tiered),
+            io,
+            &cb.sel,
+        )
     }
 }
 
 impl CardKernels {
     /// The six launches (module doc) of layer `l` over `io.m` tokens, `layer`
-    /// its card experts and `n` the model's width.
+    /// its card experts and `n` the model's width. On a `tiered` layer the
+    /// card leg's four and no more: the slots' downs stay in the buffers for
+    /// the layer's join, which sums them with the tier's rows.
     #[allow(
         clippy::too_many_arguments,
         reason = "one run's inputs: the weights, the buffers, the layer's shape and rule, the \
@@ -426,7 +546,7 @@ impl CardKernels {
         w: &Weights,
         bufs: &mut CardBufs,
         (l, layer, n): (usize, &CardLayer, usize),
-        rule: Act,
+        (rule, tiered): (Act, bool),
         io: &Io<'_>,
         sel: &DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
@@ -440,11 +560,14 @@ impl CardKernels {
             n_card: layer.n_card,
             rule,
         };
-        let sum = LegSum {
+        let sum = (!tiered).then_some(LegSum {
             w: io.weights,
             acc: &mut bufs.acc,
-        };
-        self.leg.enqueue(gpu, &mut bufs.leg, &run, Some(sum))?;
+        });
+        self.leg.enqueue(gpu, &mut bufs.leg, &run, sum)?;
+        if tiered {
+            return Ok(());
+        }
         let stream = gpu.stream();
         gpu.elem()
             .enqueue_add(stream, &bufs.acc, io.x1, io.m * n, &mut bufs.pre)

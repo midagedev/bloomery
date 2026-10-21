@@ -1,8 +1,8 @@
 //! A Solar-Open2 file planned onto a machine: the common hybrid owner's plan
 //! ([`place_hybrid`]) over this family's reading. What each layer holds is read off the
-//! description (a KDA layer's state, a NoPE GQA layer's planes), the card experts' formats are the
-//! common leg's, and a machine that hangs an expert tier card is refused by name
-//! ([`PlaceError::Tier`]) until the body serves one. The family's own is the reading.
+//! description (a KDA layer's state, a NoPE GQA layer's planes), and the card experts' formats are
+//! the common leg's; the expert tier card a machine names holds the next ids of each card layer on
+//! that leg. The family's own is the reading.
 
 use std::collections::BTreeSet;
 
@@ -14,6 +14,7 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::place_hybrid;
 use crate::placement::kernels::q8_act_bytes;
+use crate::placement::workstation::TierBatchBytes;
 use crate::placement::{PlacementError, workstation};
 
 pub use place_hybrid::{KvLayout, PlaceError, card_routed};
@@ -37,6 +38,33 @@ pub const PARTIAL_ROWS: usize = 8;
 pub const GEMM_TILE_COLS: usize = 64;
 /// See [`GEMM_TILE_COLS`].
 pub const GEMM32_STEP: usize = 64;
+
+/// Tokens a chunk of the tier's prompt-batch service runs at most: the card leg's launch group of
+/// the stage card's card experts, which the body binds to its own constant.
+pub const TIER_CHUNK: u64 = 8;
+
+/// The expert tier's prompt-batch bytes ([`TierBatchBytes`]) for a file of hyperparameters `hp`:
+/// the tier card's staging, the leg's chunk scratch and the host's rows and places, for blocks of
+/// the host union's columns. The plan reserves them on the tier card and the host, and the load
+/// checks its allocations against them.
+#[must_use]
+pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
+    workstation::tier_leg_batch_bytes(
+        hp.n_embd as u64,
+        hp.experts.ff as u64,
+        hp.experts.n_used as u64,
+        TIER_CHUNK,
+        crate::moe::UNION_MAX_COLS as u64,
+    )
+}
+
+/// The card bytes a tiered load makes beside [`prompt_reserve_bytes`]: per routed slot of the
+/// prompt batch's `rows` rows (`n_used` a row), the tier place, the copy of it the join reads and
+/// the copy of the slot's route weight, three four-byte words.
+#[must_use]
+pub fn tier_places_bytes(hp: &Hparams, rows: usize) -> u64 {
+    3 * 4 * (rows * hp.experts.n_used) as u64
+}
 
 /// Card bytes of the q8 blocks of 32 of `cols` columns of `k` values (Q8_0 and Q5_0 sites' input,
 /// `GemmAct32`): per column `16 + 2 + 2` words a step of [`GEMM32_STEP`] values.
@@ -159,7 +187,10 @@ impl PlanInputs {
         // No parser is declared: see `spec`.
         let spec = spec::spec_of(&hp, chat_of(split, None, None)?)?;
         let reserve = prompt_reserve_bytes(&hp, &spec, PROMPT_ROWS);
-        Ok(PlanInputs::new(ENGINE, hp, model, spec)?.with_prompt_reserve(reserve))
+        let tier = tier_places_bytes(&hp, PROMPT_ROWS);
+        Ok(PlanInputs::new(ENGINE, hp, model, spec)?
+            .with_prompt_reserve(reserve)
+            .with_tier_reserve(tier))
     }
 }
 
@@ -170,9 +201,11 @@ mod tests {
     use gguf::Split;
 
     use super::super::hparams::tests::{LAYERS, keys, tensors};
-    use super::{PROMPT_ROWS, PlaceError, PlanInputs, prompt_reserve_bytes};
+    use super::{
+        PROMPT_ROWS, PlaceError, PlanInputs, prompt_reserve_bytes, tier_batch, tier_places_bytes,
+    };
     use crate::arch::synthetic::{V, header_shaped};
-    use crate::placement::{PlanLevers, Violation, workstation};
+    use crate::placement::{PlacementError, PlanLevers, Violation, workstation};
 
     /// The small header's file, described; each test names its own file (the tests run in
     /// threads of one process).
@@ -192,10 +225,9 @@ mod tests {
     /// reader]: the 2 GQA layers (0 and 4) 2 key heads × (16 + 16) × 2 B = 128 B a position, the 6
     /// KDA layers 4 heads of 16 × 16 f32 (4,096 B) + 11 ring rows of 3 × 4 × 16 f32 (8,448 B) + a
     /// lane's u32 stamp = 12,548 B; at 64 positions 2 × 8,192 + 6 × 12,548 = 91,672 B, a slot each
-    /// time. A machine that hangs an expert tier card is refused by name, and a context of no
-    /// position first. Mutant: the stamp left out of the state, or a tier card planned.
+    /// time. A context of no position is refused first. Mutant: the stamp left out of the state.
     #[test]
-    fn the_cards_kv_class_is_the_layers_stores_and_a_tier_card_is_refused() {
+    fn the_cards_kv_class_is_the_layers_stores() {
         let inputs = described("so2-place-kv");
         let machine = workstation::plan_gate(LAYERS);
         let levers = PlanLevers::default();
@@ -206,13 +238,45 @@ mod tests {
                 .expect("the small header plans");
             assert_eq!(plan.cards[0].kv_bytes, n as u64 * 91_672, "{n} slots");
         }
-        let mut tiered = workstation::plan_gate(LAYERS);
-        let mut tier = tiered.cards[0].clone();
-        tier.layers = 0..0;
-        tier.head = false;
-        tier.token_embedding = false;
-        tiered.tiers.push(tier);
-        match inputs.plan(&tiered, 64, &levers) {
+        assert!(matches!(
+            inputs.plan(&machine, 0, &levers),
+            Err(PlaceError::CtxZero)
+        ));
+    }
+
+    /// A machine that names an expert tier card is planned, the stage card keeping the tier's
+    /// places of the prompt batch beside its prompt reserve: the reserve a tiered load makes is
+    /// the plain one plus the places, join places and join weights of `PROMPT_ROWS` rows of the
+    /// header's used experts, 12 B a slot, and the plan reaches the placement (which refuses the
+    /// tier idle: the header's experts all fit the stage card). A body that serves no tier
+    /// ([`PlanInputs::tier_reserve`] unset) refuses the machine by name. Mutant: the places left
+    /// out of the tiered reserve, or the tier reserve left out of the description (the plan stops
+    /// at [`PlaceError::Tier`]).
+    #[test]
+    fn a_tier_card_is_planned_with_the_batch_places_beside_the_reserve() {
+        let inputs = described("so2-place-tier");
+        let tiered = workstation::plan_bp(LAYERS, None, tier_batch(&inputs.hp));
+        let plain = workstation::plan_gate(LAYERS);
+        let places = 12 * 512 * inputs.hp.experts.n_used as u64;
+        assert_eq!(tier_places_bytes(&inputs.hp, PROMPT_ROWS), places);
+        assert_eq!(
+            inputs.reserve_on(&plain).expect("a plain machine"),
+            inputs.prompt_reserve
+        );
+        assert_eq!(
+            inputs.reserve_on(&tiered).expect("a tiered machine"),
+            inputs.prompt_reserve + places
+        );
+        // The small header's experts all fit the stage card, so the plan passes the body's tier
+        // check and meets the placement's own refusal of a tier with nothing to hold; the real
+        // file's plan puts experts on the tier (`solar_open2_meta`).
+        match inputs.plan(&tiered, 64, &PlanLevers::default()) {
+            Err(PlaceError::Placement(PlacementError::IdleTier { tier: 0, .. })) => {}
+            other => panic!("{other:?}, not the placement's idle-tier refusal"),
+        }
+        let mut untiered = inputs.clone();
+        untiered.tier_reserve = None;
+        match untiered.plan(&tiered, 64, &PlanLevers::default()) {
             Err(e @ PlaceError::Tier { tier: 0, .. }) => assert_eq!(
                 e.to_string(),
                 "the machine has the expert tier card 3090 (tier 0); the program this plan is \
@@ -220,11 +284,8 @@ mod tests {
             ),
             other => panic!("{other:?}, not the tier refusal"),
         }
-        assert!(matches!(
-            inputs.plan(&tiered, 0, &levers),
-            Err(PlaceError::CtxZero)
-        ));
     }
+
     /// A card that holds the plan's terms but not the prompt batch's reserve beside them is
     /// refused by name with the bytes it is short, and one byte more of room plans: the reserve is
     /// the one the description gives ([`prompt_reserve_bytes`] at [`PROMPT_ROWS`] rows), kept

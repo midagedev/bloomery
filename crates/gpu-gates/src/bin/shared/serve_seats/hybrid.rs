@@ -21,13 +21,14 @@ use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{Seat, note_line};
-use bloomery_gpu_gates::generate::Lane;
+use bloomery_gpu_gates::generate::{Lane, Place};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::ReasoningFormat;
 use model::arch::place_hybrid::PlanInputs;
+use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, PlacementError, Plan};
 use runtime::Target as _;
 use serve::reasoning::ThinkTags;
@@ -82,6 +83,17 @@ pub trait Family: Sized + 'static {
     /// The seat's load record: the family names its kind, the common owner
     /// fills the fields every seat's load prints.
     fn load_record() -> Record;
+
+    /// The expert tier's prompt-batch bytes the plan reserves on `place`'s
+    /// tier card ([`Tiered::tier_batch`]); a body that serves no tier card
+    /// reserves none (the default), and its plan refuses the card by name.
+    fn tier_batch(place: Place, _inputs: &PlanInputs<Self::H>) -> Option<TierBatchBytes> {
+        (!place.tier_cards().is_empty()).then_some(TierBatchBytes {
+            staging: 0,
+            scratch: 0,
+            host: 0,
+        })
+    }
 
     /// The tags the model's description names for its think span, which the
     /// server splits the reasoning on ([`serve::Server::with_think_tags`]); the
@@ -200,7 +212,7 @@ fn open_session<F: Family>(a: Open<F::Flags>) -> Result<Hybrid<F>, GateError> {
     let args = OpenArgs {
         place: a.place.name(),
         machine: beside::with_reserve(
-            a.place.machine_untiered()?,
+            a.place.machine(None, a.tier_batch)?,
             Beside {
                 image: None,
                 embedding: a.embedding,
@@ -314,6 +326,10 @@ impl<F: Family> Tiered for Hybrid<F> {
 
     fn think(inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
         F::think_tags(inputs).map(Some)
+    }
+
+    fn tier_batch(place: Place, inputs: &PlanInputs<Self::H>) -> Option<TierBatchBytes> {
+        F::tier_batch(place, inputs)
     }
 
     fn register() {

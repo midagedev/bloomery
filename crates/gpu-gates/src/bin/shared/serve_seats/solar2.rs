@@ -1,7 +1,8 @@
 //! `bloomery-serve --model solar2` — the llama-server-compatible HTTP API on
 //! the Solar-Open2 engine: a solar-open2 file, its layers on one card, the
 //! routed experts the plan puts on the card and the rest on the host tier
-//! (`placement::plan_routed` through `PlanInputs::plan`), opened as
+//! (`placement::plan_routed` through `PlanInputs::plan`), and on a placement that names an expert
+//! tier card (`bp`) the next ids of each card layer on that card, opened as
 //! `gate_solar2_e2e` opens it (`app::Loaded`, in graph mode with the step
 //! captured).
 //!
@@ -36,13 +37,14 @@
 //! name when they do not fit.
 //!
 //! `--place W` is the shared placement word (`generate::Place`): `a` (the
-//! largest visible card), `gate`, or one card of the census by name or
-//! ordinal. Unset, the common rule every serving seat takes decides
-//! (`Place::choose_untiered`: the body serves no tier card), on one census
-//! reading: a `place unset` record names the word `a` and why. A placement
-//! that hangs an expert tier card (`bp`, a two-card list) is refused before
-//! any load by the plan's own refusal (`PlaceError::Tier`), which names the
-//! card and its tier.
+//! largest visible card), `gate`, `bp` (plan (b′): the next-largest card the
+//! largest's expert tier), or one card of the census by name or ordinal. Unset,
+//! the common rule every serving seat takes decides (`Place::choose_untiered`:
+//! no sitting has shown the tier not slower), on one census reading: a `place
+//! unset` record names the word `a` and why. A placement that names more
+//! expert tier cards than the host tier serves is refused by name before any
+//! upload (`bloomery_gpu::host::refuse_tier_count`), and a tier card the
+//! census does not show is refused by the placement.
 //!
 //! `--ctx` is the context the one slot serves (`--ctx 0` is refused). The
 //! context comes first and the plan fills the machine around it
@@ -90,12 +92,15 @@
 //! holds what Solar-Open2 forces — the architectures it serves, the plan's
 //! inputs, the words its refusals name and the records it prints.
 
+use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record;
 use bloomery_gpu_gates::side_seat;
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::place_hybrid::PlanInputs;
+use model::arch::solar2::place;
 use model::placement::PlacementError;
+use model::placement::workstation::TierBatchBytes;
 use serve::ServeError;
 
 use super::hybrid::Family;
@@ -166,6 +171,12 @@ impl Family for Solar {
 
     fn load_record() -> record::Record {
         record::Record::new(&record::LOAD_SOLAR2)
+    }
+
+    /// The tier's prompt-batch bytes of the file's widths ([`place::tier_batch`]), reserved on
+    /// the placement's tier card and the host.
+    fn tier_batch(place: Place, inputs: &PlanInputs<Self::H>) -> Option<TierBatchBytes> {
+        (!place.tier_cards().is_empty()).then(|| place::tier_batch(&inputs.hp))
     }
 }
 

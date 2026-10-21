@@ -9,8 +9,8 @@
 //! All 48 layers are one card's chain, each a mixer by its description (a
 //! NoPE GQA layer with its out gate at every fourth layer from 0, a KDA layer
 //! elsewhere) and a routed block with one shared expert, whose experts run on
-//! the card where the plan puts them ([`crate::ffn::Routed`]) and on the host
-//! tier otherwise. A KDA layer's store is its recurrent state, its stamp and
+//! the card where the plan puts them ([`crate::ffn::Routed`]), on the plan's
+//! expert tier card ([`crate::tier`]) and on the host tier otherwise. A KDA layer's store is its recurrent state, its stamp and
 //! its conv ring, one lane (the file has no next-token head), whatever the
 //! context; a GQA layer's the K and V planes of every position. The
 //! embedding is a host row, dequantized per step and copied into `x` before
@@ -20,8 +20,8 @@
 //! checkpoint taken there ([`Body::checkpoint`]), or the empty model at 0,
 //! and is carried out at the next device call ([`Body::apply_cut`]).
 //!
-//! What the load refuses, by name: a plan of other than one card with no
-//! expert tier, a layer other than the two mixers over a routed block on a
+//! What the load refuses, by name: a plan of other than one stage card, more
+//! expert tier cards than the host tier serves, a layer other than the two mixers over a routed block on a
 //! plain residual, GQA or KDA widths the kernels have no geometry for, KDA
 //! layers that disagree on their rule, a tensor whose type no site launches
 //! or that is not resident in the rows its launch reads, stores whose bytes
@@ -39,6 +39,8 @@ use bloomery_gpu::checkpoint::{self, Checkpoints};
 use bloomery_gpu::flash_gqa::{GROUP, partials_ms_len, partials_v_len};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
+use bloomery_gpu::host::leg_tier::{Hang, LegOpen};
+use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
@@ -46,12 +48,13 @@ use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{
     DEADLINE, FileSwap, LIVE_DELAY, PlanStacks, ResidencyGlue, ResidencySpec, hosted_stacks,
 };
+use bloomery_gpu::host::tier::TierOpen;
 use bloomery_gpu::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
 use bloomery_gpu::linear::mixer_kda::{KdaDecay, KdaDims, KdaRule};
 use bloomery_gpu::linear::{CONV_TAPS, HEAD, KHeadMap, LinearShape};
 use bloomery_gpu::model::{
-    ChainBody, HostServed, MAX_PASS_ROWS, Rollback, StepMode, agreed, hosted_hybrid, one_card_run,
-    refuse_scratch_past,
+    ChainBody, HostServed, MAX_PASS_ROWS, Rollback, StepMode, agreed, hosted_hybrid_tiered,
+    refuse_scratch_past, stage_run,
 };
 use bloomery_gpu::site::{self, SiteTy, WideActs};
 use bloomery_gpu::weights::Weights;
@@ -65,7 +68,7 @@ use model::arch::solar2::host as solar_host;
 use model::arch::solar2::place::{self, PlanInputs};
 use model::embed::EmbedTable;
 use model::placement::Plan;
-use models::{Act, DeltaKind, Ffn, Gqa, KdaGate, LayerSpec, Mixer, ModelSpec, OutGate, RopeMode};
+use models::{DeltaKind, Gqa, KdaGate, LayerSpec, Mixer, ModelSpec, OutGate, RopeMode};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
 use runtime::seqstate::{Kept, Take};
 
@@ -74,6 +77,7 @@ use bloomery_gpu_deepseek41::prompt_walk::{self, BatchBufs};
 use crate::ffn::{CARD, Routed, RoutedDims};
 use crate::prefill::Extra;
 use crate::step::Kernels;
+use crate::tier;
 
 /// What the body's refusals name.
 pub(crate) const WHAT: &str = "solar2 Body";
@@ -575,20 +579,6 @@ fn dims_of(inputs: &PlanInputs, ctx: usize) -> Result<Dims, GpuError> {
     })
 }
 
-/// The SwiGLU limit of layer `l`'s routed experts; any other activation is
-/// refused by name.
-fn routed_limit(spec: &ModelSpec, l: usize) -> Result<f32, GpuError> {
-    match spec.layers.get(l).map(|s| &s.ffn) {
-        Some(Ffn::Moe(m)) => match m.act {
-            Act::SwiGlu { limit } => Ok(limit.unwrap_or(0.0)),
-            other => Err(shape(format!(
-                "layer {l}: the routed activation is {other:?}; this program runs SwiGLU"
-            ))),
-        },
-        _ => Err(shape(format!("layer {l}: not a routed block"))),
-    }
-}
-
 /// The stacks of the layers `inputs` describes for the residency machine's
 /// file source: each routed layer's gate, up and down, their types read from
 /// its tensors. Refused by name: a layer that holds some of its three stacks
@@ -671,6 +661,8 @@ impl Body {
                  slots to add"
             )));
         }
+        let tiers = TierOpen::of_machine(plan.machine)?;
+        refuse_tier_count(WHAT, tiers.len())?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
         let spec = ResidencySpec {
             lever: residency,
@@ -693,7 +685,7 @@ impl Body {
                     gpu,
                     file,
                     w,
-                    (plan, inputs, card),
+                    (plan, inputs, card, &tiers),
                     host,
                     (set, glue, residency),
                 )
@@ -703,24 +695,27 @@ impl Body {
 
     /// The body of card `card`: its layers' programs and values from the
     /// plan's description, the stores at the plan's `ctx_max`, the step's
-    /// buffers, the slot map the plan's routed segments make, the routed
-    /// blocks and the host tier over the routed run. `glue` is the load's
-    /// residency side, whose machine the body starts once its pieces are
-    /// sized.
+    /// buffers, the slot map the plan's routed segments make (the stage
+    /// card's and the expert tier cards' `tiers`), the routed blocks and the
+    /// host tier over the routed run with the tier cards hung under it.
+    /// `glue` is the load's residency side, whose machine the body starts once
+    /// its pieces are sized.
     fn load(
         gpu: &Gpu,
         file: &Arc<Split>,
         w: &Weights,
-        (plan, inputs, card): (&Plan<'_>, &PlanInputs, usize),
+        (plan, inputs, card, tiers): (&Plan<'_>, &PlanInputs, usize, &[TierOpen]),
         host: HostCfg,
         (set, glue, residency): (HostResidency, ResidencyGlue, Residency),
     ) -> Result<Body, GpuError> {
         let (hp, spec) = (&inputs.hp, &inputs.spec);
         gpu.context().bind_to_thread()?;
-        let (layers, ctx) = one_card_run(WHAT, plan, card, spec.layers.len())?;
+        let (layers, ctx) = stage_run(WHAT, plan, card, spec.layers.len())?;
         let dims = dims_of(inputs, ctx)?;
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
-        let map = SlotMap::of_plan(plan, card, None, run.clone(), hp.experts.n_expert)?;
+        let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+        let map =
+            SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), hp.experts.n_expert)?;
         let mut lcfg = Vec::with_capacity(spec.layers.len());
         for (l, s) in spec.layers.iter().enumerate() {
             lcfg.push(layer_cfg(l, s, &map)?);
@@ -765,10 +760,20 @@ impl Body {
             },
             CARD,
         )?;
-        let limits = (0..spec.layers.len())
-            .map(|l| routed_limit(spec, l))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut hybrid = hosted_hybrid(
+        let hang = Hang {
+            tiers,
+            family: &tier::NODE_FAMILY,
+            open: LegOpen {
+                n_expert: hp.experts.n_expert,
+                layers: spec.layers.len(),
+                hidden: dims.embd,
+                n_used: hp.experts.n_used,
+                rows: LOAD_ROWS,
+            },
+            cols: T_MAX,
+            card_dontneed: host.card_dontneed,
+        };
+        let mut hybrid = hosted_hybrid_tiered(
             (gpu, file, plan),
             (run.clone(), map),
             (host, set, &glue),
@@ -780,11 +785,8 @@ impl Body {
                 },
                 LOAD_ROWS,
             ),
-            |src| {
-                run.clone()
-                    .map(|l| solar_host::layer(src, hp, l, limits[l]))
-                    .collect()
-            },
+            Some(&hang),
+            |src| solar_host::routed_layers(src, hp, spec, run.clone()),
         )?;
         let table = EmbedTable::new(Arc::clone(file), &names::token_embd(), dims.embd)?;
         if table.n_vocab() != hp.n_vocab {
@@ -840,7 +842,10 @@ impl Body {
             "the step's buffers, the routed blocks' buffers and card experts, the mixers' \
              kernels, the host boundary, the slot map's copy",
         )?;
-        refuse_prompt_past(inputs.prompt_reserve, body.prompt_bytes())?;
+        let reserve = inputs
+            .reserve_on(plan.machine)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        refuse_prompt_past(reserve, body.prompt_bytes())?;
         // Last: the machine frees each layer's spare slots, and every piece
         // above sized itself from the load's map, capacity = live.
         body.start_residency(gpu)?;

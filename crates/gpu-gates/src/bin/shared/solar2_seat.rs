@@ -12,9 +12,9 @@ use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::tier::Tier;
 use bloomery_gpu_solar2::{Body, Solar2Model, set_prefill_group, set_taps};
 use gguf::Split;
-use model::arch::solar2::place::PlanInputs;
+use model::arch::solar2::place::{self, PlanInputs};
 use model::placement::PlanLevers;
-use model::placement::workstation::{HostRead, PLAN_ROOM};
+use model::placement::workstation::{self, HostRead, PLAN_ROOM};
 use refset::arch::solar2::ARCH;
 use std::path::{Path, PathBuf};
 
@@ -63,19 +63,13 @@ pub fn model_path(tier_now: Tier, recipe: &str) -> Result<PathBuf, GateError> {
     lcpp_e2e::model_path(tier_now, recipe, ARCH)
 }
 
-/// Open `file` on the gate card at `ctx` positions by the gate placement (`gate_card::plan_gate`) of `arm`: the body opened as
-/// the serve seat opens it (`Body::open_placed`, the plan `PlanInputs::plan` makes), the taps armed before the step is first
-/// captured, so a replay and a prompt batch both write them.
+/// Open `file` at `ctx` positions by the placement of `arm`: the gate placement (`gate_card::plan_gate`) on the gate card for
+/// `a`, plan (b′) (`workstation::plan_bp`) for `bp`. The body is opened as the serve seat opens it (`Body::open_placed`, the
+/// plan `PlanInputs::plan` makes), the taps armed before the step is first captured, so a replay and a prompt batch both write
+/// them.
 ///
 /// The including gate declares `shared/gate_card.rs` as `gate_card` beside this module.
 pub fn open(file: &Path, ctx: usize, arm: Arm) -> Result<Box<dyn Seat>, GateError> {
-    if arm == Arm::Bp {
-        return Err(
-            "solar2 seat: arm bp (plan (b′): the next-largest card an expert tier under the host tier) is refused by name: the \
-             Solar body serves no expert tier card yet (`PlaceError::Tier`)"
-                .into(),
-        );
-    }
     let levers = bloomery_levers::at_main(&[bloomery_levers::CARD_BUDGET])?;
     crate::gate_card::init()?;
     let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
@@ -84,7 +78,12 @@ pub fn open(file: &Path, ctx: usize, arm: Arm) -> Result<Box<dyn Seat>, GateErro
     // unpaged one at the workstation's plan room: no reading of the box's available bytes enters it.
     let mut inputs = PlanInputs::describe(&split)?;
     inputs.room = (PLAN_ROOM, HostRead::Given);
-    let machine = crate::gate_card::plan_gate(inputs.model.layers);
+    // Plan (b′): the stage on the largest card, the next-largest an expert tier under the host tier, holding the tier's
+    // prompt-batch bytes the file's widths give.
+    let machine = match arm {
+        Arm::A => crate::gate_card::plan_gate(inputs.model.layers),
+        Arm::Bp => workstation::plan_bp(inputs.model.layers, None, place::tier_batch(&inputs.hp)),
+    };
     let place = PlanLevers::from_levers(&levers)?;
     let plan = inputs.plan(&machine, u64::try_from(ctx)?, &place)?;
     let mut m = Body::open_placed(split, &plan, &inputs, 0, levers.host())?;

@@ -390,6 +390,10 @@ name = "gate_minimaxm3_prefill"
 required-features = ["minimaxm3"]
 
 [[bin]]
+name = "gate_solar2_twocard"
+required-features = ["solar2"]
+
+[[bin]]
 name = "gate_solar2_serve"
 required-features = ["deepseek41", "solar2"]
 

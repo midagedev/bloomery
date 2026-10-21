@@ -17,7 +17,7 @@
 //! the order of its own contribution.
 //!
 //! `--arm a|bp` picks the placement arm (default `a`: the largest card the stage; `bp`: the next-largest card an expert tier under
-//! the host tier, refused by name until the tier piece lands). The clauses are the arm's own: the same bands hold on both.
+//! the host tier). The clauses are the arm's own: the same bands hold on both.
 //!
 //! FAIL-first (box, on the first run of the body): the engine's beta scale set to 1 puts `layer_outputs_near_pai` red at layer
 //! 1 and `top_logprobs_in_band` red; a decay kernel of the GLM form (sigmoid, lower bound) the same; a prompt that skips the

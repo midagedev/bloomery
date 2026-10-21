@@ -32,3 +32,4 @@ pub mod tier;
 
 pub use body::{Body, Solar2Model, StepInput, set_taps};
 pub use prefill::set_prefill_group;
+pub use tier::NODE_FAMILY;

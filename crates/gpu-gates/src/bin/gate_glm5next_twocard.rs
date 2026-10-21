@@ -149,6 +149,14 @@ mod glm5next_tier;
 mod quiet;
 
 #[cfg(feature = "glm5next")]
+#[allow(
+    dead_code,
+    reason = "the two-card gates share the module; each takes the helpers it reads"
+)]
+#[path = "shared/tier_twocard.rs"]
+mod tier_twocard;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use std::time::Instant;
 
@@ -156,7 +164,6 @@ mod gate {
     use app::mtp::MtpDraft;
     use app::{Loaded, OpenArgs, Session};
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::batch::TierBatchStats;
     use bloomery_gpu::host::slots::Slot;
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::host::tier::TierSet;
@@ -183,6 +190,7 @@ mod gate {
 
     use crate::glm5next_tier;
     use crate::quiet::Quiet;
+    use crate::tier_twocard::{self, Leg, Sent, plus, same, sent_between, sent_every, union_plan};
 
     const NAME: &str = "gate_glm5next_twocard";
     /// The card budget both plans are made under (module header: the union
@@ -239,67 +247,6 @@ mod gate {
         Ok(prefill[..n].to_vec())
     }
 
-    /// `plan` with each routed stack's tier segment joined to its stage-card
-    /// segment on card 0 (`placement::routed_row` over the two lists), the
-    /// host's segments as they are, on `flat` — the plan's machine with no
-    /// tier card: the stage card holds the union, and no segment sits on a
-    /// tier.
-    fn union_plan<'a>(plan: &Plan<'a>, flat: &'a Machine) -> Result<Plan<'a>, GateError> {
-        let model = plan.model;
-        let tier = Device::Card(plan.machine.cards.len());
-        let mut out = plan.clone();
-        for row in &mut out.rows {
-            let t = &model.tensors[row.tensor];
-            if t.role != Role::RoutedExperts {
-                continue;
-            }
-            let ids = |d: Device| -> Vec<u32> {
-                row.segments
-                    .iter()
-                    .filter(|s| s.device == d)
-                    .filter_map(|s| s.experts.as_ref())
-                    .flat_map(|e| e.ids().iter().copied())
-                    .collect()
-            };
-            let on_tier = ids(tier);
-            if on_tier.is_empty() {
-                continue;
-            }
-            let mut union = ids(Device::Card(0));
-            union.extend(on_tier);
-            let n = union.len();
-            let card = placement::routed_row(
-                row.tensor,
-                t,
-                0,
-                ExpertList::new(union, model.experts)?,
-                model,
-            )?;
-            let segments = card
-                .segments
-                .into_iter()
-                .filter(|s| s.device == Device::Card(0))
-                .chain(
-                    row.segments
-                        .iter()
-                        .filter(|s| !matches!(s.device, Device::Card(_)))
-                        .cloned(),
-                )
-                .collect();
-            *row = Row {
-                segments,
-                ..row.clone()
-            };
-            if let Some(l) = t.layer.and_then(|l| out.n_l.get_mut(l)) {
-                *l = u64::try_from(n)?;
-            }
-        }
-        out.machine = flat;
-        out.cards.truncate(flat.cards.len());
-        out.tier_n_l.clear();
-        Ok(out)
-    }
-
     /// The tiered load through the binaries' open, refused unless its tier's
     /// `Gpu` is the 3090.
     fn open_two(
@@ -324,29 +271,8 @@ mod gate {
     /// `what` its name.
     fn tier_on_3090(s: &Session<Body>, what: &str, t0: Instant) -> Result<(), GateError> {
         let m = s.model();
-        let tier = m
-            .body(NAME)?
-            .hybrid()
-            .tiers()
-            .first()
-            .ok_or("the (b′) load holds no tier card")?;
-        let tier_device = tier.gpu()?.device_name()?;
-        if !tier_device.contains(workstation::RTX_3090.name) {
-            return Err(format!(
-                "the tier opened on {tier_device}, not the {}",
-                workstation::RTX_3090.name
-            )
-            .into());
-        }
-        println!(
-            "{what} in {:.1} s: stage {} ({} B), tier {} experts on {tier_device} ({} B)",
-            t0.elapsed().as_secs_f64(),
-            m.gpu().device_name()?,
-            m.resident_bytes(),
-            tier.set().experts(),
-            tier.resident_bytes(),
-        );
-        Ok(())
+        let stage = (m.gpu().device_name()?, m.resident_bytes());
+        tier_twocard::tier_on_3090(what, t0, (&stage.0, stage.1), m.body(NAME)?.hybrid())
     }
 
     /// The reference: `plan`, whose stage card holds the union
@@ -390,14 +316,6 @@ mod gate {
         Ok(s)
     }
 
-    /// Every token, kept count and logits row a leg read, in order.
-    #[derive(Default)]
-    struct Leg {
-        tokens: Vec<u32>,
-        logits: Vec<Vec<f32>>,
-        kept: Vec<usize>,
-    }
-
     /// What a load's three legs read, and what they sent the tier.
     struct Run {
         step: Leg,
@@ -413,57 +331,10 @@ mod gate {
         sent_call: Option<Sent>,
     }
 
-    /// What a span of a run sent the tier: its hits per layer from the
-    /// tier's first layer, and the batch services it enqueued.
-    struct Sent {
-        first: usize,
-        hits: Vec<u64>,
-        stats: TierBatchStats,
-    }
-
     /// The tier's per-layer hits and batch counters since load; `None`
     /// without a tier.
     fn tier_counts(m: &Glm5nextModel) -> Result<Option<Sent>, GateError> {
-        let hybrid = m.body(NAME)?.hybrid();
-        Ok(hybrid.tiers().first().map(|t| Sent {
-            first: t.set().layers().start,
-            hits: t.stats().layer_hits,
-            stats: hybrid
-                .tier_batch_stats()
-                .first()
-                .copied()
-                .unwrap_or_default(),
-        }))
-    }
-
-    /// The counters `after` less `before`: what the span between sent.
-    fn sent_between(before: Option<Sent>, after: Option<Sent>) -> Option<Sent> {
-        let (b, a) = (before?, after?);
-        Some(Sent {
-            first: a.first,
-            hits: a.hits.iter().zip(&b.hits).map(|(a, b)| a - b).collect(),
-            stats: TierBatchStats {
-                served: a.stats.served - b.stats.served,
-                settles: a.stats.settles - b.stats.settles,
-                settle_early: a.stats.settle_early - b.stats.settle_early,
-                settle_ns: a.stats.settle_ns - b.stats.settle_ns,
-            },
-        })
-    }
-
-    /// The counters of two spans together.
-    fn plus(a: Option<Sent>, b: Option<Sent>) -> Option<Sent> {
-        let (a, b) = (a?, b?);
-        Some(Sent {
-            first: a.first,
-            hits: a.hits.iter().zip(&b.hits).map(|(a, b)| a + b).collect(),
-            stats: TierBatchStats {
-                served: a.stats.served + b.stats.served,
-                settles: a.stats.settles + b.stats.settles,
-                settle_early: a.stats.settle_early + b.stats.settle_early,
-                settle_ns: a.stats.settle_ns + b.stats.settle_ns,
-            },
-        })
+        Ok(tier_twocard::tier_counts(m.body(NAME)?.hybrid()))
     }
 
     /// One decode step of `id`, its token and logits into `leg`.
@@ -572,102 +443,6 @@ mod gate {
         set_prefill_group(m, 1)?;
         m.reset()?;
         Ok(out)
-    }
-
-    /// Whether leg `got` is `want` bit for bit; prints the first difference.
-    fn same(what: &str, want: &Leg, got: &Leg) -> bool {
-        if want.tokens != got.tokens || want.kept != got.kept {
-            let at = want
-                .tokens
-                .iter()
-                .zip(&got.tokens)
-                .position(|(a, b)| a != b);
-            println!(
-                "FAIL {what}: tokens apart at {at:?} ({} and {} tokens), kept {:?} against the \
-                 reference's {:?}",
-                got.tokens.len(),
-                want.tokens.len(),
-                got.kept,
-                want.kept
-            );
-            return false;
-        }
-        if want.logits.len() != got.logits.len() {
-            println!(
-                "FAIL {what}: {} logits rows, the reference read {}",
-                got.logits.len(),
-                want.logits.len()
-            );
-            return false;
-        }
-        for (i, (w, g)) in want.logits.iter().zip(&got.logits).enumerate() {
-            let first = w
-                .iter()
-                .zip(g)
-                .position(|(a, b)| a.to_bits() != b.to_bits());
-            if w.len() != g.len() || first.is_some() {
-                println!("FAIL {what}: logits row {i}: first logit apart {first:?}");
-                return false;
-            }
-        }
-        println!(
-            "ok {what}: {} tokens, {} logits rows, {} passes' kept counts bit for bit the \
-             reference's",
-            got.tokens.len(),
-            got.logits.len(),
-            got.kept.len()
-        );
-        true
-    }
-
-    /// The precondition of leg `what`: it alone sent every layer of
-    /// `tier_layers` at least one routed slot, and, when `batch`, the tier
-    /// served its batch; prints its counters.
-    fn sent_every(what: &str, sent: Option<&Sent>, tier_layers: &[usize], batch: bool) -> bool {
-        let Some(sent) = sent else {
-            println!("FAIL precondition {what}: the load holds no tier card");
-            return false;
-        };
-        let hit = |l: usize| {
-            l.checked_sub(sent.first)
-                .and_then(|i| sent.hits.get(i))
-                .copied()
-                .unwrap_or(0)
-        };
-        let missing: Vec<usize> = tier_layers
-            .iter()
-            .copied()
-            .filter(|&l| hit(l) == 0)
-            .collect();
-        let st = sent.stats;
-        println!(
-            "{what} tier: {} batch services, {} settles ({} early, {:.2} ms waited), hits per \
-             layer {:?}",
-            st.served,
-            st.settles,
-            st.settle_early,
-            st.settle_ns as f64 / 1e6,
-            tier_layers.iter().map(|&l| hit(l)).collect::<Vec<_>>()
-        );
-        let served = !batch || st.served > 0;
-        if missing.is_empty() && served {
-            println!(
-                "ok precondition {what}: every tier layer was sent a routed slot{}",
-                if batch {
-                    ", the tier served the batch"
-                } else {
-                    ""
-                }
-            );
-            true
-        } else {
-            println!(
-                "FAIL precondition {what}: tier layers {missing:?} were sent no routed slot, {} \
-                 batch services; the leg proves nothing there",
-                st.served
-            );
-            false
-        }
     }
 
     /// Which of the gate's runs the command line asks for (module header).

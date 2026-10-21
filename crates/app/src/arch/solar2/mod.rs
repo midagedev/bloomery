@@ -1,8 +1,9 @@
 //! The Solar-Open2 session: [`Body`] behind the session's traits, planned
 //! once by its placement (the routed experts the card experts read by the
-//! expert rule, the rest on the host tier) and loaded by gpumodel's
-//! constructor ([`Body::open_placed_slots`]), under adaptive expert residency
-//! or not ([`HybridCfg::residency`]).
+//! expert rule, the next ids on the expert tier card a placement names, the
+//! rest on the host tier) and loaded by gpumodel's constructor
+//! ([`Body::open_placed_slots`]), which hangs the tier card under the host
+//! tier, under adaptive expert residency or not ([`HybridCfg::residency`]).
 //!
 //! A prompt is fed in batches ([`bloomery_gpu_solar2::prefill::prefill`]),
 //! one residency pass a call, and leaves the bits the decode steps leave. The

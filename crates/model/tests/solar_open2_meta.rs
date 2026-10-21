@@ -336,22 +336,81 @@ fn hw_solar_open2_plan_a() {
         card.expert_bytes,
         plan.host.expert_bytes
     );
-    // PIN(2026-10-20): plan shape bp hangs the 3090 as an expert tier, which the body does not
-    // serve until the tier layer lands: refused by name before any plan is made, the card and the
-    // missing tier named.
-    let bp = workstation::plan_bp(
-        layers,
-        None,
-        TierBatchBytes {
-            staging: 0,
-            scratch: 0,
-            host: 0,
-        },
-    );
-    let err = inputs
+    // PIN(2026-10-21): plan shape bp hangs the 3090 as an expert tier, which the body serves
+    // ([`PlanInputs::tier_reserve`], the places of the prompt batch): the stage card keeps
+    // 3 x 4 x 512 x 8 = 49,152 B more than plan a [derived: a place, the join's copy of it and of the
+    // slot's weight, four bytes each, for each of 8 used experts of 512 rows], which displaces at
+    // most one expert of 8,847,360 B [derived above], so the stage holds `n` or `n - 1` experts;
+    // the tier holds experts on candidate layers only, of the same size, at most a layer's 320
+    // with the stage's, and its bytes are its experts' times that size. Mutant: the body's tier
+    // reserve left out of `describe` (the plan is refused by name), or the tier planned on a
+    // layer the card leg cannot run.
+    let tier_batch = TierBatchBytes {
+        staging: 0,
+        scratch: 0,
+        host: 0,
+    };
+    let bp = workstation::plan_bp(layers, None, tier_batch);
+    let tiered = inputs
         .plan(&bp, CTX, &PlanLevers::default())
-        .expect_err("a machine that hangs an expert tier card is refused by name");
-    let _ = writeln!(o, "  as the plan refuses shape bp: {err}");
+        .unwrap_or_else(|e| panic!("plan bp at ctx {CTX}: {e}"));
+    let tier_n = &tiered.tier_n_l[0];
+    let tier_experts: u64 = tier_n.iter().sum();
+    let stage_experts: u64 = tiered.n_l.iter().sum();
+    let _ = writeln!(
+        o,
+        "  plan bp: stage experts {stage_experts}, tier experts {tier_experts} ({} B), host experts {}; \
+         the stage reserve {} B",
+        tiered.cards[1].expert_bytes,
+        tiered.host.experts,
+        inputs.reserve_on(&bp).unwrap_or(0)
+    );
+    row(
+        &mut o,
+        &mut b,
+        "plan bp: the stage's reserve is plan a's and the tier places",
+        inputs.reserve_on(&bp).ok(),
+        Some(RESERVE + 3 * 4 * 512 * 8),
+    );
+    row(
+        &mut o,
+        &mut b,
+        "plan bp: the tier holds experts",
+        tier_experts > 0,
+        true,
+    );
+    row(
+        &mut o,
+        &mut b,
+        "plan bp: the stage holds plan a's experts less at most one",
+        (n.saturating_sub(1)..=n).contains(&stage_experts),
+        true,
+    );
+    row(
+        &mut o,
+        &mut b,
+        "plan bp: the tier only on layers the card leg can run, a layer's experts at most",
+        (0..layers).all(|l| {
+            let t = tier_n[l];
+            t == 0 || (candidate(l) && tiered.n_l[l] + t <= inputs.model.experts)
+        }),
+        true,
+    );
+    row(
+        &mut o,
+        &mut b,
+        "plan bp: the tier's expert bytes",
+        tiered.cards[1].expert_bytes,
+        tier_experts * 8_847_360,
+    );
+    // The body that hangs no tier card refuses the same machine by name, the card and the missing
+    // tier named.
+    let mut untiered = inputs.clone();
+    untiered.tier_reserve = None;
+    let err = untiered
+        .plan(&bp, CTX, &PlanLevers::default())
+        .expect_err("a body that hangs no expert tier refuses a machine that names one");
+    let _ = writeln!(o, "  as a body with no tier refuses shape bp: {err}");
     if !matches!(err, PlaceError::Tier { tier: 0, .. })
         || !(err.to_string().contains("expert tier card 3090")
             && err.to_string().contains("hangs no expert tier"))

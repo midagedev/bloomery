@@ -350,6 +350,21 @@ gate-gpu-solar2-e2e:
 gate-gpu-solar2-prefill:
     BLOOMERY_MODEL=solar-open2 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features solar2 --release --bin gate_solar2_prefill && BLOOMERY_GATE_BOUND=1200 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_solar2_prefill'
 
+# Solar-Open2-250B on plan (b′) (gate_solar2_twocard's doc): the stage on the A6000 and the expert tier on the 3090 against the same
+# plan with every tier segment moved onto the stage card (the A6000 alone, no tier code), both planned under one card budget the gate
+# sets, on a fixed walk whose routing is checked to reach every tier layer: the step leg's tokens and logits rows, the prompt call's
+# token and logits row, the group leg's call at groups of two against groups of one, and the stage graph's node count. Every clause is
+# a self-consistency clause, so the fixture tier runs them all (the fixture's header budget puts about half of each card-eligible
+# layer's experts on a card). Both cards in view (BLOOMERY_CARD=both: both gate locks, alone in a batch), two loads of the model in
+# turn under the big-load lock the V4.1 loads take. Predicted wall [derived: gate-gpu-solar2-e2e's loads measured 9 to 28 s warm, a
+# decode step about 41 ms; glm5next-twocard at the fixture tier is 49 s median]: two loads of 10 to 60 s, the step leg's 80 steps about
+# 3 s, the call leg 512 ids and the group leg 2 x 1024 ids a few seconds each: 40 s to 3 min warm after a warm build; the bound is
+# 1200 s.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-solar2-twocard:
+    BLOOMERY_MODEL=solar-open2 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features solar2 --release --bin gate_solar2_twocard && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_solar2_twocard'
+
 # The Solar-Open2 seat of `bloomery-serve` (gate_solar2_serve's doc): `--parallel 2` refused by name before any plan, one server at
 # --ctx 4096 loading the file and listening (its `load` and `listening` records name the architecture, one slot, the file's layers and
 # the context), and one chat turn at temperature 0 with a reasoning budget of 16 answered with reasoning and content both, split at the
@@ -3062,7 +3077,7 @@ gate-mimo2-meta:
 # list. The lib half is what runs the synthetic refusals, the common noaux block and the shared role walk that MiniMax-M3 reads
 # through too; the test half is the files under /models. Headers only, seconds.
 gate-solar-open2-meta:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::solar_open2 arch::noaux arch::classify arch::minimaxm3 --nocapture && bash tools/gate.sh --release -p bloomery-model --test solar_open2_meta -- --ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::solar2 arch::noaux arch::classify arch::minimaxm3 --nocapture && bash tools/gate.sh --release -p bloomery-model --test solar_open2_meta -- --ignored --nocapture'
 
 # nemotron_h (Nemotron 3 Nano 4B) header gate: the reader's refusals on synthetic headers (a Mamba
 # layer read as attention, nemotron_h_moe, a missing ssm key, a rope need on an attention layer, a

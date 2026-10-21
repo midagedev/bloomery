@@ -11,7 +11,10 @@
 //!   boundary's handoff region, the router, the handoff into the host-mapped
 //!   image (each slot's place in the card's stacks, or the host mark, from the
 //!   layer's slot-map row) and the go ([`handoff_go`]). Three kernels and the
-//!   go;
+//!   go. On a layer the expert tier card holds experts of
+//!   ([`RouteBlock::front_tiered`]) the handoff also writes the tier's image
+//!   and each slot's tier place, and the go is the host's and the tier's
+//!   ([`handoff_go_tier`]);
 //! - the shadow, [`RouteBlock::shadow`]: the card experts of the layer
 //!   ([`crate::card_experts`]) over the normed row, with the base the card
 //!   sum is added to; none on a layer with no card experts;
@@ -33,8 +36,10 @@ use std::sync::Arc;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
 use crate::card_experts::{CardBatch, CardExperts, Io};
+use crate::card_slots::Places;
 use crate::gemm::Gemm32Kernels;
 use crate::host::handoff::{Handoff, HandoffKernels};
+use crate::host::leg_tier::{STAGE_TIER, TierSide};
 use crate::host::run::HostRun;
 use crate::hybrid::{Boundary, Hybrid};
 use crate::kquant::Act;
@@ -205,6 +210,30 @@ pub fn handoff_go(
     hybrid.boundary().enqueue_go_of(stream, l, row)
 }
 
+/// [`handoff_go`] of a tier layer: the handoff of one layer's picks `h` into
+/// row `row`'s host image and the tier's image, each slot's stage place into
+/// `sel` and its tier place (from `tmap`, the map's tier view) into `tsel`,
+/// then the go that releases the host leg and the tier. One kernel and the
+/// go.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one launch's routing, maps, hybrid, layer and row and places (rust-quality R8)"
+)]
+pub fn handoff_go_tier(
+    gpu: &Gpu,
+    kernels: &HandoffKernels,
+    h: &Handoff<'_>,
+    tmap: &DeviceBuffer<u32>,
+    hybrid: &mut Hybrid<HostRun>,
+    (l, row): (usize, usize),
+    (sel, tsel): (&mut DeviceBuffer<u32>, &mut DeviceBuffer<u32>),
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let targets = hybrid.tier_handoff(row, STAGE_TIER)?;
+    kernels.enqueue_handoff_tier(stream, h, tmap, targets, gpu.layer_sink(l)?, (sel, tsel))?;
+    hybrid.enqueue_tier_go(stream, l, row)
+}
+
 /// The wait for row `row`'s host leg of layer `l`, then the add of the
 /// host's routed sum and `shadowed`, `n` values, into `dest`.
 pub fn wait_add(
@@ -328,10 +357,26 @@ impl<R: RouterEntry> RouteBlock<R> {
     /// go, for row 0 of the boundary.
     pub fn front(
         &self,
+        gw: (&Gpu, &Weights),
+        bufs: &mut RouteBufs<R>,
+        x1: &DeviceBuffer<f32>,
+        hl: (&mut Hybrid<HostRun>, usize),
+    ) -> Result<(), GpuError> {
+        self.front_tiered(gw, bufs, x1, hl, None)
+    }
+
+    /// [`RouteBlock::front`] for a load that hangs an expert tier card: on a
+    /// layer `tier` holds experts of, the handoff is the tier's
+    /// ([`handoff_go_tier`]), writing the places of the row's slots on the
+    /// tier beside the stage card's; any other layer's front is
+    /// [`RouteBlock::front`]'s. Refused by name past the tier side's row.
+    pub fn front_tiered(
+        &self,
         (gpu, w): (&Gpu, &Weights),
         bufs: &mut RouteBufs<R>,
         x1: &DeviceBuffer<f32>,
         (hybrid, l): (&mut Hybrid<HostRun>, usize),
+        tier: Option<&mut TierSide>,
     ) -> Result<(), GpuError> {
         let layer = self.layer(l)?;
         let r = self.route_in(w, l, gpu)?;
@@ -354,7 +399,37 @@ impl<R: RouterEntry> RouteBlock<R> {
             row_off: layer.row_off,
             n_expert: R::N_EXPERT,
         };
-        handoff_go(gpu, &self.handoff, &h, hybrid, (l, 0), &mut bufs.sel)
+        match tier.filter(|t| t.k(l) > 0) {
+            Some(side) => {
+                let (places, tsel) = side.handoff_parts(0)?;
+                let sels = (&mut bufs.sel, tsel);
+                handoff_go_tier(gpu, &self.handoff, &h, places, hybrid, (l, 0), sels)
+            }
+            None => handoff_go(gpu, &self.handoff, &h, hybrid, (l, 0), &mut bufs.sel),
+        }
+    }
+
+    /// Layer `l`'s tier places of a prompt batch's `m` rows: for each of the
+    /// `m · R::N_USED` picks `ids`, its place in the tier's stacks from
+    /// `tmap` (the map's tier view, [`TierSide::places`]) into `tsel`, or the
+    /// host mark. One launch.
+    pub fn tier_places_rows(
+        &self,
+        gpu: &Gpu,
+        (l, m): (usize, usize),
+        ids: &DeviceBuffer<u32>,
+        (tmap, tsel): (&DeviceBuffer<u32>, &mut DeviceBuffer<u32>),
+    ) -> Result<(), GpuError> {
+        let places = Places {
+            ids,
+            n: m * R::N_USED,
+            map: tmap,
+            row_off: self.layer(l)?.row_off,
+            n_expert: R::N_EXPERT,
+        };
+        self.handoff
+            .places()
+            .enqueue_places(gpu.stream(), &places, gpu.layer_sink(l)?, tsel)
     }
 
     /// Layer `l`'s `ffn_norm` of the `m` rows of `x1` into `normed` and the

@@ -8,9 +8,10 @@
 //! experts read ([`placement::plan_routed`]). What stays in a family is what an architecture fact
 //! forces: the keys it reads, the layers it refuses, the engine's name in the refusals that name it.
 //!
-//! The plan refuses by name a machine that hangs an expert tier card, a context of no position and
-//! a host room that cannot hold the host experts: the bodies this plans serve no NVMe expert tier, so
-//! a plan that pages one ([`PlaceError::NoNvmeTier`]) would load experts nothing serves.
+//! The plan refuses by name a machine that hangs an expert tier card where the family's body serves
+//! none ([`PlanInputs::tier_reserve`]), a context of no position and a host room that cannot hold
+//! the host experts: the bodies this plans serve no NVMe expert tier, so a plan that pages one
+//! ([`PlaceError::NoNvmeTier`]) would load experts nothing serves.
 //!
 //! A body that makes buffers beside the plan's terms on its card (the prompt batch's rows) states
 //! their bytes in [`PlanInputs::prompt_reserve`]: the expert rule spreads within the card's budget
@@ -75,6 +76,11 @@ pub struct PlanInputs<H> {
     /// card keeps them out of the expert budget ([`placement::plan_routed_reserving`]), and the
     /// body refuses a load whose made bytes pass them. 0 for a family whose body makes none.
     pub prompt_reserve: u64,
+    /// `None` for a family whose body hangs no expert tier card: a machine that names one is
+    /// refused by name ([`PlaceError::Tier`]). `Some(bytes)` for a body that serves one: the card
+    /// keeps `bytes` more than [`PlanInputs::prompt_reserve`] on a machine that names a tier card,
+    /// the buffers only a tiered load makes.
+    pub tier_reserve: Option<u64>,
     /// The engine the refusals that name one name.
     engine: &'static str,
 }
@@ -198,6 +204,7 @@ impl<H> PlanInputs<H> {
             room,
             arena,
             prompt_reserve: 0,
+            tier_reserve: None,
             engine,
         })
     }
@@ -209,6 +216,30 @@ impl<H> PlanInputs<H> {
         PlanInputs {
             prompt_reserve: bytes,
             ..self
+        }
+    }
+
+    /// `self` for a body that serves an expert tier card, which makes `bytes` of card buffers
+    /// beside [`PlanInputs::prompt_reserve`] on a load with one ([`PlanInputs::tier_reserve`]).
+    #[must_use]
+    pub fn with_tier_reserve(self, bytes: u64) -> PlanInputs<H> {
+        PlanInputs {
+            tier_reserve: Some(bytes),
+            ..self
+        }
+    }
+
+    /// The card bytes the load of `machine` makes beside the plan's terms: the prompt batch's, and
+    /// a tiered load's more. A machine that names an expert tier card where the body serves none
+    /// is refused by name ([`PlaceError::Tier`]).
+    pub fn reserve_on(&self, machine: &Machine) -> Result<u64, PlaceError> {
+        match (machine.tiers.first(), self.tier_reserve) {
+            (Some(card), None) => Err(PlaceError::Tier {
+                card: card.name.clone(),
+                tier: 0,
+            }),
+            (Some(_), Some(more)) => Ok(self.prompt_reserve.saturating_add(more)),
+            (None, _) => Ok(self.prompt_reserve),
         }
     }
 
@@ -231,9 +262,11 @@ impl<H> PlanInputs<H> {
 
     /// The placement of the file on `machine` at `ctx_max` positions under the placement's
     /// `levers`: the expert rule on the layers whose routed stacks [`card_routed`] runs, each such
-    /// layer's id prefix on the card as far as its budget holds them, the rest on the host; refused
-    /// by name a context of no position, a machine that hangs an expert tier card, a context whose
-    /// stores do not fit the card and a host room under the host experts' need
+    /// layer's id prefix on the card as far as its budget holds them, the next ids on the expert
+    /// tier card of a machine that names one, the rest on the host; refused by name a context of no
+    /// position, a machine that hangs an expert tier card where the body serves none
+    /// ([`PlanInputs::tier_reserve`]), a context whose stores do not fit the card and a host room
+    /// under the host experts' need
     /// ([`PlanInputs::plan_with_slots`]).
     pub fn plan<'a>(
         &'a self,
@@ -263,12 +296,7 @@ impl<H> PlanInputs<H> {
         if ctx_max == 0 {
             return Err(PlaceError::CtxZero);
         }
-        if let Some((tier, card)) = machine.tiers.iter().enumerate().next() {
-            return Err(PlaceError::Tier {
-                card: card.name.clone(),
-                tier,
-            });
-        }
+        let reserve = self.reserve_on(machine)?;
         let program = program_of(self.spec.arch)
             .ok_or_else(|| PlacementError::Unimplemented(self.unimplemented()))?;
         let kv = self.seq_terms().slots_of(slots.get() as u64);
@@ -279,7 +307,7 @@ impl<H> PlanInputs<H> {
             &kv,
             levers,
             routed_rule(program),
-            self.prompt_reserve,
+            reserve,
         )?;
         let need = HostNeed::of(&plan, 0).bytes();
         let room = plan.plan_at(&self.room);
@@ -292,14 +320,14 @@ impl<H> PlanInputs<H> {
                 engine: self.engine,
             });
         }
-        let plan = checked_beside(plan, self.prompt_reserve).map_err(PlaceError::Broken)?;
+        let plan = checked_beside(plan, reserve).map_err(PlaceError::Broken)?;
         for (card, totals) in machine.cards.iter().zip(&plan.cards) {
             let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
             refuse_reserve(
                 card,
                 card_terms(totals),
                 limit,
-                self.prompt_reserve,
+                reserve,
                 |card, reserve, left, short| PlaceError::PromptOver {
                     card,
                     reserve,

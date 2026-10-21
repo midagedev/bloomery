@@ -28,6 +28,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::place_hybrid::PlanInputs;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
+use model::placement::workstation::TierBatchBytes;
 use model::placement::{PlacementError, Plan, PlanLevers};
 use serve::reasoning::ThinkTags;
 use serve::{EngineProps, ServeError};
@@ -54,6 +55,9 @@ pub struct Open<F> {
     pub group: usize,
     /// The side model's reserve on the stage card, which the plan counted.
     pub embedding: Option<u64>,
+    /// The expert tier's prompt-batch bytes the plan reserved on the placement's tier card
+    /// ([`Tiered::tier_batch`]); `None` under a placement with no tier card.
+    pub tier_batch: Option<TierBatchBytes>,
     /// The residency the plan chose, `Off` where the body keeps the experts the plan placed.
     pub residency: Residency,
     /// The seat's flags beside the common ones ([`SeatFlags`]).
@@ -93,6 +97,17 @@ pub trait Tiered: Seat + Sized + 'static {
 
     /// One of the seat's own flags (`SeatFlags::parse`'s `own`): `Ok(true)` took it.
     fn flags(flag: &str, value: &str, out: &mut Self::Flags) -> Result<bool, GateError>;
+
+    /// The expert tier's prompt-batch bytes the plan reserves on `place`'s tier card, for the file
+    /// `inputs` describes; `None` under a placement with no tier card. A body that serves no tier
+    /// card reserves none (the default), and its plan refuses the card by name.
+    fn tier_batch(place: Place, _inputs: &PlanInputs<Self::H>) -> Option<TierBatchBytes> {
+        (!place.tier_cards().is_empty()).then_some(TierBatchBytes {
+            staging: 0,
+            scratch: 0,
+            host: 0,
+        })
+    }
 
     /// The think tags the model's description names, if the family splits its reasoning on them.
     fn think(_inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
@@ -199,8 +214,9 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     } else {
         Some(lane_at(place)?)
     };
+    let tier_batch = S::tier_batch(place, &inputs);
     let machine = beside::with_reserve(
-        place.machine_untiered()?,
+        place.machine(None, tier_batch)?,
         Beside {
             image: None,
             embedding,
@@ -250,6 +266,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         pin_main: levers.pin_main(),
         group: levers.prefill_group(),
         embedding,
+        tier_batch,
         residency,
         flags,
     };

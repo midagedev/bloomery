@@ -124,13 +124,13 @@ pub const TIER_CHUNK: u64 = 8;
 /// and the load checks its allocations against.
 #[must_use]
 pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
-    let (n, ff, used) = (hp.n_embd as u64, hp.expert_ff as u64, hp.n_used as u64);
-    let cols = crate::moe::UNION_MAX_COLS as u64;
-    TierBatchBytes {
-        staging: workstation::tier_batch_staging_bytes(n, used, cols),
-        scratch: workstation::tier_chunk_scratch_bytes(n, ff, used, TIER_CHUNK),
-        host: workstation::tier_batch_host_bytes(n, used, cols),
-    }
+    workstation::tier_leg_batch_bytes(
+        hp.n_embd as u64,
+        hp.expert_ff as u64,
+        hp.n_used as u64,
+        TIER_CHUNK,
+        crate::moe::UNION_MAX_COLS as u64,
+    )
 }
 
 /// Token columns a tile of the GEMM front's dense table spans, and values

@@ -1004,6 +1004,13 @@ pub struct HandoffKernels {
 }
 
 impl HandoffKernels {
+    /// The places' kernels the handoff's routes share: for a program that
+    /// places a prompt batch's slots beside its handoff.
+    #[must_use]
+    pub fn places(&self) -> &CardSlotKernels {
+        &self.places
+    }
+
     /// Load the handoff's device bundle into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<HandoffKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the

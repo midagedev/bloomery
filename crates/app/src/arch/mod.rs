@@ -154,7 +154,9 @@ impl<B: Batch> Open for B {
 
     /// The plan on `machine`, refused unless its layers sit on one card: the
     /// chain runs on one. A placement that hangs an expert tier card is
-    /// refused by the plan itself: every routed expert is the host's.
+    /// refused by the plan itself where the body serves none
+    /// (`PlanInputs::tier_reserve`); a body that serves one hangs it under the
+    /// host tier at the load, which refuses more than the host tier serves.
     fn plan<'a>(
         inputs: &'a B::Inputs,
         machine: &'a Machine,

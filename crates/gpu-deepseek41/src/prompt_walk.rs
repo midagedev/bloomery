@@ -458,7 +458,7 @@ impl<'a, R: RouterEntry, A: BatchAttention> LayerProgram for Walk<'a, R, A> {
             let gw = (self.gpu, self.w);
             self.ffn.front_rows(gw, (l, t), &*self.units[u].x1)?;
             let key = port.key(at);
-            self.ffn.download(port.hybrid(), self.gpu.stream(), key)
+            self.ffn.download_rows(self.gpu, port.hybrid(), (key, t))
         } else {
             // A dense layer's block runs whole on the card: its rows go into the unit's `x`.
             let unit = &mut self.units[u];
@@ -478,15 +478,22 @@ impl<'a, R: RouterEntry, A: BatchAttention> LayerProgram for Walk<'a, R, A> {
         self.ffn.shadow_rows(gw, lm, &*self.units[at.unit].x1)
     }
 
-    /// The host sums joined with the shadow's, into the unit's `x`, and the layer's tap.
+    /// The host sums joined with the shadow's, into the unit's `x`, and the layer's tap. A layer the
+    /// expert tier holds experts of is joined first: the card sum over the stage card's and the
+    /// tier's slots, once the host leg has landed the tier's rows, which also uploads the host sums.
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         if self.attention.ffn(at.layer) != FfnKind::Moe {
             return Ok(());
         }
         let t = self.ts[at.unit];
+        let (gpu, l) = (self.gpu, at.layer);
+        if self.ffn.tier_k(l) > 0 {
+            let ffn = &mut *self.ffn;
+            port.join_tiered(at, |_, trows| ffn.join_rows(gpu, (l, t), trows))?;
+        }
         let unit = &mut self.units[at.unit];
         self.ffn
-            .back_rows(self.gpu, (at.layer, t), (port.hsum(), &mut *unit.x))?;
+            .back_rows(gpu, (l, t), (port.hsum(), &mut *unit.x))?;
         self.tap(at.layer, at.unit)
     }
 }

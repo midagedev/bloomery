@@ -20,23 +20,132 @@ use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
 
+use cuda_core::DeviceBuffer;
 use gguf::Split;
+use model::ModelError;
 use model::arch::models::{Ffn, LayerSpec};
 use model::arch::names::routed_stacks;
-use model::placement::Plan;
+use model::moe::HostLayer;
+use model::placement::{ModelTensors, Plan};
+use model::r8file::R8Source;
 
 use super::node::{NodeFamily, NodeOpen};
+use super::run::{HostRun, HostWidths};
 use super::tier::{
     TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet, TierShape,
 };
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
-use crate::hybrid::SlotMap;
+use crate::hybrid::{Hybrid, SlotMap};
 use crate::kquant::Act;
 use crate::weights::Weights;
-use crate::{Gpu, GpuError, Window, WindowMut};
+use crate::{DeviceTensor, Gpu, GpuError, Window, WindowMut};
 
 /// What the tier's load errors name.
 const WHAT: &str = "LegTier";
+
+/// What the stage card's side of the tier layers names in its errors.
+const SIDE: &str = "TierSide";
+
+/// The tier the stage card's tier entries serve: they hand one tier its
+/// image and join one tier's rows, so a load holds one tier card
+/// ([`crate::host::refuse_tier_count`]).
+pub const STAGE_TIER: usize = 0;
+
+/// The stage card's side of the tier layers: the slot map's tier view (a row
+/// of places per layer at the card copy's row offsets), each row's tier
+/// places of its routed slots, and per layer of the description the experts
+/// the tier holds. The tier handoff reads the view and writes a row's
+/// places; the card sum over both cards' slots reads the places. Built once at
+/// load by a body with a tier card.
+pub struct TierSide {
+    places: DeviceTensor<u32>,
+    tsel: Vec<DeviceBuffer<u32>>,
+    k: Vec<usize>,
+}
+
+impl TierSide {
+    /// The side for `map`'s tier [`STAGE_TIER`] over `layers` layers of the
+    /// description (a layer outside the map holds no tier expert), `rows`
+    /// rows of `n_used` slots. Load-time only.
+    pub fn new(
+        gpu: &Gpu,
+        map: &SlotMap,
+        layers: usize,
+        (rows, n_used): (usize, usize),
+    ) -> Result<TierSide, GpuError> {
+        let stream = gpu.stream();
+        let run = map.layers();
+        let k = (0..layers)
+            .map(|l| {
+                if run.contains(&l) {
+                    map.on_tier_of(STAGE_TIER, l)
+                } else {
+                    Ok(0)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TierSide {
+            places: DeviceTensor::upload(
+                stream,
+                &map.tier_view(STAGE_TIER)?,
+                run.len(),
+                map.n_expert(),
+            )?,
+            tsel: (0..rows)
+                .map(|_| DeviceBuffer::zeroed(stream, n_used))
+                .collect::<Result<Vec<_>, _>>()?,
+            k,
+        })
+    }
+
+    /// The tier's experts of layer `l`: 0 off the tier.
+    #[must_use]
+    pub fn k(&self, l: usize) -> usize {
+        self.k.get(l).copied().unwrap_or(0)
+    }
+
+    /// Some layer holds a tier expert.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.k.iter().any(|&k| k > 0)
+    }
+
+    /// The card copy of the map's tier view.
+    #[must_use]
+    pub fn places(&self) -> &DeviceBuffer<u32> {
+        self.places.buf()
+    }
+
+    /// Row `row`'s tier places; a row past the load's is refused by name.
+    pub fn tsel(&self, row: usize) -> Result<&DeviceBuffer<u32>, GpuError> {
+        let n = self.tsel.len();
+        self.tsel.get(row).ok_or_else(|| past_rows(n, row))
+    }
+
+    /// What row `row`'s tier handoff reads and writes: the tier view and
+    /// the row's tier places; a row past the load's is refused by name.
+    pub fn handoff_parts(
+        &mut self,
+        row: usize,
+    ) -> Result<(&DeviceBuffer<u32>, &mut DeviceBuffer<u32>), GpuError> {
+        let n = self.tsel.len();
+        let tsel = self.tsel.get_mut(row).ok_or_else(|| past_rows(n, row))?;
+        Ok((self.places.buf(), tsel))
+    }
+
+    /// Device bytes the side holds.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.places.buf().num_bytes() + self.tsel.iter().map(DeviceBuffer::num_bytes).sum::<usize>()
+    }
+}
+
+fn past_rows(n: usize, row: usize) -> GpuError {
+    GpuError::Shape {
+        what: SIDE,
+        detail: format!("row {row} of the tier side's {n} rows"),
+    }
+}
 
 /// A tier layer's experts, its routed SwiGLU limit and its stacks' names.
 struct TierLayer {
@@ -310,4 +419,189 @@ pub fn open_tier(
         block: (0, 0),
     }
     .open_tier(stage, file, plan, t.node, family, card_dontneed)
+}
+
+/// The routed block's widths a family's description gives the tier.
+#[derive(Clone, Copy, Debug)]
+pub struct LegWidths {
+    /// Routed experts a layer holds.
+    pub n_expert: usize,
+    /// Routed slots a token takes.
+    pub n_used: usize,
+    /// The model's width.
+    pub n_embd: usize,
+    /// A routed expert's width.
+    pub ff: usize,
+}
+
+impl LegWidths {
+    /// The card leg's shape for the tier: up to `cap` tokens of
+    /// [`LegWidths::n_used`] slots, `n_embd` wide, through experts `ff` wide.
+    #[must_use]
+    pub const fn shape(&self, cap: usize) -> LegShape {
+        LegShape {
+            cap,
+            slots_per_col: self.n_used,
+            n: self.n_embd,
+            ff: self.ff,
+        }
+    }
+}
+
+/// What a family gives the tier node service of its file: its placement's
+/// reading of the description, and the host views of its routed layers. The
+/// tier's computation is the card leg ([`LegTier`]) whatever the family;
+/// [`node_family`] makes the family's [`NodeFamily`] from this.
+pub trait LegFamily {
+    /// What the node's errors name.
+    const WHAT: &'static str;
+    /// The family's word on the node protocol ([`NodeFamily::word`]).
+    const WORD: &'static str;
+    /// The tier page's rows: the rows in flight of a load.
+    const ROWS: usize;
+    /// Tokens one tier run covers: the card leg's capacity.
+    const CHUNK: usize;
+    /// The file as the family's placement reads it.
+    type Inputs;
+
+    /// `file` read as the family's placement reads it; its refusals are
+    /// the family's.
+    fn describe(file: &Split) -> Result<Self::Inputs, GpuError>;
+    /// The placement's tensors of `inputs`, by role.
+    fn into_model(inputs: Self::Inputs) -> ModelTensors;
+    /// The description's layers.
+    fn layers(inputs: &Self::Inputs) -> &[LayerSpec];
+    /// The routed block's widths.
+    fn widths(inputs: &Self::Inputs) -> LegWidths;
+    /// The host views of the routed layers `run`, each from the family's
+    /// host reader; a layer of the run that does not route is refused by
+    /// name. Load-time only.
+    fn routed(
+        src: R8Source<'_>,
+        inputs: &Self::Inputs,
+        run: Range<usize>,
+    ) -> Result<Vec<HostLayer>, ModelError>;
+}
+
+/// The family `F`'s tier node service: the placement tensors of a file, the
+/// tier's computation over the stacks the node loaded, and the host run of
+/// its routed layers.
+#[must_use]
+pub const fn node_family<F: LegFamily>() -> NodeFamily {
+    NodeFamily {
+        word: F::WORD,
+        tensors: node_tensors::<F>,
+        experts: node_experts::<F>,
+        host: node_host::<F>,
+    }
+}
+
+fn node_tensors<F: LegFamily>(file: &Split) -> Result<ModelTensors, GpuError> {
+    F::describe(file).map(F::into_model)
+}
+
+/// `file` as `F` reads it, refused unless `open` is a tier open for it.
+fn node_inputs<F: LegFamily>(file: &Split, open: &NodeOpen) -> Result<F::Inputs, GpuError> {
+    let inputs = F::describe(file)?;
+    let w = F::widths(&inputs);
+    LegOpen {
+        n_expert: w.n_expert,
+        layers: F::layers(&inputs).len(),
+        hidden: w.n_embd,
+        n_used: w.n_used,
+        rows: F::ROWS,
+    }
+    .check(F::WHAT, open)?;
+    Ok(inputs)
+}
+
+fn node_experts<F: LegFamily>(
+    gpu: &Gpu,
+    file: &Split,
+    _: &ModelTensors,
+    w: &Weights,
+    open: &NodeOpen,
+) -> Result<Box<dyn TierExperts>, GpuError> {
+    let inputs = node_inputs::<F>(file, open)?;
+    let shape = F::widths(&inputs).shape(F::CHUNK);
+    Ok(Box::new(LegTier::new(
+        gpu,
+        F::layers(&inputs),
+        &open.set,
+        w,
+        shape,
+    )?))
+}
+
+fn node_host<F: LegFamily>(file: Arc<Split>, open: &NodeOpen) -> Result<HostRun, GpuError> {
+    let inputs = node_inputs::<F>(&file, open)?;
+    let run = runtime::layer::hosted(F::layers(&inputs))
+        .map_err(|e| GpuError::shape(F::WHAT, format!("the node host run: {e}")))?;
+    let w = F::widths(&inputs);
+    HostRun::build(
+        file,
+        run.start,
+        false,
+        HostWidths {
+            embd: w.n_embd,
+            ff: w.ff,
+            n_used: w.n_used,
+        },
+        |src| F::routed(src, &inputs, run),
+    )
+}
+
+/// What a load hangs under its host tier: the machine's expert tier cards,
+/// the family that opens them, the open's shape and the batch port's width.
+pub struct Hang<'a> {
+    /// The expert tier cards of the plan's machine ([`TierOpen::of_machine`]).
+    pub tiers: &'a [TierOpen],
+    /// The family's node service.
+    pub family: &'a NodeFamily,
+    /// What the family's open fixes.
+    pub open: LegOpen,
+    /// Tokens the batch port's blocks hold: the tier's batch legs are made
+    /// for them at load.
+    pub cols: usize,
+    /// The release of the tier's file pages, as for the stage card's
+    /// segments.
+    pub card_dontneed: bool,
+}
+
+/// Open every expert tier card of `hang` for the stage card `gpu`'s load of
+/// `plan` and hang them under `hybrid` ([`Hybrid::attach_tiers`]), the tier's
+/// batch legs made and their bytes checked against the plan's reserve
+/// ([`Hybrid::check_tier_reserves`]): the plan reserves them on the tier card
+/// and the host, so they are made at load, not at the first prompt. The one
+/// owner of a body's tier hang, after its [`Hybrid`] is made and before its
+/// arena leg. Nothing without a tier. Refused by name: more tier cards than
+/// the host tier serves, a map that names other tiers. Load-time only.
+pub fn hang_tiers(
+    (gpu, file, plan): (&Gpu, &Arc<Split>, &Plan<'_>),
+    hang: &Hang<'_>,
+    hybrid: &mut Hybrid<HostRun>,
+) -> Result<(), GpuError> {
+    if hang.tiers.is_empty() {
+        return Ok(());
+    }
+    let cards = hang
+        .tiers
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            open_tier(
+                gpu,
+                file,
+                plan,
+                (t, i),
+                hybrid.slots(),
+                (hang.family, hang.open),
+                hang.card_dontneed,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let planned: Vec<usize> = hang.tiers.iter().map(|t| t.card).collect();
+    hybrid.attach_tiers(cards, gpu)?;
+    hybrid.prepare_batch(gpu.context(), hang.cols)?;
+    hybrid.check_tier_reserves(plan.machine, &planned)
 }

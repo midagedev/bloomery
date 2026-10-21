@@ -41,6 +41,7 @@ use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
 use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
+use crate::host::leg_tier;
 use crate::host::nvtier::{ArenaKind, NvTier};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
@@ -1893,13 +1894,35 @@ pub fn one_card_run(
     card: usize,
     n_layers: usize,
 ) -> Result<(Range<usize>, usize), GpuError> {
-    if plan.machine.cards.len() != 1 || !plan.machine.tiers.is_empty() {
+    if !plan.machine.tiers.is_empty() {
         return Err(GpuError::shape(
             what,
             format!(
                 "a plan of {} cards and {} expert tiers; the program runs every layer on one card with no expert tier",
                 plan.machine.cards.len(),
                 plan.machine.tiers.len()
+            ),
+        ));
+    }
+    stage_run(what, plan, card, n_layers)
+}
+
+/// [`one_card_run`] for a body that hangs the plan's expert tier cards under its host tier: the stage card's layers
+/// and context, the tier cards the load's own to count ([`crate::host::refuse_tier_count`]). Refused by name as
+/// `what`'s: a plan of other than one stage card, another layer range, a context of no position or past the `u32`
+/// the position words count.
+pub fn stage_run(
+    what: &'static str,
+    plan: &Plan<'_>,
+    card: usize,
+    n_layers: usize,
+) -> Result<(Range<usize>, usize), GpuError> {
+    if plan.machine.cards.len() != 1 {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "a plan of {} cards; the program runs every layer on one stage card",
+                plan.machine.cards.len(),
             ),
         ));
     }
@@ -1971,6 +1994,34 @@ pub fn hosted_hybrid<E>(
 where
     E: std::error::Error + Send + Sync + 'static,
 {
+    hosted_hybrid_tiered(
+        (gpu, file, plan),
+        (run, map),
+        (host, set, glue),
+        (widths, rows),
+        None,
+        layers,
+    )
+}
+
+/// [`hosted_hybrid`] for a body that hangs the plan's expert tier cards under the host tier (`hang`,
+/// [`leg_tier::hang_tiers`]): they are attached after the [`Hybrid`] is made and before the arena leg, which a tier
+/// keeps off. `None` is [`hosted_hybrid`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the card, file, plan, run and map, the host levers and set, the glue, widths and rows, the tier hang and the layers' builder, each named"
+)]
+pub fn hosted_hybrid_tiered<E>(
+    (gpu, file, plan): (&Gpu, &Arc<Split>, &Plan<'_>),
+    (run, map): (Range<usize>, SlotMap),
+    (host, set, glue): (HostCfg, HostResidency, &ResidencyGlue),
+    (widths, rows): (HostWidths, usize),
+    hang: Option<&leg_tier::Hang<'_>>,
+    layers: impl FnOnce(R8Source<'_>) -> Result<Vec<HostLayer>, E>,
+) -> Result<Hybrid<HostRun>, GpuError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     let boundary = Boundary::with_rows(
         gpu.context(),
         gpu.stream(),
@@ -1994,6 +2045,9 @@ where
     let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
     hybrid.watch_fault(gpu.fault_word())?;
     hybrid.keep_residency(set);
+    if let Some(hang) = hang {
+        leg_tier::hang_tiers((gpu, file, plan), hang, &mut hybrid)?;
+    }
     // The residency machine frees arena slots between passes, which a card hold keeps: a load that starts one keeps
     // the host leg.
     hybrid.attach_arena_leg(gpu, glue.source().is_some())?;

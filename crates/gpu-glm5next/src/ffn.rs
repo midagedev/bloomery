@@ -51,6 +51,7 @@
 //! [`BlockPlan::extra_launches`]: bloomery_gpu_deepseek41::block::BlockPlan::extra_launches
 
 use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
+use bloomery_gpu::host::leg_tier::{STAGE_TIER, TierSide};
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::{Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::{
@@ -72,7 +73,6 @@ use models::{Ffn, LayerSpec};
 
 use crate::body::{Parts, f32t, f32v};
 use crate::tensors::{FfnNames, LayerNames, other_kind};
-use crate::tier::{STAGE_TIER, TierSide};
 
 /// The dense block's launches.
 pub(crate) const DENSE_LAUNCHES: usize = 3;
@@ -234,7 +234,7 @@ impl CardExperts {
                 .collect::<Result<Vec<_>, _>>()?,
             tier: match map.tiers() {
                 0 => None,
-                _ => Some(TierSide::new(gpu, map, layers.len(), rows)?),
+                _ => Some(TierSide::new(gpu, map, layers.len(), (rows, N_USED))?),
             },
         })
     }

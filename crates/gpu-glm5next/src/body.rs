@@ -79,6 +79,7 @@ use bloomery_gpu::checkpoint::saved::Identity;
 use bloomery_gpu::checkpoint::{self, Checkpoints};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
+use bloomery_gpu::host::leg_tier::{self, Hang, LegOpen};
 use bloomery_gpu::host::nvtier::NvTier;
 use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
@@ -1701,34 +1702,23 @@ impl Body {
         )?;
         glue.attach_tier(experts.tier())?;
         let nvme_tier = experts.tier().cloned();
-        let tier_cards = tiers
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                tier::open_tier(
-                    gpu,
-                    &file,
-                    plan,
-                    t,
-                    i,
-                    &spec.layers,
-                    &map,
-                    [dims.embd, LOAD_ROWS],
-                    host.card_dontneed,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(residency);
-        if !tier_cards.is_empty() {
-            let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
-            hybrid.attach_tiers(tier_cards, gpu)?;
-            // The tier's batch staging is reserved on its card by the plan, so
-            // it is made at load, not at the first prompt.
-            hybrid.prepare_batch(gpu.context(), prefill::T_MAX.min(ctx))?;
-            hybrid.check_tier_reserves(plan.machine, &cards)?;
-        }
+        let hang = Hang {
+            tiers,
+            family: &tier::NODE_FAMILY,
+            open: LegOpen {
+                n_expert: N_EXPERT,
+                layers: spec.layers.len(),
+                hidden: dims.embd,
+                n_used: N_USED,
+                rows: LOAD_ROWS,
+            },
+            cols: prefill::T_MAX.min(ctx),
+            card_dontneed: host.card_dontneed,
+        };
+        leg_tier::hang_tiers((gpu, &file, plan), &hang, &mut hybrid)?;
         // The residency machine frees arena slots between passes, which a
         // card hold keeps: a load that starts one keeps the host leg.
         hybrid.attach_arena_leg(gpu, glue.source().is_some())?;

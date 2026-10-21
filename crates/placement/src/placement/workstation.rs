@@ -459,6 +459,25 @@ pub const fn tier_batch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> T
     }
 }
 
+/// [`tier_batch_bytes`] for a tier on the common card leg (`bloomery_gpu::host::leg_tier`): the
+/// scratch is one run of the leg's buffers for `chunk` tokens ([`tier_chunk_scratch_bytes`]), in
+/// place of the tile path's. The one formula of those bytes for every family whose tier is the card
+/// leg; a family names its own `chunk` and widths.
+#[must_use]
+pub const fn tier_leg_batch_bytes(
+    n_embd: u64,
+    ff: u64,
+    n_used: u64,
+    chunk: u64,
+    cols: u64,
+) -> TierBatchBytes {
+    TierBatchBytes {
+        staging: tier_batch_staging_bytes(n_embd, n_used, cols),
+        scratch: tier_chunk_scratch_bytes(n_embd, ff, n_used, chunk),
+        host: tier_batch_host_bytes(n_embd, n_used, cols),
+    }
+}
+
 /// Plan (b′): the A6000 runs all `layers` and the head as in [`plan_a`];
 /// the 3090 is an expert tier beside the host, holding each layer's next ids
 /// after the stage's prefix, with `draft_bytes` — the DSpark draft's resident bytes

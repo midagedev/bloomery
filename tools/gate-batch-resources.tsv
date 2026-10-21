@@ -23,6 +23,8 @@
 #              0.45e9 B stays on the host), KV and scratch 5e9 B, so 25.77e9 − 4.63e9 − 5e9 = 16.1e9 B of routed experts — is
 #              146.28e9 − 16.1e9 = 130.2e9 B routed on the host, plus the embedding 0.45e9 B, rounded up to 131e9 [derived]; read
 #              the plan line of the first run and replace it.
+#   solar2     --place bp under gate_solar2_twocard's 16 GiB card budget: host routed 122,361,937,920 B (the gate's plan line, 12,657
+#              experts) plus the embedding 0.45e9 B, 122.81e9, rounded up to 123e9 [derived]; its two loads run one after the other.
 #   minimaxm3  --place gate: the plan line of `gate_minimaxm3_e2e --plan` at ctx 8192 (the 3090's usable bytes; 333 of the 7,296 routed
 #              experts on the card): routed experts on the host 185.34e9 B (6,963 experts) plus the token embedding 1.31e9 B that
 #              stays on the host, 186.65e9 B, rounded up to 187e9 [derived from the plan's own host terms].
@@ -44,6 +46,7 @@ gate-gpu-qwen4exp-mtp	m	92054154240
 gate-gpu-solar2-e2e	-	131000000000
 gate-gpu-solar2-prefill	-	131000000000
 gate-gpu-solar2-serve	-	131000000000
+gate-gpu-solar2-twocard	-	123000000000
 gate-gpu-minimaxm3-e2e	-	187000000000
 gate-gpu-minimaxm3-prefill	-	187000000000
 soak-ds41	-	237600000000
