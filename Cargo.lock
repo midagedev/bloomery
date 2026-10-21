@@ -76,6 +76,7 @@ dependencies = [
  "bloomery-gpu-deepseek41",
  "bloomery-gpu-glm5next",
  "bloomery-gpu-mimo2",
+ "bloomery-gpu-minimaxm3",
  "bloomery-gpu-solar2",
  "bloomery-levers",
  "bloomery-model",

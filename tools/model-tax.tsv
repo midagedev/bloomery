@@ -29,6 +29,7 @@ crates/gpu-gates/src/bin/bloomery_chat.rs	deepseek	13	baseline S 13: MK9 seat by
 crates/gpu-gates/src/bin/bloomery_serve.rs	clef	7	baseline S 7: MK9 seat by program
 crates/gpu-gates/src/bin/bloomery_serve.rs	deepseek	19	baseline S 19: MK9 seat by program
 crates/gpu-gates/src/bin/bloomery_serve.rs	glm	16	baseline S 16: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	minimax	11	PIN(2026-10-21) minimax: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
 crates/gpu-gates/src/bin/bloomery_serve.rs	mimo	11	baseline S 11: MK9 seat by program
 crates/gpu-gates/src/bin/bloomery_serve.rs	nemotron	15	baseline S 15: MK9 seat by program
 crates/gpu-gates/src/bin/bloomery_serve.rs	qwen	21	baseline S 21: MK9 seat by program
@@ -109,6 +110,7 @@ crates/gpu-gates/src/oracle/mod.rs	qwen	3	baseline R 4: MK1a one registry row pe
 crates/gpu-gates/src/record.rs	clef	3	baseline O 3: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	deepseek	6	baseline O 6: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	gemma	1	baseline O 1: MK12 per-bin Kind statics into record/<bin>.rs
+crates/gpu-gates/src/record.rs	minimax	4	PIN(2026-10-21) minimax: MK12 per-bin Kind statics into record/<bin>.rs: the seat's load and listening kinds are the common file's, where every seat's are
 crates/gpu-gates/src/record.rs	glm	14	baseline O 14: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	mimo	4	baseline O 4: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	nemotron	5	baseline O 5: MK12 per-bin Kind statics into record/<bin>.rs

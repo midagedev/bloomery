@@ -3,8 +3,8 @@
 //! behind [`bloomery_gpu_gates::bind::Seat`], with a `run(&args)` a binary
 //! calls once. The per-model binaries (`bloomery-serve-ds41`,
 //! `bloomery-serve-qwen38`) include their one seat directly; the one-binary
-//! server (`bloomery-serve --model ds41|qwen38|glm|qwen3|mimo2|solar2|nemotron`) includes this
-//! registry and is one call into the seat the model names.
+//! server (`bloomery-serve --model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron`)
+//! includes this registry and is one call into the seat the model names.
 //!
 //! A seat's module is its contract's owner: read it for the flags, the
 //! records, the keep rule and the prompt cache. [`glm`] is the GLM-5.3-Flash
@@ -14,8 +14,12 @@
 //! every routed expert sits on the host, opened as `gate_mimo2_e2e` opens it;
 //! [`solar2`] the Solar-Open2 seat, one sequence on one card with the routed
 //! experts the card does not hold on the host, opened as `gate_solar2_e2e`
-//! opens it; [`nemotron`] the Nemotron 3 Nano seat, one sequence on one card, opened as
-//! `gate_nemotron_e2e` opens it.
+//! opens it; [`minimaxm3`] the MiniMax-M3 seat, one sequence on one card with
+//! the routed experts the card does not hold on the host, opened as
+//! `gate_minimaxm3_e2e` opens it; [`nemotron`] the Nemotron 3 Nano seat, one
+//! sequence on one card, opened as `gate_nemotron_e2e` opens it.
+//! [`hybrid`] holds what the seats of one chain on one card ([`solar2`],
+//! [`minimaxm3`]) do the same way.
 //! `drafted` is the
 //! seats' shared MTP draft driver and `served` the owner of the DSpark draft
 //! the V4.1 and qwen3 seats serve, each one file a seat's per-model binary
@@ -51,6 +55,15 @@ pub mod mimo2;
 // surface it binds through is scoped to it, and it runs no V4.1 code.
 #[cfg(all(feature = "deepseek41", feature = "solar2"))]
 pub mod solar2;
+// The minimaxm3 seat sits behind `deepseek41` for the same reason: the server
+// surface it binds through is scoped to it, and it runs no V4.1 code.
+#[cfg(all(feature = "deepseek41", feature = "minimaxm3"))]
+pub mod minimaxm3;
+// The seats of the bodies that run one chain on one card, fed in prompt
+// batches (`solar2`, `minimaxm3`): their open, their load record, their calls
+// and their think tags are one owner's.
+#[cfg(all(feature = "deepseek41", any(feature = "solar2", feature = "minimaxm3")))]
+pub mod hybrid;
 // The nemotron seat sits behind `deepseek41` for the same reason: the server
 // surface it binds through is scoped to it, and it runs no V4.1 code. The
 // body it serves is in the gpu crate, so it needs no feature of its own.

@@ -2986,6 +2986,43 @@ pub static LISTENING_SOLAR2: Kind = Kind {
     ],
 };
 
+/// The MiniMax-M3 seat's load.
+pub static LOAD_MINIMAXM3: Kind = Kind {
+    name: "load_minimaxm3",
+    head: "load",
+    doc: "The MiniMax-M3 seat's model on its card: its architecture, resident bytes, the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`: one, the body has no more), layers, the routed experts the plan keeps on the host and on the card, the step graph's nodes, the batches a prompt group runs layer by layer (`group`: `BLOOMERY_PREFILL_GROUP`, the row's default when unset), `BLOOMERY_PIN_MAIN`'s ask (`pin_main`) and whether the engine thread's pin took (`pinned`), and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        key("host_experts", U64, "experts"),
+        key("card_experts", U64, "experts"),
+        key("graph_nodes", U64, ""),
+        key("group", U64, "batches"),
+        key("pin_main", Word, ""),
+        key("pinned", Bool, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The MiniMax-M3 seat's address.
+pub static LISTENING_MINIMAXM3: Kind = Kind {
+    name: "listening_minimaxm3",
+    head: "bloomery-serve-minimaxm3:",
+    doc: "The MiniMax-M3 seat's placement, the context its slot serves, the slots it serves and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The nemotron_h seat's load.
 pub static LOAD_NEMOTRON: Kind = Kind {
     name: "load_nemotron",
@@ -3495,6 +3532,16 @@ pub mod groups {
         pub const RUN: &[&Kind] = &[&PLAN, &NEED];
     }
 
+    /// `serve_seats/hybrid.rs` (the seats of the bodies that run one chain on
+    /// one card).
+    pub mod hybrid {
+        use crate::record::{Kind, LANE, LOAD_PHASES};
+
+        /// A hybrid seat's load: the lane's rate and the load's phases
+        /// (`hybrid::open_session`).
+        pub const GROUP: &[&Kind] = &[&LANE, &LOAD_PHASES];
+    }
+
     /// `side_seat.rs`.
     pub mod side_seat {
         use crate::record::{EMBEDDING_SEAT, Kind};
@@ -3851,6 +3898,22 @@ pub static BLOOMERY_SERVE_SOLAR2: &[&Kind] = kinds![
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LANE, &LOAD_SOLAR2, &LOAD_PHASES, &LISTENING_SOLAR2],
+    groups::bind::CACHE,
+];
+
+/// What the MiniMax-M3 seat of `bloomery-serve` prints, all on stderr: the
+/// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
+/// the server before the seat registers), the plan, the load and its phases,
+/// the address and each request's note of the prefix it kept less of than it
+/// shared (every store is a plane of positions, so a cut keeps every held
+/// position).
+pub static BLOOMERY_SERVE_MINIMAXM3: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
+    &[&PLACE_UNSET],
+    groups::tiered::RUN,
+    groups::fetch::FETCH,
+    groups::fetch::SET,
+    &[&LANE, &LOAD_MINIMAXM3, &LOAD_PHASES, &LISTENING_MINIMAXM3],
     groups::bind::CACHE,
 ];
 
@@ -5047,7 +5110,7 @@ mod tests {
             qwen3moe_place, residency38, serve_client, side_seat, vision_seat,
         };
         type Group = &'static [&'static Kind];
-        let table: [(&str, Group, &[Group]); 14] = [
+        let table: [(&str, Group, &[Group]); 15] = [
             (
                 "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
                 BLOOMERY_SERVE_DS41,
@@ -5105,6 +5168,11 @@ mod tests {
             (
                 "solar2 seat: bind::spawn",
                 BLOOMERY_SERVE_SOLAR2,
+                &[side_seat::SEAT, fetch::FETCH, fetch::SET, bind::CACHE],
+            ),
+            (
+                "minimaxm3 seat: bind::spawn",
+                BLOOMERY_SERVE_MINIMAXM3,
                 &[side_seat::SEAT, fetch::FETCH, fetch::SET, bind::CACHE],
             ),
             (

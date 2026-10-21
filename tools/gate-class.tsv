@@ -115,6 +115,7 @@ gate-gpu-minimaxm3-e2e	family	minimax-m3	e2e	graph_fault+attn_gqa+moe_route
 gate-gpu-minimaxm3-msa	family	minimax-m3	kernel	attn_gqa
 gate-gpu-minimaxm3-prefill	family	minimax-m3	e2e	prompt_walks
 gate-gpu-minimaxm3-rope	family	minimax-m3	kernel	attn_gqa
+gate-gpu-minimaxm3-serve	family	minimax-m3	serve	seats_serve_engine
 gate-gpu-moe	family	deepseek2	e2e	graph_fault+moe_route+weights_load
 gate-gpu-mxfp8	common		kernel	quant_q8
 gate-gpu-nemotron-e2e	family	nemotron_h	e2e	graph_fault+recur_mamba2

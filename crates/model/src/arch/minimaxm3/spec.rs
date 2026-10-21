@@ -3,12 +3,13 @@
 //! position. A sparse layer attends the blocks its indexer picks ([`Selector::BlockMax`]) and runs
 //! the sigmoid noaux_tc router over `swigluoai` experts beside an ungated shared one: the
 //! selection bias steers the choice only, the kept scores are renormalized and scaled by
-//! `expert_weights_scale`. The chat surface carries no tool-call or reasoning parser yet.
+//! `expert_weights_scale`. The chat surface carries no tool-call parser; its reasoning span is
+//! the pair the template's generation prompt opens and the model closes.
 
 use gguf::Split;
 use models::{
-    Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate, Residual, Rope, RopeMode,
-    Selector,
+    Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate, ReasoningFormat, Residual,
+    Rope, RopeMode, Selector,
 };
 
 use super::hparams::{Hparams, Kind, SWIGLU_ALPHA, SWIGLU_LIMIT};
@@ -21,6 +22,13 @@ const ACT: Act = Act::SwigluOai {
     alpha: SWIGLU_ALPHA,
     limit: SWIGLU_LIMIT,
 };
+
+/// The tags of the family's reasoning span, which its template's generation prompt opens and the
+/// model closes.
+const REASONING: Option<ReasoningFormat> = Some(ReasoningFormat::ThinkSpan {
+    open: "<mm:think>",
+    close: "</mm:think>",
+});
 
 /// `split`'s description and roles, and the defaults the key read took.
 pub fn read(split: &Split) -> Result<Read, PlacementError> {
@@ -104,7 +112,10 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
         hc: None,
         engram: None,
         encoder: None,
-        chat,
+        chat: ChatSpec {
+            reasoning: REASONING,
+            ..chat
+        },
     })
 }
 
@@ -148,6 +159,13 @@ mod tests {
         assert_eq!(spec.arch, models::Arch::MiniMaxM3);
         assert_eq!((spec.hidden, spec.vocab, spec.ctx_train), (64, 2, 4096));
         assert!(spec.mtp.is_empty());
+        assert_eq!(
+            spec.chat.reasoning,
+            Some(models::ReasoningFormat::ThinkSpan {
+                open: "<mm:think>",
+                close: "</mm:think>"
+            })
+        );
         let act = Act::SwigluOai {
             alpha: SWIGLU_ALPHA,
             limit: SWIGLU_LIMIT,
