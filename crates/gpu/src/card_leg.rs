@@ -540,7 +540,7 @@ impl<'a> LegStacks<'a> {
     pub fn of(w: &'a Weights, names: [&'a str; 3]) -> Result<LegStacks<'a>, GpuError> {
         const DOWN: &str =
             "a resident routed down stack of a type the card leg runs (`kernels::card_down_runs`)";
-        LegStacks::with_arms(
+        LegStacks::of_arms(
             w,
             names,
             LegArms {
@@ -556,7 +556,7 @@ impl<'a> LegStacks<'a> {
     pub fn of_rank(w: &'a Weights, names: [&'a str; 3]) -> Result<LegStacks<'a>, GpuError> {
         const DOWN: &str = "a resident routed down stack of a type a rank's card leg runs \
                             (`kernels::rank_down_runs`)";
-        LegStacks::with_arms(
+        LegStacks::of_arms(
             w,
             names,
             LegArms {
@@ -574,7 +574,7 @@ impl<'a> LegStacks<'a> {
     pub fn of_resident(w: &'a Weights, names: [&'a str; 3]) -> Result<LegStacks<'a>, GpuError> {
         const DOWN: &str = "a resident routed down stack of a type a whole-file body's card leg \
                             runs (`kernels::card_down_runs` or Q5_0)";
-        LegStacks::with_arms(
+        LegStacks::of_arms(
             w,
             names,
             LegArms {
@@ -592,17 +592,6 @@ impl<'a> LegStacks<'a> {
     /// the gate or up refusal's words, then the down's). Allocation-free on
     /// success.
     pub fn of_arms(
-        w: &'a Weights,
-        names: [&'a str; 3],
-        arms: LegArms,
-        roles: (&'static str, &'static str),
-    ) -> Result<LegStacks<'a>, GpuError> {
-        LegStacks::with_arms(w, names, arms, roles)
-    }
-
-    /// The stacks with the gate and up admitted by `arms.gate_up` and the
-    /// down by `arms.down`, refused as `roles.0` and `roles.1`.
-    fn with_arms(
         w: &'a Weights,
         names: [&'a str; 3],
         arms: LegArms,
