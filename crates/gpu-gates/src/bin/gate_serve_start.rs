@@ -44,9 +44,10 @@
 //!   "does not print this kind" or "panicked".
 //! - (s5) `--chat-template-file <file>` is a flag of every seat: a start on the fixture's own
 //!   `tokenizer.chat_template` behind a marker, and `/apply-template` of a call-carrying conversation renders
-//!   the marker and then exactly what (s1)'s plain start rendered of it. A seat that rewrites its template (the
-//!   V4.1 seat respells the DSML tags) rewrites the file's text the same way, so the two renders are equal only
-//!   if the file went through the seat's template path; a chat is a 200. (s5 runs before (s4), so (s4) reads its
+//!   the marker and then exactly what a start on the same file without the marker rendered of it, so the file's
+//!   text is the template served. A seat whose default is the file's own template (GLM) renders the unmarked file
+//!   as (s1)'s plain start did; the V4.1 seat, whose default is DeepSeek's official encoding, renders it
+//!   otherwise, so the file replaced the default. A chat is a 200. (s5 runs before (s4), so (s4) reads its
 //!   log.)
 //!
 //! - (s6) the need hook (`BLOOMERY_NEED_HOOK`): `-m <fixture>` with a hook that reads its standard input and
@@ -150,6 +151,15 @@ impl Family {
         match self {
             Family::Glm => record::BLOOMERY_SERVE_GLM,
             Family::Ds41 => record::BLOOMERY_SERVE_DS41,
+        }
+    }
+
+    /// Whether the seat serves the file's own `tokenizer.chat_template` when no
+    /// `--chat-template-file` is given (the V4.1 seat serves DeepSeek's official encoding).
+    fn serves_the_files_template(self) -> bool {
+        match self {
+            Family::Glm => true,
+            Family::Ds41 => false,
         }
     }
 
@@ -873,6 +883,16 @@ impl Gate {
         Ok(ok)
     }
 
+    /// The plain start's arguments with `--chat-template-file <file>`.
+    fn template_args(&self, file: &Path) -> Vec<String> {
+        let mut args = self.file_args();
+        args.extend([
+            "--chat-template-file".to_owned(),
+            file.display().to_string(),
+        ]);
+        args
+    }
+
     /// (s5): the seat takes `--chat-template-file`, and the file's text is the template it serves.
     fn template_file(&self) -> Result<bool, GateError> {
         let Some(plain) = self.plain_render.get() else {
@@ -886,22 +906,31 @@ impl Gate {
             .ok_or("the fixture has no tokenizer.chat_template")?;
         let dir = self.dir.join("s5");
         std::fs::create_dir_all(&dir)?;
-        let file = dir.join("template.jinja");
-        std::fs::write(&file, format!("{FILE_MARK}{template}"))?;
-        let mut args = self.file_args();
-        args.extend([
-            "--chat-template-file".to_owned(),
-            file.display().to_string(),
-        ]);
-        let mut up = self.start("s5", &args, None)?;
+        let unmarked = dir.join("unmarked.jinja");
+        std::fs::write(&unmarked, template)?;
+        let mut up = self.start("s5u", &self.template_args(&unmarked), None)?;
         let addr = up.addr.clone();
         let url = |p: &str| format!("http://{addr}{p}");
-        let mut ok = check("s5_health_ok", health(&url)?);
+        let mut ok = check("s5u_health_ok", health(&url)?);
+        let files = applied(&url, &call_messages())?;
+        println!("s5u: prompt {}", tail(&files, 160));
+        println!("s5u: server stopped: {}", up.served.stop()?);
+        ok &= if self.family.serves_the_files_template() {
+            check("s5_default_is_the_files_template", files == *plain)
+        } else {
+            check("s5_file_replaces_the_default", files != *plain)
+        };
+        let file = dir.join("template.jinja");
+        std::fs::write(&file, format!("{FILE_MARK}{template}"))?;
+        let mut up = self.start("s5", &self.template_args(&file), None)?;
+        let addr = up.addr.clone();
+        let url = |p: &str| format!("http://{addr}{p}");
+        ok &= check("s5_health_ok", health(&url)?);
         let prompt = applied(&url, &call_messages())?;
         println!("s5: prompt {}", tail(&prompt, 160));
         ok &= check(
             "s5_prompt_is_the_files_template",
-            prompt.strip_prefix(FILE_MARK) == Some(plain.as_str()),
+            prompt.strip_prefix(FILE_MARK) == Some(files.as_str()),
         );
         let (st, _) = chat(&url, &text_messages())?;
         ok &= check("s5_text_chat_200", st == 200);
