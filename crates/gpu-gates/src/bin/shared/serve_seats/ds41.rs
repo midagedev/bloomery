@@ -222,7 +222,7 @@ use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, TemplateFile,
-    Vocab, arm_screen, bind_server, model_props, parallel_line, placement_of,
+    Vocab, arm_screen, bind_server, model_props, official_template, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
 use bloomery_gpu_gates::need;
@@ -275,6 +275,12 @@ const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
 const DSML_RESPELLED: &str = "bloomery-serve: chat template: this V4.1 chat template spells \
     V4's DSML tags, but its model writes V4.1's (a space after the token: `<｜DSML｜ calls>`, \
     `<｜DSML｜ invoke>`, `<｜DSML｜ parameter>`); serving the template respelled that way";
+
+/// What the server says when it serves DeepSeek's official V4.1 prompt
+/// encoding, the one the V4.1 release's own encoder writes.
+const V41_OFFICIAL: &str = "bloomery-serve: chat template: this V4.1 model file is served with \
+    DeepSeek's official V4.1 prompt encoding (the system token, the reasoning effort and the \
+    spaced DSML tags the V4.1 release writes), not the file's own template";
 
 /// The token V4.1's chat template opens every user and tool message with.
 pub const USER_START: &str = "<｜User｜>";
@@ -555,7 +561,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?.with_user_start(USER_START)?);
     let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let ChatSurface { template, name } = ChatSurface::read(
+    let mut surface = ChatSurface::read(
         &path,
         inv.value("tokenizer.chat_template"),
         inv.value("general.name"),
@@ -566,18 +572,41 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::read(&split)?;
-    // A V4.1 model writes the spaced DSML tags whatever its GGUF's template spells
-    // (the V4.1 files carry V4's): the template is served spelled as the model writes.
-    let template = match inputs.hp.model {
-        Hp41Model::Deepseek41 => match respell(&template, Spelling::Spaced)? {
-            Some(spaced) => {
-                eprintln!("{DSML_RESPELLED}");
-                spaced
-            }
-            None => template,
-        },
-        Hp41Model::Deepseek4 => template,
+    // A V4.1 model file is served with DeepSeek's official V4.1 prompt
+    // encoding, which spells V4.1's tags, unless the client gave a template
+    // of its own. A V4 file, and any file with a client template, keeps the
+    // file's own template; a V4.1 one is respelled, because a V4.1 model
+    // writes the spaced DSML tags whatever its GGUF's template spells (the
+    // V4.1 files carry V4's): the template is served spelled as the model
+    // writes.
+    let official = match inputs.hp.model {
+        Hp41Model::Deepseek41 => Some(serve::v41::TEMPLATE),
+        Hp41Model::Deepseek4 => None,
     };
+    let template = std::mem::take(&mut surface.template);
+    let preparation: Option<serve::ChatPreparation> =
+        match official_template(official, a.template_file.path().is_some()) {
+            Some(official) => {
+                eprintln!("{V41_OFFICIAL}");
+                surface.template = official.to_owned();
+                // The official encoding's own request preparation, with it.
+                Some(serve::v41::prepare)
+            }
+            None => {
+                surface.template = match inputs.hp.model {
+                    Hp41Model::Deepseek41 => match respell(&template, Spelling::Spaced)? {
+                        Some(spaced) => {
+                            eprintln!("{DSML_RESPELLED}");
+                            spaced
+                        }
+                        None => template,
+                    },
+                    Hp41Model::Deepseek4 => template,
+                };
+                None
+            }
+        };
+    let ChatSurface { template, name, .. } = surface;
     let model = model_props(&split, &inputs.model);
     let tier_batch = place::tier_batch(a.place, &inputs.hp);
     // The context the load takes with the encoder's reserve `vision` and the side model's
@@ -749,6 +778,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             alias: a.alias.unwrap_or(name),
             path: &path,
             template,
+            preparation,
             slot_save_path: a.slot_save_path,
             api_keys: a.api_keys,
             parallel: slots.get(),

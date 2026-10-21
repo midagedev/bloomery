@@ -278,14 +278,34 @@ impl TemplateFile {
     }
 }
 
-/// The chat surface a seat's file gives the server: the Jinja template and
-/// the model's name.
+/// The official prompt encoding a seat serves for a model file of a family
+/// that has one: the encoding when the client gave no template of its own
+/// (`--chat-template-file` absent), else `None`.
+///
+/// The family is the seat's fact; the rule is here, so every family's seat
+/// picks the same one.
+pub fn official_template(
+    official: Option<&'static str>,
+    client_gave_one: bool,
+) -> Option<&'static str> {
+    match official {
+        Some(official) if !client_gave_one => Some(official),
+        _ => None,
+    }
+}
+
+/// The chat surface a seat's file gives the server: the Jinja template, the
+/// model's name, and the request preparation the template's family needs.
 pub struct ChatSurface {
     /// `--chat-template-file`'s text where the seat takes the flag, else the
     /// file's `tokenizer.chat_template`.
     pub template: String,
     /// The file's `general.name`, else the seat's default alias.
     pub name: String,
+    /// The family's request preparation, which shapes a request before the
+    /// template renders it; `None` renders the request as the template reads
+    /// it.
+    pub preparation: Option<serve::ChatPreparation>,
 }
 
 impl ChatSurface {
@@ -312,7 +332,11 @@ impl ChatSurface {
             .and_then(|v| v.as_str())
             .unwrap_or(default_alias)
             .to_owned();
-        Ok(ChatSurface { template, name })
+        Ok(ChatSurface {
+            template,
+            name,
+            preparation: None,
+        })
     }
 }
 
@@ -325,6 +349,9 @@ pub struct Listen<'a> {
     /// The model file, `/props`' `model_path`.
     pub path: &'a Path,
     pub template: String,
+    /// The family's request preparation; `None` renders the request as the
+    /// template reads it.
+    pub preparation: Option<serve::ChatPreparation>,
     /// `--slot-save-path`; `None` refuses every slot action.
     pub slot_save_path: Option<PathBuf>,
     pub api_keys: serve::flag::ApiKeys,
@@ -349,6 +376,7 @@ pub fn bind_server(engine: SeatEngine, l: Listen<'_>) -> Result<Server, ServeErr
         model_alias: l.alias,
         model_path: l.path.display().to_string(),
         chat_template: l.template,
+        chat_preparation: l.preparation,
         sampler: Some(sampler_factory()),
         fatal_linger: FATAL_LINGER,
         slot_save_path: l.slot_save_path,
@@ -579,6 +607,7 @@ impl SeatFlags {
                 alias: alias.unwrap_or(chat.name),
                 path,
                 template: chat.template,
+                preparation: chat.preparation,
                 slot_save_path: None,
                 api_keys,
                 parallel: slots,

@@ -1395,6 +1395,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let ChatSurface {
         template,
         name: alias,
+        ..
     } = ChatSurface::read(
         &path,
         split.value("tokenizer.chat_template"),
@@ -1545,6 +1546,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             alias,
             path: &path,
             template,
+            preparation: None,
             slot_save_path: None,
             api_keys: a.api_keys,
             parallel: slots,

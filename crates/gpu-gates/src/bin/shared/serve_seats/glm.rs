@@ -784,7 +784,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let path = ref_model_path()?;
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let ChatSurface { template, name } = ChatSurface::read(
+    let ChatSurface { template, name, .. } = ChatSurface::read(
         &path,
         inv.value("tokenizer.chat_template"),
         inv.value("general.name"),
@@ -1077,6 +1077,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             alias: a.alias.unwrap_or(name),
             path: &path,
             template,
+            preparation: None,
             slot_save_path: a.slot_save_path,
             api_keys: a.api_keys,
             parallel: slots,
