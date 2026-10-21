@@ -26,6 +26,8 @@
 #   minimaxm3  --place gate: the plan line of `gate_minimaxm3_e2e --plan` at ctx 8192 (the 3090's usable bytes; 333 of the 7,296 routed
 #              experts on the card): routed experts on the host 185.34e9 B (6,963 experts) plus the token embedding 1.31e9 B that
 #              stays on the host, 186.65e9 B, rounded up to 187e9 [derived from the plan's own host terms].
+#              The prefill gate opens the same gate plan at ctx 25: a smaller cache leaves the card at least as many experts,
+#              so the e2e's 187e9 bounds its host bytes [derived].
 gate-gpu-ds41-callstream	-	237600000000
 gate-gpu-ds41-long	m	237600000000
 gate-gpu-ds41-twocard	-	237600000000
@@ -43,6 +45,7 @@ gate-gpu-solar2-e2e	-	131000000000
 gate-gpu-solar2-prefill	-	131000000000
 gate-gpu-solar2-serve	-	131000000000
 gate-gpu-minimaxm3-e2e	-	187000000000
+gate-gpu-minimaxm3-prefill	-	187000000000
 soak-ds41	-	237600000000
 stage-gpu-load-v41	-	237600000000
 stage-gpu-load-v41-lock	-	237600000000
