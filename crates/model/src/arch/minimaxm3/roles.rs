@@ -12,16 +12,8 @@ use crate::arch::classify::{Counts, classify_layers};
 use crate::arch::stems::{Stem, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
-/// Every layer's attention block: the norms, the split projections and the output projection.
-const ATTENTION: &[Stem] = &[
-    req("attn_norm.weight", Role::Attention),
-    req("attn_q.weight", Role::Attention),
-    req("attn_k.weight", Role::Attention),
-    req("attn_v.weight", Role::Attention),
-    req("attn_q_norm.weight", Role::Attention),
-    req("attn_k_norm.weight", Role::Attention),
-    req("attn_output.weight", Role::Attention),
-];
+/// Every layer's attention block, the common table's.
+use crate::arch::stems::ATTENTION;
 
 /// A dense layer's feed-forward block, the common table's.
 use crate::arch::stems::DENSE;

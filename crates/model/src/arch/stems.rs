@@ -57,6 +57,18 @@ pub(crate) const fn join<const N: usize>(parts: &[&[Stem]]) -> [Stem; N] {
     out
 }
 
+/// An attention block with per-head query and key norms: the pre-attention norm, the split q, k
+/// and v projections, the two norms and the output projection.
+pub(crate) const ATTENTION: &[Stem] = &[
+    req("attn_norm.weight", Role::Attention),
+    req("attn_q.weight", Role::Attention),
+    req("attn_k.weight", Role::Attention),
+    req("attn_v.weight", Role::Attention),
+    req("attn_q_norm.weight", Role::Attention),
+    req("attn_k_norm.weight", Role::Attention),
+    req("attn_output.weight", Role::Attention),
+];
+
 /// The hyper-connection tensors a trunk layer carries: the mix of each sublayer's input and
 /// output from the streams, which every family of hyper-connections names alike.
 pub const HC: &[Stem] = &[

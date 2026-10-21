@@ -8,25 +8,12 @@ use gguf::Split;
 
 use super::hparams::Hparams;
 use crate::arch::classify::{Counts, classify_groups};
-use crate::arch::stems::{Stem, req};
-use crate::placement::{ModelTensors, PlacementError, Role};
+use crate::arch::stems::{ATTENTION, MOE_ROUTER, MOE_STACKS, Stem, join};
+use crate::placement::{ModelTensors, PlacementError};
 
 /// The stems every layer carries and nothing else: the attention block with its per-head norms, the
 /// pre-FFN norm, the router and the routed stacks ([`names::LAYER`], in its order).
-pub(super) const STEMS: &[Stem] = &[
-    req("attn_norm.weight", Role::Attention),
-    req("attn_q.weight", Role::Attention),
-    req("attn_k.weight", Role::Attention),
-    req("attn_v.weight", Role::Attention),
-    req("attn_q_norm.weight", Role::Attention),
-    req("attn_k_norm.weight", Role::Attention),
-    req("attn_output.weight", Role::Attention),
-    req("ffn_norm.weight", Role::FfnNorm),
-    req("ffn_gate_inp.weight", Role::Router),
-    req("ffn_gate_exps.weight", Role::RoutedExperts),
-    req("ffn_up_exps.weight", Role::RoutedExperts),
-    req("ffn_down_exps.weight", Role::RoutedExperts),
-];
+pub(super) const STEMS: &[Stem] = &join::<12>(&[ATTENTION, MOE_ROUTER, MOE_STACKS]);
 
 /// Every tensor of `split` with its role and header facts, and the model's
 /// layer and expert counts from `hp`, the file's [`Hparams`].
@@ -68,6 +55,18 @@ mod tests {
             let name = format!("blk.47.{}", s.name);
             assert_eq!(role(&name, 48), Some((s.role, Some(47))), "{name}");
         }
+        assert_eq!(
+            role("blk.47.ffn_norm.weight", 48),
+            Some((Role::FfnNorm, Some(47)))
+        );
+        assert_eq!(
+            role("blk.47.ffn_gate_inp.weight", 48),
+            Some((Role::Router, Some(47)))
+        );
+        assert_eq!(
+            role("blk.47.attn_q.weight", 48),
+            Some((Role::Attention, Some(47)))
+        );
         for name in [
             "blk.48.attn_q.weight",
             "blk.0.attn_qkv.weight",
