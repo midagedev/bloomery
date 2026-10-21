@@ -7,72 +7,66 @@
 use gguf::Split;
 
 use super::hparams::Hparams;
-use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role};
+use crate::arch::classify::{Counts, classify_groups};
+use crate::arch::stems::{Stem, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
-/// The role of a per-layer stem of [`names::LAYER`].
-fn layer_role(stem: &str) -> Option<Role> {
-    match stem {
-        "attn_norm.weight" | "attn_q.weight" | "attn_k.weight" | "attn_v.weight"
-        | "attn_q_norm.weight" | "attn_k_norm.weight" | "attn_output.weight" => {
-            Some(Role::Attention)
-        }
-        "ffn_norm.weight" => Some(Role::FfnNorm),
-        "ffn_gate_inp.weight" => Some(Role::Router),
-        "ffn_gate_exps.weight" | "ffn_up_exps.weight" | "ffn_down_exps.weight" => {
-            Some(Role::RoutedExperts)
-        }
-        _ => None,
-    }
-}
-
-/// A tensor's role and layer by its name; `None` when the table does not
-/// hold it, or its layer is past `n_layer`.
-fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
-    if let Some(model_level) = model_level_role(name) {
-        return Some(model_level);
-    }
-    let (layer, stem) = block_stem(name, n_layer)?;
-    layer_role(stem).map(|r| (r, Some(layer)))
-}
+/// The stems every layer carries and nothing else: the attention block with its per-head norms, the
+/// pre-FFN norm, the router and the routed stacks ([`names::LAYER`], in its order).
+const STEMS: &[Stem] = &[
+    req("attn_norm.weight", Role::Attention),
+    req("attn_q.weight", Role::Attention),
+    req("attn_k.weight", Role::Attention),
+    req("attn_v.weight", Role::Attention),
+    req("attn_q_norm.weight", Role::Attention),
+    req("attn_k_norm.weight", Role::Attention),
+    req("attn_output.weight", Role::Attention),
+    req("ffn_norm.weight", Role::FfnNorm),
+    req("ffn_gate_inp.weight", Role::Router),
+    req("ffn_gate_exps.weight", Role::RoutedExperts),
+    req("ffn_up_exps.weight", Role::RoutedExperts),
+    req("ffn_down_exps.weight", Role::RoutedExperts),
+];
 
 /// Every tensor of `split` with its role and header facts, and the model's
 /// layer and expert counts from `hp`, the file's [`Hparams`].
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
-    classify_with(
+    let e = &hp.experts;
+    classify_groups(
         split,
-        |name| role(name, hp.n_layer),
-        Counts {
-            layers: hp.n_layer,
-            experts: hp.experts.n_expert as u64,
-            experts_used: hp.experts.n_used as u64,
-        },
+        &[STEMS],
+        Counts::new(hp.n_layer, e.n_expert, e.n_used),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::role;
+    use super::STEMS;
+    use crate::arch::classify::role_in;
     use crate::arch::qwen3moe::names;
     use crate::placement::Role;
 
-    /// Every name of the table has its role on its layer; a name the table
-    /// does not hold, or a layer past the model, has none, so `classify`
-    /// lists it.
+    /// A tensor's role and layer by its name over the table.
+    fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
+        role_in(&[STEMS], name, n_layer)
+    }
+
+    /// The table is [`names::LAYER`] with every stem required; every name of it has its role on
+    /// its layer; a name the table does not hold, or a layer past the model, has none, so
+    /// `classify` lists it. Mutant: a stem dropped, or the layer bound `<=`.
     #[test]
     fn the_table_is_exact() {
+        assert!(STEMS.iter().map(|s| s.name).eq(names::LAYER));
+        assert!(STEMS.iter().all(|s| s.required));
         assert_eq!(
             role("token_embd.weight", 48),
             Some((Role::TokenEmbedding, None))
         );
         assert_eq!(role("output.weight", 48), Some((Role::Head, None)));
         assert_eq!(role("output_norm.weight", 48), Some((Role::Head, None)));
-        for stem in names::LAYER {
-            let name = format!("blk.47.{stem}");
-            assert!(
-                matches!(role(&name, 48), Some((_, Some(47)))),
-                "{name} has no role"
-            );
+        for s in STEMS {
+            let name = format!("blk.47.{}", s.name);
+            assert_eq!(role(&name, 48), Some((s.role, Some(47))), "{name}");
         }
         for name in [
             "blk.48.attn_q.weight",
