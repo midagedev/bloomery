@@ -307,7 +307,10 @@ self_test() {
   # One leaves a TERM-ignoring child behind, records its pid and exits 0.
   # shellcheck disable=SC2016 # the stub's own $!, not this shell's
   printf '#!/usr/bin/env bash\n( trap "" TERM; exec sleep 30 ) &\necho $! >"$1"\nexit 0\n' >"$dir/orphan"
-  chmod +x "$dir/code3" "$dir/code78" "$dir/hang" "$dir/stubborn" "$dir/pidhang" "$dir/orphan"
+  # One leaves the same child, records its pid and hangs until TERM ends it.
+  # shellcheck disable=SC2016 # the stub's own $!, not this shell's
+  printf '#!/usr/bin/env bash\n( trap "" TERM; exec sleep 30 ) &\necho $! >"$1"\nsleep 30\n' >"$dir/hangorphan"
+  chmod +x "$dir/code3" "$dir/code78" "$dir/hang" "$dir/stubborn" "$dir/pidhang" "$dir/orphan" "$dir/hangorphan"
 
   check "the binary's own code is returned" 3 runner "$PROG_DIR/mac-gate.sh" "$dir/code3"
   check "the binary's own 78 is returned" 78 runner "$PROG_DIR/mac-gate.sh" "$dir/code78"
@@ -377,18 +380,27 @@ time.sleep(4)
   kill "$holder" 2>/dev/null || true
   wait "$holder" 2>/dev/null || true
 
-  # A gate that exits and leaves a child: the runner returns the gate's code and the child does not outlive it.
-  local orphan_pid
+  # A gate that leaves a TERM-ignoring child, on both ends of the runner: the leader exits, or the bound ends it. The
+  # runner returns the gate's code and the child does not outlive it.
+  # shellcheck disable=SC2329 # invoked below
+  child_gone() {
+    # child_gone <name> <pid file>
+    local pid
+    pid=$(cat "$2" 2>/dev/null)
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      pass=$((pass + 1))
+      echo "self-test $1: PASS"
+    else
+      fail=$((fail + 1))
+      echo "self-test $1: FAIL (pid ${pid:-none} still runs or was not written)"
+      [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null
+    fi
+  }
   check "a gate that exits 0 and leaves a child is 0" 0 runner "$PROG_DIR/mac-gate.sh" "$dir/orphan" "$dir/orphan.pid"
-  orphan_pid=$(cat "$dir/orphan.pid" 2>/dev/null)
-  if [ -n "$orphan_pid" ] && ! kill -0 "$orphan_pid" 2>/dev/null; then
-    pass=$((pass + 1))
-    echo "self-test the child a gate left is gone: PASS"
-  else
-    fail=$((fail + 1))
-    echo "self-test the child a gate left is gone: FAIL (pid ${orphan_pid:-none} still runs or was not written)"
-    [ -n "$orphan_pid" ] && kill -KILL "$orphan_pid" 2>/dev/null
-  fi
+  child_gone "the child a gate left is gone" "$dir/orphan.pid"
+  check "the bound ends a gate that leaves a child with 124" 124 \
+    runner BLOOMERY_GATE_BOUND=1 "$PROG_DIR/mac-gate.sh" "$dir/hangorphan" "$dir/hangorphan.pid"
+  child_gone "the child of a gate the bound ended is gone" "$dir/hangorphan.pid"
 
   echo "self-test: $pass passed, $fail failed"
   [ "$fail" -eq 0 ] || exit 1
