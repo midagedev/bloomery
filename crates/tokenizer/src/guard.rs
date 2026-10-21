@@ -2,8 +2,9 @@
 //!
 //! A special token's spelling in the text is found whole, and a spelling the text begins or finishes
 //! is found by its edge: a template that writes `>` after a name makes `<|im_end|>` of a name that
-//! ends in `<|im_end|`. Every mark is strictly inside the text, so it is never where a token the
-//! template wrote starts or ends beside the text ([`crate::spans_cut`]).
+//! ends in `<|im_end|`. Every mark is strictly inside the text, and inside it after a template's
+//! `trim` as well, so it is never where a token the template wrote starts or ends beside the text
+//! ([`crate::spans_cut`]).
 
 use memchr::memmem::Finder;
 
@@ -44,8 +45,10 @@ impl Spellings {
     /// The ascending byte offsets in `text` where a mark goes, each in `1..text.len()`:
     ///
     /// - beside every spelling the text carries: before it, after it when it starts the text (a
-    ///   template's `startswith` of the spelling still sees it), after its first character when
-    ///   it is the whole text;
+    ///   template's `startswith` of the spelling still sees it), after the spelling's first
+    ///   character when no side of the spelling holds text that is not whitespace, for a
+    ///   template's `trim` would leave the mark at the edge of the text, beside a token the
+    ///   template wrote there;
     /// - before a spelling the text ends in the beginning of, and after the end of one the text
     ///   begins with the end of; a text that is only such a piece gets a mark after its first
     ///   character, and one of a single character none.
@@ -67,12 +70,16 @@ impl Spellings {
             let mut from = 0;
             while let Some(m) = finder.find(&bytes[from..]) {
                 let (start, end) = (from + m, from + m + needle.len());
-                if start > 0 {
+                if start > 0 && !text[..start].trim().is_empty() {
                     at.push(start);
-                } else if end < n {
+                } else if end < n && !text[end..].trim().is_empty() {
                     at.push(end);
                 } else {
-                    at.extend(after_first);
+                    let first = text[start..end]
+                        .chars()
+                        .next()
+                        .expect("a nonempty spelling");
+                    at.push(start + first.len_utf8());
                 }
                 from += m + 1;
             }

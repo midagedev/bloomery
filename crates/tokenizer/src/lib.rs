@@ -26,6 +26,7 @@ use std::path::Path;
 use memchr::memmem::Finder;
 
 pub use decode::Decoder;
+pub use unicode::byte_to_cpt_table;
 pub use vocab::{Specials, attr};
 
 use vocab::{Model, Vocab};
@@ -198,14 +199,16 @@ impl Tokenizer {
     /// `text` with `mark` spliced in beside every spelling of a special token it carries, and beside
     /// the beginning or the end of one it ends or starts with, which what a template writes next to
     /// the text could finish: before the spelling, after it when it starts the text (so a template's
-    /// `startswith` and `endswith` of a spelling see it where it was), and after the text's first
-    /// character when the text is no more than the spelling. The text with the marks cut out is
-    /// `text`, and no special token matches over a mark ([`Tokenizer::encode_marked`]). A spelling
-    /// of one character is left alone, which no mark could be beside without changing what the text
-    /// starts or ends with. What this finds is what `parse_special = true` would turn into a
-    /// token, CONTROL, USER_DEFINED and UNKNOWN alike; the text comes back borrowed when it carries
-    /// none. Spellings that overlap are each marked. What a template builds from its own pieces
-    /// around the text (`'<' ~ name ~ '>'`) is not found: no part of the text is a spelling.
+    /// `startswith` and `endswith` of a spelling see it where it was), and after the spelling's
+    /// first character when no side of the spelling holds text that is not whitespace, for a
+    /// template's `trim` would leave the mark at the edge of the text, beside a token the template
+    /// wrote there. The text with the marks cut out is `text`, and no special token matches over a
+    /// mark ([`Tokenizer::encode_marked`]). A spelling of one character is left alone, which no mark
+    /// could be beside without changing what the text starts or ends with. What this finds is what
+    /// `parse_special = true` would turn into a token, CONTROL, USER_DEFINED and UNKNOWN alike; the
+    /// text comes back borrowed when it carries none. Spellings that overlap are each marked. What a
+    /// template builds from its own pieces around the text (`'<' ~ name ~ '>'`) is not found: no part
+    /// of the text is a spelling.
     ///
     /// # Panics
     ///

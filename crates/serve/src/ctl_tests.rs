@@ -127,26 +127,6 @@ fn templates() -> Vec<(&'static str, &'static str)> {
     all
 }
 
-/// GPT-2's byte to code point table.
-fn byte_chars() -> Vec<char> {
-    let mut kept: Vec<u32> = (33..=126).chain(161..=172).chain(174..=255).collect();
-    let mut cps = kept.clone();
-    let mut extra = 0;
-    for b in 0..256u32 {
-        if !kept.contains(&b) {
-            kept.push(b);
-            cps.push(256 + extra);
-            extra += 1;
-        }
-    }
-    (0..256u32)
-        .map(|b| {
-            let at = kept.iter().position(|&k| k == b).expect("every byte");
-            char::from_u32(cps[at]).expect("a code point")
-        })
-        .collect()
-}
-
 /// A byte-level BPE vocabulary of the 256 byte tokens, one merge and `specials`, the first the BOS and
 /// the second the EOS.
 fn vocabulary(specials: Specials) -> tokenizer::Tokenizer {
@@ -154,7 +134,14 @@ fn vocabulary(specials: Specials) -> tokenizer::Tokenizer {
     use gguf::write::{Layout, Writer};
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let mut texts: Vec<String> = byte_chars().iter().map(char::to_string).collect();
+    let mut texts: Vec<String> = tokenizer::byte_to_cpt_table()
+        .into_iter()
+        .map(|cp| {
+            char::from_u32(cp)
+                .expect("a GPT-2 alphabet code point")
+                .to_string()
+        })
+        .collect();
     let mut types = vec![1; texts.len()];
     texts.push("ab".to_owned());
     types.push(1);
@@ -199,23 +186,6 @@ fn vocabulary(specials: Specials) -> tokenizer::Tokenizer {
 /// The server's tokenizer over the real one: what `bind`'s `Vocab` does for a GGUF file.
 struct Vocab(Arc<tokenizer::Tokenizer>);
 
-struct PieceDecoder {
-    tok: Arc<tokenizer::Tokenizer>,
-    held: Vec<u8>,
-}
-
-impl Decoder for PieceDecoder {
-    fn push(&mut self, id: u32) -> Option<String> {
-        self.held.extend_from_slice(self.tok.piece(id, true));
-        let out = String::from_utf8_lossy(&self.held).into_owned();
-        self.held.clear();
-        (!out.is_empty()).then_some(out)
-    }
-    fn flush(&mut self) -> String {
-        String::new()
-    }
-}
-
 impl Tokenizer for Vocab {
     fn encode(&self, text: &str) -> Vec<u32> {
         self.0.encode(text, false, true)
@@ -230,10 +200,7 @@ impl Tokenizer for Vocab {
         self.0.decode(ids)
     }
     fn decoder(&self) -> Box<dyn Decoder> {
-        Box::new(PieceDecoder {
-            tok: Arc::clone(&self.0),
-            held: Vec::new(),
-        })
+        unreachable!("the chat-control tests do not generate")
     }
     fn bos(&self) -> u32 {
         self.0.specials().bos.expect("a BOS")
@@ -599,8 +566,8 @@ fn the_fixture_conversations_keep_their_ids() {
 }
 
 /// A template that slices a text through its mark leaves a piece of it in the render, and the request
-/// is a 400 naming that; a slice that stops before the mark or after it, and a text with no spelling,
-/// render as they do without the guard.
+/// is a 400 naming that; a slice that stops before the mark, and a text with no spelling, render as
+/// they do without the guard.
 #[test]
 fn a_template_that_cuts_a_guarded_text_apart_is_refused_by_name() {
     let slicing = |n: usize| {
@@ -609,27 +576,76 @@ fn a_template_that_cuts_a_guarded_text_apart_is_refused_by_name() {
     };
     let body = |text: &str| json!({"messages": [{"role": "user", "content": text}]});
     let spelled = body("x<think>y");
-    // The mark, four symbols, stands after `x`: `x` and three of its symbols is a severed mark.
-    let refused =
-        chat_input(&slicing(4).state, object(&spelled)).expect_err("a severed mark is refused");
-    assert_eq!(refused.code, 400);
-    assert!(
-        refused
-            .message
-            .contains("cut a text that carries a special-token spelling apart"),
-        "{}",
-        refused.message
-    );
-    for keep in [1, 5] {
-        let fam = slicing(keep);
-        let (text, prompt) = chat_input(&fam.state, object(&spelled))
-            .unwrap_or_else(|e| panic!("a slice of {keep}: {}", e.message));
-        assert_eq!(text, "x");
-        assert_eq!(prompt.held.ids, fam.tok.encode("x", false, true));
+    // The mark, four symbols, stands after `x`: a slice that keeps two of them leaves a piece of
+    // the mark, one that keeps all four takes the mark whole, and both change the client's text.
+    for keep in [2, 4, 5] {
+        let refused = chat_input(&slicing(keep).state, object(&spelled))
+            .expect_err("a slice that changes the text is refused");
+        assert_eq!(refused.code, 400, "a slice of {keep}");
+        assert!(
+            refused
+                .message
+                .contains("cut a text that carries a special-token spelling apart"),
+            "{}",
+            refused.message
+        );
     }
+    // A slice that stops before the mark renders the text as it is.
+    let fam = slicing(1);
+    let (text, prompt) = chat_input(&fam.state, object(&spelled))
+        .unwrap_or_else(|e| panic!("a slice of 1: {}", e.message));
+    assert_eq!(text, "x");
+    assert_eq!(prompt.held.ids, fam.tok.encode("x", false, true));
     let (text, _) = chat_input(&slicing(4).state, object(&body("no spelling here")))
         .unwrap_or_else(|e| panic!("plain: {}", e.message));
     assert_eq!(text, "no s");
+}
+
+/// A client text a template trims keeps the template's own tokens: the guard's mark is inside the
+/// text, so the trim leaves it there, the turn marker the template writes beside the text stays a
+/// token, and the client's own spelling stays text.
+#[test]
+fn a_trimmed_client_text_keeps_the_turn_markers() {
+    let (name, template) = templates()
+        .into_iter()
+        .find(|(n, _)| *n == "qwen36")
+        .expect("the qwen36 template");
+    let fam = family(name, template);
+    let body = json!({"messages": [{"role": "user", "content": "<think>\n"}]});
+    let (text, ids) = fam.prompt("qwen36/trimmed", &body);
+    let plain = json!({"messages": [{"role": "user", "content": "hi"}]});
+    let (_, base) = fam.prompt("qwen36/plain", &plain);
+    assert_eq!(fam.specials_in(&ids), fam.specials_in(&base), "{ids:?}");
+    assert!(text.contains("<think>"), "{text}");
+    assert_eq!(fam.tok.decode(&ids), text);
+}
+
+/// A tool call's arguments that hold a special token's spelling in JSON escapes keep their text:
+/// the mark the guard uses is one the decoded arguments do not hold, so the text the template
+/// renders is the text the client sent, byte for byte.
+#[test]
+fn escaped_tool_arguments_keep_their_text() {
+    let (name, template) = templates()
+        .into_iter()
+        .find(|(n, _)| *n == "qwen3")
+        .expect("the qwen3 template");
+    let fam = family(name, template);
+    let body = json!({"messages": [
+        {"role": "user", "content": "time?"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "get_time", "arguments": r#"{"q":"\u007e\u007e\u007e\u005e<think>"}"#},
+        }]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "12:00"},
+    ], "tools": [{
+        "type": "function", "function": {
+            "name": "get_time", "description": "d",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+        },
+    }]});
+    let (text, ids) = fam.prompt("qwen3/escaped arguments", &body);
+    assert!(text.contains("~~~^<think>"), "{text}");
+    assert_eq!(fam.tok.decode(&ids), text);
 }
 
 /// A `chat_template_kwargs` value that reaches the template as the client sent it is the client's

@@ -31,12 +31,14 @@
 //! The mark is a few ASCII symbols the request and the template do not hold, so no string of the
 //! render can be mistaken for it, and it passes through the filters a template applies to strings
 //! (`tojson`, `lower`, `trim`, `string`) unchanged. A template that cuts a marked string apart (a
-//! slice through a mark) leaves part of a mark in the render, which [`Guard::finish`] finds and
-//! refuses by name: a prompt with a stray mark in it is never built.
+//! slice through a mark) or that reads it another way renders other text than the marked render
+//! does without its marks, which [`Guard::finish`] finds and refuses by name: a prompt that does
+//! not carry the text the client sent is never built.
 
 use std::borrow::Cow;
 use std::cell::Cell;
 
+use jinja::ChatTemplate;
 use serde_json::{Map, Value};
 
 use crate::engine::Tokenizer;
@@ -54,11 +56,12 @@ pub(crate) enum GuardError {
          marks text with, so it cannot be guarded"
     )]
     NoMark { symbols: &'static str },
-    /// The template cut a marked string apart: a piece of the mark is left in the render.
+    /// The template cut a marked string apart, or read it another way than it reads the text
+    /// without the mark: the text it renders is not the text the client sent.
     #[error(
-        "the chat template cut a text that carries a special-token spelling apart (a piece of the \
-         guard's mark {mark:?} is left in the prompt), so it cannot keep that text as text; send \
-         the text without the spelling"
+        "the chat template cut a text that carries a special-token spelling apart (the text it \
+         renders is not the text the client sent, and the guard's mark {mark:?} does not survive \
+         it), so it cannot keep that text as text; send the text without the spelling"
     )]
     Severed { mark: String },
 }
@@ -79,7 +82,15 @@ impl Pairs {
 
     fn add_value(&mut self, v: &Value) {
         match v {
-            Value::String(s) => self.add(s),
+            // A string that holds JSON is read back by the template as the object it writes, so
+            // the mark must not be in that text either: the pairs of the decoded text are held
+            // as well as the pairs of the string that carries it.
+            Value::String(s) => {
+                self.add(s);
+                if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                    self.add_value(&parsed);
+                }
+            }
             Value::Array(a) => a.iter().for_each(|x| self.add_value(x)),
             Value::Object(o) => {
                 for (k, x) in o {
@@ -109,8 +120,6 @@ impl Pairs {
 pub(crate) struct Guard<'a> {
     tok: &'a dyn Tokenizer,
     mark: String,
-    /// The mark's two pairs: any piece of the mark two symbols long holds one of them.
-    ends: [String; 2],
     /// A string that carries one of these is left as it came ([`Guard::except`]).
     except: Vec<String>,
     /// How many strings came back with a mark in them.
@@ -142,7 +151,6 @@ impl<'a> Guard<'a> {
         Ok(Guard {
             tok,
             mark: format!("{first}{last}"),
-            ends: [first, last],
             except: Vec::new(),
             marked: Cell::new(0),
         })
@@ -278,13 +286,30 @@ impl<'a> Guard<'a> {
     }
 
     /// The rendered prompt `marked` as the text the client sent and the marked string to tokenize,
-    /// `None` when no string was marked. A piece of a mark left in the text is [`GuardError::Severed`].
-    pub(crate) fn finish(&self, marked: String) -> Result<(String, Option<Guarded>), GuardError> {
+    /// `None` when no string was marked. A template that cut a marked text apart, or that read it
+    /// another way than it reads the text without the mark, is [`GuardError::Severed`].
+    pub(crate) fn finish(
+        &self,
+        marked: String,
+        template: &ChatTemplate,
+        vars: &Map<String, Value>,
+    ) -> Result<(String, Option<Guarded>), GuardError> {
         if !self.any() {
             return Ok((marked, None));
         }
         let text = marked.replace(&self.mark, "");
-        if self.ends.iter().any(|piece| text.contains(piece.as_str())) {
+        // What the template renders of the client's text without the mark: a template that cuts
+        // a marked text apart, or that reads it another way, renders other text than the marked
+        // render does without its marks.
+        let encoded = serde_json::to_string(vars).expect("JSON values serialize");
+        let original: Map<String, Value> = serde_json::from_str(&encoded.replace(&self.mark, ""))
+            .expect("guard symbols cannot change JSON syntax");
+        let expected = template
+            .render(&original)
+            .map_err(|_| GuardError::Severed {
+                mark: self.mark.clone(),
+            })?;
+        if text != expected {
             return Err(GuardError::Severed {
                 mark: self.mark.clone(),
             });
@@ -300,7 +325,6 @@ impl<'a> Guard<'a> {
 }
 
 /// A rendered prompt that carries marks, as [`Tokenizer::encode_marked`] reads it.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Guarded {
     text: String,
     mark: String,

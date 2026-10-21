@@ -135,7 +135,7 @@ pub(crate) fn collapse_hf(cpt: u32) -> u8 {
 
 /// GPT-2's byte-level alphabet: the codepoint each byte is written as inside
 /// a vocabulary string (`unicode_byte_to_utf8_map`).
-pub(crate) fn byte_to_cpt_table() -> [u32; 256] {
+pub fn byte_to_cpt_table() -> [u32; 256] {
     let mut table = [0u32; 256];
     let mut assigned = [false; 256];
     for b in (0x21..=0x7E).chain(0xA1..=0xAC).chain(0xAE..=0xFF) {

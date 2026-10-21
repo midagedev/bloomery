@@ -2562,7 +2562,9 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         kind: "server_error",
         message: e.to_string(),
     })?;
-    let (text, guarded) = guard.finish(marked).map_err(guard_error)?;
+    let (text, guarded) = guard
+        .finish(marked, &state.template, &vars)
+        .map_err(guard_error)?;
     Ok(Rendered {
         text,
         guarded,

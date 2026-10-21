@@ -684,7 +684,7 @@ pub fn flatten(
 
 /// [`flatten`] with `text` applied to each text part after the marker check: the text the template
 /// gets for it. The placeholders and a clip's text are the server's and are not passed through it.
-pub fn flatten_with(
+pub(crate) fn flatten_with(
     role: &str,
     parts: &[Value],
     model: &dyn MediaModel,
