@@ -1,0 +1,210 @@
+// The Q4_K mat-vec: y[r] = sum_c W[r, c] * x[c] for one f32 activation vector,
+// W in GGUF block_q4_K layout, one dispatch. Three entries share one body:
+//
+//   q4k_matvec        y = W . x
+//   q4k_matvec_norm   y = W . rms_norm(x, gain, eps): the norm applied as x is
+//                     loaded (norm.metal)
+//   q4k_matvec_resid  y = y + W . x, in place: the residual epilogue
+//
+// Adapted from llama.cpp's kernel_mul_mv_q4_K_f32 (MIT licence; see
+// THIRD_PARTY_NOTICES.md):
+//   ggml/src/ggml-metal/kernels/mul_mv.metal
+// The lane map (ix/it/iq/ir), the four-block loop, the uint16 nibble trick, the
+// row loop over a SIMD group's rows and the simd_sum reduction are llama.cpp's:
+// 2 rows per SIMD group, 2 SIMD groups per threadgroup.
+//
+// What differs from llama.cpp's loop:
+//   - the matrix is not padded: a SIMD group past the last row returns, and each
+//     row's blocks are addressed from a pointer taken once before the loop,
+//     clamped to the last row, so a row past the last re-reads the last row (a
+//     defined access) and is never stored; llama.cpp advances one pointer by a
+//     row's bytes and reads whole threadgroups of rows past the end;
+//   - the variants above.
+//
+// This file comes after norm.metal and defines what the Q6_K and embed files
+// use of it: QK_K, FOR_UNROLL and block_q4_K.
+
+#include <metal_stdlib>
+
+using namespace metal;
+
+#pragma METAL fp contract(off)
+
+#define QK_K 256
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
+
+struct block_q4_K {
+    half    d;
+    half    dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+
+static_assert(sizeof(block_q4_K) == 144, "block_q4_K is 144 bytes");
+static_assert(BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP == 2,
+              "the tail step below is the pair's: it is written for two rows");
+
+template <bool NORM, bool RESID>
+inline void q4k_matvec_body(device const block_q4_K * W,
+                            device const float      * x,
+                            device float            * y,
+                            constant MatvecArgs     & args,
+                            device const float      * gain,
+                            device atomic_uint      * faults,
+                            uint3  tgpig,
+                            ushort tiisg,
+                            ushort sgitg) {
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+    constexpr short NR0 = BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP;
+
+    const short ix = tiisg/8;  // 0...3
+    const short it = tiisg%8;  // 0...7
+    const short iq = it/4;     // 0 or 1
+    const short ir = it%4;     // 0...3
+
+    const int nb = args.nblocks;
+    const int rows = args.rows;
+    const int first_row = (int)(tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS_PER_GROUP + sgitg) * NR0;
+    if (first_row >= rows) {
+        return;
+    }
+    // Each row's blocks, the last row's for a row past the last.
+    device const block_q4_K * rp[NR0];
+    for (short r = 0; r < NR0; ++r) {
+        rp[r] = W + (ulong)min(first_row + r, rows - 1) * (ulong)nb;
+    }
+
+    float yl[16];
+    float yh[16];
+    float sumf[NR0];
+    for (short r = 0; r < NR0; ++r) sumf[r] = 0.f;
+    float sum_sq = 0.f;
+
+    const int y_offset = ix * QK_K + 64 * iq + 8 * ir;
+    device const float * y4 = x + y_offset;
+    device const float * g4 = gain + y_offset;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short i = 0; i < 8; ++i) {
+            float a0 = y4[i+  0];
+            float a1 = y4[i+ 32];
+            float a2 = y4[i+128];
+            float a3 = y4[i+160];
+            if (NORM) {
+                sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
+                a0 *= g4[i+  0];
+                a1 *= g4[i+ 32];
+                a2 *= g4[i+128];
+                a3 *= g4[i+160];
+            }
+            yl[i+0] = a0; sumy[0] += a0;
+            yl[i+8] = a1; sumy[1] += a1;
+            yh[i+0] = a2; sumy[2] += a2;
+            yh[i+8] = a3; sumy[3] += a3;
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            device const uint16_t * sc = (device const uint16_t *)rp[row][ib].scales + iq;
+            device const uint16_t * q1 = (device const uint16_t *)rp[row][ib].qs + 16 * iq + 4 * ir;
+            device const half     * dh = &rp[row][ib].d;
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
+                                  sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+
+        y4 += 4 * QK_K;
+        g4 += 4 * QK_K;
+    }
+
+    float scale = 1.f;
+    if (NORM) {
+        const float sum_squares = simd_sum(sum_sq);
+        scale = rms_scale(sum_squares, (uint)nb * QK_K, args.eps);
+        if (!rms_usable(sum_squares, scale)) {
+            if (tiisg == 0) {
+                raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+                for (short row = 0; row < NR0 && first_row + row < rows; ++row) {
+                    y[first_row + row] = NAN;
+                }
+            }
+            return;
+        }
+    }
+
+    for (short row = 0; row < NR0 && first_row + row < rows; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (NORM) {
+            sum_all *= scale;
+        }
+        if (tiisg == 0) {
+            if (RESID) {
+                y[first_row + row] += sum_all;
+            } else {
+                y[first_row + row] = sum_all;
+            }
+        }
+    }
+}
+
+kernel void q4k_matvec(device const block_q4_K * W [[buffer(0)]],
+                       device const float      * x [[buffer(1)]],
+                       device float            * y [[buffer(2)]],
+                       constant MatvecArgs     & args [[buffer(3)]],
+                       uint3  tgpig [[threadgroup_position_in_grid]],
+                       ushort tiisg [[thread_index_in_simdgroup]],
+                       ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    q4k_matvec_body<false, false>(W, x, y, args, nullptr, nullptr, tgpig, tiisg, sgitg);
+}
+
+kernel void q4k_matvec_norm(device const block_q4_K * W [[buffer(0)]],
+                            device const float      * x [[buffer(1)]],
+                            device float            * y [[buffer(2)]],
+                            constant MatvecArgs     & args [[buffer(3)]],
+                            device const float      * gain [[buffer(4)]],
+                            device atomic_uint      * faults [[buffer(5)]],
+                            uint3  tgpig [[threadgroup_position_in_grid]],
+                            ushort tiisg [[thread_index_in_simdgroup]],
+                            ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    q4k_matvec_body<true, false>(W, x, y, args, gain, faults, tgpig, tiisg, sgitg);
+}
+
+kernel void q4k_matvec_resid(device const block_q4_K * W [[buffer(0)]],
+                             device const float      * x [[buffer(1)]],
+                             device float            * y [[buffer(2)]],
+                             constant MatvecArgs     & args [[buffer(3)]],
+                             uint3  tgpig [[threadgroup_position_in_grid]],
+                             ushort tiisg [[thread_index_in_simdgroup]],
+                             ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    q4k_matvec_body<false, true>(W, x, y, args, nullptr, nullptr, tgpig, tiisg, sgitg);
+}
