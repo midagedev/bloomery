@@ -4,15 +4,16 @@
 //! first-layer word, and word `1 + layer` is that layer's site mask. A
 //! kernel raises it with an atomic minimum on word 0 and an atomic OR on
 //! its own layer's mask — the same two operations the contract's host model
-//! does. The host reads and clears it as atomic words, after the stream it is
-//! asked against has finished its work.
+//! does. The host reads it through the contract's one decoding rule
+//! ([`Fault::read_from`]) and clears it, as atomic words, after the stream it
+//! is asked against has finished its work.
 
 use core::sync::atomic::Ordering;
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
 
-use bloomery_device::fault::{FAULT_NONE, FAULT_WORDS, Fault, FaultWord, LAYER_NONE, mask_index};
+use bloomery_device::fault::{FAULT_NONE, FAULT_WORDS, Fault, FaultWord};
 use bloomery_device::{DeviceError, Elems, Stream};
 
 use crate::buffer::MetalBuffer;
@@ -31,7 +32,7 @@ impl MetalFaultWord {
             buffer: MetalBuffer::new(device, Elems(FAULT_WORDS))?,
         };
         // No stream has seen the buffer yet, so nothing is in flight.
-        word.write_clean();
+        word.write_clean()?;
         Ok(word)
     }
 
@@ -45,43 +46,29 @@ impl MetalFaultWord {
     /// the host model of the word.
     pub fn words(&self, s: &MetalStream) -> Result<Vec<u32>, DeviceError> {
         s.sync()?;
-        Ok(self
-            .buffer
-            .pages()
-            .atomics()
-            .iter()
-            .map(|w| w.load(Ordering::Relaxed))
-            .collect())
+        Ok(self.buffer.pages().to_vec())
     }
 
     /// Word 0 clean and every mask empty.
-    fn write_clean(&self) {
-        let words = self.buffer.pages().atomics();
-        words[0].store(FAULT_NONE, Ordering::Relaxed);
-        for mask in &words[1..] {
-            mask.store(0, Ordering::Relaxed);
+    fn write_clean(&self) -> Result<(), DeviceError> {
+        let pages = self.buffer.pages();
+        pages.store(0, FAULT_NONE, Ordering::Relaxed)?;
+        for i in 1..FAULT_WORDS {
+            pages.store(i, 0, Ordering::Relaxed)?;
         }
+        Ok(())
     }
 }
 
 impl FaultWord<MetalStream> for MetalFaultWord {
     fn read(&self, s: &MetalStream) -> Result<Option<Fault>, DeviceError> {
         s.sync()?;
-        let words = self.buffer.pages().atomics();
-        let first = words[0].load(Ordering::Relaxed);
-        // A word naming a layer past the last has no mask; it reads as a
-        // fault with no sites, as the host model does.
-        let sites = if first == FAULT_NONE || first >> 8 > LAYER_NONE {
-            0
-        } else {
-            words[mask_index(first >> 8)].load(Ordering::Relaxed)
-        };
-        Ok(Fault::from_words(first, sites))
+        let pages = self.buffer.pages();
+        Fault::read_from(|i| pages.load(i, Ordering::Relaxed))
     }
 
     fn clear(&self, s: &MetalStream) -> Result<(), DeviceError> {
         s.sync()?;
-        self.write_clean();
-        Ok(())
+        self.write_clean()
     }
 }

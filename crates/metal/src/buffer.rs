@@ -4,7 +4,8 @@
 //! Every buffer of this backend is `StorageModeShared`: the Mac's memory is
 //! one pool, and a buffer's pages are the host's pages. The `Shared` buffer
 //! is the one the host reads and writes in place; the plain buffer is the
-//! one a kernel binds.
+//! one a kernel binds. Either one's pages are reached on the host only through
+//! the contract's [`HostPages`].
 
 use core::ptr::NonNull;
 
@@ -13,13 +14,12 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice};
 
 use bloomery_device::{
-    Buffer, Bytes, DeviceError, Elem, Elems, Shared, Stream, Window, WindowMut, check_window,
+    BUFFER_ALIGN, Buffer, Bytes, DeviceError, Elem, Elems, HostPages, Shared, Window, WindowMut,
+    buffer_bytes, check_window,
 };
 
 use crate::device::{MetalDevice, buffer_options};
 use crate::handle::Handle;
-use crate::pages::HostPages;
-use crate::stream::MetalStream;
 
 /// A buffer as a Metal kernel binds it: the buffer and the byte offset of its
 /// own start inside its backing store. The window that carries it keeps the
@@ -52,6 +52,50 @@ impl MetalRaw {
         // SAFETY: the caller's contract: the buffer outlives this borrow.
         unsafe { self.buffer.as_ref() }
     }
+
+    /// The host pages of `len` elements of `T` at byte `at` of the buffer:
+    /// a window's own elements, for a copy to or from the host.
+    ///
+    /// # Safety
+    /// `self` is lent by a window of a live buffer whose elements are those
+    /// `len` at byte `at` (the window's range), borrowed for as long as the
+    /// pages live, and the pages keep the rest of [`HostPages::new`]'s
+    /// contract: a read window's pages are only read, and a write window's
+    /// are the only host access to its elements.
+    pub(crate) unsafe fn pages<T: Elem>(
+        &self,
+        at: Bytes,
+        len: Elems,
+    ) -> Result<HostPages<T>, DeviceError> {
+        let offset = self
+            .base
+            .get()
+            .checked_add(at.get())
+            .ok_or_else(|| DeviceError::Range {
+                what: "window",
+                detail: "the window's byte offset wraps".to_string(),
+            })?;
+        // SAFETY: the caller's contract: the buffer lives while `&self` is
+        // held.
+        let contents = unsafe { self.buffer() }.contents().cast::<u8>();
+        // SAFETY: the window's elements lie inside the buffer's bytes (the
+        // caller's contract), so the offset stays inside the allocation
+        // `contents()` addresses.
+        let ptr = unsafe { contents.add(offset) }.cast::<T>();
+        if !ptr.is_aligned() {
+            return Err(DeviceError::Range {
+                what: "window",
+                detail: format!(
+                    "byte {offset} is not aligned for {}-byte elements",
+                    size_of::<T>()
+                ),
+            });
+        }
+        // SAFETY: `len` aligned elements of the window lie at `ptr` and stay
+        // mapped while the window's borrow holds; the caller keeps the rest
+        // of `new`'s contract.
+        Ok(unsafe { HostPages::new(ptr, len) })
+    }
 }
 
 /// A buffer the device holds.
@@ -61,18 +105,13 @@ pub struct MetalBuffer<T: Elem> {
 }
 
 impl<T: Elem> MetalBuffer<T> {
-    /// A buffer of `n` elements, its contents undefined.
+    /// A buffer of `n` elements, its contents undefined. A buffer of no
+    /// elements is refused by name.
     pub(crate) fn new(
         device: &ProtocolObject<dyn MTLDevice>,
         n: Elems,
     ) -> Result<Self, DeviceError> {
-        let bytes = n.bytes_of::<T>()?;
-        if bytes == Bytes::ZERO {
-            return Err(DeviceError::Range {
-                what: "buffer",
-                detail: "a buffer of no elements is refused".to_string(),
-            });
-        }
+        let bytes = buffer_bytes::<T>(n)?;
         let length = NSUInteger::try_from(bytes.get()).map_err(|_| DeviceError::Range {
             what: "buffer",
             detail: format!("{} bytes are more than a Metal buffer holds", bytes.get()),
@@ -83,19 +122,17 @@ impl<T: Elem> MetalBuffer<T> {
                 DeviceError::backend("buffer", "the device made no buffer".to_string())
             })?;
         let ptr = buffer.contents().cast::<T>();
-        if !ptr.is_aligned() {
+        if !ptr.as_ptr().addr().is_multiple_of(BUFFER_ALIGN) {
             return Err(DeviceError::backend(
                 "buffer",
-                format!(
-                    "the buffer's pages are not aligned for {}-byte elements",
-                    core::mem::size_of::<T>()
-                ),
+                format!("the buffer's pages do not start at a multiple of {BUFFER_ALIGN} bytes"),
             ));
         }
         // SAFETY: a shared buffer's `contents()` addresses its `bytes` bytes
-        // of pages, aligned (checked above), for the buffer's whole life; the
-        // buffer is kept in `Self` beside the pages, and every host access to
-        // them goes through this value.
+        // of pages, aligned for every element (checked above), for the
+        // buffer's whole life; the buffer is kept in `Self` beside the pages,
+        // and every host access to them goes through this value or a window's
+        // pages, which borrow it.
         let pages = unsafe { HostPages::new(ptr, n) };
         Ok(Self {
             buffer: Handle(buffer),
@@ -158,11 +195,6 @@ impl<T: Elem> Buffer<T> for MetalBuffer<T> {
         // outlives the window.
         Ok(unsafe { WindowMut::from_raw(self.raw(), at, len) })
     }
-
-    fn read(&self, s: &MetalStream, into: &mut [T]) -> Result<(), DeviceError> {
-        s.sync()?;
-        self.pages.read(into)
-    }
 }
 
 /// A buffer the host and the device share: the same pages. On Metal every
@@ -199,25 +231,11 @@ impl<T: Elem> Buffer<T> for MetalShared<T> {
     ) -> Result<WindowMut<'_, T, MetalDevice>, DeviceError> {
         self.0.window_mut(at, len)
     }
-
-    fn read(&self, s: &MetalStream, into: &mut [T]) -> Result<(), DeviceError> {
-        self.0.read(s, into)
-    }
 }
 
 impl<T: Elem> Shared<T> for MetalShared<T> {
-    fn load(&self, i: usize) -> Result<T, DeviceError> {
-        self.0.pages.load(i)
-    }
-
-    fn store(&mut self, i: usize, v: T) -> Result<(), DeviceError> {
-        self.0.pages.store(i, v)
-    }
-
-    unsafe fn host(&self) -> &[T] {
-        // SAFETY: the caller promises no device work in flight writes the
-        // buffer.
-        unsafe { self.0.pages.as_slice() }
+    fn pages(&self) -> &HostPages<T> {
+        self.0.pages()
     }
 
     unsafe fn host_mut(&mut self) -> &mut [T] {

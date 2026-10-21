@@ -26,8 +26,6 @@ pub mod fault;
 mod handle;
 #[cfg(target_os = "macos")]
 pub mod library;
-#[cfg(any(target_os = "macos", test))]
-mod pages;
 #[cfg(target_os = "macos")]
 pub mod stream;
 

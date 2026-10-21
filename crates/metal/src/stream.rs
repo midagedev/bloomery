@@ -13,7 +13,7 @@
 //! clauses that fail where that does not hold.
 
 use core::time::Duration;
-use std::cell::{Cell, RefCell};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use objc2::rc::Retained;
@@ -39,13 +39,31 @@ pub struct MetalStream {
     queue: Handle<dyn MTLCommandQueue>,
     /// The one event the stream's `record` signals, at rising values.
     timeline: Handle<dyn MTLSharedEvent>,
-    // The contract's `record` and `wait` take `&self`, so the counter and the
-    // list of unfinished buffers are interior; the stream is `Send` and not
-    // `Sync`, so one thread touches them at a time.
+    // The contract's `record` and `wait` take `&self` from any thread, so
+    // the counter and the list of unfinished buffers are behind one lock: a
+    // value is taken and its buffer committed in one step, so the values rise
+    // in commit order.
+    committed: Mutex<Committed>,
+}
+
+/// What a stream has committed.
+struct Committed {
     /// The value the last `record` signals.
-    last: Cell<u64>,
+    last: u64,
     /// The committed command buffers not yet seen complete.
-    pending: RefCell<Vec<CommandBufferHandle>>,
+    pending: Vec<CommandBufferHandle>,
+}
+
+impl Committed {
+    /// Commit `buffer` and register it; the buffers already complete are
+    /// dropped from the list first, so it holds only unfinished work and
+    /// errors not yet reported.
+    fn commit(&mut self, buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>) {
+        self.pending
+            .retain(|b| b.0.status() != MTLCommandBufferStatus::Completed);
+        buffer.commit();
+        self.pending.push(CommandBufferHandle(buffer));
+    }
 }
 
 /// A command buffer being encoded for a stream: made by
@@ -80,9 +98,20 @@ impl MetalStream {
         Ok(Self {
             queue,
             timeline: Handle(timeline),
-            last: Cell::new(0),
-            pending: RefCell::new(Vec::new()),
+            committed: Mutex::new(Committed {
+                last: 0,
+                pending: Vec::new(),
+            }),
         })
+    }
+
+    /// The committed state. A panic while it was held left it whole (every
+    /// change to it is one push or one retain), so a poisoned lock is taken
+    /// as it stands.
+    fn committed(&self) -> MutexGuard<'_, Committed> {
+        self.committed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A command buffer of this stream's queue, not yet committed.
@@ -115,18 +144,8 @@ impl MetalStream {
                 "the recording was made by another stream".to_string(),
             ));
         }
-        self.commit(recording.buffer);
+        self.committed().commit(recording.buffer);
         Ok(())
-    }
-
-    /// Commit `buffer` and register it; the buffers already complete are
-    /// dropped from the list first, so it holds only unfinished work and
-    /// errors not yet reported.
-    fn commit(&self, buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>) {
-        let mut pending = self.pending.borrow_mut();
-        pending.retain(|b| b.0.status() != MTLCommandBufferStatus::Completed);
-        buffer.commit();
-        pending.push(CommandBufferHandle(buffer));
     }
 
     /// Every submitted buffer is done, or `timeout` has passed. Every pending
@@ -134,7 +153,7 @@ impl MetalStream {
     /// returned, and a buffer that did not finish stays pending.
     pub fn sync_for(&self, timeout: Duration) -> Result<(), DeviceError> {
         let deadline = Instant::now() + timeout;
-        let pending = std::mem::take(&mut *self.pending.borrow_mut());
+        let pending = std::mem::take(&mut self.committed().pending);
         let mut first = None;
         let mut unfinished = Vec::new();
         for buffer in pending {
@@ -157,7 +176,7 @@ impl MetalStream {
                 }
             }
         }
-        self.pending.borrow_mut().extend(unfinished);
+        self.committed().pending.extend(unfinished);
         first.map_or(Ok(()), Err)
     }
 }
@@ -183,11 +202,12 @@ impl Stream for MetalStream {
     type Event = MetalEvent;
 
     fn record(&self) -> Result<Self::Event, DeviceError> {
-        let value = self.last.get() + 1;
         let buffer = self.command_buffer()?;
+        let mut committed = self.committed();
+        let value = committed.last + 1;
         buffer.encodeSignalEvent_value(ProtocolObject::from_ref(&*self.timeline), value);
-        self.commit(buffer);
-        self.last.set(value);
+        committed.commit(buffer);
+        committed.last = value;
         Ok(MetalEvent {
             event: self.timeline.clone(),
             value,
@@ -197,7 +217,7 @@ impl Stream for MetalStream {
     fn wait(&self, e: &Self::Event) -> Result<(), DeviceError> {
         let buffer = self.command_buffer()?;
         buffer.encodeWaitForEvent_value(ProtocolObject::from_ref(&*e.event), e.value);
-        self.commit(buffer);
+        self.committed().commit(buffer);
         Ok(())
     }
 
