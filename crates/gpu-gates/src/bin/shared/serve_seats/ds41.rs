@@ -222,7 +222,7 @@ use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotStep, SlotsFrom, TemplateFile,
-    Vocab, arm_screen, bind_server, model_props, official_template, parallel_line, placement_of,
+    Vocab, arm_screen, bind_server, model_props, parallel_line, placement_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, PlaceWhy, lane_at, mode_name};
 use bloomery_gpu_gates::need;
@@ -585,7 +585,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let template = std::mem::take(&mut surface.template);
     let preparation: Option<serve::ChatPreparation> =
-        match official_template(official, a.template_file.path().is_some()) {
+        match official.filter(|_| a.template_file.path().is_none()) {
             Some(official) => {
                 eprintln!("{V41_OFFICIAL}");
                 surface.template = official.to_owned();

@@ -278,34 +278,14 @@ impl TemplateFile {
     }
 }
 
-/// The official prompt encoding a seat serves for a model file of a family
-/// that has one: the encoding when the client gave no template of its own
-/// (`--chat-template-file` absent), else `None`.
-///
-/// The family is the seat's fact; the rule is here, so every family's seat
-/// picks the same one.
-pub fn official_template(
-    official: Option<&'static str>,
-    client_gave_one: bool,
-) -> Option<&'static str> {
-    match official {
-        Some(official) if !client_gave_one => Some(official),
-        _ => None,
-    }
-}
-
-/// The chat surface a seat's file gives the server: the Jinja template, the
-/// model's name, and the request preparation the template's family needs.
+/// The chat surface a seat's file gives the server: the Jinja template and
+/// the model's name.
 pub struct ChatSurface {
     /// `--chat-template-file`'s text where the seat takes the flag, else the
     /// file's `tokenizer.chat_template`.
     pub template: String,
     /// The file's `general.name`, else the seat's default alias.
     pub name: String,
-    /// The family's request preparation, which shapes a request before the
-    /// template renders it; `None` renders the request as the template reads
-    /// it.
-    pub preparation: Option<serve::ChatPreparation>,
 }
 
 impl ChatSurface {
@@ -332,11 +312,7 @@ impl ChatSurface {
             .and_then(|v| v.as_str())
             .unwrap_or(default_alias)
             .to_owned();
-        Ok(ChatSurface {
-            template,
-            name,
-            preparation: None,
-        })
+        Ok(ChatSurface { template, name })
     }
 }
 
@@ -579,9 +555,9 @@ impl SeatFlags {
     }
 
     /// [`bind_server`] over `engine` with these flags: the alias the flag
-    /// gave or `chat`'s, `chat`'s template, no slot file path, `slots`
-    /// slots the seat made at its open, the server settings from `levers`,
-    /// and the side model beside it.
+    /// gave or `chat`'s, `chat`'s template, no request preparation, no slot
+    /// file path, `slots` slots the seat made at its open, the server
+    /// settings from `levers`, and the side model beside it.
     pub fn bind(
         self,
         engine: SeatEngine,
@@ -607,7 +583,7 @@ impl SeatFlags {
                 alias: alias.unwrap_or(chat.name),
                 path,
                 template: chat.template,
-                preparation: chat.preparation,
+                preparation: None,
                 slot_save_path: None,
                 api_keys,
                 parallel: slots,
