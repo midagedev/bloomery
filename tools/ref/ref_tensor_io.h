@@ -1,8 +1,7 @@
 #pragma once
 // The element reads every node dumper shares (dump_ref, dump_mtp, dump_draft, cb_dump): a tensor's
 // file-name stem, the one per-type conversion and the two layouts of its elements. One owner, so a
-// type handled in one dumper cannot fall through to a silent zero in another. Each dumper's build
-// and run scripts hash this header with the dumper's source.
+// type handled in one dumper cannot fall through to a silent zero in another.
 #include "ggml.h"
 
 #include <cstdint>
