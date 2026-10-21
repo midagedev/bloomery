@@ -43,10 +43,23 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
+/// The prefix a template's own refusal (`raise_exception`) carries.
+const REFUSAL: &str = "raise_exception: ";
+
 /// A template that failed to parse or to render.
 #[derive(Debug, thiserror::Error)]
 #[error("chat template: {0}")]
 pub struct TemplateError(pub String);
+
+impl TemplateError {
+    /// The message the template refused the request with, when the template
+    /// refused the request itself (`raise_exception`): the client's request,
+    /// not a fault of the template. `None` for every other error.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&str> {
+        self.0.strip_prefix(REFUSAL)
+    }
+}
 
 fn err<T>(msg: impl Into<String>) -> Result<T, TemplateError> {
     Err(TemplateError(msg.into()))
@@ -1879,7 +1892,7 @@ impl Renderer {
                     ([m], []) | ([], [("message", m)]) => to_str(m)?,
                     _ => return err("raise_exception() takes 1 argument (message)"),
                 };
-                err(format!("raise_exception: {msg}"))
+                err(format!("{REFUSAL}{msg}"))
             }
             Expr::Name(n) if n == "range" => range(&args, &kwargs),
             Expr::Attr(obj, method) => {
