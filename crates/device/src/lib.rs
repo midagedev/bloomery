@@ -9,13 +9,11 @@
 //! clamped: a clamped window is a defined output for an undefined input.
 
 pub mod fault;
-pub mod step;
 
 use core::marker::PhantomData;
 use core::ops::Range;
 
 pub use fault::{FAULT_NONE, Fault, FaultSite, FaultWord, LAYER_HEAD, LAYER_NONE};
-pub use step::{ReplayShape, StepRecord, TokenReplay};
 
 use bloomery_placement::placement::devices::DeviceInfo;
 
@@ -137,11 +135,6 @@ pub enum DeviceError {
 }
 
 impl DeviceError {
-    /// The error a refused range names, with the buffer's size in the text.
-    pub fn range(what: &'static str, detail: String) -> Self {
-        Self::Range { what, detail }
-    }
-
     /// The error a backend failure names.
     pub fn backend(what: &'static str, detail: String) -> Self {
         Self::Backend { what, detail }
@@ -934,6 +927,8 @@ mod tests {
         ] {
             fault::raise(&mut words, 3, site).expect("long enough");
         }
+        // A higher site raised after the lowest keeps the lowest.
+        fault::raise(&mut words, 3, FaultSite::TokenId).expect("long enough");
 
         let fault = fault::Fault::decode(&words)
             .expect("long enough")
@@ -954,6 +949,8 @@ mod tests {
         let mut words = fresh_words();
         fault::raise(&mut words, 7, FaultSite::Logit).expect("long enough");
         fault::raise(&mut words, 2, FaultSite::Router).expect("long enough");
+        // A later layer raised after the earliest keeps the earliest.
+        fault::raise(&mut words, 7, FaultSite::Logit).expect("long enough");
 
         let fault = fault::Fault::decode(&words)
             .expect("long enough")

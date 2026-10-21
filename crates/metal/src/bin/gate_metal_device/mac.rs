@@ -108,7 +108,7 @@ fn launch(
     threads: usize,
     group: usize,
 ) -> Result<(), String> {
-    let recording = stream.begin().map_err(why)?;
+    let mut recording = stream.begin().map_err(why)?;
     {
         let mut encoder = recording.compute_encoder().map_err(why)?;
         encoder.set_pipeline(pipeline);
@@ -317,7 +317,7 @@ fn encoder_refusals(device: &MetalDevice, stream: &MetalStream) -> Clause {
     )?;
     Binding::bytes(&[0u8; MAX_BYTES_BINDING]).map_err(why)?;
 
-    let recording = stream.begin().map_err(why)?;
+    let mut recording = stream.begin().map_err(why)?;
     {
         let mut encoder = recording.compute_encoder().map_err(why)?;
         expect_range(encoder.dispatch(4, 4), "dispatch", "no pipeline")?;

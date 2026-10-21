@@ -57,9 +57,10 @@ pub struct Recording<'s> {
 }
 
 impl Recording<'_> {
-    /// A compute encoder on the recording's command buffer. The recording
-    /// cannot be submitted while the encoder lives.
-    pub fn compute_encoder(&self) -> Result<ComputeEncoder<'_>, DeviceError> {
+    /// A compute encoder on the recording's command buffer. The recording is
+    /// borrowed exclusively while the encoder lives: Metal ends one encoder
+    /// before it starts another, and a recording cannot be submitted mid-encode.
+    pub fn compute_encoder(&mut self) -> Result<ComputeEncoder<'_>, DeviceError> {
         ComputeEncoder::new(&self.buffer)
     }
 }
