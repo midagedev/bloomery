@@ -89,17 +89,22 @@ impl Library {
         }
         #[cfg(not(metal_lib = "metallib"))]
         {
-            Self::source_of(device)
+            Self::source_of(device, SOURCE)
         }
     }
 
     /// The library the runtime compiles from the source.
     pub fn from_source(device: &MetalDevice) -> Result<Self, DeviceError> {
-        Self::source_of(device.handle())
+        Self::source_of(device.handle(), SOURCE)
     }
 
-    fn source_of(device: &Handle<dyn MTLDevice>) -> Result<Self, DeviceError> {
-        let source = NSString::from_str(SOURCE);
+    /// The library the runtime compiles from the given source text.
+    pub fn from_source_text(device: &MetalDevice, text: &str) -> Result<Self, DeviceError> {
+        Self::source_of(device.handle(), text)
+    }
+
+    fn source_of(device: &Handle<dyn MTLDevice>, text: &str) -> Result<Self, DeviceError> {
+        let source = NSString::from_str(text);
         let options = MTLCompileOptions::new();
         options.setMathMode(MTLMathMode::Safe);
         options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);

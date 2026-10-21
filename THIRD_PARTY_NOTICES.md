@@ -32,6 +32,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## llama.cpp (ggml-metal)
+
+`crates/metal/kernels/matvec_q4k.metal` and `crates/metal/kernels/matvec_q6k.metal` are adapted from the Metal
+kernels `kernel_mul_mv_q4_K_f32` and `kernel_mul_mv_q6_K_f32` of llama.cpp (`ggml/src/ggml-metal/kernels/mul_mv.metal`,
+commit `36a73916e`): the lane maps, the block loops, the nibble and 6-bit unpacking, the row loop and the SIMD-group
+reduction are llama.cpp's; each file's header says what differs. The licence is the one above, the ggml authors' MIT
+licence, whose text applies to those two files.
+
 ## cuda-oxide
 
 `crates/oxide-ice-unroll` (a compiler-bug reproducer, excluded from the workspace) carries NVIDIA's
