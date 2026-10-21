@@ -6,7 +6,7 @@
 
 use gguf::Split;
 
-use super::roles::{ATTENTION, DENSE, INDEXER, ROUTED};
+use super::roles::stems_of;
 use crate::arch::hybrid::layers_agree;
 use crate::arch::{
     dims_agree, finite_positive, meta_usize, metadata, n_vocab, noaux, optional_usize, plain_rope,
@@ -220,15 +220,7 @@ impl Hparams {
     /// or misplaced name, with how many more there are.
     fn tensors_agree(&self, split: &Split) -> Result<(), PlacementError> {
         let kinds: Vec<Kind> = (0..self.n_layer).map(|l| self.kind(l)).collect();
-        layers_agree(
-            split,
-            &kinds,
-            |kind| match kind {
-                Kind::Dense => vec![ATTENTION, DENSE],
-                Kind::Sparse => vec![ATTENTION, ROUTED, INDEXER],
-            },
-            &[Kind::Dense, Kind::Sparse],
-        )
+        layers_agree(split, &kinds, stems_of, &[Kind::Dense, Kind::Sparse])
     }
 
     /// Layer `l`'s tensors by stem and the dims llama.cpp creates them with, ggml order.

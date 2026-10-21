@@ -8,7 +8,7 @@
 use gguf::Split;
 use models::KdaGate;
 
-use super::roles::{DENSE, HC, MLA, RDA, ROUTED};
+use super::roles::{KINDS, stems_of};
 use crate::arch::hybrid::{layers_agree, no_nextn};
 use crate::arch::noaux::{self, Experts};
 use crate::arch::{
@@ -257,24 +257,7 @@ impl Hparams {
         let layers: Vec<(Kind, bool)> = (0..self.n_layer)
             .map(|l| (self.kind(l), self.dense(l)))
             .collect();
-        let all = [
-            (Kind::Rda, true),
-            (Kind::Rda, false),
-            (Kind::Mla, true),
-            (Kind::Mla, false),
-        ];
-        layers_agree(
-            split,
-            &layers,
-            |(kind, dense)| {
-                let mixer = match kind {
-                    Kind::Rda => RDA,
-                    Kind::Mla => MLA,
-                };
-                vec![mixer, if dense { DENSE } else { ROUTED }, HC]
-            },
-            &all,
-        )
+        layers_agree(split, &layers, stems_of, &KINDS)
     }
 
     /// Layer `l`'s tensors by stem and the dims llama.cpp creates them with, ggml order.
