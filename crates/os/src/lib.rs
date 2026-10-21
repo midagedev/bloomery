@@ -779,12 +779,19 @@ mod tests {
         let _ = std::fs::remove_file(&there);
     }
 
-    /// The free bytes of a directory are a count.
+    /// The free bytes of a directory are its free blocks times their size, so
+    /// the count is a whole number of 512-byte sectors (every filesystem's
+    /// fragment size is one); a count of blocks without their size is not.
     #[test]
     fn the_free_bytes_of_a_directory_are_counted() {
         let dir = std::env::temp_dir();
         let free = super::free_bytes(&dir).expect("the filesystem answers");
         assert!(free > 0, "the filesystem has room: {free}");
+        assert_eq!(
+            free % 512,
+            0,
+            "free_bytes {free} is not blocks times their size"
+        );
     }
 
     /// The page cache drops the clean pages of a file.

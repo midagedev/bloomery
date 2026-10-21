@@ -886,27 +886,28 @@ const NO_POPULATE_READ: &str = "host populate: this platform has no madvise(MADV
 /// `madvise(MADV_POPULATE_READ)` over `span`, a live sub-slice of a set's
 /// mappings: a shard's read-only file mapping, or the sidecar's, which is its
 /// file's mapping or a resident anonymous copy.
-fn advise_populate(span: &[u8]) -> io::Result<()> {
+fn advise_populate(span: &[u8]) -> Result<(), os::OsError> {
     // SAFETY: `span` is a live slice (the caller's contract above), so its
     // pages are inside one live mapping.
     unsafe { os::advise_populate(span.as_ptr().cast_mut().cast(), span.len()) }
-        .map_err(io::Error::from)
 }
 
 /// Fault the pages of `span` in through `advise` (the madvise call,
 /// [`advise_populate`]); a kernel that does not know the advice (EINVAL,
-/// before Linux 5.14) gets the same pages faulted by a read of one byte each
-/// `page` bytes instead. Any other refusal is the walk's, by name.
+/// before Linux 5.14) or a platform without it ([`os::OsError::Unsupported`])
+/// gets the same pages faulted by a read of one byte each `page` bytes
+/// instead. Any other refusal is the walk's, by name. The error stays typed
+/// through this seam: the fallback reads the variant and the errno.
 fn populate_span(
     span: &[u8],
     page: u64,
-    advise: impl Fn(&[u8]) -> io::Result<()>,
+    advise: impl Fn(&[u8]) -> Result<(), os::OsError>,
 ) -> Result<Populated, String> {
     // SAFETY: `span` is a live slice (the caller's contract above), so its
     // pages are inside one live mapping.
     unsafe {
         os::populate_span(span.as_ptr().cast_mut().cast(), span.len(), page, || {
-            advise(span).map_err(os::OsError::Io)
+            advise(span)
         })
     }
     .map_err(|e| format!("madvise(MADV_POPULATE_READ): {e}"))
@@ -1201,21 +1202,36 @@ mod tests {
     use gguf::write::{Layout, TensorDecl, Writer};
     use gguf::{Split, Weights};
 
-    /// A kernel without `MADV_POPULATE_READ` (EINVAL) gets the span's pages
-    /// read one byte each instead; an advice the kernel takes reads nothing
-    /// more, and any other refusal is named. The madvise call is the seam: the errno comes from
-    /// the test, not from the running kernel.
+    /// A kernel without `MADV_POPULATE_READ` (EINVAL) or a platform without
+    /// it (`Unsupported`) gets the span's pages read one byte each instead; an
+    /// advice the kernel takes reads nothing more, and any other refusal is
+    /// named. The madvise call is the seam: the error comes from the test, not
+    /// from the running kernel.
     #[test]
     fn a_kernel_without_populate_read_reads_a_byte_a_page() {
         let page = 4096u64;
         let span: Vec<u8> = (0..3 * 4096 + 7).map(|i| (i % 251) as u8).collect();
-        let einval = |_: &[u8]| Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        let einval = |_: &[u8]| {
+            Err(os::OsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )))
+        };
         assert_eq!(populate_span(&span, page, einval), Ok(Populated::Touched));
+        let absent = |_: &[u8]| {
+            Err(os::OsError::Unsupported {
+                call: "madvise(MADV_POPULATE_READ)",
+            })
+        };
+        assert_eq!(populate_span(&span, page, absent), Ok(Populated::Touched));
         assert_eq!(
             populate_span(&span, page, |_: &[u8]| Ok(())),
             Ok(Populated::Advised)
         );
-        let enomem = |_: &[u8]| Err(std::io::Error::from_raw_os_error(libc::ENOMEM));
+        let enomem = |_: &[u8]| {
+            Err(os::OsError::Io(std::io::Error::from_raw_os_error(
+                libc::ENOMEM,
+            )))
+        };
         let e = populate_span(&span, page, enomem).unwrap_err();
         assert!(e.starts_with("madvise(MADV_POPULATE_READ): "), "{e}");
         assert_eq!(
