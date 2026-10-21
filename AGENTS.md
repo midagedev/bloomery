@@ -21,7 +21,9 @@ change is checked and merged is in `CONTRIBUTING.md`. A maintainer's machine may
   `just mac-lint` (check and clippy as an x86_64-linux cross check, no linker), `just mac-fmt-check`,
   `just mac-static [BASE]` (fmt-check, lint, the feature combos scoped to BASE's changed files and every check script,
   in parallel; `tools/mac-static.sh`) and the pure crates' native tests (`just mac-test`, the crates
-  `tools/recipes.py pure-crates` selects). A static result is development-loop evidence, not a gate's.
+  `tools/recipes.py pure-crates` selects). A static result is development-loop evidence, not a gate's. The one Mac gate
+  is the Metal backend's: `just lab-metal` (Apple Silicon, macOS 26.2 or later, through `tools/mac-gate.sh`) and
+  `just mac-metal-lint`; `crates/metal` links no cuda-oxide, so plain cargo builds it.
 - **Never time by hand.** The project's numbers come from the runners in `tools/ref/` (`decode-measure.sh`,
   `ab-decode.sh`, `depth-gpu.sh`, `depth-ds41.sh`, `nsys-gpu.sh`, `ncu-gpu.sh` and their recipes), each taking the
   timing lease through `lease_take`: a machine-wide lock, a GPU-idle wait, and witness blocks around every timed
@@ -52,6 +54,7 @@ reference; what follows is the contract.
     just ptx-compare BASE BIN [--features F]   # the add class's proof in one command: BIN's JIT scan at BASE and here as
                               # one table (added, removed, changed); rc 0 = nothing existing moved, 3 changed, 4 removed, 5 both
     just mac-check / mac-lint / mac-fmt-check / mac-static / mac-test   # the Mac's static tier (above)
+    just lab-metal / mac-metal-lint        # the Metal backend's gate and clippy, on an Apple Silicon Mac (above)
     just records-refresh      # tools/bloomery/schema/ and tools/flow/plans/ after a record kind or prompt-call plan
                               # change, each plan at the plan room (tools/ref/plan-room.sh)
     just lab-engram           # the engram IO lab's tests; lab-, not gate-, so no engine landing selects it
@@ -139,8 +142,11 @@ forced_exact count pin, the reference gates).
     crates/runtime/     the generation loop, host only: Target/Verify/Draft, plain and speculative advances
     crates/app/         Session<B> over a GpuModel: open, plan, capture, the card drafts
     crates/serve/       llama-server-compatible HTTP API over an Engine trait
+    crates/record/      the record core: a line's Kind, its render, the schema and the reader (pure)
     crates/refset/      the reference sets' readers and the family table per architecture (src/arch)
     crates/gpu*/        the card engine and its per-family crates; gpu-gates holds the GPU gates and bins
+    crates/device/      the device contract: buffers, windows, streams, events, the fault word, the census (pure)
+    crates/metal/       the Metal backend of that contract, macOS only (an empty library elsewhere)
     crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile; excluded from the workspace
     tools/ref/          C++ harnesses linking ggml, and the timing runners
     tools/bloomery/     the Python side's one reader per fact: records.py, manifest.py
@@ -181,9 +187,10 @@ forced_exact count pin, the reference gates).
   common owners it covers, named in `tools/owners.tsv`), and every family a row in `tools/families.tsv` (rep R or F,
   its own-file globs). `tools/gate_class.py check` (in `just check-recipes`) holds them to the justfile and the arch
   registry. A new model's gates are `family` rows of an F family.
-- **Record lines have one owner:** a `Kind` in `crates/gpu-gates/src/record.rs`, rendered by `Record`, which panics by
-  name on a value out of order, missing or of another type (`<bin> --records-schema` prints the kinds). Readers go
-  through `tools/bloomery/records.py` by kind and field. `generate_ds41 --plan` prints the prompt call's records and
+- **Record lines have one owner:** a `Kind` (the card binaries' kinds in `crates/gpu-gates/src/record.rs`), rendered by
+  `Record` (`crates/record`, the core), which panics by name on a value out of order, missing or of another type
+  (`<bin> --records-schema` prints the kinds). Readers go through `tools/bloomery/records.py` by kind and field.
+  `generate_ds41 --plan` prints the prompt call's records and
   exits before the load; a batched run stops with a named error when the call it ran differs from its printed plan.
   Under `BLOOMERY_STEP_STATS=1`, `tools/flow/ds41_prefill.py --counts <log>` holds the flow model's queue-entry counts
   to the engine's `stat prefill front` and `stat prefill lb` records.

@@ -26,6 +26,11 @@ deny = [
   { crate = "cuda-core", deny-multiple-versions = true },
   { crate = "cuda-bindings", deny-multiple-versions = true },
   { crate = "oxide-artifacts", deny-multiple-versions = true },
+  # The Metal backend's Objective-C bindings, pinned by `=`: two copies give two sets of class and protocol types
+  # that do not unify.
+  { crate = "objc2", deny-multiple-versions = true },
+  { crate = "objc2-foundation", deny-multiple-versions = true },
+  { crate = "objc2-metal", deny-multiple-versions = true },
 ]
 
 [sources]
