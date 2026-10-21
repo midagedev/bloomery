@@ -6883,6 +6883,10 @@ mod ccd_tests {
     /// in: a lane holds the CCD's share of several pairs, so the first unit of
     /// a lane that also fails far above it must not outrank another lane's
     /// failure in between. Nothing steals; both error channels.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the Linux fact it reads: the calling thread's cpu id"
+    )]
     #[test]
     fn a_ccd_dispatch_returns_the_error_of_the_lowest_failing_run() {
         let pool = threads::pool();
@@ -6925,6 +6929,10 @@ mod ccd_tests {
     /// unit's lane. The chunks sorted by their first unit are in lane order,
     /// which is not participant order, so a table by sorted position puts the
     /// time under another index.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the Linux fact it reads: the calling thread's cpu id"
+    )]
     #[test]
     fn a_profiled_ccd_dispatch_counts_busy_time_by_participant() {
         let pool = threads::pool();

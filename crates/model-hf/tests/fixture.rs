@@ -844,12 +844,8 @@ fn run(args: &[&str]) -> (Option<i32>, String, String) {
 
 /// Peak RSS of the largest waited-for child, KiB.
 fn children_peak_kib() -> i64 {
-    let mut ru = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    // SAFETY: `ru` is storage for one `rusage`, which the call fills on success.
-    let rc = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, ru.as_mut_ptr()) };
-    assert_eq!(rc, 0, "getrusage(RUSAGE_CHILDREN)");
-    // SAFETY: the call returned 0, so it wrote every field of `ru`.
-    unsafe { ru.assume_init() }.ru_maxrss
+    let bytes = os::children_max_rss_bytes().expect("getrusage(RUSAGE_CHILDREN)");
+    i64::try_from(bytes / 1024).expect("a peak fits an i64")
 }
 
 fn flip(path: &Path, at: u64) {

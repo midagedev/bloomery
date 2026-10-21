@@ -15,7 +15,8 @@ use super::nodes::{
     NodesError, POST_NS, PoolOver, Terms, Workload, plan_nodes, routed_only,
 };
 use super::workstation::{
-    GB10_NIC, GB10_POOL, GB10_READ, TierBatchBytes, gb10, plan_node_tiers, plan_on, spark_nodes,
+    GB10_NIC, GB10_POOL, GB10_READ, ROW_PAGE, TierBatchBytes, gb10, plan_node_tiers, plan_on,
+    spark_nodes,
 };
 use super::{
     CardFormat, Device, Format, KvBytes, Machine, ModelTensor, ModelTensors, PlacementError, Plan,
@@ -986,7 +987,7 @@ fn n1_is_today() {
     assert_eq!(nvme.serial_nvme, 4 * row);
     let (_, faster_step) = step_of(&plan, n, 2_000_000_000);
     assert_eq!(filled_step - faster_step, 2 * row);
-    row_table_tier(&mut plan, u64::MAX, 0, 1).expect("the table's tier");
+    row_table_tier(&mut plan, u64::MAX, 0, 1, ROW_PAGE).expect("the table's tier");
     assert_eq!(plan.row_tier().expect("one tier"), Some(Device::Host));
     let (t, step) = step_of(&plan, n, 0);
     let serial = (attn * shape.layers as u64 + 1) * row + VOCAB * n * 4;
@@ -1038,7 +1039,7 @@ fn n1_is_today() {
     unread.rows[table].segments[0].format = Format::NvmeFile;
     unread.rows[table].read_bytes = 0;
     let unread = Terms::of(&unread, 2560).expect("the file's unread table");
-    row_table_tier(&mut plan, u64::MAX, 0, 1).expect("the PLE table's tier");
+    row_table_tier(&mut plan, u64::MAX, 0, 1, ROW_PAGE).expect("the PLE table's tier");
     let on_host = Terms::of(&plan, 2560).expect("the file's host terms");
     let gathered = ple.gathered_rows.expect("its rows") * ple.file_bytes
         / ple.dims[1..].iter().product::<u64>();

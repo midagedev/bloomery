@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_cpu_list(s: &str) -> Vec<u32> {
     let mut out = Vec::new();
     for part in s.trim().split(',') {
@@ -42,6 +43,7 @@ pub(crate) struct Topology {
 
 /// `cache/index3/size` as bytes: `32768K`, `32M`, `1G` or a bare count;
 /// `None` for anything else.
+#[cfg(any(target_os = "linux", test))]
 fn parse_cache_size(s: &str) -> Option<u64> {
     let s = s.trim();
     let (digits, unit) = match s.char_indices().last()? {
@@ -58,6 +60,7 @@ fn parse_cache_size(s: &str) -> Option<u64> {
 /// no such file (the topology does not say — a container, a VM). A file that is
 /// there and holds no size, or cannot be read, panics by name: a cap taken from
 /// it must not be a 0 that looks like an absent L3.
+#[cfg(any(target_os = "linux", test))]
 fn l3_size(path: &str, read: std::io::Result<String>) -> u64 {
     match read {
         Ok(text) => parse_cache_size(&text).unwrap_or_else(|| {
@@ -73,11 +76,40 @@ fn l3_size(path: &str, read: std::io::Result<String>) -> u64 {
 /// core is its lowest sibling id. Ported from `crates/q3k-cpu/src/main.rs:324`
 /// (`ccd_topology`), restructured so the physical-core count is recoverable
 /// and a core's cpus stay together.
+#[cfg(target_os = "linux")]
 pub(crate) fn detect_topology() -> Topology {
     detect_with(&|path| std::fs::read_to_string(path))
 }
 
+/// The machine's cpu topology: the performance level's cores and the cache
+/// they share. The platform names no cpu's level, so the performance level
+/// takes the machine's lowest logical cpu ids — one core a physical cpu of
+/// the level — and the cache it shares stands where the L3 stands. The pool
+/// floats on this platform (it has no per-thread mask), so the ids shape
+/// the plan's report and the threads' placement among the level's cores.
+#[cfg(target_os = "macos")]
+pub(crate) fn detect_topology() -> Topology {
+    let levels = os::perf_levels().unwrap_or_else(|e| panic!("the performance levels: {e}"));
+    let Some(performance) = levels.first() else {
+        return Topology {
+            groups: Vec::new(),
+            read: false,
+        };
+    };
+    let cores = (0..performance.physical_cpus)
+        .map(|cpu| vec![cpu])
+        .collect::<Vec<Vec<u32>>>();
+    Topology {
+        groups: vec![CcdGroup {
+            cores,
+            l3_bytes: performance.l2_bytes,
+        }],
+        read: true,
+    }
+}
+
 /// [`detect_topology`] over `read`, the reader of a sysfs file.
+#[cfg(any(target_os = "linux", test))]
 fn detect_with(read: &dyn Fn(&str) -> std::io::Result<String>) -> Topology {
     let read_sys = |path: &str| read(path).ok();
     let mut groups: Vec<(String, Vec<u32>)> = Vec::new(); // (l3 key, primaries)
@@ -659,5 +691,34 @@ mod tests {
     fn a_cpu_list_reads_ranges_and_singles() {
         assert_eq!(parse_cpu_list("0,32\n"), vec![0, 32]);
         assert_eq!(parse_cpu_list("0-3,8"), vec![0, 1, 2, 3, 8]);
+    }
+
+    /// The machine's cpu topology: on the platform that reads sysfs, the
+    /// shared L3 groups it lists; on the platform that names its performance
+    /// levels, the performance level's cores and the cache they share, and
+    /// the pool's default thread count is that level's core count.
+    #[test]
+    fn the_topology_is_the_machines_groups() {
+        #[cfg(target_os = "linux")]
+        {
+            let topology = detect_topology();
+            assert_eq!(topology.read, !topology.groups.is_empty());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let topology = detect_topology();
+            assert!(topology.read, "the performance levels read");
+            assert_eq!(topology.groups.len(), 1, "one performance level");
+            let group = &topology.groups[0];
+            assert!(group.l3_bytes > 0, "the level shares a cache");
+            let cpus: Vec<u32> = group.cores.iter().flat_map(|c| c.iter().copied()).collect();
+            assert_eq!(cpus, (0..group.cores.len() as u32).collect::<Vec<u32>>());
+            // The pool's default thread count is the level's cores.
+            let cores = group.cores.len();
+            let mask: Vec<u32> = (0..cores as u32 + 2).collect();
+            let shape = Shape::of(topology, &mask, None);
+            assert_eq!(shape.threads, cores);
+            assert_eq!(shape.physical, cores);
+        }
     }
 }

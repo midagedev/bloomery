@@ -134,28 +134,7 @@ pub fn mask_cpus() -> Result<Vec<u32>, OsError> {
 /// The machine's logical cpu count (`hw.logicalcpu`).
 #[cfg(target_os = "macos")]
 fn logical_cpus() -> Result<u32, OsError> {
-    let mut n: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>();
-    // SAFETY: `n` is a live `c_int` and `len` its size; the call writes at
-    // most that many bytes into it.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"hw.logicalcpu".as_ptr(),
-            (&raw mut n).cast(),
-            (&raw mut len),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return Err(OsError::Io(std::io::Error::last_os_error()));
-    }
-    u32::try_from(n).map_err(|_| {
-        OsError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "hw.logicalcpu is not a cpu count",
-        ))
-    })
+    sysctl_u32("hw.logicalcpu")
 }
 
 /// Set the calling thread's mask to `cpus`.
@@ -452,6 +431,316 @@ pub fn sync_range(fd: RawFd, _at: libc::off_t, _len: libc::off_t) -> Result<(), 
         return Err(OsError::Io(std::io::Error::last_os_error()));
     }
     Ok(())
+}
+
+// --------------------------------------------------------------------- host
+
+/// The smallest base page a row room can count in, in bytes.
+const MIN_PAGE: u64 = 4096;
+
+/// The host's base page size in bytes: the unit every page-aligned mapping
+/// and every row-room count holds.
+///
+/// Linux and macOS: `sysconf(_SC_PAGESIZE)`. A host whose base page is not
+/// a power of two, or is under [`MIN_PAGE`] bytes, is refused by name: the
+/// row room counts pages, and a page it cannot count in is a page it cannot
+/// size a room in.
+pub fn page_bytes() -> Result<u64, OsError> {
+    // SAFETY: `sysconf` reads no memory of ours and writes none.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        return Err(OsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sysconf(_SC_PAGESIZE) is not a page size",
+        )));
+    }
+    counted_page(page as u64)
+}
+
+/// A base page size the row room can count in: a power of two of at least
+/// [`MIN_PAGE`] bytes.
+fn counted_page(page: u64) -> Result<u64, OsError> {
+    if page < MIN_PAGE || !page.is_power_of_two() {
+        return Err(OsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the base page is {page} B: a power of two of at least {MIN_PAGE} B is what the \
+                 row room counts in"
+            ),
+        )));
+    }
+    Ok(page)
+}
+
+/// The host's memory: what it has, and what this process may use of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostMemory {
+    /// The machine's total memory in bytes.
+    pub total_bytes: u64,
+    /// The memory available to this process, in bytes.
+    pub available_bytes: u64,
+}
+
+/// The host's total and available memory.
+///
+/// Linux: `/proc/meminfo`'s `MemTotal` and `MemAvailable`. macOS: the
+/// machine's `hw.memsize` and its host statistics' free, inactive and
+/// purgeable pages. A field the platform does not report is refused by
+/// name, never read as 0.
+#[cfg(target_os = "linux")]
+pub fn host_memory() -> Result<HostMemory, OsError> {
+    let text = std::fs::read_to_string("/proc/meminfo").map_err(|e| {
+        OsError::Io(std::io::Error::new(
+            e.kind(),
+            format!("read /proc/meminfo: {e}"),
+        ))
+    })?;
+    let (total, available) = meminfo_bytes(&text)?;
+    Ok(HostMemory {
+        total_bytes: total,
+        available_bytes: available,
+    })
+}
+
+/// The host's total and available memory.
+///
+/// Linux: `/proc/meminfo`'s `MemTotal` and `MemAvailable`. macOS: the
+/// machine's `hw.memsize` and its host statistics' free, inactive and
+/// purgeable pages. A field the platform does not report is refused by
+/// name, never read as 0.
+#[cfg(target_os = "macos")]
+pub fn host_memory() -> Result<HostMemory, OsError> {
+    let total_bytes = sysctl_u64("hw.memsize")?;
+    let page = page_bytes()?;
+    let mut statistics = std::mem::MaybeUninit::<libc::vm_statistics64>::uninit();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // The libc crate marks `mach_host_self` deprecated in favour of the
+    // `mach2` crate, which this workspace does not carry; the host's
+    // statistics come through it.
+    #[allow(deprecated)]
+    // SAFETY: `mach_host_self` takes no arguments and touches no memory of
+    // ours; it returns the host port this task may query.
+    let host = unsafe { libc::mach_host_self() };
+    // SAFETY: `statistics` is storage for one `vm_statistics64` and `count`
+    // the number of fields the call writes; the call fills them on success.
+    let rc = unsafe {
+        libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            (&raw mut statistics).cast(),
+            &raw mut count,
+        )
+    };
+    if rc != libc::KERN_SUCCESS {
+        return Err(OsError::Io(std::io::Error::other(format!(
+            "host_statistics64(HOST_VM_INFO64) returned kern_return {rc}"
+        ))));
+    }
+    // SAFETY: the call returned `KERN_SUCCESS`, so it wrote the statistics.
+    let statistics = unsafe { statistics.assume_init() };
+    let pages = statistics
+        .free_count
+        .saturating_add(statistics.inactive_count)
+        .saturating_add(statistics.purgeable_count);
+    Ok(HostMemory {
+        total_bytes,
+        available_bytes: u64::from(pages).saturating_mul(page),
+    })
+}
+
+/// The `MemTotal` and `MemAvailable` of a `/proc/meminfo` text, in bytes.
+#[cfg(target_os = "linux")]
+fn meminfo_bytes(text: &str) -> Result<(u64, u64), OsError> {
+    let kib = |name: &str| {
+        let prefix = format!("{name}:");
+        let value = text
+            .lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .ok_or_else(|| {
+                OsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("the meminfo text has no {name} line"),
+                ))
+            })?;
+        value
+            .trim()
+            .strip_suffix("kB")
+            .map(str::trim_end)
+            .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|d| d.parse::<u64>().ok())
+            .and_then(|kb| kb.checked_mul(1024))
+            .ok_or_else(|| {
+                OsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("the meminfo text's {name} is {value:?}, not a whole number of kB"),
+                ))
+            })
+    };
+    Ok((kib("MemTotal")?, kib("MemAvailable")?))
+}
+
+/// One performance level of the machine: its cores, its threads and the
+/// cache its cores share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PerfLevel {
+    /// The level's physical cores.
+    pub physical_cpus: u32,
+    /// The level's logical cpus.
+    pub logical_cpus: u32,
+    /// The cache the level's cores share, in bytes.
+    pub l2_bytes: u64,
+}
+
+/// The machine's performance levels, the fastest first.
+///
+/// macOS: the `hw.perflevel*` sysctls, one entry a level. Linux: the
+/// platform has no such levels — its cpu topology is read from sysfs — so
+/// the call is refused by name.
+#[cfg(target_os = "macos")]
+pub fn perf_levels() -> Result<Vec<PerfLevel>, OsError> {
+    let count = sysctl_u32("hw.nperflevels")?;
+    let mut levels = Vec::with_capacity(count as usize);
+    for level in 0..count {
+        levels.push(PerfLevel {
+            physical_cpus: sysctl_u32(&format!("hw.perflevel{level}.physicalcpu"))?,
+            logical_cpus: sysctl_u32(&format!("hw.perflevel{level}.logicalcpu"))?,
+            l2_bytes: sysctl_u64(&format!("hw.perflevel{level}.l2cachesize"))?,
+        });
+    }
+    Ok(levels)
+}
+
+/// The machine's performance levels, the fastest first.
+///
+/// macOS: the `hw.perflevel*` sysctls, one entry a level. Linux: the
+/// platform has no such levels — its cpu topology is read from sysfs — so
+/// the call is refused by name.
+#[cfg(target_os = "linux")]
+pub fn perf_levels() -> Result<Vec<PerfLevel>, OsError> {
+    Err(OsError::Unsupported {
+        call: "sysctl(hw.perflevel*)",
+    })
+}
+
+/// This process's peak resident set size, in bytes.
+///
+/// Linux: `getrusage`'s `ru_maxrss`, in kibibytes, in bytes. macOS: the
+/// same field, in bytes as that platform reports it.
+pub fn max_rss_bytes() -> Result<u64, OsError> {
+    max_rss_of(libc::RUSAGE_SELF)
+}
+
+/// The peak resident set size of the largest child this process has waited
+/// for, in bytes, read as [`max_rss_bytes`] reads its own.
+pub fn children_max_rss_bytes() -> Result<u64, OsError> {
+    max_rss_of(libc::RUSAGE_CHILDREN)
+}
+
+fn max_rss_of(who: libc::c_int) -> Result<u64, OsError> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `usage` is storage for one `rusage`, which the call fills.
+    if unsafe { libc::getrusage(who, usage.as_mut_ptr()) } != 0 {
+        return Err(OsError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: the call returned 0, so it wrote every field of `usage`.
+    let usage = unsafe { usage.assume_init() };
+    Ok(rss_bytes(usage.ru_maxrss))
+}
+
+/// The peak resident set `maxrss` holds, in bytes: Linux counts it in
+/// kibibytes, macOS in bytes.
+#[cfg(target_os = "linux")]
+fn rss_bytes(maxrss: libc::c_long) -> u64 {
+    u64::try_from(maxrss.max(0))
+        .unwrap_or(0)
+        .saturating_mul(1024)
+}
+
+/// The peak resident set `maxrss` holds, in bytes: Linux counts it in
+/// kibibytes, macOS in bytes.
+#[cfg(target_os = "macos")]
+fn rss_bytes(maxrss: libc::c_long) -> u64 {
+    u64::try_from(maxrss.max(0)).unwrap_or(0)
+}
+
+/// The `u32` the named sysctl holds.
+#[cfg(target_os = "macos")]
+fn sysctl_u32(name: &str) -> Result<u32, OsError> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let c = std::ffi::CString::new(name)
+        .map_err(|e| OsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    // SAFETY: `value` is a live `c_int` and `len` its size; the call writes
+    // at most that many bytes into it.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c.as_ptr(),
+            (&raw mut value).cast(),
+            (&raw mut len),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(sysctl_refused(name));
+    }
+    if len != std::mem::size_of::<libc::c_int>() {
+        return Err(sysctl_width(name, len));
+    }
+    u32::try_from(value).map_err(|_| {
+        OsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{name} is not a count"),
+        ))
+    })
+}
+
+/// The `u64` the named sysctl holds.
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &str) -> Result<u64, OsError> {
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let c = std::ffi::CString::new(name)
+        .map_err(|e| OsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    // SAFETY: `value` is a live `u64` and `len` its size; the call writes at
+    // most that many bytes into it.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c.as_ptr(),
+            (&raw mut value).cast(),
+            (&raw mut len),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(sysctl_refused(name));
+    }
+    // A 4-byte value fills the low half of the zeroed `u64`, which is the
+    // same number on this little-endian platform.
+    if len != std::mem::size_of::<u64>() && len != std::mem::size_of::<u32>() {
+        return Err(sysctl_width(name, len));
+    }
+    Ok(value)
+}
+
+/// The named sysctl's refusal, with the call's errno.
+#[cfg(target_os = "macos")]
+fn sysctl_refused(name: &str) -> OsError {
+    let e = std::io::Error::last_os_error();
+    OsError::Io(std::io::Error::new(
+        e.kind(),
+        format!("sysctlbyname({name}): {e}"),
+    ))
+}
+
+/// A sysctl whose value has a width the reader does not take.
+#[cfg(target_os = "macos")]
+fn sysctl_width(name: &str, len: usize) -> OsError {
+    OsError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("sysctlbyname({name}) wrote {len} B, not an integer this reader takes"),
+    ))
 }
 
 // ------------------------------------------------------------------- memory
@@ -807,7 +1096,15 @@ mod tests {
         let dropped = super::fadvise_dontneed(fd, 0, 8);
         let _ = std::fs::remove_file(&p);
         #[cfg(target_os = "linux")]
-        dropped.expect("the pages drop");
+        {
+            dropped.expect("the pages drop");
+            // The call reaches the kernel: a closed descriptor is refused.
+            let e = super::fadvise_dontneed(-1, 0, 8).expect_err("no file is open at -1");
+            assert!(
+                matches!(&e, OsError::Io(io) if io.raw_os_error() == Some(libc::EBADF)),
+                "{e}"
+            );
+        }
         #[cfg(target_os = "macos")]
         {
             let e = dropped.expect_err("the platform has no call");
@@ -830,6 +1127,12 @@ mod tests {
         };
         super::sync_range(fd, 0, 8).expect("the bytes are written out");
         let _ = std::fs::remove_file(&p);
+        // The call reaches the kernel: a closed descriptor is refused.
+        let e = super::sync_range(-1, 0, 8).expect_err("no file is open at -1");
+        assert!(
+            matches!(&e, OsError::Io(io) if io.raw_os_error() == Some(libc::EBADF)),
+            "{e}"
+        );
     }
 
     /// The pages of a span are faulted in: by the platform's advice where it
@@ -869,5 +1172,123 @@ mod tests {
         );
         #[cfg(target_os = "macos")]
         assert_eq!(vec[0] & 1, 1, "the first page is resident: {vec:?}");
+    }
+
+    /// The base page is a power of two of at least 4 KiB: the row room counts
+    /// pages, and a page it cannot count in is a page it cannot size a room
+    /// in.
+    #[test]
+    fn the_base_page_is_a_power_of_two_of_at_least_four_kibibytes() {
+        let page = super::page_bytes().expect("the base page reads");
+        assert!(page >= 4096, "the base page is {page} B");
+        assert!(page.is_power_of_two(), "the base page is {page} B");
+        // x86_64 Linux: the base page is 4 KiB (aarch64 kernels may take 16
+        // or 64 KiB).
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(page, 4096, "the kernel's base page");
+        // macOS: the kernel's base page is 16 KiB on Apple silicon.
+        #[cfg(target_os = "macos")]
+        assert!(page >= 16384, "the base page is {page} B");
+        // A page the row room cannot count in is refused by name.
+        assert_eq!(super::counted_page(4096).expect("4 KiB counts"), 4096);
+        assert_eq!(super::counted_page(16384).expect("16 KiB counts"), 16384);
+        for bad in [0u64, 1, 3000, 4095, 5000] {
+            let why = super::counted_page(bad).expect_err("the page cannot be counted in");
+            assert!(why.to_string().contains(&bad.to_string()), "{why}");
+        }
+    }
+
+    /// The host's total and available memory, in bytes: the platform's own
+    /// reading, with the total the machine has and the available no more
+    /// than it.
+    #[test]
+    fn the_host_memory_names_its_total_and_its_available_bytes() {
+        let memory = super::host_memory().expect("the host memory reads");
+        assert!(memory.total_bytes > 0, "the host has memory");
+        assert!(memory.available_bytes > 0, "the host has memory available");
+        // Linux: the reading is `/proc/meminfo`'s own lines.
+        #[cfg(target_os = "linux")]
+        {
+            // `MemAvailable` moves between two reads; `MemTotal` does not.
+            assert!(memory.available_bytes <= memory.total_bytes);
+            let text = std::fs::read_to_string("/proc/meminfo").expect("meminfo reads");
+            let (total, _) = super::meminfo_bytes(&text).expect("the meminfo lines read");
+            assert_eq!(memory.total_bytes, total);
+        }
+        // macOS: the total is the machine's `hw.memsize`.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            memory.total_bytes,
+            super::sysctl_u64("hw.memsize").expect("hw.memsize reads")
+        );
+    }
+
+    /// The `MemTotal` and `MemAvailable` of a `/proc/meminfo` text, in
+    /// bytes; a text without the line, or with a value that is not a whole
+    /// number of kB, is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn meminfo_reads_its_lines_in_kb() {
+        let text = "MemTotal:       263741212 kB\nMemFree:         1234567 kB\n\
+                    MemAvailable:   257300180 kB\nBuffers:            1234 kB\n";
+        assert_eq!(
+            super::meminfo_bytes(text).expect("the lines read"),
+            (263_741_212 * 1024, 257_300_180 * 1024)
+        );
+        assert!(super::meminfo_bytes("MemTotal: 1 kB\n").is_err());
+        assert!(super::meminfo_bytes("MemAvailable:   12x kB\n").is_err());
+        assert!(super::meminfo_bytes("MemAvailable:   12 MB\n").is_err());
+        assert!(super::meminfo_bytes("MemAvailable:    kB\n").is_err());
+    }
+
+    /// The machine's performance levels: their cores, their threads and the
+    /// cache they share. The platform with no such levels refuses the call
+    /// by name.
+    #[test]
+    fn the_machine_names_its_performance_levels() {
+        // Linux: the platform has no performance levels.
+        #[cfg(target_os = "linux")]
+        {
+            let e = super::perf_levels().expect_err("the platform has no performance levels");
+            assert!(
+                matches!(e, OsError::Unsupported { call } if call == "sysctl(hw.perflevel*)"),
+                "{e}"
+            );
+        }
+        // macOS: the machine names its levels, their cores and their cache.
+        #[cfg(target_os = "macos")]
+        {
+            let levels = super::perf_levels().expect("the performance levels read");
+            assert!(!levels.is_empty(), "the machine names a level");
+            for level in levels {
+                assert!(level.physical_cpus > 0, "the level has cores");
+                assert!(level.logical_cpus >= level.physical_cpus);
+                assert!(level.l2_bytes > 0, "the level has a cache");
+            }
+        }
+    }
+
+    /// This process's peak resident set, in bytes: the platform's own unit
+    /// widened to bytes.
+    #[test]
+    fn the_peak_resident_set_is_in_bytes() {
+        let bytes = super::max_rss_bytes().expect("the peak resident set reads");
+        assert!(bytes > 0, "the process holds memory");
+        // Linux: `ru_maxrss` counts kibibytes, so the bytes are a whole
+        // number of them.
+        #[cfg(target_os = "linux")]
+        assert_eq!(bytes % 1024, 0, "the bytes are whole kibibytes: {bytes}");
+        // Both: a test process holds more than a mebibyte and less than the
+        // machine, so a count left in kibibytes, or multiplied once more, is
+        // out of range.
+        let total = super::host_memory()
+            .expect("the host memory reads")
+            .total_bytes;
+        assert!(
+            (1 << 20..=total).contains(&bytes),
+            "the peak is {bytes} B on a {total} B host"
+        );
+        let children = super::children_max_rss_bytes().expect("the children's peak reads");
+        assert!(children <= total, "the children's peak is {children} B");
     }
 }

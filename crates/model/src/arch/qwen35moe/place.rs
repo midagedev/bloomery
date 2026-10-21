@@ -479,7 +479,8 @@ impl PlanInputs {
             )?;
             let room = plan.plan_at(&self.room);
             let floor = 2 * self.seq_state_bytes(ctx_max, None);
-            placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
+            let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
+            placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED, page)?;
             plan.host.step_slots(1, placement::STEP_PORT_COLUMNS)?;
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             Ok(plan)
@@ -660,7 +661,8 @@ impl PlanInputs {
             };
             let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
             let room = plan.plan_at(&self.room);
-            placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
+            let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
+            placement::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED, page)?;
             plan.host
                 .step_slots(beside.slots, placement::STEP_PORT_COLUMNS)?;
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
@@ -3433,7 +3435,12 @@ mod tests {
                     assert_eq!(plan.row_tier().unwrap(), Some(placement::Device::Nvme));
                     assert_eq!(
                         plan.host.row_reserve_bytes,
-                        placement::row_room(&inputs.model, super::super::UBATCH_PLANNED).unwrap()
+                        placement::row_room(
+                            &inputs.model,
+                            super::super::UBATCH_PLANNED,
+                            os::page_bytes().expect("the base page reads")
+                        )
+                        .unwrap()
                     );
                     assert_eq!(plan.tier_n_l, vec![vec![owned[1]; LAYERS]]);
                     assert!(plan.n_l.iter().all(|&n| n <= owned[0]));

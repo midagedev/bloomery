@@ -38,17 +38,10 @@ use super::{Device, ExpertList, Format, ModelTensor, PlacementError, Plan, Segme
 use crate::r8file::{R8Error, R8Source, Sidecar};
 
 /// Bytes per page of this host (`sysconf(_SC_PAGESIZE)`), the unit a lock is
-/// taken and counted in; a host that does not answer is refused by name.
+/// taken and counted in; a host whose base page the row room cannot count in
+/// is refused by name.
 pub fn page_bytes() -> Result<u64, PlacementError> {
-    // SAFETY: `sysconf` reads a static system value and touches no memory of
-    // ours.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u64::try_from(page).ok().filter(|&p| p > 0).ok_or_else(|| {
-        PlacementError::Host(format!(
-            "sysconf(_SC_PAGESIZE) returned {page}: {}",
-            io::Error::last_os_error()
-        ))
-    })
+    os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))
 }
 
 /// About how many chunks, a thread each, a walk cuts a set into: several
@@ -862,12 +855,44 @@ pub(crate) fn drop_pages(
         libc::off_t::try_from(v)
             .map_err(|_| PlacementError::Host(format!("{name} offset {v} passes off_t")))
     };
-    os::fadvise_dontneed(file.as_raw_fd(), off(first)?, off(end - first)?).map_err(|e| {
+    drop_cached_pages(file.as_raw_fd(), off(first)?, off(end - first)?).map_err(|e| {
         PlacementError::Host(format!(
             "posix_fadvise(DONTNEED) of {name} bytes {first}..{end}: {e}"
         ))
     })?;
     Ok(end - first)
+}
+
+/// The line a page drop prints once when the platform has no
+/// `posix_fadvise(DONTNEED)`: the page cache keeps the pages the call would
+/// have dropped.
+const NO_FADVISE: &str = "host pages: this platform has no posix_fadvise(DONTNEED), so the page \
+                          cache keeps the pages";
+
+/// Whether the line has been printed already.
+static SAID_FADVISE: AtomicBool = AtomicBool::new(false);
+
+/// Drop the clean pages of `fd` over `at .. at + len` from the page cache,
+/// where the platform has such a call. A platform without one keeps its
+/// pages: the refusal is the platform saying so, the line says it once, and
+/// the drop goes on. Any other error is the caller's to refuse.
+pub(crate) fn drop_cached_pages(
+    fd: std::os::fd::RawFd,
+    at: libc::off_t,
+    len: libc::off_t,
+) -> Result<(), os::OsError> {
+    match os::fadvise_dontneed(fd, at, len) {
+        Ok(()) => Ok(()),
+        Err(os::OsError::Unsupported {
+            call: "posix_fadvise",
+        }) => {
+            if !SAID_FADVISE.swap(true, Ordering::Relaxed) {
+                eprintln!("{NO_FADVISE}");
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The line a populate prints once when the kernel has no

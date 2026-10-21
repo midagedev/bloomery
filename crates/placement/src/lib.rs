@@ -21,10 +21,11 @@
 //!
 //! What does not live here, because the Mac cannot run it: the host tier's
 //! page locks and residency walks (`bloomery-model`'s
-//! `placement::host_lock`), the reading of `/proc/meminfo`
-//! (`placement::workstation::host_available`) and the r8 sidecar's writer
-//! and checker (`r8file`, which re-exports this crate's [`r8`]: the refusal
-//! type the planner's error wraps).
+//! `placement::host_lock`) and the r8 sidecar's writer and checker
+//! (`r8file`, which re-exports this crate's [`r8`]: the refusal
+//! type the planner's error wraps). The host's own memory is read by
+//! `bloomery-os`; the arithmetic of the room that reading gives is here
+//! ([`placement::workstation::host_room`]).
 
 pub mod accepts;
 pub mod kernels;

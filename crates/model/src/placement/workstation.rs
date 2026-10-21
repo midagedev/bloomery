@@ -5,15 +5,17 @@
 
 pub use bloomery_placement::placement::workstation::*;
 
-/// The host's available bytes now ([`host_room`]): the smaller of
-/// [`mem_available`] of `/proc/meminfo` and the room under every cgroup v2
-/// memory limit above this process — inside a container (`docker run
-/// --memory`), a systemd scope (`MemoryMax`) or a pod, `/proc/meminfo`
-/// still shows the whole machine, and the limit's room is the reading that
-/// binds. `BLOOMERY_HOST_ROOM` set (bytes, `M` and `G` binary units, a
-/// parsed lever) replaces both, read [`HostRead::Given`]; a value that is
-/// not bytes is refused by name. A base page size other than [`ROW_PAGE`]
-/// is refused even when the room is supplied by the caller.
+/// The host's available bytes now ([`host_room`]): the smaller of the
+/// platform's own reading of the host's memory — Linux's `MemAvailable` in
+/// `/proc/meminfo`, macOS's free, inactive and purgeable pages — and the
+/// room under every cgroup v2 memory limit above this process — inside a
+/// container (`docker run --memory`), a systemd scope (`MemoryMax`) or a
+/// pod, the platform's reading still shows the whole machine, and the
+/// limit's room is the reading that binds. `BLOOMERY_HOST_ROOM` set
+/// (bytes, `M` and `G` binary units, a parsed lever) replaces both, read
+/// [`HostRead::Given`]; a value that is not bytes is refused by name. A
+/// base page the row room cannot count in is refused even when the room is
+/// supplied by the caller.
 pub fn host_available() -> Result<u64, String> {
     host_available_read().map(|(bytes, _)| bytes)
 }
@@ -21,18 +23,14 @@ pub fn host_available() -> Result<u64, String> {
 /// [`host_available`] with the reading that decided ([`HostRead`]), for
 /// every refusal and line that prints the bytes to name.
 pub fn host_available_read() -> Result<(u64, HostRead), String> {
-    let page = super::host_lock::page_bytes().map_err(|e| e.to_string())?;
-    if page != ROW_PAGE {
-        return Err(format!(
-            "sysconf(_SC_PAGESIZE) is {page} B; row room requires {ROW_PAGE} B pages"
-        ));
-    }
+    // The base page the row room counts in: a page the platform cannot
+    // count in is refused by name, before the room is read.
+    os::page_bytes().map_err(|e| e.to_string())?;
     let levers = bloomery_levers::nvtier_levers().map_err(|e| e.to_string())?;
     if let Some(room) = levers.host_room {
         return Ok((room, HostRead::Given));
     }
-    let meminfo =
-        std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("read /proc/meminfo: {e}"))?;
+    let memory = os::host_memory().map_err(|e| e.to_string())?;
     let levels = cgroup_levels()?;
     let texts: Vec<CgroupLevel<'_>> = levels
         .iter()
@@ -43,7 +41,21 @@ pub fn host_available_read() -> Result<(u64, HostRead), String> {
             stat,
         })
         .collect();
-    host_room(&meminfo, &texts)
+    host_room(memory.available_bytes, platform_reading(), &texts)
+}
+
+/// The platform's own reading of the host's available bytes, as the host
+/// room names it.
+#[cfg(target_os = "linux")]
+fn platform_reading() -> HostRead {
+    HostRead::MemAvailable
+}
+
+/// The platform's own reading of the host's available bytes, as the host
+/// room names it.
+#[cfg(target_os = "macos")]
+fn platform_reading() -> HostRead {
+    HostRead::VmStats
 }
 
 /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gives the NVMe expert tier
@@ -118,22 +130,29 @@ fn cgroup_levels() -> Result<Vec<(String, String, String, String)>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ROW_PAGE, host_available_read};
+    use super::host_available_read;
 
+    /// The host's room reads on this platform, named by the platform's own
+    /// reading, and the base page the row room counts in is one the
+    /// platform can count in.
     #[test]
-    fn host_room_refuses_another_row_page() {
-        let page = crate::placement::host_lock::page_bytes().expect("host page size");
-        let reading = host_available_read();
-        if page == ROW_PAGE {
-            assert!(reading.is_ok(), "{reading:?}");
-        } else {
-            let why = reading
-                .as_ref()
-                .expect_err("a row page other than the planner's must be refused");
-            assert!(why.contains("sysconf(_SC_PAGESIZE)"), "{why}");
-            assert!(why.contains(&page.to_string()), "{why}");
-            assert!(why.contains(&ROW_PAGE.to_string()), "{why}");
-        }
-        eprintln!("host page {page} B, row room: {reading:?}");
+    fn the_host_room_reads_on_this_platform() {
+        let page = crate::placement::host_lock::page_bytes().expect("the base page reads");
+        assert!(page >= 4096, "the base page is {page} B");
+        assert!(page.is_power_of_two(), "the base page is {page} B");
+        let (bytes, read) = host_available_read().expect("the host room reads");
+        assert!(bytes > 0, "the host has memory available");
+        // Linux: the room is `/proc/meminfo`'s `MemAvailable`. macOS: the
+        // host statistics' free, inactive and purgeable pages.
+        // A cgroup limit above this process, or `BLOOMERY_HOST_ROOM`, may name
+        // the reading in place of the platform's own.
+        let word = read.word();
+        #[cfg(target_os = "linux")]
+        assert!(
+            word == "MemAvailable" || word.starts_with("cgroup:") || word == "given",
+            "{word}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(word == "vmstats" || word == "given", "{word}");
     }
 }

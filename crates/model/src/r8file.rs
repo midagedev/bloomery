@@ -516,10 +516,11 @@ fn sync_and_drop(file: &File, path: &Path, range: Range<u64>) -> Result<(), Mode
 }
 
 /// `posix_fadvise(DONTNEED)` over `range`: the kernel drops the clean pages
-/// that lie wholly inside it and no process maps.
+/// that lie wholly inside it and no process maps. A platform with no such
+/// call keeps its pages, and the drop goes on.
 fn drop_cached(file: &File, path: &Path, range: Range<u64>) -> Result<(), ModelError> {
     let (at, len) = (off(path, range.start)?, off(path, range.end - range.start)?);
-    os::fadvise_dontneed(file.as_raw_fd(), at, len)
+    crate::placement::host_lock::drop_cached_pages(file.as_raw_fd(), at, len)
         .map_err(|e| io_err(path, "posix_fadvise(DONTNEED)", e.into()))
 }
 

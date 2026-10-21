@@ -506,14 +506,17 @@ levers 0 0 0
 # compute call (ops.rs dispatch_ccd, over each run of a block) and the warm walk's prefetch (ops.rs warm_touch), each
 # with its SAFETY line, and the cut test's RowSet double (ccd_tests::Pairs, whose `unsafe fn compute` the trait
 # makes unsafe).
-model 109 31 13
+model 108 31 13
 # model-hf: the four blocks that left model (119 -> 115) with the fixture bin and its test, the page-fault reads (`getrusage`),
 # each with its SAFETY line; no new unsafe.
-model-hf 4 0 0
+model-hf 0 0 0
 models 0 0 0
 # PIN(2026-10-21): os 24 blocks, 5 fns, not old code relaxed: the host chain's OS calls moved here from threads,
 # gguf, engram and model (their pins come down), each beside its macOS body, each block with its SAFETY line.
-os 24 5 0
+# PIN(2026-10-21): os 24 -> 31 blocks, new code, not old code relaxed: the base page (moved from model's host_lock),
+# the peak resident set (moved from model-hf's four), and macOS's host memory (mach_host_self, host_statistics64)
+# and sysctl reads; model and model-hf come down by the five that moved.
+os 31 5 0
 placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row
 # lanes (pack_lanes_avx2, dot_lanes_avx2 and their helpers transpose8_epi32, transpose8_ps, lane_codes: five

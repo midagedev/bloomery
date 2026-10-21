@@ -136,8 +136,9 @@ const _: () = assert!(PLAN_ROOM == HOST_USABLE - OS_OTHER);
 /// ([`super::row_table_tier`] replaces it with [`super::row_room`]).
 pub const ROW_CACHE: u64 = 4_294_967_296;
 
-/// The page the row room counts in ([`super::row_room`]). The host-room
-/// read refuses a host whose base page size differs.
+/// This workstation's base page, the unit its row room counts in
+/// ([`super::row_room`]). A host on another base page passes its own page
+/// to the row room, and the row room counts the pages a row sits on.
 pub const ROW_PAGE: u64 = 4096;
 
 /// What the machine's [`OS_OTHER`] is called: what the OS and every other
@@ -1248,31 +1249,16 @@ impl HostNeed {
     }
 }
 
-/// `MemAvailable` of a `/proc/meminfo` text, in bytes. A text with no such
-/// line (a kernel before 3.14), or one whose value is not a whole number of
-/// kB, is refused by name.
-pub fn mem_available(meminfo: &str) -> Result<u64, String> {
-    let line = meminfo
-        .lines()
-        .find_map(|l| l.strip_prefix("MemAvailable:"))
-        .ok_or("the meminfo text has no MemAvailable line")?;
-    line.trim()
-        .strip_suffix("kB")
-        .map(str::trim_end)
-        .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|d| d.parse::<u64>().ok())
-        .and_then(|kb| kb.checked_mul(1024))
-        .ok_or_else(|| {
-            format!("the meminfo text's MemAvailable is {line:?}, not a whole number of kB")
-        })
-}
-
 /// Which reading of the host's available bytes decided ([`host_room`]):
-/// `MemAvailable`, or the room under a cgroup v2 memory limit.
+/// the platform's own, or the room under a cgroup v2 memory limit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostRead {
     /// `/proc/meminfo`'s `MemAvailable`.
     MemAvailable,
+    /// The host's free, inactive and purgeable pages, as the platform's
+    /// virtual-memory statistics report them (macOS's
+    /// `host_statistics64(HOST_VM_INFO64)`).
+    VmStats,
     /// The room under the cgroup v2 memory limit at `path`, as
     /// [`cgroup_v2_path`] names it under `/sys/fs/cgroup`.
     Cgroup { path: String },
@@ -1285,6 +1271,10 @@ impl fmt::Display for HostRead {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HostRead::MemAvailable => write!(f, "MemAvailable in /proc/meminfo"),
+            HostRead::VmStats => write!(
+                f,
+                "the host's free, inactive and purgeable pages (vm_statistics64)"
+            ),
             HostRead::Cgroup { path } => write!(
                 f,
                 "the room under the cgroup v2 memory limit at /sys/fs/cgroup{path} \
@@ -1296,12 +1286,13 @@ impl fmt::Display for HostRead {
 }
 
 impl HostRead {
-    /// One word for a `key=value` line: `MemAvailable`, `cgroup:<path>`, or
-    /// `given`.
+    /// One word for a `key=value` line: `MemAvailable`, `vmstats`,
+    /// `cgroup:<path>`, or `given`.
     #[must_use]
     pub fn word(&self) -> String {
         match self {
             HostRead::MemAvailable => "MemAvailable".to_string(),
+            HostRead::VmStats => "vmstats".to_string(),
             HostRead::Cgroup { path } => format!("cgroup:{path}"),
             HostRead::Given => "given".to_string(),
         }
@@ -1324,7 +1315,9 @@ pub const HOST_DRIFT: u64 = 512 * MIB;
 pub fn plan_room(room: &(u64, HostRead)) -> u64 {
     match room.1 {
         HostRead::Given => room.0,
-        HostRead::MemAvailable | HostRead::Cgroup { .. } => room.0.saturating_sub(HOST_DRIFT),
+        HostRead::MemAvailable | HostRead::VmStats | HostRead::Cgroup { .. } => {
+            room.0.saturating_sub(HOST_DRIFT)
+        }
     }
 }
 
@@ -1453,17 +1446,23 @@ pub fn cgroup_room(level: &CgroupLevel<'_>) -> Result<Option<u64>, String> {
         .map(Some)
 }
 
-/// The host's available bytes of a `/proc/meminfo` text and the cgroup v2
-/// levels above the process (its own cgroup first, every ancestor after):
-/// the smaller of `MemAvailable` and every level's room ([`cgroup_room`])
-/// — inside a container (`docker run --memory`), a systemd scope
-/// (`MemoryMax`) or a pod, `/proc/meminfo` still shows the whole machine,
-/// so a limit's room is the reading that binds — with the reading that
-/// decided ([`HostRead`]), for every refusal and line that prints the
-/// bytes to name. A level that sets no limit does not bind; no levels is
-/// `MemAvailable` alone; a tie leaves `MemAvailable` the named one.
-pub fn host_room(meminfo: &str, levels: &[CgroupLevel<'_>]) -> Result<(u64, HostRead), String> {
-    let mut best = (mem_available(meminfo)?, HostRead::MemAvailable);
+/// The host's available bytes and the cgroup v2 levels above the process
+/// (its own cgroup first, every ancestor after): the smaller of `available`
+/// — the platform's own reading of the host's memory, named by `base`
+/// ([`HostRead`]) — and every level's room ([`cgroup_room`]) — inside a
+/// container (`docker run --memory`), a systemd scope (`MemoryMax`) or a
+/// pod, the platform's reading still shows the whole machine, so a limit's
+/// room is the reading that binds — with the reading that decided
+/// ([`HostRead`]), for every refusal and line that prints the bytes to
+/// name. A level that sets no limit does not bind; no levels is the
+/// platform's reading alone; a tie leaves the platform's reading the named
+/// one.
+pub fn host_room(
+    available: u64,
+    base: HostRead,
+    levels: &[CgroupLevel<'_>],
+) -> Result<(u64, HostRead), String> {
+    let mut best = (available, base);
     for level in levels {
         if let Some(room) = cgroup_room(level)?
             && room < best.0
@@ -1486,8 +1485,8 @@ mod tests {
         DeviceInfo, GRANULE, HOST_DRIFT, Host, HostNeed, HostRead, MARGIN, Machine, Node,
         PLAN_ROOM, PlacementError, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE,
         TierBatchBytes, TierDraft, UnifiedPool, card, cgroup_room, cgroup_v2_path,
-        counted_arena_bytes, gb10, host, host_of, host_room, mem_available, placed_with_arena,
-        plan_a, plan_a_draft, plan_bp, plan_gate, plan_node_tiers, plan_on, plan_room, plan_tiers,
+        counted_arena_bytes, gb10, host, host_of, host_room, placed_with_arena, plan_a,
+        plan_a_draft, plan_bp, plan_gate, plan_node_tiers, plan_on, plan_room, plan_tiers,
         spec_of_device, tier_batch_bytes, unified_of,
     };
 
@@ -1948,19 +1947,6 @@ mod tests {
         assert_eq!(b.host, 2 * (62_914_560 + 12_288));
     }
 
-    /// `MemAvailable` in bytes from a `/proc/meminfo` text; a text without
-    /// the line, or with a value that is not a whole number of kB, is refused.
-    #[test]
-    fn mem_available_reads_the_line_in_kb() {
-        let text = "MemTotal:       263741212 kB\nMemFree:         1234567 kB\n\
-                    MemAvailable:   257300180 kB\nBuffers:            1234 kB\n";
-        assert_eq!(mem_available(text), Ok(257_300_180 * 1024));
-        assert!(mem_available("MemTotal: 1 kB\n").is_err());
-        assert!(mem_available("MemAvailable:   12x kB\n").is_err());
-        assert!(mem_available("MemAvailable:   12 MB\n").is_err());
-        assert!(mem_available("MemAvailable:    kB\n").is_err());
-    }
-
     /// One level's texts, its files as the kernel writes them: `pages` its
     /// `active_file` and `inactive_file` bytes, held beside the texts so
     /// [`CgroupLevel`] can borrow them.
@@ -2075,21 +2061,24 @@ mod tests {
         );
     }
 
-    /// The host's available bytes are the smaller of `MemAvailable` and
-    /// every cgroup v2 level's room, the deciding reading named: no levels
-    /// and a level without a limit leave `MemAvailable`; a nested limit
-    /// binds through the smaller parent; a tie names `MemAvailable`.
+    /// The host's available bytes are the smaller of the platform's reading
+    /// and every cgroup v2 level's room, the deciding reading named: no
+    /// levels and a level without a limit leave the platform's reading; a
+    /// nested limit binds through the smaller parent; a tie names the
+    /// platform's reading.
     #[test]
     fn host_room_takes_the_smaller_reading() {
-        let meminfo = "MemTotal:       263741212 kB\nMemAvailable:   257300180 kB\n";
         let mem = 257_300_180 * 1024;
-        assert_eq!(host_room(meminfo, &[]), Ok((mem, HostRead::MemAvailable)));
-        let unlimited = [level("/", "max\n", "0\n", (0, 0))];
         assert_eq!(
-            host_room(meminfo, &as_levels(&unlimited)),
+            host_room(mem, HostRead::MemAvailable, &[]),
             Ok((mem, HostRead::MemAvailable))
         );
-        // The scope's limit binds: the room is under MemAvailable.
+        let unlimited = [level("/", "max\n", "0\n", (0, 0))];
+        assert_eq!(
+            host_room(mem, HostRead::MemAvailable, &as_levels(&unlimited)),
+            Ok((mem, HostRead::MemAvailable))
+        );
+        // The scope's limit binds: the room is under the platform's reading.
         let scope = [level(
             "/user.slice/session-3.scope",
             "65539000000\n",
@@ -2097,7 +2086,7 @@ mod tests {
             (512 << 20, 512 << 20),
         )];
         assert_eq!(
-            host_room(meminfo, &as_levels(&scope)),
+            host_room(mem, HostRead::MemAvailable, &as_levels(&scope)),
             Ok((
                 65_539_000_000,
                 HostRead::Cgroup {
@@ -2116,7 +2105,8 @@ mod tests {
             ),
             level("/user.slice", "65539000000\n", "0\n", (0, 0)),
         ];
-        let (bytes, read) = host_room(meminfo, &as_levels(&nested)).expect("the room");
+        let (bytes, read) =
+            host_room(mem, HostRead::MemAvailable, &as_levels(&nested)).expect("the room");
         assert_eq!(
             (bytes, &read.to_string()),
             (
@@ -2126,10 +2116,10 @@ mod tests {
                     .to_owned()
             )
         );
-        // A tie leaves MemAvailable the named reading.
+        // A tie leaves the platform's reading the named one.
         let tie = [level("/scope", &format!("{}\n", mem), "0\n", (0, 0))];
         assert_eq!(
-            host_room(meminfo, &as_levels(&tie)),
+            host_room(mem, HostRead::MemAvailable, &as_levels(&tie)),
             Ok((mem, HostRead::MemAvailable))
         );
     }

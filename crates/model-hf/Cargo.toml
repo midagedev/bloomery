@@ -21,8 +21,8 @@ bloomery-model = { path = "../model" }
 bloomery-safetensors = { path = "../safetensors" }
 # The `prepare` bin builds serving's tokenizer from the GGUF header it wrote and checks its split.
 bloomery-tokenizer = { path = "../tokenizer" }
-# The `fixture` bin reads its own page faults (`getrusage`).
-libc = { workspace = true }
+# The `fixture` bin and its test read peak resident sets in bytes on every platform.
+bloomery-os.workspace = true
 # The GLM name map reads a Hugging Face checkpoint's config.json.
 serde_json = "=1.0.151"
 thiserror = { workspace = true }

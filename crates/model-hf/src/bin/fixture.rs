@@ -354,15 +354,10 @@ fn plan(source: &str, a: &Args) -> Res<()> {
     Ok(())
 }
 
-/// Peak resident set of this process, in KiB.
+/// Peak resident set of this process, in KiB; -1 when the platform refuses
+/// the reading.
 fn peak_rss_kib() -> i64 {
-    let mut ru = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    // SAFETY: `ru` is storage for one `rusage`, which the call fills on success.
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) } != 0 {
-        return -1;
-    }
-    // SAFETY: the call returned 0, so it wrote every field of `ru`.
-    unsafe { ru.assume_init() }.ru_maxrss
+    os::max_rss_bytes().map_or(-1, |b| i64::try_from(b / 1024).expect("a peak fits an i64"))
 }
 
 fn generate(source: &str, out: &str, a: &Args) -> Res<()> {

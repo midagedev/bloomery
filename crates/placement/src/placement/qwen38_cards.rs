@@ -13,7 +13,7 @@ use gguf::GgmlType;
 use super::churn::ChurnPool;
 use super::workstation::{
     A6000, ALIASES, CONTEXT, CONTEXT_SELF, CardSpec, DeviceInfo, GRANULE, HOST_DRIFT, HostNeed,
-    HostRead, MARGIN, MIB, PLAN_ROOM, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+    HostRead, MARGIN, MIB, PLAN_ROOM, ROW_PAGE, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
     TIER_BATCH_RESERVE, census_usable, host, plan_room, resolve, tier_batch_host_bytes,
     tier_batch_staging_bytes,
 };
@@ -399,7 +399,13 @@ fn planned<'a>(
         routed_rule(Program::Qwen38Body),
         rows,
     )?;
-    super::row_table_tier(&mut plan, room, 2 * state38(ctx, false), UBATCH_PLANNED)?;
+    super::row_table_tier(
+        &mut plan,
+        room,
+        2 * state38(ctx, false),
+        UBATCH_PLANNED,
+        ROW_PAGE,
+    )?;
     if let Some(given) = split {
         plan.host.step_slots(
             usize::try_from(slots).expect("slots"),
@@ -634,7 +640,7 @@ fn q3_routes_onto_cards_like_the_q4_file() {
     // and a table on no tier a reader takes is refused by name.
     let mut moved = at(PLAN_ROOM);
     assert!(matches!(
-        super::row_table_tier(&mut moved, PLAN_ROOM, 0, UBATCH_PLANNED),
+        super::row_table_tier(&mut moved, PLAN_ROOM, 0, UBATCH_PLANNED, ROW_PAGE),
         Err(PlacementError::Tensor { .. })
     ));
     let ple = moved
@@ -1789,7 +1795,7 @@ fn spark_holds(
     )
     .and_then(|mut plan| {
         let floor = 2 * state38(ctx, fixed.is_some());
-        super::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED)?;
+        super::row_table_tier(&mut plan, room, floor, UBATCH_PLANNED, ROW_PAGE)?;
         super::expert_nvme_tier(&mut plan, room, None)?;
         plan.cards[0].grow_kv(rows);
         Ok(plan)
