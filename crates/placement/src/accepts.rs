@@ -209,7 +209,7 @@ pub enum LegSplit {
 /// residency stack table and the placed side read.
 #[must_use]
 pub fn qwen35_leg([gate, up, down]: [GgmlType; 3]) -> Option<LegSplit> {
-    if gate != up || !prompt_leg_gate_up(gate) || !prompt_leg_down(down) {
+    if leg_runs(Program::Qwen35Body, [gate, up, down]) != Some(true) {
         return None;
     }
     Some(

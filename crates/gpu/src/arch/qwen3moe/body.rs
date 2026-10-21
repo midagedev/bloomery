@@ -275,48 +275,27 @@ fn pins(hp: &Hparams) -> Result<RouterDims, GpuError> {
 
 /// Layer `l`'s routed stacks `[gate, up, down]` of `n` experts (or a stack of
 /// one expert: a placed layer's shared expert) of `ff` rows of `h` values:
-/// each a resident K-quant word plane of its shape, its type the file's, then
-/// the types the card kernel table's entries admit for the family's FFN
-/// dispatch ([`gate_up_entry`]: one launch reads the gate and up of one
-/// type; [`down_entry`]), a type with no entry refused by name with the
-/// layer. Returns the gate, up and down types.
+/// each a resident K-quant word plane of its shape, its type the file's (the
+/// layout checked by [`super::placed::stack_files`]), then the types the card
+/// kernel table's entries admit for the family's FFN dispatch
+/// ([`gate_up_entry`]: one launch reads the gate and up of one type;
+/// [`down_entry`]), a type with no entry refused by name with the layer.
+/// Returns the gate, up and down types.
 pub(super) fn stack_tys(
     w: &Weights,
-    [gate, up, down]: [&str; 3],
+    names: [&str; 3],
     (n, ff, h): (usize, usize, usize),
     l: usize,
 ) -> Result<[SiteTy; 3], GpuError> {
     let what = "qwen3moe::Body::load";
-    let stack = |name: &str, rows: usize, k: usize| -> Result<SiteTy, GpuError> {
-        let Some(DevWeight::KQuant { ty, w: t, k: wk }) = w.get(name) else {
-            return Err(GpuError::tensor(
-                what,
-                name,
-                "a resident K-quant word plane",
-            ));
-        };
-        let Some(site) = SiteTy::of_ggml(*ty) else {
-            return Err(GpuError::shape(
-                what,
-                format!("{name} is {ty}; no launch family reads it"),
-            ));
-        };
-        if t.rows() != rows || *wk != k {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{name} is {ty} {} rows x {wk}; the chain takes {rows} rows x {k}",
-                    t.rows()
-                ),
-            ));
-        }
-        Ok(site)
+    let raw = super::placed::stack_files(w, names, (n, ff, h), l, what)?;
+    let site_ty = |i: usize| {
+        let (name, ty) = (names[i], raw[i]);
+        SiteTy::of_ggml(ty).ok_or_else(|| {
+            GpuError::shape(what, format!("{name} is {ty}; no launch family reads it"))
+        })
     };
-    let tys = [
-        stack(gate, n * ff, h)?,
-        stack(up, n * ff, h)?,
-        stack(down, n * h, ff)?,
-    ];
+    let tys = [site_ty(0)?, site_ty(1)?, site_ty(2)?];
     stack_entries(tys, l)?;
     Ok(tys)
 }

@@ -293,7 +293,6 @@ pub(crate) struct RouteBlock<'a> {
     pub(crate) ff: usize,
     /// Rows an expert of the down.
     pub(crate) hidden: usize,
-    pub(crate) rule: Act,
 }
 
 /// The rows a [`RouteBlock`] reads and writes: the unit's normed rows in the
@@ -393,7 +392,7 @@ impl RouteBlock<'_> {
         match self.down {
             RouteW::Grouped(ty, w) => {
                 let act = h128.ok_or_else(|| lacks("q8_1 blocks of 128 (the down)"))?;
-                gemm.enqueue_swiglu_act_quant(stream, g, u, self.rule, n_slots, act, fault)?;
+                gemm.enqueue_swiglu_quant(stream, g, u, n_slots, act, fault)?;
                 gemm.enqueue_gemm(
                     stream,
                     GemmArgs {
@@ -409,14 +408,7 @@ impl RouteBlock<'_> {
             }
             RouteW::Blocks32(w) => {
                 let act = h32.ok_or_else(|| lacks("q8 blocks of 32 (the down)"))?;
-                match self.rule {
-                    Act::SiluMul => {
-                        g32.enqueue_swiglu_quant32(stream, g, u, n_slots, act, fault)?
-                    }
-                    rule => {
-                        g32.enqueue_swiglu_act_quant32(stream, g, u, rule, n_slots, act, fault)?;
-                    }
-                }
+                g32.enqueue_swiglu_quant32(stream, g, u, n_slots, act, fault)?;
                 g32.enqueue_gemm32(
                     stream,
                     Gemm32Args {

@@ -1231,24 +1231,26 @@ pub(super) fn apart_plans(plans: Vec<LayerPlan>) -> Vec<LayerPlan> {
 /// `h` values, each a resident word plane of its shape ([`DevWeight::KQuant`]:
 /// the file's blocks), as their file types: the types the placed card leg's
 /// classifier reads ([`accepts::qwen35_leg`]). A stack that is not one, or of
-/// another shape, is refused by name with the layer.
-fn stack_files(
+/// another shape, is refused by name with the layer, `what` naming the entry
+/// point that read the stacks.
+pub(super) fn stack_files(
     w: &Weights,
     names: [&str; 3],
     (n, ff, h): (usize, usize, usize),
     l: usize,
+    what: &'static str,
 ) -> Result<[GgmlType; 3], GpuError> {
     let stack = |name: &str, rows: usize, k: usize| -> Result<GgmlType, GpuError> {
         let Some(DevWeight::KQuant { ty, w: t, k: wk }) = w.get(name) else {
             return Err(GpuError::tensor(
-                WHAT,
+                what,
                 name,
-                "a resident K-quant word plane (the file's blocks)",
+                "a resident K-quant word plane",
             ));
         };
         if t.rows() != rows || *wk != k {
             return Err(GpuError::shape(
-                WHAT,
+                what,
                 format!(
                     "layer {l}: {name} is {ty} {} rows x {wk}; the chain takes {rows} rows x {k}",
                     t.rows()
@@ -1284,7 +1286,7 @@ fn placed_ffn(
     );
     let (h, ff) = (s.hidden, s.ff);
     let leg = if n_card > 0 {
-        let tys = stack_files(w, [&gate, &up, &down], (n_card, ff, h), l)?;
+        let tys = stack_files(w, [&gate, &up, &down], (n_card, ff, h), l, WHAT)?;
         Some(match accepts::qwen35_leg(tys) {
             Some(LegSplit::Dispatch) => {
                 let [g, u, d] = stack_tys(w, [&gate, &up, &down], (n_card, ff, h), l)?;
@@ -1688,7 +1690,6 @@ fn common_wide(
         down,
         ff: d.ff,
         hidden: d.hidden,
-        rule: Act::SiluMul,
     };
     blk.enqueue(
         gpu,
