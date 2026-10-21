@@ -14,7 +14,7 @@
 
 use std::fmt;
 
-use super::{Join, Parked, WHAT, WalkMode};
+use super::{Hidden, Join, Parked, WHAT, WalkMode};
 
 /// A join the draft cannot make: no rows of the held sequence wait for it.
 const NOTHING_WAITS: &str = "no rows of the held sequence wait for the draft: it did not walk \
@@ -49,24 +49,13 @@ pub(super) enum Fail<E> {
     Exec(E),
 }
 
-/// Where a walk's hidden rows come from; `A` is the body's arena kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Source<A> {
-    /// One zero row: position 0's input, the target holding nothing before
-    /// it.
-    Zero,
-    /// The target's final hidden rows in the arena `walk`, from its row
-    /// `first` on, as the target's last call of that arena left them.
-    Target { walk: A, first: usize },
-}
-
 /// One walk of the draft with no readback, as the window decides it: `tokens`
 /// at positions `pos0 ..`, each beside its hidden row, run in `mode`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Walk<'a, A> {
     pub(super) tokens: &'a [u32],
     pub(super) pos0: u32,
-    pub(super) hidden: Source<A>,
+    pub(super) hidden: Hidden<'a, A>,
     pub(super) mode: WalkMode,
 }
 
@@ -95,6 +84,9 @@ pub(super) struct Shape<A> {
     pub(super) width: usize,
     /// The most rows one store walk takes.
     pub(super) store_rows: usize,
+    /// Values of one hidden row a walk reads: the width of the zero row
+    /// position 0's walk is given.
+    pub(super) hidden_width: usize,
 }
 
 /// The refresh a window's chain opens with: its rows' tokens, their first
@@ -114,7 +106,7 @@ impl<A: Copy> Refresh<A> {
         Walk {
             tokens: &self.tokens,
             pos0: self.pos0,
-            hidden: Source::Target {
+            hidden: Hidden::Target {
                 walk: self.walk,
                 first: self.first,
             },
@@ -127,7 +119,7 @@ impl<A: Copy> Refresh<A> {
         super::Feed {
             tokens: &self.tokens,
             pos0: self.pos0,
-            hidden: super::Hidden::Target {
+            hidden: Hidden::Target {
                 walk: self.walk,
                 first: self.first,
             },
@@ -158,6 +150,9 @@ pub(super) struct Call<'a> {
 #[derive(Debug)]
 pub(super) struct Policy<A> {
     shape: Shape<A>,
+    /// One zero hidden row: the row at position 0's input, the target
+    /// holding nothing before it.
+    zeros: Vec<f32>,
     /// The next window's refresh; `None` between a prompt call and its
     /// `begin`.
     next: Option<Refresh<A>>,
@@ -174,6 +169,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     pub(super) fn new(shape: Shape<A>) -> Self {
         Policy {
             shape,
+            zeros: vec![0.0; shape.hidden_width],
             next: None,
             last_unit: None,
             joined: None,
@@ -187,6 +183,11 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
         self.last_unit = None;
         self.joined = None;
         self.skip = None;
+    }
+
+    /// Values of one hidden row a walk reads.
+    pub(super) fn hidden_width(&self) -> usize {
+        self.zeros.len()
     }
 
     pub(super) fn skipping(&self) -> bool {
@@ -397,7 +398,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
             x.walk(&Walk {
                 tokens: &call.ids[..1],
                 pos0: first,
-                hidden: Source::Zero,
+                hidden: Hidden::Host(&self.zeros),
                 mode: WalkMode::Store,
             })?;
         }
@@ -429,7 +430,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
                 tokens: run,
                 pos0: pos0
                     + u32::try_from(i * rows).expect("a prompt's positions lie below its context"),
-                hidden: Source::Target {
+                hidden: Hidden::Target {
                     walk,
                     first: i * rows,
                 },
@@ -595,7 +596,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
                     x.walk(&Walk {
                         tokens: &[last],
                         pos0: 0,
-                        hidden: Source::Zero,
+                        hidden: Hidden::Host(&self.zeros),
                         mode: self.shape.mode,
                     })
                     .map_err(Fail::Exec)?;
@@ -643,6 +644,7 @@ mod tests {
         mode: WalkMode::Graph,
         width: 3,
         store_rows: 4,
+        hidden_width: 2,
     };
 
     /// The prompt every test feeds: nine ids at positions 0..9.
@@ -651,16 +653,25 @@ mod tests {
     const HEAD: WalkMode = WalkMode::Graph;
     const STORE: WalkMode = WalkMode::Store;
 
+    /// The hidden rows a walk read, as the card saw them.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Read {
+        /// The zero row of the host: position 0's input.
+        Zero,
+        /// The arena `walk`'s rows from its row `first` on.
+        Rows { walk: Ar, first: usize },
+    }
+
     /// One walk as the card ran it.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct Seen {
         mode: WalkMode,
         pos0: u32,
         tokens: Vec<u32>,
-        hidden: Source<Ar>,
+        hidden: Read,
     }
 
-    fn seen(mode: WalkMode, pos0: u32, tokens: &[u32], hidden: Source<Ar>) -> Seen {
+    fn seen(mode: WalkMode, pos0: u32, tokens: &[u32], hidden: Read) -> Seen {
         Seen {
             mode,
             pos0,
@@ -669,8 +680,8 @@ mod tests {
         }
     }
 
-    fn rows_of(walk: Ar, first: usize) -> Source<Ar> {
-        Source::Target { walk, first }
+    fn rows_of(walk: Ar, first: usize) -> Read {
+        Read::Rows { walk, first }
     }
 
     /// The rows an arena holds, row `r` the position `first + r`: the body's
@@ -764,15 +775,18 @@ mod tests {
                     w.pos0, self.store
                 ));
             }
-            match w.hidden {
-                Source::Zero if w.pos0 == 0 && m == 1 => {}
-                Source::Zero => {
+            let read = match w.hidden {
+                Hidden::Host(v) if w.pos0 == 0 && m == 1 && v == [0.0; SHAPE.hidden_width] => {
+                    Read::Zero
+                }
+                Hidden::Host(v) => {
                     return Err(format!(
-                        "a zero hidden row for {m} rows from position {}",
-                        w.pos0
+                        "host hidden values {v:?} for {m} rows from position {}: only position \
+                         0's one zero row of {}",
+                        w.pos0, SHAPE.hidden_width
                     ));
                 }
-                Source::Target { walk, first } => {
+                Hidden::Target { walk, first } => {
                     let at = w
                         .pos0
                         .checked_sub(1)
@@ -789,10 +803,11 @@ mod tests {
                             h.first as usize + h.rows
                         ));
                     }
+                    Read::Rows { walk, first }
                 }
-            }
+            };
             self.store = w.pos0 as usize + m;
-            self.seen.push(seen(w.mode, w.pos0, w.tokens, w.hidden));
+            self.seen.push(seen(w.mode, w.pos0, w.tokens, read));
             Ok(())
         }
 
@@ -921,7 +936,7 @@ mod tests {
         assert_eq!(
             rig.c.take(),
             [
-                seen(STORE, 0, &[10], Source::Zero),
+                seen(STORE, 0, &[10], Read::Zero),
                 seen(STORE, 1, &[11, 12, 13, 14], rows_of(Ar::Ubatch, 0)),
                 seen(STORE, 5, &[15, 16, 17, 18], rows_of(Ar::Ubatch, 0)),
             ]
@@ -934,7 +949,7 @@ mod tests {
         assert_eq!(
             rig.c.take(),
             [
-                seen(STORE, 0, &[10], Source::Zero),
+                seen(STORE, 0, &[10], Read::Zero),
                 seen(STORE, 1, &[11, 12, 13, 14], rows_of(Ar::Ubatch, 0)),
                 seen(STORE, 5, &[15, 16, 17, 18], rows_of(Ar::Ubatch, 4)),
             ]

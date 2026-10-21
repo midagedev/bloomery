@@ -1,35 +1,34 @@
 //! GLM-5.3-Flash's [`MtpBody`]: [`Body`]'s NextN layer
 //! ([`bloomery_gpu_glm5next::Nextn`]) behind the shared window's calls, each
-//! one call into the body's own API. The NextN program walks the shared feed
-//! and walk mode; the arena, the head and the prompt path are GLM's own
-//! types.
+//! one call into the body's own API. The NextN program walks the shared feed,
+//! head and walk mode; the arena and the prompt path are GLM's own types.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::draft::{DraftFeed, WalkBounds};
 use bloomery_gpu::media::MediaSpan;
 use bloomery_gpu::model::Rows;
-use bloomery_gpu_glm5next::{Body, GlmArena, Nextn, NextnHead, PrefillMode, WALK_ROWS};
+use bloomery_gpu_glm5next::{Body, GlmArena, Nextn, PrefillMode};
 
 use super::WHAT;
-use crate::mtp::{Feed, MtpBody, UnitSink, WalkMode};
+use crate::mtp::{DraftHead, Feed, MtpBody, UnitSink, WalkMode};
 
 impl MtpBody for Body {
     /// A proposal of one id: the NextN layer predicts one position ahead.
     const WIDTH: usize = 1;
-    const WALK_ROWS: usize = WALK_ROWS;
+    const WALK_ROWS: usize = <Nextn as WalkBounds>::WALK_ROWS;
 
     type Arena = GlmArena;
     const STEP_ARENA: GlmArena = GlmArena::Step;
     const VERIFY_ARENA: GlmArena = GlmArena::Pair;
 
-    type Head = NextnHead;
     type Path = PrefillMode;
 
     /// The full vocabulary: the load opens no row list. Refused by name on a
     /// load without the NextN layer, so the window never opens over it.
-    fn head(m: &GpuModel<Body>) -> Result<NextnHead, GpuError> {
+    fn head(m: &GpuModel<Body>) -> Result<DraftHead, GpuError> {
         match m.body(WHAT)?.nextn() {
-            Some(_) => Ok(NextnHead::Full),
+            Some(_) => Ok(DraftHead::Full),
             None => Err(GpuError::Shape {
                 what: WHAT,
                 detail: "an MTP draft on a load without the NextN layer (open_nextn loads it)"
@@ -79,10 +78,10 @@ impl MtpBody for Body {
     fn walk(
         m: &mut GpuModel<Body>,
         feed: Feed<'_, GlmArena>,
-        head: NextnHead,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<(), GpuError> {
-        bloomery_gpu_glm5next::nextn_walk(m, feed, head, mode)
+        bloomery_gpu_glm5next::nextn_walk(m, DraftFeed::Rows(feed), head, mode)
     }
 
     /// The NextN head reads back its ids alone: `p` is refused by name.
@@ -90,7 +89,7 @@ impl MtpBody for Body {
         m: &mut GpuModel<Body>,
         refresh: Feed<'_, GlmArena>,
         own: usize,
-        head: NextnHead,
+        head: DraftHead,
         mode: WalkMode,
         out: &mut [u32],
         p: Option<&mut [f32]>,
@@ -101,7 +100,7 @@ impl MtpBody for Body {
                 detail: "a chain's probabilities: the NextN head reads back its ids alone".into(),
             });
         }
-        bloomery_gpu_glm5next::nextn_chain(m, refresh, own, head, mode, out)
+        bloomery_gpu_glm5next::nextn_chain(m, DraftFeed::Rows(refresh), own, head, mode, out)
     }
 }
 

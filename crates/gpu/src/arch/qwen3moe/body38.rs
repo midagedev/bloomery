@@ -116,8 +116,7 @@ use super::image::{
     MediaCarrier, MediaRows, imrope_sections, media_call, section_order, window_spans,
 };
 use super::mtp38::{
-    DraftRows38, DraftSeq38, Held38, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpTaps, Target38,
-    TargetRows,
+    DraftRows38, DraftSeq38, Held38, Mtp38, MtpCtx, MtpDraft, MtpTaps, Target38, TargetRows,
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -143,7 +142,7 @@ use crate::checkpoint::saved::{
 };
 use crate::checkpoint::staging::NoRoom;
 use crate::checkpoint::{self, Checkpoints};
-use crate::draft::{Feed, Hidden, WalkMode};
+use crate::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
 use crate::head::{Head, HeadNorm};
 use crate::host::nvtier::NvTier;
 use crate::host::prompt_stream::PromptStream;
@@ -1925,8 +1924,8 @@ impl Body38 {
         &mut self,
         gpu: &Gpu,
         w: &Weights,
-        feed: MtpFeed<'_>,
-        head: MtpHead,
+        feed: DraftFeed<'_, TargetRows>,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         let Body38 {
@@ -1961,8 +1960,8 @@ impl Body38 {
         &mut self,
         gpu: &Gpu,
         w: &Weights,
-        feed: MtpFeed<'_>,
-        head: MtpHead,
+        feed: DraftFeed<'_, TargetRows>,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<usize, GpuError> {
         let Body38 {
@@ -1997,9 +1996,9 @@ impl Body38 {
         &mut self,
         gpu: &Gpu,
         w: &Weights,
-        refresh: MtpFeed<'_>,
+        refresh: DraftFeed<'_, TargetRows>,
         own: usize,
-        head: MtpHead,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         let Body38 {
@@ -3973,10 +3972,10 @@ fn mtp_target<'b>(
     plans: &[Layer38],
     arenas: [&'b Arena38; 3],
     wrote: &Wrote38,
-    feed: MtpFeed<'_>,
+    feed: DraftFeed<'_, TargetRows>,
 ) -> Option<Target38<'b>> {
     match feed {
-        MtpFeed::Rows(Feed {
+        DraftFeed::Rows(Feed {
             hidden: Hidden::Target { walk, .. },
             ..
         }) => Some(Target38 {
@@ -4019,8 +4018,8 @@ impl GpuModel<Body38> {
     /// stays on the card's word, which the target's next readback names.
     pub fn mtp_draft(
         &mut self,
-        feed: MtpFeed<'_>,
-        head: MtpHead,
+        feed: DraftFeed<'_, TargetRows>,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_draft";
@@ -4037,8 +4036,8 @@ impl GpuModel<Body38> {
     /// next readback — a chain's, the target's — names.
     pub fn mtp_walk(
         &mut self,
-        feed: MtpFeed<'_>,
-        head: MtpHead,
+        feed: DraftFeed<'_, TargetRows>,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<(), GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_walk";
@@ -4057,16 +4056,16 @@ impl GpuModel<Body38> {
 
     /// One window's chain of the draft (module doc of `mtp38`): `refresh`'s
     /// rows — the target's kept rows with the target's hidden rows, a
-    /// [`MtpFeed::Rows`] feed — walked, then `own` own walks, each reading
+    /// [`DraftFeed::Rows`] feed — walked, then `own` own walks, each reading
     /// the walk before it on the card, into `head`, eager or captured, and
     /// the proposal's ids (1 + `own` of them) and their probabilities read
     /// back once. A poisoned model is refused; a fault any walk of the chain
     /// raised is its error and poisons the model as the target's would.
     pub fn mtp_chain(
         &mut self,
-        refresh: MtpFeed<'_>,
+        refresh: DraftFeed<'_, TargetRows>,
         own: usize,
-        head: MtpHead,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_chain";

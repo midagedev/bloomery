@@ -84,11 +84,11 @@ use crate::{Keep, Prompt, Session, SessionError};
 
 /// The types a draft walk is given, owned by the card crate (`bloomery_gpu`):
 /// how a walk runs, where its hidden rows come from and the rows it walks.
-pub use bloomery_gpu::draft::{Feed, Hidden, WalkMode};
+pub use bloomery_gpu::draft::{DraftHead, Feed, Hidden, WalkMode};
 
 mod policy;
 
-use policy::{Exec, Fail, Policy, Refresh, Refused, Shape, Source, Walk};
+use policy::{Exec, Fail, Policy, Refresh, Refused, Shape, Walk};
 
 /// The window's name in its refusals.
 const WHAT: &str = "MTP window";
@@ -190,16 +190,12 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
     /// kept rows there.
     const VERIFY_ARENA: Self::Arena;
 
-    /// Which projection the draft's head runs: the full vocabulary, or a row
-    /// list the load opened.
-    type Head: Copy + fmt::Debug;
-
     /// How the target runs a prompt: the body's own paths (steps, passes,
     /// ubatches).
     type Path: Copy + fmt::Debug;
 
     /// The head the load opened for the draft. Load-time only.
-    fn head(m: &GpuModel<Self>) -> Result<Self::Head, GpuError>;
+    fn head(m: &GpuModel<Self>) -> Result<DraftHead, GpuError>;
 
     /// Values of one hidden row a walk reads: the length of each row of a
     /// [`Hidden::Host`] feed.
@@ -261,7 +257,7 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
     fn walk(
         m: &mut GpuModel<Self>,
         feed: Feed<'_, Self::Arena>,
-        head: Self::Head,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<(), GpuError>;
 
@@ -279,7 +275,7 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
         m: &mut GpuModel<Self>,
         refresh: Feed<'_, Self::Arena>,
         own: usize,
-        head: Self::Head,
+        head: DraftHead,
         mode: WalkMode,
         out: &mut [u32],
         p: Option<&mut [f32]>,
@@ -343,12 +339,10 @@ pub struct Join {
 pub struct MtpDraft<B: MtpBody> {
     /// The prompt path.
     path: B::Path,
-    head: B::Head,
+    head: DraftHead,
     /// What the window knows between two calls, and every decision a call
     /// makes of it.
     policy: Policy<B::Arena>,
-    /// A zero hidden row: the row at position 0's input.
-    zeros: Vec<f32>,
     /// The windows kept under [`MtpDraft::keep_windows`]; `None`, nothing
     /// is kept.
     windows: Option<Windows>,
@@ -359,13 +353,11 @@ pub struct MtpDraft<B: MtpBody> {
 }
 
 /// The card's side of a call's walks ([`Exec`]): the model, the head the load
-/// opened, the zero row and the call's span rows (`None` on a text call),
-/// for the length of one call. Every walk of the call reads `media`: the
-/// join's and each unit's.
+/// opened and the call's span rows (`None` on a text call), for the length of
+/// one call. Every walk of the call reads `media`: the join's and each unit's.
 struct Card<'a, B: MtpBody> {
     m: &'a mut GpuModel<B>,
-    head: B::Head,
-    zeros: &'a [f32],
+    head: DraftHead,
     media: Option<&'a CallRows<'a>>,
 }
 
@@ -373,14 +365,10 @@ impl<B: MtpBody> Exec<B::Arena> for Card<'_, B> {
     type Err = GpuError;
 
     fn walk(&mut self, w: &Walk<'_, B::Arena>) -> Result<(), GpuError> {
-        let hidden = match w.hidden {
-            Source::Zero => Hidden::Host(self.zeros),
-            Source::Target { walk, first } => Hidden::Target { walk, first },
-        };
         let feed = Feed {
             tokens: w.tokens,
             pos0: w.pos0,
-            hidden,
+            hidden: w.hidden,
             media: self.media,
         };
         B::walk(self.m, feed, self.head, w.mode)
@@ -399,7 +387,7 @@ impl<B: MtpBody> MtpDraft<B> {
     pub fn open(m: &GpuModel<B>, path: B::Path, mode: StepMode) -> Result<Self, SessionError> {
         let () = B::FITS;
         let head = B::head(m)?;
-        let zeros = vec![0.0; B::hidden_width(m)?];
+        let hidden_width = B::hidden_width(m)?;
         Ok(MtpDraft {
             path,
             head,
@@ -409,8 +397,8 @@ impl<B: MtpBody> MtpDraft<B> {
                 mode: WalkMode::from(mode),
                 width: B::WIDTH,
                 store_rows: B::STORE_ROWS,
+                hidden_width,
             }),
-            zeros,
             windows: None,
             p: vec![0.0; B::WIDTH],
         })
@@ -443,7 +431,7 @@ impl<B: MtpBody> MtpDraft<B> {
 
     /// The head the load opened.
     #[must_use]
-    pub fn head(&self) -> B::Head {
+    pub fn head(&self) -> DraftHead {
         self.head
     }
 
@@ -557,7 +545,6 @@ impl<B: MtpBody> MtpDraft<B> {
         let mut card = Card {
             m: t.model_mut(),
             head: self.head,
-            zeros: &self.zeros,
             media: None,
         };
         Ok(self.policy.before_step(&mut card, pos, last)?)
@@ -737,24 +724,18 @@ impl<B: MtpBody> MtpDraft<B> {
         let mut card = Card {
             m: t.model_mut(),
             head,
-            zeros: &self.zeros,
             media,
         };
         let Some(mut join) = self.policy.prompt_start(&mut card, start, ids)? else {
             return Ok(call(t.model_mut(), None)?);
         };
-        let (policy, zeros) = (&mut self.policy, &self.zeros[..]);
+        let policy = &mut self.policy;
         let mut sink = |m: &mut GpuModel<B>,
                         walk: B::Arena,
                         first: u32,
                         rows: usize|
          -> Result<(), GpuError> {
-            let mut card = Card {
-                m,
-                head,
-                zeros,
-                media,
-            };
+            let mut card = Card { m, head, media };
             policy.unit(&mut join, &mut card, walk, first, rows)
         };
         Ok(call(t.model_mut(), Some(&mut sink))?)
@@ -783,7 +764,7 @@ impl<B: MtpBody + MediaBody> MtpDraft<B> {
         }
         let rows = CallRows::new(
             t.pos(),
-            self.zeros.len(),
+            self.policy.hidden_width(),
             spans.iter().map(|s| {
                 let s = B::media_span(s);
                 (&s.at, s.rows)
@@ -902,7 +883,6 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
         let mut card = Card {
             m: t.model_mut(),
             head: self.head,
-            zeros: &self.zeros,
             media: None,
         };
         Ok(self.policy.stepped(&mut card, pos, last, next)?)

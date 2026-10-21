@@ -26,7 +26,7 @@
 //! `is_mtp`) over `m` rows (1..=[`MTP_ROWS`]; captured at 1..=[`MTP_GRAPH_ROWS`]):
 //! row `t` is a token at position `pos0 + t` and a target hidden row (the
 //! four streams after the target's last layer, `res_hc`), or the draft's own
-//! last row ([`MtpFeed::Own`], ik's scheme A: its token the draft's argmax,
+//! last row ([`DraftFeed::Own`], ik's scheme A: its token the draft's argmax,
 //! its hidden the draft's own streams). Every launch is an entry the
 //! target's chain has, but two of its own (`crate::mtp`), the routed
 //! experts' expert-select gemv and a listed head's `q8_0_gemv_ids` (one
@@ -56,16 +56,16 @@
 //!   and its gated sum (`q38_shared_add`);
 //! - the head site's mix (`nextn.hc_head_*`, the block's combine first, so
 //!   the streams are then the layer's output, `l_out`), the head's
-//!   projection — a Q8_0 `output`'s planes ([`MtpHead::Full`]) or its rows
+//!   projection — a Q8_0 `output`'s planes ([`DraftHead::Full`]) or its rows
 //!   of the list read in place through the map (`q8_0_gemv_ids`, or
-//!   `q8_0_gemv_ids_mcol` past one row; [`MtpHead::Rows`]); a Q6_K one
+//!   `q8_0_gemv_ids_mcol` past one row; [`DraftHead::Rows`]); a Q6_K one
 //!   quantizes the head's input rows to q8_1 in the arena first (one launch
 //!   a Q8_0 walk has not), then reads its rows, full or listed, through
 //!   `q6k_gemv_ids`/`_mcol` — and
 //!   `argmax_p_rows_fault`, which names each
 //!   row's token and the draft's largest probability among the head's rows;
 //! - the last row's token and streams copied beside the arena, where the
-//!   next [`MtpFeed::Own`] walk reads them.
+//!   next [`DraftFeed::Own`] walk reads them.
 //!
 //! The store is by position: a walk appends its rows' keys before its
 //! attention reads them, and one may start at or below the end of the last
@@ -103,14 +103,13 @@ use super::scratch::{IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
 use crate::card_slots::CardAcc;
 use crate::checkpoint::saved::Spans;
-use crate::draft::{Feed, Hidden, WalkMode};
+use crate::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkBounds, WalkMode, refuse_rows};
 use crate::fault::Fault;
 use crate::flash_gqa::{GqaArgs, partials_ms_len, partials_v_len_256};
 use crate::gemm::{GemmAct32, GemmRoute};
 use crate::graph::Graph;
 use crate::hc_gated::{Before, HcMatrix, HcScratch, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::host::handoff::Places;
-use crate::media::CallRows;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};
 use crate::q6k_ids::{Q6kIdsArgs, Q6kIdsKernels};
@@ -203,7 +202,7 @@ pub struct Mtp38 {
     graphs: Vec<(MtpKey, Graph)>,
     /// The rows of the last walk, which the readbacks and the next own row
     /// read; `None` before a walk of the sequence and after a store walk.
-    last: Option<(usize, MtpHead)>,
+    last: Option<(usize, DraftHead)>,
     /// Positions of this sequence the store holds: the last walk's end. A
     /// walk may start at or below it, never past it.
     held: usize,
@@ -215,13 +214,13 @@ pub struct Mtp38 {
 /// The captures are declared first: they address the store, and drop while
 /// it is alive. The program's arena stays the model's one — a walk's
 /// buffers are scratch, rewritten within the walk before anything reads
-/// them, save the own row an [`MtpFeed::Own`] walk reads, which no call
+/// them, save the own row a [`DraftFeed::Own`] walk reads, which no call
 /// reads across a select: a chain's refresh walk rewrites it before any own
 /// walk of the chain does.
 pub(super) struct DraftSeq38 {
     graphs: Vec<(MtpKey, Graph)>,
     store: KvPlanes,
-    last: Option<(usize, MtpHead)>,
+    last: Option<(usize, DraftHead)>,
     held: usize,
 }
 
@@ -733,21 +732,27 @@ fn widened(
 
 // ------------------------------------------------------------ the program
 
-/// The most rows one walk of the draft takes: the m-column kernels' width.
+/// The program's [`WalkBounds::WALK_ROWS`]: the m-column kernels' width.
 pub const MTP_ROWS: usize = PASS_ROWS;
 
-/// The most rows a captured walk takes: a verify's, whose kept rows a
-/// refresh runs.
+/// The program's [`WalkBounds::GRAPH_ROWS`]: a verify's rows, whose kept rows
+/// a refresh runs.
 pub const MTP_GRAPH_ROWS: usize = VERIFY_ROWS;
 
-/// The most rows one store walk ([`WalkMode::Store`]) takes: the columns of
-/// its GEMMs, and the rows of the store arena it runs in. A store walk
+/// The program's [`WalkBounds::STORE_ROWS`] ([`WalkMode::Store`]): the columns
+/// of its GEMMs, and the rows of the store arena it runs in. A store walk
 /// enqueues launch by launch through the store's append and no further, up to
 /// these rows through the wide launches (module doc): the rows' keys and
 /// values, which are all a later row reads of them. A row's stored bits are
 /// a function of that row's inputs alone, within the q8 activations' error
 /// of an [`WalkMode::Eager`] walk's.
 pub const MTP_STORE_ROWS: usize = 64;
+
+impl WalkBounds for Mtp38 {
+    const WALK_ROWS: usize = MTP_ROWS;
+    const GRAPH_ROWS: usize = MTP_GRAPH_ROWS;
+    const STORE_ROWS: usize = MTP_STORE_ROWS;
+}
 
 /// Values of a row's streams, the target's hidden row.
 const WIDE: usize = geo::STREAMS * geo::HIDDEN;
@@ -772,16 +777,6 @@ pub fn walk_launches(m: usize, q6k_head: bool) -> usize {
         + (3 + 1 + 1)
         + usize::from(q6k_head)
         + 2
-}
-
-/// Which projection the draft's head runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MtpHead {
-    /// The target's `output`: every token of the vocabulary.
-    Full,
-    /// The load's row list: the target's `output` rows of its ids, read in
-    /// place through the head's map.
-    Rows,
 }
 
 /// The target arena a [`Hidden::Target`] feed reads: the target's streams
@@ -872,17 +867,6 @@ impl DraftRows38 {
     }
 }
 
-/// A walk's rows.
-#[derive(Clone, Copy, Debug)]
-pub enum MtpFeed<'a> {
-    /// `tokens` at positions `pos0 ..`, each beside its hidden row. The
-    /// feed's media rows are refused by name: this draft has no media prompt
-    /// call.
-    Rows(Feed<'a, TargetRows>),
-    /// One row at `pos0`: the last walk's last row's token and streams.
-    Own { pos0: u32 },
-}
-
 /// The target's streams a [`Hidden::Target`] feed copies from, and the
 /// positions its rows hold ([`Held38`]): the buffer and the record together,
 /// the body's `mtp_target` resolving both over its arenas.
@@ -898,7 +882,7 @@ pub(super) struct Target38<'a> {
 struct MtpKey {
     m: usize,
     own: bool,
-    head: MtpHead,
+    head: DraftHead,
 }
 
 /// A walk's readback: each row's token and the draft's probability of it
@@ -1100,8 +1084,8 @@ struct MtpArena {
     /// The walk's record — `pos0`, then the rows' tokens — and its windows.
     inbox: Inbox,
     pos0: WindowMut<'static, u32>,
-    /// The hidden rows a [`MtpFeed::Rows`] walk reads, and the last row's
-    /// token and streams a [`MtpFeed::Own`] walk reads.
+    /// The hidden rows a [`DraftFeed::Rows`] walk reads, and the last row's
+    /// token and streams a [`DraftFeed::Own`] walk reads.
     h_in: DeviceBuffer<f32>,
     own_id: DeviceBuffer<u32>,
     own_h: DeviceBuffer<f32>,
@@ -1467,7 +1451,7 @@ impl Mtp38 {
 
     /// The captured walks' node counts, by rows, feed and head.
     #[must_use]
-    pub fn graph_nodes(&self) -> Vec<(usize, bool, MtpHead, usize)> {
+    pub fn graph_nodes(&self) -> Vec<(usize, bool, DraftHead, usize)> {
         self.graphs
             .iter()
             .map(|(k, g)| (k.m, k.own, k.head, g.node_count()))
@@ -1490,8 +1474,8 @@ impl Mtp38 {
         &mut self,
         c: &MtpCtx<'_>,
         target: Option<Target38<'_>>,
-        feed: MtpFeed<'_>,
-        head: MtpHead,
+        feed: DraftFeed<'_, TargetRows>,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         let stream = c.gpu.stream();
@@ -1516,40 +1500,20 @@ impl Mtp38 {
         &mut self,
         c: &MtpCtx<'_>,
         target: Option<Target38<'_>>,
-        feed: MtpFeed<'_>,
-        head: MtpHead,
+        feed: DraftFeed<'_, TargetRows>,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<usize, GpuError> {
         let stream = c.gpu.stream();
-        if head == MtpHead::Rows && self.head.rows.is_none() {
-            return Err(GpuError::state(
-                WHAT,
-                "a row-list head: this draft was opened with the full head",
-            ));
-        }
+        head.check_opened(WHAT, self.head.rows.is_some())?;
         let ctx = self.ctx;
         let taps_on = self.arena_ref()?.taps.is_some();
         if mode == WalkMode::Graph && taps_on {
             return Err(GpuError::state(WHAT, "the taps off for a captured walk"));
         }
-        let (m, own, pos0) = match feed {
-            MtpFeed::Rows(f) => {
-                refuse_media(f.media)?;
-                (f.tokens.len(), false, f.pos0)
-            }
-            MtpFeed::Own { pos0 } => (1, true, pos0),
-        };
-        let most = match mode {
-            WalkMode::Eager => MTP_ROWS,
-            WalkMode::Graph => MTP_GRAPH_ROWS,
-            WalkMode::Store => MTP_STORE_ROWS,
-        };
-        if !(1..=most).contains(&m) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("a walk of {m} rows; the {mode:?} walk takes 1..={most}"),
-            ));
-        }
+        let rows = media_free_rows(feed)?;
+        let (m, own, pos0) = (feed.count(), rows.is_none(), feed.pos0());
+        refuse_rows::<Mtp38>(WHAT, mode, m)?;
         if pos0 as usize + m > ctx {
             return Err(GpuError::shape(
                 WHAT,
@@ -1573,7 +1537,7 @@ impl Mtp38 {
             ));
         }
         let mut src = None;
-        if let MtpFeed::Rows(f) = feed {
+        if let Some(f) = rows {
             let (tokens, hidden) = (f.tokens, f.hidden);
             super::refuse_past_vocab(WHAT, tokens, vocab)?;
             match hidden {
@@ -1622,8 +1586,8 @@ impl Mtp38 {
             }
         }
         let a = self.arena()?;
-        match feed {
-            MtpFeed::Rows(f) => {
+        match rows {
+            Some(f) => {
                 let (tokens, hidden) = (f.tokens, f.hidden);
                 put_input(a.inbox.host_mut()?, tokens, pos0)?;
                 a.inbox.upload(stream, IN_IDS + m)?;
@@ -1649,7 +1613,7 @@ impl Mtp38 {
                     }
                 }
             }
-            MtpFeed::Own { .. } => {
+            None => {
                 put_input(a.inbox.host_mut()?, &[], pos0)?;
                 a.inbox.upload(stream, IN_IDS)?;
             }
@@ -1681,9 +1645,9 @@ impl Mtp38 {
     }
 
     /// One window's chain — the draft's proposal, one readback: `refresh`'s
-    /// walk (a [`MtpFeed::Rows`] feed, its rows the target's kept rows with
+    /// walk (a [`DraftFeed::Rows`] feed, its rows the target's kept rows with
     /// the target's hidden rows), whose last row proposes the first id, then
-    /// `own` walks of [`MtpFeed::Own`], each reading the walk before it on
+    /// `own` walks of [`DraftFeed::Own`], each reading the walk before it on
     /// the card and proposing one id more, into `head`. Each walk's last
     /// row's id and probability bits are copied into the arena's chain
     /// buffer as it ends and the whole chain is read back once, the last
@@ -1694,9 +1658,9 @@ impl Mtp38 {
         &mut self,
         c: &MtpCtx<'_>,
         target: Option<Target38<'_>>,
-        refresh: MtpFeed<'_>,
+        refresh: DraftFeed<'_, TargetRows>,
         own: usize,
-        head: MtpHead,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         let stream = c.gpu.stream();
@@ -1704,13 +1668,12 @@ impl Mtp38 {
             mode,
             "a chain's walks with a head (WalkMode::Store writes the store alone)",
         )?;
-        let MtpFeed::Rows(f) = refresh else {
+        let Some(f) = media_free_rows(refresh)? else {
             return Err(GpuError::shape(
                 WHAT,
                 format!("a chain's refresh {refresh:?}: the rows the target kept"),
             ));
         };
-        refuse_media(f.media)?;
         let (tokens, pos0) = (f.tokens, f.pos0);
         if own >= MTP_GRAPH_ROWS {
             return Err(GpuError::shape(
@@ -1735,9 +1698,9 @@ impl Mtp38 {
                 ),
             ));
         }
-        let feeds: Vec<MtpFeed<'_>> = std::iter::once(refresh)
+        let feeds: Vec<DraftFeed<'_, TargetRows>> = std::iter::once(refresh)
             .chain((0..own).map(|i| {
-                MtpFeed::Own {
+                DraftFeed::Own {
                     pos0: u32::try_from(end + i)
                         .expect("a chain's positions lie below its store (checked above)"),
                 }
@@ -2116,8 +2079,8 @@ impl Mtp38 {
             HeadOut::Q6K { w } | HeadOut::Bf16 { w } => w.rows(),
         };
         let (rows, map) = match head {
-            MtpHead::Full => (full_rows, None),
-            MtpHead::Rows => (
+            DraftHead::Full => (full_rows, None),
+            DraftHead::Rows => (
                 hm.rows
                     .ok_or(GpuError::state(WHAT, "a row list for the head"))?,
                 Some(&hm.ids),
@@ -2386,7 +2349,7 @@ impl Mtp38 {
         let a = self.arena_ref()?;
         let (m, head) = self.last.ok_or(GpuError::state(WHAT, "a walk to read"))?;
         let rows = match (head, self.head.rows) {
-            (MtpHead::Rows, Some(n)) => n,
+            (DraftHead::Rows, Some(n)) => n,
             _ => a.vocab,
         };
         let mut v = a.logits.to_host_vec(stream)?;
@@ -2442,17 +2405,22 @@ fn refuse_store(mode: WalkMode, why: &'static str) -> Result<(), GpuError> {
     Ok(())
 }
 
-/// Refuse by name a walk whose rows carry media rows: this draft has no media
-/// prompt call, and a draft that dropped them would walk another feed than
-/// the target's. Refused before the walk enqueues anything.
-fn refuse_media(media: Option<&CallRows<'_>>) -> Result<(), GpuError> {
-    if media.is_some() {
-        return Err(GpuError::shape(
+/// The rows `feed` walks, the one place a walk's rows are taken from it:
+/// `None` for the own row, which has no rows of a call's. Refused by name
+/// where the rows carry media rows: this draft has no media prompt call, and
+/// a draft that dropped them would walk another feed than the target's.
+/// Refused before the walk enqueues anything.
+fn media_free_rows(
+    feed: DraftFeed<'_, TargetRows>,
+) -> Result<Option<Feed<'_, TargetRows>>, GpuError> {
+    match feed {
+        DraftFeed::Rows(f) if f.media.is_some() => Err(GpuError::shape(
             WHAT,
             "a walk with media rows: this body's draft has no media prompt call",
-        ));
+        )),
+        DraftFeed::Rows(f) => Ok(Some(f)),
+        DraftFeed::Own { .. } => Ok(None),
     }
-    Ok(())
 }
 
 /// The readback of a walk of `m` rows: the tokens, then the probabilities'
@@ -2480,21 +2448,41 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
-    use super::refuse_media;
+    use super::{TargetRows, media_free_rows};
+    use crate::draft::{DraftFeed, Feed, Hidden};
     use crate::media::CallRows;
 
     /// A feed that holds media rows is refused by name, not walked without
-    /// them: this draft has no media prompt call.
+    /// them: this draft has no media prompt call. A feed with none gives its
+    /// rows, and the own row has none.
     #[test]
     fn media_rows_are_refused_by_name() {
         let (at, rows) = (0..1, [0u16; 2]);
         let media = CallRows::new(5, 2, [(&at, &rows[..])]).expect("one whole row");
-        let e = refuse_media(Some(&media)).expect_err("media rows");
+        let feed = |media| {
+            DraftFeed::Rows(Feed {
+                tokens: &[1],
+                pos0: 0,
+                hidden: Hidden::Target {
+                    walk: TargetRows::Step,
+                    first: 0,
+                },
+                media,
+            })
+        };
+        let e = media_free_rows(feed(Some(&media))).expect_err("media rows");
         assert!(
             e.to_string()
                 .contains("this body's draft has no media prompt call"),
             "{e}"
         );
-        assert!(refuse_media(None).is_ok(), "a feed with no media");
+        assert!(
+            matches!(media_free_rows(feed(None)), Ok(Some(f)) if f.tokens == [1]),
+            "a feed with no media"
+        );
+        assert!(
+            matches!(media_free_rows(DraftFeed::Own { pos0: 3 }), Ok(None)),
+            "the own row has no rows"
+        );
     }
 }
