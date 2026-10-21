@@ -45,6 +45,7 @@ tokenizer_jinja	host	crates/tokenizer/src/lib.rs crates/jinja/src/lib.rs
 levers	lever	crates/levers/src/registry.rs crates/levers/src/lib.rs
 refset_readers	refset	crates/refset/src/lib.rs crates/refset/src/family.rs crates/refset/src/fixture.rs crates/refset/src/columns.rs
 threads_pool	host	crates/threads/src/lib.rs
+os_calls	host	crates/os/src/lib.rs
 engram_verbs	host	crates/engram/src/lib.rs crates/verbs/src/lib.rs
 arch_registry	refset	crates/model/src/arch/registry.rs crates/model/src/arch/mod.rs crates/model/src/arch/classify.rs crates/model/src/arch/names.rs crates/model/src/arch/stems.rs crates/model/src/arch/coverage.rs
 model_host_ops	host	crates/model/src/ops.rs crates/model/src/ffn.rs crates/model/src/moe.rs crates/model/src/head.rs crates/model/src/embed.rs crates/model/src/quant.rs

@@ -646,25 +646,25 @@ mod tests {
         );
     }
 
-    /// The mask the caller sets is the mask the thread then has.
-    #[cfg(target_os = "linux")]
+    /// The mask the caller sets is the mask the thread then has; the platform
+    /// with no per-thread mask refuses the call by name.
     #[test]
     fn the_mask_is_the_one_the_caller_sets() {
-        let cpus = super::mask_cpus().expect("the mask reads");
-        let one = &cpus[..1];
-        super::set_mask(one).expect("the mask is set");
-        assert_eq!(super::mask_cpus().expect("the mask reads back"), one);
-    }
-
-    /// The platform with no per-thread mask refuses the mask call by name.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_mask_call_the_platform_has_not_is_refused_by_name() {
-        let e = super::set_mask(&[0]).expect_err("the platform has no mask");
-        assert!(
-            matches!(e, OsError::Unsupported { call } if call == "sched_setaffinity"),
-            "{e}"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            let cpus = super::mask_cpus().expect("the mask reads");
+            let one = &cpus[..1];
+            super::set_mask(one).expect("the mask is set");
+            assert_eq!(super::mask_cpus().expect("the mask reads back"), one);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let e = super::set_mask(&[0]).expect_err("the platform has no mask");
+            assert!(
+                matches!(e, OsError::Unsupported { call } if call == "sched_setaffinity"),
+                "{e}"
+            );
+        }
     }
 
     /// A pin of a cpu the mask does not name is refused.
@@ -678,25 +678,25 @@ mod tests {
         );
     }
 
-    /// A pin of a cpu the mask names holds the thread on it.
-    #[cfg(target_os = "linux")]
+    /// A pin of a cpu the mask names holds the thread on it; the platform with
+    /// no per-thread mask refuses the pin by name.
     #[test]
     fn a_pin_holds_the_thread_on_its_cpu() {
-        let cpus = super::mask_cpus().expect("the mask reads");
-        let cpu = cpus[0];
-        super::pin(cpu).expect("the pin holds");
-        assert_eq!(super::mask_cpus().expect("the mask reads back"), vec![cpu]);
-    }
-
-    /// The platform with no per-thread mask refuses the pin by name.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_pin_the_platform_has_not_is_refused_by_name() {
-        let e = super::pin(0).expect_err("the platform has no mask");
-        assert!(
-            matches!(e, OsError::Unsupported { call } if call == "sched_setaffinity"),
-            "{e}"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            let cpus = super::mask_cpus().expect("the mask reads");
+            let cpu = cpus[0];
+            super::pin(cpu).expect("the pin holds");
+            assert_eq!(super::mask_cpus().expect("the mask reads back"), vec![cpu]);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let e = super::pin(0).expect_err("the platform has no mask");
+            assert!(
+                matches!(e, OsError::Unsupported { call } if call == "sched_setaffinity"),
+                "{e}"
+            );
+        }
     }
 
     /// Floating widens a narrow mask back to the cpus the process may run on;
@@ -719,28 +719,27 @@ mod tests {
     }
 
     /// The page faults of the calling thread are a count that does not go
-    /// back.
-    #[cfg(target_os = "linux")]
+    /// back; the platform that counts a process, not a thread, refuses the
+    /// per-thread count by name.
     #[test]
     fn the_thread_faults_are_counted() {
-        let before = super::thread_faults().expect("the fault count reads");
-        let after = super::thread_faults().expect("the fault count reads");
-        assert!(
-            after >= before,
-            "the count does not go back: {before} then {after}"
-        );
-    }
-
-    /// The platform that counts a process, not a thread, refuses the
-    /// per-thread fault count by name.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_thread_fault_count_the_platform_has_not_is_refused_by_name() {
-        let e = super::thread_faults().expect_err("the platform counts a process");
-        assert!(
-            matches!(e, OsError::Unsupported { call } if call == "getrusage(RUSAGE_THREAD)"),
-            "{e}"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            let before = super::thread_faults().expect("the fault count reads");
+            let after = super::thread_faults().expect("the fault count reads");
+            assert!(
+                after >= before,
+                "the count does not go back: {before} then {after}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let e = super::thread_faults().expect_err("the platform counts a process");
+            assert!(
+                matches!(e, OsError::Unsupported { call } if call == "getrusage(RUSAGE_THREAD)"),
+                "{e}"
+            );
+        }
     }
 
     /// A direct open of a file the process wrote is the handle of that file;
@@ -794,8 +793,8 @@ mod tests {
         );
     }
 
-    /// The page cache drops the clean pages of a file.
-    #[cfg(target_os = "linux")]
+    /// The page cache drops the clean pages of a file; the platform with no
+    /// `posix_fadvise` refuses the drop by name.
     #[test]
     fn the_page_cache_drops_a_files_clean_pages() {
         let p = scratch("fadvise");
@@ -805,20 +804,18 @@ mod tests {
             use std::os::fd::AsRawFd;
             file.as_raw_fd()
         };
-        super::fadvise_dontneed(fd, 0, 8).expect("the pages drop");
+        let dropped = super::fadvise_dontneed(fd, 0, 8);
         let _ = std::fs::remove_file(&p);
-    }
-
-    /// The platform with no `posix_fadvise` refuses the page-cache drop by
-    /// name.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_page_cache_drop_the_platform_has_not_is_refused_by_name() {
-        let e = super::fadvise_dontneed(0, 0, 8).expect_err("the platform has no call");
-        assert!(
-            matches!(e, OsError::Unsupported { call } if call == "posix_fadvise"),
-            "{e}"
-        );
+        #[cfg(target_os = "linux")]
+        dropped.expect("the pages drop");
+        #[cfg(target_os = "macos")]
+        {
+            let e = dropped.expect_err("the platform has no call");
+            assert!(
+                matches!(e, OsError::Unsupported { call } if call == "posix_fadvise"),
+                "{e}"
+            );
+        }
     }
 
     /// A file's bytes are written out.

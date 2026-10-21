@@ -190,6 +190,7 @@ gate-nemotron-h-moe-host	family	nemotron_h_moe	host	model_host_ops
 gate-nemotron-h-moe-meta	family	nemotron_h_moe	meta	arch_registry
 gate-nemotron-meta	family	nemotron_h	meta	arch_registry
 gate-ops	common		host	model_host_ops
+gate-os	common		host	os_calls
 gate-placement	common		place	placement_sizing
 gate-prepare	tooling		corpus	-
 gate-prepare-corpus	tooling		corpus	-
