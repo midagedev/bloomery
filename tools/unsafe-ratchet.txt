@@ -24,7 +24,7 @@ embed 0 0 0
 # line.
 engram 10 0 0
 engram-lab 0 0 0
-gguf 9 2 0
+gguf 7 2 0
 # PIN(2026-10-01): gpu 1354 -> 1356, a new kernel entry, not old code relaxed: kda_delta_lanes (GLM's two-row
 # verify, one state lane per row) adds its launcher's and its kernel's decay-row blocks, each with its SAFETY line.
 # PIN(2026-10-01): gpu 1356 -> 1363 blocks, 143 -> 144 fns, a new kernel entry, not old code relaxed:
@@ -506,11 +506,14 @@ levers 0 0 0
 # compute call (ops.rs dispatch_ccd, over each run of a block) and the warm walk's prefetch (ops.rs warm_touch), each
 # with its SAFETY line, and the cut test's RowSet double (ccd_tests::Pairs, whose `unsafe fn compute` the trait
 # makes unsafe).
-model 115 31 13
+model 109 31 13
 # model-hf: the four blocks that left model (119 -> 115) with the fixture bin and its test, the page-fault reads (`getrusage`),
 # each with its SAFETY line; no new unsafe.
 model-hf 4 0 0
 models 0 0 0
+# PIN(2026-10-21): os 24 blocks, 5 fns, not old code relaxed: the host chain's OS calls moved here from threads,
+# gguf, engram and model (their pins come down), each beside its macOS body, each block with its SAFETY line.
+os 24 5 0
 placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row
 # lanes (pack_lanes_avx2, dot_lanes_avx2 and their helpers transpose8_epi32, transpose8_ps, lane_codes: five
@@ -583,7 +586,7 @@ sampler 4 4 1
 # the zeroed sigaction and its registration, the handler's stderr write with _exit on a second
 # interrupt and its one-byte write on the first, each with its SAFETY line.
 serve 6 0 0
-threads 9 0 1
+threads 3 0 1
 tokenizer 0 0 0
 # PIN(2026-10-14): verbs 0 -> 57 blocks, 22 fns, 2 impls, new crate, moved from gpu-gates/src/bin/shared/verbs.rs (45
 # blocks there) with the tier link's RDMA end as its second user: the calls into libibverbs loaded at run time
