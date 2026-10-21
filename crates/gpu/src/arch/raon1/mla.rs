@@ -28,8 +28,12 @@
 //!
 //! and last, 11. `attn_output` into `out`.
 //!
-//! [`step`] runs one row. [`rows`] runs a pass of 1 to [`PASS_ROWS`] rows in
-//! position order — a verify's rows or a prompt chunk — through the same
+//! [`step`] runs one row. [`rows_wide`] runs a prompt unit of up to
+//! [`WIDE_ROWS`] rows: the projections as GEMMs, the cache append, the gather,
+//! the absorb ([`absorb_heads`], one 32-value GEMM over every (row, head)),
+//! the value projection and the output gate once over the unit, and the
+//! latent attention in chunks of [`ATTN_CHUNK`] query tokens. [`rows`] runs a
+//! pass of 1 to [`PASS_ROWS`] rows in position order — a verify's rows or a prompt chunk — through the same
 //! launches, each once over the pass's rows: the projections' m-column
 //! launches ([`super::rda::project_rows`]), the cache rows of every row
 //! appended before any attends, the absorb and a Q8_0 value projection over
@@ -49,7 +53,8 @@
 use super::rda::{RowsKit, kgemv_rows, project_rows};
 use super::state::PASS_ROWS;
 use super::wide::{
-    Input, WIDE_ROWS, WideKit, input, quantize_hid, quantize_out, quantize_qb, value_heads,
+    AbsorbShape, Input, WIDE_ROWS, WideKit, absorb_heads, input, quantize_hid, quantize_out,
+    quantize_qb, route_heads, value_heads,
 };
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::fault::FaultSink;
@@ -70,6 +75,15 @@ use model::arch::raon1::names;
 
 /// What the refusals of this file name.
 const WHAT: &str = "raon1 mla";
+
+/// The query tokens a wide unit's latent flash takes a launch: the partials
+/// ([`partials_lens_rows`]) hold this many tokens' rows a segment, and an
+/// even count keeps each launch's groups of sixteen rows in the same token
+/// pairs whatever the chunk (`heads` is 40 rows a token).
+pub(super) const ATTN_CHUNK: usize = 32;
+
+const _: () = assert!(ATTN_CHUNK >= PASS_ROWS && ATTN_CHUNK.is_multiple_of(2));
+const _: () = assert!(WIDE_ROWS.is_multiple_of(ATTN_CHUNK));
 
 /// Types a dense projection of the layer may have.
 const DENSE: &[SiteTy] = &[
@@ -829,14 +843,15 @@ pub(crate) fn rows(
 
 /// Enqueue MLA layer `l` over a wide unit of `m` rows (above [`PASS_ROWS`]),
 /// in position order: the projections as GEMMs over the unit's rows
-/// ([`super::wide`]); the cache append, the gather of the extra part and the
-/// output gate once over the unit; the absorb and the latent flash in chunks
-/// of [`PASS_ROWS`] query tokens on windows of the unit's buffers (the flash
-/// takes no more), each chunk over the cache rows the unit's append wrote,
-/// bounded by its own live counts; and a Q6_K per-head value projection as one
-/// grouped GEMM over every (row, head) of the unit ([`value_heads`]), a Q8_0
-/// one per chunk. `b`'s buffers hold at least `m` rows of their widths, the
-/// partials a pass's rows.
+/// ([`super::wide`]); the cache append, the gather of the extra part, the
+/// key absorption ([`absorb_heads`]: one GEMM over every (row, head) slot of
+/// the unit), a Q6_K per-head value projection ([`value_heads`]: one grouped
+/// GEMM over the same slots) and the output gate once over the unit; and the
+/// latent flash in chunks of [`ATTN_CHUNK`] query tokens on windows of the
+/// unit's buffers, each chunk over the cache rows the unit's append wrote,
+/// bounded by its own live counts (a Q8_0 value projection runs per chunk, in
+/// windows of [`PASS_ROWS`] rows). `b`'s buffers hold at least `m` rows of
+/// their widths, the partials [`ATTN_CHUNK`] rows.
 pub(super) fn rows_wide(
     cx: &GqaCx<'_>,
     k: &MlaKernels,
@@ -887,12 +902,7 @@ pub(super) fn rows_wide(
         let x_in = input(wb.forms, Input::Qb, &*b.qr);
         wk.project(cx, (&sites.q_b, d.heads * d.head_k()), &x_in, m, b.q)?;
     }
-    let (hk, row, hl, hv) = (
-        d.heads * d.head_k(),
-        d.heads * d.row(),
-        d.heads * LATENT,
-        d.heads * d.v_head,
-    );
+    let (row, hl, hv) = (d.heads * d.row(), d.heads * LATENT, d.heads * d.v_head);
     let (f, u) = (size_of::<f32>(), size_of::<u32>());
     let kv_norm = w.f32_buf(WHAT, kv_a_norm)?;
     k.latent.enqueue_latent_extra_append(
@@ -921,31 +931,26 @@ pub(super) fn rows_wide(
         m * d.heads * d.extra,
         &mut *b.qabs,
     )?;
-    let (qs, dd) = q8_planes(w, &sites.k_b)?;
+    route_heads(gpu, (wk, wb), (m, fault))?;
+    let shape = AbsorbShape {
+        head_k: d.head_k(),
+        nope: d.nope,
+        row: d.row(),
+    };
+    absorb_heads(
+        gpu,
+        (wk, wb),
+        (w, &sites.k_b),
+        (&*b.q, m),
+        (shape, fault, &mut *b.qabs),
+    )?;
     let value = value_w(w, &sites.v_b)?;
     let q8 = gpu.q8f32();
-    for c0 in (0..m).step_by(PASS_ROWS) {
-        let mc = PASS_ROWS.min(m - c0);
-        let q = Window::<f32>::of(&*b.q, c0 * hk * f, mc * hk)?;
+    for c0 in (0..m).step_by(ATTN_CHUNK) {
+        let mc = ATTN_CHUNK.min(m - c0);
         let n_keys = Window::<u32>::of(b.n_keys, (c0 + mc - 1) * u, 1)?;
-        let mut qabs = WindowMut::<f32>::of_mut(&mut *b.qabs, c0 * row * f, mc * row)?;
+        let qabs = Window::<f32>::of(&*b.qabs, c0 * row * f, mc * row)?;
         let mut att = WindowMut::<f32>::of_mut(&mut *b.att, c0 * hl * f, mc * hl)?;
-        q8.enqueue_q8_0_gemv_heads_mcol(
-            stream,
-            Q8_0GemvHeadsMcolArgs {
-                qs,
-                d: dd,
-                x: &q,
-                rows_per_head: LATENT,
-                x_head_stride: d.head_k(),
-                y_head_stride: d.row(),
-                y_off: d.extra,
-                m: mc,
-                x_col_stride: hk,
-                y_col_stride: row,
-                y: &mut qabs,
-            },
-        )?;
         gpu.flash().enqueue_flash_latent_split(
             stream,
             FlashSplitArgs {
@@ -966,24 +971,30 @@ pub(super) fn rows_wide(
                 y: &mut att,
             },
         )?;
+        drop(att);
         if let ValueW::Q8_0(vqs, vd) = value {
-            let mut av = WindowMut::<f32>::of_mut(&mut *b.av, c0 * hv * f, mc * hv)?;
-            q8.enqueue_q8_0_gemv_heads_mcol(
-                stream,
-                Q8_0GemvHeadsMcolArgs {
-                    qs: vqs,
-                    d: vd,
-                    x: &att,
-                    rows_per_head: d.v_head,
-                    x_head_stride: LATENT,
-                    y_head_stride: d.v_head,
-                    y_off: 0,
-                    m: mc,
-                    x_col_stride: hl,
-                    y_col_stride: hv,
-                    y: &mut av,
-                },
-            )?;
+            for c1 in (0..mc).step_by(PASS_ROWS) {
+                let mm = PASS_ROWS.min(mc - c1);
+                let at = c0 + c1;
+                let x = Window::<f32>::of(&*b.att, at * hl * f, mm * hl)?;
+                let mut av = WindowMut::<f32>::of_mut(&mut *b.av, at * hv * f, mm * hv)?;
+                q8.enqueue_q8_0_gemv_heads_mcol(
+                    stream,
+                    Q8_0GemvHeadsMcolArgs {
+                        qs: vqs,
+                        d: vd,
+                        x: &x,
+                        rows_per_head: d.v_head,
+                        x_head_stride: LATENT,
+                        y_head_stride: d.v_head,
+                        y_off: 0,
+                        m: mm,
+                        x_col_stride: hl,
+                        y_col_stride: hv,
+                        y: &mut av,
+                    },
+                )?;
+            }
         }
     }
     if let ValueW::Q6K(wv) = value {
@@ -1025,12 +1036,13 @@ mod tests {
     use crate::arch::raon1::rda::tests::{Lcg, f32s, q6k, q8_0, resident, same};
     use crate::arch::raon1::rda::{RowKernels, RowsKit, add_row_forms};
     use crate::arch::raon1::state::PASS_ROWS;
+    use crate::flash::{FlashGeom, FlashInputs, FlashSplitArgs};
     use crate::flash_gqa::FlashGqaKernels;
     use crate::gemm::Gemm32Kernels;
     use crate::latent::LATENT;
     use crate::linear::LinearKernels;
     use crate::site::{KGemvKernels, SiteTy};
-    use crate::tensor::DeviceTensor;
+    use crate::tensor::{DeviceTensor, Window, WindowMut};
     use crate::weights::Weights;
     use cuda_core::DeviceBuffer;
     use gguf::quant::f32_to_f16_bits;
@@ -1296,6 +1308,93 @@ mod tests {
             assert!(
                 same(&held(&c_pass), &held(&c_steps), u32::from),
                 "cache of {height} rows from {p0}: the pass writes the steps' cache rows"
+            );
+        }
+    }
+
+    /// The latent flash over a unit's query tokens is the same bits however
+    /// the tokens are cut into launches: a row's cut of the keys is its
+    /// group's, and under the single-span regime (a live count within
+    /// `SEGMENTS` segments of the floor) every group cuts alike. The split
+    /// attention (a cache past one segment), chunks of the groups' token
+    /// period and a cut that falls inside a group.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_flash_tokens_per_launch_are_bits() {
+        const TOKENS: usize = 32;
+        const HEIGHT: usize = 1024;
+        // The last token's live key count.
+        const LIVE: usize = 600;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let s = gpu.stream();
+        let mut r = Lcg(0x0066_6c61);
+        let mut cache_rows: Vec<u16> = r
+            .fill(LIVE * D.row(), -1.0, 1.0)
+            .into_iter()
+            .map(f32_to_f16_bits)
+            .collect();
+        cache_rows.resize(HEIGHT * D.row(), 0);
+        let cache = DeviceTensor::upload(s, &cache_rows, HEIGHT, D.row()).expect("the cache");
+        let (row, hl) = (D.heads * D.row(), D.heads * LATENT);
+        let q = r.fill(TOKENS * row, -1.0, 1.0);
+        let q = DeviceBuffer::from_host(s, &q).expect("the queries up");
+        // The tokens cut into launches of `chunks` tokens each, in order.
+        let run = |chunks: &[usize]| -> Vec<f32> {
+            assert_eq!(
+                chunks.iter().sum::<usize>(),
+                TOKENS,
+                "the cut covers the tokens"
+            );
+            let widest = chunks.iter().copied().max().expect("a chunk");
+            let (pv, pm) = partials_lens_rows(&D, HEIGHT, widest);
+            let mut part_v = DeviceBuffer::<f32>::zeroed(s, pv).expect("the partials");
+            let mut part_ms = DeviceBuffer::<f32>::zeroed(s, pm).expect("the partials");
+            let mut y = DeviceBuffer::<f32>::zeroed(s, TOKENS * hl).expect("the output");
+            let mut c0 = 0;
+            for &chunk in chunks {
+                let last = u32::try_from(LIVE - (TOKENS - c0 - chunk)).expect("a u32 count");
+                let n_keys = DeviceBuffer::from_host(s, &[last]).expect("the live count up");
+                let qw = Window::<f32>::of(&q, c0 * row * 4, chunk * row).expect("the queries");
+                let mut yw = WindowMut::<f32>::of_mut(&mut y, c0 * hl * 4, chunk * hl)
+                    .expect("the output window");
+                gpu.flash()
+                    .enqueue_flash_latent_split(
+                        s,
+                        FlashSplitArgs {
+                            inputs: FlashInputs {
+                                q: &qw,
+                                kv: &cache,
+                                n_keys_buf: &n_keys,
+                                kq_scale: 1.0 / (D.head_k() as f32).sqrt(),
+                                geom: FlashGeom {
+                                    tokens: chunk,
+                                    heads: D.heads,
+                                    rope_dims: D.extra,
+                                    latent_dims: LATENT,
+                                },
+                            },
+                            part_v: &mut part_v,
+                            part_ms: &mut part_ms,
+                            y: &mut yw,
+                        },
+                    )
+                    .expect("the latent flash");
+                c0 += chunk;
+            }
+            y.to_host_vec(s).expect("the output back")
+        };
+        let whole = run(&[TOKENS]);
+        for cut in [
+            &[16, 16][..],
+            &[8, 8, 8, 8],
+            &[4; 8],
+            &[6, 26],
+            &[1, 31],
+            &[9, 9, 14],
+        ] {
+            assert!(
+                same(&whole, &run(cut), f32::to_bits),
+                "{TOKENS} tokens in one launch are the same bits cut as {cut:?}"
             );
         }
     }

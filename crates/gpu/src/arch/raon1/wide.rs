@@ -17,9 +17,10 @@
 //! - the RDA layer: [`rda_rows`], the common mixer
 //!   ([`crate::linear::mixer_kda`]) over [`RdaWide`]'s projections;
 //! - the latent layer: [`super::mla::rows_wide`], the projections wide, the
-//!   cache append, the gather, the per-head value projection ([`value_heads`])
-//!   and the output gate over the unit, the absorb and the latent flash in
-//!   chunks of [`PASS_ROWS`] query tokens (the flash takes no more);
+//!   cache append, the gather, the per-head key absorption ([`absorb_heads`])
+//!   and value projection ([`value_heads`]) and the output gate over the
+//!   unit, the latent flash in chunks of [`super::mla::ATTN_CHUNK`] query
+//!   tokens (the partials' size bounds them);
 //! - the feed-forward block: [`ffn`], below.
 
 use super::body::Scratch;
@@ -113,9 +114,52 @@ mod wide_kernels {
         // SAFETY: i < row·m <= y.len() by the launch contract.
         unsafe { *y.get_unchecked_mut(i) = x };
     }
+
+    /// `rows` windows of `width` values copied between two row-strided
+    /// buffers: `y[r·y_stride + y_off + c] = x[r·x_stride + x_off + c]` for
+    /// `r < rows`, `c < width` — a copy, so exact. One thread per value; the
+    /// host holds each window inside its stride, so no two threads store one
+    /// slot.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= rows * x_stride, y.len() >= rows * y_stride)
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn raon_row_window(
+        x: &[f32],
+        x_stride: u32,
+        x_off: u32,
+        width: u32,
+        rows: u32,
+        y_stride: u32,
+        y_off: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let (width, rows) = (width as usize, rows as usize);
+        if i >= width * rows {
+            return;
+        }
+        let r = i / width;
+        let c = i - r * width;
+        // SAFETY: r < rows and c < width, with x_off + width <= x_stride and
+        // y_off + width <= y_stride (host-checked), put both indices below
+        // rows·stride, inside x and y by the launch contract; thread i is the
+        // only writer of its (r, c) slot of y.
+        unsafe {
+            *y.get_unchecked_mut(r * y_stride as usize + y_off as usize + c) =
+                *x.get_unchecked(r * x_stride as usize + x_off as usize + c);
+        }
+    }
 }
 
-/// The module of the join.
+/// The module of the join and of the window copy.
 pub(super) struct JoinKernels {
     module: wide_kernels::LoadedModule,
 }
@@ -170,6 +214,53 @@ impl JoinKernels {
             .raon_join_qkv(stream, &prep, q, k, v, wq, wv, m, y)?;
         Ok(())
     }
+
+    /// Enqueue the copy of `rows` windows of `width` values: row `r` of `x`
+    /// starts at `r · x_stride + x_off`, row `r` of `y` at `r · y_stride +
+    /// y_off`. A window past its stride, or a buffer short of its rows, is
+    /// refused by name.
+    pub(super) fn enqueue_window(
+        &self,
+        stream: &CudaStream,
+        (x, x_stride, x_off): (&DeviceBuffer<f32>, usize, usize),
+        (width, rows): (usize, usize),
+        (y, y_stride, y_off): (&mut DeviceBuffer<f32>, usize, usize),
+    ) -> Result<(), GpuError> {
+        let what = "raon1 wide window";
+        if width == 0
+            || rows == 0
+            || x_off + width > x_stride
+            || y_off + width > y_stride
+            || x.len() < rows * x_stride
+            || y.len() < rows * y_stride
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{rows} windows of {width}: x stride {x_stride} from {x_off} over {} values, \
+                     y stride {y_stride} from {y_off} over {}",
+                    x.len(),
+                    y.len()
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", (width * rows).div_ceil(256))?;
+        let (x_stride, x_off, width, rows, y_stride, y_off) = (
+            launch_u32(what, "x_stride", x_stride)?,
+            launch_u32(what, "x_off", x_off)?,
+            launch_u32(what, "width", width)?,
+            launch_u32(what, "rows", rows)?,
+            launch_u32(what, "y_stride", y_stride)?,
+            launch_u32(what, "y_off", y_off)?,
+        );
+        let prep = self
+            .module
+            .prepare_raon_row_window(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module.raon_row_window(
+            stream, &prep, x, x_stride, x_off, width, rows, y_stride, y_off, y,
+        )?;
+        Ok(())
+    }
 }
 
 /// The activation forms a wide unit's sites read, one buffer per input the
@@ -192,6 +283,9 @@ pub(super) struct Forms {
     /// The latent attention's output, a column a (row, head), into the value
     /// projection.
     lat128: GemmAct,
+    /// The queries' nope parts, a column a (row, head), into the key
+    /// absorption.
+    nope32: GemmAct32,
 }
 
 /// The widths a wide unit is cut for.
@@ -201,8 +295,10 @@ pub(super) struct WideDims {
     /// `heads · v_head`: the output projections' input.
     pub attn: usize,
     pub q_lora: usize,
-    /// The latent layers' heads.
+    /// The latent layers' heads, and the nope values of a query head the key
+    /// absorption reads.
     pub heads: usize,
+    pub nope: usize,
     pub dense_ff: usize,
     pub shared_ff: usize,
     pub expert_ff: usize,
@@ -224,6 +320,7 @@ impl Forms {
             shared32: GemmAct32::new(stream, rows, d.shared_ff)?,
             slots32: GemmAct32::new(stream, slots, d.expert_ff)?,
             lat128: GemmAct::new(stream, rows * d.heads, LATENT)?,
+            nope32: GemmAct32::new(stream, rows * d.heads, d.nope)?,
         })
     }
 
@@ -235,6 +332,7 @@ impl Forms {
             + rows * (act32_col_bytes(d.q_lora) + act32_col_bytes(d.shared_ff))
             + slots * act32_col_bytes(d.expert_ff)
             + rows * d.heads * act_col_bytes(LATENT)
+            + rows * d.heads * act32_col_bytes(d.nope)
     }
 }
 
@@ -283,16 +381,22 @@ impl WideFfn {
     }
 }
 
-/// The latent layers' per-head value projection's table: a slot a (row, head),
-/// slot `s` routed to expert `s % heads`, the head's rows of the stack.
+/// The latent layers' per-head projections' table: a slot a (row, head), slot
+/// `s` routed to expert `s % heads`, the head's rows of the stack, shared by
+/// the key absorption and the value projection; and the rows between the
+/// absorption's steps.
 pub(super) struct HeadSlots {
     heads: usize,
     ids: DeviceBuffer<u32>,
     route: GemmRoute,
+    /// The absorption's input, the queries' nope values a slot, and its output,
+    /// [`LATENT`] values a slot.
+    nope: DeviceBuffer<f32>,
+    lat: DeviceBuffer<f32>,
 }
 
 impl HeadSlots {
-    fn new(stream: &CudaStream, heads: usize) -> Result<HeadSlots, GpuError> {
+    fn new(stream: &CudaStream, heads: usize, nope: usize) -> Result<HeadSlots, GpuError> {
         let slots = WIDE_ROWS * heads;
         let ids = (0..slots)
             .map(|s| launch_u32(WHAT, "head", s % heads))
@@ -301,15 +405,18 @@ impl HeadSlots {
             heads,
             ids: DeviceBuffer::from_host(stream, &ids)?,
             route: GemmRoute::new(stream, slots, heads)?,
+            nope: DeviceBuffer::zeroed(stream, slots * nope)?,
+            lat: DeviceBuffer::zeroed(stream, slots * LATENT)?,
         })
     }
 
-    fn bytes_of(heads: usize) -> usize {
-        4 * WIDE_ROWS * heads + route_bytes(WIDE_ROWS * heads, heads)
+    fn bytes_of(heads: usize, nope: usize) -> usize {
+        let slots = WIDE_ROWS * heads;
+        4 * slots + route_bytes(slots, heads) + 4 * slots * (nope + LATENT)
     }
 
     fn bytes(&self) -> usize {
-        self.ids.num_bytes() + self.route.bytes()
+        self.ids.num_bytes() + self.route.bytes() + self.nope.num_bytes() + self.lat.num_bytes()
     }
 }
 
@@ -369,7 +476,7 @@ impl Wide {
             forms: Forms::new(stream, d)?,
             parts: [part()?, part()?, part()?],
             dense: GemmRoute::new(stream, WIDE_ROWS, 1)?,
-            heads: HeadSlots::new(stream, d.heads)?,
+            heads: HeadSlots::new(stream, d.heads, d.nope)?,
             gemm: GemmKernels::load(ctx)?,
             join: JoinKernels::load(ctx)?,
             slots: CardSlotKernels::load(ctx)?,
@@ -383,7 +490,7 @@ impl Wide {
             + WideFfn::bytes_of(d)
             + 3 * 4 * WIDE_ROWS * d.attn
             + route_bytes(WIDE_ROWS, 1)
-            + HeadSlots::bytes_of(d.heads)
+            + HeadSlots::bytes_of(d.heads, d.nope)
             + stage
     }
 
@@ -461,6 +568,7 @@ impl Forms {
             + self.shared32.bytes()
             + self.slots32.bytes()
             + self.lat128.bytes()
+            + self.nope32.bytes()
     }
 }
 
@@ -492,6 +600,8 @@ pub(super) enum Input {
     Out,
     /// The query latent into `attn_q_b` ([`quantize_qb`]).
     Qb,
+    /// The queries' nope parts into the key absorption ([`absorb_heads`]).
+    Nope,
     /// The f32 rows alone (an F32 site).
     Plain,
 }
@@ -502,6 +612,7 @@ pub(super) fn input<'f>(forms: &'f Forms, which: Input, x: &'f DeviceBuffer<f32>
         Input::Hid => (Some(&forms.hid128), Some(&forms.hid32)),
         Input::Out => (None, Some(&forms.out32)),
         Input::Qb => (None, Some(&forms.qb32)),
+        Input::Nope => (None, Some(&forms.nope32)),
         Input::Plain => (None, None),
     };
     WideIn {
@@ -560,11 +671,92 @@ pub(super) fn quantize_hid(
     Ok(())
 }
 
+/// The head table ([`HeadSlots`]) filled for a unit's `m` rows: `m · heads`
+/// slots, which [`absorb_heads`] and [`value_heads`] read.
+pub(super) fn route_heads(
+    gpu: &Gpu,
+    (k, b): (&Kern<'_>, &mut Bufs<'_>),
+    (m, sink): (usize, FaultSink),
+) -> Result<(), GpuError> {
+    let h = &mut *b.heads;
+    k.gemm
+        .enqueue_route(gpu.stream(), &h.ids, m * h.heads, &mut h.route, sink)
+}
+
+/// A named refusal of a head table not filled for exactly `slots` slots.
+fn heads_filled(route: &GemmRoute, slots: usize) -> Result<(), GpuError> {
+    if route.filled() == Some(slots) {
+        return Ok(());
+    }
+    Err(GpuError::shape(
+        WHAT,
+        format!(
+            "the head table filled for the unit's {slots} slots (route_heads); it is filled for \
+             {:?}",
+            route.filled()
+        ),
+    ))
+}
+
+/// The widths of a latent layer's queries the key absorption reads: a head's
+/// query row is `head_k` values, its nope part the first `nope`, and the
+/// absorbed row `row` values with the latent last.
+#[derive(Clone, Copy)]
+pub(super) struct AbsorbShape {
+    pub head_k: usize,
+    pub nope: usize,
+    pub row: usize,
+}
+
+/// The latent layers' per-head key absorption over a unit's `m` rows: the nope
+/// part of each (row, head) slot of `q` in q8 blocks of 32, a slot routed to
+/// its head ([`route_heads`]), times `k_b`, a Q8_0 stack of `heads` experts of
+/// [`LATENT`] rows (`attn_k_b`), one 32-value GEMM, the result into each slot's
+/// absorbed row `qabs` after its first `row − LATENT` values, which the caller
+/// has laid there.
+pub(super) fn absorb_heads(
+    gpu: &Gpu,
+    (k, b): (&Kern<'_>, &mut Bufs<'_>),
+    (w, k_b): (&Weights, &str),
+    (q, m): (&DeviceBuffer<f32>, usize),
+    (shape, sink, qabs): (AbsorbShape, FaultSink, &mut DeviceBuffer<f32>),
+) -> Result<(), GpuError> {
+    let AbsorbShape { head_k, nope, row } = shape;
+    let (stream, h) = (gpu.stream(), &mut *b.heads);
+    let slots = m * h.heads;
+    heads_filled(&h.route, slots)?;
+    k.join.enqueue_window(
+        stream,
+        (q, head_k, 0),
+        (nope, slots),
+        (&mut h.nope, nope, 0),
+    )?;
+    k.g32
+        .enqueue_quantize_gemm32(stream, &h.nope, slots, &mut b.forms.nope32, sink)?;
+    let x_in = input(b.forms, Input::Nope, &h.nope);
+    site::gemm(
+        gpu,
+        &k.kernels(),
+        (SiteTy::Q8_0, w, SiteWeight::Resident(k_b)),
+        LATENT,
+        &x_in,
+        (&h.route, GemmInput::PerSlot),
+        slots,
+        &mut h.lat,
+    )?;
+    k.join.enqueue_window(
+        stream,
+        (&h.lat, LATENT, 0),
+        (LATENT, slots),
+        (qabs, row, row - LATENT),
+    )
+}
+
 /// The latent layers' per-head value projection over a unit's `m` rows: `att`
 /// (`m · heads` rows of [`LATENT`] values, the attention's output) times
 /// `wv`, a Q6_K stack of `heads` experts of `rows` rows (`attn_v_b`), into `av`
 /// (`m · heads` rows of `rows` values): the rows in q8_1 blocks, a slot a
-/// (row, head) routed to its head, one grouped GEMM.
+/// (row, head) routed to its head ([`route_heads`]), one grouped GEMM.
 pub(super) fn value_heads(
     gpu: &Gpu,
     (k, b): (&Kern<'_>, &mut Bufs<'_>),
@@ -579,9 +771,8 @@ pub(super) fn value_heads(
         ));
     };
     let (stream, heads) = (gpu.stream(), b.heads.heads);
+    heads_filled(&b.heads.route, m * heads)?;
     gpu.enqueue_quantize_gemm(att, m * heads, &mut b.forms.lat128, sink)?;
-    k.gemm
-        .enqueue_route(stream, &b.heads.ids, m * heads, &mut b.heads.route, sink)?;
     k.gemm.enqueue_gemm(
         stream,
         GemmArgs {
@@ -989,4 +1180,122 @@ fn routed(
         fault: sink,
     };
     k.slots.enqueue_card_acc(stream, &acc, &mut wf.routed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Gemm32Args, Gemm32Kernels, GemmAct32, GemmInput, GemmKernels, GemmRoute, LATENT};
+    use crate::Gpu;
+    use crate::arch::raon1::rda::tests::{Lcg, q8_0, resident};
+    use crate::gemm::Gemm32Weight;
+    use crate::q8f32::Q8_0GemvHeadsMcolArgs;
+    use crate::tensor::{Window, WindowMut};
+    use cuda_core::DeviceBuffer;
+    use model::arch::raon1::names;
+
+    /// The query's nope values the absorption reads a head: the file's `attn_k_b` is
+    /// 128 values (4 blocks of 32) a row.
+    const NOPE: usize = 128;
+
+    /// The key absorption's 32-value GEMM ([`super::absorb_heads`]'s core) over the file's
+    /// geometry is the f32 gemv's rows ([`crate::q8f32`]'s `q8_0_gemv_heads_mcol`, the pass's
+    /// absorb) to the activation's quantization: the rows' relative rms distance stays under
+    /// [`BAND`], where a step, a scale or a head's rows read wrong is O(1). Both the unit's
+    /// shape (40 heads, 256 rows: the slab entry's launch) and a small one.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_absorb_gemm_is_the_gemv_to_the_activation_quantization() {
+        // 8-bit codes of a block of 32 with the block's own scale: ~0.4 % of the rms of a result
+        // of 128 products; 1.0e-2 is 2.5 times that.
+        const BAND: f64 = 1.0e-2;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let (s, ctx) = (gpu.stream(), gpu.context());
+        let gemm = GemmKernels::load(ctx).expect("the route kernels");
+        let g32 = Gemm32Kernels::load(ctx).expect("the 32-value GEMM");
+        for (heads, rows) in [(40, 256), (6, 40)] {
+            let mut r = Lcg(0x0061_6273 + heads as u64);
+            let name = names::attn_k_b(3);
+            let w = resident(
+                &gpu,
+                &[q8_0(&mut r, name.clone(), vec![NOPE, LATENT, heads])],
+            );
+            let (qs, d) = w.q8_planes("test", &name).expect("the planes");
+            let slots = rows * heads;
+            let x = r.fill(slots * NOPE, -1.0, 1.0);
+            let x = DeviceBuffer::from_host(s, &x).expect("the rows up");
+            // The gemv, eight tokens a launch.
+            let mut want = DeviceBuffer::<f32>::zeroed(s, slots * LATENT).expect("the output");
+            for t0 in (0..rows).step_by(8) {
+                let mc = 8.min(rows - t0);
+                let xw = Window::<f32>::of(&x, t0 * heads * NOPE * 4, mc * heads * NOPE)
+                    .expect("the rows");
+                let mut yw = WindowMut::<f32>::of_mut(
+                    &mut want,
+                    t0 * heads * LATENT * 4,
+                    mc * heads * LATENT,
+                )
+                .expect("the output window");
+                gpu.q8f32()
+                    .enqueue_q8_0_gemv_heads_mcol(
+                        s,
+                        Q8_0GemvHeadsMcolArgs {
+                            qs,
+                            d,
+                            x: &xw,
+                            rows_per_head: LATENT,
+                            x_head_stride: NOPE,
+                            y_head_stride: LATENT,
+                            y_off: 0,
+                            m: mc,
+                            x_col_stride: heads * NOPE,
+                            y_col_stride: heads * LATENT,
+                            y: &mut yw,
+                        },
+                    )
+                    .expect("the gemv");
+            }
+            // The GEMM: a slot a (row, head), slot s on head s % heads.
+            let mut act = GemmAct32::new(s, slots, NOPE).expect("the form");
+            g32.enqueue_quantize_gemm32(s, &x, slots, &mut act, gpu.unlabelled_sink())
+                .expect("the quantization");
+            let ids: Vec<u32> = (0..slots).map(|i| (i % heads) as u32).collect();
+            let ids = DeviceBuffer::from_host(s, &ids).expect("the ids up");
+            let mut route = GemmRoute::new(s, slots, heads).expect("the table");
+            gemm.enqueue_route(s, &ids, slots, &mut route, gpu.unlabelled_sink())
+                .expect("the route");
+            let mut got = DeviceBuffer::<f32>::zeroed(s, slots * LATENT).expect("the output");
+            g32.enqueue_gemm32(
+                s,
+                Gemm32Args {
+                    w: Gemm32Weight::Q8_0Plane { qs, d },
+                    rows_per_expert: LATENT,
+                    act: &act,
+                    route: &route,
+                    input: GemmInput::PerSlot,
+                    y: &mut got,
+                },
+            )
+            .expect("the GEMM");
+            let (got, want) = (
+                got.to_host_vec(s).expect("the GEMM back"),
+                want.to_host_vec(s).expect("the gemv back"),
+            );
+            assert!(
+                got.iter().chain(&want).all(|v| v.is_finite()),
+                "{heads} heads, {rows} rows: finite outputs"
+            );
+            let (num, den) = got
+                .iter()
+                .zip(&want)
+                .fold((0.0f64, 0.0f64), |(n, d), (&g, &w)| {
+                    (n + f64::from(g - w).powi(2), d + f64::from(w).powi(2))
+                });
+            let rel = (num / den).sqrt();
+            println!("absorb gemm vs gemv: {heads} heads, {rows} rows: rel rms {rel:.3e}");
+            assert!(
+                rel <= BAND,
+                "{heads} heads, {rows} rows: the GEMM is {rel:.3e} (rel rms) from the gemv; band {BAND:.1e}"
+            );
+        }
+    }
 }

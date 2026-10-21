@@ -157,8 +157,10 @@ mod gate {
     /// a stage that carries state across units.
     const DRIFT_AT: &[usize] = &[64, 256, 512, 1024];
 
-    /// Where `prompt_wide_is_partitions` cuts a prompt: a multiple of a pass's rows, so the
-    /// attention chunks of both runs hold the same rows, and not of a unit's.
+    /// Where `prompt_wide_is_partitions` cuts a prompt: a multiple of a pass's rows, and of
+    /// neither a unit's rows nor a latent attention chunk's, so the second call's launches start
+    /// at other positions than the first call's: a row's bits do not depend on where its launch
+    /// begins.
     const SPLIT_AT: usize = 600;
     const _: () = assert!(SPLIT_AT.is_multiple_of(PASS));
 

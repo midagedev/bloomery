@@ -196,6 +196,7 @@ fn wide_dims(hp: &Hparams, kda: &KdaDims, mla: &MlaDims) -> Result<WideDims, Gpu
         attn,
         q_lora: hp.mla.q_lora,
         heads: mla.heads,
+        nope: mla.nope,
         dense_ff: hp.dense_ff,
         shared_ff: e.shared_ff(),
         expert_ff: e.ff,
@@ -256,9 +257,9 @@ impl Scratch {
         })?;
         let lin = d.shape;
         let (channels, v, n_v) = (lin.channels(), lin.n_v * HEAD, lin.n_v);
-        // The latent attention takes at most a pass's rows a launch: a wider
-        // unit runs it in chunks that share one set of partials.
-        let (part_v, part_ms) = mla::partials_lens_rows(m, ctx, rows.min(PASS_ROWS));
+        // The latent attention takes at most [`mla::ATTN_CHUNK`] rows a launch:
+        // a wider unit runs it in chunks that share one set of partials.
+        let (part_v, part_ms) = mla::partials_lens_rows(m, ctx, rows.min(mla::ATTN_CHUNK));
         let (heads, row) = (m.heads, m.row());
         Ok((
             [

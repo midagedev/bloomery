@@ -1,0 +1,26 @@
+# Raon-1-mini-preview's prompt: the key absorption as one 32-value GEMM over every (row, head) of a wide unit,
+# and the latent flash in launches of 32 query tokens (branch raonpf2 on PR #627's head raonpf).
+# Derivation [derived], RTX 3090, P = 512 in two 256-row units: a unit is a = 105.5 ms plus 19.5 us a key of
+# depth (from the two measured rows 2,317.3 and 1,759.6 tok/s); the latent loops are 672 of ~1,780 launches a
+# unit, 532 of them leave: 532 x f (16..20 us, the chunk path's floor) = 8.5..10.6 ms, less 2.2 ms of work the
+# bigger launches carry: 6.3..8.4 ms a unit, 4.5..6.2 % of the wall. docs: raonpf-design.md section 9.
+kind: ab
+question: does the wide absorb with 32-token flash launches read the derived gain on the prompt's rate, and so
+  the floor of a small launch (f = 16..20 us)?
+term: pp tok/s @ P = 512 (prose corpus ids), Raon-1-mini-preview Q4_K_M, bloomery-serve at the serving
+  defaults, RTX 3090; P = 4096 in the same lease as the second row
+unit: %
+predict: +4.0..+10.0
+rounds: 3
+sd: 0.6 % AGENTS.md Know the ruler, same-binary scatter; the ratio at 3 rounds reads +-1.4 %
+condition: one lease with the box quiet (no gate on either card); depth-serve.sh, one fresh server an arm and
+  a round, the base arm PR #627's bloomery-serve (raonpf) and the changed arm raonpf2's, D 512 and 4096 at C
+  4160 with N 64; rows tagged [cpu-busy], [other-busy] or [cold] are rerun
+decide-in: land: the README's Raon row takes the measured pp512 and pp4096; f is read from the effect (effect
+  / 532 launches); the next lever is the unit size (a 512-row unit reads each expert once for 24 columns,
+  section 9.5), read first by one nsys of a P = 512 prompt
+decide-below: under +4 %: the launch floor is under 16 us or the 32-token flash launch carries more work than
+  derived; read one nsys of a P = 512 prompt (nsys-gpu.sh): flash_latent_mma, flash_merge and the absorb GEMM
+  against the derived 5..8 ms a unit, before landing
+decide-above: beyond +10 %: the floor is above 20 us; the 3 remaining small-launch groups (mHC 225, RDA ~14 a
+  layer, routed FFN ~10 a layer) are the next bulk lever, each at f; land
