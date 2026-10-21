@@ -11184,6 +11184,10 @@ def narrow_self_test(expect, side: Side) -> None:
 
         lib_pair = pair("libs", "gx", libs)
         swap, kquant = pair("swap", "gate_swap", own), pair("kquant", "gate_kquant", own)
+        # PIN(2026-10-22): gate_gpu_device joins the bin carriers: its conformance kernels are its own, so a change
+        # under crates/gpu reaches its closure too, and "both bins scanned" scans it as well (the message named it
+        # "not scanned").
+        device = pair("device", "gate_gpu_device", own)
 
         def picked(*pairs) -> tuple[set[str], str]:
             got = narrow(["crates/gpu/src/model.rs"], side, side, list(pairs), gpu_rows)
@@ -11198,7 +11202,7 @@ def narrow_self_test(expect, side: Side) -> None:
         got, why = picked(lib_pair, kquant)
         expect("gate-gpu-kquant" not in got and "gate-gpu-swap" in got and "bin gate_kquant" not in why and "bin gate_swap not scanned" in why,
                f"narrow: a scan of gate_kquant does not cover gate_kquant alone: {sorted(got)} {why}")
-        got, why = picked(lib_pair, swap, kquant)
+        got, why = picked(lib_pair, swap, kquant, device)
         expect(not {"gate-gpu-swap", "gate-gpu-kquant"} & got and "not scanned" not in why, f"narrow: both bins scanned still keep a bin carrier's gates: {sorted(got)} {why}")
         got, why = picked(lib_pair, pair("swap-nobundle", "gate_swap", ("bloomery-gpu",)))
         expect("gate-gpu-swap" in got and "bin gate_swap not scanned" in why,

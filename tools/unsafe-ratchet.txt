@@ -13,7 +13,13 @@ decision 2 0 0
 # PIN(2026-10-22): device 3 blocks, 6 fns, 5 impls, a new crate, not old code relaxed: the contract's `Elem` impls for
 # the five plain types, the two `from_raw` constructors and the two `Shared` accessors that state their invariant in
 # `# Safety`, and the mock's zeroed element, each with its SAFETY line.
-device 3 6 5
+# PIN(2026-10-22): device 3 -> 17 blocks, 6 -> 8 fns, 5 -> 9 impls, code moved in and new code, not old code relaxed:
+# the shared pages' one owner (`HostPages`, pages.rs, moved from metal) with its constructor, its two slice
+# accessors, its Send/Sync and its six blocks (the atomic view, the zeroing, the ranged copy and its tests'); the
+# `Elem` impls of u64 and f64; the `Shared::host` default's block; the mock's `HostPages` and `host_mut` blocks; and
+# the conformance clauses' two borrows of a shared buffer after the event its writer came down at. Each has its SAFETY
+# line.
+device 17 8 9
 embed 0 0 0
 # PIN(2026-10-07): engram 6 -> 7 blocks, new code, not old code relaxed: the row reads over a table's bytes in a
 # mapping the reader does not own (TableBytes, which a split's table, Qwen3.8's PLE, and a site share) advise its
@@ -422,7 +428,11 @@ gguf 7 2 0
 # (arch/raon1/wide.rs) copies a column window of each of a wide unit's rows; its one-writer store has its SAFETY line.
 # PIN(2026-10-22): gpu 2119 -> 2121 blocks, a new kernel entry, not old code relaxed: gemm_iq3s (gemm/grouped.rs)
 # reads the file's IQ3_S blocks: its block load (iq3s_dec) and its lane decode (iq3s_lane). Each block has its SAFETY line.
-gpu 2121 247 10
+# PIN(2026-10-22): gpu 2121 -> 2134 blocks, 247 -> 248 fns, new code, not old code relaxed: the card as the device
+# contract's `Device` (device.rs): the four window constructors of its two buffers, the shared buffer's `HostPages`
+# and `host_mut` (its one unsafe fn), the engine stream's transparent view, the two window bindings a launch takes, and
+# the four driver copies (the fault words', a read, a write, a copy between windows), each with its SAFETY line.
+gpu 2134 248 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -500,7 +510,10 @@ gpu-deepseek41 382 44 0
 # PIN(2026-10-22): gpu-gates 88 -> 89 blocks, new code, not old code relaxed: MiniCPM-V 4.7's full-vocabulary DSpark
 # draft (shared/dspark_hf.rs) borrows the target's resident Q6_K head in place, as the DFlash2 draft does, with its
 # SAFETY line; the seat checks the draft's CUDA context against the target's first.
-gpu-gates 89 5 1
+# PIN(2026-10-22): gpu-gates 89 -> 93 blocks, new code, not old code relaxed: gate_gpu_device's module load, its raise
+# kernel's FaultSink over the gate's own fault word and its atomic view of the first word for a layer past the last,
+# and the host flag's drop once the stream that waited on it is drained, each with its SAFETY line.
+gpu-gates 93 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of
@@ -553,9 +566,9 @@ jinja 0 0 0
 levers 0 0 0
 # PIN(2026-10-22): metal 21 blocks, 6 fns, 13 impls, a new crate, not old code relaxed: the Objective-C bindings declare
 # no Metal protocol thread-safe, so the thread-safe handles and the window's raw carry `unsafe impl Send/Sync` with Apple's
-# list as their invariant; the shared pages' one owner (`HostPages`) holds every access through the contents pointer; the
-# window raw's buffer dereference and the encoder's two argument calls each carry their SAFETY line.
-metal 21 6 13
+# list as their invariant; the window raw's buffer dereference and pages and the encoder's two argument calls each carry
+# their SAFETY line. Lowered to 15 blocks, 3 fns, 11 impls when the shared pages' owner moved to the device crate.
+metal 15 3 11
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.

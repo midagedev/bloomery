@@ -189,6 +189,7 @@ gate-jinja	common		host	tokenizer_jinja
 gate-kv	family	deepseek2	host	kv_pool_checkpoint
 gate-levers	common		lever	levers
 gate-device	common		device	device_seam
+gate-gpu-device	common		device	device_seam
 gate-mimo2-meta	family	mimo2	meta	arch_registry
 gate-model-hf	common		host	arch_registry
 gate-models	common		host	arch_registry
