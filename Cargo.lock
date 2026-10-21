@@ -151,6 +151,7 @@ dependencies = [
 name = "bloomery-gpu"
 version = "0.1.0"
 dependencies = [
+ "bloomery-device",
  "bloomery-engram",
  "bloomery-gguf",
  "bloomery-levers",
@@ -190,6 +191,7 @@ version = "0.3.8"
 dependencies = [
  "bloomery-app",
  "bloomery-decision",
+ "bloomery-device",
  "bloomery-engram",
  "bloomery-gguf",
  "bloomery-gpu",

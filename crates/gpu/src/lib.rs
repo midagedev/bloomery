@@ -36,6 +36,7 @@ pub mod card_leg;
 pub mod card_slots;
 pub mod checkpoint;
 pub mod cores;
+pub mod device;
 pub mod draft;
 pub mod draft_taps;
 pub mod dspark;
@@ -2151,39 +2152,42 @@ fn integrated_room(what: &'static str) -> Result<u64, GpuError> {
 pub fn census() -> Result<Vec<::model::placement::workstation::DeviceInfo>, GpuError> {
     let n = usize::try_from(cuda_core::Device::device_count()?)
         .map_err(|_| GpuError::shape("census", "negative device count"))?;
-    let mut out = Vec::with_capacity(n);
-    for ordinal in 0..n {
-        let dev = cuda_core::Device::raw_device(ordinal)?;
-        let mut total = 0usize;
-        // SAFETY: `total` is a live out-pointer for the call and `dev` a
-        // device handle the driver just returned.
-        let rc = unsafe { cuda_core::sys::cuDeviceTotalMem_v2(&mut total, dev) };
-        graph::cu(rc, "cuDeviceTotalMem")?;
-        let mut bus: [std::ffi::c_char; 32] = [0; 32];
-        let len = std::ffi::c_int::try_from(bus.len()).expect("32 fits a c_int");
-        // SAFETY: `bus` is a live, writable buffer of `len` bytes for the
-        // call, and the driver writes at most that many, a NUL included.
-        let rc = unsafe { cuda_core::sys::cuDeviceGetPCIBusId(bus.as_mut_ptr(), len, dev) };
-        graph::cu(rc, "cuDeviceGetPCIBusId")?;
-        let bus: Vec<u8> = bus
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c.to_ne_bytes()[0])
-            .collect();
-        let integrated = raw_device_integrated(dev)?;
-        out.push(::model::placement::workstation::DeviceInfo {
-            ordinal: u32::try_from(ordinal)
-                .map_err(|_| GpuError::shape("census", "an ordinal past u32"))?,
-            name: raw_device_name(dev)?,
-            total_bytes: total as u64,
-            free_bytes: raw_device_free_bytes(dev, integrated)?,
-            integrated,
-            uuid: raw_device_uuid(dev)?,
-            pci_bus: String::from_utf8_lossy(&bus).into_owned(),
-            held_by: None,
-        });
-    }
-    Ok(out)
+    (0..n).map(device_info).collect()
+}
+
+/// The census row of the visible device at `ordinal` ([`census`]).
+pub(crate) fn device_info(
+    ordinal: usize,
+) -> Result<::model::placement::workstation::DeviceInfo, GpuError> {
+    let dev = cuda_core::Device::raw_device(ordinal)?;
+    let mut total = 0usize;
+    // SAFETY: `total` is a live out-pointer for the call and `dev` a
+    // device handle the driver just returned.
+    let rc = unsafe { cuda_core::sys::cuDeviceTotalMem_v2(&mut total, dev) };
+    graph::cu(rc, "cuDeviceTotalMem")?;
+    let mut bus: [std::ffi::c_char; 32] = [0; 32];
+    let len = std::ffi::c_int::try_from(bus.len()).expect("32 fits a c_int");
+    // SAFETY: `bus` is a live, writable buffer of `len` bytes for the
+    // call, and the driver writes at most that many, a NUL included.
+    let rc = unsafe { cuda_core::sys::cuDeviceGetPCIBusId(bus.as_mut_ptr(), len, dev) };
+    graph::cu(rc, "cuDeviceGetPCIBusId")?;
+    let bus: Vec<u8> = bus
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c.to_ne_bytes()[0])
+        .collect();
+    let integrated = raw_device_integrated(dev)?;
+    Ok(::model::placement::workstation::DeviceInfo {
+        ordinal: u32::try_from(ordinal)
+            .map_err(|_| GpuError::shape("census", "an ordinal past u32"))?,
+        name: raw_device_name(dev)?,
+        total_bytes: total as u64,
+        free_bytes: raw_device_free_bytes(dev, integrated)?,
+        integrated,
+        uuid: raw_device_uuid(dev)?,
+        pci_bus: String::from_utf8_lossy(&bus).into_owned(),
+        held_by: None,
+    })
 }
 
 /// A CUDA context on one device ([`Gpu::new`]: device 0; [`Gpu::open_card`]:
@@ -2589,18 +2593,31 @@ impl Gpu {
     /// raise into what it clears, every launch after it starts clean. Never
     /// inside a capture.
     pub fn clear_fault(&self) -> Result<(), GpuError> {
+        self.clear_fault_on(&self.stream)
+    }
+
+    /// [`Gpu::clear_fault`] in `stream`'s order: the launches enqueued on it
+    /// before may still raise into what it clears, those after it start
+    /// clean. A stream of another context is refused by name.
+    pub(crate) fn clear_fault_on(&self, stream: &CudaStream) -> Result<(), GpuError> {
+        if stream.context().cu_ctx() != self.ctx.cu_ctx() {
+            return Err(GpuError::shape(
+                "Gpu::clear_fault",
+                "a stream of another context",
+            ));
+        }
         self.ctx.bind_to_thread()?;
         // SAFETY: both ranges lie inside this Gpu's own live allocation of
-        // FAULT_ALLOC_WORDS >= FAULT_WORDS u32s, the stream handle is this
-        // Gpu's engine stream, and this context is current on the calling
-        // thread (bound above); the memsets are ordered on that stream like
-        // every launch that touches the allocation.
+        // FAULT_ALLOC_WORDS >= FAULT_WORDS u32s, the stream is one of this
+        // Gpu's context (checked above), and this context is current on the
+        // calling thread (bound above); the memsets are ordered on that
+        // stream like every launch on it that touches the allocation.
         let rc = unsafe {
             cuda_core::sys::cuMemsetD32Async(
                 self.fault.cu_deviceptr(),
                 FAULT_NONE,
                 1,
-                self.stream.cu_stream(),
+                stream.cu_stream(),
             )
         };
         graph::cu(rc, "cuMemsetD32Async (fault word)")?;
@@ -2610,7 +2627,7 @@ impl Gpu {
                 self.fault.cu_deviceptr() + 4,
                 0,
                 FAULT_WORDS - 1,
-                self.stream.cu_stream(),
+                stream.cu_stream(),
             )
         };
         graph::cu(rc, "cuMemsetD32Async (fault site masks)")?;
