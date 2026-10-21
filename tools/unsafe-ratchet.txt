@@ -568,10 +568,10 @@ placement 0 0 0
 # PIN(2026-10-20): qdot 205 -> 217 blocks, new code, not old code relaxed: swiglu_clamp_avx2 separates
 # its expf and checked clamp passes. Full vectors and the padded tail each have three expf blocks (load,
 # v_silu, store) and four clamp blocks (three loads, one store): 14 in place of 2, each with its SAFETY line.
-# PIN(2026-10-21): qdot 217 -> 221 blocks, 95 -> 97 fns, new code, not old code relaxed: swiglu_oai's AVX2 rule, the
+# PIN(2026-10-21): qdot 217 -> 227 blocks, 95 -> 97 fns, new code, not old code relaxed: swiglu_oai's AVX2 rule, the
 # dispatch in swiglu_oai (1 block), v_swiglu_oai and its v_expf call (1 block), swiglu_oai_avx2's full-vector and
-# padded-tail blocks (2), each with its SAFETY line.
-qdot 221 97 0
+# padded-tail bodies (two loads, the v_swiglu_oai call and the store each: 8), each with its own SAFETY line.
+qdot 227 97 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1

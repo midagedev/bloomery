@@ -9724,26 +9724,30 @@ unsafe fn swiglu_oai_avx2(
     let mut acc = _mm256_setzero_si256();
     let mut i = 0;
     while i < full {
-        // SAFETY: i + 8 <= full <= gate.len(), up.len() and out.len().
-        unsafe {
-            let g = _mm256_loadu_ps(gate.as_ptr().add(i));
-            let u = _mm256_loadu_ps(up.as_ptr().add(i));
-            acc = max_abs_bits(acc, g, u);
-            _mm256_storeu_ps(out.as_mut_ptr().add(i), v_swiglu_oai(g, u, (a, hi, lo)));
-        }
+        // SAFETY: i + 8 <= full <= gate.len().
+        let g = unsafe { _mm256_loadu_ps(gate.as_ptr().add(i)) };
+        // SAFETY: i + 8 <= full <= up.len().
+        let u = unsafe { _mm256_loadu_ps(up.as_ptr().add(i)) };
+        acc = max_abs_bits(acc, g, u);
+        // SAFETY: this function requires AVX2 and FMA.
+        let v = unsafe { v_swiglu_oai(g, u, (a, hi, lo)) };
+        // SAFETY: i + 8 <= full <= out.len().
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(i), v) };
         i += 8;
     }
     if full < n {
         let (mut gp, mut upad, mut op) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
         gp[..n - full].copy_from_slice(&gate[full..]);
         upad[..n - full].copy_from_slice(&up[full..]);
-        // SAFETY: the three arrays are eight f32 each.
-        unsafe {
-            let g = _mm256_loadu_ps(gp.as_ptr());
-            let u = _mm256_loadu_ps(upad.as_ptr());
-            acc = max_abs_bits(acc, g, u);
-            _mm256_storeu_ps(op.as_mut_ptr(), v_swiglu_oai(g, u, (a, hi, lo)));
-        }
+        // SAFETY: gp holds eight f32 values.
+        let g = unsafe { _mm256_loadu_ps(gp.as_ptr()) };
+        // SAFETY: upad holds eight f32 values.
+        let u = unsafe { _mm256_loadu_ps(upad.as_ptr()) };
+        acc = max_abs_bits(acc, g, u);
+        // SAFETY: this function requires AVX2 and FMA.
+        let v = unsafe { v_swiglu_oai(g, u, (a, hi, lo)) };
+        // SAFETY: op holds eight writable f32 values.
+        unsafe { _mm256_storeu_ps(op.as_mut_ptr(), v) };
         out[full..].copy_from_slice(&op[..n - full]);
     }
     let finite = _mm256_cmpgt_epi32(_mm256_castps_si256(_mm256_set1_ps(f32::INFINITY)), acc);
