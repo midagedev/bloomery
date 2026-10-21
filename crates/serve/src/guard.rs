@@ -301,9 +301,22 @@ impl<'a> Guard<'a> {
         // What the template renders of the client's text without the mark: a template that cuts
         // a marked text apart, or that reads it another way, renders other text than the marked
         // render does without its marks.
-        let encoded = serde_json::to_string(vars).expect("JSON values serialize");
-        let original: Map<String, Value> = serde_json::from_str(&encoded.replace(&self.mark, ""))
-            .expect("guard symbols cannot change JSON syntax");
+        let mut original = vars.clone();
+        let mut pending: Vec<&mut Value> = original.values_mut().collect();
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::String(s) => *s = s.replace(&self.mark, ""),
+                Value::Array(a) => pending.extend(a.iter_mut()),
+                Value::Object(o) => {
+                    *o = std::mem::take(o)
+                        .into_iter()
+                        .map(|(k, v)| (k.replace(&self.mark, ""), v))
+                        .collect();
+                    pending.extend(o.values_mut());
+                }
+                Value::Null | Value::Bool(_) | Value::Number(_) => {}
+            }
+        }
         let expected = template
             .render(&original)
             .map_err(|_| GuardError::Severed {

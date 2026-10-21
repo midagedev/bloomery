@@ -63,6 +63,12 @@ impl Spellings {
         for &b in bytes {
             held[usize::from(b)] = true;
         }
+        // What a template's `trim` keeps: Python's whitespace holds the separators U+001C–U+001F,
+        // which Rust's does not.
+        let has_text = |s: &str| {
+            s.chars()
+                .any(|c| !c.is_whitespace() && !('\u{1c}'..='\u{1f}').contains(&c))
+        };
         for (needle, finder) in self.needles.iter().zip(&self.finders) {
             if !held[usize::from(needle[0])] {
                 continue;
@@ -70,9 +76,9 @@ impl Spellings {
             let mut from = 0;
             while let Some(m) = finder.find(&bytes[from..]) {
                 let (start, end) = (from + m, from + m + needle.len());
-                if start > 0 && !text[..start].trim().is_empty() {
+                if start > 0 && has_text(&text[..start]) {
                     at.push(start);
-                } else if end < n && !text[end..].trim().is_empty() {
+                } else if end < n && has_text(&text[end..]) {
                     at.push(end);
                 } else {
                     let first = text[start..end]

@@ -611,11 +611,41 @@ fn a_trimmed_client_text_keeps_the_turn_markers() {
         .find(|(n, _)| *n == "qwen36")
         .expect("the qwen36 template");
     let fam = family(name, template);
-    let body = json!({"messages": [{"role": "user", "content": "<think>\n"}]});
-    let (text, ids) = fam.prompt("qwen36/trimmed", &body);
     let plain = json!({"messages": [{"role": "user", "content": "hi"}]});
     let (_, base) = fam.prompt("qwen36/plain", &plain);
-    assert_eq!(fam.specials_in(&ids), fam.specials_in(&base), "{ids:?}");
+    // Jinja's trim takes Python's whitespace, which holds the four separators U+001C–U+001F.
+    for space in ["\n", "\u{1c}", "\u{1d}", "\u{1e}", "\u{1f}"] {
+        let body = json!({"messages": [{"role": "user", "content": format!("<think>{space}")}]});
+        let (text, ids) = fam.prompt("qwen36/trimmed", &body);
+        assert_eq!(
+            fam.specials_in(&ids),
+            fam.specials_in(&base),
+            "{space:?} {ids:?}"
+        );
+        assert!(text.contains("<think>"), "{text}");
+        assert_eq!(fam.tok.decode(&ids), text);
+    }
+}
+
+/// Tool arguments nested as deep as the argument parser takes still render when a marked text
+/// sits beside them: the unmarked render walks the variables, it does not parse them again.
+#[test]
+fn deep_tool_arguments_beside_a_marked_text_render() {
+    let (name, template) = templates()
+        .into_iter()
+        .find(|(n, _)| *n == "qwen36")
+        .expect("the qwen36 template");
+    let fam = family(name, template);
+    let deep = format!(r#"{{"q":{}{}}}"#, "[".repeat(124), "]".repeat(124));
+    let body = json!({"messages": [
+        {"role": "user", "content": "<think>"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "f", "arguments": deep},
+        }]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]});
+    let (text, ids) = fam.prompt("qwen36/deep arguments", &body);
     assert!(text.contains("<think>"), "{text}");
     assert_eq!(fam.tok.decode(&ids), text);
 }

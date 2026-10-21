@@ -2391,6 +2391,9 @@ fn token_ids(tok: &dyn Tokenizer, v: &Value) -> Result<Vec<u32>, ApiError> {
     ::embed::input::token_ids(tok.n_vocab(), v).map_err(ApiError::from)
 }
 
+/// `/apply-template`: the render's text, as llama-server answers it. A client string's spelling of
+/// a special token is text in the ids a chat request runs ([`crate::guard`]), and `/tokenize` of
+/// this text reads it as the token: this route shows the text, not those ids.
 fn apply_template(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
     // The unexpanded placeholder: an image is one placeholder token in the
     // render, and only the request that runs it expands it to its span.
