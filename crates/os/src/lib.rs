@@ -484,9 +484,9 @@ pub struct HostMemory {
 /// The host's total and available memory.
 ///
 /// Linux: `/proc/meminfo`'s `MemTotal` and `MemAvailable`. macOS: the
-/// machine's `hw.memsize` and its host statistics' free, inactive and
-/// purgeable pages. A field the platform does not report is refused by
-/// name, never read as 0.
+/// machine's `hw.memsize` and its host statistics' free and inactive
+/// pages. A field the platform does not report is refused by name, never
+/// read as 0.
 #[cfg(target_os = "linux")]
 pub fn host_memory() -> Result<HostMemory, OsError> {
     let text = std::fs::read_to_string("/proc/meminfo").map_err(|e| {
@@ -505,9 +505,9 @@ pub fn host_memory() -> Result<HostMemory, OsError> {
 /// The host's total and available memory.
 ///
 /// Linux: `/proc/meminfo`'s `MemTotal` and `MemAvailable`. macOS: the
-/// machine's `hw.memsize` and its host statistics' free, inactive and
-/// purgeable pages. A field the platform does not report is refused by
-/// name, never read as 0.
+/// machine's `hw.memsize` and its host statistics' free and inactive
+/// pages. A field the platform does not report is refused by name, never
+/// read as 0.
 #[cfg(target_os = "macos")]
 pub fn host_memory() -> Result<HostMemory, OsError> {
     let total_bytes = sysctl_u64("hw.memsize")?;
@@ -538,10 +538,11 @@ pub fn host_memory() -> Result<HostMemory, OsError> {
     }
     // SAFETY: the call returned `KERN_SUCCESS`, so it wrote the statistics.
     let statistics = unsafe { statistics.assume_init() };
+    // Purgeable pages sit on the active and inactive queues too, so they are
+    // not added again.
     let pages = statistics
         .free_count
-        .saturating_add(statistics.inactive_count)
-        .saturating_add(statistics.purgeable_count);
+        .saturating_add(statistics.inactive_count);
     Ok(HostMemory {
         total_bytes,
         available_bytes: u64::from(pages).saturating_mul(page),
@@ -651,48 +652,30 @@ fn max_rss_of(who: libc::c_int) -> Result<u64, OsError> {
 /// kibibytes, macOS in bytes.
 #[cfg(target_os = "linux")]
 fn rss_bytes(maxrss: libc::c_long) -> u64 {
-    u64::try_from(maxrss.max(0))
-        .unwrap_or(0)
-        .saturating_mul(1024)
+    u64::try_from(maxrss)
+        .expect("getrusage peak RSS must be nonnegative")
+        .checked_mul(1024)
+        .expect("getrusage peak RSS in bytes exceeds u64")
 }
 
 /// The peak resident set `maxrss` holds, in bytes: Linux counts it in
 /// kibibytes, macOS in bytes.
 #[cfg(target_os = "macos")]
 fn rss_bytes(maxrss: libc::c_long) -> u64 {
-    u64::try_from(maxrss.max(0)).unwrap_or(0)
+    u64::try_from(maxrss).expect("getrusage peak RSS must be nonnegative")
 }
 
 /// The `u32` the named sysctl holds.
 #[cfg(target_os = "macos")]
 fn sysctl_u32(name: &str) -> Result<u32, OsError> {
-    let mut value: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>();
-    let c = std::ffi::CString::new(name)
-        .map_err(|e| OsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-    // SAFETY: `value` is a live `c_int` and `len` its size; the call writes
-    // at most that many bytes into it.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c.as_ptr(),
-            (&raw mut value).cast(),
-            (&raw mut len),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return Err(sysctl_refused(name));
-    }
-    if len != std::mem::size_of::<libc::c_int>() {
-        return Err(sysctl_width(name, len));
-    }
-    u32::try_from(value).map_err(|_| {
+    let invalid = || {
         OsError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("{name} is not a count"),
         ))
-    })
+    };
+    let value = i32::try_from(sysctl_u64(name)?).map_err(|_| invalid())?;
+    u32::try_from(value).map_err(|_| invalid())
 }
 
 /// The `u64` the named sysctl holds.
@@ -1236,9 +1219,11 @@ mod tests {
             (263_741_212 * 1024, 257_300_180 * 1024)
         );
         assert!(super::meminfo_bytes("MemTotal: 1 kB\n").is_err());
-        assert!(super::meminfo_bytes("MemAvailable:   12x kB\n").is_err());
-        assert!(super::meminfo_bytes("MemAvailable:   12 MB\n").is_err());
-        assert!(super::meminfo_bytes("MemAvailable:    kB\n").is_err());
+        assert!(super::meminfo_bytes("MemAvailable: 1 kB\n").is_err());
+        for value in ["12x kB", "12 MB", "kB"] {
+            let text = format!("MemTotal: 1 kB\nMemAvailable: {value}\n");
+            assert!(super::meminfo_bytes(&text).is_err(), "{value}");
+        }
     }
 
     /// The machine's performance levels: their cores, their threads and the
@@ -1288,6 +1273,10 @@ mod tests {
             (1 << 20..=total).contains(&bytes),
             "the peak is {bytes} B on a {total} B host"
         );
+        #[cfg(target_os = "linux")]
+        assert_eq!(super::rss_bytes(2048), 2_097_152);
+        #[cfg(target_os = "macos")]
+        assert_eq!(super::rss_bytes(2048), 2048);
         let children = super::children_max_rss_bytes().expect("the children's peak reads");
         assert!(children <= total, "the children's peak is {children} B");
     }

@@ -7,7 +7,7 @@ pub use bloomery_placement::placement::workstation::*;
 
 /// The host's available bytes now ([`host_room`]): the smaller of the
 /// platform's own reading of the host's memory — Linux's `MemAvailable` in
-/// `/proc/meminfo`, macOS's free, inactive and purgeable pages — and the
+/// `/proc/meminfo`, macOS's free and inactive pages — and the
 /// room under every cgroup v2 memory limit above this process — inside a
 /// container (`docker run --memory`), a systemd scope (`MemoryMax`) or a
 /// pod, the platform's reading still shows the whole machine, and the
@@ -143,7 +143,7 @@ mod tests {
         let (bytes, read) = host_available_read().expect("the host room reads");
         assert!(bytes > 0, "the host has memory available");
         // Linux: the room is `/proc/meminfo`'s `MemAvailable`. macOS: the
-        // host statistics' free, inactive and purgeable pages.
+        // host statistics' free and inactive pages.
         // A cgroup limit above this process, or `BLOOMERY_HOST_ROOM`, may name
         // the reading in place of the platform's own.
         let word = read.word();

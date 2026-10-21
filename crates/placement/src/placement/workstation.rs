@@ -1255,7 +1255,7 @@ impl HostNeed {
 pub enum HostRead {
     /// `/proc/meminfo`'s `MemAvailable`.
     MemAvailable,
-    /// The host's free, inactive and purgeable pages, as the platform's
+    /// The host's free and inactive pages, as the platform's
     /// virtual-memory statistics report them (macOS's
     /// `host_statistics64(HOST_VM_INFO64)`).
     VmStats,
@@ -1271,10 +1271,7 @@ impl fmt::Display for HostRead {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HostRead::MemAvailable => write!(f, "MemAvailable in /proc/meminfo"),
-            HostRead::VmStats => write!(
-                f,
-                "the host's free, inactive and purgeable pages (vm_statistics64)"
-            ),
+            HostRead::VmStats => write!(f, "the host's free and inactive pages (vm_statistics64)"),
             HostRead::Cgroup { path } => write!(
                 f,
                 "the room under the cgroup v2 memory limit at /sys/fs/cgroup{path} \
