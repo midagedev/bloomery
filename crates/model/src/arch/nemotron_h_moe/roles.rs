@@ -15,7 +15,7 @@ use super::names::{
     ATTN_NORM, EXP_PROBS_B, FFN_DOWN_EXPS, FFN_DOWN_SHEXP, FFN_GATE_INP, FFN_LATENT_DOWN,
     FFN_LATENT_UP, FFN_UP_EXPS, FFN_UP_SHEXP, SSM_IN_SCALE, SSM_OUT_SCALE,
 };
-use crate::arch::classify::{Counts, classify_with};
+use crate::arch::classify::{Counts, classify_layers};
 use crate::arch::hybrid::{ATTENTION, MAMBA};
 use crate::arch::stems::{Stem, opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
@@ -51,37 +51,13 @@ pub(super) fn stems_of(kind: Kind) -> Vec<&'static [Stem]> {
     }
 }
 
-/// A tensor's role and layer by its name; `None` when the tables of its
-/// layer's kind do not hold it.
-fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
-    match name {
-        "token_embd.weight" => return Some((Role::TokenEmbedding, None)),
-        "output_norm.weight" | "output.weight" => return Some((Role::Head, None)),
-        _ => {}
-    }
-    let (layer, stem) = name.strip_prefix("blk.")?.split_once('.')?;
-    let layer: usize = layer.parse().ok().filter(|&l| l < hp.n_layer)?;
-    stems_of(hp.kinds[layer])
-        .into_iter()
-        .flat_map(|g| g.iter())
-        .find(|s| s.name == stem)
-        .map(|s| (s.role, Some(layer)))
-}
-
 /// Every tensor of `split` with its role and header facts. The expert
 /// counts are `expert_count`, the largest layer's, and the top-k the MoE
 /// layers share: a layer's own count is its description's
 /// (`models::Moe::experts`).
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
-    classify_with(
-        split,
-        |name| role(name, hp),
-        Counts {
-            layers: hp.n_layer,
-            experts: hp.n_expert as u64,
-            experts_used: hp.top_k_max() as u64,
-        },
-    )
+    let counts = Counts::new(hp.n_layer, hp.n_expert, hp.top_k_max());
+    classify_layers(split, counts, |l| stems_of(hp.kinds[l]))
 }
 
 #[cfg(test)]

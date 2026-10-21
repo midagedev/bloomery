@@ -19,6 +19,18 @@ pub(crate) struct Counts {
     pub(crate) experts_used: u64,
 }
 
+impl Counts {
+    /// The counts of a family that reports `layers` layers, `experts` routed experts and `used` of
+    /// them per token.
+    pub(crate) const fn new(layers: usize, experts: usize, used: usize) -> Counts {
+        Counts {
+            layers,
+            experts: experts as u64,
+            experts_used: used as u64,
+        }
+    }
+}
+
 /// The role of a model-level tensor every family names alike: the token embedding, and the output
 /// norm and matrix (the head); `None` for any other name.
 pub(crate) fn model_level_role(name: &str) -> Option<(Role, Option<usize>)> {
@@ -37,23 +49,60 @@ pub(crate) fn block_stem(name: &str, n_layer: usize) -> Option<(usize, &str)> {
     Some((layer, stem))
 }
 
-/// The role and layer of `name` in a family whose layers' stems sit in `groups`: the model-level
-/// three, else a `blk.{layer}.{stem}` below `n_layer` whose stem a group holds; `None` for any other
-/// name.
-pub(crate) fn role_in(
-    groups: &[&[Stem]],
+/// The role and layer of `name` in a family whose layer `l` carries the stem groups of
+/// `groups_of(l)`: the model-level three, else a `blk.{layer}.{stem}` below `n_layer` whose stem a
+/// group of its layer holds; `None` for any other name.
+pub(crate) fn role_by_layer<'a, G: IntoIterator<Item = &'a [Stem]>>(
     name: &str,
     n_layer: usize,
+    groups_of: impl FnOnce(usize) -> G,
 ) -> Option<(Role, Option<usize>)> {
     if let Some(model_level) = model_level_role(name) {
         return Some(model_level);
     }
     let (layer, stem) = block_stem(name, n_layer)?;
-    groups
-        .iter()
+    groups_of(layer)
+        .into_iter()
         .flat_map(|g| g.iter())
         .find(|s| s.name == stem)
         .map(|s| (s.role, Some(layer)))
+}
+
+/// The role and layer of `name` in a family whose every layer's stems sit in `groups`
+/// ([`role_by_layer`]).
+pub(crate) fn role_in(
+    groups: &[&[Stem]],
+    name: &str,
+    n_layer: usize,
+) -> Option<(Role, Option<usize>)> {
+    role_by_layer(name, n_layer, |_| groups.iter().copied())
+}
+
+/// The role and layer of `name` in a family whose layers from `n_trunk` to `n_layer` are
+/// next-token layers: a trunk layer's stem takes the role of the `trunk` group that holds it, and
+/// a next-token layer's stem, whether the trunk's or one of `nextn`, is [`Role::Unused`]
+/// (carried, never loaded). `None` for any other name.
+pub(crate) fn role_with_nextn(
+    name: &str,
+    n_layer: usize,
+    n_trunk: usize,
+    trunk: &[&[Stem]],
+    nextn: &[Stem],
+) -> Option<(Role, Option<usize>)> {
+    if let Some(model_level) = model_level_role(name) {
+        return Some(model_level);
+    }
+    let (layer, stem) = block_stem(name, n_layer)?;
+    let trunk_role = trunk
+        .iter()
+        .flat_map(|g| g.iter())
+        .find(|s| s.name == stem)
+        .map(|s| s.role);
+    if layer < n_trunk {
+        return trunk_role.map(|r| (r, Some(layer)));
+    }
+    (trunk_role.is_some() || nextn.iter().any(|s| s.name == stem))
+        .then_some((Role::Unused, Some(layer)))
 }
 
 /// The role of a format's tensor scale, `<stem>.scale` beside a `<stem>.weight`
@@ -114,6 +163,59 @@ pub(crate) fn classify_with(
         experts_used: counts.experts_used,
         bf16_words: |_| false,
     })
+}
+
+/// [`classify_with`] for a family whose layer `l` carries the stem groups of `groups_of(l)`, below
+/// the `counts.layers` the family reports ([`role_by_layer`]).
+pub(crate) fn classify_layers<'a, G: IntoIterator<Item = &'a [Stem]>>(
+    split: &Split,
+    counts: Counts,
+    groups_of: impl Fn(usize) -> G,
+) -> Result<ModelTensors, PlacementError> {
+    classify_with(
+        split,
+        |name| role_by_layer(name, counts.layers, &groups_of),
+        counts,
+    )
+}
+
+/// [`classify_with`] for a family whose every layer's stems sit in `groups` ([`role_in`]).
+pub(crate) fn classify_groups(
+    split: &Split,
+    groups: &[&[Stem]],
+    counts: Counts,
+) -> Result<ModelTensors, PlacementError> {
+    classify_layers(split, counts, |_| groups.iter().copied())
+}
+
+/// What a family's flat stem groups hold, for its test: each stem has its own role on a layer, no
+/// group lists a stem twice, and a stem two groups share names one role in both.
+#[cfg(test)]
+pub(crate) fn assert_one_role_per_stem(groups: &[&[Stem]]) {
+    for (g, group) in groups.iter().enumerate() {
+        for (i, s) in group.iter().enumerate() {
+            assert_eq!(
+                role_in(groups, &format!("blk.0.{}", s.name), 1),
+                Some((s.role, Some(0))),
+                "{}",
+                s.name
+            );
+            assert!(
+                !group[..i].iter().any(|t| t.name == s.name),
+                "{} twice",
+                s.name
+            );
+            for other in &groups[g + 1..] {
+                for t in *other {
+                    assert!(
+                        t.name != s.name || t.role == s.role,
+                        "{} in two roles",
+                        s.name
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +287,112 @@ mod tests {
         ] {
             assert_eq!(role_in(&groups, name, 4), None, "{name}");
         }
+    }
+
+    /// A layer's own groups decide its stems: a stem another layer's group holds has no role here,
+    /// and a layer past the bound has none at all. Mutant: the groups of layer 0 for every layer,
+    /// or the bound `<=`.
+    #[test]
+    fn a_layers_own_groups_decide_its_stems() {
+        use super::role_by_layer;
+        use crate::arch::stems::{Stem, req};
+        const A: &[Stem] = &[req("attn_q.weight", Role::Attention)];
+        const B: &[Stem] = &[req("ffn_gate_inp.weight", Role::Router)];
+        let of = |l: usize| [if l.is_multiple_of(2) { A } else { B }];
+        let role = |name: &str| role_by_layer(name, 4, of);
+        assert_eq!(
+            role("token_embd.weight"),
+            Some((Role::TokenEmbedding, None))
+        );
+        assert_eq!(
+            role("blk.2.attn_q.weight"),
+            Some((Role::Attention, Some(2)))
+        );
+        assert_eq!(
+            role("blk.3.ffn_gate_inp.weight"),
+            Some((Role::Router, Some(3)))
+        );
+        for name in [
+            "blk.1.attn_q.weight",
+            "blk.2.ffn_gate_inp.weight",
+            "blk.4.attn_q.weight",
+            "rope_freqs.weight",
+        ] {
+            assert_eq!(role(name), None, "{name}");
+        }
+    }
+
+    /// A next-token layer carries every stem of the trunk and of its own as unused, a trunk layer
+    /// only the trunk's, and a stem in neither is claimed by no layer. Mutant: the trunk bound
+    /// `<=`, or a next-token stem given a role on a trunk layer.
+    #[test]
+    fn a_next_token_layer_carries_every_stem_unused() {
+        use super::role_with_nextn;
+        use crate::arch::stems::{Stem, req};
+        const TRUNK: &[Stem] = &[req("attn_q.weight", Role::Attention)];
+        const FFN: &[Stem] = &[req("ffn_gate_inp.weight", Role::Router)];
+        const NEXTN: &[Stem] = &[req("nextn.eh_proj.weight", Role::Unused)];
+        let role = |name: &str| role_with_nextn(name, 6, 4, &[TRUNK, FFN], NEXTN);
+        assert_eq!(role("output.weight"), Some((Role::Head, None)));
+        assert_eq!(
+            role("blk.3.attn_q.weight"),
+            Some((Role::Attention, Some(3)))
+        );
+        assert_eq!(
+            role("blk.3.ffn_gate_inp.weight"),
+            Some((Role::Router, Some(3)))
+        );
+        for (name, layer) in [
+            ("blk.4.attn_q.weight", 4),
+            ("blk.5.ffn_gate_inp.weight", 5),
+            ("blk.4.nextn.eh_proj.weight", 4),
+        ] {
+            assert_eq!(role(name), Some((Role::Unused, Some(layer))), "{name}");
+        }
+        for name in [
+            "blk.3.nextn.eh_proj.weight",
+            "blk.4.attn_k.weight",
+            "blk.6.attn_q.weight",
+        ] {
+            assert_eq!(role(name), None, "{name}");
+        }
+    }
+
+    /// The group walk takes each layer's own groups below the family's layer count: a stem the
+    /// file puts on a layer that does not carry it, and a layer past the count, fail the file by
+    /// name. Mutant: the layer count as the bound `<=`, or every layer given every group.
+    #[test]
+    fn the_layer_walk_refuses_a_stem_on_a_layer_that_does_not_carry_it() {
+        use super::{classify_groups, classify_layers};
+        use crate::arch::stems::{Stem, req};
+        const A: &[Stem] = &[req("attn_q.weight", Role::Attention)];
+        const B: &[Stem] = &[req("ffn_gate_inp.weight", Role::Router)];
+        let path = synthetic::header(
+            "classify-layers",
+            "qwen3moe",
+            &[],
+            &[
+                "token_embd.weight".to_string(),
+                "blk.0.attn_q.weight".to_string(),
+                "blk.1.ffn_gate_inp.weight".to_string(),
+                "blk.1.attn_q.weight".to_string(),
+                "blk.2.attn_q.weight".to_string(),
+            ],
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let counts = Counts::new(2, 8, 2);
+        let err = classify_layers(&split, counts, |l| [if l == 0 { A } else { B }])
+            .expect_err("two names no layer's groups claim");
+        let PlacementError::Unclassified { names } = err else {
+            panic!("the refusal is Unclassified, got {err}");
+        };
+        assert_eq!(names, ["blk.1.attn_q.weight", "blk.2.attn_q.weight"]);
+        let err = classify_groups(&split, &[A], counts).expect_err("the gate is no group's");
+        let PlacementError::Unclassified { names } = err else {
+            panic!("the refusal is Unclassified, got {err}");
+        };
+        assert_eq!(names, ["blk.1.ffn_gate_inp.weight", "blk.2.attn_q.weight"]);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A name no role claims fails the file with every such name listed, in
@@ -293,16 +501,8 @@ mod tests {
             ],
         );
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
-        let model = classify_with(
-            &split,
-            role,
-            Counts {
-                layers: 48,
-                experts: 256,
-                experts_used: 8,
-            },
-        )
-        .expect("both names have roles");
+        let model =
+            classify_with(&split, role, Counts::new(48, 256, 8)).expect("both names have roles");
         let [embd, mixer] = &model.tensors[..] else {
             panic!("two tensors, got {}", model.tensors.len());
         };

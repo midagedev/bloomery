@@ -8,7 +8,7 @@ use gguf::Split;
 
 use super::hparams::{Hparams, Kind};
 use super::names::{ATTN_NORM, FFN_DOWN, FFN_UP};
-use crate::arch::classify::{Counts, classify_with};
+use crate::arch::classify::{Counts, classify_layers};
 use crate::arch::hybrid::{ATTENTION, MAMBA};
 use crate::arch::stems::{Stem, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
@@ -29,33 +29,11 @@ pub(super) fn stems_of(kind: Kind) -> &'static [Stem] {
     }
 }
 
-/// A tensor's role and layer by its name; `None` when the table of its
-/// layer's kind does not hold it.
-fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
-    match name {
-        "token_embd.weight" => return Some((Role::TokenEmbedding, None)),
-        "output_norm.weight" | "output.weight" => return Some((Role::Head, None)),
-        _ => {}
-    }
-    let (layer, stem) = name.strip_prefix("blk.")?.split_once('.')?;
-    let layer: usize = layer.parse().ok().filter(|&l| l < hp.n_layer)?;
-    stems_of(hp.kinds[layer])
-        .iter()
-        .find(|s| s.name == stem)
-        .map(|s| (s.role, Some(layer)))
-}
-
 /// Every tensor of `split` with its role and header facts.
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
-    classify_with(
-        split,
-        |name| role(name, hp),
-        Counts {
-            layers: hp.n_layer,
-            experts: 0,
-            experts_used: 0,
-        },
-    )
+    classify_layers(split, Counts::new(hp.n_layer, 0, 0), |l| {
+        [stems_of(hp.kinds[l])]
+    })
 }
 
 #[cfg(test)]

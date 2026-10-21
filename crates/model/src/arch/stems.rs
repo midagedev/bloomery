@@ -1,8 +1,8 @@
 //! The role tables' row, shared by the families whose tables name their
-//! tensors by stem (`glm5next`, `mimo2`): what a layer of some kind carries,
-//! and which of it the file must carry. The tables themselves stay in each
-//! family's `roles` — the GGUF names are its architecture's strings — as
-//! `classify_with`'s contract says.
+//! tensors by stem, and the blocks of rows every such family spells alike
+//! ([`DENSE`], [`HC`]). A family's own table holds the rows its architecture
+//! alone carries, in its `roles` — the GGUF names are its architecture's
+//! strings — and the walk over them is [`classify`](crate::arch::classify)'s.
 
 use crate::placement::Role;
 
@@ -65,4 +65,13 @@ pub const HC: &[Stem] = &[
     req("hc_ffn_fn.weight", Role::HyperConnection),
     req("hc_ffn_base.weight", Role::HyperConnection),
     req("hc_ffn_scale.weight", Role::HyperConnection),
+];
+
+/// A dense layer's feed-forward block: the pre-FFN norm, the gate and up projections of the GLU
+/// and the down projection.
+pub const DENSE: &[Stem] = &[
+    req("ffn_norm.weight", Role::FfnNorm),
+    req("ffn_gate.weight", Role::DenseFfn),
+    req("ffn_up.weight", Role::DenseFfn),
+    req("ffn_down.weight", Role::DenseFfn),
 ];

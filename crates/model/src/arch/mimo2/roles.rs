@@ -11,7 +11,7 @@
 use gguf::Split;
 
 use super::hparams::Hparams;
-use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role};
+use crate::arch::classify::{Counts, classify_with, role_with_nextn};
 use crate::arch::stems::{opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
@@ -38,13 +38,8 @@ pub(super) const QKV_SPLIT: &[Stem] = &[
     req("attn_v.weight", Role::Attention),
 ];
 
-/// A dense layer's feed-forward block.
-pub(super) const DENSE: &[Stem] = &[
-    req("ffn_norm.weight", Role::FfnNorm),
-    req("ffn_gate.weight", Role::DenseFfn),
-    req("ffn_up.weight", Role::DenseFfn),
-    req("ffn_down.weight", Role::DenseFfn),
-];
+/// A dense layer's feed-forward block, the common table's.
+pub(super) use crate::arch::stems::DENSE;
 
 /// A routed layer's feed-forward block: the router with its selection bias,
 /// which the graph adds for the selection only, and the routed stacks.
@@ -76,75 +71,40 @@ pub(super) const NEXTN: &[Stem] = &[
 ];
 
 /// Every stem a trunk layer may carry, by group.
-const TRUNK: [&[Stem]; 4] = [MIXER, DENSE, MOE, QKV_SPLIT];
-
-/// The role of a trunk layer's stem.
-pub(super) fn layer_role(stem: &str) -> Option<Role> {
-    if stem == QKV_FUSED.name {
-        return Some(QKV_FUSED.role);
-    }
-    TRUNK
-        .iter()
-        .flat_map(|g| g.iter())
-        .find(|s| s.name == stem)
-        .map(|s| s.role)
-}
-
-/// A next-token layer's own stems, beside the trunk's.
-pub(super) fn nextn_stem(stem: &str) -> bool {
-    NEXTN.iter().any(|s| s.name == stem)
-}
-
-/// A tensor's role and layer by its name; `None` when the table does not
-/// hold it, its layer is past the file's, or a trunk layer carries a
-/// next-token stem.
-fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
-    if let Some(model_level) = model_level_role(name) {
-        return Some(model_level);
-    }
-    let (layer, stem) = block_stem(name, hp.n_layer)?;
-    if layer >= hp.n_trunk {
-        return (layer_role(stem).is_some() || nextn_stem(stem))
-            .then_some((Role::Unused, Some(layer)));
-    }
-    layer_role(stem).map(|r| (r, Some(layer)))
-}
+const TRUNK: [&[Stem]; 5] = [MIXER, DENSE, MOE, QKV_SPLIT, &[QKV_FUSED]];
 
 /// Every tensor of `split` with its role and header facts.
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
     classify_with(
         split,
-        |name| role(name, hp),
-        Counts {
-            layers: hp.n_trunk,
-            experts: hp.n_expert as u64,
-            experts_used: hp.n_used as u64,
-        },
+        |name| role_with_nextn(name, hp.n_layer, hp.n_trunk, &TRUNK, NEXTN),
+        Counts::new(hp.n_trunk, hp.n_expert, hp.n_used),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::placement::Role;
+    use super::{NEXTN, TRUNK};
+    use crate::arch::classify::{assert_one_role_per_stem, role_in};
 
-    use super::{MIXER, NEXTN, QKV_SPLIT, Stem, TRUNK, layer_role, nextn_stem};
-
-    /// A stem in two groups names one role, and no group lists a stem twice;
-    /// the fused qkv matrix and each split projection are the only stems
-    /// their counterpart's check refuses by name.
+    /// A stem in two groups names one role, and no group lists a stem twice; the fused qkv matrix
+    /// and each split projection are the only stems their counterpart's check refuses by name, and
+    /// a next-token layer's own stem is no trunk stem.
     #[test]
     fn a_stem_has_one_role() {
-        let all: Vec<&Stem> = TRUNK.iter().flat_map(|g| g.iter()).collect();
-        for s in &all {
-            assert_eq!(layer_role(s.name), Some(s.role), "{}", s.name);
+        assert_one_role_per_stem(&TRUNK);
+        for (i, s) in NEXTN.iter().enumerate() {
+            assert!(
+                !NEXTN[..i].iter().any(|t| t.name == s.name),
+                "{} twice",
+                s.name
+            );
+            assert_eq!(
+                role_in(&TRUNK, &format!("blk.0.{}", s.name), 1),
+                None,
+                "{}",
+                s.name
+            );
         }
-        for g in TRUNK.iter().chain([&NEXTN]) {
-            for (i, s) in g.iter().enumerate() {
-                assert!(!g[..i].iter().any(|t| t.name == s.name), "{} twice", s.name);
-            }
-        }
-        assert_eq!(layer_role("attn_qkv.weight"), Some(Role::Attention));
-        assert!(NEXTN.iter().all(|s| layer_role(s.name).is_none()));
-        assert!(MIXER.iter().chain(QKV_SPLIT).all(|s| !nextn_stem(s.name)));
     }
 }
