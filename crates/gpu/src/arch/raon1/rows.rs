@@ -4,9 +4,11 @@
 //!   positions, each row's RDA state in a lane of its own, every row into
 //!   one head of the pass's rows; [`Rollback`] commits the rows kept
 //!   ([`super::state`]);
-//! - a prompt call ([`GpuModel::prompt_rows`]): its ids staged on the card
-//!   [`GROUP`] at a time, each chunk of up to [`PASS_ROWS`] of them one walk
-//!   in place, the head on the call's last row alone;
+//! - a prompt call ([`GpuModel::prompt_rows`]): wide units of up to
+//!   [`WIDE_ROWS`] rows ([`super::wide`]) while at least [`WIDE_FROM`] rows
+//!   remain, then the rest's ids staged on the card [`GROUP`] at a time, each
+//!   chunk of up to [`PASS_ROWS`] of them one walk in place, the head on the
+//!   call's last row alone;
 //! - the taps ([`GpuModel::set_draft_taps`]): the streams entering the
 //!   layers a draft names, laid in by every walk, one row a position.
 //!
@@ -17,6 +19,7 @@
 use super::body::{Body, Run, Tail};
 use super::mhc::STREAMS;
 use super::state::{Lanes, PASS_ROWS, Pass};
+use super::wide::{WIDE_FROM, WIDE_ROWS};
 use crate::draft_taps::{DraftTaps, TapRowsSink};
 use crate::head::Head;
 use crate::hybrid::Chain;
@@ -57,7 +60,7 @@ pub(super) struct RowViews<'a> {
 }
 
 impl RowsIn {
-    fn new(stream: &CudaStream, cap: usize) -> Result<RowsIn, GpuError> {
+    pub(super) fn new(stream: &CudaStream, cap: usize) -> Result<RowsIn, GpuError> {
         let len = (STREAMS + 2) * cap;
         let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
         Ok(RowsIn {
@@ -69,7 +72,7 @@ impl RowsIn {
         })
     }
 
-    fn bytes(&self) -> usize {
+    pub(super) fn bytes(&self) -> usize {
         [&self.buf, &self.epos, &self.ekeys]
             .into_iter()
             .map(DeviceBuffer::num_bytes)
@@ -79,7 +82,12 @@ impl RowsIn {
     /// `ids` at positions `pos, pos + 1, …` into the staging's first rows:
     /// one copy, which waits for the walks before it. Refused by name for
     /// no ids, more than the staging holds, or a live count past u32.
-    fn stage(&mut self, stream: &CudaStream, ids: &[u32], pos: u32) -> Result<(), GpuError> {
+    pub(super) fn stage(
+        &mut self,
+        stream: &CudaStream,
+        ids: &[u32],
+        pos: u32,
+    ) -> Result<(), GpuError> {
         let c = self.cap;
         if ids.is_empty() || ids.len() > c {
             return Err(GpuError::shape(
@@ -298,11 +306,14 @@ impl Rollback for Body {
 }
 
 impl Body {
-    /// A prompt call's walks from `pos` ([`GpuModel::prompt_rows`]): the ids
-    /// staged a group at a time, each chunk of up to [`PASS_ROWS`] a walk in
-    /// place, the head on the call's last row; with `tapped`, the taps of the
-    /// call's last `window` rows handed to its sink after each group that
-    /// holds any. Returns `true`: the call's last chunk enqueues the head.
+    /// A prompt call's walks from `pos` ([`GpuModel::prompt_rows`]): wide
+    /// units of up to [`WIDE_ROWS`] rows ([`super::wide`]) as long as at
+    /// least [`WIDE_FROM`] rows remain, then the rest with its ids staged a
+    /// group at a time, each chunk of up to [`PASS_ROWS`] a walk in place
+    /// (every row the step's bits). The head is on the call's last row; with
+    /// `tapped`, the taps of the call's last `window` rows are handed to its
+    /// sink after each unit or group that holds any. Returns `true`: the
+    /// call's last walk enqueues the head.
     fn prompt_walk(
         &mut self,
         gpu: &Gpu,
@@ -321,8 +332,31 @@ impl Body {
         let from = tapped
             .as_ref()
             .map_or(n, |(window, _)| n - (*window).min(n));
-        for (g, group) in ids.chunks(GROUP).enumerate() {
-            let g0 = g * GROUP;
+        let mut done = 0;
+        while n - done >= WIDE_FROM {
+            let m = WIDE_ROWS.min(n - done);
+            let at = pos + launch_u32(WHAT, "row", done)?;
+            self.wide.rin.stage(stream, &ids[done..done + m], at)?;
+            if let Some(t) = self.rows.taps.as_mut() {
+                t.plan(m);
+            }
+            let tail = if done + m == n {
+                Tail::Last(&mut *head)
+            } else {
+                Tail::Open
+            };
+            let run = Run::Rows {
+                at: 0,
+                m,
+                pass: Pass::InPlace,
+            };
+            self.walk(gpu, w, run, tail)?;
+            self.rows.held = pos + launch_u32(WHAT, "row", done + m)?;
+            self.hand_over(gpu, tapped.as_mut(), (pos, from), (done, m))?;
+            done += m;
+        }
+        for (g, group) in ids[done..].chunks(GROUP).enumerate() {
+            let g0 = done + g * GROUP;
             let gpos = pos + launch_u32(WHAT, "row", g0)?;
             self.rows.rin.stage(stream, group, gpos)?;
             if let Some(t) = self.rows.taps.as_mut() {
@@ -343,29 +377,48 @@ impl Body {
                 self.walk(gpu, w, run, tail)?;
                 self.rows.held = gpos + launch_u32(WHAT, "row", at + m)?;
             }
-            if let Some((_, sink)) = tapped.as_mut() {
-                let (lo, hi) = (from.max(g0), g0 + group.len());
-                if lo < hi {
-                    let taps = self
-                        .rows
-                        .taps
-                        .as_ref()
-                        .ok_or(GpuError::state(WHAT, "taps set (set_draft_taps)"))?;
-                    let rows = taps.read(stream, lo - g0, hi - lo)?;
-                    sink(pos + launch_u32(WHAT, "row", lo)?, &rows)?;
-                }
-            }
+            self.hand_over(gpu, tapped.as_mut(), (pos, from), (g0, group.len()))?;
         }
         Ok(true)
+    }
+
+    /// The tapped rows of the call's rows `first .. first + rows` that lie
+    /// from `from` on, handed to the sink as `(position, rows)`; the call
+    /// began at position `pos`. Nothing for an untapped call or a unit wholly
+    /// before `from`.
+    fn hand_over(
+        &self,
+        gpu: &Gpu,
+        tapped: Option<&mut (usize, &mut TapRowsSink<'_>)>,
+        (pos, from): (u32, usize),
+        (first, rows): (usize, usize),
+    ) -> Result<(), GpuError> {
+        let Some((_, sink)) = tapped else {
+            return Ok(());
+        };
+        let (lo, hi) = (from.max(first), first + rows);
+        if lo >= hi {
+            return Ok(());
+        }
+        let taps = self
+            .rows
+            .taps
+            .as_ref()
+            .ok_or(GpuError::state(WHAT, "taps set (set_draft_taps)"))?;
+        let read = taps.read(gpu.stream(), lo - first, hi - lo)?;
+        sink(pos + launch_u32(WHAT, "row", lo)?, &read)
     }
 }
 
 impl GpuModel<Body> {
-    /// Run `ids` from the model's position as passes of rows and return the
-    /// argmax after the last: each chunk of up to [`PASS_ROWS`] ids one walk
-    /// whose rows are the steps' bits, the head on the call's last row alone
-    /// (its fault word read there). Refused by name with no ids, and while a
-    /// verify waits.
+    /// Run `ids` from the model's position and return the argmax after the
+    /// last: units of up to [`WIDE_ROWS`] ids as GEMMs (the wide arm: a row
+    /// is the step's row to the error of the GEMM's sums, not its bits) while
+    /// at least [`WIDE_FROM`] remain, the rest as passes of up to
+    /// [`PASS_ROWS`] ids whose rows are the steps' bits; a call of up to
+    /// [`PASS_ROWS`] ids is those passes alone. The head is on the call's
+    /// last row alone (its fault word read there). Refused by name with no
+    /// ids, and while a verify waits.
     pub fn prompt_rows(&mut self, ids: &[u32]) -> Result<u32, GpuError> {
         self.prompt_call(ids, None)
     }
@@ -373,8 +426,8 @@ impl GpuModel<Body> {
     /// [`GpuModel::prompt_rows`] with the tapped rows of the call's last
     /// `window` positions (all of them when the call is shorter) handed to
     /// `sink` as `(first position, rows)`, one [`GpuModel::draft_tap_width`]
-    /// row a position, after each group of [`GROUP`] rows that holds any of
-    /// them — in order, no position twice or missed. The walks are the plain
+    /// row a position, after each unit or group that holds any of them — in
+    /// order, no position twice or missed. The walks are the plain
     /// call's, so its stores and argmax are bit for bit. Refused by name with
     /// no taps set; a sink that fails ends the call with its error.
     pub fn prompt_rows_tapped(
@@ -403,8 +456,8 @@ impl GpuModel<Body> {
 
     /// Tap the rows entering `layers` (strictly rising, each below the
     /// layer count; empty stops tapping) from the next walk on: every walk —
-    /// a step, a verify's pass, each prompt chunk — lays them into a buffer
-    /// of [`GROUP`] rows a layer ([`DraftTaps`]), allocated here against the
+    /// a step, a verify's pass, each prompt chunk or wide unit — lays them
+    /// into a buffer of [`WIDE_ROWS`] rows a layer ([`DraftTaps`]), allocated here against the
     /// card's free bytes with [`FIT_RESERVE`](crate::model::fit::FIT_RESERVE)
     /// left. The captured chains are dropped first (a capture records the
     /// copies into the buffer of its time), and the next graph step or pass
@@ -434,7 +487,7 @@ impl GpuModel<Body> {
             gpu.stream(),
             layers,
             n_layer,
-            (hidden, GROUP),
+            (hidden, WIDE_ROWS),
             free,
         )?);
         Ok(())

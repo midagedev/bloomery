@@ -48,6 +48,9 @@
 
 use super::rda::{RowsKit, kgemv_rows, project_rows};
 use super::state::PASS_ROWS;
+use super::wide::{
+    Input, WIDE_ROWS, WideKit, input, quantize_hid, quantize_out, quantize_qb, value_heads,
+};
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::fault::FaultSink;
 use crate::flash::{FlashGeom, FlashInputs, FlashSplitArgs, partials_ms_len, partials_v_len};
@@ -56,7 +59,7 @@ use crate::linear::out_gate::{OutGateArgs, OutGateKernels};
 use crate::model::{Q8_0GemvHeadsArgs, StepKernels};
 use crate::q6k_heads::{Q6kHeadsArgs, Q6kHeadsKernels};
 use crate::q8f32::Q8_0GemvHeadsMcolArgs;
-use crate::site::{self, Form, SiteTy};
+use crate::site::{self, Form, SiteTy, WideActs};
 use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
@@ -220,8 +223,8 @@ impl MlaSites {
 }
 
 /// The kernels every MLA layer launches beyond the `Gpu`'s own, and the
-/// extra part's gather tables for up to [`PASS_ROWS`] rows
-/// (`[(t·heads + h)·head_k + nope + j] → [(t·heads + h)·row + j]`; a pass of
+/// extra part's gather tables for up to [`WIDE_ROWS`] rows
+/// (`[(t·heads + h)·head_k + nope + j] → [(t·heads + h)·row + j]`; a call of
 /// `m` rows reads the first `m·heads·extra` pairs).
 pub struct MlaKernels {
     step: StepKernels,
@@ -239,9 +242,9 @@ impl MlaKernels {
         let at = |v: usize| {
             u32::try_from(v).map_err(|_| GpuError::shape(WHAT, "a gather index past u32"))
         };
-        let pairs = PASS_ROWS * d.heads * d.extra;
+        let pairs = WIDE_ROWS * d.heads * d.extra;
         let (mut src, mut dst) = (Vec::with_capacity(pairs), Vec::with_capacity(pairs));
-        for head in 0..PASS_ROWS * d.heads {
+        for head in 0..WIDE_ROWS * d.heads {
             for j in 0..d.extra {
                 src.push(at(head * d.head_k() + d.nope + j)?);
                 dst.push(at(head * d.row() + j)?);
@@ -822,6 +825,196 @@ pub(crate) fn rows(
     )?;
     let out = (&sites.out, d.embd);
     project_rows(cx, &mut kit, acts, (l, m), out, b.gated, b.out)
+}
+
+/// Enqueue MLA layer `l` over a wide unit of `m` rows (above [`PASS_ROWS`]),
+/// in position order: the projections as GEMMs over the unit's rows
+/// ([`super::wide`]); the cache append, the gather of the extra part and the
+/// output gate once over the unit; the absorb and the latent flash in chunks
+/// of [`PASS_ROWS`] query tokens on windows of the unit's buffers (the flash
+/// takes no more), each chunk over the cache rows the unit's append wrote,
+/// bounded by its own live counts; and a Q6_K per-head value projection as one
+/// grouped GEMM over every (row, head) of the unit ([`value_heads`]), a Q8_0
+/// one per chunk. `b`'s buffers hold at least `m` rows of their widths, the
+/// partials a pass's rows.
+pub(super) fn rows_wide(
+    cx: &GqaCx<'_>,
+    k: &MlaKernels,
+    kit: &mut WideKit<'_>,
+    (sites, d): (&MlaSites, &MlaDims),
+    (l, m): (usize, usize),
+    b: MlaBufs<'_>,
+) -> Result<(), GpuError> {
+    let (gpu, w) = (cx.gpu, cx.w);
+    let stream = gpu.stream();
+    let fault = gpu.layer_sink(l)?;
+    let [norm, q_a_norm, kv_a_norm] = &sites.vecs;
+    gpu.elem().enqueue_rms_norm(
+        stream,
+        b.x,
+        w.f32_buf(WHAT, norm)?,
+        d.rms_eps,
+        d.embd,
+        m,
+        b.xn,
+    )?;
+    let (wk, wb) = (&kit.k, &mut kit.b);
+    let tys = [sites.q_a.ty(), sites.kv_a.ty(), sites.gate.ty()];
+    quantize_hid(
+        gpu,
+        wk.g32,
+        wb.forms,
+        (&*b.xn, m),
+        (fault, WideActs::wants_of(&tys)),
+    )?;
+    {
+        let x_in = input(wb.forms, Input::Hid, &*b.xn);
+        wk.project(cx, (&sites.q_a, d.q_lora), &x_in, m, b.qa)?;
+        wk.project(cx, (&sites.kv_a, d.row()), &x_in, m, b.kv)?;
+        wk.project(cx, (&sites.gate, d.heads * d.v_head), &x_in, m, b.gate)?;
+    }
+    gpu.elem().enqueue_rms_norm(
+        stream,
+        b.qa,
+        w.f32_buf(WHAT, q_a_norm)?,
+        d.latent_eps,
+        d.q_lora,
+        m,
+        b.qr,
+    )?;
+    quantize_qb(gpu, wk.g32, wb.forms, (&*b.qr, m), (fault, sites.q_b.ty()))?;
+    {
+        let x_in = input(wb.forms, Input::Qb, &*b.qr);
+        wk.project(cx, (&sites.q_b, d.heads * d.head_k()), &x_in, m, b.q)?;
+    }
+    let (hk, row, hl, hv) = (
+        d.heads * d.head_k(),
+        d.heads * d.row(),
+        d.heads * LATENT,
+        d.heads * d.v_head,
+    );
+    let (f, u) = (size_of::<f32>(), size_of::<u32>());
+    let kv_norm = w.f32_buf(WHAT, kv_a_norm)?;
+    k.latent.enqueue_latent_extra_append(
+        stream,
+        LatentExtraAppendArgs {
+            rows: Rows {
+                x: &*b.kv,
+                stride: d.row(),
+                m,
+            },
+            off: 0,
+            e_off: LATENT,
+            extra: d.extra,
+            gain: kv_norm,
+            pos: &*b.pos,
+            eps: d.latent_eps,
+            fault,
+            cache: &mut *b.cache,
+        },
+    )?;
+    k.step.enqueue_gather(
+        stream,
+        &*b.q,
+        &k.src,
+        &k.dst,
+        m * d.heads * d.extra,
+        &mut *b.qabs,
+    )?;
+    let (qs, dd) = q8_planes(w, &sites.k_b)?;
+    let value = value_w(w, &sites.v_b)?;
+    let q8 = gpu.q8f32();
+    for c0 in (0..m).step_by(PASS_ROWS) {
+        let mc = PASS_ROWS.min(m - c0);
+        let q = Window::<f32>::of(&*b.q, c0 * hk * f, mc * hk)?;
+        let n_keys = Window::<u32>::of(b.n_keys, (c0 + mc - 1) * u, 1)?;
+        let mut qabs = WindowMut::<f32>::of_mut(&mut *b.qabs, c0 * row * f, mc * row)?;
+        let mut att = WindowMut::<f32>::of_mut(&mut *b.att, c0 * hl * f, mc * hl)?;
+        q8.enqueue_q8_0_gemv_heads_mcol(
+            stream,
+            Q8_0GemvHeadsMcolArgs {
+                qs,
+                d: dd,
+                x: &q,
+                rows_per_head: LATENT,
+                x_head_stride: d.head_k(),
+                y_head_stride: d.row(),
+                y_off: d.extra,
+                m: mc,
+                x_col_stride: hk,
+                y_col_stride: row,
+                y: &mut qabs,
+            },
+        )?;
+        gpu.flash().enqueue_flash_latent_split(
+            stream,
+            FlashSplitArgs {
+                inputs: FlashInputs {
+                    q: &qabs,
+                    kv: &*b.cache,
+                    n_keys_buf: &n_keys,
+                    kq_scale: 1.0 / (d.head_k() as f32).sqrt(),
+                    geom: FlashGeom {
+                        tokens: mc,
+                        heads: d.heads,
+                        rope_dims: d.extra,
+                        latent_dims: LATENT,
+                    },
+                },
+                part_v: &mut *b.part_v,
+                part_ms: &mut *b.part_ms,
+                y: &mut att,
+            },
+        )?;
+        if let ValueW::Q8_0(vqs, vd) = value {
+            let mut av = WindowMut::<f32>::of_mut(&mut *b.av, c0 * hv * f, mc * hv)?;
+            q8.enqueue_q8_0_gemv_heads_mcol(
+                stream,
+                Q8_0GemvHeadsMcolArgs {
+                    qs: vqs,
+                    d: vd,
+                    x: &att,
+                    rows_per_head: d.v_head,
+                    x_head_stride: LATENT,
+                    y_head_stride: d.v_head,
+                    y_off: 0,
+                    m: mc,
+                    x_col_stride: hl,
+                    y_col_stride: hv,
+                    y: &mut av,
+                },
+            )?;
+        }
+    }
+    if let ValueW::Q6K(wv) = value {
+        value_heads(
+            gpu,
+            (wk, wb),
+            wv,
+            (&*b.att, m),
+            (d.v_head, fault, &mut *b.av),
+        )?;
+    }
+    k.out_gate.enqueue_out_gate(
+        stream,
+        OutGateArgs {
+            attn: &*b.av,
+            gate: &*b.gate,
+            n_head: d.heads,
+            m,
+            fault,
+            y: &mut *b.gated,
+        },
+    )?;
+    quantize_out(
+        gpu,
+        wk.g32,
+        wb.forms,
+        (&*b.gated, m),
+        (fault, sites.out.ty()),
+    )?;
+    let x_in = input(wb.forms, Input::Out, &*b.gated);
+    wk.project(cx, (&sites.out, d.embd), &x_in, m, b.out)
 }
 
 #[cfg(test)]

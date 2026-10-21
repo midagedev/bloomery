@@ -3,7 +3,9 @@
 //! ([`ffn`]), the RDA layer ([`rda`]) and the gated latent layer ([`mla`]);
 //! the passes of several rows — a verify, a prompt call's chunks — and the
 //! taps a block draft reads ([`rows`]), over the RDA stores' lanes
-//! ([`state`]). The model description is `model::arch::raon1`.
+//! ([`state`]); and a prompt's units of more rows than a pass, which run the
+//! projections and the experts as GEMMs ([`wide`]). The model description is
+//! `model::arch::raon1`.
 
 mod body;
 mod ffn;
@@ -12,6 +14,7 @@ pub mod mla;
 pub mod rda;
 mod rows;
 mod state;
+mod wide;
 
 pub use body::Body;
 pub use ffn::sigmoid_128_6;

@@ -379,6 +379,7 @@ generate_ds41   raon_hc_mix                              0           0
 generate_ds41   raon_hc_mean                             0           0
 generate_ds41   raon_hc_post                             0           0
 generate_ds41   raon_hc_route                            0           112
+generate_ds41   raon_join_qkv                           0           0
 generate_ds41   relu_sqr                                 0           0
 generate_ds41   relu_sqr_quant32                         0           0
 generate_ds41   rms_norm                                 0           0

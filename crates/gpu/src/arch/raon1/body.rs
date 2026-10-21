@@ -25,6 +25,7 @@ use super::mla::{self, MlaBufs, MlaDims, MlaKernels, MlaSites};
 use super::rda::{self, RdaSites, RowKernels, RowsKit};
 use super::rows::{RowState, RowViews};
 use super::state::{self, PASS_ROWS, Pass};
+use super::wide::{self, WIDE_ROWS, Wide, WideDims};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::FlashGqaKernels;
@@ -175,9 +176,36 @@ fn dims(hp: &Hparams) -> Result<(KdaDims, MlaDims), GpuError> {
     Ok((kda, mla))
 }
 
+/// The widths a wide unit is cut for, or a named refusal of a shape the
+/// wide arm's forms do not cover: the two mixers' output projections read
+/// one width, the routed block's slots a card sum of the router's pick count.
+fn wide_dims(hp: &Hparams, kda: &KdaDims, mla: &MlaDims) -> Result<WideDims, GpuError> {
+    let attn = kda.shape.n_v * HEAD;
+    if attn != mla.heads * mla.v_head {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "the RDA layers' output projection reads {attn} values, the latent layers' {}: the wide arm holds one form of its input",
+                mla.heads * mla.v_head
+            ),
+        ));
+    }
+    let e = hp.experts;
+    Ok(WideDims {
+        embd: hp.n_embd,
+        attn,
+        q_lora: hp.mla.q_lora,
+        heads: mla.heads,
+        dense_ff: hp.dense_ff,
+        shared_ff: e.shared_ff(),
+        expert_ff: e.ff,
+        ff_rows: hp.dense_ff.max(ffn::sigmoid_128_6::N_USED * e.ff),
+    })
+}
+
 /// A walk's buffers, `rows` rows of each width, token-major: the step's
 /// one row, or a pass's [`PASS_ROWS`].
-struct Scratch {
+pub(super) struct Scratch {
     /// The streams the layer reads and the ones it writes, `STREAMS · n` a
     /// row.
     x: DeviceBuffer<f32>,
@@ -228,7 +256,9 @@ impl Scratch {
         })?;
         let lin = d.shape;
         let (channels, v, n_v) = (lin.channels(), lin.n_v * HEAD, lin.n_v);
-        let (part_v, part_ms) = mla::partials_lens_rows(m, ctx, rows);
+        // The latent attention takes at most a pass's rows a launch: a wider
+        // unit runs it in chunks that share one set of partials.
+        let (part_v, part_ms) = mla::partials_lens_rows(m, ctx, rows.min(PASS_ROWS));
         let (heads, row) = (m.heads, m.row());
         Ok((
             [
@@ -311,7 +341,7 @@ impl Scratch {
         })
     }
 
-    fn bytes(&self) -> usize {
+    pub(super) fn bytes(&self) -> usize {
         [
             &self.x, &self.x2, &self.hc, &self.part, &self.u, &self.un, &self.br,
         ]
@@ -397,6 +427,8 @@ pub struct Body {
     pass: Scratch,
     ffn_rows: FfnRows,
     stage: DeviceBuffer<f32>,
+    /// A wide unit's rows, forms and kernels ([`super::wide`]).
+    pub(super) wide: Wide,
     /// The passes' staging, the lane word, the taps and the position the
     /// stores stand at.
     pub(super) rows: RowState,
@@ -491,8 +523,9 @@ fn exact(w: &Weights, name: String, len: usize) -> Result<String, GpuError> {
 }
 
 impl Body {
-    /// Card bytes of the rows pass's walk buffers ([`PASS_ROWS`] rows, the
-    /// latent layers' attention partials among them), which every load of
+    /// Card bytes of the walk buffers of the rows pass ([`PASS_ROWS`] rows, the
+    /// latent layers' attention partials among them) and of a wide unit
+    /// ([`WIDE_ROWS`] rows, its forms and feed-forward rows), which every load of
     /// the file `hp` describes makes beside a plan's terms: what its plan
     /// keeps out of the expert budget (`PlanInputs::with_prompt_reserve`).
     /// Counted at a cache taller than one attention segment, the most any
@@ -500,7 +533,9 @@ impl Body {
     pub fn pass_reserve(hp: &Hparams) -> Result<u64, GpuError> {
         let (kda, mla) = dims(hp)?;
         let lens = Scratch::lens(hp, (&kda, &mla), usize::MAX, PASS_ROWS)?;
-        Ok(Scratch::bytes_of(&lens) as u64)
+        let wide_lens = Scratch::lens(hp, (&kda, &mla), usize::MAX, WIDE_ROWS)?;
+        let wide = Scratch::bytes_of(&wide_lens) + Wide::bytes_of(&wide_dims(hp, &kda, &mla)?);
+        Ok((Scratch::bytes_of(&lens) + wide) as u64)
     }
 
     /// The last hyper-connection site's route as the step left it: the last
@@ -632,6 +667,11 @@ impl Body {
             pass: Scratch::new(stream, &hp, (&kda, &mla), ctx, PASS_ROWS)?,
             ffn_rows: FfnRows::new(stream, n, ff, PASS_ROWS)?,
             stage: DeviceBuffer::zeroed(stream, stage)?,
+            wide: Wide::new(
+                gpu,
+                &wide_dims(&hp, &kda, &mla)?,
+                Scratch::new(stream, &hp, (&kda, &mla), ctx, WIDE_ROWS)?,
+            )?,
             rows: RowState::new(stream, lanes)?,
             kda,
             mla,
@@ -652,6 +692,7 @@ impl Body {
             + self.pass.bytes()
             + self.ffn_rows.bytes()
             + self.stage.num_bytes()
+            + self.wide.bytes()
             + self.rows.bytes()
             + self.acts.bytes()
             + self.k.kgemv.device_bytes()
@@ -695,6 +736,7 @@ impl Body {
             ffn_rows,
             stage,
             rows,
+            wide,
             ctx,
             ..
         } = self;
@@ -722,6 +764,7 @@ impl Body {
         } = rows;
         let pos_w: Window<'_, u32>;
         let keys_w: Window<'_, u32>;
+        let mut wide_kit = None;
         let (sc, mut ffn_b, pos, keys, (at, m, pass)) = match run {
             Run::Step => {
                 gpu.elem().enqueue_embed_rows_kquant(
@@ -739,6 +782,46 @@ impl Body {
                 )?;
                 let (pos, keys) = (&step_in.pos, &step_in.n_keys);
                 (s, FfnBufs::Step(ffn_s), pos, keys, (0, 1, Pass::InPlace))
+            }
+            Run::Rows { at, m, pass } if m > PASS_ROWS => {
+                if pass != Pass::InPlace {
+                    return Err(GpuError::shape(
+                        STEP,
+                        format!("a {pass:?} pass of {m} rows: only a prompt's units run wide"),
+                    ));
+                }
+                wide.route_dense(gpu, m)?;
+                let (kit, ws, wrin) = wide.kit(&k.g32, &k.ffn.router);
+                let RowViews {
+                    ids,
+                    pos,
+                    keys,
+                    epos,
+                    ekeys,
+                } = wrin.views(at, m)?;
+                gpu.elem().enqueue_embed_rows_kquant(
+                    stream,
+                    *ty,
+                    EmbedRowsArgs {
+                        w: table,
+                        ids: &ids,
+                        pos0: &pos,
+                        first: 0,
+                        y: &mut ws.x,
+                        pos: epos,
+                        n_keys: ekeys,
+                    },
+                )?;
+                pos_w = pos;
+                keys_w = keys;
+                wide_kit = Some(kit);
+                (
+                    ws,
+                    FfnBufs::Rows(ffn_rows),
+                    &*pos_w,
+                    &*keys_w,
+                    (at, m, pass),
+                )
             }
             Run::Rows { at, m, pass } => {
                 let RowViews {
@@ -848,6 +931,8 @@ impl Body {
                     };
                     if m == 1 {
                         rda::step(&cx, &k.linear, acts, sites, (l, &*kd), st, bufs)?;
+                    } else if let Some(kit) = wide_kit.as_mut() {
+                        wide::rda_rows(&cx, kit, &k.linear, sites, (l, &*kd, m), st, bufs)?;
                     } else {
                         let kit = RowsKit {
                             linear: &k.linear,
@@ -880,6 +965,8 @@ impl Body {
                     };
                     if m == 1 {
                         mla::step(&cx, &k.mla, acts, (&**sites, &*md), l, bufs)?;
+                    } else if let Some(kit) = wide_kit.as_mut() {
+                        mla::rows_wide(&cx, &k.mla, kit, (&**sites, &*md), (l, m), bufs)?;
                     } else {
                         let kit = RowsKit {
                             linear: &k.linear,
@@ -905,15 +992,19 @@ impl Body {
                 .enqueue_rms_norm(stream, u, gain, hp.rms_eps, n, m, un)?;
             let rule = (*act, hp.experts.weights_scale);
             let at_l = (l, &layer.ffn);
-            match &mut ffn_b {
-                FfnBufs::Step(f) => ffn::ffn(&cx, &k.ffn, acts, rule, at_l, un, f, br)?,
-                FfnBufs::Rows(f) => {
-                    let kit = RowsKit {
-                        linear: &k.linear,
-                        rows: &k.rows,
-                        stage: &mut *stage,
-                    };
-                    ffn::ffn_rows(&cx, &k.ffn, acts, rule, at_l, m, un, f, br, kit)?
+            if let Some(kit) = wide_kit.as_mut() {
+                wide::ffn(&cx, kit, rule, at_l, m, un, br)?;
+            } else {
+                match &mut ffn_b {
+                    FfnBufs::Step(f) => ffn::ffn(&cx, &k.ffn, acts, rule, at_l, un, f, br)?,
+                    FfnBufs::Rows(f) => {
+                        let kit = RowsKit {
+                            linear: &k.linear,
+                            rows: &k.rows,
+                            stage: &mut *stage,
+                        };
+                        ffn::ffn_rows(&cx, &k.ffn, acts, rule, at_l, m, un, f, br, kit)?
+                    }
                 }
             }
             mhc.enqueue_post(stream, (x2, br, hc), (n, m), x)?;
