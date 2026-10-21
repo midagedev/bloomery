@@ -65,7 +65,7 @@ pub use draft_taps::TapRowsSink;
 pub use mtp35::{Mtp35, addresses};
 pub use mtp38::{
     BorrowedPlanes, DraftRows38, Held38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
-    MtpFeed, MtpHead, MtpHidden, MtpMode, MtpNode, MtpTaps, TargetRows, walk_launches,
+    MtpFeed, MtpHead, MtpNode, MtpTaps, TargetRows, walk_launches,
 };
 pub use placed::Placed;
 pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHost};

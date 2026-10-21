@@ -1,19 +1,17 @@
 //! GLM-5.3-Flash's [`MtpBody`]: [`Body`]'s NextN layer
 //! ([`bloomery_gpu_glm5next::Nextn`]) behind the shared window's calls, each
-//! one call into the body's own API. The shared feed and walk mode map onto
-//! the NextN program's one to one; the arena, the head and the prompt path
-//! are GLM's own types.
+//! one call into the body's own API. The NextN program walks the shared feed
+//! and walk mode; the arena, the head and the prompt path are GLM's own
+//! types.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::media::MediaSpan;
 use bloomery_gpu::model::Rows;
-use bloomery_gpu_glm5next::{
-    Body, GlmArena, Nextn, NextnFeed, NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS,
-};
+use bloomery_gpu_glm5next::{Body, GlmArena, Nextn, NextnHead, PrefillMode, WALK_ROWS};
 
 use super::WHAT;
-use crate::mtp::{Feed, Hidden, MtpBody, UnitSink, WalkMode};
+use crate::mtp::{Feed, MtpBody, UnitSink, WalkMode};
 
 impl MtpBody for Body {
     /// A proposal of one id: the NextN layer predicts one position ahead.
@@ -84,7 +82,7 @@ impl MtpBody for Body {
         head: NextnHead,
         mode: WalkMode,
     ) -> Result<(), GpuError> {
-        bloomery_gpu_glm5next::nextn_walk(m, nextn_feed(feed), head, nextn_mode(mode))
+        bloomery_gpu_glm5next::nextn_walk(m, feed, head, mode)
     }
 
     /// The NextN head reads back its ids alone: `p` is refused by name.
@@ -103,7 +101,7 @@ impl MtpBody for Body {
                 detail: "a chain's probabilities: the NextN head reads back its ids alone".into(),
             });
         }
-        bloomery_gpu_glm5next::nextn_chain(m, nextn_feed(refresh), own, head, nextn_mode(mode), out)
+        bloomery_gpu_glm5next::nextn_chain(m, refresh, own, head, mode, out)
     }
 }
 
@@ -117,26 +115,3 @@ const _: () = assert!(
     <Body as MtpBody>::WIDTH == 1,
     "a GLM proposal wider than one id needs the index_share_mtp rule (Hparams::index_share_mtp)"
 );
-
-/// The shared feed as the NextN program's, field for field.
-fn nextn_feed(f: Feed<'_, GlmArena>) -> NextnFeed<'_> {
-    NextnFeed {
-        tokens: f.tokens,
-        pos0: f.pos0,
-        hidden: match f.hidden {
-            Hidden::Host(v) => NextnHidden::Host(v),
-            Hidden::Target { walk, first } => NextnHidden::Target { walk, first },
-        },
-        media: f.media,
-    }
-}
-
-/// The walk mode as the NextN program's: each shared mode is one of its
-/// own; the program refuses a captured walk by name.
-fn nextn_mode(m: WalkMode) -> NextnMode {
-    match m {
-        WalkMode::Eager => NextnMode::Eager,
-        WalkMode::Graph => NextnMode::Graph,
-        WalkMode::Store => NextnMode::Store,
-    }
-}

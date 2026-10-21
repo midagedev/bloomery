@@ -1,17 +1,17 @@
 //! Qwen3.8's [`MtpBody`]: [`Body38`]'s draft layer ([`Mtp38`]) behind the
-//! shared window's calls, each one call into the model's own API. The shared
-//! feed and walk mode map onto Qwen3.8's one to one; the arena, the head and
-//! the prompt path are Qwen3.8's own types.
+//! shared window's calls, each one call into the model's own API. The MTP
+//! layer walks the shared feed and walk mode; the arena, the head and the
+//! prompt path are Qwen3.8's own types.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::{
-    Body38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpFeed, MtpHead, MtpHidden, MtpMode,
-    Prompt38, Qwen38Model, TargetRows,
+    Body38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpFeed, MtpHead, Prompt38,
+    Qwen38Model, TargetRows,
 };
 use bloomery_gpu::model::Rows;
 
 use super::WHAT;
-use crate::mtp::{Feed, Hidden, MtpBody, UnitSink, WalkMode};
+use crate::mtp::{Feed, MtpBody, UnitSink, WalkMode};
 
 impl MtpBody for Body38 {
     /// A proposal fills the widest verify the GDN lanes hold.
@@ -61,7 +61,7 @@ impl MtpBody for Body38 {
         head: MtpHead,
         mode: WalkMode,
     ) -> Result<(), GpuError> {
-        m.mtp_walk(mtp_feed(feed)?, head, mtp_mode(mode))
+        m.mtp_walk(MtpFeed::Rows(feed), head, mode)
     }
 
     fn chain(
@@ -73,7 +73,7 @@ impl MtpBody for Body38 {
         out: &mut [u32],
         p: Option<&mut [f32]>,
     ) -> Result<usize, GpuError> {
-        let d = m.mtp_chain(mtp_feed(refresh)?, own, head, mtp_mode(mode))?;
+        let d = m.mtp_chain(MtpFeed::Rows(refresh), own, head, mode)?;
         let n = d.tokens.len();
         let places = out.len();
         out.get_mut(..n)
@@ -99,128 +99,3 @@ impl MtpBody for Body38 {
 // rows is a captured walk.
 const _: () = <Body38 as MtpBody>::FITS;
 const _: () = assert!(<Body38 as MtpBody>::VERIFY_ROWS <= MTP_GRAPH_ROWS);
-
-/// The shared feed as Qwen3.8's: always [`MtpFeed::Rows`], which the window
-/// builds; [`MtpFeed::Own`] is the chain's own. Media rows are refused by
-/// name: the body has no media prompt call ([`Feed::media`] is a media call's
-/// alone), and a draft that dropped them would walk another feed than the
-/// target's.
-fn mtp_feed(f: Feed<'_, TargetRows>) -> Result<MtpFeed<'_>, GpuError> {
-    if f.media.is_some() {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: "a walk with media rows: this body's draft has no media prompt call"
-                .to_string(),
-        });
-    }
-    Ok(MtpFeed::Rows {
-        tokens: f.tokens,
-        pos0: f.pos0,
-        hidden: match f.hidden {
-            Hidden::Host(v) => MtpHidden::Host(v),
-            Hidden::Target { walk, first } => MtpHidden::Target { walk, first },
-        },
-    })
-}
-
-/// The walk mode as Qwen3.8's: each shared mode is one of the draft's own,
-/// the store-only walk included.
-fn mtp_mode(m: WalkMode) -> MtpMode {
-    match m {
-        WalkMode::Eager => MtpMode::Eager,
-        WalkMode::Graph => MtpMode::Graph,
-        WalkMode::Store => MtpMode::Store,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{mtp_feed, mtp_mode};
-    use crate::mtp::{Feed, Hidden, WalkMode};
-    use bloomery_gpu::arch::qwen3moe::{MtpFeed, MtpHidden, MtpMode, TargetRows};
-    use bloomery_gpu::media::CallRows;
-
-    /// The shared walk mode and feed map onto Qwen3.8's one to one: each
-    /// value comes back from its image as itself, and a variant added to
-    /// either walk mode or to the shared hidden source fails to compile.
-    #[test]
-    fn feed_and_mode_map_one_to_one() {
-        fn mode_back(m: MtpMode) -> WalkMode {
-            match m {
-                MtpMode::Eager => WalkMode::Eager,
-                MtpMode::Graph => WalkMode::Graph,
-                MtpMode::Store => WalkMode::Store,
-            }
-        }
-        for m in [WalkMode::Eager, WalkMode::Graph, WalkMode::Store] {
-            assert_eq!(mode_back(mtp_mode(m)), m);
-        }
-
-        let zeros = [0.0f32; 2];
-        let tokens = [7u32, 8];
-        let sources = [
-            Hidden::Host(&zeros[..]),
-            Hidden::Target {
-                walk: TargetRows::Step,
-                first: 0,
-            },
-            Hidden::Target {
-                walk: TargetRows::Pass,
-                first: 1,
-            },
-            Hidden::Target {
-                walk: TargetRows::Ubatch,
-                first: 3,
-            },
-        ];
-        for h in sources {
-            let f = mtp_feed(Feed {
-                tokens: &tokens,
-                pos0: 5,
-                hidden: h,
-                media: None,
-            })
-            .expect("a feed with no media");
-            let MtpFeed::Rows {
-                tokens: t,
-                pos0,
-                hidden,
-            } = f
-            else {
-                panic!("the shared feed of {h:?} mapped to {f:?}");
-            };
-            assert!(std::ptr::eq(t, &tokens[..]) && pos0 == 5, "{f:?}");
-            match (h, hidden) {
-                (Hidden::Host(a), MtpHidden::Host(b)) => assert!(std::ptr::eq(a, b)),
-                (Hidden::Target { walk: a, first: i }, MtpHidden::Target { walk: b, first: j }) => {
-                    assert_eq!((a, i), (b, j));
-                }
-                (h, hidden) => panic!("{h:?} mapped to {hidden:?}"),
-            }
-        }
-    }
-
-    /// A feed that holds media rows is refused by name, not walked without
-    /// them.
-    #[test]
-    fn media_rows_are_refused_by_name() {
-        let (at, rows) = (0..1, [0u16; 2]);
-        let media = CallRows::new(5, 2, [(&at, &rows[..])]).expect("one whole row");
-        let tokens = [7u32];
-        let e = mtp_feed(Feed {
-            tokens: &tokens,
-            pos0: 5,
-            hidden: Hidden::Target {
-                walk: TargetRows::Step,
-                first: 0,
-            },
-            media: Some(&media),
-        })
-        .expect_err("media rows");
-        assert!(
-            e.to_string()
-                .contains("this body's draft has no media prompt call"),
-            "{e}"
-        );
-    }
-}

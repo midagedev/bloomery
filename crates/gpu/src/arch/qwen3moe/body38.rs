@@ -116,8 +116,8 @@ use super::image::{
     MediaCarrier, MediaRows, imrope_sections, media_call, section_order, window_spans,
 };
 use super::mtp38::{
-    DraftRows38, DraftSeq38, Held38, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode,
-    MtpTaps, Target38, TargetRows,
+    DraftRows38, DraftSeq38, Held38, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpTaps, Target38,
+    TargetRows,
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -143,6 +143,7 @@ use crate::checkpoint::saved::{
 };
 use crate::checkpoint::staging::NoRoom;
 use crate::checkpoint::{self, Checkpoints};
+use crate::draft::{Feed, Hidden, WalkMode};
 use crate::head::{Head, HeadNorm};
 use crate::host::nvtier::NvTier;
 use crate::host::prompt_stream::PromptStream;
@@ -1923,7 +1924,7 @@ impl Body38 {
         w: &Weights,
         feed: MtpFeed<'_>,
         head: MtpHead,
-        mode: MtpMode,
+        mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         let Body38 {
             mtp,
@@ -1959,7 +1960,7 @@ impl Body38 {
         w: &Weights,
         feed: MtpFeed<'_>,
         head: MtpHead,
-        mode: MtpMode,
+        mode: WalkMode,
     ) -> Result<usize, GpuError> {
         let Body38 {
             mtp,
@@ -1996,7 +1997,7 @@ impl Body38 {
         refresh: MtpFeed<'_>,
         own: usize,
         head: MtpHead,
-        mode: MtpMode,
+        mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         let Body38 {
             mtp,
@@ -2504,7 +2505,7 @@ impl Body38 {
         }
     }
 
-    /// The target's final hidden row at `pos` ([`MtpHidden::Target`]'s
+    /// The target's final hidden row at `pos` ([`Hidden::Target`]'s
     /// rows), read from the arena whose record holds it ([`Wrote38`]);
     /// `None` when none does. Blocking.
     fn hidden_row(&self, stream: &CudaStream, pos: u32) -> Result<Option<Vec<f32>>, GpuError> {
@@ -3961,7 +3962,7 @@ fn final_streams_mut<'b>(
     &mut arena.res[cur]
 }
 
-/// The target's streams a [`MtpHidden::Target`] feed of a walk or a chain's
+/// The target's streams a [`Hidden::Target`] feed of a walk or a chain's
 /// refresh names, over the body's arenas, with the positions the arena's
 /// rows hold ([`Wrote38`]): the walk refuses rows that hold other
 /// positions, or none.
@@ -3972,10 +3973,10 @@ fn mtp_target<'b>(
     feed: MtpFeed<'_>,
 ) -> Option<Target38<'b>> {
     match feed {
-        MtpFeed::Rows {
-            hidden: MtpHidden::Target { walk, .. },
+        MtpFeed::Rows(Feed {
+            hidden: Hidden::Target { walk, .. },
             ..
-        } => Some(Target38 {
+        }) => Some(Target38 {
             buf: final_streams(plans, arenas, walk),
             held: wrote.of(walk),
         }),
@@ -4017,7 +4018,7 @@ impl GpuModel<Body38> {
         &mut self,
         feed: MtpFeed<'_>,
         head: MtpHead,
-        mode: MtpMode,
+        mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_draft";
         self.refuse_if_poisoned(WHAT_D)?;
@@ -4035,7 +4036,7 @@ impl GpuModel<Body38> {
         &mut self,
         feed: MtpFeed<'_>,
         head: MtpHead,
-        mode: MtpMode,
+        mode: WalkMode,
     ) -> Result<(), GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_walk";
         self.refuse_if_poisoned(WHAT_D)?;
@@ -4063,7 +4064,7 @@ impl GpuModel<Body38> {
         refresh: MtpFeed<'_>,
         own: usize,
         head: MtpHead,
-        mode: MtpMode,
+        mode: WalkMode,
     ) -> Result<MtpDraft, GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_chain";
         self.refuse_if_poisoned(WHAT_D)?;

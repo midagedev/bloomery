@@ -11,7 +11,7 @@
 //! already has:
 //! - the store part, every row: the token's embedding row read from the file
 //!   on the host, position 0 included (ik's GLM MTP input masks no row), or,
-//!   at a position a media span holds ([`NextnFeed::media`]), the span's bf16
+//!   at a position a media span holds ([`Feed::media`]), the span's bf16
 //!   row widened exactly — the row the target consumed there, as the
 //!   reference's MTP draft adds the target's vision row at an image position;
 //!   the hidden rows — a target arena's streams' mean (`ds41_hc_mean`) then
@@ -21,7 +21,7 @@
 //!   `attn_norm`, the joined `[q_a; latent; key; gate]` projection over the
 //!   columns, the latent and index rows appended at the rows' positions and
 //!   the pools they complete — a later row's attention reads nothing else of
-//!   a row, so [`NextnMode::Store`] stops here;
+//!   a row, so [`WalkMode::Store`] stops here;
 //! - the full part, the last row alone: the latent mixer of a trunk layer on
 //!   the one-row buffers (`crate::mla::latent_row`, which appends the row
 //!   again, the same bits), the plain residual `h = x + attn`, `ffn_norm`,
@@ -34,7 +34,7 @@
 //!   layer's own launch).
 //!
 //! The walk runs launch by launch: the host's union call sits in the middle
-//! of it, so no walk is captured ([`NextnMode::Graph`] is refused by name).
+//! of it, so no walk is captured ([`WalkMode::Graph`] is refused by name).
 //! The store is by position: one walk may start at or below the end of the
 //! last walk of the sequence, never past it ([`Nextn::held`]); the model's
 //! reset and a cut behind it move that end back, and a walk that fails
@@ -51,13 +51,14 @@
 //! walk's host leg; until then it stays on the card's fault word, which the
 //! target's next readback names.
 
+use bloomery_gpu::draft::{Feed, Hidden, WalkMode};
 use bloomery_gpu::head::{Head, HeadNorm};
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::latent::{
     INDEX_HEAD, INDEX_ROW, IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for,
 };
-use bloomery_gpu::media::{CallRows, widen_bf16};
+use bloomery_gpu::media::widen_bf16;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockPlan, enqueue_block};
@@ -97,48 +98,11 @@ pub enum GlmArena {
     Prefill,
 }
 
-/// Where a walk's hidden rows come from.
-#[derive(Clone, Copy, Debug)]
-pub enum NextnHidden<'a> {
-    /// Rows written from the host, [`Body::nextn_hidden_width`] values a row,
-    /// normed as the target's head norms them: the row at position 0 reads a
-    /// zero row, the target holding nothing before it.
-    Host(&'a [f32]),
-    /// The target's rows in the arena `walk`, from its row `first` on, as the
-    /// target's last call of that arena left them.
-    Target { walk: GlmArena, first: usize },
-}
-
-/// A walk's rows: `tokens` at positions `pos0 ..`, each beside its hidden row.
-/// `media` is the prompt call's span rows by absolute position: at a position
-/// it holds, the row stands in for the token's embedding row. A chain takes
-/// none.
-#[derive(Clone, Copy, Debug)]
-pub struct NextnFeed<'a> {
-    pub tokens: &'a [u32],
-    pub pos0: u32,
-    pub hidden: NextnHidden<'a>,
-    pub media: Option<&'a CallRows<'a>>,
-}
-
 /// Which projection the draft's head runs: the target's `output`, the whole
 /// vocabulary (the load opens no row list).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NextnHead {
     Full,
-}
-
-/// How a walk runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NextnMode {
-    /// Enqueued launch by launch, the last row through the head.
-    Eager,
-    /// Replayed from a capture: refused by name, the walk's host union call
-    /// sits between its launches.
-    Graph,
-    /// Enqueued launch by launch through the store's appends and no further
-    /// (module doc): no head, no readback.
-    Store,
 }
 
 /// The layer's tensor names, and the target's `output_norm` its hidden rows
@@ -658,13 +622,13 @@ impl Wrote {
 /// position, its rows and their width.
 #[derive(Clone, Copy)]
 struct Want<'h> {
-    hidden: NextnHidden<'h>,
+    hidden: Hidden<'h, GlmArena>,
     pos0: u32,
     m: usize,
     n: usize,
 }
 
-/// The target's streams a [`NextnHidden::Target`] feed reads: one buffer of
+/// The target's streams a [`Hidden::Target`] feed reads: one buffer of
 /// rows of `4 · n_embd` values, or the verify's two rows apart.
 enum Src<'a> {
     Rows {
@@ -711,14 +675,14 @@ fn hidden_src<'a>(
     let Want { hidden, pos0, m, n } = want;
     let fin = crate::program::final_streams(layers);
     let (walk, first) = match hidden {
-        NextnHidden::Host(v) if v.len() != m * n => {
+        Hidden::Host(v) if v.len() != m * n => {
             return Err(shape(format!(
                 "{} hidden values for {m} rows of {n}",
                 v.len()
             )));
         }
-        NextnHidden::Host(_) => return Ok(None),
-        NextnHidden::Target { walk, first } => (walk, first),
+        Hidden::Host(_) => return Ok(None),
+        Hidden::Target { walk, first } => (walk, first),
     };
     let src = match walk {
         GlmArena::Step => Src::Rows {
@@ -778,7 +742,7 @@ fn enqueue_hidden(
     norm: &str,
     k: &Kernels,
     d: &Dims,
-    hidden: NextnHidden<'_>,
+    hidden: Hidden<'_, GlmArena>,
     src: Option<(Src<'_>, usize)>,
     m: usize,
     a: &mut Arena,
@@ -786,10 +750,10 @@ fn enqueue_hidden(
     let stream = gpu.stream();
     let n = d.embd;
     match (hidden, src) {
-        (NextnHidden::Host(v), _) => {
+        (Hidden::Host(v), _) => {
             span_mut(WHAT, &mut a.hn, 0, m * n)?.copy_from_host(stream, v)?;
         }
-        (NextnHidden::Target { .. }, Some((src, first))) => {
+        (Hidden::Target { .. }, Some((src, first))) => {
             for t in 0..m {
                 let rowv = src.row(first + t, HC_STREAMS * n)?;
                 k.hc.enqueue_mean(stream, &rowv, n, t * n, &mut a.hid)?;
@@ -804,7 +768,7 @@ fn enqueue_hidden(
                 &mut a.hn,
             )?;
         }
-        (NextnHidden::Target { .. }, None) => {
+        (Hidden::Target { .. }, None) => {
             return Err(shape("the target's rows to read".to_string()));
         }
     }
@@ -1003,8 +967,8 @@ impl Body {
         &mut self,
         gpu: &Gpu,
         tw: &Weights,
-        feed: NextnFeed<'_>,
-        mode: NextnMode,
+        feed: Feed<'_, GlmArena>,
+        mode: WalkMode,
     ) -> Result<(), GpuError> {
         let layers = self.cfg.len();
         let Body {
@@ -1022,7 +986,8 @@ impl Body {
         let nx = nextn
             .as_deref_mut()
             .ok_or_else(|| shape("a walk on a load without the NextN layer".to_string()))?;
-        if mode == NextnMode::Graph {
+        if mode == WalkMode::Graph {
+            // Refused by name: the walk's host union call sits between its launches.
             return Err(shape(
                 "a captured NextN walk: the host's union call over the layer's routed experts \
                  sits between its launches"
@@ -1204,7 +1169,7 @@ impl Body {
             mla::pool(stream, w, k, &ln.sel, index_rows, &cnt, m, fault, pooled)?;
         }
         *held = pos0 + m;
-        if mode == NextnMode::Store {
+        if mode == WalkMode::Store {
             return Ok(());
         }
         // The full part, the last row alone.
@@ -1311,9 +1276,9 @@ impl Body {
 /// read stays on the card's fault word, which the next readback names.
 pub fn nextn_walk(
     m: &mut GpuModel<Body>,
-    feed: NextnFeed<'_>,
+    feed: Feed<'_, GlmArena>,
     head: NextnHead,
-    mode: NextnMode,
+    mode: WalkMode,
 ) -> Result<(), GpuError> {
     let NextnHead::Full = head;
     if let Some(fault) = m.poisoned() {
@@ -1332,10 +1297,10 @@ pub fn nextn_walk(
 /// model as the target's would.
 pub fn nextn_chain(
     m: &mut GpuModel<Body>,
-    refresh: NextnFeed<'_>,
+    refresh: Feed<'_, GlmArena>,
     own: usize,
     head: NextnHead,
-    mode: NextnMode,
+    mode: WalkMode,
     out: &mut [u32],
 ) -> Result<usize, GpuError> {
     if own != 0 {
@@ -1349,7 +1314,7 @@ pub fn nextn_chain(
                 .to_string(),
         ));
     }
-    if mode == NextnMode::Store {
+    if mode == WalkMode::Store {
         return Err(shape(
             "a chain in the store walk's mode: it reads the head".to_string(),
         ));
@@ -1378,7 +1343,7 @@ pub fn nextn_chain(
 pub fn nextn_hidden(
     m: &mut GpuModel<Body>,
     pos0: u32,
-    hidden: NextnHidden<'_>,
+    hidden: Hidden<'_, GlmArena>,
     rows: usize,
 ) -> Result<Vec<f32>, GpuError> {
     if !(1..=WALK_ROWS).contains(&rows) {
@@ -1431,7 +1396,7 @@ pub fn nextn_hidden(
 pub fn nextn_target_streams(
     m: &mut GpuModel<Body>,
     pos0: u32,
-    hidden: NextnHidden<'_>,
+    hidden: Hidden<'_, GlmArena>,
     rows: usize,
 ) -> Result<Vec<f32>, GpuError> {
     if !(1..=WALK_ROWS).contains(&rows) {

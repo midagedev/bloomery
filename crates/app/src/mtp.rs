@@ -82,6 +82,10 @@ use runtime::{Draft, TapNeed, Target, accepted_rows};
 
 use crate::{Keep, Prompt, Session, SessionError};
 
+/// The types a draft walk is given, owned by the card crate (`bloomery_gpu`):
+/// how a walk runs, where its hidden rows come from and the rows it walks.
+pub use bloomery_gpu::draft::{Feed, Hidden, WalkMode};
+
 mod policy;
 
 use policy::{Exec, Fail, Policy, Refresh, Refused, Shape, Source, Walk};
@@ -114,62 +118,6 @@ impl From<Fail<GpuError>> for SessionError {
             Fail::Exec(e) => e.into(),
         }
     }
-}
-
-/// How a walk runs ([`MtpBody::walk`], [`MtpBody::chain`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WalkMode {
-    /// Enqueued launch by launch.
-    Eager,
-    /// Replayed from its capture, captured on first use.
-    Graph,
-    /// Enqueued launch by launch through the store's append and no further:
-    /// the rows' keys and values, which are all a later row reads of them (a
-    /// row's input is its token and the target's hidden row, never the
-    /// draft's output). No flash, feed-forward block or head, no readback
-    /// and no own row: the prompt's warmup. The store's bits are a
-    /// [`WalkMode::Eager`] walk's. A body with no such walk refuses it by
-    /// name; a chain never takes it.
-    Store,
-}
-
-impl From<StepMode> for WalkMode {
-    /// A step's mode as a walk's: the window's walks with a head run as the
-    /// target's steps do.
-    fn from(m: StepMode) -> WalkMode {
-        match m {
-            StepMode::Eager => WalkMode::Eager,
-            StepMode::Graph => WalkMode::Graph,
-        }
-    }
-}
-
-/// Where a walk's hidden rows come from; `A` is the body's
-/// [`MtpBody::Arena`].
-#[derive(Clone, Copy, Debug)]
-pub enum Hidden<'a, A> {
-    /// Rows written from the host, [`MtpBody::hidden_width`] values a row:
-    /// the row at position 0 reads a zero row, the target holding nothing
-    /// before it.
-    Host(&'a [f32]),
-    /// The target's final hidden rows in the arena `walk`, from its row
-    /// `first` on, as the target's last call of that arena left them.
-    Target { walk: A, first: usize },
-}
-
-/// A walk's rows: `tokens` at positions `pos0 ..`, each beside its hidden
-/// row (the target's at the position before it). `media` is the prompt
-/// call's span rows by absolute position: a row the lookup holds replaces
-/// the token's embedding row at its position, as the target's media call
-/// took it. Only a prompt call that holds an image carries it
-/// ([`MtpDraft::prompt_media`]); a body whose walk cannot take it refuses it
-/// by name.
-#[derive(Clone, Copy, Debug)]
-pub struct Feed<'a, A> {
-    pub tokens: &'a [u32],
-    pub pos0: u32,
-    pub hidden: Hidden<'a, A>,
-    pub media: Option<&'a CallRows<'a>>,
 }
 
 /// A prompt call's tap ([`MtpBody::prompt_with`]): called after each unit

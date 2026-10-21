@@ -133,6 +133,7 @@ mod gate {
     use app::Session;
     use app::mtp::{MtpDraft, SLOT_DEPTH, SlotWindow, pass_slots};
     use bloomery_gpu::GpuError;
+    use bloomery_gpu::draft::{Feed, Hidden, WalkMode};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
@@ -144,10 +145,10 @@ mod gate {
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, patch_bytes, verdict};
     use bloomery_gpu_glm5next::{
-        Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, GlmSeq, NextnFeed,
-        NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS, checkpoint_price, feed,
-        nextn_chain, nextn_hidden, nextn_logits, nextn_router, nextn_store, nextn_target_streams,
-        nextn_walk, prompt_with, seq_bytes, seq_resume, seq_save, set_prefill, set_prefill_group,
+        Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, GlmSeq, NextnHead,
+        PrefillMode, WALK_ROWS, checkpoint_price, feed, nextn_chain, nextn_hidden, nextn_logits,
+        nextn_router, nextn_store, nextn_target_streams, nextn_walk, prompt_with, seq_bytes,
+        seq_resume, seq_save, set_prefill, set_prefill_group,
     };
     use gguf::Split;
     use model::arch::glm5next::names;
@@ -588,17 +589,17 @@ mod gate {
         let mut ours = None;
         while c0 < n {
             let rows = WALK_ROWS.min(n - c0);
-            let f = NextnFeed {
+            let f = Feed {
                 tokens: &g.tokens[c0..c0 + rows],
                 pos0: g.pos[c0],
-                hidden: NextnHidden::Host(&g.states[c0 * hidden..(c0 + rows) * hidden]),
+                hidden: Hidden::Host(&g.states[c0 * hidden..(c0 + rows) * hidden]),
                 media: None,
             };
             if c0 + rows < n {
-                nextn_walk(m, f, NextnHead::Full, NextnMode::Store)?;
+                nextn_walk(m, f, NextnHead::Full, WalkMode::Store)?;
             } else {
                 let mut out = [0u32; 1];
-                let k = nextn_chain(m, f, 0, NextnHead::Full, NextnMode::Eager, &mut out)?;
+                let k = nextn_chain(m, f, 0, NextnHead::Full, WalkMode::Eager, &mut out)?;
                 if k != 1 {
                     return Err(format!("{}: a chain of {k} ids, want 1", g.label()).into());
                 }
@@ -836,7 +837,7 @@ mod gate {
                 let r = WALK_ROWS.min(rows - c0);
                 // The walk from the position after the unit's row c0 reads it.
                 let pos0 = first + c0 as u32 + 1;
-                let target = NextnHidden::Target {
+                let target = Hidden::Target {
                     walk: arena,
                     first: c0,
                 };
@@ -1112,7 +1113,7 @@ mod gate {
             nextn_hidden(
                 m,
                 pos0,
-                NextnHidden::Target {
+                Hidden::Target {
                     walk: GlmArena::Step,
                     first: 0,
                 },
@@ -1136,7 +1137,7 @@ mod gate {
             nextn_hidden(
                 m,
                 p + 1,
-                NextnHidden::Target {
+                Hidden::Target {
                     walk: GlmArena::Pair,
                     first: 0,
                 },
@@ -1164,7 +1165,7 @@ mod gate {
         m.step_rows::<2>([t2, t2])?;
         m.rollback(q + 1)?;
         m.keep_rows(KeptRows::prefix(1), PassKind::Pair)?;
-        let pair = |first: usize| NextnHidden::Target {
+        let pair = |first: usize| Hidden::Target {
             walk: GlmArena::Pair,
             first,
         };
@@ -1371,8 +1372,8 @@ mod gate {
     }
 
     /// A walk's feed.
-    fn f<'a>(tokens: &'a [u32], pos0: u32, hidden: NextnHidden<'a>) -> NextnFeed<'a> {
-        NextnFeed {
+    fn f<'a>(tokens: &'a [u32], pos0: u32, hidden: Hidden<'a, GlmArena>) -> Feed<'a, GlmArena> {
+        Feed {
             tokens,
             pos0,
             hidden,
@@ -1385,7 +1386,7 @@ mod gate {
     fn refusals(m: &mut Glm5nextModel, hidden: usize) -> Result<bool, GateError> {
         m.reset()?;
         let zeros = vec![0.0f32; (WALK_ROWS + 1) * hidden];
-        let host = |rows: usize| NextnHidden::Host(&zeros[..rows * hidden]);
+        let host = |rows: usize| Hidden::Host(&zeros[..rows * hidden]);
         let toks = vec![1u32; WALK_ROWS + 1];
         let mut ok = true;
         ok &= refused(
@@ -1394,7 +1395,7 @@ mod gate {
                 m,
                 f(&toks[..1], 0, host(1)),
                 NextnHead::Full,
-                NextnMode::Graph,
+                WalkMode::Graph,
             ),
             "a captured NextN walk",
         );
@@ -1404,7 +1405,7 @@ mod gate {
                 m,
                 f(&toks[..0], 0, host(0)),
                 NextnHead::Full,
-                NextnMode::Eager,
+                WalkMode::Eager,
             ),
             "a walk of 0 rows",
         );
@@ -1414,7 +1415,7 @@ mod gate {
                 m,
                 f(&toks, 0, host(WALK_ROWS + 1)),
                 NextnHead::Full,
-                NextnMode::Eager,
+                WalkMode::Eager,
             ),
             &format!("a walk of {} rows", WALK_ROWS + 1),
         );
@@ -1424,7 +1425,7 @@ mod gate {
                 m,
                 f(&toks[..1], 1, host(1)),
                 NextnHead::Full,
-                NextnMode::Eager,
+                WalkMode::Eager,
             ),
             "a walk from position 1",
         );
@@ -1434,7 +1435,7 @@ mod gate {
                 m,
                 f(&[u32::MAX], 0, host(1)),
                 NextnHead::Full,
-                NextnMode::Eager,
+                WalkMode::Eager,
             ),
             "past the",
         );
@@ -1442,9 +1443,9 @@ mod gate {
             "a host hidden slice of the wrong length",
             nextn_walk(
                 m,
-                f(&toks[..1], 0, NextnHidden::Host(&zeros[..hidden - 1])),
+                f(&toks[..1], 0, Hidden::Host(&zeros[..hidden - 1])),
                 NextnHead::Full,
-                NextnMode::Eager,
+                WalkMode::Eager,
             ),
             "hidden values for 1 rows",
         );
@@ -1455,13 +1456,13 @@ mod gate {
                 f(
                     &toks[..1],
                     0,
-                    NextnHidden::Target {
+                    Hidden::Target {
                         walk: GlmArena::Step,
                         first: 1,
                     },
                 ),
                 NextnHead::Full,
-                NextnMode::Eager,
+                WalkMode::Eager,
             ),
             "of the Step arena's 1",
         );
@@ -1473,7 +1474,7 @@ mod gate {
                 f(&toks[..1], 0, host(1)),
                 1,
                 NextnHead::Full,
-                NextnMode::Eager,
+                WalkMode::Eager,
                 &mut out,
             ),
             "a chain of 1 own walks",
@@ -1485,7 +1486,7 @@ mod gate {
                 f(&toks[..1], 0, host(1)),
                 0,
                 NextnHead::Full,
-                NextnMode::Store,
+                WalkMode::Store,
                 &mut out,
             ),
             "a chain in the store walk's mode",
@@ -1497,7 +1498,7 @@ mod gate {
                 f(&toks[..1], 0, host(1)),
                 0,
                 NextnHead::Full,
-                NextnMode::Eager,
+                WalkMode::Eager,
                 &mut [],
             ),
             "into 0 places",
@@ -1524,7 +1525,7 @@ mod gate {
     /// from 5, which reads positions 4 and 5: each refused by name. The model
     /// left reset.
     fn by_position(m: &mut Glm5nextModel, toks: &[u32]) -> Result<bool, GateError> {
-        let target = |walk: GlmArena, first: usize| NextnHidden::Target { walk, first };
+        let target = |walk: GlmArena, first: usize| Hidden::Target { walk, first };
         m.reset()?;
         let mut ok = refused(
             "the pair arena before any verify",
@@ -1593,21 +1594,21 @@ mod gate {
     fn chain_fault(m: &mut Glm5nextModel, index: usize, hidden: usize) -> Result<bool, GateError> {
         let zeros = vec![0.0f32; hidden];
         let tok = [1u32];
-        let feed = || f(&tok, 0, NextnHidden::Host(&zeros));
+        let feed = || f(&tok, 0, Hidden::Host(&zeros));
         let mut out = [0u32; 1];
         m.reset()?;
-        nextn_chain(m, feed(), 0, NextnHead::Full, NextnMode::Eager, &mut out)?;
+        nextn_chain(m, feed(), 0, NextnHead::Full, WalkMode::Eager, &mut out)?;
         let clean = out[0];
         m.reset()?;
         let old = patch_head_norm(m, index, f32::NAN.to_le_bytes())?;
         let first =
-            nextn_chain(m, feed(), 0, NextnHead::Full, NextnMode::Eager, &mut out).map(|_| out[0]);
+            nextn_chain(m, feed(), 0, NextnHead::Full, WalkMode::Eager, &mut out).map(|_| out[0]);
         let poisoned = m.poisoned();
-        let walk = nextn_walk(m, feed(), NextnHead::Full, NextnMode::Store);
+        let walk = nextn_walk(m, feed(), NextnHead::Full, WalkMode::Store);
         patch_head_norm(m, index, old)?;
         m.reset()?;
         let again =
-            nextn_chain(m, feed(), 0, NextnHead::Full, NextnMode::Eager, &mut out).map(|_| out[0]);
+            nextn_chain(m, feed(), 0, NextnHead::Full, WalkMode::Eager, &mut out).map(|_| out[0]);
         m.reset()?;
         let named = match &first {
             Err(GpuError::Fault { fault, .. }) => poisoned == Some(*fault),
@@ -1944,14 +1945,14 @@ mod gate {
             "a walk on a load without the layer",
             nextn_walk(
                 &mut m,
-                NextnFeed {
+                Feed {
                     tokens: &[1],
                     pos0: 0,
-                    hidden: NextnHidden::Host(&vec![0.0; hidden]),
+                    hidden: Hidden::Host(&vec![0.0; hidden]),
                     media: None,
                 },
                 NextnHead::Full,
-                NextnMode::Eager,
+                WalkMode::Eager,
             ),
             "without the NextN layer",
         );
