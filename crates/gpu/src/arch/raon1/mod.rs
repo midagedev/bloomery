@@ -14,6 +14,8 @@ pub mod mla;
 pub mod rda;
 mod rows;
 mod state;
+#[cfg(test)]
+mod synth;
 mod wide;
 
 pub use body::Body;

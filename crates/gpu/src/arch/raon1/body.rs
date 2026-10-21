@@ -44,6 +44,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::KdaGate;
+use model::arch::noaux::Experts;
 use model::arch::raon1::hparams::{Hparams, Kind};
 use model::arch::raon1::names::{self, Sub};
 use model::placement::CardFormat;
@@ -109,6 +110,28 @@ impl Layer {
             Mixer::Mla { cache, .. } => cache.buf().num_bytes(),
         }
     }
+
+    /// `Ok` when the wide arm runs layer `l`: neither its mixer's projections
+    /// nor its feed-forward block of resident weights `w` meet a refusal the wide
+    /// arm raises ([`Body::wide_ok`]).
+    fn wide_runs(&self, l: usize, w: &Weights, d: &WideDims) -> Result<(), GpuError> {
+        let mixer = match &self.mixer {
+            Mixer::Rda { sites, .. } => wide::rda_runs(sites),
+            Mixer::Mla { sites, .. } => sites.wide_runs(),
+        };
+        mixer.map_err(|refusal| GpuError::shape(WHAT, format!("layer {l}'s mixer: {refusal}")))?;
+        wide::ffn_runs(l, &self.ffn, w, d)
+    }
+}
+
+/// The first refusal the wide arm raises over `layers` in file order, or `None`
+/// when it runs every one ([`Body::wide_ok`]).
+fn wide_refusal(layers: &[Layer], w: &Weights, d: &WideDims) -> Option<String> {
+    layers
+        .iter()
+        .enumerate()
+        .find_map(|(l, layer)| layer.wide_runs(l, w, d).err())
+        .map(|refusal| refusal.to_string())
 }
 
 /// The kernels the step launches beyond the `Gpu`'s own.
@@ -200,8 +223,21 @@ fn wide_dims(hp: &Hparams, kda: &KdaDims, mla: &MlaDims) -> Result<WideDims, Gpu
         dense_ff: hp.dense_ff,
         shared_ff: e.shared_ff(),
         expert_ff: e.ff,
-        ff_rows: hp.dense_ff.max(ffn::sigmoid_128_6::N_USED * e.ff),
+        ff_rows: wide_ff_rows(hp.dense_ff, &e),
     })
+}
+
+/// The width of the widest block the dense forms' buffers hold rows of: the dense
+/// layers' and the shared experts' (`n_shared` experts of `ff` run as one block
+/// of `ff · n_shared` values).
+fn dense_block_ff(dense_ff: usize, e: &Experts) -> usize {
+    dense_ff.max(e.shared_ff())
+}
+
+/// The gate and up rows' width of a wide unit's feed-forward buffers: the widest
+/// dense-form block, or the routed slots' (`N_USED` experts of `ff`).
+fn wide_ff_rows(dense_ff: usize, e: &Experts) -> usize {
+    dense_block_ff(dense_ff, e).max(ffn::sigmoid_128_6::N_USED * e.ff)
 }
 
 /// A walk's buffers, `rows` rows of each width, token-major: the step's
@@ -430,6 +466,9 @@ pub struct Body {
     stage: DeviceBuffer<f32>,
     /// A wide unit's rows, forms and kernels ([`super::wide`]).
     pub(super) wide: Wide,
+    /// What keeps the wide arm off this file's prompts, found at load, or `None`
+    /// when it runs every layer ([`Body::wide_ok`]).
+    wide_off: Option<String>,
     /// The passes' staging, the lane word, the taps and the position the
     /// stores stand at.
     pub(super) rows: RowState,
@@ -546,6 +585,30 @@ impl Body {
         Ok(self.s.hc.to_host_vec(stream)?)
     }
 
+    /// Whether a prompt of more than [`PASS_ROWS`] ids runs as wide units
+    /// ([`super::wide`]), decided once at load over every layer. The wide arm
+    /// refuses a weight the loader admits — an output projection or `attn_q_b`
+    /// that is not Q8_0, a forget projection that is not F32, a dense block or
+    /// shared expert whose down has no form at its width (a K-quant down over
+    /// the dense width, a Q8_0 down over the shared width), routed stacks that
+    /// are not one grouped K-quant type with a down the 32-value GEMM reads
+    /// ([`wide::rda_runs`], `MlaSites::wide_runs`, [`wide::ffn_runs`]). One
+    /// such layer keeps the whole file on the rows pass for prompts of every
+    /// length, where a prompt past [`PASS_ROWS`] ids would otherwise stop at
+    /// that layer by name.
+    #[must_use]
+    pub fn wide_ok(&self) -> bool {
+        self.wide_off.is_none()
+    }
+
+    /// The refusal the load found that keeps the wide arm off this file's
+    /// prompts, the first layer's in file order; `None` when
+    /// [`Body::wide_ok`].
+    #[must_use]
+    pub fn wide_off(&self) -> Option<&str> {
+        self.wide_off.as_deref()
+    }
+
     fn load(
         gpu: &Gpu,
         file: &Split,
@@ -656,7 +719,9 @@ impl Body {
             &mut acts,
             layers.iter().flat_map(Layer::mixer_sites),
         )?;
-        let ff = (hp.dense_ff.max(e.shared_ff()), e.ff);
+        let ff = (dense_block_ff(hp.dense_ff, &e), e.ff);
+        let wd = wide_dims(&hp, &kda, &mla)?;
+        let wide_off = wide_refusal(&layers, w, &wd);
         let stage = rda::stage_len(&kda)
             .max(mla::stage_len(&mla))
             .max(ffn::stage_len(ff.0.max(ff.1)));
@@ -670,9 +735,10 @@ impl Body {
             stage: DeviceBuffer::zeroed(stream, stage)?,
             wide: Wide::new(
                 gpu,
-                &wide_dims(&hp, &kda, &mla)?,
+                &wd,
                 Scratch::new(stream, &hp, (&kda, &mla), ctx, WIDE_ROWS)?,
             )?,
+            wide_off,
             rows: RowState::new(stream, lanes)?,
             kda,
             mla,
@@ -738,6 +804,7 @@ impl Body {
             stage,
             rows,
             wide,
+            wide_off,
             ctx,
             ..
         } = self;
@@ -789,6 +856,12 @@ impl Body {
                     return Err(GpuError::shape(
                         STEP,
                         format!("a {pass:?} pass of {m} rows: only a prompt's units run wide"),
+                    ));
+                }
+                if let Some(why) = wide_off {
+                    return Err(GpuError::shape(
+                        STEP,
+                        format!("a wide unit of {m} rows with the wide arm off: {why}"),
                     ));
                 }
                 wide.route_dense(gpu, m)?;
@@ -1099,5 +1172,128 @@ impl ChainBody for Body {
 
     fn host(&mut self) -> Option<&mut NoHost> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ffn::sigmoid_128_6::{N_EXPERT, N_USED};
+    use super::mla::tests::typed_sites;
+    use super::{Ffn, Glu, Layer, Mixer, STREAMS, Site, SiteTy, dims, wide_dims, wide_refusal};
+    use crate::weights::Weights;
+    use crate::{DeviceTensor, Gpu};
+    use model::arch::kda::Keys;
+    use model::arch::models::KdaGate;
+    use model::arch::noaux::Experts;
+    use model::arch::raon1::hparams::{Hc, Hparams, Kind, Mla, Situ};
+
+    /// A header with Raon's widths and a dense width, a routed expert's width and a
+    /// count of shared experts of the caller's.
+    fn header(dense_ff: usize, ff: usize, n_shared: usize) -> Hparams {
+        Hparams {
+            n_layer: 3,
+            n_embd: 2560,
+            n_head: 40,
+            kda: Keys {
+                conv: 4,
+                head_dim: 128,
+            },
+            decay_rank: 128,
+            gate: KdaGate::Sigmoid { lower_bound: -5.0 },
+            mla: Mla {
+                q_lora: 576,
+                kv_lora: 512,
+                head_k: 192,
+                head_v: 128,
+                pe: 64,
+            },
+            rms_eps: 1e-5,
+            latent_eps: 1e-6,
+            hc: Hc {
+                streams: STREAMS,
+                eps: 1e-5,
+                magnitude: 2.0,
+            },
+            situ: Situ {
+                gate_beta: 4.0,
+                value_beta: 4.0,
+            },
+            n_vocab: 1024,
+            n_ctx_train: 4096,
+            dense_lead: 1,
+            dense_ff,
+            experts: Experts {
+                n_expert: N_EXPERT,
+                n_used: N_USED,
+                ff,
+                n_shared,
+                weights_scale: 1.0,
+                weights_norm: true,
+            },
+            kinds: vec![Kind::Rda, Kind::Rda, Kind::Mla],
+            defaults: Vec::new(),
+        }
+    }
+
+    /// A wide unit's gate and up rows hold the widest block that writes them: the
+    /// dense layer's, a routed layer's shared experts' (`n_shared` of `ff` run as
+    /// one block) and the routed slots' (`N_USED` of `ff`). Seven shared experts of
+    /// 256 beside a dense width of 1024 are 1792 values, past the dense width and
+    /// the slots' 1536. The buffers' size and the plan's reserve
+    /// ([`Body::pass_reserve`]) both read these widths.
+    #[test]
+    fn a_wide_units_gate_rows_hold_the_shared_block() {
+        for (dense_ff, ff, n_shared) in [(1024, 256, 7), (12032, 1088, 1), (512, 128, 1)] {
+            let hp = header(dense_ff, ff, n_shared);
+            let (kda, mla) = dims(&hp).expect("the header's widths");
+            let d = wide_dims(&hp, &kda, &mla).expect("the wide arm's widths");
+            for (what, width) in [
+                ("dense", dense_ff),
+                ("shared", ff * n_shared),
+                ("routed slots", N_USED * ff),
+            ] {
+                assert!(
+                    d.ff_rows >= width,
+                    "dense {dense_ff}, {n_shared} shared of {ff}: gate rows of {} values hold \
+                     the {what} block of {width}",
+                    d.ff_rows
+                );
+            }
+        }
+    }
+
+    /// One layer the wide arm refuses keeps the whole file off it: a latent layer
+    /// whose output projection is Q6_K among Q8_0 ones is the first refusal, named
+    /// by its layer, and a file of Raon's types has none.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_one_layer_with_a_q6k_output_keeps_the_file_off_the_wide_arm() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let hp = header(1024, 256, 1);
+        let (kda, mla) = dims(&hp).expect("the header's widths");
+        let d = wide_dims(&hp, &kda, &mla).expect("the wide arm's widths");
+        let site = |name: &str, ty: SiteTy, k: usize| Site::new(name.to_owned(), ty, k);
+        let layer = |out: SiteTy| Layer {
+            mixer: Mixer::Mla {
+                sites: Box::new(typed_sites(SiteTy::Q8_0, out)),
+                cache: DeviceTensor::zeroed(gpu.stream(), 1, mla.row()).expect("a cache row"),
+            },
+            ffn: Ffn::Dense(Glu {
+                gate: site("gate", SiteTy::Q4K, hp.n_embd),
+                up: site("up", SiteTy::Q4K, hp.n_embd),
+                down: site("down", SiteTy::Q6K, hp.dense_ff),
+                ff: hp.dense_ff,
+            }),
+            hc: std::array::from_fn(|_| std::array::from_fn(|_| String::new())),
+        };
+        let w = Weights::default();
+        let raon = [layer(SiteTy::Q8_0), layer(SiteTy::Q8_0)];
+        assert_eq!(wide_refusal(&raon, &w, &d), None);
+        let mixed = [layer(SiteTy::Q8_0), layer(SiteTy::Q6K), layer(SiteTy::F32)];
+        let refusal = wide_refusal(&mixed, &w, &d).expect("a refusal");
+        assert!(
+            refusal.contains("layer 1's mixer") && refusal.contains("an output projection of Q6_K"),
+            "{refusal}"
+        );
     }
 }

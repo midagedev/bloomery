@@ -53,8 +53,8 @@
 use super::rda::{RowsKit, kgemv_rows, project_rows};
 use super::state::PASS_ROWS;
 use super::wide::{
-    AbsorbShape, Input, WIDE_ROWS, WideKit, absorb_heads, input, quantize_hid, quantize_out,
-    quantize_qb, route_heads, value_heads,
+    AbsorbShape, Input, WIDE_ROWS, WideKit, absorb_heads, input, out_runs, qb_runs, quantize_hid,
+    quantize_out, quantize_qb, route_heads, value_heads,
 };
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::fault::FaultSink;
@@ -233,6 +233,14 @@ impl MlaSites {
     /// Every site the layer launches, for the load's [`Acts::new`].
     pub(crate) fn sites(&self) -> [&Site; 5] {
         [&self.q_a, &self.kv_a, &self.gate, &self.q_b, &self.out]
+    }
+
+    /// `Ok` when the wide arm runs the layer's projections ([`rows_wide`]), else
+    /// the refusal it raises: `attn_q_b` and the output projection read q8
+    /// blocks of 32.
+    pub(super) fn wide_runs(&self) -> Result<(), GpuError> {
+        qb_runs(self.q_b.ty())?;
+        out_runs(self.out.ty())
     }
 }
 
@@ -1029,7 +1037,7 @@ pub(super) fn rows_wide(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{MlaBufs, MlaDims, MlaKernels, MlaSites, ValueHeads, partials_lens_rows, rows};
     use crate::Gpu;
     use crate::arch::hybrid::{Acts, GqaCx, Site};
@@ -1103,6 +1111,41 @@ mod tests {
             ],
         };
         (w, sites)
+    }
+
+    /// A layer's sites with `q_b` and `out` of the given types, the others Raon's.
+    pub(crate) fn typed_sites(q_b: SiteTy, out: SiteTy) -> MlaSites {
+        let site = |name: String, ty: SiteTy, k: usize| Site::new(name, ty, k);
+        let (e, hv) = (D.embd, D.heads * D.v_head);
+        MlaSites {
+            q_a: site(names::attn_q_a(L), SiteTy::Q6K, e),
+            kv_a: site(names::attn_kv_a_mqa(L), SiteTy::Q6K, e),
+            gate: site(names::attn_gate(L), SiteTy::Q8_0, e),
+            q_b: site(names::attn_q_b(L), q_b, D.q_lora),
+            out: site(names::attn_output(L), out, hv),
+            k_b: names::attn_k_b(L),
+            v_b: ValueHeads::Q6K(names::attn_v_b(L)),
+            vecs: [
+                names::attn_norm(L),
+                names::attn_q_a_norm(L),
+                names::attn_kv_a_norm(L),
+            ],
+        }
+    }
+
+    /// The wide arm runs a latent layer whose `attn_q_b` and output projection
+    /// are Q8_0 (Raon's), and refuses by name one whose either is another type:
+    /// a Q6_K output projection reads q8_1 blocks of 128, and the wide arm
+    /// quantizes the gated rows in blocks of 32 alone.
+    #[test]
+    fn a_latent_layer_runs_wide_only_with_q8_0_query_up_and_output() {
+        assert!(typed_sites(SiteTy::Q8_0, SiteTy::Q8_0).wide_runs().is_ok());
+        for ty in [SiteTy::Q6K, SiteTy::Q4K, SiteTy::F32] {
+            let e = typed_sites(SiteTy::Q8_0, ty).wide_runs().unwrap_err();
+            assert!(e.to_string().contains("an output projection"), "{e}");
+            let e = typed_sites(ty, SiteTy::Q8_0).wide_runs().unwrap_err();
+            assert!(e.to_string().contains("a query up projection"), "{e}");
+        }
     }
 
     /// The buffers of a pass of up to [`PASS_ROWS`] rows over a cache of

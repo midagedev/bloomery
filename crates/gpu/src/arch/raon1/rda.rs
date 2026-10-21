@@ -617,6 +617,11 @@ pub(super) mod tests {
     /// contiguous axis first) and bytes.
     pub(crate) struct Part(String, GgmlType, Vec<usize>, Vec<u8>);
 
+    /// A file tensor of `ty` over `dims` whose bytes are `bytes` as they stand.
+    pub(crate) fn raw(name: String, ty: GgmlType, dims: Vec<usize>, bytes: Vec<u8>) -> Part {
+        Part(name, ty, dims, bytes)
+    }
+
     /// Q6_K rows over `dims`: random codes, sub-block scales in −4..=4 and a
     /// small `d` (high byte 0x14), so every weight is finite and small.
     pub(crate) fn q6k(r: &mut Lcg, name: String, dims: Vec<usize>) -> Part {

@@ -6,7 +6,8 @@
 //!   ([`super::state`]);
 //! - a prompt call ([`GpuModel::prompt_rows`]): wide units of up to
 //!   [`WIDE_ROWS`] rows ([`super::wide`]) while at least [`WIDE_FROM`] rows
-//!   remain, then the rest's ids staged on the card [`GROUP`] at a time, each
+//!   remain and the file runs wide ([`Body::wide_ok`]), then the rest's ids
+//!   staged on the card [`GROUP`] at a time, each
 //!   chunk of up to [`PASS_ROWS`] of them one walk in place, the head on the
 //!   call's last row alone;
 //! - the taps ([`GpuModel::set_draft_taps`]): the streams entering the
@@ -308,7 +309,9 @@ impl Rollback for Body {
 impl Body {
     /// A prompt call's walks from `pos` ([`GpuModel::prompt_rows`]): wide
     /// units of up to [`WIDE_ROWS`] rows ([`super::wide`]) as long as at
-    /// least [`WIDE_FROM`] rows remain, then the rest with its ids staged a
+    /// least [`WIDE_FROM`] rows remain and the file runs wide
+    /// ([`Body::wide_ok`]; a file that does not takes the rest's path for
+    /// every row), then the rest with its ids staged a
     /// group at a time, each chunk of up to [`PASS_ROWS`] a walk in place
     /// (every row the step's bits). The head is on the call's last row; with
     /// `tapped`, the taps of the call's last `window` rows are handed to its
@@ -333,7 +336,7 @@ impl Body {
             .as_ref()
             .map_or(n, |(window, _)| n - (*window).min(n));
         let mut done = 0;
-        while n - done >= WIDE_FROM {
+        while self.wide_ok() && n - done >= WIDE_FROM {
             let m = WIDE_ROWS.min(n - done);
             let at = pos + launch_u32(WHAT, "row", done)?;
             self.wide.rin.stage(stream, &ids[done..done + m], at)?;

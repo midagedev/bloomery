@@ -34,14 +34,15 @@ use crate::card_leg::{RouteW, StackW};
 use crate::card_slots::{CardAcc, CardSlotKernels};
 use crate::fault::FaultSink;
 use crate::gemm::{
-    Gemm32Args, Gemm32Kernels, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels, GemmRoute,
+    Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
+    GemmRoute, GemmWeight,
 };
 use crate::kquant::Act;
 use crate::latent::LATENT;
 use crate::linear::mixer_kda::{self, KdaBufs, KdaDims, KdaIn, KdaProj, KdaState};
 use crate::linear::{HEAD, LinearKernels, LinearShape};
 use crate::model::fit::{act_col_bytes, act32_col_bytes, route_bytes};
-use crate::site::{self, Gated, GatedIo, SiteTy, SiteWeight, SwigluRows, WideActs, WideIn};
+use crate::site::{self, Form, Gated, GatedIo, SiteTy, SiteWeight, SwigluRows, WideActs, WideIn};
 use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, launch_u32};
@@ -303,7 +304,7 @@ pub(super) struct WideDims {
     pub shared_ff: usize,
     pub expert_ff: usize,
     /// The widest feed-forward block's gate rows a unit holds: the dense
-    /// block's, or the routed slots'.
+    /// block's, the shared expert's, or the routed slots'.
     pub ff_rows: usize,
 }
 
@@ -796,7 +797,7 @@ pub(super) fn quantize_out(
     (x, m): (&DeviceBuffer<f32>, usize),
     (sink, ty): (FaultSink, SiteTy),
 ) -> Result<(), GpuError> {
-    only_blocks32(ty, "an output projection")?;
+    out_runs(ty)?;
     g32.enqueue_quantize_gemm32(gpu.stream(), x, m, &mut forms.out32, sink)
 }
 
@@ -809,19 +810,53 @@ pub(super) fn quantize_qb(
     (x, m): (&DeviceBuffer<f32>, usize),
     (sink, ty): (FaultSink, SiteTy),
 ) -> Result<(), GpuError> {
-    only_blocks32(ty, "a query up projection")?;
+    qb_runs(ty)?;
     g32.enqueue_quantize_gemm32(gpu.stream(), x, m, &mut forms.qb32, sink)
+}
+
+/// Whether a site of type `ty` reads q8 blocks of 32 alone, as the unit's gated
+/// rows and query latent are quantized for an output or query up projection.
+fn blocks32(ty: SiteTy) -> bool {
+    let (q128, q32) = WideActs::wants(ty);
+    !q128 && q32
 }
 
 /// A named refusal of a projection `what` of type `ty` that reads another
 /// form than q8 blocks of 32: the wide arm's forms for those inputs are
 /// Q8_0's.
 fn only_blocks32(ty: SiteTy, what: &str) -> Result<(), GpuError> {
-    let (q128, q32) = WideActs::wants(ty);
-    if q128 || !q32 {
+    if !blocks32(ty) {
         return Err(GpuError::shape(
             WHAT,
             format!("{what} of {ty}: the wide arm's form for its input is q8 blocks of 32 (Q8_0)"),
+        ));
+    }
+    Ok(())
+}
+
+/// `Ok` when the wide arm runs a mixer's output projection of type `ty`.
+pub(super) fn out_runs(ty: SiteTy) -> Result<(), GpuError> {
+    only_blocks32(ty, "an output projection")
+}
+
+/// `Ok` when the wide arm runs the latent layers' `attn_q_b` of type `ty`.
+pub(super) fn qb_runs(ty: SiteTy) -> Result<(), GpuError> {
+    only_blocks32(ty, "a query up projection")
+}
+
+/// `Ok` when the wide arm runs the RDA layer's projections `s`, else the refusal
+/// it raises: the output projection reads q8 blocks of 32, and the forget
+/// projection's second half the f32 rows of its first half's output.
+pub(super) fn rda_runs(s: &RdaSites) -> Result<(), GpuError> {
+    out_runs(s.out.ty())?;
+    let ty = s.f_b.ty();
+    if WideActs::wants(ty) != (false, false) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "the forget projection's second half of {ty}: the wide arm's form for its input \
+                 is the f32 rows (F32)"
+            ),
         ));
     }
     Ok(())
@@ -853,6 +888,7 @@ impl KdaProj for RdaWide<'_, '_> {
         let (cx, s, shape) = (self.cx, self.sites, self.shape);
         let sink = gpu.layer_sink(l)?;
         let (qk, v) = (shape.n_k * HEAD, shape.n_v * HEAD);
+        rda_runs(s)?;
         let all = s.sites();
         let tys: Vec<SiteTy> = all[..7].iter().map(|t| t.ty()).collect();
         let KdaIn {
@@ -956,6 +992,111 @@ fn stack<'w>(w: &'w Weights, name: &str) -> Result<(GgmlType, StackW<'w>), GpuEr
     }
 }
 
+/// The form a dense block's or a shared expert's SwiGLU rows take into its
+/// down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DownForm {
+    /// q8_1 blocks of 128 over the dense width: a K-quant down.
+    Q128,
+    /// q8 blocks of 32 over the shared width: a Q8_0 down.
+    Q32,
+}
+
+/// The form of the SwiGLU rows of a block of width `ff` into its down of type
+/// `down`, with the unit's forms cut for `(dense_ff, shared_ff)` values; `None`
+/// where the wide arm holds none: a down whose form no wide SwiGLU writes (a
+/// Q5_0 down reads such blocks), or a width other than its form's.
+pub(super) fn down_form(
+    down: SiteTy,
+    ff: usize,
+    (dense_ff, shared_ff): (usize, usize),
+) -> Option<DownForm> {
+    match down.reads() {
+        Form::Q8x128 if ff == dense_ff => Some(DownForm::Q128),
+        Form::Q8x32 if ff == shared_ff => Some(DownForm::Q32),
+        _ => None,
+    }
+}
+
+/// A layer's routed stacks as the wide arm's route GEMMs read them.
+struct RoutedStacks<'w> {
+    /// The grouped GEMM's type of the gate and the up stacks, one for both.
+    ty: GemmWeight,
+    gate: &'w DeviceTensor<u32>,
+    up: &'w DeviceTensor<u32>,
+    down: Gemm32Weight<'w>,
+}
+
+/// Layer `l`'s stacks `names` (gate, up, down) as the wide arm reads them: the
+/// gate and up of one type the grouped K-quant GEMM decodes, the down of a type
+/// the 32-value route GEMM reads; any other is refused by name.
+fn routed_stacks<'w>(
+    w: &'w Weights,
+    l: usize,
+    names: &[String; 3],
+) -> Result<RoutedStacks<'w>, GpuError> {
+    let (gty, gate) = stack(w, &names[0])?;
+    let (uty, up) = stack(w, &names[1])?;
+    let (dty, down) = stack(w, &names[2])?;
+    if gty != uty {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("layer {l}: gate and up stacks of {gty} and {uty}: one GEMM type reads both"),
+        ));
+    }
+    let (Some(RouteW::Grouped(ty, gate)), Some(RouteW::Grouped(_, up))) =
+        (gate.route(gty), up.route(uty))
+    else {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "layer {l}: gate and up stacks of {gty} and {uty}: the wide arm runs the grouped K-quant GEMM over them"
+            ),
+        ));
+    };
+    let Some(RouteW::Blocks32(down)) = down.route(dty) else {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("layer {l}: a down stack of {dty}, which no 32-value route GEMM reads"),
+        ));
+    };
+    Ok(RoutedStacks { ty, gate, up, down })
+}
+
+/// The named refusal of block `g` of layer `l`: its down has no form at the
+/// block's width ([`down_form`]).
+fn no_down_form(l: usize, g: &Glu) -> GpuError {
+    GpuError::shape(
+        WHAT,
+        format!(
+            "layer {l}: a block of width {} with a down of {}: the wide arm holds q8_1 rows of \
+             the dense width and q8 blocks of 32 of the shared width",
+            g.ff,
+            g.down.ty()
+        ),
+    )
+}
+
+/// `Ok` when the wide arm runs layer `l`'s feed-forward block `f` of resident
+/// weights `w` at the widths `d`, else the refusal [`ffn`] raises for it: a
+/// dense block or shared expert needs a form for its down ([`down_form`]), a
+/// routed layer's stacks ones [`routed_stacks`] reads.
+pub(super) fn ffn_runs(l: usize, f: &Ffn, w: &Weights, d: &WideDims) -> Result<(), GpuError> {
+    let widths = (d.dense_ff, d.shared_ff);
+    let glu = |g: &Glu| {
+        down_form(g.down.ty(), g.ff, widths)
+            .map(drop)
+            .ok_or_else(|| no_down_form(l, g))
+    };
+    match f {
+        Ffn::Dense(g) => glu(g),
+        Ffn::Routed(r) => {
+            glu(&r.shared)?;
+            routed_stacks(w, l, &r.stacks).map(drop)
+        }
+    }
+}
+
 /// A dense block (the leading layer's, or a shared expert) over the unit's
 /// `m` rows of the normed rows whose forms the caller made: the gate and up
 /// GEMMs, the rule's SiTU quantized into the form the down reads, the down
@@ -989,28 +1130,19 @@ fn glu(
         q32: Some(&forms.hid32),
         f32: None,
     };
-    let rows = match WideActs::wants(g.down.ty()) {
-        (true, _) if forms.dense128.k() == g.ff => SwigluRows {
+    let widths = (forms.dense128.k(), forms.shared32.k());
+    let rows = match down_form(g.down.ty(), g.ff, widths) {
+        Some(DownForm::Q128) => SwigluRows {
             q128: Some(&mut forms.dense128),
             q32: None,
             f32: None,
         },
-        (false, true) if forms.shared32.k() == g.ff => SwigluRows {
+        Some(DownForm::Q32) => SwigluRows {
             q128: None,
             q32: Some(&mut forms.shared32),
             f32: None,
         },
-        _ => {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "layer {l}: a block of width {} with a down of {}: the wide arm holds q8_1 \
-                     rows of the dense width and q8 blocks of 32 of the shared width",
-                    g.ff,
-                    g.down.ty()
-                ),
-            ));
-        }
+        None => return Err(no_down_form(l, g)),
     };
     let io = GatedIo {
         x: &x,
@@ -1098,25 +1230,7 @@ fn routed(
     let (gpu, w) = (cx.gpu, cx.w);
     let (stream, sink) = (gpu.stream(), gpu.layer_sink(l)?);
     let used = sigmoid_128_6::N_USED;
-    let (gty, gate) = stack(w, &r.stacks[0])?;
-    let (uty, up) = stack(w, &r.stacks[1])?;
-    let (dty, down) = stack(w, &r.stacks[2])?;
-    let (Some(RouteW::Grouped(ty, gate)), Some(RouteW::Grouped(_, up))) =
-        (gate.route(gty), up.route(uty))
-    else {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "layer {l}: gate and up stacks of {gty} and {uty}: the wide arm runs the grouped K-quant GEMM over them"
-            ),
-        ));
-    };
-    let Some(RouteW::Blocks32(down)) = down.route(dty) else {
-        return Err(GpuError::shape(
-            WHAT,
-            format!("layer {l}: a down stack of {dty}, which no 32-value route GEMM reads"),
-        ));
-    };
+    let RoutedStacks { ty, gate, up, down } = routed_stacks(w, l, &r.stacks)?;
     k.router.enqueue_router_rows(
         stream,
         gpu,
@@ -1184,18 +1298,219 @@ fn routed(
 
 #[cfg(test)]
 mod tests {
-    use super::{Gemm32Args, Gemm32Kernels, GemmAct32, GemmInput, GemmKernels, GemmRoute, LATENT};
+    use super::{
+        DownForm, Ffn, Gemm32Args, Gemm32Kernels, GemmAct32, GemmInput, GemmKernels, GemmRoute,
+        Glu, LATENT, RdaSites, Routed, WideDims, down_form, ffn_runs, out_runs, qb_runs, rda_runs,
+        routed_stacks,
+    };
     use crate::Gpu;
-    use crate::arch::raon1::rda::tests::{Lcg, q8_0, resident};
+    use crate::arch::hybrid::Site;
+    use crate::arch::raon1::rda::tests::{Lcg, q8_0, raw, resident};
     use crate::gemm::Gemm32Weight;
     use crate::q8f32::Q8_0GemvHeadsMcolArgs;
+    use crate::site::SiteTy;
     use crate::tensor::{Window, WindowMut};
     use cuda_core::DeviceBuffer;
+    use gguf::GgmlType;
     use model::arch::raon1::names;
 
     /// The query's nope values the absorption reads a head: the file's `attn_k_b` is
     /// 128 values (4 blocks of 32) a row.
     const NOPE: usize = 128;
+
+    /// A dense block or a shared expert has a form for its down at the widths the
+    /// unit's forms are cut for: a K-quant down reads q8_1 blocks over the dense
+    /// width, a Q8_0 down q8 blocks of 32 over the shared width; a Q5_0 down reads
+    /// blocks no wide SwiGLU writes, and any down at the other form's width has none.
+    #[test]
+    fn a_down_has_a_form_only_at_the_width_its_form_is_cut_for() {
+        let (dense, shared) = (1024, 1792);
+        for ty in [SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K] {
+            assert_eq!(
+                down_form(ty, dense, (dense, shared)),
+                Some(DownForm::Q128),
+                "{ty} at the dense width"
+            );
+            assert_eq!(
+                down_form(ty, shared, (dense, shared)),
+                None,
+                "{ty} at the shared width"
+            );
+        }
+        assert_eq!(
+            down_form(SiteTy::Q8_0, shared, (dense, shared)),
+            Some(DownForm::Q32)
+        );
+        assert_eq!(down_form(SiteTy::Q8_0, dense, (dense, shared)), None);
+        for ff in [dense, shared] {
+            assert_eq!(down_form(SiteTy::Q5_0, ff, (dense, shared)), None, "Q5_0");
+        }
+        let one = (1088, 1088);
+        assert_eq!(down_form(SiteTy::Q6K, 1088, one), Some(DownForm::Q128));
+        assert_eq!(down_form(SiteTy::Q8_0, 1088, one), Some(DownForm::Q32));
+    }
+
+    /// An output projection and `attn_q_b` run wide over q8 blocks of 32 alone:
+    /// Q8_0 and Q5_0 do; every K-quant and every f32-row type is refused by name.
+    #[test]
+    fn an_output_projection_runs_wide_only_over_blocks_of_32() {
+        for &ty in SiteTy::ALL {
+            let runs = matches!(ty, SiteTy::Q8_0 | SiteTy::Q5_0);
+            for (what, r) in [
+                ("an output projection", out_runs(ty)),
+                ("a query up projection", qb_runs(ty)),
+            ] {
+                assert_eq!(r.is_ok(), runs, "{what} of {ty}");
+                if let Err(e) = r {
+                    assert!(e.to_string().contains(what), "{e}");
+                }
+            }
+        }
+    }
+
+    /// An RDA layer's sites with `out` and `f_b` of the given types, the others
+    /// Raon's.
+    fn rda_sites(out: SiteTy, f_b: SiteTy) -> RdaSites {
+        let site = |name: &str, ty: SiteTy, k: usize| Site::new(name.to_owned(), ty, k);
+        RdaSites {
+            qkv: [
+                site("q", SiteTy::Q6K, 512),
+                site("k", SiteTy::Q6K, 512),
+                site("v", SiteTy::Q6K, 512),
+            ],
+            g: site("g", SiteTy::Q6K, 512),
+            beta: site("beta", SiteTy::F32, 512),
+            write: site("write", SiteTy::F32, 512),
+            f_a: site("f_a", SiteTy::F32, 512),
+            f_b: site("f_b", f_b, 128),
+            out: site("out", out, 256),
+            vecs: std::array::from_fn(|_| String::new()),
+        }
+    }
+
+    /// The wide arm runs an RDA layer whose output projection is Q8_0 and whose
+    /// forget projection's second half is F32 (Raon's), and refuses by name one
+    /// whose output projection is another type or whose second half reads a
+    /// quantized form.
+    #[test]
+    fn an_rda_layer_runs_wide_with_a_q8_0_output_and_an_f32_forget_projection() {
+        assert!(rda_runs(&rda_sites(SiteTy::Q8_0, SiteTy::F32)).is_ok());
+        for ty in [SiteTy::Q6K, SiteTy::Q4K, SiteTy::F32] {
+            let e = rda_runs(&rda_sites(ty, SiteTy::F32)).unwrap_err();
+            assert!(e.to_string().contains("an output projection"), "{e}");
+        }
+        for ty in [SiteTy::Q8_0, SiteTy::Q6K] {
+            let e = rda_runs(&rda_sites(SiteTy::Q8_0, ty)).unwrap_err();
+            assert!(e.to_string().contains("forget projection"), "{e}");
+        }
+    }
+
+    /// The wide arm runs a dense block by its down (a K-quant down over the dense
+    /// width, a Q8_0 down over the shared width), and a routed layer by its shared
+    /// expert's down and by its stacks: a shared expert with a down of no form, or
+    /// stacks the weights do not hold, are refused by name.
+    #[test]
+    fn a_feed_forward_block_runs_wide_by_its_down_and_its_stacks() {
+        let site = |name: &str, ty: SiteTy, k: usize| Site::new(name.to_owned(), ty, k);
+        let glu = |down: SiteTy, ff: usize| Glu {
+            gate: site("gate", SiteTy::Q4K, 512),
+            up: site("up", SiteTy::Q4K, 512),
+            down: site("down", down, ff),
+            ff,
+        };
+        let (dense_ff, shared_ff) = (1024, 1792);
+        let d = WideDims {
+            embd: 512,
+            attn: 512,
+            q_lora: 256,
+            heads: 4,
+            nope: 128,
+            dense_ff,
+            shared_ff,
+            expert_ff: 256,
+            ff_rows: shared_ff,
+        };
+        let w = crate::weights::Weights::default();
+        let routed = |shared: Glu| {
+            Ffn::Routed(Routed {
+                router: "router".to_owned(),
+                bias: "bias".to_owned(),
+                stacks: ["gate", "up", "down"].map(str::to_owned),
+                shared,
+            })
+        };
+        assert!(ffn_runs(0, &Ffn::Dense(glu(SiteTy::Q6K, dense_ff)), &w, &d).is_ok());
+        let e = ffn_runs(0, &Ffn::Dense(glu(SiteTy::Q8_0, dense_ff)), &w, &d).unwrap_err();
+        assert!(e.to_string().contains("a block of width 1024"), "{e}");
+        let e = ffn_runs(1, &routed(glu(SiteTy::Q5_0, shared_ff)), &w, &d).unwrap_err();
+        assert!(e.to_string().contains("a block of width 1792"), "{e}");
+        let e = ffn_runs(1, &routed(glu(SiteTy::Q8_0, shared_ff)), &w, &d).unwrap_err();
+        assert!(e.to_string().contains("a resident routed stack"), "{e}");
+    }
+
+    /// A layer's routed stacks run wide as the gate and up of one grouped
+    /// K-quant type over a down the 32-value GEMM reads (a packed Q5_0 here); a
+    /// mixed gate and up, a K-quant down and a missing stack are refused by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_routed_stacks_run_wide_as_one_grouped_type_over_a_32_value_down() {
+        const ROWS: usize = 256;
+        const K: usize = 256;
+        const EXPERTS: usize = 2;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let names = ["gate", "up", "down"].map(|n| format!("blk.1.ffn_{n}_exps.weight"));
+        // Every block's scale bytes small (the high byte of an f16 at 0x14), the codes zero.
+        let stack = |name: &String, ty: GgmlType, block: (usize, usize)| {
+            let blocks = ROWS * K * EXPERTS / block.0;
+            let bytes = (0..blocks * block.1)
+                .map(|i| {
+                    if i % block.1 % 2 == 1 && i % block.1 < 4 {
+                        0x14
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            raw(name.clone(), ty, vec![K, ROWS, EXPERTS], bytes)
+        };
+        let q4k = (256, 144);
+        let q5k = (256, 176);
+        let q5_0 = (32, 22);
+        let resident_of = |gate: (GgmlType, (usize, usize)),
+                           up: (GgmlType, (usize, usize)),
+                           down: Option<(GgmlType, (usize, usize))>| {
+            let mut parts = vec![
+                stack(&names[0], gate.0, gate.1),
+                stack(&names[1], up.0, up.1),
+            ];
+            parts.extend(down.map(|d| stack(&names[2], d.0, d.1)));
+            resident(&gpu, &parts)
+        };
+        let runs = |w: &crate::weights::Weights| routed_stacks(w, 1, &names).map(drop);
+        let ok = resident_of(
+            (GgmlType::Q4_K, q4k),
+            (GgmlType::Q4_K, q4k),
+            Some((GgmlType::Q5_0, q5_0)),
+        );
+        runs(&ok).expect("Q4_K gate and up over a Q5_0 down");
+        let mixed = resident_of(
+            (GgmlType::Q4_K, q4k),
+            (GgmlType::Q5_K, q5k),
+            Some((GgmlType::Q5_0, q5_0)),
+        );
+        let e = runs(&mixed).unwrap_err();
+        assert!(e.to_string().contains("one GEMM type reads both"), "{e}");
+        let kquant_down = resident_of(
+            (GgmlType::Q4_K, q4k),
+            (GgmlType::Q4_K, q4k),
+            Some((GgmlType::Q4_K, q4k)),
+        );
+        let e = runs(&kquant_down).unwrap_err();
+        assert!(e.to_string().contains("no 32-value route GEMM"), "{e}");
+        let no_down = resident_of((GgmlType::Q4_K, q4k), (GgmlType::Q4_K, q4k), None);
+        let e = runs(&no_down).unwrap_err();
+        assert!(e.to_string().contains(&names[2]), "{e}");
+    }
 
     /// The key absorption's 32-value GEMM ([`super::absorb_heads`]'s core) over the file's
     /// geometry is the f32 gemv's rows ([`crate::q8f32`]'s `q8_0_gemv_heads_mcol`, the pass's

@@ -36,6 +36,9 @@
 //!   steps' own distance from the vendor's is printed beside it.
 //! - `prompt_wide_is_partitions`, on the sets past [`SPLIT_AT`] ids: the same prompt as one call and
 //!   as two cut at [`SPLIT_AT`] gives the last logits row by bits.
+//! - `wide_runs_the_file`, on the plain load: the load found every layer of the file runnable by
+//!   the wide arm (`Body::wide_ok`), so the wide clauses run the wide arm and not the passes a
+//!   file it cannot run takes.
 //! - `verify_is_steps`, in eager and in graph mode: after the prompt call, a verify of the plain
 //!   run's first 8 ids (and of its first 2) gives the plain run's next ids, each row's logits the
 //!   plain step's by bits.
@@ -50,6 +53,10 @@
 //!   seat's pick and open), every pass a proposal of 7 ids verified by one pass of 8 rows: the
 //!   first [`DRAFTED`] greedy ids are the plain session's (its prompt call, then a step an id), id
 //!   for id. The passes, and the proposed ids the target kept, are printed beside it.
+//!
+//! Before the card loads, the band check of `taps_are_steps` is held to what it refuses: eight
+//! rows at a distance inside the bands pass it, and the same rows with one tap of the last row NaN
+//! do not.
 //!
 //! A step that raises the card's fault word ends the gate by name. A set
 //! absent from the box, dumped from another file or build, or unfinished ends
@@ -643,6 +650,50 @@ mod gate {
             .collect()
     }
 
+    /// Whether one layer's rows' distances `v` hold the bands: every one finite, then the median
+    /// at most [`TAPS_MEDIAN_BAND`] and the 90th percentile at most [`TAPS_P90_BAND`]. A NaN tap
+    /// is an infinite distance ([`rel`]), and the percentiles of a few rows skip the largest
+    /// (eight rows: the median reads the fifth, the 90th percentile the seventh), so finiteness
+    /// is its own condition.
+    fn within_bands(v: Vec<f64>) -> bool {
+        if v.iter().any(|r| !r.is_finite()) {
+            return false;
+        }
+        let (med, p90, _) = spread(v);
+        med <= TAPS_MEDIAN_BAND && p90 <= TAPS_P90_BAND
+    }
+
+    /// The band check held to what it refuses, on the host before the card loads: [`VERIFY_ROWS`]
+    /// rows of two layers' taps at a distance of 1 % of their rows' size pass it in both layers,
+    /// and the same rows with one tap of the last row NaN do not pass it in that tap's layer.
+    fn within_bands_separate() -> Result<(), GateError> {
+        const LAYERS_TAPPED: usize = 2;
+        const SEG: usize = 4;
+        let w = LAYERS_TAPPED * SEG;
+        let theirs: Vec<f32> = (0..VERIFY_ROWS * w).map(|i| 1.0 + (i % 7) as f32).collect();
+        let ours: Vec<f32> = theirs.iter().map(|v| v * 1.01).collect();
+        let held = |ours: &[f32], layer: usize| {
+            let rels = row_rels(ours, &theirs, w, (0, LAYERS_TAPPED));
+            within_bands(rels.iter().map(|r| r.2[layer]).collect())
+        };
+        let clean = (0..LAYERS_TAPPED).all(|l| held(&ours, l));
+        let mut nan = ours.clone();
+        nan[(VERIFY_ROWS - 1) * w + SEG] = f32::NAN;
+        let refused = !held(&nan, 1) && held(&nan, 0);
+        println!(
+            "taps_band_separation rows={VERIFY_ROWS} clean_held={clean} nan_last_row_refused={refused} {}",
+            verdict(clean && refused)
+        );
+        if clean && refused {
+            Ok(())
+        } else {
+            Err(format!(
+                "the taps' band check holds clean rows {clean} and refuses a NaN tap {refused}"
+            )
+            .into())
+        }
+    }
+
     /// Clause `taps_are_steps` on set `s`, taps on `layers`: the rows a step taps
     /// (`GpuModel::draft_taps` of 1 after each id of the prompt, then of the plain run's first
     /// [`VERIFY_ROWS`] ids) against the rows the rows pass hands its sink
@@ -698,11 +749,8 @@ mod gate {
         m.reset()?;
         m.set_draft_taps(&[])?;
         let rels = row_rels(&sunk, &stepped, w, (from, layers.len()));
-        let within = |v: Vec<f64>| {
-            let (med, p90, _) = spread(v);
-            med <= TAPS_MEDIAN_BAND && p90 <= TAPS_P90_BAND
-        };
-        let prompt_ok = (0..layers.len()).all(|l| within(rels.iter().map(|r| r.2[l]).collect()));
+        let prompt_ok =
+            (0..layers.len()).all(|l| within_bands(rels.iter().map(|r| r.2[l]).collect()));
         let by_layer = (0..layers.len())
             .map(|l| {
                 let (med, p90, max) = spread(rels.iter().map(|r| r.2[l]).collect());
@@ -726,7 +774,8 @@ mod gate {
             .collect::<Vec<_>>()
             .join(",");
         let verify = row_rels(&verified, &stepped, w, (p, layers.len()));
-        let verify_ok = (0..layers.len()).all(|l| within(verify.iter().map(|r| r.2[l]).collect()));
+        let verify_ok =
+            (0..layers.len()).all(|l| within_bands(verify.iter().map(|r| r.2[l]).collect()));
         let (vmed, vp90, vmax) = spread(verify.iter().map(|r| r.1).collect());
         let pass = head_bits && in_order && prompt_ok && verify_ok;
         println!(
@@ -800,6 +849,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        within_bands_separate()?;
         let sets: Vec<Set> = SETS
             .iter()
             .map(|&n| open_set(n))
@@ -839,6 +889,16 @@ mod gate {
             .into());
         }
         let mut ok = true;
+        {
+            let body = m.body("gate_raon1_e2e")?;
+            let wide_ok = body.wide_ok();
+            println!(
+                "wide_runs_the_file wide_ok={wide_ok} refusal={:?} {}",
+                body.wide_off(),
+                verdict(wide_ok)
+            );
+            ok &= wide_ok;
+        }
         for s in &sets {
             m.reset()?;
             let first = m.step(&s.prompt)?;
