@@ -95,7 +95,7 @@ excluded crates (`crates/oxide-ice-unroll`, `fuzz`, `labs/hip-native`, `Cargo.to
 
 Layer 1 totals: 14 crates rc 0, 7 crates rc 101; 21 distinct errors (`gguf` 1, `threads` 20), 2 distinct causes. The five
 crates behind `threads` show nothing of their own, so a second and a third layer were measured in a scratch copy of the
-tree (outside the worktree, `/private/tmp/.../scratchpad/mac-portmap/work/layer2` and `layer3`; the copies are not part of
+tree (outside the worktree, a scratch directory's `layer2` and `layer3`; the copies are not part of
 the repository and the worktree is untouched):
 
 - **Layer 2**: `threads`' affinity calls replaced by stubs (a `shim` module returning refusal). Logs
@@ -555,7 +555,7 @@ hparams, `gguf`, `refset` and `threads`, which do not build on a Mac today.
 
 ## Appendix. What was run in this round
 
-All under `/Users/hckim/repo/bloomery-mac-portmap/target/mac-portmap/` (gitignored):
+All under the round's `target/mac-portmap/` (gitignored, not published):
 
 | What | File |
 |---|---|
