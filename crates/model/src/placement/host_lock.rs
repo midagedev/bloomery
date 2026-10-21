@@ -32,6 +32,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gguf::{Gguf, Split};
+use os::Populated;
 
 use super::{Device, ExpertList, Format, ModelTensor, PlacementError, Plan, Segment};
 use crate::r8file::{R8Error, R8Source, Sidecar};
@@ -861,59 +862,35 @@ pub(crate) fn drop_pages(
         libc::off_t::try_from(v)
             .map_err(|_| PlacementError::Host(format!("{name} offset {v} passes off_t")))
     };
-    // SAFETY: the descriptor is this file's own and lives across the call;
-    // fadvise reads no memory of ours.
-    let rc = unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            off(first)?,
-            off(end - first)?,
-            libc::POSIX_FADV_DONTNEED,
-        )
-    };
-    if rc != 0 {
-        return Err(PlacementError::Host(format!(
-            "posix_fadvise(DONTNEED) of {name} bytes {first}..{end}: {}",
-            io::Error::from_raw_os_error(rc)
-        )));
-    }
+    os::fadvise_dontneed(file.as_raw_fd(), off(first)?, off(end - first)?).map_err(|e| {
+        PlacementError::Host(format!(
+            "posix_fadvise(DONTNEED) of {name} bytes {first}..{end}: {e}"
+        ))
+    })?;
     Ok(end - first)
-}
-
-/// How [`populate_span`] faulted a span's pages in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Populated {
-    /// `MADV_POPULATE_READ`.
-    Advised,
-    /// A read of one byte a page: the kernel has no `MADV_POPULATE_READ`.
-    Touched,
 }
 
 /// The line a populate prints once when the kernel has no
 /// `MADV_POPULATE_READ`.
+#[cfg(target_os = "linux")]
 const NO_POPULATE_READ: &str = "host populate: madvise(MADV_POPULATE_READ) is not in this kernel \
                                 (EINVAL; it came in Linux 5.14), so the load reads one byte a page \
                                 instead";
+
+/// The line a populate prints once when the platform has no
+/// `MADV_POPULATE_READ`.
+#[cfg(target_os = "macos")]
+const NO_POPULATE_READ: &str = "host populate: this platform has no madvise(MADV_POPULATE_READ), \
+                                so the load reads one byte a page instead";
 
 /// `madvise(MADV_POPULATE_READ)` over `span`, a live sub-slice of a set's
 /// mappings: a shard's read-only file mapping, or the sidecar's, which is its
 /// file's mapping or a resident anonymous copy.
 fn advise_populate(span: &[u8]) -> io::Result<()> {
-    // SAFETY: `span` is a live slice (the caller's contract above);
-    // MADV_POPULATE_READ faults its pages in on either kind of mapping and
-    // never writes them.
-    let rc = unsafe {
-        libc::madvise(
-            span.as_ptr().cast_mut().cast(),
-            span.len(),
-            libc::MADV_POPULATE_READ,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    // SAFETY: `span` is a live slice (the caller's contract above), so its
+    // pages are inside one live mapping.
+    unsafe { os::advise_populate(span.as_ptr().cast_mut().cast(), span.len()) }
+        .map_err(io::Error::from)
 }
 
 /// Fault the pages of `span` in through `advise` (the madvise call,
@@ -925,19 +902,14 @@ fn populate_span(
     page: u64,
     advise: impl Fn(&[u8]) -> io::Result<()>,
 ) -> Result<Populated, String> {
-    match advise(span) {
-        Ok(()) => Ok(Populated::Advised),
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-            let step = usize::try_from(page).map_err(|_| format!("a page of {page} bytes"))?;
-            for at in (0..span.len()).step_by(step) {
-                // SAFETY: `at` is below `span.len()`, so the byte is inside
-                // the live slice; the read is volatile so that it is made.
-                let _ = unsafe { std::ptr::read_volatile(span.as_ptr().add(at)) };
-            }
-            Ok(Populated::Touched)
-        }
-        Err(e) => Err(format!("madvise(MADV_POPULATE_READ): {e}")),
+    // SAFETY: `span` is a live slice (the caller's contract above), so its
+    // pages are inside one live mapping.
+    unsafe {
+        os::populate_span(span.as_ptr().cast_mut().cast(), span.len(), page, || {
+            advise(span).map_err(os::OsError::Io)
+        })
     }
+    .map_err(|e| format!("madvise(MADV_POPULATE_READ): {e}"))
 }
 
 /// What one chunk's thread hands back: every span its call succeeded on —
@@ -1207,20 +1179,12 @@ fn host_pages(
 fn resident_pages(span: &[u8], page: u64) -> io::Result<(u64, u64)> {
     let n = (span.len() as u64).div_ceil(page);
     let mut vec = vec![0u8; usize::try_from(n).map_err(io::Error::other)?];
-    // SAFETY: `span` starts on a page boundary inside one live mapping (a set
-    // run starts at a page multiple of the mapping's page-aligned start), and
-    // `vec` has one byte for each of its pages. mincore only reads the page
-    // tables; nothing is written through `addr`.
-    let rc = unsafe {
-        libc::mincore(
-            span.as_ptr().cast_mut().cast(),
-            span.len(),
-            vec.as_mut_ptr(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // `span` starts on a page boundary inside one live mapping (a set run
+    // starts at a page multiple of the mapping's page-aligned start), and
+    // `vec` has one byte for each of its pages.
+    // SAFETY: the caller's contract above.
+    unsafe { os::mincore(span.as_ptr().cast_mut().cast(), span.len(), &mut vec) }
+        .map_err(io::Error::from)?;
     Ok((vec.iter().filter(|&&b| b & 1 != 0).count() as u64, n))
 }
 

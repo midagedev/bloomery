@@ -13,4 +13,5 @@ workspace = true
 
 [dependencies]
 bloomery-levers = { path = "../levers" }
+bloomery-os.workspace = true
 libc.workspace = true

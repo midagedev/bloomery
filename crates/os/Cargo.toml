@@ -1,0 +1,15 @@
+[package]
+name = "bloomery-os"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+name = "os"
+
+[lints]
+workspace = true
+
+[dependencies]
+libc.workspace = true

@@ -1321,16 +1321,15 @@ mod split_tests {
 
     /// Page faults the calling thread has taken, minor and major.
     fn thread_faults() -> u64 {
-        // SAFETY: `rusage` is a C struct of integers; all-zero bytes are a value of it.
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        // SAFETY: `usage` is a live, writable `rusage` for the duration of the call.
-        let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
-        assert_eq!(rc, 0, "getrusage(RUSAGE_THREAD)");
-        u64::try_from(usage.ru_minflt + usage.ru_majflt).unwrap()
+        os::thread_faults().expect("getrusage(RUSAGE_THREAD)")
     }
 
     /// A file refused by the strict pass costs a populating open its header's
     /// pages, not its data's: the populate waits for the validation.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the Linux fact it reads: a per-thread page-fault count"
+    )]
     #[test]
     fn a_refused_file_is_not_populated() {
         const DATA: usize = 64 << 20;

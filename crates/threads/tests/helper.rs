@@ -8,17 +8,11 @@ use threads::helper::{Placement, helpers, mask, sibling_of, spawn_helper};
 
 /// Set the calling thread's mask to `cpus`.
 fn set_mask(cpus: &[usize]) {
-    // SAFETY: `set` is a zeroed cpu_set_t only written through `CPU_SET` with
-    // indices the test took from a mask of the same size, and
-    // `sched_setaffinity` reads it with the matching size.
-    let ok = unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        for &c in cpus {
-            libc::CPU_SET(c, &mut set);
-        }
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
-    };
-    assert!(ok, "sched_setaffinity to {cpus:?}");
+    let cpus: Vec<u32> = cpus
+        .iter()
+        .map(|&c| u32::try_from(c).expect("a cpu id fits a u32"))
+        .collect();
+    os::set_mask(&cpus).unwrap_or_else(|e| panic!("the mask is set to {cpus:?}: {e}"));
 }
 
 /// The mask a helper named `name`, placed as `asked`, runs its body with when
@@ -47,6 +41,10 @@ fn helper_mask(name: &str, opener: Vec<usize>, asked: Placement) -> (Vec<usize>,
 /// already, left as it is; on the cpu asked for; and on the SMT sibling of
 /// the cpu asked for, from an opener pinned to that cpu. A test thread whose own
 /// mask holds one cpu cannot tell the float from the pin and skips by name.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the Linux fact it reads: a thread's own affinity mask"
+)]
 #[test]
 fn a_helper_leaves_its_openers_one_cpu_mask() {
     let wide = mask().expect("the test thread's mask");

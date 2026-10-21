@@ -744,35 +744,11 @@ pub fn chunk_bounds(n: usize, threads: usize, t: usize) -> (usize, usize) {
 
 // --------------------------------------------------------------------- mask
 
-/// The cpus the calling thread may run on (`sched_getaffinity`), ascending.
-/// The buffer grows until the kernel's mask fits, so a machine of more than
-/// 1024 cpus reads whole.
+/// The cpus the calling thread may run on, ascending: the kernel's mask for
+/// the calling thread, read into a buffer that grows until the mask fits, so
+/// a machine of more than 1024 cpus reads whole.
 fn mask_cpus() -> std::io::Result<Vec<u32>> {
-    let mut words = 16usize;
-    loop {
-        let mut set = vec![0u64; words];
-        let bytes = words * std::mem::size_of::<u64>();
-        // SAFETY: `set` is `bytes` writable bytes, and `sched_getaffinity`
-        // writes at most that many.
-        let rc = unsafe { libc::sched_getaffinity(0, bytes, set.as_mut_ptr().cast()) };
-        if rc == 0 {
-            return Ok(set
-                .iter()
-                .enumerate()
-                .flat_map(|(w, &bits)| {
-                    (0..64u32)
-                        .filter(move |b| bits >> b & 1 == 1)
-                        .map(move |b| w as u32 * 64 + b)
-                })
-                .collect());
-        }
-        let e = std::io::Error::last_os_error();
-        // EINVAL: the mask is wider than the buffer.
-        if e.raw_os_error() != Some(libc::EINVAL) || words >= 1 << 14 {
-            return Err(e);
-        }
-        words *= 2;
-    }
+    os::mask_cpus().map_err(std::io::Error::from)
 }
 
 /// The pool's shape from this machine: its sysfs topology cut to the calling
@@ -805,28 +781,10 @@ pub fn report() -> Result<PoolPlan, String> {
 
 /// Pin the calling thread to one logical cpu. Returns the kernel's refusal
 /// instead of panicking — a seccomp filter or a cpu outside the process's mask
-/// cannot be pinned, and the pool must keep running, floating.
+/// cannot be pinned, and the pool must keep running, floating. A platform
+/// with no per-thread mask refuses the pin by name.
 fn pin(cpu: u32) -> std::io::Result<()> {
-    let named = 8 * std::mem::size_of::<libc::cpu_set_t>();
-    if cpu as usize >= named {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("cpu {cpu} is past the {named} a cpu_set_t names"),
-        ));
-    }
-    // SAFETY: `set` is a zeroed cpu_set_t only written through CPU_SET with
-    // an index inside it, and sched_setaffinity reads it with the matching
-    // size.
-    let rc = unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(cpu as usize, &mut set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    os::pin(cpu).map_err(std::io::Error::from)
 }
 
 #[cfg(test)]
@@ -835,19 +793,10 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     /// Run `f` on a thread pinned to `cpus`, so the kernel's mask for it is
-    /// theirs: a test of the real `sched_getaffinity` read.
+    /// theirs: a test of the real mask read.
     fn on_cpus<T: Send + 'static>(cpus: Vec<u32>, f: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::spawn(move || {
-            // SAFETY: `set` is a zeroed cpu_set_t only written through
-            // CPU_SET, and sched_setaffinity reads it with the matching size.
-            let rc = unsafe {
-                let mut set: libc::cpu_set_t = std::mem::zeroed();
-                for &c in &cpus {
-                    libc::CPU_SET(c as usize, &mut set);
-                }
-                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
-            };
-            assert_eq!(rc, 0, "the test thread pins to {cpus:?}");
+            os::set_mask(&cpus).unwrap_or_else(|e| panic!("the test thread pins to {cpus:?}: {e}"));
             f()
         })
         .join()
@@ -860,6 +809,10 @@ mod tests {
     /// thread of two the pool takes two cores or one with its sibling, and a
     /// thread count the lever gave stands over it. The unpinned process sees
     /// the whole mask, the topology whole and no cut.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the Linux fact it reads: a thread's own affinity mask"
+    )]
     #[test]
     fn the_pool_plans_inside_the_threads_mask() {
         let whole = super::mask_cpus().expect("the mask reads");
@@ -900,6 +853,10 @@ mod tests {
 
     /// The built pool and the plan before it are one placement, and a pool
     /// built on a one-cpu thread pins its workers inside that mask.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the Linux fact it reads: a thread's own affinity mask"
+    )]
     #[test]
     fn a_built_pool_is_the_plan() {
         let planned = super::plan_pool().expect("a plan");
@@ -934,8 +891,15 @@ mod tests {
         assert!(p.pin_failed());
         assert!(p.plan().workers.is_empty());
         let refused = super::pin(1 << 20).expect_err("no cpu_set_t holds that cpu");
-        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(refused.to_string().contains("1048576"), "{refused}");
+        // Linux: the cpu is past the mask's size, and the refusal says so.
+        // A platform with no per-thread mask refuses the pin by name.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(refused.to_string().contains("1048576"), "{refused}");
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported, "{refused}");
     }
 
     /// A pool has a CCD map only once every participant is pinned: the

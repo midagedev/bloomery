@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/qdot", "crates/gguf", "crates/models", "crates/model", "crates/model-hf", "crates/placement", "crates/threads", "crates/levers", "crates/verbs", "crates/gpu", "crates/gpu-deepseek41", "crates/gpu-glm5next", "crates/gpu-mimo2", "crates/gpu-solar2", "crates/gpu-gemma-embedding2", "crates/gpu-gates", "crates/engram", "crates/engram-lab", "crates/sampler", "crates/tokenizer", "crates/serve", "crates/jinja", "crates/vision", "crates/gpu-vision", "crates/gpu-gemma4a", "crates/refset", "crates/runtime", "crates/app", "crates/decision", "crates/embed", "crates/hf", "crates/safetensors"]
+members = ["crates/qdot", "crates/gguf", "crates/models", "crates/model", "crates/model-hf", "crates/placement", "crates/threads", "crates/levers", "crates/verbs", "crates/gpu", "crates/gpu-deepseek41", "crates/gpu-glm5next", "crates/gpu-mimo2", "crates/gpu-solar2", "crates/gpu-gemma-embedding2", "crates/gpu-gates", "crates/engram", "crates/engram-lab", "crates/sampler", "crates/tokenizer", "crates/serve", "crates/jinja", "crates/vision", "crates/gpu-vision", "crates/gpu-gemma4a", "crates/refset", "crates/runtime", "crates/app", "crates/decision", "crates/embed", "crates/hf", "crates/safetensors", "crates/os"]
 # 의도적으로 컴파일되지 않는 재현기다(MUL-7). 워크스페이스에 넣으면 --workspace가 영구히 빨갛다.
 exclude = ["crates/oxide-ice-unroll", "crates/oxide-ice-unroll/variants/unroll_smoke", "fuzz", "labs/hip-native"]
 
@@ -16,6 +16,9 @@ cuda-core = { version = "0.4.0", git = "https://github.com/NVIDIA/cuda-rust.git"
 # one semver line unify into one version, so the gates cut the text handed to the driver with the loader's own code.
 oxide-artifacts = "0.2.1"
 libc = "0.2"
+# The one owner of the operating-system calls the host chain makes: the crate
+# that holds what Linux and macOS do differently.
+bloomery-os = { path = "crates/os" }
 # The decision head's host sgemm (crates/decision); its own threading stays off.
 matrixmultiply = { version = "0.3.10", default-features = false, features = ["std"] }
 memmap2 = "0.9"

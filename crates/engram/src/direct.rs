@@ -33,15 +33,10 @@ pub const DIRECT_ALIGN: usize = 4096;
 /// are multiples of [`DIRECT_ALIGN`]; the kernel refuses any other with
 /// `EINVAL`.
 pub fn open_direct(path: &Path) -> Result<File, EngramError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-        .map_err(|source| EngramError::OpenDirect {
-            path: path.to_path_buf(),
-            source,
-        })
+    os::open_direct(path).map_err(|source| EngramError::OpenDirect {
+        path: path.to_path_buf(),
+        source: source.into(),
+    })
 }
 
 /// A file read without the page cache ([`DirectFile::open`]) or through it

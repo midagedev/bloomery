@@ -112,12 +112,14 @@ does not depend on which feature set a recipe picks:
      its dependencies as a dependent sees them. What counts is what the crates use:
      `std::arch::x86_64` / `core::arch::x86_64`, `#[target_feature(…)]`, `is_x86_feature_detected!`,
      `std::os::linux`, the Linux-only libc items the tree calls (cpu_set_t and CPU_*, sched_*affinity,
-     posix_fadvise, sync_file_range, RUSAGE_THREAD, renameat2, prctl, MADV_POPULATE_*, the huge-page
-     flags), memmap2's Linux-only advice (PopulateRead/Write, HugePage, NoHugePage), and a "/proc/" or
+     posix_fadvise, sync_file_range, RUSAGE_THREAD, renameat2 and RENAME_NOREPLACE, prctl,
+     MADV_POPULATE_*, O_DIRECT, the huge-page flags), memmap2's Linux-only advice
+     (PopulateRead/Write, HugePage, NoHugePage), and a "/proc/" or
      "/sys/" path literal (the file does not exist on the Mac, so the code that reads it fails there).
      Comments are not code. An item or statement under a `#[cfg(…)]` that is false on
      aarch64-apple-darwin (target_arch, target_os, target_family, target_vendor, target_env,
-     target_pointer_width, target_endian, unix, windows) is left out, up to its end — the `;` or `,` at
+     target_pointer_width, target_endian, unix, windows) is left out, up to its end — the item's own
+     end first (a signature's comma, in `Result<A, B>`, does not end it), then the `;` or `,` at
      its own depth, its closing brace, or the close of the block around it, whichever comes first. A
      file whose `#![cfg(…)]` is false is left out whole. `cfg(test)` is unknown in the crate's own files
      (both sides are built) and false in a dependency's (its test modules are not built). Any other
@@ -5882,11 +5884,14 @@ _NOT_ON_MAC = [
     (
         re.compile(
             r"\blibc::(?:cpu_set_t|CPU_[A-Z_]+|sched_[gs]etaffinity|sched_getcpu|posix_fadvise|POSIX_FADV_[A-Z_]+|sync_file_range"
-            r"|SYNC_FILE_RANGE_[A-Z_]+|RUSAGE_THREAD|renameat2|RENAME_[A-Z_]+|prctl|PR_[A-Z_]+|MADV_POPULATE_[A-Z_]+"
+            r"|SYNC_FILE_RANGE_[A-Z_]+|RUSAGE_THREAD|renameat2|RENAME_(?:NOREPLACE|EXCHANGE|WHITEOUT)|prctl|PR_[A-Z_]+"
+            r"|MADV_POPULATE_[A-Z_]+|O_DIRECT"
             r"|MADV_(?:NO)?HUGEPAGE|MAP_POPULATE|MAP_HUGETLB)\b"
         ),
         "a Linux-only libc item",
     ),
+    # `RENAME_EXCL` and `RENAME_SWAP` are not in the list above: macOS has them
+    # (`renamex_np`), so only Linux's own rename flags are a Linux-only item.
     (re.compile(r"\bAdvice::(?:PopulateRead|PopulateWrite|HugePage|NoHugePage)\b"), "memmap2's Linux-only advice"),
     (re.compile(r"\"/(?:proc|sys)/"), "a Linux /proc or /sys path"),
 ]
@@ -6066,8 +6071,10 @@ def _item_end(shape: str, start: int) -> int:
 @functools.cache
 def mac_view(text: str, test: bool | None) -> str:
     """`text` as aarch64-apple-darwin compiles it: comments blanked, and every item or statement under a
-    `#[cfg(…)]` false there (a file under a false `#![cfg(…)]`) blanked; newlines kept, so line numbers hold."""
-    return _cfg_blanked(text, test, _MAC_CFG_KEYS, _MAC_CFG_NAMES)[0]
+    `#[cfg(…)]` false there (a file under a false `#![cfg(…)]`) blanked; newlines kept, so line numbers hold.
+    The item's own end is read (`items`), so a fenced item whose signature holds a comma — a `Result<A, B>`
+    return type — is blanked whole and not only up to that comma."""
+    return _cfg_blanked(text, test, _MAC_CFG_KEYS, _MAC_CFG_NAMES, items=True)[0]
 
 
 @functools.cache
@@ -7170,7 +7177,23 @@ class TestScan:
                 inside = text[len("cfg_attr") :].strip()
                 parts = _split_top(inside[1:-1]) if inside.startswith("(") and inside.endswith(")") else []
                 named = [re.sub(r"\s+", "", pm.group(1)) if (pm := _ATTR_PATH.match(p)) else p for p in parts[1:]]
-                if not parts or any(n in ("cfg", "ignore", "path", "test") or n.endswith("::test") for n in named):
+                if parts and named == ["ignore"] and re.match(r'^ignore\s*=\s*".*"$', parts[1]):
+                    # A conditional ignore the box can decide: the test is
+                    # skipped on the platform the predicate names and runs on
+                    # the one it names not. The box is the platform this scan
+                    # reads, so the ignore applies there when the predicate
+                    # holds there; a predicate the box cannot decide (a
+                    # feature) is refused with the rest.
+                    pred = self._cfg_of(rel, aline, f"cfg({parts[0]})", errs)
+                    if pred is None:
+                        return
+                    v = eval_cfg(pred[3], True, _BOX_CFG_KEYS, _BOX_CFG_NAMES)
+                    if v is True:
+                        ignored = True
+                    elif v is None:
+                        errs.append(f"{rel}:{aline}: #[{text}] — a conditional ignore whose predicate this checker cannot decide for the box")
+                        return
+                elif not parts or any(n in ("cfg", "ignore", "path", "test") or n.endswith("::test") for n in named):
                     errs.append(f"{rel}:{aline}: #[{text}] — a conditional cfg, ignore, path or test attribute this checker does not evaluate")
                     return
             elif name == "test":
@@ -12156,6 +12179,12 @@ def _st_pure_crates(fails: list[str], side: Side) -> None:
             "procp": 'pub fn f() -> String { std::fs::read_to_string("/proc/self/io").unwrap() }\n',
             "lastfield": 'pub struct S {\n    #[cfg(target_os = "linux")]\n    a: u32\n}\npub fn b() -> i32 { libc::RUSAGE_THREAD }\n',
             "tmod": "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { let _ = libc::RUSAGE_THREAD; }\n}\n",
+            # The one owner of the OS calls: its Linux-only item sits behind the
+            # platform's own cfg, so the crate and every crate that reaches it
+            # stay pure. The same item outside that fence is a Linux-only item
+            # the Mac cannot build, and the rule says so.
+            "osfence": '#[cfg(target_os = "linux")]\npub fn f() -> i32 { unsafe { libc::O_DIRECT } }\n',
+            "osoutside": "pub fn f() -> i32 { unsafe { libc::O_DIRECT } }\n",
             "user": "pub fn f() {}\n",
         }
         deps = {
@@ -12215,9 +12244,10 @@ def _st_pure_crates(fails: list[str], side: Side) -> None:
             ("lastfield", "lastfield/src/lib.rs:5: a Linux-only libc item"),
             ("procp", "procp/src/lib.rs:1: a Linux /proc or /sys path"),
             ("tmod", "tmod/src/lib.rs:4: a Linux-only libc item"),
+            ("osoutside", "osoutside/src/lib.rs:1: a Linux-only libc item"),
         ]:
             expect(any(want in w for w in verdict.get(n, [])), f"pure: {n} is not rejected with '{want}': {verdict.get(n)}")
-        for n in ("guarded", "inner", "user"):
+        for n in ("guarded", "inner", "user", "osfence"):
             expect(verdict.get(n) == [], f"pure: {n} is rejected: {verdict.get(n)}")
         # host nightly: the same lock reading over the synthetic workspace — every crate with no device root, whatever its
         # x86_64 or Linux-only code, and an admitted device-linked one only by name; the tables' stale entries are problems
@@ -12262,10 +12292,13 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     real = dict(pure_crates(tree, load_lock(tree.root)))
     pure_now = sorted(n for n, w in real.items() if not w)
     expect(
-        pure_now == ["bloomery-decision", "bloomery-embed", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
+        pure_now == ["bloomery-decision", "bloomery-embed", "bloomery-gguf", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
-    expect(any("crates/gguf/src/lib.rs:" in w and "RUSAGE_THREAD" in w for w in real.get("bloomery-gguf", [])), f"pure: gguf's reason {real.get('bloomery-gguf')}")
+    # the host chain's Linux-only items are the one owner's now, behind its own cfg, so a crate that holds
+    # none of its own is pure; a crate that holds one is still named
+    expect(not real.get("bloomery-gguf"), f"pure: gguf is rejected: {real.get('bloomery-gguf')}")
+    expect(any("a Linux-only libc item" in w for ws in real.values() for w in ws), "pure: the rule names no Linux-only libc item in the tree")
     expect(any("bloomery-gpu -> cuda-" in w for w in real.get("bloomery-gpu", [])), f"pure: bloomery-gpu's reason {real.get('bloomery-gpu')}")
     expect(any("crates/threads/src/" in w for w in real.get("bloomery-qdot", [])), f"pure: qdot's reason {real.get('bloomery-qdot')}")
     # host nightly on the real tree: the crates the set runs are the device-free ones and the admitted app; every gpu crate is left out
@@ -12275,12 +12308,14 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # PIN(2026-10-20): bloomery-model-hf joined with the tests it took out of bloomery-model (the fixture fetch's, the GLM checkpoint
     # map's), which the nightly ran as part of that crate.
     # PIN(2026-10-21): safetensors keeps the mapped reader's fixture tests previously run by bloomery-hf.
+    # PIN(2026-10-21): bloomery-os joined with the OS calls the host chain now makes through it, which the nightly runs as part of
+    # that crate.
     expect(
         host_now
         == [
             "bloomery-app", "bloomery-decision", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf", "bloomery-jinja",
-            "bloomery-levers", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-placement", "bloomery-qdot", "bloomery-refset", "bloomery-runtime",
-            "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
+            "bloomery-levers", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-refset",
+            "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
             "bloomery-vision",
         ],
         f"host nightly: the real tree's set is {host_now} — a new member of the set is proven by a nightly run before this list takes it",

@@ -214,33 +214,13 @@ fn place(cpu: Option<usize>) -> Result<Option<usize>, HelperError> {
 /// Widen the calling thread's affinity to every cpu the set can name; false
 /// when the kernel refuses.
 fn float_everywhere() -> bool {
-    let max = 8 * std::mem::size_of::<libc::cpu_set_t>();
-    // SAFETY: `set` is a zeroed cpu_set_t only written through `CPU_SET` with
-    // indices below its own bit count, and `sched_setaffinity` reads it with
-    // the matching size.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        for c in 0..max {
-            libc::CPU_SET(c, &mut set);
-        }
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
-    }
+    os::float_everywhere().is_ok()
 }
 
 /// Pin the calling thread to one logical cpu; false when the kernel refuses
 /// (a container, a cpu outside the process's set).
 fn pin_to(cpu: usize) -> bool {
-    if cpu >= 8 * std::mem::size_of::<libc::cpu_set_t>() {
-        return false;
-    }
-    // SAFETY: `set` is a zeroed cpu_set_t only written through `CPU_SET` with
-    // an index inside it, and `sched_setaffinity` reads it with the matching
-    // size.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
-    }
+    u32::try_from(cpu).is_ok_and(|c| os::pin(c).is_ok())
 }
 
 /// The cpus of a sysfs cpu list (`0,32`, `0-1`, `0-3,8`); a malformed entry

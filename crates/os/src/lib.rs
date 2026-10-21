@@ -1,0 +1,869 @@
+//! bloomery-os: the one owner of the operating-system calls the host chain
+//! makes, so that what Linux and macOS do differently is written once.
+//!
+//! Every call here has a Linux body — the call the kernel has — and a macOS
+//! body: the call that platform has, or a named refusal
+//! ([`OsError::Unsupported`]) when it has none. A platform with neither is a
+//! compile error, never a silent fallback: a caller that gets a refusal
+//! handles it by name, as it already handles the kernel's.
+//!
+//! The Linux bodies are the ones the callers had before this crate existed,
+//! moved here unchanged; the macOS bodies are the forms the Mac port map
+//! names. A type the two platforms shape differently (a `mincore` vector, a
+//! `statvfs` field) is settled here, so every caller sees one signature.
+
+use std::ffi::CString;
+use std::fs::File;
+use std::os::fd::RawFd;
+use std::path::Path;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("bloomery-os has a body for Linux and macOS only; add this platform's calls here");
+
+/// A refusal by the platform: a call it does not have, or one the kernel
+/// refused.
+#[derive(Debug)]
+pub enum OsError {
+    /// The platform has no such call; `call` names it.
+    Unsupported { call: &'static str },
+    /// The kernel refused the call.
+    Io(std::io::Error),
+}
+
+impl OsError {
+    /// Whether the call is one the platform does not have, or one the kernel
+    /// does not know: the two refusals the populate fallback stands for.
+    fn is_no_advice(&self) -> bool {
+        match self {
+            Self::Unsupported { .. } => true,
+            Self::Io(e) => e.raw_os_error() == Some(libc::EINVAL),
+        }
+    }
+}
+
+impl std::fmt::Display for OsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported { call } => write!(f, "unsupported on this platform: {call}"),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for OsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Unsupported { .. } => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for OsError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<OsError> for std::io::Error {
+    fn from(e: OsError) -> Self {
+        match e {
+            OsError::Unsupported { call } => std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("unsupported on this platform: {call}"),
+            ),
+            OsError::Io(e) => e,
+        }
+    }
+}
+
+/// `p` as a C string; a path holding a NUL is refused.
+fn c_path(p: &Path) -> Result<CString, OsError> {
+    use std::os::unix::ffi::OsStrExt;
+    CString::new(p.as_os_str().as_bytes())
+        .map_err(|e| OsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))
+}
+
+// ------------------------------------------------------------------- affinity
+
+/// The cpus the calling thread may run on, ascending.
+///
+/// Linux: the kernel's mask for the calling thread, read into a buffer that
+/// grows until the mask fits. macOS: every logical cpu of the machine, for
+/// the platform has no per-thread mask.
+#[cfg(target_os = "linux")]
+pub fn mask_cpus() -> Result<Vec<u32>, OsError> {
+    let mut words = 16usize;
+    loop {
+        let mut set = vec![0u64; words];
+        let bytes = words * std::mem::size_of::<u64>();
+        // SAFETY: `set` is `bytes` writable bytes, and `sched_getaffinity`
+        // writes at most that many.
+        let rc = unsafe { libc::sched_getaffinity(0, bytes, set.as_mut_ptr().cast()) };
+        if rc == 0 {
+            return Ok(set
+                .iter()
+                .enumerate()
+                .flat_map(|(w, &bits)| {
+                    (0..64u32)
+                        .filter(move |b| bits >> b & 1 == 1)
+                        .map(move |b| w as u32 * 64 + b)
+                })
+                .collect());
+        }
+        let e = std::io::Error::last_os_error();
+        // EINVAL: the mask is wider than the buffer.
+        if e.raw_os_error() != Some(libc::EINVAL) || words >= 1 << 14 {
+            return Err(OsError::Io(e));
+        }
+        words *= 2;
+    }
+}
+
+/// The cpus the calling thread may run on, ascending.
+///
+/// Linux: the kernel's mask for the calling thread, read into a buffer that
+/// grows until the mask fits. macOS: every logical cpu of the machine, for
+/// the platform has no per-thread mask.
+#[cfg(target_os = "macos")]
+pub fn mask_cpus() -> Result<Vec<u32>, OsError> {
+    let n = logical_cpus()?;
+    Ok((0..n).collect())
+}
+
+/// The machine's logical cpu count (`hw.logicalcpu`).
+#[cfg(target_os = "macos")]
+fn logical_cpus() -> Result<u32, OsError> {
+    let mut n: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: `n` is a live `c_int` and `len` its size; the call writes at
+    // most that many bytes into it.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.logicalcpu".as_ptr(),
+            (&raw mut n).cast(),
+            (&raw mut len),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(OsError::Io(std::io::Error::last_os_error()));
+    }
+    u32::try_from(n).map_err(|_| {
+        OsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hw.logicalcpu is not a cpu count",
+        ))
+    })
+}
+
+/// Set the calling thread's mask to `cpus`.
+///
+/// Linux: the kernel's mask for the calling thread. macOS: the platform has
+/// no per-thread mask, so the call is refused by name.
+#[cfg(target_os = "linux")]
+pub fn set_mask(cpus: &[u32]) -> Result<(), OsError> {
+    let named = 8 * std::mem::size_of::<libc::cpu_set_t>();
+    for &c in cpus {
+        if c as usize >= named {
+            return Err(OsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("cpu {c} is past the {named} a cpu_set_t names"),
+            )));
+        }
+    }
+    // SAFETY: `set` is a zeroed cpu_set_t only written through CPU_SET with
+    // indices below its own bit count, and sched_setaffinity reads it with
+    // the matching size.
+    let rc = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        for &c in cpus {
+            libc::CPU_SET(c as usize, &mut set);
+        }
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(OsError::Io(std::io::Error::last_os_error()))
+    }
+}
+
+/// Set the calling thread's mask to `cpus`.
+///
+/// Linux: the kernel's mask for the calling thread. macOS: the platform has
+/// no per-thread mask, so the call is refused by name.
+#[cfg(target_os = "macos")]
+pub fn set_mask(_cpus: &[u32]) -> Result<(), OsError> {
+    Err(OsError::Unsupported {
+        call: "sched_setaffinity",
+    })
+}
+
+/// Pin the calling thread to one logical cpu.
+///
+/// Linux: the kernel's mask, set to that one cpu. macOS: the platform has no
+/// per-thread mask, so the call is refused by name and the pool floats.
+#[cfg(target_os = "linux")]
+pub fn pin(cpu: u32) -> Result<(), OsError> {
+    set_mask(&[cpu])
+}
+
+/// Pin the calling thread to one logical cpu.
+///
+/// Linux: the kernel's mask, set to that one cpu. macOS: the platform has no
+/// per-thread mask, so the call is refused by name and the pool floats.
+#[cfg(target_os = "macos")]
+pub fn pin(_cpu: u32) -> Result<(), OsError> {
+    Err(OsError::Unsupported {
+        call: "sched_setaffinity",
+    })
+}
+
+/// Widen the calling thread's mask to every cpu the set can name.
+///
+/// Linux: the kernel's mask, set to every cpu it names. macOS: the platform
+/// has no per-thread mask to widen — a thread there runs on every cpu — so
+/// the call has nothing to do and says so.
+#[cfg(target_os = "linux")]
+pub fn float_everywhere() -> Result<(), OsError> {
+    let max = u32::try_from(8 * std::mem::size_of::<libc::cpu_set_t>())
+        .expect("a cpu_set_t names fewer cpus than a u32 holds");
+    let cpus: Vec<u32> = (0..max).collect();
+    set_mask(&cpus)
+}
+
+/// Widen the calling thread's mask to every cpu the set can name.
+///
+/// Linux: the kernel's mask, set to every cpu it names. macOS: the platform
+/// has no per-thread mask to widen — a thread there runs on every cpu — so
+/// the call has nothing to do and says so.
+#[cfg(target_os = "macos")]
+pub fn float_everywhere() -> Result<(), OsError> {
+    Ok(())
+}
+
+// -------------------------------------------------------------------- rusage
+
+/// The page faults the calling thread has taken, minor and major.
+///
+/// Linux: the kernel's count for the calling thread. macOS: the platform
+/// counts a process, not a thread, so the call is refused by name.
+#[cfg(target_os = "linux")]
+pub fn thread_faults() -> Result<u64, OsError> {
+    // SAFETY: `rusage` is a C struct of integers; all-zero bytes are a value of it.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is a live, writable `rusage` for the duration of the call.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
+    assert_eq!(rc, 0, "getrusage(RUSAGE_THREAD)");
+    Ok(u64::try_from(usage.ru_minflt + usage.ru_majflt).expect("a fault count is not negative"))
+}
+
+/// The page faults the calling thread has taken, minor and major.
+///
+/// Linux: the kernel's count for the calling thread. macOS: the platform
+/// counts a process, not a thread, so the call is refused by name.
+#[cfg(target_os = "macos")]
+pub fn thread_faults() -> Result<u64, OsError> {
+    Err(OsError::Unsupported {
+        call: "getrusage(RUSAGE_THREAD)",
+    })
+}
+
+// ---------------------------------------------------------------------- file
+
+/// The open flag a direct read carries, where the platform has one: Linux's
+/// `O_DIRECT`. macOS turns the cache off with a descriptor command
+/// (`F_NOCACHE`), not an open flag, so it has none.
+#[cfg(target_os = "linux")]
+pub const DIRECT_FLAG: Option<u32> = Some(libc::O_DIRECT as u32);
+
+/// The open flag a direct read carries, where the platform has one: Linux's
+/// `O_DIRECT`. macOS turns the cache off with a descriptor command
+/// (`F_NOCACHE`), not an open flag, so it has none.
+#[cfg(target_os = "macos")]
+pub const DIRECT_FLAG: Option<u32> = None;
+
+/// `path` opened for reads that bypass the page cache.
+///
+/// Linux: the `O_DIRECT` flag. macOS: the flag has no counterpart, so the
+/// file is opened and its cache turned off with `F_NOCACHE`.
+#[cfg(target_os = "linux")]
+pub fn open_direct(path: &Path) -> Result<File, OsError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+        .map_err(OsError::Io)
+}
+
+/// `path` opened for reads that bypass the page cache.
+///
+/// Linux: the `O_DIRECT` flag. macOS: the flag has no counterpart, so the
+/// file is opened and its cache turned off with `F_NOCACHE`.
+#[cfg(target_os = "macos")]
+pub fn open_direct(path: &Path) -> Result<File, OsError> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(OsError::Io)?;
+    // SAFETY: the descriptor is this file's own and lives across the call.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    if rc != 0 {
+        return Err(OsError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(file)
+}
+
+/// Rename `from` to `to`, refused when `to` exists.
+///
+/// Linux: `renameat2` with `RENAME_NOREPLACE`. macOS: `renamex_np` with
+/// `RENAME_EXCL`.
+#[cfg(target_os = "linux")]
+pub fn rename_noreplace(from: &Path, to: &Path) -> Result<(), OsError> {
+    let (a, b) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both are NUL-terminated paths that live across the call.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(OsError::Io(std::io::Error::last_os_error()))
+    }
+}
+
+/// Rename `from` to `to`, refused when `to` exists.
+///
+/// Linux: `renameat2` with `RENAME_NOREPLACE`. macOS: `renamex_np` with
+/// `RENAME_EXCL`.
+#[cfg(target_os = "macos")]
+pub fn rename_noreplace(from: &Path, to: &Path) -> Result<(), OsError> {
+    let (a, b) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both are NUL-terminated paths that live across the call.
+    let rc = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_EXCL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(OsError::Io(std::io::Error::last_os_error()))
+    }
+}
+
+/// Bytes free to this process on the filesystem that holds `dir`.
+///
+/// Linux: the `statvfs` fields as they are. macOS: the same fields, whose
+/// widths that platform sets differently, widened to the same numbers.
+#[cfg(target_os = "linux")]
+pub fn free_bytes(dir: &Path) -> Result<u64, OsError> {
+    let c = c_path(dir)?;
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c` is a NUL-terminated path that lives across the call, and
+    // `st` is storage for one `statvfs`, which the call fills on success.
+    if unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
+        return Err(OsError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: the call returned 0, so it wrote every field of `st`.
+    let st = unsafe { st.assume_init() };
+    Ok(st.f_bavail.saturating_mul(st.f_frsize))
+}
+
+/// Bytes free to this process on the filesystem that holds `dir`.
+///
+/// Linux: the `statvfs` fields as they are. macOS: the same fields, whose
+/// widths that platform sets differently, widened to the same numbers.
+#[cfg(target_os = "macos")]
+pub fn free_bytes(dir: &Path) -> Result<u64, OsError> {
+    let c = c_path(dir)?;
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: as in the Linux body: `c` is a NUL-terminated path that lives
+    // across the call, and `st` is storage for one `statvfs`.
+    if unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) } != 0 {
+        return Err(OsError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: the call returned 0, so it wrote every field of `st`.
+    let st = unsafe { st.assume_init() };
+    // `f_bavail` is a 32-bit count on macOS and `f_frsize` a 64-bit one: the
+    // same numbers Linux's fields hold, widened once.
+    Ok(u64::from(st.f_bavail).saturating_mul(st.f_frsize))
+}
+
+/// Drop the clean pages of `fd` over `at .. at + len` from the page cache.
+///
+/// Linux: `posix_fadvise(DONTNEED)`. macOS: the platform has no such call,
+/// so it is refused by name.
+#[cfg(target_os = "linux")]
+pub fn fadvise_dontneed(fd: RawFd, at: libc::off_t, len: libc::off_t) -> Result<(), OsError> {
+    // SAFETY: the descriptor is the caller's own and lives across the call;
+    // fadvise reads and writes no memory of ours.
+    let rc = unsafe { libc::posix_fadvise(fd, at, len, libc::POSIX_FADV_DONTNEED) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(OsError::Io(std::io::Error::from_raw_os_error(rc)))
+    }
+}
+
+/// Drop the clean pages of `fd` over `at .. at + len` from the page cache.
+///
+/// Linux: `posix_fadvise(DONTNEED)`. macOS: the platform has no such call,
+/// so it is refused by name.
+#[cfg(target_os = "macos")]
+pub fn fadvise_dontneed(_fd: RawFd, _at: libc::off_t, _len: libc::off_t) -> Result<(), OsError> {
+    Err(OsError::Unsupported {
+        call: "posix_fadvise",
+    })
+}
+
+/// Write the bytes of `fd` over `at .. at + len` out to the drive.
+///
+/// Linux: `sync_file_range` over the range. macOS: the platform has no
+/// ranged write-out, so the whole file is synced with `F_FULLFSYNC`.
+#[cfg(target_os = "linux")]
+pub fn sync_range(fd: RawFd, at: libc::off_t, len: libc::off_t) -> Result<(), OsError> {
+    let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
+        | libc::SYNC_FILE_RANGE_WRITE
+        | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+    // SAFETY: the descriptor is the caller's own and lives across the call; the
+    // call reads no memory of ours.
+    if unsafe { libc::sync_file_range(fd, at, len, flags) } != 0 {
+        return Err(OsError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Write the bytes of `fd` over `at .. at + len` out to the drive.
+///
+/// Linux: `sync_file_range` over the range. macOS: the platform has no
+/// ranged write-out, so the whole file is synced with `F_FULLFSYNC`.
+#[cfg(target_os = "macos")]
+pub fn sync_range(fd: RawFd, _at: libc::off_t, _len: libc::off_t) -> Result<(), OsError> {
+    // SAFETY: the descriptor is the caller's own and lives across the call.
+    let rc = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC, 0) };
+    if rc != 0 {
+        return Err(OsError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------- memory
+
+/// How a span's pages were faulted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Populated {
+    /// The platform's populate advice.
+    Advised,
+    /// A read of one byte a page.
+    Touched,
+}
+
+/// The platform's populate advice: fault the pages of `addr .. addr + len` in.
+///
+/// Linux: `madvise(MADV_POPULATE_READ)`. macOS: the platform has no such
+/// advice, so the call is refused by name and the pages are read in instead.
+///
+/// # Safety
+/// `addr .. addr + len` must be whole pages inside one live mapping.
+#[cfg(target_os = "linux")]
+pub unsafe fn advise_populate(addr: *mut libc::c_void, len: usize) -> Result<(), OsError> {
+    // SAFETY: the caller's contract above; MADV_POPULATE_READ faults the
+    // pages in and never writes them.
+    let rc = unsafe { libc::madvise(addr, len, libc::MADV_POPULATE_READ) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(OsError::Io(std::io::Error::last_os_error()))
+    }
+}
+
+/// The platform's populate advice: fault the pages of `addr .. addr + len` in.
+///
+/// Linux: `madvise(MADV_POPULATE_READ)`. macOS: the platform has no such
+/// advice, so the call is refused by name and the pages are read in instead.
+///
+/// # Safety
+/// `addr .. addr + len` must be whole pages inside one live mapping.
+#[cfg(target_os = "macos")]
+pub unsafe fn advise_populate(_addr: *mut libc::c_void, _len: usize) -> Result<(), OsError> {
+    Err(OsError::Unsupported {
+        call: "madvise(MADV_POPULATE_READ)",
+    })
+}
+
+/// Fault the pages of `addr .. addr + len` in.
+///
+/// `advise` is the platform's populate advice call. A refusal that names the
+/// advice as unknown (EINVAL) or absent ([`OsError::Unsupported`]) gets the
+/// same pages faulted by a read of one byte each `page` bytes instead; any
+/// other refusal is the caller's, by name.
+///
+/// # Safety
+/// `addr .. addr + len` must be inside one live mapping: the pages are read
+/// one byte a page when the advice is not there.
+pub unsafe fn populate_span(
+    addr: *mut libc::c_void,
+    len: usize,
+    page: u64,
+    advise: impl Fn() -> Result<(), OsError>,
+) -> Result<Populated, OsError> {
+    match advise() {
+        Ok(()) => Ok(Populated::Advised),
+        Err(e) if e.is_no_advice() => {
+            // SAFETY: the caller's contract above.
+            unsafe { touch(addr, len, page)? };
+            Ok(Populated::Touched)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The pages of `addr .. addr + len` faulted in by a read of one byte a page.
+///
+/// # Safety
+/// `addr .. addr + len` must be inside one live mapping.
+unsafe fn touch(addr: *mut libc::c_void, len: usize, page: u64) -> Result<(), OsError> {
+    let step = usize::try_from(page).map_err(|_| {
+        OsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("a page of {page} bytes"),
+        ))
+    })?;
+    for at in (0..len).step_by(step) {
+        // SAFETY: `at` is below `len`, so the byte is inside the caller's live
+        // range; the read is volatile so that it is made.
+        let _ = unsafe { std::ptr::read_volatile(addr.cast::<u8>().add(at)) };
+    }
+    Ok(())
+}
+
+/// The kernel's `mincore` vector for `vec`: a byte a page.
+#[cfg(target_os = "linux")]
+fn mincore_vec(vec: &mut [u8]) -> *mut libc::c_uchar {
+    vec.as_mut_ptr()
+}
+
+/// The kernel's `mincore` vector for `vec`: a `c_char` a page.
+#[cfg(target_os = "macos")]
+fn mincore_vec(vec: &mut [u8]) -> *mut libc::c_char {
+    vec.as_mut_ptr().cast()
+}
+
+/// The address `mincore` takes: a mutable pointer on Linux, a constant one
+/// on macOS.
+#[cfg(target_os = "linux")]
+fn mincore_addr(addr: *mut libc::c_void) -> *mut libc::c_void {
+    addr
+}
+
+/// The address `mincore` takes: a mutable pointer on Linux, a constant one
+/// on macOS.
+#[cfg(target_os = "macos")]
+fn mincore_addr(addr: *mut libc::c_void) -> *const libc::c_void {
+    addr.cast_const()
+}
+
+/// The resident pages of `addr .. addr + len`, one byte a page in `vec`.
+///
+/// Linux: the kernel's `mincore`, whose vector is a byte a page. macOS: the
+/// same call, whose vector is a `c_char` a page; the shapes are settled here.
+///
+/// # Safety
+/// `addr .. addr + len` must be inside one live mapping, and `vec` must hold
+/// one byte for each of the pages of that range.
+pub unsafe fn mincore(addr: *mut libc::c_void, len: usize, vec: &mut [u8]) -> Result<(), OsError> {
+    // SAFETY: the caller's contract above; mincore only reads the page tables
+    // and writes nothing through `addr`.
+    let rc = unsafe { libc::mincore(mincore_addr(addr), len, mincore_vec(vec)) };
+    if rc != 0 {
+        return Err(OsError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OsError, Populated};
+    use std::path::PathBuf;
+
+    /// A scratch file of this process's own making, removed when the test
+    /// ends.
+    fn scratch(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("bloomery-os-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// `len` bytes on a page boundary, zeroed: the mapping the populate
+    /// advice and the resident-page count take.
+    struct Page {
+        ptr: *mut u8,
+        len: usize,
+        layout: std::alloc::Layout,
+    }
+
+    impl Page {
+        fn new(len: usize) -> Page {
+            let layout =
+                std::alloc::Layout::from_size_align(len, 4096).expect("a page-aligned layout");
+            // SAFETY: `layout` has a non-zero size; the memory is zeroed below
+            // before anything reads it.
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            assert!(!ptr.is_null(), "the page-aligned memory is there");
+            // SAFETY: `ptr` is `len` writable bytes of the allocation above.
+            unsafe { std::ptr::write_bytes(ptr, 0, len) };
+            Page { ptr, len, layout }
+        }
+
+        fn addr(&self) -> *mut std::ffi::c_void {
+            self.ptr.cast()
+        }
+    }
+
+    impl Drop for Page {
+        fn drop(&mut self) {
+            // SAFETY: `ptr` came from `alloc` with this layout, and nothing
+            // uses it after the drop.
+            unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+        }
+    }
+
+    /// The cpus the calling thread may run on: at least one, ascending.
+    #[test]
+    fn the_mask_names_the_cpus_the_thread_may_run_on() {
+        let cpus = super::mask_cpus().expect("the mask reads");
+        assert!(!cpus.is_empty(), "the mask names a cpu");
+        assert!(
+            cpus.windows(2).all(|w| w[0] < w[1]),
+            "the mask is ascending: {cpus:?}"
+        );
+    }
+
+    /// The mask the caller sets is the mask the thread then has.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_mask_is_the_one_the_caller_sets() {
+        let cpus = super::mask_cpus().expect("the mask reads");
+        let one = &cpus[..1];
+        super::set_mask(one).expect("the mask is set");
+        assert_eq!(super::mask_cpus().expect("the mask reads back"), one);
+    }
+
+    /// The platform with no per-thread mask refuses the mask call by name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mask_call_the_platform_has_not_is_refused_by_name() {
+        let e = super::set_mask(&[0]).expect_err("the platform has no mask");
+        assert!(
+            matches!(e, OsError::Unsupported { call } if call == "sched_setaffinity"),
+            "{e}"
+        );
+    }
+
+    /// A pin of a cpu the mask does not name is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pin_past_the_mask_is_refused() {
+        let e = super::pin(u32::MAX).expect_err("the cpu is past the mask");
+        assert!(
+            matches!(&e, OsError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "{e}"
+        );
+    }
+
+    /// A pin of a cpu the mask names holds the thread on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pin_holds_the_thread_on_its_cpu() {
+        let cpus = super::mask_cpus().expect("the mask reads");
+        let cpu = cpus[0];
+        super::pin(cpu).expect("the pin holds");
+        assert_eq!(super::mask_cpus().expect("the mask reads back"), vec![cpu]);
+    }
+
+    /// The platform with no per-thread mask refuses the pin by name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pin_the_platform_has_not_is_refused_by_name() {
+        let e = super::pin(0).expect_err("the platform has no mask");
+        assert!(
+            matches!(e, OsError::Unsupported { call } if call == "sched_setaffinity"),
+            "{e}"
+        );
+    }
+
+    /// Floating widens a narrow mask back to the cpus the process may run on;
+    /// the platform with no mask has nothing to widen and says so.
+    #[test]
+    fn floating_widens_the_mask() {
+        #[cfg(target_os = "linux")]
+        {
+            let cpus = super::mask_cpus().expect("the mask reads");
+            super::set_mask(&cpus[..1]).expect("the mask is set");
+            super::float_everywhere().expect("the mask widens");
+            let after = super::mask_cpus().expect("the mask reads back");
+            assert!(
+                after.len() >= cpus.len(),
+                "the mask widened: {cpus:?} then {after:?}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        super::float_everywhere().expect("there is no mask to widen");
+    }
+
+    /// The page faults of the calling thread are a count that does not go
+    /// back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_thread_faults_are_counted() {
+        let before = super::thread_faults().expect("the fault count reads");
+        let after = super::thread_faults().expect("the fault count reads");
+        assert!(
+            after >= before,
+            "the count does not go back: {before} then {after}"
+        );
+    }
+
+    /// The platform that counts a process, not a thread, refuses the
+    /// per-thread fault count by name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_thread_fault_count_the_platform_has_not_is_refused_by_name() {
+        let e = super::thread_faults().expect_err("the platform counts a process");
+        assert!(
+            matches!(e, OsError::Unsupported { call } if call == "getrusage(RUSAGE_THREAD)"),
+            "{e}"
+        );
+    }
+
+    /// A direct open of a file the process wrote is the handle of that file;
+    /// the flag the platform has for it is named.
+    #[test]
+    fn a_direct_open_is_the_handle_of_the_file() {
+        let p = scratch("direct");
+        std::fs::write(&p, vec![7u8; 4096]).expect("the file is written");
+        let file = super::open_direct(&p).expect("the file opens for direct reads");
+        let len = file.metadata().expect("the file has a size").len();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(len, 4096, "the handle is the file that was written");
+        #[cfg(target_os = "linux")]
+        assert!(super::DIRECT_FLAG.is_some(), "the platform has the flag");
+        #[cfg(target_os = "macos")]
+        assert!(super::DIRECT_FLAG.is_none(), "the platform has no flag");
+    }
+
+    /// A rename that replaces nothing moves the file; a rename onto an
+    /// existing file is refused.
+    #[test]
+    fn a_rename_onto_an_existing_file_is_refused() {
+        let from = scratch("rename-from");
+        let to = scratch("rename-to");
+        let there = scratch("rename-there");
+        std::fs::write(&from, b"a").expect("the file is written");
+        std::fs::write(&there, b"b").expect("the file is written");
+        super::rename_noreplace(&from, &to).expect("the rename moves the file");
+        assert!(to.exists(), "the file is at its new name");
+        let e = super::rename_noreplace(&there, &to).expect_err("the target exists");
+        assert!(
+            matches!(&e, OsError::Io(e) if e.raw_os_error() == Some(libc::EEXIST)),
+            "{e}"
+        );
+        let _ = std::fs::remove_file(&to);
+        let _ = std::fs::remove_file(&there);
+    }
+
+    /// The free bytes of a directory are a count.
+    #[test]
+    fn the_free_bytes_of_a_directory_are_counted() {
+        let dir = std::env::temp_dir();
+        let free = super::free_bytes(&dir).expect("the filesystem answers");
+        assert!(free > 0, "the filesystem has room: {free}");
+    }
+
+    /// The page cache drops the clean pages of a file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_page_cache_drops_a_files_clean_pages() {
+        let p = scratch("fadvise");
+        std::fs::write(&p, b"bloomery").expect("the file is written");
+        let file = std::fs::File::open(&p).expect("the file opens");
+        let fd = {
+            use std::os::fd::AsRawFd;
+            file.as_raw_fd()
+        };
+        super::fadvise_dontneed(fd, 0, 8).expect("the pages drop");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The platform with no `posix_fadvise` refuses the page-cache drop by
+    /// name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_page_cache_drop_the_platform_has_not_is_refused_by_name() {
+        let e = super::fadvise_dontneed(0, 0, 8).expect_err("the platform has no call");
+        assert!(
+            matches!(e, OsError::Unsupported { call } if call == "posix_fadvise"),
+            "{e}"
+        );
+    }
+
+    /// A file's bytes are written out.
+    #[test]
+    fn a_files_bytes_are_written_out() {
+        let p = scratch("sync");
+        std::fs::write(&p, b"bloomery").expect("the file is written");
+        let file = std::fs::File::open(&p).expect("the file opens");
+        let fd = {
+            use std::os::fd::AsRawFd;
+            file.as_raw_fd()
+        };
+        super::sync_range(fd, 0, 8).expect("the bytes are written out");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The pages of a span are faulted in: by the platform's advice where it
+    /// has one, by a read of one byte a page where it has none.
+    #[test]
+    fn a_span_is_faulted_in() {
+        let span = Page::new(8192);
+        let addr = span.addr();
+        // SAFETY: the span is the page-aligned allocation above, so its pages
+        // are inside one live mapping.
+        let got = unsafe {
+            super::populate_span(addr, span.len, 4096, || {
+                super::advise_populate(addr, span.len)
+            })
+        }
+        .expect("the pages fault in");
+        #[cfg(target_os = "linux")]
+        assert_eq!(got, Populated::Advised);
+        #[cfg(target_os = "macos")]
+        assert_eq!(got, Populated::Touched);
+    }
+
+    /// The resident pages of a span are counted, a byte a page.
+    #[test]
+    fn a_span_s_resident_pages_are_counted() {
+        let span = Page::new(8192);
+        let mut vec = [0u8; 2];
+        // SAFETY: the span is the page-aligned allocation above, so its pages
+        // are inside one live mapping, and `vec` holds a byte for each.
+        unsafe { super::mincore(span.addr(), span.len, &mut vec) }.expect("the pages are counted");
+        // Linux answers for every page of the range; macOS answers for the
+        // first page of it, so the claim both make is that one.
+        #[cfg(target_os = "linux")]
+        assert!(
+            vec.iter().all(|b| b & 1 == 1),
+            "the pages are resident: {vec:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(vec[0] & 1, 1, "the first page is resident: {vec:?}");
+    }
+}

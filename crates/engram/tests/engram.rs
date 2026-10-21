@@ -866,8 +866,15 @@ fn hw_engram_expert_stack_evicts_and_reads_back() {
 /// A direct handle reads the file's bytes at an aligned offset into an aligned
 /// buffer, carries the `O_DIRECT` flag, and a path that is not there is
 /// refused by name.
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "hw: the box's disk-backed target directory"
+)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the Linux fact it reads: the open flags in /proc/self/fdinfo"
+)]
 #[test]
-#[ignore = "hw: the box's disk-backed target directory"]
 fn hw_engram_open_direct_reads_the_files_bytes() {
     use std::os::fd::AsRawFd;
     let scratch = Scratch::new("direct");
@@ -881,10 +888,11 @@ fn hw_engram_open_direct_reads_the_files_bytes() {
         .find_map(|l| l.strip_prefix("flags:"))
         .map(|v| u32::from_str_radix(v.trim(), 8).unwrap())
         .expect("fdinfo names the open flags");
+    let direct_flag = os::DIRECT_FLAG.expect("this platform has a direct-open flag");
     assert_ne!(
-        flags & libc::O_DIRECT as u32,
+        flags & direct_flag,
         0,
-        "the handle carries O_DIRECT: flags {flags:o}"
+        "the handle carries the direct flag: flags {flags:o}"
     );
 
     let align = engram::DIRECT_ALIGN;
