@@ -206,6 +206,7 @@ dependencies = [
  "bloomery-model",
  "bloomery-model-hf",
  "bloomery-qdot",
+ "bloomery-record",
  "bloomery-refset",
  "bloomery-runtime",
  "bloomery-safetensors",
@@ -431,6 +432,10 @@ dependencies = [
  "bloomery-refset",
  "bloomery-threads",
 ]
+
+[[package]]
+name = "bloomery-record"
+version = "0.1.0"
 
 [[package]]
 name = "bloomery-refset"
