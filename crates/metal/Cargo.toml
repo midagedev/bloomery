@@ -1,0 +1,36 @@
+[package]
+name = "bloomery-metal"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+build = "build.rs"
+
+[lib]
+name = "bloomery_metal"
+
+[[bin]]
+name = "gate_metal_device"
+path = "src/bin/gate_metal_device.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The contract this backend implements, and the placement's terms (the
+# census of the devices a backend opens).
+bloomery-device = { path = "../device" }
+bloomery-placement = { path = "../placement" }
+
+# The Objective-C bindings, macOS only: on another operating system the
+# library is empty and the gate bin only refuses, so these are never built.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-metal = { workspace = true }
+dispatch2 = { workspace = true }
+
+[build-dependencies]
+# The fault site's table, the one owner the generated header is written
+# from.
+bloomery-device = { path = "../device" }

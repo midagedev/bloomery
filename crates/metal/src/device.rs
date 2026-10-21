@@ -1,0 +1,165 @@
+//! The Metal device: the contract's `Device` over `objc2-metal`.
+
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSProcessInfo;
+use objc2_metal::{MTLCommandQueue, MTLDevice, MTLResourceOptions};
+
+use bloomery_device::{Device, DeviceError, Elem, Elems, FaultWord};
+use bloomery_placement::placement::devices::DeviceInfo;
+
+use crate::buffer::{MetalBuffer, MetalRaw, MetalShared};
+use crate::census::MetalCensus;
+use crate::fault::MetalFaultWord;
+use crate::handle::Handle;
+use crate::library::{Library, Pipeline};
+use crate::stream::{MetalEvent, MetalStream};
+
+/// The macOS floor this backend runs on: below it the backend is refused by
+/// name.
+pub(crate) const MACOS_FLOOR: (u32, u32, u32) = (26, 2, 0);
+
+/// The operating system version this process runs on.
+#[must_use]
+pub(crate) fn os_version() -> (u32, u32, u32) {
+    let version = NSProcessInfo::processInfo().operatingSystemVersion();
+    let part = |n: isize| {
+        u32::try_from(n).expect("an operating system version part is a small non-negative number")
+    };
+    (
+        part(version.majorVersion),
+        part(version.minorVersion),
+        part(version.patchVersion),
+    )
+}
+
+/// The refusal of a macOS below the floor this backend needs.
+pub fn require_macos(major: u32, minor: u32, patch: u32) -> Result<(), DeviceError> {
+    if (major, minor, patch) >= MACOS_FLOOR {
+        return Ok(());
+    }
+    Err(DeviceError::unsupported(
+        "macos",
+        format!(
+            "macOS {major}.{minor}.{patch} is below the floor {}.{}.{} this backend needs",
+            MACOS_FLOOR.0, MACOS_FLOOR.1, MACOS_FLOOR.2
+        ),
+    ))
+}
+
+/// The Metal device the engine programs against.
+pub struct MetalDevice {
+    device: Handle<dyn MTLDevice>,
+    queue: Handle<dyn MTLCommandQueue>,
+    library: Library,
+    fault: MetalFaultWord,
+    info: DeviceInfo,
+}
+
+impl MetalDevice {
+    /// Open the machine's default Metal device.
+    pub fn open() -> Result<Self, DeviceError> {
+        let (major, minor, patch) = os_version();
+        require_macos(major, minor, patch)?;
+
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().ok_or_else(|| {
+            DeviceError::unsupported(
+                "metal device",
+                "this machine has no Metal device".to_string(),
+            )
+        })?;
+        let device = Handle(device);
+        let queue = device.newCommandQueue().ok_or_else(|| {
+            DeviceError::backend(
+                "command queue",
+                "the device made no command queue".to_string(),
+            )
+        })?;
+        let library = Library::compile(&device)?;
+        let fault = MetalFaultWord::new(&device)?;
+        let info = MetalCensus::info_of(&device, MetalCensus::ordinal_of(&device)?)?;
+        Ok(Self {
+            device,
+            queue: Handle(queue),
+            library,
+            fault,
+            info,
+        })
+    }
+
+    /// The device's own Metal object.
+    #[must_use]
+    pub fn metal(&self) -> &ProtocolObject<dyn MTLDevice> {
+        &self.device
+    }
+
+    /// The device's own handle, for the objects that outlive a borrow of it.
+    pub(crate) fn handle(&self) -> &Handle<dyn MTLDevice> {
+        &self.device
+    }
+
+    /// The library the kernels come from.
+    #[must_use]
+    pub fn library(&self) -> &Library {
+        &self.library
+    }
+
+    /// The compute pipeline of the named kernel of [`MetalDevice::library`].
+    pub fn pipeline(&self, name: &str) -> Result<Pipeline, DeviceError> {
+        self.library.pipeline(name)
+    }
+
+    /// The fault word this device's kernels raise, as the Metal backend's own
+    /// type: the binding a kernel raises it through, and the whole word.
+    #[must_use]
+    pub fn fault_word(&self) -> &MetalFaultWord {
+        &self.fault
+    }
+
+    /// A new stream on the device's queue.
+    pub fn stream(&self) -> Result<MetalStream, DeviceError> {
+        MetalStream::new(self.device.clone(), self.queue.clone())
+    }
+}
+
+impl Device for MetalDevice {
+    type Buffer<T: Elem> = MetalBuffer<T>;
+    type Shared<T: Elem> = MetalShared<T>;
+    type Stream = MetalStream;
+    type Event = MetalEvent;
+    type Raw = MetalRaw;
+    const BACKEND: &'static str = "metal";
+
+    fn info(&self) -> &DeviceInfo {
+        &self.info
+    }
+
+    fn zeroed<T: Elem>(&self, _s: &Self::Stream, n: Elems) -> Result<Self::Buffer<T>, DeviceError> {
+        let mut buffer = MetalBuffer::<T>::new(&self.device, n)?;
+        buffer.zero();
+        Ok(buffer)
+    }
+
+    fn upload<T: Elem>(
+        &self,
+        _s: &Self::Stream,
+        host: &[T],
+    ) -> Result<Self::Buffer<T>, DeviceError> {
+        let mut buffer = MetalBuffer::<T>::new(&self.device, Elems(host.len()))?;
+        buffer.write(host)?;
+        Ok(buffer)
+    }
+
+    fn shared<T: Elem>(&self, n: Elems) -> Result<Self::Shared<T>, DeviceError> {
+        MetalShared::<T>::new(&self.device, n)
+    }
+
+    fn fault(&self) -> &dyn FaultWord<Self::Stream> {
+        &self.fault
+    }
+}
+
+/// The options every buffer of this backend is made with: the host and the
+/// device share the pages, and the barriers are ours to place.
+pub(crate) fn buffer_options() -> MTLResourceOptions {
+    MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked
+}
