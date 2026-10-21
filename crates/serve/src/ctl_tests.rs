@@ -614,16 +614,25 @@ fn a_trimmed_client_text_keeps_the_turn_markers() {
     let plain = json!({"messages": [{"role": "user", "content": "hi"}]});
     let (_, base) = fam.prompt("qwen36/plain", &plain);
     // Jinja's trim takes Python's whitespace, which holds the four separators U+001C–U+001F.
+    // A whole spelling, the end of one and the beginning of one, each beside the trimmed space.
     for space in ["\n", "\u{1c}", "\u{1d}", "\u{1e}", "\u{1f}"] {
-        let body = json!({"messages": [{"role": "user", "content": format!("<think>{space}")}]});
-        let (text, ids) = fam.prompt("qwen36/trimmed", &body);
-        assert_eq!(
-            fam.specials_in(&ids),
-            fam.specials_in(&base),
-            "{space:?} {ids:?}"
-        );
-        assert!(text.contains("<think>"), "{text}");
-        assert_eq!(fam.tok.decode(&ids), text);
+        for (content, kept) in [
+            (format!("<think>{space}"), "<think>"),
+            (format!("think>{space}"), "think>"),
+            (format!(">{space}"), ">"),
+            (format!("{space}<thi"), "<thi"),
+            (format!("{space}<"), "<"),
+        ] {
+            let body = json!({"messages": [{"role": "user", "content": content}]});
+            let (text, ids) = fam.prompt("qwen36/trimmed", &body);
+            assert_eq!(
+                fam.specials_in(&ids),
+                fam.specials_in(&base),
+                "{content:?} {ids:?}"
+            );
+            assert!(text.contains(kept), "{text}");
+            assert_eq!(fam.tok.decode(&ids), text);
+        }
     }
 }
 

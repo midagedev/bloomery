@@ -50,8 +50,8 @@ impl Spellings {
     ///   template's `trim` would leave the mark at the edge of the text, beside a token the
     ///   template wrote there;
     /// - before a spelling the text ends in the beginning of, and after the end of one the text
-    ///   begins with the end of; a text that is only such a piece gets a mark after its first
-    ///   character, and one of a single character none.
+    ///   begins with the end of, when the rest of the text holds what a `trim` keeps; otherwise
+    ///   after the piece's first character, and in a piece of a single character none.
     pub(crate) fn cuts(&self, text: &str) -> Vec<usize> {
         let bytes = text.as_bytes();
         let n = bytes.len();
@@ -100,10 +100,11 @@ impl Spellings {
                 .iter()
                 .any(|&i| self.needles[i].len() > rest.len() && self.needles[i].starts_with(rest))
             {
-                if start > 0 {
+                if start > 0 && has_text(&text[..start]) {
                     at.push(start);
                 } else {
-                    at.extend(after_first);
+                    let first = text[start..].chars().next().map_or(0, char::len_utf8);
+                    at.extend(Some(start + first).filter(|&cut| cut < n));
                 }
             }
         }
@@ -117,10 +118,10 @@ impl Spellings {
                 .iter()
                 .any(|&i| self.needles[i].len() > len && self.needles[i].ends_with(head))
             {
-                if len < n {
+                if len < n && has_text(&text[len..]) {
                     at.push(len);
                 } else {
-                    at.extend(after_first);
+                    at.extend(after_first.filter(|&cut| cut < len));
                 }
             }
         }
