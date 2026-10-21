@@ -66,7 +66,7 @@
 //! - (g) a captured walk equals the eager walk over the same rows, bit for
 //!   bit — tokens, probabilities, streams, logits — at 1 to 4 rows with the
 //!   list head and at 1 row with the full head, each capture of
-//!   [`GRAPH_NODES`] nodes; two own rows (`MtpFeed::Own`) in a row, captured
+//!   [`GRAPH_NODES`] nodes; two own rows (`DraftFeed::Own`) in a row, captured
 //!   then replayed, equal them eager, and the first equals a host walk of
 //!   the previous walk's last token and streams; a window's chain
 //!   (`GpuModel::mtp_chain`: a refresh and two own walks, one readback)
@@ -74,8 +74,8 @@
 //! - (f) the walk's refusals by name — its own row before any walk and
 //!   after a reset, no rows, nine rows eager, five captured, rows past the
 //!   store, a walk past the positions the store holds for the sequence, a
-//!   token past the vocabulary, a hidden slice of the wrong length, a capture
-//!   with the taps armed; a store walk (`WalkMode::Store`) past its
+//!   token past the vocabulary, a hidden slice of the wrong length, a walk and
+//!   a chain whose rows carry media rows, a capture with the taps armed; a store walk (`WalkMode::Store`) past its
 //!   `MTP_STORE_ROWS` rows, read back or chained, and the own row and the
 //!   streams after one — and a NaN in a
 //!   hidden row raised on the fault word as the draft layer's `hc_mix`, the
@@ -254,11 +254,12 @@ mod gate {
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
         Body38, CHECKPOINT_EVERY, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
-        MtpFeed, MtpHead, MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38, Store38Host, TargetRows,
-        checkpoint_bytes, seq_positional_bytes, seq38_bytes,
+        MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38, Store38Host, TargetRows, checkpoint_bytes,
+        seq_positional_bytes, seq38_bytes,
     };
-    use bloomery_gpu::draft::{Feed, Hidden, WalkMode};
+    use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
     use bloomery_gpu::fault::FaultSite;
+    use bloomery_gpu::media::CallRows;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::act_rule::{Arm, site_rel};
     use bloomery_gpu_gates::flip::{self, Flip};
@@ -716,8 +717,8 @@ mod gate {
 
     fn walk(
         m: &mut Qwen38Model,
-        feed: MtpFeed<'_>,
-        head: MtpHead,
+        feed: DraftFeed<'_, TargetRows>,
+        head: DraftHead,
         mode: WalkMode,
     ) -> Result<Walk, GateError> {
         let draft = m.mtp_draft(feed, head, mode)?;
@@ -1411,13 +1412,13 @@ mod gate {
             let rows = MTP_ROWS.min(n - c0);
             let w = walk(
                 m,
-                MtpFeed::Rows(Feed {
+                DraftFeed::Rows(Feed {
                     tokens: &g.tokens[c0..c0 + rows],
                     pos0: g.pos[c0],
                     hidden: Hidden::Host(&g.states[c0 * WIDE..(c0 + rows) * WIDE]),
                     media: None,
                 }),
-                MtpHead::Full,
+                DraftHead::Full,
                 WalkMode::Eager,
             )?;
             let taps = m.mtp_taps()?;
@@ -1578,14 +1579,14 @@ mod gate {
         let mut all = true;
         for rows in [MTP_ROWS.min(n), 1] {
             let c0 = n - rows;
-            let feed = MtpFeed::Rows(Feed {
+            let feed = DraftFeed::Rows(Feed {
                 tokens: &g.tokens[c0..],
                 pos0: g.pos[c0],
                 hidden: Hidden::Host(&g.states[c0 * WIDE..]),
                 media: None,
             });
-            let full = walk(m, feed, MtpHead::Full, WalkMode::Eager)?;
-            let list = walk(m, feed, MtpHead::Rows, WalkMode::Eager)?;
+            let full = walk(m, feed, DraftHead::Full, WalkMode::Eager)?;
+            let list = walk(m, feed, DraftHead::Rows, WalkMode::Eager)?;
             let mut ok = list.rows == ids.len();
             let mut differ = 0usize;
             let (mut p_worst, mut p_bad) = (0.0f64, 0usize);
@@ -1925,18 +1926,18 @@ mod gate {
         let pos0 = u32::try_from(first + 1)?;
         let host = walk(
             m,
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &tokens,
                 pos0,
                 hidden: Hidden::Host(&ours),
                 media: None,
             }),
-            MtpHead::Rows,
+            DraftHead::Rows,
             WalkMode::Eager,
         );
         let place = walk(
             m,
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &tokens,
                 pos0,
                 hidden: Hidden::Target {
@@ -1945,7 +1946,7 @@ mod gate {
                 },
                 media: None,
             }),
-            MtpHead::Rows,
+            DraftHead::Rows,
             WalkMode::Eager,
         );
         let same = match (&host, &place) {
@@ -1968,16 +1969,16 @@ mod gate {
         m.set_mtp_taps(false)?;
         let mut ok = true;
         let rows_of = |k: usize| {
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &g.tokens[..k],
                 pos0: g.pos[0],
                 hidden: Hidden::Host(&g.states[..k * WIDE]),
                 media: None,
             })
         };
-        let mut shapes: Vec<(usize, MtpHead)> =
-            (1..=MTP_GRAPH_ROWS).map(|k| (k, MtpHead::Rows)).collect();
-        shapes.push((1, MtpHead::Full));
+        let mut shapes: Vec<(usize, DraftHead)> =
+            (1..=MTP_GRAPH_ROWS).map(|k| (k, DraftHead::Rows)).collect();
+        shapes.push((1, DraftHead::Full));
         for (k, head) in shapes {
             let e = walk(m, rows_of(k), head, WalkMode::Eager)?;
             let c = walk(m, rows_of(k), head, WalkMode::Graph)?;
@@ -1990,27 +1991,27 @@ mod gate {
             );
         }
         let pos1 = g.pos[0] + 1;
-        let own = |p: u32| MtpFeed::Own { pos0: p };
-        let x = walk(m, rows_of(1), MtpHead::Rows, WalkMode::Eager)?;
+        let own = |p: u32| DraftFeed::Own { pos0: p };
+        let x = walk(m, rows_of(1), DraftHead::Rows, WalkMode::Eager)?;
         let own_e = [
-            walk(m, own(pos1), MtpHead::Rows, WalkMode::Eager)?,
-            walk(m, own(pos1 + 1), MtpHead::Rows, WalkMode::Eager)?,
+            walk(m, own(pos1), DraftHead::Rows, WalkMode::Eager)?,
+            walk(m, own(pos1 + 1), DraftHead::Rows, WalkMode::Eager)?,
         ];
-        walk(m, rows_of(1), MtpHead::Rows, WalkMode::Eager)?;
+        walk(m, rows_of(1), DraftHead::Rows, WalkMode::Eager)?;
         let own_g = [
-            walk(m, own(pos1), MtpHead::Rows, WalkMode::Graph)?,
-            walk(m, own(pos1 + 1), MtpHead::Rows, WalkMode::Graph)?,
+            walk(m, own(pos1), DraftHead::Rows, WalkMode::Graph)?,
+            walk(m, own(pos1 + 1), DraftHead::Rows, WalkMode::Graph)?,
         ];
-        walk(m, rows_of(1), MtpHead::Rows, WalkMode::Eager)?;
+        walk(m, rows_of(1), DraftHead::Rows, WalkMode::Eager)?;
         let host = walk(
             m,
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &x.draft.tokens,
                 pos0: pos1,
                 hidden: Hidden::Host(&x.l_out),
                 media: None,
             }),
-            MtpHead::Rows,
+            DraftHead::Rows,
             WalkMode::Eager,
         )?;
         let chain_ok = same_bits(&own_e[0], &own_g[0]) && same_bits(&own_e[1], &own_g[1]);
@@ -2025,11 +2026,11 @@ mod gate {
         // A window's chain — a refresh of two rows, then two own walks, one
         // readback — against the same walks one by one: each walk's last id
         // and probability, bit for bit.
-        let chain = m.mtp_chain(rows_of(2), 2, MtpHead::Rows, WalkMode::Graph)?;
+        let chain = m.mtp_chain(rows_of(2), 2, DraftHead::Rows, WalkMode::Graph)?;
         let one = [
-            walk(m, rows_of(2), MtpHead::Rows, WalkMode::Eager)?,
-            walk(m, own(g.pos[0] + 2), MtpHead::Rows, WalkMode::Eager)?,
-            walk(m, own(g.pos[0] + 3), MtpHead::Rows, WalkMode::Eager)?,
+            walk(m, rows_of(2), DraftHead::Rows, WalkMode::Eager)?,
+            walk(m, own(g.pos[0] + 2), DraftHead::Rows, WalkMode::Eager)?,
+            walk(m, own(g.pos[0] + 3), DraftHead::Rows, WalkMode::Eager)?,
         ];
         let want: Vec<(u32, u32)> = one
             .iter()
@@ -2094,14 +2095,14 @@ mod gate {
         let tokens: Vec<u32> = g.tokens.iter().copied().cycle().take(over).collect();
         let states: Vec<f32> = g.states.iter().copied().cycle().take(over * WIDE).collect();
         let feed = |k: usize, pos0: u32| {
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &tokens[..k],
                 pos0,
                 hidden: Hidden::Host(&states[..k * WIDE]),
                 media: None,
             })
         };
-        let (h, e) = (MtpHead::Rows, WalkMode::Eager);
+        let (h, e) = (DraftHead::Rows, WalkMode::Eager);
         let mut ok = true;
         ok &= refused("no rows", m.mtp_draft(feed(0, 0), h, e), "a walk of 0 rows");
         ok &= refused(
@@ -2129,7 +2130,7 @@ mod gate {
         ok &= refused(
             "a token past the vocabulary",
             m.mtp_draft(
-                MtpFeed::Rows(Feed {
+                DraftFeed::Rows(Feed {
                     tokens: &past,
                     pos0: 0,
                     hidden: Hidden::Host(&states[..WIDE]),
@@ -2143,7 +2144,7 @@ mod gate {
         ok &= refused(
             "a short hidden slice",
             m.mtp_draft(
-                MtpFeed::Rows(Feed {
+                DraftFeed::Rows(Feed {
                     tokens: &tokens[..2],
                     pos0: 0,
                     hidden: Hidden::Host(&states[..WIDE]),
@@ -2153,6 +2154,26 @@ mod gate {
                 e,
             ),
             "hidden values for 2 rows",
+        );
+        // The draft has no media prompt call: a walk and a chain whose rows
+        // carry media rows are refused, each through the one accessor.
+        let (at, span) = (0..1, vec![0u16; WIDE]);
+        let media = CallRows::new(0, WIDE, [(&at, &span[..])]).map_err(|e| e.to_string())?;
+        let with_media = DraftFeed::Rows(Feed {
+            tokens: &tokens[..1],
+            pos0: 0,
+            hidden: Hidden::Host(&states[..WIDE]),
+            media: Some(&media),
+        });
+        ok &= refused(
+            "a walk with media rows",
+            m.mtp_draft(with_media, h, e),
+            "this body's draft has no media prompt call",
+        );
+        ok &= refused(
+            "a chain with media rows",
+            m.mtp_chain(with_media, 1, h, e),
+            "this body's draft has no media prompt call",
         );
         m.set_mtp_taps(true)?;
         ok &= refused(
@@ -2169,7 +2190,7 @@ mod gate {
         let mut nan = states[..WIDE].to_vec();
         nan[7] = f32::NAN;
         let r = m.mtp_draft(
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &tokens[..1],
                 pos0: 0,
                 hidden: Hidden::Host(&nan),
@@ -2193,7 +2214,7 @@ mod gate {
         m.reset()?;
         ok &= refused(
             "the draft's own row after a reset",
-            m.mtp_draft(MtpFeed::Own { pos0: 0 }, h, e),
+            m.mtp_draft(DraftFeed::Own { pos0: 0 }, h, e),
             "a walk before the draft's own row",
         );
         // A store walk writes the store alone: nothing of it is read back,
@@ -2212,7 +2233,7 @@ mod gate {
         m.mtp_walk(feed(1, 0), h, store)?;
         ok &= refused(
             "the draft's own row after a store walk",
-            m.mtp_draft(MtpFeed::Own { pos0: 1 }, h, e),
+            m.mtp_draft(DraftFeed::Own { pos0: 1 }, h, e),
             "a walk before the draft's own row",
         );
         ok &= refused(
@@ -2243,27 +2264,27 @@ mod gate {
         // call's warmup shape).
         let zeros = vec![0.0f32; MTP_STORE_ROWS * WIDE];
         m.mtp_walk(
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &prompt[..MTP_STORE_ROWS.min(prompt.len())],
                 pos0: 0,
                 hidden: Hidden::Host(&zeros[..MTP_STORE_ROWS.min(prompt.len()) * WIDE]),
                 media: None,
             }),
-            MtpHead::Rows,
+            DraftHead::Rows,
             WalkMode::Store,
         )?;
         m.mtp_walk(
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &prompt[..1],
                 pos0: n,
                 hidden: Hidden::Host(&zeros[..WIDE]),
                 media: None,
             }),
-            MtpHead::Rows,
+            DraftHead::Rows,
             WalkMode::Store,
         )?;
-        fn feed(tokens: &[u32], pos0: u32, at: usize) -> MtpFeed<'_> {
-            MtpFeed::Rows(Feed {
+        fn feed(tokens: &[u32], pos0: u32, at: usize) -> DraftFeed<'_, TargetRows> {
+            DraftFeed::Rows(Feed {
                 tokens,
                 pos0,
                 hidden: Hidden::Target {
@@ -2273,7 +2294,7 @@ mod gate {
                 media: None,
             })
         }
-        let (h, e) = (MtpHead::Rows, WalkMode::Eager);
+        let (h, e) = (DraftHead::Rows, WalkMode::Eager);
         let mut ok = refused(
             "the Pass arena's rows read as the position before their first",
             m.mtp_draft(feed(&prompt[..1], first, 0), h, e),
@@ -2304,7 +2325,7 @@ mod gate {
         let mut tokens = prompt[first as usize + 1..].to_vec();
         tokens.push(next);
         let runs = m.mtp_draft(
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &tokens,
                 pos0: first + 1,
                 hidden: Hidden::Target {
@@ -2380,13 +2401,13 @@ mod gate {
         // carries the rows below the position only.
         let zeros = vec![0.0f32; WIDE];
         m.mtp_walk(
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &prompt[..1],
                 pos0: u32::try_from(at)?,
                 hidden: Hidden::Host(&zeros),
                 media: None,
             }),
-            MtpHead::Rows,
+            DraftHead::Rows,
             WalkMode::Store,
         )?;
         let mut ok = cut && snap_ok;
@@ -2413,20 +2434,20 @@ mod gate {
             .collect();
         overwrite_store(&mut m, prompt, at, 1)?;
         m.mtp_walk(
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &ids[at..at + 1],
                 pos0: u32::try_from(at)?,
                 hidden: Hidden::Host(&zeros[..WIDE]),
                 media: None,
             }),
-            MtpHead::Rows,
+            DraftHead::Rows,
             WalkMode::Store,
         )?;
         ok &= w_ok;
         ok &= refused(
             "the pass arena's rejected row",
             m.mtp_draft(
-                MtpFeed::Rows(Feed {
+                DraftFeed::Rows(Feed {
                     tokens: &ids[..1],
                     pos0: u32::try_from(at + 1)?,
                     hidden: Hidden::Target {
@@ -2435,7 +2456,7 @@ mod gate {
                     },
                     media: None,
                 }),
-                MtpHead::Rows,
+                DraftHead::Rows,
                 WalkMode::Eager,
             ),
             &format!(
@@ -2504,7 +2525,7 @@ mod gate {
         at: usize,
     ) -> Result<Result<Vec<u32>, String>, GateError> {
         let r = m.mtp_draft(
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &[id],
                 pos0: u32::try_from(at)?,
                 hidden: Hidden::Target {
@@ -2513,7 +2534,7 @@ mod gate {
                 },
                 media: None,
             }),
-            MtpHead::Rows,
+            DraftHead::Rows,
             WalkMode::Eager,
         );
         Ok(match r {
@@ -2900,13 +2921,13 @@ mod gate {
     fn lane_refused(m: &mut Qwen38Model, prompt: &[u32], n: u32) -> Result<bool, GateError> {
         let zeros = vec![0.0f32; WIDE];
         m.mtp_walk(
-            MtpFeed::Rows(Feed {
+            DraftFeed::Rows(Feed {
                 tokens: &prompt[..1],
                 pos0: n,
                 hidden: Hidden::Host(&zeros),
                 media: None,
             }),
-            MtpHead::Rows,
+            DraftHead::Rows,
             WalkMode::Store,
         )?;
         let (gdn, qsa) = (cfg().shape.n_gdn(), cfg().shape.n_qsa());
@@ -2942,13 +2963,13 @@ mod gate {
         let zeros = vec![0.0f32; MTP_STORE_ROWS * WIDE];
         for (i, run) in ids.chunks(MTP_STORE_ROWS).enumerate() {
             m.mtp_walk(
-                MtpFeed::Rows(Feed {
+                DraftFeed::Rows(Feed {
                     tokens: run,
                     pos0: u32::try_from(i * MTP_STORE_ROWS)?,
                     hidden: Hidden::Host(&zeros[..run.len() * WIDE]),
                     media: None,
                 }),
-                MtpHead::Rows,
+                DraftHead::Rows,
                 WalkMode::Store,
             )?;
         }
@@ -3544,7 +3565,7 @@ mod gate {
             };
             m.prompt38_with(prompt, path, Some(&mut sink))?;
         }
-        let (h, e) = (MtpHead::Rows, WalkMode::Eager);
+        let (h, e) = (DraftHead::Rows, WalkMode::Eager);
         let zeros = vec![0.0f32; WIDE];
         // Position 0 beside a zero row, then each unit's rows from its second
         // position on, each beside the hidden row of the position before it,
@@ -3552,7 +3573,7 @@ mod gate {
         let walk_host =
             |m: &mut Qwen38Model, mode: WalkMode, run: usize| -> Result<(), GateError> {
                 m.mtp_walk(
-                    MtpFeed::Rows(Feed {
+                    DraftFeed::Rows(Feed {
                         tokens: &prompt[..1],
                         pos0: 0,
                         hidden: Hidden::Host(&zeros),
@@ -3566,7 +3587,7 @@ mod gate {
                     for (i, r) in prompt[f + 1..end].chunks(run).enumerate() {
                         let q = f + 1 + i * run;
                         m.mtp_walk(
-                            MtpFeed::Rows(Feed {
+                            DraftFeed::Rows(Feed {
                                 tokens: r,
                                 pos0: u32::try_from(q)?,
                                 hidden: Hidden::Host(
@@ -3587,7 +3608,7 @@ mod gate {
         let other: Vec<u32> = prompt.iter().map(|&t| (t + 1) % vocab).collect();
         let overwrite = |m: &mut Qwen38Model| -> Result<(), GateError> {
             m.mtp_walk(
-                MtpFeed::Rows(Feed {
+                DraftFeed::Rows(Feed {
                     tokens: &other[..1],
                     pos0: 0,
                     hidden: Hidden::Host(&zeros),
@@ -3599,7 +3620,7 @@ mod gate {
             for (i, run) in other[1..].chunks(MTP_ROWS).enumerate() {
                 let q = 1 + i * MTP_ROWS;
                 m.mtp_walk(
-                    MtpFeed::Rows(Feed {
+                    DraftFeed::Rows(Feed {
                         tokens: run,
                         pos0: u32::try_from(q)?,
                         hidden: Hidden::Host(&streams[(q - 1) * WIDE..(q - 1 + run.len()) * WIDE]),
@@ -3628,7 +3649,7 @@ mod gate {
         let anchor = |m: &mut Qwen38Model| {
             walk(
                 m,
-                MtpFeed::Rows(Feed {
+                DraftFeed::Rows(Feed {
                     tokens: &prompt[..1],
                     pos0: u32::try_from(n).expect("a prompt fits u32"),
                     hidden: Hidden::Host(&streams[(n - 1) * WIDE..]),
@@ -5718,7 +5739,7 @@ mod gate {
         ok &= draft_budget(&inputs, &mtp, ub)?;
         ok &= refused(
             "the draft's own row before any walk",
-            m.mtp_draft(MtpFeed::Own { pos0: 0 }, MtpHead::Rows, WalkMode::Eager),
+            m.mtp_draft(DraftFeed::Own { pos0: 0 }, DraftHead::Rows, WalkMode::Eager),
             "a walk before the draft's own row",
         );
 

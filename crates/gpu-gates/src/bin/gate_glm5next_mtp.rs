@@ -58,7 +58,8 @@
 //!   and the MTP window opened over it (`MtpBody::head`), a captured walk, no
 //!   rows, [`WALK_ROWS`] + 1 rows, a walk from past the positions the store
 //!   holds, a token past the vocabulary, a host hidden slice of the wrong
-//!   length, target rows past the arena's, and a chain with own walks, in
+//!   length, target rows past the arena's, a row-list head, the draft's own
+//!   row, and a chain with own walks or with the own row as its refresh, in
 //!   the store walk's mode or into no place; each leaves the store's
 //!   positions where they were. Then the target's rows by position
 //!   (`nextn_hidden`, the walk's own gather): the pair arena before any
@@ -133,7 +134,7 @@ mod gate {
     use app::Session;
     use app::mtp::{MtpDraft, SLOT_DEPTH, SlotWindow, pass_slots};
     use bloomery_gpu::GpuError;
-    use bloomery_gpu::draft::{Feed, Hidden, WalkMode};
+    use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
@@ -145,10 +146,10 @@ mod gate {
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, patch_bytes, verdict};
     use bloomery_gpu_glm5next::{
-        Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, GlmSeq, NextnHead,
-        PrefillMode, WALK_ROWS, checkpoint_price, feed, nextn_chain, nextn_hidden, nextn_logits,
-        nextn_router, nextn_store, nextn_target_streams, nextn_walk, prompt_with, seq_bytes,
-        seq_resume, seq_save, set_prefill, set_prefill_group,
+        Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, GlmSeq, PrefillMode,
+        WALK_ROWS, checkpoint_price, feed, nextn_chain, nextn_hidden, nextn_logits, nextn_router,
+        nextn_store, nextn_target_streams, nextn_walk, prompt_with, seq_bytes, seq_resume,
+        seq_save, set_prefill, set_prefill_group,
     };
     use gguf::Split;
     use model::arch::glm5next::names;
@@ -589,17 +590,17 @@ mod gate {
         let mut ours = None;
         while c0 < n {
             let rows = WALK_ROWS.min(n - c0);
-            let f = Feed {
+            let f = DraftFeed::Rows(Feed {
                 tokens: &g.tokens[c0..c0 + rows],
                 pos0: g.pos[c0],
                 hidden: Hidden::Host(&g.states[c0 * hidden..(c0 + rows) * hidden]),
                 media: None,
-            };
+            });
             if c0 + rows < n {
-                nextn_walk(m, f, NextnHead::Full, WalkMode::Store)?;
+                nextn_walk(m, f, DraftHead::Full, WalkMode::Store)?;
             } else {
                 let mut out = [0u32; 1];
-                let k = nextn_chain(m, f, 0, NextnHead::Full, WalkMode::Eager, &mut out)?;
+                let k = nextn_chain(m, f, 0, DraftHead::Full, WalkMode::Eager, &mut out)?;
                 if k != 1 {
                     return Err(format!("{}: a chain of {k} ids, want 1", g.label()).into());
                 }
@@ -1372,13 +1373,17 @@ mod gate {
     }
 
     /// A walk's feed.
-    fn f<'a>(tokens: &'a [u32], pos0: u32, hidden: Hidden<'a, GlmArena>) -> Feed<'a, GlmArena> {
-        Feed {
+    fn f<'a>(
+        tokens: &'a [u32],
+        pos0: u32,
+        hidden: Hidden<'a, GlmArena>,
+    ) -> DraftFeed<'a, GlmArena> {
+        DraftFeed::Rows(Feed {
             tokens,
             pos0,
             hidden,
             media: None,
-        }
+        })
     }
 
     /// (f) on the NextN load, from a reset: every refusal leaves the store's
@@ -1394,17 +1399,37 @@ mod gate {
             nextn_walk(
                 m,
                 f(&toks[..1], 0, host(1)),
-                NextnHead::Full,
+                DraftHead::Full,
                 WalkMode::Graph,
             ),
             "a captured NextN walk",
+        );
+        ok &= refused(
+            "a row-list head",
+            nextn_walk(
+                m,
+                f(&toks[..1], 0, host(1)),
+                DraftHead::Rows,
+                WalkMode::Eager,
+            ),
+            "a row-list head",
+        );
+        ok &= refused(
+            "the draft's own row",
+            nextn_walk(
+                m,
+                DraftFeed::Own { pos0: 0 },
+                DraftHead::Full,
+                WalkMode::Eager,
+            ),
+            "a walk of the draft's own row at position 0",
         );
         ok &= refused(
             "no rows",
             nextn_walk(
                 m,
                 f(&toks[..0], 0, host(0)),
-                NextnHead::Full,
+                DraftHead::Full,
                 WalkMode::Eager,
             ),
             "a walk of 0 rows",
@@ -1414,7 +1439,7 @@ mod gate {
             nextn_walk(
                 m,
                 f(&toks, 0, host(WALK_ROWS + 1)),
-                NextnHead::Full,
+                DraftHead::Full,
                 WalkMode::Eager,
             ),
             &format!("a walk of {} rows", WALK_ROWS + 1),
@@ -1424,7 +1449,7 @@ mod gate {
             nextn_walk(
                 m,
                 f(&toks[..1], 1, host(1)),
-                NextnHead::Full,
+                DraftHead::Full,
                 WalkMode::Eager,
             ),
             "a walk from position 1",
@@ -1434,7 +1459,7 @@ mod gate {
             nextn_walk(
                 m,
                 f(&[u32::MAX], 0, host(1)),
-                NextnHead::Full,
+                DraftHead::Full,
                 WalkMode::Eager,
             ),
             "past the",
@@ -1444,7 +1469,7 @@ mod gate {
             nextn_walk(
                 m,
                 f(&toks[..1], 0, Hidden::Host(&zeros[..hidden - 1])),
-                NextnHead::Full,
+                DraftHead::Full,
                 WalkMode::Eager,
             ),
             "hidden values for 1 rows",
@@ -1461,7 +1486,7 @@ mod gate {
                         first: 1,
                     },
                 ),
-                NextnHead::Full,
+                DraftHead::Full,
                 WalkMode::Eager,
             ),
             "of the Step arena's 1",
@@ -1473,11 +1498,23 @@ mod gate {
                 m,
                 f(&toks[..1], 0, host(1)),
                 1,
-                NextnHead::Full,
+                DraftHead::Full,
                 WalkMode::Eager,
                 &mut out,
             ),
             "a chain of 1 own walks",
+        );
+        ok &= refused(
+            "a chain whose refresh is the draft's own row",
+            nextn_chain(
+                m,
+                DraftFeed::Own { pos0: 0 },
+                0,
+                DraftHead::Full,
+                WalkMode::Eager,
+                &mut out,
+            ),
+            "no own row (DraftFeed::Own)",
         );
         ok &= refused(
             "a chain in the store walk's mode",
@@ -1485,7 +1522,7 @@ mod gate {
                 m,
                 f(&toks[..1], 0, host(1)),
                 0,
-                NextnHead::Full,
+                DraftHead::Full,
                 WalkMode::Store,
                 &mut out,
             ),
@@ -1497,7 +1534,7 @@ mod gate {
                 m,
                 f(&toks[..1], 0, host(1)),
                 0,
-                NextnHead::Full,
+                DraftHead::Full,
                 WalkMode::Eager,
                 &mut [],
             ),
@@ -1597,18 +1634,18 @@ mod gate {
         let feed = || f(&tok, 0, Hidden::Host(&zeros));
         let mut out = [0u32; 1];
         m.reset()?;
-        nextn_chain(m, feed(), 0, NextnHead::Full, WalkMode::Eager, &mut out)?;
+        nextn_chain(m, feed(), 0, DraftHead::Full, WalkMode::Eager, &mut out)?;
         let clean = out[0];
         m.reset()?;
         let old = patch_head_norm(m, index, f32::NAN.to_le_bytes())?;
         let first =
-            nextn_chain(m, feed(), 0, NextnHead::Full, WalkMode::Eager, &mut out).map(|_| out[0]);
+            nextn_chain(m, feed(), 0, DraftHead::Full, WalkMode::Eager, &mut out).map(|_| out[0]);
         let poisoned = m.poisoned();
-        let walk = nextn_walk(m, feed(), NextnHead::Full, WalkMode::Store);
+        let walk = nextn_walk(m, feed(), DraftHead::Full, WalkMode::Store);
         patch_head_norm(m, index, old)?;
         m.reset()?;
         let again =
-            nextn_chain(m, feed(), 0, NextnHead::Full, WalkMode::Eager, &mut out).map(|_| out[0]);
+            nextn_chain(m, feed(), 0, DraftHead::Full, WalkMode::Eager, &mut out).map(|_| out[0]);
         m.reset()?;
         let named = match &first {
             Err(GpuError::Fault { fault, .. }) => poisoned == Some(*fault),
@@ -1945,13 +1982,13 @@ mod gate {
             "a walk on a load without the layer",
             nextn_walk(
                 &mut m,
-                Feed {
+                DraftFeed::Rows(Feed {
                     tokens: &[1],
                     pos0: 0,
                     hidden: Hidden::Host(&vec![0.0; hidden]),
                     media: None,
-                },
-                NextnHead::Full,
+                }),
+                DraftHead::Full,
                 WalkMode::Eager,
             ),
             "without the NextN layer",
