@@ -4865,7 +4865,7 @@ mod tests {
                     let got = Log::of(&line, set)
                         .one(kind)
                         .unwrap_or_else(|e| panic!("{}: {e}", kind.name));
-                    assert_eq!(got.values, want, "{}: {line}", kind.name);
+                    assert_eq!(got.values(), want.as_slice(), "{}: {line}", kind.name);
                     for (name, text) in &want {
                         let Some(Part::Key(f) | Part::Pos(f)) =
                             kind.parts.iter().find(|p| p.value_name() == Some(name))

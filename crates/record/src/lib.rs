@@ -885,10 +885,16 @@ pub struct Fields {
     kind: &'static Kind,
     at: usize,
     line: String,
-    pub values: Vec<(&'static str, String)>,
+    values: Vec<(&'static str, String)>,
 }
 
 impl Fields {
+    /// The parsed field names and values, in record order.
+    #[must_use]
+    pub fn values(&self) -> &[(&'static str, String)] {
+        &self.values
+    }
+
     #[must_use]
     pub fn kind(&self) -> &'static Kind {
         self.kind
