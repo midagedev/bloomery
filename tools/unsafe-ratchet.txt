@@ -418,7 +418,9 @@ gguf 7 2 0
 # PIN(2026-10-22): gpu 2115 -> 2118 blocks, a new kernel entry, not old code relaxed: raon_join_qkv (arch/raon1/wide.rs)
 # joins the wide unit's q, k and v rows into one token-major buffer, its source read and its one-writer store (2), and
 # the shared-slot load every module family makes (1). Each block has its SAFETY line.
-gpu 2118 247 10
+# PIN(2026-10-22): gpu 2118 -> 2119 blocks, a new kernel entry, not old code relaxed: raon_row_window
+# (arch/raon1/wide.rs) copies a column window of each of a wide unit's rows; its one-writer store has its SAFETY line.
+gpu 2119 247 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
