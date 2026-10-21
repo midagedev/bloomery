@@ -318,6 +318,9 @@ blk_seedtarget() { tool_selftest seed-target.sh; }
 # not run, and a mutant of each guard that does run it), the seed choice, the read-only seed, and the in-flight rule of
 # `retire`, on scratch git repos with stub seed-target and mac-disk, no cargo, no box.
 blk_wt() { tool_selftest wt.sh; }
+# mac-gate.sh runs the Metal gate on a Mac: the refusals (another host, a box card name, a macOS below the floor, no device), the
+# bound and the lock, on a stub gate binary, on any host.
+blk_macgate() { tool_selftest mac-gate.sh; }
 # check-bounded.sh: the scan reads the tree, its self-test reads fixtures (path composed, see blk_scancheck).
 blk_boundedscan() { local c=bounded; bash "$(dirname "$0")/check-$c.sh" > /dev/null && blk_scancheck "$c"; }
 # gate-bound.sh's own self-test: the owner's cancellation table on stub timeouts (no card, no lock).
@@ -1066,7 +1069,7 @@ proc_leg_gpu() {
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh seedtarget carry releasebuild pytools boxqcodes fixturevariants fixturedirs dsparkread
-  refsetpublish orphan archowner treecommit archivepipe fnowner wt boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
+  refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are
 # missing or empty is no proof (a scan of the justfile or crates/ passes on empty input). procleg is never skipped.
