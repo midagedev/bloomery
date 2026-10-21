@@ -1620,7 +1620,7 @@ impl<B: ChainBody> GpuModel<B> {
             Err(e) => e,
         };
         if let GpuError::Fault { fault, .. } = &mut e {
-            *fault = fault.in_arch(B::arch());
+            *fault = fault.in_order(crate::fault::step_order::of(B::arch()));
             self.poisoned = Some(SlotFault {
                 slots,
                 why: PoisonWhy::Fault(*fault),

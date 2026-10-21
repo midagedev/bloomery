@@ -26,760 +26,52 @@
 //! ([`crate::Gpu::clear_fault`]) when the state they condemned is gone: a
 //! model's `reset`, or a gate that has asserted them.
 //!
+//! The layout, the site codes, the decoding and the host model of a raise
+//! have one owner for every backend, `bloomery_device::fault`, which this
+//! module re-exports; a kernel reads its constants and [`mask_index`] from
+//! there too. What is the card's own stays here: the sink a kernel raises
+//! through, the quantizers' finite test, the reader of a `Gpu`'s allocation
+//! and the map from an architecture to its step order.
+//!
 //! A kernel gets the allocation as a [`FaultSink`] launch argument: its
 //! device address and the layer the launch belongs to, one by-value
 //! parameter. The site is the kernel's own constant. Only
 //! [`crate::Gpu::fault_sink`] makes a sink, from the allocation it owns, so a
 //! sink always addresses a live fault of that `Gpu`'s context.
 
+pub use bloomery_device::fault::*;
+
 use cuda_device::ptx_asm;
 
-/// The fault word's value while no fault has been raised.
-pub const FAULT_NONE: u32 = u32::MAX;
-
-/// The layer a launch outside every layer raises with: the output head.
-pub const LAYER_HEAD: u32 = 0xFFFE;
-
-/// The layer a launch raises with when its caller names none — a gate's
-/// direct launch, or an architecture whose chain does not label its
-/// quantizers.
-pub const LAYER_NONE: u32 = 0xFFFF;
-
-/// The fault allocation's length in u32s that carry meaning: the first-layer
-/// word, then one site mask for every layer up to [`LAYER_NONE`].
-pub const FAULT_WORDS: usize = 1 + LAYER_NONE as usize + 1;
-
-/// The word index of layer `layer`'s site mask in the fault allocation.
-#[inline(always)]
-#[must_use]
-pub const fn mask_index(layer: u32) -> usize {
-    1 + layer as usize
-}
-
-/// Where a fault was raised: the kernel family that refused its input. The
-/// codes are fixed — a gate pins the word they make.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum FaultSite {
-    /// The q8_1 activation quantizer (`q8_1_quant_vals`: `q3k_quantize_q8_1`
-    /// and every entry that runs its body) met a non-finite value.
-    QuantColumn = 1,
-    /// `norm_quant` normalized a column to a non-finite value, or to a zero
-    /// scale.
-    NormQuant = 2,
-    /// The 32-value q8 quantizer of the Q5 path met a non-finite value.
-    Q5Quant = 3,
-    /// `ds41_hc_pre`'s in-register q8_1 activation met a non-finite value.
-    HcQuant = 4,
-    /// A router met a non-finite logit, found fewer finite candidates than
-    /// slots, or produced a non-finite weight.
-    Router = 5,
-    /// A selected-attention list named a row past the compressed stream.
-    AttnSel = 6,
-    /// A grouped GEMM's route table met an expert id past its stack.
-    ExpertId = 7,
-    /// An attention launch was handed a visible count past the rows of its
-    /// key source: the window ring's, or the compressed stream's.
-    AttnCount = 8,
-    /// A token id that selects a table row — an embedding row, the DSpark
-    /// Markov head's previous token, a reduced head's listed row — lies past
-    /// the table's rows.
-    TokenId = 9,
-    /// A prefill flash row's live key count was zero or past the cache.
-    KeyCount = 10,
-    /// A cache append was handed a position at or past the cache's rows.
-    CachePos = 11,
-    /// A linear-attention conv and prep (`linear::conv`) met a non-finite
-    /// input, a conv sum, a query/key norm, β or decay not finite, or a
-    /// token position other than `pos[0] + t`.
-    LinearConv = 12,
-    /// A linear-attention delta step (`linear::delta`) produced a
-    /// non-finite output: a non-finite input, or a state that stopped being
-    /// finite.
-    LinearDelta = 13,
-    /// A linear-attention gated norm (`linear::norm_gate`) met a non-finite
-    /// input or a mean square that is not finite.
-    LinearGate = 14,
-    /// A linear-attention delta step (`linear::delta`) read a lane word at
-    /// or past the state's lanes.
-    DeltaLane = 15,
-    /// A cache append (`latent`, and the fused `kv_norm_rope_append`) stored a
-    /// value that is not finite: a non-finite input, a norm whose mean square
-    /// or variance is not finite, or a value past f16's range.
-    CacheValue = 16,
-    /// A token-pool selector (`qsa`; GLM's `latent::index_pool` and `kpool`)
-    /// met an indexer key that is not finite after its f16 rounding
-    /// (`q38::qsa_key_append`, the raw key), a pooled key or a head's score
-    /// that is not finite, its top-k a refused live count, or its selected
-    /// flash a list entry at or past the cache. A block selector (MiniMax's
-    /// `msa`) raises it for a head's score that is not finite, a selection
-    /// that lost the query's own block, and its selected flash for a block
-    /// at or past the cache.
-    PoolSelect = 18,
-    /// A PLE site's gate or conv (`ple`) met a key, stream, gated value or
-    /// conv input whose sum of squares, dot or value is not finite, or a
-    /// token position other than `pos[0] + t`.
-    Ple = 19,
-    /// A gated-residual hyper-connection (`hc_gated`) met a stream whose sum
-    /// of squares is not finite, or produced a partial dot, a bottleneck
-    /// value, a combine weight or a mixed value that is not finite.
-    HcMix = 20,
-    /// The shared RMSNorm sum of squares (`rms_norm`, and every norm that takes
-    /// its scale from `elem::rms_scale_checked` or
-    /// `elem::rms_scale_of_mean_checked`: the latent norm of the fused
-    /// `kv_norm_rope_append`, `rope_neox`'s head norms, V4.1's hyper-connection,
-    /// key and compressor norms) not finite, or a scale that is not finite and
-    /// positive; a value the fused `kv_norm_rope_append` wrote to `kv_s` that is
-    /// not finite; an f32 product kernel of Qwen3.8's layer (`q38`: the
-    /// attention output under its sigmoid gate, the shared expert's gated sum)
-    /// or Gemma4a's audio channel normalization, attention score or GLU met
-    /// non-finite arithmetic; a gate-up's gate or up dot sum was not finite
-    /// before its activation (including an NVFP4 expert's tensor scale).
-    F32Product = 21,
-    /// A head whose logits no quantizer checked before them (a Q8_0 lm_head
-    /// over f32 rows) met a logit that is not finite in its argmax.
-    Logit = 22,
-    /// A linear-attention delta step over lanes (`linear::delta`'s
-    /// `gdn_delta_lanes`) read a lane whose stamp is not the position its
-    /// first row stands at: a lane never written, or one a commit did not
-    /// leave there.
-    DeltaStamp = 23,
-    /// A two-level candidate selection (`cand`) met a visible count past its
-    /// score rows, a source or moved score that is not finite, a kept list
-    /// that is not strictly ascending or does not end at its pin, or a list
-    /// entry at or past the candidate rows.
-    CandMask = 26,
-    /// A q8_0 cache append (`rope_neox`'s quantizing entries) met a
-    /// non-finite key or value: the block is stored with a NaN scale, so
-    /// every value it dequantizes to is NaN.
-    KvQuant = 27,
-    /// A Mamba-2 decode step (`mamba2`) produced a `y` that is not finite: a
-    /// non-finite input, a state that stopped being finite, or a grouped
-    /// norm whose mean square is not finite.
-    Mamba2Scan = 28,
-}
-
-// A site is one bit of a u32 mask.
-const _: () = assert!((FaultSite::HcMix as u32) < 32);
-const _: () = assert!((FaultSite::F32Product as u32) < 32);
-const _: () = assert!((FaultSite::Logit as u32) < 32);
-const _: () = assert!((FaultSite::DeltaStamp as u32) < 32);
-const _: () = assert!((FaultSite::CandMask as u32) < 32);
-const _: () = assert!((FaultSite::KvQuant as u32) < 32);
-const _: () = assert!((FaultSite::Mamba2Scan as u32) < 32);
-// No site's code is 0, so a raise never stores word 0 with an empty mask:
-// that pair is a head readback's unwritten seed, which `Head::tokens` names
-// as a state error instead of decoding as a fault.
-const _: () = {
-    let mut i = 0;
-    while i < FaultSite::ALL.len() {
-        assert!(FaultSite::ALL[i] as u32 >= 1, "a FaultSite code is 0");
-        i += 1;
-    }
-};
-
-impl FaultSite {
-    /// Every site, in code order.
-    pub const ALL: &[FaultSite] = &[
-        FaultSite::QuantColumn,
-        FaultSite::NormQuant,
-        FaultSite::Q5Quant,
-        FaultSite::HcQuant,
-        FaultSite::Router,
-        FaultSite::AttnSel,
-        FaultSite::ExpertId,
-        FaultSite::AttnCount,
-        FaultSite::TokenId,
-        FaultSite::KeyCount,
-        FaultSite::CachePos,
-        FaultSite::LinearConv,
-        FaultSite::LinearDelta,
-        FaultSite::LinearGate,
-        FaultSite::DeltaLane,
-        FaultSite::CacheValue,
-        FaultSite::PoolSelect,
-        FaultSite::Ple,
-        FaultSite::HcMix,
-        FaultSite::F32Product,
-        FaultSite::Logit,
-        FaultSite::DeltaStamp,
-        FaultSite::CandMask,
-        FaultSite::KvQuant,
-        FaultSite::Mamba2Scan,
-    ];
-
-    /// The site's name as an error prints it.
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            FaultSite::QuantColumn => "quant_column",
-            FaultSite::NormQuant => "norm_quant",
-            FaultSite::Q5Quant => "q5_quant",
-            FaultSite::HcQuant => "hc_quant",
-            FaultSite::Router => "router",
-            FaultSite::AttnSel => "attn_sel",
-            FaultSite::ExpertId => "expert_id",
-            FaultSite::AttnCount => "attn_count",
-            FaultSite::TokenId => "token_id",
-            FaultSite::KeyCount => "key_count",
-            FaultSite::CachePos => "cache_pos",
-            FaultSite::LinearConv => "linear_conv",
-            FaultSite::LinearDelta => "linear_delta",
-            FaultSite::LinearGate => "linear_gate",
-            FaultSite::DeltaLane => "delta_lane",
-            FaultSite::CacheValue => "cache_value",
-            FaultSite::PoolSelect => "pool_select",
-            FaultSite::Ple => "ple",
-            FaultSite::HcMix => "hc_mix",
-            FaultSite::F32Product => "f32_product",
-            FaultSite::Logit => "logit",
-            FaultSite::DeltaStamp => "delta_stamp",
-            FaultSite::CandMask => "cand_mask",
-            FaultSite::KvQuant => "kv_quant",
-            FaultSite::Mamba2Scan => "mamba2_scan",
-        }
-    }
-
-    /// What the site refused, for the error's text.
-    #[must_use]
-    pub fn cause(self) -> &'static str {
-        match self {
-            FaultSite::QuantColumn
-            | FaultSite::NormQuant
-            | FaultSite::Q5Quant
-            | FaultSite::HcQuant => "non-finite activation",
-            FaultSite::Router => {
-                "a non-finite router logit, fewer finite candidates than slots, or a non-finite weight"
-            }
-            FaultSite::AttnSel => "a selected row past the compressed stream",
-            FaultSite::ExpertId => "a routed expert id past the stack's expert count",
-            FaultSite::AttnCount => "a visible key count past the rows of its source",
-            FaultSite::TokenId => "a token id past the table's rows",
-            FaultSite::KeyCount => "a flash row's live key count of zero or past the cache",
-            FaultSite::CachePos => "a cache append position at or past the cache's rows",
-            FaultSite::LinearConv => {
-                "a non-finite conv input, a conv sum, query/key norm, beta or decay not finite, \
-                 or a token position other than pos[0] + t"
-            }
-            FaultSite::LinearDelta => {
-                "a non-finite delta-step output: a non-finite input or a state no longer finite"
-            }
-            FaultSite::LinearGate => "a non-finite gated-norm input or mean square",
-            FaultSite::DeltaLane => "a delta-step lane word at or past the state's lanes",
-            FaultSite::CacheValue => {
-                "a cache row value not finite: a non-finite input, a non-finite mean square or \
-                 variance, or a value past f16's range"
-            }
-            FaultSite::PoolSelect => {
-                "a raw or pooled indexer key or a selector score not finite, or a selected token \
-                 past the cache"
-            }
-            FaultSite::Ple => {
-                "a PLE key, stream, gated value or conv input not finite (a value, its sum of \
-                 squares or the gate's dot), or a token position other than pos[0] + t"
-            }
-            FaultSite::HcMix => {
-                "a hyper-connection stream sum of squares, partial dot, bottleneck value, combine \
-                 weight or mixed value not finite"
-            }
-            FaultSite::F32Product => {
-                "an attention output, its gate, a shared expert output, its weight, the host sum, \
-                 an RMS sum of squares, audio channel variance, attention score or GLU input not finite, \
-                 or a product or sum that is not"
-            }
-            FaultSite::Logit => "a head logit not finite",
-            FaultSite::DeltaStamp => {
-                "a delta-step lane whose stamp is not the position of the call's first row: a lane \
-                 never written, or one a commit did not leave there"
-            }
-            FaultSite::CandMask => {
-                "a candidate count past its score rows, a source or moved score not finite, a kept \
-                 list not strictly ascending or not ending at its pin, or a list entry past the \
-                 candidate rows"
-            }
-            FaultSite::KvQuant => "a q8_0 cache row value not finite",
-            FaultSite::Mamba2Scan => {
-                "a Mamba-2 step output not finite: a non-finite input, a scan state no longer \
-                 finite, or a grouped norm whose mean square is not finite"
-            }
-        }
-    }
-}
-
-/// The order a layer's step meets the fault sites in, per architecture —
-/// the order a site mask prints in. Each table names every site exactly
-/// once, at its *first* occurrence on the decode path: a site a step meets
-/// twice (the norm and the q8_1 quantizer run before attention and again
-/// around the experts) stands where it is first met, and the sites an
-/// architecture never raises follow the ones it does, so no bit of a mask
-/// goes unprinted. The embedding's [`FaultSite::TokenId`] comes first: it is
-/// raised before any layer (as an unlabelled launch).
+/// The step orders a fault's mask prints in: the device side's tables, and
+/// the map from an architecture to its own.
 pub mod step_order {
-    use super::FaultSite;
-    use super::FaultSite::{
-        AttnCount, AttnSel, CachePos, CacheValue, CandMask, DeltaLane, DeltaStamp, ExpertId,
-        F32Product, HcMix, HcQuant, KeyCount, KvQuant, LinearConv, LinearDelta, LinearGate, Logit,
-        Mamba2Scan, NormQuant, Ple, PoolSelect, Q5Quant, QuantColumn, Router, TokenId,
-    };
+    pub use bloomery_device::fault::step_order::*;
 
-    /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
-    /// the layer's entry, the key path's cache append, the attention
-    /// output's q8_1 quantizer (in the flash launch or its own), the router,
-    /// the card's slot list and the routed `_sel` kernels, the down
-    /// projection's 32-value quantizer.
-    pub const DEEPSEEK2: &[FaultSite] = &[
-        TokenId,
-        NormQuant,
-        CachePos,
-        KvQuant,
-        QuantColumn,
-        Router,
-        ExpertId,
-        Q5Quant,
-        AttnCount,
-        AttnSel,
-        KeyCount,
-        HcQuant,
-        LinearConv,
-        LinearDelta,
-        LinearGate,
-        DeltaLane,
-        CacheValue,
-        PoolSelect,
-        Ple,
-        HcMix,
-        F32Product,
-        DeltaStamp,
-        Logit,
-        CandMask,
-        Mamba2Scan,
-    ];
-    /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
-    /// attention norm, the projections' quantizer, the attention's visible
-    /// counts and selected rows, then the MoE sub-layer's router and the
-    /// routed experts (the handoff's id check among them).
-    pub const DEEPSEEK41: &[FaultSite] = &[
-        TokenId,
-        HcQuant,
-        NormQuant,
-        QuantColumn,
-        CandMask,
-        AttnCount,
-        AttnSel,
-        Router,
-        ExpertId,
-        KeyCount,
-        Q5Quant,
-        CachePos,
-        KvQuant,
-        LinearConv,
-        LinearDelta,
-        LinearGate,
-        DeltaLane,
-        CacheValue,
-        PoolSelect,
-        Ple,
-        HcMix,
-        F32Product,
-        DeltaStamp,
-        Logit,
-        Mamba2Scan,
-    ];
-    /// Qwen3-MoE (`arch::qwen3moe`): the fused norm and quantizer at the
-    /// layer's entry, the cache append's position, the flash's key count,
-    /// the attention output's quantizer, the router's fused norm, the routed
-    /// experts. On the ubatch path the grouped GEMM's route (`ExpertId`) is
-    /// enqueued before the router's norm; the table follows the decode path.
-    pub const QWEN3MOE: &[FaultSite] = &[
-        TokenId,
-        NormQuant,
-        CachePos,
-        KvQuant,
-        KeyCount,
-        QuantColumn,
-        Router,
-        ExpertId,
-        AttnCount,
-        AttnSel,
-        Q5Quant,
-        HcQuant,
-        LinearConv,
-        LinearDelta,
-        LinearGate,
-        DeltaLane,
-        CacheValue,
-        PoolSelect,
-        Ple,
-        HcMix,
-        F32Product,
-        DeltaStamp,
-        Logit,
-        CandMask,
-        Mamba2Scan,
-    ];
+    use bloomery_device::fault::StepOrder;
 
-    /// Qwen3.6-35B-A3B and Qwen3.8-Flash-Next (`arch::qwen3moe`'s `Body35`
-    /// and `Body38`; both are `Arch::Qwen35moe`, so one order serves both).
-    /// Qwen3.6's two layer kinds read in their launch order: the fused norm
-    /// and quantizer at the layer's entry; an attention layer's cache append
-    /// and flash key count, or a delta layer's conv, delta step (its lane
-    /// word right after it) and gated norm; the output projection's
-    /// quantizer; then the router's fused norm and the routed experts.
-    /// Qwen3.8's sites stand beside them: its PLE site before its layer's
-    /// mix, its gated-residual mix before the rest of the layer, its f32
-    /// products before the output projection's quantizer. That is not every
-    /// Qwen3.8 layer's launch order; among the differences, a delta layer's
-    /// first [`F32Product`] is the shared expert's sum, raised after
-    /// [`Router`] and [`ExpertId`], and a selecting layer raises
-    /// [`PoolSelect`] (its raw key append first) before its out gate's
-    /// [`F32Product`]. The mask names every site raised either way; only the
-    /// order it prints them in differs.
-    /// A q8_0 head's logits read after every layer's sites.
-    pub const QWEN35MOE: &[FaultSite] = &[
-        TokenId,
-        Ple,
-        HcMix,
-        NormQuant,
-        CachePos,
-        KvQuant,
-        KeyCount,
-        LinearConv,
-        LinearDelta,
-        DeltaLane,
-        DeltaStamp,
-        LinearGate,
-        F32Product,
-        QuantColumn,
-        Router,
-        ExpertId,
-        Logit,
-        AttnCount,
-        AttnSel,
-        Q5Quant,
-        HcQuant,
-        PoolSelect,
-        CacheValue,
-        CandMask,
-        Mamba2Scan,
-    ];
-
-    /// GLM-5.3-Flash (`gpu-glm5next`): a KDA layer's conv, delta step (its
-    /// lane word right after it) and gated norm; a latent layer's two cache
-    /// appends and its attention's visible count; then the router and the
-    /// handoff's id check; the q8_0 head's logits last. The token id is checked on the host before the
-    /// step (the embedding is a host row), and the hyper-connection and
-    /// projection launches read f32 rows with nothing to raise; those sites
-    /// follow the ones the step raises.
-    pub const GLM5NEXT: &[FaultSite] = &[
-        TokenId,
-        LinearConv,
-        LinearDelta,
-        DeltaLane,
-        LinearGate,
-        CachePos,
-        CacheValue,
-        KvQuant,
-        AttnCount,
-        Router,
-        ExpertId,
-        Logit,
-        HcQuant,
-        NormQuant,
-        QuantColumn,
-        AttnSel,
-        KeyCount,
-        Q5Quant,
-        PoolSelect,
-        Ple,
-        HcMix,
-        F32Product,
-        DeltaStamp,
-        CandMask,
-        Mamba2Scan,
-    ];
-
-    /// No program runs `nemotron_h`. The order is [`MIMO2`]'s so a fault word
-    /// still decodes; it is not a step this architecture runs.
-    pub const NEMOTRON_H: &[FaultSite] = MIMO2;
-
-    /// The Gemma encoders have no step order of their own. The order is
-    /// [`MIMO2`]'s so a fault word still decodes; it is not the order the
-    /// `gemma-embedding2` encoder's pass raises its sites in.
-    pub const GEMMA_ENCODER: &[FaultSite] = MIMO2;
-
-    /// No program runs `nemotron_h_moe`. The order is [`MIMO2`]'s so a fault
-    /// word still decodes; it is not a step this architecture runs.
-    pub const NEMOTRON_H_MOE: &[FaultSite] = MIMO2;
-
-    /// MiMo-V2.6-Flash (`gpu-mimo2`): the token id checked on the host before
-    /// the step; a layer's cache append (position) and its flash (visible
-    /// key count); the router and the handoff's id check; the q8_0 head's
-    /// logits last. The projections and the norms read f32 rows with
-    /// nothing to raise; those sites follow the ones the step raises.
-    pub const MIMO2: &[FaultSite] = &[
-        TokenId,
-        CachePos,
-        KeyCount,
-        Router,
-        ExpertId,
-        Logit,
-        QuantColumn,
-        NormQuant,
-        Q5Quant,
-        HcQuant,
-        AttnSel,
-        AttnCount,
-        LinearConv,
-        LinearDelta,
-        LinearGate,
-        DeltaLane,
-        CacheValue,
-        PoolSelect,
-        Ple,
-        HcMix,
-        F32Product,
-        DeltaStamp,
-        CandMask,
-        KvQuant,
-        Mamba2Scan,
-    ];
-
-    /// MiniMax-M3 (`gpu-minimaxm3`): the token id checked on the host before the step; a layer's cache append
-    /// (position), the sparse layers' block pick (the selector's counts and the ids it keeps) and the flash's
-    /// visible key count; the router and the handoff's id check; the q8_0 head's logits last. The projections and
-    /// the norms read f32 rows with nothing to raise; the sites the step never raises follow in [`MIMO2`]'s order.
-    pub const MINIMAXM3: &[FaultSite] = &[
-        TokenId,
-        CachePos,
-        PoolSelect,
-        KeyCount,
-        Router,
-        ExpertId,
-        Logit,
-        QuantColumn,
-        NormQuant,
-        Q5Quant,
-        HcQuant,
-        AttnSel,
-        AttnCount,
-        LinearConv,
-        LinearDelta,
-        LinearGate,
-        DeltaLane,
-        CacheValue,
-        Ple,
-        HcMix,
-        F32Product,
-        DeltaStamp,
-        CandMask,
-        KvQuant,
-        Mamba2Scan,
-    ];
-
-    /// Solar-Open2 (`gpu-solar2`): the token id checked on the host before
-    /// the step; a layer's norm and the q8_1 quantizer of its normed row, the
-    /// Q5_0 halves' 32-value quantizer, a KDA layer's conv, delta step (its
-    /// lane word and stamp right after it) and gated norm, a GQA layer's
-    /// cache append (position), flash (visible key count) and out gate's
-    /// product (the norm's [`F32Product`] already stands first); then the
-    /// router and the handoff's id check, and the head's logits last. The
-    /// order of the sites the step raises is the order a KDA layer's launches
-    /// meet them, then the sites only a GQA layer meets; the sites the step
-    /// never raises follow. Raon-1 (`arch::raon1`) runs the same order: an RDA
-    /// layer launches a KDA layer's sites, and a latent layer's cache append
-    /// and visible count stand where a GQA layer's do.
-    pub const SOLAR2: &[FaultSite] = &[
-        TokenId,
-        F32Product,
-        QuantColumn,
-        Q5Quant,
-        LinearConv,
-        LinearDelta,
-        DeltaLane,
-        DeltaStamp,
-        LinearGate,
-        CachePos,
-        KeyCount,
-        Router,
-        ExpertId,
-        Logit,
-        NormQuant,
-        HcQuant,
-        AttnCount,
-        AttnSel,
-        CacheValue,
-        KvQuant,
-        PoolSelect,
-        Ple,
-        HcMix,
-        CandMask,
-        Mamba2Scan,
-    ];
-
-    /// The order of `arch`'s step.
+    /// The order of `arch`'s step, named as the architecture's `Debug` form.
     #[must_use]
-    pub fn of(arch: model::arch::Arch) -> &'static [FaultSite] {
-        match arch {
-            model::arch::Arch::Deepseek2 => DEEPSEEK2,
-            model::arch::Arch::Deepseek41 => DEEPSEEK41,
-            model::arch::Arch::Qwen3moe => QWEN3MOE,
-            model::arch::Arch::Qwen35moe => QWEN35MOE,
-            model::arch::Arch::Glm5next => GLM5NEXT,
-            model::arch::Arch::Mimo2 => MIMO2,
-            model::arch::Arch::SolarOpen2 | model::arch::Arch::Raon1 => SOLAR2,
-            model::arch::Arch::MiniMaxM3 => MINIMAXM3,
+    pub fn of(arch: model::arch::Arch) -> StepOrder {
+        use model::arch::Arch;
+        let (name, sites) = match arch {
+            Arch::Deepseek2 => ("Deepseek2", DEEPSEEK2),
+            Arch::Deepseek41 => ("Deepseek41", DEEPSEEK41),
+            Arch::Qwen3moe => ("Qwen3moe", QWEN3MOE),
+            Arch::Qwen35moe => ("Qwen35moe", QWEN35MOE),
+            Arch::Glm5next => ("Glm5next", GLM5NEXT),
+            Arch::Mimo2 => ("Mimo2", MIMO2),
+            Arch::SolarOpen2 => ("SolarOpen2", SOLAR2),
+            Arch::Raon1 => ("Raon1", SOLAR2),
+            Arch::MiniMaxM3 => ("MiniMaxM3", MINIMAXM3),
             // No program runs nemotron_h. The listing is MiMo's so a fault
             // word still decodes; it is not a step this architecture runs.
-            model::arch::Arch::NemotronH => NEMOTRON_H,
-            model::arch::Arch::NemotronHMoe => NEMOTRON_H_MOE,
-            model::arch::Arch::GemmaEmbedding | model::arch::Arch::GemmaEmbedding2 => GEMMA_ENCODER,
-        }
-    }
-}
-
-/// A raised fault, decoded from the pair the card holds: the first layer a
-/// launch raised in, the smallest site code raised there, and the mask of
-/// every site raised there (`1 << code` per site). A code that is no
-/// [`FaultSite`] is kept as it came, so a corrupt word still reads as a
-/// fault rather than as clean. Equality is on those three; the step order a
-/// fault prints its mask in ([`Fault::in_arch`]) is presentation.
-#[derive(Clone, Copy, Debug)]
-pub struct Fault {
-    /// The raising launch's layer: a model layer, [`LAYER_HEAD`] or
-    /// [`LAYER_NONE`].
-    pub layer: u32,
-    /// The raw site code (`FaultSite as u32` for every known site): the
-    /// smallest raised in `layer`.
-    pub code: u32,
-    /// Every site raised in `layer`, bit `code` per site.
-    pub sites: u32,
-    /// The architecture whose step order the mask prints in, once a model
-    /// has named it.
-    arch: Option<model::arch::Arch>,
-}
-
-impl PartialEq for Fault {
-    fn eq(&self, other: &Fault) -> bool {
-        (self.layer, self.code, self.sites) == (other.layer, other.code, other.sites)
-    }
-}
-
-impl Eq for Fault {}
-
-impl Fault {
-    /// The fault a first-layer word and that layer's mask hold, `None` for
-    /// [`FAULT_NONE`].
-    #[must_use]
-    pub fn from_words(word: u32, sites: u32) -> Option<Fault> {
-        (word != FAULT_NONE).then_some(Fault {
-            layer: word >> 8,
-            code: word & 0xFF,
-            sites,
-            arch: None,
-        })
-    }
-
-    /// The fault of `site` raised alone in `layer`: what a gate that plants
-    /// one fault expects.
-    #[must_use]
-    pub fn at(layer: u32, site: FaultSite) -> Fault {
-        Fault::of_sites(layer, &[site])
-    }
-
-    /// The fault of every site in `sites` raised in `layer` and nowhere
-    /// earlier. An empty list is no fault a card can hold; it reads as code
-    /// 0 with an empty mask.
-    #[must_use]
-    pub fn of_sites(layer: u32, sites: &[FaultSite]) -> Fault {
-        Fault {
-            layer,
-            code: sites.iter().map(|s| *s as u32).min().unwrap_or(0),
-            sites: sites.iter().fold(0, |m, s| m | (1 << *s as u32)),
-            arch: None,
-        }
-    }
-
-    /// The first-layer word this fault is stored as.
-    #[must_use]
-    pub fn word(self) -> u32 {
-        (self.layer << 8) | self.code
-    }
-
-    /// This fault, printing its mask in `arch`'s step order.
-    #[must_use]
-    pub fn in_arch(self, arch: model::arch::Arch) -> Fault {
-        Fault {
-            arch: Some(arch),
-            ..self
-        }
-    }
-
-    /// The site, when the code is a known one.
-    #[must_use]
-    pub fn site(self) -> Option<FaultSite> {
-        FaultSite::ALL
-            .iter()
-            .copied()
-            .find(|s| *s as u32 == self.code)
-    }
-
-    /// The mask's sites in `order`, then any bit `order` does not name, as
-    /// its raw code: nothing the card raised is left out.
-    #[must_use]
-    pub fn sites_in(self, order: &[FaultSite]) -> Vec<Result<FaultSite, u32>> {
-        let mut out: Vec<Result<FaultSite, u32>> = order
-            .iter()
-            .filter(|s| self.sites & (1 << **s as u32) != 0)
-            .map(|s| Ok(*s))
-            .collect();
-        for bit in 0..32 {
-            if self.sites & (1 << bit) != 0 && !order.iter().any(|s| *s as u32 == bit) {
-                out.push(Err(bit));
-            }
-        }
-        out
-    }
-}
-
-/// Where the fault was raised, its site's name and the mask in step order.
-/// The alternate form (`{:#}`) adds the site's [`FaultSite::cause`] after its
-/// name: an error's text carries it once ([`crate::GpuError::Fault`]), while a
-/// gate line that prints a fault beside the one it wants reads the two
-/// without it.
-impl std::fmt::Display for Fault {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let where_ = match self.layer {
-            LAYER_HEAD => "the output head".to_string(),
-            LAYER_NONE => "an unlabelled launch".to_string(),
-            l => format!("layer {l}"),
+            Arch::NemotronH => ("NemotronH", NEMOTRON_H),
+            Arch::NemotronHMoe => ("NemotronHMoe", NEMOTRON_H_MOE),
+            Arch::GemmaEmbedding => ("GemmaEmbedding", GEMMA_ENCODER),
+            Arch::GemmaEmbedding2 => ("GemmaEmbedding2", GEMMA_ENCODER),
         };
-        write!(f, "{where_}")?;
-        match self.site() {
-            Some(s) if f.alternate() => write!(f, " site {} ({})", s.name(), s.cause())?,
-            Some(s) => write!(f, " site {}", s.name())?,
-            None => write!(f, " site code {} (unknown)", self.code)?,
-        }
-        let (order, named) = match self.arch {
-            Some(a) => (step_order::of(a), format!("{a:?} step order")),
-            None => (
-                FaultSite::ALL,
-                "architecture unknown, so in code order, not step order".to_string(),
-            ),
-        };
-        let names: Vec<String> = self
-            .sites_in(order)
-            .into_iter()
-            .map(|s| match s {
-                Ok(s) => s.name().to_string(),
-                Err(code) => format!("code {code}"),
-            })
-            .collect();
-        write!(f, "; sites raised in {where_} ({named}): ")?;
-        if names.is_empty() {
-            write!(f, "none recorded (mask 0)")
-        } else {
-            write!(f, "{}", names.join(", "))
-        }
+        StepOrder { arch: name, sites }
     }
 }
 
@@ -883,19 +175,20 @@ pub fn quad_finite(v: [f32; 4]) -> bool {
 /// What the fault `word` (a `Gpu`'s fault allocation, [`FAULT_WORDS`] u32s or
 /// more) holds now: the first-layer word and that layer's site mask, each read
 /// by a synchronous copy that waits on no stream of the engine (they are all
-/// non-blocking). The one reader of the word: the caller orders it — the
-/// engine's reader synchronizes its stream first ([`crate::Gpu::fault`]), a
-/// batch service runs after the event its handoffs came down at, so every
+/// non-blocking), and decoded by the device side's one rule
+/// ([`Fault::read_from`]). The one reader of the word: the caller orders it —
+/// the engine's reader synchronizes its stream first ([`crate::Gpu::fault`]),
+/// a batch service runs after the event its handoffs came down at, so every
 /// kernel that wrote them has finished.
 pub fn read(word: &cuda_core::DeviceBuffer<u32>) -> Result<Option<Fault>, crate::GpuError> {
     use cuda_core::sys;
     word.context().bind_to_thread()?;
-    let at = |i: usize| -> Result<u32, crate::GpuError> {
+    Fault::read_from(|i: usize| -> Result<u32, crate::GpuError> {
         let mut v = FAULT_NONE;
-        // SAFETY: word `i` lies inside the allocation (`i` is 0 or a mask
-        // index of a layer at most LAYER_NONE, below FAULT_WORDS, which every
-        // holder of the word checked its length against —
-        // `module_fault_word` and the `Gpu`'s own allocation); the
+        // SAFETY: word `i` lies inside the allocation (`read_from` asks for
+        // word 0 or the mask index of a layer at most LAYER_NONE, below
+        // FAULT_WORDS, which every holder of the word checked its length
+        // against — `module_fault_word` and the `Gpu`'s own allocation); the
         // destination is `v`, four bytes that outlive the synchronous copy;
         // the context is current on this thread (bound above).
         let rc = unsafe {
@@ -907,64 +200,13 @@ pub fn read(word: &cuda_core::DeviceBuffer<u32>) -> Result<Option<Fault>, crate:
         };
         crate::graph::cu(rc, "cuMemcpyDtoH_v2 (fault word)")?;
         Ok(v)
-    };
-    let first = at(0)?;
-    if first == FAULT_NONE {
-        return Ok(None);
-    }
-    let sites = if first >> 8 <= LAYER_NONE {
-        at(mask_index(first >> 8))?
-    } else {
-        0
-    };
-    Ok(Fault::from_words(first, sites))
-}
-
-/// The fault of several cards' words as read, for a step that ran on more
-/// than one: the first layer wins — the smallest first-layer word — and a
-/// layer two cards both raised in keeps the smaller code and both masks.
-/// `None` when every card is clean.
-#[must_use]
-pub fn read_cards(cards: &[Option<Fault>]) -> Option<Fault> {
-    cards
-        .iter()
-        .flatten()
-        .copied()
-        .fold(None, |acc, f| match acc {
-            None => Some(f),
-            Some(a) if a.layer == f.layer => Some(Fault {
-                code: a.code.min(f.code),
-                sites: a.sites | f.sites,
-                ..a
-            }),
-            Some(a) if f.word() < a.word() => Some(f),
-            Some(a) => Some(a),
-        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use model::arch::Arch;
-
-    /// Of two cards' faults the first layer wins; one layer raised on both
-    /// keeps the smaller code and both masks; clean cards read clean.
-    #[test]
-    fn read_cards_takes_the_first_layer() {
-        let a = Fault::at(9, FaultSite::QuantColumn);
-        let b = Fault::at(4, FaultSite::ExpertId);
-        assert_eq!(read_cards(&[Some(a), Some(b)]), Some(b));
-        assert_eq!(read_cards(&[Some(b), None, Some(a)]), Some(b));
-        assert_eq!(read_cards(&[None, None]), None);
-        let c = Fault::at(4, FaultSite::QuantColumn);
-        assert_eq!(
-            read_cards(&[Some(b), Some(c)]),
-            Some(Fault::of_sites(
-                4,
-                &[FaultSite::ExpertId, FaultSite::QuantColumn]
-            ))
-        );
-    }
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`step_order::of`] gives it a table).
@@ -1007,7 +249,7 @@ mod tests {
     #[test]
     fn every_step_order_names_every_site_exactly_once() {
         for arch in every_arch() {
-            let order = step_order::of(arch);
+            let order = step_order::of(arch).sites;
             assert_eq!(
                 order.len(),
                 FaultSite::ALL.len(),
@@ -1022,13 +264,21 @@ mod tests {
         }
     }
 
+    /// A fault's print names the architecture as its `Debug` form does.
+    #[test]
+    fn every_step_order_is_named_as_its_architecture() {
+        for arch in every_arch() {
+            assert_eq!(step_order::of(arch).arch, format!("{arch:?}"));
+        }
+    }
+
     /// MiMo-V2.6-Flash's order opens with the six sites its step raises, in
     /// the order its launches meet them: the host's token check, the append's
     /// position, the flash's key count, the router, the handoff, the head.
     #[test]
     fn the_mimo2_order_leads_with_the_sites_its_step_raises() {
         assert_eq!(
-            step_order::of(Arch::Mimo2)[..6],
+            step_order::of(Arch::Mimo2).sites[..6],
             [
                 FaultSite::TokenId,
                 FaultSite::CachePos,
@@ -1048,7 +298,7 @@ mod tests {
     #[test]
     fn the_solar2_order_leads_with_the_sites_its_step_raises() {
         assert_eq!(
-            step_order::of(Arch::SolarOpen2)[..14],
+            step_order::of(Arch::SolarOpen2).sites[..14],
             [
                 FaultSite::TokenId,
                 FaultSite::F32Product,
@@ -1079,25 +329,17 @@ mod tests {
             unknown.contains("code order") && unknown.contains("quant_column, key_count"),
             "{unknown}"
         );
-        let qwen = f.in_arch(Arch::Qwen3moe);
+        let qwen = f.in_order(step_order::of(Arch::Qwen3moe));
         assert_eq!(qwen, f, "the step order is not part of equality");
         let shown = qwen.to_string();
-        assert!(shown.contains("key_count, quant_column"), "{shown}");
+        assert!(
+            shown.contains("Qwen3moe step order") && shown.contains("key_count, quant_column"),
+            "{shown}"
+        );
         // A mask bit past every site prints as its code: the bit after the highest site's.
         let past = FaultSite::ALL.iter().map(|&s| s as u32).max().unwrap_or(0) + 1;
         let odd = Fault::from_words((3 << 8) | 1, (1 << 1) | (1 << past)).unwrap();
         assert!(odd.to_string().contains(&format!("code {past}")), "{odd}");
-    }
-
-    /// The (0, 0) pair no raise can store still decodes — every site's code
-    /// is 1 or more, and a raise ORs its bit into the mask — into a code no
-    /// site names: why `Head::tokens` refuses that pair as an unwritten
-    /// readback before it decodes one.
-    #[test]
-    fn the_zero_pair_decodes_to_a_code_no_site_names() {
-        let phantom = Fault::from_words(0, 0).unwrap();
-        assert_eq!((phantom.layer, phantom.code, phantom.sites), (0, 0, 0));
-        assert_eq!(phantom.site(), None);
     }
 
     #[test]

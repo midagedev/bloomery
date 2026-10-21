@@ -17,6 +17,8 @@ cuda-core.workspace = true
 # metadata readers and `Derived` are reused, and model never learns about gpu.
 bloomery-model = { path = "../model" }
 bloomery-gguf = { path = "../gguf" }
+# The device contract: the fault table every backend shares, and the `Device` this crate implements (`device`).
+bloomery-device = { path = "../device" }
 # The typed host-tier settings a binary's one lever reading makes (`HostCfg`).
 bloomery-levers = { path = "../levers" }
 # Host only: Qwen3.8's PLE rows are the n-gram hash's (`engram::Hash::ple_rows_into`).
