@@ -78,10 +78,28 @@ pub(crate) fn role_in(
     role_by_layer(name, n_layer, |_| groups.iter().copied())
 }
 
-/// The role and layer of `name` in a family whose layers from `n_trunk` to `n_layer` are
-/// next-token layers: a trunk layer's stem takes the role of the `trunk` group that holds it, and
-/// a next-token layer's stem, whether the trunk's or one of `nextn`, is [`Role::Unused`]
-/// (carried, never loaded). `None` for any other name.
+/// The role and layer of a `blk.{layer}.{stem}` name in a family whose layers from `n_trunk` to
+/// `n_layer` are next-token layers: a trunk layer's stem takes the role `trunk_role` gives it, and
+/// a next-token layer's stem, whether the trunk's or one of its own (`is_nextn`), is
+/// [`Role::Unused`] (carried, never loaded). `None` for any other name.
+pub(crate) fn block_role_with_nextn(
+    name: &str,
+    n_layer: usize,
+    n_trunk: usize,
+    trunk_role: impl Fn(&str) -> Option<Role>,
+    is_nextn: impl Fn(&str) -> bool,
+) -> Option<(Role, Option<usize>)> {
+    let (layer, stem) = block_stem(name, n_layer)?;
+    let role = trunk_role(stem);
+    if layer < n_trunk {
+        return role.map(|r| (r, Some(layer)));
+    }
+    (role.is_some() || is_nextn(stem)).then_some((Role::Unused, Some(layer)))
+}
+
+/// The role and layer of `name` in a family whose trunk stems sit in the `trunk` groups and whose
+/// next-token layers carry the stems `nextn` besides: the model-level three, else
+/// [`block_role_with_nextn`] over the tables.
 pub(crate) fn role_with_nextn(
     name: &str,
     n_layer: usize,
@@ -89,20 +107,21 @@ pub(crate) fn role_with_nextn(
     trunk: &[&[Stem]],
     nextn: &[Stem],
 ) -> Option<(Role, Option<usize>)> {
-    if let Some(model_level) = model_level_role(name) {
-        return Some(model_level);
-    }
-    let (layer, stem) = block_stem(name, n_layer)?;
-    let trunk_role = trunk
-        .iter()
-        .flat_map(|g| g.iter())
-        .find(|s| s.name == stem)
-        .map(|s| s.role);
-    if layer < n_trunk {
-        return trunk_role.map(|r| (r, Some(layer)));
-    }
-    (trunk_role.is_some() || nextn.iter().any(|s| s.name == stem))
-        .then_some((Role::Unused, Some(layer)))
+    model_level_role(name).or_else(|| {
+        block_role_with_nextn(
+            name,
+            n_layer,
+            n_trunk,
+            |stem| {
+                trunk
+                    .iter()
+                    .flat_map(|g| g.iter())
+                    .find(|s| s.name == stem)
+                    .map(|s| s.role)
+            },
+            |stem| nextn.iter().any(|s| s.name == stem),
+        )
+    })
 }
 
 /// The role of a format's tensor scale, `<stem>.scale` beside a `<stem>.weight`

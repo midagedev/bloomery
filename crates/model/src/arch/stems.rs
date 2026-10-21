@@ -1,8 +1,9 @@
 //! The role tables' row, shared by the families whose tables name their
 //! tensors by stem, and the blocks of rows every such family spells alike
-//! ([`DENSE`], [`HC`]). A family's own table holds the rows its architecture
-//! alone carries, in its `roles` — the GGUF names are its architecture's
-//! strings — and the walk over them is [`classify`](crate::arch::classify)'s.
+//! ([`DENSE`], [`MOE`], [`HC`]). A family's own table holds the rows its
+//! architecture alone carries, in its `roles` — the GGUF names are its
+//! architecture's strings — and the walk over them is
+//! [`classify`](crate::arch::classify)'s.
 
 use crate::placement::Role;
 
@@ -67,11 +68,31 @@ pub const HC: &[Stem] = &[
     req("hc_ffn_scale.weight", Role::HyperConnection),
 ];
 
+/// A dense layer's gate and down stems, which a placement reads to size the forms of the
+/// feed-forward block ([`DENSE`]).
+pub const DENSE_GATE: &str = "ffn_gate.weight";
+pub const DENSE_DOWN: &str = "ffn_down.weight";
+
 /// A dense layer's feed-forward block: the pre-FFN norm, the gate and up projections of the GLU
 /// and the down projection.
 pub const DENSE: &[Stem] = &[
     req("ffn_norm.weight", Role::FfnNorm),
-    req("ffn_gate.weight", Role::DenseFfn),
+    req(DENSE_GATE, Role::DenseFfn),
     req("ffn_up.weight", Role::DenseFfn),
-    req("ffn_down.weight", Role::DenseFfn),
+    req(DENSE_DOWN, Role::DenseFfn),
+];
+
+/// The router's selection bias, which the graph adds for the selection only and the loader reads
+/// when the file carries it.
+pub const SELECTION_BIAS: &str = "exp_probs_b.bias";
+
+/// A routed layer's feed-forward block: the pre-FFN norm, the router with its optional selection
+/// bias, and the routed stacks.
+pub const MOE: &[Stem] = &[
+    req("ffn_norm.weight", Role::FfnNorm),
+    req("ffn_gate_inp.weight", Role::Router),
+    opt(SELECTION_BIAS, Role::Router),
+    req("ffn_gate_exps.weight", Role::RoutedExperts),
+    req("ffn_up_exps.weight", Role::RoutedExperts),
+    req("ffn_down_exps.weight", Role::RoutedExperts),
 ];

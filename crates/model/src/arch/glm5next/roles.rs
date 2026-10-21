@@ -9,12 +9,13 @@
 use gguf::Split;
 
 use super::hparams::Hparams;
-use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role, role_in};
+use crate::arch::classify::{Counts, classify_with, role_in, role_with_nextn};
 use crate::arch::kda;
 use crate::arch::stems::{opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
-pub use crate::arch::stems::{Stem, required};
+pub use crate::arch::stems::{DENSE, MOE, SELECTION_BIAS, Stem, required};
+pub(super) use crate::arch::stems::{DENSE_DOWN, DENSE_GATE};
 
 /// The KDA mixer's stems: the common [`kda`] module's table, which every
 /// family with a KDA layer reads.
@@ -40,33 +41,6 @@ pub const LATENT: &[Stem] = &[
     req("indexer.proj.weight", Role::Attention),
     req("indexer_compressor_gate.weight", Role::Attention),
     req("indexer_compressor_ape.weight", Role::Attention),
-];
-
-/// A dense layer's gate and down stems, which the front's forms read ([`DENSE`]).
-pub(super) const DENSE_GATE: &str = "ffn_gate.weight";
-pub(super) const DENSE_DOWN: &str = "ffn_down.weight";
-
-/// A dense layer's feed-forward block.
-pub const DENSE: &[Stem] = &[
-    req("ffn_norm.weight", Role::FfnNorm),
-    req(DENSE_GATE, Role::DenseFfn),
-    req("ffn_up.weight", Role::DenseFfn),
-    req(DENSE_DOWN, Role::DenseFfn),
-];
-
-/// The router's selection bias, which ik loads when present: the spec's
-/// `Router::bias` is its presence.
-pub const SELECTION_BIAS: &str = "exp_probs_b.bias";
-
-/// A routed layer's feed-forward block: the router with its selection bias,
-/// and the routed stacks.
-pub const MOE: &[Stem] = &[
-    req("ffn_norm.weight", Role::FfnNorm),
-    req("ffn_gate_inp.weight", Role::Router),
-    opt(SELECTION_BIAS, Role::Router),
-    req("ffn_gate_exps.weight", Role::RoutedExperts),
-    req("ffn_up_exps.weight", Role::RoutedExperts),
-    req("ffn_down_exps.weight", Role::RoutedExperts),
 ];
 
 /// A routed layer's shared expert, when the file has one.
@@ -106,7 +80,7 @@ pub fn nextn_role(stem: &str) -> Option<Role> {
     if stem == "nextn.shared_head_norm.weight" {
         return Some(Role::Head);
     }
-    if nextn_stem(stem) {
+    if NEXTN.iter().any(|s| s.name == stem) {
         return Some(Role::Attention);
     }
     NEXTN_BLOCK
@@ -123,36 +97,12 @@ pub fn tensor_role(name: &str) -> Option<Role> {
     role_in(&TRUNK, name, usize::MAX).map(|(role, _)| role)
 }
 
-/// A next-token layer's own stems, beside the trunk's.
-fn nextn_stem(stem: &str) -> bool {
-    NEXTN.iter().any(|s| s.name == stem)
-}
-
-/// A tensor's role and layer by its name; `None` when the table does not
-/// hold it, its layer is past the file's, or a trunk layer carries a
-/// next-token stem.
-fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
-    if let Some(model_level) = model_level_role(name) {
-        return Some(model_level);
-    }
-    let (layer, stem) = block_stem(name, hp.n_layer)?;
-    if layer >= hp.n_trunk {
-        return (tensor_role(name).is_some() || nextn_stem(stem))
-            .then_some((Role::Unused, Some(layer)));
-    }
-    tensor_role(name).map(|r| (r, Some(layer)))
-}
-
 /// Every tensor of `split` with its role and header facts.
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
     classify_with(
         split,
-        |name| role(name, hp),
-        Counts {
-            layers: hp.n_trunk,
-            experts: hp.n_expert as u64,
-            experts_used: hp.n_used as u64,
-        },
+        |name| role_with_nextn(name, hp.n_layer, hp.n_trunk, &TRUNK, NEXTN),
+        Counts::new(hp.n_trunk, hp.n_expert, hp.n_used),
     )
 }
 

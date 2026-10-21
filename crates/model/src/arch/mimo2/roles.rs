@@ -38,23 +38,9 @@ pub(super) const QKV_SPLIT: &[Stem] = &[
     req("attn_v.weight", Role::Attention),
 ];
 
-/// A dense layer's feed-forward block, the common table's.
-pub(super) use crate::arch::stems::DENSE;
-
-/// A routed layer's feed-forward block: the router with its selection bias,
-/// which the graph adds for the selection only, and the routed stacks.
-pub(super) const MOE: &[Stem] = &[
-    req("ffn_norm.weight", Role::FfnNorm),
-    req("ffn_gate_inp.weight", Role::Router),
-    opt(SELECTION_BIAS, Role::Router),
-    req("ffn_gate_exps.weight", Role::RoutedExperts),
-    req("ffn_up_exps.weight", Role::RoutedExperts),
-    req("ffn_down_exps.weight", Role::RoutedExperts),
-];
-
-/// The router's selection bias (`ffn_exp_probs_b`), which the file carries
-/// per layer (mimo2.cpp:72) and the graph keeps out of the weights.
-pub(super) const SELECTION_BIAS: &str = "exp_probs_b.bias";
+/// A dense layer's feed-forward block and a routed layer's, the common tables'. The router's
+/// selection bias is carried per layer (mimo2.cpp:72) and the graph keeps it out of the weights.
+pub(super) use crate::arch::stems::{DENSE, MOE, SELECTION_BIAS};
 
 /// A next-token layer's own stems beside the trunk's: the input projection of
 /// the two norms, the two norms, and the head's own norm and matrices some
