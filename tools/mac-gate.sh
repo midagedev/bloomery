@@ -229,6 +229,8 @@ while rc is None and not signalled and time.monotonic() < limit:
         time.sleep(0.05)
 
 if rc is not None:
+    # The leader is gone; a child it left behind must not outlive the lock.
+    stop_group(signal.SIGKILL)
     sys.exit(rc if rc >= 0 else 128 - rc)
 
 # The bound passed or the runner was signalled: end the gate's whole group.
@@ -241,6 +243,7 @@ if proc.poll() is None:
     stop_group(signal.SIGKILL)
     proc.wait()
     sys.exit(137)
+stop_group(signal.SIGKILL)
 sys.exit(cause)
 PY
 }
@@ -301,7 +304,10 @@ self_test() {
   printf '#!/usr/bin/env bash\ntrap "" TERM\nwhile :; do sleep 1; done\n' >"$dir/stubborn"
   # shellcheck disable=SC2016 # the stub's own $$, not this shell's
   printf '#!/usr/bin/env bash\necho $$ >"$1"\nsleep 30\n' >"$dir/pidhang"
-  chmod +x "$dir/code3" "$dir/code78" "$dir/hang" "$dir/stubborn" "$dir/pidhang"
+  # One leaves a TERM-ignoring child behind, records its pid and exits 0.
+  # shellcheck disable=SC2016 # the stub's own $!, not this shell's
+  printf '#!/usr/bin/env bash\n( trap "" TERM; exec sleep 30 ) &\necho $! >"$1"\nexit 0\n' >"$dir/orphan"
+  chmod +x "$dir/code3" "$dir/code78" "$dir/hang" "$dir/stubborn" "$dir/pidhang" "$dir/orphan"
 
   check "the binary's own code is returned" 3 runner "$PROG_DIR/mac-gate.sh" "$dir/code3"
   check "the binary's own 78 is returned" 78 runner "$PROG_DIR/mac-gate.sh" "$dir/code78"
@@ -370,6 +376,19 @@ time.sleep(4)
   check "a held lock is 75" 75 runner "$PROG_DIR/mac-gate.sh" "$dir/code3"
   kill "$holder" 2>/dev/null || true
   wait "$holder" 2>/dev/null || true
+
+  # A gate that exits and leaves a child: the runner returns the gate's code and the child does not outlive it.
+  local orphan_pid
+  check "a gate that exits 0 and leaves a child is 0" 0 runner "$PROG_DIR/mac-gate.sh" "$dir/orphan" "$dir/orphan.pid"
+  orphan_pid=$(cat "$dir/orphan.pid" 2>/dev/null)
+  if [ -n "$orphan_pid" ] && ! kill -0 "$orphan_pid" 2>/dev/null; then
+    pass=$((pass + 1))
+    echo "self-test the child a gate left is gone: PASS"
+  else
+    fail=$((fail + 1))
+    echo "self-test the child a gate left is gone: FAIL (pid ${orphan_pid:-none} still runs or was not written)"
+    [ -n "$orphan_pid" ] && kill -KILL "$orphan_pid" 2>/dev/null
+  fi
 
   echo "self-test: $pass passed, $fail failed"
   [ "$fail" -eq 0 ] || exit 1
