@@ -620,6 +620,7 @@ placement 0 0 0
 # dispatch in swiglu_oai (1 block), v_swiglu_oai and its v_expf call (1 block), swiglu_oai_avx2's full-vector and
 # padded-tail bodies (two loads, the v_swiglu_oai call and the store each: 8), each with its own SAFETY line.
 qdot 227 97 0
+record 0 0 0
 refset 0 0 0
 runtime 0 0 0
 # PIN(2026-10-21): two existing blocks moved from hf, not new unsafe: the read-only mapping and checked bf16 view.

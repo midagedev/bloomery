@@ -1734,6 +1734,10 @@ gate-os:
 gate-device:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-device'
 
+# The record core (crates/record, host only): the one owner of a line's syntax, its schema and its reader.
+gate-record:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-record --lib'
+
 # 레버 레지스트리 게이트(crates/levers, 호스트만): 모든 행이 형식에 맞는가, 종류가 받지 않는 값과 은퇴한 이름을
 # 이름을 대고 거부하는가, 제자리 행과 tools/levers-direct.txt가 서로 맞는가. 레지스트리를 마크다운 표로 찍는다.
 [group('canary')]
