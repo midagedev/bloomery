@@ -485,7 +485,10 @@ gpu-mimo2 0 0 0
 # enqueue_index is an unsafe fn, as the head kernel it calls (the positions are distinct).
 # PIN(2026-10-21): gpu-minimaxm3 19 -> 21 blocks, new code, not old code relaxed: the step's two launches of those head
 # kernels (the index heads and the attention heads, one token, so the positions are distinct), each with its SAFETY line.
-gpu-minimaxm3 21 1 0
+# PIN(2026-10-21): gpu-minimaxm3 21 -> 23 blocks, new code, not old code relaxed: the prompt batch's two launches of those
+# head kernels (the index heads and the attention heads, a unit's rows, so the positions are distinct), each with its SAFETY
+# line.
+gpu-minimaxm3 23 1 0
 gpu-solar2 0 0 0
 # PIN(2026-10-10): gpu-vision 48 -> 86 blocks, new code, not old code relaxed: the Qwen3-VL tower's five kernel entries read and
 # write their buffers through the same raw places as V4.1's, each block with its SAFETY line — vis_attn_h72 17, vis_rope2d_h72 4,

@@ -53,6 +53,7 @@ use runtime::layer::{Layer, MixerKind, ResidualKind, hosted};
 use crate::attn::{DIM, HEADS, MsaScratch, MsaShape, N_HEAD, ROT, partials_lens};
 use crate::ffn::{CARD, Routed, RoutedDims};
 use crate::step::Kernels;
+use bloomery_gpu_deepseek41::prompt_walk::BatchBufs;
 
 /// What the body's refusals name.
 pub(crate) const WHAT: &str = "minimaxm3 Body";
@@ -239,6 +240,10 @@ pub struct Body {
     pub(crate) cfg: Vec<Layer>,
     pub(crate) stores: Vec<Store>,
     pub(crate) s: Scratch,
+    /// The prompt batch's buffers: the rows' own and the wide forms.
+    pub(crate) batch: crate::prefill::Batch,
+    /// The prompt batch's units: the walker's own buffers.
+    pub(crate) units: BatchBufs,
     pub(crate) slots: Arc<DeviceTensor<u32>>,
     /// The positions the stores hold: a step at `pos` needs `pos <= at`, and it leaves `pos + 1`.
     pub(crate) at: u32,
@@ -503,14 +508,14 @@ impl Body {
             RoutedDims {
                 embd: dims.embd,
                 rms_eps: dims.rms_eps,
-                batch_rows: 1,
+                batch_rows: crate::prefill::T_MAX,
             },
             CARD,
         )?;
         let rules = (0..spec.layers.len())
             .map(|l| routed_oai(spec, l))
             .collect::<Result<Vec<_>, _>>()?;
-        let hybrid = hosted_hybrid(
+        let mut hybrid = hosted_hybrid(
             (gpu, file, plan),
             (run.clone(), map),
             (host, set, &glue),
@@ -536,11 +541,20 @@ impl Body {
                 hp.n_vocab
             )));
         }
+        bloomery_gpu_deepseek41::prompt_walk::prepare_host(
+            gpu,
+            &mut hybrid,
+            crate::prefill::T_MAX,
+        )?;
+        let batch = crate::prefill::Batch::new(gpu, (&dims, &msa), crate::prefill::T_MAX)?;
+        let units = BatchBufs::new(gpu, dims.embd, crate::prefill::T_MAX, 1)?;
         let mut body = Body {
             shell: TierShell::new(hybrid, glue, dims.embd, WHAT),
             cfg,
             stores,
             s,
+            batch,
+            units,
             slots,
             at: 0,
             k: Kernels::load(gpu)?,
@@ -592,6 +606,41 @@ impl Body {
         self.at
     }
 
+    /// The bytes of the stores over the written positions: each layer's K and V planes and a sparse
+    /// layer's index-key plane, over the `pos` positions written.
+    pub fn store_bytes_at(&self, gpu: &Gpu, pos: u32) -> Result<Vec<(String, Vec<u8>)>, GpuError> {
+        let stream = gpu.stream();
+        let (ctx, kv_heads, pos) = (self.dims.ctx, self.dims.kv_heads, pos as usize);
+        if pos > ctx {
+            return Err(shape(format!("store bytes at {pos} positions of {ctx}")));
+        }
+        let plane = |t: &DeviceTensor<u16>| -> Result<Vec<u8>, GpuError> {
+            let host = t.buf().to_host_vec(stream)?;
+            let mut out = Vec::with_capacity(kv_heads * pos * HEAD * 2);
+            for h in 0..kv_heads {
+                let rows = &host[h * ctx * HEAD..(h * ctx + pos) * HEAD];
+                out.extend(rows.iter().flat_map(|v| v.to_le_bytes()));
+            }
+            Ok(out)
+        };
+        let mut out = Vec::new();
+        for (l, store) in self.stores.iter().enumerate() {
+            out.push((format!("layer {l} gqa k"), plane(&store.gqa.kc)?));
+            out.push((format!("layer {l} gqa v"), plane(&store.gqa.vc)?));
+            if let Some(ix) = store.index.as_ref() {
+                let host = ix.keys.to_host_vec(stream)?;
+                out.push((
+                    format!("layer {l} index keys"),
+                    host[..pos * DIM]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// Device bytes of the stores: every layer's planes and the sparse layers' index keys.
     #[must_use]
     pub fn store_bytes(&self) -> usize {
@@ -604,7 +653,10 @@ impl Body {
     #[must_use]
     pub fn scratch_bytes(&self) -> usize {
         self.s.bytes()
+            + self.batch.bytes()
+            + self.units.bytes()
             + self.ffn.bytes()
+            + self.ffn.batch_bytes()
             + self.k.bytes()
             + self.rope.table.num_bytes()
             + self.shell.hybrid.boundary().device_bytes()

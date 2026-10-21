@@ -3,16 +3,19 @@
 //! and the gate plan's printed terms (`--plan`). A gate includes it by `#[path]` beside `shared/lcpp_e2e.rs` and
 //! `shared/gate_card.rs`.
 //!
-//! The body ([`bloomery_gpu_minimaxm3`]) holds one sequence and has no prompt batch: [`Seat::prompt`], [`Seat::set_group`] and
-//! [`Seat::stores`] are refused by name, and the gate's descriptor says it has no prefill clause.
+//! The prompt call and the stores are the body's own ([`bloomery_gpu_minimaxm3`]): [`Seat::prompt`] runs `ids` from the seat's
+//! position by the prompt batch (up to `bloomery_gpu_minimaxm3::prefill::T_MAX` rows a unit); [`Seat::stores`] names each
+//! layer's K and V planes and each sparse layer's index-key plane over the written positions.
 
-use crate::lcpp_e2e::{Arm, Dims, ForcedRoute, ForcedRow, Seat};
+use crate::lcpp_e2e::{Arm, Dims, ForcedRoute, ForcedRow, Seat, fnv1a};
 use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
 use bloomery_gpu::host::served::TierBody;
+use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::tier::Tier;
+use bloomery_gpu_minimaxm3::prefill::{prefill, set_prefill_group};
 use bloomery_gpu_minimaxm3::{Body, MiniMaxM3Model, set_taps};
 use bloomery_levers::HostCfg;
 use gguf::Split;
@@ -47,6 +50,29 @@ pub const FORCED_ERR: f64 = 2.5e-3;
 /// run's routing holds: `√prefix` times the forced arm's own per-layer error.
 pub fn free_ceil(prefix: usize, _layer: usize) -> f64 {
     (prefix as f64).sqrt() * FORCED_ERR
+}
+
+/// The layers the forced arm's prefix covers: the dense lead and the first sparse layer. The
+/// prefix is layer 3 in every measured set, so the layers from it on may carry an exchange of
+/// experts (a flip of the top 4 at a near tie) and are held to nothing.
+pub const FORCED_PREFIX: usize = 3;
+
+/// The prefill gate's ceiling of a layer's output distance: the forced arm's own per-layer error
+/// over the layers its prefix covers, and none over the layers from it on.
+pub fn prefill_ceil(_tier: Tier, layer: usize) -> f64 {
+    if layer < FORCED_PREFIX {
+        free_ceil(FORCED_PREFIX, layer)
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// The ceilings of [`prefill_ceil`] as a line prints them.
+pub fn prefill_ceils(_tier: Tier) -> String {
+    format!(
+        "the forced arm's {:.2e} over the layers before {FORCED_PREFIX} and none over the layers from it on",
+        free_ceil(FORCED_PREFIX, 0)
+    )
 }
 
 /// The ceiling of layer `layer`'s output distance. The model has no fixture file, so only the real tier reaches it.
@@ -190,11 +216,6 @@ impl Loaded {
     }
 }
 
-/// The refusal of a call the body has no program for.
-fn no_prompt_batch(call: &str) -> GateError {
-    format!("minimaxm3 seat: {call}: the minimaxm3 body has no prompt batch yet").into()
-}
-
 impl Seat for Loaded {
     fn dims(&self) -> Dims {
         self.dims
@@ -213,12 +234,19 @@ impl Seat for Loaded {
         self.row()
     }
 
-    fn prompt(&mut self, _ids: &[u32]) -> Result<Vec<f32>, GateError> {
-        Err(no_prompt_batch("prompt"))
+    fn prompt(&mut self, ids: &[u32]) -> Result<Vec<f32>, GateError> {
+        prompt_pass(&mut self.m, |m| {
+            m.run_rows(ids.len(), "minimaxm3 prompt", |gpu, w, body, head, pos| {
+                prefill(gpu, w, body, head, ids, pos)
+            })
+        })
+        .map_err(|e| e.to_string())?;
+        self.row()
     }
 
-    fn set_group(&mut self, _group: usize) -> Result<(), GateError> {
-        Err(no_prompt_batch("set_group"))
+    fn set_group(&mut self, group: usize) -> Result<(), GateError> {
+        set_prefill_group(&mut self.m, group).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn taps(&mut self) -> Result<Vec<f32>, GateError> {
@@ -227,7 +255,13 @@ impl Seat for Loaded {
     }
 
     fn stores(&mut self) -> Result<Vec<(String, u64)>, GateError> {
-        Err(no_prompt_batch("stores"))
+        let pos = self.m.pos();
+        let (gpu, _, body) = self.m.body_parts("minimaxm3 seat")?;
+        Ok(body
+            .store_bytes_at(gpu, pos)?
+            .into_iter()
+            .map(|(name, bytes)| (name, fnv1a(&bytes)))
+            .collect())
     }
 
     fn fault(&mut self) -> Result<(), GateError> {

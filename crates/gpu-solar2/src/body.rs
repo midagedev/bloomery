@@ -69,8 +69,10 @@ use models::{Act, DeltaKind, Ffn, Gqa, KdaGate, LayerSpec, Mixer, ModelSpec, Out
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
 use runtime::seqstate::{Kept, Take};
 
+use bloomery_gpu_deepseek41::prompt_walk::{self, BatchBufs};
+
 use crate::ffn::{CARD, Routed, RoutedDims};
-use crate::prefill::{self, Extra};
+use crate::prefill::Extra;
 use crate::step::Kernels;
 
 /// What the body's refusals name.
@@ -210,16 +212,11 @@ pub struct LayerCfg {
 pub struct Scratch {
     pub x: DeviceBuffer<f32>,
     pub x1: DeviceBuffer<f32>,
-    pub xn: DeviceBuffer<f32>,
     pub pos: DeviceBuffer<u32>,
     pub words: DeviceBuffer<u32>,
     pub n_keys: DeviceBuffer<u32>,
-    /// KDA: qkv, fa, ga, beta_raw, f, z, conv, beta, decay, o, gated.
-    pub kda: [DeviceBuffer<f32>; 11],
-    /// GQA: q, k, v, g, attn, part_v, part_ms.
-    pub gqa: [DeviceBuffer<f32>; 7],
-    pub delta: DeviceBuffer<f32>,
-    pub acts: Acts,
+    /// The mixers' intermediates and the activation forms.
+    pub mixers: MixerBufs,
 }
 
 impl Scratch {
@@ -233,18 +230,61 @@ impl Scratch {
     ) -> Result<Scratch, GpuError> {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, rows * n);
         let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
+        Ok(Scratch {
+            x: z(d.embd)?,
+            x1: z(d.embd)?,
+            pos: u(rows)?,
+            words: u(WORD_ROWS + d.kv_heads)?,
+            n_keys: u(rows)?,
+            mixers: MixerBufs::new(stream, d, rows, sites)?,
+        })
+    }
+
+    /// Device bytes of every buffer and activation form.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        let f32s = [&self.x, &self.x1]
+            .into_iter()
+            .map(DeviceBuffer::num_bytes)
+            .sum::<usize>();
+        let words = [&self.pos, &self.words, &self.n_keys]
+            .into_iter()
+            .map(DeviceBuffer::num_bytes)
+            .sum::<usize>();
+        f32s + words + self.mixers.bytes()
+    }
+}
+
+/// The mixers' buffers: the normed rows, every mixer's intermediates and the
+/// activation forms, at `rows` rows. The step holds them in its [`Scratch`],
+/// the prompt batch in its [`Batch`].
+pub struct MixerBufs {
+    pub xn: DeviceBuffer<f32>,
+    /// KDA: qkv, fa, ga, beta_raw, f, z, conv, beta, decay, o, gated.
+    pub kda: [DeviceBuffer<f32>; 11],
+    /// GQA: q, k, v, g, attn, part_v, part_ms.
+    pub gqa: [DeviceBuffer<f32>; 7],
+    pub delta: DeviceBuffer<f32>,
+    pub acts: Acts,
+}
+
+impl MixerBufs {
+    /// `rows` rows of every width the mixers and `sites` read. Load-time
+    /// only.
+    fn new<'s>(
+        stream: &CudaStream,
+        d: &Dims,
+        rows: usize,
+        sites: impl Iterator<Item = &'s Site>,
+    ) -> Result<MixerBufs, GpuError> {
+        let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, rows * n);
         let shape = d.kda.shape;
         let (channels, v, n_v) = (shape.channels(), shape.n_v * HEAD, shape.n_v);
         let (q_width, kv_width) = (d.heads * HEAD, d.kv_heads * HEAD);
         // The decode flash splits a row's keys; a batch's flash needs no partials.
         let attn_rows = rows.min(MAX_PASS_ROWS);
-        Ok(Scratch {
-            x: z(d.embd)?,
-            x1: z(d.embd)?,
+        Ok(MixerBufs {
             xn: z(d.embd)?,
-            pos: u(rows)?,
-            words: u(WORD_ROWS + d.kv_heads)?,
-            n_keys: u(rows)?,
             kda: [
                 z(channels)?,
                 z(HEAD)?,
@@ -275,24 +315,20 @@ impl Scratch {
     /// Device bytes of every buffer and activation form.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        let f32s = [&self.x, &self.x1, &self.xn, &self.delta]
+        let f32s = [&self.xn, &self.delta]
             .into_iter()
             .chain(&self.kda)
             .chain(&self.gqa)
             .map(DeviceBuffer::num_bytes)
             .sum::<usize>();
-        let words = [&self.pos, &self.words, &self.n_keys]
-            .into_iter()
-            .map(DeviceBuffer::num_bytes)
-            .sum::<usize>();
-        f32s + words + self.acts.bytes()
+        f32s + self.acts.bytes()
     }
 }
 
-/// The prompt batch's buffers: [`Scratch`]'s at [`T_MAX`] rows, and the
+/// The prompt batch's buffers: the mixers' rows at [`T_MAX`] rows, and the
 /// wide activation forms the GEMMs read.
 pub struct Batch {
-    pub rows: Scratch,
+    pub rows: MixerBufs,
     pub wide: WideActs,
 }
 
@@ -323,6 +359,8 @@ pub struct Body {
     pub(crate) stores: Vec<Store>,
     pub(crate) s: Scratch,
     pub(crate) batch: Batch,
+    /// The prompt batch's units: the walker's own buffers.
+    pub(crate) units: BatchBufs,
     pub(crate) slots: Arc<DeviceTensor<u32>>,
     /// The positions the stores hold: a step at `pos` needs `at == pos`, and
     /// it leaves `pos + 1`.
@@ -756,9 +794,10 @@ impl Body {
                 hp.n_vocab
             )));
         }
-        prefill::prepare_host(gpu, &mut hybrid)?;
+        prompt_walk::prepare_host(gpu, &mut hybrid, T_MAX)?;
         let batch = new_batch(gpu, &dims, &stores)?;
         let extra = Extra::new(gpu, &dims, &stores, 1)?;
+        let units = BatchBufs::new(gpu, dims.embd, T_MAX, 1)?;
         let ckpt = Checkpoints::sequence(
             gpu.context(),
             checkpoint_lens(spec, &dims),
@@ -777,6 +816,7 @@ impl Body {
             stores,
             s,
             batch,
+            units,
             slots,
             at: 0,
             k: Kernels::load(gpu)?,
@@ -920,7 +960,7 @@ impl Body {
     /// out of the expert budget; a load past it is refused by name.
     #[must_use]
     pub fn prompt_bytes(&self) -> usize {
-        self.batch.bytes() + self.prefill.bytes() + self.ffn.batch_bytes()
+        self.batch.bytes() + self.prefill.bytes() + self.units.bytes() + self.ffn.batch_bytes()
     }
 
     /// Every store's and buffer's bytes on the card, the armed taps
@@ -1187,7 +1227,7 @@ fn store(
 /// only.
 fn new_batch(gpu: &Gpu, d: &Dims, stores: &[Store]) -> Result<Batch, GpuError> {
     let sites = || stores.iter().flat_map(Store::sites);
-    let rows = Scratch::new(gpu.stream(), d, T_MAX, sites())?;
+    let rows = MixerBufs::new(gpu.stream(), d, T_MAX, sites())?;
     let tys: Vec<SiteTy> = sites().filter(|s| s.k() == d.embd).map(Site::ty).collect();
     Ok(Batch {
         rows,

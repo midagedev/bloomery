@@ -1486,6 +1486,12 @@ gate-gpu-minimaxm3-msa:
 gate-gpu-minimaxm3-e2e *ARGS:
     BLOOMERY_MODEL=minimax-m3 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minimaxm3-e2e && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features minimaxm3 --release --bin gate_minimaxm3_e2e && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minimaxm3_e2e {{ARGS}}'
 
+# MiniMax-M3 prefill gate (gate_minimaxm3_prefill's doc): the prompt batch against the one-token steps over the four
+# prompt lengths, in the logits row, the layer outputs and the stores; the family has no fixture file, so the recipe runs in
+# the real tier.
+gate-gpu-minimaxm3-prefill:
+    BLOOMERY_MODEL=minimax-m3 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minimaxm3-prefill && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features minimaxm3 --release --bin gate_minimaxm3_prefill && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minimaxm3_prefill'
+
 # Head-256 pack-one prefill, whole inputs and symmetric windows, against the f64 attention band.
 gate-gpu-gemma-embedding-head256:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemma_embedding_head256 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding_head256'

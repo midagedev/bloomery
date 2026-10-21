@@ -33,6 +33,7 @@ pub mod index_key;
 pub mod indexer;
 pub mod markov;
 pub mod params;
+pub mod prompt_walk;
 pub mod rope;
 pub mod router;
 pub mod shared_routed;

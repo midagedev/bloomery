@@ -12,8 +12,9 @@
 //! 16 blocks of 128 cover, so its last position drops a block.
 //!
 //! The clauses are `shared/lcpp_e2e.rs`'s (`finite_and_fault_clean`, `reset_rewinds`, `layer_outputs_near_lcpp`,
-//! `top_logprobs_in_band`, `forced_greedy_count_pin`); the body has no prompt batch, so the prefill clause is not declared, and the
-//! family has no fixture file, so the fixture tier is refused by name before anything loads. This file holds the model's part: the
+//! `top_logprobs_in_band`, `forced_greedy_count_pin`); the prompt batch's own clauses are the prefill gate's
+//! (`gate_minimaxm3_prefill`), so this gate declares no prefill clause, and the family has no fixture file, so the fixture
+//! tier is refused by name before anything loads. This file holds the model's part: the
 //! family and the seat (`shared/minimaxm3_seat.rs`: the load, the tap ceilings — provisional, [`seat::TAP_EARLY_CEIL`] over the
 //! dense lead and [`seat::TAP_CEIL`] after).
 //!
@@ -61,6 +62,10 @@ mod e2e;
 mod lcpp_e2e;
 
 #[cfg(feature = "minimaxm3")]
+#[allow(
+    dead_code,
+    reason = "the seat serves two gates; each takes the calls it reads"
+)]
 #[path = "shared/minimaxm3_seat.rs"]
 mod seat;
 

@@ -33,7 +33,7 @@ use cuda_core::DeviceBuffer;
 use runtime::layer::{FfnKind, MixerKind};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
-use crate::body::{Body, Dims, LayerCfg, Scratch, StepInput, Store, WORD_ROWS};
+use crate::body::{Body, Dims, LayerCfg, MixerBufs, Scratch, StepInput, Store, WORD_ROWS};
 use crate::ffn::{self, Routed};
 use crate::kda::Sites;
 
@@ -217,14 +217,18 @@ impl StepProgram<'_> {
         let Scratch {
             x,
             x1,
-            xn,
             words,
             n_keys,
+            mixers,
+            ..
+        } = &mut *self.s;
+        let MixerBufs {
+            xn,
             gqa,
             delta,
             acts,
             ..
-        } = &mut *self.s;
+        } = &mut *mixers;
         let [q, k, v, g, attn, part_v, part_ms] = gqa;
         let bufs = GqaBufs {
             words: &*words,
@@ -256,15 +260,15 @@ impl StepProgram<'_> {
             return Err(wrong_store(l, "KDA"));
         };
         let Scratch {
-            x,
-            x1,
+            x, x1, pos, mixers, ..
+        } = &mut *self.s;
+        let MixerBufs {
             xn,
-            pos,
             kda,
             delta,
             acts,
             ..
-        } = &mut *self.s;
+        } = &mut *mixers;
         let [qkv, fa, ga, beta_raw, f, z, conv, beta, decay, o, gated] = kda;
         let [norm, conv_w, dt_bias, a, gate_norm] = sites.vecs.each_ref();
         let vecs = KdaVecs {

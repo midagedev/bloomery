@@ -179,28 +179,19 @@ struct SharedWide {
 }
 
 impl SharedWide {
-    /// Buffers for up to `cap` rows over the layers' shared experts `per` of
-    /// width `ff` on `embd` values. Load-time only.
+    /// Buffers for up to `cap` rows over a block of width `ff` on `embd` values, whose gate and up read
+    /// the types `gate_up` and whose down reads the types `down`. Load-time only.
     fn new(
         gpu: &Gpu,
-        per: &[Option<LayerFfn>],
+        (gate_up, down): (&[SiteTy], &[SiteTy]),
         (cap, embd, ff): (usize, usize, usize),
     ) -> Result<SharedWide, GpuError> {
         let stream = gpu.stream();
-        let gate_up: Vec<SiteTy> = per
-            .iter()
-            .flatten()
-            .flat_map(|l| {
-                let [gate, up, _] = l.plan.types();
-                [gate, up]
-            })
-            .collect();
-        let down: Vec<SiteTy> = per.iter().flatten().map(|l| l.plan.types()[2]).collect();
         Ok(SharedWide {
             gemm: GemmKernels::load(gpu.context())?,
             route: GemmRoute::new(stream, cap, 1)?,
-            x: WideActs::new(stream, WideActs::wants_of(&gate_up), cap, embd)?,
-            h: WideActs::new(stream, WideActs::wants_of(&down), cap, ff)?,
+            x: WideActs::new(stream, WideActs::wants_of(gate_up), cap, embd)?,
+            h: WideActs::new(stream, WideActs::wants_of(down), cap, ff)?,
             g: DeviceBuffer::zeroed(stream, cap * ff)?,
             u: DeviceBuffer::zeroed(stream, cap * ff)?,
         })
@@ -284,16 +275,40 @@ struct BatchBufs {
     card: Option<CardBatch>,
     /// Made when a unit can reach [`GATED_FROM`] rows.
     wide: Option<SharedWide>,
+    /// The shared expert's `h` row: the cols path writes a row a column, so a unit of
+    /// fewer rows than [`GATED_FROM`] needs a row a column.
+    h: DeviceBuffer<f32>,
+    /// The dense blocks' normed rows and their output, over the unit's rows.
+    /// A plan with no dense block holds none of them.
+    dense_xn: Option<DeviceBuffer<f32>>,
+    dense_out: Option<DeviceBuffer<f32>>,
+    /// Made when the plan holds a dense block and a unit can reach [`GATED_FROM`] rows.
+    dense_wide: Option<SharedWide>,
+}
+
+/// The types the blocks' gate and up read, and the types their down reads, of the plans `plans` names.
+fn block_types<'a>(plans: impl Iterator<Item = &'a BlockPlan>) -> (Vec<SiteTy>, Vec<SiteTy>) {
+    let mut gate_up = Vec::new();
+    let mut down = Vec::new();
+    for p in plans {
+        let [gate, up, d] = p.types();
+        gate_up.push(gate);
+        gate_up.push(up);
+        down.push(d);
+    }
+    (gate_up, down)
 }
 
 impl BatchBufs {
     fn new<R: RouterEntry>(
         gpu: &Gpu,
-        (card, per): (&CardExperts, &[Option<LayerFfn>]),
-        (cap, embd, ff): (usize, usize, usize),
+        (card, per, dense): (&CardExperts, &[Option<LayerFfn>], &[Option<DenseFfn>]),
+        (cap, embd, ff, dense_ff): (usize, usize, usize, usize),
     ) -> Result<Self, GpuError> {
         let stream = gpu.stream();
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        let (shared_gate_up, shared_down) = block_types(per.iter().flatten().map(|l| &l.plan));
+        let (dense_gate_up, dense_down) = block_types(dense.iter().flatten().map(|l| &l.plan));
         Ok(BatchBufs {
             cap,
             normed: z(cap * embd)?,
@@ -303,26 +318,36 @@ impl BatchBufs {
             sh: z(cap * embd)?,
             x1s: z(cap * embd)?,
             card: card.any().then(|| card.batch(gpu, cap)).transpose()?,
+            h: z(cap * ff.max(dense_ff))?,
             wide: (cap >= GATED_FROM)
-                .then(|| SharedWide::new(gpu, per, (cap, embd, ff)))
+                .then(|| SharedWide::new(gpu, (&shared_gate_up, &shared_down), (cap, embd, ff)))
+                .transpose()?,
+            dense_xn: (dense_ff > 0).then(|| z(cap * embd)).transpose()?,
+            dense_out: (dense_ff > 0).then(|| z(cap * embd)).transpose()?,
+            dense_wide: (cap >= GATED_FROM && dense_ff > 0)
+                .then(|| SharedWide::new(gpu, (&dense_gate_up, &dense_down), (cap, embd, dense_ff)))
                 .transpose()?,
         })
     }
 
     fn bytes(&self) -> usize {
         [
-            &self.normed,
-            &self.probs,
-            &self.weights,
-            &self.sh,
-            &self.x1s,
+            Some(&self.normed),
+            Some(&self.probs),
+            Some(&self.weights),
+            Some(&self.sh),
+            Some(&self.x1s),
+            self.dense_xn.as_ref(),
+            self.dense_out.as_ref(),
         ]
-        .iter()
+        .into_iter()
+        .flatten()
         .map(|b| b.num_bytes())
         .sum::<usize>()
             + self.ids.num_bytes()
             + self.card.as_ref().map_or(0, CardBatch::bytes)
             + self.wide.as_ref().map_or(0, SharedWide::bytes)
+            + self.dense_wide.as_ref().map_or(0, SharedWide::bytes)
     }
 
     /// `m` rows are a unit this buffer set holds.
@@ -547,9 +572,14 @@ impl<R: RouterEntry> Routed<R> {
             .map(|l| l.ff)
             .fold(desc.shared_ff, usize::max);
         let card = CardExperts::new(gpu, w, card, layers, map, (d.embd, desc.expert_ff), 1)?;
+        let dense_ff = dense.iter().flatten().map(|l| l.ff).max().unwrap_or(0);
         let batch = (d.batch_rows > 1)
             .then(|| {
-                BatchBufs::new::<R>(gpu, (&card, &per), (d.batch_rows, d.embd, desc.shared_ff))
+                BatchBufs::new::<R>(
+                    gpu,
+                    (&card, &per, &dense),
+                    (d.batch_rows, d.embd, desc.shared_ff, dense_ff),
+                )
             })
             .transpose()?;
         Ok(Routed {
@@ -807,7 +837,6 @@ impl<R: RouterEntry> Routed<R> {
             card,
             rules,
             shared_ff,
-            h,
             block,
             batch,
             d,
@@ -823,7 +852,7 @@ impl<R: RouterEntry> Routed<R> {
             let mut ys = span_mut(WHAT, &mut b.sh, 0, m * n)?;
             let io = BlockIo {
                 x: &xs,
-                h: &mut *h,
+                h: &mut b.h,
                 y: &mut ys,
             };
             enqueue_block_cols_act(gpu, w, &kernels, block, (&blk, rules.1), m, io)?;
@@ -868,6 +897,56 @@ impl<R: RouterEntry> Routed<R> {
         };
         gpu.elem()
             .enqueue_add(gpu.stream(), hsum, shadowed, m * self.d.embd, x)
+    }
+
+    /// Enqueue dense layer `l`'s feed-forward over the unit's `m` rows:
+    /// `dest = x1 + block(rms_norm(x1))` with the layer's own rule and no
+    /// host leg. The block runs on the wide GEMMs, as the shared expert's
+    /// does above [`GATED_FROM`] rows.
+    pub fn dense_rows(
+        &mut self,
+        (gpu, w): (&Gpu, &Weights),
+        (l, m): (usize, usize),
+        (x1, dest): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
+    ) -> Result<(), GpuError> {
+        let layer = self
+            .dense
+            .get(l)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("layer {l}: not a dense block")))?;
+        let b = self.batch.as_mut().ok_or_else(no_batch)?;
+        b.check(l, m)?;
+        let n = self.d.embd;
+        let norm = w.f32_buf(WHAT, &layer.norm)?;
+        let dense_xn = b.dense_xn.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch's normed rows of the dense blocks",
+        })?;
+        gpu.elem()
+            .enqueue_rms_norm(gpu.stream(), x1, norm, self.d.rms_eps, n, m, dense_xn)?;
+        let blk = Block {
+            plan: layer.plan,
+            names: layer.names.each_ref().map(String::as_str),
+            ff: layer.ff,
+            limit: 0.0,
+            layer: l,
+        };
+        let wide = b.dense_wide.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch's GEMM buffers of the dense blocks",
+        })?;
+        let dense_out = b.dense_out.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch's output rows of the dense blocks",
+        })?;
+        wide.run(
+            (gpu, w, &self.k.g32),
+            (&blk, layer.rule),
+            (m, n),
+            (dense_xn, dense_out),
+        )?;
+        gpu.elem()
+            .enqueue_add(gpu.stream(), x1, dense_out, m * n, dest)
     }
 }
 

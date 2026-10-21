@@ -30,8 +30,9 @@ impl PlanInputs {
     }
 
     /// The file as it is, for a gate that plans or describes it whatever the coverage list holds,
-    /// and the host's room and the arena's given bytes. The body makes no prompt batch yet, so the
-    /// plan holds no card bytes beside its terms ([`PlanInputs::prompt_reserve`] is 0).
+    /// and the host's room and the arena's given bytes. The prompt batch's bytes come out of the
+    /// plan's scratch term, so the plan holds no card bytes beside its terms
+    /// ([`PlanInputs::prompt_reserve`] is 0).
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let model = roles::classify(split, &hp)?;
