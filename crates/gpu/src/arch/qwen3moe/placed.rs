@@ -18,14 +18,17 @@
 //!   and the go; a unit's download of its rows and routing with its places
 //!   (`hostleg`);
 //! - the shadow: the card's routed experts of the layer when it has any —
-//!   the K-quant family's gate·up over the places ([`GateUpEntry`]: Q4_K or
-//!   Q5_K, the table's entry for the stack's type), the q8_1 of the card
-//!   slots' rows, the down `_sel` the table names for the stack's type
-//!   ([`DownArm`]: Q4_K, Q5_K or Q6_K) — and on Qwen3.6 the shared
-//!   expert by its types ([`SharedFfn`]): on its own stacks, a stack of one
-//!   expert on a fixed route of expert 0, when the same table runs all three
-//!   parts, else as its own dense FFN at its site types; a slot the host
-//!   serves is [`HOST`] there and no launch reads or writes it;
+//!   by the layer's leg ([`FfnLeg`], `accepts::qwen35_leg`): the dispatch's
+//!   K-quant launches over the places ([`GateUpEntry`]: Q4_K or Q5_K, the
+//!   table's entry for the stack's type; the down `_sel` the table names for
+//!   the stack's type, [`DownArm`]: Q4_K, Q5_K or Q6_K), or the common card
+//!   leg's ([`CardLeg`]: every type its arms run, the unit's wide arm its
+//!   route GEMMs, [`RouteBlock`]) — the q8_1 of the card slots' rows, and on
+//!   Qwen3.6 the shared expert by its types ([`SharedFfn`]): on its own
+//!   stacks, a stack of one expert on a fixed route of expert 0, when the
+//!   same table runs all three parts, else as its own dense FFN at its site
+//!   types; a slot the host serves is [`HOST`] there and no launch reads or
+//!   writes it;
 //! - the back: the step's wait (a unit's serve and upload are the walk's),
 //!   then the combine of the card's slots with the host's routed sum, the
 //!   residual and the shared expert (`hostleg`), into the next layer's
@@ -67,6 +70,9 @@ use super::plan::{
 use super::program::{Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Forms, Io};
 use super::wide::{self, CardRoute, GEMV_COLS, HostSide, arena_bytes};
+use crate::card_leg::{
+    CardLeg, LegBufs, LegRun, LegShape, LegStacks, RouteBlock, RouteIo, RouteW, leg_bytes_for,
+};
 use crate::gemm::{Gemm32Kernels, GemmRoute};
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::prompt_stream::PromptStream;
@@ -79,13 +85,13 @@ use crate::host::xstream::{self, Costs, LAND_BATCHES, LandBatch, RingLayer, XCfg
 use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HOST, HostResidency, Hybrid, SlotMap};
 use crate::kquant::{Act, GateUpAct, SelDown};
-use crate::model::fit::{act_col_bytes, route_bytes};
+use crate::model::fit::{act_col_bytes, act32_col_bytes, route_bytes};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q4k_sel::QuantSel;
 use crate::quant_sel::QuantSelKernels;
-use crate::site;
+use crate::site::{self, WideActs};
 use crate::tensor::{DeviceTensor, Q8Act, Window, WindowMut};
-use crate::weights::Weights;
+use crate::weights::{DevWeight, Weights};
 use crate::{FaultSink, Gpu, GpuError};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -93,6 +99,7 @@ use gguf::Split;
 use gguf::quant::GgmlType;
 use model::moe::UNION_MAX_COLS;
 use model::placement::Plan;
+use model::placement::accepts::{self, Leg35};
 use model::placement::kernels::{self, DownAct, DownEntry};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use std::sync::Arc;
@@ -133,11 +140,28 @@ pub(super) struct SharedStack {
     down_ty: SiteTy,
 }
 
+/// How a placed layer's card experts run: the dispatch's own launches for the
+/// types the family's FFN dispatch holds, or the common card leg
+/// (`crate::card_leg`) for the rest of the types its arms run
+/// ([`accepts::qwen35_leg`]).
+#[derive(Clone, Copy)]
+enum FfnLeg {
+    /// The K-quant family's gate·up at the table's entry and its down by the
+    /// stack's site type ([`gate_up_sel`], [`down_sel`]).
+    Dispatch {
+        gate_up: GateUpEntry,
+        down_ty: SiteTy,
+    },
+    /// The common leg's launches over the stacks' file types: the gate and up
+    /// of `gate_up`, the down of `down`.
+    Common { gate_up: GgmlType, down: GgmlType },
+}
+
 /// A placed layer's routed experts on the card: its slots there (the slot
 /// map's capacity, fixed for the load's life: the residency machine moves
 /// which experts fill them, never how many there are), the file's three
-/// stacks (the card holds their rows of those slots), the gate·up entry and
-/// the down's type; and the shared expert, on a chain that has one.
+/// stacks (the card holds their rows of those slots), the leg that runs them
+/// ([`FfnLeg`]); and the shared expert, on a chain that has one.
 pub(super) struct PlacedFfn {
     /// The slots of the layer's card stacks: the bound a place must be below
     /// to name one, and the width of the layer's routed table.
@@ -146,9 +170,108 @@ pub(super) struct PlacedFfn {
     up: String,
     down: String,
     /// `None` on a layer with no card expert, which launches none.
-    gate_up: Option<GateUpEntry>,
-    down_ty: SiteTy,
+    leg: Option<FfnLeg>,
     shared: Option<SharedFfn>,
+}
+
+impl PlacedFfn {
+    /// The types of a layer the common leg runs, when it is one with card
+    /// experts.
+    fn common(&self) -> Option<[GgmlType; 2]> {
+        match self.leg {
+            Some(FfnLeg::Common { gate_up, down }) => Some([gate_up, down]),
+            Some(FfnLeg::Dispatch { .. }) | None => None,
+        }
+    }
+}
+
+/// The forms a placed load's common-leg layers hold buffers for: which of the
+/// leg's two down forms ([`DownAct`]) some layer's down reads, and which of the
+/// wide arm's two GEMM forms its gate·up reads (the unit's normed rows) and its
+/// down reads (the SwiGLU rows). A load with no common layer holds
+/// [`CommonForms::NONE`] and allocates none of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CommonForms {
+    act8: bool,
+    blocks32: bool,
+    x128: bool,
+    x32: bool,
+    h128: bool,
+    h32: bool,
+}
+
+impl CommonForms {
+    /// No common layer.
+    pub(super) const NONE: CommonForms = CommonForms {
+        act8: false,
+        blocks32: false,
+        x128: false,
+        x32: false,
+        h128: false,
+        h32: false,
+    };
+
+    /// The forms of the layers whose `[gate·up, down]` file types are `tys`:
+    /// the down's launch form ([`kernels::down`]) and each GEMM's form
+    /// ([`kernels::gemm`], [`kernels::gemm_reads_blocks32`]).
+    pub(super) fn of(tys: impl IntoIterator<Item = [GgmlType; 2]>) -> CommonForms {
+        let mut f = CommonForms::NONE;
+        for [gate_up, down] in tys {
+            match kernels::down(down) {
+                Some((_, DownAct::Q8Act)) => f.act8 = true,
+                Some((_, DownAct::Q8Blocks32)) => f.blocks32 = true,
+                None => {}
+            }
+            match kernels::gemm(gate_up).map(kernels::gemm_reads_blocks32) {
+                Some(true) => f.x32 = true,
+                Some(false) => f.x128 = true,
+                None => {}
+            }
+            match kernels::gemm(down).map(kernels::gemm_reads_blocks32) {
+                Some(true) => f.h32 = true,
+                Some(false) => f.h128 = true,
+                None => {}
+            }
+        }
+        f
+    }
+
+    /// Whether any layer is a common one.
+    fn any(self) -> bool {
+        self != CommonForms::NONE
+    }
+
+    /// The leg's device bytes for an arena of `rows` rows of `shape`
+    /// ([`LegBufs`] of each down form held), and past [`GEMV_COLS`] rows the
+    /// wide arm's: the gate and up rows, and the unit's normed rows and the
+    /// SwiGLU rows in the forms the GEMMs read.
+    fn bytes(self, shape: RouteShape, rows: usize) -> usize {
+        let leg = LegShape {
+            cap: rows.min(GEMV_COLS),
+            slots_per_col: shape.pitch,
+            n: shape.hidden,
+            ff: shape.ff,
+        };
+        let forms = [
+            (self.act8, DownAct::Q8Act),
+            (self.blocks32, DownAct::Q8Blocks32),
+        ];
+        let bufs: usize = forms
+            .into_iter()
+            .filter(|&(held, _)| held)
+            .map(|(_, act)| leg_bytes_for(leg, act))
+            .sum();
+        if rows <= GEMV_COLS || !self.any() {
+            return bufs;
+        }
+        let slots = rows * shape.pitch;
+        let acts = |cols: usize, k: usize, (q128, q32): (bool, bool)| {
+            cols * (usize::from(q128) * act_col_bytes(k) + usize::from(q32) * act32_col_bytes(k))
+        };
+        bufs + 2 * slots * shape.ff * 4
+            + acts(rows, shape.hidden, (self.x128, self.x32))
+            + acts(slots, shape.ff, (self.h128, self.h32))
+    }
 }
 
 /// The residency machine's tally shape for a placed load over arena dims
@@ -208,6 +331,95 @@ pub(super) struct PlacedRows {
     shared: Option<SharedRows>,
     routes: Vec<Option<GemmRoute>>,
     ring: Option<RingRows>,
+    /// The buffers of the load's common-leg layers; `None` on a load with none.
+    common: Option<CommonRows>,
+}
+
+/// An arena's buffers for the common-leg layers ([`FfnLeg::Common`]): the
+/// common card leg's own (one [`LegBufs`] per down form the load's layers
+/// read, of the gemv arm's [`GEMV_COLS`] rows at most), and, past that many
+/// rows, the wide arm's: the unit's normed rows
+/// and the SwiGLU rows in the forms the route GEMMs read, and the gate and up
+/// rows.
+struct CommonRows {
+    act8: Option<LegBufs>,
+    blocks32: Option<LegBufs>,
+    wide: Option<CommonWide>,
+}
+
+/// The wide arm's buffers of the common-leg layers ([`CommonRows`]).
+struct CommonWide {
+    x: WideActs,
+    h: WideActs,
+    g: DeviceBuffer<f32>,
+    u: DeviceBuffer<f32>,
+}
+
+impl CommonRows {
+    /// The buffers of an arena of `rows` rows for `shape` over the forms
+    /// `forms` name; `None` for a load with no common layer. Load-time only.
+    fn new(
+        stream: &CudaStream,
+        shape: RouteShape,
+        rows: usize,
+        forms: CommonForms,
+    ) -> Result<Option<CommonRows>, GpuError> {
+        if !forms.any() {
+            return Ok(None);
+        }
+        let leg = LegShape {
+            cap: rows.min(GEMV_COLS),
+            slots_per_col: shape.pitch,
+            n: shape.hidden,
+            ff: shape.ff,
+        };
+        let slots = rows * shape.pitch;
+        let wide = (rows > GEMV_COLS)
+            .then(|| {
+                Ok::<_, GpuError>(CommonWide {
+                    x: WideActs::new(stream, (forms.x128, forms.x32), rows, shape.hidden)?,
+                    h: WideActs::new(stream, (forms.h128, forms.h32), slots, shape.ff)?,
+                    g: DeviceBuffer::zeroed(stream, slots * shape.ff)?,
+                    u: DeviceBuffer::zeroed(stream, slots * shape.ff)?,
+                })
+            })
+            .transpose()?;
+        Ok(Some(CommonRows {
+            act8: forms.act8.then(|| LegBufs::new(stream, leg)).transpose()?,
+            blocks32: forms
+                .blocks32
+                .then(|| LegBufs::for_down(stream, leg, DownAct::Q8Blocks32))
+                .transpose()?,
+            wide,
+        }))
+    }
+
+    /// The leg's buffers a down of file type `down` reads its columns in
+    /// ([`kernels::down`]'s form), refused by name when the load holds none.
+    fn bufs(&mut self, down: GgmlType) -> Result<&mut LegBufs, GpuError> {
+        let held = match kernels::down(down) {
+            Some((_, DownAct::Q8Act)) => self.act8.as_mut(),
+            Some((_, DownAct::Q8Blocks32)) => self.blocks32.as_mut(),
+            None => None,
+        };
+        held.ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!(
+                    "a common-leg layer of a {down} down, whose form the load holds no buffers of"
+                ),
+            )
+        })
+    }
+
+    /// Device bytes.
+    fn bytes(&self) -> usize {
+        self.act8.as_ref().map_or(0, LegBufs::bytes)
+            + self.blocks32.as_ref().map_or(0, LegBufs::bytes)
+            + self.wide.as_ref().map_or(0, |w| {
+                w.x.bytes() + w.h.bytes() + w.g.num_bytes() + w.u.num_bytes()
+            })
+    }
 }
 
 /// The ring pass's buffers of a wide arena ([`ring_pass`]): the routed table
@@ -254,7 +466,7 @@ impl PlacedRows {
         stream: &CudaStream,
         shape: RouteShape,
         rows: usize,
-        cards: &[usize],
+        (cards, common): (&[usize], CommonForms),
     ) -> Result<PlacedRows, GpuError> {
         if rows == 0 {
             return Err(GpuError::shape(
@@ -294,6 +506,7 @@ impl PlacedRows {
             shared,
             routes,
             ring: None,
+            common: CommonRows::new(stream, shape, rows, common)?,
         })
     }
 
@@ -347,6 +560,7 @@ impl PlacedRows {
                     + r.union.num_bytes()
                     + r.maps.iter().map(DeviceBuffer::num_bytes).sum::<usize>()
             })
+            + self.common.as_ref().map_or(0, CommonRows::bytes)
     }
 }
 
@@ -360,6 +574,8 @@ pub(super) struct PlacedKernels {
     kquant: QuantSelKernels,
     leg: HostLegKernels,
     g32: Option<Gemm32Kernels>,
+    /// The common card leg's modules, on a load with a common-leg layer.
+    card: Option<CardLeg>,
 }
 
 /// What every placed walk reads besides the arena: each layer's card
@@ -522,6 +738,7 @@ impl Placed {
         let stage = map.stage_view();
         let slots = Arc::new(DeviceTensor::upload(stream, &stage, n, shape.n_expert)?);
         let cards: Vec<usize> = ffn.iter().map(|f| f.n_card).collect();
+        let common = CommonForms::of(ffn.iter().filter_map(PlacedFfn::common));
         let live = o.glue.source().is_some();
         let maps = if o.rows > GEMV_COLS {
             layer_maps(stream, &stage, n, shape.n_expert)?
@@ -574,6 +791,7 @@ impl Placed {
             g32: (o.rows > GEMV_COLS)
                 .then(|| Gemm32Kernels::load(ctx))
                 .transpose()?,
+            card: common.any().then(|| CardLeg::load(gpu)).transpose()?,
         };
         let placed = Placed {
             hybrid,
@@ -586,8 +804,8 @@ impl Placed {
                 k,
                 cap: o.rows,
             },
-            step: PlacedRows::new(stream, shape, STEP_ROWS, &[])?,
-            pass: PlacedRows::new(stream, shape, o.rows, &cards)?,
+            step: PlacedRows::new(stream, shape, STEP_ROWS, (&[], common))?,
+            pass: PlacedRows::new(stream, shape, o.rows, (&cards, common))?,
             pass_hsum: DeviceBuffer::zeroed(stream, o.rows * shape.hidden)?,
             glue: o.glue,
         };
@@ -597,7 +815,12 @@ impl Placed {
             .filter(|&&c| c > 0)
             .map(|&c| route_bytes(o.rows * shape.pitch, c))
             .sum();
-        let counted = placed_total(d, n, o.rows, if o.rows > GEMV_COLS { tables } else { 0 })?;
+        let counted = placed_total(
+            d,
+            n,
+            o.rows,
+            (if o.rows > GEMV_COLS { tables } else { 0 }, common),
+        )?;
         if made as u64 != counted {
             return Err(GpuError::shape(
                 WHAT,
@@ -619,6 +842,15 @@ impl Placed {
     /// [`HostTier::xstream_start`]: crate::host::HostTier::xstream_start
     pub(super) fn start_xstream(&mut self, gpu: &Gpu, costs: Costs) -> Result<(), GpuError> {
         let shape = self.side.shape;
+        if let Some(l) = self.side.ffn.iter().position(|f| f.common().is_some()) {
+            return Err(GpuError::shape(
+                "BLOOMERY_XSTREAM",
+                format!(
+                    "split on a placed load whose layer {l} runs its card experts through the \
+                     common leg: the ring pass reads the dispatch's K-quant words only"
+                ),
+            ));
+        }
         if self.side.cap <= GEMV_COLS {
             return Err(GpuError::shape(
                 "BLOOMERY_XSTREAM",
@@ -764,6 +996,19 @@ impl Placed {
 /// know; [`Placed::new`] checks the load against the count at its split. A
 /// chain of dense FFNs is refused by name.
 pub(super) fn placed_bytes(d: &Dims, layers: usize, rows: usize) -> Result<u64, GpuError> {
+    placed_bytes_with(d, layers, rows, CommonForms::NONE)
+}
+
+/// [`placed_bytes`] for a load with the common-leg layers `common` names:
+/// their buffers counted beside the rest, at the forms the plan's types hold
+/// (a load whose plan gives none of a form's layers card experts holds fewer,
+/// which [`Placed::new`] checks at its split).
+pub(super) fn placed_bytes_with(
+    d: &Dims,
+    layers: usize,
+    rows: usize,
+    common: CommonForms,
+) -> Result<u64, GpuError> {
     let s = RouteShape::of(d)?;
     let slots = rows * s.pitch;
     let table = route_bytes(slots, s.n_expert).max(route_bytes(slots, 1));
@@ -771,13 +1016,19 @@ pub(super) fn placed_bytes(d: &Dims, layers: usize, rows: usize) -> Result<u64, 
         d,
         layers,
         rows,
-        if rows > GEMV_COLS { layers * table } else { 0 },
+        (if rows > GEMV_COLS { layers * table } else { 0 }, common),
     )
 }
 
 /// [`placed_bytes`] with the layers' tables counted as `tables` bytes in all
-/// (past [`GEMV_COLS`] rows).
-fn placed_total(d: &Dims, layers: usize, rows: usize, tables: usize) -> Result<u64, GpuError> {
+/// (past [`GEMV_COLS`] rows), and the common-leg layers' buffers of `common`'s
+/// forms in the step's and the pass's arena.
+fn placed_total(
+    d: &Dims,
+    layers: usize,
+    rows: usize,
+    (tables, common): (usize, CommonForms),
+) -> Result<u64, GpuError> {
     let s = RouteShape::of(d)?;
     let shared = |r: usize| {
         if s.shared() {
@@ -799,7 +1050,9 @@ fn placed_total(d: &Dims, layers: usize, rows: usize, tables: usize) -> Result<u
         + leg(1, 1)
         + leg(rows, rows.min(GEMV_COLS))
         + rows * s.hidden * 4
-        + maps;
+        + maps
+        + common.bytes(s, STEP_ROWS)
+        + common.bytes(s, rows);
     u64::try_from(total).map_err(|_| GpuError::shape(WHAT, "the placed side's bytes pass u64"))
 }
 
@@ -817,8 +1070,18 @@ pub(super) fn prompt_rows(u: usize, ctx: usize) -> usize {
 /// (`model::placement::workstation::placed_with_arena`), and what [`counted_arena`]
 /// holds the load to.
 pub(super) fn placed_scratch(d: &Dims, layers: usize, forms: Forms) -> Result<u64, GpuError> {
+    placed_scratch_with(d, layers, (forms, CommonForms::NONE))
+}
+
+/// [`placed_scratch`] for a load with the common-leg layers `common` names
+/// ([`placed_bytes_with`]).
+pub(super) fn placed_scratch_with(
+    d: &Dims,
+    layers: usize,
+    (forms, common): (Forms, CommonForms),
+) -> Result<u64, GpuError> {
     let arena = arena_bytes(d, prompt_rows(PLACED_ROWS, d.ctx), forms) as u64;
-    Ok(arena + placed_bytes(d, layers, PLACED_ROWS)?)
+    Ok(arena + placed_bytes_with(d, layers, PLACED_ROWS, common)?)
 }
 
 /// The ubatch arena of `d` for ubatches of `u` tokens on a placed load,
@@ -964,6 +1227,44 @@ pub(super) fn apart_plans(plans: Vec<LayerPlan>) -> Vec<LayerPlan> {
         .collect()
 }
 
+/// Layer `l`'s routed stacks `[gate, up, down]` of `n` experts of `ff` rows of
+/// `h` values, each a resident word plane of its shape ([`DevWeight::KQuant`]:
+/// the file's blocks), as their file types: the types the placed card leg's
+/// classifier reads ([`accepts::qwen35_leg`]). A stack that is not one, or of
+/// another shape, is refused by name with the layer.
+fn stack_files(
+    w: &Weights,
+    names: [&str; 3],
+    (n, ff, h): (usize, usize, usize),
+    l: usize,
+) -> Result<[GgmlType; 3], GpuError> {
+    let stack = |name: &str, rows: usize, k: usize| -> Result<GgmlType, GpuError> {
+        let Some(DevWeight::KQuant { ty, w: t, k: wk }) = w.get(name) else {
+            return Err(GpuError::tensor(
+                WHAT,
+                name,
+                "a resident K-quant word plane (the file's blocks)",
+            ));
+        };
+        if t.rows() != rows || *wk != k {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}: {name} is {ty} {} rows x {wk}; the chain takes {rows} rows x {k}",
+                    t.rows()
+                ),
+            ));
+        }
+        Ok(*ty)
+    };
+    let [gate, up, down] = names;
+    Ok([
+        stack(gate, n * ff, h)?,
+        stack(up, n * ff, h)?,
+        stack(down, n * h, ff)?,
+    ])
+}
+
 /// Layer `l`'s card stacks under `map` (module doc, [`Placed::new`]): their
 /// slots are the map's capacity, which a residency machine's evictions and
 /// admissions leave as it is (`SlotMap::evict`), where the live count drops
@@ -982,11 +1283,32 @@ fn placed_ffn(
         model::arch::qwen3moe::names::ffn_down_exps(l),
     );
     let (h, ff) = (s.hidden, s.ff);
-    let (gate_up, down_ty) = if n_card > 0 {
-        let [g, u, d] = stack_tys(w, [&gate, &up, &down], (n_card, ff, h), l)?;
-        (Some(gate_up_entry(g, u, WHAT)?), d)
+    let leg = if n_card > 0 {
+        let tys = stack_files(w, [&gate, &up, &down], (n_card, ff, h), l)?;
+        Some(match accepts::qwen35_leg(tys) {
+            Some(Leg35::Dispatch) => {
+                let [g, u, d] = stack_tys(w, [&gate, &up, &down], (n_card, ff, h), l)?;
+                FfnLeg::Dispatch {
+                    gate_up: gate_up_entry(g, u, WHAT)?,
+                    down_ty: d,
+                }
+            }
+            Some(Leg35::Common) => FfnLeg::Common {
+                gate_up: tys[0],
+                down: tys[2],
+            },
+            None => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {l}'s card stacks are {tys:?} (gate, up, down): no card leg runs \
+                         them (`accepts::qwen35_leg`)"
+                    ),
+                ));
+            }
+        })
     } else {
-        (None, p.ffn.down_ty)
+        None
     };
     let shared = match &p.ffn.route {
         FfnRoute::Router {
@@ -1028,8 +1350,7 @@ fn placed_ffn(
         gate,
         up,
         down,
-        gate_up,
-        down_ty,
+        leg,
         shared,
     })
 }
@@ -1188,47 +1509,53 @@ fn shadow(
     } = side.shape;
     let i = s.col(m)?;
     if f.n_card > 0 {
-        let n_slots = m * pitch;
-        let entry = f.gate_up.ok_or(GpuError::state(
-            WHAT,
-            "a gate·up entry for a layer with card experts",
-        ))?;
-        gate_up_sel(
-            (stream, &side.k.kquant),
-            entry,
-            &GateUpAct {
-                wg: kq_weight(w, &f.gate)?,
-                wu: kq_weight(w, &f.up)?,
-                act: &s.act_ffn[i],
-                sel: &rows.sel,
-                n_slots,
-                rows_per_expert: ff,
-                slots_per_col: pitch,
-                rule: Act::SiluMul,
-            },
-            c.sink,
-            &mut s.h,
-        )?;
-        gpu.q4k_sel().enqueue_quantize_sel(
-            stream,
-            &QuantSel {
-                x: &s.h,
-                cols: 0..n_slots,
-                sel: &rows.sel,
-                n_card: f.n_card,
-            },
-            c.sink,
-            &mut s.act_h[i],
-        )?;
-        down_sel(
-            (gpu, k, &side.k.kquant),
-            (f.down_ty, kq_weight(w, &f.down)?),
-            (&s.act_h[i], &rows.sel),
-            n_slots,
-            hidden,
-            c.sink,
-            &mut s.down,
-        )?;
+        match f.leg {
+            Some(FfnLeg::Dispatch { gate_up, down_ty }) => {
+                let n_slots = m * pitch;
+                gate_up_sel(
+                    (stream, &side.k.kquant),
+                    gate_up,
+                    &GateUpAct {
+                        wg: kq_weight(w, &f.gate)?,
+                        wu: kq_weight(w, &f.up)?,
+                        act: &s.act_ffn[i],
+                        sel: &rows.sel,
+                        n_slots,
+                        rows_per_expert: ff,
+                        slots_per_col: pitch,
+                        rule: Act::SiluMul,
+                    },
+                    c.sink,
+                    &mut s.h,
+                )?;
+                gpu.q4k_sel().enqueue_quantize_sel(
+                    stream,
+                    &QuantSel {
+                        x: &s.h,
+                        cols: 0..n_slots,
+                        sel: &rows.sel,
+                        n_card: f.n_card,
+                    },
+                    c.sink,
+                    &mut s.act_h[i],
+                )?;
+                down_sel(
+                    (gpu, k, &side.k.kquant),
+                    (down_ty, kq_weight(w, &f.down)?),
+                    (&s.act_h[i], &rows.sel),
+                    n_slots,
+                    hidden,
+                    c.sink,
+                    &mut s.down,
+                )?;
+            }
+            Some(FfnLeg::Common { down, .. }) => {
+                common_shadow(c, side, rows, s, normed, (f, down, m))?;
+            }
+            None => {
+                return Err(GpuError::state(WHAT, "a leg for a layer with card experts"));
+            }
+        }
     }
     match (&f.shared, rows.shared.as_mut()) {
         (Some(SharedFfn::Stack(sh)), Some(r)) => shared_stack(c, side, (sh, r), s, m)?,
@@ -1239,6 +1566,146 @@ fn shadow(
         }
     }
     Ok(())
+}
+
+/// The plan's card leg arms the common-leg layers' stacks are admitted by
+/// ([`accepts::leg_arms`] of the qwen35moe body), and what a refusal of a
+/// stack of another type names.
+fn common_stacks<'a>(w: &'a Weights, f: &'a PlacedFfn) -> Result<LegStacks<'a>, GpuError> {
+    let arms = accepts::leg_arms(accepts::Program::Qwen35Body)
+        .ok_or(GpuError::state(WHAT, "the qwen35moe body's card leg arms"))?;
+    LegStacks::of_arms(
+        w,
+        [&f.gate, &f.up, &f.down],
+        arms,
+        (
+            "a resident routed gate or up stack of a type the qwen35moe card leg runs \
+             (`accepts::qwen35_common_gate_up`)",
+            "a resident routed down stack of a type the qwen35moe card leg runs \
+             (`accepts::qwen35_common_down`)",
+        ),
+    )
+}
+
+/// Layer `c.layer`'s card experts through the common leg over `m` rows of the
+/// gemv arm's width (at most [`GEMV_COLS`]): the four launches of
+/// [`CardLeg::enqueue_rows`] over the f32 normed rows (`normed`, the step
+/// boundary's, or the arena's own when `None`) and the places in `rows`,
+/// writing the slots' down rows into the arena's `down` as the dispatch's
+/// launches do. `f` the layer's placed FFN and `down` the file type of its
+/// down.
+fn common_shadow(
+    c: &Ctx<'_>,
+    side: &PlacedSide,
+    rows: &mut PlacedRows,
+    s: &mut Arena,
+    normed: Option<&DeviceBuffer<f32>>,
+    (f, down, m): (&PlacedFfn, GgmlType, usize),
+) -> Result<(), GpuError> {
+    let leg = side.k.card.as_ref().ok_or(GpuError::state(
+        WHAT,
+        "the common card leg's modules on a load with a common-leg layer",
+    ))?;
+    let PlacedRows { sel, common, .. } = rows;
+    let bufs = common
+        .as_mut()
+        .ok_or(GpuError::state(
+            WHAT,
+            "the common-leg buffers of a load with a common-leg layer",
+        ))?
+        .bufs(down)?;
+    let stacks = common_stacks(c.w, f)?;
+    stacks.check(f.n_card, bufs.shape())?;
+    let Arena {
+        normed: own,
+        down: out,
+        ..
+    } = s;
+    let run = LegRun {
+        layer: c.layer,
+        stacks: &stacks,
+        normed: normed.unwrap_or(&*own),
+        m,
+        sel,
+        n_card: f.n_card,
+        rule: Act::SiluMul,
+    };
+    leg.enqueue_rows(c.gpu, bufs, &run, out)
+}
+
+/// Layer `c.layer`'s card experts through the common leg over `m` rows past
+/// the gemv arm's width: the layer's routed table through its map, the unit's
+/// normed rows in the form the gate and up route GEMMs read, and the routed
+/// block ([`RouteBlock`]: gate, up, the SwiGLU into the form the down reads,
+/// down) over the card's stacks, writing the slots' down rows into the arena's
+/// `down` as the dispatch's wide route does. The shared expert is the caller's.
+fn common_wide(
+    c: &Ctx<'_>,
+    side: &PlacedSide,
+    (table, common): (&mut GemmRoute, &mut CommonRows),
+    s: &mut Arena,
+    (f, map, m): (&PlacedFfn, &DeviceBuffer<u32>, usize),
+) -> Result<(), GpuError> {
+    let g32 = side.k.g32.as_ref().ok_or(GpuError::state(
+        WHAT,
+        "the 32-value kernels of a side whose units run the wide arm",
+    ))?;
+    let stack = common_stacks(c.w, f)?;
+    let [gate, up, down] = stack.routes()?;
+    let (gpu, stream) = (c.gpu, c.gpu.stream());
+    let CommonWide { x, h, g, u } = common.wide.as_mut().ok_or(GpuError::state(
+        WHAT,
+        "the wide arm's buffers of a load with a common-leg layer",
+    ))?;
+    let d = s.dims;
+    let slots = d.slots();
+    let Arena {
+        normed,
+        route,
+        down: out,
+        ..
+    } = s;
+    g32.enqueue_route_remap(stream, route.ids(), map, m * slots, table, c.sink)?;
+    match gate {
+        RouteW::Grouped(..) => {
+            let a = x.q128.as_mut().ok_or(GpuError::state(
+                WHAT,
+                "the unit's q8_1 rows of 128 a grouped gate and up read",
+            ))?;
+            gpu.enqueue_quantize_gemm(normed, m, a, c.sink)?;
+        }
+        RouteW::Blocks32(_) => {
+            let a = x.q32.as_mut().ok_or(GpuError::state(
+                WHAT,
+                "the unit's q8 rows of 32 a 32-value gate and up read",
+            ))?;
+            g32.enqueue_quantize_gemm32(stream, normed, m, a, c.sink)?;
+        }
+    }
+    let blk = RouteBlock {
+        gate,
+        up,
+        down,
+        ff: d.ff,
+        hidden: d.hidden,
+        rule: Act::SiluMul,
+    };
+    blk.enqueue(
+        gpu,
+        (&c.k.gemm, g32),
+        (&*table, slots),
+        m * slots,
+        RouteIo {
+            x128: x.q128.as_ref(),
+            x32: x.q32.as_ref(),
+            g,
+            u,
+            h128: h.q128.as_mut(),
+            h32: h.q32.as_mut(),
+            y: out,
+        },
+        c.sink,
+    )
 }
 
 /// Layer `c.layer`'s shared expert as a stack of one expert on a fixed route
@@ -1356,6 +1823,7 @@ fn gate_up_sel(
         GateUpEntry::Q4k => kq.enqueue_gate_up_q4k(stream, a, sink, h),
         GateUpEntry::Q5k => kq.enqueue_gate_up_q5k(stream, a, sink, h),
         GateUpEntry::Q8_0
+        | GateUpEntry::Q6k
         | GateUpEntry::Iq2xs
         | GateUpEntry::Iq3xxs
         | GateUpEntry::Iq3s
@@ -1530,8 +1998,8 @@ fn card_wide(
         WHAT,
         "a map of the card's experts for every layer of a wide unit",
     ))?;
-    let table = rows
-        .routes
+    let PlacedRows { routes, common, .. } = rows;
+    let table = routes
         .get_mut(c.layer)
         .ok_or(GpuError::state(
             WHAT,
@@ -1542,6 +2010,25 @@ fn card_wide(
         WHAT,
         "the remap kernels of a side whose units run the wide arm",
     ))?;
+    let f = side
+        .ffn
+        .get(c.layer)
+        .ok_or(GpuError::state(WHAT, "a placed FFN for every layer"))?;
+    // A common-leg layer's routed experts run through the common leg; the
+    // wide arm's own routed GEMMs (the table) are the dispatch layers'.
+    let table = match (f.common(), table, common.as_mut()) {
+        (Some(_), Some(table), Some(common)) => {
+            common_wide(c, side, (table, common), s, (f, map, m))?;
+            None
+        }
+        (Some(_), _, _) => {
+            return Err(GpuError::state(
+                WHAT,
+                "a table and the common-leg buffers for a common-leg layer with card experts",
+            ));
+        }
+        (None, table, _) => table,
+    };
     wide::ffn_card(c, &c.p.ffn, s, m, Some(CardRoute { map, table, remap }))
 }
 

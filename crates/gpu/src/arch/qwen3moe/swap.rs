@@ -136,36 +136,49 @@ mod tests {
         }
     }
 
-    /// Qwen3.6's leg: a Q4_K or Q5_K gate and up of one type with a Q4_K,
-    /// Q5_K or Q6_K down is a card layer; a Q6_K gate and up (a type its
-    /// down runs, not its gate·up), a gate and up of two types, a Q6_K up
-    /// beside a Q4_K gate and a carded layer with a stack of a type the leg
-    /// does not run (a Q5_1 down, an IQ4_XS gate) are refused by name.
-    /// Mutant: Qwen3.8's down arm for Qwen3.6's — the Q4_K and Q6_K downs are
-    /// refused and the Q5_1 one passes.
+    /// Qwen3.6's leg: the dispatch's types (a Q4_K or Q5_K gate and up of one
+    /// type with a Q4_K, Q5_K or Q6_K down) and the common leg's (a Q6_K, Q8_0,
+    /// IQ3_XXS or IQ4_XS gate and up of one type with a down any of the
+    /// common down arm's types) are card layers; a gate and up of two types,
+    /// and a carded layer with a stack of a type no card launch runs (an
+    /// IQ2_XS gate: no prompt GEMM, an MXFP4 down) are refused by name, the
+    /// refusal listing both arms' types in file order. PIN(2026-10-22): the
+    /// IQ4_XS and Q6_K gate and up and the Q5_1 down moved from refused to card
+    /// layers when `placement::accepts` gave the body the common leg's arms.
+    /// Mutant: the dispatch's arms (`accepts::qwen35_gate_up`/`qwen35_down`)
+    /// for the common ones in `leg_arms` — the IQ4_XS, Q6_K, Q8_0 and IQ3_XXS
+    /// layers are refused.
     #[test]
     fn qwen36s_leg_checks_a_card_layer_against_its_launches() {
-        use GgmlType::{IQ4_XS, Q4_K, Q5_1, Q5_K, Q6_K};
+        use GgmlType::{IQ2_XS, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0};
         for ok in [
             [Q4_K, Q4_K, Q4_K],
             [Q4_K, Q4_K, Q6_K],
             [Q5_K, Q5_K, Q5_K],
             [Q5_K, Q5_K, Q6_K],
+            [Q4_K, Q4_K, Q5_1],
+            [IQ4_XS, IQ4_XS, Q4_K],
+            [Q8_0, Q8_0, Q8_0],
+            [IQ3_XXS, IQ3_XXS, IQ4_NL],
+            [Q6_K, Q6_K, Q4_K],
+            [Q6_K, Q6_K, Q8_0],
         ] {
             assert_eq!(layer::<Leg35>(ok), Ok(()), "{ok:?}");
         }
         for bad in [
-            [Q4_K, Q4_K, Q5_1],
-            [IQ4_XS, IQ4_XS, Q4_K],
-            [Q6_K, Q6_K, Q4_K],
+            [IQ2_XS, IQ2_XS, Q4_K],
+            [Q4_K, Q4_K, MXFP4],
             [Q4_K, Q5_K, Q4_K],
             [Q4_K, Q6_K, Q4_K],
-            [Q6_K, Q6_K, Q6_K],
+            [Q6_K, Q8_0, Q6_K],
         ] {
             let text = layer::<Leg35>(bad).expect_err(&format!("{bad:?} is refused"));
             assert!(
                 text.contains("layer 0's gate")
-                    && text.ends_with("a gate and an up of one type, [Q4_K, Q5_K], and a down of [Q4_K, Q5_K, Q6_K]"),
+                    && text.ends_with(
+                        "a gate and an up of one type, [Q8_0, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_XS], \
+                         and a down of [Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_NL, IQ4_XS]"
+                    ),
                 "{text}"
             );
         }
@@ -214,17 +227,17 @@ mod tests {
     /// layer 2 arm catches it.
     #[test]
     fn the_table_checks_every_layer() {
-        use GgmlType::{Q4_K, Q6_K};
+        use GgmlType::{IQ2_XS, Q4_K, Q6_K};
         let three = |l: usize| {
             if l == 2 {
-                [Q6_K, Q6_K, Q4_K]
+                [IQ2_XS, IQ2_XS, Q4_K]
             } else {
                 [Q4_K, Q4_K, Q6_K]
             }
         };
         match stacks::<Leg35>(&model(4, three), |_| Ok(true)) {
             Err(GpuError::Shape { detail, .. }) => {
-                assert!(detail.starts_with("layer 2's gate q6_K"), "{detail}");
+                assert!(detail.starts_with("layer 2's gate iq2_xs"), "{detail}");
             }
             _ => panic!("layer 2 is refused by name"),
         }
@@ -240,14 +253,14 @@ mod tests {
     }
 
     /// A layer the plan gives no card expert loads whatever its types: the
-    /// leg never runs its stacks, so a gate and an up of two card types (or a
-    /// Q6_K gate and up on Qwen3.6's leg) is refused only on a carded layer.
+    /// leg never runs its stacks, so a gate and an up of two card types (or an
+    /// IQ2_XS gate and up on Qwen3.6's leg) is refused only on a carded layer.
     /// Mutant: the check run on every layer whatever `carded` says — the
     /// uncarded arms are refused.
     #[test]
     fn a_layer_with_no_card_expert_is_not_checked() {
-        use GgmlType::{Q4_K, Q5_K, Q6_K};
-        for bad in [[Q4_K, Q5_K, Q4_K], [Q6_K, Q6_K, Q4_K]] {
+        use GgmlType::{IQ2_XS, Q4_K, Q5_K};
+        for bad in [[Q4_K, Q5_K, Q4_K], [IQ2_XS, IQ2_XS, Q4_K]] {
             let two = model(2, |_| bad);
             assert!(
                 stacks::<Leg35>(&two, |_| Ok(false)).is_ok(),

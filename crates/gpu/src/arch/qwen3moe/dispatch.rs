@@ -1151,6 +1151,7 @@ fn slots_down(
                 &mut s.h,
             )?,
             GateUpEntry::Q8_0
+            | GateUpEntry::Q6k
             | GateUpEntry::Iq2xs
             | GateUpEntry::Iq3xxs
             | GateUpEntry::Iq3s
@@ -1376,6 +1377,7 @@ fn apart_down(
         GateUpEntry::Q4k => kk.kq.enqueue_gate_up_q4k(stream, &gate_up, c.sink, h)?,
         GateUpEntry::Q5k => kk.kq.enqueue_gate_up_q5k(stream, &gate_up, c.sink, h)?,
         GateUpEntry::Q8_0
+        | GateUpEntry::Q6k
         | GateUpEntry::Iq2xs
         | GateUpEntry::Iq3xxs
         | GateUpEntry::Iq3s
