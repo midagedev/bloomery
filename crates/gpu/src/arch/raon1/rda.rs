@@ -596,7 +596,7 @@ pub(super) mod tests {
     pub(crate) struct Lcg(pub(crate) u64);
 
     impl Lcg {
-        fn next(&mut self) -> u64 {
+        pub(crate) fn next(&mut self) -> u64 {
             self.0 = self
                 .0
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -615,7 +615,7 @@ pub(super) mod tests {
 
     /// A file tensor of the test's layers: its name, type, ggml dims (the
     /// contiguous axis first) and bytes.
-    pub(crate) struct Part(String, GgmlType, Vec<usize>, Vec<u8>);
+    pub(crate) struct Part(String, GgmlType, Vec<usize>, pub(crate) Vec<u8>);
 
     /// A file tensor of `ty` over `dims` whose bytes are `bytes` as they stand.
     pub(crate) fn raw(name: String, ty: GgmlType, dims: Vec<usize>, bytes: Vec<u8>) -> Part {

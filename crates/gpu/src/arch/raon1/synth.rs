@@ -5,10 +5,9 @@
 //! small where none does; the weights are random with small scales, so every value is finite.
 
 use super::body::Body;
-use super::rda::tests::same;
+use super::rda::tests::{Lcg, f32s, q6k, q8_0, same};
 use crate::model::GpuModel;
 use crate::{Gpu, GpuError};
-use gguf::quant::Q8Block;
 use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GgmlType, Split, Value};
 use std::path::PathBuf;
@@ -34,47 +33,15 @@ const VOCAB: usize = 512;
 const LAYERS: usize = 3;
 const CTX: usize = 128;
 
-/// A 64-bit LCG (Knuth's MMIX constants).
-struct Lcg(u64);
-
-impl Lcg {
-    fn next(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        self.0 >> 40
-    }
-
-    fn uniform(&mut self, (lo, hi): (f32, f32)) -> f32 {
-        lo + (hi - lo) * (self.next() as f32 / (1u64 << 24) as f32)
-    }
-}
-
 /// `n` values of type `ty` as the file holds them: F32 values in `range`, or blocks of random
 /// codes under a small scale, so every weight is finite and small.
 fn values(r: &mut Lcg, ty: GgmlType, n: usize, range: (f32, f32)) -> Vec<u8> {
+    let name = String::new();
+    let dims = vec![n];
     match ty {
-        GgmlType::F32 => (0..n)
-            .flat_map(|_| r.uniform(range).to_le_bytes())
-            .collect(),
-        GgmlType::Q8_0 => {
-            let mut bytes = Vec::with_capacity(n / 32 * 34);
-            for _ in 0..n / 32 {
-                let x: [f32; 32] = std::array::from_fn(|_| r.uniform((-0.05, 0.05)));
-                let q = Q8Block::quantize_ref(&x).expect("a finite block");
-                bytes.extend(q.d.to_le_bytes());
-                bytes.extend(q.q.map(|c| c.to_le_bytes()[0]));
-            }
-            bytes
-        }
-        GgmlType::Q6_K => (0..n / 256 * 210)
-            .map(|i| match i % 210 {
-                192..=207 => ((r.next() % 9) as i8 - 4).to_le_bytes()[0],
-                209 => 0x14,
-                _ => r.next() as u8,
-            })
-            .collect(),
+        GgmlType::F32 => f32s(r, name, dims, range).3,
+        GgmlType::Q8_0 => q8_0(r, name, dims).3,
+        GgmlType::Q6_K => q6k(r, name, dims).3,
         GgmlType::Q4_K => (0..n / 256 * 144)
             .map(|i| match i % 144 {
                 1 | 3 => 0x14,
@@ -254,14 +221,10 @@ fn keys() -> Vec<(String, Value)> {
 
 /// The bytes `n` values of type `ty` take in the file.
 fn nbytes(ty: GgmlType, n: usize) -> usize {
-    match ty {
-        GgmlType::F32 => 4 * n,
-        GgmlType::Q8_0 => n / 32 * 34,
-        GgmlType::Q6_K => n / 256 * 210,
-        GgmlType::Q4_K => n / 256 * 144,
-        GgmlType::Q5_0 => n / 32 * 22,
-        other => panic!("the synthetic file holds no {other:?} tensor"),
-    }
+    let row = ty.row().expect("a known fixture tensor type");
+    let n = u64::try_from(n).expect("fixture element count fits u64");
+    let bytes = gguf::tensor_bytes(row.blck, row.bytes, &[n]).expect("fixture byte count fits u64");
+    usize::try_from(bytes).expect("fixture byte count fits usize")
 }
 
 /// The file of [`tensors`]`(out)` written to a temporary path named by `tag`.
