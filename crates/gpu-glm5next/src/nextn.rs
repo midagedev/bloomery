@@ -581,16 +581,25 @@ impl Held {
         self.rows = self.rows.min(pos.saturating_sub(self.first));
     }
 
-    /// Whether rows `row .. row + m` hold positions `at .. at + m`.
+    /// Whether rows `row .. row + m` hold positions `at .. at + m`. A range
+    /// whose end, or whose first position, is past `usize` holds nothing.
     fn holds(&self, row: usize, m: usize, at: u32) -> bool {
-        row + m <= self.rows as usize && self.first as usize + row == at as usize
+        let (Some(end), Some(first)) = (row.checked_add(m), (self.first as usize).checked_add(row))
+        else {
+            return false;
+        };
+        end <= self.rows as usize && first == at as usize
     }
 
     /// The positions held, for a refusal's words.
     fn shown(&self) -> String {
         match self.rows {
             0 => "no position".to_string(),
-            r => format!("positions {}..{}", self.first, self.first + r),
+            r => format!(
+                "positions {}..{}",
+                self.first,
+                u64::from(self.first) + u64::from(r)
+            ),
         }
     }
 }
@@ -707,10 +716,9 @@ fn hidden_src<'a>(
         Src::Rows { rows, .. } => rows,
         Src::Pair { .. } => 2,
     };
-    if first + m > rows {
+    if first.checked_add(m).is_none_or(|end| end > rows) {
         return Err(shape(format!(
-            "rows {first}..{} of the {walk:?} arena's {rows}",
-            first + m
+            "{m} rows from row {first} of the {walk:?} arena's {rows}"
         )));
     }
     let at = pos0.checked_sub(1).ok_or_else(|| {

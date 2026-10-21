@@ -1491,6 +1491,23 @@ mod gate {
             ),
             "of the Step arena's 1",
         );
+        ok &= refused(
+            "target rows from a first row whose end wraps",
+            nextn_walk(
+                m,
+                f(
+                    &toks[..1],
+                    0,
+                    Hidden::Target {
+                        walk: GlmArena::Step,
+                        first: usize::MAX,
+                    },
+                ),
+                DraftHead::Full,
+                WalkMode::Eager,
+            ),
+            &format!("1 rows from row {} of the Step arena's 1", usize::MAX),
+        );
         let mut out = [0u32; 1];
         ok &= refused(
             "a chain with an own walk",

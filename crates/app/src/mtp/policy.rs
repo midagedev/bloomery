@@ -792,7 +792,9 @@ mod tests {
                         .checked_sub(1)
                         .ok_or("the target holds no row before position 0")?;
                     let h = self.arenas[walk as usize];
-                    if first + m > h.rows || h.first as usize + first != at as usize {
+                    if first.checked_add(m).is_none_or(|end| end > h.rows)
+                        || (h.first as usize).checked_add(first) != Some(at as usize)
+                    {
                         return Err(format!(
                             "rows {first}..{} of the {walk:?} arena as positions {at}..{} for a \
                              walk from {}: the arena holds {}..{}",

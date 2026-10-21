@@ -841,7 +841,11 @@ impl Held38 {
     fn shown(self) -> String {
         match self.rows {
             0 => "no position".to_string(),
-            r => format!("positions {}..{}", self.first, self.first + r),
+            r => format!(
+                "positions {}..{}",
+                self.first,
+                u64::from(self.first) + u64::from(r)
+            ),
         }
     }
 }
