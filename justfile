@@ -1277,6 +1277,16 @@ gate-gpu-qwen35moe-moe *ARGS:
 gate-gpu-qwen35moe-e2e:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e'
 
+# Qwen3.6's placed load on the common card leg's types (`gate_qwen35moe_e2e --common-placed-only`, clause (o9)): the file planned
+# with no card expert (the host tier's chain) and at (o)'s budget, the card running every layer's experts by the leg its types name
+# (`accepts::qwen35_leg`). Asserted: the planner's counted arena is the load's, the common layers hold card experts, the prompt
+# call is the fifth step's bits, each layer's output after five steps stays within the host tier's arithmetic band, and a wide
+# unit's logits stand within the band of the host tier's and of the same load's one-token steps. Runs on the fixture variants whose
+# routed stacks are a type the dispatch's launches do not run (tools/fixture-variants.tsv); the base fixture runs the dispatch's.
+[group('pool')]
+gate-gpu-qwen35moe-leg:
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e --common-placed-only'
+
 # The Qwen3.6 verify gate (one card): a load opened to verify drafted rows (`open_verifying`: 8 stamped lanes a delta layer)
 # commits every `accepted` in 1..=m of a verify of m = 4 and 8 rows with no re-feed and no copy, and the 16 steps after it
 # give the plain load's ids and last logits bit for bit (graph and eager, a chain of commits too); a lookup draft over

@@ -425,12 +425,13 @@ mod gate {
     use bloomery_levers::{CARD_BUDGET, HostCfg};
     use cuda_core::sys;
     use gguf::Split;
-    use gguf::quant::half_to_f32;
+    use gguf::quant::{GgmlType, half_to_f32};
     use model::arch::models::Mixer;
     use model::arch::models::shape::{AttnShape, MoeShape};
     use model::arch::qwen35moe::hparams::Hparams;
     use model::arch::qwen35moe::names;
     use model::placement::PlanLevers;
+    use model::placement::accepts::{self, Leg35};
     use refset::arch::qwen35moe::fixture as fx;
     use refset::arch::qwen35moe::{BATCH, D1K, IK, MODEL, STEP4};
     use runtime::{Out, Target, Want};
@@ -1463,6 +1464,14 @@ mod gate {
     /// their arithmetic is the host's own, 5.1e-3 to 5.5e-3 in today's six
     /// runs; 2e-2 is four times the larger.
     const FREE_PROBE_HOST: f64 = 2e-2;
+    /// PIN(2026-10-22): (o9)'s wide unit's last-row logits against the host
+    /// tier's wide unit over the same ids (the card runs the experts through
+    /// the route GEMMs on q8_1 rows, the host through ik's 8-bit rule):
+    /// 1.90e-2 to 2.26e-2 in today's five runs (the base fixture's dispatch
+    /// layers and the variants `q35iq4xs`, `q35q80`, `q35iq4q8` and `q35q6k`);
+    /// 1e-1 is four times the larger. A route block whose gate and up weights
+    /// are swapped reads 4.8e-1 on `q35q6k`.
+    const COMMON_WIDE_REL: f64 = 1e-1;
 
     /// The free-running clause: every layer's output of the one-token
     /// chain against ik's `l_out-L` within [`FREE_BAND`], and the last
@@ -3794,6 +3803,309 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------- (o9) the common card leg on the placed load
+
+    /// The layers of `file` whose three routed stacks the common card leg runs
+    /// ([`Leg35::Common`]: a type the dispatch's launches do not), with the
+    /// stacks' file types, read from the header.
+    fn common_layers(file: &Split) -> Result<Vec<(usize, [GgmlType; 3])>, GateError> {
+        let mut out = Vec::new();
+        for l in 0..n_layer() {
+            let mut tys = [GgmlType::F32; 3];
+            for (ty, name) in tys.iter_mut().zip(model::arch::names::routed_stacks(l)) {
+                let (_, t) = file
+                    .find(&name)
+                    .ok_or_else(|| format!("no tensor {name}"))?;
+                *ty = t.ty;
+            }
+            if accepts::qwen35_leg(tys) == Some(Leg35::Common) {
+                out.push((l, tys));
+            }
+        }
+        Ok(out)
+    }
+
+    /// What one placed load of (o9) saw: its plan, its layers' card experts, the
+    /// arena the planner counts against the one the load counts, five graph
+    /// steps with each layer's output, the prompt call against the fifth step,
+    /// a wide unit.
+    struct CommonRun {
+        /// The plan's card experts and host experts.
+        experts: (u64, u64),
+        /// The card experts each layer holds.
+        counts: Vec<usize>,
+        /// The plan's counted arena and placed side, and the load's.
+        scratch: (u64, u64),
+        /// Five graph steps over the batch tokens.
+        steps: PathRun,
+        /// The layers' output rows of each of the five steps, `[step][layer]`.
+        taps: Vec<Vec<Vec<f32>>>,
+        /// The prompt call (a unit within the gemv arm's cut) left the fifth
+        /// step's bits.
+        call_same: bool,
+        /// The wide unit's greedy id and logits.
+        wide: (u32, Vec<f32>),
+        /// The host tier's slots on the step and the batch ports.
+        host_slots: (u64, u64),
+    }
+
+    /// One placed load of (o9) at the card budget `pick` names for the file's
+    /// planner, run over `toks` (the gemv arm) and a wide unit of an lcg's ids.
+    fn common_chain(
+        label: &str,
+        pick: impl FnOnce(&PlaceQ3) -> Result<u64, GateError>,
+        toks: &[u32],
+        host: HostCfg,
+    ) -> Result<CommonRun, GateError> {
+        let file = open_model()?;
+        let o = Open35 {
+            ctx: CTX,
+            mma: true,
+            ubatch: U_GATE,
+            kv: KvQ8::F16,
+            media: false,
+        };
+        let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
+        let budget = pick(&q)?;
+        let levers = PlanLevers {
+            card_budget_bytes: Some(budget),
+        };
+        let plan = q.plan(CTX, &levers)?;
+        for line in q.records(&plan, None)? {
+            line.print();
+        }
+        let experts = (
+            plan.cards.first().ok_or("a plan of no card")?.experts,
+            plan.host.experts,
+        );
+        let card = plan.machine.cards.first().ok_or("a plan of no card")?;
+        let scratch = (
+            model::placement::workstation::counted_arena_bytes(card),
+            GpuModel::<Body35>::placed_arena_bytes(&file, o)?,
+        );
+        let t = Instant::now();
+        let mut m = GpuModel::<Body35>::open_placed(file, &plan, o, host)?;
+        let counts = m
+            .body("gate_qwen35moe_e2e")?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .card_counts()
+            .to_vec();
+        println!(
+            "placed common {label}: card budget {budget} B card_experts={} host_experts={} card \
+             experts per layer {counts:?} resident_bytes={} in {:.1} s (runtime value)",
+            experts.0,
+            experts.1,
+            m.resident_bytes(),
+            t.elapsed().as_secs_f64()
+        );
+        // The gemv arm: five graph steps, then the same five eager with each
+        // layer's output kept.
+        m.set_mode(StepMode::Graph);
+        println!(
+            "placed common {label} capture graph_nodes={}",
+            m.capture_step()?
+        );
+        let mut steps = decode_run(&mut m, toks, false)?;
+        m.set_mode(StepMode::Eager);
+        m.set_layer_taps(true)?;
+        fresh(&mut m)?;
+        let mut taps = Vec::new();
+        for &tok in toks {
+            m.step(&[tok])?;
+            taps.push(m.layer_taps()?);
+        }
+        m.set_layer_taps(false)?;
+        // The prompt call against the fifth step.
+        m.set_mode(StepMode::Graph);
+        fresh(&mut m)?;
+        let plan_p = m.prefill_plan(toks.len(), PrefillPath::Auto)?;
+        let tok = m.prefill_with(toks, PrefillPath::Auto)?;
+        let call = PathRun {
+            logits: vec![m.logits()?],
+            tokens: vec![tok],
+            stores: stores(&mut m)?,
+        };
+        let fifth = PathRun {
+            logits: steps.logits.last().cloned().into_iter().collect(),
+            tokens: steps.tokens.last().copied().into_iter().collect(),
+            stores: std::mem::take(&mut steps.stores),
+        };
+        let call_same = same_run(
+            &format!("placed common {label}: the prompt call ({plan_p}) vs the fifth graph step"),
+            &call,
+            &fifth,
+        );
+        // The wide arm: one unit past the gemv arm's cut, then its ids as steps.
+        let vocab = m.body("gate_qwen35moe_e2e")?.vocab();
+        let ids = lcg_ids(PLACED_UBATCH, vocab);
+        fresh(&mut m)?;
+        let plan_w = m.prefill_plan(ids.len(), PrefillPath::Gemm)?;
+        let next = m.prefill_with(&ids, PrefillPath::Gemm)?;
+        let wide = (next, m.logits()?);
+        println!(
+            "placed common {label}: wide unit of {} ids (plan={plan_w}) token {next}",
+            ids.len()
+        );
+        let stats = m
+            .body("gate_qwen35moe_e2e")?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .hybrid()
+            .stats();
+        Ok(CommonRun {
+            experts,
+            counts,
+            scratch,
+            steps,
+            taps,
+            call_same,
+            wide,
+            host_slots: (stats.host_slots, stats.batch_host_slots),
+        })
+    }
+
+    /// (o9) (module doc): the file's placed load with no card expert (the host
+    /// tier's chain, ik's 8-bit rule) first, then its placed load at (o)'s
+    /// budget, whose card runs every layer's experts by the leg its types name
+    /// ([`accepts::qwen35_leg`]); each load opened and dropped alone.
+    fn placed_common(host: HostCfg) -> Result<bool, GateError> {
+        tier::sc(
+            "(o9) the common card leg on the placed load: the host tier's chain, the card's, the \
+             wide arm",
+        )?;
+        let file = open_model()?;
+        let common = common_layers(&file)?;
+        drop(file);
+        let variant = refset::fixture::selected()?.is_some();
+        let premise = !variant || !common.is_empty();
+        println!(
+            "placed common file: {} of {} layers hold stacks the common card leg runs {:?} {}",
+            common.len(),
+            n_layer(),
+            common.iter().map(|(l, t)| (*l, *t)).collect::<Vec<_>>(),
+            verdict(premise)
+        );
+        if !premise {
+            return Ok(false);
+        }
+        let toks = TEXT_TOKENS;
+        let want = common_chain(
+            "host-only plan",
+            |q| budget_for_card_experts(q, 0),
+            &toks,
+            host,
+        )?;
+        let got = common_chain("plan", |_| Ok(placed_budget()), &toks, host)?;
+        let mut ok = true;
+        // The plans: the reference leaves (about) nothing on the card, the run
+        // splits the experts, and both count the arena the load made.
+        let split = got.experts.0 > 0 && got.experts.1 > 0;
+        let lean = want.experts.0 * 8 <= got.experts.0;
+        let counted = want.scratch.0 == want.scratch.1 && got.scratch.0 == got.scratch.1;
+        println!(
+            "placed common plans: reference card_experts={} host_experts={}, run card_experts={} \
+             host_experts={}; the reference holds at most an eighth of the run's card experts {} \
+             and the run splits {}; the planner's counted scratch is the load's: reference {} B \
+             = {} B, run {} B = {} B {}",
+            want.experts.0,
+            want.experts.1,
+            got.experts.0,
+            got.experts.1,
+            verdict(lean),
+            verdict(split),
+            want.scratch.0,
+            want.scratch.1,
+            got.scratch.0,
+            got.scratch.1,
+            verdict(counted)
+        );
+        ok &= lean && split && counted;
+        // The legs ran: every common layer with card experts is one the run
+        // carded, and a variant has one.
+        let carded: Vec<usize> = common
+            .iter()
+            .map(|&(l, _)| l)
+            .filter(|&l| got.counts.get(l).is_some_and(|&n| n > 0))
+            .collect();
+        let ran = !variant || !carded.is_empty();
+        println!(
+            "placed common legs: {} of the file's {} common layers hold card experts in the run \
+             (layers {carded:?}) {}; host slots on the run's step and batch ports {:?} (both \
+             above 0) {}",
+            carded.len(),
+            common.len(),
+            verdict(ran),
+            got.host_slots,
+            verdict(got.host_slots.0 > 0 && got.host_slots.1 > 0)
+        );
+        ok &= ran && got.host_slots.0 > 0 && got.host_slots.1 > 0;
+        // The gemv arm: the prompt call is the fifth step's bits on each load;
+        // the steps and the layers' outputs against the host tier's.
+        ok &= want.call_same && got.call_same;
+        ok &= forced_calls(
+            "placed common gemv arm, the batch tokens' steps against the host tier's chain",
+            (&got.steps.tokens, &got.steps.logits),
+            (&want.steps.tokens, &want.steps.logits),
+        )?;
+        // Each layer's output of each step against the host tier's: layer l
+        // carries l + 1 layers of the host tier's arithmetic, so its bound is
+        // (l + 1) times one layer's. A near-tie router flip moves one token's
+        // expert set from its layer on, and a wiring fault moves every token's
+        // rows, so the rows over their bound may belong to one token alone.
+        let mut over = std::collections::BTreeSet::new();
+        let mut first_clean = true;
+        for l in 0..want.taps[0].len() {
+            let per_token: Vec<f64> = got
+                .taps
+                .iter()
+                .zip(&want.taps)
+                .map(|(g, w)| rel_to(&g[l], &w[l]))
+                .collect();
+            let bound = (l + 1) as f64 * FREE_PROBE_HOST;
+            let exceed: Vec<usize> = (0..per_token.len())
+                .filter(|&t| per_token[t] > bound || per_token[t].is_nan())
+                .collect();
+            over.extend(exceed.iter().copied());
+            first_clean &= l > 0 || exceed.is_empty();
+            println!(
+                "placed common layer={l} l_out_rel={:.3e} (bound {bound:.1e}, {} layers of the \
+                 host tier's arithmetic) per step {:?}; steps over the bound {exceed:?}",
+                per_token.iter().copied().fold(0.0f64, worse),
+                l + 1,
+                per_token
+                    .iter()
+                    .map(|e| format!("{e:.2e}"))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let layers_ok = over.len() <= 1 && first_clean;
+        println!(
+            "placed common layers: the steps over their bound are {over:?} (at most one step, and \
+             none at layer 0, whose router sees the same input in both loads: a router flip moves \
+             one token's experts, a fault every token's) {}",
+            verdict(layers_ok)
+        );
+        ok &= layers_ok;
+        // The wide arm: a unit past the gemv arm's cut against the host tier's
+        // wide unit over the same ids.
+        ok &= forced_calls(
+            "placed common wide arm against the host tier's",
+            (&[got.wide.0], std::slice::from_ref(&got.wide.1)),
+            (&[want.wide.0], std::slice::from_ref(&want.wide.1)),
+        )?;
+        let (rel, _) = e_distance(&got.wide.1, &want.wide.1);
+        let tight = rel <= COMMON_WIDE_REL;
+        println!(
+            "placed common wide arm: logits rel {rel:.3e} against the host tier's wide unit \
+             (bound {COMMON_WIDE_REL:.0e}) {}",
+            verdict(tight)
+        );
+        ok &= tight;
+        println!("placed common: {}", verdict(ok));
+        Ok(ok)
+    }
+
     const NAME: &str = "gate_qwen35moe_e2e";
 
     // ------------------------------------- (e) residency on the placed load
@@ -4791,6 +5103,11 @@ mod gate {
             let mut ok = proof;
             ok &= placed_unjoined(&toks, host)?;
             return close("gate_qwen35moe_e2e --unjoined-placed-only", ok, 0);
+        }
+        if std::env::args().any(|a| a == "--common-placed-only") {
+            let mut ok = proof;
+            ok &= placed_common(host)?;
+            return close("gate_qwen35moe_e2e --common-placed-only", ok, 0);
         }
         if std::env::args().any(|a| a == "--residency-only") {
             let mut ok = proof;

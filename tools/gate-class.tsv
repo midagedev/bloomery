@@ -143,6 +143,7 @@ gate-gpu-qwen35-dspark	family	qwen35moe	draft	drafts_dspark
 gate-gpu-qwen35-media	family	qwen35	media	serve_media
 gate-gpu-qwen35moe-attn	common		kernel	attn_gqa
 gate-gpu-qwen35moe-e2e	family	qwen35moe	e2e	graph_fault+attn_linear_gdn_kda+attn_gqa+moe_route
+gate-gpu-qwen35moe-leg	family	qwen35moe	tier	tier_legs+placement_sizing
 gate-gpu-qwen35moe-media	family	qwen35moe	media	serve_media
 gate-gpu-qwen35moe-moe	family	qwen35moe	kernel	moe_route
 gate-gpu-qwen35moe-mtp	family	qwen35moe	draft	drafts_mtp
