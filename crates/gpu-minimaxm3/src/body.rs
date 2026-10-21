@@ -132,6 +132,9 @@ pub struct Scratch {
     pub xn: DeviceBuffer<f32>,
     /// A sub-layer's output before its residual add.
     pub delta: DeviceBuffer<f32>,
+    /// The feed-forward block's input of a forced row, when the caller gave
+    /// one in place of the attention sub-layer's residual.
+    pub forced_x: DeviceBuffer<f32>,
     pub pos: DeviceBuffer<u32>,
     pub n_keys: DeviceBuffer<u32>,
     /// The query projection, its normed and turned heads, the key and value rows, the flash's output.
@@ -169,6 +172,7 @@ impl Scratch {
             x1: z(d.embd)?,
             xn: z(d.embd)?,
             delta: z(d.embd)?,
+            forced_x: z(d.embd)?,
             pos: u(1)?,
             n_keys: u(1)?,
             q_raw: z(q_width)?,
@@ -196,6 +200,7 @@ impl Scratch {
             &self.x1,
             &self.xn,
             &self.delta,
+            &self.forced_x,
             &self.q_raw,
             &self.q,
             &self.k,

@@ -16,6 +16,8 @@
 pub mod attn;
 pub mod body;
 pub mod ffn;
+pub mod forced;
 pub mod step;
 
 pub use body::{Body, MiniMaxM3Model, StepInput, set_taps};
+pub use forced::{ForcedRoute, ForcedRow};

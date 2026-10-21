@@ -591,6 +591,24 @@ impl<R: RouterEntry> Routed<R> {
     pub fn batch_bytes(&self) -> usize {
         self.batch.as_ref().map_or(0, BatchBufs::bytes)
     }
+
+    /// The last token's routed expert ids, in router rank order: the picks
+    /// the block made, for a gate that holds them against a reference's.
+    #[must_use]
+    pub fn route_ids(&self) -> &DeviceBuffer<u32> {
+        self.step.route.ids()
+    }
+
+    /// Layer `l`'s selection bias, the values the router adds to the scores
+    /// before it ranks them: the ranking a reference engine's picks are read
+    /// at.
+    pub fn route_bias<'a>(
+        &'a self,
+        w: &'a Weights,
+        l: usize,
+    ) -> Result<&'a DeviceBuffer<f32>, GpuError> {
+        self.route.bias_of(w, l)
+    }
 }
 
 /// Layer `l`'s shared expert, or a named refusal.

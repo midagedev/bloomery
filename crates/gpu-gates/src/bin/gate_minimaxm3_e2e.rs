@@ -93,6 +93,18 @@ mod gate {
         tap_ceils: seat::tap_ceils,
         open: seat::open,
         has_prefill: false,
+        has_forced: true,
+        n_expert: 128,
+        free_ceil: Some(seat::free_ceil),
+        // The shared logprob band is the other llama.cpp-oracle gate's, derived from two
+        // implementations' logits; here a divergence is a discrete exchange of experts at a near
+        // tie, not a Gaussian, so no sigma derives from it. The forced_greedy clause holds the
+        // argmax instead, and the forced arm holds the layers.
+        top_deferred: Some(
+            "the band is the other llama.cpp-oracle gate's (Solar-Open2's), from two implementations' \
+             logits; a divergence here is a discrete exchange of experts at a near tie, not a Gaussian, \
+             so no sigma derives from it",
+        ),
     };
 
     /// The positions `--plan` plans at.

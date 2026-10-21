@@ -78,6 +78,12 @@ mod gate {
         tap_ceils: seat::tap_ceils,
         open: seat::open,
         has_prefill: true,
+        // The Solar-Open2 body runs no layer alone yet, so the teacher-forced arm is not declared
+        // for it; the common clause is there for the family that has one.
+        has_forced: false,
+        n_expert: 320,
+        free_ceil: None,
+        top_deferred: None,
     };
 
     pub fn run() -> Result<(), GateError> {

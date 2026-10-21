@@ -2674,6 +2674,14 @@ impl<H: HostExperts> HostTier<H> {
         Ok(())
     }
 
+    /// Each hybrid layer's routed ids of the last step, in rank order: the
+    /// engine's own routing, empty for a layer the host leg did not serve.
+    /// A gate reads them against a reference engine's picks.
+    #[must_use]
+    pub fn step_ids(&self) -> &[Vec<u32>] {
+        self.step.ids()
+    }
+
     /// Layer `layer`'s hybrid work is enqueued: a capture notes it, an eager
     /// chain serves it now, before anything more joins the stream behind its
     /// wait. Row 0's.

@@ -6,7 +6,7 @@
 //! The body ([`bloomery_gpu_minimaxm3`]) holds one sequence and has no prompt batch: [`Seat::prompt`], [`Seat::set_group`] and
 //! [`Seat::stores`] are refused by name, and the gate's descriptor says it has no prefill clause.
 
-use crate::lcpp_e2e::{Arm, Dims, Seat};
+use crate::lcpp_e2e::{Arm, Dims, ForcedRoute, ForcedRow, Seat};
 use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
 use bloomery_gpu::host::served::TierBody;
 use bloomery_gpu::host::swap::Residency;
@@ -33,6 +33,21 @@ pub const TAP_EARLY: usize = 3;
 // quantized model); re-pinned from the first run's printed distances, never tuned to pass.
 pub const TAP_EARLY_CEIL: f64 = 0.05;
 pub const TAP_CEIL: f64 = 0.3;
+
+/// The teacher-forced arm's own per-layer error: the free chain's layers before the prefix its
+/// routing holds are held to `√prefix` times it, and the layers from the prefix on to nothing (a
+/// flip is a discrete exchange of experts, not a rounding of the activations).
+///
+/// PIN(2026-10-21): the forced arm's own worst per-layer error over the layers the prefix covers
+/// (the prefix is layer 3 in every measured set: the dense lead and the first sparse layer), as
+/// the arm measures it: 2.496e-3 at layer 1 of set a, 8.687e-4 at layer 2.
+pub const FORCED_ERR: f64 = 2.5e-3;
+
+/// The free chain's ceiling of a layer's output distance, over the layers before the prefix the
+/// run's routing holds: `√prefix` times the forced arm's own per-layer error.
+pub fn free_ceil(prefix: usize, _layer: usize) -> f64 {
+    (prefix as f64).sqrt() * FORCED_ERR
+}
 
 /// The ceiling of layer `layer`'s output distance. The model has no fixture file, so only the real tier reaches it.
 ///
@@ -224,6 +239,31 @@ impl Seat for Loaded {
             None => Ok(()),
             Some(fault) => Err(format!("the card's fault word holds {fault:?}").into()),
         }
+    }
+
+    fn forced_row(
+        &mut self,
+        layer: usize,
+        pos: u32,
+        x: &[f32],
+        ffn_x: Option<&[f32]>,
+    ) -> Result<ForcedRow, GateError> {
+        let (gpu, w, body) = self.m.body_parts("minimaxm3 seat")?;
+        let row = body.forced_row(gpu, w, layer, pos, x, ffn_x)?;
+        Ok(ForcedRow {
+            ffn_in: row.ffn_in,
+            ffn_out: row.ffn_out,
+            route: row.route.map(|r| ForcedRoute {
+                ids: r.ids,
+                bias: r.bias,
+            }),
+            out: row.out,
+        })
+    }
+
+    fn route_ids(&mut self) -> Result<Vec<Vec<u32>>, GateError> {
+        let (_, _, body) = self.m.body_parts("minimaxm3 seat")?;
+        Ok(body.hybrid().step_ids().to_vec())
     }
 }
 

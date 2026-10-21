@@ -20,6 +20,12 @@
 //! - `forced_greedy_count_pin` (oracle): the oracle's greedy tokens fed as input (teacher-forced), our argmax at each position;
 //!   the disagreements at an oracle margin of at least `MARGIN_FLOOR` are held to the pin derived from the margins themselves
 //!   ([`forced_pin`]). A set with no greedy continuation is left out.
+//! - `forced_layers_near_<slug>` (oracle, declared only by a gate whose seat runs a layer alone, [`Gate::has_forced`]): every layer
+//!   run alone at every position on the oracle's own input, and the feed-forward half alone on the oracle's own feed-forward
+//!   input: the layer's update and the block's increment against the oracle's, the flip-free sites' error held to the ratio of
+//!   the activation quantization's gap ([`RATIO_BAND`]), the router's picks against the oracle's (a flip at a margin past the f32
+//!   sum-order band is red), and the free chain's own layers held to the band the arm's error gives over the layers before the
+//!   first flip ([`Gate::free_ceil`]).
 //! - `prefill_near_<slug>` (oracle, declared only by a gate whose seat has a prompt batch, [`Gate::has_prefill`]): the same
 //!   prompts fed by the prompt batch ([`Seat::prompt`]) from a reset, their layer outputs and logprobs held to the bands the
 //!   steps are.
@@ -32,13 +38,15 @@
 //! `--arm a|bp` picks the placement arm ([`arm_arg`]); a seat refuses by name an arm it does not serve.
 
 use crate::e2e::{argmax, ik_last, rel, tap, top_ids};
+use bloomery_gpu_gates::flip;
 use bloomery_gpu_gates::prompts::{
     GreedyRow, MARGIN_FLOOR, SIGMA_LOGIT, compare_forced, k_of, log_softmax, sigma_lp,
     std_normal_cdf,
 };
 use bloomery_gpu_gates::tier::{self, Tag, Tier};
 use bloomery_gpu_gates::{
-    GateError, RefManifest, bits_equal, checks_failed, ref_model_path, verdict,
+    GateError, RefError, RefManifest, bits_equal, checks_failed, ref_model_path,
+    ref_tensor_logical_in, topk_ids_logical_within, verdict,
 };
 use gguf::Split;
 use refset::arch::prompt_tables::{self as read, Greedy, Top};
@@ -55,6 +63,26 @@ pub struct Dims {
     pub vocab: usize,
 }
 
+/// A routed block's picks at one position, and the selection bias they were ranked with.
+pub struct ForcedRoute {
+    /// The picks, in rank order.
+    pub ids: Vec<u32>,
+    /// The layer's selection bias: the values the router adds to the scores before it ranks them.
+    pub bias: Vec<f32>,
+}
+
+/// One layer alone at one position, read back: the teacher-forced arm's row.
+pub struct ForcedRow {
+    /// The residual after the attention sub-layer: the feed-forward block's input.
+    pub ffn_in: Vec<f32>,
+    /// The feed-forward block's increment: its routed sum and the shared expert's.
+    pub ffn_out: Vec<f32>,
+    /// A routed block's picks and its selection bias; `None` for a dense block.
+    pub route: Option<ForcedRoute>,
+    /// The layer's output.
+    pub out: Vec<f32>,
+}
+
 /// One loaded body on the gate card, as a gate drives it. The contract of each call is the body's, fixed here so the gates and
 /// the body are written against one text:
 /// - [`Seat::prompt`] runs `ids` from the seat's position by the prompt batch and answers the last id's logits row;
@@ -65,7 +93,8 @@ pub struct Dims {
 /// - [`Seat::fault`] is `Ok` while the fault word is clean and the model not poisoned.
 ///
 /// A body without a prompt batch refuses [`Seat::prompt`], [`Seat::set_group`] and [`Seat::stores`] by name and its gate's
-/// descriptor says [`Gate::has_prefill`] is false.
+/// descriptor says [`Gate::has_prefill`] is false. A body that does not run a layer alone refuses [`Seat::forced_row`] by name
+/// and its gate's descriptor says [`Gate::has_forced`] is false.
 pub trait Seat {
     fn dims(&self) -> Dims;
 
@@ -92,6 +121,27 @@ pub trait Seat {
 
     /// `Ok` while the card's fault word is clean and the model is not poisoned.
     fn fault(&mut self) -> Result<(), GateError>;
+
+    /// Layer `layer` alone at position `pos` on the rows `x` (`embd` values): the teacher-forced
+    /// arm's row. With `ffn_x`, the feed-forward sub-layer reads those rows in place of the
+    /// attention sub-layer's (its residual too), so the router reads the oracle's own normed row.
+    /// A seat whose body does not run a layer alone refuses by name.
+    fn forced_row(
+        &mut self,
+        _layer: usize,
+        _pos: u32,
+        _x: &[f32],
+        _ffn_x: Option<&[f32]>,
+    ) -> Result<ForcedRow, GateError> {
+        Err("this seat has no forced row: its body does not run one layer alone".into())
+    }
+
+    /// The routed ids of the last step, per layer, in rank order: the engine's own routing, for a
+    /// gate that holds it against the oracle's. Empty for a seat that does not read the routing
+    /// back.
+    fn route_ids(&mut self) -> Result<Vec<Vec<u32>>, GateError> {
+        Ok(Vec::new())
+    }
 }
 
 /// The placement arm a gate runs: plan (a), the largest card the stage with the experts that fit on it and the rest on the host,
@@ -195,6 +245,19 @@ pub struct Gate {
     pub open: OpenSeat,
     /// Whether the seat has a prompt batch: the `prefill_near_<slug>` clause is declared only then.
     pub has_prefill: bool,
+    /// Whether the seat runs a layer alone on the caller's rows: the `forced_layers_near_<slug>`
+    /// clause is declared only then.
+    pub has_forced: bool,
+    /// The experts the model's router scores: the bound the oracle's picks are read at.
+    pub n_expert: usize,
+    /// The reason the `top_logprobs_in_band` clause is deferred, when it is: the clause is named
+    /// and the reason printed, and it holds nothing. `None` for a family the band is derived for.
+    pub top_deferred: Option<&'static str>,
+    /// The free chain's ceiling of a layer's output distance, when the family's own band depends on
+    /// the run's routing: the layers before the prefix the routing holds, at `free_ceil(prefix,
+    /// layer)`, and the layers from it on are held to nothing (a flip is a discrete exchange, not
+    /// a rounding). `None` for a family that holds every layer to [`Gate::tap_ceil`].
+    pub free_ceil: Option<fn(usize, usize) -> f64>,
 }
 
 /// The clauses, in the order they run.
@@ -202,6 +265,7 @@ pub struct Gate {
 enum Clause {
     Finite,
     Reset,
+    ForcedLayers,
     Layers,
     LayersFx,
     Top,
@@ -210,9 +274,10 @@ enum Clause {
 }
 
 impl Clause {
-    const ALL: [Clause; 7] = [
+    const ALL: [Clause; 8] = [
         Clause::Finite,
         Clause::Reset,
+        Clause::ForcedLayers,
         Clause::Layers,
         Clause::LayersFx,
         Clause::Top,
@@ -228,6 +293,7 @@ impl Clause {
             Clause::LayersFx => format!("layer_outputs_near_{slug}_fx"),
             Clause::Top => "top_logprobs_in_band".to_string(),
             Clause::Forced => "forced_greedy_count_pin".to_string(),
+            Clause::ForcedLayers => format!("forced_layers_near_{slug}"),
             Clause::Prefill => format!("prefill_near_{slug}"),
         }
     }
@@ -236,7 +302,11 @@ impl Clause {
         match self {
             Clause::Finite | Clause::Reset => Tag::SelfConsistency,
             Clause::LayersFx => Tag::FixtureOracle,
-            Clause::Layers | Clause::Top | Clause::Forced | Clause::Prefill => Tag::Oracle,
+            Clause::ForcedLayers
+            | Clause::Layers
+            | Clause::Top
+            | Clause::Forced
+            | Clause::Prefill => Tag::Oracle,
         }
     }
 
@@ -245,6 +315,7 @@ impl Clause {
         match self {
             Clause::LayersFx => g.fixture.is_some(),
             Clause::Prefill => g.has_prefill,
+            Clause::ForcedLayers => g.has_forced,
             _ => true,
         }
     }
@@ -256,6 +327,7 @@ impl Clause {
             Clause::Layers | Clause::LayersFx => layer_outputs(seat, case),
             Clause::Top => top_logprobs(seat, case),
             Clause::Forced => forced_greedy(seat, case),
+            Clause::ForcedLayers => forced_layers(seat, case),
             Clause::Prefill => prefill_near(seat, case),
         }
     }
@@ -335,6 +407,8 @@ struct Oracle {
 struct Run {
     logits: Vec<f32>,
     taps: Vec<f32>,
+    /// The routing of every step, per layer, in rank order.
+    ids: Vec<Vec<Vec<u32>>>,
 }
 
 struct Case<'g> {
@@ -421,10 +495,17 @@ fn feed(seat: &mut dyn Seat, ids: &[u32]) -> Result<Vec<f32>, GateError> {
 }
 
 fn run_of(seat: &mut dyn Seat, ids: &[u32]) -> Result<Run, GateError> {
-    let logits = feed(seat, ids)?;
+    seat.reset()?;
+    let mut logits = Vec::new();
+    let mut ids_of_steps = Vec::with_capacity(ids.len());
+    for &id in ids {
+        logits = seat.step(id)?;
+        ids_of_steps.push(seat.route_ids()?);
+    }
     Ok(Run {
         logits,
         taps: seat.taps()?,
+        ids: ids_of_steps,
     })
 }
 
@@ -435,6 +516,7 @@ fn run_by_prompt(seat: &mut dyn Seat, ids: &[u32]) -> Result<Run, GateError> {
     Ok(Run {
         logits,
         taps: seat.taps()?,
+        ids: Vec::new(),
     })
 }
 
@@ -474,6 +556,83 @@ fn reset_rewinds(seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
     Ok(pass)
 }
 
+/// The ceiling of layer `l`'s output distance: the family's own band over the layers before the
+/// prefix the run's routing holds, and none over the layers from it on (a flip is a discrete
+/// exchange, not a rounding).
+fn ceil_of(case: &Case, prefix: usize, l: usize) -> f64 {
+    match case.gate.free_ceil {
+        Some(f) if l < prefix => f(prefix, l),
+        Some(_) => f64::INFINITY,
+        None => (case.gate.tap_ceil)(case.tier, l),
+    }
+}
+
+/// The oracle's picks of layer `l`, a position's ids in rank order, the positions the set holds
+/// (the last ones); `None` where the set holds no row for that layer.
+fn oracle_picks(o: &Oracle, l: usize, n_expert: usize) -> Result<Option<Vec<Vec<u32>>>, GateError> {
+    let row = match o.man.tensor(&format!("ffn_moe_topk-{l}"), 0) {
+        Ok(r) => r,
+        Err(RefError::Missing { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let used = row.ne[0] as usize;
+    let ids = topk_ids_logical_within(&o.man, row, u32::try_from(n_expert)?)?;
+    Ok(Some(
+        ids.chunks(used)
+            .map(|c| {
+                c.iter()
+                    .map(|&i| u32::try_from(i).unwrap_or(u32::MAX))
+                    .collect()
+            })
+            .collect(),
+    ))
+}
+
+/// Whether two sets of picks are one set, whatever their rank order.
+fn same_picks(a: &[u32], b: &[u32]) -> bool {
+    a.len() == b.len() && a.iter().all(|id| b.contains(id))
+}
+
+/// The first layer at which the run's routing differs from the oracle's, over every position: the
+/// prefix the free chain's layer outputs are held to before a flip's exchange reaches them.
+fn route_prefix(o: &Oracle, r: &Run, n_layer: usize, n_expert: usize) -> Result<usize, GateError> {
+    let n = o.ids.len();
+    let mut first = vec![n_layer; n];
+    for l in 0..n_layer {
+        let Some(theirs) = oracle_picks(o, l, n_expert)? else {
+            continue;
+        };
+        let kept = theirs.len();
+        for (t, per_layer) in r.ids.iter().enumerate() {
+            if first[t] != n_layer {
+                continue;
+            }
+            let Some(ours) = per_layer.get(l) else {
+                continue;
+            };
+            if ours.is_empty() {
+                continue;
+            }
+            let Some(at) = t.checked_sub(n - kept) else {
+                continue;
+            };
+            if !same_picks(ours, &theirs[at]) {
+                first[t] = l;
+            }
+        }
+    }
+    Ok(first.iter().copied().min().unwrap_or(n_layer))
+}
+
+/// A set's tap `name`, or `None` where the set holds no such row.
+fn tap_opt(man: &RefManifest, name: &str) -> Result<Option<Vec<f32>>, GateError> {
+    match man.tensor(name, 0) {
+        Ok(row) => Ok(Some(ref_tensor_logical_in(&man.dir, row)?)),
+        Err(RefError::Missing { .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Each layer's output at the last position against the oracle's `l_out-L`: the last `embd` values of the node (the last
 /// layer's holds the last position alone, the others every position).
 fn layer_outputs(_seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
@@ -511,16 +670,33 @@ fn layer_outputs_of(label: &str, case: &Case, runs: &[Run]) -> Result<bool, Gate
                 (0.0f64, 0usize),
                 |w, (l, &d)| if d > w.0 { (d, l) } else { w },
             );
+        // The prefix the run's routing holds: the first layer any position's picks differ at. The
+        // layers from it on carry a discrete exchange, not a rounding, and are held to nothing.
+        let prefix = match case.gate.free_ceil {
+            Some(_) => route_prefix(o, r, layers, case.gate.n_expert)?,
+            None => layers,
+        };
         let first = table
             .iter()
             .enumerate()
-            .position(|(l, &d)| d > (case.gate.tap_ceil)(case.tier, l));
+            .position(|(l, &d)| d > ceil_of(case, prefix, l));
         let pass = first.is_none();
+        if case.gate.free_ceil.is_some() {
+            println!(
+                "  the routing holds to layer {prefix} (the first layer any position's picks differ at), \
+                 the ceiling {ceil:.4} over the layers before it, and none over the layers from it on",
+                ceil = ceil_of(case, prefix, 0)
+            );
+        }
         println!(
             "{label}: prompt {} ({} ids): worst {worst:.4} at layer {at}, {}, first past it {first:?} {}",
             o.name,
             o.ids.len(),
-            (case.gate.tap_ceils)(case.tier),
+            if case.gate.free_ceil.is_some() {
+                "the routing prefix's ceiling (the line above)".to_string()
+            } else {
+                (case.gate.tap_ceils)(case.tier)
+            },
             verdict(pass)
         );
         println!(
@@ -537,6 +713,10 @@ fn layer_outputs_of(label: &str, case: &Case, runs: &[Run]) -> Result<bool, Gate
 }
 
 fn top_logprobs(_seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
+    if let Some(reason) = case.gate.top_deferred {
+        println!("top_logprobs_in_band: deferred by name: {reason}");
+        return Ok(true);
+    }
     top_logprobs_of("top_logprobs", case, &case.runs)
 }
 
@@ -673,6 +853,238 @@ fn forced_greedy(seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
         );
     }
     Ok(pass)
+}
+
+// ------------------------------------------------------------ the forced arm
+
+/// The teacher-forced bound on each half's error ratio: the error over the activation
+/// quantization's gap, as the qwen3moe arm reads it.
+const RATIO_BAND: f64 = 10.0;
+
+/// The f32 sum-order term of a gap: the relative size of two implementations' sums.
+const SUM_ORDER: f64 = 1e-6;
+
+/// The margin band of the router clause: a flip at a margin past it is not a rounding.
+const SUM_ORDER_BAND: f64 = 1e-5;
+
+/// The activation quantization gap of a feed-forward input row: the largest one-sided gap over the
+/// formats the block's inputs take — Q8_K (per 256) for the routed experts, Q8_0 (per 32) for the
+/// Q8_0 attention, dense and shared tensors, and ik's Q8_2X4 for the q6_K ones — plus the f32
+/// sum-order term. Both sides quantize the same way, so the two-sided gap is zero and the ratio is
+/// read against this floor.
+fn act_gap(row: &[f32]) -> f64 {
+    let mut qk = vec![0.0f32; row.len()];
+    gguf::quantize_row_q8_k_roundtrip(row, &mut qk);
+    let mut q0 = vec![0.0f32; row.len()];
+    gguf::quant::quantize_row_q8_0_roundtrip(row, &mut q0);
+    let mut q2 = vec![0.0f32; row.len()];
+    gguf::quantize_row_q8_2_x4_roundtrip(row, &mut q2);
+    rel(&qk, row).max(rel(&q0, row)).max(rel(&q2, row)) + SUM_ORDER
+}
+
+/// The number of our picks the oracle's do not hold, and the oracle's own margin at that position:
+/// the gap between the weakest pick it kept and the best it left out, in the values it ranked by
+/// (its scores and the layer's selection bias).
+fn flip_numbers(
+    ours: &ForcedRow,
+    picks: &Option<Vec<Vec<u32>>>,
+    probs: &Option<Vec<f32>>,
+    bias: &[f32],
+    t: usize,
+    n: usize,
+    n_expert: usize,
+) -> (usize, f64) {
+    let (Some(theirs), Some(probs), Some(route)) = (picks, probs, &ours.route) else {
+        return (0, f64::INFINITY);
+    };
+    let Some(at) = t.checked_sub(n - theirs.len()) else {
+        return (0, f64::INFINITY);
+    };
+    let kept = probs.len() / n_expert;
+    let Some(ip) = t.checked_sub(n - kept) else {
+        return (0, f64::INFINITY);
+    };
+    let values: Vec<f32> = probs[ip * n_expert..(ip + 1) * n_expert]
+        .iter()
+        .zip(bias)
+        .map(|(p, b)| p + b)
+        .collect();
+    let ids: Vec<i32> = theirs[at].iter().map(|&i| i as i32).collect();
+    let flipped = route
+        .ids
+        .iter()
+        .filter(|id| !theirs[at].contains(id))
+        .count();
+    (flipped, flip::margin(&values, &ids))
+}
+
+/// The teacher-forced arm: every layer run alone at every position on the oracle's own input, and
+/// the feed-forward half alone on the oracle's own feed-forward input.
+///
+/// The layer's update (its output against the oracle's `l_out-L`, on the oracle's own input) and
+/// the block's increment (the feed-forward half's output against the oracle's `ffn_out-L`) are
+/// measured; the flip-free sites' increment error is held to [`RATIO_BAND`] times the activation
+/// quantization's gap, and a router's flip at a margin past [`SUM_ORDER_BAND`] is red: the router
+/// read the oracle's own normed row, so a flip there is not a rounding of the input.
+fn forced_layers(seat: &mut dyn Seat, case: &Case) -> Result<bool, GateError> {
+    let Dims { layers, embd, .. } = case.dims;
+    let mut ok = true;
+    for o in case.oracles.iter().filter(|o| o.layer_outputs) {
+        let n = o.ids.len();
+        let mut rels = Vec::with_capacity(layers);
+        let mut ratios = Vec::with_capacity(layers);
+        // The flip-free sites the ratio band judged: none on a set that holds no feed-forward taps.
+        let mut ratio_sites = 0usize;
+        let mut sites = Vec::with_capacity(layers);
+        let mut margins = Vec::with_capacity(layers);
+        let mut close = Vec::with_capacity(layers);
+        // Layer 0's input is the embedding, which the oracle does not dump: the arm starts at
+        // layer 1, on the oracle's own layer 0 output.
+        for l in 1..layers {
+            let x_in = tap(&o.man, &format!("l_out-{}", l - 1))?;
+            let want = tap(&o.man, &format!("l_out-{l}"))?;
+            let kept_in = x_in.len() / embd;
+            let kept_out = want.len() / embd;
+            let ffn_inp = tap_opt(&o.man, &format!("ffn_inp-{l}"))?;
+            let ffn_out = tap_opt(&o.man, &format!("ffn_out-{l}"))?;
+            let ffn_norm = tap_opt(&o.man, &format!("ffn_norm-{l}"))?;
+            let ffn_probs = tap_opt(&o.man, &format!("ffn_moe_probs-{l}"))?;
+            let picks = oracle_picks(o, l, case.gate.n_expert)?;
+            // The layer's run starts from empty stores: the positions before it wrote its own
+            // rows, and the ones after it are not read.
+            seat.reset()?;
+            let (mut l_rel, mut l_ratio, mut l_flip) = (0.0f64, 0.0f64, 0usize);
+            let mut l_margin = 0.0f64;
+            let mut l_close = 0usize;
+            let mut bias: Vec<f32> = Vec::new();
+            for t in 0..n {
+                let Some(i_in) = t.checked_sub(n - kept_in) else {
+                    break;
+                };
+                let x = &x_in[i_in * embd..(i_in + 1) * embd];
+                let row = seat.forced_row(l, u32::try_from(t)?, x, None)?;
+                if let Some(i_out) = t.checked_sub(n - kept_out) {
+                    l_rel = l_rel.max(rel(&row.out, &want[i_out * embd..(i_out + 1) * embd]));
+                }
+                // The whole layer's picks against the oracle's: counted and printed, not judged
+                // (this run's router read our residual, not the oracle's, so a difference here is
+                // the divergence the arm measures).
+                if let (Some(theirs), Some(route)) = (&picks, &row.route)
+                    && let Some(at) = t.checked_sub(n - theirs.len())
+                    && !same_picks(&route.ids, &theirs[at])
+                {
+                    l_flip += 1;
+                }
+                let (Some(inp), Some(out), Some(norm)) = (&ffn_inp, &ffn_out, &ffn_norm) else {
+                    continue;
+                };
+                let Some(i) = t.checked_sub(n - inp.len() / embd) else {
+                    continue;
+                };
+                let Some(i_out) = t.checked_sub(n - out.len() / embd) else {
+                    continue;
+                };
+                let f = seat.forced_row(
+                    l,
+                    u32::try_from(t)?,
+                    x,
+                    Some(&inp[i * embd..(i + 1) * embd]),
+                )?;
+                if bias.is_empty()
+                    && let Some(route) = &f.route
+                {
+                    bias = route.bias.clone();
+                }
+                let e = rel(&f.ffn_out, &out[i_out * embd..(i_out + 1) * embd]);
+                let gap = act_gap(&norm[i * embd..(i + 1) * embd]);
+                let ratio = e / gap;
+                let (flipped, margin) =
+                    flip_numbers(&f, &picks, &ffn_probs, &bias, t, n, case.gate.n_expert);
+                if flipped == 0 {
+                    ratio_sites += 1;
+                    l_ratio = l_ratio.max(ratio);
+                } else {
+                    l_close += 1;
+                    l_margin = l_margin.max(margin);
+                    if margin > SUM_ORDER_BAND {
+                        println!(
+                            "forced layer={l} pos={t}: {flipped} of our picks differ from the oracle's, \
+                             margin {margin:.3e} past the sum-order band {SUM_ORDER_BAND:.0e} FAIL"
+                        );
+                        ok = false;
+                    }
+                }
+            }
+            if l_ratio > RATIO_BAND {
+                println!(
+                    "forced layer={l}: a flip-free site's error ratio {l_ratio:.2} passes {RATIO_BAND} FAIL"
+                );
+                ok = false;
+            }
+            rels.push(l_rel);
+            ratios.push(l_ratio);
+            sites.push(l_flip);
+            margins.push(l_margin);
+            close.push(l_close);
+        }
+        let ratio_line = if ratio_sites == 0 {
+            "the ratio band not run (the set holds no feed-forward taps)".to_string()
+        } else {
+            format!(
+                "the worst flip-free ratio {:.2} over {ratio_sites} sites",
+                ratios.iter().copied().fold(0.0f64, f64::max)
+            )
+        };
+        println!(
+            "forced_layers: prompt {} ({} ids): {} layers (1.., the oracle holds no embedding row), \
+             the worst update {:.3e}, {ratio_line}, {} flip sites",
+            o.name,
+            n,
+            rels.len(),
+            rels.iter().copied().fold(0.0f64, f64::max),
+            sites.iter().sum::<usize>()
+        );
+        println!(
+            "  by layer: update {}",
+            rels.iter()
+                .map(|d| format!("{d:.3e}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        println!(
+            "  by layer: ratio {}",
+            ratios
+                .iter()
+                .map(|d| format!("{d:.2}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        println!(
+            "  by layer: flips {}",
+            sites
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        println!(
+            "  by layer: the oracle's input's own flips {}",
+            close
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        println!(
+            "  by layer: the widest flip margin {}",
+            margins
+                .iter()
+                .map(|d| format!("{d:.1e}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    Ok(ok)
 }
 
 // ------------------------------------------------------------ run

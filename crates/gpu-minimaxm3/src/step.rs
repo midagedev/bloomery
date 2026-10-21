@@ -43,7 +43,7 @@ use crate::ffn::{self, Routed};
 
 /// The step flash scores on the tensor cores from the query rounded to f16, which is the prefill flash's score pass
 /// bit for bit: a position's bits do not depend on which of the two ran it.
-const FLASH_MMA: bool = true;
+pub(crate) const FLASH_MMA: bool = true;
 
 /// What the walk's errors name.
 const WHAT: &str = "minimaxm3 enqueue_step";
@@ -195,171 +195,213 @@ impl StepProgram<'_> {
 
     /// Layer `l`'s attention sub-layer: `x1 = x + attention(rms_norm(x))` (module doc).
     fn attend(&mut self, l: usize) -> Result<(), GpuError> {
-        let (gpu, w, k, d) = (self.gpu, self.w, self.k, *self.dims);
-        let stream = gpu.stream();
-        let fault = gpu.layer_sink(l)?;
-        let Some(Store {
-            gqa,
-            q_norm,
-            k_norm,
-            index,
-        }) = self.stores.get_mut(l)
-        else {
-            return Err(shape(format!("layer {l}: no store")));
+        let parts = AttendParts {
+            gpu: self.gpu,
+            w: self.w,
+            k: self.k,
+            rope: self.rope,
+            msa: self.msa,
+            dims: self.dims,
+            cx: &self.cx,
         };
-        let Scratch {
-            x,
-            x1,
-            xn,
-            delta,
-            pos,
-            n_keys,
-            q_raw,
-            q,
-            k: key,
-            v,
-            attn,
-            part_v,
-            part_ms,
-            iq_raw,
-            iq,
-            ik,
-            zeros,
-            sink,
-            msa,
-            acts,
-        } = &mut *self.s;
-        let cx = &self.cx;
-        let table = &self.rope.table;
-        gpu.elem().enqueue_rms_norm(
-            stream,
-            x,
-            w.f32_buf(WHAT, &gqa.norm)?,
-            d.rms_eps,
-            d.embd,
-            1,
-            xn,
-        )?;
-        gqa.q.project(cx, acts, l, xn, q_raw)?;
-        gqa.k.project(cx, acts, l, xn, key)?;
-        gqa.v.project(cx, acts, l, xn, v)?;
-        if let Some(ix) = index.as_mut() {
-            ix.q.project(cx, acts, l, xn, iq_raw)?;
-            ix.k.project(cx, acts, l, xn, ik)?;
-            // SAFETY: the step holds one token, so the head kernel's distinct-position contract holds.
-            unsafe {
-                enqueue_index(
-                    &k.rope,
-                    stream,
-                    IndexArgs {
-                        proj_q: &*iq_raw,
-                        iq,
-                        proj_k: ik,
-                        zeros: &*zeros,
-                        gain_q: w.f32_buf(WHAT, &ix.q_norm)?,
-                        gain_k: w.f32_buf(WHAT, &ix.k_norm)?,
-                        table,
-                        pos: &*pos,
-                        eps: d.rms_eps,
-                        ctx: d.ctx,
-                        m: 1,
-                        fault,
-                        keys: &mut ix.keys,
-                        sink,
-                    },
-                )?;
-            }
-            k.msa.enqueue_score(
-                stream,
-                self.msa,
-                ScoreArgs {
-                    iq: &*iq,
-                    ik: &ix.keys,
-                    n_keys: &*n_keys,
-                    ctx: d.ctx,
-                    m: 1,
-                    blocks: blocks_for(d.ctx),
-                    fault,
-                },
-                msa,
-            )?;
-            k.msa.enqueue_pick(
-                stream,
-                self.msa,
-                PickArgs {
-                    n_keys: &*n_keys,
-                    ctx: d.ctx,
-                    m: 1,
-                    fault,
-                },
-                msa,
-            )?;
-        }
+        attend_layer(&parts, self.stores, self.s, l)
+    }
+}
+
+/// What a layer's attention sub-layer reads and does not change: the step's program and the
+/// forced row ([`crate::forced`]) each lend theirs.
+#[derive(Clone, Copy)]
+pub(crate) struct AttendParts<'a, 'c> {
+    pub(crate) gpu: &'a Gpu,
+    pub(crate) w: &'a Weights,
+    pub(crate) k: &'a Kernels,
+    pub(crate) rope: &'a RopeRows,
+    pub(crate) msa: &'a MsaShape,
+    pub(crate) dims: &'a Dims,
+    pub(crate) cx: &'a GqaCx<'c>,
+}
+
+/// Layer `l`'s attention sub-layer: `x1 = x + attention(rms_norm(x))` (module doc), over the pieces
+/// the step's program and the forced row ([`crate::forced`]) share.
+pub(crate) fn attend_layer(
+    parts: &AttendParts<'_, '_>,
+    stores: &mut [Store],
+    s: &mut Scratch,
+    l: usize,
+) -> Result<(), GpuError> {
+    let AttendParts {
+        gpu,
+        w,
+        k,
+        rope,
+        msa: msa_shape,
+        dims,
+        cx,
+    } = *parts;
+    let d = *dims;
+    let stream = gpu.stream();
+    let fault = gpu.layer_sink(l)?;
+    let Some(Store {
+        gqa,
+        q_norm,
+        k_norm,
+        index,
+    }) = stores.get_mut(l)
+    else {
+        return Err(shape(format!("layer {l}: no store")));
+    };
+    let Scratch {
+        x,
+        x1,
+        xn,
+        delta,
+        pos,
+        n_keys,
+        q_raw,
+        q,
+        k: key,
+        v,
+        attn,
+        part_v,
+        part_ms,
+        iq_raw,
+        iq,
+        ik,
+        zeros,
+        sink,
+        msa,
+        acts,
+        forced_x: _,
+    } = &mut *s;
+    let table = &rope.table;
+    gpu.elem().enqueue_rms_norm(
+        stream,
+        x,
+        w.f32_buf(WHAT, &gqa.norm)?,
+        d.rms_eps,
+        d.embd,
+        1,
+        xn,
+    )?;
+    gqa.q.project(cx, acts, l, xn, q_raw)?;
+    gqa.k.project(cx, acts, l, xn, key)?;
+    gqa.v.project(cx, acts, l, xn, v)?;
+    if let Some(ix) = index.as_mut() {
+        ix.q.project(cx, acts, l, xn, iq_raw)?;
+        ix.k.project(cx, acts, l, xn, ik)?;
         // SAFETY: the step holds one token, so the head kernel's distinct-position contract holds.
         unsafe {
-            k.rope.enqueue_head_norm_neox_append_128_partial(
+            enqueue_index(
+                &k.rope,
                 stream,
-                PartialNeoxArgs {
-                    qg: &*q_raw,
-                    q,
-                    k: key,
-                    v: &*v,
-                    gq: w.f32_buf(WHAT, q_norm)?,
-                    gk: w.f32_buf(WHAT, k_norm)?,
+                IndexArgs {
+                    proj_q: &*iq_raw,
+                    iq,
+                    proj_k: ik,
+                    zeros: &*zeros,
+                    gain_q: w.f32_buf(WHAT, &ix.q_norm)?,
+                    gain_k: w.f32_buf(WHAT, &ix.k_norm)?,
                     table,
                     pos: &*pos,
                     eps: d.rms_eps,
-                    n_head: d.heads,
-                    n_kv: d.kv_heads,
                     ctx: d.ctx,
                     m: 1,
                     fault,
-                    cache_k: gqa.kc.buf_mut(),
-                    cache_v: gqa.vc.buf_mut(),
+                    keys: &mut ix.keys,
+                    sink,
                 },
             )?;
         }
-        if index.is_some() {
-            enqueue_attention(
-                &k.flash,
-                stream,
-                self.msa,
-                msa,
-                AttnArgs {
-                    q: &*q,
-                    kc: gqa.kc.buf(),
-                    vc: gqa.vc.buf(),
-                    ctx: d.ctx,
-                    m: 1,
-                    part_v,
-                    part_ms,
-                    fault,
-                    y: &mut *attn,
-                },
-            )?;
-        } else {
-            k.flash.enqueue_pass::<GROUP_16>(
-                stream,
-                GqaArgs {
-                    q: &*q,
-                    kc: gqa.kc.buf(),
-                    vc: gqa.vc.buf(),
-                    n_keys: &*n_keys,
-                    scale: attn_scale(),
-                    n_kv: d.kv_heads,
-                    ctx: d.ctx,
-                    m: 1,
-                    part_v,
-                    part_ms,
-                    fault,
-                    y: &mut *attn,
-                },
-                FLASH_MMA,
-            )?;
-        }
-        gqa.o.project(cx, acts, l, attn, delta)?;
-        gpu.elem().enqueue_add(stream, x, delta, d.embd, x1)
+        k.msa.enqueue_score(
+            stream,
+            msa_shape,
+            ScoreArgs {
+                iq: &*iq,
+                ik: &ix.keys,
+                n_keys: &*n_keys,
+                ctx: d.ctx,
+                m: 1,
+                blocks: blocks_for(d.ctx),
+                fault,
+            },
+            msa,
+        )?;
+        k.msa.enqueue_pick(
+            stream,
+            msa_shape,
+            PickArgs {
+                n_keys: &*n_keys,
+                ctx: d.ctx,
+                m: 1,
+                fault,
+            },
+            msa,
+        )?;
     }
+    // SAFETY: the step holds one token, so the head kernel's distinct-position contract holds.
+    unsafe {
+        k.rope.enqueue_head_norm_neox_append_128_partial(
+            stream,
+            PartialNeoxArgs {
+                qg: &*q_raw,
+                q,
+                k: key,
+                v: &*v,
+                gq: w.f32_buf(WHAT, q_norm)?,
+                gk: w.f32_buf(WHAT, k_norm)?,
+                table,
+                pos: &*pos,
+                eps: d.rms_eps,
+                n_head: d.heads,
+                n_kv: d.kv_heads,
+                ctx: d.ctx,
+                m: 1,
+                fault,
+                cache_k: gqa.kc.buf_mut(),
+                cache_v: gqa.vc.buf_mut(),
+            },
+        )?;
+    }
+    if index.is_some() {
+        enqueue_attention(
+            &k.flash,
+            stream,
+            msa_shape,
+            msa,
+            AttnArgs {
+                q: &*q,
+                kc: gqa.kc.buf(),
+                vc: gqa.vc.buf(),
+                ctx: d.ctx,
+                m: 1,
+                part_v,
+                part_ms,
+                fault,
+                y: &mut *attn,
+            },
+        )?;
+    } else {
+        k.flash.enqueue_pass::<GROUP_16>(
+            stream,
+            GqaArgs {
+                q: &*q,
+                kc: gqa.kc.buf(),
+                vc: gqa.vc.buf(),
+                n_keys: &*n_keys,
+                scale: attn_scale(),
+                n_kv: d.kv_heads,
+                ctx: d.ctx,
+                m: 1,
+                part_v,
+                part_ms,
+                fault,
+                y: &mut *attn,
+            },
+            FLASH_MMA,
+        )?;
+    }
+    gqa.o.project(cx, acts, l, attn, delta)?;
+    gpu.elem().enqueue_add(stream, x, delta, d.embd, x1)
 }
 
 impl<'a> LayerProgram for StepProgram<'a> {

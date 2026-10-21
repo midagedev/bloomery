@@ -56,7 +56,7 @@ pub static LCPP: Family = Family {
     build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &[],
+    consumers: &["gate-gpu-minimaxm3-e2e"],
 };
 
 /// The architecture's families, in the order `refset-check` lists them.

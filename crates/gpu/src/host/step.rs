@@ -691,6 +691,10 @@ pub struct StepPort {
     card: Vec<(usize, u32)>,
     card_ids: Vec<u32>,
     card_offs: Vec<[u64; ARENA_PARTS]>,
+    /// Each layer's routed ids of the last step, in rank order: the
+    /// engine's own routing, read back by a gate that holds it against a
+    /// reference engine's. Empty for a layer the host leg did not serve.
+    ids: Vec<Vec<u32>>,
 }
 
 /// Go waits the ring keeps ([`StepPort::gap_summary`]).
@@ -794,7 +798,13 @@ impl StepPort {
             card: Vec::with_capacity(h.n_used),
             card_ids: Vec::with_capacity(h.n_used),
             card_offs: Vec::with_capacity(h.n_used),
+            ids: (0..layers).map(|_| Vec::with_capacity(h.n_used)).collect(),
         }
+    }
+
+    /// Each layer's routed ids of the last step, in rank order.
+    pub(super) fn ids(&self) -> &[Vec<u32>] {
+        &self.ids
     }
 
     /// Let go of every row's card hold. Only where the card has read every
@@ -845,6 +855,9 @@ impl StepPort {
             ));
         }
         self.chain = chain;
+        for ids in &mut self.ids {
+            ids.clear();
+        }
         self.capturing = capturing(stream)?;
         if self.capturing {
             self.captured[chain.index()].clear();
@@ -1057,6 +1070,11 @@ impl StepPort {
         let mut w2_all = 0.0f64;
         let mut tier_slots = [0u64; MAX_TIERS];
         let mut unknown = None;
+        // The router's picks of this service, in rank order: the ids the
+        // engine chose, for a gate that holds them against a reference's.
+        if let Some(ours) = self.ids.get_mut(layer) {
+            ours.clear();
+        }
         for s in 0..h.n_used {
             let (Some(id), Some(wb)) = (
                 payload_word(page, image_off, h.ids + s, words),
@@ -1066,6 +1084,9 @@ impl StepPort {
             };
             let w = f32::from_bits(wb);
             w2_all += f64::from(w) * f64::from(w);
+            if let Some(ours) = self.ids.get_mut(layer) {
+                ours.push(id);
+            }
             self.tally.note(layer, row, s, id)?;
             match slots.slot(layer, id) {
                 Some(Slot::Host) => {

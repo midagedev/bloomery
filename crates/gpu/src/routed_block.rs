@@ -169,6 +169,12 @@ impl<R: RouterEntry> RouteBufs<R> {
         &mut self.sel
     }
 
+    /// The picks' expert ids in router rank order.
+    #[must_use]
+    pub fn ids(&self) -> &DeviceBuffer<u32> {
+        R::out_ids(&self.out)
+    }
+
     /// The weights of the last token routed.
     #[must_use]
     pub fn weights(&self) -> &DeviceBuffer<f32> {
@@ -269,6 +275,25 @@ impl<R: RouterEntry> RouteBlock<R> {
                 ),
             )
         })
+    }
+
+    /// Layer `l`'s selection bias, the file's own or the zeros of a layer it
+    /// gives none: the values the router adds to the scores before it ranks
+    /// them.
+    pub fn bias_of<'a>(
+        &'a self,
+        w: &'a Weights,
+        l: usize,
+    ) -> Result<&'a DeviceBuffer<f32>, GpuError> {
+        let layer = self.layer(l)?;
+        match (&layer.bias, &self.no_bias) {
+            (Some(name), _) => w.f32_buf(self.what, name),
+            (None, Some(zero)) => Ok(zero),
+            (None, None) => Err(GpuError::State {
+                what: self.what,
+                missing: "the zero selection bias of a layer with no bias",
+            }),
+        }
     }
 
     /// Layer `l`'s router weight and bias, the router's `scale` and the layer's
