@@ -13,6 +13,14 @@ name = "bloomery_metal"
 name = "gate_metal_device"
 path = "src/bin/gate_metal_device.rs"
 
+[[bin]]
+name = "gate_metal_qwen35moe_kernels"
+path = "src/bin/gate_metal_qwen35moe_kernels.rs"
+
+[[bin]]
+name = "metal_matvec_time"
+path = "src/bin/metal_matvec_time.rs"
+
 [lints]
 workspace = true
 
@@ -29,6 +37,8 @@ objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-metal = { workspace = true }
 dispatch2 = { workspace = true }
+# The fixture's tensors and their dequantization: the kernel gate's oracle.
+bloomery-gguf = { path = "../gguf" }
 
 [build-dependencies]
 # The fault site's table, the one owner the generated header is written
