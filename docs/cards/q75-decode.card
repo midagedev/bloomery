@@ -1,0 +1,25 @@
+# Qwen3.6-35B-A3B's placed card leg runs Q8_0 and Q6_K experts (branch q75, PR #629): decode at the serving
+# defaults, --place unset, on one RTX 3090.
+# Derivation [derived], from the plan measured on the 3090 (q75-design.md section 5): at ctx 262144 the card holds
+# 4505 of 10240 experts of the Q8_0 file (f 0.440) and 5844 of the UD-Q6_K file (f 0.571), where main holds 0.
+# Per layer: front 0.045 ms + the host leg (0.209 ms Q8_0, 0.161 ms UD-Q6_K, at 128 GB/s) x (1 - f) + back
+# 0.06 ms; the card's shadow (0.05 ms) sits under the host leg. Q8_0 0.314 -> 0.222 ms (x1.4); UD-Q6_K 0.266 ->
+# 0.174 ms (x1.5). Uniform routing assumed; skewed routing raises the card's share.
+# Timeline per token: host DRAM carries the wall (the host leg is the max term); card SMs and PCIe sit under it.
+kind: ab
+question: does moving 44-57 % of the experts of a Q8_0 or UD-Q6_K file onto the card read the derived decode gain
+  on one RTX 3090 at the serving defaults?
+term: tg tok/s @ D = 6 (prose corpus ids), Qwen3.6-35B-A3B Q8_0, bloomery-serve at the serving defaults, ctx
+  262144, --place unset, RTX 3090; the UD-Q6_K file in the same lease as the second table
+unit: %
+predict: +25..+60
+rounds: 4
+sd: 0.6 % AGENTS.md Know the ruler, same-binary scatter; the ratio at 4 rounds reads +-1.0 %
+condition: one lease with the box quiet (no gate on either card); depth-serve.sh, one fresh server an arm and a
+  round, the base arm main 1e8e923e9's bloomery-serve and the changed arm q75's, D 6 at C 262144 with N 128;
+  rows tagged [cpu-busy], [other-busy] or [cold] are rerun
+decide-in: land #629; the README's Qwen3.6 rows name the Q8_0 and UD-Q6_K decode rates
+decide-below: under +25 %: the host leg is not the max term, or the card's shadow is above it; read one nsys of a
+  decode step on the Q8_0 file before landing
+decide-above: beyond +60 %: routing is skewed toward the experts the plan placed; land, and read the residency
+  hit rate from the step stats
