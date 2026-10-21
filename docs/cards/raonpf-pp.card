@@ -1,0 +1,23 @@
+# Raon-1-mini-preview's prompt on the wide units (branch raonpf): the rows pass of up to 256 rows, the grouped GEMM
+# for every projection, the common KDA mixer's chunked path for the RDA layers and the route tables for the experts.
+# Derivation [derived], RTX 3090, P = 512 in two 256-row units: int8 GEMM 1.56 TFLOP at the ~40 TOPS the
+# Qwen3-30B-A3B pp512 row implies, 36..40 ms; the weights' 17.4 GB at ~900 GB/s, 19 ms, under the GEMM's shadow;
+# delta 2 ms, latent 7..10 ms, mHC and element-wise 5 ms: 50..57 ms a unit pair, so pp512 about 4,300 tok/s
+# (band 3,000..5,800). The 8-row chunks it replaces ran about 1,150 launches a chunk, 64 chunks at P = 512, and read
+# 250..300 tok/s. pp4096 about 2,000 tok/s (band 1,000..3,000): the latent attention grows with depth.
+# Timeline per unit: card SMs carry the wall; host issue 0.25 ms a layer is under it; PCIe, DRAM and NVMe 0.
+kind: baseline
+question: does Raon-1-mini-preview's prompt on the wide units reach the derived rate on one RTX 3090?
+term: pp tok/s @ P = 512 (prose corpus ids), Raon-1-mini-preview Q4_K_M, bloomery-serve at the serving defaults,
+  RTX 3090; P = 4096 in the same lease as the second row
+unit: tok/s
+predict: 3000..5800
+condition: one lease with the box quiet (no gate on either card); depth-serve.sh, one fresh server an arm and a
+  round, the base arm main's bloomery-serve and the changed arm raonpf's, D 512 and 4096 at C 4160 with N 64;
+  rows tagged [cpu-busy], [other-busy] or [cold] are rerun
+reason: the 0.3.7 release notes name Raon's prompt rate as its known limit (about 250..300 tok/s against the model's
+  own llama.cpp fork's pp512 2,675 on the same card); this sitting is the change's one measurement before it lands
+decide-in: land the wide units; the README's Raon row and the known limit take the measured pp512 and pp4096
+decide-below: under 3,000: a unit term is larger than derived; read one nsys of a P = 512 prompt (nsys-gpu.sh) and
+  name the stage before landing
+decide-above: beyond 5,800: the GEMM term is smaller than derived; land, and re-derive the int8 rate from the row
