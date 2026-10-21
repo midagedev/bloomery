@@ -20,6 +20,7 @@ use bloomery_placement::accepts::{
     BOLT_LEG, embed_of_widened, head_of_widened, qwen3moe_dense, resident_down_runs,
 };
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
+use bloomery_placement::accepts::{qwen35_common_down, qwen35_common_gate_up};
 pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
 use gguf::GgmlType;
 use models::shape::{RouterBody, gqa_row, gqa_row_v, select_router};
@@ -1378,9 +1379,10 @@ struct RowPin {
 /// body's attention sites ([`qwen3moe_dense`]: the table's dense row kept to
 /// the forms that body's arena carries, the fused Q4_K ones among them), head
 /// ([`head_of_widened`]: `head.rs`) and token embedding ([`embed_of_widened`]:
-/// `elem.rs`), each the table's row but BF16, and routed stacks ([`qwen35_gate_up`], [`qwen35_down`]: the FFN
-/// dispatch both bodies share), and `Body35`'s FFN ([`qwen35_gate_up`],
-/// [`qwen35_down`], [`qwen35_shared`]),
+/// `elem.rs`), each the table's row but BF16, and routed stacks (the qwen3moe
+/// body's [`qwen35_gate_up`], [`qwen35_down`]: the FFN dispatch; `Body35`'s
+/// [`qwen35_common_gate_up`], [`qwen35_common_down`]: the dispatch and the
+/// common card leg), and `Body35`'s shared expert ([`qwen35_shared`]),
 /// and the glm5next and mimo2 bodies' token embedding (the host's rows,
 /// `GgmlType::has_dequant`), and the gemma-embedding2 encoder's token table
 /// and per-layer input projection (the host's rows), each `what` naming the
@@ -1479,16 +1481,16 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
-        what: "routed experts gate and up (the body reads q4_K and q5_K)",
-        row: |ty| qwen35_gate_up(ty).is_some(),
+        what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq4_xs and q8_0)",
+        row: qwen35_common_gate_up,
     },
     RowPin {
         program: Program::Qwen35Body,
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
-        what: "routed experts down (the body reads q4_K, q5_K and q6_K)",
-        row: |ty| qwen35_down(ty).is_some(),
+        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq4_xs, q5_1, q8_0 and iq4_nl)",
+        row: qwen35_common_down,
     },
     RowPin {
         program: Program::Raon1Body,
@@ -2125,43 +2127,54 @@ mod tests {
         }
     }
 
-    /// The whole-card bodies' routed pins, by part: both bodies run the FFN
-    /// dispatch's rows of the card kernel table, q4_K or q5_K gate and up
+    /// The whole-card bodies' routed pins, by part: the qwen3moe body runs the
+    /// FFN dispatch's rows of the card kernel table, q4_K or q5_K gate and up
     /// and q4_K, q5_K or q6_K down — the parts the default expert rule's card
     /// formats pass (q3_K, q6_K, q8_0 gate·up; q3_K, q8_0 down) reach the
-    /// loads' refusal otherwise.
+    /// loads' refusal otherwise; `Body35` runs those and the common card leg's
+    /// rows beside them (`qwen35_common_gate_up`, `qwen35_common_down`).
     // PIN(2026-10-10): `Body35`'s routed pins moved from the joined stacks'
     // q4_K gate·up and q4_K or q6_K down to the table's rows its dispatch
     // runs (`qwen35_gate_up`, `qwen35_down`): q5_K gate·up and down left its
     // refused types; red on the tree before the move by those two. The
     // qwen3moe body's moved the same way (q4_K gate·up, q4_K or q6_K down
     // before): the dispatch is one code path, so one row decides both.
+    // PIN(2026-10-22): `Body35`'s pins moved on to the rows of its placed card
+    // leg (`qwen35_common_gate_up`, `qwen35_common_down`: the dispatch's types
+    // and the common leg's): a q6_K, iq3_xxs, iq4_xs or q8_0 gate·up and an
+    // iq3_xxs, iq4_xs, q5_1, q8_0 or iq4_nl down left its refused types, each a type the
+    // common leg launches with a prompt GEMM; red on the tree before the move
+    // by those. The qwen3moe body keeps the dispatch's rows (its placed side
+    // has no common leg).
     #[test]
     fn the_whole_card_bodies_read_routed_stacks_by_part() {
+        use GgmlType::{
+            IQ2_XS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q3_K, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0,
+        };
         type Parts = (&'static str, &'static [GgmlType], &'static [GgmlType]);
-        let gate_up: Parts = (
-            "q4_K and q5_K",
-            &[GgmlType::Q4_K, GgmlType::Q5_K],
-            &[
-                GgmlType::Q3_K,
-                GgmlType::Q6_K,
-                GgmlType::Q8_0,
-                GgmlType::IQ4_XS,
-            ],
-        );
-        let down: Parts = (
-            "q4_K, q5_K and q6_K",
-            &[GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K],
-            &[
-                GgmlType::Q3_K,
-                GgmlType::Q8_0,
-                GgmlType::Q5_1,
-                GgmlType::IQ4_NL,
-            ],
-        );
-        let bodies = [
-            (Program::Qwen3moeBody, gate_up, down),
-            (Program::Qwen35Body, gate_up, down),
+        let bodies: [(Program, Parts, Parts); 2] = [
+            (
+                Program::Qwen3moeBody,
+                ("q4_K and q5_K", &[Q4_K, Q5_K], &[Q3_K, Q6_K, Q8_0, IQ4_XS]),
+                (
+                    "q4_K, q5_K and q6_K",
+                    &[Q4_K, Q5_K, Q6_K],
+                    &[Q3_K, Q8_0, Q5_1, IQ4_NL],
+                ),
+            ),
+            (
+                Program::Qwen35Body,
+                (
+                    "q4_K, q5_K, q6_K, iq3_xxs, iq4_xs and q8_0",
+                    &[Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_XS, Q8_0],
+                    &[Q3_K, IQ2_XS, IQ3_S, MXFP4],
+                ),
+                (
+                    "q4_K, q5_K, q6_K, iq3_xxs, iq4_xs, q5_1, q8_0 and iq4_nl",
+                    &[Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_XS, Q5_1, Q8_0, IQ4_NL],
+                    &[Q3_K, IQ2_XS, IQ3_S, MXFP4],
+                ),
+            ),
         ];
         for (program, gate_up, down) in bodies {
             for (names, part, (reads, runs, refused)) in [
@@ -2250,24 +2263,48 @@ mod tests {
     }
 
     /// The FFN pins are the card kernel table's: over every type id, a
-    /// routed part's matrix is an item (of either body) exactly when
-    /// [`qwen35_gate_up`] or [`qwen35_down`] gives its type no entry, `Body35`'s
+    /// routed part's matrix is an item exactly when its body's rows give its
+    /// type no entry (the qwen3moe body's [`qwen35_gate_up`], [`qwen35_down`];
+    /// `Body35`'s [`qwen35_common_gate_up`], [`qwen35_common_down`]), `Body35`'s
     /// shared expert's exactly when [`qwen35_shared`] does not, and each pin's
     /// text names the types its row takes (a pin reads no F32 matrix).
     #[test]
     fn the_ffn_pins_are_the_card_kernel_table() {
-        use super::{qwen35_down, qwen35_gate_up, qwen35_shared};
+        use super::{
+            qwen35_common_down, qwen35_common_gate_up, qwen35_down, qwen35_gate_up, qwen35_shared,
+        };
         type Row = fn(GgmlType) -> bool;
-        let parts: [(&str, Role, Row); 3] = [
-            ("ffn_gate_exps.weight", Role::RoutedExperts, |t| {
-                qwen35_gate_up(t).is_some()
-            }),
-            ("ffn_down_exps.weight", Role::RoutedExperts, |t| {
-                qwen35_down(t).is_some()
-            }),
-            ("ffn_up_shexp.weight", Role::SharedExpert, |t| {
-                qwen35_shared(t).is_some()
-            }),
+        let parts: [(&str, Role, Program, Row); 5] = [
+            (
+                "ffn_gate_exps.weight",
+                Role::RoutedExperts,
+                Program::Qwen3moeBody,
+                |t| qwen35_gate_up(t).is_some(),
+            ),
+            (
+                "ffn_down_exps.weight",
+                Role::RoutedExperts,
+                Program::Qwen3moeBody,
+                |t| qwen35_down(t).is_some(),
+            ),
+            (
+                "ffn_gate_exps.weight",
+                Role::RoutedExperts,
+                Program::Qwen35Body,
+                qwen35_common_gate_up,
+            ),
+            (
+                "ffn_down_exps.weight",
+                Role::RoutedExperts,
+                Program::Qwen35Body,
+                qwen35_common_down,
+            ),
+            (
+                "ffn_up_shexp.weight",
+                Role::SharedExpert,
+                Program::Qwen35Body,
+                |t| qwen35_shared(t).is_some(),
+            ),
         ];
         let rows = |row: Row| -> Vec<GgmlType> {
             (0..64u32)
@@ -2275,50 +2312,39 @@ mod tests {
                 .filter(|&t| t != GgmlType::F32 && row(t))
                 .collect()
         };
-        let programs = |role: Role| -> &'static [Program] {
-            if role == Role::SharedExpert {
-                &[Program::Qwen35Body]
-            } else {
-                &[Program::Qwen3moeBody, Program::Qwen35Body]
-            }
-        };
-        for (name, role, row) in parts {
-            for program in programs(role) {
-                for id in 0..64u32 {
-                    let ty = GgmlType::from_u32(id);
-                    if ty == GgmlType::F32 {
-                        continue;
-                    }
-                    assert_eq!(
-                        items(*program, &matrix(name, role, ty)).is_empty(),
-                        row(ty),
-                        "{program:?} {name} {ty:?}"
-                    );
+        for (name, role, program, row) in parts {
+            for id in 0..64u32 {
+                let ty = GgmlType::from_u32(id);
+                if ty == GgmlType::F32 {
+                    continue;
                 }
+                assert_eq!(
+                    items(program, &matrix(name, role, ty)).is_empty(),
+                    row(ty),
+                    "{program:?} {name} {ty:?}"
+                );
             }
         }
         // Each pin's text names, in any order, exactly the types its row
         // takes: the list inside its parentheses, "a, b and c".
-        for (name, role, row) in parts {
-            for program in programs(role) {
-                let text = items(*program, &matrix(name, role, GgmlType::BF16));
-                let [text] = text.as_slice() else {
-                    panic!("{program:?} {name}: one item for bf16, got {text:?}");
-                };
-                let list = text
-                    .split_once("(the body reads ")
-                    .and_then(|(_, l)| l.strip_suffix(')'))
-                    .unwrap_or_else(|| panic!("{name}: no type list in {text:?}"));
-                let mut named: Vec<String> = list
-                    .replace(" and ", ", ")
-                    .split(", ")
-                    .map(str::to_string)
-                    .collect();
-                let mut want: Vec<String> = rows(row).iter().map(ToString::to_string).collect();
-                named.sort();
-                want.sort();
-                assert_eq!(named, want, "{program:?} {name}: {text}");
-            }
+        for (name, role, program, row) in parts {
+            let text = items(program, &matrix(name, role, GgmlType::BF16));
+            let [text] = text.as_slice() else {
+                panic!("{program:?} {name}: one item for bf16, got {text:?}");
+            };
+            let list = text
+                .split_once("(the body reads ")
+                .and_then(|(_, l)| l.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("{name}: no type list in {text:?}"));
+            let mut named: Vec<String> = list
+                .replace(" and ", ", ")
+                .split(", ")
+                .map(str::to_string)
+                .collect();
+            let mut want: Vec<String> = rows(row).iter().map(ToString::to_string).collect();
+            named.sort();
+            want.sort();
+            assert_eq!(named, want, "{program:?} {name}: {text}");
         }
     }
 
@@ -2331,6 +2357,9 @@ mod tests {
     /// table names no `Body35` launch for stays an item by name.
     // PIN(2026-10-10): red on the tree before the table's rows (the q5_K
     // down, the q8_0 and q6_K shared experts beside stacks of other types).
+    // PIN(2026-10-22): the q8_0 routed gate·up and down it held as items run on
+    // the common card leg now; the routed items it keeps are types that leg has
+    // no prompt GEMM for (an iq2_xs gate·up, an mxfp4 down).
     #[test]
     fn the_hf_qwen36_layer_shapes_are_no_items() {
         use GgmlType::{Q4_K, Q5_K, Q6_K, Q8_0};
@@ -2374,14 +2403,14 @@ mod tests {
             (
                 "ffn_gate_exps.weight",
                 Role::RoutedExperts,
-                Q8_0,
-                "q8_0 routed experts gate and up (the body reads q4_K and q5_K)",
+                GgmlType::IQ2_XS,
+                "iq2_xs routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq4_xs and q8_0)",
             ),
             (
                 "ffn_down_exps.weight",
                 Role::RoutedExperts,
-                Q8_0,
-                "q8_0 routed experts down (the body reads q4_K, q5_K and q6_K)",
+                GgmlType::MXFP4,
+                "mxfp4 routed experts down (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq4_xs, q5_1, q8_0 and iq4_nl)",
             ),
             (
                 "ffn_gate_shexp.weight",

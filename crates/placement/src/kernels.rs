@@ -47,6 +47,25 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
     ty.card().gemm
 }
 
+/// Whether the prompt GEMM `entry` reads its activation in 32-value blocks
+/// (`Gemm32Weight`'s entries: Q8_0, Q5_1, IQ4_NL and NVFP4, over a
+/// `GemmAct32`), else in the grouped GEMM's q8_1 blocks of 128 (`GemmAct`):
+/// the form a prompt walk quantizes a unit's normed rows and SwiGLU rows into
+/// for a stack of that type.
+#[must_use]
+pub const fn gemm_reads_blocks32(entry: GemmEntry) -> bool {
+    match entry {
+        GemmEntry::Q8_0 | GemmEntry::Q5_1 | GemmEntry::Iq4nl | GemmEntry::Nvfp4 => true,
+        GemmEntry::Q3k
+        | GemmEntry::Q4k
+        | GemmEntry::Q5k
+        | GemmEntry::Q6k
+        | GemmEntry::Iq2xxs
+        | GemmEntry::Iq3xxs
+        | GemmEntry::Iq4xs => false,
+    }
+}
+
 /// The dense gemv site launch family for a file tensor of type `ty`.
 #[must_use]
 pub const fn dense(ty: GgmlType) -> Option<SiteEntry> {
@@ -86,8 +105,13 @@ pub const fn q8_act_bytes(cols: u64, k: u64) -> u64 {
 /// gate·up entry of a routed gate or up stack of type `ty` in the file's
 /// blocks ([`crate::placement::CardFormat::KQuant`]): the table's [`gate_up`]
 /// row, for the entries whose launchers read a `Q8Act` of more columns than a
-/// run uses. The Q8_0 row has a launcher of that shape and no arm in the leg
-/// yet. A stack in its planes is [`card_planes_runs`]'.
+/// run uses. The Q8_0 row has a launcher of that shape and an arm in the leg
+/// (`CardLeg::launch`), which this set leaves out: the families that plan by
+/// it (GLM-5.3, MiMo, Solar-Open2, MiniMax-M3, Raon) hold `Q8Act` down buffers
+/// only, so a Q8_0 layer they planned on the card would fail at its first
+/// launch where it runs on the host today; a program whose buffers follow the
+/// down's form reads the arm through its own row ([`crate::accepts::qwen35_common_gate_up`]).
+/// A stack in its planes is [`card_planes_runs`]'.
 #[must_use]
 pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
     matches!(
@@ -347,6 +371,7 @@ mod tests {
                 (GgmlType::Q8_0, GateUpEntry::Q8_0),
                 (GgmlType::Q4_K, GateUpEntry::Q4k),
                 (GgmlType::Q5_K, GateUpEntry::Q5k),
+                (GgmlType::Q6_K, GateUpEntry::Q6k),
                 (GgmlType::MXFP4, GateUpEntry::Mxfp4),
                 (GgmlType::NVFP4, GateUpEntry::Nvfp4),
                 (GgmlType::IQ2_XS, GateUpEntry::Iq2xs),
@@ -451,6 +476,28 @@ mod tests {
             Some(CardFormat::Nvfp4Planes)
         );
         assert!(!card_runs(GgmlType::NVFP4) && !card_sel32_runs(GgmlType::NVFP4));
+    }
+
+    /// The GEMM entries that read 32-value blocks are the `Gemm32Weight`
+    /// ones (the file's Q8_0, Q5_1 and IQ4_NL blocks, NVFP4's planes); the
+    /// grouped GEMM's read q8_1 blocks of 128. A type's GEMM form is one fact:
+    /// the table's `gemm` row read through this.
+    #[test]
+    fn gemm_form_is_the_32_value_entries() {
+        let blocks32: Vec<_> = ALL
+            .iter()
+            .filter(|&&ty| gemm(ty).is_some_and(gemm_reads_blocks32))
+            .copied()
+            .collect();
+        assert_eq!(
+            blocks32,
+            [
+                GgmlType::Q5_1,
+                GgmlType::Q8_0,
+                GgmlType::NVFP4,
+                GgmlType::IQ4_NL
+            ]
+        );
     }
 
     // PIN(2026-10-20): the GEMM pairs gain NVFP4 (`gemm_nvfp4p` over its

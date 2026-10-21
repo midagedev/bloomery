@@ -5498,14 +5498,19 @@ mod tests {
         assert_eq!(plan.n_l, vec![8]);
     }
 
+    // PIN(2026-10-22): the Qwen3.6 leg runs a Q8_0 down and (once the leg has the
+    // arm) a Q6_K gate and up through the common leg, so the layers that held those
+    // types hold types it still has no GEMM for (an MXFP4 down, an IQ2_XS gate and
+    // up); its rows are the ones the test held, and Qwen3.8's gain the MXFP4 down
+    // its Q8_0 down did not have.
     #[test]
     fn host_only_reasons_follow_the_program_and_part_in_file_order() {
         use crate::accepts::{Program, routed_rule};
-        use GgmlType::{Q4_K, Q5_K, Q6_K, Q8_0};
+        use GgmlType::{IQ2_XS, MXFP4, Q4_K, Q5_K, Q6_K};
         let model = legged(&[
             [Q4_K, Q4_K, Q6_K],
-            [Q4_K, Q4_K, Q8_0],
-            [Q6_K, Q6_K, Q6_K],
+            [Q4_K, Q4_K, MXFP4],
+            [IQ2_XS, IQ2_XS, Q6_K],
             [Q4_K, Q5_K, Q4_K],
         ]);
         let rows = |program| {
@@ -5529,6 +5534,7 @@ mod tests {
             rows(Program::Qwen38Body),
             [
                 (0, "ffn_down_exps.weight"),
+                (1, "ffn_down_exps.weight"),
                 (2, "ffn_gate_exps.weight"),
                 (2, "ffn_up_exps.weight"),
                 (2, "ffn_down_exps.weight"),

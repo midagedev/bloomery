@@ -96,7 +96,7 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::Q5_K, name: "q5_K", blck: 256, bytes: 176, dequant: true, host_act: H::Q8_2X4,
            card: card!(KQuant        -             Q5k     (Q5k, Q8Act)        Q5k    Q5k     -    Q5k) },
     QRow { ty: T::Q6_K, name: "q6_K", blck: 256, bytes: 210, dequant: true, host_act: H::Q8_2X4,
-           card: card!(KQuant        KQuant        -       (Q6k, Q8Act)        Q6k    Q6k     Q6k  Q6k) },
+           card: card!(KQuant        KQuant        Q6k     (Q6k, Q8Act)        Q6k    Q6k     Q6k  Q6k) },
     // q8_K: ggml's activation form, mainline's block (llama.cpp 36a73916 ggml-common.h:371-376, ggml.c:880): float d, 256 int8
     // codes, 16 int16 bsums = 292 B. ik's block adds a float sum, 296 B (c10fbbcc ggml-common.h:405-411): a divergence.
     QRow { ty: T::Q8_K, name: "q8_K", blck: 256, bytes: 292, dequant: false, host_act: H::None, card: Card::NONE },

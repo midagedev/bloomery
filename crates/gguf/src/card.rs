@@ -87,6 +87,10 @@ pub enum GateUpEntry {
     /// `KquantKernels::enqueue_gate_up_q8_0` (`kq_gate_up_act_q8_0`, the
     /// file's `block_q8_0` stream) in `crates/gpu/src/kquant/sel.rs`.
     Q8_0,
+    /// `Q6kSelKernels::enqueue_gate_up` (`q6k_gate_up_sel`, the file's 210-byte
+    /// `block_q6_K` stream over the `Q8Act`'s q6 plane) in
+    /// `crates/gpu/src/q6k_sel.rs`.
+    Q6k,
     /// `QuantSelKernels::enqueue_gate_up` (`iq2_xs_gate_up_sel`, the file's
     /// 74-byte `block_iq2_xs` stream) in `crates/gpu/src/iq_sel.rs`.
     Iq2xs,

@@ -4013,7 +4013,7 @@ mod tests {
 
     #[test]
     fn host_only_records_name_causes_and_skip_an_all_host_choice() {
-        use gguf::GgmlType::{Q4_K, Q5_K, Q6_K, Q8_0};
+        use gguf::GgmlType::{IQ2_XS, MXFP4, Q4_K, Q5_K, Q6_K};
         use model::placement::accepts::{Program, routed_rule};
         use model::placement::{ModelTensor, ModelTensors, Role};
         let mut model = ModelTensors {
@@ -4023,10 +4023,15 @@ mod tests {
             experts_used: 2,
             bf16_words: |_| false,
         };
+        // PIN(2026-10-22): the Q8_0 down and the Q6_K gate and up the layers named
+        // here once were refused by the qwen35moe card leg; the common leg runs the
+        // Q8_0 down now, so the layers take types the leg still has no GEMM for
+        // (an MXFP4 down, an IQ2_XS gate and up); the causes and their order are
+        // the ones the test held.
         for (layer, types) in [
             [Q4_K, Q4_K, Q6_K],
-            [Q4_K, Q4_K, Q8_0],
-            [Q6_K, Q6_K, Q6_K],
+            [Q4_K, Q4_K, MXFP4],
+            [IQ2_XS, IQ2_XS, Q6_K],
             [Q4_K, Q5_K, Q4_K],
         ]
         .into_iter()
@@ -4066,7 +4071,7 @@ mod tests {
             ]
         );
         // The rendered reason carries the offending type and keeps distinct
-        // causes apart: the Q8_0 down is an unsupported part, the Q4_K/Q5_K
+        // causes apart: the MXFP4 down is an unsupported part, the Q4_K/Q5_K
         // gate/up a mismatch. The wording itself is not pinned.
         let why = |layer: u64, tensor: &str| {
             causes
@@ -4078,7 +4083,7 @@ mod tests {
         };
         let unsupported = why(1, "ffn_down_exps.weight");
         let mismatch = why(3, "ffn_up_exps.weight");
-        assert!(unsupported.starts_with(&Q8_0.to_string()), "{unsupported}");
+        assert!(unsupported.starts_with(&MXFP4.to_string()), "{unsupported}");
         assert!(mismatch.starts_with(&Q5_K.to_string()), "{mismatch}");
         assert_ne!(unsupported, mismatch, "distinct causes must not collapse");
         // The renderer hands the policy's own reason through, so losing or
