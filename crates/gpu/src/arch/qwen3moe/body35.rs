@@ -130,7 +130,7 @@ use gguf::quant::GgmlType;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft};
-use model::placement::accepts::Leg35;
+use model::placement::accepts::LegSplit;
 use model::placement::{Plan, WholeLoad, accepts};
 use runtime::seqstate::{Kept, Price};
 use std::num::NonZeroUsize;
@@ -590,7 +590,7 @@ fn card_leg(
     file: &Split,
     l: usize,
     (ff, h, n): (usize, usize, usize),
-) -> Result<Option<(Leg35, [GgmlType; 3])>, GpuError> {
+) -> Result<Option<(LegSplit, [GgmlType; 3])>, GpuError> {
     let program = accepts::Program::Qwen35Body;
     let arms = accepts::leg_arms(program)
         .ok_or_else(|| GpuError::shape(WHAT, "the qwen35moe body runs no card leg"))?;
@@ -622,7 +622,7 @@ fn card_leg(
     Ok(accepts::qwen35_leg(tys).map(|leg| (leg, tys)))
 }
 
-/// The forms the layers the common card leg runs ([`Leg35::Common`]) hold
+/// The forms the layers the common card leg runs ([`LegSplit::Common`]) hold
 /// buffers of, from `file`'s header: [`CommonForms::NONE`] unless the read is a
 /// placed one, which is the only one a card leg runs a layer of by it.
 fn common_forms(
@@ -638,7 +638,9 @@ fn common_forms(
     for (l, layer) in layers.iter().enumerate() {
         let Ffn::Moe(m) = &layer.ffn else { continue };
         let n = m.experts as usize;
-        if let Some((Leg35::Common, [gate_up, _, down])) = card_leg(file, l, (d.ff, d.hidden, n))? {
+        if let Some((LegSplit::Common, [gate_up, _, down])) =
+            card_leg(file, l, (d.ff, d.hidden, n))?
+        {
             tys.push([gate_up, down]);
         }
     }
@@ -679,7 +681,7 @@ fn part_tys(
 /// the host tier's: its stacks are read as [`HOSTED`] and no card entry is
 /// asked of them, its shared expert kept apart at its own types, which the
 /// card runs whatever the stacks are; the common leg's layers
-/// ([`Leg35::Common`]) are among them, their types the placed side's to
+/// ([`LegSplit::Common`]) are among them, their types the placed side's to
 /// read. A dense one: its three matrices a stack of one expert on the
 /// arena's fixed route.
 fn plan_ffn(
@@ -695,7 +697,10 @@ fn plan_ffn(
         Ffn::Moe(m) => {
             let n = m.experts as usize;
             let hosted = read == Read35::Placed
-                && !matches!(card_leg(file, l, (ff, h, n))?, Some((Leg35::Dispatch, _)));
+                && !matches!(
+                    card_leg(file, l, (ff, h, n))?,
+                    Some((LegSplit::Dispatch, _))
+                );
             let (gate_ty, sh_gate) = part_tys(file, l, "gate", (ff, h, n), hosted)?;
             let (up_ty, sh_up) = part_tys(file, l, "up", (ff, h, n), hosted)?;
             let (down_ty, sh_down) = part_tys(file, l, "down", (h, ff, n), hosted)?;

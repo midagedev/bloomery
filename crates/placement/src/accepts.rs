@@ -171,7 +171,7 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
 /// GEMM, so IQ2_XS, IQ3_S and MXFP4, which have none, stay on the host by
 /// name; NVFP4 is not admitted (no qwen35 file or fixture proves it).
 #[must_use]
-pub const fn qwen35_common_gate_up(ty: GgmlType) -> bool {
+pub const fn prompt_leg_gate_up(ty: GgmlType) -> bool {
     (kernels::card_gate_up_runs(ty)
         || matches!(
             kernels::gate_up(ty),
@@ -187,19 +187,19 @@ pub const fn qwen35_common_gate_up(ty: GgmlType) -> bool {
 /// (Q5_1, Q8_0, IQ4_NL) read the `Q8Blocks32` form the leg quantizes for
 /// them.
 #[must_use]
-pub const fn qwen35_common_down(ty: GgmlType) -> bool {
+pub const fn prompt_leg_down(ty: GgmlType) -> bool {
     kernels::rank_down_runs(ty) && kernels::gemm(ty).is_some()
 }
 
 /// How `Body35`'s placed card leg runs a layer's routed stacks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Leg35 {
+pub enum LegSplit {
     /// The family's own dispatch launches ([`qwen35_gate_up`], [`qwen35_down`]):
     /// a Q4_K or Q5_K gate and up with a Q4_K, Q5_K or Q6_K down, the arms
     /// whose launches and graph are the load's reference.
     Dispatch,
-    /// The common leg's launches ([`qwen35_common_gate_up`],
-    /// [`qwen35_common_down`]): any other layer its arms run.
+    /// The common leg's launches ([`prompt_leg_gate_up`],
+    /// [`prompt_leg_down`]): any other layer its arms run.
     Common,
 }
 
@@ -208,15 +208,15 @@ pub enum Leg35 {
 /// tier's). The one classifier the plan's rule, the load's check, the
 /// residency stack table and the placed side read.
 #[must_use]
-pub fn qwen35_leg([gate, up, down]: [GgmlType; 3]) -> Option<Leg35> {
-    if gate != up || !qwen35_common_gate_up(gate) || !qwen35_common_down(down) {
+pub fn qwen35_leg([gate, up, down]: [GgmlType; 3]) -> Option<LegSplit> {
+    if gate != up || !prompt_leg_gate_up(gate) || !prompt_leg_down(down) {
         return None;
     }
     Some(
         if qwen35_gate_up(gate).is_some() && qwen35_down(down).is_some() {
-            Leg35::Dispatch
+            LegSplit::Dispatch
         } else {
-            Leg35::Common
+            LegSplit::Common
         },
     )
 }
@@ -356,8 +356,8 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             down: |ty| qwen35_down(ty).is_some(),
         }),
         Program::Qwen35Body => Some(LegArms {
-            gate_up: qwen35_common_gate_up,
-            down: qwen35_common_down,
+            gate_up: prompt_leg_gate_up,
+            down: prompt_leg_down,
         }),
         Program::Qwen38Body => Some(LegArms {
             gate_up: |ty| qwen38_gate_up(ty).is_some(),
@@ -410,8 +410,8 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             down: |ty| qwen35_down(ty).map(|_| leg_card_format(ty)),
         },
         Program::Qwen35Body => RoutedRule::Leg {
-            gate_up: |ty| qwen35_common_gate_up(ty).then(|| leg_card_format(ty)),
-            down: |ty| qwen35_common_down(ty).then(|| leg_card_format(ty)),
+            gate_up: |ty| prompt_leg_gate_up(ty).then(|| leg_card_format(ty)),
+            down: |ty| prompt_leg_down(ty).then(|| leg_card_format(ty)),
         },
         Program::Qwen38Body => RoutedRule::Leg {
             gate_up: |ty| qwen38_gate_up(ty).map(|_| leg_card_format(ty)),
@@ -559,11 +559,11 @@ mod tests {
     }
 
     /// `Body35`'s placed card leg: a Q4_K or Q5_K gate and up with a Q4_K, Q5_K
-    /// or Q6_K down are the dispatch's own launches ([`Leg35::Dispatch`], the
+    /// or Q6_K down are the dispatch's own launches ([`LegSplit::Dispatch`], the
     /// layers whose graph the load's reference holds); a Q4_K, Q5_K, Q6_K, IQ3_XXS,
     /// IQ4_XS or Q8_0 gate and up of one type with a Q4_K, Q5_K, Q6_K,
     /// IQ3_XXS, IQ4_XS, Q5_1, Q8_0 or IQ4_NL down are the rest of the common
-    /// leg's ([`Leg35::Common`]); every other triple, a gate and up of two
+    /// leg's ([`LegSplit::Common`]); every other triple, a gate and up of two
     /// types among them, is the host tier's. The sets are spelled out, so a
     /// type entering or leaving an arm goes red here. Mutant: the dispatch
     /// row widened to the common leg's gate·up arms — the IQ4_XS layer reads
@@ -576,20 +576,16 @@ mod tests {
         let dispatch_gate_up = [Q4_K, Q5_K];
         let dispatch_down = [Q4_K, Q5_K, Q6_K];
         for g in types() {
-            assert_eq!(
-                qwen35_common_gate_up(g),
-                gate_up.contains(&g),
-                "{g} gate·up"
-            );
-            assert_eq!(qwen35_common_down(g), down.contains(&g), "{g} down");
+            assert_eq!(prompt_leg_gate_up(g), gate_up.contains(&g), "{g} gate·up");
+            assert_eq!(prompt_leg_down(g), down.contains(&g), "{g} down");
             for u in types() {
                 for d in types() {
                     let want = if g == u && gate_up.contains(&g) && down.contains(&d) {
                         Some(
                             if dispatch_gate_up.contains(&g) && dispatch_down.contains(&d) {
-                                Leg35::Dispatch
+                                LegSplit::Dispatch
                             } else {
-                                Leg35::Common
+                                LegSplit::Common
                             },
                         )
                     } else {
@@ -610,12 +606,8 @@ mod tests {
         let arms = leg_arms(Program::Qwen35Body).expect("a card leg");
         let old = leg_arms(Program::Qwen3moeBody).expect("a card leg");
         for ty in types() {
-            assert_eq!(
-                (arms.gate_up)(ty),
-                qwen35_common_gate_up(ty),
-                "{ty} gate·up"
-            );
-            assert_eq!((arms.down)(ty), qwen35_common_down(ty), "{ty} down");
+            assert_eq!((arms.gate_up)(ty), prompt_leg_gate_up(ty), "{ty} gate·up");
+            assert_eq!((arms.down)(ty), prompt_leg_down(ty), "{ty} down");
             assert_eq!(
                 (old.gate_up)(ty),
                 qwen35_gate_up(ty).is_some(),

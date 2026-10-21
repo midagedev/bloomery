@@ -20,7 +20,7 @@ use bloomery_placement::accepts::{
     BOLT_LEG, embed_of_widened, head_of_widened, qwen3moe_dense, resident_down_runs,
 };
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
-use bloomery_placement::accepts::{qwen35_common_down, qwen35_common_gate_up};
+use bloomery_placement::accepts::{prompt_leg_down, prompt_leg_gate_up};
 pub use bloomery_placement::kernels::{DownEntry, GateUpEntry, SiteEntry};
 use gguf::GgmlType;
 use models::shape::{RouterBody, gqa_row, gqa_row_v, select_router};
@@ -1381,7 +1381,7 @@ struct RowPin {
 /// ([`head_of_widened`]: `head.rs`) and token embedding ([`embed_of_widened`]:
 /// `elem.rs`), each the table's row but BF16, and routed stacks (the qwen3moe
 /// body's [`qwen35_gate_up`], [`qwen35_down`]: the FFN dispatch; `Body35`'s
-/// [`qwen35_common_gate_up`], [`qwen35_common_down`]: the dispatch and the
+/// [`prompt_leg_gate_up`], [`prompt_leg_down`]: the dispatch and the
 /// common card leg), and `Body35`'s shared expert ([`qwen35_shared`]),
 /// and the glm5next and mimo2 bodies' token embedding (the host's rows,
 /// `GgmlType::has_dequant`), and the gemma-embedding2 encoder's token table
@@ -1482,7 +1482,7 @@ const ROW_PINS: &[RowPin] = &[
         matrices: true,
         names: Some(routed_gate_up),
         what: "routed experts gate and up (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq4_xs and q8_0)",
-        row: qwen35_common_gate_up,
+        row: prompt_leg_gate_up,
     },
     RowPin {
         program: Program::Qwen35Body,
@@ -1490,7 +1490,7 @@ const ROW_PINS: &[RowPin] = &[
         matrices: true,
         names: Some(routed_down),
         what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq3_xxs, iq4_xs, q5_1, q8_0 and iq4_nl)",
-        row: qwen35_common_down,
+        row: prompt_leg_down,
     },
     RowPin {
         program: Program::Raon1Body,
@@ -2132,7 +2132,7 @@ mod tests {
     /// and q4_K, q5_K or q6_K down — the parts the default expert rule's card
     /// formats pass (q3_K, q6_K, q8_0 gate·up; q3_K, q8_0 down) reach the
     /// loads' refusal otherwise; `Body35` runs those and the common card leg's
-    /// rows beside them (`qwen35_common_gate_up`, `qwen35_common_down`).
+    /// rows beside them (`prompt_leg_gate_up`, `prompt_leg_down`).
     // PIN(2026-10-10): `Body35`'s routed pins moved from the joined stacks'
     // q4_K gate·up and q4_K or q6_K down to the table's rows its dispatch
     // runs (`qwen35_gate_up`, `qwen35_down`): q5_K gate·up and down left its
@@ -2140,7 +2140,7 @@ mod tests {
     // qwen3moe body's moved the same way (q4_K gate·up, q4_K or q6_K down
     // before): the dispatch is one code path, so one row decides both.
     // PIN(2026-10-22): `Body35`'s pins moved on to the rows of its placed card
-    // leg (`qwen35_common_gate_up`, `qwen35_common_down`: the dispatch's types
+    // leg (`prompt_leg_gate_up`, `prompt_leg_down`: the dispatch's types
     // and the common leg's): a q6_K, iq3_xxs, iq4_xs or q8_0 gate·up and an
     // iq3_xxs, iq4_xs, q5_1, q8_0 or iq4_nl down left its refused types, each a type the
     // common leg launches with a prompt GEMM; red on the tree before the move
@@ -2265,13 +2265,13 @@ mod tests {
     /// The FFN pins are the card kernel table's: over every type id, a
     /// routed part's matrix is an item exactly when its body's rows give its
     /// type no entry (the qwen3moe body's [`qwen35_gate_up`], [`qwen35_down`];
-    /// `Body35`'s [`qwen35_common_gate_up`], [`qwen35_common_down`]), `Body35`'s
+    /// `Body35`'s [`prompt_leg_gate_up`], [`prompt_leg_down`]), `Body35`'s
     /// shared expert's exactly when [`qwen35_shared`] does not, and each pin's
     /// text names the types its row takes (a pin reads no F32 matrix).
     #[test]
     fn the_ffn_pins_are_the_card_kernel_table() {
         use super::{
-            qwen35_common_down, qwen35_common_gate_up, qwen35_down, qwen35_gate_up, qwen35_shared,
+            prompt_leg_down, prompt_leg_gate_up, qwen35_down, qwen35_gate_up, qwen35_shared,
         };
         type Row = fn(GgmlType) -> bool;
         let parts: [(&str, Role, Program, Row); 5] = [
@@ -2291,13 +2291,13 @@ mod tests {
                 "ffn_gate_exps.weight",
                 Role::RoutedExperts,
                 Program::Qwen35Body,
-                qwen35_common_gate_up,
+                prompt_leg_gate_up,
             ),
             (
                 "ffn_down_exps.weight",
                 Role::RoutedExperts,
                 Program::Qwen35Body,
-                qwen35_common_down,
+                prompt_leg_down,
             ),
             (
                 "ffn_up_shexp.weight",

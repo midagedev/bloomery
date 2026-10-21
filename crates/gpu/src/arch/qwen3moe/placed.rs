@@ -99,7 +99,7 @@ use gguf::Split;
 use gguf::quant::GgmlType;
 use model::moe::UNION_MAX_COLS;
 use model::placement::Plan;
-use model::placement::accepts::{self, Leg35};
+use model::placement::accepts::{self, LegSplit};
 use model::placement::kernels::{self, DownAct, DownEntry};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use std::sync::Arc;
@@ -1286,14 +1286,14 @@ fn placed_ffn(
     let leg = if n_card > 0 {
         let tys = stack_files(w, [&gate, &up, &down], (n_card, ff, h), l)?;
         Some(match accepts::qwen35_leg(tys) {
-            Some(Leg35::Dispatch) => {
+            Some(LegSplit::Dispatch) => {
                 let [g, u, d] = stack_tys(w, [&gate, &up, &down], (n_card, ff, h), l)?;
                 FfnLeg::Dispatch {
                     gate_up: gate_up_entry(g, u, WHAT)?,
                     down_ty: d,
                 }
             }
-            Some(Leg35::Common) => FfnLeg::Common {
+            Some(LegSplit::Common) => FfnLeg::Common {
                 gate_up: tys[0],
                 down: tys[2],
             },
@@ -1580,9 +1580,9 @@ fn common_stacks<'a>(w: &'a Weights, f: &'a PlacedFfn) -> Result<LegStacks<'a>, 
         arms,
         (
             "a resident routed gate or up stack of a type the qwen35moe card leg runs \
-             (`accepts::qwen35_common_gate_up`)",
+             (`accepts::prompt_leg_gate_up`)",
             "a resident routed down stack of a type the qwen35moe card leg runs \
-             (`accepts::qwen35_common_down`)",
+             (`accepts::prompt_leg_down`)",
         ),
     )
 }

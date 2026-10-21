@@ -92,7 +92,7 @@ pub(super) fn stacks<L: CardLeg>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::swap35::Leg35;
+    use super::super::swap35::LegSplit;
     use super::super::swap38::Leg38;
     use super::*;
     use model::placement::{ModelTensor, Role};
@@ -163,7 +163,7 @@ mod tests {
             [Q6_K, Q6_K, Q4_K],
             [Q6_K, Q6_K, Q8_0],
         ] {
-            assert_eq!(layer::<Leg35>(ok), Ok(()), "{ok:?}");
+            assert_eq!(layer::<LegSplit>(ok), Ok(()), "{ok:?}");
         }
         for bad in [
             [IQ2_XS, IQ2_XS, Q4_K],
@@ -172,7 +172,7 @@ mod tests {
             [Q4_K, Q6_K, Q4_K],
             [Q6_K, Q8_0, Q6_K],
         ] {
-            let text = layer::<Leg35>(bad).expect_err(&format!("{bad:?} is refused"));
+            let text = layer::<LegSplit>(bad).expect_err(&format!("{bad:?} is refused"));
             assert!(
                 text.contains("layer 0's gate")
                     && text.ends_with(
@@ -235,7 +235,7 @@ mod tests {
                 [Q4_K, Q4_K, Q6_K]
             }
         };
-        match stacks::<Leg35>(&model(4, three), |_| Ok(true)) {
+        match stacks::<LegSplit>(&model(4, three), |_| Ok(true)) {
             Err(GpuError::Shape { detail, .. }) => {
                 assert!(detail.starts_with("layer 2's gate iq2_xs"), "{detail}");
             }
@@ -245,7 +245,7 @@ mod tests {
         short.tensors.pop();
         assert!(
             matches!(
-                stacks::<Leg35>(&short, |_| Ok(true)),
+                stacks::<LegSplit>(&short, |_| Ok(true)),
                 Err(GpuError::Tensor { .. })
             ),
             "a layer without its down is a missing tensor"
@@ -263,10 +263,10 @@ mod tests {
         for bad in [[Q4_K, Q5_K, Q4_K], [IQ2_XS, IQ2_XS, Q4_K]] {
             let two = model(2, |_| bad);
             assert!(
-                stacks::<Leg35>(&two, |_| Ok(false)).is_ok(),
+                stacks::<LegSplit>(&two, |_| Ok(false)).is_ok(),
                 "{bad:?} on layers with no card expert loads"
             );
-            match stacks::<Leg35>(&two, |l| Ok(l == 1)) {
+            match stacks::<LegSplit>(&two, |l| Ok(l == 1)) {
                 Err(GpuError::Shape { detail, .. }) => {
                     assert!(detail.starts_with("layer 1's gate"), "{detail}");
                 }

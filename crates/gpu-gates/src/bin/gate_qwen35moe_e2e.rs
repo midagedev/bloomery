@@ -431,7 +431,7 @@ mod gate {
     use model::arch::qwen35moe::hparams::Hparams;
     use model::arch::qwen35moe::names;
     use model::placement::PlanLevers;
-    use model::placement::accepts::{self, Leg35};
+    use model::placement::accepts::{self, LegSplit};
     use refset::arch::qwen35moe::fixture as fx;
     use refset::arch::qwen35moe::{BATCH, D1K, IK, MODEL, STEP4};
     use runtime::{Out, Target, Want};
@@ -3806,7 +3806,7 @@ mod gate {
     // ------------------------------- (o9) the common card leg on the placed load
 
     /// The layers of `file` whose three routed stacks the common card leg runs
-    /// ([`Leg35::Common`]: a type the dispatch's launches do not), with the
+    /// ([`LegSplit::Common`]: a type the dispatch's launches do not), with the
     /// stacks' file types, read from the header.
     fn common_layers(file: &Split) -> Result<Vec<(usize, [GgmlType; 3])>, GateError> {
         let mut out = Vec::new();
@@ -3818,7 +3818,7 @@ mod gate {
                     .ok_or_else(|| format!("no tensor {name}"))?;
                 *ty = t.ty;
             }
-            if accepts::qwen35_leg(tys) == Some(Leg35::Common) {
+            if accepts::qwen35_leg(tys) == Some(LegSplit::Common) {
                 out.push((l, tys));
             }
         }

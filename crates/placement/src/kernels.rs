@@ -110,7 +110,7 @@ pub const fn q8_act_bytes(cols: u64, k: u64) -> u64 {
 /// it (GLM-5.3, MiMo, Solar-Open2, MiniMax-M3, Raon) hold `Q8Act` down buffers
 /// only, so a Q8_0 layer they planned on the card would fail at its first
 /// launch where it runs on the host today; a program whose buffers follow the
-/// down's form reads the arm through its own row ([`crate::accepts::qwen35_common_gate_up`]).
+/// down's form reads the arm through its own row ([`crate::accepts::prompt_leg_gate_up`]).
 /// A stack in its planes is [`card_planes_runs`]'.
 #[must_use]
 pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
