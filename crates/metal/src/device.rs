@@ -4,7 +4,9 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSProcessInfo;
 use objc2_metal::{MTLCommandQueue, MTLDevice, MTLResourceOptions};
 
-use bloomery_device::{Device, DeviceError, Elem, Elems, FaultWord};
+use bloomery_device::{
+    Device, DeviceError, Elem, Elems, FaultWord, Stream, Window, WindowMut, check_len,
+};
 use bloomery_placement::placement::devices::DeviceInfo;
 
 use crate::buffer::{MetalBuffer, MetalRaw, MetalShared};
@@ -50,9 +52,12 @@ pub fn require_macos(major: u32, minor: u32, patch: u32) -> Result<(), DeviceErr
 pub struct MetalDevice {
     device: Handle<dyn MTLDevice>,
     queue: Handle<dyn MTLCommandQueue>,
+    /// The device's own stream, on its queue.
+    stream: MetalStream,
     library: Library,
     fault: MetalFaultWord,
-    info: DeviceInfo,
+    /// The device's place in the driver's list, as the census names it.
+    ordinal: u32,
 }
 
 impl MetalDevice {
@@ -74,15 +79,18 @@ impl MetalDevice {
                 "the device made no command queue".to_string(),
             )
         })?;
+        let queue = Handle(queue);
+        let stream = MetalStream::new(device.clone(), queue.clone())?;
         let library = Library::compile(&device)?;
         let fault = MetalFaultWord::new(&device)?;
-        let info = MetalCensus::info_of(&device, MetalCensus::ordinal_of(&device)?)?;
+        let ordinal = MetalCensus::ordinal_of(&device)?;
         Ok(Self {
             device,
-            queue: Handle(queue),
+            queue,
+            stream,
             library,
             fault,
-            info,
+            ordinal,
         })
     }
 
@@ -115,8 +123,9 @@ impl MetalDevice {
         &self.fault
     }
 
-    /// A new stream on the device's queue.
-    pub fn stream(&self) -> Result<MetalStream, DeviceError> {
+    /// A new stream on the device's queue, beside the device's own
+    /// ([`Device::stream`]).
+    pub fn new_stream(&self) -> Result<MetalStream, DeviceError> {
         MetalStream::new(self.device.clone(), self.queue.clone())
     }
 }
@@ -129,8 +138,12 @@ impl Device for MetalDevice {
     type Raw = MetalRaw;
     const BACKEND: &'static str = "metal";
 
-    fn info(&self) -> &DeviceInfo {
-        &self.info
+    fn info(&self) -> Result<DeviceInfo, DeviceError> {
+        MetalCensus::info_of(&self.device, self.ordinal)
+    }
+
+    fn stream(&self) -> &MetalStream {
+        &self.stream
     }
 
     fn zeroed<T: Elem>(&self, _s: &Self::Stream, n: Elems) -> Result<Self::Buffer<T>, DeviceError> {
@@ -151,6 +164,60 @@ impl Device for MetalDevice {
 
     fn shared<T: Elem>(&self, n: Elems) -> Result<Self::Shared<T>, DeviceError> {
         MetalShared::<T>::new(&self.device, n)
+    }
+
+    // The copies are the host's: every buffer's pages are the host's pages,
+    // so each waits for `s` and copies through the window's pages. A blit
+    // would take whole 4-byte words only.
+
+    fn read<T: Elem>(
+        &self,
+        s: &MetalStream,
+        from: Window<'_, T, Self>,
+        into: &mut [T],
+    ) -> Result<(), DeviceError> {
+        check_len("read", into.len(), from.len())?;
+        s.sync()?;
+        // SAFETY: `from` is a window of a live buffer, borrowed while the
+        // pages live, and its pages are only read.
+        let pages = unsafe {
+            from.raw()
+                .pages::<T>(from.byte_range()?.start, from.len())?
+        };
+        pages.read(into)
+    }
+
+    fn write<T: Elem>(
+        &self,
+        s: &MetalStream,
+        to: WindowMut<'_, T, Self>,
+        from: &[T],
+    ) -> Result<(), DeviceError> {
+        check_len("write", from.len(), to.len())?;
+        s.sync()?;
+        // SAFETY: `to` is a window of a live buffer held exclusively while
+        // the pages live, so they are the only host access to its elements.
+        let mut pages = unsafe { to.raw().pages::<T>(to.byte_range()?.start, to.len())? };
+        pages.write(from)
+    }
+
+    fn copy<T: Elem>(
+        &self,
+        s: &MetalStream,
+        from: Window<'_, T, Self>,
+        to: WindowMut<'_, T, Self>,
+    ) -> Result<(), DeviceError> {
+        check_len("copy", from.len().get(), to.len())?;
+        s.sync()?;
+        // SAFETY: as in `read`.
+        let values = unsafe {
+            from.raw()
+                .pages::<T>(from.byte_range()?.start, from.len())?
+        }
+        .to_vec();
+        // SAFETY: as in `write`.
+        let mut pages = unsafe { to.raw().pages::<T>(to.byte_range()?.start, to.len())? };
+        pages.write(&values)
     }
 
     fn fault(&self) -> &dyn FaultWord<Self::Stream> {

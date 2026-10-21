@@ -5,7 +5,7 @@
 //! once; those, and only those, are wrapped by [`Handle`]. A command buffer
 //! is not among them: it may move to another thread between uses, never be
 //! used by two at once, so it is wrapped by [`CommandBufferHandle`], which is
-//! `Send` and not `Sync`. An encoder is not wrapped at all.
+//! `Send` and not `Sync`, and kept behind a lock. An encoder is not wrapped at all.
 
 use core::ops::Deref;
 
@@ -65,6 +65,6 @@ impl<T: ?Sized + ThreadSafe> Deref for Handle<T> {
 pub(crate) struct CommandBufferHandle(pub(crate) Retained<ProtocolObject<dyn MTLCommandBuffer>>);
 
 // SAFETY: a command buffer is not documented thread-safe, but it may be
-// handed to another thread when the first stops using it: the stream that
-// holds it is `Send` and not `Sync`, so one thread uses it at a time.
+// handed to another thread when the first stops using it: the stream holds
+// it behind its lock, so one thread uses it at a time.
 unsafe impl Send for CommandBufferHandle {}
