@@ -91,10 +91,11 @@ mac-test:
 
 # The Metal backend's gate, on an Apple Silicon Mac: the device contract's clauses on this Mac's Metal device, run by
 # tools/mac-gate.sh (the Metal lock, the bound, the refusals). crates/metal links no cuda-oxide, so plain cargo builds it.
-# The backend's own unit tests run first. A lab-* recipe, not a gate-* one: the box has no Metal device, so no landing
-# batch selects it.
+# The backend's own unit tests run first, then the device gate and the qwen35moe kernels' gate (the fixture's trunk file at
+# ~/.cache/bloomery/mac-port/fixture/, or --fixture). A lab-* recipe, not a gate-* one: the box has no Metal device, so no
+# landing batch selects it.
 lab-metal:
-    cargo test -p bloomery-metal --lib && cargo build --release -p bloomery-metal --bin gate_metal_device && ./tools/mac-gate.sh gate_metal_device
+    cargo test -p bloomery-metal --lib && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels
 
 # clippy on the Metal backend's macOS body, which the static tier's x86_64-linux cross check compiles as an empty crate.
 mac-metal-lint:

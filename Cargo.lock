@@ -356,6 +356,7 @@ name = "bloomery-metal"
 version = "0.1.0"
 dependencies = [
  "bloomery-device",
+ "bloomery-gguf",
  "bloomery-placement",
  "dispatch2",
  "objc2",
