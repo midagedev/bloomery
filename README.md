@@ -36,11 +36,10 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.3.6)
+## Status (0.3.7)
 
-0.3.6 answers structured requests with schemajump (the fixed parts of a JSON answer are fed in one call, not decoded
-token by token), serves `/v1/systemone` on every generative seat in the same body as the Clef seat, and runs
-Solar-Open2-250B with its experts on the card and the host ([release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.6)).
+0.3.7 runs Raon-1-mini-preview on one card with its DFlash2 draft, MiniMax-M3 with its experts on the card and the
+host, and Solar-Open2 on two cards (`--place bp`) ([release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.7)).
 
 | Area | State |
 |---|---|
@@ -62,7 +61,9 @@ Solar-Open2-250B with its experts on the card and the host ([release notes](http
 | Text embeddings | EmbeddingGemma v1 (300M) and EmbeddingGemma 2, Q8_0, beside a chat model: `--embd-model FILE` or `--embd-hf ggml-org/embeddinggemma-2-GGUF:Q8_0`. `/v1/embeddings` and `/embedding` return mean-pooled vectors; `dimensions` selects 128, 256, 512 or the full output width (768), normalized after the cut. V1 takes up to 2048 tokens per input; v2 takes up to 8192. The side seat reserves its bytes before the chat plan places experts. See [serving](docs/serving.md) |
 | Image input | V4.1, Qwen3.6, MiniCPM-V 4.7, GLM-5.3 and the Clef decide seat, with `--mmproj <file>` (llama-server's flag). Under `--hf` with no `--mmproj`, a seat takes the projector in the model's repo when it costs the text model no card experts or context; otherwise it prints the projector's bytes and serves text (`--no-mmproj` skips it). Images go in as base64 (`data:` URLs), not fetched URLs. A request with an image to a seat started without an encoder is refused by name |
 
-### Known issues and limits (0.3.6)
+### Known issues and limits (0.3.7)
+
+- **Raon-1-mini-preview's prompt processing runs at about 250–300 tok/s** (the rows pass in chunks of 8); decode is not affected.
 
 - **DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`).** Unset `--place` picks `a`.
 - **The Qwen3.6 real-tier e2e gate's `split` residency clause can fail on one run and pass on the next at the same commit** (on an RTX 3090, logits distance from the off run up to 4.879e-1 against its 0.26 band, then 1.6–1.8e-1 on a rerun). The experts it streams follow the lane rate measured at runtime, so the clause's distance moves from run to run. This is a developer gate, not a change in what a load serves.
@@ -100,12 +101,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.3.6-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.6-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.3.7-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.7-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.3.6](https://github.com/midagedev/bloomery/releases/tag/v0.3.6)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.3.7](https://github.com/midagedev/bloomery/releases/tag/v0.3.7)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
