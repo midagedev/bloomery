@@ -45,7 +45,12 @@ pub struct Clauses {
 
 /// The tokens the chat request asks for at most, and the reasoning tokens the
 /// budget lets the model spend before the server writes the close.
-const MAX_TOKENS: u64 = 64;
+// PIN(2026-10-21): 64 → 512. MiniMax-M3's greedy answer to `TURN` ends its turn at
+// 143 tokens (16 of reasoning, the rest content), past 64, so the turn-end clause
+// read a cut answer (`finish_reason "length"`); 512 holds it 3.5×, and Solar-Open2
+// stops under 64 either way. The clause still asks `stop` and no turn end in the
+// message: red at 64, green at 512 on the same binary.
+const MAX_TOKENS: u64 = 512;
 const BUDGET: u64 = 16;
 
 /// Polls of a second that bound the wait for a server to listen: a cold load

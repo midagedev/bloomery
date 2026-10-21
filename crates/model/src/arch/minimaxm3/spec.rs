@@ -221,9 +221,9 @@ mod tests {
     }
 
     /// Only the features no program runs are listed: the swigluoai blocks, the block-max
-    /// indexer, the sigmoid router and the program itself — and the chat surface: the `minimax-m2`
-    /// pre-tokenizer and the template's tool-call parser. Each is a coverage item, so a load
-    /// refuses the file by name rather than running it wrong.
+    /// indexer, the sigmoid router and the program itself — and the chat surface's template
+    /// tool-call parser. Each is a coverage item, so a load refuses the file by name rather than
+    /// running it wrong. The `minimax-m2` pre-tokenizer is run by the tokenizer crate and is no item.
     #[test]
     fn what_no_program_runs_is_listed() {
         let (_, items) = read("mm3-coverage");
@@ -231,9 +231,12 @@ mod tests {
         for needle in [
             "swigluoai",
             "block-max indexer: 2 heads x 16, blocks of 4 keep 3 (1 local)",
-            "pre-tokenizer minimax-m2",
         ] {
             assert!(listed(needle), "{needle:?} not listed: {items:#?}");
         }
+        assert!(
+            !listed("pre-tokenizer"),
+            "a pre-tokenizer is listed: {items:#?}"
+        );
     }
 }

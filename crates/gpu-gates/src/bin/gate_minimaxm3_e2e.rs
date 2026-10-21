@@ -219,8 +219,7 @@ mod gate {
         let path = real_file()?;
         let split =
             gguf::Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        // The file's pre-tokenizer (`minimax-m2`) is one the tokenizer crate does not run yet: the prompt is the ids
-        // of the reference set's prompt a, and the output is shown as the vocabulary's pieces.
+        // The prompt is the ids of the reference set's prompt a, and the output is shown as the vocabulary's pieces.
         let man = RefManifest::open(&minimaxm3::LCPP.path(minimaxm3::A), &minimaxm3::LCPP)?;
         let prompt = prompt_tables::tokens(&man)?.to_vec();
         let pieces = pieces_of(&split)?;

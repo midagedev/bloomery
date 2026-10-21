@@ -1769,8 +1769,8 @@ gate-engram:
 
 # The tokenizer gate: our ids equal `llama-tokenize`'s on every engram corpus text and every case of
 # crates/tokenizer/tests/cases.txt, in both parse modes, and the reference's ids decode back to the text, for
-# the five vocabularies the engine runs: V4.1 (deepseek-v3), Qwen3-MoE (qwen2), GLM-5.3-Flash (glm4),
-# Qwen3.8-Flash-Next (qwen35) and Nemotron 3 Nano 4B (pixtral). It only reads the sets: each opens through its refset family
+# the six vocabularies the engine runs: V4.1 (deepseek-v3), Qwen3-MoE (qwen2), GLM-5.3-Flash (glm4),
+# Qwen3.8-Flash-Next (qwen35), Nemotron 3 Nano 4B (pixtral) and MiniMax-M3 (minimax-m2). It only reads the sets: each opens through its refset family
 # (crates/refset/src/arch/tokenizer.rs), which refuses by name a set written from another reference tree (commit or patch), from
 # another vocabulary file or other cases, with a text that is not the one dumped, or never finished.
 # `just dump-ref-tokenizer` writes them. EmbeddingGemma v1's llama SentencePiece cases also compare with
@@ -1779,7 +1779,7 @@ gate-tokenizer:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
 # The tokenizer oracle's sets, once per change of the reference trees, the vocabulary files, cases.txt or the
 # docs/ the Korean text is gathered from: `llama-tokenize`'s ids per vocabulary into $BLOOMERY_DATA/ref-tokenizer-<v>/
-# (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron, gemma4, llama or all, every one but
+# (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron, minimaxm3, gemma4, llama or all, every one but
 # gemma4 and llama). No lease, no GPU. gemma4 (EmbeddingGemma 2) and llama (v1) use mainline 6868a52cb
 # (`just build-emb2-lcpp`), with their profile's EMBED_CASES after cases.txt. The EmbeddingGemma oracle sets read those ids.
 # Every vocabulary is held to the tree it is read by: before the dump the tree's commit, its patch and its build are checked against
@@ -1790,7 +1790,8 @@ gate-tokenizer:
 # V4.1's reference is a side tree (/home/user/ik-tilde: ik main plus the one line that puts `~` in the S class,
 # ik#2528) and Qwen3-MoE, GLM-5.3-Flash and Qwen3.8 use /home/user/ik-tokref (the ik-idxkey commit plus the
 # unicode_tolower fix, ik#2520). Nemotron uses /home/user/llama.cpp-mainline: ik-tokref has no nemotron_h
-# architecture, so it refuses the file, and that mainline binary loads it.
+# architecture, so it refuses the file, and that mainline binary loads it. MiniMax-M3 uses /home/user/llama.cpp-solar2
+# (mainline 6ea215d17 plus the Solar-Open2 patch), whose lenient UTF-8 decoder the crate follows.
 # Pass --cases-only to dump the fixed texts without the large corpus snapshots.
 dump-ref-tokenizer VOCAB='all' *ARGS:
     ./tools/box.sh 'timeout --kill-after=10 900 bash crates/tokenizer/tools/oracle.sh {{VOCAB}} {{ARGS}}'

@@ -39,6 +39,7 @@
 #   glm5next  GLM-5.3-Flash's first shard         ik-tokref                                            ref-tokenizer-glm5next
 #   qwen38    Qwen3.8-Flash-Next's first shard    ik-tokref                                            ref-tokenizer-qwen38
 #   nemotron  Nemotron 3 Nano 4B                  llama.cpp-mainline (pixtral; --no-bos, below)        ref-tokenizer-nemotron
+#   minimaxm3 MiniMax-M3-UD-IQ4_XS's first shard  llama.cpp-solar2 (minimax-m2; --no-bos, below)       ref-tokenizer-minimaxm3
 #   gemma4    EmbeddingGemma 2's Q8_0 file        mainline 6868a52cb (the gemma-embedding2 profile's  ref-tokenizer-gemma4
 #                                                 LCPP and MODEL, tools/ref/models/gemma-embedding2.sh)
 #   llama     EmbeddingGemma v1's Q8_0 file      the same mainline pin, gemma-embedding profile       ref-tokenizer-llama
@@ -74,7 +75,7 @@
 # takes one snapshot of docs/ per vocabulary, in turn, all but gemma4 and llama, which run by name on a machine with their
 # mainline tree.
 #
-# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|llama|all [--cases-only]
+# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|gemma4|llama|all [--cases-only]
 # --cases-only writes the fixed cases without reading the corpus trees.
 set -euo pipefail
 
@@ -157,15 +158,15 @@ case $#:${2:-} in
 esac
 
 case ${1:-} in
-  v41 | qwen3moe | glm5next | qwen38 | nemotron | gemma4 | llama) ;;
+  v41 | qwen3moe | glm5next | qwen38 | nemotron | minimaxm3 | gemma4 | llama) ;;
   all)
-    for v in v41 qwen3moe glm5next qwen38 nemotron; do
+    for v in v41 qwen3moe glm5next qwen38 nemotron minimaxm3; do
       echo "oracle: $v"
       bash "${BASH_SOURCE[0]}" "$v" "${@:2}"
     done
     exit 0
     ;;
-  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|gemma4|llama|all" >&2; exit 64 ;;
+  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|gemma4|llama|all" >&2; exit 64 ;;
 esac
 VOCAB_NAME=$1
 
@@ -245,6 +246,20 @@ profile() {
       # llama-tokenize also processes escapes in a -f text by default
       # (tokenize.cpp `params.escape`), so a `\n` in the code corpus would
       # reach the tokenizer as a newline; --no-escape keeps the text's bytes.
+      REF_FLAGS=(--no-bos --no-escape)
+      ;;
+    minimaxm3)
+      # llama.cpp-solar2: mainline at 6ea215d17 plus the Solar-Open2 patch (crates/refset/src/arch/solar2). Its `minimax-m2` pre
+      # is the GPT4O regex list with one expression, which unicode.cpp has no hand-written splitter for, and its UTF-8 decoder
+      # is the lenient one this crate's decode_lenient follows (an overlong form passes through): the mainline tree the
+      # MiniMax-M3 node dumps are read by (cd0a5b6a1) rejects one, byte by byte, as U+FFFD.
+      ORACLE_TREE=/home/user/llama.cpp-solar2
+      # Its llama-tokenize reports `version: <n> (<commit>)`, not the `commit <hash>` the tree check reads: the age check is all there is.
+      BUILD_PIN=6ea215d171fd31df943bf1ac8227129f2b963160 BUILD_PATCH=1616f7f3d842
+      TREE_FLAGS=(--unversioned)
+      SHARD=/models/MiniMax-M3-UD-IQ4_XS/MiniMax-M3-UD-IQ4_XS-00001-of-00006.gguf
+      SET=ref-tokenizer-minimaxm3
+      # Nemotron's flags, a mainline llama-tokenize too: the gate compares the text's own ids, and a `\n` in a text is two bytes.
       REF_FLAGS=(--no-bos --no-escape)
       ;;
     gemma4 | llama)

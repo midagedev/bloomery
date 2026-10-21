@@ -145,8 +145,7 @@ impl Family for MiniMax3 {
 
     /// The family's own reading (`PlanInputs::describe`), as its end-to-end
     /// gate's seat reads the file: the coverage list still names the
-    /// pre-tokenizer the tokenizer crate does not run, and the seat's own
-    /// vocabulary build refuses the file by name when the server starts.
+    /// template's tool-call parser.
     fn read(split: &Split) -> Result<PlanInputs<Self::H>, PlacementError> {
         model::arch::minimaxm3::place::PlanInputs::describe(split)
     }

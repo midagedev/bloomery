@@ -2,7 +2,7 @@
 //! id, and the reference's ids decode back to the source bytes — for each
 //! vocabulary the engine runs: V4.1's (`deepseek-v3` pre-tokenizer),
 //! Qwen3-MoE's (`qwen2`), GLM-5.3-Flash's (`glm4`), Qwen3.8-Flash-Next's
-//! (`qwen35`) and Nemotron 3 Nano 4B's (`pixtral`).
+//! (`qwen35`), Nemotron 3 Nano 4B's (`pixtral`) and MiniMax-M3's (`minimax-m2`).
 //!
 //! The reference's sets are written once by `just dump-ref-tokenizer`
 //! (`crates/tokenizer/tools/oracle.sh`) and opened here through their refset
@@ -17,14 +17,15 @@
 //! `llama-tokenize`'s `add_special` false, the call `encode` makes here, and
 //! the ids are the text's own. The round trip decodes with
 //! special tokens rendered, which returns their text, so it is exact for
-//! every input that is valid UTF-8. Invalid input is not: the reference
-//! decodes it to U+FFFD first.
+//! every input that is valid UTF-8, up to a vocabulary's `unspelled` texts
+//! in the mode that does not parse special tokens. Invalid input is not: the
+//! reference decodes it to U+FFFD first.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use refset::arch::gemma_embedding::TOKENIZER as LLAMA;
-use refset::arch::tokenizer::{GLM5NEXT, NEMOTRON, QWEN3MOE, QWEN38, V41};
+use refset::arch::tokenizer::{GLM5NEXT, MINIMAXM3, NEMOTRON, QWEN3MOE, QWEN38, V41};
 use refset::family::Family;
 use refset::tokenizer::{Text, TokenizerSet};
 use tokenizer::{Decoder, Tokenizer};
@@ -43,6 +44,10 @@ struct Vocabulary {
     /// Texts that must end generation whichever candidate an ambiguous role
     /// took.
     eog: &'static [&'static str],
+    /// Texts the reference's `--no-parse-special` ids may drop, so that they
+    /// decode to the text up to them (empty for a vocabulary whose ids round
+    /// trip).
+    unspelled: &'static [&'static str],
 }
 
 /// V4.1's first shard: the family's file, `$BLOOMERY_V41_DIR` or the served
@@ -51,6 +56,7 @@ fn v41() -> Vocabulary {
     Vocabulary {
         family: &V41,
         ambiguous: &[],
+        unspelled: &[],
         eog: &[],
     }
 }
@@ -63,6 +69,7 @@ fn qwen3moe() -> Vocabulary {
         // are CONTROL tokens on the reference's EOT list. Both are in the
         // end-of-generation set either way (every EOG text is).
         ambiguous: &["eot"],
+        unspelled: &[],
         eog: &["<|im_end|>", "<|endoftext|>"],
     }
 }
@@ -72,6 +79,7 @@ fn glm5next() -> Vocabulary {
     Vocabulary {
         family: &GLM5NEXT,
         ambiguous: &[],
+        unspelled: &[],
         // The header's eos, eot and eom: a generation ends on any of the three.
         eog: &["<|endoftext|>", "<|user|>", "<|observation|>"],
     }
@@ -84,6 +92,7 @@ fn qwen38() -> Vocabulary {
         // No `eot_token_id` key, as Qwen3-MoE's: `<|im_end|>` (the eos) and
         // `<|endoftext|>` (the bos and pad) are both on the reference's EOT list.
         ambiguous: &["eot"],
+        unspelled: &[],
         eog: &["<|im_end|>", "<|endoftext|>"],
     }
 }
@@ -95,7 +104,24 @@ fn nemotron() -> Vocabulary {
     Vocabulary {
         family: &NEMOTRON,
         ambiguous: &[],
+        unspelled: &[],
         eog: &["</s>", "<|im_end|>"],
+    }
+}
+
+/// MiniMax-M3-UD-IQ4_XS's first shard on the box (`minimax-m2`). No `eot_token_id`
+/// key; generation ends on the eos `[e~[`. U+FFFD is a control token (id 16474): with
+/// special tokens parsed it is that token. With `--no-parse-special` the reference spells
+/// it `ï¿½`, whose merges end in a symbol that is no token, and the bytes of a symbol that
+/// is no token have no tokens of their own, so it drops the character (`a\u{FFFD}b` is two
+/// ids) unless a token spells the word it is in (` \u{FFFD}`, id 122700). Those ids decode
+/// to the text up to U+FFFD.
+fn minimaxm3() -> Vocabulary {
+    Vocabulary {
+        family: &MINIMAXM3,
+        ambiguous: &[],
+        eog: &["[e~["],
+        unspelled: &["\u{FFFD}"],
     }
 }
 
@@ -164,8 +190,10 @@ fn stream(tok: &Tokenizer, ids: &[u32]) -> String {
 }
 
 /// One text in both parse modes: ids equal, and the reference's ids decode
-/// (whole and streamed) to the text when it is UTF-8. Returns the failures.
-fn check(tok: &Tokenizer, name: &str, text: &Text, failures: &mut Vec<String>) {
+/// (whole and streamed) to the text when it is UTF-8, up to the vocabulary's
+/// `unspelled` texts in the mode that does not parse special tokens. Returns
+/// the failures.
+fn check(tok: &Tokenizer, v: &Vocabulary, name: &str, text: &Text, failures: &mut Vec<String>) {
     let bytes = text.read().unwrap_or_else(|e| panic!("{e}"));
     for (mode, parse) in [("parse", true), ("no-parse", false)] {
         let oracle = text.ids(parse).unwrap_or_else(|e| panic!("{e}"));
@@ -175,19 +203,35 @@ fn check(tok: &Tokenizer, name: &str, text: &Text, failures: &mut Vec<String>) {
         let verdict = compare(tok, &ours, &oracle);
         let round = match std::str::from_utf8(&bytes) {
             Err(_) => "not UTF-8, no round trip".to_string(),
-            Ok(_) if tok.decode_bytes(&oracle, true) != bytes => {
-                failures.push(format!(
-                    "{name} {mode}: the reference's ids do not decode to the text"
-                ));
-                "round trip FAILED".into()
+            Ok(s) => {
+                // Exact; without special-token parsing, up to the vocabulary's
+                // `unspelled` texts, which the reference may drop.
+                let up_to = |t: &str| {
+                    v.unspelled
+                        .iter()
+                        .fold(t.to_string(), |t, u| t.replace(u, ""))
+                };
+                let same = |got: &str| match parse {
+                    true => got == s,
+                    false => up_to(got) == up_to(s),
+                };
+                let decoded = String::from_utf8(tok.decode_bytes(&oracle, true));
+                if !decoded.as_ref().is_ok_and(|d| same(d)) {
+                    failures.push(format!(
+                        "{name} {mode}: the reference's ids do not decode to the text"
+                    ));
+                    "round trip FAILED".into()
+                } else if !same(&stream(tok, &oracle)) {
+                    failures.push(format!(
+                        "{name} {mode}: the streamed decode differs from the text"
+                    ));
+                    "stream FAILED".into()
+                } else if decoded.is_ok_and(|d| d == s) {
+                    "round trip exact".into()
+                } else {
+                    "round trip exact up to the unspelled".into()
+                }
             }
-            Ok(s) if stream(tok, &oracle) != s => {
-                failures.push(format!(
-                    "{name} {mode}: the streamed decode differs from the text"
-                ));
-                "stream FAILED".into()
-            }
-            Ok(_) => "round trip exact".into(),
         };
         println!(
             "set {name} {mode}: ours {} = reference {} ids: {} — {round} — encode {:.0} tok/s",
@@ -219,7 +263,7 @@ fn corpus_ids_equal_reference(v: &Vocabulary) {
     );
     let mut failures = Vec::new();
     for text in set.corpora() {
-        check(&tok, &text.name, text, &mut failures);
+        check(&tok, v, &text.name, text, &mut failures);
     }
     assert!(
         failures.is_empty(),
@@ -288,7 +332,7 @@ fn cases_equal_reference(v: &Vocabulary) {
             text.name.trim_start_matches("cases/"),
             String::from_utf8_lossy(&bytes)
         );
-        check(&tok, &name, text, &mut failures);
+        check(&tok, v, &name, text, &mut failures);
     }
     assert!(
         failures.is_empty(),
@@ -382,4 +426,16 @@ fn hw_nemotron_corpus_ids_equal_reference() {
 #[ignore = "needs the nemotron vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_nemotron_cases_equal_reference() {
     cases_equal_reference(&nemotron());
+}
+
+#[test]
+#[ignore = "needs the minimaxm3 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
+fn hw_minimaxm3_corpus_ids_equal_reference() {
+    corpus_ids_equal_reference(&minimaxm3());
+}
+
+#[test]
+#[ignore = "needs the minimaxm3 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
+fn hw_minimaxm3_cases_equal_reference() {
+    cases_equal_reference(&minimaxm3());
 }

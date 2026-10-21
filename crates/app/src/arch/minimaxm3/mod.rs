@@ -40,9 +40,7 @@ impl Batch for Body {
     const WHAT: &'static str = self::WHAT;
 
     /// The family's own reading ([`PlanInputs::describe`]), not the strict
-    /// one: the coverage list still names the pre-tokenizer the tokenizer
-    /// crate does not run, and the seat's own vocabulary build refuses the
-    /// file by name when the server starts.
+    /// one: the coverage list still names the template's tool-call parser.
     fn read(file: &Split) -> Result<PlanInputs, GpuError> {
         PlanInputs::describe(file).map_err(|e| GpuError::plan(WHAT, e))
     }
