@@ -504,11 +504,15 @@ mod tests {
     // planes); every other pair is unchanged.
     // PIN(2026-10-21): and IQ2_XXS (`gemm_iq2xxs`, which `GemmWeight` already
     // decoded and the latent MoE body launches); every other pair is unchanged.
+    // PIN(2026-10-22): and Q5_0 (`gemm_q5_0p` over a stack's `pack_q5_0` words,
+    // which Raon-1's Q5_0 down stacks' prompt route reads); every other pair
+    // is unchanged.
     #[test]
     fn gemm_admits_exactly_the_pinned_pairs() {
         assert_eq!(
             rows(gemm),
             [
+                (GgmlType::Q5_0, GemmEntry::Q5_0),
                 (GgmlType::Q5_1, GemmEntry::Q5_1),
                 (GgmlType::Q8_0, GemmEntry::Q8_0),
                 (GgmlType::Q3_K, GemmEntry::Q3k),

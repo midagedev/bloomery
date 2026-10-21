@@ -254,11 +254,13 @@ impl<'a> StackW<'a> {
     /// The stack, of file type `ty`, as the route GEMM the kernel table names
     /// for that type reads it ([`kernels::gemm`]): a K-quant's or an
     /// i-quant's words through the grouped GEMM, the file's Q8_0, Q5_1 or
-    /// IQ4_NL blocks and NVFP4's planes through the 32-value GEMM. `None` for
-    /// a type the table names no GEMM for, or a form that GEMM does not read.
+    /// IQ4_NL blocks, a Q5_0 stack's packed words and NVFP4's planes through
+    /// the 32-value GEMM. `None` for a type the table names no GEMM for, or a
+    /// form that GEMM does not read.
     pub(crate) fn route(self, ty: GgmlType) -> Option<RouteW<'a>> {
         Some(match (kernels::gemm(ty)?, self) {
             (GemmEntry::Q8_0, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q8_0File(w)),
+            (GemmEntry::Q5_0, StackW::Q5_0(w)) => RouteW::Blocks32(Gemm32Weight::Q5_0Packed(w)),
             (GemmEntry::Q5_1, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q5_1File(w)),
             (GemmEntry::Iq4nl, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Iq4NlFile(w)),
             (GemmEntry::Nvfp4, StackW::Nvfp4(s)) => RouteW::Blocks32(Gemm32Weight::Nvfp4Planes(s)),
@@ -2485,9 +2487,9 @@ pub(crate) mod tests {
     /// A stack routes by the GEMM entry the kernel table names for its type
     /// (`kernels::gemm`): a K-quant's or an i-quant's words through the
     /// grouped GEMM in the type that GEMM decodes (`GemmWeight::from_ggml`),
-    /// the file's Q8_0, Q5_1 and IQ4_NL blocks and NVFP4's planes through the
-    /// 32-value GEMM in their own weights; a stack in the other form, and a
-    /// type the table names no GEMM for, has no route.
+    /// the file's Q8_0, Q5_1 and IQ4_NL blocks, a Q5_0 stack's packed words and
+    /// NVFP4's planes through the 32-value GEMM in their own weights; a stack
+    /// in the other form, and a type the table names no GEMM for, has no route.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_a_stack_routes_by_the_tables_gemm_entry() {
@@ -2534,6 +2536,14 @@ pub(crate) mod tests {
             blocks32(words, GgmlType::Q5_1),
             Some(Gemm32Weight::Q5_1File(_))
         ));
+        // PIN(2026-10-22): a Q5_0 stack's packed words join the 32-value
+        // routes with the table's GEMM row for the type (`gemm_q5_0p`); the
+        // file's blocks as words have no route.
+        assert!(matches!(
+            blocks32(StackW::Q5_0(&qs), GgmlType::Q5_0),
+            Some(Gemm32Weight::Q5_0Packed(_))
+        ));
+        assert!(words.route(GgmlType::Q5_0).is_none(), "Q5_0 as words");
         assert!(matches!(
             blocks32(words, GgmlType::IQ4_NL),
             Some(Gemm32Weight::Iq4NlFile(_))
@@ -2546,7 +2556,7 @@ pub(crate) mod tests {
             assert!(planes.route(ty).is_none(), "{ty} in planes");
         }
         assert!(words.route(GgmlType::NVFP4).is_none(), "NVFP4 as words");
-        for ty in [GgmlType::MXFP4, GgmlType::Q5_0, GgmlType::F32] {
+        for ty in [GgmlType::MXFP4, GgmlType::F32] {
             assert!(kernels::gemm(ty).is_none(), "{ty} has a GEMM row");
             assert!(words.route(ty).is_none(), "{ty}");
         }

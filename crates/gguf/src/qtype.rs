@@ -78,7 +78,7 @@ pub const QROWS: &[QRow] = &[
     // q5_0: ggml.c:756, ggml-common.h:196-216; q5_1: ggml.c:777; q8_0: ggml.c:819, ggml-common.h:233-238
     // (one f16 d and 32 int8 codes)
     QRow { ty: T::Q5_0, name: "q5_0", blck: 32, bytes: 22, dequant: true, host_act: H::Q8_2X4,
-           card: card!(Q5_0          Q5_0          -       (Q5_0, Q8Blocks32)  -      Q5_0    -    -) },
+           card: card!(Q5_0          Q5_0          -       (Q5_0, Q8Blocks32)  Q5_0   Q5_0    -    -) },
     QRow { ty: T::Q5_1, name: "q5_1", blck: 32, bytes: 24, dequant: true, host_act: H::Q8_2X4,
            card: card!(Q5_1          Q5_1          -       (Q5_1, Q8Blocks32)  Q5_1   -       -    -) },
     QRow { ty: T::Q8_0, name: "q8_0", blck: 32, bytes: 34, dequant: true, host_act: H::Q8_2X4,

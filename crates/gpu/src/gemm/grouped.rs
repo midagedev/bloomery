@@ -203,7 +203,11 @@ impl GemmWeight {
             GemmEntry::Iq2xxs => Some(GemmWeight::Iq2Xxs),
             GemmEntry::Iq3xxs => Some(GemmWeight::Iq3Xxs),
             GemmEntry::Iq4xs => Some(GemmWeight::Iq4Xs),
-            GemmEntry::Q8_0 | GemmEntry::Q5_1 | GemmEntry::Iq4nl | GemmEntry::Nvfp4 => None,
+            GemmEntry::Q8_0
+            | GemmEntry::Q5_0
+            | GemmEntry::Q5_1
+            | GemmEntry::Iq4nl
+            | GemmEntry::Nvfp4 => None,
         }
     }
 

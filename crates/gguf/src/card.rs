@@ -30,8 +30,9 @@
 //!
 //! Weights. The routed `_sel`, gate·up and file-layout gemm entries read a
 //! stack as the file's blocks in the [`CardFormat::KQuant`] word stream;
-//! `q5_0_gemv_sel` and the Q5_0 dense site ([`SiteEntry::Q5_0`]) read the
-//! packed [`CardFormat::Q5_0`] layout, the Q8_0 dense, head and embedding
+//! `q5_0_gemv_sel`, the Q5_0 gemm entry and the Q5_0 dense site
+//! ([`SiteEntry::Q5_0`]) read the packed [`CardFormat::Q5_0`] layout, the
+//! Q8_0 dense, head and embedding
 //! entries read [`CardFormat::Q8_0Planes`], and the NVFP4 entries read
 //! [`CardFormat::Nvfp4Planes`] (a routed stack's with one tensor scale an
 //! expert). A routed entry's layout is its `layout`, which
@@ -196,6 +197,9 @@ pub enum GemmEntry {
     /// the q8f32 planes) for a dense projection (`SiteEntry::Q8_0`); both in
     /// `crates/gpu/src/gemm/kernels32.rs`.
     Q8_0,
+    /// `Gemm32Weight::Q5_0Packed` (`gemm_q5_0p`, the `pack_q5_0` layout a
+    /// stack's `q5_0_gemv_sel` reads) in `crates/gpu/src/gemm/kernels32.rs`.
+    Q5_0,
     /// `Gemm32Weight::Q5_1File` (`gemm_q5_1`) in
     /// `crates/gpu/src/gemm/kernels32.rs`.
     Q5_1,
