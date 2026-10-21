@@ -154,15 +154,6 @@ impl Family {
         }
     }
 
-    /// Whether the seat serves the file's own `tokenizer.chat_template` when no
-    /// `--chat-template-file` is given (the V4.1 seat serves DeepSeek's official encoding).
-    fn serves_the_files_template(self) -> bool {
-        match self {
-            Family::Glm => true,
-            Family::Ds41 => false,
-        }
-    }
-
     /// The `clip.projector_type` of the family's projector.
     fn projector_type(self) -> &'static str {
         match self {
@@ -915,7 +906,8 @@ impl Gate {
         let files = applied(&url, &call_messages())?;
         println!("s5u: prompt {}", tail(&files, 160));
         println!("s5u: server stopped: {}", up.served.stop()?);
-        ok &= if self.family.serves_the_files_template() {
+        // The GLM seat serves the file's own template by default; the V4.1 seat serves the official encoding.
+        ok &= if self.family == Family::Glm {
             check("s5_default_is_the_files_template", files == *plain)
         } else {
             check("s5_file_replaces_the_default", files != *plain)
