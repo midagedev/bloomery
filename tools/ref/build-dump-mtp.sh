@@ -56,7 +56,7 @@ echo "build-dump-mtp: ik libraries current in $(($(date +%s) - t0)) s"
 mkdir -p "$OUT"
 TMP=$OUT/dump_mtp.tmp.$$
 trap 'rm -f "$TMP" "$TMP.build"' EXIT
-SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
+SRC_SHA=$(cat "$SRC" "$HERE/tools/ref/ref_tensor_io.h" | sha256sum | cut -d' ' -f1)
 # -rdynamic exports dump_mtp's ggml_backend_sched_graph_compute_async and llama_set_mtp_op_type so
 # libllama's calls bind to them (its header says why); -ldl for the dlsym(RTLD_NEXT) that forwards to
 # the libraries' own.
@@ -66,4 +66,4 @@ lease_release
 printf 'source_sha256 %s\nik %s\nbuild %s\n' "$SRC_SHA" "$(readlink -f "$IK")" "$GLM_MTP_SHA" > "$TMP.build"
 mv -f "$TMP" "$OUT/dump_mtp"
 mv -f "$TMP.build" "$OUT/dump_mtp.build"
-echo "built $OUT/dump_mtp from dump_mtp.cpp sha256 ${SRC_SHA:0:12} against $IK ($GLM_MTP_SHA)"
+echo "built $OUT/dump_mtp from dump_mtp.cpp and ref_tensor_io.h sha256 ${SRC_SHA:0:12} against $IK ($GLM_MTP_SHA)"

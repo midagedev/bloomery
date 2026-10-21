@@ -171,7 +171,7 @@ SRC="${BASH_SOURCE[0]%/*}/dump_ref.cpp"
 BUILD_REC="$BIN.build"
 BIN_SHA=$(sha256sum "$BIN" | cut -c1-12)
 BIN_MTIME=$(date -u -r "$BIN" +%Y-%m-%dT%H:%M:%SZ)
-SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
+SRC_SHA=$(cat "$SRC" "${BASH_SOURCE[0]%/*}/ref_tensor_io.h" | sha256sum | cut -d' ' -f1)
 REC_SHA=$(awk '$1 == "source_sha256" { print $2 }' "$BUILD_REC" 2>/dev/null || true)
 stale=()
 if [ -z "$REC_SHA" ]; then

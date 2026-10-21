@@ -65,6 +65,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "ref_io.h"
+#include "ref_tensor_io.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -116,14 +117,6 @@ struct dump_ctx {
     int                           scratch = 0;
     int                           copies  = 0;  // scheduler copies of host inputs, written as input rows
 };
-
-static std::string safe_name(const char * name) {
-    std::string s(name);
-    for (char & c : s) {
-        if (c == '/' || c == '\\' || c == ' ') c = '_';
-    }
-    return s;
-}
 
 static void fail(dump_ctx * d, const char * fmt, ...) {
     va_list ap;
@@ -185,42 +178,6 @@ static void flush_block(dump_ctx * d, const std::string & accepted) {
     d->pending.clear();
     if (d->block >= 0 && d->proposal >= 0) {
         fprintf(d->manifest, "draft\t%d\t0\t%d\n", d->block, d->proposal);
-    }
-}
-
-enum elem_kind { ELEM_UNHANDLED, ELEM_FLOAT, ELEM_INT };
-
-static elem_kind read_elem(ggml_type type, const uint8_t * p, float & f, int64_t & i) {
-    switch (type) {
-        case GGML_TYPE_F32:  { float       x; memcpy(&x, p, sizeof x); f = x;                    return ELEM_FLOAT; }
-        case GGML_TYPE_F16:  { ggml_fp16_t x; memcpy(&x, p, sizeof x); f = ggml_fp16_to_fp32(x); return ELEM_FLOAT; }
-        case GGML_TYPE_BF16: { ggml_bf16_t x; memcpy(&x, p, sizeof x); f = ggml_bf16_to_fp32(x); return ELEM_FLOAT; }
-        case GGML_TYPE_I8:   { int8_t      x; memcpy(&x, p, sizeof x); i = x; break; }
-        case GGML_TYPE_I16:  { int16_t     x; memcpy(&x, p, sizeof x); i = x; break; }
-        case GGML_TYPE_I32:  { int32_t     x; memcpy(&x, p, sizeof x); i = x; break; }
-        case GGML_TYPE_I64:  { int64_t     x; memcpy(&x, p, sizeof x); i = x; break; }
-        default:             return ELEM_UNHANDLED;
-    }
-    f = (float) i;
-    return ELEM_INT;
-}
-
-static void gather(const ggml_tensor * t, const uint8_t * src, bool logical,
-                   std::vector<float> & f, std::vector<int64_t> & ints) {
-    const size_t esize = ggml_type_size(t->type);
-    const bool   is_int = !ints.empty();
-    int64_t v_int = 0;
-    size_t  li    = 0;
-    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3)
-    for (int64_t i2 = 0; i2 < t->ne[2]; ++i2)
-    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1)
-    for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
-        const size_t off = logical
-            ? (size_t) i0 * t->nb[0] + (size_t) i1 * t->nb[1] + (size_t) i2 * t->nb[2] + (size_t) i3 * t->nb[3]
-            : li * esize;
-        read_elem(t->type, src + off, f[li], v_int);
-        if (is_int) ints[li] = v_int;
-        ++li;
     }
 }
 
