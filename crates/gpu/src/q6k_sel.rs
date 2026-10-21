@@ -2,7 +2,9 @@
 //! projection of a Q6_K expert stack in the decode shape, all `n_slots`
 //! routed experts in one launch — the per-slot-column shape of
 //! `q4k_gemv_sel`: slot `s` dots the rows of expert `sel[s]` with
-//! activation column `s`.
+//! activation column `s` — and the gate·up of Q6_K stacks (`q6k_gate_up_sel`),
+//! the same row walk twice and the activation rule, slot `s` against column
+//! `s / slots_per_col`.
 //!
 //! The per-row body is `q6k_gemv`'s column-0 path verbatim — the same
 //! byte-window loads with the 16-bit funnel for a super-block at 2 mod 4,
@@ -18,7 +20,11 @@
 use crate::cores::{funnel16, half_to_f32, l2_prefetch, q6k_chain, q6k_dequant, q6k_sub_scale};
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
 use crate::hybrid::HOST;
-use crate::kquant::sel::{ARENA_PARTS, ARENA_SKIP, PART_DOWN, SelDownAt, arena_part, down_at_dims};
+use crate::kquant::act;
+use crate::kquant::sel::{
+    ARENA_PARTS, ARENA_SKIP, GateUpAct, PART_DOWN, SelDownAt, arena_part, check_gate_up_slots,
+    down_at_dims,
+};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -288,6 +294,96 @@ mod q6k_sel_kernels {
         }
     }
 
+    /// Q6_K gate·up over expert slots selected on the device: one warp per
+    /// output row, eight rows per 256-thread block; thread row `n = slot ·
+    /// rows_per_expert + r` stores `h[n]`, the activation rule `act` over the
+    /// dots of weight row `sel[slot] · rows_per_expert + r` of the gate and of
+    /// the up stack (`210 · n_sb` bytes at byte `row · 210 · n_sb` of each)
+    /// against q8_1 column `slot / slots_per_col` in the q6 permutation. Each
+    /// dot is [`q6k_sel_row_dot`], `q6k_gemv_sel`'s row walk, so the sums are
+    /// the down launch's of the same column bit for bit. An id `>= n_experts`
+    /// returns the slot's warps before their first weight load (warp-uniform);
+    /// one that is not [`HOST`] (a slot the host tier serves, skipped by
+    /// contract) raises [`FaultSite::ExpertId`] on `fault` first and writes NaN
+    /// into its rows, as the common leg's other gate·up entries. `m_cols` only
+    /// bounds the activation in the launch contract.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * wg.len() >= n_experts * rows_per_expert * 210 * n_sb,
+            4 * wu.len() >= n_experts * rows_per_expert * 210 * n_sb,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 128 * iters,
+            d8.len() >= m_cols * 2 * n_sb,
+            sel.len() >= n_slots,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn q6k_gate_up_sel(
+        wg: &[u32],
+        wu: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        iters: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        let _ = m_cols;
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        let slot = row / rows_per_expert as usize;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform (all 32 lanes share `row`, hence `slot`).
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+                // SAFETY: row < n_slots·rows_per_expert <= h.len() by the
+                // launch contract; only lane 0 of the warp writes h[row].
+                unsafe { *h.get_unchecked_mut(row) = f32::NAN };
+            }
+            return;
+        }
+        let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
+        let col = slot / slots_per_col as usize;
+        let n_sb = n_sb as usize;
+        let row_at = row_abs * 210 * n_sb;
+        // SAFETY: row_abs bounds both stacks' row by the launch contract and
+        // col < m_cols bounds q and d8 (slot < n_slots <= m_cols ·
+        // slots_per_col); the host passes iters = ceil(n_sb/2); the returns
+        // above are warp-uniform, so all 32 lanes are here.
+        let g = q6k_sel_row_dot!(wg, row_at, q, d8, n_sb, iters, col, lane);
+        let u = q6k_sel_row_dot!(wu, row_at, q, d8, n_sb, iters, col, lane);
+        if lane == 0 {
+            // SAFETY: row < n_slots·rows_per_expert <= h.len() by the launch
+            // contract; only lane 0 of the warp writes h[row].
+            unsafe {
+                *h.get_unchecked_mut(row) = act::apply_checked(act, limit, g, u, fault);
+            }
+        }
+    }
+
     /// The Q6_K down arena entry: [`q6k_gemv_sel`] with slot `slot`'s
     /// expert read from its down part in `arena` (word
     /// `offs[slot · ARENA_PARTS + PART_DOWN]`, the expert's rows as its file
@@ -522,6 +618,90 @@ impl Q6kSelKernels {
                 y,
             )?;
         }
+        Ok(())
+    }
+
+    /// Enqueue the device-indirect MoE gate·up for Q6_K expert stacks
+    /// (`q6k_gate_up_sel`): slot `s` writes `h[s·rows_per_expert ..][..
+    /// rows_per_expert]`, `a.rule` over expert `sel[s]`'s rows of the gate and
+    /// up stacks against `a.act` column `s / slots_per_col`. The stacks are
+    /// the byte streams [`Self::enqueue_gemv_q6k_sel`] reads, both of one
+    /// shape; `a.act` holds at least `ceil(n_slots / slots_per_col)` columns.
+    /// An id `>= n_experts` writes nothing, and one that is not [`HOST`] raises
+    /// [`FaultSite::ExpertId`] on `fault` and writes NaN into its rows.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_gate_up(
+        &self,
+        stream: &CudaStream,
+        a: &GateUpAct<'_>,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_gate_up_q6k";
+        let n_sb = a.act.n_sb();
+        let (rpe, rows) = (a.rows_per_expert, a.wg.rows());
+        if a.wu.rows() != rows || a.wu.cols() != a.wg.cols() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the up stack {} x {} must be the gate stack's {rows} x {}",
+                    a.wu.rows(),
+                    a.wu.cols(),
+                    a.wg.cols()
+                ),
+            ));
+        }
+        if rpe == 0 || !rows.is_multiple_of(rpe) {
+            return Err(GpuError::shape(
+                what,
+                format!("w.rows() {rows} must be a positive multiple of rows_per_expert {rpe}"),
+            ));
+        }
+        let need = (rows * 210 * n_sb).div_ceil(4);
+        if a.wg.buf().len() < need || a.wu.buf().len() < need {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{rows} rows of 210*{n_sb} bytes need {need} words, got {} and {}",
+                    a.wg.buf().len(),
+                    a.wu.buf().len()
+                ),
+            ));
+        }
+        let slot_rows = check_gate_up_slots(
+            what,
+            a.n_slots,
+            rpe,
+            a.act.m(),
+            a.slots_per_col,
+            a.sel.len(),
+            h.len(),
+        )?;
+        let (code, limit) = a.rule.code(what)?;
+        let grid = launch_u32(what, "grid", slot_rows.div_ceil(8))?;
+        let prep = self
+            .module
+            .prepare_q6k_gate_up_sel(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module.q6k_gate_up_sel(
+            stream,
+            &prep,
+            a.wg.buf(),
+            a.wu.buf(),
+            &a.act.q6,
+            &a.act.d8,
+            a.sel,
+            launch_u32(what, "n_experts", rows / rpe)?,
+            launch_u32(what, "rows_per_expert", rpe)?,
+            launch_u32(what, "n_slots", a.n_slots)?,
+            launch_u32(what, "m_cols", a.act.m())?,
+            launch_u32(what, "slots_per_col", a.slots_per_col)?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "iters", n_sb.div_ceil(2))?,
+            code,
+            limit,
+            fault,
+            h,
+        )?;
         Ok(())
     }
 
