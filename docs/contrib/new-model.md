@@ -70,10 +70,14 @@ surface; `crates/models/src/lib.rs:1-12`) and a role for every tensor, and refus
 A next family calls the common readers instead of copying them. A count above zero is `positive` and an optional
 count is `optional_usize`, both beside `meta_usize` in `arch/mod.rs`. The block spelling is `names::blk`, and the
 three model-level tensors are `names::token_embd`, `names::output_norm` and `names::output`. Already common, and
-still the ones to call: `classify_with`, `Stem` with `req` and `opt`, the `meta_*` key readers, `chat_of`,
-`n_vocab`, `spec_u32` and `nextn_layers`. Shared or per-layer counts use `per_layer_count` (`arch/mod.rs`): a scalar
-expands to every layer; an array must have one count per layer, zero included. A family that refuses zero checks it
-after the read. Gemma and MiMo use `check_kv` to reject zero KV-head counts or counts that do not divide the query-head
+still the ones to call: the role walks in `arch/classify.rs` (`classify_groups` when every layer carries the same
+stem groups, `classify_layers` when a layer's kind picks them, `role_with_nextn` and `block_role_with_nextn` when
+next-token layers close the file, and `Counts::new`; `classify_with` under them takes any role function), `Stem` with
+`req` and `opt` and the rows several families spell alike (`DENSE`, `MOE`, `HC` in `arch/stems.rs`), the `meta_*` key
+readers, `chat_of`, `n_vocab`, `spec_u32` and `nextn_layers`. A family's `roles.rs` then holds only its own rows, and
+its header reader's tensor check reads the same table (`layers_agree` over the kind's groups). Shared or per-layer
+counts use `per_layer_count` (`arch/mod.rs`): a scalar expands to every layer; an array must have one count per layer,
+zero included. A family that refuses zero checks it after the read. Gemma and MiMo use `check_kv` to reject zero KV-head counts or counts that do not divide the query-head
 count. A float array with a scalar fallback (GLM's clamps) stays the family's own read.
 `program_of` is defined in `crates/placement/src/accepts.rs` and re-exported from
 `coverage`. An architecture with a reader and no program returns `None` from it; the coverage check then names
