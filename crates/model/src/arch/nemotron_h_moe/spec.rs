@@ -110,6 +110,7 @@ mod tests {
 
     use super::super::names;
     use super::super::place::Experts;
+    use super::Hparams;
     use super::host_split::{half_expert_budget, prefix_split};
     use crate::arch::coverage;
     use crate::arch::synthetic::{Ty, V, header_typed};
@@ -971,6 +972,30 @@ mod tests {
                 "4 experts",
             ],
         );
+    }
+
+    /// The card pass is sized for the largest top-k: in a file whose MoE
+    /// layers keep 1 and 2 experts, the layer that keeps 1 is refused by
+    /// name and the layers that keep 2 are not.
+    #[test]
+    fn a_layer_keeping_fewer_than_the_largest_top_k_is_refused_on_the_card() {
+        let kv = with("expert_used_count", Some(V::I32s(vec![0, 1, 0, 0, 2, 2])));
+        let global = [("tokenizer.ggml.pre", V::Str("pixtral"))];
+        let path = header_typed("nhm-mixed-topk", "nemotron_h_moe", &kv, &global, &tensors());
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let hp = Hparams::read(&split).expect("a mixed top-k is a file the reader takes");
+        let _ = std::fs::remove_file(&path);
+        let err = hp
+            .refuse_card_keeps(1, 1)
+            .expect_err("layer 1 keeps 1 of the pass's 2");
+        assert!(
+            err.contains("layer 1 keeps 1 experts") && err.contains("the 2 the pass is sized for"),
+            "{err}"
+        );
+        for l in [4, 5] {
+            hp.refuse_card_keeps(l, 2)
+                .expect("a layer that keeps the largest top-k");
+        }
     }
 
     /// Every MoE key the reader needs is required by name, and a value the

@@ -318,6 +318,29 @@ impl Hparams {
             .unwrap_or(0)
     }
 
+    /// Whether layer `l`, whose router keeps `n_used` ids a token, fits the
+    /// card pass. The pass, its slots and its scratch are sized for
+    /// [`Hparams::top_k_max`], so a layer that keeps fewer is refused (its
+    /// ids and weights would be read past their end), and the router
+    /// renormalizes what it keeps.
+    pub fn refuse_card_keeps(&self, l: usize, n_used: usize) -> Result<(), String> {
+        let top_k = self
+            .experts
+            .get(l)
+            .copied()
+            .flatten()
+            .map_or(0, |x| x.top_k);
+        if top_k == n_used && n_used == self.top_k_max() && self.weights_norm {
+            return Ok(());
+        }
+        Err(format!(
+            "layer {l} keeps {top_k} experts, renormalized {}: the router keeps {n_used}, \
+             renormalized, and every layer keeps the {} the pass is sized for",
+            self.weights_norm,
+            self.top_k_max()
+        ))
+    }
+
     /// The attention widths, as the `nemotron_h` reader's pieces take them.
     pub(super) fn attn(&self) -> Attn {
         Attn {

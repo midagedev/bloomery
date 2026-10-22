@@ -314,21 +314,9 @@ impl Body {
         }
         Body::refuse_widths(&layers)?;
         let mut acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
-        for (l, layer) in layers.iter().enumerate() {
+        for layer in &layers {
             if let Layer::Moe(m) = layer {
                 for (k, cols) in m.forms(&hp) {
-                    // The layer's q8_1 forms: the K-quant's blocks of 256
-                    // values. A width no form takes is refused by name, with
-                    // the layer and the width.
-                    if !k.is_multiple_of(256) || !(256..=Q8ACT_MAX_K).contains(&k) {
-                        return Err(GpuError::shape(
-                            WHAT,
-                            format!(
-                                "layer {l}: a q8_1 form takes a width that is a multiple of 256 in \
-                                 256..={Q8ACT_MAX_K}, got {k}"
-                            ),
-                        ));
-                    }
                     acts.add_q8_1(stream, k, cols)?;
                 }
             }
