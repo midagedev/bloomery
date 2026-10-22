@@ -1,9 +1,11 @@
-//! Launch order: the chain and one layer, enqueued asynchronously against a
+//! The launch groups of a layer's ops, each enqueued asynchronously against a
 //! resident arena. No allocation, no synchronization, no host round trip —
-//! so this is both the eager body and what the capture records. One layer
-//! body serves every pass and both bodies of the family: the decode step is
-//! its one-row instance, a pass its `m`-row instance, and a layer's
-//! [`LayerPlan`] picks its mixer — attention over K/V planes, or the delta
+//! so the same enqueues are the eager body and what the capture records. The
+//! chain crate's walk orders the ops (its doc names what it does not lay
+//! out); [`Program`] and the passes of several slots run them. One op serves
+//! every pass and both bodies of the family: the decode step is its one-row
+//! instance, a pass its `m`-row instance, and a layer's [`LayerPlan`] picks
+//! its mixer — attention over K/V planes, or the delta
 //! rule over a recurrent store ([`super::delta`]) — and whether its experts
 //! carry a folded shared expert. Which kernel an op launches follows from
 //! `m` and the plan inside the op: past [`GEMV_COLS`] rows its first line
@@ -23,11 +25,12 @@ use super::head_argmax::HeadArgmaxState;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
 use super::plan::{
     DownEntry, FfnPlan, FfnRoute, GateUpEntry, GqaKind, GqaPlan, LayerPlan, MixerPlan, SharedPlan,
-    SharedSites, SiteTy, down_entry, gate_up_entry,
+    SharedSites, SiteTy, down_entry, down_sel, gate_up_entry, gate_up_fused, o_fused, qkv_fused,
+    reads_f32,
 };
 use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
-use super::scratch::{Append128, Append256, Arena, FlashPass, Io, KvPlanes, StoreMut};
+use super::scratch::{Append128, Append256, Arena, FlashPass, Io, KvPlanes};
 use super::wide::{self, GEMV_COLS};
 use crate::elem::EmbedRowsArgs;
 use crate::gated_quant::GateLayout;
@@ -172,47 +175,10 @@ pub(super) fn enqueue_head(
     })
 }
 
-/// Enqueue layer `slot`'s step, the step's front in front of it when `embed`
-/// — the token's embedding row into `x` and its position and live key count
-/// into the arena, from the step's input record; `x` in, the output residual
-/// into `out` (`None`: back into `x`), the step's K/V row appended to the
-/// layer's planes at the position the front wrote.
-pub(super) fn enqueue_layer(
-    gpu: &Gpu,
-    w: &Weights,
-    b: &mut Body,
-    slot: usize,
-    embed: bool,
-    out: Option<&mut DeviceBuffer<f32>>,
-) -> Result<(), GpuError> {
-    let Body {
-        hp,
-        plans,
-        kv,
-        rope,
-        s,
-        sp,
-        k,
-        mma,
-        ..
-    } = b;
-    let c = Ctx::new(
-        gpu,
-        w,
-        (&plans[slot], slot),
-        k,
-        *mma,
-        hp.rms_eps,
-        &rope.table,
-    )?;
-    layer(&c, StoreMut::Kv(&mut kv[slot]), s, &sp.io(), 1, embed, out)
-}
-
 /// Enqueue the step's front alone: the embedding row of the step's token
 /// into the one-row arena's `x`, and its position and live key count. A
-/// layer run on its own from another input ([`enqueue_layer`] without
-/// `embed`) needs the position the front writes; the caller then replaces
-/// `x`.
+/// layer run on its own from another input (`taps::step_layer`) needs the
+/// position the front writes; the caller then replaces `x`.
 pub(super) fn enqueue_front(gpu: &Gpu, w: &Weights, b: &mut Body) -> Result<(), GpuError> {
     let Body { s, sp, k, .. } = b;
     embed_rows(gpu, w, k, &sp.io(), s)
@@ -255,8 +221,8 @@ pub(super) fn enqueue_pass(
 }
 
 /// The launches a pass of `m` rows makes over layers `plans`, counted from
-/// [`layer`]'s enqueues: the embedding, then per layer the mixer and the FFN
-/// half.
+/// the ops' enqueues in the walk's order: the embedding, then per layer the
+/// mixer and the FFN half.
 /// - Attention: norm+quant, q·k·v, QK-norm+rope+append, the flash's segment
 ///   pass and merge, the attention rows' quantizer (with the output gate at
 ///   head 256) and the output projection — 7 — plus a Q6_K value
@@ -315,12 +281,12 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                 1 + wide_quants(&[g.q_ty, g.k_ty, g.v_ty]) + 3 + 2 + out + 2
             }
             MixerPlan::Gqa(g) => {
-                let qkv = if g.qkv_fused() {
+                let qkv = if qkv_fused(g) {
                     1 + usize::from(g.v_ty == SiteTy::Q6K) * (1 + many)
                 } else {
                     site(g.q_ty) + site(g.k_ty) + site(g.v_ty)
                 };
-                let out = if g.o_fused() {
+                let out = if o_fused(g) {
                     2
                 } else {
                     // The quantizer of the attention rows (a K-quant) or the
@@ -348,7 +314,7 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                 },
                 false,
             ) => {
-                1 + usize::from(sh.reads_f32())
+                1 + usize::from(reads_f32(sh))
                     + 4
                     + site(sh.gate_ty)
                     + site(sh.up_ty)
@@ -361,12 +327,12 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
             (FfnRoute::Router { .. }, false) => 5,
             (FfnRoute::Dense, true) => 1 + wide_quants(&[f.gate_ty, f.up_ty]) + 5,
             (FfnRoute::Dense, false) => {
-                let gate_up = if f.gate_up_fused() {
+                let gate_up = if gate_up_fused(f) {
                     1
                 } else {
                     site(f.gate_ty) + site(f.up_ty) + 1
                 };
-                let down = if f.down_sel() {
+                let down = if down_sel(f) {
                     2
                 } else {
                     usize::from(f.down_ty.kquant()) + site(f.down_ty)
@@ -386,86 +352,32 @@ pub(super) fn wide_quants(tys: &[SiteTy]) -> usize {
     usize::from(q128) + usize::from(q32)
 }
 
-/// Enqueue layer `slot`'s FFN half alone: `ffn_inp` in, the output residual
-/// into `x`.
-pub(super) fn enqueue_ffn(
-    gpu: &Gpu,
-    w: &Weights,
-    b: &mut Body,
-    slot: usize,
-) -> Result<(), GpuError> {
-    let Body {
-        hp,
-        plans,
-        rope,
-        s,
-        k,
-        mma,
-        ..
-    } = b;
-    let c = Ctx::new(
-        gpu,
-        w,
-        (&plans[slot], slot),
-        k,
-        *mma,
-        hp.rms_eps,
-        &rope.table,
-    )?;
-    ffn(&c, &plans[slot].ffn, s, 1, None)
-}
-
-/// One layer at `m` rows: the embedding rows with their positions and live
-/// key counts in front when `embed` ([`embed_rows`]), the mixer the plan
-/// names over the layer's store, then the FFN half into `out` (`None`: back
-/// into `x`).
-pub(super) fn layer(
+/// A unit's front: its embedding rows with their positions and live key
+/// counts ([`embed_rows`]), a media call's rows over the embeddings of their
+/// positions, and past [`GEMV_COLS`] rows the unit's dense route table.
+pub(super) fn unit_front(
     c: &Ctx<'_>,
-    st: StoreMut<'_>,
     s: &mut Arena,
     io: &Io<'_>,
     m: usize,
-    embed: bool,
-    out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
-    mixer(c, st, s, io, m, embed)?;
-    ffn(c, &c.p.ffn, s, m, out)
-}
-
-/// One layer at `m` rows up to its FFN half ([`layer`]'s first part): the
-/// embedding rows in front when `embed` — a media call's rows over the
-/// embeddings of their positions —, then the mixer the plan names over the
-/// layer's store, which leaves the FFN's input residual in `ffn_inp`.
-pub(super) fn mixer(
-    c: &Ctx<'_>,
-    st: StoreMut<'_>,
-    s: &mut Arena,
-    io: &Io<'_>,
-    m: usize,
-    embed: bool,
-) -> Result<(), GpuError> {
-    if embed {
-        embed_rows(c.gpu, c.w, c.k, io, s)?;
-        s.write_media(c.gpu.stream())?;
-        if m > GEMV_COLS {
-            wide::route_dense(c, s, m)?;
-        }
-    }
-    match (&c.p.mixer, st) {
-        (MixerPlan::Gqa(g), StoreMut::Kv(kv)) => attention(c, g, kv, s, m)?,
-        (MixerPlan::Delta(d), StoreMut::Rec(r)) => delta::delta(c, d, r, s, io, m)?,
-        _ => {
-            return Err(GpuError::shape(
-                "qwen3moe::layer",
-                format!(
-                    "layer {}'s plan and store are of two kinds (attention over K/V planes, the \
-                     delta rule over a recurrent store)",
-                    c.layer
-                ),
-            ));
-        }
+    embed_rows(c.gpu, c.w, c.k, io, s)?;
+    s.write_media(c.gpu.stream())?;
+    if m > GEMV_COLS {
+        wide::route_dense(c, s, m)?;
     }
     Ok(())
+}
+
+/// The refusal of layer `layer`'s plan and store being of two kinds.
+pub(super) fn two_kinds(layer: usize) -> GpuError {
+    GpuError::shape(
+        "qwen3moe::layer",
+        format!(
+            "layer {layer}'s plan and store are of two kinds (attention over K/V planes, the \
+             delta rule over a recurrent store)"
+        ),
+    )
 }
 
 /// A unit's front, one launch: the embedding rows of `io`'s ids into `s.x`
@@ -560,7 +472,7 @@ pub(super) fn embed_into(
 /// K-quant's gemv, and past one row the token-major copy of a row-major one;
 /// any other type's one launch.
 pub(super) fn site_launches(ty: SiteTy, m: usize) -> usize {
-    1 + usize::from(ty.kgemv_order() == Some(Order::RowMajor) && m > 1)
+    1 + usize::from(site::kgemv_order(ty) == Some(Order::RowMajor) && m > 1)
 }
 
 /// `y = W · x` for site `name` of type `ty`, `rows` rows, at `m <=
@@ -583,7 +495,7 @@ pub(super) fn site_gemv(
     const WHAT: &str = "qwen3moe::site_gemv";
     let gpu = c.gpu;
     let q35 = c.k.q35(WHAT)?;
-    let Some(order) = ty.kgemv_order() else {
+    let Some(order) = site::kgemv_order(ty) else {
         return site::gemv(gpu, &q35.g32, (ty, c.w, name), x, m, y);
     };
     let gemv = |out: &mut DeviceBuffer<f32>| {
@@ -652,18 +564,12 @@ pub(super) fn shared_dense(
     site_gemv(c, (sh.down_ty, &sh.down), hidden, (act, h), m, cols, y)
 }
 
-/// The attention half: `x` in, `ffn_inp = x + attn_output(attn(x))` out —
-/// q, k and v in one launch (a Q6_K v in its own) when Q4_K, else each by
-/// its type ([`site_gemv`]), the head norm and the rope by the rows'
-/// positions with the cache append, the flash over the rows' live key
-/// counts, the output projection — a Q4_K one with the residual add in its
-/// store, any other into `normed` and an add. At head 256 the query
-/// projection writes each head's `[q | gate]`, the rope reads the queries
-/// out of those rows and turns the first 64 values, and the output
-/// projection's input is the flash output multiplied by `σ(gate)`: in its
-/// quantizer for a K-quant, as f32 rows for any other type
-/// ([`GqaKind::Gated256`]).
-fn attention(
+/// The attention half's middle at `m` rows, after [`attn_in`]: the head
+/// norm and the rope by the rows' positions with the cache append, the flash
+/// over the rows' live key counts, and the output projection's input — the
+/// attention rows' q8_1 for a K-quant one ([`attn_in`]'s doc); past
+/// [`GEMV_COLS`] rows the wide arm's ([`wide::attn_core`]).
+pub(super) fn attn_core(
     c: &Ctx<'_>,
     n: &GqaPlan,
     kv: &mut KvPlanes,
@@ -671,9 +577,8 @@ fn attention(
     m: usize,
 ) -> Result<(), GpuError> {
     if m > GEMV_COLS {
-        return wide::attention(c, n, kv, s, m);
+        return wide::attn_core(c, n, kv, s, m);
     }
-    attn_in(c, n, s, m)?;
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
     let d = s.dims;
@@ -725,14 +630,31 @@ fn attention(
         }
         GqaKind::Gated256 => gated_256(c, n, kv, s, m)?,
     }
-    attn_out(c, n, s, m)
+    Ok(())
 }
 
-/// The attention half's row-wise front at `m <= GEMV_COLS` rows: the
-/// attention norm with its quantizer, then q, k and v — in one launch (a
-/// Q6_K v in its own) when Q4_K, else each by its type ([`site_gemv`]) —
-/// into the arena's `q`, `k` and `v` rows.
+/// The attention half's input side at `m` rows: the attention norm with its
+/// quantizer, then q, k and v — in one launch (a Q6_K v in its own) when
+/// Q4_K, else each by its type ([`site_gemv`]) — into the arena's `q`, `k`
+/// and `v` rows; past [`GEMV_COLS`] rows the wide arm's
+/// ([`wide::attn_in`]).
+///
+/// The half, [`attn_in`], [`attn_core`] and [`attn_out`] in the walk's order:
+/// `x` in, `ffn_inp = x + attn_output(attn(x))` out —
+/// q, k and v in one launch (a Q6_K v in its own) when Q4_K, else each by
+/// its type ([`site_gemv`]), the head norm and the rope by the rows'
+/// positions with the cache append, the flash over the rows' live key
+/// counts, the output projection — a Q4_K one with the residual add in its
+/// store, any other into `normed` and an add. At head 256 the query
+/// projection writes each head's `[q | gate]`, the rope reads the queries
+/// out of those rows and turns the first 64 values, and the output
+/// projection's input is the flash output multiplied by `σ(gate)`: in its
+/// quantizer for a K-quant, as f32 rows for any other type
+/// ([`GqaKind::Gated256`]).
 pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
+    if m > GEMV_COLS {
+        return wide::attn_in(c, n, s, m);
+    }
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
     let d = s.dims;
@@ -746,7 +668,7 @@ pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Resu
         &mut s.normed,
         c.sink,
     )?;
-    if n.qkv_fused() {
+    if qkv_fused(n) {
         let wv = kq_weight(w, &n.attn_v)?;
         let (off_k, off_v) = s.qkv_offsets();
         k.proj.enqueue_qkv(
@@ -790,17 +712,21 @@ pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Resu
     Ok(())
 }
 
-/// The attention half's row-wise back at `m <= GEMV_COLS` rows, once the
-/// attention rows are ready for the output projection — their q8_1 in
-/// `act_attn` for a K-quant one, f32 rows for any other: the output
-/// projection, a Q4_K one with the residual add in its store, any other into
-/// `normed` and an add, into `ffn_inp`.
+/// The attention half's output side at `m` rows, once the attention rows
+/// are ready for the output projection — their q8_1 in `act_attn` for a
+/// K-quant one, f32 rows for any other: the output projection, a Q4_K one
+/// with the residual add in its store, any other into `normed` and an add,
+/// into `ffn_inp`; past [`GEMV_COLS`] rows the wide arm's
+/// ([`wide::attn_out`]).
 pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
+    if m > GEMV_COLS {
+        return wide::attn_out(c, n, s, m);
+    }
     let (w, k) = (c.w, c.k);
     let stream = c.gpu.stream();
     let d = s.dims;
     let i = s.col(m)?;
-    if n.o_fused() {
+    if o_fused(n) {
         let wo = kq_weight(w, &n.attn_output)?;
         return k.proj.enqueue_o_resid(
             stream,
@@ -972,7 +898,11 @@ fn gated_256(
     )
 }
 
-/// The FFN half: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
+/// The FFN half's front at `m` rows: the norm with its quantizer and the
+/// router's pick of every token's slots; a dense FFN's norm alone; past
+/// [`GEMV_COLS`] rows the wide arm's ([`wide::route`]).
+///
+/// The half, [`route`] then [`experts`] in the walk's order: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
 /// down_s(swiglu(gate_s, up_s))` over each token's slots out, into `out`
 /// (`None`: into `x`). A plan without a shared expert routes `k` slots a
 /// token (the file's `top_k`); with one ([`FfnRoute::Router`]'s `shared`)
@@ -994,17 +924,11 @@ fn gated_256(
 /// launch, `norm_quant`'s bytes: `enqueue_norm_fused` at one token,
 /// `enqueue_norm_fused_m` at more; a shared expert kept apart whose gate or
 /// up reads f32 rows takes `norm_quant` and the router on those rows.
-pub(super) fn ffn(
-    c: &Ctx<'_>,
-    n: &FfnPlan,
-    s: &mut Arena,
-    m: usize,
-    out: Option<&mut DeviceBuffer<f32>>,
-) -> Result<(), GpuError> {
-    const WHAT: &str = "qwen3moe::ffn";
+pub(super) fn route(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     if m > GEMV_COLS {
-        return wide::ffn(c, n, s, m, out);
+        return wide::route(c, n, s, m);
     }
+    const WHAT: &str = "qwen3moe::ffn";
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
     let i = s.col(m)?;
@@ -1012,7 +936,7 @@ pub(super) fn ffn(
     let (gate_inp, shared) = match &n.route {
         FfnRoute::Router { gate_inp, shared } => (gate_inp, shared),
         FfnRoute::Dense => {
-            gpu.fused().enqueue_norm_quant(
+            return gpu.fused().enqueue_norm_quant(
                 stream,
                 &s.ffn_inp,
                 gain,
@@ -1020,8 +944,7 @@ pub(super) fn ffn(
                 &mut s.act_ffn[i],
                 &mut s.normed,
                 c.sink,
-            )?;
-            return slots_down(c, n, s, m, out);
+            );
         }
     };
     let router = f32_tensor(w, gate_inp)?;
@@ -1029,7 +952,7 @@ pub(super) fn ffn(
         // A shared expert kept apart whose gate or up reads the f32 normed
         // rows: `norm_quant` writes them beside their q8_1, then the router
         // reads them — the bytes the fused norm and router write.
-        Some(SharedPlan::Apart(sh)) if sh.reads_f32() => {
+        Some(SharedPlan::Apart(sh)) if reads_f32(sh) => {
             gpu.fused().enqueue_norm_quant(
                 stream,
                 &s.ffn_inp,
@@ -1089,6 +1012,23 @@ pub(super) fn ffn(
             s.route.gated(WHAT)?,
         )?,
     }
+    Ok(())
+}
+
+/// The FFN half after its slots are picked, at `m` rows ([`route`]'s doc):
+/// the routed slots' gate·up·SwiGLU, quantizer and down, the shared expert
+/// kept apart as its own FFN, and the combine into `out` (`None`: into `x`);
+/// past [`GEMV_COLS`] rows the wide arm's ([`wide::experts`]).
+pub(super) fn experts(
+    c: &Ctx<'_>,
+    n: &FfnPlan,
+    s: &mut Arena,
+    m: usize,
+    out: Option<&mut DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
+    if m > GEMV_COLS {
+        return wide::experts(c, n, s, m, out);
+    }
     match n.apart() {
         Some(sh) => apart_down(c, n, sh, s, m, out),
         None => slots_down(c, n, s, m, out),
@@ -1097,7 +1037,7 @@ pub(super) fn ffn(
 
 /// The FFN half after its slots are picked: the gate·up·SwiGLU of every
 /// token's slots, one quantizer over them, the down `_sel` and the combine
-/// ([`ffn`]'s doc).
+/// ([`route`]'s doc).
 fn slots_down(
     c: &Ctx<'_>,
     n: &FfnPlan,
@@ -1122,7 +1062,7 @@ fn slots_down(
             ),
         ));
     }
-    if n.gate_up_fused() {
+    if gate_up_fused(n) {
         match gate_up_entry(n.gate_ty, n.up_ty, WHAT)? {
             // The family's own Q4_K gate·up·SwiGLU over the slots' ids.
             GateUpEntry::Q4k => k.experts.enqueue_gate_up(
@@ -1189,7 +1129,7 @@ fn slots_down(
         gpu.elem()
             .enqueue_swiglu(stream, &g.g, &g.u, m * slots * d.ff, h)?;
     }
-    if n.down_sel() {
+    if down_sel(n) {
         let entry = down_entry(n.down_ty, WHAT)?;
         let wd = kq_weight(w, &n.down)?;
         gpu.enqueue_quantize_q8_1_layer(&s.h, &mut s.act_h[i], c.layer)?;

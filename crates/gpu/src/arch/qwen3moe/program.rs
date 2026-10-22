@@ -1,25 +1,29 @@
-//! The family's layer program ([`Program`]): the chain and the pass of both
-//! bodies as one walk of [`runtime::sched::walk`] over one unit of `m`
-//! columns, `(1, m, Step)` — the decode step at `m = 1`, a pass at its `m`.
-//! A layer has no host leg, so its front is the whole layer
-//! ([`dispatch::layer`]) and its shadow and back are empty; its port
-//! ([`NoLeg`]) exchanges nothing and refuses by name a point the arena
-//! cannot hold. What follows the last layer is the walk's [`Tail`]: a head,
-//! nothing, or the final norm of every row (a prompt call that returns
-//! hidden states).
+//! The family's layer program ([`Program`]): the ops ([`ChainOps`]) the chain
+//! crate's walk ([`Walk`]) orders over one unit of `m` columns, `(1, m,
+//! Step)` — the decode step at `m = 1`, a pass at its `m`. Each op is one of
+//! the launch groups of [`dispatch`] and [`delta`], which picks its gemv or
+//! wide arm from `m`. What follows the last layer is the program's [`Tail`]:
+//! a head, nothing, the final norm of every row (a prompt call that returns
+//! hidden states), or a caller's buffer the last layer's output goes into.
+//! The FFN half's ops end each layer as the tail asks: the last layer's
+//! output into the head's input or the caller's buffer, and on a decode step
+//! with the gate's taps on, each layer's output copied into its tap row.
 
 use super::body::{Kernels, TapRows};
+use super::delta;
 use super::dispatch::{self, Ctx, PassCtx};
-use super::draft_taps::{DraftTaps, Tapping};
+use super::draft_taps::DraftTaps;
 use super::head_argmax::HeadArgmaxState;
+use super::plan::{DeltaPlan, FfnPlan, GqaPlan};
 use super::scratch::{Arena, Io, KvPlanes, LayerStore, StoreMut, f32_view};
 use crate::head::Head;
 use crate::model::lookup::f32_gain;
 use crate::tensor::Window;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
+use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
+use chain::arch::qwen3moe::walk::Walk;
 use cuda_core::DeviceBuffer;
-use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind, Refused};
 
 const WHAT: &str = "qwen3moe::Program";
 
@@ -41,7 +45,21 @@ impl Stores for [LayerStore] {
     }
 }
 
-/// What a walk enqueues after its last layer.
+/// The planes of one layer run on its own outside a body's chain (the MTP
+/// layer's, `index` its index), stored for that index alone.
+pub(super) struct OneLayer<'a> {
+    pub(super) index: usize,
+    pub(super) kv: &'a mut KvPlanes,
+}
+
+impl Stores for OneLayer<'_> {
+    fn store(&mut self, l: usize) -> Option<StoreMut<'_>> {
+        (l == self.index).then_some(StoreMut::Kv(&mut *self.kv))
+    }
+}
+
+/// What a walk enqueues after its last layer, and where the last layer's
+/// output goes ([`Tail::last_out`]).
 pub(super) enum Tail<'a> {
     /// The decode step: the last layer writes the head's input, each
     /// layer's output is copied into its tap row when taps are on, then the
@@ -76,6 +94,38 @@ pub(super) enum Tail<'a> {
     /// `output_norm` over the `m` rows of the arena's `x` into its `normed`
     /// ([`enqueue_hidden`]); no head, no logits.
     Hidden,
+    /// A layer run on its own whose output goes into a buffer of the
+    /// caller's (the MTP layer's head input); nothing follows.
+    Into(&'a mut DeviceBuffer<f32>),
+}
+
+impl Tail<'_> {
+    /// The buffer the last layer's combine writes: the head's input on a
+    /// decode step, the caller's buffer for [`Tail::Into`]; `None`, the
+    /// arena's `x`, for every other tail.
+    fn last_out(&mut self) -> Option<&mut DeviceBuffer<f32>> {
+        match self {
+            Tail::Step { head, .. } => Some(head.input_mut()),
+            Tail::Into(buf) => Some(&mut **buf),
+            _ => None,
+        }
+    }
+
+    /// A decode step's gate instrument, at the end of layer `l`'s FFN half:
+    /// the layer's output rows into its tap row, from the head's input after
+    /// the last layer and from the arena's `x` before it.
+    fn tap(&mut self, gpu: &Gpu, x: &DeviceBuffer<f32>, l: LayerCtx<'_>) -> Result<(), GpuError> {
+        if let Tail::Step {
+            head,
+            taps: Some(t),
+            ..
+        } = self
+        {
+            let src: &DeviceBuffer<f32> = if l.last { head.input_mut() } else { x };
+            t.rows[l.layer].copy_from_device_async(src, gpu.stream())?;
+        }
+        Ok(())
+    }
 }
 
 /// One walk of a qwen3moe chain: every layer at `m` rows over arena `s`
@@ -90,106 +140,132 @@ pub(super) struct Program<'a, S: Stores + ?Sized> {
 }
 
 impl<S: Stores + ?Sized> Program<'_, S> {
-    /// Enqueue the walk `(1, m, Step)` over every layer of the plans; a
-    /// chain of no layer is refused by name.
+    /// Enqueue the walk `(1, m, Step)` over every layer of the plans
+    /// ([`Walk::run`]); a chain of no layer is refused by name.
     pub(super) fn walk(self) -> Result<(), GpuError> {
         self.walk_with(None)
     }
 
     /// [`Program::walk`], and with `draft` the walk also lays the rows
     /// entering the layers it taps into its buffer ([`DraftTaps`]): one
-    /// device copy a tapped layer, none otherwise.
+    /// device copy a tapped layer between its mixer and its FFN half
+    /// ([`Walk::run_between`]), where the arena's `x` holds the rows entering
+    /// the layer, layer 0's embedding rows included.
     pub(super) fn walk_with(mut self, draft: Option<&mut DraftTaps>) -> Result<(), GpuError> {
-        if self.c.plans.is_empty() {
-            return Err(GpuError::shape(WHAT, "a chain of no layer"));
-        }
-        let o = Overlap {
-            units: 1,
-            cols: self.m,
-            port: PortKind::Step,
-        };
-        let layers = self.c.plans.len();
-        let mut port = NoLeg { rows: self.s.rows };
+        let (plans, m, rows) = (self.c.plans, self.m, self.s.rows);
+        let walk = Walk::new(&mut self, plans, m);
         match draft {
-            None => sched::walk(o, layers, &mut port, &mut self),
-            Some(taps) => {
-                let mut walk = Tapping::new(&mut self, taps);
-                sched::walk(o, layers, &mut port, &mut walk)
-            }
+            None => walk.run(rows),
+            Some(taps) => walk.run_between(rows, |p, cx| match taps.slot(cx.layer) {
+                Some(slot) => taps.enter(p.c.gpu.stream(), slot, &p.s.x, p.m),
+                None => Ok(()),
+            }),
         }
     }
 
-    /// Layer `l` at `m` rows. With `entering` (the layer's slot in `taps`),
-    /// `taps` copies the layer's input rows between its mixer and its FFN:
-    /// the mixer reads `x` and writes `ffn_inp`, and the FFN's combine is
-    /// the first launch to write `x` (or the head's input, on a step's last
-    /// layer), so `x` holds the rows entering the layer there, layer 0's
-    /// embedding rows included.
-    pub(super) fn layer(
-        &mut self,
-        l: usize,
-        entering: Option<(&mut DraftTaps, usize)>,
-    ) -> Result<(), GpuError> {
-        let Program {
-            c,
-            stores,
-            s,
-            io,
-            m,
-            tail,
-        } = self;
-        let (p, st) = c
-            .plans
-            .get(l)
-            .zip(stores.store(l))
-            .ok_or(GpuError::state(WHAT, "a plan and a store for every layer"))?;
-        let lc = Ctx::new(c.gpu, c.w, (p, l), c.k, c.mma, c.eps, c.table)?;
-        let last = l + 1 == c.plans.len();
-        let out = match tail {
-            Tail::Step { head, .. } if last => Some(head.input_mut()),
-            _ => None,
-        };
-        match entering {
-            None => dispatch::layer(&lc, st, s, io, *m, l == 0, out)?,
-            Some((taps, slot)) => {
-                dispatch::mixer(&lc, st, s, io, *m, l == 0)?;
-                taps.enter(c.gpu.stream(), slot, &s.x, *m)?;
-                dispatch::ffn(&lc, &lc.p.ffn, s, *m, out)?;
-            }
-        }
-        if let Tail::Step {
-            head,
-            taps: Some(t),
-            ..
-        } = tail
-        {
-            let src: &DeviceBuffer<f32> = if last { head.input_mut() } else { &s.x };
-            t.rows[l].copy_from_device_async(src, c.gpu.stream())?;
-        }
-        Ok(())
+    /// Run `part` of layer `layer` of the plans on its own at `m` rows — the
+    /// whole layer (`walk::layer`) or its FFN half (`walk::ffn`) — from the
+    /// rows its caller laid in.
+    pub(super) fn alone<P>(mut self, layer: usize, part: P) -> Result<(), GpuError>
+    where
+        P: FnOnce(&mut Self, LayerCtx<'_>) -> Result<(), GpuError>,
+    {
+        let cx = LayerCtx::of(self.c.plans, layer, self.m)?;
+        part(&mut self, cx)
     }
 }
 
-impl<S: Stores + ?Sized> LayerProgram for Program<'_, S> {
-    type Port = NoLeg;
+/// Layer `l`'s launch context: what every launch of the layer reads besides
+/// the arena and the store.
+pub(super) fn layer_ctx<'x>(c: &'x PassCtx<'x>, l: LayerCtx<'x>) -> Result<Ctx<'x>, GpuError> {
+    Ctx::new(c.gpu, c.w, (l.plan, l.layer), c.k, c.mma, c.eps, c.table)
+}
 
-    /// The whole layer at `m` rows, the embedding in front of layer 0; on
-    /// the decode step the last layer into the head's input, and the
-    /// layer's output into its tap row.
-    fn front(&mut self, _: &mut NoLeg, at: At) -> Result<(), GpuError> {
-        self.layer(at.layer, None)
+/// Layer `layer`'s store, or a named refusal for a chain with fewer stores
+/// than layers.
+fn store_of<S: Stores + ?Sized>(stores: &mut S, layer: usize) -> Result<StoreMut<'_>, GpuError> {
+    stores.store(layer).ok_or_else(|| {
+        GpuError::shape(
+            WHAT,
+            format!("no store for layer {layer}: every layer of the plans has one"),
+        )
+    })
+}
+
+impl<S: Stores + ?Sized> ChainOps for Program<'_, S> {
+    type Error = GpuError;
+
+    fn embed(&mut self, m: usize) -> Result<(), GpuError> {
+        let c = self.c;
+        let first = c
+            .plans
+            .first()
+            .ok_or(GpuError::shape(WHAT, "a chain of no layer"))?;
+        let lc = Ctx::new(c.gpu, c.w, (first, 0), c.k, c.mma, c.eps, c.table)?;
+        dispatch::unit_front(&lc, self.s, self.io, m)
+    }
+
+    fn attn_in(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        dispatch::attn_in(&lc, g, self.s, l.m)
+    }
+
+    fn attn_core(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        match store_of(self.stores, l.layer)? {
+            StoreMut::Kv(kv) => dispatch::attn_core(&lc, g, kv, self.s, l.m),
+            StoreMut::Rec(_) => Err(dispatch::two_kinds(l.layer)),
+        }
+    }
+
+    fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        dispatch::attn_out(&lc, g, self.s, l.m)
+    }
+
+    fn delta_in(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        delta::delta_in(&lc, d, self.s, l.m)
+    }
+
+    fn delta_core(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        match store_of(self.stores, l.layer)? {
+            StoreMut::Rec(r) => delta::delta_core(&lc, d, r, self.s, self.io, l.m),
+            StoreMut::Kv(_) => Err(dispatch::two_kinds(l.layer)),
+        }
+    }
+
+    fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        delta::delta_out(&lc, d, self.s, l.m)
+    }
+
+    fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        dispatch::route(&lc, f, self.s, l.m)
+    }
+
+    /// The FFN half's rest, the last layer's output into the buffer the
+    /// [`Tail`] names ([`Tail::last_out`]), and the decode step's tap of
+    /// the layer's output ([`Tail::tap`]).
+    fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
+        let lc = layer_ctx(self.c, l)?;
+        let out = if l.last { self.tail.last_out() } else { None };
+        dispatch::experts(&lc, f, self.s, l.m, out)?;
+        self.tail.tap(self.c.gpu, &self.s.x, l)
     }
 
     /// The walk's [`Tail`].
-    fn end(&mut self, _: usize) -> Result<(), GpuError> {
-        let Program { c, s, m, tail, .. } = self;
-        enqueue_tail(c, s, *m, tail)
+    fn head(&mut self, m: usize) -> Result<(), GpuError> {
+        let Program { c, s, tail, .. } = self;
+        enqueue_tail(c, s, m, tail)
     }
 }
 
 /// Enqueue what follows the last layer of a walk of `m` rows over arena `s`:
 /// the walk's [`Tail`] (a step's taps are its layers', copied as each layer
-/// ends).
+/// ends; a [`Tail::Into`]'s buffer the last layer wrote).
 pub(super) fn enqueue_tail(
     c: &PassCtx<'_>,
     s: &mut Arena,
@@ -210,6 +286,7 @@ pub(super) fn enqueue_tail(
         Tail::Pass => Ok(()),
         Tail::Last { head, state } => enqueue_last(gpu, w, k, state, s, m, head),
         Tail::Hidden => enqueue_hidden(gpu, w, c.eps, s, m),
+        Tail::Into(_) => Ok(()),
     }
 }
 
@@ -294,35 +371,4 @@ pub(super) fn enqueue_hidden(
         m,
         &mut s.normed,
     )
-}
-
-/// The port of a chain with no host leg: it exchanges nothing, and opens
-/// one unit of `1..=rows` columns, `rows` the arena's.
-pub(super) struct NoLeg {
-    rows: usize,
-}
-
-impl Port for NoLeg {
-    type Error = GpuError;
-    const KIND: PortKind = PortKind::Step;
-
-    /// Refuses by name more than one unit (no leg to overlap across units)
-    /// and more columns than the arena holds rows.
-    fn open(&mut self, o: Overlap) -> Result<(), GpuError> {
-        if o.units != 1 || !(1..=self.rows).contains(&o.cols) {
-            return Err(GpuError::shape(
-                "qwen3moe::NoLeg::open",
-                format!(
-                    "{} units of {} columns; a chain with no host leg walks one unit of \
-                     1..={} columns (the arena's rows)",
-                    o.units, o.cols, self.rows
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    fn refused(why: Refused) -> GpuError {
-        GpuError::shape(WHAT, why.to_string())
-    }
 }

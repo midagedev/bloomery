@@ -85,6 +85,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-chain"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-model",
+ "bloomery-runtime",
+]
+
+[[package]]
 name = "bloomery-decision"
 version = "0.1.0"
 dependencies = [
@@ -151,6 +160,7 @@ dependencies = [
 name = "bloomery-gpu"
 version = "0.1.0"
 dependencies = [
+ "bloomery-chain",
  "bloomery-device",
  "bloomery-engram",
  "bloomery-gguf",

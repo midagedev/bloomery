@@ -6,13 +6,17 @@
 //! asked; and the decode flash pass switched for an eager ruler.
 
 use super::body35::Body35;
-use super::dispatch::{self, Ctx};
+use super::dispatch::{self, PassCtx};
 use super::plan::MixerPlan;
+use super::program::{Program, Tail};
 use super::scratch::LayerStore;
 use crate::media::rope_table;
 use crate::model::{GpuModel, MAX_PASS_ROWS, StepMode};
 use crate::tensor::WindowMut;
+use crate::weights::Weights;
 use crate::{Gpu, GpuError};
+use chain::arch::qwen3moe::ops::LayerCtx;
+use chain::arch::qwen3moe::walk;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 /// What an attention layer's mixer leaves for its `m` rows, token-major:
@@ -259,6 +263,39 @@ fn rows_of(what: &'static str, v: &[f32], hidden: usize) -> Result<usize, GpuErr
     Ok(m)
 }
 
+/// Run `part` of layer `slot` on its own at `m` rows over the pass arena
+/// ([`Program::alone`]): from its `x` (the whole layer) or its `ffn_inp`
+/// (the FFN half), the output residual into `x`.
+fn alone35<P>(
+    gpu: &Gpu,
+    w: &Weights,
+    b: &mut Body35,
+    (slot, m): (usize, usize),
+    part: P,
+) -> Result<(), GpuError>
+where
+    P: FnOnce(&mut Program<'_, [LayerStore]>, LayerCtx<'_>) -> Result<(), GpuError>,
+{
+    let c = PassCtx {
+        gpu,
+        w,
+        plans: &b.plans,
+        k: &b.k,
+        mma: b.mma,
+        eps: b.eps,
+        table: rope_table(&b.rope, b.seq_rope.as_ref()),
+    };
+    Program {
+        c: &c,
+        stores: b.stores.as_mut_slice(),
+        s: &mut b.a,
+        io: &b.rp.io(m)?,
+        m,
+        tail: Tail::Pass,
+    }
+    .alone(slot, part)
+}
+
 impl GpuModel<Body35> {
     /// Run layer `l` eagerly at the rows of `x_in` (1 to [`MAX_PASS_ROWS`]
     /// rows of the residual) from position `pos` on the pass arena, and read
@@ -283,17 +320,7 @@ impl GpuModel<Body35> {
         // `x_in` replaces the embedding rows the front wrote; the window
         // lives for this copy alone.
         WindowMut::<f32>::of_mut(&mut b.a.x, 0, m * hidden)?.copy_from_host(stream, x_in)?;
-        let c = Ctx::new(
-            gpu,
-            w,
-            (&b.plans[slot], slot),
-            &b.k,
-            b.mma,
-            b.eps,
-            rope_table(&b.rope, b.seq_rope.as_ref()),
-        )?;
-        let io = b.rp.io(m)?;
-        dispatch::layer(&c, b.stores[slot].as_mut(), &mut b.a, &io, m, false, None)?;
+        alone35(gpu, w, b, (slot, m), |p, cx| walk::layer(p, cx))?;
         b.read_run(gpu, slot, m)
     }
 
@@ -310,16 +337,7 @@ impl GpuModel<Body35> {
         // The window lives for this copy alone.
         WindowMut::<f32>::of_mut(&mut b.a.ffn_inp, 0, m * hidden)?
             .copy_from_host(stream, ffn_inp)?;
-        let c = Ctx::new(
-            gpu,
-            w,
-            (&b.plans[slot], slot),
-            &b.k,
-            b.mma,
-            b.eps,
-            rope_table(&b.rope, b.seq_rope.as_ref()),
-        )?;
-        dispatch::ffn(&c, &b.plans[slot].ffn, &mut b.a, m, None)?;
+        alone35(gpu, w, b, (slot, m), |p, cx| walk::ffn(p, cx))?;
         b.read_ffn(gpu, m)
     }
 

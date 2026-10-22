@@ -18,7 +18,6 @@ use super::body::KvQ8;
 use super::image::MediaRows;
 use super::plan::Flash;
 use super::router::{MAX_TOKENS, RouterDims, RouterOut};
-use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, Wide};
 use crate::GpuError;
 use crate::fault::FaultSink;
@@ -29,6 +28,7 @@ use crate::flash_gqa::{
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::linear::{self, LinearShape};
+use chain::arch::qwen3moe::router::ubatch_at;
 
 pub(super) use crate::recur::{RecStore, fresh_stamps, stamps_at};
 use crate::rope_neox::{
@@ -212,12 +212,11 @@ impl Dims {
         ))
     }
 
-    /// The most tokens a ubatch may hold: the router's
-    /// ([`RouterDims::ubatch`]), or for a dense chain at most [`UBATCH`] and
-    /// one slot each in one GEMM route table.
+    /// The most tokens a ubatch may hold in one GEMM route table: at the
+    /// router's slots a token ([`RouterDims::ubatch`]), or a dense chain's
+    /// one.
     pub(super) fn ubatch_most(&self) -> usize {
-        self.router
-            .map_or(UBATCH.min(GEMM_MAX_SLOTS), |r| r.ubatch())
+        ubatch_at(self.slots(), GEMM_MAX_SLOTS)
     }
 }
 

@@ -1,0 +1,19 @@
+[package]
+name = "bloomery-chain"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+name = "chain"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The file's tensor table (`Split::find`) and its types: a plan reads names, shapes and types and no bytes.
+bloomery-gguf = { path = "../gguf" }
+bloomery-model = { path = "../model" }
+# The layer walk is a `runtime::sched` program: the order of a walk's items and the port it opens, device-free.
+bloomery-runtime = { path = "../runtime" }

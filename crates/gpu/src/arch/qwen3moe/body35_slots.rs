@@ -32,12 +32,12 @@
 use super::body::ATTN_SCALE_256;
 use super::body35::{Body35, Slot35};
 use super::delta;
-use super::dispatch::{self, Ctx, PassCtx};
+use super::dispatch::{self, PassCtx};
 use super::head_argmax::HeadArgmaxState;
 use super::image::MediaCarrier;
 use super::plan::LayerPlan;
-use super::plan::{DeltaPlan, GqaKind, GqaPlan, MixerPlan};
-use super::program::{self, Tail};
+use super::plan::{DeltaPlan, FfnPlan, GqaKind, GqaPlan, MixerPlan};
+use super::program::{self, Tail, layer_ctx};
 use super::scratch::{Append256, Arena, FlashPass, Io, KvPlanes, LayerStore, RecStore};
 use crate::flash_gqa::{partials_ms_len, partials_v_len_256};
 use crate::gated_quant::GateLayout;
@@ -51,6 +51,8 @@ use crate::q38::OutGateArgs;
 use crate::tensor::{Window, WindowMut};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
+use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
+use chain::arch::qwen3moe::walk::Walk;
 use cuda_core::{CudaStream, DeviceBuffer};
 use std::ops::Range;
 
@@ -214,7 +216,15 @@ impl SlotRows for Body35 {
                 rows: r.rows.clone(),
             });
         }
-        walk(&c, &mut seqs, a, total, (head, head_state))
+        let rows = a.rows;
+        let mut ops = Slots35 {
+            c: &c,
+            seqs: &mut seqs,
+            s: a,
+            head,
+            state: head_state,
+        };
+        Walk::new(&mut ops, c.plans, total).run(rows)
     }
 }
 
@@ -291,265 +301,276 @@ struct SlotSeq35<'a> {
     rows: Range<usize>,
 }
 
-/// Enqueue the pass (module doc): each slot's embedding into its rows, every
-/// layer at the pass's `m` rows, then the one head of every row.
-fn walk(
-    c: &PassCtx<'_>,
-    seqs: &mut [SlotSeq35<'_>],
-    s: &mut Arena,
-    m: usize,
-    (head, state): (&mut Head, &mut HeadArgmaxState),
-) -> Result<(), GpuError> {
-    let hidden = s.dims.hidden;
-    for q in seqs.iter() {
-        let Arena { x, pos, n_keys, .. } = &mut *s;
-        let mut x = rows_mut(x, &q.rows, hidden)?;
-        let mut pos = rows_mut(pos, &q.rows, 1)?;
-        let mut n_keys = rows_mut(n_keys, &q.rows, 1)?;
-        dispatch::embed_into(c.gpu, c.w, c.k, &q.io, (&mut x, &mut pos, &mut n_keys))?;
-    }
-    for (l, p) in c.plans.iter().enumerate() {
-        let lc = Ctx::new(c.gpu, c.w, (p, l), c.k, c.mma, c.eps, c.table)?;
-        match &p.mixer {
-            MixerPlan::Delta(d) => delta_layer(&lc, d, seqs, s, m)?,
-            MixerPlan::Gqa(g) => gqa_layer(&lc, g, seqs, s, m)?,
-        }
-        dispatch::ffn(&lc, &p.ffn, s, m, None)?;
-    }
-    program::enqueue_tail(c, s, m, &mut Tail::One { head, state })
+/// The pass (module doc) as the ops the chain's walk orders: the row-wise
+/// launches over all `R` rows of the arena `s`, the launches bound to a
+/// sequence per busy slot of `seqs`, the one head of every row last.
+struct Slots35<'a, 'q> {
+    c: &'a PassCtx<'a>,
+    seqs: &'a mut [SlotSeq35<'q>],
+    s: &'a mut Arena,
+    head: &'a mut Head,
+    state: &'a mut HeadArgmaxState,
 }
 
-/// A delta layer's mixer at the pass's `m` rows (`delta`'s launches in its
-/// order): the input projections over every row, each slot's conv and
-/// delta step over its rows, its conv ring and its state at the slot's
-/// lane word, then the gated norm and the output projection over every row.
-fn delta_layer(
-    c: &Ctx<'_>,
-    d: &DeltaPlan,
-    seqs: &mut [SlotSeq35<'_>],
-    s: &mut Arena,
-    m: usize,
-) -> Result<(), GpuError> {
-    let (gpu, w) = (c.gpu, c.w);
-    let lin = &c.k.q35(WHAT)?.linear;
-    let stream = gpu.stream();
-    match s.gdn.as_ref() {
-        Some(g) if g.shape == d.shape => {}
-        Some(g) => {
+impl ChainOps for Slots35<'_, '_> {
+    type Error = GpuError;
+
+    /// Each slot's embedding into its rows, from its own input record.
+    fn embed(&mut self, _: usize) -> Result<(), GpuError> {
+        let (c, s) = (self.c, &mut *self.s);
+        let hidden = s.dims.hidden;
+        for q in self.seqs.iter() {
+            let Arena { x, pos, n_keys, .. } = &mut *s;
+            let mut x = rows_mut(x, &q.rows, hidden)?;
+            let mut pos = rows_mut(pos, &q.rows, 1)?;
+            let mut n_keys = rows_mut(n_keys, &q.rows, 1)?;
+            dispatch::embed_into(c.gpu, c.w, c.k, &q.io, (&mut x, &mut pos, &mut n_keys))?;
+        }
+        Ok(())
+    }
+
+    /// q, k and v over every row; any attention other than gated head 256
+    /// is refused by name.
+    fn attn_in(&mut self, l: LayerCtx<'_>, n: &GqaPlan) -> Result<(), GpuError> {
+        let c = &layer_ctx(self.c, l)?;
+        if n.kind != GqaKind::Gated256 {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "layer {}: the arena is cut for {:?}, the plan runs {:?}",
-                    c.layer, g.shape, d.shape
+                    "layer {} is not gated attention at head 256, the one attention a pass of slots \
+                 binds per slot",
+                    c.layer
                 ),
             ));
         }
-        None => return Err(GpuError::state(WHAT, "the arena's delta intermediates")),
+        dispatch::attn_in(c, n, self.s, l.m)
     }
-    delta::project(c, d, s, m)?;
-    let (ch, nv) = (d.shape.channels(), d.shape.n_v);
-    let (wc, dt, sa) = (
-        f32_gain(w, &d.conv)?,
-        f32_gain(w, &d.dt_bias)?,
-        f32_gain(w, &d.ssm_a)?,
-    );
-    let Arena { pos, attn, gdn, .. } = &mut *s;
-    let g = gdn
-        .as_mut()
-        .ok_or(GpuError::state(WHAT, "the arena's delta intermediates"))?;
-    for q in seqs.iter_mut() {
-        let r = &q.rows;
-        let lane =
-            q.io.lane
-                .ok_or(GpuError::state(WHAT, "a slot's lane word"))?;
-        let mut conv = rows_mut(&mut g.conv, r, ch)?;
-        let mut beta = rows_mut(&mut g.beta, r, nv)?;
-        let mut decay = rows_mut(&mut g.decay, r, nv)?;
-        // The conv over the slot's ring, then the delta step over its
-        // state: each launch binds the slot's own store.
-        lin.conv.enqueue_conv_prep(
-            stream,
-            ConvArgs {
-                x: &*rows(&g.x, r, ch)?,
-                b_raw: &*rows(&g.b, r, nv)?,
-                a_raw: &*rows(&g.a, r, nv)?,
-                w: wc,
-                dt_bias: dt,
-                ssm_a: sa,
-                pos: &*rows(pos, r, 1)?,
-                shape: d.shape,
-                eps: c.eps,
-                m: r.len(),
-                fault: c.sink,
-                y: &mut conv,
-                beta: &mut beta,
-                decay: &mut decay,
-                ring: &mut rec_of(&mut *q.stores, c.layer)?.ring,
-            },
-        )?;
-        let st = rec_of(&mut *q.stores, c.layer)?;
-        lin.delta.enqueue_delta(
-            stream,
-            DeltaArgs {
-                qkv: &conv,
-                beta: &beta,
-                decay: &decay,
-                lane,
-                lane_at: 0,
-                lanes: st.lanes,
-                shape: d.shape,
-                m: r.len(),
-                fault: c.sink,
-                o: &mut *rows_mut(&mut g.o, r, nv * linear::HEAD)?,
-                state: &mut st.state,
-            },
-        )?;
-    }
-    lin.norm_gate.enqueue_norm_gate(
-        stream,
-        NormGateArgs {
-            o: &g.o,
-            z: &g.z,
-            w: f32_gain(w, &d.ssm_norm)?,
-            eps: c.eps,
-            n_v: nv,
-            m,
-            fault: c.sink,
-            y: attn,
-        },
-    )?;
-    delta::output(c, d, s, m)
-}
 
-/// A gated head-256 attention layer's mixer at the pass's `m` rows (the
-/// step's launches in its order): q, k and v over every row, each slot's
-/// q/k norm, rope and cache append and its flash over its rows and its K/V
-/// planes, then the output gate over every row — in the output
-/// projection's quantizer for a K-quant, as f32 rows otherwise — and the
-/// output projection. Any other attention is refused by name.
-fn gqa_layer(
-    c: &Ctx<'_>,
-    n: &GqaPlan,
-    seqs: &mut [SlotSeq35<'_>],
-    s: &mut Arena,
-    m: usize,
-) -> Result<(), GpuError> {
-    if n.kind != GqaKind::Gated256 {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "layer {} is not gated attention at head 256, the one attention a pass of slots \
-                 binds per slot",
-                c.layer
-            ),
-        ));
-    }
-    dispatch::attn_in(c, n, s, m)?;
-    let (gpu, w, k) = (c.gpu, c.w, c.k);
-    let q35 = k.q35(WHAT)?;
-    let stream = gpu.stream();
-    let d = s.dims;
-    let (gq, gk) = (f32_gain(w, &n.attn_q_norm)?, f32_gain(w, &n.attn_k_norm)?);
-    {
-        let Arena {
-            q,
-            k: kr,
-            v,
-            pos,
-            n_keys,
-            q_out,
-            part_v,
-            part_ms,
-            attn,
-            ..
-        } = &mut *s;
-        let q_out = q_out
-            .as_mut()
-            .ok_or(GpuError::state(WHAT, "the arena's buffer of gated queries"))?;
-        for qs in seqs.iter_mut() {
-            let r = &qs.rows;
-            let kv = kv_of(&mut *qs.stores, c.layer)?;
-            let pos = rows(pos, r, 1)?;
-            let mut qo = rows_mut(q_out, r, d.attn_len())?;
-            // SAFETY: the layer program embeds consecutive positions before attention;
-            // saturation is outside the cache. Each call uses one sequence's row window
-            // and its own cache planes, not the combined positions of different slots.
-            unsafe {
-                kv.append_256(
-                    &k.neox,
+    /// Each slot's q/k norm, rope and cache append and its flash over its
+    /// rows and its K/V planes, then the output gate over every row — in
+    /// the output projection's quantizer for a K-quant, as f32 rows
+    /// otherwise.
+    fn attn_core(&mut self, l: LayerCtx<'_>, n: &GqaPlan) -> Result<(), GpuError> {
+        let (c, seqs, s, m) = (&layer_ctx(self.c, l)?, &mut *self.seqs, &mut *self.s, l.m);
+        let (gpu, w, k) = (c.gpu, c.w, c.k);
+        let q35 = k.q35(WHAT)?;
+        let stream = gpu.stream();
+        let d = s.dims;
+        let (gq, gk) = (f32_gain(w, &n.attn_q_norm)?, f32_gain(w, &n.attn_k_norm)?);
+        {
+            let Arena {
+                q,
+                k: kr,
+                v,
+                pos,
+                n_keys,
+                q_out,
+                part_v,
+                part_ms,
+                attn,
+                ..
+            } = &mut *s;
+            let q_out = q_out
+                .as_mut()
+                .ok_or(GpuError::state(WHAT, "the arena's buffer of gated queries"))?;
+            for qs in seqs.iter_mut() {
+                let r = &qs.rows;
+                let kv = kv_of(&mut *qs.stores, c.layer)?;
+                let pos = rows(pos, r, 1)?;
+                let mut qo = rows_mut(q_out, r, d.attn_len())?;
+                // SAFETY: the layer program embeds consecutive positions before attention;
+                // saturation is outside the cache. Each call uses one sequence's row window
+                // and its own cache planes, not the combined positions of different slots.
+                unsafe {
+                    kv.append_256(
+                        &k.neox,
+                        stream,
+                        Append256 {
+                            qg: &*rows(q, r, d.q_rows)?,
+                            q: &mut qo,
+                            k: &mut *rows_mut(kr, r, d.kv_len())?,
+                            v: &*rows(v, r, d.kv_len())?,
+                            gq,
+                            gk,
+                            table: qs.table,
+                            pos: &pos,
+                            eps: c.eps,
+                            n_head: d.n_head,
+                            n_kv: d.n_kv,
+                            ctx: d.ctx,
+                            m: r.len(),
+                            fault: c.sink,
+                        },
+                    )
+                }?;
+                kv.flash_256(
+                    &k.flash,
                     stream,
-                    Append256 {
-                        qg: &*rows(q, r, d.q_rows)?,
-                        q: &mut qo,
-                        k: &mut *rows_mut(kr, r, d.kv_len())?,
-                        v: &*rows(v, r, d.kv_len())?,
-                        gq,
-                        gk,
-                        table: qs.table,
-                        pos: &pos,
-                        eps: c.eps,
-                        n_head: d.n_head,
+                    FlashPass {
+                        q: &qo,
+                        n_keys: &*rows(n_keys, r, 1)?,
+                        scale: ATTN_SCALE_256,
                         n_kv: d.n_kv,
                         ctx: d.ctx,
                         m: r.len(),
+                        part_v: &mut *rows_mut(part_v, r, partials_v_len_256(1, d.n_head))?,
+                        part_ms: &mut *rows_mut(part_ms, r, partials_ms_len(1, d.n_head))?,
                         fault: c.sink,
+                        y: &mut *rows_mut(attn, r, d.attn_len())?,
                     },
-                )
-            }?;
-            kv.flash_256(
-                &k.flash,
+                    d.n_head,
+                    n.flash,
+                    c.mma,
+                )?;
+            }
+        }
+        let i = s.col(m)?;
+        if n.o_ty.kquant() {
+            q35.gated.enqueue_q8act(
                 stream,
-                FlashPass {
-                    q: &qo,
-                    n_keys: &*rows(n_keys, r, 1)?,
-                    scale: ATTN_SCALE_256,
-                    n_kv: d.n_kv,
-                    ctx: d.ctx,
-                    m: r.len(),
-                    part_v: &mut *rows_mut(part_v, r, partials_v_len_256(1, d.n_head))?,
-                    part_ms: &mut *rows_mut(part_ms, r, partials_ms_len(1, d.n_head))?,
-                    fault: c.sink,
-                    y: &mut *rows_mut(attn, r, d.attn_len())?,
+                (&s.attn, &s.q),
+                GateLayout {
+                    head: d.head,
+                    head_stride: 2 * d.head,
+                    offset: d.head,
+                    col_stride: d.q_rows,
                 },
-                d.n_head,
-                n.flash,
-                c.mma,
+                &mut s.act_attn[i],
+                m,
+                c.sink,
+            )?;
+        } else {
+            let gated = s
+                .gated_rows
+                .as_mut()
+                .ok_or(GpuError::state(WHAT, "the arena's gated rows"))?;
+            q35.q38.enqueue_out_gate(
+                stream,
+                OutGateArgs {
+                    attn: &s.attn,
+                    qg: &s.q,
+                    n_head: d.n_head,
+                    m,
+                    fault: c.sink,
+                    y: gated,
+                },
             )?;
         }
+        Ok(())
     }
-    let i = s.col(m)?;
-    if n.o_ty.kquant() {
-        q35.gated.enqueue_q8act(
-            stream,
-            (&s.attn, &s.q),
-            GateLayout {
-                head: d.head,
-                head_stride: 2 * d.head,
-                offset: d.head,
-                col_stride: d.q_rows,
-            },
-            &mut s.act_attn[i],
-            m,
-            c.sink,
-        )?;
-    } else {
-        let gated = s
-            .gated_rows
+
+    fn attn_out(&mut self, l: LayerCtx<'_>, n: &GqaPlan) -> Result<(), GpuError> {
+        dispatch::attn_out(&layer_ctx(self.c, l)?, n, self.s, l.m)
+    }
+
+    /// The arena checked against the plan's shape, then the input
+    /// projections over every row: `delta`'s own input half (a pass's rows
+    /// never go past `GEMV_COLS`, so it takes the gemv arm).
+    fn delta_in(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), GpuError> {
+        delta::delta_in(&layer_ctx(self.c, l)?, d, self.s, l.m)
+    }
+
+    /// Each slot's conv and delta step over its rows, its conv ring and its
+    /// state at the slot's lane word, then the gated norm over every row.
+    fn delta_core(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), GpuError> {
+        let (c, seqs, s, m) = (&layer_ctx(self.c, l)?, &mut *self.seqs, &mut *self.s, l.m);
+        let (gpu, w) = (c.gpu, c.w);
+        let lin = &c.k.q35(WHAT)?.linear;
+        let stream = gpu.stream();
+        let (ch, nv) = (d.shape.channels(), d.shape.n_v);
+        let (wc, dt, sa) = (
+            f32_gain(w, &d.conv)?,
+            f32_gain(w, &d.dt_bias)?,
+            f32_gain(w, &d.ssm_a)?,
+        );
+        let Arena { pos, attn, gdn, .. } = &mut *s;
+        let g = gdn
             .as_mut()
-            .ok_or(GpuError::state(WHAT, "the arena's gated rows"))?;
-        q35.q38.enqueue_out_gate(
+            .ok_or(GpuError::state(WHAT, "the arena's delta intermediates"))?;
+        for q in seqs.iter_mut() {
+            let r = &q.rows;
+            let lane =
+                q.io.lane
+                    .ok_or(GpuError::state(WHAT, "a slot's lane word"))?;
+            let mut conv = rows_mut(&mut g.conv, r, ch)?;
+            let mut beta = rows_mut(&mut g.beta, r, nv)?;
+            let mut decay = rows_mut(&mut g.decay, r, nv)?;
+            // The conv over the slot's ring, then the delta step over its
+            // state: each launch binds the slot's own store.
+            lin.conv.enqueue_conv_prep(
+                stream,
+                ConvArgs {
+                    x: &*rows(&g.x, r, ch)?,
+                    b_raw: &*rows(&g.b, r, nv)?,
+                    a_raw: &*rows(&g.a, r, nv)?,
+                    w: wc,
+                    dt_bias: dt,
+                    ssm_a: sa,
+                    pos: &*rows(pos, r, 1)?,
+                    shape: d.shape,
+                    eps: c.eps,
+                    m: r.len(),
+                    fault: c.sink,
+                    y: &mut conv,
+                    beta: &mut beta,
+                    decay: &mut decay,
+                    ring: &mut rec_of(&mut *q.stores, c.layer)?.ring,
+                },
+            )?;
+            let st = rec_of(&mut *q.stores, c.layer)?;
+            lin.delta.enqueue_delta(
+                stream,
+                DeltaArgs {
+                    qkv: &conv,
+                    beta: &beta,
+                    decay: &decay,
+                    lane,
+                    lane_at: 0,
+                    lanes: st.lanes,
+                    shape: d.shape,
+                    m: r.len(),
+                    fault: c.sink,
+                    o: &mut *rows_mut(&mut g.o, r, nv * linear::HEAD)?,
+                    state: &mut st.state,
+                },
+            )?;
+        }
+        lin.norm_gate.enqueue_norm_gate(
             stream,
-            OutGateArgs {
-                attn: &s.attn,
-                qg: &s.q,
-                n_head: d.n_head,
+            NormGateArgs {
+                o: &g.o,
+                z: &g.z,
+                w: f32_gain(w, &d.ssm_norm)?,
+                eps: c.eps,
+                n_v: nv,
                 m,
                 fault: c.sink,
-                y: gated,
+                y: attn,
             },
         )?;
+        Ok(())
     }
-    dispatch::attn_out(c, n, s, m)
+
+    fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), GpuError> {
+        delta::output(&layer_ctx(self.c, l)?, d, self.s, l.m)
+    }
+
+    fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
+        dispatch::route(&layer_ctx(self.c, l)?, f, self.s, l.m)
+    }
+
+    fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
+        dispatch::experts(&layer_ctx(self.c, l)?, f, self.s, l.m, None)
+    }
+
+    /// The one head of every row ([`Tail::One`]).
+    fn head(&mut self, m: usize) -> Result<(), GpuError> {
+        let tail = &mut Tail::One {
+            head: &mut *self.head,
+            state: &mut *self.state,
+        };
+        program::enqueue_tail(self.c, self.s, m, tail)
+    }
 }
 
 /// Layer `l`'s recurrent store of a slot's `stores`, else refused by name.

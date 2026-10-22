@@ -1,6 +1,7 @@
 //! The Qwen3.6-35B-A3B (`qwen35moe`) and Qwen3.5-9B (`qwen35`, the Clef
-//! backbone) `ChainBody`: the family's one layer body (`dispatch::layer`)
-//! over plans that interleave gated-delta-rule layers with gated GQA layers
+//! backbone) `ChainBody`: the family's one layer program (the chain's walk
+//! over the ops of `dispatch` and `delta`, `program`) over plans that
+//! interleave gated-delta-rule layers with gated GQA layers
 //! at head 256 — every routed layer's experts carrying the sigmoid-gated
 //! shared expert as one more slot of joined stacks, every dense layer's FFN a
 //! stack of one expert on the arena's fixed one-slot route. The head counts
@@ -72,7 +73,7 @@
 //! the table of the sequence it runs. A media call is eager and runs every
 //! unit on [`PrefillPath::Wide`]; each unit's first layer copies the rows of
 //! the spans inside it over the embeddings of their positions
-//! (`image::MediaRows`, `dispatch::mixer`).
+//! (`image::MediaRows`, the unit's front, `dispatch::unit_front`).
 
 use super::body::{Kernels, KvQ8, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
@@ -84,13 +85,12 @@ use super::image::{
 use super::mtp35::Mtp35;
 use super::placed::{
     BatchWalk, CommonForms, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, apart_plans,
-    card_leg, common_forms as placed_forms, counted_arena, placed_bytes, placed_scratch,
-    prompt_rows, tally_shape,
+    common_forms as placed_forms, counted_arena, placed_bytes, placed_scratch, prompt_rows,
+    tally_shape,
 };
 use super::plan::{
-    DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
-    SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry, kind35, kinds35, moe_fits, q35,
-    shared_entry,
+    FfnPlan, FfnRoute, Flash, GqaKind, Kind35, LayerPlan, MixerPlan, SharedPlan, SiteTy, down_sel,
+    gate_up_fused, input_fused, kind35, kinds35, moe_fits, o_fused, out_fused, q35, qkv_fused,
 };
 use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 use super::program::{Program, Tail};
@@ -112,7 +112,7 @@ use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec};
 use crate::host::xstream::{Costs, XLayer, XMode, XReport, XStreamBody};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Chain, SlotMap};
-use crate::linear::{self, LinearShape};
+use crate::linear;
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::fit::{FIT_RESERVE, largest_fit};
 use crate::model::{
@@ -125,12 +125,15 @@ use crate::tensor::WindowMut;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
 use bloomery_levers::{ChurnHosting, HostCfg};
+use chain::arch::qwen3moe::read::{
+    PlanDims, Read35, joint, joint_gate_inp, plan_delta, plan_ffn, plan_gqa,
+};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft};
-use model::placement::accepts::LegSplit;
+pub(super) use model::arch::names::blk;
 use model::placement::{Plan, WholeLoad};
 use runtime::seqstate::{Kept, Price};
 use std::num::NonZeroUsize;
@@ -427,11 +430,6 @@ pub struct Slot35 {
     pub(super) rope: Option<SeqRope>,
 }
 
-/// `name` of layer `l`.
-pub(super) fn blk(l: usize, stem: &str) -> String {
-    format!("blk.{l}.{stem}")
-}
-
 /// The delta layers' stores a checkpoint copies, lent for one call: each
 /// layer's state lane `lane` (the committed one) as a window of its lanes,
 /// and its conv ring.
@@ -480,43 +478,9 @@ impl<'a> Copied35<'a> {
     }
 }
 
-/// The joined name of layer `l`'s stack `part` (`gate`, `up`, `down`).
-fn joint(l: usize, part: &str) -> String {
-    format!("derived.blk.{l}.ffn_{part}_exps_sh")
-}
-
-/// The types each site launches (`crate::site`): a projection of the normed
-/// rows or an output projection, a K-quant or Q8_0; β and α also F32; the
-/// embedding Q3_K, Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K,
-/// Q4_K or Q8_0 (`Head`). A routed layer's stacks and its shared expert are
-/// read at any site type ([`FFN_READ`]) and admitted by the card kernel
-/// table's entries ([`plan_ffn`]); under a placed read the stacks of a layer
-/// the dispatch's launches do not run are typed as the host tier's instead
-/// ([`card_leg`]): a layer the common leg runs holds its stacks to the placed
-/// side, which reads their types from the resident stacks.
-const PROJ: &[SiteTy] = &[
-    SiteTy::Q3K,
-    SiteTy::Q4K,
-    SiteTy::Q5K,
-    SiteTy::Q6K,
-    SiteTy::Q8_0,
-];
-const BETA_ALPHA: &[SiteTy] = &[
-    SiteTy::Q3K,
-    SiteTy::Q4K,
-    SiteTy::Q5K,
-    SiteTy::Q6K,
-    SiteTy::Q8_0,
-    SiteTy::F32,
-];
-const FFN_READ: &[SiteTy] = &[
-    SiteTy::Q3K,
-    SiteTy::Q4K,
-    SiteTy::Q5K,
-    SiteTy::Q6K,
-    SiteTy::Q8_0,
-    SiteTy::F32,
-];
+/// The types the embedding and the head read (`crate::site`): the embedding
+/// Q3_K, Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K, Q4_K or Q8_0
+/// (`Head`).
 const EMBED: &[SiteTy] = &[
     SiteTy::Q3K,
     SiteTy::Q4K,
@@ -526,38 +490,7 @@ const EMBED: &[SiteTy] = &[
 ];
 const HEAD_TY: &[SiteTy] = &[SiteTy::Q6K, SiteTy::Q4K, SiteTy::Q8_0];
 
-/// The type of site `name` (`rows` rows of `k`) from `file`'s header.
-fn ty_of(
-    file: &Split,
-    name: &str,
-    rows: usize,
-    k: usize,
-    allowed: &[SiteTy],
-) -> Result<SiteTy, GpuError> {
-    file_site(file, WHAT, name, (rows, k), allowed)
-}
-
-/// What a read of the file holds a layer's routed stacks to.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Read35 {
-    /// A whole load: every routed stack runs on the card, so each is read at
-    /// a site type and admitted by the card kernel table's entries.
-    Whole,
-    /// A placed load: a layer whose stacks the card leg does not run is the
-    /// host tier's, and its stacks are read as [`HOSTED`] — each stack still
-    /// refused by name when no tier runs its type.
-    Placed,
-}
-
-/// The type a placed plan holds a host layer's routed stacks as. No launch
-/// reads them: the layer has no card expert (the open refuses card experts of
-/// a layer the leg does not run, [`swap35::stacks`]), and an F32 site reads no
-/// quantized form (`SiteTy::reads`), so neither the arena's forms
-/// ([`Forms::of`]) nor the wide arm's front (`wide::ffn_front`) counts a form
-/// for them: the layer's card work is its shared expert's alone.
-const HOSTED: SiteTy = SiteTy::F32;
-
-/// The forms the layers the common card leg runs ([`LegSplit::Common`]) hold
+/// The forms the layers the common card leg runs ([`model::placement::accepts::LegSplit::Common`]) hold
 /// buffers of, from `file`'s header: [`CommonForms::NONE`] unless the read is a
 /// placed one, which is the only one a card leg runs a layer of by it.
 fn common_forms(
@@ -577,122 +510,6 @@ fn common_forms(
             Ffn::Dense { .. } => None,
         });
     placed_forms(file, WHAT, moe, (d.ff, d.hidden))
-}
-
-/// The types of routed part `part` of layer `l` from `file`'s header: its
-/// experts' stack (`experts` experts of `rows` rows of `k` values; [`HOSTED`]
-/// for a layer the host tier runs) and its shared expert's matrix (`rows` of
-/// `k`).
-fn part_tys(
-    file: &Split,
-    l: usize,
-    part: &str,
-    (rows, k, experts): (usize, usize, usize),
-    hosted: bool,
-) -> Result<(SiteTy, SiteTy), GpuError> {
-    let exps = blk(l, &format!("ffn_{part}_exps.weight"));
-    let sh = blk(l, &format!("ffn_{part}_shexp.weight"));
-    let routed = if hosted {
-        HOSTED
-    } else {
-        ty_of(file, &exps, experts * rows, k, FFN_READ)?
-    };
-    Ok((routed, ty_of(file, &sh, rows, k, FFN_READ)?))
-}
-
-/// Layer `l`'s FFN by its description `spec`, every site's type from
-/// `file`'s header. A routed one: its stacks' types admitted by the card
-/// kernel table's entries (`plan::gate_up_entry`, `plan::down_entry`) and
-/// its shared expert's by its dense sites (`plan::shared_entry`), each
-/// refused by name with the layer; the router joined with the shared gate
-/// as row `n` (the routed count, [`join_ffn`]); and the shared expert folded
-/// into the stacks as expert `n` when its gate, up and down are each its
-/// stack's type ([`SharedPlan::Joined`]), else kept apart at its own types
-/// ([`SharedPlan::Apart`]). Under a placed read ([`Read35::Placed`]) a layer
-/// whose stacks the dispatch's launches do not run ([`card_leg`]) is typed as
-/// the host tier's: its stacks are read as [`HOSTED`] and no card entry is
-/// asked of them, its shared expert kept apart at its own types, which the
-/// card runs whatever the stacks are; the common leg's layers
-/// ([`LegSplit::Common`]) are among them, their types the placed side's to
-/// read. A dense one: its three matrices a stack of one expert on the
-/// arena's fixed route.
-fn plan_ffn(
-    file: &Split,
-    d: &Dims,
-    spec: &LayerSpec,
-    l: usize,
-    read: Read35,
-) -> Result<FfnPlan, GpuError> {
-    let (h, ff) = (d.hidden, d.ff);
-    let ffn_norm = blk(l, "post_attention_norm.weight");
-    match &spec.ffn {
-        Ffn::Moe(m) => {
-            let n = m.experts as usize;
-            let hosted = read == Read35::Placed
-                && !matches!(
-                    card_leg(file, WHAT, l, (ff, h, n))?,
-                    Some((LegSplit::Dispatch, _))
-                );
-            let (gate_ty, sh_gate) = part_tys(file, l, "gate", (ff, h, n), hosted)?;
-            let (up_ty, sh_up) = part_tys(file, l, "up", (ff, h, n), hosted)?;
-            let (down_ty, sh_down) = part_tys(file, l, "down", (h, ff, n), hosted)?;
-            let at = |e: GpuError| GpuError::shape(WHAT, format!("layer {l}: {e}"));
-            if !hosted {
-                gate_up_entry(gate_ty, up_ty, WHAT).map_err(at)?;
-                down_entry(down_ty, WHAT).map_err(at)?;
-            }
-            for ty in [sh_gate, sh_up, sh_down] {
-                shared_entry(ty, WHAT).map_err(at)?;
-            }
-            let routed = |part: &str| blk(l, &format!("ffn_{part}_exps.weight"));
-            let (shared, [gate, up, down]) =
-                if !hosted && (gate_ty, up_ty, down_ty) == (sh_gate, sh_up, sh_down) {
-                    let stacks = ["gate", "up", "down"].map(|part| joint(l, part));
-                    (SharedPlan::Joined, stacks)
-                } else {
-                    let sites = SharedSites {
-                        gate: blk(l, "ffn_gate_shexp.weight"),
-                        up: blk(l, "ffn_up_shexp.weight"),
-                        down: blk(l, "ffn_down_shexp.weight"),
-                        gate_ty: sh_gate,
-                        up_ty: sh_up,
-                        down_ty: sh_down,
-                    };
-                    let stacks = ["gate", "up", "down"].map(routed);
-                    (SharedPlan::Apart(sites), stacks)
-                };
-            Ok(FfnPlan {
-                ffn_norm,
-                route: FfnRoute::Router {
-                    gate_inp: format!("derived.blk.{l}.ffn_gate_inp_sh"),
-                    shared: Some(shared),
-                },
-                gate,
-                up,
-                down,
-                gate_ty,
-                up_ty,
-                down_ty,
-            })
-        }
-        Ffn::Dense { .. } => {
-            let (gate, up, down) = (
-                blk(l, "ffn_gate.weight"),
-                blk(l, "ffn_up.weight"),
-                blk(l, "ffn_down.weight"),
-            );
-            Ok(FfnPlan {
-                ffn_norm,
-                route: FfnRoute::Dense,
-                gate_ty: ty_of(file, &gate, ff, h, PROJ)?,
-                up_ty: ty_of(file, &up, ff, h, PROJ)?,
-                down_ty: ty_of(file, &down, h, ff, PROJ)?,
-                gate,
-                up,
-                down,
-            })
-        }
-    }
 }
 
 /// Layer `l`'s router joined with its shared gate, and, when its plan `f`
@@ -731,65 +548,19 @@ fn join_gate_inp(stream: &CudaStream, w: &mut Weights, l: usize) -> Result<(), G
             blk(l, "ffn_gate_inp.weight").as_str(),
             blk(l, "ffn_gate_inp_shexp.weight").as_str(),
         ],
-        format!("derived.blk.{l}.ffn_gate_inp_sh"),
+        joint_gate_inp(l),
     )
 }
 
-/// Layer `l`'s gated attention over the flash `flash` its group selects,
-/// every site's type from `file`'s header.
-fn plan_gqa(file: &Split, d: &Dims, l: usize, flash: Flash) -> Result<GqaPlan, GpuError> {
-    let (h, kv, att) = (d.hidden, d.kv_len(), d.attn_len());
-    let (q, k, v, o) = (
-        blk(l, "attn_q.weight"),
-        blk(l, "attn_k.weight"),
-        blk(l, "attn_v.weight"),
-        blk(l, "attn_output.weight"),
-    );
-    Ok(GqaPlan {
-        kind: GqaKind::Gated256,
-        flash,
-        attn_norm: blk(l, "attn_norm.weight"),
-        attn_q_norm: blk(l, "attn_q_norm.weight"),
-        attn_k_norm: blk(l, "attn_k_norm.weight"),
-        q_ty: ty_of(file, &q, d.q_rows, h, PROJ)?,
-        k_ty: ty_of(file, &k, kv, h, PROJ)?,
-        v_ty: ty_of(file, &v, kv, h, PROJ)?,
-        o_ty: ty_of(file, &o, h, att, PROJ)?,
-        attn_q: q,
-        attn_k: k,
-        attn_v: v,
-        attn_output: o,
-    })
-}
-
-/// Layer `l`'s delta rule, every site's type from `file`'s header.
-fn plan_delta(file: &Split, d: &Dims, shape: LinearShape, l: usize) -> Result<DeltaPlan, GpuError> {
-    let (h, c, nv) = (d.hidden, shape.channels(), shape.n_v);
-    let (qkv, gate, beta, alpha, out) = (
-        blk(l, "attn_qkv.weight"),
-        blk(l, "attn_gate.weight"),
-        blk(l, "ssm_beta.weight"),
-        blk(l, "ssm_alpha.weight"),
-        blk(l, "ssm_out.weight"),
-    );
-    Ok(DeltaPlan {
-        attn_norm: blk(l, "attn_norm.weight"),
-        conv: blk(l, "ssm_conv1d.weight"),
-        dt_bias: blk(l, "ssm_dt.bias"),
-        ssm_a: blk(l, "ssm_a"),
-        ssm_norm: blk(l, "ssm_norm.weight"),
-        shape,
-        qkv_ty: ty_of(file, &qkv, c, h, PROJ)?,
-        gate_ty: ty_of(file, &gate, nv * linear::HEAD, h, PROJ)?,
-        beta_ty: ty_of(file, &beta, nv, h, BETA_ALPHA)?,
-        alpha_ty: ty_of(file, &alpha, nv, h, BETA_ALPHA)?,
-        out_ty: ty_of(file, &out, h, nv * linear::HEAD, PROJ)?,
-        qkv,
-        gate,
-        beta,
-        alpha,
-        ssm_out: out,
-    })
+/// What a layer's plan reads of the arena's dims: the rows its sites are read at.
+fn plan_dims(d: &Dims) -> PlanDims {
+    PlanDims {
+        hidden: d.hidden,
+        ff: d.ff,
+        q_rows: d.q_rows,
+        kv_len: d.kv_len(),
+        attn_len: d.attn_len(),
+    }
 }
 
 /// Every weight of layer plan `p` resident as the plan read it from the
@@ -878,7 +649,7 @@ impl Forms {
         let mut apart: Vec<SiteTy> = Vec::new();
         let mut out_gate = false;
         let mut alone = |ty: SiteTy, rows: usize| {
-            if ty.kgemv_order() == Some(Order::RowMajor) {
+            if site::kgemv_order(ty) == Some(Order::RowMajor) {
                 cols = cols.max(rows);
             }
         };
@@ -888,25 +659,25 @@ impl Forms {
                     hid.extend([g.q_ty, g.k_ty, g.v_ty]);
                     attn.push(g.o_ty);
                     out_gate |= g.kind == GqaKind::Gated256 && !g.o_ty.kquant();
-                    if !g.qkv_fused() {
+                    if !qkv_fused(g) {
                         alone(g.q_ty, d.q_rows);
                         alone(g.k_ty, d.kv_len());
                         alone(g.v_ty, d.kv_len());
                     }
-                    if !g.o_fused() {
+                    if !o_fused(g) {
                         alone(g.o_ty, d.hidden);
                     }
                 }
                 MixerPlan::Delta(dp) => {
                     hid.extend([dp.qkv_ty, dp.gate_ty, dp.beta_ty, dp.alpha_ty]);
                     attn.push(dp.out_ty);
-                    if !dp.input_fused() {
+                    if !input_fused(dp) {
                         alone(dp.qkv_ty, dp.shape.channels());
                         alone(dp.gate_ty, dp.shape.n_v * linear::HEAD);
                         alone(dp.beta_ty, dp.shape.n_v);
                         alone(dp.alpha_ty, dp.shape.n_v);
                     }
-                    if !dp.out_fused() {
+                    if !out_fused(dp) {
                         alone(dp.out_ty, d.hidden);
                     }
                 }
@@ -923,12 +694,12 @@ impl Forms {
                 alone(sh.up_ty, d.ff);
                 alone(sh.down_ty, d.hidden);
             }
-            if !f.gate_up_fused() {
+            if !gate_up_fused(f) {
                 glu = true;
                 alone(f.gate_ty, d.slots() * d.ff);
                 alone(f.up_ty, d.slots() * d.ff);
             }
-            if !f.down_sel() {
+            if !down_sel(f) {
                 alone(f.down_ty, d.hidden);
             }
         }
@@ -1038,27 +809,30 @@ impl Pre35 {
             ));
         }
         let vocab = spec.vocab as usize;
-        ty_of(file, "token_embd.weight", vocab, d.hidden, EMBED)?;
-        ty_of(
+        file_site(file, WHAT, "token_embd.weight", (vocab, d.hidden), EMBED)?;
+        file_site(
             file,
+            WHAT,
             crate::weights::head_tensor(file),
-            vocab,
-            d.hidden,
+            (vocab, d.hidden),
             HEAD_TY,
         )?;
         let common = common_forms(file, &d, &spec.layers, mode)?;
+        let pd = plan_dims(&d);
         let plans = kinds
             .iter()
             .zip(&spec.layers)
             .enumerate()
             .map(|(l, (kind, layer))| {
                 let mixer = match *kind {
-                    Kind35::Gqa(flash) => MixerPlan::Gqa(plan_gqa(file, &d, l, flash)?),
-                    Kind35::Delta(shape) => MixerPlan::Delta(plan_delta(file, &d, shape, l)?),
+                    Kind35::Gqa(flash) => MixerPlan::Gqa(plan_gqa(file, WHAT, &pd, l, flash)?),
+                    Kind35::Delta(shape) => {
+                        MixerPlan::Delta(plan_delta(file, WHAT, &pd, shape, l)?)
+                    }
                 };
                 Ok(LayerPlan {
                     mixer,
-                    ffn: plan_ffn(file, &d, layer, l, mode)?,
+                    ffn: plan_ffn(file, WHAT, &pd, layer, l, mode)?,
                 })
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
@@ -1170,7 +944,7 @@ fn ffn_dims(spec: &ModelSpec) -> Result<(Option<super::router::RouterDims>, usiz
                     ),
                 ));
             }
-            let router = moe_fits(first).map_err(|e| GpuError::shape(WHAT, e))?;
+            let router = moe_fits(first, WHAT)?;
             Ok((Some(router), q35::EXPERT_FF as usize))
         }
         (None, Some(ff)) => match dense.find(|&o| o != ff) {
@@ -1237,9 +1011,10 @@ fn draft_layer(
             format!("layer {l}: the next-token layer is full attention, not a delta rule"),
         ));
     };
+    let pd = plan_dims(d);
     let plan = LayerPlan {
-        mixer: MixerPlan::Gqa(plan_gqa(file, d, l, flash)?),
-        ffn: plan_ffn(file, d, &draft.layer, l, Read35::Whole)?,
+        mixer: MixerPlan::Gqa(plan_gqa(file, WHAT, &pd, l, flash)?),
+        ffn: plan_ffn(file, WHAT, &pd, &draft.layer, l, Read35::Whole)?,
     };
     let prefix = blk(l, "");
     let mut w = Weights::load_where(gpu.stream(), file, |name| name.starts_with(&prefix))?;

@@ -4,15 +4,17 @@
 //! the card in its stacks, the rest on the host tier (`crate::host`), which
 //! computes them with qdot's fused kernels while the card runs its own.
 //!
-//! The walks are the layer program's (`program`) over a host leg: the
+//! The walks are layer programs of their own over a host leg (the FFN half
+//! splits around the leg, which the chain's walk does not lay out): the
 //! decode step `(1, 1, Step)` through the tier's step port ([`StepWalk`],
 //! captured), a prompt unit `(1, m, Batch)` of up to [`PlacedOpen::rows`]
 //! rows through its batch port ([`BatchWalk`]): a unit of up to
 //! [`GEMV_COLS`] rows runs the gemv arm's launches below, a longer one the
 //! wide arm's (`wide::ffn_front`, `wide::ffn_card`, `wide::ffn_combine`) over
 //! the layer's own map and table of the card's experts. A layer's parts:
-//! - the front: the mixer (`dispatch::mixer`, the chain's own), the FFN
-//!   norm with its q8_1 form and the router — the norm into the step
+//! - the front: the chain's walk ahead of the FFN half (`walk::front`: the
+//!   embedding in front of layer 0, then the mixer, over the family's ops
+//!   [`Program`]), the FFN norm with its q8_1 form and the router — the norm into the step
 //!   boundary's activation, or the arena's for a unit — then the host leg's
 //!   send: the step's handoff into the page with each routed slot's place
 //!   and the go; a unit's download of its rows and routing with its places
@@ -67,7 +69,7 @@ use super::plan::{
     FfnPlan, FfnRoute, GateUpEntry, LayerPlan, SharedPlan, SharedSites, SiteTy, down_entry,
     gate_up_entry, shared_entry,
 };
-use super::program::{Stores, Tail, enqueue_tail};
+use super::program::{Program, Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Forms, Io};
 use super::wide::{self, CardRoute, GEMV_COLS, HostSide, arena_bytes};
 use crate::card_leg::{
@@ -94,6 +96,10 @@ use crate::tensor::{DeviceTensor, Q8Act, Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{FaultSink, Gpu, GpuError};
 use bloomery_levers::HostCfg;
+use chain::ChainError;
+use chain::arch::qwen3moe::ops::LayerCtx;
+use chain::arch::qwen3moe::read::card_leg;
+use chain::arch::qwen3moe::walk;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::GgmlType;
@@ -1277,78 +1283,6 @@ pub(super) fn stack_files(
     ])
 }
 
-/// The file type of routed stack `name` of `rows` rows of `k` values, from
-/// its header entry: the type itself, where `file_site` names only the types
-/// a card site launches. A missing tensor or another shape is refused by
-/// name, `what` naming the entry point that read the header.
-fn stack_ty(
-    file: &Split,
-    what: &'static str,
-    name: &str,
-    (rows, k): (usize, usize),
-) -> Result<GgmlType, GpuError> {
-    let (_, t) = file
-        .find(name)
-        .ok_or_else(|| GpuError::tensor(what, name, "in the file"))?;
-    let got_k = t.dims.first().copied().unwrap_or(0);
-    let got_rows: u64 = t.dims.iter().skip(1).product();
-    if usize::try_from(got_k).ok() != Some(k) || usize::try_from(got_rows).ok() != Some(rows) {
-        return Err(GpuError::shape(
-            what,
-            format!(
-                "{name} is {:?} in the file; the stack takes {rows} rows of {k}",
-                t.dims
-            ),
-        ));
-    }
-    Ok(t.ty)
-}
-
-/// The leg that runs layer `l`'s routed stacks (`n` experts of `ff` rows of
-/// `h` values) on the placed card, with the stacks' file types, read from
-/// `file`'s header before any upload: the planner's own verdict
-/// ([`accepts::qwen35_leg`]), `None` for a layer the host tier runs. A stack of
-/// a type that neither the card leg's arm for its part ([`accepts::leg_arms`])
-/// nor the host tier's fused rows ([`model::ops::host_stack_runs`]) runs is
-/// refused by name, with the layer: no plan can place it. `what` names the
-/// entry point that read the header.
-pub(super) fn card_leg(
-    file: &Split,
-    what: &'static str,
-    l: usize,
-    (ff, h, n): (usize, usize, usize),
-) -> Result<Option<(LegSplit, [GgmlType; 3])>, GpuError> {
-    let program = accepts::Program::Qwen35Body;
-    let arms = accepts::leg_arms(program)
-        .ok_or_else(|| GpuError::shape(what, "the placed side's body runs no card leg"))?;
-    let stack = |part: &str,
-                 name: String,
-                 (rows, k): (usize, usize),
-                 (kind, arm): (&str, fn(GgmlType) -> bool)|
-     -> Result<GgmlType, GpuError> {
-        let ty = stack_ty(file, what, &name, (n * rows, k))?;
-        if !arm(ty) {
-            model::ops::host_stack_runs("the host tier", &name, ty, k).map_err(|e| {
-                GpuError::shape(
-                    what,
-                    format!(
-                        "layer {l}: the {part} stack is {ty}, which runs on no tier: the card \
-                         leg's {kind} launches read none; {e}"
-                    ),
-                )
-            })?;
-        }
-        Ok(ty)
-    };
-    let gate_up = ("gate·up", arms.gate_up);
-    let tys = [
-        stack("gate", ffn_gate_exps(l), (ff, h), gate_up)?,
-        stack("up", ffn_up_exps(l), (ff, h), gate_up)?,
-        stack("down", ffn_down_exps(l), (h, ff), ("down", arms.down))?,
-    ];
-    Ok(accepts::qwen35_leg(tys).map(|leg| (leg, tys)))
-}
-
 /// The forms the layers the common card leg runs ([`LegSplit::Common`]) hold
 /// buffers of, from `file`'s header: `layers` are each routed layer with its
 /// expert count, `ff` and `h` the width of an expert's stacks. A load whose
@@ -1473,7 +1407,7 @@ fn shared_ffn(
     (ff, h): (usize, usize),
     l: usize,
 ) -> Result<SharedFfn, GpuError> {
-    let at = |e: GpuError| GpuError::shape(WHAT, format!("layer {l}: {e}"));
+    let at = |e: ChainError| GpuError::shape(WHAT, format!("layer {l}: {e}"));
     for (name, ty, shape) in [
         (&sh.gate, sh.gate_ty, (ff, h)),
         (&sh.up, sh.up_ty, (ff, h)),
@@ -2283,17 +2217,20 @@ pub(super) struct WalkParts<'a, S: Stores + ?Sized> {
 }
 
 impl<S: Stores + ?Sized> WalkParts<'_, S> {
-    /// Layer `l`'s context and its mixer at the walk's rows (the embedding
-    /// in front of layer 0): the front up to the FFN norm.
+    /// Layer `l`'s front up to the FFN norm at the walk's rows: the chain's
+    /// walk ahead of the FFN half ([`walk::front`]: the embedding in front of
+    /// layer 0, then the mixer) over the family's ops.
     fn mixer(&mut self, l: usize) -> Result<(), GpuError> {
-        let c = self.c;
-        let (p, st) = c
-            .plans
-            .get(l)
-            .zip(self.stores.store(l))
-            .ok_or(GpuError::state(WHAT, "a plan and a store for every layer"))?;
-        let lc = Ctx::new(c.gpu, c.w, (p, l), c.k, c.mma, c.eps, c.table)?;
-        dispatch::mixer(&lc, st, self.s, self.io, self.m, l == 0)
+        let cx = LayerCtx::of(self.c.plans, l, self.m)?;
+        let mut ops = Program {
+            c: self.c,
+            stores: &mut *self.stores,
+            s: &mut *self.s,
+            io: self.io,
+            m: self.m,
+            tail: Tail::Pass,
+        };
+        walk::front(&mut ops, cx)
     }
 
     /// Layer `lc`'s places of the unit's routed slots into the leg's `sel`,

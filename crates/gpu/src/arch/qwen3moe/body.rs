@@ -12,7 +12,7 @@ use super::placed::{
 };
 use super::plan::{
     FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy, down_entry,
-    gate_up_entry,
+    gate_up_entry, kq_sel, o_fused, qkv_fused,
 };
 use super::prefill::Prefill;
 use super::program::Tail;
@@ -42,6 +42,7 @@ use crate::tensor::WindowMut;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, Graph};
 use bloomery_levers::HostCfg;
+use chain::ChainError;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::GgmlType;
@@ -307,7 +308,7 @@ pub(super) fn stack_tys(
 /// the file's header, so a type the load refuses never fits the plan.
 fn stack_entries([gate, up, down]: [SiteTy; 3], l: usize) -> Result<(), GpuError> {
     let what = "qwen3moe::Body::load";
-    let at = |e: GpuError| GpuError::shape(what, format!("layer {l}: {e}"));
+    let at = |e: ChainError| GpuError::shape(what, format!("layer {l}: {e}"));
     gate_up_entry(gate, up, what).map_err(at)?;
     down_entry(down, what).map_err(at)?;
     Ok(())
@@ -315,7 +316,7 @@ fn stack_entries([gate, up, down]: [SiteTy; 3], l: usize) -> Result<(), GpuError
 
 /// Weight `name` as a dense site of `rows` rows of `k` values and the launch
 /// family the qwen3moe body's dense owner ([`qwen3moe_dense`]) picks for the
-/// site type of its resident form ([`SiteTy::of_resident`]). A form no site
+/// site type of its resident form ([`site::of_resident`]). A form no site
 /// reads, a type the table names no dense site for, a site whose activation
 /// the arena does not carry, or a weight of another shape, is refused by
 /// name.
@@ -326,7 +327,7 @@ pub(super) fn dense_site(
     k: usize,
 ) -> Result<SiteTy, GpuError> {
     let what = "qwen3moe::Body::load";
-    let Some(ty) = SiteTy::of_resident(w.resident(what, name)?) else {
+    let Some(ty) = site::of_resident(w.resident(what, name)?) else {
         return Err(GpuError::shape(
             what,
             format!("{name} is resident in a form no site launch reads"),
@@ -476,7 +477,8 @@ fn card_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<Option<[SiteTy; 3
         if SiteTy::of_ggml(t.ty).is_none() {
             return Ok(None);
         }
-        site::file_site(file, WHAT_H, &name, shape, SiteTy::ALL).map(Some)
+        let ty = site::file_site(file, WHAT_H, &name, shape, SiteTy::ALL)?;
+        Ok(Some(ty))
     };
     let (Some(gate), Some(up), Some(down)) = (
         site(names::ffn_gate_exps(l), (e * ff, h))?,
@@ -589,9 +591,9 @@ fn placed_plans(
 fn needs_site_kernels(w: &Weights, plans: &[LayerPlan], placed: bool) -> bool {
     let fused = plans
         .iter()
-        .all(|p| matches!(&p.mixer, MixerPlan::Gqa(g) if g.qkv_fused() && g.o_fused()));
+        .all(|p| matches!(&p.mixer, MixerPlan::Gqa(g) if qkv_fused(g) && o_fused(g)));
     !fused
-        || (!placed && plans.iter().any(|p| p.ffn.kq_sel()))
+        || (!placed && plans.iter().any(|p| kq_sel(&p.ffn)))
         || matches!(w.get(&token_embd()), Some(DevWeight::Q8_0 { .. }))
 }
 

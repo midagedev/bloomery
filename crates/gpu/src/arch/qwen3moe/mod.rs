@@ -1,10 +1,11 @@
 //! The qwen3moe family's half of the GPU engine: two chain bodies over one
-//! layer body (`dispatch::layer`) — [`Body`], Qwen3-30B-A3B (every layer
+//! layer program (the chain crate's walk over the ops of `dispatch` and
+//! `delta`, `program`) — [`Body`], Qwen3-30B-A3B (every layer
 //! QK-normed grouped-query attention over the layer's own K/V planes, then
 //! eight routed experts; no shared expert, no dense layer), and [`Body35`],
 //! Qwen3.6-35B-A3B (gated-delta-rule layers between gated GQA layers at head
 //! 256, each layer's experts carrying a sigmoid-gated shared expert; its
-//! file's own next-token layer runs through that layer body, [`Mtp35`]) — each
+//! file's own next-token layer runs through that layer program, [`Mtp35`]) — each
 //! layer's kind a load-time plan (`plan`); [`Body38`], Qwen3.8-Flash-Next,
 //! over its own plan and program (`plan38`, [`program38`]: the layers in
 //! gated-residual streams, a selecting attention, every routed expert on the
