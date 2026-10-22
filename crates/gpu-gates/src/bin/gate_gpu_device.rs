@@ -26,6 +26,7 @@ mod gate {
     use std::sync::Arc;
 
     use bloomery_device::conformance::{self, Harness, Hold, Report};
+    use bloomery_device::fault::LAYER_SHIFT;
     use bloomery_device::{
         Buffer, Device, DeviceError, Elems, FAULT_NONE, FaultSite, LAYER_NONE, Shared, Window,
         WindowMut, check_len,
@@ -119,10 +120,12 @@ mod gate {
                 // before the `Gpu` goes), and `layer <= LAYER_NONE`.
                 unsafe { FaultSink::new(word, layer) }.raise(site);
             } else {
-                // SAFETY: as above: word 0 is a live, aligned u32 of the
-                // allocation, which the card reaches only atomically.
+                // SAFETY: `word` is a `Gpu`'s fault allocation (FAULT_WORDS
+                // live u32s of this context that outlive the launch), so word
+                // 0 is a live, aligned u32 of it, which the card reaches only
+                // atomically.
                 let first = unsafe { DeviceAtomicU32::from_ptr(word) };
-                first.fetch_min((layer << 8) | code, AtomicOrdering::Relaxed);
+                first.fetch_min((layer << LAYER_SHIFT) | code, AtomicOrdering::Relaxed);
             }
         }
     }

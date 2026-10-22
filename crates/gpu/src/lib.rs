@@ -2596,16 +2596,21 @@ impl Gpu {
         self.clear_fault_on(&self.stream)
     }
 
+    /// `stream` belongs to this `Gpu`'s context; a stream of another context
+    /// is refused by name. The one owner of the rule, for the contract's calls
+    /// ([`crate::device`]) and the engine's.
+    pub(crate) fn own_stream(&self, stream: &CudaStream) -> Result<(), GpuError> {
+        if stream.context().cu_ctx() != self.ctx.cu_ctx() {
+            return Err(GpuError::shape("stream", "a stream of another context"));
+        }
+        Ok(())
+    }
+
     /// [`Gpu::clear_fault`] in `stream`'s order: the launches enqueued on it
     /// before may still raise into what it clears, those after it start
     /// clean. A stream of another context is refused by name.
     pub(crate) fn clear_fault_on(&self, stream: &CudaStream) -> Result<(), GpuError> {
-        if stream.context().cu_ctx() != self.ctx.cu_ctx() {
-            return Err(GpuError::shape(
-                "Gpu::clear_fault",
-                "a stream of another context",
-            ));
-        }
+        self.own_stream(stream)?;
         self.ctx.bind_to_thread()?;
         // SAFETY: both ranges lie inside this Gpu's own live allocation of
         // FAULT_ALLOC_WORDS >= FAULT_WORDS u32s, the stream is one of this

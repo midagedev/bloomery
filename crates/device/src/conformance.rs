@@ -35,7 +35,9 @@
 //!     the read that follows it.
 //! 11. **census**: the devices' ordinals and ids are distinct, this device is
 //!     the census's device at its ordinal, the free bytes are below the total,
-//!     and an allocation lowers the free bytes the device reports.
+//!     and an allocation lowers the free bytes the device reports. It reads the
+//!     free bytes twice, so it holds only on a device no other process frees
+//!     memory on meanwhile.
 
 use core::sync::atomic::Ordering;
 use std::process::ExitCode;
@@ -340,7 +342,11 @@ fn window_range<H: Harness>(h: &H) -> Clause {
         return Err("a split at the end is not the whole and nothing".to_string());
     }
     let window = buffer.window_mut(Elems(2), Elems(4)).map_err(why)?;
-    expect_range(window.split_at(Elems(5)), "window", "split at element 5")?;
+    expect_range(
+        window.split_at(Elems(5)),
+        "window",
+        "elements 0..5 pass the window's 4 elements",
+    )?;
 
     // A cast and a span through this backend's windows.
     let arena = d.zeroed::<u8>(s, Elems(32)).map_err(why)?;
@@ -569,7 +575,9 @@ fn submit_registers<H: Harness>(h: &H) -> Clause {
     Ok(Verdict::Pass)
 }
 
-/// How long a clause gives held work to show it ran when it must not have.
+/// How long a clause gives held work to show it ran when it must not have: a
+/// backend that runs held work later than this is not seen, so the wait bounds
+/// the defect and does not prove its absence.
 const HELD: Duration = Duration::from_millis(100);
 
 fn event_wait_holds<H: Harness>(h: &H) -> Clause {
@@ -771,7 +779,9 @@ fn fault_read_waits<H: Harness>(h: &H) -> Clause {
     Ok(Verdict::Pass)
 }
 
-/// The bytes the census clause allocates to see the free bytes fall.
+/// The bytes the census clause allocates to see the free bytes fall: the fall
+/// is read from the device's own free count, so another process freeing more
+/// than this meanwhile turns the clause red.
 const CENSUS_PROBE: usize = 64 << 20;
 
 fn census<H: Harness, C: Census>(h: &H) -> Clause {
