@@ -23,6 +23,8 @@
 use std::fmt::{Debug, Display, Write as _};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
+/// The version of the schema a binary's `--records-schema` prints; a reader
+/// refuses a schema of another version.
 pub const VERSION: u32 = 1;
 
 /// What a value part holds, and how it is written.
@@ -66,9 +68,13 @@ impl Ty {
 /// whether the line may leave it out.
 #[derive(Clone, Copy, Debug)]
 pub struct Field {
+    /// The name the schema and a read call the value by.
     pub name: &'static str,
+    /// What the value holds.
     pub ty: Ty,
+    /// The unit the value is in, empty for a count or a label.
     pub unit: &'static str,
+    /// Whether the line may leave the value out.
     pub opt: bool,
 }
 
@@ -88,6 +94,8 @@ pub enum Part {
 }
 
 impl Part {
+    /// The name of the value (or flag) the part carries, `None` for literal
+    /// text.
     pub fn value_name(&self) -> Option<&'static str> {
         match self {
             Part::Key(f) | Part::Pos(f) => Some(f.name),
@@ -109,9 +117,13 @@ impl Part {
 /// it opens with, its parts, and one sentence on what it says.
 #[derive(Debug)]
 pub struct Kind {
+    /// The name the schema and a reader call the kind by.
     pub name: &'static str,
+    /// The words a line of the kind opens with.
     pub head: &'static str,
+    /// The line after its head, part by part, in order.
     pub parts: &'static [Part],
+    /// One sentence on what the line says.
     pub doc: &'static str,
 }
 
@@ -167,9 +179,9 @@ fn json_str(s: &str) -> String {
 
 /// A binary and the kinds it prints, as its [`at_main`] registered them.
 #[derive(Clone, Copy, Debug)]
-pub struct Prints {
-    pub bin: &'static str,
-    pub kinds: &'static [&'static Kind],
+struct Prints {
+    bin: &'static str,
+    kinds: &'static [&'static Kind],
 }
 
 impl Prints {
@@ -184,7 +196,7 @@ static PRINTS: OnceLock<Prints> = OnceLock::new();
 
 /// A group a shared module's entry needs registered ([`require`]) and the entry's name.
 #[derive(Clone, Copy)]
-pub struct Needs {
+struct Needs {
     group: &'static [&'static Kind],
     who: &'static str,
 }
@@ -247,7 +259,7 @@ fn enforce(held: &Prints, group: &[&'static Kind], who: &str) {
 /// [`require`] under the registration `slot` and the wait `pending`. Once the
 /// process registered, the check takes no lock: an entry that runs per request
 /// pays a few pointer compares.
-pub fn require_in(
+fn require_in(
     slot: &OnceLock<Prints>,
     pending: &Mutex<Vec<Needs>>,
     group: &'static [&'static Kind],
@@ -277,7 +289,7 @@ pub fn require_in(
 
 /// [`at_main`]'s registration of `bin`'s `kinds` in `slot`, then the check of
 /// every group that waited in `pending`.
-pub fn register_in(
+fn register_in(
     slot: &OnceLock<Prints>,
     pending: &Mutex<Vec<Needs>>,
     bin: &'static str,
@@ -328,6 +340,7 @@ pub struct Record {
 }
 
 impl Record {
+    /// A line of `kind`, its head written, no value given yet.
     pub fn new(kind: &'static Kind) -> Record {
         Record {
             kind,
@@ -457,7 +470,7 @@ impl Record {
     }
 
     /// [`Record::line`] under the registration `prints`.
-    pub fn line_under(mut self, prints: Option<&Prints>) -> String {
+    fn line_under(mut self, prints: Option<&Prints>) -> String {
         if let Some(held) = prints
             && !held.holds(self.kind)
         {
@@ -507,9 +520,9 @@ impl Record {
 /// Where [`Record::eprint`] also hands each line, set once by [`tee`].
 static TEE: OnceLock<fn(&str)> = OnceLock::new();
 
-/// Hands every line [`Record::eprint`] prints from now on to `to` as well: a
-/// serving seat's start screen (`serve::screen`) when the seat armed it. A
-/// second call keeps the first.
+/// Hands every line [`Record::eprint`] prints from now on to `to` as well, for
+/// a caller that shows or keeps what the process printed. A second call keeps
+/// the first.
 pub fn tee(to: fn(&str)) {
     let _ = TEE.set(to);
 }
@@ -895,6 +908,7 @@ impl Fields {
         &self.values
     }
 
+    /// The kind the record was read as.
     #[must_use]
     pub fn kind(&self) -> &'static Kind {
         self.kind
@@ -1106,5 +1120,429 @@ mod tests {
         let taken = TAKEN.lock().unwrap();
         assert_eq!(taken.len(), 1, "one line to the tee");
         assert_eq!(taken[0], "core kind count=3 in 2.00 warm");
+    }
+
+    /// A kind of one word, named for its head: the samples the registry and
+    /// the reader tests are made of.
+    macro_rules! word_kind {
+        ($ident:ident, $name:literal) => {
+            static $ident: Kind = Kind {
+                name: $name,
+                head: $name,
+                parts: &[Part::Key(Field {
+                    name: "w",
+                    ty: Ty::Word,
+                    unit: "",
+                    opt: false,
+                })],
+                doc: "a sample of one word.",
+            };
+        };
+    }
+
+    word_kind!(ALPHA, "alpha");
+    word_kind!(BETA, "beta");
+    word_kind!(GAMMA, "gamma");
+    word_kind!(DELTA, "delta");
+
+    /// A count, a literal, a float and a word, the last a part the line may
+    /// not leave out: what a refused line is made on.
+    static STEP: Kind = Kind {
+        name: "step",
+        head: "step",
+        parts: &[
+            Part::Key(Field {
+                name: "n",
+                ty: Ty::U64,
+                unit: "",
+                opt: false,
+            }),
+            Part::Lit(" in "),
+            Part::Pos(Field {
+                name: "ms",
+                ty: Ty::F64(1),
+                unit: "ms",
+                opt: false,
+            }),
+            Part::Key(Field {
+                name: "last",
+                ty: Ty::Word,
+                unit: "",
+                opt: false,
+            }),
+        ],
+        doc: "a step.",
+    };
+
+    /// Two kinds that share a head and a first field, and one whose head is the
+    /// other's head and a word more.
+    static ROUND: Kind = Kind {
+        name: "round",
+        head: "round",
+        parts: &[
+            Part::Key(Field {
+                name: "place",
+                ty: Ty::Word,
+                unit: "",
+                opt: false,
+            }),
+            Part::Key(Field {
+                name: "tail",
+                ty: Ty::U64,
+                unit: "",
+                opt: false,
+            }),
+        ],
+        doc: "a round.",
+    };
+    static ROUND_CARD: Kind = Kind {
+        name: "round_card",
+        head: "round",
+        parts: &[
+            Part::Key(Field {
+                name: "place",
+                ty: Ty::Word,
+                unit: "",
+                opt: false,
+            }),
+            Part::Key(Field {
+                name: "card",
+                ty: Ty::Word,
+                unit: "",
+                opt: false,
+            }),
+        ],
+        doc: "a round on a named card.",
+    };
+    static ROUND_SAVE: Kind = Kind {
+        name: "round_save",
+        head: "round save",
+        parts: &[Part::Key(Field {
+            name: "positions",
+            ty: Ty::U64,
+            unit: "",
+            opt: false,
+        })],
+        doc: "a round's save.",
+    };
+
+    /// A kind that reads any line of its head, and the kind whose head is that
+    /// head and a word more: the longer head is read first.
+    static NOTE: Kind = Kind {
+        name: "note",
+        head: "note",
+        parts: &[
+            Part::Lit(" "),
+            Part::Pos(Field {
+                name: "text",
+                ty: Ty::Text,
+                unit: "",
+                opt: false,
+            }),
+        ],
+        doc: "a note.",
+    };
+    static NOTE_SAVE: Kind = Kind {
+        name: "note_save",
+        head: "note save",
+        parts: &[Part::Key(Field {
+            name: "positions",
+            ty: Ty::U64,
+            unit: "",
+            opt: false,
+        })],
+        doc: "a note's save.",
+    };
+
+    /// A gauge: a word, a signed level, a count the line may leave out, and a
+    /// cap after it.
+    static GAUGE: Kind = Kind {
+        name: "gauge",
+        head: "gauge",
+        parts: &[
+            Part::Key(Field {
+                name: "name",
+                ty: Ty::Word,
+                unit: "",
+                opt: false,
+            }),
+            Part::Key(Field {
+                name: "level",
+                ty: Ty::I64,
+                unit: "",
+                opt: false,
+            }),
+            Part::Key(Field {
+                name: "count",
+                ty: Ty::U64,
+                unit: "",
+                opt: true,
+            }),
+            Part::Key(Field {
+                name: "cap",
+                ty: Ty::U64,
+                unit: "",
+                opt: false,
+            }),
+        ],
+        doc: "a gauge.",
+    };
+
+    /// `missing` names exactly the kinds of the group a list lacks, in the
+    /// group's order.
+    #[test]
+    fn missing_names_the_kinds_a_list_lacks() {
+        static GROUP: &[&Kind] = &[&ALPHA, &BETA, &GAMMA];
+        assert_eq!(missing(&[&BETA], GROUP), ["alpha", "gamma"]);
+        assert!(missing(&[&GAMMA, &BETA, &ALPHA, &DELTA], GROUP).is_empty());
+        assert!(missing(&[], &[]).is_empty());
+    }
+
+    /// A group required after the process registered, and missing from its
+    /// list, panics by name.
+    #[test]
+    #[should_panic(expected = "bin-x enters entry-y without registering its records: beta")]
+    fn a_group_required_after_registration_and_missing_panics() {
+        static LIST: &[&Kind] = &[&ALPHA];
+        static GROUP: &[&Kind] = &[&ALPHA, &BETA];
+        let slot = OnceLock::new();
+        let wait = Mutex::new(Vec::new());
+        register_in(&slot, &wait, "bin-x", LIST);
+        require_in(&slot, &wait, GROUP, "entry-y");
+    }
+
+    /// A group required before the process registered waits, and the
+    /// registration checks it: a missing kind panics at `at_main`, not at the
+    /// entry that asked.
+    #[test]
+    #[should_panic(expected = "bin-x enters entry-y without registering its records: beta")]
+    fn a_group_required_before_registration_is_checked_at_registration() {
+        static LIST: &[&Kind] = &[&ALPHA];
+        static GROUP: &[&Kind] = &[&ALPHA, &BETA];
+        let slot = OnceLock::new();
+        let wait = Mutex::new(Vec::new());
+        require_in(&slot, &wait, GROUP, "entry-y");
+        register_in(&slot, &wait, "bin-x", LIST);
+    }
+
+    /// Groups the registered list holds, required before or after, pass; a
+    /// process that never registers leaves the wait unread.
+    #[test]
+    fn a_group_the_list_holds_passes_and_an_unregistered_process_never_reads_the_wait() {
+        static LIST: &[&Kind] = &[&ALPHA, &BETA];
+        static GROUP: &[&Kind] = &[&BETA];
+        static OTHER: &[&Kind] = &[&GAMMA];
+        let slot = OnceLock::new();
+        let wait = Mutex::new(Vec::new());
+        require_in(&slot, &wait, GROUP, "before");
+        require_in(&slot, &wait, GROUP, "before");
+        assert_eq!(wait.lock().unwrap().len(), 1, "the same entry waits once");
+        register_in(&slot, &wait, "bin-x", LIST);
+        require_in(&slot, &wait, GROUP, "after");
+        assert!(wait.lock().unwrap().is_empty());
+        let never = OnceLock::new();
+        let wait = Mutex::new(Vec::new());
+        require_in(&never, &wait, OTHER, "entry-y");
+        assert_eq!(wait.lock().unwrap().len(), 1);
+    }
+
+    /// Under a binary's registered kinds, one of them renders and a line of
+    /// another kind is refused, naming the kind and the binary.
+    #[test]
+    #[should_panic(expected = "record beta: bin-x does not print this kind")]
+    fn a_kind_its_binary_does_not_print_is_refused() {
+        static LIST: &[&Kind] = &[&ALPHA];
+        let held = Prints {
+            bin: "bin-x",
+            kinds: LIST,
+        };
+        let line = Record::new(&ALPHA).w("w", "a").line_under(Some(&held));
+        assert_eq!(line, "alpha w=a");
+        let _ = Record::new(&BETA).w("w", "b").line_under(Some(&held));
+    }
+
+    #[test]
+    #[should_panic(expected = "record step: ms given where n is due")]
+    fn a_value_given_out_of_order_is_refused_by_name() {
+        let _ = Record::new(&STEP).f("ms", 1.0).line();
+    }
+
+    #[test]
+    #[should_panic(expected = "record step: last left out")]
+    fn a_line_with_a_part_left_out_is_refused_by_name() {
+        let _ = Record::new(&STEP).u("n", 4).f("ms", 1.0).line();
+    }
+
+    /// A line that opens a kind's record and does not read whole is refused by
+    /// name on every read of each kind it opens, never read as no record; a
+    /// line under a kind's head that opens no record refuses nothing; a line
+    /// that opens two kinds sharing a head and reads as neither refuses both.
+    #[test]
+    fn a_line_that_opens_a_record_and_does_not_read_whole_is_refused() {
+        let kinds: &[&'static Kind] = &[&GAUGE, &STEP];
+        let text = "gauge name=a level=-3 cap=9\nstep n=1 in 2.0\ngauge name=b level=4 cap=7";
+        let log = Log::of(text, kinds).named("server.err");
+        let broken = ReadError::Broken {
+            log: "server.err".to_owned(),
+            kind: "step",
+            at: 2,
+            line: "step n=1 in 2.0".to_owned(),
+        };
+        assert_eq!(log.all(&STEP).unwrap_err(), broken);
+        assert_eq!(log.first(&STEP).unwrap_err(), broken);
+        assert_eq!(log.one(&STEP).unwrap_err(), broken);
+        assert!(
+            broken
+                .to_string()
+                .contains("server.err: line 2 opens a `step`")
+        );
+        assert_eq!(log.all(&GAUGE).map(|g| g.len()), Ok(2));
+
+        // Text under a head that opens no record.
+        let log = Log::of(
+            "gauge reading from the probe\ngauge name=a level=1 cap=2",
+            kinds,
+        );
+        assert_eq!(log.one(&GAUGE).and_then(|f| f.u64("cap")), Ok(2));
+
+        // Two kinds that share a head and a first field, and a line that reads
+        // as neither.
+        let both: &[&'static Kind] = &[&ROUND, &ROUND_CARD];
+        let log = Log::of("round place=a tail=oops", both);
+        assert!(matches!(
+            log.first(&ROUND),
+            Err(ReadError::Broken { kind: "round", .. })
+        ));
+        assert!(matches!(
+            log.first(&ROUND_CARD),
+            Err(ReadError::Broken {
+                kind: "round_card",
+                ..
+            })
+        ));
+    }
+
+    /// Kinds that share a head are told apart by the whole line, and a kind
+    /// whose head is another's head and a word more by the longer head first.
+    #[test]
+    fn kinds_that_share_a_head_are_told_apart_by_the_whole_line() {
+        let all: &[&'static Kind] = &[&ROUND, &ROUND_CARD, &ROUND_SAVE];
+        let text = "round place=a card=A6000\nround save positions=46\nround place=b tail=7";
+        let log = Log::of(text, all);
+        let card = log.one(&ROUND_CARD).unwrap();
+        assert_eq!((card.at(), card.line()), (1, "round place=a card=A6000"));
+        assert_eq!(card.word("card"), Ok("A6000"));
+        assert_eq!(
+            log.one(&ROUND_SAVE).and_then(|f| f.u64("positions")),
+            Ok(46)
+        );
+        let tail = log.one(&ROUND).unwrap();
+        assert_eq!((tail.at(), tail.u64("tail")), (3, Ok(7)));
+
+        // The kind that reads any line of its head does not take the longer
+        // head's line.
+        let notes: &[&'static Kind] = &[&NOTE, &NOTE_SAVE];
+        let log = Log::of("note any words at all\nnote save positions=46", notes);
+        assert_eq!(log.all(&NOTE).map(|n| n.len()), Ok(1));
+        assert_eq!(log.one(&NOTE_SAVE).and_then(|f| f.u64("positions")), Ok(46));
+    }
+
+    /// `one` names the kind and the log when the log holds none of it, or more
+    /// than one, and `all` refuses a kind the log is not read by.
+    #[test]
+    fn one_names_an_absent_kind_and_the_log() {
+        let kinds: &[&'static Kind] = &[&GAUGE, &STEP];
+        let log = Log::of("gauge reading from the probe", kinds).named("server.err");
+        let absent = log.one(&GAUGE).unwrap_err();
+        assert_eq!(
+            absent,
+            ReadError::Absent {
+                log: "server.err".to_owned(),
+                kind: "gauge"
+            }
+        );
+        assert_eq!(absent.to_string(), "server.err: no `gauge` record");
+        let twice = Log::of(
+            "gauge name=a level=1 cap=2\ngauge name=a level=1 cap=2",
+            kinds,
+        );
+        assert!(matches!(
+            twice.one(&GAUGE),
+            Err(ReadError::Many {
+                kind: "gauge",
+                n: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            log.all(&ALPHA),
+            Err(ReadError::NotPrinted { kind: "alpha", .. })
+        ));
+    }
+
+    /// An optional part the line leaves out reads as absent, and the parts
+    /// after it keep their own values.
+    #[test]
+    fn an_optional_part_left_out_reads_as_absent_and_the_parts_after_it_keep_their_values() {
+        let kinds: &[&'static Kind] = &[&GAUGE];
+        let with = Log::of("gauge name=a level=-3 count=5 cap=9", kinds)
+            .one(&GAUGE)
+            .unwrap();
+        assert_eq!(
+            (with.opt_u64("count"), with.u64("cap")),
+            (Ok(Some(5)), Ok(9))
+        );
+        let without = Log::of("gauge name=a level=-3 cap=9", kinds)
+            .one(&GAUGE)
+            .unwrap();
+        assert_eq!(
+            (without.opt_u64("count"), without.u64("cap")),
+            (Ok(None), Ok(9))
+        );
+    }
+
+    /// A field read is refused by name when the kind has no such field, when
+    /// the field is of another type, when the line left it out, and when its
+    /// value is past the type's range.
+    #[test]
+    fn field_reads_refuse_by_name() {
+        let kinds: &[&'static Kind] = &[&GAUGE];
+        let gauge = Log::of("gauge name=mid level=-68550098944 cap=9", kinds)
+            .one(&GAUGE)
+            .unwrap();
+        assert_eq!(gauge.i64("level"), Ok(-68_550_098_944));
+        assert_eq!(gauge.word("name"), Ok("mid"));
+        assert!(matches!(
+            gauge.u64("landed"),
+            Err(ReadError::NoField { kind: "gauge", .. })
+        ));
+        assert!(matches!(
+            gauge.u64("level"),
+            Err(ReadError::Type {
+                field: "level",
+                ty: Ty::I64,
+                asked: "u64",
+                ..
+            })
+        ));
+        assert!(matches!(
+            gauge.csv("name"),
+            Err(ReadError::Type {
+                ty: Ty::Word,
+                asked: "csv",
+                ..
+            })
+        ));
+        assert!(matches!(
+            gauge.u64("count"),
+            Err(ReadError::Missing { field: "count", .. })
+        ));
+        let past = Log::of("gauge name=mid level=1 cap=99999999999999999999", kinds)
+            .one(&GAUGE)
+            .unwrap();
+        assert!(matches!(
+            past.u64("cap"),
+            Err(ReadError::Value { field: "cap", .. })
+        ));
     }
 }
