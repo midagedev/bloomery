@@ -368,7 +368,7 @@ fn planned_tensors(
     let mut planned = Vec::new();
     for (name, mut m) in mapped {
         let source = &m.sources[0];
-        let format = modelopt::format_of(&m.placed(&plan)?)?;
+        let format = modelopt::format_of(&m.placed(plan)?)?;
         if m.role == Use::Matrix(Plain::Q8_0) && matches!(format, Format::Bf16 | Format::F32) {
             if m.dims.len() == 3 {
                 return Err(format!(

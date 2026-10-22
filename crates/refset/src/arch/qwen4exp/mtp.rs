@@ -114,7 +114,7 @@ mod tests {
             (other.clone(), DraftFrom::Lever(MTP_LEVER))
         );
         assert_eq!(draft_file(None, &dir), (dir.clone(), DraftFrom::Folder));
-        assert_eq!(super::draft_places(&dir), [dir.clone()]);
+        assert_eq!(super::draft_places(&dir), std::slice::from_ref(&dir));
         assert_eq!(
             draft_file(Some(&other), &dir),
             (other, DraftFrom::Lever(MTP_LEVER))
