@@ -84,6 +84,22 @@ impl MetalRaw {
         // of `new`'s contract.
         Ok(unsafe { HostPages::new(ptr, len) })
     }
+
+    /// The host pages of `len` elements of `T` at byte `at`.
+    ///
+    /// The caller passes a live window's own range and keeps that window
+    /// borrowed for as long as the pages live. A read window's pages are only
+    /// read, and a write window's pages are the only host access to its
+    /// elements.
+    pub(crate) fn window_pages<T: Elem>(
+        &self,
+        at: Bytes,
+        len: Elems,
+    ) -> Result<HostPages<T>, DeviceError> {
+        // SAFETY: the caller passes a live window's own range and keeps the
+        // window borrowed, which is the contract of `pages`.
+        unsafe { self.pages(at, len) }
+    }
 }
 
 /// A buffer the device holds.
