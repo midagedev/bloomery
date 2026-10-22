@@ -35,7 +35,17 @@ runs of the same binary scatter on one machine. *DSpark* is V4.1's draft model f
 
 Paste what each command printed into the pull request: for `contrib-check`, its header block, its unit lines and its
 `DONE` line; for a gate, its summary lines and its exit code. Name the machine as `CONTRIBUTING.md` asks ("Pull requests
-for your own hardware"). CI runs `just contrib-check --tier t0` on every pull request (`.github/workflows/pr.yml`).
+for your own hardware"). CI runs `just contrib-check --tier t0` and the clippy ratchet lint on every pull request
+(`.github/workflows/pr.yml`).
+
+**The pull-request lint.** CI lints the whole workspace with clippy against the ratchet: the `lint` job runs
+`tools/mac-check.sh lint` on x86_64 Linux, which runs the `lint` recipe's own command and ends red when its `^warning:`
+count is above the one number in `tools/lint-ratchet.txt` (the job's log names the count and the ratchet on one line).
+The same lint runs locally: `just mac-lint` on a Mac, and on x86_64 Linux `CUDA_TOOLKIT_PATH=<the headers>
+LIBCLANG_PATH=/usr/lib/llvm-18/lib tools/mac-check.sh lint`, with the CUDA 13.3 headers and libclang this section lists
+(`tools/nightly/fetch-cuda-headers.sh <dir>` fetches the headers from the pinned `.deb` files). When the count is over
+the ratchet, fix the warnings: the ratchet is never raised to make a lint pass (AGENTS.md, "Never relax a gate or a
+lint"); a count below it can bring the number down.
 
 `just pre-review` (`tools/review/local.py`) runs only the reviewer by default, in at most 10 minutes; `--full` adds the
 validator as the pull request review runs it. Nothing is posted, and the pull request's own review stays the review of
@@ -122,8 +132,8 @@ Exceptions:
 - **The Mac's environment file.** `just mac-static` checks the Linux build, so bindgen needs the CUDA 13.3 headers and
   an x86_64 Linux `/usr/include` on the Mac, beside libclang from the Xcode command line tools. The header of
   `tools/mac-check.sh` copies the two directories from the maintainers' workstation. Any x86_64 Linux host with CUDA 13.3
-  has the same two, `/usr/local/cuda-13.3/include` and `/usr/include`; without CUDA there, the headers are in the three
-  `.deb` files `tools/nightly/install.sh` names.
+  has the same two, `/usr/local/cuda-13.3/include` and `/usr/include`; without CUDA there,
+  `tools/nightly/fetch-cuda-headers.sh` unpacks the headers from the `.deb` files `tools/nightly/cuda-debs.tsv` pins.
 
 The CPU guard's synthetic process IDs are derived from each case's shell PID,
 so a low PID in a container cannot replace a fixture process. Its live pair
@@ -380,8 +390,9 @@ cards.
 - **`contrib-check` flags and states:** `--base`, `--require T2`, a `report.txt` per run (the header and the log
   directory carry its facts), the `SKIP` and `DEFER` unit states (no unit is skipped in T0 or T1), and a call of
   `mac-static` on a Mac (`just mac-static` stays the Mac's static tier beside this command).
-- **T1 in CI.** `.github/workflows/pr.yml` runs T0 only: T1 needs three NVIDIA `.deb` files unpacked by hand, more than
-  apt packages (its header).
+- **T1 in CI.** `.github/workflows/pr.yml` runs T0 and the `lint` job only: T1 also builds the host tier in release
+  mode, which the nightly's own machine does (the lint job already fetches the pinned `.deb` headers through
+  `tools/nightly/fetch-cuda-headers.sh`, the same one owner the nightly installer uses).
 - **An example environment file** for local mode (reference row 2).
 - **One model path resolver** for the path literals of reference row 9.
 - **A root-relative set identity,** so the fixtures could sit under another root: it comes as its own change when a

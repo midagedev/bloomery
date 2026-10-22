@@ -30,13 +30,14 @@ The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:3
   pinned nightly: `cargo fmt --check`, `cargo test -p` for each pure crate, the Python tool self-tests and every
   `tools/check-*.sh`. `--tier t1` (the default on x86_64 Linux) adds the host-nightly units. It prints one line per unit
   and a `DONE` line; paste them in your pull request. The card tier (T2) is designed, not built:
-  [`docs/contrib/local-check.md`](docs/contrib/local-check.md). CI runs `just contrib-check --tier t0` on every pull
-  request (`.github/workflows/pr.yml`); that is a smoke test for your change, not landing evidence.
+  [`docs/contrib/local-check.md`](docs/contrib/local-check.md). CI runs `just contrib-check --tier t0` and the clippy
+  ratchet lint (`tools/mac-check.sh lint` against `tools/lint-ratchet.txt`) on every pull request
+  (`.github/workflows/pr.yml`); that is a smoke test for your change, not landing evidence.
 
 ## How a pull request is verified and merged
 
-- **CI.** `just contrib-check --tier t0` runs on every pull request (`.github/workflows/pr.yml`); `main` requires it
-  green.
+- **CI.** `just contrib-check --tier t0` and the clippy ratchet lint (`tools/mac-check.sh lint` against
+  `tools/lint-ratchet.txt`) run on every pull request (`.github/workflows/pr.yml`); `main` requires both green.
 - **Review.** Every ready pull request gets one review from Shingler, our Claude review bot (`.github/workflows/review.yml`; how it
   works: [`.github/review/README.md`](.github/review/README.md)). A clean review approves, and the maintainers usually
   merge an approved pull request; a must-fix review requests changes, which you answer with a push (the next review

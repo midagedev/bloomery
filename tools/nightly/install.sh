@@ -11,7 +11,8 @@
 #   apt        libclang-common-18-dev (clang's builtin headers, which bindgen needs; libclang 18 itself is already installed),
 #              python3-numpy and python3-pil (the Python tool self-tests of tools/check-recipes.sh)
 #   rustup     in bnightly's home, the channel rust-toolchain.toml pins, minimal profile (rustc, cargo, rust-std)
-#   CUDA       the 13.3 headers only, from NVIDIA's apt repository's .deb files, unpacked by hand into opt/cuda-13.3/ (no
+#   CUDA       the 13.3 headers only, from NVIDIA's apt repository's .deb files pinned in tools/nightly/cuda-debs.tsv,
+#              fetched, sha256-checked and unpacked by tools/nightly/fetch-cuda-headers.sh into opt/cuda-13.3/ (no
 #              repository added, no driver, no toolkit, no libcuda: cuda-bindings loads libcuda at run time and the units
 #              open no card). cuda-cudart-dev (cuda.h), libcurand-dev (curand.h), cuda-crt (crt/host_config.h).
 #   just       the prebuilt release binary (the version the Mac's recipes.py self-test is run with; its JSON dump differs between versions)
@@ -27,14 +28,8 @@ if [ -z "$SRC" ] && [ -f "$0" ]; then SRC=$(cd "$(dirname "$0")/../.." && pwd); 
 H=/srv/bloomery-nightly
 STATE=/var/lib/bloomery-nightly
 LIB=/usr/local/lib/bloomery-nightly
-CUDA_REPO=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64
 JUST_VERSION=1.58.0
 JUST_SHA=4a5cc2f53e6f0f8c59092a6cc38291eb729d46a7dd95d3ae582008881b84931d
-CUDA_DEBS=(
-  "cuda-cudart-dev-13-3_13.3.29-1_amd64.deb 600e5cf3685d0afae85970ba02451358068b7b56c954999b9149900ec5d940d9"
-  "libcurand-dev-13-3_10.4.3.29-1_amd64.deb 6c97426757e6bd37d7bda14380dbe463079af00e1693a574460cf6ad09c408bd"
-  "cuda-crt-13-3_13.3.33-1_amd64.deb d7a7893e49a84f7b6bfe4cdbbecbfecd4fe1f30e00cc33e2643352ea317f5be6"
-)
 # From /, with the channel named: run inside the checkout, rustup reads rust-toolchain.toml and installs its whole component
 # list (rust-src, rustc-dev, rust-analyzer, clippy, rustfmt, llvm-tools: about a gigabyte no unit needs).
 cd /
@@ -69,26 +64,15 @@ if ! as_b rustup toolchain list | grep -q "^$CHANNEL"; then
   say "toolchain $CHANNEL installed"
 fi
 
-# ---- CUDA headers ----
+# ---- CUDA headers: the pins and the unpack are tools/nightly/cuda-debs.tsv and fetch-cuda-headers.sh,
+# the one owner CI's lint job shares (it skips everything when the three headers are already there) ----
+as_b bash "$SRC/tools/nightly/fetch-cuda-headers.sh" "$H/opt/cuda-13.3"
+say "CUDA 13.3 headers in place: $(grep -m1 'define CUDA_VERSION' "$H/opt/cuda-13.3/include/cuda.h")"
+
+# ---- just ----
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 chown bnightly: "$T"
-if [ ! -f "$H/opt/cuda-13.3/include/cuda.h" ] || [ ! -f "$H/opt/cuda-13.3/include/curand.h" ] || [ ! -f "$H/opt/cuda-13.3/include/crt/host_config.h" ]; then
-  as_b rm -rf "$H/opt/cuda-13.3"
-  as_b mkdir -p "$H/opt/cuda-13.3/targets/x86_64-linux/include"
-  for row in "${CUDA_DEBS[@]}"; do
-    deb=${row% *}
-    sha=${row#* }
-    as_b curl -sSf -m 600 -o "$T/$deb" "$CUDA_REPO/$deb"
-    [ "$(sha256sum "$T/$deb" | cut -d' ' -f1)" = "$sha" ] || { echo "install: sha256 of $deb differs from the pin" >&2; exit 1; }
-    as_b bash -c 'x=$3/x && mkdir -p "$x" && dpkg-deb --fsys-tarfile "$1" | tar -x -C "$x" --wildcards "./usr/local/cuda-13.3/targets/x86_64-linux/include/*" &&
-      cp -a "$x/usr/local/cuda-13.3/targets/x86_64-linux/include/." "$2/" && rm -rf "$x"' _ "$T/$deb" "$H/opt/cuda-13.3/targets/x86_64-linux/include" "$T"
-  done
-  as_b ln -sfn targets/x86_64-linux/include "$H/opt/cuda-13.3/include"
-  say "CUDA 13.3 headers unpacked: $(grep -m1 'define CUDA_VERSION' "$H/opt/cuda-13.3/include/cuda.h")"
-fi
-
-# ---- just ----
 if [ "$(as_b "$H/bin/just" --version 2> /dev/null || true)" != "just $JUST_VERSION" ]; then
   as_b mkdir -p "$H/bin"
   as_b curl -sSfL -m 300 -o "$T/just.tgz" "https://github.com/casey/just/releases/download/$JUST_VERSION/just-$JUST_VERSION-x86_64-unknown-linux-musl.tar.gz"

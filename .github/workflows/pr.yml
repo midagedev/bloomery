@@ -1,10 +1,13 @@
-# The off-box check on every pull request and every push to main: `just contrib-check --tier t0` (tools/contrib-check.sh):
-# cargo fmt --check, `cargo test -p` for each pure crate, the Python tool self-tests and every tools/check-*.sh.
+# The off-box checks on every pull request and every push to main: `just contrib-check --tier t0`
+# (tools/contrib-check.sh): cargo fmt --check, `cargo test -p` for each pure crate, the Python tool
+# self-tests and every tools/check-*.sh; and the `lint` job below, the clippy ratchet
+# (tools/mac-check.sh lint, the same count and compare the Mac and the box use).
 #
-# Tier t1 (the host-nightly units) is not run here. It needs the CUDA 13.3 headers (cuda.h, curand.h, crt/host_config.h), and
-# those come from three .deb files of NVIDIA's download site that tools/nightly/install.sh checks against pinned sha256 and
-# unpacks by hand: more than apt packages (Ubuntu's own CUDA packages are another version). It also builds the host tier in
-# release mode. The nightly (tools/nightly/run.sh) runs t1 on a machine made for it.
+# Tier t1 (the host-nightly units) is not run here. It needs the CUDA 13.3 headers (cuda.h, curand.h,
+# crt/host_config.h) and builds the host tier in release mode; the lint job needs the headers too, and
+# they come from the .deb files pinned in tools/nightly/cuda-debs.tsv, fetched, sha256-checked and
+# unpacked by tools/nightly/fetch-cuda-headers.sh — more than apt packages (Ubuntu's own CUDA packages
+# are another version). The nightly (tools/nightly/run.sh) runs t1 on a machine made for it.
 #
 # This is a smoke test of a change, never landing evidence: the gates run on the maintainers' workstation.
 name: PR check
@@ -76,3 +79,76 @@ jobs:
         env:
           RUSTFLAGS: -C target-cpu=x86-64-v3
         run: just contrib-check --tier t0
+
+  # The clippy ratchet: `tools/mac-check.sh lint` runs the `lint` recipe's own clippy command
+  # (tools/recipes.py box-command) natively on x86_64 Linux and ends red when the `^warning:` count is
+  # above the one number in tools/lint-ratchet.txt — which is never raised to make a lint pass (AGENTS.md
+  # "Never"). It runs beside t0, not after it, so it adds no wall.
+  lint:
+    name: lint (clippy ratchet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The channel rust-toolchain.toml pins, minimal profile plus clippy and rustfmt (tools/mac-check.sh
+      # reads the same channel from the file and resolves the toolchain's own bin directory).
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml | head -1)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+
+      # recipes.py reads the justfile through `just --dump`; the version and sha256 are the nightly's pin.
+      - name: Install just
+        run: |
+          version=$(sed -n 's/^JUST_VERSION=//p' tools/nightly/install.sh)
+          sha=$(sed -n 's/^JUST_SHA=//p' tools/nightly/install.sh)
+          test -n "$version" && test -n "$sha"
+          curl -sSfL -o "$RUNNER_TEMP/just.tgz" "https://github.com/casey/just/releases/download/$version/just-$version-x86_64-unknown-linux-musl.tar.gz"
+          echo "$sha  $RUNNER_TEMP/just.tgz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$RUNNER_TEMP/just.tgz" -C "$HOME/.local/bin" just
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # bindgen needs libclang itself (libclang1-18) and clang's builtin headers (libclang-common-18-dev) —
+      # the same 18 the nightly host's machine installs (tools/nightly/install.sh).
+      - name: Install libclang
+        run: sudo apt-get install -y --no-install-recommends libclang1-18 libclang-common-18-dev
+
+      # The CUDA 13.3 headers crates/gpu and the crates linking it bindgen, fetched and sha256-checked from
+      # the one pinned list (tools/nightly/cuda-debs.tsv, shared with the nightly installer); the cache
+      # holds the unpacked directory keyed on that list's hash, so a repin refetches and an unchanged pin
+      # restores. The fetch script skips the download when the cache restored the headers.
+      - name: Cache the CUDA headers
+        uses: actions/cache@v4
+        with:
+          path: ~/opt/cuda-13.3
+          key: cuda-13-3-headers-${{ runner.os }}-${{ hashFiles('tools/nightly/cuda-debs.tsv') }}
+      - name: Fetch the CUDA headers
+        run: bash tools/nightly/fetch-cuda-headers.sh "$HOME/opt/cuda-13.3"
+
+      # Clippy's artifacts differ from t0's test builds, so this cache shares no prefix with t0's.
+      # `x86-64-v3` names the CPU level the step below builds at; a cache built at another level is never
+      # restored (t0's step says why).
+      - name: Cache cargo downloads and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: lint-x86-64-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            lint-x86-64-v3-${{ runner.os }}-
+
+      # The same RUSTFLAGS as t0 for the same reason: one cache never restores a build of another CPU
+      # level. Its last line names the warning count and the ratchet on one line.
+      - name: Lint against the ratchet
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3
+        run: |
+          CUDA_TOOLKIT_PATH="$HOME/opt/cuda-13.3" LIBCLANG_PATH=/usr/lib/llvm-18/lib tools/mac-check.sh lint

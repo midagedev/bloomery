@@ -1,0 +1,8 @@
+# The CUDA 13.3 header .debs: one line a package, <file name in NVIDIA's ubuntu2404/x86_64 apt repository>
+# <TAB> <sha256>. tools/nightly/fetch-cuda-headers.sh fetches, checks and unpacks them (the one owner of
+# the unpack steps); tools/nightly/install.sh and the CI lint job (.github/workflows/pr.yml) both go
+# through that script, and the CI cache key is this file's hash. A new pin changes this file alone.
+# cuda-cudart-dev (cuda.h), libcurand-dev (curand.h), cuda-crt (crt/host_config.h).
+cuda-cudart-dev-13-3_13.3.29-1_amd64.deb	600e5cf3685d0afae85970ba02451358068b7b56c954999b9149900ec5d940d9
+libcurand-dev-13-3_10.4.3.29-1_amd64.deb	6c97426757e6bd37d7bda14380dbe463079af00e1693a574460cf6ad09c408bd
+cuda-crt-13-3_13.3.33-1_amd64.deb	d7a7893e49a84f7b6bfe4cdbbecbfecd4fe1f30e00cc33e2643352ea317f5be6
