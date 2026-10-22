@@ -67,6 +67,11 @@
 //! 38. **attn-m**: two query positions match the oracle. // K5-REGISTER
 //! 39. **attn-fault**: KeyCount, CachePos and KvQuant. // K5-REGISTER
 //! 40. **attn-bounds**: a shape or a window the kernel does not take is refused by name. // K5-REGISTER
+//! 41. **head_logit**: sample rows of `output.weight` sit inside the Q6_K norm-on-load band. // K6-REGISTER
+//! 42. **head_id**: a wide margin on the shipped grid names the f64 argmax, and a bit tie names the smaller index. // K6-REGISTER
+//! 43. **head_ticket**: 1000 launches, and each launch's id and candidates are that launch's logits. // K6-REGISTER
+//! 44. **head_nan**: a NaN block scale stays NaN, raises the logit site, and the id is the finite argmax. // K6-REGISTER
+//! 45. **head_bounds**: a shape, a window, an eps or a SIMD-group count the kernel does not take is refused by name, and nothing is encoded. // K6-REGISTER
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
@@ -97,6 +102,8 @@ mod clauses_attention; // K5-REGISTER
 mod clauses_delta; // K4-REGISTER
 #[path = "clauses_experts.rs"] // K3-REGISTER
 mod clauses_experts; // K3-REGISTER
+#[path = "clauses_head.rs"] // K6-REGISTER
+mod clauses_head; // K6-REGISTER
 #[path = "clauses_router.rs"] // K2-REGISTER
 mod clauses_router; // K2-REGISTER
 #[path = "fixture.rs"]
@@ -566,7 +573,7 @@ pub fn main() -> ExitCode {
         Err(e) => Err(e.clone()),
     };
     #[rustfmt::skip] // K2-REGISTER
-    let clauses: [(&'static str, ClauseRun<'_>); 40] = [ // K2-REGISTER
+    let clauses: [(&'static str, ClauseRun<'_>); 45] = [ // K2-REGISTER
         ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
         ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
         ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
@@ -622,6 +629,11 @@ pub fn main() -> ExitCode {
         ("attn-m", Box::new(|| with(clauses_attention::attn_m))), // K5-REGISTER
         ("attn-fault", Box::new(|| with(clauses_attention::attn_fault))), // K5-REGISTER
         ("attn-bounds", Box::new(|| with(clauses_attention::attn_bounds))), // K5-REGISTER
+        ("head_logit", Box::new(|| with(clauses_head::head_logit))), // K6-REGISTER
+        ("head_id", Box::new(|| with(clauses_head::head_id))), // K6-REGISTER
+        ("head_ticket", Box::new(|| with(clauses_head::head_ticket))), // K6-REGISTER
+        ("head_nan", Box::new(|| with(clauses_head::head_nan))), // K6-REGISTER
+        ("head_bounds", Box::new(|| clauses_head::head_bounds(&harness))), // K6-REGISTER
     ];
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)

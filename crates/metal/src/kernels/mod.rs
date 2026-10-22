@@ -17,12 +17,14 @@
 //! The gated delta step ([`delta`]) writes the numerator and the partials that // K4-REGISTER
 //! mat-vec reads. Its kernel is `kernels/delta.metal`. // K4-REGISTER
 //! Decode attention is `kernels/attention.metal`. // K5-REGISTER
+//! The head ([`head`]) is one more pipeline: `kernels/head.metal`, the same ticket. // K6-REGISTER
 
 mod attention; // K5-REGISTER
 mod delta; // K4-REGISTER
 mod embed;
 mod experts; // K3-REGISTER
 mod geometry;
+mod head; // K6-REGISTER
 mod headnorm;
 mod matvec;
 mod router; // K2-REGISTER
@@ -86,6 +88,15 @@ pub use router::{ // K2-REGISTER
     THREADS,      // K2-REGISTER
     TOP_K_MAX,    // K2-REGISTER
 }; // K2-REGISTER
+#[rustfmt::skip] // K6-REGISTER
+pub use head::{ // K6-REGISTER
+    HEAD_GROUPS,      // K6-REGISTER
+    HEAD_K,           // K6-REGISTER
+    HEAD_SIMD_GROUPS, // K6-REGISTER
+    HEAD_THREADS,     // K6-REGISTER
+    HEAD_VOCAB,       // K6-REGISTER
+    HeadParams,       // K6-REGISTER
+}; // K6-REGISTER
 pub use seg::{SegParams, Segment};
 
 use bloomery_device::DeviceError;
@@ -133,6 +144,7 @@ pub struct Kernels {
     /// The gated delta step. // K4-REGISTER
     delta: Pipeline, // K4-REGISTER
     attention: attention::AttentionPipelines, // K5-REGISTER
+    head: Pipeline,    // K6-REGISTER
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -204,6 +216,8 @@ impl Kernels {
             fold_q6: library.pipeline("q6k_down_fold")?, // K3-REGISTER
             delta: library.pipeline("gdn_step")?,  // K4-REGISTER
             attention: attention::AttentionPipelines::new(library)?, // K5-REGISTER
+            // Eight SIMD groups, not the mat-vec count this function was given. // K6-REGISTER
+            head: library.pipeline_with_simdgroups("q6k_head_argmax", 8)?, // K6-REGISTER
             simdgroups,
         })
     }

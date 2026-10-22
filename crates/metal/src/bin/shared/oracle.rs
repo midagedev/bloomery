@@ -206,6 +206,18 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
     }
 }
 
+impl Band {
+    /// The width [`check`] allows one row at `magnitude`, with no residual.
+    ///
+    /// The same width the norm-on-load and the plain store use: the relative
+    /// factor times the terms' magnitudes, and the path's absolute floor.
+    #[must_use]
+    pub fn row_width(self, magnitude: f64) -> f64 {
+        let floor = self.ops as f64 * f64::from(f32::MIN_POSITIVE);
+        self.factor * magnitude * (1.0 + U) + floor
+    }
+}
+
 /// The head scale the head-normed mat-vec applies to a head's columns:
 /// `1 / sqrt(sum / cols + eps)`, in f64, from the head's partial sums.
 pub fn head_scale(partials: &[f64], cols_per_head: usize, eps: f64) -> f64 {

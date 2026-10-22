@@ -346,6 +346,50 @@ pub const MUTANTS: &[Mutant] = &[
             1,                                                           // K5-REGISTER
         )], // K5-REGISTER
     }, // K5-REGISTER
+    Mutant {
+        // K6-REGISTER
+        name: "head_logit",                 // K6-REGISTER
+        clause: "head_logit",               // K6-REGISTER
+        why: "the stored logit is doubled", // K6-REGISTER
+        edits: &[(
+            "float head_logit_scale = 1.f", // K6-REGISTER
+            "float head_logit_scale = 2.f", // K6-REGISTER
+            1,                              // K6-REGISTER
+        )], // K6-REGISTER
+    }, // K6-REGISTER
+    Mutant {
+        // K6-REGISTER
+        name: "head_id",                                // K6-REGISTER
+        clause: "head_id",                              // K6-REGISTER
+        why: "the threadgroup keeps the smaller logit", // K6-REGISTER
+        edits: &[("head_takes = v > best_v", "head_takes = v < best_v", 1)], // K6-REGISTER
+    }, // K6-REGISTER
+    Mutant {
+        // K6-REGISTER
+        name: "head_ticket",                                      // K6-REGISTER
+        clause: "head_ticket",                                    // K6-REGISTER
+        why: "the step id is one past the selected row",          // K6-REGISTER
+        edits: &[("step_id[0] = id", "step_id[0] = id + 1u", 1)], // K6-REGISTER
+    }, // K6-REGISTER
+    Mutant {
+        // K6-REGISTER
+        name: "head_nan",                         // K6-REGISTER
+        clause: "head_nan",                       // K6-REGISTER
+        why: "a non-finite logit raises nothing", // K6-REGISTER
+        edits: &[(
+            // K6-REGISTER
+            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);", // K6-REGISTER
+            "",                                                      // K6-REGISTER
+            1,                                                       // K6-REGISTER
+        )], // K6-REGISTER
+    }, // K6-REGISTER
+    Mutant {
+        // K6-REGISTER
+        name: "head_bounds",                          // K6-REGISTER
+        clause: "head_bounds",                        // K6-REGISTER
+        why: "every thread returns before it writes", // K6-REGISTER
+        edits: &[("head_bounds_gate == 0u", "head_bounds_gate == 1u", 1)], // K6-REGISTER
+    }, // K6-REGISTER
 ];
 
 /// The mutant of this name.
