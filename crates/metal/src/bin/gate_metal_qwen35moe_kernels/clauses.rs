@@ -6,13 +6,16 @@ use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, Elems};
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::kernels::{BLOCK_VALUES, EmbedParams, MatvecParams, Mode, NormOnLoad, Quant};
+use bloomery_metal::kernels::{
+    BLOCK_VALUES, EmbedParams, HEAD_COLS, Kernels, MatvecParams, Mode, NormOnLoad,
+    PARTIALS_PER_HEAD, Quant, SegParams, Segment, VALUE_HEADS,
+};
 use bloomery_metal::stream::MetalStream;
 use gguf::quant::GgmlType;
 
 use super::fixture::Fixture;
 use super::oracle::{self, Kind};
-use super::{Harness, Launch, ModeSpec, SENTINEL_BITS, flag};
+use super::{Harness, HeadNormLaunch, Launch, ModeSpec, SENTINEL_BITS, SegLaunch, flag};
 
 /// The layer the clauses launch in: a model layer, so a raise is told apart
 /// from a launch that names none.
@@ -529,6 +532,7 @@ pub fn metallib_equals_source(
             device,
             stream,
             kernels: &kernels,
+            library,
         };
         suite_outputs(&h, fixture)
     };
@@ -926,4 +930,419 @@ pub fn block_shape() -> Clause {
     Ok(Verdict::Noted(
         "Q4_K and Q6_K block bytes and values are gguf's".to_string(),
     ))
+}
+
+/// The ggml type a mat-vec reads.
+fn ggml_type(quant: Quant) -> GgmlType {
+    match quant {
+        Quant::Q4K => GgmlType::Q4_K,
+        Quant::Q6K => GgmlType::Q6_K,
+    }
+}
+
+/// The groups of the segmented launch: the tensors of one type and one width
+/// that a layer's projections are.
+struct SegGroup {
+    quant: Quant,
+    /// The layer's norm gain, the width's gain.
+    gain: &'static str,
+    /// The tensors: their names and their row counts.
+    tensors: Vec<(&'static str, usize)>,
+}
+
+/// Every segment of a segmented dispatch is the same bits as the same tensor
+/// run alone: the kernel does not change the order of a row's sum, and the
+/// norm on the load is the norm the tensor alone gets.
+pub fn seg_bit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let eps = fixture.rms_eps()?;
+    let cols = 2048;
+    let groups = [
+        SegGroup {
+            quant: Quant::Q4K,
+            gain: "blk.0.attn_norm.weight",
+            tensors: vec![
+                ("blk.0.attn_qkv.weight", 8192),
+                ("blk.0.attn_gate.weight", 4096),
+            ],
+        },
+        SegGroup {
+            quant: Quant::Q4K,
+            gain: "blk.1.attn_norm.weight",
+            tensors: vec![
+                ("blk.1.attn_q.weight", 8192),
+                ("blk.1.attn_k.weight", 512),
+                ("blk.1.attn_v.weight", 512),
+            ],
+        },
+        SegGroup {
+            quant: Quant::Q6K,
+            gain: "blk.2.attn_norm.weight",
+            tensors: vec![("blk.2.attn_qkv.weight", 8192)],
+        },
+    ];
+    let mut parts = Vec::new();
+    for (i, group) in groups.iter().enumerate() {
+        let gain = fixture.f32s(group.gain, cols)?;
+        let x = oracle::activations(cols, 0x5E6 + i as u64, 1.0);
+        let mut segments: Vec<(usize, &[u8])> = Vec::new();
+        let mut rows = 0usize;
+        for (name, n) in &group.tensors {
+            segments.push((*n, fixture.rows(name, ggml_type(group.quant), cols, *n)?));
+            rows += n;
+        }
+        let got = h.seg(&SegLaunch {
+            quant: group.quant,
+            cols,
+            segments: segments.clone(),
+            x: &x,
+            y0: &sentinel_rows(rows),
+            gain: &gain,
+            eps,
+            layer: LAYER,
+        })?;
+        if let Some(fault) = h.fault()? {
+            return Err(format!("the segmented launch raised {fault}"));
+        }
+        let mut at = 0usize;
+        for (j, (n, bytes)) in segments.iter().enumerate() {
+            let alone = h.matvec(&Launch {
+                quant: group.quant,
+                rows: *n,
+                cols,
+                weights: bytes,
+                x: &x,
+                y0: &sentinel_rows(*n),
+                mode: ModeSpec::Norm {
+                    gain: &gain,
+                    eps,
+                    layer: LAYER,
+                },
+            })?;
+            for (k, (a, b)) in got[at..at + n].iter().zip(alone.iter()).enumerate() {
+                if a.to_bits() != b.to_bits() {
+                    return Err(format!(
+                        "{} segment {j} row {k}: the segment read {a:?}, the tensor alone read {b:?}",
+                        group.tensors[j].0
+                    ));
+                }
+            }
+            at += n;
+        }
+        parts.push(format!(
+            "{} {} segments",
+            group.tensors[0].0,
+            group.tensors.len()
+        ));
+    }
+    noted(parts)
+}
+
+/// The bounds of a segment list: a list the kernel cannot run is refused by
+/// name, and nothing is encoded for it. A dispatch of the most segments writes
+/// every row and nothing past the last.
+pub fn seg_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let eps = fixture.rms_eps()?;
+    let cols = 2048;
+    let gain = fixture.f32s("blk.0.attn_norm.weight", cols)?;
+    let x = oracle::activations(cols, 0x5E7, 1.0);
+    let names = [
+        ("blk.0.attn_qkv.weight", 8192usize),
+        ("blk.0.attn_gate.weight", 4096),
+        ("blk.1.attn_q.weight", 8192),
+        // A tail: not a multiple of the rows a threadgroup owns.
+        ("blk.1.attn_k.weight", 511),
+    ];
+    let mut segments: Vec<(usize, &[u8])> = Vec::new();
+    let mut rows = 0usize;
+    for (name, n) in names {
+        segments.push((n, fixture.rows(name, GgmlType::Q4_K, cols, n)?));
+        rows += n;
+    }
+    let got = h.seg(&SegLaunch {
+        quant: Quant::Q4K,
+        cols,
+        segments,
+        x: &x,
+        y0: &sentinel_rows(rows),
+        gain: &gain,
+        eps,
+        layer: LAYER,
+    })?;
+    if let Some(fault) = h.fault()? {
+        return Err(format!("the segmented launch raised {fault}"));
+    }
+    if let Some(r) = got.iter().position(|v| v.to_bits() == SENTINEL_BITS) {
+        return Err(format!("row {r} was not written"));
+    }
+
+    // The refusals: a list the kernel cannot run.
+    let device = h.device;
+    let stream = h.stream;
+    let bytes = cols / BLOCK_VALUES * Quant::Q4K.block_bytes();
+    let weights = device.upload(stream, &vec![0u8; bytes * 16]).map_err(why)?;
+    let x = device.upload(stream, &vec![0f32; cols + 4]).map_err(why)?;
+    let mut y = device.upload(stream, &vec![1f32; 64]).map_err(why)?;
+    let gain = device.upload(stream, &vec![1f32; cols + 4]).map_err(why)?;
+    let segment = |cols: usize, rows: usize, weight_blocks: usize, out_offset: usize| Segment {
+        cols,
+        rows,
+        weight_blocks,
+        out_offset,
+    };
+    let cases: [(&str, Vec<Segment>, &str); 4] = [
+        (
+            "segments of different widths",
+            vec![
+                segment(cols, 8, 0, 0),
+                segment(cols + BLOCK_VALUES, 8, 8, 8),
+            ],
+            "columns",
+        ),
+        (
+            "a segment of no rows",
+            vec![segment(cols, 0, 0, 0)],
+            "no rows",
+        ),
+        (
+            "more segments than a dispatch runs",
+            vec![
+                segment(cols, 8, 0, 0),
+                segment(cols, 8, 8, 8),
+                segment(cols, 8, 16, 16),
+                segment(cols, 8, 24, 24),
+                segment(cols, 8, 32, 32),
+            ],
+            "at most",
+        ),
+        (
+            "segments whose outputs overlap",
+            vec![segment(cols, 8, 0, 0), segment(cols, 8, 8, 4)],
+            "overlap",
+        ),
+    ];
+    let count = cases.len();
+    for (what, segments, needle) in cases {
+        let refused = h.encode(|encoder| {
+            h.kernels.matvec_seg(
+                encoder,
+                SegParams {
+                    quant: Quant::Q4K,
+                    segments,
+                    weights: weights.window(Elems(0), Elems(bytes * 16))?,
+                    x: x.window(Elems(0), Elems(cols))?,
+                    y: y.window_mut(Elems(0), Elems(64))?,
+                    norm: NormOnLoad {
+                        gain: gain.window(Elems(0), Elems(cols))?,
+                        eps: 1e-6,
+                        fault: device.fault_word(),
+                        layer: LAYER,
+                    },
+                },
+            )
+        });
+        match refused {
+            Ok(()) => return Err(format!("{what} was accepted")),
+            Err(text) if !text.contains(needle) => {
+                return Err(format!(
+                    "{what} was refused without naming {needle}: {text}"
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    let mut back = vec![0f32; 64];
+    device
+        .read(stream, y.whole().map_err(why)?, &mut back)
+        .map_err(why)?;
+    if back.iter().any(|&v| v != 1.0) {
+        return Err("a refused launch wrote".to_string());
+    }
+    Ok(Verdict::Noted(format!(
+        "{count} refusals, each by name, nothing written, {rows} rows of a four-segment dispatch written"
+    )))
+}
+
+/// The head-normed residual mat-vec against the f64 oracle: the gated
+/// numerator and the heads' partial sums are the inputs.
+pub fn headnorm(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let eps = fixture.rms_eps()?;
+    let t = Tensor::q4k("blk.0.ssm_out.weight", HEAD_COLS * VALUE_HEADS, 2048);
+    let weights = t.bytes(fixture)?;
+    let g = oracle::activations(HEAD_COLS * VALUE_HEADS, 0x5E8, 1.0);
+    let partials = head_partials();
+    let x = head_scaled(&g, &partials, eps);
+    let reference = oracle::reference(Quant::Q4K, weights, 2048, HEAD_COLS * VALUE_HEADS, &x)?;
+    let resid = oracle::activations(2048, 0x5E9, 2.0);
+    let got = h.headnorm(&HeadNormLaunch {
+        rows: 2048,
+        cols: HEAD_COLS * VALUE_HEADS,
+        weights,
+        g: &g,
+        partials: &partials,
+        y0: &resid,
+        eps,
+        layer: LAYER,
+    })?;
+    if let Some(fault) = h.fault()? {
+        return Err(format!("the launch raised {fault}"));
+    }
+    let kind = Kind::HeadNorm(oracle::HeadGeometry {
+        heads: VALUE_HEADS,
+        cols_per_head: HEAD_COLS,
+        partials_per_head: PARTIALS_PER_HEAD,
+    });
+    let band = oracle::band(Quant::Q4K, (HEAD_COLS * VALUE_HEADS) / BLOCK_VALUES, kind);
+    let worst = oracle::check(&got, &reference, band, kind, Some(&resid))?;
+    Ok(Verdict::Noted(format!(
+        "the out projection's worst error over its band: {worst:.3}"
+    )))
+}
+
+/// A head the norm cannot take: the gate's site is raised and the head is
+/// NaN, not a zero head.
+pub fn headnorm_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let eps = fixture.rms_eps()?;
+    let t = Tensor::q4k("blk.0.ssm_out.weight", HEAD_COLS * VALUE_HEADS, 2048);
+    let weights = t.bytes(fixture)?;
+    let g = oracle::activations(HEAD_COLS * VALUE_HEADS, 0x5E8, 1.0);
+    let partials = head_partials();
+    let resid = oracle::activations(2048, 0x5E9, 2.0);
+    let mut bad_partials = partials.clone();
+    bad_partials[5 * PARTIALS_PER_HEAD + 3] = f32::INFINITY;
+    let mut bad_g = g.clone();
+    bad_g[17] = f32::NAN;
+    for (what, g, partials) in [
+        ("a partial that is not finite", &g, &bad_partials),
+        ("a gated numerator that is not finite", &bad_g, &partials),
+    ] {
+        h.clear_fault()?;
+        let got = h.headnorm(&HeadNormLaunch {
+            rows: 2048,
+            cols: HEAD_COLS * VALUE_HEADS,
+            weights,
+            g,
+            partials,
+            y0: &resid,
+            eps,
+            layer: LAYER,
+        })?;
+        expect_fault(h, what, FaultSite::LinearGate)?;
+        if let Some(r) = got.iter().position(|v| !v.is_nan()) {
+            return Err(format!("{what}: row {r} is {:?}, not NaN", got[r]));
+        }
+    }
+    h.clear_fault()?;
+    Ok(Verdict::Noted(
+        "a partial and a gated numerator that are not finite each raised the gate site, every row NaN"
+            .to_string(),
+    ))
+}
+
+/// The Q6_K mat-vec at eight SIMD groups in a threadgroup is the same bits as
+/// at two: the count is a geometry, not an arithmetic.
+pub fn nsg(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let eight = Kernels::with_simdgroups(h.library, 8).map_err(why)?;
+    let many = Harness {
+        device: h.device,
+        stream: h.stream,
+        kernels: &eight,
+        library: h.library,
+    };
+    let mut parts = Vec::new();
+    for (name, cols, rows) in [
+        ("blk.2.attn_qkv.weight", 2048usize, 8192usize),
+        ("blk.2.ffn_down_shexp.weight", 512, 2048),
+        ("blk.3.attn_v.weight", 2048, 512),
+        ("output.weight", 2048, 4096),
+    ] {
+        let bytes = fixture.rows(name, GgmlType::Q6_K, cols, rows)?;
+        let x = oracle::activations(cols, 0x5EA, 1.0);
+        let two = h.matvec(&Launch {
+            quant: Quant::Q6K,
+            rows,
+            cols,
+            weights: bytes,
+            x: &x,
+            y0: &sentinel_rows(rows),
+            mode: ModeSpec::Store,
+        })?;
+        let many_rows = many.matvec(&Launch {
+            quant: Quant::Q6K,
+            rows,
+            cols,
+            weights: bytes,
+            x: &x,
+            y0: &sentinel_rows(rows),
+            mode: ModeSpec::Store,
+        })?;
+        for (i, (a, b)) in two.iter().zip(many_rows.iter()).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                return Err(format!(
+                    "{name} row {i}: two groups read {a:?}, eight read {b:?}"
+                ));
+            }
+        }
+        parts.push(format!("{name} {rows}x{cols}"));
+    }
+    // A tail: rows that are not a multiple of the sixteen a threadgroup of
+    // eight SIMD groups owns.
+    let tail = 1153;
+    let bytes = fixture.rows_at("output.weight", GgmlType::Q6_K, 2048, 248_320 - tail, tail)?;
+    let x = oracle::activations(2048, 0x5EA, 1.0);
+    let two = h.matvec(&Launch {
+        quant: Quant::Q6K,
+        rows: tail,
+        cols: 2048,
+        weights: bytes,
+        x: &x,
+        y0: &sentinel_rows(tail),
+        mode: ModeSpec::Store,
+    })?;
+    let many_rows = many.matvec(&Launch {
+        quant: Quant::Q6K,
+        rows: tail,
+        cols: 2048,
+        weights: bytes,
+        x: &x,
+        y0: &sentinel_rows(tail),
+        mode: ModeSpec::Store,
+    })?;
+    for (i, (a, b)) in two.iter().zip(many_rows.iter()).enumerate() {
+        if a.to_bits() != b.to_bits() {
+            return Err(format!(
+                "the tail row {i}: two groups read {a:?}, eight read {b:?}"
+            ));
+        }
+    }
+    parts.push(format!("output.weight tail {tail}x2048"));
+    Ok(Verdict::Noted(format!(
+        "{} shapes, every row the same bits at two and eight SIMD groups",
+        parts.len()
+    )))
+}
+
+/// The heads' partial sums of the squares of their values: positive, and of
+/// the size the values of a head have.
+fn head_partials() -> Vec<f32> {
+    (0..VALUE_HEADS * PARTIALS_PER_HEAD)
+        .map(|i| 0.5 + (i % 7) as f32 * 0.25)
+        .collect()
+}
+
+/// The input the head-normed mat-vec dots with: the gated numerator times the
+/// scale of the head each column belongs to.
+fn head_scaled(g: &[f32], partials: &[f32], eps: f32) -> Vec<f64> {
+    let scales: Vec<f64> = (0..VALUE_HEADS)
+        .map(|head| {
+            let head_partials: Vec<f64> = partials
+                [head * PARTIALS_PER_HEAD..(head + 1) * PARTIALS_PER_HEAD]
+                .iter()
+                .map(|&v| f64::from(v))
+                .collect();
+            oracle::head_scale(&head_partials, HEAD_COLS, f64::from(eps))
+        })
+        .collect();
+    (0..g.len())
+        .map(|c| f64::from(g[c]) * scales[c / HEAD_COLS])
+        .collect()
 }

@@ -37,7 +37,9 @@ SOFTWARE.
 `crates/metal/kernels/matvec_q4k.metal` and `crates/metal/kernels/matvec_q6k.metal` are adapted from the Metal
 kernels `kernel_mul_mv_q4_K_f32` and `kernel_mul_mv_q6_K_f32` of llama.cpp (`ggml/src/ggml-metal/kernels/mul_mv.metal`,
 commit `36a73916e`): the lane maps, the block loops, the nibble and 6-bit unpacking, the row loop and the SIMD-group
-reduction are llama.cpp's; each file's header says what differs. The licence is the one above, the ggml authors' MIT
+reduction are llama.cpp's; each file's header says what differs. The segmented entries of the two files and the
+head-normed entry of the Q4_K file are the same body with the segment's rows or the input's head scale in place of the
+one tensor's rows: the parts named above are the adapted ones. The licence is the one above, the ggml authors' MIT
 licence, whose text applies to those two files.
 
 ## cuda-oxide

@@ -35,7 +35,7 @@ bloomery-placement = { path = "../placement" }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
-objc2-metal = { workspace = true }
+objc2-metal = { workspace = true, features = ["MTLFunctionConstantValues", "MTLDataType"] }
 dispatch2 = { workspace = true }
 # The fixture's tensors and their dequantization: the kernel gate's oracle.
 bloomery-gguf = { path = "../gguf" }

@@ -1,0 +1,128 @@
+//! The head-normed residual mat-vec: a gated delta net's out projection.
+//!
+//! The input of the projection is the gated numerator `g` (the delta step's
+//! output, the norm gain and the gate activation, per value head) times the
+//! norm scale of the head each column belongs to. The scale comes from the
+//! head's partial sums of the squares of its values, which the delta kernel
+//! leaves in `partials[head][block]`: the head's sum is the sum of its eight
+//! partials, and the scale is `1 / sqrt(sum / HEAD_COLS + eps)`.
+//!
+//! The layout of `g` and `partials` is the contract with the delta kernel: the
+//! value heads' count and width are the geometry's constants
+//! ([`VALUE_HEADS`], [`HEAD_COLS`], [`PARTIALS_PER_HEAD`]).
+
+use bloomery_device::{DeviceError, Window, WindowMut};
+
+use crate::device::MetalDevice;
+use crate::encode::{Binding, ComputeEncoder};
+use crate::fault::MetalFaultWord;
+
+use super::geometry::{
+    BLOCK_VALUES, HEAD_COLS, PARTIALS_PER_HEAD, ROWS_PER_SIMD_GROUP, VALUE_HEADS,
+};
+use super::matvec::Quant;
+use super::{Kernels, args_bytes, check_window_len, word};
+
+/// The head-normed residual mat-vec's parameters: the out projection's weights,
+/// the gated numerator, the heads' partial sums, and the output the residual
+/// is added into.
+pub struct HeadNormParams<'w> {
+    /// The output rows: the model's hidden width.
+    pub rows: usize,
+    /// The input columns: one value head's gated output after another.
+    pub cols: usize,
+    /// The out projection's weights.
+    pub weights: Window<'w, u8, MetalDevice>,
+    /// The gated numerator, one value per input column.
+    pub g: Window<'w, f32, MetalDevice>,
+    /// The partial sums of the squares of the values: every head's row of
+    /// [`PARTIALS_PER_HEAD`] partials.
+    pub partials: Window<'w, f32, MetalDevice>,
+    /// The output, the residual added into it.
+    pub y: WindowMut<'w, f32, MetalDevice>,
+    /// The epsilon of the head norm.
+    pub eps: f32,
+    /// The fault word a raise lands in.
+    pub fault: &'w MetalFaultWord,
+    /// The layer a raise is recorded in.
+    pub layer: u32,
+}
+
+/// The shape of a head-normed launch, once its windows were checked against it.
+struct Shape {
+    nblocks: u32,
+    rows: u32,
+    groups: usize,
+}
+
+fn refuse(detail: String) -> DeviceError {
+    DeviceError::Range {
+        what: "headnorm matvec",
+        detail,
+    }
+}
+
+/// The shape of `p`, refused by name when the width is not the heads' own, when
+/// a window is not the shape's, or when a count passes the kernel's 32-bit
+/// words.
+fn check(p: &HeadNormParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
+    if p.rows == 0 {
+        return Err(refuse("no rows".to_string()));
+    }
+    if p.cols != VALUE_HEADS * HEAD_COLS {
+        return Err(refuse(format!(
+            "{} columns, the kernel's heads hold {} of {HEAD_COLS}",
+            p.cols, VALUE_HEADS
+        )));
+    }
+    let nblocks = p.cols / BLOCK_VALUES;
+    let weight_bytes = p
+        .rows
+        .checked_mul(nblocks)
+        .and_then(|blocks| blocks.checked_mul(Quant::Q4K.block_bytes()))
+        .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.cols)))?;
+    check_window_len("headnorm matvec", "weights", p.weights.len(), weight_bytes)?;
+    check_window_len("headnorm matvec", "g", p.g.len(), p.cols)?;
+    check_window_len(
+        "headnorm matvec",
+        "partials",
+        p.partials.len(),
+        VALUE_HEADS * PARTIALS_PER_HEAD,
+    )?;
+    check_window_len("headnorm matvec", "y", p.y.len(), p.rows)?;
+    let start = p.weights.byte_range()?.start.get();
+    if !start.is_multiple_of(2) {
+        return Err(refuse(format!(
+            "the weights start {start} bytes into their buffer: the kernels read 16-bit words"
+        )));
+    }
+    Ok(Shape {
+        nblocks: word("headnorm matvec", "the block count", nblocks)?,
+        rows: word("headnorm matvec", "the row count", p.rows)?,
+        groups: p.rows.div_ceil(simdgroups * ROWS_PER_SIMD_GROUP),
+    })
+}
+
+impl Kernels {
+    /// Encode one head-normed residual mat-vec dispatch on `encoder`. Every
+    /// window is checked against the shape first; nothing is encoded for a
+    /// launch that is refused.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn headnorm_resid(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: HeadNormParams<'_>,
+    ) -> Result<(), DeviceError> {
+        let shape = check(&p, self.simdgroups)?;
+        let args = args_bytes([shape.rows, shape.nblocks, p.layer, p.eps.to_bits()]);
+        encoder.set_pipeline(&self.headnorm);
+        encoder.set_binding(0, Binding::of(&p.weights)?)?;
+        encoder.set_binding(1, Binding::of(&p.g)?)?;
+        encoder.set_binding(2, Binding::of(&p.partials)?)?;
+        encoder.set_binding(3, Binding::of_mut(&p.y)?)?;
+        encoder.set_binding(4, Binding::bytes(&args)?)?;
+        encoder.set_binding(5, p.fault.binding())?;
+        let threads = self.threads_per_group();
+        encoder.dispatch(shape.groups * threads, threads)
+    }
+}

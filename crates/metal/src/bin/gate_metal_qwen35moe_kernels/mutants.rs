@@ -6,7 +6,9 @@
 //! silently turn a mutant into a no-op.
 //!
 //! `matvec_refusals` has no mutant here: it checks the host module, whose
-//! defect is a source edit of `src/kernels/matvec.rs`, not of a kernel.
+//! defect is a source edit of `src/kernels/matvec.rs`, not of a kernel. The
+//! refusals of `seg_bounds` are the host's too, so that clause's mutant is
+//! the kernel's: a dispatch of the most segments must write every row.
 
 use bloomery_metal::library::SOURCE;
 
@@ -55,7 +57,7 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "norm_on_load",
         why: "a norm that cannot take its input writes NaN rows and raises nothing",
         edits: &[(
-            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);",
+            "raise(faults, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);",
             "",
             2,
         )],
@@ -110,6 +112,55 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "row_tail_reads",
         why: "the rows past the last read past the weights window",
         edits: &[(ROW_POINTER, ROW_POINTER_RAW, 2), (EARLY_RETURN, "", 2)],
+    },
+    Mutant {
+        name: "seg_weight_offset",
+        clause: "seg_bit",
+        why: "a segment reads the weights of the first segment",
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 2)],
+    },
+    Mutant {
+        name: "seg_last_segment",
+        clause: "seg_bounds",
+        why: "the search for the segment stops before the last one",
+        edits: &[(
+            "for (uint i = 0; i < args.nseg; ++i) {",
+            "for (uint i = 0; i < 3 && i < args.nseg; ++i) {",
+            2,
+        )],
+    },
+    Mutant {
+        name: "headnorm_divisor",
+        clause: "headnorm",
+        why: "the head scale divides the sum by twice the head's columns",
+        edits: &[(
+            "sum / float(BLOOMERY_MATVEC_HEAD_COLS)",
+            "sum / float(BLOOMERY_MATVEC_HEAD_COLS * 2)",
+            1,
+        )],
+    },
+    Mutant {
+        name: "headnorm_no_raise",
+        clause: "headnorm_nan",
+        why: "a head the norm cannot take raises nothing",
+        edits: &[
+            (
+                "raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",
+                "",
+                1,
+            ),
+            (
+                "raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",
+                "",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "nsg_first_row",
+        clause: "nsg",
+        why: "the first row of a threadgroup ignores the SIMD group count",
+        edits: &[("BLOOMERY_MATVEC_SIMD_GROUPS + sgitg", "2 + sgitg", 9)],
     },
 ];
 

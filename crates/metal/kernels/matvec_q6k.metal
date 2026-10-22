@@ -1,17 +1,20 @@
 // The Q6_K mat-vec: the same three entries as matvec_q4k.metal over
-// block_q6_K, one dispatch each.
+// block_q6_K, one dispatch each, and the segmented entry beside them.
 //
 //   q6k_matvec        y = W . x
 //   q6k_matvec_norm   y = W . rms_norm(x, gain, eps)
 //   q6k_matvec_resid  y = y + W . x, in place
+//   q6k_matvec_seg    the row segments of up to four tensors of one type and
+//                     one width, in one dispatch
 //
 // Adapted from llama.cpp's kernel_mul_mv_q6_K_f32 (MIT licence; see
 // THIRD_PARTY_NOTICES.md):
 //   ggml/src/ggml-metal/kernels/mul_mv.metal
 // The lane map (tid/ix/ip/il), the two-block stride, the unpacking of the
 // 6-bit values, the row loop over a SIMD group's rows and the simd_sum
-// reduction are llama.cpp's: 2 rows per SIMD group, 2 SIMD groups per
-// threadgroup. The tail and the variants are matvec_q4k.metal's:
+// reduction are llama.cpp's: 2 rows per SIMD group, the SIMD groups in a
+// threadgroup the function constant of norm.metal (2 today, 8 for the head
+// kernel of a later round). The tail and the variants are matvec_q4k.metal's:
 // a SIMD group past the last row returns, and a row past the last re-reads the
 // last row and is never stored.
 //
@@ -33,24 +36,24 @@ struct block_q6_K {
 static_assert(sizeof(block_q6_K) == 210, "block_q6_K is 210 bytes");
 
 template <bool NORM, bool RESID>
-inline void q6k_matvec_body(device const block_q6_K * W,
-                            device const float      * x,
-                            device float            * y,
-                            constant MatvecArgs     & args,
-                            device const float      * gain,
-                            device atomic_uint      * faults,
-                            uint3  tgpig,
-                            ushort tiisg,
-                            ushort sgitg) {
+inline void q6k_rows(device const block_q6_K * W,
+                      device const float      * x,
+                      device float            * y,
+                      int nblocks,
+                      float eps,
+                      uint layer,
+                      device const float      * gain,
+                      device atomic_uint      * faults,
+                      int first_row,
+                      int rows,
+                      ushort tiisg) {
     constexpr uint8_t kmask1 = 0x03;
     constexpr uint8_t kmask2 = 0x0C;
     constexpr uint8_t kmask3 = 0x30;
     constexpr uint8_t kmask4 = 0xC0;
     constexpr short NR0 = BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP;
 
-    const int nb = args.nblocks;
-    const int rows = args.rows;
-    const int first_row = (int)(tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS_PER_GROUP + sgitg) * NR0;
+    const int nb = nblocks;
     if (first_row >= rows) {
         return;
     }
@@ -124,10 +127,10 @@ inline void q6k_matvec_body(device const block_q6_K * W,
     float scale = 1.f;
     if (NORM) {
         const float sum_squares = simd_sum(sum_sq);
-        scale = rms_scale(sum_squares, (uint)nb * QK_K, args.eps);
+        scale = rms_scale(sum_squares, (uint)nb * QK_K, eps);
         if (!rms_usable(sum_squares, scale)) {
             if (tiisg == 0) {
-                raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+                raise(faults, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
                 for (short row = 0; row < NR0 && first_row + row < rows; ++row) {
                     y[first_row + row] = NAN;
                 }
@@ -158,7 +161,9 @@ kernel void q6k_matvec(device const block_q6_K * W [[buffer(0)]],
                        uint3  tgpig [[threadgroup_position_in_grid]],
                        ushort tiisg [[thread_index_in_simdgroup]],
                        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    q6k_matvec_body<false, false>(W, x, y, args, nullptr, nullptr, tgpig, tiisg, sgitg);
+    const int first_row = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    q6k_rows<false, false>(W, x, y, args.nblocks, args.eps, args.layer,
+                           nullptr, nullptr, first_row, (int)args.rows, tiisg);
 }
 
 kernel void q6k_matvec_norm(device const block_q6_K * W [[buffer(0)]],
@@ -170,7 +175,9 @@ kernel void q6k_matvec_norm(device const block_q6_K * W [[buffer(0)]],
                             uint3  tgpig [[threadgroup_position_in_grid]],
                             ushort tiisg [[thread_index_in_simdgroup]],
                             ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    q6k_matvec_body<true, false>(W, x, y, args, gain, faults, tgpig, tiisg, sgitg);
+    const int first_row = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    q6k_rows<true, false>(W, x, y, args.nblocks, args.eps, args.layer,
+                          gain, faults, first_row, (int)args.rows, tiisg);
 }
 
 kernel void q6k_matvec_resid(device const block_q6_K * W [[buffer(0)]],
@@ -180,5 +187,36 @@ kernel void q6k_matvec_resid(device const block_q6_K * W [[buffer(0)]],
                              uint3  tgpig [[threadgroup_position_in_grid]],
                              ushort tiisg [[thread_index_in_simdgroup]],
                              ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    q6k_matvec_body<false, true>(W, x, y, args, nullptr, nullptr, tgpig, tiisg, sgitg);
+    const int first_row = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    q6k_rows<false, true>(W, x, y, args.nblocks, args.eps, args.layer,
+                          nullptr, nullptr, first_row, (int)args.rows, tiisg);
+}
+
+// The row segments of up to four tensors of one type and one width: the
+// threadgroup takes the segment whose first threadgroup it is, and the rows
+// are the ones a launch of that segment alone would write.
+kernel void q6k_matvec_seg(device const block_q6_K * W [[buffer(0)]],
+                            device const float      * x [[buffer(1)]],
+                            device float            * y [[buffer(2)]],
+                            constant SegArgs        & args [[buffer(3)]],
+                            device const float      * gain [[buffer(4)]],
+                            device atomic_uint      * faults [[buffer(5)]],
+                            uint3  tgpig [[threadgroup_position_in_grid]],
+                            ushort tiisg [[thread_index_in_simdgroup]],
+                            ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    uint s = 0;
+    for (uint i = 0; i < args.nseg; ++i) {
+        if (tgpig.x >= args.segs[i].first_group) {
+            s = i;
+        }
+    }
+    const uint local = tgpig.x - args.segs[s].first_group;
+    const int first_row = (int)((local * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    q6k_rows<true, false>(
+        W + (ulong)args.segs[s].wblocks,
+        x,
+        y + args.segs[s].out,
+        args.nblocks, args.eps, args.layer,
+        gain, faults,
+        first_row, (int)args.segs[s].rows, tiisg);
 }
