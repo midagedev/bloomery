@@ -3,7 +3,7 @@
 //! [`crate::route_body`] GLM-5.3-Flash's and MiMo's routers are instances
 //! of) at each expert count a MoE layer has — 240, 304, 368, 432 and 496
 //! with the top 9 of each (Bolt) and 128 with the top 6 (Lightning's, the
-//! instance Raon-1's module owns by its shape), the rows of
+//! instance `route_body` owns by its shape), the rows of
 //! `models::shape::ROUTERS` this family runs. Each expert scores
 //! `sigmoid(logit)` of its F32 router row on the layer's normed row; the
 //! bias is added for the pick only; the top of each by the biased score are
@@ -20,7 +20,7 @@
 //! results at its own count; a count no instance is built for is refused by
 //! name at load.
 
-use crate::arch::raon1::ffn::sigmoid_128_6;
+use crate::route_body::sigmoid_128_6;
 use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use std::sync::Arc;

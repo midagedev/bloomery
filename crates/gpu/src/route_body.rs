@@ -344,7 +344,7 @@ pub unsafe fn pick_body<const E: usize, const U: usize>(
 /// holding `N_EXPERT` and `N_USED`, the three `#[cuda_module]` entries
 /// (`$router`, `$scores`, `$pick`), `RouterOut` and `RouterKernels` at those
 /// counts, compiled into the crate that invokes it (`gpu-deepseek41`'s
-/// `glm5next` and `mimo2`; Bolt's five, `arch/nemotron_h_moe/router.rs`). The expert and slot counts are tokens, not constants, so the
+/// `glm5next` and `mimo2`; Bolt's five, `arch/nemotron_h_moe/router.rs`; the 128/6 one below). The expert and slot counts are tokens, not constants, so the
 /// entries' `launch_contract` literals and the module's constants are one
 /// source. The entry names are the PTX entry names, and `$p_router`,
 /// `$p_scores` and `$p_pick` the `prepare_*` launchers `#[cuda_module]`
@@ -803,4 +803,18 @@ macro_rules! sigmoid_router_instance {
         }
         }
     };
+}
+
+crate::sigmoid_router_instance! {
+    /// The sigmoid router at 128 experts and the top 6 (Raon-1's and
+    /// Nemotron-3.5-Lightning's): the rule of `sigmoid_128_4` (MiniMax-M3)
+    /// at another pick count, from the generic bodies. Named by its shape:
+    /// any family at 128/6 imports it.
+    pub mod sigmoid_128_6 {
+        experts: 128,
+        used: 6,
+        kernels: sigmoid_128_6_router_kernels,
+        entries: sigmoid_128_6_router, sigmoid_128_6_router_pick,
+        prepare: prepare_sigmoid_128_6_router, prepare_sigmoid_128_6_router_pick,
+    }
 }

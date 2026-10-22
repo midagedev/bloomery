@@ -309,7 +309,7 @@ pub const ROUTERS: &[RouterInst] = &[
         experts: 128,
         top_k_min: 6,
         top_k_max: 6,
-        at: "gpu/src/arch/raon1/ffn.rs sigmoid_128_6_router*",
+        at: "gpu/src/route_body.rs sigmoid_128_6_router*",
     },
 ];
 

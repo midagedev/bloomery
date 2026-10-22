@@ -408,7 +408,7 @@ pub const AVAILABLE: &[Available] = &[
             Program::Solar2Body,
             Program::Raon1Body,
         ],
-        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body (gpu-deepseek41 router: glm5next at 288 experts, mimo2 at 256, solar2 at 320; gpu/src/arch/raon1/ffn.rs sigmoid_128_6: raon1 at 128)",
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body (gpu-deepseek41 router: glm5next at 288 experts, mimo2 at 256, solar2 at 320; gpu/src/route_body.rs sigmoid_128_6: raon1 and nemotron_h_moe at 128)",
         runs: |n| routes(n, &[RouterBody::BiasedSigmoid]),
     },
     Available {

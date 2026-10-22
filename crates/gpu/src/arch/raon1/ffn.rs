@@ -36,18 +36,7 @@ use crate::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::placement::kernels::DownAct;
 
-crate::sigmoid_router_instance! {
-    /// The sigmoid router at 128 experts and the top 6 (Raon-1): the rule
-    /// of `sigmoid_128_4` (MiniMax-M3) at another pick count, from the
-    /// generic bodies. Named by its shape: any family at 128/6 imports it.
-    pub mod sigmoid_128_6 {
-        experts: 128,
-        used: 6,
-        kernels: sigmoid_128_6_router_kernels,
-        entries: sigmoid_128_6_router, sigmoid_128_6_router_pick,
-        prepare: prepare_sigmoid_128_6_router, prepare_sigmoid_128_6_router_pick,
-    }
-}
+pub use crate::route_body::sigmoid_128_6;
 
 /// What the refusals of this file name.
 const WHAT: &str = "raon1 ffn";
