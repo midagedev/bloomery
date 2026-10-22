@@ -25,6 +25,10 @@ path = "src/bin/gate_metal_qwen35moe_e2e.rs"
 name = "metal_matvec_time"
 path = "src/bin/metal_matvec_time.rs"
 
+[[bin]]
+name = "generate_metal"
+path = "src/bin/generate_metal.rs"
+
 [lints]
 workspace = true
 
@@ -53,6 +57,11 @@ bloomery-refset = { path = "../refset" }
 # The session as the generation loop's target (`arch/qwen3moe/target.rs`):
 # the loop, its stop rule and its cut reasons, all host-only.
 bloomery-runtime = { path = "../runtime" }
+# The generation CLI's own owners, host-only: the file's vocabulary (the
+# prompt's encode, the streamed decode, the end-of-generation set) and the
+# lever rows a binary parses at main (this CLI acts on none).
+bloomery-tokenizer = { path = "../tokenizer" }
+bloomery-levers = { path = "../levers" }
 
 [build-dependencies]
 # The fault site's table, the one owner the generated header is written
