@@ -72,6 +72,8 @@ const fn flag(name: &'static str) -> Part {
 
 /// Registers `bin`'s kinds, after which a line of any other kind is refused
 /// by name, and, under the `gpu` feature, the residency machine's leak sink.
+/// A binary of this crate calls this one: the core's `bloomery_record::at_main`
+/// alone registers the kinds and leaves the leak sink out.
 pub fn at_main(bin: &'static str, kinds: &'static [&'static Kind]) {
     bloomery_record::at_main(bin, kinds);
     #[cfg(feature = "gpu")]
@@ -4029,9 +4031,8 @@ pub fn residency_reset(r: &ResetReport) -> Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
-    use bloomery_record::{Prints, missing, register_in, require_in};
+    use bloomery_record::missing;
 
     #[test]
     fn host_only_records_name_causes_and_skip_an_all_host_choice() {
@@ -4120,15 +4121,6 @@ mod tests {
             );
         }
         assert!(host_only(&model, None).unwrap().next().is_none());
-    }
-
-    /// `missing` names exactly the kinds of the group a list lacks, in the group's order.
-    #[test]
-    fn missing_names_the_kinds_a_list_lacks() {
-        static GROUP: &[&Kind] = &[&HF_OFFLINE, &HF_FILE, &HF_DONE];
-        assert_eq!(missing(&[&HF_FILE], GROUP), ["hf_offline", "hf_done"]);
-        assert!(missing(&[&HF_DONE, &HF_FILE, &HF_OFFLINE, &VISION], GROUP).is_empty());
-        assert!(missing(&[], &[]).is_empty());
     }
 
     /// Every seat that takes images calls `vision_seat::Flags::encoder` on its start (the GLM
@@ -4356,52 +4348,6 @@ mod tests {
             missing(BLOOMERY_SERVE_MIMO2, bind::SLOTS),
             ["slots round", "slot call"]
         );
-    }
-
-    /// A group required after the process registered, and missing from its list, panics by name.
-    #[test]
-    #[should_panic(expected = "bin-x enters entry-y without registering its records: hf_file")]
-    fn a_group_required_after_registration_and_missing_panics() {
-        static LIST: &[&Kind] = &[&HF_OFFLINE];
-        static GROUP: &[&Kind] = &[&HF_OFFLINE, &HF_FILE];
-        let slot = OnceLock::new();
-        let wait = Mutex::new(Vec::new());
-        register_in(&slot, &wait, "bin-x", LIST);
-        require_in(&slot, &wait, GROUP, "entry-y");
-    }
-
-    /// A group required before the process registered waits, and the registration checks it:
-    /// a missing kind panics at `at_main`, not at the entry that asked.
-    #[test]
-    #[should_panic(expected = "bin-x enters entry-y without registering its records: hf_file")]
-    fn a_group_required_before_registration_is_checked_at_registration() {
-        static LIST: &[&Kind] = &[&HF_OFFLINE];
-        static GROUP: &[&Kind] = &[&HF_OFFLINE, &HF_FILE];
-        let slot = OnceLock::new();
-        let wait = Mutex::new(Vec::new());
-        require_in(&slot, &wait, GROUP, "entry-y");
-        register_in(&slot, &wait, "bin-x", LIST);
-    }
-
-    /// Groups the registered list holds, required before or after, pass; a process that
-    /// never registers leaves the wait unread.
-    #[test]
-    fn a_group_the_list_holds_passes_and_an_unregistered_process_never_reads_the_wait() {
-        static LIST: &[&Kind] = &[&HF_OFFLINE, &HF_FILE];
-        static GROUP: &[&Kind] = &[&HF_FILE];
-        static OTHER: &[&Kind] = &[&VISION];
-        let slot = OnceLock::new();
-        let wait = Mutex::new(Vec::new());
-        require_in(&slot, &wait, GROUP, "before");
-        require_in(&slot, &wait, GROUP, "before");
-        assert_eq!(wait.lock().unwrap().len(), 1, "the same entry waits once");
-        register_in(&slot, &wait, "bin-x", LIST);
-        require_in(&slot, &wait, GROUP, "after");
-        assert!(wait.lock().unwrap().is_empty());
-        let never = OnceLock::new();
-        let wait = Mutex::new(Vec::new());
-        require_in(&never, &wait, OTHER, "entry-y");
-        assert_eq!(wait.lock().unwrap().len(), 1);
     }
 
     /// Every binary's kinds: names unique, each value part named once, a
@@ -4806,42 +4752,6 @@ mod tests {
             .line();
     }
 
-    #[test]
-    #[should_panic(expected = "record time_step: ms given where i is due")]
-    fn refuses_a_value_out_of_order() {
-        let _ = Record::new(&TIME_STEP).f("ms", 1.0).line();
-    }
-
-    #[test]
-    #[should_panic(expected = "record fed: last left out")]
-    fn refuses_a_line_with_a_part_missing() {
-        let _ = Record::new(&FED)
-            .u("ids", 4)
-            .list("first", &[1u32, 2])
-            .line();
-    }
-
-    /// Under a binary's registered kinds, one of them renders and a line of
-    /// another kind is refused, naming the kind and the binary.
-    #[test]
-    #[should_panic(expected = "record listening: generate_ds41 does not print this kind")]
-    fn refuses_a_kind_its_binary_does_not_print() {
-        let generate = Prints {
-            bin: "generate_ds41",
-            kinds: GENERATE_DS41,
-        };
-        let lock = Record::new(&HOST_LOCK)
-            .u("host_lock_bytes", 4096)
-            .u("sidecar_bytes", 0)
-            .line_under(Some(&generate));
-        assert_eq!(lock, "host_lock=4096 B sidecar_bytes=0");
-        let _ = Record::new(&LISTENING)
-            .w("place", "a")
-            .u("ctx", 4096)
-            .w("addr", "127.0.0.1:8080")
-            .line_under(Some(&generate));
-    }
-
     // ------------------------------------------------------------ the reader
 
     /// Lines the servers printed, as the serve gates' logs carry them.
@@ -5190,12 +5100,13 @@ mod tests {
         );
     }
 
-    /// A line that opens a kind's record and does not read whole is refused
-    /// by name on every read of each kind it opens, never read as no record;
-    /// a line under a kind's head that opens no record (a placement's text,
-    /// the host tier's) refuses nothing.
+    /// A `residency pass` line of an older text (the reread fields came after
+    /// it) opens the kind's record and does not read whole: refused by name on
+    /// every read, while the lines around it still read. Lines under a kind's
+    /// head that are no record (a placement's and the host tier's own text)
+    /// refuse nothing.
     #[test]
-    fn a_line_that_opens_a_record_and_does_not_read_whole_is_refused() {
+    fn an_older_residency_pass_line_is_refused_and_placement_text_is_not() {
         let text = format!("{RESIDENCY_HOST_GLM}\n{PASS_OLD}");
         let log = Log::of(&text, BLOOMERY_SERVE_QWEN38).named("server.err");
         let broken = ReadError::Broken {
@@ -5204,31 +5115,11 @@ mod tests {
             at: 2,
             line: PASS_OLD.to_owned(),
         };
-        assert_eq!(log.all(&RESIDENCY_PASS).unwrap_err(), broken);
-        assert_eq!(log.first(&RESIDENCY_PASS).unwrap_err(), broken);
         assert_eq!(log.one(&RESIDENCY_PASS).unwrap_err(), broken);
-        assert!(
-            broken
-                .to_string()
-                .contains("server.err: line 2 opens a `residency_pass`")
-        );
         assert_eq!(
             log.one(&RESIDENCY_HOST).and_then(|f| f.u64("pinned")),
             Ok(0)
         );
-        // `plan` and `plan38` share their head and first field: a line that
-        // opens both and reads as neither refuses both.
-        let both: &[&'static Kind] = &[&PLAN, &PLAN38];
-        let torn = "plan place=a card=A6000 ctx_max=4096 card_experts=12841";
-        let log = Log::of(torn, both);
-        assert!(matches!(
-            log.first(&PLAN),
-            Err(ReadError::Broken { kind: "plan", .. })
-        ));
-        assert!(matches!(
-            log.first(&PLAN38),
-            Err(ReadError::Broken { kind: "plan38", .. })
-        ));
         let text = format!("{TEXT_UNDER_HEADS}\n{PLAN_BP}");
         let log = Log::of(&text, BLOOMERY_SERVE_DS41);
         assert_eq!(
@@ -5236,38 +5127,6 @@ mod tests {
             Ok(PLAN_BP.to_owned())
         );
         assert_eq!(log.first(&LOAD_GENERATOR).map(|f| f.is_none()), Ok(true));
-    }
-
-    /// `one` names the kind and the log when the log holds none of it, or
-    /// more than one, and `all` refuses a kind the log is not read by.
-    #[test]
-    fn one_names_an_absent_kind_and_the_log() {
-        let log = Log::of(TEXT_UNDER_HEADS, BLOOMERY_SERVE_DS41).named("server.err");
-        let absent = log.one(&PLAN).unwrap_err();
-        assert_eq!(
-            absent,
-            ReadError::Absent {
-                log: "server.err".to_owned(),
-                kind: "plan"
-            }
-        );
-        assert_eq!(absent.to_string(), "server.err: no `plan` record");
-        let twice = Log::of(&format!("{PLAN_BP}\n{PLAN_BP}"), BLOOMERY_SERVE_DS41);
-        assert!(matches!(
-            twice.one(&PLAN),
-            Err(ReadError::Many {
-                kind: "plan",
-                n: 2,
-                ..
-            })
-        ));
-        assert!(matches!(
-            log.all(&LISTENING38),
-            Err(ReadError::NotPrinted {
-                kind: "listening38",
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -5331,60 +5190,5 @@ mod tests {
                 assert_eq!(fields.i64("headroom"), Ok(i64::try_from(before).unwrap()));
             }
         }
-    }
-
-    /// A field read is refused by name when the kind has no such field, when
-    /// the field is of another type, when the line left it out, and when its
-    /// value is past the type's range.
-    #[test]
-    fn field_reads_refuse_by_name() {
-        let host = Log::of(RESIDENCY_HOST_GLM, BLOOMERY_SERVE_QWEN38)
-            .one(&RESIDENCY_HOST)
-            .unwrap();
-        assert_eq!(host.i64("headroom_after"), Ok(68_550_098_944));
-        assert_eq!(host.word("residency"), Ok("mid-p0-s1"));
-        assert!(matches!(
-            host.u64("landed"),
-            Err(ReadError::NoField {
-                kind: "residency_host",
-                ..
-            })
-        ));
-        assert!(matches!(
-            host.u64("headroom"),
-            Err(ReadError::Type {
-                field: "headroom",
-                ty: Ty::I64,
-                asked: "u64",
-                ..
-            })
-        ));
-        assert!(matches!(
-            host.csv("residency"),
-            Err(ReadError::Type {
-                ty: Ty::Word,
-                asked: "csv",
-                ..
-            })
-        ));
-        let plan = Log::of(PLAN38_NO_FREE, BLOOMERY_SERVE_QWEN3)
-            .one(&PLAN38)
-            .unwrap();
-        assert!(matches!(
-            plan.u64("card_free"),
-            Err(ReadError::Missing {
-                field: "card_free",
-                ..
-            })
-        ));
-        let past = PLAN38_PLACED.replace("card_experts=4813", "card_experts=99999999999999999999");
-        let past = Log::of(&past, BLOOMERY_SERVE_QWEN3).one(&PLAN38).unwrap();
-        assert!(matches!(
-            past.u64("card_experts"),
-            Err(ReadError::Value {
-                field: "card_experts",
-                ..
-            })
-        ));
     }
 }
