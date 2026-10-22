@@ -42,6 +42,13 @@ head-normed entry of the Q4_K file are the same body with the segment's rows or 
 one tensor's rows: the parts named above are the adapted ones. The licence is the one above, the ggml authors' MIT
 licence, whose text applies to those two files.
 
+`crates/metal/kernels/experts.metal` is adapted from those same two llama.cpp kernels
+(`kernel_mul_mv_q4_K_f32` and `kernel_mul_mv_q6_K_f32` in `ggml/src/ggml-metal/kernels/mul_mv.metal`,
+commit `36a73916e`): the lane map, the block loop, the nibble and 6-bit unpacking and the SIMD-group
+reduction. The pair's gate and up rows, the slot select, the folded K' and the route weight on the
+load are this engine's. The licence is the one above, the ggml authors' MIT licence, whose text
+applies to that file.
+
 ## cuda-oxide
 
 `crates/oxide-ice-unroll` (a compiler-bug reproducer, excluded from the workspace) carries NVIDIA's

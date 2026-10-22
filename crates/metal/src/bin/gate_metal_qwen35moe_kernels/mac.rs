@@ -42,6 +42,12 @@
 //! 15. **nsg**: the Q6_K mat-vec at eight SIMD groups in a threadgroup is the
 //!     same bits as at two, for every row count the fixture's Q6_K tensors
 //!     have.
+//! 16. **pair**: silu(gate) times up, against the f64 oracle. // K3-REGISTER
+//! 17. **pair_id**: an id past the stack raises expert_id and writes NaN. // K3-REGISTER
+//! 18. **pair_shared**: slot 8 reads the shared expert, the others the stack. // K3-REGISTER
+//! 19. **fold**: the folded down plus the residual, against the f64 oracle. // K3-REGISTER
+//! 20. **fold_type**: a shared expert of another quant is refused by name. // K3-REGISTER
+//! 21. **experts_bounds**: a launch that is not the shape is refused by name. // K3-REGISTER
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
@@ -66,12 +72,16 @@ use bloomery_metal::stream::MetalStream;
 
 #[path = "clauses.rs"]
 mod clauses;
+#[path = "clauses_experts.rs"] // K3-REGISTER
+mod clauses_experts; // K3-REGISTER
 #[path = "fixture.rs"]
 mod fixture;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "../shared/oracle.rs"]
 mod oracle;
+#[path = "../shared/oracle_experts.rs"] // K3-REGISTER
+mod oracle_experts; // K3-REGISTER
 
 /// A clause, ready to run.
 type ClauseRun<'a> = Box<dyn Fn() -> Clause + 'a>;
@@ -524,7 +534,8 @@ pub fn main() -> ExitCode {
         Ok(fixture) => f(&harness, fixture),
         Err(e) => Err(e.clone()),
     };
-    let clauses: [(&'static str, ClauseRun<'_>); 15] = [
+    // K3-REGISTER
+    let clauses: [(&'static str, ClauseRun<'_>); 21] = [
         ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
         ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
         ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
@@ -555,6 +566,18 @@ pub fn main() -> ExitCode {
         ("headnorm", Box::new(|| with(clauses::headnorm))),
         ("headnorm_nan", Box::new(|| with(clauses::headnorm_nan))),
         ("nsg", Box::new(|| with(clauses::nsg))),
+        ("pair", Box::new(|| with(clauses_experts::pair))), // K3-REGISTER
+        ("pair_id", Box::new(|| with(clauses_experts::pair_id))), // K3-REGISTER
+        (
+            "pair_shared",
+            Box::new(|| with(clauses_experts::pair_shared)),
+        ), // K3-REGISTER
+        ("fold", Box::new(|| with(clauses_experts::fold))), // K3-REGISTER
+        ("fold_type", Box::new(|| with(clauses_experts::fold_type))), // K3-REGISTER
+        (
+            "experts_bounds",
+            Box::new(|| with(clauses_experts::experts_bounds)),
+        ), // K3-REGISTER
     ];
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)

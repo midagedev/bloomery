@@ -137,6 +137,27 @@ pub struct Band {
     ops: usize,
 }
 
+impl Band {
+    /// The relative factor of the sum of the terms' magnitudes.
+    #[must_use]
+    pub fn factor(self) -> f64 {
+        self.factor
+    }
+
+    /// The operations of the longest path. The absolute floor is this many
+    /// times the smallest positive f32.
+    #[must_use]
+    pub fn ops(self) -> usize {
+        self.ops
+    }
+}
+
+/// The relative error of `n` rounded operations, `n U / (1 - n U)`.
+#[must_use]
+pub fn gamma_bound(n: usize) -> f64 {
+    gamma(n)
+}
+
 /// The band of a mat-vec of `quant` over `nblocks` blocks of columns.
 pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
     let (lane_blocks, base) = match quant {
