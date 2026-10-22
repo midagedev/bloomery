@@ -137,8 +137,9 @@ mod gate {
     /// it: the (b′) plan's 881 tier experts over its 38 hybrid layers are 23.2 a layer, which
     /// rounds to 23. The real tier prints the derived depth beside it and requires them equal.
     const REAL_K3: usize = 23;
-    /// Prompt positions, fed one decode step each.
-    const PROMPT: usize = 16;
+    /// Prompt positions, fed one decode step each: the batch arm's length, whose
+    /// prose sends a slot to every tier layer of the real file.
+    const PROMPT: usize = 64;
     /// Greedy steps after the prompt.
     const STEPS: usize = 32;
     /// Pair passes after the prompt.
