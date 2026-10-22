@@ -222,16 +222,15 @@ fn mutated_kernels(device: &MetalDevice, mutant: &mutants::Mutant) -> Result<Ker
     Kernels::from_library(&library).map_err(why)
 }
 
-/// The fixture path: `--fixture PATH`, else the Mac's cache copy; with no
-/// `HOME` to find it under, refused by name.
+/// The fixture path: `--fixture PATH`, else the qwen35moe fixture under the
+/// fixture root (`BLOOMERY_FIXTURE_ROOT`), as the reference sets resolve it.
 fn fixture_path(args: &[String]) -> Result<PathBuf, String> {
     if let Some(path) = flag(args, "--fixture") {
         return Ok(PathBuf::from(path));
     }
-    let home = std::env::var_os("HOME")
-        .ok_or("HOME is not set: name the fixture's trunk file with --fixture PATH")?;
-    Ok(PathBuf::from(home)
-        .join(".cache/bloomery/mac-port/fixture/qwen35moe-fixture-00001-of-00001.gguf"))
+    refset::fixture::first_shard("qwen35moe")
+        .map(PathBuf::from)
+        .map_err(|e| format!("{e} (name the fixture's trunk file with --fixture PATH)"))
 }
 
 /// Every mutant of the table, each in a child run of this gate

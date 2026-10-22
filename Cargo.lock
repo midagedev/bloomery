@@ -368,6 +368,7 @@ dependencies = [
  "bloomery-device",
  "bloomery-gguf",
  "bloomery-placement",
+ "bloomery-refset",
  "dispatch2",
  "objc2",
  "objc2-foundation",
