@@ -140,8 +140,9 @@ impl<T: Elem> Buffer<T> for GpuBuffer<T> {
 
     fn window_mut(&mut self, at: Elems, len: Elems) -> Result<WindowMut<'_, T, Gpu>, DeviceError> {
         check_window("buffer", self.len, at, len)?;
-        // SAFETY: as in `window`, and the exclusive borrow of the buffer
-        // outlives the window.
+        // SAFETY: the raw is the buffer's own allocation of `self.len`
+        // elements of `T`, which holds `at + len` of them (checked above),
+        // and the exclusive borrow of the buffer outlives the window.
         Ok(unsafe { WindowMut::from_raw(self.raw(), at, len) })
     }
 }
@@ -169,8 +170,10 @@ impl<T: Elem> Drop for GpuShared<T> {
     fn drop(&mut self) {
         // The page is freed after this body; an error stays on the context,
         // as cuda-core's own buffers keep theirs.
-        self.ctx
-            .record_err(crate::capsync::ctx_sync_in_drop(&self.ctx, "shared page drop"));
+        self.ctx.record_err(crate::capsync::ctx_sync_in_drop(
+            &self.ctx,
+            "shared page drop",
+        ));
     }
 }
 
@@ -191,8 +194,10 @@ impl<T: Elem> Buffer<T> for GpuShared<T> {
 
     fn window_mut(&mut self, at: Elems, len: Elems) -> Result<WindowMut<'_, T, Gpu>, DeviceError> {
         check_window("buffer", self.len(), at, len)?;
-        // SAFETY: as in `window`, and the exclusive borrow of the buffer
-        // outlives the window.
+        // SAFETY: the raw is the page's device address, where the page's
+        // `self.len()` elements of `T` lie (`at + len` of them, checked
+        // above), and the exclusive borrow of the buffer outlives the
+        // window.
         Ok(unsafe { WindowMut::from_raw(self.raw(), at, len) })
     }
 }
@@ -288,18 +293,6 @@ impl<T> DerefMut for BoundMut<'_, T> {
 }
 
 impl Gpu {
-    /// A stream of another context, refused by name.
-    fn check_stream(&self, s: &GpuStream) -> Result<(), DeviceError> {
-        if context_id(s.0.context()) == context_id(&self.ctx) {
-            Ok(())
-        } else {
-            Err(DeviceError::Range {
-                what: "stream",
-                detail: "a stream of another context".to_string(),
-            })
-        }
-    }
-
     /// The device address and byte count of the window `raw` and `bytes`
     /// name; a window of another context's buffer is refused by name.
     fn address(
@@ -348,9 +341,11 @@ impl Gpu {
         w: WindowMut<'w, T, Gpu>,
     ) -> Result<BoundMut<'w, T>, DeviceError> {
         let (ptr, _) = self.address(*w.raw(), w.byte_range()?)?;
-        // SAFETY: as in `bind`, and the window's exclusive borrow of its
-        // buffer, which the handle keeps for `'w`, makes it the elements'
-        // only handle.
+        // SAFETY: the window's elements lie inside a live buffer of this
+        // context (its cut checked them, and the context is checked above),
+        // aligned for `T`, and the buffer stays borrowed, in place, for `'w`;
+        // the window's exclusive borrow of it, which the handle keeps, makes
+        // the handle the elements' only one.
         Ok(BoundMut(unsafe {
             crate::WindowMut::from_raw(ptr, w.len().get(), &self.ctx)
         }))
@@ -360,21 +355,10 @@ impl Gpu {
     /// far is done: what a gate compares with the contract's host model,
     /// word for word.
     pub fn fault_words(&self, s: &GpuStream) -> Result<Vec<u32>, DeviceError> {
-        self.check_stream(s)?;
+        self.own_stream(&s.0)?;
         host::await_done("Gpu::fault_words", || s.0.query())?;
-        self.ctx.bind_to_thread().map_err(cuda)?;
         let mut words = vec![0u32; FAULT_WORDS];
-        // SAFETY: the allocation holds FAULT_ALLOC_WORDS >= FAULT_WORDS u32s;
-        // the destination holds FAULT_WORDS u32s and outlives the synchronous
-        // copy; the context is current on this thread (bound above).
-        let rc = unsafe {
-            sys::cuMemcpyDtoH_v2(
-                words.as_mut_ptr().cast(),
-                self.fault.cu_deviceptr(),
-                FAULT_WORDS * size_of::<u32>(),
-            )
-        };
-        graph::cu(rc, "cuMemcpyDtoH_v2 (fault words)")?;
+        fault::read_words(&self.fault, 0, &mut words)?;
         Ok(words)
     }
 }
@@ -396,7 +380,7 @@ impl Device for Gpu {
     }
 
     fn zeroed<T: Elem>(&self, s: &GpuStream, n: Elems) -> Result<GpuBuffer<T>, DeviceError> {
-        self.check_stream(s)?;
+        self.own_stream(&s.0)?;
         let bytes = buffer_bytes::<T>(n)?;
         let buffer = DeviceBuffer::<u8>::zeroed(&s.0, bytes.get()).map_err(cuda)?;
         if !buffer.cu_deviceptr().is_multiple_of(BUFFER_ALIGN as u64) {
@@ -450,7 +434,7 @@ impl Device for Gpu {
         into: &mut [T],
     ) -> Result<(), DeviceError> {
         check_len("read", into.len(), from.len())?;
-        self.check_stream(s)?;
+        self.own_stream(&s.0)?;
         let (ptr, bytes) = self.address(*from.raw(), from.byte_range()?)?;
         host::await_done("Device::read", || s.0.query())?;
         self.ctx.bind_to_thread().map_err(cuda)?;
@@ -471,7 +455,7 @@ impl Device for Gpu {
         from: &[T],
     ) -> Result<(), DeviceError> {
         check_len("write", from.len(), to.len())?;
-        self.check_stream(s)?;
+        self.own_stream(&s.0)?;
         let (ptr, bytes) = self.address(*to.raw(), to.byte_range()?)?;
         host::await_done("Device::write", || s.0.query())?;
         self.ctx.bind_to_thread().map_err(cuda)?;
@@ -497,7 +481,7 @@ impl Device for Gpu {
         to: WindowMut<'_, T, Gpu>,
     ) -> Result<(), DeviceError> {
         check_len("copy", from.len().get(), to.len())?;
-        self.check_stream(s)?;
+        self.own_stream(&s.0)?;
         let (src, bytes) = self.address(*from.raw(), from.byte_range()?)?;
         let (dst, _) = self.address(*to.raw(), to.byte_range()?)?;
         self.ctx.bind_to_thread().map_err(cuda)?;
@@ -520,7 +504,7 @@ impl Device for Gpu {
 /// [`Gpu::fault`] and [`Gpu::clear_fault`], ordered on the stream given.
 impl FaultWord<GpuStream> for Gpu {
     fn read(&self, s: &GpuStream) -> Result<Option<Fault>, DeviceError> {
-        self.check_stream(s)?;
+        self.own_stream(&s.0)?;
         host::await_done("FaultWord::read", || s.0.query())?;
         Ok(fault::read(&self.fault)?)
     }

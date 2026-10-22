@@ -19,7 +19,13 @@ decision 2 0 0
 # `Elem` impls of u64 and f64; the `Shared::host` default's block; the mock's `HostPages` and `host_mut` blocks; and
 # the conformance clauses' two borrows of a shared buffer after the event its writer came down at. Each has its SAFETY
 # line.
-device 17 8 9
+# PIN(2026-10-22): device 17 -> 18 blocks, 9 -> 3 impls, review fixes, not old code relaxed: `HostPages::copy_from`
+# (the Metal backend's copy between two windows no longer goes through a vector) adds one block with its SAFETY line,
+# and the seven `Elem` impls are one macro's, so their one SAFETY statement counts once.
+# PIN(2026-10-22): device 18 -> 20 blocks, 8 -> 10 fns, 3 -> 4 impls, new test code, not old code relaxed: the
+# counting allocator of `tests/no_alloc_on_success.rs` (its `GlobalAlloc` impl, `alloc` and `dealloc`, each forwarding
+# to the system allocator), which holds the range rules' success paths to no allocation.
+device 20 10 4
 embed 0 0 0
 # PIN(2026-10-07): engram 6 -> 7 blocks, new code, not old code relaxed: the row reads over a table's bytes in a
 # mapping the reader does not own (TableBytes, which a split's table, Qwen3.8's PLE, and a site share) advise its
@@ -465,7 +471,9 @@ gguf 7 2 0
 # contract's `Device` (device.rs): the four window constructors of its two buffers, the shared buffer's `HostPages`
 # and `host_mut` (its one unsafe fn), the engine stream's transparent view, the two window bindings a launch takes, and
 # the four driver copies (the fault words', a read, a write, a copy between windows), each with its SAFETY line.
-gpu 2269 278 10
+# PIN(2026-10-22): gpu 2269 -> 2268 blocks, review fix, one block fewer: the fault words' bulk copy and the fault
+# reader's one-word copy are one `fault::read_words` with its one block (the range checked in it), not two.
+gpu 2268 278 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

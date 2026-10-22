@@ -35,7 +35,9 @@ pub struct HostPages<T: Elem> {
 // SAFETY: the pages are plain memory (`T: Elem` is `Send + Sync`). An access
 // through `&self` is atomic, and every plain write takes `&mut self`.
 unsafe impl<T: Elem> Send for HostPages<T> {}
-// SAFETY: as above.
+// SAFETY: a shared reference reaches the pages through atomic loads and stores,
+// or through `as_slice`, whose caller promises no writer meanwhile; every plain
+// write takes `&mut self`.
 unsafe impl<T: Elem> Sync for HostPages<T> {}
 
 impl<T: Elem> HostPages<T> {
@@ -103,6 +105,21 @@ impl<T: Elem> HostPages<T> {
         self.write_at(Elems::ZERO, host)
     }
 
+    /// The pages become `from`'s elements, each a relaxed atomic load of
+    /// `from`'s and a plain write here; a `from` of another length is refused
+    /// by name.
+    pub fn copy_from(&mut self, from: &HostPages<T>) -> Result<(), DeviceError> {
+        crate::check_len("copy", from.len.get(), self.len)?;
+        for (i, atom) in from.atoms().iter().enumerate() {
+            // SAFETY: `i < len` (the lengths match and `i` indexes `from`'s
+            // `len` atoms), so the write lies inside the pages (`new`'s
+            // contract); `&mut self` makes this the only host access to them,
+            // and `new`'s contract keeps `from`'s elements apart from these.
+            unsafe { self.ptr.as_ptr().add(i).write(atom.load(Ordering::Relaxed)) };
+        }
+        Ok(())
+    }
+
     /// Elements `at..at + into.len()` into `into`, each a relaxed atomic load;
     /// a range past the pages is refused by name.
     pub fn read_at(&self, at: Elems, into: &mut [T]) -> Result<(), DeviceError> {
@@ -165,8 +182,9 @@ impl<T: Elem> HostPages<T> {
     /// No device work in flight reads or writes the pages for as long as the
     /// slice lives.
     pub unsafe fn as_mut_slice(&mut self) -> &mut [T] {
-        // SAFETY: as in `as_slice`, and `&mut self` makes this the only host
-        // access; the caller promises the device touches none of them.
+        // SAFETY: `len` elements are mapped at `ptr` for as long as `self`
+        // lives, `&mut self` makes this the only host access, and the caller
+        // promises the device touches none of them.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len.get()) }
     }
 }
@@ -242,6 +260,20 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_between_pages_is_whole_and_checked_for_length() {
+        let mut from_backing = vec![1.5f32, -2.0, 3.0];
+        let mut to_backing = vec![0.0f32; 3];
+        let from = over(&mut from_backing);
+        let mut to = over(&mut to_backing);
+        to.copy_from(&from).expect("the lengths match");
+        assert_eq!(to.to_vec(), [1.5, -2.0, 3.0]);
+        let mut short_backing = vec![0.0f32; 2];
+        let mut short = over(&mut short_backing);
+        refused(short.copy_from(&from), "copy");
+        assert_eq!(short.to_vec(), [0.0, 0.0]);
+    }
+
+    #[test]
     fn load_and_store_are_checked_against_the_count() {
         let mut backing = vec![0.0f32; 3];
         let mut pages = over(&mut backing);
@@ -251,7 +283,8 @@ mod tests {
         refused(pages.load(3, Ordering::Relaxed), "load");
         // SAFETY: nothing else touches the vector or the device.
         assert_eq!(unsafe { pages.as_slice() }, &[0.0, 0.0, 1.5]);
-        // SAFETY: as above.
+        // SAFETY: nothing else touches the vector or the device, and no slice of
+        // the pages is live.
         let slice = unsafe { pages.as_mut_slice() };
         slice[0] = 4.0;
         assert_eq!(pages.load(0, Ordering::Relaxed).expect("inside"), 4.0);

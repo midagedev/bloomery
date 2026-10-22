@@ -91,37 +91,29 @@ impl Atom<f64> for AtomicU64 {
     }
 }
 
-// SAFETY: the primitive types have no padding, every bit pattern of each is a
-// value of the type, and each atomic twin has its type's size and alignment
-// (asserted below); a u16 holds f16's or bf16's bits.
-unsafe impl Elem for u8 {
-    type Atom = AtomicU8;
+/// `Elem` for the primitive types, each with its atomic twin.
+macro_rules! elem_of_primitive {
+    ($($t:ty => $a:ty),* $(,)?) => {$(
+        // SAFETY: a primitive type has no padding and every bit pattern of it is
+        // a value of the type (some of a float's are NaN); `$a` has the type's
+        // size and alignment (`twins`, asserted below) and loads and stores its
+        // bits (a float's through `to_bits`/`from_bits`); an `f16` or `bf16`
+        // travels as the `u16` of its bits.
+        unsafe impl Elem for $t {
+            type Atom = $a;
+        }
+    )*};
 }
-// SAFETY: as above.
-unsafe impl Elem for u16 {
-    type Atom = AtomicU16;
-}
-// SAFETY: as above.
-unsafe impl Elem for u32 {
-    type Atom = AtomicU32;
-}
-// SAFETY: as above.
-unsafe impl Elem for i32 {
-    type Atom = AtomicI32;
-}
-// SAFETY: as above.
-unsafe impl Elem for u64 {
-    type Atom = AtomicU64;
-}
-// SAFETY: as above; every bit pattern of an f32 is a value (some are NaN),
-// and its twin is the u32 of its bits.
-unsafe impl Elem for f32 {
-    type Atom = AtomicU32;
-}
-// SAFETY: as above, with the u64 of an f64's bits.
-unsafe impl Elem for f64 {
-    type Atom = AtomicU64;
-}
+
+elem_of_primitive!(
+    u8 => AtomicU8,
+    u16 => AtomicU16,
+    u32 => AtomicU32,
+    i32 => AtomicI32,
+    u64 => AtomicU64,
+    f32 => AtomicU32,
+    f64 => AtomicU64,
+);
 
 /// Whether `T`'s atomic twin has its size and alignment, and `T` fits a
 /// buffer's alignment: the layout half of [`Elem`]'s contract.
@@ -177,7 +169,7 @@ impl Elems {
 
     /// The sum, refused by name when it would wrap.
     pub fn try_add(self, other: Self) -> Result<Self, DeviceError> {
-        self.checked_add(other).ok_or(DeviceError::Range {
+        self.checked_add(other).ok_or_else(|| DeviceError::Range {
             what: "elems",
             detail: format!("{} + {} element counts wrap", self.0, other.0),
         })
@@ -612,16 +604,7 @@ impl<'a, T: Elem, D: Device> WindowMut<'a, T, D> {
     /// Two disjoint windows at `mid`: the left `mid` elements and the rest.
     /// A `mid` past the window is refused by name.
     pub fn split_at(self, mid: Elems) -> Result<(Self, Self), DeviceError> {
-        if mid > self.len {
-            return Err(DeviceError::Range {
-                what: "window",
-                detail: format!(
-                    "the split at element {} passes the window's {} elements",
-                    mid.get(),
-                    self.len.get()
-                ),
-            });
-        }
+        check_window("window", self.len, Elems::ZERO, mid)?;
         let left = Self {
             raw: self.raw,
             at: self.at,
@@ -1009,8 +992,9 @@ mod tests {
         len: Elems,
     ) -> Result<WindowMut<'_, T, MockDevice>, DeviceError> {
         check_window("buffer", Elems(data.len()), at, len)?;
-        // SAFETY: as in `window_of`, and the exclusive borrow of the buffer
-        // outlives the window.
+        // SAFETY: the mock's raw is the buffer's byte count, which covers
+        // `at + len` elements after the check, and the exclusive borrow of
+        // the buffer outlives the window.
         Ok(unsafe { WindowMut::from_raw(size_of_val(data), at, len) })
     }
 
@@ -1246,7 +1230,7 @@ mod tests {
 
         let window = buffer.window_mut(Elems(1), Elems(4)).expect("inside");
         let detail = range_refusal(window.split_at(Elems(5)).map(|_| ()));
-        assert!(detail.contains("split at element 5"), "{detail}");
+        assert!(detail.contains("elements 0..5 pass"), "{detail}");
     }
 
     #[test]
