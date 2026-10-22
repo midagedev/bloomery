@@ -1,8 +1,11 @@
 //! The encoding of a kernel: the bindings, the dispatch, the end.
 //!
-//! The encoder is a serial one: its dispatches run in the order they were
-//! encoded, so a dispatch that reads what the one before it wrote needs no
-//! barrier. (A concurrent encoder would need `memoryBarrier` between them.)
+//! A token group is the dispatches between barriers.
+//! [`ComputeEncoder::memory_barrier`] is that boundary, not a name for the
+//! group. The serial encoder's dispatches run in encode order, so a reader
+//! after a writer on that encoder needs no barrier. The concurrent encoder's
+//! dispatches overlap until `memory_barrier`.
+//!
 //! The command buffer the encoder is made on retains every object bound to
 //! it, so a buffer dropped by the host after its dispatch was encoded still
 //! lives until the work is done; a command buffer made with unretained
@@ -16,7 +19,8 @@ use objc2::ffi::NSUInteger;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
+    MTLDispatchType, MTLSize,
 };
 
 use bloomery_device::{Bytes, DeviceError, Elem, Window, WindowMut};
@@ -132,11 +136,30 @@ pub struct ComputeEncoder<'r> {
 }
 
 impl ComputeEncoder<'_> {
-    /// The compute encoder of a command buffer.
+    /// The serial compute encoder of a command buffer.
     pub(crate) fn new(
         buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<ComputeEncoder<'_>, DeviceError> {
-        let encoder = buffer.computeCommandEncoder().ok_or_else(|| {
+        Self::with_encoder(buffer, |buffer| buffer.computeCommandEncoder())
+    }
+
+    /// A compute encoder of a command buffer whose dispatches may overlap.
+    pub(crate) fn concurrent(
+        buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<ComputeEncoder<'_>, DeviceError> {
+        Self::with_encoder(buffer, |buffer| {
+            buffer.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+        })
+    }
+
+    /// An encoder from `make`, refused by name when the command buffer makes none.
+    fn with_encoder<'a>(
+        buffer: &'a ProtocolObject<dyn MTLCommandBuffer>,
+        make: impl FnOnce(
+            &ProtocolObject<dyn MTLCommandBuffer>,
+        ) -> Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+    ) -> Result<ComputeEncoder<'a>, DeviceError> {
+        let encoder = make(buffer).ok_or_else(|| {
             DeviceError::backend(
                 "compute encoder",
                 "the command buffer made no compute encoder".to_string(),
@@ -280,6 +303,16 @@ impl ComputeEncoder<'_> {
             },
         );
         Ok(())
+    }
+
+    /// A barrier on the encoder's buffers: the dispatches before it are one
+    /// group, and on a concurrent encoder the dispatches after it see what
+    /// that group wrote. On a serial encoder Metal ignores the barrier; the
+    /// call is still encoded. The barrier is the group's boundary, not a
+    /// name for the group.
+    pub fn memory_barrier(&mut self) {
+        self.encoder
+            .memoryBarrierWithScope(MTLBarrierScope::Buffers);
     }
 
     /// The encoder is done; the recording may be submitted.
