@@ -97,6 +97,7 @@ use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::GgmlType;
+use model::arch::qwen3moe::names::{ffn_down_exps, ffn_gate_exps, ffn_up_exps};
 use model::moe::UNION_MAX_COLS;
 use model::placement::Plan;
 use model::placement::accepts::{self, LegSplit};
@@ -924,6 +925,26 @@ impl Placed {
             + self.hybrid.boundary().device_bytes()
     }
 
+    /// Refuses by name a placed side that holds more card bytes (the boundary
+    /// beside it, which the context and margin cover, left out) than `counted`,
+    /// the bytes the plan counts for it ([`placed_bytes`]): a side past its
+    /// count would take card bytes the plan's scratch does not hold.
+    pub(super) fn within(&self, counted: u64) -> Result<(), GpuError> {
+        let held = self.device_bytes() - self.hybrid.boundary().device_bytes();
+        if u64::try_from(held)
+            .map_err(|_| GpuError::shape(WHAT, "the placed side's bytes pass u64"))?
+            > counted
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the placed side holds {held} card bytes, past the {counted} the plan counts for it"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// The host tier ([`crate::host::HostTier::stats`] and the rest).
     #[must_use]
     pub fn hybrid(&self) -> &Hybrid<HostRun> {
@@ -993,17 +1014,12 @@ impl Placed {
 /// it. Past [`GEMV_COLS`] rows each layer's table over its card experts is
 /// counted at the larger of the file's expert count and one expert, the
 /// bound the plan's expert split (which this count is an input to) cannot
-/// know; [`Placed::new`] checks the load against the count at its split. A
-/// chain of dense FFNs is refused by name.
-pub(super) fn placed_bytes(d: &Dims, layers: usize, rows: usize) -> Result<u64, GpuError> {
-    placed_bytes_with(d, layers, rows, CommonForms::NONE)
-}
-
-/// [`placed_bytes`] for a load with the common-leg layers `common` names:
-/// their buffers counted beside the rest, at the forms the plan's types hold
-/// (a load whose plan gives none of a form's layers card experts holds fewer,
-/// which [`Placed::new`] checks at its split).
-pub(super) fn placed_bytes_with(
+/// know; [`Placed::new`] checks the load against the count at its split. The
+/// common-leg layers `common` names have their buffers counted beside the
+/// rest, at the forms the file's types hold (a load whose plan gives none of
+/// a form's layers card experts holds fewer, which [`Placed::new`] checks at
+/// its split). A chain of dense FFNs is refused by name.
+pub(super) fn placed_bytes(
     d: &Dims,
     layers: usize,
     rows: usize,
@@ -1063,25 +1079,19 @@ pub(super) fn prompt_rows(u: usize, ctx: usize) -> usize {
     u.max(GEMV_COLS).min(ctx)
 }
 
-/// The card bytes a placed load of `layers` layers over arena dims `d` and
-/// forms `forms` holds past the m = 1 scratch: its ubatch arena at the placed
-/// units' rows ([`PLACED_ROWS`], [`arena_bytes`]) and its placed side
-/// ([`placed_bytes`]) — what the plan's machine counts in the card's scratch
-/// (`model::placement::workstation::placed_with_arena`), and what [`counted_arena`]
-/// holds the load to.
-pub(super) fn placed_scratch(d: &Dims, layers: usize, forms: Forms) -> Result<u64, GpuError> {
-    placed_scratch_with(d, layers, (forms, CommonForms::NONE))
-}
-
-/// [`placed_scratch`] for a load with the common-leg layers `common` names
-/// ([`placed_bytes_with`]).
-pub(super) fn placed_scratch_with(
+/// The card bytes a placed load of `layers` layers over arena dims `d`, forms
+/// `forms` and common-leg forms `common` holds past the m = 1 scratch: its
+/// ubatch arena at the placed units' rows ([`PLACED_ROWS`], [`arena_bytes`])
+/// and its placed side ([`placed_bytes`]) — what the plan's machine counts in
+/// the card's scratch (`model::placement::workstation::placed_with_arena`),
+/// and what [`counted_arena`] holds the load to.
+pub(super) fn placed_scratch(
     d: &Dims,
     layers: usize,
     (forms, common): (Forms, CommonForms),
 ) -> Result<u64, GpuError> {
     let arena = arena_bytes(d, prompt_rows(PLACED_ROWS, d.ctx), forms) as u64;
-    Ok(arena + placed_bytes_with(d, layers, PLACED_ROWS, common)?)
+    Ok(arena + placed_bytes(d, layers, PLACED_ROWS, common)?)
 }
 
 /// The ubatch arena of `d` for ubatches of `u` tokens on a placed load,
@@ -1215,9 +1225,9 @@ pub(super) fn apart_plans(plans: Vec<LayerPlan>) -> Vec<LayerPlan> {
                             down_ty: ffn.down_ty,
                         })),
                     },
-                    gate: model::arch::qwen3moe::names::ffn_gate_exps(l),
-                    up: model::arch::qwen3moe::names::ffn_up_exps(l),
-                    down: model::arch::qwen3moe::names::ffn_down_exps(l),
+                    gate: ffn_gate_exps(l),
+                    up: ffn_up_exps(l),
+                    down: ffn_down_exps(l),
                     ..ffn
                 },
                 route => FfnPlan { route, ..ffn },
@@ -1267,6 +1277,97 @@ pub(super) fn stack_files(
     ])
 }
 
+/// The file type of routed stack `name` of `rows` rows of `k` values, from
+/// its header entry: the type itself, where `file_site` names only the types
+/// a card site launches. A missing tensor or another shape is refused by
+/// name, `what` naming the entry point that read the header.
+fn stack_ty(
+    file: &Split,
+    what: &'static str,
+    name: &str,
+    (rows, k): (usize, usize),
+) -> Result<GgmlType, GpuError> {
+    let (_, t) = file
+        .find(name)
+        .ok_or_else(|| GpuError::tensor(what, name, "in the file"))?;
+    let got_k = t.dims.first().copied().unwrap_or(0);
+    let got_rows: u64 = t.dims.iter().skip(1).product();
+    if usize::try_from(got_k).ok() != Some(k) || usize::try_from(got_rows).ok() != Some(rows) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{name} is {:?} in the file; the stack takes {rows} rows of {k}",
+                t.dims
+            ),
+        ));
+    }
+    Ok(t.ty)
+}
+
+/// The leg that runs layer `l`'s routed stacks (`n` experts of `ff` rows of
+/// `h` values) on the placed card, with the stacks' file types, read from
+/// `file`'s header before any upload: the planner's own verdict
+/// ([`accepts::qwen35_leg`]), `None` for a layer the host tier runs. A stack of
+/// a type that neither the card leg's arm for its part ([`accepts::leg_arms`])
+/// nor the host tier's fused rows ([`model::ops::host_stack_runs`]) runs is
+/// refused by name, with the layer: no plan can place it. `what` names the
+/// entry point that read the header.
+pub(super) fn card_leg(
+    file: &Split,
+    what: &'static str,
+    l: usize,
+    (ff, h, n): (usize, usize, usize),
+) -> Result<Option<(LegSplit, [GgmlType; 3])>, GpuError> {
+    let program = accepts::Program::Qwen35Body;
+    let arms = accepts::leg_arms(program)
+        .ok_or_else(|| GpuError::shape(what, "the placed side's body runs no card leg"))?;
+    let stack = |part: &str,
+                 name: String,
+                 (rows, k): (usize, usize),
+                 (kind, arm): (&str, fn(GgmlType) -> bool)|
+     -> Result<GgmlType, GpuError> {
+        let ty = stack_ty(file, what, &name, (n * rows, k))?;
+        if !arm(ty) {
+            model::ops::host_stack_runs("the host tier", &name, ty, k).map_err(|e| {
+                GpuError::shape(
+                    what,
+                    format!(
+                        "layer {l}: the {part} stack is {ty}, which runs on no tier: the card \
+                         leg's {kind} launches read none; {e}"
+                    ),
+                )
+            })?;
+        }
+        Ok(ty)
+    };
+    let gate_up = ("gate·up", arms.gate_up);
+    let tys = [
+        stack("gate", ffn_gate_exps(l), (ff, h), gate_up)?,
+        stack("up", ffn_up_exps(l), (ff, h), gate_up)?,
+        stack("down", ffn_down_exps(l), (h, ff), ("down", arms.down))?,
+    ];
+    Ok(accepts::qwen35_leg(tys).map(|leg| (leg, tys)))
+}
+
+/// The forms the layers the common card leg runs ([`LegSplit::Common`]) hold
+/// buffers of, from `file`'s header: `layers` are each routed layer with its
+/// expert count, `ff` and `h` the width of an expert's stacks. A load whose
+/// layers the dispatch's launches run alone holds [`CommonForms::NONE`].
+pub(super) fn common_forms(
+    file: &Split,
+    what: &'static str,
+    layers: impl IntoIterator<Item = (usize, usize)>,
+    (ff, h): (usize, usize),
+) -> Result<CommonForms, GpuError> {
+    let mut tys = Vec::new();
+    for (l, n) in layers {
+        if let Some((LegSplit::Common, [gate_up, _, down])) = card_leg(file, what, l, (ff, h, n))? {
+            tys.push([gate_up, down]);
+        }
+    }
+    Ok(CommonForms::of(tys))
+}
+
 /// Layer `l`'s card stacks under `map` (module doc, [`Placed::new`]): their
 /// slots are the map's capacity, which a residency machine's evictions and
 /// admissions leave as it is (`SlotMap::evict`), where the live count drops
@@ -1279,11 +1380,7 @@ fn placed_ffn(
     l: usize,
 ) -> Result<PlacedFfn, GpuError> {
     let n_card = map.capacity(l)?;
-    let (gate, up, down) = (
-        model::arch::qwen3moe::names::ffn_gate_exps(l),
-        model::arch::qwen3moe::names::ffn_up_exps(l),
-        model::arch::qwen3moe::names::ffn_down_exps(l),
-    );
+    let (gate, up, down) = (ffn_gate_exps(l), ffn_up_exps(l), ffn_down_exps(l));
     let (h, ff) = (s.hidden, s.ff);
     let leg = if n_card > 0 {
         let tys = stack_files(w, [&gate, &up, &down], (n_card, ff, h), l, WHAT)?;
@@ -1571,19 +1668,19 @@ fn shadow(
 }
 
 /// The plan's card leg arms the common-leg layers' stacks are admitted by
-/// ([`accepts::leg_arms`] of the qwen35moe body), and what a refusal of a
-/// stack of another type names.
+/// ([`accepts::leg_arms`], one pair for both bodies of the family), and what
+/// a refusal of a stack of another type names.
 fn common_stacks<'a>(w: &'a Weights, f: &'a PlacedFfn) -> Result<LegStacks<'a>, GpuError> {
     let arms = accepts::leg_arms(accepts::Program::Qwen35Body)
-        .ok_or(GpuError::state(WHAT, "the qwen35moe body's card leg arms"))?;
+        .ok_or(GpuError::state(WHAT, "the placed card leg's arms"))?;
     LegStacks::of_arms(
         w,
         [&f.gate, &f.up, &f.down],
         arms,
         (
-            "a resident routed gate or up stack of a type the qwen35moe card leg runs \
+            "a resident routed gate or up stack of a type the placed card leg runs \
              (`accepts::prompt_leg_gate_up`)",
-            "a resident routed down stack of a type the qwen35moe card leg runs \
+            "a resident routed down stack of a type the placed card leg runs \
              (`accepts::prompt_leg_down`)",
         ),
     )

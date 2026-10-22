@@ -1,0 +1,39 @@
+# Qwen3-30B-A3B's placed card leg reads Qwen3.6's arms (branch q30leg, stacked on PR #629): decode at the serving
+# defaults, --place unset, ctx unset, on one RTX 3090.
+# Derivation [derived], from the plan the bin prints at the serving defaults (`bloomery-serve --model qwen3 -m <file> --plan`
+# on the 3090, card_free 25073352704 B, ctx rule halved to 131072, one slot): Q8_0 card_experts=1746 host_experts=4398
+# (n_l 36-37 of 128), Q6_K card_experts=2306 host_experts=3838 (n_l 48-49), where main plans 0 for both. Expert bytes
+# (2048 x 768 elements a stack, 3 stacks): Q8_0 8.5 bpw = 5.014 MB, Q6_K 6.5625 bpw = 3.871 MB; 8 routed experts a layer, 48
+# layers, so the host leg at 128 GB/s is 0.313 ms a layer (15.04 ms a token) for Q8_0 and 0.242 ms (11.61 ms) for Q6_K.
+# Wall a token = c + sum over layers of max(host leg x (1 - f), card shadow x f); f = card experts / 6144 = 0.284 (Q8_0),
+# 0.375 (Q6_K); the card's shadow (11 MB a layer at 0.78 TB/s, 0.015 ms, plus its launches) sits under the host leg, so
+# the host leg is the max term. c (trunk front and back, handoff) = 7.0 +- 1.5 ms [assumed: the census's value from q75's
+# 0.158 ms a layer], and the common leg's shadow adds 0 to 1 ms to it [measured on Qwen3.6, q75-decode.card: c 6.19 -> 6.49
+# and 5.76 -> 6.72 ms]. Q8_0: 22.04 -> 17.77 ms at c 7.0 (45.4 -> 56.3 tok/s, +24 %); the band is c 5.5 with no added
+# cost (+26.2 %) to c 8.5 with 1.0 ms added (+16.1 %). Q6_K: 18.61 -> 14.25 ms (53.7 -> 70.2 tok/s, +31 %); the band is
+# +20.1 % to +34.2 %. Uniform routing assumed; skewed routing raises the card's share.
+# Timeline per layer, Q8_0 (ms): host DRAM and CPU 0.224 (28.7 MB of the 40.1 MB a layer); card SMs front and back 0.146,
+# shadow 0.045 [assumed: 0.015 for its 11 MB, 30 us of launches] under the host leg; PCIe handoff 0.01; NVMe 0 (the host
+# set is page cache). Wall 0.370 = front + max(host, shadow) + back, not a sum of the resources: the next layer's front
+# needs this layer's combine, so the trunk cannot run under the host leg. Demands in ms a token: host 10.77, trunk 7.0, shadow 2.1 of the 17.77 step; the host leg is the
+# largest and a lever on it moves the step (the card's bytes taken off it).
+# Predicted absolute rates before the change [derived]: Q8_0 45.4 tok/s (42.5-48.7 over c), Q6_K 53.7 (49.7-58.4).
+kind: ab
+question: does moving 28 % of the experts of the Qwen3-30B-A3B-Instruct-2507 Q8_0 file (and 38 % of its Q6_K file) onto
+  the card read the derived decode gain on one RTX 3090 at the serving defaults?
+term: tg tok/s @ D = 6 (prose corpus ids), Qwen3-30B-A3B-Instruct-2507 Q8_0, bloomery-serve at the serving defaults, ctx
+  131072 (the seat's own pick), --place unset, RTX 3090; the Q6_K file in the same lease as the second table
+unit: %
+predict: +16..+26
+rounds: 4
+sd: 0.6 % AGENTS.md Know the ruler, same-binary scatter; the ratio at 4 rounds reads +-1.0 %
+condition: one lease with the box quiet (no gate on either card); depth-serve.sh with DEPTH_SERVE_CTX=131072 (the ctx the
+  seat picks at its defaults, which the runner's listening-line check requires of both arms), one fresh server an arm and a
+  round, the base arm main a0d5dec43's bloomery-serve (q30leg's parent, which plans no card expert for either file) and the changed
+  arm q30leg's, D 6 with N 128; the Q8_0 file /models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf and the Q6_K
+  file beside it; rows tagged [cpu-busy], [other-busy] or [cold] are rerun
+decide-in: land q30leg; the README's Qwen3-30B rows name the Q8_0 and Q6_K decode rates
+decide-below: under +16 %: the host leg is not the max term, c is above 8.5 ms or the common leg's shadow costs more than 1 ms
+  a layer; read one nsys of a decode step on the Q8_0 file before landing
+decide-above: beyond +26 %: routing is skewed toward the experts the plan placed, or c is under 5.5 ms; land, and read the
+  residency hit rate from the step stats

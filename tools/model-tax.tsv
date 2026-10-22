@@ -140,7 +140,7 @@ crates/model/src/arch/coverage.rs	gemma	18	baseline P 18: MK2 program by body
 crates/model/src/arch/coverage.rs	glm	21	baseline P 21: MK2 program by body
 crates/model/src/arch/coverage.rs	mimo	10	baseline P 10: MK2 program by body
 crates/model/src/arch/coverage.rs	nemotron	36	baseline P 36: MK2 program by body
-crates/model/src/arch/coverage.rs	qwen	61	baseline P 63: MK2 program by body
+crates/model/src/arch/coverage.rs	qwen	59	baseline P 63: MK2 program by body
 crates/model/src/arch/draft.rs	mimo	3	baseline D 4: MK1a draft usability as an ArchRow row
 crates/model/src/arch/draft.rs	qwen	13	baseline D 15: MK1a draft usability as an ArchRow row
 crates/model/src/arch/dspark.rs	deepseek	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
@@ -166,7 +166,7 @@ crates/placement/src/accepts.rs	gemma	5	PIN(2026-10-21) gemma: MK2 program by bo
 crates/placement/src/accepts.rs	glm	5	PIN(2026-10-21) glm: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	mimo	5	PIN(2026-10-21) mimo: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	nemotron	17	PIN(2026-10-21) nemotron: MK2 program by body; +2 is the family's word in the common Program::name owner, which the model's own code does not carry yet
-crates/placement/src/accepts.rs	qwen	31	PIN(2026-10-21) qwen: MK2 program by body; +3 is the family's word in the common Program::name owner, which the model's own code does not carry yet. PIN(2026-10-22): +4 is Qwen35Body's own program rows, split from Qwen3moeBody's because its placed card leg also runs the common leg (qwen35_leg, the one classifier both rules read); +1 is qwen35_leg reading leg_runs(Program::Qwen35Body, …) so its rule and the plan read one table
+crates/placement/src/accepts.rs	qwen	25	PIN(2026-10-21) qwen: MK2 program by body; +3 is the family's word in the common Program::name owner, which the model's own code does not carry yet.
 crates/placement/src/placement/nodes_scale.rs	deepseek	10	baseline D 10: shapes read from the fixture ModelSpec rows (deferred)
 crates/placement/src/placement/nodes_scale.rs	glm	2	baseline D 2: shapes read from the fixture ModelSpec rows (deferred)
 crates/placement/src/placement/nodes_scale.rs	qwen	32	baseline D 32: shapes read from the fixture ModelSpec rows (deferred)

@@ -25,11 +25,13 @@ use crate::placement::{
 use runtime::stores::{F32_BYTES, kv_plane_bytes};
 
 /// The qwen3moe program, whose card experts read the routed stacks
-/// ([`routed_rule`] of it): by part, a gate and an up
-/// of one type the program's routed gate·up launches read (a Q4_K or Q5_K)
-/// and a down its down launches read (a Q4_K, Q5_K or Q6_K). A layer with a
-/// stack of another type, or of one of these in a part no entry runs it in
-/// (a Q6_K gate), keeps its experts on the host.
+/// ([`routed_rule`] of it): by part, a gate and an up of one type the placed
+/// card leg's gate·up launches read and a down its down launches read
+/// ([`crate::placement::accepts::prompt_leg_gate_up`],
+/// [`crate::placement::accepts::prompt_leg_down`]: the same arms as Qwen3.6's
+/// program, whose body shares the placed side). A layer with a stack of another
+/// type (a Q3_K, a Q2_K), or of one of these in a part no launch runs it in (a
+/// Q6_K gate over a Q3_K down), keeps its experts on the host.
 pub const PROGRAM: Program = Program::Qwen3moeBody;
 
 /// A qwen3moe file's per-layer cache: every layer's K and V planes, a

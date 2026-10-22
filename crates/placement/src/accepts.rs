@@ -115,8 +115,8 @@ impl Program {
 /// row reads a stack in the file's block stream, its i-quant rows are
 /// `iq_sel.rs`'s, its MXFP4 row is `mxfp4_sel.rs`'s and its NVFP4 row
 /// `mxfp4_sel.rs`'s; the dispatch launches none of them, so a whole-card load
-/// refuses such a stack by name. `Body35`'s placed card leg runs those types
-/// through the common leg ([`qwen35_leg`]).
+/// refuses such a stack by name. A placed card leg (`Body`'s and `Body35`'s)
+/// runs those types through the common leg ([`qwen35_leg`]).
 #[must_use]
 pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
     let (Some(entry), Some(_)) = (kernels::gate_up(ty), kernels::gemm(ty)) else {
@@ -141,7 +141,7 @@ pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
 /// launches: the downs over `Q8Act`, Q4_K, Q5_K and Q6_K. The downs over
 /// `Q8Blocks32` (Q5_0, Q5_1, Q8_0, IQ4_NL, NVFP4) read an activation form the
 /// dispatch does not quantize, so a whole-card load refuses such a stack by
-/// name; `Body35`'s placed card leg runs the ones the common leg does
+/// name; a placed card leg runs the ones the common leg does
 /// ([`qwen35_leg`]).
 #[must_use]
 pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
@@ -163,8 +163,9 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
     }
 }
 
-/// Whether `Body35`'s placed card leg runs a routed gate or up stack of `ty`
-/// through the common leg (`crate::card_leg`'s `CardLeg`): the common leg's
+/// Whether the placed card leg of the qwen3moe family (`Body` and `Body35`:
+/// one arm pair, [`leg_arms`]) runs a routed gate or up stack of `ty` through
+/// the common leg (`crate::card_leg`'s `CardLeg`): the common leg's
 /// gate·up arms ([`kernels::card_gate_up_runs`], and the Q8_0 and Q6_K arms the
 /// leg launches for the stacks no other family's plan reads) of the types whose
 /// prompt GEMM the table names ([`kernels::gemm`]). The wide arm reads that
@@ -180,8 +181,8 @@ pub const fn prompt_leg_gate_up(ty: GgmlType) -> bool {
         && kernels::gemm(ty).is_some()
 }
 
-/// Whether `Body35`'s placed card leg runs a routed down stack of `ty`
-/// through the common leg: the arms a tensor-parallel rank runs
+/// Whether the qwen3moe family's placed card leg runs a routed down stack of
+/// `ty` through the common leg: the arms a tensor-parallel rank runs
 /// ([`kernels::rank_down_runs`]: [`kernels::card_down_runs`] and the Q6_K
 /// one) of the types whose prompt GEMM the table names. The 32-value downs
 /// (Q5_1, Q8_0, IQ4_NL) read the `Q8Blocks32` form the leg quantizes for
@@ -191,7 +192,7 @@ pub const fn prompt_leg_down(ty: GgmlType) -> bool {
     kernels::rank_down_runs(ty) && kernels::gemm(ty).is_some()
 }
 
-/// How `Body35`'s placed card leg runs a layer's routed stacks.
+/// How the qwen3moe family's placed card leg runs a layer's routed stacks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LegSplit {
     /// The family's own dispatch launches ([`qwen35_gate_up`], [`qwen35_down`]):
@@ -204,9 +205,9 @@ pub enum LegSplit {
 }
 
 /// The leg that runs a layer of routed stacks of types `[gate, up, down]` on
-/// `Body35`'s placed card, or `None` when none does (the layer is the host
-/// tier's). The one classifier the plan's rule, the load's check, the
-/// residency stack table and the placed side read.
+/// the placed card of `Body` or `Body35` (one arm pair), or `None` when none
+/// does (the layer is the host tier's). The one classifier the plan's rule,
+/// the load's check, the residency stack table and the placed side read.
 #[must_use]
 pub fn qwen35_leg([gate, up, down]: [GgmlType; 3]) -> Option<LegSplit> {
     if leg_runs(Program::Qwen35Body, [gate, up, down]) != Some(true) {
@@ -351,11 +352,7 @@ pub struct LegArms {
 #[must_use]
 pub fn leg_arms(p: Program) -> Option<LegArms> {
     match p {
-        Program::Qwen3moeBody => Some(LegArms {
-            gate_up: |ty| qwen35_gate_up(ty).is_some(),
-            down: |ty| qwen35_down(ty).is_some(),
-        }),
-        Program::Qwen35Body => Some(LegArms {
+        Program::Qwen3moeBody | Program::Qwen35Body => Some(LegArms {
             gate_up: prompt_leg_gate_up,
             down: prompt_leg_down,
         }),
@@ -405,11 +402,7 @@ pub fn leg_runs(p: Program, [gate, up, down]: [GgmlType; 3]) -> Option<bool> {
 #[must_use]
 pub fn routed_rule(p: Program) -> RoutedRule {
     match p {
-        Program::Qwen3moeBody => RoutedRule::Leg {
-            gate_up: |ty| qwen35_gate_up(ty).map(|_| leg_card_format(ty)),
-            down: |ty| qwen35_down(ty).map(|_| leg_card_format(ty)),
-        },
-        Program::Qwen35Body => RoutedRule::Leg {
+        Program::Qwen3moeBody | Program::Qwen35Body => RoutedRule::Leg {
             gate_up: |ty| prompt_leg_gate_up(ty).then(|| leg_card_format(ty)),
             down: |ty| prompt_leg_down(ty).then(|| leg_card_format(ty)),
         },
@@ -597,32 +590,47 @@ mod tests {
         }
     }
 
-    /// `Body35`'s plan rule and load check are the classifier's: a layer the
-    /// rule cards is one [`qwen35_leg`] runs, and the arms are the common
-    /// leg's. The qwen3moe body (Qwen3-30B-A3B) keeps the dispatch's arms: its
-    /// placed side has no common layer.
+    /// The qwen3moe family's placed card leg has one arm pair for both bodies
+    /// (`Body` for Qwen3-30B-A3B, `Body35` for Qwen3.6): the plan's rule and
+    /// the load's check read the common leg's arms ([`prompt_leg_gate_up`],
+    /// [`prompt_leg_down`]), and a layer the rule cards is one [`qwen35_leg`]
+    /// runs, whichever body asks. Mutant: `Program::Qwen3moeBody` back on the
+    /// FFN dispatch's arms ([`qwen35_gate_up`], [`qwen35_down`]) — the IQ4_XS
+    /// layer is the host's again for `Body`.
     #[test]
-    fn qwen35_arms_are_the_classifiers_and_the_qwen3moe_body_keeps_the_dispatchs() {
-        let arms = leg_arms(Program::Qwen35Body).expect("a card leg");
-        let old = leg_arms(Program::Qwen3moeBody).expect("a card leg");
-        for ty in types() {
-            assert_eq!((arms.gate_up)(ty), prompt_leg_gate_up(ty), "{ty} gate·up");
-            assert_eq!((arms.down)(ty), prompt_leg_down(ty), "{ty} down");
-            assert_eq!(
-                (old.gate_up)(ty),
-                qwen35_gate_up(ty).is_some(),
-                "{ty} old gate·up"
-            );
-            assert_eq!((old.down)(ty), qwen35_down(ty).is_some(), "{ty} old down");
+    fn the_qwen3moe_bodies_read_the_placed_legs_arms_and_the_classifiers() {
+        for program in [Program::Qwen3moeBody, Program::Qwen35Body] {
+            let arms = leg_arms(program).expect("a card leg");
+            let RoutedRule::Leg { gate_up, down } = routed_rule(program) else {
+                panic!("a leg rule");
+            };
+            for ty in types() {
+                assert_eq!(
+                    (arms.gate_up)(ty),
+                    prompt_leg_gate_up(ty),
+                    "{program:?} {ty} gate·up"
+                );
+                assert_eq!(
+                    (arms.down)(ty),
+                    prompt_leg_down(ty),
+                    "{program:?} {ty} down"
+                );
+                assert_eq!(
+                    gate_up(ty).is_some(),
+                    prompt_leg_gate_up(ty),
+                    "{program:?} {ty} gate·up rule"
+                );
+                assert_eq!(
+                    down(ty).is_some(),
+                    prompt_leg_down(ty),
+                    "{program:?} {ty} down rule"
+                );
+            }
+            for ty in [GgmlType::IQ4_XS, GgmlType::Q6_K, GgmlType::Q8_0] {
+                assert_eq!(leg_runs(program, [ty; 3]), Some(true), "{program:?} {ty}");
+                assert_eq!(qwen35_leg([ty; 3]), Some(LegSplit::Common), "{ty}");
+            }
         }
-        assert_eq!(
-            leg_runs(Program::Qwen35Body, [GgmlType::IQ4_XS; 3]),
-            Some(true)
-        );
-        assert_eq!(
-            leg_runs(Program::Qwen3moeBody, [GgmlType::IQ4_XS; 3]),
-            Some(false)
-        );
     }
 
     /// Qwen3.8's arms are the card leg's launches: a Q4_K, Q5_K, IQ3_XXS,

@@ -84,7 +84,8 @@ use super::image::{
 use super::mtp35::Mtp35;
 use super::placed::{
     BatchWalk, CommonForms, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, apart_plans,
-    counted_arena, placed_bytes_with, placed_scratch_with, prompt_rows, tally_shape,
+    card_leg, common_forms as placed_forms, counted_arena, placed_bytes, placed_scratch,
+    prompt_rows, tally_shape,
 };
 use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
@@ -126,12 +127,11 @@ use crate::{Gpu, GpuError, launch_u32};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
-use gguf::quant::GgmlType;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft};
 use model::placement::accepts::LegSplit;
-use model::placement::{Plan, WholeLoad, accepts};
+use model::placement::{Plan, WholeLoad};
 use runtime::seqstate::{Kept, Price};
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -557,71 +557,6 @@ enum Read35 {
 /// for them: the layer's card work is its shared expert's alone.
 const HOSTED: SiteTy = SiteTy::F32;
 
-/// The file type of routed stack `name` of `rows` rows of `k` values, from
-/// its header entry: the type itself, where `file_site` names only the types
-/// a card site launches. A missing tensor or another shape is refused by
-/// name.
-fn stack_ty(file: &Split, name: &str, (rows, k): (usize, usize)) -> Result<GgmlType, GpuError> {
-    let (_, t) = file
-        .find(name)
-        .ok_or_else(|| GpuError::tensor(WHAT, name, "in the file"))?;
-    let got_k = t.dims.first().copied().unwrap_or(0);
-    let got_rows: u64 = t.dims.iter().skip(1).product();
-    if usize::try_from(got_k).ok() != Some(k) || usize::try_from(got_rows).ok() != Some(rows) {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "{name} is {:?} in the file; the stack takes {rows} rows of {k}",
-                t.dims
-            ),
-        ));
-    }
-    Ok(t.ty)
-}
-
-/// The leg that runs layer `l`'s routed stacks (`n` experts of `ff` rows of
-/// `h` values) on the placed card, with the stacks' file types, read from
-/// `file`'s header before any upload: the planner's own verdict
-/// ([`accepts::qwen35_leg`]), `None` for a layer the host tier runs. A stack of
-/// a type that neither the card leg's arm for its part ([`accepts::leg_arms`])
-/// nor the host tier's fused rows ([`model::ops::host_stack_runs`]) runs is
-/// refused by name, with the layer: no plan can place it.
-fn card_leg(
-    file: &Split,
-    l: usize,
-    (ff, h, n): (usize, usize, usize),
-) -> Result<Option<(LegSplit, [GgmlType; 3])>, GpuError> {
-    let program = accepts::Program::Qwen35Body;
-    let arms = accepts::leg_arms(program)
-        .ok_or_else(|| GpuError::shape(WHAT, "the qwen35moe body runs no card leg"))?;
-    let stack = |part: &str,
-                 (rows, k): (usize, usize),
-                 (kind, arm): (&str, fn(GgmlType) -> bool)|
-     -> Result<GgmlType, GpuError> {
-        let name = blk(l, &format!("ffn_{part}_exps.weight"));
-        let ty = stack_ty(file, &name, (n * rows, k))?;
-        if !arm(ty) {
-            model::ops::host_stack_runs("the host tier", &name, ty, k).map_err(|e| {
-                GpuError::shape(
-                    WHAT,
-                    format!(
-                        "layer {l}: the {part} stack is {ty}, which runs on no tier: the card \
-                         leg's {kind} launches read none; {e}"
-                    ),
-                )
-            })?;
-        }
-        Ok(ty)
-    };
-    let gate_up = ("gate·up", arms.gate_up);
-    let tys = [
-        stack("gate", (ff, h), gate_up)?,
-        stack("up", (ff, h), gate_up)?,
-        stack("down", (h, ff), ("down", arms.down))?,
-    ];
-    Ok(accepts::qwen35_leg(tys).map(|leg| (leg, tys)))
-}
-
 /// The forms the layers the common card leg runs ([`LegSplit::Common`]) hold
 /// buffers of, from `file`'s header: [`CommonForms::NONE`] unless the read is a
 /// placed one, which is the only one a card leg runs a layer of by it.
@@ -634,17 +569,14 @@ fn common_forms(
     if read != Read35::Placed {
         return Ok(CommonForms::NONE);
     }
-    let mut tys = Vec::new();
-    for (l, layer) in layers.iter().enumerate() {
-        let Ffn::Moe(m) = &layer.ffn else { continue };
-        let n = m.experts as usize;
-        if let Some((LegSplit::Common, [gate_up, _, down])) =
-            card_leg(file, l, (d.ff, d.hidden, n))?
-        {
-            tys.push([gate_up, down]);
-        }
-    }
-    Ok(CommonForms::of(tys))
+    let moe = layers
+        .iter()
+        .enumerate()
+        .filter_map(|(l, layer)| match &layer.ffn {
+            Ffn::Moe(m) => Some((l, m.experts as usize)),
+            Ffn::Dense { .. } => None,
+        });
+    placed_forms(file, WHAT, moe, (d.ff, d.hidden))
 }
 
 /// The types of routed part `part` of layer `l` from `file`'s header: its
@@ -698,7 +630,7 @@ fn plan_ffn(
             let n = m.experts as usize;
             let hosted = read == Read35::Placed
                 && !matches!(
-                    card_leg(file, l, (ff, h, n))?,
+                    card_leg(file, WHAT, l, (ff, h, n))?,
                     Some((LegSplit::Dispatch, _))
                 );
             let (gate_ty, sh_gate) = part_tys(file, l, "gate", (ff, h, n), hosted)?;
@@ -1403,7 +1335,7 @@ impl GpuModel<Body35> {
     /// refused by name here, before any plan.
     pub fn placed_arena_bytes(file: &Split, o: Open35) -> Result<u64, GpuError> {
         let pre = Pre35::read_placed(file, placed_open(o))?;
-        placed_scratch_with(
+        placed_scratch(
             &pre.d,
             pre.plans.len(),
             (Forms::of(&pre.plans, &pre.d), pre.common),
@@ -1665,9 +1597,11 @@ impl Body35 {
             }
             Some((open, counted)) => {
                 refuse_stage_rows_past(WHAT, open.plan, 0, rope.table.num_bytes() as u64)?;
-                let side = placed_bytes_with(&d, plans.len(), open.rows, common)?;
+                let side = placed_bytes(&d, plans.len(), open.rows, common)?;
                 let u = counted_arena(stream, (d, forms), ubatch.get(), counted, side)?;
-                (u, Some(Placed::new(gpu, w, &plans, &d, open)?))
+                let built = Placed::new(gpu, w, &plans, &d, open)?;
+                built.within(side)?;
+                (u, Some(built))
             }
         };
         u.media = o

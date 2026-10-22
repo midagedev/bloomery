@@ -7,8 +7,8 @@ use super::dispatch::{self, PassCtx};
 use super::experts::ExpertKernels;
 use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
 use super::placed::{
-    PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, counted_arena, placed_bytes,
-    placed_scratch,
+    CommonForms, PLACED_ROWS, Placed, PlacedOpen, StepWalk, WalkParts, common_forms, counted_arena,
+    placed_bytes, placed_scratch,
 };
 use super::plan::{
     FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy, down_entry,
@@ -469,14 +469,14 @@ fn header_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<[SiteTy; 3], Gp
     Ok(tys)
 }
 
-/// Layer `l`'s routed stacks' types as a placed load's card part runs them,
-/// read from `file`'s header before any upload: `None` when the card kernel
-/// table runs no entry for them (a type no site launches, or one
-/// [`stack_entries`] refuses). Such a layer holds no card expert a placed
-/// load can run — its load refuses card experts of it by name (`placed`'s
-/// `n_card > 0` arm) and its wide arm launches nothing for a layer with none —
-/// so the plan does not refuse it. A missing tensor, or a site type of
-/// another shape, is refused by name.
+/// Layer `l`'s routed stacks' types as a placed load's dispatch runs them,
+/// read from `file`'s header before any upload: `None` when the dispatch's
+/// entries run none for them (a type no site launches, or one
+/// [`stack_entries`] refuses). Such a layer is the common card leg's
+/// ([`model::placement::accepts::qwen35_leg`]) or the host tier's, which the
+/// placed side classifies from the resident stacks (`placed`'s `n_card > 0`
+/// arm), so the plan does not refuse it. A missing tensor, or a site type of another
+/// shape, is refused by name.
 fn card_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<Option<[SiteTy; 3]>, GpuError> {
     const WHAT_H: &str = "qwen3moe::Body::load";
     let (h, ff, e) = (hp.n_embd, hp.experts.ff, hp.experts.n_expert);
@@ -503,9 +503,10 @@ fn card_stacks(file: &Split, hp: &Hparams, l: usize) -> Result<Option<[SiteTy; 3
 /// Layer `l`'s plan read from `file`'s header alone: the four attention
 /// sites' types and the three routed stacks' as the card part runs them
 /// ([`card_stacks`]), which are the types [`resolve`] finds resident; a layer
-/// whose stacks the card runs none of keeps [`parts_of`]'s, which no launch
-/// reads. An attention site [`qwen3moe_dense`] does not run is refused by
-/// name, the missing activation form named. A placed load plans its card
+/// whose stacks the dispatch runs none of keeps [`parts_of`]'s, which no
+/// dispatch launch of its experts reads (the common leg's buffers are
+/// [`CommonForms`]'s). An attention site [`qwen3moe_dense`] does not run is
+/// refused by name, the missing activation form named. A placed load plans its card
 /// bytes from it before any weight is uploaded
 /// ([`GpuModel::placed_arena_bytes`]) and its wide arm reads the stacks'
 /// types from it, the resident stacks being the card's part of them.
@@ -532,6 +533,23 @@ fn header_plan(file: &Split, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuErr
         mixer: MixerPlan::Gqa(g),
         ffn: f,
     })
+}
+
+/// The forms the layers the common card leg runs hold buffers of
+/// ([`CommonForms`]), from `file`'s header: every layer routes the family's
+/// experts, so each is read for its stacks' types ([`common_forms`]), `what`
+/// naming the entry point.
+fn header_common_forms(
+    file: &Split,
+    hp: &Hparams,
+    what: &'static str,
+) -> Result<CommonForms, GpuError> {
+    common_forms(
+        file,
+        what,
+        (0..hp.n_layer).map(|l| (l, hp.experts.n_expert)),
+        (hp.experts.ff, hp.n_embd),
+    )
 }
 
 /// A placed load's plans: [`resolve`]d against the resident weights, with the
@@ -783,7 +801,8 @@ impl GpuModel<Body> {
     /// counts in the card's scratch (`model::placement::workstation::placed_with_arena`),
     /// and what [`GpuModel::open_placed`] refuses to pass. The arena's forms
     /// are read from the file's header plan ([`header_plan`]), the plan the
-    /// load runs.
+    /// load runs, and the common leg's from the stacks' header types
+    /// ([`header_common_forms`]).
     pub fn placed_arena_bytes(file: &Split, ctx: usize) -> Result<u64, GpuError> {
         let what = "qwen3moe GpuModel::placed_arena_bytes";
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(what, e))?;
@@ -799,7 +818,8 @@ impl GpuModel<Body> {
         let plans = (0..hp.n_layer)
             .map(|l| header_plan(file, &hp, l))
             .collect::<Result<Vec<_>, _>>()?;
-        placed_scratch(&dims, plans.len(), Forms::of(&plans, &dims))
+        let common = header_common_forms(file, &hp, what)?;
+        placed_scratch(&dims, plans.len(), (Forms::of(&plans, &dims), common))
     }
 
     /// What a whole load of `file` ([`GpuModel::open`]) holds past its
@@ -842,7 +862,7 @@ impl Body {
     /// and that side) the routed stacks are the placed side's to check, their
     /// types in the plans the header's ([`placed_plans`]), the arena held to
     /// the plan's count with the side's bytes ([`counted_arena`]) and the side
-    /// built ([`Placed::new`]).
+    /// built ([`Placed::new`]) and held to those bytes ([`Placed::within`]).
     #[allow(
         clippy::too_many_arguments,
         reason = "the load's card, file, weights, layers, cache and format, ubatch and flash, and the placed side (rust-quality R8)"
@@ -901,10 +921,13 @@ impl Body {
             None => (Ubatch::new(stream, dims, ubatch, Q32::of(&plans))?, None),
             Some((open, counted)) => {
                 refuse_stage_rows_past(what, open.plan, 0, rope.table.num_bytes() as u64)?;
-                let side = placed_bytes(&dims, plans.len(), open.rows)?;
+                let common = header_common_forms(file, &hp, what)?;
+                let side = placed_bytes(&dims, plans.len(), open.rows, common)?;
                 let arena = counted_arena(stream, (dims, forms), ubatch, counted, side)?;
                 let ub = Ubatch::placed(stream, arena, ubatch)?;
-                (ub, Some(Placed::new(gpu, w, &plans, &dims, open)?))
+                let built = Placed::new(gpu, w, &plans, &dims, open)?;
+                built.within(side)?;
+                (ub, Some(built))
             }
         };
         Ok(Body {

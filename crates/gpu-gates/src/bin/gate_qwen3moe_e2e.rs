@@ -163,6 +163,27 @@
 //!   loaded by that plan gives the whole-card greedy tokens by the same
 //!   rule, the host tier serving slots. `--q5-only` runs (y) alone.
 //!
+//! - (z) the common card leg on the placed load, on each of [`Z_FILES`]
+//!   (unsloth's Qwen3-30B-A3B-Instruct-2507 `Q8_0` and `Q6_K`, which the
+//!   family has no fixture of): every layer's three routed stacks are one type
+//!   the FFN dispatch does not launch, so each layer is one the common card
+//!   leg runs (`accepts::qwen35_leg` says `LegSplit::Common`). The file is
+//!   planned at the card's floor budget (a host-only plan: no card expert) and
+//!   at [`PLACED_BUDGET`] (experts on both tiers), each loaded by its plan and
+//!   dropped alone, the planner's counted scratch the load's on both. The pass
+//!   prefill of [`Z_PASS`] ids and the wide prefill of [`WIDE_IDS`] ids, each
+//!   with its greedy continuation, give the host-only load's tokens by (y)'s
+//!   rule (a first difference only where the host-only run's margin is under
+//!   [`MARGIN_FLOOR`]) and last logits within [`Z_LOGITS_REL`] of its, and the
+//!   host tier serves fewer slots on both ports than in the host-only load,
+//!   the difference the card's. FAIL-first: `Qwen3moeBody`'s arms back on the
+//!   dispatch's (`qwen35_gate_up`, `qwen35_down`) plan no card expert on
+//!   either file, and the split is named red; the common leg's gate and up
+//!   stacks swapped (`placed::common_stacks`) move the logits past the bound;
+//!   the load with no common forms counted (`header_common_forms` returning
+//!   `CommonForms::NONE`) is refused by name at the load. `--common-only` runs
+//!   (z) alone.
+//!
 //! - (m) the memory guard, `--memguard-only` (the card as the runner pins
 //!   it, nothing loaded): the census reads device 0's free bytes (at most
 //!   its usable bytes and under its total, `record::device_free_limit`);
@@ -321,6 +342,7 @@ mod gate {
     use model::arch::qwen3moe::hparams::Hparams;
     use model::moe::UNION_MAX_COLS;
     use model::placement::PlanLevers;
+    use model::placement::accepts::{self, LegSplit};
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
@@ -532,6 +554,14 @@ mod gate {
             }
             return Ok(());
         }
+        if args.iter().any(|a| a == "--common-only") {
+            let ok = common_leg(host)?;
+            println!("gate_qwen3moe_e2e --common-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--memguard-only") {
             let ok = memguard()?;
             println!("gate_qwen3moe_e2e --memguard-only: {}", verdict(ok));
@@ -626,6 +656,7 @@ mod gate {
         ok &= placed(host)?;
         ok &= placed_no_host(host)?;
         ok &= q5_routed(host)?;
+        ok &= common_leg(host)?;
         ok &= q8_cache()?;
         println!("gate_qwen3moe_e2e: {}", verdict(ok));
         if !ok {
@@ -1590,6 +1621,211 @@ mod gate {
             verdict(served)
         );
         ok &= near_tie && served;
+        Ok(ok)
+    }
+
+    // ------------------------------- (z) the common card leg on Qwen3-30B
+
+    /// (z)'s files: unsloth's Qwen3-30B-A3B-Instruct-2507 `Q8_0` and `Q6_K`
+    /// (the family has no fixture), each of one type in every routed stack of
+    /// every layer, a type the FFN dispatch does not launch: every layer is
+    /// one the common card leg runs, the Q8_0 file's through the 32-value
+    /// forms (a `Q8Blocks32` down, the 32-value route GEMMs), the Q6_K file's
+    /// through the 128-value ones.
+    const Z_FILES: [&str; 2] = [
+        "/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf",
+        "/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q6_K.gguf",
+    ];
+
+    /// The ids (z)'s pass arm prefills: several passes, the last short.
+    const Z_PASS: usize = MAX_TOKENS * 2 + 3;
+
+    /// PIN(2026-10-22): (z)'s last-row logits after a prompt against the
+    /// host-only load's over the same ids, `‖a − b‖ / ‖b‖` (the card runs the
+    /// experts on q8_1 rows, the host through ik's 8-bit rule): 1.14e-2 and
+    /// 2.29e-2 on the Q8_0 file, 2.61e-2 and 3.68e-2 on the Q6_K file, the pass
+    /// and the wide arm each, in the first run; 1e-1 is 2.7 times the larger.
+    /// The same distance with the gate and up stacks of the common leg's
+    /// launches swapped reads 5.78e-1 to 8.08e-1.
+    const Z_LOGITS_REL: f64 = 1e-1;
+
+    /// The leg that runs layer `l` of `file` by the planner's own classifier
+    /// ([`accepts::qwen35_leg`]) over the layer's three routed stacks' header
+    /// types.
+    fn layer_leg(file: &gguf::Split, l: usize) -> Result<Option<LegSplit>, GateError> {
+        let mut tys = [gguf::quant::GgmlType::F32; 3];
+        for (ty, name) in tys.iter_mut().zip(model::arch::names::routed_stacks(l)) {
+            let (_, t) = file
+                .find(&name)
+                .ok_or_else(|| format!("no tensor {name}"))?;
+            *ty = t.ty;
+        }
+        Ok(accepts::qwen35_leg(tys))
+    }
+
+    /// What one placed load of (z) saw: its plan's card and host experts, the
+    /// planner's counted scratch against the load's, the layers that hold card
+    /// experts, the pass run and the wide run of the prompts, and the host
+    /// tier's slots on the step and the batch ports after them.
+    struct ZRun {
+        experts: (u64, u64),
+        scratch: (u64, u64),
+        carded: usize,
+        pass: LongRun,
+        wide: LongRun,
+        host_slots: (u64, u64),
+    }
+
+    /// One placed load of `path` at the card budget `pick` names for the
+    /// file's planner, its prompts run as (z) says; the model is dropped
+    /// before the call returns.
+    fn z_load(
+        path: &str,
+        label: &str,
+        pick: impl FnOnce(&PlaceQ3) -> Result<u64, GateError>,
+        host: HostCfg,
+    ) -> Result<ZRun, GateError> {
+        let file = gguf::Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, CTX, KvQ8::F16)?;
+        let budget = pick(&q)?;
+        let levers = PlanLevers {
+            card_budget_bytes: Some(budget),
+        };
+        let plan = q.plan(CTX, &levers)?;
+        for line in q.records(&plan, None)? {
+            line.print();
+        }
+        let experts = (
+            plan.cards.first().ok_or("a plan of no card")?.experts,
+            plan.host.experts,
+        );
+        let card = plan.machine.cards.first().ok_or("a plan of no card")?;
+        let scratch = (
+            model::placement::workstation::counted_arena_bytes(card),
+            Qwen3moeModel::placed_arena_bytes(&file, CTX)?,
+        );
+        let t = Instant::now();
+        let opts = Qwen3moeModel::lever_opts(CTX, KvQ8::F16)?;
+        let mut m = q3place::open_qwen3(file, &plan, opts, host)?;
+        let counts = m
+            .body("gate_qwen3moe_e2e")?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .card_counts();
+        println!(
+            "z {label}: card budget {budget} B card_experts={} host_experts={} card experts per \
+             layer {counts:?} resident_bytes={} in {:.1} s (runtime value)",
+            experts.0,
+            experts.1,
+            m.resident_bytes(),
+            t.elapsed().as_secs_f64()
+        );
+        m.set_mode(StepMode::Graph);
+        let pass = long_run(&mut m, &prose(Z_PASS)?, Some(PrefillPath::Pass), None)?;
+        let wide = long_run(&mut m, &prose(WIDE_IDS)?, Some(PrefillPath::Wide), None)?;
+        let stats = m
+            .body("gate_qwen3moe_e2e")?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .hybrid()
+            .stats();
+        Ok(ZRun {
+            experts,
+            scratch,
+            carded: counts.iter().filter(|&&n| n > 0).count(),
+            pass,
+            wide,
+            host_slots: (stats.host_slots, stats.batch_host_slots),
+        })
+    }
+
+    /// (z) (module doc), on each of [`Z_FILES`].
+    fn common_leg(host: HostCfg) -> Result<bool, GateError> {
+        let mut ok = true;
+        for path in Z_FILES {
+            ok &= common_leg_file(path, host)?;
+        }
+        Ok(ok)
+    }
+
+    /// (z) on one file: the premise from its header, the host-only load, the
+    /// split load, and the second against the first.
+    fn common_leg_file(path: &str, host: HostCfg) -> Result<bool, GateError> {
+        let file = gguf::Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let layers = Hparams::read(&file)?.n_layer;
+        let mut common = 0;
+        for l in 0..layers {
+            common += usize::from(layer_leg(&file, l)? == Some(LegSplit::Common));
+        }
+        drop(file);
+        let premise = common == layers;
+        println!(
+            "z {path}: {common} of {layers} layers hold stacks the common card leg runs {}",
+            verdict(premise)
+        );
+        if !premise {
+            return Ok(false);
+        }
+        let want = z_load(
+            path,
+            "host-only plan",
+            |q| q.budget_for_card_experts(CTX, 0, PLACED_BUDGET),
+            host,
+        )?;
+        let got = z_load(path, "split plan", |_| Ok(PLACED_BUDGET), host)?;
+        let split = got.experts.0 > 0 && got.experts.1 > 0;
+        let lean = want.experts.0 * 8 <= got.experts.0;
+        let counted = want.scratch.0 == want.scratch.1 && got.scratch.0 == got.scratch.1;
+        println!(
+            "z plans: host-only card_experts={} host_experts={}, split card_experts={} \
+             host_experts={}; the host-only plan holds at most an eighth of the split's card \
+             experts {} and the split has experts on both tiers {}; the planner's counted scratch \
+             is the load's: host-only {} B = {} B, split {} B = {} B {}",
+            want.experts.0,
+            want.experts.1,
+            got.experts.0,
+            got.experts.1,
+            verdict(lean),
+            verdict(split),
+            want.scratch.0,
+            want.scratch.1,
+            got.scratch.0,
+            got.scratch.1,
+            verdict(counted)
+        );
+        let served = got.host_slots.0 > 0 && got.host_slots.1 > 0;
+        let by_card = got.carded > 0
+            && got.host_slots.0 < want.host_slots.0
+            && got.host_slots.1 < want.host_slots.1;
+        println!(
+            "z legs: {} of {layers} layers hold card experts in the split; host slots (step, \
+             batch) {:?} against the host-only load's {:?}, fewer on both ports: the card served \
+             the difference {}; the host tier served both ports {}",
+            got.carded,
+            got.host_slots,
+            want.host_slots,
+            verdict(by_card),
+            verdict(served)
+        );
+        let mut ok = lean && split && counted && by_card && served;
+        for (arm, g, w) in [
+            ("pass", &got.pass, &want.pass),
+            ("wide", &got.wide, &want.wide),
+        ] {
+            let first_diff = w.tokens.iter().zip(&g.tokens).position(|(a, b)| a != b);
+            let near_tie = first_diff.is_none_or(|i| w.margins[i] < MARGIN_FLOOR);
+            let rel = rel_base(&g.logits, &w.logits, |i| f64::from(w.logits[i]));
+            let tight = rel <= Z_LOGITS_REL;
+            println!(
+                "z {arm} prefill greedy vs the host-only load: first difference {first_diff:?} \
+                 (none, or at a margin under {MARGIN_FLOOR}) {}; logits rel {rel:.3e} (bound \
+                 {Z_LOGITS_REL:.0e}) {}",
+                verdict(near_tie),
+                verdict(tight)
+            );
+            ok &= near_tie && tight;
+        }
+        println!("z {path}: {}", verdict(ok));
         Ok(ok)
     }
 

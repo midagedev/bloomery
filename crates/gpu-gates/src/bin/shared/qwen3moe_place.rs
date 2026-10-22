@@ -403,6 +403,73 @@ impl PlaceQ3 {
         plan_inputs(&self.inputs, &self.machine, ctx, levers)
     }
 
+    /// The smallest card budget, in bytes, under which the plan at `ctx`
+    /// positions keeps at least `want` routed experts on the card, searched up
+    /// to `ceiling`, which must itself plan that many. The expert rule fills
+    /// the layers in ascending order, one expert at a time, so a plan of
+    /// fewer experts than the file has layers leaves the later layers none.
+    /// Card experts only grow with the budget and the planner is host
+    /// arithmetic, so the search is a bisection from a budget the planner
+    /// refuses as below the card's floor; a refusal other than the floor's
+    /// ends the search by name.
+    #[allow(
+        dead_code,
+        reason = "the e2e gate's reference plan; the CLI and the seat plan at no budget"
+    )]
+    pub fn budget_for_card_experts(
+        &self,
+        ctx: usize,
+        want: u64,
+        ceiling: u64,
+    ) -> Result<u64, GateError> {
+        let card_experts = |budget: u64| -> Result<Option<u64>, GateError> {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(budget),
+            };
+            match self.plan(ctx, &levers) {
+                Ok(plan) => Ok(Some(plan.cards.first().ok_or("a plan of no card")?.experts)),
+                Err(e)
+                    if e.to_string()
+                        .contains(&format!("budget {budget} B is below its floor ")) =>
+                {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            }
+        };
+        let (mut lo, mut hi) = (0u64, ceiling);
+        if card_experts(lo)?.is_some() {
+            return Err(
+                format!("a card budget of {lo} B plans: the card's floor is not read").into(),
+            );
+        }
+        match card_experts(hi)? {
+            Some(top) if top >= want => {}
+            Some(top) => {
+                return Err(format!(
+                    "the search's upper bound, a card budget of {hi} B, plans {top} card \
+                     experts, under the {want} the caller needs"
+                )
+                .into());
+            }
+            None => {
+                return Err(format!(
+                    "the search's upper bound, a card budget of {hi} B, is below the card's floor"
+                )
+                .into());
+            }
+        }
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if card_experts(mid)?.is_some_and(|n| n >= want) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Ok(hi)
+    }
+
     /// The layers the model loads ([`layers_of`]).
     fn layers(&self) -> usize {
         layers_of(&self.inputs)
