@@ -6,7 +6,9 @@
 //! (`expert_weights_norm`) and scaled (`expert_weights_scale`), squared-ReLU
 //! experts with no gate inside the `moe_latent_size` latent, and one
 //! squared-ReLU shared expert with no gate on the hidden row
-//! (nemotron-h.cpp:282-334). No next-token layer is read. The tool calls are
+//! (nemotron-h.cpp:282-334). A file without that key has no latent: its
+//! experts act on the hidden row itself. The file's next-token blocks are
+//! carried, never read. The tool calls are
 //! the `<tool_call>` parser and the `<think>` span is read.
 
 use gguf::Split;
@@ -50,7 +52,10 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
         act: Act::ReluSqr,
         sigmoid_gate: false,
     };
-    let latent = spec_u32("moe_latent_size", hp.latent)?;
+    let latent = match hp.latent {
+        Some(v) => Some(spec_u32("moe_latent_size", v)?),
+        None => None,
+    };
     let layer = |l: usize| -> Result<LayerSpec, PlacementError> {
         let (mixer, ffn) = match hp.kinds[l] {
             Kind::Mamba => (Mixer::Mamba2(mamba), NO_BLOCK),
@@ -63,7 +68,7 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
                         experts: spec_u32("the layer's router rows", x.n_expert)?,
                         top_k: spec_u32("expert_used_count", x.top_k)?,
                         expert_ff: spec_u32("expert_feed_forward_length", x.ff)?,
-                        latent: Some(latent),
+                        latent,
                         act: Act::ReluSqr,
                         router,
                         shared: Some(shared),
@@ -84,7 +89,7 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
         vocab: spec_u32("vocab", hp.n_vocab)?,
         ctx_train: spec_u32("context_length", hp.n_ctx)?,
         rms_eps: hp.rms_eps,
-        layers: (0..hp.n_layer).map(layer).collect::<Result<Vec<_>, _>>()?,
+        layers: (0..hp.n_trunk).map(layer).collect::<Result<Vec<_>, _>>()?,
         mtp: Vec::new(),
         hc: None,
         engram: None,
@@ -142,7 +147,9 @@ mod tests {
         inner: u64,
         mamba_heads: u64,
         groups: u64,
-        latent: u64,
+        /// `moe_latent_size`: the latent the routed experts run in, `None`
+        /// where the file has none and its experts act on the hidden row.
+        latent: Option<u64>,
         shared: u64,
         top_k: i32,
         /// The Bolt file's types (NVFP4 Mamba projections, Q8_0 attention,
@@ -162,10 +169,17 @@ mod tests {
         inner: INNER,
         mamba_heads: MAMBA_HEADS,
         groups: GROUPS,
-        latent: LATENT,
+        latent: Some(LATENT),
         shared: SHARED,
         top_k: TOP_K,
         quant: false,
+    };
+
+    /// The same header without a latent: the experts act on the hidden row
+    /// itself and the file holds no latent pair.
+    const NO_LATENT: Geo = Geo {
+        latent: None,
+        ..SMALL
     };
 
     /// The gate fixture's layout (`fixture::LAYER_MAP`: Mamba-2, MoE of 240,
@@ -184,7 +198,7 @@ mod tests {
         inner: 256,
         mamba_heads: 4,
         groups: 1,
-        latent: 256,
+        latent: Some(256),
         shared: 256,
         top_k: 9,
         quant: true,
@@ -214,7 +228,7 @@ mod tests {
             let width = |_, s: Option<(u64, u64)>| s.map_or(0, |(_, w)| w as i32);
             let n_expert = self.shapes.iter().map(|&(n, _)| n).max().unwrap_or(0);
             let (kv, top_k) = (self.kv, self.top_k);
-            vec![
+            let mut keys = vec![
                 ("block_count", V::U32(self.kinds.len() as u32)),
                 ("context_length", V::U32(128)),
                 ("embedding_length", V::U32(self.embd as u32)),
@@ -251,8 +265,12 @@ mod tests {
                 ("expert_shared_count", V::U32(1)),
                 ("expert_weights_norm", V::Bool(true)),
                 ("expert_weights_scale", V::F32(5.0)),
-                ("moe_latent_size", V::U32(self.latent as u32)),
-            ]
+            ];
+            // The latent, where the file has one.
+            if let Some(latent) = self.latent {
+                keys.push(("moe_latent_size", V::U32(latent as u32)));
+            }
+            keys
         }
 
         /// A tensor's type: `quant`'s for a quantized family, f32 otherwise.
@@ -293,11 +311,16 @@ mod tests {
                 }
                 'e' => {
                     let (n, w) = shape.expect("a MoE layer's shape");
-                    let (lat, sh) = (self.latent, self.shared);
+                    // The width the experts run in: the latent, or the hidden
+                    // row where the file has no latent.
+                    let lat = self.latent.unwrap_or(self.embd);
+                    let sh = self.shared;
                     one(names::FFN_GATE_INP, vec![e, n], Ty::F32);
                     one(names::EXP_PROBS_B, vec![n], Ty::F32);
-                    one(names::FFN_LATENT_DOWN, vec![e, lat], q8);
-                    one(names::FFN_LATENT_UP, vec![lat, e], q8);
+                    if let Some(latent) = self.latent {
+                        one(names::FFN_LATENT_DOWN, vec![e, latent], q8);
+                        one(names::FFN_LATENT_UP, vec![latent, e], q8);
+                    }
                     one(names::FFN_UP_EXPS, vec![lat, w, n], iq);
                     one(names::FFN_DOWN_EXPS, vec![w, lat, n], iq);
                     one(names::FFN_UP_SHEXP, vec![e, sh], iq);
@@ -329,6 +352,17 @@ mod tests {
 
     fn tensors() -> Tensors {
         SMALL.tensors()
+    }
+
+    /// The no-latent header's keys: the same file without `moe_latent_size`.
+    fn nolatent_keys() -> Vec<(&'static str, V)> {
+        NO_LATENT.keys()
+    }
+
+    /// The no-latent header's tensors: the experts at the hidden width and no
+    /// latent pair.
+    fn nolatent_tensors() -> Tensors {
+        NO_LATENT.tensors()
     }
 
     fn load(tag: &str, kv: Vec<(&str, V)>, tensors: &Tensors) -> Result<crate::arch::Read, String> {
@@ -687,15 +721,143 @@ mod tests {
         assert_eq!(plan.host.experts, 240 + 496);
     }
 
-    /// FAIL-first: a header without `moe_latent_size` is refused by the key's
-    /// name. Reading the experts at the hidden width instead lets it read.
+    /// A header without `moe_latent_size` reads as the no-latent form: the
+    /// routed experts act on the hidden row itself, the file holds no latent
+    /// pair and the description says the experts have no latent. A reader
+    /// that still wants the key refuses the file by its name.
     #[test]
-    fn a_missing_moe_latent_size_is_named() {
-        refused(
-            "nhm-nolatent",
-            with("moe_latent_size", None),
-            &tensors(),
-            &["nemotron_h_moe.moe_latent_size", "absent"],
+    fn a_missing_moe_latent_size_reads_as_the_no_latent_form() {
+        let read = load("nhm-nolatent", nolatent_keys(), &nolatent_tensors())
+            .expect("the header reads without a latent");
+        let moe = read
+            .spec
+            .layers
+            .iter()
+            .filter_map(|l| match &l.ffn {
+                Ffn::Moe(m) => Some(m),
+                _ => None,
+            })
+            .next()
+            .expect("a MoE layer");
+        assert_eq!(moe.latent, None, "the experts act on the hidden row");
+        assert!(
+            read.tensors
+                .tensors
+                .iter()
+                .all(|t| !t.name.contains("ffn_latent")),
+            "the file holds no latent pair: {:?}",
+            read.tensors
+                .tensors
+                .iter()
+                .map(|t| &t.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A file with a next-token block: the trunk is the blocks before it, the
+    /// next-token block's tensors are carried and never loaded, and the
+    /// description runs the trunk's layers only. A reader that reads every
+    /// block as a trunk layer fails this.
+    #[test]
+    fn a_next_token_block_is_carried_and_never_run() {
+        let mut kv = keys();
+        {
+            let row = kv.iter_mut().find(|(k, _)| *k == "block_count").unwrap();
+            row.1 = V::U32((KINDS.len() + 1) as u32);
+        }
+        kv.push(("nextn_predict_layers", V::U32(1)));
+        // The per-layer arrays run over the file's blocks, the next-token
+        // block's included.
+        for key in ["feed_forward_length", "attention.head_count_kv"] {
+            let row = kv.iter_mut().find(|(k, _)| *k == key).unwrap();
+            let V::I32s(xs) = &mut row.1 else {
+                panic!("{key} is an array")
+            };
+            xs.push(0);
+        }
+        let mut t = tensors();
+        // The next-token block: a MoE layer's stems and its own.
+        let nextn = KINDS.len();
+        let (n, w) = SHAPES[0];
+        let e = EMBD;
+        let sh = SHARED;
+        t.push((
+            format!("blk.{nextn}.{}", names::ATTN_NORM),
+            vec![e],
+            Ty::F32,
+        ));
+        t.push((
+            format!("blk.{nextn}.{}", names::FFN_GATE_INP),
+            vec![e, n],
+            Ty::F32,
+        ));
+        t.push((
+            format!("blk.{nextn}.{}", names::EXP_PROBS_B),
+            vec![n],
+            Ty::F32,
+        ));
+        t.push((
+            format!("blk.{nextn}.{}", names::FFN_UP_EXPS),
+            vec![LATENT, w, n],
+            Ty::F32,
+        ));
+        t.push((
+            format!("blk.{nextn}.{}", names::FFN_DOWN_EXPS),
+            vec![w, LATENT, n],
+            Ty::F32,
+        ));
+        t.push((
+            format!("blk.{nextn}.{}", names::FFN_UP_SHEXP),
+            vec![e, sh],
+            Ty::F32,
+        ));
+        t.push((
+            format!("blk.{nextn}.{}", names::FFN_DOWN_SHEXP),
+            vec![sh, e],
+            Ty::F32,
+        ));
+        for stem in names::NEXTN {
+            let dims = if stem.ends_with("eh_proj.weight") {
+                vec![2 * e, e]
+            } else {
+                vec![e]
+            };
+            t.push((format!("blk.{nextn}.{stem}"), dims, Ty::F32));
+        }
+        let read = load("nhm-nextn", kv, &t).expect("the header reads");
+        assert_eq!(read.spec.layers.len(), KINDS.len(), "the trunk's layers");
+        assert_eq!(read.tensors.layers, KINDS.len(), "the trunk's layer count");
+        let role = |name: String| {
+            read.tensors
+                .tensors
+                .iter()
+                .find(|x| x.name == name)
+                .map(|x| x.role)
+                .expect("a classified tensor")
+        };
+        for stem in names::NEXTN {
+            assert_eq!(role(format!("blk.{nextn}.{stem}")), Role::Unused, "{stem}");
+        }
+        assert_eq!(
+            role(format!("blk.{nextn}.{}", names::FFN_UP_EXPS)),
+            Role::Unused
+        );
+        // The next-token block's tensors carry no bytes in a plan.
+        let nextn_bytes: u64 = read
+            .tensors
+            .tensors
+            .iter()
+            .filter(|t| t.name.starts_with(&format!("blk.{nextn}.")))
+            .map(|t| t.file_bytes)
+            .sum();
+        assert!(nextn_bytes > 0, "the file holds the next-token block");
+        assert!(
+            read.tensors
+                .tensors
+                .iter()
+                .filter(|t| t.name.starts_with(&format!("blk.{nextn}.")))
+                .all(|t| t.role == Role::Unused),
+            "the next-token block is carried, never loaded"
         );
     }
 
@@ -722,7 +884,7 @@ mod tests {
                 &tensors(),
                 &[
                     &format!("nemotron_h_moe.{key}"),
-                    "has 5 values for 6 layers",
+                    "has 5 values for 6 trunk layers",
                 ],
             );
         }
@@ -820,7 +982,6 @@ mod tests {
             "expert_count",
             "expert_shared_feed_forward_length",
             "expert_shared_count",
-            "expert_gating_func",
             "expert_weights_norm",
             "expert_weights_scale",
             "attention.layer_norm_epsilon",
@@ -832,6 +993,29 @@ mod tests {
                 &[&format!("nemotron_h_moe.{key}"), "absent"],
             );
         }
+        // The gating key is the dialect's to default: the dialect builds the
+        // sigmoid router whatever the key says, so a file that carries no key
+        // reads with that router and the line that says where it came from.
+        let read = load("nhm-gate", with("expert_gating_func", None), &tensors())
+            .expect("the header reads without the gating key");
+        assert_eq!(
+            read.defaults,
+            [
+                "expert_gating_func = sigmoid (nemotron-h.cpp:312, the sigmoid router the dialect \
+             builds)"
+            ]
+        );
+        let moe = read
+            .spec
+            .layers
+            .iter()
+            .filter_map(|l| match &l.ffn {
+                Ffn::Moe(m) => Some(m),
+                _ => None,
+            })
+            .next()
+            .expect("a MoE layer");
+        assert_eq!(moe.router.score, Score::Sigmoid);
         for (key, v, want) in [
             (
                 "expert_gating_func",

@@ -1,8 +1,9 @@
 //! The host tier's view of a Bolt layer's routed experts: relu² — the up and
 //! down stacks, the layer's own expert count and width, read in the
-//! `moe_latent_size` latent the experts run in. The one place that wires them
-//! into a [`Relu2Spec`] (`HostLayer::build_relu2`); this architecture's files
-//! hold no gate stack.
+//! `moe_latent_size` latent the experts run in, or in the hidden row itself
+//! where the file has no latent. The one place that wires them into a
+//! [`Relu2Spec`] (`HostLayer::build_relu2`); this architecture's files hold
+//! no gate stack.
 
 use super::hparams::{Experts, Hparams};
 use crate::ModelError;
@@ -37,7 +38,7 @@ pub fn layer(src: R8Source<'_>, hp: &Hparams, l: usize) -> Result<Option<HostLay
             up: &up,
             down: &down,
             n_expert,
-            embd: hp.latent,
+            embd: hp.experts_width() as usize,
             ff,
         },
     )

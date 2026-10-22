@@ -1,11 +1,15 @@
 //! Every `nemotron_h_moe.*` key the description reads, and each layer's kind
 //! from the per-layer arrays. A layer is Mamba-2 where both
 //! `attention.head_count_kv` and `feed_forward_length` are 0, attention
-//! where only the feed-forward length is 0, and a latent MoE layer otherwise
+//! where only the feed-forward length is 0, and a MoE layer otherwise
 //! (nemotron-h.cpp:12-16, :102, :110-111: with `expert_count` above 0 every
 //! feed-forward layer is routed). The layer's marker tensor has to say the
 //! same thing. The Mamba-2 and attention keys and tensors are read by the
 //! hybrid trunk's common pieces (`arch::hybrid`), as `nemotron_h` reads its.
+//!
+//! The file's blocks close with its next-token layers (`nextn_predict_layers`,
+//! the common owner `arch::nextn_layers`): the trunk is the blocks before
+//! them, and a next-token block's tensors are carried, never loaded.
 //!
 //! The MoE layers differ from layer to layer: `expert_feed_forward_length`
 //! and `expert_used_count` are per-layer arrays, 0 on every other layer, and
@@ -13,9 +17,10 @@
 //! dim and its bias repeat. `expert_count` is the largest layer's. The
 //! routed experts run in a `moe_latent_size` latent, and a shared expert of
 //! `expert_shared_feed_forward_length` runs beside them on the hidden row
-//! (nemotron-h.cpp:111-131, :282-334).
+//! (nemotron-h.cpp:111-131, :282-334). A file without that key has no
+//! latent: its experts act on the hidden row itself.
 
-use gguf::{GgmlType, Split};
+use gguf::{GgmlType, Split, Value};
 
 use super::names::{
     self, ATTN_NORM, EXP_PROBS_B, FFN_DOWN_EXPS, FFN_DOWN_SHEXP, FFN_GATE_INP, FFN_LATENT_DOWN,
@@ -23,10 +28,10 @@ use super::names::{
 };
 use super::roles;
 pub use crate::arch::hybrid::Ssm;
-use crate::arch::hybrid::{Attn, attn, layer_kinds, layers_agree, mamba_dims, no_nextn, ssm};
+use crate::arch::hybrid::{Attn, attn, layer_kinds, layers_agree, mamba_dims, ssm};
 use crate::arch::{
-    finite_positive, meta_bool, metadata, n_vocab, one_expert_group, per_layer_count, positive,
-    sigmoid_gating, unread_keys_of,
+    finite_positive, meta_bool, metadata, n_vocab, nextn_layers, one_expert_group, optional_usize,
+    per_layer_count_trunk, positive, sigmoid_gating, unread_keys_of,
 };
 use crate::placement::PlacementError;
 
@@ -71,9 +76,11 @@ pub struct Experts {
 /// The hyperparameters of one `nemotron_h_moe` file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hparams {
-    /// `block_count`. This reader runs no next-token layer, so every block
-    /// is a trunk layer.
+    /// `block_count`: the file's blocks, the next-token block's included.
     pub n_layer: usize,
+    /// The trunk: the blocks the description runs, `block_count` less the
+    /// next-token layers the file carries.
+    pub n_trunk: usize,
     /// `embedding_length`.
     pub n_embd: usize,
     /// `context_length`.
@@ -90,16 +97,19 @@ pub struct Hparams {
     pub value_len: usize,
     /// The Mamba-2 widths. One set for every Mamba-2 layer.
     pub ssm: Ssm,
-    /// `attention.head_count_kv`, per layer. 0 on a Mamba-2 or MoE layer.
+    /// `attention.head_count_kv`, per trunk layer. 0 on a Mamba-2 or MoE
+    /// layer.
     pub kv: Vec<usize>,
-    /// Every layer's kind, in order.
+    /// Every trunk layer's kind, in order.
     pub kinds: Vec<Kind>,
     /// `expert_count`: the largest MoE layer's expert count.
     pub n_expert: usize,
-    /// Each layer's routed experts; `None` on a Mamba-2 or attention layer.
+    /// Each trunk layer's routed experts; `None` on a Mamba-2 or attention
+    /// layer.
     pub experts: Vec<Option<Experts>>,
-    /// `moe_latent_size`: the values the routed experts read and write.
-    pub latent: usize,
+    /// `moe_latent_size`: the values the routed experts read and write,
+    /// `None` when they act on the hidden row itself.
+    pub latent: Option<usize>,
     /// `expert_shared_feed_forward_length`: the shared expert's values.
     pub shared_ff: usize,
     /// `expert_weights_norm`: the kept weights renormalized to sum to one.
@@ -158,7 +168,11 @@ impl Hparams {
     /// tensor.
     pub fn read(split: &Split) -> Result<Hparams, PlacementError> {
         let n_layer = positive(split, "block_count")?;
-        no_nextn(split)?;
+        let mut defaults = Vec::new();
+        // The next-token blocks the file closes with (the common owner). A
+        // file with no such key has none, and the absence is no default the
+        // reader took.
+        let n_trunk = n_layer - nextn_layers(split, n_layer, "", "", &mut defaults)?.past_trunk;
         let n_embd = positive(split, "embedding_length")?;
         let n_ctx = positive(split, "context_length")?;
         let rms_eps = finite_positive(split, "attention.layer_norm_rms_epsilon")?;
@@ -167,7 +181,12 @@ impl Hparams {
         let ssm = ssm(split)?;
         let n_vocab = n_vocab(split)?;
         let n_expert = positive(split, "expert_count")?;
-        let latent = positive(split, "moe_latent_size")?;
+        // The latent the routed experts run in; a file without the key has
+        // none, and its experts act on the hidden row itself.
+        let latent = match optional_usize(split, "moe_latent_size")? {
+            Some(0) => return Err(metadata(split, "moe_latent_size", "is 0")),
+            other => other,
+        };
         let shared_ff = positive(split, "expert_shared_feed_forward_length")?;
         let shared = positive(split, "expert_shared_count")?;
         if shared != 1 {
@@ -177,17 +196,28 @@ impl Hparams {
                 format!("is {shared}; a layer runs one shared expert"),
             ));
         }
-        // Required: nemotron-h.cpp:312 builds the sigmoid router whatever the
-        // key says, so a file that says another is refused, not defaulted.
-        let mut defaults = Vec::new();
-        sigmoid_gating(split, None, &mut defaults)?;
+        // The dialect builds the sigmoid router whatever the key says
+        // (nemotron-h.cpp:312), so a file that says another is refused; a
+        // file that carries no key has the dialect's router.
+        sigmoid_gating(
+            split,
+            Some("nemotron-h.cpp:312, the sigmoid router the dialect builds"),
+            &mut defaults,
+        )?;
         let weights_norm = meta_bool(split, "expert_weights_norm")?;
         let weights_scale = finite_positive(split, "expert_weights_scale")?;
         one_expert_group(split, "the nemotron_h_moe router")?;
-        let kv = per_layer_count(split, "attention.head_count_kv", n_layer)?;
-        let ff = per_layer_count(split, "feed_forward_length", n_layer)?;
-        let expert_ff = per_layer_count(split, "expert_feed_forward_length", n_layer)?;
-        let top_k = per_layer_count(split, "expert_used_count", n_layer)?;
+        let kv = per_layer_count_trunk(split, "attention.head_count_kv", n_trunk, n_layer)?;
+        let ff = per_layer_count_trunk(split, "feed_forward_length", n_trunk, n_layer)?;
+        let expert_ff =
+            per_layer_count_trunk(split, "expert_feed_forward_length", n_trunk, n_layer)?;
+        let top_k = per_layer_count_trunk(split, "expert_used_count", n_trunk, n_layer)?;
+        // A per-layer array marks the layers that route; a shared count
+        // describes every layer's experts and marks no layer.
+        let per_layer = [
+            per_layer_array(split, "expert_feed_forward_length"),
+            per_layer_array(split, "expert_used_count"),
+        ];
         let kinds = layer_kinds(
             split,
             &kv,
@@ -202,9 +232,22 @@ impl Hparams {
             if kind == Kind::Attention {
                 attn.check_layer(split, l, kv[l])?;
             }
-            routed_arrays_agree(split, l, kind, expert_ff[l], top_k[l])?;
+            routed_arrays_agree(
+                split,
+                l,
+                kind,
+                [
+                    ("expert_feed_forward_length", expert_ff[l], per_layer[0]),
+                    ("expert_used_count", top_k[l], per_layer[1]),
+                ],
+            )?;
         }
-        layers_agree(split, &kinds, roles::stems_of, &KINDS)?;
+        layers_agree(
+            split,
+            &kinds,
+            |k| roles::stems_of(k, latent.is_some()),
+            &KINDS,
+        )?;
         let experts = kinds
             .iter()
             .enumerate()
@@ -227,6 +270,7 @@ impl Hparams {
         }
         let hp = Hparams {
             n_layer,
+            n_trunk,
             n_embd,
             n_ctx,
             n_vocab,
@@ -288,20 +332,33 @@ impl Hparams {
             Kind::Moe => {
                 let x = self.experts[l].expect("a MoE layer's experts are read");
                 let (n, w) = (x.n_expert as u64, x.ff as u64);
-                let (lat, sh) = (self.latent as u64, self.shared_ff as u64);
+                let (lat, sh) = (self.experts_width(), self.shared_ff as u64);
                 want.extend([
                     (FFN_GATE_INP, vec![e, n]),
                     (EXP_PROBS_B, vec![n]),
-                    (FFN_LATENT_DOWN, vec![e, lat]),
-                    (FFN_LATENT_UP, vec![lat, e]),
                     (FFN_UP_EXPS, vec![lat, w, n]),
                     (FFN_DOWN_EXPS, vec![w, lat, n]),
                     (FFN_UP_SHEXP, vec![e, sh]),
                     (FFN_DOWN_SHEXP, vec![sh, e]),
                 ]);
+                // The latent pair, where the file has a latent.
+                if let Some(lat) = self.latent {
+                    want.extend([
+                        (FFN_LATENT_DOWN, vec![e, lat as u64]),
+                        (FFN_LATENT_UP, vec![lat as u64, e]),
+                    ]);
+                }
             }
         }
         want
+    }
+
+    /// The width the routed experts read and write: the latent the file's
+    /// down projection makes, or the hidden row itself where the file has no
+    /// latent.
+    #[must_use]
+    pub fn experts_width(&self) -> u64 {
+        self.latent.unwrap_or(self.n_embd) as u64
     }
 
     /// A projection's per-tensor scale is one f32: the graph multiplies the
@@ -329,20 +386,23 @@ impl Hparams {
     }
 }
 
+/// Whether `suffix` is a per-layer array in `split`: a shared count is one
+/// value for every layer and marks no layer.
+fn per_layer_array(split: &Split, suffix: &str) -> bool {
+    matches!(split.value(&split.arch_key(suffix)), Some(Value::Array(_)))
+}
+
 /// Layer `l`'s entries of the two routed arrays agree with its kind: both
-/// above 0 on a MoE layer, both 0 on any other. Each refusal names its key
-/// and the layer.
+/// above 0 on a MoE layer, and 0 on any other where the key is a per-layer
+/// array (a shared count describes every layer's experts and marks no
+/// layer). Each refusal names its key and the layer.
 fn routed_arrays_agree(
     split: &Split,
     l: usize,
     kind: Kind,
-    ff: usize,
-    top_k: usize,
+    routed: [(&'static str, usize, bool); 2],
 ) -> Result<(), PlacementError> {
-    for (key, v) in [
-        ("expert_feed_forward_length", ff),
-        ("expert_used_count", top_k),
-    ] {
+    for (key, v, per_layer) in routed {
         let moe = kind == Kind::Moe;
         if moe && v == 0 {
             return Err(metadata(
@@ -351,7 +411,7 @@ fn routed_arrays_agree(
                 format!("is 0 at layer {l}, {}", kind.what()),
             ));
         }
-        if !moe && v != 0 {
+        if per_layer && !moe && v != 0 {
             return Err(metadata(
                 split,
                 key,

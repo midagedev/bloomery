@@ -1,29 +1,29 @@
 //! Bolt's routers: the sigmoid router with a selection bias
 //! ([`crate::sigmoid_router_instance!`], the generic bodies of
 //! [`crate::route_body`] GLM-5.3-Flash's and MiMo's routers are instances
-//! of) at each expert count a Bolt MoE layer has — 240, 304, 368, 432 and
-//! 496, the top 9 of each (`models::shape::ROUTERS`' Bolt rows). Each
-//! expert scores `sigmoid(logit)` of its F32 router row on the layer's normed
-//! row; the bias is added for the pick only; the top 9 by the biased score
-//! are kept, their unbiased scores summed in f64 in slot order, the sum
-//! narrowed to f32 and guarded ([`crate::route_core::renorm_divisor`]), each
-//! score divided by it and multiplied by `expert_weights_scale`, all in f32
+//! of) at each expert count a MoE layer has — 240, 304, 368, 432 and 496
+//! with the top 9 of each (Bolt) and 128 with the top 6 (Lightning's, the
+//! instance Raon-1's module owns by its shape), the rows of
+//! `models::shape::ROUTERS` this family runs. Each expert scores
+//! `sigmoid(logit)` of its F32 router row on the layer's normed row; the
+//! bias is added for the pick only; the top of each by the biased score are
+//! kept, their unbiased scores summed in f64 in slot order, the sum narrowed
+//! to f32 and guarded ([`crate::route_core::renorm_divisor`]), each score
+//! divided by it and multiplied by `expert_weights_scale`, all in f32
 //! (llama-graph.cpp `build_moe_ffn`:2167-2280 at cd0a5b6a1: `ggml_sigmoid`,
 //! `probs + exp_probs_b` for the selection, `ggml_argsort_top_k`,
 //! `ggml_get_rows` of the unbiased probs, the clamped sum's division,
 //! `ggml_scale`). A selection value or a weight that is not finite raises
 //! [`crate::FaultSite::Router`].
 //!
-//! [`Routers`] holds the five instances' modules, [`RouteOut`] one layer's
+//! [`Routers`] holds the instances' modules, [`RouteOut`] one layer's
 //! results at its own count; a count no instance is built for is refused by
 //! name at load.
 
+use crate::arch::raon1::ffn::sigmoid_128_6;
 use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use std::sync::Arc;
-
-/// Experts every Bolt MoE layer keeps a token.
-pub(crate) const TOP_K: usize = 9;
 
 crate::sigmoid_router_instance! {
     /// Bolt's router at 240 experts, the top 9.
@@ -80,30 +80,29 @@ crate::sigmoid_router_instance! {
     }
 }
 
-const _: () = assert!(
-    e240::N_USED == TOP_K
-        && e304::N_USED == TOP_K
-        && e368::N_USED == TOP_K
-        && e432::N_USED == TOP_K
-        && e496::N_USED == TOP_K
-);
+/// The most experts a token keeps, over the instances (the top 9 of Bolt's
+/// five widths, the top 6 of the 128-expert one).
+pub(crate) const MAX_TOP_K: usize = 9;
 
 /// The expert counts an instance is built for.
-pub(crate) const COUNTS: [usize; 5] = [
+pub(crate) const COUNTS: [usize; 6] = [
     e240::N_EXPERT,
     e304::N_EXPERT,
     e368::N_EXPERT,
     e432::N_EXPERT,
     e496::N_EXPERT,
+    sigmoid_128_6::N_EXPERT,
 ];
 
-/// The five instances' loaded modules.
+/// The instances' loaded modules.
 pub(crate) struct Routers {
     e240: e240::RouterKernels,
     e304: e304::RouterKernels,
     e368: e368::RouterKernels,
     e432: e432::RouterKernels,
     e496: e496::RouterKernels,
+    /// The 128-expert instance (the top 6), Raon-1's module by its shape.
+    e128: sigmoid_128_6::RouterKernels,
 }
 
 /// One layer's router results at its own expert count.
@@ -113,6 +112,7 @@ pub(crate) enum RouteOut {
     E368(e368::RouterOut),
     E432(e432::RouterOut),
     E496(e496::RouterOut),
+    E128(sigmoid_128_6::RouterOut),
 }
 
 impl RouteOut {
@@ -129,6 +129,7 @@ impl RouteOut {
             e368::N_EXPERT => RouteOut::E368(e368::RouterOut::new(stream)?),
             e432::N_EXPERT => RouteOut::E432(e432::RouterOut::new(stream)?),
             e496::N_EXPERT => RouteOut::E496(e496::RouterOut::new(stream)?),
+            sigmoid_128_6::N_EXPERT => RouteOut::E128(sigmoid_128_6::RouterOut::new(stream)?),
             other => {
                 return Err(GpuError::shape(
                     what,
@@ -146,12 +147,26 @@ impl RouteOut {
             RouteOut::E368(_) => e368::N_EXPERT,
             RouteOut::E432(_) => e432::N_EXPERT,
             RouteOut::E496(_) => e496::N_EXPERT,
+            RouteOut::E128(_) => sigmoid_128_6::N_EXPERT,
+        }
+    }
+
+    /// The experts a token keeps (`expert_used_count`).
+    pub(crate) fn n_used(&self) -> usize {
+        match self {
+            RouteOut::E240(_) => e240::N_USED,
+            RouteOut::E304(_) => e304::N_USED,
+            RouteOut::E368(_) => e368::N_USED,
+            RouteOut::E432(_) => e432::N_USED,
+            RouteOut::E496(_) => e496::N_USED,
+            RouteOut::E128(_) => sigmoid_128_6::N_USED,
         }
     }
 
     /// Enqueue the copy of row `row` of a pass's router results (`probs` of
-    /// [`RouteOut::n_expert`] per row, `ids` and `weights` of [`TOP_K`]) into
-    /// these buffers, so the layer's results read as that row's.
+    /// [`RouteOut::n_expert`] per row, `ids` and `weights` of
+    /// [`RouteOut::n_used`]) into these buffers, so the layer's results read
+    /// as that row's.
     pub(crate) fn enqueue_row_from(
         &mut self,
         stream: &CudaStream,
@@ -159,6 +174,7 @@ impl RouteOut {
         row: usize,
     ) -> Result<(), GpuError> {
         let n = self.n_expert();
+        let used = self.n_used();
         let row_of = |width: usize| crate::tensor::Pitched {
             width,
             rows: 1,
@@ -172,18 +188,14 @@ impl RouteOut {
             RouteOut::E368(o) => (&mut o.probs, &mut o.ids, &mut o.weights),
             RouteOut::E432(o) => (&mut o.probs, &mut o.ids, &mut o.weights),
             RouteOut::E496(o) => (&mut o.probs, &mut o.ids, &mut o.weights),
+            RouteOut::E128(o) => (&mut o.probs, &mut o.ids, &mut o.weights),
         };
         crate::tensor::dtod_2d(stream, (probs, row * n * f), (p, 0), row_of(n * f))?;
-        crate::tensor::dtod_2d(stream, (ids, row * TOP_K * u), (i, 0), row_of(TOP_K * u))?;
-        crate::tensor::dtod_2d(
-            stream,
-            (weights, row * TOP_K * f),
-            (w, 0),
-            row_of(TOP_K * f),
-        )
+        crate::tensor::dtod_2d(stream, (ids, row * used * u), (i, 0), row_of(used * u))?;
+        crate::tensor::dtod_2d(stream, (weights, row * used * f), (w, 0), row_of(used * f))
     }
 
-    /// The slots' expert ids, in rank order ([`TOP_K`]).
+    /// The slots' expert ids, in rank order ([`RouteOut::n_used`]).
     pub(crate) fn ids(&self) -> &DeviceBuffer<u32> {
         match self {
             RouteOut::E240(o) => &o.ids,
@@ -191,6 +203,7 @@ impl RouteOut {
             RouteOut::E368(o) => &o.ids,
             RouteOut::E432(o) => &o.ids,
             RouteOut::E496(o) => &o.ids,
+            RouteOut::E128(o) => &o.ids,
         }
     }
 
@@ -202,6 +215,7 @@ impl RouteOut {
             RouteOut::E368(o) => &o.probs,
             RouteOut::E432(o) => &o.probs,
             RouteOut::E496(o) => &o.probs,
+            RouteOut::E128(o) => &o.probs,
         }
     }
 
@@ -213,6 +227,7 @@ impl RouteOut {
             RouteOut::E368(o) => &o.weights,
             RouteOut::E432(o) => &o.weights,
             RouteOut::E496(o) => &o.weights,
+            RouteOut::E128(o) => &o.weights,
         }
     }
 
@@ -225,13 +240,14 @@ impl RouteOut {
             RouteOut::E368(o) => (b(&o.logits, &o.probs), o.ids.num_bytes()),
             RouteOut::E432(o) => (b(&o.logits, &o.probs), o.ids.num_bytes()),
             RouteOut::E496(o) => (b(&o.logits, &o.probs), o.ids.num_bytes()),
+            RouteOut::E128(o) => (b(&o.logits, &o.probs), o.ids.num_bytes()),
         };
         lp + 2 * slots + size_of::<u32>()
     }
 }
 
 impl Routers {
-    /// Load the five modules into `ctx`. Load-time only.
+    /// Load the instances' modules into `ctx`. Load-time only.
     pub(crate) fn load(ctx: &Arc<CudaContext>) -> Result<Routers, GpuError> {
         Ok(Routers {
             e240: e240::RouterKernels::load(ctx)?,
@@ -239,6 +255,7 @@ impl Routers {
             e368: e368::RouterKernels::load(ctx)?,
             e432: e432::RouterKernels::load(ctx)?,
             e496: e496::RouterKernels::load(ctx)?,
+            e128: sigmoid_128_6::RouterKernels::load(ctx)?,
         })
     }
 
@@ -276,13 +293,17 @@ impl Routers {
             RouteOut::E496(o) => self
                 .e496
                 .enqueue_router(stream, w, x, bias, scale, o, fault),
+            RouteOut::E128(o) => self
+                .e128
+                .enqueue_router(stream, w, x, bias, scale, o, fault),
         }
     }
 
     /// Enqueue the router of `n_expert` experts for `t` tokens: `x` the
     /// tokens' normed rows, row-major; the results `probs` ([`RouteOut::n_expert`]
-    /// per row), `ids` and `weights` ([`TOP_K`] per row). A count no instance
-    /// is built for is refused by name. Asynchronous, allocation-free.
+    /// per row), `ids` and `weights` ([`RouteOut::n_used`] per row). A count
+    /// no instance is built for is refused by name. Asynchronous,
+    /// allocation-free.
     #[allow(
         clippy::too_many_arguments,
         reason = "the instances' launcher's inputs and the pass's results (rust-quality R8)"
@@ -319,6 +340,9 @@ impl Routers {
                 stream, gpu, wide, w, x, bias, scale, t, probs, ids, weights, fault,
             ),
             e496::N_EXPERT => self.e496.enqueue_router_rows(
+                stream, gpu, wide, w, x, bias, scale, t, probs, ids, weights, fault,
+            ),
+            sigmoid_128_6::N_EXPERT => self.e128.enqueue_router_rows(
                 stream, gpu, wide, w, x, bias, scale, t, probs, ids, weights, fault,
             ),
             other => Err(GpuError::shape(

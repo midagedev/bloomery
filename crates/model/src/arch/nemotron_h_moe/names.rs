@@ -34,6 +34,17 @@ pub const FFN_UP_SHEXP: &str = "ffn_up_shexp.weight";
 /// The shared expert's down projection.
 pub const FFN_DOWN_SHEXP: &str = "ffn_down_shexp.weight";
 
+/// The next-token block's own stems: the input join and its two norms, the
+/// head's norm and the block's pre-FFN norm. The block is carried, never
+/// loaded.
+pub const NEXTN: &[&str] = &[
+    "nextn.eh_proj.weight",
+    "nextn.enorm.weight",
+    "nextn.hnorm.weight",
+    "nextn.shared_head_norm.weight",
+    "post_attention_norm.weight",
+];
+
 /// `blk.{l}.ffn_gate_inp.weight`.
 #[must_use]
 pub fn ffn_gate_inp(l: usize) -> String {

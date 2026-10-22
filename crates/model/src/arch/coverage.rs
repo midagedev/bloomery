@@ -176,9 +176,10 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::NemotronHMoeBody],
         at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body at 240, 304, 368, 432 and 496 \
-             (gpu/src/arch/nemotron_h_moe/router.rs)",
+             with the top 9 and at 128 with the top 6 (gpu/src/arch/nemotron_h_moe/router.rs)",
         runs: |n| {
-            matches!(n, Need::Router(s) if s.top_k == 9) && routes(n, &[RouterBody::BiasedSigmoid])
+            matches!(n, Need::Router(s) if NEMOTRON_ROUTERS.contains(&(s.experts, s.top_k)))
+                && routes(n, &[RouterBody::BiasedSigmoid])
         },
     },
     Available {
@@ -204,14 +205,14 @@ pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::NemotronHMoeBody],
         at: "gpu/src/arch/nemotron_h_moe/moe.rs (the shared expert, one-expert iq2_xxs_gemv_sel \
-             stacks)",
+             stacks or a q8_0 site)",
         runs: |n| {
             matches!(
                 n,
                 Need::Shared {
                     ff,
                     sigmoid_gate: false,
-                } if ff.is_multiple_of(256)
+                } if ff.is_multiple_of(32)
             )
         },
     },
@@ -1257,22 +1258,6 @@ const TYPE_PINS: &[TypePin] = &[
         reads: &[GgmlType::Q8_0],
     },
     TypePin {
-        programs: &[Program::NemotronHMoeBody],
-        role: Role::RoutedExperts,
-        matrices: false,
-        names: None,
-        what: "routed experts (the body's iq2_xxs_gemv_sel reads iq2_xxs)",
-        reads: &[BOLT_LEG],
-    },
-    TypePin {
-        programs: &[Program::NemotronHMoeBody],
-        role: Role::SharedExpert,
-        matrices: false,
-        names: None,
-        what: "shared expert (the body's iq2_xxs_gemv_sel reads iq2_xxs)",
-        reads: &[BOLT_LEG],
-    },
-    TypePin {
         programs: &[Program::GemmaEmbedding2Body],
         role: Role::Attention,
         matrices: true,
@@ -1524,6 +1509,15 @@ const ROW_PINS: &[RowPin] = &[
         what: "routed experts down (the card leg's types and q5_0: accepts::resident_down_runs)",
         row: resident_down_runs,
     },
+    RowPin {
+        program: Program::NemotronHMoeBody,
+        role: Role::SharedExpert,
+        matrices: false,
+        names: None,
+        what: "shared expert (the card's iq2_xxs_gemv_sel reads iq2_xxs, its q8_0 site reads \
+               q8_0)",
+        row: |ty| ty == BOLT_LEG || ty == GgmlType::Q8_0,
+    },
 ];
 
 /// `Body35`'s projection types (`PROJ`): every attention, delta-rule and
@@ -1593,6 +1587,11 @@ fn per_layer_model_proj(name: &str) -> bool {
 fn indexer_projection(name: &str) -> bool {
     name.ends_with(".indexer.k_proj.weight") || name.ends_with(".indexer.q_proj.weight")
 }
+
+/// The `nemotron_h_moe` router instances: the (experts, kept) pairs
+/// `gpu/src/arch/nemotron_h_moe/router.rs` is built for.
+const NEMOTRON_ROUTERS: &[(u32, u32)] =
+    &[(240, 9), (304, 9), (368, 9), (432, 9), (496, 9), (128, 6)];
 
 /// The type pins of `program` (every program's when `None`), [`TYPE_PINS`]
 /// then [`ROW_PINS`], that tensor `t` is of a type none of reads, as items:
@@ -1755,11 +1754,15 @@ pub fn check_with(
                 Some(Program::NemotronHBody | Program::GemmaEmbedding2Body) => {
                     at(t.layer, Need::RoutedFormat(t.ty));
                 }
-                // The latent MoE body's rule (`routed_rule`'s arm): its up
-                // and down launches read [`BOLT_LEG`] stacks, every part of
-                // another type is an item.
+                // The latent MoE body's rule: a stack passes when the
+                // program can run it — on the card by its expert rule
+                // ([`BOLT_LEG`], `routed_rule`'s arm) or on the host by a
+                // qdot fused kernel at the stack's row width
+                // ([`routed_unrun`], the one owner). A layer with a stack the
+                // card experts do not read keeps all its experts on the
+                // host.
                 Some(Program::NemotronHMoeBody) => {
-                    if t.ty != BOLT_LEG {
+                    if routed_unrun(t, |ty| ty == BOLT_LEG) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }

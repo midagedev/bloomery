@@ -13,10 +13,11 @@ use crate::flash_gqa::GROUP_16;
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::head::Head;
 use crate::host::StepLeg;
-use crate::model::{ChainBody, GpuModel, block_count, refuse_scratch_past};
+use crate::model::{ChainBody, GpuModel, refuse_scratch_past};
 use crate::q38::{EmbedArgs, EmbedRows, Q38Kernels};
 use crate::quant_sel::QuantSelKernels;
-use crate::site::SiteTy;
+use crate::site::{Form, SiteTy};
+use crate::tensor::Q8ACT_MAX_K;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Window};
 use bloomery_levers::HostCfg;
@@ -115,7 +116,11 @@ impl GpuModel<Body> {
         ctx: usize,
         pass_rows: Option<usize>,
     ) -> Result<GpuModel<Body>, GpuError> {
-        let n_layers = block_count(&file, "nemotron_h_moe GpuModel::open")?;
+        // The trunk's blocks: the next-token block a file may close with is
+        // carried, never loaded.
+        let n_layers = Hparams::read(&file)
+            .map_err(|e| GpuError::plan(WHAT, e))?
+            .n_trunk;
         GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
             Body::derive(gpu.stream(), &file, w)?;
             Body::load(gpu, &file, w, ctx, Open::Whole { pass_rows })
@@ -173,6 +178,35 @@ impl GpuModel<Body> {
 }
 
 impl Body {
+    /// Every site's width must be one the form its weight type reads takes:
+    /// a K-quant site's q8_1 blocks of 256 values, a Q8_0 or Q5_0 site's q8
+    /// blocks of 32 (the Q8_0 site's gemv reads the f32 rows, its wide GEMM
+    /// the blocks of 32), an F32 site's f32 rows (any width). A width no
+    /// form takes is refused by name, with the site and the width.
+    fn refuse_widths(layers: &[Layer]) -> Result<(), GpuError> {
+        for l in layers {
+            for s in l.sites() {
+                let gran = match s.ty.reads() {
+                    Form::Q8x128 => 256,
+                    Form::Q8Blocks32 | Form::Q8x32 => 32,
+                    Form::F32 => continue,
+                };
+                if s.k == 0 || !s.k.is_multiple_of(gran) || s.k > Q8ACT_MAX_K {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "{}: a form of {gran} values takes a width that is a positive multiple of \
+                             {gran} up to {Q8ACT_MAX_K}, got {}",
+                            s.name(),
+                            s.k()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The weights a load derives before any name is resolved: the zero conv
     /// bias of a file whose Mamba-2 layers hold none.
     fn derive(stream: &CudaStream, file: &Split, w: &mut Weights) -> Result<(), GpuError> {
@@ -251,8 +285,8 @@ impl Body {
         };
         let embed = names::token_embd();
         names.site(&embed, (hp.n_vocab, hidden), &[SiteTy::Q8_0])?;
-        let mut layers = Vec::with_capacity(hp.n_layer);
-        for l in 0..hp.n_layer {
+        let mut layers = Vec::with_capacity(hp.n_trunk);
+        for l in 0..hp.n_trunk {
             let n_card = |n_expert: usize| match &map {
                 Some((m, _)) => m.on_card(l),
                 None => Ok(n_expert),
@@ -278,10 +312,23 @@ impl Body {
                 }
             });
         }
+        Body::refuse_widths(&layers)?;
         let mut acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
-        for l in &layers {
-            if let Layer::Moe(m) = l {
+        for (l, layer) in layers.iter().enumerate() {
+            if let Layer::Moe(m) = layer {
                 for (k, cols) in m.forms(&hp) {
+                    // The layer's q8_1 forms: the K-quant's blocks of 256
+                    // values. A width no form takes is refused by name, with
+                    // the layer and the width.
+                    if !k.is_multiple_of(256) || !(256..=Q8ACT_MAX_K).contains(&k) {
+                        return Err(GpuError::shape(
+                            WHAT,
+                            format!(
+                                "layer {l}: a q8_1 form takes a width that is a multiple of 256 in \
+                                 256..={Q8ACT_MAX_K}, got {k}"
+                            ),
+                        ));
+                    }
                     acts.add_q8_1(stream, k, cols)?;
                 }
             }
@@ -294,7 +341,8 @@ impl Body {
             ctx,
         };
         let moe = MoeShape {
-            latent: hp.latent,
+            width: hp.experts_width() as usize,
+            top_k: hp.top_k_max(),
             shared_ff: hp.shared_ff,
             scale: hp.weights_scale,
         };

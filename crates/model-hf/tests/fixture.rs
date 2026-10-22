@@ -4740,7 +4740,7 @@ fn hw_fixture_bolt_plan() {
     assert_eq!(hp.experts, [None, shape(240, 1536), None, shape(496, 2560)]);
     assert_eq!(
         (hp.n_layer, hp.n_embd, hp.n_expert, hp.latent, hp.shared_ff),
-        (4, 4096, 496, 1024, 5376)
+        (4, 4096, 496, Some(1024), 5376)
     );
     assert_eq!(
         (hp.ssm.n_heads, hp.ssm.n_groups, hp.ssm.d_inner),

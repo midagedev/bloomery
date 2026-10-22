@@ -52,10 +52,10 @@
 //! multi-column launches' own contract.
 
 use super::body::{Body, Layer};
-use super::moe::{MoeLayer, MoeShape};
+use super::moe::{MoeLayer, MoeShape, Shared};
 use super::placed::{Placed, PlacedSide};
 use super::router::Routers;
-use super::router::{COUNTS, TOP_K};
+use super::router::{COUNTS, MAX_TOP_K};
 use crate::arch::hybrid::{RowBuffers, Shape, Site, norm_rows, residual_rows};
 use crate::card_slots::CardAcc;
 use crate::fault::FaultSink;
@@ -91,7 +91,7 @@ const WHAT: &str = "nemotron_h_moe::prefill";
 /// ([`GemmRoute::new`], [`GemmAct::new`]); the pass's rows themselves are
 /// chosen at load ([`choose_pass_rows`]).
 pub const PASS_ROWS_MAX: usize = 4096;
-const _: () = assert!(TOP_K * PASS_ROWS_MAX <= GEMM_MAX_SLOTS);
+const _: () = assert!(MAX_TOP_K * PASS_ROWS_MAX <= GEMM_MAX_SLOTS);
 
 /// The columns one gemv run takes: the multi-column gemvs' most.
 const COLS: usize = 8;
@@ -151,10 +151,21 @@ impl PassSizes {
             }
         };
         for m in moes() {
-            want_slots(moe.latent, COLS);
-            want_slots(m.ff, TOP_K * COLS);
-            want_slots(sh.hidden, COLS);
-            want_slots(moe.shared_ff, COLS);
+            // The q8_1 slot forms the `_sel` fallback reads: the routed
+            // experts' input and the slots' squared ReLU where the card
+            // holds experts of the layer, the normed row and the shared
+            // expert's where the shared expert is an IQ2_XXS stack. A launch
+            // that reads no q8_1 form asks for none: the form's block is the
+            // K-quant's 256 values, and a width no K-quant form takes would
+            // refuse the load for a form nothing reads.
+            if m.n_card > 0 {
+                want_slots(moe.width, COLS);
+                want_slots(m.ff, moe.top_k * COLS);
+            }
+            if m.shared_is_sel() {
+                want_slots(sh.hidden, COLS);
+                want_slots(moe.shared_ff, COLS);
+            }
         }
         let mut route_n: Vec<usize> = Vec::new();
         let mut gemm_acts: Vec<(usize, usize)> = Vec::new();
@@ -167,16 +178,16 @@ impl PassSizes {
             // The table runs over the card's experts of the layer: every
             // expert on a whole-card load, the plan's share on a placed one.
             let n = m.n_card;
-            if n > 0 && !route_n.contains(&n) {
-                route_n.push(n);
+            if n > 0 {
+                if !route_n.contains(&n) {
+                    route_n.push(n);
+                }
+                want_acts(moe.width, 1);
+                want_acts(m.ff, moe.top_k);
             }
-            for (k, per_row) in [
-                (moe.latent, 1),
-                (m.ff, TOP_K),
-                (sh.hidden, 1),
-                (moe.shared_ff, 1),
-            ] {
-                want_acts(k, per_row);
+            if m.shared_is_sel() {
+                want_acts(sh.hidden, 1);
+                want_acts(moe.shared_ff, 1);
             }
         }
         let mut run_k: Vec<usize> = Vec::new();
@@ -207,7 +218,7 @@ impl PassSizes {
     /// The width of a row of the host's sums: the latent on a placed load,
     /// none on a whole-card one.
     fn hsum_width(&self) -> usize {
-        if self.placed { self.moe.latent } else { 0 }
+        if self.placed { self.moe.width } else { 0 }
     }
 
     /// The device bytes the pass's buffers hold at `rows` rows — every
@@ -226,11 +237,11 @@ impl PassSizes {
         let attn_rows = cut.min(crate::model::MAX_PASS_ROWS);
         let f32s = 4 * z(sh.hidden) // x twice, sh, sum
             + z(self.n_expert) // probs
-            + z(TOP_K) // weights
-            + z(moe.latent) * 2 // lat, moe
-            + z(TOP_K * self.ff) // up
-            + z(TOP_K * moe.latent) // down
-            + z(moe.shared_ff) // sh_up
+            + z(moe.top_k) // weights
+            + z(moe.width) * 2 // lat, moe
+            + z(moe.top_k * self.ff) // up
+            + z(moe.top_k * moe.width) // down
+            + z(moe.shared_ff) * 2 // sh_up, sh_relu
             + 2 * z(kv_width) // kh, vh
             + 2 * z(sh.hidden) // RowBuffers' xn, delta
             + z(sh.mamba.in_proj_width()) // zxbcdt
@@ -243,8 +254,8 @@ impl PassSizes {
                 + partials_ms_len(attn_rows, self.n_head))
                 * f;
         let u32s = (P_ROWS + sh.n_kv + rows // words
-            + cut * TOP_K // ids
-            + cut * TOP_K // sel
+            + cut * moe.top_k // ids
+            + cut * moe.top_k // sel
             + cut // zero_ids
             + 2 * cut) // RowBuffers' pos, n_keys
             * size_of::<u32>();
@@ -252,7 +263,7 @@ impl PassSizes {
             + self
                 .route_n
                 .iter()
-                .map(|&n| route_bytes(TOP_K * cut, n))
+                .map(|&n| route_bytes(moe.top_k * cut, n))
                 .sum::<usize>()
             + self
                 .gemm_acts
@@ -398,9 +409,10 @@ struct PassBufs {
     up: DeviceBuffer<f32>,
     down: DeviceBuffer<f32>,
     moe: DeviceBuffer<f32>,
-    /// The shared expert's up rows and its down rows, then `moe_out +
-    /// shared`.
+    /// The shared expert's up rows, its relu² rows and its down rows, then
+    /// `moe_out + shared`.
     sh_up: DeviceBuffer<f32>,
+    sh_relu: DeviceBuffer<f32>,
     sh: DeviceBuffer<f32>,
     sum: DeviceBuffer<f32>,
     /// One id 0 a row: the shared expert's slots.
@@ -476,7 +488,8 @@ impl Prompt {
             acts: Vec::new(),
         };
         for &n in &sizes.route_n {
-            ex.routes.push((n, GemmRoute::new(stream, TOP_K * cut, n)?));
+            ex.routes
+                .push((n, GemmRoute::new(stream, moe.top_k * cut, n)?));
         }
         for &(k, per_row) in &sizes.gemm_acts {
             let cols = per_row * cut;
@@ -502,14 +515,15 @@ impl Prompt {
                 words: DeviceBuffer::zeroed(stream, n_words)?,
                 host_words: vec![0; n_words],
                 probs: z(sizes.n_expert)?,
-                ids: DeviceBuffer::zeroed(stream, cut * TOP_K)?,
-                weights: z(TOP_K)?,
-                sel: DeviceBuffer::zeroed(stream, cut * TOP_K)?,
-                lat: z(moe.latent)?,
-                up: z(TOP_K * sizes.ff)?,
-                down: z(TOP_K * moe.latent)?,
-                moe: z(moe.latent)?,
+                ids: DeviceBuffer::zeroed(stream, cut * moe.top_k)?,
+                weights: z(moe.top_k)?,
+                sel: DeviceBuffer::zeroed(stream, cut * moe.top_k)?,
+                lat: z(moe.width)?,
+                up: z(moe.top_k * sizes.ff)?,
+                down: z(moe.top_k * moe.width)?,
+                moe: z(moe.width)?,
                 sh_up: z(moe.shared_ff)?,
+                sh_relu: z(moe.shared_ff)?,
                 sh: z(sh.hidden)?,
                 sum: z(sh.hidden)?,
                 zero_ids: DeviceBuffer::zeroed(stream, cut)?,
@@ -557,7 +571,7 @@ impl Prompt {
         let b = &self.b;
         let f = [
             &self.x[0], &self.x[1], &b.kh, &b.vh, &b.probs, &b.weights, &b.lat, &b.up, &b.down,
-            &b.moe, &b.sh_up, &b.sh, &b.sum, &self.hsum,
+            &b.moe, &b.sh_up, &b.sh_relu, &b.sh, &b.sum, &self.hsum,
         ]
         .iter()
         .map(|b| b.num_bytes())
@@ -771,7 +785,7 @@ fn moe_card_experts(
     let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
     let stream = gpu.stream();
     let fault = gpu.layer_sink(l)?;
-    let slots = TOP_K * m;
+    let slots = sh.top_k * m;
     // The grouped GEMM's IQ2_XXS entry, where the build has one.
     if let Some(ty) = GemmWeight::from_ggml(GgmlType::IQ2_XXS)
         .ok()
@@ -780,7 +794,7 @@ fn moe_card_experts(
         return experts_gemm(
             cx,
             &mut p.ex,
-            (fault, ml, sh.latent, ty),
+            (fault, ml, sh.width, ty),
             (&p.ids, places),
             (&p.lat, &mut p.up, &mut p.down),
         );
@@ -790,8 +804,14 @@ fn moe_card_experts(
         Places::Cut { .. } => &p.sel,
     };
     {
-        let act = slot_form(&mut p.slots, sh.latent, m)?;
-        gpu.quantize_q8_1_cols_at(&p.lat, 0, act, m, fault)?;
+        // The experts' input: the latent rows, or the normed rows where the
+        // file has no latent.
+        let act = slot_form(&mut p.slots, sh.width, m)?;
+        if ml.latent_down.is_some() {
+            gpu.quantize_q8_1_cols_at(&p.lat, 0, act, m, fault)?;
+        } else {
+            gpu.quantize_q8_1_cols_at(&p.buf.xn, 0, act, m, fault)?;
+        }
         let up = SelDown {
             w: stack(w, ml.up()?)?,
             act,
@@ -800,7 +820,7 @@ fn moe_card_experts(
             rows_per_expert: ml.ff,
         };
         cx.iq
-            .enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, TOP_K, fault, &mut p.up)?;
+            .enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, sh.top_k, fault, &mut p.up)?;
     }
     let act = slot_form(&mut p.slots, ml.ff, slots)?;
     gpu.quantize_q8_1_cols_at_relu_sqr(&p.up, 0, act, slots, fault)?;
@@ -809,7 +829,7 @@ fn moe_card_experts(
         act,
         sel,
         n_slots: slots,
-        rows_per_expert: sh.latent,
+        rows_per_expert: sh.width,
     };
     cx.iq
         .enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.down)
@@ -826,42 +846,62 @@ fn moe_shared(
     let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
     let stream = gpu.stream();
     let fault = gpu.layer_sink(l)?;
-    if let Some(ty) = GemmWeight::from_ggml(GgmlType::IQ2_XXS)
-        .ok()
-        .filter(|_| m > COLS)
-    {
-        return shared_gemm(
-            cx,
-            (&mut p.ex, &p.arms.route),
-            (fault, ml, sh.shared_ff, hidden, ty),
-            &p.buf.xn,
-            (&mut p.sh_up, &mut p.sh),
-        );
+    match &ml.shared {
+        // The Q8_0 sites: the dense projections, over the pass's rows.
+        Shared::Site { up, down } => {
+            project_rows(
+                cx,
+                &mut p.arms,
+                l,
+                (up, sh.shared_ff),
+                &p.buf.xn,
+                &mut p.sh_up,
+            )?;
+            gpu.elem()
+                .enqueue_relu_sqr(stream, &p.sh_up, m * sh.shared_ff, &mut p.sh_relu)?;
+            project_rows(cx, &mut p.arms, l, (down, hidden), &p.sh_relu, &mut p.sh)
+        }
+        // The IQ2_XXS stacks: the grouped GEMM past [`COLS`] rows, the
+        // one-expert `_sel` launches up to them.
+        Shared::Sel { up, down } => {
+            if let Some(ty) = GemmWeight::from_ggml(GgmlType::IQ2_XXS)
+                .ok()
+                .filter(|_| m > COLS)
+            {
+                return shared_gemm(
+                    cx,
+                    (&mut p.ex, &p.arms.route),
+                    (fault, ml, sh.shared_ff, hidden, ty),
+                    &p.buf.xn,
+                    (&mut p.sh_up, &mut p.sh),
+                );
+            }
+            {
+                let act = slot_form(&mut p.slots, hidden, m)?;
+                gpu.quantize_q8_1_cols_at(&p.buf.xn, 0, act, m, fault)?;
+                let up = SelDown {
+                    w: stack(w, up)?,
+                    act,
+                    sel: &p.zero_ids,
+                    n_slots: m,
+                    rows_per_expert: sh.shared_ff,
+                };
+                cx.iq
+                    .enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &up, fault, &mut p.sh_up)?;
+            }
+            let act = slot_form(&mut p.slots, sh.shared_ff, m)?;
+            gpu.quantize_q8_1_cols_at_relu_sqr(&p.sh_up, 0, act, m, fault)?;
+            let down = SelDown {
+                w: stack(w, down)?,
+                act,
+                sel: &p.zero_ids,
+                n_slots: m,
+                rows_per_expert: hidden,
+            };
+            cx.iq
+                .enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.sh)
+        }
     }
-    {
-        let act = slot_form(&mut p.slots, hidden, m)?;
-        gpu.quantize_q8_1_cols_at(&p.buf.xn, 0, act, m, fault)?;
-        let up = SelDown {
-            w: stack(w, &ml.up_shexp)?,
-            act,
-            sel: &p.zero_ids,
-            n_slots: m,
-            rows_per_expert: sh.shared_ff,
-        };
-        cx.iq
-            .enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &up, fault, &mut p.sh_up)?;
-    }
-    let act = slot_form(&mut p.slots, sh.shared_ff, m)?;
-    gpu.quantize_q8_1_cols_at_relu_sqr(&p.sh_up, 0, act, m, fault)?;
-    let down = SelDown {
-        w: stack(w, &ml.down_shexp)?,
-        act,
-        sel: &p.zero_ids,
-        n_slots: m,
-        rows_per_expert: hidden,
-    };
-    cx.iq
-        .enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut p.sh)
 }
 
 /// One latent MoE layer, every expert resident, over the pass's `m` rows of
@@ -876,35 +916,32 @@ fn moe_rows(
     let (gpu, m) = (cx.gpu, cx.m);
     let stream = gpu.stream();
     moe_route(cx, p, (l, ml, sh))?;
-    project_rows(
-        cx,
-        &mut p.arms,
-        l,
-        (&ml.latent_down, sh.latent),
-        &p.buf.xn,
-        &mut p.lat,
-    )?;
+    if let Some(site) = &ml.latent_down {
+        project_rows(cx, &mut p.arms, l, (site, sh.width), &p.buf.xn, &mut p.lat)?;
+    }
     moe_card_experts(cx, p, (l, ml, sh), Places::Ids)?;
     gpu.elem().enqueue_weighted_sum(
         stream,
         &p.down,
         &p.weights,
-        sh.latent,
-        TOP_K as u32,
+        sh.width,
+        sh.top_k as u32,
         m,
         &mut p.moe,
     )?;
-    project_rows(
-        cx,
-        &mut p.arms,
-        l,
-        (&ml.latent_up, hidden),
-        &p.moe,
-        &mut p.buf.delta,
-    )?;
     moe_shared(cx, p, (l, ml, sh), hidden)?;
-    gpu.elem()
-        .enqueue_add(stream, &p.buf.delta, &p.sh, m * hidden, &mut p.sum)
+    // The layer's delta: the latent up's projection, or the experts' sum
+    // itself where the file has no latent.
+    match &ml.latent_up {
+        Some(site) => {
+            project_rows(cx, &mut p.arms, l, (site, hidden), &p.moe, &mut p.buf.delta)?;
+            gpu.elem()
+                .enqueue_add(stream, &p.buf.delta, &p.sh, m * hidden, &mut p.sum)
+        }
+        None => gpu
+            .elem()
+            .enqueue_add(stream, &p.moe, &p.sh, m * hidden, &mut p.sum),
+    }
 }
 
 /// The GEMM form of `cols` columns of `k` values in `acts`.
@@ -938,7 +975,7 @@ fn experts_gemm(
 ) -> Result<(), GpuError> {
     let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
     let stream = gpu.stream();
-    let slots = TOP_K * m;
+    let slots = ml.top_k * m;
     let n = ml.n_card;
     let route = ex
         .routes
@@ -964,7 +1001,7 @@ fn experts_gemm(
                 rows_per_expert: ml.ff,
                 act: a,
                 route,
-                input: GemmInput::Shared { top_k: TOP_K },
+                input: GemmInput::Shared { top_k: ml.top_k },
                 y: up,
             },
         )?;
@@ -997,6 +1034,16 @@ fn shared_gemm(
 ) -> Result<(), GpuError> {
     let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
     let stream = gpu.stream();
+    let Shared::Sel {
+        up: up_stack,
+        down: down_stack,
+    } = &ml.shared
+    else {
+        return Err(GpuError::state(
+            WHAT,
+            "a shared expert of q8_0 sites (the grouped GEMM is the iq2_xxs stack's)",
+        ));
+    };
     {
         let a = gemm_form(&mut ex.acts, hidden, m)?;
         gpu.enqueue_quantize_gemm(xn, m, a, fault)?;
@@ -1004,7 +1051,7 @@ fn shared_gemm(
             stream,
             GemmArgs {
                 ty,
-                w: stack(w, &ml.up_shexp)?,
+                w: stack(w, up_stack)?,
                 rows_per_expert: shared_ff,
                 act: a,
                 route: dense,
@@ -1019,7 +1066,7 @@ fn shared_gemm(
         stream,
         GemmArgs {
             ty,
-            w: stack(w, &ml.down_shexp)?,
+            w: stack(w, down_stack)?,
             rows_per_expert: hidden,
             act: a,
             route: dense,
@@ -1254,20 +1301,22 @@ impl PassWalk<'_> {
             &mut b.buf.xn,
         )?;
         moe_route(cx, b, (l, ml, *moe))?;
-        project_rows(
-            cx,
-            &mut b.arms,
-            l,
-            (&ml.latent_down, moe.latent),
-            &b.buf.xn,
-            &mut b.lat,
-        )?;
+        // The rows the host's experts read: the latent the file's down
+        // projection makes, or the normed rows where the file has no latent.
+        if let Some(site) = &ml.latent_down {
+            project_rows(cx, &mut b.arms, l, (site, moe.width), &b.buf.xn, &mut b.lat)?;
+        }
+        let lat: &DeviceBuffer<f32> = if ml.latent_down.is_some() {
+            &b.lat
+        } else {
+            &b.buf.xn
+        };
         let key = leg.key(at);
         leg.hybrid()
-            .enqueue_download_pitched(stream, [&b.lat, &b.weights], &b.ids, TOP_K, key)?;
+            .enqueue_download_pitched(stream, [lat, &b.weights], &b.ids, moe.top_k, key)?;
         side.enqueue_places(
             stream,
-            (l, ml.route.n_expert()),
+            (l, ml.route.n_expert(), moe.top_k),
             (&b.ids, &mut b.sel, m),
             gpu.layer_sink(l)?,
         )
@@ -1327,11 +1376,11 @@ impl PassWalk<'_> {
                     down: &b.down,
                     w: &b.weights,
                     sel: &b.sel,
-                    n: moe.latent,
+                    n: moe.width,
                     m,
                     n_card: ml.n_card,
-                    n_used: TOP_K,
-                    w_pitch: TOP_K,
+                    n_used: moe.top_k,
+                    w_pitch: moe.top_k,
                     fault: gpu.layer_sink(l)?,
                 },
                 &mut b.moe,
@@ -1339,21 +1388,31 @@ impl PassWalk<'_> {
             // The latent rows are spent once the card's slots ran: they take
             // the card's sum and the host's.
             gpu.elem()
-                .enqueue_add(stream, &b.moe, hsum, m * moe.latent, &mut b.lat)?;
+                .enqueue_add(stream, &b.moe, hsum, m * moe.width, &mut b.lat)?;
             &b.lat
         } else {
             hsum
         };
-        project_rows(
-            cx,
-            &mut b.arms,
-            l,
-            (&ml.latent_up, sh.hidden),
-            merged,
-            &mut b.buf.delta,
-        )?;
-        gpu.elem()
-            .enqueue_add(stream, &b.buf.delta, &b.sh, m * sh.hidden, &mut b.sum)?;
+        // The layer's delta: the latent up's projection, or the experts' sum
+        // itself where the file has no latent.
+        match &ml.latent_up {
+            Some(site) => {
+                project_rows(
+                    cx,
+                    &mut b.arms,
+                    l,
+                    (site, sh.hidden),
+                    merged,
+                    &mut b.buf.delta,
+                )?;
+                gpu.elem()
+                    .enqueue_add(stream, &b.buf.delta, &b.sh, m * sh.hidden, &mut b.sum)?;
+            }
+            None => {
+                gpu.elem()
+                    .enqueue_add(stream, merged, &b.sh, m * sh.hidden, &mut b.sum)?;
+            }
+        }
         let [x0, x1] = &mut **x;
         let (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>) =
             if *cur == 0 { (x0, x1) } else { (x1, x0) };

@@ -68,7 +68,10 @@ fn hw_nemotron_h_moe_host() {
     // Every layer through the arch's one wiring.
     let mut layers: Vec<(usize, Experts, HostLayer)> = Vec::new();
     let mut hosted_none = 0usize;
-    for l in 0..hp.n_layer {
+    // The width the routed experts read and write: the latent, or the hidden
+    // row where the file has no latent.
+    let latent = hp.experts_width() as usize;
+    for l in 0..hp.n_trunk {
         let built = host::layer(src, &hp, l)
             .unwrap_or_else(|e| panic!("layer {l} ({:?}): {e}", hp.kinds[l]));
         match (hp.kinds[l], hp.experts[l], built) {
@@ -93,11 +96,11 @@ fn hw_nemotron_h_moe_host() {
         format!(
             "{} MoE layers built, {hosted_none} others hosted as none, of {} layers",
             layers.len(),
-            hp.n_layer
+            hp.n_trunk
         ),
-        layers.len() + hosted_none == hp.n_layer && !layers.is_empty(),
+        layers.len() + hosted_none == hp.n_trunk && !layers.is_empty(),
     );
-    let past = host::layer(src, &hp, hp.n_layer)
+    let past = host::layer(src, &hp, hp.n_trunk)
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
@@ -122,30 +125,30 @@ fn hw_nemotron_h_moe_host() {
     let narrow = by_width(|a, b| a.ff < b.ff);
     let wide = by_width(|a, b| a.ff > b.ff);
     let ff_cap = layers.iter().map(|(_, e, _)| e.ff).max().unwrap();
-    let mut us = UnionScratch::new_routed(hp.latent, ff_cap, USED, USED)
+    let mut us = UnionScratch::new_routed(latent, ff_cap, USED, USED)
         .expect("a scratch for the widest layer");
     for l in [narrow, wide] {
         let (_, e, layer) = layers.iter().find(|(i, _, _)| *i == l).unwrap();
-        let mut host = HostScratch::new(hp.latent, e.ff, USED).expect("a scratch of nine experts");
+        let mut host = HostScratch::new(latent, e.ff, USED).expect("a scratch of nine experts");
         for k in KS {
             let x = Tensor2::from_vec(
-                hp.latent,
+                latent,
                 k,
                 (0..k)
-                    .flat_map(|j| seeded(hp.latent, 0xb017 + (l * 16 + j) as u64))
+                    .flat_map(|j| seeded(latent, 0xb017 + (l * 16 + j) as u64))
                     .collect(),
             );
             let lists: Vec<Vec<(u32, f32)>> = (0..k).map(|j| list(j, e.n_expert)).collect();
             let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
-            let mut want = vec![f32::NAN; hp.latent * k];
+            let mut want = vec![f32::NAN; latent * k];
             for j in 0..k {
-                let xj = Tensor2::from_vec(hp.latent, 1, x.col(j).to_vec());
+                let xj = Tensor2::from_vec(latent, 1, x.col(j).to_vec());
                 layer
                     .experts_into(
                         src,
                         &xj,
                         &lists[j],
-                        &mut want[j * hp.latent..(j + 1) * hp.latent],
+                        &mut want[j * latent..(j + 1) * latent],
                         &mut host,
                     )
                     .unwrap_or_else(|err| panic!("layer {l} experts_into column {j}: {err}"));
@@ -156,7 +159,7 @@ fn hw_nemotron_h_moe_host() {
             );
             for (arm, on) in [("defer", true), ("prepass", false)] {
                 ops::set_defer_quant(Some(on));
-                let mut got = vec![f32::NAN; hp.latent * k];
+                let mut got = vec![f32::NAN; latent * k];
                 let r = layer.experts_union_into(src, &x, &slices, &mut got, &mut us);
                 ops::set_defer_quant(None);
                 r.unwrap_or_else(|err| panic!("layer {l} k {k} {arm}: {err}"));

@@ -32,8 +32,7 @@
 //! map's rows cover every layer, only the MoE layers' hold experts).
 
 use super::body::Layer;
-use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, one_expert, stack};
-use super::router::TOP_K;
+use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, Shared, one_expert, stack};
 use crate::arch::hybrid::{self, Acts, Cx, gqa_layer, mamba_layer, residual};
 use crate::card_slots::{CardAcc, CardSlotKernels, ColPlaces};
 use crate::fault::FaultSink;
@@ -68,7 +67,7 @@ pub(super) const PLACED_ROWS: usize = UNION_MAX_COLS;
 /// layer's row ends in places no id reaches). A plan of other than one card
 /// holding every layer, or with an expert tier, is refused by name.
 pub(super) fn plan_map(plan: &Plan<'_>, hp: &Hparams) -> Result<(SlotMap, usize), GpuError> {
-    let n = hp.n_layer;
+    let n = hp.n_trunk;
     let spec = plan
         .machine
         .cards
@@ -146,7 +145,7 @@ impl PlacedSide {
     pub(super) fn enqueue_places(
         &self,
         stream: &CudaStream,
-        (l, n_expert): (usize, usize),
+        (l, n_expert, used): (usize, usize, usize),
         (ids, sel, m): (&DeviceBuffer<u32>, &mut DeviceBuffer<u32>, usize),
         fault: FaultSink,
     ) -> Result<(), GpuError> {
@@ -154,9 +153,9 @@ impl PlacedSide {
             stream,
             &ColPlaces {
                 ids,
-                ids_pitch: TOP_K,
-                used: TOP_K,
-                sel_pitch: TOP_K,
+                ids_pitch: used,
+                used,
+                sel_pitch: used,
                 m,
                 map: self.slots.buf(),
                 row_off: l * self.stride,
@@ -230,12 +229,14 @@ impl Placed {
                 _ => Ok(None),
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
+        let width = hp.experts_width() as usize;
+        let top_k = hp.top_k_max();
         let boundary = Boundary::new(
             gpu.context(),
             stream,
             BoundaryShape {
-                hidden: hp.latent,
-                n_used: TOP_K,
+                hidden: width,
+                n_used: top_k,
             },
         )?;
         let mut experts = crate::model::host_run(
@@ -246,9 +247,9 @@ impl Placed {
             open.host.r8,
             open.set.arena(),
             HostWidths {
-                embd: hp.latent,
+                embd: width,
                 ff: hp.experts.iter().flatten().map(|x| x.ff).max().unwrap_or(0),
-                n_used: TOP_K,
+                n_used: top_k,
             },
             |src| routed_layers(src, hp, &set),
         )?;
@@ -267,9 +268,9 @@ impl Placed {
                 stride,
                 handoff: HandoffKernels::load(gpu.context())?,
                 acc_k: CardSlotKernels::load(gpu.context())?,
-                sel: DeviceBuffer::zeroed(stream, TOP_K)?,
-                acc: z(hp.latent)?,
-                sum: z(hp.latent)?,
+                sel: DeviceBuffer::zeroed(stream, top_k)?,
+                acc: z(width)?,
+                sum: z(width)?,
             },
         })
     }
@@ -341,15 +342,26 @@ fn front(
     let (gpu, what) = (cx.gpu, cx.what);
     let stream = gpu.stream();
     let fault = gpu.layer_sink(l)?;
-    gpu.fused().enqueue_norm_quant(
-        stream,
-        src,
-        cx.f32(&m.norm)?,
-        cx.sh.eps,
-        acts.q8_1_at(what, cx.sh.hidden, 1)?,
-        &mut t.buf.xn,
-        fault,
-    )?;
+    // The normed row the router and the host's experts read. A K-quant site
+    // reads the row as the q8_1 form the fused launch writes beside it; a
+    // file whose shared expert is a dense site has no such form, and the
+    // plain norm writes the row alone.
+    match &m.shared {
+        Shared::Sel { .. } => {
+            gpu.fused().enqueue_norm_quant(
+                stream,
+                src,
+                cx.f32(&m.norm)?,
+                cx.sh.eps,
+                acts.q8_1_at(what, cx.sh.hidden, 1)?,
+                &mut t.buf.xn,
+                fault,
+            )?;
+        }
+        Shared::Site { .. } => {
+            hybrid::norm(cx, &m.norm, src, &mut t.buf.xn)?;
+        }
+    }
     k.routers.enqueue(
         stream,
         cx.w.f32_tensor(what, &m.router)?,
@@ -360,13 +372,31 @@ fn front(
         fault,
     )?;
     let hy = leg.hybrid();
-    m.latent_down.project(
-        &cx.gqa(),
-        acts,
-        l,
-        &t.buf.xn,
-        hy.boundary_mut().normed_mut(),
-    )?;
+    // The row the host's experts read: the latent the file's down projection
+    // makes, or the normed row itself where the file has no latent.
+    match &m.latent_down {
+        Some(site) => site.project(
+            &cx.gqa(),
+            acts,
+            l,
+            &t.buf.xn,
+            hy.boundary_mut().normed_mut(),
+        )?,
+        None => {
+            let width = sh.width;
+            crate::tensor::dtod_2d(
+                stream,
+                (&t.buf.xn, 0),
+                (hy.boundary_mut().normed_mut(), 0),
+                crate::tensor::Pitched {
+                    width: width * size_of::<f32>(),
+                    rows: 1,
+                    dev_pitch: width * size_of::<f32>(),
+                    host_pitch: width * size_of::<f32>(),
+                },
+            )?;
+        }
+    }
     let h = Handoff {
         ids: m.route.ids(),
         weights: m.route.weights(),
@@ -383,7 +413,7 @@ fn shadow(
     (k, sh): (&MoeKernels, MoeShape),
     side: &PlacedSide,
     (l, m): (usize, &MoeLayer),
-    (s, acts): (&mut MoeScratch, &mut Acts),
+    (t, s, acts): (&mut hybrid::Scratch, &mut MoeScratch, &mut Acts),
     leg: &mut StepLeg<'_, HostRun>,
 ) -> Result<(), GpuError> {
     let (gpu, what) = (cx.gpu, cx.what);
@@ -391,53 +421,53 @@ fn shadow(
     let fault = gpu.layer_sink(l)?;
     {
         // The shared expert's up reads the norm's (hidden, 1) q8_1 form
-        // before the latent's quantize may overwrite it (`moe`'s module doc).
-        let act = acts.q8_1_at(what, cx.sh.hidden, 1)?;
-        one_expert(
-            cx,
-            k,
-            l,
-            &m.up_shexp,
-            sh.shared_ff,
-            act,
-            &s.zero_id,
-            &mut s.sh_up,
-        )?;
+        // before the experts' quantize may overwrite it (`moe`'s module doc);
+        // the Q8_0 site reads the normed row itself.
+        match &m.shared {
+            Shared::Sel { up, .. } => {
+                let act = acts.q8_1_at(what, cx.sh.hidden, 1)?;
+                one_expert(cx, k, l, up, sh.shared_ff, act, &s.zero_id, &mut s.sh_up)?;
+            }
+            Shared::Site { up, .. } => {
+                up.project(&cx.gqa(), acts, l, &t.buf.xn, &mut s.sh_up)?;
+            }
+        }
     }
     if m.n_card > 0 {
-        let act = acts.q8_1_at(what, sh.latent, 1)?;
+        let width = sh.width;
+        let act = acts.q8_1_at(what, width, 1)?;
         gpu.enqueue_quantize_q8_1_layer(leg.hybrid().boundary().normed(), act, l)?;
         let up = SelDown {
             w: stack(cx.w, what, m.up()?)?,
             act,
             sel: &side.sel,
-            n_slots: TOP_K,
+            n_slots: sh.top_k,
             rows_per_expert: m.ff,
         };
-        k.iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, TOP_K, fault, &mut s.up)?;
-        let act = acts.q8_1_at(what, m.ff, TOP_K)?;
+        k.iq.enqueue_gemv_sel_cols(stream, GgmlType::IQ2_XXS, &up, sh.top_k, fault, &mut s.up)?;
+        let act = acts.q8_1_at(what, m.ff, sh.top_k)?;
         gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.up, act, l)?;
         let down = SelDown {
             w: stack(cx.w, what, m.down()?)?,
             act,
             sel: &side.sel,
-            n_slots: TOP_K,
-            rows_per_expert: sh.latent,
+            n_slots: sh.top_k,
+            rows_per_expert: width,
         };
         k.iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &down, fault, &mut s.down)?;
     }
-    let act = acts.q8_1_at(what, sh.shared_ff, 1)?;
-    gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.sh_up, act, l)?;
-    one_expert(
-        cx,
-        k,
-        l,
-        &m.down_shexp,
-        cx.sh.hidden,
-        act,
-        &s.zero_id,
-        &mut s.sh,
-    )
+    match &m.shared {
+        Shared::Sel { down, .. } => {
+            let act = acts.q8_1_at(what, sh.shared_ff, 1)?;
+            gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.sh_up, act, l)?;
+            one_expert(cx, k, l, down, cx.sh.hidden, act, &s.zero_id, &mut s.sh)
+        }
+        Shared::Site { down, .. } => {
+            gpu.elem()
+                .enqueue_relu_sqr(stream, &s.sh_up, sh.shared_ff, &mut s.sh_relu)?;
+            down.project(&cx.gqa(), acts, l, &s.sh_relu, &mut s.sh)
+        }
+    }
 }
 
 /// Layer `l`'s back on a hosted layer: the module doc's third part.
@@ -455,6 +485,7 @@ fn back(
     let hy = leg.hybrid();
     hy.boundary().enqueue_back_of(stream, 0, l)?;
     {
+        let width = sh.width;
         let hsum = hy.boundary().hsum_of(0)?;
         let merged: &DeviceBuffer<f32> = if m.n_card > 0 {
             side.acc_k.enqueue_card_acc(
@@ -463,26 +494,33 @@ fn back(
                     down: &s.down,
                     w: m.route.weights(),
                     sel: &side.sel,
-                    n: sh.latent,
+                    n: width,
                     m: 1,
                     n_card: m.n_card,
-                    n_used: TOP_K,
-                    w_pitch: TOP_K,
+                    n_used: sh.top_k,
+                    w_pitch: sh.top_k,
                     fault: gpu.layer_sink(l)?,
                 },
                 &mut side.acc,
             )?;
             gpu.elem()
-                .enqueue_add(stream, &side.acc, hsum, sh.latent, &mut side.sum)?;
+                .enqueue_add(stream, &side.acc, hsum, width, &mut side.sum)?;
             &side.sum
         } else {
             hsum
         };
-        m.latent_up
-            .project(&cx.gqa(), acts, l, merged, &mut t.buf.delta)?;
+        // The layer's delta: the latent up's projection, or the experts' sum
+        // itself where the file has no latent.
+        let delta: &DeviceBuffer<f32> = match &m.latent_up {
+            Some(site) => {
+                site.project(&cx.gqa(), acts, l, merged, &mut t.buf.delta)?;
+                &t.buf.delta
+            }
+            None => merged,
+        };
+        gpu.elem()
+            .enqueue_add(stream, delta, &s.sh, cx.sh.hidden, &mut s.sum)?;
     }
-    gpu.elem()
-        .enqueue_add(stream, &t.buf.delta, &s.sh, cx.sh.hidden, &mut s.sum)?;
     residual(cx, src, &s.sum, dst)?;
     hy.row_enqueued(l, 0)
 }
@@ -577,7 +615,7 @@ impl<'a> LayerProgram for StepWalk<'a> {
             (self.mk, self.moe),
             self.side,
             (l, m),
-            (&mut *self.ms, &mut *self.acts),
+            (&mut *self.t, &mut *self.ms, &mut *self.acts),
             leg,
         )
     }

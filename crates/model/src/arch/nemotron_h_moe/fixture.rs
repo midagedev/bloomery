@@ -142,6 +142,9 @@ pub fn key_rule(suffix: &str) -> Option<KeyRule> {
     match suffix {
         "expert_feed_forward_length" | "expert_used_count" => Some(KeyRule::PerLayer),
         "expert_count" => Some(KeyRule::Table),
+        // The fixture maps the source's trunk layers and carries no
+        // next-token block.
+        "nextn_predict_layers" => Some(KeyRule::Set(0)),
         s if COPY.contains(&s) => Some(KeyRule::Copy),
         s => hybrid::trunk_key_rule(s),
     }
@@ -335,12 +338,12 @@ pub fn check_kinds(
         ("moe_latent_size", fx.latent, src.latent),
         (
             "expert_shared_feed_forward_length",
-            fx.shared_ff,
-            src.shared_ff,
+            Some(fx.shared_ff),
+            Some(src.shared_ff),
         ),
     ] {
         if a != b {
-            return Err(bad(key.into(), format!("{a}, want {b}")));
+            return Err(bad(key.into(), format!("{a:?}, want {b:?}")));
         }
     }
     if fx.weights_norm != src.weights_norm {
@@ -361,7 +364,7 @@ pub fn check_kinds(
 /// The facts of `hp` a fixture keeps in common with the other hybrid family.
 fn trunk(hp: &Hparams) -> Trunk<'_, Kind> {
     Trunk {
-        n_layer: hp.n_layer,
+        n_layer: hp.n_trunk,
         n_embd: hp.n_embd,
         n_ctx: hp.n_ctx,
         n_vocab: hp.n_vocab,

@@ -8,7 +8,7 @@
 //! `model::arch::raon1`.
 
 mod body;
-mod ffn;
+pub(crate) mod ffn;
 mod mhc;
 pub mod mla;
 pub mod rda;
