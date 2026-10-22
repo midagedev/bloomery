@@ -943,8 +943,9 @@ mod gate {
         let long_user = format!("{report}Summarize the report in one sentence.");
         let off = json!({"enable_thinking": false});
         let on = json!({"thinking": true});
-        // The template's preamble under each kwargs: what two requests with different first
-        // messages share, which an earlier request of the gate may have left in the cache.
+        // PIN(2026-10-22): a BOS-only ledger rejected valid reuse of the template's preamble (the
+        // official V4.1 encoding's system and reasoning ids). The preamble under each kwargs is what
+        // two requests with different first messages share; an earlier request may have left it.
         for kw in [&off, &on] {
             let a = rendered(
                 url,
