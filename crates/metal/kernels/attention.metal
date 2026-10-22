@@ -792,13 +792,3 @@ kernel void gqa256_merge(device float const *partials [[buffer(0)]],
         attn_commit(out, o + d, attn, gate, merged, faults, args.layer);
     }
 }
-
-// Every f16 bit pattern as f32, one value per thread. The host compares it
-// with `half_to_f32`.
-kernel void gqa256_f16_expand(device float *out [[buffer(0)]],
-                              uint gid [[thread_position_in_grid]]) {
-    if (gid >= 65536u) {
-        return;
-    }
-    out[gid] = attn_half(ushort(gid));
-}

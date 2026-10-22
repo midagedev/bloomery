@@ -51,7 +51,7 @@
 use bloomery_metal::kernels::{HEAD_DIM, ROT, SCALE, TILE};
 use gguf::quant::{f32_to_f16_bits, half_to_f32, quantize_q8_0};
 
-const U: f64 = 1.0 / 16_777_216.0;
+use super::oracle::{U, gamma_bound, sigmoid};
 /// Lane fmas, the SIMD-group sum, and the scale multiply.
 const DOT_OPS: usize = 8 + 31 + 1;
 /// 4 ulp of a normal, as a relative error: `4 * 2^-23`.
@@ -61,11 +61,6 @@ const GATE_OPS: usize = 4;
 
 fn f64_usize(n: usize) -> f64 {
     f64::from(u32::try_from(n).expect("a band count fits u32"))
-}
-
-fn gamma(n: usize) -> f64 {
-    let nu = f64_usize(n) * U;
-    nu / (1.0 - nu)
 }
 
 fn warp_sums(x: &[f32; HEAD_DIM]) -> [f32; 4] {
@@ -187,12 +182,6 @@ pub fn dequant_q8(codes: &[u32], scales: &[u16]) -> [f32; HEAD_DIM] {
     out
 }
 
-/// `1 / (1 + exp(-x))` in f64, the reference for the kernel's gate.
-#[must_use]
-pub fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-
 /// The f64 softmax weights of `q` over `keys`, summing to 1.
 fn softmax_weights(q: &[f32; HEAD_DIM], keys: &[[f32; HEAD_DIM]]) -> Result<Vec<f64>, String> {
     if keys.is_empty() {
@@ -269,7 +258,7 @@ pub fn band(
     }
     let weights = softmax_weights(q, keys)?;
     let scale = f64::from(SCALE);
-    let g = gamma(DOT_OPS);
+    let g = gamma_bound(DOT_OPS);
     let mut delta = 0.0f64;
     for k in keys {
         let mut mag = 0.0f64;
@@ -284,7 +273,7 @@ pub fn band(
     let rel = (2.0 * delta).exp() * (1.0 + ETA) * (1.0 + ETA) - 1.0;
     let n_keys = keys.len();
     let n_rescale = n_keys.div_ceil(TILE) + segments;
-    let theta = gamma(n_keys + n_rescale) + f64_usize(n_rescale) * ETA;
+    let theta = gamma_bound(n_keys + n_rescale) + f64_usize(n_rescale) * ETA;
     let ops = DOT_OPS + n_keys + n_rescale + 1 + GATE_OPS;
     let floor = f64::from(f32::MIN_POSITIVE) * f64_usize(ops);
     let mut out = [0.0f64; HEAD_DIM];

@@ -1,0 +1,331 @@
+//! The segmented mat-vec clauses: every segment of one dispatch the same bits
+//! as its tensor run alone, and the segment list the launch refuses.
+
+use bloomery_device::conformance::{Clause, Verdict, why};
+use bloomery_device::{Buffer, Device, Elems};
+use bloomery_metal::kernels::{BLOCK_VALUES, NormOnLoad, Quant, SegParams, Segment};
+use gguf::quant::GgmlType;
+
+use super::common::{self, BadArg, Edit, LAYER};
+use super::fixture::Fixture;
+use super::oracle;
+use super::{Harness, Launch, ModeSpec, SENTINEL_BITS, SegLaunch};
+
+/// The ggml type a mat-vec reads.
+fn ggml_type(quant: Quant) -> GgmlType {
+    match quant {
+        Quant::Q4K => GgmlType::Q4_K,
+        Quant::Q6K => GgmlType::Q6_K,
+    }
+}
+
+/// The groups of the segmented launch: the tensors of one type and one width
+/// that a layer's projections are.
+struct SegGroup {
+    quant: Quant,
+    /// The layer's norm gain, the width's gain.
+    gain: &'static str,
+    /// The tensors: their names and their row counts.
+    tensors: Vec<(&'static str, usize)>,
+}
+
+/// Every segment of a segmented dispatch is the same bits as the same tensor
+/// run alone: the kernel does not change the order of a row's sum, and the
+/// norm on the load is the norm the tensor alone gets.
+pub fn seg_bit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let eps = fixture.rms_eps()?;
+    let cols = 2048;
+    let groups = [
+        SegGroup {
+            quant: Quant::Q4K,
+            gain: "blk.0.attn_norm.weight",
+            tensors: vec![
+                ("blk.0.attn_qkv.weight", 8192),
+                ("blk.0.attn_gate.weight", 4096),
+            ],
+        },
+        SegGroup {
+            quant: Quant::Q4K,
+            gain: "blk.1.attn_norm.weight",
+            tensors: vec![
+                ("blk.1.attn_q.weight", 8192),
+                ("blk.1.attn_k.weight", 512),
+                ("blk.1.attn_v.weight", 512),
+            ],
+        },
+        SegGroup {
+            quant: Quant::Q6K,
+            gain: "blk.2.attn_norm.weight",
+            tensors: vec![("blk.2.attn_qkv.weight", 8192)],
+        },
+    ];
+    let mut parts = Vec::new();
+    for (i, group) in groups.iter().enumerate() {
+        let gain = fixture.f32s(group.gain, cols)?;
+        let x = oracle::activations(cols, 0x5E6 + i as u64, 1.0);
+        let mut segments: Vec<(usize, &[u8])> = Vec::new();
+        let mut rows = 0usize;
+        for (name, n) in &group.tensors {
+            segments.push((*n, fixture.rows(name, ggml_type(group.quant), cols, *n)?));
+            rows += n;
+        }
+        let got = h.seg(&SegLaunch {
+            quant: group.quant,
+            cols,
+            segments: segments.clone(),
+            x: &x,
+            y0: &common::sentinel_rows(rows),
+            gain: &gain,
+            eps,
+            layer: LAYER,
+        })?;
+        if let Some(fault) = h.fault()? {
+            return Err(format!("the segmented launch raised {fault}"));
+        }
+        let mut at = 0usize;
+        for (j, (n, bytes)) in segments.iter().enumerate() {
+            let alone = h.matvec(&Launch {
+                quant: group.quant,
+                rows: *n,
+                cols,
+                weights: bytes,
+                x: &x,
+                y0: &common::sentinel_rows(*n),
+                mode: ModeSpec::Norm {
+                    gain: &gain,
+                    eps,
+                    layer: LAYER,
+                },
+            })?;
+            for (k, (a, b)) in got[at..at + n].iter().zip(alone.iter()).enumerate() {
+                if a.to_bits() != b.to_bits() {
+                    return Err(format!(
+                        "{} segment {j} row {k}: the segment read {a:?}, the tensor alone read {b:?}",
+                        group.tensors[j].0
+                    ));
+                }
+            }
+            at += n;
+        }
+        parts.push(format!(
+            "{} {} segments",
+            group.tensors[0].0,
+            group.tensors.len()
+        ));
+    }
+    common::noted(parts)
+}
+
+/// The buffers of the refusal table: one weights buffer of sixteen blocks,
+/// and the windows every well-formed case of the table shares.
+struct Refusals {
+    cols: usize,
+    bytes: usize,
+    weights: bloomery_metal::MetalBuffer<u8>,
+    x: bloomery_metal::MetalBuffer<f32>,
+    y: bloomery_metal::MetalBuffer<f32>,
+    gain: bloomery_metal::MetalBuffer<f32>,
+}
+
+/// The segment list of one case, one property of it bad, and the weights
+/// window the launch reads.
+#[derive(Clone, Copy)]
+struct Args {
+    segments: [Option<Segment>; 5],
+    weights_len: usize,
+    y_len: usize,
+}
+
+impl Args {
+    /// The table's arguments: the weights window spans the whole buffer, so
+    /// a case's own check refuses before the window check can.
+    const fn whole(weights_len: usize, y_len: usize) -> Self {
+        Self {
+            segments: [
+                Some(Segment {
+                    cols: 2048,
+                    rows: 8,
+                    weight_blocks: 0,
+                    out_offset: 0,
+                }),
+                None,
+                None,
+                None,
+                None,
+            ],
+            weights_len,
+            y_len,
+        }
+    }
+
+    fn list(&self) -> Vec<Segment> {
+        self.segments.iter().filter_map(|s| *s).collect()
+    }
+}
+
+fn refuse(
+    h: &Harness<'_>,
+    b: &mut Refusals,
+    a: &Args,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), bloomery_device::DeviceError> {
+    let segments = a.list();
+    h.kernels.matvec_seg(
+        encoder,
+        SegParams {
+            quant: Quant::Q4K,
+            segments: &segments,
+            weights: b.weights.window(Elems(0), Elems(a.weights_len))?,
+            x: b.x.window(Elems(0), Elems(b.cols))?,
+            y: b.y.window_mut(Elems(0), Elems(a.y_len))?,
+            norm: NormOnLoad {
+                gain: b.gain.window(Elems(0), Elems(b.cols))?,
+                eps: 1e-6,
+                fault: h.device.fault_word(),
+                layer: LAYER,
+            },
+        },
+    )
+}
+
+fn bad<'a>(
+    what: &'static str,
+    needle: &'static str,
+    edit: impl FnOnce(&mut Args) + 'a,
+    h: &'a Harness<'_>,
+    weights_len: usize,
+) -> BadArg<'a, Refusals> {
+    let whole = Args::whole(weights_len, 64);
+    BadArg::new(
+        what,
+        needle,
+        Box::new(move |b, encoder| {
+            let mut a = whole;
+            edit(&mut a);
+            refuse(h, b, &a, encoder)
+        }),
+    )
+}
+
+/// The bounds of a segment list: a list the kernel cannot run is refused by
+/// name, and nothing is encoded for it. A dispatch of the most segments writes
+/// every row and nothing past the last.
+pub fn seg_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let eps = fixture.rms_eps()?;
+    let cols = 2048;
+    let gain = fixture.f32s("blk.0.attn_norm.weight", cols)?;
+    let x = oracle::activations(cols, 0x5E7, 1.0);
+    let names = [
+        ("blk.0.attn_qkv.weight", 8192usize),
+        ("blk.0.attn_gate.weight", 4096),
+        ("blk.1.attn_q.weight", 8192),
+        // A tail: not a multiple of the rows a threadgroup owns.
+        ("blk.1.attn_k.weight", 511),
+    ];
+    let mut segments: Vec<(usize, &[u8])> = Vec::new();
+    let mut rows = 0usize;
+    for (name, n) in names {
+        segments.push((n, fixture.rows(name, GgmlType::Q4_K, cols, n)?));
+        rows += n;
+    }
+    let got = h.seg(&SegLaunch {
+        quant: Quant::Q4K,
+        cols,
+        segments,
+        x: &x,
+        y0: &common::sentinel_rows(rows),
+        gain: &gain,
+        eps,
+        layer: LAYER,
+    })?;
+    if let Some(fault) = h.fault()? {
+        return Err(format!("the segmented launch raised {fault}"));
+    }
+    if let Some(r) = got.iter().position(|v| v.to_bits() == SENTINEL_BITS) {
+        return Err(format!("row {r} was not written"));
+    }
+
+    // The refusals: a list the kernel cannot run.
+    let (device, stream) = (h.device, h.stream);
+    let bytes = cols / BLOCK_VALUES * Quant::Q4K.block_bytes();
+    let mut bufs = Refusals {
+        cols,
+        bytes,
+        weights: device.upload(stream, &vec![0u8; bytes * 16]).map_err(why)?,
+        x: device.upload(stream, &vec![0f32; cols + 4]).map_err(why)?,
+        y: device.upload(stream, &vec![1f32; 64]).map_err(why)?,
+        gain: device.upload(stream, &vec![1f32; cols + 4]).map_err(why)?,
+    };
+    let cases = vec![
+        bad(
+            "segments of different widths",
+            "columns",
+            |a| {
+                a.segments[1] = Some(Segment {
+                    cols: cols + BLOCK_VALUES,
+                    rows: 8,
+                    weight_blocks: 8,
+                    out_offset: 8,
+                });
+            },
+            h,
+            bytes * 16,
+        ),
+        bad(
+            "a segment of no rows",
+            "no rows",
+            |a| {
+                a.segments[0] = Some(Segment {
+                    cols: 2048,
+                    rows: 0,
+                    weight_blocks: 0,
+                    out_offset: 0,
+                });
+            },
+            h,
+            bytes * 16,
+        ),
+        bad(
+            "more segments than a dispatch runs",
+            "at most",
+            |a| {
+                for (i, slot) in a.segments.iter_mut().enumerate() {
+                    *slot = Some(Segment {
+                        cols: 2048,
+                        rows: 8,
+                        weight_blocks: i * 8,
+                        out_offset: i * 8,
+                    });
+                }
+            },
+            h,
+            bytes * 16,
+        ),
+        bad(
+            "segments whose outputs overlap",
+            "overlap",
+            |a| {
+                a.segments[1] = Some(Segment {
+                    cols: 2048,
+                    rows: 8,
+                    weight_blocks: 8,
+                    out_offset: 4,
+                });
+            },
+            h,
+            bytes * 16,
+        ),
+    ];
+    let unchanged = |h: &Harness<'_>, b: &Refusals| common::still(h, &b.y, |v| *v == 1.0);
+    let count = common::refuse_launches(h, "matvec seg", &mut bufs, cases, unchanged)?;
+    let good: Edit<'_, Refusals> = Box::new(|b, encoder| {
+        let a = Args::whole(8 * b.bytes, 8);
+        refuse(h, b, &a, encoder)
+    });
+    common::accepted_writes(h, &mut bufs, good, |h, b| {
+        common::moved(h, &b.y, |v| *v != 1.0)
+    })?;
+    Ok(Verdict::Noted(format!(
+        "{count} refusals, each by name, nothing written, {rows} rows of a four-segment dispatch written"
+    )))
+}

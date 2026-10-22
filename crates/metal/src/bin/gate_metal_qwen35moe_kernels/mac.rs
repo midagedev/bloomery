@@ -28,21 +28,29 @@ use bloomery_metal::device::MetalDevice;
 use bloomery_metal::kernels::{
     HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, Quant, SegParams, Segment,
 };
-use bloomery_metal::library::Library;
+use bloomery_metal::library::{Library, SOURCE};
 use bloomery_metal::stream::MetalStream;
 
-#[path = "clauses.rs"]
-mod clauses;
 #[path = "clauses_attention.rs"]
 mod clauses_attention;
 #[path = "clauses_delta.rs"]
 mod clauses_delta;
+#[path = "clauses_embed.rs"]
+mod clauses_embed;
 #[path = "clauses_experts.rs"]
 mod clauses_experts;
 #[path = "clauses_head.rs"]
 mod clauses_head;
+#[path = "clauses_matvec.rs"]
+mod clauses_matvec;
+#[path = "clauses_norm.rs"]
+mod clauses_norm;
 #[path = "clauses_router.rs"]
 mod clauses_router;
+#[path = "clauses_seg.rs"]
+mod clauses_seg;
+#[path = "common.rs"]
+mod common;
 #[path = "fixture.rs"]
 mod fixture;
 #[path = "mutants.rs"]
@@ -147,6 +155,10 @@ pub struct ClauseCtx<'a> {
     pub harness: &'a Harness<'a>,
     pub fixture: &'a Result<fixture::Fixture, String>,
     pub args: &'a [String],
+    /// The kernel source this run compiles from: the shipped text, or the
+    /// text with a mutant's edits in. A clause that compiles a library of its
+    /// own appends to this, so its kernel sees the same edits.
+    pub source: &'a str,
 }
 
 impl<'a> ClauseCtx<'a> {
@@ -364,14 +376,9 @@ pub fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.get(at + 1).map(String::as_str)
 }
 
-/// The kernels compiled from the source with the mutant's edits in, and the
-/// library they came from.
-fn mutated_kernels(
-    device: &MetalDevice,
-    mutant: &mutants::Mutant,
-) -> Result<(Library, Kernels), String> {
-    let text = mutants::source_of(mutant)?;
-    let library = Library::from_source_text(device, &text).map_err(why)?;
+/// The kernels compiled from `text`, and the library they came from.
+fn kernels_of_text(device: &MetalDevice, text: &str) -> Result<(Library, Kernels), String> {
+    let library = Library::from_source_text(device, text).map_err(why)?;
     let kernels = Kernels::from_library(&library).map_err(why)?;
     Ok((library, kernels))
 }
@@ -493,15 +500,21 @@ pub fn main() -> ExitCode {
         },
         None => None,
     };
-    let mutated = match mutant {
-        Some(mutant) => match mutated_kernels(&device, mutant) {
-            Ok(mutated) => Some(mutated),
+    let (run_source, mutated) = match mutant {
+        Some(mutant) => match mutants::source_of(mutant) {
+            Ok(text) => match kernels_of_text(&device, &text) {
+                Ok(mutated) => (text, Some(mutated)),
+                Err(e) => {
+                    println!("gate_metal_qwen35moe_kernels: the mutant does not build: {e}");
+                    return ExitCode::from(64);
+                }
+            },
             Err(e) => {
                 println!("gate_metal_qwen35moe_kernels: the mutant does not build: {e}");
                 return ExitCode::from(64);
             }
         },
-        None => None,
+        None => (SOURCE.to_string(), None),
     };
     let harness = Harness {
         device: &device,
@@ -526,9 +539,59 @@ pub fn main() -> ExitCode {
         harness: &harness,
         fixture: &fixture,
         args: &args,
+        source: &run_source,
     };
-    // The token's kernels follow the token DAG. A new kernel adds one line.
-    let clauses: Vec<_> = clauses::table(&ctx)
+    // The mat-vec, norm, embed, seg and head-norm families in gate order, then
+    // the token's kernels in the token DAG's. A new kernel adds one line.
+    let front: Vec<_> = vec![
+        (
+            "q4k_matvec",
+            Box::new(|| ctx.with(clauses_matvec::q4k_matvec)) as ClauseRun,
+        ),
+        (
+            "q6k_matvec",
+            Box::new(|| ctx.with(clauses_matvec::q6k_matvec)),
+        ),
+        (
+            "norm_on_load",
+            Box::new(|| ctx.with(clauses_norm::norm_on_load)),
+        ),
+        (
+            "residual_epilogue",
+            Box::new(|| ctx.with(clauses_norm::residual_epilogue)),
+        ),
+        ("row_tail", Box::new(|| ctx.with(clauses_matvec::row_tail))),
+        (
+            "row_tail_reads",
+            Box::new(|| clauses_matvec::row_tail_reads(ctx.args)),
+        ),
+        (
+            "metallib_equals_source",
+            Box::new(|| match ctx.fixture {
+                Ok(fixture) => clauses_matvec::metallib_equals_source(
+                    ctx.harness.device,
+                    ctx.harness.stream,
+                    fixture,
+                ),
+                Err(e) => Err(e.clone()),
+            }),
+        ),
+        ("embed", Box::new(|| ctx.with(clauses_embed::embed))),
+        (
+            "matvec_refusals",
+            Box::new(|| clauses_matvec::matvec_refusals(ctx.harness)),
+        ),
+        ("block_shape", Box::new(clauses_matvec::block_shape)),
+        ("seg_bit", Box::new(|| ctx.with(clauses_seg::seg_bit))),
+        ("seg_bounds", Box::new(|| ctx.with(clauses_seg::seg_bounds))),
+        ("headnorm", Box::new(|| ctx.with(clauses_norm::headnorm))),
+        (
+            "headnorm_nan",
+            Box::new(|| ctx.with(clauses_norm::headnorm_nan)),
+        ),
+        ("nsg", Box::new(|| ctx.with(clauses_matvec::nsg))),
+    ];
+    let clauses: Vec<_> = front
         .into_iter()
         .chain(clauses_delta::table(&ctx))
         .chain(clauses_router::table(&ctx))

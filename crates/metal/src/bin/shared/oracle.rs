@@ -4,12 +4,6 @@
 //!
 //! # The band
 //!
-//! PIN(2026-10-22): the model below, and no measured error, sets the band.
-//! (Re-derived the same day, before landing: the scale's `(1 + t)^(-1/2)` is
-//! taken exactly, where it was taken to first order with a 1 % margin, and the
-//! absolute floor counts its path's operations, where it was a count with no
-//! derivation. The norm band narrowed by under half a percent.)
-//!
 //! Every f32 operation rounds once to nearest: `fl(a . b) = (a . b)(1 + d)`,
 //! `|d| <= U = 2^-24`. A term of a sum that passes through `n` rounding
 //! operations before the output carries a factor `(1 + d)^n`, bounded by
@@ -56,8 +50,6 @@
 //! to, and the scale comes from the head's partial sums of the squares of its
 //! values.
 //!
-//! PIN(2026-10-22): the model below sets the head-normed band.
-//!
 //! The scale of a head: the head's `partials_per_head` partials summed in the
 //! kernel's order (one add per partial after the first), the division by the
 //! head's columns (exact: a power of two), the epsilon's add (1), and the
@@ -91,10 +83,26 @@ use bloomery_metal::kernels::{BLOCK_VALUES, Quant};
 use gguf::quant::{GgmlType, dequant_row};
 
 /// Unit roundoff of an f32 operation rounded to nearest.
-const U: f64 = 1.0 / 16_777_216.0;
+pub const U: f64 = 1.0 / 16_777_216.0;
 
 /// The most error of the library's `rsqrt`, in units in the last place.
-const RSQRT_ULP: f64 = 2.0;
+pub const RSQRT_ULP: f64 = 2.0;
+
+/// The operations of a Q4_K store path before the lane's blocks and the SIMD
+/// group's sum: the `dmin` side's fixed count of the model in this module's
+/// doc.
+///
+/// PIN(2026-10-22): the model in this module's doc, and no measured error,
+/// sets the band. (Re-derived the same day, before landing: the scale's
+/// `(1 + t)^(-1/2)` is taken exactly, where it was taken to first order with
+/// a 1 % margin, and the absolute floor counts its path's operations, where
+/// it was a count with no derivation. The norm band narrowed by under half a
+/// percent.)
+const Q4K_STORE_BASE: usize = 13;
+
+/// The operations of a Q6_K store path before the lane's blocks and the SIMD
+/// group's sum: the four-term sum, its scale and its lane count.
+const Q6K_STORE_BASE: usize = 9;
 
 /// The longest path through the SIMD group's sum: a binary tree over 32 lanes
 /// is at most 31 adds deep, whatever its shape.
@@ -161,8 +169,8 @@ pub fn gamma_bound(n: usize) -> f64 {
 /// The band of a mat-vec of `quant` over `nblocks` blocks of columns.
 pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
     let (lane_blocks, base) = match quant {
-        Quant::Q4K => (nblocks.div_ceil(4), 13),
-        Quant::Q6K => (nblocks.div_ceil(2), 9),
+        Quant::Q4K => (nblocks.div_ceil(4), Q4K_STORE_BASE),
+        Quant::Q6K => (nblocks.div_ceil(2), Q6K_STORE_BASE),
     };
     let n_store = base + lane_blocks + SIMD_SUM_DEPTH;
     match kind {
@@ -189,6 +197,9 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
             }
         }
         Kind::HeadNorm(heads) => {
+            // PIN(2026-10-22): the model in this module's doc sets the
+            // head-normed band.
+            //
             // The head scale: the head's partial sums summed (one add per
             // partial after the first), the division by the head's columns
             // (exact: a power of two), the epsilon's add, and the rsqrt.
@@ -351,6 +362,18 @@ pub fn check(
         worst = worst.max(err / width);
     }
     Ok(worst)
+}
+
+/// `1 / (1 + exp(-x))` in f64.
+#[must_use]
+pub fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// `x / (1 + exp(-x))` in f64.
+#[must_use]
+pub fn silu(x: f64) -> f64 {
+    x / (1.0 + (-x).exp())
 }
 
 /// A deterministic stream of pseudo-random numbers (SplitMix64).

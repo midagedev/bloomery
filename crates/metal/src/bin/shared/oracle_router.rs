@@ -3,8 +3,6 @@
 //!
 //! # The band
 //!
-//! PIN(2026-10-22): the model below, and no measured error, sets the band.
-//!
 //! Unit roundoff `U = 2^-24`. `G(n) = nU / (1 - nU)`. One `simd_sum` over 32
 //! lanes is at most 31 adds, whatever its shape. The library `rsqrt` is taken
 //! as `RSQRT_ULP` units in the last place of 1 (2 ulp = 4U), the same
@@ -54,13 +52,7 @@
 
 use bloomery_metal::kernels::router::{EXPERTS, K, ROWS, TOP_K_MAX};
 
-use super::oracle;
-
-/// Unit roundoff of an f32 operation rounded to nearest.
-const U: f64 = 1.0 / 16_777_216.0;
-
-/// The most error of the library's `rsqrt`, in units in the last place.
-const RSQRT_ULP: f64 = 2.0;
+use super::oracle::{self, RSQRT_ULP, U};
 
 /// `exp` under the precise f32 functions, in ulp of the result.
 const EXP_ULP: f64 = 4.0;
@@ -70,6 +62,9 @@ const LANE_ADDS: usize = LANE_PRODUCTS - 1;
 const SIMD_SUM_DEPTH: usize = 31;
 /// Gain product, weight product, the lane's adds, the SIMD group's adds, the
 /// scale product, and the split add.
+///
+/// PIN(2026-10-22): the model in this module's doc, and no measured error,
+/// sets the band's counts.
 const N_DOT: usize = 1 + 1 + LANE_ADDS + SIMD_SUM_DEPTH + 1 + 1;
 const SQUARES: usize = 64;
 /// The square, the lane's adds of the squares, and the SIMD group's adds.
@@ -84,11 +79,6 @@ const _: () = assert!(K == 2048);
 const _: () = assert!(ROWS == EXPERTS + 1);
 const _: () = assert!(TOP_K_MAX == 8);
 
-const fn gamma(n: usize) -> f64 {
-    let nu = n as f64 * U;
-    nu / (1.0 - nu)
-}
-
 /// The relative factor of a logit and the operations that set its floor.
 #[derive(Clone, Copy, Debug)]
 pub struct Band {
@@ -99,9 +89,9 @@ pub struct Band {
 /// The band of one router logit.
 #[must_use]
 pub fn logit_band() -> Band {
-    let t = gamma(N_ARG);
+    let t = oracle::gamma_bound(N_ARG);
     let theta_s = (1.0 - t).powf(-0.5) - 1.0 + RSQRT_ULP * 2.0 * U;
-    let g = gamma(N_DOT);
+    let g = oracle::gamma_bound(N_DOT);
     Band {
         factor: theta_s + g + theta_s * g,
         ops: N_ARG + N_DOT,
@@ -276,21 +266,16 @@ pub fn weights(step: &Step, ids: &[usize]) -> Result<WeightOracle, String> {
     }
     let mut want: Vec<f64> = term.into_iter().map(|e| e / sum).collect();
     let mut band = vec![abs; k];
-    want.push(sigmoid(step.logits[EXPERTS]));
+    want.push(oracle::sigmoid(step.logits[EXPERTS]));
     band.push(shared_band(step.logits[EXPERTS], step.width[EXPERTS]));
     Ok(WeightOracle { want, band })
-}
-
-/// `1 / (1 + exp(-l))`.
-fn sigmoid(l: f64) -> f64 {
-    1.0 / (1.0 + (-l).exp())
 }
 
 /// The relative evaluation error of the eight-exp weight, capped at 1.
 fn weight_rel(reach: f64, k: usize) -> f64 {
     let eta = EXP_ULP * 2.0_f64.powi(-23);
     let rel_e = (1.0 + eta) * (U * reach).exp() - 1.0;
-    let g = gamma(k.saturating_sub(1));
+    let g = oracle::gamma_bound(k.saturating_sub(1));
     let rel_s = rel_e + g * (1.0 + rel_e);
     if !rel_s.is_finite() || rel_s >= 0.5 {
         return 1.0;
