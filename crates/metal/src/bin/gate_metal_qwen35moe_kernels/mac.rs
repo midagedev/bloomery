@@ -27,8 +27,9 @@
 //! 9. **matvec_refusals**: a window that is not the shape's, columns that are
 //!    not whole blocks and an empty shape are refused by name, and nothing is
 //!    encoded for them.
-//! 10. **block_shape**: the block bytes and values the launch arithmetic
-//!     uses are gguf's own for Q4_K and Q6_K.
+//! 10. **block_shape**: the block values the launch arithmetic uses are
+//!     gguf's own for Q4_K and Q6_K; the bytes are gguf's row by
+//!     construction.
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
@@ -51,9 +52,11 @@ use bloomery_metal::stream::MetalStream;
 
 #[path = "clauses.rs"]
 mod clauses;
+#[path = "fixture.rs"]
+mod fixture;
 #[path = "mutants.rs"]
 mod mutants;
-#[path = "oracle.rs"]
+#[path = "../shared/oracle.rs"]
 mod oracle;
 
 /// A clause, ready to run.
@@ -355,14 +358,14 @@ pub fn main() -> ExitCode {
     let only = flag(&args, "--child")
         .or(mutant.map(|m| m.clause))
         .or(flag(&args, "--only"));
-    let fixture = fixture_path(&args).and_then(|path| oracle::Fixture::open(&path));
+    let fixture = fixture_path(&args).and_then(|path| fixture::Fixture::open(&path));
     match &fixture {
         Ok(f) => println!("fixture: {}", f.path.display()),
         Err(e) => println!("fixture: {e}"),
     }
 
     let mut report = Report::new();
-    let with = |f: fn(&Harness<'_>, &oracle::Fixture) -> Clause| match &fixture {
+    let with = |f: fn(&Harness<'_>, &fixture::Fixture) -> Clause| match &fixture {
         Ok(fixture) => f(&harness, fixture),
         Err(e) => Err(e.clone()),
     };

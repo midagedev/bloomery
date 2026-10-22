@@ -19,12 +19,24 @@ pub enum Quant {
 }
 
 impl Quant {
-    /// The bytes of one block of 256 values.
+    /// The bytes of one block of 256 values: gguf's own row for the type,
+    /// the one owner of the number.
     #[must_use]
-    pub const fn block_bytes(self) -> usize {
+    pub fn block_bytes(self) -> usize {
+        usize::try_from(
+            self.ggml()
+                .type_size()
+                .expect("both kernel types have GGUF rows"),
+        )
+        .expect("Q4_K and Q6_K block sizes fit usize")
+    }
+
+    /// The GGUF type this kernel reads.
+    #[must_use]
+    pub const fn ggml(self) -> gguf::quant::GgmlType {
         match self {
-            Self::Q4K => 144,
-            Self::Q6K => 210,
+            Self::Q4K => gguf::quant::GgmlType::Q4_K,
+            Self::Q6K => gguf::quant::GgmlType::Q6_K,
         }
     }
 
@@ -39,8 +51,9 @@ impl Quant {
 }
 
 /// The RMS norm a mat-vec applies as it loads its input: `x * gain / sqrt(mean(x^2) + eps)`.
-/// A norm that finds a value that is not finite, or a zero scale, raises the
-/// norm site of `layer` on `fault` and writes NaN to its rows.
+/// A norm whose input or scale it cannot take, or whose gain leaves a row
+/// not finite, raises the norm site of `layer` on `fault` and writes NaN to
+/// its rows.
 pub struct NormOnLoad<'w> {
     /// The norm's gain, one value per input column.
     pub gain: Window<'w, f32, MetalDevice>,

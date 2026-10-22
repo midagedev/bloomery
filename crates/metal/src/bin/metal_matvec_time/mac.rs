@@ -27,7 +27,7 @@ use bloomery_device::{Buffer, Device, DeviceError, Elems, Event, Stream};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::kernels::{BLOCK_VALUES, Kernels, MatvecParams, Mode, Quant};
 
-#[path = "../gate_metal_qwen35moe_kernels/oracle.rs"]
+#[path = "../shared/oracle.rs"]
 #[allow(
     dead_code,
     reason = "the probe reads the oracle's reference and band; the gate reads the rest"
@@ -239,13 +239,29 @@ fn trials_of(value: Option<&String>) -> Result<usize, String> {
     }
 }
 
+/// The `--only` value: one of the probe's weight types, refused by name
+/// otherwise (a selection that matches no shape would skip every shape and
+/// exit as a success).
+fn only_of(value: Option<&String>) -> Result<&str, String> {
+    let Some(value) = value else {
+        return Err("--only takes a value".to_string());
+    };
+    if [Quant::Q4K, Quant::Q6K]
+        .iter()
+        .any(|q| q.name() == value.as_str())
+    {
+        Ok(value)
+    } else {
+        Err(format!(
+            "--only takes {} or {}, not {value:?}",
+            Quant::Q4K.name(),
+            Quant::Q6K.name()
+        ))
+    }
+}
+
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let flag = |name: &str| {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1))
-    };
     let trials = match args
         .iter()
         .position(|a| a == "--trials")
@@ -257,7 +273,17 @@ pub fn main() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    let only = flag("--only").map(String::as_str);
+    let only = match args
+        .iter()
+        .position(|a| a == "--only")
+        .map_or(Ok(None), |at| only_of(args.get(at + 1)).map(Some))
+    {
+        Ok(only) => only,
+        Err(e) => {
+            println!("metal_matvec_time: {e}");
+            return ExitCode::from(64);
+        }
+    };
     let check = !args.iter().any(|a| a == "--no-check");
     let show_gaps = args.iter().any(|a| a == "--gaps");
 

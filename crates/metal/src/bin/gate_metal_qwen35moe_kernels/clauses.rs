@@ -10,7 +10,8 @@ use bloomery_metal::kernels::{BLOCK_VALUES, EmbedParams, MatvecParams, Mode, Nor
 use bloomery_metal::stream::MetalStream;
 use gguf::quant::GgmlType;
 
-use super::oracle::{self, Fixture, Kind};
+use super::fixture::Fixture;
+use super::oracle::{self, Kind};
 use super::{Harness, Launch, ModeSpec, SENTINEL_BITS, flag};
 
 /// The layer the clauses launch in: a model layer, so a raise is told apart
@@ -19,6 +20,7 @@ const LAYER: u32 = 5;
 
 /// A tensor a clause reads: its name, the type, the columns and the rows the
 /// clause takes of it.
+#[derive(Clone, Copy)]
 struct Tensor {
     name: &'static str,
     quant: Quant,
@@ -45,15 +47,8 @@ impl Tensor {
         }
     }
 
-    fn ggml(&self) -> GgmlType {
-        match self.quant {
-            Quant::Q4K => GgmlType::Q4_K,
-            Quant::Q6K => GgmlType::Q6_K,
-        }
-    }
-
     fn bytes<'f>(&self, fixture: &'f Fixture) -> Result<&'f [u8], String> {
-        fixture.rows(self.name, self.ggml(), self.cols, self.rows)
+        fixture.rows(self.name, self.quant.ggml(), self.cols, self.rows)
     }
 
     fn label(&self) -> String {
@@ -288,20 +283,62 @@ pub fn norm_on_load(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     .map_err(|e| format!("an input whose mean square is near eps {eps}: {e}"))?;
     parts.push(format!("small input {worst:.3}"));
 
-    // Input the norm cannot take: each raises the norm site of the layer and
-    // writes NaN to every row.
-    for (what, mut x, eps) in [
-        ("a NaN input", oracle::activations(t.cols, 1, 1.0), eps),
+    // Input, epsilon or gain a norm cannot take: each raises the norm site
+    // of the layer and writes NaN to every row. The infinite epsilon, the
+    // NaN gain and the infinite gain run on both weight types, which share
+    // the predicates.
+    for (t, what, mut x, eps) in [
+        (t, "a NaN input", oracle::activations(t.cols, 1, 1.0), eps),
         (
+            t,
             "an infinite input",
             oracle::activations(t.cols, 2, 1.0),
             eps,
         ),
-        ("a zero input and a zero epsilon", vec![0f32; t.cols], 0.0),
+        (
+            t,
+            "a zero input and a zero epsilon",
+            vec![0f32; t.cols],
+            0.0,
+        ),
+        (
+            t,
+            "an infinite epsilon",
+            oracle::activations(t.cols, 3, 1.0),
+            f32::INFINITY,
+        ),
+        (
+            Tensor::q6k("blk.2.ffn_down_shexp.weight", 512, 2048),
+            "an infinite epsilon",
+            oracle::activations(512, 3, 1.0),
+            f32::INFINITY,
+        ),
+        (t, "a NaN gain", oracle::activations(t.cols, 4, 1.0), eps),
+        (
+            t,
+            "an infinite gain",
+            oracle::activations(t.cols, 5, 1.0),
+            eps,
+        ),
+        (
+            Tensor::q6k("blk.2.ffn_down_shexp.weight", 512, 2048),
+            "a NaN gain",
+            oracle::activations(512, 4, 1.0),
+            eps,
+        ),
+        (
+            Tensor::q6k("blk.2.ffn_down_shexp.weight", 512, 2048),
+            "an infinite gain",
+            oracle::activations(512, 5, 1.0),
+            eps,
+        ),
     ] {
+        let mut gain = gain_for(fixture, None, t.cols, 0x6B0)?;
         match what {
             "a NaN input" => x[17] = f32::NAN,
             "an infinite input" => x[t.cols - 1] = f32::INFINITY,
+            "a NaN gain" => gain[0] = f32::NAN,
+            "an infinite gain" => gain[t.cols - 1] = f32::INFINITY,
             _ => {}
         }
         h.clear_fault()?;
@@ -902,18 +939,12 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
 }
 
 /// The block shape the kernels are written for is gguf's own row for each
-/// type: this crate keeps a second copy of the two numbers (the launch's
-/// shape arithmetic), and the clause holds it to the first.
+/// type: the bytes are gguf's row by construction ([`Quant::block_bytes`]
+/// reads it), and this crate's own count of the values a block holds is
+/// held to the same row.
 pub fn block_shape() -> Clause {
-    for (quant, ty) in [(Quant::Q4K, GgmlType::Q4_K), (Quant::Q6K, GgmlType::Q6_K)] {
-        if Some(quant.block_bytes() as u64) != ty.type_size() {
-            return Err(format!(
-                "{} blocks are {} bytes here and {:?} in gguf",
-                quant.name(),
-                quant.block_bytes(),
-                ty.type_size()
-            ));
-        }
+    for quant in [Quant::Q4K, Quant::Q6K] {
+        let ty = quant.ggml();
         if Some(BLOCK_VALUES as u64) != ty.blck_size() {
             return Err(format!(
                 "{} blocks hold {BLOCK_VALUES} values here and {:?} in gguf",
@@ -923,6 +954,7 @@ pub fn block_shape() -> Clause {
         }
     }
     Ok(Verdict::Noted(
-        "Q4_K and Q6_K block bytes and values are gguf's".to_string(),
+        "Q4_K and Q6_K blocks hold gguf's 256 values; their bytes are gguf's by construction"
+            .to_string(),
     ))
 }
