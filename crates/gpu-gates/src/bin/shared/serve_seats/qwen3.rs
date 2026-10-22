@@ -714,7 +714,7 @@ impl Body3 for Body35 {
         // The draft's own shape first: a draft over the target's own ids borrows the target's
         // head in place, a reduced one carries its own head and reads the target's not at all.
         let borrows_head = matches!(
-            dspark_hf::shape_of(dir)?.vocab,
+            dspark_hf::shape(dir, &dspark_hf::HfFile::open(dir)?)?.vocab,
             runtime::dspark::DraftVocab::Full { .. }
         );
         let borrowed = if borrows_head {

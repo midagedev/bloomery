@@ -222,18 +222,6 @@ pub fn open(gpu: &Gpu, dir: &Path, ctx: usize) -> Result<Parts, GateError> {
     open_with(gpu, dir, ctx, None)
 }
 
-/// The shape the draft in `dir` states, read from its config and its file's header alone: the
-/// seat asks it before it opens the target, to know whether the draft borrows the target's head
-/// ([`shape`]'s [`DraftVocab`]).
-#[allow(
-    dead_code,
-    reason = "the reader is shared by the draft gate and the serve seat; each opens the part it reads"
-)]
-pub fn shape_of(dir: &Path) -> Result<DsparkShape, GateError> {
-    let file = HfFile::open(dir)?;
-    shape(dir, &file)
-}
-
 /// Open the draft in `dir` beside `target`, for contexts of up to `ctx` positions: a full-vocabulary
 /// draft borrows the target's Q6_K head in place and its `token_embd.weight` rows, a reduced one
 /// loads its own `lm_head` and embedding. The draft's ids, mask and taps are held to the target
