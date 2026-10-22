@@ -585,7 +585,7 @@ levers 0 0 0
 # PIN(2026-10-23): metal 17 -> 21 blocks, 3 -> 7 fns, 11 -> 12 impls, new code, not old code relaxed: the e2e gate's
 # counting #[global_allocator] (crates/model/tests/alloc.rs's pattern) forwards alloc, alloc_zeroed, realloc and
 # dealloc to System, one impl, four fns, four blocks, each with its SAFETY line.
-metal 21 7 12
+metal 21 7 11
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.

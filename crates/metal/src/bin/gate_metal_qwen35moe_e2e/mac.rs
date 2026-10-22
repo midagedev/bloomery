@@ -28,8 +28,8 @@
 //!
 //! `--nodes` is a tool, not a clause: the step set's prompt host-fed, then
 //! its step token traced, every named node against ik's, the first past its
-//! band printed. `--ops` is another: each op's wall in the traced step
-//! (`wall.rs`). `--list` prints the clause names; `--only CLAUSE` runs one;
+//! band printed. `--ops` is another: each op's wall in the traced step,
+//! the host-fed and chain step medians beside it (`wall.rs`). `--list` prints the clause names; `--only CLAUSE` runs one;
 //! `--mutant NAME` runs the clause that must catch a kernel defect against
 //! kernels compiled with it (`mutants.rs`); `--mutants-all` runs each in a
 //! child gate and is red when one stays green.

@@ -482,17 +482,9 @@ mod gate {
     /// added in quadrature over 48 layers, independent: √48 · 4e-2 ≈ 0.28.
     const FREE_BAND: f64 = 0.28;
 
-    /// `‖a − b‖ / ‖base‖` over the zipped values in f64, the denominator's
-    /// values from `base`: not `e2e::rel`, which divides by `‖b‖` and is
-    /// infinite on a length mismatch or a NaN (this one has neither guard).
-    fn rel_base(a: &[f32], b: &[f32], base: impl Fn(usize) -> f64) -> f64 {
-        let (mut num, mut den) = (0.0f64, 0.0f64);
-        for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
-            num += (f64::from(x) - f64::from(y)).powi(2);
-            den += base(i).powi(2);
-        }
-        (num / den.max(f64::MIN_POSITIVE)).sqrt()
-    }
+    // `‖a − b‖ / ‖base‖` over the zipped values in f64: not `e2e::rel`,
+    // which divides by `‖b‖` and is infinite on a length mismatch or a NaN.
+    use refset::flip::rel_base;
 
     /// ik's `name` rows, `k` values each.
     fn rows(man: &RefManifest, name: &str, k: usize) -> Result<Vec<Vec<f32>>, GateError> {

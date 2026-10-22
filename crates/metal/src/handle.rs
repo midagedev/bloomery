@@ -1,11 +1,12 @@
 //! Metal objects held across threads.
 //!
-//! The bindings declare none of Metal's protocols `Send` or `Sync`. Apple's
-//! documentation names which objects are safe to use from several threads at
-//! once; those, and only those, are wrapped by [`Handle`]. A command buffer
-//! is not among them: it may move to another thread between uses, never be
-//! used by two at once, so it is wrapped by [`CommandBufferHandle`], which is
-//! `Send` and not `Sync`, and kept behind a lock. An encoder is not wrapped at all.
+//! The shared event crosses threads as it comes: the bindings declare its
+//! `MTLEvent` protocol `Send + Sync`. The other objects used from several
+//! threads at once are wrapped by [`Handle`], whose [`ThreadSafe`] list is
+//! Apple's list of thread-safe Metal objects. A command buffer is not among
+//! them: it may move to another thread between uses, never be used by two at
+//! once, so it is wrapped by [`CommandBufferHandle`], which is `Send` and not
+//! `Sync`, and kept behind a lock. An encoder is not wrapped at all.
 
 use core::ops::Deref;
 
@@ -13,7 +14,6 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLSharedEvent,
 };
 
 /// A Metal protocol that Apple documents as safe to use from several threads
@@ -21,8 +21,8 @@ use objc2_metal::{
 ///
 /// # Safety
 /// Apple's thread-safety list for Metal names the protocol: the device, the
-/// command queue, the resources (buffers), the compiled-code objects
-/// (libraries and pipeline states) and the shared event.
+/// command queue, the resources (buffers) and the compiled-code objects
+/// (libraries and pipeline states).
 pub(crate) unsafe trait ThreadSafe {}
 
 // SAFETY: the device is on Apple's list of objects usable from any thread.
@@ -35,9 +35,6 @@ unsafe impl ThreadSafe for dyn MTLBuffer {}
 unsafe impl ThreadSafe for dyn MTLComputePipelineState {}
 // SAFETY: a library is compiled code, on Apple's list.
 unsafe impl ThreadSafe for dyn MTLLibrary {}
-// SAFETY: a shared event is built to be signalled and waited on across
-// threads and processes.
-unsafe impl ThreadSafe for dyn MTLSharedEvent {}
 
 /// A Metal object of a thread-safe protocol, shared across threads.
 pub(crate) struct Handle<T: ?Sized + ThreadSafe>(pub(crate) Retained<ProtocolObject<T>>);

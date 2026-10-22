@@ -7,7 +7,8 @@
 //! does. The host reads it through the contract's one decoding rule
 //! ([`Fault::read_from`]) and clears it, as atomic words, after the stream it
 //! is asked against has finished its work, or, with no wait of its own, on
-//! the proof a settle of the stream returned ([`Settled`]).
+//! proof the caller holds that that work is done: a settle's ([`Settled`])
+//! or its own wait of the stream.
 
 use core::sync::atomic::Ordering;
 
@@ -65,6 +66,13 @@ impl MetalFaultWord {
     /// raises into this word.
     pub fn clear_settled(&self, settled: &Settled) -> Result<(), DeviceError> {
         let _ = settled;
+        self.write_clean()
+    }
+
+    /// The word clean again with no wait of its own: the caller has waited
+    /// the stream's work first, so no recording still running can raise
+    /// into this word after this.
+    pub(crate) fn clear_waited(&self) -> Result<(), DeviceError> {
         self.write_clean()
     }
 

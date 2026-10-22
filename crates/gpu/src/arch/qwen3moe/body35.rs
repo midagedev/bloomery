@@ -126,7 +126,7 @@ use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use chain::arch::qwen3moe::read::{
-    PlanDims, Read35, joint, joint_gate_inp, plan_delta, plan_ffn, plan_gqa,
+    PlanDims, Read35, joint, joint_gate_inp, layer_plans, plan_ffn, plan_gqa,
 };
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -819,23 +819,7 @@ impl Pre35 {
         )?;
         let common = common_forms(file, &d, &spec.layers, mode)?;
         let pd = plan_dims(&d);
-        let plans = kinds
-            .iter()
-            .zip(&spec.layers)
-            .enumerate()
-            .map(|(l, (kind, layer))| {
-                let mixer = match *kind {
-                    Kind35::Gqa(flash) => MixerPlan::Gqa(plan_gqa(file, WHAT, &pd, l, flash)?),
-                    Kind35::Delta(shape) => {
-                        MixerPlan::Delta(plan_delta(file, WHAT, &pd, shape, l)?)
-                    }
-                };
-                Ok(LayerPlan {
-                    mixer,
-                    ffn: plan_ffn(file, WHAT, &pd, layer, l, mode)?,
-                })
-            })
-            .collect::<Result<Vec<_>, GpuError>>()?;
+        let plans = layer_plans(file, WHAT, &pd, &kinds, &spec.layers, mode)?;
         Ok(Pre35 {
             vocab,
             eps: spec.rms_eps,

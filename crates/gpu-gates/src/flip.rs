@@ -10,8 +10,14 @@
 //! large — a broken chain moves every value and every flip reads as
 //! rounding — so a flip is allowed only while each pair's error also sits
 //! under a cap the gate pins from what a correct chain reaches.
+//!
+//! The rules every backend's gate reads — the margin, the top-set check and
+//! the head's tie band — are the reference sets' (`refset::flip`), re-exported
+//! here under the path the card's gates read them at.
 
 use crate::GateError;
+use refset::flip::rms;
+pub use refset::flip::{head_cap, head_gap, head_tie, margin, picks_its_top};
 
 /// A token whose chosen set differs from ik's, with every exchanged pair.
 #[derive(Clone, Debug)]
@@ -110,43 +116,6 @@ impl Flip {
     }
 }
 
-/// ik's own margin over `values` (one token's row) and its chosen `ids`: the
-/// lowest value it kept less the highest it left.
-#[must_use]
-pub fn margin(values: &[f32], ids: &[i32]) -> f64 {
-    let min_in = ids
-        .iter()
-        .map(|&e| values.get(e as usize).map_or(f64::NAN, |&v| f64::from(v)))
-        .fold(f64::INFINITY, f64::min);
-    let max_out = (0..values.len())
-        .filter(|&e| !ids.contains(&(e as i32)))
-        .map(|e| f64::from(values[e]))
-        .fold(f64::NEG_INFINITY, f64::max);
-    min_in - max_out
-}
-
-/// Whether ids are n_used distinct experts at the top of finite logits.
-#[must_use]
-pub fn picks_its_top(ids: &[u32], logits: &[f32], n_used: usize) -> bool {
-    if ids.len() != n_used
-        || logits.iter().any(|v| !v.is_finite())
-        || ids
-            .iter()
-            .enumerate()
-            .any(|(i, &e)| e as usize >= logits.len() || ids[..i].contains(&e))
-    {
-        return false;
-    }
-    let low = ids
-        .iter()
-        .map(|&e| logits[e as usize])
-        .fold(f32::INFINITY, f32::min);
-    logits
-        .iter()
-        .enumerate()
-        .all(|(e, &v)| ids.iter().any(|&id| id as usize == e) || v <= low)
-}
-
 /// A head's argmax that differs from ik's, excused as a tie: ours is ik's
 /// runner-up, ik's own margin between the two lies within twice our
 /// distance from ik's logits at those ids, and our whole logits row lies
@@ -162,11 +131,6 @@ pub fn tie_allowed(
     ratio: f64,
 ) -> bool {
     top != ik_top && top == ik_runner_up && margin <= 2.0 * dist && logits_rel <= ratio * input_rel
-}
-
-/// The RMS of a row.
-fn rms(v: &[f32]) -> f64 {
-    (v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt()
 }
 
 /// The deviation of a row about its mean: the spread a ranking reads (a common offset moves no
@@ -211,41 +175,6 @@ pub fn head_margin(row: &[f32]) -> Result<f32, GateError> {
     }
     let (_, a, _, b) = crate::kld::top2(row);
     Ok(a - b)
-}
-
-/// How far below ik's top logit ik's own row puts our argmax `ours`: `max(ik_row) − ik_row[ours]`,
-/// 0 when `ours` is ik's argmax. NaN for an id past the row and for a row with a value that is
-/// not finite, which no rule allows.
-#[must_use]
-pub fn head_gap(ik_row: &[f32], ours: u32) -> f64 {
-    if ik_row.iter().any(|v| !v.is_finite()) {
-        return f64::NAN;
-    }
-    let top = ik_row
-        .iter()
-        .fold(f64::NEG_INFINITY, |m, &v| m.max(f64::from(v)));
-    ik_row
-        .get(ours as usize)
-        .map_or(f64::NAN, |&v| top - f64::from(v))
-}
-
-/// The widest [`head_gap`] a head's rounding excuses: `6 · band ·` [`rms`] of ik's row, the
-/// row's logits moving by about `band` times their RMS (the head is a linear map after a norm
-/// whose input carries `band` of relative error), three deviations each for our logit and
-/// ik's.
-#[must_use]
-pub fn head_cap(band: f64, ik_row: &[f32]) -> f64 {
-    flip_cap(band, ik_row)
-}
-
-/// A head's argmax excused as a tie band: ours is ik's argmax, or ik's own logit at our argmax
-/// lies within [`head_cap`] of ik's top ([`head_gap`]). Unlike [`tie_allowed`] it asks for no
-/// runner-up: where ik's row is near flat (random weights), our argmax is ik's third or lower
-/// at a rate the runner-up rule cannot hold, and the band is what the error model gives. The
-/// bound is inclusive. A NaN band, a row that is not finite or an id past the row is not a tie.
-#[must_use]
-pub fn head_tie(ik_row: &[f32], ours: u32, band: f64) -> bool {
-    head_gap(ik_row, ours) <= head_cap(band, ik_row)
 }
 
 #[cfg(test)]
@@ -307,65 +236,6 @@ mod tests {
                 (offset + scale * z) as f32
             })
             .collect()
-    }
-
-    /// The head's tie band on a unit-RMS row (band 0.0716, cap 6 · band · 1 = 0.43): ours is ik's
-    /// argmax, or its lag below ik's top is within the cap, bound included. The cases are the
-    /// two ends of the band's simulation (ik's row of iid N(0, 1) logits, ours moved by iid
-    /// N(0, s²)): at s = 0.05, within the band, our argmax lags by at most 6·s = 0.30 and holds;
-    /// at s = 0.15, past it, a lag of 0.60 is a false fail. Mutant: `<` for `<=`, or the cap's
-    /// `6` moved.
-    #[test]
-    fn a_head_tie_is_held_within_the_band_and_fails_past_it() {
-        let band = 0.0716;
-        let mut ik = row(4096, 1.0, 0.0);
-        ik[10] = 4.976;
-        ik[11] = 4.976 - 0.30;
-        ik[12] = 4.976 - 0.60;
-        let cap = head_cap(band, &ik);
-        assert!(
-            (0.40..0.46).contains(&cap),
-            "cap {cap}: the unit-RMS row's 0.43"
-        );
-        assert_eq!(head_gap(&ik, 10), 0.0);
-        assert!((head_gap(&ik, 11) - 0.30).abs() < 1e-6);
-        assert!(head_tie(&ik, 10, band), "ik's own argmax");
-        assert!(
-            head_tie(&ik, 11, band),
-            "s = 0.05 <= band: a lag of 6 s = 0.30 holds"
-        );
-        assert!(
-            !head_tie(&ik, 12, band),
-            "s = 0.15 > band: a lag of 0.60 is a false fail"
-        );
-
-        // The bound itself: a row whose RMS is 1, the lag 2 = 6 · (1/3) · 1.
-        let edge = [2.0f32, 0.0, 0.0, 0.0];
-        let third = 1.0 / 3.0;
-        assert_eq!(head_cap(third, &edge), 2.0);
-        assert_eq!(head_gap(&edge, 1), 2.0);
-        assert!(head_tie(&edge, 1, third), "the cap is inclusive");
-        assert!(
-            !head_tie(&edge, 1, third * 0.999),
-            "a hair under the cap is not"
-        );
-    }
-
-    /// What no rule allows is not a tie, whatever the band: an id past the row, a row with a
-    /// value that is not finite, an empty row and a NaN band.
-    /// Mutant: a NaN read as a pass.
-    #[test]
-    fn a_head_tie_needs_a_finite_row_and_band() {
-        let ik = [1.0f32, 0.5, 0.25];
-        assert!(head_tie(&ik, 1, 1.0));
-        assert!(!head_tie(&ik, 3, 1.0), "past the row");
-        assert!(!head_tie(&[1.0, f32::NAN, 0.0], 0, 1.0), "NaN in the row");
-        assert!(
-            !head_tie(&[1.0, f32::INFINITY, 0.0], 0, 1.0),
-            "inf in the row"
-        );
-        assert!(!head_tie(&[], 0, 1.0), "an empty row");
-        assert!(!head_tie(&ik, 0, f64::NAN), "NaN band");
     }
 
     // The five copies the e2e gates carry, as they read when they were lifted: `gate_glm5next_mtp`'s
