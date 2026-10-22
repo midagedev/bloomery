@@ -16,7 +16,7 @@ use chain::arch::qwen3moe::plan::{FfnRoute, LayerPlan, MixerPlan, SharedPlan};
 use chain::linear::{KHeadMap, LinearShape};
 use gguf::Split;
 use gguf::quant::GgmlType;
-use model::arch::models::{Ffn, Mixer as SpecMixer, ModelSpec};
+use model::arch::models::{Ffn, LayerSpec, Mixer as SpecMixer, ModelSpec};
 use model::arch::names::{self, blk};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
@@ -184,6 +184,15 @@ fn refuse(detail: impl Into<String>) -> SessionError {
     }
 }
 
+/// The shape facts every layer must share, each set by the first layer that
+/// has one and held by every later layer: the rope table's base (one table
+/// serves one) and the MoE's experts-and-picks shape.
+#[derive(Default)]
+struct SharedShapes {
+    rope_base: Option<f32>,
+    moe: Option<(usize, usize)>,
+}
+
 /// The launch quant of file type `ty`, or `None` for a type no mat-vec runs.
 fn quant_of(ty: GgmlType) -> Option<Quant> {
     match ty {
@@ -337,6 +346,80 @@ impl Loader<'_> {
             ranges,
         ))
     }
+
+    /// Layer `l`'s buffers: the mixer its plan and description agree on, the
+    /// FFN of the expert shape every layer shares, the facts the layers must
+    /// share read from and set on `shared` (the first layer that has one sets
+    /// each). A refusal of layer `l` names it.
+    fn layer(
+        &self,
+        plan: &LayerPlan,
+        layer: &LayerSpec,
+        l: usize,
+        hidden: usize,
+        ctx: usize,
+        shared: &mut SharedShapes,
+    ) -> Result<LayerBufs, SessionError> {
+        let at = |e: SessionError| match e {
+            SessionError::Shape { what, detail } => SessionError::Shape {
+                what,
+                detail: format!("layer {l}: {detail}"),
+            },
+            other => other,
+        };
+        let mixer = match (&plan.mixer, &layer.mixer) {
+            (MixerPlan::Delta(d), SpecMixer::DeltaRule(_)) => {
+                MixerBufs::Delta(delta(self, d, hidden).map_err(at)?)
+            }
+            (MixerPlan::Gqa(g), SpecMixer::Gqa(spec_g)) => {
+                if spec_g.rope.dims as usize != ROT {
+                    return Err(at(refuse(format!(
+                        "a rope over {} values; the attention turns {ROT}",
+                        spec_g.rope.dims
+                    ))));
+                }
+                match shared.rope_base {
+                    None => shared.rope_base = Some(spec_g.rope.base),
+                    Some(b) if b == spec_g.rope.base => {}
+                    Some(b) => {
+                        return Err(at(refuse(format!(
+                            "a rope base of {}, another layer's is {b}; one table serves one",
+                            spec_g.rope.base
+                        ))));
+                    }
+                }
+                MixerBufs::Attention(attention(self, g, hidden, ctx).map_err(at)?)
+            }
+            _ => {
+                return Err(at(refuse(
+                    "the plan's mixer and the description's differ".to_string(),
+                )));
+            }
+        };
+        let Ffn::Moe(m) = &layer.ffn else {
+            return Err(at(refuse(
+                "a dense FFN, which this backend's experts do not run".to_string(),
+            )));
+        };
+        let shape = (m.experts as usize, m.top_k as usize);
+        match shared.moe {
+            None => shared.moe = Some(shape),
+            Some(s) if s == shape => {}
+            Some(s) => {
+                return Err(at(refuse(format!(
+                    "{shape:?} experts and picks, another layer's are {s:?}"
+                ))));
+            }
+        }
+        if m.expert_ff as usize != EXPERT_K {
+            return Err(at(refuse(format!(
+                "an expert of {}; the experts run {EXPERT_K}",
+                m.expert_ff
+            ))));
+        }
+        let ffn = ffn(self, self.device, plan, hidden, shape, l).map_err(at)?;
+        Ok(LayerBufs { mixer, ffn })
+    }
 }
 
 /// A buffer of `n` elements, zeroed.
@@ -421,72 +504,15 @@ impl Arena {
             )));
         }
         let head_norm = load.f32s(&names::output_norm(), hidden)?;
-        let mut rope_base = None;
-        let mut moe = None;
+        let mut shared = SharedShapes::default();
         let mut layers = Vec::with_capacity(plans.len());
         for (l, (plan, layer)) in plans.iter().zip(&spec.layers).enumerate() {
-            let at = |e: SessionError| match e {
-                SessionError::Shape { what, detail } => SessionError::Shape {
-                    what,
-                    detail: format!("layer {l}: {detail}"),
-                },
-                other => other,
-            };
-            let mixer = match (&plan.mixer, &layer.mixer) {
-                (MixerPlan::Delta(d), SpecMixer::DeltaRule(_)) => {
-                    MixerBufs::Delta(delta(&load, d, hidden).map_err(at)?)
-                }
-                (MixerPlan::Gqa(g), SpecMixer::Gqa(spec_g)) => {
-                    if spec_g.rope.dims as usize != ROT {
-                        return Err(at(refuse(format!(
-                            "a rope over {} values; the attention turns {ROT}",
-                            spec_g.rope.dims
-                        ))));
-                    }
-                    match rope_base {
-                        None => rope_base = Some(spec_g.rope.base),
-                        Some(b) if b == spec_g.rope.base => {}
-                        Some(b) => {
-                            return Err(at(refuse(format!(
-                                "a rope base of {}, another layer's is {b}; one table serves one",
-                                spec_g.rope.base
-                            ))));
-                        }
-                    }
-                    MixerBufs::Attention(attention(&load, g, hidden, ctx).map_err(at)?)
-                }
-                _ => {
-                    return Err(at(refuse(
-                        "the plan's mixer and the description's differ".to_string(),
-                    )));
-                }
-            };
-            let Ffn::Moe(m) = &layer.ffn else {
-                return Err(at(refuse(
-                    "a dense FFN, which this backend's experts do not run".to_string(),
-                )));
-            };
-            let shape = (m.experts as usize, m.top_k as usize);
-            match moe {
-                None => moe = Some(shape),
-                Some(s) if s == shape => {}
-                Some(s) => {
-                    return Err(at(refuse(format!(
-                        "{shape:?} experts and picks, another layer's are {s:?}"
-                    ))));
-                }
-            }
-            if m.expert_ff as usize != EXPERT_K {
-                return Err(at(refuse(format!(
-                    "an expert of {}; the experts run {EXPERT_K}",
-                    m.expert_ff
-                ))));
-            }
-            let ffn = ffn(&load, device, plan, hidden, shape, l).map_err(at)?;
-            layers.push(LayerBufs { mixer, ffn });
+            layers.push(load.layer(plan, layer, l, hidden, ctx, &mut shared)?);
         }
-        let (n_experts, top_k) = moe.ok_or_else(|| refuse("a file of no layer"))?;
-        let base = rope_base.ok_or_else(|| refuse("no attention layer to read the rope from"))?;
+        let (n_experts, top_k) = shared.moe.ok_or_else(|| refuse("a file of no layer"))?;
+        let base = shared
+            .rope_base
+            .ok_or_else(|| refuse("no attention layer to read the rope from"))?;
         let mut rope = MetalBuffer::new(device, Elems(ctx * ROT))?;
         rope.write(&rope_table(ctx, base))?;
         let proj = layers
@@ -568,6 +594,7 @@ impl Arena {
         }
         self.head_ticket.zero();
         self.step_id.zero();
+        self.lane.zero();
     }
 }
 

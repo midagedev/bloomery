@@ -51,6 +51,10 @@ struct Committed {
     last: u64,
     /// The committed command buffers not yet seen complete.
     pending: Vec<CommandBufferHandle>,
+    /// An empty list holding capacity for the one [`MetalStream::sync_for`]
+    /// leaves in `pending`'s place while it waits, so the wait commits into
+    /// capacity and the sync itself allocates nothing.
+    spare: Vec<CommandBufferHandle>,
 }
 
 impl Committed {
@@ -185,7 +189,10 @@ impl MetalStream {
             timeline: Handle(timeline),
             committed: Mutex::new(Committed {
                 last: 0,
-                pending: Vec::new(),
+                // Both lists start with capacity, so no sync from the first
+                // step on grows one.
+                pending: Vec::with_capacity(1),
+                spare: Vec::with_capacity(1),
             }),
         })
     }
@@ -238,10 +245,18 @@ impl MetalStream {
     /// returned, and a buffer that did not finish stays pending.
     pub fn sync_for(&self, timeout: Duration) -> Result<(), DeviceError> {
         let deadline = Instant::now() + timeout;
-        let pending = std::mem::take(&mut self.committed().pending);
+        // The spare list stands in for `pending` while the wait runs, so the
+        // lock is held by no poll and a submit on another thread pushes into
+        // capacity; the lists' capacity is the stream's, so a sync that finds
+        // every buffer done allocates nothing.
+        let mut pending = {
+            let mut c = self.committed();
+            let spare = core::mem::take(&mut c.spare);
+            core::mem::replace(&mut c.pending, spare)
+        };
         let mut first = None;
         let mut unfinished = Vec::new();
-        for buffer in pending {
+        for buffer in pending.drain(..) {
             while !is_over(buffer.0.status()) && Instant::now() < deadline {
                 std::thread::sleep(POLL);
             }
@@ -261,7 +276,11 @@ impl MetalStream {
                 }
             }
         }
-        self.committed().pending.extend(unfinished);
+        {
+            let mut c = self.committed();
+            c.pending.append(&mut unfinished);
+            c.spare = pending;
+        }
         first.map_or(Ok(()), Err)
     }
 }

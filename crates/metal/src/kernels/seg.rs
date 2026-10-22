@@ -36,8 +36,9 @@ pub struct Segment {
 pub struct SegParams<'w> {
     /// The weight type every segment has.
     pub quant: Quant,
-    /// The segments, one to [`MAX_SEGMENTS`] of them.
-    pub segments: Vec<Segment>,
+    /// The segments, one to [`MAX_SEGMENTS`] of them, borrowed from the
+    /// launcher's own list: a launch allocates none.
+    pub segments: &'w [Segment],
     /// The weights of every segment, one buffer.
     pub weights: Window<'w, u8, MetalDevice>,
     /// The input vector, one value per column.
@@ -111,19 +112,20 @@ fn check(p: &SegParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
     let nblocks = cols / BLOCK_VALUES;
 
     // The output: the segments' ranges must not overlap, or one segment's rows
-    // would be another's.
-    let mut ranges: Vec<(usize, usize)> = p
-        .segments
-        .iter()
-        .map(|s| (s.out_offset, s.out_offset + s.rows))
-        .collect();
-    ranges.sort_unstable();
-    for pair in ranges.windows(2) {
-        if pair[0].1 > pair[1].0 {
-            return Err(refuse(format!(
-                "the output of the segments at {} and {} overlaps",
-                pair[0].0, pair[1].0
-            )));
+    // would be another's. A dispatch holds at most MAX_SEGMENTS segments, so
+    // the pairwise compare needs no list.
+    for (j, b) in p.segments.iter().enumerate() {
+        for a in &p.segments[..j] {
+            if a.out_offset < b.out_offset + b.rows && b.out_offset < a.out_offset + a.rows {
+                let (first, second) = if a.out_offset <= b.out_offset {
+                    (a.out_offset, b.out_offset)
+                } else {
+                    (b.out_offset, a.out_offset)
+                };
+                return Err(refuse(format!(
+                    "the output of the segments at {first} and {second} overlaps"
+                )));
+            }
         }
     }
 
@@ -131,7 +133,7 @@ fn check(p: &SegParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
     // read them as 16-bit words. A segment's rows are `rows` rows of
     // `nblocks` blocks each.
     let mut weight_end = 0usize;
-    for s in &p.segments {
+    for s in p.segments {
         let span = super::weight_bytes(p.quant, s.rows, nblocks)
             .ok_or_else(|| refuse(format!("a segment of {} rows wraps", s.rows)))?;
         let end = s
@@ -144,7 +146,12 @@ fn check(p: &SegParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
     check_window_len(WHAT, "weights", p.weights.len(), weight_end)?;
     check_window_len(WHAT, "x", p.x.len(), cols)?;
     check_window_len(WHAT, "gain", p.norm.gain.len(), cols)?;
-    let out_end = ranges.last().map_or(0, |r| r.1);
+    let out_end = p
+        .segments
+        .iter()
+        .map(|s| s.out_offset + s.rows)
+        .max()
+        .unwrap_or(0);
     check_window_len(WHAT, "y", p.y.len(), out_end)?;
 
     let start = p.weights.byte_range()?.start.get();

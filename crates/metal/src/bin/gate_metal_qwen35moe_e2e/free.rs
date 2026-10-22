@@ -116,7 +116,12 @@ pub fn a_free(s: &mut Session) -> Clause {
     );
 
     // Every layer's output over the rows ik kept.
-    let hidden = rows[0][0].out.len();
+    let hidden = rows
+        .first()
+        .and_then(|layer| layer.first())
+        .ok_or("no token: the set holds no step row")?
+        .out
+        .len();
     let mut rel = vec![vec![None::<f64>; t_n]; n];
     for (l, ik) in ik_out.iter().enumerate() {
         let kept = ik.len() / hidden;

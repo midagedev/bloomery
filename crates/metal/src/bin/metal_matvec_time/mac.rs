@@ -531,7 +531,7 @@ fn time_shape(
                             encoder,
                             SegParams {
                                 quant: *quant,
-                                segments: segments.clone(),
+                                segments: &segments,
                                 weights: w,
                                 x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
                                 y: out,
