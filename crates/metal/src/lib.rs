@@ -13,6 +13,10 @@
 //! - one command buffer per token, and no indirect command buffer.
 
 pub mod arch;
+/// The decode attention's geometry and segment rule, one file read by the
+/// launch (macOS) and by the token count (every OS).
+#[path = "kernels/attention_geom.rs"]
+pub mod attention_geom;
 
 #[cfg(target_os = "macos")]
 pub mod buffer;

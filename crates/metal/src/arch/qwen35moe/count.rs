@@ -63,13 +63,17 @@ pub(crate) struct TokenCount {
     pub(crate) dispatches: u32,
 }
 
+use crate::attention_geom as launch_geom;
+
 /// The groups and the dispatches one token encodes for `layers`.
 ///
 /// The embed and the head are the 2. Each layer adds six groups: P1, the
-/// mixer, its out, the router, the gate-up and the down. A Q6 projection adds
-/// one dispatch. Live keys past 64 add the memory group on each attention
-/// layer. An unfolded ticket adds one group for each layer's router and one
-/// for the head. A count that does not fit `u32` panics by name.
+/// mixer, its out, the router, the gate-up and the down. Those six already
+/// include the flash. A Q6 projection adds one dispatch. Live keys past one
+/// segment add the merge on each attention layer, the second dispatch
+/// [`launch_geom::attention_dispatches`] reports. An unfolded ticket adds one
+/// group for each layer's router and one for the head. A count that does not
+/// fit `u32` panics by name.
 pub(crate) fn token_count(layers: &[Layer], live: LiveKeys, ticket: Ticket) -> TokenCount {
     let mut n = 0u32;
     let mut n_q6 = 0u32;
@@ -90,8 +94,20 @@ pub(crate) fn token_count(layers: &[Layer], live: LiveKeys, ticket: Ticket) -> T
     let mut groups = fit("group", 2u32.checked_add(fit("group", 6u32.checked_mul(n))));
     let mut dispatches = fit("dispatch", groups.checked_add(n_q6));
     if matches!(live, LiveKeys::Past64) {
-        groups = fit("group", groups.checked_add(n_attn));
-        dispatches = fit("dispatch", dispatches.checked_add(n_attn));
+        let edge = u32::try_from(launch_geom::SEGMENT_KEYS).expect("the segment holds a u32 count");
+        let one = launch_geom::attention_dispatches(launch_geom::segments_for_keys(edge));
+        let two = launch_geom::attention_dispatches(launch_geom::segments_for_keys(
+            edge.checked_add(1).expect("the next key count fits u32"),
+        ));
+        if one != 1 {
+            panic!(
+                "token count: one segment is one dispatch, and the six groups already include it"
+            );
+        }
+        let merge = fit("dispatch", two.checked_sub(one));
+        let extra = fit("attention", n_attn.checked_mul(merge));
+        groups = fit("group", groups.checked_add(extra));
+        dispatches = fit("dispatch", dispatches.checked_add(extra));
     }
     if matches!(ticket, Ticket::Unfolded) {
         let extra = fit("group", n.checked_add(1));
@@ -110,6 +126,7 @@ fn fit(what: &str, n: Option<u32>) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::launch_geom;
     use super::*;
 
     fn fixture() -> [Layer; 4] {
@@ -219,6 +236,27 @@ mod tests {
                 dispatches: 313
             }
         );
+    }
+
+    #[test]
+    fn attention_count_matches_the_launch() {
+        let edge = u32::try_from(launch_geom::SEGMENT_KEYS).expect("the segment holds a u32 count");
+        let one = launch_geom::attention_dispatches(launch_geom::segments_for_keys(edge));
+        let two = launch_geom::attention_dispatches(launch_geom::segments_for_keys(edge + 1));
+        assert_eq!((one, two), (1, 2));
+        #[cfg(target_os = "macos")]
+        {
+            use crate::kernels::{attention_dispatches, segments_for_keys};
+            assert_eq!(attention_dispatches(segments_for_keys(edge)), one);
+            assert_eq!(attention_dispatches(segments_for_keys(edge + 1)), two);
+        }
+        let extra = two - one;
+        for (layers, n_attn) in [(fixture().as_slice(), 2u32), (target().as_slice(), 10u32)] {
+            let within = token_count(layers, LiveKeys::Within64, Ticket::Folded);
+            let past = token_count(layers, LiveKeys::Past64, Ticket::Folded);
+            assert_eq!(past.groups - within.groups, n_attn * extra);
+            assert_eq!(past.dispatches - within.dispatches, n_attn * extra);
+        }
     }
 
     #[test]
