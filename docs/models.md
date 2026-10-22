@@ -22,7 +22,9 @@
 Each file is the public upload as downloaded; the downloads are checked against the uploads' sha256. How close
 each Clef quantization answers to the BF16 release, per question: [agreement table](https://huggingface.co/midagedev/clef-flash-bloomery).
 The DSpark draft for V4.1 is converted from DeepSeek's checkpoint (the converter in llama.cpp's V4.1 pull
-request).
+request). Qwen3.6-35B-A3B and MiniCPM-V 4.7 keep their HF DSpark draft directory beside the GGUF
+(`BLOOMERY_DSPARK_MODEL`): RedHatAI's Qwen3.6 speculator for the former, and MiniCPM-V 4.7's own draft, whose
+full vocabulary takes the target's head and embedding rows, for the latter.
 
 ## Hardware
 

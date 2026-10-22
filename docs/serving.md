@@ -283,8 +283,13 @@ counters; a load that attached no tier prints none). Limits of a paged load, as 
 
 **Speculative decoding.** `BLOOMERY_DRAFT=mtp` drafts with the model's own MTP head (Qwen3.8 and GLM-5.3, on by
 default in their servers); `BLOOMERY_DRAFT=dspark` drafts V4.1 with DeepSeek's DSpark head on a second card
-(`--place bp`). Unset, the MTP draft yields to the context: it goes off when the plan with it would leave a slot
-fewer positions than the plan without it, a set `--ctx-size`/`--ctx` included, a `draft yield` record naming its
+(`--place bp`). On the qwen3 seat, `BLOOMERY_DRAFT=dspark` with `BLOOMERY_DSPARK_MODEL` naming an HF draft
+directory serves a whole-card `qwen35moe` target from one slot: RedHat's Qwen3.6 speculator carries its own
+reduced head and id map, and MiniCPM-V 4.7's full-vocabulary draft borrows the target's Q6_K `output.weight` in
+place and its `token_embd.weight` rows, so neither file is copied. A draft whose ids, mask or taps do not fit
+the target is refused by name before a weight is read; a placed load and `--parallel > 1` are refused by name.
+Unset, the MTP draft yields to the context: it goes off when the plan with it would leave a slot fewer positions
+than the plan without it, a set `--ctx-size`/`--ctx` included, a `draft yield` record naming its
 card bytes and the positions a slot gets either way, and the context line that follows is the plain plan's.
 `BLOOMERY_DRAFT=mtp` keeps it on whatever the context. The
 drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones

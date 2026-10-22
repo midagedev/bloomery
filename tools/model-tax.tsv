@@ -27,7 +27,7 @@ crates/gguf/src/lib.rs	deepseek	1	baseline T 1: case-table row, a fixture label 
 crates/gpu-gates/src/arch/embedding.rs	gemma	16	baseline O 16: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/bloomery_chat.rs	deepseek	13	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/bloomery_serve.rs	clef	7	baseline S 7: MK9 seat by program
-crates/gpu-gates/src/bin/bloomery_serve.rs	deepseek	19	baseline S 19: MK9 seat by program
+crates/gpu-gates/src/bin/bloomery_serve.rs	deepseek	21	PIN(2026-10-22) deepseek: MK9 seat by program: the qwen3 seat includes the shared DSpark reader and the quiet log under the deepseek41 feature; two module attributes, the reader itself is common
 crates/gpu-gates/src/bin/bloomery_serve.rs	glm	16	baseline S 16: MK9 seat by program
 crates/gpu-gates/src/bin/bloomery_serve.rs	minimax	10	PIN(2026-10-21) minimax: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
 crates/gpu-gates/src/bin/bloomery_serve.rs	mimo	10	baseline S 11: MK9 seat by program
@@ -108,7 +108,7 @@ crates/gpu-gates/src/oracle/mod.rs	mimo	1	baseline R 2: MK1a one registry row pe
 crates/gpu-gates/src/oracle/mod.rs	nemotron	2	baseline R 2: MK1a one registry row per crate
 crates/gpu-gates/src/oracle/mod.rs	qwen	3	baseline R 4: MK1a one registry row per crate
 crates/gpu-gates/src/record.rs	clef	3	baseline O 3: MK12 per-bin Kind statics into record/<bin>.rs
-crates/gpu-gates/src/record.rs	deepseek	6	baseline O 6: MK12 per-bin Kind statics into record/<bin>.rs
+crates/gpu-gates/src/record.rs	deepseek	7	PIN(2026-10-22) deepseek: MK12 per-bin Kind statics into record/<bin>.rs: the qwen3 seat registers the shared DSpark load and width kinds it prints
 crates/gpu-gates/src/record.rs	gemma	1	baseline O 1: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	minimax	4	PIN(2026-10-21) minimax: MK12 per-bin Kind statics into record/<bin>.rs: the seat's load and listening kinds are the common file's, where every seat's are
 crates/gpu-gates/src/record.rs	glm	14	baseline O 14: MK12 per-bin Kind statics into record/<bin>.rs

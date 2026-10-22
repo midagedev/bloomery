@@ -119,6 +119,24 @@ mod dspark;
 #[path = "shared/ds41_draft.rs"]
 mod draft;
 
+// The qwen3 seat's draft opens through the same HF reader the dspark gates use
+// (`crate::dspark_hf`) and its verify capture records nothing (`crate::quiet`).
+#[cfg(feature = "deepseek41")]
+#[path = "shared/dspark_hf.rs"]
+#[allow(
+    dead_code,
+    reason = "the serve seat opens a draft; the gate-only readers stay unused here"
+)]
+mod dspark_hf;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/quiet.rs"]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "each binary includes the shared log by path; a seat binary may reach it twice"
+)]
+mod quiet;
+
 #[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_place.rs"]
 mod place;

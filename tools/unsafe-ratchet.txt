@@ -495,7 +495,10 @@ gpu-deepseek41 382 44 0
 # its SAFETY line.
 # PIN(2026-10-21): gpu-gates 86 -> 88 blocks: the f16 and Q8 head-256 rope gates
 # invoke their contracted launchers only after checking distinct host cache writers.
-gpu-gates 88 5 1
+# PIN(2026-10-22): gpu-gates 88 -> 89 blocks, new code, not old code relaxed: MiniCPM-V 4.7's full-vocabulary DSpark
+# draft (shared/dspark_hf.rs) borrows the target's resident Q6_K head in place, as the DFlash2 draft does, with its
+# SAFETY line; the seat checks the draft's CUDA context against the target's first.
+gpu-gates 89 5 1
 # PIN(2026-10-15): gpu-gemma-embedding2 0 -> 1 blocks, new code, not old code relaxed: the head-512
 # launcher call requires distinct Consts::pos positions, with its SAFETY line.
 # PIN(2026-10-15): gpu-gemma-embedding2 1 -> 2 blocks, new code, not old code relaxed: Encoder::pass's call of

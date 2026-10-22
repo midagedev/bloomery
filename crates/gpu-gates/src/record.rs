@@ -2911,6 +2911,8 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
     &[&LISTENING_QWEN3],
     groups::bind::CACHE,
     groups::bind::SLOTS,
+    groups::drafted::WIDTH,
+    groups::ds41_draft::LOAD,
 ];
 
 /// What the MiMo seat of `bloomery-serve` prints, all on stderr: the

@@ -12,14 +12,20 @@
 //! planner then refuses by that name when the card cannot hold it.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bloomery_gpu::dspark::dense::{Bf16Source, DenseDims, DenseLayers, DenseSpec};
 use bloomery_gpu::dspark::head::{HeadTail, HeadWeights, MarkovTail};
-use bloomery_gpu::dspark::{EmbedSource, FcWeights, HeadSource, HostEmbed, Q8Rows};
+use bloomery_gpu::dspark::{
+    EmbedSource, FcWeights, HeadSource, HostEmbed, InPlace, Q8Rows, TargetHead,
+};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_gates::GateError;
-use cuda_core::DeviceBuffer;
+use cuda_core::{CudaContext, DeviceBuffer};
+use gguf::Split;
 use hf::dspark as config;
+use model::arch::names;
+use model::embed::EmbedTable;
 use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};
 use safetensors::Safetensors;
 
@@ -35,6 +41,23 @@ pub struct Parts {
     pub fc: FcWeights,
     pub head: HeadWeights,
     pub embed: EmbedSource,
+}
+
+/// The target a full-vocabulary draft borrows its head and embedding rows from: a draft over the
+/// target's own ids carries neither an `lm_head` nor an `embed_tokens` of its own.
+pub struct Borrowed<'a> {
+    /// The target's file, for its `token_embd.weight` rows.
+    pub split: Arc<Split>,
+    /// The target's resident Q6_K `output.weight`.
+    pub head: &'a DeviceTensor<u32>,
+    /// The target's vocabulary: the draft's ids.
+    pub n_vocab: usize,
+    /// The target's layers: every tap is below this.
+    pub n_layers: usize,
+    /// The target's hidden width: one tap row's width and the head's rows'.
+    pub hidden: usize,
+    /// The CUDA context the target's buffers live in: the draft's `Gpu` must be on it.
+    pub ctx: &'a Arc<CudaContext>,
 }
 
 /// A draft's safetensors file as the layers' weight source.
@@ -86,6 +109,41 @@ pub fn shape(dir: &Path, file: &HfFile) -> Result<DsparkShape, GateError> {
         None
     };
     Ok(config::shape(&config_text(dir)?, d2t.as_deref())?)
+}
+
+/// Whether `shape` serves a target of `n_vocab` ids, `n_layers` layers and hidden width `hidden`:
+/// its ids, its mask and every tap fit the target. Refused by name, before any weight is read.
+pub fn fits(
+    shape: &DsparkShape,
+    n_vocab: usize,
+    n_layers: usize,
+    hidden: usize,
+) -> Result<(), GateError> {
+    let n_target = shape.vocab.n_target();
+    if n_target != n_vocab {
+        return Err(format!(
+            "{WHAT}: the draft is over the target's {n_target} ids; the target holds {n_vocab}"
+        )
+        .into());
+    }
+    if shape.mask_id as usize >= n_vocab {
+        return Err(format!(
+            "{WHAT}: mask id {} beside a target of {n_vocab} ids",
+            shape.mask_id
+        )
+        .into());
+    }
+    if let Some(&tap) = shape.taps.iter().find(|&&t| t >= n_layers) {
+        return Err(format!("{WHAT}: tap {tap} beside a target of {n_layers} layers").into());
+    }
+    if shape.hidden != hidden {
+        return Err(format!(
+            "{WHAT}: tap rows of {} values; the target's hidden width is {hidden}",
+            shape.hidden
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// The dense layers' spec: the config's numbers, checked against the tensors' shapes.
@@ -149,14 +207,100 @@ fn row_f32(gpu: &Gpu, v: &[f32]) -> Result<DeviceTensor<f32>, GateError> {
     Ok(DeviceTensor::upload(gpu.stream(), v, 1, v.len())?)
 }
 
-/// Open the draft in `dir` on `gpu`, for contexts of up to `ctx` positions.
+/// Open the draft in `dir` on `gpu`, for contexts of up to `ctx` positions. A draft over the
+/// target's own ids is refused by name: it borrows the target's head and embedding
+/// ([`open_for_target`]).
 pub fn open(gpu: &Gpu, dir: &Path, ctx: usize) -> Result<Parts, GateError> {
+    open_with(gpu, dir, ctx, None)
+}
+
+/// Open the draft in `dir` beside `target`, for contexts of up to `ctx` positions: a full-vocabulary
+/// draft borrows the target's Q6_K head in place and its `token_embd.weight` rows, a reduced one
+/// loads its own `lm_head` and embedding. The draft's ids, mask and taps are held to the target
+/// before any weight is read.
+#[allow(
+    dead_code,
+    reason = "the reader is shared by the draft gate and the serve seat; each opens the part it reads"
+)]
+pub fn open_for_target(
+    gpu: &Gpu,
+    dir: &Path,
+    ctx: usize,
+    target: Borrowed<'_>,
+) -> Result<Parts, GateError> {
+    open_with(gpu, dir, ctx, Some(&target))
+}
+
+fn open_with(
+    gpu: &Gpu,
+    dir: &Path,
+    ctx: usize,
+    target: Option<&Borrowed<'_>>,
+) -> Result<Parts, GateError> {
     let file = HfFile::open(dir)?;
     let shape = shape(dir, &file)?;
+    if let Some(t) = target {
+        fits(&shape, t.n_vocab, t.n_layers, t.hidden)?;
+    }
     let (spec, dims) = dense_spec(dir, &file, ctx)?;
     let hidden = dims.hidden;
     let taps = shape.taps.len();
-    let layers = DenseLayers::load(gpu, &spec, &file)?;
+    let rows = shape.vocab.rows();
+    let n_target = shape.vocab.n_target();
+
+    let (layers, source, embed) = match shape.vocab {
+        DraftVocab::Full { .. } => {
+            let Some(t) = target else {
+                return Err(format!(
+                    "{WHAT}: a draft over the target's own {n_target} ids borrows the target's \
+                     head, which the seat holds; this loader opens drafts with their own lm_head"
+                )
+                .into());
+            };
+            for own in ["lm_head.weight", "embed_tokens.weight"] {
+                if file.st.entry(own).is_some() {
+                    return Err(format!(
+                        "{WHAT}: a full-vocabulary draft carries {own}; a draft over the target's \
+                         own ids borrows both its head and its embedding"
+                    )
+                    .into());
+                }
+            }
+            let table = EmbedTable::new(Arc::clone(&t.split), &names::token_embd(), hidden)
+                .map_err(|e| format!("{WHAT}: {e}"))?;
+            let layers = DenseLayers::load_target_embed(gpu, &spec, &file, table, shape.mask_id)?;
+            if t.ctx.cu_ctx() != gpu.context().cu_ctx() {
+                return Err(format!(
+                    "{WHAT}: the target's head is on another CUDA context; a borrowed head runs \
+                     only on the target's own device"
+                )
+                .into());
+            }
+            // SAFETY: the target's model owns `head` and outlives the draft (the seat holds both in
+            // one session), and the check above holds the draft's `Gpu` to the head's context, so
+            // the address a captured graph bakes in stays alive and in place.
+            let source = HeadSource::Target(TargetHead::Q6KInPlace(unsafe {
+                InPlace::new(t.head, t.ctx)
+            }));
+            (layers, source, EmbedSource::Target)
+        }
+        DraftVocab::Reduced { .. } => {
+            let layers = DenseLayers::load(gpu, &spec, &file)?;
+            expect_shape(&file, "lm_head.weight", &[rows, hidden])?;
+            let (lm_bits, _) = file.bf16("lm_head.weight")?;
+            let own = Q8Rows::from_bf16(gpu, lm_bits, rows, hidden, &|r| r)?;
+            // The draft's own embedding table stays on the host: the owner gathers the rows a
+            // pass needs.
+            expect_shape(&file, "embed_tokens.weight", &[n_target, hidden])?;
+            let (embed_bits, _) = file.bf16("embed_tokens.weight")?;
+            let embed = EmbedSource::OwnHost(HostEmbed {
+                rows: n_target,
+                cols: hidden,
+                bf16: embed_bits.to_vec(),
+            });
+            (layers, HeadSource::Own(own), embed)
+        }
+    };
 
     // fc over the taps, then the hidden norm.
     expect_shape(&file, "fc.weight", &[hidden, taps * shape.hidden])?;
@@ -169,19 +313,8 @@ pub fn open(gpu: &Gpu, dir: &Path, ctx: usize) -> Result<Parts, GateError> {
         eps: spec.eps,
     };
 
-    // The head: the final norm, the draft's own projection, the Markov tables and the id map.
-    let rows = shape.vocab.rows();
-    let n_target = shape.vocab.n_target();
-    if !matches!(shape.vocab, DraftVocab::Reduced { .. }) {
-        return Err(format!(
-            "{WHAT}: a draft over the target's own {n_target} ids borrows the target's head, which \
-             the seat holds; this loader opens drafts with their own lm_head"
-        )
-        .into());
-    }
-    expect_shape(&file, "lm_head.weight", &[rows, hidden])?;
-    let (lm_bits, _) = file.bf16("lm_head.weight")?;
-    let own = Q8Rows::from_bf16(gpu, lm_bits, rows, hidden, &|r| r)?;
+    // The head: the final norm, the projection (borrowed or the draft's own), the Markov tables
+    // and, for a reduced vocabulary, the id map.
     let (head_norm, _) = file.f32s("norm.weight")?;
     let HeadKind::Markov { rank, confidence } = shape.head else {
         return Err(format!(
@@ -209,7 +342,7 @@ pub fn open(gpu: &Gpu, dir: &Path, ctx: usize) -> Result<Parts, GateError> {
     let head = HeadWeights {
         norm: row_f32(gpu, &head_norm)?,
         eps: spec.eps,
-        source: HeadSource::Own(own),
+        source,
         tail: HeadTail::Markov(MarkovTail {
             markov_w1: DeviceTensor::upload(stream, &w1, n_target, rank / 2)?,
             markov_w2: DeviceTensor::upload(stream, &w2, rows, rank / 2)?,
@@ -217,15 +350,6 @@ pub fn open(gpu: &Gpu, dir: &Path, ctx: usize) -> Result<Parts, GateError> {
             conf,
         }),
     };
-
-    // The draft's own embedding table stays on the host: the owner gathers the rows a pass needs.
-    expect_shape(&file, "embed_tokens.weight", &[n_target, hidden])?;
-    let (embed_bits, _) = file.bf16("embed_tokens.weight")?;
-    let embed = EmbedSource::OwnHost(HostEmbed {
-        rows: n_target,
-        cols: hidden,
-        bf16: embed_bits.to_vec(),
-    });
     Ok(Parts {
         shape,
         layers,
@@ -235,13 +359,43 @@ pub fn open(gpu: &Gpu, dir: &Path, ctx: usize) -> Result<Parts, GateError> {
     })
 }
 
-/// The card bytes [`open`] puts on `dir`'s draft at `ctx` positions, from the file's header and config
-/// alone: the dense layers ([`DenseDims::card_bytes`]), fc, the head's own projection and norm, the
-/// Markov tables, the id map and the confidence head. The embedding table is the host's.
+/// The card bytes [`open`] puts on `dir`'s reduced-vocabulary draft at `ctx` positions, from the
+/// file's header and config alone. A full-vocabulary draft's bytes need its target
+/// ([`card_bytes_for_target`]).
 pub fn card_bytes(dir: &Path, ctx: usize) -> Result<u64, GateError> {
     let file = HfFile::open(dir)?;
     let shape = shape(dir, &file)?;
+    if matches!(shape.vocab, DraftVocab::Full { .. }) {
+        return Err(format!(
+            "{WHAT}: a full-vocabulary draft's card bytes need the target: its head and embedding \
+             are the target's"
+        )
+        .into());
+    }
     let (spec, dims) = dense_spec(dir, &file, ctx)?;
+    card_bytes_of(&shape, &dims, &spec)
+}
+
+/// The card bytes [`open_for_target`] puts on `dir`'s draft at `ctx` positions, from the file's
+/// header and config alone: the dense layers (with the target embedding's staging rows for a full
+/// vocabulary), fc, the head's own projection and norm, the Markov tables, the id map (a reduced
+/// vocabulary) and the confidence head. A borrowed head and the target's table are the target's.
+#[allow(
+    dead_code,
+    reason = "the reader is shared by the draft gate and the serve seat; each opens the part it reads"
+)]
+pub fn card_bytes_for_target(dir: &Path, ctx: usize) -> Result<u64, GateError> {
+    let file = HfFile::open(dir)?;
+    let shape = shape(dir, &file)?;
+    let (spec, dims) = dense_spec(dir, &file, ctx)?;
+    card_bytes_of(&shape, &dims, &spec)
+}
+
+fn card_bytes_of(
+    shape: &DsparkShape,
+    dims: &DenseDims,
+    spec: &DenseSpec,
+) -> Result<u64, GateError> {
     let q8 = |rows: usize, k: usize| (rows * (k + k / 16)) as u64;
     let rows = shape.vocab.rows();
     let n_target = shape.vocab.n_target();
@@ -254,16 +408,48 @@ pub fn card_bytes(dir: &Path, ctx: usize) -> Result<u64, GateError> {
     };
     let h = dims.hidden;
     let fc = q8(h, shape.taps.len() * shape.hidden);
-    let head = q8(rows, h);
     let markov = 4 * ((n_target + rows) * (rank / 2)) as u64;
-    let map = 4 * rows as u64;
     let conf = if confidence {
         4 * (h + rank + 1) as u64
     } else {
         0
     };
     let norms = 4 * (2 * h) as u64;
-    Ok(dims.card_bytes(&spec) + fc + head + markov + map + conf + norms)
+    let (layers, head, map) = match shape.vocab {
+        DraftVocab::Full { .. } => (dims.card_bytes_target_embed(spec), 0, 0),
+        DraftVocab::Reduced { .. } => (dims.card_bytes(spec), q8(rows, h), 4 * rows as u64),
+    };
+    Ok(layers + fc + head + markov + map + conf + norms)
+}
+
+/// `BLOOMERY_DSPARK_MODEL` as a full-vocabulary draft's HF directory: `config.json` and
+/// `model.safetensors` beside each other. Refused by name when unset or not a directory.
+#[allow(
+    dead_code,
+    reason = "the reader is shared by the draft gate and the serve seat; each opens the part it reads"
+)]
+pub fn dir_from_env() -> Result<PathBuf, GateError> {
+    let dir = match std::env::var_os("BLOOMERY_DSPARK_MODEL") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => {
+            return Err(
+                "BLOOMERY_DRAFT=dspark: BLOOMERY_DSPARK_MODEL unset — export the HF DSpark \
+                 draft's directory (`config.json` and `model.safetensors`), as the dspark gates do"
+                    .into(),
+            );
+        }
+    };
+    for name in ["config.json", "model.safetensors"] {
+        if !dir.join(name).is_file() {
+            return Err(format!(
+                "BLOOMERY_DRAFT=dspark: {} holds no {name}; BLOOMERY_DSPARK_MODEL is an HF \
+                 draft's directory",
+                dir.display()
+            )
+            .into());
+        }
+    }
+    Ok(dir)
 }
 
 /// The directory the RedHat speculator is read from on the box.

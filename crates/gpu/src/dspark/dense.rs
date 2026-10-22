@@ -256,6 +256,18 @@ impl DenseDims {
         self.bytes(spec, Features::NONE)
     }
 
+    /// [`DenseDims::card_bytes`] of layers that embed the block from the target's table
+    /// ([`DenseLayers::load_target_embed`]): the plain layer plus the staged anchor and mask rows.
+    pub fn card_bytes_target_embed(&self, spec: &DenseSpec) -> u64 {
+        self.bytes(
+            spec,
+            Features {
+                target_embed: true,
+                ..Features::NONE
+            },
+        )
+    }
+
     /// [`DenseDims::card_bytes`] of layers with `f` set: the convolution's weights and scratch, the
     /// target embedding's rows, the per-row window's ring and image.
     fn bytes(&self, spec: &DenseSpec, f: Features) -> u64 {
@@ -926,6 +938,32 @@ impl DenseLayers {
     ) -> Result<DenseLayers, GpuError> {
         let dims = DenseDims::read(src)?;
         Self::assemble(gpu, spec, dims, Features::NONE, &HfDraft(src), None)
+    }
+
+    /// Load `spec.layers` layers from `src` with the block embedded from the target's table `embed`:
+    /// row 0 of a block is the anchor token's row and rows 1.. are `mask_id`'s
+    /// ([`DenseLayers::load_dflash2`]'s embedding, without its convolution or per-row window). A mask
+    /// id past `embed`'s vocabulary and every tensor of another type or shape are refused by name.
+    pub fn load_target_embed(
+        gpu: &Gpu,
+        spec: &DenseSpec,
+        src: &dyn Bf16Source,
+        embed: EmbedTable,
+        mask_id: u32,
+    ) -> Result<DenseLayers, GpuError> {
+        let dims = DenseDims::read(src)?;
+        let features = Features {
+            target_embed: true,
+            ..Features::NONE
+        };
+        Self::assemble(
+            gpu,
+            spec,
+            dims,
+            features,
+            &HfDraft(src),
+            Some((embed, mask_id)),
+        )
     }
 
     /// Load a DFlash2 draft's layers from its GGUF file `draft`, `hp` its header

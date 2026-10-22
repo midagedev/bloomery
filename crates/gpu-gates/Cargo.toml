@@ -609,6 +609,10 @@ name = "gate_linear"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_qwen3_dspark"
+required-features = ["deepseek41", "hf"]
+
+[[bin]]
 name = "gate_qwen35_dspark"
 required-features = ["gpu", "hf"]
 

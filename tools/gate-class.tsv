@@ -139,6 +139,7 @@ gate-gpu-ple	common		kernel	ple_embed
 gate-gpu-q4k-sel	common		kernel	quant_q4k
 gate-gpu-q6k-ids	common		kernel	quant_q6k
 gate-gpu-qwen3-serve	family	qwen3moe	serve	seats_serve_engine+serve_http_api
+gate-gpu-qwen3-dspark	family	qwen35moe	serve	seats_serve_engine+serve_http_api+drafts_dspark
 gate-gpu-qwen35-dspark	family	qwen35moe	draft	drafts_dspark
 gate-gpu-qwen35-media	family	qwen35	media	serve_media
 gate-gpu-qwen35moe-attn	common		kernel	attn_gqa
