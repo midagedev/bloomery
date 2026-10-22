@@ -132,7 +132,20 @@ pub struct ComputeEncoder<'r> {
     encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
     /// The group size the current pipeline allows, once one is set.
     max_threads_per_group: Option<usize>,
+    /// What this encoder has encoded so far.
+    count: EncodeCount,
+    /// A dispatch was encoded since the last barrier.
+    group_open: bool,
     _recording: PhantomData<&'r ()>,
+}
+
+/// What one encoder encoded: its groups (runs of dispatches between
+/// barriers, empty runs not counted), its dispatches and its barriers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EncodeCount {
+    pub groups: usize,
+    pub dispatches: usize,
+    pub barriers: usize,
 }
 
 impl ComputeEncoder<'_> {
@@ -168,6 +181,8 @@ impl ComputeEncoder<'_> {
         Ok(ComputeEncoder {
             encoder,
             max_threads_per_group: None,
+            count: EncodeCount::default(),
+            group_open: false,
             _recording: PhantomData,
         })
     }
@@ -237,7 +252,17 @@ impl ComputeEncoder<'_> {
                 detail: format!("{groups_x} groups of {threads_per_group} threads wrap"),
             })?;
         self.submit(width, groups_y, threads_per_group);
+        self.count.dispatches += 1;
+        if !self.group_open {
+            self.group_open = true;
+            self.count.groups += 1;
+        }
         Ok(())
+    }
+
+    /// What this encoder has encoded so far.
+    pub fn count(&self) -> EncodeCount {
+        self.count
     }
 
     /// A pipeline is set, the grid is not empty, and the group is within the
@@ -298,6 +323,8 @@ impl ComputeEncoder<'_> {
     pub fn memory_barrier(&mut self) {
         self.encoder
             .memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        self.count.barriers += 1;
+        self.group_open = false;
     }
 
     /// The encoder is done; the recording may be submitted.

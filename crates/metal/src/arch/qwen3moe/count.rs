@@ -3,12 +3,8 @@
 //! The caller passes the layers it has. An empty list is the embed and the
 //! head, not a hidden default trunk.
 //!
-//! The token encoder is the caller. Until that lands, the tests are the use.
-
-#![allow(
-    dead_code,
-    reason = "M2.3a's token encoder is the consumer; the tests pin the count until it lands"
-)]
+//! The token encoder is the caller: the e2e gate holds what one token
+//! encodes to this count.
 
 /// One layer of the token.
 ///
@@ -16,8 +12,8 @@
 /// projection splitting into two dispatches in one group (`qkv` on a delta
 /// layer, `v` on an attention layer). It is not a quant of the layer's
 /// other tensors.
-#[derive(Clone, Copy)]
-pub(crate) enum Layer {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layer {
     /// A gated delta layer. The live-key length does not add a dispatch.
     Delta { qkv: Projection },
     /// A gated attention layer. Live keys past 64 add the memory dispatch.
@@ -25,8 +21,8 @@ pub(crate) enum Layer {
 }
 
 /// Whether P1 is one dispatch or two in one group.
-#[derive(Clone, Copy)]
-pub(crate) enum Projection {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Projection {
     /// P1 is one dispatch.
     Q4,
     /// P1 is two dispatches in one group.
@@ -34,8 +30,8 @@ pub(crate) enum Projection {
 }
 
 /// Whether the live keys are past 64.
-#[derive(Clone, Copy)]
-pub(crate) enum LiveKeys {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveKeys {
     /// At most 64. No layer grows.
     Within64,
     /// Past 64. Each attention layer adds the memory dispatch.
@@ -43,8 +39,8 @@ pub(crate) enum LiveKeys {
 }
 
 /// Whether the router's ticket and the head's stay one dispatch.
-#[derive(Clone, Copy)]
-pub(crate) enum Ticket {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ticket {
     /// The router and the head are one dispatch and one group each.
     Folded,
     /// Each layer's router, and the head, are two dispatches and two groups.
@@ -58,9 +54,9 @@ pub(crate) enum Ticket {
 /// `groups` is the table's first number, `dispatches` the second.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
-pub(crate) struct TokenCount {
-    pub(crate) groups: u32,
-    pub(crate) dispatches: u32,
+pub struct TokenCount {
+    pub groups: u32,
+    pub dispatches: u32,
 }
 
 use crate::attention_geom as launch_geom;
@@ -69,12 +65,13 @@ use crate::attention_geom as launch_geom;
 ///
 /// The embed and the head are the 2. Each layer adds six groups: P1, the
 /// mixer, its out, the router, the gate-up and the down. Those six already
-/// include the flash. A Q6 projection adds one dispatch. Live keys past one
+/// include the flash, and the FFN norm, which the router and the gate-up each
+/// apply as they load the residual. A Q6 projection adds one dispatch. Live keys past one
 /// segment add the merge on each attention layer, the second dispatch
 /// [`launch_geom::attention_dispatches`] reports. An unfolded ticket adds one
 /// group for each layer's router and one for the head. A count that does not
 /// fit `u32` panics by name.
-pub(crate) fn token_count(layers: &[Layer], live: LiveKeys, ticket: Ticket) -> TokenCount {
+pub fn token_count(layers: &[Layer], live: LiveKeys, ticket: Ticket) -> TokenCount {
     let mut n = 0u32;
     let mut n_q6 = 0u32;
     let mut n_attn = 0u32;

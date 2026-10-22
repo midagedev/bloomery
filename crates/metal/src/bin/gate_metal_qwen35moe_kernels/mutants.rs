@@ -260,6 +260,22 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[("return shared_slot ? shexp : stack;", "return stack;", 1)],
     },
     Mutant {
+        name: "pair_norm_gain",
+        clause: "pair",
+        why: "the pair's Q4_K norm drops the gain of a value",
+        edits: &[("a0 *= gain[base + i + 0];", "a0 *= 1.f;", 1)],
+    },
+    Mutant {
+        name: "pair_norm_no_raise",
+        clause: "pair_norm",
+        why: "a pair norm that cannot take its input writes NaN rows and raises nothing",
+        edits: &[(
+            "pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer,\n                           BLOOMERY_FAULT_SITE_NORM_QUANT);",
+            "y[(ulong)slot * args.stride + (uint)row0] = NAN;",
+            2,
+        )],
+    },
+    Mutant {
         name: "fold_drop_weight",
         clause: "fold",
         why: "the fold loads the activation without the route weight",

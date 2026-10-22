@@ -1,4 +1,5 @@
-//! The routed pair and the folded down.
+//! The routed pair and the folded down. The pair norms its input as it loads
+//! it, with a synthetic gain and the fixture's epsilon.
 
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
@@ -24,6 +25,25 @@ const PAIR_COLS: usize = 2048;
 const FOLD_ROWS: usize = 2048;
 const IDS: [i32; ROUTED_IDS] = [0, 1, 2, 3, 1, 2, 3, 0];
 const ROUTE: [f32; EXPERT_SLOTS] = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8];
+
+/// The norm a pair launch applies to its input.
+struct PairNorm {
+    gain: Vec<f32>,
+    eps: f32,
+}
+
+/// A positive synthetic gain, not the fixture's FFN gain: that one is all
+/// ones, under which a dropped gain is invisible. The epsilon is the
+/// fixture's.
+fn ffn_norm(fix: &Fixture) -> Result<PairNorm, String> {
+    Ok(PairNorm {
+        gain: oracle::activations(PAIR_COLS, 0x6C0, 0.5)
+            .iter()
+            .map(|g| 1.0 + g.abs())
+            .collect(),
+        eps: fix.rms_eps()?,
+    })
+}
 
 fn ggml(quant: Quant) -> GgmlType {
     match quant {
@@ -185,6 +205,7 @@ struct PairIn<'a> {
     shared_gate: &'a [u8],
     shared_up: &'a [u8],
     x: &'a [f32],
+    norm: &'a PairNorm,
     y0: &'a [f32],
 }
 
@@ -209,6 +230,12 @@ fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, String> 
     let shared_gate = padded(0xFFu8, WEIGHT_PAD, launch.shared_gate, WEIGHT_TAIL);
     let shared_up = padded(0xFFu8, WEIGHT_PAD, launch.shared_up, WEIGHT_TAIL);
     let x = padded(f32::from_bits(SENTINEL_BITS), VALUE_PAD, launch.x, 1);
+    let gain = padded(
+        f32::from_bits(SENTINEL_BITS),
+        VALUE_PAD,
+        &launch.norm.gain,
+        1,
+    );
     let ids = padded(-1, VALUE_PAD, launch.ids, 1);
     let y_words = padded(
         f32::from_bits(SENTINEL_BITS),
@@ -221,6 +248,7 @@ fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, String> 
     let shared_gate = device.upload(stream, &shared_gate).map_err(why)?;
     let shared_up = device.upload(stream, &shared_up).map_err(why)?;
     let x = device.upload(stream, &x).map_err(why)?;
+    let gain = device.upload(stream, &gain).map_err(why)?;
     let ids = device.upload(stream, &ids).map_err(why)?;
     let mut y = device.upload(stream, &y_words).map_err(why)?;
     let n_experts = launch.n_experts;
@@ -241,6 +269,8 @@ fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, String> 
                     .window(Elems(WEIGHT_PAD), Elems(launch.shared_gate.len()))?,
                 shared_up: shared_up.window(Elems(WEIGHT_PAD), Elems(launch.shared_up.len()))?,
                 x: x.window(Elems(VALUE_PAD), Elems(launch.x.len()))?,
+                gain: gain.window(Elems(VALUE_PAD), Elems(launch.norm.gain.len()))?,
+                eps: launch.norm.eps,
                 y: y.window_mut(Elems(OUT_GUARD), Elems(y_len))?,
                 out_stride: EXPERT_K,
                 fault: device.fault_word(),
@@ -309,18 +339,19 @@ fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, String> 
     read_interior(h, &y, rows)
 }
 
-fn expert_id(fault: Option<bloomery_device::Fault>, what: &str) -> Result<(), String> {
+/// The fault word names `site` in [`LAYER`], and only that site.
+fn only_site(
+    fault: Option<bloomery_device::Fault>,
+    what: &str,
+    site: FaultSite,
+) -> Result<(), String> {
     match fault {
-        Some(f)
-            if f.layer == LAYER
-                && f.code == FaultSite::ExpertId as u32
-                && f.sites == 1 << (FaultSite::ExpertId as u32) =>
-        {
+        Some(f) if f.layer == LAYER && f.code == site as u32 && f.sites == 1 << (site as u32) => {
             Ok(())
         }
         Some(f) => Err(format!(
             "{what} raised {f}, not {} in layer {LAYER}",
-            FaultSite::ExpertId.name()
+            site.name()
         )),
         None => Err(format!("{what} raised nothing")),
     }
@@ -344,6 +375,7 @@ fn bits_eq(got: &[f32], want: &[f32], what: &str) -> Result<(), String> {
 
 fn check_pair_quant(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<String, String> {
     let weights = pair_weights(fix, quant)?;
+    let norm = ffn_norm(fix)?;
     let x = oracle::activations(PAIR_COLS, 0xA11 + tag(quant), 1.0);
     let y0 = vec![f32::from_bits(SENTINEL_BITS); EXPERT_SLOTS * EXPERT_K];
     h.clear_fault()?;
@@ -358,13 +390,14 @@ fn check_pair_quant(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<Stri
             shared_gate: &weights.shared_gate,
             shared_up: &weights.shared_up,
             x: &x,
+            norm: &norm,
             y0: &y0,
         },
     )?;
     if let Some(f) = h.fault()? {
         return Err(format!("{} pair raised {f}", quant.name()));
     }
-    let x64: Vec<f64> = x.iter().copied().map(f64::from).collect();
+    let x64 = oracle::rms_norm(&x, &norm.gain, norm.eps);
     let nblocks = PAIR_COLS / BLOCK_VALUES;
     let rb = row_bytes(quant, PAIR_COLS);
     let mut worst = 0.0f64;
@@ -429,6 +462,7 @@ pub fn pair(h: &Harness<'_>, fix: &Fixture) -> Clause {
 pub fn pair_id(h: &Harness<'_>, fix: &Fixture) -> Clause {
     let quant = Quant::Q4K;
     let weights = pair_weights(fix, quant)?;
+    let norm = ffn_norm(fix)?;
     let x = oracle::activations(PAIR_COLS, 0xB1D, 1.0);
     let y_len = EXPERT_SLOTS * EXPERT_K;
     h.clear_fault()?;
@@ -443,6 +477,7 @@ pub fn pair_id(h: &Harness<'_>, fix: &Fixture) -> Clause {
             shared_gate: &weights.shared_gate,
             shared_up: &weights.shared_up,
             x: &x,
+            norm: &norm,
             y0: &vec![f32::from_bits(SENTINEL_BITS); y_len],
         },
     )?;
@@ -465,10 +500,11 @@ pub fn pair_id(h: &Harness<'_>, fix: &Fixture) -> Clause {
                 shared_gate: &weights.shared_gate,
                 shared_up: &weights.shared_up,
                 x: &x,
+                norm: &norm,
                 y0: &vec![1.0; y_len],
             },
         )?;
-        expert_id(h.fault()?, &format!("id {bad}"))?;
+        only_site(h.fault()?, &format!("id {bad}"), FaultSite::ExpertId)?;
         for slot in 0..EXPERT_SLOTS {
             let row = &got[slot * EXPERT_K..(slot + 1) * EXPERT_K];
             let clean_row = &clean[slot * EXPERT_K..(slot + 1) * EXPERT_K];
@@ -493,15 +529,85 @@ pub fn pair_id(h: &Harness<'_>, fix: &Fixture) -> Clause {
     ))
 }
 
+/// Input the pair's norm cannot take raises [`FaultSite::NormQuant`] in the
+/// layer, and only that site, and every slot's rows are NaN, the shared
+/// slot's too: a NaN input, an infinite one, and a zero input with a zero
+/// epsilon, both quants. The output fill is finite, so a row the kernel
+/// leaves unwritten is not a NaN.
+pub fn pair_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
+    let norm = ffn_norm(fix)?;
+    let y_len = EXPERT_SLOTS * EXPERT_K;
+    for quant in [Quant::Q4K, Quant::Q6K] {
+        let weights = pair_weights(fix, quant)?;
+        for (what, mut x, eps) in [
+            (
+                "a NaN input",
+                oracle::activations(PAIR_COLS, 0xA0 + tag(quant), 1.0),
+                norm.eps,
+            ),
+            (
+                "an infinite input",
+                oracle::activations(PAIR_COLS, 0xA1 + tag(quant), 1.0),
+                norm.eps,
+            ),
+            (
+                "a zero input and a zero epsilon",
+                vec![0f32; PAIR_COLS],
+                0.0,
+            ),
+        ] {
+            match what {
+                "a NaN input" => x[17] = f32::NAN,
+                "an infinite input" => x[PAIR_COLS - 1] = f32::INFINITY,
+                _ => {}
+            }
+            let what = format!("{} {what}", quant.name());
+            h.clear_fault()?;
+            let got = launch_pair(
+                h,
+                PairIn {
+                    quant,
+                    n_experts: N_EXPERTS,
+                    ids: &IDS,
+                    gate: &weights.gate,
+                    up: &weights.up,
+                    shared_gate: &weights.shared_gate,
+                    shared_up: &weights.shared_up,
+                    x: &x,
+                    norm: &PairNorm {
+                        gain: norm.gain.clone(),
+                        eps,
+                    },
+                    y0: &vec![1.0; y_len],
+                },
+            )?;
+            only_site(h.fault()?, &what, FaultSite::NormQuant)?;
+            if let Some(k) = got.iter().position(|v| !v.is_nan()) {
+                return Err(format!(
+                    "{what}: slot {} row {} is {:?}, not NaN",
+                    k / EXPERT_K,
+                    k % EXPERT_K,
+                    got[k]
+                ));
+            }
+        }
+    }
+    h.clear_fault()?;
+    Ok(Verdict::Noted(
+        "a NaN input, an infinite input and a zero input with a zero epsilon raised norm_quant only, NaN in all nine slots' rows, both quants".to_string(),
+    ))
+}
+
+/// Slot 0 of a pair over a one-expert stack, `rows` being `[gate, up, shared
+/// gate, shared up]`.
 fn solo_slot(
     h: &Harness<'_>,
     quant: Quant,
-    gate: &[u8],
-    up: &[u8],
-    shared_gate: &[u8],
-    shared_up: &[u8],
+    rows: [&[u8]; 4],
     x: &[f32],
+    norm: &PairNorm,
 ) -> Result<Vec<f32>, String> {
+    let [gate, up, shared_gate, shared_up] = rows;
     let ids = [0; ROUTED_IDS];
     let y_len = EXPERT_SLOTS * EXPERT_K;
     let got = launch_pair(
@@ -515,6 +621,7 @@ fn solo_slot(
             shared_gate,
             shared_up,
             x,
+            norm,
             y0: &vec![f32::from_bits(SENTINEL_BITS); y_len],
         },
     )?;
@@ -526,6 +633,7 @@ fn solo_slot(
 
 fn check_pair_shared(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<(), String> {
     let weights = pair_weights(fix, quant)?;
+    let norm = ffn_norm(fix)?;
     let x = oracle::activations(PAIR_COLS, 0x5E1 + tag(quant), 1.0);
     let y_len = EXPERT_SLOTS * EXPERT_K;
     h.clear_fault()?;
@@ -540,6 +648,7 @@ fn check_pair_shared(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<(),
             shared_gate: &weights.shared_gate,
             shared_up: &weights.shared_up,
             x: &x,
+            norm: &norm,
             y0: &vec![f32::from_bits(SENTINEL_BITS); y_len],
         },
     )?;
@@ -565,7 +674,7 @@ fn check_pair_shared(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<(),
             )
         };
         h.clear_fault()?;
-        let solo = solo_slot(h, quant, gate, up, shared_gate, shared_up, &x)?;
+        let solo = solo_slot(h, quant, [gate, up, shared_gate, shared_up], &x, &norm)?;
         let got = &full[slot * EXPERT_K..(slot + 1) * EXPERT_K];
         bits_eq(got, &solo, &format!("{} slot {slot}", quant.name()))?;
     }
@@ -674,7 +783,11 @@ fn fold_bad_id(h: &Harness<'_>, weights: &FoldWeights, quant: Quant) -> Result<(
                 y0: &vec![1.0; FOLD_ROWS],
             },
         )?;
-        expert_id(h.fault()?, &format!("{} id {bad}", quant.name()))?;
+        only_site(
+            h.fault()?,
+            &format!("{} id {bad}", quant.name()),
+            FaultSite::ExpertId,
+        )?;
         if let Some(row) = got.iter().position(|v| !v.is_nan()) {
             return Err(format!(
                 "{} id {bad} row {row} is {:?}, not NaN",
@@ -744,6 +857,8 @@ fn pair_bounds(
                     shared_gate: bytes.window(Elems(0), Elems(gate_len))?,
                     shared_up: bytes.window(Elems(0), Elems(gate_len))?,
                     x: values.window(Elems(0), Elems(16))?,
+                    gain: values.window(Elems(0), Elems(16))?,
+                    eps: 1e-6,
                     y: marker.window_mut(Elems(0), Elems(64))?,
                     out_stride: stride,
                     fault: device.fault_word(),
@@ -960,6 +1075,7 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::Cla
     vec![
         ("pair", Box::new(|| ctx.with(pair))),
         ("pair_id", Box::new(|| ctx.with(pair_id))),
+        ("pair_norm", Box::new(|| ctx.with(pair_norm))),
         ("pair_shared", Box::new(|| ctx.with(pair_shared))),
         ("fold", Box::new(|| ctx.with(fold))),
         ("fold_type", Box::new(|| ctx.with(fold_type))),

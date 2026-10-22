@@ -1,7 +1,8 @@
 //! The launch of the routed gate-up pair and the folded down.
 //!
-//! Both are one dispatch. The pair's grid height is the slot. The fold maps
-//! every slot's blocks as one K' and adds the residual in the same kernel.
+//! Both are one dispatch. The pair's grid height is the slot, and it norms
+//! its input as it loads it. The fold maps every slot's blocks as one K' and
+//! adds the residual in the same kernel.
 //! A launch whose shape is not that one is refused by name before anything
 //! is encoded.
 
@@ -38,7 +39,10 @@ pub enum SharedPlan<'w> {
     Apart,
 }
 
-/// One gate-up pair: nine slots, each `silu(gate) * up` over `cols` inputs.
+/// One gate-up pair: nine slots, each `silu(gate · x̂) * (up · x̂)` over `cols`
+/// inputs, `x̂ = x * gain / sqrt(mean(x^2) + eps)`. A norm that finds a value
+/// that is not finite, or a zero scale, raises the norm site of `layer` on
+/// `fault` and writes NaN to its rows.
 pub struct PairParams<'w> {
     /// The weight type. A layer's experts are one type.
     pub quant: Quant,
@@ -60,14 +64,19 @@ pub struct PairParams<'w> {
     pub shared_gate: Window<'w, u8, MetalDevice>,
     /// The shared expert's up, one expert.
     pub shared_up: Window<'w, u8, MetalDevice>,
-    /// The input, `cols` values.
+    /// The input, `cols` values, before the norm.
     pub x: Window<'w, f32, MetalDevice>,
+    /// The norm's gain, `cols` values.
+    pub gain: Window<'w, f32, MetalDevice>,
+    /// The epsilon added to the mean of the squares.
+    pub eps: f32,
     /// The nine slot outputs. Slot `s` starts at `s * out_stride`.
     pub y: WindowMut<'w, f32, MetalDevice>,
     /// Floats from one slot's output to the next. Below [`EXPERT_K`] the
     /// slots overlap and the launch is refused.
     pub out_stride: usize,
-    /// The fault word an id past the stack raises into.
+    /// The fault word an id past the stack or a norm that cannot take its
+    /// input raises into.
     pub fault: &'w MetalFaultWord,
     /// The layer a raise is recorded in.
     pub layer: u32,
@@ -212,6 +221,7 @@ fn check_pair(p: &PairParams<'_>) -> Result<PairShape, DeviceError> {
     check_window_len(PAIR, "shared gate", p.shared_gate.len(), shared)?;
     check_window_len(PAIR, "shared up", p.shared_up.len(), shared)?;
     check_window_len(PAIR, "x", p.x.len(), p.cols)?;
+    check_window_len(PAIR, "gain", p.gain.len(), p.cols)?;
     check_window_len(PAIR, "ids", p.ids.len(), ROUTED_IDS)?;
     check_window_len(PAIR, "y", p.y.len(), y_len)?;
     aligned(PAIR, "gate", p.gate)?;
@@ -330,6 +340,7 @@ impl super::Kernels {
             shape.n_experts,
             p.layer,
             shape.stride,
+            p.eps.to_bits(),
         ]);
         encoder.set_pipeline(self.experts.pair(p.quant));
         let mut slot = Bindings::new(encoder);
@@ -338,6 +349,7 @@ impl super::Kernels {
         slot.set(Binding::of(&p.shared_gate)?)?;
         slot.set(Binding::of(&p.shared_up)?)?;
         slot.set(Binding::of(&p.x)?)?;
+        slot.set(Binding::of(&p.gain)?)?;
         slot.set(Binding::of(&p.ids)?)?;
         slot.set(Binding::of_mut(&p.y)?)?;
         slot.set(p.fault.binding())?;
