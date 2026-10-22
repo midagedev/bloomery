@@ -68,9 +68,10 @@ use gguf::iq_tables::{
     IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
 use gguf::quant::{
-    KVALUES_MXFP4, bf16_bits_to_f32, e8m0_to_f32_half, f32_to_f16_bits, fp32_to_bf16_bits,
-    half_to_f32, non_finite_activation, q80_inverse, q82_inverse,
+    KVALUES_MXFP4, bf16_bits_to_f32, e8m0_to_f32_half, fp32_to_bf16_bits, half_to_f32, q82_inverse,
 };
+#[cfg(target_arch = "x86_64")]
+use gguf::quant::{f32_to_f16_bits, non_finite_activation, q80_inverse};
 
 pub mod generic;
 
