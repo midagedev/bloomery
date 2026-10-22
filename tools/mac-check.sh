@@ -90,7 +90,6 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 BOX_TARGET=x86_64-unknown-linux-gnu # the box's triple, whose lint tools/lint-ratchet.txt counts
 TARGET=${BLOOMERY_CHECK_TARGET:-$BOX_TARGET}
-CROSS=1 # 0 on the native x86_64 Linux lint lane: the box command runs as the recipes' own, with no --target
 MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of one cold check's and one cold combos' growth of a tree's target/, rounded up to a whole GiB
 
 say() { printf '%s\n' "$*" >&2; }
@@ -178,7 +177,7 @@ combo_lines() {
 # derive MODE CMD: the cargo argv this script runs for the box command CMD, one word a line. CMD
 # must be one plain `cargo <the mode's subcommand> …` — no shell syntax, quoting, variable or
 # environment prefix, no --target of its own; the cross check adds `--target $TARGET` right after the
-# subcommand (the native x86_64 Linux lane, CROSS=0, runs the command as the recipes' own); `fmt`
+# subcommand (the native x86_64 Linux lane, NATIVE=1, runs the command as the recipes' own); `fmt`
 # takes fmt-check's command, which must end `-- --check`, without those two words. Anything else is
 # refused with 64, naming why.
 derive() {
@@ -215,7 +214,7 @@ derive() {
     n=$((n - 2))
   fi
   printf '%s\n' cargo "$verb"
-  case $mode in check | lint) if [ "$CROSS" = 1 ]; then printf '%s\n' --target "$TARGET"; fi ;; esac
+  case $mode in check | lint) if [ "${NATIVE:-0}" = 0 ]; then printf '%s\n' --target "$TARGET"; fi ;; esac
   [ "$n" -le 2 ] || printf '%s\n' "${words[@]:2:n-2}"
 }
 
@@ -454,7 +453,7 @@ seed_record() {
 self_test() {
   # the cases are written for the default target, the Mac's cross lane and an unset commit word, whatever
   # the caller exported
-  local fails=0 out t m cmd fake tc ch host a b tab why drc sc r head TARGET=$BOX_TARGET NATIVE=0 CROSS=1
+  local fails=0 out t m cmd fake tc ch host a b tab why drc sc r head TARGET=$BOX_TARGET NATIVE=0
   unset BLOOMERY_CHECK_TARGET BLOOMERY_GIT_COMMIT
   fail() { say "mac-check self-test FAIL: $*"; fails=$((fails + 1)); }
 
@@ -767,6 +766,8 @@ EOF
   [ "$(wc -l < "$t/a/seed.tsv" | tr -d ' ')" = 1 ] || fail "seed_record with no sha wrote a line"
   out=$(WT_SEED_TSV=/dev/null/x/seed.tsv seed_record /some/tree abc123 2>&1) || fail "seed_record with an unwritable file failed its caller"
   case $out in *"seed record: could not append to /dev/null/x/seed.tsv"*) ;; *) fail "an unwritable seed file is not named: $out" ;; esac
+  # the seed file's line count, for both platforms' lint cases below
+  seed_lines() { if [ -f "$sc/seed.tsv" ]; then wc -l < "$sc/seed.tsv" | tr -d ' '; else echo 0; fi; }
   if [ "$(uname -s)" = Darwin ] && command -v just > /dev/null 2>&1; then
     write_env
     cat > "$tc/cargo" << 'CARGO'
@@ -792,7 +793,6 @@ CARGO
       shift 2
       (cd "$sc" && env HOME="$fake" PATH="$fake/brew/bin:$(dirname "$(command -v just)"):/usr/bin:/bin:/sbin" WT_SEED_TSV="$sc/seed.tsv" "$@" bash "$s" "$m" > "$sc/out" 2>&1)
     }
-    seed_lines() { if [ -f "$sc/seed.tsv" ]; then wc -l < "$sc/seed.tsv" | tr -d ' '; else echo 0; fi; }
     drc=0; lint_run "$sc/tools/mac-check.sh" lint FAKE_WARN=0 || drc=$?
     [ "$drc" = 0 ] || fail "a green fake lint ended rc $drc: $(tail -3 "$sc/out")"
     [ "$(seed_lines)" = 1 ] || fail "a green lint wrote $(seed_lines) seed lines, not 1"
@@ -854,18 +854,17 @@ CARGO
         CUDA_TOOLKIT_PATH="$fake/opt/cuda-13.3" LIBCLANG_PATH="$fake/clt/lib" WT_SEED_TSV="$sc/seed.tsv" \
         "$@" bash "$sc/tools/mac-check.sh" lint > "$sc/out" 2>&1)
     }
-    native_seed_lines() { if [ -f "$sc/seed.tsv" ]; then wc -l < "$sc/seed.tsv" | tr -d ' '; else echo 0; fi; }
     r=$(ratchet "$HERE/tools/lint-ratchet.txt")
     drc=0; native_run FAKE_WARN=0 || drc=$?
     [ "$drc" = 0 ] || fail "the native green lint ended rc $drc, not 0: $(tail -3 "$sc/out")"
     head=$(grep -m1 '^mac-check: cargo clippy' "$sc/out" || true)
     [ -n "$head" ] || fail "the native lint prints no command line: $(tail -3 "$sc/out")"
     case $head in *--target*) fail "the native lint derives a --target of its own: $head" ;; esac
-    [ "$(native_seed_lines)" = 1 ] || fail "a green native lint wrote $(native_seed_lines) seed lines, not 1"
+    [ "$(seed_lines)" = 1 ] || fail "a green native lint wrote $(seed_lines) seed lines, not 1"
     drc=0; native_run FAKE_WARN=$((r + 1)) || drc=$?
     [ "$drc" = 1 ] || fail "a native lint over the ratchet ended rc $drc, not 1: $(tail -3 "$sc/out")"
     grep -q "lint \^warning: $((r + 1)), above the ratchet $r" "$sc/out" || fail "the native lint over the ratchet names no verdict: $(tail -3 "$sc/out")"
-    [ "$(native_seed_lines)" = 1 ] || fail "a red native lint wrote a seed line"
+    [ "$(seed_lines)" = 1 ] || fail "a red native lint wrote a seed line"
     for b in "cuda.h|$fake/opt/cuda-13.3/include/cuda.h|missing cuda.h" \
       "libclang|$fake/clt/lib/libclang.so|missing a libclang .so"; do
       IFS='|' read -r m cmd why <<< "$b"
@@ -987,7 +986,6 @@ if [ "$HOST" = "$BOX_TARGET" ]; then
     say "mac-check.sh: on x86_64 Linux this script runs lint only (the box command as the host's own, against the ratchet); the other modes are the box's recipes (just check, just fmt-check; test is tools/recipes.py pure-crates)"
     exit 64
   fi
-  CROSS=0
 fi
 CHANNEL=$(channel) || exit $?
 TC=$HOME/.rustup/toolchains/$CHANNEL-$HOST/bin

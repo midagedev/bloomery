@@ -66,13 +66,16 @@ fi
 
 # ---- CUDA headers: the pins and the unpack are tools/nightly/cuda-debs.tsv and fetch-cuda-headers.sh,
 # the one owner CI's lint job shares (it skips everything when the three headers are already there) ----
-as_b bash "$SRC/tools/nightly/fetch-cuda-headers.sh" "$H/opt/cuda-13.3"
+# the fetcher and its pins are staged where bnightly can read them: the checkout may sit under a
+# directory only root reads
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+install -m 0644 "$SRC/tools/nightly/fetch-cuda-headers.sh" "$SRC/tools/nightly/cuda-debs.tsv" "$T/"
+chown bnightly: "$T"
+as_b bash "$T/fetch-cuda-headers.sh" "$H/opt/cuda-13.3"
 say "CUDA 13.3 headers in place: $(grep -m1 'define CUDA_VERSION' "$H/opt/cuda-13.3/include/cuda.h")"
 
 # ---- just ----
-T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
-chown bnightly: "$T"
 if [ "$(as_b "$H/bin/just" --version 2> /dev/null || true)" != "just $JUST_VERSION" ]; then
   as_b mkdir -p "$H/bin"
   as_b curl -sSfL -m 300 -o "$T/just.tgz" "https://github.com/casey/just/releases/download/$JUST_VERSION/just-$JUST_VERSION-x86_64-unknown-linux-musl.tar.gz"

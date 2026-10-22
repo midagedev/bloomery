@@ -8,8 +8,10 @@
 # <dir> is what CUDA_TOOLKIT_PATH names (tools/nightly/install.sh's ~/opt/cuda-13.3): the headers under
 # <dir>/targets/x86_64-linux/include, with <dir>/include a symlink to it (the build reads
 # <dir>/include/cuda.h). Idempotent: when the three header files are already there, nothing is fetched —
-# only the symlink is made sure of; an incomplete directory is fetched again whole. The unpack goes to a
-# staging directory first, so a failed download or sha check leaves <dir> untouched.
+# only the symlink is made sure of; otherwise the headers are fetched and copied into that include
+# directory, and nothing else under <dir> is removed or replaced. The unpack goes to a staging directory
+# first, so a failed download or sha check leaves <dir> untouched. A <dir>/include that is a directory of
+# its own (not the symlink) is refused by name before anything is fetched.
 #
 # One owner: tools/nightly/install.sh and the CI lint job (.github/workflows/pr.yml, which caches <dir>
 # keyed on cuda-debs.tsv's hash) both run this script — the pins and the unpack steps have no second copy.
@@ -55,6 +57,10 @@ complete() {
 }
 
 link_include() { ln -sfn targets/x86_64-linux/include "$1/include"; }
+if [ -e "$DEST/include" ] && [ ! -L "$DEST/include" ]; then
+  say "$DEST/include is a directory, not the symlink to targets/x86_64-linux/include this script keeps — name another directory"
+  exit 64
+fi
 
 if complete "$DEST"; then
   link_include "$DEST"
@@ -117,10 +123,10 @@ for deb in "${debs[@]}"; do
   i=$((i + 1))
 done
 
-# the sentinels prove the unpack before anything replaces an existing directory
+# the sentinels prove the unpack before anything is copied into <dir>; only its include directory is
+# written, so the rest of an existing toolkit under it stays as it was
 complete "$stage" || { say "the unpack left no cuda.h, curand.h, crt/host_config.h under $stage"; exit 69; }
-rm -rf "$DEST"
-mkdir -p "$(dirname "$DEST")"
-mv "$stage" "$DEST"
+mkdir -p "$DEST/targets/x86_64-linux/include"
+cp -a "$stage/targets/x86_64-linux/include/." "$DEST/targets/x86_64-linux/include/"
 link_include "$DEST"
 say "CUDA 13.3 headers unpacked: $(grep -m1 'define CUDA_VERSION' "$DEST/targets/x86_64-linux/include/cuda.h" || echo 'cuda.h without a CUDA_VERSION line')"
