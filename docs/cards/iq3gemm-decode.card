@@ -33,8 +33,8 @@ predict: +25..+45
 rounds: 4
 sd: 0.6 % AGENTS.md Know the ruler, same-binary scatter; the ratio at 4 rounds reads +-1.0 %
 condition: one lease with the box quiet (no gate on either card); depth-serve.sh, one fresh server an arm and a
-  round, the base arm the merge commit 0f866fb34's bloomery-serve and the changed arm this branch's, D 6 at C 262144
-  with N 128; the file Qwen3.6-35B-A3B-UD-IQ4_XS.gguf (unsloth) on the box first (it is not in /models today) and the
+  round, the base arm main be69eb0ce's bloomery-serve (this branch's parent) and the changed arm this branch's, D 6 at C 262144
+  with N 128; the file Qwen3.6-35B-A3B-UD-IQ4_XS.gguf (unsloth) at /models/Qwen3.6-35B-A3B/, sha256 checked against the hub, and the
   plan's card-expert count read before the sitting (>= 9,900 of 10,240 expected); rows tagged [cpu-busy], [other-busy]
   or [cold] are rerun
 decide-in: land the IQ3_S GEMM row with its pins; the README's Qwen3.6 rows and docs/models.md's quant-types line name
