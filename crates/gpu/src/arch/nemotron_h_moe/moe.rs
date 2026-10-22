@@ -233,15 +233,19 @@ impl MoeLayer {
             )
         })?;
         let route = RouteOut::new(what, stream, x.n_expert)?;
-        if x.top_k != route.n_used() || !hp.weights_norm {
+        // The slots, scratch and pass are sized for the shape's top_k (the
+        // most any layer keeps), so a layer that keeps fewer is refused: its
+        // ids and weights would be read past their end.
+        if x.top_k != route.n_used() || route.n_used() != hp.top_k_max() || !hp.weights_norm {
             return Err(GpuError::shape(
                 what,
                 format!(
                     "layer {l} keeps {} experts, renormalized {}: the router keeps {}, \
-                     renormalized",
+                     renormalized, and every layer keeps the {} the pass is sized for",
                     x.top_k,
                     hp.weights_norm,
-                    route.n_used()
+                    route.n_used(),
+                    hp.top_k_max()
                 ),
             ));
         }

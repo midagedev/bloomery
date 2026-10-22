@@ -183,6 +183,10 @@ impl Hparams {
         let n_expert = positive(split, "expert_count")?;
         // The latent the routed experts run in; a file without the key has
         // none, and its experts act on the hidden row itself.
+        // PIN(2026-10-22): an absent `moe_latent_size` is no latent, not a
+        // refusal. Nemotron-3.5-Lightning's GGUF carries no such key, and
+        // llama.cpp reads it as optional and runs the experts at n_embd
+        // without it (nemotron-h.cpp:29, :64 at cd0a5b6a1).
         let latent = match optional_usize(split, "moe_latent_size")? {
             Some(0) => return Err(metadata(split, "moe_latent_size", "is 0")),
             other => other,
@@ -199,6 +203,10 @@ impl Hparams {
         // The dialect builds the sigmoid router whatever the key says
         // (nemotron-h.cpp:312), so a file that says another is refused; a
         // file that carries no key has the dialect's router.
+        // PIN(2026-10-22): an absent `expert_gating_func` is the sigmoid
+        // router, not a refusal. Nemotron-3.5-Lightning's GGUF carries no such
+        // key, and llama.cpp builds the sigmoid router without reading it
+        // (nemotron-h.cpp:324 at cd0a5b6a1).
         sigmoid_gating(
             split,
             Some("nemotron-h.cpp:312, the sigmoid router the dialect builds"),
