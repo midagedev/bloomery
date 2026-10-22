@@ -10,7 +10,8 @@ use bloomery_metal::kernels::{BLOCK_VALUES, EmbedParams, MatvecParams, Mode, Nor
 use bloomery_metal::stream::MetalStream;
 use gguf::quant::GgmlType;
 
-use super::oracle::{self, Fixture, Kind};
+use super::fixture::Fixture;
+use super::oracle::{self, Kind};
 use super::{Harness, Launch, ModeSpec, SENTINEL_BITS, flag};
 
 /// The layer the clauses launch in: a model layer, so a raise is told apart

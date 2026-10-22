@@ -51,9 +51,11 @@ use bloomery_metal::stream::MetalStream;
 
 #[path = "clauses.rs"]
 mod clauses;
+#[path = "fixture.rs"]
+mod fixture;
 #[path = "mutants.rs"]
 mod mutants;
-#[path = "oracle.rs"]
+#[path = "../shared/oracle.rs"]
 mod oracle;
 
 /// A clause, ready to run.
@@ -355,14 +357,14 @@ pub fn main() -> ExitCode {
     let only = flag(&args, "--child")
         .or(mutant.map(|m| m.clause))
         .or(flag(&args, "--only"));
-    let fixture = fixture_path(&args).and_then(|path| oracle::Fixture::open(&path));
+    let fixture = fixture_path(&args).and_then(|path| fixture::Fixture::open(&path));
     match &fixture {
         Ok(f) => println!("fixture: {}", f.path.display()),
         Err(e) => println!("fixture: {e}"),
     }
 
     let mut report = Report::new();
-    let with = |f: fn(&Harness<'_>, &oracle::Fixture) -> Clause| match &fixture {
+    let with = |f: fn(&Harness<'_>, &fixture::Fixture) -> Clause| match &fixture {
         Ok(fixture) => f(&harness, fixture),
         Err(e) => Err(e.clone()),
     };

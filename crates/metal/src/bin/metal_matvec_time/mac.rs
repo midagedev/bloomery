@@ -27,7 +27,7 @@ use bloomery_device::{Buffer, Device, DeviceError, Elems, Event, Stream};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::kernels::{BLOCK_VALUES, Kernels, MatvecParams, Mode, Quant};
 
-#[path = "../gate_metal_qwen35moe_kernels/oracle.rs"]
+#[path = "../shared/oracle.rs"]
 #[allow(
     dead_code,
     reason = "the probe reads the oracle's reference and band; the gate reads the rest"
