@@ -1,13 +1,13 @@
 //! The launch of the Q4_K and Q6_K mat-vecs.
 
-use bloomery_device::{DeviceError, Window, WindowMut};
+use bloomery_device::{DeviceError, LAYER_NONE, Window, WindowMut};
 
 use crate::device::MetalDevice;
 use crate::encode::{Binding, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
 use super::geometry::{BLOCK_VALUES, ROWS_PER_GROUP, THREADS_PER_GROUP};
-use super::{Kernels, MatvecPipelines, args_bytes, check_len, word};
+use super::{Kernels, MatvecPipelines, args_bytes, check_window_len, word};
 
 /// The weight type a mat-vec reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,9 +46,12 @@ pub struct NormOnLoad<'w> {
     pub gain: Window<'w, f32, MetalDevice>,
     /// The epsilon added to the mean of the squares.
     pub eps: f32,
-    /// The fault word a raise lands in.
+    /// The fault word a raise lands in. Metal's own type: how a word binds to
+    /// a kernel is backend code, and the contract's `FaultWord` does not say.
     pub fault: &'w MetalFaultWord,
-    /// The layer a raise is recorded in (`LAYER_NONE` for a direct launch).
+    /// The layer a raise is recorded in: [`LAYER_NONE`] for a direct launch.
+    /// The caller's: when Metal implements `ChainOps`, the walk's
+    /// `LayerCtx.layer` feeds it.
     pub layer: u32,
 }
 
@@ -115,14 +118,15 @@ fn check(p: &MatvecParams<'_>) -> Result<Shape, DeviceError> {
         .checked_mul(nblocks)
         .and_then(|blocks| blocks.checked_mul(p.quant.block_bytes()))
         .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.cols)))?;
-    check_len("matvec", "weights", p.weights.len(), weight_bytes)?;
-    check_len("matvec", "x", p.x.len(), p.cols)?;
-    check_len("matvec", "y", p.y.len(), p.rows)?;
+    check_window_len("matvec", "weights", p.weights.len(), weight_bytes)?;
+    check_window_len("matvec", "x", p.x.len(), p.cols)?;
+    check_window_len("matvec", "y", p.y.len(), p.rows)?;
     if let Mode::NormOnLoad(norm) = &p.mode {
-        check_len("matvec", "gain", norm.gain.len(), p.cols)?;
+        check_window_len("matvec", "gain", norm.gain.len(), p.cols)?;
     }
-    // The kernels read the weights as 16-bit words.
-    let start = p.weights.raw().base().get() + p.weights.byte_range()?.start.get();
+    // The kernels read the weights as 16-bit words, from the window's byte
+    // offset in its buffer.
+    let start = p.weights.byte_range()?.start.get();
     if !start.is_multiple_of(2) {
         return Err(refuse(format!(
             "the weights start {start} bytes into their buffer: the kernels read 16-bit words"
@@ -158,7 +162,7 @@ impl Kernels {
         let shape = check(&p)?;
         let (layer, eps) = match &p.mode {
             Mode::NormOnLoad(norm) => (norm.layer, norm.eps),
-            Mode::Store | Mode::Residual => (0, 0.0),
+            Mode::Store | Mode::Residual => (LAYER_NONE, 0.0),
         };
         let args = args_bytes([shape.rows, shape.nblocks, layer, eps.to_bits()]);
         let family = match p.quant {

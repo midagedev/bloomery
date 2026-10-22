@@ -79,7 +79,9 @@ inline void q6k_matvec_body(device const block_q6_K * W,
 
     for (int i = ix; i < nb; i += 2) {
         device const float * yb = x + i * QK_K + y_offset;
-        device const float * gb = gain + i * QK_K + y_offset;
+        // The gain is bound by the norm entry only: the others form no pointer
+        // from it.
+        device const float * gb = NORM ? gain + i * QK_K + y_offset : gain;
 
         for (short l = 0; l < 4; ++l) {
             float a0 = yb[l +  0];

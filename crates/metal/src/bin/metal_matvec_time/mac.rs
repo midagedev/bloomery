@@ -22,9 +22,10 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
+use bloomery_device::conformance::why;
 use bloomery_device::{Buffer, Device, DeviceError, Elems, Event, Stream};
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::kernels::{Kernels, MatvecParams, Mode, Quant};
+use bloomery_metal::kernels::{BLOCK_VALUES, Kernels, MatvecParams, Mode, Quant};
 
 #[path = "../gate_metal_qwen35moe_kernels/oracle.rs"]
 #[allow(
@@ -48,15 +49,11 @@ const SHAPES: [(usize, usize); 5] = [
     (8192, 4096),
 ];
 
-fn why(e: DeviceError) -> String {
-    e.to_string()
-}
-
 /// One matrix of random blocks the probe's way: random bytes, with `d` (and
 /// `dmin`) a finite f16 in [0.0005, 0.004].
 fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
     let block = quant.block_bytes();
-    let blocks = rows * cols / 256;
+    let blocks = rows * cols / BLOCK_VALUES;
     let mut rng = oracle::Rng::new(seed);
     let mut bytes = vec![0u8; blocks * block];
     for chunk in bytes.chunks_mut(8) {
@@ -107,7 +104,7 @@ fn time_shape(
     trials: usize,
     check: bool,
 ) -> Result<Timing, String> {
-    let stream = device.stream().map_err(why)?;
+    let stream = device.stream();
     let one = matrix(
         quant,
         rows,
@@ -121,15 +118,15 @@ fn time_shape(
     for c in 0..copies {
         all[c * stride..c * stride + bytes].copy_from_slice(&one);
     }
-    let weights = device.upload(&stream, &all).map_err(why)?;
+    let weights = device.upload(stream, &all).map_err(why)?;
     drop(all);
     let x_values = oracle::activations(cols, 0x78, 1.0);
-    let x = device.upload(&stream, &x_values).map_err(why)?;
+    let x = device.upload(stream, &x_values).map_err(why)?;
 
     let dispatches = WINDOW_BYTES.div_ceil(bytes).max(30);
     let buffers = WARMUPS + trials;
     let mut y = device
-        .zeroed::<f32>(&stream, Elems(buffers * dispatches * rows))
+        .zeroed::<f32>(stream, Elems(buffers * dispatches * rows))
         .map_err(why)?;
 
     // Encode every buffer, then commit them back to back, an event after each.
@@ -178,7 +175,9 @@ fn time_shape(
     stream.sync().map_err(why)?;
 
     let mut out = vec![0f32; buffers * dispatches * rows];
-    y.read(&stream, &mut out).map_err(why)?;
+    device
+        .read(stream, y.whole().map_err(why)?, &mut out)
+        .map_err(why)?;
     let first = &out[..rows];
     for (n, slice) in out.chunks_exact(rows).enumerate() {
         if slice
@@ -194,8 +193,8 @@ fn time_shape(
     if check {
         let x64: Vec<f64> = x_values.iter().map(|&v| f64::from(v)).collect();
         let reference = oracle::reference(quant, &one, rows, cols, &x64)?;
-        let factor = oracle::band_factor(quant, cols / 256, oracle::Kind::Store);
-        oracle::check(first, &reference, factor, oracle::Kind::Store, None)?;
+        let band = oracle::band(quant, cols / BLOCK_VALUES, oracle::Kind::Store);
+        oracle::check(first, &reference, band, oracle::Kind::Store, None)?;
     }
 
     let gaps: Vec<f64> = (WARMUPS..buffers)
@@ -228,6 +227,18 @@ fn median(xs: &[f64]) -> f64 {
     v[v.len() / 2]
 }
 
+/// The `--trials` value: a whole number of at least one, refused by name
+/// otherwise (no trial has no median to take).
+fn trials_of(value: Option<&String>) -> Result<usize, String> {
+    match value.map(|v| (v, v.parse::<usize>())) {
+        None => Err("--trials takes a value".to_string()),
+        Some((_, Ok(n))) if n >= 1 => Ok(n),
+        Some((value, _)) => Err(format!(
+            "--trials takes a whole number of at least 1, not {value:?}"
+        )),
+    }
+}
+
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| {
@@ -235,7 +246,17 @@ pub fn main() -> ExitCode {
             .position(|a| a == name)
             .and_then(|i| args.get(i + 1))
     };
-    let trials: usize = flag("--trials").and_then(|v| v.parse().ok()).unwrap_or(16);
+    let trials = match args
+        .iter()
+        .position(|a| a == "--trials")
+        .map_or(Ok(16), |at| trials_of(args.get(at + 1)))
+    {
+        Ok(trials) => trials,
+        Err(e) => {
+            println!("metal_matvec_time: {e}");
+            return ExitCode::from(64);
+        }
+    };
     let only = flag("--only").map(String::as_str);
     let check = !args.iter().any(|a| a == "--no-check");
     let show_gaps = args.iter().any(|a| a == "--gaps");
@@ -258,9 +279,16 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let info = match device.info() {
+        Ok(info) => info,
+        Err(e) => {
+            println!("metal_matvec_time: FAIL ({e})");
+            return ExitCode::FAILURE;
+        }
+    };
     println!(
         "info\tdevice={}\tlib={}\tbackend={}\ttrials={trials}\twarmups={WARMUPS}\twindow_bytes={WINDOW_BYTES}\tworking_set_bytes={WORKING_SET_BYTES}",
-        device.info().name,
+        info.name,
         device.library().path().name(),
         <MetalDevice as Device>::BACKEND
     );
@@ -277,7 +305,7 @@ pub fn main() -> ExitCode {
                             t.gaps.iter().map(|g| format!("{:.0}", g * 1e6)).collect();
                         println!("gaps_us\t{}", us.join(" "));
                     }
-                    let bytes = rows * cols / 256 * quant.block_bytes();
+                    let bytes = rows * cols / BLOCK_VALUES * quant.block_bytes();
                     println!(
                         "matvec\ttype={}\trows={rows}\tcols={cols}\tdispatches={}\ttrials={trials}\tclean={}\tbytes={bytes}\tcopies={}\tworking_set_bytes={}\tgbps_median={:.2}\tus_median={:.2}\tencode_us={:.2}",
                         quant.name(),

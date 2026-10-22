@@ -17,23 +17,32 @@
 //! 4. **residual_epilogue**: `y = y + W . x` in place.
 //! 5. **row_tail**: a row count that is not a multiple of the rows of a
 //!    threadgroup writes every row and nothing past the last.
-//! 6. **metallib_equals_source**: the metallib's outputs and the source's are
+//! 6. **row_tail_reads**: those launches read nothing outside their weights'
+//!    buffer, as Metal's shader validation sees them in a child run of this
+//!    gate (a read nothing stores shows in no output).
+//! 7. **metallib_equals_source**: the metallib's outputs and the source's are
 //!    the same bits, when both paths exist.
-//! 7. **embed**: an id at or past the vocabulary raises the token-id site, and
+//! 8. **embed**: an id at or past the vocabulary raises the token-id site, and
 //!    its row is NaN.
-//! 8. **matvec_refusals**: a window that is not the shape's, columns that are
+//! 9. **matvec_refusals**: a window that is not the shape's, columns that are
 //!    not whole blocks and an empty shape are refused by name, and nothing is
 //!    encoded for them.
+//! 10. **block_shape**: the block bytes and values the launch arithmetic
+//!     uses are gguf's own for Q4_K and Q6_K.
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
 //! clause that must catch the named kernel defect (`mutants.rs`) against
 //! kernels compiled from the edited source, and a clause that stays green on
-//! its mutant is the finding.
+//! its mutant is the finding; `--mutants-all` runs every mutant in a child
+//! gate of its own and is red when one stays green on its clause (a mutant
+//! that no clause catches is a test that cannot fail); `--child CLAUSE` is
+//! `--only` for a run whose output a parent gate reads (`row_tail_reads`).
 
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
+use bloomery_device::conformance::{Clause, Report, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::kernels::{Kernels, MatvecParams, Mode, NormOnLoad, Quant};
@@ -47,46 +56,13 @@ mod mutants;
 #[path = "oracle.rs"]
 mod oracle;
 
-/// How a clause that did not fail ended.
-pub enum Verdict {
-    /// Passed, with a fact worth printing.
-    Noted(String),
-    /// Could not run here, with the reason.
-    Skip(String),
-}
-
-/// A clause's result: a verdict, or the reason it failed.
-pub type Clause = Result<Verdict, String>;
-
 /// A clause, ready to run.
 type ClauseRun<'a> = Box<dyn Fn() -> Clause + 'a>;
 
-/// The gate's own report: one line per clause.
-struct Report {
-    failures: Vec<&'static str>,
-}
-
-impl Report {
-    fn clause(&mut self, name: &'static str, result: Clause) {
-        match result {
-            Ok(Verdict::Noted(note)) => println!("clause {name}: PASS ({note})"),
-            Ok(Verdict::Skip(why)) => println!("clause {name}: SKIP ({why})"),
-            Err(why) => {
-                println!("clause {name}: FAIL ({why})");
-                self.failures.push(name);
-            }
-        }
-    }
-}
-
-/// The error of a device call, as a clause's text.
-pub fn why(e: DeviceError) -> String {
-    e.to_string()
-}
-
 /// A word the buffers around a window hold, so that a write past the window
-/// is seen: a NaN, so a row that was never written is not a number either.
-pub const SENTINEL_BITS: u32 = 0xDEAD_BEEF;
+/// is seen: a quiet NaN, so a row that was never written is not a number
+/// either, and an input read from outside its window poisons the output.
+pub const SENTINEL_BITS: u32 = 0x7FC0_DEAD;
 
 /// Bytes the weights' buffer holds before and after the window (odd multiples
 /// of two, so the window's offset is neither zero nor aligned to anything
@@ -184,7 +160,9 @@ impl Harness<'_> {
         };
         self.encode(|encoder| self.kernels.matvec(encoder, params))?;
         let mut back = vec![0f32; launch.rows + 2 * OUT_GUARD];
-        y.read(stream, &mut back).map_err(why)?;
+        device
+            .read(stream, y.whole().map_err(why)?, &mut back)
+            .map_err(why)?;
         check_guards(&back, launch.rows)?;
         Ok(back[OUT_GUARD..OUT_GUARD + launch.rows].to_vec())
     }
@@ -229,7 +207,7 @@ fn check_guards(back: &[f32], rows: usize) -> Result<(), String> {
 }
 
 /// The value after the option `name`, when it is given.
-fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+pub fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     let at = args.iter().position(|a| a == name)?;
     args.get(at + 1).map(String::as_str)
 }
@@ -241,19 +219,82 @@ fn mutated_kernels(device: &MetalDevice, mutant: &mutants::Mutant) -> Result<Ker
     Kernels::from_library(&library).map_err(why)
 }
 
-/// The fixture path: `--fixture PATH`, else the Mac's cache copy.
-fn fixture_path(args: &[String]) -> PathBuf {
+/// The fixture path: `--fixture PATH`, else the Mac's cache copy; with no
+/// `HOME` to find it under, refused by name.
+fn fixture_path(args: &[String]) -> Result<PathBuf, String> {
     if let Some(path) = flag(args, "--fixture") {
-        return PathBuf::from(path);
+        return Ok(PathBuf::from(path));
     }
     let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".cache/bloomery/mac-port/fixture/qwen35moe-fixture-00001-of-00001.gguf")
+        .ok_or("HOME is not set: name the fixture's trunk file with --fixture PATH")?;
+    Ok(PathBuf::from(home)
+        .join(".cache/bloomery/mac-port/fixture/qwen35moe-fixture-00001-of-00001.gguf"))
+}
+
+/// Every mutant of the table, each in a child run of this gate
+/// (`--mutant NAME`): its clause must be red and the child's exit code not 0.
+/// One that stays green is a defect no clause catches.
+fn mutants_all(args: &[String]) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            println!("gate_metal_qwen35moe_kernels --mutants-all: FAIL (the gate's own path: {e})");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut green = Vec::new();
+    for mutant in mutants::MUTANTS {
+        let mut child = Command::new(&exe);
+        child.args(["--mutant", mutant.name]);
+        if let Some(path) = flag(args, "--fixture") {
+            child.args(["--fixture", path]);
+        }
+        let out = match child.output() {
+            Ok(out) => out,
+            Err(e) => {
+                println!("mutant {}: the child gate did not start: {e}", mutant.name);
+                return ExitCode::FAILURE;
+            }
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let red =
+            !out.status.success() && text.contains(&format!("clause {}: FAIL", mutant.clause));
+        println!(
+            "mutant {}: {} on {}",
+            mutant.name,
+            if red { "red" } else { "NOT RED" },
+            mutant.clause
+        );
+        if !red {
+            green.push(mutant.name);
+        }
+    }
+    if green.is_empty() {
+        println!(
+            "gate_metal_qwen35moe_kernels --mutants-all: PASS ({} mutants, each red on its clause)",
+            mutants::MUTANTS.len()
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "gate_metal_qwen35moe_kernels --mutants-all: FAIL (not red: {})",
+        green.join(", ")
+    );
+    ExitCode::FAILURE
 }
 
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(name) = ["--fixture", "--only", "--mutant", "--child"]
+        .into_iter()
+        .find(|name| args.last().is_some_and(|last| last == name))
+    {
+        println!("gate_metal_qwen35moe_kernels: {name} takes a value");
+        return ExitCode::from(64);
+    }
+    if args.iter().any(|a| a == "--mutants-all") {
+        return mutants_all(&args);
+    }
     let device = match MetalDevice::open() {
         Ok(device) => device,
         Err(e @ DeviceError::Unsupported { .. }) => {
@@ -265,15 +306,16 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let stream = match device.stream() {
-        Ok(stream) => stream,
+    let stream = device.stream();
+    let kernels = match Kernels::new(&device) {
+        Ok(kernels) => kernels,
         Err(e) => {
             println!("clause open: FAIL ({e})");
             return ExitCode::FAILURE;
         }
     };
-    let kernels = match Kernels::new(&device) {
-        Ok(kernels) => kernels,
+    let info = match device.info() {
+        Ok(info) => info,
         Err(e) => {
             println!("clause open: FAIL ({e})");
             return ExitCode::FAILURE;
@@ -282,7 +324,7 @@ pub fn main() -> ExitCode {
     println!(
         "metal-lib: path={} device={} backend={}",
         device.library().path().name(),
-        device.info().name,
+        info.name,
         <MetalDevice as Device>::BACKEND
     );
     let mutant = match flag(&args, "--mutant") {
@@ -304,28 +346,27 @@ pub fn main() -> ExitCode {
     };
     let harness = Harness {
         device: &device,
-        stream: &stream,
+        stream,
         kernels: mutated.as_ref().unwrap_or(&kernels),
     };
     if let Some(mutant) = mutant {
         println!("mutant: {} ({})", mutant.name, mutant.why);
     }
-    let only = mutant.map(|m| m.clause).or(flag(&args, "--only"));
-    let path = fixture_path(&args);
-    let fixture = oracle::Fixture::open(&path);
+    let only = flag(&args, "--child")
+        .or(mutant.map(|m| m.clause))
+        .or(flag(&args, "--only"));
+    let fixture = fixture_path(&args).and_then(|path| oracle::Fixture::open(&path));
     match &fixture {
         Ok(f) => println!("fixture: {}", f.path.display()),
         Err(e) => println!("fixture: {e}"),
     }
 
-    let mut report = Report {
-        failures: Vec::new(),
-    };
+    let mut report = Report::new();
     let with = |f: fn(&Harness<'_>, &oracle::Fixture) -> Clause| match &fixture {
         Ok(fixture) => f(&harness, fixture),
         Err(e) => Err(e.clone()),
     };
-    let clauses: [(&'static str, ClauseRun<'_>); 8] = [
+    let clauses: [(&'static str, ClauseRun<'_>); 10] = [
         ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
         ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
         ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
@@ -335,9 +376,13 @@ pub fn main() -> ExitCode {
         ),
         ("row_tail", Box::new(|| with(clauses::row_tail))),
         (
+            "row_tail_reads",
+            Box::new(|| clauses::row_tail_reads(&args)),
+        ),
+        (
             "metallib_equals_source",
             Box::new(|| match &fixture {
-                Ok(fixture) => clauses::metallib_equals_source(&device, &stream, fixture),
+                Ok(fixture) => clauses::metallib_equals_source(&device, stream, fixture),
                 Err(e) => Err(e.clone()),
             }),
         ),
@@ -346,6 +391,7 @@ pub fn main() -> ExitCode {
             "matvec_refusals",
             Box::new(|| clauses::matvec_refusals(&harness)),
         ),
+        ("block_shape", Box::new(clauses::block_shape)),
     ];
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)
@@ -364,13 +410,5 @@ pub fn main() -> ExitCode {
         (None, Some(name)) => format!(" (only {name})"),
         (None, None) => String::new(),
     };
-    if report.failures.is_empty() {
-        println!("gate_metal_qwen35moe_kernels: PASS{scope}");
-        return ExitCode::SUCCESS;
-    }
-    println!(
-        "gate_metal_qwen35moe_kernels: FAIL{scope} ({})",
-        report.failures.join(", ")
-    );
-    ExitCode::FAILURE
+    report.finish(&format!("gate_metal_qwen35moe_kernels{scope}"))
 }

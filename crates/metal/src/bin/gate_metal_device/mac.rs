@@ -28,7 +28,9 @@ use core::sync::atomic::Ordering;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use bloomery_device::conformance::{self, Clause, Harness, Hold, Report, Verdict, why};
+use bloomery_device::conformance::{
+    self, Clause, Harness, Hold, Report, Verdict, expect_range, why,
+};
 use bloomery_device::{
     Buffer, Census, Device, DeviceError, Elems, Event, FaultSite, Shared, Stream, Window,
     WindowMut, check_len,
@@ -206,9 +208,6 @@ impl Harness for MetalHarness {
         self.device.new_stream()
     }
 }
-
-/// A refusal is a range refusal of `what` whose text holds `needle`.
-use conformance::expect_range;
 
 fn encoder_refusals(device: &MetalDevice) -> Clause {
     let stream = device.stream();

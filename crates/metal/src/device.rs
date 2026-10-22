@@ -207,17 +207,17 @@ impl Device for MetalDevice {
         from: Window<'_, T, Self>,
         to: WindowMut<'_, T, Self>,
     ) -> Result<(), DeviceError> {
-        check_len("copy", from.len().get(), to.len())?;
         s.sync()?;
-        // SAFETY: as in `read`.
-        let values = unsafe {
+        // SAFETY: `from` is a window of a live buffer, borrowed while the
+        // pages live, and its pages are only read.
+        let source = unsafe {
             from.raw()
                 .pages::<T>(from.byte_range()?.start, from.len())?
-        }
-        .to_vec();
-        // SAFETY: as in `write`.
+        };
+        // SAFETY: `to` is a window of a live buffer held exclusively while the
+        // pages live, so they are the only host access to its elements.
         let mut pages = unsafe { to.raw().pages::<T>(to.byte_range()?.start, to.len())? };
-        pages.write(&values)
+        pages.copy_from(&source)
     }
 
     fn fault(&self) -> &dyn FaultWord<Self::Stream> {

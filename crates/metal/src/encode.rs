@@ -62,29 +62,17 @@ impl<'w> Binding<'w> {
 
     /// A read window: the buffer, at the window's byte offset.
     pub fn of<T: Elem>(window: &'w Window<'_, T, MetalDevice>) -> Result<Self, DeviceError> {
-        let start = window.byte_range()?.start;
-        Self::at::<T>(window.raw(), start)
+        Self::at::<T>(window.raw(), window.byte_range()?.start)
     }
 
     /// A mutable window: the buffer, at the window's byte offset.
     pub fn of_mut<T: Elem>(window: &'w WindowMut<'_, T, MetalDevice>) -> Result<Self, DeviceError> {
-        let start = window.byte_range()?.start;
-        Self::at::<T>(window.raw(), start)
+        Self::at::<T>(window.raw(), window.byte_range()?.start)
     }
 
-    /// The buffer of `raw`, `start` bytes into the buffer's window range,
-    /// refused by name when the offset is past the buffer or misaligned for
-    /// `T`.
-    fn at<T: Elem>(raw: &'w MetalRaw, start: Bytes) -> Result<Self, DeviceError> {
-        let offset = raw
-            .base()
-            .get()
-            .checked_add(start.get())
-            .map(Bytes)
-            .ok_or_else(|| DeviceError::Range {
-                what: "binding",
-                detail: "the window's byte offset wraps".to_string(),
-            })?;
+    /// The buffer of `raw`, `offset` bytes in, refused by name when the
+    /// offset is past the buffer or misaligned for `T`.
+    fn at<T: Elem>(raw: &'w MetalRaw, offset: Bytes) -> Result<Self, DeviceError> {
         // SAFETY: `raw` is lent by a window of a live buffer, and this
         // binding borrows the window for `'w`.
         let buffer = unsafe { raw.buffer() };
@@ -99,7 +87,7 @@ impl<'w> Binding<'w> {
             });
         }
         let align = core::mem::align_of::<T>();
-        if offset.get() % align != 0 {
+        if !offset.get().is_multiple_of(align) {
             return Err(DeviceError::Range {
                 what: "binding",
                 detail: format!(

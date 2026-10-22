@@ -84,7 +84,9 @@ inline void q4k_matvec_body(device const block_q4_K * W,
 
     const int y_offset = ix * QK_K + 64 * iq + 8 * ir;
     device const float * y4 = x + y_offset;
-    device const float * g4 = gain + y_offset;
+    // The gain is bound by the norm entry only: the others form no pointer
+    // from it.
+    device const float * g4 = NORM ? gain + y_offset : gain;
 
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
@@ -144,7 +146,9 @@ inline void q4k_matvec_body(device const block_q4_K * W,
         }
 
         y4 += 4 * QK_K;
-        g4 += 4 * QK_K;
+        if (NORM) {
+            g4 += 4 * QK_K;
+        }
     }
 
     float scale = 1.f;

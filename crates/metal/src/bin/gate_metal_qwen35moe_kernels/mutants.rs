@@ -8,9 +8,7 @@
 //! `matvec_refusals` has no mutant here: it checks the host module, whose
 //! defect is a source edit of `src/kernels/matvec.rs`, not of a kernel.
 
-/// The kernels' source as the build assembled it, the text the library
-/// compiles.
-const SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/bloomery.metal"));
+use bloomery_metal::library::SOURCE;
 
 /// A defect and the clause that must be red on it.
 pub struct Mutant {
@@ -104,11 +102,12 @@ pub const MUTANTS: &[Mutant] = &[
         why: "an id past the vocabulary writes a zero row",
         edits: &[("value = NAN;", "value = 0.0f;", 1)],
     },
-    // A read the output never shows: only the Metal shader validation layer
-    // reports it (`MTL_SHADER_VALIDATION=1`), so the clause alone stays green.
+    // A read the output never shows: only Metal's shader validation reports
+    // it, so `row_tail` stays green and `row_tail_reads` runs the launches in a
+    // child under the layer. It is that clause's control as well.
     Mutant {
         name: "tail_read",
-        clause: "row_tail",
+        clause: "row_tail_reads",
         why: "the rows past the last read past the weights window",
         edits: &[(ROW_POINTER, ROW_POINTER_RAW, 2), (EARLY_RETURN, "", 2)],
     },

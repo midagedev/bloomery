@@ -42,9 +42,11 @@ unsafe impl ThreadSafe for dyn MTLSharedEvent {}
 /// A Metal object of a thread-safe protocol, shared across threads.
 pub(crate) struct Handle<T: ?Sized + ThreadSafe>(pub(crate) Retained<ProtocolObject<T>>);
 
-// SAFETY: `T: ThreadSafe` states the protocol is documented thread-safe.
+// SAFETY: `T: ThreadSafe` states the protocol is documented thread-safe, so the
+// object may be released and used from any thread.
 unsafe impl<T: ?Sized + ThreadSafe> Send for Handle<T> {}
-// SAFETY: as above.
+// SAFETY: `T: ThreadSafe` states the protocol's methods may be called from
+// several threads at once, which is what sharing the handle by reference does.
 unsafe impl<T: ?Sized + ThreadSafe> Sync for Handle<T> {}
 
 impl<T: ?Sized + ThreadSafe> Clone for Handle<T> {
