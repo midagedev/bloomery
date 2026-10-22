@@ -79,7 +79,9 @@ inline void q6k_matvec_body(device const block_q6_K * W,
 
     for (int i = ix; i < nb; i += 2) {
         device const float * yb = x + i * QK_K + y_offset;
-        device const float * gb = gain + i * QK_K + y_offset;
+        // The gain is bound by the norm entry only: the others form no pointer
+        // from it.
+        device const float * gb = NORM ? gain + i * QK_K + y_offset : gain;
 
         for (short l = 0; l < 4; ++l) {
             float a0 = yb[l +  0];
@@ -140,7 +142,12 @@ inline void q6k_matvec_body(device const block_q6_K * W,
             sum_all *= scale;
         }
         if (tiisg == 0) {
-            if (RESID) {
+            // A row the scaled sum leaves not finite (a gain or a weight that is
+            // not finite) raises the norm site and is NaN, not a plausible value.
+            if (NORM && !isfinite(sum_all)) {
+                raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+                y[first_row + row] = NAN;
+            } else if (RESID) {
                 y[first_row + row] += sum_all;
             } else {
                 y[first_row + row] = sum_all;

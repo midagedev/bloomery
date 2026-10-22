@@ -84,7 +84,9 @@ inline void q4k_matvec_body(device const block_q4_K * W,
 
     const int y_offset = ix * QK_K + 64 * iq + 8 * ir;
     device const float * y4 = x + y_offset;
-    device const float * g4 = gain + y_offset;
+    // The gain is bound by the norm entry only: the others form no pointer
+    // from it.
+    device const float * g4 = NORM ? gain + y_offset : gain;
 
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
@@ -144,7 +146,9 @@ inline void q4k_matvec_body(device const block_q4_K * W,
         }
 
         y4 += 4 * QK_K;
-        g4 += 4 * QK_K;
+        if (NORM) {
+            g4 += 4 * QK_K;
+        }
     }
 
     float scale = 1.f;
@@ -168,7 +172,12 @@ inline void q4k_matvec_body(device const block_q4_K * W,
             sum_all *= scale;
         }
         if (tiisg == 0) {
-            if (RESID) {
+            // A row the scaled sum leaves not finite (a gain or a weight that is
+            // not finite) raises the norm site and is NaN, not a plausible value.
+            if (NORM && !isfinite(sum_all)) {
+                raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+                y[first_row + row] = NAN;
+            } else if (RESID) {
                 y[first_row + row] += sum_all;
             } else {
                 y[first_row + row] = sum_all;

@@ -13,22 +13,27 @@
 //!    are refused by name.
 //! 4. **sync_bound_named**: a sync and an event wait that outlast their bound
 //!    are refused by name, and a host event is done only once signalled.
-//! 5. **event_values_rise**: the events one stream records rise in value.
-//! 6. **queue_overlap**: whether two command buffers of one queue overlap on
+//! 5. **sync_two_waiters**: two threads waiting on one held stream at once,
+//!    neither's wait ends before the host event opens, and both return `Ok`
+//!    after it.
+//! 6. **event_values_rise**: the events one stream records rise in value.
+//! 7. **queue_overlap**: whether two command buffers of one queue overlap on
 //!    this machine; it reports the answer and passes either way.
-//! 7. **arith_matches_host**: a fused multiply-add and a multiply and add
+//! 8. **arith_matches_host**: a fused multiply-add and a multiply and add
 //!    rounded apart are the host's bits.
-//! 8. **metallib_equals_source**: the metallib's output and the source's
+//! 9. **metallib_equals_source**: the metallib's output and the source's
 //!    output are the same bits, when both paths exist.
-//! 9. **census_driver**: the census names an integrated device whose total is
-//!    the driver's working set and no more than the machine's memory.
-//! 10. **macos_floor**: a macOS below 26.2 is refused by name.
+//! 10. **census_driver**: the census names an integrated device whose total is
+//!     the driver's working set and no more than the machine's memory.
+//! 11. **macos_floor**: a macOS below 26.2 is refused by name.
 
 use core::sync::atomic::Ordering;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use bloomery_device::conformance::{self, Clause, Harness, Hold, Report, Verdict, why};
+use bloomery_device::conformance::{
+    self, Clause, Harness, Hold, Report, Verdict, expect_range, why,
+};
 use bloomery_device::{
     Buffer, Census, Device, DeviceError, Elems, Event, FaultSite, Shared, Stream, Window,
     WindowMut, check_len,
@@ -207,9 +212,6 @@ impl Harness for MetalHarness {
     }
 }
 
-/// A refusal is a range refusal of `what` whose text holds `needle`.
-use conformance::expect_range;
-
 fn encoder_refusals(device: &MetalDevice) -> Clause {
     let stream = device.stream();
     let pipeline = device.pipeline("copy_f32").map_err(why)?;
@@ -304,6 +306,63 @@ fn sync_bound_named(h: &MetalHarness) -> Clause {
     held?;
     if !gate.event().done().map_err(why)? {
         return Err("a signalled host event is not done".to_string());
+    }
+    stream.sync_for(Duration::from_secs(10)).map_err(why)?;
+    Ok(Verdict::Pass)
+}
+
+/// Two threads wait on one held stream at once: neither's wait ends before
+/// the host event opens, and both return `Ok` after it (the wait holds the
+/// stream's lock, and a thread queued behind another thread's wait gives up
+/// by name at its own bound).
+fn sync_two_waiters(h: &MetalHarness) -> Clause {
+    let device = &h.device;
+    let stream = device.new_stream().map_err(why)?;
+    let src = device.upload(&stream, &[1.0f32]).map_err(why)?;
+    let mut dst = device.zeroed::<f32>(&stream, Elems(1)).map_err(why)?;
+    let gate = HostEvent::new(device).map_err(why)?;
+    stream.wait(gate.event()).map_err(why)?;
+    h.copy_f32(
+        &stream,
+        src.whole().map_err(why)?,
+        dst.whole_mut().map_err(why)?,
+    )
+    .map_err(why)?;
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (wait_tx, wait_rx) = std::sync::mpsc::channel::<(Result<(), DeviceError>, Instant)>();
+    let waiter = &stream;
+    let (opened, waits) = std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let (ready_tx, wait_tx) = (ready_tx.clone(), wait_tx.clone());
+            scope.spawn(move || {
+                ready_tx.send(()).ok();
+                let done = waiter.sync_for(Duration::from_secs(10));
+                let _ = wait_tx.send((done, Instant::now()));
+            });
+        }
+        drop((ready_tx, wait_tx));
+        // Both waiters are in their wait; hold the work a moment longer.
+        for _ in 0..2 {
+            ready_rx.recv().ok();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let opened = Instant::now();
+        gate.signal();
+        let waits = (0..2)
+            .map(|_| wait_rx.recv().ok())
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        (opened, waits)
+    });
+    if waits.len() != 2 {
+        return Err("a waiter did not answer".to_string());
+    }
+    for (done, at) in waits {
+        done.map_err(|e| format!("a waiter failed once the gate was open: {e}"))?;
+        if at < opened {
+            return Err("a wait ended Ok before the host event opened".to_string());
+        }
     }
     stream.sync_for(Duration::from_secs(10)).map_err(why)?;
     Ok(Verdict::Pass)
@@ -559,6 +618,7 @@ pub fn main() -> ExitCode {
     let device = &harness.device;
     report.clause("encoder_refusals", encoder_refusals(device));
     report.clause("sync_bound_named", sync_bound_named(&harness));
+    report.clause("sync_two_waiters", sync_two_waiters(&harness));
     report.clause("event_values_rise", event_values_rise(device));
     report.clause("queue_overlap", queue_overlap(&harness));
     report.clause("arith_matches_host", arith_matches_host(device));

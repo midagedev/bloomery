@@ -1,14 +1,17 @@
 //! The clauses of the qwen35moe kernels' gate.
 
+use std::process::Command;
+
+use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, Elems};
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::kernels::{EmbedParams, MatvecParams, Mode, NormOnLoad, Quant};
+use bloomery_metal::kernels::{BLOCK_VALUES, EmbedParams, MatvecParams, Mode, NormOnLoad, Quant};
 use bloomery_metal::stream::MetalStream;
 use gguf::quant::GgmlType;
 
 use super::oracle::{self, Fixture, Kind};
-use super::{Clause, Harness, Launch, ModeSpec, SENTINEL_BITS, Verdict, why};
+use super::{Harness, Launch, ModeSpec, SENTINEL_BITS, flag};
 
 /// The layer the clauses launch in: a model layer, so a raise is told apart
 /// from a launch that names none.
@@ -104,8 +107,8 @@ fn run_checked(h: &Harness<'_>, launch: &Launch<'_>) -> Result<f64, String> {
     if let Some(fault) = h.fault()? {
         return Err(format!("the launch raised {fault}"));
     }
-    let factor = oracle::band_factor(launch.quant, launch.cols / 256, kind);
-    oracle::check(&got, &reference, factor, kind, base)
+    let band = oracle::band(launch.quant, launch.cols / BLOCK_VALUES, kind);
+    oracle::check(&got, &reference, band, kind, base)
 }
 
 fn sentinel_rows(rows: usize) -> Vec<f32> {
@@ -382,7 +385,7 @@ pub fn row_tail(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             rows: 8192,
         };
         let all = t.bytes(fixture)?;
-        let row_bytes = 2048 / 256 * quant.block_bytes();
+        let row_bytes = 2048 / BLOCK_VALUES * quant.block_bytes();
         let x = oracle::activations(2048, 0x4B60, 1.0);
         for rows in counts {
             run_checked(
@@ -403,6 +406,110 @@ pub fn row_tail(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     Ok(Verdict::Noted(format!(
         "{} row counts per type, every row written, no word past the last",
         counts.len()
+    )))
+}
+
+/// What a child run of the gate under Metal's shader validation said on
+/// stderr.
+struct Validated {
+    /// Whether the validation layer announced itself.
+    started: bool,
+    /// How many accesses it reported.
+    reports: usize,
+    /// The first report's lines, for a clause that fails on it.
+    first: String,
+    /// The child's own verdict and last words.
+    exit: Result<(), String>,
+}
+
+/// The gate's own binary, run as `--child row_tail` with Metal's shader
+/// validation on (its reports go to stderr), beside the gate's own `--fixture`
+/// and a `--mutant` when one is named.
+fn row_tail_under_validation(args: &[String], mutant: Option<&str>) -> Result<Validated, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("the gate's own path: {e}"))?;
+    let mut child = Command::new(exe);
+    child.args(["--child", "row_tail"]);
+    if let Some(path) = flag(args, "--fixture") {
+        child.args(["--fixture", path]);
+    }
+    if let Some(name) = mutant {
+        child.args(["--mutant", name]);
+    }
+    child
+        .env("MTL_SHADER_VALIDATION", "1")
+        .env("MTL_SHADER_VALIDATION_GLOBAL_MEMORY", "1")
+        .env("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1")
+        .env("MTL_SHADER_VALIDATION_ENABLE_VERBOSE_LOGGING", "1");
+    let out = child
+        .output()
+        .map_err(|e| format!("the child gate did not start: {e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let first = stderr
+        .split("=====")
+        .find(|block| block.contains("Invalid Metal usage"))
+        .map(|block| {
+            block
+                .lines()
+                .filter(|l| !l.is_empty())
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_default();
+    Ok(Validated {
+        started: stderr.contains("Metal GPU Validation Enabled"),
+        reports: stderr.matches("Invalid Metal usage").count(),
+        first,
+        exit: if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the child exited {}: {}",
+                out.status,
+                stdout.lines().last().unwrap_or("no output")
+            ))
+        },
+    })
+}
+
+/// No launch of `row_tail` reads outside its weights' buffer. The reads of the
+/// rows past the last are never stored, so no output shows them; only Metal's
+/// shader validation reports an access outside a buffer, and it must be on
+/// when the process starts, so the launches run in child gates. The rows are
+/// wider than the buffer's padding after the window, so a read of the row past
+/// the last leaves the buffer.
+///
+/// The control: the same child with the `tail_read` mutant, which reads those
+/// rows, must be reported; a layer that reports nothing there checked nothing,
+/// and the clause is red, not green.
+pub fn row_tail_reads(args: &[String]) -> Clause {
+    let control = row_tail_under_validation(args, Some("tail_read"))?;
+    if !control.started || control.reports == 0 {
+        return Err(format!(
+            "shader validation {} for the control, a kernel that reads past its weights: nothing \
+             was checked",
+            if control.started {
+                "reported nothing"
+            } else {
+                "did not start"
+            }
+        ));
+    }
+    let own = row_tail_under_validation(args, flag(args, "--mutant"))?;
+    if !own.started {
+        return Err("shader validation did not start: nothing was checked".to_string());
+    }
+    if own.reports > 0 {
+        return Err(format!(
+            "{} accesses outside a buffer reported, the first: {}",
+            own.reports, own.first
+        ));
+    }
+    own.exit?;
+    Ok(Verdict::Noted(format!(
+        "no report in the row-tail launches, {} for the control",
+        control.reports
     )))
 }
 
@@ -530,7 +637,9 @@ fn run_embed(
     };
     h.encode(|encoder| h.kernels.embed(encoder, params))?;
     let mut rows = vec![0f32; ids.len() * 2048];
-    out.read(stream, &mut rows).map_err(why)?;
+    device
+        .read(stream, out.whole().map_err(why)?, &mut rows)
+        .map_err(why)?;
     let fault = h.fault()?;
     h.clear_fault()?;
     Ok((rows, fault))
@@ -595,12 +704,55 @@ pub fn embed(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             ));
         }
     }
+    embed_refuses_an_odd_table(h)?;
     Ok(Verdict::Noted(format!(
-        "{} ids bit-equal to the reader, ids {} and {} raised token_id with NaN rows",
+        "{} ids bit-equal to the reader, ids {} and {} raised token_id with NaN rows, a table at an odd byte refused",
         good.len(),
         vocab,
         u32::MAX
     )))
+}
+
+/// A table window that starts at an odd byte offset is refused by name, and
+/// nothing is encoded for it: the kernel reads the table as 16-bit words.
+fn embed_refuses_an_odd_table(h: &Harness<'_>) -> Result<(), String> {
+    let (device, stream) = (h.device, h.stream);
+    let (vocab, cols) = (2usize, 2048usize);
+    let bytes = vocab * cols / BLOCK_VALUES * Quant::Q4K.block_bytes();
+    let table = device.upload(stream, &vec![0u8; bytes + 1]).map_err(why)?;
+    let ids = device.upload(stream, &[0u32]).map_err(why)?;
+    let mut out = device.upload(stream, &vec![1f32; cols]).map_err(why)?;
+    let refused = h.encode(|encoder| {
+        h.kernels.embed(
+            encoder,
+            EmbedParams {
+                table: table.window(Elems(1), Elems(bytes))?,
+                vocab,
+                cols,
+                ids: ids.window(Elems(0), Elems(1))?,
+                out: out.window_mut(Elems(0), Elems(cols))?,
+                fault: device.fault_word(),
+                layer: LAYER,
+            },
+        )
+    });
+    match refused {
+        Ok(()) => return Err("a table at an odd byte offset was accepted".to_string()),
+        Err(text) if !text.contains("16-bit words") => {
+            return Err(format!(
+                "a table at an odd byte offset was refused without naming the 16-bit words: {text}"
+            ));
+        }
+        Err(_) => {}
+    }
+    let mut back = vec![0f32; cols];
+    device
+        .read(stream, out.whole().map_err(why)?, &mut back)
+        .map_err(why)?;
+    if back.iter().any(|&v| v != 1.0) {
+        return Err("a refused embed wrote".to_string());
+    }
+    Ok(())
 }
 
 /// One launch the host module must refuse: the shape it is told, the length of
@@ -610,6 +762,8 @@ struct Refusal {
     rows: usize,
     cols: usize,
     weights: usize,
+    /// The element the weights' window starts at in its buffer.
+    weights_at: usize,
     x: usize,
     y: usize,
     gain: Option<usize>,
@@ -621,7 +775,7 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
     let stream = h.stream;
     let rows = 8usize;
     let cols = 512usize;
-    let bytes = rows * cols / 256 * Quant::Q4K.block_bytes();
+    let bytes = rows * cols / BLOCK_VALUES * Quant::Q4K.block_bytes();
     let weights = device.upload(stream, &vec![0u8; bytes + 64]).map_err(why)?;
     let x = device.upload(stream, &vec![0f32; cols + 4]).map_err(why)?;
     let mut y = device.upload(stream, &vec![1f32; rows + 4]).map_err(why)?;
@@ -632,6 +786,7 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
         rows,
         cols,
         weights: bytes,
+        weights_at: 0,
         x: cols,
         y: rows,
         gain: None,
@@ -648,6 +803,12 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
             what: "a long weights window",
             weights: bytes + 1,
             needle: "weights",
+            ..whole
+        },
+        Refusal {
+            what: "weights at an odd byte offset",
+            weights_at: 1,
+            needle: "16-bit words",
             ..whole
         },
         Refusal {
@@ -710,7 +871,7 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
                     quant: Quant::Q4K,
                     rows: case.rows,
                     cols: case.cols,
-                    weights: weights.window(Elems(0), Elems(case.weights))?,
+                    weights: weights.window(Elems(case.weights_at), Elems(case.weights))?,
                     x: x.window(Elems(0), Elems(case.x))?,
                     y: y.window_mut(Elems(0), Elems(case.y))?,
                     mode,
@@ -729,11 +890,39 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
         }
     }
     let mut back = vec![0f32; rows + 4];
-    y.read(stream, &mut back).map_err(why)?;
+    device
+        .read(stream, y.whole().map_err(why)?, &mut back)
+        .map_err(why)?;
     if back.iter().any(|&v| v != 1.0) {
         return Err(format!("a refused launch wrote: {back:?}"));
     }
     Ok(Verdict::Noted(format!(
         "{count} refusals, each by name, nothing written"
     )))
+}
+
+/// The block shape the kernels are written for is gguf's own row for each
+/// type: this crate keeps a second copy of the two numbers (the launch's
+/// shape arithmetic), and the clause holds it to the first.
+pub fn block_shape() -> Clause {
+    for (quant, ty) in [(Quant::Q4K, GgmlType::Q4_K), (Quant::Q6K, GgmlType::Q6_K)] {
+        if Some(quant.block_bytes() as u64) != ty.type_size() {
+            return Err(format!(
+                "{} blocks are {} bytes here and {:?} in gguf",
+                quant.name(),
+                quant.block_bytes(),
+                ty.type_size()
+            ));
+        }
+        if Some(BLOCK_VALUES as u64) != ty.blck_size() {
+            return Err(format!(
+                "{} blocks hold {BLOCK_VALUES} values here and {:?} in gguf",
+                quant.name(),
+                ty.blck_size()
+            ));
+        }
+    }
+    Ok(Verdict::Noted(
+        "Q4_K and Q6_K block bytes and values are gguf's".to_string(),
+    ))
 }

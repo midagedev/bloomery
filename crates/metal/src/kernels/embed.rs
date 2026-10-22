@@ -8,7 +8,7 @@ use crate::fault::MetalFaultWord;
 
 use super::geometry::BLOCK_VALUES;
 use super::matvec::Quant;
-use super::{Kernels, args_bytes, check_len, word};
+use super::{Kernels, args_bytes, check_window_len, word};
 
 /// The threads in an embedding's threadgroup.
 const GROUP_THREADS: usize = 256;
@@ -25,9 +25,10 @@ pub struct EmbedParams<'w> {
     pub ids: Window<'w, u32, MetalDevice>,
     /// The output: `ids.len() * cols` values, row `t` the embedding of `ids[t]`.
     pub out: WindowMut<'w, f32, MetalDevice>,
-    /// The fault word a raise lands in.
+    /// The fault word a raise lands in. Metal's own type, as
+    /// [`NormOnLoad::fault`](super::NormOnLoad) is.
     pub fault: &'w MetalFaultWord,
-    /// The layer a raise is recorded in.
+    /// The layer a raise is recorded in: the caller's.
     pub layer: u32,
 }
 
@@ -68,12 +69,12 @@ impl Kernels {
             .checked_mul(nblocks)
             .and_then(|blocks| blocks.checked_mul(Quant::Q4K.block_bytes()))
             .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.vocab, p.cols)))?;
-        check_len("embed", "table", p.table.len(), table_bytes)?;
+        check_window_len("embed", "table", p.table.len(), table_bytes)?;
         let values = count
             .checked_mul(p.cols)
             .ok_or_else(|| refuse(format!("{count} ids of {} columns wrap", p.cols)))?;
-        check_len("embed", "out", p.out.len(), values)?;
-        let start = p.table.raw().base().get() + p.table.byte_range()?.start.get();
+        check_window_len("embed", "out", p.out.len(), values)?;
+        let start = p.table.byte_range()?.start.get();
         if !start.is_multiple_of(2) {
             return Err(refuse(format!(
                 "the table starts {start} bytes into its buffer: the kernel reads 16-bit words"

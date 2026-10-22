@@ -84,9 +84,11 @@ pub(crate) fn word(what: &'static str, name: &str, n: usize) -> Result<u32, Devi
     })
 }
 
-/// A window's length against the length the shape needs, refused by name when
-/// they differ.
-pub(crate) fn check_len(
+/// A kernel window's length against the length the launch's shape needs,
+/// refused by name when they differ: `name` says which window. (The
+/// contract's [`bloomery_device::check_len`] is the other rule: a host slice
+/// against the window it is copied to or from.)
+pub(crate) fn check_window_len(
     what: &'static str,
     name: &str,
     got: bloomery_device::Elems,

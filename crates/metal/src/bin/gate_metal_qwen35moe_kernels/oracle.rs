@@ -5,6 +5,10 @@
 //! # The band
 //!
 //! PIN(2026-10-22): the model below, and no measured error, sets the band.
+//! (Re-derived the same day, before landing: the scale's `(1 + t)^(-1/2)` is
+//! taken exactly, where it was taken to first order with a 1 % margin, and the
+//! absolute floor counts its path's operations, where it was a count with no
+//! derivation. The norm band narrowed by under half a percent.)
 //!
 //! Every f32 operation rounds once to nearest: `fl(a . b) = (a . b)(1 + d)`,
 //! `|d| <= U = 2^-24`. A term of a sum that passes through `n` rounding
@@ -37,11 +41,21 @@
 //! the sum of squares in the kernel's own order (a square, two adds, the lane's
 //! chain of `8 ceil(nb / 4)` adds for Q4_K or `4 ceil(nb / 2)` for Q6_K, the
 //! 31 adds of the SIMD group), then the division and the addition. `s` is off
-//! by `(1 + t)^(-1/2)` for `t = G(nS + 2)`, and by the library `rsqrt`'s own
-//! error, taken as `RSQRT_ULP` units in the last place (2 ulp = 4U). The
-//! `RSQRT_ULP` premise is `[unverified]`: no source for Metal's `rsqrt` bound
-//! was read, so it is the first term to question when the norm clause misses.
+//! by at most `(1 - t)^(-1/2) - 1` for `t = G(nS + 2)` (the worse direction),
+//! and by the library `rsqrt`'s own error, taken as `RSQRT_ULP` units in the
+//! last place (2 ulp = 4U). The `RSQRT_ULP` premise is `[unverified]`: no source
+//! for Metal's `rsqrt` bound was read, so it is the first term to question when
+//! the norm clause misses. Its weight: at the widest norm the gate runs
+//! (K = 4096, Q4_K), the term is 4U of about 88U in the norm's band factor, so
+//! 4 ulp in place of 2 widens the norm band by about 5 % and moves no other
+//! clause.
 //! The band is on `sum_c M_c |x_hat_c|`, `x_hat = x * gain * s` in f64.
+//!
+//! **Floor.** A result below the smallest normal `f32::MIN_POSITIVE` may be
+//! flushed to zero (the hardware's choice, not read here): an absolute error of
+//! at most that per operation of the path, which the relative bound does not
+//! cover. The gate's operands are not that small, so the floor only keeps a row
+//! whose terms all vanish from being held to a band of zero.
 //!
 //! **Residual** adds the final `y + dot`: one rounding of the sum, `U |y|`.
 //!
@@ -78,26 +92,44 @@ pub enum Kind {
     Residual,
 }
 
-/// The relative factor of the band for a mat-vec of `quant` over `nblocks`
-/// blocks of columns (the derivation above).
-pub fn band_factor(quant: Quant, nblocks: usize, kind: Kind) -> f64 {
+/// What a mat-vec's band is made of (the derivation above): the relative
+/// factor of the sum of the terms' magnitudes, and the operations of the
+/// longest path, which set the absolute floor.
+#[derive(Clone, Copy, Debug)]
+pub struct Band {
+    factor: f64,
+    ops: usize,
+}
+
+/// The band of a mat-vec of `quant` over `nblocks` blocks of columns.
+pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
     let (lane_blocks, base) = match quant {
         Quant::Q4K => (nblocks.div_ceil(4), 13),
         Quant::Q6K => (nblocks.div_ceil(2), 9),
     };
     let n_store = base + lane_blocks + SIMD_SUM_DEPTH;
     match kind {
-        Kind::Store | Kind::Residual => gamma(n_store),
+        Kind::Store | Kind::Residual => Band {
+            factor: gamma(n_store),
+            ops: n_store,
+        },
         Kind::Norm => {
             let chain = match quant {
                 Quant::Q4K => 8 * lane_blocks,
                 Quant::Q6K => 4 * lane_blocks,
             };
             let n_s = 1 + 2 + chain + SIMD_SUM_DEPTH;
-            let theta_s = 0.5 * 1.01 * gamma(n_s + 2) + RSQRT_ULP * 2.0 * U;
+            // The scale's argument is off by at most `t` relative, so the
+            // scale by at most (1 - t)^(-1/2) - 1 (the worse direction); the
+            // library's rsqrt adds its own.
+            let t = gamma(n_s + 2);
+            let theta_s = (1.0 - t).powf(-0.5) - 1.0 + RSQRT_ULP * 2.0 * U;
             // The gain product joins the path, and the scale product ends it.
             let g = gamma(n_store + 2);
-            theta_s + g + theta_s * g
+            Band {
+                factor: theta_s + g + theta_s * g,
+                ops: n_s + 2 + n_store + 2,
+            }
         }
     }
 }
@@ -201,7 +233,7 @@ fn residual_term(kind: Kind, total: f64) -> f64 {
 pub fn check(
     got: &[f32],
     reference: &Reference,
-    factor: f64,
+    band: Band,
     kind: Kind,
     base: Option<&[f32]>,
 ) -> Result<f64, String> {
@@ -212,19 +244,20 @@ pub fn check(
             reference.y.len()
         ));
     }
-    let floor = (SIMD_SUM_DEPTH + 64) as f64 * f64::from(f32::MIN_POSITIVE);
+    let floor = band.ops as f64 * f64::from(f32::MIN_POSITIVE);
     let mut worst = 0f64;
     for (r, &got) in got.iter().enumerate() {
         let carried = base.map_or(0.0, |b| f64::from(b[r]));
         let want = carried + reference.y[r];
-        let band = factor * reference.magnitude[r] * (1.0 + U) + residual_term(kind, want) + floor;
+        let width =
+            band.factor * reference.magnitude[r] * (1.0 + U) + residual_term(kind, want) + floor;
         let err = (f64::from(got) - want).abs();
-        if !got.is_finite() || err > band {
+        if !got.is_finite() || err > width {
             return Err(format!(
-                "row {r}: got {got:e}, want {want:e}, error {err:e} over the band {band:e}"
+                "row {r}: got {got:e}, want {want:e}, error {err:e} over the band {width:e}"
             ));
         }
-        worst = worst.max(err / band);
+        worst = worst.max(err / width);
     }
     Ok(worst)
 }

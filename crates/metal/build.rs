@@ -42,9 +42,10 @@ fn fault_sites_header() -> String {
          #define BLOOMERY_LAYER_NONE {}u\n\
          #define BLOOMERY_FAULT_WORDS {}u\n\
          // The word a raise stores: the layer above the site.\n\
-         #define BLOOMERY_FAULT_WORD(layer, site) (((layer) << 8) | (site))\n",
+         #define BLOOMERY_FAULT_WORD(layer, site) (((layer) << {}) | (site))\n",
         bloomery_device::fault::LAYER_NONE,
-        bloomery_device::fault::FAULT_WORDS
+        bloomery_device::fault::FAULT_WORDS,
+        bloomery_device::fault::LAYER_SHIFT
     ));
     out
 }

@@ -21,28 +21,23 @@ use bloomery_device::{
 use crate::device::{MetalDevice, buffer_options};
 use crate::handle::Handle;
 
-/// A buffer as a Metal kernel binds it: the buffer and the byte offset of its
-/// own start inside its backing store. The window that carries it keeps the
-/// buffer borrowed.
+/// A buffer as a Metal kernel binds it: the buffer itself. A window's byte
+/// offset is the offset into this buffer, since every window is cut from the
+/// buffer it names; the window that carries the raw keeps the buffer borrowed.
 #[derive(Clone, Copy)]
 pub struct MetalRaw {
     buffer: NonNull<ProtocolObject<dyn MTLBuffer>>,
-    base: Bytes,
 }
 
 // SAFETY: the pointer addresses an `MTLBuffer`, a resource Apple documents as
 // usable from several threads; the window that holds the raw keeps the buffer
 // borrowed, so the pointer stays valid wherever the window goes.
 unsafe impl Send for MetalRaw {}
-// SAFETY: as above.
+// SAFETY: the same pointer, to the same documented-thread-safe `MTLBuffer`; a
+// shared reference to it grants nothing a copy of it does not.
 unsafe impl Sync for MetalRaw {}
 
 impl MetalRaw {
-    /// The byte offset of the buffer's own start inside its backing store.
-    pub(crate) fn base(&self) -> Bytes {
-        self.base
-    }
-
     /// The buffer, for as long as the window `self` was lent by is borrowed.
     ///
     /// # Safety
@@ -67,14 +62,7 @@ impl MetalRaw {
         at: Bytes,
         len: Elems,
     ) -> Result<HostPages<T>, DeviceError> {
-        let offset = self
-            .base
-            .get()
-            .checked_add(at.get())
-            .ok_or_else(|| DeviceError::Range {
-                what: "window",
-                detail: "the window's byte offset wraps".to_string(),
-            })?;
+        let offset = at.get();
         // SAFETY: the caller's contract: the buffer lives while `&self` is
         // held.
         let contents = unsafe { self.buffer() }.contents().cast::<u8>();
@@ -161,11 +149,10 @@ impl<T: Elem> MetalBuffer<T> {
         &self.pages
     }
 
-    /// The window's raw: the buffer and its base offset.
+    /// The window's raw: the buffer.
     fn raw(&self) -> MetalRaw {
         MetalRaw {
             buffer: NonNull::from(&*self.buffer),
-            base: Bytes::ZERO,
         }
     }
 }
@@ -191,8 +178,9 @@ impl<T: Elem> Buffer<T> for MetalBuffer<T> {
         len: Elems,
     ) -> Result<WindowMut<'_, T, MetalDevice>, DeviceError> {
         check_window("buffer", self.len(), at, len)?;
-        // SAFETY: as in `window`, and the exclusive borrow of the buffer
-        // outlives the window.
+        // SAFETY: the raw is the buffer's own pages, which hold `at + len`
+        // elements of `T` (checked above), and the exclusive borrow of the
+        // buffer outlives the window.
         Ok(unsafe { WindowMut::from_raw(self.raw(), at, len) })
     }
 }
