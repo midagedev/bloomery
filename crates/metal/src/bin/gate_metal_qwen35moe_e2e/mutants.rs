@@ -53,6 +53,17 @@ pub const MUTANTS: &[Mutant] = &[
             1,
         )],
     },
+    Mutant {
+        name: "merge_first_segment",
+        clause: "f_deep",
+        why: "the merge folds the first segment's partial alone, so every live key \
+              past one segment misses from the output",
+        edits: &[(
+            "for (uint seg = 0u; seg < args.segments; ++seg) {",
+            "for (uint seg = 0u; seg < 1u; ++seg) {",
+            1,
+        )],
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static Mutant> {
