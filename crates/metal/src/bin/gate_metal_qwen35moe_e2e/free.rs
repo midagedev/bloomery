@@ -16,7 +16,7 @@
 //! the step it reads.
 
 use bloomery_device::conformance::{Clause, Verdict};
-use bloomery_metal::arch::qwen3moe::session::{Node, Op, Session};
+use bloomery_metal::arch::qwen3moe::session::{Node, Op, Session, StepMode};
 use bloomery_metal::kernels::{ROUTED_IDS, router};
 
 use super::flip::{self, RouteFlip, held_rows, picks_its_top, rel_to, router_tie, worse};
@@ -100,7 +100,7 @@ pub fn a_free(s: &mut Session) -> Clause {
     s.reset().map_err(says)?;
     let mut plain_ids = Vec::with_capacity(t_n);
     for &tok in &toks {
-        plain_ids.push(s.step(tok).map_err(says)?.id);
+        plain_ids.push(s.step(tok, StepMode::HostFed).map_err(says)?.id);
     }
     let plain_logits = s.probe().map_err(says)?.read(Node::Logits).map_err(says)?;
     let same_bits = plain_logits.len() == traced_logits.len()

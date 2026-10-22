@@ -17,7 +17,7 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
-use bloomery_metal::arch::qwen3moe::session::{Node, Op, Probe, Session, SessionError};
+use bloomery_metal::arch::qwen3moe::session::{Node, Op, Probe, Session, SessionError, StepMode};
 use bloomery_metal::kernels::{
     EXPERT_K, HEAD_COLS, PARTIALS_PER_HEAD, ROUTED_IDS, SHARED_SLOT, router,
 };
@@ -328,7 +328,7 @@ fn go(s: &mut Session) -> Result<(), String> {
     };
     s.reset().map_err(says)?;
     for &id in &prompt {
-        s.step(id).map_err(says)?;
+        s.step(id, StepMode::HostFed).map_err(says)?;
     }
     if s.pos() != pos {
         return Err(format!(

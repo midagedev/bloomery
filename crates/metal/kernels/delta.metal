@@ -15,12 +15,18 @@
 // value channel is the threadgroup that owns the column. Reads finish before
 // writes; the written slot is not a slot this token reads.
 //
-// A lane word at or past the lane count raises the lane site and does not
-// write the state. A lane whose state is not finite raises the same site and
-// writes NaN on that lane only; the other lanes of its column keep the state
-// they loaded. A conv, a norm, β or a decay that is not finite raises the
-// conv site and leaves the state. A non-finite output that is none of those
-// raises the delta site. Nothing here raises the gate site.
+// The state is read from the lane the word at `lane_at` names and written to
+// the lane the word at `lane_to` names. The two words may name one lane: the
+// step then updates it in place. Two lanes apart, the step leaves the lane it
+// read as it was.
+//
+// A lane word at or past the lane count, read or written, raises the lane
+// site and does not write the state. A lane whose state is not finite raises
+// the same site and writes NaN on that lane only; the other lanes of its
+// column write the state they loaded. A conv, a norm, β or a decay that is
+// not finite raises the conv site and does not write the state. A non-finite
+// output that is none of those raises the delta site. Nothing here raises the
+// gate site.
 
 #include <metal_stdlib>
 
@@ -28,18 +34,19 @@ using namespace metal;
 
 #pragma METAL fp contract(off)
 
-// The step's argument block, bound by value. Seven words: the epsilon is a float.
+// The step's argument block, bound by value. Eight words: the epsilon is a float.
 struct DeltaArgs {
     uint n_k;
     uint grouped; // 0 tiled (h % n_k), else grouped (h / (n_v / n_k))
     uint lanes;
-    uint lane_at;
+    uint lane_at; // the word of the lane the step reads
+    uint lane_to; // the word of the lane the step writes
     uint layer;
     uint pos;
     float eps;
 };
 
-static_assert(sizeof(DeltaArgs) == 28, "DeltaArgs is 28 bytes: the host packs seven words");
+static_assert(sizeof(DeltaArgs) == 32, "DeltaArgs is 32 bytes: the host packs eight words");
 static_assert(BLOOMERY_DELTA_HEAD_COLS / BLOOMERY_DELTA_COLUMN_BLOCKS == BLOOMERY_DELTA_COLS_PER_BLOCK,
               "a column block is the head divided by the block count");
 
@@ -210,7 +217,8 @@ kernel void gdn_step(device const float *x [[buffer(0)]],
     }
 
     uint word = lane_buf[args.lane_at];
-    bool lane_ok = word < lanes;
+    uint word_to = lane_buf[args.lane_to];
+    bool lane_ok = word < lanes && word_to < lanes;
 
     // The slot written once per channel. Reads use other slots.
     uint slot = pos % BLOOMERY_DELTA_RING_ROWS;
@@ -297,11 +305,13 @@ kernel void gdn_step(device const float *x [[buffer(0)]],
     float qq[16];
     bool lane_state_bad = false;
     uint base = 0u;
+    uint base_to = 0u;
     for (uint i = 0u; i < 16u; ++i) {
         s0[i] = 0.0f;
     }
     if (lane_ok) {
         base = ((word * n_v + h) * head + col) * head;
+        base_to = ((word_to * n_v + h) * head + col) * head;
         for (uint i = 0u; i < 16u; ++i) {
             s0[i] = state[base + key_of(j, i)];
             if (!isfinite(s0[i])) {
@@ -366,19 +376,19 @@ kernel void gdn_step(device const float *x [[buffer(0)]],
         if (lane_state_bad) {
             for (uint i = 0u; i < 16u; ++i) {
                 uint key = key_of(j, i);
-                state[base + key] = NAN;
+                state[base_to + key] = NAN;
             }
             raise(faults, layer, BLOOMERY_FAULT_SITE_DELTA_LANE);
         } else {
             for (uint i = 0u; i < 16u; ++i) {
                 uint key = key_of(j, i);
-                state[base + key] = s0[i];
+                state[base_to + key] = s0[i];
             }
         }
     } else {
         for (uint i = 0u; i < 16u; ++i) {
             uint key = key_of(j, i);
-            state[base + key] = sp[i];
+            state[base_to + key] = sp[i];
         }
         if (j == 0u && !isfinite(o)) {
             raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_DELTA);

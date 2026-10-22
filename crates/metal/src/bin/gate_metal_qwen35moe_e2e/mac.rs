@@ -4,16 +4,22 @@
 //! the fixture family runs (`refset::fixture::first_shard`), the file its
 //! reference sets were dumped from, and every clause starts from its reset:
 //!
-//! - `d_count`: every step of a depth within one segment of keys encodes the
-//!   groups and dispatches `count::token_count` gives (one barrier between
-//!   groups), the device's allocated size is the same before and after those
-//!   steps (the step allocates nothing on the device), and the host's
-//!   allocation calls, read as a difference around the step (the first step,
+//! - `d_count`: host-fed, then in chain steps, every step of a depth within
+//!   one segment of keys encodes the groups and dispatches
+//!   `count::token_count` gives (one barrier between groups) and waits once;
+//!   the device's allocated size is the same before and after those steps
+//!   (the step allocates nothing on the device), and the host's allocation
+//!   calls, read as a difference around the step (each run's first step,
 //!   which may warm the driver's paths, aside), are none in every steady
-//!   step. It prints the step's wall per token, host-fed and waited.
+//!   step. The chain's last call, at the cache's last row, commits nothing
+//!   ahead. It prints the step's wall per token in both modes.
 //! - `e_token_id`: an id past the vocabulary raises the token-id site at
 //!   layer 0 and poisons the session; the next step is refused by name; the
-//!   reset clears it and a step runs again.
+//!   reset clears it and a step runs again. The same in chain steps, where
+//!   the token ahead embeds the faulted token's pick: the fault is the
+//!   faulted token's, its position does not move, and after the reset chain
+//!   steps run clean past the dropped token's position.
+//! - `b_chain`, `c_resume`: the run-ahead clauses (`chain.rs`).
 //! - `a_free`: the batch set's tokens host-fed one at a time; every layer's
 //!   output over the rows ik kept within [`free::FREE_BAND`] of ik's, the
 //!   last position's argmax as the fixture tier takes it, the rows a
@@ -38,13 +44,15 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use bloomery_device::conformance::{Clause, Report, Verdict, why};
-use bloomery_device::fault::FaultSite;
+use bloomery_device::fault::{Fault, FaultSite};
 use bloomery_device::{Device, DeviceError};
 use bloomery_metal::arch::qwen3moe::count::{LiveKeys, Ticket, token_count};
-use bloomery_metal::arch::qwen3moe::session::{Session, SessionError};
+use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::library::Library;
 
+#[path = "chain.rs"]
+mod chain;
 #[path = "flip.rs"]
 mod flip;
 #[path = "free.rs"]
@@ -67,6 +75,10 @@ const CTX: usize = bloomery_metal::kernels::SEGMENT_KEYS;
 /// The token `d_count` and `e_token_id` start from: any id the vocabulary
 /// holds. Neither clause reads a reference set.
 const SEED: u32 = 0;
+
+/// The chain steps `e_token_id` runs after its reset: past the position of
+/// the token ahead the faulted step dropped.
+const CHAIN_AFTER_RESET: usize = 3;
 
 /// `--name VALUE`'s value.
 pub fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -131,93 +143,130 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-/// `d`: the token's count at every depth of one segment, and no allocation on
-/// either side of a steady step.
-fn d_count(s: &mut Session, device: &MetalDevice) -> Clause {
+/// One `d_count` run in `mode` from its reset to the cache's last row: every
+/// call's count and its one wait, and no host allocation in a steady call.
+/// The walls of the calls, in order.
+fn d_run(s: &mut Session, mode: StepMode) -> Result<Vec<Duration>, String> {
     s.reset().map_err(says)?;
     let want = token_count(s.token_layers(), LiveKeys::Within64, Ticket::Folded);
-    let before = device.info().map_err(why)?.free_bytes;
+    let (groups, dispatches) = (want.groups as usize, want.dispatches as usize);
     let mut walls: Vec<Duration> = Vec::with_capacity(s.ctx());
-    let mut host: Vec<u64> = Vec::with_capacity(s.ctx().saturating_sub(1));
     let mut id = SEED;
-    for step in 0..s.ctx() {
+    for call in 0..s.ctx() {
         let pos = s.pos();
+        let waits = s.stats().waits;
         let t = Instant::now();
         let calls0 = HOST_ALLOC_CALLS.load(Relaxed);
-        let stepped = s.step(id).map_err(says)?;
-        walls.push(t.elapsed());
+        let stepped = s.step(id, mode).map_err(says)?;
         let calls = HOST_ALLOC_CALLS.load(Relaxed) - calls0;
+        walls.push(t.elapsed());
+        let waits = s.stats().waits - waits;
         let c = stepped.count;
-        let (groups, dispatches) = (want.groups as usize, want.dispatches as usize);
         if c.groups != groups || c.dispatches != dispatches || c.barriers + 1 != c.groups {
             return Err(format!(
-                "position {pos}: {} groups, {} dispatches, {} barriers encoded; the count is \
-                 {groups} groups, {dispatches} dispatches, {} barriers",
+                "{mode:?} position {pos}: {} groups, {} dispatches, {} barriers encoded; the \
+                 count is {groups} groups, {dispatches} dispatches, {} barriers",
                 c.groups,
                 c.dispatches,
                 c.barriers,
                 groups - 1
             ));
         }
+        if waits != 1 {
+            return Err(format!(
+                "{mode:?} position {pos}: the step waited {waits} times; a step waits once"
+            ));
+        }
         // The first step may warm the driver's paths; a later one is steady
         // and must allocate nothing on the host.
-        if step > 0 {
-            host.push(calls);
-            if calls != 0 {
-                return Err(format!(
-                    "position {pos}: {calls} host allocation calls in the step; a steady \
-                     step allocates none"
-                ));
-            }
+        if call > 0 && calls != 0 {
+            return Err(format!(
+                "{mode:?} position {pos}: {calls} host allocation calls in the step; a steady \
+                 step allocates none"
+            ));
         }
         id = stepped.id;
     }
+    Ok(walls)
+}
+
+/// The median and the 90th percentile of `walls`, in ms.
+fn spread(mut walls: Vec<Duration>) -> (f64, f64) {
+    walls.sort_unstable();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let at = |q: usize| ms(walls[(walls.len() - 1) * q / 100]);
+    (at(50), at(90))
+}
+
+/// `d`: the token's count at every depth of one segment and one wait a step,
+/// host-fed and in chain steps, and no allocation on either side of a steady
+/// step.
+fn d_count(s: &mut Session, device: &MetalDevice) -> Clause {
+    let want = token_count(s.token_layers(), LiveKeys::Within64, Ticket::Folded);
+    let before = device.info().map_err(why)?.free_bytes;
+    let host = d_run(s, StepMode::HostFed)?;
+    let stats0 = s.stats();
+    let chain = d_run(s, StepMode::Chain)?;
+    let stats = chain::moved(s, stats0);
     let after = device.info().map_err(why)?.free_bytes;
     if after != before {
         return Err(format!(
             "the device's free bytes moved from {before} to {after} across {} steps: a step \
              allocated",
-            s.ctx()
+            2 * s.ctx()
         ));
     }
-    walls.sort_unstable();
-    let ms = |d: Duration| d.as_secs_f64() * 1e3;
-    let mid = walls[walls.len() / 2];
+    let ctx = s.ctx() as u64;
+    if stats.last_row != 1 || stats.ahead != ctx - 1 || stats.kept != ctx - 1 {
+        return Err(format!(
+            "{ctx} chain calls: {} tokens ahead, {} kept, {} at the last row; {} ahead, {} kept \
+             and 1 at the last row are expected",
+            stats.ahead,
+            stats.kept,
+            stats.last_row,
+            ctx - 1,
+            ctx - 1
+        ));
+    }
+    // Steady: the first call, which commits two tokens, and the chain's last,
+    // which commits none ahead, aside.
+    let (host_mid, host_p90) = spread(host[1..].to_vec());
+    let (chain_mid, chain_p90) = spread(chain[1..chain.len() - 1].to_vec());
     println!(
-        "d_count: step wall per token, host-fed and waited, {} steps: median {:.3} ms, min {:.3} \
-         ms, max {:.3} ms (development-loop number)",
-        walls.len(),
-        ms(mid),
-        ms(walls[0]),
-        ms(walls[walls.len() - 1])
+        "d_count: step wall per token, host-fed, {} steady steps: median {host_mid:.3} ms, p90 \
+         {host_p90:.3} ms (development-loop number)",
+        host.len() - 1
     );
-    let steady = host.iter().copied().max().unwrap_or(0);
     println!(
-        "d_count: host allocation calls per steady step ({} steps, the first aside): {steady}",
-        host.len()
+        "d_count: step wall per token, chain, {} steady calls: median {chain_mid:.3} ms, p90 \
+         {chain_p90:.3} ms (development-loop number)",
+        chain.len() - 2
     );
     Ok(Verdict::Noted(format!(
-        "{} steps at positions 0..{}: {} groups, {} dispatches, {} barriers each; device \
-         allocation unmoved; {steady} host allocation calls in every steady step",
-        s.ctx(),
-        s.ctx(),
+        "{ctx} steps at positions 0..{ctx}, host-fed and in chain steps: {} groups, {} \
+         dispatches, {} barriers and one wait each; device allocation unmoved; no host \
+         allocation call in a steady step; call {ctx} took the last-row rule",
         want.groups,
         want.dispatches,
         want.groups - 1
     )))
 }
 
-/// `e`: an id past the vocabulary raises the token-id site at layer 0, the
-/// session refuses the next step by name, and the reset clears it.
-fn e_token_id(s: &mut Session) -> Clause {
+/// The fault an id past the vocabulary raises in `mode`, held to the
+/// token-id site at layer 0, and the refusal by poison of the step after it.
+fn e_fault(s: &mut Session, mode: StepMode) -> Result<Fault, String> {
     s.reset().map_err(says)?;
     let bad = u32::try_from(s.vocab()).map_err(|_| "the vocabulary does not fit u32")?;
-    let fault = match s.step(bad) {
+    let fault = match s.step(bad, mode) {
         Err(SessionError::Fault(f)) => f,
-        Err(e) => return Err(format!("id {bad}: another error than a fault: {e}")),
+        Err(e) => {
+            return Err(format!(
+                "{mode:?} id {bad}: another error than a fault: {e}"
+            ));
+        }
         Ok(st) => {
             return Err(format!(
-                "id {bad} (the vocabulary's size) stepped clean, picking {}",
+                "{mode:?} id {bad} (the vocabulary's size) stepped clean, picking {}",
                 st.id
             ));
         }
@@ -225,30 +274,64 @@ fn e_token_id(s: &mut Session) -> Clause {
     let token_bit = 1u32 << (FaultSite::TokenId as u32);
     if fault.layer != 0 || fault.sites & token_bit == 0 {
         return Err(format!(
-            "id {bad} raised {fault}; the token-id site at layer 0 is not among them"
+            "{mode:?} id {bad} raised {fault}; the token-id site at layer 0 is not among them"
         ));
     }
-    let good = SEED;
-    match s.step(good) {
-        Err(SessionError::Poisoned(f)) if f == fault => {}
-        Err(e) => {
-            return Err(format!(
-                "the step after the fault: {e}; a refusal by poison is expected"
-            ));
-        }
-        Ok(_) => return Err("the step after the fault ran on a poisoned session".to_string()),
+    if s.pos() != 0 {
+        return Err(format!(
+            "{mode:?}: the faulted step moved the position to {}",
+            s.pos()
+        ));
     }
+    match s.step(SEED, mode) {
+        Err(SessionError::Poisoned(f)) if f == fault => Ok(fault),
+        Err(e) => Err(format!(
+            "{mode:?}: the step after the fault: {e}; a refusal by poison is expected"
+        )),
+        Ok(_) => Err(format!(
+            "{mode:?}: the step after the fault ran on a poisoned session"
+        )),
+    }
+}
+
+/// `e`: an id past the vocabulary raises the token-id site at layer 0, the
+/// session refuses the next step by name, and the reset clears it; host-fed,
+/// then in chain steps, where the fault is the same and the reset clears
+/// what the dropped token ahead raised.
+fn e_token_id(s: &mut Session) -> Clause {
+    let fault = e_fault(s, StepMode::HostFed)?;
     s.reset().map_err(says)?;
     let st = s
-        .step(good)
+        .step(SEED, StepMode::HostFed)
         .map_err(|e| format!("the step after the reset: {}", says(e)))?;
     if st.id as usize >= s.vocab() {
         return Err(format!("the step after the reset picked {}", st.id));
     }
+    let dropped = s.stats().discarded;
+    let chained = e_fault(s, StepMode::Chain)?;
+    if chained != fault {
+        return Err(format!(
+            "in chain steps the id raised {chained}; host-fed it raised {fault}"
+        ));
+    }
+    if s.stats().discarded != dropped + 1 {
+        return Err("the faulted chain step did not drop its token ahead".to_string());
+    }
+    s.reset().map_err(says)?;
+    let mut id = SEED;
+    for _ in 0..CHAIN_AFTER_RESET {
+        id = s
+            .step(id, StepMode::Chain)
+            .map_err(|e| format!("a chain step after the reset: {}", says(e)))?
+            .id;
+        if id as usize >= s.vocab() {
+            return Err(format!("a chain step after the reset picked {id}"));
+        }
+    }
     Ok(Verdict::Noted(format!(
-        "id {bad} raised {fault}; the next step refused by poison; after the reset id {good} \
-         picked {}",
-        st.id
+        "id {} raised {fault}, host-fed and in chain steps; the next step refused by poison; \
+         after each reset steps ran clean, {CHAIN_AFTER_RESET} of them in chain steps",
+        s.vocab()
     )))
 }
 
@@ -278,7 +361,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 3] = ["d_count", "e_token_id", "a_free"];
+    const NAMES: [&str; 5] = ["d_count", "e_token_id", "b_chain", "c_resume", "a_free"];
     if args.iter().any(|a| a == "--list") {
         for name in NAMES {
             println!("{name}");
@@ -363,6 +446,8 @@ pub fn main() -> ExitCode {
         let result = match name {
             "d_count" => d_count(&mut session, &device),
             "e_token_id" => e_token_id(&mut session),
+            "b_chain" => chain::b_chain(&mut session),
+            "c_resume" => chain::c_resume(&mut session),
             _ => free::a_free(&mut session),
         };
         report.clause(name, result);

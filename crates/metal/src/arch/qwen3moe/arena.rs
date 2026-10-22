@@ -4,10 +4,16 @@
 //! The weights are copied from the file into buffers of their own. A layer's
 //! P1 projection is one buffer per weight type, each the segments of one
 //! dispatch. The activations, the caches, the recurrent stores, the router's
-//! and the head's tickets, the id slot and the fault word are the session's.
-//! Every length comes from the plan, the file's shapes or a launch's
-//! geometry. A shape no launch runs is refused by name before the buffers
-//! past it are allocated.
+//! and the head's tickets, the host's id slot, the step record slots and the
+//! fault words are the session's. Every length comes from the plan, the
+//! file's shapes or a launch's geometry. A shape no launch runs is refused by
+//! name before the buffers past it are allocated.
+//!
+//! Two tokens may be committed at once, the second reading what the first
+//! writes. What the second would overwrite before the first is done is held
+//! twice: the step record (the head's id and the fault word) has a slot per
+//! position parity, and so does the delta state, whose lanes a token reads by
+//! its position's parity and writes by the next position's.
 
 use core::ops::Range;
 
@@ -34,8 +40,34 @@ use crate::kernels::{
 
 const WHAT: &str = "qwen35moe arena";
 
-/// Lanes of every recurrent store: one, read and written in place.
-pub(super) const LANES: usize = 1;
+/// Lanes of the delta state: the token at `pos` reads lane [`lane_of`]`(pos)`
+/// and writes the next position's, so a token that ran and was not taken
+/// leaves the lane its replacement reads as it was.
+pub(super) const LANES: usize = 2;
+
+/// The lane words: word `i` names lane `i`.
+const LANE_WORDS: [u32; LANES] = [0, 1];
+
+/// Step record slots: the token at `pos` writes its id and raises its fault
+/// word in slot [`slot_of`]`(pos)`, so the host reads one token's record
+/// while the next token writes the other.
+pub(super) const RECORD_SLOTS: usize = 2;
+
+/// The step record slot of the token at `pos`.
+pub(super) fn slot_of(pos: u32) -> usize {
+    pos as usize % RECORD_SLOTS
+}
+
+/// The step record slot of the token before `pos`: the slot whose id a token
+/// fed on the device embeds.
+pub(super) fn slot_before(pos: u32) -> usize {
+    (pos as usize + RECORD_SLOTS - 1) % RECORD_SLOTS
+}
+
+/// The delta lane the token at `pos` reads; it writes `lane_of(pos + 1)`.
+pub(super) fn lane_of(pos: u32) -> usize {
+    pos as usize % LANES
+}
 
 /// One P1 dispatch: the segments of one weight type, in one buffer.
 pub(super) struct P1Part {
@@ -163,13 +195,14 @@ pub(super) struct Arena {
     pub(super) logits: MetalBuffer<f32>,
     pub(super) candidates: MetalBuffer<u64>,
     pub(super) head_ticket: MetalBuffer<u32>,
-    /// The head's pick.
+    /// The head's pick, one per step record slot.
     pub(super) step_id: MetalBuffer<u32>,
-    /// The token the step embeds, written by the host.
+    /// The id a host-fed token embeds, written by the host.
     pub(super) id_in: MetalBuffer<u32>,
-    /// The delta step's lane words: lane 0 of one.
+    /// The delta step's lane words, [`LANE_WORDS`].
     pub(super) lane: MetalBuffer<u32>,
-    pub(super) fault: MetalFaultWord,
+    /// The fault word of each step record slot.
+    pub(super) faults: [MetalFaultWord; RECORD_SLOTS],
 }
 
 /// The fault word's layer of model layer `l`.
@@ -527,7 +560,7 @@ impl Arena {
         let attn_partials = partials_len(segments_for_keys(ctx_word(ctx)?) as usize)
             .ok_or_else(|| refuse("the attention partials do not fit"))?;
         let mut lane = MetalBuffer::new(device, Elems(LANES))?;
-        lane.zero();
+        lane.write(&LANE_WORDS)?;
         Ok(Arena {
             hidden,
             vocab,
@@ -553,10 +586,10 @@ impl Arena {
             logits: zeroed(device, vocab)?,
             candidates: zeroed(device, HEAD_GROUPS)?,
             head_ticket: zeroed(device, 1)?,
-            step_id: zeroed(device, 1)?,
+            step_id: zeroed(device, RECORD_SLOTS)?,
             id_in: zeroed(device, 1)?,
             lane,
-            fault: MetalFaultWord::new(device)?,
+            faults: [MetalFaultWord::new(device)?, MetalFaultWord::new(device)?],
         })
     }
 
@@ -577,8 +610,10 @@ impl Arena {
     }
 
     /// Every store a token sequence writes back to its state at rest: the
-    /// caches, the recurrent states and rings, the tickets, the head's pick.
-    pub(super) fn clear_stores(&mut self) {
+    /// caches, the recurrent states (both lanes) and rings, the tickets, the
+    /// id slots, the lane words. The fault words are the session's to clear,
+    /// on its stream.
+    pub(super) fn clear_stores(&mut self) -> Result<(), SessionError> {
         for layer in &mut self.layers {
             match &mut layer.mixer {
                 MixerBufs::Delta(d) => {
@@ -594,7 +629,9 @@ impl Arena {
         }
         self.head_ticket.zero();
         self.step_id.zero();
-        self.lane.zero();
+        self.id_in.zero();
+        self.lane.write(&LANE_WORDS)?;
+        Ok(())
     }
 }
 

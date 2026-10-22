@@ -5,8 +5,10 @@
 //! by name, so a kernel edit cannot silently turn a mutant into a no-op.
 //!
 //! `d_count`'s defects are the host's (a barrier too many, an allocation in
-//! the step): source edits of the session, not of a kernel, so they have no
-//! row here.
+//! the step, a second wait a step), as are `b_chain`'s (an embed reading
+//! another record slot) and `c_resume`'s host half (a lane parity from a
+//! count of calls, not from the position): source edits of the session, not
+//! of a kernel, so they have no row here.
 
 use bloomery_metal::library::SOURCE;
 
@@ -27,6 +29,17 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "raise(faults, args.layer, BLOOMERY_FAULT_SITE_TOKEN_ID);",
             "",
+            1,
+        )],
+    },
+    Mutant {
+        name: "delta_lane_in_place",
+        clause: "c_resume",
+        why: "the delta step writes the lane it read, so a dropped token ahead leaves its \
+              update in the lane its replacement reads",
+        edits: &[(
+            "uint word_to = lane_buf[args.lane_to];",
+            "uint word_to = lane_buf[args.lane_at];",
             1,
         )],
     },

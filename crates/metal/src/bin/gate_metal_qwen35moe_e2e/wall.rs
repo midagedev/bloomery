@@ -8,7 +8,7 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use bloomery_metal::arch::qwen3moe::session::{Op, Session};
+use bloomery_metal::arch::qwen3moe::session::{Op, Session, StepMode};
 
 use super::says;
 
@@ -37,7 +37,7 @@ fn go(s: &mut Session) -> Result<(), String> {
     let mut plain = Vec::new();
     for _ in 0..WARM + READS {
         let t = Instant::now();
-        id = s.step(id).map_err(says)?.id;
+        id = s.step(id, StepMode::HostFed).map_err(says)?.id;
         plain.push(t.elapsed());
     }
     let plain = median(plain.split_off(WARM));

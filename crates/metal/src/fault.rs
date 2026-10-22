@@ -6,7 +6,8 @@
 //! its own layer's mask — the same two operations the contract's host model
 //! does. The host reads it through the contract's one decoding rule
 //! ([`Fault::read_from`]) and clears it, as atomic words, after the stream it
-//! is asked against has finished its work.
+//! is asked against has finished its work, or, with no wait of its own, on
+//! the proof a settle of the stream returned ([`Settled`]).
 
 use core::sync::atomic::Ordering;
 
@@ -18,7 +19,7 @@ use bloomery_device::{DeviceError, Elems, Stream};
 
 use crate::buffer::MetalBuffer;
 use crate::encode::Binding;
-use crate::stream::MetalStream;
+use crate::stream::{MetalStream, Settled};
 
 /// The fault word of a Metal device.
 pub struct MetalFaultWord {
@@ -47,6 +48,24 @@ impl MetalFaultWord {
     pub fn words(&self, s: &MetalStream) -> Result<Vec<u32>, DeviceError> {
         s.sync()?;
         Ok(self.buffer.pages().to_vec())
+    }
+
+    /// The fault the word holds, read on `settled`: the stream's proof that
+    /// the recording which raises into this word is done, so the read waits
+    /// for nothing. The caller pairs the word with that recording; work
+    /// still running may raise into another word, not this one.
+    pub fn read_settled(&self, settled: &Settled) -> Result<Option<Fault>, DeviceError> {
+        let _ = settled;
+        let pages = self.buffer.pages();
+        Fault::read_from(|i| pages.load(i, Ordering::Relaxed))
+    }
+
+    /// The word clean again, on `settled`, under the pairing
+    /// [`MetalFaultWord::read_settled`] reads under: no work still running
+    /// raises into this word.
+    pub fn clear_settled(&self, settled: &Settled) -> Result<(), DeviceError> {
+        let _ = settled;
+        self.write_clean()
     }
 
     /// Word 0 clean and every mask empty.
