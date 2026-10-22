@@ -245,12 +245,31 @@ impl Family {
     }
 
     /// The draft model `set` states, against the draft file the tree runs.
+    /// A fixture identity ([`Identity::on_fixture`]) takes a path of the
+    /// draft file's file name: the draft of a fixture file is part of the
+    /// same fixture content, whose `# fixture` line the set's checks read
+    /// ([`Family::check_fixture`]).
     pub fn check_draft(&self, set: &Path, dumped_from: Option<&str>) -> Result<(), RefError> {
         let runs = self.draft_runs.ok_or_else(|| RefError::Missing {
             path: set.to_path_buf(),
             what: format!("the {} family names no draft file", self.name),
         })?()?;
-        check_same(set, "# draft_model", dumped_from, &runs)
+        if !self.identity.on_fixture() {
+            return check_same(set, "# draft_model", dumped_from, &runs);
+        }
+        let same_name =
+            |path: &str| file_name(path).is_some() && file_name(path) == file_name(&runs);
+        match dumped_from {
+            Some(stated) if stated == runs || same_name(stated) => Ok(()),
+            Some(stated) => Err(RefError::Stale {
+                set: set.display().to_string(),
+                dumped_from: format!(
+                    "{stated} (a fixture set: its file name is not the run draft file's)"
+                ),
+                runs,
+            }),
+            None => check_same(set, "# draft_model", None, &runs),
+        }
     }
 
     /// `stated`, the text after the tab of the `# fixture` line set `set`
