@@ -91,8 +91,8 @@ mac-test:
 
 # The Metal backend's gate, on an Apple Silicon Mac: the device contract's clauses on this Mac's Metal device, run by
 # tools/mac-gate.sh (the Metal lock, the bound, the refusals). crates/metal links no cuda-oxide, so plain cargo builds it.
-# The device gate, then the qwen35moe kernels' gate (the fixture's trunk file at ~/.cache/bloomery/mac-port/fixture/, or
-# --fixture), then that gate's mutants, each of which its clause must catch. The backend has no unit tests of its own: its
+# The device gate, then the qwen35moe kernels' gate (the qwen35moe fixture under $BLOOMERY_FIXTURE_ROOT, or --fixture),
+# then that gate's mutants, each of which its clause must catch. The backend has no unit tests of its own: its
 # contracts are the gates' clauses. A lab-* recipe, not a gate-* one: the box has no Metal device, so no landing batch
 # selects it.
 lab-metal:

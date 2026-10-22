@@ -39,6 +39,8 @@ objc2-metal = { workspace = true }
 dispatch2 = { workspace = true }
 # The fixture's tensors and their dequantization: the kernel gate's oracle.
 bloomery-gguf = { path = "../gguf" }
+# Where the fixture file sits: the one owner of the fixture root and layout.
+bloomery-refset = { path = "../refset" }
 
 [build-dependencies]
 # The fault site's table, the one owner the generated header is written
