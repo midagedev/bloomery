@@ -64,6 +64,45 @@ impl Fixture {
         Ok(&all[at * row_bytes..])
     }
 
+    /// One expert of a 3-D tensor: expert `expert` of `dims[2]`, `rows` by `cols`.
+    pub fn expert(
+        &self,
+        name: &str,
+        ty: GgmlType,
+        cols: usize,
+        rows: usize,
+        expert: usize,
+    ) -> Result<&[u8], String> {
+        let t = self
+            .file
+            .find(name)
+            .ok_or_else(|| format!("the fixture has no tensor {name}"))?;
+        if t.ty != ty
+            || t.dims.len() != 3
+            || t.dims[0] != cols as u64
+            || t.dims[1] != rows as u64
+            || expert as u64 >= t.dims[2]
+            || !cols.is_multiple_of(BLOCK_VALUES)
+        {
+            return Err(format!(
+                "{name} is {:?} {:?}, the gate reads {ty:?} expert {expert} of {cols} columns by {rows} rows",
+                t.ty, t.dims
+            ));
+        }
+        let all = self.file.data(t).map_err(|e| format!("{name}: {e}"))?;
+        let row_bytes = cols / BLOCK_VALUES * quant_block_bytes(ty)?;
+        let one = rows * row_bytes;
+        let start = expert * one;
+        let end = start + one;
+        if end > all.len() {
+            return Err(format!(
+                "{name} expert {expert} needs {end} bytes and the tensor holds {}",
+                all.len()
+            ));
+        }
+        Ok(&all[start..end])
+    }
+
     /// The f32 tensor `name` of `len` values.
     pub fn f32s(&self, name: &str, len: usize) -> Result<Vec<f32>, String> {
         let t = self

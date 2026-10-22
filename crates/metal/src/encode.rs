@@ -235,6 +235,53 @@ impl ComputeEncoder<'_> {
         Ok(())
     }
 
+    /// A two-dimensional dispatch: `groups_x` by `groups_y` threadgroups, each
+    /// of `threads_per_group` threads. The group's height is one, so the
+    /// grid's height is `groups_y`. A pipeline not set, no groups, or a group
+    /// larger than the pipeline allows is refused by name.
+    pub fn dispatch_grid(
+        &mut self,
+        groups_x: usize,
+        groups_y: usize,
+        threads_per_group: usize,
+    ) -> Result<(), DeviceError> {
+        let refuse = |detail: String| DeviceError::Range {
+            what: "dispatch",
+            detail,
+        };
+        let Some(max) = self.max_threads_per_group else {
+            return Err(refuse("no pipeline is set".to_string()));
+        };
+        if groups_x == 0 || groups_y == 0 || threads_per_group == 0 {
+            return Err(refuse(format!(
+                "{groups_x} by {groups_y} groups of {threads_per_group} is refused"
+            )));
+        }
+        if threads_per_group > max {
+            return Err(refuse(format!(
+                "a group of {threads_per_group} threads passes the pipeline's {max}"
+            )));
+        }
+        let width = groups_x.checked_mul(threads_per_group).ok_or_else(|| {
+            refuse(format!(
+                "{groups_x} groups of {threads_per_group} threads wrap"
+            ))
+        })?;
+        self.encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: to_ns(width),
+                height: to_ns(groups_y),
+                depth: 1,
+            },
+            MTLSize {
+                width: to_ns(threads_per_group),
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
     /// The encoder is done; the recording may be submitted.
     pub fn end(self) {
         // `Drop` ends the encoding.

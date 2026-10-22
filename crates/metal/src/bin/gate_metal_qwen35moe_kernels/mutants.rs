@@ -224,6 +224,46 @@ pub const MUTANTS: &[Mutant] = &[
         why: "every thread returns before it writes", // K2-REGISTER
         edits: &[("router_bounds_gate == 0u", "router_bounds_gate == 1u", 1)], // K2-REGISTER
     }, // K2-REGISTER
+    // fold_type and experts_bounds check the host, so they have no kernel mutant. // K3-REGISTER
+    Mutant {
+        // K3-REGISTER
+        name: "pair_no_silu",                                 // K3-REGISTER
+        clause: "pair",                                       // K3-REGISTER
+        why: "the pair multiplies gate by up and skips silu", // K3-REGISTER
+        edits: &[(
+            "return gate / (1.0f + exp(-gate)) * up;", // K3-REGISTER
+            "return gate * up;",                       // K3-REGISTER
+            1,                                         // K3-REGISTER
+        )], // K3-REGISTER
+    }, // K3-REGISTER
+    Mutant {
+        // K3-REGISTER
+        name: "pair_id_zero",                    // K3-REGISTER
+        clause: "pair_id",                       // K3-REGISTER
+        why: "an id past the stack writes zero", // K3-REGISTER
+        edits: &[("float pair_bad = NAN;", "float pair_bad = 0.0f;", 1)], // K3-REGISTER
+    }, // K3-REGISTER
+    Mutant {
+        // K3-REGISTER
+        name: "pair_shared_stack",            // K3-REGISTER
+        clause: "pair_shared",                // K3-REGISTER
+        why: "slot 8 reads the expert stack", // K3-REGISTER
+        edits: &[("return shared_slot ? shexp : stack;", "return stack;", 1)], // K3-REGISTER
+    }, // K3-REGISTER
+    Mutant {
+        // K3-REGISTER
+        name: "fold_drop_weight", // K3-REGISTER
+        clause: "fold",           // K3-REGISTER
+        why: "the fold loads the activation without the route weight", // K3-REGISTER
+        edits: &[("float xscale = w[block >> 1];", "float xscale = 1.0f;", 1)], // K3-REGISTER
+    }, // K3-REGISTER
+    Mutant {
+        // K3-REGISTER
+        name: "fold_no_resid",                            // K3-REGISTER
+        clause: "fold",                                   // K3-REGISTER
+        why: "the fold overwrites the residual",          // K3-REGISTER
+        edits: &[("y[row] += dot;", "y[row] = dot;", 1)], // K3-REGISTER
+    }, // K3-REGISTER
 ];
 
 /// The mutant of this name.
