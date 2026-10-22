@@ -60,6 +60,13 @@
 //! 31. **delta_partial**: the partials and the numerator, accepted by the head-norm launch. // K4-REGISTER
 //! 32. **delta_nan**: a non-finite lane raises the lane site and writes NaN on that lane. // K4-REGISTER
 //! 33. **delta_bounds**: a shape, a position window and a numerator window are refused by name. // K4-REGISTER
+//! 34. **attn-f16**: f16 attention and the appended cache match f64 attention, at S = 1 and S = 4. // K5-REGISTER
+//! 35. **attn-q8**: the appended q8_0 row matches `gguf::quant::quantize_q8_0`, and attention over it is inside the band. // K5-REGISTER
+//! 36. **attn-s**: S = 1 and S = 4 agree inside the band. // K5-REGISTER
+//! 37. **attn-reread**: the re-fetch arm matches the tile arm inside the band. // K5-REGISTER
+//! 38. **attn-m**: two query positions match the oracle. // K5-REGISTER
+//! 39. **attn-fault**: KeyCount, CachePos and KvQuant. // K5-REGISTER
+//! 40. **attn-bounds**: a shape or a window the kernel does not take is refused by name. // K5-REGISTER
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
@@ -84,24 +91,28 @@ use bloomery_metal::stream::MetalStream;
 
 #[path = "clauses.rs"]
 mod clauses;
-#[path = "clauses_router.rs"] // K2-REGISTER
-mod clauses_router; // K2-REGISTER
-#[path = "clauses_experts.rs"] // K3-REGISTER
-mod clauses_experts; // K3-REGISTER
+#[path = "clauses_attention.rs"] // K5-REGISTER
+mod clauses_attention; // K5-REGISTER
 #[path = "clauses_delta.rs"] // K4-REGISTER
 mod clauses_delta; // K4-REGISTER
+#[path = "clauses_experts.rs"] // K3-REGISTER
+mod clauses_experts; // K3-REGISTER
+#[path = "clauses_router.rs"] // K2-REGISTER
+mod clauses_router; // K2-REGISTER
 #[path = "fixture.rs"]
 mod fixture;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "../shared/oracle.rs"]
 mod oracle;
-#[path = "../shared/oracle_router.rs"] // K2-REGISTER
-mod oracle_router; // K2-REGISTER
-#[path = "../shared/oracle_experts.rs"] // K3-REGISTER
-mod oracle_experts; // K3-REGISTER
+#[path = "../shared/oracle_attention.rs"] // K5-REGISTER
+mod oracle_attention;
 #[path = "../shared/oracle_delta.rs"] // K4-REGISTER
 mod oracle_delta; // K4-REGISTER
+#[path = "../shared/oracle_experts.rs"] // K3-REGISTER
+mod oracle_experts; // K3-REGISTER
+#[path = "../shared/oracle_router.rs"] // K2-REGISTER
+mod oracle_router; // K2-REGISTER // K5-REGISTER
 
 /// A clause, ready to run.
 type ClauseRun<'a> = Box<dyn Fn() -> Clause + 'a>;
@@ -555,7 +566,7 @@ pub fn main() -> ExitCode {
         Err(e) => Err(e.clone()),
     };
     #[rustfmt::skip] // K2-REGISTER
-    let clauses: [(&'static str, ClauseRun<'_>); 33] = [ // K2-REGISTER
+    let clauses: [(&'static str, ClauseRun<'_>); 40] = [ // K2-REGISTER
         ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
         ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
         ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
@@ -604,6 +615,13 @@ pub fn main() -> ExitCode {
         ("delta_partial", Box::new(|| with(clauses_delta::delta_partial))), // K4-REGISTER
         ("delta_nan", Box::new(|| with(clauses_delta::delta_nan))), // K4-REGISTER
         ("delta_bounds", Box::new(|| clauses_delta::delta_bounds(&harness))), // K4-REGISTER
+        ("attn-f16", Box::new(|| with(clauses_attention::attn_f16))), // K5-REGISTER
+        ("attn-q8", Box::new(|| with(clauses_attention::attn_q8))), // K5-REGISTER
+        ("attn-s", Box::new(|| with(clauses_attention::attn_s))), // K5-REGISTER
+        ("attn-reread", Box::new(|| with(clauses_attention::attn_reread))), // K5-REGISTER
+        ("attn-m", Box::new(|| with(clauses_attention::attn_m))), // K5-REGISTER
+        ("attn-fault", Box::new(|| with(clauses_attention::attn_fault))), // K5-REGISTER
+        ("attn-bounds", Box::new(|| with(clauses_attention::attn_bounds))), // K5-REGISTER
     ];
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)
