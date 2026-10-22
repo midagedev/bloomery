@@ -147,7 +147,6 @@ forced_exact count pin, the reference gates).
     crates/gpu*/        the card engine and its per-family crates; gpu-gates holds the GPU gates and bins
     crates/device/      the device contract: buffers, windows, streams, events, the fault word, the census (pure)
     crates/metal/       the Metal backend of that contract, macOS only (an empty library elsewhere)
-    crates/chain/       the chain plans the device backends share (host data, no device code)
     crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile; excluded from the workspace
     tools/ref/          C++ harnesses linking ggml, and the timing runners
     tools/bloomery/     the Python side's one reader per fact: records.py, manifest.py
