@@ -42,6 +42,13 @@
 //! 15. **nsg**: the Q6_K mat-vec at eight SIMD groups in a threadgroup is the
 //!     same bits as at two, for every row count the fixture's Q6_K tensors
 //!     have.
+//! 16. **attn-f16**: f16 attention and the appended cache match f64 attention, at S = 1 and S = 4. // K5-REGISTER
+//! 17. **attn-q8**: the appended q8_0 row matches `gguf::quant::quantize_q8_0`, and attention over it is inside the band. // K5-REGISTER
+//! 18. **attn-s**: S = 1 and S = 4 agree inside the band. // K5-REGISTER
+//! 19. **attn-reread**: the re-fetch arm matches the tile arm inside the band. // K5-REGISTER
+//! 20. **attn-m**: two query positions match the oracle. // K5-REGISTER
+//! 21. **attn-fault**: KeyCount, CachePos and KvQuant. // K5-REGISTER
+//! 22. **attn-bounds**: a shape or a window the kernel does not take is refused by name. // K5-REGISTER
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
@@ -66,12 +73,16 @@ use bloomery_metal::stream::MetalStream;
 
 #[path = "clauses.rs"]
 mod clauses;
+#[path = "clauses_attention.rs"] // K5-REGISTER
+mod clauses_attention; // K5-REGISTER
 #[path = "fixture.rs"]
 mod fixture;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "../shared/oracle.rs"]
 mod oracle;
+#[path = "../shared/oracle_attention.rs"] // K5-REGISTER
+mod oracle_attention; // K5-REGISTER
 
 /// A clause, ready to run.
 type ClauseRun<'a> = Box<dyn Fn() -> Clause + 'a>;
@@ -524,7 +535,8 @@ pub fn main() -> ExitCode {
         Ok(fixture) => f(&harness, fixture),
         Err(e) => Err(e.clone()),
     };
-    let clauses: [(&'static str, ClauseRun<'_>); 15] = [
+    // K5-REGISTER
+    let clauses: [(&'static str, ClauseRun<'_>); 22] = [
         ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
         ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
         ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
@@ -555,6 +567,22 @@ pub fn main() -> ExitCode {
         ("headnorm", Box::new(|| with(clauses::headnorm))),
         ("headnorm_nan", Box::new(|| with(clauses::headnorm_nan))),
         ("nsg", Box::new(|| with(clauses::nsg))),
+        ("attn-f16", Box::new(|| with(clauses_attention::attn_f16))), // K5-REGISTER
+        ("attn-q8", Box::new(|| with(clauses_attention::attn_q8))),   // K5-REGISTER
+        ("attn-s", Box::new(|| with(clauses_attention::attn_s))),     // K5-REGISTER
+        (
+            "attn-reread",                                     // K5-REGISTER
+            Box::new(|| with(clauses_attention::attn_reread)), // K5-REGISTER
+        ), // K5-REGISTER
+        ("attn-m", Box::new(|| with(clauses_attention::attn_m))),     // K5-REGISTER
+        (
+            "attn-fault",                                     // K5-REGISTER
+            Box::new(|| with(clauses_attention::attn_fault)), // K5-REGISTER
+        ), // K5-REGISTER
+        (
+            "attn-bounds",                                     // K5-REGISTER
+            Box::new(|| with(clauses_attention::attn_bounds)), // K5-REGISTER
+        ), // K5-REGISTER
     ];
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)

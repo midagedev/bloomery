@@ -157,6 +157,7 @@ fn main() {
         "matvec_q4k",
         "matvec_q6k",
         "embed",
+        "attention", // K5-REGISTER
     ] {
         let path = kernels_dir.join(format!("{name}.metal"));
         let source =

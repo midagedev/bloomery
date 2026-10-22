@@ -162,6 +162,37 @@ pub const MUTANTS: &[Mutant] = &[
         why: "the first row of a threadgroup ignores the SIMD group count",
         edits: &[("BLOOMERY_MATVEC_SIMD_GROUPS + sgitg", "2 + sgitg", 9)],
     },
+    Mutant {
+        // K5-REGISTER
+        name: "attn_score_scale",                 // K5-REGISTER
+        clause: "attn-f16",                       // K5-REGISTER
+        why: "the score is twice the scaled dot", // K5-REGISTER
+        edits: &[(
+            // K5-REGISTER
+            "float score = dot * args.scale;",        // K5-REGISTER
+            "float score = dot * args.scale * 2.0f;", // K5-REGISTER
+            1,                                        // K5-REGISTER
+        )], // K5-REGISTER
+    }, // K5-REGISTER
+    Mutant {
+        // K5-REGISTER
+        name: "attn_q8_id", // K5-REGISTER
+        clause: "attn-q8",  // K5-REGISTER
+        why: "a q8_0 code uses 126 / amax instead of the host quantizer's 127 / amax", // K5-REGISTER
+        edits: &[("127.0f / amax", "126.0f / amax", 1)], // K5-REGISTER
+    }, // K5-REGISTER
+    Mutant {
+        // K5-REGISTER
+        name: "attn_key_count", // K5-REGISTER
+        clause: "attn-fault",   // K5-REGISTER
+        why: "a live key count of zero or past the cache raises nothing", // K5-REGISTER
+        edits: &[(
+            // K5-REGISTER
+            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_KEY_COUNT);", // K5-REGISTER
+            "",                                                          // K5-REGISTER
+            1,                                                           // K5-REGISTER
+        )], // K5-REGISTER
+    }, // K5-REGISTER
 ];
 
 /// The mutant of this name.

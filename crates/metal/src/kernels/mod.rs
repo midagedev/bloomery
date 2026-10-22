@@ -6,18 +6,36 @@
 //! (a window that is not the shape's is a named [`bloomery_device::DeviceError`], never a
 //! partial read or write), and encodes one dispatch on the caller's encoder.
 //! The kernels themselves are `kernels/{norm,matvec_q4k,matvec_q6k,embed}.metal`.
+//! Decode attention is `kernels/attention.metal`. // K5-REGISTER
 //!
 //! Three mat-vecs live here, one concept each: the plain mat-vec of one
 //! tensor ([`matvec`]), the segmented mat-vec of up to four tensors of one
 //! type and one width in one dispatch ([`seg`]), and the head-normed residual
 //! mat-vec of a gated delta net's out projection ([`headnorm`]).
 
+mod attention; // K5-REGISTER
 mod embed;
 mod geometry;
 mod headnorm;
 mod matvec;
 mod seg;
 
+pub use attention::{
+    // K5-REGISTER
+    AttentionParams, // K5-REGISTER
+    AttnCache,       // K5-REGISTER
+    HEAD_DIM,        // K5-REGISTER
+    KV_HEADS,        // K5-REGISTER
+    QUERY_HEADS,     // K5-REGISTER
+    ROT,             // K5-REGISTER
+    SCALE,           // K5-REGISTER
+    TILE,            // K5-REGISTER
+    f16_len,         // K5-REGISTER
+    out_len,         // K5-REGISTER
+    partials_len,    // K5-REGISTER
+    q8_code_len,     // K5-REGISTER
+    q8_scale_len,    // K5-REGISTER
+};
 pub use embed::EmbedParams;
 pub use geometry::{
     BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,
@@ -64,6 +82,7 @@ pub struct Kernels {
     q6k: MatvecPipelines,
     headnorm: Pipeline,
     embed: Pipeline,
+    attention: attention::AttentionPipelines, // K5-REGISTER
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -128,6 +147,7 @@ impl Kernels {
             )?,
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             embed: library.pipeline("embed_q4k")?,
+            attention: attention::AttentionPipelines::new(library)?, // K5-REGISTER
             simdgroups,
         })
     }
