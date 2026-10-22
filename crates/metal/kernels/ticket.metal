@@ -14,6 +14,9 @@
 //   ticket_load       that reader loads one partial through coherent(device)
 //   ticket_load_u64   that reader loads one packed candidate the same way
 //   ticket_reset      that reader stores 0, relaxed
+//   ticket_is_last    the producing lanes have stored; one barrier publishes
+//                     them, thread 0 arrives, and a second barrier publishes
+//                     last_flag. The caller does not barrier around it.
 //
 // The fence is device-scope and sequentially consistent. The fetch_add and
 // the reset are relaxed. The partial pointer is coherent(device).
@@ -60,4 +63,17 @@ static void ticket_write_u64(device coherent(device) ulong *candidates, uint ind
 static ulong ticket_load_u64(device coherent(device) ulong *candidates, uint index)
 {
     return candidates[index];
+}
+
+// The last threadgroup of the dispatch. `groups` is the grid's threadgroup
+// count. Thread 0 writes `last_flag`; every thread reads it after the return.
+static void ticket_is_last(device atomic_uint *ticket, uint groups, uint tid,
+                           threadgroup uint &last_flag)
+{
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0u) {
+        uint old = ticket_arrive(ticket);
+        last_flag = (old + 1u == groups) ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }

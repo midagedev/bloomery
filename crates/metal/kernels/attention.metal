@@ -580,6 +580,8 @@ static void attn_flash(constant AttnArgs &args,
                     }
                     // `on` is the same for every lane. The sum still runs on the
                     // lanes that loaded nothing, whose dot is zero.
+                    // The score band counts at most 31 adds, whichever tree the
+                    // language picks, so this is the built-in reduction.
                     dot = simd_sum(dot);
                     float score = dot * args.scale;
                     scores[t] = 0.0f;

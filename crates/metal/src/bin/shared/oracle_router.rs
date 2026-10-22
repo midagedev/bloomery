@@ -52,7 +52,7 @@
 //! derived in [`shared_band`], and is 1 when that expression is not a finite
 //! bound.
 
-use bloomery_metal::kernels::{EXPERTS, K, ROWS, TOP_K_MAX};
+use bloomery_metal::kernels::router::{EXPERTS, K, ROWS, TOP_K_MAX};
 
 use super::oracle;
 

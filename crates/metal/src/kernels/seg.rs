@@ -10,11 +10,11 @@
 use bloomery_device::{DeviceError, Window, WindowMut};
 
 use crate::device::MetalDevice;
-use crate::encode::{Binding, ComputeEncoder};
+use crate::encode::{Binding, Bindings, ComputeEncoder};
 
 use super::geometry::{BLOCK_VALUES, MAX_SEGMENTS, ROWS_PER_SIMD_GROUP};
 use super::matvec::{NormOnLoad, Quant};
-use super::{Kernels, check_window_len, word};
+use super::{Kernels, args_bytes, check_window_len, pack, word};
 
 /// One segment of a segmented mat-vec: the rows of one tensor, and where they
 /// sit in the weights and in the output.
@@ -72,11 +72,10 @@ struct Shape {
     groups: usize,
 }
 
-fn refuse(detail: String) -> DeviceError {
-    DeviceError::Range {
-        what: "matvec seg",
-        detail,
-    }
+const WHAT: &str = "matvec seg";
+
+fn refuse(detail: impl Into<String>) -> DeviceError {
+    super::range(WHAT, detail)
 }
 
 /// The shape of `p`, refused by name when the segments disagree, when one of
@@ -110,7 +109,6 @@ fn check(p: &SegParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
         )));
     }
     let nblocks = cols / BLOCK_VALUES;
-    let block_bytes = p.quant.block_bytes();
 
     // The output: the segments' ranges must not overlap, or one segment's rows
     // would be another's.
@@ -134,29 +132,23 @@ fn check(p: &SegParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
     // `nblocks` blocks each.
     let mut weight_end = 0usize;
     for s in &p.segments {
-        let blocks = s
-            .rows
-            .checked_mul(nblocks)
+        let span = super::weight_bytes(p.quant, s.rows, nblocks)
             .ok_or_else(|| refuse(format!("a segment of {} rows wraps", s.rows)))?;
         let end = s
             .weight_blocks
-            .checked_add(blocks)
-            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .checked_mul(p.quant.block_bytes())
+            .and_then(|at| at.checked_add(span))
             .ok_or_else(|| refuse(format!("a segment at block {} wraps", s.weight_blocks)))?;
         weight_end = weight_end.max(end);
     }
-    check_window_len("matvec seg", "weights", p.weights.len(), weight_end)?;
-    check_window_len("matvec seg", "x", p.x.len(), cols)?;
-    check_window_len("matvec seg", "gain", p.norm.gain.len(), cols)?;
+    check_window_len(WHAT, "weights", p.weights.len(), weight_end)?;
+    check_window_len(WHAT, "x", p.x.len(), cols)?;
+    check_window_len(WHAT, "gain", p.norm.gain.len(), cols)?;
     let out_end = ranges.last().map_or(0, |r| r.1);
-    check_window_len("matvec seg", "y", p.y.len(), out_end)?;
+    check_window_len(WHAT, "y", p.y.len(), out_end)?;
 
     let start = p.weights.byte_range()?.start.get();
-    if !start.is_multiple_of(2) {
-        return Err(refuse(format!(
-            "the weights start {start} bytes into their buffer: the kernels read 16-bit words"
-        )));
-    }
+    super::check_weights_align(WHAT, "weights", start, super::WeightAlign::Half)?;
 
     // The threadgroups: every segment's own, so a segment's rows are the rows
     // a launch of that segment alone would write.
@@ -169,24 +161,24 @@ fn check(p: &SegParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
     let mut groups = 0usize;
     for (i, s) in p.segments.iter().enumerate() {
         segments[i] = SegArg {
-            rows: word("matvec seg", "a segment's rows", s.rows)?,
-            weight_blocks: word("matvec seg", "a segment's weight blocks", s.weight_blocks)?,
-            out: word("matvec seg", "a segment's output offset", s.out_offset)?,
-            first_group: word("matvec seg", "a segment's first threadgroup", groups)?,
+            rows: word(WHAT, "a segment's rows", s.rows)?,
+            weight_blocks: word(WHAT, "a segment's weight blocks", s.weight_blocks)?,
+            out: word(WHAT, "a segment's output offset", s.out_offset)?,
+            first_group: word(WHAT, "a segment's first threadgroup", groups)?,
         };
         groups += s.rows.div_ceil(simdgroups * ROWS_PER_SIMD_GROUP);
     }
     Ok(Shape {
-        nblocks: word("matvec seg", "the block count", nblocks)?,
+        nblocks: word(WHAT, "the block count", nblocks)?,
         segments,
-        nseg: word("matvec seg", "the segment count", p.segments.len())?,
+        nseg: word(WHAT, "the segment count", p.segments.len())?,
         groups,
     })
 }
 
-/// The segmented mat-vec's argument block, as the bytes the kernel reads: the
-/// header's four words and every segment's four.
-fn args_bytes_of(shape: &Shape, layer: u32, eps: f32) -> [u8; 16 + 16 * MAX_SEGMENTS] {
+/// The segmented mat-vec's argument words: the header's four and every
+/// segment's four. `pack` is the bytes the kernel reads.
+fn args_words(shape: &Shape, layer: u32, eps: f32) -> [u32; 4 + 4 * MAX_SEGMENTS] {
     let mut words = [0u32; 4 + 4 * MAX_SEGMENTS];
     words[0] = shape.nblocks;
     words[1] = layer;
@@ -199,11 +191,7 @@ fn args_bytes_of(shape: &Shape, layer: u32, eps: f32) -> [u8; 16 + 16 * MAX_SEGM
         words[at + 2] = s.out;
         words[at + 3] = s.first_group;
     }
-    let mut out = [0u8; 16 + 16 * MAX_SEGMENTS];
-    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-        *chunk = word.to_ne_bytes();
-    }
-    out
+    words
 }
 
 impl Kernels {
@@ -216,19 +204,20 @@ impl Kernels {
         p: SegParams<'_>,
     ) -> Result<(), DeviceError> {
         let shape = check(&p, self.simdgroups)?;
-        let args = args_bytes_of(&shape, p.norm.layer, p.norm.eps);
+        let args = args_bytes(args_words(&shape, p.norm.layer, p.norm.eps));
         let family = match p.quant {
             Quant::Q4K => &self.q4k,
             Quant::Q6K => &self.q6k,
         };
         encoder.set_pipeline(family.seg());
-        encoder.set_binding(0, Binding::of(&p.weights)?)?;
-        encoder.set_binding(1, Binding::of(&p.x)?)?;
-        encoder.set_binding(2, Binding::of_mut(&p.y)?)?;
-        encoder.set_binding(3, Binding::bytes(&args)?)?;
-        encoder.set_binding(4, Binding::of(&p.norm.gain)?)?;
-        encoder.set_binding(5, p.norm.fault.binding())?;
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.weights)?)?;
+        slot.set(Binding::of(&p.x)?)?;
+        slot.set(Binding::of_mut(&p.y)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.set(Binding::of(&p.norm.gain)?)?;
+        slot.set(p.norm.fault.binding())?;
         let threads = self.threads_per_group();
-        encoder.dispatch(shape.groups * threads, threads)
+        slot.dispatch_groups(shape.groups, 1, threads)
     }
 }

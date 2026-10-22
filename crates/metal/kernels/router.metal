@@ -12,32 +12,32 @@
 
 #pragma METAL fp contract(off)
 
-#define ROUTER_ROWS 257
-#define ROUTER_EXPERTS 256
-#define ROUTER_K 2048
-#define ROUTER_SPLIT 2
-#define ROUTER_SG 4
-#define ROUTER_FLOAT4S 8
-#define ROUTER_TOPK_MAX 8
-#define ROUTER_LANES 32
+#define ROUTER_ROWS BLOOMERY_ROUTER_ROWS
+#define ROUTER_EXPERTS BLOOMERY_ROUTER_EXPERTS
+#define ROUTER_K BLOOMERY_ROUTER_K
+#define ROUTER_SPLIT BLOOMERY_ROUTER_SPLIT
+#define ROUTER_SG BLOOMERY_ROUTER_SG
+#define ROUTER_FLOAT4S BLOOMERY_ROUTER_FLOAT4S
+#define ROUTER_TOPK_MAX BLOOMERY_ROUTER_TOPK_MAX
+#define ROUTER_LANES BLOOMERY_ROUTER_LANES
 #define ROUTER_WORK (ROUTER_ROWS * ROUTER_SPLIT)
 
 static_assert(ROUTER_ROWS == ROUTER_EXPERTS + 1, "the shared expert is the last row");
-static_assert(ROUTER_WORK == 514, "257 rows and two splits");
+static_assert(ROUTER_WORK == ROUTER_ROWS * ROUTER_SPLIT, "the work is the rows times the splits");
 static_assert(ROUTER_LANES * ROUTER_FLOAT4S * 4 == ROUTER_K / ROUTER_SPLIT,
-              "eight float4s cover one split");
-static_assert(ROUTER_LANES * 16 * 4 == ROUTER_K, "sixteen float4s cover K");
-static_assert(ROUTER_SG * ROUTER_LANES == 128, "a threadgroup is four SIMD groups");
+              "the float4s cover one split");
+static_assert(ROUTER_LANES * ROUTER_FLOAT4S * ROUTER_SPLIT * 4 == ROUTER_K,
+              "the splits' float4s cover K");
 
-// The argument block, bound by value. The host packs four words.
+// The argument block, bound by value. The host packs three words. The grid's
+// threadgroup count is `[[threadgroups_per_grid]]`, not a word of this block.
 struct RouterArgs {
     uint top_k;
     uint layer;
     float eps;
-    uint groups;
 };
 
-static_assert(sizeof(RouterArgs) == 16, "RouterArgs is 16 bytes: the host packs four words");
+static_assert(sizeof(RouterArgs) == 12, "RouterArgs is 12 bytes: the host packs three words");
 
 inline float4 router_load4(device const float *p, uint f4)
 {
@@ -79,7 +79,6 @@ static void route_last(device coherent(device) float *partials,
             taken[i] = false;
         }
         float chosen_v[ROUTER_TOPK_MAX];
-        uint router_chosen[ROUTER_TOPK_MAX];
         for (uint s = 0u; s < args.top_k; ++s) {
             bool any = false;
             float best_v = 0.f;
@@ -89,8 +88,7 @@ static void route_last(device coherent(device) float *partials,
                     continue;
                 }
                 float v = logits[i];
-                bool router_better = v > best_v;
-                if (!any || router_better) {
+                if (!any || v > best_v) {
                     any = true;
                     best_v = v;
                     best_i = i;
@@ -98,7 +96,7 @@ static void route_last(device coherent(device) float *partials,
             }
             taken[best_i] = true;
             chosen_v[s] = best_v;
-            router_chosen[s] = best_i;
+            ids[s] = best_i;
         }
         float l_max = chosen_v[0];
         float term[ROUTER_TOPK_MAX];
@@ -108,9 +106,7 @@ static void route_last(device coherent(device) float *partials,
             sum_exp += term[s];
         }
         for (uint s = 0u; s < args.top_k; ++s) {
-            float router_weight = term[s] / sum_exp;
-            weights[s] = router_weight;
-            ids[s] = router_chosen[s];
+            weights[s] = term[s] / sum_exp;
         }
         ids[args.top_k] = ROUTER_EXPERTS;
         weights[args.top_k] = 1.f / (1.f + exp(-logits[ROUTER_EXPERTS]));
@@ -132,16 +128,10 @@ kernel void router35(device const float *routed [[buffer(0)]],
                      uint tg [[threadgroup_position_in_grid]],
                      uint tid [[thread_position_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]],
-                     uint sg_in_tg [[simdgroup_index_in_threadgroup]])
+                     uint sg_in_tg [[simdgroup_index_in_threadgroup]],
+                     uint groups [[threadgroups_per_grid]])
 {
     threadgroup uint last_flag = 0u;
-
-    // A launch the host accepted passes this. The bounds mutant flips the
-    // comparison so every thread returns before a barrier.
-    uint router_bounds_gate = 1u;
-    if (router_bounds_gate == 0u) {
-        return;
-    }
 
     const uint sg = tg * ROUTER_SG + sg_in_tg;
     if (sg < ROUTER_WORK) {
@@ -164,7 +154,7 @@ kernel void router35(device const float *routed [[buffer(0)]],
                 ? routed + (ulong)row * (ulong)ROUTER_K
                 : shared;
             const uint base4 = split * (ROUTER_K / ROUTER_SPLIT / 4u);
-            float router_acc = 0.f;
+            float acc = 0.f;
 #pragma unroll(8)
             for (uint i = 0u; i < ROUTER_FLOAT4S; ++i) {
                 const uint f4 = base4 + lane + ROUTER_LANES * i;
@@ -172,24 +162,19 @@ kernel void router35(device const float *routed [[buffer(0)]],
                 float4 gv = router_load4(gain, f4);
                 float4 h = xv * gv;
                 float4 w = router_load4(row_base, f4);
-                router_acc += w.x * h.x;
-                router_acc += w.y * h.y;
-                router_acc += w.z * h.z;
-                router_acc += w.w * h.w;
+                acc += w.x * h.x;
+                acc += w.y * h.y;
+                acc += w.z * h.z;
+                acc += w.w * h.w;
             }
-            router_acc = simd_sum(router_acc) * scale;
+            acc = simd_sum(acc) * scale;
             if (lane == 0u) {
-                ticket_write(partials, sg, router_acc);
+                ticket_write(partials, sg, acc);
             }
         }
     }
 
-    threadgroup_barrier(mem_flags::mem_device);
-    if (tid == 0u) {
-        uint old = ticket_arrive(ticket);
-        last_flag = (old + 1u == args.groups) ? 1u : 0u;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ticket_is_last(ticket, groups, tid, last_flag);
     if (last_flag == 1u && tid == 0u) {
         route_last(partials, ticket, logits, ids, weights, faults, args);
     }

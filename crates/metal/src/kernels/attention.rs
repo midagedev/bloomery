@@ -326,12 +326,12 @@ impl Kernels {
                 encoder.set_binding(13, p.fault.binding())?;
             }
         }
-        encoder.dispatch(flash_threads, FLASH_THREADS)?;
+        encoder.dispatch_groups(flash_threads / FLASH_THREADS, 1, FLASH_THREADS)?;
 
         encoder.set_pipeline(&self.attention.merge);
         encoder.set_binding(0, Binding::of_mut(&p.partials)?)?;
         encoder.set_binding(1, Binding::of_mut(&p.out)?)?;
         encoder.set_binding(2, Binding::bytes(&args)?)?;
-        encoder.dispatch(merge_threads, MERGE_THREADS)
+        encoder.dispatch_groups(merge_threads / MERGE_THREADS, 1, MERGE_THREADS)
     }
 }

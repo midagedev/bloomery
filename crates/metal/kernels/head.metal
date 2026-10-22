@@ -8,7 +8,8 @@
 // non-negative one is OR-ed with 0x80000000. The key is that u32 in the
 // high half and ~index in the low half. An unsigned maximum of keys is the
 // comparison below, so the scan order does not matter. An empty group, and
-// a group whose live logits are all NaN, packs (-inf, 0).
+// a group whose live logits are all NaN, packs (-inf, 0). When that key
+// wins, the step id is not a token.
 //
 // This file comes after matvec_q6k.metal (q6k_rows, block_q6_K) and
 // ticket.metal.
@@ -43,27 +44,17 @@ kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
 {
     threadgroup uint last_flag = 0u;
 
-    // A launch the host accepted passes this. The bounds mutant flips the
-    // comparison so every thread returns before a barrier.
-    uint head_bounds_gate = 1u;
-    if (head_bounds_gate == 0u) {
-        return;
-    }
-
-    const int first_row = (int)((tg * BLOOMERY_MATVEC_SIMD_GROUPS + sg) *
-                                BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    const int first_row = simd_first_row(tg, sg);
     q6k_rows<true, false>(weights, x, logits, (int)args.nblocks, args.eps, args.layer, gain,
                           faults, first_row, (int)args.rows, tiisg);
 
     // Every logit this group stored is visible.
     threadgroup_barrier(mem_flags::mem_device);
 
-    // Lane 0 of a SIMD group is thread 0 of that group's rows. It raises on
-    // a non-finite logit and leaves the NaN stored, then scales the stored
-    // value. The scale is 1. The following barrier publishes those stores
-    // to the thread that reduces.
+    // Lane 0 of a SIMD group raises on a non-finite logit and leaves the NaN
+    // stored. The following barrier publishes those stores to the thread
+    // that reduces.
     if (tiisg == 0u) {
-        float head_logit_scale = 1.f;
         for (int r = 0; r < (int)BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP; ++r) {
             int row = first_row + r;
             if (row >= (int)args.rows) {
@@ -72,7 +63,6 @@ kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
             if (!isfinite(logits[row])) {
                 raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);
             }
-            logits[row] *= head_logit_scale;
         }
     }
     threadgroup_barrier(mem_flags::mem_device);
@@ -89,8 +79,7 @@ kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
                 break;
             }
             float v = logits[row];
-            bool head_takes = v > best_v || (v == best_v && (uint)row < best_i);
-            if (head_takes) {
+            if (v > best_v || (v == best_v && (uint)row < best_i)) {
                 best_v = v;
                 best_i = (uint)row;
             }
@@ -98,12 +87,7 @@ kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
         ticket_write_u64(candidates, tg, argmax_key(best_v, best_i));
     }
 
-    threadgroup_barrier(mem_flags::mem_device);
-    if (tid == 0u) {
-        uint old = ticket_arrive(ticket);
-        last_flag = (old + 1u == groups) ? 1u : 0u;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ticket_is_last(ticket, groups, tid, last_flag);
     if (last_flag == 1u && tid == 0u) {
         ticket_acquire();
         ulong best_key = ticket_load_u64(candidates, 0u);
@@ -113,8 +97,15 @@ kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
                 best_key = key;
             }
         }
-        uint id = ~uint(best_key);
-        step_id[0] = id;
+        // (-inf, 0) is the smallest key, so any finite logit wins. When it
+        // wins, every logit was NaN and the id must not be a token.
+        ulong empty_key = argmax_key(-INFINITY, 0u);
+        if (best_key == empty_key) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);
+            step_id[0] = 0xFFFFFFFFu;
+        } else {
+            step_id[0] = ~uint(best_key);
+        }
         ticket_reset(ticket);
     }
 }

@@ -954,3 +954,15 @@ pub fn fold_type(h: &Harness<'_>, _fix: &Fixture) -> Clause {
         "Apart is refused by name before the slot count, the width, an empty stack and an empty id list".to_string(),
     ))
 }
+
+/// The expert pair and fold clauses, in gate order.
+pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    vec![
+        ("pair", Box::new(|| ctx.with(pair))),
+        ("pair_id", Box::new(|| ctx.with(pair_id))),
+        ("pair_shared", Box::new(|| ctx.with(pair_shared))),
+        ("fold", Box::new(|| ctx.with(fold))),
+        ("fold_type", Box::new(|| ctx.with(fold_type))),
+        ("experts_bounds", Box::new(|| ctx.with(experts_bounds))),
+    ]
+}

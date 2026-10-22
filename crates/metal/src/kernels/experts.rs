@@ -9,28 +9,25 @@ use bloomery_device::{DeviceError, Elems, Window, WindowMut};
 
 use crate::buffer::MetalRaw;
 use crate::device::MetalDevice;
-use crate::encode::{Binding, ComputeEncoder};
+use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
+use crate::library::{Library, Pipeline};
 
 use super::geometry::{BLOCK_VALUES, ROWS_PER_SIMD_GROUP, SIMD_WIDTH};
-use super::{Quant, args_bytes, check_window_len, word};
+use super::{Quant, args_bytes, check_window_len, pack, word};
 
-/// Slots in one launch: eight routed experts and the shared expert.
-pub const EXPERT_SLOTS: usize = 9;
-/// Ids a launch reads. The shared slot has none.
-pub const ROUTED_IDS: usize = 8;
-/// The slot that reads the shared expert.
-pub const SHARED_SLOT: usize = 8;
-/// The expert intermediate width. The pair's rows and the fold's K are this.
-pub const EXPERT_K: usize = 512;
+include!("experts_geom.rs");
+
+const PAIR: &str = "pair";
+const FOLD: &str = "fold";
 
 /// SIMD groups in an expert threadgroup. Hardcoded: the pipelines are not
 /// retiled when a mat-vec launch asks for another count.
 const EXPERT_NSG: usize = 2;
 const EXPERT_THREADS: usize = SIMD_WIDTH * EXPERT_NSG;
 /// Blocks of K': nine slots, two blocks of [`EXPERT_K`] each.
-const FOLDED_BLOCKS: usize = EXPERT_SLOTS * (EXPERT_K / BLOCK_VALUES);
-const _: () = assert!(FOLDED_BLOCKS == 18);
+const _: () = assert!(super::geometry::BLOCK_VALUES == 256);
+const _: () = assert!(FOLDED_BLOCKS == EXPERT_SLOTS * (EXPERT_K / super::geometry::BLOCK_VALUES));
 
 /// The shared expert, or a refusal when its quant is not the routed experts'.
 #[derive(Clone, Copy)]
@@ -108,64 +105,50 @@ pub struct FoldParams<'w, 'h, 'y, 'buf> {
     pub layer: u32,
 }
 
-fn refuse_pair(detail: String) -> DeviceError {
-    DeviceError::Range {
-        what: "pair",
-        detail,
-    }
+fn refuse_pair(detail: impl Into<String>) -> DeviceError {
+    super::range(PAIR, detail)
 }
 
-fn refuse_fold(detail: String) -> DeviceError {
-    DeviceError::Range {
-        what: "fold",
-        detail,
-    }
+fn refuse_fold(detail: impl Into<String>) -> DeviceError {
+    super::range(FOLD, detail)
 }
 
 fn refuse_slots(what: &'static str, slots: usize) -> Result<(), DeviceError> {
     if slots == EXPERT_SLOTS {
         return Ok(());
     }
-    Err(DeviceError::Range {
+    Err(super::range(
         what,
-        detail: format!("a launch runs {EXPERT_SLOTS} slots, not {slots}"),
-    })
+        format!("a launch runs {EXPERT_SLOTS} slots, not {slots}"),
+    ))
 }
 
 fn refuse_k(what: &'static str, k: usize) -> Result<(), DeviceError> {
     if k == EXPERT_K {
         return Ok(());
     }
-    Err(DeviceError::Range {
+    Err(super::range(
         what,
-        detail: format!("the expert width is {k}, not {EXPERT_K}"),
-    })
+        format!("the expert width is {k}, not {EXPERT_K}"),
+    ))
 }
 
 fn refuse_stack(what: &'static str, n_experts: usize) -> Result<(), DeviceError> {
     if n_experts == 0 {
-        return Err(DeviceError::Range {
-            what,
-            detail: "the expert stack is empty".to_string(),
-        });
+        return Err(super::range(what, "the expert stack is empty"));
     }
     Ok(())
 }
 
 fn refuse_ids(what: &'static str, ids: Elems) -> Result<(), DeviceError> {
     if ids.get() == 0 {
-        return Err(DeviceError::Range {
-            what,
-            detail: "the id list is empty".to_string(),
-        });
+        return Err(super::range(what, "the id list is empty"));
     }
     Ok(())
 }
 
 fn weight_bytes(quant: Quant, rows: usize, nblocks: usize, experts: usize) -> Option<usize> {
-    rows.checked_mul(nblocks)?
-        .checked_mul(experts)?
-        .checked_mul(quant.block_bytes())
+    super::weight_bytes(quant, rows, nblocks)?.checked_mul(experts)
 }
 
 fn aligned(
@@ -174,15 +157,7 @@ fn aligned(
     window: Window<'_, u8, MetalDevice>,
 ) -> Result<(), DeviceError> {
     let start = window.byte_range()?.start.get();
-    if start.is_multiple_of(2) {
-        return Ok(());
-    }
-    Err(DeviceError::Range {
-        what,
-        detail: format!(
-            "the {name} weights start {start} bytes into their buffer: the kernels read 16-bit words"
-        ),
-    })
+    super::check_weights_align(what, name, start, super::WeightAlign::Half)
 }
 
 fn hidden_overlaps_output(
@@ -197,14 +172,6 @@ fn hidden_overlaps_output(
     Ok(h.start < y.end && y.start < h.end)
 }
 
-fn pack_words(words: &[u32]) -> Vec<u8> {
-    let mut out = vec![0u8; words.len() * 4];
-    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-        *chunk = word.to_ne_bytes();
-    }
-    out
-}
-
 struct PairShape {
     nblocks: u32,
     rows: u32,
@@ -214,10 +181,10 @@ struct PairShape {
 }
 
 fn check_pair(p: &PairParams<'_>) -> Result<PairShape, DeviceError> {
-    refuse_slots("pair", p.slots)?;
-    refuse_k("pair", p.k)?;
-    refuse_stack("pair", p.n_experts)?;
-    refuse_ids("pair", p.ids.len())?;
+    refuse_slots(PAIR, p.slots)?;
+    refuse_k(PAIR, p.k)?;
+    refuse_stack(PAIR, p.n_experts)?;
+    refuse_ids(PAIR, p.ids.len())?;
     if p.out_stride < EXPERT_K {
         return Err(refuse_pair("the slot outputs overlap".to_string()));
     }
@@ -240,22 +207,22 @@ fn check_pair(p: &PairParams<'_>) -> Result<PairShape, DeviceError> {
         .checked_mul(p.out_stride)
         .and_then(|n| n.checked_add(EXPERT_K))
         .ok_or_else(|| refuse_pair("the output length wraps".to_string()))?;
-    check_window_len("pair", "gate", p.gate.len(), stack)?;
-    check_window_len("pair", "up", p.up.len(), stack)?;
-    check_window_len("pair", "shared gate", p.shared_gate.len(), shared)?;
-    check_window_len("pair", "shared up", p.shared_up.len(), shared)?;
-    check_window_len("pair", "x", p.x.len(), p.cols)?;
-    check_window_len("pair", "ids", p.ids.len(), ROUTED_IDS)?;
-    check_window_len("pair", "y", p.y.len(), y_len)?;
-    aligned("pair", "gate", p.gate)?;
-    aligned("pair", "up", p.up)?;
-    aligned("pair", "shared gate", p.shared_gate)?;
-    aligned("pair", "shared up", p.shared_up)?;
+    check_window_len(PAIR, "gate", p.gate.len(), stack)?;
+    check_window_len(PAIR, "up", p.up.len(), stack)?;
+    check_window_len(PAIR, "shared gate", p.shared_gate.len(), shared)?;
+    check_window_len(PAIR, "shared up", p.shared_up.len(), shared)?;
+    check_window_len(PAIR, "x", p.x.len(), p.cols)?;
+    check_window_len(PAIR, "ids", p.ids.len(), ROUTED_IDS)?;
+    check_window_len(PAIR, "y", p.y.len(), y_len)?;
+    aligned(PAIR, "gate", p.gate)?;
+    aligned(PAIR, "up", p.up)?;
+    aligned(PAIR, "shared gate", p.shared_gate)?;
+    aligned(PAIR, "shared up", p.shared_up)?;
     Ok(PairShape {
-        nblocks: word("pair", "the block count", nblocks)?,
-        rows: word("pair", "the row count", EXPERT_K)?,
-        n_experts: word("pair", "the expert count", p.n_experts)?,
-        stride: word("pair", "the output stride", p.out_stride)?,
+        nblocks: word(PAIR, "the block count", nblocks)?,
+        rows: word(PAIR, "the row count", EXPERT_K)?,
+        n_experts: word(PAIR, "the expert count", p.n_experts)?,
+        stride: word(PAIR, "the output stride", p.out_stride)?,
         groups_x: EXPERT_K / EXPERT_NSG,
     })
 }
@@ -277,10 +244,10 @@ fn check_fold<'w>(
         }
         SharedPlan::Same(window) => window,
     };
-    refuse_slots("fold", p.slots)?;
-    refuse_k("fold", p.k)?;
-    refuse_stack("fold", p.n_experts)?;
-    refuse_ids("fold", p.ids.len())?;
+    refuse_slots(FOLD, p.slots)?;
+    refuse_k(FOLD, p.k)?;
+    refuse_stack(FOLD, p.n_experts)?;
+    refuse_ids(FOLD, p.ids.len())?;
     if hidden_overlaps_output(p.h, p.y)? {
         return Err(refuse_fold(
             "the output overlaps the hidden states".to_string(),
@@ -295,23 +262,56 @@ fn check_fold<'w>(
     let shared_bytes = weight_bytes(p.quant, p.rows, nblocks, 1)
         .ok_or_else(|| refuse_fold("one shared expert wraps".to_string()))?;
     let hidden = EXPERT_SLOTS * EXPERT_K;
-    check_window_len("fold", "down", p.down.len(), stack)?;
-    check_window_len("fold", "shared down", shared.len(), shared_bytes)?;
-    check_window_len("fold", "hidden", p.h.len(), hidden)?;
-    check_window_len("fold", "route", p.w.len(), EXPERT_SLOTS)?;
-    check_window_len("fold", "ids", p.ids.len(), ROUTED_IDS)?;
-    check_window_len("fold", "y", p.y.len(), p.rows)?;
-    aligned("fold", "down", p.down)?;
-    aligned("fold", "shared down", shared)?;
+    check_window_len(FOLD, "down", p.down.len(), stack)?;
+    check_window_len(FOLD, "shared down", shared.len(), shared_bytes)?;
+    check_window_len(FOLD, "hidden", p.h.len(), hidden)?;
+    check_window_len(FOLD, "route", p.w.len(), EXPERT_SLOTS)?;
+    check_window_len(FOLD, "ids", p.ids.len(), ROUTED_IDS)?;
+    check_window_len(FOLD, "y", p.y.len(), p.rows)?;
+    aligned(FOLD, "down", p.down)?;
+    aligned(FOLD, "shared down", shared)?;
     let rows_per_group = EXPERT_NSG * ROWS_PER_SIMD_GROUP;
     Ok((
         FoldShape {
-            rows: word("fold", "the row count", p.rows)?,
-            n_experts: word("fold", "the expert count", p.n_experts)?,
+            rows: word(FOLD, "the row count", p.rows)?,
+            n_experts: word(FOLD, "the expert count", p.n_experts)?,
             groups_x: p.rows.div_ceil(rows_per_group),
         },
         shared,
     ))
+}
+
+/// The pair and the fold, one pipeline per quant.
+pub(crate) struct Pipelines {
+    pair_q4: Pipeline,
+    pair_q6: Pipeline,
+    fold_q4: Pipeline,
+    fold_q6: Pipeline,
+}
+
+impl Pipelines {
+    pub(crate) fn new(library: &Library) -> Result<Self, DeviceError> {
+        Ok(Self {
+            pair_q4: library.pipeline("q4k_pair_swiglu")?,
+            pair_q6: library.pipeline("q6k_pair_swiglu")?,
+            fold_q4: library.pipeline("q4k_down_fold")?,
+            fold_q6: library.pipeline("q6k_down_fold")?,
+        })
+    }
+
+    fn pair(&self, quant: Quant) -> &Pipeline {
+        match quant {
+            Quant::Q4K => &self.pair_q4,
+            Quant::Q6K => &self.pair_q6,
+        }
+    }
+
+    fn fold(&self, quant: Quant) -> &Pipeline {
+        match quant {
+            Quant::Q4K => &self.fold_q4,
+            Quant::Q6K => &self.fold_q6,
+        }
+    }
 }
 
 impl super::Kernels {
@@ -324,28 +324,25 @@ impl super::Kernels {
         p: PairParams<'_>,
     ) -> Result<(), DeviceError> {
         let shape = check_pair(&p)?;
-        let pipe = match p.quant {
-            Quant::Q4K => &self.pair_q4,
-            Quant::Q6K => &self.pair_q6,
-        };
-        let args = pack_words(&[
+        let args = args_bytes([
             shape.rows,
             shape.nblocks,
             shape.n_experts,
             p.layer,
             shape.stride,
         ]);
-        encoder.set_pipeline(pipe);
-        encoder.set_binding(0, Binding::of(&p.gate)?)?;
-        encoder.set_binding(1, Binding::of(&p.up)?)?;
-        encoder.set_binding(2, Binding::of(&p.shared_gate)?)?;
-        encoder.set_binding(3, Binding::of(&p.shared_up)?)?;
-        encoder.set_binding(4, Binding::of(&p.x)?)?;
-        encoder.set_binding(5, Binding::of(&p.ids)?)?;
-        encoder.set_binding(6, Binding::of_mut(&p.y)?)?;
-        encoder.set_binding(7, p.fault.binding())?;
-        encoder.set_binding(8, Binding::bytes(&args)?)?;
-        encoder.dispatch_grid(shape.groups_x, EXPERT_SLOTS, EXPERT_THREADS)
+        encoder.set_pipeline(self.experts.pair(p.quant));
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.gate)?)?;
+        slot.set(Binding::of(&p.up)?)?;
+        slot.set(Binding::of(&p.shared_gate)?)?;
+        slot.set(Binding::of(&p.shared_up)?)?;
+        slot.set(Binding::of(&p.x)?)?;
+        slot.set(Binding::of(&p.ids)?)?;
+        slot.set(Binding::of_mut(&p.y)?)?;
+        slot.set(p.fault.binding())?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.dispatch_groups(shape.groups_x, EXPERT_SLOTS, EXPERT_THREADS)
     }
 
     /// Encode one folded down. The route weights scale the load, and the
@@ -358,20 +355,17 @@ impl super::Kernels {
         p: FoldParams<'_, '_, '_, '_>,
     ) -> Result<(), DeviceError> {
         let (shape, shared) = check_fold(&p)?;
-        let pipe = match p.quant {
-            Quant::Q4K => &self.fold_q4,
-            Quant::Q6K => &self.fold_q6,
-        };
         let args = args_bytes([shape.rows, shape.n_experts, p.layer, 0]);
-        encoder.set_pipeline(pipe);
-        encoder.set_binding(0, Binding::of(&p.down)?)?;
-        encoder.set_binding(1, Binding::of(&shared)?)?;
-        encoder.set_binding(2, Binding::of(&p.h)?)?;
-        encoder.set_binding(3, Binding::of(&p.w)?)?;
-        encoder.set_binding(4, Binding::of(&p.ids)?)?;
-        encoder.set_binding(5, Binding::of_mut(p.y)?)?;
-        encoder.set_binding(6, p.fault.binding())?;
-        encoder.set_binding(7, Binding::bytes(&args)?)?;
-        encoder.dispatch(shape.groups_x * EXPERT_THREADS, EXPERT_THREADS)
+        encoder.set_pipeline(self.experts.fold(p.quant));
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.down)?)?;
+        slot.set(Binding::of(&shared)?)?;
+        slot.set(Binding::of(&p.h)?)?;
+        slot.set(Binding::of(&p.w)?)?;
+        slot.set(Binding::of(&p.ids)?)?;
+        slot.set(Binding::of_mut(p.y)?)?;
+        slot.set(p.fault.binding())?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.dispatch_groups(shape.groups_x, 1, EXPERT_THREADS)
     }
 }

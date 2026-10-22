@@ -76,33 +76,47 @@ inline float pair_swiglu(float gate, float up) {
     return gate / (1.0f + exp(-gate)) * up;
 }
 
-// The route weight of the block's slot: blocks 2s and 2s+1 belong to slot s.
-inline float fold_route(device const float * w, int block) {
-    float xscale = w[block >> 1];
-    return xscale;
+// True when the routed slot's id is past the stack. Slot 8 is the shared
+// expert and leaves `expert` at 0; the caller reads the shared tensors.
+inline bool pair_expert(device const int * ids, uint slot, uint n_experts,
+                        thread int & expert) {
+    expert = 0;
+    if (slot == BLOOMERY_EXPERT_SHARED) {
+        return false;
+    }
+    int id = ids[slot];
+    if (id < 0 || (uint)id >= n_experts) {
+        return true;
+    }
+    expert = id;
+    return false;
 }
 
-// The residual epilogue: the dot adds into the row.
-inline void fold_store(device float * y, uint row, float dot) {
-    y[row] += dot;
+// True when every routed id is inside the stack. The shared slot is not an id.
+inline bool fold_ids_ok(device const int * ids, uint n_experts) {
+    for (uint s = 0u; s < BLOOMERY_EXPERT_ROUTED; ++s) {
+        int id = ids[s];
+        if (id < 0 || (uint)id >= n_experts) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline void pair_write_bad(device float * y, uint slot, uint stride, uint row,
                            device atomic_uint * faults, uint layer) {
     raise(faults, layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
-    float pair_bad = NAN;
-    y[(ulong)slot * stride + row] = pair_bad;
+    y[(ulong)slot * stride + row] = NAN;
 }
 
 inline void fold_write_bad(device float * y, int row0, int rows,
                            device atomic_uint * faults, uint layer) {
     raise(faults, layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
-    float fold_bad = NAN;
     if (row0 < rows) {
-        y[(uint)row0] = fold_bad;
+        y[(uint)row0] = NAN;
     }
     if (row0 + 1 < rows) {
-        y[(uint)row0 + 1u] = fold_bad;
+        y[(uint)row0 + 1u] = NAN;
     }
 }
 
@@ -257,9 +271,9 @@ inline device const Block * pair_rows(device const Block * stack,
     return ((device const Block *)(base + bytes)) + (ulong)row * (ulong)nblocks;
 }
 
-// One block of the folded K'. Slot s owns blocks 2s and 2s+1; slot 8 is the
-// shared tensor. The stack is not contiguous across experts, so the pointer
-// is this block's own.
+// One block of the folded K'. Slot s owns blocks 2s and 2s+1; the shared slot
+// is the shared tensor. The stack is not contiguous across experts, so the
+// pointer is this block's own.
 template <typename Block>
 inline device const Block * fold_block(device const Block * stack,
                                        device const Block * shared,
@@ -269,7 +283,7 @@ inline device const Block * fold_block(device const Block * stack,
                                        int ib) {
     int slot = ib >> 1;
     int local = ib & 1;
-    bool shared_slot = slot == 8;
+    bool shared_slot = slot == BLOOMERY_EXPERT_SHARED;
     int expert = shared_slot ? 0 : ids[slot];
     device const char * base = expert_base(shared_slot,
                                            (device const char *)shared,
@@ -295,7 +309,7 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
     const short iq = it / 4;
     const short ir = it % 4;
     const uint slot = tgpig.y;
-    if (slot >= 9u) {
+    if (slot >= BLOOMERY_EXPERT_SLOTS) {
         return;
     }
     // One output row per SIMD group, two SIMD groups in the threadgroup.
@@ -305,16 +319,7 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
     }
 
     int expert = 0;
-    bool bad = false;
-    if (slot != 8u) {
-        int id = ids[slot];
-        if (id < 0 || (uint)id >= args.n_experts) {
-            bad = true;
-        } else {
-            expert = id;
-        }
-    }
-    if (bad) {
+    if (pair_expert(ids, slot, args.n_experts, expert)) {
         if (tiisg == 0u) {
             pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer);
         }
@@ -322,9 +327,9 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
     }
 
     device const block_q4_K * grow =
-        pair_rows(gate, shexp_gate, slot == 8u, expert, args.rows, args.nblocks, row0);
+        pair_rows(gate, shexp_gate, slot == BLOOMERY_EXPERT_SHARED, expert, args.rows, args.nblocks, row0);
     device const block_q4_K * urow =
-        pair_rows(up, shexp_up, slot == 8u, expert, args.rows, args.nblocks, row0);
+        pair_rows(up, shexp_up, slot == BLOOMERY_EXPERT_SHARED, expert, args.rows, args.nblocks, row0);
     float sumg = 0.f;
     float sumu = 0.f;
     for (int ib = ix; ib < (int)args.nblocks; ib += 4) {
@@ -360,7 +365,7 @@ kernel void q6k_pair_swiglu(device const block_q6_K * gate [[buffer(0)]],
     const short il = tid % 8;
     const short l0 = 4 * il;
     const uint slot = tgpig.y;
-    if (slot >= 9u) {
+    if (slot >= BLOOMERY_EXPERT_SLOTS) {
         return;
     }
     const int row0 = (int)(tgpig.x * 2u + (uint)sgitg);
@@ -369,16 +374,7 @@ kernel void q6k_pair_swiglu(device const block_q6_K * gate [[buffer(0)]],
     }
 
     int expert = 0;
-    bool bad = false;
-    if (slot != 8u) {
-        int id = ids[slot];
-        if (id < 0 || (uint)id >= args.n_experts) {
-            bad = true;
-        } else {
-            expert = id;
-        }
-    }
-    if (bad) {
+    if (pair_expert(ids, slot, args.n_experts, expert)) {
         if (tiisg == 0u) {
             pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer);
         }
@@ -386,9 +382,9 @@ kernel void q6k_pair_swiglu(device const block_q6_K * gate [[buffer(0)]],
     }
 
     device const block_q6_K * grow =
-        pair_rows(gate, shexp_gate, slot == 8u, expert, args.rows, args.nblocks, row0);
+        pair_rows(gate, shexp_gate, slot == BLOOMERY_EXPERT_SHARED, expert, args.rows, args.nblocks, row0);
     device const block_q6_K * urow =
-        pair_rows(up, shexp_up, slot == 8u, expert, args.rows, args.nblocks, row0);
+        pair_rows(up, shexp_up, slot == BLOOMERY_EXPERT_SHARED, expert, args.rows, args.nblocks, row0);
     float sumg = 0.f;
     float sumu = 0.f;
     for (int ib = ix; ib < (int)args.nblocks; ib += 2) {
@@ -427,14 +423,7 @@ kernel void q4k_down_fold(device const block_q4_K * down [[buffer(0)]],
 
     // Every row reads every slot, so one bad id condemns the whole row, and
     // the check finishes before any weight pointer is formed.
-    bool bad = false;
-    for (uint s = 0u; s < 8u; ++s) {
-        int id = ids[s];
-        if (id < 0 || (uint)id >= args.n_experts) {
-            bad = true;
-        }
-    }
-    if (bad) {
+    if (!fold_ids_ok(ids, args.n_experts)) {
         if (tiisg == 0u) {
             fold_write_bad(y, row0, (int)args.rows, faults, args.layer);
         }
@@ -445,8 +434,8 @@ kernel void q4k_down_fold(device const block_q4_K * down [[buffer(0)]],
     float sum1 = 0.f;
     const int row1 = row0 + 1;
     const bool has1 = row1 < (int)args.rows;
-    for (int ib = ix; ib < 18; ib += 4) {
-        float scale = fold_route(w, ib);
+    for (int ib = ix; ib < BLOOMERY_EXPERT_BLOCKS; ib += 4) {
+        float scale = w[ib >> 1];
         float yl[16];
         float yh[16];
         float4 sumy;
@@ -463,9 +452,9 @@ kernel void q4k_down_fold(device const block_q4_K * down [[buffer(0)]],
     float d0 = simd_sum(sum0);
     float d1 = simd_sum(sum1);
     if (tiisg == 0u) {
-        fold_store(y, (uint)row0, d0);
+        y[(uint)row0] += d0;
         if (has1) {
-            fold_store(y, (uint)row1, d1);
+            y[(uint)row1] += d1;
         }
     }
 }
@@ -491,14 +480,7 @@ kernel void q6k_down_fold(device const block_q6_K * down [[buffer(0)]],
         return;
     }
 
-    bool bad = false;
-    for (uint s = 0u; s < 8u; ++s) {
-        int id = ids[s];
-        if (id < 0 || (uint)id >= args.n_experts) {
-            bad = true;
-        }
-    }
-    if (bad) {
+    if (!fold_ids_ok(ids, args.n_experts)) {
         if (tiisg == 0u) {
             fold_write_bad(y, row0, (int)args.rows, faults, args.layer);
         }
@@ -509,8 +491,8 @@ kernel void q6k_down_fold(device const block_q6_K * down [[buffer(0)]],
     float sum1 = 0.f;
     const int row1 = row0 + 1;
     const bool has1 = row1 < (int)args.rows;
-    for (int ib = ix; ib < 18; ib += 2) {
-        float scale = fold_route(w, ib);
+    for (int ib = ix; ib < BLOOMERY_EXPERT_BLOCKS; ib += 2) {
+        float scale = w[ib >> 1];
         float yl[16];
         q6k_load<true>(h + (ulong)ib * QK_K, ip, l0, scale, yl);
         device const block_q6_K * b0 =
@@ -525,9 +507,9 @@ kernel void q6k_down_fold(device const block_q6_K * down [[buffer(0)]],
     float d0 = simd_sum(sum0);
     float d1 = simd_sum(sum1);
     if (tiisg == 0u) {
-        fold_store(y, (uint)row0, d0);
+        y[(uint)row0] += d0;
         if (has1) {
-            fold_store(y, (uint)row1, d1);
+            y[(uint)row1] += d1;
         }
     }
 }

@@ -14,14 +14,14 @@
 use bloomery_device::{DeviceError, Window, WindowMut};
 
 use crate::device::MetalDevice;
-use crate::encode::{Binding, ComputeEncoder};
+use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
 use super::geometry::{
     BLOCK_VALUES, HEAD_COLS, PARTIALS_PER_HEAD, ROWS_PER_SIMD_GROUP, VALUE_HEADS,
 };
 use super::matvec::Quant;
-use super::{Kernels, args_bytes, check_window_len, word};
+use super::{Kernels, args_bytes, check_window_len, pack, word};
 
 /// The head-normed residual mat-vec's parameters: the out projection's weights,
 /// the gated numerator, the heads' partial sums, and the output the residual
@@ -55,11 +55,10 @@ struct Shape {
     groups: usize,
 }
 
-fn refuse(detail: String) -> DeviceError {
-    DeviceError::Range {
-        what: "headnorm matvec",
-        detail,
-    }
+const WHAT: &str = "headnorm matvec";
+
+fn refuse(detail: impl Into<String>) -> DeviceError {
+    super::range(WHAT, detail)
 }
 
 /// The shape of `p`, refused by name when the width is not the heads' own, when
@@ -76,29 +75,22 @@ fn check(p: &HeadNormParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError
         )));
     }
     let nblocks = p.cols / BLOCK_VALUES;
-    let weight_bytes = p
-        .rows
-        .checked_mul(nblocks)
-        .and_then(|blocks| blocks.checked_mul(Quant::Q4K.block_bytes()))
+    let weight_bytes = super::weight_bytes(Quant::Q4K, p.rows, nblocks)
         .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.cols)))?;
-    check_window_len("headnorm matvec", "weights", p.weights.len(), weight_bytes)?;
-    check_window_len("headnorm matvec", "g", p.g.len(), p.cols)?;
+    check_window_len(WHAT, "weights", p.weights.len(), weight_bytes)?;
+    check_window_len(WHAT, "g", p.g.len(), p.cols)?;
     check_window_len(
-        "headnorm matvec",
+        WHAT,
         "partials",
         p.partials.len(),
         VALUE_HEADS * PARTIALS_PER_HEAD,
     )?;
-    check_window_len("headnorm matvec", "y", p.y.len(), p.rows)?;
+    check_window_len(WHAT, "y", p.y.len(), p.rows)?;
     let start = p.weights.byte_range()?.start.get();
-    if !start.is_multiple_of(2) {
-        return Err(refuse(format!(
-            "the weights start {start} bytes into their buffer: the kernels read 16-bit words"
-        )));
-    }
+    super::check_weights_align(WHAT, "weights", start, super::WeightAlign::Half)?;
     Ok(Shape {
-        nblocks: word("headnorm matvec", "the block count", nblocks)?,
-        rows: word("headnorm matvec", "the row count", p.rows)?,
+        nblocks: word(WHAT, "the block count", nblocks)?,
+        rows: word(WHAT, "the row count", p.rows)?,
         groups: p.rows.div_ceil(simdgroups * ROWS_PER_SIMD_GROUP),
     })
 }
@@ -116,13 +108,14 @@ impl Kernels {
         let shape = check(&p, self.simdgroups)?;
         let args = args_bytes([shape.rows, shape.nblocks, p.layer, p.eps.to_bits()]);
         encoder.set_pipeline(&self.headnorm);
-        encoder.set_binding(0, Binding::of(&p.weights)?)?;
-        encoder.set_binding(1, Binding::of(&p.g)?)?;
-        encoder.set_binding(2, Binding::of(&p.partials)?)?;
-        encoder.set_binding(3, Binding::of_mut(&p.y)?)?;
-        encoder.set_binding(4, Binding::bytes(&args)?)?;
-        encoder.set_binding(5, p.fault.binding())?;
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.weights)?)?;
+        slot.set(Binding::of(&p.g)?)?;
+        slot.set(Binding::of(&p.partials)?)?;
+        slot.set(Binding::of_mut(&p.y)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.set(p.fault.binding())?;
         let threads = self.threads_per_group();
-        encoder.dispatch(shape.groups * threads, threads)
+        slot.dispatch_groups(shape.groups, 1, threads)
     }
 }

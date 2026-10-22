@@ -734,7 +734,7 @@ pub fn delta_bounds(h: &Harness<'_>) -> Clause {
         },
         Refusal {
             pos: PASS_ROWS + 1,
-            needle: "past the ring",
+            needle: "position window",
             ..whole
         },
         Refusal {
@@ -830,4 +830,16 @@ pub fn delta_bounds(h: &Harness<'_>) -> Clause {
     Ok(Verdict::Noted(format!(
         "{count} refusals, each by name, nothing written"
     )))
+}
+
+/// The gated-delta clauses, in gate order.
+pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    vec![
+        ("delta_step", Box::new(|| ctx.with(delta_step))),
+        ("delta_roll", Box::new(|| ctx.with(delta_roll))),
+        ("delta_ring", Box::new(|| ctx.with(delta_ring))),
+        ("delta_partial", Box::new(|| ctx.with(delta_partial))),
+        ("delta_nan", Box::new(|| ctx.with(delta_nan))),
+        ("delta_bounds", Box::new(|| delta_bounds(ctx.harness))),
+    ]
 }

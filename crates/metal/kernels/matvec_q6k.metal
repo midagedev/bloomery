@@ -12,9 +12,9 @@
 //   ggml/src/ggml-metal/kernels/mul_mv.metal
 // The lane map (tid/ix/ip/il), the two-block stride, the unpacking of the
 // 6-bit values, the row loop over a SIMD group's rows and the simd_sum
-// reduction are llama.cpp's: 2 rows per SIMD group, the SIMD groups in a
-// threadgroup the function constant of norm.metal (2 today, 8 for the head
-// kernel of a later round). The tail and the variants are matvec_q4k.metal's:
+// reduction are llama.cpp's: 2 rows per SIMD group. The SIMD groups in a
+// threadgroup are the function constant of norm.metal: 2 for the dense
+// mat-vec, 8 for the output head. The tail and the variants are matvec_q4k.metal's:
 // a SIMD group past the last row returns, and a row past the last re-reads the
 // last row and is never stored.
 //
@@ -161,7 +161,7 @@ kernel void q6k_matvec(device const block_q6_K * W [[buffer(0)]],
                        uint3  tgpig [[threadgroup_position_in_grid]],
                        ushort tiisg [[thread_index_in_simdgroup]],
                        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const int first_row = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    const int first_row = simd_first_row(tgpig.x, sgitg);
     q6k_rows<false, false>(W, x, y, args.nblocks, args.eps, args.layer,
                            nullptr, nullptr, first_row, (int)args.rows, tiisg);
 }
@@ -175,7 +175,7 @@ kernel void q6k_matvec_norm(device const block_q6_K * W [[buffer(0)]],
                             uint3  tgpig [[threadgroup_position_in_grid]],
                             ushort tiisg [[thread_index_in_simdgroup]],
                             ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const int first_row = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    const int first_row = simd_first_row(tgpig.x, sgitg);
     q6k_rows<true, false>(W, x, y, args.nblocks, args.eps, args.layer,
                           gain, faults, first_row, (int)args.rows, tiisg);
 }
@@ -187,7 +187,7 @@ kernel void q6k_matvec_resid(device const block_q6_K * W [[buffer(0)]],
                              uint3  tgpig [[threadgroup_position_in_grid]],
                              ushort tiisg [[thread_index_in_simdgroup]],
                              ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const int first_row = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    const int first_row = simd_first_row(tgpig.x, sgitg);
     q6k_rows<false, true>(W, x, y, args.nblocks, args.eps, args.layer,
                           nullptr, nullptr, first_row, (int)args.rows, tiisg);
 }
@@ -211,7 +211,7 @@ kernel void q6k_matvec_seg(device const block_q6_K * W [[buffer(0)]],
         }
     }
     const uint local = tgpig.x - args.segs[s].first_group;
-    const int first_row = (int)((local * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    const int first_row = simd_first_row(local, sgitg);
     q6k_rows<true, false>(
         W + (ulong)args.segs[s].wblocks,
         x,

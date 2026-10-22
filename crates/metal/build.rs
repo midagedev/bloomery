@@ -14,14 +14,40 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The mat-vec launch geometry, from the file the host module reads it from:
-/// the one owner of the numbers both sides use.
+/// The mat-vec launch geometry, from the file the host module reads it from.
 #[allow(
     dead_code,
-    reason = "the host module reads every constant; the header takes two of them"
+    reason = "the host module reads every constant; the header emits the ones the kernels read"
 )]
 mod geometry {
     include!("src/kernels/geometry.rs");
+}
+
+/// The gated delta step's geometry, from the file the host module reads.
+#[allow(
+    dead_code,
+    reason = "the host module reads every constant; the header emits the ring length"
+)]
+mod delta_geom {
+    include!("src/kernels/delta_geom.rs");
+}
+
+/// The router's geometry, from the file the host module reads.
+#[allow(
+    dead_code,
+    reason = "the host module reads every constant; the header emits the ones the kernel reads"
+)]
+mod router_geom {
+    include!("src/kernels/router_geom.rs");
+}
+
+/// The expert pair and fold geometry, from the file the host module reads.
+#[allow(
+    dead_code,
+    reason = "the host module reads every constant; the header emits the ones the kernel reads"
+)]
+mod experts_geom {
+    include!("src/kernels/experts_geom.rs");
 }
 
 /// The fault site's table, written as the Metal compiler sees it.
@@ -50,20 +76,56 @@ fn fault_sites_header() -> String {
     out
 }
 
-/// The mat-vec launch geometry, written as the Metal compiler sees it.
-fn matvec_geometry_header() -> String {
+/// The launch geometry, written as the Metal compiler sees it. Each number
+/// has one owner: the Rust constant the host module includes.
+fn geometry_header() -> String {
     format!(
         "// The mat-vec launch geometry, from src/kernels/geometry.rs.\n\
-         #define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {}\n\
-         #define BLOOMERY_MATVEC_MAX_SEGMENTS {}\n\
-         #define BLOOMERY_MATVEC_VALUE_HEADS {}\n\
-         #define BLOOMERY_MATVEC_HEAD_COLS {}\n\
-         #define BLOOMERY_MATVEC_PARTIALS_PER_HEAD {}\n",
-        geometry::ROWS_PER_SIMD_GROUP,
-        geometry::MAX_SEGMENTS,
-        geometry::VALUE_HEADS,
-        geometry::HEAD_COLS,
-        geometry::PARTIALS_PER_HEAD
+         #define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {rows}\n\
+         #define BLOOMERY_MATVEC_MAX_SEGMENTS {segs}\n\
+         // The gated delta net's head geometry. The numbers live with the\n\
+         // mat-vec geometry; the delta step and the head-normed mat-vec read them.\n\
+         #define BLOOMERY_DELTA_VALUE_HEADS {heads}\n\
+         #define BLOOMERY_DELTA_HEAD_COLS {cols}\n\
+         #define BLOOMERY_DELTA_COLUMN_BLOCKS {blocks}\n\
+         #define BLOOMERY_DELTA_COLS_PER_BLOCK {per}\n\
+         // The conv ring, from src/kernels/delta_geom.rs.\n\
+         #define BLOOMERY_DELTA_RING_ROWS {ring}\n\
+         // The router, from src/kernels/router_geom.rs.\n\
+         #define BLOOMERY_ROUTER_ROWS {rrows}\n\
+         #define BLOOMERY_ROUTER_EXPERTS {rexperts}\n\
+         #define BLOOMERY_ROUTER_K {rk}\n\
+         #define BLOOMERY_ROUTER_SPLIT {rsplit}\n\
+         #define BLOOMERY_ROUTER_SG {rsg}\n\
+         #define BLOOMERY_ROUTER_FLOAT4S {rfloat4}\n\
+         #define BLOOMERY_ROUTER_TOPK_MAX {rtop}\n\
+         #define BLOOMERY_ROUTER_LANES {rlanes}\n\
+         // The expert pair and the folded down, from src/kernels/experts_geom.rs.\n\
+         #define BLOOMERY_EXPERT_SLOTS {eslots}\n\
+         #define BLOOMERY_EXPERT_ROUTED {erouted}\n\
+         #define BLOOMERY_EXPERT_SHARED {eshared}\n\
+         #define BLOOMERY_EXPERT_K {ek}\n\
+         #define BLOOMERY_EXPERT_BLOCKS {eblocks}\n",
+        rows = geometry::ROWS_PER_SIMD_GROUP,
+        segs = geometry::MAX_SEGMENTS,
+        heads = geometry::VALUE_HEADS,
+        cols = geometry::HEAD_COLS,
+        blocks = geometry::PARTIALS_PER_HEAD,
+        per = geometry::HEAD_COLS / geometry::PARTIALS_PER_HEAD,
+        ring = delta_geom::RING_ROWS,
+        rrows = router_geom::ROWS,
+        rexperts = router_geom::EXPERTS,
+        rk = router_geom::K,
+        rsplit = router_geom::SPLIT,
+        rsg = router_geom::SIMD_GROUPS,
+        rfloat4 = router_geom::FLOAT4S,
+        rtop = router_geom::TOP_K_MAX,
+        rlanes = router_geom::SIMD_WIDTH,
+        eslots = experts_geom::EXPERT_SLOTS,
+        erouted = experts_geom::ROUTED_IDS,
+        eshared = experts_geom::SHARED_SLOT,
+        ek = experts_geom::EXPERT_K,
+        eblocks = experts_geom::FOLDED_BLOCKS,
     )
 }
 
@@ -135,6 +197,9 @@ fn build_metallib(source: &Path, out_dir: &Path) -> Option<PathBuf> {
 fn main() {
     println!("cargo:rerun-if-changed=kernels");
     println!("cargo:rerun-if-changed=src/kernels/geometry.rs");
+    println!("cargo:rerun-if-changed=src/kernels/delta_geom.rs");
+    println!("cargo:rerun-if-changed=src/kernels/router_geom.rs");
+    println!("cargo:rerun-if-changed=src/kernels/experts_geom.rs");
     println!("cargo:rerun-if-changed=build.rs");
     // Installing the Metal Toolchain (or pointing at another one) changes
     // what `xcrun` answers: the build runs again.
@@ -157,13 +222,14 @@ fn main() {
         "matvec_q4k",
         "matvec_q6k",
         "embed",
-        // K2-REGISTER ticket's helpers are what the router calls, so ticket is first.
-        "ticket",    // K2-REGISTER
-        "router",    // K2-REGISTER
-        "experts",   // K3-REGISTER
-        "delta",     // K4-REGISTER
-        "attention", // K5-REGISTER
-        "head",      // K6-REGISTER
+        // Ticket's helpers are what the router and the head call, so ticket
+        // comes before either kernel.
+        "ticket",
+        "router",
+        "experts",
+        "delta",
+        "attention",
+        "head",
     ] {
         let path = kernels_dir.join(format!("{name}.metal"));
         let source =
@@ -171,7 +237,7 @@ fn main() {
         kernels.push((name, source));
     }
 
-    let header = fault_sites_header() + &matvec_geometry_header();
+    let header = fault_sites_header() + &geometry_header();
     let combined = combined_source(&header, &kernels);
     let source_path = out_dir.join("bloomery.metal");
     std::fs::write(&source_path, &combined).expect("the source is written");

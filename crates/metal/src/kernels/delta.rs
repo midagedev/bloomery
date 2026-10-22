@@ -8,23 +8,13 @@
 use bloomery_device::{DeviceError, Window, WindowMut};
 
 use crate::device::MetalDevice;
-use crate::encode::{Binding, ComputeEncoder};
+use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
 use super::geometry::{HEAD_COLS, PARTIALS_PER_HEAD, VALUE_HEADS};
-use super::{Kernels, check_window_len, check_word, word};
+use super::{Kernels, check_window_len, check_word, pack, word};
 
-/// Taps of the causal conv.
-pub const CONV_TAPS: usize = 4;
-
-/// Predecessors the conv reads: the taps except the current token.
-pub const CONV_ROWS: usize = CONV_TAPS - 1;
-
-/// Positions one step's position window may name.
-pub const PASS_ROWS: usize = 8;
-
-/// Slots of the conv ring: the predecessors plus the positions of one pass.
-pub const RING_ROWS: usize = CONV_ROWS + PASS_ROWS;
+include!("delta_geom.rs");
 
 /// `1 / sqrt(HEAD_COLS)` rounded to f32. The kernel multiplies the query by
 /// this value; an oracle promotes these bits, rather than a fresh reciprocal.
@@ -149,31 +139,18 @@ pub struct DeltaParams<'w> {
     pub lane_at: usize,
     /// The layer a raise is recorded in.
     pub layer: u32,
-    /// The position window. A step reads one position; more than
-    /// [`PASS_ROWS`] is past the ring.
+    /// The position window. A step reads one position.
     pub pos: &'w [u32],
     /// The L2 norm's epsilon.
     pub eps: f32,
 }
 
 fn refuse(detail: impl Into<String>) -> DeviceError {
-    DeviceError::Range {
-        what: WHAT,
-        detail: detail.into(),
-    }
+    super::range(WHAT, detail)
 }
 
-fn pack(words: [u32; 8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for (i, word) in words.into_iter().enumerate() {
-        out[i * 4..][..4].copy_from_slice(&word.to_ne_bytes());
-    }
-    out
-}
-
-/// The shape, refused by name before any window is read. The position window
-/// is checked here too: a window past the ring is a different refusal from a
-/// window of the wrong length.
+/// The shape, refused by name before any window is read. A position window
+/// that is not one position is refused here too.
 fn check_shape(p: &DeltaParams<'_>) -> Result<(), DeviceError> {
     if p.n_v != VALUE_HEADS {
         return Err(refuse(format!(
@@ -201,12 +178,6 @@ fn check_shape(p: &DeltaParams<'_>) -> Result<(), DeviceError> {
     }
     if p.lanes == 0 {
         return Err(refuse("lanes of 0"));
-    }
-    if p.pos.len() > PASS_ROWS {
-        return Err(refuse(format!(
-            "a position window of {} is past the ring",
-            p.pos.len()
-        )));
     }
     if p.pos.len() != 1 {
         return Err(refuse(format!(
@@ -270,32 +241,32 @@ impl Kernels {
         let n_k = word(WHAT, "n_k", p.n_k)?;
         let lanes = word(WHAT, "the lane count", p.lanes)?;
         let lane_at = word(WHAT, "the lane index", p.lane_at)?;
-        let args = pack([
-            n_k,
-            p.map.word(),
-            lanes,
-            lane_at,
-            p.layer,
-            p.pos[0],
-            p.eps.to_bits(),
-            0,
-        ]);
+        let args = [
+            n_k.to_ne_bytes(),
+            p.map.word().to_ne_bytes(),
+            lanes.to_ne_bytes(),
+            lane_at.to_ne_bytes(),
+            p.layer.to_ne_bytes(),
+            p.pos[0].to_ne_bytes(),
+            p.eps.to_ne_bytes(),
+        ];
         encoder.set_pipeline(&self.delta);
-        encoder.set_binding(0, Binding::of(&p.x)?)?;
-        encoder.set_binding(1, Binding::of(&p.conv_w)?)?;
-        encoder.set_binding(2, Binding::of(&p.b_raw)?)?;
-        encoder.set_binding(3, Binding::of(&p.a_raw)?)?;
-        encoder.set_binding(4, Binding::of(&p.dt_bias)?)?;
-        encoder.set_binding(5, Binding::of(&p.ssm_a)?)?;
-        encoder.set_binding(6, Binding::of(&p.z)?)?;
-        encoder.set_binding(7, Binding::of(&p.norm_w)?)?;
-        encoder.set_binding(8, Binding::of(&p.lane)?)?;
-        encoder.set_binding(9, Binding::of_mut(&p.state)?)?;
-        encoder.set_binding(10, Binding::of_mut(&p.ring)?)?;
-        encoder.set_binding(11, Binding::of_mut(&p.partials)?)?;
-        encoder.set_binding(12, Binding::of_mut(&p.g)?)?;
-        encoder.set_binding(13, Binding::bytes(&args)?)?;
-        encoder.set_binding(14, p.faults.binding())?;
-        encoder.dispatch(GROUPS * GROUP_THREADS, GROUP_THREADS)
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.x)?)?;
+        slot.set(Binding::of(&p.conv_w)?)?;
+        slot.set(Binding::of(&p.b_raw)?)?;
+        slot.set(Binding::of(&p.a_raw)?)?;
+        slot.set(Binding::of(&p.dt_bias)?)?;
+        slot.set(Binding::of(&p.ssm_a)?)?;
+        slot.set(Binding::of(&p.z)?)?;
+        slot.set(Binding::of(&p.norm_w)?)?;
+        slot.set(Binding::of(&p.lane)?)?;
+        slot.set(Binding::of_mut(&p.state)?)?;
+        slot.set(Binding::of_mut(&p.ring)?)?;
+        slot.set(Binding::of_mut(&p.partials)?)?;
+        slot.set(Binding::of_mut(&p.g)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.set(p.faults.binding())?;
+        slot.dispatch_groups(GROUPS, 1, GROUP_THREADS)
     }
 }

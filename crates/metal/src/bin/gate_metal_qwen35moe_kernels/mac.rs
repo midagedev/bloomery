@@ -4,78 +4,15 @@
 //! 1 when any clause failed, 78 when this machine cannot run the backend (a
 //! macOS below the floor, no Metal device), 0 otherwise. The weights are the
 //! fixture's own tensors; the oracle is `crates/gguf`'s dequantization of the
-//! same blocks with an f64 dot, held to the band `oracle.rs` derives. The
-//! clauses:
-//!
-//! 1. **q4k_matvec**: the Q4_K mat-vec at K = 2048 (`blk.0.attn_qkv`), 4096
-//!    (`blk.0.ssm_out`) and 512 (`blk.0.ffn_down_shexp`).
-//! 2. **q6k_matvec**: the Q6_K mat-vec on `blk.2.attn_qkv`,
-//!    `blk.2.ffn_down_shexp`, `blk.3.attn_v` and rows of `output.weight`.
-//! 3. **norm_on_load**: the mat-vec of an RMS-normed input is the host's
-//!    `rms_norm` then the mat-vec, and an input the norm cannot take raises
-//!    the norm site and writes NaN rows.
-//! 4. **residual_epilogue**: `y = y + W . x` in place.
-//! 5. **row_tail**: a row count that is not a multiple of the rows of a
-//!    threadgroup writes every row and nothing past the last.
-//! 6. **row_tail_reads**: those launches read nothing outside their weights'
-//!    buffer, as Metal's shader validation sees them in a child run of this
-//!    gate (a read nothing stores shows in no output).
-//! 7. **metallib_equals_source**: the metallib's outputs and the source's are
-//!    the same bits, when both paths exist.
-//! 8. **embed**: an id at or past the vocabulary raises the token-id site, and
-//!    its row is NaN.
-//! 9. **matvec_refusals**: a window that is not the shape's, columns that are
-//!    not whole blocks and an empty shape are refused by name, and nothing is
-//!    encoded for them.
-//! 10. **block_shape**: the block bytes and values the launch arithmetic
-//!     uses are gguf's own for Q4_K and Q6_K.
-//! 11. **seg_bit**: every segment of a segmented dispatch is the same bits as
-//!     the same tensor run alone: the delta layer's Q4_K group, the attention
-//!     layer's group, and the mixed-type layer's Q6_K dispatch.
-//! 12. **seg_bounds**: a segment list with mismatched widths, a row count of
-//!     zero, more segments than a dispatch runs, or overlapping outputs is
-//!     refused by name, and nothing is encoded for it.
-//! 13. **headnorm**: the head-normed residual mat-vec against the f64 oracle,
-//!     the gated numerator and the heads' partial sums as the inputs.
-//! 14. **headnorm_nan**: a partial or a gated numerator that is not finite
-//!     raises the gate site and writes NaN.
-//! 15. **nsg**: the Q6_K mat-vec at eight SIMD groups in a threadgroup is the
-//!     same bits as at two, for every row count the fixture's Q6_K tensors
-//!     have.
-//! 16. **router_logit**: the router's logits sit inside the f64 band. // K2-REGISTER
-//! 17. **router_ids**: the routed ids match the f64 ranking when the 8th-vs-9th margin is wider than the band, and a step inside the band is printed by name. // K2-REGISTER
-//! 18. **router_weights**: the top-8 weights and the shared-expert sigmoid match the f64 rule. // K2-REGISTER
-//! 19. **router_ticket**: 10000 launches, and each launch's ids are the host's selection from that launch's logits. // K2-REGISTER
-//! 20. **router_nan**: a non-finite weight raises the router site and the ids stay in range. // K2-REGISTER
-//! 21. **router_bounds**: a shape, a window, an eps or an alignment the kernel does not take is refused by name, and nothing is encoded. // K2-REGISTER
-//! 22. **pair**: silu(gate) times up, against the f64 oracle. // K3-REGISTER
-//! 23. **pair_id**: an id past the stack raises expert_id and writes NaN. // K3-REGISTER
-//! 24. **pair_shared**: slot 8 reads the shared expert, the others the stack. // K3-REGISTER
-//! 25. **fold**: the folded down plus the residual, against the f64 oracle. // K3-REGISTER
-//! 26. **fold_type**: a shared expert of another quant is refused by name. // K3-REGISTER
-//! 27. **experts_bounds**: a launch that is not the shape is refused by name. // K3-REGISTER
-//! 28. **delta_step**: one gated delta step from a host state, against f64. // K4-REGISTER
-//! 29. **delta_roll**: five steps, each fed by the kernel's own state. // K4-REGISTER
-//! 30. **delta_ring**: a predecessor is read only while the position reaches it, and one ring slot is written. // K4-REGISTER
-//! 31. **delta_partial**: the partials and the numerator, accepted by the head-norm launch. // K4-REGISTER
-//! 32. **delta_nan**: a non-finite lane raises the lane site and writes NaN on that lane. // K4-REGISTER
-//! 33. **delta_bounds**: a shape, a position window and a numerator window are refused by name. // K4-REGISTER
-//! 34. **attn-f16**: f16 attention and the appended cache match f64 attention, at S = 1 and S = 4. // K5-REGISTER
-//! 35. **attn-q8**: the appended q8_0 row matches `gguf::quant::quantize_q8_0`, and attention over it is inside the band. // K5-REGISTER
-//! 36. **attn-s**: S = 1 and S = 4 agree inside the band. // K5-REGISTER
-//! 37. **attn-reread**: the re-fetch arm matches the tile arm inside the band. // K5-REGISTER
-//! 38. **attn-m**: two query positions match the oracle. // K5-REGISTER
-//! 39. **attn-fault**: KeyCount, CachePos and KvQuant. // K5-REGISTER
-//! 40. **attn-bounds**: a shape or a window the kernel does not take is refused by name. // K5-REGISTER
-//! 41. **head_logit**: sample rows of `output.weight` sit inside the Q6_K norm-on-load band. // K6-REGISTER
-//! 42. **head_id**: a wide margin on the shipped grid names the f64 argmax, and a bit tie names the smaller index. // K6-REGISTER
-//! 43. **head_ticket**: 1000 launches, and each launch's id and candidates are that launch's logits. // K6-REGISTER
-//! 44. **head_nan**: a NaN block scale stays NaN, raises the logit site, and the id is the finite argmax. // K6-REGISTER
-//! 45. **head_bounds**: a shape, a window, an eps or a SIMD-group count the kernel does not take is refused by name, and nothing is encoded. // K6-REGISTER
+//! same blocks with an f64 dot, held to the band `oracle.rs` derives.
+//! `--list` prints the clause names in the order the gate runs them: the
+//! mat-vec clauses, then the token's kernels (delta, router, experts,
+//! attention, head).
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
-//! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
-//! clause that must catch the named kernel defect (`mutants.rs`) against
+//! otherwise); `--list` prints the clause names and exits; `--only CLAUSE`
+//! runs one clause; `--mutant NAME` runs the one clause that must catch the
+//! named kernel defect (`mutants.rs`) against
 //! kernels compiled from the edited source, and a clause that stays green on
 //! its mutant is the finding; `--mutants-all` runs every mutant in a child
 //! gate of its own and is red when one stays green on its clause (a mutant
@@ -96,30 +33,30 @@ use bloomery_metal::stream::MetalStream;
 
 #[path = "clauses.rs"]
 mod clauses;
-#[path = "clauses_attention.rs"] // K5-REGISTER
-mod clauses_attention; // K5-REGISTER
-#[path = "clauses_delta.rs"] // K4-REGISTER
-mod clauses_delta; // K4-REGISTER
-#[path = "clauses_experts.rs"] // K3-REGISTER
-mod clauses_experts; // K3-REGISTER
-#[path = "clauses_head.rs"] // K6-REGISTER
-mod clauses_head; // K6-REGISTER
-#[path = "clauses_router.rs"] // K2-REGISTER
-mod clauses_router; // K2-REGISTER
+#[path = "clauses_attention.rs"]
+mod clauses_attention;
+#[path = "clauses_delta.rs"]
+mod clauses_delta;
+#[path = "clauses_experts.rs"]
+mod clauses_experts;
+#[path = "clauses_head.rs"]
+mod clauses_head;
+#[path = "clauses_router.rs"]
+mod clauses_router;
 #[path = "fixture.rs"]
 mod fixture;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "../shared/oracle.rs"]
 mod oracle;
-#[path = "../shared/oracle_attention.rs"] // K5-REGISTER
+#[path = "../shared/oracle_attention.rs"]
 mod oracle_attention;
-#[path = "../shared/oracle_delta.rs"] // K4-REGISTER
-mod oracle_delta; // K4-REGISTER
-#[path = "../shared/oracle_experts.rs"] // K3-REGISTER
-mod oracle_experts; // K3-REGISTER
-#[path = "../shared/oracle_router.rs"] // K2-REGISTER
-mod oracle_router; // K2-REGISTER // K5-REGISTER
+#[path = "../shared/oracle_delta.rs"]
+mod oracle_delta;
+#[path = "../shared/oracle_experts.rs"]
+mod oracle_experts;
+#[path = "../shared/oracle_router.rs"]
+mod oracle_router;
 
 /// A clause, ready to run.
 type ClauseRun<'a> = Box<dyn Fn() -> Clause + 'a>;
@@ -203,6 +140,23 @@ pub struct Harness<'a> {
     /// The library the kernels came from: a clause that runs the same kernels
     /// with another geometry builds them again from it.
     pub library: &'a Library,
+}
+
+/// What a clause table closes over.
+pub struct ClauseCtx<'a> {
+    pub harness: &'a Harness<'a>,
+    pub fixture: &'a Result<fixture::Fixture, String>,
+    pub args: &'a [String],
+}
+
+impl<'a> ClauseCtx<'a> {
+    /// Run a fixture clause, or the fixture's open error when there is none.
+    fn with(&self, f: fn(&Harness<'_>, &fixture::Fixture) -> Clause) -> Clause {
+        match self.fixture {
+            Ok(fixture) => f(self.harness, fixture),
+            Err(e) => Err(e.clone()),
+        }
+    }
 }
 
 fn padded<T: Copy>(pad: T, before: usize, body: &[T], after: usize) -> Vec<T> {
@@ -568,73 +522,26 @@ pub fn main() -> ExitCode {
     }
 
     let mut report = Report::new();
-    let with = |f: fn(&Harness<'_>, &fixture::Fixture) -> Clause| match &fixture {
-        Ok(fixture) => f(&harness, fixture),
-        Err(e) => Err(e.clone()),
+    let ctx = ClauseCtx {
+        harness: &harness,
+        fixture: &fixture,
+        args: &args,
     };
-    #[rustfmt::skip] // K2-REGISTER
-    let clauses: [(&'static str, ClauseRun<'_>); 45] = [ // K2-REGISTER
-        ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
-        ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
-        ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
-        (
-            "residual_epilogue",
-            Box::new(|| with(clauses::residual_epilogue)),
-        ),
-        ("row_tail", Box::new(|| with(clauses::row_tail))),
-        (
-            "row_tail_reads",
-            Box::new(|| clauses::row_tail_reads(&args)),
-        ),
-        (
-            "metallib_equals_source",
-            Box::new(|| match &fixture {
-                Ok(fixture) => clauses::metallib_equals_source(&device, stream, fixture),
-                Err(e) => Err(e.clone()),
-            }),
-        ),
-        ("embed", Box::new(|| with(clauses::embed))),
-        (
-            "matvec_refusals",
-            Box::new(|| clauses::matvec_refusals(&harness)),
-        ),
-        ("block_shape", Box::new(clauses::block_shape)),
-        ("seg_bit", Box::new(|| with(clauses::seg_bit))),
-        ("seg_bounds", Box::new(|| with(clauses::seg_bounds))),
-        ("headnorm", Box::new(|| with(clauses::headnorm))),
-        ("headnorm_nan", Box::new(|| with(clauses::headnorm_nan))),
-        ("nsg", Box::new(|| with(clauses::nsg))),
-        ("router_logit", Box::new(|| with(clauses_router::router_logit))), // K2-REGISTER
-        ("router_ids", Box::new(|| with(clauses_router::router_ids))), // K2-REGISTER
-        ("router_weights", Box::new(|| with(clauses_router::router_weights))), // K2-REGISTER
-        ("router_ticket", Box::new(|| with(clauses_router::router_ticket))), // K2-REGISTER
-        ("router_nan", Box::new(|| with(clauses_router::router_nan))), // K2-REGISTER
-        ("router_bounds", Box::new(|| clauses_router::router_bounds(&harness))), // K2-REGISTER
-        ("pair", Box::new(|| with(clauses_experts::pair))), // K3-REGISTER
-        ("pair_id", Box::new(|| with(clauses_experts::pair_id))), // K3-REGISTER
-        ("pair_shared", Box::new(|| with(clauses_experts::pair_shared))), // K3-REGISTER
-        ("fold", Box::new(|| with(clauses_experts::fold))), // K3-REGISTER
-        ("fold_type", Box::new(|| with(clauses_experts::fold_type))), // K3-REGISTER
-        ("experts_bounds", Box::new(|| with(clauses_experts::experts_bounds))), // K3-REGISTER
-        ("delta_step", Box::new(|| with(clauses_delta::delta_step))), // K4-REGISTER
-        ("delta_roll", Box::new(|| with(clauses_delta::delta_roll))), // K4-REGISTER
-        ("delta_ring", Box::new(|| with(clauses_delta::delta_ring))), // K4-REGISTER
-        ("delta_partial", Box::new(|| with(clauses_delta::delta_partial))), // K4-REGISTER
-        ("delta_nan", Box::new(|| with(clauses_delta::delta_nan))), // K4-REGISTER
-        ("delta_bounds", Box::new(|| clauses_delta::delta_bounds(&harness))), // K4-REGISTER
-        ("attn-f16", Box::new(|| with(clauses_attention::attn_f16))), // K5-REGISTER
-        ("attn-q8", Box::new(|| with(clauses_attention::attn_q8))), // K5-REGISTER
-        ("attn-s", Box::new(|| with(clauses_attention::attn_s))), // K5-REGISTER
-        ("attn-reread", Box::new(|| with(clauses_attention::attn_reread))), // K5-REGISTER
-        ("attn-m", Box::new(|| with(clauses_attention::attn_m))), // K5-REGISTER
-        ("attn-fault", Box::new(|| with(clauses_attention::attn_fault))), // K5-REGISTER
-        ("attn-bounds", Box::new(|| with(clauses_attention::attn_bounds))), // K5-REGISTER
-        ("head_logit", Box::new(|| with(clauses_head::head_logit))), // K6-REGISTER
-        ("head_id", Box::new(|| with(clauses_head::head_id))), // K6-REGISTER
-        ("head_ticket", Box::new(|| with(clauses_head::head_ticket))), // K6-REGISTER
-        ("head_nan", Box::new(|| with(clauses_head::head_nan))), // K6-REGISTER
-        ("head_bounds", Box::new(|| clauses_head::head_bounds(&harness))), // K6-REGISTER
-    ];
+    // The token's kernels follow the token DAG. A new kernel adds one line.
+    let clauses: Vec<_> = clauses::table(&ctx)
+        .into_iter()
+        .chain(clauses_delta::table(&ctx))
+        .chain(clauses_router::table(&ctx))
+        .chain(clauses_experts::table(&ctx))
+        .chain(clauses_attention::table(&ctx))
+        .chain(clauses_head::table(&ctx))
+        .collect();
+    if args.iter().any(|a| a == "--list") {
+        for (name, _) in &clauses {
+            println!("{name}");
+        }
+        return ExitCode::SUCCESS;
+    }
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)
     {
