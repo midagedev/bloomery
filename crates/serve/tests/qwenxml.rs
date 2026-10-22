@@ -574,8 +574,9 @@ fn weather_tools() -> Value {
 /// its name or from its source's spelling alone: MiMo's compact call is
 /// [`Framing::Compact`], the Qwen3.6, Qwen3.8 and Nemotron calls (a value on a
 /// line of its own) are [`Framing::Lines`], and so are two small templates
-/// that differ in nothing but how they write a value. A template that spells
-/// the tags and renders no call keeps the spelled markup's own framing.
+/// that differ in nothing but how they write a value. The probe's own call
+/// decides, not a header's example before it. A template that spells the tags
+/// and renders no call is [`ToolFormat::Unparsed`]: no framing is guessed.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_framing_follows_the_rendered_call() {
@@ -601,9 +602,19 @@ fn hw_framing_follows_the_rendered_call() {
         )
     };
     assert_eq!(ToolFormat::of_template(&small("{{ v }}")), compact);
-    assert_eq!(ToolFormat::of_template(&small("\n{{ v }}\n")), lines);
+    assert_eq!(
+        ToolFormat::of_template(
+            &small("\n{{ v }}\n").replace("</parameter>", "</parameter>{{ '\\n' }}")
+        ),
+        lines
+    );
+    let example = "<tool_call><function=get_weather><parameter=location>\nSeoul\n</parameter>\n</function></tool_call>";
+    assert_eq!(
+        ToolFormat::of_template(&format!("{example}{}", small("{{ v }}"))),
+        compact
+    );
     let no_call = "{{- raise_exception('nothing renders') }}<tool_call><function=f><parameter=p>";
-    assert_eq!(ToolFormat::of_template(no_call), lines);
+    assert_eq!(ToolFormat::of_template(no_call), ToolFormat::Unparsed);
 }
 
 /// The two outputs the llama.cpp reference's autoparser (mainline,
@@ -1125,10 +1136,8 @@ fn hw_qwen_chat_tool_calls_stream_and_non_stream() {
     assert_eq!(folded["calls"], json!(calls), "streamed == non-streamed");
 }
 
-/// A server on MiMo's template answers a compact call, streamed and not: the
-/// request that answered `500` ("expected a newline after <parameter=KEY>")
-/// when every Qwen3-Coder template was read as the lines framing is a `200`
-/// with the call the reference reads, `get_weather {"city":"Seoul"}`.
+/// MiMo's compact calls return the reference arguments,
+/// `get_weather {"city":"Seoul"}`, in streamed and non-streamed responses.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_a_server_on_mimos_template_answers_a_compact_call() {

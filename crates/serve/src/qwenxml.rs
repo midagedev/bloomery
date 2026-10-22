@@ -94,24 +94,23 @@ impl Framing {
     }
 
     /// The framing a rendered assistant call shows: the text a template wrote
-    /// for `<parameter=key>` holding the string `value`, which sits between the
-    /// tags bare ([`Framing::Compact`]) or on a line of its own
-    /// ([`Framing::Lines`]). `None` when no such parameter is rendered, or in a
-    /// spelling that is neither.
+    /// for `<parameter=key>` holding the string `value` in its last
+    /// `<tool_call>` (the probe's call; a header's example sits before it),
+    /// read with the scanner's own delimiters, so the framing found is one
+    /// the scanner closes. `None` when that call renders no such parameter,
+    /// or in a spelling that is neither.
     pub(crate) fn of_rendered(rendered: &str, key: &str, value: &str) -> Option<Framing> {
-        let opener = format!("{PARAM_OPEN}{key}>");
-        let compact = format!("{value}{PARAM_CLOSE}");
-        let lines = format!("\n{value}\n{PARAM_CLOSE}");
-        rendered.match_indices(&opener).find_map(|(at, _)| {
-            let after = &rendered[at + opener.len()..];
-            if after.starts_with(&compact) {
-                Some(Framing::Compact)
-            } else if after.starts_with(&lines) {
-                Some(Framing::Lines)
-            } else {
-                None
-            }
-        })
+        let (_, call) = rendered.rsplit_once(CALL_OPEN)?;
+        let (_, after) = call.split_once(&format!("{PARAM_OPEN}{key}>"))?;
+        [Framing::Lines, Framing::Compact]
+            .into_iter()
+            .find(|framing| {
+                after.starts_with(&format!(
+                    "{}{value}{}",
+                    framing.value_open(),
+                    framing.value_close()
+                ))
+            })
     }
 }
 

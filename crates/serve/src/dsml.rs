@@ -480,14 +480,15 @@ impl ToolFormat {
     /// Hermes' JSON body, which only a rendered call tells apart
     /// ([`ToolFormat::of_chat_template`]). Qwen3-Coder's framing is read from
     /// that rendered call too: the source is parsed and probed here, and a
-    /// source that does not render one is [`Framing::Lines`], the spelled
-    /// markup's own.
+    /// source that does not render one in either framing is
+    /// [`ToolFormat::Unparsed`] (a guessed framing would change a value's
+    /// bytes).
     #[must_use]
     pub fn of_template(source: &str) -> ToolFormat {
         ToolFormat::spelled(source, || {
             ChatTemplate::parse(source)
                 .ok()
-                .and_then(|t| qwen_framing(&t))
+                .and_then(|t| probe_framing(&t))
         })
     }
 
@@ -498,11 +499,10 @@ impl ToolFormat {
     /// `<tool_call>` template the source cannot type by spelling — Hermes'
     /// when some rendered `<tool_call>`…`</tool_call>` holds a JSON body
     /// naming `name` and `arguments`. A template whose probe render fails
-    /// teaches nothing this server parses, except Qwen3-Coder's spelled markup,
-    /// which stays [`Framing::Lines`].
+    /// teaches nothing this server parses.
     #[must_use]
     pub fn of_chat_template(t: &ChatTemplate) -> ToolFormat {
-        let spelled = ToolFormat::spelled(t.source(), || qwen_framing(t));
+        let spelled = ToolFormat::spelled(t.source(), || probe_framing(t));
         if spelled != ToolFormat::Unparsed {
             return spelled;
         }
@@ -524,7 +524,7 @@ impl ToolFormat {
         if let Some(spelling) = KvSpelling::of_template(source) {
             ToolFormat::KvMarkup(spelling)
         } else if qwen.iter().all(|tag| source.contains(tag)) {
-            ToolFormat::QwenXml(framing().unwrap_or(Framing::Lines))
+            framing().map_or(ToolFormat::Unparsed, ToolFormat::QwenXml)
         } else if source.contains(DSML) {
             ToolFormat::Dsml(Spelling::of_template(source))
         } else {
@@ -556,17 +556,20 @@ fn probe_render(t: &ChatTemplate) -> Option<String> {
     vars.insert(
         "tools".into(),
         json!([{"type": "function", "function": {
-            "name": "get_weather", "parameters": {"type": "object"},
+            "name": "get_weather", "parameters": {
+                "type": "object",
+                "properties": {PROBE_KEY: {"type": "string"}},
+            },
         }}]),
     );
     vars.insert("enable_thinking".into(), json!(true));
     t.render(&vars).ok()
 }
 
-/// How a Qwen3-Coder template frames a value, read from the call it renders
+/// How a template frames a parameter value, read from the call it renders
 /// ([`probe_render`]); `None` when it renders no call, or one in neither
 /// framing.
-fn qwen_framing(t: &ChatTemplate) -> Option<Framing> {
+fn probe_framing(t: &ChatTemplate) -> Option<Framing> {
     Framing::of_rendered(&probe_render(t)?, PROBE_KEY, PROBE_VALUE)
 }
 
