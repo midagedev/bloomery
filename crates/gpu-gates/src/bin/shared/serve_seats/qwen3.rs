@@ -413,14 +413,15 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
         verifying: bool,
     ) -> Result<GpuModel<Self>, GateError>;
     /// The DSpark draft beside this body's model at `path`, `dir` its HF directory, for contexts
-    /// of up to `ctx` positions. Refused by the default: only a body whose session verifies rows
-    /// (a qwen35moe body's) takes one.
+    /// of up to `ctx` positions, behind the width chooser of `mode`. Refused by the default: only
+    /// a body whose session verifies rows (a qwen35moe body's) takes one.
     fn open_dspark(
         _s: &mut app::Session<Self>,
         _path: &Path,
         _dir: &Path,
         _ctx: usize,
         _card: &'static str,
+        _mode: WidthMode,
     ) -> Result<Option<ServedDraft<Self>>, GateError> {
         Ok(None)
     }
@@ -675,6 +676,7 @@ impl Body3 for Body35 {
         dir: &Path,
         ctx: usize,
         card: &'static str,
+        mode: WidthMode,
     ) -> Result<Option<ServedDraft<Body35>>, GateError> {
         let model = s.model();
         let device = model.gpu().device_id()?;
@@ -775,7 +777,7 @@ impl Body3 for Body35 {
         Ok(Some(ServedDraft::dspark::<_, 8>(
             s,
             draft,
-            WidthMode::Cost,
+            mode,
             &mut log,
             Some(dir.to_path_buf()),
         )?))
@@ -982,7 +984,7 @@ impl<B: Body3> Q3<B> {
                 let Some(dir) = dspark else {
                     return Err("BLOOMERY_DRAFT=dspark: no DSpark draft directory".into());
                 };
-                B::open_dspark(&mut s, path, &dir, ctx, card)?.ok_or_else(|| {
+                B::open_dspark(&mut s, path, &dir, ctx, card, width)?.ok_or_else(|| {
                     format!("BLOOMERY_DRAFT=dspark: a {} body takes no draft", B::ARCH)
                 })?
             }
@@ -1520,14 +1522,16 @@ fn open_minicpm(
     Err(vision_seat::NO_TOWER.into())
 }
 
-/// The refusal of `BLOOMERY_DRAFT=dspark` on a qwen35moe load placed on the
-/// host tier (`placement` and `why` are what it resolved to): the draft needs
-/// the whole-card verifying load. The leading phrase is the release pass's key.
-fn dspark_refusal((placement, why): (String, String)) -> GateError {
+/// The refusal of a draft (`word`, the `BLOOMERY_DRAFT` value; `name`, how
+/// the sentence names it) on a qwen35moe load placed on the host tier
+/// (`placement` and `why` are what it resolved to): the draft's verify pass
+/// needs the whole model on the card. The leading phrase is the release
+/// pass's key.
+fn whole_card_refusal(word: &str, name: &str, (placement, why): (String, String)) -> GateError {
     format!(
-        "BLOOMERY_DRAFT=dspark needs the whole-card load: {placement} resolved to a placed \
-         load, {why}; the DSpark draft runs only on a model held whole on the card - serve a \
-         load that holds the whole model there, or no draft"
+        "BLOOMERY_DRAFT={word} needs the whole-card load: {placement} resolved to a placed \
+         load, {why}; the {name} draft verifies its rows on a model held whole on the card - \
+         serve a load that holds the whole model there, or no draft"
     )
     .into()
 }
@@ -1568,18 +1572,6 @@ fn lookup_refusal(arch: Family) -> String {
          several rows, and the qwen3moe body runs no pass of several rows; serve the plain path",
         arch.name()
     )
-}
-
-/// The refusal of `BLOOMERY_DRAFT=lookup` on a load that puts routed experts
-/// on the host tier: the lookup draft's verify pass needs the whole model on
-/// the card, as the DSpark draft's does.
-fn lookup_load_refusal((placement, why): (String, String)) -> GateError {
-    format!(
-        "BLOOMERY_DRAFT=lookup needs the whole-card load: {placement} resolved to a placed \
-         load, {why}; the lookup draft verifies its rows on a model held whole on the card - \
-         serve a load that holds the whole model there, or no draft"
-    )
-    .into()
 }
 
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
@@ -1732,8 +1724,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             ),
         };
         return Err(match draft {
-            Draft::Dspark => dspark_refusal(why),
-            Draft::Lookup => lookup_load_refusal(why),
+            Draft::Dspark => whole_card_refusal("dspark", "DSpark", why),
+            Draft::Lookup => whole_card_refusal("lookup", "lookup", why),
             Draft::Off => unreachable!("the plain path is never placed away"),
         });
     }

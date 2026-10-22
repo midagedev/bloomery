@@ -27,7 +27,9 @@
 //!
 //! then the lookup draft on the qwen3.6 file: one server with the lookup and one without,
 //! the lookup's ids are the plain run's (`ids_are_the_plain_ids`) and `/props` names the
-//! lookup as the draft the seat serves (`lookup_is_served`); then the refusals,
+//! lookup as the draft the seat serves (`lookup_is_served`), and a prompt that repeats
+//! a phrase gets proposals from it (`lookup_proposes`: `timings.draft_n` above 0, so a
+//! seat that names the lookup and steps plain does not pass); then the refusals,
 //! each named on the server's stderr:
 //!
 //! - `cross_target_is_refused`: each of the two base targets with the other case's draft
@@ -71,6 +73,9 @@ mod gate {
 
     /// The prompt every arm is fed.
     const PROMPT: &str = "The capital of France is";
+    /// A prompt whose phrase repeats, so the lookup's n-grams match from its first step.
+    const REPEATS: &str =
+        "one two three four five one two three four five one two three four five one two";
     /// The ids compared and the tokens the any-draft arms decode.
     const N: usize = 16;
     /// How long a server gets to listen or to refuse, and the poll's gap.
@@ -265,6 +270,14 @@ mod gate {
                     ok,
                     "lookup_is_served",
                     props["engine"]["draft"]["kind"].as_str() == Some("lookup"),
+                );
+                let repeats = completion(&url, &tokenized(&url, REPEATS)?, N, false)?;
+                check(
+                    ok,
+                    "lookup_proposes",
+                    repeats["timings"]["draft_n"]
+                        .as_u64()
+                        .is_some_and(|n| n > 0),
                 );
             }
             None => {}
