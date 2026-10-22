@@ -541,6 +541,79 @@ fn write_node_set(
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
+/// A node-dump set dumped from a copy of the fixture file at another root
+/// (another machine's) is current when its `# model` names a file of the run
+/// file's name and its `# fixture` line is the run file's; one whose line
+/// differs is stale on that line, naming both lines and the run file's path.
+#[test]
+fn a_fixture_set_from_another_root_is_current_by_its_name_and_line() -> Result<(), RefError> {
+    let root = temp("moved-root")?;
+    let other = temp("moved-other")?;
+    let set = temp("moved-set")?;
+    let u = under("fx-ik-qwen35moe", "ik-qwen35moe")?;
+    let (arch, build) = (u.arch, u.build);
+    let first = root_with(&root, arch, &fixture_kvs(1))?;
+    let ours = line(Path::new(&first))?;
+    let theirs = line_of(&other, &fixture_kvs(2))?;
+    let name = Path::new(&first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("a first shard has a file name");
+    let elsewhere = format!("/models/fixtures/{arch}/{name}");
+    assert_ne!(elsewhere, first);
+
+    write_node_set(&set, arch, &elsewhere, Some(body(&ours)), build, true);
+    let p = open(u.family, &root, &set)?;
+    assert_eq!(p.dumped_from, elsewhere);
+
+    write_node_set(&set, arch, &elsewhere, Some(body(&theirs)), build, true);
+    let e = open(u.family, &root, &set).expect_err("another seed at another root");
+    assert!(matches!(e, RefError::Stale { .. }), "{e:?}");
+    let e = e.to_string();
+    assert!(
+        e.contains(&set.display().to_string())
+            && e.contains(&format!("dumped from {theirs}"))
+            && e.contains(&format!("the tree runs {ours}"))
+            && e.contains(&first),
+        "{e}"
+    );
+
+    remove(&root)?;
+    remove(&other)?;
+    remove(&set)
+}
+
+/// A node-dump set whose `# model` names a file of another name than the run
+/// file's is stale on the file name, naming both paths, even when its
+/// `# fixture` line is the run file's.
+#[test]
+fn a_fixture_set_of_another_file_name_is_stale() -> Result<(), RefError> {
+    let root = temp("renamed-root")?;
+    let set = temp("renamed-set")?;
+    let u = under("fx-ik-qwen35moe", "ik-qwen35moe")?;
+    let (arch, build) = (u.arch, u.build);
+    let first = root_with(&root, arch, &fixture_kvs(1))?;
+    let ours = line(Path::new(&first))?;
+    let renamed = Path::new(&first)
+        .with_file_name("g-00001-of-00001.gguf")
+        .display()
+        .to_string();
+
+    write_node_set(&set, arch, &renamed, Some(body(&ours)), build, true);
+    let e = open(u.family, &root, &set).expect_err("another file name");
+    assert!(matches!(e, RefError::Stale { .. }), "{e:?}");
+    let e = e.to_string();
+    assert!(
+        e.contains(&format!("dumped from {renamed}"))
+            && e.contains(&format!("the tree runs {first}"))
+            && e.contains("file name"),
+        "{e}"
+    );
+
+    remove(&root)?;
+    remove(&set)
+}
+
 /// A node-dump set of the fixture the tree runs passes, and its `# fixture`
 /// line is a header field, given at most once; one whose line differs in the
 /// seed, or has none, is stale and names both lines; a set of the real file
@@ -1103,7 +1176,8 @@ fn a_variant_file_is_found_under_its_root_and_says_so() -> Result<(), RefError> 
 }
 
 /// A fixture family resolves a set's name at one place: the base name on a base fixture, `fx_<tag>_` on a
-/// variant's. A set dumped from one file is stale for the other, at either name, by `# model` first.
+/// variant's. A set dumped from one file is stale for the other, at either name: the two files share a file name,
+/// so the `# fixture` line refuses it by its variant key, naming both lines and the file the tree runs.
 #[test]
 fn a_variants_sets_are_named_and_checked_apart_from_the_bases() -> Result<(), RefError> {
     let top = temp("variant-sets")?;
@@ -1155,16 +1229,20 @@ fn a_variants_sets_are_named_and_checked_apart_from_the_bases() -> Result<(), Re
     assert!(matches!(e, RefError::Stale { .. }), "{e:?}");
     let e = e.to_string();
     assert!(
-        e.contains(&format!("dumped from {var}")) && e.contains(&format!("the tree runs {base}")),
+        e.contains(&format!("dumped from {var_line}"))
+            && e.contains(&format!("the tree runs {base_line}"))
+            && e.contains(&base),
         "{e}"
     );
-    // The base's set under the variant: stale on the model file, not on the fixture line.
+    // The base's set under the variant: stale on the fixture line, which lacks the variant key.
     write_node_set(&set, u.arch, &base, Some(body(&base_line)), u.build, true);
     let e = under_var(&set).expect_err("a base set under the variant");
     assert!(matches!(e, RefError::Stale { .. }), "{e:?}");
     let e = e.to_string();
     assert!(
-        e.contains(&format!("dumped from {base}")) && e.contains(&format!("the tree runs {var}")),
+        e.contains(&format!("dumped from {base_line}"))
+            && e.contains(&format!("the tree runs {var_line}"))
+            && e.contains(&var),
         "{e}"
     );
     // The variant's file with the base's fixture line: the line is what differs.

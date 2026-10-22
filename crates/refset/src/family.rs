@@ -10,7 +10,10 @@
 //! shard, as the dumper was given it. The two V4.1 files name their shards
 //! alike, so a basename cannot tell them apart; their directories differ.
 //! A fixture file is regenerated in place at one path, so the sets dumped from
-//! it carry a second identity line, `# fixture` ([`crate::fixture`]).
+//! it carry a second identity line, `# fixture` ([`crate::fixture`]). That
+//! line states the file's content, so a fixture set's identity is its file
+//! name and that line: a copy of the fixture file at another root (another
+//! machine's) runs the sets dumped on the original.
 
 use crate::RefError;
 use std::path::{Path, PathBuf};
@@ -212,14 +215,33 @@ impl Family {
     /// `dumped_from`, the model file set `set` states in its `line`, against
     /// the file the tree runs: [`RefError::Stale`] unless the two paths are
     /// the same string. A set that states none is stale too — nothing says
-    /// which file it came from.
+    /// which file it came from. A fixture identity ([`Identity::on_fixture`])
+    /// takes a path of the run file's file name: its content is the
+    /// `# fixture` line, which every reader of a fixture identity checks next
+    /// ([`Family::check_fixture`]).
     pub fn check_file(
         &self,
         set: &Path,
         line: &str,
         dumped_from: Option<&str>,
     ) -> Result<(), RefError> {
-        check_same(set, line, dumped_from, &self.runs()?)
+        let runs = self.runs()?;
+        if !self.identity.on_fixture() {
+            return check_same(set, line, dumped_from, &runs);
+        }
+        let same_name =
+            |path: &str| file_name(path).is_some() && file_name(path) == file_name(&runs);
+        match dumped_from {
+            Some(stated) if stated == runs || same_name(stated) => Ok(()),
+            Some(stated) => Err(RefError::Stale {
+                set: set.display().to_string(),
+                dumped_from: format!(
+                    "{stated} (a fixture set: its file name is not the run file's)"
+                ),
+                runs,
+            }),
+            None => check_same(set, line, None, &runs),
+        }
     }
 
     /// The draft model `set` states, against the draft file the tree runs.
@@ -241,7 +263,19 @@ impl Family {
         if !self.identity.on_fixture() {
             return Ok(());
         }
-        crate::fixture::check_stated(set, stated, Path::new(&self.runs()?))
+        let runs = self.runs()?;
+        crate::fixture::check_stated(set, stated, Path::new(&runs)).map_err(|e| match e {
+            RefError::Stale {
+                set,
+                dumped_from,
+                runs: line,
+            } => RefError::Stale {
+                set,
+                dumped_from,
+                runs: format!("{line} (the fixture line of {runs})"),
+            },
+            e => e,
+        })
     }
 
     /// `build`, the ik build set `set` names, against the family's
@@ -450,6 +484,11 @@ impl Family {
             }
         }
     }
+}
+
+/// The last component of `path`, `None` for a path that ends in none.
+fn file_name(path: &str) -> Option<&std::ffi::OsStr> {
+    Path::new(path).file_name()
 }
 
 /// [`RefError::Stale`] unless `dumped_from` is `runs`.
