@@ -240,11 +240,11 @@ pub(crate) fn add_row_forms<'s>(
 }
 
 /// Where site `t`'s m-column launch lands column `c`'s outputs: a K-quant's
-/// by its gemv ([`SiteTy::kgemv_order`]), token-major on the gemv arm;
+/// by its gemv ([`site::kgemv_order`]), token-major on the gemv arm;
 /// `None` for the Q5_0 form, which no row launch here reads.
 fn order(t: &Site) -> Option<Order> {
     match t.ty().reads() {
-        Form::Q8x128 => t.ty().kgemv_order(),
+        Form::Q8x128 => site::kgemv_order(t.ty()),
         Form::F32 | Form::Q8x32 => Some(Order::TokenMajor),
         Form::Q8Blocks32 => None,
     }
@@ -275,7 +275,7 @@ pub(super) fn kgemv_rows(
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     let m = act.m();
-    match t.ty().kgemv_order() {
+    match site::kgemv_order(t.ty()) {
         Some(Order::TokenMajor) => t.kgemv(cx, act, l, y),
         Some(Order::RowMajor) => {
             {

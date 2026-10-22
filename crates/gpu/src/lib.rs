@@ -620,6 +620,49 @@ impl From<::model::ModelError> for GpuError {
     }
 }
 
+/// A plan the chain crate refused is the same refusal here: its `Shape` and `Tensor` errors become this
+/// crate's two variants of the same names, with the text a gate pins unchanged.
+impl From<chain::ChainError> for GpuError {
+    fn from(e: chain::ChainError) -> GpuError {
+        match e {
+            chain::ChainError::Shape { what, detail } => GpuError::Shape { what, detail },
+            chain::ChainError::Tensor { what, name, need } => GpuError::Tensor { what, name, need },
+        }
+    }
+}
+
+#[cfg(test)]
+mod chain_error_tests {
+    use super::GpuError;
+    use chain::ChainError;
+
+    /// A refusal of the chain crate converts into the variant of its own name and reads the same:
+    /// `what`, then the detail or the tensor's name.
+    #[test]
+    fn a_chain_refusal_keeps_its_variant_and_its_text() {
+        let shape = ChainError::shape("qwen35moe plan", "layer 3: no kernel");
+        let text = shape.to_string();
+        match GpuError::from(shape) {
+            GpuError::Shape { what, detail } => {
+                assert_eq!(
+                    (what, detail.as_str()),
+                    ("qwen35moe plan", "layer 3: no kernel")
+                );
+            }
+            other => panic!("a shape refusal became {other:?}"),
+        }
+        assert_eq!(
+            GpuError::shape("qwen35moe plan", "layer 3: no kernel").to_string(),
+            text
+        );
+        let tensor = ChainError::tensor("w", "token_embd.weight", "in the file");
+        let text = tensor.to_string();
+        let got = GpuError::from(tensor);
+        assert!(matches!(got, GpuError::Tensor { .. }), "{got:?}");
+        assert_eq!(got.to_string(), text);
+    }
+}
+
 /// One 128-value q8_1 block of column `col` of the activation plane based at
 /// `x0`, quantized and stored in the three gemv permutations plus the group
 /// sums and the block scale. The body of `kernels::q3k_quantize_q8_1` — the

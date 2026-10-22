@@ -31,13 +31,16 @@
 //! of `m` rows leaves the state, the ring and the outputs of `m` one-row
 //! steps.
 //!
+//! The chain's walk runs them as three ops: [`delta_in`] (1–2),
+//! [`delta_core`] (3–5) and [`delta_out`] (6).
+//!
 //! Past [`GEMV_COLS`] rows the input half (1–2) and the output half (6) are
 //! the wide arm's (`wide::delta_in`, `wide::delta_out`: the norm and the
 //! quantizer, each projection a GEMM, the residual add a launch of its own);
 //! the conv, the delta step and the gated norm (3–5) are the same launches.
 
 use super::dispatch::{self, Ctx, site_launches};
-use super::plan::{DeltaPlan, SiteTy};
+use super::plan::{DeltaPlan, SiteTy, input_fused, out_fused};
 use super::proj::{OResidArgs, QkvArgs};
 use super::scratch::{Arena, Io, LaneRun, RecStore};
 use super::wide::{self, GEMV_COLS};
@@ -65,7 +68,7 @@ pub(super) fn launches(d: &DeltaPlan, m: usize) -> usize {
             + dispatch::wide_quants(&[d.out_ty])
             + 2;
     }
-    let input = if d.input_fused() {
+    let input = if input_fused(d) {
         2 + usize::from(d.qkv_ty == SiteTy::Q6K && m > 1)
     } else {
         [d.qkv_ty, d.gate_ty, d.beta_ty, d.alpha_ty]
@@ -73,7 +76,7 @@ pub(super) fn launches(d: &DeltaPlan, m: usize) -> usize {
             .map(|t| site_launches(*t, m))
             .sum()
     };
-    let output = if d.out_fused() {
+    let output = if out_fused(d) {
         2
     } else {
         usize::from(d.out_ty.kquant()) + dispatch::out_resid_launches(d.out_ty, m)
@@ -81,21 +84,18 @@ pub(super) fn launches(d: &DeltaPlan, m: usize) -> usize {
     1 + input + 3 + output
 }
 
-/// Enqueue layer `c.layer`'s delta-rule mixer at `m` rows over its store
-/// `r` (module doc). The rows' positions are the arena's `pos` (the
-/// embedding launch wrote them), the state lane the word `io.lane` holds.
-pub(super) fn delta(
+/// The mixer's input half at `m` rows (module doc, 1–2): the arena checked
+/// against the plan's shape, then the wide arm's or the gemv arm's.
+pub(super) fn delta_in(
     c: &Ctx<'_>,
     d: &DeltaPlan,
-    r: &mut RecStore,
     s: &mut Arena,
-    io: &Io<'_>,
     m: usize,
 ) -> Result<(), GpuError> {
     const WHAT: &str = "qwen3moe::delta";
-    let (gpu, w, k) = (c.gpu, c.w, c.k);
-    let q35 = k.q35(WHAT)?;
-    let stream = gpu.stream();
+    // The load's Qwen3.6 kernels, which the mixer's three parts launch: a
+    // load without them is refused here by name, ahead of any launch.
+    c.k.q35(WHAT)?;
     let g = s
         .gdn
         .as_ref()
@@ -110,10 +110,29 @@ pub(super) fn delta(
         ));
     }
     if m > GEMV_COLS {
-        wide::delta_in(c, d, s, m)?;
+        wide::delta_in(c, d, s, m)
     } else {
-        project(c, d, s, m)?;
+        project(c, d, s, m)
     }
+}
+
+/// The mixer's middle at `m` rows (module doc, 3–5), the same launches at
+/// every `m`: the conv and prep over the layer's ring by the rows' positions
+/// (the arena's `pos`, which the embedding launch wrote), the delta step over
+/// the state lane the word `io.lane` holds, the gated norm into the arena's
+/// attention rows.
+pub(super) fn delta_core(
+    c: &Ctx<'_>,
+    d: &DeltaPlan,
+    r: &mut RecStore,
+    s: &mut Arena,
+    io: &Io<'_>,
+    m: usize,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "qwen3moe::delta";
+    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    let q35 = k.q35(WHAT)?;
+    let stream = gpu.stream();
     let Arena { pos, attn, gdn, .. } = s;
     let g = gdn
         .as_mut()
@@ -207,7 +226,17 @@ pub(super) fn delta(
             fault: c.sink,
             y: attn,
         },
-    )?;
+    )
+}
+
+/// The mixer's output half at `m` rows (module doc, 6): the wide arm's or
+/// the gemv arm's.
+pub(super) fn delta_out(
+    c: &Ctx<'_>,
+    d: &DeltaPlan,
+    s: &mut Arena,
+    m: usize,
+) -> Result<(), GpuError> {
     if m > GEMV_COLS {
         wide::delta_out(c, d, s, m)
     } else {
@@ -244,7 +273,7 @@ pub(super) fn project(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Re
         c.sink,
     )?;
     let act = &act_x[i];
-    if !d.input_fused() {
+    if !input_fused(d) {
         let (ch, zl, nv) = (d.shape.channels(), d.shape.n_v * linear::HEAD, d.shape.n_v);
         let x = (act, &*normed);
         let mut cols = cols.as_mut();
@@ -350,7 +379,7 @@ pub(super) fn output(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Res
     if d.out_ty.kquant() {
         gpu.enqueue_quantize_q8_1_layer(attn, &mut act_attn[i], c.layer)?;
     }
-    if d.out_fused() {
+    if out_fused(d) {
         return k.proj.enqueue_o_resid(
             gpu.stream(),
             OResidArgs {

@@ -25,13 +25,13 @@
 //!   super-block count the down `_sel` over one expert, one column); Q5_K
 //!   the K-quant down `_sel` over a stack of one expert, token-major (a slot
 //!   a column); NVFP4 `nvfp4_gemv` over its planes times the tensor's scale,
-//!   token-major. [`SiteTy::kgemv_order`] is this family's layout and is
+//!   token-major. [`kgemv_order`] is this family's layout and is
 //!   `None` for Q5_0. Where a body copies a row-major output token-major,
 //!   and its fused groups of Q4_K launches, stay the body's.
 //! - [`blocks32_gemv`], a Q5_0 site at most eight columns over the
 //!   `Q8Blocks32` rows: `enqueue_gemv_q5_0` over the packed weight, the site
 //!   as one expert (`row0 = 0`), row-major (`y[r · m + c]`). That row-major
-//!   layout is this function's, not [`SiteTy::kgemv_order`]'s.
+//!   layout is this function's, not [`kgemv_order`]'s.
 //! - [`gemm`], a wide unit through a route table: a K-quant the grouped
 //!   int8 GEMM over the q8_1 blocks of 128 values ([`GemmAct`]), Q8_0 the
 //!   32-value GEMM over the q8 blocks of 32 values ([`GemmAct32`]) on the
@@ -59,7 +59,7 @@
 //! wide arm [`resident_gemm`] and [`resident_gemm_rows`]. Each launches
 //! what the typed call launches for the site type of the weight's resident
 //! form, which the kernel table's dense entry decides
-//! ([`SiteTy::of_resident`]); [`resident_site`] checks that type and shape
+//! ([`of_resident`]); [`resident_site`] checks that type and shape
 //! at load.
 
 use crate::gemm::{
@@ -77,42 +77,17 @@ use crate::quant_sel::QuantSelKernels;
 use crate::tensor::{Q8Act, TensorWindow};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
+use chain::site::list;
 use cuda_core::{DeviceBuffer, DeviceCopy};
-use gguf::Split;
 use gguf::quant::GgmlType;
-use model::placement::kernels::{self, SiteEntry};
-use std::fmt;
+use model::placement::kernels;
 
-/// The launch family a site's file type selects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SiteTy {
-    Q3K,
-    Q4K,
-    Q5K,
-    Q6K,
-    /// Packed Q5_0 (`pack_q5_0`), launched by [`blocks32_gemv`] and, wide,
-    /// by [`gemm`].
-    Q5_0,
-    Q8_0,
-    F32,
-    /// NVFP4 in its two planes and the tensor's scale (`DevWeight::Nvfp4`),
-    /// launched by [`kgemv`]; no wide GEMM.
-    Nvfp4,
-    /// bloomery's MXFP8 in its two planes (`DevWeight::Mxfp8`), launched by
-    /// [`gemv`] and, wide, by [`gemm`] on the f32 rows.
-    Mxfp8,
-    /// bloomery's FP8_B128 in the same two planes (`DevWeight::Fp8B128`),
-    /// launched as MXFP8 is.
-    Fp8B128,
-    /// BF16 in its words (`DevWeight::Bf16`), launched by [`gemv`] and, wide,
-    /// by [`gemm`] on the f32 rows.
-    Bf16,
-}
+pub use chain::site::{SiteTy, file_site};
 
 /// The activation form a site's launch reads: the kernel table's fact.
 pub use model::placement::kernels::SiteAct as Form;
 
-/// Where a gemv writes output `r` of column `c` of a site of `rows` rows.
+/// Where [`kgemv`] writes output `r` of column `c` of a site of `rows` rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Order {
     /// `y[r · m + c]`, the `m` columns of a row together.
@@ -121,177 +96,55 @@ pub enum Order {
     TokenMajor,
 }
 
-impl SiteTy {
-    /// Every family, the range of [`SiteTy::of_ggml`].
-    pub const ALL: &'static [SiteTy] = &[
-        SiteTy::Q3K,
-        SiteTy::Q4K,
-        SiteTy::Q5K,
-        SiteTy::Q6K,
-        SiteTy::Q5_0,
-        SiteTy::Q8_0,
-        SiteTy::F32,
-        SiteTy::Nvfp4,
-        SiteTy::Mxfp8,
-        SiteTy::Fp8B128,
-        SiteTy::Bf16,
-    ];
-
-    /// The family of a file tensor of type `ty`, the one that launches the
-    /// kernel table's dense entry for it (`kernels::dense`); a type with no
-    /// dense entry that loads widened to f32 (F16) is the f32 site of its
-    /// widened rows; `None` for a type no launch here reads.
-    #[must_use]
-    pub fn of_ggml(ty: GgmlType) -> Option<SiteTy> {
-        match kernels::dense(ty) {
-            Some(entry) => SiteTy::of_entry(entry),
-            None if gguf::card::CardFormat::of(ty) == Some(gguf::card::CardFormat::Bf16AsF32) => {
-                Some(SiteTy::F32)
-            }
-            None => None,
+/// The family of a resident weight: the kernel table's dense entry for the
+/// file type its form holds ([`SiteTy::of_ggml`]; an F32 plane is the f32
+/// site whatever type it was widened from). `None` for a form no dense entry
+/// reads: a stack in the file's blocks of a type whose entry reads another
+/// layout (Q8_0's planes, an i-quant), a derived weight and an NVFP4 stack.
+/// The resident form is this crate's, so the map is here, beside the
+/// launches that read it, and not on the chain's [`SiteTy`].
+#[must_use]
+pub fn of_resident(w: &DevWeight) -> Option<SiteTy> {
+    let ty = match w {
+        DevWeight::KQuant { ty, .. } => {
+            return SiteTy::of_ggml(*ty).filter(|s| s.kquant());
         }
-    }
+        DevWeight::Q5_0 { .. } => GgmlType::Q5_0,
+        DevWeight::Q5_1 { .. } => GgmlType::Q5_1,
+        DevWeight::Q8_0 { .. } => GgmlType::Q8_0,
+        DevWeight::F32 { .. } => GgmlType::F32,
+        DevWeight::Nvfp4 { .. } => GgmlType::NVFP4,
+        DevWeight::Mxfp8 { .. } => GgmlType::MXFP8,
+        DevWeight::Fp8B128 { .. } => GgmlType::FP8_B128,
+        DevWeight::Bf16 { .. } => GgmlType::BF16,
+        DevWeight::Q8_0Derived { .. } | DevWeight::Nvfp4Stack { .. } => return None,
+    };
+    SiteTy::of_ggml(ty)
+}
 
-    /// The family of a resident weight: the kernel table's dense entry for
-    /// the file type its form holds ([`SiteTy::of_ggml`]; an F32 plane is
-    /// the f32 site whatever type it was widened from). `None` for a form no
-    /// dense entry reads: a stack in the file's blocks of a type whose entry
-    /// reads another layout (Q8_0's planes, an i-quant), a derived weight and
-    /// an NVFP4 stack.
-    #[must_use]
-    pub fn of_resident(w: &DevWeight) -> Option<SiteTy> {
-        let ty = match w {
-            DevWeight::KQuant { ty, .. } => {
-                return SiteTy::of_ggml(*ty).filter(|s| s.kquant());
-            }
-            DevWeight::Q5_0 { .. } => GgmlType::Q5_0,
-            DevWeight::Q5_1 { .. } => GgmlType::Q5_1,
-            DevWeight::Q8_0 { .. } => GgmlType::Q8_0,
-            DevWeight::F32 { .. } => GgmlType::F32,
-            DevWeight::Nvfp4 { .. } => GgmlType::NVFP4,
-            DevWeight::Mxfp8 { .. } => GgmlType::MXFP8,
-            DevWeight::Fp8B128 { .. } => GgmlType::FP8_B128,
-            DevWeight::Bf16 { .. } => GgmlType::BF16,
-            DevWeight::Q8_0Derived { .. } | DevWeight::Nvfp4Stack { .. } => return None,
-        };
-        SiteTy::of_ggml(ty)
-    }
-
-    /// The family that launches the kernel table's dense entry `entry`;
-    /// `None` for an entry no family here launches.
-    #[must_use]
-    pub(crate) fn of_entry(entry: SiteEntry) -> Option<SiteTy> {
-        SiteTy::ALL.iter().copied().find(|s| s.entry() == entry)
-    }
-
-    /// The kernel table's dense entry this family launches: the one map
-    /// between the two names.
-    const fn entry(self) -> SiteEntry {
-        match self {
-            SiteTy::Q3K => SiteEntry::Q3k,
-            SiteTy::Q4K => SiteEntry::Q4k,
-            SiteTy::Q5K => SiteEntry::Q5k,
-            SiteTy::Q6K => SiteEntry::Q6k,
-            SiteTy::Q5_0 => SiteEntry::Q5_0,
-            SiteTy::Q8_0 => SiteEntry::Q8_0,
-            SiteTy::F32 => SiteEntry::F32,
-            SiteTy::Nvfp4 => SiteEntry::Nvfp4,
-            SiteTy::Mxfp8 => SiteEntry::Mxfp8,
-            SiteTy::Fp8B128 => SiteEntry::Fp8B128,
-            SiteTy::Bf16 => SiteEntry::Bf16,
-        }
-    }
-
-    /// The file type a site of this family holds: the type whose row names
-    /// its entry (`SiteEntry::ty`).
-    #[must_use]
-    pub(crate) fn ggml(self) -> GgmlType {
-        self.entry().ty()
-    }
-
-    /// Whether the type is one of the four K-quants.
-    #[must_use]
-    pub fn kquant(self) -> bool {
-        self.gemm_weight().is_some()
-    }
-
-    /// The grouped GEMM's type of a K-quant, the one the kernel table's GEMM
-    /// entry for the file type names (`kernels::gemm`); `None` for Q5_0, Q8_0,
-    /// F32, MXFP8, FP8_B128 and BF16, whose wide GEMM is the 32-value family's
-    /// ([`gemm`]), and NVFP4, which has none.
-    #[must_use]
-    pub fn gemm_weight(self) -> Option<GemmWeight> {
-        kernels::gemm(self.ggml()).and_then(GemmWeight::of_entry)
-    }
-
-    /// How [`kgemv`] lays a site's columns out: Q3_K, Q4_K and Q6_K
-    /// row-major, Q5_K and NVFP4 token-major. `None` for a type [`kgemv`] does not run:
-    /// Q8_0, F32, MXFP8, FP8_B128 and BF16 ([`gemv`]), and Q5_0 ([`blocks32_gemv`], whose row-major
-    /// layout `y[r · m + c]` is that function's own).
-    #[must_use]
-    pub fn kgemv_order(self) -> Option<Order> {
-        match self {
-            SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q6K => Some(Order::RowMajor),
-            SiteTy::Q5K | SiteTy::Nvfp4 => Some(Order::TokenMajor),
-            SiteTy::Q5_0
-            | SiteTy::Q8_0
-            | SiteTy::F32
-            | SiteTy::Mxfp8
-            | SiteTy::Fp8B128
-            | SiteTy::Bf16 => None,
-        }
-    }
-
-    /// The activation form the site's launch reads (`SiteEntry::reads`).
-    #[must_use]
-    pub const fn reads(self) -> Form {
-        self.entry().reads()
+/// How [`kgemv`] lays a site of type `ty` out: Q3_K, Q4_K and Q6_K row-major, Q5_K and NVFP4 token-major.
+/// `None` for a type [`kgemv`] does not run: Q8_0, F32, MXFP8, FP8_B128 and BF16 ([`gemv`]), and Q5_0
+/// ([`blocks32_gemv`], whose row-major layout `y[r · m + c]` is that function's own).
+#[must_use]
+pub fn kgemv_order(ty: SiteTy) -> Option<Order> {
+    match ty {
+        SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q6K => Some(Order::RowMajor),
+        SiteTy::Q5K | SiteTy::Nvfp4 => Some(Order::TokenMajor),
+        SiteTy::Q5_0
+        | SiteTy::Q8_0
+        | SiteTy::F32
+        | SiteTy::Mxfp8
+        | SiteTy::Fp8B128
+        | SiteTy::Bf16 => None,
     }
 }
 
-/// The family's file type, its ggml name in upper case (`Q4_K`, `NVFP4`).
-impl fmt::Display for SiteTy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.ggml().to_string().to_ascii_uppercase())
-    }
-}
-
-/// The type of site `name` in `file`, a matrix of `rows` rows (every expert's
-/// of a stack) of `k` values, read from its header entry before any upload:
-/// a type outside `allowed`, another shape or a missing tensor is refused by
-/// name with the site.
-pub fn file_site(
-    file: &Split,
-    what: &'static str,
-    name: &str,
-    (rows, k): (usize, usize),
-    allowed: &[SiteTy],
-) -> Result<SiteTy, GpuError> {
-    let (_, t) = file
-        .find(name)
-        .ok_or_else(|| GpuError::tensor(what, name, "in the file"))?;
-    let got_k = t.dims.first().copied().unwrap_or(0);
-    let got_rows: u64 = t.dims.iter().skip(1).product();
-    if usize::try_from(got_k).ok() != Some(k) || usize::try_from(got_rows).ok() != Some(rows) {
-        return Err(GpuError::shape(
-            what,
-            format!(
-                "{name} is {:?} in the file; the site takes {rows} rows of {k}",
-                t.dims
-            ),
-        ));
-    }
-    match SiteTy::of_ggml(t.ty).filter(|ty| allowed.contains(ty)) {
-        Some(ty) => Ok(ty),
-        None => Err(GpuError::shape(
-            what,
-            format!(
-                "{name} is {} in the file; this site launches {}",
-                t.ty,
-                list(allowed)
-            ),
-        )),
-    }
+/// The grouped GEMM's type of a K-quant, the one the kernel table's GEMM entry for the file type names
+/// (`kernels::gemm`); `None` for Q5_0, Q8_0, F32, MXFP8, FP8_B128 and BF16, whose wide GEMM is the 32-value
+/// family's ([`gemm`]), and NVFP4, which has none.
+#[must_use]
+pub fn gemm_weight(ty: SiteTy) -> Option<GemmWeight> {
+    kernels::gemm(ty.ggml()).and_then(GemmWeight::of_entry)
 }
 
 /// The resident f32 vector `name` of `len` values, as its name: a vector of another length is refused by name as
@@ -325,7 +178,7 @@ pub fn site(
     resident_site(w, what, name, shape, &[ty]).map(drop)
 }
 
-/// The family of the resident weight `name` ([`SiteTy::of_resident`]), `rows`
+/// The family of the resident weight `name` ([`of_resident`]), `rows`
 /// rows (every expert's of a stack) of `k` values: a family outside
 /// `allowed`, a form no site launch reads, another shape or a weight that is
 /// not resident is refused by name as `what`'s.
@@ -338,7 +191,7 @@ pub fn resident_site(
 ) -> Result<SiteTy, GpuError> {
     let t = w.resident(what, name)?;
     let (r, wk) = (t.rows(), t.k());
-    match SiteTy::of_resident(t) {
+    match of_resident(t) {
         Some(ty) if allowed.contains(&ty) && (r, wk) == (rows, k) => Ok(ty),
         Some(ty) => Err(GpuError::shape(
             what,
@@ -368,15 +221,6 @@ pub const BY_NAME: [SiteTy; 5] = [
     SiteTy::Fp8B128,
     SiteTy::Bf16,
 ];
-
-/// `allowed` as a list of names.
-fn list(allowed: &[SiteTy]) -> String {
-    allowed
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
 
 /// The resident K-quant words of `name`, or a named refusal.
 fn kq<'w>(
@@ -409,7 +253,7 @@ pub fn gemv(
 }
 
 /// [`gemv`] for the resident weight `name` at the site type of its resident
-/// form ([`SiteTy::of_resident`]) over the first `m` (1..=8) columns of the
+/// form ([`of_resident`]) over the first `m` (1..=8) columns of the
 /// f32 rows `x`, token-major: a body whose plan picks each site's type per
 /// tensor. `g32` is read only by an F32 site past one column, which is
 /// refused by name without it.
@@ -484,21 +328,21 @@ pub fn resident_sel_f32(
     }
 }
 
-/// The site type of the resident weight `name` ([`SiteTy::of_resident`]): a
+/// The site type of the resident weight `name` ([`of_resident`]): a
 /// missing weight, or a form no site launch reads, is refused by name as
 /// `what`'s.
 pub fn resident_type(w: &Weights, what: &'static str, name: &str) -> Result<SiteTy, GpuError> {
     resident_ty(what, (None, w.resident(what, name)?, name))
 }
 
-/// The site type of the resident weight `name` ([`SiteTy::of_resident`]),
+/// The site type of the resident weight `name` ([`of_resident`]),
 /// which must be `declared` when the caller names one: another type, or a
 /// form no site launch reads, is refused by name as `what`'s.
 fn resident_ty(
     what: &'static str,
     (declared, w, name): (Option<SiteTy>, &DevWeight, &str),
 ) -> Result<SiteTy, GpuError> {
-    match (SiteTy::of_resident(w), declared) {
+    match (of_resident(w), declared) {
         (Some(ty), None) => Ok(ty),
         (Some(ty), Some(d)) if ty == d => Ok(ty),
         (Some(ty), Some(d)) => Err(GpuError::shape(
@@ -720,7 +564,7 @@ impl KGemvKernels {
 }
 
 /// `y = W · act` for site `name` of type `ty` over the `act.m()` columns of
-/// the q8_1 rows `act`, laid out as [`SiteTy::kgemv_order`] says: Q4_K, Q6_K
+/// the q8_1 rows `act`, laid out as [`kgemv_order`] says: Q4_K, Q6_K
 /// and Q3_K their gemvs, row-major; Q5_K the down `_sel` over the site as
 /// one expert, token-major, an id past it raising on `fault`; NVFP4 its gemv
 /// times the tensor's scale, token-major. Q8_0, F32, MXFP8, FP8_B128 and BF16 are [`gemv`];
@@ -1109,9 +953,7 @@ pub fn gemm(
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K => k.gemm.enqueue_gemm(
             stream,
             GemmArgs {
-                ty: ty
-                    .gemm_weight()
-                    .ok_or(GpuError::state(WHAT, "a K-quant's GEMM type"))?,
+                ty: gemm_weight(ty).ok_or(GpuError::state(WHAT, "a K-quant's GEMM type"))?,
                 w: match src {
                     SiteWeight::Words { w, .. } => w,
                     _ => kq(w, WHAT, name)?,
@@ -1176,7 +1018,7 @@ pub fn gemm(
 }
 
 /// [`gemm`] for the resident weight `name` at the site type of its resident
-/// form ([`SiteTy::of_resident`]) on the unit's one-expert table `route`,
+/// form ([`of_resident`]) on the unit's one-expert table `route`,
 /// filled for the first `m` slots, token-major: a body whose plan picks each
 /// dense site's type per tensor. A site reads the form its type reads from
 /// `x` ([`resident_quantize`] writes the q8 blocks of 32).
@@ -1228,7 +1070,7 @@ fn wide_by_name(
 
 /// The q8 blocks of 32 of the first `m` columns of the f32 rows `x` into
 /// `q32` when a site of one of the resident weights `names` reads them
-/// ([`WideActs::wants`] of its type, [`SiteTy::of_resident`]): what
+/// ([`WideActs::wants`] of its type, [`of_resident`]): what
 /// [`resident_gemm`] reads for a Q8_0 or Q5_0 site.
 pub fn resident_quantize(
     gpu: &Gpu,
@@ -1240,7 +1082,7 @@ pub fn resident_quantize(
 ) -> Result<(), GpuError> {
     let reads_q32 = |n: &&str| {
         w.get(n)
-            .and_then(SiteTy::of_resident)
+            .and_then(of_resident)
             .is_some_and(|ty| WideActs::wants(ty).1)
     };
     if names.iter().any(reads_q32) {
@@ -1490,7 +1332,10 @@ fn swiglu(
 
 #[cfg(test)]
 mod tests {
-    use super::{Form, SiteTy, SwigluLaunch, WideActs, file_site, swiglu_launch};
+    use super::{
+        Form, Order, SiteTy, SwigluLaunch, WideActs, file_site, gemm_weight, kgemv_order,
+        swiglu_launch,
+    };
     use crate::gemm::GemmWeight;
     use crate::kquant::Act;
     use gguf::Split;
@@ -1685,9 +1530,9 @@ mod tests {
             assert_eq!(s, want);
             assert_eq!(s.ggml(), ty);
             assert_eq!(s.to_string(), label);
-            assert_eq!(s.gemm_weight(), grouped);
+            assert_eq!(gemm_weight(s), grouped);
             assert_eq!(s.kquant(), grouped.is_some());
-            assert_eq!(s.kgemv_order().is_some(), s.reads() == Form::Q8x128);
+            assert_eq!(kgemv_order(s).is_some(), s.reads() == Form::Q8x128);
             let by_name = model::placement::accepts::dense_by_name(ty);
             assert_eq!(super::BY_NAME.contains(&s), by_name.is_some(), "{s}");
             if let Some(entry) = by_name {
@@ -1695,9 +1540,9 @@ mod tests {
             }
         }
         assert_eq!(SiteTy::Q5_0.reads(), Form::Q8Blocks32);
-        assert_eq!(SiteTy::Q5_0.kgemv_order(), None);
+        assert_eq!(kgemv_order(SiteTy::Q5_0), None);
         assert_eq!(SiteTy::Nvfp4.reads(), Form::Q8x128);
-        assert_eq!(SiteTy::Nvfp4.kgemv_order(), Some(super::Order::TokenMajor));
+        assert_eq!(kgemv_order(SiteTy::Nvfp4), Some(Order::TokenMajor));
         assert_eq!(SiteTy::Mxfp8.reads(), Form::F32);
     }
 
@@ -1706,8 +1551,8 @@ mod tests {
         assert_eq!(SiteTy::of_ggml(GgmlType::BF16), Some(SiteTy::Bf16));
         assert!(SiteTy::ALL.contains(&SiteTy::Bf16));
         assert_eq!(SiteTy::Bf16.reads(), Form::F32);
-        assert_eq!(SiteTy::Bf16.kgemv_order(), None);
-        assert_eq!(SiteTy::Bf16.gemm_weight(), None);
+        assert_eq!(kgemv_order(SiteTy::Bf16), None);
+        assert_eq!(gemm_weight(SiteTy::Bf16), None);
         assert_eq!(WideActs::wants(SiteTy::Bf16), (false, false));
         assert_eq!(SiteTy::Bf16.to_string(), "BF16");
     }

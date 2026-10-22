@@ -15,9 +15,10 @@
 //!
 //! `h` is the target's post-`output_norm` row of the position before `t`. The
 //! step's input join is the crate's `mtp_input` kernel at one stream; the
-//! layer is [`dispatch::layer`](super::dispatch::layer) over a plan, weights
-//! and store of the draft's own and an arena of one row, so attention, the
-//! router, the routed and the shared experts are the trunk's launches; the
+//! layer is the chain's walk of one layer (`walk::layer`) over the family's
+//! ops ([`Program`](super::program::Program)) with a plan, weights and store
+//! of the draft's own and an arena of one row, so attention, the router, the
+//! routed and the shared experts are the trunk's launches; the
 //! head is [`Head`] with the draft's gain over the target's own `output`
 //! buffer, read where it sits. A step is eager and enqueues the same stream
 //! as the target.
@@ -29,16 +30,19 @@
 //! by name when either has moved.
 
 use super::body::{Kernels, KvQ8};
-use super::dispatch::{self, Ctx, embed_into};
+use super::dispatch::{PassCtx, embed_into};
 use super::mtp38::BorrowedPlanes;
 use super::plan::LayerPlan;
-use super::scratch::{Arena, Dims, Forms, KvPlanes, StepParams, StoreMut};
+use super::program::{OneLayer, Program, Tail};
+use super::scratch::{Arena, Dims, Forms, KvPlanes, StepParams};
 use crate::head::{Head, HeadNorm};
 use crate::model::lookup::f32_gain;
 use crate::mtp::{MtpInputArgs, MtpKernels};
 use crate::site;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use crate::{Gpu, GpuError, launch_u32};
+use chain::arch::qwen3moe::ops::LayerCtx;
+use chain::arch::qwen3moe::walk;
 use cuda_core::DeviceBuffer;
 use model::arch::models::MtpDraft;
 use model::arch::qwen3moe::names::token_embd;
@@ -311,24 +315,33 @@ impl Mtp35 {
             },
         )?;
         site::resident_gemv(gpu, &self.w, &self.names.eh, &self.pack, &mut self.s.x)?;
-        let c = Ctx::new(
+        let c = PassCtx {
             gpu,
-            &self.w,
-            (&self.plan, self.index),
+            w: &self.w,
+            plans: std::slice::from_ref(&self.plan),
             k,
             mma,
-            self.eps,
+            eps: self.eps,
             table,
-        )?;
-        dispatch::layer(
-            &c,
-            StoreMut::Kv(&mut self.kv),
-            &mut self.s,
-            &self.sp.io(),
-            1,
-            false,
-            Some(self.head.input_mut()),
-        )?;
+        };
+        let cx = LayerCtx {
+            layer: self.index,
+            plan: &self.plan,
+            m: 1,
+            last: true,
+        };
+        let mut layer = Program {
+            c: &c,
+            stores: &mut OneLayer {
+                index: self.index,
+                kv: &mut self.kv,
+            },
+            s: &mut self.s,
+            io: &self.sp.io(),
+            m: 1,
+            tail: Tail::Into(self.head.input_mut()),
+        };
+        walk::layer(&mut layer, cx)?;
         self.head.enqueue_over(gpu, &self.w, target)
     }
 

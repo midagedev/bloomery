@@ -55,8 +55,7 @@ use super::dispatch::embed_into;
 use super::experts::CombineArgs;
 pub use super::image::ImageWrite;
 use super::image::{ImageWindows, PromptImage};
-use super::plan::{FfnPlan, FfnRoute, GqaPlan, LayerPlan, SiteTy};
-use super::plan::{Form, MixerPlan};
+use super::plan::{FfnPlan, FfnRoute, GqaPlan, LayerPlan, MixerPlan, SiteTy};
 use super::router::RouterOut;
 use super::scratch::{Arena, Dims, KvPlanes, f32_view};
 use super::wide::{self, Neox128Rows};
@@ -65,7 +64,7 @@ use crate::gemm::GemmAct32;
 use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::model::GpuModel;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
-use crate::site::WideActsMut;
+use crate::site::{Form, WideActsMut};
 use crate::tensor::WindowMut;
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
@@ -74,12 +73,7 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::time::Duration;
 
-/// The most tokens one ubatch takes; its slots must also fit the grouped
-/// GEMM's slot cap at the file's `top_k` (the arena refuses by name a ubatch
-/// they do not fit). Also the default ubatch size: the one that reads each
-/// weight the fewest times per prompt and gives each expert's GEMM the most
-/// columns.
-pub const UBATCH: usize = 4096;
+pub use chain::arch::qwen3moe::router::UBATCH;
 
 /// The environment variable a load reads the ubatch size from.
 pub const UBATCH_ENV: &str = "BLOOMERY_QWEN3_UBATCH";
@@ -120,13 +114,14 @@ pub fn ubatch_for(ctx: usize) -> Result<usize, GpuError> {
     Ok(ubatch_size()?.min(ctx))
 }
 
-// The default ubatch is the one a default qwen4exp machine counts.
-const _: () = assert!(UBATCH as u64 == model::arch::qwen35moe::place::UBATCH_PLANNED);
+// The default ubatch at nine slots a token (eight routed experts and the
+// shared one) fills one GEMM route.
+const _: () = assert!(UBATCH * 9 == GEMM_MAX_SLOTS);
 
 /// The GEMM's type for a qwen3moe projection, a K-quant (the qwen3moe load
 /// admits no other); another type is refused by name.
 fn gemm_ty(ty: SiteTy) -> Result<GemmWeight, GpuError> {
-    ty.gemm_weight().ok_or_else(|| {
+    crate::site::gemm_weight(ty).ok_or_else(|| {
         GpuError::shape(
             "qwen3moe::ubatch",
             format!("a {ty} projection; the qwen3moe ubatch runs K-quants"),

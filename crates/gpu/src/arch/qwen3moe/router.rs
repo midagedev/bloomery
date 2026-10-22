@@ -14,9 +14,10 @@
 //! `qwen3moe_router_route`, the routing alone over given logits, one warp per
 //! token. A ubatch's logits come from
 //! `qwen3moe_router_logits`: the fused entry's lane sums over a ubatch of up
-//! to [`UBATCH`] tokens as register tiles — a block of sixteen warps covers
-//! 32 tokens and 32 expert rows, each warp eight rows by eight tokens, the
-//! rows' and the tokens' values staged in shared memory — so the two ubatch
+//! to [`UBATCH`](super::ubatch::UBATCH) tokens as register tiles — a block
+//! of sixteen warps covers 32 tokens and 32 expert rows, each warp eight rows
+//! by eight tokens, the rows' and the tokens' values staged in shared memory
+//! — so the two ubatch
 //! launches leave each token's logits, ids and weights bit for bit what the
 //! fused launch leaves for it. The
 //! fused gemv is `q8f32::f32_gemv`'s row body — one warp per expert row,
@@ -53,7 +54,6 @@
 //! in range: this module writes only ids below [`WIDTH`] and allocates
 //! them zeroed.
 
-use super::ubatch::UBATCH;
 use crate::cores::l2_prefetch;
 use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree};
 use crate::fault::{FaultSink, FaultSite, quad_finite};
@@ -71,8 +71,10 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, threadfence, warp,
 };
 use cuda_host::cuda_module;
-use model::arch::models::shape::{self, MoeShape, RouterBody, RouterInst, rules};
+use model::arch::models::shape::{self, RouterBody, RouterInst, rules};
 use std::sync::Arc;
+
+pub use chain::arch::qwen3moe::router::RouterDims;
 
 /// Tokens one fused launch routes: the f32 gemv's column bound, and one
 /// warp of the routing block per token.
@@ -2101,83 +2103,6 @@ mod qwen3moe_router_kernels {
     }
 }
 
-/// A router's shape as its buffers and launches take it: the instance row a
-/// file's shape selected, and the experts a token keeps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RouterDims {
-    inst: RouterInst,
-    used: usize,
-}
-
-impl RouterDims {
-    /// The dims of `shape`: its instance row, which must be one of this
-    /// module's bodies (`qwen3moe_router_*` or `gated`'s entries), and its
-    /// `top_k`. A shape no row serves, or a row another module owns, is
-    /// refused by name.
-    pub fn of(shape: MoeShape) -> Result<RouterDims, GpuError> {
-        const WHAT: &str = "qwen3moe::router::RouterDims::of";
-        let inst = shape::select_router(shape).map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
-        if !matches!(inst.body, RouterBody::Qwen3moe | RouterBody::Qwen35moe) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{shape:?} selects {}, which this module does not run",
-                    inst.at
-                ),
-            ));
-        }
-        Ok(RouterDims {
-            inst,
-            used: shape.top_k as usize,
-        })
-    }
-
-    /// The instance row.
-    #[must_use]
-    pub fn inst(&self) -> RouterInst {
-        self.inst
-    }
-
-    /// Experts the router softmaxes over.
-    #[must_use]
-    pub fn experts(&self) -> usize {
-        self.inst.experts() as usize
-    }
-
-    /// Routed experts a token keeps.
-    #[must_use]
-    pub fn used(&self) -> usize {
-        self.used
-    }
-
-    /// Whether a shared expert's gate is the router's last row and its slot
-    /// the token's last.
-    #[must_use]
-    pub fn gated(&self) -> bool {
-        self.inst.rule.gated
-    }
-
-    /// Logits per token: one per router row.
-    #[must_use]
-    pub fn logits(&self) -> usize {
-        self.experts() + usize::from(self.gated())
-    }
-
-    /// Slots (an id and a weight each) per token: the routed ones, then a
-    /// gated shared expert's.
-    #[must_use]
-    pub fn slots(&self) -> usize {
-        self.used + usize::from(self.gated())
-    }
-
-    /// The most tokens a ubatch routing may hold: at most [`UBATCH`], and
-    /// every slot of them in one GEMM route table.
-    #[must_use]
-    pub fn ubatch(&self) -> usize {
-        UBATCH.min(GEMM_MAX_SLOTS / self.slots())
-    }
-}
-
 /// Where one router launch leaves its results, allocated once and reused by
 /// every launch and replay: per token the logits (the fused launches') and
 /// the probabilities, per slot the expert id and the weight, and the fused
@@ -2223,7 +2148,7 @@ impl RouterBufs {
         tokens: usize,
     ) -> Result<Self, GpuError> {
         let what = "qwen3moe::router::RouterBufs::for_ubatch";
-        Self::alloc(stream, dims, tokens, dims.ubatch(), what)
+        Self::alloc(stream, dims, tokens, dims.ubatch(GEMM_MAX_SLOTS), what)
     }
 
     /// The buffers for `tokens` (1..=`most`) tokens, the ticket count zeroed;
@@ -2286,7 +2211,7 @@ impl RouterBufs {
         body: RouterBody,
         per_lane: Option<u32>,
     ) -> Result<u32, GpuError> {
-        let inst = self.dims.inst;
+        let inst = self.dims.inst();
         if inst.body != body || per_lane.is_some_and(|w| w != inst.per_lane()) {
             return Err(GpuError::shape(
                 what,
@@ -2296,7 +2221,7 @@ impl RouterBufs {
                 ),
             ));
         }
-        launch_u32(what, "used", self.dims.used)
+        launch_u32(what, "used", self.dims.used())
     }
 }
 

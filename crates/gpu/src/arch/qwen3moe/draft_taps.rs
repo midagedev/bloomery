@@ -12,46 +12,19 @@
 //! name, and these taps refuse a placed load and a pass of several slots.
 //!
 //! The buffer and its layout are the common [`DraftTaps`]'s, here with the
-//! ubatch arena's rows a tap.
+//! ubatch arena's rows a tap. A walk lays a tapped layer's rows in between
+//! its mixer and its FFN half (`Program::walk_with`, over the chain walk's
+//! `Walk::run_between`).
 
 pub(super) use crate::draft_taps::DraftTaps;
 pub use crate::draft_taps::TapRowsSink;
 
 use super::body35::Body35;
 use super::prefill::PrefillPath;
-use super::program::{NoLeg, Program, Stores};
 use crate::model::GpuModel;
 use crate::{GpuError, launch_u32};
-use runtime::sched::{At, LayerProgram};
 
 const WHAT: &str = "qwen35moe::draft_taps";
-
-/// A [`Program`] that also lays in the rows entering the layers a
-/// [`DraftTaps`] names: its tapped layers run with the copy between mixer
-/// and FFN ([`Program::layer`]), the rest as the program does.
-pub(super) struct Tapping<'t, 'p, S: Stores + ?Sized> {
-    program: &'t mut Program<'p, S>,
-    taps: &'t mut DraftTaps,
-}
-
-impl<'t, 'p, S: Stores + ?Sized> Tapping<'t, 'p, S> {
-    pub(super) fn new(program: &'t mut Program<'p, S>, taps: &'t mut DraftTaps) -> Self {
-        Tapping { program, taps }
-    }
-}
-
-impl<S: Stores + ?Sized> LayerProgram for Tapping<'_, '_, S> {
-    type Port = NoLeg;
-
-    fn front(&mut self, _: &mut NoLeg, at: At) -> Result<(), GpuError> {
-        let entering = self.taps.slot(at.layer).map(|slot| (&mut *self.taps, slot));
-        self.program.layer(at.layer, entering)
-    }
-
-    fn end(&mut self, unit: usize) -> Result<(), GpuError> {
-        self.program.end(unit)
-    }
-}
 
 impl GpuModel<Body35> {
     /// Tap the rows entering `layers` (strictly rising, each below the

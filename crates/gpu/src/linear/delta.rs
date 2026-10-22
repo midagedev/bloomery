@@ -67,7 +67,7 @@
 //! whatever `qᵢ` is (`∞·0` is NaN). A non-finite `o` raises
 //! [`FaultSite::LinearDelta`] once per lane and is written as it is.
 
-use super::{BLOCK, DECAY_HEAD, DECAY_KEY, HEAD, LinearShape};
+use super::{BLOCK, DECAY_HEAD, DECAY_KEY, HEAD, KHeadMap, LinearShape};
 use crate::GpuError;
 use crate::cores::global_addr;
 use crate::fault::{FaultSink, FaultSite};
@@ -554,6 +554,11 @@ mod delta_kernels {
     }
 }
 
+/// The kernels' `grouped` argument for `map`: 1 for grouped value heads, 0 for tiled ones.
+fn grouped_arg(map: KHeadMap) -> u32 {
+    u32::from(map == KHeadMap::Grouped)
+}
+
 /// [`DeltaKernels::enqueue_delta`]'s and [`DeltaKernels::enqueue_kda_delta`]'s
 /// arguments: `m` tokens of the conv's output `qkv` (`[m][C]`), β
 /// (`[m][n_v]`) and decay (`[m][n_v]`, or `[m][n_v][HEAD]` per key), the lane word
@@ -669,7 +674,7 @@ impl DeltaKernels {
         let lane_at = launch_u32(what, "lane_at", lane_at)?;
         let lanes = launch_u32(what, "lanes", lanes)?;
         let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
-        let map = shape.map.code();
+        let map = grouped_arg(shape.map);
         if DECAY == DECAY_HEAD {
             let prep = self.module.prepare_gdn_delta(cfg)?;
             self.module.gdn_delta(
@@ -1149,7 +1154,7 @@ impl DeltaKernels {
             launch_u32(WHAT, "lanes", lanes)?,
             launch_u32(WHAT, "n_k", shape.n_k)?,
             launch_u32(WHAT, "n_v", nv)?,
-            shape.map.code(),
+            grouped_arg(shape.map),
             launch_u32(WHAT, "m", m)?,
             u32::from(each),
             pos,
@@ -1230,7 +1235,7 @@ impl DeltaKernels {
             launch_u32(WHAT, "lanes", lanes)?,
             launch_u32(WHAT, "n_k", shape.n_k)?,
             launch_u32(WHAT, "n_v", nv)?,
-            shape.map.code(),
+            grouped_arg(shape.map),
             launch_u32(WHAT, "m", m)?,
             u32::from(each),
             launch_u32(WHAT, "row", row)?,

@@ -4,12 +4,16 @@
 //! a run wrote.
 
 use super::body::Body;
-use super::dispatch;
+use super::dispatch::{self, PassCtx};
 use super::plan::Flash;
+use super::program::{Program, Tail};
 use super::scratch::KvPlanes;
-use crate::GpuError;
 use crate::flash_gqa::HEAD;
 use crate::model::{GpuModel, StepMode};
+use crate::weights::Weights;
+use crate::{Gpu, GpuError};
+use chain::arch::qwen3moe::ops::LayerCtx;
+use chain::arch::qwen3moe::walk;
 use cuda_core::DeviceBuffer;
 
 /// One layer's q8_0 cache planes on the host, rows `0..rows` per head, for
@@ -31,6 +35,44 @@ pub struct LayerRun {
     pub ids: Vec<u32>,
     /// The layer's output residual.
     pub l_out: Vec<f32>,
+}
+
+/// Run `part` of layer `slot` on its own at one row over the step arena
+/// ([`Program::alone`]): from its `x` (the whole layer) or its `ffn_inp`
+/// (the FFN half), the output residual into `x`.
+fn alone<P>(gpu: &Gpu, w: &Weights, b: &mut Body, slot: usize, part: P) -> Result<(), GpuError>
+where
+    P: FnOnce(&mut Program<'_, [KvPlanes]>, LayerCtx<'_>) -> Result<(), GpuError>,
+{
+    let Body {
+        hp,
+        plans,
+        kv,
+        rope,
+        s,
+        sp,
+        k,
+        mma,
+        ..
+    } = b;
+    let c = PassCtx {
+        gpu,
+        w,
+        plans,
+        k,
+        mma: *mma,
+        eps: hp.rms_eps,
+        table: &rope.table,
+    };
+    Program {
+        c: &c,
+        stores: kv.as_mut_slice(),
+        s,
+        io: &sp.io(),
+        m: 1,
+        tail: Tail::Pass,
+    }
+    .alone(slot, part)
 }
 
 impl GpuModel<Body> {
@@ -58,7 +100,7 @@ impl GpuModel<Body> {
         }
         dispatch::enqueue_front(gpu, w, body)?;
         body.s.x.copy_from_host(stream, x_in)?;
-        dispatch::enqueue_layer(gpu, w, body, slot, false, None)?;
+        alone(gpu, w, body, slot, |p, cx| walk::layer(p, cx))?;
         let s = &body.s;
         Ok(LayerRun {
             ffn_inp: s.ffn_inp.to_host_vec(stream)?,
@@ -86,7 +128,7 @@ impl GpuModel<Body> {
             ));
         }
         body.s.ffn_inp.copy_from_host(stream, ffn_inp)?;
-        dispatch::enqueue_ffn(gpu, w, body, slot)?;
+        alone(gpu, w, body, slot, |p, cx| walk::ffn(p, cx))?;
         let s = &body.s;
         Ok(LayerRun {
             ffn_inp: s.ffn_inp.to_host_vec(stream)?,

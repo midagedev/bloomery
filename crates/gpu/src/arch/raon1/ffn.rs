@@ -29,7 +29,7 @@ use super::state::PASS_ROWS;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
 use crate::kquant::Act;
-use crate::site::{Form, SiteTy};
+use crate::site::{self, Form, SiteTy};
 use crate::tensor::{Window, WindowMut};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
@@ -290,7 +290,7 @@ fn has_columns(s: &Site) -> bool {
         Form::F32 | Form::Q8x32 => true,
         Form::Q8x128 => {
             let odd_q6k = matches!(s.ty(), SiteTy::Q6K) && (s.k() / 256) % 2 == 1;
-            s.ty().kgemv_order().is_some() && !odd_q6k
+            site::kgemv_order(s.ty()).is_some() && !odd_q6k
         }
         Form::Q8Blocks32 => false,
     }

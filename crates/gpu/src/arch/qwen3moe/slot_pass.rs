@@ -21,8 +21,8 @@
 use super::body::ATTN_SCALE;
 use super::dispatch::{self, Ctx, PassCtx};
 use super::head_argmax::HeadArgmaxState;
-use super::plan::{GqaKind, GqaPlan, MixerPlan};
-use super::program::{self, Tail};
+use super::plan::{DeltaPlan, FfnPlan, GqaKind, GqaPlan};
+use super::program::{self, Tail, layer_ctx};
 use super::scratch::{
     Append128, Arena, FlashPass, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, put_input,
 };
@@ -33,6 +33,8 @@ use crate::head::Head;
 use crate::model::lookup::f32_gain;
 use crate::model::{MAX_PASS_ROWS, SlotRange};
 use crate::tensor::{Window, WindowMut};
+use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
+use chain::arch::qwen3moe::walk::Walk;
 use cuda_core::{CudaStream, DeviceBuffer};
 use std::ops::Range;
 
@@ -158,71 +160,145 @@ pub(super) struct SlotPass<'a, 'p> {
 
 impl SlotPass<'_, '_> {
     /// Enqueue the pass (module doc): each slot's embedding, every layer,
-    /// the one head of every row. Refused by name before any launch: ranges
-    /// that do not tile `0..R` in order, `R` past the arena's gemv rows, a
-    /// head count other than one or a parked count other than the ranges', a
-    /// layer other than head-128 attention.
+    /// the one head of every row — the chain's walk over the pass's ops
+    /// ([`SlotOps`]). Refused by name before any launch: ranges that do not
+    /// tile `0..R` in order, `R` past the arena's gemv rows, a head count
+    /// other than one or a parked count other than the ranges'; a layer
+    /// other than head-128 attention is refused by name at its mixer.
     pub(super) fn enqueue(self) -> Result<(), GpuError> {
-        let SlotPass {
-            c,
-            live,
-            parked,
-            rows,
-            ins,
-            s,
-            heads,
-            state,
-        } = self;
-        let total = check(rows, s.rows.min(GEMV_COLS), heads.len(), parked.len())?;
+        let total = check(
+            self.rows,
+            self.s.rows.min(GEMV_COLS),
+            self.heads.len(),
+            self.parked.len(),
+        )?;
         // The per-row launches when several slots are busy and they serve the
         // planes (the module doc): the load's one cache format, read from the
         // live planes.
-        let per_row = rows.len() > 1 && live.first().is_some_and(|p| p.rows_serve(c.mma));
+        let per_row =
+            self.rows.len() > 1 && self.live.first().is_some_and(|p| p.rows_serve(self.c.mma));
+        let (plans, arena) = (self.c.plans, self.s.rows);
+        let mut ops = SlotOps {
+            pass: self,
+            per_row,
+        };
+        Walk::new(&mut ops, plans, total).run(arena)
+    }
+}
+
+/// A [`SlotPass`] as the ops the chain's walk orders: the row-wise launches
+/// over all the pass's rows, the launches bound to the sequences' planes
+/// per row through the slots' table when `per_row`, else per busy slot.
+struct SlotOps<'a, 'p> {
+    pass: SlotPass<'a, 'p>,
+    per_row: bool,
+}
+
+/// The refusal of layer `l`, whose mixer is not the one a pass of slots
+/// binds per slot.
+fn not_neox(l: usize) -> GpuError {
+    GpuError::shape(
+        WHAT,
+        format!(
+            "layer {l} is not head-128 attention over K/V planes, the one mixer a pass of \
+             slots binds per slot"
+        ),
+    )
+}
+
+impl ChainOps for SlotOps<'_, '_> {
+    type Error = GpuError;
+
+    /// Each busy slot's embedding over its row window, from the slot's own
+    /// input record.
+    fn embed(&mut self, _: usize) -> Result<(), GpuError> {
+        let SlotPass {
+            c, rows, ins, s, ..
+        } = &mut self.pass;
         let hidden = s.dims.hidden;
         for (j, r) in rows.iter().enumerate() {
             let rec = ins.io(j, r)?;
-            let Arena { x, pos, n_keys, .. } = &mut *s;
+            let Arena { x, pos, n_keys, .. } = &mut **s;
             let mut x = rows_mut(x, &r.rows, hidden)?;
             let mut pos = rows_mut(pos, &r.rows, 1)?;
             let mut n_keys = rows_mut(n_keys, &r.rows, 1)?;
             dispatch::embed_into(c.gpu, c.w, c.k, &rec.io(), (&mut x, &mut pos, &mut n_keys))?;
         }
-        for (l, p) in c.plans.iter().enumerate() {
-            let lc = Ctx::new(c.gpu, c.w, (p, l), c.k, c.mma, c.eps, c.table)?;
-            let g = match &p.mixer {
-                MixerPlan::Gqa(g) if g.kind == GqaKind::Neox128 => g,
-                _ => {
-                    return Err(GpuError::shape(
-                        WHAT,
-                        format!(
-                            "layer {l} is not head-128 attention over K/V planes, the one mixer \
-                             a pass of slots binds per slot"
-                        ),
-                    ));
-                }
-            };
-            dispatch::attn_in(&lc, g, s, total)?;
-            let slots = layer_planes(live, parked, rows, l);
-            if per_row {
-                let mut table = RowTable::default();
-                for slot in slots {
-                    let (r, kv) = slot?;
-                    kv.put_rows(&mut table, r.rows.clone())?;
-                }
-                attention(&lc, g, Planes::Rows(&table), s, &(0..total))?;
-            } else {
-                for slot in slots {
-                    let (r, kv) = slot?;
-                    attention(&lc, g, Planes::Slot(kv), s, &r.rows)?;
-                }
-            }
-            let i = s.col(total)?;
-            c.gpu
-                .enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], l)?;
-            dispatch::attn_out(&lc, g, s, total)?;
-            dispatch::ffn(&lc, &p.ffn, s, total, None)?;
+        Ok(())
+    }
+
+    fn attn_in(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        if g.kind != GqaKind::Neox128 {
+            return Err(not_neox(l.layer));
         }
-        let [head] = heads else {
+        let p = &mut self.pass;
+        dispatch::attn_in(&layer_ctx(p.c, l)?, g, p.s, l.m)
+    }
+
+    /// The launches bound to the sequences' planes ([`attention`]), then the
+    /// attention rows' q8_1 over all the rows.
+    fn attn_core(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        let SlotPass {
+            c,
+            live,
+            parked,
+            rows,
+            s,
+            ..
+        } = &mut self.pass;
+        let lc = layer_ctx(c, l)?;
+        let slots = layer_planes(live, parked, rows, l.layer);
+        if self.per_row {
+            let mut table = RowTable::default();
+            for slot in slots {
+                let (r, kv) = slot?;
+                kv.put_rows(&mut table, r.rows.clone())?;
+            }
+            attention(&lc, g, Planes::Rows(&table), s, &(0..l.m))?;
+        } else {
+            for slot in slots {
+                let (r, kv) = slot?;
+                attention(&lc, g, Planes::Slot(kv), s, &r.rows)?;
+            }
+        }
+        let i = s.col(l.m)?;
+        c.gpu
+            .enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], l.layer)
+    }
+
+    fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        let p = &mut self.pass;
+        dispatch::attn_out(&layer_ctx(p.c, l)?, g, p.s, l.m)
+    }
+
+    fn delta_in(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), GpuError> {
+        Err(not_neox(l.layer))
+    }
+
+    fn delta_core(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), GpuError> {
+        Err(not_neox(l.layer))
+    }
+
+    fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), GpuError> {
+        Err(not_neox(l.layer))
+    }
+
+    fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
+        let p = &mut self.pass;
+        dispatch::route(&layer_ctx(p.c, l)?, f, p.s, l.m)
+    }
+
+    fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), GpuError> {
+        let p = &mut self.pass;
+        dispatch::experts(&layer_ctx(p.c, l)?, f, p.s, l.m, None)
+    }
+
+    /// The one head of every row ([`Tail::One`]).
+    fn head(&mut self, m: usize) -> Result<(), GpuError> {
+        let SlotPass {
+            c, s, heads, state, ..
+        } = &mut self.pass;
+        let [head] = &mut **heads else {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
@@ -231,7 +307,7 @@ impl SlotPass<'_, '_> {
                 ),
             ));
         };
-        program::enqueue_tail(c, s, total, &mut Tail::One { head, state })
+        program::enqueue_tail(c, s, m, &mut Tail::One { head, state })
     }
 }
 
