@@ -94,6 +94,7 @@ scan_lits() { # scan_lits <path…>: rule ②'s hits into lits
     | grep_answer check-arch -vE '^tools/ref/models/' \
     | grep_answer check-arch -vE '^crates/[^/]+/tests/' \
     | grep_answer check-arch -vE '^crates/gpu-gates/src/bin/' \
+    | grep_answer check-arch -vE '^crates/metal/src/bin/' \
     | grep_answer check-arch -vE '^crates/engram/' \
     | grep_answer check-arch -vE '^crates/gguf/src/bin/' \
     | grep_answer check-arch -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
