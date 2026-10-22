@@ -42,6 +42,12 @@
 //! 15. **nsg**: the Q6_K mat-vec at eight SIMD groups in a threadgroup is the
 //!     same bits as at two, for every row count the fixture's Q6_K tensors
 //!     have.
+//! 16. **delta_step**: one gated delta step from a host state, against f64. // K4-REGISTER
+//! 17. **delta_roll**: five steps, each fed by the kernel's own state. // K4-REGISTER
+//! 18. **delta_ring**: a predecessor is read only while the position reaches it, and one ring slot is written. // K4-REGISTER
+//! 19. **delta_partial**: the partials and the numerator, accepted by the head-norm launch. // K4-REGISTER
+//! 20. **delta_nan**: a non-finite lane raises the lane site and writes NaN on that lane. // K4-REGISTER
+//! 21. **delta_bounds**: a shape, a position window and a numerator window are refused by name. // K4-REGISTER
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
@@ -66,12 +72,16 @@ use bloomery_metal::stream::MetalStream;
 
 #[path = "clauses.rs"]
 mod clauses;
+#[path = "clauses_delta.rs"] // K4-REGISTER
+mod clauses_delta; // K4-REGISTER
 #[path = "fixture.rs"]
 mod fixture;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "../shared/oracle.rs"]
 mod oracle;
+#[path = "../shared/oracle_delta.rs"] // K4-REGISTER
+mod oracle_delta; // K4-REGISTER
 
 /// A clause, ready to run.
 type ClauseRun<'a> = Box<dyn Fn() -> Clause + 'a>;
@@ -524,7 +534,8 @@ pub fn main() -> ExitCode {
         Ok(fixture) => f(&harness, fixture),
         Err(e) => Err(e.clone()),
     };
-    let clauses: [(&'static str, ClauseRun<'_>); 15] = [
+    #[rustfmt::skip] // K4-REGISTER
+    let clauses: [(&'static str, ClauseRun<'_>); 21] = [ // K4-REGISTER
         ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
         ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
         ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
@@ -555,6 +566,18 @@ pub fn main() -> ExitCode {
         ("headnorm", Box::new(|| with(clauses::headnorm))),
         ("headnorm_nan", Box::new(|| with(clauses::headnorm_nan))),
         ("nsg", Box::new(|| with(clauses::nsg))),
+        ("delta_step", Box::new(|| with(clauses_delta::delta_step))), // K4-REGISTER
+        ("delta_roll", Box::new(|| with(clauses_delta::delta_roll))), // K4-REGISTER
+        ("delta_ring", Box::new(|| with(clauses_delta::delta_ring))), // K4-REGISTER
+        ( // K4-REGISTER
+            "delta_partial", // K4-REGISTER
+            Box::new(|| with(clauses_delta::delta_partial)), // K4-REGISTER
+        ), // K4-REGISTER
+        ("delta_nan", Box::new(|| with(clauses_delta::delta_nan))), // K4-REGISTER
+        ( // K4-REGISTER
+            "delta_bounds", // K4-REGISTER
+            Box::new(|| clauses_delta::delta_bounds(&harness)), // K4-REGISTER
+        ), // K4-REGISTER
     ];
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)

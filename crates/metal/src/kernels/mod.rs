@@ -11,13 +11,27 @@
 //! tensor ([`matvec`]), the segmented mat-vec of up to four tensors of one
 //! type and one width in one dispatch ([`seg`]), and the head-normed residual
 //! mat-vec of a gated delta net's out projection ([`headnorm`]).
+//! The gated delta step ([`delta`]) writes the numerator and the partials that // K4-REGISTER
+//! mat-vec reads. Its kernel is `kernels/delta.metal`. // K4-REGISTER
 
+mod delta; // K4-REGISTER
 mod embed;
 mod geometry;
 mod headnorm;
 mod matvec;
 mod seg;
 
+pub use delta::CONV_TAPS; // K4-REGISTER
+pub use delta::DeltaParams; // K4-REGISTER
+pub use delta::HeadMap; // K4-REGISTER
+pub use delta::PASS_ROWS; // K4-REGISTER
+pub use delta::Q_SCALE; // K4-REGISTER
+pub use delta::RING_ROWS; // K4-REGISTER
+pub use delta::channels; // K4-REGISTER
+pub use delta::key_of; // K4-REGISTER
+pub use delta::ring_elems; // K4-REGISTER
+pub use delta::state_elems; // K4-REGISTER
+pub use delta::state_index; // K4-REGISTER
 pub use embed::EmbedParams;
 pub use geometry::{
     BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,
@@ -64,6 +78,8 @@ pub struct Kernels {
     q6k: MatvecPipelines,
     headnorm: Pipeline,
     embed: Pipeline,
+    /// The gated delta step. // K4-REGISTER
+    delta: Pipeline, // K4-REGISTER
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -128,6 +144,7 @@ impl Kernels {
             )?,
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             embed: library.pipeline("embed_q4k")?,
+            delta: library.pipeline("gdn_step")?, // K4-REGISTER
             simdgroups,
         })
     }
