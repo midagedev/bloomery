@@ -1,9 +1,9 @@
 //! The Metal backend of the device contract: the `Device` implementation
 //! over `objc2-metal`.
 //!
-//! On another operating system this crate compiles to an empty library (and
-//! its gate bin only refuses): the contract names no backend, and the
-//! workspace still checks on Linux.
+//! On another operating system the device modules are not built (and the
+//! gate bin only refuses). [`arch`] is host arithmetic and builds on every
+//! target, so the workspace still checks on Linux.
 //!
 //! The backend's own choices:
 //!
@@ -11,6 +11,8 @@
 //! - `objc2-metal` pinned by version, with no Objective-C++ shim;
 //! - macOS 26.2 and above, refused by name below it;
 //! - one command buffer per token, and no indirect command buffer.
+
+pub mod arch;
 
 #[cfg(target_os = "macos")]
 pub mod buffer;
