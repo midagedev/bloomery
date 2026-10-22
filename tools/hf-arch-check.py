@@ -20,7 +20,8 @@ seat (`Model::serves`; for the decide row one of `serve::decide::pick`'s paths) 
 architecture (`model::arch::spec`). embd and exps are the ggml types of `token_embd.weight` and of the routed-expert
 tensors in the headers of the set's shards (a split set's later shards are range-read for theirs, within the same
 64 MiB), exps by role. types is judged for the decide seat alone, whose backbone body keeps one list per site kind
-(`crates/gpu/src/arch/qwen3moe/body35.rs`: ok, or REFUSED naming the first tensor and its list); every other seat
+(`crates/chain/src/arch/qwen3moe/read.rs` and `crates/gpu/src/arch/qwen3moe/body35.rs`: ok, or REFUSED naming the first
+tensor and its list); every other seat
 decides its weight types in several places, so types=printed names them and nothing is judged from the types.
 
 --live --box runs `box-facts` on the box through tools/box.sh (it syncs this tree to the box and builds nothing) for
@@ -163,16 +164,20 @@ DECIDE_ROWS = (
     {"name": "lev", "backbones": ("qwen35",), "in_file_arch": (), "in_file_decision": ("lev",),
      "head_repo": None, "quant_repo": None, "unserved": ()},
 )
-# The decide seat's backbone body has one owner list of the weight types it launches: crates/gpu/src/arch/qwen3moe/body35.rs
-# (its `const` lists of SiteTy, read at each site by `ty_of` and `routed_ty`). The lists are read from that source each run
-# (body35_lists joins SiteTy::entry in site.rs to the card! dense column in gguf's qtype.rs), so a type added is followed.
-# BODY35_ARCHS are the architectures that body reads (crates/model/src/arch/mod.rs:QWEN35_BODY); BODY35_SITES the tensors
-# each list is read for, by the `ty_of`/`routed_ty` calls of `plan_gqa`, `plan_delta`, `plan_ffn` and `open`; --self-test
-# holds how many calls read each list. A routed layer's stacks and shared expert are read against FFN_READ, their admission
-# being the card kernel table's (crates/model/src/arch/coverage.rs:qwen35_gate_up/qwen35_down/qwen35_shared); a qwen35 file
-# has no routed layer.
+# The decide seat's backbone body has one owner list of the weight types each site kind launches: its `const` lists of
+# SiteTy. The layers' lists are the chain crate's plan reader's (BODY35_LAYERS_RS: PROJ and PROJ_F32, read at each site by
+# `ty_of` and `routed_ty`), the embedding's and the head's the card body's (BODY35_RS: EMBED and HEAD_TY, read by
+# `file_site`); BODY35_SOURCES are both. The lists are read from those sources each run (body35_lists joins SiteTy::entry
+# in the chain crate's site.rs to the card! dense column in gguf's qtype.rs), so a type added is followed. BODY35_ARCHS
+# are the architectures that body reads (crates/model/src/arch/mod.rs:QWEN35_BODY); BODY35_SITES the tensors each list is
+# read for, by the `ty_of`/`routed_ty` calls of `plan_gqa`, `plan_delta` and `plan_ffn` and the `file_site` calls of
+# `open`; --self-test holds how many calls read each list. A routed layer's stacks and shared expert are read against
+# PROJ_F32, their admission being the card kernel table's
+# (crates/model/src/arch/coverage.rs:qwen35_gate_up/qwen35_down/qwen35_shared); a qwen35 file has no routed layer.
 # The head site is `crates/gpu/src/weights.rs:head_tensor`.
+BODY35_LAYERS_RS = "crates/chain/src/arch/qwen3moe/read.rs"
 BODY35_RS = "crates/gpu/src/arch/qwen3moe/body35.rs"
+BODY35_SOURCES = (BODY35_LAYERS_RS, BODY35_RS)
 BODY35_ARCHS = ("qwen35", "clef")
 BODY35_SITES = (
     (r"blk\.\d+\.attn_q\.weight", "PROJ"),
@@ -185,10 +190,10 @@ BODY35_SITES = (
     (r"blk\.\d+\.ffn_gate\.weight", "PROJ"),
     (r"blk\.\d+\.ffn_up\.weight", "PROJ"),
     (r"blk\.\d+\.ffn_down\.weight", "PROJ"),
-    (r"blk\.\d+\.ssm_beta\.weight", "BETA_ALPHA"),
-    (r"blk\.\d+\.ssm_alpha\.weight", "BETA_ALPHA"),
-    (r"blk\.\d+\.ffn_(?:gate|up|down)_exps\.weight", "FFN_READ"),
-    (r"blk\.\d+\.ffn_(?:gate|up|down)_shexp\.weight", "FFN_READ"),
+    (r"blk\.\d+\.ssm_beta\.weight", "PROJ_F32"),
+    (r"blk\.\d+\.ssm_alpha\.weight", "PROJ_F32"),
+    (r"blk\.\d+\.ffn_(?:gate|up|down)_exps\.weight", "PROJ_F32"),
+    (r"blk\.\d+\.ffn_(?:gate|up|down)_shexp\.weight", "PROJ_F32"),
 )
 # crates/gpu-gates/src/bin/shared/serve_seats/decide.rs:BODIES — the one backbone body the decide seat opens, by the
 # predicate that selects it (`is_qwen35_body`: BODY35_ARCHS).
@@ -535,7 +540,7 @@ def places(seat):
 
 
 def body35_lists_of(name, head):
-    """The lists of body35.rs the tensor `name` is read against, `head` being the head tensor's name."""
+    """The body's lists the tensor `name` is read against, `head` being the head tensor's name."""
     out = [lst for rx, lst in BODY35_SITES if re.fullmatch(rx, name)]
     if name == BODY35_EMBED_TENSOR:
         out.append("EMBED")
@@ -547,21 +552,35 @@ def body35_lists_of(name, head):
 _BODY35 = None
 
 
+def body35_where(lst, what):
+    """`path:line` of the declaration of the body's list `lst`, in the one of BODY35_SOURCES that holds it."""
+    anchor = f"const {lst}: &[SiteTy]"
+    for path in BODY35_SOURCES:
+        try:
+            held = anchor in read_source(path)
+        except SourceError:
+            continue
+        if held:
+            return anchor_line(path, anchor, what)
+    raise Refuse(65, f"{', '.join(BODY35_SOURCES)}: no line with `{anchor}`, the place {what}")
+
+
 def body35_lists(lists=None):
-    """The lists of body35.rs, {list name: [ggml type names]}, read from the source; `lists` stands in for the source
+    """The body's lists, {list name: [ggml type names]}, read from BODY35_SOURCES; `lists` stands in for the sources
     (the self-test's). A source this cannot read, or a list a site reads that it does not hold, is a Refuse(65)."""
     global _BODY35
     if lists is None:
         if _BODY35 is None:
             try:
-                _BODY35 = src_body35(Src(BODY35_RS, read_source(BODY35_RS)), Src(SITE_RS, read_source(SITE_RS)),
-                                     Src(QTYPE_RS, read_source(QTYPE_RS)))[0]
+                _BODY35 = src_body35([Src(p, read_source(p)) for p in BODY35_SOURCES],
+                                     Src(SITE_RS, read_source(SITE_RS)), Src(QTYPE_RS, read_source(QTYPE_RS)))[0]
             except SourceError as e:
                 raise Refuse(65, f"the type lists of the decide seat's body cannot be read: {e}")
         lists = _BODY35
     wanted = {lst for _, lst in BODY35_SITES} | {"EMBED", "HEAD_TY"}
     if wanted - set(lists):
-        raise Refuse(65, f"{BODY35_RS}: no list {sorted(wanted - set(lists))}, which a site of this tool's table reads")
+        raise Refuse(65, f"{', '.join(BODY35_SOURCES)}: no list {sorted(wanted - set(lists))}, which a site of this "
+                         "tool's table reads")
     return lists
 
 
@@ -580,7 +599,7 @@ def body35_types(tensors_by_shard, lists=None):
         for lst in body35_lists_of(name, head):
             checked += 1
             if type_name(ty) not in lists[lst]:
-                where = anchor_line(BODY35_RS, f"const {lst}: &[SiteTy]", "the list is declared in")
+                where = body35_where(lst, "the list is declared in")
                 return (f"{name} is {type_name(ty)}; {where} {lst} takes {', '.join(lists[lst])}"), checked
     return None, checked
 
@@ -646,7 +665,8 @@ def check_row(row, hub, scratch, picked=None):
                 types, green = f"REFUSED: {refusal}", False
             else:
                 types = (f"ok ({n} site tensors against the lists at "
-                         f"{anchor_line(BODY35_RS, 'const PROJ: &[SiteTy]', 'the lists are declared in')})")
+                         f"{body35_where('PROJ', 'the lists are declared in')} and "
+                         f"{body35_where('EMBED', 'the lists are declared in')})")
     elif types is None:
         types = "printed (no one owner: " + ", ".join(places(seat)) + ")"
     return (f"{head} shard1={shard1} arch={arch or '<missing>'} route={shown_route} embd={embd or 'not-found'}{tail} "
@@ -1108,7 +1128,7 @@ ARCH_RS = "crates/model/src/arch/mod.rs"
 DECIDE_SERVE_RS = "crates/serve/src/decide.rs"
 DECIDE_SEAT_RS = "crates/gpu-gates/src/bin/shared/serve_seats/decide.rs"
 QUANT_RS = "crates/gguf/src/quant.rs"
-SITE_RS = "crates/gpu/src/site.rs"
+SITE_RS = "crates/chain/src/site.rs"
 QTYPE_RS = "crates/gguf/src/qtype.rs"
 RELEASE_RS = {"clef": "crates/decision/src/release/clef.rs", "lev": "crates/decision/src/release/lev.rs"}
 
@@ -1535,26 +1555,30 @@ def src_site_names(site, qtype):
     return out
 
 
-def src_body35(body, site, qtype):
-    """body35.rs: ({list name: [ggml type names]}, {list name: how many `ty_of`/`routed_ty` calls read it})."""
+def src_body35(bodies, site, qtype):
+    """The body's sources (BODY35_SOURCES, in that order): ({list name: [ggml type names]}, {list name: how many
+    `ty_of`/`routed_ty`/`file_site` calls read it}). A list two sources declare is refused by both places."""
     names = src_site_names(site, qtype)
-    lists = {}
-    for hit in re.finditer(r"\bconst\s+(\w+)\s*:\s*&\[SiteTy\]\s*=\s*&\[", body.m):
-        lo = hit.end() - 1
-        items = re.findall(r"SiteTy::(\w+)", body.m[lo:body.close(lo)])
-        for v in items:
-            if v not in names:
-                raise body.err(lo, f"SiteTy::{v} is no family of {SITE_RS}:SiteTy::entry")
-        lists[hit.group(1)] = [names[v] for v in items]
+    lists, at = {}, {}
     calls = {}
-    for hit in re.finditer(r"(?<!fn )\b(?:ty_of|routed_ty)\(", body.m):
-        open_at = hit.end() - 1
-        args = [sp for sp in body.split_top(open_at + 1, body.close(open_at), ",") if body.m[sp[0]:sp[1]].strip()]
-        last = body.m[args[-1][0]:args[-1][1]].strip()
-        if re.fullmatch(r"[A-Z][A-Z_0-9]*", last):
-            calls[last] = calls.get(last, 0) + 1
-        elif not re.fullmatch(r"[a-z_]\w*", last):
-            raise body.err(args[-1][0], f"a site call whose list this tool cannot read: {last!r}")
+    for body in bodies:
+        for hit in re.finditer(r"\bconst\s+(\w+)\s*:\s*&\[SiteTy\]\s*=\s*&\[", body.m):
+            lo = hit.end() - 1
+            if hit.group(1) in lists:
+                raise body.err(lo, f"the list {hit.group(1)} is declared in {at[hit.group(1)]} too")
+            items = re.findall(r"SiteTy::(\w+)", body.m[lo:body.close(lo)])
+            for v in items:
+                if v not in names:
+                    raise body.err(lo, f"SiteTy::{v} is no family of {SITE_RS}:SiteTy::entry")
+            lists[hit.group(1)], at[hit.group(1)] = [names[v] for v in items], body.path
+        for hit in re.finditer(r"(?<!fn )\b(?:ty_of|routed_ty|file_site)\(", body.m):
+            open_at = hit.end() - 1
+            args = [sp for sp in body.split_top(open_at + 1, body.close(open_at), ",") if body.m[sp[0]:sp[1]].strip()]
+            last = body.m[args[-1][0]:args[-1][1]].strip()
+            if re.fullmatch(r"[A-Z][A-Z_0-9]*", last):
+                calls[last] = calls.get(last, 0) + 1
+            elif not re.fullmatch(r"[a-z_]\w*", last):
+                raise body.err(args[-1][0], f"a site call whose list this tool cannot read: {last!r}")
     return lists, calls
 
 
@@ -1652,12 +1676,13 @@ def mirror_vs_source(read):
     out += [f"{ARCH_RS}:QWEN35_BODY: {n!r} has no reader in {REGISTRY_TSV}" for n in consts.get("QWEN35_BODY", [])
             if n not in spec]
     out += diff_sets(f"{DECIDE_SEAT_RS}:BODIES predicates", DECIDE_BODY_PREDICATES, src_bodies(seat), DECIDE_SEAT_RS)
-    _, calls = src_body35(Src(BODY35_RS, read(BODY35_RS)), Src(SITE_RS, read(SITE_RS)), Src(QTYPE_RS, read(QTYPE_RS)))
+    _, calls = src_body35([Src(p, read(p)) for p in BODY35_SOURCES], Src(SITE_RS, read(SITE_RS)),
+                          Src(QTYPE_RS, read(QTYPE_RS)))
     mine = {}
     for _, lst in BODY35_SITES:
         mine[lst] = mine.get(lst, 0) + 1
     mine["EMBED"], mine["HEAD_TY"] = 1, 1
-    out += diff_maps(f"{BODY35_RS} sites per list", mine, calls, BODY35_RS)
+    out += diff_maps("the body's sites per list", mine, calls, " and ".join(BODY35_SOURCES))
     ids = src_types(quant)
     out += diff_maps(f"{QUANT_RS}:GgmlType::from_u32", {str(k): v for k, v in GGML_TYPES.items()},
                      {str(k): v for k, v in ids.items()}, QUANT_RS)
@@ -1809,8 +1834,9 @@ def self_test():
          "glm5-next"),
         ("an id added to GgmlType::from_u32 is named", QUANT_RS, "            40 => GgmlType::NVFP4,\n",
          "            40 => GgmlType::NVFP4,\n            43 => GgmlType::Q1_0,\n", "'43'"),
-        ("a new site read against a body35 list is named", BODY35_RS,
-         "v_ty: ty_of(file, &v, kv, h, PROJ)?,", "v_ty: ty_of(file, &v, kv, h, PROJ)?, x_ty: ty_of(file, &v, kv, h, PROJ)?,",
+        ("a new site read against a body35 list is named", BODY35_LAYERS_RS,
+         "v_ty: ty_of(file, what, &v, kv, h, PROJ)?,",
+         "v_ty: ty_of(file, what, &v, kv, h, PROJ)?, x_ty: ty_of(file, what, &v, kv, h, PROJ)?,",
          "sites per list PROJ"),
         ("a second backbone body of the decide seat is named", DECIDE_SEAT_RS,
          "&[(is_qwen35_body, open_qwen35)]", "&[(is_qwen35_body, open_qwen35), (is_other_body, open_other)]",
@@ -1829,7 +1855,8 @@ def self_test():
         if old not in text:
             raise SourceError(f"{BODY35_RS}: the self-test's doctoring text is gone: {old!r}")
         doc = Src(BODY35_RS, text.replace(old, old + "SiteTy::Q3K,", 1))
-        lists = src_body35(doc, Src(SITE_RS, read_source(SITE_RS)), Src(QTYPE_RS, read_source(QTYPE_RS)))[0]
+        lists = src_body35([Src(BODY35_LAYERS_RS, read_source(BODY35_LAYERS_RS)), doc], Src(SITE_RS, read_source(SITE_RS)),
+                           Src(QTYPE_RS, read_source(QTYPE_RS)))[0]
         pair = lambda ty: [[("token_embd.weight", ty, [], 0), ("output.weight", 14, [], 0)]]
         return (body35_types(pair(11), lists)[0] is None and "Q3_K" in lists["EMBED"]
                 and body35_types(pair(1), lists)[0] is not None)
@@ -1910,12 +1937,12 @@ def self_test():
         dense = [("token_embd.weight", inside("EMBED"), [256, 2], b"\0" * 8),
                  ("output.weight", inside("HEAD_TY"), [256, 2], b"\0" * 8),
                  ("blk.0.attn_q.weight", inside("PROJ"), [256, 2], b"\0" * 8),
-                 ("blk.0.ssm_beta.weight", inside("BETA_ALPHA"), [8, 2], b"\0" * 8),
+                 ("blk.0.ssm_beta.weight", inside("PROJ_F32"), [8, 2], b"\0" * 8),
                  ("blk.0.ffn_down.weight", inside("PROJ"), [32, 2], b"\0" * 8),
                  ("blk.0.attn_norm.weight", 0, [8], b"\0" * 8)]
         line, green, _ = row_line("decide", "clef", dense)
         check("a clef file whose sites read their lists is types=ok", green and "types=ok (5 site tensors" in line
-              and "body35.rs:" in line, line)
+              and f"{BODY35_LAYERS_RS}:" in line and f"{BODY35_RS}:" in line, line)
 
         def swapped(name, ty):
             return [(n, ty if n == name else t, d, b) for n, t, d, b in dense]
@@ -1932,10 +1959,10 @@ def self_test():
         bad = outside("PROJ")
         line, green, _ = row_line("decide", "clef", swapped("blk.0.attn_q.weight", bad))
         check("a projection outside PROJ is a red row", not green and f"blk.0.attn_q.weight is {type_name(bad)}" in line, line)
-        bad = outside("BETA_ALPHA")
+        bad = outside("PROJ_F32")
         line, green, _ = row_line("decide", "clef", swapped("blk.0.ssm_beta.weight", bad))
-        check("a beta outside BETA_ALPHA is a red row", not green and f"blk.0.ssm_beta.weight is {type_name(bad)}" in line,
-              line)
+        check("a beta outside PROJ_F32 is a red row naming the chain's list", not green
+              and f"blk.0.ssm_beta.weight is {type_name(bad)}; {BODY35_LAYERS_RS}:" in line, line)
         tied = both("EMBED", "HEAD_TY")
         line, green, _ = row_line("decide", "clef", [("token_embd.weight", tied, [256, 2], b"\0" * 8)] + dense[2:])
         check("a tied head is read against HEAD_TY as the token embedding", not green and

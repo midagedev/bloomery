@@ -47,6 +47,7 @@ refset_readers	refset	crates/refset/src/lib.rs crates/refset/src/family.rs crate
 threads_pool	host	crates/threads/src/lib.rs
 os_calls	host	crates/os/src/lib.rs
 record_core	host	crates/record/src/lib.rs
+chain_plan	host	crates/chain/src/*.rs crates/chain/src/arch/*.rs crates/chain/src/arch/*/*.rs
 engram_verbs	host	crates/engram/src/lib.rs crates/verbs/src/lib.rs
 arch_registry	refset	crates/model/src/arch/registry.rs crates/model/src/arch/mod.rs crates/model/src/arch/classify.rs crates/model/src/arch/names.rs crates/model/src/arch/stems.rs crates/model/src/arch/coverage.rs
 model_host_ops	host	crates/model/src/ops.rs crates/model/src/ffn.rs crates/model/src/moe.rs crates/model/src/head.rs crates/model/src/embed.rs crates/model/src/quant.rs
