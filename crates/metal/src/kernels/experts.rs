@@ -14,10 +14,9 @@ use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 use crate::library::{Library, Pipeline};
 
+use super::experts_geom::{EXPERT_K, EXPERT_SLOTS, FOLDED_BLOCKS, ROUTED_IDS};
 use super::geometry::{BLOCK_VALUES, ROWS_PER_SIMD_GROUP, SIMD_WIDTH};
 use super::{Quant, args_bytes, check_window_len, pack, word};
-
-include!("experts_geom.rs");
 
 const PAIR: &str = "pair";
 const FOLD: &str = "fold";

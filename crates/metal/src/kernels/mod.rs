@@ -21,13 +21,16 @@
 mod attention;
 use crate::attention_geom;
 mod delta;
+mod delta_geom;
 mod embed;
 mod experts;
+mod experts_geom;
 mod geometry;
 mod head;
 mod headnorm;
 mod matvec;
 pub mod router;
+mod router_geom;
 mod seg;
 
 pub use attention::{
@@ -35,21 +38,20 @@ pub use attention::{
     SEGMENT_KEYS, TILE, attention_dispatches, f16_len, out_len, partials_len, q8_code_len,
     q8_scale_len, qg_len, segments_for_keys,
 };
-pub use delta::CONV_TAPS;
 pub use delta::DeltaParams;
 pub use delta::HeadMap;
-pub use delta::PASS_ROWS;
 pub use delta::Q_SCALE;
-pub use delta::RING_ROWS;
 pub use delta::channels;
 pub use delta::key_of;
 pub use delta::ring_elems;
 pub use delta::state_elems;
 pub use delta::state_index;
+pub use delta_geom::CONV_TAPS;
+pub use delta_geom::PASS_ROWS;
+pub use delta_geom::RING_ROWS;
 pub use embed::EmbedParams;
-pub use experts::{
-    EXPERT_K, EXPERT_SLOTS, FoldParams, PairParams, ROUTED_IDS, SHARED_SLOT, SharedPlan,
-};
+pub use experts::{FoldParams, PairParams, SharedPlan};
+pub use experts_geom::{EXPERT_K, EXPERT_SLOTS, ROUTED_IDS, SHARED_SLOT};
 pub use geometry::{
     BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,
     SIMD_GROUPS_PER_GROUP, THREADS_PER_GROUP, VALUE_HEADS,

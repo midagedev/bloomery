@@ -11,10 +11,9 @@ use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
+use super::delta_geom::{CONV_TAPS, RING_ROWS};
 use super::geometry::{HEAD_COLS, PARTIALS_PER_HEAD, VALUE_HEADS};
 use super::{Kernels, check_window_len, check_word, pack, word};
-
-include!("delta_geom.rs");
 
 /// `1 / sqrt(HEAD_COLS)` rounded to f32. The kernel multiplies the query by
 /// this value; an oracle promotes these bits, rather than a fresh reciprocal.
