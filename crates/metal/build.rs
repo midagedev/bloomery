@@ -161,6 +161,7 @@ fn main() {
         "ticket", // K2-REGISTER
         "router", // K2-REGISTER
         "experts", // K3-REGISTER
+        "delta", // K4-REGISTER
     ] {
         let path = kernels_dir.join(format!("{name}.metal"));
         let source =

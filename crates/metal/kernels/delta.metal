@@ -1,0 +1,387 @@
+// The gated delta step of one decode token: causal conv and SiLU, the q/k
+// L2 norm, β and the per-head decay, the delta update, the gated numerator
+// and the partial sums of o². The norm scale is not applied here; the
+// head-normed mat-vec multiplies it on load.
+//
+// The grid is 256 threadgroups of 128 threads: 32 value heads, 8 column
+// blocks, 4 simdgroups. A simdgroup holds 4 columns of 8 lanes. Lane j of a
+// column holds keys 32·r + 4·j + c. The q/k conv is redone in every
+// threadgroup (256 channels, 4 taps).
+//
+// The ring stores the conv input. A predecessor at distance d is 0 while
+// pos < d, otherwise the slot (pos − d) mod 11. The current token is the
+// launch's x, not a ring slot. One threadgroup writes each channel: a q/k
+// channel is the lowest value head of its key head and column block 0, a
+// value channel is the threadgroup that owns the column. Reads finish before
+// writes; the written slot is not a slot this token reads.
+//
+// A lane word at or past the lane count raises the lane site and does not
+// write the state. A lane whose state is not finite raises the same site and
+// writes NaN on that lane only; the other lanes of its column keep the state
+// they loaded. A conv, a norm, β or a decay that is not finite raises the
+// conv site and leaves the state. A non-finite output that is none of those
+// raises the delta site. Nothing here raises the gate site.
+
+#include <metal_stdlib>
+
+using namespace metal;
+
+#pragma METAL fp contract(off)
+
+// The step's argument block, bound by value. Eight words, no padding.
+struct DeltaArgs {
+    uint n_k;
+    uint grouped; // 0 tiled (h % n_k), else grouped (h / (n_v / n_k))
+    uint lanes;
+    uint lane_at;
+    uint layer;
+    uint pos;
+    uint eps_bits;
+    uint pad;
+};
+
+static_assert(sizeof(DeltaArgs) == 32, "DeltaArgs is 32 bytes: the host packs eight words");
+static_assert(BLOOMERY_MATVEC_VALUE_HEADS == 32, "the grid is 32 value heads");
+static_assert(BLOOMERY_MATVEC_HEAD_COLS == 128, "a head is 128 columns");
+static_assert(BLOOMERY_MATVEC_PARTIALS_PER_HEAD == 8, "a head has eight column blocks");
+
+constant float Q_SCALE = as_type<float>(0x3db504f3u);
+
+inline uint key_of(uint j, uint i) {
+    return 32u * (i / 4u) + 4u * j + (i % 4u);
+}
+
+// The conv input d steps before pos. Distance 0 is this token's x.
+inline float tap_x(uint c, uint pos, uint d, uint ch,
+                   device const float *x, device const float *ring) {
+    if (d == 0u) {
+        return x[c];
+    }
+    if (pos < d) {
+        return 0.0f;
+    }
+    uint s = (pos + 11u - d) % 11u;
+    return ring[s * ch + c];
+}
+
+// SiLU(conv4) of channel c, and whether every value stayed finite.
+inline float conv_silu(uint c, uint pos, uint ch,
+                       device const float *x, device const float *ring,
+                       device const float *w, thread bool *ok) {
+    float x0 = tap_x(c, pos, 3u, ch, x, ring);
+    float x1 = tap_x(c, pos, 2u, ch, x, ring);
+    float x2 = tap_x(c, pos, 1u, ch, x, ring);
+    float x3 = tap_x(c, pos, 0u, ch, x, ring);
+    float w0 = w[4u * c];
+    float w1 = w[4u * c + 1u];
+    float w2 = w[4u * c + 2u];
+    float w3 = w[4u * c + 3u];
+    float acc = x0 * w0;
+    acc = fma(x1, w1, acc);
+    acc = fma(x2, w2, acc);
+    acc = fma(x3, w3, acc);
+    float y = acc / (1.0f + exp(-acc));
+    if (!isfinite(x0) || !isfinite(x1) || !isfinite(x2) || !isfinite(x3) ||
+        !isfinite(w0) || !isfinite(w1) || !isfinite(w2) || !isfinite(w3) ||
+        !isfinite(acc) || !isfinite(y)) {
+        *ok = false;
+    }
+    return y;
+}
+
+inline float softplus(float x) {
+    if (x > 20.0f) {
+        return x;
+    }
+    return log(1.0f + exp(x));
+}
+
+inline float sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+// One lane's sixteen products, in the contract's (r, c) order.
+inline float lane_dot(thread const float *a, thread const float *b) {
+    float p0 = a[0] * b[0];
+    float p1 = a[1] * b[1];
+    float p2 = a[2] * b[2];
+    float p3 = a[3] * b[3];
+    for (uint r = 1u; r < 4u; ++r) {
+        p0 = fma(a[4u * r], b[4u * r], p0);
+        p1 = fma(a[4u * r + 1u], b[4u * r + 1u], p1);
+        p2 = fma(a[4u * r + 2u], b[4u * r + 2u], p2);
+        p3 = fma(a[4u * r + 3u], b[4u * r + 3u], p3);
+    }
+    return (p0 + p1) + (p2 + p3);
+}
+
+// The eight lanes of one column. Distances 4, 2, 1 stay inside the column:
+// the eight lanes are eight-aligned.
+inline float column_sum(float x) {
+    x += simd_shuffle_xor(x, ushort(4));
+    x += simd_shuffle_xor(x, ushort(2));
+    x += simd_shuffle_xor(x, ushort(1));
+    return x;
+}
+
+inline uint column_or(uint x) {
+    x |= simd_shuffle_xor(x, ushort(4));
+    x |= simd_shuffle_xor(x, ushort(2));
+    x |= simd_shuffle_xor(x, ushort(1));
+    return x;
+}
+
+inline uint simd_or(uint x) {
+    x |= simd_shuffle_xor(x, ushort(16));
+    x |= simd_shuffle_xor(x, ushort(8));
+    x |= simd_shuffle_xor(x, ushort(4));
+    x |= simd_shuffle_xor(x, ushort(2));
+    x |= simd_shuffle_xor(x, ushort(1));
+    return x;
+}
+
+inline float simd_sum(float x) {
+    x += simd_shuffle_xor(x, ushort(16));
+    x += simd_shuffle_xor(x, ushort(8));
+    x += simd_shuffle_xor(x, ushort(4));
+    x += simd_shuffle_xor(x, ushort(2));
+    x += simd_shuffle_xor(x, ushort(1));
+    return x;
+}
+
+// 1 / max(sqrt(sum), eps). A non-finite sum is NaN, not max(NaN, eps).
+inline float l2_scale(float sum, float eps) {
+    if (!isfinite(sum)) {
+        return NAN;
+    }
+    float root = sqrt(sum);
+    float denom = root > eps ? root : eps;
+    return 1.0f / denom;
+}
+
+kernel void gdn_step(device const float *x [[buffer(0)]],
+                     device const float *conv_w [[buffer(1)]],
+                     device const float *b_raw [[buffer(2)]],
+                     device const float *a_raw [[buffer(3)]],
+                     device const float *dt_bias [[buffer(4)]],
+                     device const float *ssm_a [[buffer(5)]],
+                     device const float *z [[buffer(6)]],
+                     device const float *norm_w [[buffer(7)]],
+                     device const uint *lane_buf [[buffer(8)]],
+                     device float *state [[buffer(9)]],
+                     device float *ring [[buffer(10)]],
+                     device float *partials [[buffer(11)]],
+                     device float *g [[buffer(12)]],
+                     constant DeltaArgs &args [[buffer(13)]],
+                     device atomic_uint *faults [[buffer(14)]],
+                     uint3 tgp [[threadgroup_position_in_grid]],
+                     uint3 tpt [[thread_position_in_threadgroup]],
+                     ushort tiisg [[thread_index_in_simdgroup]],
+                     ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    uint tid = tpt.x;
+    uint tg = tgp.x;
+    uint n_k = args.n_k;
+    uint n_v = BLOOMERY_MATVEC_VALUE_HEADS;
+    uint head = BLOOMERY_MATVEC_HEAD_COLS;
+    uint lanes = args.lanes;
+    uint pos = args.pos;
+    uint layer = args.layer;
+    float eps = as_type<float>(args.eps_bits);
+    uint ch = (2u * n_k + n_v) * head;
+    uint block = tg % 8u;
+    uint h = tg / 8u;
+    uint j = (uint)(tiisg % 8);
+    uint sub = (uint)(tiisg / 8);
+    uint col = block * 16u + (uint)sgitg * 4u + sub;
+    uint col_in_block = (uint)sgitg * 4u + sub;
+    uint per = n_v / n_k;
+    uint kh = args.grouped != 0u ? h / per : h % n_k;
+    bool lowest = args.grouped != 0u ? (h % per == 0u) : (h < n_k);
+    bool qk_owner = block == 0u && lowest;
+
+    threadgroup float qv[128];
+    threadgroup float kv[128];
+    threadgroup float o2[16];
+    threadgroup uint sg_bad[4];
+    threadgroup uint scale_bad;
+
+    if (tid == 0u) {
+        scale_bad = 0u;
+    }
+
+    uint word = lane_buf[args.lane_at];
+    bool lane_ok = word < lanes;
+
+    // The slot written once per channel. Reads use other slots.
+    uint slot = pos % 11u;
+
+    bool q_ok = true;
+    bool k_ok = true;
+    float qs = conv_silu(kh * head + tid, pos, ch, x, ring, conv_w, &q_ok);
+    float ks = conv_silu((n_k + kh) * head + tid, pos, ch, x, ring, conv_w, &k_ok);
+    qv[tid] = qs;
+    kv[tid] = ks;
+    if (qk_owner) {
+        uint qc = kh * head + tid;
+        uint kc = (n_k + kh) * head + tid;
+        ring[slot * ch + qc] = x[qc];
+        ring[slot * ch + kc] = x[kc];
+    }
+
+    float v = 0.0f;
+    bool v_ok = true;
+    if (j == 0u) {
+        uint vc = (2u * n_k + h) * head + col;
+        v = conv_silu(vc, pos, ch, x, ring, conv_w, &v_ok);
+        ring[slot * ch + vc] = x[vc];
+    }
+    v = simd_shuffle(v, (ushort)((tiisg / 8) * 8));
+    // v_ok is the j == 0 thread's. Spread it with the flag below; a shuffle
+    // of the value already gave every lane of the column the same v.
+
+    float ba = b_raw[h];
+    float aa = a_raw[h];
+    float dt = dt_bias[h];
+    float sa = ssm_a[h];
+    float decay = exp(sa * softplus(aa + dt));
+    float beta = sigmoid(ba);
+    bool prep_ok = isfinite(ba) && isfinite(aa) && isfinite(dt) && isfinite(sa) &&
+                   isfinite(decay) && isfinite(beta) && isfinite(v);
+    uint my_bad = (q_ok && k_ok && v_ok && prep_ok) ? 0u : 1u;
+    // j != 0 did not run the value conv, so its v_ok is still true. The j == 0
+    // thread's flag reaches the whole simdgroup through this or.
+    my_bad = simd_or(my_bad);
+    if (tiisg == 0u) {
+        sg_bad[sgitg] = my_bad;
+    }
+
+    // q and k are in threadgroup memory; the norm reads them.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0u) {
+        float q0 = qv[tiisg];
+        float q1 = qv[tiisg + 32u];
+        float q2 = qv[tiisg + 64u];
+        float q3 = qv[tiisg + 96u];
+        float k0 = kv[tiisg];
+        float k1 = kv[tiisg + 32u];
+        float k2 = kv[tiisg + 64u];
+        float k3 = kv[tiisg + 96u];
+        float sumq = (q0 * q0 + q1 * q1) + (q2 * q2 + q3 * q3);
+        float sumk = (k0 * k0 + k1 * k1) + (k2 * k2 + k3 * k3);
+        sumq = simd_sum(sumq);
+        sumk = simd_sum(sumk);
+        float sq = l2_scale(sumq, eps);
+        float sk = l2_scale(sumk, eps);
+        if (tiisg == 0u && (!isfinite(sq) || !isfinite(sk))) {
+            scale_bad = 1u;
+        }
+        qv[tiisg] = (q0 * sq) * Q_SCALE;
+        qv[tiisg + 32u] = (q1 * sq) * Q_SCALE;
+        qv[tiisg + 64u] = (q2 * sq) * Q_SCALE;
+        qv[tiisg + 96u] = (q3 * sq) * Q_SCALE;
+        kv[tiisg] = k0 * sk;
+        kv[tiisg + 32u] = k1 * sk;
+        kv[tiisg + 64u] = k2 * sk;
+        kv[tiisg + 96u] = k3 * sk;
+    }
+
+    // Scaled q and k are in threadgroup memory; every column reads them.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bool conv_bad = (sg_bad[0] | sg_bad[1] | sg_bad[2] | sg_bad[3] | scale_bad) != 0u;
+
+    float s0[16];
+    float sp[16];
+    float kk[16];
+    float qq[16];
+    bool lane_state_bad = false;
+    uint base = 0u;
+    for (uint i = 0u; i < 16u; ++i) {
+        s0[i] = 0.0f;
+    }
+    if (lane_ok) {
+        base = ((word * n_v + h) * head + col) * head;
+        for (uint i = 0u; i < 16u; ++i) {
+            s0[i] = state[base + key_of(j, i)];
+            if (!isfinite(s0[i])) {
+                lane_state_bad = true;
+            }
+        }
+    }
+    for (uint i = 0u; i < 16u; ++i) {
+        uint key = key_of(j, i);
+        kk[i] = kv[key];
+        qq[i] = qv[key];
+        sp[i] = (lane_ok && !lane_state_bad) ? s0[i] * decay : 0.0f;
+    }
+
+    float kvdot = column_sum(lane_dot(sp, kk));
+    float u = (v - kvdot) * beta;
+    for (uint i = 0u; i < 16u; ++i) {
+        sp[i] = fma(kk[i], u, sp[i]);
+    }
+    float o = column_sum(lane_dot(sp, qq));
+
+    uint lb = lane_state_bad ? 1u : 0u;
+    lb = column_or(lb);
+    bool column_bad = lane_ok && !conv_bad && lb != 0u;
+
+    float gval = NAN;
+    float oval = NAN;
+    if (lane_ok && !conv_bad && !column_bad) {
+        oval = o;
+        float zv = z[h * head + col];
+        gval = (o * norm_w[col]) * (zv / (1.0f + exp(-zv)));
+    }
+    if (j == 0u) {
+        o2[col_in_block] = oval * oval;
+        g[h * head + col] = gval;
+    }
+
+    // One square per column of this block; thread 0 sums them. The third
+    // barrier: the norm's two do not cover this reduction.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float p = o2[0];
+        for (uint i = 1u; i < 16u; ++i) {
+            p += o2[i];
+        }
+        if (!lane_ok || conv_bad) {
+            p = NAN;
+        }
+        partials[h * 8u + block] = p;
+    }
+
+    if (!lane_ok) {
+        if (tid == 0u) {
+            raise(faults, layer, BLOOMERY_FAULT_SITE_DELTA_LANE);
+        }
+    } else if (conv_bad) {
+        if (tid == 0u) {
+            raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_CONV);
+        }
+    } else if (column_bad) {
+        if (lane_state_bad) {
+            for (uint i = 0u; i < 16u; ++i) {
+                uint key = key_of(j, i);
+                state[base + key] = NAN;
+            }
+            raise(faults, layer, BLOOMERY_FAULT_SITE_DELTA_LANE);
+        } else {
+            for (uint i = 0u; i < 16u; ++i) {
+                uint key = key_of(j, i);
+                state[base + key] = s0[i];
+            }
+        }
+    } else {
+        for (uint i = 0u; i < 16u; ++i) {
+            uint key = key_of(j, i);
+            state[base + key] = sp[i];
+        }
+        if (j == 0u && !isfinite(o)) {
+            raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_DELTA);
+        }
+    }
+}
