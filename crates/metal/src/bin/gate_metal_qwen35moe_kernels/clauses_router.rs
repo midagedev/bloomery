@@ -80,6 +80,33 @@ fn constructed(eps: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     (routed, shared, x, gain)
 }
 
+/// The tie construction: rows `LOW` and `HIGH` carry the same weights, so
+/// their logits are the same bits, and the tie sits at the 8th and 9th
+/// places of the ranking.
+fn constructed_tie(eps: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    const ABOVE: usize = 7;
+    const TIE: f64 = 0.75;
+    let mut x = vec![0f32; K];
+    x[0] = 1.0;
+    let gain = vec![1.0f32; K];
+    let xhat = oracle::rms_norm(&x, &gain, eps);
+    let x0 = xhat[0];
+    let mut routed = vec![0f32; EXPERTS * K];
+    for i in 0..EXPERTS {
+        let target = if i < ABOVE {
+            4.0 - 0.5 * f64::from(u32::try_from(i).unwrap_or(0))
+        } else if i == ABOVE || i == ABOVE + 1 {
+            TIE
+        } else {
+            -2.0 - 0.01 * f64::from(u32::try_from(i - ABOVE - 2).unwrap_or(0))
+        };
+        routed[i * K] = (target / x0) as f32;
+    }
+    let mut shared = vec![0f32; K];
+    shared[0] = (0.5 / x0) as f32;
+    (routed, shared, x, gain)
+}
+
 fn run(
     h: &Harness<'_>,
     routed: &[f32],
@@ -316,6 +343,62 @@ pub fn router_ids(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         ranking.margin,
         ranking.margin_band,
         notes.join(", ")
+    )))
+}
+
+/// The 8th and 9th logits tie in bits; the smaller id must take the 8th
+/// slot. The construction carries no fixture weights, so the clause reads
+/// none.
+pub fn router_tie(h: &Harness<'_>) -> Clause {
+    const LOW: usize = 7;
+    const HIGH: usize = 8;
+    const ABOVE: usize = 7;
+    let eps = 1e-5;
+    h.clear_fault()?;
+    let (routed, shared, x, gain) = constructed_tie(eps);
+    let out = run(h, &routed, &shared, &x, &gain, eps)?;
+    clean(h, "constructed")?;
+    if out.logits[LOW].to_bits() != out.logits[HIGH].to_bits() {
+        return Err(format!(
+            "rows {LOW} and {HIGH} are {:e} and {:e}, not the same bits",
+            out.logits[LOW], out.logits[HIGH]
+        ));
+    }
+    let tied = out.logits[LOW];
+    if !tied.is_finite() {
+        return Err(format!("the tied logit {tied:e} is not finite"));
+    }
+    for (i, &v) in out.logits.iter().enumerate() {
+        if i == LOW || i == HIGH || i == EXPERTS {
+            continue;
+        }
+        let above = if i < ABOVE { v > tied } else { v < tied };
+        if !above {
+            return Err(format!(
+                "row {i} is {v:e}, not on its side of the tie {tied:e}"
+            ));
+        }
+    }
+    let shared_id = out.ids[TOP_K];
+    if shared_id != EXPERTS as u32 {
+        return Err(format!(
+            "shared id is {shared_id}, the shared expert is {EXPERTS}"
+        ));
+    }
+    for (s, &got) in out.ids[..TOP_K].iter().enumerate() {
+        let want = u32::try_from(s).map_err(|_| "a slot id does not fit u32")?;
+        if got != want {
+            return Err(format!(
+                "slot {s} is {got}, the tied ranking selects {want} (the tie is {LOW} and {HIGH})"
+            ));
+        }
+    }
+    if out.weights[..TOP_K].iter().any(|w| !w.is_finite()) {
+        return Err("a routed weight is not finite".to_string());
+    }
+    Ok(Verdict::Noted(format!(
+        "slots 0..{} are 0..{LOW}; the tie {LOW}/{HIGH} takes {LOW}",
+        TOP_K - 1
     )))
 }
 
@@ -825,6 +908,7 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::Cla
     vec![
         ("router_logit", Box::new(|| ctx.with(router_logit))),
         ("router_ids", Box::new(|| ctx.with(router_ids))),
+        ("router_tie", Box::new(|| router_tie(ctx.harness))),
         ("router_weights", Box::new(|| ctx.with(router_weights))),
         ("router_ticket", Box::new(|| ctx.with(router_ticket))),
         ("router_nan", Box::new(|| ctx.with(router_nan))),
