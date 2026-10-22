@@ -89,11 +89,13 @@ cross_uses() { # cross_uses <name> <dir…>
   [ -z "$hits" ] || cross="${cross:+$cross$'\n'}$hits"
 }
 scan_lits() { # scan_lits <path…>: rule ②'s hits into lits
+  # The gpu-gates and metal bins are exempt: they are gates and probes, and naming the fixture's tensors is their job.
   lits=$(grep_answer check-arch -rnE "\"blk\\.|(^|[^.a-z])blk\\.\\{|$KEYS" "$@" --include='*.rs' --include='*.sh' \
     | grep_answer check-arch -vE "$OWN" \
     | grep_answer check-arch -vE '^tools/ref/models/' \
     | grep_answer check-arch -vE '^crates/[^/]+/tests/' \
     | grep_answer check-arch -vE '^crates/gpu-gates/src/bin/' \
+    | grep_answer check-arch -vE '^crates/metal/src/bin/' \
     | grep_answer check-arch -vE '^crates/engram/' \
     | grep_answer check-arch -vE '^crates/gguf/src/bin/' \
     | grep_answer check-arch -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
