@@ -12,6 +12,7 @@ gate-alloc	common		host	model_host_ops
 gate-app	common		host	seats_app+drafts_mtp+drafts_dspark
 gate-arch-registry	common		registry	arch_registry
 gate-attn	family	deepseek2	host	model_host_ops
+gate-chain	common		host	chain_plan
 gate-decision-clef	common		constrain	decision_head
 gate-decision-lev	common		constrain	decision_head
 gate-deepseek4-meta	family	deepseek41	meta	arch_registry

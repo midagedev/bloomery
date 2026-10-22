@@ -12342,10 +12342,11 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # that crate.
     # PIN(2026-10-21): bloomery-device joined with the device contract's pure tests; bloomery-metal is an empty library off macOS.
     # PIN(2026-10-21): bloomery-record joined: the record core lifted out of gpu-gates
+    # PIN(2026-10-22): bloomery-chain joined: the qwen3moe chain plan, host data moved out of bloomery-gpu.
     expect(
         host_now
         == [
-            "bloomery-app", "bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf",
+            "bloomery-app", "bloomery-chain", "bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf",
             "bloomery-jinja", "bloomery-levers", "bloomery-metal", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-record", "bloomery-refset",
             "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
             "bloomery-vision",
