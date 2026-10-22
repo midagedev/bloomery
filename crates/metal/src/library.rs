@@ -104,9 +104,9 @@ impl Library {
     }
 
     /// The library the runtime compiles from the given source text. For the
-    /// kernel gate's mutants alone (a defect edited into the shipped source's
-    /// text, in a bin of its own, which is why it is public): every other
-    /// caller takes [`Library::from_source`].
+    /// kernels gate alone, which is why it is public: its mutants (a defect
+    /// edited into the shipped source's text) and its gate-only kernels
+    /// appended to that text. The engine takes [`Library::from_source`].
     pub fn from_source_text(device: &MetalDevice, text: &str) -> Result<Self, DeviceError> {
         Self::source_of(device.handle(), text)
     }
