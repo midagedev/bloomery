@@ -371,6 +371,7 @@ dependencies = [
  "bloomery-model",
  "bloomery-placement",
  "bloomery-refset",
+ "bloomery-runtime",
  "dispatch2",
  "objc2",
  "objc2-foundation",

@@ -327,6 +327,12 @@ impl Session {
         let kernels = Kernels::from_library(library)?;
         let stream = device.new_stream()?;
         let arena = Arena::open(device.metal(), &split, &spec, &plans, ctx)?;
+        if u32::try_from(arena.ctx).is_err() {
+            return Err(refuse(format!(
+                "a cache of {} rows: more than a u32 position names",
+                arena.ctx
+            )));
+        }
         let layers = arena.token_layers();
         Ok(Session {
             stream,
@@ -578,6 +584,25 @@ impl Session {
             arena: &self.arena,
             lane: lane_of(self.pos),
         })
+    }
+
+    /// The head's logits row of the last stepped token: the shared pages the
+    /// head wrote, zero copy. Refused while a token runs ahead, as a probe
+    /// is: its head would overwrite the row while the caller reads it.
+    pub fn logits_row(&self) -> Result<&[f32], SessionError> {
+        if self.ahead.is_some() {
+            return Err(refuse(format!(
+                "the logits row at position {}: the token at it runs ahead; a host-fed step \
+                 drops it",
+                self.pos
+            )));
+        }
+        self.stream.sync()?;
+        // SAFETY: no token runs ahead (refused above) and the last step
+        // settled before it returned, so no device work writes these pages;
+        // the row borrows the session, whose steps and stores all go through
+        // `&mut self`, so none writes them for as long as the row lives.
+        Ok(unsafe { self.arena.logits.pages().as_slice() })
     }
 
     /// Every store back at rest: position 0, the caches, the recurrent
