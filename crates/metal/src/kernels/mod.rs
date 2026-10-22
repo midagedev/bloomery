@@ -11,11 +11,13 @@
 //! tensor ([`matvec`]), the segmented mat-vec of up to four tensors of one
 //! type and one width in one dispatch ([`seg`]), and the head-normed residual
 //! mat-vec of a gated delta net's out projection ([`headnorm`]).
+//! The router ([`router`]) is one more pipeline: `kernels/router.metal`, its ticket `kernels/ticket.metal`. // K2-REGISTER
 
 mod embed;
 mod geometry;
 mod headnorm;
 mod matvec;
+mod router; // K2-REGISTER
 mod seg;
 
 pub use embed::EmbedParams;
@@ -25,6 +27,20 @@ pub use geometry::{
 };
 pub use headnorm::HeadNormParams;
 pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
+#[rustfmt::skip] // K2-REGISTER
+pub use router::{ // K2-REGISTER
+    EXPERTS,      // K2-REGISTER
+    FLOAT4S,      // K2-REGISTER
+    GROUPS,       // K2-REGISTER
+    K,            // K2-REGISTER
+    PARTIALS,     // K2-REGISTER
+    ROWS,         // K2-REGISTER
+    RouterParams, // K2-REGISTER
+    SIMD_GROUPS,  // K2-REGISTER
+    SPLIT,        // K2-REGISTER
+    THREADS,      // K2-REGISTER
+    TOP_K_MAX,    // K2-REGISTER
+}; // K2-REGISTER
 pub use seg::{SegParams, Segment};
 
 use bloomery_device::DeviceError;
@@ -64,6 +80,7 @@ pub struct Kernels {
     q6k: MatvecPipelines,
     headnorm: Pipeline,
     embed: Pipeline,
+    router: Pipeline, // K2-REGISTER
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -128,6 +145,7 @@ impl Kernels {
             )?,
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             embed: library.pipeline("embed_q4k")?,
+            router: library.pipeline("router35")?, // K2-REGISTER
             simdgroups,
         })
     }

@@ -162,6 +162,68 @@ pub const MUTANTS: &[Mutant] = &[
         why: "the first row of a threadgroup ignores the SIMD group count",
         edits: &[("BLOOMERY_MATVEC_SIMD_GROUPS + sgitg", "2 + sgitg", 9)],
     },
+    Mutant {
+        // K2-REGISTER
+        name: "router_logit",                                    // K2-REGISTER
+        clause: "router_logit",                                  // K2-REGISTER
+        why: "one component of every float4 product is dropped", // K2-REGISTER
+        edits: &[("router_acc += w.x * h.x", "router_acc += 0.f", 1)], // K2-REGISTER
+    }, // K2-REGISTER
+    Mutant {
+        // K2-REGISTER
+        name: "router_ids",                           // K2-REGISTER
+        clause: "router_ids",                         // K2-REGISTER
+        why: "the selection keeps the smaller logit", // K2-REGISTER
+        edits: &[(
+            // K2-REGISTER
+            "router_better = v > best_v", // K2-REGISTER
+            "router_better = v < best_v", // K2-REGISTER
+            1,                            // K2-REGISTER
+        )], // K2-REGISTER
+    }, // K2-REGISTER
+    Mutant {
+        // K2-REGISTER
+        name: "router_weights",   // K2-REGISTER
+        clause: "router_weights", // K2-REGISTER
+        why: "a routed weight is the exponential, not its share of the eight", // K2-REGISTER
+        edits: &[(
+            // K2-REGISTER
+            "router_weight = term[s] / sum_exp", // K2-REGISTER
+            "router_weight = term[s]",           // K2-REGISTER
+            1,                                   // K2-REGISTER
+        )], // K2-REGISTER
+    }, // K2-REGISTER
+    Mutant {
+        // K2-REGISTER
+        name: "router_ticket",                              // K2-REGISTER
+        clause: "router_ticket",                            // K2-REGISTER
+        why: "a routed id is one past the selected expert", // K2-REGISTER
+        edits: &[(
+            // K2-REGISTER
+            "ids[s] = router_chosen[s]",      // K2-REGISTER
+            "ids[s] = router_chosen[s] + 1u", // K2-REGISTER
+            1,                                // K2-REGISTER
+        )], // K2-REGISTER
+    }, // K2-REGISTER
+    Mutant {
+        // K2-REGISTER
+        name: "router_nan",                       // K2-REGISTER
+        clause: "router_nan",                     // K2-REGISTER
+        why: "a non-finite logit raises nothing", // K2-REGISTER
+        edits: &[(
+            // K2-REGISTER
+            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_ROUTER);", // K2-REGISTER
+            "",                                                       // K2-REGISTER
+            1,                                                        // K2-REGISTER
+        )], // K2-REGISTER
+    }, // K2-REGISTER
+    Mutant {
+        // K2-REGISTER
+        name: "router_bounds",                        // K2-REGISTER
+        clause: "router_bounds",                      // K2-REGISTER
+        why: "every thread returns before it writes", // K2-REGISTER
+        edits: &[("router_bounds_gate == 0u", "router_bounds_gate == 1u", 1)], // K2-REGISTER
+    }, // K2-REGISTER
 ];
 
 /// The mutant of this name.

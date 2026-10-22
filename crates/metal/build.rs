@@ -157,6 +157,9 @@ fn main() {
         "matvec_q4k",
         "matvec_q6k",
         "embed",
+        // K2-REGISTER ticket's helpers are what the router calls, so ticket is first.
+        "ticket", // K2-REGISTER
+        "router", // K2-REGISTER
     ] {
         let path = kernels_dir.join(format!("{name}.metal"));
         let source =
