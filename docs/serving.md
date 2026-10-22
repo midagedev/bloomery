@@ -288,6 +288,11 @@ directory serves a whole-card `qwen35moe` target from one slot: RedHat's Qwen3.6
 reduced head and id map, and MiniCPM-V 4.7's full-vocabulary draft borrows the target's Q6_K `output.weight` in
 place and its `token_embd.weight` rows, so neither file is copied. A draft whose ids, mask or taps do not fit
 the target is refused by name before a weight is read; a placed load and `--parallel > 1` are refused by name.
+The draft fits a target by its facts, not by the file's name: a fine-tune that carries Qwen3.6's shapes (Sage-A1.5,
+Ornith-1.5) takes the same draft, and a reduced draft borrows nothing from the target, so a target whose own head
+is not a Q6_K projection serves it too. On the same seat, `BLOOMERY_DRAFT=lookup` serves the n-gram lookup draft
+on the same whole-card verifying load, one context a slot; a `qwen3moe` file has no multi-row pass and refuses it
+by name.
 Unset, the MTP draft yields to the context: it goes off when the plan with it would leave a slot fewer positions
 than the plan without it, a set `--ctx-size`/`--ctx` included, a `draft yield` record naming its
 card bytes and the positions a slot gets either way, and the context line that follows is the plain plan's.

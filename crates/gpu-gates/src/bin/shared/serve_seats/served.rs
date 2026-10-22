@@ -13,6 +13,10 @@
 //! (the DSpark draft serves one, [`draft_slots`]), so a body of one sequence
 //! serves it alone, without the lookup arm.
 //!
+//! The card draft's own adapter is one impl here too ([`Spark`] over
+//! [`CardDspark`], every seat's): a seat names its draft's layers, never a
+//! copy of these calls.
+//!
 //! The lookup arm holds the serve seats' one owner of the lookup draft,
 //! [`Lookups`]: a context and a width chooser a resident slot, the context
 //! one the V4.1 seat rebuilds from its body's token history when it falls
@@ -23,8 +27,10 @@
 
 use std::path::{Path, PathBuf};
 
+use app::dspark::CardDspark;
 use app::{Keep, Prompt, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuError;
+use bloomery_gpu::dspark::DraftLayers;
 use bloomery_gpu::model::{ChainBody, Rollback, Rows, Slots};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{SlotsFrom, nvidia_smi_index};
@@ -78,6 +84,54 @@ where
 
     /// The card the draft runs on.
     fn card(&self) -> &'static str;
+}
+
+/// The DSpark draft of any body that taps its rows: the card draft the session drives, as
+/// the owner calls it. One impl for every seat ([`CardDspark`] is the one owner of the card
+/// draft), so a new body takes the draft by naming its layers, never by copying this.
+///
+/// A draft with no window keeps every position, so [`Spark::window`] answers `usize::MAX`: a
+/// cut then leaves a prompt call that starts the draft over at 0 and feeds every id. The two
+/// families whose draft file always carries one (V4.1's `DraftHparams::read` and DFlash2's
+/// `Hparams::read` refuse a missing `attention.sliding_window` by name) read the same way
+/// here: the file's own reader has already refused the case that has no window.
+impl<B, L> Spark<B> for CardDspark<L>
+where
+    B: Prompt + Keep + Rows + Rollback + 'static,
+    Session<B>: runtime::TappedPrompt<Error = SessionError>,
+    L: DraftLayers + 'static,
+{
+    fn feed_call(&mut self, s: &mut Session<B>, ids: &[u32]) -> Result<u32, SessionError> {
+        CardDspark::<L>::feed_call(self, s, ids)
+    }
+
+    fn forget(&mut self) {
+        CardDspark::<L>::forget(self);
+    }
+
+    fn restart(&mut self) -> Result<(), GpuError> {
+        CardDspark::<L>::restart(self)
+    }
+
+    fn window(&self) -> usize {
+        CardDspark::<L>::window(self).unwrap_or(usize::MAX)
+    }
+
+    fn follows(&self, pos: u32) -> bool {
+        CardDspark::<L>::follows(self, pos)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        CardDspark::<L>::resident_bytes(self)
+    }
+
+    fn device(&self) -> Result<DeviceId, GpuError> {
+        CardDspark::<L>::device(self)
+    }
+
+    fn card(&self) -> &'static str {
+        CardDspark::<L>::card(self)
+    }
 }
 
 /// A draft's window behind the width chooser, as the owner drives it. One

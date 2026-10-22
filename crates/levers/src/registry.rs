@@ -443,7 +443,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         ),
         doc: "`generate_ds41` and `bloomery-serve-ds41`: `lookup` serves an n-gram lookup \
               draft, `dspark` the DSpark draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed \
-              two-row pass; the qwen3 seat of `bloomery-serve` and `generate_qwen3moe` on a \
+              two-row pass; the qwen3 seat of `bloomery-serve` on a \
+              qwen35moe or qwen35 file: `dspark` serves the HF DSpark draft \
+              (`$BLOOMERY_DSPARK_MODEL`) on a whole-card load of one slot, and `lookup` serves \
+              the n-gram lookup draft on the same whole-card verifying load, one context a \
+              slot, while `dspark` on a qwen3moe file and on a placed load, `lookup` on a \
+              qwen3moe file and on a placed load, and several slots under `dspark` are refused \
+              by name, and the seat (not the CLI) takes `off` as the plain path; \
+              `generate_qwen3moe` on a \
               qwen35moe file: `dspark` serves the HF DSpark draft (`$BLOOMERY_DSPARK_MODEL`) \
               on a whole-card load of one slot, while `lookup`, `dspark` on a qwen3moe file and \
               on a placed load, and several slots under it, are refused by name, and the seat \
@@ -572,7 +579,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means("`cost` on a run that drafts"),
         doc: "A run that drafts (the MTP draft of `generate_qwen3moe`, `generate_glm5next` and \
               their serve seats; the lookup and DSpark drafts of `generate_ds41` and \
-              `bloomery-serve-ds41`; the DFlash2 draft of `bloomery-serve`'s raon1 seat): how \
+              `bloomery-serve-ds41`; the lookup and DSpark drafts of `bloomery-serve`'s qwen3 \
+              seat; the DFlash2 draft of `bloomery-serve`'s raon1 seat): how \
               many of a proposal's ids a pass verifies. `cost` \
               (unset) puts the draft behind the width chooser (`runtime::width`): each window \
               verifies the width whose expected kept positions over its measured pass wall is \

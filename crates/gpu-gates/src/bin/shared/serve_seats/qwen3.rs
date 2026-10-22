@@ -161,10 +161,15 @@
 //! whole-card load serves the draft: a full-vocabulary HF draft (MiniCPM-V
 //! 4.7) borrows the target's Q6_K `output.weight` in place and its
 //! `token_embd.weight` rows, and a reduced one (RedHat's Qwen3.6 speculator)
-//! carries its own head and table. The draft's ids, mask and taps are held to
-//! the target before any weight is read, and its bytes against the card's
-//! free room after the target's load. On a qwen3moe file the word is refused
-//! by name before any plan, and so is `lookup` on either file.
+//! carries its own head and table and borrows nothing of the target's. The
+//! draft's ids, mask and taps are held to the target before any weight is
+//! read, and its bytes against the card's free room after the target's load.
+//! The draft fits a target by its facts, not by the file's name, so a
+//! fine-tune that carries the same shapes takes it too. On a qwen3moe file
+//! the word is refused by name before any plan.
+//! `lookup` is the n-gram draft a qwen35moe or qwen35 file serves on the same
+//! whole-card verifying load, one context a slot, and a qwen3moe file refuses
+//! it by name (its body runs no pass of several rows).
 //!
 //! The seat sits behind the `deepseek41` feature, the server surface's
 //! scope (`bind`, the `serve` and `sampler` crates); it runs no V4.1 code;
@@ -177,7 +182,6 @@ use std::time::Instant;
 
 #[path = "../qwen3moe_place.rs"]
 mod q3place;
-use app::SessionError;
 use app::arch::qwen3moe::GEMM_FROM;
 use app::dspark::CardDspark;
 use q3place::Seqs;
@@ -186,7 +190,6 @@ use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Qwen35moeModel};
 use bloomery_gpu::dspark::DsparkBody;
-use bloomery_gpu::dspark::dense::DenseLayers;
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::weights::{DevWeight, head_tensor};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
@@ -207,7 +210,6 @@ use gguf::quant::GgmlType;
 use model::arch::qwen35moe::hparams::Hparams;
 use model::placement::PlanLevers;
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS};
-use model::placement::workstation::DeviceId;
 use runtime::Target as _;
 use runtime::width::Mode as WidthMode;
 #[cfg(feature = "vision")]
@@ -215,7 +217,7 @@ use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{CacheNote, Drafted, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
-use super::served::{self, ServedDraft, Spark};
+use super::served::{self, ServedDraft};
 use crate::draft::Draft;
 use crate::dspark_hf;
 use crate::quiet::Quiet;
@@ -419,6 +421,17 @@ trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
         _dir: &Path,
         _ctx: usize,
         _card: &'static str,
+    ) -> Result<Option<ServedDraft<Self>>, GateError> {
+        Ok(None)
+    }
+    /// The lookup draft beside this body's model, one context a resident slot
+    /// of `s`, each behind the width chooser of `mode`, verified by the
+    /// session's pass of several rows. Refused by the default: only a body
+    /// whose session verifies rows (a qwen35moe body's) takes one.
+    fn open_lookup(
+        _s: &mut app::Session<Self>,
+        _slots: usize,
+        _mode: WidthMode,
     ) -> Result<Option<ServedDraft<Self>>, GateError> {
         Ok(None)
     }
@@ -653,7 +666,8 @@ impl Body3 for Body35 {
 
     /// The DSpark draft beside the whole-card verifying target: the target's Q6_K `output.weight`
     /// borrowed in place and its `token_embd.weight` rows (a full-vocabulary draft), or the draft's
-    /// own head and table (a reduced one). The draft's bytes are checked against the card's free room
+    /// own head and table (a reduced one, which borrows nothing and so asks the target for no head
+    /// at all). The draft's bytes are checked against the card's free room
     /// after the target's load, its own `Gpu` on the target's card and context.
     fn open_dspark(
         s: &mut app::Session<Body35>,
@@ -687,26 +701,41 @@ impl Body3 for Body35 {
         let n_layers = model.layers().len();
         let target_split =
             Arc::new(Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?);
-        let head_name = head_tensor(&target_split);
-        let Some(DevWeight::KQuant {
-            ty: GgmlType::Q6_K,
-            w,
-            k,
-        }) = model.weights().get(head_name)
-        else {
-            return Err(format!(
-                "BLOOMERY_DRAFT=dspark: the target's {head_name} is not a resident Q6_K \
-                 projection; the draft borrows that matrix in place"
-            )
-            .into());
-        };
-        let borrowed = dspark_hf::Borrowed {
-            split: target_split,
-            head: w,
+        // The target's hidden width, from its own description: the draft's tap rows are held to
+        // it, whatever the target's head is quantized as.
+        let hp = Hparams::read(&target_split)?;
+        let target = dspark_hf::Target {
             n_vocab,
             n_layers,
-            hidden: *k,
-            ctx: &target_ctx,
+            hidden: hp.n_embd,
+        };
+        // The draft's own shape first: a draft over the target's own ids borrows the target's
+        // head in place, a reduced one carries its own head and reads the target's not at all.
+        let borrows_head = matches!(
+            dspark_hf::shape_of(dir)?.vocab,
+            runtime::dspark::DraftVocab::Full { .. }
+        );
+        let borrowed = if borrows_head {
+            let head_name = head_tensor(&target_split);
+            let Some(DevWeight::KQuant {
+                ty: GgmlType::Q6_K,
+                w,
+                ..
+            }) = model.weights().get(head_name)
+            else {
+                return Err(format!(
+                    "BLOOMERY_DRAFT=dspark: the target's {head_name} is not a resident Q6_K \
+                     projection; the draft borrows that matrix in place"
+                )
+                .into());
+            };
+            Some(dspark_hf::Borrowed {
+                split: target_split,
+                head: w,
+                ctx: &target_ctx,
+            })
+        } else {
+            None
         };
         let dspark_hf::Parts {
             shape,
@@ -714,7 +743,7 @@ impl Body3 for Body35 {
             fc,
             head,
             embed,
-        } = dspark_hf::open_for_target(&draft_gpu, dir, ctx, borrowed)?;
+        } = dspark_hf::open_for_target(&draft_gpu, dir, ctx, &target, borrowed.as_ref())?;
         let body = DsparkBody::new(&draft_gpu, &shape, layers, fc, head, embed)?;
         let (free1, _) = draft_gpu.mem_info()?;
         let taken = free0.saturating_sub(free1);
@@ -750,6 +779,20 @@ impl Body3 for Body35 {
             &mut log,
             Some(dir.to_path_buf()),
         )?))
+    }
+
+    /// The lookup draft beside the whole-card verifying target: one n-gram
+    /// context a resident slot, each behind the width chooser of `mode`,
+    /// verified by the session's two-row pass. The body keeps no token
+    /// history, so a context that falls behind the target is not rebuilt from
+    /// one.
+    fn open_lookup(
+        s: &mut app::Session<Body35>,
+        slots: usize,
+        mode: WidthMode,
+    ) -> Result<Option<ServedDraft<Body35>>, GateError> {
+        let mut log = Quiet;
+        Ok(Some(ServedDraft::lookup(s, slots, mode, &mut log, None)?))
     }
 
     fn placed(m: &Qwen35moeModel) -> Result<bool, GateError> {
@@ -845,47 +888,6 @@ impl Body3 for Body35 {
     }
 }
 
-/// The DSpark draft of the qwen35moe body: the card draft the session drives, as the owner calls
-/// it. A draft with no window keeps every position, so [`Spark::window`] answers `usize::MAX`: a
-/// cut then leaves a prompt call that starts the draft over at 0 and feeds every id.
-impl Spark<Body35> for CardDspark<DenseLayers> {
-    fn feed_call(
-        &mut self,
-        s: &mut app::Session<Body35>,
-        ids: &[u32],
-    ) -> Result<u32, SessionError> {
-        CardDspark::<DenseLayers>::feed_call(self, s, ids)
-    }
-
-    fn forget(&mut self) {
-        CardDspark::<DenseLayers>::forget(self);
-    }
-
-    fn restart(&mut self) -> Result<(), bloomery_gpu::GpuError> {
-        CardDspark::<DenseLayers>::restart(self)
-    }
-
-    fn window(&self) -> usize {
-        CardDspark::<DenseLayers>::window(self).unwrap_or(usize::MAX)
-    }
-
-    fn follows(&self, pos: u32) -> bool {
-        CardDspark::<DenseLayers>::follows(self, pos)
-    }
-
-    fn resident_bytes(&self) -> usize {
-        CardDspark::<DenseLayers>::resident_bytes(self)
-    }
-
-    fn device(&self) -> Result<DeviceId, bloomery_gpu::GpuError> {
-        CardDspark::<DenseLayers>::device(self)
-    }
-
-    fn card(&self) -> &'static str {
-        CardDspark::<DenseLayers>::card(self)
-    }
-}
-
 /// The session on the engine thread, the positions its cache was sized
 /// for, and what the seat decided once at its open: whether it runs every
 /// round of several slots as one pass, and whether it counts those rounds.
@@ -929,7 +931,9 @@ impl<B: Body3> Q3<B> {
         load: Q3Load,
         levers: &Levers,
         (kv, vision): (KvQ8, Option<Opened>),
-        draft: Option<PathBuf>,
+        draft: Draft,
+        dspark: Option<PathBuf>,
+        width: WidthMode,
     ) -> Result<Q3<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -949,12 +953,12 @@ impl<B: Body3> Q3<B> {
             load,
             levers,
             (kv, vision.as_ref()),
-            draft.is_some(),
+            draft != Draft::Off,
         )?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         let placed = B::placed(&m)?;
-        let ran = pass_of::<B>(slots, placed);
+        let ran = pass_of::<B>(slots, placed, draft);
         if ran != pass {
             return Err(format!(
                 "the `parallel` line named pass={} and the load runs pass={}: the plan's host \
@@ -973,10 +977,21 @@ impl<B: Body3> Q3<B> {
             s.add_slots(slots)?;
         }
         let draft = match draft {
-            Some(dir) => B::open_dspark(&mut s, path, &dir, ctx, card)?.ok_or_else(|| {
-                format!("BLOOMERY_DRAFT=dspark: a {} body takes no draft", B::ARCH)
+            Draft::Off => ServedDraft::off(),
+            Draft::Dspark => {
+                let Some(dir) = dspark else {
+                    return Err("BLOOMERY_DRAFT=dspark: no DSpark draft directory".into());
+                };
+                B::open_dspark(&mut s, path, &dir, ctx, card)?.ok_or_else(|| {
+                    format!("BLOOMERY_DRAFT=dspark: a {} body takes no draft", B::ARCH)
+                })?
+            }
+            Draft::Lookup => B::open_lookup(&mut s, slots, width)?.ok_or_else(|| {
+                format!(
+                    "BLOOMERY_DRAFT=lookup: a {} body takes no lookup draft",
+                    B::ARCH
+                )
             })?,
-            None => ServedDraft::off(),
         };
         let total = t.elapsed();
         Record::new(&record::LOAD_QWEN3)
@@ -1140,6 +1155,13 @@ impl<B: Body3> Seat for Q3<B> {
         self.s.slots()
     }
 
+    /// Whether the seat keeps its draft's state per slot: the lookup draft's
+    /// context is a slot's own ([`ServedDraft::slot_drafts`]), the DSpark
+    /// draft's is one sequence's.
+    fn slot_drafts(&self) -> bool {
+        self.draft.slot_drafts()
+    }
+
     /// The session's slot (`app::Session::select_slot`): the model exchanges
     /// its live sequence with the slot's parked state — pointer moves. The
     /// target then stands on another sequence than the draft was fed.
@@ -1254,10 +1276,12 @@ impl Q3Load {
 /// The shape of a round of `slots` slots on body `B` whose load `placed` its
 /// experts on the host tier or not: one pass of the busy rows on a body that
 /// runs one ([`Body3::ONE_PASS`]) beside no host tier, else the fallback loop
-/// (a select and a step a slot). The one owner of the rule, which the
-/// `parallel` line names ahead of the load and the open holds the load to.
-fn pass_of<B: Body3>(slots: usize, placed: bool) -> Pass {
-    Pass::of(slots, B::ONE_PASS && !placed)
+/// (a select and a step a slot). The lookup draft's state is a slot's own, so
+/// a round of several slots takes turns under it. The one owner of the rule,
+/// which the `parallel` line names ahead of the load and the open holds the
+/// load to.
+fn pass_of<B: Body3>(slots: usize, placed: bool, draft: Draft) -> Pass {
+    Pass::of(slots, B::ONE_PASS && !placed && draft != Draft::Lookup)
 }
 
 /// What the `arch` file loads as at `total` positions for `parallel`
@@ -1511,12 +1535,12 @@ fn dspark_refusal((placement, why): (String, String)) -> GateError {
 /// The draft `BLOOMERY_DRAFT` names for the `arch` file at `path`: unset and
 /// `off` are the plain path ([`served::word`]), `dspark` is the draft a
 /// qwen35moe file serves, refused by name on the other families, and `lookup`
-/// is refused on all, each family by why its load verifies no rows
-/// ([`lookup_refusal`]).
+/// is the n-gram draft a qwen35moe or qwen35 file serves on a whole-card
+/// verifying load, refused by name on a qwen3moe file ([`lookup_refusal`]).
 fn draft_of(arch: Family, levers: &Levers, path: &Path) -> Result<Draft, GateError> {
     let draft = served::word(levers)?;
     match (draft, arch) {
-        (Draft::Lookup, _) => Err(lookup_refusal(arch).into()),
+        (Draft::Lookup, Family::Qwen3moe) => Err(lookup_refusal(arch).into()),
         (Draft::Dspark, Family::Qwen3moe | Family::Qwen35) => Err(format!(
             "BLOOMERY_DRAFT=dspark: the DSpark draft serves a qwen35moe file (Qwen3.6-35B-A3B \
              or MiniCPM-V 4.7-35B-A3B); {} is a {} file",
@@ -1528,24 +1552,34 @@ fn draft_of(arch: Family, levers: &Levers, path: &Path) -> Result<Draft, GateErr
     }
 }
 
-/// Why `BLOOMERY_DRAFT=lookup` is refused on an `arch` file: the lookup
-/// draft needs a load whose session verifies several rows. The qwen3moe body
-/// has no multi-row pass; a qwen35moe or qwen35 body verifies only on a
-/// whole-card load of one slot with a lane of delta state a row
-/// (`GpuModel::<Body35>::open_verifying`), which this seat does not open.
+/// Why `BLOOMERY_DRAFT=lookup` is refused on a qwen3moe file: the lookup
+/// draft needs a load whose session verifies several rows, and the qwen3moe
+/// body runs no pass of several rows.
+///
+/// PIN(2026-10-22): the qwen35moe and qwen35 arms of this refusal are gone —
+/// the seat now opens the whole-card verifying load (`GpuModel::<Body35>::open_verifying`)
+/// that the lookup draft needs, so a qwen35moe file serves the lookup and this
+/// sentence is the qwen3moe body's own reason alone. The gate that proves it
+/// (`gate_qwen3_dspark`) gained the clause that the lookup's ids are the plain
+/// run's and the clause that `/props` names the lookup as the served draft.
 fn lookup_refusal(arch: Family) -> String {
-    let why = match arch {
-        Family::Qwen3moe => "the qwen3moe body runs no pass of several rows",
-        _ => {
-            "its body verifies rows only on a load with a lane of delta state a row, which this \
-             seat does not open"
-        }
-    };
     format!(
         "BLOOMERY_DRAFT=lookup on a {} file: the lookup draft needs a load that verifies \
-         several rows, and {why}; serve the plain path",
+         several rows, and the qwen3moe body runs no pass of several rows; serve the plain path",
         arch.name()
     )
+}
+
+/// The refusal of `BLOOMERY_DRAFT=lookup` on a load that puts routed experts
+/// on the host tier: the lookup draft's verify pass needs the whole model on
+/// the card, as the DSpark draft's does.
+fn lookup_load_refusal((placement, why): (String, String)) -> GateError {
+    format!(
+        "BLOOMERY_DRAFT=lookup needs the whole-card load: {placement} resolved to a placed \
+         load, {why}; the lookup draft verifies its rows on a model held whole on the card - \
+         serve a load that holds the whole model there, or no draft"
+    )
+    .into()
 }
 
 /// Loads the model, and the embedding model `side` names beside it, and serves until the listener
@@ -1556,6 +1590,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let placed = args.iter().any(|a| a == "--place");
     let mut acts_on = vec![
         bloomery_levers::DRAFT,
+        bloomery_levers::MTP_WIDTH,
         bloomery_levers::QWEN3_KV,
         bloomery_levers::STEP_STATS,
         bloomery_levers::SCREEN,
@@ -1580,7 +1615,17 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     })?;
     // The draft word, before anything is planned or loaded.
     let draft = draft_of(arch, &levers, &path)?;
-    if draft == Draft::Dspark {
+    // The width a drafted window verifies: the chooser's (`cost`, unset) or the
+    // draft's own (`fixed`).
+    let width = WidthMode::of(levers.mtp_width())?;
+    if draft == Draft::Off && levers.mtp_width().is_some() {
+        return Err(
+            "BLOOMERY_MTP_WIDTH picks the width a drafted window verifies; \
+             BLOOMERY_DRAFT=off serves no draft"
+                .into(),
+        );
+    }
+    if draft != Draft::Off {
         // The width chooser's record is printed on every drafted request.
         super::drafted::serves_widths();
     }
@@ -1619,7 +1664,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // (`bind::slots_of`).
     let (slots, from) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
     // The DSpark draft's window is one sequence's: several slots are refused by name.
-    let (slots, from) = served::draft_slots(a.parallel, draft, false)?.unwrap_or((slots, from));
+    let (slots, from) = served::draft_slots(a.parallel, draft, true)?.unwrap_or((slots, from));
     // A set `--ctx` is the total the slots split: a share under the rows a
     // slot loads at is refused before any plan.
     if let Some(total) = a.ctx {
@@ -1673,8 +1718,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // The shape of a round of several slots, from the load's body
     // ([`Q3Load::placed_body`]); the open holds the opened body to it.
     let placed = load.placed_body();
-    if draft == Draft::Dspark && placed {
-        return Err(dspark_refusal(match a.place {
+    if draft != Draft::Off && placed {
+        let why = match a.place {
             Some(p) => (
                 format!("--place {}", p.name()),
                 "its plan puts routed experts on the host tier".to_owned(),
@@ -1685,15 +1730,20 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                  experts on the host tier"
                     .to_owned(),
             ),
-        }));
+        };
+        return Err(match draft {
+            Draft::Dspark => dspark_refusal(why),
+            Draft::Lookup => lookup_load_refusal(why),
+            Draft::Off => unreachable!("the plain path is never placed away"),
+        });
     }
     let draft_dir = match draft {
         Draft::Dspark => Some(dspark_hf::dir_from_env()?),
         Draft::Off | Draft::Lookup => None,
     };
     let pass = match arch {
-        Family::Qwen3moe => pass_of::<Body>(slots, placed),
-        _ => pass_of::<Body35>(slots, placed),
+        Family::Qwen3moe => pass_of::<Body>(slots, placed, draft),
+        _ => pass_of::<Body35>(slots, placed, draft),
     };
     // The slots the seat serves, one line before the load (`from` names what
     // set the count).
@@ -1741,7 +1791,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                     load,
                     &levers,
                     (kv, vision),
+                    draft,
                     draft_dir,
+                    width,
                 )
             },
             slot_ctx,
@@ -1760,7 +1812,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                     load,
                     &levers,
                     (kv, vision),
+                    draft,
                     draft_dir,
+                    width,
                 )
             },
             slot_ctx,

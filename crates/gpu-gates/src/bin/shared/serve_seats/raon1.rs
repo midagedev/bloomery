@@ -56,10 +56,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use app::{Session, SessionError};
+use app::Session;
 use bloomery_gpu::arch::raon1::Body;
 use bloomery_gpu::model::{ChainBody, StepMode};
-use bloomery_gpu::{Gpu, GpuError, GpuModel};
+use bloomery_gpu::{Gpu, GpuModel};
 use bloomery_gpu_gates::bind::{
     ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, model_props, note_line,
     parallel_line, placement_of, slots_of,
@@ -81,7 +81,7 @@ use runtime::width::Mode as WidthMode;
 use serve::{CacheNote, Drafted, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
-use super::served::{ServedSpark, Spark};
+use super::served::ServedSpark;
 
 #[path = "../quiet.rs"]
 mod quiet;
@@ -353,45 +353,6 @@ struct Raon1 {
     drafts: Drafts,
     /// Whether the request in flight runs through the draft.
     drafting: bool,
-}
-
-/// The DSpark draft of the raon1 body: the card draft the session drives, as
-/// the owner calls it.
-impl Spark<Body> for RaonDraft {
-    fn feed_call(&mut self, s: &mut Session<Body>, ids: &[u32]) -> Result<u32, SessionError> {
-        RaonDraft::feed_call(self, s, ids)
-    }
-
-    fn forget(&mut self) {
-        RaonDraft::forget(self);
-    }
-
-    fn restart(&mut self) -> Result<(), GpuError> {
-        RaonDraft::restart(self)
-    }
-
-    fn window(&self) -> usize {
-        // `dflash2::Hparams::read` refuses a file without a positive
-        // `attention.sliding_window` by name, and `dflash2::shape` stores it as
-        // `Some`: the expect is that invariant, not a second check.
-        RaonDraft::window(self).expect("a DFlash2 draft has a window")
-    }
-
-    fn follows(&self, pos: u32) -> bool {
-        RaonDraft::follows(self, pos)
-    }
-
-    fn resident_bytes(&self) -> usize {
-        RaonDraft::resident_bytes(self)
-    }
-
-    fn device(&self) -> Result<DeviceId, GpuError> {
-        RaonDraft::device(self)
-    }
-
-    fn card(&self) -> &'static str {
-        RaonDraft::card(self)
-    }
 }
 
 impl Raon1 {

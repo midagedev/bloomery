@@ -211,9 +211,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use app::arch::deepseek41::{Ds41Cfg, Ds41Draft};
+use app::arch::deepseek41::Ds41Cfg;
 use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
-use bloomery_gpu::GpuError;
 use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{Slots, StepMode};
@@ -237,7 +236,7 @@ use model::arch::deepseek41::hparams::Model as Hp41Model;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::dspark::DraftHparams;
 use model::placement::ctx_ask::DEFAULT_SLOTS;
-use model::placement::workstation::{DeviceId, HostNeed, TierBatchBytes};
+use model::placement::workstation::{HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
 use runtime::width::Mode as WidthMode;
@@ -259,7 +258,7 @@ use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
 use vision_seat::{Opened, PleImage, TextFacts};
 
-use super::served::{self, ServedDraft, Spark};
+use super::served::{self, ServedDraft};
 use crate::draft::{Draft, open_dspark};
 use crate::{dspark, place};
 
@@ -998,47 +997,6 @@ struct SeatArgs {
 /// draft's context is rebuilt from when it falls behind the target.
 fn history(s: &Session<Body>) -> Option<&[u32]> {
     s.model().body(WHAT).ok().map(Body::history)
-}
-
-/// The DSpark draft of the V4.1 body: the card draft the session drives, as
-/// the owner calls it.
-impl Spark<Body> for Ds41Draft {
-    fn feed_call(&mut self, s: &mut Session<Body>, ids: &[u32]) -> Result<u32, SessionError> {
-        Ds41Draft::feed_call(self, s, ids)
-    }
-
-    fn forget(&mut self) {
-        Ds41Draft::forget(self);
-    }
-
-    fn restart(&mut self) -> Result<(), GpuError> {
-        Ds41Draft::restart(self)
-    }
-
-    fn window(&self) -> usize {
-        // V4.1's draft file always carries a window. `DraftHparams::read`
-        // refuses a missing `attention.sliding_window` by name, and
-        // `dspark::shape` stores that count as `Some`. A window of 0 fails
-        // `DsparkShape::check` (`Window`) when the body opens, before this
-        // seat runs. The expect is that invariant, not a second check.
-        Ds41Draft::window(self).expect("V4.1's DSpark draft has a window")
-    }
-
-    fn follows(&self, pos: u32) -> bool {
-        Ds41Draft::follows(self, pos)
-    }
-
-    fn resident_bytes(&self) -> usize {
-        Ds41Draft::resident_bytes(self)
-    }
-
-    fn device(&self) -> Result<DeviceId, GpuError> {
-        Ds41Draft::device(self)
-    }
-
-    fn card(&self) -> &'static str {
-        Ds41Draft::card(self)
-    }
 }
 
 /// The V4.1 session on the engine thread, and its draft.

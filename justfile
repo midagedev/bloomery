@@ -1307,12 +1307,15 @@ gate-gpu-qwen35moe-verify:
 gate-gpu-qwen35moe-mtp:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-mtp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_mtp'
 
-# The qwen3 serve seat under BLOOMERY_DRAFT=dspark: Qwen3.6 with RedHat's reduced-vocabulary speculator and
-# MiniCPM-V 4.7 with its full-vocabulary draft (borrowed Q6_K head and embedding rows), each target greedy
-# with and without the draft on the same prompt, the chat surface under the draft, and the cross-target,
-# placed and --parallel 2 refusals. Real files only (the drafts and both targets).
+# The qwen3 serve seat's served drafts: BLOOMERY_DRAFT=dspark on Qwen3.6, on its two fine-tunes (Sage-A1.5 and
+# Ornith-1.5, which the RedHat draft fits by their shapes, not by their names) and on MiniCPM-V 4.7 (its
+# full-vocabulary draft, borrowing the target's Q6_K head and embedding rows), each target greedy with and
+# without the draft on the same prompt, the chat surface under the draft, BLOOMERY_DRAFT=lookup on Qwen3.6,
+# and the cross-target, placed, --parallel 2 and qwen3moe refusals. Real files only (the drafts and every
+# target). The card is the A6000: the DSpark draft's load holds the whole target on it, and Qwen3.6's
+# 29 GB does not fit the 24 GB card (the seat then refuses the draft by name).
 gate-gpu-qwen3-dspark:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-dspark && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,vision,gemma-embedding2,hf --release --bin bloomery-serve --bin gate_qwen3_dspark && D=target/qwen3-dspark-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && MINI=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/minicpmv47.sh) && test -n "$MINI" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_dspark --qwen "$Q36" --qwen-draft /models/Qwen3.6-35B-A3B/dspark-redhat --minicpm "$MINI" --minicpm-draft /models/MiniCPM-V-4.7-35B-A3B/dspark --dir $D'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-dspark && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_dspark && D=target/qwen3-dspark-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && MINI=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/minicpmv47.sh) && test -n "$MINI" && Q30=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen3moe.sh) && test -n "$Q30" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-a6000} bash tools/gpu-gate.sh gate_qwen3_dspark --qwen "$Q36" --qwen-draft /models/Qwen3.6-35B-A3B/dspark-redhat --sage /models/Sage-A1.5/Sage-A1.5-Q4_K_M.gguf --ornith /models/Ornith-1.5-35B-A3B/Ornith-1.5-35B-Q4_K_M.gguf --minicpm "$MINI" --minicpm-draft /models/MiniCPM-V-4.7-35B-A3B/dspark --qwen3moe "$Q30" --dir $D'
 
 # Qwen3.6-35B-A3B's DSpark draft, RedHatAI's speculator (an HF directory on the box, `--draft DIR` names another): the dense layers on the card against a host f64 computation of the same layers from the file's bf16
 # weights (a block of 8 rows over 3 and over 2,100 context rows, the window 2,048), the captured pass replaying to the

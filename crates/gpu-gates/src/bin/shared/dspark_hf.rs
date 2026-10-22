@@ -43,19 +43,27 @@ pub struct Parts {
     pub embed: EmbedSource,
 }
 
-/// The target a full-vocabulary draft borrows its head and embedding rows from: a draft over the
-/// target's own ids carries neither an `lm_head` nor an `embed_tokens` of its own.
-pub struct Borrowed<'a> {
-    /// The target's file, for its `token_embd.weight` rows.
-    pub split: Arc<Split>,
-    /// The target's resident Q6_K `output.weight`.
-    pub head: &'a DeviceTensor<u32>,
+/// The target a draft is opened beside: the facts the draft's own shape is held to — its ids,
+/// its layers and its hidden width. A draft over the target's own ids borrows the target's
+/// head and embedding rows beside these facts ([`Borrowed`]); a reduced one borrows nothing.
+#[derive(Clone, Copy)]
+pub struct Target {
     /// The target's vocabulary: the draft's ids.
     pub n_vocab: usize,
     /// The target's layers: every tap is below this.
     pub n_layers: usize,
     /// The target's hidden width: one tap row's width and the head's rows'.
     pub hidden: usize,
+}
+
+/// What a full-vocabulary draft borrows of its target: the head in place and the embedding
+/// table's rows. A draft over the target's own ids carries neither an `lm_head` nor an
+/// `embed_tokens` of its own; a reduced one carries both and borrows nothing.
+pub struct Borrowed<'a> {
+    /// The target's file, for its `token_embd.weight` rows.
+    pub split: Arc<Split>,
+    /// The target's resident Q6_K `output.weight`.
+    pub head: &'a DeviceTensor<u32>,
     /// The CUDA context the target's buffers live in: the draft's `Gpu` must be on it.
     pub ctx: &'a Arc<CudaContext>,
 }
@@ -214,6 +222,18 @@ pub fn open(gpu: &Gpu, dir: &Path, ctx: usize) -> Result<Parts, GateError> {
     open_with(gpu, dir, ctx, None)
 }
 
+/// The shape the draft in `dir` states, read from its config and its file's header alone: the
+/// seat asks it before it opens the target, to know whether the draft borrows the target's head
+/// ([`shape`]'s [`DraftVocab`]).
+#[allow(
+    dead_code,
+    reason = "the reader is shared by the draft gate and the serve seat; each opens the part it reads"
+)]
+pub fn shape_of(dir: &Path) -> Result<DsparkShape, GateError> {
+    let file = HfFile::open(dir)?;
+    shape(dir, &file)
+}
+
 /// Open the draft in `dir` beside `target`, for contexts of up to `ctx` positions: a full-vocabulary
 /// draft borrows the target's Q6_K head in place and its `token_embd.weight` rows, a reduced one
 /// loads its own `lm_head` and embedding. The draft's ids, mask and taps are held to the target
@@ -226,20 +246,21 @@ pub fn open_for_target(
     gpu: &Gpu,
     dir: &Path,
     ctx: usize,
-    target: Borrowed<'_>,
+    target: &Target,
+    borrowed: Option<&Borrowed<'_>>,
 ) -> Result<Parts, GateError> {
-    open_with(gpu, dir, ctx, Some(&target))
+    open_with(gpu, dir, ctx, Some((target, borrowed)))
 }
 
 fn open_with(
     gpu: &Gpu,
     dir: &Path,
     ctx: usize,
-    target: Option<&Borrowed<'_>>,
+    target: Option<(&Target, Option<&Borrowed<'_>>)>,
 ) -> Result<Parts, GateError> {
     let file = HfFile::open(dir)?;
     let shape = shape(dir, &file)?;
-    if let Some(t) = target {
+    if let Some((t, _)) = target {
         fits(&shape, t.n_vocab, t.n_layers, t.hidden)?;
     }
     let (spec, dims) = dense_spec(dir, &file, ctx)?;
@@ -250,7 +271,7 @@ fn open_with(
 
     let (layers, source, embed) = match shape.vocab {
         DraftVocab::Full { .. } => {
-            let Some(t) = target else {
+            let Some((_, Some(t))) = target else {
                 return Err(format!(
                     "{WHAT}: a draft over the target's own {n_target} ids borrows the target's \
                      head, which the seat holds; this loader opens drafts with their own lm_head"
