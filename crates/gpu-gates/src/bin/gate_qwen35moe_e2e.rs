@@ -3503,67 +3503,6 @@ mod gate {
     /// within the placed load's ubatch.
     const _: () = assert!(PLACED_UBATCH >= WIDE_FROM);
 
-    /// The smallest card budget, in bytes, under which `q`'s plan keeps at
-    /// least `want` routed experts on the card. The expert rule fills the
-    /// layers in ascending order, one expert at a time, so a plan of fewer
-    /// experts than the file has layers leaves the later layers none: the mix
-    /// of layers (o8) needs, which [`placed_budget`]'s even spread does not
-    /// give. Card experts only grow with the budget and the planner is host
-    /// arithmetic, so the search is a bisection from a budget the planner
-    /// refuses as below the card's floor up to [`placed_budget`], which must
-    /// itself plan `want` experts; a refusal other than the floor's ends the
-    /// search by name.
-    fn budget_for_card_experts(q: &PlaceQ3, want: u64) -> Result<u64, GateError> {
-        // The card experts a budget plans; `None` for the budget-floor refusal
-        // (`PlacementError::CardBudgetFloor`: "budget {b} B is below its floor").
-        let card_experts = |budget: u64| -> Result<Option<u64>, GateError> {
-            let levers = PlanLevers {
-                card_budget_bytes: Some(budget),
-            };
-            match q.plan(CTX, &levers) {
-                Ok(plan) => Ok(Some(plan.cards.first().ok_or("a plan of no card")?.experts)),
-                Err(e)
-                    if e.to_string()
-                        .contains(&format!("budget {budget} B is below its floor ")) =>
-                {
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            }
-        };
-        let (mut lo, mut hi) = (0u64, placed_budget());
-        if card_experts(lo)?.is_some() {
-            return Err(
-                format!("a card budget of {lo} B plans: the card's floor is not read").into(),
-            );
-        }
-        match card_experts(hi)? {
-            Some(top) if top >= want => {}
-            Some(top) => {
-                return Err(format!(
-                    "the search's upper bound, a card budget of {hi} B, plans {top} card \
-                     experts, under the {want} the clause needs"
-                )
-                .into());
-            }
-            None => {
-                return Err(format!(
-                    "the search's upper bound, a card budget of {hi} B, is below the card's floor"
-                )
-                .into());
-            }
-        }
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if card_experts(mid)?.is_some_and(|n| n >= want) {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        Ok(hi)
-    }
-
     /// `got`'s calls (each a greedy id and a logits row) against the
     /// whole-card load's `want` by (e)'s rule ([`e_band`]), a call at a time:
     /// the calls are fed the same ids, so each id stands alone and a part at
@@ -3629,7 +3568,7 @@ mod gate {
 
     /// (o8) (module doc): the whole-card load's references first, its model
     /// dropped before the placed one opens (two whole-sized models never share
-    /// a card), then the placed load by the plan [`budget_for_card_experts`]
+    /// a card), then the placed load by the plan [`PlaceQ3::budget_for_card_experts`]
     /// finds.
     fn placed_unjoined(toks: &[u32], host: HostCfg) -> Result<bool, GateError> {
         let Some((ud, proof)) =
@@ -3684,7 +3623,7 @@ mod gate {
         };
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let (want, top) = (u64::try_from(want_layers / 2)?, placed_budget());
-        let budget = budget_for_card_experts(&q, want)?;
+        let budget = q.budget_for_card_experts(CTX, want, placed_budget())?;
         let levers = PlanLevers {
             card_budget_bytes: Some(budget),
         };
@@ -3992,7 +3931,7 @@ mod gate {
         let toks = TEXT_TOKENS;
         let want = common_chain(
             "host-only plan",
-            |q| budget_for_card_experts(q, 0),
+            |q| q.budget_for_card_experts(CTX, 0, placed_budget()),
             &toks,
             host,
         )?;
