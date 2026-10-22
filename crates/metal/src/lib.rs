@@ -46,4 +46,4 @@ pub use device::MetalDevice;
 #[cfg(target_os = "macos")]
 pub use library::{Library, LibraryPath, Pipeline};
 #[cfg(target_os = "macos")]
-pub use stream::{HostEvent, MetalEvent, MetalStream, Recording};
+pub use stream::{GpuInterval, GpuStamps, HostEvent, MetalEvent, MetalStream, Recording};
