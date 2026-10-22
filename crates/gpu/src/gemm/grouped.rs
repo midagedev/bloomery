@@ -13,22 +13,26 @@
 //! the integer `2s + 1` of its aux word, `d·(2s + 1)/8·q`; IQ3_XXS the
 //! signed `iq3xxs_grid` values its index bytes name (magnitudes up to 62),
 //! each 32-value sub-block scaled by
-//! the integer `2s + 1` of its aux word, `d·(2s + 1)/4·q`; IQ4_XS the
+//! the integer `2s + 1` of its aux word, `d·(2s + 1)/4·q`; IQ3_S the signed
+//! `iq3s_grid` values its 9-bit indices name (an index byte plus a bit of the
+//! sub-block's `qh` byte; magnitudes up to 15), each negated by its raw sign
+//! bit and each 32-value sub-block scaled by the integer `2s + 1` of its
+//! 4-bit scale, `d·(2s + 1)·q`; IQ4_XS the
 //! `kvalues_iq4nl` entry of each code nibble (|kv| ≤ 127) with a signed
 //! 6-bit scale `ls − 32` per sub-block, `d·(ls − 32)·q`. The activations are
 //! the quantizer's blocks: int8 codes `a`, one scale `d8` per 128 values,
 //! and the code sums `s8` per 32. Inside one 128-value block every product
 //! is an integer. The tensor cores multiply codes (`m16n8k32` per 32-value
-//! sub-block for Q4_K, Q5_K, IQ2_XXS, IQ3_XXS and IQ4_XS; two `m16n8k16` per
+//! sub-block for Q4_K, Q5_K, IQ2_XXS, IQ3_XXS, IQ3_S and IQ4_XS; two `m16n8k16` per
 //! 32 values, one per 16-value scale, for Q6_K and Q3_K), each i32 result is
 //! multiplied by its sub-block scale into `isum = Σ sc·(q·a)`, and for Q4_K
 //! and Q5_K the min term is `imin = Σ m·s8`; every one of these is exact in
 //! i32 — `|isum|` over a block's four sub-blocks is at most
-//! `4·31·32·43·127 < 2^31` for IQ2_XXS, `4·31·32·62·127 < 2^31` for IQ3_XXS
-//! and `4·32·32·127·127 < 2^31` for
+//! `4·31·32·43·127 < 2^31` for IQ2_XXS, `4·31·32·62·127 < 2^31` for IQ3_XXS,
+//! `4·31·32·15·127 < 2^31` for IQ3_S and `4·32·32·127·127 < 2^31` for
 //! IQ4_XS. The block then enters the f32 accumulator in this order, which is
 //! the gate: `acc = fma(d8, fma(−dmin, f32(imin), d·f32(isum)), acc)` for
-//! Q4_K and Q5_K, `acc = fma(d8, d·f32(isum), acc)` for Q6_K, Q3_K and
+//! Q4_K and Q5_K, `acc = fma(d8, d·f32(isum), acc)` for Q6_K, Q3_K, IQ3_S and
 //! IQ4_XS, `acc = fma(d8, (d/4)·f32(isum), acc)` for IQ3_XXS (`d/4` exact in
 //! f32), `acc = fma(d8, (d/8)·f32(isum), acc)` for IQ2_XXS (`d/8` exact in
 //! f32), blocks in increasing k.
@@ -41,12 +45,13 @@
 //! slab's weight words with them, in the same copy group — per row the
 //! super-block's header at its first half and the half's sixteen qs words —
 //! and each warp reads its own rows' words from there, the header once per
-//! super-block; a Q5_K, Q6_K, Q3_K, IQ2_XXS, IQ3_XXS or IQ4_XS warp reads its own
-//! rows' weight bytes from global memory straight into its `mma` fragments at
-//! the head of each step — the IQ2_XXS and IQ3_XXS decodes read their grid
-//! entries from `iq.rs`'s `GRID2XXS` and `GRID3` device globals (one L1 load
-//! a fragment word) and sign
-//! them with `iq.rs`'s computed `ksigns` rule, IQ4_XS decodes its code words
+//! super-block; a Q5_K, Q6_K, Q3_K, IQ2_XXS, IQ3_XXS, IQ3_S or IQ4_XS warp reads
+//! its own rows' weight bytes from global memory straight into its `mma`
+//! fragments at the head of each step — the IQ2_XXS and IQ3_XXS decodes read
+//! their grid entries from `iq.rs`'s `GRID2XXS` and `GRID3` device globals (one
+//! L1 load a fragment word) and sign
+//! them with `iq.rs`'s computed `ksigns` rule, IQ3_S reads `GRID3S` the same way
+//! and signs from its file's raw sign bytes, IQ4_XS decodes its code words
 //! through `iq.rs`'s register table. The fragment k-mapping is the
 //! instruction's own (lane
 //! `4g + t` holds values `4t..4t+3` and `16+4t..16+4t+3` of each 32), and in
@@ -55,7 +60,7 @@
 
 use super::route::gemm_max_tiles;
 use super::{GEMM_BN, GemmAct, GemmKernels, GemmRoute};
-use crate::iq::{GRID3, iq2xxs_grid_half, sign_mask4, signed4, signs_of};
+use crate::iq::{GRID3, GRID3S, iq2xxs_grid_half, sign_mask4, signed4, signs_of};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -106,13 +111,14 @@ const _: () = assert!(WT_ROW_W % 8 == 4 && WT_ROW_W == 4 + 16 && GEMM_THREADS ==
 
 // Bytes of one 256-value super-block of each type, as the file stores it
 // (ggml's `block_q3_K` .. `block_q6_K`, `block_iq2_xxs`, `block_iq3_xxs`,
-// `block_iq4_xs`).
+// `block_iq3_s`, `block_iq4_xs`).
 pub(super) const Q3K_SB_BYTES: usize = 110;
 const Q4K_SB_BYTES: usize = 144;
 const Q5K_SB_BYTES: usize = 176;
 pub(super) const Q6K_SB_BYTES: usize = 210;
 pub(super) const IQ2XXS_SB_BYTES: usize = 66;
 pub(super) const IQ3XXS_SB_BYTES: usize = 98;
+pub(super) const IQ3S_SB_BYTES: usize = 110;
 // An IQ3_XXS super-block in bytes (the Q6_K/Q3_K unit) and an IQ4_XS one in
 // words (the Q4_K/Q5_K unit): 136 is a whole number of words, so an IQ4_XS
 // row of whole super-blocks never straddles a word.
@@ -132,6 +138,7 @@ const _: () = assert!(
         && Q3K_SB_BYTES == 110
         && IQ2XXS_SB_BYTES == 66
         && IQ3XXS_SB_BYTES == 98
+        && IQ3S_SB_BYTES == 110
 );
 
 // Byte offsets inside a Q6_K super-block (ggml's `block_q6_K`): the low
@@ -162,6 +169,21 @@ const _: () = assert!(
         && Q3K_D + 2 == Q3K_SB_BYTES
 );
 
+// Byte offsets inside an IQ3_S super-block (ggml's `block_iq3_s`): the f16 `d`,
+// the 64 index bytes `qs` (eight a 32-value sub-block), the eight high-bit
+// bytes `qh` (one a sub-block), the 32 sign bytes (four a sub-block) and the
+// four scale bytes (a nibble a sub-block).
+pub(super) const IQ3S_QS: usize = 2;
+pub(super) const IQ3S_QH: usize = 66;
+pub(super) const IQ3S_SIGNS: usize = 74;
+pub(super) const IQ3S_SCALES: usize = 106;
+const _: () = assert!(
+    IQ3S_QH == IQ3S_QS + 64
+        && IQ3S_SIGNS == IQ3S_QH + 8
+        && IQ3S_SCALES == IQ3S_SIGNS + 32
+        && IQ3S_SCALES + 4 == IQ3S_SB_BYTES
+);
+
 /// The K-quant and i-quant weight types the GEMM decodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GemmWeight {
@@ -171,6 +193,7 @@ pub enum GemmWeight {
     Q6K,
     Iq2Xxs,
     Iq3Xxs,
+    Iq3S,
     Iq4Xs,
 }
 
@@ -202,6 +225,7 @@ impl GemmWeight {
             GemmEntry::Q6k => Some(GemmWeight::Q6K),
             GemmEntry::Iq2xxs => Some(GemmWeight::Iq2Xxs),
             GemmEntry::Iq3xxs => Some(GemmWeight::Iq3Xxs),
+            GemmEntry::Iq3s => Some(GemmWeight::Iq3S),
             GemmEntry::Iq4xs => Some(GemmWeight::Iq4Xs),
             GemmEntry::Q8_0
             | GemmEntry::Q5_0
@@ -221,6 +245,7 @@ impl GemmWeight {
             GemmWeight::Q6K => Q6K_SB_BYTES,
             GemmWeight::Iq2Xxs => IQ2XXS_SB_BYTES,
             GemmWeight::Iq3Xxs => IQ3XXS_SB_BYTES,
+            GemmWeight::Iq3S => IQ3S_SB_BYTES,
             GemmWeight::Iq4Xs => 4 * IQ4XS_SB_WORDS,
         }
     }
@@ -736,6 +761,80 @@ macro_rules! iq3xxs_dec {
     }};
 }
 
+/// The IQ3_S decode of one row's half `hh` of a super-block at byte `x`: per
+/// sub-block `s = 4·hh .. 4·hh + 3` the lane's two signed-grid fragment words
+/// and integer scale ([`iq3s_lane`]; the sub-block's index bytes at
+/// `2 + 32·hh + 8s`, its sign bytes at `74 + 16·hh + 4s`, its `qh` byte from
+/// the half's four-byte window at `66 + 4·hh` and its scale nibble from the
+/// half's two scale bytes at `106 + 2·hh`), then the word holding `d`. `@frag`
+/// only selects per pair, as IQ3_XXS's; `@rows` is `d` itself, the grid being
+/// unscaled.
+macro_rules! iq3s_dec {
+    (@load $w:ident, $x:expr, $hh:expr, $t:expr) => {{
+        let x: usize = $x;
+        let t: u32 = $t as u32;
+        let iq = x + IQ3S_QS + 32 * $hh;
+        let ig = x + IQ3S_SIGNS + 16 * $hh;
+        let sa = x + IQ3S_SCALES + 2 * $hh;
+        let sh = 8 * t;
+        // SAFETY: every window starts at an even byte of the super-block, at
+        // or below `x + 74 + 16·hh + 12`, and ends inside it; the scale
+        // halfword at `sa` (even) lies in one word, and the word holding `d`
+        // covers bytes `x, x + 1`; with the stack's byte stream padded to
+        // whole words these reads stay inside it (launch contract).
+        unsafe {
+            let qh = win($w, x + IQ3S_QH + 4 * $hh);
+            let sc = *$w.get_unchecked(sa / 4) >> (8 * (sa & 2) as u32);
+            let (a0, a1, s0) =
+                iq3s_lane(win($w, iq) >> sh, win($w, iq + 4) >> sh, qh, win($w, ig), sc, t);
+            let (b0, b1, s1) = iq3s_lane(
+                win($w, iq + 8) >> sh,
+                win($w, iq + 12) >> sh,
+                qh >> 8,
+                win($w, ig + 4),
+                sc >> 4,
+                t,
+            );
+            let (c0, c1, s2) = iq3s_lane(
+                win($w, iq + 16) >> sh,
+                win($w, iq + 20) >> sh,
+                qh >> 16,
+                win($w, ig + 8),
+                sc >> 8,
+                t,
+            );
+            let (d0, d1, s3) = iq3s_lane(
+                win($w, iq + 24) >> sh,
+                win($w, iq + 28) >> sh,
+                qh >> 24,
+                win($w, ig + 12),
+                sc >> 12,
+                t,
+            );
+            [
+                a0, a1, s0, b0, b1, s1, c0, c1, s2, d0, d1, s3,
+                *$w.get_unchecked(x / 4) >> (8 * (x & 2) as u32),
+            ]
+        }
+    }};
+    (@frag $r0:ident, $r1:ident, $pp:expr, $hh:expr) => {
+        iq3xxs_dec!(@frag $r0, $r1, $pp, $hh)
+    };
+    (@mma $a:expr, $b0:expr, $b1:expr, $sc:ident, $par:expr, $isum:ident, $first:expr) => {
+        q4k_dec!(@mma $a, $b0, $b1, $sc, $par, $isum, $first)
+    };
+    (@rows $r0:ident, $r1:ident, $hh:expr) => {
+        [
+            half_bits_to_f32(($r0[12] & 0xffff) as u16),
+            half_bits_to_f32(($r1[12] & 0xffff) as u16),
+        ]
+    };
+    (@epi $rw:ident, $s8st:ident, $n0:expr, $dcol:ident, $isum:ident, $acc:ident, $nt:expr) => {{
+        let _ = ($s8st, $n0);
+        k16_epi!($rw, $dcol, $isum, $acc, $nt)
+    }};
+}
+
 /// The IQ4_XS decode of one row's half `hh` of a super-block at word `wb`:
 /// the super-block's first two words (`d | scales_h << 16`, then `scales_l`),
 /// then code word `t` of each of the half's four sub-blocks (sub-block `c`'s
@@ -854,7 +953,7 @@ macro_rules! gemm_stage {
 }
 
 /// Weight words of the direct entries (Q5_K, Q6_K, Q3_K, IQ2_XXS, IQ3_XXS,
-/// IQ4_XS):
+/// IQ3_S, IQ4_XS):
 /// each warp reads its
 /// two rows' raw words from global memory at the head of every step, before
 /// the step's barrier. `@decl` is the rows' first units, `@head` the loads and
@@ -1005,7 +1104,7 @@ macro_rules! gemm_walk {
     }};
 }
 
-/// The step walk of Q5_K, Q3_K, IQ2_XXS, IQ3_XXS and IQ4_XS: one expansion of
+/// The step walk of Q5_K, Q3_K, IQ2_XXS, IQ3_XXS, IQ3_S and IQ4_XS: one expansion of
 /// [`gemm_step`], the half `hh` a runtime value and every n-tile tested
 /// against the tile's length. Only `gate_gemm` launches them, and the split
 /// walk doubles a loop's code.
@@ -1356,6 +1455,43 @@ pub(super) fn iq3xxs_lane(q_lo: u32, q_hi: u32, aux: u32, t: u32) -> (u32, u32, 
     }
 }
 
+/// One IQ3_S sub-block's lane-`t` decode: its two A-fragment words — the
+/// `GRID3S` entries its 9-bit indices `t` and `4 + t` name (index byte `t` of
+/// `q_lo` and of `q_hi`, each with bit `t` and `4 + t` of the sub-block's `qh`
+/// byte as bit 8), values `4t..4t+3` and `16+4t..16+4t+3`, negated where the
+/// sub-block's raw sign bytes `sg` say (sign byte `t/2` and `2 + t/2` at nibble
+/// `t&1`) — and the sub-block's integer scale `2·(sc & 15) + 1` as the third
+/// word. `q_lo`/`q_hi` hold the index byte in their byte 0, `qh` the sub-block's
+/// `qh` byte in its byte 0 and `sc` its scale nibble in its low four bits.
+/// `iq.rs`'s `iq3s_group` takes the eight values of two neighbouring indices;
+/// a fragment lane holds one index of each half, so it reads the grid table and
+/// the sign primitives directly.
+#[inline(always)]
+pub(super) fn iq3s_lane(
+    q_lo: u32,
+    q_hi: u32,
+    qh: u32,
+    sg: u32,
+    sc: u32,
+    t: u32,
+) -> (u32, u32, u32) {
+    let idx = |q: u32, bit: u32| (q & 255) | (((qh >> bit) & 1) << 8);
+    // SAFETY: both grid indices are below 512, GRID3S's length.
+    unsafe {
+        (
+            signed4(
+                *GRID3S.get_unchecked(idx(q_lo, t) as usize),
+                sign_mask4(sg >> (4 * t)),
+            ),
+            signed4(
+                *GRID3S.get_unchecked(idx(q_hi, 4 + t) as usize),
+                sign_mask4(sg >> (4 * t + 16)),
+            ),
+            ((sc & 15) << 1) | 1,
+        )
+    }
+}
+
 /// Sub-block `c`'s signed IQ4_XS scale `ls − 32`: the 6-bit `ls` is nibble
 /// `c & 1` of `scales_l[c/2]` with bits `2c .. 2c + 2` of `scales_h` (the
 /// high word of `m0`) as its high pair.
@@ -1572,6 +1708,7 @@ impl GemmKernels {
             GemmWeight::Q6K => launch!(prepare_gemm_q6k, gemm_q6k),
             GemmWeight::Iq2Xxs => launch!(prepare_gemm_iq2xxs, gemm_iq2xxs),
             GemmWeight::Iq3Xxs => launch!(prepare_gemm_iq3xxs, gemm_iq3xxs),
+            GemmWeight::Iq3S => launch!(prepare_gemm_iq3s, gemm_iq3s),
             GemmWeight::Iq4Xs => launch!(prepare_gemm_iq4xs, gemm_iq4xs),
         }
         Ok(())

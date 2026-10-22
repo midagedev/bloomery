@@ -66,6 +66,7 @@ pub const fn gemm_reads_blocks32(entry: GemmEntry) -> bool {
         | GemmEntry::Q6k
         | GemmEntry::Iq2xxs
         | GemmEntry::Iq3xxs
+        | GemmEntry::Iq3s
         | GemmEntry::Iq4xs => false,
     }
 }
@@ -510,8 +511,8 @@ mod tests {
     // PIN(2026-10-21): and IQ2_XXS (`gemm_iq2xxs`, which `GemmWeight` already
     // decoded and the latent MoE body launches); every other pair is unchanged.
     // PIN(2026-10-22): and Q5_0 (`gemm_q5_0p` over a stack's `pack_q5_0` words,
-    // which Raon-1's Q5_0 down stacks' prompt route reads); every other pair
-    // is unchanged.
+    // which Raon-1's Q5_0 down stacks' prompt route reads), and IQ3_S
+    // (`gemm_iq3s`, over the file's blocks); every other pair is unchanged.
     #[test]
     fn gemm_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -528,6 +529,7 @@ mod tests {
                 (GgmlType::IQ2_XXS, GemmEntry::Iq2xxs),
                 (GgmlType::IQ3_XXS, GemmEntry::Iq3xxs),
                 (GgmlType::IQ4_NL, GemmEntry::Iq4nl),
+                (GgmlType::IQ3_S, GemmEntry::Iq3s),
                 (GgmlType::IQ4_XS, GemmEntry::Iq4xs),
             ]
         );

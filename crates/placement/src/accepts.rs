@@ -554,8 +554,8 @@ mod tests {
     /// `Body35`'s placed card leg: a Q4_K or Q5_K gate and up with a Q4_K, Q5_K
     /// or Q6_K down are the dispatch's own launches ([`LegSplit::Dispatch`], the
     /// layers whose graph the load's reference holds); a Q4_K, Q5_K, Q6_K, IQ3_XXS,
-    /// IQ4_XS or Q8_0 gate and up of one type with a Q4_K, Q5_K, Q6_K,
-    /// IQ3_XXS, IQ4_XS, Q5_1, Q8_0 or IQ4_NL down are the rest of the common
+    /// IQ3_S, IQ4_XS or Q8_0 gate and up of one type with a Q4_K, Q5_K, Q6_K,
+    /// IQ3_XXS, IQ3_S, IQ4_XS, Q5_1, Q8_0 or IQ4_NL down are the rest of the common
     /// leg's ([`LegSplit::Common`]); every other triple, a gate and up of two
     /// types among them, is the host tier's. The sets are spelled out, so a
     /// type entering or leaving an arm goes red here. Mutant: the dispatch
@@ -563,9 +563,9 @@ mod tests {
     /// `Dispatch`.
     #[test]
     fn qwen35_leg_is_the_dispatch_for_its_types_and_the_common_leg_for_the_rest() {
-        use GgmlType::{IQ3_XXS, IQ4_NL, IQ4_XS, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0};
-        let gate_up = [Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_XS, Q8_0];
-        let down = [Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_XS, Q5_1, Q8_0, IQ4_NL];
+        use GgmlType::{IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0};
+        let gate_up = [Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ3_S, IQ4_XS, Q8_0];
+        let down = [Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ3_S, IQ4_XS, Q5_1, Q8_0, IQ4_NL];
         let dispatch_gate_up = [Q4_K, Q5_K];
         let dispatch_down = [Q4_K, Q5_K, Q6_K];
         for g in types() {

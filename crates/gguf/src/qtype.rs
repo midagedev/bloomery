@@ -112,7 +112,7 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::IQ4_NL, name: "iq4_nl", blck: 32, bytes: 18, dequant: true, host_act: H::Q8_2X4,
            card: card!(-             -             -       (Iq4nl, Q8Blocks32) Iq4nl  -       -    -) },
     QRow { ty: T::IQ3_S, name: "iq3_s", blck: 256, bytes: 110, dequant: true, host_act: H::Q8K,
-           card: card!(-             -             Iq3s    (Iq3s, Q8Act)       -      -       -    -) },
+           card: card!(-             -             Iq3s    (Iq3s, Q8Act)       Iq3s   -       -    -) },
     QRow { ty: T::IQ2_S, name: "iq2_s", blck: 256, bytes: 82, dequant: false, host_act: H::None, card: Card::NONE },
     QRow { ty: T::IQ4_XS, name: "iq4_xs", blck: 256, bytes: 136, dequant: true, host_act: H::Q8K,
            card: card!(-             -             Iq4xs   (Iq4xs, Q8Act)      Iq4xs  -       -    -) },

@@ -2506,6 +2506,7 @@ pub(crate) mod tests {
         let words = StackW::Words(&qs);
         // PIN(2026-10-21): IQ2_XXS's words join the grouped routes with the
         // table's GEMM row for the type (`gemm_iq2xxs`).
+        // PIN(2026-10-22): IQ3_S's words join them with its row (`gemm_iq3s`).
         for ty in [
             GgmlType::Q3_K,
             GgmlType::Q4_K,
@@ -2513,6 +2514,7 @@ pub(crate) mod tests {
             GgmlType::Q6_K,
             GgmlType::IQ2_XXS,
             GgmlType::IQ3_XXS,
+            GgmlType::IQ3_S,
             GgmlType::IQ4_XS,
         ] {
             let want = GemmWeight::from_ggml(ty).expect("a type the grouped GEMM decodes");

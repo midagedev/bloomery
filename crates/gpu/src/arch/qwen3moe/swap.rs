@@ -138,19 +138,22 @@ mod tests {
 
     /// Qwen3.6's leg: the dispatch's types (a Q4_K or Q5_K gate and up of one
     /// type with a Q4_K, Q5_K or Q6_K down) and the common leg's (a Q6_K, Q8_0,
-    /// IQ3_XXS or IQ4_XS gate and up of one type with a down any of the
+    /// IQ3_XXS, IQ3_S or IQ4_XS gate and up of one type with a down any of the
     /// common down arm's types) are card layers; a gate and up of two types,
     /// and a carded layer with a stack of a type no card launch runs (an
     /// IQ2_XS gate: no prompt GEMM, an MXFP4 down) are refused by name, the
     /// refusal listing both arms' types in file order. PIN(2026-10-22): the
     /// IQ4_XS and Q6_K gate and up and the Q5_1 down moved from refused to card
-    /// layers when `placement::accepts` gave the body the common leg's arms.
+    /// layers when `placement::accepts` gave the body the common leg's arms;
+    /// the IQ3_S gate and up and down joined both arms with its prompt GEMM.
     /// Mutant: the dispatch's arms (`accepts::qwen35_gate_up`/`qwen35_down`)
     /// for the common ones in `leg_arms` — the IQ4_XS, Q6_K, Q8_0 and IQ3_XXS
     /// layers are refused.
     #[test]
     fn qwen36s_leg_checks_a_card_layer_against_its_launches() {
-        use GgmlType::{IQ2_XS, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0};
+        use GgmlType::{
+            IQ2_XS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q4_K, Q5_1, Q5_K, Q6_K, Q8_0,
+        };
         for ok in [
             [Q4_K, Q4_K, Q4_K],
             [Q4_K, Q4_K, Q6_K],
@@ -160,6 +163,7 @@ mod tests {
             [IQ4_XS, IQ4_XS, Q4_K],
             [Q8_0, Q8_0, Q8_0],
             [IQ3_XXS, IQ3_XXS, IQ4_NL],
+            [IQ3_S, IQ3_S, IQ4_XS],
             [Q6_K, Q6_K, Q4_K],
             [Q6_K, Q6_K, Q8_0],
         ] {
@@ -176,8 +180,8 @@ mod tests {
             assert!(
                 text.contains("layer 0's gate")
                     && text.ends_with(
-                        "a gate and an up of one type, [Q8_0, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_XS], \
-                         and a down of [Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_NL, IQ4_XS]"
+                        "a gate and an up of one type, [Q8_0, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ3_S, IQ4_XS], \
+                         and a down of [Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ3_XXS, IQ4_NL, IQ3_S, IQ4_XS]"
                     ),
                 "{text}"
             );

@@ -1,0 +1,46 @@
+# Qwen3.6-35B-A3B UD-IQ4_XS's placed card leg runs its IQ3_S gate and up (branch iq3gemm): decode at the serving
+# defaults, --place unset, on one RTX 3090.
+# Derivation [derived]. The file (unsloth UD-IQ4_XS, its header's type profile in the levers census): 37 layers hold
+# IQ3_S gate and up with an IQ4_XS down, 3 hold IQ3_S gate and up with a Q6_K down; a stack is 2048 x 512 values, 256
+# experts. One expert of one layer is 1,048,576 x (3.4375 + 3.4375 + 4.25) / 8 = 1.458 MB (IQ3_S 110 B / 256 values,
+# IQ4_XS 136 B, Q6_K 210 B), so the 40 layers hold 59.24 MB an expert slot and 15.165 GB in all; a token reads 8 slots,
+# 473.9 MB. Today `gemm(IQ3_S)` is `-`, so `prompt_leg_gate_up` refuses the type and every layer stays on the host:
+# host leg 473.9 MB / 128.4 GB/s [measured, rig-log plan-triage] = 3.69 ms, plus the card trunk c = 6.3 ms
+# [measured: q75-decode's 68.73 and 81.59 tok/s rows give c = 6.19 and 5.76 ms before, 6.49 and 6.72 after]; t0 = 10.0 ms,
+# 100 tok/s.
+# After the change every layer is eligible, so the card holds what its room holds: the plan at ctx 262144 held 15.06 GB of
+# Q8_0 experts (4505 of 10240, q75-decode.card), so f = 15.06 / 15.165 = 0.99 here (0.97 if the common leg's arena for
+# these types takes 0.3 GB more, the UD-Q6_K plan's 1.5 % miss); at ctx 16384 f = 1. The plan's own count is read with
+# `bloomery-serve --model qwen3 -m <file> --plan` once the file is on the box.
+# With f near 1 there is no host leg to hide the card's shadow under: per token the card reads 0.99 x 473.9 MB at
+# ~0.78 TB/s [assumed, q75's 83 % of 936 GB/s] = 0.60 ms on top of c, and the leg's fixed cost the q75 rows left
+# (c after - c before = +0.30 and +0.96 ms) stays: t1 = 6.3 + 0.60 + 0.30..0.96 + (1 - f) x 3.69 = 7.2..8.0 ms.
+# Ratio t0 / t1 = 1.25..1.39; the census model without the fixed cost reads 1.448 (the upper edge). Realized against
+# ideal saving on the two q75 rows: 92 % (Q8_0) and 74 % (UD-Q6_K); here the ideal saving is 3.69 - 0.60 = 3.09 ms, 74-92 %
+# of it 2.3-2.8 ms, t1 = 7.2-7.7 ms, ratio 1.30-1.39; the band takes 1.25 for a shadow below 0.78 TB/s and 1.45 for the
+# model's own value. The prompt GEMM (`gemm_iq3s`) is not a decode term: decode runs the `_sel` entries `iq3_s_gate_up_sel`
+# and `iq4_xs_gemv_sel`, which exist today.
+# Timeline per token: host DRAM 3.69 ms -> 0.04 ms; card SMs trunk 6.3 ms + shadow 0.60 ms; PCIe 8 KB a layer each way
+# (~0.01 ms a layer), NVMe 0. The wall is the sum on the card side (trunk, then the shadow), the host leg a max term only
+# for the 1 % of experts the plan leaves.
+kind: ab
+question: does moving 99 % of the experts of Qwen3.6's UD-IQ4_XS file (IQ3_S gate and up, IQ4_XS or Q6_K down) onto the
+  card read the derived decode gain on one RTX 3090 at the serving defaults?
+term: tg tok/s @ D = 6 (prose corpus ids), Qwen3.6-35B-A3B UD-IQ4_XS, bloomery-serve at the serving defaults, ctx
+  262144, --place unset, RTX 3090
+unit: %
+predict: +25..+45
+rounds: 4
+sd: 0.6 % AGENTS.md Know the ruler, same-binary scatter; the ratio at 4 rounds reads +-1.0 %
+condition: one lease with the box quiet (no gate on either card); depth-serve.sh, one fresh server an arm and a
+  round, the base arm the merge commit 0f866fb34's bloomery-serve and the changed arm this branch's, D 6 at C 262144
+  with N 128; the file Qwen3.6-35B-A3B-UD-IQ4_XS.gguf (unsloth) on the box first (it is not in /models today) and the
+  plan's card-expert count read before the sitting (>= 9,900 of 10,240 expected); rows tagged [cpu-busy], [other-busy]
+  or [cold] are rerun
+decide-in: land the IQ3_S GEMM row with its pins; the README's Qwen3.6 rows and docs/models.md's quant-types line name
+  UD-IQ4_XS as a card file
+decide-below: under +25 %: the card's shadow is above 0.6 ms (the `_sel` decode of IQ3_S or IQ4_XS runs below 0.78
+  TB/s, or the leg's fixed cost is above 1 ms); read one nsys of a decode step on the file before landing, and
+  price iq3_s_gate_up_sel and iq4_xs_gemv_sel against HBM
+decide-above: beyond +45 %: the host's IQ3_S and IQ4_XS dots run below 128 GB/s on this file (the base t0 is above 10.0
+  ms): land, and record the base rate beside the ratio

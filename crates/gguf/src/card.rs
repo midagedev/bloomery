@@ -190,6 +190,8 @@ pub enum GemmEntry {
     Iq2xxs,
     /// `GemmWeight::Iq3Xxs` (`gemm_iq3xxs`).
     Iq3xxs,
+    /// `GemmWeight::Iq3S` (`gemm_iq3s`).
+    Iq3s,
     /// `GemmWeight::Iq4Xs` (`gemm_iq4xs`).
     Iq4xs,
     /// `Gemm32Weight::Q8_0File` (`gemm_q8_0f`, the file's `block_q8_0` stream)

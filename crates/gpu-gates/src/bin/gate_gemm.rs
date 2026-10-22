@@ -36,6 +36,16 @@
 //! NaN, `from_ggml`'s acceptance of IQ2_XXS, and the host API's refusal of
 //! IQ3_XXS on the stack.
 //!
+//! The IQ3_S cases (`iq3s_*`, the stacks of Qwen3.6's UD-IQ4_XS file): a
+//! synthetic gate stack of the routed shape (256 experts of 512 rows, K 2048,
+//! top 8, every slot its token's column), a down stack (256 experts of 2048
+//! rows, K 512, each slot its own column) and a 400-row ragged slab at K 1280
+//! (odd super-blocks a row: each row padded to whole words, every other
+//! super-block at 2 mod 4), each under the four routings — with the same
+//! checks, a NaN `d` super-block's outputs NaN, `from_ggml`'s acceptance of
+//! IQ3_S beside its refusal of IQ2_XS, and the host API's refusal of IQ3_XXS
+//! and IQ4_XS on the stack by its row size.
+//!
 //! Checks per run:
 //! 1. Every output of every slot written (`y` starts at a sentinel).
 //! 2. Every checked output within its derived band of the f64 reference:
@@ -272,7 +282,9 @@ mod gate {
         open_model, verdict,
     };
     use cuda_core::DeviceBuffer;
-    use gguf::iq_tables::{IQ2XXS_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL};
+    use gguf::iq_tables::{
+        IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL,
+    };
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
     use model::arch::models::shape::{MoeShape, rules};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -428,6 +440,7 @@ mod gate {
             | GemmWeight::Q5K
             | GemmWeight::Iq2Xxs
             | GemmWeight::Iq3Xxs
+            | GemmWeight::Iq3S
             | GemmWeight::Iq4Xs => 32,
             GemmWeight::Q6K | GemmWeight::Q3K => 16,
         };
@@ -551,6 +564,31 @@ mod gate {
                             };
                             let g = i32::from(IQ3XXS_GRID[ib].to_le_bytes()[m]);
                             let sgn = if signs(l) & KMASK_IQ2XS[j] != 0 {
+                                -1
+                            } else {
+                                1
+                            };
+                            dec.q.push((g * sgn) as i8);
+                        }
+                    }
+                }
+                GemmWeight::Iq3S => {
+                    // The kernel keeps `2s + 1` whole in the integer scale and
+                    // scales by `d` (the grid is unscaled), as ggml's
+                    // `dequantize_row_iq3_s` forms `d·(1 + 2s)·grid`.
+                    dec.d.push(f16(&b[0..2]));
+                    dec.dmin.push(0.0);
+                    let (qs, qh, signs, scales) =
+                        (&b[2..66], &b[66..74], &b[74..106], &b[106..110]);
+                    for c in 0..8 {
+                        dec.sc
+                            .push(2 * i32::from((scales[c / 2] >> (4 * (c % 2))) & 0x0f) + 1);
+                        for v in 0..32 {
+                            let m = v / 4;
+                            let index =
+                                usize::from(qs[8 * c + m]) | (usize::from(qh[c] >> m & 1) << 8);
+                            let g = i32::from(IQ3S_GRID[index].to_le_bytes()[v % 4]);
+                            let sgn = if signs[4 * c + v / 8] & KMASK_IQ2XS[v % 8] != 0 {
                                 -1
                             } else {
                                 1
@@ -706,6 +744,7 @@ mod gate {
             GemmWeight::Q6K => GgmlType::Q6_K,
             GemmWeight::Iq2Xxs => GgmlType::IQ2_XXS,
             GemmWeight::Iq3Xxs => GgmlType::IQ3_XXS,
+            GemmWeight::Iq3S => GgmlType::IQ3_S,
             GemmWeight::Iq4Xs => GgmlType::IQ4_XS,
         };
         let nb = st.k / 128;
@@ -886,7 +925,10 @@ mod gate {
                 (GemmWeight::Q5K, _) | (GemmWeight::Q3K, Input::PerSlot(_)) => return Ok(None),
                 // The i-quant types' diagnostic is `iq_rows_diag`, not a
                 // `_sel` gemv.
-                (GemmWeight::Iq2Xxs, _) | (GemmWeight::Iq3Xxs, _) | (GemmWeight::Iq4Xs, _) => {
+                (GemmWeight::Iq2Xxs, _)
+                | (GemmWeight::Iq3Xxs, _)
+                | (GemmWeight::Iq3S, _)
+                | (GemmWeight::Iq4Xs, _) => {
                     return Ok(None);
                 }
                 (GemmWeight::Q3K, Input::Shared(top_k)) => {
@@ -965,7 +1007,7 @@ mod gate {
                     .q6s
                     .enqueue_gemv_q6k_sel(stream, &res.w, act, &sel, m, st.rows, &mut y)?,
                 GemmWeight::Q5K => return Err("Q5_K has no _sel gemv".into()),
-                GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => {
+                GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs | GemmWeight::Iq3S | GemmWeight::Iq4Xs => {
                     return Err("an i-quant stack has no _sel gemv".into());
                 }
             }
@@ -1329,7 +1371,7 @@ mod gate {
                 }
                 GemmWeight::Q6K => sb[208..210].copy_from_slice(&a),
                 GemmWeight::Q3K => sb[108..110].copy_from_slice(&a),
-                GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => {
+                GemmWeight::Iq2Xxs | GemmWeight::Iq3Xxs | GemmWeight::Iq3S | GemmWeight::Iq4Xs => {
                     sb[0..2].copy_from_slice(&a)
                 }
             }
@@ -2426,6 +2468,7 @@ mod gate {
         }
         ok &= q38_cases(&dev)?;
         ok &= iq2xxs_cases(&dev)?;
+        ok &= iq3s_cases(&dev)?;
         ok &= dense_case(&dev)?;
         ok &= route_table_case(&dev)?;
         ok &= swiglu_case(&dev)?;
@@ -2589,7 +2632,7 @@ mod gate {
         };
         let mut res = dev.resident_at(&st, top_k)?;
         let ids = vec![0u32; top_k];
-        let x = activations(st.k, 1, (seed as u32) ^ 0xd1a9);
+        let x = activations(st.k, st.input.cols(top_k), (seed as u32) ^ 0xd1a9);
         let xd = DeviceBuffer::from_host(stream, &x)?;
         let y = dev.run(&st, &mut res, &xd, &ids)?;
         let nan = y.iter().all(|v| v.is_nan());
@@ -2776,6 +2819,109 @@ mod gate {
         Ok(ok)
     }
 
+    /// The IQ3_S cases (the card route Qwen3.6's UD-IQ4_XS file takes on the
+    /// placed load's wide arm): a synthetic gate stack of that routed shape —
+    /// 256 experts of 512 rows, K 2048, top 8, every slot its token's column —
+    /// a down stack of the shape the files that hold an IQ3_S down take (256
+    /// experts of 2048 rows, K 512, each slot its own column), and a stack of
+    /// 400 rows an expert (a partial 128-row slab) at K 1280, whose odd five
+    /// super-blocks a row pad each row to 550 bytes and put every other
+    /// super-block at 2 mod 4. Each runs the four routings at [`TOKENS`],
+    /// `from_ggml`'s acceptance of IQ3_S beside its refusal of IQ2_XS, a NaN
+    /// `d` super-block's outputs NaN, and the host API's refusal of the other
+    /// i-quant types on the stack.
+    fn iq3s_cases(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if ![
+            "iq3s_gate_synth",
+            "iq3s_down_synth",
+            "iq3s_ragged_rows_synth",
+        ]
+        .iter()
+        .any(|&n| wanted(n))
+        {
+            return Ok(true);
+        }
+        let accept = GemmWeight::from_ggml(GgmlType::IQ3_S).is_ok_and(|t| t == GemmWeight::Iq3S)
+            && GemmWeight::from_ggml(GgmlType::IQ2_XS).is_err();
+        println!(
+            "gemm case=iq3s_types from_ggml(iq3_s, iq2_xs)={} {}",
+            if accept { "accepted, refused" } else { "WRONG" },
+            verdict(accept)
+        );
+        let mut ok = accept;
+        for (name, n_exp, rows, k, input, seed) in [
+            (
+                "iq3s_gate_synth",
+                256usize,
+                512usize,
+                2048usize,
+                Input::Shared(8),
+                0x5fbu64,
+            ),
+            ("iq3s_down_synth", 256, 2048, 512, Input::PerSlot(8), 0x5fd),
+        ] {
+            if !wanted(name) {
+                continue;
+            }
+            let st = Stack {
+                name: name.into(),
+                ty: GemmWeight::Iq3S,
+                bytes: synthetic(GemmWeight::Iq3S, n_exp * rows * k / 256, seed).into(),
+                n_exp,
+                rows,
+                k,
+                input,
+            };
+            ok &= run_case(dev, &st, seed ^ 0x61)?;
+            ok &= iq_nan_d(dev, &st, seed)?;
+            // The host API refuses the other i-quant types on this stack, by
+            // the row size: the route is filled first, so no other check
+            // refuses before the type's.
+            let stream = dev.gpu.stream();
+            let top_k = st.input.top_k();
+            let mut res = dev.resident_at(&st, top_k)?;
+            let ids = route_ids(Routing::Uniform, 1, top_k, n_exp, seed ^ 0xd1a6);
+            let x = activations(k, st.input.cols(ids.len()), (seed as u32) ^ 0xd1a7);
+            dev.run(&st, &mut res, &DeviceBuffer::from_host(stream, &x)?, &ids)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, top_k * rows)?;
+            let mut refused = true;
+            for other in [GemmWeight::Iq3Xxs, GemmWeight::Iq4Xs] {
+                let outcome = dev.gk.enqueue_gemm(
+                    stream,
+                    GemmArgs {
+                        ty: other,
+                        w: &res.w,
+                        rows_per_expert: rows,
+                        act: &res.act,
+                        route: &res.route,
+                        input: st.input.gemm(),
+                        y: &mut y,
+                    },
+                );
+                refused &= outcome.is_err_and(|e| e.to_string().contains("rows at K"));
+            }
+            println!(
+                "gemm case={name} other_iq_types_on_stack_refused={refused} {}",
+                verdict(refused)
+            );
+            ok &= refused;
+        }
+        if wanted("iq3s_ragged_rows_synth") {
+            let (n_exp, rows, k) = (16usize, 400usize, 1280usize);
+            let st = Stack {
+                name: "iq3s_ragged_rows_synth".into(),
+                ty: GemmWeight::Iq3S,
+                bytes: synthetic(GemmWeight::Iq3S, n_exp * rows * k / 256, 0x5ff).into(),
+                n_exp,
+                rows,
+                k,
+                input: Input::Shared(4),
+            };
+            ok &= run_case(dev, &st, 0x75)?;
+        }
+        Ok(ok)
+    }
+
     /// `--bench-kernels`: the grouped int8 GEMM's launch cost, the eager
     /// burst and the graph replay of each arm (`bench op=` rows), timed by
     /// `tools/ref/time-gate.sh` under the machine lease. Weight and activation
@@ -2943,7 +3089,7 @@ mod gate {
 
         /// The i-quant arms of the two GEMM families at the Qwen3.8 card
         /// route's shapes (`gate_gemm`'s q38 cases): the routed gate — 64
-        /// experts of 640 × 2560, top-10's shape — for IQ3_XXS and IQ4_XS, and
+        /// experts of 640 × 2560, top-10's shape — for IQ3_XXS, IQ3_S and IQ4_XS, and
         /// the routed down — 64 experts of 2560 rows × K 640, each slot its
         /// own column — for IQ4_NL. Ten slots a token pass the route table's
         /// 36,864-slot cap at 4096 tokens, so every arm runs 4096 tokens of
@@ -2966,6 +3112,7 @@ mod gate {
                     245usize,
                     98usize,
                 ),
+                (GemmWeight::Iq3S, "gemm_iq3s_moe_t4096", 275, 110),
                 (GemmWeight::Iq4Xs, "gemm_iq4xs_moe_t4096", 340, 136),
             ] {
                 if only.is_some_and(|o| o != op) {
