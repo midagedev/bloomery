@@ -146,7 +146,7 @@ fn check(
             p.cols
         )));
     }
-        if !p.cols.is_multiple_of(p.quant.values_per_block()) {
+    if !p.cols.is_multiple_of(p.quant.values_per_block()) {
         return Err(refuse(format!(
             "{} columns are not whole blocks of {}",
             p.cols,

@@ -280,9 +280,14 @@ fn q4k_magnitude_blocks(row: &[u8]) -> Vec<u8> {
 /// terms of an A4 weight. Each sign bit is the top bit of the pair's second
 /// byte (little-endian).
 fn a4_magnitude_blocks(row: &[u8]) -> Vec<u8> {
-    const GROUP: usize = Quant::A4.block_bytes();
+    let bytes = Quant::A4.block_bytes();
+    assert!(
+        row.len().is_multiple_of(bytes),
+        "an A4 row of {} bytes is not whole {bytes}-byte groups",
+        row.len()
+    );
     let mut out = row.to_vec();
-    for group in out.as_chunks_mut::<GROUP>().0 {
+    for group in out.chunks_exact_mut(bytes) {
         group[33] &= 0x7F;
         group[35] &= 0x7F;
     }
