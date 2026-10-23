@@ -43,6 +43,12 @@
 //! 15. **nsg**: the Q6_K mat-vec at eight SIMD groups in a threadgroup is the
 //!     same bits as at two, for every row count the fixture's Q6_K tensors
 //!     have.
+//! 16. **router_logit**: the router's logits sit inside the f64 band. // K2-REGISTER
+//! 17. **router_ids**: the routed ids match the f64 ranking when the 8th-vs-9th margin is wider than the band, and a step inside the band is printed by name. // K2-REGISTER
+//! 18. **router_weights**: the top-8 weights and the shared-expert sigmoid match the f64 rule. // K2-REGISTER
+//! 19. **router_ticket**: 10000 launches, and each launch's ids are the host's selection from that launch's logits. // K2-REGISTER
+//! 20. **router_nan**: a non-finite weight raises the router site and the ids stay in range. // K2-REGISTER
+//! 21. **router_bounds**: a shape, a window, an eps or an alignment the kernel does not take is refused by name, and nothing is encoded. // K2-REGISTER
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
@@ -67,12 +73,16 @@ use bloomery_metal::stream::MetalStream;
 
 #[path = "clauses.rs"]
 mod clauses;
+#[path = "clauses_router.rs"] // K2-REGISTER
+mod clauses_router; // K2-REGISTER
 #[path = "fixture.rs"]
 mod fixture;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "../shared/oracle.rs"]
 mod oracle;
+#[path = "../shared/oracle_router.rs"] // K2-REGISTER
+mod oracle_router; // K2-REGISTER
 
 /// A clause, ready to run.
 type ClauseRun<'a> = Box<dyn Fn() -> Clause + 'a>;
@@ -529,7 +539,8 @@ pub fn main() -> ExitCode {
         Ok(fixture) => f(&harness, fixture),
         Err(e) => Err(e.clone()),
     };
-    let clauses: [(&'static str, ClauseRun<'_>); 15] = [
+    #[rustfmt::skip] // K2-REGISTER
+    let clauses: [(&'static str, ClauseRun<'_>); 21] = [ // K2-REGISTER
         ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
         ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
         ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
@@ -560,6 +571,12 @@ pub fn main() -> ExitCode {
         ("headnorm", Box::new(|| with(clauses::headnorm))),
         ("headnorm_nan", Box::new(|| with(clauses::headnorm_nan))),
         ("nsg", Box::new(|| with(clauses::nsg))),
+        ("router_logit", Box::new(|| with(clauses_router::router_logit))), // K2-REGISTER
+        ("router_ids", Box::new(|| with(clauses_router::router_ids))), // K2-REGISTER
+        ("router_weights", Box::new(|| with(clauses_router::router_weights))), // K2-REGISTER
+        ("router_ticket", Box::new(|| with(clauses_router::router_ticket))), // K2-REGISTER
+        ("router_nan", Box::new(|| with(clauses_router::router_nan))), // K2-REGISTER
+        ("router_bounds", Box::new(|| clauses_router::router_bounds(&harness))), // K2-REGISTER
     ];
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)
