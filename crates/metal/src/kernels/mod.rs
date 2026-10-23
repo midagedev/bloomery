@@ -6,6 +6,7 @@
 //! (a window that is not the shape's is a named [`bloomery_device::DeviceError`], never a
 //! partial read or write), and encodes one dispatch on the caller's encoder.
 //! The kernels themselves are `kernels/{norm,matvec_q4k,matvec_q6k,embed}.metal`.
+//! Decode attention is `kernels/attention.metal`. // K5-REGISTER
 //!
 //! Three mat-vecs live here, one concept each: the plain mat-vec of one
 //! tensor ([`matvec`]), the segmented mat-vec of up to four tensors of one
@@ -15,7 +16,9 @@
 //! The routed gate-up pair and the folded down are one dispatch each. // K3-REGISTER
 //! The gated delta step ([`delta`]) writes the numerator and the partials that // K4-REGISTER
 //! mat-vec reads. Its kernel is `kernels/delta.metal`. // K4-REGISTER
+//! Decode attention is `kernels/attention.metal`. // K5-REGISTER
 
+mod attention; // K5-REGISTER
 mod delta; // K4-REGISTER
 mod embed;
 mod experts; // K3-REGISTER
@@ -25,6 +28,22 @@ mod matvec;
 mod router; // K2-REGISTER
 mod seg;
 
+pub use attention::{
+    // K5-REGISTER
+    AttentionParams, // K5-REGISTER
+    AttnCache,       // K5-REGISTER
+    HEAD_DIM,        // K5-REGISTER
+    KV_HEADS,        // K5-REGISTER
+    QUERY_HEADS,     // K5-REGISTER
+    ROT,             // K5-REGISTER
+    SCALE,           // K5-REGISTER
+    TILE,            // K5-REGISTER
+    f16_len,         // K5-REGISTER
+    out_len,         // K5-REGISTER
+    partials_len,    // K5-REGISTER
+    q8_code_len,     // K5-REGISTER
+    q8_scale_len,    // K5-REGISTER
+};
 pub use delta::CONV_TAPS; // K4-REGISTER
 pub use delta::DeltaParams; // K4-REGISTER
 pub use delta::HeadMap; // K4-REGISTER
@@ -106,13 +125,14 @@ pub struct Kernels {
     q6k: MatvecPipelines,
     headnorm: Pipeline,
     embed: Pipeline,
-    router: Pipeline, // K2-REGISTER
+    router: Pipeline,  // K2-REGISTER
     pair_q4: Pipeline, // K3-REGISTER
     pair_q6: Pipeline, // K3-REGISTER
     fold_q4: Pipeline, // K3-REGISTER
     fold_q6: Pipeline, // K3-REGISTER
     /// The gated delta step. // K4-REGISTER
     delta: Pipeline, // K4-REGISTER
+    attention: attention::AttentionPipelines, // K5-REGISTER
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -182,7 +202,8 @@ impl Kernels {
             pair_q6: library.pipeline("q6k_pair_swiglu")?, // K3-REGISTER
             fold_q4: library.pipeline("q4k_down_fold")?, // K3-REGISTER
             fold_q6: library.pipeline("q6k_down_fold")?, // K3-REGISTER
-            delta: library.pipeline("gdn_step")?, // K4-REGISTER
+            delta: library.pipeline("gdn_step")?,  // K4-REGISTER
+            attention: attention::AttentionPipelines::new(library)?, // K5-REGISTER
             simdgroups,
         })
     }
