@@ -28,6 +28,7 @@ struct In<'a> {
     map: HeadMap,
     lanes: usize,
     lane_at: usize,
+    lane_to: usize,
     lane: &'a [u32],
     pos: &'a [u32],
     x: &'a [f32],
@@ -131,6 +132,7 @@ fn run(h: &Harness<'_>, inp: &In<'_>) -> Result<Back, String> {
                 map: inp.map,
                 lanes: inp.lanes,
                 lane_at: inp.lane_at,
+                lane_to: inp.lane_to,
                 layer: LAYER,
                 pos: inp.pos,
                 eps: inp.eps,
@@ -163,6 +165,7 @@ fn step_in<'a>(inp: &'a In<'a>) -> StepIn<'a> {
         n_k: inp.n_k,
         map: inp.map,
         lane: inp.lane[inp.lane_at],
+        lane_out: inp.lane[inp.lane_to],
         pos: inp.pos[0],
         eps: inp.eps,
         lanes: inp.lanes,
@@ -236,16 +239,19 @@ struct View<'a> {
     map: HeadMap,
     lanes: usize,
     lane_at: usize,
+    lane_to: usize,
     lane: &'a [u32],
     pos: &'a [u32],
     state: &'a [f32],
     ring: &'a [f32],
 }
 
+/// A view of `owned` whose step reads the lane the word at `lane_at` names
+/// and writes the lane the word at `lane_to` names.
 fn view_of<'a>(
     map: HeadMap,
     lanes: usize,
-    lane_at: usize,
+    (lane_at, lane_to): (usize, usize),
     lane: &'a [u32],
     pos: &'a [u32],
     owned: &'a Owned,
@@ -254,6 +260,7 @@ fn view_of<'a>(
         map,
         lanes,
         lane_at,
+        lane_to,
         lane,
         pos,
         state: &owned.state,
@@ -268,6 +275,7 @@ impl Owned {
             map: view.map,
             lanes: view.lanes,
             lane_at: view.lane_at,
+            lane_to: view.lane_to,
             lane: view.lane,
             pos: view.pos,
             x: &self.x,
@@ -299,12 +307,12 @@ pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let lane = [0u32];
     let (tiled, tiled_fit) = launch_fit(
         h,
-        &owned.as_in(view_of(HeadMap::Tiled, 1, 0, &lane, &pos, &owned)),
+        &owned.as_in(view_of(HeadMap::Tiled, 1, (0, 0), &lane, &pos, &owned)),
         true,
     )?;
     let (grouped, grouped_fit) = launch_fit(
         h,
-        &owned.as_in(view_of(HeadMap::Grouped, 1, 0, &lane, &pos, &owned)),
+        &owned.as_in(view_of(HeadMap::Grouped, 1, (0, 0), &lane, &pos, &owned)),
         true,
     )?;
     if common::bits_eq(&tiled.g, &grouped.g) && common::bits_eq(&tiled.state, &grouped.state) {
@@ -315,15 +323,24 @@ pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let mut narrow = inputs(&mut rng, 8, &fixed, &conv8)?;
     let lanes = elems(state_elems(2), "state")?;
     narrow.state = draw(&mut rng, lanes, 0.04);
-    let lane_words = [7u32, 1];
+    // Word 1 names lane 1, read; word 2 names lane 0, written. Word 0 names
+    // no lane, so a step that reads a word by another index raises.
+    let lane_words = [7u32, 1, 0];
     let (back, narrow_fit) = launch_fit(
         h,
-        &narrow.as_in(view_of(HeadMap::Tiled, 2, 1, &lane_words, &pos, &narrow)),
+        &narrow.as_in(view_of(
+            HeadMap::Tiled,
+            2,
+            (1, 2),
+            &lane_words,
+            &pos,
+            &narrow,
+        )),
         true,
     )?;
-    let lane0 = elems(state_elems(1), "state")?;
-    if !common::bits_eq(&back.state[..lane0], &narrow.state[..lane0]) {
-        return Err("the unselected lane of the state was written".to_string());
+    let lane1 = elems(state_elems(1), "state")?;
+    if !common::bits_eq(&back.state[lane1..], &narrow.state[lane1..]) {
+        return Err("the lane the step read was written".to_string());
     }
     let mut worst = 0.0;
     let mut widest = 0.0;
@@ -358,6 +375,7 @@ pub fn delta_roll(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             map: HeadMap::Tiled,
             lanes: 1,
             lane_at: 0,
+            lane_to: 0,
             lane: &lane,
             pos: &pos,
             x: &x,
@@ -417,6 +435,7 @@ fn ring_launch(
             map: HeadMap::Tiled,
             lanes: 1,
             lane_at: 0,
+            lane_to: 0,
             lane: &lane,
             pos: &pos,
             state: &owned.state,
@@ -481,7 +500,7 @@ pub fn delta_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let lane = [0u32];
     let (back, fit) = launch_fit(
         h,
-        &owned.as_in(view_of(HeadMap::Tiled, 1, 0, &lane, &pos, &owned)),
+        &owned.as_in(view_of(HeadMap::Tiled, 1, (0, 0), &lane, &pos, &owned)),
         true,
     )?;
     let rows = 32;
@@ -540,6 +559,7 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
             map: HeadMap::Tiled,
             lanes: 1,
             lane_at: 0,
+            lane_to: 0,
             lane: &lane,
             pos: &pos,
             state: &state,
@@ -576,6 +596,7 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
         n_k: owned.n_k,
         map: HeadMap::Tiled,
         lane: 0,
+        lane_out: 0,
         pos: 4,
         eps: owned.eps,
         lanes: 1,
@@ -605,28 +626,38 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
     Ok(())
 }
 
-/// A lane word past the lanes, and one non-finite key, each raise the lane site.
+/// A read or a write lane word past the lanes, and one non-finite key, each
+/// raise the lane site.
 pub fn delta_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let fixed = fixed(fixture)?;
     let mut rng = oracle::Rng::new(0xD41C);
     let owned = inputs(&mut rng, 16, &fixed, &fixed.conv_w)?;
     let pos = [4u32];
-    let lane = [4u32];
-    let back = run(
-        h,
-        &owned.as_in(view_of(HeadMap::Tiled, 1, 0, &lane, &pos, &owned)),
-    )?;
-    common::expect_fault(h, "a lane word past the lanes", FaultSite::DeltaLane)?;
-    if !common::bits_eq(&back.state, &owned.state) {
-        return Err("a lane word past the lanes wrote the state".to_string());
+    // Word 0 names lane 0, word 1 a lane past the one there is.
+    let lane = [0u32, 4];
+    for (what, at) in [("a read", (1, 0)), ("a write", (0, 1))] {
+        let back = run(
+            h,
+            &owned.as_in(view_of(HeadMap::Tiled, 1, at, &lane, &pos, &owned)),
+        )?;
+        common::expect_fault(
+            h,
+            &format!("{what} lane word past the lanes"),
+            FaultSite::DeltaLane,
+        )?;
+        if !common::bits_eq(&back.state, &owned.state) {
+            return Err(format!("{what} lane word past the lanes wrote the state"));
+        }
+        if back.g.iter().any(|v| !v.is_nan()) || back.partials.iter().any(|v| !v.is_nan()) {
+            return Err(format!(
+                "{what} lane word past the lanes left a finite numerator or partial"
+            ));
+        }
+        written_once(&back.ring, &owned.ring, &owned.x, 4)?;
     }
-    if back.g.iter().any(|v| !v.is_nan()) || back.partials.iter().any(|v| !v.is_nan()) {
-        return Err("a lane word past the lanes left a finite numerator or partial".to_string());
-    }
-    written_once(&back.ring, &owned.ring, &owned.x, 4)?;
     poison_column(h, &owned)?;
     Ok(Verdict::Noted(
-        "a lane word past the lanes left the state untouched, and one non-finite key wrote NaN on that lane only"
+        "a read or a write lane word past the lanes left the state untouched, and one non-finite key wrote NaN on that lane only"
             .to_string(),
     ))
 }
@@ -665,6 +696,8 @@ struct Args {
     /// The position window's length; `refuse` picks the slice it stands for.
     pos_len: usize,
     g: usize,
+    /// The written lane's word index, in a lane window of one word.
+    lane_to: usize,
 }
 
 impl Args {
@@ -676,6 +709,7 @@ impl Args {
             n_k,
             pos_len: 1,
             g: g_len,
+            lane_to: 0,
         }
     }
 }
@@ -722,6 +756,7 @@ fn refuse(
             map: HeadMap::Tiled,
             lanes: 1,
             lane_at: 0,
+            lane_to: a.lane_to,
             layer: LAYER,
             pos,
             eps: 1e-6,
@@ -810,6 +845,13 @@ pub fn delta_bounds(h: &Harness<'_>) -> Clause {
             "a long numerator window",
             "g window",
             |a| a.g = g_len + 1,
+            h,
+            whole,
+        ),
+        bad(
+            "a write lane index past the lane window",
+            "write lane index",
+            |a| a.lane_to = 1,
             h,
             whole,
         ),

@@ -2,14 +2,28 @@
 //!
 //! The work of a stream is its committed command buffers, in the order they
 //! were submitted. A buffer is made with [`MetalStream::begin`], encoded into,
-//! and committed with [`MetalStream::submit`], which also registers it: the
-//! stream waits for exactly the buffers it submitted, and no other path
-//! commits one. `record` and `wait` are signal-only and wait-only command
-//! buffers of the same queue. The queue orders a signal-only buffer after
-//! the work submitted before it and a wait-only buffer before the work
-//! submitted after it; `event_record_orders` and `event_wait_holds` are the
-//! clauses that fail where that does not hold.
+//! and committed with [`MetalStream::submit`] or
+//! [`MetalStream::submit_signalled`], which also register it: the stream
+//! waits for exactly the buffers it submitted, and no other path commits one.
+//! `record` and `wait` are signal-only and wait-only command buffers of the
+//! same queue. The queue orders a signal-only buffer after the work submitted
+//! before it and a wait-only buffer before the work submitted after it;
+//! `event_record_orders` and `event_wait_holds` are the clauses that fail
+//! where that does not hold.
+//!
+//! The buffers' resources are untracked, so the queue's order alone does not
+//! keep one buffer's dispatches from overlapping the next one's. Work that
+//! must follow the work before it opens with a token encoder
+//! ([`Recording::token_encoder`]): its buffer waits for the stream's token
+//! boundary, a device event every signalled buffer signals at its end.
+//!
+//! [`MetalStream::settle`] waits for one signalled buffer, not for every
+//! pending one: it wakes on the stream's event at the value that buffer
+//! signals, and returns the proof ([`Settled`]) a host read of what the
+//! buffer wrote takes. Every host wait, a settle or a sync, is counted
+//! ([`MetalStream::waits`]).
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -18,7 +32,7 @@ use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue, MTLDevice, MTLSharedEvent,
+    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue, MTLDevice, MTLEvent, MTLSharedEvent,
 };
 
 use bloomery_device::{DeviceError, Event, Stream};
@@ -33,22 +47,41 @@ pub(crate) const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a wait for a command buffer sleeps between looks at its status.
 const POLL: Duration = Duration::from_micros(50);
 
+/// How long a settle waits on the event before it looks at the buffers'
+/// status: a buffer that failed may never reach its signal.
+const SETTLE_LOOK_MS: u64 = 100;
+
+/// The buffers a stream holds while they run: the token a step waits for,
+/// the token committed ahead of it, and one settled whose completion the
+/// driver has not yet reported.
+const PENDING: usize = 3;
+
 /// The stream the device's work is enqueued on.
 pub struct MetalStream {
     queue: Handle<dyn MTLCommandQueue>,
-    /// The one event the stream's `record` signals, at rising values.
+    /// The one event the stream's `record` and its signalled buffers signal,
+    /// at rising values: the host's waits.
     timeline: Handle<dyn MTLSharedEvent>,
+    /// The token boundary: every signalled buffer signals it at its end, at
+    /// its timeline value, and a token encoder's buffer waits for the last
+    /// such value. It is the device's own event, not the shared one: the
+    /// device hands one buffer to the next through it with no host path.
+    boundary: Retained<ProtocolObject<dyn MTLEvent>>,
     // The contract's `record` and `wait` take `&self` from any thread, so
     // the counter and the list of unfinished buffers are behind one lock: a
     // value is taken and its buffer committed in one step, so the values rise
     // in commit order.
     committed: Mutex<Committed>,
+    /// The host's waits: every settle and every sync.
+    waits: AtomicU64,
 }
 
 /// What a stream has committed.
 struct Committed {
-    /// The value the last `record` signals.
+    /// The value the last signal takes.
     last: u64,
+    /// The value the last signalled buffer signals the boundary at.
+    boundary: u64,
     /// The committed command buffers not yet seen complete.
     pending: Vec<CommandBufferHandle>,
     /// An empty list holding capacity for the one [`MetalStream::sync_for`]
@@ -67,7 +100,27 @@ impl Committed {
         buffer.commit();
         self.pending.push(CommandBufferHandle(buffer));
     }
+
+    /// The next value a signal takes.
+    fn next_value(&mut self) -> u64 {
+        self.last += 1;
+        self.last
+    }
 }
+
+/// A recording committed with a signal of its own: the stream's event reaches
+/// its value once the recording's work is done. It is settled by
+/// [`MetalStream::settle`], which is where its failure is read.
+#[must_use = "a signalled recording is settled, which reads its failure"]
+#[derive(Debug)]
+pub struct Signalled {
+    value: u64,
+}
+
+/// The proof a signalled recording's work is done and what it wrote is the
+/// host's to read: only [`MetalStream::settle`] makes one.
+#[derive(Debug)]
+pub struct Settled(());
 
 /// A command buffer being encoded for a stream: made by
 /// [`MetalStream::begin`], given its encoders, and committed by
@@ -90,6 +143,22 @@ impl Recording<'_> {
     /// encoder lives, as for [`Recording::compute_encoder`], and it cannot
     /// be submitted until the encoder ends.
     pub fn compute_encoder_concurrent(&mut self) -> Result<ComputeEncoder<'_>, DeviceError> {
+        ComputeEncoder::concurrent(&self.buffer)
+    }
+
+    /// A concurrent compute encoder at the stream's token boundary: the
+    /// buffer first waits for the boundary's last value, so the encoder's
+    /// dispatches start after the work of every signalled buffer committed
+    /// before it opened. The resources are untracked, so the queue's order
+    /// does not keep two buffers' dispatches apart: without the wait, a
+    /// token committed ahead starts before the token it embeds the pick of
+    /// is done, and the e2e gate's `b_chain` is red.
+    pub fn token_encoder(&mut self) -> Result<ComputeEncoder<'_>, DeviceError> {
+        let last = self.stream.committed().boundary;
+        if last > 0 {
+            self.buffer
+                .encodeWaitForEvent_value(&self.stream.boundary, last);
+        }
         ComputeEncoder::concurrent(&self.buffer)
     }
 }
@@ -184,17 +253,29 @@ impl MetalStream {
                 "the device made no shared event".to_string(),
             )
         })?;
+        let boundary = device
+            .newEvent()
+            .ok_or_else(|| DeviceError::backend("event", "the device made no event".to_string()))?;
         Ok(Self {
             queue,
             timeline: Handle(timeline),
+            boundary,
             committed: Mutex::new(Committed {
                 last: 0,
-                // Both lists start with capacity, so no sync from the first
-                // step on grows one.
-                pending: Vec::with_capacity(1),
-                spare: Vec::with_capacity(1),
+                boundary: 0,
+                // Both lists start with capacity, so no commit or sync from
+                // the first step on grows one.
+                pending: Vec::with_capacity(PENDING),
+                spare: Vec::with_capacity(PENDING),
             }),
+            waits: AtomicU64::new(0),
         })
+    }
+
+    /// The host's waits on this stream so far: every settle and every sync.
+    #[must_use]
+    pub fn waits(&self) -> u64 {
+        self.waits.load(Ordering::Relaxed)
     }
 
     /// The committed state. A panic while it was held left it whole (every
@@ -240,10 +321,79 @@ impl MetalStream {
         Ok(())
     }
 
+    /// Commit a recording's command buffer with a signal of its own and
+    /// register it; [`MetalStream::settle`] waits for that signal, and the
+    /// next token encoder for the buffer's end. A recording made by another
+    /// stream is refused by name.
+    pub fn submit_signalled(&self, recording: Recording<'_>) -> Result<Signalled, DeviceError> {
+        if !core::ptr::eq(recording.stream, self) {
+            return Err(DeviceError::backend(
+                "command buffer",
+                "the recording was made by another stream".to_string(),
+            ));
+        }
+        let mut c = self.committed();
+        let value = c.next_value();
+        recording
+            .buffer
+            .encodeSignalEvent_value(&self.boundary, value);
+        recording
+            .buffer
+            .encodeSignalEvent_value(ProtocolObject::from_ref(&*self.timeline), value);
+        c.boundary = value;
+        c.commit(recording.buffer);
+        Ok(Signalled { value })
+    }
+
+    /// Wait for one signalled recording, not for every pending one. The wait
+    /// sleeps on the stream's event and looks at the buffers' status between
+    /// [`SETTLE_LOOK_MS`] waits, since a buffer that failed may never reach
+    /// its signal; past [`SYNC_TIMEOUT`] it is refused by name. A failure the
+    /// driver has reported by the time the signal arrives is named here; one
+    /// it reports later is named by the next settle or sync.
+    pub fn settle(&self, signalled: Signalled) -> Result<Settled, DeviceError> {
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        let value = signalled.value;
+        let deadline = Instant::now() + SYNC_TIMEOUT;
+        while !self
+            .timeline
+            .waitUntilSignaledValue_timeoutMS(value, SETTLE_LOOK_MS)
+        {
+            self.reap()?;
+            if Instant::now() >= deadline {
+                return Err(DeviceError::backend(
+                    "command buffer",
+                    format!(
+                        "signal {value} not reached within {} ms",
+                        SYNC_TIMEOUT.as_millis()
+                    ),
+                ));
+            }
+        }
+        self.reap()?;
+        Ok(Settled(()))
+    }
+
+    /// Drop the buffers seen complete and name the first one seen failed; a
+    /// buffer still running stays pending.
+    fn reap(&self) -> Result<(), DeviceError> {
+        let mut first = None;
+        self.committed().pending.retain(|b| match b.0.status() {
+            MTLCommandBufferStatus::Completed => false,
+            MTLCommandBufferStatus::Error => {
+                first.get_or_insert_with(|| command_buffer_error(b));
+                false
+            }
+            _ => true,
+        });
+        first.map_or(Ok(()), Err)
+    }
+
     /// Every submitted buffer is done, or `timeout` has passed. Every pending
     /// buffer is looked at even when one failed, the first failure is
     /// returned, and a buffer that did not finish stays pending.
     pub fn sync_for(&self, timeout: Duration) -> Result<(), DeviceError> {
+        self.waits.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + timeout;
         // The spare list stands in for `pending` while the wait runs, so the
         // lock is held by no poll and a submit on another thread pushes into
@@ -308,10 +458,9 @@ impl Stream for MetalStream {
     fn record(&self) -> Result<Self::Event, DeviceError> {
         let buffer = self.command_buffer()?;
         let mut committed = self.committed();
-        let value = committed.last + 1;
+        let value = committed.next_value();
         buffer.encodeSignalEvent_value(ProtocolObject::from_ref(&*self.timeline), value);
         committed.commit(buffer);
-        committed.last = value;
         Ok(MetalEvent {
             event: self.timeline.clone(),
             value,

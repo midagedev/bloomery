@@ -6,8 +6,15 @@
 //! W` for every layer, then `H`. P1 is one dispatch per weight type of the
 //! layer's projections in one group. The FFN norm has no group of its own:
 //! the router (R) and the gate-up pair (G) each norm the residual as they
-//! load it. The head is the token's last group and closes no barrier. Every op only encodes: no wait, no allocation past the
-//! launches' own argument lists, no host round trip.
+//! load it. The head is the token's last group and closes no barrier. Every
+//! op only encodes: no wait, no allocation past the launches' own argument
+//! lists, no host round trip.
+//!
+//! The token at `pos` binds the step record slot of its position: the head
+//! writes its id there and every kernel raises that slot's fault word. A
+//! host-fed token embeds the host's id slot; a token fed on the device embeds
+//! the id the token before it wrote, in that token's slot. The delta step
+//! reads the lane of `pos` and writes the lane of `pos + 1`.
 
 use bloomery_device::fault::LAYER_HEAD;
 use bloomery_device::{Buffer, DeviceError, Elem, Elems, Window, WindowMut};
@@ -15,7 +22,7 @@ use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
 use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan};
 
-use super::arena::{Arena, LANES, MixerBufs, layer_word};
+use super::arena::{Arena, LANES, MixerBufs, lane_of, layer_word, slot_before, slot_of};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
@@ -49,13 +56,24 @@ fn part<'b, T: Elem>(
     b.window(Elems(r.start), Elems(r.len()))
 }
 
+/// Where a token's embed finds its id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Feed {
+    /// The host's id slot, which the host wrote before the commit.
+    Host,
+    /// The step record slot of the token before it: that token's pick.
+    Device,
+}
+
 /// The ops of one token over the session's arena, encoding on `enc`. `pos`
-/// is the token's position: its cache row and its conv ring slot.
+/// is the token's position: its cache row, its conv ring slot, its step
+/// record slot and its delta lanes.
 pub(super) struct MetalOps<'a, 'e> {
     enc: &'a mut ComputeEncoder<'e>,
     arena: &'a mut Arena,
     kernels: &'a Kernels,
     pos: u32,
+    feed: Feed,
 }
 
 impl<'a, 'e> MetalOps<'a, 'e> {
@@ -64,12 +82,14 @@ impl<'a, 'e> MetalOps<'a, 'e> {
         arena: &'a mut Arena,
         kernels: &'a Kernels,
         pos: u32,
+        feed: Feed,
     ) -> Self {
         Self {
             enc,
             arena,
             kernels,
             pos,
+            feed,
         }
     }
 
@@ -90,11 +110,12 @@ impl<'a, 'e> MetalOps<'a, 'e> {
     /// Layer `l`'s P1: the norm on load, one dispatch per weight type, one
     /// group.
     fn p1(&mut self, l: usize) -> Result<(), SessionError> {
+        let slot = slot_of(self.pos);
         let Arena {
             x,
             proj,
             layers,
-            fault,
+            faults,
             eps,
             hidden,
             ..
@@ -115,7 +136,7 @@ impl<'a, 'e> MetalOps<'a, 'e> {
                     norm: NormOnLoad {
                         gain: all(&p1.norm)?,
                         eps: *eps,
-                        fault,
+                        fault: &faults[slot],
                         layer: layer_word(l),
                     },
                 },
@@ -163,24 +184,30 @@ impl ChainOps for MetalOps<'_, '_> {
 
     fn embed(&mut self, m: usize) -> Result<(), SessionError> {
         Self::one_row(m)?;
+        let slot = slot_of(self.pos);
         let Arena {
             embed,
             vocab,
             hidden,
             id_in,
+            step_id,
             x,
-            fault,
+            faults,
             ..
         } = &mut *self.arena;
+        let ids = match self.feed {
+            Feed::Host => all(id_in)?,
+            Feed::Device => step_id.window(Elems(slot_before(self.pos)), Elems(1))?,
+        };
         self.kernels.embed(
             self.enc,
             EmbedParams {
                 table: all(embed)?,
                 vocab: *vocab,
                 cols: *hidden,
-                ids: all(id_in)?,
+                ids,
                 out: x.window_mut(Elems(0), Elems(*hidden))?,
-                fault,
+                fault: &faults[slot],
                 layer: layer_word(0),
             },
         )?;
@@ -205,13 +232,14 @@ impl ChainOps for MetalOps<'_, '_> {
                 ),
             });
         }
+        let slot = slot_of(self.pos);
         let Arena {
             proj,
             layers,
             rope,
             attn,
             attn_partials,
-            fault,
+            faults,
             eps,
             ctx,
             ..
@@ -241,7 +269,7 @@ impl ChainOps for MetalOps<'_, '_> {
                 },
                 partials: all_mut(attn_partials)?,
                 out: all_mut(attn)?,
-                fault,
+                fault: &faults[slot],
             },
         )?;
         self.close();
@@ -280,13 +308,14 @@ impl ChainOps for MetalOps<'_, '_> {
 
     fn delta_core(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
         let pos = [self.pos];
+        let slot = slot_of(self.pos);
         let Arena {
             proj,
             layers,
             g,
             delta_partials,
             lane,
-            fault,
+            faults,
             eps,
             ..
         } = &mut *self.arena;
@@ -307,14 +336,15 @@ impl ChainOps for MetalOps<'_, '_> {
                 ring: all_mut(&mut d.ring)?,
                 partials: all_mut(delta_partials)?,
                 g: all_mut(g)?,
-                faults: fault,
+                faults: &faults[slot],
                 n_v: VALUE_HEADS,
                 head: HEAD_COLS,
                 taps: CONV_TAPS,
                 n_k: d.n_k,
                 map: d.map,
                 lanes: LANES,
-                lane_at: 0,
+                lane_at: lane_of(self.pos),
+                lane_to: lane_of(self.pos + 1),
                 layer: layer_word(l.layer),
                 pos: &pos,
                 eps: *eps,
@@ -325,12 +355,13 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
+        let slot = slot_of(self.pos);
         let Arena {
             layers,
             g,
             delta_partials,
             x,
-            fault,
+            faults,
             eps,
             hidden,
             ..
@@ -346,7 +377,7 @@ impl ChainOps for MetalOps<'_, '_> {
                 partials: all(delta_partials)?,
                 y: x.window_mut(Elems(0), Elems(*hidden))?,
                 eps: *eps,
-                fault,
+                fault: &faults[slot],
                 layer: layer_word(l.layer),
             },
         )?;
@@ -355,10 +386,11 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn route(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), SessionError> {
+        let slot = slot_of(self.pos);
         let Arena {
             layers,
             x,
-            fault,
+            faults,
             eps,
             hidden,
             top_k,
@@ -381,7 +413,7 @@ impl ChainOps for MetalOps<'_, '_> {
                 ids: all_mut(&mut f.ids)?,
                 weights: all_mut(&mut f.weights)?,
                 eps: *eps,
-                fault,
+                fault: &faults[slot],
                 layer: layer_word(l.layer),
             },
         )?;
@@ -390,11 +422,12 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn experts(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), SessionError> {
+        let slot = slot_of(self.pos);
         let Arena {
             layers,
             x,
             h,
-            fault,
+            faults,
             hidden,
             eps,
             n_experts,
@@ -420,7 +453,7 @@ impl ChainOps for MetalOps<'_, '_> {
                 eps: *eps,
                 y: all_mut(h)?,
                 out_stride: EXPERT_K,
-                fault,
+                fault: &faults[slot],
                 layer: layer_word(l.layer),
             },
         )?;
@@ -440,7 +473,7 @@ impl ChainOps for MetalOps<'_, '_> {
                 h: all(h)?,
                 w: all(&f.weights)?,
                 y: &y,
-                fault,
+                fault: &faults[slot],
                 layer: layer_word(l.layer),
             },
         )?;
@@ -450,6 +483,7 @@ impl ChainOps for MetalOps<'_, '_> {
 
     fn head(&mut self, m: usize) -> Result<(), SessionError> {
         Self::one_row(m)?;
+        let slot = slot_of(self.pos);
         let Arena {
             head_w,
             head_norm,
@@ -458,7 +492,7 @@ impl ChainOps for MetalOps<'_, '_> {
             candidates,
             head_ticket,
             step_id,
-            fault,
+            faults,
             eps,
             hidden,
             vocab,
@@ -476,9 +510,9 @@ impl ChainOps for MetalOps<'_, '_> {
                 logits: all_mut(logits)?,
                 candidates: all_mut(candidates)?,
                 ticket: all_mut(head_ticket)?,
-                step_id: all_mut(step_id)?,
+                step_id: step_id.window_mut(Elems(slot), Elems(1))?,
                 eps: *eps,
-                fault,
+                fault: &faults[slot],
                 layer: LAYER_HEAD,
             },
         )?;

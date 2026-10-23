@@ -111,9 +111,10 @@ pub struct DeltaParams<'w> {
     pub z: Window<'w, f32, MetalDevice>,
     /// The norm gain, one value per column. The norm scale is not applied.
     pub norm_w: Window<'w, f32, MetalDevice>,
-    /// Lane words. The kernel reads the word at `lane_at`.
+    /// Lane words. The kernel reads the words at `lane_at` and `lane_to`.
     pub lane: Window<'w, u32, MetalDevice>,
-    /// The recurrent state, read and written in place.
+    /// The recurrent state: the lane the word at `lane_at` names is read, the
+    /// lane the word at `lane_to` names is written.
     pub state: WindowMut<'w, f32, MetalDevice>,
     /// The conv ring, read and written in place.
     pub ring: WindowMut<'w, f32, MetalDevice>,
@@ -135,8 +136,11 @@ pub struct DeltaParams<'w> {
     pub map: HeadMap,
     /// Lanes of the state. Zero is refused.
     pub lanes: usize,
-    /// The lane word this step reads.
+    /// The word of the lane this step reads.
     pub lane_at: usize,
+    /// The word of the lane this step writes. A word naming the lane
+    /// `lane_at`'s names updates that lane in place.
+    pub lane_to: usize,
     /// The layer a raise is recorded in.
     pub layer: u32,
     /// The position window. A step reads one position.
@@ -208,15 +212,16 @@ fn check_windows(p: &DeltaParams<'_>) -> Result<(), DeviceError> {
     check_window_len(WHAT, "ssm a", p.ssm_a.len(), VALUE_HEADS)?;
     check_window_len(WHAT, "z", p.z.len(), z_len)?;
     check_window_len(WHAT, "norm weight", p.norm_w.len(), HEAD_COLS)?;
-    let lane_need = p
-        .lane_at
-        .checked_add(1)
-        .ok_or_else(|| refuse(format!("the lane index {} does not fit", p.lane_at)))?;
-    if p.lane.len().get() < lane_need {
-        return Err(refuse(format!(
-            "the lane window holds {}, the lane index needs {lane_need}",
-            p.lane.len().get()
-        )));
+    for (what, at) in [("read", p.lane_at), ("write", p.lane_to)] {
+        let need = at
+            .checked_add(1)
+            .ok_or_else(|| refuse(format!("the {what} lane index {at} does not fit")))?;
+        if p.lane.len().get() < need {
+            return Err(refuse(format!(
+                "the lane window holds {}, the {what} lane index needs {need}",
+                p.lane.len().get()
+            )));
+        }
     }
     word(WHAT, "the state length", state)?;
     word(WHAT, "the ring length", ring)?;
@@ -240,12 +245,14 @@ impl Kernels {
         check_windows(&p)?;
         let n_k = word(WHAT, "n_k", p.n_k)?;
         let lanes = word(WHAT, "the lane count", p.lanes)?;
-        let lane_at = word(WHAT, "the lane index", p.lane_at)?;
+        let lane_at = word(WHAT, "the read lane index", p.lane_at)?;
+        let lane_to = word(WHAT, "the write lane index", p.lane_to)?;
         let args = [
             n_k.to_ne_bytes(),
             p.map.word().to_ne_bytes(),
             lanes.to_ne_bytes(),
             lane_at.to_ne_bytes(),
+            lane_to.to_ne_bytes(),
             p.layer.to_ne_bytes(),
             p.pos[0].to_ne_bytes(),
             p.eps.to_ne_bytes(),

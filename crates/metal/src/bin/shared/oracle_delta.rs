@@ -249,6 +249,10 @@ pub struct StepIn<'a> {
     pub map: HeadMap,
     /// The lane the step reads. It is inside `lanes`.
     pub lane: u32,
+    /// The lane the step writes. It is inside `lanes`; equal to `lane`, the
+    /// step updates that lane in place, and apart from it the read lane keeps
+    /// its state.
+    pub lane_out: u32,
     /// The position.
     pub pos: u32,
     /// The L2 epsilon.
@@ -421,11 +425,13 @@ fn check_lens(inp: &StepIn<'_>) -> Result<usize, String> {
     if inp.n_k == 0 || !VALUE_HEADS.is_multiple_of(inp.n_k) {
         return Err(format!("n_k {} does not divide the value heads", inp.n_k));
     }
-    if (inp.lane as usize) >= inp.lanes {
-        return Err(format!(
-            "oracle lane {} is past the {} lanes",
-            inp.lane, inp.lanes
-        ));
+    for (what, lane) in [("read", inp.lane), ("write", inp.lane_out)] {
+        if (lane as usize) >= inp.lanes {
+            return Err(format!(
+                "oracle {what} lane {lane} is past the {} lanes",
+                inp.lanes
+            ));
+        }
     }
     Ok(ch)
 }
@@ -433,6 +439,7 @@ fn check_lens(inp: &StepIn<'_>) -> Result<usize, String> {
 struct Head<'a> {
     h: usize,
     lane: usize,
+    lane_out: usize,
     decay: Ev,
     beta: Ev,
     q: &'a [Ev; HEAD_COLS],
@@ -484,7 +491,7 @@ fn column(
             *out.flip = (*out.flip).max(2.0 * (kk[j][i].v * u[j].v).abs());
             sp[j][i] = fma(kk[j][i], u[j], sp[j][i]);
             let key = key_of(j, i);
-            let at = state_index(head.lane, head.h, col, key);
+            let at = state_index(head.lane_out, head.h, col, key);
             out.state[at] = sp[j][i].v;
             out.state_err[at] = sp[j][i].e;
         }
@@ -526,6 +533,7 @@ pub fn step(inp: &StepIn<'_>) -> Result<StepOut, String> {
         ks.push(k);
     }
     let lane = inp.lane as usize;
+    let lane_out = inp.lane_out as usize;
     let g_len = VALUE_HEADS * HEAD_COLS;
     let mut g = vec![0.0; g_len];
     let mut g_err = vec![0.0; g_len];
@@ -544,6 +552,7 @@ pub fn step(inp: &StepIn<'_>) -> Result<StepOut, String> {
         let head = Head {
             h,
             lane,
+            lane_out,
             decay,
             beta,
             q: &qs[kh],

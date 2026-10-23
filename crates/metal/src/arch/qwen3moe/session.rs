@@ -1,16 +1,27 @@
 //! A qwen35moe session on Metal: the file opened into its plan, its arena and
 //! its pipelines, then one token a step.
 //!
-//! A step is host-fed and waited: the host writes the token id into the id
-//! slot, the walk encodes the token on one command buffer, and the step
-//! commits it, waits for it, reads the fault word, then the head's pick. A
-//! raised fault poisons the session: the step returns it by name, decoded to
-//! its layer and sites, and every later step is refused by name until
-//! [`Session::reset`].
+//! A host-fed step ([`StepMode::HostFed`]) writes the token id into the host
+//! id slot, encodes the token on one command buffer, commits it, waits for
+//! it, and reads the token's fault word, then the head's pick. A chain step
+//! ([`StepMode::Chain`]) also commits the next token before it waits, its
+//! embed reading the pick on the device: the token runs ahead of the call
+//! that names it. The next call keeps it when its id is that pick; any other
+//! id breaks the promise, and the token is waited out and dropped, its fault
+//! word cleared if it raised, and replaced by a host-fed token. Nothing is
+//! restored: the dropped token wrote only what its replacement writes again
+//! (its record slot, its cache row, its conv ring row and the delta lane it
+//! writes, not the one it reads). A chain step at the cache's last row
+//! commits nothing ahead.
+//!
+//! A raised fault poisons the session: the step waits out the token ahead,
+//! returns the fault by name, decoded to its layer and sites, and every later
+//! step is refused by name until [`Session::reset`].
 //!
 //! [`Session::step_traced`] is the instrument the gates read nodes through:
-//! the same ops, each on a command buffer of its own, waited, with a hook
-//! after each. It encodes what [`Session::step`] encodes, op for op.
+//! the same ops of a host-fed step, each on a command buffer of its own,
+//! waited, with a hook after each. It encodes what [`Session::step`]
+//! encodes, op for op.
 
 use core::fmt;
 use core::ops::Range;
@@ -29,15 +40,15 @@ use chain::arch::qwen3moe::walk::Walk;
 use gguf::Split;
 use model::arch::models::Mixer;
 
-use super::arena::{Arena, MixerBufs};
+use super::arena::{Arena, MixerBufs, lane_of, slot_of};
 use super::count::Layer;
-use super::ops::MetalOps;
+use super::ops::{Feed, MetalOps};
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
-use crate::kernels::{HEAD_DIM, Kernels};
+use crate::kernels::{HEAD_DIM, Kernels, state_elems};
 use crate::library::Library;
-use crate::stream::MetalStream;
+use crate::stream::{MetalStream, Settled, Signalled};
 
 const WHAT: &str = "qwen35moe session";
 
@@ -105,6 +116,43 @@ pub struct Stepped {
     pub count: EncodeCount,
 }
 
+/// How a step's token reaches the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepMode {
+    /// The id is written into the host id slot; the step commits its token
+    /// and waits for it, and nothing runs ahead.
+    HostFed,
+    /// As host-fed, unless a token runs ahead with this id; either way the
+    /// next token is committed before this one is waited, embedding this
+    /// token's pick on the device.
+    Chain,
+}
+
+/// What the session's steps did with the token ahead, and the host's waits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StepStats {
+    /// The host's waits on the session's stream: every settle and sync.
+    pub waits: u64,
+    /// Tokens committed ahead of the call that names them.
+    pub ahead: u64,
+    /// Tokens ahead a call kept: its id was their embedded pick.
+    pub kept: u64,
+    /// Tokens ahead waited out and dropped: a broken promise, a fault, a
+    /// reset, a traced step.
+    pub discarded: u64,
+    /// Chain steps at the cache's last row, which commit nothing ahead.
+    pub last_row: u64,
+}
+
+/// The token committed ahead of its call.
+struct Ahead {
+    signalled: Signalled,
+    count: EncodeCount,
+    pos: u32,
+    /// The id its embed reads: the pick of the token before it.
+    embeds: u32,
+}
+
 /// One op of the walk, as a traced step names it to its hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -157,6 +205,8 @@ pub enum Node {
 /// What a traced step's hook reads: the arena after an op's work is done.
 pub struct Probe<'a> {
     arena: &'a Arena,
+    /// The delta lane the next token reads.
+    lane: usize,
 }
 
 /// Every value of `b` in `r`. No device work is in flight when a probe or a
@@ -199,7 +249,11 @@ impl Probe<'_> {
             Node::AttnV(l) => read(&a.proj, attn(l)?.v.clone()),
             Node::DeltaG => whole(&a.g),
             Node::DeltaPartials => whole(&a.delta_partials),
-            Node::DeltaState(l) => whole(&delta(l)?.state),
+            Node::DeltaState(l) => {
+                let lane = state_elems(1).ok_or_else(|| refuse("a state lane does not fit"))?;
+                let at = self.lane * lane;
+                read(&delta(l)?.state, at..at + lane)
+            }
             Node::AttnOut => whole(&a.attn),
             Node::KeyRow(l, pos) | Node::ValueRow(l, pos) => {
                 let at = attn(l)?;
@@ -250,6 +304,9 @@ pub struct Session {
     layers: Vec<Layer>,
     pos: u32,
     poisoned: Option<Fault>,
+    /// The token at `pos`, committed by the last chain step.
+    ahead: Option<Ahead>,
+    stats: StepStats,
 }
 
 impl Session {
@@ -313,6 +370,8 @@ impl Session {
             layers,
             pos: 0,
             poisoned: None,
+            ahead: None,
+            stats: StepStats::default(),
         })
     }
 
@@ -372,36 +431,141 @@ impl Session {
         Ok(())
     }
 
-    /// One token: `id` written into the id slot, the walk encoded on one
-    /// command buffer, committed and waited; then the fault word and the
-    /// head's pick.
-    pub fn step(&mut self, id: u32) -> Result<Stepped, SessionError> {
+    /// What the steps did with the token ahead, and the host's waits so far.
+    #[must_use]
+    pub fn stats(&self) -> StepStats {
+        StepStats {
+            waits: self.stream.waits(),
+            ..self.stats
+        }
+    }
+
+    /// One token at the next position, `id` its input; the head's pick is
+    /// returned. A token running ahead with this id is kept; any other is
+    /// waited out and dropped first. In [`StepMode::Chain`] the next token is
+    /// committed before this one is waited, unless this is the cache's last
+    /// row. A call waits for this token alone, and on a broken promise for
+    /// the dropped token before it.
+    pub fn step(&mut self, id: u32, mode: StepMode) -> Result<Stepped, SessionError> {
         self.ready()?;
-        self.arena.id_in.pages().store(0, id, Ordering::Relaxed)?;
+        let (current, count) = match self.ahead.take() {
+            Some(a) if a.embeds == id => {
+                self.stats.kept += 1;
+                (a.signalled, a.count)
+            }
+            ahead => {
+                if let Some(a) = ahead {
+                    self.drop_ahead(a)?;
+                }
+                self.commit(id, self.pos, Feed::Host)?
+            }
+        };
+        // On an error past this point the token at `pos` is waited for and
+        // not landed: its fault word, if it raised, poisons the next step at
+        // `pos`. The first error is the step's; a later one on the same path
+        // is not returned.
+        if mode == StepMode::Chain {
+            let next = self.pos + 1;
+            if (next as usize) < self.arena.ctx {
+                match self.commit(id, next, Feed::Device) {
+                    Ok((signalled, count)) => {
+                        self.stats.ahead += 1;
+                        self.ahead = Some(Ahead {
+                            signalled,
+                            count,
+                            pos: next,
+                            embeds: 0,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = self.stream.settle(current);
+                        return Err(e);
+                    }
+                }
+            } else {
+                self.stats.last_row += 1;
+            }
+        }
+        let settled = match self.stream.settle(current) {
+            Ok(settled) => settled,
+            Err(e) => {
+                if let Some(a) = self.ahead.take() {
+                    let _ = self.drop_ahead(a);
+                }
+                return Err(e.into());
+            }
+        };
+        let stepped = self.land(&settled, count);
+        match (&stepped, self.ahead.as_mut()) {
+            (Ok(s), Some(a)) => a.embeds = s.id,
+            (Err(_), Some(_)) => self.wait_out_ahead(),
+            _ => {}
+        }
+        stepped
+    }
+
+    /// Encode and commit the token at `pos`, signalled: its embed reads the
+    /// host id slot, which `id` is written into first, or the record slot of
+    /// the token before it.
+    fn commit(
+        &mut self,
+        id: u32,
+        pos: u32,
+        feed: Feed,
+    ) -> Result<(Signalled, EncodeCount), SessionError> {
+        if feed == Feed::Host {
+            self.arena.id_in.pages().store(0, id, Ordering::Relaxed)?;
+        }
         let mut recording = self.stream.begin()?;
-        let mut enc = recording.compute_encoder_concurrent()?;
+        let mut enc = recording.token_encoder()?;
         Walk::new(
-            &mut MetalOps::new(&mut enc, &mut self.arena, &self.kernels, self.pos),
+            &mut MetalOps::new(&mut enc, &mut self.arena, &self.kernels, pos, feed),
             &self.plans,
             1,
         )
         .run(1)?;
         let count = enc.count();
         enc.end();
-        self.stream.submit(recording)?;
-        self.finish(count)
+        Ok((self.stream.submit_signalled(recording)?, count))
     }
 
-    /// [`Session::step`] with every op on a command buffer of its own,
-    /// waited, and `hook` called after each with what the op left. The count
-    /// is the sum of the ops' counts: what one encoder of the whole token
-    /// encodes. A hook's error ends the step and is returned; the session
-    /// keeps the work done so far, and its position does not move.
+    /// The token ahead waited out and dropped, its fault word cleared if it
+    /// raised: the token at its position is computed again, from the id the
+    /// call names, and starts clean.
+    fn drop_ahead(&mut self, a: Ahead) -> Result<(), SessionError> {
+        self.stats.discarded += 1;
+        let settled = self.stream.settle(a.signalled)?;
+        let fault = &self.arena.faults[slot_of(a.pos)];
+        if fault.read_settled(&settled)?.is_some() {
+            fault.clear_settled(&settled)?;
+        }
+        Ok(())
+    }
+
+    /// The token ahead waited out and dropped when the token before it
+    /// faulted: the step returns that fault, and [`Session::reset`] clears
+    /// whatever the token ahead raised. Its own failure is not returned.
+    fn wait_out_ahead(&mut self) {
+        if let Some(a) = self.ahead.take() {
+            self.stats.discarded += 1;
+            let _ = self.stream.settle(a.signalled);
+        }
+    }
+
+    /// [`Session::step`] host-fed, with every op on a command buffer of its
+    /// own, waited, and `hook` called after each with what the op left. The
+    /// count is the sum of the ops' counts: what one encoder of the whole
+    /// token encodes. A token running ahead is dropped first. A hook's error
+    /// ends the step and is returned; the session keeps the work done so far,
+    /// and its position does not move.
     pub fn step_traced<H>(&mut self, id: u32, hook: H) -> Result<Stepped, SessionError>
     where
         H: FnMut(Op, &Probe<'_>) -> Result<(), SessionError>,
     {
         self.ready()?;
+        if let Some(a) = self.ahead.take() {
+            self.drop_ahead(a)?;
+        }
         self.arena.id_in.pages().store(0, id, Ordering::Relaxed)?;
         let mut tracer = Tracer {
             stream: &self.stream,
@@ -409,39 +573,61 @@ impl Session {
             arena: &mut self.arena,
             pos: self.pos,
             count: EncodeCount::default(),
+            settled: None,
             hook,
         };
         Walk::new(&mut tracer, &self.plans, 1).run(1)?;
         let count = tracer.count;
-        self.finish(count)
+        let settled = tracer
+            .settled
+            .ok_or_else(|| refuse("a traced step settled no op"))?;
+        self.land(&settled, count)
     }
 
-    /// The step's end: wait, read the fault word (a fault poisons the
-    /// session), read the pick, move the position.
-    fn finish(&mut self, count: EncodeCount) -> Result<Stepped, SessionError> {
-        self.stream.sync()?;
-        if let Some(fault) = self.arena.fault.read(&self.stream)? {
+    /// A settled token's end: its fault word (a fault poisons the session),
+    /// then its pick; the position moves.
+    fn land(&mut self, settled: &Settled, count: EncodeCount) -> Result<Stepped, SessionError> {
+        let slot = slot_of(self.pos);
+        if let Some(fault) = self.arena.faults[slot].read_settled(settled)? {
             self.poisoned = Some(fault);
             return Err(SessionError::Fault(fault));
         }
-        let id = self.arena.step_id.pages().load(0, Ordering::Relaxed)?;
+        let id = self.arena.step_id.pages().load(slot, Ordering::Relaxed)?;
         self.pos += 1;
         Ok(Stepped { id, count })
     }
 
-    /// What the last step left, read as a traced step's hook reads it.
+    /// What the last step left, read as a traced step's hook reads it. A
+    /// token running ahead is still writing the arena, so a probe is refused
+    /// by name while one runs: a host-fed step drops it.
     pub fn probe(&self) -> Result<Probe<'_>, SessionError> {
+        if self.ahead.is_some() {
+            return Err(refuse(format!(
+                "a probe at position {}: the token at it runs ahead; a host-fed step drops it",
+                self.pos
+            )));
+        }
         self.stream.sync()?;
-        Ok(Probe { arena: &self.arena })
+        Ok(Probe {
+            arena: &self.arena,
+            lane: lane_of(self.pos),
+        })
     }
 
     /// Every store back at rest: position 0, the caches, the recurrent
-    /// states and rings, the tickets and the fault word cleared, the poison
-    /// lifted.
+    /// states and rings, the lane words, the tickets, both record slots and
+    /// both fault words cleared, the poison lifted. A token running ahead is
+    /// waited out first.
     pub fn reset(&mut self) -> Result<(), SessionError> {
+        if let Some(a) = self.ahead.take() {
+            self.stats.discarded += 1;
+            self.stream.settle(a.signalled)?;
+        }
         self.stream.sync()?;
-        self.arena.clear_stores();
-        self.arena.fault.clear(&self.stream)?;
+        self.arena.clear_stores()?;
+        for fault in &self.arena.faults {
+            fault.clear(&self.stream)?;
+        }
         self.pos = 0;
         self.poisoned = None;
         Ok(())
@@ -456,6 +642,8 @@ struct Tracer<'s, H> {
     arena: &'s mut Arena,
     pos: u32,
     count: EncodeCount,
+    /// The last op's settle: the head's, once the walk is done.
+    settled: Option<Settled>,
     hook: H,
 }
 
@@ -469,21 +657,26 @@ where
         f: impl FnOnce(&mut MetalOps<'_, '_>) -> Result<(), SessionError>,
     ) -> Result<(), SessionError> {
         let mut recording = self.stream.begin()?;
-        let mut enc = recording.compute_encoder_concurrent()?;
+        let mut enc = recording.token_encoder()?;
         f(&mut MetalOps::new(
             &mut enc,
             self.arena,
             self.kernels,
             self.pos,
+            Feed::Host,
         ))?;
         let c = enc.count();
         enc.end();
-        self.stream.submit(recording)?;
-        self.stream.sync()?;
+        let signalled = self.stream.submit_signalled(recording)?;
+        self.settled = Some(self.stream.settle(signalled)?);
         self.count.groups += c.groups;
         self.count.dispatches += c.dispatches;
         self.count.barriers += c.barriers;
-        (self.hook)(op, &Probe { arena: self.arena })
+        let probe = Probe {
+            arena: self.arena,
+            lane: lane_of(self.pos + 1),
+        };
+        (self.hook)(op, &probe)
     }
 }
 

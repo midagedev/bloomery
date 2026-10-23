@@ -309,8 +309,18 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "delta_roll",
         why: "the state store keeps the value it loaded",
         edits: &[(
-            "state[base + key] = sp[i];",
-            "state[base + key] = s0[i];",
+            "state[base_to + key] = sp[i];",
+            "state[base_to + key] = s0[i];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "delta_lane_in_place",
+        clause: "delta_step",
+        why: "the step writes the lane it read, not the lane its write word names",
+        edits: &[(
+            "uint word_to = lane_buf[args.lane_to];",
+            "uint word_to = lane_buf[args.lane_at];",
             1,
         )],
     },
@@ -338,7 +348,11 @@ pub const MUTANTS: &[Mutant] = &[
         name: "delta_nan_zero",
         clause: "delta_nan",
         why: "a non-finite lane stores zero",
-        edits: &[("state[base + key] = NAN;", "state[base + key] = 0.0f;", 1)],
+        edits: &[(
+            "state[base_to + key] = NAN;",
+            "state[base_to + key] = 0.0f;",
+            1,
+        )],
     },
     Mutant {
         name: "attn_score_scale",
