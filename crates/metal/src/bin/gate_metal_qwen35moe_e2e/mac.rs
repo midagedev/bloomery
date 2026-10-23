@@ -25,10 +25,17 @@
 //!   last position's argmax as the fixture tier takes it, the rows a
 //!   near-tie router flip carries left unheld by the CUDA gate's rule; and
 //!   the traced run's logits and picks equal to the plain steps'.
+//! - `f_deep`: the d1k set's prompt host-fed one id at a time through a
+//!   session of the set's depth, past one segment of keys, then its step
+//!   token traced; every step's count by its live keys (one wait a step, one
+//!   barrier between groups), the device's allocation unmoved and no host
+//!   allocation call in a steady step, every layer's step output within
+//!   [`free::FREE_BAND`] of ik's and the head's pick by its tie rule.
 //!
-//! `--nodes` is a tool, not a clause: the step set's prompt host-fed, then
-//! its step token traced, every named node against ik's, the first past its
-//! band printed. `--ops` is another: each op's wall in the traced step,
+//! `--nodes` is a tool, not a clause: its set's prompt host-fed, then its
+//! step token traced, every named node against ik's, the first past its
+//! band printed (`--set d1k` walks the d1k set at its depth; the step set is
+//! the default). `--ops` is another: each op's wall in the traced step,
 //! the host-fed and chain step medians beside it (`wall.rs`). `--list` prints the clause names; `--only CLAUSE` runs one;
 //! `--mutant NAME` runs the clause that must catch a kernel defect against
 //! kernels compiled with it (`mutants.rs`); `--mutants-all` runs each in a
@@ -53,6 +60,8 @@ use bloomery_metal::library::Library;
 
 #[path = "chain.rs"]
 mod chain;
+#[path = "deep.rs"]
+mod deep;
 #[path = "flip.rs"]
 mod flip;
 #[path = "free.rs"]
@@ -96,6 +105,22 @@ fn model_path() -> Result<PathBuf, String> {
     refset::fixture::first_shard(refset::arch::qwen35moe::ARCH)
         .map(PathBuf::from)
         .map_err(|e| format!("the fixture file: {e}"))
+}
+
+/// The cache rows the `--nodes` walk needs: the step set's depth within one
+/// segment, the d1k set's prompt plus its step token.
+fn nodes_ctx(set: sets::Set) -> Result<usize, String> {
+    match set {
+        sets::Set::Step => Ok(CTX),
+        sets::Set::D1k => {
+            let man = sets::open(set)?;
+            let (pos, step, _) = man
+                .step()
+                .map_err(|e| format!("the d1k set's tokens: {e}"))?;
+            Ok(pos as usize + step.len())
+        }
+        sets::Set::Batch => Err("--nodes walks a step set".to_string()),
+    }
 }
 
 /// Allocation calls the process has made, for `d_count`'s host half: read as
@@ -361,7 +386,14 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 5] = ["d_count", "e_token_id", "b_chain", "c_resume", "a_free"];
+    const NAMES: [&str; 6] = [
+        "d_count",
+        "e_token_id",
+        "b_chain",
+        "c_resume",
+        "a_free",
+        "f_deep",
+    ];
     if args.iter().any(|a| a == "--list") {
         for name in NAMES {
             println!("{name}");
@@ -417,8 +449,31 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let nodes = args.iter().any(|a| a == "--nodes");
+    let nodes_set = match flag(&args, "--set") {
+        None => sets::Set::Step,
+        Some(name) => match name {
+            "step4" => sets::Set::Step,
+            "d1k" => sets::Set::D1k,
+            other => {
+                println!("{GATE}: --set takes step4 or d1k, not {other}");
+                return ExitCode::from(64);
+            }
+        },
+    };
+    if !nodes && flag(&args, "--set").is_some() {
+        println!("{GATE}: --set names the --nodes walk's set");
+        return ExitCode::from(64);
+    }
+    let ctx = match if nodes { nodes_ctx(nodes_set) } else { Ok(CTX) } {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            println!("clause open: FAIL ({e})");
+            return ExitCode::FAILURE;
+        }
+    };
     let t = Instant::now();
-    let mut session = match Session::open(&device, library, &path, CTX) {
+    let mut session = match Session::open(&device, library, &path, ctx) {
         Ok(s) => s,
         Err(e) => {
             println!("clause open: FAIL ({e})");
@@ -426,14 +481,14 @@ pub fn main() -> ExitCode {
         }
     };
     println!(
-        "session: {} ({} layers, ctx {CTX}) open in {:.1} s; token {:?}",
+        "session: {} ({} layers, ctx {ctx}) open in {:.1} s; token {:?}",
         path.display(),
         session.layer_count(),
         t.elapsed().as_secs_f64(),
         session.token_layers()
     );
-    if args.iter().any(|a| a == "--nodes") {
-        return nodes::run(&mut session);
+    if nodes {
+        return nodes::run(&mut session, nodes_set);
     }
     if args.iter().any(|a| a == "--ops") {
         return wall::run(&mut session);
@@ -448,6 +503,7 @@ pub fn main() -> ExitCode {
             "e_token_id" => e_token_id(&mut session),
             "b_chain" => chain::b_chain(&mut session),
             "c_resume" => chain::c_resume(&mut session),
+            "f_deep" => deep::f_deep(&device, library, &path),
             _ => free::a_free(&mut session),
         };
         report.clause(name, result);

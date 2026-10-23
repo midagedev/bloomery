@@ -35,8 +35,8 @@ use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
 use crate::kernels::{
     BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HEAD_GROUPS, HEAD_K, HEAD_VOCAB,
-    HeadMap, KV_HEADS, MAX_SEGMENTS, PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, SEGMENT_KEYS,
-    Segment, VALUE_HEADS, channels, f16_len, out_len, partials_len, qg_len, ring_elems, router,
+    HeadMap, KV_HEADS, MAX_SEGMENTS, PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, Segment,
+    VALUE_HEADS, channels, f16_len, out_len, partials_len, qg_len, ring_elems, router,
     segments_for_keys, state_elems,
 };
 
@@ -475,7 +475,7 @@ fn zeroed<T: bloomery_device::Elem>(
 fn rope_rows(ctx: usize, base: f32) -> Result<Vec<f32>, SessionError> {
     let table = RopeTable::new(&RopeSpec::window(base, ROT))
         .map_err(|e| refuse(format!("the rope table: {e}")))?;
-    let positions = u32::try_from(ctx).expect("a cache of at most SEGMENT_KEYS rows fits u32");
+    let positions = u32::try_from(ctx).expect("the arena checked the cache's rows fit u32");
     let mut out = Vec::with_capacity(ctx * ROT);
     for pos in 0..positions {
         table.push(pos, Direction::Forward, &mut out);
@@ -485,8 +485,10 @@ fn rope_rows(ctx: usize, base: f32) -> Result<Vec<f32>, SessionError> {
 
 impl Arena {
     /// The arena of `plans` (read from `split`, whose description is
-    /// `spec`) at `ctx` positions. A `ctx` past one segment of keys, a shape
-    /// no launch runs, or a type no launch reads is refused by name.
+    /// `spec`) at `ctx` positions, past one segment of keys or within it. A
+    /// `ctx` of no rows or past the file's trained context, a length one of
+    /// the session's buffers does not fit, a shape no launch runs, or a type
+    /// no launch reads is refused by name.
     pub(super) fn open(
         device: &ProtocolObject<dyn MTLDevice>,
         split: &Split,
@@ -494,12 +496,31 @@ impl Arena {
         plans: &[LayerPlan],
         ctx: usize,
     ) -> Result<Arena, SessionError> {
-        if ctx == 0 || ctx > SEGMENT_KEYS {
+        if ctx == 0 {
             return Err(refuse(format!(
-                "a cache of {ctx} rows; this session runs one segment of keys, 1 to \
-                 {SEGMENT_KEYS} rows"
+                "a cache of {ctx} rows; a session holds at least one"
             )));
         }
+        let trained = spec.ctx_train as usize;
+        if ctx > trained {
+            return Err(refuse(format!(
+                "a cache of {ctx} rows; the file was trained to {trained}"
+            )));
+        }
+        // Every length the session holds of `ctx` rows, before any of them
+        // is allocated.
+        let word = ctx_word(ctx)?;
+        let _ = f16_len(ctx)
+            .ok_or_else(|| refuse(format!("the f16 cache of {ctx} rows does not fit")))?;
+        let rope_len = ctx
+            .checked_mul(ROT)
+            .ok_or_else(|| refuse(format!("the rope table of {ctx} rows does not fit")))?;
+        let segments = segments_for_keys(word) as usize;
+        let attn_partials = partials_len(segments).ok_or_else(|| {
+            refuse(format!(
+                "the attention partials of {segments} segments do not fit"
+            ))
+        })?;
         let hidden = spec.hidden as usize;
         let vocab = spec.vocab as usize;
         if hidden != HEAD_K || hidden != router::K {
@@ -544,7 +565,7 @@ impl Arena {
         let base = shared
             .rope_base
             .ok_or_else(|| refuse("no attention layer to read the rope from"))?;
-        let mut rope = MetalBuffer::new(device, Elems(ctx * ROT))?;
+        let mut rope = MetalBuffer::new(device, Elems(rope_len))?;
         rope.write(&rope_rows(ctx, base)?)?;
         let proj = layers
             .iter()
@@ -555,8 +576,6 @@ impl Arena {
             .map(|p| p.out_end)
             .max()
             .ok_or_else(|| refuse("a file of no layer"))?;
-        let attn_partials = partials_len(segments_for_keys(ctx_word(ctx)?) as usize)
-            .ok_or_else(|| refuse("the attention partials do not fit"))?;
         let mut lane = MetalBuffer::new(device, Elems(LANES))?;
         lane.write(&LANE_WORDS)?;
         Ok(Arena {

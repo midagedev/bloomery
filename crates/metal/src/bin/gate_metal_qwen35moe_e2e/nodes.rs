@@ -1,7 +1,8 @@
-//! `--nodes`: the step set's prompt host-fed one token at a time through the
-//! plain step (no store is loaded from the set), then its step token through
-//! the traced step, every named node it can read against ik's dump of the
-//! same node. One line per node: the layer, the name, the relative distance
+//! `--nodes`: its set's prompt host-fed one token at a time through the
+//! plain step (no store is loaded from the set; `--set` names it, the step
+//! set the default), then its step token through the traced step, every
+//! named node it can read against ik's dump of the same node. One line per
+//! node: the layer, the name, the relative distance
 //! (on ik's norm), the largest absolute error and the band; then the first
 //! node past its band, the place a wrong value enters. A router whose picks
 //! differ from ik's at a near tie (clause a's rule) changes every value after
@@ -300,9 +301,9 @@ impl Nodes<'_> {
     }
 }
 
-pub fn run(s: &mut Session) -> ExitCode {
+pub fn run(s: &mut Session, set: Set) -> ExitCode {
     let t0 = Instant::now();
-    match go(s) {
+    match go(s, set) {
         Ok(()) => {
             println!("nodes: one run in {:.1} s", t0.elapsed().as_secs_f64());
             ExitCode::SUCCESS
@@ -314,11 +315,9 @@ pub fn run(s: &mut Session) -> ExitCode {
     }
 }
 
-fn go(s: &mut Session) -> Result<(), String> {
-    let man = sets::open(Set::Step)?;
-    let (pos, step, prompt) = man
-        .step()
-        .map_err(|e| format!("the step set's tokens: {e}"))?;
+fn go(s: &mut Session, set: Set) -> Result<(), String> {
+    let man = sets::open(set)?;
+    let (pos, step, prompt) = man.step().map_err(|e| format!("the set's tokens: {e}"))?;
     let (step, prompt) = (step.to_vec(), prompt.to_vec());
     let [tok] = step[..] else {
         return Err(format!(

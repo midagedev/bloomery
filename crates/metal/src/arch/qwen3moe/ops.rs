@@ -4,7 +4,9 @@
 //!
 //! The DAG, one group per op past the embed: `E | P1 | mixer | out | R | G |
 //! W` for every layer, then `H`. P1 is one dispatch per weight type of the
-//! layer's projections in one group. The FFN norm has no group of its own:
+//! layer's projections in one group. An attention mixer past one segment of
+//! keys is two groups: the flash writes its partials, the barrier, then the
+//! merge folds them into the output. The FFN norm has no group of its own:
 //! the router (R) and the gate-up pair (G) each norm the residual as they
 //! load it. The head is the token's last group and closes no barrier. Every
 //! op only encodes: no wait, no allocation past the launches' own argument
@@ -32,7 +34,7 @@ use crate::kernels::{
     AttentionParams, AttnCache, CONV_TAPS, DeltaParams, EXPERT_K, EXPERT_SLOTS, EmbedParams,
     FoldParams, HEAD_COLS, HEAD_DIM, HEAD_SIMD_GROUPS, HeadNormParams, HeadParams, KV_HEADS,
     Kernels, MatvecParams, Mode, NormOnLoad, PairParams, QUERY_HEADS, ROUTED_IDS, SegParams,
-    SharedPlan, VALUE_HEADS, attention_dispatches, router, segments_for_keys,
+    SharedPlan, VALUE_HEADS, attention_dispatches, partials_len, router, segments_for_keys,
 };
 
 const WHAT: &str = "qwen35moe ops";
@@ -179,6 +181,63 @@ macro_rules! attention_of {
     };
 }
 
+impl MetalOps<'_, '_> {
+    /// The attention launch of layer `l` at `pos`: the one shape both its
+    /// dispatches read, built per dispatch (the windows it holds are `Copy`,
+    /// the parameters are not).
+    fn attn_params(
+        arena: &mut Arena,
+        l: usize,
+        pos: u32,
+        n_keys: u32,
+        segments: u32,
+    ) -> Result<AttentionParams<'_>, SessionError> {
+        let slot = slot_of(pos);
+        let Arena {
+            proj,
+            layers,
+            rope,
+            attn,
+            attn_partials,
+            faults,
+            eps,
+            ctx,
+            ..
+        } = &mut *arena;
+        let a = attention_of!(layers, l);
+        // The arena holds the partials of the cache's whole segment count;
+        // the launch reads and writes the prefix this token's keys take.
+        let parts = partials_len(segments as usize).ok_or_else(|| SessionError::Shape {
+            what: WHAT,
+            detail: format!("the partials of {segments} segments do not fit"),
+        })?;
+        Ok(AttentionParams {
+            head_dim: HEAD_DIM,
+            query_heads: QUERY_HEADS,
+            kv_heads: KV_HEADS,
+            segments: segments as usize,
+            ctx: *ctx,
+            eps: *eps,
+            layer: layer_word(l),
+            pos,
+            n_keys,
+            q: part(proj, &a.q)?,
+            k: part(proj, &a.k)?,
+            v: part(proj, &a.v)?,
+            q_gain: all(&a.q_norm)?,
+            k_gain: all(&a.k_norm)?,
+            rope: all(rope)?,
+            cache: AttnCache::F16 {
+                k: all_mut(&mut a.k_cache)?,
+                v: all_mut(&mut a.v_cache)?,
+            },
+            partials: attn_partials.window_mut(Elems(0), Elems(parts))?,
+            out: all_mut(attn)?,
+            fault: &faults[slot],
+        })
+    }
+}
+
 impl ChainOps for MetalOps<'_, '_> {
     type Error = SessionError;
 
@@ -224,55 +283,16 @@ impl ChainOps for MetalOps<'_, '_> {
         let pos = self.pos;
         let n_keys = pos + 1;
         let segments = segments_for_keys(n_keys);
-        if attention_dispatches(segments) != 1 {
-            return Err(SessionError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "{n_keys} live keys take the merge, which this session does not encode"
-                ),
-            });
-        }
-        let slot = slot_of(self.pos);
-        let Arena {
-            proj,
-            layers,
-            rope,
-            attn,
-            attn_partials,
-            faults,
-            eps,
-            ctx,
-            ..
-        } = &mut *self.arena;
-        let a = attention_of!(layers, l.layer);
-        self.kernels.attention_flash(
-            self.enc,
-            AttentionParams {
-                head_dim: HEAD_DIM,
-                query_heads: QUERY_HEADS,
-                kv_heads: KV_HEADS,
-                segments: segments as usize,
-                ctx: *ctx,
-                eps: *eps,
-                layer: layer_word(l.layer),
-                pos,
-                n_keys,
-                q: part(proj, &a.q)?,
-                k: part(proj, &a.k)?,
-                v: part(proj, &a.v)?,
-                q_gain: all(&a.q_norm)?,
-                k_gain: all(&a.k_norm)?,
-                rope: all(rope)?,
-                cache: AttnCache::F16 {
-                    k: all_mut(&mut a.k_cache)?,
-                    v: all_mut(&mut a.v_cache)?,
-                },
-                partials: all_mut(attn_partials)?,
-                out: all_mut(attn)?,
-                fault: &faults[slot],
-            },
-        )?;
+        let p = Self::attn_params(&mut *self.arena, l.layer, pos, n_keys, segments)?;
+        self.kernels.attention_flash(self.enc, p)?;
         self.close();
+        // Live keys past one segment: the flash wrote partials, and the merge
+        // is their own group, after the barrier.
+        if attention_dispatches(segments) == 2 {
+            let p = Self::attn_params(&mut *self.arena, l.layer, pos, n_keys, segments)?;
+            self.kernels.attention_merge(self.enc, p)?;
+            self.close();
+        }
         Ok(())
     }
 
