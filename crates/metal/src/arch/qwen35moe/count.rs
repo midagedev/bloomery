@@ -72,7 +72,6 @@ const SPLIT: TokenCount = TokenCount {
 /// `live` adds the memory dispatch on attention layers when the keys are
 /// past 64. A folded `ticket` keeps the router and the head one dispatch
 /// each. A count that does not fit `u32` panics by name.
-#[must_use]
 pub(crate) fn token_count(layers: &[Layer], live: LiveKeys, ticket: Ticket) -> TokenCount {
     let mut total = add(embed(), head(ticket));
     for layer in layers {
