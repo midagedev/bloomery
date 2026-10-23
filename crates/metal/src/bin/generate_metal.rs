@@ -5,7 +5,7 @@
 //! file is `$BLOOMERY_REF_MODEL`, as there.
 //!
 //!     generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
-//!                    [--print-ids]
+//!                    [--print-ids] [--profile [N]] [--profile-layers]
 //!
 //! Defaults: N 32, C the smaller of 4096 and the file's `context_length`. A
 //! flag given twice takes its last value. `--prompt` tokenizes the text with
@@ -26,8 +26,17 @@
 //!     prompt_s=<the prompt's wall> prompt_tok_s=<rate> decode_tokens=<count>
 //!     decode_s=<the loop's wall> decode_tok_s=<rate> stop=<eog|length|ctx>
 //!
+//! `--profile [N]` (default N 32; `--profile-layers` implies it) steps N
+//! more tokens after the summary, each group of each token on a command
+//! buffer of its own with its GPU seconds and its bytes read, and prints a
+//! `prof` line a group kind (and a layer, under `--profile-layers`), then
+//! the total beside the run's own decode ms a token, so the gap between the
+//! groups' GPU time and the real step shows.
+//!
 //! The wall and rate lines are development-loop numbers: no lease, no
-//! witness, this Mac whatever else it runs.
+//! witness, this Mac whatever else it runs. The `prof` lines are too: the
+//! profiled token runs one command buffer a group, waited, which the real
+//! step's single buffer does not.
 //!
 //! A bad flag or a bad value is a named error and exit 2; a refusal of the
 //! device, the session or the tokenizer, or a fault the device raised, is a
@@ -47,8 +56,9 @@ mod cli {
     use std::time::Instant;
 
     use bloomery_device::Device;
+    use bloomery_metal::arch::qwen3moe::count::{GroupKind, KINDS};
     use bloomery_metal::arch::qwen3moe::generate::greedy;
-    use bloomery_metal::arch::qwen3moe::session::Session;
+    use bloomery_metal::arch::qwen3moe::session::{ProfileGroup, Session};
     use bloomery_metal::device::MetalDevice;
 
     /// The model file, as the CUDA generate CLIs name it.
@@ -58,14 +68,18 @@ mod cli {
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
+generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers]
   the file is $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
-  and the file's context_length; --print-ids prints the ids, not the text";
+  and the file's context_length; --print-ids prints the ids, not the text;
+  --profile [N] (default 32) steps N more tokens after the summary, each
+  group's GPU time and bytes printed; --profile-layers adds a layer each";
 
     /// The flags that take a value.
     const VALUE_FLAGS: [&str; 4] = ["--prompt", "--tokens", "-n", "--ctx"];
     /// The flags that stand alone.
-    const BARE_FLAGS: [&str; 2] = ["--print-ids", "--help"];
+    const BARE_FLAGS: [&str; 3] = ["--print-ids", "--help", "--profile-layers"];
+    /// The profile tokens' default count.
+    const PROFILE_DEFAULT: usize = 32;
 
     /// What named the prompt: the text the tokenizer encodes, or the ids as
     /// given. The tokenizer's own failures are the run's, not the usage
@@ -75,11 +89,19 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         Ids(Vec<u32>),
     }
 
+    /// What `--profile` asked: how many tokens to step past the summary,
+    /// and whether a layer's line prints beside each kind's.
+    struct Profile {
+        n: usize,
+        layers: bool,
+    }
+
     struct Args {
         prompt: Prompt,
         n: usize,
         ctx: Option<usize>,
         print_ids: bool,
+        profile: Option<Profile>,
         model: PathBuf,
     }
 
@@ -114,6 +136,8 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
     }
 
     /// A flag this CLI does not know, if one sits among the arguments.
+    /// `--profile` stands alone or takes its count, so it eats the next
+    /// argument only when that one names a count.
     fn unknown_flag() -> Option<String> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -121,6 +145,12 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             let a = &args[i];
             if VALUE_FLAGS.contains(&a.as_str()) {
                 i += 2;
+            } else if a == "--profile" {
+                i += if args.get(i + 1).is_some_and(|v| v.parse::<usize>().is_ok()) {
+                    2
+                } else {
+                    1
+                };
             } else if BARE_FLAGS.contains(&a.as_str()) {
                 i += 1;
             } else {
@@ -168,6 +198,39 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             }
         };
         let print_ids = std::env::args().any(|a| a == "--print-ids");
+        // `--profile` stands alone at its default count or takes one; a last
+        // value wins, as for every flag. `--profile-layers` alone implies
+        // the profile.
+        let mut profile_n: Option<usize> = None;
+        {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            for (i, a) in args.iter().enumerate() {
+                if a != "--profile" {
+                    continue;
+                }
+                let n = args
+                    .get(i + 1)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(PROFILE_DEFAULT);
+                profile_n = Some(n);
+            }
+        }
+        let layers = std::env::args().any(|a| a == "--profile-layers");
+        let profile = match (profile_n, layers) {
+            (Some(n), l) => {
+                if n == 0 {
+                    return Err(format!(
+                        "--profile {n}: a profile of no tokens; drop the flag to run none"
+                    ));
+                }
+                Some(Profile { n, layers: l })
+            }
+            (None, true) => Some(Profile {
+                n: PROFILE_DEFAULT,
+                layers: true,
+            }),
+            (None, false) => None,
+        };
         let model = match std::env::var_os(MODEL_ENV) {
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => {
@@ -181,6 +244,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             n: n_gen,
             ctx,
             print_ids,
+            profile,
             model,
         })
     }
@@ -232,6 +296,142 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             }
             let _ = std::io::stdout().flush();
         }
+    }
+
+    /// One accumulator of a kind's (or a kind and layer's) profiled groups.
+    #[derive(Clone, Copy, Default)]
+    struct Acc {
+        groups: u64,
+        gpu_s: f64,
+        bytes: u64,
+    }
+
+    /// The `prof` lines after a run's summary: `p.n` more tokens stepped,
+    /// each group on a command buffer of its own, its GPU seconds and its
+    /// bytes read, one line a kind and (under `p.layers`) a layer, then the
+    /// total beside the run's own decode ms a token. The ids stop nothing
+    /// here: the profile steps on, whatever the run stopped at, until the
+    /// count or the cache's last row.
+    fn profile_run(
+        s: &mut Session,
+        p: &Profile,
+        mut id: u32,
+        decode_ms: f64,
+    ) -> Result<(), String> {
+        let rows = s.ctx() - s.pos() as usize;
+        if rows == 0 {
+            eprintln!(
+                "prof: refused: the cache holds no row past position {}; give --ctx more rows",
+                s.pos()
+            );
+            return Ok(());
+        }
+        let steps = p.n.min(rows);
+        let layers = s.layer_count();
+        // One accumulator a kind and layer (the head's and the embed's sit
+        // at `layers`), filled in place: the first token sizes it, the rest
+        // allocate nothing.
+        let mut acc: Vec<Acc> = vec![Acc::default(); KINDS.len() * (layers + 1)];
+        let mut samples: Vec<ProfileGroup> = Vec::new();
+        let mut ids: Vec<Vec<u32>> = Vec::with_capacity(layers);
+        for _ in 0..steps {
+            let pos = s.pos();
+            id = s
+                .step_profile(id, &mut samples)
+                .map_err(|e| e.to_string())?
+                .id;
+            let probe = s.probe().map_err(|e| e.to_string())?;
+            ids.clear();
+            for l in 0..layers {
+                ids.push(probe.router_ids(l).map_err(|e| e.to_string())?);
+            }
+            for g in &samples {
+                let none: &[u32] = &[];
+                let routed = match g.kind {
+                    GroupKind::GateUp | GroupKind::Down => &ids[g.layer.unwrap_or(0)],
+                    _ => none,
+                };
+                let bytes = s
+                    .group_bytes(g, pos, routed)
+                    .map_err(|e| e.to_string())?
+                    .total();
+                let a = &mut acc[kind_index(g.kind) * (layers + 1) + g.layer.unwrap_or(layers)];
+                a.groups += 1;
+                a.gpu_s += g.gpu_s;
+                a.bytes += bytes;
+            }
+        }
+        eprintln!(
+            "prof tokens={steps} at {}..={} (development-loop numbers: one command buffer a \
+             group, waited; the real step's single buffer is not this)",
+            s.pos() - steps as u32,
+            s.pos() - 1
+        );
+        let kind_total = |kind: GroupKind| -> Acc {
+            let mut t = Acc::default();
+            for l in 0..=layers {
+                let a = &acc[kind_index(kind) * (layers + 1) + l];
+                t.groups += a.groups;
+                t.gpu_s += a.gpu_s;
+                t.bytes += a.bytes;
+            }
+            t
+        };
+        let line = |op: &str, layer: Option<usize>, a: &Acc| {
+            let n = steps as f64;
+            let at = layer.map_or_else(String::new, |l| format!(" layer={l}"));
+            eprintln!(
+                "prof op={op}{at} groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1}",
+                a.groups as f64 / n,
+                a.gpu_s / n * 1e3,
+                a.bytes as f64 / n,
+                if a.gpu_s > 0.0 {
+                    a.bytes as f64 / a.gpu_s / 1e9
+                } else {
+                    0.0
+                },
+            );
+        };
+        let mut total = Acc::default();
+        for &kind in &KINDS {
+            let t = kind_total(kind);
+            if t.groups == 0 {
+                continue;
+            }
+            line(kind.name(), None, &t);
+            total.groups += t.groups;
+            total.gpu_s += t.gpu_s;
+            total.bytes += t.bytes;
+            if p.layers {
+                for l in 0..layers {
+                    let a = &acc[kind_index(kind) * (layers + 1) + l];
+                    if a.groups != 0 {
+                        line(kind.name(), Some(l), a);
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "prof total groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1} decode_ms={:.3}",
+            total.groups as f64 / steps as f64,
+            total.gpu_s / steps as f64 * 1e3,
+            total.bytes as f64 / steps as f64,
+            if total.gpu_s > 0.0 {
+                total.bytes as f64 / total.gpu_s / 1e9
+            } else {
+                0.0
+            },
+            decode_ms,
+        );
+        Ok(())
+    }
+
+    /// `kind`'s place in [`KINDS`].
+    fn kind_index(kind: GroupKind) -> usize {
+        KINDS
+            .iter()
+            .position(|k| *k == kind)
+            .unwrap_or_else(|| panic!("generate_metal: the kind {kind:?} sits in no kind table"))
     }
 
     pub(super) fn run() -> ExitCode {
@@ -306,6 +506,14 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         eprintln!("decode_s={decode_s:.3}");
         eprintln!("decode_tok_s={:.1}", out.tokens() as f64 / decode_s);
         eprintln!("stop={}", out.stop.name());
+        if let Some(p) = &a.profile {
+            let id = *out
+                .ids
+                .last()
+                .ok_or("a profile of no token: the run picked none")?;
+            let decode_ms = decode_s / out.tokens() as f64 * 1e3;
+            profile_run(&mut session, p, id, decode_ms)?;
+        }
         Ok(())
     }
 }

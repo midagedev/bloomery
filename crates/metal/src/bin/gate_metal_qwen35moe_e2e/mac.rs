@@ -45,6 +45,11 @@
 //!   barrier between groups), the device's allocation unmoved and no host
 //!   allocation call in a steady step, every layer's step output within
 //!   [`free::FREE_BAND`] of ik's and the head's pick by its tie rule.
+//! - `p_profile`: the profile step (`Session::step_profile`) against the
+//!   step it instruments, within one segment of keys and past it: the picks
+//!   and last logits equal bit for bit over the same ids, one sample a
+//!   group covering every group the count counts, and the groups' weight
+//!   bytes equal to the file's own tensors walked under the plan's names.
 //!
 //! `--nodes` is a tool, not a clause: its set's prompt host-fed, then its
 //! step token traced, every named node against ik's, the first past its
@@ -86,6 +91,8 @@ mod generate;
 mod mutants;
 #[path = "nodes.rs"]
 mod nodes;
+#[path = "profile.rs"]
+mod profile;
 #[path = "sets.rs"]
 mod sets;
 #[path = "target.rs"]
@@ -404,7 +411,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 8] = [
+    const NAMES: [&str; 9] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -413,6 +420,7 @@ pub fn main() -> ExitCode {
         "t_target",
         "g_generate",
         "f_deep",
+        "p_profile",
     ];
     if args.iter().any(|a| a == "--list") {
         for name in NAMES {
@@ -526,6 +534,7 @@ pub fn main() -> ExitCode {
             "t_target" => target::t_target(&mut session),
             "g_generate" => generate::g_generate(&mut session),
             "f_deep" => deep::f_deep(&device, library, &path),
+            "p_profile" => profile::p_profile(&device, library, &path),
             _ => free::a_free(&mut session),
         };
         report.clause(name, result);

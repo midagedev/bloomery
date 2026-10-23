@@ -121,6 +121,100 @@ fn fit(what: &str, n: Option<u32>) -> u32 {
     }
 }
 
+/// What one group of a token runs: the kinds a profiled token's groups are
+/// tagged with, one kind a group, the groups [`token_count`] counts. P1 is
+/// one kind a mixer; the attention past one segment of keys is two kinds,
+/// the flash and the merge; the gate-up group and the down group each carry
+/// the shared expert's part with the routed picks' — the pair and the fold
+/// run them together, so no kind of the shared expert stands alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GroupKind {
+    /// The token's embedding row.
+    Embed,
+    /// An attention layer's P1: the norm on load and its projections.
+    AttnP1,
+    /// The attention core: the flash over the live keys.
+    AttnFlash,
+    /// The attention merge: the flash's partials folded, past one segment.
+    AttnMerge,
+    /// The attention's output projection back to the residual.
+    AttnOut,
+    /// A delta layer's P1: the norm on load and its projections.
+    DeltaP1,
+    /// The gated delta rule's step.
+    DeltaCore,
+    /// The delta step's head-norm projection back to the residual.
+    DeltaOut,
+    /// The router: the routed logits, the picks and their weights.
+    Router,
+    /// The experts' gate and up, the routed picks' and the shared expert's.
+    GateUp,
+    /// The experts' down, the routed picks' and the shared expert's, folded
+    /// into the residual.
+    Down,
+    /// The head: the logits and the pick.
+    Head,
+}
+
+impl GroupKind {
+    /// The kind's name, the `op=` a profile line prints.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            GroupKind::Embed => "embed",
+            GroupKind::AttnP1 => "attn_p1",
+            GroupKind::AttnFlash => "attn_flash",
+            GroupKind::AttnMerge => "attn_merge",
+            GroupKind::AttnOut => "attn_out",
+            GroupKind::DeltaP1 => "delta_p1",
+            GroupKind::DeltaCore => "delta_core",
+            GroupKind::DeltaOut => "delta_out",
+            GroupKind::Router => "router",
+            GroupKind::GateUp => "gate_up",
+            GroupKind::Down => "down",
+            GroupKind::Head => "head",
+        }
+    }
+}
+
+/// Every kind, in the token's walk order: the order a profile's lines print.
+pub const KINDS: [GroupKind; 12] = [
+    GroupKind::Embed,
+    GroupKind::AttnP1,
+    GroupKind::AttnFlash,
+    GroupKind::AttnMerge,
+    GroupKind::AttnOut,
+    GroupKind::DeltaP1,
+    GroupKind::DeltaCore,
+    GroupKind::DeltaOut,
+    GroupKind::Router,
+    GroupKind::GateUp,
+    GroupKind::Down,
+    GroupKind::Head,
+];
+
+/// The bytes one group of a token moves, by what moves them: the weights
+/// the group's launches read, the activations they read and write, and the
+/// KV or recurrent state they read and write. The byte rule that fills it is
+/// the arena's, beside this table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupBytes {
+    /// The weight bytes the group's launches read.
+    pub weights: u64,
+    /// The activation bytes the group reads and writes.
+    pub acts: u64,
+    /// The KV rows and recurrent state the group reads and writes.
+    pub state: u64,
+}
+
+impl GroupBytes {
+    /// The group's bytes altogether.
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.weights + self.acts + self.state
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::launch_geom;
@@ -265,5 +359,16 @@ mod tests {
                 dispatches: 2
             }
         );
+    }
+
+    #[test]
+    fn kind_names_are_distinct() {
+        for (a, &kind) in KINDS.iter().enumerate() {
+            let name = kind.name();
+            assert!(name.split_ascii_whitespace().count() == 1 && !name.contains('='));
+            for &other in &KINDS[..a] {
+                assert_ne!(name, other.name());
+            }
+        }
     }
 }

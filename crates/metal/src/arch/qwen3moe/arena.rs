@@ -17,7 +17,7 @@
 
 use core::ops::Range;
 
-use bloomery_device::Elems;
+use bloomery_device::{Elem, Elems};
 use chain::arch::qwen3moe::plan::{FfnRoute, LayerPlan, MixerPlan, SharedPlan};
 use chain::arch::qwen3moe::read::file_names;
 use chain::linear::{KHeadMap, LinearShape};
@@ -29,15 +29,15 @@ use model::arch::names;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
 
-use super::count::{Layer, Projection};
+use super::count::{GroupBytes, GroupKind, Layer, Projection};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
 use crate::kernels::{
     BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HEAD_GROUPS, HEAD_K, HEAD_VOCAB,
     HeadMap, KV_HEADS, MAX_SEGMENTS, PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, Segment,
-    VALUE_HEADS, channels, f16_len, out_len, partials_len, qg_len, ring_elems, router,
-    segments_for_keys, state_elems,
+    VALUE_HEADS, attention_dispatches, channels, f16_len, out_len, partials_len, qg_len,
+    ring_elems, router, segments_for_keys, state_elems,
 };
 
 const WHAT: &str = "qwen35moe arena";
@@ -467,6 +467,39 @@ fn zeroed<T: bloomery_device::Elem>(
     Ok(buffer)
 }
 
+/// `n` as the byte rule's u64, a count the arena already holds.
+fn count_u64(n: usize, what: &str) -> u64 {
+    u64::try_from(n).unwrap_or_else(|_| panic!("the byte rule: {what} do not fit u64"))
+}
+
+/// The bytes `n` elements of `T` take.
+fn bytes_of_len<T: Elem>(n: usize) -> u64 {
+    count_u64(n, "elements")
+        * u64::try_from(core::mem::size_of::<T>()).expect("an element's size fits u64")
+}
+
+/// The bytes buffer `b` holds.
+fn bytes_of<T: Elem>(b: &MetalBuffer<T>) -> u64 {
+    bytes_of_len::<T>(b.pages().len().get())
+}
+
+/// Layer `layer`'s attention buffers for the byte rule, or the named
+/// refusal for a layer of the other mixer.
+fn attn_of(layer: &LayerBufs, l: usize, kind: GroupKind) -> Result<&AttnBufs, SessionError> {
+    match &layer.mixer {
+        MixerBufs::Attention(a) => Ok(a),
+        MixerBufs::Delta(_) => Err(refuse(format!("{kind:?}: layer {l} is no attention layer"))),
+    }
+}
+
+/// Layer `layer`'s delta buffers for the byte rule, or the named refusal.
+fn delta_of(layer: &LayerBufs, l: usize, kind: GroupKind) -> Result<&DeltaBufs, SessionError> {
+    match &layer.mixer {
+        MixerBufs::Delta(d) => Ok(d),
+        MixerBufs::Attention(_) => Err(refuse(format!("{kind:?}: layer {l} is no delta layer"))),
+    }
+}
+
 /// The rope table of `ctx` positions: per position, [`ROT`] / 2 pairs
 /// `(cos θ, sin θ)` with θ = `pos · base^(−2i/ROT)`, θ advanced by repeated
 /// multiplication in f32 as ggml's `rope_yarn` does with no YaRN — chain's
@@ -624,6 +657,239 @@ impl Arena {
                 },
             })
             .collect()
+    }
+
+    /// The bytes the group `kind` of layer `layer` of the token at `pos`
+    /// moves: the one owner of the per-group byte rule. `ids` is that
+    /// layer's router ids as the step left them (the routed picks, then the
+    /// shared expert's); the expert groups read them, every other group
+    /// takes none and is refused a slice.
+    ///
+    /// What is counted, each side once: the weights the group's launches
+    /// read (the embedding's one row, each routed pick's slice of its
+    /// stack, every other weight whole); the activations the group reads
+    /// and writes (the residual, the projections' output, the experts'
+    /// rows, the norms, the logits and the router's small outputs); and the
+    /// state the group reads and writes (the attention's key and value
+    /// rows — the live keys read, the token's own row written — and the
+    /// delta state's read and written lanes with the conv ring).
+    pub(super) fn group_bytes(
+        &self,
+        kind: GroupKind,
+        layer: usize,
+        pos: u32,
+        ids: &[u32],
+    ) -> Result<GroupBytes, SessionError> {
+        let f32s = |n: usize| bytes_of_len::<f32>(n);
+        let no_ids = || {
+            (ids.is_empty()).then_some(()).ok_or_else(|| {
+                refuse(format!(
+                    "{kind:?}: router ids belong to the expert groups, which read them"
+                ))
+            })
+        };
+        let bufs = || {
+            self.layers
+                .get(layer)
+                .ok_or_else(|| refuse(format!("{kind:?}: no layer {layer}")))
+        };
+        match kind {
+            GroupKind::Embed => {
+                no_ids()?;
+                let row = bytes_of(&self.embed) / count_u64(self.vocab, "the embedding's rows");
+                if row * count_u64(self.vocab, "the embedding's rows") != bytes_of(&self.embed) {
+                    return Err(refuse(
+                        "the embedding table holds no whole row a vocabulary shares",
+                    ));
+                }
+                Ok(GroupBytes {
+                    weights: row,
+                    // The id slot read, the residual written.
+                    acts: 4 + f32s(self.hidden),
+                    state: 0,
+                })
+            }
+            GroupKind::AttnP1 | GroupKind::DeltaP1 => {
+                no_ids()?;
+                let l = bufs()?;
+                let p1 = match kind {
+                    GroupKind::AttnP1 => &attn_of(l, layer, kind)?.p1,
+                    _ => &delta_of(l, layer, kind)?.p1,
+                };
+                let out_end = p1.parts.iter().map(|p| p.out_end).max().unwrap_or(0);
+                Ok(GroupBytes {
+                    weights: p1.parts.iter().map(|p| bytes_of(&p.weights)).sum::<u64>()
+                        + bytes_of(&p1.norm),
+                    // The residual read, the projection's output written.
+                    acts: f32s(self.hidden) + f32s(out_end),
+                    state: 0,
+                })
+            }
+            GroupKind::AttnFlash => {
+                no_ids()?;
+                let a = attn_of(bufs()?, layer, kind)?;
+                let n_keys = u64::from(pos) + 1;
+                let kv_row = count_u64(KV_HEADS * HEAD_DIM, "a cache row") * 2;
+                let segments = segments_for_keys(pos + 1);
+                let parts = partials_len(segments as usize)
+                    .ok_or_else(|| refuse("the attention partials do not fit"))?;
+                // Within one segment the flash writes the output itself;
+                // past it, it writes the partials the merge folds.
+                let wrote = if attention_dispatches(segments) == 1 {
+                    bytes_of(&self.attn)
+                } else {
+                    f32s(parts)
+                };
+                Ok(GroupBytes {
+                    // The query's and the key's head norms.
+                    weights: 2 * f32s(HEAD_DIM),
+                    // The query with its gate, the rope row, and the flash's
+                    // output.
+                    acts: f32s(a.q.len()) + f32s(ROT) + wrote,
+                    // The live keys and values read, this token's row written.
+                    state: 2 * (n_keys * kv_row + kv_row),
+                })
+            }
+            GroupKind::AttnMerge => {
+                no_ids()?;
+                let segments = segments_for_keys(pos + 1);
+                let parts = partials_len(segments as usize)
+                    .ok_or_else(|| refuse("the attention partials do not fit"))?;
+                Ok(GroupBytes {
+                    weights: 0,
+                    // The partials read, the attention output written.
+                    acts: f32s(parts) + bytes_of(&self.attn),
+                    state: 0,
+                })
+            }
+            GroupKind::AttnOut => {
+                no_ids()?;
+                let a = attn_of(bufs()?, layer, kind)?;
+                Ok(GroupBytes {
+                    weights: bytes_of(&a.out),
+                    // The attention output read, the residual read and written.
+                    acts: bytes_of(&self.attn) + 2 * f32s(self.hidden),
+                    state: 0,
+                })
+            }
+            GroupKind::DeltaCore => {
+                no_ids()?;
+                let d = delta_of(bufs()?, layer, kind)?;
+                let lane = state_elems(1).ok_or_else(|| refuse("a state lane does not fit"))?;
+                Ok(GroupBytes {
+                    weights: bytes_of(&d.conv)
+                        + bytes_of(&d.dt_bias)
+                        + bytes_of(&d.ssm_a)
+                        + bytes_of(&d.ssm_norm),
+                    // The P1 outputs read, the gated numerator and its
+                    // partials written, the ring read and written, the lane
+                    // word read.
+                    acts: f32s(d.qkv.len())
+                        + f32s(d.z.len())
+                        + f32s(d.beta.len())
+                        + f32s(d.alpha.len())
+                        + bytes_of(&self.g)
+                        + bytes_of(&self.delta_partials)
+                        + 2 * bytes_of(&d.ring)
+                        + 4,
+                    // The lane the token reads and the lane it writes.
+                    state: 2 * f32s(lane),
+                })
+            }
+            GroupKind::DeltaOut => {
+                no_ids()?;
+                let d = delta_of(bufs()?, layer, kind)?;
+                Ok(GroupBytes {
+                    weights: bytes_of(&d.out),
+                    // The numerator and its partials read, the residual read
+                    // and written.
+                    acts: bytes_of(&self.g)
+                        + bytes_of(&self.delta_partials)
+                        + 2 * f32s(self.hidden),
+                    state: 0,
+                })
+            }
+            GroupKind::Router => {
+                no_ids()?;
+                let f = &bufs()?.ffn;
+                Ok(GroupBytes {
+                    weights: bytes_of(&f.gate_inp)
+                        + bytes_of(&f.gate_inp_shexp)
+                        + bytes_of(&f.norm),
+                    // The residual read; the logits, the ids, the weights,
+                    // the partials and the ticket written.
+                    acts: f32s(self.hidden)
+                        + bytes_of(&f.logits)
+                        + bytes_of(&f.ids)
+                        + bytes_of(&f.weights)
+                        + bytes_of(&f.partials)
+                        + 4,
+                    state: 0,
+                })
+            }
+            GroupKind::GateUp | GroupKind::Down => {
+                let f = &bufs()?.ffn;
+                let picks = self.top_k;
+                if ids.len() != picks + 1 {
+                    return Err(refuse(format!(
+                        "{kind:?}: {} router ids; the picks, then the shared expert's, are {}",
+                        ids.len(),
+                        picks + 1
+                    )));
+                }
+                let n = count_u64(self.n_experts, "the experts");
+                let expert = |stack: &MetalBuffer<u8>| -> Result<u64, SessionError> {
+                    let whole = bytes_of(stack);
+                    let slice = whole / n;
+                    if slice * n != whole {
+                        return Err(refuse(
+                            "an expert stack holds no whole slice an expert takes",
+                        ));
+                    }
+                    Ok(slice)
+                };
+                // A pick reads its expert's slice of every stack it runs; the
+                // shared expert's parts run with the picks'.
+                let picks = count_u64(picks, "the picks");
+                let (weights, acts) = match kind {
+                    GroupKind::GateUp => (
+                        picks * (expert(&f.gate)? + expert(&f.up)?)
+                            + bytes_of(&f.shexp_gate)
+                            + bytes_of(&f.shexp_up),
+                        // The residual normed as it is loaded, the ids read,
+                        // the experts' rows written.
+                        f32s(self.hidden)
+                            + bytes_of(&f.norm)
+                            + 4 * count_u64(ids.len(), "ids")
+                            + bytes_of(&self.h),
+                    ),
+                    _ => (
+                        picks * expert(&f.down)? + bytes_of(&f.shexp_down),
+                        // The experts' rows and their weights read, the
+                        // residual read and written.
+                        bytes_of(&self.h) + bytes_of(&f.weights) + 2 * f32s(self.hidden),
+                    ),
+                };
+                Ok(GroupBytes {
+                    weights,
+                    acts,
+                    state: 0,
+                })
+            }
+            GroupKind::Head => {
+                no_ids()?;
+                Ok(GroupBytes {
+                    weights: bytes_of(&self.head_w) + bytes_of(&self.head_norm),
+                    // The residual read, the logits, the candidates and the
+                    // pick written.
+                    acts: f32s(self.hidden)
+                        + bytes_of(&self.logits)
+                        + bytes_of(&self.candidates)
+                        + 4,
+                    state: 0,
+                })
+            }
+        }
     }
 
     /// Every store a token sequence writes back to its state at rest: the
