@@ -461,17 +461,17 @@ impl Device for Gpu {
         self.ctx.bind_to_thread().map_err(cuda)?;
         // SAFETY: the destination is the window's `bytes` bytes of a live
         // buffer of this context (checked above); the source is `from`,
-        // exactly `bytes` bytes (its length checked above), which the event
-        // below outlives: the call waits for the copy before it returns; the
+        // exactly `bytes` bytes (its length checked above), borrowed until
+        // the stream wait below, the call's only step after the enqueue; the
         // context is current on this thread (bound above).
         let rc =
             unsafe { sys::cuMemcpyHtoDAsync_v2(ptr, from.as_ptr().cast(), bytes, s.0.cu_stream()) };
         graph::cu(rc, "cuMemcpyHtoDAsync_v2 (Device::write)")?;
         // `s`'s work before the copy is done (waited for above), so this
-        // wait is the copy's alone: it has no bound, because `from` is
-        // borrowed only for the call.
-        let copied = s.0.record_event(None).map_err(cuda)?;
-        copied.synchronize().map_err(cuda)
+        // wait is the copy's alone. It is the stream's own wait, with no
+        // fallible setup between the enqueue and it: `from` is borrowed only
+        // for the call, so no return may come before the copy has landed.
+        s.0.synchronize().map_err(cuda)
     }
 
     fn copy<T: Elem>(
