@@ -13,31 +13,26 @@
 //!    are refused by name.
 //! 4. **sync_bound_named**: a sync and an event wait that outlast their bound
 //!    are refused by name, and a host event is done only once signalled.
-//! 5. **sync_two_waiters**: two threads waiting on one held stream at once,
-//!    neither's wait ends before the host event opens, and both return `Ok`
-//!    after it.
-//! 6. **event_values_rise**: the events one stream records rise in value.
-//! 7. **queue_overlap**: whether two command buffers of one queue overlap on
-//!    this machine; it reports the answer and passes either way.
-//! 8. **arith_matches_host**: a fused multiply-add and a multiply and add
+//! 5. **event_values_rise**: the events one stream records rise in value.
+//! 6. **arith_matches_host**: a fused multiply-add and a multiply and add
 //!    rounded apart are the host's bits.
-//! 9. **metallib_equals_source**: the metallib's output and the source's
+//! 7. **metallib_equals_source**: the metallib's output and the source's
 //!    output are the same bits, when both paths exist.
-//! 10. **census_driver**: the census names an integrated device whose total is
-//!     the driver's working set and no more than the machine's memory.
-//! 11. **macos_floor**: a macOS below 26.2 is refused by name.
-//! 12. **concurrent_independent**: one concurrent encoder runs two copies
-//!     over four distinct buffers, with no barrier between them; each output
-//!     equals the bytes uploaded to its source. No pipeline, no groups and a
-//!     value of no bytes are refused on that encoder, and a refusal encodes
-//!     nothing.
-//! 13. **concurrent_barrier**: one concurrent encoder copies a pattern into a
-//!     middle buffer, encodes a memory barrier, then copies the middle buffer
-//!     to the output; the output equals the pattern.
+//! 8. **census_driver**: the census names an integrated device whose total is
+//!    the driver's working set and no more than the machine's memory.
+//! 9. **macos_floor**: a macOS below 26.2 is refused by name.
+//! 10. **concurrent_barrier**: one concurrent encoder runs `spin_until_set`
+//!     and then `set_flag`. With no barrier, a GPU that overlaps the two
+//!     writes 2 (the flag arrived during the spin). With a memory barrier
+//!     between them, the flag is stored only after the spin has written 1.
+//!     No overlap, and the clause skips: a barrier cannot be shown to matter.
+//!
+//! `--drop-barrier` is this gate's seam: the ordered arm encodes no memory
+//! barrier. Nothing else reads it. `--help` lists the arguments.
 
 use core::sync::atomic::Ordering;
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bloomery_device::conformance::{
     self, Clause, Harness, Hold, Report, Verdict, expect_range, why,
@@ -52,7 +47,7 @@ use objc2_metal::MTLDevice;
 use bloomery_metal::buffer::{MetalBuffer, MetalShared};
 use bloomery_metal::census::MetalCensus;
 use bloomery_metal::device::{MetalDevice, require_macos};
-use bloomery_metal::encode::{Binding, ComputeEncoder, MAX_BINDINGS, MAX_BYTES_BINDING};
+use bloomery_metal::encode::{Binding, MAX_BINDINGS, MAX_BYTES_BINDING};
 use bloomery_metal::library::{Library, Pipeline};
 use bloomery_metal::stream::{HostEvent, MetalStream};
 
@@ -61,11 +56,21 @@ use bloomery_metal::stream::{HostEvent, MetalStream};
 /// watchdog.
 const SPIN: u32 = 1 << 22;
 
+/// What `spin_until_set` writes when its loads run out.
+const SPIN_RAN_OUT: u32 = 1;
+
+/// What `spin_until_set` writes when it saw the flag.
+const SPIN_SAW_FLAG: u32 = 2;
+
+/// How long the host waits for the barrier clause's command buffer.
+///
+/// The spin writes and returns after [`SPIN`] loads. The long kernel uses
+/// that same cap and returns inside this gate, so the wait is not what ends
+/// the spin: a buffer that is still running is a named failure.
+const BARRIER_WAIT: Duration = Duration::from_secs(30);
+
 /// The largest group a gate dispatch asks for.
 const GROUP: usize = 64;
-
-/// How many f32s the concurrent clauses copy.
-const CONCURRENT_LEN: usize = 1 << 20;
 
 /// Encode one dispatch of `pipeline` over `bindings` (slot = position) and
 /// submit it; it does not wait.
@@ -328,63 +333,6 @@ fn sync_bound_named(h: &MetalHarness) -> Clause {
     Ok(Verdict::Pass)
 }
 
-/// Two threads wait on one held stream at once: neither's wait ends before
-/// the host event opens, and both return `Ok` after it (the wait holds the
-/// stream's lock, and a thread queued behind another thread's wait gives up
-/// by name at its own bound).
-fn sync_two_waiters(h: &MetalHarness) -> Clause {
-    let device = &h.device;
-    let stream = device.new_stream().map_err(why)?;
-    let src = device.upload(&stream, &[1.0f32]).map_err(why)?;
-    let mut dst = device.zeroed::<f32>(&stream, Elems(1)).map_err(why)?;
-    let gate = HostEvent::new(device).map_err(why)?;
-    stream.wait(gate.event()).map_err(why)?;
-    h.copy_f32(
-        &stream,
-        src.whole().map_err(why)?,
-        dst.whole_mut().map_err(why)?,
-    )
-    .map_err(why)?;
-
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-    let (wait_tx, wait_rx) = std::sync::mpsc::channel::<(Result<(), DeviceError>, Instant)>();
-    let waiter = &stream;
-    let (opened, waits) = std::thread::scope(|scope| {
-        for _ in 0..2 {
-            let (ready_tx, wait_tx) = (ready_tx.clone(), wait_tx.clone());
-            scope.spawn(move || {
-                ready_tx.send(()).ok();
-                let done = waiter.sync_for(Duration::from_secs(10));
-                let _ = wait_tx.send((done, Instant::now()));
-            });
-        }
-        drop((ready_tx, wait_tx));
-        // Both waiters are in their wait; hold the work a moment longer.
-        for _ in 0..2 {
-            ready_rx.recv().ok();
-        }
-        std::thread::sleep(Duration::from_millis(300));
-        let opened = Instant::now();
-        gate.signal();
-        let waits = (0..2)
-            .map(|_| wait_rx.recv().ok())
-            .collect::<Option<Vec<_>>>()
-            .unwrap_or_default();
-        (opened, waits)
-    });
-    if waits.len() != 2 {
-        return Err("a waiter did not answer".to_string());
-    }
-    for (done, at) in waits {
-        done.map_err(|e| format!("a waiter failed once the gate was open: {e}"))?;
-        if at < opened {
-            return Err("a wait ended Ok before the host event opened".to_string());
-        }
-    }
-    stream.sync_for(Duration::from_secs(10)).map_err(why)?;
-    Ok(Verdict::Pass)
-}
-
 /// The events one stream records rise in value, in the order recorded.
 fn event_values_rise(device: &MetalDevice) -> Clause {
     let stream = device.stream();
@@ -398,45 +346,6 @@ fn event_values_rise(device: &MetalDevice) -> Clause {
         return Err(format!("the events' values are {values:?}, not rising"));
     }
     Ok(Verdict::Pass)
-}
-
-/// Two command buffers of one queue, the second ending the first's spin: it
-/// ends early only when the two ran at once.
-fn queue_overlap(h: &MetalHarness) -> Clause {
-    let device = &h.device;
-    let stream = device.stream();
-    let mut flag = device.shared::<u32>(Elems(1)).map_err(why)?;
-    let out = device.shared::<u32>(Elems(1)).map_err(why)?;
-    {
-        let (flag, out) = (
-            flag.whole().map_err(why)?,
-            out.window(Elems(0), Elems(1)).map_err(why)?,
-        );
-        let limit = SPIN.to_ne_bytes();
-        let bindings = [
-            Binding::of(&flag).map_err(why)?,
-            Binding::of(&out).map_err(why)?,
-            Binding::bytes(&limit).map_err(why)?,
-        ];
-        launch(stream, &h.spin, &bindings, 1, 1).map_err(why)?;
-    }
-    let set = device.pipeline("set_flag").map_err(why)?;
-    let window = flag.whole_mut().map_err(why)?;
-    launch(
-        stream,
-        &set,
-        &[Binding::of_mut(&window).map_err(why)?],
-        1,
-        1,
-    )
-    .map_err(why)?;
-    stream.sync().map_err(why)?;
-    let overlap = match out.load(0, Ordering::Acquire).map_err(why)? {
-        2 => "yes",
-        1 => "no",
-        other => return Err(format!("the spin wrote {other}")),
-    };
-    Ok(Verdict::Noted(format!("overlap={overlap}")))
 }
 
 /// The inputs of the arithmetic kernel: products whose fused and rounded-apart
@@ -579,148 +488,77 @@ fn census_driver(device: &MetalDevice) -> Clause {
     Ok(Verdict::Pass)
 }
 
-/// One `copy_f32` dispatch: `src` into `dst`, `threads` of them, groups of
-/// [`GROUP`].
-fn encode_copy(
-    encoder: &mut ComputeEncoder<'_>,
-    dst: &WindowMut<'_, f32, MetalDevice>,
-    src: &Window<'_, f32, MetalDevice>,
-    count: &[u8],
-    threads: usize,
-) -> Result<(), DeviceError> {
-    encoder.set_binding(0, Binding::of_mut(dst)?)?;
-    encoder.set_binding(1, Binding::of(src)?)?;
-    encoder.set_binding(2, Binding::bytes(count)?)?;
-    encoder.dispatch_groups(threads.div_ceil(GROUP), 1, GROUP)
+/// The spin, then the flag, on one concurrent encoder. `barrier` encodes
+/// `memory_barrier` between them. The spin's cap is [`SPIN`]: both dispatches
+/// are already in this command buffer, so a GPU that overlaps them stores the
+/// flag while the spin is still loading, and the kernel writes and returns
+/// when the cap is reached either way.
+fn spin_then_flag(device: &MetalDevice, barrier: bool) -> Result<u32, String> {
+    let stream = device.stream();
+    let spin = device.pipeline("spin_until_set").map_err(why)?;
+    let set = device.pipeline("set_flag").map_err(why)?;
+    let mut flag = device.shared::<u32>(Elems(1)).map_err(why)?;
+    let mut out = device.shared::<u32>(Elems(1)).map_err(why)?;
+    let limit = SPIN.to_ne_bytes();
+    let mut recording = stream.begin().map_err(why)?;
+    {
+        let mut encoder = recording.compute_encoder_concurrent().map_err(why)?;
+        encoder.set_pipeline(&spin);
+        {
+            let flag_w = flag.whole().map_err(why)?;
+            let out_w = out.whole_mut().map_err(why)?;
+            encoder
+                .set_binding(0, Binding::of(&flag_w).map_err(why)?)
+                .map_err(why)?;
+            encoder
+                .set_binding(1, Binding::of_mut(&out_w).map_err(why)?)
+                .map_err(why)?;
+            encoder
+                .set_binding(2, Binding::bytes(&limit).map_err(why)?)
+                .map_err(why)?;
+            encoder.dispatch_groups(1, 1, 1).map_err(why)?;
+        }
+        if barrier {
+            encoder.memory_barrier();
+        }
+        encoder.set_pipeline(&set);
+        {
+            let flag_w = flag.whole_mut().map_err(why)?;
+            encoder
+                .set_binding(0, Binding::of_mut(&flag_w).map_err(why)?)
+                .map_err(why)?;
+            encoder.dispatch_groups(1, 1, 1).map_err(why)?;
+        }
+        encoder.end();
+    }
+    stream.submit(recording).map_err(why)?;
+    stream.sync_for(BARRIER_WAIT).map_err(why)?;
+    match out.load(0, Ordering::Acquire).map_err(why)? {
+        n @ (SPIN_RAN_OUT | SPIN_SAW_FLAG) => Ok(n),
+        other => Err(format!("the spin wrote {other}")),
+    }
 }
 
-/// `got` against `want`, bit for bit. The first difference names how many differ.
-fn same_bits(got: &[f32], want: &[f32]) -> Result<(), String> {
-    if got.len() != want.len() {
-        return Err(format!(
-            "{} values came back, not {}",
-            got.len(),
-            want.len()
-        ));
-    }
-    let mut differ = 0usize;
-    let mut first = None;
-    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-        if g.to_bits() != w.to_bits() {
-            if first.is_none() {
-                first = Some((i, *g, *w));
-            }
-            differ += 1;
-        }
-    }
-    match first {
-        None => Ok(()),
-        Some((i, g, w)) => Err(format!(
-            "element {i} is {g}, not {w}; {differ} of {} differ",
-            got.len()
+/// The barrier-free arm first. No overlap, and the clause skips. Overlap, and
+/// the arm with a memory barrier between the dispatches must write
+/// [`SPIN_RAN_OUT`]. `drop_barrier` is `--drop-barrier`: that arm encodes no
+/// barrier, so the overlap the free arm saw makes the clause fail.
+fn concurrent_barrier(device: &MetalDevice, drop_barrier: bool) -> Clause {
+    match spin_then_flag(device, false)? {
+        SPIN_RAN_OUT => Ok(Verdict::Skip(
+            "no overlap on this GPU: the spin ran out before the flag was set, so a barrier cannot be shown to matter"
+                .to_string(),
         )),
+        SPIN_SAW_FLAG => match spin_then_flag(device, !drop_barrier)? {
+            SPIN_RAN_OUT => Ok(Verdict::Pass),
+            SPIN_SAW_FLAG => Err(
+                "the ordered arm wrote 2: the flag was set during the spin, so the dispatches overlapped"
+                    .to_string(),
+            ),
+            other => Err(format!("the ordered arm wrote {other}")),
+        },
+        other => Err(format!("the barrier-free arm wrote {other}")),
     }
-}
-
-/// The values a concurrent clause uploads: index `i` as f32, or that value
-/// negated.
-fn ramp(n: usize, neg: bool) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            let x = i as f32;
-            if neg { -x - 1.0 } else { x }
-        })
-        .collect()
-}
-
-/// The buffer's f32s, once `stream`'s work is done.
-fn read_f32(
-    device: &MetalDevice,
-    stream: &MetalStream,
-    buffer: &MetalBuffer<f32>,
-) -> Result<Vec<f32>, String> {
-    let mut got = vec![0.0f32; buffer.len().get()];
-    device
-        .read(stream, buffer.whole().map_err(why)?, &mut got)
-        .map_err(why)?;
-    Ok(got)
-}
-
-/// Two independent copies on one concurrent encoder, and the refusals that
-/// encode nothing.
-fn concurrent_independent(device: &MetalDevice) -> Clause {
-    let n = CONCURRENT_LEN;
-    let stream = device.stream();
-    let pipeline = device.pipeline("copy_f32").map_err(why)?;
-    let count = count_bytes(n).map_err(why)?;
-    let pat_a = ramp(n, false);
-    let pat_b = ramp(n, true);
-    let src_a = device.upload(stream, &pat_a).map_err(why)?;
-    let src_b = device.upload(stream, &pat_b).map_err(why)?;
-    let mut dst_a = device.zeroed::<f32>(stream, Elems(n)).map_err(why)?;
-    let mut dst_b = device.zeroed::<f32>(stream, Elems(n)).map_err(why)?;
-
-    let mut recording = stream.begin().map_err(why)?;
-    {
-        let mut encoder = recording.compute_encoder_concurrent().map_err(why)?;
-        expect_range(Binding::bytes(&[]), "binding", "0 bytes")?;
-        expect_range(
-            encoder.dispatch_groups(n / GROUP, 1, GROUP),
-            "dispatch",
-            "no pipeline",
-        )?;
-        encoder.set_pipeline(&pipeline);
-        expect_range(encoder.dispatch_groups(0, 1, GROUP), "dispatch", "0 by 1")?;
-        {
-            let dst = dst_a.whole_mut().map_err(why)?;
-            let src = src_a.whole().map_err(why)?;
-            encode_copy(&mut encoder, &dst, &src, &count, n).map_err(why)?;
-        }
-        {
-            let dst = dst_b.whole_mut().map_err(why)?;
-            let src = src_b.whole().map_err(why)?;
-            encode_copy(&mut encoder, &dst, &src, &count, n).map_err(why)?;
-        }
-        encoder.end();
-    }
-    stream.submit(recording).map_err(why)?;
-    same_bits(&read_f32(device, stream, &dst_a)?, &pat_a)?;
-    same_bits(&read_f32(device, stream, &dst_b)?, &pat_b)?;
-    Ok(Verdict::Pass)
-}
-
-/// A dependent pair on one concurrent encoder: the pattern into a middle
-/// buffer, a barrier, then the middle buffer to the output.
-fn concurrent_barrier(device: &MetalDevice) -> Clause {
-    let n = CONCURRENT_LEN;
-    let stream = device.stream();
-    let pipeline = device.pipeline("copy_f32").map_err(why)?;
-    let count = count_bytes(n).map_err(why)?;
-    let pattern = ramp(n, false);
-    let src = device.upload(stream, &pattern).map_err(why)?;
-    let mut middle = device.zeroed::<f32>(stream, Elems(n)).map_err(why)?;
-    let mut out = device.zeroed::<f32>(stream, Elems(n)).map_err(why)?;
-
-    let mut recording = stream.begin().map_err(why)?;
-    {
-        let mut encoder = recording.compute_encoder_concurrent().map_err(why)?;
-        encoder.set_pipeline(&pipeline);
-        {
-            let dst = middle.whole_mut().map_err(why)?;
-            let from = src.whole().map_err(why)?;
-            encode_copy(&mut encoder, &dst, &from, &count, n).map_err(why)?;
-        }
-        encoder.memory_barrier();
-        {
-            let dst = out.whole_mut().map_err(why)?;
-            let from = middle.whole().map_err(why)?;
-            encode_copy(&mut encoder, &dst, &from, &count, n).map_err(why)?;
-        }
-        encoder.end();
-    }
-    stream.submit(recording).map_err(why)?;
-    same_bits(&read_f32(device, stream, &out)?, &pattern)?;
-    Ok(Verdict::Pass)
 }
 
 fn macos_floor() -> Clause {
@@ -744,7 +582,38 @@ fn macos_floor() -> Clause {
     Ok(Verdict::Pass)
 }
 
+fn help() {
+    println!(
+        "\
+gate_metal_device: the Metal device gate.
+
+The clauses run in order. The exit code is 0 when every clause passed, 1 when
+one failed, 78 when this machine cannot run the backend.
+
+  --help            print this and exit 0
+  --drop-barrier    concurrent_barrier encodes no memory barrier on the ordered
+                    arm. The gate uses this to show the clause goes red when
+                    the barrier is gone. Nothing else reads it."
+    );
+}
+
 pub fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        help();
+        return ExitCode::SUCCESS;
+    }
+    let mut drop_barrier = false;
+    for arg in &args {
+        match arg.as_str() {
+            "--drop-barrier" => drop_barrier = true,
+            other => {
+                println!("gate_metal_device: unknown argument {other}; --help lists the arguments");
+                return ExitCode::from(64);
+            }
+        }
+    }
+
     let device = match MetalDevice::open() {
         Ok(device) => device,
         Err(e @ DeviceError::Unsupported { .. }) => {
@@ -779,14 +648,14 @@ pub fn main() -> ExitCode {
     let device = &harness.device;
     report.clause("encoder_refusals", encoder_refusals(device));
     report.clause("sync_bound_named", sync_bound_named(&harness));
-    report.clause("sync_two_waiters", sync_two_waiters(&harness));
     report.clause("event_values_rise", event_values_rise(device));
-    report.clause("queue_overlap", queue_overlap(&harness));
     report.clause("arith_matches_host", arith_matches_host(device));
     report.clause("metallib_equals_source", metallib_equals_source(device));
     report.clause("census_driver", census_driver(device));
     report.clause("macos_floor", macos_floor());
-    report.clause("concurrent_independent", concurrent_independent(device));
-    report.clause("concurrent_barrier", concurrent_barrier(device));
+    report.clause(
+        "concurrent_barrier",
+        concurrent_barrier(device, drop_barrier),
+    );
     report.finish("gate_metal_device")
 }

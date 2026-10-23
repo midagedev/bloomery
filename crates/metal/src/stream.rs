@@ -5,9 +5,7 @@
 //! and committed with [`MetalStream::submit`], which also registers it: the
 //! stream waits for exactly the buffers it submitted, and no other path
 //! commits one. `record` and `wait` are signal-only and wait-only command
-//! buffers of the same queue. Two command buffers of one queue did not overlap
-//! on the machine the gate measured (its `queue_overlap` clause reports the
-//! answer on every machine), so the queue orders a signal-only buffer after
+//! buffers of the same queue. The queue orders a signal-only buffer after
 //! the work submitted before it and a wait-only buffer before the work
 //! submitted after it; `event_record_orders` and `event_wait_holds` are the
 //! clauses that fail where that does not hold.
@@ -16,6 +14,7 @@ use core::time::Duration;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -88,6 +87,84 @@ impl Recording<'_> {
     /// be submitted until the encoder ends.
     pub fn compute_encoder_concurrent(&mut self) -> Result<ComputeEncoder<'_>, DeviceError> {
         ComputeEncoder::concurrent(&self.buffer)
+    }
+}
+
+impl Recording<'_> {
+    /// A handle on this recording's GPU stamps, read once
+    /// [`MetalStream::submit`] has committed it and the GPU has run it.
+    #[must_use]
+    pub fn stamps(&self) -> GpuStamps {
+        GpuStamps(self.buffer.clone())
+    }
+}
+
+/// The GPU's own start and end stamps of one recording's command buffer.
+pub struct GpuStamps(Retained<ProtocolObject<dyn MTLCommandBuffer>>);
+
+/// What [`GpuStamps::interval`] saw within its wait.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GpuInterval {
+    /// The buffer completed: the seconds the GPU ran it.
+    Ran(f64),
+    /// The buffer was still running when the wait ended.
+    StillRunning,
+}
+
+impl GpuStamps {
+    /// `GPUEndTime` minus `GPUStartTime` once the buffer has completed, polled
+    /// for at most `wait`. The stamps are the driver's record of when the GPU
+    /// ran the buffer, so a host that reads them late reads the same interval.
+    /// A buffer that failed, or completed with no stamps or a non-positive
+    /// interval, is refused by name.
+    pub fn interval(&self, wait: Duration) -> Result<GpuInterval, DeviceError> {
+        let refuse = |detail: String| DeviceError::backend("command buffer", detail);
+        let started = Instant::now();
+        let status = loop {
+            let status = self.0.status();
+            if status == MTLCommandBufferStatus::Completed
+                || status == MTLCommandBufferStatus::Error
+            {
+                break status;
+            }
+            if started.elapsed() > wait {
+                return Ok(GpuInterval::StillRunning);
+            }
+            std::thread::sleep(POLL);
+        };
+        if status == MTLCommandBufferStatus::Error {
+            let detail = self.0.error().map_or_else(
+                || "the command buffer failed".to_string(),
+                |err| err.localizedDescription().to_string(),
+            );
+            return Err(refuse(format!(
+                "the command buffer failed on the GPU: {detail}"
+            )));
+        }
+        // The typed getters sit behind objc2-metal's `objc2-core-foundation`
+        // feature, which this crate does not enable; the selectors are the
+        // command buffer's own.
+        // SAFETY: `GPUStartTime` and `GPUEndTime` are MTLCommandBuffer's
+        // getters, each returning a `CFTimeInterval` (`f64`), sent to a live
+        // retained command buffer that has completed.
+        let (start, end): (f64, f64) = unsafe {
+            (
+                msg_send![&*self.0, GPUStartTime],
+                msg_send![&*self.0, GPUEndTime],
+            )
+        };
+        if start == 0.0 || end == 0.0 {
+            return Err(refuse(
+                "the command buffer completed and reports no GPU start or end time".to_string(),
+            ));
+        }
+        let gpu = end - start;
+        if !(gpu.is_finite() && gpu > 0.0) {
+            return Err(refuse(format!(
+                "the GPU's own interval is {gpu} s, not a positive finite duration"
+            )));
+        }
+        Ok(GpuInterval::Ran(gpu))
     }
 }
 
