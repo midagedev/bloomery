@@ -9,6 +9,10 @@
 //!   step, [`Want::Argmax`] for a greedy request (the session chains the
 //!   pick into the token ahead) and [`Want::Logits`] for one that samples,
 //!   the row copied into the server's buffer;
+//! - `prefill_splits` returns every mark. The target's prompt runs one
+//!   host-fed step a position, so a cut anywhere in the call is bit-neutral,
+//!   and each call's end becomes a checkpoint. Splitting at every mark makes
+//!   the start of each chat message a point;
 //! - `keepable`, `cut`, `reset` and `ctx_max` are the target's own rules: a
 //!   prefix the target cannot keep is a reset, and why is the target's
 //!   [`runtime::seqstate::Why`] word.
@@ -65,6 +69,13 @@ fn engine_error(e: impl Display) -> EngineError {
 impl<T: Target + Send> Engine for TargetEngine<T> {
     fn tokenizer(&self) -> Arc<dyn Tokenizer> {
         Arc::clone(&self.vocab)
+    }
+
+    /// Every mark, in order. The target's prompt is one host-fed step a
+    /// position, so ending a call at a mark is bit-neutral, and that end is
+    /// a checkpoint. A chat message's start, passed in as a mark, becomes one.
+    fn prefill_splits(&self, _first: usize, _end: usize, marks: &[usize]) -> Vec<usize> {
+        marks.to_vec()
     }
 
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
@@ -228,5 +239,14 @@ mod tests {
 
         // No ids is no call of the target, whose prompt refuses them.
         e.prefill(&[]).expect("an empty prefill is a no-op");
+    }
+
+    #[test]
+    fn prefill_splits_returns_every_mark() {
+        let n = MockTokenizer.n_vocab();
+        let e = engine(n, n).expect("a head of the vocabulary's rows");
+        let marks = [2usize, 7];
+        assert_eq!(Engine::prefill_splits(&e, 0, 10, &marks), marks);
+        assert_eq!(Engine::prefill_splits(&e, 1, 4, &[]), Vec::<usize>::new());
     }
 }

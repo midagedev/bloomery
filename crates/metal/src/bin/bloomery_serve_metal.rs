@@ -15,11 +15,12 @@
 //! session's argmax, the ids `generate_metal --tokens` picks for the same
 //! prompt ids.
 //!
-//! One slot: the session is one sequence. A request keeps what the slot
-//! holds only when it extends it (the session keeps no checkpoint of its
-//! recurrent state below its position); any other runs its prompt from
-//! position 0. The prompt runs one host-fed step a id. No prompt cache, no
-//! slot files, no image input.
+//! One slot: the session is one sequence. A request keeps a prefix back to a
+//! checkpoint of the delta layers' recurrent state: a prompt call takes one
+//! at its start, every `CHECKPOINT_EVERY` positions and at its end, and a
+//! prompt split at each message start makes that start a call's end. Any
+//! other prefix runs from position 0. The prompt runs one host-fed step a
+//! id. No prompt cache, no slot files, no image input.
 //!
 //! A bad flag or value is a named error and exit 64; a refusal of the file,
 //! the device or the session is a named error and exit 1; an engine failure
@@ -157,15 +158,18 @@ bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-fi
         )?;
         drop(split);
         let tok = tokenizer::Tokenizer::from_gguf(path).map_err(|e| e.to_string())?;
-        let vocab = Arc::new(Vocab::new(tok)?);
+        let vocab = Arc::new(Vocab::new(tok)?.with_chat_template(&template)?);
         let device = MetalDevice::open().map_err(|e| e.to_string())?;
         let t0 = Instant::now();
         let session =
             Session::open(&device, device.library(), path, ctx).map_err(|e| e.to_string())?;
         eprintln!(
-            "bloomery-serve-metal: opened {} in {:.1} s, ctx {ctx}",
+            "bloomery-serve-metal: opened {} in {:.1} s, ctx {ctx}, checkpoints every {} ({} bytes a point, capacity {})",
             path.display(),
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            session.checkpoint_every(),
+            session.checkpoint_bytes(),
+            session.checkpoint_capacity()
         );
         let head_rows = session.vocab();
         let engine = TargetEngine::new(
