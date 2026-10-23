@@ -29,6 +29,7 @@ const ROW_POINTER: &str = "rp[r] = W + (ulong)min(first_row + r, rows - 1) * (ul
 const ROW_POINTER_RAW: &str = "rp[r] = W + (ulong)(first_row + r) * (ulong)nb;";
 const EARLY_RETURN: &str = "    if (first_row >= rows) {\n        return;\n    }\n";
 
+#[rustfmt::skip] // K4-REGISTER
 pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "q4k_dmin_sign",
@@ -264,6 +265,56 @@ pub const MUTANTS: &[Mutant] = &[
         why: "the fold overwrites the residual",          // K3-REGISTER
         edits: &[("y[row] += dot;", "y[row] = dot;", 1)], // K3-REGISTER
     }, // K3-REGISTER
+    Mutant { // K4-REGISTER
+        name: "delta_fma_sign",                // K4-REGISTER
+        clause: "delta_step",                  // K4-REGISTER
+        why: "the state update subtracts k*u", // K4-REGISTER
+        edits: &[( // K4-REGISTER
+            "sp[i] = fma(kk[i], u, sp[i]);",  // K4-REGISTER
+            "sp[i] = fma(-kk[i], u, sp[i]);", // K4-REGISTER
+            1,                                // K4-REGISTER
+        )], // K4-REGISTER
+    }, // K4-REGISTER
+    Mutant { // K4-REGISTER
+        name: "delta_roll_keep",                          // K4-REGISTER
+        clause: "delta_roll",                             // K4-REGISTER
+        why: "the state store keeps the value it loaded", // K4-REGISTER
+        edits: &[( // K4-REGISTER
+            "state[base + key] = sp[i];", // K4-REGISTER
+            "state[base + key] = s0[i];", // K4-REGISTER
+            1,                            // K4-REGISTER
+        )], // K4-REGISTER
+    }, // K4-REGISTER
+    Mutant { // K4-REGISTER
+        name: "delta_ring_slot",                  // K4-REGISTER
+        clause: "delta_ring",                     // K4-REGISTER
+        why: "the ring write uses the next slot", // K4-REGISTER
+        edits: &[( // K4-REGISTER
+            "uint slot = pos % 11u;",        // K4-REGISTER
+            "uint slot = (pos + 1u) % 11u;", // K4-REGISTER
+            1,                               // K4-REGISTER
+        )], // K4-REGISTER
+    }, // K4-REGISTER
+    Mutant { // K4-REGISTER
+        name: "delta_partial_scale",            // K4-REGISTER
+        clause: "delta_partial",                // K4-REGISTER
+        why: "the partial sum is stored twice", // K4-REGISTER
+        edits: &[( // K4-REGISTER
+            "partials[h * 8u + block] = p;",     // K4-REGISTER
+            "partials[h * 8u + block] = p + p;", // K4-REGISTER
+            1,                                   // K4-REGISTER
+        )], // K4-REGISTER
+    }, // K4-REGISTER
+    Mutant { // K4-REGISTER
+        name: "delta_nan_zero",               // K4-REGISTER
+        clause: "delta_nan",                  // K4-REGISTER
+        why: "a non-finite lane stores zero", // K4-REGISTER
+        edits: &[( // K4-REGISTER
+            "state[base + key] = NAN;",  // K4-REGISTER
+            "state[base + key] = 0.0f;", // K4-REGISTER
+            1,                           // K4-REGISTER
+        )], // K4-REGISTER
+    }, // K4-REGISTER
 ];
 
 /// The mutant of this name.

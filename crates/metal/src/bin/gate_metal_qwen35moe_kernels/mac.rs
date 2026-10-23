@@ -55,6 +55,12 @@
 //! 25. **fold**: the folded down plus the residual, against the f64 oracle. // K3-REGISTER
 //! 26. **fold_type**: a shared expert of another quant is refused by name. // K3-REGISTER
 //! 27. **experts_bounds**: a launch that is not the shape is refused by name. // K3-REGISTER
+//! 28. **delta_step**: one gated delta step from a host state, against f64. // K4-REGISTER
+//! 29. **delta_roll**: five steps, each fed by the kernel's own state. // K4-REGISTER
+//! 30. **delta_ring**: a predecessor is read only while the position reaches it, and one ring slot is written. // K4-REGISTER
+//! 31. **delta_partial**: the partials and the numerator, accepted by the head-norm launch. // K4-REGISTER
+//! 32. **delta_nan**: a non-finite lane raises the lane site and writes NaN on that lane. // K4-REGISTER
+//! 33. **delta_bounds**: a shape, a position window and a numerator window are refused by name. // K4-REGISTER
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
@@ -83,6 +89,8 @@ mod clauses;
 mod clauses_router; // K2-REGISTER
 #[path = "clauses_experts.rs"] // K3-REGISTER
 mod clauses_experts; // K3-REGISTER
+#[path = "clauses_delta.rs"] // K4-REGISTER
+mod clauses_delta; // K4-REGISTER
 #[path = "fixture.rs"]
 mod fixture;
 #[path = "mutants.rs"]
@@ -93,6 +101,8 @@ mod oracle;
 mod oracle_router; // K2-REGISTER
 #[path = "../shared/oracle_experts.rs"] // K3-REGISTER
 mod oracle_experts; // K3-REGISTER
+#[path = "../shared/oracle_delta.rs"] // K4-REGISTER
+mod oracle_delta; // K4-REGISTER
 
 /// A clause, ready to run.
 type ClauseRun<'a> = Box<dyn Fn() -> Clause + 'a>;
@@ -550,7 +560,7 @@ pub fn main() -> ExitCode {
         Err(e) => Err(e.clone()),
     };
     #[rustfmt::skip] // K2-REGISTER
-    let clauses: [(&'static str, ClauseRun<'_>); 27] = [ // K2-REGISTER
+    let clauses: [(&'static str, ClauseRun<'_>); 33] = [ // K2-REGISTER
         ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
         ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
         ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
@@ -593,6 +603,12 @@ pub fn main() -> ExitCode {
         ("fold", Box::new(|| with(clauses_experts::fold))), // K3-REGISTER
         ("fold_type", Box::new(|| with(clauses_experts::fold_type))), // K3-REGISTER
         ("experts_bounds", Box::new(|| with(clauses_experts::experts_bounds))), // K3-REGISTER
+        ("delta_step", Box::new(|| with(clauses_delta::delta_step))), // K4-REGISTER
+        ("delta_roll", Box::new(|| with(clauses_delta::delta_roll))), // K4-REGISTER
+        ("delta_ring", Box::new(|| with(clauses_delta::delta_ring))), // K4-REGISTER
+        ("delta_partial", Box::new(|| with(clauses_delta::delta_partial))), // K4-REGISTER
+        ("delta_nan", Box::new(|| with(clauses_delta::delta_nan))), // K4-REGISTER
+        ("delta_bounds", Box::new(|| clauses_delta::delta_bounds(&harness))), // K4-REGISTER
     ];
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)

@@ -13,7 +13,10 @@
 //! mat-vec of a gated delta net's out projection ([`headnorm`]).
 //! The router ([`router`]) is one more pipeline: `kernels/router.metal`, its ticket `kernels/ticket.metal`. // K2-REGISTER
 //! The routed gate-up pair and the folded down are one dispatch each. // K3-REGISTER
+//! The gated delta step ([`delta`]) writes the numerator and the partials that // K4-REGISTER
+//! mat-vec reads. Its kernel is `kernels/delta.metal`. // K4-REGISTER
 
+mod delta; // K4-REGISTER
 mod embed;
 mod experts; // K3-REGISTER
 mod geometry;
@@ -22,6 +25,17 @@ mod matvec;
 mod router; // K2-REGISTER
 mod seg;
 
+pub use delta::CONV_TAPS; // K4-REGISTER
+pub use delta::DeltaParams; // K4-REGISTER
+pub use delta::HeadMap; // K4-REGISTER
+pub use delta::PASS_ROWS; // K4-REGISTER
+pub use delta::Q_SCALE; // K4-REGISTER
+pub use delta::RING_ROWS; // K4-REGISTER
+pub use delta::channels; // K4-REGISTER
+pub use delta::key_of; // K4-REGISTER
+pub use delta::ring_elems; // K4-REGISTER
+pub use delta::state_elems; // K4-REGISTER
+pub use delta::state_index; // K4-REGISTER
 pub use embed::EmbedParams;
 pub use experts::{
     // K3-REGISTER
@@ -97,6 +111,8 @@ pub struct Kernels {
     pair_q6: Pipeline, // K3-REGISTER
     fold_q4: Pipeline, // K3-REGISTER
     fold_q6: Pipeline, // K3-REGISTER
+    /// The gated delta step. // K4-REGISTER
+    delta: Pipeline, // K4-REGISTER
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -166,6 +182,7 @@ impl Kernels {
             pair_q6: library.pipeline("q6k_pair_swiglu")?, // K3-REGISTER
             fold_q4: library.pipeline("q4k_down_fold")?, // K3-REGISTER
             fold_q6: library.pipeline("q6k_down_fold")?, // K3-REGISTER
+            delta: library.pipeline("gdn_step")?, // K4-REGISTER
             simdgroups,
         })
     }
