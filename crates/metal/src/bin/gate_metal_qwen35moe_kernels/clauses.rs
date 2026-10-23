@@ -874,6 +874,12 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
             ..whole
         },
         Refusal {
+            what: "columns past the kernels' signed 32-bit index",
+            cols: (1usize << 31) + BLOCK_VALUES,
+            needle: "signed 32-bit",
+            ..whole
+        },
+        Refusal {
             what: "no rows",
             rows: 0,
             weights: 0,

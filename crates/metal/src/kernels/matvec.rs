@@ -119,6 +119,15 @@ fn check(p: &MatvecParams<'_>) -> Result<Shape, DeviceError> {
             p.rows, p.cols
         )));
     }
+    // The kernels index the input with signed 32-bit arithmetic (a block
+    // index times its values) and divide the norm's sum by the column count
+    // in 32 bits.
+    if i32::try_from(p.cols).is_err() {
+        return Err(refuse(format!(
+            "{} columns pass the kernels' signed 32-bit index",
+            p.cols
+        )));
+    }
     if !p.cols.is_multiple_of(BLOCK_VALUES) {
         return Err(refuse(format!(
             "{} columns are not whole blocks of {BLOCK_VALUES}",
