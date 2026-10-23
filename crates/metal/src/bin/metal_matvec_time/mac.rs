@@ -73,7 +73,7 @@
 //! geometry's rows, the fold owns the geometry's rows a SIMD group.
 //!
 //! Flags: `--only` (repeatable; comma-separated `matvec`, `seg`, `headnorm`,
-//! `pair`, `fold`, `q4k`, `q6k`, `router`, `head`, or a shape label),
+//! `pair`, `fold`, `q4k`, `q6k`, `a4`, `router`, `head`, or a shape label),
 //! `--trials N`, `--chain N`, `--geometry rows=N,sg=M,router_sg=K`, `--gaps`,
 //! `--no-check`, `--help`.
 
@@ -86,10 +86,10 @@ use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::ComputeEncoder;
 use bloomery_metal::kernels::router::{self, RouterParams};
 use bloomery_metal::kernels::{
-    BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, FoldParams, HEAD_GROUPS, HEAD_K, HEAD_SIMD_GROUPS,
-    HEAD_VOCAB, HeadNormParams, HeadParams, Kernels, MatvecParams, Mode, NormOnLoad,
-    PARTIALS_PER_HEAD, PairParams, Quant, ROUTED_IDS, ROWS_PER_SIMD_GROUP, SIMD_GROUPS_PER_GROUP,
-    SegParams, Segment, SharedPlan, VALUE_HEADS,
+    EXPERT_K, EXPERT_SLOTS, FoldParams, HEAD_GROUPS, HEAD_K, HEAD_SIMD_GROUPS, HEAD_VOCAB,
+    HeadNormParams, HeadParams, Kernels, MatvecParams, Mode, NormOnLoad, PARTIALS_PER_HEAD,
+    PairParams, Quant, ROUTED_IDS, ROWS_PER_SIMD_GROUP, SIMD_GROUPS_PER_GROUP, SegParams, Segment,
+    SharedPlan, VALUE_HEADS,
 };
 use bloomery_metal::library::{Library, SOURCE};
 use bloomery_metal::{GpuInterval, MetalStream};
@@ -122,7 +122,7 @@ const ROUTER_BYTES: usize = router::ROWS * router::K * core::mem::size_of::<f32>
 /// The head's weight bytes: 248320 rows of K 2048 Q6_K. The design's head
 /// matrix, and the kernel's own shape; the block bytes are gguf's row.
 fn head_bytes() -> usize {
-    HEAD_VOCAB * (HEAD_K / BLOCK_VALUES) * Quant::Q6K.block_bytes()
+    HEAD_VOCAB * (HEAD_K / Quant::Q6K.values_per_block()) * Quant::Q6K.block_bytes()
 }
 
 /// The review's predicted tail span for one router dispatch, in the row's
@@ -227,16 +227,18 @@ impl Shape {
 
     /// The bytes a dispatch streams: its weights.
     fn bytes(&self) -> usize {
+        let per =
+            |quant: Quant, values: usize| values / quant.values_per_block() * quant.block_bytes();
         match self {
             Self::Matvec {
                 quant, rows, cols, ..
-            } => rows * cols / BLOCK_VALUES * quant.block_bytes(),
+            } => per(*quant, rows * cols),
             Self::Seg {
                 quant,
                 cols,
                 segments,
-            } => segments.iter().sum::<usize>() * cols / BLOCK_VALUES * quant.block_bytes(),
-            Self::HeadNorm { rows, cols } => rows * cols / BLOCK_VALUES * Quant::Q4K.block_bytes(),
+            } => per(*quant, segments.iter().sum::<usize>() * cols),
+            Self::HeadNorm { rows, cols } => per(Quant::Q4K, rows * cols),
         }
     }
 }
@@ -290,11 +292,12 @@ fn other_shapes() -> Vec<(&'static str, Shape)> {
     ]
 }
 
-/// One matrix of random blocks the probe's way: random bytes, with `d` (and
-/// `dmin`) a finite f16 in [0.0005, 0.004].
+/// One matrix of random blocks the probe's way: random bytes, with the
+/// scales (and the mins, the biases) small and finite — an f16 pair in
+/// [0.0005, 0.004] for Q4_K and Q6_K, a BF16 pair for A4's groups.
 fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
     let block = quant.block_bytes();
-    let blocks = rows * cols / BLOCK_VALUES;
+    let blocks = rows * cols / quant.values_per_block();
     let mut rng = oracle::Rng::new(seed);
     let mut bytes = vec![0u8; blocks * block];
     for chunk in bytes.chunks_mut(8) {
@@ -302,17 +305,28 @@ fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
         let n = chunk.len();
         chunk.copy_from_slice(&word[..n]);
     }
-    let mut small = || {
+    let small_f16 = |rng: &mut oracle::Rng| {
         let unit = (rng.signed() + 1.0) / 2.0;
         gguf::quant::f32_to_f16_bits(0.0005 + 0.0035 * unit).to_le_bytes()
     };
+    let small_bf16 = |rng: &mut oracle::Rng| {
+        let unit = (rng.signed() + 1.0) / 2.0;
+        gguf::quant::fp32_to_bf16_bits(0.0005 + 0.0035 * unit).to_le_bytes()
+    };
+    let zero_bias = gguf::quant::fp32_to_bf16_bits(0.0).to_le_bytes();
     for b in bytes.chunks_exact_mut(block) {
         match quant {
             Quant::Q4K => {
-                b[0..2].copy_from_slice(&small());
-                b[2..4].copy_from_slice(&small());
+                b[0..2].copy_from_slice(&small_f16(&mut rng));
+                b[2..4].copy_from_slice(&small_f16(&mut rng));
             }
-            Quant::Q6K => b[208..210].copy_from_slice(&small()),
+            Quant::Q6K => b[208..210].copy_from_slice(&small_f16(&mut rng)),
+            // A group: the scale and the bias at its end, both BF16, so the
+            // reader's finiteness check takes the matrix.
+            Quant::A4 => {
+                b[32..34].copy_from_slice(&small_bf16(&mut rng));
+                b[34..36].copy_from_slice(&zero_bias);
+            }
         }
     }
     bytes
@@ -526,7 +540,7 @@ fn time_shape(
                 weight_blocks,
                 out_offset,
             });
-            weight_blocks += r * (cols / BLOCK_VALUES);
+            weight_blocks += r * (cols / quant.values_per_block());
             out_offset += r;
         }
     }
@@ -599,6 +613,7 @@ fn time_shape(
                         .headnorm_resid(
                             encoder,
                             HeadNormParams {
+                                quant: Quant::Q4K,
                                 rows: *rows,
                                 cols: *cols,
                                 weights: w,
@@ -637,7 +652,7 @@ fn time_shape(
     if check && matches!(shape, Shape::Matvec { resid: false, .. }) {
         let x64: Vec<f64> = x_values.iter().map(|&v| f64::from(v)).collect();
         let reference = oracle::reference(quant, &one, rows, cols, &x64)?;
-        let band = oracle::band(quant, cols / BLOCK_VALUES, oracle::Kind::Store);
+        let band = oracle::band(quant, cols / quant.values_per_block(), oracle::Kind::Store);
         oracle::check(first, &reference, band, oracle::Kind::Store, None)?;
     }
     Ok(timing)
@@ -798,7 +813,7 @@ const PROBE_IDS: [i32; ROUTED_IDS] = [0, 1, 2, 3, 4, 5, 6, 7];
 
 /// The bytes of `experts` experts of `rows` rows over `cols` columns.
 fn expert_stack_bytes(quant: Quant, experts: usize, rows: usize, cols: usize) -> usize {
-    experts * rows * cols / BLOCK_VALUES * quant.block_bytes()
+    experts * rows * cols / quant.values_per_block() * quant.block_bytes()
 }
 
 /// One tensor's share of the working set: `copies` copies at a 256-aligned
@@ -1239,6 +1254,7 @@ fn time_head(
                 .head(
                     encoder,
                     HeadParams {
+                        quant: Quant::Q6K,
                         rows: HEAD_VOCAB,
                         k: HEAD_K,
                         simdgroups: HEAD_SIMD_GROUPS,
@@ -1404,9 +1420,9 @@ us_p90, gbps.
 
   --help                 print this and exit 0
   --only KIND            a kernel (matvec, seg, headnorm, router, head), a
-                         mat-vec type (q4k, q6k), or a shape label. Repeatable,
-                         and one value may be comma-separated. Unset times every
-                         shape.
+                         mat-vec type (q4k, q6k, a4), or a shape label.
+                         Repeatable, and one value may be comma-separated.
+                         Unset times every shape.
   --trials N             timed command buffers per arm (default 16)
   --chain N              also time N back-to-back dispatches: arm lone (one
                          dispatch), serial and concurrent (a memory barrier
@@ -1691,7 +1707,7 @@ pub fn main() -> ExitCode {
     );
 
     let mut shapes: Vec<(String, Shape)> = Vec::new();
-    for quant in [Quant::Q4K, Quant::Q6K] {
+    for quant in [Quant::Q4K, Quant::Q6K, Quant::A4] {
         for (rows, cols) in SHAPES {
             shapes.push((
                 format!("matvec {} {rows}x{cols}", quant.name()),
@@ -1770,8 +1786,10 @@ pub fn main() -> ExitCode {
     for (kind, quant, rows, cols) in [
         ("pair", Quant::Q4K, EXPERT_K, 2048usize),
         ("pair", Quant::Q6K, EXPERT_K, 2048),
+        ("pair", Quant::A4, EXPERT_K, 2048),
         ("fold", Quant::Q4K, 2048, EXPERT_K),
         ("fold", Quant::Q6K, 2048, EXPERT_K),
+        ("fold", Quant::A4, 2048, EXPERT_K),
     ] {
         let label = match kind {
             "pair" => format!("pair {} 9x{rows}x{cols}", quant.name()),
