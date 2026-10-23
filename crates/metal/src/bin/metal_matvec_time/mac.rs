@@ -227,14 +227,19 @@ fn median(xs: &[f64]) -> f64 {
     v[v.len() / 2]
 }
 
-/// The `--trials` value: a whole number of at least one, refused by name
-/// otherwise (no trial has no median to take).
+/// The most timed buffers: every buffer, warm-ups included, is encoded before
+/// any is committed, and each takes a signal buffer beside it, so both must fit
+/// the default queue's 64 command buffers or `begin` blocks.
+const MAX_TRIALS: usize = 64 / 2 - WARMUPS;
+
+/// The `--trials` value: a whole number in `1..=MAX_TRIALS`, refused by name
+/// otherwise (no trial has no median to take; more would block the queue).
 fn trials_of(value: Option<&String>) -> Result<usize, String> {
     match value.map(|v| (v, v.parse::<usize>())) {
         None => Err("--trials takes a value".to_string()),
-        Some((_, Ok(n))) if n >= 1 => Ok(n),
+        Some((_, Ok(n))) if (1..=MAX_TRIALS).contains(&n) => Ok(n),
         Some((value, _)) => Err(format!(
-            "--trials takes a whole number of at least 1, not {value:?}"
+            "--trials takes a whole number in 1..={MAX_TRIALS}, not {value:?}"
         )),
     }
 }

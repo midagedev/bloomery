@@ -200,7 +200,7 @@ impl<S: Stores + ?Sized> ChainOps for Program<'_, S> {
         let first = c
             .plans
             .first()
-            .ok_or(GpuError::shape(WHAT, "a chain of no layer"))?;
+            .ok_or_else(|| GpuError::shape(WHAT, "a chain of no layer"))?;
         let lc = Ctx::new(c.gpu, c.w, (first, 0), c.k, c.mma, c.eps, c.table)?;
         dispatch::unit_front(&lc, self.s, self.io, m)
     }
