@@ -20,6 +20,8 @@ Bolt's two files list 27,921 modules (15 MB); they are cut to the first module o
 
 `../checkpoint-headers/glm-5.3-flash-nvfp4-layers-0-3.tensors.json.gz` is the dtype and shape of every tensor of `nvidia/GLM-5.3-Flash-NVFP4` layers 0 and 3 and every unlayered `model.language_model.` tensor and `lm_head.weight`, gathered from all 33 shard headers.
 
+| `mlx-community/Qwen3.6-35B-A3B-4bit` | (the folder on the M4 Pro; no revision recorded) | MLX affine 4-bit g64, 8-bit router and shared-expert gates |
+
 **Class-name targets.** `quant_config::plan` takes an explicit module-class resolver; the checkpoint-module
 classifier in `model_hf::arch::module_class` supplies the projection and embedding roles read by the GLM and
 Qwen3.8 maps. `Linear` and `Embedding` select only their own classes, in both `targets` and `ignore`.

@@ -3,7 +3,10 @@
 //! ModelOpt writes `hf_quant_config.json`: `quant_algo`, the per-module `quantized_layers` of a
 //! MIXED_PRECISION export and `exclude_modules` globs. transformers' `fp8` (`config.json`
 //! `quantization_config`) gives `weight_block_size` and `modules_to_not_convert`;
-//! compressed-tensors gives `config_groups` and `ignore`. [`Config`] reads them into the formats
+//! compressed-tensors gives `config_groups` and `ignore`. MLX's own block (`config.json`
+//! `quantization`, what mlx-lm's convert writes, with a verbatim copy at `quantization_config`)
+//! gives `group_size`, `bits`, `mode` and per-module `{group_size, bits}` overrides keyed as the
+//! tensor names minus `.weight`. [`Config`] reads them into the formats
 //! each module is declared, and [`plan`] gives every tensor of a checkpoint one [`Format`]: each
 //! weight's stored tensors (dtype, shape and companion scales) are matched against the formats
 //! its module is declared.
@@ -24,7 +27,10 @@ use gguf::GgmlType;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::schema::{self, Fields, Rule::Read};
+use crate::schema::{
+    self, Fields,
+    Rule::{Need, Read},
+};
 use safetensors::Dtype;
 
 /// Why a config or a tensor was refused.
@@ -70,6 +76,13 @@ pub enum Format {
     Int4Pack {
         group: usize,
     },
+    /// MLX's affine quantization (`config.json`'s `quantization`, mlx-lm's
+    /// convert): `bits` 4-bit codes an U32 word, one BF16 `.scales` value and
+    /// one BF16 `.biases` value a `group` values along the row.
+    MlxAffine {
+        bits: usize,
+        group: usize,
+    },
     Bf16,
     F32,
 }
@@ -86,6 +99,9 @@ impl fmt::Display for Format {
             Format::Fp8Tensor => f.write_str("FP8-tensor"),
             Format::Mxfp4 => f.write_str("MXFP4-OCP"),
             Format::Int4Pack { group } => write!(f, "INT4-pack group {group}"),
+            Format::MlxAffine { bits, group } => {
+                write!(f, "MLX-affine {bits}-bit group {group}")
+            }
             Format::Bf16 => f.write_str("BF16"),
             Format::F32 => f.write_str("F32"),
         }
@@ -125,6 +141,10 @@ impl Format {
                 }
             }
             Format::Mxfp4 => Some(GgmlType::MXFP4),
+            // The block type holds the group's scale and bias beside its codes, so only the
+            // block sizes' own group (64) has one.
+            Format::MlxAffine { bits: 4, group: 64 } => Some(GgmlType::MLX_A4),
+            Format::MlxAffine { bits: 8, group: 64 } => Some(GgmlType::MLX_A8),
             Format::Bf16 => Some(GgmlType::BF16),
             Format::F32 => Some(GgmlType::F32),
             _ => None,
@@ -187,7 +207,8 @@ impl Format {
     }
 
     /// The logical shape of a tensor of the format with `stored` shape (row-major): two E2M1
-    /// values a stored byte for NVFP4 and MXFP4, eight int4 an I32 for the packed format. `stored`
+    /// values a stored byte for NVFP4 and MXFP4, eight int4 an I32 for the packed format, and
+    /// `32 / bits` codes an U32 for the MLX one. `stored`
     /// is a weight [`plan`] placed in the format, whose unpacked count it checked fits.
     #[must_use]
     pub fn logical(self, stored: &[usize]) -> Vec<usize> {
@@ -195,6 +216,7 @@ impl Format {
         let per = match self {
             Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 | Format::Mxfp4 => 2,
             Format::Int4Pack { .. } => 8,
+            Format::MlxAffine { bits, .. } => 32 / bits,
             _ => 1,
         };
         if let Some(last) = s.last_mut() {
@@ -207,6 +229,8 @@ impl Format {
 /// A checkpoint's quantization config: the formats each module is declared.
 #[derive(Debug, Default)]
 pub struct Config {
+    /// MLX's own `quantization` block, which takes a module before any other.
+    mlx: Option<Mlx>,
     /// ModelOpt's config, which takes a module first.
     modelopt: Option<Modelopt>,
     /// `config.json`'s own config: the modules ModelOpt leaves, or every module.
@@ -220,6 +244,16 @@ struct Modelopt {
     /// `quantized_layers`: a module and its format.
     layers: Vec<(String, Format)>,
     exclude: Vec<String>,
+}
+
+/// MLX's `quantization` block: the affine format every module takes, and the
+/// per-module `{group_size, bits}` entries that override it, keyed exactly as
+/// the tensor names minus `.weight` (mlx-lm's convert writes them from the
+/// module paths it quantized).
+#[derive(Debug)]
+struct Mlx {
+    all: Format,
+    layers: BTreeMap<String, Format>,
 }
 
 #[derive(Debug)]
@@ -291,14 +325,45 @@ impl Config {
 
     /// The config from `config.json` and ModelOpt's `hf_quant_config.json`.
     pub fn parse(config: &Value, hf_quant: Option<&Value>) -> Result<Config, Error> {
+        let mlx = config.get("quantization").map(Mlx::parse).transpose()?;
         let qc = config
             .get("quantization_config")
             .or_else(|| config.get("text_config")?.get("quantization_config"));
+        // MLX's convert writes its `quantization` block beside a verbatim copy
+        // of it at `quantization_config`, with no `quant_method`; the copy is
+        // not a second producer, and anything else beside the block is.
+        let qc = match (qc, &mlx) {
+            (Some(q), Some(_)) if !q.get("quant_method").is_some_and(Value::is_string) => {
+                if q != config
+                    .get("quantization")
+                    .expect("the MLX block is present")
+                {
+                    return Err(bad(
+                        "quantization_config beside quantization is not its copy",
+                    ));
+                }
+                None
+            }
+            (q, _) => q,
+        };
+        if mlx.is_some() && hf_quant.is_some() {
+            return Err(bad(
+                "a quantization block beside ModelOpt's hf_quant_config.json",
+            ));
+        }
         let method = qc.map(|q| str_of(q, "quant_method")).transpose()?;
+        if let (Some(_), Some(m)) = (&mlx, method) {
+            return Err(bad(format!(
+                "a quantization block beside quantization_config's quant_method {m}"
+            )));
+        }
         if method == Some("quark") {
             return Err(bad("Quark checkpoints are not read yet"));
         }
-        let mut out = Config::default();
+        let mut out = Config {
+            mlx,
+            ..Config::default()
+        };
         // ModelOpt's own file wins over the copy it writes into config.json.
         let modelopt = match (hf_quant, method) {
             (Some(h), _) => Some(h.get("quantization").unwrap_or(h)),
@@ -328,6 +393,11 @@ impl Config {
         module: &str,
         class_of: impl FnOnce() -> Option<ModuleClass>,
     ) -> (Vec<Format>, Option<&str>) {
+        if let Some(m) = &self.mlx {
+            // The block has no exclude list: a module takes its own entry or
+            // the block's format, so no module is left unquantized.
+            return (vec![*m.layers.get(module).unwrap_or(&m.all)], None);
+        }
         if let Some(m) = &self.modelopt {
             let layer = m
                 .layers
@@ -388,6 +458,79 @@ const LAYER: &Fields = &[
     ("weight_block_size", Read),
     ("weight_scale_encoding", Read),
 ];
+
+/// A per-module `quantization` entry's keys, each read by [`mlx_format`].
+const MLX_LAYER: &Fields = &[("group_size", Read), ("bits", Read)];
+
+impl Mlx {
+    fn parse(q: &Value) -> Result<Mlx, Error> {
+        let object = q
+            .as_object()
+            .ok_or_else(|| bad("quantization is no object"))?;
+        let mut block = serde_json::Map::new();
+        let mut layers = BTreeMap::new();
+        for (key, entry) in object {
+            if matches!(key.as_str(), "group_size" | "bits" | "mode") {
+                block.insert(key.clone(), entry.clone());
+                continue;
+            }
+            let entry = entry.as_object().ok_or_else(|| {
+                bad(format!(
+                    "quantization {key} is neither a per-module object nor one of the block's keys"
+                ))
+            })?;
+            let value = Value::Object(entry.clone());
+            schema::check(&value, &format!("quantization {key}"), &[MLX_LAYER]).map_err(bad)?;
+            layers.insert(key.clone(), mlx_format(key, &value)?);
+        }
+        let block = Value::Object(block);
+        schema::check(&block, "quantization", &[MLX_BLOCK]).map_err(bad)?;
+        Ok(Mlx {
+            all: mlx_format("the block", &block)?,
+            layers,
+        })
+    }
+}
+
+/// The `quantization` block's own keys, each read by [`mlx_format`]; `mode`
+/// must name the affine form this reader places.
+const MLX_BLOCK: &Fields = &[
+    ("group_size", Read),
+    ("bits", Read),
+    ("mode", Need("[\"affine\"]")),
+];
+
+/// The affine format of one `quantization` entry (`what` names it in a
+/// refusal): a `bits` width and a `group_size`. Only the block sizes this
+/// reader places are formats — 4 and 8 bits at a group of 64, gguf's MLX_A4
+/// and MLX_A8 — and another value is refused by name, as is a width or group
+/// the blocks do not have.
+fn mlx_format(what: &str, entry: &Value) -> Result<Format, Error> {
+    let refuse = |key: &str| {
+        bad(format!(
+            "quantization {key} {} for {what} is not one this reader places",
+            entry.get(key).unwrap_or(&Value::Null)
+        ))
+    };
+    let bits = entry
+        .get("bits")
+        .and_then(Value::as_u64)
+        .filter(|&b| b == 4 || b == 8);
+    let group = entry
+        .get("group_size")
+        .and_then(Value::as_u64)
+        .filter(|&g| g == 64);
+    if bits.is_none() {
+        return Err(refuse("bits"));
+    }
+    if group.is_none() {
+        return Err(refuse("group_size"));
+    }
+    Ok(Format::MlxAffine {
+        bits: bits.unwrap() as usize,
+        group: group.unwrap() as usize,
+    })
+}
 
 impl Modelopt {
     fn parse(q: &Value) -> Result<Modelopt, Error> {
@@ -633,11 +776,13 @@ pub struct Plan {
 }
 
 /// The companion suffixes a weight's format reads.
-const COMPANIONS: [&str; 7] = [
+const COMPANIONS: [&str; 9] = [
     "weight_scale",
     "weight_scale_2",
     "weight_scale_inv",
     "scale",
+    "scales",
+    "biases",
     "input_scale",
     "weight_shape",
     "weight_zero_point",
@@ -750,6 +895,12 @@ fn layout(
     shape: &[usize],
     table: &BTreeMap<&str, (Dtype, &[usize])>,
 ) -> Option<Vec<String>> {
+    // MLX's expert stacks are one 3-D U32 tensor (`switch_mlp`), so the affine
+    // format matches any rank whose last dim is the packed row; every other
+    // format's weights here are 2-D.
+    if let Format::MlxAffine { bits, group } = format {
+        return mlx_layout(bits, group, module, dtype, shape, table);
+    }
     let &[rows, cols] = shape else { return None };
     // The first of `suffixes` beside the weight (or, for a shared scale, beside `owner`) that is
     // one of `dtypes` and of `want`'s shape.
@@ -893,6 +1044,38 @@ fn layout(
         _ => return None,
     }
     Some(out)
+}
+
+/// The companions an MLX affine weight reads: `.weight` U32 with its row's K
+/// packed `bits` to a word along the last dim, beside BF16 `.scales` and
+/// `.biases` of the same leading dims with K/`group` columns — one placed
+/// tensor whatever the rank (a `switch_mlp` stack's `[E, R, packed]` as much
+/// as a linear's `[R, packed]`).
+fn mlx_layout(
+    bits: usize,
+    group: usize,
+    module: &str,
+    dtype: Dtype,
+    shape: &[usize],
+    table: &BTreeMap<&str, (Dtype, &[usize])>,
+) -> Option<Vec<String>> {
+    if dtype != Dtype::U32 || shape.len() < 2 {
+        return None;
+    }
+    let mut grid = shape.to_vec();
+    let k = grid.pop()?.checked_mul(32 / bits)?;
+    if k % group != 0 {
+        return None;
+    }
+    grid.push(k / group);
+    let find = |suffix: &str| {
+        let n = format!("{module}.{suffix}");
+        table
+            .get(n.as_str())
+            .filter(|&&(d, s)| d == Dtype::Bf16 && s == grid)
+            .map(|_| n)
+    };
+    Some(vec![find("scales")?, find("biases")?])
 }
 
 /// Whether `module` is `key` or inside it.
@@ -1695,6 +1878,220 @@ mod tests {
             format!(
                 "{w}: FP8-tensor F8_E4M3 [1, 3136] (3136 bytes), not F8_E4M3 rows of whole 128-value blocks"
             )
+        );
+    }
+
+    /// MLX's own `quantization` block (mlx-community's Qwen3.6 4-bit, its
+    /// config.json and the dtype and shape of every tensor of layers 0 and 3,
+    /// the unlayered text tensors, `lm_head` and one `vision_tower` pair):
+    /// every text-model weight is placed — the 4-bit default, the 8-bit router
+    /// and shared-expert gate by their per-module entries, the pre-stacked
+    /// `switch_mlp` as one 3-D tensor — the BF16 tensors (the vision tower's
+    /// among them) land plain and out of the quantization, and nothing is
+    /// refused. A `mode` that is not affine, a width or group the blocks do
+    /// not have, a second producer beside the block, a divergent
+    /// `quantization_config` copy, a `.weight` without its
+    /// `.scales`/`.biases` and a shape that does not match the group are all
+    /// refused by name.
+    #[test]
+    fn mlx_affine_places_the_real_headers_or_refuses_by_name() {
+        let tag = "mlx-community__Qwen3.6-35B-A3B-4bit";
+        let real = fixture(&format!("{tag}__config.json")).unwrap();
+        let alone = |real: &Value| {
+            let mut c = real.clone();
+            c.as_object_mut().unwrap().remove("quantization_config");
+            c
+        };
+        let c = Config::parse(&real, None).unwrap();
+        let gz = std::fs::read(format!(
+            "{}/tests/fixtures/checkpoint-headers/qwen3.6-mlx-4bit-layers-0-3.tensors.json.gz",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let mut text = Vec::new();
+        flate2::read::GzDecoder::new(gz.as_slice())
+            .read_to_end(&mut text)
+            .unwrap();
+        let header: serde_json::Map<String, Value> = serde_json::from_slice(&text).unwrap();
+        let entries: Vec<(String, Dtype, Vec<usize>)> = header
+            .iter()
+            .map(|(n, e)| {
+                (
+                    n.clone(),
+                    Dtype::of(e["dtype"].as_str().unwrap()).unwrap(),
+                    e["shape"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|d| d.as_u64().unwrap() as usize)
+                        .collect(),
+                )
+            })
+            .collect();
+        fn tensors(
+            entries: &[(String, Dtype, Vec<usize>)],
+        ) -> impl Iterator<Item = (&str, Dtype, &[usize])> {
+            entries
+                .iter()
+                .map(|(n, d, s)| (n.as_str(), *d, s.as_slice()))
+        }
+        let p = plan(&c, tensors(&entries), |_| None);
+        assert!(p.refused.is_empty(), "{:?}", p.refused);
+        let mut count = BTreeMap::new();
+        for pl in p.placed.values() {
+            *count.entry(pl.format.to_string()).or_insert(0) += 1;
+        }
+        let want = [
+            ("BF16", 13),
+            ("MLX-affine 4-bit group 64", 23),
+            ("MLX-affine 8-bit group 64", 4),
+        ];
+        assert_eq!(
+            count.into_iter().collect::<Vec<_>>(),
+            want.map(|(f, n)| (f.to_string(), n))
+        );
+        let l0 = "language_model.model.layers.0";
+        assert_eq!(
+            p.placed[&format!("{l0}.mlp.gate.weight")].format,
+            Format::MlxAffine { bits: 8, group: 64 }
+        );
+        assert_eq!(
+            c.declared(&format!("{l0}.mlp.gate"), || None).0,
+            [Format::MlxAffine { bits: 8, group: 64 }]
+        );
+        assert_eq!(
+            c.declared(&format!("{l0}.mlp.shared_expert_gate"), || None)
+                .0,
+            [Format::MlxAffine { bits: 8, group: 64 }]
+        );
+        assert_eq!(
+            c.declared(&format!("{l0}.linear_attn.out_proj"), || None).0,
+            [Format::MlxAffine { bits: 4, group: 64 }]
+        );
+        // The pre-stacked expert tensor: [E, R, packed] with [E, R, K/group]
+        // scales and biases, one placed tensor.
+        let down = &p.placed[&format!("{l0}.mlp.switch_mlp.down_proj.weight")];
+        assert_eq!(down.format, Format::MlxAffine { bits: 4, group: 64 });
+        assert_eq!(
+            down.companions,
+            [
+                format!("{l0}.mlp.switch_mlp.down_proj.scales"),
+                format!("{l0}.mlp.switch_mlp.down_proj.biases")
+            ]
+        );
+        assert_eq!(
+            Format::MlxAffine { bits: 4, group: 64 }.logical(&[256, 2048, 64]),
+            [256, 2048, 512]
+        );
+        assert_eq!(
+            Format::MlxAffine { bits: 8, group: 64 }.card_type(),
+            Some(GgmlType::MLX_A8)
+        );
+        assert_eq!(Format::MlxAffine { bits: 3, group: 64 }.card_type(), None);
+        // The vision tower's BF16 tensors land plain, out of the quantization.
+        assert_eq!(
+            p.placed["vision_tower.patch_embed.proj.weight"].format,
+            Format::Bf16
+        );
+        // A `.weight` without its companions, and one whose scales do not
+        // match the group, are refused by name under the block's config.
+        let mut dropped = entries.clone();
+        dropped.retain(|(n, _, _)| n != &format!("{l0}.mlp.gate.scales"));
+        let p = plan(&c, tensors(&dropped), |_| None);
+        assert!(
+            p.refused[&format!("{l0}.mlp.gate.weight")]
+                .contains("fits none of [\"MLX-affine 8-bit group 64\"]"),
+            "{:?}",
+            p.refused
+        );
+        assert!(
+            p.refused[&format!("{l0}.mlp.gate.biases")]
+                .contains("a companion no placed weight reads"),
+            "{:?}",
+            p.refused
+        );
+        let mut narrow = entries.clone();
+        let at = narrow
+            .iter()
+            .position(|(n, _, _)| n == &format!("{l0}.mlp.gate.scales"))
+            .unwrap();
+        narrow[at].2 = vec![256, 31];
+        let p = plan(&c, tensors(&narrow), |_| None);
+        assert!(
+            p.refused[&format!("{l0}.mlp.gate.weight")]
+                .contains("fits none of [\"MLX-affine 8-bit group 64\"]"),
+            "{:?}",
+            p.refused
+        );
+        // The block's own refusals, each from the real config with one value
+        // changed (the copy beside it removed, so the block stands alone).
+        let refuse = |key: &str, v: Value, want: &str| {
+            let mut config = alone(&real);
+            config["quantization"][key] = v;
+            let e = Config::parse(&config, None).unwrap_err();
+            assert!(e.to_string().contains(want), "{e}");
+        };
+        refuse(
+            "mode",
+            "affine2".into(),
+            "quantization.mode \"affine2\" is unsupported",
+        );
+        refuse(
+            "bits",
+            3.into(),
+            "quantization bits 3 for the block is not one this reader places",
+        );
+        refuse(
+            "group_size",
+            32.into(),
+            "quantization group_size 32 for the block is not one this reader places",
+        );
+        let mut module = alone(&real);
+        module["quantization"][&format!("{l0}.mlp.gate")]["bits"] = 2.into();
+        let e = Config::parse(&module, None).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains(&format!("quantization bits 2 for {l0}.mlp.gate")),
+            "{e}"
+        );
+        let mut unknown = alone(&real);
+        unknown["quantization"][&format!("{l0}.mlp.gate")]["zzz"] = 1.into();
+        let e = Config::parse(&unknown, None).unwrap_err();
+        assert!(
+            e.to_string().contains(&format!(
+                "quantization {l0}.mlp.gate.zzz is not a key this converter reads"
+            )),
+            "{e}"
+        );
+        // A divergent copy beside the block, and a second producer, are
+        // refused; the verbatim copy the real config carries parsed above.
+        let mut divergent = real.clone();
+        divergent["quantization_config"]["bits"] = 8.into();
+        let e = Config::parse(&divergent, None).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("quantization_config beside quantization is not its copy"),
+            "{e}"
+        );
+        let e = Config::parse(
+            &alone(&real),
+            Some(&serde_json::json!({ "quantization": { "quant_algo": "FP8" } })),
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("a quantization block beside ModelOpt's hf_quant_config.json"),
+            "{e}"
+        );
+        let mut fp8 = alone(&real);
+        fp8["quantization_config"] = serde_json::json!({
+            "quant_method": "fp8", "weight_block_size": [128, 128]
+        });
+        let e = Config::parse(&fp8, None).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("a quantization block beside quantization_config's quant_method fp8"),
+            "{e}"
         );
     }
 }
