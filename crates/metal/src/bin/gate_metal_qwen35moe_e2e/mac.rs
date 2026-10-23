@@ -25,6 +25,9 @@
 //!   last position's argmax as the fixture tier takes it, the rows a
 //!   near-tie router flip carries left unheld by the CUDA gate's rule; and
 //!   the traced run's logits and picks equal to the plain steps'.
+//! - `s_serve`: the server's engine over a session of its own: greedy picks,
+//!   a sampled step's row and the keep rule held to this session's host-fed
+//!   steps (`serve.rs`).
 //! - `t_target`: the session as the generation loop's target
 //!   (`runtime::Target`): `generate` over `Plain` and a count stop emits the
 //!   plain steps' own greedy picks with every chained token kept; a
@@ -93,6 +96,8 @@ mod mutants;
 mod nodes;
 #[path = "profile.rs"]
 mod profile;
+#[path = "serve.rs"]
+mod serve;
 #[path = "sets.rs"]
 mod sets;
 #[path = "target.rs"]
@@ -411,13 +416,14 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 9] = [
+    const NAMES: [&str; 10] = [
         "d_count",
         "e_token_id",
         "b_chain",
         "c_resume",
         "a_free",
         "t_target",
+        "s_serve",
         "g_generate",
         "f_deep",
         "p_profile",
@@ -532,6 +538,7 @@ pub fn main() -> ExitCode {
             "b_chain" => chain::b_chain(&mut session),
             "c_resume" => chain::c_resume(&mut session),
             "t_target" => target::t_target(&mut session),
+            "s_serve" => serve::s_serve(&mut session, &device, library, &path),
             "g_generate" => generate::g_generate(&mut session),
             "f_deep" => deep::f_deep(&device, library, &path),
             "p_profile" => profile::p_profile(&device, library, &path),

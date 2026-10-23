@@ -373,6 +373,7 @@ dependencies = [
  "bloomery-placement",
  "bloomery-refset",
  "bloomery-runtime",
+ "bloomery-serve",
  "bloomery-tokenizer",
  "dispatch2",
  "objc2",
