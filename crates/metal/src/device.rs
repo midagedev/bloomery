@@ -195,9 +195,9 @@ impl Device for MetalDevice {
     ) -> Result<(), DeviceError> {
         check_len("write", from.len(), to.len())?;
         s.sync()?;
-        // `to` is a window of a live buffer held exclusively while the pages
-        // live, so they are the only host access to its elements.
-        let mut pages = to.raw().window_pages(to.byte_range()?.start, to.len())?;
+        // SAFETY: `to` is a window of a live buffer held exclusively while the
+        // pages live, so they are the only host access to its elements.
+        let mut pages = unsafe { to.raw().pages::<T>(to.byte_range()?.start, to.len())? };
         pages.write(from)
     }
 

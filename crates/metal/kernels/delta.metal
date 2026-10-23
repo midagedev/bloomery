@@ -9,7 +9,7 @@
 // threadgroup (256 channels, 4 taps).
 //
 // The ring stores the conv input. A predecessor at distance d is 0 while
-// pos < d, otherwise the slot (pos − d) mod 11. The current token is the
+// pos < d, otherwise the slot (pos − d) mod the ring length. The current token is the
 // launch's x, not a ring slot. One threadgroup writes each channel: a q/k
 // channel is the lowest value head of its key head and column block 0, a
 // value channel is the threadgroup that owns the column. Reads finish before
@@ -28,7 +28,7 @@ using namespace metal;
 
 #pragma METAL fp contract(off)
 
-// The step's argument block, bound by value. Eight words, no padding.
+// The step's argument block, bound by value. Seven words: the epsilon is a float.
 struct DeltaArgs {
     uint n_k;
     uint grouped; // 0 tiled (h % n_k), else grouped (h / (n_v / n_k))
@@ -36,14 +36,12 @@ struct DeltaArgs {
     uint lane_at;
     uint layer;
     uint pos;
-    uint eps_bits;
-    uint pad;
+    float eps;
 };
 
-static_assert(sizeof(DeltaArgs) == 32, "DeltaArgs is 32 bytes: the host packs eight words");
-static_assert(BLOOMERY_MATVEC_VALUE_HEADS == 32, "the grid is 32 value heads");
-static_assert(BLOOMERY_MATVEC_HEAD_COLS == 128, "a head is 128 columns");
-static_assert(BLOOMERY_MATVEC_PARTIALS_PER_HEAD == 8, "a head has eight column blocks");
+static_assert(sizeof(DeltaArgs) == 28, "DeltaArgs is 28 bytes: the host packs seven words");
+static_assert(BLOOMERY_DELTA_HEAD_COLS / BLOOMERY_DELTA_COLUMN_BLOCKS == BLOOMERY_DELTA_COLS_PER_BLOCK,
+              "a column block is the head divided by the block count");
 
 constant float Q_SCALE = as_type<float>(0x3db504f3u);
 
@@ -60,7 +58,7 @@ inline float tap_x(uint c, uint pos, uint d, uint ch,
     if (pos < d) {
         return 0.0f;
     }
-    uint s = (pos + 11u - d) % 11u;
+    uint s = (pos + BLOOMERY_DELTA_RING_ROWS - d) % BLOOMERY_DELTA_RING_ROWS;
     return ring[s * ch + c];
 }
 
@@ -131,7 +129,9 @@ inline uint column_or(uint x) {
     return x;
 }
 
-inline uint simd_or(uint x) {
+// The whole simdgroup, in the order the delta's sum contract names:
+// distances 16, 8, 4, 2, 1. These are not the language's reductions.
+inline uint butterfly_or(uint x) {
     x |= simd_shuffle_xor(x, ushort(16));
     x |= simd_shuffle_xor(x, ushort(8));
     x |= simd_shuffle_xor(x, ushort(4));
@@ -140,7 +140,7 @@ inline uint simd_or(uint x) {
     return x;
 }
 
-inline float simd_sum(float x) {
+inline float butterfly_sum(float x) {
     x += simd_shuffle_xor(x, ushort(16));
     x += simd_shuffle_xor(x, ushort(8));
     x += simd_shuffle_xor(x, ushort(4));
@@ -181,18 +181,18 @@ kernel void gdn_step(device const float *x [[buffer(0)]],
     uint tid = tpt.x;
     uint tg = tgp.x;
     uint n_k = args.n_k;
-    uint n_v = BLOOMERY_MATVEC_VALUE_HEADS;
-    uint head = BLOOMERY_MATVEC_HEAD_COLS;
+    uint n_v = BLOOMERY_DELTA_VALUE_HEADS;
+    uint head = BLOOMERY_DELTA_HEAD_COLS;
     uint lanes = args.lanes;
     uint pos = args.pos;
     uint layer = args.layer;
-    float eps = as_type<float>(args.eps_bits);
+    float eps = args.eps;
     uint ch = (2u * n_k + n_v) * head;
-    uint block = tg % 8u;
-    uint h = tg / 8u;
+    uint block = tg % BLOOMERY_DELTA_COLUMN_BLOCKS;
+    uint h = tg / BLOOMERY_DELTA_COLUMN_BLOCKS;
     uint j = (uint)(tiisg % 8);
     uint sub = (uint)(tiisg / 8);
-    uint col = block * 16u + (uint)sgitg * 4u + sub;
+    uint col = block * BLOOMERY_DELTA_COLS_PER_BLOCK + (uint)sgitg * 4u + sub;
     uint col_in_block = (uint)sgitg * 4u + sub;
     uint per = n_v / n_k;
     uint kh = args.grouped != 0u ? h / per : h % n_k;
@@ -213,7 +213,7 @@ kernel void gdn_step(device const float *x [[buffer(0)]],
     bool lane_ok = word < lanes;
 
     // The slot written once per channel. Reads use other slots.
-    uint slot = pos % 11u;
+    uint slot = pos % BLOOMERY_DELTA_RING_ROWS;
 
     bool q_ok = true;
     bool k_ok = true;
@@ -250,7 +250,7 @@ kernel void gdn_step(device const float *x [[buffer(0)]],
     uint my_bad = (q_ok && k_ok && v_ok && prep_ok) ? 0u : 1u;
     // j != 0 did not run the value conv, so its v_ok is still true. The j == 0
     // thread's flag reaches the whole simdgroup through this or.
-    my_bad = simd_or(my_bad);
+    my_bad = butterfly_or(my_bad);
     if (tiisg == 0u) {
         sg_bad[sgitg] = my_bad;
     }
@@ -269,8 +269,8 @@ kernel void gdn_step(device const float *x [[buffer(0)]],
         float k3 = kv[tiisg + 96u];
         float sumq = (q0 * q0 + q1 * q1) + (q2 * q2 + q3 * q3);
         float sumk = (k0 * k0 + k1 * k1) + (k2 * k2 + k3 * k3);
-        sumq = simd_sum(sumq);
-        sumk = simd_sum(sumk);
+        sumq = butterfly_sum(sumq);
+        sumk = butterfly_sum(sumk);
         float sq = l2_scale(sumq, eps);
         float sk = l2_scale(sumk, eps);
         if (tiisg == 0u && (!isfinite(sq) || !isfinite(sk))) {
@@ -351,7 +351,7 @@ kernel void gdn_step(device const float *x [[buffer(0)]],
         if (!lane_ok || conv_bad) {
             p = NAN;
         }
-        partials[h * 8u + block] = p;
+        partials[h * BLOOMERY_DELTA_COLUMN_BLOCKS + block] = p;
     }
 
     if (!lane_ok) {

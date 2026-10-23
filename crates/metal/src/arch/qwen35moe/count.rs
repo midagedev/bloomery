@@ -2,6 +2,13 @@
 //!
 //! The caller passes the layers it has. An empty list is the embed and the
 //! head, not a hidden default trunk.
+//!
+//! The token encoder is the caller. Until that lands, the tests are the use.
+
+#![allow(
+    dead_code,
+    reason = "M2.3a's token encoder is the consumer; the tests pin the count until it lands"
+)]
 
 /// One layer of the token.
 ///
@@ -41,6 +48,8 @@ pub(crate) enum Ticket {
     /// The router and the head are one dispatch and one group each.
     Folded,
     /// Each layer's router, and the head, are two dispatches and two groups.
+    /// The count when a fence cannot fold those dispatches. Nothing encodes
+    /// this path; the tests keep the number.
     Unfolded,
 }
 
@@ -54,109 +63,54 @@ pub(crate) struct TokenCount {
     pub(crate) dispatches: u32,
 }
 
-/// One dispatch and one group: the embed, a folded head, a folded router,
-/// and each step that does not split.
-const ONE: TokenCount = TokenCount {
-    groups: 1,
-    dispatches: 1,
-};
-
-/// Two dispatches in one group: the Q6 projection beside the Q4 one.
-const SPLIT: TokenCount = TokenCount {
-    groups: 1,
-    dispatches: 2,
-};
-
 /// The groups and the dispatches one token encodes for `layers`.
 ///
-/// `live` adds the memory dispatch on attention layers when the keys are
-/// past 64. A folded `ticket` keeps the router and the head one dispatch
-/// each. A count that does not fit `u32` panics by name.
+/// The embed and the head are the 2. Each layer adds six groups: P1, the
+/// mixer, its out, the router, the gate-up and the down. A Q6 projection adds
+/// one dispatch. Live keys past 64 add the memory group on each attention
+/// layer. An unfolded ticket adds one group for each layer's router and one
+/// for the head. A count that does not fit `u32` panics by name.
 pub(crate) fn token_count(layers: &[Layer], live: LiveKeys, ticket: Ticket) -> TokenCount {
-    let mut total = add(embed(), head(ticket));
+    let mut n = 0u32;
+    let mut n_q6 = 0u32;
+    let mut n_attn = 0u32;
     for layer in layers {
-        total = add(total, p1(p1_of(*layer)));
-        total = add(total, after_p1(ticket));
-        if let Some(memory) = memory(*layer, live) {
-            total = add(total, memory);
+        n = fit("layer", n.checked_add(1));
+        let q6 = match layer {
+            Layer::Delta { qkv } => matches!(qkv, Projection::Q6),
+            Layer::Attention { v } => matches!(v, Projection::Q6),
+        };
+        if q6 {
+            n_q6 = fit("Q6", n_q6.checked_add(1));
+        }
+        if matches!(layer, Layer::Attention { .. }) {
+            n_attn = fit("attention", n_attn.checked_add(1));
         }
     }
-    total
-}
-
-fn p1_of(layer: Layer) -> Projection {
-    match layer {
-        Layer::Delta { qkv } => qkv,
-        Layer::Attention { v } => v,
+    let mut groups = fit("group", 2u32.checked_add(fit("group", 6u32.checked_mul(n))));
+    let mut dispatches = fit("dispatch", groups.checked_add(n_q6));
+    if matches!(live, LiveKeys::Past64) {
+        groups = fit("group", groups.checked_add(n_attn));
+        dispatches = fit("dispatch", dispatches.checked_add(n_attn));
     }
-}
-
-fn p1(projection: Projection) -> TokenCount {
-    match projection {
-        Projection::Q4 => ONE,
-        Projection::Q6 => SPLIT,
+    if matches!(ticket, Ticket::Unfolded) {
+        let extra = fit("group", n.checked_add(1));
+        groups = fit("group", groups.checked_add(extra));
+        dispatches = fit("dispatch", dispatches.checked_add(extra));
     }
+    TokenCount { groups, dispatches }
 }
 
-/// The steps after P1: the mixer (D' on a delta layer, F' on an attention
-/// layer), its out (O' or O), the router, the gate-up and the down.
-///
-/// An unfolded ticket makes the router two dispatches and two groups.
-fn after_p1(ticket: Ticket) -> TokenCount {
-    let mixer = ONE;
-    let out = ONE;
-    let router = match ticket {
-        Ticket::Folded => ONE,
-        Ticket::Unfolded => add(ONE, ONE),
-    };
-    let gate_up = ONE;
-    let down = ONE;
-    let mut total = mixer;
-    for step in [out, router, gate_up, down] {
-        total = add(total, step);
-    }
-    total
-}
-
-/// The memory dispatch. Attention only, and only once the live keys are
-/// past 64. A delta layer does not grow.
-fn memory(layer: Layer, live: LiveKeys) -> Option<TokenCount> {
-    if matches!(layer, Layer::Attention { .. }) && matches!(live, LiveKeys::Past64) {
-        Some(ONE)
-    } else {
-        None
-    }
-}
-
-fn embed() -> TokenCount {
-    ONE
-}
-
-fn head(ticket: Ticket) -> TokenCount {
-    match ticket {
-        Ticket::Folded => ONE,
-        Ticket::Unfolded => add(ONE, ONE),
-    }
-}
-
-fn add(total: TokenCount, next: TokenCount) -> TokenCount {
-    TokenCount {
-        groups: match total.groups.checked_add(next.groups) {
-            Some(n) => n,
-            None => panic!("token count: the group count does not fit u32"),
-        },
-        dispatches: match total.dispatches.checked_add(next.dispatches) {
-            Some(n) => n,
-            None => panic!("token count: the dispatch count does not fit u32"),
-        },
+fn fit(what: &str, n: Option<u32>) -> u32 {
+    match n {
+        Some(n) => n,
+        None => panic!("token count: the {what} count does not fit u32"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // PIN(2026-10-22): design-m22c-a section 3.4. Groups, then dispatches.
 
     fn fixture() -> [Layer; 4] {
         [

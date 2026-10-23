@@ -5,9 +5,9 @@ pub const SIMD_WIDTH: usize = 32;
 /// written for a pair.
 pub const ROWS_PER_SIMD_GROUP: usize = 2;
 
-/// The SIMD groups in a mat-vec's threadgroup: the default. A launch may ask
-/// for another (the head kernel of a later round runs eight); the count is the
-/// kernels' function constant, so each count is its own pipeline.
+/// The SIMD groups in a mat-vec's threadgroup: the default. The output head
+/// runs eight; the count is the kernels' function constant, so each count is
+/// its own pipeline.
 pub const SIMD_GROUPS_PER_GROUP: usize = 2;
 
 /// The output rows one threadgroup of a mat-vec owns.

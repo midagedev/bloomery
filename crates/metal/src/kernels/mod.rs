@@ -6,97 +6,55 @@
 //! (a window that is not the shape's is a named [`bloomery_device::DeviceError`], never a
 //! partial read or write), and encodes one dispatch on the caller's encoder.
 //! The kernels themselves are `kernels/{norm,matvec_q4k,matvec_q6k,embed}.metal`.
-//! Decode attention is `kernels/attention.metal`. // K5-REGISTER
+//! Decode attention is `kernels/attention.metal`.
 //!
 //! Three mat-vecs live here, one concept each: the plain mat-vec of one
 //! tensor ([`matvec`]), the segmented mat-vec of up to four tensors of one
 //! type and one width in one dispatch ([`seg`]), and the head-normed residual
 //! mat-vec of a gated delta net's out projection ([`headnorm`]).
-//! The router ([`router`]) is one more pipeline: `kernels/router.metal`, its ticket `kernels/ticket.metal`. // K2-REGISTER
-//! The routed gate-up pair and the folded down are one dispatch each. // K3-REGISTER
-//! The gated delta step ([`delta`]) writes the numerator and the partials that // K4-REGISTER
-//! mat-vec reads. Its kernel is `kernels/delta.metal`. // K4-REGISTER
-//! Decode attention is `kernels/attention.metal`. // K5-REGISTER
-//! The head ([`head`]) is one more pipeline: `kernels/head.metal`, the same ticket. // K6-REGISTER
+//! The router ([`router`]) is one more pipeline: `kernels/router.metal`, its ticket `kernels/ticket.metal`.
+//! The routed gate-up pair and the folded down are one dispatch each.
+//! The gated delta step ([`delta`]) writes the numerator and the partials that
+//! mat-vec reads. Its kernel is `kernels/delta.metal`.
+//! The head ([`head`]) is one more pipeline: `kernels/head.metal`, the same ticket.
 
-mod attention; // K5-REGISTER
-mod delta; // K4-REGISTER
+mod attention;
+mod delta;
 mod embed;
-mod experts; // K3-REGISTER
+mod experts;
 mod geometry;
-mod head; // K6-REGISTER
+mod head;
 mod headnorm;
 mod matvec;
-mod router; // K2-REGISTER
+pub mod router;
 mod seg;
 
 pub use attention::{
-    // K5-REGISTER
-    AttentionParams, // K5-REGISTER
-    AttnCache,       // K5-REGISTER
-    HEAD_DIM,        // K5-REGISTER
-    KV_HEADS,        // K5-REGISTER
-    QUERY_HEADS,     // K5-REGISTER
-    ROT,             // K5-REGISTER
-    SCALE,           // K5-REGISTER
-    TILE,            // K5-REGISTER
-    f16_len,         // K5-REGISTER
-    out_len,         // K5-REGISTER
-    partials_len,    // K5-REGISTER
-    q8_code_len,     // K5-REGISTER
-    q8_scale_len,    // K5-REGISTER
+    AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QUERY_HEADS, ROT, SCALE, TILE, f16_len,
+    out_len, partials_len, q8_code_len, q8_scale_len,
 };
-pub use delta::CONV_TAPS; // K4-REGISTER
-pub use delta::DeltaParams; // K4-REGISTER
-pub use delta::HeadMap; // K4-REGISTER
-pub use delta::PASS_ROWS; // K4-REGISTER
-pub use delta::Q_SCALE; // K4-REGISTER
-pub use delta::RING_ROWS; // K4-REGISTER
-pub use delta::channels; // K4-REGISTER
-pub use delta::key_of; // K4-REGISTER
-pub use delta::ring_elems; // K4-REGISTER
-pub use delta::state_elems; // K4-REGISTER
-pub use delta::state_index; // K4-REGISTER
+pub use delta::CONV_TAPS;
+pub use delta::DeltaParams;
+pub use delta::HeadMap;
+pub use delta::PASS_ROWS;
+pub use delta::Q_SCALE;
+pub use delta::RING_ROWS;
+pub use delta::channels;
+pub use delta::key_of;
+pub use delta::ring_elems;
+pub use delta::state_elems;
+pub use delta::state_index;
 pub use embed::EmbedParams;
 pub use experts::{
-    // K3-REGISTER
-    EXPERT_K,     // K3-REGISTER
-    EXPERT_SLOTS, // K3-REGISTER
-    FoldParams,   // K3-REGISTER
-    PairParams,   // K3-REGISTER
-    ROUTED_IDS,   // K3-REGISTER
-    SHARED_SLOT,  // K3-REGISTER
-    SharedPlan,   // K3-REGISTER
-}; // K3-REGISTER
+    EXPERT_K, EXPERT_SLOTS, FoldParams, PairParams, ROUTED_IDS, SHARED_SLOT, SharedPlan,
+};
 pub use geometry::{
     BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,
     SIMD_GROUPS_PER_GROUP, THREADS_PER_GROUP, VALUE_HEADS,
 };
+pub use head::{HEAD_GROUPS, HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HEAD_VOCAB, HeadParams};
 pub use headnorm::HeadNormParams;
 pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
-#[rustfmt::skip] // K2-REGISTER
-pub use router::{ // K2-REGISTER
-    EXPERTS,      // K2-REGISTER
-    FLOAT4S,      // K2-REGISTER
-    GROUPS,       // K2-REGISTER
-    K,            // K2-REGISTER
-    PARTIALS,     // K2-REGISTER
-    ROWS,         // K2-REGISTER
-    RouterParams, // K2-REGISTER
-    SIMD_GROUPS,  // K2-REGISTER
-    SPLIT,        // K2-REGISTER
-    THREADS,      // K2-REGISTER
-    TOP_K_MAX,    // K2-REGISTER
-}; // K2-REGISTER
-#[rustfmt::skip] // K6-REGISTER
-pub use head::{ // K6-REGISTER
-    HEAD_GROUPS,      // K6-REGISTER
-    HEAD_K,           // K6-REGISTER
-    HEAD_SIMD_GROUPS, // K6-REGISTER
-    HEAD_THREADS,     // K6-REGISTER
-    HEAD_VOCAB,       // K6-REGISTER
-    HeadParams,       // K6-REGISTER
-}; // K6-REGISTER
 pub use seg::{SegParams, Segment};
 
 use bloomery_device::DeviceError;
@@ -136,15 +94,12 @@ pub struct Kernels {
     q6k: MatvecPipelines,
     headnorm: Pipeline,
     embed: Pipeline,
-    router: Pipeline,  // K2-REGISTER
-    pair_q4: Pipeline, // K3-REGISTER
-    pair_q6: Pipeline, // K3-REGISTER
-    fold_q4: Pipeline, // K3-REGISTER
-    fold_q6: Pipeline, // K3-REGISTER
-    /// The gated delta step. // K4-REGISTER
-    delta: Pipeline, // K4-REGISTER
-    attention: attention::AttentionPipelines, // K5-REGISTER
-    head: Pipeline,    // K6-REGISTER
+    router: Pipeline,
+    experts: experts::Pipelines,
+    /// The gated delta step.
+    delta: Pipeline,
+    attention: attention::AttentionPipelines,
+    head: Pipeline,
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -209,15 +164,17 @@ impl Kernels {
             )?,
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             embed: library.pipeline("embed_q4k")?,
-            router: library.pipeline("router35")?, // K2-REGISTER
-            pair_q4: library.pipeline("q4k_pair_swiglu")?, // K3-REGISTER
-            pair_q6: library.pipeline("q6k_pair_swiglu")?, // K3-REGISTER
-            fold_q4: library.pipeline("q4k_down_fold")?, // K3-REGISTER
-            fold_q6: library.pipeline("q6k_down_fold")?, // K3-REGISTER
-            delta: library.pipeline("gdn_step")?,  // K4-REGISTER
-            attention: attention::AttentionPipelines::new(library)?, // K5-REGISTER
-            // Eight SIMD groups, not the mat-vec count this function was given. // K6-REGISTER
-            head: library.pipeline_with_simdgroups("q6k_head_argmax", 8)?, // K6-REGISTER
+            router: library.pipeline("router35")?,
+            experts: experts::Pipelines::new(library)?,
+            delta: library.pipeline("gdn_step")?,
+            attention: attention::AttentionPipelines::new(library)?,
+            // The head's SIMD-group count, not the mat-vec count this function
+            // was given. The constant is the pipeline's function constant.
+            head: library.pipeline_with_simdgroups(
+                "q6k_head_argmax",
+                u32::try_from(head::HEAD_SIMD_GROUPS)
+                    .expect("the head's SIMD-group count fits u32"),
+            )?,
             simdgroups,
         })
     }
@@ -235,21 +192,82 @@ impl Kernels {
     }
 }
 
-/// A kernel's argument block, as the bytes the kernel reads: the words in
-/// order, each in the machine's byte order.
-pub(crate) fn args_bytes(words: [u32; 4]) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-        *chunk = word.to_ne_bytes();
+/// A named range error. Launch modules build every refusal through this.
+pub(crate) fn range(what: &'static str, detail: impl Into<String>) -> DeviceError {
+    DeviceError::Range {
+        what,
+        detail: detail.into(),
     }
-    out
+}
+
+/// How a kernel reads a weight window.
+pub(crate) enum WeightAlign {
+    /// The kernel loads `float4` from the window.
+    Float4,
+    /// The kernel loads 16-bit words from the window.
+    Half,
+}
+
+/// `start` is the window's first byte in its buffer. A misaligned window is
+/// refused by name: the message names the word the kernel loads.
+pub(crate) fn check_weights_align(
+    what: &'static str,
+    name: &str,
+    start: usize,
+    kind: WeightAlign,
+) -> Result<(), DeviceError> {
+    match kind {
+        WeightAlign::Float4 => {
+            if start.is_multiple_of(16) {
+                return Ok(());
+            }
+            Err(range(
+                what,
+                format!(
+                    "the {name} window starts {start} bytes into its buffer and is not 16-byte aligned"
+                ),
+            ))
+        }
+        WeightAlign::Half => {
+            if start.is_multiple_of(2) {
+                return Ok(());
+            }
+            Err(range(
+                what,
+                format!(
+                    "the {name} weights start {start} bytes into their buffer: the kernels read 16-bit words"
+                ),
+            ))
+        }
+    }
+}
+
+/// The bytes of `rows` rows of `nblocks` quantized blocks. `None` when the
+/// product does not fit. An expert stack multiplies the result by the expert
+/// count.
+pub(crate) fn weight_bytes(quant: Quant, rows: usize, nblocks: usize) -> Option<usize> {
+    rows.checked_mul(nblocks)?.checked_mul(quant.block_bytes())
+}
+
+/// The bytes a kernel reads: `words` in order, each already in the machine's
+/// byte order.
+pub(crate) fn pack<const N: usize>(words: &[[u8; 4]; N]) -> &[u8] {
+    words.as_flattened()
+}
+
+/// A kernel's argument words, each in the machine's byte order. [`pack`] is
+/// the bytes.
+pub(crate) fn args_bytes<const N: usize>(words: [u32; N]) -> [[u8; 4]; N] {
+    words.map(u32::to_ne_bytes)
 }
 
 /// A count as the kernel's 32-bit word, refused by name when it does not fit.
 pub(crate) fn word(what: &'static str, name: &str, n: usize) -> Result<u32, DeviceError> {
-    u32::try_from(n).map_err(|_| DeviceError::Range {
-        what,
-        detail: format!("{name} of {n} does not fit the kernel's 32-bit word"),
+    u32::try_from(n).map_err(|_| {
+        range(
+            what,
+            format!("{name} of {n} does not fit the kernel's 32-bit word"),
+        )
     })
 }
 
@@ -266,11 +284,11 @@ pub(crate) fn check_window_len(
     if got.get() == want {
         return Ok(());
     }
-    Err(DeviceError::Range {
+    Err(range(
         what,
-        detail: format!(
+        format!(
             "the {name} window holds {} elements, the shape needs {want}",
             got.get()
         ),
-    })
+    ))
 }

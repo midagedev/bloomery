@@ -3,12 +3,12 @@
 use bloomery_device::{DeviceError, Window, WindowMut};
 
 use crate::device::MetalDevice;
-use crate::encode::{Binding, ComputeEncoder};
+use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
 use super::geometry::BLOCK_VALUES;
 use super::matvec::Quant;
-use super::{Kernels, args_bytes, check_window_len, word};
+use super::{Kernels, args_bytes, check_window_len, pack, word};
 
 /// The threads in an embedding's threadgroup.
 const GROUP_THREADS: usize = 256;
@@ -32,11 +32,10 @@ pub struct EmbedParams<'w> {
     pub layer: u32,
 }
 
-fn refuse(detail: String) -> DeviceError {
-    DeviceError::Range {
-        what: "embed",
-        detail,
-    }
+const WHAT: &str = "embed";
+
+fn refuse(detail: impl Into<String>) -> DeviceError {
+    super::range(WHAT, detail)
 }
 
 impl Kernels {
@@ -64,36 +63,31 @@ impl Kernels {
             )));
         }
         let nblocks = p.cols / BLOCK_VALUES;
-        let table_bytes = p
-            .vocab
-            .checked_mul(nblocks)
-            .and_then(|blocks| blocks.checked_mul(Quant::Q4K.block_bytes()))
+        let table_bytes = super::weight_bytes(Quant::Q4K, p.vocab, nblocks)
             .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.vocab, p.cols)))?;
-        check_window_len("embed", "table", p.table.len(), table_bytes)?;
+        check_window_len(WHAT, "table", p.table.len(), table_bytes)?;
         let values = count
             .checked_mul(p.cols)
             .ok_or_else(|| refuse(format!("{count} ids of {} columns wrap", p.cols)))?;
-        check_window_len("embed", "out", p.out.len(), values)?;
+        check_window_len(WHAT, "out", p.out.len(), values)?;
         let start = p.table.byte_range()?.start.get();
-        if !start.is_multiple_of(2) {
-            return Err(refuse(format!(
-                "the table starts {start} bytes into its buffer: the kernel reads 16-bit words"
-            )));
-        }
+        super::check_weights_align(WHAT, "table", start, super::WeightAlign::Half)?;
         let args = args_bytes([
-            word("embed", "the vocabulary", p.vocab)?,
-            word("embed", "the block count", nblocks)?,
+            word(WHAT, "the vocabulary", p.vocab)?,
+            word(WHAT, "the block count", nblocks)?,
             p.layer,
-            word("embed", "the id count", count)?,
+            word(WHAT, "the id count", count)?,
         ]);
         // One thread per value, and a thread's index is a 32-bit word.
-        word("embed", "the value count", values)?;
+        // The columns are a multiple of the group, so the value count is too.
+        word(WHAT, "the value count", values)?;
         encoder.set_pipeline(&self.embed);
-        encoder.set_binding(0, Binding::of(&p.table)?)?;
-        encoder.set_binding(1, Binding::of(&p.ids)?)?;
-        encoder.set_binding(2, Binding::of_mut(&p.out)?)?;
-        encoder.set_binding(3, Binding::bytes(&args)?)?;
-        encoder.set_binding(4, p.fault.binding())?;
-        encoder.dispatch(values, GROUP_THREADS)
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.table)?)?;
+        slot.set(Binding::of(&p.ids)?)?;
+        slot.set(Binding::of_mut(&p.out)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.set(p.fault.binding())?;
+        slot.dispatch_groups(values / GROUP_THREADS, 1, GROUP_THREADS)
     }
 }

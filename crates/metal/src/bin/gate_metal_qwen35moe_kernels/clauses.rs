@@ -1383,3 +1383,35 @@ fn head_scaled(g: &[f32], partials: &[f32], eps: f32) -> Vec<f64> {
         .map(|c| f64::from(g[c]) * scales[c / HEAD_COLS])
         .collect()
 }
+
+/// The mat-vec, segment, embed and head-norm clauses, in gate order.
+pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    vec![
+        ("q4k_matvec", Box::new(|| ctx.with(q4k_matvec))),
+        ("q6k_matvec", Box::new(|| ctx.with(q6k_matvec))),
+        ("norm_on_load", Box::new(|| ctx.with(norm_on_load))),
+        (
+            "residual_epilogue",
+            Box::new(|| ctx.with(residual_epilogue)),
+        ),
+        ("row_tail", Box::new(|| ctx.with(row_tail))),
+        ("row_tail_reads", Box::new(|| row_tail_reads(ctx.args))),
+        (
+            "metallib_equals_source",
+            Box::new(|| match ctx.fixture {
+                Ok(fixture) => {
+                    metallib_equals_source(ctx.harness.device, ctx.harness.stream, fixture)
+                }
+                Err(e) => Err(e.clone()),
+            }),
+        ),
+        ("embed", Box::new(|| ctx.with(embed))),
+        ("matvec_refusals", Box::new(|| matvec_refusals(ctx.harness))),
+        ("block_shape", Box::new(block_shape)),
+        ("seg_bit", Box::new(|| ctx.with(seg_bit))),
+        ("seg_bounds", Box::new(|| ctx.with(seg_bounds))),
+        ("headnorm", Box::new(|| ctx.with(headnorm))),
+        ("headnorm_nan", Box::new(|| ctx.with(headnorm_nan))),
+        ("nsg", Box::new(|| ctx.with(nsg))),
+    ]
+}

@@ -218,82 +218,68 @@ impl ComputeEncoder<'_> {
         Ok(())
     }
 
-    /// The dispatch: `threads` threads, `threads_per_group` of them in a
-    /// group. A pipeline not set, no threads, no group, or a group larger than
-    /// the pipeline allows is refused by name.
-    pub fn dispatch(
-        &mut self,
-        threads: usize,
-        threads_per_group: usize,
-    ) -> Result<(), DeviceError> {
-        let refuse = |detail: String| DeviceError::Range {
-            what: "dispatch",
-            detail,
-        };
-        let Some(max) = self.max_threads_per_group else {
-            return Err(refuse("no pipeline is set".to_string()));
-        };
-        if threads == 0 || threads_per_group == 0 {
-            return Err(refuse(format!(
-                "{threads} threads in groups of {threads_per_group} is refused"
-            )));
-        }
-        if threads_per_group > max {
-            return Err(refuse(format!(
-                "a group of {threads_per_group} threads passes the pipeline's {max}"
-            )));
-        }
-        self.encoder.dispatchThreads_threadsPerThreadgroup(
-            MTLSize {
-                width: to_ns(threads),
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: to_ns(threads_per_group),
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
-    }
-
-    /// A two-dimensional dispatch: `groups_x` by `groups_y` threadgroups, each
-    /// of `threads_per_group` threads. The group's height is one, so the
-    /// grid's height is `groups_y`. A pipeline not set, no groups, or a group
-    /// larger than the pipeline allows is refused by name.
-    pub fn dispatch_grid(
+    /// The dispatch: `groups_x` by `groups_y` threadgroups, each of
+    /// `threads_per_group` threads. The group's height is one, so the grid's
+    /// height is `groups_y` and its width is `groups_x` groups. A pipeline not
+    /// set, an empty grid, a group larger than the pipeline allows, or a width
+    /// that wraps is refused by name.
+    pub fn dispatch_groups(
         &mut self,
         groups_x: usize,
         groups_y: usize,
         threads_per_group: usize,
     ) -> Result<(), DeviceError> {
-        let refuse = |detail: String| DeviceError::Range {
-            what: "dispatch",
-            detail,
-        };
+        self.check_group(groups_x, groups_y, threads_per_group)?;
+        let width = groups_x
+            .checked_mul(threads_per_group)
+            .ok_or_else(|| DeviceError::Range {
+                what: "dispatch",
+                detail: format!("{groups_x} groups of {threads_per_group} threads wrap"),
+            })?;
+        self.submit(width, groups_y, threads_per_group);
+        Ok(())
+    }
+
+    /// A pipeline is set, the grid is not empty, and the group is within the
+    /// pipeline's maximum. The width's wrap is checked by the caller.
+    fn check_group(
+        &self,
+        groups_x: usize,
+        groups_y: usize,
+        threads_per_group: usize,
+    ) -> Result<(), DeviceError> {
         let Some(max) = self.max_threads_per_group else {
-            return Err(refuse("no pipeline is set".to_string()));
+            return Err(DeviceError::Range {
+                what: "dispatch",
+                detail: "no pipeline is set".to_string(),
+            });
         };
         if groups_x == 0 || groups_y == 0 || threads_per_group == 0 {
-            return Err(refuse(format!(
-                "{groups_x} by {groups_y} groups of {threads_per_group} is refused"
-            )));
+            return Err(DeviceError::Range {
+                what: "dispatch",
+                detail: format!(
+                    "{groups_x} by {groups_y} groups of {threads_per_group} is refused"
+                ),
+            });
         }
         if threads_per_group > max {
-            return Err(refuse(format!(
-                "a group of {threads_per_group} threads passes the pipeline's {max}"
-            )));
+            return Err(DeviceError::Range {
+                what: "dispatch",
+                detail: format!(
+                    "a group of {threads_per_group} threads passes the pipeline's {max}"
+                ),
+            });
         }
-        let width = groups_x.checked_mul(threads_per_group).ok_or_else(|| {
-            refuse(format!(
-                "{groups_x} groups of {threads_per_group} threads wrap"
-            ))
-        })?;
+        Ok(())
+    }
+
+    /// Record the grid. `width` is the threads across, `height` the
+    /// threadgroups down, and every group holds `threads_per_group` threads.
+    fn submit(&self, width: usize, height: usize, threads_per_group: usize) {
         self.encoder.dispatchThreads_threadsPerThreadgroup(
             MTLSize {
                 width: to_ns(width),
-                height: to_ns(groups_y),
+                height: to_ns(height),
                 depth: 1,
             },
             MTLSize {
@@ -302,7 +288,6 @@ impl ComputeEncoder<'_> {
                 depth: 1,
             },
         );
-        Ok(())
     }
 
     /// A barrier on the encoder's buffers: the dispatches before it are one
@@ -318,6 +303,37 @@ impl ComputeEncoder<'_> {
     /// The encoder is done; the recording may be submitted.
     pub fn end(self) {
         // `Drop` ends the encoding.
+    }
+}
+
+/// Bindings filled from slot 0. The nth call is the kernel's `[[buffer(n)]]`.
+pub struct Bindings<'a, 'b> {
+    encoder: &'a mut ComputeEncoder<'b>,
+    next: usize,
+}
+
+impl<'a, 'b> Bindings<'a, 'b> {
+    /// Bindings on `encoder`, starting at slot 0.
+    pub fn new(encoder: &'a mut ComputeEncoder<'b>) -> Self {
+        Self { encoder, next: 0 }
+    }
+
+    /// The next slot.
+    pub fn set(&mut self, binding: Binding<'_>) -> Result<(), DeviceError> {
+        let index = self.next;
+        self.next += 1;
+        self.encoder.set_binding(index, binding)
+    }
+
+    /// [`ComputeEncoder::dispatch_groups`] on the encoder these bindings fill.
+    pub fn dispatch_groups(
+        &mut self,
+        groups_x: usize,
+        groups_y: usize,
+        threads_per_group: usize,
+    ) -> Result<(), DeviceError> {
+        self.encoder
+            .dispatch_groups(groups_x, groups_y, threads_per_group)
     }
 }
 

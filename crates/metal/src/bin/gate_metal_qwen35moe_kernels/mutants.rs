@@ -29,7 +29,6 @@ const ROW_POINTER: &str = "rp[r] = W + (ulong)min(first_row + r, rows - 1) * (ul
 const ROW_POINTER_RAW: &str = "rp[r] = W + (ulong)(first_row + r) * (ulong)nb;";
 const EARLY_RETURN: &str = "    if (first_row >= rows) {\n        return;\n    }\n";
 
-#[rustfmt::skip] // K4-REGISTER
 pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "q4k_dmin_sign",
@@ -135,8 +134,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "headnorm",
         why: "the head scale divides the sum by twice the head's columns",
         edits: &[(
-            "sum / float(BLOOMERY_MATVEC_HEAD_COLS)",
-            "sum / float(BLOOMERY_MATVEC_HEAD_COLS * 2)",
+            "sum / float(BLOOMERY_DELTA_HEAD_COLS)",
+            "sum / float(BLOOMERY_DELTA_HEAD_COLS * 2)",
             1,
         )],
     },
@@ -161,235 +160,222 @@ pub const MUTANTS: &[Mutant] = &[
         name: "nsg_first_row",
         clause: "nsg",
         why: "the first row of a threadgroup ignores the SIMD group count",
-        edits: &[("BLOOMERY_MATVEC_SIMD_GROUPS + sgitg", "2 + sgitg", 9)],
+        edits: &[("BLOOMERY_MATVEC_SIMD_GROUPS + sg", "2 + sg", 1)],
     },
     Mutant {
-        // K2-REGISTER
-        name: "router_logit",                                    // K2-REGISTER
-        clause: "router_logit",                                  // K2-REGISTER
-        why: "one component of every float4 product is dropped", // K2-REGISTER
-        edits: &[("router_acc += w.x * h.x", "router_acc += 0.f", 1)], // K2-REGISTER
-    }, // K2-REGISTER
+        name: "router_logit",
+        clause: "router_logit",
+        why: "one component of every float4 product is dropped",
+        edits: &[("acc += w.x * h.x", "acc += 0.f", 1)],
+    },
     Mutant {
-        // K2-REGISTER
-        name: "router_ids",                           // K2-REGISTER
-        clause: "router_ids",                         // K2-REGISTER
-        why: "the selection keeps the smaller logit", // K2-REGISTER
+        name: "router_ids",
+        clause: "router_ids",
+        why: "the selection keeps the smaller logit",
+        edits: &[("!any || v > best_v", "!any || v < best_v", 1)],
+    },
+    Mutant {
+        name: "router_weights",
+        clause: "router_weights",
+        why: "a routed weight is the exponential, not its share of the eight",
+        edits: &[("weights[s] = term[s] / sum_exp", "weights[s] = term[s]", 1)],
+    },
+    Mutant {
+        name: "router_ticket",
+        clause: "router_ticket",
+        why: "a routed id is one past the selected expert",
+        edits: &[("ids[s] = best_i", "ids[s] = best_i + 1u", 1)],
+    },
+    Mutant {
+        name: "router_nan",
+        clause: "router_nan",
+        why: "a non-finite logit raises nothing",
         edits: &[(
-            // K2-REGISTER
-            "router_better = v > best_v", // K2-REGISTER
-            "router_better = v < best_v", // K2-REGISTER
-            1,                            // K2-REGISTER
-        )], // K2-REGISTER
-    }, // K2-REGISTER
+            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_ROUTER);",
+            "",
+            1,
+        )],
+    },
     Mutant {
-        // K2-REGISTER
-        name: "router_weights",   // K2-REGISTER
-        clause: "router_weights", // K2-REGISTER
-        why: "a routed weight is the exponential, not its share of the eight", // K2-REGISTER
+        name: "router_bounds",
+        clause: "router_bounds",
+        why: "the last threadgroup does not run the epilogue",
         edits: &[(
-            // K2-REGISTER
-            "router_weight = term[s] / sum_exp", // K2-REGISTER
-            "router_weight = term[s]",           // K2-REGISTER
-            1,                                   // K2-REGISTER
-        )], // K2-REGISTER
-    }, // K2-REGISTER
+            "if (last_flag == 1u && tid == 0u) {\n        route_last(",
+            "if (last_flag == 2u && tid == 0u) {\n        route_last(",
+            1,
+        )],
+    },
+    // fold_type and experts_bounds check the host, so they have no kernel mutant.
     Mutant {
-        // K2-REGISTER
-        name: "router_ticket",                              // K2-REGISTER
-        clause: "router_ticket",                            // K2-REGISTER
-        why: "a routed id is one past the selected expert", // K2-REGISTER
+        name: "pair_no_silu",
+        clause: "pair",
+        why: "the pair multiplies gate by up and skips silu",
         edits: &[(
-            // K2-REGISTER
-            "ids[s] = router_chosen[s]",      // K2-REGISTER
-            "ids[s] = router_chosen[s] + 1u", // K2-REGISTER
-            1,                                // K2-REGISTER
-        )], // K2-REGISTER
-    }, // K2-REGISTER
+            "return gate / (1.0f + exp(-gate)) * up;",
+            "return gate * up;",
+            1,
+        )],
+    },
     Mutant {
-        // K2-REGISTER
-        name: "router_nan",                       // K2-REGISTER
-        clause: "router_nan",                     // K2-REGISTER
-        why: "a non-finite logit raises nothing", // K2-REGISTER
+        name: "pair_id_zero",
+        clause: "pair_id",
+        why: "an id past the stack writes zero",
         edits: &[(
-            // K2-REGISTER
-            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_ROUTER);", // K2-REGISTER
-            "",                                                       // K2-REGISTER
-            1,                                                        // K2-REGISTER
-        )], // K2-REGISTER
-    }, // K2-REGISTER
+            "y[(ulong)slot * stride + row] = NAN;",
+            "y[(ulong)slot * stride + row] = 0.0f;",
+            1,
+        )],
+    },
     Mutant {
-        // K2-REGISTER
-        name: "router_bounds",                        // K2-REGISTER
-        clause: "router_bounds",                      // K2-REGISTER
-        why: "every thread returns before it writes", // K2-REGISTER
-        edits: &[("router_bounds_gate == 0u", "router_bounds_gate == 1u", 1)], // K2-REGISTER
-    }, // K2-REGISTER
-    // fold_type and experts_bounds check the host, so they have no kernel mutant. // K3-REGISTER
+        name: "pair_shared_stack",
+        clause: "pair_shared",
+        why: "slot 8 reads the expert stack",
+        edits: &[("return shared_slot ? shexp : stack;", "return stack;", 1)],
+    },
     Mutant {
-        // K3-REGISTER
-        name: "pair_no_silu",                                 // K3-REGISTER
-        clause: "pair",                                       // K3-REGISTER
-        why: "the pair multiplies gate by up and skips silu", // K3-REGISTER
+        name: "fold_drop_weight",
+        clause: "fold",
+        why: "the fold loads the activation without the route weight",
+        edits: &[("float scale = w[ib >> 1];", "float scale = 1.0f;", 2)],
+    },
+    Mutant {
+        name: "fold_no_resid",
+        clause: "fold",
+        why: "the fold overwrites the residual",
+        edits: &[
+            ("y[(uint)row0] += d0;", "y[(uint)row0] = d0;", 2),
+            ("y[(uint)row1] += d1;", "y[(uint)row1] = d1;", 2),
+        ],
+    },
+    Mutant {
+        name: "delta_fma_sign",
+        clause: "delta_step",
+        why: "the state update subtracts k*u",
         edits: &[(
-            "return gate / (1.0f + exp(-gate)) * up;", // K3-REGISTER
-            "return gate * up;",                       // K3-REGISTER
-            1,                                         // K3-REGISTER
-        )], // K3-REGISTER
-    }, // K3-REGISTER
+            "sp[i] = fma(kk[i], u, sp[i]);",
+            "sp[i] = fma(-kk[i], u, sp[i]);",
+            1,
+        )],
+    },
     Mutant {
-        // K3-REGISTER
-        name: "pair_id_zero",                    // K3-REGISTER
-        clause: "pair_id",                       // K3-REGISTER
-        why: "an id past the stack writes zero", // K3-REGISTER
-        edits: &[("float pair_bad = NAN;", "float pair_bad = 0.0f;", 1)], // K3-REGISTER
-    }, // K3-REGISTER
-    Mutant {
-        // K3-REGISTER
-        name: "pair_shared_stack",            // K3-REGISTER
-        clause: "pair_shared",                // K3-REGISTER
-        why: "slot 8 reads the expert stack", // K3-REGISTER
-        edits: &[("return shared_slot ? shexp : stack;", "return stack;", 1)], // K3-REGISTER
-    }, // K3-REGISTER
-    Mutant {
-        // K3-REGISTER
-        name: "fold_drop_weight", // K3-REGISTER
-        clause: "fold",           // K3-REGISTER
-        why: "the fold loads the activation without the route weight", // K3-REGISTER
-        edits: &[("float xscale = w[block >> 1];", "float xscale = 1.0f;", 1)], // K3-REGISTER
-    }, // K3-REGISTER
-    Mutant {
-        // K3-REGISTER
-        name: "fold_no_resid",                            // K3-REGISTER
-        clause: "fold",                                   // K3-REGISTER
-        why: "the fold overwrites the residual",          // K3-REGISTER
-        edits: &[("y[row] += dot;", "y[row] = dot;", 1)], // K3-REGISTER
-    }, // K3-REGISTER
-    Mutant { // K4-REGISTER
-        name: "delta_fma_sign",                // K4-REGISTER
-        clause: "delta_step",                  // K4-REGISTER
-        why: "the state update subtracts k*u", // K4-REGISTER
-        edits: &[( // K4-REGISTER
-            "sp[i] = fma(kk[i], u, sp[i]);",  // K4-REGISTER
-            "sp[i] = fma(-kk[i], u, sp[i]);", // K4-REGISTER
-            1,                                // K4-REGISTER
-        )], // K4-REGISTER
-    }, // K4-REGISTER
-    Mutant { // K4-REGISTER
-        name: "delta_roll_keep",                          // K4-REGISTER
-        clause: "delta_roll",                             // K4-REGISTER
-        why: "the state store keeps the value it loaded", // K4-REGISTER
-        edits: &[( // K4-REGISTER
-            "state[base + key] = sp[i];", // K4-REGISTER
-            "state[base + key] = s0[i];", // K4-REGISTER
-            1,                            // K4-REGISTER
-        )], // K4-REGISTER
-    }, // K4-REGISTER
-    Mutant { // K4-REGISTER
-        name: "delta_ring_slot",                  // K4-REGISTER
-        clause: "delta_ring",                     // K4-REGISTER
-        why: "the ring write uses the next slot", // K4-REGISTER
-        edits: &[( // K4-REGISTER
-            "uint slot = pos % 11u;",        // K4-REGISTER
-            "uint slot = (pos + 1u) % 11u;", // K4-REGISTER
-            1,                               // K4-REGISTER
-        )], // K4-REGISTER
-    }, // K4-REGISTER
-    Mutant { // K4-REGISTER
-        name: "delta_partial_scale",            // K4-REGISTER
-        clause: "delta_partial",                // K4-REGISTER
-        why: "the partial sum is stored twice", // K4-REGISTER
-        edits: &[( // K4-REGISTER
-            "partials[h * 8u + block] = p;",     // K4-REGISTER
-            "partials[h * 8u + block] = p + p;", // K4-REGISTER
-            1,                                   // K4-REGISTER
-        )], // K4-REGISTER
-    }, // K4-REGISTER
-    Mutant { // K4-REGISTER
-        name: "delta_nan_zero",               // K4-REGISTER
-        clause: "delta_nan",                  // K4-REGISTER
-        why: "a non-finite lane stores zero", // K4-REGISTER
-        edits: &[( // K4-REGISTER
-            "state[base + key] = NAN;",  // K4-REGISTER
-            "state[base + key] = 0.0f;", // K4-REGISTER
-            1,                           // K4-REGISTER
-        )], // K4-REGISTER
-    }, // K4-REGISTER
-    Mutant {
-        // K5-REGISTER
-        name: "attn_score_scale",                 // K5-REGISTER
-        clause: "attn-f16",                       // K5-REGISTER
-        why: "the score is twice the scaled dot", // K5-REGISTER
+        name: "delta_roll_keep",
+        clause: "delta_roll",
+        why: "the state store keeps the value it loaded",
         edits: &[(
-            // K5-REGISTER
-            "float score = dot * args.scale;",        // K5-REGISTER
-            "float score = dot * args.scale * 2.0f;", // K5-REGISTER
-            1,                                        // K5-REGISTER
-        )], // K5-REGISTER
-    }, // K5-REGISTER
+            "state[base + key] = sp[i];",
+            "state[base + key] = s0[i];",
+            1,
+        )],
+    },
     Mutant {
-        // K5-REGISTER
-        name: "attn_q8_id", // K5-REGISTER
-        clause: "attn-q8",  // K5-REGISTER
-        why: "a q8_0 code uses 126 / amax instead of the host quantizer's 127 / amax", // K5-REGISTER
-        edits: &[("127.0f / amax", "126.0f / amax", 1)], // K5-REGISTER
-    }, // K5-REGISTER
-    Mutant {
-        // K5-REGISTER
-        name: "attn_key_count", // K5-REGISTER
-        clause: "attn-fault",   // K5-REGISTER
-        why: "a live key count of zero or past the cache raises nothing", // K5-REGISTER
+        name: "delta_ring_slot",
+        clause: "delta_ring",
+        why: "the ring write uses the next slot",
         edits: &[(
-            // K5-REGISTER
-            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_KEY_COUNT);", // K5-REGISTER
-            "",                                                          // K5-REGISTER
-            1,                                                           // K5-REGISTER
-        )], // K5-REGISTER
-    }, // K5-REGISTER
+            "uint slot = pos % BLOOMERY_DELTA_RING_ROWS;",
+            "uint slot = (pos + 1u) % BLOOMERY_DELTA_RING_ROWS;",
+            1,
+        )],
+    },
     Mutant {
-        // K6-REGISTER
-        name: "head_logit",                 // K6-REGISTER
-        clause: "head_logit",               // K6-REGISTER
-        why: "the stored logit is doubled", // K6-REGISTER
+        name: "delta_partial_scale",
+        clause: "delta_partial",
+        why: "the partial sum is stored twice",
         edits: &[(
-            "float head_logit_scale = 1.f", // K6-REGISTER
-            "float head_logit_scale = 2.f", // K6-REGISTER
-            1,                              // K6-REGISTER
-        )], // K6-REGISTER
-    }, // K6-REGISTER
+            "partials[h * BLOOMERY_DELTA_COLUMN_BLOCKS + block] = p;",
+            "partials[h * BLOOMERY_DELTA_COLUMN_BLOCKS + block] = p + p;",
+            1,
+        )],
+    },
     Mutant {
-        // K6-REGISTER
-        name: "head_id",                                // K6-REGISTER
-        clause: "head_id",                              // K6-REGISTER
-        why: "the threadgroup keeps the smaller logit", // K6-REGISTER
-        edits: &[("head_takes = v > best_v", "head_takes = v < best_v", 1)], // K6-REGISTER
-    }, // K6-REGISTER
+        name: "delta_nan_zero",
+        clause: "delta_nan",
+        why: "a non-finite lane stores zero",
+        edits: &[("state[base + key] = NAN;", "state[base + key] = 0.0f;", 1)],
+    },
     Mutant {
-        // K6-REGISTER
-        name: "head_ticket",                                      // K6-REGISTER
-        clause: "head_ticket",                                    // K6-REGISTER
-        why: "the step id is one past the selected row",          // K6-REGISTER
-        edits: &[("step_id[0] = id", "step_id[0] = id + 1u", 1)], // K6-REGISTER
-    }, // K6-REGISTER
-    Mutant {
-        // K6-REGISTER
-        name: "head_nan",                         // K6-REGISTER
-        clause: "head_nan",                       // K6-REGISTER
-        why: "a non-finite logit raises nothing", // K6-REGISTER
+        name: "attn_score_scale",
+        clause: "attn-f16",
+        why: "the score is twice the scaled dot",
         edits: &[(
-            // K6-REGISTER
-            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);", // K6-REGISTER
-            "",                                                      // K6-REGISTER
-            1,                                                       // K6-REGISTER
-        )], // K6-REGISTER
-    }, // K6-REGISTER
+            "float score = dot * args.scale;",
+            "float score = dot * args.scale * 2.0f;",
+            1,
+        )],
+    },
     Mutant {
-        // K6-REGISTER
-        name: "head_bounds",                          // K6-REGISTER
-        clause: "head_bounds",                        // K6-REGISTER
-        why: "every thread returns before it writes", // K6-REGISTER
-        edits: &[("head_bounds_gate == 0u", "head_bounds_gate == 1u", 1)], // K6-REGISTER
-    }, // K6-REGISTER
+        name: "attn_q8_id",
+        clause: "attn-q8",
+        why: "a q8_0 code uses 126 / amax instead of the host quantizer's 127 / amax",
+        edits: &[("127.0f / amax", "126.0f / amax", 1)],
+    },
+    Mutant {
+        name: "attn_key_count",
+        clause: "attn-fault",
+        why: "a live key count of zero or past the cache raises nothing",
+        edits: &[(
+            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_KEY_COUNT);",
+            "",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_logit",
+        clause: "head_logit",
+        why: "the stored logit is doubled",
+        edits: &[(
+            "            if (!isfinite(logits[row])) {\n                raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);\n            }",
+            "            logits[row] *= 2.f;\n            if (!isfinite(logits[row])) {\n                raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);\n            }",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_id",
+        clause: "head_id",
+        why: "the threadgroup keeps the smaller logit",
+        edits: &[(
+            "v > best_v || (v == best_v && (uint)row < best_i)",
+            "v < best_v || (v == best_v && (uint)row < best_i)",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_ticket",
+        clause: "head_ticket",
+        why: "the step id is one past the selected row",
+        edits: &[(
+            "step_id[0] = ~uint(best_key)",
+            "step_id[0] = ~uint(best_key) + 1u",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_nan",
+        clause: "head_nan",
+        why: "a non-finite logit raises nothing",
+        edits: &[(
+            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);",
+            "",
+            2,
+        )],
+    },
+    Mutant {
+        name: "head_bounds",
+        clause: "head_bounds",
+        why: "the mat-vec does not run, so the logits stay the sentinel",
+        edits: &[(
+            "q6k_rows<true, false>(weights, x, logits,",
+            "if (false) q6k_rows<true, false>(weights, x, logits,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "head_all_nan",
+        clause: "head_all_nan",
+        why: "an all-NaN head stores the empty key's id, which is token 0",
+        edits: &[("best_key == empty_key", "best_key == 0u", 1)],
+    },
 ];
 
 /// The mutant of this name.

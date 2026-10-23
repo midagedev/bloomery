@@ -128,7 +128,8 @@ fn group_key(logits: &[f32], base: usize, rows: usize) -> Result<u64, String> {
     Ok(argmax_key(best_v, best_i))
 }
 
-/// One head launch. Logits start as the sentinel, the step id as `u32::MAX`.
+/// One head launch. Logits start as the sentinel, the ticket as 0, the step
+/// id as `u32::MAX`.
 fn run(
     h: &Harness<'_>,
     weights: &[u8],
@@ -147,7 +148,7 @@ fn run(
         .upload(stream, &vec![f32::from_bits(SENTINEL_BITS); rows])
         .map_err(why)?;
     let mut candidates_b = device.upload(stream, &vec![0u64; groups]).map_err(why)?;
-    let mut ticket_b = device.upload(stream, &[u32::MAX]).map_err(why)?;
+    let mut ticket_b = device.upload(stream, &[0]).map_err(why)?;
     let mut step_b = device.upload(stream, &[u32::MAX]).map_err(why)?;
     let fault = device.fault_word();
     h.encode(|encoder| {
@@ -439,7 +440,7 @@ pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let mut candidates_b = device
         .upload(stream, &vec![0u64; LAUNCHES * groups])
         .map_err(why)?;
-    let mut ticket_b = device.upload(stream, &[u32::MAX]).map_err(why)?;
+    let mut ticket_b = device.upload(stream, &[0]).map_err(why)?;
     let mut step_b = device
         .upload(stream, &vec![u32::MAX; LAUNCHES])
         .map_err(why)?;
@@ -604,6 +605,76 @@ pub fn head_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     }
     Ok(Verdict::Noted(
         "logit site, the NaN stays stored, the id is the finite argmax".to_string(),
+    ))
+}
+
+/// Every logit is NaN. The step id is not a token.
+pub fn head_all_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    const ROWS: usize = 32;
+    const K: usize = 256;
+    h.clear_fault()?;
+    expect_head(fixture)?;
+    let eps = fixture.rms_eps()?;
+    if !eps.is_finite() || eps <= 0.0 {
+        return Err(format!("construction: eps {eps} is not usable"));
+    }
+    let bytes = row_bytes(HEAD_K);
+    let block = block_bytes();
+    let pool = fixture.rows(OUTPUT, GgmlType::Q6_K, HEAD_K, 64)?;
+    let mut chosen: Option<Vec<u8>> = None;
+    for row in pool.chunks_exact(bytes) {
+        let one = &row[..block];
+        let (y, width) = margin(one, K, eps)?;
+        if y.is_finite() && y > width {
+            chosen = Some(one.to_vec());
+            break;
+        }
+    }
+    let Some(good) = chosen else {
+        return Err(
+            "construction: no Q6_K block is a wide positive margin over a zero row".to_string(),
+        );
+    };
+    let x = dequant(&good, K)?;
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err("construction: the row's dequant is not finite".to_string());
+    }
+    let mut weights = vec![0u8; ROWS * block];
+    for row in 0..ROWS {
+        let dst = &mut weights[row * block..(row + 1) * block];
+        dst.copy_from_slice(&good);
+        dst[Q6K_D] = 0x00;
+        dst[Q6K_D + 1] = 0x7E;
+    }
+    let gain = vec![1f32; K];
+    let out = run(h, &weights, &x, &gain, ROWS, K, eps)?;
+    if out.logits.iter().any(|v| !v.is_nan()) {
+        return Err("an all-NaN head stored a finite logit".to_string());
+    }
+    if out.id != u32::MAX {
+        return Err(format!("an all-NaN head stored id {}, a token id", out.id));
+    }
+    match h.fault()? {
+        Some(f)
+            if f.layer == LAYER
+                && f.code == FaultSite::Logit as u32
+                && f.sites == 1 << (FaultSite::Logit as u32) => {}
+        Some(f) => {
+            return Err(format!(
+                "an all-NaN head raised {f}, not {} in layer {LAYER}",
+                FaultSite::Logit.name()
+            ));
+        }
+        None => return Err("an all-NaN head raised nothing".to_string()),
+    }
+    if out.ticket != 0 {
+        return Err(format!(
+            "head-all-nan: the ticket counter is {}, not 0",
+            out.ticket
+        ));
+    }
+    Ok(Verdict::Noted(
+        "logit site, every logit stays NaN, the id is not a token".to_string(),
     ))
 }
 
@@ -905,4 +976,16 @@ fn still_sentinel(
         return Err("a refused launch wrote".to_string());
     }
     Ok(())
+}
+
+/// The output-head clauses, in gate order.
+pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    vec![
+        ("head_logit", Box::new(|| ctx.with(head_logit))),
+        ("head_id", Box::new(|| ctx.with(head_id))),
+        ("head_ticket", Box::new(|| ctx.with(head_ticket))),
+        ("head_nan", Box::new(|| ctx.with(head_nan))),
+        ("head_all_nan", Box::new(|| ctx.with(head_all_nan))),
+        ("head_bounds", Box::new(|| head_bounds(ctx.harness))),
+    ]
 }

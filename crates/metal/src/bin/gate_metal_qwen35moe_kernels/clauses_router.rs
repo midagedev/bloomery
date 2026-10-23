@@ -4,7 +4,7 @@ use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::buffer::MetalBuffer;
-use bloomery_metal::kernels::{EXPERTS, K, PARTIALS, ROWS, RouterParams, TOP_K_MAX};
+use bloomery_metal::kernels::router::{EXPERTS, K, PARTIALS, ROWS, RouterParams, TOP_K_MAX};
 use gguf::Gguf;
 use gguf::quant::{GgmlType, dequant_row};
 
@@ -818,4 +818,16 @@ fn still_sentinel(
         return Err("a refused launch wrote".to_string());
     }
     Ok(())
+}
+
+/// The router clauses, in gate order.
+pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    vec![
+        ("router_logit", Box::new(|| ctx.with(router_logit))),
+        ("router_ids", Box::new(|| ctx.with(router_ids))),
+        ("router_weights", Box::new(|| ctx.with(router_weights))),
+        ("router_ticket", Box::new(|| ctx.with(router_ticket))),
+        ("router_nan", Box::new(|| ctx.with(router_nan))),
+        ("router_bounds", Box::new(|| router_bounds(ctx.harness))),
+    ]
 }

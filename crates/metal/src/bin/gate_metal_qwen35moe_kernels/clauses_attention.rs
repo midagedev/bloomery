@@ -1367,3 +1367,16 @@ pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             .to_string(),
     ))
 }
+
+/// The decode-attention clauses, in gate order.
+pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    vec![
+        ("attn-f16", Box::new(|| ctx.with(attn_f16))),
+        ("attn-q8", Box::new(|| ctx.with(attn_q8))),
+        ("attn-s", Box::new(|| ctx.with(attn_s))),
+        ("attn-reread", Box::new(|| ctx.with(attn_reread))),
+        ("attn-m", Box::new(|| ctx.with(attn_m))),
+        ("attn-fault", Box::new(|| ctx.with(attn_fault))),
+        ("attn-bounds", Box::new(|| ctx.with(attn_bounds))),
+    ]
+}

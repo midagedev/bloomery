@@ -3,11 +3,11 @@
 use bloomery_device::{DeviceError, LAYER_NONE, Window, WindowMut};
 
 use crate::device::MetalDevice;
-use crate::encode::{Binding, ComputeEncoder};
+use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
 use super::geometry::{BLOCK_VALUES, ROWS_PER_SIMD_GROUP};
-use super::{Kernels, MatvecPipelines, args_bytes, check_window_len, word};
+use super::{Kernels, MatvecPipelines, args_bytes, check_window_len, pack, word};
 
 /// The weight type a mat-vec reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,11 +103,10 @@ struct Shape {
     groups: usize,
 }
 
-fn refuse(detail: String) -> DeviceError {
-    DeviceError::Range {
-        what: "matvec",
-        detail,
-    }
+const WHAT: &str = "matvec";
+
+fn refuse(detail: impl Into<String>) -> DeviceError {
+    super::range(WHAT, detail)
 }
 
 /// The shape of `p`, refused by name when a window is not the shape's, the
@@ -135,28 +134,21 @@ fn check(p: &MatvecParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> 
         )));
     }
     let nblocks = p.cols / BLOCK_VALUES;
-    let weight_bytes = p
-        .rows
-        .checked_mul(nblocks)
-        .and_then(|blocks| blocks.checked_mul(p.quant.block_bytes()))
+    let weight_bytes = super::weight_bytes(p.quant, p.rows, nblocks)
         .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.cols)))?;
-    check_window_len("matvec", "weights", p.weights.len(), weight_bytes)?;
-    check_window_len("matvec", "x", p.x.len(), p.cols)?;
-    check_window_len("matvec", "y", p.y.len(), p.rows)?;
+    check_window_len(WHAT, "weights", p.weights.len(), weight_bytes)?;
+    check_window_len(WHAT, "x", p.x.len(), p.cols)?;
+    check_window_len(WHAT, "y", p.y.len(), p.rows)?;
     if let Mode::NormOnLoad(norm) = &p.mode {
-        check_window_len("matvec", "gain", norm.gain.len(), p.cols)?;
+        check_window_len(WHAT, "gain", norm.gain.len(), p.cols)?;
     }
     // The kernels read the weights as 16-bit words, from the window's byte
     // offset in its buffer.
     let start = p.weights.byte_range()?.start.get();
-    if !start.is_multiple_of(2) {
-        return Err(refuse(format!(
-            "the weights start {start} bytes into their buffer: the kernels read 16-bit words"
-        )));
-    }
+    super::check_weights_align(WHAT, "weights", start, super::WeightAlign::Half)?;
     Ok(Shape {
-        nblocks: word("matvec", "the block count", nblocks)?,
-        rows: word("matvec", "the row count", p.rows)?,
+        nblocks: word(WHAT, "the block count", nblocks)?,
+        rows: word(WHAT, "the row count", p.rows)?,
         groups: p.rows.div_ceil(simdgroups * ROWS_PER_SIMD_GROUP),
     })
 }
@@ -192,15 +184,16 @@ impl Kernels {
             Quant::Q6K => &self.q6k,
         };
         encoder.set_pipeline(family.of(&p.mode));
-        encoder.set_binding(0, Binding::of(&p.weights)?)?;
-        encoder.set_binding(1, Binding::of(&p.x)?)?;
-        encoder.set_binding(2, Binding::of_mut(&p.y)?)?;
-        encoder.set_binding(3, Binding::bytes(&args)?)?;
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.weights)?)?;
+        slot.set(Binding::of(&p.x)?)?;
+        slot.set(Binding::of_mut(&p.y)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
         if let Mode::NormOnLoad(norm) = &p.mode {
-            encoder.set_binding(4, Binding::of(&norm.gain)?)?;
-            encoder.set_binding(5, norm.fault.binding())?;
+            slot.set(Binding::of(&norm.gain)?)?;
+            slot.set(norm.fault.binding())?;
         }
         let threads = self.threads_per_group();
-        encoder.dispatch(shape.groups * threads, threads)
+        slot.dispatch_groups(shape.groups, 1, threads)
     }
 }

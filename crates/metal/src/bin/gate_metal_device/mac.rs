@@ -9,7 +9,7 @@
 //! 1. **open**: the device opens, and the library path it came from is named.
 //! 2. the contract's clauses, `zeroed_upload_roundtrip` to `census`.
 //! 3. **encoder_refusals**: a binding slot past the last, a value of no bytes
-//!    or too many, a dispatch of no threads, no pipeline or a too large group
+//!    or too many, a dispatch of no groups, no pipeline or a too large group
 //!    are refused by name.
 //! 4. **sync_bound_named**: a sync and an event wait that outlast their bound
 //!    are refused by name, and a host event is done only once signalled.
@@ -28,7 +28,7 @@
 //! 11. **macos_floor**: a macOS below 26.2 is refused by name.
 //! 12. **concurrent_independent**: one concurrent encoder runs two copies
 //!     over four distinct buffers, with no barrier between them; each output
-//!     equals the bytes uploaded to its source. No pipeline, no threads and a
+//!     equals the bytes uploaded to its source. No pipeline, no groups and a
 //!     value of no bytes are refused on that encoder, and a refusal encodes
 //!     nothing.
 //! 13. **concurrent_barrier**: one concurrent encoder copies a pattern into a
@@ -83,7 +83,7 @@ fn launch(
         for (slot, binding) in bindings.iter().enumerate() {
             encoder.set_binding(slot, *binding)?;
         }
-        encoder.dispatch(threads, group)?;
+        encoder.dispatch_groups(threads.div_ceil(group), 1, group)?;
         encoder.end();
     }
     stream.submit(recording)
@@ -241,7 +241,7 @@ fn encoder_refusals(device: &MetalDevice) -> Clause {
     let mut recording = stream.begin().map_err(why)?;
     {
         let mut encoder = recording.compute_encoder().map_err(why)?;
-        expect_range(encoder.dispatch(4, 4), "dispatch", "no pipeline")?;
+        expect_range(encoder.dispatch_groups(1, 1, 4), "dispatch", "no pipeline")?;
         encoder.set_pipeline(&pipeline);
         expect_range(
             encoder.set_binding(MAX_BINDINGS, binding),
@@ -251,13 +251,19 @@ fn encoder_refusals(device: &MetalDevice) -> Clause {
         encoder
             .set_binding(MAX_BINDINGS - 1, binding)
             .map_err(why)?;
-        expect_range(encoder.dispatch(0, 4), "dispatch", "0 threads")?;
-        expect_range(encoder.dispatch(4, 0), "dispatch", "groups of 0")?;
+        expect_range(encoder.dispatch_groups(0, 1, 4), "dispatch", "0 by 1")?;
+        expect_range(encoder.dispatch_groups(1, 1, 0), "dispatch", "groups of 0")?;
         let too_many = pipeline.max_threads_per_group() + 1;
         expect_range(
-            encoder.dispatch(too_many, too_many),
+            encoder.dispatch_groups(1, 1, too_many),
             "dispatch",
             "passes the pipeline's",
+        )?;
+        expect_range(encoder.dispatch_groups(1, 0, 4), "dispatch", "by 0")?;
+        expect_range(
+            encoder.dispatch_groups(usize::MAX, 1, 2),
+            "dispatch",
+            "wrap",
         )?;
         encoder.end();
     }
@@ -585,7 +591,7 @@ fn encode_copy(
     encoder.set_binding(0, Binding::of_mut(dst)?)?;
     encoder.set_binding(1, Binding::of(src)?)?;
     encoder.set_binding(2, Binding::bytes(count)?)?;
-    encoder.dispatch(threads, GROUP)
+    encoder.dispatch_groups(threads.div_ceil(GROUP), 1, GROUP)
 }
 
 /// `got` against `want`, bit for bit. The first difference names how many differ.
@@ -658,9 +664,13 @@ fn concurrent_independent(device: &MetalDevice) -> Clause {
     {
         let mut encoder = recording.compute_encoder_concurrent().map_err(why)?;
         expect_range(Binding::bytes(&[]), "binding", "0 bytes")?;
-        expect_range(encoder.dispatch(n, GROUP), "dispatch", "no pipeline")?;
+        expect_range(
+            encoder.dispatch_groups(n / GROUP, 1, GROUP),
+            "dispatch",
+            "no pipeline",
+        )?;
         encoder.set_pipeline(&pipeline);
-        expect_range(encoder.dispatch(0, GROUP), "dispatch", "0 threads")?;
+        expect_range(encoder.dispatch_groups(0, 1, GROUP), "dispatch", "0 by 1")?;
         {
             let dst = dst_a.whole_mut().map_err(why)?;
             let src = src_a.whole().map_err(why)?;
