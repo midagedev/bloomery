@@ -7,7 +7,7 @@
 
 use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
-    SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry, q35, shared_entry,
+    SharedPlan, SharedSites, SiteTy, q35,
 };
 use crate::ChainError;
 use crate::linear::{self, LinearShape};
@@ -120,8 +120,8 @@ pub fn file_names(l: usize) -> FileNames {
     }
 }
 
-/// The types a projection site launches at: a projection of the normed rows or
-/// an output projection, a K-quant or Q8_0.
+/// The types a card projection site launches at: a projection of the normed
+/// rows or an output projection, a K-quant or Q8_0.
 const PROJ: &[SiteTy] = &[
     SiteTy::Q3K,
     SiteTy::Q4K,
@@ -129,12 +129,13 @@ const PROJ: &[SiteTy] = &[
     SiteTy::Q6K,
     SiteTy::Q8_0,
 ];
-/// [`PROJ`] and F32: the types β and α launch at, and those a routed layer's
-/// stacks and its shared expert are read at, which the card kernel table's
-/// entries then admit ([`plan_ffn`]); under a placed read the stacks of a layer
-/// the dispatch's launches do not run are typed as the host tier's instead
-/// ([`card_leg`]): a layer the common leg runs holds its stacks to the placed
-/// side, which reads their types from the resident stacks.
+/// [`PROJ`] and F32: the types the card's β and α launch at, and those a
+/// routed layer's stacks and its shared expert are read at, which the card
+/// kernel table's entries then admit ([`plan_ffn`]); under a placed read the
+/// stacks of a layer the dispatch's launches do not run are typed as the host
+/// tier's instead ([`card_leg`]): a layer the common leg runs holds its
+/// stacks to the placed side, which reads their types from the resident
+/// stacks.
 const PROJ_F32: &[SiteTy] = &[
     SiteTy::Q3K,
     SiteTy::Q4K,
@@ -143,6 +144,65 @@ const PROJ_F32: &[SiteTy] = &[
     SiteTy::Q8_0,
     SiteTy::F32,
 ];
+
+/// The site types a backend's launches read, this reader's one question of a
+/// backend: stated as data by each backend's owner — the card's
+/// [`Sites35::CARD`] here, Metal's beside its session — never a branch in
+/// this reader. A type no list of the backend's holds is refused by name
+/// with the site (`file_site`), the dispatch lists' refusal naming the list.
+pub struct Sites35 {
+    /// A projection of the normed rows or an output projection.
+    pub proj: &'static [SiteTy],
+    /// The routed stacks, the shared expert's parts, β and α.
+    pub stacks: &'static [SiteTy],
+    /// The gate·up launch's types: one launch reads the gate and the up of
+    /// one type, whatever the lists (a gate beside another type's up is
+    /// refused whatever the backend).
+    pub gate_up: &'static [SiteTy],
+    /// The down launch's types.
+    pub down: &'static [SiteTy],
+    /// A shared expert kept apart: the types its own parts run at.
+    pub shared: &'static [SiteTy],
+}
+
+impl Sites35 {
+    /// The card's lists: the projections' and the stacks' of today, and the
+    /// FFN dispatch's three from the kernel tables (`model::arch::coverage`'s
+    /// `qwen35_gate_up`, `qwen35_down` and `qwen35_shared`), each pinned to
+    /// its table by test. A backend with launches of its own states its
+    /// lists beside them (Metal's beside its session).
+    pub const CARD: Sites35 = Sites35 {
+        proj: PROJ,
+        stacks: PROJ_F32,
+        gate_up: &[SiteTy::Q4K, SiteTy::Q5K],
+        down: &[SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K],
+        shared: &[
+            SiteTy::Q3K,
+            SiteTy::Q4K,
+            SiteTy::Q5K,
+            SiteTy::Q6K,
+            SiteTy::Q8_0,
+            SiteTy::F32,
+            SiteTy::Mxfp8,
+            SiteTy::Fp8B128,
+        ],
+    };
+}
+
+/// `ty` among `list`, else the named refusal that lists the types the
+/// backend's launch reads.
+fn launches(ty: SiteTy, list: &[SiteTy], kind: &str, what: &'static str) -> Result<(), ChainError> {
+    if list.contains(&ty) {
+        return Ok(());
+    }
+    Err(ChainError::shape(
+        what,
+        format!(
+            "a {ty} {kind}; this backend launches {}",
+            crate::site::list(list)
+        ),
+    ))
+}
 
 /// The type of site `name` (`rows` rows of `k`) from `file`'s header.
 fn ty_of(
@@ -236,7 +296,7 @@ pub fn card_leg(
 /// The types of routed part `part` of layer `l` from `file`'s header: its
 /// experts' stack (`experts` experts of `rows` rows of `k` values; [`HOSTED`]
 /// for a layer the host tier runs) and its shared expert's matrix (`rows` of
-/// `k`).
+/// `k`), each at a type of the backend's `sites`.
 fn part_tys(
     file: &Split,
     what: &'static str,
@@ -244,27 +304,29 @@ fn part_tys(
     part: &str,
     (rows, k, experts): (usize, usize, usize),
     hosted: bool,
+    sites: &Sites35,
 ) -> Result<(SiteTy, SiteTy), ChainError> {
     let (routed_name, sh_name) = (exps(l, part), shexp(l, part));
     let routed = if hosted {
         HOSTED
     } else {
-        ty_of(file, what, &routed_name, experts * rows, k, PROJ_F32)?
+        ty_of(file, what, &routed_name, experts * rows, k, sites.stacks)?
     };
-    Ok((routed, ty_of(file, what, &sh_name, rows, k, PROJ_F32)?))
+    Ok((routed, ty_of(file, what, &sh_name, rows, k, sites.stacks)?))
 }
 
 /// Layer `l`'s FFN by its description `spec`, every site's type from
-/// `file`'s header. A routed one: its stacks' types admitted by the card
-/// kernel table's entries (`gate_up_entry`, `down_entry`) and
-/// its shared expert's by its dense sites (`shared_entry`), each
-/// refused by name with the layer; the router joined with the shared gate
+/// `file`'s header at a type of the backend's `sites`. A routed one: its
+/// stacks' types admitted by the backend's dispatch lists (`gate_up`, `down`
+/// — one gate·up launch reading the gate and the up of one type) and its
+/// shared expert's by its own (`shared`), each refused by name with the
+/// layer; the router joined with the shared gate
 /// as row `n` (the routed count, which a backend's load joins); and the shared expert folded
 /// into the stacks as expert `n` when its gate, up and down are each its
 /// stack's type ([`SharedPlan::Joined`]), else kept apart at its own types
 /// ([`SharedPlan::Apart`]). Under a placed read ([`Read35::Placed`]) a layer
 /// whose stacks the dispatch's launches do not run ([`card_leg`]) is typed as
-/// the host tier's: its stacks are read as `HOSTED` and no card entry is
+/// the host tier's: its stacks are read as `HOSTED` and no dispatch list is
 /// asked of them, its shared expert kept apart at its own types, which the
 /// card runs whatever the stacks are; the common leg's layers
 /// ([`LegSplit::Common`]) are among them, their types the placed side's to
@@ -276,6 +338,7 @@ pub fn plan_ffn(
     d: &PlanDims,
     spec: &LayerSpec,
     l: usize,
+    sites: &Sites35,
     read: Read35,
 ) -> Result<FfnPlan, ChainError> {
     let (h, ff) = (d.hidden, d.ff);
@@ -288,16 +351,25 @@ pub fn plan_ffn(
                     card_leg(file, what, l, (ff, h, n))?,
                     Some((LegSplit::Dispatch, _))
                 );
-            let (gate_ty, sh_gate) = part_tys(file, what, l, "gate", (ff, h, n), hosted)?;
-            let (up_ty, sh_up) = part_tys(file, what, l, "up", (ff, h, n), hosted)?;
-            let (down_ty, sh_down) = part_tys(file, what, l, "down", (h, ff, n), hosted)?;
+            let (gate_ty, sh_gate) = part_tys(file, what, l, "gate", (ff, h, n), hosted, sites)?;
+            let (up_ty, sh_up) = part_tys(file, what, l, "up", (ff, h, n), hosted, sites)?;
+            let (down_ty, sh_down) = part_tys(file, what, l, "down", (h, ff, n), hosted, sites)?;
             let at = |e: ChainError| ChainError::shape(what, format!("layer {l}: {e}"));
             if !hosted {
-                gate_up_entry(gate_ty, up_ty, what).map_err(at)?;
-                down_entry(down_ty, what).map_err(at)?;
+                if gate_ty != up_ty {
+                    return Err(at(ChainError::shape(
+                        what,
+                        format!(
+                            "a {gate_ty} gate beside a {up_ty} up; one gate·up launch reads one \
+                             type"
+                        ),
+                    )));
+                }
+                launches(gate_ty, sites.gate_up, "gate·up", what).map_err(at)?;
+                launches(down_ty, sites.down, "down `_sel`", what).map_err(at)?;
             }
             for ty in [sh_gate, sh_up, sh_down] {
-                shared_entry(ty, what).map_err(at)?;
+                launches(ty, sites.shared, "shared expert part", what).map_err(at)?;
             }
             let routed = |part: &str| exps(l, part);
             let (shared, [gate, up, down]) =
@@ -339,9 +411,9 @@ pub fn plan_ffn(
             Ok(FfnPlan {
                 ffn_norm,
                 route: FfnRoute::Dense,
-                gate_ty: ty_of(file, what, &gate, ff, h, PROJ)?,
-                up_ty: ty_of(file, what, &up, ff, h, PROJ)?,
-                down_ty: ty_of(file, what, &down, h, ff, PROJ)?,
+                gate_ty: ty_of(file, what, &gate, ff, h, sites.proj)?,
+                up_ty: ty_of(file, what, &up, ff, h, sites.proj)?,
+                down_ty: ty_of(file, what, &down, h, ff, sites.proj)?,
                 gate,
                 up,
                 down,
@@ -351,13 +423,14 @@ pub fn plan_ffn(
 }
 
 /// Layer `l`'s gated attention over the flash `flash` its group selects,
-/// every site's type from `file`'s header.
+/// every site's type from `file`'s header at a type of the backend's `sites`.
 pub fn plan_gqa(
     file: &Split,
     what: &'static str,
     d: &PlanDims,
     l: usize,
     flash: Flash,
+    sites: &Sites35,
 ) -> Result<GqaPlan, ChainError> {
     let (h, kv, att) = (d.hidden, d.kv_len, d.attn_len);
     let (q, k, v, o) = (
@@ -372,10 +445,10 @@ pub fn plan_gqa(
         attn_norm: blk(l, "attn_norm.weight"),
         attn_q_norm: blk(l, "attn_q_norm.weight"),
         attn_k_norm: blk(l, "attn_k_norm.weight"),
-        q_ty: ty_of(file, what, &q, d.q_rows, h, PROJ)?,
-        k_ty: ty_of(file, what, &k, kv, h, PROJ)?,
-        v_ty: ty_of(file, what, &v, kv, h, PROJ)?,
-        o_ty: ty_of(file, what, &o, h, att, PROJ)?,
+        q_ty: ty_of(file, what, &q, d.q_rows, h, sites.proj)?,
+        k_ty: ty_of(file, what, &k, kv, h, sites.proj)?,
+        v_ty: ty_of(file, what, &v, kv, h, sites.proj)?,
+        o_ty: ty_of(file, what, &o, h, att, sites.proj)?,
         attn_q: q,
         attn_k: k,
         attn_v: v,
@@ -383,13 +456,15 @@ pub fn plan_gqa(
     })
 }
 
-/// Layer `l`'s delta rule, every site's type from `file`'s header.
+/// Layer `l`'s delta rule, every site's type from `file`'s header at a type
+/// of the backend's `sites`.
 pub fn plan_delta(
     file: &Split,
     what: &'static str,
     d: &PlanDims,
     shape: LinearShape,
     l: usize,
+    sites: &Sites35,
 ) -> Result<DeltaPlan, ChainError> {
     let (h, c, nv) = (d.hidden, shape.channels(), shape.n_v);
     let (qkv, gate, beta, alpha, out) = (
@@ -406,11 +481,11 @@ pub fn plan_delta(
         ssm_a: blk(l, "ssm_a"),
         ssm_norm: blk(l, "ssm_norm.weight"),
         shape,
-        qkv_ty: ty_of(file, what, &qkv, c, h, PROJ)?,
-        gate_ty: ty_of(file, what, &gate, nv * linear::HEAD, h, PROJ)?,
-        beta_ty: ty_of(file, what, &beta, nv, h, PROJ_F32)?,
-        alpha_ty: ty_of(file, what, &alpha, nv, h, PROJ_F32)?,
-        out_ty: ty_of(file, what, &out, h, nv * linear::HEAD, PROJ)?,
+        qkv_ty: ty_of(file, what, &qkv, c, h, sites.proj)?,
+        gate_ty: ty_of(file, what, &gate, nv * linear::HEAD, h, sites.proj)?,
+        beta_ty: ty_of(file, what, &beta, nv, h, sites.stacks)?,
+        alpha_ty: ty_of(file, what, &alpha, nv, h, sites.stacks)?,
+        out_ty: ty_of(file, what, &out, h, nv * linear::HEAD, sites.proj)?,
         qkv,
         gate,
         beta,
@@ -421,16 +496,17 @@ pub fn plan_delta(
 
 /// Every layer's plan of a qwen35moe chain, `kinds` its layers' kinds
 /// ([`kinds35`], one a layer), each layer's mixer and FFN read from `file`'s
-/// header at the rows `pd` names, the routed stacks held as `read` says
-/// ([`Read35`]): the loop a whole load runs, both backends' — a backend that
-/// transforms the plans after the read (a placed load's `apart_plans`)
-/// transforms the `Vec` this returns.
+/// header at the rows `pd` names and at a type of the backend's `sites`, the
+/// routed stacks held as `read` says ([`Read35`]): the loop a whole load
+/// runs, both backends' — a backend that transforms the plans after the read
+/// (a placed load's `apart_plans`) transforms the `Vec` this returns.
 pub fn layer_plans(
     file: &Split,
     what: &'static str,
     pd: &PlanDims,
     kinds: &[Kind35],
     layers: &[LayerSpec],
+    sites: &Sites35,
     read: Read35,
 ) -> Result<Vec<LayerPlan>, ChainError> {
     if kinds.len() != layers.len() {
@@ -449,13 +525,48 @@ pub fn layer_plans(
         .enumerate()
         .map(|(l, (kind, layer))| {
             let mixer = match *kind {
-                Kind35::Gqa(flash) => MixerPlan::Gqa(plan_gqa(file, what, pd, l, flash)?),
-                Kind35::Delta(shape) => MixerPlan::Delta(plan_delta(file, what, pd, shape, l)?),
+                Kind35::Gqa(flash) => MixerPlan::Gqa(plan_gqa(file, what, pd, l, flash, sites)?),
+                Kind35::Delta(shape) => {
+                    MixerPlan::Delta(plan_delta(file, what, pd, shape, l, sites)?)
+                }
             };
             Ok(LayerPlan {
                 mixer,
-                ffn: plan_ffn(file, what, pd, layer, l, read)?,
+                ffn: plan_ffn(file, what, pd, layer, l, sites, read)?,
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SiteTy, Sites35};
+    use gguf::quant::GgmlType;
+    use model::arch::coverage::{qwen35_down, qwen35_gate_up, qwen35_shared};
+
+    /// The card's dispatch lists are the kernel tables' families, each list
+    /// exactly the families whose file type its table names an entry for: a
+    /// table row that moves a type in or out moves its list with it, and
+    /// this names the change. The projections' lists the tables admit not
+    /// (a projection runs at whatever the table's dense rows name), so
+    /// `proj` and `stacks` carry no such pin.
+    #[test]
+    fn the_card_dispatch_lists_are_the_tables_families() {
+        let families = |table: fn(GgmlType) -> bool| -> Vec<SiteTy> {
+            SiteTy::ALL
+                .iter()
+                .copied()
+                .filter(|&s| table(s.ggml()))
+                .collect()
+        };
+        assert_eq!(
+            families(|ty| qwen35_gate_up(ty).is_some()),
+            Sites35::CARD.gate_up
+        );
+        assert_eq!(families(|ty| qwen35_down(ty).is_some()), Sites35::CARD.down);
+        assert_eq!(
+            families(|ty| qwen35_shared(ty).is_some()),
+            Sites35::CARD.shared
+        );
+    }
 }

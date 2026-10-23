@@ -126,7 +126,7 @@ use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use chain::arch::qwen3moe::read::{
-    PlanDims, Read35, joint, joint_gate_inp, layer_plans, plan_ffn, plan_gqa,
+    PlanDims, Read35, Sites35, joint, joint_gate_inp, layer_plans, plan_ffn, plan_gqa,
 };
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -819,7 +819,7 @@ impl Pre35 {
         )?;
         let common = common_forms(file, &d, &spec.layers, mode)?;
         let pd = plan_dims(&d);
-        let plans = layer_plans(file, WHAT, &pd, &kinds, &spec.layers, mode)?;
+        let plans = layer_plans(file, WHAT, &pd, &kinds, &spec.layers, &Sites35::CARD, mode)?;
         Ok(Pre35 {
             vocab,
             eps: spec.rms_eps,
@@ -997,8 +997,16 @@ fn draft_layer(
     };
     let pd = plan_dims(d);
     let plan = LayerPlan {
-        mixer: MixerPlan::Gqa(plan_gqa(file, WHAT, &pd, l, flash)?),
-        ffn: plan_ffn(file, WHAT, &pd, &draft.layer, l, Read35::Whole)?,
+        mixer: MixerPlan::Gqa(plan_gqa(file, WHAT, &pd, l, flash, &Sites35::CARD)?),
+        ffn: plan_ffn(
+            file,
+            WHAT,
+            &pd,
+            &draft.layer,
+            l,
+            &Sites35::CARD,
+            Read35::Whole,
+        )?,
     };
     let prefix = blk(l, "");
     let mut w = Weights::load_where(gpu.stream(), file, |name| name.starts_with(&prefix))?;

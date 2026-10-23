@@ -1,6 +1,7 @@
 //! A weight site's type: the launch family a dense projection of a file's type runs, read once at
 //! load from the file's header ([`file_site`], before any byte is uploaded). A type no launch here
-//! reads is refused by name, with the site.
+//! reads is refused by name, with the site. The card's families come from the kernel table; a
+//! backend's own ([`BACKEND_SITES`]) only a backend's list admits.
 //!
 //! Which activation form a site reads is [`SiteTy::reads`]: a body quantizes a unit's rows into
 //! exactly the forms its sites read. The launches themselves are a backend's.
@@ -31,10 +32,18 @@ pub enum SiteTy {
     Fp8B128,
     /// BF16 in its words, read on the f32 rows, narrow and wide.
     Bf16,
+    /// MLX's affine 4-bit groups (`MLX_A4`): a family no card launch reads,
+    /// a backend's mat-vec (Metal's). Outside the card kernel table, so
+    /// [`SiteTy::ALL`] does not hold it, no card list names it and its dense
+    /// entry is none; a backend whose launch reads it names it in the list
+    /// [`file_site`] takes.
+    MlxA4,
 }
 
 impl SiteTy {
-    /// Every family, the range of [`SiteTy::of_ggml`].
+    /// Every family the card launches, the range of [`SiteTy::of_ggml`]. A
+    /// family outside the card kernel table ([`BACKEND_SITES`]) is not here,
+    /// so no card list holds it; a backend's list alone admits it.
     pub const ALL: &'static [SiteTy] = &[
         SiteTy::Q3K,
         SiteTy::Q4K,
@@ -68,32 +77,41 @@ impl SiteTy {
     /// `None` for an entry no family here launches.
     #[must_use]
     pub fn of_entry(entry: SiteEntry) -> Option<SiteTy> {
-        SiteTy::ALL.iter().copied().find(|s| s.entry() == entry)
+        SiteTy::ALL
+            .iter()
+            .copied()
+            .find(|s| s.entry() == Some(entry))
     }
 
     /// The kernel table's dense entry this family launches: the one map
-    /// between the two names.
-    const fn entry(self) -> SiteEntry {
+    /// between the two names; `None` for a family outside the card kernel
+    /// table, whose [`BACKEND_SITES`] row answers for it.
+    const fn entry(self) -> Option<SiteEntry> {
         match self {
-            SiteTy::Q3K => SiteEntry::Q3k,
-            SiteTy::Q4K => SiteEntry::Q4k,
-            SiteTy::Q5K => SiteEntry::Q5k,
-            SiteTy::Q6K => SiteEntry::Q6k,
-            SiteTy::Q5_0 => SiteEntry::Q5_0,
-            SiteTy::Q8_0 => SiteEntry::Q8_0,
-            SiteTy::F32 => SiteEntry::F32,
-            SiteTy::Nvfp4 => SiteEntry::Nvfp4,
-            SiteTy::Mxfp8 => SiteEntry::Mxfp8,
-            SiteTy::Fp8B128 => SiteEntry::Fp8B128,
-            SiteTy::Bf16 => SiteEntry::Bf16,
+            SiteTy::Q3K => Some(SiteEntry::Q3k),
+            SiteTy::Q4K => Some(SiteEntry::Q4k),
+            SiteTy::Q5K => Some(SiteEntry::Q5k),
+            SiteTy::Q6K => Some(SiteEntry::Q6k),
+            SiteTy::Q5_0 => Some(SiteEntry::Q5_0),
+            SiteTy::Q8_0 => Some(SiteEntry::Q8_0),
+            SiteTy::F32 => Some(SiteEntry::F32),
+            SiteTy::Nvfp4 => Some(SiteEntry::Nvfp4),
+            SiteTy::Mxfp8 => Some(SiteEntry::Mxfp8),
+            SiteTy::Fp8B128 => Some(SiteEntry::Fp8B128),
+            SiteTy::Bf16 => Some(SiteEntry::Bf16),
+            SiteTy::MlxA4 => None,
         }
     }
 
     /// The file type a site of this family holds: the type whose row names
-    /// its entry (`SiteEntry::ty`).
+    /// its entry (`SiteEntry::ty`), or, for a family outside the card kernel
+    /// table, its [`BACKEND_SITES`] row's.
     #[must_use]
     pub fn ggml(self) -> GgmlType {
-        self.entry().ty()
+        match self.entry() {
+            Some(entry) => entry.ty(),
+            None => self.row().0,
+        }
     }
 
     /// Whether the type is one of the four K-quants: the kernel table runs
@@ -106,12 +124,39 @@ impl SiteTy {
         )
     }
 
-    /// The activation form the site's launch reads (`SiteEntry::reads`, the kernel table's fact).
+    /// The activation form the site's launch reads (`SiteEntry::reads`, the
+    /// kernel table's fact), or the backend row's for a family outside it.
     #[must_use]
-    pub const fn reads(self) -> SiteAct {
-        self.entry().reads()
+    pub fn reads(self) -> SiteAct {
+        match self.entry() {
+            Some(entry) => entry.reads(),
+            None => self.row().2,
+        }
+    }
+
+    /// This family's [`BACKEND_SITES`] row; a card family has none. A family
+    /// outside the card kernel table whose table holds no row is a named
+    /// panic, not a guessed type.
+    fn row(self) -> (GgmlType, SiteTy, SiteAct) {
+        let mut i = 0;
+        while i < BACKEND_SITES.len() {
+            if BACKEND_SITES[i].1 == self {
+                return BACKEND_SITES[i];
+            }
+            i += 1;
+        }
+        panic!("a site family outside the card kernel table has no BACKEND_SITES row")
     }
 }
+
+/// The site families outside the card kernel table: each a file type no card
+/// launch reads, with the family a backend's launch reads it at and the
+/// activation form that launch reads. One row a type; [`file_site`] alone
+/// reads the table, so a card's `allowed` — which holds no family here —
+/// refuses the type by name exactly as it did before the row, and
+/// [`SiteTy::of_ggml`], the card table's map, names each of the types none.
+const BACKEND_SITES: &[(GgmlType, SiteTy, SiteAct)] =
+    &[(GgmlType::MLX_A4, SiteTy::MlxA4, SiteAct::F32)];
 
 /// The family's file type, its ggml name in upper case (`Q4_K`, `NVFP4`).
 impl fmt::Display for SiteTy {
@@ -148,7 +193,9 @@ pub(crate) fn shaped<'a>(
 /// The type of site `name` in `file`, a matrix of `rows` rows (every expert's
 /// of a stack) of `k` values, read from its header entry before any upload:
 /// a type outside `allowed`, another shape or a missing tensor is refused by
-/// name with the site.
+/// name with the site. The family comes from [`SiteTy::of_ggml`] or, for a
+/// type no card launch reads, [`BACKEND_SITES`], so a backend whose list
+/// names such a family reads it while a card's list refuses it by name.
 pub fn file_site(
     file: &Split,
     what: &'static str,
@@ -157,7 +204,7 @@ pub fn file_site(
     allowed: &[SiteTy],
 ) -> Result<SiteTy, ChainError> {
     let t = shaped(file, what, name, shape)?;
-    match SiteTy::of_ggml(t.ty).filter(|ty| allowed.contains(ty)) {
+    match family_of(t.ty).filter(|ty| allowed.contains(ty)) {
         Some(ty) => Ok(ty),
         None => Err(ChainError::shape(
             what,
@@ -168,6 +215,23 @@ pub fn file_site(
             ),
         )),
     }
+}
+
+/// The family of a file tensor of type `ty`: [`SiteTy::of_ggml`]'s, or its
+/// [`BACKEND_SITES`] row's for a type no card launch reads. The one map a
+/// site's family comes through.
+fn family_of(ty: GgmlType) -> Option<SiteTy> {
+    if let Some(s) = SiteTy::of_ggml(ty) {
+        return Some(s);
+    }
+    let mut i = 0;
+    while i < BACKEND_SITES.len() {
+        if BACKEND_SITES[i].0 == ty {
+            return Some(BACKEND_SITES[i].1);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// `allowed` as a list of names, the one a refusal of a site of the wrong type names.
@@ -181,7 +245,7 @@ pub fn list(allowed: &[SiteTy]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::SiteTy;
+    use super::{BACKEND_SITES, SiteTy};
 
     /// The kernel table's K-quant GEMM entries name exactly the four K-quant
     /// families: a table row that moves a type in or out of them moves
@@ -190,5 +254,23 @@ mod tests {
     fn the_kquant_sites_are_the_four_kquants() {
         let kq: Vec<SiteTy> = SiteTy::ALL.iter().copied().filter(|s| s.kquant()).collect();
         assert_eq!(kq, [SiteTy::Q3K, SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K]);
+    }
+
+    /// A family outside the card kernel table is its row alone: no card list
+    /// holds it ([`SiteTy::ALL`]), it maps no dense entry, its file type and
+    /// activation form are its row's, and [`SiteTy::of_ggml`] — the card
+    /// table's map — names its type none, so a card `allowed` refuses the
+    /// type by name exactly as before the row existed.
+    #[test]
+    fn a_backend_family_is_its_row_alone() {
+        for &(ty, family, act) in BACKEND_SITES {
+            assert!(family.entry().is_none(), "{family} has a card entry");
+            assert!(!SiteTy::ALL.contains(&family), "{family} is a card list's");
+            assert_eq!(family.ggml(), ty, "{family}");
+            assert_eq!(family.to_string(), ty.to_string().to_ascii_uppercase());
+            assert_eq!(family.reads(), act, "{family}");
+            assert!(!family.kquant(), "{family}");
+            assert_eq!(SiteTy::of_ggml(ty), None, "{ty} has a card family");
+        }
     }
 }
