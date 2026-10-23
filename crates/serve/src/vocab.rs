@@ -1,0 +1,220 @@
+//! What a model file gives the server beside its engine, for every seat on
+//! every backend: [`Vocab`], the file's own vocabulary as the server's
+//! [`Tokenizer`], and [`ChatSurface`], its chat template and name
+//! (`--chat-template-file`'s text, [`TemplateFile`], in place of the header's
+//! template). Host code only: a CUDA seat and the Metal server read the file
+//! through the same owner.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::engine::{Decoder, Tokenizer};
+
+/// The file's vocabulary as the server reads it.
+pub struct Vocab {
+    tok: Arc<tokenizer::Tokenizer>,
+    bos: u32,
+    eos: u32,
+    user_start: Vec<u32>,
+}
+
+impl Vocab {
+    /// Wraps a loaded vocabulary; refused when it names no BOS or EOS.
+    pub fn new(tok: tokenizer::Tokenizer) -> Result<Vocab, String> {
+        let sp = tok.specials();
+        let bos = sp
+            .bos
+            .ok_or_else(|| "the vocabulary names no BOS token".to_owned())?;
+        let eos = sp
+            .eos
+            .ok_or_else(|| "the vocabulary names no EOS token".to_owned())?;
+        Ok(Vocab {
+            tok: Arc::new(tok),
+            bos,
+            eos,
+            user_start: Vec::new(),
+        })
+    }
+
+    /// The same vocabulary with `marker`, one of its special tokens, as the
+    /// token that opens a user message ([`Tokenizer::user_start`]); refused
+    /// when no special token has that text.
+    pub fn with_user_start(mut self, marker: &str) -> Result<Vocab, String> {
+        let id = self
+            .tok
+            .special_tokens()
+            .iter()
+            .copied()
+            .find(|&id| self.tok.text(id) == Some(marker))
+            .ok_or_else(|| format!("the vocabulary has no special token {marker:?}"))?;
+        self.user_start = vec![id];
+        Ok(self)
+    }
+
+    /// The vocabulary itself.
+    pub fn tokenizer(&self) -> &tokenizer::Tokenizer {
+        &self.tok
+    }
+}
+
+impl Tokenizer for Vocab {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        // The rendered prompt carries the BOS string and the role markers as text.
+        self.tok.encode(text, false, true)
+    }
+
+    fn guard<'a>(&self, text: &'a str, mark: &str) -> std::borrow::Cow<'a, str> {
+        self.tok.guard(text, mark)
+    }
+
+    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
+        self.tok.encode_marked(text, mark, false, true)
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        self.tok.decode(ids)
+    }
+
+    fn decoder(&self) -> Box<dyn Decoder> {
+        Box::new(VocabDecoder {
+            tok: Arc::clone(&self.tok),
+            pending: Vec::new(),
+        })
+    }
+
+    fn bos(&self) -> u32 {
+        self.bos
+    }
+
+    fn eos(&self) -> u32 {
+        self.eos
+    }
+
+    fn stops(&self) -> Vec<u32> {
+        // The tokenizer owns the complete end-of-generation set, including explicit HF stops.
+        self.tok.eog().to_vec()
+    }
+
+    fn add_bos(&self) -> bool {
+        self.tok.add_bos()
+    }
+
+    fn add_eos(&self) -> bool {
+        self.tok.add_eos()
+    }
+
+    fn n_vocab(&self) -> usize {
+        self.tok.n_vocab()
+    }
+
+    fn user_start(&self) -> Vec<u32> {
+        self.user_start.clone()
+    }
+}
+
+/// `tokenizer::Decoder`'s rule over an owned vocabulary handle: pieces with
+/// special tokens rendered, an incomplete UTF-8 tail held, an invalid
+/// sequence replaced by U+FFFD. `tokenizer::Decoder` borrows its vocabulary,
+/// and the server's decoder must outlive the call that made it.
+struct VocabDecoder {
+    tok: Arc<tokenizer::Tokenizer>,
+    pending: Vec<u8>,
+}
+
+impl Decoder for VocabDecoder {
+    fn push(&mut self, id: u32) -> Option<String> {
+        self.pending.extend_from_slice(self.tok.piece(id, true));
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.pending.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    // The first `valid` bytes were just checked.
+                    out.push_str(std::str::from_utf8(&self.pending[..valid]).unwrap_or_default());
+                    match e.error_len() {
+                        None => {
+                            self.pending.drain(..valid);
+                            break;
+                        }
+                        Some(bad) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            self.pending.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    fn flush(&mut self) -> String {
+        let rest = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        rest
+    }
+}
+
+/// `--chat-template-file PATH`: the chat template read from a file in place of
+/// the model file's own ([`ChatSurface::read`]). The seats that take the flag take
+/// it through this type, so its spelling and its reading have one owner.
+#[derive(Debug, Default)]
+pub struct TemplateFile(Option<PathBuf>);
+
+impl TemplateFile {
+    /// The flag's spelling.
+    pub const FLAG: &'static str = "--chat-template-file";
+
+    /// Takes the file the flag named.
+    pub fn set(&mut self, value: &str) {
+        self.0 = Some(PathBuf::from(value));
+    }
+
+    /// The file, when the flag was given.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+/// The chat surface a seat's file gives the server: the Jinja template and
+/// the model's name.
+pub struct ChatSurface {
+    /// `--chat-template-file`'s text where the seat takes the flag, else the
+    /// file's `tokenizer.chat_template`.
+    pub template: String,
+    /// The file's `general.name`, else the seat's default alias.
+    pub name: String,
+}
+
+impl ChatSurface {
+    /// The surface of the file at `path` from its header's `tokenizer.chat_template`
+    /// and `general.name` (`template` and `name`): `template_file`'s text
+    /// replaces the header's template, and a file with neither is refused by
+    /// name; `name` falls to `default_alias` when the file states none.
+    pub fn read(
+        path: &Path,
+        template: Option<&gguf::Value>,
+        name: Option<&gguf::Value>,
+        template_file: Option<&Path>,
+        default_alias: &str,
+    ) -> Result<ChatSurface, String> {
+        let template = match template_file {
+            Some(file) => std::fs::read_to_string(file)
+                .map_err(|e| format!("--chat-template-file {}: {e}", file.display()))?,
+            None => template
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("{}: no tokenizer.chat_template", path.display()))?
+                .to_owned(),
+        };
+        let name = name
+            .and_then(|v| v.as_str())
+            .unwrap_or(default_alias)
+            .to_owned();
+        Ok(ChatSurface { template, name })
+    }
+}

@@ -4,9 +4,12 @@
 //! (the prompt's tail then the generated ids, as llama-server feeds the whole
 //! prompt into the sampler), then top_k, then top_p, then min_p, then temperature,
 //! then a draw; temperature `<= 0` takes the best candidate after the penalties.
+//! [`sampler_factory`] is that plug, every seat's: the sampler crate's chain.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use sampler::{Sampler as Chain, SamplerParams};
 
 use crate::engine::{Sampler, SamplerFactory, SamplerRefused, SamplingParams};
 
@@ -20,6 +23,38 @@ pub fn reference_factory() -> SamplerFactory {
         let mut cand: Vec<(u32, f32)> = Vec::new();
         Ok(Box::new(move |logits: &[f32], history: &[u32]| {
             sample(&p, &mut rng, &mut cand, logits, history)
+        }))
+    })
+}
+
+/// The server's `SamplingParams` as the sampler crate's chain: the penalties
+/// over the request's window, `top_k <= 0` keeps every candidate. The server
+/// never builds a sampler for `temperature <= 0`: those requests take the
+/// engine's argmax.
+#[must_use]
+pub fn sampler_params(p: &SamplingParams) -> SamplerParams {
+    SamplerParams {
+        temperature: p.temperature,
+        top_k: u32::try_from(p.top_k).unwrap_or(0),
+        top_p: p.top_p,
+        // Past 1 keeps only the best candidate, as 1 does; the chain refuses it.
+        min_p: p.min_p.min(1.0),
+        repeat_penalty: p.repeat_penalty,
+        frequency_penalty: p.frequency_penalty,
+        presence_penalty: p.presence_penalty,
+        repeat_last_n: p.repeat_last_n,
+        seed: p.seed,
+    }
+}
+
+/// A factory of sampler-crate samplers. A parameter the chain still refuses
+/// (a non-finite value) refuses the request, in the chain's own words.
+#[must_use]
+pub fn sampler_factory() -> SamplerFactory {
+    Arc::new(|p: &SamplingParams| -> Result<Sampler, SamplerRefused> {
+        let mut s = Chain::new(sampler_params(p)).map_err(|e| SamplerRefused(e.to_string()))?;
+        Ok(Box::new(move |logits: &[f32], recent: &[u32]| {
+            s.sample(logits, recent)
         }))
     })
 }
@@ -175,6 +210,33 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The factory's sampler is the sampler crate's chain over the request's
+    /// parameters, and a parameter the chain refuses (a non-finite
+    /// temperature) is the request's refusal in the chain's own words: no
+    /// sampler that draws something else stands in for it.
+    #[test]
+    fn the_sampler_factory_refuses_what_the_chain_refuses() {
+        use crate::engine::SamplingParams;
+        let factory = super::sampler_factory();
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            repeat_penalty: 1.0,
+            ..SamplingParams::default()
+        };
+        let mut draw = factory(&greedy).unwrap_or_else(|e| panic!("refused: {e}"));
+        assert_eq!(draw(&[0.0, 3.0, 1.0], &[]), 1, "the chain's argmax");
+        let Err(refused) = factory(&SamplingParams {
+            temperature: f32::NAN,
+            ..greedy
+        }) else {
+            panic!("a NaN temperature built a sampler");
+        };
+        assert!(
+            refused.0.contains("temperature") && refused.0.contains("a finite number"),
+            "{refused}"
+        );
+    }
 
     #[test]
     fn same_seed_same_draws_and_greedy_limit() {

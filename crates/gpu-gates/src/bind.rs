@@ -1,7 +1,7 @@
 //! The server's engine over a [`Seat`]: [`SeatEngine`] implements
-//! `serve::Engine`, [`Vocab`] implements `serve::Tokenizer` over the file's
-//! own vocabulary, and [`sampler_factory`] builds each request's sampler from
-//! the sampler crate.
+//! `serve::Engine`. The file's vocabulary ([`Vocab`]), its chat surface
+//! ([`ChatSurface`]) and the sampler factory ([`sampler_factory`]) are the
+//! serve crate's, every backend's, and re-exported here for the seats.
 //!
 //! The seat — the model, its draft if one runs, and the body's rules — lives
 //! on one thread of its own, for the whole run. The server calls its engine
@@ -65,256 +65,19 @@ use bloomery_levers::Levers;
 use gguf::Split;
 use model::placement::workstation::{self, DeviceId, HostRead};
 use model::placement::{Device, Machine, ModelTensors, Plan, Role};
-use sampler::{Sampler, SamplerParams};
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
-    CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER,
-    Flight, Landed, ModelProps, Pending, PlacementProps, ResidencyReset, SamplerFactory,
-    SamplerRefused, SamplingParams, Saved, SavedState, ServeError, Server, ServerConfig,
-    SlotConfig, StateError, Tokenizer,
+    CacheNote, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER, Flight,
+    Landed, ModelProps, Pending, PlacementProps, ResidencyReset, Saved, SavedState, ServeError,
+    Server, ServerConfig, SlotConfig, StateError, Tokenizer,
 };
 
 use crate::GateError;
 use crate::record::Record;
 use crate::side_seat::SideEngine;
 
-/// The file's vocabulary as the server reads it.
-pub struct Vocab {
-    tok: Arc<tokenizer::Tokenizer>,
-    bos: u32,
-    eos: u32,
-    user_start: Vec<u32>,
-}
-
-impl Vocab {
-    /// Wraps a loaded vocabulary; refused when it names no BOS or EOS.
-    pub fn new(tok: tokenizer::Tokenizer) -> Result<Vocab, GateError> {
-        let sp = tok.specials();
-        let bos = sp.bos.ok_or("the vocabulary names no BOS token")?;
-        let eos = sp.eos.ok_or("the vocabulary names no EOS token")?;
-        Ok(Vocab {
-            tok: Arc::new(tok),
-            bos,
-            eos,
-            user_start: Vec::new(),
-        })
-    }
-
-    /// The same vocabulary with `marker`, one of its special tokens, as the
-    /// token that opens a user message ([`Tokenizer::user_start`]); refused
-    /// when no special token has that text.
-    pub fn with_user_start(mut self, marker: &str) -> Result<Vocab, GateError> {
-        let id = self
-            .tok
-            .special_tokens()
-            .iter()
-            .copied()
-            .find(|&id| self.tok.text(id) == Some(marker))
-            .ok_or_else(|| format!("the vocabulary has no special token {marker:?}"))?;
-        self.user_start = vec![id];
-        Ok(self)
-    }
-
-    /// The vocabulary itself.
-    pub fn tokenizer(&self) -> &tokenizer::Tokenizer {
-        &self.tok
-    }
-}
-
-impl Tokenizer for Vocab {
-    fn encode(&self, text: &str) -> Vec<u32> {
-        // The rendered prompt carries the BOS string and the role markers as text.
-        self.tok.encode(text, false, true)
-    }
-
-    fn guard<'a>(&self, text: &'a str, mark: &str) -> std::borrow::Cow<'a, str> {
-        self.tok.guard(text, mark)
-    }
-
-    fn encode_marked(&self, text: &str, mark: &str) -> Vec<u32> {
-        self.tok.encode_marked(text, mark, false, true)
-    }
-
-    fn decode(&self, ids: &[u32]) -> String {
-        self.tok.decode(ids)
-    }
-
-    fn decoder(&self) -> Box<dyn Decoder> {
-        Box::new(VocabDecoder {
-            tok: Arc::clone(&self.tok),
-            pending: Vec::new(),
-        })
-    }
-
-    fn bos(&self) -> u32 {
-        self.bos
-    }
-
-    fn eos(&self) -> u32 {
-        self.eos
-    }
-
-    fn stops(&self) -> Vec<u32> {
-        // The tokenizer owns the complete end-of-generation set, including explicit HF stops.
-        self.tok.eog().to_vec()
-    }
-
-    fn add_bos(&self) -> bool {
-        self.tok.add_bos()
-    }
-
-    fn add_eos(&self) -> bool {
-        self.tok.add_eos()
-    }
-
-    fn n_vocab(&self) -> usize {
-        self.tok.n_vocab()
-    }
-
-    fn user_start(&self) -> Vec<u32> {
-        self.user_start.clone()
-    }
-}
-
-/// `tokenizer::Decoder`'s rule over an owned vocabulary handle: pieces with
-/// special tokens rendered, an incomplete UTF-8 tail held, an invalid
-/// sequence replaced by U+FFFD. `tokenizer::Decoder` borrows its vocabulary,
-/// and the server's decoder must outlive the call that made it.
-struct VocabDecoder {
-    tok: Arc<tokenizer::Tokenizer>,
-    pending: Vec<u8>,
-}
-
-impl Decoder for VocabDecoder {
-    fn push(&mut self, id: u32) -> Option<String> {
-        self.pending.extend_from_slice(self.tok.piece(id, true));
-        let mut out = String::new();
-        loop {
-            match std::str::from_utf8(&self.pending) {
-                Ok(s) => {
-                    out.push_str(s);
-                    self.pending.clear();
-                    break;
-                }
-                Err(e) => {
-                    let valid = e.valid_up_to();
-                    // The first `valid` bytes were just checked.
-                    out.push_str(std::str::from_utf8(&self.pending[..valid]).unwrap_or_default());
-                    match e.error_len() {
-                        None => {
-                            self.pending.drain(..valid);
-                            break;
-                        }
-                        Some(bad) => {
-                            out.push(char::REPLACEMENT_CHARACTER);
-                            self.pending.drain(..valid + bad);
-                        }
-                    }
-                }
-            }
-        }
-        (!out.is_empty()).then_some(out)
-    }
-
-    fn flush(&mut self) -> String {
-        let rest = String::from_utf8_lossy(&self.pending).into_owned();
-        self.pending.clear();
-        rest
-    }
-}
-
-/// The server's `SamplingParams` as the sampler crate's chain: the penalties
-/// over the request's window, `top_k <= 0` keeps every candidate. The server
-/// never builds a sampler for `temperature <= 0`: those requests take the
-/// engine's argmax.
-pub fn sampler_params(p: &SamplingParams) -> SamplerParams {
-    SamplerParams {
-        temperature: p.temperature,
-        top_k: u32::try_from(p.top_k).unwrap_or(0),
-        top_p: p.top_p,
-        // Past 1 keeps only the best candidate, as 1 does; the chain refuses it.
-        min_p: p.min_p.min(1.0),
-        repeat_penalty: p.repeat_penalty,
-        frequency_penalty: p.frequency_penalty,
-        presence_penalty: p.presence_penalty,
-        repeat_last_n: p.repeat_last_n,
-        seed: p.seed,
-    }
-}
-
-/// A factory of sampler-crate samplers. A parameter the chain still refuses
-/// (a non-finite value) refuses the request, in the chain's own words.
-pub fn sampler_factory() -> SamplerFactory {
-    Arc::new(
-        |p: &SamplingParams| -> Result<serve::Sampler, SamplerRefused> {
-            let mut s =
-                Sampler::new(sampler_params(p)).map_err(|e| SamplerRefused(e.to_string()))?;
-            Ok(Box::new(move |logits: &[f32], recent: &[u32]| {
-                s.sample(logits, recent)
-            }))
-        },
-    )
-}
-
-/// `--chat-template-file PATH`: the chat template read from a file in place of
-/// the model file's own ([`ChatSurface::read`]). The seats that take the flag take
-/// it through this type, so its spelling and its reading have one owner.
-#[derive(Debug, Default)]
-pub struct TemplateFile(Option<PathBuf>);
-
-impl TemplateFile {
-    /// The flag's spelling.
-    pub const FLAG: &'static str = "--chat-template-file";
-
-    /// Takes the file the flag named.
-    pub fn set(&mut self, value: &str) {
-        self.0 = Some(PathBuf::from(value));
-    }
-
-    /// The file, when the flag was given.
-    #[must_use]
-    pub fn path(&self) -> Option<&Path> {
-        self.0.as_deref()
-    }
-}
-
-/// The chat surface a seat's file gives the server: the Jinja template and
-/// the model's name.
-pub struct ChatSurface {
-    /// `--chat-template-file`'s text where the seat takes the flag, else the
-    /// file's `tokenizer.chat_template`.
-    pub template: String,
-    /// The file's `general.name`, else the seat's default alias.
-    pub name: String,
-}
-
-impl ChatSurface {
-    /// The surface of the file at `path` from its header's `tokenizer.chat_template`
-    /// and `general.name` (`template` and `name`): `template_file`'s text
-    /// replaces the header's template, and a file with neither is refused by
-    /// name; `name` falls to `default_alias` when the file states none.
-    pub fn read(
-        path: &Path,
-        template: Option<&gguf::Value>,
-        name: Option<&gguf::Value>,
-        template_file: Option<&Path>,
-        default_alias: &str,
-    ) -> Result<ChatSurface, GateError> {
-        let template = match template_file {
-            Some(file) => std::fs::read_to_string(file)
-                .map_err(|e| format!("--chat-template-file {}: {e}", file.display()))?,
-            None => template
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("{}: no tokenizer.chat_template", path.display()))?
-                .to_owned(),
-        };
-        let name = name
-            .and_then(|v| v.as_str())
-            .unwrap_or(default_alias)
-            .to_owned();
-        Ok(ChatSurface { template, name })
-    }
-}
+pub use serve::sampling::{sampler_factory, sampler_params};
+pub use serve::vocab::{ChatSurface, TemplateFile, Vocab};
 
 /// What a seat's server binds with, past its engine.
 pub struct Listen<'a> {
@@ -3271,33 +3034,6 @@ mod tests {
     const N_VOCAB: usize = 8;
 
     // PIN(2026-10-21): Removed seat-source/copy wiring assertions; the shared binder reads parsed levers.
-
-    /// The factory's sampler is the sampler crate's chain over the request's
-    /// parameters, and a parameter the chain refuses (a non-finite
-    /// temperature) is the request's refusal in the chain's own words: no
-    /// sampler that draws something else stands in for it.
-    #[test]
-    fn the_sampler_factory_refuses_what_the_chain_refuses() {
-        use serve::SamplingParams;
-        let factory = super::sampler_factory();
-        let greedy = SamplingParams {
-            temperature: 0.0,
-            repeat_penalty: 1.0,
-            ..SamplingParams::default()
-        };
-        let mut draw = factory(&greedy).unwrap_or_else(|e| panic!("refused: {e}"));
-        assert_eq!(draw(&[0.0, 3.0, 1.0], &[]), 1, "the chain's argmax");
-        let Err(refused) = factory(&SamplingParams {
-            temperature: f32::NAN,
-            ..greedy
-        }) else {
-            panic!("a NaN temperature built a sampler");
-        };
-        assert!(
-            refused.0.contains("temperature") && refused.0.contains("a finite number"),
-            "{refused}"
-        );
-    }
 
     /// A link to a thread that answers every `Next` as the engine thread does:
     /// it fills the lent row and hands it back with the argmax. A

@@ -26,6 +26,10 @@ bloomery-embed = { path = "../embed" }
 bloomery-gguf = { path = "../gguf" }
 # The chat-template engine: `ChatTemplate` and `TemplateError` are the jinja crate's, re-exported here.
 bloomery-jinja = { path = "../jinja" }
+# The file's vocabulary as the server's `Tokenizer` (`vocab::Vocab`), and the sampler crate's chain as
+# the server's sampler factory (`sampling::sampler_factory`): every seat's, the CUDA seats' and Metal's.
+bloomery-tokenizer = { path = "../tokenizer" }
+bloomery-sampler = { path = "../sampler" }
 # The media part: the image decoders and a model's MediaModel (data plus one prepare) are the vision
 # crate's; an image's cache key is the sha256 of its file bytes.
 bloomery-vision = { path = "../vision" }
@@ -37,8 +41,3 @@ thiserror.workspace = true
 # The orderly stop's signal handlers: `sigaction`, a `write` a handler makes,
 # a `read` the reader thread blocks on. The workspace's pinned version.
 libc.workspace = true
-
-[dev-dependencies]
-# The chat-path gates tokenize with the real byte-level BPE over a synthetic vocabulary: a control
-# string in client text must come out as ordinary tokens, which only the tokenizer can say.
-bloomery-tokenizer = { path = "../tokenizer" }

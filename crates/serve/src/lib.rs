@@ -49,6 +49,7 @@ mod stop;
 mod swap;
 pub mod v41;
 pub mod video;
+pub mod vocab;
 mod worker;
 
 pub use api::{
