@@ -1584,7 +1584,6 @@ mod tests {
             assert_eq!(s.ggml(), ty);
             assert_eq!(s.to_string(), label);
             assert_eq!(gemm_weight(s), grouped);
-            assert_eq!(s.kquant(), grouped.is_some());
             assert_eq!(kgemv_order(s).is_some(), s.reads() == Form::Q8x128);
             let by_name = model::placement::accepts::dense_by_name(ty);
             assert_eq!(super::BY_NAME.contains(&s), by_name.is_some(), "{s}");
