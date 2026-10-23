@@ -35,8 +35,8 @@ mod seg;
 
 pub use attention::{
     AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE,
-    SEGMENT_KEYS, TILE, attention_dispatches, f16_len, out_len, partials_len, q8_code_len,
-    q8_scale_len, qg_len, segments_for_keys,
+    SEGMENT_CAP, SEGMENT_KEYS, TILE, f16_len, out_len, partials_len, q8_code_len, q8_scale_len,
+    qg_len, segments_for_keys,
 };
 pub use delta::DeltaParams;
 pub use delta::HeadMap;

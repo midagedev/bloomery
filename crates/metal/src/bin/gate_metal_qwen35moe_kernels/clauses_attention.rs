@@ -8,8 +8,8 @@ use bloomery_device::fault::{Fault, FaultSite};
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::encode::{Binding, ComputeEncoder};
 use bloomery_metal::kernels::{
-    AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT,
-    attention_dispatches, f16_len, out_len, partials_len, q8_code_len, q8_scale_len, qg_len,
+    AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, f16_len, out_len,
+    partials_len, q8_code_len, q8_scale_len, qg_len, segments_for_keys,
 };
 use bloomery_metal::library::Library;
 use bloomery_metal::{MetalBuffer, MetalDevice};
@@ -23,8 +23,15 @@ use super::oracle_attention::{
 };
 use super::{Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD};
 
-/// Cache rows. The append sits at 63, and rows past it stay unread.
+/// Cache rows of the fault and refusal scenes. The append sits at 63, and
+/// rows past it stay unread.
 const CTX: usize = 80;
+/// The widest key-count scene's cache rows: the 4096-key scene plus rows
+/// past the live keys that stay unread.
+const DEEP_CTX: usize = 4112;
+/// The key counts the attention scenes run at: the rule's one-segment
+/// waterline and its counted splits, the ticket's fold past the first.
+const SCENE_KEYS: [u32; 5] = [1, 64, 100, 512, 4096];
 /// An f16 cache word no packed value of the planted rows uses as its check.
 const F16_HOLE: u16 = 0x0BAD;
 /// A q8_0 code word planted where no row was written.
@@ -206,7 +213,7 @@ fn load_tables(fixture: &Fixture) -> Result<Tables, String> {
     }
     let (q_gain, q_note) = load_gain(fixture, "blk.0.attn_q_norm.weight", KIND_Q);
     let (k_gain, k_note) = load_gain(fixture, "blk.0.attn_k_norm.weight", KIND_K);
-    let (rope, rope_note) = load_rope(fixture, CTX)?;
+    let (rope, rope_note) = load_rope(fixture, DEEP_CTX)?;
     Ok(Tables {
         eps,
         q_gain,
@@ -223,6 +230,20 @@ fn scene_one(segments: usize, q8: bool) -> Scene {
         pos: 63,
         n_keys: 64,
         prefill: 63,
+        q8,
+    }
+}
+
+/// The scene of a live key count: the rule's segments, the append at the
+/// last live row, every earlier row planted.
+fn scene_keys(n_keys: u32, q8: bool) -> Scene {
+    let pos = n_keys - 1;
+    Scene {
+        segments: segments_for_keys(n_keys) as usize,
+        ctx: DEEP_CTX,
+        pos,
+        n_keys,
+        prefill: (pos) as usize,
         q8,
     }
 }
@@ -441,8 +462,8 @@ fn launch(
 ) -> Result<Seen, String> {
     let (device, stream) = (h.device, h.stream);
     h.clear_fault()?;
-    if tables.rope.len() != scene.ctx * ROT {
-        return Err("the rope table is not one row per cache row".to_string());
+    if tables.rope.len() < scene.ctx * ROT {
+        return Err("the rope table is shorter than the scene's cache".to_string());
     }
     let out_n = out_len().ok_or("the output length wraps")?;
     let q_n = qg_len().ok_or("the query length wraps")?;
@@ -456,8 +477,9 @@ fn launch(
     let (v_buf, _) = upload_f32(device, stream, v)?;
     let (q_gain, _) = upload_f32(device, stream, &tables.q_gain)?;
     let (k_gain, _) = upload_f32(device, stream, &tables.k_gain)?;
-    let (rope, _) = upload_f32(device, stream, &tables.rope)?;
+    let (rope, _) = upload_f32(device, stream, &tables.rope[..scene.ctx * ROT])?;
     let mut partials = device.upload(stream, &vec![0f32; partial_n]).map_err(why)?;
+    let mut ticket = device.upload(stream, &[0u32]).map_err(why)?;
     let sentinel = f32::from_bits(SENTINEL_BITS);
     let out_host = super::padded(sentinel, OUT_GUARD, &vec![sentinel; out_n], OUT_GUARD);
     let mut out_buf = device.upload(stream, &out_host).map_err(why)?;
@@ -469,8 +491,6 @@ fn launch(
     let eps = tables.eps;
     let q_len = q.len();
     let k_len = k.len();
-    let segments_u =
-        u32::try_from(segments).map_err(|_| "the segment count does not fit".to_string())?;
     h.encode(|encoder| {
         let flash = AttentionParams {
             head_dim: HEAD_DIM,
@@ -492,35 +512,23 @@ fn launch(
             partials: partials.window_mut(Elems(0), Elems(partial_n))?,
             out: out_buf.window_mut(Elems(OUT_GUARD), Elems(out_n))?,
             fault: device.fault_word(),
+            ticket: ticket.window_mut(Elems(0), Elems(1))?,
         };
+        // One dispatch: past one segment its last threadgroup folds the
+        // partials and writes the gated output.
         h.kernels.attention_flash(encoder, flash)?;
-        if attention_dispatches(segments_u) == 2 {
-            encoder.memory_barrier();
-            let merge = AttentionParams {
-                head_dim: HEAD_DIM,
-                query_heads: QUERY_HEADS,
-                kv_heads: KV_HEADS,
-                segments,
-                ctx,
-                eps,
-                layer: LAYER,
-                pos,
-                n_keys,
-                q: q_buf.window(Elems(VALUE_PAD), Elems(q_len))?,
-                k: k_buf.window(Elems(VALUE_PAD), Elems(k_len))?,
-                v: v_buf.window(Elems(VALUE_PAD), Elems(k_len))?,
-                q_gain: q_gain.window(Elems(VALUE_PAD), Elems(HEAD_DIM))?,
-                k_gain: k_gain.window(Elems(VALUE_PAD), Elems(HEAD_DIM))?,
-                rope: rope.window(Elems(VALUE_PAD), Elems(ctx * ROT))?,
-                cache: cache_of(&mut uploaded, ctx)?,
-                partials: partials.window_mut(Elems(0), Elems(partial_n))?,
-                out: out_buf.window_mut(Elems(OUT_GUARD), Elems(out_n))?,
-                fault: device.fault_word(),
-            };
-            h.kernels.attention_merge(encoder, merge)?;
-        }
         Ok(())
     })?;
+    let mut ticket_back = [1u32; 1];
+    device
+        .read(stream, ticket.whole().map_err(why)?, &mut ticket_back)
+        .map_err(why)?;
+    if ticket_back[0] != 0 {
+        return Err(format!(
+            "the fold's ticket reads back {}, not the zero it resets to",
+            ticket_back[0]
+        ));
+    }
     let mut back = vec![0f32; out_host.len()];
     device
         .read(stream, out_buf.whole().map_err(why)?, &mut back)
@@ -880,27 +888,48 @@ fn noted_band(tables: &Tables, worst: f64, what: &str) -> Verdict {
     ))
 }
 
-/// f16 attention and the appended row match the oracle at one segment and at four.
+/// f16 attention and the appended row match the oracle at the rule's key
+/// counts: the one-segment waterline, its counted splits, the ticket's fold
+/// past the first segment, and the four-segment scene the split rule leaves.
 pub fn attn_f16(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let tables = load_tables(fixture)?;
-    let one = run(h, &tables, &scene_one(1, false))?;
+    let mut worst = 0.0f64;
+    let mut note = String::new();
+    for &n_keys in &SCENE_KEYS {
+        let checked = run(h, &tables, &scene_keys(n_keys, false))?;
+        worst = wider(worst, checked.worst);
+        note.push_str(&format!(
+            " keys={n_keys}/S={} by the rule",
+            segments_for_keys(n_keys)
+        ));
+    }
     let four = run(h, &tables, &scene_one(4, false))?;
     Ok(noted_band(
         &tables,
-        wider(one.worst, four.worst),
-        "f16 S=1 and S=4",
+        wider(worst, four.worst),
+        &format!("f16{note} and S=4 off the rule"),
     ))
 }
 
-/// The appended q8_0 row matches `gguf::quant::quantize_q8_0`, and attention over it is inside the band.
+/// The appended q8_0 row matches `gguf::quant::quantize_q8_0`, and attention
+/// over it is inside the band, at the same key counts.
 pub fn attn_q8(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let tables = load_tables(fixture)?;
-    let one = run(h, &tables, &scene_one(1, true))?;
+    let mut worst = 0.0f64;
+    let mut note = String::new();
+    for &n_keys in &SCENE_KEYS {
+        let checked = run(h, &tables, &scene_keys(n_keys, true))?;
+        worst = wider(worst, checked.worst);
+        note.push_str(&format!(
+            " keys={n_keys}/S={} by the rule",
+            segments_for_keys(n_keys)
+        ));
+    }
     let four = run(h, &tables, &scene_one(4, true))?;
     Ok(noted_band(
         &tables,
-        wider(one.worst, four.worst),
-        "q8_0 S=1 and S=4, append gguf::quant::quantize_q8_0",
+        wider(worst, four.worst),
+        &format!("q8_0{note} and S=4 off the rule, append gguf::quant::quantize_q8_0"),
     ))
 }
 
@@ -1123,6 +1152,7 @@ struct Bounds {
     out: MetalBuffer<f32>,
     k_cache: MetalBuffer<u16>,
     v_cache: MetalBuffer<u16>,
+    ticket: MetalBuffer<u32>,
 }
 
 /// The launch of one case: a head dim, a head count, a segment count, a cache
@@ -1189,6 +1219,7 @@ fn refuse(
             partials: b.partials.window_mut(Elems(0), Elems(partial_n))?,
             out: b.out.window_mut(Elems(0), Elems(out_n))?,
             fault: h.device.fault_word(),
+            ticket: b.ticket.window_mut(Elems(0), Elems(1))?,
         },
     )
 }
@@ -1243,6 +1274,7 @@ pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         v_cache: device
             .upload(stream, &vec![F16_HOLE; f16_len(CTX).ok_or("cache")?])
             .map_err(why)?,
+        ticket: device.upload(stream, &[0u32]).map_err(why)?,
     };
     let whole = Args::whole(q_n);
     let case = |what: &'static str, needle: &'static str, edit: Box<dyn FnOnce(&mut Args)>| {

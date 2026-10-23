@@ -56,11 +56,11 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "merge_first_segment",
         clause: "f_deep",
-        why: "the merge folds the first segment's partial alone, so every live key \
+        why: "the fold folds the first segment's values alone, so every live key \
               past one segment misses from the output",
         edits: &[(
-            "for (uint seg = 0u; seg < args.segments; ++seg) {",
-            "for (uint seg = 0u; seg < 1u; ++seg) {",
+            "if (!refused) {\n        for (uint seg = 0u; seg < args.segments; ++seg) {",
+            "if (!refused) {\n        for (uint seg = 0u; seg < 1u; ++seg) {",
             1,
         )],
     },

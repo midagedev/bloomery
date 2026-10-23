@@ -403,10 +403,30 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "attn_gate_merge",
         clause: "attn_f16",
-        why: "the merge stores the attention without the gate",
+        why: "the fold stores the attention without the gate",
         edits: &[(
             "float merged = attn * attn_sigmoid(gate);",
             "float merged = attn;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_no_fold",
+        clause: "attn_f16",
+        why: "the fold never runs, so past one segment the output is never written",
+        edits: &[(
+            "if (args.segments > 1u) {\n        ticket_is_last(ticket, groups, tid, last_flag);",
+            "if (args.segments > 64u) {\n        ticket_is_last(ticket, groups, tid, last_flag);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_f16_round",
+        clause: "attn_f16",
+        why: "the f16 conversion rounds one bit high, so the appended row is not the host quantizer's bits",
+        edits: &[(
+            "uint t = v + 0x0fffu + ((v >> 13) & 1u);",
+            "uint t = v + 0x1fffu + ((v >> 13) & 1u);",
             1,
         )],
     },

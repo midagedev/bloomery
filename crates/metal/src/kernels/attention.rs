@@ -1,12 +1,14 @@
 //! The launch of decode GQA attention: 16 query heads, 2 key heads, head
-//! dim 256. One threadgroup is one key head and one segment. It stages one
-//! tile of 16 K/V rows and four SIMD groups read that tile.
+//! dim 256. One threadgroup is one key head and one segment of eight SIMD
+//! groups, one query head a group, the keys streamed from the cache into
+//! registers.
 //!
 //! One segment is the flash: it normalizes, applies the gate and writes the
-//! output. More than one segment is the flash, which writes partials, and
-//! then the merge, which normalizes, applies the gate and writes the output.
-//! The caller places the barrier between those two dispatches. Both read
-//! [`attention_dispatches`].
+//! output. More than one writes partials, and the dispatch's last
+//! threadgroup — the ticket's — folds them, applies the gate and writes the
+//! output in the same launch. The ticket is one word the caller holds
+//! zeroed; the fold resets it, so the next launch finds it zero. There is
+//! no merge dispatch.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -17,10 +19,10 @@ use crate::library::{Library, Pipeline};
 
 use super::{Kernels, args_bytes, check_window_len, pack, word};
 
-use super::attention_geom::{FLASH_THREADS, MERGE_THREADS, PARTIAL_ELEMS};
+use super::attention_geom::{FLASH_THREADS, PARTIAL_ELEMS};
 pub use super::attention_geom::{
-    HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE, SEGMENT_KEYS, TILE,
-    attention_dispatches, segments_for_keys,
+    HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE, SEGMENT_CAP, SEGMENT_KEYS, TILE,
+    segments_for_keys,
 };
 
 /// The f16 cache or the q8_0 planes a launch reads and appends.
@@ -88,6 +90,9 @@ pub struct AttentionParams<'w> {
     pub out: WindowMut<'w, f32, MetalDevice>,
     /// The fault word.
     pub fault: &'w MetalFaultWord,
+    /// The fold's ticket, one word. Held zeroed; the fold resets it, so the
+    /// next launch finds it zero. Bound only past one segment.
+    pub ticket: WindowMut<'w, u32, MetalDevice>,
 }
 
 /// The partial buffer's length: one partial per head and segment.
@@ -131,7 +136,6 @@ pub fn q8_scale_len(ctx: usize) -> Option<usize> {
 pub(crate) struct AttentionPipelines {
     f16: Pipeline,
     q8: Pipeline,
-    merge: Pipeline,
 }
 
 impl AttentionPipelines {
@@ -139,7 +143,6 @@ impl AttentionPipelines {
         Ok(Self {
             f16: library.pipeline("gqa256_flash_f16")?,
             q8: library.pipeline("gqa256_flash_q8")?,
-            merge: library.pipeline("gqa256_merge")?,
         })
     }
 }
@@ -152,7 +155,6 @@ fn refuse(detail: String) -> DeviceError {
 }
 
 struct Checked {
-    segments: u32,
     args: [[u8; 4]; 7],
 }
 
@@ -191,6 +193,20 @@ fn checked(p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
         .ok_or_else(|| refuse("the rope length wraps".to_string()))?;
     let partials =
         partials_len(p.segments).ok_or_else(|| refuse("the partial length wraps".to_string()))?;
+    if p.segments > SEGMENT_CAP {
+        return Err(refuse(format!(
+            "segments of {} past the kernel's {SEGMENT_CAP}",
+            p.segments
+        )));
+    }
+    check_window_len("attention", "ticket", p.ticket.len(), 1)?;
+    let ticket = p
+        .ticket
+        .byte_range()
+        .map_err(|e| refuse(format!("the ticket window: {e}")))?;
+    if ticket.start.get() % 4 != 0 {
+        return Err(refuse("the ticket word is not 4-byte aligned".to_string()));
+    }
     let out = out_len().ok_or_else(|| refuse("the output length wraps".to_string()))?;
     check_window_len("attention", "q", p.q.len(), q_len)?;
     check_window_len("attention", "k", p.k.len(), kv_len)?;
@@ -205,6 +221,19 @@ fn checked(p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
             let n = f16_len(p.ctx).ok_or_else(|| refuse("the cache length wraps".to_string()))?;
             check_window_len("attention", "k cache", k.len(), n)?;
             check_window_len("attention", "v cache", v.len(), n)?;
+            // The kernel reads each cache row as 16-byte words, one a lane:
+            // the windows must start where those words align.
+            for (name, w) in [("k cache", k), ("v cache", v)] {
+                let range = w
+                    .byte_range()
+                    .map_err(|e| refuse(format!("the {name} window: {e}")))?;
+                if range.start.get() % 16 != 0 {
+                    return Err(refuse(format!(
+                        "the {name} starts {start} bytes in, not on the 16-byte word the kernel                          reads",
+                        start = range.start.get()
+                    )));
+                }
+            }
         }
         AttnCache::Q8 {
             k_codes,
@@ -222,6 +251,8 @@ fn checked(p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
             check_window_len("attention", "v scales", v_scales.len(), scales)?;
         }
     }
+    // Each count is validated to fit the kernel's word; the flash's grid
+    // takes the segment count itself.
     let segments = word("attention", "segments", p.segments)?;
     let ctx = word("attention", "ctx", p.ctx)?;
     let args = args_bytes([
@@ -233,7 +264,7 @@ fn checked(p: &AttentionParams<'_>) -> Result<Checked, DeviceError> {
         p.pos,
         p.n_keys,
     ]);
-    Ok(Checked { segments, args })
+    Ok(Checked { args })
 }
 
 fn bind_flash(
@@ -255,6 +286,7 @@ fn bind_flash(
             encoder.set_binding(9, Binding::of_mut(&p.out)?)?;
             encoder.set_binding(10, Binding::bytes(pack(args))?)?;
             encoder.set_binding(11, p.fault.binding())?;
+            encoder.set_binding(12, Binding::of_mut(&p.ticket)?)?;
         }
         AttnCache::Q8 {
             k_codes,
@@ -270,16 +302,17 @@ fn bind_flash(
             encoder.set_binding(11, Binding::of_mut(&p.out)?)?;
             encoder.set_binding(12, Binding::bytes(pack(args))?)?;
             encoder.set_binding(13, p.fault.binding())?;
+            encoder.set_binding(14, Binding::of_mut(&p.ticket)?)?;
         }
     }
     Ok(())
 }
 
 impl Kernels {
-    /// Encode the flash. One dispatch. A shape the kernel does not take, or
-    /// a window that is not that shape, is refused by name and nothing is
-    /// encoded. One segment writes the gated output; more than one writes
-    /// partials and leaves the output to [`Self::attention_merge`].
+    /// Encode the flash. One dispatch, which past one segment also folds
+    /// the partials and writes the gated output. A shape the kernel does
+    /// not take, or a window that is not that shape, is refused by name and
+    /// nothing is encoded.
     #[must_use = "a refused launch encoded nothing"]
     pub fn attention_flash(
         &self,
@@ -297,29 +330,5 @@ impl Kernels {
         encoder.set_pipeline(pipeline);
         bind_flash(encoder, &p, &checked.args)?;
         encoder.dispatch_groups(groups, 1, FLASH_THREADS)
-    }
-
-    /// Encode the merge. One dispatch. One segment is refused by name: that
-    /// launch finishes in the flash, and this call encodes nothing.
-    #[must_use = "a refused launch encoded nothing"]
-    pub fn attention_merge(
-        &self,
-        encoder: &mut ComputeEncoder<'_>,
-        p: AttentionParams<'_>,
-    ) -> Result<(), DeviceError> {
-        let checked = checked(&p)?;
-        if attention_dispatches(checked.segments) == 1 {
-            return Err(refuse(
-                "one segment finishes in the flash, and the merge is not launched".to_string(),
-            ));
-        }
-        let groups = QUERY_HEADS;
-        encoder.set_pipeline(&self.attention.merge);
-        encoder.set_binding(0, Binding::of_mut(&p.partials)?)?;
-        encoder.set_binding(1, Binding::of_mut(&p.out)?)?;
-        encoder.set_binding(2, Binding::of(&p.q)?)?;
-        encoder.set_binding(3, Binding::bytes(pack(&checked.args))?)?;
-        encoder.set_binding(4, p.fault.binding())?;
-        encoder.dispatch_groups(groups, 1, MERGE_THREADS)
     }
 }
