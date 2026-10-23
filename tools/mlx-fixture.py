@@ -8,14 +8,18 @@
 `make` reads the fixture's tensors through the repo's one GGUF header parser
 (tools/ref/gguf-ranges.py, loaded the way tools/ref/gguf-respell.py loads it), dequantizes each
 Q4_K, Q6_K and F32 tensor by the rule crates/gguf/src/quant.rs ports from ggml (dequant_q4_k,
-dequant_q6_k), moves it to the Qwen3.6 checkpoint's MLX names — the inverse of the qwen4exp map's
-per-tensor steps (crates/model-hf/src/arch/qwen35moe.rs: the VCols{head:1} untile and `-exp` on
-A_log, the untile on dt_bias, `-1` on the q/k norms, the conv taps relabel; VRows is Qwen3-Next's
-and does not apply, the value heads are head-major on both sides) — and quantizes every linear
-with mx.quantize(..., group_size=64, bits=4|8, mode="affine") over its bf16 cast: 8 bits for the
+dequant_q6_k), moves it to the Qwen3.6 checkpoint's MLX names — the inverse of the map's per-tensor
+steps (crates/model-hf/src/arch/qwen35moe.rs, Family::Qwen36): the V heads of the gated delta-rule
+tensors from tiled to grouped by K head (VRows on in_proj_qkv, in_proj_z, in_proj_a, in_proj_b and
+the conv taps, VCols on out_proj, VCols{head:1} on A_log and dt_bias; the same order mlx-lm's
+gated_delta.py reads), `ln(-x)` on A_log, the conv taps relabelled [channels, taps, 1]; the norm
+gammas are written as the GGUF holds them (the GGUF's `x + 1` is what mlx-lm's sanitize stores,
+qwen3_5.py norm_keys) — and quantizes every linear with mx.quantize(..., group_size=64,
+bits=4|8, mode="affine") over its bf16 cast: 8 bits for the
 router (mlp.gate) and the shared-expert gate (mlp.shared_expert_gate), the per-module entries the
-config carries, 4 bits for every other linear; the norms, A_log, dt_bias and conv1d stay BF16. It
-writes safetensors shards (~1 GiB each, cut greedily in sorted-name order),
+config carries, 4 bits for every other linear; the norms, A_log, dt_bias and conv1d stay BF16. A
+quantized linear `X.weight` writes its companions as `X.scales` and `X.biases`, the real file's
+names. It writes safetensors shards (~1 GiB each, cut greedily in sorted-name order),
 model.safetensors.index.json and a config.json cut from the real one (num_hidden_layers,
 layer_types and the quantization module entries cut to the fixture's mirrored layers), then runs
 `check`.
@@ -161,7 +165,7 @@ def mlx_names(layers):
     """The output tensors, in a fixed order: (mlx name, gguf name, kind, bits).
 
     `layers` is [(blk index, 'linear'|'full')]. Kinds: `quant` a linear transposed and
-    quantized at `bits`; `bf16` a plain BF16 tensor; `alog`, `dt`, `minus1`, `conv` the
+    quantized at `bits`; `bf16` a plain BF16 tensor; `alog`, `dt`, `conv` the
     step-bearing BF16 tensors.
     """
     out = [
@@ -200,40 +204,86 @@ def mlx_names(layers):
             (f"{L}self_attn.k_proj.weight", f"{G}attn_k.weight", "quant", 4),
             (f"{L}self_attn.v_proj.weight", f"{G}attn_v.weight", "quant", 4),
             (f"{L}self_attn.o_proj.weight", f"{G}attn_output.weight", "quant", 4),
-            (f"{L}self_attn.q_norm.weight", f"{G}attn_q_norm.weight", "minus1", 0),
-            (f"{L}self_attn.k_norm.weight", f"{G}attn_k_norm.weight", "minus1", 0),
+            (f"{L}self_attn.q_norm.weight", f"{G}attn_q_norm.weight", "bf16", 0),
+            (f"{L}self_attn.k_norm.weight", f"{G}attn_k_norm.weight", "bf16", 0),
         ]
         out.extend(common + (linear if kind == "linear" else full))
     return out
 
 
 def untile():
-    """The inverse of the map's VCols{head:1} tile (quant.rs Step::VCols: tiled(h) =
-    (h % per)·k + h/per over 32 value heads of 16 key heads): MLX[h] = GGUF[tiled(h)]."""
+    """The inverse of the map's V-head tile (qwen35moe.rs Step::VRows/VCols: grouped head h goes
+    to GGUF place tiled(h) = (h % per)·k + h/per, over 32 value heads of 16 key heads):
+    MLX[h] = GGUF[tiled(h)]."""
     per = N_V // N_K
     return [(h % per) * N_K + h // per for h in range(N_V)]
+
+
+# The V-head moves by GGUF tensor: `tail` the rows after the q and k rows, `all` every row, `cols`
+# the columns of each row.
+V_MOVES = {
+    "attn_qkv.weight": "tail",
+    "ssm_conv1d.weight": "tail",
+    "attn_gate.weight": "all",
+    "ssm_alpha.weight": "all",
+    "ssm_beta.weight": "all",
+    "ssm_out.weight": "cols",
+}
+
+
+def value_head(info, layers):
+    """The V head's size: the first delta-rule layer's z projection rows over the V heads (0 when
+    the fixture has no delta-rule layer)."""
+    for blk, kind in layers:
+        if kind == "linear":
+            rows = info[f"blk.{blk}.attn_gate.weight"][1][1]
+            if rows % N_V:
+                raise Refusal(EXIT_REFUSED, f"blk.{blk}.attn_gate.weight: {rows} rows are not "
+                                            f"{N_V} V heads")
+            return rows // N_V
+    return 0
+
+
+def grouped(values, dims, how, head_v):
+    """A GGUF tensor's f32 values (ggml `dims`, 2-D) with the V heads from tiled to grouped by K
+    head (`how` is the V_MOVES entry): MLX head h is GGUF head tiled(h)."""
+    perm = untile()
+    a = np.asarray(values, dtype=np.float32).reshape(dims[::-1])
+    if how == "cols":
+        r, k = a.shape
+        if k % N_V:
+            raise Refusal(EXIT_REFUSED, f"{k} columns are not {N_V} V heads")
+        return a.reshape(r, N_V, k // N_V)[:, perm, :].reshape(r, k).copy()
+    rows = a.shape[0]
+    head = head_v if how == "tail" else rows // N_V
+    start = rows - N_V * head
+    if head == 0 or start < 0 or (how == "all" and rows % N_V):
+        raise Refusal(EXIT_REFUSED, f"{rows} rows are not {N_V} V heads of {head}"
+                                    f"{' after the q and k rows' if how == 'tail' else ''}")
+    tail = a[start:].reshape(N_V, head, -1)[perm].reshape(rows - start, -1)
+    return np.concatenate([a[:start], tail]).copy()
 
 
 def mlx_shape(kind, dims):
     """The MLX-side logical shape of a GGUF tensor with ggml dims `dims` (ne[0] first)."""
     if kind == "conv":
         return [dims[1], dims[0], 1]
-    if kind in ("bf16", "minus1", "dt", "alog"):
+    if kind in ("bf16", "dt", "alog"):
         return list(dims)
     if len(dims) == 1:
         return [1, dims[0]]  # the shared-expert gate: one row, as the real file holds it
     return list(dims[::-1])  # GGUF [K, R, E] memory is MLX [E, R, K] row-major
 
 
-def to_mlx(kind, values, dims):
+def to_mlx(kind, values, dims, gguf_name, head_v):
     """One tensor's f32 values (file order, ne[0] contiguous) as the MLX-side f32 array."""
+    how = V_MOVES.get(gguf_name.split(".", 2)[-1])
     if kind == "quant":
+        w = grouped(values, dims, how, head_v) if how else np.asarray(values)
         shape = [1, dims[0]] if len(dims) == 1 else dims[::-1]
-        return np.asarray(values).reshape(shape).copy()
+        return w.reshape(shape).copy()
     if kind == "bf16":
         return np.asarray(values, dtype=np.float32).copy()
-    if kind == "minus1":
-        return np.asarray(values, dtype=np.float32) - 1.0
     if kind == "dt":
         return np.asarray(values, dtype=np.float32)[untile()].copy()
     if kind == "alog":
@@ -243,7 +293,7 @@ def to_mlx(kind, values, dims):
         return np.log(neg).astype(np.float32)
     if kind == "conv":
         # GGUF [taps, channels] and MLX [channels, taps, 1] hold the same order.
-        return np.asarray(values).reshape(dims[1], dims[0], 1).copy()
+        return grouped(values, dims, how, head_v).reshape(dims[1], dims[0], 1).copy()
     raise Refusal(EXIT_USAGE, f"unknown kind {kind}")
 
 
@@ -430,6 +480,7 @@ def make(fixture, out, config_path, quantizer, quiet=False):
     if os.path.exists(out):
         raise Refusal(EXIT_REFUSED, f"{out} already exists (remove it first)")
     _meta, info, layers = read_gguf(fixture)
+    head_v = value_head(info, layers)
     entries = mlx_names(layers)
     missing = [g for _, g, _, _ in entries if g not in info]
     if missing:
@@ -461,16 +512,17 @@ def make(fixture, out, config_path, quantizer, quiet=False):
         for name in shard:
             gguf_name, kind, bits, shape = plan[name]
             values, dims = gguf(gguf_name)
-            w = to_mlx(kind, values, dims)
+            w = to_mlx(kind, values, dims, gguf_name, head_v)
             if list(w.shape) != shape:
                 raise Refusal(EXIT_REFUSED, f"{name}: shape {w.shape}, planned {shape}")
             if kind == "quant":
                 q, s, b = quantizer.quantize(w, bits)
                 if q.dtype != np.uint32 or q.shape[-1] != shape[-1] * bits // 32:
                     raise Refusal(EXIT_REFUSED, f"{name}: quantized {q.shape}, not {shape} words")
+                stem = name[: -len(".weight")]
                 tensors[name] = ("U32", list(q.shape), q.astype("<u4").tobytes())
-                tensors[f"{name}.scales"] = ("BF16", list(s.shape), s.astype("<u2").tobytes())
-                tensors[f"{name}.biases"] = ("BF16", list(b.shape), b.astype("<u2").tobytes())
+                tensors[f"{stem}.scales"] = ("BF16", list(s.shape), s.astype("<u2").tobytes())
+                tensors[f"{stem}.biases"] = ("BF16", list(b.shape), b.astype("<u2").tobytes())
             else:
                 tensors[name] = ("BF16", shape, to_bf16_bits(w.reshape(-1)).astype("<u2").tobytes())
             del values, w
@@ -534,6 +586,7 @@ def check(out, fixture, quantizer, quiet=False):
     with open(os.path.join(out, "model.safetensors.index.json")) as fh:
         weight_map = json.load(fh)["weight_map"]
     _meta, info, layers = read_gguf(fixture)
+    head_v = value_head(info, layers)
     entries = {m: (g, kind, bits) for m, g, kind, bits in mlx_names(layers)}
     gguf = GgufTensor(fixture, info)
     worst = {}
@@ -547,7 +600,7 @@ def check(out, fixture, quantizer, quiet=False):
                 raise Refusal(EXIT_REFUSED, f"{name}: not a tensor the map names")
             gguf_name, kind, bits = entries[name]
             values, dims = gguf(gguf_name)
-            want = to_mlx(kind, values, dims)
+            want = to_mlx(kind, values, dims, gguf_name, head_v)
             if kind == "quant":
                 override = qconf.get(name[: -len(".weight")], {})
                 if (override.get("bits", 4), override.get("group_size", GROUP)) != (bits, GROUP):
@@ -557,8 +610,9 @@ def check(out, fixture, quantizer, quiet=False):
                 if dty != "U32":
                     raise Refusal(EXIT_REFUSED, f"{name}: dtype {dty}, not U32")
                 words = np.frombuffer(blob, dtype="<u4").reshape(qshape)
-                s_dty, s_shape, s_blob = shard.read(f"{name}.scales")
-                b_dty, b_shape, b_blob = shard.read(f"{name}.biases")
+                stem = name[: -len(".weight")]
+                s_dty, s_shape, s_blob = shard.read(f"{stem}.scales")
+                b_dty, b_shape, b_blob = shard.read(f"{stem}.biases")
                 if s_dty != "BF16" or b_dty != "BF16":
                     raise Refusal(EXIT_REFUSED, f"{name}: a companion is {s_dty}/{b_dty}, not BF16")
                 s_bits = np.frombuffer(s_blob, dtype="<u2").reshape(s_shape)
@@ -674,12 +728,13 @@ def self_test():
             ("output_norm.weight", F32, [16], f32((16,)).astype("<f4").tobytes()),
             ("blk.0.attn_norm.weight", F32, [16], f32((16,)).astype("<f4").tobytes()),
             ("blk.0.post_attention_norm.weight", F32, [16], f32((16,)).astype("<f4").tobytes()),
-            ("blk.0.attn_qkv.weight", F32, [64, 12], f32((12, 64)).astype("<f4").tobytes()),
-            ("blk.0.attn_gate.weight", F32, [64, 6], f32((6, 64)).astype("<f4").tobytes()),
-            ("blk.0.ssm_alpha.weight", F32, [64, 4], f32((4, 64)).astype("<f4").tobytes()),
-            ("blk.0.ssm_beta.weight", F32, [64, 4], f32((4, 64)).astype("<f4").tobytes()),
+            # 32 V heads of 2 rows over 16 K heads of 1: q and k rows 32, V rows 64
+            ("blk.0.attn_qkv.weight", F32, [64, 96], f32((96, 64)).astype("<f4").tobytes()),
+            ("blk.0.attn_gate.weight", F32, [64, 64], f32((64, 64)).astype("<f4").tobytes()),
+            ("blk.0.ssm_alpha.weight", F32, [64, 32], f32((32, 64)).astype("<f4").tobytes()),
+            ("blk.0.ssm_beta.weight", F32, [64, 32], f32((32, 64)).astype("<f4").tobytes()),
             ("blk.0.ssm_out.weight", F32, [64, 6], f32((6, 64)).astype("<f4").tobytes()),
-            ("blk.0.ssm_conv1d.weight", F32, [4, 12], f32((12, 4)).astype("<f4").tobytes()),
+            ("blk.0.ssm_conv1d.weight", F32, [4, 96], f32((96, 4)).astype("<f4").tobytes()),
             # ssm_a: -exp(A_log), a permutation that covers the untile
             ("blk.0.ssm_a", F32, [32],
              (-np.exp(np.arange(1, 33, dtype=np.float32))).astype("<f4").tobytes()),
@@ -742,6 +797,12 @@ def self_test():
         # and the head) a weight, scales and biases, and 11 plain BF16 tensors
         # (6 + 4 beside the layers, the final norm)
         expect("index holds every tensor", len(weight_map) == 27 * 3 + 11, str(len(weight_map)))
+        # the companions are `X.scales` and `X.biases`, the real file's names
+        for stem in (f"{P}layers.0.mlp.gate", f"{P}layers.1.self_attn.q_proj", f"{P}embed_tokens"):
+            expect("companion names", all(f"{stem}.{x}" in weight_map
+                                          for x in ("weight", "scales", "biases")), stem)
+        expect("no `.weight.scales`", not any(".weight.scales" in k or ".weight.biases" in k
+                                              for k in weight_map))
         reader = ShardReader(os.path.join(out, weight_map[f"{P}layers.0.linear_attn.A_log"]))
         _dt, shape, blob = reader.read(f"{P}layers.0.linear_attn.A_log")
         alog = bf16_bits_to_f32(np.frombuffer(blob, dtype="<u2"))
@@ -752,6 +813,62 @@ def self_test():
               np.array_equal(to_bf16_bits(alog), to_bf16_bits(want.astype(np.float32))),
               f"{alog[:4]} vs {want[:4]}")
         reader.close()
+        # The V heads, by hand: MLX head h is GGUF head (h % 2)·16 + h // 2, so heads 0..3 are
+        # GGUF heads 0, 16, 1, 17.
+        _meta, info, _layers = read_gguf(fixture)
+        src = GgufTensor(fixture, info)
+
+        def mlx_plane(stem, bits=4):
+            rd = ShardReader(os.path.join(out, weight_map[f"{stem}.weight"]))
+            _d, shape, blob = rd.read(f"{stem}.weight")
+            words = np.frombuffer(blob, dtype="<u4").reshape(shape)
+            _d, sh, blob = rd.read(f"{stem}.scales")
+            scales = np.frombuffer(blob, dtype="<u2").reshape(sh)
+            _d, sh, blob = rd.read(f"{stem}.biases")
+            biases = np.frombuffer(blob, dtype="<u2").reshape(sh)
+            rd.close()
+            return decode_affine(words, scales, biases, bits)
+
+        tiled = lambda h: (h % 2) * 16 + h // 2
+        la = f"{P}layers.0.linear_attn."
+        z = mlx_plane(la + "in_proj_z")
+        gz = src("blk.0.attn_gate.weight")[0].reshape(64, 64)
+        for h in range(32):
+            expect(f"z head {h}", np.array_equal(z[2 * h:2 * h + 2],
+                                                 gz[2 * tiled(h):2 * tiled(h) + 2]))
+        qkv = mlx_plane(la + "in_proj_qkv")
+        gq = src("blk.0.attn_qkv.weight")[0].reshape(96, 64)
+        expect("qkv q and k rows", np.array_equal(qkv[:32], gq[:32]))
+        for h in range(32):
+            expect(f"qkv head {h}", np.array_equal(qkv[32 + 2 * h:34 + 2 * h],
+                                                   gq[32 + 2 * tiled(h):34 + 2 * tiled(h)]))
+        a = mlx_plane(la + "in_proj_a")
+        ga = src("blk.0.ssm_alpha.weight")[0].reshape(32, 64)
+        expect("alpha rows", all(np.array_equal(a[h], ga[tiled(h)]) for h in range(32)))
+        o = mlx_plane(la + "out_proj")
+        go = src("blk.0.ssm_out.weight")[0].reshape(6, 64)
+        expect("out_proj columns", all(np.array_equal(o[:, 2 * h:2 * h + 2],
+                                                      go[:, 2 * tiled(h):2 * tiled(h) + 2])
+                                       for h in range(32)))
+        rd = ShardReader(os.path.join(out, weight_map[la + "conv1d.weight"]))
+        _d, _s, blob = rd.read(la + "conv1d.weight")
+        rd.close()
+        conv = bf16_bits_to_f32(np.frombuffer(blob, dtype="<u2")).reshape(96, 4)
+        gc = src("blk.0.ssm_conv1d.weight")[0].reshape(96, 4)
+        expect("conv q and k rows", np.array_equal(conv[:32], gc[:32]))
+        expect("conv rows", all(np.array_equal(conv[32 + 2 * h:34 + 2 * h],
+                                               gc[32 + 2 * tiled(h):34 + 2 * tiled(h)])
+                                for h in range(32)))
+        # the norm gammas as the GGUF holds them
+        rd = ShardReader(os.path.join(out, weight_map[f"{P}layers.1.self_attn.q_norm.weight"]))
+        _d, _s, blob = rd.read(f"{P}layers.1.self_attn.q_norm.weight")
+        rd.close()
+        qn = bf16_bits_to_f32(np.frombuffer(blob, dtype="<u2"))
+        expect("q_norm unchanged", np.array_equal(qn, src("blk.1.attn_q_norm.weight")[0]))
+        src.close()
+        # the one-row-a-head move on 0..31: MLX heads 0..3 are GGUF 0, 16, 1, 17
+        moved = grouped(np.arange(32, dtype=np.float32), [1, 32], "all", 0).reshape(-1)
+        expect("grouped by hand", list(moved[:4]) == [0.0, 16.0, 1.0, 17.0], str(moved[:4]))
         check(out, fixture, StubQuantizer(), quiet=True)
         shutil.rmtree(out)
     print("mlx-fixture self-test: ok")
