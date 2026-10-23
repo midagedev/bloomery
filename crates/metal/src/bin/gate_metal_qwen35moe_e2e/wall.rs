@@ -2,8 +2,8 @@
 //! development-loop reading, not a timed number: the traced step puts every
 //! op on a command buffer of its own and waits for it, so an op's wall is
 //! its kernels' time plus one commit and one wait; the embed, whose kernel
-//! reads one row, is about that floor. The plain step's wall is printed
-//! beside the sum.
+//! reads one row, is about that floor. The host-fed and the chain step's
+//! walls are printed beside the sum, the same reading each.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -34,13 +34,17 @@ fn median(mut v: Vec<Duration>) -> Duration {
 fn go(s: &mut Session) -> Result<(), String> {
     s.reset().map_err(says)?;
     let mut id = 0u32;
-    let mut plain = Vec::new();
-    for _ in 0..WARM + READS {
-        let t = Instant::now();
-        id = s.step(id, StepMode::HostFed).map_err(says)?.id;
-        plain.push(t.elapsed());
-    }
-    let plain = median(plain.split_off(WARM));
+    let mut run = |id: &mut u32, mode: StepMode| -> Result<Vec<Duration>, String> {
+        let mut walls = Vec::new();
+        for _ in 0..WARM + READS {
+            let t = Instant::now();
+            *id = s.step(*id, mode).map_err(says)?.id;
+            walls.push(t.elapsed());
+        }
+        Ok(walls)
+    };
+    let host = median(run(&mut id, StepMode::HostFed)?.split_off(WARM));
+    let chain = median(run(&mut id, StepMode::Chain)?.split_off(WARM));
     let mut walls: Vec<(Op, Vec<Duration>)> = Vec::new();
     for _ in 0..READS {
         let mut at = 0usize;
@@ -67,10 +71,11 @@ fn go(s: &mut Session) -> Result<(), String> {
         println!("ops: {op:?} {:.3} ms", ms(m));
     }
     println!(
-        "ops: traced sum {:.3} ms over the ops; plain step median {:.3} ms ({READS} steps after \
-         {WARM})",
+        "ops: traced sum {:.3} ms over the ops; host-fed step median {:.3} ms, chain step median \
+         {:.3} ms ({READS} steps after {WARM} each)",
         ms(sum),
-        ms(plain)
+        ms(host),
+        ms(chain)
     );
     Ok(())
 }

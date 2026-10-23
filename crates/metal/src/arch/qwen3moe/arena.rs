@@ -19,11 +19,13 @@ use core::ops::Range;
 
 use bloomery_device::Elems;
 use chain::arch::qwen3moe::plan::{FfnRoute, LayerPlan, MixerPlan, SharedPlan};
+use chain::arch::qwen3moe::read::file_names;
 use chain::linear::{KHeadMap, LinearShape};
+use chain::rope::{Direction, RopeSpec, RopeTable};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::models::{Ffn, LayerSpec, Mixer as SpecMixer, ModelSpec};
-use model::arch::names::{self, blk};
+use model::arch::names;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
 
@@ -467,22 +469,18 @@ fn zeroed<T: bloomery_device::Elem>(
 
 /// The rope table of `ctx` positions: per position, [`ROT`] / 2 pairs
 /// `(cos θ, sin θ)` with θ = `pos · base^(−2i/ROT)`, θ advanced by repeated
-/// multiplication in f32 as ggml's `rope_yarn` does with no YaRN
-/// (`crates/gpu/src/rope_table.rs` `RopeTable::push`, the CUDA backend's
-/// table).
-fn rope_table(ctx: usize, base: f32) -> Vec<f32> {
-    let theta_scale = base.powf(-2.0 / ROT as f32);
+/// multiplication in f32 as ggml's `rope_yarn` does with no YaRN — chain's
+/// [`RopeTable`] over a window spec, the one owner of the recipe both
+/// backends' tables come from.
+fn rope_rows(ctx: usize, base: f32) -> Result<Vec<f32>, SessionError> {
+    let table = RopeTable::new(&RopeSpec::window(base, ROT))
+        .map_err(|e| refuse(format!("the rope table: {e}")))?;
+    let positions = u32::try_from(ctx).expect("a cache of at most SEGMENT_KEYS rows fits u32");
     let mut out = Vec::with_capacity(ctx * ROT);
-    for pos in 0..ctx {
-        let mut theta = pos as f32;
-        for _ in 0..ROT / 2 {
-            let (s, c) = theta.sin_cos();
-            out.push(c);
-            out.push(s);
-            theta *= theta_scale;
-        }
+    for pos in 0..positions {
+        table.push(pos, Direction::Forward, &mut out);
     }
-    out
+    Ok(out)
 }
 
 impl Arena {
@@ -547,7 +545,7 @@ impl Arena {
             .rope_base
             .ok_or_else(|| refuse("no attention layer to read the rope from"))?;
         let mut rope = MetalBuffer::new(device, Elems(ctx * ROT))?;
-        rope.write(&rope_table(ctx, base))?;
+        rope.write(&rope_rows(ctx, base)?)?;
         let proj = layers
             .iter()
             .flat_map(|l| match &l.mixer {
@@ -779,22 +777,22 @@ fn ffn(
             router::EXPERTS
         )));
     }
-    // The file's tensors: the plan names the joined stacks, which this
+    // The file's tensors, under the plan's file-side names (chain's one
+    // owner of the naming): the plan names the joined stacks, which this
     // backend reads as the routed stack and the shared expert apart.
-    let stack = |part: &str| blk(l, &format!("ffn_{part}_exps.weight"));
-    let shexp = |part: &str| blk(l, &format!("ffn_{part}_shexp.weight"));
-    let (gq, gate) = load.quant(&stack("gate"), hidden, EXPERT_K * n_experts)?;
-    let (uq, up) = load.quant(&stack("up"), hidden, EXPERT_K * n_experts)?;
-    let (sgq, shexp_gate) = load.quant(&shexp("gate"), hidden, EXPERT_K)?;
-    let (suq, shexp_up) = load.quant(&shexp("up"), hidden, EXPERT_K)?;
+    let file = file_names(l);
+    let (gq, gate) = load.quant(&file.gate, hidden, EXPERT_K * n_experts)?;
+    let (uq, up) = load.quant(&file.up, hidden, EXPERT_K * n_experts)?;
+    let (sgq, shexp_gate) = load.quant(&file.sh_gate, hidden, EXPERT_K)?;
+    let (suq, shexp_up) = load.quant(&file.sh_up, hidden, EXPERT_K)?;
     if [uq, sgq, suq].iter().any(|&q| q != gq) {
         return Err(refuse(format!(
             "gate {gq:?}, up {uq:?}, shared gate {sgq:?}, shared up {suq:?}; the pair runs \
              one type"
         )));
     }
-    let (dq, down) = load.quant(&stack("down"), EXPERT_K, hidden * n_experts)?;
-    let (sdq, shexp_down) = load.quant(&shexp("down"), EXPERT_K, hidden)?;
+    let (dq, down) = load.quant(&file.down, EXPERT_K, hidden * n_experts)?;
+    let (sdq, shexp_down) = load.quant(&file.sh_down, EXPERT_K, hidden)?;
     if sdq != dq {
         return Err(refuse(format!(
             "down {dq:?}, shared down {sdq:?}; the fold runs one type"
@@ -802,8 +800,8 @@ fn ffn(
     }
     Ok(FfnBufs {
         norm: load.f32s(&plan.ffn.ffn_norm, hidden)?,
-        gate_inp: load.f32s(&blk(l, "ffn_gate_inp.weight"), n_experts * hidden)?,
-        gate_inp_shexp: load.f32s(&blk(l, "ffn_gate_inp_shexp.weight"), hidden)?,
+        gate_inp: load.f32s(&file.router, n_experts * hidden)?,
+        gate_inp_shexp: load.f32s(&file.router_gate, hidden)?,
         gate_up_quant: gq,
         gate,
         up,

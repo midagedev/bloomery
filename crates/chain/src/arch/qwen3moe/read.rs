@@ -6,15 +6,16 @@
 //! Each reader takes `what`, the loader's entry-point name its refusals are attributed to.
 
 use super::plan::{
-    DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, SharedPlan, SharedSites, SiteTy,
-    down_entry, gate_up_entry, shared_entry,
+    DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
+    SharedPlan, SharedSites, SiteTy, down_entry, gate_up_entry, q35, shared_entry,
 };
 use crate::ChainError;
 use crate::linear::{self, LinearShape};
 use crate::site::{file_site, shaped};
 use gguf::Split;
 use gguf::quant::GgmlType;
-use model::arch::models::{Ffn, LayerSpec};
+use model::arch::models::Mixer;
+use model::arch::models::{Ffn, LayerSpec, ModelSpec};
 use model::arch::names::blk;
 use model::placement::accepts::{self, LegSplit};
 
@@ -34,6 +35,35 @@ pub struct PlanDims {
     pub attn_len: usize,
 }
 
+impl PlanDims {
+    /// The row counts a qwen35moe plan reads its sites at, from `spec`'s
+    /// description: its first attention layer's head counts (a layer with
+    /// another count is refused by name when its own `plan_gqa` reads its
+    /// sites at these rows) and the geometry the kernels are built for —
+    /// [`q35::HEAD_DIM`] values an attention head, a routed expert's
+    /// [`q35::EXPERT_FF`].
+    pub fn q35(spec: &ModelSpec, what: &'static str) -> Result<PlanDims, ChainError> {
+        let (n_head, n_kv) = spec
+            .layers
+            .iter()
+            .find_map(|l| match &l.mixer {
+                Mixer::Gqa(g) => Some((g.heads as usize, g.kv_heads as usize)),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ChainError::shape(what, "no attention layer to size the attention rows for")
+            })?;
+        let head = q35::HEAD_DIM as usize;
+        Ok(PlanDims {
+            hidden: spec.hidden as usize,
+            ff: q35::EXPERT_FF as usize,
+            q_rows: 2 * n_head * head,
+            kv_len: n_kv * head,
+            attn_len: n_head * head,
+        })
+    }
+}
+
 /// The joined name of layer `l`'s stack `part` (`gate`, `up`, `down`).
 pub fn joint(l: usize, part: &str) -> String {
     format!("derived.blk.{l}.ffn_{part}_exps_sh")
@@ -42,6 +72,52 @@ pub fn joint(l: usize, part: &str) -> String {
 /// The joined name of layer `l`'s router weight with its shared gate as the last row.
 pub fn joint_gate_inp(l: usize) -> String {
     format!("derived.blk.{l}.ffn_gate_inp_sh")
+}
+
+/// Layer `l`'s routed `part` stack (`gate`, `up`, `down`), the file's own name.
+fn exps(l: usize, part: &str) -> String {
+    blk(l, &format!("ffn_{part}_exps.weight"))
+}
+
+/// Layer `l`'s shared expert's `part` (`gate`, `up`, `down`), the file's own name.
+fn shexp(l: usize, part: &str) -> String {
+    blk(l, &format!("ffn_{part}_shexp.weight"))
+}
+
+/// A routed layer's weights as the file holds them, beside the joined names
+/// its plan carries ([`joint`], [`joint_gate_inp`]): the router weight and
+/// the shared expert's gate row beside it, the routed stacks, and the shared
+/// expert's three parts. A load that folds the shared expert in joins these
+/// into the plan's derived names; a backend that runs it apart from the
+/// stacks loads them as they are.
+pub struct FileNames {
+    /// The router weight (`ffn_gate_inp.weight`).
+    pub router: String,
+    /// The shared expert's gate row (`ffn_gate_inp_shexp.weight`).
+    pub router_gate: String,
+    /// The routed stacks' file names.
+    pub gate: String,
+    pub up: String,
+    pub down: String,
+    /// The shared expert's parts' file names.
+    pub sh_gate: String,
+    pub sh_up: String,
+    pub sh_down: String,
+}
+
+/// Layer `l`'s routed FFN's [`FileNames`]: the file's own names, whatever
+/// the plan folds into derived ones.
+pub fn file_names(l: usize) -> FileNames {
+    FileNames {
+        router: blk(l, "ffn_gate_inp.weight"),
+        router_gate: blk(l, "ffn_gate_inp_shexp.weight"),
+        gate: exps(l, "gate"),
+        up: exps(l, "up"),
+        down: exps(l, "down"),
+        sh_gate: shexp(l, "gate"),
+        sh_up: shexp(l, "up"),
+        sh_down: shexp(l, "down"),
+    }
 }
 
 /// The types a projection site launches at: a projection of the normed rows or
@@ -169,14 +245,13 @@ fn part_tys(
     (rows, k, experts): (usize, usize, usize),
     hosted: bool,
 ) -> Result<(SiteTy, SiteTy), ChainError> {
-    let exps = blk(l, &format!("ffn_{part}_exps.weight"));
-    let sh = blk(l, &format!("ffn_{part}_shexp.weight"));
+    let (routed_name, sh_name) = (exps(l, part), shexp(l, part));
     let routed = if hosted {
         HOSTED
     } else {
-        ty_of(file, what, &exps, experts * rows, k, PROJ_F32)?
+        ty_of(file, what, &routed_name, experts * rows, k, PROJ_F32)?
     };
-    Ok((routed, ty_of(file, what, &sh, rows, k, PROJ_F32)?))
+    Ok((routed, ty_of(file, what, &sh_name, rows, k, PROJ_F32)?))
 }
 
 /// Layer `l`'s FFN by its description `spec`, every site's type from
@@ -224,16 +299,16 @@ pub fn plan_ffn(
             for ty in [sh_gate, sh_up, sh_down] {
                 shared_entry(ty, what).map_err(at)?;
             }
-            let routed = |part: &str| blk(l, &format!("ffn_{part}_exps.weight"));
+            let routed = |part: &str| exps(l, part);
             let (shared, [gate, up, down]) =
                 if !hosted && (gate_ty, up_ty, down_ty) == (sh_gate, sh_up, sh_down) {
                     let stacks = ["gate", "up", "down"].map(|part| joint(l, part));
                     (SharedPlan::Joined, stacks)
                 } else {
                     let sites = SharedSites {
-                        gate: blk(l, "ffn_gate_shexp.weight"),
-                        up: blk(l, "ffn_up_shexp.weight"),
-                        down: blk(l, "ffn_down_shexp.weight"),
+                        gate: shexp(l, "gate"),
+                        up: shexp(l, "up"),
+                        down: shexp(l, "down"),
                         gate_ty: sh_gate,
                         up_ty: sh_up,
                         down_ty: sh_down,
@@ -342,4 +417,45 @@ pub fn plan_delta(
         alpha,
         ssm_out: out,
     })
+}
+
+/// Every layer's plan of a qwen35moe chain, `kinds` its layers' kinds
+/// ([`kinds35`], one a layer), each layer's mixer and FFN read from `file`'s
+/// header at the rows `pd` names, the routed stacks held as `read` says
+/// ([`Read35`]): the loop a whole load runs, both backends' — a backend that
+/// transforms the plans after the read (a placed load's `apart_plans`)
+/// transforms the `Vec` this returns.
+pub fn layer_plans(
+    file: &Split,
+    what: &'static str,
+    pd: &PlanDims,
+    kinds: &[Kind35],
+    layers: &[LayerSpec],
+    read: Read35,
+) -> Result<Vec<LayerPlan>, ChainError> {
+    if kinds.len() != layers.len() {
+        return Err(ChainError::shape(
+            what,
+            format!(
+                "{} mixer kinds for {} layers; the plan reads one kind a layer",
+                kinds.len(),
+                layers.len()
+            ),
+        ));
+    }
+    kinds
+        .iter()
+        .zip(layers)
+        .enumerate()
+        .map(|(l, (kind, layer))| {
+            let mixer = match *kind {
+                Kind35::Gqa(flash) => MixerPlan::Gqa(plan_gqa(file, what, pd, l, flash)?),
+                Kind35::Delta(shape) => MixerPlan::Delta(plan_delta(file, what, pd, shape, l)?),
+            };
+            Ok(LayerPlan {
+                mixer,
+                ffn: plan_ffn(file, what, pd, layer, l, read)?,
+            })
+        })
+        .collect()
 }

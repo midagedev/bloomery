@@ -18,6 +18,7 @@
 
 pub mod arch;
 pub mod linear;
+pub mod rope;
 pub mod site;
 
 use std::fmt;

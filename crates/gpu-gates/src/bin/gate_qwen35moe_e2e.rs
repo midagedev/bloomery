@@ -434,6 +434,7 @@ mod gate {
     use model::placement::accepts::{self, LegSplit};
     use refset::arch::qwen35moe::fixture as fx;
     use refset::arch::qwen35moe::{BATCH, D1K, IK, MODEL, STEP4};
+    use refset::flip::{RouteFlip, held_rows, rel_base, rel_to, router_tie, worse};
     use runtime::{Out, Target, Want};
     use std::time::Instant;
     use tokenizer::Tokenizer;
@@ -921,39 +922,6 @@ mod gate {
         geometry().store_bytes(CTX)
     }
 
-    /// `‖a − b‖ / ‖base‖` over the zipped values in f64, the denominator's
-    /// values from `base`: not `e2e::rel`, which divides by `‖b‖` and is
-    /// infinite on a length mismatch or a NaN (this one has neither guard).
-    fn rel_base(a: &[f32], b: &[f32], base: impl Fn(usize) -> f64) -> f64 {
-        let (mut num, mut den) = (0.0f64, 0.0f64);
-        for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
-            num += (f64::from(x) - f64::from(y)).powi(2);
-            den += base(i).powi(2);
-        }
-        (num / den.max(f64::MIN_POSITIVE)).sqrt()
-    }
-
-    /// `rel_base` of our last `ik.len()` values against ik's, on ik's own norm:
-    /// a tap ik keeps only the output token's rows of (the last layer past
-    /// its attention) meets our last rows. Infinite when ik holds more
-    /// values than ours, and a NaN reads infinite, so neither passes a band.
-    fn rel_to(ours: &[f32], ik: &[f32]) -> f64 {
-        let Some(tail) = ours.len().checked_sub(ik.len()).map(|s| &ours[s..]) else {
-            return f64::INFINITY;
-        };
-        worse(0.0, rel_base(tail, ik, |i| f64::from(ik[i])))
-    }
-
-    /// The larger of two errors, a NaN counting as infinite: `f64::max`
-    /// would drop it.
-    fn worse(a: f64, b: f64) -> f64 {
-        if a.is_nan() || b.is_nan() {
-            f64::INFINITY
-        } else {
-            a.max(b)
-        }
-    }
-
     /// `‖x̂_ours − x̂_ik‖ / ‖x‖` over the `k`-value rows of `x`: how far apart
     /// the two sides' 8-bit activations of the same input sit (ours q8_1 per
     /// 128 values, ik q8_2 per 32). Not `e2e::quant_gap`, which is ik's q8_2
@@ -1263,14 +1231,6 @@ mod gate {
         }
     }
 
-    /// The router test the forced arm and the free clause read: a token whose
-    /// chosen set differs from ik's is a near tie when ik's own margin between
-    /// its eighth pick and the best expert it left lies within twice our
-    /// logits' largest error at that token.
-    fn router_tie(margin: f32, err: f32) -> bool {
-        margin <= 2.0 * err
-    }
-
     /// The router decisions of a free-running chain, read by a probe: the
     /// chain's own layer outputs `rows` (`[layer][token · HIDDEN]`, from the
     /// layer taps) fed to a whole-card load's layers, each layer's pass over
@@ -1325,17 +1285,6 @@ mod gate {
             r.logits.push(run.ffn.logits);
         }
         Ok(r)
-    }
-
-    /// A router site of a chain whose chosen set differs from ik's.
-    struct RouteFlip {
-        layer: usize,
-        token: usize,
-        ours: Vec<u32>,
-        theirs: Vec<i32>,
-        margin: f32,
-        err: f32,
-        tie: bool,
     }
 
     /// A chain's router sites against ik's, over the rows ik kept.
@@ -1404,25 +1353,6 @@ mod gate {
             }
         }
         Ok(out)
-    }
-
-    /// The rows `[layer][token]` a near-tie flip leaves unheld: the flipped
-    /// token from its layer's output on, and every later token at the deeper
-    /// layers (their mixers read the flipped token's state and keys); earlier
-    /// tokens never see it.
-    fn held_rows(n: usize, t_n: usize, flips: &[RouteFlip]) -> Vec<Vec<bool>> {
-        let mut held = vec![vec![true; t_n]; n];
-        for f in flips.iter().filter(|f| f.tie) {
-            for row in &mut held[f.layer..] {
-                row[f.token] = false;
-            }
-            for row in held.iter_mut().skip(f.layer + 1) {
-                for h in &mut row[f.token + 1..] {
-                    *h = false;
-                }
-            }
-        }
-        held
     }
 
     /// PIN(2026-10-13): the fixture tier's free clause leaves unheld the rows a

@@ -28,17 +28,14 @@ use core::ops::Range;
 use core::sync::atomic::Ordering;
 use std::path::Path;
 
-use bloomery_device::fault::{Fault, FaultWord};
+use bloomery_device::fault::Fault;
 use bloomery_device::{DeviceError, Elem, Stream};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
-use chain::arch::qwen3moe::plan::{
-    DeltaPlan, FfnPlan, GqaPlan, Kind35, LayerPlan, MixerPlan, kinds35, q35,
-};
-use chain::arch::qwen3moe::read::{PlanDims, Read35, plan_delta, plan_ffn, plan_gqa};
+use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, kinds35};
+use chain::arch::qwen3moe::read::{PlanDims, Read35, layer_plans};
 use chain::arch::qwen3moe::walk::Walk;
 use gguf::Split;
-use model::arch::models::Mixer;
 
 use super::arena::{Arena, MixerBufs, lane_of, slot_of};
 use super::count::Layer;
@@ -325,39 +322,8 @@ impl Session {
             .map_err(|e| refuse(format!("{}: {e}", path.display())))?;
         let spec = read.spec;
         let kinds = kinds35(&spec.layers)?;
-        let (n_head, n_kv) = spec
-            .layers
-            .iter()
-            .find_map(|l| match &l.mixer {
-                Mixer::Gqa(g) => Some((g.heads as usize, g.kv_heads as usize)),
-                _ => None,
-            })
-            .ok_or_else(|| refuse("no attention layer to size the attention rows for"))?;
-        let head = q35::HEAD_DIM as usize;
-        let pd = PlanDims {
-            hidden: spec.hidden as usize,
-            ff: q35::EXPERT_FF as usize,
-            q_rows: 2 * n_head * head,
-            kv_len: n_kv * head,
-            attn_len: n_head * head,
-        };
-        let plans = kinds
-            .iter()
-            .zip(&spec.layers)
-            .enumerate()
-            .map(|(l, (kind, layer))| {
-                let mixer = match *kind {
-                    Kind35::Gqa(flash) => MixerPlan::Gqa(plan_gqa(&split, WHAT, &pd, l, flash)?),
-                    Kind35::Delta(shape) => {
-                        MixerPlan::Delta(plan_delta(&split, WHAT, &pd, shape, l)?)
-                    }
-                };
-                Ok(LayerPlan {
-                    mixer,
-                    ffn: plan_ffn(&split, WHAT, &pd, layer, l, Read35::Whole)?,
-                })
-            })
-            .collect::<Result<Vec<_>, ChainError>>()?;
+        let pd = PlanDims::q35(&spec, WHAT)?;
+        let plans = layer_plans(&split, WHAT, &pd, &kinds, &spec.layers, Read35::Whole)?;
         let kernels = Kernels::from_library(library)?;
         let stream = device.new_stream()?;
         let arena = Arena::open(device.metal(), &split, &spec, &plans, ctx)?;
@@ -626,7 +592,7 @@ impl Session {
         self.stream.sync()?;
         self.arena.clear_stores()?;
         for fault in &self.arena.faults {
-            fault.clear(&self.stream)?;
+            fault.clear_waited()?;
         }
         self.pos = 0;
         self.poisoned = None;

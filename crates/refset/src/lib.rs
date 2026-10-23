@@ -15,6 +15,9 @@
 //! - [`fixture`]: the fixture tier's identity — the path of each
 //!   architecture's fixture file and the `# fixture` line a set dumped from it
 //!   carries.
+//! - [`flip`]: the free-running rules the end-to-end gates share, on both
+//!   backends — the relative distances, the router's flip test, the head's
+//!   tie band.
 //! - [`ik`]: ik's node dumps (`tools/ref/dump_ref.cpp`), the v1 and v2
 //!   `MANIFEST.tsv` and the files its rows name.
 //! - [`dsref`]: ik's DSpark draft sets (`tools/ref/dump_draft.cpp`).
@@ -56,6 +59,7 @@ pub mod dsref;
 pub mod emb2;
 pub mod family;
 pub mod fixture;
+pub mod flip;
 pub mod greedy;
 pub mod hfmap;
 pub mod ik;

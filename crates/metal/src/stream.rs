@@ -61,7 +61,7 @@ pub struct MetalStream {
     queue: Handle<dyn MTLCommandQueue>,
     /// The one event the stream's `record` and its signalled buffers signal,
     /// at rising values: the host's waits.
-    timeline: Handle<dyn MTLSharedEvent>,
+    timeline: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     /// The token boundary: every signalled buffer signals it at its end, at
     /// its timeline value, and a token encoder's buffer waits for the last
     /// such value. It is the device's own event, not the shared one: the
@@ -258,7 +258,7 @@ impl MetalStream {
             .ok_or_else(|| DeviceError::backend("event", "the device made no event".to_string()))?;
         Ok(Self {
             queue,
-            timeline: Handle(timeline),
+            timeline,
             boundary,
             committed: Mutex::new(Committed {
                 last: 0,
@@ -481,7 +481,7 @@ impl Stream for MetalStream {
 
 /// A point in a stream's order: a shared event and the value it fires at.
 pub struct MetalEvent {
-    event: Handle<dyn MTLSharedEvent>,
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     value: u64,
 }
 
@@ -534,10 +534,7 @@ impl HostEvent {
             )
         })?;
         Ok(Self {
-            event: MetalEvent {
-                event: Handle(event),
-                value: 1,
-            },
+            event: MetalEvent { event, value: 1 },
         })
     }
 
