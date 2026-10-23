@@ -11,15 +11,13 @@ use bloomery_metal::kernels::{
 };
 use gguf::quant::GgmlType;
 
+use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle;
 use super::oracle_experts;
 use super::{
     Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD, WEIGHT_PAD, WEIGHT_TAIL, check_guards, padded,
 };
-
-/// The layer these clauses launch in.
-const LAYER: u32 = 5;
 const N_EXPERTS: usize = 4;
 const PAIR_COLS: usize = 2048;
 const FOLD_ROWS: usize = 2048;
@@ -339,25 +337,8 @@ fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, String> 
     read_interior(h, &y, rows)
 }
 
-/// The fault word names `site` in [`LAYER`], and only that site.
-fn only_site(
-    fault: Option<bloomery_device::Fault>,
-    what: &str,
-    site: FaultSite,
-) -> Result<(), String> {
-    match fault {
-        Some(f) if f.layer == LAYER && f.code == site as u32 && f.sites == 1 << (site as u32) => {
-            Ok(())
-        }
-        Some(f) => Err(format!(
-            "{what} raised {f}, not {} in layer {LAYER}",
-            site.name()
-        )),
-        None => Err(format!("{what} raised nothing")),
-    }
-}
-
-fn bits_eq(got: &[f32], want: &[f32], what: &str) -> Result<(), String> {
+/// The words `got` holds, against a solo launch of the same rows.
+fn expect_bits(got: &[f32], want: &[f32], what: &str) -> Result<(), String> {
     if got.len() != want.len() {
         return Err(format!(
             "{what}: {} values against {}",
@@ -365,10 +346,8 @@ fn bits_eq(got: &[f32], want: &[f32], what: &str) -> Result<(), String> {
             want.len()
         ));
     }
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        if g.to_bits() != w.to_bits() {
-            return Err(format!("{what} value {i}: got {g:?}, the solo read {w:?}"));
-        }
+    if let Some((i, g, w)) = common::first_diff(got, want) {
+        return Err(format!("{what} value {i}: got {g:?}, the solo read {w:?}"));
     }
     Ok(())
 }
@@ -504,7 +483,7 @@ pub fn pair_id(h: &Harness<'_>, fix: &Fixture) -> Clause {
                 y0: &vec![1.0; y_len],
             },
         )?;
-        only_site(h.fault()?, &format!("id {bad}"), FaultSite::ExpertId)?;
+        common::expect_fault(h, &format!("id {bad}"), FaultSite::ExpertId)?;
         for slot in 0..EXPERT_SLOTS {
             let row = &got[slot * EXPERT_K..(slot + 1) * EXPERT_K];
             let clean_row = &clean[slot * EXPERT_K..(slot + 1) * EXPERT_K];
@@ -581,7 +560,7 @@ pub fn pair_norm(h: &Harness<'_>, fix: &Fixture) -> Clause {
                     y0: &vec![1.0; y_len],
                 },
             )?;
-            only_site(h.fault()?, &what, FaultSite::NormQuant)?;
+            common::expect_fault(h, &what, FaultSite::NormQuant)?;
             if let Some(k) = got.iter().position(|v| !v.is_nan()) {
                 return Err(format!(
                     "{what}: slot {} row {} is {:?}, not NaN",
@@ -676,7 +655,7 @@ fn check_pair_shared(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<(),
         h.clear_fault()?;
         let solo = solo_slot(h, quant, [gate, up, shared_gate, shared_up], &x, &norm)?;
         let got = &full[slot * EXPERT_K..(slot + 1) * EXPERT_K];
-        bits_eq(got, &solo, &format!("{} slot {slot}", quant.name()))?;
+        expect_bits(got, &solo, &format!("{} slot {slot}", quant.name()))?;
     }
     Ok(())
 }
@@ -783,8 +762,8 @@ fn fold_bad_id(h: &Harness<'_>, weights: &FoldWeights, quant: Quant) -> Result<(
                 y0: &vec![1.0; FOLD_ROWS],
             },
         )?;
-        only_site(
-            h.fault()?,
+        common::expect_fault(
+            h,
             &format!("{} id {bad}", quant.name()),
             FaultSite::ExpertId,
         )?;
@@ -808,219 +787,344 @@ pub fn fold(h: &Harness<'_>, fix: &Fixture) -> Clause {
     )))
 }
 
-fn expect_named(
-    result: Result<(), String>,
-    what: &str,
-    needle: &str,
-    also: &str,
-) -> Result<(), String> {
-    match result {
-        Ok(()) => Err(format!("{what} was accepted")),
-        Err(text) => {
-            if !text.contains(needle) {
-                return Err(format!(
-                    "{what} was refused without naming {needle}: {text}"
-                ));
-            }
-            if !also.is_empty() && !text.contains(also) {
-                return Err(format!("{what} was refused without naming {also}: {text}"));
-            }
-            if needle != "window" && text.contains("window") {
-                return Err(format!("{what} named a window: {text}"));
-            }
-            Ok(())
+/// The buffers of the two refusal tables: one weight buffer big enough for a
+/// well-formed pair of one expert, and the windows the tables share.
+struct Refusals {
+    marker: MetalBuffer<f32>,
+    bytes: MetalBuffer<u8>,
+    values: MetalBuffer<f32>,
+    route: MetalBuffer<f32>,
+    ids: MetalBuffer<i32>,
+}
+
+/// One pair case: a slot count, a width, an id list, a window or an output
+/// stride, one of them bad.
+#[derive(Clone, Copy)]
+struct PairArgs {
+    slots: usize,
+    k: usize,
+    n_experts: usize,
+    id_len: usize,
+    gate_len: usize,
+    stride: usize,
+    x: usize,
+    y_len: usize,
+}
+
+impl PairArgs {
+    /// The table's arguments: every window short of its good length, so a
+    /// case's own check refuses before any window check can.
+    const fn whole(gate_len: usize) -> Self {
+        Self {
+            slots: EXPERT_SLOTS,
+            k: EXPERT_K,
+            n_experts: 1,
+            id_len: ROUTED_IDS,
+            gate_len,
+            stride: EXPERT_K,
+            x: 16,
+            y_len: 64,
+        }
+    }
+
+    /// The well-formed launch of the same buffers.
+    const fn good(gate_len: usize) -> Self {
+        Self {
+            x: PAIR_COLS,
+            y_len: EXPERT_SLOTS * EXPERT_K,
+            ..Self::whole(gate_len)
         }
     }
 }
 
-fn pair_bounds(
+fn refuse_pair(
     h: &Harness<'_>,
-    marker: &mut MetalBuffer<f32>,
-    bytes: &MetalBuffer<u8>,
-    values: &MetalBuffer<f32>,
-    ids: &MetalBuffer<i32>,
-) -> Result<(), String> {
-    let device = h.device;
-    let mut run = |slots, k, n_experts, id_len, gate_len, stride| {
-        h.encode(|encoder| {
-            h.kernels.pair(
-                encoder,
-                PairParams {
-                    quant: Quant::Q4K,
-                    slots,
-                    k,
-                    cols: PAIR_COLS,
-                    n_experts,
-                    ids: ids.window(Elems(0), Elems(id_len))?,
-                    gate: bytes.window(Elems(0), Elems(gate_len))?,
-                    up: bytes.window(Elems(0), Elems(gate_len))?,
-                    shared_gate: bytes.window(Elems(0), Elems(gate_len))?,
-                    shared_up: bytes.window(Elems(0), Elems(gate_len))?,
-                    x: values.window(Elems(0), Elems(16))?,
-                    gain: values.window(Elems(0), Elems(16))?,
-                    eps: 1e-6,
-                    y: marker.window_mut(Elems(0), Elems(64))?,
-                    out_stride: stride,
-                    fault: device.fault_word(),
-                    layer: LAYER,
-                },
-            )
-        })
-    };
-    expect_named(
-        run(3, EXPERT_K, 1, ROUTED_IDS, 16, EXPERT_K),
-        "a pair of 3 slots",
-        "9",
-        "",
-    )?;
-    expect_named(
-        run(EXPERT_SLOTS, 256, 1, ROUTED_IDS, 16, EXPERT_K),
-        "a pair of width 256",
-        "512",
-        "",
-    )?;
-    expect_named(
-        run(EXPERT_SLOTS, EXPERT_K, 1, ROUTED_IDS, 16, EXPERT_K),
-        "a short gate window",
-        "window",
-        "gate",
-    )?;
-    expect_named(
-        run(EXPERT_SLOTS, EXPERT_K, 1, 0, 16, EXPERT_K),
-        "an empty pair id list",
-        "empty",
-        "id list",
-    )?;
-    expect_named(
-        run(EXPERT_SLOTS, EXPERT_K, 1, ROUTED_IDS, 16, 1),
-        "overlapping pair outputs",
-        "overlap",
-        "",
-    )?;
-    Ok(())
+    b: &mut Refusals,
+    a: &PairArgs,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), bloomery_device::DeviceError> {
+    h.kernels.pair(
+        encoder,
+        PairParams {
+            quant: Quant::Q4K,
+            slots: a.slots,
+            k: a.k,
+            cols: PAIR_COLS,
+            n_experts: a.n_experts,
+            ids: b.ids.window(Elems(0), Elems(a.id_len))?,
+            gate: b.bytes.window(Elems(0), Elems(a.gate_len))?,
+            up: b.bytes.window(Elems(0), Elems(a.gate_len))?,
+            shared_gate: b.bytes.window(Elems(0), Elems(a.gate_len))?,
+            shared_up: b.bytes.window(Elems(0), Elems(a.gate_len))?,
+            x: b.values.window(Elems(0), Elems(a.x))?,
+            gain: b.values.window(Elems(0), Elems(a.x))?,
+            eps: 1e-6,
+            y: b.marker.window_mut(Elems(0), Elems(a.y_len))?,
+            out_stride: a.stride,
+            fault: h.device.fault_word(),
+            layer: LAYER,
+        },
+    )
 }
 
-fn fold_bounds(
+/// One fold case: a slot count, a width, an id list, a window or the rows,
+/// one of them bad.
+#[derive(Clone, Copy)]
+struct FoldArgs {
+    slots: usize,
+    k: usize,
+    n_experts: usize,
+    id_len: usize,
+    rows: usize,
+    down_len: usize,
+    h_len: usize,
+    y_len: usize,
+}
+
+impl FoldArgs {
+    /// The table's arguments: every window short of its good length, so a
+    /// case's own check refuses before any window check can.
+    const fn whole() -> Self {
+        Self {
+            slots: EXPERT_SLOTS,
+            k: EXPERT_K,
+            n_experts: 1,
+            id_len: ROUTED_IDS,
+            rows: 8,
+            down_len: 16,
+            h_len: 16,
+            y_len: 64,
+        }
+    }
+}
+
+fn refuse_fold(
     h: &Harness<'_>,
-    marker: &mut MetalBuffer<f32>,
-    bytes: &MetalBuffer<u8>,
-    hidden: &MetalBuffer<f32>,
-    route: &MetalBuffer<f32>,
-    ids: &MetalBuffer<i32>,
-) -> Result<(), String> {
-    let device = h.device;
-    let mut run = |slots, k, n_experts, id_len, rows, down_len| {
-        h.encode(|encoder| {
-            let y = marker.window_mut(Elems(0), Elems(64))?;
-            h.kernels.fold(
-                encoder,
-                FoldParams {
-                    quant: Quant::Q4K,
-                    shared: SharedPlan::Same(bytes.window(Elems(0), Elems(down_len))?),
-                    rows,
-                    slots,
-                    k,
-                    n_experts,
-                    ids: ids.window(Elems(0), Elems(id_len))?,
-                    down: bytes.window(Elems(0), Elems(down_len))?,
-                    h: hidden.window(Elems(0), Elems(16))?,
-                    w: route.window(Elems(0), Elems(EXPERT_SLOTS))?,
-                    y: &y,
-                    fault: device.fault_word(),
-                    layer: LAYER,
-                },
-            )
-        })
-    };
-    expect_named(
-        run(3, EXPERT_K, 1, ROUTED_IDS, 8, 16),
-        "a fold of 3 slots",
-        "9",
-        "",
-    )?;
-    expect_named(
-        run(EXPERT_SLOTS, 256, 1, ROUTED_IDS, 8, 16),
-        "a fold of width 256",
-        "512",
-        "",
-    )?;
-    expect_named(
-        run(EXPERT_SLOTS, EXPERT_K, 1, ROUTED_IDS, 8, 16),
-        "a short down window",
-        "window",
-        "down",
-    )?;
-    expect_named(
-        run(EXPERT_SLOTS, EXPERT_K, 1, 0, 8, 16),
-        "an empty fold id list",
-        "empty",
-        "id list",
-    )?;
-    let overlap = h.encode(|encoder| {
-        let y = marker.window_mut(Elems(0), Elems(FOLD_ROWS))?;
-        let same = y.as_read();
-        h.kernels.fold(
-            encoder,
-            FoldParams {
-                quant: Quant::Q4K,
-                shared: SharedPlan::Same(bytes.window(Elems(0), Elems(16))?),
-                rows: FOLD_ROWS,
-                slots: EXPERT_SLOTS,
-                k: EXPERT_K,
-                n_experts: 1,
-                ids: ids.window(Elems(0), Elems(ROUTED_IDS))?,
-                down: bytes.window(Elems(0), Elems(16))?,
-                h: same,
-                w: route.window(Elems(0), Elems(EXPERT_SLOTS))?,
-                y: &y,
-                fault: device.fault_word(),
-                layer: LAYER,
-            },
-        )
-    });
-    expect_named(
-        overlap,
-        "a fold whose output overlaps the hidden states",
-        "overlap",
-        "",
-    )?;
-    Ok(())
+    b: &mut Refusals,
+    a: &FoldArgs,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), bloomery_device::DeviceError> {
+    h.kernels.fold(
+        encoder,
+        FoldParams {
+            quant: Quant::Q4K,
+            shared: SharedPlan::Same(b.bytes.window(Elems(0), Elems(a.down_len))?),
+            rows: a.rows,
+            slots: a.slots,
+            k: a.k,
+            n_experts: a.n_experts,
+            ids: b.ids.window(Elems(0), Elems(a.id_len))?,
+            down: b.bytes.window(Elems(0), Elems(a.down_len))?,
+            h: b.values.window(Elems(0), Elems(a.h_len))?,
+            w: b.route.window(Elems(0), Elems(EXPERT_SLOTS))?,
+            y: &b.marker.window_mut(Elems(0), Elems(a.y_len))?,
+            fault: h.device.fault_word(),
+            layer: LAYER,
+        },
+    )
 }
 
 pub fn experts_bounds(h: &Harness<'_>, _fix: &Fixture) -> Clause {
     let (device, stream) = (h.device, h.stream);
-    let mut marker = device.upload(stream, &[1.0f32; FOLD_ROWS]).map_err(why)?;
-    let bytes = device.upload(stream, &[0u8; 64]).map_err(why)?;
-    let hidden = device
-        .upload(stream, &[0f32; EXPERT_SLOTS * EXPERT_K])
-        .map_err(why)?;
-    let route = device
-        .upload(stream, &[1.0f32; EXPERT_SLOTS])
-        .map_err(why)?;
-    let ids = device.upload(stream, &[0i32; ROUTED_IDS]).map_err(why)?;
-    pair_bounds(h, &mut marker, &bytes, &hidden, &ids)?;
-    fold_bounds(h, &mut marker, &bytes, &hidden, &route, &ids)?;
-    let mut back = vec![0.0; FOLD_ROWS];
-    device
-        .read(stream, marker.whole().map_err(why)?, &mut back)
-        .map_err(why)?;
-    if back.iter().any(|&v| v != 1.0) {
-        return Err("a refused launch wrote".to_string());
-    }
-    Ok(Verdict::Noted(
-        "10 refusals, each by name, nothing written".to_string(),
-    ))
+    let gate_len = EXPERT_K * row_bytes(Quant::Q4K, PAIR_COLS);
+    let mut bufs = Refusals {
+        marker: device
+            .upload(stream, &vec![1.0f32; EXPERT_SLOTS * EXPERT_K])
+            .map_err(why)?,
+        bytes: device.upload(stream, &vec![0u8; gate_len]).map_err(why)?,
+        values: device
+            .upload(stream, &vec![0f32; EXPERT_SLOTS * EXPERT_K])
+            .map_err(why)?,
+        route: device
+            .upload(stream, &[1.0f32; EXPERT_SLOTS])
+            .map_err(why)?,
+        ids: device.upload(stream, &[0i32; ROUTED_IDS]).map_err(why)?,
+    };
+    let pair_whole = PairArgs::whole(gate_len);
+    let pair_good = PairArgs::good(gate_len);
+    let bad_pair = |what: &'static str,
+                    needle: &'static str,
+                    also: &'static str,
+                    mask: &'static str,
+                    edit: Box<dyn FnOnce(&mut PairArgs)>| {
+        BadArg::new(
+            what,
+            needle,
+            Box::new(move |b: &mut Refusals, encoder| {
+                let mut a = pair_whole;
+                edit(&mut a);
+                refuse_pair(h, b, &a, encoder)
+            }),
+        )
+        .naming(also)
+        .masking(mask)
+    };
+    let pair_cases = vec![
+        bad_pair(
+            "a pair of 3 slots",
+            "9",
+            "",
+            "window",
+            Box::new(|a| a.slots = 3),
+        ),
+        bad_pair(
+            "a pair of width 256",
+            "512",
+            "",
+            "window",
+            Box::new(|a| a.k = 256),
+        ),
+        bad_pair(
+            "a short gate window",
+            "window",
+            "gate",
+            "",
+            Box::new(|a| a.gate_len = 16),
+        ),
+        bad_pair(
+            "an empty pair id list",
+            "empty",
+            "id list",
+            "window",
+            Box::new(|a| a.id_len = 0),
+        ),
+        bad_pair(
+            "overlapping pair outputs",
+            "overlap",
+            "",
+            "window",
+            Box::new(|a| a.stride = 1),
+        ),
+    ];
+    let fold_whole = FoldArgs::whole();
+    let bad_fold = |what: &'static str,
+                    needle: &'static str,
+                    also: &'static str,
+                    mask: &'static str,
+                    edit: Box<dyn FnOnce(&mut FoldArgs)>| {
+        BadArg::new(
+            what,
+            needle,
+            Box::new(move |b: &mut Refusals, encoder| {
+                let mut a = fold_whole;
+                edit(&mut a);
+                refuse_fold(h, b, &a, encoder)
+            }),
+        )
+        .naming(also)
+        .masking(mask)
+    };
+    let fold_cases = vec![
+        bad_fold(
+            "a fold of 3 slots",
+            "9",
+            "",
+            "window",
+            Box::new(|a| a.slots = 3),
+        ),
+        bad_fold(
+            "a fold of width 256",
+            "512",
+            "",
+            "window",
+            Box::new(|a| a.k = 256),
+        ),
+        bad_fold(
+            "a short down window",
+            "window",
+            "down",
+            "",
+            Box::new(|a| a.down_len = 16),
+        ),
+        bad_fold(
+            "an empty fold id list",
+            "empty",
+            "id list",
+            "window",
+            Box::new(|a| a.id_len = 0),
+        ),
+        {
+            // The hidden states window of the overlap case is the output
+            // window, so the launch is built by hand.
+            BadArg::new(
+                "a fold whose output overlaps the hidden states",
+                "overlap",
+                Box::new(
+                    |b: &mut Refusals, encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>| {
+                        let y = b.marker.window_mut(Elems(0), Elems(FOLD_ROWS))?;
+                        let same = y.as_read();
+                        h.kernels.fold(
+                            encoder,
+                            FoldParams {
+                                quant: Quant::Q4K,
+                                shared: SharedPlan::Same(b.bytes.window(Elems(0), Elems(16))?),
+                                rows: FOLD_ROWS,
+                                slots: EXPERT_SLOTS,
+                                k: EXPERT_K,
+                                n_experts: 1,
+                                ids: b.ids.window(Elems(0), Elems(ROUTED_IDS))?,
+                                down: b.bytes.window(Elems(0), Elems(16))?,
+                                h: same,
+                                w: b.route.window(Elems(0), Elems(EXPERT_SLOTS))?,
+                                y: &y,
+                                fault: h.device.fault_word(),
+                                layer: LAYER,
+                            },
+                        )
+                    },
+                ),
+            )
+            .masking("window")
+        },
+    ];
+    let unchanged = |h: &Harness<'_>, b: &Refusals| common::still(h, &b.marker, |v| *v == 1.0);
+    let pairs = common::refuse_launches(h, "pair", &mut bufs, pair_cases, unchanged)?;
+    let folds = common::refuse_launches(h, "fold", &mut bufs, fold_cases, unchanged)?;
+    let good_pair: Edit<'_, Refusals> = Box::new(|b, encoder| {
+        let a = pair_good;
+        refuse_pair(h, b, &a, encoder)
+    });
+    common::accepted_writes(h, &mut bufs, good_pair, |h, b| {
+        common::moved(h, &b.marker, |v| *v != 1.0)
+    })?;
+    let good_fold: Edit<'_, Refusals> = Box::new(|b, encoder| {
+        let mut a = fold_whole;
+        a.down_len = a.rows * row_bytes(Quant::Q4K, EXPERT_K);
+        a.h_len = EXPERT_SLOTS * EXPERT_K;
+        a.y_len = a.rows;
+        refuse_fold(h, b, &a, encoder)
+    });
+    common::accepted_writes(h, &mut bufs, good_fold, |h, b| {
+        common::moved(h, &b.marker, |v| *v != 1.0)
+    })?;
+    Ok(Verdict::Noted(format!(
+        "{} refusals, each by name, nothing written",
+        pairs + folds
+    )))
 }
 
-pub fn fold_type(h: &Harness<'_>, _fix: &Fixture) -> Clause {
+pub fn fold_type(h: &Harness<'_>, fix: &Fixture) -> Clause {
     let (device, stream) = (h.device, h.stream);
-    let mut marker = device.upload(stream, &[1.0f32; 8]).map_err(why)?;
-    let bytes = device.upload(stream, &[0u8; 64]).map_err(why)?;
-    let hidden = device.upload(stream, &[0f32; 16]).map_err(why)?;
-    let route = device
-        .upload(stream, &[1.0f32; EXPERT_SLOTS])
-        .map_err(why)?;
-    let ids = device.upload(stream, &[0i32; ROUTED_IDS]).map_err(why)?;
+    let down_len = 4 * row_bytes(Quant::Q4K, EXPERT_K);
+    let down = fix.rows("blk.0.ffn_down_exps.weight", GgmlType::Q4_K, EXPERT_K, 4)?;
+    struct Bufs {
+        marker: MetalBuffer<f32>,
+        down: MetalBuffer<u8>,
+        hidden: MetalBuffer<f32>,
+        route: MetalBuffer<f32>,
+        ids: MetalBuffer<i32>,
+    }
+    let mut bufs = Bufs {
+        marker: device.upload(stream, &[1.0f32; 8]).map_err(why)?,
+        down: device.upload(stream, down).map_err(why)?,
+        hidden: device
+            .upload(stream, &vec![1.0f32; EXPERT_SLOTS * EXPERT_K])
+            .map_err(why)?,
+        route: device
+            .upload(stream, &[1.0f32; EXPERT_SLOTS])
+            .map_err(why)?,
+        ids: device.upload(stream, &[0i32; ROUTED_IDS]).map_err(why)?,
+    };
     let cases = [
         ("Apart", EXPERT_SLOTS, EXPERT_K, 1usize, ROUTED_IDS),
         ("Apart with a bad slot count", 1, EXPERT_K, 1, ROUTED_IDS),
@@ -1033,38 +1137,63 @@ pub fn fold_type(h: &Harness<'_>, _fix: &Fixture) -> Clause {
             ROUTED_IDS,
         ),
         ("Apart with an empty id list", EXPERT_SLOTS, EXPERT_K, 1, 0),
-    ];
-    for (what, slots, k, n_experts, id_len) in cases {
-        let refused = h.encode(|encoder| {
-            let y = marker.window_mut(Elems(0), Elems(8))?;
-            h.kernels.fold(
-                encoder,
-                FoldParams {
-                    quant: Quant::Q4K,
-                    shared: SharedPlan::Apart,
-                    rows: 4,
-                    slots,
-                    k,
-                    n_experts,
-                    ids: ids.window(Elems(0), Elems(id_len))?,
-                    down: bytes.window(Elems(0), Elems(16))?,
-                    h: hidden.window(Elems(0), Elems(16))?,
-                    w: route.window(Elems(0), Elems(EXPERT_SLOTS))?,
-                    y: &y,
-                    fault: device.fault_word(),
-                    layer: LAYER,
-                },
-            )
-        });
-        expect_named(refused, what, "SharedPlan::Apart", "")?;
-    }
-    let mut back = vec![0.0; 8];
-    device
-        .read(stream, marker.whole().map_err(why)?, &mut back)
-        .map_err(why)?;
-    if back.iter().any(|&v| v != 1.0) {
-        return Err("an Apart launch wrote".to_string());
-    }
+    ]
+    .into_iter()
+    .map(|(what, slots, k, n_experts, id_len)| {
+        BadArg::new(
+            what,
+            "SharedPlan::Apart",
+            Box::new(move |b: &mut Bufs, encoder| {
+                let y = b.marker.window_mut(Elems(0), Elems(8))?;
+                h.kernels.fold(
+                    encoder,
+                    FoldParams {
+                        quant: Quant::Q4K,
+                        shared: SharedPlan::Apart,
+                        rows: 4,
+                        slots,
+                        k,
+                        n_experts,
+                        ids: b.ids.window(Elems(0), Elems(id_len))?,
+                        down: b.down.window(Elems(0), Elems(16))?,
+                        h: b.hidden.window(Elems(0), Elems(16))?,
+                        w: b.route.window(Elems(0), Elems(EXPERT_SLOTS))?,
+                        y: &y,
+                        fault: h.device.fault_word(),
+                        layer: LAYER,
+                    },
+                )
+            }),
+        )
+        .masking("window")
+    })
+    .collect::<Vec<_>>();
+    let unchanged = |h: &Harness<'_>, b: &Bufs| common::still(h, &b.marker, |v| *v == 1.0);
+    common::refuse_launches(h, "fold", &mut bufs, cases, unchanged)?;
+    let good: Edit<'_, Bufs> = Box::new(|b, encoder| {
+        let y = b.marker.window_mut(Elems(0), Elems(4))?;
+        h.kernels.fold(
+            encoder,
+            FoldParams {
+                quant: Quant::Q4K,
+                shared: SharedPlan::Same(b.down.window(Elems(0), Elems(down_len))?),
+                rows: 4,
+                slots: EXPERT_SLOTS,
+                k: EXPERT_K,
+                n_experts: 1,
+                ids: b.ids.window(Elems(0), Elems(ROUTED_IDS))?,
+                down: b.down.window(Elems(0), Elems(down_len))?,
+                h: b.hidden.window(Elems(0), Elems(EXPERT_SLOTS * EXPERT_K))?,
+                w: b.route.window(Elems(0), Elems(EXPERT_SLOTS))?,
+                y: &y,
+                fault: h.device.fault_word(),
+                layer: LAYER,
+            },
+        )
+    });
+    common::accepted_writes(h, &mut bufs, good, |h, b| {
+        common::moved(h, &b.marker, |v| *v != 1.0)
+    })?;
     Ok(Verdict::Noted(
         "Apart is refused by name before the slot count, the width, an empty stack and an empty id list".to_string(),
     ))

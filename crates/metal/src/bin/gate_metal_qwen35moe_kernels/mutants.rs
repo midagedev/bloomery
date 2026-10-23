@@ -5,10 +5,15 @@
 //! other than the one named is an error by name, so a kernel edit cannot
 //! silently turn a mutant into a no-op.
 //!
-//! `matvec_refusals` has no mutant here: it checks the host module, whose
-//! defect is a source edit of `src/kernels/matvec.rs`, not of a kernel. The
-//! refusals of `seg_bounds` are the host's too, so that clause's mutant is
-//! the kernel's: a dispatch of the most segments must write every row.
+//! Every kernel clause has a mutant. The refusal tables check the host launch
+//! modules, whose defect is a source edit of `crates/metal/src/kernels/*.rs`:
+//! the module is compiled into this gate's own binary, so each such defect is
+//! a one-off edit recorded in the round that proves it, not a mutant here.
+//! `matvec_refusals`, `delta_bounds`, `experts_bounds` and `fold_type` are
+//! wholly host-side; `seg_bounds`, `router_bounds`, `head_bounds` and
+//! `attn_bounds` also have a kernel-side contract, and the kernel mutants
+//! below pin that side. The gate's refusal loop turns red on a deleted launch
+//! check; a table that stayed green on one would be wrong.
 
 use bloomery_metal::library::SOURCE;
 
@@ -232,7 +237,6 @@ pub const MUTANTS: &[Mutant] = &[
         why: "a non-finite logit's word does not cross the threadgroup",
         edits: &[("flags[sg_in_tg] = mine_bad;", "flags[sg_in_tg] = 0u;", 1)],
     },
-    // fold_type and experts_bounds check the host, so they have no kernel mutant.
     Mutant {
         name: "pair_no_silu",
         clause: "pair",
@@ -338,7 +342,7 @@ pub const MUTANTS: &[Mutant] = &[
     },
     Mutant {
         name: "attn_score_scale",
-        clause: "attn-f16",
+        clause: "attn_f16",
         why: "the score is twice the scaled dot",
         edits: &[(
             "float score = dot * args.scale;",
@@ -348,13 +352,13 @@ pub const MUTANTS: &[Mutant] = &[
     },
     Mutant {
         name: "attn_q8_id",
-        clause: "attn-q8",
+        clause: "attn_q8",
         why: "a q8_0 code uses 126 / amax instead of the host quantizer's 127 / amax",
         edits: &[("127.0f / amax", "126.0f / amax", 1)],
     },
     Mutant {
         name: "attn_key_count",
-        clause: "attn-fault",
+        clause: "attn_fault",
         why: "a live key count of zero or past the cache raises nothing",
         edits: &[(
             "raise(faults, args.layer, BLOOMERY_FAULT_SITE_KEY_COUNT);",
@@ -364,7 +368,7 @@ pub const MUTANTS: &[Mutant] = &[
     },
     Mutant {
         name: "attn_gate_s1",
-        clause: "attn-f16",
+        clause: "attn_f16",
         why: "one segment stores the attention without the gate",
         edits: &[(
             "float gated = attn * attn_sigmoid(g);",
@@ -374,7 +378,7 @@ pub const MUTANTS: &[Mutant] = &[
     },
     Mutant {
         name: "attn_gate_merge",
-        clause: "attn-f16",
+        clause: "attn_f16",
         why: "the merge stores the attention without the gate",
         edits: &[(
             "float merged = attn * attn_sigmoid(gate);",
@@ -384,13 +388,13 @@ pub const MUTANTS: &[Mutant] = &[
     },
     Mutant {
         name: "attn_s1_partials",
-        clause: "attn-f16",
+        clause: "attn_f16",
         why: "one segment writes partials and leaves the output untouched",
         edits: &[("if (args.segments == 1u)", "if (args.segments == 0u)", 1)],
     },
     Mutant {
         name: "attn_half",
-        clause: "attn-half",
+        clause: "attn_half",
         why: "the hardware half conversion flips the low bit",
         edits: &[(
             "float y = float(as_type<half>(bits));",
@@ -400,7 +404,7 @@ pub const MUTANTS: &[Mutant] = &[
     },
     Mutant {
         name: "attn_bounds",
-        clause: "attn-bounds",
+        clause: "attn_bounds",
         why: "every segment spans one tile, so a longer key count is only partly attended",
         edits: &[(
             "return per < BLOOMERY_ATTN_TILE ? BLOOMERY_ATTN_TILE : per;",

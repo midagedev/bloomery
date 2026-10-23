@@ -23,11 +23,6 @@ pub use super::attention_geom::{
     attention_dispatches, segments_for_keys,
 };
 
-/// Every f16 bit pattern, one f32 each.
-const F16_PATTERNS: usize = 65_536;
-/// Threads in the pattern dispatch.
-const EXPAND_THREADS: usize = 256;
-
 /// The f16 cache or the q8_0 planes a launch reads and appends.
 pub enum AttnCache<'w> {
     /// `[kv][ctx][256]` f16 bits.
@@ -137,7 +132,6 @@ pub(crate) struct AttentionPipelines {
     f16: Pipeline,
     q8: Pipeline,
     merge: Pipeline,
-    expand: Pipeline,
 }
 
 impl AttentionPipelines {
@@ -146,7 +140,6 @@ impl AttentionPipelines {
             f16: library.pipeline("gqa256_flash_f16")?,
             q8: library.pipeline("gqa256_flash_q8")?,
             merge: library.pipeline("gqa256_merge")?,
-            expand: library.pipeline("gqa256_f16_expand")?,
         })
     }
 }
@@ -328,18 +321,5 @@ impl Kernels {
         encoder.set_binding(3, Binding::bytes(pack(&checked.args))?)?;
         encoder.set_binding(4, p.fault.binding())?;
         encoder.dispatch_groups(groups, 1, MERGE_THREADS)
-    }
-
-    /// Encode the f16-pattern expansion. The window holds every pattern.
-    #[must_use = "a refused launch encoded nothing"]
-    pub fn attention_f16_expand(
-        &self,
-        encoder: &mut ComputeEncoder<'_>,
-        out: WindowMut<'_, f32, MetalDevice>,
-    ) -> Result<(), DeviceError> {
-        check_window_len("attention", "f16 patterns", out.len(), F16_PATTERNS)?;
-        encoder.set_pipeline(&self.attention.expand);
-        encoder.set_binding(0, Binding::of_mut(&out)?)?;
-        encoder.dispatch_groups(F16_PATTERNS / EXPAND_THREADS, 1, EXPAND_THREADS)
     }
 }

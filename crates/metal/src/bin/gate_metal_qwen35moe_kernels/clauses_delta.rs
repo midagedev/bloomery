@@ -9,12 +9,11 @@ use bloomery_metal::kernels::{
 };
 use gguf::quant::GgmlType;
 
+use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle::{self, Kind};
 use super::oracle_delta::{self, Fit, StepIn};
 use super::{Harness, HeadNormLaunch};
-
-const LAYER: u32 = 5;
 
 struct Fixed {
     conv_w: Vec<f32>,
@@ -182,7 +181,7 @@ fn step_in<'a>(inp: &'a In<'a>) -> StepIn<'a> {
 
 fn launch_fit(h: &Harness<'_>, inp: &In<'_>, tripwire: bool) -> Result<(Back, Fit), String> {
     let back = run(h, inp)?;
-    expect_clean(h, "the step")?;
+    common::expect_clean(h, "the step")?;
     let out = oracle_delta::step(&step_in(inp))?;
     let fit = oracle_delta::fit(
         &back.g,
@@ -193,32 +192,6 @@ fn launch_fit(h: &Harness<'_>, inp: &In<'_>, tripwire: bool) -> Result<(Back, Fi
         tripwire,
     )?;
     Ok((back, fit))
-}
-
-fn expect_clean(h: &Harness<'_>, what: &str) -> Result<(), String> {
-    if let Some(fault) = h.fault()? {
-        return Err(format!("{what} raised {fault}"));
-    }
-    Ok(())
-}
-
-fn expect_fault(h: &Harness<'_>, what: &str, site: FaultSite) -> Result<(), String> {
-    match h.fault()? {
-        Some(f)
-            if f.layer == LAYER && f.code == site as u32 && f.sites == 1u32 << (site as u32) =>
-        {
-            Ok(())
-        }
-        Some(f) => Err(format!(
-            "{what} raised {f}, not {} in layer {LAYER}",
-            site.name()
-        )),
-        None => Err(format!("{what} raised nothing, not {}", site.name())),
-    }
-}
-
-fn bits_eq(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits())
 }
 
 fn inputs(
@@ -334,7 +307,7 @@ pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         &owned.as_in(view_of(HeadMap::Grouped, 1, 0, &lane, &pos, &owned)),
         true,
     )?;
-    if bits_eq(&tiled.g, &grouped.g) && bits_eq(&tiled.state, &grouped.state) {
+    if common::bits_eq(&tiled.g, &grouped.g) && common::bits_eq(&tiled.state, &grouped.state) {
         return Err("tiled and grouped wrote the same bits".to_string());
     }
     let mut rng = oracle::Rng::new(0xD418);
@@ -349,7 +322,7 @@ pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         true,
     )?;
     let lane0 = elems(state_elems(1), "state")?;
-    if !bits_eq(&back.state[..lane0], &narrow.state[..lane0]) {
+    if !common::bits_eq(&back.state[..lane0], &narrow.state[..lane0]) {
         return Err("the unselected lane of the state was written".to_string());
     }
     let mut worst = 0.0;
@@ -358,8 +331,7 @@ pub fn delta_step(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     keep_max(&mut worst, &mut widest, &grouped_fit);
     keep_max(&mut worst, &mut widest, &narrow_fit);
     Ok(Verdict::Noted(format!(
-        "one-step band, roll factor {}, worst ratio {worst:.3}, widest state band {widest:.3e}",
-        oracle_delta::ROLL_FACTOR
+        "one-step band, roll factor 1, worst ratio {worst:.3}, widest state band {widest:.3e}"
     )))
 }
 
@@ -406,8 +378,7 @@ pub fn delta_roll(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         ring = back.ring;
     }
     Ok(Verdict::Noted(format!(
-        "roll factor {}, so the five steps are held to the one-step radius, worst ratio {worst:.3}, widest state band {widest:.3e}",
-        oracle_delta::ROLL_FACTOR
+        "roll factor 1, so the five steps are held to the one-step radius, worst ratio {worst:.3}, widest state band {widest:.3e}"
     )))
 }
 
@@ -424,7 +395,7 @@ fn written_once(out: &[f32], before: &[f32], x: &[f32], pos: u32) -> Result<(), 
             continue;
         }
         let at = s * ch;
-        if !bits_eq(&out[at..at + ch], &before[at..at + ch]) {
+        if !common::bits_eq(&out[at..at + ch], &before[at..at + ch]) {
             return Err(format!("slot {s} was written at position {pos}"));
         }
     }
@@ -467,14 +438,16 @@ pub fn delta_ring(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let mut sentinel = vec![1e6f32; owned.ring.len()];
     let at_zero_s = ring_launch(h, &owned, &sentinel, 0, false)?;
     let at_zero = ring_launch(h, &owned, &zeros, 0, true)?;
-    if !bits_eq(&at_zero_s.g, &at_zero.g) || !bits_eq(&at_zero_s.state, &at_zero.state) {
+    if !common::bits_eq(&at_zero_s.g, &at_zero.g)
+        || !common::bits_eq(&at_zero_s.state, &at_zero.state)
+    {
         return Err("position 0 read the ring".to_string());
     }
     sentinel.fill(0.0);
     sentinel[..ch].fill(1e6);
     let live = ring_launch(h, &owned, &sentinel, 1, false)?;
     let quiet = ring_launch(h, &owned, &zeros, 1, true)?;
-    if bits_eq(&live.g, &quiet.g) {
+    if common::bits_eq(&live.g, &quiet.g) {
         return Err("position 1 ignored the ring slot it reads".to_string());
     }
     let mut unread_a = zeros.clone();
@@ -483,36 +456,20 @@ pub fn delta_ring(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     unread_a[unread * ch..(unread + 1) * ch].fill(1e6);
     let a = ring_launch(h, &owned, &unread_a, 1, false)?;
     let b = ring_launch(h, &owned, &unread_b, 1, true)?;
-    if !bits_eq(&a.g, &b.g) || !bits_eq(&a.state, &b.state) {
+    if !common::bits_eq(&a.g, &b.g) || !common::bits_eq(&a.state, &b.state) {
         return Err(format!("position 1 read unread slot {unread}"));
     }
     let mut pred = zeros.clone();
     pred[..ch].fill(1e6);
     let at_two = ring_launch(h, &owned, &pred, 2, false)?;
     let at_two_zero = ring_launch(h, &owned, &zeros, 2, true)?;
-    if bits_eq(&at_two.g, &at_two_zero.g) {
+    if common::bits_eq(&at_two.g, &at_two_zero.g) {
         return Err("position 2 ignored the distance-2 ring slot".to_string());
     }
     Ok(Verdict::Noted(
         "position 0 reads no ring slot, positions 1 and 2 read the live slot, and one slot is written"
             .to_string(),
     ))
-}
-
-fn head_input(g: &[f32], partials: &[f32], eps: f32) -> Vec<f64> {
-    let scales: Vec<f64> = (0..VALUE_HEADS)
-        .map(|head| {
-            let row: Vec<f64> = partials[head * PARTIALS_PER_HEAD..(head + 1) * PARTIALS_PER_HEAD]
-                .iter()
-                .map(|&v| f64::from(v))
-                .collect();
-            oracle::head_scale(&row, HEAD_COLS, f64::from(eps))
-        })
-        .collect();
-    g.iter()
-        .enumerate()
-        .map(|(c, &v)| f64::from(v) * scales[c / HEAD_COLS])
-        .collect()
 }
 
 /// The partials and the numerator match the oracle, and the head-norm launch accepts them.
@@ -542,8 +499,15 @@ pub fn delta_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         eps: owned.eps,
         layer: LAYER,
     })?;
-    expect_clean(h, "the head norm")?;
-    let x = head_input(&back.g, &back.partials, owned.eps);
+    common::expect_clean(h, "the head norm")?;
+    let x = common::head_scaled(
+        &back.g,
+        &back.partials,
+        VALUE_HEADS,
+        HEAD_COLS,
+        PARTIALS_PER_HEAD,
+        owned.eps,
+    );
     let reference = oracle::reference(Quant::Q4K, weights, rows, cols, &x)?;
     let kind = Kind::HeadNorm(oracle::HeadGeometry {
         heads: VALUE_HEADS,
@@ -582,7 +546,7 @@ fn poison_column(h: &Harness<'_>, owned: &Owned) -> Result<(), String> {
             ring: &owned.ring,
         }),
     )?;
-    expect_fault(h, "a non-finite state lane", FaultSite::DeltaLane)?;
+    common::expect_fault(h, "a non-finite state lane", FaultSite::DeltaLane)?;
     for j in 0..8 {
         for i in 0..16 {
             let key = key_of(j, i);
@@ -652,8 +616,8 @@ pub fn delta_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         h,
         &owned.as_in(view_of(HeadMap::Tiled, 1, 0, &lane, &pos, &owned)),
     )?;
-    expect_fault(h, "a lane word past the lanes", FaultSite::DeltaLane)?;
-    if !bits_eq(&back.state, &owned.state) {
+    common::expect_fault(h, "a lane word past the lanes", FaultSite::DeltaLane)?;
+    if !common::bits_eq(&back.state, &owned.state) {
         return Err("a lane word past the lanes wrote the state".to_string());
     }
     if back.g.iter().any(|v| !v.is_nan()) || back.partials.iter().any(|v| !v.is_nan()) {
@@ -667,14 +631,120 @@ pub fn delta_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     ))
 }
 
-struct Refusal {
+/// The buffers of the refusal table: one upload per window, and the shapes
+/// every well-formed case of the table shares.
+struct Refusals {
+    ch: usize,
+    state_len: usize,
+    ring_len: usize,
+    g_len: usize,
+    p_len: usize,
+    x: bloomery_metal::MetalBuffer<f32>,
+    conv_w: bloomery_metal::MetalBuffer<f32>,
+    b: bloomery_metal::MetalBuffer<f32>,
+    a: bloomery_metal::MetalBuffer<f32>,
+    dt: bloomery_metal::MetalBuffer<f32>,
+    ssm_a: bloomery_metal::MetalBuffer<f32>,
+    z: bloomery_metal::MetalBuffer<f32>,
+    norm_w: bloomery_metal::MetalBuffer<f32>,
+    lane: bloomery_metal::MetalBuffer<u32>,
+    state: bloomery_metal::MetalBuffer<f32>,
+    ring: bloomery_metal::MetalBuffer<f32>,
+    partials: bloomery_metal::MetalBuffer<f32>,
+    g: bloomery_metal::MetalBuffer<f32>,
+}
+
+/// The launch of one case: a shape, a position window or the numerator
+/// window, one of them bad.
+#[derive(Clone, Copy)]
+struct Args {
     n_v: usize,
     head: usize,
     taps: usize,
     n_k: usize,
-    pos: usize,
+    /// The position window's length; `refuse` picks the slice it stands for.
+    pos_len: usize,
     g: usize,
+}
+
+impl Args {
+    const fn whole(n_k: usize, g_len: usize) -> Self {
+        Self {
+            n_v: VALUE_HEADS,
+            head: HEAD_COLS,
+            taps: CONV_TAPS,
+            n_k,
+            pos_len: 1,
+            g: g_len,
+        }
+    }
+}
+
+/// The position windows a case can ask for by length.
+const POS_ONE: [u32; 1] = [4];
+const POS_TWO: [u32; 2] = [0, 1];
+const POS_LONG: [u32; PASS_ROWS + 1] = [0; PASS_ROWS + 1];
+
+fn refuse(
+    h: &Harness<'_>,
+    b: &mut Refusals,
+    a: &Args,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), bloomery_device::DeviceError> {
+    let pos: &[u32] = if a.pos_len == PASS_ROWS + 1 {
+        &POS_LONG
+    } else if a.pos_len == 2 {
+        &POS_TWO
+    } else {
+        &POS_ONE
+    };
+    h.kernels.delta(
+        encoder,
+        bloomery_metal::kernels::DeltaParams {
+            x: b.x.window(Elems(0), Elems(b.ch))?,
+            conv_w: b.conv_w.window(Elems(0), Elems(CONV_TAPS * b.ch))?,
+            b_raw: b.b.window(Elems(0), Elems(VALUE_HEADS))?,
+            a_raw: b.a.window(Elems(0), Elems(VALUE_HEADS))?,
+            dt_bias: b.dt.window(Elems(0), Elems(VALUE_HEADS))?,
+            ssm_a: b.ssm_a.window(Elems(0), Elems(VALUE_HEADS))?,
+            z: b.z.window(Elems(0), Elems(b.g_len))?,
+            norm_w: b.norm_w.window(Elems(0), Elems(HEAD_COLS))?,
+            lane: b.lane.window(Elems(0), Elems(1))?,
+            state: b.state.window_mut(Elems(0), Elems(b.state_len))?,
+            ring: b.ring.window_mut(Elems(0), Elems(b.ring_len))?,
+            partials: b.partials.window_mut(Elems(0), Elems(b.p_len))?,
+            g: b.g.window_mut(Elems(0), Elems(a.g))?,
+            faults: h.device.fault_word(),
+            n_v: a.n_v,
+            head: a.head,
+            taps: a.taps,
+            n_k: a.n_k,
+            map: HeadMap::Tiled,
+            lanes: 1,
+            lane_at: 0,
+            layer: LAYER,
+            pos,
+            eps: 1e-6,
+        },
+    )
+}
+
+fn bad<'a>(
+    what: &'static str,
     needle: &'static str,
+    edit: impl FnOnce(&mut Args) + 'a,
+    h: &'a Harness<'_>,
+    whole: Args,
+) -> BadArg<'a, Refusals> {
+    BadArg::new(
+        what,
+        needle,
+        Box::new(move |b, encoder| {
+            let mut a = whole;
+            edit(&mut a);
+            refuse(h, b, &a, encoder)
+        }),
+    )
 }
 
 /// A shape, a position window and a numerator window the launch refuses by name.
@@ -687,146 +757,77 @@ pub fn delta_bounds(h: &Harness<'_>) -> Clause {
     let ring_len = elems(ring_elems(n_k), "ring")?;
     let g_len = VALUE_HEADS * HEAD_COLS;
     let p_len = VALUE_HEADS * PARTIALS_PER_HEAD;
-    let x = device.upload(stream, &vec![1f32; ch]).map_err(why)?;
-    let conv_w = device
-        .upload(stream, &vec![1f32; CONV_TAPS * ch])
-        .map_err(why)?;
-    let b = device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?;
-    let a = device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?;
-    let dt = device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?;
-    let ssm_a = device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?;
-    let z = device.upload(stream, &vec![1f32; g_len]).map_err(why)?;
-    let norm_w = device.upload(stream, &vec![1f32; HEAD_COLS]).map_err(why)?;
-    let lane = device.upload(stream, &[0u32]).map_err(why)?;
-    let mut state = device.upload(stream, &vec![1f32; state_len]).map_err(why)?;
-    let mut ring = device.upload(stream, &vec![1f32; ring_len]).map_err(why)?;
-    let mut partials = device.upload(stream, &vec![1f32; p_len]).map_err(why)?;
-    let mut g = device.upload(stream, &vec![1f32; g_len + 1]).map_err(why)?;
-    let whole = Refusal {
-        n_v: VALUE_HEADS,
-        head: HEAD_COLS,
-        taps: CONV_TAPS,
-        n_k,
-        pos: 1,
-        g: g_len,
-        needle: "",
+    let mut bufs = Refusals {
+        ch,
+        state_len,
+        ring_len,
+        g_len,
+        p_len,
+        x: device.upload(stream, &vec![1f32; ch]).map_err(why)?,
+        conv_w: device
+            .upload(stream, &vec![1f32; CONV_TAPS * ch])
+            .map_err(why)?,
+        b: device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?,
+        a: device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?,
+        dt: device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?,
+        ssm_a: device.upload(stream, &[1f32; VALUE_HEADS]).map_err(why)?,
+        z: device.upload(stream, &vec![1f32; g_len]).map_err(why)?,
+        norm_w: device.upload(stream, &vec![1f32; HEAD_COLS]).map_err(why)?,
+        lane: device.upload(stream, &[0u32]).map_err(why)?,
+        state: device.upload(stream, &vec![1f32; state_len]).map_err(why)?,
+        ring: device.upload(stream, &vec![1f32; ring_len]).map_err(why)?,
+        partials: device.upload(stream, &vec![1f32; p_len]).map_err(why)?,
+        g: device.upload(stream, &vec![1f32; g_len + 1]).map_err(why)?,
     };
-    let cases = [
-        Refusal {
-            n_v: 16,
-            needle: "n_v 32",
-            ..whole
-        },
-        Refusal {
-            head: 64,
-            needle: "head 128",
-            ..whole
-        },
-        Refusal {
-            taps: 3,
-            needle: "taps",
-            ..whole
-        },
-        Refusal {
-            n_k: 3,
-            needle: "n_k",
-            ..whole
-        },
-        Refusal {
-            pos: PASS_ROWS + 1,
-            needle: "position window",
-            ..whole
-        },
-        Refusal {
-            pos: 2,
-            needle: "position window",
-            ..whole
-        },
-        Refusal {
-            g: g_len - 1,
-            needle: "g window",
-            ..whole
-        },
-        Refusal {
-            g: g_len + 1,
-            needle: "g window",
-            ..whole
-        },
+    let whole = Args::whole(n_k, g_len);
+    let cases = vec![
+        bad("n_v of 16", "n_v 32", |a| a.n_v = 16, h, whole),
+        bad("head of 64", "head 128", |a| a.head = 64, h, whole),
+        bad("taps of 3", "taps", |a| a.taps = 3, h, whole),
+        bad("n_k of 3", "n_k", |a| a.n_k = 3, h, whole),
+        bad(
+            "a position window of 33 words",
+            "position window",
+            |a| a.pos_len = PASS_ROWS + 1,
+            h,
+            whole,
+        ),
+        bad(
+            "a position window of 2 words",
+            "position window",
+            |a| a.pos_len = 2,
+            h,
+            whole,
+        ),
+        bad(
+            "a short numerator window",
+            "g window",
+            |a| a.g = g_len - 1,
+            h,
+            whole,
+        ),
+        bad(
+            "a long numerator window",
+            "g window",
+            |a| a.g = g_len + 1,
+            h,
+            whole,
+        ),
     ];
-    let count = cases.len();
-    let pos_long = [0u32; PASS_ROWS + 1];
-    let pos_two = [0u32, 1];
-    let pos_one = [4u32];
-    for case in cases {
-        let pos: &[u32] = if case.pos == PASS_ROWS + 1 {
-            &pos_long
-        } else if case.pos == 2 {
-            &pos_two
-        } else {
-            &pos_one
-        };
-        let refused = h.encode(|encoder| {
-            h.kernels.delta(
-                encoder,
-                bloomery_metal::kernels::DeltaParams {
-                    x: x.window(Elems(0), Elems(ch))?,
-                    conv_w: conv_w.window(Elems(0), Elems(CONV_TAPS * ch))?,
-                    b_raw: b.window(Elems(0), Elems(VALUE_HEADS))?,
-                    a_raw: a.window(Elems(0), Elems(VALUE_HEADS))?,
-                    dt_bias: dt.window(Elems(0), Elems(VALUE_HEADS))?,
-                    ssm_a: ssm_a.window(Elems(0), Elems(VALUE_HEADS))?,
-                    z: z.window(Elems(0), Elems(g_len))?,
-                    norm_w: norm_w.window(Elems(0), Elems(HEAD_COLS))?,
-                    lane: lane.window(Elems(0), Elems(1))?,
-                    state: state.window_mut(Elems(0), Elems(state_len))?,
-                    ring: ring.window_mut(Elems(0), Elems(ring_len))?,
-                    partials: partials.window_mut(Elems(0), Elems(p_len))?,
-                    g: g.window_mut(Elems(0), Elems(case.g))?,
-                    faults: device.fault_word(),
-                    n_v: case.n_v,
-                    head: case.head,
-                    taps: case.taps,
-                    n_k: case.n_k,
-                    map: HeadMap::Tiled,
-                    lanes: 1,
-                    lane_at: 0,
-                    layer: LAYER,
-                    pos,
-                    eps: 1e-6,
-                },
-            )
-        });
-        match refused {
-            Ok(()) => return Err(format!("{} was accepted", case.needle)),
-            Err(text) if !text.contains(case.needle) => {
-                return Err(format!("a refusal did not name {}: {text}", case.needle));
-            }
-            Err(_) => {}
-        }
-    }
-    let mut g_back = vec![0f32; g_len + 1];
-    let mut state_back = vec![0f32; state_len];
-    let mut partials_back = vec![0f32; p_len];
-    let mut ring_back = vec![0f32; ring_len];
-    device
-        .read(stream, g.whole().map_err(why)?, &mut g_back)
-        .map_err(why)?;
-    device
-        .read(stream, state.whole().map_err(why)?, &mut state_back)
-        .map_err(why)?;
-    device
-        .read(stream, partials.whole().map_err(why)?, &mut partials_back)
-        .map_err(why)?;
-    device
-        .read(stream, ring.whole().map_err(why)?, &mut ring_back)
-        .map_err(why)?;
-    if g_back.iter().any(|&v| v != 1.0)
-        || state_back.iter().any(|&v| v != 1.0)
-        || partials_back.iter().any(|&v| v != 1.0)
-        || ring_back.iter().any(|&v| v != 1.0)
-    {
-        return Err("a refused launch wrote".to_string());
-    }
+    let unchanged = |h: &Harness<'_>, b: &Refusals| {
+        common::still(h, &b.g, |v| *v == 1.0)?;
+        common::still(h, &b.state, |v| *v == 1.0)?;
+        common::still(h, &b.partials, |v| *v == 1.0)?;
+        common::still(h, &b.ring, |v| *v == 1.0)
+    };
+    let count = common::refuse_launches(h, "delta step", &mut bufs, cases, unchanged)?;
+    let good: Edit<'_, Refusals> = Box::new(|b, encoder| {
+        let a = whole;
+        refuse(h, b, &a, encoder)
+    });
+    common::accepted_writes(h, &mut bufs, good, |h, b| {
+        common::moved(h, &b.g, |v| *v != 1.0)
+    })?;
     Ok(Verdict::Noted(format!(
         "{count} refusals, each by name, nothing written"
     )))

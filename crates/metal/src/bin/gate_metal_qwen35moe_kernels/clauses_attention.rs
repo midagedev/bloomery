@@ -3,24 +3,26 @@
 //! `gguf::quant::quantize_q8_0`. The norm and the partial rope are the f32
 //! tree in `oracle_attention`.
 
-use bloomery_device::conformance::{Clause, Verdict, expect_range, why};
-use bloomery_device::fault::{Fault, FaultSite, site_mask};
+use bloomery_device::conformance::{Clause, Verdict, why};
+use bloomery_device::fault::{Fault, FaultSite};
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
+use bloomery_metal::encode::{Binding, ComputeEncoder};
 use bloomery_metal::kernels::{
     AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT,
     attention_dispatches, f16_len, out_len, partials_len, q8_code_len, q8_scale_len, qg_len,
 };
+use bloomery_metal::library::Library;
 use bloomery_metal::{MetalBuffer, MetalDevice};
 use gguf::quant::{GgmlType, dequant_row, half_to_f32};
 
+use super::common::{self, BadArg, LAYER, expect_fault, first_diff};
 use super::fixture::Fixture;
+use super::oracle::sigmoid;
 use super::oracle_attention::{
-    attend, band, dequant_f16, dequant_q8, norm_rope, pack_f16, pack_q8, sigmoid,
+    attend, band, dequant_f16, dequant_q8, norm_rope, pack_f16, pack_q8,
 };
 use super::{Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD};
 
-/// The layer a raise is recorded in.
-const LAYER: u32 = 5;
 /// Cache rows. The append sits at 63, and rows past it stay unread.
 const CTX: usize = 80;
 /// An f16 cache word no packed value of the planted rows uses as its check.
@@ -31,6 +33,12 @@ const CODE_HOLE: u32 = 0x0BAD_0BAD;
 const SCALE_HOLE: u16 = 0x0BAD;
 /// The q8_0 scale a non-finite block stores.
 const Q8_NAN_SCALE: u16 = 0x7e00;
+
+/// The pattern-expansion kernel, the `attn_half` clause's own: the shipped
+/// library does not carry it, and the clause compiles it once beside the
+/// source this run's kernels came from, so it still pins the production
+/// `attn_half` the attention kernel reads its cache with.
+const EXPAND: &str = "\n// Every f16 bit pattern as f32, one value per thread. The host compares it\n// with `half_to_f32`.\nkernel void gqa256_f16_expand(device float *out [[buffer(0)]],\n                              uint gid [[thread_position_in_grid]]) {\n    if (gid >= 65536u) {\n        return;\n    }\n    out[gid] = attn_half(ushort(gid));\n}\n";
 
 const KIND_Q: u32 = 3;
 const KIND_K: u32 = 5;
@@ -564,13 +572,6 @@ fn dequant_v(cache: &CacheBack, ctx: usize, kv: usize, index: usize) -> [f32; HE
     }
 }
 
-fn first_diff<T: PartialEq + Copy>(got: &[T], want: &[T]) -> Option<(usize, T, T)> {
-    got.iter()
-        .zip(want)
-        .enumerate()
-        .find_map(|(i, (g, w))| (*g != *w).then_some((i, *g, *w)))
-}
-
 fn quant_label(scene: &Scene) -> &'static str {
     if scene.q8 {
         "gguf::quant::quantize_q8_0"
@@ -757,7 +758,8 @@ struct QueryIn<'a> {
     seen: &'a Seen,
 }
 
-fn check_head(inp: &QueryIn<'_>, head: usize, worst: &mut f64) -> Result<(), String> {
+/// One head against the oracle: its worst ratio of the error to the band.
+fn check_head(inp: &QueryIn<'_>, head: usize) -> Result<f64, String> {
     let QueryIn {
         tables,
         scene,
@@ -788,6 +790,7 @@ fn check_head(inp: &QueryIn<'_>, head: usize, worst: &mut f64) -> Result<(), Str
     }
     let refer = attend(&qn, &keys, &vals)?;
     let bound = band(&qn, &keys, &vals, &gate, scene.segments)?;
+    let mut worst = 0.0f64;
     for dim in 0..HEAD_DIM {
         let at = head * HEAD_DIM + dim;
         let got = seen.out.get(at).copied().ok_or("the output is short")?;
@@ -804,7 +807,7 @@ fn check_head(inp: &QueryIn<'_>, head: usize, worst: &mut f64) -> Result<(), Str
         } else {
             f64::INFINITY
         };
-        *worst = wider(*worst, ratio);
+        worst = wider(worst, ratio);
         if !got.is_finite() || !want.is_finite() || diff.total_cmp(&b).is_gt() {
             return Err(format!(
                 "head {head} dim {dim}: got {got}, gated f64 attention {want}, |diff| {diff} over band {b} (ratio {ratio}) via {}",
@@ -812,7 +815,7 @@ fn check_head(inp: &QueryIn<'_>, head: usize, worst: &mut f64) -> Result<(), Str
             ));
         }
     }
-    Ok(())
+    Ok(worst)
 }
 
 fn check_queries(inp: &QueryIn<'_>, heads: std::ops::Range<usize>) -> Result<Checked, String> {
@@ -831,7 +834,7 @@ fn check_queries(inp: &QueryIn<'_>, heads: std::ops::Range<usize>) -> Result<Che
     expect_cache(tables, scene, k, v, planted, &seen.cache)?;
     let mut worst = 0.0f64;
     for head in heads {
-        check_head(inp, head, &mut worst)?;
+        worst = wider(worst, check_head(inp, head)?);
     }
     Ok(Checked { worst })
 }
@@ -870,7 +873,7 @@ fn run(h: &Harness<'_>, tables: &Tables, scene: &Scene) -> Result<Checked, Strin
     )
 }
 
-fn noted(tables: &Tables, worst: f64, what: &str) -> Verdict {
+fn noted_band(tables: &Tables, worst: f64, what: &str) -> Verdict {
     Verdict::Noted(format!(
         "{what}, worst |got-ref|/band {worst:.4}, {}",
         tables.note
@@ -882,7 +885,7 @@ pub fn attn_f16(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let tables = load_tables(fixture)?;
     let one = run(h, &tables, &scene_one(1, false))?;
     let four = run(h, &tables, &scene_one(4, false))?;
-    Ok(noted(
+    Ok(noted_band(
         &tables,
         wider(one.worst, four.worst),
         "f16 S=1 and S=4",
@@ -894,7 +897,7 @@ pub fn attn_q8(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let tables = load_tables(fixture)?;
     let one = run(h, &tables, &scene_one(1, true))?;
     let four = run(h, &tables, &scene_one(4, true))?;
-    Ok(noted(
+    Ok(noted_band(
         &tables,
         wider(one.worst, four.worst),
         "q8_0 S=1 and S=4, append gguf::quant::quantize_q8_0",
@@ -903,14 +906,19 @@ pub fn attn_q8(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 
 /// The hardware half conversion matches `half_to_f32` on every pattern.
 /// A finite value matches bit for bit. A NaN matches as NaN-ness and sign.
-pub fn attn_half(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
+pub fn attn_half(h: &Harness<'_>, source: &str) -> Clause {
     const N: usize = 65_536;
+    const THREADS: usize = 256;
     let (device, stream) = (h.device, h.stream);
+    let text = format!("{source}{EXPAND}");
+    let library = Library::from_source_text(device, &text).map_err(why)?;
+    let pipeline = library.pipeline("gqa256_f16_expand").map_err(why)?;
     let host = vec![f32::from_bits(SENTINEL_BITS); N];
     let mut out = device.upload(stream, &host).map_err(why)?;
     h.encode(|encoder| {
-        h.kernels
-            .attention_f16_expand(encoder, out.window_mut(Elems(0), Elems(N))?)
+        encoder.set_pipeline(&pipeline);
+        encoder.set_binding(0, Binding::of_mut(&out.window_mut(Elems(0), Elems(N))?)?)?;
+        encoder.dispatch_groups(N / THREADS, 1, THREADS)
     })?;
     let mut back = vec![0f32; N];
     device
@@ -948,16 +956,6 @@ pub fn attn_half(h: &Harness<'_>, _fixture: &Fixture) -> Clause {
         "65536 patterns: finite bits match half_to_f32, NaN compared as NaN-ness and sign"
             .to_string(),
     ))
-}
-
-fn expect_site(fault: Option<Fault>, site: FaultSite) -> Result<(), String> {
-    match fault {
-        Some(f) if f.layer == LAYER && f.site() == Some(site) && f.sites == site_mask(site) => {
-            Ok(())
-        }
-        Some(f) => Err(format!("raised {f}, not {} in layer {LAYER}", site.name())),
-        None => Err(format!("{} raised nothing", site.name())),
-    }
 }
 
 fn expect_written_nan(out: &[f32]) -> Result<(), String> {
@@ -1018,10 +1016,20 @@ fn expect_nan_q8_row(codes: &[u32], scales: &[u16], row: usize) -> Result<(), St
 /// KeyCount and CachePos write NaN and leave the cache untouched. KvQuant stores a NaN scale and zero codes.
 pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let tables = load_tables(fixture)?;
-    for (pos, keys, site) in [
-        (63u32, 0u32, FaultSite::KeyCount),
-        (63, u(CTX + 1), FaultSite::KeyCount),
-        (u(CTX), 64, FaultSite::CachePos),
+    for (pos, keys, site, what) in [
+        (63u32, 0u32, FaultSite::KeyCount, "a key count of 0"),
+        (
+            63,
+            u(CTX + 1),
+            FaultSite::KeyCount,
+            "a key count past the cache",
+        ),
+        (
+            u(CTX),
+            64,
+            FaultSite::CachePos,
+            "a position at the cache end",
+        ),
     ] {
         let scene = Scene {
             segments: 1,
@@ -1034,7 +1042,7 @@ pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         let (q, k, v) = inputs(&scene);
         let planted = plant(&scene)?;
         let seen = launch(h, &tables, &scene, &q, &k, &v, &planted)?;
-        expect_site(seen.fault, site)?;
+        expect_fault(h, what, site)?;
         expect_written_nan(&seen.out)?;
         cache_same(&planted, &seen.cache)?;
     }
@@ -1051,7 +1059,7 @@ pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     k[0] = f32::NAN;
     let planted = plant(&scene)?;
     let seen = launch(h, &tables, &scene, &q, &k, &v, &planted)?;
-    expect_site(seen.fault, FaultSite::KvQuant)?;
+    expect_fault(h, "a non-finite key", FaultSite::KvQuant)?;
     let CacheBack::Q8 {
         k_codes,
         k_scales,
@@ -1096,13 +1104,14 @@ pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         seen: &seen,
     };
     for head in 8..QUERY_HEADS {
-        check_head(&inp, head, &mut worst)?;
+        worst = wider(worst, check_head(&inp, head)?);
     }
     Ok(Verdict::Noted(format!(
         "key_count at 0 and past the cache, cache_pos, kv_quant with a NaN scale and zero codes, other key head worst ratio {worst:.4}"
     )))
 }
 
+/// The buffers of the refusal table.
 struct Bounds {
     q: MetalBuffer<f32>,
     k: MetalBuffer<f32>,
@@ -1114,87 +1123,94 @@ struct Bounds {
     out: MetalBuffer<f32>,
     k_cache: MetalBuffer<u16>,
     v_cache: MetalBuffer<u16>,
-    out_bytes: Vec<f32>,
 }
 
-struct Refusal {
+/// The launch of one case: a head dim, a head count, a segment count, a cache
+/// width or the query window, one of them bad.
+#[derive(Clone, Copy)]
+struct Args {
     head_dim: usize,
     query_heads: usize,
     kv_heads: usize,
     segments: usize,
     ctx: usize,
     q_window: usize,
-    needle: &'static str,
 }
 
-fn refuse_one(
+impl Args {
+    const fn whole(q_window: usize) -> Self {
+        Self {
+            head_dim: HEAD_DIM,
+            query_heads: QUERY_HEADS,
+            kv_heads: KV_HEADS,
+            segments: 1,
+            ctx: CTX,
+            q_window,
+        }
+    }
+}
+
+fn refuse(
     h: &Harness<'_>,
-    bounds: &mut Bounds,
-    eps: f32,
-    refusal: &Refusal,
-) -> Result<(), String> {
-    let result = {
-        let mut recording = h.stream.begin().map_err(why)?;
-        let mut encoder = recording.compute_encoder().map_err(why)?;
-        h.kernels.attention_flash(
-            &mut encoder,
-            AttentionParams {
-                head_dim: refusal.head_dim,
-                query_heads: refusal.query_heads,
-                kv_heads: refusal.kv_heads,
-                segments: refusal.segments,
-                ctx: refusal.ctx,
-                eps,
-                layer: LAYER,
-                pos: 63,
-                n_keys: 64,
-                q: bounds
-                    .q
-                    .window(Elems(0), Elems(refusal.q_window))
-                    .map_err(why)?,
-                k: bounds
-                    .k
-                    .window(Elems(0), Elems(KV_HEADS * HEAD_DIM))
-                    .map_err(why)?,
-                v: bounds
-                    .v
-                    .window(Elems(0), Elems(KV_HEADS * HEAD_DIM))
-                    .map_err(why)?,
-                q_gain: bounds
-                    .q_gain
-                    .window(Elems(0), Elems(HEAD_DIM))
-                    .map_err(why)?,
-                k_gain: bounds
-                    .k_gain
-                    .window(Elems(0), Elems(HEAD_DIM))
-                    .map_err(why)?,
-                rope: bounds
-                    .rope
-                    .window(Elems(0), Elems(CTX * ROT))
-                    .map_err(why)?,
-                cache: AttnCache::F16 {
-                    k: bounds
-                        .k_cache
-                        .window_mut(Elems(0), Elems(f16_len(CTX).ok_or("cache")?))
-                        .map_err(why)?,
-                    v: bounds
-                        .v_cache
-                        .window_mut(Elems(0), Elems(f16_len(CTX).ok_or("cache")?))
-                        .map_err(why)?,
-                },
-                partials: bounds
-                    .partials
-                    .window_mut(Elems(0), Elems(partials_len(1).ok_or("partials")?))
-                    .map_err(why)?,
-                out: bounds
-                    .out
-                    .window_mut(Elems(0), Elems(out_len().ok_or("out")?))
-                    .map_err(why)?,
-                fault: h.device.fault_word(),
-            },
-        )
+    b: &mut Bounds,
+    tables: &Tables,
+    a: &Args,
+    encoder: &mut ComputeEncoder<'_>,
+) -> Result<(), DeviceError> {
+    let wrap = |what: &str| DeviceError::Range {
+        what: "attention",
+        detail: format!("the {what} length wraps"),
     };
-    expect_range(result, "attention", refusal.needle)
+    let cache_n = f16_len(CTX).ok_or_else(|| wrap("cache"))?;
+    let partial_n = partials_len(1).ok_or_else(|| wrap("partials"))?;
+    let out_n = out_len().ok_or_else(|| wrap("out"))?;
+    h.kernels.attention_flash(
+        encoder,
+        AttentionParams {
+            head_dim: a.head_dim,
+            query_heads: a.query_heads,
+            kv_heads: a.kv_heads,
+            segments: a.segments,
+            ctx: a.ctx,
+            eps: tables.eps,
+            layer: LAYER,
+            pos: 63,
+            n_keys: 64,
+            q: b.q.window(Elems(0), Elems(a.q_window))?,
+            k: b.k.window(Elems(0), Elems(KV_HEADS * HEAD_DIM))?,
+            v: b.v.window(Elems(0), Elems(KV_HEADS * HEAD_DIM))?,
+            q_gain: b.q_gain.window(Elems(0), Elems(HEAD_DIM))?,
+            k_gain: b.k_gain.window(Elems(0), Elems(HEAD_DIM))?,
+            rope: b.rope.window(Elems(0), Elems(CTX * ROT))?,
+            cache: AttnCache::F16 {
+                k: b.k_cache.window_mut(Elems(0), Elems(cache_n))?,
+                v: b.v_cache.window_mut(Elems(0), Elems(cache_n))?,
+            },
+            partials: b.partials.window_mut(Elems(0), Elems(partial_n))?,
+            out: b.out.window_mut(Elems(0), Elems(out_n))?,
+            fault: h.device.fault_word(),
+        },
+    )
+}
+
+/// One case of the table: the whole arguments with one of them made bad.
+fn bad_arg<'a>(
+    what: &'static str,
+    needle: &'static str,
+    edit: Box<dyn FnOnce(&mut Args) + 'a>,
+    h: &'a Harness<'_>,
+    tables: &'a Tables,
+    whole: Args,
+) -> BadArg<'a, Bounds> {
+    BadArg::new(
+        what,
+        needle,
+        Box::new(move |b: &mut Bounds, encoder: &mut ComputeEncoder<'_>| {
+            let mut a = whole;
+            edit(&mut a);
+            refuse(h, b, tables, &a, encoder)
+        }),
+    )
 }
 
 /// A head dim, head count or window the kernel does not take is refused by name.
@@ -1202,11 +1218,9 @@ fn refuse_one(
 pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let tables = load_tables(fixture)?;
     let (device, stream) = (h.device, h.stream);
-    let sentinel = f32::from_bits(SENTINEL_BITS);
     let out_n = out_len().ok_or("the output length wraps")?;
     let q_n = qg_len().ok_or("the query length wraps")?;
-    let out_bytes = vec![sentinel; out_n];
-    let mut bounds = Bounds {
+    let mut bufs = Bounds {
         q: device.upload(stream, &vec![0f32; q_n]).map_err(why)?,
         k: device
             .upload(stream, &vec![0f32; KV_HEADS * HEAD_DIM])
@@ -1220,89 +1234,49 @@ pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         partials: device
             .upload(stream, &vec![0f32; partials_len(1).ok_or("partials")?])
             .map_err(why)?,
-        out: device.upload(stream, &out_bytes).map_err(why)?,
+        out: device
+            .upload(stream, &vec![f32::from_bits(SENTINEL_BITS); out_n])
+            .map_err(why)?,
         k_cache: device
             .upload(stream, &vec![F16_HOLE; f16_len(CTX).ok_or("cache")?])
             .map_err(why)?,
         v_cache: device
             .upload(stream, &vec![F16_HOLE; f16_len(CTX).ok_or("cache")?])
             .map_err(why)?,
-        out_bytes,
     };
-    let full = q_n;
-    let cases = [
-        Refusal {
-            head_dim: 128,
-            query_heads: QUERY_HEADS,
-            kv_heads: KV_HEADS,
-            segments: 1,
-            ctx: CTX,
-            q_window: full,
-            needle: "head dim",
-        },
-        Refusal {
-            head_dim: HEAD_DIM,
-            query_heads: 8,
-            kv_heads: KV_HEADS,
-            segments: 1,
-            ctx: CTX,
-            q_window: full,
-            needle: "query heads",
-        },
-        Refusal {
-            head_dim: HEAD_DIM,
-            query_heads: QUERY_HEADS,
-            kv_heads: 1,
-            segments: 1,
-            ctx: CTX,
-            q_window: full,
-            needle: "kv heads",
-        },
-        Refusal {
-            head_dim: HEAD_DIM,
-            query_heads: QUERY_HEADS,
-            kv_heads: KV_HEADS,
-            segments: 1,
-            ctx: CTX,
-            q_window: 1,
-            needle: "window",
-        },
-        Refusal {
-            head_dim: HEAD_DIM,
-            query_heads: QUERY_HEADS,
-            kv_heads: KV_HEADS,
-            segments: 0,
-            ctx: CTX,
-            q_window: full,
-            needle: "segments",
-        },
-        Refusal {
-            head_dim: HEAD_DIM,
-            query_heads: QUERY_HEADS,
-            kv_heads: KV_HEADS,
-            segments: 1,
-            ctx: 0,
-            q_window: full,
-            needle: "ctx",
-        },
+    let whole = Args::whole(q_n);
+    let case = |what: &'static str, needle: &'static str, edit: Box<dyn FnOnce(&mut Args)>| {
+        bad_arg(what, needle, edit, h, &tables, whole)
+    };
+    let cases = vec![
+        case(
+            "a head dim of 128",
+            "head dim",
+            Box::new(|a| a.head_dim = 128),
+        ),
+        case(
+            "eight query heads",
+            "query heads",
+            Box::new(|a| a.query_heads = 8),
+        ),
+        case("one kv head", "kv heads", Box::new(|a| a.kv_heads = 1)),
+        case(
+            "a query window of one value",
+            "window",
+            Box::new(|a| a.q_window = 1),
+        ),
+        case(
+            "a segment count of zero",
+            "segments",
+            Box::new(|a| a.segments = 0),
+        ),
+        case("a cache of no rows", "ctx", Box::new(|a| a.ctx = 0)),
     ];
-    for case in &cases {
-        refuse_one(h, &mut bounds, tables.eps, case)?;
-    }
-    let mut back = vec![0f32; bounds.out_bytes.len()];
-    device
-        .read(stream, bounds.out.whole().map_err(why)?, &mut back)
-        .map_err(why)?;
-    if let Some((i, (g, w))) = back
-        .iter()
-        .zip(&bounds.out_bytes)
-        .enumerate()
-        .find(|(_, (g, w))| g.to_bits() != w.to_bits())
-    {
-        return Err(format!(
-            "a refused launch wrote output word {i}: {g:?}, it was {w:?}"
-        ));
-    }
+    let unchanged =
+        |h: &Harness<'_>, b: &Bounds| common::still(h, &b.out, |v| v.to_bits() == SENTINEL_BITS);
+    common::refuse_launches(h, "attention", &mut bufs, cases, unchanged)?;
+    // The well-formed launch is the one-segment scene below: the oracle holds
+    // its every output, so an unwritten word is red there.
     let checked = run(h, &tables, &scene_one(1, false))?;
     Ok(Verdict::Noted(format!(
         "head dim, query heads, kv heads, window, segments and ctx refused, nothing written; S=1 worst ratio {:.4}",
@@ -1313,10 +1287,16 @@ pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 /// The decode-attention clauses, in gate order.
 pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
     vec![
-        ("attn-f16", Box::new(|| ctx.with(attn_f16))),
-        ("attn-q8", Box::new(|| ctx.with(attn_q8))),
-        ("attn-half", Box::new(|| ctx.with(attn_half))),
-        ("attn-fault", Box::new(|| ctx.with(attn_fault))),
-        ("attn-bounds", Box::new(|| ctx.with(attn_bounds))),
+        ("attn_f16", Box::new(|| ctx.with(attn_f16))),
+        ("attn_q8", Box::new(|| ctx.with(attn_q8))),
+        (
+            "attn_half",
+            Box::new(|| match ctx.fixture {
+                Ok(_fixture) => attn_half(ctx.harness, ctx.source),
+                Err(e) => Err(e.clone()),
+            }),
+        ),
+        ("attn_fault", Box::new(|| ctx.with(attn_fault))),
+        ("attn_bounds", Box::new(|| ctx.with(attn_bounds))),
     ]
 }

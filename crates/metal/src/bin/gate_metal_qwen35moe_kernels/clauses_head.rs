@@ -16,12 +16,10 @@ use bloomery_metal::kernels::{
 use gguf::Gguf;
 use gguf::quant::{GgmlType, dequant_row};
 
+use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle::{self, Kind};
 use super::{Harness, SENTINEL_BITS};
-
-/// The layer the clauses launch in.
-const LAYER: u32 = 6;
 
 /// The rows one threadgroup owns.
 const ROWS_PER_GROUP: usize = HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP;
@@ -576,19 +574,7 @@ pub fn head_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             out.logits[NAN_ROW]
         ));
     }
-    match h.fault()? {
-        Some(f)
-            if f.layer == LAYER
-                && f.code == FaultSite::Logit as u32
-                && f.sites == 1 << (FaultSite::Logit as u32) => {}
-        Some(f) => {
-            return Err(format!(
-                "a NaN scale raised {f}, not {} in layer {LAYER}",
-                FaultSite::Logit.name()
-            ));
-        }
-        None => return Err("a NaN scale raised nothing".to_string()),
-    }
+    common::expect_fault(h, "a NaN scale", FaultSite::Logit)?;
     let (_, want) = host_argmax(&out.logits)?;
     let winner = u32::try_from(WINNER).map_err(|_| "the winner index does not fit the step id")?;
     if want != winner || out.id != winner {
@@ -654,19 +640,7 @@ pub fn head_all_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     if out.id != u32::MAX {
         return Err(format!("an all-NaN head stored id {}, a token id", out.id));
     }
-    match h.fault()? {
-        Some(f)
-            if f.layer == LAYER
-                && f.code == FaultSite::Logit as u32
-                && f.sites == 1 << (FaultSite::Logit as u32) => {}
-        Some(f) => {
-            return Err(format!(
-                "an all-NaN head raised {f}, not {} in layer {LAYER}",
-                FaultSite::Logit.name()
-            ));
-        }
-        None => return Err("an all-NaN head raised nothing".to_string()),
-    }
+    common::expect_fault(h, "an all-NaN head", FaultSite::Logit)?;
     if out.ticket != 0 {
         return Err(format!(
             "head-all-nan: the ticket counter is {}, not 0",
@@ -678,9 +652,10 @@ pub fn head_all_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     ))
 }
 
+/// The launch of one case: a width, a row count, a SIMD-group count, an
+/// epsilon or a window, one of them bad.
 #[derive(Clone, Copy)]
-struct Refusal {
-    what: &'static str,
+struct Args {
     k: usize,
     rows: usize,
     simdgroups: usize,
@@ -692,7 +667,80 @@ struct Refusal {
     candidates: usize,
     step_id: usize,
     ticket: usize,
+}
+
+impl Args {
+    const fn whole(k: usize, rows: usize, weights_len: usize) -> Self {
+        Self {
+            k,
+            rows,
+            simdgroups: HEAD_SIMD_GROUPS,
+            eps: 1e-5,
+            weights: weights_len,
+            x: k,
+            gain: k,
+            logits: rows,
+            candidates: 1,
+            step_id: 1,
+            ticket: 1,
+        }
+    }
+}
+
+/// The buffers a bounds launch slices. One struct, so the launch stays under
+/// the argument limit.
+struct BoundBufs<'a> {
+    weights: &'a MetalBuffer<u8>,
+    x: &'a MetalBuffer<f32>,
+    gain: &'a MetalBuffer<f32>,
+    logits: &'a mut MetalBuffer<f32>,
+    candidates: &'a mut MetalBuffer<u64>,
+    ticket: &'a mut MetalBuffer<u32>,
+    step_id: &'a mut MetalBuffer<u32>,
+}
+
+fn refuse(
+    h: &Harness<'_>,
+    bufs: &mut BoundBufs<'_>,
+    a: &Args,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), DeviceError> {
+    h.kernels.head(
+        encoder,
+        HeadParams {
+            rows: a.rows,
+            k: a.k,
+            simdgroups: a.simdgroups,
+            weights: bufs.weights.window(Elems(0), Elems(a.weights))?,
+            x: bufs.x.window(Elems(0), Elems(a.x))?,
+            gain: bufs.gain.window(Elems(0), Elems(a.gain))?,
+            logits: bufs.logits.window_mut(Elems(0), Elems(a.logits))?,
+            candidates: bufs.candidates.window_mut(Elems(0), Elems(a.candidates))?,
+            ticket: bufs.ticket.window_mut(Elems(0), Elems(a.ticket))?,
+            step_id: bufs.step_id.window_mut(Elems(0), Elems(a.step_id))?,
+            eps: a.eps,
+            fault: h.device.fault_word(),
+            layer: LAYER,
+        },
+    )
+}
+
+fn bad<'a>(
+    what: &'static str,
     needle: &'static str,
+    edit: impl FnOnce(&mut Args) + 'a,
+    h: &'a Harness<'_>,
+    whole: Args,
+) -> BadArg<'a, BoundBufs<'a>> {
+    BadArg::new(
+        what,
+        needle,
+        Box::new(move |bufs, encoder| {
+            let mut a = whole;
+            edit(&mut a);
+            refuse(h, bufs, &a, encoder)
+        }),
+    )
 }
 
 pub fn head_bounds(h: &Harness<'_>) -> Clause {
@@ -712,22 +760,6 @@ pub fn head_bounds(h: &Harness<'_>) -> Clause {
     let mut candidates = device.upload(stream, &[0u64; 4]).map_err(why)?;
     let mut ticket = device.upload(stream, &[u32::MAX, u32::MAX]).map_err(why)?;
     let mut step_id = device.upload(stream, &[u32::MAX, u32::MAX]).map_err(why)?;
-    let whole = Refusal {
-        what: "",
-        k: K,
-        rows: ROWS,
-        simdgroups: HEAD_SIMD_GROUPS,
-        eps: 1e-5,
-        weights: weights_len,
-        x: K,
-        gain: K,
-        logits: ROWS,
-        candidates: 1,
-        step_id: 1,
-        ticket: 1,
-        needle: "",
-    };
-    let cases = refusal_cases(whole);
     let mut bufs = BoundBufs {
         weights: &weights,
         x: &x,
@@ -737,245 +769,123 @@ pub fn head_bounds(h: &Harness<'_>) -> Clause {
         ticket: &mut ticket,
         step_id: &mut step_id,
     };
-    for case in cases {
-        let refused = h.encode(|encoder| refuse_launch(h, encoder, &case, &mut bufs));
-        match refused {
-            Ok(()) => return Err(format!("{} was accepted", case.what)),
-            Err(text) if text.contains(case.needle) => {}
-            Err(text) => {
-                return Err(format!(
-                    "{} was refused without naming {}: {text}",
-                    case.what, case.needle
-                ));
-            }
-        }
-        still_sentinel(h, bufs.logits, bufs.ticket, bufs.step_id)
-            .map_err(|e| format!("{}: {e}", case.what))?;
-    }
-    let accepted = h.encode(|encoder| refuse_launch(h, encoder, &whole, &mut bufs));
-    accepted?;
-    let mut back = vec![0f32; ROWS + 4];
-    device
-        .read(stream, bufs.logits.whole().map_err(why)?, &mut back)
-        .map_err(why)?;
-    if back[..ROWS].iter().all(|v| v.to_bits() == SENTINEL_BITS) {
-        return Err("an accepted launch wrote nothing".to_string());
-    }
+    let whole = Args::whole(K, ROWS, weights_len);
+    let case = |what: &'static str, needle: &'static str, edit: Box<dyn FnOnce(&mut Args)>| {
+        bad(what, needle, edit, h, whole)
+    };
+    let cases = vec![
+        case("K of 0", "multiple of 256", Box::new(|a| a.k = 0)),
+        case("K of 128", "multiple of 256", Box::new(|a| a.k = 128)),
+        case("K of 255", "multiple of 256", Box::new(|a| a.k = 255)),
+        case("no rows", "row count", Box::new(|a| a.rows = 0)),
+        case(
+            "a non-finite eps",
+            "not finite",
+            Box::new(|a| a.eps = f32::NAN),
+        ),
+        case(
+            "an infinite eps",
+            "not finite",
+            Box::new(|a| a.eps = f32::INFINITY),
+        ),
+        case(
+            "a short x window",
+            "x window",
+            Box::new(|a| a.x = whole.x - 1),
+        ),
+        case(
+            "a long x window",
+            "x window",
+            Box::new(|a| a.x = whole.x + 1),
+        ),
+        case(
+            "a short gain window",
+            "gain",
+            Box::new(|a| a.gain = whole.gain - 1),
+        ),
+        case(
+            "a long gain window",
+            "gain",
+            Box::new(|a| a.gain = whole.gain + 1),
+        ),
+        case(
+            "a short logits window",
+            "logits",
+            Box::new(|a| a.logits = whole.logits - 1),
+        ),
+        case(
+            "a long logits window",
+            "logits",
+            Box::new(|a| a.logits = whole.logits + 1),
+        ),
+        case(
+            "an empty candidates window",
+            "candidates",
+            Box::new(|a| a.candidates = 0),
+        ),
+        case(
+            "a long candidates window",
+            "candidates",
+            Box::new(|a| a.candidates = 2),
+        ),
+        case(
+            "an empty step id window",
+            "step id",
+            Box::new(|a| a.step_id = 0),
+        ),
+        case(
+            "a long step id window",
+            "step id",
+            Box::new(|a| a.step_id = 2),
+        ),
+        case(
+            "an empty ticket window",
+            "ticket",
+            Box::new(|a| a.ticket = 0),
+        ),
+        case("a long ticket window", "ticket", Box::new(|a| a.ticket = 2)),
+        case(
+            "a short weights window",
+            "weights",
+            Box::new(|a| a.weights = whole.weights - 1),
+        ),
+        case(
+            "a long weights window",
+            "weights",
+            Box::new(|a| a.weights = whole.weights + 1),
+        ),
+        case(
+            "no SIMD groups",
+            "SIMD-group",
+            Box::new(|a| a.simdgroups = 0),
+        ),
+        case(
+            "4 SIMD groups",
+            "SIMD-group",
+            Box::new(|a| a.simdgroups = 4),
+        ),
+        case(
+            "16 SIMD groups",
+            "SIMD-group",
+            Box::new(|a| a.simdgroups = 16),
+        ),
+    ];
+    let unchanged = |h: &Harness<'_>, b: &BoundBufs<'_>| {
+        common::still(h, b.logits, |v| v.to_bits() == SENTINEL_BITS)?;
+        common::still(h, b.ticket, |v| *v == u32::MAX)?;
+        common::still(h, b.step_id, |v| *v == u32::MAX)
+    };
+    let count = common::refuse_launches(h, "head", &mut bufs, cases, unchanged)?;
+    let good: Edit<'_, BoundBufs<'_>> = Box::new(|bufs, encoder| {
+        let a = whole;
+        refuse(h, bufs, &a, encoder)
+    });
+    common::accepted_writes(h, &mut bufs, good, |h, b| {
+        common::moved(h, b.logits, |v| v.to_bits() != SENTINEL_BITS)
+    })?;
     Ok(Verdict::Noted(format!(
-        "{} refusals left the outputs unchanged, and an accepted launch wrote",
-        cases.len()
+        "{count} refusals left the outputs unchanged, and an accepted launch wrote"
     )))
-}
-
-fn refusal_cases(whole: Refusal) -> [Refusal; 23] {
-    [
-        Refusal {
-            what: "K of 0",
-            k: 0,
-            needle: "multiple of 256",
-            ..whole
-        },
-        Refusal {
-            what: "K of 128",
-            k: 128,
-            needle: "multiple of 256",
-            ..whole
-        },
-        Refusal {
-            what: "K of 255",
-            k: 255,
-            needle: "multiple of 256",
-            ..whole
-        },
-        Refusal {
-            what: "no rows",
-            rows: 0,
-            needle: "row count",
-            ..whole
-        },
-        Refusal {
-            what: "a non-finite eps",
-            eps: f32::NAN,
-            needle: "not finite",
-            ..whole
-        },
-        Refusal {
-            what: "an infinite eps",
-            eps: f32::INFINITY,
-            needle: "not finite",
-            ..whole
-        },
-        Refusal {
-            what: "a short x window",
-            x: whole.x - 1,
-            needle: "x window",
-            ..whole
-        },
-        Refusal {
-            what: "a long x window",
-            x: whole.x + 1,
-            needle: "x window",
-            ..whole
-        },
-        Refusal {
-            what: "a short gain window",
-            gain: whole.gain - 1,
-            needle: "gain",
-            ..whole
-        },
-        Refusal {
-            what: "a long gain window",
-            gain: whole.gain + 1,
-            needle: "gain",
-            ..whole
-        },
-        Refusal {
-            what: "a short logits window",
-            logits: whole.logits - 1,
-            needle: "logits",
-            ..whole
-        },
-        Refusal {
-            what: "a long logits window",
-            logits: whole.logits + 1,
-            needle: "logits",
-            ..whole
-        },
-        Refusal {
-            what: "an empty candidates window",
-            candidates: 0,
-            needle: "candidates",
-            ..whole
-        },
-        Refusal {
-            what: "a long candidates window",
-            candidates: 2,
-            needle: "candidates",
-            ..whole
-        },
-        Refusal {
-            what: "an empty step id window",
-            step_id: 0,
-            needle: "step id",
-            ..whole
-        },
-        Refusal {
-            what: "a long step id window",
-            step_id: 2,
-            needle: "step id",
-            ..whole
-        },
-        Refusal {
-            what: "an empty ticket window",
-            ticket: 0,
-            needle: "ticket",
-            ..whole
-        },
-        Refusal {
-            what: "a long ticket window",
-            ticket: 2,
-            needle: "ticket",
-            ..whole
-        },
-        Refusal {
-            what: "a short weights window",
-            weights: whole.weights - 1,
-            needle: "weights",
-            ..whole
-        },
-        Refusal {
-            what: "a long weights window",
-            weights: whole.weights + 1,
-            needle: "weights",
-            ..whole
-        },
-        Refusal {
-            what: "no SIMD groups",
-            simdgroups: 0,
-            needle: "SIMD-group",
-            ..whole
-        },
-        Refusal {
-            what: "4 SIMD groups",
-            simdgroups: 4,
-            needle: "SIMD-group",
-            ..whole
-        },
-        Refusal {
-            what: "16 SIMD groups",
-            simdgroups: 16,
-            needle: "SIMD-group",
-            ..whole
-        },
-    ]
-}
-
-/// The buffers a bounds launch slices. One struct, so the launch stays under
-/// the argument limit.
-struct BoundBufs<'a> {
-    weights: &'a MetalBuffer<u8>,
-    x: &'a MetalBuffer<f32>,
-    gain: &'a MetalBuffer<f32>,
-    logits: &'a mut MetalBuffer<f32>,
-    candidates: &'a mut MetalBuffer<u64>,
-    ticket: &'a mut MetalBuffer<u32>,
-    step_id: &'a mut MetalBuffer<u32>,
-}
-
-fn refuse_launch(
-    h: &Harness<'_>,
-    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
-    case: &Refusal,
-    bufs: &mut BoundBufs<'_>,
-) -> Result<(), DeviceError> {
-    h.kernels.head(
-        encoder,
-        HeadParams {
-            rows: case.rows,
-            k: case.k,
-            simdgroups: case.simdgroups,
-            weights: bufs.weights.window(Elems(0), Elems(case.weights))?,
-            x: bufs.x.window(Elems(0), Elems(case.x))?,
-            gain: bufs.gain.window(Elems(0), Elems(case.gain))?,
-            logits: bufs.logits.window_mut(Elems(0), Elems(case.logits))?,
-            candidates: bufs
-                .candidates
-                .window_mut(Elems(0), Elems(case.candidates))?,
-            ticket: bufs.ticket.window_mut(Elems(0), Elems(case.ticket))?,
-            step_id: bufs.step_id.window_mut(Elems(0), Elems(case.step_id))?,
-            eps: case.eps,
-            fault: h.device.fault_word(),
-            layer: LAYER,
-        },
-    )
-}
-
-fn still_sentinel(
-    h: &Harness<'_>,
-    logits: &MetalBuffer<f32>,
-    ticket: &MetalBuffer<u32>,
-    step_id: &MetalBuffer<u32>,
-) -> Result<(), String> {
-    let (device, stream) = (h.device, h.stream);
-    let mut logits_h = vec![0f32; logits.len().get()];
-    let mut ticket_h = [0u32; 2];
-    let mut step_h = [0u32; 2];
-    device
-        .read(stream, logits.whole().map_err(why)?, &mut logits_h)
-        .map_err(why)?;
-    device
-        .read(stream, ticket.whole().map_err(why)?, &mut ticket_h)
-        .map_err(why)?;
-    device
-        .read(stream, step_id.whole().map_err(why)?, &mut step_h)
-        .map_err(why)?;
-    if logits_h.iter().any(|v| v.to_bits() != SENTINEL_BITS)
-        || ticket_h.iter().any(|v| *v != u32::MAX)
-        || step_h.iter().any(|v| *v != u32::MAX)
-    {
-        return Err("a refused launch wrote".to_string());
-    }
-    Ok(())
 }
 
 /// The output-head clauses, in gate order.

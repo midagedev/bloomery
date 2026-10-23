@@ -8,13 +8,11 @@ use bloomery_metal::kernels::router::{EXPERTS, K, PARTIALS, ROWS, RouterParams, 
 use gguf::Gguf;
 use gguf::quant::{GgmlType, dequant_row};
 
+use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle;
 use super::oracle_router::{self, Ranking, Step};
 use super::{Harness, SENTINEL_BITS};
-
-/// The layer the clauses launch in.
-const LAYER: u32 = 5;
 
 /// The routed count the numeric clauses select.
 const TOP_K: usize = TOP_K_MAX;
@@ -170,13 +168,6 @@ fn run(
     })
 }
 
-fn clean(h: &Harness<'_>, name: &str) -> Result<(), String> {
-    match h.fault()? {
-        None => Ok(()),
-        Some(f) => Err(format!("{name} raised {f}")),
-    }
-}
-
 fn match_ids(name: &str, out: &Out, ranking: &Ranking) -> Result<(), String> {
     for (s, &want) in ranking.ids.iter().enumerate() {
         let got = out.ids[s] as usize;
@@ -269,7 +260,7 @@ pub fn router_logit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             &weights.gain,
             weights.eps,
         )?;
-        clean(h, name)?;
+        common::expect_clean(h, name)?;
         let step = oracle_router::step(
             name,
             &weights.routed,
@@ -285,7 +276,7 @@ pub fn router_logit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let eps = 1e-5;
     let (routed, shared, x, gain) = constructed(eps);
     let out = run(h, &routed, &shared, &x, &gain, eps)?;
-    clean(h, "constructed")?;
+    common::expect_clean(h, "constructed")?;
     let step = oracle_router::step("constructed", &routed, &shared, &x, &gain, eps)?;
     let ratio = check_logits_named("constructed", &out.logits, &step)?;
     worst = worst.max(ratio);
@@ -314,7 +305,7 @@ pub fn router_ids(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             &weights.gain,
             weights.eps,
         )?;
-        clean(h, name)?;
+        common::expect_clean(h, name)?;
         let step = oracle_router::step(
             name,
             &weights.routed,
@@ -328,7 +319,7 @@ pub fn router_ids(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let eps = 1e-5;
     let (routed, shared, x, gain) = constructed(eps);
     let out = run(h, &routed, &shared, &x, &gain, eps)?;
-    clean(h, "constructed")?;
+    common::expect_clean(h, "constructed")?;
     let step = oracle_router::step("constructed", &routed, &shared, &x, &gain, eps)?;
     let ranking = oracle_router::rank(&step);
     if !ranking.sequence_stable {
@@ -357,7 +348,7 @@ pub fn router_tie(h: &Harness<'_>) -> Clause {
     h.clear_fault()?;
     let (routed, shared, x, gain) = constructed_tie(eps);
     let out = run(h, &routed, &shared, &x, &gain, eps)?;
-    clean(h, "constructed")?;
+    common::expect_clean(h, "constructed")?;
     if out.logits[LOW].to_bits() != out.logits[HIGH].to_bits() {
         return Err(format!(
             "rows {LOW} and {HIGH} are {:e} and {:e}, not the same bits",
@@ -417,7 +408,7 @@ pub fn router_weights(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             &weights.gain,
             weights.eps,
         )?;
-        clean(h, name)?;
+        common::expect_clean(h, name)?;
         let step = oracle_router::step(
             name,
             &weights.routed,
@@ -433,7 +424,7 @@ pub fn router_weights(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let eps = 1e-5;
     let (routed, shared, x, gain) = constructed(eps);
     let out = run(h, &routed, &shared, &x, &gain, eps)?;
-    clean(h, "constructed")?;
+    common::expect_clean(h, "constructed")?;
     let step = oracle_router::step("constructed", &routed, &shared, &x, &gain, eps)?;
     let ranking = oracle_router::rank(&step);
     if !ranking.sequence_stable {
@@ -514,7 +505,7 @@ pub fn router_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     device
         .read(stream, bufs.ids.whole().map_err(why)?, &mut ids_h)
         .map_err(why)?;
-    clean(h, "router-ticket")?;
+    common::expect_clean(h, "router-ticket")?;
     for launch in 0..LAUNCHES {
         let row = launch * ROWS;
         let logits_l = &logits_h[row..row + ROWS];
@@ -599,19 +590,7 @@ pub fn router_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         &weights.gain,
         weights.eps,
     )?;
-    match h.fault()? {
-        Some(f)
-            if f.layer == LAYER
-                && f.code == FaultSite::Router as u32
-                && f.sites == 1 << (FaultSite::Router as u32) => {}
-        Some(f) => {
-            return Err(format!(
-                "a non-finite weight raised {f}, not {} in layer {LAYER}",
-                FaultSite::Router.name()
-            ));
-        }
-        None => return Err("a non-finite weight raised nothing".to_string()),
-    }
+    common::expect_fault(h, "a non-finite weight", FaultSite::Router)?;
     for (s, &id) in out.ids.iter().enumerate() {
         if s < TOP_K {
             if id >= EXPERTS as u32 {
@@ -629,9 +608,9 @@ pub fn router_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     ))
 }
 
+/// The launch of one case: a shape, an epsilon or a window, one of them bad.
 #[derive(Clone, Copy)]
-struct Refusal {
-    what: &'static str,
+struct Args {
     k: usize,
     rows: usize,
     top_k: usize,
@@ -646,7 +625,73 @@ struct Refusal {
     logits: usize,
     ids: usize,
     weights: usize,
+}
+
+impl Args {
+    const fn whole() -> Self {
+        Self {
+            k: K,
+            rows: ROWS,
+            top_k: TOP_K,
+            eps: 1e-5,
+            routed: EXPERTS * K,
+            shared: K,
+            x_len: K,
+            x_at: 0,
+            gain: K,
+            partials: PARTIALS,
+            ticket: 1,
+            logits: ROWS,
+            ids: TOP_K + 1,
+            weights: TOP_K + 1,
+        }
+    }
+}
+
+fn refuse(
+    h: &Harness<'_>,
+    bufs: &mut Buffers<'_>,
+    a: &Args,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), DeviceError> {
+    h.kernels.router(
+        encoder,
+        RouterParams {
+            rows: a.rows,
+            k: a.k,
+            top_k: a.top_k,
+            routed: bufs.routed.window(Elems(0), Elems(a.routed))?,
+            shared: bufs.shared.window(Elems(0), Elems(a.shared))?,
+            x: bufs.x.window(Elems(a.x_at), Elems(a.x_len))?,
+            gain: bufs.gain.window(Elems(0), Elems(a.gain))?,
+            partials: bufs.partials.window_mut(Elems(0), Elems(a.partials))?,
+            ticket: bufs.ticket.window_mut(Elems(0), Elems(a.ticket))?,
+            logits: bufs.logits.window_mut(Elems(0), Elems(a.logits))?,
+            ids: bufs.ids.window_mut(Elems(0), Elems(a.ids))?,
+            weights: bufs.weights.window_mut(Elems(0), Elems(a.weights))?,
+            eps: a.eps,
+            fault: h.device.fault_word(),
+            layer: LAYER,
+        },
+    )
+}
+
+fn bad<'a>(
+    what: &'static str,
     needle: &'static str,
+    edit: impl FnOnce(&mut Args) + 'a,
+    h: &'a Harness<'_>,
+) -> BadArg<'a, Buffers<'a>> {
+    let whole = Args::whole();
+    BadArg::new(
+        what,
+        needle,
+        Box::new(move |bufs, encoder| {
+            let mut a = whole;
+            edit(&mut a);
+            refuse(h, bufs, &a, encoder)
+        }),
+    )
 }
 
 pub fn router_bounds(h: &Harness<'_>) -> Clause {
@@ -679,228 +724,68 @@ pub fn router_bounds(h: &Harness<'_>) -> Clause {
         ids: &mut ids,
         weights: &mut weights,
     };
-    let whole = Refusal {
-        what: "",
-        k: K,
-        rows: ROWS,
-        top_k: TOP_K,
-        eps: 1e-5,
-        routed: EXPERTS * K,
-        shared: K,
-        x_len: K,
-        x_at: 0,
-        gain: K,
-        partials: PARTIALS,
-        ticket: 1,
-        logits: ROWS,
-        ids: TOP_K + 1,
-        weights: TOP_K + 1,
-        needle: "",
+    let cases = vec![
+        bad("K of 2047", "2048", |a| a.k = 2047, h),
+        bad("K of 4096", "2048", |a| a.k = 4096, h),
+        bad("256 rows", "257", |a| a.rows = 256, h),
+        bad("258 rows", "257", |a| a.rows = 258, h),
+        bad("top-k of 0", "top-k", |a| a.top_k = 0, h),
+        bad("top-k of 9", "top-k", |a| a.top_k = 9, h),
+        bad("top-k of 32", "top-k", |a| a.top_k = 32, h),
+        bad("a non-finite eps", "eps", |a| a.eps = f32::NAN, h),
+        bad("an infinite eps", "eps", |a| a.eps = f32::INFINITY, h),
+        bad(
+            "a short routed window",
+            "routed",
+            |a| a.routed = EXPERTS * K - 1,
+            h,
+        ),
+        bad("a short shared window", "shared", |a| a.shared = K - 1, h),
+        bad("a short x window", "x window", |a| a.x_len = K - 1, h),
+        bad("a short gain window", "gain", |a| a.gain = K - 1, h),
+        bad(
+            "a short partials window",
+            "partials",
+            |a| a.partials = PARTIALS - 1,
+            h,
+        ),
+        bad("an empty ticket window", "ticket", |a| a.ticket = 0, h),
+        bad(
+            "a short logits window",
+            "logits",
+            |a| a.logits = ROWS - 1,
+            h,
+        ),
+        bad("a short ids window", "ids", |a| a.ids = TOP_K, h),
+        bad(
+            "a short weights window",
+            "weights",
+            |a| a.weights = TOP_K,
+            h,
+        ),
+        bad(
+            "an x window that is not 16-byte aligned",
+            "16-byte aligned",
+            |a| a.x_at = 1,
+            h,
+        ),
+    ];
+    let unchanged = |h: &Harness<'_>, b: &Buffers<'_>| {
+        common::still(h, b.logits, |v| v.to_bits() == SENTINEL_BITS)?;
+        common::still(h, b.ids, |v| *v == SENTINEL_BITS)?;
+        common::still(h, b.weights, |v| v.to_bits() == SENTINEL_BITS)
     };
-    let cases = refusal_cases(whole);
-    for case in cases {
-        let refused = h.encode(|encoder| refuse_launch(h, encoder, &case, &mut bufs));
-        match refused {
-            Ok(()) => return Err(format!("{} was accepted", case.what)),
-            Err(text) if text.contains(case.needle) => {}
-            Err(text) => {
-                return Err(format!(
-                    "{} was refused without naming {}: {text}",
-                    case.what, case.needle
-                ));
-            }
-        }
-        still_sentinel(h, bufs.logits, bufs.ids, bufs.weights)
-            .map_err(|e| format!("{}: {e}", case.what))?;
-    }
-    let accepted = h.encode(|encoder| refuse_launch(h, encoder, &whole, &mut bufs));
-    accepted?;
-    let mut back = vec![0f32; ROWS];
-    device
-        .read(stream, bufs.logits.whole().map_err(why)?, &mut back)
-        .map_err(why)?;
-    if back.iter().all(|v| v.to_bits() == SENTINEL_BITS) {
-        return Err("an accepted launch wrote nothing".to_string());
-    }
+    let count = common::refuse_launches(h, "router", &mut bufs, cases, unchanged)?;
+    let good: Edit<'_, Buffers<'_>> = Box::new(|bufs, encoder| {
+        let a = Args::whole();
+        refuse(h, bufs, &a, encoder)
+    });
+    common::accepted_writes(h, &mut bufs, good, |h, b| {
+        common::moved(h, b.logits, |v| v.to_bits() != SENTINEL_BITS)
+    })?;
     Ok(Verdict::Noted(format!(
-        "{} refusals left the outputs unchanged, and an accepted launch wrote",
-        cases.len()
+        "{count} refusals left the outputs unchanged, and an accepted launch wrote"
     )))
-}
-
-fn refusal_cases(whole: Refusal) -> [Refusal; 19] {
-    [
-        Refusal {
-            what: "K of 2047",
-            k: 2047,
-            needle: "2048",
-            ..whole
-        },
-        Refusal {
-            what: "K of 4096",
-            k: 4096,
-            needle: "2048",
-            ..whole
-        },
-        Refusal {
-            what: "256 rows",
-            rows: 256,
-            needle: "257",
-            ..whole
-        },
-        Refusal {
-            what: "258 rows",
-            rows: 258,
-            needle: "257",
-            ..whole
-        },
-        Refusal {
-            what: "top-k of 0",
-            top_k: 0,
-            needle: "top-k",
-            ..whole
-        },
-        Refusal {
-            what: "top-k of 9",
-            top_k: 9,
-            needle: "top-k",
-            ..whole
-        },
-        Refusal {
-            what: "top-k of 32",
-            top_k: 32,
-            needle: "top-k",
-            ..whole
-        },
-        Refusal {
-            what: "a non-finite eps",
-            eps: f32::NAN,
-            needle: "eps",
-            ..whole
-        },
-        Refusal {
-            what: "an infinite eps",
-            eps: f32::INFINITY,
-            needle: "eps",
-            ..whole
-        },
-        Refusal {
-            what: "a short routed window",
-            routed: EXPERTS * K - 1,
-            needle: "routed",
-            ..whole
-        },
-        Refusal {
-            what: "a short shared window",
-            shared: K - 1,
-            needle: "shared",
-            ..whole
-        },
-        Refusal {
-            what: "a short x window",
-            x_len: K - 1,
-            needle: "x window",
-            ..whole
-        },
-        Refusal {
-            what: "a short gain window",
-            gain: K - 1,
-            needle: "gain",
-            ..whole
-        },
-        Refusal {
-            what: "a short partials window",
-            partials: PARTIALS - 1,
-            needle: "partials",
-            ..whole
-        },
-        Refusal {
-            what: "an empty ticket window",
-            ticket: 0,
-            needle: "ticket",
-            ..whole
-        },
-        Refusal {
-            what: "a short logits window",
-            logits: ROWS - 1,
-            needle: "logits",
-            ..whole
-        },
-        Refusal {
-            what: "a short ids window",
-            ids: TOP_K,
-            needle: "ids",
-            ..whole
-        },
-        Refusal {
-            what: "a short weights window",
-            weights: TOP_K,
-            needle: "weights",
-            ..whole
-        },
-        Refusal {
-            what: "an x window that is not 16-byte aligned",
-            x_at: 1,
-            needle: "16-byte aligned",
-            ..whole
-        },
-    ]
-}
-
-fn refuse_launch(
-    h: &Harness<'_>,
-    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
-    case: &Refusal,
-    bufs: &mut Buffers<'_>,
-) -> Result<(), DeviceError> {
-    h.kernels.router(
-        encoder,
-        RouterParams {
-            rows: case.rows,
-            k: case.k,
-            top_k: case.top_k,
-            routed: bufs.routed.window(Elems(0), Elems(case.routed))?,
-            shared: bufs.shared.window(Elems(0), Elems(case.shared))?,
-            x: bufs.x.window(Elems(case.x_at), Elems(case.x_len))?,
-            gain: bufs.gain.window(Elems(0), Elems(case.gain))?,
-            partials: bufs.partials.window_mut(Elems(0), Elems(case.partials))?,
-            ticket: bufs.ticket.window_mut(Elems(0), Elems(case.ticket))?,
-            logits: bufs.logits.window_mut(Elems(0), Elems(case.logits))?,
-            ids: bufs.ids.window_mut(Elems(0), Elems(case.ids))?,
-            weights: bufs.weights.window_mut(Elems(0), Elems(case.weights))?,
-            eps: case.eps,
-            fault: h.device.fault_word(),
-            layer: LAYER,
-        },
-    )
-}
-
-fn still_sentinel(
-    h: &Harness<'_>,
-    logits: &MetalBuffer<f32>,
-    ids: &MetalBuffer<u32>,
-    weights: &MetalBuffer<f32>,
-) -> Result<(), String> {
-    let (device, stream) = (h.device, h.stream);
-    let mut logits_h = vec![0f32; ROWS];
-    let mut ids_h = vec![0u32; TOP_K + 1];
-    let mut weights_h = vec![0f32; TOP_K + 1];
-    device
-        .read(stream, logits.whole().map_err(why)?, &mut logits_h)
-        .map_err(why)?;
-    device
-        .read(stream, ids.whole().map_err(why)?, &mut ids_h)
-        .map_err(why)?;
-    device
-        .read(stream, weights.whole().map_err(why)?, &mut weights_h)
-        .map_err(why)?;
-    if logits_h.iter().any(|v| v.to_bits() != SENTINEL_BITS)
-        || ids_h.iter().any(|v| *v != SENTINEL_BITS)
-        || weights_h.iter().any(|v| v.to_bits() != SENTINEL_BITS)
-    {
-        return Err("a refused launch wrote".to_string());
-    }
-    Ok(())
 }
 
 /// The router clauses, in gate order.

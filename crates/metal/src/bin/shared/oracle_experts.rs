@@ -1,55 +1,22 @@
 //! The pair's band and the fold's band.
-//!
-//! PIN(2026-10-23): pair = the norm-on-load mat-vec band, silu slope under 1.1, exp's 4 ulp; fold n = 13 + ceil(18/4) + 31 + 2.
 
-use bloomery_metal::kernels::Quant;
+use bloomery_metal::kernels::{BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, Quant};
 
-use super::oracle::{self, Kind};
+use super::oracle::{self, Kind, U, silu};
 
-/// f32 unit roundoff, the value the mat-vec band's gamma is built from.
-const U: f64 = 1.0 / 16_777_216.0;
+/// The blocks of one fold: the hidden states of every slot, `slots * k`
+/// columns.
+const FOLD_BLOCKS: usize = EXPERT_SLOTS * EXPERT_K / BLOCK_VALUES;
 
-/// Operations on the store path of a mat-vec of `nblocks` blocks.
-fn store_ops(quant: Quant, nblocks: usize) -> usize {
-    match quant {
-        Quant::Q4K => 13 + nblocks.div_ceil(4) + 31,
-        Quant::Q6K => 9 + nblocks.div_ceil(2) + 31,
-    }
-}
-
-/// Operations on the pair's dot path. The pair norms its input in the
-/// mat-vec's norm-on-load order: the sum of squares (a square and two adds per
-/// four values, the lane's chain of `8 ceil(nb / 4)` adds for Q4_K or
-/// `4 ceil(nb / 2)` for Q6_K, the SIMD group's 31), its division and addition,
-/// then the store path with the gain product on the load and the scale
-/// product at the end.
-fn norm_ops(quant: Quant, nblocks: usize) -> usize {
-    let chain = match quant {
-        Quant::Q4K => 8 * nblocks.div_ceil(4),
-        Quant::Q6K => 4 * nblocks.div_ceil(2),
-    };
-    let sum_squares = 1 + 2 + chain + 31;
-    sum_squares + 2 + store_ops(quant, nblocks) + 2
-}
-
-/// Operations on the fold's path. Q4 is `13 + ceil(18/4) + 31 + 2`. Q6 is the
-/// same count with its base and its stride: `9 + ceil(18/2) + 31 + 2`. The
-/// added two are the route-weight product on the load and the residual add.
-fn fold_ops(quant: Quant) -> usize {
-    match quant {
-        Quant::Q4K => FOLD_OPS_Q4,
-        Quant::Q6K => FOLD_OPS_Q6,
-    }
-}
-
-const FOLD_OPS_Q4: usize = 13 + 18_usize.div_ceil(4) + 31 + 2;
-const FOLD_OPS_Q6: usize = 9 + 18_usize.div_ceil(2) + 31 + 2;
-const _: [(); 51] = [(); FOLD_OPS_Q4];
-const _: [(); 51] = [(); FOLD_OPS_Q6];
-
-fn silu(g: f64) -> f64 {
-    g / (1.0 + (-g).exp())
-}
+/// The operations the fold adds to a store path of `FOLD_BLOCKS` blocks: the
+/// route-weight product on the load and the residual add (2), over the store
+/// path's own base (13 for Q4_K, 9 for Q6_K) and SIMD-group sum (31).
+///
+/// PIN(2026-10-23): pair = the norm-on-load mat-vec band, silu's slope under
+/// 1.1, exp's 4 ulp; fold = the store path of 18 blocks (base 13, SIMD sum 31) plus the
+/// route weight and the residual (2). The model in this module's doc, and no
+/// measured error, sets the counts.
+const FOLD_EXTRA_OPS: usize = 2;
 
 /// `(want, width)` for one output `silu(g) * u`.
 ///
@@ -71,13 +38,7 @@ pub fn pair_width(
     mag_u: f64,
 ) -> Result<(f64, f64), String> {
     let dot = oracle::band(quant, nblocks, Kind::Norm);
-    let ops = norm_ops(quant, nblocks);
-    if dot.ops() != ops {
-        return Err(format!(
-            "the norm-on-load band is {} operations, the pair derives {ops}",
-            dot.ops()
-        ));
-    }
+    let ops = dot.ops();
     let g_err = dot.factor() * mag_g * (1.0 + U);
     let u_err = dot.factor() * mag_u * (1.0 + U);
     let s = silu(g);
@@ -98,7 +59,7 @@ pub fn pair_width(
 /// contributes `U |y|` on top of gamma of the fold's operation count.
 #[must_use]
 pub fn fold_width(quant: Quant, magnitude: f64, y: f64) -> f64 {
-    let n = fold_ops(quant);
+    let n = oracle::band(quant, FOLD_BLOCKS, Kind::Store).ops() + FOLD_EXTRA_OPS;
     let factor = oracle::gamma_bound(n);
     let floor = n as f64 * f64::from(f32::MIN_POSITIVE);
     factor * magnitude * (1.0 + U) + U * y.abs() + floor

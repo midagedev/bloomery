@@ -1,8 +1,7 @@
 //! The gated delta step's oracle: the kernel's arithmetic in f64, and the
 //! absolute error one f32 evaluation of that arithmetic can carry.
 //!
-//! PIN(2026-10-22): the model below sets the one-step band. The device has no
-//! f64 in the shader, so the query and key sum of squares is f32
+//! The device has no f64 in the shader, so the query and key sum of squares is f32
 //! `(s0 + s1) + (s2 + s3)` then a butterfly of widths 16, 8, 4, 2, 1, and the
 //! delta butterfly is f32 of widths 4, 2, 1. `exp` and `log` are taken within
 //! 4 ulp, and 1 ulp of a value `y` is at most `2·U·|y|`, so 4 ulp is at most
@@ -26,11 +25,13 @@ use bloomery_metal::kernels::{
     key_of, ring_elems, state_elems, state_index,
 };
 
-/// The factor a later step's band may grow by, over the one-step radius.
-/// Each step is re-oracled from the kernel's snapshot, so the factor is 1.
-pub const ROLL_FACTOR: f64 = 1.0;
+use super::oracle::U;
 
-const U: f64 = 1.0 / 16_777_216.0;
+/// The subnormal floor: one minimum-positive f32 per operation of the path
+/// the model in this module's doc counts, which the relative bound does not
+/// cover.
+///
+/// PIN(2026-10-22): the model in this module's doc sets the one-step band.
 const FLOOR: f64 = 8.0 * (f32::MIN_POSITIVE as f64);
 
 /// One value and the absolute error an f32 evaluation may add.
@@ -293,6 +294,9 @@ pub struct StepOut {
     pub state_err: Vec<f64>,
     /// The ring after the step.
     pub ring: Vec<f32>,
+    /// The widest sign flip of the state update, `2 |k u|`, over the step: a
+    /// state band wider than this would hide the flip.
+    pub flip: f64,
 }
 
 /// The worst ratio of an error to its band, and the widest state band.
@@ -443,6 +447,8 @@ struct Out<'a> {
     g_err: &'a mut [f64],
     state: &'a mut [f64],
     state_err: &'a mut [f64],
+    /// The widest sign flip of the state update, `2 |k u|`, over the step.
+    flip: &'a mut f64,
 }
 
 fn column(
@@ -475,6 +481,7 @@ fn column(
     }
     for j in 0..8 {
         for i in 0..16 {
+            *out.flip = (*out.flip).max(2.0 * (kk[j][i].v * u[j].v).abs());
             sp[j][i] = fma(kk[j][i], u[j], sp[j][i]);
             let key = key_of(j, i);
             let at = state_index(head.lane, head.h, col, key);
@@ -526,6 +533,7 @@ pub fn step(inp: &StepIn<'_>) -> Result<StepOut, String> {
     let mut partials_err = vec![0.0; VALUE_HEADS * PARTIALS_PER_HEAD];
     let mut out_state: Vec<f64> = inp.state.iter().map(|&v| f64::from(v)).collect();
     let mut out_err = vec![0.0; inp.state.len()];
+    let mut flip = 0.0f64;
     for h in 0..VALUE_HEADS {
         let decay = exp_ev(mul(
             Ev::exact(inp.ssm_a[h]),
@@ -549,6 +557,7 @@ pub fn step(inp: &StepIn<'_>) -> Result<StepOut, String> {
             g_err: &mut g_err,
             state: &mut out_state,
             state_err: &mut out_err,
+            flip: &mut flip,
         };
         let mut o2 = [Ev::zero(); 16];
         for col in 0..HEAD_COLS {
@@ -579,6 +588,7 @@ pub fn step(inp: &StepIn<'_>) -> Result<StepOut, String> {
         state: out_state,
         state_err: out_err,
         ring,
+        flip,
     })
 }
 
@@ -589,7 +599,7 @@ fn cell(got: f32, v: f64, e: f64, what: &str, index: usize) -> Result<f64, Strin
     if !e.is_finite() || e < 0.0 {
         return Err(format!("{what}[{index}]: band is not finite"));
     }
-    let width = ROLL_FACTOR * e + FLOOR;
+    let width = e + FLOOR;
     let err = (f64::from(got) - v).abs();
     if !got.is_finite() || err > width {
         return Err(format!(
@@ -617,8 +627,8 @@ fn scan(got: &[f32], v: &[f64], e: &[f64], what: &str) -> Result<(f64, f64), Str
 }
 
 /// `got` against `out`. The ring is compared bit for bit. When `tripwire` is
-/// set, a state band wider than the sign-flip of this step's data fails: that
-/// width would hide the state-update mutant.
+/// set, a state band wider than this step's sign-flip width `2 |k u|` fails:
+/// that width would hide the state-update mutant.
 pub fn fit(
     got_g: &[f32],
     got_partials: &[f32],
@@ -642,9 +652,10 @@ pub fn fit(
             return Err(format!("ring[{i}]: got {got:e}, want {want:e}"));
         }
     }
-    if tripwire && widest > 1e-2 {
+    if tripwire && widest > out.flip {
         return Err(format!(
-            "the widest state band is {widest:e}, which would hide a sign flip of the state update"
+            "the widest state band is {widest:e}, over this step's sign-flip width {:e}, which would hide a sign flip of the state update",
+            out.flip
         ));
     }
     Ok(Fit {
