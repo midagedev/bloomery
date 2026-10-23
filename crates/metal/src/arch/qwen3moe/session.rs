@@ -21,11 +21,14 @@
 //! [`Session::step_traced`] is the instrument the gates read nodes through:
 //! the same ops of a host-fed step, each on a command buffer of its own,
 //! waited, with a hook after each. It encodes what [`Session::step`]
-//! encodes, op for op.
+//! encodes, op for op. [`Session::step_profile`] is the finer instrument:
+//! each group on a command buffer of its own, its GPU seconds read, one
+//! sample a group.
 
 use core::fmt;
 use core::ops::Range;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 use std::path::Path;
 
 use bloomery_device::fault::Fault;
@@ -38,16 +41,21 @@ use chain::arch::qwen3moe::walk::Walk;
 use gguf::Split;
 
 use super::arena::{Arena, MixerBufs, lane_of, slot_of};
-use super::count::Layer;
+use super::count::{GroupBytes, GroupKind, Layer};
 use super::ops::{Feed, MetalOps};
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
-use crate::kernels::{HEAD_DIM, Kernels, state_elems};
+use crate::kernels::{HEAD_DIM, Kernels, attention_dispatches, segments_for_keys, state_elems};
 use crate::library::Library;
-use crate::stream::{MetalStream, Settled, Signalled};
+use crate::stream::{GpuInterval, MetalStream, Settled, Signalled};
 
 const WHAT: &str = "qwen35moe session";
+
+/// How long a profiled group's stamps wait for the completed status its
+/// settle already implied: the buffer's signal fires before the driver
+/// reports it complete, so the stamps give the report a moment.
+const STAMP_WAIT: Duration = Duration::from_secs(1);
 
 /// A session's refusal or failure.
 #[derive(Debug)]
@@ -148,6 +156,16 @@ struct Ahead {
     pos: u32,
     /// The id its embed reads: the pick of the token before it.
     embeds: u32,
+}
+
+/// One group of a profiled token: what the group runs, the layer it runs in
+/// (none for the embed and the head), and the GPU seconds the group's own
+/// command buffer ran, `GPUEndTime` − `GPUStartTime`.
+#[derive(Clone, Copy, Debug)]
+pub struct ProfileGroup {
+    pub kind: GroupKind,
+    pub layer: Option<usize>,
+    pub gpu_s: f64,
 }
 
 /// One op of the walk, as a traced step names it to its hook.
@@ -556,6 +574,55 @@ impl Session {
         self.land(&settled, count)
     }
 
+    /// [`Session::step`] host-fed, with every group on a command buffer of
+    /// its own, waited, its GPU seconds read and one sample a group appended
+    /// to `out`, in the token's order. The count is the sum of the groups'
+    /// counts: what one encoder of the whole token encodes. A token running
+    /// ahead is dropped first. `out` is cleared and keeps its capacity, so a
+    /// steady call allocates nothing.
+    pub fn step_profile(
+        &mut self,
+        id: u32,
+        out: &mut Vec<ProfileGroup>,
+    ) -> Result<Stepped, SessionError> {
+        self.ready()?;
+        if let Some(a) = self.ahead.take() {
+            self.drop_ahead(a)?;
+        }
+        self.arena.id_in.pages().store(0, id, Ordering::Relaxed)?;
+        out.clear();
+        let mut profiler = Profiler {
+            stream: &self.stream,
+            kernels: &self.kernels,
+            arena: &mut self.arena,
+            pos: self.pos,
+            count: EncodeCount::default(),
+            settled: None,
+            out,
+        };
+        Walk::new(&mut profiler, &self.plans, 1).run(1)?;
+        let count = profiler.count;
+        let settled = profiler
+            .settled
+            .ok_or_else(|| refuse("a profiled step settled no group"))?;
+        self.land(&settled, count)
+    }
+
+    /// The bytes the profiled group `g` of the token at `pos` moved, by what
+    /// moved them: the byte rule's one owner is the arena's. `ids` is that
+    /// group's layer's router ids as the step left them (the routed picks,
+    /// then the shared expert's); the expert groups take them, every other
+    /// group none.
+    pub fn group_bytes(
+        &self,
+        g: &ProfileGroup,
+        pos: u32,
+        ids: &[u32],
+    ) -> Result<GroupBytes, SessionError> {
+        let layer = g.layer.unwrap_or(0);
+        self.arena.group_bytes(g.kind, layer, pos, ids)
+    }
+
     /// A settled token's end: its fault word (a fault poisons the session),
     /// then its pick; the position moves.
     fn land(&mut self, settled: &Settled, count: EncodeCount) -> Result<Stepped, SessionError> {
@@ -715,5 +782,121 @@ where
 
     fn head(&mut self, m: usize) -> Result<(), SessionError> {
         self.one(Op::Head, |o| o.head(m))
+    }
+}
+
+/// The profiled step's groups: each group of [`MetalOps`] on its own command
+/// buffer, waited, its GPU interval read, one sample appended. The groups
+/// are the token's as the encoder counts them, so the walk's `attn_core`
+/// past one segment of keys and its `experts` are two groups each.
+struct Profiler<'s> {
+    stream: &'s MetalStream,
+    kernels: &'s Kernels,
+    arena: &'s mut Arena,
+    pos: u32,
+    count: EncodeCount,
+    /// The last group's settle: the head's, once the walk is done.
+    settled: Option<Settled>,
+    out: &'s mut Vec<ProfileGroup>,
+}
+
+impl Profiler<'_> {
+    fn one(
+        &mut self,
+        kind: GroupKind,
+        layer: Option<usize>,
+        f: impl FnOnce(&mut MetalOps<'_, '_>) -> Result<(), SessionError>,
+    ) -> Result<(), SessionError> {
+        let mut recording = self.stream.begin()?;
+        let mut enc = recording.token_encoder()?;
+        f(&mut MetalOps::new(
+            &mut enc,
+            self.arena,
+            self.kernels,
+            self.pos,
+            Feed::Host,
+        ))?;
+        let c = enc.count();
+        enc.end();
+        let stamps = recording.stamps();
+        let signalled = self.stream.submit_signalled(recording)?;
+        let settled = self.stream.settle(signalled)?;
+        self.settled = Some(settled);
+        self.count.groups += c.groups;
+        self.count.dispatches += c.dispatches;
+        self.count.barriers += c.barriers;
+        // The settle above waited the buffer out, so its stamps are the
+        // driver's record of a completed run; anything else is a refusal.
+        let gpu = match stamps.interval(STAMP_WAIT)? {
+            GpuInterval::Ran(s) => s,
+            GpuInterval::StillRunning => {
+                return Err(refuse(format!(
+                    "{kind:?} layer {layer:?}: its buffer still runs after its settle"
+                )));
+            }
+        };
+        self.out.push(ProfileGroup {
+            kind,
+            layer,
+            gpu_s: gpu,
+        });
+        Ok(())
+    }
+}
+
+impl ChainOps for Profiler<'_> {
+    type Error = SessionError;
+
+    fn embed(&mut self, m: usize) -> Result<(), SessionError> {
+        self.one(GroupKind::Embed, None, |o| o.embed(m))
+    }
+
+    fn attn_in(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::AttnP1, Some(l.layer), |o| o.attn_in(l, g))
+    }
+
+    fn attn_core(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
+        let n_keys = self.pos + 1;
+        let segments = segments_for_keys(n_keys);
+        self.one(GroupKind::AttnFlash, Some(l.layer), |o| {
+            o.attn_flash(l.layer, n_keys, segments)
+        })?;
+        if attention_dispatches(segments) == 2 {
+            self.one(GroupKind::AttnMerge, Some(l.layer), |o| {
+                o.attn_merge(l.layer, n_keys, segments)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::AttnOut, Some(l.layer), |o| o.attn_out(l, g))
+    }
+
+    fn delta_in(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::DeltaP1, Some(l.layer), |o| o.delta_in(l, d))
+    }
+
+    fn delta_core(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::DeltaCore, Some(l.layer), |o| o.delta_core(l, d))
+    }
+
+    fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::DeltaOut, Some(l.layer), |o| o.delta_out(l, d))
+    }
+
+    fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::Router, Some(l.layer), |o| o.route(l, f))
+    }
+
+    fn experts(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), SessionError> {
+        self.one(GroupKind::GateUp, Some(l.layer), |o| {
+            o.experts_pair(l.layer)
+        })?;
+        self.one(GroupKind::Down, Some(l.layer), |o| o.experts_fold(l.layer))
+    }
+
+    fn head(&mut self, m: usize) -> Result<(), SessionError> {
+        self.one(GroupKind::Head, None, |o| o.head(m))
     }
 }

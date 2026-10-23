@@ -238,6 +238,116 @@ impl MetalOps<'_, '_> {
     }
 }
 
+impl MetalOps<'_, '_> {
+    /// Layer `l`'s flash group: the attention over its `n_keys` live keys in
+    /// `segments` segments, this position's keys stored first. The group a
+    /// merge follows past one segment.
+    pub(super) fn attn_flash(
+        &mut self,
+        l: usize,
+        n_keys: u32,
+        segments: u32,
+    ) -> Result<(), SessionError> {
+        let p = Self::attn_params(&mut *self.arena, l, self.pos, n_keys, segments)?;
+        self.kernels.attention_flash(self.enc, p)?;
+        self.close();
+        Ok(())
+    }
+
+    /// Layer `l`'s merge group: the flash's partials folded into the output.
+    pub(super) fn attn_merge(
+        &mut self,
+        l: usize,
+        n_keys: u32,
+        segments: u32,
+    ) -> Result<(), SessionError> {
+        let p = Self::attn_params(&mut *self.arena, l, self.pos, n_keys, segments)?;
+        self.kernels.attention_merge(self.enc, p)?;
+        self.close();
+        Ok(())
+    }
+
+    /// Layer `l`'s gate-up group: the routed picks' and the shared expert's
+    /// gate and up, the residual normed as it is loaded.
+    pub(super) fn experts_pair(&mut self, l: usize) -> Result<(), SessionError> {
+        let slot = slot_of(self.pos);
+        let Arena {
+            layers,
+            x,
+            h,
+            faults,
+            hidden,
+            eps,
+            n_experts,
+            ..
+        } = &mut *self.arena;
+        let f = &layers[l].ffn;
+        let ids = f.ids.window(Elems(0), Elems(ROUTED_IDS))?.cast::<i32>()?;
+        self.kernels.pair(
+            self.enc,
+            PairParams {
+                quant: f.gate_up_quant,
+                slots: EXPERT_SLOTS,
+                k: EXPERT_K,
+                cols: *hidden,
+                n_experts: *n_experts,
+                ids,
+                gate: all(&f.gate)?,
+                up: all(&f.up)?,
+                shared_gate: all(&f.shexp_gate)?,
+                shared_up: all(&f.shexp_up)?,
+                x: x.window(Elems(0), Elems(*hidden))?,
+                gain: all(&f.norm)?,
+                eps: *eps,
+                y: all_mut(h)?,
+                out_stride: EXPERT_K,
+                fault: &faults[slot],
+                layer: layer_word(l),
+            },
+        )?;
+        self.close();
+        Ok(())
+    }
+
+    /// Layer `l`'s down group: the experts' down projections, the routed
+    /// picks' and the shared expert's, folded into the residual.
+    pub(super) fn experts_fold(&mut self, l: usize) -> Result<(), SessionError> {
+        let slot = slot_of(self.pos);
+        let Arena {
+            layers,
+            x,
+            h,
+            faults,
+            hidden,
+            n_experts,
+            ..
+        } = &mut *self.arena;
+        let f = &layers[l].ffn;
+        let ids = f.ids.window(Elems(0), Elems(ROUTED_IDS))?.cast::<i32>()?;
+        let y = x.window_mut(Elems(0), Elems(*hidden))?;
+        self.kernels.fold(
+            self.enc,
+            FoldParams {
+                quant: f.down_quant,
+                shared: SharedPlan::Same(all(&f.shexp_down)?),
+                rows: *hidden,
+                slots: EXPERT_SLOTS,
+                k: EXPERT_K,
+                n_experts: *n_experts,
+                ids,
+                down: all(&f.down)?,
+                h: all(h)?,
+                w: all(&f.weights)?,
+                y: &y,
+                fault: &faults[slot],
+                layer: layer_word(l),
+            },
+        )?;
+        self.close();
+        Ok(())
+    }
+}
+
 impl ChainOps for MetalOps<'_, '_> {
     type Error = SessionError;
 
@@ -280,18 +390,13 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn attn_core(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
-        let pos = self.pos;
-        let n_keys = pos + 1;
+        let n_keys = self.pos + 1;
         let segments = segments_for_keys(n_keys);
-        let p = Self::attn_params(&mut *self.arena, l.layer, pos, n_keys, segments)?;
-        self.kernels.attention_flash(self.enc, p)?;
-        self.close();
+        self.attn_flash(l.layer, n_keys, segments)?;
         // Live keys past one segment: the flash wrote partials, and the merge
         // is their own group, after the barrier.
         if attention_dispatches(segments) == 2 {
-            let p = Self::attn_params(&mut *self.arena, l.layer, pos, n_keys, segments)?;
-            self.kernels.attention_merge(self.enc, p)?;
-            self.close();
+            self.attn_merge(l.layer, n_keys, segments)?;
         }
         Ok(())
     }
@@ -442,63 +547,8 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn experts(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), SessionError> {
-        let slot = slot_of(self.pos);
-        let Arena {
-            layers,
-            x,
-            h,
-            faults,
-            hidden,
-            eps,
-            n_experts,
-            ..
-        } = &mut *self.arena;
-        let f = &layers[l.layer].ffn;
-        let ids = f.ids.window(Elems(0), Elems(ROUTED_IDS))?.cast::<i32>()?;
-        self.kernels.pair(
-            self.enc,
-            PairParams {
-                quant: f.gate_up_quant,
-                slots: EXPERT_SLOTS,
-                k: EXPERT_K,
-                cols: *hidden,
-                n_experts: *n_experts,
-                ids,
-                gate: all(&f.gate)?,
-                up: all(&f.up)?,
-                shared_gate: all(&f.shexp_gate)?,
-                shared_up: all(&f.shexp_up)?,
-                x: x.window(Elems(0), Elems(*hidden))?,
-                gain: all(&f.norm)?,
-                eps: *eps,
-                y: all_mut(h)?,
-                out_stride: EXPERT_K,
-                fault: &faults[slot],
-                layer: layer_word(l.layer),
-            },
-        )?;
-        self.enc.memory_barrier();
-        let y = x.window_mut(Elems(0), Elems(*hidden))?;
-        self.kernels.fold(
-            self.enc,
-            FoldParams {
-                quant: f.down_quant,
-                shared: SharedPlan::Same(all(&f.shexp_down)?),
-                rows: *hidden,
-                slots: EXPERT_SLOTS,
-                k: EXPERT_K,
-                n_experts: *n_experts,
-                ids,
-                down: all(&f.down)?,
-                h: all(h)?,
-                w: all(&f.weights)?,
-                y: &y,
-                fault: &faults[slot],
-                layer: layer_word(l.layer),
-            },
-        )?;
-        self.close();
-        Ok(())
+        self.experts_pair(l.layer)?;
+        self.experts_fold(l.layer)
     }
 
     fn head(&mut self, m: usize) -> Result<(), SessionError> {
