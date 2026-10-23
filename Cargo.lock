@@ -366,8 +366,10 @@ version = "0.1.0"
 name = "bloomery-metal"
 version = "0.1.0"
 dependencies = [
+ "bloomery-chain",
  "bloomery-device",
  "bloomery-gguf",
+ "bloomery-model",
  "bloomery-placement",
  "bloomery-refset",
  "dispatch2",

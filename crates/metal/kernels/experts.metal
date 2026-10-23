@@ -1,6 +1,7 @@
 // The routed expert gate-up pair and the folded down. One dispatch each:
 //
-//   q4k_pair_swiglu   y[slot, r] = silu(gate_r · x) * (up_r · x)
+//   q4k_pair_swiglu   y[slot, r] = silu(gate_r · x̂) * (up_r · x̂),
+//                     x̂ = x * gain / sqrt(mean(x^2) + eps)
 //   q6k_pair_swiglu   the same over block_q6_K
 //   q4k_down_fold     y[r] += sum over slots of w_s * (down_s[r] · h_s)
 //   q6k_down_fold     the same over block_q6_K
@@ -20,6 +21,14 @@
 // reads an id. The select is uniform in the threadgroup. The route weight is
 // not applied here.
 //
+// The pair norms its input as it loads it, the dense mat-vec's norm on load
+// (norm.metal) in its order: every SIMD group loads the whole input once, the
+// lane adds the squares of what it loaded before the gain multiplies them,
+// the SIMD group sums the squares, and the scale multiplies both finished
+// dots. Every slot, the shared one too, dots with that one normed input. A
+// norm that cannot take its input raises NormQuant and writes NaN in the
+// row, as the mat-vec's does.
+//
 // The fold's K' is nine slots of K 512, eighteen blocks. A lane owns blocks
 // by the dense stride across that whole K', not slot by slot: Q4_K steps four
 // blocks (a lane owns four or five), Q6_K steps two (a lane owns nine). The
@@ -31,7 +40,7 @@
 // in every row of the threadgroup, because every row reads every slot.
 //
 // This file comes after matvec_q6k.metal (QK_K, FOR_UNROLL, the block
-// structs) and fault.metal (raise).
+// structs), norm.metal (rms_scale, rms_usable) and fault.metal (raise).
 
 #include <metal_stdlib>
 
@@ -39,17 +48,19 @@ using namespace metal;
 
 #pragma METAL fp contract(off)
 
-// Five words: the output rows, the blocks of one row, the experts in the
-// stack, the layer a raise names, and the output stride in floats.
+// Six words: the output rows, the blocks of one row, the experts in the
+// stack, the layer a raise names, the output stride in floats, and the
+// norm's epsilon.
 struct PairArgs {
     uint rows;
     uint nblocks;
     uint n_experts;
     uint layer;
     uint stride;
+    float eps;
 };
 
-static_assert(sizeof(PairArgs) == 20, "PairArgs is five words");
+static_assert(sizeof(PairArgs) == 24, "PairArgs is six words");
 
 // Four words: the output rows, the experts in the stack, the layer, and a pad
 // so the block is four words. The fold's K' is fixed: the host refuses any
@@ -103,9 +114,11 @@ inline bool fold_ids_ok(device const int * ids, uint n_experts) {
     return true;
 }
 
+// A slot's row the pair cannot compute: `site` raised in the layer, NaN in
+// the row.
 inline void pair_write_bad(device float * y, uint slot, uint stride, uint row,
-                           device atomic_uint * faults, uint layer) {
-    raise(faults, layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
+                           device atomic_uint * faults, uint layer, uint site) {
+    raise(faults, layer, site);
     y[(ulong)slot * stride + row] = NAN;
 }
 
@@ -198,12 +211,22 @@ inline float q6k_partial(device const block_q6_K & blk,
     return dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
 }
 
-// The activations of one Q4_K block, in the dense lane's registers. `SCALED`
-// multiplies each loaded value by the route weight before it joins either
-// sum; the pair's instantiation does not.
-template <bool SCALED>
-inline void q4k_load(device const float * block, short iq, short ir, float scale,
-                     thread float * yl, thread float * yh, thread float4 & sumy) {
+// What a load does to each value it loads.
+enum ExpertLoad {
+    // The fold's: the route weight of the block's slot multiplies it.
+    LOAD_ROUTE,
+    // The pair's: its square joins the lane's sum of squares, then its gain
+    // multiplies it (the mat-vec's norm on load, in its order).
+    LOAD_NORM,
+};
+
+// The activations of one Q4_K block, in the dense lane's registers. `gain`
+// (the block's gain) and `sum_sq` (the lane's sum of squares) are the pair's;
+// the fold passes null for both, and LOAD_ROUTE reads neither.
+template <ExpertLoad LOAD>
+inline void q4k_load(device const float * block, device const float * gain, short iq, short ir,
+                     float scale, thread float * yl, thread float * yh, thread float4 & sumy,
+                     thread float * sum_sq) {
     const int base = 64 * iq + 8 * ir;
     sumy = float4(0.f, 0.f, 0.f, 0.f);
     for (short i = 0; i < 8; ++i) {
@@ -211,13 +234,17 @@ inline void q4k_load(device const float * block, short iq, short ir, float scale
         float a1 = block[base + i + 32];
         float a2 = block[base + i + 128];
         float a3 = block[base + i + 160];
-        if (SCALED) {
+        if (LOAD == LOAD_ROUTE) {
             a0 *= scale;
             a1 *= scale;
             a2 *= scale;
             a3 *= scale;
         } else {
-            (void)scale;
+            *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
+            a0 *= gain[base + i + 0];
+            a1 *= gain[base + i + 32];
+            a2 *= gain[base + i + 128];
+            a3 *= gain[base + i + 160];
         }
         yl[i + 0] = a0;
         sumy[0] += a0;
@@ -230,22 +257,26 @@ inline void q4k_load(device const float * block, short iq, short ir, float scale
     }
 }
 
-template <bool SCALED>
-inline void q6k_load(device const float * block, short ip, short l0, float scale,
-                     thread float * yl) {
+template <ExpertLoad LOAD>
+inline void q6k_load(device const float * block, device const float * gain, short ip, short l0,
+                     float scale, thread float * yl, thread float * sum_sq) {
     const int base = 128 * ip + l0;
     for (short l = 0; l < 4; ++l) {
         float a0 = block[base + l + 0];
         float a1 = block[base + l + 32];
         float a2 = block[base + l + 64];
         float a3 = block[base + l + 96];
-        if (SCALED) {
+        if (LOAD == LOAD_ROUTE) {
             a0 *= scale;
             a1 *= scale;
             a2 *= scale;
             a3 *= scale;
         } else {
-            (void)scale;
+            *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
+            a0 *= gain[base + l + 0];
+            a1 *= gain[base + l + 32];
+            a2 *= gain[base + l + 64];
+            a3 *= gain[base + l + 96];
         }
         yl[4 * l + 0] = a0;
         yl[4 * l + 1] = a1;
@@ -297,10 +328,11 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
                             device const block_q4_K * shexp_gate [[buffer(2)]],
                             device const block_q4_K * shexp_up [[buffer(3)]],
                             device const float * x [[buffer(4)]],
-                            device const int * ids [[buffer(5)]],
-                            device float * y [[buffer(6)]],
-                            device atomic_uint * faults [[buffer(7)]],
-                            constant PairArgs & args [[buffer(8)]],
+                            device const float * gain [[buffer(5)]],
+                            device const int * ids [[buffer(6)]],
+                            device float * y [[buffer(7)]],
+                            device atomic_uint * faults [[buffer(8)]],
+                            constant PairArgs & args [[buffer(9)]],
                             uint3 tgpig [[threadgroup_position_in_grid]],
                             ushort tiisg [[thread_index_in_simdgroup]],
                             ushort sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -321,7 +353,8 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
     int expert = 0;
     if (pair_expert(ids, slot, args.n_experts, expert)) {
         if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer);
+            pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer,
+                           BLOOMERY_FAULT_SITE_EXPERT_ID);
         }
         return;
     }
@@ -332,16 +365,27 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
         pair_rows(up, shexp_up, slot == BLOOMERY_EXPERT_SHARED, expert, args.rows, args.nblocks, row0);
     float sumg = 0.f;
     float sumu = 0.f;
+    float sum_sq = 0.f;
     for (int ib = ix; ib < (int)args.nblocks; ib += 4) {
         float yl[16];
         float yh[16];
         float4 sumy;
-        q4k_load<false>(x + (ulong)ib * QK_K, iq, ir, 1.f, yl, yh, sumy);
+        q4k_load<LOAD_NORM>(x + (ulong)ib * QK_K, gain + (ulong)ib * QK_K, iq, ir, 1.f, yl, yh,
+                            sumy, &sum_sq);
         sumg += q4k_partial(grow[ib], yl, yh, sumy, iq, ir);
         sumu += q4k_partial(urow[ib], yl, yh, sumy, iq, ir);
     }
-    float g = simd_sum(sumg);
-    float u = simd_sum(sumu);
+    const float sum_squares = simd_sum(sum_sq);
+    const float scale = rms_scale(sum_squares, args.nblocks * QK_K, args.eps);
+    if (!rms_usable(sum_squares, scale)) {
+        if (tiisg == 0u) {
+            pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer,
+                           BLOOMERY_FAULT_SITE_NORM_QUANT);
+        }
+        return;
+    }
+    float g = simd_sum(sumg) * scale;
+    float u = simd_sum(sumu) * scale;
     if (tiisg == 0u) {
         y[(ulong)slot * args.stride + (uint)row0] = pair_swiglu(g, u);
     }
@@ -352,10 +396,11 @@ kernel void q6k_pair_swiglu(device const block_q6_K * gate [[buffer(0)]],
                             device const block_q6_K * shexp_gate [[buffer(2)]],
                             device const block_q6_K * shexp_up [[buffer(3)]],
                             device const float * x [[buffer(4)]],
-                            device const int * ids [[buffer(5)]],
-                            device float * y [[buffer(6)]],
-                            device atomic_uint * faults [[buffer(7)]],
-                            constant PairArgs & args [[buffer(8)]],
+                            device const float * gain [[buffer(5)]],
+                            device const int * ids [[buffer(6)]],
+                            device float * y [[buffer(7)]],
+                            device atomic_uint * faults [[buffer(8)]],
+                            constant PairArgs & args [[buffer(9)]],
                             uint3 tgpig [[threadgroup_position_in_grid]],
                             ushort tiisg [[thread_index_in_simdgroup]],
                             ushort sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -376,7 +421,8 @@ kernel void q6k_pair_swiglu(device const block_q6_K * gate [[buffer(0)]],
     int expert = 0;
     if (pair_expert(ids, slot, args.n_experts, expert)) {
         if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer);
+            pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer,
+                           BLOOMERY_FAULT_SITE_EXPERT_ID);
         }
         return;
     }
@@ -387,14 +433,25 @@ kernel void q6k_pair_swiglu(device const block_q6_K * gate [[buffer(0)]],
         pair_rows(up, shexp_up, slot == BLOOMERY_EXPERT_SHARED, expert, args.rows, args.nblocks, row0);
     float sumg = 0.f;
     float sumu = 0.f;
+    float sum_sq = 0.f;
     for (int ib = ix; ib < (int)args.nblocks; ib += 2) {
         float yl[16];
-        q6k_load<false>(x + (ulong)ib * QK_K, ip, l0, 1.f, yl);
+        q6k_load<LOAD_NORM>(x + (ulong)ib * QK_K, gain + (ulong)ib * QK_K, ip, l0, 1.f, yl,
+                            &sum_sq);
         sumg += q6k_partial(grow[ib], yl, ip, l0);
         sumu += q6k_partial(urow[ib], yl, ip, l0);
     }
-    float g = simd_sum(sumg);
-    float u = simd_sum(sumu);
+    const float sum_squares = simd_sum(sum_sq);
+    const float scale = rms_scale(sum_squares, args.nblocks * QK_K, args.eps);
+    if (!rms_usable(sum_squares, scale)) {
+        if (tiisg == 0u) {
+            pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer,
+                           BLOOMERY_FAULT_SITE_NORM_QUANT);
+        }
+        return;
+    }
+    float g = simd_sum(sumg) * scale;
+    float u = simd_sum(sumu) * scale;
     if (tiisg == 0u) {
         y[(ulong)slot * args.stride + (uint)row0] = pair_swiglu(g, u);
     }
@@ -439,7 +496,7 @@ kernel void q4k_down_fold(device const block_q4_K * down [[buffer(0)]],
         float yl[16];
         float yh[16];
         float4 sumy;
-        q4k_load<true>(h + (ulong)ib * QK_K, iq, ir, scale, yl, yh, sumy);
+        q4k_load<LOAD_ROUTE>(h + (ulong)ib * QK_K, nullptr, iq, ir, scale, yl, yh, sumy, nullptr);
         device const block_q4_K * b0 =
             fold_block<block_q4_K>(down, shared, ids, args.rows, row0, ib);
         sum0 += q4k_partial(*b0, yl, yh, sumy, iq, ir);
@@ -494,7 +551,7 @@ kernel void q6k_down_fold(device const block_q6_K * down [[buffer(0)]],
     for (int ib = ix; ib < BLOOMERY_EXPERT_BLOCKS; ib += 2) {
         float scale = w[ib >> 1];
         float yl[16];
-        q6k_load<true>(h + (ulong)ib * QK_K, ip, l0, scale, yl);
+        q6k_load<LOAD_ROUTE>(h + (ulong)ib * QK_K, nullptr, ip, l0, scale, yl, nullptr);
         device const block_q6_K * b0 =
             fold_block<block_q6_K>(down, shared, ids, args.rows, row0, ib);
         sum0 += q6k_partial(*b0, yl, ip, l0);

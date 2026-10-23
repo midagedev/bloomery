@@ -121,6 +121,7 @@ scan_archpath() { # scan_archpath <path…>: rule ④'s hits into archpath
                "$@" --include='*.rs' | sort -u \
     | grep_answer check-arch -vE "$OWN" \
     | grep_answer check-arch -vE '^crates/gpu-gates/src/bin/' \
+    | grep_answer check-arch -vE '^crates/metal/src/bin/' \
     | grep_answer check-arch -vE '^[^:]+:[0-9]+:[[:space:]]*//') ||
     nov "4 cannot read $* (exit $?, above)"
 }

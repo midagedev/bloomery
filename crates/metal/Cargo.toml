@@ -18,6 +18,10 @@ name = "gate_metal_qwen35moe_kernels"
 path = "src/bin/gate_metal_qwen35moe_kernels.rs"
 
 [[bin]]
+name = "gate_metal_qwen35moe_e2e"
+path = "src/bin/gate_metal_qwen35moe_e2e.rs"
+
+[[bin]]
 name = "metal_matvec_time"
 path = "src/bin/metal_matvec_time.rs"
 
@@ -39,7 +43,12 @@ objc2-metal = { workspace = true, features = ["MTLFunctionConstantValues", "MTLD
 dispatch2 = { workspace = true }
 # The fixture's tensors and their dequantization: the kernel gate's oracle.
 bloomery-gguf = { path = "../gguf" }
-# Where the fixture file sits: the one owner of the fixture root and layout.
+# The session: the qwen35moe walk and plan it runs (`ChainOps`), and the
+# file's description the plan is read from.
+bloomery-chain.workspace = true
+bloomery-model = { path = "../model" }
+# Where the fixture file sits (the one owner of the fixture root and layout),
+# and the e2e gate's oracle: ik's reference sets, opened through their family.
 bloomery-refset = { path = "../refset" }
 
 [build-dependencies]
