@@ -24,23 +24,29 @@
 //! most 31 adds, whichever tree the language picks. The score multiplies by
 //! the exact scale `1/16`. The longest path from a product `q_i k_i` to the
 //! score is 40 roundings, so a score is off by at most
-//! `G(40) * scale * sum_i |q_i k_i|`, `G(n) = nU / (1 - nU)`, `U = 2^-24`.
-//! The library `exp` is taken as 4 ulp of a magnitude-1 f32
-//! (`4 * 2^-23 = 2^-21`) added to that score error. This exp premise is the
-//! first term to question when a clause misses: no source for Metal's
-//! precise `exp` bound was read.
+//! `Δ = G(40) * scale * sum_i |q_i k_i|`, `G(n) = nU / (1 - nU)`, `U = 2^-24`.
 //!
-//! Logits perturbed by at most `Δ` move the softmax weights by at most
-//! `exp(2Δ) - 1` relative (each weight and the partition can each slip by
-//! `exp(Δ)`). The online sum then adds one rounding per key, one rescale
-//! per tile and one per segment in the merge:
+//! Metal Shading Language Specification version 4.1, section 8.4, Table 8.1,
+//! row `exp`: at most 4 ulp. The build selects that table
+//! (`-fmetal-math-mode=safe`, `-fmetal-math-fp32-functions=precise`). One ulp
+//! of a normal is at most `2^-23` relative, so 4 ulp is `η = 2^-21` relative.
+//! Addition and division in the same table are correctly rounded.
+//!
+//! Two centered exps each slip by `exp(Δ)`, and each `exp` by `η`:
+//! `rel = exp(2Δ) * (1+η) * (1+η) - 1`. The online sum then adds one rounding
+//! per key, one rescale per tile and one per segment in the merge:
 //! `n_rescale = ceil(n_keys / 16) + segments`, and
-//! `θ = G(n_keys + n_rescale) + n_rescale * η` with `η` the exp term.
-//! Dimension `d` is held to
-//! `(exp(2Δ) - 1 + θ) * sum_j |v_jd|`, plus the absolute floor of one
-//! `f32::MIN_POSITIVE` per operation on that path. The reference softmax is
-//! f64. S = 1 and S > 1 are two evaluations of this band; the triangle
-//! through the reference is the sum of the two bounds.
+//! `θ = G(n_keys + n_rescale) + n_rescale * η`. Dimension `d` of the attention
+//! is held to `B = (rel + θ) * sum_j w_j |v_jd|`, `w` the f64 softmax weight.
+//!
+//! The stored value is `y = attn * σ(g)`, `σ(g) = 1 / (1 + exp(-g))`.
+//! `|Δσ| ≤ η σ (1-σ) + 2 U σ`: the exp's relative slip through `dσ/de * e`
+//! (`e / (1+e) = 1-σ`), then one correctly rounded add and one correctly
+//! rounded division. The product adds `U |y|`. The band is
+//! `|σ| B + |attn| |Δσ| + U |y|`, plus one `f32::MIN_POSITIVE` per operation
+//! on that path (the 40, one per key, one per rescale, the division by the
+//! weight sum, and four for the sigmoid and the product). The reference
+//! softmax and the reference sigmoid are f64.
 
 use bloomery_metal::kernels::{HEAD_DIM, ROT, SCALE, TILE};
 use gguf::quant::{f32_to_f16_bits, half_to_f32, quantize_q8_0};
@@ -48,8 +54,10 @@ use gguf::quant::{f32_to_f16_bits, half_to_f32, quantize_q8_0};
 const U: f64 = 1.0 / 16_777_216.0;
 /// Lane fmas, the SIMD-group sum, and the scale multiply.
 const DOT_OPS: usize = 8 + 31 + 1;
-/// 4 ulp of a magnitude-1 f32, as an absolute score error.
+/// 4 ulp of a normal, as a relative error: `4 * 2^-23`.
 const ETA: f64 = 1.0 / 2_097_152.0;
+/// The sigmoid and the product: exp, add, divide, multiply.
+const GATE_OPS: usize = 4;
 
 fn f64_usize(n: usize) -> f64 {
     f64::from(u32::try_from(n).expect("a band count fits u32"))
@@ -179,19 +187,16 @@ pub fn dequant_q8(codes: &[u32], scales: &[u16]) -> [f32; HEAD_DIM] {
     out
 }
 
-/// f64 attention of `q` over `keys` and `vals`: scale `1/16`, softmax, then
-/// the weighted values. The result is the attention context.
-pub fn attend(
-    q: &[f32; HEAD_DIM],
-    keys: &[[f32; HEAD_DIM]],
-    vals: &[[f32; HEAD_DIM]],
-) -> Result<[f64; HEAD_DIM], String> {
-    if keys.len() != vals.len() || keys.is_empty() {
-        return Err(format!(
-            "attention over {} keys and {} values",
-            keys.len(),
-            vals.len()
-        ));
+/// `1 / (1 + exp(-x))` in f64, the reference for the kernel's gate.
+#[must_use]
+pub fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// The f64 softmax weights of `q` over `keys`, summing to 1.
+fn softmax_weights(q: &[f32; HEAD_DIM], keys: &[[f32; HEAD_DIM]]) -> Result<Vec<f64>, String> {
+    if keys.is_empty() {
+        return Err("attention over no keys".to_string());
     }
     let scale = f64::from(SCALE);
     let mut scores = Vec::with_capacity(keys.len());
@@ -207,29 +212,62 @@ pub fn attend(
         }
         scores.push(s);
     }
-    let mut acc = [0.0f64; HEAD_DIM];
+    let mut weights = Vec::with_capacity(scores.len());
     let mut weight_sum = 0.0f64;
-    for (j, s) in scores.iter().enumerate() {
+    for s in &scores {
         let w = (s - m).exp();
         weight_sum += w;
-        for d in 0..HEAD_DIM {
-            acc[d] += w * f64::from(vals[j][d]);
-        }
+        weights.push(w);
     }
     if !weight_sum.is_finite() || weight_sum <= 0.0 {
         return Err("the softmax weight sum is empty".to_string());
     }
-    Ok(acc.map(|a| a / weight_sum))
+    for w in &mut weights {
+        *w /= weight_sum;
+    }
+    Ok(weights)
 }
 
-/// The absolute band per dimension, from the derivation above.
-#[must_use]
+/// f64 attention of `q` over `keys` and `vals`: scale `1/16`, softmax, then
+/// the weighted values. The result is the attention context, before the gate.
+pub fn attend(
+    q: &[f32; HEAD_DIM],
+    keys: &[[f32; HEAD_DIM]],
+    vals: &[[f32; HEAD_DIM]],
+) -> Result<[f64; HEAD_DIM], String> {
+    if keys.len() != vals.len() {
+        return Err(format!(
+            "attention over {} keys and {} values",
+            keys.len(),
+            vals.len()
+        ));
+    }
+    let weights = softmax_weights(q, keys)?;
+    let mut acc = [0.0f64; HEAD_DIM];
+    for (j, w) in weights.iter().enumerate() {
+        for d in 0..HEAD_DIM {
+            acc[d] += w * f64::from(vals[j][d]);
+        }
+    }
+    Ok(acc)
+}
+
+/// The absolute band per dimension of the gated output, from the derivation above.
 pub fn band(
     q: &[f32; HEAD_DIM],
     keys: &[[f32; HEAD_DIM]],
     vals: &[[f32; HEAD_DIM]],
+    gate: &[f32; HEAD_DIM],
     segments: usize,
-) -> [f64; HEAD_DIM] {
+) -> Result<[f64; HEAD_DIM], String> {
+    if keys.len() != vals.len() {
+        return Err(format!(
+            "the band over {} keys and {} values",
+            keys.len(),
+            vals.len()
+        ));
+    }
+    let weights = softmax_weights(q, keys)?;
     let scale = f64::from(SCALE);
     let g = gamma(DOT_OPS);
     let mut delta = 0.0f64;
@@ -243,20 +281,26 @@ pub fn band(
             delta = dj;
         }
     }
-    let err = delta + ETA;
-    let rel = (2.0 * err).exp() - 1.0;
+    let rel = (2.0 * delta).exp() * (1.0 + ETA) * (1.0 + ETA) - 1.0;
     let n_keys = keys.len();
     let n_rescale = n_keys.div_ceil(TILE) + segments;
     let theta = gamma(n_keys + n_rescale) + f64_usize(n_rescale) * ETA;
-    let ops = DOT_OPS + n_keys + n_rescale + 1;
+    let ops = DOT_OPS + n_keys + n_rescale + 1 + GATE_OPS;
     let floor = f64::from(f32::MIN_POSITIVE) * f64_usize(ops);
     let mut out = [0.0f64; HEAD_DIM];
     for (d, out) in out.iter_mut().enumerate() {
-        let mut mag = 0.0f64;
-        for v in vals {
-            mag += f64::from(v[d]).abs();
+        let mut weighted = 0.0f64;
+        let mut attn = 0.0f64;
+        for (j, v) in vals.iter().enumerate() {
+            let value = f64::from(v[d]);
+            weighted += weights[j] * value.abs();
+            attn += weights[j] * value;
         }
-        *out = (rel + theta) * mag + floor;
+        let sigma = sigmoid(f64::from(gate[d]));
+        let y = attn * sigma;
+        let d_sigma = ETA * sigma * (1.0 - sigma) + 2.0 * U * sigma;
+        let b_attn = (rel + theta) * weighted;
+        *out = sigma.abs() * b_attn + attn.abs() * d_sigma.abs() + U * y.abs() + floor;
     }
-    out
+    Ok(out)
 }

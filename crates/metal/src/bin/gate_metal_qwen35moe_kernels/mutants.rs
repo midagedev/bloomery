@@ -321,6 +321,52 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "attn_gate_s1",
+        clause: "attn-f16",
+        why: "one segment stores the attention without the gate",
+        edits: &[(
+            "float gated = attn * attn_sigmoid(g);",
+            "float gated = attn;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_gate_merge",
+        clause: "attn-f16",
+        why: "the merge stores the attention without the gate",
+        edits: &[(
+            "float merged = attn * attn_sigmoid(gate);",
+            "float merged = attn;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_s1_partials",
+        clause: "attn-f16",
+        why: "one segment writes partials and leaves the output untouched",
+        edits: &[("if (args.segments == 1u)", "if (args.segments == 0u)", 1)],
+    },
+    Mutant {
+        name: "attn_half",
+        clause: "attn-half",
+        why: "the hardware half conversion flips the low bit",
+        edits: &[(
+            "float y = float(as_type<half>(bits));",
+            "float y = float(as_type<half>(ushort(bits ^ 1u)));",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_bounds",
+        clause: "attn-bounds",
+        why: "every segment spans one tile, so a longer key count is only partly attended",
+        edits: &[(
+            "return per < BLOOMERY_ATTN_TILE ? BLOOMERY_ATTN_TILE : per;",
+            "return BLOOMERY_ATTN_TILE;",
+            1,
+        )],
+    },
+    Mutant {
         name: "head_logit",
         clause: "head_logit",
         why: "the stored logit is doubled",

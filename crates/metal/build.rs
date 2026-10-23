@@ -50,6 +50,15 @@ mod experts_geom {
     include!("src/kernels/experts_geom.rs");
 }
 
+/// Decode attention's geometry, from the file the host module reads.
+#[allow(
+    dead_code,
+    reason = "the host module reads every constant; the header emits the ones the kernel reads"
+)]
+mod attention_geom {
+    include!("src/kernels/attention_geom.rs");
+}
+
 /// The fault site's table, written as the Metal compiler sees it.
 fn fault_sites_header() -> String {
     let mut out = String::from(
@@ -105,7 +114,20 @@ fn geometry_header() -> String {
          #define BLOOMERY_EXPERT_ROUTED {erouted}\n\
          #define BLOOMERY_EXPERT_SHARED {eshared}\n\
          #define BLOOMERY_EXPERT_K {ek}\n\
-         #define BLOOMERY_EXPERT_BLOCKS {eblocks}\n",
+         #define BLOOMERY_EXPERT_BLOCKS {eblocks}\n\
+         // Decode attention, from src/kernels/attention_geom.rs.\n\
+         #define BLOOMERY_ATTN_HEAD {ahead}\n\
+         #define BLOOMERY_ATTN_ROT {arot}\n\
+         #define BLOOMERY_ATTN_Q {aq}\n\
+         #define BLOOMERY_ATTN_KV {akv}\n\
+         #define BLOOMERY_ATTN_TILE {atile}\n\
+         #define BLOOMERY_ATTN_SG {asg}\n\
+         #define BLOOMERY_ATTN_HPT {ahpt}\n\
+         #define BLOOMERY_ATTN_GQA {agqa}\n\
+         #define BLOOMERY_ATTN_PARTIAL {apartial}\n\
+         #define BLOOMERY_ATTN_QG {aqg}\n\
+         #define BLOOMERY_ATTN_LANES {alanes}\n\
+         #define BLOOMERY_ATTN_THREADS {athreads}\n",
         rows = geometry::ROWS_PER_SIMD_GROUP,
         segs = geometry::MAX_SEGMENTS,
         heads = geometry::VALUE_HEADS,
@@ -126,6 +148,18 @@ fn geometry_header() -> String {
         eshared = experts_geom::SHARED_SLOT,
         ek = experts_geom::EXPERT_K,
         eblocks = experts_geom::FOLDED_BLOCKS,
+        ahead = attention_geom::HEAD_DIM,
+        arot = attention_geom::ROT,
+        aq = attention_geom::QUERY_HEADS,
+        akv = attention_geom::KV_HEADS,
+        atile = attention_geom::TILE,
+        asg = attention_geom::SIMD_GROUPS,
+        ahpt = attention_geom::HEADS_PER_SG,
+        agqa = attention_geom::GQA,
+        apartial = attention_geom::PARTIAL_ELEMS,
+        aqg = attention_geom::QG_STRIDE,
+        alanes = attention_geom::SIMD_WIDTH,
+        athreads = attention_geom::FLASH_THREADS,
     )
 }
 
@@ -200,6 +234,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/kernels/delta_geom.rs");
     println!("cargo:rerun-if-changed=src/kernels/router_geom.rs");
     println!("cargo:rerun-if-changed=src/kernels/experts_geom.rs");
+    println!("cargo:rerun-if-changed=src/kernels/attention_geom.rs");
     println!("cargo:rerun-if-changed=build.rs");
     // Installing the Metal Toolchain (or pointing at another one) changes
     // what `xcrun` answers: the build runs again.

@@ -19,6 +19,7 @@
 //! The head ([`head`]) is one more pipeline: `kernels/head.metal`, the same ticket.
 
 mod attention;
+use crate::attention_geom;
 mod delta;
 mod embed;
 mod experts;
@@ -30,8 +31,9 @@ pub mod router;
 mod seg;
 
 pub use attention::{
-    AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QUERY_HEADS, ROT, SCALE, TILE, f16_len,
-    out_len, partials_len, q8_code_len, q8_scale_len,
+    AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, QG_STRIDE, QUERY_HEADS, ROT, SCALE,
+    SEGMENT_KEYS, TILE, attention_dispatches, f16_len, out_len, partials_len, q8_code_len,
+    q8_scale_len, qg_len, segments_for_keys,
 };
 pub use delta::CONV_TAPS;
 pub use delta::DeltaParams;
