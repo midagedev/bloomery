@@ -26,6 +26,14 @@
 //! 10. **census_driver**: the census names an integrated device whose total is
 //!     the driver's working set and no more than the machine's memory.
 //! 11. **macos_floor**: a macOS below 26.2 is refused by name.
+//! 12. **concurrent_independent**: one concurrent encoder runs two copies
+//!     over four distinct buffers, with no barrier between them; each output
+//!     equals the bytes uploaded to its source. No pipeline, no threads and a
+//!     value of no bytes are refused on that encoder, and a refusal encodes
+//!     nothing.
+//! 13. **concurrent_barrier**: one concurrent encoder copies a pattern into a
+//!     middle buffer, encodes a memory barrier, then copies the middle buffer
+//!     to the output; the output equals the pattern.
 
 use core::sync::atomic::Ordering;
 use std::process::ExitCode;
@@ -44,7 +52,7 @@ use objc2_metal::MTLDevice;
 use bloomery_metal::buffer::{MetalBuffer, MetalShared};
 use bloomery_metal::census::MetalCensus;
 use bloomery_metal::device::{MetalDevice, require_macos};
-use bloomery_metal::encode::{Binding, MAX_BINDINGS, MAX_BYTES_BINDING};
+use bloomery_metal::encode::{Binding, ComputeEncoder, MAX_BINDINGS, MAX_BYTES_BINDING};
 use bloomery_metal::library::{Library, Pipeline};
 use bloomery_metal::stream::{HostEvent, MetalStream};
 
@@ -55,6 +63,9 @@ const SPIN: u32 = 1 << 22;
 
 /// The largest group a gate dispatch asks for.
 const GROUP: usize = 64;
+
+/// How many f32s the concurrent clauses copy.
+const CONCURRENT_LEN: usize = 1 << 20;
 
 /// Encode one dispatch of `pipeline` over `bindings` (slot = position) and
 /// submit it; it does not wait.
@@ -562,6 +573,146 @@ fn census_driver(device: &MetalDevice) -> Clause {
     Ok(Verdict::Pass)
 }
 
+/// One `copy_f32` dispatch: `src` into `dst`, `threads` of them, groups of
+/// [`GROUP`].
+fn encode_copy(
+    encoder: &mut ComputeEncoder<'_>,
+    dst: &WindowMut<'_, f32, MetalDevice>,
+    src: &Window<'_, f32, MetalDevice>,
+    count: &[u8],
+    threads: usize,
+) -> Result<(), DeviceError> {
+    encoder.set_binding(0, Binding::of_mut(dst)?)?;
+    encoder.set_binding(1, Binding::of(src)?)?;
+    encoder.set_binding(2, Binding::bytes(count)?)?;
+    encoder.dispatch(threads, GROUP)
+}
+
+/// `got` against `want`, bit for bit. The first difference names how many differ.
+fn same_bits(got: &[f32], want: &[f32]) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!(
+            "{} values came back, not {}",
+            got.len(),
+            want.len()
+        ));
+    }
+    let mut differ = 0usize;
+    let mut first = None;
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        if g.to_bits() != w.to_bits() {
+            if first.is_none() {
+                first = Some((i, *g, *w));
+            }
+            differ += 1;
+        }
+    }
+    match first {
+        None => Ok(()),
+        Some((i, g, w)) => Err(format!(
+            "element {i} is {g}, not {w}; {differ} of {} differ",
+            got.len()
+        )),
+    }
+}
+
+/// The values a concurrent clause uploads: index `i` as f32, or that value
+/// negated.
+fn ramp(n: usize, neg: bool) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let x = i as f32;
+            if neg { -x - 1.0 } else { x }
+        })
+        .collect()
+}
+
+/// The buffer's f32s, once `stream`'s work is done.
+fn read_f32(
+    device: &MetalDevice,
+    stream: &MetalStream,
+    buffer: &MetalBuffer<f32>,
+) -> Result<Vec<f32>, String> {
+    let mut got = vec![0.0f32; buffer.len().get()];
+    device
+        .read(stream, buffer.whole().map_err(why)?, &mut got)
+        .map_err(why)?;
+    Ok(got)
+}
+
+/// Two independent copies on one concurrent encoder, and the refusals that
+/// encode nothing.
+fn concurrent_independent(device: &MetalDevice) -> Clause {
+    let n = CONCURRENT_LEN;
+    let stream = device.stream();
+    let pipeline = device.pipeline("copy_f32").map_err(why)?;
+    let count = count_bytes(n).map_err(why)?;
+    let pat_a = ramp(n, false);
+    let pat_b = ramp(n, true);
+    let src_a = device.upload(stream, &pat_a).map_err(why)?;
+    let src_b = device.upload(stream, &pat_b).map_err(why)?;
+    let mut dst_a = device.zeroed::<f32>(stream, Elems(n)).map_err(why)?;
+    let mut dst_b = device.zeroed::<f32>(stream, Elems(n)).map_err(why)?;
+
+    let mut recording = stream.begin().map_err(why)?;
+    {
+        let mut encoder = recording.compute_encoder_concurrent().map_err(why)?;
+        expect_range(Binding::bytes(&[]), "binding", "0 bytes")?;
+        expect_range(encoder.dispatch(n, GROUP), "dispatch", "no pipeline")?;
+        encoder.set_pipeline(&pipeline);
+        expect_range(encoder.dispatch(0, GROUP), "dispatch", "0 threads")?;
+        {
+            let dst = dst_a.whole_mut().map_err(why)?;
+            let src = src_a.whole().map_err(why)?;
+            encode_copy(&mut encoder, &dst, &src, &count, n).map_err(why)?;
+        }
+        {
+            let dst = dst_b.whole_mut().map_err(why)?;
+            let src = src_b.whole().map_err(why)?;
+            encode_copy(&mut encoder, &dst, &src, &count, n).map_err(why)?;
+        }
+        encoder.end();
+    }
+    stream.submit(recording).map_err(why)?;
+    same_bits(&read_f32(device, stream, &dst_a)?, &pat_a)?;
+    same_bits(&read_f32(device, stream, &dst_b)?, &pat_b)?;
+    Ok(Verdict::Pass)
+}
+
+/// A dependent pair on one concurrent encoder: the pattern into a middle
+/// buffer, a barrier, then the middle buffer to the output.
+fn concurrent_barrier(device: &MetalDevice) -> Clause {
+    let n = CONCURRENT_LEN;
+    let stream = device.stream();
+    let pipeline = device.pipeline("copy_f32").map_err(why)?;
+    let count = count_bytes(n).map_err(why)?;
+    let pattern = ramp(n, false);
+    let src = device.upload(stream, &pattern).map_err(why)?;
+    let mut middle = device.zeroed::<f32>(stream, Elems(n)).map_err(why)?;
+    let mut out = device.zeroed::<f32>(stream, Elems(n)).map_err(why)?;
+
+    let mut recording = stream.begin().map_err(why)?;
+    {
+        let mut encoder = recording.compute_encoder_concurrent().map_err(why)?;
+        encoder.set_pipeline(&pipeline);
+        {
+            let dst = middle.whole_mut().map_err(why)?;
+            let from = src.whole().map_err(why)?;
+            encode_copy(&mut encoder, &dst, &from, &count, n).map_err(why)?;
+        }
+        encoder.memory_barrier();
+        {
+            let dst = out.whole_mut().map_err(why)?;
+            let from = middle.whole().map_err(why)?;
+            encode_copy(&mut encoder, &dst, &from, &count, n).map_err(why)?;
+        }
+        encoder.end();
+    }
+    stream.submit(recording).map_err(why)?;
+    same_bits(&read_f32(device, stream, &out)?, &pattern)?;
+    Ok(Verdict::Pass)
+}
+
 fn macos_floor() -> Clause {
     for (major, minor, patch) in [(26, 1, 9), (15, 0, 0), (0, 0, 0)] {
         match require_macos(major, minor, patch) {
@@ -625,5 +776,7 @@ pub fn main() -> ExitCode {
     report.clause("metallib_equals_source", metallib_equals_source(device));
     report.clause("census_driver", census_driver(device));
     report.clause("macos_floor", macos_floor());
+    report.clause("concurrent_independent", concurrent_independent(device));
+    report.clause("concurrent_barrier", concurrent_barrier(device));
     report.finish("gate_metal_device")
 }

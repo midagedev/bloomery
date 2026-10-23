@@ -81,6 +81,14 @@ impl Recording<'_> {
     pub fn compute_encoder(&mut self) -> Result<ComputeEncoder<'_>, DeviceError> {
         ComputeEncoder::new(&self.buffer)
     }
+
+    /// A compute encoder whose dispatches may overlap, on the recording's
+    /// command buffer. The recording is borrowed exclusively while the
+    /// encoder lives, as for [`Recording::compute_encoder`], and it cannot
+    /// be submitted until the encoder ends.
+    pub fn compute_encoder_concurrent(&mut self) -> Result<ComputeEncoder<'_>, DeviceError> {
+        ComputeEncoder::concurrent(&self.buffer)
+    }
 }
 
 impl MetalStream {
