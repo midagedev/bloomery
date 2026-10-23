@@ -8,7 +8,8 @@
 //   q4k_matvec_seg            the row segments of up to four tensors of one
 //                             type and one width, in one dispatch
 //   q4k_matvec_headnorm_resid y = y + W . (g * head_scale): the gated delta
-//                             net's out projection, the head scale on the load
+//                             net's out projection, the head scale applied to
+//                             each block's head groups
 //
 // Adapted from llama.cpp's kernel_mul_mv_q4_K_f32 (MIT licence; see
 // THIRD_PARTY_NOTICES.md):
@@ -56,9 +57,10 @@ inline int simd_first_row(uint tg, ushort sg) {
 }
 
 // The rows of one segment or one tensor a threadgroup owns. The norm scales
-// the whole input at the end, the head norm scales every value on the load,
-// and the residual adds into the output: the dot product is the same in all
-// of them, so the rows they write are the same bits.
+// the whole input at the end, the head norm scales each block's two head
+// groups once at the end of the block, and the residual adds into the
+// output: the dot product is the same in all of them, so the rows they write
+// are the same bits.
 template <bool NORM, bool RESID, bool HEADNORM>
 inline void q4k_rows(device const block_q4_K * W,
                       device const float      * x,
@@ -121,18 +123,6 @@ inline void q4k_rows(device const block_q4_K * W,
             float a1 = y4[i+ 32];
             float a2 = y4[i+128];
             float a3 = y4[i+160];
-            if (HEADNORM) {
-                // A value the gated numerator cannot carry: the gate's site
-                // is raised, and the sum it is in is not finite either, so
-                // the row is NaN.
-                if (!isfinite(a0) || !isfinite(a1) || !isfinite(a2) || !isfinite(a3)) {
-                    raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
-                }
-                a0 *= lo;
-                a1 *= lo;
-                a2 *= hi;
-                a3 *= hi;
-            }
             if (NORM) {
                 sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
                 a0 *= g4[i+  0];
@@ -144,6 +134,13 @@ inline void q4k_rows(device const block_q4_K * W,
             yl[i+8] = a1; sumy[1] += a1;
             yh[i+0] = a2; sumy[2] += a2;
             yh[i+8] = a3; sumy[3] += a3;
+        }
+        // A value the gated numerator cannot carry, or a group sum that left
+        // the finite range: the gate's site is raised, and the sums it is in
+        // are not finite either, so the rows are NaN.
+        if (HEADNORM && (!isfinite(sumy[0]) || !isfinite(sumy[1]) ||
+                         !isfinite(sumy[2]) || !isfinite(sumy[3]))) {
+            raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
         }
 
         for (short row = 0; row < NR0; ++row) {
@@ -172,12 +169,23 @@ inline void q4k_rows(device const block_q4_K * W,
                 acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
             }
 
-            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
-                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
-                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
-                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
-                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
-                                  sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            // The head scale multiplies each group's whole term once, not
+            // every value in it: the dot is linear in the input.
+            if (HEADNORM) {
+                sumf[row] += lo * (dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                            (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f) -
+                                   dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3])) +
+                             hi * (dh[0] * ((acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                            (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                                   dh[1] * (sumy[2] * sc8[6] + sumy[3] * sc8[7]));
+            } else {
+                sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                      (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                      (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                      (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                             dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
+                                      sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            }
         }
 
         y4 += 4 * QK_K;
@@ -285,7 +293,11 @@ kernel void q4k_matvec_seg(device const block_q4_K * W [[buffer(0)]],
 
 // The gated delta net's out projection: the input is the gated numerator g
 // times the norm scale of the head each column belongs to, and the scale comes
-// from the head's partial sums of the squares of its values.
+// from the head's partial sums of the squares of its values. The scales are
+// computed once per threadgroup; the row loop reads g from device memory the
+// way the plain residual path reads its input, and multiplies each block's two
+// head groups by their scale once, so the per-value work the plain path does
+// not do is two threadgroup loads and two products a block.
 kernel void q4k_matvec_headnorm_resid(device const block_q4_K * W [[buffer(0)]],
                                       device const float      * g [[buffer(1)]],
                                       device const float      * partials [[buffer(2)]],

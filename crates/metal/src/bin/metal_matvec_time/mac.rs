@@ -38,6 +38,16 @@
 //! between each. `cb_us` on those two is (chain buffer time − N × lone
 //! time) / N, from the medians.
 //!
+//! Beside the router and the head-normed mat-vec, the probe times their
+//! phase cuts: a copy of the shipped source with one counted text edit, the
+//! way the kernels gate compiles its mutants, compiled by the runtime and
+//! launched by the same host module. A row whose shape ends in `[name]` is
+//! that cut: the router without its fused norm's input pass and without its
+//! tail, the head-normed mat-vec with the scales precomputed. The cut is a
+//! development instrument, not a kernel: the edit's find text must occur
+//! exactly as often as named, so a kernel edit that moves it is a named
+//! error, not a silent no-op.
+//!
 //! Router and head rows also carry the time their weight bytes take at the
 //! stream bandwidth measured in this run — the `window` arm of `q4k
 //! 8192x4096`, run for that purpose when the selection does not already
@@ -63,6 +73,7 @@ use bloomery_metal::kernels::{
     Kernels, MatvecParams, Mode, NormOnLoad, PARTIALS_PER_HEAD, Quant, SegParams, Segment,
     VALUE_HEADS,
 };
+use bloomery_metal::library::{Library, SOURCE};
 use bloomery_metal::{GpuInterval, MetalStream};
 
 #[path = "../shared/oracle.rs"]
@@ -146,6 +157,8 @@ enum Shape {
         quant: Quant,
         rows: usize,
         cols: usize,
+        /// Whether the launch adds into its output: the residual epilogue.
+        resid: bool,
     },
     /// A segmented mat-vec: the row segments of several tensors of one type
     /// and one width, in one dispatch.
@@ -197,7 +210,9 @@ impl Shape {
     /// The bytes a dispatch streams: its weights.
     fn bytes(&self) -> usize {
         match self {
-            Self::Matvec { quant, rows, cols } => rows * cols / BLOCK_VALUES * quant.block_bytes(),
+            Self::Matvec {
+                quant, rows, cols, ..
+            } => rows * cols / BLOCK_VALUES * quant.block_bytes(),
             Self::Seg {
                 quant,
                 cols,
@@ -241,6 +256,17 @@ fn other_shapes() -> Vec<(&'static str, Shape)> {
             Shape::HeadNorm {
                 rows: 2048,
                 cols: 4096,
+            },
+        ),
+        // The attention output projection's shape: the plain Q4_K residual
+        // mat-vec beside the head-normed one, the same weights stream.
+        (
+            "matvec q4k 2048x4096 resid",
+            Shape::Matvec {
+                quant: Quant::Q4K,
+                rows: 2048,
+                cols: 4096,
+                resid: true,
             },
         ),
     ]
@@ -509,7 +535,12 @@ fn time_shape(
                 .map_err(why)?;
             let out = y.window_mut(Elems(n * rows), Elems(rows)).map_err(why)?;
             match shape {
-                Shape::Matvec { quant, rows, cols } => {
+                Shape::Matvec {
+                    quant,
+                    rows,
+                    cols,
+                    resid,
+                } => {
                     kernels
                         .matvec(
                             encoder,
@@ -520,7 +551,7 @@ fn time_shape(
                                 weights: w,
                                 x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
                                 y: out,
-                                mode: Mode::Store,
+                                mode: if *resid { Mode::Residual } else { Mode::Store },
                             },
                         )
                         .map_err(why)?;
@@ -585,7 +616,7 @@ fn time_shape(
             ));
         }
     }
-    if check && matches!(shape, Shape::Matvec { .. }) {
+    if check && matches!(shape, Shape::Matvec { resid: false, .. }) {
         let x64: Vec<f64> = x_values.iter().map(|&v| f64::from(v)).collect();
         let reference = oracle::reference(quant, &one, rows, cols, &x64)?;
         let band = oracle::band(quant, cols / BLOCK_VALUES, oracle::Kind::Store);
@@ -641,6 +672,62 @@ fn ticket_and_fault(
     }
     Ok(())
 }
+
+/// One counted text edit of the kernels' source: a phase cut's copy, the way
+/// the gate's mutants edit theirs. The find text must occur exactly once, so
+/// a kernel edit that moves it is a named error, not a silent no-op.
+struct Phase {
+    name: &'static str,
+    find: &'static str,
+    with: &'static str,
+}
+
+/// The kernels of a phase cut's copy of the shipped source, compiled by the
+/// runtime.
+fn phase_kernels(device: &MetalDevice, phase: &Phase) -> Result<Kernels, String> {
+    let found = SOURCE.matches(phase.find).count();
+    if found != 1 {
+        return Err(format!(
+            "phase {}: its find text occurs {found} times, not 1; the kernel moved",
+            phase.name
+        ));
+    }
+    let text = SOURCE.replacen(phase.find, phase.with, 1);
+    let library = Library::from_source_text(device, &text).map_err(why)?;
+    Kernels::from_library(&library).map_err(why)
+}
+
+/// The router's phase cuts: the norm's load pass (the gained input a constant,
+/// the squares skipped; the reduction stays), and the tail (the last
+/// threadgroup resets its ticket and selects nothing).
+const ROUTER_PHASES: &[Phase] = &[
+    Phase {
+        name: "nonorm",
+        find: "    float sum_sq = 0.f;\n    for (uint i = 0u; i < ROUTER_K / 4u / ROUTER_THREADS; ++i) {\n        const uint f4 = tid + ROUTER_THREADS * i;\n        float4 xv = router_load4(x, f4);\n        float4 gv = router_load4(gain, f4);\n        tg_h[f4] = xv * gv;\n        sum_sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;\n    }",
+        with: "    float sum_sq = 0.f;\n    for (uint i = 0u; i < ROUTER_K / 4u / ROUTER_THREADS; ++i) {\n        const uint f4 = tid + ROUTER_THREADS * i;\n        tg_h[f4] = 1.f;\n    }",
+    },
+    Phase {
+        name: "notail",
+        find: "    ticket_is_last(ticket, groups, tid, last_flag);\n    if (last_flag == 1u) {\n        route_last(partials, ticket, logits, ids, weights, faults, args,\n                   tid, lane, sg_in_tg, tg_logits, tg_keys, tg_bad);\n    }\n",
+        with: "    ticket_is_last(ticket, groups, tid, last_flag);\n    if (last_flag == 1u && tid == 0u) {\n        ticket_reset(ticket);\n    }\n",
+    },
+];
+
+/// The head-normed mat-vec's phase cuts: the scales precomputed by the
+/// producer (the pass reads them, the barrier stays), and the apply cut (the
+/// row loop the plain residual path runs: no head scale on the block).
+const HEADNORM_PHASES: &[Phase] = &[
+    Phase {
+        name: "pre",
+        find: "    threadgroup float scales[BLOOMERY_DELTA_VALUE_HEADS];\n    if (sgitg == 0 && tiisg < BLOOMERY_DELTA_VALUE_HEADS) {\n        const uint head = tiisg;\n        float sum = 0.f;\n        for (short j = 0; j < BLOOMERY_DELTA_COLUMN_BLOCKS; ++j) {\n            sum += partials[head * BLOOMERY_DELTA_COLUMN_BLOCKS + j];\n        }\n        const float mean = sum / float(BLOOMERY_DELTA_HEAD_COLS);\n        const float s = rsqrt(mean + args.eps);\n        if (!isfinite(sum) || !isfinite(s)) {\n            // A head the norm cannot take is NaN, not a zero head: its values\n            // are then not finite and the rows that read them are NaN.\n            raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);\n            scales[head] = NAN;\n        } else {\n            scales[head] = s;\n        }\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+        with: "    threadgroup float scales[BLOOMERY_DELTA_VALUE_HEADS];\n    if (sgitg == 0 && tiisg < BLOOMERY_DELTA_VALUE_HEADS) {\n        scales[tiisg] = partials[tiisg];\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+    },
+    Phase {
+        name: "noapply",
+        find: "    threadgroup float scales[BLOOMERY_DELTA_VALUE_HEADS];\n    if (sgitg == 0 && tiisg < BLOOMERY_DELTA_VALUE_HEADS) {\n        const uint head = tiisg;\n        float sum = 0.f;\n        for (short j = 0; j < BLOOMERY_DELTA_COLUMN_BLOCKS; ++j) {\n            sum += partials[head * BLOOMERY_DELTA_COLUMN_BLOCKS + j];\n        }\n        const float mean = sum / float(BLOOMERY_DELTA_HEAD_COLS);\n        const float s = rsqrt(mean + args.eps);\n        if (!isfinite(sum) || !isfinite(s)) {\n            // A head the norm cannot take is NaN, not a zero head: its values\n            // are then not finite and the rows that read them are NaN.\n            raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);\n            scales[head] = NAN;\n        } else {\n            scales[head] = s;\n        }\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n\n    const int first_row = simd_first_row(tgpig.x, sgitg);\n    q4k_rows<false, true, true>(W, g, y, args.nblocks, args.eps, args.layer,\n                                nullptr, scales, faults, first_row, (int)args.rows, tiisg);",
+        with: "    const int first_row = simd_first_row(tgpig.x, sgitg);\n    q4k_rows<false, true, false>(W, g, y, args.nblocks, args.eps, args.layer,\n                                 nullptr, nullptr, faults, first_row, (int)args.rows, tiisg);",
+    },
+];
 
 fn time_router(
     device: &MetalDevice,
@@ -895,6 +982,7 @@ fn stream_shape() -> Shape {
         quant: Quant::Q4K,
         rows: 8192,
         cols: 4096,
+        resid: false,
     }
 }
 
@@ -1182,7 +1270,12 @@ pub fn main() -> ExitCode {
         for (rows, cols) in SHAPES {
             shapes.push((
                 format!("matvec {} {rows}x{cols}", quant.name()),
-                Shape::Matvec { quant, rows, cols },
+                Shape::Matvec {
+                    quant,
+                    rows,
+                    cols,
+                    resid: false,
+                },
             ));
         }
     }
@@ -1244,6 +1337,48 @@ pub fn main() -> ExitCode {
         }
     }
 
+    // The head-normed mat-vec's phase cuts, beside its own row: the scales
+    // precomputed by the producer, and the apply cut down to the plain
+    // residual path.
+    let headnorm_shape = Shape::HeadNorm {
+        rows: 2048,
+        cols: 4096,
+    };
+    if selects(&run.only, "headnorm", Quant::Q4K.name(), "headnorm out") {
+        for phase in HEADNORM_PHASES {
+            let phase_kernels = match phase_kernels(&device, phase) {
+                Ok(kernels) => kernels,
+                Err(e) => {
+                    println!("phase {}: FAIL ({e})", phase.name);
+                    failed = true;
+                    continue;
+                }
+            };
+            let outcome = time_arms(
+                &run,
+                "headnorm",
+                &format!("headnorm out 2048x4096 [{}]", phase.name),
+                headnorm_shape.bytes(),
+                None,
+                None,
+                |arm| {
+                    time_shape(
+                        &device,
+                        &phase_kernels,
+                        &headnorm_shape,
+                        arm,
+                        run.trials,
+                        false,
+                    )
+                },
+            );
+            failed |= outcome.failed;
+            if outcome.stuck {
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     let router_label = format!(
         "router35 {}x{} f32 top{}",
         router::ROWS,
@@ -1263,6 +1398,29 @@ pub fn main() -> ExitCode {
         failed |= outcome.failed;
         if outcome.stuck {
             return ExitCode::FAILURE;
+        }
+        for phase in ROUTER_PHASES {
+            let phase_kernels = match phase_kernels(&device, phase) {
+                Ok(kernels) => kernels,
+                Err(e) => {
+                    println!("phase {}: FAIL ({e})", phase.name);
+                    failed = true;
+                    continue;
+                }
+            };
+            let outcome = time_arms(
+                &run,
+                "router",
+                &format!("{router_label} [{}]", phase.name),
+                ROUTER_BYTES,
+                Some(ROUTER_TAIL_US),
+                stream_gbps,
+                |arm| time_router(&device, &phase_kernels, arm, run.trials),
+            );
+            failed |= outcome.failed;
+            if outcome.stuck {
+                return ExitCode::FAILURE;
+            }
         }
     }
     let head_label = format!("q6k_head_argmax {HEAD_VOCAB}x{HEAD_K} q6k");

@@ -59,8 +59,9 @@
 //! library `rsqrt`'s own error (`RSQRT_ULP` units in the last place, as in the
 //! norm above).
 //!
-//! The scale multiplies the value on the load, so its product joins the path
-//! (1) and the gated numerator is the input and is exact: the mat-vec's path
+//! The scale multiplies each block's two head groups once at the end of the
+//! block (the dot is linear in the input), so its product joins the path (1)
+//! and the gated numerator is the input and is exact: the mat-vec's path
 //! grows by one operation, `G(n_store + 1)`. The scale's own error is a
 //! relative error of every term, so it enters the band the same way the norm's
 //! does: the factor is `theta_s + g + theta_s * g` with `g = G(n_store + 1)`.
@@ -206,8 +207,8 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
             let n_s = heads.partials_per_head - 1 + 1;
             let t = gamma(n_s);
             let theta_s = (1.0 - t).powf(-0.5) - 1.0 + RSQRT_ULP * 2.0 * U;
-            // The scale multiplies the value on the load, so its product
-            // joins the path; the gated numerator is the input and is exact.
+            // The scale multiplies each block's two head groups once, so
+            // its product joins the path; the numerator is the input.
             let g = gamma(n_store + 1);
             Band {
                 factor: theta_s + g + theta_s * g,

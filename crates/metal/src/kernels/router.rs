@@ -1,4 +1,5 @@
-//! The launch of the router: 257 rows of K 2048, split two ways, one dispatch.
+//! The launch of the router: 257 rows of K 2048, one row a SIMD group, one
+//! dispatch.
 //!
 //! The kernel is `kernels/router.metal`. A launch checks the shape, every
 //! window's length and the alignment of the windows the kernel loads as
@@ -17,8 +18,8 @@ use super::{Kernels, check_window_len, pack, word};
 const WHAT: &str = "router";
 
 const _: () = assert!(PARTIALS == ROWS * SPLIT);
-const _: () = assert!(GROUPS == 129);
-const _: () = assert!(THREADS == 128);
+const _: () = assert!(GROUPS == 33);
+const _: () = assert!(THREADS == 256);
 const _: () = assert!(SIMD_WIDTH * FLOAT4S * 4 == K / SPLIT);
 const _: () = assert!(SIMD_WIDTH * FLOAT4S * SPLIT * 4 == K);
 const _: () = assert!(SIMD_WIDTH == super::geometry::SIMD_WIDTH);
