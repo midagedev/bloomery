@@ -614,6 +614,78 @@ fn a_fixture_set_of_another_file_name_is_stale() -> Result<(), RefError> {
     remove(&set)
 }
 
+/// A draft set of the fixture MTP family whose `# draft_model` names a copy
+/// of the draft file at another root is current: the draft of a fixture
+/// family is named like the real draft's file, and its identity is that file
+/// name (the generation is the `# fixture` line's, checked before it).
+#[test]
+fn a_fixture_draft_from_another_root_is_current_by_its_name() -> Result<(), RefError> {
+    let root = temp("draft-root")?;
+    let set = temp("draft-set")?;
+    let u = under("fx-mtp-qwen4exp", "mtp-qwen4exp")?;
+    let (arch, build) = (u.arch, u.build);
+    let first = root_with(&root, arch, &fixture_kvs(1))?;
+    let ours = line(Path::new(&first))?;
+    let real_draft = family("mtp-qwen4exp").draft_runs.expect("a draft file")()?;
+    let name = real_draft
+        .rsplit_once('/')
+        .map_or(real_draft.as_str(), |(_, n)| n);
+    let dir = first.rsplit_once('/').map(|(d, _)| d).expect("a directory");
+    let draft = format!("{dir}/{name}");
+    std::fs::write(&draft, b"").map_err(|e| RefError::missing(&draft, e.to_string()))?;
+    let elsewhere = format!("/models/fixtures/{arch}/{name}");
+    assert_ne!(elsewhere, draft);
+
+    write_mtp_set(
+        &set,
+        arch,
+        &first,
+        Some(&elsewhere),
+        Some(body(&ours)),
+        build,
+    );
+    let p = open(u.family, &root, &set)?;
+    assert_eq!(p.draft.as_deref(), Some(elsewhere.as_str()));
+
+    remove(&root)?;
+    remove(&set)
+}
+
+/// A draft set of the fixture MTP family whose `# draft_model` names a file
+/// of another name than the draft the tree runs is stale on the file name,
+/// naming both paths, even when its `# fixture` line is the run file's.
+#[test]
+fn a_fixture_draft_of_another_file_name_is_stale() -> Result<(), RefError> {
+    let root = temp("draft-name-root")?;
+    let set = temp("draft-name-set")?;
+    let u = under("fx-mtp-qwen4exp", "mtp-qwen4exp")?;
+    let (arch, build) = (u.arch, u.build);
+    let first = root_with(&root, arch, &fixture_kvs(1))?;
+    let ours = line(Path::new(&first))?;
+    let real_draft = family("mtp-qwen4exp").draft_runs.expect("a draft file")()?;
+    let name = real_draft
+        .rsplit_once('/')
+        .map_or(real_draft.as_str(), |(_, n)| n);
+    let dir = first.rsplit_once('/').map(|(d, _)| d).expect("a directory");
+    let draft = format!("{dir}/{name}");
+    std::fs::write(&draft, b"").map_err(|e| RefError::missing(&draft, e.to_string()))?;
+    let other = format!("{dir}/other-draft.gguf");
+
+    write_mtp_set(&set, arch, &first, Some(&other), Some(body(&ours)), build);
+    let e = open(u.family, &root, &set).expect_err("another draft name");
+    assert!(matches!(e, RefError::Stale { .. }), "{e:?}");
+    let e = e.to_string();
+    assert!(
+        e.contains(&format!("dumped from {other}"))
+            && e.contains(&format!("the tree runs {draft}"))
+            && e.contains("file name"),
+        "{e}"
+    );
+
+    remove(&root)?;
+    remove(&set)
+}
+
 /// A node-dump set of the fixture the tree runs passes, and its `# fixture`
 /// line is a header field, given at most once; one whose line differs in the
 /// seed, or has none, is stale and names both lines; a set of the real file
@@ -936,8 +1008,9 @@ fn write_mtp_set(
 /// layer) and for the family with a draft file of its own (Qwen3.8's): a set
 /// of the fixture passes and states the draft beside the target; a line that
 /// differs in the seed, or none, is stale and names both lines; the real
-/// file's set is stale on `# model`; a set that states the real draft is stale
-/// on the draft; a draft missing beside the target is `Missing`.
+/// file's set is stale on `# model`; a set that states the real draft (the
+/// same file name at another root) is current; a draft missing beside the
+/// target is `Missing`.
 #[test]
 fn an_mtp_set_of_another_generation_is_stale() -> Result<(), RefError> {
     let root = temp("mtp-root")?;
@@ -1036,14 +1109,8 @@ fn an_mtp_set_of_another_generation_is_stale() -> Result<(), RefError> {
         Some(body(&qours)),
         build,
     );
-    let e = open(q.family, &qroot, &set).expect_err("the real draft");
-    assert!(matches!(e, RefError::Stale { .. }), "{e:?}");
-    let e = e.to_string();
-    assert!(
-        e.contains(&format!("dumped from {real_draft}"))
-            && e.contains(&format!("the tree runs {draft}")),
-        "{e}"
-    );
+    let p = open(q.family, &qroot, &set)?;
+    assert_eq!(p.draft.as_deref(), Some(real_draft.as_str()));
 
     write_mtp_set(
         &set,
