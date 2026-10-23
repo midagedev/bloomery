@@ -36,8 +36,8 @@ use crate::fault::MetalFaultWord;
 use crate::kernels::{
     BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HEAD_GROUPS, HEAD_K, HEAD_VOCAB,
     HeadMap, KV_HEADS, MAX_SEGMENTS, PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, Segment,
-    VALUE_HEADS, attention_dispatches, channels, f16_len, out_len, partials_len, qg_len,
-    ring_elems, router, segments_for_keys, state_elems,
+    VALUE_HEADS, channels, f16_len, out_len, partials_len, qg_len, ring_elems, router,
+    segments_for_keys, state_elems,
 };
 
 const WHAT: &str = "qwen35moe arena";
@@ -190,6 +190,9 @@ pub(super) struct Arena {
     /// The attention output after its gate, and its segment partials.
     pub(super) attn: MetalBuffer<f32>,
     pub(super) attn_partials: MetalBuffer<f32>,
+    /// The attention fold's ticket, one word: the flash's last threadgroup
+    /// resets it, so every launch finds it zero.
+    pub(super) attn_ticket: MetalBuffer<u32>,
     /// `ctx` rows of [`ROT`] interleaved `(cos, sin)`.
     pub(super) rope: MetalBuffer<f32>,
     /// The experts' activations, one row of [`EXPERT_K`] per slot.
@@ -631,6 +634,7 @@ impl Arena {
                 out_len().ok_or_else(|| refuse("the attention output does not fit"))?,
             )?,
             attn_partials: zeroed(device, attn_partials)?,
+            attn_ticket: zeroed(device, 1)?,
             rope,
             h: zeroed(device, EXPERT_SLOTS * EXPERT_K)?,
             logits: zeroed(device, vocab)?,
@@ -733,12 +737,12 @@ impl Arena {
                 let segments = segments_for_keys(pos + 1);
                 let parts = partials_len(segments as usize)
                     .ok_or_else(|| refuse("the attention partials do not fit"))?;
-                // Within one segment the flash writes the output itself;
-                // past it, it writes the partials the merge folds.
-                let wrote = if attention_dispatches(segments) == 1 {
+                // The flash writes the gated output within one segment;
+                // past it, the partials its own fold then reads back.
+                let wrote = if segments == 1 {
                     bytes_of(&self.attn)
                 } else {
-                    f32s(parts)
+                    f32s(parts) + bytes_of(&self.attn)
                 };
                 Ok(GroupBytes {
                     // The query's and the key's head norms.
@@ -748,18 +752,6 @@ impl Arena {
                     acts: f32s(a.q.len()) + f32s(ROT) + wrote,
                     // The live keys and values read, this token's row written.
                     state: 2 * (n_keys * kv_row + kv_row),
-                })
-            }
-            GroupKind::AttnMerge => {
-                no_ids()?;
-                let segments = segments_for_keys(pos + 1);
-                let parts = partials_len(segments as usize)
-                    .ok_or_else(|| refuse("the attention partials do not fit"))?;
-                Ok(GroupBytes {
-                    weights: 0,
-                    // The partials read, the attention output written.
-                    acts: f32s(parts) + bytes_of(&self.attn),
-                    state: 0,
                 })
             }
             GroupKind::AttnOut => {
@@ -911,6 +903,7 @@ impl Arena {
             layer.ffn.ticket.zero();
         }
         self.head_ticket.zero();
+        self.attn_ticket.zero();
         self.step_id.zero();
         self.id_in.zero();
         self.lane.write(&LANE_WORDS)?;

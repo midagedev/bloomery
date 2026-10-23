@@ -46,7 +46,7 @@ use super::ops::{Feed, MetalOps};
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
-use crate::kernels::{HEAD_DIM, Kernels, attention_dispatches, segments_for_keys, state_elems};
+use crate::kernels::{HEAD_DIM, Kernels, segments_for_keys, state_elems};
 use crate::library::Library;
 use crate::stream::{GpuInterval, MetalStream, Settled, Signalled};
 
@@ -860,13 +860,7 @@ impl ChainOps for Profiler<'_> {
         let segments = segments_for_keys(n_keys);
         self.one(GroupKind::AttnFlash, Some(l.layer), |o| {
             o.attn_flash(l.layer, n_keys, segments)
-        })?;
-        if attention_dispatches(segments) == 2 {
-            self.one(GroupKind::AttnMerge, Some(l.layer), |o| {
-                o.attn_merge(l.layer, n_keys, segments)
-            })?;
-        }
-        Ok(())
+        })
     }
 
     fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {

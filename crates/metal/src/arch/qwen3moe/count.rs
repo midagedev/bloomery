@@ -32,9 +32,11 @@ pub enum Projection {
 /// Whether the live keys are past 64.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveKeys {
-    /// At most 64. No layer grows.
+    /// At most 64: one attention segment.
     Within64,
-    /// Past 64. Each attention layer adds the memory dispatch.
+    /// Past 64: the segment rule splits the keys. Since the flash folds the
+    /// merge, the count does not grow past the waterline; the variant keeps
+    /// the caller's two scenes apart.
     Past64,
 }
 
@@ -59,22 +61,19 @@ pub struct TokenCount {
     pub dispatches: u32,
 }
 
-use crate::attention_geom as launch_geom;
-
 /// The groups and the dispatches one token encodes for `layers`.
 ///
 /// The embed and the head are the 2. Each layer adds six groups: P1, the
 /// mixer, its out, the router, the gate-up and the down. Those six already
-/// include the flash, and the FFN norm, which the router and the gate-up each
-/// apply as they load the residual. A Q6 projection adds one dispatch. Live keys past one
-/// segment add the merge on each attention layer, the second dispatch
-/// [`launch_geom::attention_dispatches`] reports. An unfolded ticket adds one
-/// group for each layer's router and one for the head. A count that does not
-/// fit `u32` panics by name.
-pub fn token_count(layers: &[Layer], live: LiveKeys, ticket: Ticket) -> TokenCount {
+/// include the flash — the attention's fold runs inside it, so past the
+/// segment rule's waterline the count is the same — and the FFN norm, which
+/// the router and the gate-up each apply as they load the residual. A Q6
+/// projection adds one dispatch. An unfolded ticket adds one group for each
+/// layer's router and one for the head. A count that does not fit `u32`
+/// panics by name.
+pub fn token_count(layers: &[Layer], _live: LiveKeys, ticket: Ticket) -> TokenCount {
     let mut n = 0u32;
     let mut n_q6 = 0u32;
-    let mut n_attn = 0u32;
     for layer in layers {
         n = fit("layer", n.checked_add(1));
         let q6 = match layer {
@@ -84,28 +83,9 @@ pub fn token_count(layers: &[Layer], live: LiveKeys, ticket: Ticket) -> TokenCou
         if q6 {
             n_q6 = fit("Q6", n_q6.checked_add(1));
         }
-        if matches!(layer, Layer::Attention { .. }) {
-            n_attn = fit("attention", n_attn.checked_add(1));
-        }
     }
     let mut groups = fit("group", 2u32.checked_add(fit("group", 6u32.checked_mul(n))));
     let mut dispatches = fit("dispatch", groups.checked_add(n_q6));
-    if matches!(live, LiveKeys::Past64) {
-        let edge = u32::try_from(launch_geom::SEGMENT_KEYS).expect("the segment holds a u32 count");
-        let one = launch_geom::attention_dispatches(launch_geom::segments_for_keys(edge));
-        let two = launch_geom::attention_dispatches(launch_geom::segments_for_keys(
-            edge.checked_add(1).expect("the next key count fits u32"),
-        ));
-        if one != 1 {
-            panic!(
-                "token count: one segment is one dispatch, and the six groups already include it"
-            );
-        }
-        let merge = fit("dispatch", two.checked_sub(one));
-        let extra = fit("attention", n_attn.checked_mul(merge));
-        groups = fit("group", groups.checked_add(extra));
-        dispatches = fit("dispatch", dispatches.checked_add(extra));
-    }
     if matches!(ticket, Ticket::Unfolded) {
         let extra = fit("group", n.checked_add(1));
         groups = fit("group", groups.checked_add(extra));
@@ -123,20 +103,20 @@ fn fit(what: &str, n: Option<u32>) -> u32 {
 
 /// What one group of a token runs: the kinds a profiled token's groups are
 /// tagged with, one kind a group, the groups [`token_count`] counts. P1 is
-/// one kind a mixer; the attention past one segment of keys is two kinds,
-/// the flash and the merge; the gate-up group and the down group each carry
-/// the shared expert's part with the routed picks' — the pair and the fold
-/// run them together, so no kind of the shared expert stands alone.
+/// one kind a mixer; the attention is one kind, the flash, which past one
+/// segment of keys also folds its partials; the gate-up group and the down
+/// group each carry the shared expert's part with the routed picks' — the
+/// pair and the fold run them together, so no kind of the shared expert
+/// stands alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GroupKind {
     /// The token's embedding row.
     Embed,
     /// An attention layer's P1: the norm on load and its projections.
     AttnP1,
-    /// The attention core: the flash over the live keys.
+    /// The attention core: the flash over the live keys, which past one
+    /// segment also folds its partials.
     AttnFlash,
-    /// The attention merge: the flash's partials folded, past one segment.
-    AttnMerge,
     /// The attention's output projection back to the residual.
     AttnOut,
     /// A delta layer's P1: the norm on load and its projections.
@@ -164,7 +144,6 @@ impl GroupKind {
             GroupKind::Embed => "embed",
             GroupKind::AttnP1 => "attn_p1",
             GroupKind::AttnFlash => "attn_flash",
-            GroupKind::AttnMerge => "attn_merge",
             GroupKind::AttnOut => "attn_out",
             GroupKind::DeltaP1 => "delta_p1",
             GroupKind::DeltaCore => "delta_core",
@@ -178,11 +157,10 @@ impl GroupKind {
 }
 
 /// Every kind, in the token's walk order: the order a profile's lines print.
-pub const KINDS: [GroupKind; 12] = [
+pub const KINDS: [GroupKind; 11] = [
     GroupKind::Embed,
     GroupKind::AttnP1,
     GroupKind::AttnFlash,
-    GroupKind::AttnMerge,
     GroupKind::AttnOut,
     GroupKind::DeltaP1,
     GroupKind::DeltaCore,
@@ -217,7 +195,6 @@ impl GroupBytes {
 
 #[cfg(test)]
 mod tests {
-    use super::launch_geom;
     use super::*;
 
     fn fixture() -> [Layer; 4] {
@@ -265,11 +242,18 @@ mod tests {
 
     #[test]
     fn fixture_folded_past_64() {
+        // The flash folds the merge, so past the waterline the count is the
+        // within-waterline one: 28/30 before the fold, one merge group and
+        // dispatch an attention layer.
+        assert_eq!(
+            token_count(&fixture(), LiveKeys::Past64, Ticket::Folded),
+            token_count(&fixture(), LiveKeys::Within64, Ticket::Folded)
+        );
         assert_eq!(
             token_count(&fixture(), LiveKeys::Past64, Ticket::Folded),
             TokenCount {
-                groups: 28,
-                dispatches: 30
+                groups: 26,
+                dispatches: 28
             }
         );
     }
@@ -298,11 +282,13 @@ mod tests {
 
     #[test]
     fn target_folded_past_64() {
+        // 252/272 before the fold: ten attention layers' merge group and
+        // dispatch each.
         assert_eq!(
             token_count(&target(), LiveKeys::Past64, Ticket::Folded),
             TokenCount {
-                groups: 252,
-                dispatches: 272
+                groups: 242,
+                dispatches: 262
             }
         );
     }
@@ -323,30 +309,18 @@ mod tests {
         assert_eq!(
             token_count(&target(), LiveKeys::Past64, Ticket::Unfolded),
             TokenCount {
-                groups: 293,
-                dispatches: 313
+                groups: 283,
+                dispatches: 303
             }
         );
     }
 
     #[test]
-    fn attention_count_matches_the_launch() {
-        let edge = u32::try_from(launch_geom::SEGMENT_KEYS).expect("the segment holds a u32 count");
-        let one = launch_geom::attention_dispatches(launch_geom::segments_for_keys(edge));
-        let two = launch_geom::attention_dispatches(launch_geom::segments_for_keys(edge + 1));
-        assert_eq!((one, two), (1, 2));
-        #[cfg(target_os = "macos")]
-        {
-            use crate::kernels::{attention_dispatches, segments_for_keys};
-            assert_eq!(attention_dispatches(segments_for_keys(edge)), one);
-            assert_eq!(attention_dispatches(segments_for_keys(edge + 1)), two);
-        }
-        let extra = two - one;
-        for (layers, n_attn) in [(fixture().as_slice(), 2u32), (target().as_slice(), 10u32)] {
+    fn past_the_waterline_the_count_does_not_grow() {
+        for layers in [fixture().as_slice(), target().as_slice()] {
             let within = token_count(layers, LiveKeys::Within64, Ticket::Folded);
             let past = token_count(layers, LiveKeys::Past64, Ticket::Folded);
-            assert_eq!(past.groups - within.groups, n_attn * extra);
-            assert_eq!(past.dispatches - within.dispatches, n_attn * extra);
+            assert_eq!(past, within);
         }
     }
 

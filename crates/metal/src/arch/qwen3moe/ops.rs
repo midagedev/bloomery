@@ -34,7 +34,7 @@ use crate::kernels::{
     AttentionParams, AttnCache, CONV_TAPS, DeltaParams, EXPERT_K, EXPERT_SLOTS, EmbedParams,
     FoldParams, HEAD_COLS, HEAD_DIM, HEAD_SIMD_GROUPS, HeadNormParams, HeadParams, KV_HEADS,
     Kernels, MatvecParams, Mode, NormOnLoad, PairParams, QUERY_HEADS, ROUTED_IDS, SegParams,
-    SharedPlan, VALUE_HEADS, attention_dispatches, partials_len, router, segments_for_keys,
+    SharedPlan, VALUE_HEADS, partials_len, router, segments_for_keys,
 };
 
 const WHAT: &str = "qwen35moe ops";
@@ -199,6 +199,7 @@ impl MetalOps<'_, '_> {
             rope,
             attn,
             attn_partials,
+            attn_ticket,
             faults,
             eps,
             ctx,
@@ -234,6 +235,7 @@ impl MetalOps<'_, '_> {
             partials: attn_partials.window_mut(Elems(0), Elems(parts))?,
             out: all_mut(attn)?,
             fault: &faults[slot],
+            ticket: attn_ticket.window_mut(Elems(0), Elems(1))?,
         })
     }
 }
@@ -250,19 +252,6 @@ impl MetalOps<'_, '_> {
     ) -> Result<(), SessionError> {
         let p = Self::attn_params(&mut *self.arena, l, self.pos, n_keys, segments)?;
         self.kernels.attention_flash(self.enc, p)?;
-        self.close();
-        Ok(())
-    }
-
-    /// Layer `l`'s merge group: the flash's partials folded into the output.
-    pub(super) fn attn_merge(
-        &mut self,
-        l: usize,
-        n_keys: u32,
-        segments: u32,
-    ) -> Result<(), SessionError> {
-        let p = Self::attn_params(&mut *self.arena, l, self.pos, n_keys, segments)?;
-        self.kernels.attention_merge(self.enc, p)?;
         self.close();
         Ok(())
     }
@@ -392,13 +381,9 @@ impl ChainOps for MetalOps<'_, '_> {
     fn attn_core(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
         let n_keys = self.pos + 1;
         let segments = segments_for_keys(n_keys);
-        self.attn_flash(l.layer, n_keys, segments)?;
-        // Live keys past one segment: the flash wrote partials, and the merge
-        // is their own group, after the barrier.
-        if attention_dispatches(segments) == 2 {
-            self.attn_merge(l.layer, n_keys, segments)?;
-        }
-        Ok(())
+        // Live keys past one segment fold inside the flash: its last
+        // threadgroup merges the partials and writes the gated output.
+        self.attn_flash(l.layer, n_keys, segments)
     }
 
     fn attn_out(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {

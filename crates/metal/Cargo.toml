@@ -26,6 +26,10 @@ name = "metal_matvec_time"
 path = "src/bin/metal_matvec_time.rs"
 
 [[bin]]
+name = "metal_attention_time"
+path = "src/bin/metal_attention_time.rs"
+
+[[bin]]
 name = "generate_metal"
 path = "src/bin/generate_metal.rs"
 

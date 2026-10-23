@@ -61,16 +61,13 @@ fn live_of(n_keys: usize) -> LiveKeys {
 /// The kinds one token's groups are tagged with, as the count model derives
 /// them from the layer list and the live keys: the tags' own derivation is
 /// the walk's, so the two agree only while both are right.
-fn kinds_expected(layers: &[Layer], live: LiveKeys) -> Vec<GroupKind> {
+fn kinds_expected(layers: &[Layer], _live: LiveKeys) -> Vec<GroupKind> {
     let mut out = vec![GroupKind::Embed];
     for layer in layers {
         match layer {
             Layer::Attention { .. } => {
                 out.push(GroupKind::AttnP1);
                 out.push(GroupKind::AttnFlash);
-                if matches!(live, LiveKeys::Past64) {
-                    out.push(GroupKind::AttnMerge);
-                }
                 out.push(GroupKind::AttnOut);
             }
             Layer::Delta { .. } => {
@@ -416,18 +413,18 @@ pub fn p_profile(device: &MetalDevice, library: &Library, path: &Path) -> Clause
         &weights_of_token(&s, &samples, deep as u32)?,
         &file_weights(path, s.vocab(), &picks_of(&s)?)?,
     )?;
-    let merges = samples
+    let flashes = samples
         .iter()
-        .filter(|g| g.kind == GroupKind::AttnMerge)
+        .filter(|g| g.kind == GroupKind::AttnFlash)
         .count();
     let attns = s
         .token_layers()
         .iter()
         .filter(|l| matches!(l, Layer::Attention { .. }))
         .count();
-    if merges != attns {
+    if flashes != attns {
         return Err(format!(
-            "the deep profiled step tagged {merges} merge groups; the session holds {attns} \
+            "the deep profiled step tagged {flashes} flash groups; the session holds {attns} \
              attention layers"
         ));
     }
@@ -440,8 +437,8 @@ pub fn p_profile(device: &MetalDevice, library: &Library, path: &Path) -> Clause
     Ok(Verdict::Noted(format!(
         "{WITHIN} tokens within a segment and the token at {deep} past it, host-fed and \
          profiled over the same ids: picks and last logits equal bit for bit; every step's \
-         count the count model's, one sample a group, the tags covering every group, {merges} \
-         merges among them; the groups' weight bytes {weights} (within) and {weights_deep} \
+         count the count model's, one sample a group, the tags covering every group, {flashes} \
+         flashes among them; the groups' weight bytes {weights} (within) and {weights_deep} \
          (deep) equal the file's own walk; a steady profiled step allocated nothing; the \
          groups' GPU sum {:.3} ms a token within, {:.3} ms deep",
         gpu_within, gpu_deep,
