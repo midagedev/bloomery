@@ -16,7 +16,6 @@
 //! here under the path the card's gates read them at.
 
 use crate::GateError;
-use refset::flip::rms;
 pub use refset::flip::{head_cap, head_gap, head_tie, margin, picks_its_top};
 
 /// A token whose chosen set differs from ik's, with every exchanged pair.
@@ -145,12 +144,12 @@ fn spread(v: &[f32]) -> f64 {
         .sqrt()
 }
 
-/// The most error two of a row's values may carry at an excused flip: each value moves by about
-/// `band` times the row's RMS (a dot of an input carrying `band` of relative error), three
-/// deviations each.
+/// The most error two of a row's values may carry at an excused flip: [`head_cap`]'s bound, each
+/// value moving by about `band` times the row's RMS (a dot of an input carrying `band` of relative
+/// error), three deviations each.
 #[must_use]
 pub fn flip_cap(band: f64, row: &[f32]) -> f64 {
-    6.0 * band * rms(row)
+    head_cap(band, row)
 }
 
 /// The widest gap between two of a row's values the errors can cross: `band` times the row's
