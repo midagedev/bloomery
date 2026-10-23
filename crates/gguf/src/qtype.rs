@@ -170,6 +170,17 @@ pub(crate) const OWN_ROWS: &[QRow] = &[
     // a 128 by 128 square is written into each row's block of it. No CPU matmul here.
     QRow { ty: T::FP8_B128, name: "fp8_b128", blck: 128, bytes: 132, dequant: true, host_act: H::None,
            card: card!(Fp8B128Planes Fp8B128Planes -       -                   -      Fp8B128 -    -) },
+    // mlx_a4: MLX's affine 4-bit groups of 64 (`quant::check_mlx_affine`, `dequant_mlx_a4`): the
+    // group's 8 little-endian U32 words of codes — value i the 4 bits at bit 4·(i mod 8) of word
+    // i/8, low nibble first — then its BF16 scale and BF16 bias, the bytes an mlx-community
+    // checkpoint holds as `.weight`/`.scales`/`.biases` interleaved per group and moved verbatim.
+    // No CPU matmul here.
+    QRow { ty: T::MLX_A4, name: "mlx_a4", blck: 64, bytes: 36, dequant: true, host_act: H::None,
+           card: Card::NONE },
+    // mlx_a8: the same block with one-byte codes (`dequant_mlx_a8`): 16 U32 words, value i byte i,
+    // then the BF16 scale and bias.
+    QRow { ty: T::MLX_A8, name: "mlx_a8", blck: 64, bytes: 68, dequant: true, host_act: H::None,
+           card: Card::NONE },
 ];
 
 /// The build refuses an own row whose type `from_u32` does not name, whose tag ggml's table

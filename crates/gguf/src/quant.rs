@@ -71,7 +71,8 @@ use crate::qtype::HostAct;
 /// Q8_1=9 and Q8_K=15 are ggml's activation forms (ggml.h:399, :405): named so the table of
 /// ggml's types is whole, sized, and decoded by nothing here.
 ///
-/// F8E4M3_ROWS=2000, MXFP8=2001, NVFP4_ROWS=2002 and FP8_B128=2003 are bloomery's own value types, in its range of ids no
+/// F8E4M3_ROWS=2000, MXFP8=2001, NVFP4_ROWS=2002, FP8_B128=2003, MLX_A4=2004 and MLX_A8=2005 are
+/// bloomery's own value types, in its range of ids no
 /// ggml table holds (2000 up; 1000 up holds its re-layouts of ggml types): their rows are
 /// `qtype::OWN_ROWS`, beside ggml's.
 ///
@@ -127,6 +128,8 @@ pub enum GgmlType {
     MXFP8,
     NVFP4_ROWS,
     FP8_B128,
+    MLX_A4,
+    MLX_A8,
     Unknown(u32),
 }
 
@@ -173,6 +176,8 @@ impl GgmlType {
             2001 => GgmlType::MXFP8,
             2002 => GgmlType::NVFP4_ROWS,
             2003 => GgmlType::FP8_B128,
+            2004 => GgmlType::MLX_A4,
+            2005 => GgmlType::MLX_A8,
             other => GgmlType::Unknown(other),
         }
     }
@@ -218,6 +223,8 @@ impl GgmlType {
             GgmlType::MXFP8 => 2001,
             GgmlType::NVFP4_ROWS => 2002,
             GgmlType::FP8_B128 => 2003,
+            GgmlType::MLX_A4 => 2004,
+            GgmlType::MLX_A8 => 2005,
             GgmlType::Unknown(v) => v,
         }
     }
@@ -317,6 +324,17 @@ pub enum QuantError {
         bits: u32,
         why: &'static str,
     },
+    /// An MLX affine block's BF16 scale or bias that is not finite, or a scale
+    /// whose largest product with a code leaves f32's range at
+    /// ([`check_mlx_affine`]): no value is written for its group.
+    #[error("dequant {ty}: block {block} holds {field} bits {bits:#06x}, {why}")]
+    UndefinedBf16 {
+        ty: GgmlType,
+        block: usize,
+        field: &'static str,
+        bits: u16,
+        why: &'static str,
+    },
     /// A byte that is no UE4M3 scale, outside a block ([`ue4m3_to_f32_half`]).
     #[error("{byte:#04x} is no UE4M3 scale: {why}")]
     NotUe4m3 { byte: u8, why: &'static str },
@@ -389,6 +407,8 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::Q2_0 => dequant_q2_0(&src[..need], dst),
         GgmlType::MXFP8 => dequant_mxfp8(&src[..need], dst)?,
         GgmlType::FP8_B128 => dequant_fp8_b128(&src[..need], dst)?,
+        GgmlType::MLX_A4 => dequant_mlx_a4(&src[..need], dst)?,
+        GgmlType::MLX_A8 => dequant_mlx_a8(&src[..need], dst)?,
         GgmlType::Q4_0
         | GgmlType::Q4_1
         | GgmlType::IQ1_S
@@ -1320,6 +1340,127 @@ fn dequant_fp8_b128(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
     Ok(())
 }
 
+// ----------------------------------------------------------------- MLX affine
+
+/// Whether MLX's affine blocks `src` hold only values: each group's BF16 scale
+/// or bias that is not finite, or a scale whose largest product with a code
+/// leaves f32's range at, is [`QuantError::UndefinedBf16`] naming its block,
+/// and a partial last block [`QuantError::ShortSrc`]. [`GgmlType::MLX_A4`]
+/// blocks are whole 36-byte groups (8 little-endian U32 words of codes, then
+/// the scale and bias), [`GgmlType::MLX_A8`] 68-byte (16 words, then the
+/// pair); the largest product sits at the group's top code (15, 255), the
+/// value a finite bias and scale cannot overflow past — the sum is linear in
+/// the code, so an endpoint bounds it.
+///
+/// # Errors
+///
+/// The first such block, or the partial block.
+pub fn check_mlx_affine(ty: GgmlType, src: &[u8]) -> Result<(), QuantError> {
+    match ty {
+        GgmlType::MLX_A4 => check_affine_blocks::<36, 15>(ty, src),
+        GgmlType::MLX_A8 => check_affine_blocks::<68, 255>(ty, src),
+        other => Err(QuantError::Unsupported(other)),
+    }
+}
+
+fn check_affine_blocks<const N: usize, const TOP: u32>(
+    ty: GgmlType,
+    src: &[u8],
+) -> Result<(), QuantError> {
+    let (blocks, tail) = src.as_chunks::<N>();
+    if !tail.is_empty() {
+        return Err(QuantError::ShortSrc {
+            ty,
+            src: src.len(),
+            need: src.len().next_multiple_of(N),
+            n: 64 * (blocks.len() + 1),
+        });
+    }
+    for (block, blk) in blocks.iter().enumerate() {
+        let scale = u16::from_le_bytes([blk[N - 4], blk[N - 3]]);
+        let bias = u16::from_le_bytes([blk[N - 2], blk[N - 1]]);
+        let refuse =
+            |field: &'static str, bits: u16, why: &'static str| QuantError::UndefinedBf16 {
+                ty,
+                block,
+                field,
+                bits,
+                why,
+            };
+        if !bf16_bits_to_f32(scale).is_finite() {
+            return Err(refuse("scale", scale, "not finite"));
+        }
+        if !bf16_bits_to_f32(bias).is_finite() {
+            return Err(refuse("bias", bias, "not finite"));
+        }
+        let s = bf16_bits_to_f32(scale);
+        let b = bf16_bits_to_f32(bias);
+        if !(s * TOP as f32 + b).is_finite() {
+            return Err(refuse(
+                "scale",
+                scale,
+                "a value times it leaves f32's range",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// MLX's affine 4-bit groups of 64 ([`GgmlType::MLX_A4`], 36 bytes: the
+/// group's 8 little-endian U32 words of codes, then its BF16 scale and BF16
+/// bias) decoded: value `i` is the 4 bits at bit `4·(i mod 8)` of word `i/8`
+/// (low nibble first) as `s·q + b` in f32, `s` and `b` the widened pair. The
+/// product of an 8-bit-significand scale and a 4-bit code is exact in f32, so
+/// the sum rounds once; MLX's own `dequantize` returns that value rounded
+/// once more to bf16 (measured, mlx 0.32.1: `mx.quantize` then
+/// `mx.dequantize`, every bit explained by the single rounding). This f32
+/// value is the oracle the Metal kernels gate compares against.
+/// [`check_mlx_affine`]'s refusals come before any value is written; `src`
+/// holds `dst`'s blocks exactly ([`dequant_row`]).
+fn dequant_mlx_a4(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
+    check_mlx_affine(GgmlType::MLX_A4, src)?;
+    for (blk, out) in src
+        .as_chunks::<36>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<64>().0)
+    {
+        let s = bf16_bits_to_f32(u16::from_le_bytes([blk[32], blk[33]]));
+        let b = bf16_bits_to_f32(u16::from_le_bytes([blk[34], blk[35]]));
+        for (w, word) in blk[..32].as_chunks::<4>().0.iter().enumerate() {
+            let word = u32::from_le_bytes(*word);
+            for j in 0..8 {
+                out[w * 8 + j] = s * ((word >> (4 * j)) & 0xf) as f32 + b;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// MLX's affine 8-bit groups of 64 ([`GgmlType::MLX_A8`], 68 bytes: 16
+/// little-endian U32 words of one-byte codes, then the BF16 scale and bias)
+/// decoded: value `i` is byte `i` as `s·q + b` in f32, the same sum
+/// [`dequant_mlx_a4`] forms (an 8-bit code still exact in the product).
+fn dequant_mlx_a8(src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
+    check_mlx_affine(GgmlType::MLX_A8, src)?;
+    for (blk, out) in src
+        .as_chunks::<68>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<64>().0)
+    {
+        let s = bf16_bits_to_f32(u16::from_le_bytes([blk[64], blk[65]]));
+        let b = bf16_bits_to_f32(u16::from_le_bytes([blk[66], blk[67]]));
+        for (w, word) in blk[..64].as_chunks::<4>().0.iter().enumerate() {
+            let word = u32::from_le_bytes(*word);
+            for j in 0..4 {
+                out[w * 4 + j] = s * ((word >> (8 * j)) & 0xff) as f32 + b;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Port of `dequantize_row_nvfp4` (llama.cpp-mainline ggml-quants.c:589-612).
 /// Block geometry (block_nvfp4, ggml-common.h:221-227, 36 bytes / 64
 /// values): four UE4M3 scales `d[4]` @0, `qs[32]` @4; sub-block `s` holds
@@ -1967,7 +2108,8 @@ mod tests {
     }
 
     use super::{
-        GgmlType, QuantError, activation_format, check_fp8_b128, check_mxfp8, dequant_row,
+        GgmlType, QuantError, activation_format, check_fp8_b128, check_mlx_affine, check_mxfp8,
+        dequant_row,
     };
     use crate::qtype::{HostAct, QROWS};
 
@@ -3344,5 +3486,357 @@ mod tests {
         }
         // Finite values whose scale `amax / 127` is past f16's range.
         assert_eq!(super::Q8Block::quantize_ref(&[1e10; 32]), None);
+    }
+    // MLX's affine blocks pinned from real mx.quantize output: pip mlx 0.32.1,
+    // mx.quantize(w, group_size=64, bits=4|8, mode="affine") over a two-row LCG weight
+    // (x = (1103515245·x + 12345) mod 2^31, value ((x >> 7) mod 2000 − 1000) / 347),
+    // then mx.dequantize(q, s, b, group_size=64, bits). The words are the returned
+    // `.weight` (LE U32), the scales and biases its `.scales`/`.biases` BF16 bits.
+    const A4_WORDS: [[u32; 16]; 2] = [
+        [
+            0xd450dfe9, 0x3a4bf290, 0x4114bb68, 0x16bb6dc0, 0x98fff4e1, 0xf2a4b15b, 0x1fd471af,
+            0x7454684a, 0x4e4502fe, 0xc5b8d467, 0xb22876da, 0xf049b6bc, 0x6d1c225f, 0x1de1ff29,
+            0xb6364005, 0x2b59f488,
+        ],
+        [
+            0xb23f5b5e, 0xe48dfd81, 0xd9585ae5, 0xbf4f8b8b, 0x75d23f87, 0x70ed02c7, 0xd14619b7,
+            0x256985fd, 0x7f58f9ed, 0xe44f7999, 0x36491eca, 0x8c8ad9e0, 0xf204b4a5, 0x5b4f4425,
+            0xfaacfea1, 0x2b692460,
+        ],
+    ];
+    const A4_SCALES: [[u16; 2]; 2] = [[0xbeb4, 0xbeb7], [0x3eb8, 0x3eb4]];
+    const A4_BIASES: [[u16; 2]; 2] = [[0x4034, 0x4037], [0xc038, 0xc034]];
+    const A4_MX_DEQ: [[u32; 128]; 2] = [
+        [
+            0xbeb40000, 0xc0070000, 0xc01e0000, 0xbfe10000, 0x40340000, 0x3f870000, 0x3fb40000,
+            0xbfe10000, 0x40340000, 0xbeb40000, 0x40070000, 0xc01e0000, 0xbf870000, 0x3fb40000,
+            0xbf340000, 0x3fe10000, 0x00000000, 0x3f340000, 0xbf870000, 0xbf870000, 0x3fb40000,
+            0x401e0000, 0x401e0000, 0x3fb40000, 0x40340000, 0xbfb40000, 0xbfe10000, 0x3f340000,
+            0xbf870000, 0xbf870000, 0x3f340000, 0x401e0000, 0x401e0000, 0xc0070000, 0x3fb40000,
+            0xc01e0000, 0xc01e0000, 0xc01e0000, 0x00000000, 0xbeb40000, 0xbf870000, 0x3f870000,
+            0x401e0000, 0xbf870000, 0x3fb40000, 0xbf340000, 0x40070000, 0xc01e0000, 0xc01e0000,
+            0xbf340000, 0x401e0000, 0x3eb40000, 0x3fb40000, 0xbfe10000, 0xc01e0000, 0x401e0000,
+            0xbf340000, 0x3fb40000, 0x00000000, 0x3f340000, 0x3fb40000, 0x3f870000, 0x3fb40000,
+            0x3eb40000, 0xc0090000, 0xc0200000, 0x40090000, 0x40370000, 0x3f890000, 0x3fb70000,
+            0xc0090000, 0x3fb70000, 0x3eb70000, 0x3f370000, 0x3fb70000, 0xbfe50000, 0x00000000,
+            0xbf890000, 0x3f890000, 0xbfb70000, 0xbf370000, 0xbfe50000, 0x3f370000, 0x3eb70000,
+            0x00000000, 0x40090000, 0x40090000, 0xbf890000, 0xbfb70000, 0xbf890000, 0x3f370000,
+            0xbf890000, 0xbeb70000, 0x3fb70000, 0x40370000, 0xc0200000, 0xc0200000, 0x3f890000,
+            0x40090000, 0x40090000, 0xbfb70000, 0x40200000, 0xbfe50000, 0x3f370000, 0xbeb70000,
+            0x40090000, 0xc0200000, 0xc0200000, 0x40200000, 0xc0090000, 0xbfe50000, 0x40200000,
+            0x3f890000, 0x40370000, 0x40370000, 0x3fb70000, 0x3f370000, 0x3fe50000, 0x3f370000,
+            0xbf890000, 0x00000000, 0x00000000, 0x3fb70000, 0xc0200000, 0xbeb70000, 0x3f890000,
+            0xbf890000, 0x40090000,
+        ],
+        [
+            0x400a0000, 0xbf8a0000, 0x3f8a0000, 0xbf8a0000, 0x40210000, 0xbfe60000, 0xc00a0000,
+            0x3f8a0000, 0xc0210000, 0x00000000, 0x3fe60000, 0x40210000, 0x3fe60000, 0x00000000,
+            0xbfb80000, 0x400a0000, 0xbf8a0000, 0x400a0000, 0x3f380000, 0xbf8a0000, 0x00000000,
+            0xbf8a0000, 0x3eb80000, 0x3fe60000, 0x3f8a0000, 0x00000000, 0x3f8a0000, 0x00000000,
+            0x40210000, 0xbfb80000, 0x40210000, 0x3f8a0000, 0xbeb80000, 0x00000000, 0x40210000,
+            0xbfe60000, 0xc00a0000, 0x3fe60000, 0xbf8a0000, 0xbeb80000, 0xbeb80000, 0x3fb80000,
+            0xc00a0000, 0xc0380000, 0x3fe60000, 0x400a0000, 0xc0380000, 0xbeb80000, 0xbeb80000,
+            0x3f8a0000, 0x3eb80000, 0xc0210000, 0xbf380000, 0xbfb80000, 0xc0210000, 0x3fe60000,
+            0x3fe60000, 0x40210000, 0xbf8a0000, 0x00000000, 0x3eb80000, 0xbf380000, 0xbf8a0000,
+            0xc00a0000, 0x3fe10000, 0x40070000, 0x3eb40000, 0x401e0000, 0x00000000, 0xbf870000,
+            0x401e0000, 0xbeb40000, 0x3eb40000, 0x3eb40000, 0x3eb40000, 0xbeb40000, 0x401e0000,
+            0xbfb40000, 0xbfb40000, 0x40070000, 0x3f340000, 0x3fb40000, 0x40070000, 0xc01e0000,
+            0x3eb40000, 0xbfb40000, 0xbf340000, 0xbfe10000, 0xc0340000, 0x40070000, 0x3eb40000,
+            0x3fe10000, 0x3f340000, 0x00000000, 0x3fb40000, 0x00000000, 0xbf870000, 0x3f340000,
+            0xbfb40000, 0x3f870000, 0xbfb40000, 0xc0340000, 0xc0070000, 0x401e0000, 0xbf870000,
+            0xc0070000, 0xbfb40000, 0xbfb40000, 0x401e0000, 0xbfb40000, 0x3f870000, 0xbf870000,
+            0xc01e0000, 0x3f340000, 0x40070000, 0x401e0000, 0x3fb40000, 0x3f340000, 0x3f340000,
+            0x401e0000, 0xc0340000, 0xbf340000, 0xbfb40000, 0xc0070000, 0x3eb40000, 0xbf340000,
+            0x3f870000, 0xc0070000,
+        ],
+    ];
+    const A8_WORDS: [[u32; 32]; 2] = [
+        [
+            0xcfebe08e, 0xd03b5100, 0xf7248802, 0x34a23ab6, 0xaaaa5a7d, 0x440a0a3e, 0x5fd3bb07,
+            0x1058b3ac, 0xfd47e60f, 0x9186f0f5, 0xb20e4fb5, 0xfc21a03e, 0x680ca4e9, 0x10ffd242,
+            0x65793c9c, 0x7746493f, 0x0023efe0, 0x45df3a4a, 0xd63c5d77, 0xbf4db97a, 0x6f65d29b,
+            0xab1d2088, 0xab66b8bf, 0xff003c8c, 0x1b264af8, 0x5ccc11c9, 0xfcff2499, 0x0bcfde0f,
+            0x3a01024e, 0xad673168, 0xf2457a80, 0x1ab84c95,
+        ],
+        [
+            0x53ad4cdc, 0xb92037fe, 0xf4d0830e, 0xe74588d9, 0x57a6de54, 0xcd985279, 0x7bae86b1,
+            0xadff3cfe, 0x2afe856c, 0x7149cc20, 0x0827c473, 0x6f00e7d3, 0x1390b270, 0xd4103861,
+            0x884ef5ca, 0x254a6297, 0xf891e0cf, 0x75eb5781, 0x77959499, 0xe6403bfc, 0x0bdbc99c,
+            0x37693f8c, 0xcd90e500, 0x86c37b9b, 0xaf3ba54f, 0xfc270848, 0x44401f51, 0x4fb139f9,
+            0xffe59e10, 0xfe9ca4be, 0x22426606, 0x22b35a8b,
+        ],
+    ];
+    const A8_SCALES: [[u16; 2]; 2] = [[0xbcb4, 0xbcb6], [0x3cb7, 0x3cb3]];
+    const A8_BIASES: [[u16; 2]; 2] = [[0x4034, 0x4037], [0xc038, 0xc034]];
+    const A8_MX_DEQ: [[u32; 128]; 2] = [
+        [
+            0xbe9e0000, 0xc0070000, 0xc0160000, 0xbfde0000, 0x40340000, 0x3f840000, 0x3fc20000,
+            0xbfe10000, 0x40310000, 0xbe340000, 0x40010000, 0xc0270000, 0xbf980000, 0x3fc50000,
+            0xbf3f0000, 0x3fd60000, 0x3d870000, 0x3f560000, 0xbf6c0000, 0xbf6c0000, 0x3fba0000,
+            0x40260000, 0x40260000, 0x3fa90000, 0x402a0000, 0xbfa60000, 0xbfe90000, 0x3f3a0000,
+            0xbf780000, 0xbf8f0000, 0x3f610000, 0x401e0000, 0x401f0000, 0xc00f0000, 0x3fa00000,
+            0xc0300000, 0xc0250000, 0xc01e0000, 0xbe070000, 0xbebf0000, 0xbf950000, 0x3f8a0000,
+            0x40200000, 0xbf8d0000, 0x3fba0000, 0xbf340000, 0x40060000, 0xc02e0000, 0xc0140000,
+            0xbf4a0000, 0x40230000, 0x3f070000, 0x3fae0000, 0xbfe70000, 0xc0330000, 0x401e0000,
+            0xbf1e0000, 0x3fbf0000, 0x3e1e0000, 0x3f180000, 0x3fb70000, 0x3f9b0000, 0x3fa30000,
+            0x3e4a0000, 0xc0080000, 0xc01d0000, 0x40050000, 0x40370000, 0x3f9c0000, 0x3fc90000,
+            0xc0060000, 0x3faa0000, 0x3e5d0000, 0x3f4b0000, 0x3fc30000, 0xbff30000, 0x3e180000,
+            0xbfa00000, 0x3f930000, 0xbfb10000, 0xbf160000, 0xbfe70000, 0x3f1e0000, 0x3ec90000,
+            0xbe260000, 0x400a0000, 0x400e0000, 0xbf710000, 0xbfb10000, 0xbf9d0000, 0x3f180000,
+            0xbf710000, 0xbe800000, 0x3fc30000, 0x40370000, 0xc0340000, 0xc02a0000, 0x3f9c0000,
+            0x40010000, 0x40110000, 0xbfce0000, 0x401f0000, 0xbfd60000, 0x3f510000, 0xbf0a0000,
+            0x40040000, 0xc0340000, 0xc02f0000, 0x40220000, 0xc0050000, 0xbfdf0000, 0x40270000,
+            0x3f900000, 0x40340000, 0x40360000, 0x3fc90000, 0x3f0c0000, 0x3fe30000, 0x3f120000,
+            0xbf7c0000, 0x3c800000, 0x3e180000, 0x3faa0000, 0xc0210000, 0xbee70000, 0x3f960000,
+            0xbf9d0000, 0x40120000,
+        ],
+        [
+            0x40030000, 0xbf970000, 0x3f7d0000, 0xbf830000, 0x40330000, 0xbfd30000, 0xc00a0000,
+            0x3fa10000, 0xc0240000, 0x3d520000, 0x3fe30000, 0x40250000, 0x3ffc0000, 0x3e270000,
+            0xbfab0000, 0x40120000, 0xbf800000, 0x40050000, 0x3f550000, 0xbf6e0000, 0xbe300000,
+            0xbf860000, 0x3f050000, 0x3fda0000, 0x3f8a0000, 0x3df20000, 0x3f820000, 0xbe020000,
+            0x40330000, 0xbfc40000, 0x40350000, 0x3f7d0000, 0xbeed0000, 0x3dc50000, 0x40330000,
+            0xbff80000, 0xc00a0000, 0x3fd70000, 0xbf9f0000, 0xbeb40000, 0xbe9d0000, 0x3fc00000,
+            0xc0000000, 0xc02d0000, 0x3feb0000, 0x40120000, 0xc0380000, 0xbeca0000, 0xbebf0000,
+            0x3f8d0000, 0x3eaf0000, 0xc01d0000, 0xbf350000, 0xbfd00000, 0xc0210000, 0x3fee0000,
+            0x3fd20000, 0x40260000, 0xbf910000, 0x3e270000, 0x3eff0000, 0xbf300000, 0xbf9c0000,
+            0xc0030000, 0x3fdb0000, 0x40050000, 0x3eb60000, 0x40270000, 0x3bcc0000, 0xbf690000,
+            0x40150000, 0xbe830000, 0x3f080000, 0x3ed80000, 0x3ee30000, 0xbe590000, 0x402c0000,
+            0xbfc30000, 0xbfb50000, 0x400e0000, 0x3f190000, 0x3fca0000, 0x3ffd0000, 0xc0250000,
+            0x3e7c0000, 0xbfb80000, 0xbf050000, 0xbfce0000, 0xc0340000, 0x400c0000, 0x3eab0000,
+            0x3fd50000, 0x3f130000, 0xbe000000, 0x3fb90000, 0x3dec0000, 0xbf8b0000, 0x3f4b0000,
+            0xbfc30000, 0x3f810000, 0xbf9f0000, 0xc0290000, 0xbffb0000, 0x402c0000, 0xbf850000,
+            0xc0090000, 0xbfb50000, 0xbfaa0000, 0x40280000, 0xbfc90000, 0x3f870000, 0xbf8b0000,
+            0xc01e0000, 0x3f240000, 0x400c0000, 0x40310000, 0x3fab0000, 0x3f450000, 0x3f190000,
+            0x402f0000, 0xc02c0000, 0xbf150000, 0xbfaf0000, 0xc0040000, 0x3e660000, 0xbf590000,
+            0x3f8d0000, 0xc0040000,
+        ],
+    ];
+    // The exact f32 oracle (`s·q + b`, the product exact) and MLX's own bf16 outputs.
+    const A4_F32: [[u32; 128]; 2] = [
+        [
+            0xbeb40000, 0xc0070000, 0xc01d8000, 0xbfe10000, 0x40340000, 0x3f870000, 0x3fb40000,
+            0xbfe10000, 0x40340000, 0xbeb40000, 0x40070000, 0xc01d8000, 0xbf870000, 0x3fb40000,
+            0xbf340000, 0x3fe10000, 0x00000000, 0x3f340000, 0xbf870000, 0xbf870000, 0x3fb40000,
+            0x401d8000, 0x401d8000, 0x3fb40000, 0x40340000, 0xbfb40000, 0xbfe10000, 0x3f340000,
+            0xbf870000, 0xbf870000, 0x3f340000, 0x401d8000, 0x401d8000, 0xc0070000, 0x3fb40000,
+            0xc01d8000, 0xc01d8000, 0xc01d8000, 0x00000000, 0xbeb40000, 0xbf870000, 0x3f870000,
+            0x401d8000, 0xbf870000, 0x3fb40000, 0xbf340000, 0x40070000, 0xc01d8000, 0xc01d8000,
+            0xbf340000, 0x401d8000, 0x3eb40000, 0x3fb40000, 0xbfe10000, 0xc01d8000, 0x401d8000,
+            0xbf340000, 0x3fb40000, 0x00000000, 0x3f340000, 0x3fb40000, 0x3f870000, 0x3fb40000,
+            0x3eb40000, 0xc0094000, 0xc0202000, 0x40094000, 0x40370000, 0x3f894000, 0x3fb70000,
+            0xc0094000, 0x3fb70000, 0x3eb70000, 0x3f370000, 0x3fb70000, 0xbfe4c000, 0x00000000,
+            0xbf894000, 0x3f894000, 0xbfb70000, 0xbf370000, 0xbfe4c000, 0x3f370000, 0x3eb70000,
+            0x00000000, 0x40094000, 0x40094000, 0xbf894000, 0xbfb70000, 0xbf894000, 0x3f370000,
+            0xbf894000, 0xbeb70000, 0x3fb70000, 0x40370000, 0xc0202000, 0xc0202000, 0x3f894000,
+            0x40094000, 0x40094000, 0xbfb70000, 0x40202000, 0xbfe4c000, 0x3f370000, 0xbeb70000,
+            0x40094000, 0xc0202000, 0xc0202000, 0x40202000, 0xc0094000, 0xbfe4c000, 0x40202000,
+            0x3f894000, 0x40370000, 0x40370000, 0x3fb70000, 0x3f370000, 0x3fe4c000, 0x3f370000,
+            0xbf894000, 0x00000000, 0x00000000, 0x3fb70000, 0xc0202000, 0xbeb70000, 0x3f894000,
+            0xbf894000, 0x40094000,
+        ],
+        [
+            0x400a0000, 0xbf8a0000, 0x3f8a0000, 0xbf8a0000, 0x40210000, 0xbfe60000, 0xc00a0000,
+            0x3f8a0000, 0xc0210000, 0x00000000, 0x3fe60000, 0x40210000, 0x3fe60000, 0x00000000,
+            0xbfb80000, 0x400a0000, 0xbf8a0000, 0x400a0000, 0x3f380000, 0xbf8a0000, 0x00000000,
+            0xbf8a0000, 0x3eb80000, 0x3fe60000, 0x3f8a0000, 0x00000000, 0x3f8a0000, 0x00000000,
+            0x40210000, 0xbfb80000, 0x40210000, 0x3f8a0000, 0xbeb80000, 0x00000000, 0x40210000,
+            0xbfe60000, 0xc00a0000, 0x3fe60000, 0xbf8a0000, 0xbeb80000, 0xbeb80000, 0x3fb80000,
+            0xc00a0000, 0xc0380000, 0x3fe60000, 0x400a0000, 0xc0380000, 0xbeb80000, 0xbeb80000,
+            0x3f8a0000, 0x3eb80000, 0xc0210000, 0xbf380000, 0xbfb80000, 0xc0210000, 0x3fe60000,
+            0x3fe60000, 0x40210000, 0xbf8a0000, 0x00000000, 0x3eb80000, 0xbf380000, 0xbf8a0000,
+            0xc00a0000, 0x3fe10000, 0x40070000, 0x3eb40000, 0x401d8000, 0x00000000, 0xbf870000,
+            0x401d8000, 0xbeb40000, 0x3eb40000, 0x3eb40000, 0x3eb40000, 0xbeb40000, 0x401d8000,
+            0xbfb40000, 0xbfb40000, 0x40070000, 0x3f340000, 0x3fb40000, 0x40070000, 0xc01d8000,
+            0x3eb40000, 0xbfb40000, 0xbf340000, 0xbfe10000, 0xc0340000, 0x40070000, 0x3eb40000,
+            0x3fe10000, 0x3f340000, 0x00000000, 0x3fb40000, 0x00000000, 0xbf870000, 0x3f340000,
+            0xbfb40000, 0x3f870000, 0xbfb40000, 0xc0340000, 0xc0070000, 0x401d8000, 0xbf870000,
+            0xc0070000, 0xbfb40000, 0xbfb40000, 0x401d8000, 0xbfb40000, 0x3f870000, 0xbf870000,
+            0xc01d8000, 0x3f340000, 0x40070000, 0x401d8000, 0x3fb40000, 0x3f340000, 0x3f340000,
+            0x401d8000, 0xc0340000, 0xbf340000, 0xbfb40000, 0xc0070000, 0x3eb40000, 0xbf340000,
+            0x3f870000, 0xc0070000,
+        ],
+    ];
+    const A8_F32: [[u32; 128]; 2] = [
+        [
+            0xbe9d8000, 0xc0070000, 0xc0167800, 0xbfde3000, 0x40340000, 0x3f843000, 0x3fc21000,
+            0xbfe10000, 0x40313000, 0xbe340000, 0x40016000, 0xc0275800, 0xbf97e000, 0x3fc4e000,
+            0xbf3f4000, 0x3fd5c000, 0x3d870000, 0x3f55c000, 0xbf6c4000, 0xbf6c4000, 0x3fb9a000,
+            0x4025f000, 0x4025f000, 0x3fa8c000, 0x402a2800, 0xbfa5f000, 0xbfe97000, 0x3f39a000,
+            0xbf778000, 0xbf8f7000, 0x3f610000, 0x401d8000, 0x401ee800, 0xc00f7000, 0x3fa05000,
+            0xc02fc800, 0xc0248800, 0xc01d8000, 0xbe070000, 0xbebf4000, 0xbf951000, 0x3f89d000,
+            0x40205000, 0xbf8ca000, 0x3fb9a000, 0xbf340000, 0x40059800, 0xc02e6000, 0xc013a800,
+            0xbf4a8000, 0x40232000, 0x3f070000, 0x3fae6000, 0xbfe6a000, 0xc0329800, 0x401d8000,
+            0xbf1d8000, 0x3fbf4000, 0x3e1d8000, 0x3f17e000, 0x3fb6d000, 0x3f9ab000, 0x3fa32000,
+            0x3e4a8000, 0xc0078000, 0xc01cd400, 0x40053c00, 0x40370000, 0x3f9b9000, 0x3fc91000,
+            0xc0061400, 0x3fa9c800, 0x3e5cc000, 0x3f4b1000, 0x3fc36000, 0xbff29000, 0x3e188000,
+            0xbfa01800, 0x3f930800, 0xbfb12800, 0xbf159000, 0xbfe73000, 0x3f1d9000, 0x3ec96000,
+            0xbe260000, 0x40098000, 0x400dc400, 0xbf709000, 0xbfb12800, 0xbf9d4000, 0x3f17e000,
+            0xbf709000, 0xbe808000, 0x3fc36000, 0x40370000, 0xc0339400, 0xc029a000, 0x3f9b9000,
+            0x4000f800, 0x40109c00, 0xbfcd9800, 0x401ed400, 0xbfd62000, 0x3f50c000, 0xbf0a3000,
+            0x4003d000, 0xc0339400, 0xc02f5000, 0x4021ac00, 0xc004a800, 0xbfdea800, 0x40275c00,
+            0x3f903000, 0x40342800, 0x40359400, 0x3fc91000, 0x3f0c8000, 0x3fe2a800, 0x3f123000,
+            0xbf7bf000, 0x3c800000, 0x3e188000, 0x3fa9c800, 0xc0211800, 0xbee6e000, 0x3f95e000,
+            0xbf9d4000, 0x40120800,
+        ],
+        [
+            0x40028800, 0xbf96b000, 0x3f7d5800, 0xbf82ac00, 0x40332400, 0xbfd2bc00, 0xc00a4000,
+            0x3fa0fc00, 0xc023fc00, 0x3d528000, 0x3fe2c000, 0x4024d800, 0x3ffc7c00, 0x3e270000,
+            0xbfaab400, 0x40124200, 0xbf7fa000, 0x40056400, 0x3f555000, 0xbf6e7800, 0xbe302000,
+            0xbf858800, 0x3f054000, 0x3fda2c00, 0x3f8a1c00, 0x3df28000, 0x3f818800, 0xbe026000,
+            0x40332400, 0xbfc47000, 0x40349200, 0x3f7d5800, 0xbeecc000, 0x3dc4c000, 0x40332400,
+            0xbff7e800, 0xc00a4000, 0x3fd75000, 0xbf9f4400, 0xbeb39000, 0xbe9cb000, 0x3fc07000,
+            0xc0003e00, 0xc02c9000, 0x3feb5400, 0x40124200, 0xc0380000, 0xbeca7000, 0xbebf0000,
+            0x3f8cf800, 0x3eaf0000, 0xc01cd600, 0xbf354800, 0xbfcfe000, 0xc0212000, 0x3fee3000,
+            0x3fd19800, 0x40264600, 0xbf90f800, 0x3e270000, 0x3eff1000, 0xbf2f9000, 0xbf9c6800,
+            0xc0031a00, 0x3fdaf400, 0x40054000, 0x3eb63000, 0x4026d000, 0x3bcc0000, 0xbf695800,
+            0x4014a200, 0xbe831000, 0x3f07d800, 0x3ed7c000, 0x3ee2f000, 0xbe596000, 0x402c6800,
+            0xbfc2fc00, 0xbfb50000, 0x400da400, 0x3f18a000, 0x3fca2c00, 0x3ffc8400, 0xc0249e00,
+            0x3e7c8000, 0xbfb7cc00, 0xbf04a800, 0xbfce2c00, 0xc0340000, 0x400c3e00, 0x3eab0000,
+            0x3fd55c00, 0x3f130800, 0xbdffc000, 0x3fb96400, 0x3dec8000, 0xbf8b0c00, 0x3f4af800,
+            0xbfc2fc00, 0x3f817400, 0xbf9ea000, 0xc028d000, 0xbffaec00, 0x402c6800, 0xbf857400,
+            0xc008a600, 0xbfb50000, 0xbfa9d000, 0x40283600, 0xbfc89400, 0x3f870c00, 0xbf8b0c00,
+            0xc01da000, 0x3f23d000, 0x400c3e00, 0x40309a00, 0x3fab6800, 0x3f456000, 0x3f18a000,
+            0x402f3400, 0xc02b9c00, 0xbf157000, 0xbfaf6800, 0xc0047400, 0x3e662000, 0xbf589000,
+            0x3f8ca400, 0xc0047400,
+        ],
+    ];
+
+    /// The pinned MLX blocks decode to the exact f32 `s·q + b` and, rounded
+    /// once to bf16, to MLX's own `dequantize` bit for bit; the rows are named
+    /// and sized as the table holds them. Swapping the nibble order
+    /// (`4 * j` → `4 * (7 - j)` in `dequant_mlx_a4`) or the scale·bias pair is
+    /// red here.
+    #[test]
+    fn mlx_blocks_decode_mx_quantize_output_bit_for_bit() {
+        let run = |ty: GgmlType,
+                   wpg: usize,
+                   words: &[[u32; 32]; 2],
+                   scales: &[[u16; 2]; 2],
+                   biases: &[[u16; 2]; 2],
+                   f32_bits: &[[u32; 128]; 2],
+                   mx_bits: &[[u32; 128]; 2]| {
+            assert_eq!(
+                ty.name(),
+                Some(if ty == GgmlType::MLX_A4 {
+                    "mlx_a4"
+                } else {
+                    "mlx_a8"
+                })
+            );
+            assert_eq!(ty.blck_size(), Some(64));
+            assert_eq!(
+                ty.type_size(),
+                Some(if ty == GgmlType::MLX_A4 { 36 } else { 68 })
+            );
+            let mut src = Vec::new();
+            for r in 0..2 {
+                for g in 0..2 {
+                    for w in &words[r][g * wpg..(g + 1) * wpg] {
+                        src.extend_from_slice(&w.to_le_bytes());
+                    }
+                    src.extend_from_slice(&scales[r][g].to_le_bytes());
+                    src.extend_from_slice(&biases[r][g].to_le_bytes());
+                }
+            }
+            let mut got = vec![0.0f32; 256];
+            dequant_row(ty, &src, &mut got).unwrap();
+            for r in 0..2 {
+                for i in 0..128 {
+                    let v = got[r * 128 + i];
+                    assert_eq!(v.to_bits(), f32_bits[r][i], "{ty} row {r} value {i}");
+                    assert_eq!(
+                        u32::from(super::fp32_to_bf16_bits(v)) << 16,
+                        mx_bits[r][i],
+                        "{ty} row {r} value {i}: mx.dequantize's bf16"
+                    );
+                }
+            }
+        };
+        run(
+            GgmlType::MLX_A4,
+            8,
+            &{
+                let mut w = [[0u32; 32]; 2];
+                for r in 0..2 {
+                    w[r][..16].copy_from_slice(&A4_WORDS[r]);
+                }
+                w
+            },
+            &A4_SCALES,
+            &A4_BIASES,
+            &A4_F32,
+            &A4_MX_DEQ,
+        );
+        run(
+            GgmlType::MLX_A8,
+            16,
+            &A8_WORDS,
+            &A8_SCALES,
+            &A8_BIASES,
+            &A8_F32,
+            &A8_MX_DEQ,
+        );
+    }
+
+    /// An MLX affine block whose BF16 scale or bias is not finite, or whose
+    /// top code's sum leaves f32, is refused by name before any value is
+    /// written; a partial block and a CPU matmul's activation format are
+    /// refused too.
+    #[test]
+    fn mlx_blocks_refuse_undefined_pairs_and_activations() {
+        let block = |ty: GgmlType, scale: u16, bias: u16| -> Vec<u8> {
+            let codes = ty.type_size().unwrap() as usize - 4;
+            let mut b = vec![0x11u8; codes];
+            b.extend_from_slice(&scale.to_le_bytes());
+            b.extend_from_slice(&bias.to_le_bytes());
+            b
+        };
+        let refused = |ty: GgmlType, src: &[u8], want: &str| {
+            let mut dst = vec![0.0f32; 64];
+            let e = dequant_row(ty, src, &mut dst).unwrap_err();
+            assert!(e.to_string().contains(want), "{ty}: {e}");
+        };
+        // 0x7fc0: bf16 NaN; 0x7f80: bf16 inf; 0x7f7f: bf16's largest finite,
+        // whose product with the 4-bit top code 15 overflows.
+        refused(
+            GgmlType::MLX_A4,
+            &block(GgmlType::MLX_A4, 0x7fc0, 0),
+            "block 0 holds scale bits 0x7fc0, not finite",
+        );
+        refused(
+            GgmlType::MLX_A8,
+            &block(GgmlType::MLX_A8, 0x3f80, 0x7f80),
+            "block 0 holds bias bits 0x7f80, not finite",
+        );
+        for ty in [GgmlType::MLX_A4, GgmlType::MLX_A8] {
+            let e = check_mlx_affine(ty, &block(ty, 0x7f7f, 0)).unwrap_err();
+            assert_eq!(
+                e,
+                QuantError::UndefinedBf16 {
+                    ty,
+                    block: 0,
+                    field: "scale",
+                    bits: 0x7f7f,
+                    why: "a value times it leaves f32's range",
+                },
+                "{ty}"
+            );
+        }
+        let e = dequant_row(
+            GgmlType::MLX_A4,
+            &block(GgmlType::MLX_A4, 0, 0)[..35],
+            &mut vec![0.0; 64],
+        )
+        .unwrap_err();
+        assert!(matches!(e, QuantError::ShortSrc { .. }), "{e}");
+        assert_eq!(
+            activation_format(GgmlType::MLX_A4),
+            Err(QuantError::NoActivationFormat(GgmlType::MLX_A4))
+        );
+        assert_eq!(
+            activation_format(GgmlType::MLX_A8),
+            Err(QuantError::NoActivationFormat(GgmlType::MLX_A8))
+        );
     }
 }
