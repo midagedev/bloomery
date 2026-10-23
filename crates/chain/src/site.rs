@@ -120,17 +120,14 @@ impl fmt::Display for SiteTy {
     }
 }
 
-/// The type of site `name` in `file`, a matrix of `rows` rows (every expert's
-/// of a stack) of `k` values, read from its header entry before any upload:
-/// a type outside `allowed`, another shape or a missing tensor is refused by
-/// name with the site.
-pub fn file_site(
-    file: &Split,
+/// The header entry of `name` in `file`, a matrix of `rows` rows of `k`
+/// values: a missing tensor or another shape is refused by name.
+pub(crate) fn shaped<'a>(
+    file: &'a Split,
     what: &'static str,
     name: &str,
     (rows, k): (usize, usize),
-    allowed: &[SiteTy],
-) -> Result<SiteTy, ChainError> {
+) -> Result<&'a gguf::TensorInfo, ChainError> {
     let (_, t) = file
         .find(name)
         .ok_or_else(|| ChainError::tensor(what, name, "in the file"))?;
@@ -140,11 +137,26 @@ pub fn file_site(
         return Err(ChainError::shape(
             what,
             format!(
-                "{name} is {:?} in the file; the site takes {rows} rows of {k}",
+                "{name} is {:?} in the file; it takes {rows} rows of {k}",
                 t.dims
             ),
         ));
     }
+    Ok(t)
+}
+
+/// The type of site `name` in `file`, a matrix of `rows` rows (every expert's
+/// of a stack) of `k` values, read from its header entry before any upload:
+/// a type outside `allowed`, another shape or a missing tensor is refused by
+/// name with the site.
+pub fn file_site(
+    file: &Split,
+    what: &'static str,
+    name: &str,
+    shape: (usize, usize),
+    allowed: &[SiteTy],
+) -> Result<SiteTy, ChainError> {
+    let t = shaped(file, what, name, shape)?;
     match SiteTy::of_ggml(t.ty).filter(|ty| allowed.contains(ty)) {
         Some(ty) => Ok(ty),
         None => Err(ChainError::shape(

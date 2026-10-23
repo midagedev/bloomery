@@ -11,7 +11,7 @@ use super::plan::{
 };
 use crate::ChainError;
 use crate::linear::{self, LinearShape};
-use crate::site::file_site;
+use crate::site::{file_site, shaped};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::models::{Ffn, LayerSpec};
@@ -107,23 +107,9 @@ fn stack_ty(
     file: &Split,
     what: &'static str,
     name: &str,
-    (rows, k): (usize, usize),
+    shape: (usize, usize),
 ) -> Result<GgmlType, ChainError> {
-    let (_, t) = file
-        .find(name)
-        .ok_or_else(|| ChainError::tensor(what, name, "in the file"))?;
-    let got_k = t.dims.first().copied().unwrap_or(0);
-    let got_rows: u64 = t.dims.iter().skip(1).product();
-    if usize::try_from(got_k).ok() != Some(k) || usize::try_from(got_rows).ok() != Some(rows) {
-        return Err(ChainError::shape(
-            what,
-            format!(
-                "{name} is {:?} in the file; the stack takes {rows} rows of {k}",
-                t.dims
-            ),
-        ));
-    }
-    Ok(t.ty)
+    Ok(shaped(file, what, name, shape)?.ty)
 }
 
 /// The leg that runs layer `l`'s routed stacks (`n` experts of `ff` rows of

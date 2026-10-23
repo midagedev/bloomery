@@ -1466,7 +1466,7 @@ mod tests {
                 "q8 is q8_0 in the file",
             ),
             ("iq", (1, 256), &all[..], "iq is iq4_xs in the file"),
-            ("q8", (4, 64), &all[..], "the site takes 4 rows of 64"),
+            ("q8", (4, 64), &all[..], "it takes 4 rows of 64"),
         ];
         for (name, shape, allowed, want) in refused {
             match file_site(&split, "test", name, shape, allowed) {
