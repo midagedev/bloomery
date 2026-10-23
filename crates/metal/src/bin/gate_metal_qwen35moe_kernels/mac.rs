@@ -49,6 +49,12 @@
 //! 19. **router_ticket**: 10000 launches, and each launch's ids are the host's selection from that launch's logits. // K2-REGISTER
 //! 20. **router_nan**: a non-finite weight raises the router site and the ids stay in range. // K2-REGISTER
 //! 21. **router_bounds**: a shape, a window, an eps or an alignment the kernel does not take is refused by name, and nothing is encoded. // K2-REGISTER
+//! 22. **pair**: silu(gate) times up, against the f64 oracle. // K3-REGISTER
+//! 23. **pair_id**: an id past the stack raises expert_id and writes NaN. // K3-REGISTER
+//! 24. **pair_shared**: slot 8 reads the shared expert, the others the stack. // K3-REGISTER
+//! 25. **fold**: the folded down plus the residual, against the f64 oracle. // K3-REGISTER
+//! 26. **fold_type**: a shared expert of another quant is refused by name. // K3-REGISTER
+//! 27. **experts_bounds**: a launch that is not the shape is refused by name. // K3-REGISTER
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
@@ -75,6 +81,8 @@ use bloomery_metal::stream::MetalStream;
 mod clauses;
 #[path = "clauses_router.rs"] // K2-REGISTER
 mod clauses_router; // K2-REGISTER
+#[path = "clauses_experts.rs"] // K3-REGISTER
+mod clauses_experts; // K3-REGISTER
 #[path = "fixture.rs"]
 mod fixture;
 #[path = "mutants.rs"]
@@ -83,6 +91,8 @@ mod mutants;
 mod oracle;
 #[path = "../shared/oracle_router.rs"] // K2-REGISTER
 mod oracle_router; // K2-REGISTER
+#[path = "../shared/oracle_experts.rs"] // K3-REGISTER
+mod oracle_experts; // K3-REGISTER
 
 /// A clause, ready to run.
 type ClauseRun<'a> = Box<dyn Fn() -> Clause + 'a>;
@@ -540,7 +550,7 @@ pub fn main() -> ExitCode {
         Err(e) => Err(e.clone()),
     };
     #[rustfmt::skip] // K2-REGISTER
-    let clauses: [(&'static str, ClauseRun<'_>); 21] = [ // K2-REGISTER
+    let clauses: [(&'static str, ClauseRun<'_>); 27] = [ // K2-REGISTER
         ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
         ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
         ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
@@ -577,6 +587,12 @@ pub fn main() -> ExitCode {
         ("router_ticket", Box::new(|| with(clauses_router::router_ticket))), // K2-REGISTER
         ("router_nan", Box::new(|| with(clauses_router::router_nan))), // K2-REGISTER
         ("router_bounds", Box::new(|| clauses_router::router_bounds(&harness))), // K2-REGISTER
+        ("pair", Box::new(|| with(clauses_experts::pair))), // K3-REGISTER
+        ("pair_id", Box::new(|| with(clauses_experts::pair_id))), // K3-REGISTER
+        ("pair_shared", Box::new(|| with(clauses_experts::pair_shared))), // K3-REGISTER
+        ("fold", Box::new(|| with(clauses_experts::fold))), // K3-REGISTER
+        ("fold_type", Box::new(|| with(clauses_experts::fold_type))), // K3-REGISTER
+        ("experts_bounds", Box::new(|| with(clauses_experts::experts_bounds))), // K3-REGISTER
     ];
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)

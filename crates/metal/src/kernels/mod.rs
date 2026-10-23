@@ -12,8 +12,10 @@
 //! type and one width in one dispatch ([`seg`]), and the head-normed residual
 //! mat-vec of a gated delta net's out projection ([`headnorm`]).
 //! The router ([`router`]) is one more pipeline: `kernels/router.metal`, its ticket `kernels/ticket.metal`. // K2-REGISTER
+//! The routed gate-up pair and the folded down are one dispatch each. // K3-REGISTER
 
 mod embed;
+mod experts; // K3-REGISTER
 mod geometry;
 mod headnorm;
 mod matvec;
@@ -21,6 +23,16 @@ mod router; // K2-REGISTER
 mod seg;
 
 pub use embed::EmbedParams;
+pub use experts::{
+    // K3-REGISTER
+    EXPERT_K,     // K3-REGISTER
+    EXPERT_SLOTS, // K3-REGISTER
+    FoldParams,   // K3-REGISTER
+    PairParams,   // K3-REGISTER
+    ROUTED_IDS,   // K3-REGISTER
+    SHARED_SLOT,  // K3-REGISTER
+    SharedPlan,   // K3-REGISTER
+}; // K3-REGISTER
 pub use geometry::{
     BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,
     SIMD_GROUPS_PER_GROUP, THREADS_PER_GROUP, VALUE_HEADS,
@@ -81,6 +93,10 @@ pub struct Kernels {
     headnorm: Pipeline,
     embed: Pipeline,
     router: Pipeline, // K2-REGISTER
+    pair_q4: Pipeline, // K3-REGISTER
+    pair_q6: Pipeline, // K3-REGISTER
+    fold_q4: Pipeline, // K3-REGISTER
+    fold_q6: Pipeline, // K3-REGISTER
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -146,6 +162,10 @@ impl Kernels {
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             embed: library.pipeline("embed_q4k")?,
             router: library.pipeline("router35")?, // K2-REGISTER
+            pair_q4: library.pipeline("q4k_pair_swiglu")?, // K3-REGISTER
+            pair_q6: library.pipeline("q6k_pair_swiglu")?, // K3-REGISTER
+            fold_q4: library.pipeline("q4k_down_fold")?, // K3-REGISTER
+            fold_q6: library.pipeline("q6k_down_fold")?, // K3-REGISTER
             simdgroups,
         })
     }

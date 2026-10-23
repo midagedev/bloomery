@@ -160,6 +160,7 @@ fn main() {
         // K2-REGISTER ticket's helpers are what the router calls, so ticket is first.
         "ticket", // K2-REGISTER
         "router", // K2-REGISTER
+        "experts", // K3-REGISTER
     ] {
         let path = kernels_dir.join(format!("{name}.metal"));
         let source =

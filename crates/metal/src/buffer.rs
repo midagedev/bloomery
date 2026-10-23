@@ -48,6 +48,12 @@ impl MetalRaw {
         unsafe { self.buffer.as_ref() }
     }
 
+    /// Whether `self` and `other` name the same Metal buffer.
+    #[must_use]
+    pub(crate) fn same_buffer(self, other: Self) -> bool {
+        self.buffer == other.buffer
+    }
+
     /// The host pages of `len` elements of `T` at byte `at` of the buffer:
     /// a window's own elements, for a copy to or from the host.
     ///
