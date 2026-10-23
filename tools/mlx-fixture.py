@@ -21,8 +21,10 @@ config carries, 4 bits for every other linear; the norms, A_log, dt_bias and con
 quantized linear `X.weight` writes its companions as `X.scales` and `X.biases`, the real file's
 names. It writes safetensors shards (~1 GiB each, cut greedily in sorted-name order),
 model.safetensors.index.json and a config.json cut from the real one (num_hidden_layers,
-layer_types and the quantization module entries cut to the fixture's mirrored layers), then runs
-`check`.
+layer_types and the quantization module entries cut to the fixture's mirrored layers), copies the
+tokenizer files that sit beside the real config.json (tokenizer.json, which `prepare` reads, is
+refused by name when absent; tokenizer_config.json, chat_template.jinja and generation_config.json
+are copied when present), then runs `check`.
 
 `check` re-reads the folder's shard headers, decodes every quantized tensor with the affine rule
 bloomery's MLX_A4/MLX_A8 rows own (value i the 4 bits at bit 4·(i mod 8) of word i/8, low nibble
@@ -53,6 +55,10 @@ import tempfile
 
 USAGE = ("usage: tools/mlx-fixture.py make <fixture.gguf> <out dir> --config <real config.json> | "
          "check <out dir> <fixture.gguf> | --self-test")
+
+# The real folder's tokenizer files make copies of, beside its config.json; the first is required.
+TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
+                   "generation_config.json")
 
 EXIT_MISSING = 2
 EXIT_USAGE = 64
@@ -479,6 +485,9 @@ def tensor_bytes(kind, bits, shape):
 def make(fixture, out, config_path, quantizer, quiet=False):
     if os.path.exists(out):
         raise Refusal(EXIT_REFUSED, f"{out} already exists (remove it first)")
+    tokenizer_dir = os.path.dirname(os.path.abspath(config_path))
+    if not os.path.isfile(os.path.join(tokenizer_dir, TOKENIZER_FILES[0])):
+        raise Refusal(EXIT_REFUSED, f"{tokenizer_dir} has no {TOKENIZER_FILES[0]} beside the config")
     _meta, info, layers = read_gguf(fixture)
     head_v = value_head(info, layers)
     entries = mlx_names(layers)
@@ -540,7 +549,17 @@ def make(fixture, out, config_path, quantizer, quiet=False):
                   fh, indent=2)
         fh.write("\n")
     cut_config(config_path, layers, out)
+    copy_tokenizer(tokenizer_dir, out)
     return layers
+
+
+def copy_tokenizer(src, out):
+    """The tokenizer files of TOKENIZER_FILES that sit in `src`, copied byte for byte into `out`."""
+    for name in TOKENIZER_FILES:
+        path = os.path.join(src, name)
+        if os.path.isfile(path):
+            with open(path, "rb") as fh, open(os.path.join(out, name), "wb") as dst:
+                dst.write(fh.read())
 
 
 def cut_config(config_path, layers, out):
@@ -658,7 +677,8 @@ def check(out, fixture, quantizer, quiet=False):
     for key in sorted(worst):
         err, ratio, n = worst[key]
         print(f"  {key}: {n} tensors, worst |err| {err:.6g}, worst err/scale {ratio:.4f}")
-    for sf in sorted(set(weight_map.values())) + ["model.safetensors.index.json", "config.json"]:
+    tokenizer = [n for n in TOKENIZER_FILES if os.path.isfile(os.path.join(out, n))]
+    for sf in sorted(set(weight_map.values())) + ["model.safetensors.index.json", "config.json"] + tokenizer:
         with open(os.path.join(out, sf), "rb") as fh:
             print(f"sha256 {sf} {hashlib.sha256(fh.read()).hexdigest()}")
 
@@ -777,7 +797,16 @@ def self_test():
                        "text_config": {"num_hidden_layers": 40,
                                        "layer_types": ["linear_attention"] * 40}}, fh)
         out = os.path.join(tmp, "out")
+        try:
+            make(fixture, out, config_path, StubQuantizer(), quiet=True)
+            expect("no tokenizer.json refused", False, "made")
+        except Refusal as e:
+            expect("no tokenizer.json refused", "tokenizer.json" in str(e), str(e))
+        expect("refused before writing", not os.path.exists(out))
+        with open(os.path.join(tmp, "tokenizer.json"), "w") as fh:
+            fh.write('{"version": "1.0"}')
         layers = make(fixture, out, config_path, StubQuantizer(), quiet=True)
+        expect("tokenizer copied", open(os.path.join(out, "tokenizer.json")).read() == '{"version": "1.0"}')
         expect("layers", layers == [(0, "linear"), (1, "full")], str(layers))
         with open(os.path.join(out, "config.json")) as fh:
             cut = json.load(fh)
