@@ -496,6 +496,7 @@ dependencies = [
  "bloomery-embed",
  "bloomery-gguf",
  "bloomery-jinja",
+ "bloomery-sampler",
  "bloomery-tokenizer",
  "bloomery-vision",
  "libc",
