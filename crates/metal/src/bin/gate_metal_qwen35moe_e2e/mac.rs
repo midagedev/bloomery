@@ -57,6 +57,11 @@
 //!   and last logits equal bit for bit over the same ids, one sample a
 //!   group covering every group the count counts, and the groups' weight
 //!   bytes equal to the file's own tensors walked under the plan's names.
+//! - `m_mlx`: the MLX-format fixture split (`qwen35moe-mlxsplit` under the
+//!   fixture root, every typed site MLX_A4, its routers MLX_A8) opens
+//!   through the session — the reader admitting its sites through Metal's
+//!   site lists — and `generate` over `Plain` emits the session's own
+//!   host-fed picks (`t_target`'s greedy pattern on that session).
 //!
 //! `--nodes` is a tool, not a clause: its set's prompt host-fed, then its
 //! step token traced, every named node against ik's, the first past its
@@ -96,6 +101,8 @@ mod free;
 mod generate;
 #[path = "keep.rs"]
 mod keep;
+#[path = "mlx.rs"]
+mod mlx;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "nodes.rs"]
@@ -422,7 +429,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 11] = [
+    const NAMES: [&str; 12] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -434,6 +441,7 @@ pub fn main() -> ExitCode {
         "g_generate",
         "f_deep",
         "p_profile",
+        "m_mlx",
     ];
     if args.iter().any(|a| a == "--list") {
         for name in NAMES {
@@ -550,6 +558,7 @@ pub fn main() -> ExitCode {
             "g_generate" => generate::g_generate(&mut session),
             "f_deep" => deep::f_deep(&device, library, &path),
             "p_profile" => profile::p_profile(&device, library, &path),
+            "m_mlx" => mlx::m_mlx(&device, library),
             _ => free::a_free(&mut session),
         };
         report.clause(name, result);

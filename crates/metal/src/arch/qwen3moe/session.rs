@@ -42,8 +42,8 @@ use bloomery_device::fault::Fault;
 use bloomery_device::{DeviceError, Elem, Elems, Stream};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
-use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, kinds35};
-use chain::arch::qwen3moe::read::{PlanDims, Read35, layer_plans};
+use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, SiteTy, kinds35};
+use chain::arch::qwen3moe::read::{PlanDims, Read35, Sites35, layer_plans};
 use chain::arch::qwen3moe::walk::Walk;
 use gguf::Split;
 use runtime::seqstate::{self, Kept};
@@ -72,6 +72,21 @@ const WHAT: &str = "qwen35moe session";
 /// positions is 288_000 bytes beside each position of the prompt, and a
 /// cut between points re-feeds at most 255 positions.
 pub const CHECKPOINT_EVERY: u32 = 256;
+
+/// The site types Metal's launches read, every list the same: the arena's
+/// mat-vec set (`arena`'s `quant_of`) as families — Q4_K, Q6_K and MLX_A4,
+/// the A4 kernels' affine 4-bit groups. The F32 tensors a session reads as
+/// values (the norms, the conv, the dt bias, `ssm_a`) and the router's
+/// MLX_A8, which its loader dequantizes exactly at open, are no typed site,
+/// so no list holds them; a type outside the lists is refused by name at the
+/// site (`file_site`).
+pub const SITES: Sites35 = Sites35 {
+    proj: &[SiteTy::Q4K, SiteTy::Q6K, SiteTy::MlxA4],
+    stacks: &[SiteTy::Q4K, SiteTy::Q6K, SiteTy::MlxA4],
+    gate_up: &[SiteTy::Q4K, SiteTy::Q6K, SiteTy::MlxA4],
+    down: &[SiteTy::Q4K, SiteTy::Q6K, SiteTy::MlxA4],
+    shared: &[SiteTy::Q4K, SiteTy::Q6K, SiteTy::MlxA4],
+};
 
 /// How long a profiled group's stamps wait for the completed status its
 /// settle already implied: the buffer's signal fires before the driver
@@ -377,7 +392,15 @@ impl Session {
         let spec = read.spec;
         let kinds = kinds35(&spec.layers)?;
         let pd = PlanDims::q35(&spec, WHAT)?;
-        let plans = layer_plans(&split, WHAT, &pd, &kinds, &spec.layers, Read35::Whole)?;
+        let plans = layer_plans(
+            &split,
+            WHAT,
+            &pd,
+            &kinds,
+            &spec.layers,
+            &SITES,
+            Read35::Whole,
+        )?;
         let kernels = Kernels::from_library(library)?;
         let stream = device.new_stream()?;
         let arena = Arena::open(device.metal(), &split, &spec, &plans, ctx)?;

@@ -224,6 +224,7 @@ fn file_weights(path: &Path, vocab: usize, picks: &[Vec<u32>]) -> Result<Vec<u64
         &pd,
         &kinds,
         &spec.layers,
+        &bloomery_metal::arch::qwen3moe::session::SITES,
         chain::arch::qwen3moe::read::Read35::Whole,
     )
     .map_err(|e| e.to_string())?;
