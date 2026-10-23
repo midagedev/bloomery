@@ -12,10 +12,12 @@
 // The lane map, the block loop, the nibble and 6-bit unpacking and the
 // simd_sum reduction are llama.cpp's, the same ones the dense mat-vec uses.
 //
-// The pair tile is one output row per SIMD group and two SIMD groups in the
-// threadgroup. The group's two weight rows are the gate row and the up row
-// of that one output, which is the dense mat-vec's register shape with the
-// two output rows replaced by the pair. grid.y is the slot. Slot 8 reads the
+// The pair tile is one pair of weight rows (a gate row and the up row of one
+// output) per two rows of the mat-vec geometry: a SIMD group owns
+// BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP weight rows, half that many outputs, and
+// the threadgroup holds BLOOMERY_MATVEC_SIMD_GROUPS of them. The tile is the
+// dense mat-vec's register shape: the group loads its share of the input once
+// and dots it with every row it owns. grid.y is the slot. Slot 8 reads the
 // shared-expert tensors; every other slot reads stack + ids[slot] * expert
 // bytes. The id is an int32, then that expert's rows, the way ggml mul_mv_id
 // reads an id. The select is uniform in the threadgroup. The route weight is
@@ -47,6 +49,13 @@
 using namespace metal;
 
 #pragma METAL fp contract(off)
+
+// The outputs one SIMD group of a pair owns: the mat-vec geometry's rows, a
+// gate row and an up row to an output.
+#define PAIR_OUTS (BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP / 2)
+
+static_assert(BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP % 2 == 0,
+              "a pair's weight rows are a gate and an up");
 
 // Six words: the output rows, the blocks of one row, the experts in the
 // stack, the layer a raise names, the output stride in floats, and the
@@ -114,22 +123,21 @@ inline bool fold_ids_ok(device const int * ids, uint n_experts) {
     return true;
 }
 
-// A slot's row the pair cannot compute: `site` raised in the layer, NaN in
-// the row.
-inline void pair_write_bad(device float * y, uint slot, uint stride, uint row,
+// A slot's rows the pair cannot compute: `site` raised in the layer, NaN in
+// every row of the threadgroup's.
+inline void pair_write_bad(device float * y, uint slot, uint stride, int row0, int rows,
                            device atomic_uint * faults, uint layer, uint site) {
     raise(faults, layer, site);
-    y[(ulong)slot * stride + row] = NAN;
+    for (short o = 0; o < PAIR_OUTS && row0 + o < rows; ++o) {
+        y[(ulong)slot * stride + (uint)(row0 + o)] = NAN;
+    }
 }
 
 inline void fold_write_bad(device float * y, int row0, int rows,
                            device atomic_uint * faults, uint layer) {
     raise(faults, layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
-    if (row0 < rows) {
-        y[(uint)row0] = NAN;
-    }
-    if (row0 + 1 < rows) {
-        y[(uint)row0 + 1u] = NAN;
+    for (short r = 0; r < BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP && row0 + r < rows; ++r) {
+        y[(uint)(row0 + r)] = NAN;
     }
 }
 
@@ -344,8 +352,10 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
     if (slot >= BLOOMERY_EXPERT_SLOTS) {
         return;
     }
-    // One output row per SIMD group, two SIMD groups in the threadgroup.
-    const int row0 = (int)(tgpig.x * 2u + (uint)sgitg);
+    // One pair (a gate row and an up row) to two rows of the mat-vec
+    // geometry: a SIMD group owns PAIR_OUTS outputs, the threadgroup
+    // BLOOMERY_MATVEC_SIMD_GROUPS of them.
+    const int row0 = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + (uint)sgitg) * (uint)PAIR_OUTS);
     if (row0 >= (int)args.rows) {
         return;
     }
@@ -353,18 +363,26 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
     int expert = 0;
     if (pair_expert(ids, slot, args.n_experts, expert)) {
         if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer,
+            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
                            BLOOMERY_FAULT_SITE_EXPERT_ID);
         }
         return;
     }
 
-    device const block_q4_K * grow =
-        pair_rows(gate, shexp_gate, slot == BLOOMERY_EXPERT_SHARED, expert, args.rows, args.nblocks, row0);
-    device const block_q4_K * urow =
-        pair_rows(up, shexp_up, slot == BLOOMERY_EXPERT_SHARED, expert, args.rows, args.nblocks, row0);
-    float sumg = 0.f;
-    float sumu = 0.f;
+    device const block_q4_K * grow[PAIR_OUTS];
+    device const block_q4_K * urow[PAIR_OUTS];
+    for (short o = 0; o < PAIR_OUTS; ++o) {
+        grow[o] = pair_rows(gate, shexp_gate, slot == BLOOMERY_EXPERT_SHARED, expert,
+                            args.rows, args.nblocks, row0 + o);
+        urow[o] = pair_rows(up, shexp_up, slot == BLOOMERY_EXPERT_SHARED, expert,
+                            args.rows, args.nblocks, row0 + o);
+    }
+    float sumg[PAIR_OUTS];
+    float sumu[PAIR_OUTS];
+    for (short o = 0; o < PAIR_OUTS; ++o) {
+        sumg[o] = 0.f;
+        sumu[o] = 0.f;
+    }
     float sum_sq = 0.f;
     for (int ib = ix; ib < (int)args.nblocks; ib += 4) {
         float yl[16];
@@ -372,22 +390,26 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
         float4 sumy;
         q4k_load<LOAD_NORM>(x + (ulong)ib * QK_K, gain + (ulong)ib * QK_K, iq, ir, 1.f, yl, yh,
                             sumy, &sum_sq);
-        sumg += q4k_partial(grow[ib], yl, yh, sumy, iq, ir);
-        sumu += q4k_partial(urow[ib], yl, yh, sumy, iq, ir);
+        for (short o = 0; o < PAIR_OUTS; ++o) {
+            sumg[o] += q4k_partial(grow[o][ib], yl, yh, sumy, iq, ir);
+            sumu[o] += q4k_partial(urow[o][ib], yl, yh, sumy, iq, ir);
+        }
     }
     const float sum_squares = simd_sum(sum_sq);
     const float scale = rms_scale(sum_squares, args.nblocks * QK_K, args.eps);
     if (!rms_usable(sum_squares, scale)) {
         if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer,
+            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
                            BLOOMERY_FAULT_SITE_NORM_QUANT);
         }
         return;
     }
-    float g = simd_sum(sumg) * scale;
-    float u = simd_sum(sumu) * scale;
-    if (tiisg == 0u) {
-        y[(ulong)slot * args.stride + (uint)row0] = pair_swiglu(g, u);
+    for (short o = 0; o < PAIR_OUTS && row0 + o < (int)args.rows; ++o) {
+        float g = simd_sum(sumg[o]) * scale;
+        float u = simd_sum(sumu[o]) * scale;
+        if (tiisg == 0u) {
+            y[(ulong)slot * args.stride + (uint)(row0 + o)] = pair_swiglu(g, u);
+        }
     }
 }
 
@@ -413,7 +435,7 @@ kernel void q6k_pair_swiglu(device const block_q6_K * gate [[buffer(0)]],
     if (slot >= BLOOMERY_EXPERT_SLOTS) {
         return;
     }
-    const int row0 = (int)(tgpig.x * 2u + (uint)sgitg);
+    const int row0 = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + (uint)sgitg) * (uint)PAIR_OUTS);
     if (row0 >= (int)args.rows) {
         return;
     }
@@ -421,39 +443,51 @@ kernel void q6k_pair_swiglu(device const block_q6_K * gate [[buffer(0)]],
     int expert = 0;
     if (pair_expert(ids, slot, args.n_experts, expert)) {
         if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer,
+            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
                            BLOOMERY_FAULT_SITE_EXPERT_ID);
         }
         return;
     }
 
-    device const block_q6_K * grow =
-        pair_rows(gate, shexp_gate, slot == BLOOMERY_EXPERT_SHARED, expert, args.rows, args.nblocks, row0);
-    device const block_q6_K * urow =
-        pair_rows(up, shexp_up, slot == BLOOMERY_EXPERT_SHARED, expert, args.rows, args.nblocks, row0);
-    float sumg = 0.f;
-    float sumu = 0.f;
+    device const block_q6_K * grow[PAIR_OUTS];
+    device const block_q6_K * urow[PAIR_OUTS];
+    for (short o = 0; o < PAIR_OUTS; ++o) {
+        grow[o] = pair_rows(gate, shexp_gate, slot == BLOOMERY_EXPERT_SHARED, expert,
+                            args.rows, args.nblocks, row0 + o);
+        urow[o] = pair_rows(up, shexp_up, slot == BLOOMERY_EXPERT_SHARED, expert,
+                            args.rows, args.nblocks, row0 + o);
+    }
+    float sumg[PAIR_OUTS];
+    float sumu[PAIR_OUTS];
+    for (short o = 0; o < PAIR_OUTS; ++o) {
+        sumg[o] = 0.f;
+        sumu[o] = 0.f;
+    }
     float sum_sq = 0.f;
     for (int ib = ix; ib < (int)args.nblocks; ib += 2) {
         float yl[16];
         q6k_load<LOAD_NORM>(x + (ulong)ib * QK_K, gain + (ulong)ib * QK_K, ip, l0, 1.f, yl,
                             &sum_sq);
-        sumg += q6k_partial(grow[ib], yl, ip, l0);
-        sumu += q6k_partial(urow[ib], yl, ip, l0);
+        for (short o = 0; o < PAIR_OUTS; ++o) {
+            sumg[o] += q6k_partial(grow[o][ib], yl, ip, l0);
+            sumu[o] += q6k_partial(urow[o][ib], yl, ip, l0);
+        }
     }
     const float sum_squares = simd_sum(sum_sq);
     const float scale = rms_scale(sum_squares, args.nblocks * QK_K, args.eps);
     if (!rms_usable(sum_squares, scale)) {
         if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer,
+            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
                            BLOOMERY_FAULT_SITE_NORM_QUANT);
         }
         return;
     }
-    float g = simd_sum(sumg) * scale;
-    float u = simd_sum(sumu) * scale;
-    if (tiisg == 0u) {
-        y[(ulong)slot * args.stride + (uint)row0] = pair_swiglu(g, u);
+    for (short o = 0; o < PAIR_OUTS && row0 + o < (int)args.rows; ++o) {
+        float g = simd_sum(sumg[o]) * scale;
+        float u = simd_sum(sumu[o]) * scale;
+        if (tiisg == 0u) {
+            y[(ulong)slot * args.stride + (uint)(row0 + o)] = pair_swiglu(g, u);
+        }
     }
 }
 
@@ -472,8 +506,10 @@ kernel void q4k_down_fold(device const block_q4_K * down [[buffer(0)]],
     const short it = tiisg % 8;
     const short iq = it / 4;
     const short ir = it % 4;
-    // Two rows per SIMD group, two SIMD groups: four rows in the threadgroup.
-    const int row0 = (int)((tgpig.x * 2u + (uint)sgitg) * 2u);
+    // BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP rows per SIMD group,
+    // BLOOMERY_MATVEC_SIMD_GROUPS of them in the threadgroup.
+    constexpr short NR0 = BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP;
+    const int row0 = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + (uint)sgitg) * (uint)NR0);
     if (row0 >= (int)args.rows) {
         return;
     }
@@ -487,31 +523,26 @@ kernel void q4k_down_fold(device const block_q4_K * down [[buffer(0)]],
         return;
     }
 
-    float sum0 = 0.f;
-    float sum1 = 0.f;
-    const int row1 = row0 + 1;
-    const bool has1 = row1 < (int)args.rows;
+    float sum[NR0];
+    for (short r = 0; r < NR0; ++r) {
+        sum[r] = 0.f;
+    }
     for (int ib = ix; ib < BLOOMERY_EXPERT_BLOCKS; ib += 4) {
         float scale = w[ib >> 1];
         float yl[16];
         float yh[16];
         float4 sumy;
         q4k_load<LOAD_ROUTE>(h + (ulong)ib * QK_K, nullptr, iq, ir, scale, yl, yh, sumy, nullptr);
-        device const block_q4_K * b0 =
-            fold_block<block_q4_K>(down, shared, ids, args.rows, row0, ib);
-        sum0 += q4k_partial(*b0, yl, yh, sumy, iq, ir);
-        if (has1) {
-            device const block_q4_K * b1 =
-                fold_block<block_q4_K>(down, shared, ids, args.rows, row1, ib);
-            sum1 += q4k_partial(*b1, yl, yh, sumy, iq, ir);
+        for (short r = 0; r < NR0 && row0 + r < (int)args.rows; ++r) {
+            device const block_q4_K * b =
+                fold_block<block_q4_K>(down, shared, ids, args.rows, row0 + r, ib);
+            sum[r] += q4k_partial(*b, yl, yh, sumy, iq, ir);
         }
     }
-    float d0 = simd_sum(sum0);
-    float d1 = simd_sum(sum1);
-    if (tiisg == 0u) {
-        y[(uint)row0] += d0;
-        if (has1) {
-            y[(uint)row1] += d1;
+    for (short r = 0; r < NR0 && row0 + r < (int)args.rows; ++r) {
+        float d = simd_sum(sum[r]);
+        if (tiisg == 0u) {
+            y[(uint)(row0 + r)] += d;
         }
     }
 }
@@ -532,7 +563,8 @@ kernel void q6k_down_fold(device const block_q6_K * down [[buffer(0)]],
     const short ip = tid / 8;
     const short il = tid % 8;
     const short l0 = 4 * il;
-    const int row0 = (int)((tgpig.x * 2u + (uint)sgitg) * 2u);
+    constexpr short NR0 = BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP;
+    const int row0 = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + (uint)sgitg) * (uint)NR0);
     if (row0 >= (int)args.rows) {
         return;
     }
@@ -544,29 +576,24 @@ kernel void q6k_down_fold(device const block_q6_K * down [[buffer(0)]],
         return;
     }
 
-    float sum0 = 0.f;
-    float sum1 = 0.f;
-    const int row1 = row0 + 1;
-    const bool has1 = row1 < (int)args.rows;
+    float sum[NR0];
+    for (short r = 0; r < NR0; ++r) {
+        sum[r] = 0.f;
+    }
     for (int ib = ix; ib < BLOOMERY_EXPERT_BLOCKS; ib += 2) {
         float scale = w[ib >> 1];
         float yl[16];
         q6k_load<LOAD_ROUTE>(h + (ulong)ib * QK_K, nullptr, ip, l0, scale, yl, nullptr);
-        device const block_q6_K * b0 =
-            fold_block<block_q6_K>(down, shared, ids, args.rows, row0, ib);
-        sum0 += q6k_partial(*b0, yl, ip, l0);
-        if (has1) {
-            device const block_q6_K * b1 =
-                fold_block<block_q6_K>(down, shared, ids, args.rows, row1, ib);
-            sum1 += q6k_partial(*b1, yl, ip, l0);
+        for (short r = 0; r < NR0 && row0 + r < (int)args.rows; ++r) {
+            device const block_q6_K * b =
+                fold_block<block_q6_K>(down, shared, ids, args.rows, row0 + r, ib);
+            sum[r] += q6k_partial(*b, yl, ip, l0);
         }
     }
-    float d0 = simd_sum(sum0);
-    float d1 = simd_sum(sum1);
-    if (tiisg == 0u) {
-        y[(uint)row0] += d0;
-        if (has1) {
-            y[(uint)row1] += d1;
+    for (short r = 0; r < NR0 && row0 + r < (int)args.rows; ++r) {
+        float d = simd_sum(sum[r]);
+        if (tiisg == 0u) {
+            y[(uint)(row0 + r)] += d;
         }
     }
 }

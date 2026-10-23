@@ -16,7 +16,10 @@ pub const PARTIALS: usize = ROWS * SPLIT;
 
 /// The SIMD groups in the router's threadgroup. Eight fill the threadgroup
 /// the norm's cooperative load wants (256 lanes over the 512 float4s of the
-/// input), and 257 rows make 33 threadgroups.
+/// input), and 257 rows make 33 threadgroups. The kernel takes any count that
+/// divides the input's float4s exactly (the norm's lanes cover the input, so
+/// the probe can sweep the threadgroup count a card fills best); the norm
+/// band's counts follow the shipped count.
 pub const SIMD_GROUPS: usize = 8;
 
 /// The width of a SIMD group. The mat-vec geometry owns the same width.

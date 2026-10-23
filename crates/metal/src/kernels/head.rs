@@ -28,14 +28,15 @@ pub const HEAD_SIMD_GROUPS: usize = 8;
 /// The threads in the head's threadgroup.
 pub const HEAD_THREADS: usize = 256;
 
-/// The threadgroups of the engine's head.
-pub const HEAD_GROUPS: usize = 15_520;
-
-/// The rows one threadgroup owns: eight SIMD groups, two rows each.
+/// The rows one threadgroup owns: the head's SIMD groups of the mat-vec
+/// geometry's rows each.
 const ROWS_PER_THREADGROUP: usize = HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP;
 
-const _: () = assert!(ROWS_PER_THREADGROUP == 16);
+/// The threadgroups of the engine's head.
+pub const HEAD_GROUPS: usize = HEAD_VOCAB / ROWS_PER_THREADGROUP;
+
 const _: () = assert!(HEAD_THREADS == 32 * HEAD_SIMD_GROUPS);
+const _: () = assert!(HEAD_VOCAB.is_multiple_of(ROWS_PER_THREADGROUP));
 const _: () = assert!(HEAD_GROUPS * ROWS_PER_THREADGROUP == HEAD_VOCAB);
 
 /// One head launch.
@@ -79,8 +80,9 @@ fn refuse(detail: impl Into<String>) -> DeviceError {
 }
 
 /// The shape of `p`, refused by name when it is not the kernel's or a window
-/// is not that shape's.
-fn check(p: &HeadParams<'_>) -> Result<(), DeviceError> {
+/// is not that shape's. `rows_per_threadgroup` is the geometry of the
+/// pipelines this launch encodes against.
+fn check(p: &HeadParams<'_>, rows_per_threadgroup: usize) -> Result<(), DeviceError> {
     if p.k == 0 || !p.k.is_multiple_of(256) {
         return Err(refuse(format!(
             "K is {}, the kernel reads a positive multiple of 256",
@@ -96,7 +98,7 @@ fn check(p: &HeadParams<'_>) -> Result<(), DeviceError> {
     let nblocks = p.k / 256;
     let weight_bytes = super::weight_bytes(Quant::Q6K, p.rows, nblocks)
         .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.k)))?;
-    let candidates = p.rows.div_ceil(ROWS_PER_THREADGROUP);
+    let candidates = p.rows.div_ceil(rows_per_threadgroup);
     check_window_len(WHAT, "x", p.x.len(), p.k)?;
     check_window_len(WHAT, "gain", p.gain.len(), p.k)?;
     check_window_len(WHAT, "logits", p.logits.len(), p.rows)?;
@@ -126,9 +128,10 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: HeadParams<'_>,
     ) -> Result<(), DeviceError> {
-        check(&p)?;
+        let rows_per_threadgroup = HEAD_SIMD_GROUPS * self.rows_per_simd_group;
+        check(&p, rows_per_threadgroup)?;
         let nblocks = p.k / 256;
-        let groups = p.rows.div_ceil(ROWS_PER_THREADGROUP);
+        let groups = p.rows.div_ceil(rows_per_threadgroup);
         let args = args_bytes([
             word(WHAT, "the row count", p.rows)?,
             word(WHAT, "the block count", nblocks)?,

@@ -162,6 +162,16 @@ pub const MUTANTS: &[Mutant] = &[
         ],
     },
     Mutant {
+        name: "fold_tail",
+        clause: "fold",
+        why: "the fold's store no longer stops at the last row",
+        edits: &[(
+            "    for (short r = 0; r < NR0 && row0 + r < (int)args.rows; ++r) {\n        float d = simd_sum(sum[r]);",
+            "    for (short r = 0; r < NR0; ++r) {\n        float d = simd_sum(sum[r]);",
+            2,
+        )],
+    },
+    Mutant {
         name: "nsg_first_row",
         clause: "nsg",
         why: "the first row of a threadgroup ignores the SIMD group count",
@@ -262,8 +272,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "pair_id",
         why: "an id past the stack writes zero",
         edits: &[(
-            "y[(ulong)slot * stride + row] = NAN;",
-            "y[(ulong)slot * stride + row] = 0.0f;",
+            "y[(ulong)slot * stride + (uint)(row0 + o)] = NAN;",
+            "y[(ulong)slot * stride + (uint)(row0 + o)] = 0.0f;",
             1,
         )],
     },
@@ -284,8 +294,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "pair_norm",
         why: "a pair norm that cannot take its input writes NaN rows and raises nothing",
         edits: &[(
-            "pair_write_bad(y, slot, args.stride, (uint)row0, faults, args.layer,\n                           BLOOMERY_FAULT_SITE_NORM_QUANT);",
-            "y[(ulong)slot * args.stride + (uint)row0] = NAN;",
+            "pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,\n                           BLOOMERY_FAULT_SITE_NORM_QUANT);",
+            "for (short o = 0; o < PAIR_OUTS && row0 + o < (int)args.rows; ++o) {\n                y[(ulong)slot * args.stride + (uint)(row0 + o)] = NAN;\n            }",
             2,
         )],
     },
@@ -299,10 +309,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "fold_no_resid",
         clause: "fold",
         why: "the fold overwrites the residual",
-        edits: &[
-            ("y[(uint)row0] += d0;", "y[(uint)row0] = d0;", 2),
-            ("y[(uint)row1] += d1;", "y[(uint)row1] = d1;", 2),
-        ],
+        edits: &[("y[(uint)(row0 + r)] += d;", "y[(uint)(row0 + r)] = d;", 2)],
     },
     Mutant {
         name: "delta_fma_sign",

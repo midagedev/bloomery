@@ -594,6 +594,7 @@ pub fn main() -> ExitCode {
             Box::new(|| ctx.with(clauses_norm::headnorm_nan)),
         ),
         ("nsg", Box::new(|| ctx.with(clauses_matvec::nsg))),
+        ("nrows", Box::new(|| ctx.with(clauses_matvec::nrows))),
     ];
     let clauses: Vec<_> = front
         .into_iter()

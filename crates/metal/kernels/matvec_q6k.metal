@@ -12,11 +12,10 @@
 //   ggml/src/ggml-metal/kernels/mul_mv.metal
 // The lane map (tid/ix/ip/il), the two-block stride, the unpacking of the
 // 6-bit values, the row loop over a SIMD group's rows and the simd_sum
-// reduction are llama.cpp's: 2 rows per SIMD group. The SIMD groups in a
-// threadgroup are the function constant of norm.metal: 2 for the dense
-// mat-vec, 8 for the output head. The tail and the variants are matvec_q4k.metal's:
-// a SIMD group past the last row returns, and a row past the last re-reads the
-// last row and is never stored.
+// reduction are llama.cpp's. The rows a SIMD group owns and the SIMD groups
+// in a threadgroup are matvec_q4k.metal's geometry. The tail and the variants
+// are its too: a SIMD group past the last row returns, and a row past the
+// last re-reads the last row and is never stored.
 //
 // This file comes after matvec_q4k.metal (QK_K, FOR_UNROLL) and norm.metal.
 

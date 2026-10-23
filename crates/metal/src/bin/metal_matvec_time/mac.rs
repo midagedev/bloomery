@@ -56,9 +56,26 @@
 //! bandwidth, the row still prints its own microseconds and marks the byte
 //! time unavailable, by name.
 //!
+//! The routed experts are timed beside the mat-vecs: the gate-up pair
+//! (`q4k_pair_swiglu`, nine slots of 512 by 2048, the session's gate_up) and
+//! the folded down (`q4k_down_fold`, 2048 rows of the slots' 512, the
+//! session's down), at eight routed experts and the shared one, on synthetic
+//! stacks. `--only pair` / `--only fold` select them.
+//!
+//! `--geometry rows=N,sg=M,router_sg=K` compiles the kernels' own source with
+//! other values of the geometry constants — the rows a SIMD group owns
+//! (2/4/8, a `#define` of the source), the SIMD groups in a mat-vec
+//! threadgroup (the kernels' function constant) and the router's own group
+//! count (another `#define`) — and launches every arm through that variant,
+//! so one binary sweeps the geometry: the rows of a run under a variant carry
+//! `[rows=N sg=M router_sg=K]` in their shape label. The pair and the fold
+//! follow the mat-vec geometry: a pair's gate and up rows are two of the
+//! geometry's rows, the fold owns the geometry's rows a SIMD group.
+//!
 //! Flags: `--only` (repeatable; comma-separated `matvec`, `seg`, `headnorm`,
-//! `q4k`, `q6k`, `router`, `head`, or a shape label), `--trials N`,
-//! `--chain N`, `--gaps`, `--no-check`, `--help`.
+//! `pair`, `fold`, `q4k`, `q6k`, `router`, `head`, or a shape label),
+//! `--trials N`, `--chain N`, `--geometry rows=N,sg=M,router_sg=K`, `--gaps`,
+//! `--no-check`, `--help`.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -69,9 +86,10 @@ use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::ComputeEncoder;
 use bloomery_metal::kernels::router::{self, RouterParams};
 use bloomery_metal::kernels::{
-    BLOCK_VALUES, HEAD_GROUPS, HEAD_K, HEAD_SIMD_GROUPS, HEAD_VOCAB, HeadNormParams, HeadParams,
-    Kernels, MatvecParams, Mode, NormOnLoad, PARTIALS_PER_HEAD, Quant, SegParams, Segment,
-    VALUE_HEADS,
+    BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, FoldParams, HEAD_GROUPS, HEAD_K, HEAD_SIMD_GROUPS,
+    HEAD_VOCAB, HeadNormParams, HeadParams, Kernels, MatvecParams, Mode, NormOnLoad,
+    PARTIALS_PER_HEAD, PairParams, Quant, ROUTED_IDS, ROWS_PER_SIMD_GROUP, SIMD_GROUPS_PER_GROUP,
+    SegParams, Segment, SharedPlan, VALUE_HEADS,
 };
 use bloomery_metal::library::{Library, SOURCE};
 use bloomery_metal::{GpuInterval, MetalStream};
@@ -119,7 +137,7 @@ const _: () = assert!(router::ROWS == 257 && router::K == 2048);
 const _: () = assert!(router::TOP_K_MAX == 8);
 const _: () = assert!(HEAD_VOCAB == 248_320 && HEAD_K == 2048);
 const _: () = assert!(ROUTER_BYTES == 2_105_344 && ROUTER_BYTES.is_multiple_of(256));
-const _: () = assert!(HEAD_GROUPS * 16 == HEAD_VOCAB);
+const _: () = assert!(HEAD_GROUPS * HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP == HEAD_VOCAB);
 
 /// How one kernel is launched into a timed command buffer.
 struct Arm {
@@ -697,6 +715,301 @@ fn phase_kernels(device: &MetalDevice, phase: &Phase) -> Result<Kernels, String>
     Kernels::from_library(&library).map_err(why)
 }
 
+/// The geometry a run compiles the kernels' source at: the rows a SIMD group
+/// owns, the SIMD groups in a mat-vec's threadgroup, and the router's own
+/// group count. The default is the shipped source's own geometry; a value
+/// beside it is a variant source, compiled the way a phase cut's is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Geometry {
+    rows: usize,
+    simdgroups: usize,
+    router_sg: usize,
+}
+
+impl Geometry {
+    const DEFAULT: Self = Self {
+        rows: ROWS_PER_SIMD_GROUP,
+        simdgroups: SIMD_GROUPS_PER_GROUP,
+        router_sg: router::SG,
+    };
+
+    fn is_default(self) -> bool {
+        self == Self::DEFAULT
+    }
+
+    /// The marker a variant run's rows carry, empty for the default.
+    fn label(self) -> String {
+        if self.is_default() {
+            return String::new();
+        }
+        format!(
+            " [rows={} sg={} router_sg={}]",
+            self.rows, self.simdgroups, self.router_sg
+        )
+    }
+}
+
+/// The kernels of a geometry variant: the source with the two `#define`s of
+/// the geometry replaced, compiled by the runtime, one occurrence of each
+/// named so a header edit that moves one is an error, not a silent no-op.
+fn geometry_kernels(device: &MetalDevice, geometry: Geometry) -> Result<Kernels, String> {
+    let edits = [
+        (
+            format!(
+                "#define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {}",
+                ROWS_PER_SIMD_GROUP
+            ),
+            format!(
+                "#define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {}",
+                geometry.rows
+            ),
+        ),
+        (
+            format!("#define BLOOMERY_ROUTER_SG {}", router::SG),
+            format!("#define BLOOMERY_ROUTER_SG {}", geometry.router_sg),
+        ),
+    ];
+    let mut text = SOURCE.to_string();
+    for (find, with) in edits {
+        let found = text.matches(find.as_str()).count();
+        if found != 1 {
+            return Err(format!(
+                "the geometry define {find:?} occurs {found} times, not 1; the header moved"
+            ));
+        }
+        text = text.replacen(find.as_str(), with.as_str(), 1);
+    }
+    let library = Library::from_source_text(device, &text).map_err(why)?;
+    Kernels::with_geometry(
+        &library,
+        geometry.rows,
+        geometry.simdgroups,
+        geometry.router_sg,
+    )
+    .map_err(why)
+}
+
+/// The experts a pair or fold stack holds: big enough that eight routed ids
+/// and the shared expert read distinct weights, small enough to build fast.
+const PROBE_EXPERTS: usize = 16;
+
+/// The ids a probe pair or fold launches: eight distinct routed experts.
+const PROBE_IDS: [i32; ROUTED_IDS] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+/// The bytes of `experts` experts of `rows` rows over `cols` columns.
+fn expert_stack_bytes(quant: Quant, experts: usize, rows: usize, cols: usize) -> usize {
+    experts * rows * cols / BLOCK_VALUES * quant.block_bytes()
+}
+
+/// One tensor's share of the working set: `copies` copies at a 256-aligned
+/// stride, sized so every tensor of the dispatch together fills about
+/// `budget` bytes.
+fn spread_share(bytes: usize, budget: usize) -> (usize, usize, usize) {
+    let stride = bytes.div_ceil(256) * 256;
+    let copies = (budget / stride).max(1);
+    (stride, copies, copies * stride)
+}
+
+/// Upload `copies` copies of `one` at `stride`, the probe's working-set way.
+fn upload_copies(
+    device: &MetalDevice,
+    stream: &MetalStream,
+    one: &[u8],
+    stride: usize,
+    copies: usize,
+) -> Result<bloomery_metal::buffer::MetalBuffer<u8>, String> {
+    let mut all = vec![0u8; copies * stride];
+    for c in 0..copies {
+        all[c * stride..c * stride + one.len()].copy_from_slice(one);
+    }
+    let buffer = device.upload(stream, &all).map_err(why)?;
+    Ok(buffer)
+}
+
+/// The gate-up pair at the session's shape: nine slots of 512 by 2048, eight
+/// routed experts and the shared one, synthetic stacks. Every dispatch reads
+/// the same bytes of another copy, so every dispatch must give the same bits.
+fn time_pair(
+    device: &MetalDevice,
+    kernels: &Kernels,
+    quant: Quant,
+    arm: &Arm,
+    trials: usize,
+) -> Result<Timing, String> {
+    let stream = device.stream();
+    device.fault_word().clear(stream).map_err(why)?;
+    let rows = EXPERT_K;
+    let cols = 2048usize;
+    let one_expert = expert_stack_bytes(quant, 1, rows, cols);
+    let stack = expert_stack_bytes(quant, PROBE_EXPERTS, rows, cols);
+    let gate = matrix(quant, PROBE_EXPERTS * rows, cols, 0x70A1);
+    let up = matrix(quant, PROBE_EXPERTS * rows, cols, 0x70B2);
+    let shared_gate = matrix(quant, rows, cols, 0x70C3);
+    let shared_up = matrix(quant, rows, cols, 0x70D4);
+    let bytes = EXPERT_SLOTS * 2 * one_expert;
+    // Four weight tensors: the stacks get the budget's lion share, the shared
+    // experts one expert's worth of copies each.
+    let budget = WORKING_SET_BYTES / 4;
+    let (stack_stride, stack_copies, stack_set) = spread_share(stack, budget);
+    let (one_stride, one_copies, one_set) = spread_share(one_expert, budget);
+    let gate_w = upload_copies(device, stream, &gate, stack_stride, stack_copies)?;
+    let up_w = upload_copies(device, stream, &up, stack_stride, stack_copies)?;
+    let shg_w = upload_copies(device, stream, &shared_gate, one_stride, one_copies)?;
+    let shu_w = upload_copies(device, stream, &shared_up, one_stride, one_copies)?;
+    let working_set = 2 * stack_set + 2 * one_set;
+    let x = device
+        .upload(stream, &oracle::activations(cols, 0x78, 1.0))
+        .map_err(why)?;
+    let gain = device.upload(stream, &vec![1.0f32; cols]).map_err(why)?;
+    let ids = device.upload(stream, &PROBE_IDS).map_err(why)?;
+    let dispatches = dispatch_count(arm, bytes);
+    let buffers = WARMUPS + trials;
+    let out_values = EXPERT_SLOTS * EXPERT_K;
+    let mut y = device
+        .zeroed::<f32>(stream, Elems(buffers * dispatches * out_values))
+        .map_err(why)?;
+    let timing = time_dispatches(
+        stream,
+        &TimedWork {
+            bytes,
+            dispatches,
+            copies: stack_copies,
+            working_set_bytes: working_set,
+            trials,
+            arm,
+        },
+        |encoder, n| {
+            let sg = (n % one_copies) * one_stride;
+            kernels
+                .pair(
+                    encoder,
+                    PairParams {
+                        quant,
+                        slots: EXPERT_SLOTS,
+                        k: EXPERT_K,
+                        cols,
+                        n_experts: PROBE_EXPERTS,
+                        ids: ids.window(Elems(0), Elems(ROUTED_IDS)).map_err(why)?,
+                        gate: gate_w
+                            .window(Elems((n % stack_copies) * stack_stride), Elems(stack))
+                            .map_err(why)?,
+                        up: up_w
+                            .window(Elems((n % stack_copies) * stack_stride), Elems(stack))
+                            .map_err(why)?,
+                        shared_gate: shg_w.window(Elems(sg), Elems(one_expert)).map_err(why)?,
+                        shared_up: shu_w.window(Elems(sg), Elems(one_expert)).map_err(why)?,
+                        x: x.window(Elems(0), Elems(cols)).map_err(why)?,
+                        gain: gain.window(Elems(0), Elems(cols)).map_err(why)?,
+                        eps: 1e-6,
+                        y: y.window_mut(Elems(n * out_values), Elems(out_values))
+                            .map_err(why)?,
+                        out_stride: EXPERT_K,
+                        fault: device.fault_word(),
+                        layer: LAYER_NONE,
+                    },
+                )
+                .map_err(why)?;
+            Ok(())
+        },
+    )?;
+    same_outputs(device, stream, &y, out_values)?;
+    ticket_and_fault_free(device, stream)?;
+    Ok(timing)
+}
+
+/// The folded down at the session's shape: 2048 rows over the nine slots'
+/// 512-wide hidden states, the route weights applied on the load.
+fn time_fold(
+    device: &MetalDevice,
+    kernels: &Kernels,
+    quant: Quant,
+    arm: &Arm,
+    trials: usize,
+) -> Result<Timing, String> {
+    let stream = device.stream();
+    device.fault_word().clear(stream).map_err(why)?;
+    let rows = 2048usize;
+    let k = EXPERT_K;
+    let one_expert = expert_stack_bytes(quant, 1, rows, k);
+    let stack = expert_stack_bytes(quant, PROBE_EXPERTS, rows, k);
+    let down = matrix(quant, PROBE_EXPERTS * rows, k, 0x70E5);
+    let shared = matrix(quant, rows, k, 0x70F6);
+    let bytes = EXPERT_SLOTS * one_expert;
+    let budget = WORKING_SET_BYTES / 3;
+    let (stack_stride, stack_copies, stack_set) = spread_share(stack, budget);
+    let (one_stride, one_copies, one_set) = spread_share(one_expert, budget);
+    let down_w = upload_copies(device, stream, &down, stack_stride, stack_copies)?;
+    let sh_w = upload_copies(device, stream, &shared, one_stride, one_copies)?;
+    let working_set = stack_set + one_set;
+    let mut h = oracle::activations(EXPERT_SLOTS * k, 0x78, 1.0);
+    for slot in 0..EXPERT_SLOTS {
+        for v in &mut h[slot * k..(slot + 1) * k] {
+            *v *= 1.0 + 0.125 * slot as f32;
+        }
+    }
+    let h = device.upload(stream, &h).map_err(why)?;
+    let route: Vec<f32> = (0..EXPERT_SLOTS).map(|s| 0.1 * (s as f32 + 1.0)).collect();
+    let w = device.upload(stream, &route).map_err(why)?;
+    let ids = device.upload(stream, &PROBE_IDS).map_err(why)?;
+    let dispatches = dispatch_count(arm, bytes);
+    let buffers = WARMUPS + trials;
+    let mut y = device
+        .zeroed::<f32>(stream, Elems(buffers * dispatches * rows))
+        .map_err(why)?;
+    let timing = time_dispatches(
+        stream,
+        &TimedWork {
+            bytes,
+            dispatches,
+            copies: stack_copies,
+            working_set_bytes: working_set,
+            trials,
+            arm,
+        },
+        |encoder, n| {
+            let sh = (n % one_copies) * one_stride;
+            let out = y.window_mut(Elems(n * rows), Elems(rows)).map_err(why)?;
+            kernels
+                .fold(
+                    encoder,
+                    FoldParams {
+                        quant,
+                        shared: SharedPlan::Same(
+                            sh_w.window(Elems(sh), Elems(one_expert)).map_err(why)?,
+                        ),
+                        rows,
+                        slots: EXPERT_SLOTS,
+                        k,
+                        n_experts: PROBE_EXPERTS,
+                        ids: ids.window(Elems(0), Elems(ROUTED_IDS)).map_err(why)?,
+                        down: down_w
+                            .window(Elems((n % stack_copies) * stack_stride), Elems(stack))
+                            .map_err(why)?,
+                        h: h.window(Elems(0), Elems(EXPERT_SLOTS * k)).map_err(why)?,
+                        w: w.window(Elems(0), Elems(EXPERT_SLOTS)).map_err(why)?,
+                        y: &out,
+                        fault: device.fault_word(),
+                        layer: LAYER_NONE,
+                    },
+                )
+                .map_err(why)?;
+            Ok(())
+        },
+    )?;
+    same_outputs(device, stream, &y, rows)?;
+    ticket_and_fault_free(device, stream)?;
+    Ok(timing)
+}
+
+/// The pair and fold raise no fault and hold no ticket; the probe's own
+/// launches carry none.
+fn ticket_and_fault_free(device: &MetalDevice, stream: &MetalStream) -> Result<(), String> {
+    if let Some(fault) = device.fault_word().read(stream).map_err(why)? {
+        return Err(format!("the kernel raised {fault}"));
+    }
+    Ok(())
+}
+
 /// The router's phase cuts: the norm's load pass (the gained input a constant,
 /// the squares skipped; the reduction stays), and the tail (the last
 /// threadgroup resets its ticket and selects nothing).
@@ -728,6 +1041,43 @@ const HEADNORM_PHASES: &[Phase] = &[
         with: "    const int first_row = simd_first_row(tgpig.x, sgitg);\n    q4k_rows<false, true, false>(W, g, y, args.nblocks, args.eps, args.layer,\n                                 nullptr, nullptr, faults, first_row, (int)args.rows, tiisg);",
     },
 ];
+
+/// The dense mat-vec's inner-loop cuts, beside its own rows: the block loop
+/// with two blocks a step (a 512-value pass, MLX's loop shape), a compiler
+/// unroll of the shipped loop, so the lane's block order and the row's float
+/// order do not move. One cut a quant: each find text is its kernel's own.
+const MATVEC_UNROLL: &str = "_Pragma(\"clang loop unroll_count(2)\")\n";
+
+const MATVEC_PHASES: &[(&str, Quant, &str)] = &[
+    (
+        "unroll2",
+        Quant::Q4K,
+        "    for (int ib = ix; ib < nb; ib += 4) {",
+    ),
+    (
+        "unroll2",
+        Quant::Q6K,
+        "    for (int i = ix; i < nb; i += 2) {",
+    ),
+];
+
+/// The kernels of a mat-vec phase cut: the pragma in front of the quant's
+/// block loop.
+fn matvec_phase_kernels(
+    device: &MetalDevice,
+    phase: (&str, Quant, &str),
+) -> Result<Kernels, String> {
+    let (name, _, find) = phase;
+    let found = SOURCE.matches(find).count();
+    if found != 1 {
+        return Err(format!(
+            "phase {name}: its find text occurs {found} times, not 1; the kernel moved"
+        ));
+    }
+    let text = SOURCE.replacen(find, &format!("{MATVEC_UNROLL}{find}"), 1);
+    let library = Library::from_source_text(device, &text).map_err(why)?;
+    Kernels::from_library(&library).map_err(why)
+}
 
 fn time_router(
     device: &MetalDevice,
@@ -838,6 +1188,9 @@ fn time_head(
 ) -> Result<Timing, String> {
     let stream = device.stream();
     device.fault_word().clear(stream).map_err(why)?;
+    // The variant's rows a SIMD group move the threadgroup count: the
+    // candidates buffer follows the geometry the launch encodes against.
+    let head_groups = HEAD_VOCAB.div_ceil(HEAD_SIMD_GROUPS * kernels.rows_per_simd_group());
     let one = matrix(Quant::Q6K, HEAD_VOCAB, HEAD_K, 0x6EAD);
     let bytes = one.len();
     if bytes != head_bytes() {
@@ -861,7 +1214,7 @@ fn time_head(
     let buffers = WARMUPS + trials;
     // One scratch set per committed buffer, as for the router.
     let mut candidates = device
-        .zeroed::<u64>(stream, Elems(buffers * HEAD_GROUPS))
+        .zeroed::<u64>(stream, Elems(buffers * head_groups))
         .map_err(why)?;
     let mut ticket = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
     let mut step_id = device.zeroed::<u32>(stream, Elems(buffers)).map_err(why)?;
@@ -895,7 +1248,7 @@ fn time_head(
                         gain: gain.window(Elems(0), Elems(HEAD_K)).map_err(why)?,
                         logits: y.window_mut(Elems(n * rows), Elems(rows)).map_err(why)?,
                         candidates: candidates
-                            .window_mut(Elems(b * HEAD_GROUPS), Elems(HEAD_GROUPS))
+                            .window_mut(Elems(b * head_groups), Elems(head_groups))
                             .map_err(why)?,
                         ticket: ticket.window_mut(Elems(b), Elems(1)).map_err(why)?,
                         step_id: step_id.window_mut(Elems(b), Elems(1)).map_err(why)?,
@@ -925,6 +1278,44 @@ fn percentile(xs: &[f64], p: f64) -> f64 {
     v.sort_by(f64::total_cmp);
     let rank = (p * v.len() as f64).ceil() as usize;
     v[rank.saturating_sub(1)]
+}
+
+/// The `--geometry` value: `key=value` pairs of `rows`, `sg` and `router_sg`
+/// over a comma, each optional, refused by name when a key is unknown or a
+/// value is not a whole number.
+fn geometry_of(value: Option<&String>) -> Result<Geometry, String> {
+    let Some(value) = value else {
+        return Err("--geometry takes a value".to_string());
+    };
+    let mut geometry = Geometry::DEFAULT;
+    let mut seen = 0usize;
+    for tok in value.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let (key, raw) = tok
+            .split_once('=')
+            .ok_or_else(|| format!("--geometry takes key=value pairs, not {tok:?}"))?;
+        let n: usize = raw
+            .parse()
+            .map_err(|_| format!("--geometry's {key} takes a whole number, not {raw:?}"))?;
+        match key.trim() {
+            "rows" => geometry.rows = n,
+            "sg" => geometry.simdgroups = n,
+            "router_sg" => geometry.router_sg = n,
+            other => {
+                return Err(format!(
+                    "--geometry takes rows, sg or router_sg, not {other:?}"
+                ));
+            }
+        }
+        seen += 1;
+    }
+    if seen == 0 {
+        return Err("--geometry takes at least one of rows, sg, router_sg".to_string());
+    }
+    Ok(geometry)
 }
 
 /// The most timed buffers: every buffer, warm-ups included, is encoded before
@@ -996,6 +1387,7 @@ struct Run {
     only: Vec<String>,
     trials: usize,
     chain: Option<usize>,
+    geometry: Geometry,
     gaps: bool,
     check: bool,
 }
@@ -1018,6 +1410,10 @@ us_p90, gbps.
   --chain N              also time N back-to-back dispatches: arm lone (one
                          dispatch), serial and concurrent (a memory barrier
                          between each). cb_us is (chain time − N × lone time) / N
+  --geometry K=V,...     compile the kernels' own source at another geometry:
+                         rows (a SIMD group's output rows, 2/4/8), sg (SIMD
+                         groups in a mat-vec threadgroup), router_sg (the
+                         router's). Every arm of the run launches the variant.
   --gaps                 print every timed buffer's GPU time, in microseconds
   --no-check             skip the plain mat-vec's f64 oracle check"
     );
@@ -1027,6 +1423,7 @@ fn parse(args: &[String]) -> Result<Run, String> {
     let mut only = Vec::new();
     let mut trials = 16usize;
     let mut chain = None;
+    let mut geometry = None;
     let mut gaps = false;
     let mut check = true;
     let mut i = 0;
@@ -1052,6 +1449,10 @@ fn parse(args: &[String]) -> Result<Run, String> {
                 chain = Some(chain_of(next())?);
                 i += 1;
             }
+            "--geometry" => {
+                geometry = Some(geometry_of(next())?);
+                i += 1;
+            }
             other => {
                 return Err(format!(
                     "unknown argument {other}; --help lists the arguments"
@@ -1064,6 +1465,7 @@ fn parse(args: &[String]) -> Result<Run, String> {
         only,
         trials,
         chain,
+        geometry: geometry.unwrap_or(Geometry::DEFAULT),
         gaps,
         check,
     })
@@ -1245,11 +1647,24 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let kernels = match Kernels::new(&device) {
-        Ok(kernels) => kernels,
-        Err(e) => {
-            println!("metal_matvec_time: FAIL ({e})");
-            return ExitCode::FAILURE;
+    let kernels = if run.geometry.is_default() {
+        match Kernels::new(&device) {
+            Ok(kernels) => kernels,
+            Err(e) => {
+                println!("metal_matvec_time: FAIL ({e})");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match geometry_kernels(&device, run.geometry) {
+            Ok(kernels) => kernels,
+            Err(e) => {
+                println!(
+                    "metal_matvec_time: FAIL (geometry rows={} sg={} router_sg={}: {e})",
+                    run.geometry.rows, run.geometry.simdgroups, run.geometry.router_sg
+                );
+                return ExitCode::FAILURE;
+            }
         }
     };
     let info = match device.info() {
@@ -1264,11 +1679,14 @@ pub fn main() -> ExitCode {
         .map(|n| n.to_string())
         .unwrap_or_else(|| "-".to_string());
     println!(
-        "info\tinstrument=development-loop\tdevice={}\tlib={}\tbackend={}\ttrials={}\twarmups={WARMUPS}\twindow_bytes={WINDOW_BYTES}\tworking_set_bytes={WORKING_SET_BYTES}\tchain={chain}",
+        "info\tinstrument=development-loop\tdevice={}\tlib={}\tbackend={}\ttrials={}\twarmups={WARMUPS}\twindow_bytes={WINDOW_BYTES}\tworking_set_bytes={WORKING_SET_BYTES}\tchain={chain}\tgeom=rows{},sg{},router_sg{}",
         info.name,
         device.library().path().name(),
         <MetalDevice as Device>::BACKEND,
         run.trials,
+        run.geometry.rows,
+        run.geometry.simdgroups,
+        run.geometry.router_sg,
     );
 
     let mut shapes: Vec<(String, Shape)> = Vec::new();
@@ -1288,6 +1706,7 @@ pub fn main() -> ExitCode {
     for (label, shape) in other_shapes() {
         shapes.push((label.to_string(), shape));
     }
+    let geom = run.geometry.label();
     let want_router = named(&run.only, "router", "router35");
     let want_head = named(&run.only, "head", "q6k_head_argmax");
     let probe_selected = selects(&run.only, "matvec", Quant::Q4K.name(), STREAM_LABEL);
@@ -1302,6 +1721,7 @@ pub fn main() -> ExitCode {
             only: Vec::new(),
             trials: run.trials,
             chain: None,
+            geometry: run.geometry,
             gaps: run.gaps,
             check: run.check,
         };
@@ -1328,7 +1748,7 @@ pub fn main() -> ExitCode {
         let outcome = time_arms(
             &run,
             shape.kind(),
-            label,
+            &format!("{label}{geom}"),
             shape.bytes(),
             None,
             None,
@@ -1337,6 +1757,77 @@ pub fn main() -> ExitCode {
         if label == STREAM_LABEL {
             stream_gbps = stream_gbps.or(outcome.window_gbps);
         }
+        failed |= outcome.failed;
+        if outcome.stuck {
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // The routed experts at the session's shapes, both quants: the pair
+    // (nine slots of 512 rows over 2048 columns) and the folded down (2048
+    // rows over the slots' 512), eight routed experts and the shared one.
+    for (kind, quant, rows, cols) in [
+        ("pair", Quant::Q4K, EXPERT_K, 2048usize),
+        ("pair", Quant::Q6K, EXPERT_K, 2048),
+        ("fold", Quant::Q4K, 2048, EXPERT_K),
+        ("fold", Quant::Q6K, 2048, EXPERT_K),
+    ] {
+        let label = match kind {
+            "pair" => format!("pair {} 9x{rows}x{cols}", quant.name()),
+            _ => format!("fold {} {rows}x{cols}x9", quant.name()),
+        };
+        if !selects(&run.only, kind, quant.name(), &label) {
+            continue;
+        }
+        let bytes = EXPERT_SLOTS
+            * expert_stack_bytes(quant, 1, rows, cols)
+            * if kind == "pair" { 2 } else { 1 };
+        let outcome = time_arms(
+            &run,
+            kind,
+            &format!("{label}{geom}"),
+            bytes,
+            None,
+            None,
+            |arm| {
+                if kind == "pair" {
+                    time_pair(&device, &kernels, quant, arm, run.trials)
+                } else {
+                    time_fold(&device, &kernels, quant, arm, run.trials)
+                }
+            },
+        );
+        failed |= outcome.failed;
+        if outcome.stuck {
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // The dense mat-vec's phase cuts: the block loop unrolled two blocks a
+    // step, at the stream shape each.
+    for phase in MATVEC_PHASES {
+        let (name, quant, _) = *phase;
+        let shape = Shape::Matvec {
+            quant,
+            rows: 8192,
+            cols: 4096,
+            resid: false,
+        };
+        let label = format!("matvec {} 8192x4096 [{name}]{geom}", quant.name());
+        if !selects(&run.only, "matvec", quant.name(), &label) {
+            continue;
+        }
+        let phase_kernels = match matvec_phase_kernels(&device, *phase) {
+            Ok(kernels) => kernels,
+            Err(e) => {
+                println!("phase {name}: FAIL ({e})");
+                failed = true;
+                continue;
+            }
+        };
+        let outcome = time_arms(&run, "matvec", &label, shape.bytes(), None, None, |arm| {
+            time_shape(&device, &phase_kernels, &shape, arm, run.trials, false)
+        });
         failed |= outcome.failed;
         if outcome.stuck {
             return ExitCode::FAILURE;
@@ -1363,7 +1854,7 @@ pub fn main() -> ExitCode {
             let outcome = time_arms(
                 &run,
                 "headnorm",
-                &format!("headnorm out 2048x4096 [{}]", phase.name),
+                &format!("headnorm out 2048x4096 [{}]{}", phase.name, geom),
                 headnorm_shape.bytes(),
                 None,
                 None,
@@ -1386,7 +1877,7 @@ pub fn main() -> ExitCode {
     }
 
     let router_label = format!(
-        "router35 {}x{} f32 top{}",
+        "router35 {}x{} f32 top{}{geom}",
         router::ROWS,
         router::K,
         router::TOP_K_MAX
@@ -1429,7 +1920,7 @@ pub fn main() -> ExitCode {
             }
         }
     }
-    let head_label = format!("q6k_head_argmax {HEAD_VOCAB}x{HEAD_K} q6k");
+    let head_label = format!("q6k_head_argmax {HEAD_VOCAB}x{HEAD_K} q6k{geom}");
     if want_head {
         let outcome = time_arms(
             &run,

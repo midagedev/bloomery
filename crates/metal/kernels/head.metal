@@ -1,8 +1,8 @@
 // The output head: one Q6_K mat-vec with the norm on the load, and the
-// argmax in the same dispatch. A threadgroup owns sixteen rows (eight SIMD
-// groups, two rows each). It writes one packed candidate. The last
-// threadgroup's threads together reduce every candidate and thread 0 stores
-// the winning row index.
+// argmax in the same dispatch. A threadgroup owns the rows of its
+// BLOOMERY_MATVEC_SIMD_GROUPS SIMD groups, BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP
+// each. It writes one packed candidate. The last threadgroup's threads
+// together reduce every candidate and thread 0 stores the winning row index.
 //
 // The packed key is ticket.metal's argmax_key. An empty group, and a group
 // whose live logits are all NaN, packs (-inf, 0). When that key wins, the
@@ -17,12 +17,15 @@ using namespace metal;
 
 #pragma METAL fp contract(off)
 
-// The head's threadgroup: eight SIMD groups of 32 lanes. The pipeline is
-// specialized at this count (norm.metal's function constant) and the launch
-// refuses any other, so the stage array and the strides read it as a
-// constant.
-#define HEAD_SIMD_GROUPS 8u
+// The head's threadgroup: the mat-vec function constant, the count the head's
+// pipeline is specialized at, so the strides read the same count the launch
+// dispatches. A function constant cannot size an array, so the stage is sized
+// at the most a threadgroup holds (geometry.rs's
+// MAX_SIMD_GROUPS_PER_GROUP: the device's 1024 threads, 32 of them in a
+// group) and reduced over the count the launch runs.
+#define HEAD_SIMD_GROUPS BLOOMERY_MATVEC_SIMD_GROUPS
 #define HEAD_THREADS (32u * HEAD_SIMD_GROUPS)
+#define HEAD_STAGE_MAX 32u
 
 kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
                             device const float *x [[buffer(1)]],
@@ -40,7 +43,7 @@ kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
                             uint groups [[threadgroups_per_grid]])
 {
     threadgroup uint last_flag = 0u;
-    threadgroup ulong stage[HEAD_SIMD_GROUPS];
+    threadgroup ulong stage[HEAD_STAGE_MAX];
 
     const int first_row = simd_first_row(tg, sg);
     q6k_rows<true, false, false>(weights, x, logits, (int)args.nblocks, args.eps, args.layer,

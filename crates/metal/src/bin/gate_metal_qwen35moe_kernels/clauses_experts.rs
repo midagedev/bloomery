@@ -6,8 +6,8 @@ use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, Elems};
 use bloomery_metal::MetalBuffer;
 use bloomery_metal::kernels::{
-    BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, FoldParams, PairParams, Quant, ROUTED_IDS, SHARED_SLOT,
-    SharedPlan,
+    BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, FoldParams, PairParams, Quant, ROUTED_IDS,
+    ROWS_PER_SIMD_GROUP, SHARED_SLOT, SharedPlan,
 };
 use gguf::quant::GgmlType;
 
@@ -165,14 +165,28 @@ struct FoldWeights {
 }
 
 fn fold_weights(fix: &Fixture, quant: Quant) -> Result<FoldWeights, String> {
+    fold_weights_of(fix, quant, FOLD_ROWS)
+}
+
+/// The fold's weights at `rows` rows an expert: the engine's whole rows, or a
+/// count a threadgroup does not divide, for the row tail. The reader hands
+/// out an expert's whole rows, so a partial count is the stack repacked at
+/// the count's own stride, the stride the kernel's row offsets read.
+fn fold_weights_of(fix: &Fixture, quant: Quant, rows: usize) -> Result<FoldWeights, String> {
     let ty = quant.ggml();
     let (name, shared) = match quant {
         Quant::Q4K => ("blk.0.ffn_down_exps.weight", "blk.0.ffn_down_shexp.weight"),
         Quant::Q6K => ("blk.2.ffn_down_exps.weight", "blk.2.ffn_down_shexp.weight"),
     };
+    let rb = row_bytes(quant, EXPERT_K);
+    let mut down = Vec::with_capacity(N_EXPERTS * rows * rb);
+    for expert in 0..N_EXPERTS {
+        let whole = fix.expert(name, ty, EXPERT_K, FOLD_ROWS, expert)?;
+        down.extend_from_slice(&whole[..rows * rb]);
+    }
     let weights = FoldWeights {
-        down: stack(fix, name, ty, EXPERT_K, FOLD_ROWS, 0, N_EXPERTS)?,
-        shared: plane(fix, shared, ty, EXPERT_K, FOLD_ROWS)?,
+        down,
+        shared: fix.rows(shared, ty, EXPERT_K, rows)?.to_vec(),
     };
     let one = weights.down.len() / N_EXPERTS;
     if weights.shared.len() != one {
@@ -673,10 +687,15 @@ fn hidden_states(quant: Quant) -> Vec<f32> {
     out
 }
 
-fn check_fold_quant(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<String, String> {
-    let weights = fold_weights(fix, quant)?;
+fn check_fold_quant(
+    h: &Harness<'_>,
+    fix: &Fixture,
+    quant: Quant,
+    rows: usize,
+) -> Result<String, String> {
+    let weights = fold_weights_of(fix, quant, rows)?;
     let hidden = hidden_states(quant);
-    let resid = oracle::activations(FOLD_ROWS, 0xF01D + tag(quant), 2.0);
+    let resid = oracle::activations(rows, 0xF01D + tag(quant), 2.0);
     h.clear_fault()?;
     let got = launch_fold(
         h,
@@ -696,7 +715,7 @@ fn check_fold_quant(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<Stri
     }
     let rb = row_bytes(quant, EXPERT_K);
     let mut worst = 0.0f64;
-    for row in 0..FOLD_ROWS {
+    for row in 0..rows {
         let mut want = f64::from(resid[row]);
         let mut magnitude = 0.0;
         for slot in 0..EXPERT_SLOTS {
@@ -704,7 +723,7 @@ fn check_fold_quant(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<Stri
                 &weights.shared[row * rb..(row + 1) * rb]
             } else {
                 let expert = IDS[slot] as usize;
-                let at = (expert * FOLD_ROWS + row) * rb;
+                let at = (expert * rows + row) * rb;
                 &weights.down[at..at + rb]
             };
             let x: Vec<f64> = hidden[slot * EXPERT_K..(slot + 1) * EXPERT_K]
@@ -771,12 +790,22 @@ fn fold_bad_id(h: &Harness<'_>, weights: &FoldWeights, quant: Quant) -> Result<(
     Ok(())
 }
 
+/// A row count a threadgroup's four rows do not divide: the last SIMD
+/// group's live rows are one, and its dead rows are never stored.
+const FOLD_TAIL_ROWS: usize = 2045;
+
+const _: () = assert!(!FOLD_TAIL_ROWS.is_multiple_of(ROWS_PER_SIMD_GROUP));
+
 pub fn fold(h: &Harness<'_>, fix: &Fixture) -> Clause {
-    let q4 = check_fold_quant(h, fix, Quant::Q4K)?;
-    let q6 = check_fold_quant(h, fix, Quant::Q6K)?;
+    let q4 = check_fold_quant(h, fix, Quant::Q4K, FOLD_ROWS)?;
+    let q6 = check_fold_quant(h, fix, Quant::Q6K, FOLD_ROWS)?;
+    // The row tail: the rows the last SIMD group does not fill, both quants.
+    let tail_q4 = check_fold_quant(h, fix, Quant::Q4K, FOLD_TAIL_ROWS)?;
+    let tail_q6 = check_fold_quant(h, fix, Quant::Q6K, FOLD_TAIL_ROWS)?;
     fold_bad_id(h, &fold_weights(fix, Quant::Q4K)?, Quant::Q4K)?;
     Ok(Verdict::Noted(format!(
-        "worst error over its band: {q4}, {q6}; a bad id writes NaN and raises expert_id"
+        "worst error over its band: {q4}, {q6}; tail {FOLD_TAIL_ROWS} rows: {tail_q4}, {tail_q6}; \
+         a bad id writes NaN and raises expert_id"
     )))
 }
 

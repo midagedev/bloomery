@@ -15,16 +15,11 @@ use crate::fault::MetalFaultWord;
 use crate::library::{Library, Pipeline};
 
 use super::experts_geom::{EXPERT_K, EXPERT_SLOTS, FOLDED_BLOCKS, ROUTED_IDS};
-use super::geometry::{BLOCK_VALUES, ROWS_PER_SIMD_GROUP, SIMD_WIDTH};
+use super::geometry::BLOCK_VALUES;
 use super::{Quant, args_bytes, check_window_len, pack, word};
 
 const PAIR: &str = "pair";
 const FOLD: &str = "fold";
-
-/// SIMD groups in an expert threadgroup. Hardcoded: the pipelines are not
-/// retiled when a mat-vec launch asks for another count.
-const EXPERT_NSG: usize = 2;
-const EXPERT_THREADS: usize = SIMD_WIDTH * EXPERT_NSG;
 /// Blocks of K': nine slots, two blocks of [`EXPERT_K`] each.
 const _: () = assert!(super::geometry::BLOCK_VALUES == 256);
 const _: () = assert!(FOLDED_BLOCKS == EXPERT_SLOTS * (EXPERT_K / super::geometry::BLOCK_VALUES));
@@ -188,7 +183,11 @@ struct PairShape {
     groups_x: usize,
 }
 
-fn check_pair(p: &PairParams<'_>) -> Result<PairShape, DeviceError> {
+fn check_pair(
+    p: &PairParams<'_>,
+    simdgroups: usize,
+    rows_per_simd_group: usize,
+) -> Result<PairShape, DeviceError> {
     refuse_slots(PAIR, p.slots)?;
     refuse_k(PAIR, p.k)?;
     refuse_stack(PAIR, p.n_experts)?;
@@ -232,7 +231,9 @@ fn check_pair(p: &PairParams<'_>) -> Result<PairShape, DeviceError> {
         rows: word(PAIR, "the row count", EXPERT_K)?,
         n_experts: word(PAIR, "the expert count", p.n_experts)?,
         stride: word(PAIR, "the output stride", p.out_stride)?,
-        groups_x: EXPERT_K / EXPERT_NSG,
+        // A SIMD group owns the geometry's weight rows, a gate and an up to
+        // an output.
+        groups_x: EXPERT_K.div_ceil(simdgroups * rows_per_simd_group / 2),
     })
 }
 
@@ -244,6 +245,8 @@ struct FoldShape {
 
 fn check_fold<'w>(
     p: &FoldParams<'w, '_, '_, '_>,
+    simdgroups: usize,
+    rows_per_simd_group: usize,
 ) -> Result<(FoldShape, Window<'w, u8, MetalDevice>), DeviceError> {
     let shared = match p.shared {
         SharedPlan::Apart => {
@@ -279,7 +282,7 @@ fn check_fold<'w>(
     check_window_len(FOLD, "y", p.y.len(), p.rows)?;
     aligned(FOLD, "down", p.down)?;
     aligned(FOLD, "shared down", shared)?;
-    let rows_per_group = EXPERT_NSG * ROWS_PER_SIMD_GROUP;
+    let rows_per_group = simdgroups * rows_per_simd_group;
     Ok((
         FoldShape {
             rows: word(FOLD, "the row count", p.rows)?,
@@ -299,12 +302,14 @@ pub(crate) struct Pipelines {
 }
 
 impl Pipelines {
-    pub(crate) fn new(library: &Library) -> Result<Self, DeviceError> {
+    /// `simdgroups` is the mat-vec function constant: the pair and the fold
+    /// are mat-vec-shaped kernels whose threadgroup width is the same count.
+    pub(crate) fn new(library: &Library, simdgroups: u32) -> Result<Self, DeviceError> {
         Ok(Self {
-            pair_q4: library.pipeline("q4k_pair_swiglu")?,
-            pair_q6: library.pipeline("q6k_pair_swiglu")?,
-            fold_q4: library.pipeline("q4k_down_fold")?,
-            fold_q6: library.pipeline("q6k_down_fold")?,
+            pair_q4: library.pipeline_with_simdgroups("q4k_pair_swiglu", simdgroups)?,
+            pair_q6: library.pipeline_with_simdgroups("q6k_pair_swiglu", simdgroups)?,
+            fold_q4: library.pipeline_with_simdgroups("q4k_down_fold", simdgroups)?,
+            fold_q6: library.pipeline_with_simdgroups("q6k_down_fold", simdgroups)?,
         })
     }
 
@@ -332,7 +337,7 @@ impl super::Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: PairParams<'_>,
     ) -> Result<(), DeviceError> {
-        let shape = check_pair(&p)?;
+        let shape = check_pair(&p, self.simdgroups, self.rows_per_simd_group)?;
         let args = args_bytes([
             shape.rows,
             shape.nblocks,
@@ -353,7 +358,7 @@ impl super::Kernels {
         slot.set(Binding::of_mut(&p.y)?)?;
         slot.set(p.fault.binding())?;
         slot.set(Binding::bytes(pack(&args))?)?;
-        slot.dispatch_groups(shape.groups_x, EXPERT_SLOTS, EXPERT_THREADS)
+        slot.dispatch_groups(shape.groups_x, EXPERT_SLOTS, self.threads_per_group())
     }
 
     /// Encode one folded down. The route weights scale the load, and the
@@ -365,7 +370,7 @@ impl super::Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: FoldParams<'_, '_, '_, '_>,
     ) -> Result<(), DeviceError> {
-        let (shape, shared) = check_fold(&p)?;
+        let (shape, shared) = check_fold(&p, self.simdgroups, self.rows_per_simd_group)?;
         let args = args_bytes([shape.rows, shape.n_experts, p.layer, 0]);
         encoder.set_pipeline(self.experts.fold(p.quant));
         let mut slot = Bindings::new(encoder);
@@ -377,6 +382,6 @@ impl super::Kernels {
         slot.set(Binding::of_mut(p.y)?)?;
         slot.set(p.fault.binding())?;
         slot.set(Binding::bytes(pack(&args))?)?;
-        slot.dispatch_groups(shape.groups_x, 1, EXPERT_THREADS)
+        slot.dispatch_groups(shape.groups_x, 1, self.threads_per_group())
     }
 }

@@ -17,9 +17,7 @@ use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
-use super::geometry::{
-    BLOCK_VALUES, HEAD_COLS, PARTIALS_PER_HEAD, ROWS_PER_SIMD_GROUP, VALUE_HEADS,
-};
+use super::geometry::{BLOCK_VALUES, HEAD_COLS, PARTIALS_PER_HEAD, VALUE_HEADS};
 use super::matvec::Quant;
 use super::{Kernels, args_bytes, check_window_len, pack, word};
 
@@ -64,7 +62,11 @@ fn refuse(detail: impl Into<String>) -> DeviceError {
 /// The shape of `p`, refused by name when the width is not the heads' own, when
 /// a window is not the shape's, or when a count passes the kernel's 32-bit
 /// words.
-fn check(p: &HeadNormParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
+fn check(
+    p: &HeadNormParams<'_>,
+    simdgroups: usize,
+    rows_per_simd_group: usize,
+) -> Result<Shape, DeviceError> {
     if p.rows == 0 {
         return Err(refuse("no rows".to_string()));
     }
@@ -91,7 +93,7 @@ fn check(p: &HeadNormParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError
     Ok(Shape {
         nblocks: word(WHAT, "the block count", nblocks)?,
         rows: word(WHAT, "the row count", p.rows)?,
-        groups: p.rows.div_ceil(simdgroups * ROWS_PER_SIMD_GROUP),
+        groups: p.rows.div_ceil(simdgroups * rows_per_simd_group),
     })
 }
 
@@ -105,7 +107,7 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: HeadNormParams<'_>,
     ) -> Result<(), DeviceError> {
-        let shape = check(&p, self.simdgroups)?;
+        let shape = check(&p, self.simdgroups, self.rows_per_simd_group)?;
         let args = args_bytes([shape.rows, shape.nblocks, p.layer, p.eps.to_bits()]);
         encoder.set_pipeline(&self.headnorm);
         let mut slot = Bindings::new(encoder);

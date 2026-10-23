@@ -12,7 +12,7 @@ use bloomery_device::{DeviceError, Window, WindowMut};
 use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 
-use super::geometry::{BLOCK_VALUES, MAX_SEGMENTS, ROWS_PER_SIMD_GROUP};
+use super::geometry::{BLOCK_VALUES, MAX_SEGMENTS};
 use super::matvec::{NormOnLoad, Quant};
 use super::{Kernels, args_bytes, check_window_len, pack, word};
 
@@ -82,7 +82,11 @@ fn refuse(detail: impl Into<String>) -> DeviceError {
 /// The shape of `p`, refused by name when the segments disagree, when one of
 /// them is empty, when there are too many, when their outputs overlap, or when
 /// a window is not the shape's.
-fn check(p: &SegParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
+fn check(
+    p: &SegParams<'_>,
+    simdgroups: usize,
+    rows_per_simd_group: usize,
+) -> Result<Shape, DeviceError> {
     if p.segments.is_empty() {
         return Err(refuse("the dispatch has no segment".to_string()));
     }
@@ -173,7 +177,7 @@ fn check(p: &SegParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
             out: word(WHAT, "a segment's output offset", s.out_offset)?,
             first_group: word(WHAT, "a segment's first threadgroup", groups)?,
         };
-        groups += s.rows.div_ceil(simdgroups * ROWS_PER_SIMD_GROUP);
+        groups += s.rows.div_ceil(simdgroups * rows_per_simd_group);
     }
     Ok(Shape {
         nblocks: word(WHAT, "the block count", nblocks)?,
@@ -210,7 +214,7 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: SegParams<'_>,
     ) -> Result<(), DeviceError> {
-        let shape = check(&p, self.simdgroups)?;
+        let shape = check(&p, self.simdgroups, self.rows_per_simd_group)?;
         let args = args_bytes(args_words(&shape, p.norm.layer, p.norm.eps));
         let family = match p.quant {
             Quant::Q4K => &self.q4k,

@@ -15,9 +15,13 @@
 // THIRD_PARTY_NOTICES.md):
 //   ggml/src/ggml-metal/kernels/mul_mv.metal
 // The lane map (ix/it/iq/ir), the four-block loop, the uint16 nibble trick, the
-// row loop over a SIMD group's rows and the simd_sum reduction are llama.cpp's:
-// 2 rows per SIMD group. The SIMD groups in a threadgroup are the function
-// constant of norm.metal: 2 for the dense mat-vec, 8 for the output head.
+// row loop over a SIMD group's rows and the simd_sum reduction are llama.cpp's.
+// The rows a SIMD group owns are the row loop's constant, four the landed
+// count: the loop and the tail are written for any of 2, 4 and 8, and a SIMD
+// group loads the input once for all its rows (the register reuse MLX's
+// affine_qmv_fast is built on). The SIMD groups in a threadgroup are the
+// function constant of norm.metal: 2 for the dense mat-vec, 8 for the output
+// head.
 //
 // What differs from llama.cpp's loop:
 //   - the matrix is not padded: a SIMD group past the last row returns, and each
@@ -47,8 +51,10 @@ struct block_q4_K {
 };
 
 static_assert(sizeof(block_q4_K) == 144, "block_q4_K is 144 bytes");
-static_assert(BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP == 2,
-              "the tail step below is the pair's: it is written for two rows");
+static_assert(BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP == 2 ||
+              BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP == 4 ||
+              BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP == 8,
+              "the row loop and the tail are written for 2, 4 or 8 rows");
 
 // The first row a SIMD group owns. `tg` is the threadgroup's index in the
 // grid, or its index inside a segment.

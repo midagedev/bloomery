@@ -107,6 +107,16 @@ pub struct Kernels {
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
+    /// The output rows a mat-vec's SIMD group owns. The number is a constant
+    /// of the kernels' source (`geometry::ROWS_PER_SIMD_GROUP` writes it),
+    /// not a function constant: a variant count is another source, and the
+    /// launches' geometry follows the count the library was built with.
+    rows_per_simd_group: usize,
+    /// The threads in the router's threadgroup, and its threadgroup count:
+    /// the router's own geometry, its source constant by way of
+    /// `router_geom`, followed by the launch.
+    router_threads: usize,
+    router_groups: usize,
 }
 
 impl Kernels {
@@ -124,6 +134,27 @@ impl Kernels {
     /// threadgroup. The count is the kernels' function constant, so each count
     /// is its own pipeline, and every launch's geometry follows it.
     pub fn with_simdgroups(library: &Library, simdgroups: usize) -> Result<Self, DeviceError> {
+        Self::with_geometry(
+            library,
+            geometry::ROWS_PER_SIMD_GROUP,
+            simdgroups,
+            router_geom::SIMD_GROUPS,
+        )
+    }
+
+    /// The pipelines of a geometry variant: `rows` is the row count the
+    /// kernels' source was built with (the library's `#define`, which
+    /// [`geometry::ROWS_PER_SIMD_GROUP`] writes for the shipped source),
+    /// `simdgroups` the function constant of the mat-vec pipelines, and
+    /// `router_sg` the router's own SIMD-group count, another source
+    /// constant. The probe compiles variant sources and names their counts
+    /// here; the launches' geometry follows what they name.
+    pub fn with_geometry(
+        library: &Library,
+        rows: usize,
+        simdgroups: usize,
+        router_sg: usize,
+    ) -> Result<Self, DeviceError> {
         let count = u32::try_from(simdgroups).map_err(|_| DeviceError::Range {
             what: "matvec",
             detail: format!("{simdgroups} SIMD groups do not fit the kernel's word"),
@@ -145,6 +176,22 @@ impl Kernels {
                 ),
             });
         }
+        if ![2, 4, 8].contains(&rows) {
+            return Err(DeviceError::Range {
+                what: "matvec",
+                detail: format!("{rows} rows a SIMD group, the kernels take 2, 4 or 8"),
+            });
+        }
+        if router_sg == 0 || router_sg > geometry::MAX_SIMD_GROUPS_PER_GROUP {
+            return Err(DeviceError::Range {
+                what: "router",
+                detail: format!(
+                    "{router_sg} SIMD groups in a threadgroup, the kernels take 1 to {}",
+                    geometry::MAX_SIMD_GROUPS_PER_GROUP
+                ),
+            });
+        }
+        let router_threads = router_geom::SIMD_WIDTH * router_sg;
         Ok(Self {
             q4k: MatvecPipelines::new(
                 library,
@@ -169,7 +216,7 @@ impl Kernels {
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             embed: library.pipeline("embed_q4k")?,
             router: library.pipeline("router35")?,
-            experts: experts::Pipelines::new(library)?,
+            experts: experts::Pipelines::new(library, count)?,
             delta: library.pipeline("gdn_step")?,
             attention: attention::AttentionPipelines::new(library)?,
             // The head's SIMD-group count, not the mat-vec count this function
@@ -180,6 +227,11 @@ impl Kernels {
                     .expect("the head's SIMD-group count fits u32"),
             )?,
             simdgroups,
+            rows_per_simd_group: rows,
+            router_threads,
+            // The router's split is one, so a threadgroup count is the rows
+            // over the SIMD groups the source names.
+            router_groups: router_geom::ROWS.div_ceil(router_sg),
         })
     }
 
@@ -189,10 +241,29 @@ impl Kernels {
         self.simdgroups
     }
 
+    /// The output rows a mat-vec's SIMD group owns.
+    #[must_use]
+    pub fn rows_per_simd_group(&self) -> usize {
+        self.rows_per_simd_group
+    }
+
     /// The threads in a mat-vec's threadgroup.
     #[must_use]
     pub fn threads_per_group(&self) -> usize {
         geometry::SIMD_WIDTH * self.simdgroups
+    }
+
+    /// The threads in the router's threadgroup, the geometry this object's
+    /// library was built with.
+    #[must_use]
+    pub fn router_threads(&self) -> usize {
+        self.router_threads
+    }
+
+    /// The router's threadgroup count.
+    #[must_use]
+    pub fn router_groups(&self) -> usize {
+        self.router_groups
     }
 }
 

@@ -28,8 +28,8 @@ const _: () = assert!(HEAD_VOCAB == 248_320);
 const _: () = assert!(HEAD_K == 2_048);
 const _: () = assert!(HEAD_SIMD_GROUPS == 8);
 const _: () = assert!(HEAD_THREADS == 256);
-const _: () = assert!(HEAD_GROUPS == 15_520);
-const _: () = assert!(ROWS_PER_GROUP == 16);
+const _: () = assert!(HEAD_GROUPS == HEAD_VOCAB / ROWS_PER_GROUP);
+const _: () = assert!(ROWS_PER_GROUP == HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP);
 const _: () = assert!(HEAD_GROUPS * ROWS_PER_GROUP == HEAD_VOCAB);
 
 const OUTPUT: &str = "output.weight";
@@ -400,14 +400,16 @@ fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, Strin
 pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     const LAUNCHES: usize = 1_000;
     const BATCH: usize = 100;
-    const ROWS: usize = 36_864;
+    /// The threadgroups the ticket handshake runs, whatever the geometry.
+    const GROUPS: usize = 2_304;
+    const ROWS: usize = ROWS_PER_GROUP * GROUPS;
     const K: usize = 256;
     h.clear_fault()?;
     expect_head(fixture)?;
     let groups = ROWS.div_ceil(ROWS_PER_GROUP);
-    if groups != 2_304 {
+    if groups != GROUPS {
         return Err(format!(
-            "{ROWS} rows are {groups} threadgroups, the clause runs 2304"
+            "{ROWS} rows are {groups} threadgroups, the clause runs {GROUPS}"
         ));
     }
     let eps = fixture.rms_eps()?;

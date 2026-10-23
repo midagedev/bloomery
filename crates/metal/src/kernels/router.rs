@@ -11,6 +11,7 @@ use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
+pub use super::router_geom::SIMD_GROUPS as SG;
 pub use super::router_geom::{EXPERTS, K, PARTIALS, ROWS, TOP_K_MAX};
 use super::router_geom::{FLOAT4S, GROUPS, SIMD_WIDTH, SPLIT, THREADS};
 use super::{Kernels, check_window_len, pack, word};
@@ -138,6 +139,8 @@ impl Kernels {
         slot.set(Binding::of_mut(&p.weights)?)?;
         slot.set(Binding::bytes(pack(&packed))?)?;
         slot.set(p.fault.binding())?;
-        slot.dispatch_groups(GROUPS, 1, THREADS)
+        // The geometry of this object's library, its own count: a probe
+        // variant names another, and the dispatch follows it.
+        slot.dispatch_groups(self.router_groups(), 1, self.router_threads())
     }
 }

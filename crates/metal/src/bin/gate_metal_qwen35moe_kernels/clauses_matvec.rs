@@ -7,7 +7,11 @@ use std::process::Command;
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::{Buffer, Device, Elems};
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::kernels::{Kernels, MatvecParams, Mode, NormOnLoad, Quant};
+use bloomery_metal::kernels::router;
+use bloomery_metal::kernels::{
+    Kernels, MatvecParams, Mode, NormOnLoad, Quant, ROWS_PER_SIMD_GROUP, SIMD_GROUPS_PER_GROUP,
+};
+use bloomery_metal::library::{Library, SOURCE};
 use bloomery_metal::stream::MetalStream;
 use gguf::quant::GgmlType;
 
@@ -532,6 +536,117 @@ pub fn block_shape() -> Clause {
         "Q4_K and Q6_K blocks hold gguf's 256 values; their bytes are gguf's by construction"
             .to_string(),
     ))
+}
+
+/// The kernels compiled from the shipped source with the row count a SIMD
+/// group owns replaced by `rows`: the probe sweeps the same edit, and the
+/// clause holds the sweep's arithmetic still.
+/// The weight type's ggml name, for the fixture's readers.
+fn ty(quant: Quant) -> GgmlType {
+    match quant {
+        Quant::Q4K => GgmlType::Q4_K,
+        Quant::Q6K => GgmlType::Q6_K,
+    }
+}
+
+/// The kernels compiled from the shipped source with the row count a SIMD
+/// group owns replaced by `rows`: the probe sweeps the same edit, and the
+/// clause holds the sweep's arithmetic still.
+fn kernels_of_rows(h: &Harness<'_>, rows: usize) -> Result<Kernels, String> {
+    let find = format!("#define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {ROWS_PER_SIMD_GROUP}");
+    let found = SOURCE.matches(find.as_str()).count();
+    if found != 1 {
+        return Err(format!(
+            "the geometry define occurs {found} times, not 1; the header moved"
+        ));
+    }
+    let with = format!("#define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {rows}");
+    let text = SOURCE.replacen(find.as_str(), with.as_str(), 1);
+    let library = Library::from_source_text(h.device, &text).map_err(why)?;
+    Kernels::with_geometry(&library, rows, SIMD_GROUPS_PER_GROUP, router::SG).map_err(why)
+}
+
+/// The mat-vec at two rows a SIMD group is the same bits as at the shipped
+/// four: the row count is a geometry, not an arithmetic — a row's lane map
+/// and block order do not move, only which rows share a SIMD group.
+pub fn nrows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let two = kernels_of_rows(h, 2)?;
+    let few = Harness {
+        device: h.device,
+        stream: h.stream,
+        kernels: &two,
+        library: h.library,
+    };
+    let mut parts = Vec::new();
+    for (name, quant, cols, rows) in [
+        ("blk.0.attn_qkv.weight", Quant::Q4K, 2048usize, 8192usize),
+        ("blk.2.attn_qkv.weight", Quant::Q6K, 2048, 8192),
+        ("blk.2.ffn_down_shexp.weight", Quant::Q6K, 512, 2048),
+    ] {
+        let bytes = fixture.rows(name, ty(quant), cols, rows)?;
+        let x = oracle::activations(cols, 0x5EB, 1.0);
+        let many = h.matvec(&Launch {
+            quant,
+            rows,
+            cols,
+            weights: bytes,
+            x: &x,
+            y0: &common::sentinel_rows(rows),
+            mode: ModeSpec::Store,
+        })?;
+        let few_rows = few.matvec(&Launch {
+            quant,
+            rows,
+            cols,
+            weights: bytes,
+            x: &x,
+            y0: &common::sentinel_rows(rows),
+            mode: ModeSpec::Store,
+        })?;
+        for (i, (a, b)) in many.iter().zip(few_rows.iter()).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                return Err(format!(
+                    "{name} row {i}: four rows a group read {a:?}, two read {b:?}"
+                ));
+            }
+        }
+        parts.push(format!("{name} {rows}x{cols}"));
+    }
+    // A tail: rows that are not a multiple of the four a SIMD group owns, so
+    // the last group's live rows are one and its dead rows are never stored.
+    let tail = 1153;
+    let bytes = fixture.rows_at("output.weight", GgmlType::Q6_K, 2048, 248_320 - tail, tail)?;
+    let x = oracle::activations(2048, 0x5EB, 1.0);
+    let many = h.matvec(&Launch {
+        quant: Quant::Q6K,
+        rows: tail,
+        cols: 2048,
+        weights: bytes,
+        x: &x,
+        y0: &common::sentinel_rows(tail),
+        mode: ModeSpec::Store,
+    })?;
+    let few_rows = few.matvec(&Launch {
+        quant: Quant::Q6K,
+        rows: tail,
+        cols: 2048,
+        weights: bytes,
+        x: &x,
+        y0: &common::sentinel_rows(tail),
+        mode: ModeSpec::Store,
+    })?;
+    for (i, (a, b)) in many.iter().zip(few_rows.iter()).enumerate() {
+        if a.to_bits() != b.to_bits() {
+            return Err(format!(
+                "the tail row {i}: four rows a group read {a:?}, two read {b:?}"
+            ));
+        }
+    }
+    parts.push(format!("output.weight tail {tail}x2048"));
+    Ok(Verdict::Noted(format!(
+        "{} shapes, every row the same bits at four and two rows a SIMD group",
+        parts.len()
+    )))
 }
 
 /// The Q6_K mat-vec at eight SIMD groups in a threadgroup is the same bits as
