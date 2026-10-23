@@ -1,5 +1,7 @@
-// The output head: one Q6_K mat-vec with the norm on the load, and the
-// argmax in the same dispatch. A threadgroup owns the rows of its
+// The output head: one quantized mat-vec with the norm on the load, and the
+// argmax in the same dispatch. The body is a template over the quant
+// (quant.metal), its row loop matvec_q4k.metal's; the entry is the Q6_K
+// instantiation, under its host name. A threadgroup owns the rows of its
 // BLOOMERY_MATVEC_SIMD_GROUPS SIMD groups, BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP
 // each. It writes one packed candidate. The last threadgroup's threads
 // together reduce every candidate and thread 0 stores the winning row index.
@@ -8,7 +10,7 @@
 // whose live logits are all NaN, packs (-inf, 0). When that key wins, the
 // step id is not a token.
 //
-// This file comes after matvec_q6k.metal (q6k_rows, block_q6_K) and
+// This file comes after matvec_q6k.metal (the entry templates) and
 // ticket.metal.
 
 #include <metal_stdlib>
@@ -27,27 +29,29 @@ using namespace metal;
 #define HEAD_THREADS (32u * HEAD_SIMD_GROUPS)
 #define HEAD_STAGE_MAX 32u
 
-kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
-                            device const float *x [[buffer(1)]],
-                            device const float *gain [[buffer(2)]],
-                            device float *logits [[buffer(3)]],
-                            device coherent(device) ulong *candidates [[buffer(4)]],
-                            device atomic_uint *ticket [[buffer(5)]],
-                            device uint *step_id [[buffer(6)]],
-                            device atomic_uint *faults [[buffer(7)]],
-                            constant MatvecArgs &args [[buffer(8)]],
-                            uint tg [[threadgroup_position_in_grid]],
-                            uint tid [[thread_position_in_threadgroup]],
-                            ushort tiisg [[thread_index_in_simdgroup]],
-                            ushort sg [[simdgroup_index_in_threadgroup]],
-                            uint groups [[threadgroups_per_grid]])
+template <typename Q>
+kernel void head_argmax_kernel(device const typename Q::Block *weights [[buffer(0)]],
+                               device const float *x [[buffer(1)]],
+                               device const float *gain [[buffer(2)]],
+                               device float *logits [[buffer(3)]],
+                               device coherent(device) ulong *candidates [[buffer(4)]],
+                               device atomic_uint *ticket [[buffer(5)]],
+                               device uint *step_id [[buffer(6)]],
+                               device atomic_uint *faults [[buffer(7)]],
+                               constant MatvecArgs &args [[buffer(8)]],
+                               uint tg [[threadgroup_position_in_grid]],
+                               uint tid [[thread_position_in_threadgroup]],
+                               ushort tiisg [[thread_index_in_simdgroup]],
+                               ushort sg [[simdgroup_index_in_threadgroup]],
+                               uint groups [[threadgroups_per_grid]])
 {
     threadgroup uint last_flag = 0u;
     threadgroup ulong stage[HEAD_STAGE_MAX];
 
     const int first_row = simd_first_row(tg, sg);
-    q6k_rows<true, false, false>(weights, x, logits, (int)args.nblocks, args.eps, args.layer,
-                                 gain, faults, first_row, (int)args.rows, tiisg);
+    matvec_rows<Q, true, false, false, false>(weights, x, logits, (int)args.nblocks, args.eps,
+                                       args.layer, gain, nullptr, faults, first_row,
+                                       (int)args.rows, tiisg);
 
     // Every logit this group stored is visible.
     threadgroup_barrier(mem_flags::mem_device);
@@ -118,3 +122,19 @@ kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
         }
     }
 }
+
+template [[host_name("q6k_head_argmax")]]
+kernel void head_argmax_kernel<Q6K>(device const block_q6_K *weights [[buffer(0)]],
+                                    device const float *x [[buffer(1)]],
+                                    device const float *gain [[buffer(2)]],
+                                    device float *logits [[buffer(3)]],
+                                    device coherent(device) ulong *candidates [[buffer(4)]],
+                                    device atomic_uint *ticket [[buffer(5)]],
+                                    device uint *step_id [[buffer(6)]],
+                                    device atomic_uint *faults [[buffer(7)]],
+                                    constant MatvecArgs &args [[buffer(8)]],
+                                    uint tg [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_position_in_threadgroup]],
+                                    ushort tiisg [[thread_index_in_simdgroup]],
+                                    ushort sg [[simdgroup_index_in_threadgroup]],
+                                    uint groups [[threadgroups_per_grid]]);

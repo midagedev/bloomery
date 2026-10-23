@@ -1,4 +1,6 @@
-// The routed expert gate-up pair and the folded down. One dispatch each:
+// The routed expert gate-up pair and the folded down. One dispatch each,
+// one body per shape over the quant (quant.metal), the entries the
+// instantiations under their host names:
 //
 //   q4k_pair_swiglu   y[slot, r] = silu(gate_r · x̂) * (up_r · x̂),
 //                     x̂ = x * gain / sqrt(mean(x^2) + eps)
@@ -6,11 +8,11 @@
 //   q4k_down_fold     y[r] += sum over slots of w_s * (down_s[r] · h_s)
 //   q6k_down_fold     the same over block_q6_K
 //
-// Adapted from llama.cpp's kernel_mul_mv_q4_K_f32 and kernel_mul_mv_q6_K_f32
-// (MIT licence; see THIRD_PARTY_NOTICES.md):
+// The bodies' dot loops are llama.cpp's (kernel_mul_mv_q4_K_f32 and
+// kernel_mul_mv_q6_K_f32, MIT licence; see THIRD_PARTY_NOTICES.md):
 //   ggml/src/ggml-metal/kernels/mul_mv.metal
-// The lane map, the block loop, the nibble and 6-bit unpacking and the
-// simd_sum reduction are llama.cpp's, the same ones the dense mat-vec uses.
+// The lane map, the block loop and the simd_sum reduction are the ones the
+// dense mat-vec uses, owned by the quant.
 //
 // The pair tile is one pair of weight rows (a gate row and the up row of one
 // output) per two rows of the mat-vec geometry: a SIMD group owns
@@ -41,8 +43,8 @@
 // loaded. The pair writes NaN only in the bad slot's row; the fold writes NaN
 // in every row of the threadgroup, because every row reads every slot.
 //
-// This file comes after matvec_q6k.metal (QK_K, FOR_UNROLL, the block
-// structs), norm.metal (rms_scale, rms_usable) and fault.metal (raise).
+// This file comes after matvec_q6k.metal and quant.metal (the decode owners),
+// norm.metal (rms_scale, rms_usable) and fault.metal (raise).
 
 #include <metal_stdlib>
 
@@ -141,158 +143,6 @@ inline void fold_write_bad(device float * y, int row0, int rows,
     }
 }
 
-// One Q4_K block's contribution. The subtraction keeps the dense mat-vec's
-// association: d times the nibble sum, minus dmin times the activation sum.
-inline float q4k_partial(device const block_q4_K & blk,
-                         thread const float * yl,
-                         thread const float * yh,
-                         float4 sumy,
-                         short iq,
-                         short ir) {
-    constexpr uint16_t kmask1 = 0x3f3f;
-    constexpr uint16_t kmask2 = 0x0f0f;
-    constexpr uint16_t kmask3 = 0xc0c0;
-
-    uint16_t sc16[4];
-    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
-    device const uint16_t * sc = (device const uint16_t *)blk.scales + iq;
-    device const uint16_t * q1 = (device const uint16_t *)blk.qs + 16 * iq + 4 * ir;
-    device const half * dh = &blk.d;
-
-    sc16[0] = sc[0] & kmask1;
-    sc16[1] = sc[2] & kmask1;
-    sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-    sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-
-    device const uint16_t * q2 = q1 + 32;
-    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
-    FOR_UNROLL (short i = 0; i < 4; ++i) {
-        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
-    }
-
-    return dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
-                    (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
-                    (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
-                    (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f)
-         - dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
-                    sumy[2] * sc8[6] + sumy[3] * sc8[7]);
-}
-
-// One Q6_K block's contribution. The high bits of each 6-bit value are split
-// out before the offset, so the offset stays on the assembled value.
-inline float q6k_partial(device const block_q6_K & blk,
-                         thread const float * yl,
-                         short ip,
-                         short l0) {
-    constexpr uint8_t kmask1 = 0x03;
-    constexpr uint8_t kmask2 = 0x0C;
-    constexpr uint8_t kmask3 = 0x30;
-    constexpr uint8_t kmask4 = 0xC0;
-    const short q_offset_l = 64 * ip + l0;
-    const short q_offset_h = 32 * ip + l0;
-    const short is = 8 * ip + l0 / 16;
-
-    device const uint8_t * q1 = blk.ql + q_offset_l;
-    device const uint8_t * q2 = q1 + 32;
-    device const uint8_t * qh = blk.qh + q_offset_h;
-    device const char * sc = blk.scales + is;
-    device const half * dh = &blk.d;
-    float4 sums = {0.f, 0.f, 0.f, 0.f};
-    FOR_UNROLL (short l = 0; l < 4; ++l) {
-        uint8_t h0 = (uint8_t)((qh[l] & kmask1) << 4);
-        uint8_t h1 = (uint8_t)((qh[l] & kmask2) << 2);
-        uint8_t h2 = (uint8_t)((qh[l] & kmask3) << 0);
-        uint8_t h3 = (uint8_t)((qh[l] & kmask4) >> 2);
-        sums[0] += yl[4 * l + 0] * ((char)((q1[l] & 0xF) | h0) - 32);
-        sums[1] += yl[4 * l + 1] * ((char)((q2[l] & 0xF) | h1) - 32);
-        sums[2] += yl[4 * l + 2] * ((char)((q1[l] >> 4) | h2) - 32);
-        sums[3] += yl[4 * l + 3] * ((char)((q2[l] >> 4) | h3) - 32);
-    }
-    return dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
-}
-
-// What a load does to each value it loads.
-enum ExpertLoad {
-    // The fold's: the route weight of the block's slot multiplies it.
-    LOAD_ROUTE,
-    // The pair's: its square joins the lane's sum of squares, then its gain
-    // multiplies it (the mat-vec's norm on load, in its order).
-    LOAD_NORM,
-};
-
-// The activations of one Q4_K block, in the dense lane's registers. `gain`
-// (the block's gain) and `sum_sq` (the lane's sum of squares) are the pair's;
-// the fold passes null for both, and LOAD_ROUTE reads neither.
-template <ExpertLoad LOAD>
-inline void q4k_load(device const float * block, device const float * gain, short iq, short ir,
-                     float scale, thread float * yl, thread float * yh, thread float4 & sumy,
-                     thread float * sum_sq) {
-    const int base = 64 * iq + 8 * ir;
-    sumy = float4(0.f, 0.f, 0.f, 0.f);
-    for (short i = 0; i < 8; ++i) {
-        float a0 = block[base + i + 0];
-        float a1 = block[base + i + 32];
-        float a2 = block[base + i + 128];
-        float a3 = block[base + i + 160];
-        if (LOAD == LOAD_ROUTE) {
-            a0 *= scale;
-            a1 *= scale;
-            a2 *= scale;
-            a3 *= scale;
-        } else {
-            *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
-            a0 *= gain[base + i + 0];
-            a1 *= gain[base + i + 32];
-            a2 *= gain[base + i + 128];
-            a3 *= gain[base + i + 160];
-        }
-        yl[i + 0] = a0;
-        sumy[0] += a0;
-        yl[i + 8] = a1;
-        sumy[1] += a1;
-        yh[i + 0] = a2;
-        sumy[2] += a2;
-        yh[i + 8] = a3;
-        sumy[3] += a3;
-    }
-}
-
-template <ExpertLoad LOAD>
-inline void q6k_load(device const float * block, device const float * gain, short ip, short l0,
-                     float scale, thread float * yl, thread float * sum_sq) {
-    const int base = 128 * ip + l0;
-    for (short l = 0; l < 4; ++l) {
-        float a0 = block[base + l + 0];
-        float a1 = block[base + l + 32];
-        float a2 = block[base + l + 64];
-        float a3 = block[base + l + 96];
-        if (LOAD == LOAD_ROUTE) {
-            a0 *= scale;
-            a1 *= scale;
-            a2 *= scale;
-            a3 *= scale;
-        } else {
-            *sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
-            a0 *= gain[base + l + 0];
-            a1 *= gain[base + l + 32];
-            a2 *= gain[base + l + 64];
-            a3 *= gain[base + l + 96];
-        }
-        yl[4 * l + 0] = a0;
-        yl[4 * l + 1] = a1;
-        yl[4 * l + 2] = a2;
-        yl[4 * l + 3] = a3;
-    }
-}
-
 // The rows of one expert. `expert` is zero for the shared slot, and the base
 // is then the shared tensor, so the byte offset stays zero.
 template <typename Block>
@@ -331,23 +181,21 @@ inline device const Block * fold_block(device const Block * stack,
     return ((device const Block *)base) + index;
 }
 
-kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
-                            device const block_q4_K * up [[buffer(1)]],
-                            device const block_q4_K * shexp_gate [[buffer(2)]],
-                            device const block_q4_K * shexp_up [[buffer(3)]],
-                            device const float * x [[buffer(4)]],
-                            device const float * gain [[buffer(5)]],
-                            device const int * ids [[buffer(6)]],
-                            device float * y [[buffer(7)]],
-                            device atomic_uint * faults [[buffer(8)]],
-                            constant PairArgs & args [[buffer(9)]],
-                            uint3 tgpig [[threadgroup_position_in_grid]],
-                            ushort tiisg [[thread_index_in_simdgroup]],
-                            ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const short ix = tiisg / 8;
-    const short it = tiisg % 8;
-    const short iq = it / 4;
-    const short ir = it % 4;
+template <typename Q>
+kernel void pair_swiglu_kernel(device const typename Q::Block * gate [[buffer(0)]],
+                               device const typename Q::Block * up [[buffer(1)]],
+                               device const typename Q::Block * shexp_gate [[buffer(2)]],
+                               device const typename Q::Block * shexp_up [[buffer(3)]],
+                               device const float * x [[buffer(4)]],
+                               device const float * gain [[buffer(5)]],
+                               device const int * ids [[buffer(6)]],
+                               device float * y [[buffer(7)]],
+                               device atomic_uint * faults [[buffer(8)]],
+                               constant PairArgs & args [[buffer(9)]],
+                               uint3 tgpig [[threadgroup_position_in_grid]],
+                               ushort tiisg [[thread_index_in_simdgroup]],
+                               ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    typename Q::Lane lane = Q::lane_of(tiisg);
     const uint slot = tgpig.y;
     if (slot >= BLOOMERY_EXPERT_SLOTS) {
         return;
@@ -369,8 +217,8 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
         return;
     }
 
-    device const block_q4_K * grow[PAIR_OUTS];
-    device const block_q4_K * urow[PAIR_OUTS];
+    device const typename Q::Block * grow[PAIR_OUTS];
+    device const typename Q::Block * urow[PAIR_OUTS];
     for (short o = 0; o < PAIR_OUTS; ++o) {
         grow[o] = pair_rows(gate, shexp_gate, slot == BLOOMERY_EXPERT_SHARED, expert,
                             args.rows, args.nblocks, row0 + o);
@@ -384,15 +232,12 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
         sumu[o] = 0.f;
     }
     float sum_sq = 0.f;
-    for (int ib = ix; ib < (int)args.nblocks; ib += 4) {
-        float yl[16];
-        float yh[16];
-        float4 sumy;
-        q4k_load<LOAD_NORM>(x + (ulong)ib * QK_K, gain + (ulong)ib * QK_K, iq, ir, 1.f, yl, yh,
-                            sumy, &sum_sq);
+    for (int ib = Q::first_block(lane); ib < (int)args.nblocks; ib += Q::block_stride()) {
+        Q::template load<LOAD_NORM>(lane, x + (ulong)ib * QK_K, gain + (ulong)ib * QK_K,
+                                    1.f, &sum_sq);
         for (short o = 0; o < PAIR_OUTS; ++o) {
-            sumg[o] += q4k_partial(grow[o][ib], yl, yh, sumy, iq, ir);
-            sumu[o] += q4k_partial(urow[o][ib], yl, yh, sumy, iq, ir);
+            sumg[o] += Q::partial(grow[o][ib], lane);
+            sumu[o] += Q::partial(urow[o][ib], lane);
         }
     }
     const float sum_squares = simd_sum(sum_sq);
@@ -413,99 +258,19 @@ kernel void q4k_pair_swiglu(device const block_q4_K * gate [[buffer(0)]],
     }
 }
 
-kernel void q6k_pair_swiglu(device const block_q6_K * gate [[buffer(0)]],
-                            device const block_q6_K * up [[buffer(1)]],
-                            device const block_q6_K * shexp_gate [[buffer(2)]],
-                            device const block_q6_K * shexp_up [[buffer(3)]],
-                            device const float * x [[buffer(4)]],
-                            device const float * gain [[buffer(5)]],
-                            device const int * ids [[buffer(6)]],
-                            device float * y [[buffer(7)]],
-                            device atomic_uint * faults [[buffer(8)]],
-                            constant PairArgs & args [[buffer(9)]],
-                            uint3 tgpig [[threadgroup_position_in_grid]],
-                            ushort tiisg [[thread_index_in_simdgroup]],
-                            ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const short tid = tiisg / 2;
-    const short ix = tiisg % 2;
-    const short ip = tid / 8;
-    const short il = tid % 8;
-    const short l0 = 4 * il;
-    const uint slot = tgpig.y;
-    if (slot >= BLOOMERY_EXPERT_SLOTS) {
-        return;
-    }
-    const int row0 = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + (uint)sgitg) * (uint)PAIR_OUTS);
-    if (row0 >= (int)args.rows) {
-        return;
-    }
-
-    int expert = 0;
-    if (pair_expert(ids, slot, args.n_experts, expert)) {
-        if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
-                           BLOOMERY_FAULT_SITE_EXPERT_ID);
-        }
-        return;
-    }
-
-    device const block_q6_K * grow[PAIR_OUTS];
-    device const block_q6_K * urow[PAIR_OUTS];
-    for (short o = 0; o < PAIR_OUTS; ++o) {
-        grow[o] = pair_rows(gate, shexp_gate, slot == BLOOMERY_EXPERT_SHARED, expert,
-                            args.rows, args.nblocks, row0 + o);
-        urow[o] = pair_rows(up, shexp_up, slot == BLOOMERY_EXPERT_SHARED, expert,
-                            args.rows, args.nblocks, row0 + o);
-    }
-    float sumg[PAIR_OUTS];
-    float sumu[PAIR_OUTS];
-    for (short o = 0; o < PAIR_OUTS; ++o) {
-        sumg[o] = 0.f;
-        sumu[o] = 0.f;
-    }
-    float sum_sq = 0.f;
-    for (int ib = ix; ib < (int)args.nblocks; ib += 2) {
-        float yl[16];
-        q6k_load<LOAD_NORM>(x + (ulong)ib * QK_K, gain + (ulong)ib * QK_K, ip, l0, 1.f, yl,
-                            &sum_sq);
-        for (short o = 0; o < PAIR_OUTS; ++o) {
-            sumg[o] += q6k_partial(grow[o][ib], yl, ip, l0);
-            sumu[o] += q6k_partial(urow[o][ib], yl, ip, l0);
-        }
-    }
-    const float sum_squares = simd_sum(sum_sq);
-    const float scale = rms_scale(sum_squares, args.nblocks * QK_K, args.eps);
-    if (!rms_usable(sum_squares, scale)) {
-        if (tiisg == 0u) {
-            pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,
-                           BLOOMERY_FAULT_SITE_NORM_QUANT);
-        }
-        return;
-    }
-    for (short o = 0; o < PAIR_OUTS && row0 + o < (int)args.rows; ++o) {
-        float g = simd_sum(sumg[o]) * scale;
-        float u = simd_sum(sumu[o]) * scale;
-        if (tiisg == 0u) {
-            y[(ulong)slot * args.stride + (uint)(row0 + o)] = pair_swiglu(g, u);
-        }
-    }
-}
-
-kernel void q4k_down_fold(device const block_q4_K * down [[buffer(0)]],
-                          device const block_q4_K * shared [[buffer(1)]],
-                          device const float * h [[buffer(2)]],
-                          device const float * w [[buffer(3)]],
-                          device const int * ids [[buffer(4)]],
-                          device float * y [[buffer(5)]],
-                          device atomic_uint * faults [[buffer(6)]],
-                          constant FoldArgs & args [[buffer(7)]],
-                          uint3 tgpig [[threadgroup_position_in_grid]],
-                          ushort tiisg [[thread_index_in_simdgroup]],
-                          ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const short ix = tiisg / 8;
-    const short it = tiisg % 8;
-    const short iq = it / 4;
-    const short ir = it % 4;
+template <typename Q>
+kernel void down_fold_kernel(device const typename Q::Block * down [[buffer(0)]],
+                             device const typename Q::Block * shared [[buffer(1)]],
+                             device const float * h [[buffer(2)]],
+                             device const float * w [[buffer(3)]],
+                             device const int * ids [[buffer(4)]],
+                             device float * y [[buffer(5)]],
+                             device atomic_uint * faults [[buffer(6)]],
+                             constant FoldArgs & args [[buffer(7)]],
+                             uint3 tgpig [[threadgroup_position_in_grid]],
+                             ushort tiisg [[thread_index_in_simdgroup]],
+                             ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    typename Q::Lane lane = Q::lane_of(tiisg);
     // BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP rows per SIMD group,
     // BLOOMERY_MATVEC_SIMD_GROUPS of them in the threadgroup.
     constexpr short NR0 = BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP;
@@ -527,16 +292,13 @@ kernel void q4k_down_fold(device const block_q4_K * down [[buffer(0)]],
     for (short r = 0; r < NR0; ++r) {
         sum[r] = 0.f;
     }
-    for (int ib = ix; ib < BLOOMERY_EXPERT_BLOCKS; ib += 4) {
+    for (int ib = Q::first_block(lane); ib < BLOOMERY_EXPERT_BLOCKS; ib += Q::block_stride()) {
         float scale = w[ib >> 1];
-        float yl[16];
-        float yh[16];
-        float4 sumy;
-        q4k_load<LOAD_ROUTE>(h + (ulong)ib * QK_K, nullptr, iq, ir, scale, yl, yh, sumy, nullptr);
+        Q::template load<LOAD_ROUTE>(lane, h + (ulong)ib * QK_K, nullptr, scale, nullptr);
         for (short r = 0; r < NR0 && row0 + r < (int)args.rows; ++r) {
-            device const block_q4_K * b =
-                fold_block<block_q4_K>(down, shared, ids, args.rows, row0 + r, ib);
-            sum[r] += q4k_partial(*b, yl, yh, sumy, iq, ir);
+            device const typename Q::Block * b =
+                fold_block<typename Q::Block>(down, shared, ids, args.rows, row0 + r, ib);
+            sum[r] += Q::partial(*b, lane);
         }
     }
     for (short r = 0; r < NR0 && row0 + r < (int)args.rows; ++r) {
@@ -547,53 +309,58 @@ kernel void q4k_down_fold(device const block_q4_K * down [[buffer(0)]],
     }
 }
 
-kernel void q6k_down_fold(device const block_q6_K * down [[buffer(0)]],
-                          device const block_q6_K * shared [[buffer(1)]],
-                          device const float * h [[buffer(2)]],
-                          device const float * w [[buffer(3)]],
-                          device const int * ids [[buffer(4)]],
-                          device float * y [[buffer(5)]],
-                          device atomic_uint * faults [[buffer(6)]],
-                          constant FoldArgs & args [[buffer(7)]],
-                          uint3 tgpig [[threadgroup_position_in_grid]],
-                          ushort tiisg [[thread_index_in_simdgroup]],
-                          ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const short tid = tiisg / 2;
-    const short ix = tiisg % 2;
-    const short ip = tid / 8;
-    const short il = tid % 8;
-    const short l0 = 4 * il;
-    constexpr short NR0 = BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP;
-    const int row0 = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + (uint)sgitg) * (uint)NR0);
-    if (row0 >= (int)args.rows) {
-        return;
-    }
+template [[host_name("q4k_pair_swiglu")]]
+kernel void pair_swiglu_kernel<Q4K>(device const block_q4_K * gate [[buffer(0)]],
+                                    device const block_q4_K * up [[buffer(1)]],
+                                    device const block_q4_K * shexp_gate [[buffer(2)]],
+                                    device const block_q4_K * shexp_up [[buffer(3)]],
+                                    device const float * x [[buffer(4)]],
+                                    device const float * gain [[buffer(5)]],
+                                    device const int * ids [[buffer(6)]],
+                                    device float * y [[buffer(7)]],
+                                    device atomic_uint * faults [[buffer(8)]],
+                                    constant PairArgs & args [[buffer(9)]],
+                                    uint3 tgpig [[threadgroup_position_in_grid]],
+                                    ushort tiisg [[thread_index_in_simdgroup]],
+                                    ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
-    if (!fold_ids_ok(ids, args.n_experts)) {
-        if (tiisg == 0u) {
-            fold_write_bad(y, row0, (int)args.rows, faults, args.layer);
-        }
-        return;
-    }
+template [[host_name("q6k_pair_swiglu")]]
+kernel void pair_swiglu_kernel<Q6K>(device const block_q6_K * gate [[buffer(0)]],
+                                    device const block_q6_K * up [[buffer(1)]],
+                                    device const block_q6_K * shexp_gate [[buffer(2)]],
+                                    device const block_q6_K * shexp_up [[buffer(3)]],
+                                    device const float * x [[buffer(4)]],
+                                    device const float * gain [[buffer(5)]],
+                                    device const int * ids [[buffer(6)]],
+                                    device float * y [[buffer(7)]],
+                                    device atomic_uint * faults [[buffer(8)]],
+                                    constant PairArgs & args [[buffer(9)]],
+                                    uint3 tgpig [[threadgroup_position_in_grid]],
+                                    ushort tiisg [[thread_index_in_simdgroup]],
+                                    ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
-    float sum[NR0];
-    for (short r = 0; r < NR0; ++r) {
-        sum[r] = 0.f;
-    }
-    for (int ib = ix; ib < BLOOMERY_EXPERT_BLOCKS; ib += 2) {
-        float scale = w[ib >> 1];
-        float yl[16];
-        q6k_load<LOAD_ROUTE>(h + (ulong)ib * QK_K, nullptr, ip, l0, scale, yl, nullptr);
-        for (short r = 0; r < NR0 && row0 + r < (int)args.rows; ++r) {
-            device const block_q6_K * b =
-                fold_block<block_q6_K>(down, shared, ids, args.rows, row0 + r, ib);
-            sum[r] += q6k_partial(*b, yl, ip, l0);
-        }
-    }
-    for (short r = 0; r < NR0 && row0 + r < (int)args.rows; ++r) {
-        float d = simd_sum(sum[r]);
-        if (tiisg == 0u) {
-            y[(uint)(row0 + r)] += d;
-        }
-    }
-}
+template [[host_name("q4k_down_fold")]]
+kernel void down_fold_kernel<Q4K>(device const block_q4_K * down [[buffer(0)]],
+                                  device const block_q4_K * shared [[buffer(1)]],
+                                  device const float * h [[buffer(2)]],
+                                  device const float * w [[buffer(3)]],
+                                  device const int * ids [[buffer(4)]],
+                                  device float * y [[buffer(5)]],
+                                  device atomic_uint * faults [[buffer(6)]],
+                                  constant FoldArgs & args [[buffer(7)]],
+                                  uint3 tgpig [[threadgroup_position_in_grid]],
+                                  ushort tiisg [[thread_index_in_simdgroup]],
+                                  ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("q6k_down_fold")]]
+kernel void down_fold_kernel<Q6K>(device const block_q6_K * down [[buffer(0)]],
+                                  device const block_q6_K * shared [[buffer(1)]],
+                                  device const float * h [[buffer(2)]],
+                                  device const float * w [[buffer(3)]],
+                                  device const int * ids [[buffer(4)]],
+                                  device float * y [[buffer(5)]],
+                                  device atomic_uint * faults [[buffer(6)]],
+                                  constant FoldArgs & args [[buffer(7)]],
+                                  uint3 tgpig [[threadgroup_position_in_grid]],
+                                  ushort tiisg [[thread_index_in_simdgroup]],
+                                  ushort sgitg [[simdgroup_index_in_threadgroup]]);

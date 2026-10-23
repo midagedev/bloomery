@@ -39,15 +39,15 @@ pub const MUTANTS: &[Mutant] = &[
         name: "q4k_dmin_sign",
         clause: "q4k_matvec",
         why: "the dmin correction is added, not subtracted",
-        edits: &[("1.f/16.f) -\n", "1.f/16.f) +\n", 3)],
+        edits: &[("- dh[1] * (lane.sumy[0]", "+ dh[1] * (lane.sumy[0]", 1)],
     },
     Mutant {
         name: "q6k_offset",
         clause: "q6k_matvec",
         why: "one of the four 6-bit values is offset by 31, not 32",
         edits: &[(
-            "((qh[l] & kmask1) << 4)) - 32);",
-            "((qh[l] & kmask1) << 4)) - 31);",
+            "((char)((q1[l] & 0xF) | h0) - 32);",
+            "((char)((q1[l] & 0xF) | h0) - 31);",
             1,
         )],
     },
@@ -55,7 +55,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "norm_gain",
         clause: "norm_on_load",
         why: "the Q4_K norm drops the gain of a value",
-        edits: &[("a0 *= g4[i+  0];", "a0 *= 1.f;", 1)],
+        edits: &[("a0 *= gain[base + i +  0];", "a0 *= 1.f;", 1)],
     },
     Mutant {
         name: "norm_no_raise",
@@ -64,7 +64,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "raise(faults, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);",
             "",
-            4,
+            2,
         )],
     },
     Mutant {
@@ -84,14 +84,14 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "y[first_row + row] += sum_all;",
             "y[first_row + row] = sum_all;",
-            2,
+            1,
         )],
     },
     Mutant {
         name: "tail_store",
         clause: "row_tail",
         why: "the store of a pair no longer stops at the last row",
-        edits: &[(TAIL_STORE_FIND, TAIL_STORE_REPLACE, 2)],
+        edits: &[(TAIL_STORE_FIND, TAIL_STORE_REPLACE, 1)],
     },
     Mutant {
         name: "embed_no_raise",
@@ -116,13 +116,13 @@ pub const MUTANTS: &[Mutant] = &[
         name: "tail_read",
         clause: "row_tail_reads",
         why: "the rows past the last read past the weights window",
-        edits: &[(ROW_POINTER, ROW_POINTER_RAW, 2), (EARLY_RETURN, "", 2)],
+        edits: &[(ROW_POINTER, ROW_POINTER_RAW, 1), (EARLY_RETURN, "", 1)],
     },
     Mutant {
         name: "seg_weight_offset",
         clause: "seg_bit",
         why: "a segment reads the weights of the first segment",
-        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 2)],
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 1)],
     },
     Mutant {
         name: "seg_last_segment",
@@ -131,7 +131,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "for (uint i = 0; i < args.nseg; ++i) {",
             "for (uint i = 0; i < 3 && i < args.nseg; ++i) {",
-            2,
+            1,
         )],
     },
     Mutant {
@@ -168,7 +168,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "    for (short r = 0; r < NR0 && row0 + r < (int)args.rows; ++r) {\n        float d = simd_sum(sum[r]);",
             "    for (short r = 0; r < NR0; ++r) {\n        float d = simd_sum(sum[r]);",
-            2,
+            1,
         )],
     },
     Mutant {
@@ -287,7 +287,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "pair_norm_gain",
         clause: "pair",
         why: "the pair's Q4_K norm drops the gain of a value",
-        edits: &[("a0 *= gain[base + i + 0];", "a0 *= 1.f;", 1)],
+        edits: &[("a0 *= gain[base + i +  0];", "a0 *= 1.f;", 1)],
     },
     Mutant {
         name: "pair_norm_no_raise",
@@ -296,20 +296,20 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "pair_write_bad(y, slot, args.stride, row0, (int)args.rows, faults, args.layer,\n                           BLOOMERY_FAULT_SITE_NORM_QUANT);",
             "for (short o = 0; o < PAIR_OUTS && row0 + o < (int)args.rows; ++o) {\n                y[(ulong)slot * args.stride + (uint)(row0 + o)] = NAN;\n            }",
-            2,
+            1,
         )],
     },
     Mutant {
         name: "fold_drop_weight",
         clause: "fold",
         why: "the fold loads the activation without the route weight",
-        edits: &[("float scale = w[ib >> 1];", "float scale = 1.0f;", 2)],
+        edits: &[("float scale = w[ib >> 1];", "float scale = 1.0f;", 1)],
     },
     Mutant {
         name: "fold_no_resid",
         clause: "fold",
         why: "the fold overwrites the residual",
-        edits: &[("y[(uint)(row0 + r)] += d;", "y[(uint)(row0 + r)] = d;", 2)],
+        edits: &[("y[(uint)(row0 + r)] += d;", "y[(uint)(row0 + r)] = d;", 1)],
     },
     Mutant {
         name: "delta_fma_sign",
@@ -508,8 +508,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "head_bounds",
         why: "the mat-vec does not run, so the logits stay the sentinel",
         edits: &[(
-            "q6k_rows<true, false, false>(weights, x, logits,",
-            "if (false) q6k_rows<true, false, false>(weights, x, logits,",
+            "matvec_rows<Q, true, false, false, false>(weights, x, logits,",
+            "if (false) matvec_rows<Q, true, false, false, false>(weights, x, logits,",
             1,
         )],
     },

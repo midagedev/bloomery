@@ -1,5 +1,7 @@
-// The Q4_K mat-vec: y[r] = sum_c W[r, c] * x[c] for one f32 activation vector,
-// W in GGUF block_q4_K layout, one dispatch. The entries:
+// The quantized mat-vec: y[r] = sum_c W[r, c] * x[c] for one f32 activation
+// vector, one dispatch. The row loop is one template over the quant
+// (quant.metal) and the modes; the entry points are the instantiations,
+// under their host names, the names the host has always launched:
 //
 //   q4k_matvec                y = W . x
 //   q4k_matvec_norm           y = W . rms_norm(x, gain, eps): the norm applied
@@ -10,29 +12,31 @@
 //   q4k_matvec_headnorm_resid y = y + W . (g * head_scale): the gated delta
 //                             net's out projection, the head scale applied to
 //                             each block's head groups
+//   q6k_matvec / _norm / _resid / _seg   the same over Q6_K, instantiated in
+//                             matvec_q6k.metal; Q6_K has no head-norm entry
 //
-// Adapted from llama.cpp's kernel_mul_mv_q4_K_f32 (MIT licence; see
-// THIRD_PARTY_NOTICES.md):
+// The row loop is llama.cpp's (kernel_mul_mv_q4_K_f32 and
+// kernel_mul_mv_q6_K_f32, MIT licence; see THIRD_PARTY_NOTICES.md):
 //   ggml/src/ggml-metal/kernels/mul_mv.metal
-// The lane map (ix/it/iq/ir), the four-block loop, the uint16 nibble trick, the
-// row loop over a SIMD group's rows and the simd_sum reduction are llama.cpp's.
-// The rows a SIMD group owns are the row loop's constant, four the landed
-// count: the loop and the tail are written for any of 2, 4 and 8, and a SIMD
-// group loads the input once for all its rows (the register reuse MLX's
-// affine_qmv_fast is built on). The SIMD groups in a threadgroup are the
-// function constant of norm.metal: 2 for the dense mat-vec, 8 for the output
-// head.
+// The four-block and two-block walks, the row loop over a SIMD group's rows
+// and the simd_sum reduction are its. The rows a SIMD group owns are the row
+// loop's constant, four the landed count: the loop and the tail are written
+// for any of 2, 4 and 8, and a SIMD group loads the input once for all its
+// rows (the register reuse MLX's affine_qmv_fast is built on). The SIMD
+// groups in a threadgroup are the function constant of norm.metal: 2 for the
+// dense mat-vec, 8 for the output head.
 //
 // What differs from llama.cpp's loop:
-//   - the matrix is not padded: a SIMD group past the last row returns, and each
-//     row's blocks are addressed from a pointer taken once before the loop,
-//     clamped to the last row, so a row past the last re-reads the last row (a
-//     defined access) and is never stored; llama.cpp advances one pointer by a
-//     row's bytes and reads whole threadgroups of rows past the end;
+//   - the matrix is not padded: a SIMD group past the last row returns, and
+//     each row's blocks are addressed from a pointer taken once before the
+//     loop, clamped to the last row, so a row past the last re-reads the last
+//     row (a defined access) and is never stored; llama.cpp advances one
+//     pointer by a row's bytes and reads whole threadgroups of rows past the
+//     end;
 //   - the variants above.
 //
-// This file comes after norm.metal and defines what the Q6_K and embed files
-// use of it: QK_K, FOR_UNROLL and block_q4_K.
+// This file comes after norm.metal and quant.metal, and defines what the
+// Q6_K, embed and head files use of it: the row loop and the entry templates.
 
 #include <metal_stdlib>
 
@@ -40,17 +44,6 @@ using namespace metal;
 
 #pragma METAL fp contract(off)
 
-#define QK_K 256
-#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
-
-struct block_q4_K {
-    half    d;
-    half    dmin;
-    uint8_t scales[12];
-    uint8_t qs[128];
-};
-
-static_assert(sizeof(block_q4_K) == 144, "block_q4_K is 144 bytes");
 static_assert(BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP == 2 ||
               BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP == 4 ||
               BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP == 8,
@@ -66,57 +59,46 @@ inline int simd_first_row(uint tg, ushort sg) {
 // the whole input at the end, the head norm scales each block's two head
 // groups once at the end of the block, and the residual adds into the
 // output: the dot product is the same in all of them, so the rows they write
-// are the same bits.
-template <bool NORM, bool RESID, bool HEADNORM>
-inline void q4k_rows(device const block_q4_K * W,
-                      device const float      * x,
-                      device float            * y,
-                      int nblocks,
-                      float eps,
-                      uint layer,
-                      device const float      * gain,
-                      threadgroup const float  * scales,
-                      device atomic_uint      * faults,
-                      int first_row,
-                      int rows,
-                      ushort tiisg) {
-    constexpr uint16_t kmask1 = 0x3f3f;
-    constexpr uint16_t kmask2 = 0x0f0f;
-    constexpr uint16_t kmask3 = 0xc0c0;
+// are the same bits. ROW_RAISE: a norm-on-load row the scaled sum leaves
+// not finite raises the norm site and is NaN. The head turns it off: its
+// argmax owns a non-finite logit and raises the logit site for it.
+template <typename Q, bool NORM, bool RESID, bool HEADNORM, bool ROW_RAISE = true>
+inline void matvec_rows(device const typename Q::Block * W,
+                        device const float      * x,
+                        device float            * y,
+                        int nblocks,
+                        float eps,
+                        uint layer,
+                        device const float      * gain,
+                        threadgroup const float * scales,
+                        device atomic_uint      * faults,
+                        int first_row,
+                        int rows,
+                        ushort tiisg) {
     constexpr short NR0 = BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP;
-
-    const short ix = tiisg/8;  // 0...3
-    const short it = tiisg%8;  // 0...7
-    const short iq = it/4;     // 0 or 1
-    const short ir = it%4;     // 0...3
 
     const int nb = nblocks;
     if (first_row >= rows) {
         return;
     }
     // Each row's blocks, the last row's for a row past the last.
-    device const block_q4_K * rp[NR0];
+    device const typename Q::Block * rp[NR0];
     for (short r = 0; r < NR0; ++r) {
         rp[r] = W + (ulong)min(first_row + r, rows - 1) * (ulong)nb;
     }
 
-    float yl[16];
-    float yh[16];
+    typename Q::Lane lane = Q::lane_of(tiisg);
     float sumf[NR0];
     for (short r = 0; r < NR0; ++r) sumf[r] = 0.f;
     float sum_sq = 0.f;
 
-    const int y_offset = ix * QK_K + 64 * iq + 8 * ir;
-    device const float * y4 = x + y_offset;
-    // The gain is bound by the norm entry only: the others form no pointer
-    // from it.
-    device const float * g4 = NORM ? gain + y_offset : gain;
+    // The lane's share of the input and the gain: the lane's first block's
+    // base, the quant's load adding the lane's offset inside it. The gain is
+    // bound by the norm entry only: the others form no pointer from it.
+    device const float * xp = x + Q::first_block(lane) * QK_K;
+    device const float * gp = NORM ? gain + Q::first_block(lane) * QK_K : gain;
 
-    uint16_t sc16[4];
-    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
-
-    for (int ib = ix; ib < nb; ib += 4) {
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+    for (int ib = Q::first_block(lane); ib < nb; ib += Q::block_stride()) {
         // The block's two heads: the head scale of each, once for the block.
         float lo = 1.f;
         float hi = 1.f;
@@ -124,79 +106,32 @@ inline void q4k_rows(device const block_q4_K * W,
             lo = scales[2*ib];
             hi = scales[2*ib+1];
         }
-        for (short i = 0; i < 8; ++i) {
-            float a0 = y4[i+  0];
-            float a1 = y4[i+ 32];
-            float a2 = y4[i+128];
-            float a3 = y4[i+160];
-            if (NORM) {
-                sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
-                a0 *= g4[i+  0];
-                a1 *= g4[i+ 32];
-                a2 *= g4[i+128];
-                a3 *= g4[i+160];
-            }
-            yl[i+0] = a0; sumy[0] += a0;
-            yl[i+8] = a1; sumy[1] += a1;
-            yh[i+0] = a2; sumy[2] += a2;
-            yh[i+8] = a3; sumy[3] += a3;
+        if (NORM) {
+            Q::template load<LOAD_NORM>(lane, xp, gp, 1.f, &sum_sq);
+        } else {
+            Q::template load<LOAD_PLAIN>(lane, xp, nullptr, 1.f, nullptr);
         }
         // A value the gated numerator cannot carry, or a group sum that left
         // the finite range: the gate's site is raised, and the sums it is in
         // are not finite either, so the rows are NaN.
-        if (HEADNORM && (!isfinite(sumy[0]) || !isfinite(sumy[1]) ||
-                         !isfinite(sumy[2]) || !isfinite(sumy[3]))) {
-            raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
+        if constexpr (HEADNORM) {
+            if (!isfinite(lane.sumy[0]) || !isfinite(lane.sumy[1]) ||
+                !isfinite(lane.sumy[2]) || !isfinite(lane.sumy[3])) {
+                raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
+            }
         }
 
         for (short row = 0; row < NR0; ++row) {
-            device const uint16_t * sc = (device const uint16_t *)rp[row][ib].scales + iq;
-            device const uint16_t * q1 = (device const uint16_t *)rp[row][ib].qs + 16 * iq + 4 * ir;
-            device const half     * dh = &rp[row][ib].d;
-
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-
-            device const uint16_t * q2 = q1 + 32;
-
-            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
-
-            FOR_UNROLL (short i = 0; i < 4; ++i) {
-                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
-                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
-                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
-                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
-                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
-                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
-                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
-                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
-            }
-
-            // The head scale multiplies each group's whole term once, not
-            // every value in it: the dot is linear in the input.
-            if (HEADNORM) {
-                sumf[row] += lo * (dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
-                                            (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f) -
-                                   dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3])) +
-                             hi * (dh[0] * ((acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
-                                            (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
-                                   dh[1] * (sumy[2] * sc8[6] + sumy[3] * sc8[7]));
+            if constexpr (HEADNORM) {
+                sumf[row] += Q::partial_head(rp[row][ib], lane, lo, hi);
             } else {
-                sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
-                                      (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
-                                      (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
-                                      (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
-                             dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
-                                      sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+                sumf[row] += Q::partial(rp[row][ib], lane);
             }
         }
 
-        y4 += 4 * QK_K;
+        xp += Q::block_stride() * QK_K;
         if (NORM) {
-            g4 += 4 * QK_K;
+            gp += Q::block_stride() * QK_K;
         }
     }
 
@@ -223,7 +158,7 @@ inline void q4k_rows(device const block_q4_K * W,
         if (tiisg == 0) {
             // A row the scaled sum leaves not finite (a gain or a weight that is
             // not finite) raises the norm site and is NaN, not a plausible value.
-            if (NORM && !isfinite(sum_all)) {
+            if (NORM && ROW_RAISE && !isfinite(sum_all)) {
                 raise(faults, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
                 y[first_row + row] = NAN;
             } else if (RESID) {
@@ -235,56 +170,49 @@ inline void q4k_rows(device const block_q4_K * W,
     }
 }
 
-kernel void q4k_matvec(device const block_q4_K * W [[buffer(0)]],
-                       device const float      * x [[buffer(1)]],
-                       device float            * y [[buffer(2)]],
-                       constant MatvecArgs     & args [[buffer(3)]],
-                       uint3  tgpig [[threadgroup_position_in_grid]],
-                       ushort tiisg [[thread_index_in_simdgroup]],
-                       ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+// The plain mat-vec, storing or adding into the output.
+template <typename Q, bool RESID>
+kernel void matvec_kernel(device const typename Q::Block * W [[buffer(0)]],
+                          device const float      * x [[buffer(1)]],
+                          device float            * y [[buffer(2)]],
+                          constant MatvecArgs     & args [[buffer(3)]],
+                          uint3  tgpig [[threadgroup_position_in_grid]],
+                          ushort tiisg [[thread_index_in_simdgroup]],
+                          ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     const int first_row = simd_first_row(tgpig.x, sgitg);
-    q4k_rows<false, false, false>(W, x, y, args.nblocks, args.eps, args.layer,
-                                  nullptr, nullptr, nullptr, first_row, (int)args.rows, tiisg);
+    matvec_rows<Q, false, RESID, false>(W, x, y, args.nblocks, args.eps, args.layer,
+                                        nullptr, nullptr, nullptr, first_row, (int)args.rows, tiisg);
 }
 
-kernel void q4k_matvec_norm(device const block_q4_K * W [[buffer(0)]],
-                            device const float      * x [[buffer(1)]],
-                            device float            * y [[buffer(2)]],
-                            constant MatvecArgs     & args [[buffer(3)]],
-                            device const float      * gain [[buffer(4)]],
-                            device atomic_uint      * faults [[buffer(5)]],
-                            uint3  tgpig [[threadgroup_position_in_grid]],
-                            ushort tiisg [[thread_index_in_simdgroup]],
-                            ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+// The norm on load: the gain and the fault word are bound here.
+template <typename Q>
+kernel void matvec_norm_kernel(device const typename Q::Block * W [[buffer(0)]],
+                               device const float      * x [[buffer(1)]],
+                               device float            * y [[buffer(2)]],
+                               constant MatvecArgs     & args [[buffer(3)]],
+                               device const float      * gain [[buffer(4)]],
+                               device atomic_uint      * faults [[buffer(5)]],
+                               uint3  tgpig [[threadgroup_position_in_grid]],
+                               ushort tiisg [[thread_index_in_simdgroup]],
+                               ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     const int first_row = simd_first_row(tgpig.x, sgitg);
-    q4k_rows<true, false, false>(W, x, y, args.nblocks, args.eps, args.layer,
-                                 gain, nullptr, faults, first_row, (int)args.rows, tiisg);
-}
-
-kernel void q4k_matvec_resid(device const block_q4_K * W [[buffer(0)]],
-                             device const float      * x [[buffer(1)]],
-                             device float            * y [[buffer(2)]],
-                             constant MatvecArgs     & args [[buffer(3)]],
-                             uint3  tgpig [[threadgroup_position_in_grid]],
-                             ushort tiisg [[thread_index_in_simdgroup]],
-                             ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const int first_row = simd_first_row(tgpig.x, sgitg);
-    q4k_rows<false, true, false>(W, x, y, args.nblocks, args.eps, args.layer,
-                                 nullptr, nullptr, nullptr, first_row, (int)args.rows, tiisg);
+    matvec_rows<Q, true, false, false>(W, x, y, args.nblocks, args.eps, args.layer,
+                                       gain, nullptr, faults, first_row, (int)args.rows, tiisg);
 }
 
 // The row segments of up to four tensors of one type and one width: the
 // threadgroup takes the segment whose first threadgroup it is, and the rows
 // are the ones a launch of that segment alone would write.
-kernel void q4k_matvec_seg(device const block_q4_K * W [[buffer(0)]],
-                            device const float      * x [[buffer(1)]],
-                            device float            * y [[buffer(2)]],
-                            constant SegArgs        & args [[buffer(3)]],
-                            device const float      * gain [[buffer(4)]],
-                            device atomic_uint      * faults [[buffer(5)]],
-                            uint3  tgpig [[threadgroup_position_in_grid]],
-                            ushort tiisg [[thread_index_in_simdgroup]],
-                            ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+template <typename Q>
+kernel void matvec_seg_kernel(device const typename Q::Block * W [[buffer(0)]],
+                              device const float      * x [[buffer(1)]],
+                              device float            * y [[buffer(2)]],
+                              constant SegArgs        & args [[buffer(3)]],
+                              device const float      * gain [[buffer(4)]],
+                              device atomic_uint      * faults [[buffer(5)]],
+                              uint3  tgpig [[threadgroup_position_in_grid]],
+                              ushort tiisg [[thread_index_in_simdgroup]],
+                              ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     uint s = 0;
     for (uint i = 0; i < args.nseg; ++i) {
         if (tgpig.x >= args.segs[i].first_group) {
@@ -293,7 +221,7 @@ kernel void q4k_matvec_seg(device const block_q4_K * W [[buffer(0)]],
     }
     const uint local = tgpig.x - args.segs[s].first_group;
     const int first_row = simd_first_row(local, sgitg);
-    q4k_rows<true, false, false>(
+    matvec_rows<Q, true, false, false>(
         W + (ulong)args.segs[s].wblocks,
         x,
         y + args.segs[s].out,
@@ -309,15 +237,16 @@ kernel void q4k_matvec_seg(device const block_q4_K * W [[buffer(0)]],
 // way the plain residual path reads its input, and multiplies each block's two
 // head groups by their scale once, so the per-value work the plain path does
 // not do is two threadgroup loads and two products a block.
-kernel void q4k_matvec_headnorm_resid(device const block_q4_K * W [[buffer(0)]],
-                                      device const float      * g [[buffer(1)]],
-                                      device const float      * partials [[buffer(2)]],
-                                      device float            * y [[buffer(3)]],
-                                      constant MatvecArgs     & args [[buffer(4)]],
-                                      device atomic_uint      * faults [[buffer(5)]],
-                                      uint3  tgpig [[threadgroup_position_in_grid]],
-                                      ushort tiisg [[thread_index_in_simdgroup]],
-                                      ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+template <typename Q>
+kernel void matvec_headnorm_kernel(device const typename Q::Block * W [[buffer(0)]],
+                                    device const float      * g [[buffer(1)]],
+                                    device const float      * partials [[buffer(2)]],
+                                    device float            * y [[buffer(3)]],
+                                    constant MatvecArgs     & args [[buffer(4)]],
+                                    device atomic_uint      * faults [[buffer(5)]],
+                                    uint3  tgpig [[threadgroup_position_in_grid]],
+                                    ushort tiisg [[thread_index_in_simdgroup]],
+                                    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     // The head scales, in threadgroup memory: a lane reads the scale of each
     // head its columns are in, and the lanes of a SIMD group do not read the
     // same head, so a shuffle cannot share them.
@@ -342,6 +271,60 @@ kernel void q4k_matvec_headnorm_resid(device const block_q4_K * W [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const int first_row = simd_first_row(tgpig.x, sgitg);
-    q4k_rows<false, true, true>(W, g, y, args.nblocks, args.eps, args.layer,
-                                nullptr, scales, faults, first_row, (int)args.rows, tiisg);
+    matvec_rows<Q, false, true, true>(W, g, y, args.nblocks, args.eps, args.layer,
+                                      nullptr, scales, faults, first_row, (int)args.rows, tiisg);
 }
+
+// The Q4_K entries, under the names the host launches.
+
+template [[host_name("q4k_matvec")]]
+kernel void matvec_kernel<Q4K, false>(device const block_q4_K * W [[buffer(0)]],
+                                      device const float      * x [[buffer(1)]],
+                                      device float            * y [[buffer(2)]],
+                                      constant MatvecArgs     & args [[buffer(3)]],
+                                      uint3  tgpig [[threadgroup_position_in_grid]],
+                                      ushort tiisg [[thread_index_in_simdgroup]],
+                                      ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("q4k_matvec_resid")]]
+kernel void matvec_kernel<Q4K, true>(device const block_q4_K * W [[buffer(0)]],
+                                      device const float      * x [[buffer(1)]],
+                                      device float            * y [[buffer(2)]],
+                                      constant MatvecArgs     & args [[buffer(3)]],
+                                      uint3  tgpig [[threadgroup_position_in_grid]],
+                                      ushort tiisg [[thread_index_in_simdgroup]],
+                                      ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("q4k_matvec_norm")]]
+kernel void matvec_norm_kernel<Q4K>(device const block_q4_K * W [[buffer(0)]],
+                                    device const float      * x [[buffer(1)]],
+                                    device float            * y [[buffer(2)]],
+                                    constant MatvecArgs     & args [[buffer(3)]],
+                                    device const float      * gain [[buffer(4)]],
+                                    device atomic_uint      * faults [[buffer(5)]],
+                                    uint3  tgpig [[threadgroup_position_in_grid]],
+                                    ushort tiisg [[thread_index_in_simdgroup]],
+                                    ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("q4k_matvec_seg")]]
+kernel void matvec_seg_kernel<Q4K>(device const block_q4_K * W [[buffer(0)]],
+                                    device const float      * x [[buffer(1)]],
+                                    device float            * y [[buffer(2)]],
+                                    constant SegArgs        & args [[buffer(3)]],
+                                    device const float      * gain [[buffer(4)]],
+                                    device atomic_uint      * faults [[buffer(5)]],
+                                    uint3  tgpig [[threadgroup_position_in_grid]],
+                                    ushort tiisg [[thread_index_in_simdgroup]],
+                                    ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
+// The one entry the head-norm mode has: Q4_K's out projection.
+template [[host_name("q4k_matvec_headnorm_resid")]]
+kernel void matvec_headnorm_kernel<Q4K>(device const block_q4_K * W [[buffer(0)]],
+                                        device const float      * g [[buffer(1)]],
+                                        device const float      * partials [[buffer(2)]],
+                                        device float            * y [[buffer(3)]],
+                                        constant MatvecArgs     & args [[buffer(4)]],
+                                        device atomic_uint      * faults [[buffer(5)]],
+                                        uint3  tgpig [[threadgroup_position_in_grid]],
+                                        ushort tiisg [[thread_index_in_simdgroup]],
+                                        ushort sgitg [[simdgroup_index_in_threadgroup]]);

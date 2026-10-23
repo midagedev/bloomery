@@ -1037,27 +1037,28 @@ const HEADNORM_PHASES: &[Phase] = &[
     },
     Phase {
         name: "noapply",
-        find: "    threadgroup float scales[BLOOMERY_DELTA_VALUE_HEADS];\n    if (sgitg == 0 && tiisg < BLOOMERY_DELTA_VALUE_HEADS) {\n        const uint head = tiisg;\n        float sum = 0.f;\n        for (short j = 0; j < BLOOMERY_DELTA_COLUMN_BLOCKS; ++j) {\n            sum += partials[head * BLOOMERY_DELTA_COLUMN_BLOCKS + j];\n        }\n        const float mean = sum / float(BLOOMERY_DELTA_HEAD_COLS);\n        const float s = rsqrt(mean + args.eps);\n        if (!isfinite(sum) || !isfinite(s)) {\n            // A head the norm cannot take is NaN, not a zero head: its values\n            // are then not finite and the rows that read them are NaN.\n            raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);\n            scales[head] = NAN;\n        } else {\n            scales[head] = s;\n        }\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n\n    const int first_row = simd_first_row(tgpig.x, sgitg);\n    q4k_rows<false, true, true>(W, g, y, args.nblocks, args.eps, args.layer,\n                                nullptr, scales, faults, first_row, (int)args.rows, tiisg);",
-        with: "    const int first_row = simd_first_row(tgpig.x, sgitg);\n    q4k_rows<false, true, false>(W, g, y, args.nblocks, args.eps, args.layer,\n                                 nullptr, nullptr, faults, first_row, (int)args.rows, tiisg);",
+        find: "    threadgroup float scales[BLOOMERY_DELTA_VALUE_HEADS];\n    if (sgitg == 0 && tiisg < BLOOMERY_DELTA_VALUE_HEADS) {\n        const uint head = tiisg;\n        float sum = 0.f;\n        for (short j = 0; j < BLOOMERY_DELTA_COLUMN_BLOCKS; ++j) {\n            sum += partials[head * BLOOMERY_DELTA_COLUMN_BLOCKS + j];\n        }\n        const float mean = sum / float(BLOOMERY_DELTA_HEAD_COLS);\n        const float s = rsqrt(mean + args.eps);\n        if (!isfinite(sum) || !isfinite(s)) {\n            // A head the norm cannot take is NaN, not a zero head: its values\n            // are then not finite and the rows that read them are NaN.\n            raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);\n            scales[head] = NAN;\n        } else {\n            scales[head] = s;\n        }\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n\n    const int first_row = simd_first_row(tgpig.x, sgitg);\n    matvec_rows<Q, false, true, true>(W, g, y, args.nblocks, args.eps, args.layer,\n                                      nullptr, scales, faults, first_row, (int)args.rows, tiisg);",
+        with: "    const int first_row = simd_first_row(tgpig.x, sgitg);\n    matvec_rows<Q, false, true, false>(W, g, y, args.nblocks, args.eps, args.layer,\n                                       nullptr, nullptr, faults, first_row, (int)args.rows, tiisg);",
     },
 ];
 
 /// The dense mat-vec's inner-loop cuts, beside its own rows: the block loop
 /// with two blocks a step (a 512-value pass, MLX's loop shape), a compiler
 /// unroll of the shipped loop, so the lane's block order and the row's float
-/// order do not move. One cut a quant: each find text is its kernel's own.
+/// order do not move. The two rows find the one shared loop now: the cut
+/// unrolls the template's body, and the row measured is the named quant's.
 const MATVEC_UNROLL: &str = "_Pragma(\"clang loop unroll_count(2)\")\n";
 
 const MATVEC_PHASES: &[(&str, Quant, &str)] = &[
     (
         "unroll2",
         Quant::Q4K,
-        "    for (int ib = ix; ib < nb; ib += 4) {",
+        "    for (int ib = Q::first_block(lane); ib < nb; ib += Q::block_stride()) {",
     ),
     (
         "unroll2",
         Quant::Q6K,
-        "    for (int i = ix; i < nb; i += 2) {",
+        "    for (int ib = Q::first_block(lane); ib < nb; ib += Q::block_stride()) {",
     ),
 ];
 

@@ -247,13 +247,15 @@ fn main() {
 
     let mut kernels = Vec::new();
     // The order is the dependency order: norm defines the argument block the
-    // mat-vecs read, matvec_q4k the block layout and macros the Q6_K and embed
-    // files use.
+    // mat-vecs read, quant the block layouts and the decode owners every
+    // quantized kernel reads (embed's too), matvec_q4k the row loop and the
+    // entry templates the Q6_K, experts and head files instantiate.
     for name in [
         "fault",
         "copy",
         "probe",
         "norm",
+        "quant",
         "matvec_q4k",
         "matvec_q6k",
         "embed",
