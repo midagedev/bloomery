@@ -384,6 +384,7 @@ pytools_list() {
     "tools/gate-paths-merge.py --self-test"
     "tools/hf-arch-check.py --self-test"
     "tools/mac-disk.py --self-test"
+    "tools/mlx-fixture.py --self-test"
     "tools/model_tax.py --self-test"
     "tools/owners_check.py --self-test"
     "tools/pr-gate-lines.py --self-test"
