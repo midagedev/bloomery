@@ -172,7 +172,17 @@ pub const MUTANTS: &[Mutant] = &[
         name: "router_ids",
         clause: "router_ids",
         why: "the selection keeps the smaller logit",
-        edits: &[("!any || v > best_v", "!any || v < best_v", 1)],
+        edits: &[("argmax_key(l, row)", "argmax_key(-l, row)", 1)],
+    },
+    Mutant {
+        name: "router_tie",
+        clause: "router_tie",
+        why: "at an equal value the larger id is taken",
+        edits: &[(
+            "((ulong)o << 32) | (ulong)(~i)",
+            "((ulong)o << 32) | (ulong)(i)",
+            1,
+        )],
     },
     Mutant {
         name: "router_weights",
@@ -201,10 +211,26 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "router_bounds",
         why: "the last threadgroup does not run the epilogue",
         edits: &[(
-            "if (last_flag == 1u && tid == 0u) {\n        route_last(",
-            "if (last_flag == 2u && tid == 0u) {\n        route_last(",
+            "if (last_flag == 1u) {\n        route_last(",
+            "if (last_flag == 2u) {\n        route_last(",
             1,
         )],
+    },
+    Mutant {
+        name: "router_rounds",
+        clause: "router_ids",
+        why: "the exclusion keys out every key but the winner, so every slot repeats it",
+        edits: &[(
+            "            if (held[j] == chosen_key) {\n                held[j] = 0u;\n            }",
+            "            if (held[j] != chosen_key) {\n                held[j] = 0u;\n            }",
+            1,
+        )],
+    },
+    Mutant {
+        name: "router_bad",
+        clause: "router_nan",
+        why: "a non-finite logit's word does not cross the threadgroup",
+        edits: &[("flags[sg_in_tg] = mine_bad;", "flags[sg_in_tg] = 0u;", 1)],
     },
     // fold_type and experts_bounds check the host, so they have no kernel mutant.
     Mutant {
@@ -421,6 +447,16 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "head_all_nan",
         why: "an all-NaN head stores the empty key's id, which is token 0",
         edits: &[("best_key == empty_key", "best_key == 0u", 1)],
+    },
+    Mutant {
+        name: "head_stage",
+        clause: "head_ticket",
+        why: "the threadgroup's key reduction skips the last SIMD group's share",
+        edits: &[(
+            "    ulong best = stage[0];\n    for (uint g = 1u; g < sg_count; ++g) {\n        best = max(best, stage[g]);\n    }",
+            "    ulong best = stage[0];\n    for (uint g = 1u; g < sg_count - 1u; ++g) {\n        best = max(best, stage[g]);\n    }",
+            1,
+        )],
     },
 ];
 

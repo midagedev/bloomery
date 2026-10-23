@@ -1,15 +1,12 @@
 // The output head: one Q6_K mat-vec with the norm on the load, and the
 // argmax in the same dispatch. A threadgroup owns sixteen rows (eight SIMD
 // groups, two rows each). It writes one packed candidate. The last
-// threadgroup reads every candidate and stores the winning row index.
+// threadgroup's threads together reduce every candidate and thread 0 stores
+// the winning row index.
 //
-// The packed key is CUDA's argmax_key. v == 0 stores bits 0, so -0 and +0
-// are one key. A negative bit pattern is bitwise complemented. A
-// non-negative one is OR-ed with 0x80000000. The key is that u32 in the
-// high half and ~index in the low half. An unsigned maximum of keys is the
-// comparison below, so the scan order does not matter. An empty group, and
-// a group whose live logits are all NaN, packs (-inf, 0). When that key
-// wins, the step id is not a token.
+// The packed key is ticket.metal's argmax_key. An empty group, and a group
+// whose live logits are all NaN, packs (-inf, 0). When that key wins, the
+// step id is not a token.
 //
 // This file comes after matvec_q6k.metal (q6k_rows, block_q6_K) and
 // ticket.metal.
@@ -20,12 +17,12 @@ using namespace metal;
 
 #pragma METAL fp contract(off)
 
-static ulong argmax_key(float v, uint i)
-{
-    uint b = v == 0.f ? 0u : as_type<uint>(v);
-    uint o = (b & 0x80000000u) != 0u ? ~b : (b | 0x80000000u);
-    return ((ulong)o << 32) | (ulong)(~i);
-}
+// The head's threadgroup: eight SIMD groups of 32 lanes. The pipeline is
+// specialized at this count (norm.metal's function constant) and the launch
+// refuses any other, so the stage array and the strides read it as a
+// constant.
+#define HEAD_SIMD_GROUPS 8u
+#define HEAD_THREADS (32u * HEAD_SIMD_GROUPS)
 
 kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
                             device const float *x [[buffer(1)]],
@@ -43,6 +40,7 @@ kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
                             uint groups [[threadgroups_per_grid]])
 {
     threadgroup uint last_flag = 0u;
+    threadgroup ulong stage[HEAD_SIMD_GROUPS];
 
     const int first_row = simd_first_row(tg, sg);
     q6k_rows<true, false>(weights, x, logits, (int)args.nblocks, args.eps, args.layer, gain,
@@ -88,24 +86,32 @@ kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
     }
 
     ticket_is_last(ticket, groups, tid, last_flag);
-    if (last_flag == 1u && tid == 0u) {
+    if (last_flag == 1u) {
+        // The threads of the last threadgroup share the candidates by
+        // stride, so the tail is one strided load each, not one thread's
+        // chain. A share with no candidate holds key 0, which no packed key
+        // is, so it never wins.
         ticket_acquire();
-        ulong best_key = ticket_load_u64(candidates, 0u);
-        for (uint g = 1u; g < groups; ++g) {
+        ulong mine = 0u;
+        for (uint g = tid; g < groups; g += HEAD_THREADS) {
             ulong key = ticket_load_u64(candidates, g);
-            if (key > best_key) {
-                best_key = key;
+            if (key > mine) {
+                mine = key;
             }
         }
-        // (-inf, 0) is the smallest key, so any finite logit wins. When it
-        // wins, every logit was NaN and the id must not be a token.
-        ulong empty_key = argmax_key(-INFINITY, 0u);
-        if (best_key == empty_key) {
-            raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);
-            step_id[0] = 0xFFFFFFFFu;
-        } else {
-            step_id[0] = ~uint(best_key);
+        ulong best_key = ticket_max_key(mine, stage, (uint)tiisg, (uint)sg,
+                                        HEAD_SIMD_GROUPS);
+        if (tid == 0u) {
+            // (-inf, 0) is the smallest key, so any finite logit wins. When it
+            // wins, every logit was NaN and the id must not be a token.
+            ulong empty_key = argmax_key(-INFINITY, 0u);
+            if (best_key == empty_key) {
+                raise(faults, args.layer, BLOOMERY_FAULT_SITE_LOGIT);
+                step_id[0] = 0xFFFFFFFFu;
+            } else {
+                step_id[0] = ~uint(best_key);
+            }
+            ticket_reset(ticket);
         }
-        ticket_reset(ticket);
     }
 }
