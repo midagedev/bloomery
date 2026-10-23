@@ -298,7 +298,8 @@ fn the_refusals(s: &mut Session, toks: &[u32]) -> Result<String, String> {
     }
     usable_after(s, prefix, next)?;
 
-    // A cut between 0 and the position.
+    // A cut between 0 and the position. The prefix was stepped, not prompted,
+    // so no checkpoint stands below it.
     fed(s, prefix)?;
     let held = s.pos();
     let err = match Target::cut(s, 1) {

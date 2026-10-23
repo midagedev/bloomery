@@ -28,6 +28,10 @@
 //! - `s_serve`: the server's engine over a session of its own: greedy picks,
 //!   a sampled step's row and the keep rule held to this session's host-fed
 //!   steps (`serve.rs`).
+//! - `k_keep`: checkpoints of the delta state (`keep.rs`). A prompt leaves
+//!   points at `seqstate::marks`; a cut back to one matches a fresh prompt,
+//!   including while a token runs ahead; a cut where no point stands is
+//!   refused; the engine keeps a prefill's end.
 //! - `t_target`: the session as the generation loop's target
 //!   (`runtime::Target`): `generate` over `Plain` and a count stop emits the
 //!   plain steps' own greedy picks with every chained token kept; a
@@ -90,6 +94,8 @@ mod flip;
 mod free;
 #[path = "generate.rs"]
 mod generate;
+#[path = "keep.rs"]
+mod keep;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "nodes.rs"]
@@ -416,7 +422,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 10] = [
+    const NAMES: [&str; 11] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -424,6 +430,7 @@ pub fn main() -> ExitCode {
         "a_free",
         "t_target",
         "s_serve",
+        "k_keep",
         "g_generate",
         "f_deep",
         "p_profile",
@@ -539,6 +546,7 @@ pub fn main() -> ExitCode {
             "c_resume" => chain::c_resume(&mut session),
             "t_target" => target::t_target(&mut session),
             "s_serve" => serve::s_serve(&mut session, &device, library, &path),
+            "k_keep" => keep::k_keep(&device, library, &path),
             "g_generate" => generate::g_generate(&mut session),
             "f_deep" => deep::f_deep(&device, library, &path),
             "p_profile" => profile::p_profile(&device, library, &path),

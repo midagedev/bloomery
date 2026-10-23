@@ -8,9 +8,10 @@
 //! - the row: a `next` that asks for the row (a sampled request) writes the
 //!   gate's session's logits row after the same steps, bit for bit, and
 //!   returns that step's pick.
-//! - the keep rule: the position is kept, a position below it is not, and the
-//!   reuse note names why; a cut to the position continues the sequence; a
-//!   cut to 0 starts it again, and the same prompt picks the same id.
+//! - the keep rule: the position is kept, the prefill's end is a checkpoint,
+//!   and a position below that point is not (the reuse note names why); a
+//!   cut to the position continues the sequence; a cut to 0 starts it again,
+//!   and the same prompt picks the same id.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -116,21 +117,26 @@ pub fn s_serve(s: &mut Session, device: &MetalDevice, library: &Library, path: &
         ));
     }
 
-    // The keep rule at the prompt's end.
+    // The keep rule at the prompt's end. `prefill(lead)` is 2 ids, so a point
+    // stands at 2; position 1 has none. The following `next` does not take one.
     let held = PROMPT;
-    if e.keepable(held) != held || e.keepable(held - 1) != 0 {
+    let at_point = PROMPT - 1;
+    if e.keepable(held) != held || e.keepable(at_point) != at_point || e.keepable(1) != 0 {
         return Err(format!(
-            "keepable({held}) is {} and keepable({}) is {}: {held} and 0 are the session's rule",
+            "keepable({held}) is {}, keepable({at_point}) is {}, keepable(1) is {}",
             e.keepable(held),
-            held - 1,
-            e.keepable(held - 1)
+            e.keepable(at_point),
+            e.keepable(1)
         ));
     }
-    let note = e.keep_limit(held - 1).unwrap_or_default();
-    if !note.contains("no-checkpoint") || e.keep_limit(held).is_some() {
+    let note = e.keep_limit(1).unwrap_or_default();
+    if !note.contains("no-checkpoint")
+        || e.keep_limit(at_point).is_some()
+        || e.keep_limit(held).is_some()
+    {
         return Err(format!(
-            "the reuse note below the position is {note:?}, at it {:?}; no-checkpoint below and \
-             none at it are expected",
+            "the reuse note at 1 is {note:?}, at {at_point} {:?}, at {held} {:?}",
+            e.keep_limit(at_point),
             e.keep_limit(held)
         ));
     }
@@ -148,9 +154,9 @@ pub fn s_serve(s: &mut Session, device: &MetalDevice, library: &Library, path: &
     }
     Ok(Verdict::Noted(format!(
         "the engine's {PICKS} greedy picks are the session's host-fed ones; a sampled next \
-         writes the session's row of {} values bit for bit; keepable {held} -> {held}, {} -> 0 \
-         (no-checkpoint); a cut to the position continues, a cut to 0 starts again",
-        row.len(),
-        held - 1
+         writes the session's row of {} values bit for bit; keepable {held} -> {held}, \
+         {at_point} -> {at_point} (the prefill's end), 1 -> 0 (no-checkpoint); a cut to the \
+         position continues, a cut to 0 starts again",
+        row.len()
     )))
 }
