@@ -139,10 +139,11 @@ const TOKENIZER_CONFIG: &Fields = &[
         "pretokenize_regex",
         Only(concat!("[", qwen35_regex!(), "]")),
     ),
-    // Both build the tokenizer from tokenizer.json.
+    // Each builds the tokenizer from tokenizer.json; `TokenizersBackend` is
+    // transformers' class for a tokenizer.json with no class of its own.
     (
         "tokenizer_class",
-        Only(r#"["Qwen2Tokenizer", "Qwen2TokenizerFast"]"#),
+        Only(r#"["Qwen2Tokenizer", "Qwen2TokenizerFast", "TokenizersBackend"]"#),
     ),
     (
         "model_max_length",
@@ -151,7 +152,34 @@ const TOKENIZER_CONFIG: &Fields = &[
             "HF warns past it and truncates only when asked; the context length is config.json's",
         ),
     ),
+    // Both build the fast tokenizer from tokenizer.json.
+    ("backend", Only(r#"["tokenizers"]"#)),
+    (
+        "is_local",
+        Ignore(
+            Type::Bool,
+            "where HF loaded the folder from; no id depends on it",
+        ),
+    ),
+    (
+        "processor_class",
+        Ignore(
+            Type::String,
+            "the multimodal processor's class; the text tokenizer is tokenizer_class",
+        ),
+    ),
+    ("audio_bos_token", Ignore(Type::String, MEDIA)),
+    ("audio_eos_token", Ignore(Type::String, MEDIA)),
+    ("audio_token", Ignore(Type::String, MEDIA)),
+    ("image_token", Ignore(Type::String, MEDIA)),
+    ("video_token", Ignore(Type::String, MEDIA)),
+    ("vision_bos_token", Ignore(Type::String, MEDIA)),
+    ("vision_eos_token", Ignore(Type::String, MEDIA)),
+    ("model_specific_special_tokens", Ignore(Type::Object, MEDIA)),
 ];
+
+const MEDIA: &str = "the processor's media markers by name; each is an added token of \
+    tokenizer.json, which serving matches as written";
 
 const SAMPLING: &str = "a default of HF's generate; serving samples by each request, and no \
     prompt's ids or logits depend on it";
@@ -891,6 +919,17 @@ mod tests {
             ["tokenizer_config.json", "", "pretokenize_regex", "$", "different"],
             ["tokenizer_config.json", "", "tokenizer_class", "Qwen2Tokenizer", "LlamaTokenizer"],
             ["tokenizer_config.json", "", "model_max_length", 262144, "long"],
+            ["tokenizer_config.json", "", "backend", "tokenizers", "sentencepiece"],
+            ["tokenizer_config.json", "", "is_local", true, "yes"],
+            ["tokenizer_config.json", "", "processor_class", "Qwen3VLProcessor", 1],
+            ["tokenizer_config.json", "", "audio_bos_token", "<|audio_start|>", 1],
+            ["tokenizer_config.json", "", "audio_eos_token", "<|audio_end|>", 1],
+            ["tokenizer_config.json", "", "audio_token", "<|audio_pad|>", 1],
+            ["tokenizer_config.json", "", "image_token", "<|image_pad|>", 1],
+            ["tokenizer_config.json", "", "video_token", "<|video_pad|>", 1],
+            ["tokenizer_config.json", "", "vision_bos_token", "<|vision_start|>", 1],
+            ["tokenizer_config.json", "", "vision_eos_token", "<|vision_end|>", 1],
+            ["tokenizer_config.json", "", "model_specific_special_tokens", {"image_token":"<|image_pad|>"}, "x"],
             ["generation_config.json", "", "bos_token_id", 3, [3, 4]],
             ["generation_config.json", "", "eos_token_id", [3, 4], [3, "4"]],
             ["generation_config.json", "", "pad_token_id", 4, [4, 3]],
