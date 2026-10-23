@@ -170,18 +170,22 @@ impl Harness<'_> {
         Ok(back[OUT_GUARD..OUT_GUARD + launch.rows].to_vec())
     }
 
-    /// One command buffer with one dispatch encoded by `encode`, submitted.
+    /// One command buffer with one dispatch encoded by `encode`, submitted
+    /// whether or not `encode` refused, so a clause sees any work a launcher
+    /// encoded before its refusal; the refusal is returned after the submit.
     pub fn encode(
         &self,
         encode: impl FnOnce(&mut bloomery_metal::encode::ComputeEncoder<'_>) -> Result<(), DeviceError>,
     ) -> Result<(), String> {
         let mut recording = self.stream.begin().map_err(why)?;
-        {
+        let result = {
             let mut encoder = recording.compute_encoder().map_err(why)?;
-            encode(&mut encoder).map_err(why)?;
+            let result = encode(&mut encoder);
             encoder.end();
-        }
-        self.stream.submit(recording).map_err(why)
+            result
+        };
+        self.stream.submit(recording).map_err(why)?;
+        result.map_err(why)
     }
 
     /// The fault word, once the stream's work is done; `None` when clean.
