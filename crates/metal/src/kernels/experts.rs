@@ -15,12 +15,12 @@ use crate::fault::MetalFaultWord;
 use crate::library::{Library, Pipeline};
 
 use super::experts_geom::{EXPERT_K, EXPERT_SLOTS, FOLDED_BLOCKS, ROUTED_IDS};
-use super::geometry::BLOCK_VALUES;
 use super::{Quant, args_bytes, check_window_len, pack, word};
 
 const PAIR: &str = "pair";
 const FOLD: &str = "fold";
-/// Blocks of K': nine slots, two blocks of [`EXPERT_K`] each.
+/// Blocks of K': nine slots, two blocks of [`EXPERT_K`] each, in the
+/// 256-value quants' blocks (A4's fold walks its own count).
 const _: () = assert!(super::geometry::BLOCK_VALUES == 256);
 const _: () = assert!(FOLDED_BLOCKS == EXPERT_SLOTS * (EXPERT_K / super::geometry::BLOCK_VALUES));
 
@@ -44,7 +44,7 @@ pub struct PairParams<'w> {
     pub slots: usize,
     /// The expert intermediate width. A launch runs [`EXPERT_K`].
     pub k: usize,
-    /// The input columns, a positive multiple of 256.
+    /// The input columns, a positive multiple of the type's block values.
     pub cols: usize,
     /// Experts in the stack. An id at or past this is `ExpertId`.
     pub n_experts: usize,
@@ -195,13 +195,14 @@ fn check_pair(
     if p.out_stride < EXPERT_K {
         return Err(refuse_pair("the slot outputs overlap".to_string()));
     }
-    if !p.cols.is_multiple_of(BLOCK_VALUES) || p.cols == 0 {
+    if !p.cols.is_multiple_of(p.quant.values_per_block()) || p.cols == 0 {
         return Err(refuse_pair(format!(
-            "{} columns are not whole blocks of {BLOCK_VALUES}",
-            p.cols
+            "{} columns are not whole blocks of {}",
+            p.cols,
+            p.quant.values_per_block()
         )));
     }
-    let nblocks = p.cols / BLOCK_VALUES;
+    let nblocks = p.cols / p.quant.values_per_block();
     let stack = weight_bytes(p.quant, EXPERT_K, nblocks, p.n_experts).ok_or_else(|| {
         refuse_pair(format!(
             "{} experts of {} columns wrap",
@@ -268,7 +269,7 @@ fn check_fold<'w>(
     if p.rows == 0 {
         return Err(refuse_fold("no rows".to_string()));
     }
-    let nblocks = EXPERT_K / BLOCK_VALUES;
+    let nblocks = EXPERT_K / p.quant.values_per_block();
     let stack = weight_bytes(p.quant, p.rows, nblocks, p.n_experts)
         .ok_or_else(|| refuse_fold(format!("{} experts of {} rows wrap", p.n_experts, p.rows)))?;
     let shared_bytes = weight_bytes(p.quant, p.rows, nblocks, 1)
@@ -297,8 +298,10 @@ fn check_fold<'w>(
 pub(crate) struct Pipelines {
     pair_q4: Pipeline,
     pair_q6: Pipeline,
+    pair_a4: Pipeline,
     fold_q4: Pipeline,
     fold_q6: Pipeline,
+    fold_a4: Pipeline,
 }
 
 impl Pipelines {
@@ -308,8 +311,10 @@ impl Pipelines {
         Ok(Self {
             pair_q4: library.pipeline_with_simdgroups("q4k_pair_swiglu", simdgroups)?,
             pair_q6: library.pipeline_with_simdgroups("q6k_pair_swiglu", simdgroups)?,
+            pair_a4: library.pipeline_with_simdgroups("a4_pair_swiglu", simdgroups)?,
             fold_q4: library.pipeline_with_simdgroups("q4k_down_fold", simdgroups)?,
             fold_q6: library.pipeline_with_simdgroups("q6k_down_fold", simdgroups)?,
+            fold_a4: library.pipeline_with_simdgroups("a4_down_fold", simdgroups)?,
         })
     }
 
@@ -317,6 +322,7 @@ impl Pipelines {
         match quant {
             Quant::Q4K => &self.pair_q4,
             Quant::Q6K => &self.pair_q6,
+            Quant::A4 => &self.pair_a4,
         }
     }
 
@@ -324,6 +330,7 @@ impl Pipelines {
         match quant {
             Quant::Q4K => &self.fold_q4,
             Quant::Q6K => &self.fold_q6,
+            Quant::A4 => &self.fold_a4,
         }
     }
 }

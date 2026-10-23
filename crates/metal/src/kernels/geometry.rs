@@ -24,7 +24,8 @@ pub const THREADS_PER_GROUP: usize = SIMD_WIDTH * SIMD_GROUPS_PER_GROUP;
 /// them in a group.
 pub const MAX_SIMD_GROUPS_PER_GROUP: usize = 1024 / SIMD_WIDTH;
 
-/// The values one quantized block holds, in Q4_K and Q6_K alike.
+/// The values one Q4_K or Q6_K block holds: 256. The per-type count, which
+/// a mixed-type launch reads, is `Quant::values_per_block`.
 pub const BLOCK_VALUES: usize = 256;
 
 /// The row segments one segmented mat-vec runs.

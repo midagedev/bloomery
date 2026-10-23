@@ -14,6 +14,9 @@
 //                             each block's head groups
 //   q6k_matvec / _norm / _resid / _seg   the same over Q6_K, instantiated in
 //                             matvec_q6k.metal; Q6_K has no head-norm entry
+//   a4_matvec / _norm / _resid / _seg /
+//   a4_matvec_headnorm_resid  the same over MLX's affine 4-bit groups,
+//                             instantiated in matvec_a4.metal
 //
 // The row loop is llama.cpp's (kernel_mul_mv_q4_K_f32 and
 // kernel_mul_mv_q6_K_f32, MIT licence; see THIRD_PARTY_NOTICES.md):
@@ -95,16 +98,16 @@ inline void matvec_rows(device const typename Q::Block * W,
     // The lane's share of the input and the gain: the lane's first block's
     // base, the quant's load adding the lane's offset inside it. The gain is
     // bound by the norm entry only: the others form no pointer from it.
-    device const float * xp = x + Q::first_block(lane) * QK_K;
-    device const float * gp = NORM ? gain + Q::first_block(lane) * QK_K : gain;
+    device const float * xp = x + Q::first_block(lane) * Q::values_per_block();
+    device const float * gp = NORM ? gain + Q::first_block(lane) * Q::values_per_block() : gain;
 
     for (int ib = Q::first_block(lane); ib < nb; ib += Q::block_stride()) {
         // The block's two heads: the head scale of each, once for the block.
-        float lo = 1.f;
-        float hi = 1.f;
-        if (HEADNORM) {
-            lo = scales[2*ib];
-            hi = scales[2*ib+1];
+        // The two are the quant's own: a 256-value block spans two heads, a
+        // 64-value group sits inside one.
+        float2 hs = {1.f, 1.f};
+        if constexpr (HEADNORM) {
+            hs = Q::head_scales(scales, ib);
         }
         if (NORM) {
             Q::template load<LOAD_NORM>(lane, xp, gp, 1.f, &sum_sq);
@@ -115,30 +118,29 @@ inline void matvec_rows(device const typename Q::Block * W,
         // the finite range: the gate's site is raised, and the sums it is in
         // are not finite either, so the rows are NaN.
         if constexpr (HEADNORM) {
-            if (!isfinite(lane.sumy[0]) || !isfinite(lane.sumy[1]) ||
-                !isfinite(lane.sumy[2]) || !isfinite(lane.sumy[3])) {
+            if (!Q::sums_finite(lane)) {
                 raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
             }
         }
 
         for (short row = 0; row < NR0; ++row) {
             if constexpr (HEADNORM) {
-                sumf[row] += Q::partial_head(rp[row][ib], lane, lo, hi);
+                sumf[row] += Q::partial_head(rp[row][ib], lane, hs.x, hs.y);
             } else {
                 sumf[row] += Q::partial(rp[row][ib], lane);
             }
         }
 
-        xp += Q::block_stride() * QK_K;
+        xp += Q::block_stride() * Q::values_per_block();
         if (NORM) {
-            gp += Q::block_stride() * QK_K;
+            gp += Q::block_stride() * Q::values_per_block();
         }
     }
 
     float scale = 1.f;
     if (NORM) {
         const float sum_squares = simd_sum(sum_sq);
-        scale = rms_scale(sum_squares, (uint)nb * QK_K, eps);
+        scale = rms_scale(sum_squares, (uint)nb * Q::values_per_block(), eps);
         if (!rms_usable(sum_squares, scale)) {
             if (tiisg == 0) {
                 raise(faults, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);

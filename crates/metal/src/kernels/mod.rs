@@ -1,11 +1,11 @@
-//! The quantized kernels' host side: the pipelines of the Q4_K and Q6_K
-//! mat-vecs and the Q4_K embedding, and the launch of each.
+//! The quantized kernels' host side: the pipelines of the Q4_K, Q6_K and A4
+//! mat-vecs, the Q4_K and A4 embeddings, and the launch of each.
 //!
 //! A launch takes a parameter struct of windows and the shape they are for,
 //! checks every window's length against the shape before it encodes anything
 //! (a window that is not the shape's is a named [`bloomery_device::DeviceError`], never a
 //! partial read or write), and encodes one dispatch on the caller's encoder.
-//! The kernels themselves are `kernels/{norm,matvec_q4k,matvec_q6k,embed}.metal`.
+//! The kernels themselves are `kernels/{norm,matvec_q4k,matvec_q6k,matvec_a4,embed}.metal`.
 //! Decode attention is `kernels/attention.metal`.
 //!
 //! Three mat-vecs live here, one concept each: the plain mat-vec of one
@@ -96,14 +96,21 @@ impl MatvecPipelines {
 pub struct Kernels {
     q4k: MatvecPipelines,
     q6k: MatvecPipelines,
+    a4: MatvecPipelines,
+    /// The gated delta net's out projection: the Q4_K entry (A4's is
+    /// `headnorm_a4`; Q6_K has none).
     headnorm: Pipeline,
-    embed: Pipeline,
+    headnorm_a4: Pipeline,
+    embed_q4k: Pipeline,
+    embed_a4: Pipeline,
     router: Pipeline,
     experts: experts::Pipelines,
     /// The gated delta step.
     delta: Pipeline,
     attention: attention::AttentionPipelines,
-    head: Pipeline,
+    /// The output head: the Q6_K entry (A4's is `head_a4`; Q4_K has none).
+    head_q6k: Pipeline,
+    head_a4: Pipeline,
     /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
     /// constant, and the geometry of every launch.
     simdgroups: usize,
@@ -213,16 +220,33 @@ impl Kernels {
                 ],
                 count,
             )?,
+            a4: MatvecPipelines::new(
+                library,
+                [
+                    "a4_matvec",
+                    "a4_matvec_norm",
+                    "a4_matvec_resid",
+                    "a4_matvec_seg",
+                ],
+                count,
+            )?,
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
-            embed: library.pipeline("embed_q4k")?,
+            headnorm_a4: library.pipeline_with_simdgroups("a4_matvec_headnorm_resid", count)?,
+            embed_q4k: library.pipeline("embed_q4k")?,
+            embed_a4: library.pipeline("embed_a4")?,
             router: library.pipeline("router35")?,
             experts: experts::Pipelines::new(library, count)?,
             delta: library.pipeline("gdn_step")?,
             attention: attention::AttentionPipelines::new(library)?,
             // The head's SIMD-group count, not the mat-vec count this function
             // was given. The constant is the pipeline's function constant.
-            head: library.pipeline_with_simdgroups(
+            head_q6k: library.pipeline_with_simdgroups(
                 "q6k_head_argmax",
+                u32::try_from(head::HEAD_SIMD_GROUPS)
+                    .expect("the head's SIMD-group count fits u32"),
+            )?,
+            head_a4: library.pipeline_with_simdgroups(
+                "a4_head_argmax",
                 u32::try_from(head::HEAD_SIMD_GROUPS)
                     .expect("the head's SIMD-group count fits u32"),
             )?,

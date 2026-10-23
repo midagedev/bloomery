@@ -41,16 +41,19 @@ const _: () = assert!(HEAD_GROUPS * ROWS_PER_THREADGROUP == HEAD_VOCAB);
 
 /// One head launch.
 pub struct HeadParams<'w> {
+    /// The weight type. Q6_K and A4 have a head entry; Q4_K has none and is
+    /// refused by name.
+    pub quant: Quant,
     /// The output rows. The engine's head reads [`HEAD_VOCAB`]. A launch
     /// accepts any positive count, so a clause can run a shorter grid.
     pub rows: usize,
-    /// The columns, a positive multiple of 256. The engine's head reads
-    /// [`HEAD_K`].
+    /// The columns, a positive multiple of the type's block values. The
+    /// engine's head reads [`HEAD_K`].
     pub k: usize,
     /// The SIMD groups in the threadgroup. The kernel runs
     /// [`HEAD_SIMD_GROUPS`] and no other count.
     pub simdgroups: usize,
-    /// The Q6_K weights, `rows * (k / 256) * 210` bytes.
+    /// The weights, `rows * (k / values_per_block())` blocks.
     pub weights: Window<'w, u8, MetalDevice>,
     /// The input, `k` values.
     pub x: Window<'w, f32, MetalDevice>,
@@ -82,11 +85,12 @@ fn refuse(detail: impl Into<String>) -> DeviceError {
 /// The shape of `p`, refused by name when it is not the kernel's or a window
 /// is not that shape's. `rows_per_threadgroup` is the geometry of the
 /// pipelines this launch encodes against.
-fn check(p: &HeadParams<'_>, rows_per_threadgroup: usize) -> Result<(), DeviceError> {
-    if p.k == 0 || !p.k.is_multiple_of(256) {
+fn check(p: &HeadParams<'_>, rows_per_threadgroup: usize) -> Result<(usize, usize), DeviceError> {
+    if p.k == 0 || !p.k.is_multiple_of(p.quant.values_per_block()) {
         return Err(refuse(format!(
-            "K is {}, the kernel reads a positive multiple of 256",
-            p.k
+            "K is {}, the kernel reads a positive multiple of {}",
+            p.k,
+            p.quant.values_per_block()
         )));
     }
     if p.rows == 0 {
@@ -95,8 +99,8 @@ fn check(p: &HeadParams<'_>, rows_per_threadgroup: usize) -> Result<(), DeviceEr
     if !p.eps.is_finite() {
         return Err(refuse(format!("eps {} is not finite", p.eps)));
     }
-    let nblocks = p.k / 256;
-    let weight_bytes = super::weight_bytes(Quant::Q6K, p.rows, nblocks)
+    let nblocks = p.k / p.quant.values_per_block();
+    let weight_bytes = super::weight_bytes(p.quant, p.rows, nblocks)
         .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.k)))?;
     let candidates = p.rows.div_ceil(rows_per_threadgroup);
     check_window_len(WHAT, "x", p.x.len(), p.k)?;
@@ -115,7 +119,7 @@ fn check(p: &HeadParams<'_>, rows_per_threadgroup: usize) -> Result<(), DeviceEr
     word(WHAT, "the row count", p.rows)?;
     word(WHAT, "the block count", nblocks)?;
     word(WHAT, "the group count", candidates)?;
-    Ok(())
+    Ok((nblocks, candidates))
 }
 
 impl Kernels {
@@ -128,17 +132,24 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: HeadParams<'_>,
     ) -> Result<(), DeviceError> {
+        let pipeline = match p.quant {
+            Quant::Q6K => &self.head_q6k,
+            Quant::A4 => &self.head_a4,
+            // A quant with no head entry is refused by name: the entry is
+            // absent, not defaulted.
+            Quant::Q4K => {
+                return Err(refuse("Q4_K has no head entry".to_string()));
+            }
+        };
         let rows_per_threadgroup = HEAD_SIMD_GROUPS * self.rows_per_simd_group;
-        check(&p, rows_per_threadgroup)?;
-        let nblocks = p.k / 256;
-        let groups = p.rows.div_ceil(rows_per_threadgroup);
+        let (nblocks, groups) = check(&p, rows_per_threadgroup)?;
         let args = args_bytes([
             word(WHAT, "the row count", p.rows)?,
             word(WHAT, "the block count", nblocks)?,
             p.layer,
             p.eps.to_bits(),
         ]);
-        encoder.set_pipeline(&self.head);
+        encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.weights)?)?;
         slot.set(Binding::of(&p.x)?)?;

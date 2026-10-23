@@ -12,7 +12,7 @@ use bloomery_device::{DeviceError, Window, WindowMut};
 use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 
-use super::geometry::{BLOCK_VALUES, MAX_SEGMENTS};
+use super::geometry::MAX_SEGMENTS;
 use super::matvec::{NormOnLoad, Quant};
 use super::{Kernels, args_bytes, check_window_len, pack, word};
 
@@ -108,12 +108,13 @@ fn check(
             return Err(refuse(format!("segment {i} has no rows").to_string()));
         }
     }
-    if !cols.is_multiple_of(BLOCK_VALUES) {
+    if !cols.is_multiple_of(p.quant.values_per_block()) {
         return Err(refuse(format!(
-            "{cols} columns are not whole blocks of {BLOCK_VALUES}"
+            "{cols} columns are not whole blocks of {}",
+            p.quant.values_per_block()
         )));
     }
-    let nblocks = cols / BLOCK_VALUES;
+    let nblocks = cols / p.quant.values_per_block();
 
     // The output: the segments' ranges must not overlap, or one segment's rows
     // would be another's. A dispatch holds at most MAX_SEGMENTS segments, so
@@ -219,6 +220,7 @@ impl Kernels {
         let family = match p.quant {
             Quant::Q4K => &self.q4k,
             Quant::Q6K => &self.q6k,
+            Quant::A4 => &self.a4,
         };
         encoder.set_pipeline(family.seg());
         let mut slot = Bindings::new(encoder);

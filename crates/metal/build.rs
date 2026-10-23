@@ -114,7 +114,6 @@ fn geometry_header() -> String {
          #define BLOOMERY_EXPERT_ROUTED {erouted}\n\
          #define BLOOMERY_EXPERT_SHARED {eshared}\n\
          #define BLOOMERY_EXPERT_K {ek}\n\
-         #define BLOOMERY_EXPERT_BLOCKS {eblocks}\n\
          // Decode attention, from src/kernels/attention_geom.rs.\n\
          #define BLOOMERY_ATTN_HEAD {ahead}\n\
          #define BLOOMERY_ATTN_ROT {arot}\n\
@@ -147,7 +146,6 @@ fn geometry_header() -> String {
         erouted = experts_geom::ROUTED_IDS,
         eshared = experts_geom::SHARED_SLOT,
         ek = experts_geom::EXPERT_K,
-        eblocks = experts_geom::FOLDED_BLOCKS,
         ahead = attention_geom::HEAD_DIM,
         arot = attention_geom::ROT,
         aq = attention_geom::QUERY_HEADS,
@@ -249,7 +247,7 @@ fn main() {
     // The order is the dependency order: norm defines the argument block the
     // mat-vecs read, quant the block layouts and the decode owners every
     // quantized kernel reads (embed's too), matvec_q4k the row loop and the
-    // entry templates the Q6_K, experts and head files instantiate.
+    // entry templates the Q6_K, A4, experts and head files instantiate.
     for name in [
         "fault",
         "copy",
@@ -258,6 +256,7 @@ fn main() {
         "quant",
         "matvec_q4k",
         "matvec_q6k",
+        "matvec_a4",
         "embed",
         // Ticket's helpers are what the router and the head call, so ticket
         // comes before either kernel.

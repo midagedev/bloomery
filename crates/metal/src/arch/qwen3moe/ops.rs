@@ -345,6 +345,7 @@ impl ChainOps for MetalOps<'_, '_> {
         let slot = slot_of(self.pos);
         let Arena {
             embed,
+            embed_quant,
             vocab,
             hidden,
             id_in,
@@ -360,6 +361,7 @@ impl ChainOps for MetalOps<'_, '_> {
         self.kernels.embed(
             self.enc,
             EmbedParams {
+                quant: *embed_quant,
                 table: all(embed)?,
                 vocab: *vocab,
                 cols: *hidden,
@@ -480,6 +482,7 @@ impl ChainOps for MetalOps<'_, '_> {
         self.kernels.headnorm_resid(
             self.enc,
             HeadNormParams {
+                quant: d.out_quant,
                 rows: *hidden,
                 cols: g.len().get(),
                 weights: all(&d.out)?,
@@ -541,6 +544,7 @@ impl ChainOps for MetalOps<'_, '_> {
         let slot = slot_of(self.pos);
         let Arena {
             head_w,
+            head_quant,
             head_norm,
             x,
             logits,
@@ -556,6 +560,7 @@ impl ChainOps for MetalOps<'_, '_> {
         self.kernels.head(
             self.enc,
             HeadParams {
+                quant: *head_quant,
                 rows: *vocab,
                 k: *hidden,
                 simdgroups: HEAD_SIMD_GROUPS,

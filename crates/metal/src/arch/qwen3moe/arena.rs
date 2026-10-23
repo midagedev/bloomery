@@ -34,10 +34,10 @@ use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
 use crate::kernels::{
-    BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HEAD_GROUPS, HEAD_K, HEAD_VOCAB,
-    HeadMap, KV_HEADS, MAX_SEGMENTS, PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, Segment,
-    VALUE_HEADS, channels, f16_len, out_len, partials_len, qg_len, ring_elems, router,
-    segments_for_keys, state_elems,
+    EXPERT_K, EXPERT_SLOTS, HEAD_COLS, HEAD_DIM, HEAD_GROUPS, HEAD_K, HEAD_VOCAB, HeadMap,
+    KV_HEADS, MAX_SEGMENTS, PARTIALS_PER_HEAD, Quant, ROT, ROUTED_IDS, Segment, VALUE_HEADS,
+    channels, f16_len, out_len, partials_len, qg_len, ring_elems, router, segments_for_keys,
+    state_elems,
 };
 
 const WHAT: &str = "qwen35moe arena";
@@ -110,8 +110,10 @@ pub(super) struct DeltaBufs {
     pub(super) dt_bias: MetalBuffer<f32>,
     pub(super) ssm_a: MetalBuffer<f32>,
     pub(super) ssm_norm: MetalBuffer<f32>,
-    /// `ssm_out`, Q4_K: the head-norm projection's only type.
+    /// `ssm_out`: Q4_K or MLX_A4, the head-norm projection's two types.
     pub(super) out: MetalBuffer<u8>,
+    /// The out projection's type: the head-norm launch reads it.
+    pub(super) out_quant: Quant,
     pub(super) state: MetalBuffer<f32>,
     pub(super) ring: MetalBuffer<f32>,
     pub(super) n_k: usize,
@@ -177,7 +179,11 @@ pub(super) struct Arena {
     pub(super) top_k: usize,
     pub(super) n_experts: usize,
     pub(super) layers: Vec<LayerBufs>,
+    /// The embedding table's type: the embed launch reads it.
+    pub(super) embed_quant: Quant,
     pub(super) embed: MetalBuffer<u8>,
+    /// The head's type: the head launch reads it.
+    pub(super) head_quant: Quant,
     pub(super) head_w: MetalBuffer<u8>,
     pub(super) head_norm: MetalBuffer<f32>,
     /// The residual stream, updated in place by every layer.
@@ -236,6 +242,7 @@ fn quant_of(ty: GgmlType) -> Option<Quant> {
     match ty {
         GgmlType::Q4_K => Some(Quant::Q4K),
         GgmlType::Q6_K => Some(Quant::Q6K),
+        GgmlType::MLX_A4 => Some(Quant::A4),
         _ => None,
     }
 }
@@ -283,6 +290,42 @@ impl Loader<'_> {
         Ok(buffer)
     }
 
+    /// F32 tensor `name` of `len` values, or MLX's affine 8-bit tensor of the
+    /// same values, dequantized exactly at open through the host reader
+    /// (`s·q + b` in f32, the pair's product exact): the router and the
+    /// shared-expert gate never run a kernel, so no 8-bit path exists on the
+    /// card. The reader's own refusals (a non-finite scale or bias) name the
+    /// tensor and its block.
+    fn f32s_or_a8(&self, name: &str, len: usize) -> Result<MetalBuffer<f32>, SessionError> {
+        let (ty, dims, bytes) = self.tensor(name)?;
+        let n: u64 = dims.iter().product();
+        if usize::try_from(n).ok() != Some(len) {
+            return Err(refuse(format!(
+                "{name} is {ty:?} {dims:?}; the step reads {len} F32 values"
+            )));
+        }
+        let mut values = vec![0f32; len];
+        match ty {
+            GgmlType::F32 => {
+                for (v, b) in values.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    *v = f32::from_le_bytes(*b);
+                }
+            }
+            GgmlType::MLX_A8 => {
+                gguf::quant::dequant_row(GgmlType::MLX_A8, bytes, &mut values)
+                    .map_err(|e| refuse(format!("{name}: {e}")))?;
+            }
+            other => {
+                return Err(refuse(format!(
+                    "{name} is {other:?}; the step reads F32 or MLX_A8"
+                )));
+            }
+        }
+        let mut buffer = MetalBuffer::new(self.device, Elems(len))?;
+        buffer.write(&values)?;
+        Ok(buffer)
+    }
+
     /// The quant and bytes of tensor `name`: `rows` rows of `cols`, every
     /// axis past the first counted as rows, in a type a mat-vec runs.
     fn rows(&self, name: &str, cols: usize, rows: usize) -> Result<(Quant, &[u8]), SessionError> {
@@ -297,7 +340,7 @@ impl Loader<'_> {
         }
         let quant = quant_of(ty).ok_or_else(|| {
             refuse(format!(
-                "{name} is {ty:?}, which no mat-vec of this backend runs (Q4_K, Q6_K)"
+                "{name} is {ty:?}, which no mat-vec of this backend runs (Q4_K, Q6_K, MLX_A4)"
             ))
         })?;
         Ok((quant, bytes))
@@ -326,22 +369,23 @@ impl Loader<'_> {
         parts: &[(&str, usize)],
         cols: usize,
     ) -> Result<(P1, Vec<Range<usize>>), SessionError> {
-        if !cols.is_multiple_of(BLOCK_VALUES) {
-            return Err(refuse(format!(
-                "{norm}'s P1 reads {cols} columns, not whole blocks of {BLOCK_VALUES}"
-            )));
-        }
         let mut ranges = Vec::with_capacity(parts.len());
         let mut tensors = Vec::with_capacity(parts.len());
         let mut at = 0usize;
         for &(name, rows) in parts {
             let (quant, bytes) = self.rows(name, cols, rows)?;
+            if !cols.is_multiple_of(quant.values_per_block()) {
+                return Err(refuse(format!(
+                    "{norm}'s P1 reads {cols} columns, not whole blocks of {}",
+                    quant.values_per_block()
+                )));
+            }
             ranges.push(at..at + rows);
             tensors.push((quant, rows, bytes, at));
             at += rows;
         }
         let mut dispatches: Vec<P1Part> = Vec::new();
-        for quant in [Quant::Q4K, Quant::Q6K] {
+        for quant in [Quant::Q4K, Quant::Q6K, Quant::A4] {
             let mine: Vec<_> = tensors.iter().filter(|t| t.0 == quant).collect();
             if mine.is_empty() {
                 continue;
@@ -578,16 +622,16 @@ impl Arena {
         }
         let load = Loader { device, split };
         let (embed_quant, embed) = load.quant(&names::token_embd(), hidden, vocab)?;
-        if embed_quant != Quant::Q4K {
+        if !matches!(embed_quant, Quant::Q4K | Quant::A4) {
             return Err(refuse(format!(
-                "{} is {embed_quant:?}; the embedding reads Q4_K",
+                "{} is {embed_quant:?}; the embedding reads Q4_K or MLX_A4",
                 names::token_embd()
             )));
         }
         let (head_quant, head_w) = load.quant(&names::output(), hidden, vocab)?;
-        if head_quant != Quant::Q6K {
+        if !matches!(head_quant, Quant::Q6K | Quant::A4) {
             return Err(refuse(format!(
-                "{} is {head_quant:?}; the head reads Q6_K",
+                "{} is {head_quant:?}; the head reads Q6_K or MLX_A4",
                 names::output()
             )));
         }
@@ -622,7 +666,9 @@ impl Arena {
             top_k,
             n_experts,
             layers,
+            embed_quant,
             embed,
+            head_quant,
             head_w,
             head_norm,
             x: zeroed(device, hidden)?,
@@ -948,9 +994,9 @@ fn delta(
         hidden,
     )?;
     let (out_quant, out) = load.quant(&d.ssm_out, z_len, hidden)?;
-    if out_quant != Quant::Q4K {
+    if !matches!(out_quant, Quant::Q4K | Quant::A4) {
         return Err(refuse(format!(
-            "{} is {out_quant:?}; the head-norm projection reads Q4_K",
+            "{} is {out_quant:?}; the head-norm projection reads Q4_K or MLX_A4",
             d.ssm_out
         )));
     }
@@ -974,6 +1020,7 @@ fn delta(
         ssm_a: load.f32s(&d.ssm_a, VALUE_HEADS)?,
         ssm_norm: load.f32s(&d.ssm_norm, HEAD_COLS)?,
         out,
+        out_quant,
         state,
         ring,
         n_k,
@@ -1078,8 +1125,10 @@ fn ffn(
     }
     Ok(FfnBufs {
         norm: load.f32s(&plan.ffn.ffn_norm, hidden)?,
-        gate_inp: load.f32s(&file.router, n_experts * hidden)?,
-        gate_inp_shexp: load.f32s(&file.router_gate, hidden)?,
+        // The router and the shared-expert gate: F32 in a GGUF file, MLX's
+        // affine 8-bit in an MLX file, dequantized exactly at open.
+        gate_inp: load.f32s_or_a8(&file.router, n_experts * hidden)?,
+        gate_inp_shexp: load.f32s_or_a8(&file.router_gate, hidden)?,
         gate_up_quant: gq,
         gate,
         up,

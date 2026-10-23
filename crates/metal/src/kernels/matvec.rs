@@ -1,4 +1,4 @@
-//! The launch of the Q4_K and Q6_K mat-vecs.
+//! The launch of the Q4_K, Q6_K and A4 mat-vecs.
 
 use bloomery_device::{DeviceError, LAYER_NONE, Window, WindowMut};
 
@@ -6,7 +6,6 @@ use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
-use super::geometry::BLOCK_VALUES;
 use super::{Kernels, MatvecPipelines, args_bytes, check_window_len, pack, word};
 
 /// The weight type a mat-vec reads.
@@ -16,19 +15,21 @@ pub enum Quant {
     Q4K,
     /// GGUF `Q6_K`: 210-byte blocks of 256 values.
     Q6K,
+    /// MLX's affine 4-bit: 36-byte groups of 64 values (`MLX_A4`).
+    A4,
 }
 
 impl Quant {
-    /// The bytes of one block of 256 values: gguf's own row for the type,
-    /// the one owner of the number.
+    /// The bytes of one block: gguf's own row for the type, the one owner
+    /// of the number.
     #[must_use]
     pub fn block_bytes(self) -> usize {
         usize::try_from(
             self.ggml()
                 .type_size()
-                .expect("both kernel types have GGUF rows"),
+                .expect("every kernel type has a GGUF row"),
         )
-        .expect("Q4_K and Q6_K block sizes fit usize")
+        .expect("a block size fits usize")
     }
 
     /// The GGUF type this kernel reads.
@@ -37,7 +38,20 @@ impl Quant {
         match self {
             Self::Q4K => gguf::quant::GgmlType::Q4_K,
             Self::Q6K => gguf::quant::GgmlType::Q6_K,
+            Self::A4 => gguf::quant::GgmlType::MLX_A4,
         }
+    }
+
+    /// The values one block holds, gguf's row for the type: the columns of a
+    /// launch are a multiple of it, and its block count a division by it.
+    #[must_use]
+    pub fn values_per_block(self) -> usize {
+        usize::try_from(
+            self.ggml()
+                .blck_size()
+                .expect("every kernel type has a GGUF row"),
+        )
+        .expect("a block's value count fits usize")
     }
 
     /// The type's name as an error prints it.
@@ -46,6 +60,7 @@ impl Quant {
         match self {
             Self::Q4K => "q4k",
             Self::Q6K => "q6k",
+            Self::A4 => "a4",
         }
     }
 }
@@ -84,9 +99,9 @@ pub struct MatvecParams<'w> {
     pub quant: Quant,
     /// The output rows.
     pub rows: usize,
-    /// The input columns, a multiple of 256.
+    /// The input columns, a multiple of the type's block values.
     pub cols: usize,
-    /// The weights' bytes: `rows * cols / 256` blocks.
+    /// The weights' bytes: `rows * cols / values_per_block()` blocks.
     pub weights: Window<'w, u8, MetalDevice>,
     /// The input vector, `cols` values.
     pub x: Window<'w, f32, MetalDevice>,
@@ -131,13 +146,14 @@ fn check(
             p.cols
         )));
     }
-    if !p.cols.is_multiple_of(BLOCK_VALUES) {
+        if !p.cols.is_multiple_of(p.quant.values_per_block()) {
         return Err(refuse(format!(
-            "{} columns are not whole blocks of {BLOCK_VALUES}",
-            p.cols
+            "{} columns are not whole blocks of {}",
+            p.cols,
+            p.quant.values_per_block()
         )));
     }
-    let nblocks = p.cols / BLOCK_VALUES;
+    let nblocks = p.cols / p.quant.values_per_block();
     let weight_bytes = super::weight_bytes(p.quant, p.rows, nblocks)
         .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.cols)))?;
     check_window_len(WHAT, "weights", p.weights.len(), weight_bytes)?;
@@ -186,6 +202,7 @@ impl Kernels {
         let family = match p.quant {
             Quant::Q4K => &self.q4k,
             Quant::Q6K => &self.q6k,
+            Quant::A4 => &self.a4,
         };
         encoder.set_pipeline(family.of(&p.mode));
         let mut slot = Bindings::new(encoder);

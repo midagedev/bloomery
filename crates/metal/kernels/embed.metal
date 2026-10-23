@@ -1,15 +1,21 @@
-// The Q4_K embedding: row `ids[t]` of a Q4_K table, dequantized into row t of
-// an f32 output, one thread per value.
+// The embedding kernels: row `ids[t]` of a quantized table, dequantized into
+// row t of an f32 output, one thread per value — `embed_q4k` over a Q4_K
+// table, `embed_a4` over MLX's affine 4-bit groups (the owner's value decode,
+// quant.metal, not a second copy of the rule).
 //
 // An id at or past the table's rows is undefined input: the kernel raises the
 // token-id site in `layer`, reads no table word, and writes NaN to every value
 // of the row, which no later kernel can take for an embedding.
 //
-// The value is the dequantizer's (ggml's dequantize_row_q4_K): d1 * q - m1,
-// where `d * sc`, `d * sc * q` and `dmin * m` are exact in f32, so a fused or
-// an unfused subtraction gives the same bits.
+// The Q4_K value is the dequantizer's (ggml's dequantize_row_q4_K): d1 * q -
+// m1, where `d * sc`, `d * sc * q` and `dmin * m` are exact in f32, so a fused
+// or an unfused subtraction gives the same bits. The A4 value is the owner's,
+// the host reader's `s·q + b` with the product and the sum each rounded once
+// (the fp-contract pragma holds the order), so the embed's bits are the
+// reader's.
 //
-// This file comes after matvec_q4k.metal (QK_K, block_q4_K) and fault.metal.
+// This file comes after quant.metal (QK_K, the block structs, the A4 owner)
+// and fault.metal (raise).
 
 #include <metal_stdlib>
 
@@ -20,7 +26,7 @@ using namespace metal;
 // The embedding's argument block, bound by value at slot 3.
 struct EmbedArgs {
     uint vocab;    // the table's rows
-    uint nblocks;  // the table's columns / 256
+    uint nblocks;  // the table's columns / the type's block values
     uint layer;    // the layer a raise is recorded in
     uint count;    // ids to embed
 };
@@ -70,4 +76,32 @@ kernel void embed_q4k(device const block_q4_K * table [[buffer(0)]],
         value = NAN;
     }
     out[gid] = value;
+}
+
+kernel void embed_a4(device const block_mlx_a4 * table [[buffer(0)]],
+                     device const uint       * ids [[buffer(1)]],
+                     device float            * out [[buffer(2)]],
+                     constant EmbedArgs      & args [[buffer(3)]],
+                     device atomic_uint      * faults [[buffer(4)]],
+                     uint gid [[thread_position_in_grid]])
+{
+    // A group holds 64 values; the args' block count counts groups.
+    const uint width = args.nblocks * 64;
+    if ((ulong)gid >= (ulong)args.count * (ulong)width) {
+        return;
+    }
+    const uint t = gid / width;
+    const uint k = gid % width;
+    const uint id = ids[t];
+    float v;
+    if (id < args.vocab) {
+        device const block_mlx_a4 & b = table[(ulong)id * args.nblocks + k / 64];
+        v = A4::value(b, k % 64);
+    } else {
+        if (k == 0) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_TOKEN_ID);
+        }
+        v = NAN;
+    }
+    out[gid] = v;
 }

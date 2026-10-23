@@ -17,7 +17,7 @@ use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
-use super::geometry::{BLOCK_VALUES, HEAD_COLS, PARTIALS_PER_HEAD, VALUE_HEADS};
+use super::geometry::{HEAD_COLS, PARTIALS_PER_HEAD, VALUE_HEADS};
 use super::matvec::Quant;
 use super::{Kernels, args_bytes, check_window_len, pack, word};
 
@@ -25,6 +25,9 @@ use super::{Kernels, args_bytes, check_window_len, pack, word};
 /// the gated numerator, the heads' partial sums, and the output the residual
 /// is added into.
 pub struct HeadNormParams<'w> {
+    /// The weight type. Q4_K and A4 have a head-normed entry; Q6_K has none
+    /// and is refused by name.
+    pub quant: Quant,
     /// The output rows: the model's hidden width.
     pub rows: usize,
     /// The input columns: one value head's gated output after another.
@@ -76,8 +79,8 @@ fn check(
             p.cols, VALUE_HEADS
         )));
     }
-    let nblocks = p.cols / BLOCK_VALUES;
-    let weight_bytes = super::weight_bytes(Quant::Q4K, p.rows, nblocks)
+    let nblocks = p.cols / p.quant.values_per_block();
+    let weight_bytes = super::weight_bytes(p.quant, p.rows, nblocks)
         .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.rows, p.cols)))?;
     check_window_len(WHAT, "weights", p.weights.len(), weight_bytes)?;
     check_window_len(WHAT, "g", p.g.len(), p.cols)?;
@@ -109,7 +112,16 @@ impl Kernels {
     ) -> Result<(), DeviceError> {
         let shape = check(&p, self.simdgroups, self.rows_per_simd_group)?;
         let args = args_bytes([shape.rows, shape.nblocks, p.layer, p.eps.to_bits()]);
-        encoder.set_pipeline(&self.headnorm);
+        let pipeline = match p.quant {
+            Quant::Q4K => &self.headnorm,
+            Quant::A4 => &self.headnorm_a4,
+            // A quant with no head-normed entry is refused by name: the mode
+            // is absent, not defaulted.
+            Quant::Q6K => {
+                return Err(refuse("Q6_K has no head-normed mat-vec".to_string()));
+            }
+        };
+        encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.weights)?)?;
         slot.set(Binding::of(&p.g)?)?;

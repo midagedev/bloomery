@@ -1,4 +1,4 @@
-//! The launch of the Q4_K embedding.
+//! The launch of the Q4_K and A4 embeddings.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -6,20 +6,22 @@ use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
-use super::geometry::BLOCK_VALUES;
 use super::matvec::Quant;
 use super::{Kernels, args_bytes, check_window_len, pack, word};
 
 /// The threads in an embedding's threadgroup.
 const GROUP_THREADS: usize = 256;
 
-/// One embedding: `ids.len()` rows of a Q4_K table, dequantized to f32.
+/// One embedding: `ids.len()` rows of a quantized table, dequantized to f32.
 pub struct EmbedParams<'w> {
-    /// The table's bytes: `vocab * cols / 256` Q4_K blocks.
+    /// The table's type. Q4_K and A4 have an embedding entry; Q6_K has none
+    /// and is refused by name.
+    pub quant: Quant,
+    /// The table's bytes: `vocab * cols / values_per_block()` blocks.
     pub table: Window<'w, u8, MetalDevice>,
     /// The table's rows. An id at or past it raises the token-id site.
     pub vocab: usize,
-    /// The table's columns, a multiple of 256.
+    /// The table's columns, a multiple of the type's block values.
     pub cols: usize,
     /// The ids to embed.
     pub ids: Window<'w, u32, MetalDevice>,
@@ -56,14 +58,15 @@ impl Kernels {
                 count, p.vocab, p.cols
             )));
         }
-        if !p.cols.is_multiple_of(BLOCK_VALUES) {
+        if !p.cols.is_multiple_of(p.quant.values_per_block()) {
             return Err(refuse(format!(
-                "{} columns are not whole blocks of {BLOCK_VALUES}",
-                p.cols
+                "{} columns are not whole blocks of {}",
+                p.cols,
+                p.quant.values_per_block()
             )));
         }
-        let nblocks = p.cols / BLOCK_VALUES;
-        let table_bytes = super::weight_bytes(Quant::Q4K, p.vocab, nblocks)
+        let nblocks = p.cols / p.quant.values_per_block();
+        let table_bytes = super::weight_bytes(p.quant, p.vocab, nblocks)
             .ok_or_else(|| refuse(format!("{} rows of {} columns wrap", p.vocab, p.cols)))?;
         check_window_len(WHAT, "table", p.table.len(), table_bytes)?;
         let values = count
@@ -81,7 +84,16 @@ impl Kernels {
         // One thread per value, and a thread's index is a 32-bit word.
         // The columns are a multiple of the group, so the value count is too.
         word(WHAT, "the value count", values)?;
-        encoder.set_pipeline(&self.embed);
+        let pipeline = match p.quant {
+            Quant::Q4K => &self.embed_q4k,
+            Quant::A4 => &self.embed_a4,
+            // A quant with no embedding entry is refused by name: the entry
+            // is absent, not defaulted.
+            Quant::Q6K => {
+                return Err(refuse("Q6_K has no embedding entry".to_string()));
+            }
+        };
+        encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.table)?)?;
         slot.set(Binding::of(&p.ids)?)?;
