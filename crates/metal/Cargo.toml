@@ -50,6 +50,9 @@ bloomery-model = { path = "../model" }
 # Where the fixture file sits (the one owner of the fixture root and layout),
 # and the e2e gate's oracle: ik's reference sets, opened through their family.
 bloomery-refset = { path = "../refset" }
+# The session as the generation loop's target (`arch/qwen3moe/target.rs`):
+# the loop, its stop rule and its cut reasons, all host-only.
+bloomery-runtime = { path = "../runtime" }
 
 [build-dependencies]
 # The fault site's table, the one owner the generated header is written

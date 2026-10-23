@@ -99,8 +99,9 @@ lab-metal:
     cargo test -p bloomery-metal --lib && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
 
 # The qwen35moe session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh: the fixture family's file
-# (BLOOMERY_FIXTURE_ROOT) one token a step against ik's reference sets (BLOOMERY_DATA), the token's encoded count and the
-# fault path of a bad token id; then the gate's kernel mutants, each of which its clause must catch. A lab-* recipe: the
+# (BLOOMERY_FIXTURE_ROOT) one token a step against ik's reference sets (BLOOMERY_DATA), the token's encoded count, the
+# fault path of a bad token id, and the session as the generation loop's target (its greedy loop, logits read-back,
+# prompt and cut rules); then the gate's kernel mutants, each of which its clause must catch. A lab-* recipe: the
 # box has no Metal device, so no landing batch selects it.
 lab-metal-e2e:
     cargo build --release -p bloomery-metal --bin gate_metal_qwen35moe_e2e && ./tools/mac-gate.sh gate_metal_qwen35moe_e2e && ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all

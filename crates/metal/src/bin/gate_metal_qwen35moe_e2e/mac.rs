@@ -25,6 +25,15 @@
 //!   last position's argmax as the fixture tier takes it, the rows a
 //!   near-tie router flip carries left unheld by the CUDA gate's rule; and
 //!   the traced run's logits and picks equal to the plain steps'.
+//! - `t_target`: the session as the generation loop's target
+//!   (`runtime::Target`): `generate` over `Plain` and a count stop emits the
+//!   plain steps' own greedy picks with every chained token kept; a
+//!   `Want::Logits` step's row equals `Node::Logits` after the same step and
+//!   its argmax is the row's own; the target's prompt leaves the stepped
+//!   run's position and last logits; the refusals (an empty prompt, a prompt
+//!   past the cache, a cut between 0 and the position) by name with the
+//!   session stepping on, the cut rule's `kept` table, and no host
+//!   allocation call in a steady step of either read-back.
 //! - `f_deep`: the d1k set's prompt host-fed one id at a time through a
 //!   session of the set's depth, past one segment of keys, then its step
 //!   token traced; every step's count by its live keys (one wait a step, one
@@ -72,6 +81,8 @@ mod mutants;
 mod nodes;
 #[path = "sets.rs"]
 mod sets;
+#[path = "target.rs"]
+mod target;
 #[path = "wall.rs"]
 mod wall;
 
@@ -386,12 +397,13 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 6] = [
+    const NAMES: [&str; 7] = [
         "d_count",
         "e_token_id",
         "b_chain",
         "c_resume",
         "a_free",
+        "t_target",
         "f_deep",
     ];
     if args.iter().any(|a| a == "--list") {
@@ -503,6 +515,7 @@ pub fn main() -> ExitCode {
             "e_token_id" => e_token_id(&mut session),
             "b_chain" => chain::b_chain(&mut session),
             "c_resume" => chain::c_resume(&mut session),
+            "t_target" => target::t_target(&mut session),
             "f_deep" => deep::f_deep(&device, library, &path),
             _ => free::a_free(&mut session),
         };
