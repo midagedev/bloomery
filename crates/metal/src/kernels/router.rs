@@ -10,9 +10,9 @@ use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
+pub use super::router_geom::{EXPERTS, K, PARTIALS, ROWS, TOP_K_MAX};
+use super::router_geom::{FLOAT4S, GROUPS, SIMD_WIDTH, SPLIT, THREADS};
 use super::{Kernels, check_window_len, pack, word};
-
-include!("router_geom.rs");
 
 const WHAT: &str = "router";
 
