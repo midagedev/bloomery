@@ -1164,7 +1164,7 @@ pub fn seg_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
                 encoder,
                 SegParams {
                     quant: Quant::Q4K,
-                    segments,
+                    segments: &segments,
                     weights: weights.window(Elems(0), Elems(bytes * 16))?,
                     x: x.window(Elems(0), Elems(cols))?,
                     y: y.window_mut(Elems(0), Elems(64))?,

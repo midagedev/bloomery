@@ -254,7 +254,7 @@ impl Harness<'_> {
 
         let params = SegParams {
             quant: launch.quant,
-            segments,
+            segments: &segments,
             weights: weights
                 .window(Elems(WEIGHT_PAD), Elems(weight_bytes))
                 .map_err(why)?,

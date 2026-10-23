@@ -6,9 +6,11 @@
 //!
 //! - `d_count`: every step of a depth within one segment of keys encodes the
 //!   groups and dispatches `count::token_count` gives (one barrier between
-//!   groups), and the device's allocated size is the same before and after
-//!   those steps: the step allocates nothing on the device. It prints the
-//!   step's wall per token, host-fed and waited.
+//!   groups), the device's allocated size is the same before and after those
+//!   steps (the step allocates nothing on the device), and the host's
+//!   allocation calls, read as a difference around the step (the first step,
+//!   which may warm the driver's paths, aside), are none in every steady
+//!   step. It prints the step's wall per token, host-fed and waited.
 //! - `e_token_id`: an id past the vocabulary raises the token-id site at
 //!   layer 0 and poisons the session; the next step is refused by name; the
 //!   reset clears it and a step runs again.
@@ -29,8 +31,10 @@
 //! Exit 1 when a clause failed, 78 when this machine cannot run the backend,
 //! 64 on a bad argument, 0 otherwise.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use bloomery_device::conformance::{Clause, Report, Verdict, why};
@@ -82,19 +86,67 @@ fn model_path() -> Result<PathBuf, String> {
         .map_err(|e| format!("the fixture file: {e}"))
 }
 
-/// `d`: the token's count at every depth of one segment, and no device
-/// allocation across the steps.
+/// Allocation calls the process has made, for `d_count`'s host half: read as
+/// a difference around a step, it is the step's own count, whatever the
+/// process allocates for its output and errors outside it.
+static HOST_ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn counted() {
+    HOST_ALLOC_CALLS.fetch_add(1, Relaxed);
+}
+
+/// The process's allocator, which counts every allocating call and forwards
+/// it to `System` unchanged.
+struct Counting;
+
+// SAFETY: every method forwards to `System` with the caller's arguments unchanged.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        counted();
+        // SAFETY: the caller meets `alloc`'s contract for `l`, and `System`
+        // receives `l` unchanged.
+        unsafe { System.alloc(l) }
+    }
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        counted();
+        // SAFETY: the caller meets `alloc_zeroed`'s contract for `l`, and
+        // `System` receives `l` unchanged.
+        unsafe { System.alloc_zeroed(l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
+        counted();
+        // SAFETY: `p` came from this allocator with layout `l` — so from
+        // `System`, as every allocating method forwards there — and the
+        // caller meets `realloc`'s contract for `new_size`; `System` receives
+        // all three unchanged.
+        unsafe { System.realloc(p, l, new_size) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        // SAFETY: `p` came from this allocator with layout `l`, so from
+        // `System`, as every allocating method forwards there.
+        unsafe { System.dealloc(p, l) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+/// `d`: the token's count at every depth of one segment, and no allocation on
+/// either side of a steady step.
 fn d_count(s: &mut Session, device: &MetalDevice) -> Clause {
     s.reset().map_err(says)?;
     let want = token_count(s.token_layers(), LiveKeys::Within64, Ticket::Folded);
     let before = device.info().map_err(why)?.free_bytes;
     let mut walls: Vec<Duration> = Vec::with_capacity(s.ctx());
+    let mut host: Vec<u64> = Vec::with_capacity(s.ctx().saturating_sub(1));
     let mut id = SEED;
-    for _ in 0..s.ctx() {
+    for step in 0..s.ctx() {
         let pos = s.pos();
         let t = Instant::now();
+        let calls0 = HOST_ALLOC_CALLS.load(Relaxed);
         let stepped = s.step(id).map_err(says)?;
         walls.push(t.elapsed());
+        let calls = HOST_ALLOC_CALLS.load(Relaxed) - calls0;
         let c = stepped.count;
         let (groups, dispatches) = (want.groups as usize, want.dispatches as usize);
         if c.groups != groups || c.dispatches != dispatches || c.barriers + 1 != c.groups {
@@ -106,6 +158,17 @@ fn d_count(s: &mut Session, device: &MetalDevice) -> Clause {
                 c.barriers,
                 groups - 1
             ));
+        }
+        // The first step may warm the driver's paths; a later one is steady
+        // and must allocate nothing on the host.
+        if step > 0 {
+            host.push(calls);
+            if calls != 0 {
+                return Err(format!(
+                    "position {pos}: {calls} host allocation calls in the step; a steady \
+                     step allocates none"
+                ));
+            }
         }
         id = stepped.id;
     }
@@ -128,9 +191,14 @@ fn d_count(s: &mut Session, device: &MetalDevice) -> Clause {
         ms(walls[0]),
         ms(walls[walls.len() - 1])
     );
+    let steady = host.iter().copied().max().unwrap_or(0);
+    println!(
+        "d_count: host allocation calls per steady step ({} steps, the first aside): {steady}",
+        host.len()
+    );
     Ok(Verdict::Noted(format!(
         "{} steps at positions 0..{}: {} groups, {} dispatches, {} barriers each; device \
-         allocation unmoved",
+         allocation unmoved; {steady} host allocation calls in every steady step",
         s.ctx(),
         s.ctx(),
         want.groups,

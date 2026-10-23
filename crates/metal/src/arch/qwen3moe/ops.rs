@@ -108,7 +108,7 @@ impl<'a, 'e> MetalOps<'a, 'e> {
                 self.enc,
                 SegParams {
                     quant: part.quant,
-                    segments: part.segments.clone(),
+                    segments: &part.segments,
                     weights: all(&part.weights)?,
                     x: x.window(Elems(0), Elems(*hidden))?,
                     y: proj.window_mut(Elems(0), Elems(part.out_end))?,
