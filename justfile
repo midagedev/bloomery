@@ -91,12 +91,12 @@ mac-test:
 
 # The Metal backend's gate, on an Apple Silicon Mac: the device contract's clauses on this Mac's Metal device, run by
 # tools/mac-gate.sh (the Metal lock, the bound, the refusals). crates/metal links no cuda-oxide, so plain cargo builds it.
-# The device gate, then the qwen35moe kernels' gate (the qwen35moe fixture under $BLOOMERY_FIXTURE_ROOT, or --fixture),
-# then that gate's mutants, each of which its clause must catch. The backend has no unit tests of its own: its
-# contracts are the gates' clauses. A lab-* recipe, not a gate-* one: the box has no Metal device, so no landing batch
+# The crate's lib tests (the qwen35moe session's dispatch counts) first, then the device gate, then the qwen35moe
+# kernels' gate (the qwen35moe fixture under $BLOOMERY_FIXTURE_ROOT, or --fixture), then that gate's mutants, each of
+# which its clause must catch. A lab-* recipe, not a gate-* one: the box has no Metal device, so no landing batch
 # selects it.
 lab-metal:
-    cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
+    cargo test -p bloomery-metal --lib && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
 
 # The qwen35moe session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh: the fixture family's file
 # (BLOOMERY_FIXTURE_ROOT) one token a step against ik's reference sets (BLOOMERY_DATA), the token's encoded count and the
