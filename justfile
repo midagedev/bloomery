@@ -100,11 +100,14 @@ lab-metal:
 
 # The qwen35moe session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh: the fixture family's file
 # (BLOOMERY_FIXTURE_ROOT) one token a step against ik's reference sets (BLOOMERY_DATA), the token's encoded count, the
-# fault path of a bad token id, and the session as the generation loop's target (its greedy loop, logits read-back,
-# prompt and cut rules); then the gate's kernel mutants, each of which its clause must catch. A lab-* recipe: the
-# box has no Metal device, so no landing batch selects it.
+# fault path of a bad token id, the session as the generation loop's target (its greedy loop, logits read-back,
+# prompt and cut rules) and the generation core the CLI runs (ids, stops, sink); then the gate's kernel mutants, each
+# of which its clause must catch; then the generate_metal CLI's smoke on the same fixture: the batch set's first ids
+# through --tokens must print g_generate's reference ids (the fixture family is pinned by sha, so the ids are baked
+# here), and a text prompt must decode to non-empty stdout. A lab-* recipe: the box has no Metal device, so no
+# landing batch selects it.
 lab-metal-e2e:
-    cargo build --release -p bloomery-metal --bin gate_metal_qwen35moe_e2e && ./tools/mac-gate.sh gate_metal_qwen35moe_e2e && ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all
+    cargo build --release -p bloomery-metal --bin gate_metal_qwen35moe_e2e --bin generate_metal && ./tools/mac-gate.sh gate_metal_qwen35moe_e2e && ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all && fx="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/qwen35moe/qwen35moe-fixture-00001-of-00001.gguf" && ids="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --tokens 760,6511,314 -n 8 --print-ids)" && want="134895,160927,412,163951,82046,43343,102520,19258" && [ "$ids" = "$want" ] || { echo "lab-metal-e2e: generate_metal smoke: ids $ids; $want is expected"; exit 1; } && out="$(BLOOMERY_REF_MODEL="$fx" ./target/release/generate_metal --prompt "The quick brown fox" -n 8)" && [ -n "$out" ] || { echo "lab-metal-e2e: generate_metal text smoke: empty stdout"; exit 1; }
 
 # clippy on the Metal backend's macOS body, which the static tier's x86_64-linux cross check compiles as an empty crate.
 mac-metal-lint:

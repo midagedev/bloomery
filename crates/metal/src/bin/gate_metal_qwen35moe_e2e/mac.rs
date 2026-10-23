@@ -34,6 +34,11 @@
 //!   past the cache, a cut between 0 and the position) by name with the
 //!   session stepping on, the cut rule's `kept` table, and no host
 //!   allocation call in a steady step of either read-back.
+//! - `g_generate`: the generation core (`arch::qwen3moe::generate`) the CLI
+//!   runs: greedy over the batch set's first ids emits the session's own
+//!   picks, the count stop ends a run at its budget, an end-id set holding
+//!   the pick at a step ends the run at that step, and the sink sees every
+//!   id in order.
 //! - `f_deep`: the d1k set's prompt host-fed one id at a time through a
 //!   session of the set's depth, past one segment of keys, then its step
 //!   token traced; every step's count by its live keys (one wait a step, one
@@ -75,6 +80,8 @@ mod deep;
 mod flip;
 #[path = "free.rs"]
 mod free;
+#[path = "generate.rs"]
+mod generate;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "nodes.rs"]
@@ -397,13 +404,14 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 7] = [
+    const NAMES: [&str; 8] = [
         "d_count",
         "e_token_id",
         "b_chain",
         "c_resume",
         "a_free",
         "t_target",
+        "g_generate",
         "f_deep",
     ];
     if args.iter().any(|a| a == "--list") {
@@ -516,6 +524,7 @@ pub fn main() -> ExitCode {
             "b_chain" => chain::b_chain(&mut session),
             "c_resume" => chain::c_resume(&mut session),
             "t_target" => target::t_target(&mut session),
+            "g_generate" => generate::g_generate(&mut session),
             "f_deep" => deep::f_deep(&device, library, &path),
             _ => free::a_free(&mut session),
         };
