@@ -22,6 +22,8 @@ Bolt's two files list 27,921 modules (15 MB); they are cut to the first module o
 
 | `mlx-community/Qwen3.6-35B-A3B-4bit` | (the folder on the M4 Pro; no revision recorded) | MLX affine 4-bit g64, 8-bit router and shared-expert gates |
 
+`bloomery__qwen35moe-mlx-fixture__config.json.gz` is the `config.json` of the MLX-format fixture folder (`tools/mlx-fixture.py make`: the config above cut to four layers, `layer_types` of the fixture's layers and the quantization entries of those layers), unchanged.
+
 **Class-name targets.** `quant_config::plan` takes an explicit module-class resolver; the checkpoint-module
 classifier in `model_hf::arch::module_class` supplies the projection and embedding roles read by the GLM and
 Qwen3.8 maps. `Linear` and `Embedding` select only their own classes, in both `targets` and `ignore`.

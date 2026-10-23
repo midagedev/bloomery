@@ -1,12 +1,12 @@
-//! A Qwen3.8 checkpoint folder as the program reads it: the tensors of its split, each declared
-//! in the GGUF type its stored format and role give ([`plan_tensors`]), the header those tensors
-//! and the folder's keys make ([`read`]), and serving's tokenizer checked against Hugging Face's
-//! ([`served_as_hf`]). `prepare` writes that header and the tensors' bytes as a split; a load
-//! opens the folder as it is ([`open`]): the same header held in memory
-//! (`gguf::Split::header_only`), the tensors a card holds read through the folder's part source
-//! ([`crate::part::Checkpoint`]), and the PLE table's rows read where the folder stores them
-//! (`model::part::StoredRows`). Both read the folder through these functions alone, so a folder
-//! and the split `prepare` writes of it describe one model.
+//! A Qwen3.8 or Qwen3.6 ([`super::Family`]) checkpoint folder as the program reads it: the tensors
+//! of its split, each declared in the GGUF type its stored format and role give
+//! ([`plan_tensors`]), the header those tensors and the folder's keys make ([`read`]), and
+//! serving's tokenizer checked against Hugging Face's ([`served_as_hf`]). `prepare` writes that
+//! header and the tensors' bytes as a split; a load opens the folder as it is ([`open`]): the same
+//! header held in memory (`gguf::Split::header_only`), the tensors a card holds read through the
+//! folder's part source ([`crate::part::Checkpoint`]), and the PLE table's rows read where the
+//! folder stores them (`model::part::StoredRows`). Both read the folder through these functions
+//! alone, so a folder and the split `prepare` writes of it describe one model.
 
 use std::collections::BTreeMap;
 use std::path::Path;
