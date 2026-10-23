@@ -20,7 +20,7 @@
 //! f64 oracle's check of the first dispatch against the band).
 
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bloomery_device::conformance::why;
 use bloomery_device::{Buffer, Device, DeviceError, Elems, Event, Stream};
@@ -38,6 +38,9 @@ mod oracle;
 const WORKING_SET_BYTES: usize = 1 << 30;
 const WINDOW_BYTES: usize = 768 << 20;
 const WARMUPS: usize = 2;
+/// How long the timing loop spins on one buffer's event before it gives up
+/// by name: the stream's own sync bound.
+const EVENT_BOUND: Duration = Duration::from_secs(60);
 
 /// The probe's shapes: (rows, columns) of an expert's down, a layer's
 /// projections and the large ones.
@@ -167,7 +170,17 @@ fn time_shape(
     }
     let mut ends = Vec::with_capacity(buffers);
     for event in &events {
+        let deadline = Instant::now() + EVENT_BOUND;
         while !event.done().map_err(why)? {
+            if Instant::now() >= deadline {
+                // A failed command buffer stops the signal: its error first.
+                stream.sync().map_err(why)?;
+                return Err(format!(
+                    "event {} was not signalled within {} s",
+                    event.value(),
+                    EVENT_BOUND.as_secs()
+                ));
+            }
             std::hint::spin_loop();
         }
         ends.push(Instant::now());
