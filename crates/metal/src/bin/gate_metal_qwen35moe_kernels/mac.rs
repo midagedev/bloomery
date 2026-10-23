@@ -6,10 +6,12 @@
 //! fixture's own tensors; the oracle is `crates/gguf`'s dequantization of the
 //! same blocks with an f64 dot, held to the band `oracle.rs` derives.
 //! `--list` prints the clause names in the order the gate runs them: the
-//! mat-vec clauses, then the token's kernels (delta, router, experts,
-//! attention, head).
+//! mat-vec clauses, then the A4 ones, then the token's kernels (delta,
+//! router, experts, attention, head).
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
+//! otherwise); `--mlx-fixture PATH` names the MLX-format fixture split the
+//! A4 clauses read (the `qwen35moe-mlxsplit` copy under the fixture root
 //! otherwise); `--list` prints the clause names and exits; `--only CLAUSE`
 //! runs one clause; `--mutant NAME` runs the one clause that must catch the
 //! named kernel defect (`mutants.rs`) against
@@ -31,6 +33,8 @@ use bloomery_metal::kernels::{
 use bloomery_metal::library::{Library, SOURCE};
 use bloomery_metal::stream::MetalStream;
 
+#[path = "clauses_a4.rs"]
+mod clauses_a4;
 #[path = "clauses_attention.rs"]
 mod clauses_attention;
 #[path = "clauses_delta.rs"]
@@ -127,6 +131,7 @@ pub struct SegLaunch<'a> {
 
 /// One head-normed residual mat-vec launch of the gate.
 pub struct HeadNormLaunch<'a> {
+    pub quant: Quant,
     pub rows: usize,
     pub cols: usize,
     pub weights: &'a [u8],
@@ -306,6 +311,7 @@ impl Harness<'_> {
         let mut y = device.upload(stream, &y_words).map_err(why)?;
 
         let params = HeadNormParams {
+            quant: launch.quant,
             rows: launch.rows,
             cols: launch.cols,
             weights: weights
@@ -401,6 +407,33 @@ fn fixture_path(args: &[String]) -> Result<PathBuf, String> {
 /// Every mutant of the table, each in a child run of this gate
 /// (`--mutant NAME`): its clause must be red and the child's exit code not 0.
 /// One that stays green is a defect no clause catches.
+/// The MLX-format fixture split the A4 clauses read: `--mlx-fixture PATH`,
+/// else the one `*-00001-of-*.gguf` under the fixture root's
+/// `qwen35moe-mlxsplit` directory, resolved beside the gate's own fixture
+/// (`BLOOMERY_FIXTURE_ROOT`, the reference sets' root).
+fn mlx_fixture_path(args: &[String]) -> Result<PathBuf, String> {
+    if let Some(path) = flag(args, "--mlx-fixture") {
+        return Ok(PathBuf::from(path));
+    }
+    let root = refset::fixture::root()
+        .map_err(|e| format!("the fixture root: {e} (name the split with --mlx-fixture PATH)"))?;
+    let at = format!("{root}/qwen35moe-mlxsplit");
+    let entries = std::fs::read_dir(&at)
+        .map_err(|e| format!("the MLX fixture {at}: {e} (name it with --mlx-fixture PATH)"))?;
+    let mut found: Vec<String> = entries
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n.ends_with(".gguf") && n.contains("-00001-of-"))
+        .collect();
+    found.sort();
+    match found.as_slice() {
+        [one] => Ok(PathBuf::from(format!("{at}/{one}"))),
+        _ => Err(format!(
+            "the MLX fixture {at} holds {} first shards, not one (name it with --mlx-fixture PATH)",
+            found.len()
+        )),
+    }
+}
+
 fn mutants_all(args: &[String]) -> ExitCode {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -415,6 +448,9 @@ fn mutants_all(args: &[String]) -> ExitCode {
         child.args(["--mutant", mutant.name]);
         if let Some(path) = flag(args, "--fixture") {
             child.args(["--fixture", path]);
+        }
+        if let Some(path) = flag(args, "--mlx-fixture") {
+            child.args(["--mlx-fixture", path]);
         }
         let out = match child.output() {
             Ok(out) => out,
@@ -452,9 +488,15 @@ fn mutants_all(args: &[String]) -> ExitCode {
 
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(name) = ["--fixture", "--only", "--mutant", "--child"]
-        .into_iter()
-        .find(|name| args.last().is_some_and(|last| last == name))
+    if let Some(name) = [
+        "--fixture",
+        "--mlx-fixture",
+        "--only",
+        "--mutant",
+        "--child",
+    ]
+    .into_iter()
+    .find(|name| args.last().is_some_and(|last| last == name))
     {
         println!("gate_metal_qwen35moe_kernels: {name} takes a value");
         return ExitCode::from(64);
@@ -537,6 +579,14 @@ pub fn main() -> ExitCode {
         Ok(f) => println!("fixture: {}", f.path.display()),
         Err(e) => println!("fixture: {e}"),
     }
+    // The MLX-format split beside it: the A4 clauses' weights. An A4 clause
+    // run without it is red, not skipped — the split is the fixture the
+    // family's MLX plan reads.
+    let mlx = mlx_fixture_path(&args).and_then(|path| fixture::Fixture::open(&path));
+    match &mlx {
+        Ok(f) => println!("mlx fixture: {}", f.path.display()),
+        Err(e) => println!("mlx fixture: {e}"),
+    }
 
     let mut report = Report::new();
     let ctx = ClauseCtx {
@@ -598,6 +648,7 @@ pub fn main() -> ExitCode {
     ];
     let clauses: Vec<_> = front
         .into_iter()
+        .chain(clauses_a4::table(ctx.harness, &mlx))
         .chain(clauses_delta::table(&ctx))
         .chain(clauses_router::table(&ctx))
         .chain(clauses_experts::table(&ctx))

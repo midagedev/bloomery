@@ -38,10 +38,10 @@ const GAIN: &str = "output_norm.weight";
 /// The block's scale, a little-endian f16 at the end of a Q6_K block.
 const Q6K_D: usize = 208;
 
-struct Out {
-    logits: Vec<f32>,
-    id: u32,
-    ticket: u32,
+pub struct Out {
+    pub logits: Vec<f32>,
+    pub id: u32,
+    pub ticket: u32,
 }
 
 fn block_bytes() -> usize {
@@ -93,7 +93,7 @@ fn argmax_key(v: f32, i: u32) -> u64 {
     ((o as u64) << 32) | ((!i) as u64)
 }
 
-fn host_argmax(logits: &[f32]) -> Result<(f32, u32), String> {
+pub fn host_argmax(logits: &[f32]) -> Result<(f32, u32), String> {
     let mut best_v = f32::NEG_INFINITY;
     let mut best_i = 0u32;
     for (row, &v) in logits.iter().enumerate() {
@@ -125,17 +125,29 @@ fn group_key(logits: &[f32], base: usize, rows: usize) -> Result<u64, String> {
     Ok(argmax_key(best_v, best_i))
 }
 
+/// One head launch's own inputs: what every caller of [`run`] hands it.
+pub struct HeadRun<'a> {
+    pub quant: Quant,
+    pub weights: &'a [u8],
+    pub x: &'a [f32],
+    pub gain: &'a [f32],
+    pub rows: usize,
+    pub k: usize,
+    pub eps: f32,
+}
+
 /// One head launch. Logits start as the sentinel, the ticket as 0, the step
 /// id as `u32::MAX`.
-fn run(
-    h: &Harness<'_>,
-    weights: &[u8],
-    x: &[f32],
-    gain: &[f32],
-    rows: usize,
-    k: usize,
-    eps: f32,
-) -> Result<Out, String> {
+pub fn run(h: &Harness<'_>, case: HeadRun<'_>) -> Result<Out, String> {
+    let HeadRun {
+        quant,
+        weights,
+        x,
+        gain,
+        rows,
+        k,
+        eps,
+    } = case;
     let (device, stream) = (h.device, h.stream);
     let groups = rows.div_ceil(ROWS_PER_GROUP);
     let weights_b = device.upload(stream, weights).map_err(why)?;
@@ -152,6 +164,7 @@ fn run(
         h.kernels.head(
             encoder,
             HeadParams {
+                quant,
                 rows,
                 k,
                 simdgroups: HEAD_SIMD_GROUPS,
@@ -235,7 +248,18 @@ pub fn head_logit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     for (name, at, rows, seed) in samples {
         let weights = fixture.rows_at(OUTPUT, GgmlType::Q6_K, HEAD_K, at, rows)?;
         let x = oracle::activations(HEAD_K, seed, 0.5);
-        let out = run(h, weights, &x, &gain, rows, HEAD_K, eps)?;
+        let out = run(
+            h,
+            HeadRun {
+                quant: Quant::Q6K,
+                weights,
+                x: &x,
+                gain: &gain,
+                rows,
+                k: HEAD_K,
+                eps,
+            },
+        )?;
         if let Some(f) = h.fault()? {
             return Err(format!("{name} raised {f}"));
         }
@@ -308,7 +332,18 @@ fn wide_margin(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, S
     weights[WINNER * bytes..(WINNER + 1) * bytes].copy_from_slice(row);
     let x = dequant(row, HEAD_K)?;
     let gain = vec![1f32; HEAD_K];
-    let out = run(h, &weights, &x, &gain, HEAD_VOCAB, HEAD_K, eps)?;
+    let out = run(
+        h,
+        HeadRun {
+            quant: Quant::Q6K,
+            weights: &weights,
+            x: &x,
+            gain: &gain,
+            rows: HEAD_VOCAB,
+            k: HEAD_K,
+            eps,
+        },
+    )?;
     if out.ticket != 0 {
         return Err(format!(
             "head-id wide: the ticket counter is {}, not 0",
@@ -357,7 +392,18 @@ fn bit_tie(h: &Harness<'_>, fixture: &Fixture, eps: f32) -> Result<String, Strin
     weights[HIGH * block..(HIGH + 1) * block].copy_from_slice(&good);
     let x = dequant(&good, K)?;
     let gain = vec![1f32; K];
-    let out = run(h, &weights, &x, &gain, ROWS, K, eps)?;
+    let out = run(
+        h,
+        HeadRun {
+            quant: Quant::Q6K,
+            weights: &weights,
+            x: &x,
+            gain: &gain,
+            rows: ROWS,
+            k: K,
+            eps,
+        },
+    )?;
     if out.ticket != 0 {
         return Err(format!(
             "head-id tie: the ticket counter is {}, not 0",
@@ -451,6 +497,7 @@ pub fn head_ticket(h: &Harness<'_>, fixture: &Fixture) -> Clause {
                 h.kernels.head(
                     encoder,
                     HeadParams {
+                        quant: Quant::Q6K,
                         rows: ROWS,
                         k: K,
                         simdgroups: HEAD_SIMD_GROUPS,
@@ -568,7 +615,18 @@ pub fn head_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     }
     weights[WINNER * block..(WINNER + 1) * block].copy_from_slice(&good);
     let gain = vec![1f32; K];
-    let out = run(h, &weights, &x, &gain, ROWS, K, eps)?;
+    let out = run(
+        h,
+        HeadRun {
+            quant: Quant::Q6K,
+            weights: &weights,
+            x: &x,
+            gain: &gain,
+            rows: ROWS,
+            k: K,
+            eps,
+        },
+    )?;
     if !out.logits[NAN_ROW].is_nan() {
         return Err(format!(
             "the NaN scale's logit is {:e}, not NaN",
@@ -634,7 +692,18 @@ pub fn head_all_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         dst[Q6K_D + 1] = 0x7E;
     }
     let gain = vec![1f32; K];
-    let out = run(h, &weights, &x, &gain, ROWS, K, eps)?;
+    let out = run(
+        h,
+        HeadRun {
+            quant: Quant::Q6K,
+            weights: &weights,
+            x: &x,
+            gain: &gain,
+            rows: ROWS,
+            k: K,
+            eps,
+        },
+    )?;
     if out.logits.iter().any(|v| !v.is_nan()) {
         return Err("an all-NaN head stored a finite logit".to_string());
     }
@@ -709,6 +778,7 @@ fn refuse(
     h.kernels.head(
         encoder,
         HeadParams {
+            quant: Quant::Q6K,
             rows: a.rows,
             k: a.k,
             simdgroups: a.simdgroups,

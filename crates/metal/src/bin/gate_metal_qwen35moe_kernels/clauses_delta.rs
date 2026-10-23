@@ -509,6 +509,7 @@ pub fn delta_partial(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let y0 = draw(&mut rng, rows, 0.1);
     h.clear_fault()?;
     let got = h.headnorm(&HeadNormLaunch {
+        quant: Quant::Q4K,
         rows,
         cols,
         weights,

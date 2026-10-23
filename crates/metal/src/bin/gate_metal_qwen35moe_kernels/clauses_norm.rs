@@ -230,6 +230,7 @@ pub fn headnorm(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let reference = oracle::reference(Quant::Q4K, weights, 2048, HEAD_COLS * VALUE_HEADS, &x)?;
     let resid = oracle::activations(2048, 0x5E9, 2.0);
     let got = h.headnorm(&HeadNormLaunch {
+        quant: Quant::Q4K,
         rows: 2048,
         cols: HEAD_COLS * VALUE_HEADS,
         weights,
@@ -273,6 +274,7 @@ pub fn headnorm_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     ] {
         h.clear_fault()?;
         let got = h.headnorm(&HeadNormLaunch {
+            quant: Quant::Q4K,
             rows: 2048,
             cols: HEAD_COLS * VALUE_HEADS,
             weights,

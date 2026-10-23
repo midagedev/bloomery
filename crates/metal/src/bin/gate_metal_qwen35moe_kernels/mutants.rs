@@ -96,11 +96,11 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "embed_no_raise",
         clause: "embed",
-        why: "an id past the vocabulary raises nothing",
+        why: "an id past the vocabulary raises nothing (both embeddings')",
         edits: &[(
             "raise(faults, args.layer, BLOOMERY_FAULT_SITE_TOKEN_ID);",
             "",
-            1,
+            2,
         )],
     },
     Mutant {
@@ -303,7 +303,81 @@ pub const MUTANTS: &[Mutant] = &[
         name: "fold_drop_weight",
         clause: "fold",
         why: "the fold loads the activation without the route weight",
-        edits: &[("float scale = w[ib >> 1];", "float scale = 1.0f;", 1)],
+        edits: &[(
+            "float scale = w[Q::fold_slot(ib)];",
+            "float scale = 1.0f;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_lane_pair",
+        clause: "a4_matvec",
+        why: "one nibble of an A4 word pairs the lane value beside it",
+        edits: &[(
+            "acc[1] += lane.yl[4 * m + 1] * (q[m] & 0x00F0);",
+            "acc[1] += lane.yl[4 * m + 2] * (q[m] & 0x00F0);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_word_offset",
+        clause: "a4_matvec",
+        why: "an A4 lane reads the group's code words a quarter early",
+        edits: &[(
+            "device const uint16_t * q = (device const uint16_t *)blk.qs + 4 * lane.iq;",
+            "device const uint16_t * q = (device const uint16_t *)blk.qs + 2 * lane.iq;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_bias_sign",
+        clause: "a4_matvec",
+        why: "the A4 bias term is subtracted, not added",
+        edits: &[(
+            "+ bias_of(blk) * lane.sumy;",
+            "- bias_of(blk) * lane.sumy;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_scale_bias",
+        clause: "a4_matvec",
+        why: "the A4 code dot is scaled by the bias, not the scale",
+        edits: &[(
+            "return scale_of(blk) * ((acc[0] + 1.f/16.f * acc[1]) +",
+            "return bias_of(blk) * ((acc[0] + 1.f/16.f * acc[1]) +",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_fold_slot",
+        clause: "a4_fold",
+        why: "the A4 fold maps every sixteen groups, not every eight, to a slot",
+        edits: &[(
+            "    static inline float2 head_scales(threadgroup const float * scales, int ib) {\n        const int head = ib >> 1;\n        return float2(scales[head], scales[head]);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / (BLOOMERY_EXPERT_K / values_per_block());\n    }",
+            "    static inline float2 head_scales(threadgroup const float * scales, int ib) {\n        const int head = ib >> 1;\n        return float2(scales[head], scales[head]);\n    }\n\n    static inline int fold_blocks() {\n        return BLOOMERY_EXPERT_SLOTS * (BLOOMERY_EXPERT_K / values_per_block());\n    }\n\n    static inline int fold_slot(int ib) {\n        return ib / 16;\n    }",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_headnorm_scale",
+        clause: "a4_headnorm",
+        why: "an A4 group takes the neighbouring head's scale",
+        edits: &[(
+            "const int head = ib >> 1;",
+            "const int head = (ib >> 1) ^ 1;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "a4_embed_code",
+        clause: "a4_embed",
+        why: "the embed's code drops its top bit",
+        edits: &[(
+            "(word >> (4 * (j % 8))) & 0xF",
+            "(word >> (4 * (j % 8))) & 0x7",
+            1,
+        )],
     },
     Mutant {
         name: "fold_no_resid",

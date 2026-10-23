@@ -4,18 +4,19 @@
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, Elems};
-use bloomery_metal::kernels::{BLOCK_VALUES, EmbedParams, Quant};
+use bloomery_metal::kernels::{EmbedParams, Quant};
 
 use super::Harness;
 use super::common::{self, BadArg, LAYER, refuse_launches, still};
 use super::fixture::Fixture;
 use super::oracle;
 
-/// Embed `ids` from `table` (`vocab` rows of 2048 columns): the output rows.
-/// The clause reads the fault word itself; the launch clears it before it
-/// starts.
+/// Embed `ids` from `table` (`vocab` rows of 2048 columns, of `quant`): the
+/// output rows. The clause reads the fault word itself; the launch clears it
+/// before it starts.
 pub fn run_embed(
     h: &Harness<'_>,
+    quant: Quant,
     table: &[u8],
     vocab: usize,
     ids: &[u32],
@@ -29,6 +30,7 @@ pub fn run_embed(
         .map_err(why)?;
     h.clear_fault()?;
     let params = EmbedParams {
+        quant,
         table: table
             .window(Elems(0), Elems(table.len().get()))
             .map_err(why)?,
@@ -67,7 +69,7 @@ struct OddTable {
 fn refuses_an_odd_table(h: &Harness<'_>) -> Result<(), String> {
     let (device, stream) = (h.device, h.stream);
     let (vocab, cols) = (2usize, 2048usize);
-    let bytes = vocab * cols / BLOCK_VALUES * Quant::Q4K.block_bytes();
+    let bytes = vocab * cols / Quant::Q4K.values_per_block() * Quant::Q4K.block_bytes();
     let mut bufs = OddTable {
         table: device.upload(stream, &vec![0u8; bytes + 1]).map_err(why)?,
         ids: device.upload(stream, &[0u32]).map_err(why)?,
@@ -85,6 +87,7 @@ fn refuses_an_odd_table(h: &Harness<'_>) -> Result<(), String> {
                 h.kernels.embed(
                     encoder,
                     EmbedParams {
+                        quant: Quant::Q4K,
                         table: b.table.window(Elems(table_at), Elems(b.bytes))?,
                         vocab: b.vocab,
                         cols: b.cols,
@@ -104,15 +107,20 @@ fn refuses_an_odd_table(h: &Harness<'_>) -> Result<(), String> {
 }
 
 pub fn embed(h: &Harness<'_>, fixture: &Fixture) -> Clause {
-    let (table, vocab) = fixture.table("token_embd.weight", 2048)?;
+    let (table, vocab, ty) = fixture.table("token_embd.weight", 2048)?;
+    let quant = match ty {
+        gguf::quant::GgmlType::Q4_K => Quant::Q4K,
+        gguf::quant::GgmlType::MLX_A4 => Quant::A4,
+        other => return Err(format!("token_embd.weight is {other:?}, not a table type")),
+    };
     let cols = 2048;
 
     // Ids in range: the dequantizer's bits, row by row, and a clean word.
     let good = [0u32, 1, 5, 4095, (vocab - 1) as u32];
-    let rows = run_embed(h, table, vocab, &good)?;
+    let rows = run_embed(h, quant, table, vocab, &good)?;
     common::expect_clean(h, "ids in range")?;
     for (t, &id) in good.iter().enumerate() {
-        let want = oracle::q4k_row(table, cols, id as usize)?;
+        let want = oracle::table_row(quant, table, cols, id as usize)?;
         for (k, (g, w)) in rows[t * cols..(t + 1) * cols].iter().zip(&want).enumerate() {
             if g.to_bits() != w.to_bits() {
                 return Err(format!(
@@ -125,13 +133,13 @@ pub fn embed(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     // Ids at and past the vocabulary: the site is raised, the row is NaN, and
     // the ids around them are still right.
     let mixed = [7u32, vocab as u32, 9, u32::MAX, (vocab - 1) as u32];
-    let rows = run_embed(h, table, vocab, &mixed)?;
+    let rows = run_embed(h, quant, table, vocab, &mixed)?;
     common::expect_fault(h, "ids past the vocabulary", FaultSite::TokenId)?;
     h.clear_fault()?;
     for (t, &id) in mixed.iter().enumerate() {
         let row = &rows[t * cols..(t + 1) * cols];
         if (id as usize) < vocab {
-            let want = oracle::q4k_row(table, cols, id as usize)?;
+            let want = oracle::table_row(quant, table, cols, id as usize)?;
             if let Some(k) = row
                 .iter()
                 .zip(&want)

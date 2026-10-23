@@ -546,6 +546,7 @@ fn ty(quant: Quant) -> GgmlType {
     match quant {
         Quant::Q4K => GgmlType::Q4_K,
         Quant::Q6K => GgmlType::Q6_K,
+        Quant::A4 => GgmlType::MLX_A4,
     }
 }
 

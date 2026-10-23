@@ -8,7 +8,7 @@ use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elem};
 use bloomery_metal::MetalBuffer;
 use bloomery_metal::encode::ComputeEncoder;
-use bloomery_metal::kernels::{BLOCK_VALUES, Quant};
+use bloomery_metal::kernels::Quant;
 
 use super::fixture::Fixture;
 use super::oracle::{self, Kind};
@@ -43,6 +43,15 @@ impl Tensor {
         Self {
             name,
             quant: Quant::Q6K,
+            cols,
+            rows,
+        }
+    }
+
+    pub const fn a4(name: &'static str, cols: usize, rows: usize) -> Self {
+        Self {
+            name,
+            quant: Quant::A4,
             cols,
             rows,
         }
@@ -103,7 +112,11 @@ pub fn run_checked(h: &Harness<'_>, launch: &Launch<'_>) -> Result<f64, String> 
     if let Some(fault) = h.fault()? {
         return Err(format!("the launch raised {fault}"));
     }
-    let band = oracle::band(launch.quant, launch.cols / BLOCK_VALUES, kind);
+    let band = oracle::band(
+        launch.quant,
+        launch.cols / launch.quant.values_per_block(),
+        kind,
+    );
     oracle::check(&got, &reference, band, kind, base)
 }
 

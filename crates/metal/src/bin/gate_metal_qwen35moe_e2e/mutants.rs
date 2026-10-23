@@ -25,11 +25,11 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "embed_no_raise",
         clause: "e_token_id",
-        why: "an id past the table embeds NaN and raises no token-id site",
+        why: "an id past the table embeds NaN and raises no token-id site (both embeddings')",
         edits: &[(
             "raise(faults, args.layer, BLOOMERY_FAULT_SITE_TOKEN_ID);",
             "",
-            1,
+            2,
         )],
     },
     Mutant {

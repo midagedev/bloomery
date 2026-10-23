@@ -2,28 +2,45 @@
 
 use std::path::{Path, PathBuf};
 
-use bloomery_metal::kernels::{BLOCK_VALUES, Quant};
-use gguf::Gguf;
+use bloomery_metal::kernels::Quant;
+use gguf::Split;
 use gguf::quant::{GgmlType, dequant_row};
 
-/// The fixture file: the qwen35moe trunk the gate reads its tensors from.
+/// The fixture file: the qwen35moe trunk the gate reads its tensors from,
+/// opened as a split — the one reader that accepts bloomery's own value
+/// types, which an MLX-format fixture's tensors are.
 pub struct Fixture {
-    file: Gguf,
+    split: Split,
     pub path: PathBuf,
 }
 
 impl Fixture {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let file = Gguf::open(path).map_err(|e| {
+        let split = Split::open(path).map_err(|e| {
             format!(
                 "the fixture {} did not open: {e} (copy the qwen35moe fixture's trunk file there, or name it with --fixture)",
                 path.display()
             )
         })?;
         Ok(Self {
-            file,
+            split,
             path: path.to_path_buf(),
         })
+    }
+
+    /// The tensor `name`: its shard and its info.
+    fn tensor(&self, name: &str) -> Result<(usize, &gguf::TensorInfo), String> {
+        self.split
+            .find(name)
+            .ok_or_else(|| format!("the fixture has no tensor {name}"))
+    }
+
+    fn data(&self, shard: usize, info: &gguf::TensorInfo, name: &str) -> Result<&[u8], String> {
+        let file = self
+            .split
+            .shard(shard)
+            .ok_or_else(|| format!("{name}: shard {shard} is not open"))?;
+        file.data(info).map_err(|e| format!("{name}: {e}"))
     }
 
     /// The bytes of the 2-D tensor `name`, `rows` rows of `cols` columns of
@@ -35,18 +52,15 @@ impl Fixture {
         cols: usize,
         rows: usize,
     ) -> Result<&[u8], String> {
-        let t = self
-            .file
-            .find(name)
-            .ok_or_else(|| format!("the fixture has no tensor {name}"))?;
+        let (shard, t) = self.tensor(name)?;
         if t.ty != ty || t.dims.len() < 2 || t.dims[0] != cols as u64 || t.dims[1] < rows as u64 {
             return Err(format!(
                 "{name} is {:?} {:?}, the gate reads {ty:?} with {cols} columns and at least {rows} rows",
                 t.ty, t.dims
             ));
         }
-        let all = self.file.data(t).map_err(|e| format!("{name}: {e}"))?;
-        let row_bytes = cols / BLOCK_VALUES * quant_block_bytes(ty)?;
+        let all = self.data(shard, t, name)?;
+        let row_bytes = cols / values_per_block(ty)? * quant_block_bytes(ty)?;
         Ok(&all[..rows * row_bytes])
     }
 
@@ -60,7 +74,7 @@ impl Fixture {
         rows: usize,
     ) -> Result<&[u8], String> {
         let all = self.rows(name, ty, cols, at + rows)?;
-        let row_bytes = cols / BLOCK_VALUES * quant_block_bytes(ty)?;
+        let row_bytes = cols / values_per_block(ty)? * quant_block_bytes(ty)?;
         Ok(&all[at * row_bytes..])
     }
 
@@ -73,24 +87,21 @@ impl Fixture {
         rows: usize,
         expert: usize,
     ) -> Result<&[u8], String> {
-        let t = self
-            .file
-            .find(name)
-            .ok_or_else(|| format!("the fixture has no tensor {name}"))?;
+        let (shard, t) = self.tensor(name)?;
         if t.ty != ty
             || t.dims.len() != 3
             || t.dims[0] != cols as u64
             || t.dims[1] != rows as u64
             || expert as u64 >= t.dims[2]
-            || !cols.is_multiple_of(BLOCK_VALUES)
+            || !cols.is_multiple_of(values_per_block(ty)?)
         {
             return Err(format!(
                 "{name} is {:?} {:?}, the gate reads {ty:?} expert {expert} of {cols} columns by {rows} rows",
                 t.ty, t.dims
             ));
         }
-        let all = self.file.data(t).map_err(|e| format!("{name}: {e}"))?;
-        let row_bytes = cols / BLOCK_VALUES * quant_block_bytes(ty)?;
+        let all = self.data(shard, t, name)?;
+        let row_bytes = cols / values_per_block(ty)? * quant_block_bytes(ty)?;
         let one = rows * row_bytes;
         let start = expert * one;
         let end = start + one;
@@ -105,17 +116,14 @@ impl Fixture {
 
     /// The f32 tensor `name` of `len` values.
     pub fn f32s(&self, name: &str, len: usize) -> Result<Vec<f32>, String> {
-        let t = self
-            .file
-            .find(name)
-            .ok_or_else(|| format!("the fixture has no tensor {name}"))?;
+        let (shard, t) = self.tensor(name)?;
         if t.ty != GgmlType::F32 || t.dims != [len as u64] {
             return Err(format!(
                 "{name} is {:?} {:?}, the gate reads {len} f32s",
                 t.ty, t.dims
             ));
         }
-        let bytes = self.file.data(t).map_err(|e| format!("{name}: {e}"))?;
+        let bytes = self.data(shard, t, name)?;
         let mut out = vec![0f32; len];
         dequant_row(GgmlType::F32, bytes, &mut out).map_err(|e| format!("{name}: {e}"))?;
         Ok(out)
@@ -123,25 +131,37 @@ impl Fixture {
 
     /// The model's norm epsilon.
     pub fn rms_eps(&self) -> Result<f32, String> {
-        self.file
+        self.split
+            .shard(0)
+            .ok_or_else(|| "the fixture's first shard is not open".to_string())?
             .arch_get_f32("attention.layer_norm_rms_epsilon")
             .ok_or_else(|| "the fixture names no attention.layer_norm_rms_epsilon".to_string())
     }
 
-    /// The bytes of the Q4_K embedding table: `rows` rows of `cols`.
-    pub fn table(&self, name: &str, cols: usize) -> Result<(&[u8], usize), String> {
-        let t = self
-            .file
-            .find(name)
-            .ok_or_else(|| format!("the fixture has no tensor {name}"))?;
-        if t.ty != GgmlType::Q4_K || t.dims.len() != 2 || t.dims[0] != cols as u64 {
+    /// The bytes of an embedding table: `rows` rows of `cols`, its type's.
+    pub fn table(&self, name: &str, cols: usize) -> Result<(&[u8], usize, GgmlType), String> {
+        let (shard, t) = self.tensor(name)?;
+        let ty = t.ty;
+        if !matches!(ty, GgmlType::Q4_K | GgmlType::MLX_A4)
+            || t.dims.len() != 2
+            || t.dims[0] != cols as u64
+        {
             return Err(format!(
-                "{name} is {:?} {:?}, the gate reads a Q4_K table of {cols} columns",
-                t.ty, t.dims
+                "{name} is {ty:?} {:?}, the gate reads a Q4_K or MLX_A4 table of {cols} columns",
+                t.dims
             ));
         }
-        let bytes = self.file.data(t).map_err(|e| format!("{name}: {e}"))?;
-        Ok((bytes, t.dims[1] as usize))
+        let bytes = self.data(shard, t, name)?;
+        Ok((bytes, t.dims[1] as usize, ty))
+    }
+}
+
+/// The values one block of `ty` holds, in the mat-vec types the gate reads.
+fn values_per_block(ty: GgmlType) -> Result<usize, String> {
+    match ty {
+        GgmlType::Q4_K | GgmlType::Q6_K => Ok(256),
+        GgmlType::MLX_A4 => Ok(64),
+        other => Err(format!("{other:?} is not a mat-vec type")),
     }
 }
 
@@ -149,6 +169,7 @@ fn quant_block_bytes(ty: GgmlType) -> Result<usize, String> {
     match ty {
         GgmlType::Q4_K => Ok(Quant::Q4K.block_bytes()),
         GgmlType::Q6_K => Ok(Quant::Q6K.block_bytes()),
+        GgmlType::MLX_A4 => Ok(Quant::A4.block_bytes()),
         other => Err(format!("{other:?} is not a mat-vec type")),
     }
 }

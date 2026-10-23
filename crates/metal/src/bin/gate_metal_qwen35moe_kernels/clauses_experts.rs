@@ -6,8 +6,8 @@ use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, Elems};
 use bloomery_metal::MetalBuffer;
 use bloomery_metal::kernels::{
-    BLOCK_VALUES, EXPERT_K, EXPERT_SLOTS, FoldParams, PairParams, Quant, ROUTED_IDS,
-    ROWS_PER_SIMD_GROUP, SHARED_SLOT, SharedPlan,
+    EXPERT_K, EXPERT_SLOTS, FoldParams, PairParams, Quant, ROUTED_IDS, ROWS_PER_SIMD_GROUP,
+    SHARED_SLOT, SharedPlan,
 };
 use gguf::quant::GgmlType;
 
@@ -25,15 +25,15 @@ const IDS: [i32; ROUTED_IDS] = [0, 1, 2, 3, 1, 2, 3, 0];
 const ROUTE: [f32; EXPERT_SLOTS] = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8];
 
 /// The norm a pair launch applies to its input.
-struct PairNorm {
-    gain: Vec<f32>,
-    eps: f32,
+pub struct PairNorm {
+    pub gain: Vec<f32>,
+    pub eps: f32,
 }
 
 /// A positive synthetic gain, not the fixture's FFN gain: that one is all
 /// ones, under which a dropped gain is invisible. The epsilon is the
 /// fixture's.
-fn ffn_norm(fix: &Fixture) -> Result<PairNorm, String> {
+pub fn ffn_norm(fix: &Fixture) -> Result<PairNorm, String> {
     Ok(PairNorm {
         gain: oracle::activations(PAIR_COLS, 0x6C0, 0.5)
             .iter()
@@ -43,22 +43,23 @@ fn ffn_norm(fix: &Fixture) -> Result<PairNorm, String> {
     })
 }
 
-fn row_bytes(quant: Quant, cols: usize) -> usize {
-    cols / BLOCK_VALUES * quant.block_bytes()
+pub fn row_bytes(quant: Quant, cols: usize) -> usize {
+    cols / quant.values_per_block() * quant.block_bytes()
 }
 
 fn tag(quant: Quant) -> u64 {
     match quant {
         Quant::Q4K => 0,
         Quant::Q6K => 1,
+        Quant::A4 => 2,
     }
 }
 
-struct PairWeights {
-    gate: Vec<u8>,
-    up: Vec<u8>,
-    shared_gate: Vec<u8>,
-    shared_up: Vec<u8>,
+pub struct PairWeights {
+    pub gate: Vec<u8>,
+    pub up: Vec<u8>,
+    pub shared_gate: Vec<u8>,
+    pub shared_up: Vec<u8>,
 }
 
 fn stack(
@@ -89,8 +90,9 @@ fn plane(
 
 /// Q4 reads the gate and up experts. Q6 has no gate or up experts in the
 /// fixture, so each expert is one Q6_K down expert's blocks, read as 512 by
-/// 2048: the byte length is the same.
-fn pair_weights(fix: &Fixture, quant: Quant) -> Result<PairWeights, String> {
+/// 2048: the byte length is the same. A4 reads its own gate and up stacks,
+/// which an MLX-format fixture holds.
+pub fn pair_weights(fix: &Fixture, quant: Quant) -> Result<PairWeights, String> {
     let ty = quant.ggml();
     let weights = match quant {
         Quant::Q4K => PairWeights {
@@ -139,6 +141,28 @@ fn pair_weights(fix: &Fixture, quant: Quant) -> Result<PairWeights, String> {
                 .expert("blk.2.ffn_down_exps.weight", ty, EXPERT_K, PAIR_COLS, 16)?
                 .to_vec(),
         },
+        Quant::A4 => PairWeights {
+            gate: stack(
+                fix,
+                "blk.0.ffn_gate_exps.weight",
+                ty,
+                PAIR_COLS,
+                EXPERT_K,
+                0,
+                N_EXPERTS,
+            )?,
+            up: stack(
+                fix,
+                "blk.0.ffn_up_exps.weight",
+                ty,
+                PAIR_COLS,
+                EXPERT_K,
+                0,
+                N_EXPERTS,
+            )?,
+            shared_gate: plane(fix, "blk.0.ffn_gate_shexp.weight", ty, PAIR_COLS, EXPERT_K)?,
+            shared_up: plane(fix, "blk.0.ffn_up_shexp.weight", ty, PAIR_COLS, EXPERT_K)?,
+        },
     };
     let one = weights.gate.len() / N_EXPERTS;
     if weights.up.len() != weights.gate.len()
@@ -159,9 +183,9 @@ fn pair_weights(fix: &Fixture, quant: Quant) -> Result<PairWeights, String> {
     Ok(weights)
 }
 
-struct FoldWeights {
-    down: Vec<u8>,
-    shared: Vec<u8>,
+pub struct FoldWeights {
+    pub down: Vec<u8>,
+    pub shared: Vec<u8>,
 }
 
 fn fold_weights(fix: &Fixture, quant: Quant) -> Result<FoldWeights, String> {
@@ -172,11 +196,12 @@ fn fold_weights(fix: &Fixture, quant: Quant) -> Result<FoldWeights, String> {
 /// count a threadgroup does not divide, for the row tail. The reader hands
 /// out an expert's whole rows, so a partial count is the stack repacked at
 /// the count's own stride, the stride the kernel's row offsets read.
-fn fold_weights_of(fix: &Fixture, quant: Quant, rows: usize) -> Result<FoldWeights, String> {
+pub fn fold_weights_of(fix: &Fixture, quant: Quant, rows: usize) -> Result<FoldWeights, String> {
     let ty = quant.ggml();
     let (name, shared) = match quant {
         Quant::Q4K => ("blk.0.ffn_down_exps.weight", "blk.0.ffn_down_shexp.weight"),
         Quant::Q6K => ("blk.2.ffn_down_exps.weight", "blk.2.ffn_down_shexp.weight"),
+        Quant::A4 => ("blk.0.ffn_down_exps.weight", "blk.0.ffn_down_shexp.weight"),
     };
     let rb = row_bytes(quant, EXPERT_K);
     let mut down = Vec::with_capacity(N_EXPERTS * rows * rb);
@@ -201,17 +226,17 @@ fn fold_weights_of(fix: &Fixture, quant: Quant, rows: usize) -> Result<FoldWeigh
     Ok(weights)
 }
 
-struct PairIn<'a> {
-    quant: Quant,
-    n_experts: usize,
-    ids: &'a [i32],
-    gate: &'a [u8],
-    up: &'a [u8],
-    shared_gate: &'a [u8],
-    shared_up: &'a [u8],
-    x: &'a [f32],
-    norm: &'a PairNorm,
-    y0: &'a [f32],
+pub struct PairIn<'a> {
+    pub quant: Quant,
+    pub n_experts: usize,
+    pub ids: &'a [i32],
+    pub gate: &'a [u8],
+    pub up: &'a [u8],
+    pub shared_gate: &'a [u8],
+    pub shared_up: &'a [u8],
+    pub x: &'a [f32],
+    pub norm: &'a PairNorm,
+    pub y0: &'a [f32],
 }
 
 fn read_interior(
@@ -227,7 +252,7 @@ fn read_interior(
     Ok(back[OUT_GUARD..OUT_GUARD + rows].to_vec())
 }
 
-fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, String> {
+pub fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, String> {
     let (device, stream) = (h.device, h.stream);
     let y_len = EXPERT_SLOTS * EXPERT_K;
     let gate = padded(0xFFu8, WEIGHT_PAD, launch.gate, WEIGHT_TAIL);
@@ -286,18 +311,18 @@ fn launch_pair(h: &Harness<'_>, launch: PairIn<'_>) -> Result<Vec<f32>, String> 
     read_interior(h, &y, y_len)
 }
 
-struct FoldIn<'a> {
-    quant: Quant,
-    n_experts: usize,
-    ids: &'a [i32],
-    down: &'a [u8],
-    shared: &'a [u8],
-    h: &'a [f32],
-    w: &'a [f32],
-    y0: &'a [f32],
+pub struct FoldIn<'a> {
+    pub quant: Quant,
+    pub n_experts: usize,
+    pub ids: &'a [i32],
+    pub down: &'a [u8],
+    pub shared: &'a [u8],
+    pub h: &'a [f32],
+    pub w: &'a [f32],
+    pub y0: &'a [f32],
 }
 
-fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, String> {
+pub fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, String> {
     let (device, stream) = (h.device, h.stream);
     let down = padded(0xFFu8, WEIGHT_PAD, launch.down, WEIGHT_TAIL);
     let shared = padded(0xFFu8, WEIGHT_PAD, launch.shared, WEIGHT_TAIL);
@@ -345,7 +370,7 @@ fn launch_fold(h: &Harness<'_>, launch: FoldIn<'_>) -> Result<Vec<f32>, String> 
 }
 
 /// The words `got` holds, against a solo launch of the same rows.
-fn expect_bits(got: &[f32], want: &[f32], what: &str) -> Result<(), String> {
+pub fn expect_bits(got: &[f32], want: &[f32], what: &str) -> Result<(), String> {
     if got.len() != want.len() {
         return Err(format!(
             "{what}: {} values against {}",
@@ -359,7 +384,7 @@ fn expect_bits(got: &[f32], want: &[f32], what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn check_pair_quant(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<String, String> {
+pub fn check_pair_quant(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<String, String> {
     let weights = pair_weights(fix, quant)?;
     let norm = ffn_norm(fix)?;
     let x = oracle::activations(PAIR_COLS, 0xA11 + tag(quant), 1.0);
@@ -384,7 +409,7 @@ fn check_pair_quant(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<Stri
         return Err(format!("{} pair raised {f}", quant.name()));
     }
     let x64 = oracle::rms_norm(&x, &norm.gain, norm.eps);
-    let nblocks = PAIR_COLS / BLOCK_VALUES;
+    let nblocks = PAIR_COLS / quant.values_per_block();
     let rb = row_bytes(quant, PAIR_COLS);
     let mut worst = 0.0f64;
     for slot in 0..EXPERT_SLOTS {
@@ -617,7 +642,7 @@ fn solo_slot(
     Ok(got[..EXPERT_K].to_vec())
 }
 
-fn check_pair_shared(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<(), String> {
+pub fn check_pair_shared(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Result<(), String> {
     let weights = pair_weights(fix, quant)?;
     let norm = ffn_norm(fix)?;
     let x = oracle::activations(PAIR_COLS, 0x5E1 + tag(quant), 1.0);
@@ -675,7 +700,7 @@ pub fn pair_shared(h: &Harness<'_>, fix: &Fixture) -> Clause {
     ))
 }
 
-fn hidden_states(quant: Quant) -> Vec<f32> {
+pub fn hidden_states(quant: Quant) -> Vec<f32> {
     let mut out = Vec::with_capacity(EXPERT_SLOTS * EXPERT_K);
     for slot in 0..EXPERT_SLOTS {
         out.extend(oracle::activations(
@@ -687,7 +712,7 @@ fn hidden_states(quant: Quant) -> Vec<f32> {
     out
 }
 
-fn check_fold_quant(
+pub fn check_fold_quant(
     h: &Harness<'_>,
     fix: &Fixture,
     quant: Quant,
@@ -755,7 +780,7 @@ fn check_fold_quant(
     Ok(format!("{} {worst:.3}", quant.name()))
 }
 
-fn fold_bad_id(h: &Harness<'_>, weights: &FoldWeights, quant: Quant) -> Result<(), String> {
+pub fn fold_bad_id(h: &Harness<'_>, weights: &FoldWeights, quant: Quant) -> Result<(), String> {
     let hidden = hidden_states(quant);
     for bad in [-1, N_EXPERTS as i32] {
         let mut ids = IDS;

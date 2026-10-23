@@ -30,6 +30,18 @@
 //! lane's sum over its `ceil(nb / 4)` blocks, and the 31 adds of the SIMD
 //! group: `n = 13 + ceil(nb / 4) + 31`.
 //!
+//! **A4** (MLX's affine 4-bit, quant.metal's `A4`) factors a weight as
+//! `s q + b`, two terms that cancel inside a group, so the bound is on their
+//! magnitudes: `M_c = |s| q + |b|` (the same groups with both sign bits
+//! cleared, dequantized by the same reader), `sum_c M_c |x_c|`. The longest
+//! path is the code side's: the product (1), the four-term chain of its
+//! accumulator (3), the three combine adds (each an exact power-of-two
+//! product and one rounding), the product by the scale (1) and the bias
+//! side's add (1) — the bias side itself is shorter (the load's `sumy`
+//! chain of 4 adds per block, its grouping's 2, the product, the add) — the
+//! lane's sum over its `ceil(nb / 8)` blocks, and the 31 adds of the SIMD
+//! group: `n = 9 + ceil(nb / 8) + 31`.
+//!
 //! **Norm on load** adds the gain product on the load (1) and the scale
 //! product at the end (1), and the scale itself: `s = rsqrt(S / K + eps)`, `S`
 //! the sum of squares in the kernel's own order (a square, two adds, the lane's
@@ -80,7 +92,7 @@
 //! dequantized weights are the reader's f32 values, exact up to the one
 //! rounding the reader itself makes.
 
-use bloomery_metal::kernels::{BLOCK_VALUES, Quant};
+use bloomery_metal::kernels::Quant;
 use gguf::quant::dequant_row;
 
 /// Unit roundoff of an f32 operation rounded to nearest.
@@ -104,6 +116,11 @@ const Q4K_STORE_BASE: usize = 13;
 /// The operations of a Q6_K store path before the lane's blocks and the SIMD
 /// group's sum: the four-term sum, its scale and its lane count.
 const Q6K_STORE_BASE: usize = 9;
+
+/// The operations of an A4 store path before the lane's blocks and the SIMD
+/// group's sum: the four-term accumulator chain, the combine, the scale
+/// product and the bias add, as this module's doc derives.
+const A4_STORE_BASE: usize = 9;
 
 /// The longest path through the SIMD group's sum: a binary tree over 32 lanes
 /// is at most 31 adds deep, whatever its shape.
@@ -172,6 +189,7 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
     let (lane_blocks, base) = match quant {
         Quant::Q4K => (nblocks.div_ceil(4), Q4K_STORE_BASE),
         Quant::Q6K => (nblocks.div_ceil(2), Q6K_STORE_BASE),
+        Quant::A4 => (nblocks.div_ceil(8), A4_STORE_BASE),
     };
     let n_store = base + lane_blocks + SIMD_SUM_DEPTH;
     match kind {
@@ -183,6 +201,7 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
             let chain = match quant {
                 Quant::Q4K => 8 * lane_blocks,
                 Quant::Q6K => 4 * lane_blocks,
+                Quant::A4 => 4 * lane_blocks,
             };
             let n_s = 1 + 2 + chain + SIMD_SUM_DEPTH;
             // The scale's argument is off by at most `t` relative, so the
@@ -256,6 +275,20 @@ fn q4k_magnitude_blocks(row: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `block`'s bytes with the scale's and the bias's sign bits cleared: the
+/// reader's dequantization of them is `|s| q + |b|`, the magnitude of the two
+/// terms of an A4 weight. Each sign bit is the top bit of the pair's second
+/// byte (little-endian).
+fn a4_magnitude_blocks(row: &[u8]) -> Vec<u8> {
+    const GROUP: usize = Quant::A4.block_bytes();
+    let mut out = row.to_vec();
+    for group in out.as_chunks_mut::<GROUP>().0 {
+        group[33] &= 0x7F;
+        group[35] &= 0x7F;
+    }
+    out
+}
+
 /// The oracle for `rows` rows of `weights` against the input `x` (what the
 /// kernel dots with: already normed when the kernel norms).
 pub fn reference(
@@ -265,7 +298,7 @@ pub fn reference(
     cols: usize,
     x: &[f64],
 ) -> Result<Reference, String> {
-    let row_bytes = cols / BLOCK_VALUES * quant.block_bytes();
+    let row_bytes = cols / quant.values_per_block() * quant.block_bytes();
     if weights.len() != rows * row_bytes || x.len() != cols {
         return Err(format!(
             "oracle shape: {} weight bytes and {} inputs for {rows} x {cols}",
@@ -291,6 +324,11 @@ pub fn reference(
                 .sum(),
             Quant::Q4K => {
                 dequant_row(ty, &q4k_magnitude_blocks(row), &mut m)
+                    .map_err(|e| format!("dequantizing a row's magnitudes: {e}"))?;
+                m.iter().zip(x).map(|(&m, &x)| f64::from(m) * x.abs()).sum()
+            }
+            Quant::A4 => {
+                dequant_row(ty, &a4_magnitude_blocks(row), &mut m)
                     .map_err(|e| format!("dequantizing a row's magnitudes: {e}"))?;
                 m.iter().zip(x).map(|(&m, &x)| f64::from(m) * x.abs()).sum()
             }
@@ -403,12 +441,12 @@ pub fn activations(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         .collect()
 }
 
-/// The dequantized values of a Q4_K table row, the embedding oracle.
-pub fn q4k_row(table: &[u8], cols: usize, id: usize) -> Result<Vec<f32>, String> {
-    let row_bytes = cols / BLOCK_VALUES * Quant::Q4K.block_bytes();
+/// The dequantized values of a quantized table row, the embedding oracle.
+pub fn table_row(quant: Quant, table: &[u8], cols: usize, id: usize) -> Result<Vec<f32>, String> {
+    let row_bytes = cols / quant.values_per_block() * quant.block_bytes();
     let mut out = vec![0f32; cols];
     dequant_row(
-        Quant::Q4K.ggml(),
+        quant.ggml(),
         &table[id * row_bytes..(id + 1) * row_bytes],
         &mut out,
     )
