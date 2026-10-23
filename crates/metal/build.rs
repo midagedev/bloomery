@@ -55,9 +55,15 @@ fn matvec_geometry_header() -> String {
     format!(
         "// The mat-vec launch geometry, from src/kernels/geometry.rs.\n\
          #define BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP {}\n\
-         #define BLOOMERY_MATVEC_SIMD_GROUPS_PER_GROUP {}\n",
+         #define BLOOMERY_MATVEC_MAX_SEGMENTS {}\n\
+         #define BLOOMERY_MATVEC_VALUE_HEADS {}\n\
+         #define BLOOMERY_MATVEC_HEAD_COLS {}\n\
+         #define BLOOMERY_MATVEC_PARTIALS_PER_HEAD {}\n",
         geometry::ROWS_PER_SIMD_GROUP,
-        geometry::SIMD_GROUPS_PER_GROUP
+        geometry::MAX_SEGMENTS,
+        geometry::VALUE_HEADS,
+        geometry::HEAD_COLS,
+        geometry::PARTIALS_PER_HEAD
     )
 }
 

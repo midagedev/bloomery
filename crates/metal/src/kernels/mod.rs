@@ -6,14 +6,26 @@
 //! (a window that is not the shape's is a named [`bloomery_device::DeviceError`], never a
 //! partial read or write), and encodes one dispatch on the caller's encoder.
 //! The kernels themselves are `kernels/{norm,matvec_q4k,matvec_q6k,embed}.metal`.
+//!
+//! Three mat-vecs live here, one concept each: the plain mat-vec of one
+//! tensor ([`matvec`]), the segmented mat-vec of up to four tensors of one
+//! type and one width in one dispatch ([`seg`]), and the head-normed residual
+//! mat-vec of a gated delta net's out projection ([`headnorm`]).
 
 mod embed;
 mod geometry;
+mod headnorm;
 mod matvec;
+mod seg;
 
 pub use embed::EmbedParams;
-pub use geometry::{BLOCK_VALUES, ROWS_PER_GROUP, THREADS_PER_GROUP};
+pub use geometry::{
+    BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,
+    SIMD_GROUPS_PER_GROUP, THREADS_PER_GROUP, VALUE_HEADS,
+};
+pub use headnorm::HeadNormParams;
 pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
+pub use seg::{SegParams, Segment};
 
 use bloomery_device::DeviceError;
 
@@ -21,20 +33,28 @@ use crate::device::MetalDevice;
 use crate::library::{Library, Pipeline};
 
 /// The pipelines of one mat-vec type: the plain entry, the entry that norms its
-/// input as it loads it, and the one that adds into its output.
+/// input as it loads it, the one that adds into its output, and the segmented
+/// entry.
 struct MatvecPipelines {
     store: Pipeline,
     norm: Pipeline,
     residual: Pipeline,
+    seg: Pipeline,
 }
 
 impl MatvecPipelines {
-    fn new(library: &Library, names: [&str; 3]) -> Result<Self, DeviceError> {
+    fn new(library: &Library, names: [&str; 4], simdgroups: u32) -> Result<Self, DeviceError> {
         Ok(Self {
-            store: library.pipeline(names[0])?,
-            norm: library.pipeline(names[1])?,
-            residual: library.pipeline(names[2])?,
+            store: library.pipeline_with_simdgroups(names[0], simdgroups)?,
+            norm: library.pipeline_with_simdgroups(names[1], simdgroups)?,
+            residual: library.pipeline_with_simdgroups(names[2], simdgroups)?,
+            seg: library.pipeline_with_simdgroups(names[3], simdgroups)?,
         })
+    }
+
+    /// The segmented entry of one type.
+    pub(crate) fn seg(&self) -> &Pipeline {
+        &self.seg
     }
 }
 
@@ -42,7 +62,11 @@ impl MatvecPipelines {
 pub struct Kernels {
     q4k: MatvecPipelines,
     q6k: MatvecPipelines,
+    headnorm: Pipeline,
     embed: Pipeline,
+    /// The SIMD groups in a mat-vec's threadgroup: the kernels' function
+    /// constant, and the geometry of every launch.
+    simdgroups: usize,
 }
 
 impl Kernels {
@@ -53,21 +77,76 @@ impl Kernels {
 
     /// The pipelines of `library`: a missing kernel is a named error.
     pub fn from_library(library: &Library) -> Result<Self, DeviceError> {
+        Self::with_simdgroups(library, SIMD_GROUPS_PER_GROUP)
+    }
+
+    /// The pipelines of `library` with `simdgroups` SIMD groups in a
+    /// threadgroup. The count is the kernels' function constant, so each count
+    /// is its own pipeline, and every launch's geometry follows it.
+    pub fn with_simdgroups(library: &Library, simdgroups: usize) -> Result<Self, DeviceError> {
+        let count = u32::try_from(simdgroups).map_err(|_| DeviceError::Range {
+            what: "matvec",
+            detail: format!("{simdgroups} SIMD groups do not fit the kernel's word"),
+        })?;
+        if count == 0 {
+            return Err(DeviceError::Range {
+                what: "matvec",
+                detail: "a threadgroup of no SIMD groups".to_string(),
+            });
+        }
+        // A threadgroup holds at most the device's 1024 threads, and a SIMD
+        // group is 32 of them.
+        if simdgroups > geometry::MAX_SIMD_GROUPS_PER_GROUP {
+            return Err(DeviceError::Range {
+                what: "matvec",
+                detail: format!(
+                    "{simdgroups} SIMD groups in a threadgroup, the most is {}",
+                    geometry::MAX_SIMD_GROUPS_PER_GROUP
+                ),
+            });
+        }
         Ok(Self {
             q4k: MatvecPipelines::new(
                 library,
-                ["q4k_matvec", "q4k_matvec_norm", "q4k_matvec_resid"],
+                [
+                    "q4k_matvec",
+                    "q4k_matvec_norm",
+                    "q4k_matvec_resid",
+                    "q4k_matvec_seg",
+                ],
+                count,
             )?,
             q6k: MatvecPipelines::new(
                 library,
-                ["q6k_matvec", "q6k_matvec_norm", "q6k_matvec_resid"],
+                [
+                    "q6k_matvec",
+                    "q6k_matvec_norm",
+                    "q6k_matvec_resid",
+                    "q6k_matvec_seg",
+                ],
+                count,
             )?,
+            headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             embed: library.pipeline("embed_q4k")?,
+            simdgroups,
         })
+    }
+
+    /// The SIMD groups in a mat-vec's threadgroup.
+    #[must_use]
+    pub fn simdgroups(&self) -> usize {
+        self.simdgroups
+    }
+
+    /// The threads in a mat-vec's threadgroup.
+    #[must_use]
+    pub fn threads_per_group(&self) -> usize {
+        geometry::SIMD_WIDTH * self.simdgroups
     }
 }
 
-/// A word of a kernel's argument block, as the bytes the kernel reads.
+/// A kernel's argument block, as the bytes the kernel reads: the words in
+/// order, each in the machine's byte order.
 pub(crate) fn args_bytes(words: [u32; 4]) -> [u8; 16] {
     let mut out = [0u8; 16];
     for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {

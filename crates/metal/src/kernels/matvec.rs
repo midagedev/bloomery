@@ -6,7 +6,7 @@ use crate::device::MetalDevice;
 use crate::encode::{Binding, ComputeEncoder};
 use crate::fault::MetalFaultWord;
 
-use super::geometry::{BLOCK_VALUES, ROWS_PER_GROUP, THREADS_PER_GROUP};
+use super::geometry::{BLOCK_VALUES, ROWS_PER_SIMD_GROUP};
 use super::{Kernels, MatvecPipelines, args_bytes, check_window_len, word};
 
 /// The weight type a mat-vec reads.
@@ -112,7 +112,7 @@ fn refuse(detail: String) -> DeviceError {
 
 /// The shape of `p`, refused by name when a window is not the shape's, the
 /// columns are not whole blocks, or a count passes the kernel's 32-bit words.
-fn check(p: &MatvecParams<'_>) -> Result<Shape, DeviceError> {
+fn check(p: &MatvecParams<'_>, simdgroups: usize) -> Result<Shape, DeviceError> {
     if p.rows == 0 || p.cols == 0 {
         return Err(refuse(format!(
             "{} rows by {} columns is empty",
@@ -157,7 +157,7 @@ fn check(p: &MatvecParams<'_>) -> Result<Shape, DeviceError> {
     Ok(Shape {
         nblocks: word("matvec", "the block count", nblocks)?,
         rows: word("matvec", "the row count", p.rows)?,
-        groups: p.rows.div_ceil(ROWS_PER_GROUP),
+        groups: p.rows.div_ceil(simdgroups * ROWS_PER_SIMD_GROUP),
     })
 }
 
@@ -181,7 +181,7 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: MatvecParams<'_>,
     ) -> Result<(), DeviceError> {
-        let shape = check(&p)?;
+        let shape = check(&p, self.simdgroups)?;
         let (layer, eps) = match &p.mode {
             Mode::NormOnLoad(norm) => (norm.layer, norm.eps),
             Mode::Store | Mode::Residual => (LAYER_NONE, 0.0),
@@ -200,6 +200,7 @@ impl Kernels {
             encoder.set_binding(4, Binding::of(&norm.gain)?)?;
             encoder.set_binding(5, norm.fault.binding())?;
         }
-        encoder.dispatch(shape.groups * THREADS_PER_GROUP, THREADS_PER_GROUP)
+        let threads = self.threads_per_group();
+        encoder.dispatch(shape.groups * threads, threads)
     }
 }

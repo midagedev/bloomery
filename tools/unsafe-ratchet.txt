@@ -634,7 +634,10 @@ levers 0 0 0
 # no Metal protocol thread-safe, so the thread-safe handles and the window's raw carry `unsafe impl Send/Sync` with Apple's
 # list as their invariant; the window raw's buffer dereference and pages and the encoder's two argument calls each carry
 # their SAFETY line. Lowered to 15 blocks, 3 fns, 11 impls when the shared pages' owner moved to the device crate.
-metal 15 3 11
+# PIN(2026-10-22): metal 15 -> 16 blocks, new code, not old code relaxed: library.rs pipeline_with_simdgroups writes the
+# mat-vec SIMD-group count through objc2's setConstantValue_type_atIndex (the binding takes a raw pointer; the value is
+# copied for the call), one block with its SAFETY line.
+metal 16 3 11
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.

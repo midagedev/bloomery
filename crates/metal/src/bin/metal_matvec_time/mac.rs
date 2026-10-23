@@ -16,16 +16,25 @@
 //! timed ones is the stream's own and is in every gap. The figure is the median
 //! of the per-buffer rates (see [`Timing`]); `--gaps` prints every gap.
 //!
-//! Flags: `--only q4k|q6k`, `--trials N`, `--gaps`, `--no-check` (skip the
-//! f64 oracle's check of the first dispatch against the band).
+//! Three launches are timed: the plain mat-vec of one tensor, the segmented
+//! mat-vec of several tensors in one dispatch, and the head-normed residual
+//! mat-vec. The f64 oracle's check of the first dispatch against the band runs
+//! for the plain mat-vec only (`--no-check` skips it).
+//!
+//! Flags: `--only matvec|seg|headnorm|q4k|q6k`, `--trials N`, `--gaps`,
+//! `--no-check` (skip the f64 oracle's check of the first dispatch against the
+//! band).
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use bloomery_device::conformance::why;
-use bloomery_device::{Buffer, Device, DeviceError, Elems, Event, Stream};
+use bloomery_device::{Buffer, Device, DeviceError, Elems, Event, LAYER_NONE, Stream};
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::kernels::{BLOCK_VALUES, Kernels, MatvecParams, Mode, Quant};
+use bloomery_metal::kernels::{
+    BLOCK_VALUES, HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, PARTIALS_PER_HEAD,
+    Quant, SegParams, Segment, VALUE_HEADS,
+};
 
 #[path = "../shared/oracle.rs"]
 #[allow(
@@ -51,6 +60,113 @@ const SHAPES: [(usize, usize); 5] = [
     (1536, 4096),
     (8192, 4096),
 ];
+
+/// What a timed dispatch reads and writes.
+enum Shape {
+    /// A plain mat-vec of one tensor.
+    Matvec {
+        quant: Quant,
+        rows: usize,
+        cols: usize,
+    },
+    /// A segmented mat-vec: the row segments of several tensors of one type
+    /// and one width, in one dispatch.
+    Seg {
+        quant: Quant,
+        cols: usize,
+        /// The rows of every segment.
+        segments: Vec<usize>,
+    },
+    /// The head-normed residual mat-vec: a gated delta net's out projection.
+    HeadNorm { rows: usize, cols: usize },
+}
+
+impl Shape {
+    /// The name the line prints.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Matvec { .. } => "matvec",
+            Self::Seg { .. } => "seg",
+            Self::HeadNorm { .. } => "headnorm",
+        }
+    }
+
+    /// The weight type the dispatch reads.
+    fn quant(&self) -> Quant {
+        match self {
+            Self::Matvec { quant, .. } | Self::Seg { quant, .. } => *quant,
+            Self::HeadNorm { .. } => Quant::Q4K,
+        }
+    }
+
+    /// The columns the dispatch reads.
+    fn cols(&self) -> usize {
+        match self {
+            Self::Matvec { cols, .. } | Self::Seg { cols, .. } => *cols,
+            Self::HeadNorm { cols, .. } => *cols,
+        }
+    }
+
+    /// The rows the dispatch writes.
+    fn rows(&self) -> usize {
+        match self {
+            Self::Matvec { rows, .. } => *rows,
+            Self::Seg { segments, .. } => segments.iter().sum(),
+            Self::HeadNorm { rows, .. } => *rows,
+        }
+    }
+
+    /// The bytes a dispatch streams: its weights.
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Matvec { quant, rows, cols } => rows * cols / BLOCK_VALUES * quant.block_bytes(),
+            Self::Seg {
+                quant,
+                cols,
+                segments,
+            } => segments.iter().sum::<usize>() * cols / BLOCK_VALUES * quant.block_bytes(),
+            Self::HeadNorm { rows, cols } => rows * cols / BLOCK_VALUES * Quant::Q4K.block_bytes(),
+        }
+    }
+}
+
+/// The shapes of the segmented and the head-normed launches: a layer's
+/// projections, and the out projection of a gated delta net.
+fn other_shapes() -> Vec<(&'static str, Shape)> {
+    vec![
+        (
+            "seg delta qkv+gate",
+            Shape::Seg {
+                quant: Quant::Q4K,
+                cols: 2048,
+                segments: vec![8192, 4096],
+            },
+        ),
+        (
+            "seg attn q+gate+k+v",
+            Shape::Seg {
+                quant: Quant::Q4K,
+                cols: 2048,
+                segments: vec![8192, 4096, 512, 512],
+            },
+        ),
+        (
+            "seg q6k qkv",
+            Shape::Seg {
+                quant: Quant::Q6K,
+                cols: 2048,
+                segments: vec![8192],
+            },
+        ),
+        (
+            "headnorm out",
+            Shape::HeadNorm {
+                rows: 2048,
+                cols: 4096,
+            },
+        ),
+    ]
+}
 
 /// One matrix of random blocks the probe's way: random bytes, with `d` (and
 /// `dmin`) a finite f16 in [0.0005, 0.004].
@@ -101,19 +217,26 @@ struct Timing {
 fn time_shape(
     device: &MetalDevice,
     kernels: &Kernels,
-    quant: Quant,
-    rows: usize,
-    cols: usize,
+    shape: &Shape,
     trials: usize,
     check: bool,
 ) -> Result<Timing, String> {
     let stream = device.stream();
-    let one = matrix(
-        quant,
-        rows,
-        cols,
-        0x6B70_726F_6265 ^ ((rows as u64) << 24) ^ ((cols as u64) << 4),
-    );
+    let (quant, cols, rows) = (shape.quant(), shape.cols(), shape.rows());
+    let seed = 0x6B70_726F_6265 ^ ((rows as u64) << 24) ^ ((cols as u64) << 4);
+    // The weights of the dispatch: one matrix, or the segments' matrices side
+    // by side.
+    let one: Vec<u8> = match shape {
+        Shape::Matvec { rows, cols, .. } => matrix(quant, *rows, *cols, seed),
+        Shape::Seg { cols, segments, .. } => {
+            let mut all = Vec::new();
+            for (i, s) in segments.iter().enumerate() {
+                all.extend_from_slice(&matrix(quant, *s, *cols, seed ^ (i as u64)));
+            }
+            all
+        }
+        Shape::HeadNorm { rows, cols } => matrix(Quant::Q4K, *rows, *cols, seed),
+    };
     let bytes = one.len();
     let stride = bytes.div_ceil(256) * 256;
     let copies = WORKING_SET_BYTES.div_ceil(stride).max(1);
@@ -125,6 +248,33 @@ fn time_shape(
     drop(all);
     let x_values = oracle::activations(cols, 0x78, 1.0);
     let x = device.upload(stream, &x_values).map_err(why)?;
+    // The norm's gain, and the head norm's gated numerator and partial sums.
+    let gain = device.upload(stream, &vec![1.0f32; cols]).map_err(why)?;
+    let g = device.upload(stream, &x_values).map_err(why)?;
+    let partials = device
+        .upload(stream, &vec![1.0f32; VALUE_HEADS * PARTIALS_PER_HEAD])
+        .map_err(why)?;
+    // The segments' places in the weights and in the output.
+    let mut segments: Vec<Segment> = Vec::new();
+    if let Shape::Seg {
+        cols,
+        segments: rows_of,
+        ..
+    } = shape
+    {
+        let mut weight_blocks = 0usize;
+        let mut out_offset = 0usize;
+        for r in rows_of {
+            segments.push(Segment {
+                cols: *cols,
+                rows: *r,
+                weight_blocks,
+                out_offset,
+            });
+            weight_blocks += r * (cols / BLOCK_VALUES);
+            out_offset += r;
+        }
+    }
 
     let dispatches = WINDOW_BYTES.div_ceil(bytes).max(30);
     let buffers = WARMUPS + trials;
@@ -141,22 +291,68 @@ fn time_shape(
             let mut encoder = recording.compute_encoder().map_err(why)?;
             for j in 0..dispatches {
                 let n = b * dispatches + j;
-                kernels
-                    .matvec(
-                        &mut encoder,
-                        MatvecParams {
-                            quant,
-                            rows,
-                            cols,
-                            weights: weights
-                                .window(Elems((n % copies) * stride), Elems(bytes))
-                                .map_err(why)?,
-                            x: x.window(Elems(0), Elems(cols)).map_err(why)?,
-                            y: y.window_mut(Elems(n * rows), Elems(rows)).map_err(why)?,
-                            mode: Mode::Store,
-                        },
-                    )
+                let w = weights
+                    .window(Elems((n % copies) * stride), Elems(bytes))
                     .map_err(why)?;
+                let out = y.window_mut(Elems(n * rows), Elems(rows)).map_err(why)?;
+                match shape {
+                    Shape::Matvec { quant, rows, cols } => {
+                        kernels
+                            .matvec(
+                                &mut encoder,
+                                MatvecParams {
+                                    quant: *quant,
+                                    rows: *rows,
+                                    cols: *cols,
+                                    weights: w,
+                                    x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                    y: out,
+                                    mode: Mode::Store,
+                                },
+                            )
+                            .map_err(why)?;
+                    }
+                    Shape::Seg { quant, cols, .. } => {
+                        kernels
+                            .matvec_seg(
+                                &mut encoder,
+                                SegParams {
+                                    quant: *quant,
+                                    segments: segments.clone(),
+                                    weights: w,
+                                    x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                    y: out,
+                                    norm: NormOnLoad {
+                                        gain: gain.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                        eps: 1e-6,
+                                        fault: device.fault_word(),
+                                        layer: LAYER_NONE,
+                                    },
+                                },
+                            )
+                            .map_err(why)?;
+                    }
+                    Shape::HeadNorm { rows, cols } => {
+                        kernels
+                            .headnorm_resid(
+                                &mut encoder,
+                                HeadNormParams {
+                                    rows: *rows,
+                                    cols: *cols,
+                                    weights: w,
+                                    g: g.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                    partials: partials
+                                        .window(Elems(0), Elems(VALUE_HEADS * PARTIALS_PER_HEAD))
+                                        .map_err(why)?,
+                                    y: out,
+                                    eps: 1e-6,
+                                    fault: device.fault_word(),
+                                    layer: LAYER_NONE,
+                                },
+                            )
+                            .map_err(why)?;
+                    }
+                }
             }
             encoder.end();
         }
@@ -203,7 +399,7 @@ fn time_shape(
             ));
         }
     }
-    if check {
+    if check && matches!(shape, Shape::Matvec { .. }) {
         let x64: Vec<f64> = x_values.iter().map(|&v| f64::from(v)).collect();
         let reference = oracle::reference(quant, &one, rows, cols, &x64)?;
         let band = oracle::band(quant, cols / BLOCK_VALUES, oracle::Kind::Store);
@@ -326,7 +522,7 @@ pub fn main() -> ExitCode {
     let info = match device.info() {
         Ok(info) => info,
         Err(e) => {
-            println!("metal_matvec_time: FAIL ({e})");
+            println!("metal_matvec_time: FAIL ({e}");
             return ExitCode::FAILURE;
         }
     };
@@ -336,39 +532,59 @@ pub fn main() -> ExitCode {
         device.library().path().name(),
         <MetalDevice as Device>::BACKEND
     );
+    let wanted = |shape: &Shape, label: &str| -> bool {
+        match only {
+            None => true,
+            Some(o) => {
+                o == shape.kind()
+                    || (shape.kind() == "matvec" && o == shape.quant().name())
+                    || label.contains(o)
+            }
+        }
+    };
     let mut failed = false;
+    let mut shapes: Vec<(String, Shape)> = Vec::new();
     for quant in [Quant::Q4K, Quant::Q6K] {
-        if only.is_some_and(|o| o != quant.name()) {
+        for (rows, cols) in SHAPES {
+            shapes.push((
+                format!("matvec {} {rows}x{cols}", quant.name()),
+                Shape::Matvec { quant, rows, cols },
+            ));
+        }
+    }
+    for (label, shape) in other_shapes() {
+        shapes.push((label.to_string(), shape));
+    }
+    for (label, shape) in &shapes {
+        if !wanted(shape, label) {
             continue;
         }
-        for (rows, cols) in SHAPES {
-            match time_shape(&device, &kernels, quant, rows, cols, trials, check) {
-                Ok(t) => {
-                    if show_gaps {
-                        let us: Vec<String> =
-                            t.gaps.iter().map(|g| format!("{:.0}", g * 1e6)).collect();
-                        println!("gaps_us\t{}", us.join(" "));
-                    }
-                    let bytes = rows * cols / BLOCK_VALUES * quant.block_bytes();
-                    println!(
-                        "matvec\ttype={}\trows={rows}\tcols={cols}\tdispatches={}\ttrials={trials}\tclean={}\tbytes={bytes}\tcopies={}\tworking_set_bytes={}\tgbps_median={:.2}\tus_median={:.2}\tencode_us={:.2}",
-                        quant.name(),
-                        t.dispatches,
-                        t.clean,
-                        t.copies,
-                        t.working_set,
-                        t.median,
-                        bytes as f64 / t.median / 1e3,
-                        t.encode * 1e6,
-                    );
+        match time_shape(&device, &kernels, shape, trials, check) {
+            Ok(t) => {
+                if show_gaps {
+                    let us: Vec<String> =
+                        t.gaps.iter().map(|g| format!("{:.0}", g * 1e6)).collect();
+                    println!("gaps_us\t{}", us.join(" "));
                 }
-                Err(e) => {
-                    println!(
-                        "matvec\ttype={}\trows={rows}\tcols={cols}\tFAIL\t{e}",
-                        quant.name()
-                    );
-                    failed = true;
-                }
+                let bytes = shape.bytes();
+                println!(
+                    "matvec\tkind={}\tshape={label}\ttype={}\trows={}\tcols={}\tdispatches={}\ttrials={trials}\tclean={}\tbytes={bytes}\tcopies={}\tworking_set_bytes={}\tgbps_median={:.2}\tus_median={:.2}\tencode_us={:.2}",
+                    shape.kind(),
+                    shape.quant().name(),
+                    shape.rows(),
+                    shape.cols(),
+                    t.dispatches,
+                    t.clean,
+                    t.copies,
+                    t.working_set,
+                    t.median,
+                    bytes as f64 / t.median / 1e3,
+                    t.encode * 1e6,
+                );
+            }
+            Err(e) => {
+                println!("matvec\tkind={}\tshape={label}\tFAIL\t{e}", shape.kind());
+                failed = true;
             }
         }
     }

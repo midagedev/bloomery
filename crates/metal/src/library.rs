@@ -14,11 +14,14 @@
 //! neither — no metallib and a runtime that refuses the source — is a named
 //! error.
 
+use core::ptr::NonNull;
+
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCompileOptions, MTLComputePipelineState, MTLDevice, MTLFunction, MTLLanguageVersion,
-    MTLLibrary, MTLMathFloatingPointFunctions, MTLMathMode,
+    MTLCompileOptions, MTLComputePipelineState, MTLDataType, MTLDevice, MTLFunction,
+    MTLFunctionConstantValues, MTLLanguageVersion, MTLLibrary, MTLMathFloatingPointFunctions,
+    MTLMathMode,
 };
 
 use bloomery_device::DeviceError;
@@ -163,6 +166,42 @@ impl Library {
     /// The compute pipeline of the named function.
     pub fn pipeline(&self, name: &str) -> Result<Pipeline, DeviceError> {
         let function = self.function(name)?;
+        self.pipeline_of(function)
+    }
+
+    /// The compute pipeline of the named function, specialized with the
+    /// mat-vec's SIMD group count as its function constant. A function that
+    /// reads a function constant has no pipeline without one: the count is
+    /// what the kernel's geometry is.
+    pub fn pipeline_with_simdgroups(
+        &self,
+        name: &str,
+        simdgroups: u32,
+    ) -> Result<Pipeline, DeviceError> {
+        let values = MTLFunctionConstantValues::new();
+        let mut count = simdgroups;
+        // SAFETY: the constant values copy the value the pointer names, and
+        // the pointer is valid for the call.
+        unsafe {
+            values.setConstantValue_type_atIndex(
+                NonNull::from(&mut count).cast(),
+                MTLDataType::UInt,
+                0,
+            );
+        }
+        let wanted = NSString::from_str(name);
+        let function = self
+            .library
+            .newFunctionWithName_constantValues_error(&wanted, &values)
+            .map_err(|e| DeviceError::backend("library", e.localizedDescription().to_string()))?;
+        self.pipeline_of(function)
+    }
+
+    /// The pipeline of a function.
+    fn pipeline_of(
+        &self,
+        function: objc2::rc::Retained<ProtocolObject<dyn MTLFunction>>,
+    ) -> Result<Pipeline, DeviceError> {
         let state = self
             .device
             .newComputePipelineStateWithFunction_error(&function)

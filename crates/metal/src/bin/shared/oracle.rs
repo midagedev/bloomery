@@ -51,6 +51,30 @@
 //! clause.
 //! The band is on `sum_c M_c |x_hat_c|`, `x_hat = x * gain * s` in f64.
 //!
+//! **Head norm on load** (`q4k_matvec_headnorm_resid`): the input is the
+//! gated numerator `g` times the norm scale of the head each column belongs
+//! to, and the scale comes from the head's partial sums of the squares of its
+//! values.
+//!
+//! PIN(2026-10-22): the model below sets the head-normed band.
+//!
+//! The scale of a head: the head's `partials_per_head` partials summed in the
+//! kernel's order (one add per partial after the first), the division by the
+//! head's columns (exact: a power of two), the epsilon's add (1), and the
+//! library's `rsqrt`. The sum's path is `partials_per_head - 1` adds, so the
+//! scale's argument is off by at most `t = G(partials_per_head)` relative, and
+//! the scale by at most `(1 - t)^(-1/2) - 1` (the worse direction) plus the
+//! library `rsqrt`'s own error (`RSQRT_ULP` units in the last place, as in the
+//! norm above).
+//!
+//! The scale multiplies the value on the load, so its product joins the path
+//! (1) and the gated numerator is the input and is exact: the mat-vec's path
+//! grows by one operation, `G(n_store + 1)`. The scale's own error is a
+//! relative error of every term, so it enters the band the same way the norm's
+//! does: the factor is `theta_s + g + theta_s * g` with `g = G(n_store + 1)`.
+//! The band is on `sum_c M_c |x_hat_c|`, `x_hat = g * s` in f64, and the
+//! residual epilogue adds `U |y|` as in the residual kind.
+//!
 //! **Floor.** A result below the smallest normal `f32::MIN_POSITIVE` may be
 //! flushed to zero (the hardware's choice, not read here): an absolute error of
 //! at most that per operation of the path, which the relative bound does not
@@ -87,6 +111,21 @@ pub enum Kind {
     Store,
     Norm,
     Residual,
+    /// The head-normed residual mat-vec: the gated delta net's out projection.
+    HeadNorm(HeadGeometry),
+}
+
+/// The head geometry the head-normed mat-vec's band depends on: the value
+/// heads, the columns one head holds, and the partial sums one head's sum is
+/// made of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadGeometry {
+    /// The value heads.
+    pub heads: usize,
+    /// The columns one head holds.
+    pub cols_per_head: usize,
+    /// The partial sums one head's sum is made of.
+    pub partials_per_head: usize,
 }
 
 /// What a mat-vec's band is made of (the derivation above): the relative
@@ -128,7 +167,29 @@ pub fn band(quant: Quant, nblocks: usize, kind: Kind) -> Band {
                 ops: n_s + 2 + n_store + 2,
             }
         }
+        Kind::HeadNorm(heads) => {
+            // The head scale: the head's partial sums summed (one add per
+            // partial after the first), the division by the head's columns
+            // (exact: a power of two), the epsilon's add, and the rsqrt.
+            let n_s = heads.partials_per_head - 1 + 1;
+            let t = gamma(n_s);
+            let theta_s = (1.0 - t).powf(-0.5) - 1.0 + RSQRT_ULP * 2.0 * U;
+            // The scale multiplies the value on the load, so its product
+            // joins the path; the gated numerator is the input and is exact.
+            let g = gamma(n_store + 1);
+            Band {
+                factor: theta_s + g + theta_s * g,
+                ops: n_s + n_store + 1,
+            }
+        }
     }
+}
+
+/// The head scale the head-normed mat-vec applies to a head's columns:
+/// `1 / sqrt(sum / cols + eps)`, in f64, from the head's partial sums.
+pub fn head_scale(partials: &[f64], cols_per_head: usize, eps: f64) -> f64 {
+    let sum: f64 = partials.iter().sum();
+    1.0 / (sum / cols_per_head as f64 + eps).sqrt()
 }
 
 /// One output row of the oracle: the f64 dot and the sum of the terms'
@@ -209,7 +270,7 @@ pub fn rms_norm(x: &[f32], gain: &[f32], eps: f32) -> Vec<f64> {
 
 /// The part of the band a residual add contributes: `U |y|`.
 fn residual_term(kind: Kind, total: f64) -> f64 {
-    if kind == Kind::Residual {
+    if matches!(kind, Kind::Residual | Kind::HeadNorm(_)) {
         U * total.abs()
     } else {
         0.0

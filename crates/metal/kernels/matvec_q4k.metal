@@ -1,17 +1,22 @@
 // The Q4_K mat-vec: y[r] = sum_c W[r, c] * x[c] for one f32 activation vector,
-// W in GGUF block_q4_K layout, one dispatch. Three entries share one body:
+// W in GGUF block_q4_K layout, one dispatch. The entries:
 //
-//   q4k_matvec        y = W . x
-//   q4k_matvec_norm   y = W . rms_norm(x, gain, eps): the norm applied as x is
-//                     loaded (norm.metal)
-//   q4k_matvec_resid  y = y + W . x, in place: the residual epilogue
+//   q4k_matvec                y = W . x
+//   q4k_matvec_norm           y = W . rms_norm(x, gain, eps): the norm applied
+//                             as x is loaded (norm.metal)
+//   q4k_matvec_resid          y = y + W . x, in place: the residual epilogue
+//   q4k_matvec_seg            the row segments of up to four tensors of one
+//                             type and one width, in one dispatch
+//   q4k_matvec_headnorm_resid y = y + W . (g * head_scale): the gated delta
+//                             net's out projection, the head scale on the load
 //
 // Adapted from llama.cpp's kernel_mul_mv_q4_K_f32 (MIT licence; see
 // THIRD_PARTY_NOTICES.md):
 //   ggml/src/ggml-metal/kernels/mul_mv.metal
 // The lane map (ix/it/iq/ir), the four-block loop, the uint16 nibble trick, the
 // row loop over a SIMD group's rows and the simd_sum reduction are llama.cpp's:
-// 2 rows per SIMD group, 2 SIMD groups per threadgroup.
+// 2 rows per SIMD group, the SIMD groups in a threadgroup the function
+// constant of norm.metal (2 today, 8 for the head kernel of a later round).
 //
 // What differs from llama.cpp's loop:
 //   - the matrix is not padded: a SIMD group past the last row returns, and each
@@ -44,16 +49,23 @@ static_assert(sizeof(block_q4_K) == 144, "block_q4_K is 144 bytes");
 static_assert(BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP == 2,
               "the tail step below is the pair's: it is written for two rows");
 
-template <bool NORM, bool RESID>
-inline void q4k_matvec_body(device const block_q4_K * W,
-                            device const float      * x,
-                            device float            * y,
-                            constant MatvecArgs     & args,
-                            device const float      * gain,
-                            device atomic_uint      * faults,
-                            uint3  tgpig,
-                            ushort tiisg,
-                            ushort sgitg) {
+// The rows of one segment or one tensor a threadgroup owns. The norm scales
+// the whole input at the end, the head norm scales every value on the load,
+// and the residual adds into the output: the dot product is the same in all
+// of them, so the rows they write are the same bits.
+template <bool NORM, bool RESID, bool HEADNORM>
+inline void q4k_rows(device const block_q4_K * W,
+                      device const float      * x,
+                      device float            * y,
+                      int nblocks,
+                      float eps,
+                      uint layer,
+                      device const float      * gain,
+                      threadgroup const float  * scales,
+                      device atomic_uint      * faults,
+                      int first_row,
+                      int rows,
+                      ushort tiisg) {
     constexpr uint16_t kmask1 = 0x3f3f;
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
@@ -64,9 +76,7 @@ inline void q4k_matvec_body(device const block_q4_K * W,
     const short iq = it/4;     // 0 or 1
     const short ir = it%4;     // 0...3
 
-    const int nb = args.nblocks;
-    const int rows = args.rows;
-    const int first_row = (int)(tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS_PER_GROUP + sgitg) * NR0;
+    const int nb = nblocks;
     if (first_row >= rows) {
         return;
     }
@@ -93,11 +103,30 @@ inline void q4k_matvec_body(device const block_q4_K * W,
 
     for (int ib = ix; ib < nb; ib += 4) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        // The block's two heads: the head scale of each, once for the block.
+        float lo = 1.f;
+        float hi = 1.f;
+        if (HEADNORM) {
+            lo = scales[2*ib];
+            hi = scales[2*ib+1];
+        }
         for (short i = 0; i < 8; ++i) {
             float a0 = y4[i+  0];
             float a1 = y4[i+ 32];
             float a2 = y4[i+128];
             float a3 = y4[i+160];
+            if (HEADNORM) {
+                // A value the gated numerator cannot carry: the gate's site
+                // is raised, and the sum it is in is not finite either, so
+                // the row is NaN.
+                if (!isfinite(a0) || !isfinite(a1) || !isfinite(a2) || !isfinite(a3)) {
+                    raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
+                }
+                a0 *= lo;
+                a1 *= lo;
+                a2 *= hi;
+                a3 *= hi;
+            }
             if (NORM) {
                 sum_sq += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
                 a0 *= g4[i+  0];
@@ -154,10 +183,10 @@ inline void q4k_matvec_body(device const block_q4_K * W,
     float scale = 1.f;
     if (NORM) {
         const float sum_squares = simd_sum(sum_sq);
-        scale = rms_scale(sum_squares, (uint)nb * QK_K, args.eps);
+        scale = rms_scale(sum_squares, (uint)nb * QK_K, eps);
         if (!rms_usable(sum_squares, scale)) {
             if (tiisg == 0) {
-                raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+                raise(faults, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
                 for (short row = 0; row < NR0 && first_row + row < rows; ++row) {
                     y[first_row + row] = NAN;
                 }
@@ -193,7 +222,9 @@ kernel void q4k_matvec(device const block_q4_K * W [[buffer(0)]],
                        uint3  tgpig [[threadgroup_position_in_grid]],
                        ushort tiisg [[thread_index_in_simdgroup]],
                        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    q4k_matvec_body<false, false>(W, x, y, args, nullptr, nullptr, tgpig, tiisg, sgitg);
+    const int first_row = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    q4k_rows<false, false, false>(W, x, y, args.nblocks, args.eps, args.layer,
+                                  nullptr, nullptr, nullptr, first_row, (int)args.rows, tiisg);
 }
 
 kernel void q4k_matvec_norm(device const block_q4_K * W [[buffer(0)]],
@@ -205,7 +236,9 @@ kernel void q4k_matvec_norm(device const block_q4_K * W [[buffer(0)]],
                             uint3  tgpig [[threadgroup_position_in_grid]],
                             ushort tiisg [[thread_index_in_simdgroup]],
                             ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    q4k_matvec_body<true, false>(W, x, y, args, gain, faults, tgpig, tiisg, sgitg);
+    const int first_row = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    q4k_rows<true, false, false>(W, x, y, args.nblocks, args.eps, args.layer,
+                                 gain, nullptr, faults, first_row, (int)args.rows, tiisg);
 }
 
 kernel void q4k_matvec_resid(device const block_q4_K * W [[buffer(0)]],
@@ -215,5 +248,76 @@ kernel void q4k_matvec_resid(device const block_q4_K * W [[buffer(0)]],
                              uint3  tgpig [[threadgroup_position_in_grid]],
                              ushort tiisg [[thread_index_in_simdgroup]],
                              ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    q4k_matvec_body<false, true>(W, x, y, args, nullptr, nullptr, tgpig, tiisg, sgitg);
+    const int first_row = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    q4k_rows<false, true, false>(W, x, y, args.nblocks, args.eps, args.layer,
+                                 nullptr, nullptr, nullptr, first_row, (int)args.rows, tiisg);
+}
+
+// The row segments of up to four tensors of one type and one width: the
+// threadgroup takes the segment whose first threadgroup it is, and the rows
+// are the ones a launch of that segment alone would write.
+kernel void q4k_matvec_seg(device const block_q4_K * W [[buffer(0)]],
+                            device const float      * x [[buffer(1)]],
+                            device float            * y [[buffer(2)]],
+                            constant SegArgs        & args [[buffer(3)]],
+                            device const float      * gain [[buffer(4)]],
+                            device atomic_uint      * faults [[buffer(5)]],
+                            uint3  tgpig [[threadgroup_position_in_grid]],
+                            ushort tiisg [[thread_index_in_simdgroup]],
+                            ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    uint s = 0;
+    for (uint i = 0; i < args.nseg; ++i) {
+        if (tgpig.x >= args.segs[i].first_group) {
+            s = i;
+        }
+    }
+    const uint local = tgpig.x - args.segs[s].first_group;
+    const int first_row = (int)((local * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    q4k_rows<true, false, false>(
+        W + (ulong)args.segs[s].wblocks,
+        x,
+        y + args.segs[s].out,
+        args.nblocks, args.eps, args.layer,
+        gain, nullptr, faults,
+        first_row, (int)args.segs[s].rows, tiisg);
+}
+
+// The gated delta net's out projection: the input is the gated numerator g
+// times the norm scale of the head each column belongs to, and the scale comes
+// from the head's partial sums of the squares of its values.
+kernel void q4k_matvec_headnorm_resid(device const block_q4_K * W [[buffer(0)]],
+                                      device const float      * g [[buffer(1)]],
+                                      device const float      * partials [[buffer(2)]],
+                                      device float            * y [[buffer(3)]],
+                                      constant MatvecArgs     & args [[buffer(4)]],
+                                      device atomic_uint      * faults [[buffer(5)]],
+                                      uint3  tgpig [[threadgroup_position_in_grid]],
+                                      ushort tiisg [[thread_index_in_simdgroup]],
+                                      ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    // The head scales, in threadgroup memory: a lane reads the scale of each
+    // head its columns are in, and the lanes of a SIMD group do not read the
+    // same head, so a shuffle cannot share them.
+    threadgroup float scales[BLOOMERY_MATVEC_VALUE_HEADS];
+    if (sgitg == 0 && tiisg < BLOOMERY_MATVEC_VALUE_HEADS) {
+        const uint head = tiisg;
+        float sum = 0.f;
+        for (short j = 0; j < BLOOMERY_MATVEC_PARTIALS_PER_HEAD; ++j) {
+            sum += partials[head * BLOOMERY_MATVEC_PARTIALS_PER_HEAD + j];
+        }
+        const float mean = sum / float(BLOOMERY_MATVEC_HEAD_COLS);
+        const float s = rsqrt(mean + args.eps);
+        if (!isfinite(sum) || !isfinite(s)) {
+            // A head the norm cannot take is NaN, not a zero head: its values
+            // are then not finite and the rows that read them are NaN.
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
+            scales[head] = NAN;
+        } else {
+            scales[head] = s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int first_row = (int)((tgpig.x * BLOOMERY_MATVEC_SIMD_GROUPS + sgitg) * BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP);
+    q4k_rows<false, true, true>(W, g, y, args.nblocks, args.eps, args.layer,
+                                nullptr, scales, faults, first_row, (int)args.rows, tiisg);
 }

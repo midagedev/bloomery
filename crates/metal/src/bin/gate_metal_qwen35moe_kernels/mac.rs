@@ -30,6 +30,19 @@
 //! 10. **block_shape**: the block values the launch arithmetic uses are
 //!     gguf's own for Q4_K and Q6_K; the bytes are gguf's row by
 //!     construction.
+//! 11. **seg_bit**: every segment of a segmented dispatch is the same bits as
+//!     the same tensor run alone: the delta layer's Q4_K group, the attention
+//!     layer's group, and the mixed-type layer's Q6_K dispatch.
+//! 12. **seg_bounds**: a segment list with mismatched widths, a row count of
+//!     zero, more segments than a dispatch runs, or overlapping outputs is
+//!     refused by name, and nothing is encoded for it.
+//! 13. **headnorm**: the head-normed residual mat-vec against the f64 oracle,
+//!     the gated numerator and the heads' partial sums as the inputs.
+//! 14. **headnorm_nan**: a partial or a gated numerator that is not finite
+//!     raises the gate site and writes NaN.
+//! 15. **nsg**: the Q6_K mat-vec at eight SIMD groups in a threadgroup is the
+//!     same bits as at two, for every row count the fixture's Q6_K tensors
+//!     have.
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--only CLAUSE` runs one clause; `--mutant NAME` runs the one
@@ -46,7 +59,9 @@ use std::process::{Command, ExitCode};
 use bloomery_device::conformance::{Clause, Report, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::device::MetalDevice;
-use bloomery_metal::kernels::{Kernels, MatvecParams, Mode, NormOnLoad, Quant};
+use bloomery_metal::kernels::{
+    HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, Quant, SegParams, Segment,
+};
 use bloomery_metal::library::Library;
 use bloomery_metal::stream::MetalStream;
 
@@ -101,11 +116,46 @@ pub struct Launch<'a> {
     pub mode: ModeSpec<'a>,
 }
 
+/// One segmented mat-vec launch of the gate: the row segments of several
+/// tensors of one type and one width, in one dispatch.
+pub struct SegLaunch<'a> {
+    pub quant: Quant,
+    /// The input columns, the same for every segment.
+    pub cols: usize,
+    /// The segments: the rows of one tensor and the bytes of its weights.
+    pub segments: Vec<(usize, &'a [u8])>,
+    pub x: &'a [f32],
+    /// The output's contents before the launch (every segment's rows).
+    pub y0: &'a [f32],
+    /// The norm's gain, one value per column.
+    pub gain: &'a [f32],
+    pub eps: f32,
+    pub layer: u32,
+}
+
+/// One head-normed residual mat-vec launch of the gate.
+pub struct HeadNormLaunch<'a> {
+    pub rows: usize,
+    pub cols: usize,
+    pub weights: &'a [u8],
+    /// The gated numerator, one value per column.
+    pub g: &'a [f32],
+    /// The partial sums of the squares, one row per head.
+    pub partials: &'a [f32],
+    /// The output's contents before the launch (`rows` words).
+    pub y0: &'a [f32],
+    pub eps: f32,
+    pub layer: u32,
+}
+
 /// The device, its stream and the kernels a clause runs.
 pub struct Harness<'a> {
     pub device: &'a MetalDevice,
     pub stream: &'a MetalStream,
     pub kernels: &'a Kernels,
+    /// The library the kernels came from: a clause that runs the same kernels
+    /// with another geometry builds them again from it.
+    pub library: &'a Library,
 }
 
 fn padded<T: Copy>(pad: T, before: usize, body: &[T], after: usize) -> Vec<T> {
@@ -170,6 +220,104 @@ impl Harness<'_> {
         Ok(back[OUT_GUARD..OUT_GUARD + launch.rows].to_vec())
     }
 
+    /// Run `launch` and read the output window back, after checking that the
+    /// words around the window are as they were. The segments' weights share
+    /// one buffer and their outputs one window, each at its own offset.
+    pub fn seg(&self, launch: &SegLaunch<'_>) -> Result<Vec<f32>, String> {
+        let (device, stream) = (self.device, self.stream);
+        let sentinel = f32::from_bits(SENTINEL_BITS);
+        let block = launch.quant.block_bytes();
+        let mut weights: Vec<u8> = Vec::new();
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut out_offset = 0usize;
+        for (rows, bytes) in &launch.segments {
+            segments.push(Segment {
+                cols: launch.cols,
+                rows: *rows,
+                weight_blocks: weights.len() / block,
+                out_offset,
+            });
+            weights.extend_from_slice(bytes);
+            out_offset += rows;
+        }
+        let weight_bytes = weights.len();
+        let rows = out_offset;
+        let weights = padded(0xFFu8, WEIGHT_PAD, &weights, WEIGHT_TAIL);
+        let weights = device.upload(stream, &weights).map_err(why)?;
+        let x = padded(sentinel, VALUE_PAD, launch.x, 1);
+        let x = device.upload(stream, &x).map_err(why)?;
+        let y_words = padded(sentinel, OUT_GUARD, launch.y0, OUT_GUARD);
+        let mut y = device.upload(stream, &y_words).map_err(why)?;
+        let gain = padded(sentinel, VALUE_PAD, launch.gain, 1);
+        let gain = device.upload(stream, &gain).map_err(why)?;
+
+        let params = SegParams {
+            quant: launch.quant,
+            segments,
+            weights: weights
+                .window(Elems(WEIGHT_PAD), Elems(weight_bytes))
+                .map_err(why)?,
+            x: x.window(Elems(VALUE_PAD), Elems(launch.cols))
+                .map_err(why)?,
+            y: y.window_mut(Elems(OUT_GUARD), Elems(rows)).map_err(why)?,
+            norm: NormOnLoad {
+                gain: gain
+                    .window(Elems(VALUE_PAD), Elems(launch.cols))
+                    .map_err(why)?,
+                eps: launch.eps,
+                fault: device.fault_word(),
+                layer: launch.layer,
+            },
+        };
+        self.encode(|encoder| self.kernels.matvec_seg(encoder, params))?;
+        let mut back = vec![0f32; rows + 2 * OUT_GUARD];
+        device
+            .read(stream, y.whole().map_err(why)?, &mut back)
+            .map_err(why)?;
+        check_guards(&back, rows)?;
+        Ok(back[OUT_GUARD..OUT_GUARD + rows].to_vec())
+    }
+
+    /// Run `launch` and read the output window back, after checking that the
+    /// words around the window are as they were.
+    pub fn headnorm(&self, launch: &HeadNormLaunch<'_>) -> Result<Vec<f32>, String> {
+        let (device, stream) = (self.device, self.stream);
+        let sentinel = f32::from_bits(SENTINEL_BITS);
+        let weights = padded(0xFFu8, WEIGHT_PAD, launch.weights, WEIGHT_TAIL);
+        let weights = device.upload(stream, &weights).map_err(why)?;
+        let g = padded(sentinel, VALUE_PAD, launch.g, 1);
+        let g = device.upload(stream, &g).map_err(why)?;
+        let partials = padded(sentinel, VALUE_PAD, launch.partials, 1);
+        let partials = device.upload(stream, &partials).map_err(why)?;
+        let y_words = padded(sentinel, OUT_GUARD, launch.y0, OUT_GUARD);
+        let mut y = device.upload(stream, &y_words).map_err(why)?;
+
+        let params = HeadNormParams {
+            rows: launch.rows,
+            cols: launch.cols,
+            weights: weights
+                .window(Elems(WEIGHT_PAD), Elems(launch.weights.len()))
+                .map_err(why)?,
+            g: g.window(Elems(VALUE_PAD), Elems(launch.cols))
+                .map_err(why)?,
+            partials: partials
+                .window(Elems(VALUE_PAD), Elems(launch.partials.len()))
+                .map_err(why)?,
+            y: y.window_mut(Elems(OUT_GUARD), Elems(launch.rows))
+                .map_err(why)?,
+            eps: launch.eps,
+            fault: device.fault_word(),
+            layer: launch.layer,
+        };
+        self.encode(|encoder| self.kernels.headnorm_resid(encoder, params))?;
+        let mut back = vec![0f32; launch.rows + 2 * OUT_GUARD];
+        device
+            .read(stream, y.whole().map_err(why)?, &mut back)
+            .map_err(why)?;
+        check_guards(&back, launch.rows)?;
+        Ok(back[OUT_GUARD..OUT_GUARD + launch.rows].to_vec())
+    }
+
     /// One command buffer with one dispatch encoded by `encode`, submitted
     /// whether or not `encode` refused, so a clause sees any work a launcher
     /// encoded before its refusal; the refusal is returned after the submit.
@@ -219,11 +367,16 @@ pub fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.get(at + 1).map(String::as_str)
 }
 
-/// The kernels compiled from the source with the mutant's edits in.
-fn mutated_kernels(device: &MetalDevice, mutant: &mutants::Mutant) -> Result<Kernels, String> {
+/// The kernels compiled from the source with the mutant's edits in, and the
+/// library they came from.
+fn mutated_kernels(
+    device: &MetalDevice,
+    mutant: &mutants::Mutant,
+) -> Result<(Library, Kernels), String> {
     let text = mutants::source_of(mutant)?;
     let library = Library::from_source_text(device, &text).map_err(why)?;
-    Kernels::from_library(&library).map_err(why)
+    let kernels = Kernels::from_library(&library).map_err(why)?;
+    Ok((library, kernels))
 }
 
 /// The fixture path: `--fixture PATH`, else the qwen35moe fixture under the
@@ -343,17 +496,21 @@ pub fn main() -> ExitCode {
         },
         None => None,
     };
-    let mutated = match mutant.map(|m| mutated_kernels(&device, m)).transpose() {
-        Ok(mutated) => mutated,
-        Err(e) => {
-            println!("gate_metal_qwen35moe_kernels: the mutant does not build: {e}");
-            return ExitCode::from(64);
-        }
+    let mutated = match mutant {
+        Some(mutant) => match mutated_kernels(&device, mutant) {
+            Ok(mutated) => Some(mutated),
+            Err(e) => {
+                println!("gate_metal_qwen35moe_kernels: the mutant does not build: {e}");
+                return ExitCode::from(64);
+            }
+        },
+        None => None,
     };
     let harness = Harness {
         device: &device,
         stream,
-        kernels: mutated.as_ref().unwrap_or(&kernels),
+        kernels: mutated.as_ref().map_or(&kernels, |(_, k)| k),
+        library: mutated.as_ref().map_or(device.library(), |(l, _)| l),
     };
     if let Some(mutant) = mutant {
         println!("mutant: {} ({})", mutant.name, mutant.why);
@@ -372,7 +529,7 @@ pub fn main() -> ExitCode {
         Ok(fixture) => f(&harness, fixture),
         Err(e) => Err(e.clone()),
     };
-    let clauses: [(&'static str, ClauseRun<'_>); 10] = [
+    let clauses: [(&'static str, ClauseRun<'_>); 15] = [
         ("q4k_matvec", Box::new(|| with(clauses::q4k_matvec))),
         ("q6k_matvec", Box::new(|| with(clauses::q6k_matvec))),
         ("norm_on_load", Box::new(|| with(clauses::norm_on_load))),
@@ -398,6 +555,11 @@ pub fn main() -> ExitCode {
             Box::new(|| clauses::matvec_refusals(&harness)),
         ),
         ("block_shape", Box::new(clauses::block_shape)),
+        ("seg_bit", Box::new(|| with(clauses::seg_bit))),
+        ("seg_bounds", Box::new(|| with(clauses::seg_bounds))),
+        ("headnorm", Box::new(|| with(clauses::headnorm))),
+        ("headnorm_nan", Box::new(|| with(clauses::headnorm_nan))),
+        ("nsg", Box::new(|| with(clauses::nsg))),
     ];
     if let Some(name) = only
         && !clauses.iter().any(|(n, _)| *n == name)
