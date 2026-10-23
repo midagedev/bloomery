@@ -150,6 +150,12 @@ impl<T: Elem> MetalBuffer<T> {
         self.pages.write(host)
     }
 
+    /// Elements `at ..` of the buffer, `from`'s; a range past the end is
+    /// refused by name.
+    pub(crate) fn write_at(&mut self, at: Elems, from: &[T]) -> Result<(), DeviceError> {
+        self.pages.write_at(at, from)
+    }
+
     /// The pages the host sees.
     pub(crate) fn pages(&self) -> &HostPages<T> {
         &self.pages

@@ -25,6 +25,8 @@ pub mod buffer;
 #[cfg(target_os = "macos")]
 pub mod census;
 #[cfg(target_os = "macos")]
+pub(crate) mod checkpoint;
+#[cfg(target_os = "macos")]
 pub mod device;
 #[cfg(target_os = "macos")]
 pub mod encode;

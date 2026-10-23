@@ -18,6 +18,13 @@
 //! returns the fault by name, decoded to its layer and sites, and every later
 //! step is refused by name until [`Session::reset`].
 //!
+//! A checkpoint copies each delta layer's state lane at the position's parity
+//! and its whole conv ring. [`Session::checkpoint`] takes one at the position
+//! the session stands at, with no token ahead and the stream idle.
+//! [`Session::cut`] back to a point copies that lane and ring back and stands
+//! there; a cut to 0 is a reset, which drops the points too. A cut the ledger
+//! refuses leaves the position and every store as they were.
+//!
 //! [`Session::step_traced`] is the instrument the gates read nodes through:
 //! the same ops of a host-fed step, each on a command buffer of its own,
 //! waited, with a hook after each. It encodes what [`Session::step`]
@@ -32,18 +39,20 @@ use core::time::Duration;
 use std::path::Path;
 
 use bloomery_device::fault::Fault;
-use bloomery_device::{DeviceError, Elem, Stream};
+use bloomery_device::{DeviceError, Elem, Elems, Stream};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
 use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, kinds35};
 use chain::arch::qwen3moe::read::{PlanDims, Read35, layer_plans};
 use chain::arch::qwen3moe::walk::Walk;
 use gguf::Split;
+use runtime::seqstate::{self, Kept};
 
-use super::arena::{Arena, MixerBufs, lane_of, slot_of};
+use super::arena::{Arena, LANES, MixerBufs, lane_of, slot_of};
 use super::count::{GroupBytes, GroupKind, Layer};
 use super::ops::{Feed, MetalOps};
 use crate::buffer::MetalBuffer;
+use crate::checkpoint::{self, Checkpoints};
 use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
 use crate::kernels::{HEAD_DIM, Kernels, segments_for_keys, state_elems};
@@ -51,6 +60,18 @@ use crate::library::Library;
 use crate::stream::{GpuInterval, MetalStream, Settled, Signalled};
 
 const WHAT: &str = "qwen35moe session";
+
+/// Positions between the inner checkpoints a prompt call takes
+/// ([`runtime::seqstate::marks`]).
+///
+/// A point copies each delta layer's state lane and its conv ring.
+/// Qwen3.6-35B-A3B has 30 delta layers of 16 key heads and 32 value heads:
+/// a lane is 32·128·128 f32s (2_097_152 bytes) and a ring is
+/// 11·(2·16 + 32)·128 f32s (360_448 bytes), so a point is
+/// 30·(2_097_152 + 360_448) = 73_728_000 bytes. One copy every 256
+/// positions is 288_000 bytes beside each position of the prompt, and a
+/// cut between points re-feeds at most 255 positions.
+pub const CHECKPOINT_EVERY: u32 = 256;
 
 /// How long a profiled group's stamps wait for the completed status its
 /// settle already implied: the buffer's signal fires before the driver
@@ -143,7 +164,7 @@ pub struct StepStats {
     /// Tokens ahead a call kept: its id was their embedded pick.
     pub kept: u64,
     /// Tokens ahead waited out and dropped: a broken promise, a fault, a
-    /// reset, a traced step.
+    /// reset, a traced step, a checkpoint or a cut.
     pub discarded: u64,
     /// Chain steps at the cache's last row, which commit nothing ahead.
     pub last_row: u64,
@@ -322,17 +343,32 @@ pub struct Session {
     /// The token at `pos`, committed by the last chain step.
     ahead: Option<Ahead>,
     stats: StepStats,
+    /// Each delta layer's state lane and conv ring, at the positions a
+    /// prompt call takes.
+    checkpoints: Checkpoints,
 }
 
 impl Session {
     /// The session of the file at `path` on `device`, its pipelines from
     /// `library`, with a cache of `ctx` rows: the plan read from the file's
     /// header, every weight copied into the arena, every store at rest.
+    /// Checkpoints are taken every [`CHECKPOINT_EVERY`] positions.
     pub fn open(
         device: &MetalDevice,
         library: &Library,
         path: &Path,
         ctx: usize,
+    ) -> Result<Session, SessionError> {
+        Self::open_with(device, library, path, ctx, CHECKPOINT_EVERY)
+    }
+
+    /// [`Session::open`] with the inner checkpoints spaced `every` positions.
+    pub fn open_with(
+        device: &MetalDevice,
+        library: &Library,
+        path: &Path,
+        ctx: usize,
+        every: u32,
     ) -> Result<Session, SessionError> {
         let split = Split::open(path)
             .map_err(|e| refuse(format!("{} did not open: {e}", path.display())))?;
@@ -345,12 +381,20 @@ impl Session {
         let kernels = Kernels::from_library(library)?;
         let stream = device.new_stream()?;
         let arena = Arena::open(device.metal(), &split, &spec, &plans, ctx)?;
-        if u32::try_from(arena.ctx).is_err() {
-            return Err(refuse(format!(
+        let ctx_positions = u32::try_from(arena.ctx).map_err(|_| {
+            refuse(format!(
                 "a cache of {} rows: more than a u32 position names",
                 arena.ctx
-            )));
-        }
+            ))
+        })?;
+        let lens = store_lens(&arena)?;
+        let checkpoints = Checkpoints::open(
+            device.handle().clone(),
+            lens,
+            u64::from(ctx_positions),
+            every,
+        )
+        .map_err(checkpoint_error)?;
         let layers = arena.token_layers();
         Ok(Session {
             stream,
@@ -362,6 +406,7 @@ impl Session {
             poisoned: None,
             ahead: None,
             stats: StepStats::default(),
+            checkpoints,
         })
     }
 
@@ -688,8 +733,209 @@ impl Session {
         }
         self.pos = 0;
         self.poisoned = None;
+        self.checkpoints.clear();
         Ok(())
     }
+
+    /// The ledger's counts.
+    #[must_use]
+    pub fn checkpoint_stats(&self) -> seqstate::Stats {
+        self.checkpoints.stats()
+    }
+
+    /// The checkpoints' positions, ascending.
+    #[must_use]
+    pub fn checkpoint_positions(&self) -> Vec<u32> {
+        self.checkpoints.positions()
+    }
+
+    /// The bytes one checkpoint copies.
+    #[must_use]
+    pub fn checkpoint_bytes(&self) -> u64 {
+        self.checkpoints.point_bytes()
+    }
+
+    /// The checkpoints the budget holds.
+    #[must_use]
+    pub fn checkpoint_capacity(&self) -> usize {
+        self.checkpoints.capacity()
+    }
+
+    /// The spacing of a prompt call's inner checkpoints.
+    #[must_use]
+    pub fn checkpoint_every(&self) -> u32 {
+        self.checkpoints.every()
+    }
+
+    /// The positions a prompt call from `from` to `to` takes a checkpoint at.
+    #[must_use]
+    pub fn checkpoint_marks(&self, from: u32, to: u32) -> Vec<u32> {
+        self.checkpoints.marks(from, to)
+    }
+
+    /// What a cut to at most `n` keeps of the position the session stands at.
+    #[must_use]
+    pub fn kept(&self, n: u32) -> Kept {
+        self.checkpoints.kept(n, self.pos)
+    }
+
+    /// A checkpoint at the position, the stream idle: the token ahead is
+    /// waited out and dropped first. Refused while the session is poisoned.
+    pub fn checkpoint(&mut self) -> Result<(), SessionError> {
+        if let Some(fault) = self.poisoned {
+            return Err(SessionError::Poisoned(fault));
+        }
+        self.quiesce()?;
+        let owned = self.snapshot_stores()?;
+        let refs: Vec<&[f32]> = owned.iter().map(Vec::as_slice).collect();
+        self.checkpoints
+            .take(self.pos, &refs)
+            .map_err(checkpoint_error)
+    }
+
+    /// Cut to position `n`. A cut to 0 resets, which drops the checkpoints. A
+    /// cut to the position does nothing. A cut to a checkpoint waits out the
+    /// token ahead, copies that position's state lane and conv ring back, and
+    /// stands at `n`. Any other `n` is the ledger's refusal, by name, after
+    /// the token ahead is dropped: the position and every store stay.
+    /// Refused while the session is poisoned.
+    pub fn cut(&mut self, n: u32) -> Result<(), SessionError> {
+        if let Some(fault) = self.poisoned {
+            return Err(SessionError::Poisoned(fault));
+        }
+        if n == 0 {
+            return self.reset();
+        }
+        if n == self.pos {
+            return Ok(());
+        }
+        self.quiesce()?;
+        let mut copied = vec_of(self.checkpoints.lens());
+        {
+            let mut refs: Vec<&mut [f32]> = copied.iter_mut().map(Vec::as_mut_slice).collect();
+            self.checkpoints
+                .cut(n, self.pos, &mut refs)
+                .map_err(checkpoint_error)?;
+        }
+        self.install_stores(n, &copied)?;
+        self.pos = n;
+        Ok(())
+    }
+
+    /// The token ahead waited out and dropped, then the stream settled: a
+    /// take or a restore copies shared pages that no device work writes.
+    fn quiesce(&mut self) -> Result<(), SessionError> {
+        if let Some(a) = self.ahead.take() {
+            self.drop_ahead(a)?;
+        }
+        self.stream.sync()?;
+        Ok(())
+    }
+
+    /// Each delta layer's state lane at the position's parity, then its ring.
+    fn snapshot_stores(&self) -> Result<Vec<Vec<f32>>, SessionError> {
+        let lane_len = lane_len()?;
+        let start = lane_of(self.pos)
+            .checked_mul(lane_len)
+            .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
+        let mut out = Vec::new();
+        for layer in &self.arena.layers {
+            let MixerBufs::Delta(d) = &layer.mixer else {
+                continue;
+            };
+            let mut lane = vec![0.0; lane_len];
+            d.state.pages().read_at(Elems(start), &mut lane)?;
+            out.push(lane);
+            out.push(d.ring.pages().to_vec());
+        }
+        Ok(out)
+    }
+
+    /// `copied` back into lane `lane_of(n)` of each delta state, and into the
+    /// whole ring. The other lane is the one the next token writes, so it is
+    /// left as it is.
+    fn install_stores(&mut self, n: u32, copied: &[Vec<f32>]) -> Result<(), SessionError> {
+        let lane_len = lane_len()?;
+        let start = lane_of(n)
+            .checked_mul(lane_len)
+            .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
+        let mut i = 0;
+        for layer in &mut self.arena.layers {
+            let MixerBufs::Delta(d) = &mut layer.mixer else {
+                continue;
+            };
+            let lane_src = copied
+                .get(i)
+                .ok_or_else(|| refuse("a restore is short a state lane"))?;
+            let ring_src = copied
+                .get(i + 1)
+                .ok_or_else(|| refuse("a restore is short a conv ring"))?;
+            i += 2;
+            if lane_src.len() != lane_len {
+                return Err(refuse(format!(
+                    "a restored state lane is {} f32s; a lane is {lane_len}",
+                    lane_src.len()
+                )));
+            }
+            d.state.write_at(Elems(start), lane_src)?;
+            d.ring.write(ring_src)?;
+        }
+        if i != copied.len() {
+            return Err(refuse(format!(
+                "a restore of {} stores; the delta layers take {i}",
+                copied.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn checkpoint_error(e: checkpoint::Error) -> SessionError {
+    match e {
+        checkpoint::Error::Device(e) => SessionError::Device(e),
+        other => refuse(other.to_string()),
+    }
+}
+
+/// f32s of one delta state lane.
+fn lane_len() -> Result<usize, SessionError> {
+    state_elems(1).ok_or_else(|| refuse("a delta state lane's length overflowed"))
+}
+
+/// One zeroed buffer per copied store.
+fn vec_of(lens: &[usize]) -> Vec<Vec<f32>> {
+    lens.iter().map(|&n| vec![0.0; n]).collect()
+}
+
+/// Each delta layer's state lane, then its conv ring. The state buffer is
+/// both lanes; a checkpoint copies one.
+fn store_lens(arena: &Arena) -> Result<Vec<usize>, SessionError> {
+    let lane_len = lane_len()?;
+    let both = lane_len
+        .checked_mul(LANES)
+        .ok_or_else(|| refuse("the delta state's length overflowed"))?;
+    let mut lens = Vec::new();
+    for layer in &arena.layers {
+        let MixerBufs::Delta(d) = &layer.mixer else {
+            continue;
+        };
+        let state_len = d.state.pages().len().get();
+        if state_len != both {
+            return Err(refuse(format!(
+                "a delta state of {state_len} f32s; {LANES} lanes of {lane_len} are {both}"
+            )));
+        }
+        let ring_len = d.ring.pages().len().get();
+        if ring_len == 0 {
+            return Err(refuse("a conv ring of no f32s"));
+        }
+        lens.push(lane_len);
+        lens.push(ring_len);
+    }
+    if lens.is_empty() {
+        return Err(refuse("a checkpoint copies no delta layer"));
+    }
+    Ok(lens)
 }
 
 /// The traced step's ops: each op of [`MetalOps`] on its own command buffer,

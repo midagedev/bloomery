@@ -20,19 +20,22 @@
 //!   and the argmax is the row's own by the head's tie rule (the smaller id
 //!   at an equal value).
 //! - `prompt`, the ids one host-fed step each — the session has no batched
-//!   prompt schedule — read back after the last as asked.
+//!   prompt schedule — and a checkpoint at each position
+//!   [`runtime::seqstate::marks`] names: the call's start when the session
+//!   already holds one, every
+//!   [`CHECKPOINT_EVERY`](super::session::CHECKPOINT_EVERY) positions inside,
+//!   and the call's end. The row is read back after the last as asked.
 //!
 //! What it refuses:
 //!
 //! - a prompt of no ids, and one that would pass the cache's last row,
 //!   before any step runs;
-//! - a cut to any position between 0 and the position: the session keeps no
-//!   checkpoint of the delta state (a later round adds them), so `keepable`
-//!   is everything it stands at, the empty model at 0, and nothing between;
-//!   a cut to the position does nothing and a cut to 0 resets;
+//! - a cut where no checkpoint stands between 0 and the position (the
+//!   ledger's refusal, by name); a cut to the position does nothing and a
+//!   cut to 0 resets;
 //! - every mutating call of a session a fault poisoned, until `reset`.
 
-use runtime::seqstate::{Kept, Why};
+use runtime::seqstate::Kept;
 use runtime::{Out, Target, Want};
 
 use super::session::{Session, SessionError, StepMode};
@@ -74,13 +77,32 @@ impl Target for Session {
                 Session::ctx(self)
             )));
         }
-        let (last, leading) = ids
-            .split_last()
-            .expect("a non-empty prompt holds a last id");
-        for &id in leading {
-            Session::step(self, id, StepMode::HostFed)?;
+        let from = Session::pos(self);
+        let to = u32::try_from(end).map_err(|_| {
+            refuse(format!(
+                "a prompt of {} ids at position {from} passes the u32 positions",
+                ids.len()
+            ))
+        })?;
+        // The id at an inner mark is stepped by the next span, after the take.
+        let marks = self.checkpoint_marks(from, to);
+        let mut at = from;
+        let mut last_pick = None;
+        for m in marks {
+            let start = (at - from) as usize;
+            let end_i = (m - from) as usize;
+            for &id in &ids[start..end_i] {
+                last_pick = Some(Session::step(self, id, StepMode::HostFed)?.id);
+            }
+            Session::checkpoint(self)?;
+            at = m;
         }
-        let pick = Session::step(self, *last, StepMode::HostFed)?.id;
+        let pick = last_pick.ok_or_else(|| {
+            refuse(format!(
+                "a prompt of {} ids at position {from} stepped no id",
+                ids.len()
+            ))
+        })?;
         read(self, pick, want)
     }
 
@@ -101,39 +123,11 @@ impl Target for Session {
     }
 
     fn kept(&self, n: u32) -> Kept {
-        let held = Session::pos(self);
-        // The delta state is one live lane pair every token writes in place;
-        // no copy of it lies anywhere, at or below any position.
-        let (at, why) = if n == 0 {
-            (0, Why::Empty)
-        } else if n >= held {
-            (held, Why::Current)
-        } else {
-            (0, Why::Missed { lost: None })
-        };
-        Kept {
-            asked: n,
-            held,
-            at,
-            why,
-        }
+        Session::kept(self, n)
     }
 
     fn cut(&mut self, n: u32) -> Result<(), SessionError> {
-        if let Some(fault) = self.poisoned() {
-            return Err(SessionError::Poisoned(fault));
-        }
-        if n == 0 {
-            return Session::reset(self);
-        }
-        if n == Session::pos(self) {
-            return Ok(());
-        }
-        Err(refuse(format!(
-            "a cut to position {n}: the session keeps no checkpoint of the delta state below \
-             position {}",
-            Session::pos(self)
-        )))
+        Session::cut(self, n)
     }
 
     fn reset(&mut self) -> Result<(), SessionError> {
