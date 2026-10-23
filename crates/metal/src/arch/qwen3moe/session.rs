@@ -797,7 +797,8 @@ impl Session {
     /// cut to the position does nothing. A cut to a checkpoint waits out the
     /// token ahead, copies that position's state lane and conv ring back, and
     /// stands at `n`. Any other `n` is the ledger's refusal, by name, after
-    /// the token ahead is dropped: the position and every store stay.
+    /// the token ahead is dropped: the position and every store stay. A copy
+    /// back that fails resets the session before the error returns.
     /// Refused while the session is poisoned.
     pub fn cut(&mut self, n: u32) -> Result<(), SessionError> {
         if let Some(fault) = self.poisoned {
@@ -817,7 +818,14 @@ impl Session {
                 .cut(n, self.pos, &mut refs)
                 .map_err(checkpoint_error)?;
         }
-        self.install_stores(n, &copied)?;
+        if let Err(e) = self.install_stores(n, &copied) {
+            // A copy that stopped midway leaves some layers at `n` and the
+            // rest where they were: reset, so no step runs on mixed state.
+            return Err(match self.reset() {
+                Ok(()) => e,
+                Err(r) => refuse(format!("{e}; and the reset after it failed: {r}")),
+            });
+        }
         self.pos = n;
         Ok(())
     }
