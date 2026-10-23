@@ -8,23 +8,23 @@
 //! as `RSQRT_ULP` units in the last place of 1 (2 ulp = 4U), the same
 //! unverified premise as the mat-vec oracle.
 //!
-//! **One split's dot.** A lane holds 32 products (8 float4 values): a gain
-//! product and a weight product on each, then 31 adds. The SIMD group's sum
-//! is 31 more, the scale multiplies once, and the last threadgroup adds split
-//! 0 to split 1. `n_dot = 66`, `g = G(66)`.
+//! **One row's dot.** A lane holds 64 products (16 float4 values): a gain
+//! product and a weight product on each, then 63 adds. The SIMD group's sum
+//! is 31 more and the scale multiplies once: no split add, one SIMD group
+//! owns a whole row. `n_dot = 97`, `g = G(97)`.
 //!
-//! **The scale.** Each SIMD group sums 64 squares (16 float4 values): the
-//! square, 63 adds, and 31 adds of the SIMD group, `n_S = 95`. The argument
-//! of `rsqrt` is that sum divided by K (a power of two) plus eps, counted as
-//! two more roundings the way the mat-vec oracle counts them, `t = G(97)`.
-//! The scale is off by at most `(1 - t)^(-1/2) - 1` in the worse direction,
-//! plus the library `rsqrt`. `theta_s` is that sum. The factor on
-//! `sum_c |w_c xhat_c|` is `theta_s + g + theta_s * g`, with
-//! `xhat = scale * gain * x` in f64. The absolute floor is one minimum
-//! positive f32 per operation of the path (`97 + 66`). The written partial is
-//! the f32 value the last threadgroup adds; that add is the last operation
-//! of `n_dot`. The magnitude is multiplied by `1 + U`, as the mat-vec oracle
-//! multiplies its own.
+//! **The scale.** The norm is the threadgroup's: a lane squares its 8 values
+//! (2 float4 values), 7 adds, the SIMD group's 31, and one thread adds the 8
+//! SIMD groups' shares, `n_S = 46`. The argument of `rsqrt` is that sum
+//! divided by K (a power of two) plus eps, counted as two more roundings the
+//! way the mat-vec oracle counts them, `t = G(48)`. The scale is off by at
+//! most `(1 - t)^(-1/2) - 1` in the worse direction, plus the library
+//! `rsqrt`. `theta_s` is that sum. The factor on `sum_c |w_c xhat_c|` is
+//! `theta_s + g + theta_s * g`, with `xhat = scale * gain * x` in f64. The
+//! absolute floor is one minimum positive f32 per operation of the path
+//! (`48 + 97`). The written partial is the f32 value the last threadgroup
+//! reads; that read adds no operation. The magnitude is multiplied by
+//! `1 + U`, as the mat-vec oracle multiplies its own.
 //!
 //! **Ids.** The f64 ranking sorts the 256 expert logits descending and breaks
 //! a tie toward the smaller id. The 8th-vs-9th margin is wider than the band
@@ -57,24 +57,27 @@ use super::oracle::{self, RSQRT_ULP, U};
 /// `exp` under the precise f32 functions, in ulp of the result.
 const EXP_ULP: f64 = 4.0;
 
-const LANE_PRODUCTS: usize = 32;
+const LANE_PRODUCTS: usize = 64;
 const LANE_ADDS: usize = LANE_PRODUCTS - 1;
 const SIMD_SUM_DEPTH: usize = 31;
-/// Gain product, weight product, the lane's adds, the SIMD group's adds, the
-/// scale product, and the split add.
+/// Gain product, weight product, the lane's adds, the SIMD group's adds, and
+/// the scale product.
 ///
-/// PIN(2026-10-22): the model in this module's doc, and no measured error,
-/// sets the band's counts.
-const N_DOT: usize = 1 + 1 + LANE_ADDS + SIMD_SUM_DEPTH + 1 + 1;
-const SQUARES: usize = 64;
-/// The square, the lane's adds of the squares, and the SIMD group's adds.
-const N_S: usize = 1 + (SQUARES - 1) + SIMD_SUM_DEPTH;
+/// PIN(2026-10-23): the geometry's change to one row a SIMD group with the
+/// norm once per threadgroup (no split add, 64 products a lane) sets the
+/// band's counts; the model is this module's doc.
+const N_DOT: usize = 1 + 1 + LANE_ADDS + SIMD_SUM_DEPTH + 1;
+/// The values a lane squares for the threadgroup's norm.
+const SQUARES: usize = 8;
+/// The square, the lane's adds of the squares, the SIMD group's adds, and the
+/// one thread's adds of the SIMD groups' shares.
+const N_S: usize = 1 + (SQUARES - 1) + SIMD_SUM_DEPTH + (8 - 1);
 /// The division by K and the epsilon, counted with the sum of squares.
 const N_ARG: usize = N_S + 2;
 
-const _: () = assert!(N_DOT == 66);
-const _: () = assert!(N_S == 95);
-const _: () = assert!(N_ARG == 97);
+const _: () = assert!(N_DOT == 97);
+const _: () = assert!(N_S == 46);
+const _: () = assert!(N_ARG == 48);
 const _: () = assert!(K == 2048);
 const _: () = assert!(ROWS == EXPERTS + 1);
 const _: () = assert!(TOP_K_MAX == 8);

@@ -39,7 +39,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "q4k_dmin_sign",
         clause: "q4k_matvec",
         why: "the dmin correction is added, not subtracted",
-        edits: &[("1.f/16.f) -\n", "1.f/16.f) +\n", 1)],
+        edits: &[("1.f/16.f) -\n", "1.f/16.f) +\n", 3)],
     },
     Mutant {
         name: "q6k_offset",
@@ -147,7 +147,7 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "headnorm_no_raise",
         clause: "headnorm_nan",
-        why: "a head the norm cannot take raises nothing",
+        why: "a head the norm cannot take, and a group sum the row loop cannot take, raise nothing",
         edits: &[
             (
                 "raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",
@@ -234,8 +234,18 @@ pub const MUTANTS: &[Mutant] = &[
     Mutant {
         name: "router_bad",
         clause: "router_nan",
-        why: "a non-finite logit's word does not cross the threadgroup",
-        edits: &[("flags[sg_in_tg] = mine_bad;", "flags[sg_in_tg] = 0u;", 1)],
+        why: "a non-finite logit's word does not cross the lanes",
+        edits: &[("mine_bad |= isfinite(l) ? 0u : 1u;", "mine_bad |= 0u;", 1)],
+    },
+    Mutant {
+        name: "router_norm_no_raise",
+        clause: "router_norm_nan",
+        why: "a norm the threadgroup cannot take raises nothing",
+        edits: &[(
+            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);",
+            "",
+            1,
+        )],
     },
     Mutant {
         name: "pair_no_silu",

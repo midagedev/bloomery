@@ -608,6 +608,55 @@ pub fn router_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     ))
 }
 
+/// The input the norm cannot take: every threadgroup's rows write NaN
+/// partials, the tail's router site joins the norm site in the fault word,
+/// and the outputs are the non-finite set. The norm is the threadgroup's, so
+/// the clause pins the whole threadgroup's rows going NaN together.
+pub fn router_norm_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    h.clear_fault()?;
+    let weights = load_weights(fixture)?;
+    let mut x = oracle::activations(K, 1, 0.5);
+    x[17] = f32::INFINITY;
+    let out = run(
+        h,
+        &weights.routed,
+        &weights.shared,
+        &x,
+        &weights.gain,
+        weights.eps,
+    )?;
+    let both = (1u32 << (FaultSite::NormQuant as u32)) | (1u32 << (FaultSite::Router as u32));
+    match h.fault()? {
+        Some(f) if f.layer == LAYER && f.sites == both => {}
+        Some(f) => {
+            return Err(format!(
+                "a non-finite input raised {f}, not the norm and router sites in layer {LAYER}"
+            ));
+        }
+        None => {
+            return Err("a non-finite input raised nothing".to_string());
+        }
+    }
+    if let Some(r) = out.logits.iter().position(|v| v.is_finite()) {
+        return Err(format!("logit {r} is {:?}, not NaN", out.logits[r]));
+    }
+    for (s, &id) in out.ids.iter().enumerate() {
+        if s < TOP_K {
+            if id >= EXPERTS as u32 {
+                return Err(format!("slot {s} id {id} is past the routed experts"));
+            }
+        } else if id != EXPERTS as u32 {
+            return Err(format!("shared id {id}, the shared expert is {EXPERTS}"));
+        }
+    }
+    if let Some(s) = out.weights.iter().position(|w| w.is_finite()) {
+        return Err(format!("slot {s} weight {} is finite", out.weights[s]));
+    }
+    Ok(Verdict::Noted(
+        "norm and router sites, every logit NaN, ids in range, weights non-finite".to_string(),
+    ))
+}
+
 /// The launch of one case: a shape, an epsilon or a window, one of them bad.
 #[derive(Clone, Copy)]
 struct Args {
@@ -797,6 +846,7 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::Cla
         ("router_weights", Box::new(|| ctx.with(router_weights))),
         ("router_ticket", Box::new(|| ctx.with(router_ticket))),
         ("router_nan", Box::new(|| ctx.with(router_nan))),
+        ("router_norm_nan", Box::new(|| ctx.with(router_norm_nan))),
         ("router_bounds", Box::new(|| router_bounds(ctx.harness))),
     ]
 }
