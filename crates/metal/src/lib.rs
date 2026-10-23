@@ -2,8 +2,8 @@
 //! over `objc2-metal`.
 //!
 //! On another operating system the device modules are not built (and the
-//! gate bin only refuses). [`arch`] is host arithmetic and builds on every
-//! target, so the workspace still checks on Linux.
+//! gate bin only refuses). [`arch`] is host arithmetic and [`server`] host
+//! code; both build on every target, so the workspace still checks on Linux.
 //!
 //! The backend's own choices:
 //!
@@ -17,6 +17,8 @@ pub mod arch;
 /// launch (macOS) and by the token count (every OS).
 #[path = "kernels/attention_geom.rs"]
 pub mod attention_geom;
+/// The server's engine over any `runtime::Target`, host code: every OS.
+pub mod server;
 
 #[cfg(target_os = "macos")]
 pub mod buffer;

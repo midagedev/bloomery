@@ -33,6 +33,10 @@ path = "src/bin/metal_attention_time.rs"
 name = "generate_metal"
 path = "src/bin/generate_metal.rs"
 
+[[bin]]
+name = "bloomery-serve-metal"
+path = "src/bin/bloomery_serve_metal.rs"
+
 [lints]
 workspace = true
 
@@ -41,6 +45,12 @@ workspace = true
 # census of the devices a backend opens).
 bloomery-device = { path = "../device" }
 bloomery-placement = { path = "../placement" }
+# The generation loop's target (`arch/qwen3moe/target.rs`) and the server's
+# engine over any target (`server.rs`, every OS: host code only): the loop,
+# its stop rule and its cut reasons, and the HTTP API's `Engine`, the file's
+# vocabulary and the sampler chain, every seat's owners.
+bloomery-runtime = { path = "../runtime" }
+bloomery-serve = { path = "../serve" }
 
 # The Objective-C bindings, macOS only: on another operating system the
 # library is empty and the gate bin only refuses, so these are never built.
@@ -58,9 +68,6 @@ bloomery-model = { path = "../model" }
 # Where the fixture file sits (the one owner of the fixture root and layout),
 # and the e2e gate's oracle: ik's reference sets, opened through their family.
 bloomery-refset = { path = "../refset" }
-# The session as the generation loop's target (`arch/qwen3moe/target.rs`):
-# the loop, its stop rule and its cut reasons, all host-only.
-bloomery-runtime = { path = "../runtime" }
 # The generation CLI's own owners, host-only: the file's vocabulary (the
 # prompt's encode, the streamed decode, the end-of-generation set) and the
 # lever rows a binary parses at main (this CLI acts on none).

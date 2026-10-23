@@ -1,0 +1,205 @@
+//! `bloomery-serve-metal` — the llama-server-compatible HTTP API on this
+//! Mac's Metal device: a qwen35moe file opened as `generate_metal` opens it,
+//! served by `bloomery_metal::server::TargetEngine`.
+//!
+//!     bloomery-serve-metal -m PATH [--host 127.0.0.1] [--port 8080] [--ctx C]
+//!                          [--chat-template-file PATH] [--alias NAME]
+//!                          [--queue-depth Q] [--api-key KEY] [--api-key-file F]
+//!
+//! `--ctx-size` and `-c` are `--ctx` under llama-server's spellings; unset,
+//! the cache holds the smaller of 32768 rows and the file's
+//! `context_length`. The file's first shard gives the vocabulary,
+//! `tokenizer.chat_template` the chat template (`--chat-template-file`
+//! replaces it) and `general.name` the alias (`--alias` replaces it).
+//! Sampling is the sampler crate's chain; `temperature <= 0` is the
+//! session's argmax, the ids `generate_metal --tokens` picks for the same
+//! prompt ids.
+//!
+//! One slot: the session is one sequence. A request keeps what the slot
+//! holds only when it extends it (the session keeps no checkpoint of its
+//! recurrent state below its position); any other runs its prompt from
+//! position 0. The prompt runs one host-fed step a id. No prompt cache, no
+//! slot files, no image input.
+//!
+//! A bad flag or value is a named error and exit 64; a refusal of the file,
+//! the device or the session is a named error and exit 1; an engine failure
+//! while serving ends the run with exit 70. The body is macOS only;
+//! elsewhere it refuses and exits 78.
+
+#[cfg(target_os = "macos")]
+fn main() -> std::process::ExitCode {
+    cli::run()
+}
+
+#[cfg(target_os = "macos")]
+mod cli {
+    use std::path::PathBuf;
+    use std::process::ExitCode;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use bloomery_metal::MetalDevice;
+    use bloomery_metal::arch::qwen3moe::session::Session;
+    use bloomery_metal::server::TargetEngine;
+    use serve::flag::{self, ApiKeys};
+    use serve::sampling::sampler_factory;
+    use serve::vocab::{ChatSurface, TemplateFile, Vocab};
+    use serve::{EngineProps, FATAL_LINGER, ServeError, Server, ServerConfig, SlotConfig};
+
+    /// The cache rows' default cap.
+    const CTX_DEFAULT: usize = 32768;
+
+    const USAGE: &str = "\
+bloomery-serve-metal -m PATH [--host H] [--port P] [--ctx C] [--chat-template-file PATH]
+                     [--alias NAME] [--queue-depth Q] [--api-key KEY] [--api-key-file F]
+  --ctx (--ctx-size, -c) defaults to the smaller of 32768 and the file's context_length";
+
+    struct Args {
+        model: PathBuf,
+        host: String,
+        port: u16,
+        ctx: Option<usize>,
+        template_file: TemplateFile,
+        alias: Option<String>,
+        queue_depth: Option<usize>,
+        api_keys: ApiKeys,
+    }
+
+    fn parse() -> Result<Args, String> {
+        let mut model = None;
+        let mut a = Args {
+            model: PathBuf::new(),
+            host: "127.0.0.1".to_owned(),
+            port: 8080,
+            ctx: None,
+            template_file: TemplateFile::default(),
+            alias: None,
+            queue_depth: None,
+            api_keys: ApiKeys::default(),
+        };
+        let mut it = std::env::args().skip(1);
+        while let Some(f) = it.next() {
+            let mut val = || it.next().ok_or_else(|| format!("{f} needs a value"));
+            match f.as_str() {
+                "-m" | "--model" => model = Some(PathBuf::from(val()?)),
+                "--host" => a.host = val()?,
+                "--port" => a.port = flag::number(&f, &val()?)?,
+                c if flag::CTX.contains(&c) => a.ctx = Some(flag::number(&f, &val()?)?),
+                TemplateFile::FLAG => a.template_file.set(&val()?),
+                "--alias" => a.alias = Some(val()?),
+                "--queue-depth" => a.queue_depth = Some(flag::number(&f, &val()?)?),
+                k if flag::KEYS.contains(&k) => a.api_keys.add(&f, &val()?)?,
+                "--help" | "-h" => return Err(USAGE.to_owned()),
+                other => return Err(format!("unknown flag {other}\n{USAGE}")),
+            }
+        }
+        a.model = model.ok_or_else(|| format!("-m PATH is required\n{USAGE}"))?;
+        Ok(a)
+    }
+
+    pub(super) fn run() -> ExitCode {
+        if let Err(e) = bloomery_levers::at_main(&[]) {
+            eprintln!("bloomery-serve-metal: {e}");
+            return ExitCode::from(1);
+        }
+        let a = match parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("bloomery-serve-metal: {e}");
+                return ExitCode::from(64);
+            }
+        };
+        let server = match open(a) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("bloomery-serve-metal: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let e = server.run();
+        eprintln!("bloomery-serve-metal: {e}");
+        match e {
+            // EX_SOFTWARE: the engine, not the listener, ended the run.
+            ServeError::Engine(_) => ExitCode::from(70),
+            ServeError::Io(_)
+            | ServeError::Template(_)
+            | ServeError::SlotSavePath(_)
+            | ServeError::NoStops
+            | ServeError::Slots(_) => ExitCode::from(1),
+        }
+    }
+
+    fn open(a: Args) -> Result<Server, String> {
+        let path = &a.model;
+        let split = gguf::Split::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let ctx = match a.ctx {
+            Some(c) => c,
+            None => {
+                let train = split
+                    .arch_get_u64("context_length")
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "{}: {} is absent or not a count",
+                            path.display(),
+                            split.arch_key("context_length")
+                        )
+                    })?;
+                CTX_DEFAULT.min(train)
+            }
+        };
+        let ChatSurface { template, name } = ChatSurface::read(
+            path,
+            split.value("tokenizer.chat_template"),
+            split.value("general.name"),
+            a.template_file.path(),
+            "qwen35moe",
+        )?;
+        drop(split);
+        let tok = tokenizer::Tokenizer::from_gguf(path).map_err(|e| e.to_string())?;
+        let vocab = Arc::new(Vocab::new(tok)?);
+        let device = MetalDevice::open().map_err(|e| e.to_string())?;
+        let t0 = Instant::now();
+        let session =
+            Session::open(&device, device.library(), path, ctx).map_err(|e| e.to_string())?;
+        eprintln!(
+            "bloomery-serve-metal: opened {} in {:.1} s, ctx {ctx}",
+            path.display(),
+            t0.elapsed().as_secs_f64()
+        );
+        let head_rows = session.vocab();
+        let engine = TargetEngine::new(
+            session,
+            head_rows,
+            vocab,
+            "metal qwen35moe session".to_owned(),
+            EngineProps::default(),
+        )?;
+        let config = ServerConfig {
+            model_alias: a.alias.unwrap_or(name),
+            model_path: path.display().to_string(),
+            chat_template: template,
+            chat_preparation: None,
+            sampler: Some(sampler_factory()),
+            fatal_linger: FATAL_LINGER,
+            slot_save_path: None,
+            api_keys: a.api_keys,
+        };
+        let slots = SlotConfig {
+            parallel: 1,
+            queue_depth: a.queue_depth,
+            ..SlotConfig::default()
+        };
+        let server = Server::bind_with((a.host.as_str(), a.port), Box::new(engine), config, slots)
+            .map_err(|e| e.to_string())?;
+        let addr = server.local_addr().map_err(|e| e.to_string())?;
+        eprintln!("bloomery-serve-metal: listening on http://{addr}");
+        Ok(server)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() -> std::process::ExitCode {
+    eprintln!("bloomery-serve-metal: refused: the Metal server runs on macOS only");
+    std::process::ExitCode::from(78)
+}
