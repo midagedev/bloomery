@@ -11,14 +11,6 @@ use super::fixture::Fixture;
 use super::oracle;
 use super::{Harness, Launch, ModeSpec, SENTINEL_BITS, SegLaunch};
 
-/// The ggml type a mat-vec reads.
-fn ggml_type(quant: Quant) -> GgmlType {
-    match quant {
-        Quant::Q4K => GgmlType::Q4_K,
-        Quant::Q6K => GgmlType::Q6_K,
-    }
-}
-
 /// The groups of the segmented launch: the tensors of one type and one width
 /// that a layer's projections are.
 struct SegGroup {
@@ -66,7 +58,7 @@ pub fn seg_bit(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         let mut segments: Vec<(usize, &[u8])> = Vec::new();
         let mut rows = 0usize;
         for (name, n) in &group.tensors {
-            segments.push((*n, fixture.rows(name, ggml_type(group.quant), cols, *n)?));
+            segments.push((*n, fixture.rows(name, group.quant.ggml(), cols, *n)?));
             rows += n;
         }
         let got = h.seg(&SegLaunch {

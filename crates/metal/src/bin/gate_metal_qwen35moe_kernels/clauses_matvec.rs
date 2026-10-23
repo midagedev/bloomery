@@ -470,6 +470,13 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
             whole,
         ),
         bad(
+            "columns past the kernels' signed 32-bit index",
+            "signed 32-bit",
+            |a| a.cols = (1usize << 31) + BLOCK_VALUES,
+            h,
+            whole,
+        ),
+        bad(
             "no rows",
             "empty",
             |a| {
@@ -507,18 +514,12 @@ pub fn matvec_refusals(h: &Harness<'_>) -> Clause {
 }
 
 /// The block shape the kernels are written for is gguf's own row for each
-/// type: this crate keeps a second copy of the two numbers (the launch's
-/// shape arithmetic), and the clause holds it to the first.
+/// type: the bytes are gguf's row by construction ([`Quant::block_bytes`]
+/// reads it), and this crate's own count of the values a block holds is
+/// held to the same row.
 pub fn block_shape() -> Clause {
-    for (quant, ty) in [(Quant::Q4K, GgmlType::Q4_K), (Quant::Q6K, GgmlType::Q6_K)] {
-        if Some(quant.block_bytes() as u64) != ty.type_size() {
-            return Err(format!(
-                "{} blocks are {} bytes here and {:?} in gguf",
-                quant.name(),
-                quant.block_bytes(),
-                ty.type_size()
-            ));
-        }
+    for quant in [Quant::Q4K, Quant::Q6K] {
+        let ty = quant.ggml();
         if Some(BLOCK_VALUES as u64) != ty.blck_size() {
             return Err(format!(
                 "{} blocks hold {BLOCK_VALUES} values here and {:?} in gguf",
@@ -528,7 +529,8 @@ pub fn block_shape() -> Clause {
         }
     }
     Ok(Verdict::Noted(
-        "Q4_K and Q6_K block bytes and values are gguf's".to_string(),
+        "Q4_K and Q6_K blocks hold gguf's 256 values; their bytes are gguf's by construction"
+            .to_string(),
     ))
 }
 

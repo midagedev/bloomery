@@ -37,7 +37,6 @@ const ROWS_PER_THREADGROUP: usize = HEAD_SIMD_GROUPS * ROWS_PER_SIMD_GROUP;
 const _: () = assert!(ROWS_PER_THREADGROUP == 16);
 const _: () = assert!(HEAD_THREADS == 32 * HEAD_SIMD_GROUPS);
 const _: () = assert!(HEAD_GROUPS * ROWS_PER_THREADGROUP == HEAD_VOCAB);
-const _: () = assert!(HEAD_VOCAB * (HEAD_K / 256) * Quant::Q6K.block_bytes() == 417_177_600);
 
 /// One head launch.
 pub struct HeadParams<'w> {

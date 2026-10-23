@@ -43,13 +43,6 @@ fn ffn_norm(fix: &Fixture) -> Result<PairNorm, String> {
     })
 }
 
-fn ggml(quant: Quant) -> GgmlType {
-    match quant {
-        Quant::Q4K => GgmlType::Q4_K,
-        Quant::Q6K => GgmlType::Q6_K,
-    }
-}
-
 fn row_bytes(quant: Quant, cols: usize) -> usize {
     cols / BLOCK_VALUES * quant.block_bytes()
 }
@@ -98,7 +91,7 @@ fn plane(
 /// fixture, so each expert is one Q6_K down expert's blocks, read as 512 by
 /// 2048: the byte length is the same.
 fn pair_weights(fix: &Fixture, quant: Quant) -> Result<PairWeights, String> {
-    let ty = ggml(quant);
+    let ty = quant.ggml();
     let weights = match quant {
         Quant::Q4K => PairWeights {
             gate: stack(
@@ -172,7 +165,7 @@ struct FoldWeights {
 }
 
 fn fold_weights(fix: &Fixture, quant: Quant) -> Result<FoldWeights, String> {
-    let ty = ggml(quant);
+    let ty = quant.ggml();
     let (name, shared) = match quant {
         Quant::Q4K => ("blk.0.ffn_down_exps.weight", "blk.0.ffn_down_shexp.weight"),
         Quant::Q6K => ("blk.2.ffn_down_exps.weight", "blk.2.ffn_down_shexp.weight"),

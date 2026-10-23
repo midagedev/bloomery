@@ -35,7 +35,10 @@ struct block_q6_K {
 
 static_assert(sizeof(block_q6_K) == 210, "block_q6_K is 210 bytes");
 
-template <bool NORM, bool RESID>
+// ROW_RAISE: a norm-on-load row the scaled sum leaves not finite raises the
+// norm site and is NaN. The head turns it off: its argmax owns a non-finite
+// logit and raises the logit site for it.
+template <bool NORM, bool RESID, bool ROW_RAISE = true>
 inline void q6k_rows(device const block_q6_K * W,
                       device const float      * x,
                       device float            * y,
@@ -147,8 +150,8 @@ inline void q6k_rows(device const block_q6_K * W,
         if (tiisg == 0) {
             // A row the scaled sum leaves not finite (a gain or a weight that is
             // not finite) raises the norm site and is NaN, not a plausible value.
-            if (NORM && !isfinite(sum_all)) {
-                raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+            if (NORM && ROW_RAISE && !isfinite(sum_all)) {
+                raise(faults, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
                 y[first_row + row] = NAN;
             } else if (RESID) {
                 y[first_row + row] += sum_all;

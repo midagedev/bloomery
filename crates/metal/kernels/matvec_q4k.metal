@@ -218,7 +218,7 @@ inline void q4k_rows(device const block_q4_K * W,
             // A row the scaled sum leaves not finite (a gain or a weight that is
             // not finite) raises the norm site and is NaN, not a plausible value.
             if (NORM && !isfinite(sum_all)) {
-                raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+                raise(faults, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
                 y[first_row + row] = NAN;
             } else if (RESID) {
                 y[first_row + row] += sum_all;

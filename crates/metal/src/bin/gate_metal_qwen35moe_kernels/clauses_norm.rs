@@ -101,20 +101,62 @@ pub fn norm_on_load(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     .map_err(|e| format!("an input whose mean square is near eps {eps}: {e}"))?;
     parts.push(format!("small input {worst:.3}"));
 
-    // Input the norm cannot take: each raises the norm site of the layer and
-    // writes NaN to every row.
-    for (what, mut x, eps) in [
-        ("a NaN input", oracle::activations(t.cols, 1, 1.0), eps),
+    // Input, epsilon or gain a norm cannot take: each raises the norm site
+    // of the layer and writes NaN to every row. The infinite epsilon, the
+    // NaN gain and the infinite gain run on both weight types, which share
+    // the predicates.
+    for (t, what, mut x, eps) in [
+        (t, "a NaN input", oracle::activations(t.cols, 1, 1.0), eps),
         (
+            t,
             "an infinite input",
             oracle::activations(t.cols, 2, 1.0),
             eps,
         ),
-        ("a zero input and a zero epsilon", vec![0f32; t.cols], 0.0),
+        (
+            t,
+            "a zero input and a zero epsilon",
+            vec![0f32; t.cols],
+            0.0,
+        ),
+        (
+            t,
+            "an infinite epsilon",
+            oracle::activations(t.cols, 3, 1.0),
+            f32::INFINITY,
+        ),
+        (
+            common::Tensor::q6k("blk.2.ffn_down_shexp.weight", 512, 2048),
+            "an infinite epsilon",
+            oracle::activations(512, 3, 1.0),
+            f32::INFINITY,
+        ),
+        (t, "a NaN gain", oracle::activations(t.cols, 4, 1.0), eps),
+        (
+            t,
+            "an infinite gain",
+            oracle::activations(t.cols, 5, 1.0),
+            eps,
+        ),
+        (
+            common::Tensor::q6k("blk.2.ffn_down_shexp.weight", 512, 2048),
+            "a NaN gain",
+            oracle::activations(512, 4, 1.0),
+            eps,
+        ),
+        (
+            common::Tensor::q6k("blk.2.ffn_down_shexp.weight", 512, 2048),
+            "an infinite gain",
+            oracle::activations(512, 5, 1.0),
+            eps,
+        ),
     ] {
+        let mut gain = common::gain_for(fixture, None, t.cols, 0x6B0)?;
         match what {
             "a NaN input" => x[17] = f32::NAN,
             "an infinite input" => x[t.cols - 1] = f32::INFINITY,
+            "a NaN gain" => gain[0] = f32::NAN,
+            "an infinite gain" => gain[t.cols - 1] = f32::INFINITY,
             _ => {}
         }
         h.clear_fault()?;

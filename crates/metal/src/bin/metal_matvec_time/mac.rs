@@ -87,7 +87,6 @@ mod oracle;
 const WORKING_SET_BYTES: usize = 1 << 30;
 const WINDOW_BYTES: usize = 768 << 20;
 const WARMUPS: usize = 2;
-
 /// How long the host waits for one timed command buffer. A buffer still
 /// running when this ends is a named failure, and later arms are not
 /// submitted behind it. The wait only gates the read of the GPU stamps; it
@@ -103,8 +102,10 @@ const CHAIN_MAX: usize = 256;
 const ROUTER_BYTES: usize = router::ROWS * router::K * core::mem::size_of::<f32>();
 
 /// The head's weight bytes: 248320 rows of K 2048 Q6_K. The design's head
-/// matrix, and the kernel's own shape.
-const HEAD_BYTES: usize = HEAD_VOCAB * (HEAD_K / BLOCK_VALUES) * Quant::Q6K.block_bytes();
+/// matrix, and the kernel's own shape; the block bytes are gguf's row.
+fn head_bytes() -> usize {
+    HEAD_VOCAB * (HEAD_K / BLOCK_VALUES) * Quant::Q6K.block_bytes()
+}
 
 /// The review's predicted tail span for one router dispatch, in the row's
 /// microsecond fields.
@@ -118,7 +119,6 @@ const _: () = assert!(router::ROWS == 257 && router::K == 2048);
 const _: () = assert!(router::TOP_K_MAX == 8);
 const _: () = assert!(HEAD_VOCAB == 248_320 && HEAD_K == 2048);
 const _: () = assert!(ROUTER_BYTES == 2_105_344 && ROUTER_BYTES.is_multiple_of(256));
-const _: () = assert!(HEAD_BYTES == 417_177_600 && HEAD_BYTES.is_multiple_of(256));
 const _: () = assert!(HEAD_GROUPS * 16 == HEAD_VOCAB);
 
 /// How one kernel is launched into a timed command buffer.
@@ -840,9 +840,10 @@ fn time_head(
     device.fault_word().clear(stream).map_err(why)?;
     let one = matrix(Quant::Q6K, HEAD_VOCAB, HEAD_K, 0x6EAD);
     let bytes = one.len();
-    if bytes != HEAD_BYTES {
+    if bytes != head_bytes() {
         return Err(format!(
-            "the head weights are {bytes} bytes, the kernel's shape is {HEAD_BYTES}"
+            "the head weights are {bytes} bytes, the kernel's shape is {}",
+            head_bytes()
         ));
     }
     let (stride, copies, working_set) = spread(bytes);
@@ -926,14 +927,19 @@ fn percentile(xs: &[f64], p: f64) -> f64 {
     v[rank.saturating_sub(1)]
 }
 
-/// The `--trials` value: a whole number of at least one, refused by name
-/// otherwise (no trial has no median to take).
+/// The most timed buffers: every buffer, warm-ups included, is encoded before
+/// any is committed, so all of them must fit the default queue's 64 command
+/// buffers or `begin` blocks.
+const MAX_TRIALS: usize = 64 - WARMUPS;
+
+/// The `--trials` value: a whole number in `1..=MAX_TRIALS`, refused by name
+/// otherwise (no trial has no median to take; more would block the queue).
 fn trials_of(value: Option<&String>) -> Result<usize, String> {
     match value.map(|v| (v, v.parse::<usize>())) {
         None => Err("--trials takes a value".to_string()),
-        Some((_, Ok(n))) if n >= 1 => Ok(n),
+        Some((_, Ok(n))) if (1..=MAX_TRIALS).contains(&n) => Ok(n),
         Some((value, _)) => Err(format!(
-            "--trials takes a whole number of at least 1, not {value:?}"
+            "--trials takes a whole number in 1..={MAX_TRIALS}, not {value:?}"
         )),
     }
 }
@@ -1429,7 +1435,7 @@ pub fn main() -> ExitCode {
             &run,
             "head",
             &head_label,
-            HEAD_BYTES,
+            head_bytes(),
             Some(HEAD_TAIL_US),
             stream_gbps,
             |arm| time_head(&device, &kernels, arm, run.trials),

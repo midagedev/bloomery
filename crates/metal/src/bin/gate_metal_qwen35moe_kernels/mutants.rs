@@ -501,8 +501,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "head_bounds",
         why: "the mat-vec does not run, so the logits stay the sentinel",
         edits: &[(
-            "q6k_rows<true, false>(weights, x, logits,",
-            "if (false) q6k_rows<true, false>(weights, x, logits,",
+            "q6k_rows<true, false, false>(weights, x, logits,",
+            "if (false) q6k_rows<true, false, false>(weights, x, logits,",
             1,
         )],
     },

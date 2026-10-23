@@ -31,7 +31,6 @@ const _: () = assert!(HEAD_THREADS == 256);
 const _: () = assert!(HEAD_GROUPS == 15_520);
 const _: () = assert!(ROWS_PER_GROUP == 16);
 const _: () = assert!(HEAD_GROUPS * ROWS_PER_GROUP == HEAD_VOCAB);
-const _: () = assert!(HEAD_VOCAB * (HEAD_K / 256) * Quant::Q6K.block_bytes() == 417_177_600);
 
 const OUTPUT: &str = "output.weight";
 const GAIN: &str = "output_norm.weight";

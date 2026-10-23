@@ -9,7 +9,6 @@ use bloomery_device::{Buffer, Device, DeviceError, Elem};
 use bloomery_metal::MetalBuffer;
 use bloomery_metal::encode::ComputeEncoder;
 use bloomery_metal::kernels::{BLOCK_VALUES, Quant};
-use gguf::quant::GgmlType;
 
 use super::fixture::Fixture;
 use super::oracle::{self, Kind};
@@ -22,6 +21,7 @@ pub const LAYER: u32 = 5;
 
 /// A tensor a clause reads: its name, the type, the columns and the rows the
 /// clause takes of it.
+#[derive(Clone, Copy)]
 pub struct Tensor {
     pub name: &'static str,
     pub quant: Quant,
@@ -48,15 +48,8 @@ impl Tensor {
         }
     }
 
-    pub fn ggml(&self) -> GgmlType {
-        match self.quant {
-            Quant::Q4K => GgmlType::Q4_K,
-            Quant::Q6K => GgmlType::Q6_K,
-        }
-    }
-
     pub fn bytes<'f>(&self, fixture: &'f Fixture) -> Result<&'f [u8], String> {
-        fixture.rows(self.name, self.ggml(), self.cols, self.rows)
+        fixture.rows(self.name, self.quant.ggml(), self.cols, self.rows)
     }
 
     pub fn label(&self) -> String {

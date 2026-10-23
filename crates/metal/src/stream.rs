@@ -84,10 +84,6 @@ struct Committed {
     boundary: u64,
     /// The committed command buffers not yet seen complete.
     pending: Vec<CommandBufferHandle>,
-    /// An empty list holding capacity for the one [`MetalStream::sync_for`]
-    /// leaves in `pending`'s place while it waits, so the wait commits into
-    /// capacity and the sync itself allocates nothing.
-    spare: Vec<CommandBufferHandle>,
 }
 
 impl Committed {
@@ -263,10 +259,9 @@ impl MetalStream {
             committed: Mutex::new(Committed {
                 last: 0,
                 boundary: 0,
-                // Both lists start with capacity, so no commit or sync from
-                // the first step on grows one.
+                // The list starts with capacity, so no commit from the first
+                // step on grows it; a sync drops finished buffers in place.
                 pending: Vec::with_capacity(PENDING),
-                spare: Vec::with_capacity(PENDING),
             }),
             waits: AtomicU64::new(0),
         })
@@ -391,46 +386,56 @@ impl MetalStream {
 
     /// Every submitted buffer is done, or `timeout` has passed. Every pending
     /// buffer is looked at even when one failed, the first failure is
-    /// returned, and a buffer that did not finish stays pending.
+    /// returned, and a buffer that did not finish stays pending. The list is
+    /// held under the lock through the wait, so no thread sees the stream
+    /// settled while work submitted before its call still runs; a thread
+    /// queued behind another thread's wait gives up by name at its own
+    /// deadline.
     pub fn sync_for(&self, timeout: Duration) -> Result<(), DeviceError> {
+        use std::sync::TryLockError::{Poisoned, WouldBlock};
         self.waits.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + timeout;
-        // The spare list stands in for `pending` while the wait runs, so the
-        // lock is held by no poll and a submit on another thread pushes into
-        // capacity; the lists' capacity is the stream's, so a sync that finds
-        // every buffer done allocates nothing.
-        let mut pending = {
-            let mut c = self.committed();
-            let spare = core::mem::take(&mut c.spare);
-            core::mem::replace(&mut c.pending, spare)
+        let not_done = || {
+            DeviceError::backend(
+                "command buffer",
+                format!("not done within {} ms", timeout.as_millis()),
+            )
+        };
+        let mut committed = loop {
+            match self.committed.try_lock() {
+                Ok(state) => break state,
+                // A poisoned lock is taken as it stands: `committed` holds
+                // the reason.
+                Err(Poisoned(poison)) => break poison.into_inner(),
+                Err(WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(not_done());
+                    }
+                    std::thread::sleep(POLL);
+                }
+            }
         };
         let mut first = None;
-        let mut unfinished = Vec::new();
-        for buffer in pending.drain(..) {
+        // One status read decides each buffer: a finished one leaves the
+        // list (an error is reported once, to the caller that saw it), an
+        // unfinished one stays for the next wait.
+        committed.pending.retain(|buffer| {
             while !is_over(buffer.0.status()) && Instant::now() < deadline {
                 std::thread::sleep(POLL);
             }
             match buffer.0.status() {
-                MTLCommandBufferStatus::Completed => {}
+                MTLCommandBufferStatus::Completed => false,
                 MTLCommandBufferStatus::Error => {
-                    first.get_or_insert_with(|| command_buffer_error(&buffer));
+                    first.get_or_insert_with(|| command_buffer_error(buffer));
+                    false
                 }
                 _ => {
-                    first.get_or_insert_with(|| {
-                        DeviceError::backend(
-                            "command buffer",
-                            format!("not done within {} ms", timeout.as_millis()),
-                        )
-                    });
-                    unfinished.push(buffer);
+                    first.get_or_insert_with(not_done);
+                    true
                 }
             }
-        }
-        {
-            let mut c = self.committed();
-            c.pending.append(&mut unfinished);
-            c.spare = pending;
-        }
+        });
+        drop(committed);
         first.map_or(Ok(()), Err)
     }
 }

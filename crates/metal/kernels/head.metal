@@ -43,8 +43,8 @@ kernel void q6k_head_argmax(device const block_q6_K *weights [[buffer(0)]],
     threadgroup ulong stage[HEAD_SIMD_GROUPS];
 
     const int first_row = simd_first_row(tg, sg);
-    q6k_rows<true, false>(weights, x, logits, (int)args.nblocks, args.eps, args.layer, gain,
-                          faults, first_row, (int)args.rows, tiisg);
+    q6k_rows<true, false, false>(weights, x, logits, (int)args.nblocks, args.eps, args.layer,
+                                 gain, faults, first_row, (int)args.rows, tiisg);
 
     // Every logit this group stored is visible.
     threadgroup_barrier(mem_flags::mem_device);
