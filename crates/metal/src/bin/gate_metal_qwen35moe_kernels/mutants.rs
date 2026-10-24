@@ -19,25 +19,7 @@
 //! text ([`TENSOR_SOURCE`]) and are caught by the `tensor_*` clauses, which
 //! run those kernels on any device that compiles them.
 
-use bloomery_metal::library::{SOURCE, TENSOR_SOURCE};
-
-/// The program a mutant's edits go into.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Program {
-    /// The kernels' library ([`SOURCE`]).
-    Main,
-    /// The tensor-op GEMMs' library ([`TENSOR_SOURCE`]).
-    Tensor,
-}
-
-/// A defect and the clause that must be red on it.
-pub struct Mutant {
-    pub name: &'static str,
-    pub clause: &'static str,
-    pub why: &'static str,
-    /// `(find, replace, occurrences of find)`, applied in order.
-    pub edits: &'static [(&'static str, &'static str, usize)],
-}
+include!("../shared/mutants.rs");
 
 const TAIL_STORE_FIND: &str =
     "    for (short row = 0; row < NR0 && first_row + row < rows; ++row) {\n        float sum_all";
@@ -1192,37 +1174,3 @@ pub const TENSOR_MUTANTS: &[Mutant] = &[
         )],
     },
 ];
-
-/// Every mutant of both tables, with the program it edits.
-pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
-    MUTANTS
-        .iter()
-        .map(|m| (m, Program::Main))
-        .chain(TENSOR_MUTANTS.iter().map(|m| (m, Program::Tensor)))
-}
-
-/// The mutant of this name, and the program it edits.
-pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
-    all().find(|(m, _)| m.name == name)
-}
-
-/// The source of `program` with the mutant's edits applied.
-pub fn source_of(mutant: &Mutant, program: Program) -> Result<String, String> {
-    let mut text = match program {
-        Program::Main => SOURCE,
-        Program::Tensor => TENSOR_SOURCE,
-    }
-    .to_string();
-
-    for (find, replace, count) in mutant.edits {
-        let found = text.matches(find).count();
-        if found != *count {
-            return Err(format!(
-                "mutant {}: {find:?} occurs {found} times, not {count}",
-                mutant.name
-            ));
-        }
-        text = text.replace(find, replace);
-    }
-    Ok(text)
-}
