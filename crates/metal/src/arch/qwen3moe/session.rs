@@ -40,12 +40,13 @@
 //!
 //! [`Session::pass`] runs more than a step's window of ids as one pass: every
 //! layer once over all the rows, its GEMMs and row kernels over the rows
-//! arena, opened on the first pass and kept. The pass is the token at its last
-//! position as far as the record goes: its faults land in, and its head writes
-//! its pick to, the step record slot of its last row, and the delta state it
-//! leaves is the lane a step at the position after it reads. A pass is a
-//! command buffer an op, the last one waited: there is no host wait inside the
-//! pass, and none past the last op's. A prompt call cuts its ids into passes
+//! arena, which the open makes beside the token's. The pass is the token at
+//! its last position as far as the record goes: its faults land in, and its
+//! head writes its pick to, the step record slot of its last row, and the
+//! delta state it leaves is the lane a step at the position after it reads. A
+//! pass is a command buffer a layer, each opened at the token boundary and
+//! only the last one waited: there is no host wait inside the pass, and none
+//! past the last layer's. A prompt call cuts its ids into passes
 //! at its checkpoint marks ([`Session::prefill`]). A pass may also leave
 //! copies of the delta layers' lanes and rings after rows inside it: each is
 //! the state the pass held after that row, and the pass's own bits do not
@@ -53,9 +54,10 @@
 //!
 //! Every buffer the kernels bind is registered into the stream's residency
 //! set when the session allocates it, and the open waits for the set to be
-//! requested resident ([`crate::residency`]): the first token finds the
-//! weights wired, and a token after a pass or an idle gap finds them still
-//! wired. [`Session::residency`] reports the set.
+//! requested resident ([`crate::residency`]): the first token and the first
+//! pass find the weights and the rows arena wired, and a token after a pass
+//! or an idle gap finds them still wired. [`Session::residency`] reports the
+//! set, and [`Session::open_split`] how long the open's parts took.
 //!
 //! [`Session::step_traced`] is the instrument the gates read nodes through:
 //! the same ops of a host-fed step, each on a command buffer of its own,
@@ -72,6 +74,7 @@ use core::sync::atomic::Ordering;
 use core::time::Duration;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
+use std::time::Instant;
 
 use bloomery_device::fault::Fault;
 use bloomery_device::{Buffer, DeviceError, Elem, Elems, Stream};
@@ -240,8 +243,8 @@ pub enum StepMode {
     Ahead { next: Option<u32> },
 }
 
-/// What the session's steps did with the token ahead, the host's waits and
-/// the command buffers committed.
+/// What the session's steps did with the token ahead, the host's waits, the
+/// command buffers committed and the passes run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StepStats {
     /// The host's waits on the session's stream: every settle and sync.
@@ -258,6 +261,8 @@ pub struct StepStats {
     /// Steps at the cache's last row that would commit a token ahead, and
     /// commit none.
     pub last_row: u64,
+    /// Passes that ran to their settle.
+    pub passes: u64,
 }
 
 /// The token committed ahead of its call.
@@ -580,12 +585,42 @@ pub struct Session {
     /// Each delta layer's state lane and conv ring, at the positions a
     /// prompt call takes.
     checkpoints: Checkpoints,
-    /// The device the rows arena is opened on, on the first pass.
+    /// The device the mark copies are opened on, by the first pass that
+    /// takes one when the open did not make them.
     device: Handle<dyn MTLDevice>,
-    /// The buffers of a pass, once a pass has run.
-    rows: Option<RowsArena>,
+    /// The buffers of a pass.
+    rows: RowsArena,
     /// How a prompt call feeds its ids.
     prefill: PrefillMode,
+    /// How long the open's parts took.
+    open_split: OpenSplit,
+}
+
+/// When a session opens the copies a pass leaves after rows inside it
+/// ([`StateOut`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkCopies {
+    /// With the session, beside the rows arena: a server's session, whose
+    /// chat calls mark their messages.
+    AtOpen,
+    /// On the first pass that takes one: a session that never marks never
+    /// holds them.
+    OnFirstMark,
+}
+
+/// How long each part of a session's open took, on the host's clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpenSplit {
+    /// The plan read from the file and the weights copied into the arena.
+    pub load: Duration,
+    /// The rows arena's buffers allocated, and the mark copies' when the
+    /// open makes them.
+    pub rows: Duration,
+    /// The residency set's commit: the driver wiring every buffer the open
+    /// made.
+    pub residency: Duration,
+    /// The kernels' pipelines built, the prefill attention's among them.
+    pub pipelines: Duration,
 }
 
 /// What a pass returns of its head.
@@ -631,8 +666,10 @@ pub struct Passed {
 impl Session {
     /// The session of the file at `path` on `device`, its pipelines from
     /// `library`, with a cache of `ctx` rows: the plan read from the file's
-    /// header, every weight copied into the arena, every store at rest.
-    /// Checkpoints are taken every [`CHECKPOINT_EVERY`] positions.
+    /// header, every weight copied into the arena, every store at rest, and
+    /// the rows arena of [`Session::pass_rows`] rows, all resident before
+    /// the open returns. Checkpoints are taken every [`CHECKPOINT_EVERY`]
+    /// positions.
     pub fn open(
         device: &MetalDevice,
         library: &Library,
@@ -650,6 +687,28 @@ impl Session {
         ctx: usize,
         every: u32,
     ) -> Result<Session, SessionError> {
+        Self::open_as(device, library, path, ctx, every, MarkCopies::OnFirstMark)
+    }
+
+    /// [`Session::open_with`] with the mark copies opened as `copies` says.
+    /// Every buffer is made and the residency set committed here, once: a
+    /// refusal is a named error and leaves the set as it was, and no pass
+    /// allocates or builds a pipeline but the first marked pass of a session
+    /// opened [`MarkCopies::OnFirstMark`].
+    pub fn open_as(
+        device: &MetalDevice,
+        library: &Library,
+        path: &Path,
+        ctx: usize,
+        every: u32,
+        copies: MarkCopies,
+    ) -> Result<Session, SessionError> {
+        let started = Instant::now();
+        let kernels = Kernels::from_library(library)?;
+        // Built here so a refused build fails the open, never a pass.
+        kernels.prepare_prefill()?;
+        let pipelines = started.elapsed();
+        let started = Instant::now();
         let split = Split::open(path)
             .map_err(|e| refuse(format!("{} did not open: {e}", path.display())))?;
         let read = model::arch::qwen35moe::spec::read(&split)
@@ -666,23 +725,26 @@ impl Session {
             &SITES,
             Read35::Whole,
         )?;
-        let kernels = Kernels::from_library(library)?;
         let mut stream = device.new_stream()?;
         stream.enable_residency(device.metal())?;
         let residency = stream
             .residency()
             .ok_or_else(|| refuse("the stream made no residency set"))?;
         let staged = residency.stage();
-        let arena = Arena::open(
-            Alloc::new(device.metal(), &staged),
-            &split,
-            &spec,
-            &plans,
-            ctx,
-        )?;
-        // The open waits for the driver to wire the arena, so the first token
-        // finds it resident.
+        let alloc = Alloc::new(device.metal(), &staged);
+        let arena = Arena::open(alloc, &split, &spec, &plans, ctx)?;
+        let load = started.elapsed();
+        let started = Instant::now();
+        let mut rows = RowsArena::open(alloc, &arena, pass_rows_max().min(arena.ctx))?;
+        if copies == MarkCopies::AtOpen {
+            rows.snaps = Some(SnapBufs::open(alloc, &arena)?);
+        }
+        let rows_t = started.elapsed();
+        // The open waits for the driver to wire the arenas, so the first
+        // token and the first pass find them resident.
+        let started = Instant::now();
         staged.commit();
+        let residency_t = started.elapsed();
         let ctx_positions = u32::try_from(arena.ctx).map_err(|_| {
             refuse(format!(
                 "a cache of {} rows: more than a u32 position names",
@@ -711,9 +773,21 @@ impl Session {
             clock: None,
             checkpoints,
             device: device.handle().clone(),
-            rows: None,
+            rows,
             prefill: PrefillMode::Batch,
+            open_split: OpenSplit {
+                load,
+                rows: rows_t,
+                residency: residency_t,
+                pipelines,
+            },
         })
+    }
+
+    /// How long the open's parts took.
+    #[must_use]
+    pub fn open_split(&self) -> OpenSplit {
+        self.open_split
     }
 
     /// The token as the count models it.
@@ -895,7 +969,7 @@ impl Session {
     /// and no more than the cache's rows.
     #[must_use]
     pub fn pass_rows(&self) -> usize {
-        pass_rows_max().min(self.arena.ctx)
+        self.rows.cap
     }
 
     /// What the residency set of the session's kernel buffers holds and how
@@ -908,10 +982,10 @@ impl Session {
             .stats()
     }
 
-    /// The bytes the rows arena holds, once a pass has opened it.
+    /// The bytes the rows arena holds.
     #[must_use]
-    pub fn rows_arena_bytes(&self) -> Option<u64> {
-        self.rows.as_ref().map(|r| r.bytes)
+    pub fn rows_arena_bytes(&self) -> u64 {
+        self.rows.bytes
     }
 
     /// `ids` as one pass at the next positions: every layer once over all the
@@ -1006,38 +1080,20 @@ impl Session {
         if let Some(a) = self.ahead.take() {
             self.drop_ahead(a)?;
         }
-        if self.rows.is_none() {
+        let rows = &mut self.rows;
+        if !after.is_empty() && rows.snaps.is_none() {
             let residency = self
                 .stream
                 .residency()
                 .ok_or_else(|| refuse("the stream has no residency set"))?;
             let staged = residency.stage();
-            let rows = RowsArena::open(Alloc::new(&self.device, &staged), &self.arena, cap)?;
+            let copies = SnapBufs::open(Alloc::new(&self.device, &staged), &self.arena)?;
             staged.commit();
-            self.rows = Some(rows);
+            rows.snaps = Some(copies);
         }
-        if let Some(rows) = self.rows.as_mut() {
-            if !after.is_empty() && rows.snaps.is_none() {
-                let residency = self
-                    .stream
-                    .residency()
-                    .ok_or_else(|| refuse("the stream has no residency set"))?;
-                let staged = residency.stage();
-                let copies = SnapBufs::open(Alloc::new(&self.device, &staged), &self.arena)?;
-                staged.commit();
-                rows.snaps = Some(copies);
-            }
-            if let Some(copies) = rows.snaps.as_mut() {
-                copies.holds = [None; SNAPS];
-            }
+        if let Some(copies) = rows.snaps.as_mut() {
+            copies.holds = [None; SNAPS];
         }
-        // Built before the first op commits, so a refused build leaves the
-        // state, rings and cache as they were.
-        self.kernels.prepare_prefill()?;
-        let rows = self
-            .rows
-            .as_mut()
-            .ok_or_else(|| refuse("the rows arena did not open"))?;
         rows.ids.write_at(Elems(0), ids)?;
         let slot = slot_of(from + rows_n - 1);
         let head = out == PassOut::Last;
@@ -1096,6 +1152,7 @@ impl Session {
                 )
             }
         };
+        self.stats.passes += 1;
         if let Some(fault) = self.arena.faults[slot].read_settled(&settled)? {
             self.poisoned = Some(fault);
             return Err(SessionError::Fault(fault));
@@ -1105,7 +1162,7 @@ impl Session {
         } else {
             ids[m - 1]
         };
-        if let Some(copies) = self.rows.as_mut().and_then(|r| r.snaps.as_mut()) {
+        if let Some(copies) = self.rows.snaps.as_mut() {
             for (held, &r) in copies.holds.iter_mut().zip(after) {
                 *held = Some(from + r + 1);
             }
@@ -1385,7 +1442,7 @@ impl Session {
 
     /// The last pass's copies hold no position any more.
     fn drop_copies(&mut self) {
-        if let Some(copies) = self.rows.as_mut().and_then(|r| r.snaps.as_mut()) {
+        if let Some(copies) = self.rows.snaps.as_mut() {
             copies.holds = [None; SNAPS];
         }
     }
@@ -1450,8 +1507,8 @@ impl Session {
     pub fn checkpoint_copy(&mut self, at: u32) -> Result<(), SessionError> {
         let held = self
             .rows
+            .snaps
             .as_ref()
-            .and_then(|r| r.snaps.as_ref())
             .and_then(|c| c.holds.iter().position(|&h| h == Some(at)));
         match held {
             Some(k) if at <= self.pos => self.take_point(at, Some(k)),
@@ -1480,8 +1537,8 @@ impl Session {
             Some(k) => Some((
                 k,
                 self.rows
+                    .snaps
                     .as_ref()
-                    .and_then(|r| r.snaps.as_ref())
                     .ok_or_else(|| refuse("a pass's copy with no copies open"))?,
             )),
         };
