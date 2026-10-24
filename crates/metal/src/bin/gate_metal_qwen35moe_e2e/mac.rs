@@ -20,6 +20,13 @@
 //!   faulted token's, its position does not move, and after the reset chain
 //!   steps run clean past the dropped token's position.
 //! - `b_chain`, `c_resume`: the run-ahead clauses (`chain.rs`).
+//! - `h_prompt`: the prompt loop's known-id run-ahead (`ahead.rs`): every
+//!   id but the last of each checkpoint span steps the next id ahead with
+//!   no head on a row whose pick nobody reads; the prompt's pick, logits,
+//!   recurrent state, KV rows and greedy picks match the host-fed loop's
+//!   bit for bit with a mark crossed and without, `StepStats` shows the ids
+//!   ahead all kept, and a checkpoint with a token ahead drops it and keeps
+//!   the point clean.
 //! - `a_free`: the batch set's tokens host-fed one at a time; every layer's
 //!   output over the rows ik kept within [`free::FREE_BAND`] of ik's, the
 //!   last position's argmax as the fixture tier takes it, the rows a
@@ -89,6 +96,8 @@ use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::library::Library;
 
+#[path = "ahead.rs"]
+mod ahead;
 #[path = "chain.rs"]
 mod chain;
 #[path = "deep.rs"]
@@ -431,11 +440,12 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 12] = [
+    const NAMES: [&str; 13] = [
         "d_count",
         "e_token_id",
         "b_chain",
         "c_resume",
+        "h_prompt",
         "a_free",
         "t_target",
         "s_serve",
@@ -554,6 +564,7 @@ pub fn main() -> ExitCode {
             "e_token_id" => e_token_id(&mut session),
             "b_chain" => chain::b_chain(&mut session),
             "c_resume" => chain::c_resume(&mut session),
+            "h_prompt" => ahead::h_prompt(&device, library, &path),
             "t_target" => target::t_target(&mut session),
             "s_serve" => serve::s_serve(&mut session, &device, library, &path),
             "k_keep" => keep::k_keep(&device, library, &path),

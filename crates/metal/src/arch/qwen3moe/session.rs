@@ -14,6 +14,17 @@
 //! writes, not the one it reads). A chain step at the cache's last row
 //! commits nothing ahead.
 //!
+//! An ahead step ([`StepMode::Ahead`]) is a chain step whose ids are known:
+//! the ids of a prompt. The host writes the next id into this token's record
+//! slot — the slot whose pick a chain's head would write — and the token
+//! ahead, committed before this one is waited, embeds it from the device; no
+//! token the mode commits carries a head, for no pick of the run's is read
+//! but the prompt's last row's, and a headless step returns the id it was
+//! fed, reading no pick back. A call keeps the token ahead only when the two
+//! agree on the head: a pick-reading call cannot land a headless token, and
+//! the head of a token a chain committed would overwrite the slot the host
+//! writes, so each drops the other's token and recomputes its own.
+//!
 //! A raised fault poisons the session: the step waits out the token ahead,
 //! returns the fault by name, decoded to its layer and sites, and every later
 //! step is refused by name until [`Session::reset`].
@@ -30,13 +41,16 @@
 //! waited, with a hook after each. It encodes what [`Session::step`]
 //! encodes, op for op. [`Session::step_profile`] is the finer instrument:
 //! each group on a command buffer of its own, its GPU seconds read, one
-//! sample a group.
+//! sample a group. The step clock ([`Session::start_step_clock`]) is the
+//! coarser one: each settled token's encode, commit-to-start, GPU and wake
+//! seconds, a row a mode, for a profiling run to average and print.
 
 use core::fmt;
 use core::ops::Range;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 
 use bloomery_device::fault::Fault;
 use bloomery_device::{DeviceError, Elem, Elems, Stream};
@@ -57,7 +71,7 @@ use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
 use crate::kernels::{HEAD_DIM, Kernels, segments_for_keys, state_elems};
 use crate::library::Library;
-use crate::stream::{GpuInterval, MetalStream, Settled, Signalled};
+use crate::stream::{GpuInterval, GpuStamps, MetalStream, Settled, Signalled, host_secs};
 
 const WHAT: &str = "qwen35moe session";
 
@@ -171,6 +185,16 @@ pub enum StepMode {
     /// next token is committed before this one is waited, embedding this
     /// token's pick on the device.
     Chain,
+    /// The ids are known ahead of the calls: a prompt's. The token this call
+    /// names lands with no head — its pick is nobody's input, the call after
+    /// names its id — and with `next` named, that token is committed before
+    /// this one is waited, embedding `next` from this token's record slot,
+    /// which the host writes for it. A chain's token ahead reads the pick
+    /// this token's head would have written there; this token writes no
+    /// head, so the slot is the host's. `next` of `None` commits nothing
+    /// ahead: the last row of a span a checkpoint ends, or the row before
+    /// one whose pick is read.
+    Ahead { next: Option<u32> },
 }
 
 /// What the session's steps did with the token ahead, and the host's waits.
@@ -185,7 +209,8 @@ pub struct StepStats {
     /// Tokens ahead waited out and dropped: a broken promise, a fault, a
     /// reset, a traced step, a checkpoint or a cut.
     pub discarded: u64,
-    /// Chain steps at the cache's last row, which commit nothing ahead.
+    /// Steps at the cache's last row that would commit a token ahead, and
+    /// commit none.
     pub last_row: u64,
 }
 
@@ -194,8 +219,151 @@ struct Ahead {
     signalled: Signalled,
     count: EncodeCount,
     pos: u32,
-    /// The id its embed reads: the pick of the token before it.
+    /// The id its embed reads: the pick of the token before it (a chain's,
+    /// learned at that token's land) or the id its committing call named (an
+    /// ahead's, which knew it).
     embeds: u32,
+    /// Whether the token's encode carried the head: a chain's does, its pick
+    /// the next promise; an ahead's does not, the call after names its id.
+    head: bool,
+}
+
+/// One committed token the clock holds until its settle: its identity on the
+/// stream, its stamps (a command buffer's handle, which only a lock may
+/// carry), and the host's seconds around its encode and commit.
+struct PendingToken {
+    value: u64,
+    stamps: GpuStamps,
+    encode_s: f64,
+    submitted: f64,
+}
+
+/// How many step modes a clock holds a row for.
+const MODES: usize = 3;
+
+/// A mode's place in a step clock's rows.
+fn row_of(mode: StepMode) -> usize {
+    match mode {
+        StepMode::HostFed => 0,
+        StepMode::Chain => 1,
+        StepMode::Ahead { .. } => 2,
+    }
+}
+
+/// One mode's phases, summed; the averages are [`StepPhase`].
+#[derive(Clone, Copy, Default)]
+struct Phases {
+    encode_s: f64,
+    start_s: f64,
+    gpu_s: f64,
+    wake_s: f64,
+}
+
+/// One mode's averaged step phases, as a run's steps spent them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StepPhase {
+    /// The settled steps the averages hold.
+    pub steps: u64,
+    /// The host's encode of a token, µs: the encoder's begin to the commit.
+    pub encode_us: f64,
+    /// A token's GPU start against the host clock at its commit, µs.
+    pub start_us: f64,
+    /// The GPU's own µs on a token.
+    pub gpu_us: f64,
+    /// The host's µs from a token's GPU end to the settle's return.
+    pub wake_us: f64,
+}
+
+/// The step clock: what a run's steps spent, by the mode of the call that
+/// settled each token. [`Session::start_step_clock`] starts one; a session
+/// whose clock is off times nothing, and a step of it costs no read.
+pub struct StepClock {
+    /// The GPU clock's seconds minus the host clock's, as the start probe
+    /// read it: the stamps' epoch is the GPU's own, and no system call
+    /// names its difference from the host's.
+    offset: f64,
+    /// The committed tokens whose settle has not come, the run-ahead one
+    /// deep: two stand at once, the token a call settles and the one it
+    /// committed ahead of it. The stamps' buffer handle is not `Sync`, so
+    /// the lock carries it and it never leaves the clock.
+    pending: Mutex<Vec<PendingToken>>,
+    /// One row a mode, [`StepMode`]'s order.
+    rows: [Phases; MODES],
+    steps: [u64; MODES],
+}
+
+impl StepClock {
+    fn new(offset: f64) -> Self {
+        Self {
+            offset,
+            // The run-ahead holds two; a step's commits never grow it.
+            pending: Mutex::new(Vec::with_capacity(2)),
+            rows: [Phases::default(); MODES],
+            steps: [0; MODES],
+        }
+    }
+
+    /// The registry, taken as it stands: every change to it is one push or
+    /// one removal, so a panic while it was held left it whole.
+    fn registry(&self) -> std::sync::MutexGuard<'_, Vec<PendingToken>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The token `commit` clocked, held until its settle.
+    fn committed(&self, token: PendingToken) {
+        self.registry().push(token);
+    }
+
+    /// The token of signal `value`, taken from the registry: `None` when the
+    /// clock holds none (it was committed before the clock started).
+    fn take(&self, value: u64) -> Option<PendingToken> {
+        let mut pending = self.registry();
+        let at = pending.iter().position(|t| t.value == value)?;
+        Some(pending.swap_remove(at))
+    }
+
+    /// The token of signal `value` whose settle will not come — dropped,
+    /// reset — its clock dropped with it.
+    fn dropped(&self, value: u64) {
+        let mut pending = self.registry();
+        if let Some(at) = pending.iter().position(|t| t.value == value) {
+            pending.swap_remove(at);
+        }
+    }
+
+    /// The settled token's phases under `mode`'s row: its stamps read (the
+    /// settle already implied them complete) and `wake` the host's clock at
+    /// the record.
+    fn settled(
+        &mut self,
+        mode: StepMode,
+        token: PendingToken,
+        wake: f64,
+    ) -> Result<(), SessionError> {
+        let stamps = token.stamps.times(STAMP_WAIT)?;
+        let row = &mut self.rows[row_of(mode)];
+        row.encode_s += token.encode_s;
+        row.start_s += (stamps.start - self.offset) - token.submitted;
+        row.gpu_s += stamps.end - stamps.start;
+        row.wake_s += wake - (stamps.end - self.offset);
+        self.steps[row_of(mode)] += 1;
+        Ok(())
+    }
+
+    /// `mode`'s averaged phases; zeros when no step of the mode settled.
+    #[must_use]
+    pub fn phase(&self, mode: StepMode) -> StepPhase {
+        let n = self.steps[row_of(mode)];
+        let p = &self.rows[row_of(mode)];
+        let avg = |s: f64| if n == 0 { 0.0 } else { s / n as f64 * 1e6 };
+        StepPhase {
+            steps: n,
+            encode_us: avg(p.encode_s),
+            start_us: avg(p.start_s),
+            gpu_us: avg(p.gpu_s),
+            wake_us: avg(p.wake_s),
+        }
+    }
 }
 
 /// One group of a profiled token: what the group runs, the layer it runs in
@@ -359,9 +527,12 @@ pub struct Session {
     layers: Vec<Layer>,
     pos: u32,
     poisoned: Option<Fault>,
-    /// The token at `pos`, committed by the last chain step.
+    /// The token at `pos`, committed by the last step that ran one ahead.
     ahead: Option<Ahead>,
     stats: StepStats,
+    /// The step clock, when a caller started one; `None` steps and times
+    /// nothing.
+    clock: Option<StepClock>,
     /// Each delta layer's state lane and conv ring, at the positions a
     /// prompt call takes.
     checkpoints: Checkpoints,
@@ -433,6 +604,7 @@ impl Session {
             poisoned: None,
             ahead: None,
             stats: StepStats::default(),
+            clock: None,
             checkpoints,
         })
     }
@@ -502,16 +674,46 @@ impl Session {
         }
     }
 
+    /// Start the step clock: every step from here on has its phases
+    /// recorded, a row a mode, until the next start. The clock is a
+    /// profiling run's instrument; it holds nothing back and clears nothing,
+    /// not even at [`Session::reset`], which a caller that wants fresh rows
+    /// starts again past. Its first act is the offset probe: an empty
+    /// command buffer, settled, whose GPU stamps against the host clock at
+    /// its settle fix the difference between the two clocks.
+    pub fn start_step_clock(&mut self) -> Result<(), SessionError> {
+        let mut recording = self.stream.begin()?;
+        drop(recording.compute_encoder()?);
+        let stamps = recording.stamps();
+        let signalled = self.stream.submit_signalled(recording)?;
+        self.stream.settle(signalled)?;
+        let probe = stamps.times(STAMP_WAIT)?;
+        let offset = probe.end - host_secs();
+        self.clock = Some(StepClock::new(offset));
+        Ok(())
+    }
+
+    /// The step clock's phases, when one runs.
+    #[must_use]
+    pub fn step_clock(&self) -> Option<&StepClock> {
+        self.clock.as_ref()
+    }
+
     /// One token at the next position, `id` its input; the head's pick is
-    /// returned. A token running ahead with this id is kept; any other is
-    /// waited out and dropped first. In [`StepMode::Chain`] the next token is
-    /// committed before this one is waited, unless this is the cache's last
-    /// row. A call waits for this token alone, and on a broken promise for
-    /// the dropped token before it.
+    /// returned, or for an ahead step the id it was fed, which computed no
+    /// pick to read back. A token running ahead with this id is kept when
+    /// the call's mode and the token agree on the head — a pick-reading call
+    /// ([`StepMode::Chain`], [`StepMode::HostFed`]) lands only a token that
+    /// carries one, an ahead call only one that does not — and any other is
+    /// waited out and dropped first. In [`StepMode::Chain`] and an ahead
+    /// step that names a next id, the next token is committed before this
+    /// one is waited, unless this is the cache's last row. A call waits for
+    /// this token alone, and on a dropped token before it.
     pub fn step(&mut self, id: u32, mode: StepMode) -> Result<Stepped, SessionError> {
         self.ready()?;
+        let head = !matches!(mode, StepMode::Ahead { .. });
         let (current, count) = match self.ahead.take() {
-            Some(a) if a.embeds == id => {
+            Some(a) if a.embeds == id && a.head == head => {
                 self.stats.kept += 1;
                 (a.signalled, a.count)
             }
@@ -519,35 +721,36 @@ impl Session {
                 if let Some(a) = ahead {
                     self.drop_ahead(a)?;
                 }
-                self.commit(id, self.pos, Feed::Host)?
+                self.commit(id, self.pos, Feed::Host, head)?
             }
         };
         // On an error past this point the token at `pos` is waited for and
         // not landed: its fault word, if it raised, poisons the next step at
         // `pos`. The first error is the step's; a later one on the same path
         // is not returned.
-        if mode == StepMode::Chain {
-            let next = self.pos + 1;
-            if (next as usize) < self.arena.ctx {
-                match self.commit(id, next, Feed::Device) {
-                    Ok((signalled, count)) => {
-                        self.stats.ahead += 1;
-                        self.ahead = Some(Ahead {
-                            signalled,
-                            count,
-                            pos: next,
-                            embeds: 0,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = self.stream.settle(current);
-                        return Err(e);
-                    }
+        let next = self.pos + 1;
+        // The token ahead, as the mode commits it: a chain's embeds this
+        // token's pick (its head writes the record slot the embed reads) and
+        // carries a head of its own; an ahead's embeds the id the host writes
+        // into that slot and carries none.
+        let ahead = match mode {
+            StepMode::HostFed | StepMode::Ahead { next: None } => None,
+            StepMode::Chain => Some((next, 0, true, None)),
+            StepMode::Ahead {
+                next: Some(host_written),
+            } => Some((next, host_written, false, Some(host_written))),
+        };
+        if let Some((at, embeds, carries_head, host_written)) = ahead {
+            if (at as usize) < self.arena.ctx {
+                if let Err(e) = self.commit_ahead(at, embeds, carries_head, host_written) {
+                    let _ = self.stream.settle(current);
+                    return Err(e);
                 }
             } else {
                 self.stats.last_row += 1;
             }
         }
+        let value = current.value();
         let settled = match self.stream.settle(current) {
             Ok(settled) => settled,
             Err(e) => {
@@ -557,8 +760,17 @@ impl Session {
                 return Err(e.into());
             }
         };
-        let stepped = self.land(&settled, count);
+        if let Some(clock) = self.clock.as_mut()
+            && let Some(token) = clock.take(value)
+        {
+            let wake = host_secs();
+            clock.settled(mode, token, wake)?;
+        }
+        let stepped = self.land(&settled, count, head, id);
         match (&stepped, self.ahead.as_mut()) {
+            // A chain's token ahead learns its promise here, the pick of the
+            // token it embeds; an ahead's named its at the commit.
+            (Ok(_), Some(a)) if !a.head => {}
             (Ok(s), Some(a)) => a.embeds = s.id,
             (Err(_), Some(_)) => self.wait_out_ahead(),
             _ => {}
@@ -566,29 +778,78 @@ impl Session {
         stepped
     }
 
+    /// Commit the token ahead at `at` and register the promise `embeds`: the
+    /// id the host writes into this token's record slot first when
+    /// `host_written` names one, then the token encoded on the device's feed
+    /// — the record slot of the token before it — carrying a head only when
+    /// `head`. The stream's token boundary orders it after this token; on
+    /// `Err` nothing is registered and the caller settles this token.
+    fn commit_ahead(
+        &mut self,
+        at: u32,
+        embeds: u32,
+        head: bool,
+        host_written: Option<u32>,
+    ) -> Result<(), SessionError> {
+        if let Some(id) = host_written {
+            // The slot the token ahead embeds: this token's, which its
+            // skipped head leaves for the host. Its last reader, the embed
+            // of the token two positions back, settled with the call before.
+            self.arena
+                .step_id
+                .pages()
+                .store(slot_of(self.pos), id, Ordering::Relaxed)?;
+        }
+        let (signalled, count) = self.commit(embeds, at, Feed::Device, head)?;
+        self.stats.ahead += 1;
+        self.ahead = Some(Ahead {
+            signalled,
+            count,
+            pos: at,
+            embeds,
+            head,
+        });
+        Ok(())
+    }
+
     /// Encode and commit the token at `pos`, signalled: its embed reads the
     /// host id slot, which `id` is written into first, or the record slot of
-    /// the token before it.
+    /// the token before it, and it carries the head only when `head` — a
+    /// step whose pick nobody reads skips it.
     fn commit(
         &mut self,
         id: u32,
         pos: u32,
         feed: Feed,
+        head: bool,
     ) -> Result<(Signalled, EncodeCount), SessionError> {
         if feed == Feed::Host {
             self.arena.id_in.pages().store(0, id, Ordering::Relaxed)?;
         }
+        let clock = self.clock.as_ref();
+        let encode_from = clock.is_some().then(host_secs);
         let mut recording = self.stream.begin()?;
         let mut enc = recording.token_encoder()?;
         Walk::new(
-            &mut MetalOps::new(&mut enc, &mut self.arena, &self.kernels, pos, feed),
+            &mut MetalOps::new(&mut enc, &mut self.arena, &self.kernels, pos, feed, head),
             &self.plans,
             1,
         )
         .run(1)?;
         let count = enc.count();
         enc.end();
-        Ok((self.stream.submit_signalled(recording)?, count))
+        let stamps = clock.is_some().then(|| recording.stamps());
+        let signalled = self.stream.submit_signalled(recording)?;
+        if let (Some(clock), Some(stamps), Some(from)) = (clock, stamps, encode_from) {
+            let at = host_secs();
+            clock.committed(PendingToken {
+                value: signalled.value(),
+                stamps,
+                encode_s: at - from,
+                submitted: at,
+            });
+        }
+        Ok((signalled, count))
     }
 
     /// The token ahead waited out and dropped, its fault word cleared if it
@@ -596,6 +857,9 @@ impl Session {
     /// call names, and starts clean.
     fn drop_ahead(&mut self, a: Ahead) -> Result<(), SessionError> {
         self.stats.discarded += 1;
+        if let Some(clock) = &self.clock {
+            clock.dropped(a.signalled.value());
+        }
         let settled = self.stream.settle(a.signalled)?;
         let fault = &self.arena.faults[slot_of(a.pos)];
         if fault.read_settled(&settled)?.is_some() {
@@ -610,6 +874,9 @@ impl Session {
     fn wait_out_ahead(&mut self) {
         if let Some(a) = self.ahead.take() {
             self.stats.discarded += 1;
+            if let Some(clock) = &self.clock {
+                clock.dropped(a.signalled.value());
+            }
             let _ = self.stream.settle(a.signalled);
         }
     }
@@ -643,7 +910,7 @@ impl Session {
         let settled = tracer
             .settled
             .ok_or_else(|| refuse("a traced step settled no op"))?;
-        self.land(&settled, count)
+        self.land(&settled, count, true, id)
     }
 
     /// [`Session::step`] host-fed, with every group on a command buffer of
@@ -677,7 +944,7 @@ impl Session {
         let settled = profiler
             .settled
             .ok_or_else(|| refuse("a profiled step settled no group"))?;
-        self.land(&settled, count)
+        self.land(&settled, count, true, id)
     }
 
     /// The bytes the profiled group `g` of the token at `pos` moved, by what
@@ -696,14 +963,26 @@ impl Session {
     }
 
     /// A settled token's end: its fault word (a fault poisons the session),
-    /// then its pick; the position moves.
-    fn land(&mut self, settled: &Settled, count: EncodeCount) -> Result<Stepped, SessionError> {
+    /// then its pick — the head's when the token carries one, else the id
+    /// `fed` the call, for a headless token computed no pick to read back;
+    /// the position moves.
+    fn land(
+        &mut self,
+        settled: &Settled,
+        count: EncodeCount,
+        head: bool,
+        fed: u32,
+    ) -> Result<Stepped, SessionError> {
         let slot = slot_of(self.pos);
         if let Some(fault) = self.arena.faults[slot].read_settled(settled)? {
             self.poisoned = Some(fault);
             return Err(SessionError::Fault(fault));
         }
-        let id = self.arena.step_id.pages().load(slot, Ordering::Relaxed)?;
+        let id = if head {
+            self.arena.step_id.pages().load(slot, Ordering::Relaxed)?
+        } else {
+            fed
+        };
         self.pos += 1;
         Ok(Stepped { id, count })
     }
@@ -751,6 +1030,9 @@ impl Session {
     pub fn reset(&mut self) -> Result<(), SessionError> {
         if let Some(a) = self.ahead.take() {
             self.stats.discarded += 1;
+            if let Some(clock) = &self.clock {
+                clock.dropped(a.signalled.value());
+            }
             self.stream.settle(a.signalled)?;
         }
         self.stream.sync()?;
@@ -1003,6 +1285,7 @@ where
             self.kernels,
             self.pos,
             Feed::Host,
+            true,
         ))?;
         let c = enc.count();
         enc.end();
@@ -1096,6 +1379,7 @@ impl Profiler<'_> {
             self.kernels,
             self.pos,
             Feed::Host,
+            true,
         ))?;
         let c = enc.count();
         enc.end();

@@ -206,7 +206,9 @@ pub(super) struct Arena {
     pub(super) logits: MetalBuffer<f32>,
     pub(super) candidates: MetalBuffer<u64>,
     pub(super) head_ticket: MetalBuffer<u32>,
-    /// The head's pick, one per step record slot.
+    /// The head's pick, one per step record slot — or, for a token whose
+    /// pick nobody reads, the id the host writes there for the token ahead
+    /// to embed.
     pub(super) step_id: MetalBuffer<u32>,
     /// The id a host-fed token embeds, written by the host.
     pub(super) id_in: MetalBuffer<u32>,

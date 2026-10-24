@@ -6,6 +6,7 @@
 //!
 //!     generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
 //!                    [--print-ids] [--profile [N]] [--profile-layers]
+//!                    [--step-times [N]]
 //!
 //! Defaults: N 32, C the smaller of 4096 and the file's `context_length`. A
 //! flag given twice takes its last value. `--prompt` tokenizes the text with
@@ -33,6 +34,14 @@
 //! the total beside the run's own decode ms a token, so the gap between the
 //! groups' GPU time and the real step shows.
 //!
+//! `--step-times [N]` (default N 32) steps N more tokens in each mode —
+//! host-fed, chain, ahead, one id throughout — and prints one `step_times`
+//! line a mode: the host's encode µs a token, its GPU start against the host
+//! clock at the commit, the GPU's own µs, and the host's µs from the GPU end
+//! to the settle's return. What the phases say of a mode the sum against the
+//! step's wall does: a host-fed step pays all four serially, a chain or
+//! ahead step encodes the next token under the current one's GPU time.
+//!
 //! The wall and rate lines are development-loop numbers: no lease, no
 //! witness, this Mac whatever else it runs. The `prof` lines are too: the
 //! profiled token runs one command buffer a group, waited, which the real
@@ -58,7 +67,7 @@ mod cli {
     use bloomery_device::Device;
     use bloomery_metal::arch::qwen3moe::count::{GroupKind, KINDS};
     use bloomery_metal::arch::qwen3moe::generate::greedy;
-    use bloomery_metal::arch::qwen3moe::session::{ProfileGroup, Session};
+    use bloomery_metal::arch::qwen3moe::session::{ProfileGroup, Session, StepMode};
     use bloomery_metal::device::MetalDevice;
 
     /// The model file, as the CUDA generate CLIs name it.
@@ -68,17 +77,19 @@ mod cli {
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers]
+generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]]
   the file is $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
   and the file's context_length; --print-ids prints the ids, not the text;
   --profile [N] (default 32) steps N more tokens after the summary, each
-  group's GPU time and bytes printed; --profile-layers adds a layer each";
+  group's GPU time and bytes printed; --profile-layers adds a layer each;
+  --step-times [N] (default 32) steps N more tokens in each mode, the step
+  clock's phases a mode printed";
 
     /// The flags that take a value.
     const VALUE_FLAGS: [&str; 4] = ["--prompt", "--tokens", "-n", "--ctx"];
     /// The flags that stand alone.
     const BARE_FLAGS: [&str; 3] = ["--print-ids", "--help", "--profile-layers"];
-    /// The profile tokens' default count.
+    /// The profile tokens' default count, and the step-times' per mode.
     const PROFILE_DEFAULT: usize = 32;
 
     /// What named the prompt: the text the tokenizer encodes, or the ids as
@@ -102,6 +113,8 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         ctx: Option<usize>,
         print_ids: bool,
         profile: Option<Profile>,
+        /// `--step-times [N]`: the step clock's tokens a mode.
+        step_times: Option<usize>,
         model: PathBuf,
     }
 
@@ -145,7 +158,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             let a = &args[i];
             if VALUE_FLAGS.contains(&a.as_str()) {
                 i += 2;
-            } else if a == "--profile" {
+            } else if ["--profile", "--step-times"].contains(&a.as_str()) {
                 i += if args.get(i + 1).is_some_and(|v| v.parse::<usize>().is_ok()) {
                     2
                 } else {
@@ -231,6 +244,27 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             }),
             (None, false) => None,
         };
+        // `--step-times` stands alone at its default count or takes one; a
+        // last value wins, as for every flag.
+        let mut step_times: Option<usize> = None;
+        {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            for (i, a) in args.iter().enumerate() {
+                if a != "--step-times" {
+                    continue;
+                }
+                let n = args
+                    .get(i + 1)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(PROFILE_DEFAULT);
+                step_times = Some(n);
+            }
+        }
+        if step_times == Some(0) {
+            return Err(
+                "--step-times 0: a step-times run of no tokens; drop the flag to run none".into(),
+            );
+        }
         let model = match std::env::var_os(MODEL_ENV) {
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => {
@@ -245,6 +279,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             ctx,
             print_ids,
             profile,
+            step_times,
             model,
         })
     }
@@ -434,6 +469,64 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             .unwrap_or_else(|| panic!("generate_metal: the kind {kind:?} sits in no kind table"))
     }
 
+    /// The `step_times` lines: `n` tokens in each mode past the run —
+    /// host-fed and chain greedy, ahead on one id throughout, so every token
+    /// ahead is kept — the step clock's phases averaged a mode and printed
+    /// as one line, then the count. The lines are development-loop numbers,
+    /// like the summary's: the three runs sit at three depths, a mode's
+    /// attention reading a few keys more than the mode before it.
+    fn step_times_run(s: &mut Session, n: usize, id: u32) -> Result<(), String> {
+        let rows = s.ctx() - s.pos() as usize;
+        let per = n.min(rows / 3);
+        if per == 0 {
+            eprintln!(
+                "step_times: refused: {} rows past position {} hold no token of each of the \
+                 three modes; give --ctx more rows",
+                rows,
+                s.pos()
+            );
+            return Ok(());
+        }
+        s.start_step_clock().map_err(|e| e.to_string())?;
+        let mut pick = id;
+        for _ in 0..per {
+            pick = s
+                .step(pick, StepMode::HostFed)
+                .map_err(|e| e.to_string())?
+                .id;
+        }
+        for _ in 0..per {
+            pick = s.step(pick, StepMode::Chain).map_err(|e| e.to_string())?.id;
+        }
+        for _ in 0..per {
+            s.step(id, StepMode::Ahead { next: Some(id) })
+                .map_err(|e| e.to_string())?;
+        }
+        let clock = s.step_clock().ok_or("the step clock did not run")?;
+        for mode in [
+            StepMode::HostFed,
+            StepMode::Chain,
+            StepMode::Ahead { next: None },
+        ] {
+            let name = match mode {
+                StepMode::HostFed => "host",
+                StepMode::Chain => "chain",
+                StepMode::Ahead { .. } => "ahead",
+            };
+            let p = clock.phase(mode);
+            eprintln!(
+                "step_times mode={name} steps={} encode_us={:.1} start_us={:.1} gpu_us={:.1} \
+                 wake_us={:.1}",
+                p.steps, p.encode_us, p.start_us, p.gpu_us, p.wake_us,
+            );
+        }
+        eprintln!(
+            "step_times {per} tokens each of host, chain and ahead (development-loop numbers: \
+             no lease, no witness)"
+        );
+        Ok(())
+    }
+
     pub(super) fn run() -> ExitCode {
         // No lever row acts on this CLI; `at_main` still refuses a retired
         // name that is set, and `--levers` prints the table.
@@ -513,6 +606,13 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
                 .ok_or("a profile of no token: the run picked none")?;
             let decode_ms = decode_s / out.tokens() as f64 * 1e3;
             profile_run(&mut session, p, id, decode_ms)?;
+        }
+        if let Some(n) = a.step_times {
+            let id = *out
+                .ids
+                .last()
+                .ok_or("a step-times run of no token: the run picked none")?;
+            step_times_run(&mut session, n, id)?;
         }
         Ok(())
     }

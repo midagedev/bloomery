@@ -669,7 +669,10 @@ levers 0 0 0
 # token ahead, the last step settled, and the row's borrow pins the session).
 # PIN(2026-10-23): metal 12 -> 11 impls, lowered: stream.rs holds the shared event as the bindings declare it (Send +
 # Sync), so handle.rs's ThreadSafe impl for MTLSharedEvent is gone; the 17 -> 21 line's allocator impl is one of the 11.
-metal 22 7 11
+# PIN(2026-10-24): metal 22 -> 25 blocks, new code, not old code relaxed: stream.rs's host clock for the step-time
+# breakdown declares libSystem's mach_continuous_time and mach_timebase_info (one extern block) and calls each once,
+# each call with its SAFETY line.
+metal 25 7 11
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.

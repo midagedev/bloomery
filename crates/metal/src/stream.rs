@@ -25,7 +25,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use objc2::msg_send;
@@ -113,6 +113,14 @@ pub struct Signalled {
     value: u64,
 }
 
+impl Signalled {
+    /// The signal's value: the token's identity on its stream, the key a
+    /// holder of its stamps (the step clock) knows it by.
+    pub(crate) fn value(&self) -> u64 {
+        self.value
+    }
+}
+
 /// The proof a signalled recording's work is done and what it wrote is the
 /// host's to read: only [`MetalStream::settle`] makes one.
 #[derive(Debug)]
@@ -164,12 +172,22 @@ impl Recording<'_> {
     /// [`MetalStream::submit`] has committed it and the GPU has run it.
     #[must_use]
     pub fn stamps(&self) -> GpuStamps {
-        GpuStamps(self.buffer.clone())
+        GpuStamps(CommandBufferHandle(self.buffer.clone()))
     }
 }
 
 /// The GPU's own start and end stamps of one recording's command buffer.
-pub struct GpuStamps(Retained<ProtocolObject<dyn MTLCommandBuffer>>);
+/// The handle is [`Send`](CommandBufferHandle), so a lock may hold the stamps
+/// across threads; it is not `Sync`, and never leaves one.
+pub struct GpuStamps(CommandBufferHandle);
+
+/// The GPU's own stamps of one recording's buffer, in seconds on the clock
+/// [`host_secs`] reads: Apple GPUs stamp the mach timebase the host shares.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpuTimes {
+    pub start: f64,
+    pub end: f64,
+}
 
 /// What [`GpuStamps::interval`] saw within its wait.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -181,28 +199,57 @@ pub enum GpuInterval {
 }
 
 impl GpuStamps {
+    /// The buffer's `GPUStartTime` and `GPUEndTime` once it has completed,
+    /// polled for at most `wait`. The stamps are the driver's record of when
+    /// the GPU ran the buffer, so a host that reads them late reads the same
+    /// times. A buffer that failed, one that did not complete within the
+    /// wait, and one that completed with no stamps or a non-positive
+    /// interval are refused by name.
+    pub fn times(&self, wait: Duration) -> Result<GpuTimes, DeviceError> {
+        let (start, end) = self.raw(wait)?.ok_or_else(|| {
+            DeviceError::backend(
+                "command buffer",
+                format!(
+                    "the command buffer did not complete within {} ms, so its GPU times cannot \
+                     be read",
+                    wait.as_millis()
+                ),
+            )
+        })?;
+        Ok(GpuTimes { start, end })
+    }
+
     /// `GPUEndTime` minus `GPUStartTime` once the buffer has completed, polled
-    /// for at most `wait`. The stamps are the driver's record of when the GPU
-    /// ran the buffer, so a host that reads them late reads the same interval.
-    /// A buffer that failed, or completed with no stamps or a non-positive
-    /// interval, is refused by name.
+    /// for at most `wait`; a buffer still running at the wait's end says so.
+    /// The refusals are [`GpuStamps::times`]'s.
     pub fn interval(&self, wait: Duration) -> Result<GpuInterval, DeviceError> {
+        match self.raw(wait)? {
+            Some((start, end)) => Ok(GpuInterval::Ran(end - start)),
+            None => Ok(GpuInterval::StillRunning),
+        }
+    }
+
+    /// The stamps of a completed buffer, `None` while it still runs, with the
+    /// failure, the missing stamps and the non-positive interval refused by
+    /// name: the one read both readers of the stamps share.
+    fn raw(&self, wait: Duration) -> Result<Option<(f64, f64)>, DeviceError> {
+        let buffer = &self.0.0;
         let refuse = |detail: String| DeviceError::backend("command buffer", detail);
         let started = Instant::now();
         let status = loop {
-            let status = self.0.status();
+            let status = buffer.status();
             if status == MTLCommandBufferStatus::Completed
                 || status == MTLCommandBufferStatus::Error
             {
                 break status;
             }
             if started.elapsed() > wait {
-                return Ok(GpuInterval::StillRunning);
+                return Ok(None);
             }
             std::thread::sleep(POLL);
         };
         if status == MTLCommandBufferStatus::Error {
-            let detail = self.0.error().map_or_else(
+            let detail = buffer.error().map_or_else(
                 || "the command buffer failed".to_string(),
                 |err| err.localizedDescription().to_string(),
             );
@@ -218,8 +265,8 @@ impl GpuStamps {
         // retained command buffer that has completed.
         let (start, end): (f64, f64) = unsafe {
             (
-                msg_send![&*self.0, GPUStartTime],
-                msg_send![&*self.0, GPUEndTime],
+                msg_send![&**buffer, GPUStartTime],
+                msg_send![&**buffer, GPUEndTime],
             )
         };
         if start == 0.0 || end == 0.0 {
@@ -233,8 +280,46 @@ impl GpuStamps {
                 "the GPU's own interval is {gpu} s, not a positive finite duration"
             )));
         }
-        Ok(GpuInterval::Ran(gpu))
+        Ok(Some((start, end)))
     }
+}
+
+/// The mach tick in seconds, as `mach_timebase_info` states it: the clock's
+/// ticks are the timebase's fraction of a nanosecond, which is a nanosecond
+/// on some machines and not on others. Read once.
+static TICK_S: OnceLock<f64> = OnceLock::new();
+
+/// The host's seconds on a monotonic clock: macOS's `mach_continuous_time`,
+/// ticks since boot on the continuous timebase — the one that keeps running
+/// through the machine's sleep — scaled by the timebase. The GPU's stamps
+/// are seconds on the GPU's own epoch, which no system call names the
+/// difference from, so the step clock fixes it with a probe.
+pub(crate) fn host_secs() -> f64 {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_continuous_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let per_tick = *TICK_S.get_or_init(|| {
+        let mut tb = Timebase { numer: 0, denom: 0 };
+        // SAFETY: `mach_timebase_info` writes the timebase into `tb`, which
+        // matches `mach_timebase_info_data_t`'s layout, and reads nothing.
+        let r = unsafe { mach_timebase_info(&mut tb) };
+        assert!(
+            r == 0 && tb.denom != 0,
+            "mach_timebase_info said {r} with a timebase of {}/{}",
+            tb.numer,
+            tb.denom
+        );
+        f64::from(tb.numer) / f64::from(tb.denom) / 1e9
+    });
+    // SAFETY: `mach_continuous_time` is libSystem's clock read, declared
+    // above; it takes no arguments and writes nothing.
+    (unsafe { mach_continuous_time() } as f64) * per_tick
 }
 
 impl MetalStream {

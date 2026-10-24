@@ -8,15 +8,17 @@
 //! keys is two groups: the flash writes its partials, the barrier, then the
 //! merge folds them into the output. The FFN norm has no group of its own:
 //! the router (R) and the gate-up pair (G) each norm the residual as they
-//! load it. The head is the token's last group and closes no barrier. Every
-//! op only encodes: no wait, no allocation past the launches' own argument
-//! lists, no host round trip.
+//! load it. The head is the token's last group and closes no barrier; a
+//! token whose pick nobody reads encodes none of it. Every op only encodes:
+//! no wait, no allocation past the launches' own argument lists, no host
+//! round trip.
 //!
 //! The token at `pos` binds the step record slot of its position: the head
 //! writes its id there and every kernel raises that slot's fault word. A
 //! host-fed token embeds the host's id slot; a token fed on the device embeds
-//! the id the token before it wrote, in that token's slot. The delta step
-//! reads the lane of `pos` and writes the lane of `pos + 1`.
+//! the id the token before it wrote, in that token's slot: its head's pick,
+//! or the id the host wrote there for a token ahead. The delta step reads the
+//! lane of `pos` and writes the lane of `pos + 1`.
 
 use bloomery_device::fault::LAYER_HEAD;
 use bloomery_device::{Buffer, DeviceError, Elem, Elems, Window, WindowMut};
@@ -63,19 +65,23 @@ fn part<'b, T: Elem>(
 pub(super) enum Feed {
     /// The host's id slot, which the host wrote before the commit.
     Host,
-    /// The step record slot of the token before it: that token's pick.
+    /// The step record slot of the token before it: that token's pick, or
+    /// the id the host wrote there for a token ahead whose pick nobody
+    /// reads.
     Device,
 }
 
 /// The ops of one token over the session's arena, encoding on `enc`. `pos`
 /// is the token's position: its cache row, its conv ring slot, its step
-/// record slot and its delta lanes.
+/// record slot and its delta lanes. `head` names whether the token encodes
+/// the head: a step whose pick nobody reads skips it.
 pub(super) struct MetalOps<'a, 'e> {
     enc: &'a mut ComputeEncoder<'e>,
     arena: &'a mut Arena,
     kernels: &'a Kernels,
     pos: u32,
     feed: Feed,
+    head: bool,
 }
 
 impl<'a, 'e> MetalOps<'a, 'e> {
@@ -85,6 +91,7 @@ impl<'a, 'e> MetalOps<'a, 'e> {
         kernels: &'a Kernels,
         pos: u32,
         feed: Feed,
+        head: bool,
     ) -> Self {
         Self {
             enc,
@@ -92,6 +99,7 @@ impl<'a, 'e> MetalOps<'a, 'e> {
             kernels,
             pos,
             feed,
+            head,
         }
     }
 
@@ -541,6 +549,13 @@ impl ChainOps for MetalOps<'_, '_> {
 
     fn head(&mut self, m: usize) -> Result<(), SessionError> {
         Self::one_row(m)?;
+        if !self.head {
+            // The call said nobody reads this token's pick: the head's
+            // dispatch is the whole of what is skipped, and no later op
+            // depends on it — the head closes no barrier and writes nothing
+            // but its own outputs.
+            return Ok(());
+        }
         let slot = slot_of(self.pos);
         let Arena {
             head_w,

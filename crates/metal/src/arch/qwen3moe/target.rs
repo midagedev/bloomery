@@ -19,12 +19,15 @@
 //!   committed. The row is the head's shared pages themselves, zero copy,
 //!   and the argmax is the row's own by the head's tie rule (the smaller id
 //!   at an equal value).
-//! - `prompt`, the ids one host-fed step each — the session has no batched
-//!   prompt schedule — and a checkpoint at each position
-//!   [`runtime::seqstate::marks`] names: the call's start when the session
-//!   already holds one, every
-//!   [`CHECKPOINT_EVERY`](super::session::CHECKPOINT_EVERY) positions inside,
-//!   and the call's end. The row is read back after the last as asked.
+//! - `prompt`, the ids one ahead step each where the next id is known and
+//!   inner — [`StepMode::Ahead`], no head on a row whose pick nobody reads —
+//!   and a checkpoint at each position [`runtime::seqstate::marks`] names:
+//!   the call's start when the session already holds one, every
+//!   [`CHECKPOINT_EVERY`](super::session::CHECKPOINT_EVERY) positions
+//!   inside, and the call's end, each take waiting out whatever token runs
+//!   ahead of it. The span's last row and the row before the prompt's last
+//!   commit nothing ahead — the mark's take, and the last row's own head,
+//!   the one pick read back after the last as asked.
 //!
 //! What it refuses:
 //!
@@ -86,13 +89,29 @@ impl Target for Session {
         })?;
         // The id at an inner mark is stepped by the next span, after the take.
         let marks = self.checkpoint_marks(from, to);
+        let last = ids.len() - 1;
         let mut at = from;
         let mut last_pick = None;
         for m in marks {
             let start = (at - from) as usize;
             let end_i = (m - from) as usize;
-            for &id in &ids[start..end_i] {
-                last_pick = Some(Session::step(self, id, StepMode::HostFed)?.id);
+            for i in start..end_i {
+                // Every id but the last of the span steps the next id ahead,
+                // both tokens without the head: no inner pick is read. The
+                // span's last row commits nothing — the mark's take follows —
+                // and so does the row before the prompt's last, whose next
+                // runs the head on its own commit, the one pick the caller
+                // reads.
+                let mode = if i == last {
+                    StepMode::HostFed
+                } else if i + 1 < end_i && i + 1 != last {
+                    StepMode::Ahead {
+                        next: Some(ids[i + 1]),
+                    }
+                } else {
+                    StepMode::Ahead { next: None }
+                };
+                last_pick = Some(Session::step(self, ids[i], mode)?.id);
             }
             Session::checkpoint(self)?;
             at = m;
