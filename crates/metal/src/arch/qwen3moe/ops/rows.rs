@@ -23,10 +23,10 @@ use super::super::session::SessionError;
 use super::{MetalOps, WHAT, all, all_mut};
 use crate::kernels::{
     AttentionPrefillParams, AttnCache, CONV_TAPS, CombineParams, DeltaRowStrides, DeltaRowsParams,
-    EXPERT_K, EXPERT_SLOTS, EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams,
-    HEAD_COLS, HEAD_DIM, HEAD_SIMD_GROUPS, HeadNormRowsParams, HeadParams, KV_HEADS, LOGIT_STRIDE,
-    NormRowsParams, Operand, QUERY_HEADS, RouteSelectParams, RouteTableParams, RoutedKind,
-    RoutedParams, VALUE_HEADS, route_table_words, route_tiles,
+    DeltaSnaps, EXPERT_K, EXPERT_SLOTS, EmbedParams, F32GemmParams, GemmMode, GemmParams,
+    GemmSegParams, HEAD_COLS, HEAD_DIM, HEAD_SIMD_GROUPS, HeadNormRowsParams, HeadParams, KV_HEADS,
+    LOGIT_STRIDE, NormRowsParams, Operand, QUERY_HEADS, RouteSelectParams, RouteTableParams,
+    RoutedKind, RoutedParams, VALUE_HEADS, route_table_words, route_tiles, state_elems,
 };
 
 /// The operand type the pass's GEMMs compute in.
@@ -239,7 +239,9 @@ impl MetalOps<'_, '_> {
         Ok(())
     }
 
-    /// Layer `l`'s delta step over the rows, and the ring's commit after it.
+    /// Layer `l`'s delta step over the rows, and the ring's commit after it;
+    /// with the pass's copies, the lane and the ring after each row they
+    /// name, into the layer's copies.
     pub(super) fn rows_delta_core(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
         let slot = self.pass_slot(m);
         let from = self.pos;
@@ -247,6 +249,7 @@ impl MetalOps<'_, '_> {
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
+        let after = ctx.after;
         let rows = &mut *ctx.arena;
         let Arena {
             layers,
@@ -275,6 +278,25 @@ impl MetalOps<'_, '_> {
             ..dense
         };
         let tail = |start: usize| -> Elems { Elems(m * stride - start) };
+        let snaps = if after.is_empty() {
+            None
+        } else {
+            let copies = rows.snaps.as_mut();
+            let at = copies.as_ref().and_then(|c| c.at.get(l).copied().flatten());
+            let (Some(c), Some(at), Some(lane_len)) = (copies, at, state_elems(1)) else {
+                return Err(ChainError::shape(
+                    WHAT,
+                    format!("layer {l}: a pass's copies with none open for the layer"),
+                )
+                .into());
+            };
+            let n = after.len();
+            Some(DeltaSnaps {
+                after,
+                lane: c.lane.window_mut(Elems(at.lane), Elems(n * lane_len))?,
+                ring: c.ring.window_mut(Elems(at.ring), Elems(n * at.ring_len))?,
+            })
+        };
         self.kernels.delta_rows(
             self.enc,
             DeltaRowsParams {
@@ -312,6 +334,7 @@ impl MetalOps<'_, '_> {
                 pos: from,
                 strides,
                 eps: *eps,
+                snaps,
             },
         )?;
         self.enc.memory_barrier();

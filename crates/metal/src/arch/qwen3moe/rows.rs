@@ -11,6 +11,10 @@
 //!
 //! The expert buffers hold a row per slot (`m * 9`), the pair's output and
 //! the down's output at their widths: they are most of the arena.
+//!
+//! The copies a pass leaves after rows inside it ([`SnapBufs`]) are opened
+//! on the first pass that takes one, apart from the arena: a pass that takes
+//! none never pays for them.
 
 use bloomery_device::{Buffer, Elems};
 
@@ -18,8 +22,8 @@ use super::arena::{Arena, MixerBufs};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::kernels::{
-    EXPERT_K, EXPERT_SLOTS, LOGIT_STRIDE, PARTIALS_PER_HEAD, VALUE_HEADS, prepared_elems,
-    route_table_words,
+    EXPERT_K, EXPERT_SLOTS, LOGIT_STRIDE, PARTIALS_PER_HEAD, SNAPS, VALUE_HEADS, prepared_elems,
+    route_table_words, state_elems,
 };
 use crate::residency::Alloc;
 
@@ -98,6 +102,71 @@ pub(super) struct RowsArena {
     pub(super) y: MetalBuffer<f32>,
     /// The bytes the buffers take.
     pub(super) bytes: u64,
+    /// The copies of the delta layers' stores, once a pass has taken one.
+    pub(super) snaps: Option<SnapBufs>,
+}
+
+/// Where one delta layer's copies sit: its [`SNAPS`] lanes from `lane` in
+/// [`SnapBufs::lane`], its [`SNAPS`] rings from `ring` in [`SnapBufs::ring`],
+/// a ring being `ring_len` values.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SnapAt {
+    pub(super) lane: usize,
+    pub(super) ring: usize,
+    pub(super) ring_len: usize,
+}
+
+/// The copies a pass leaves after rows inside it: for each delta layer,
+/// [`SNAPS`] lanes of its state and [`SNAPS`] of its conv ring, each laid out
+/// as the store it copies, and the position each copy holds. A copy holds a
+/// position only once the pass that wrote it has settled clean, and only
+/// until the next pass, cut or reset: its buffers are read for nothing else,
+/// so they are not zeroed.
+pub(super) struct SnapBufs {
+    pub(super) lane: MetalBuffer<f32>,
+    pub(super) ring: MetalBuffer<f32>,
+    /// Each layer's copies; none for an attention layer.
+    pub(super) at: Vec<Option<SnapAt>>,
+    /// The position copy `k` holds: the position after the row it follows.
+    pub(super) holds: [Option<u32>; SNAPS],
+}
+
+impl SnapBufs {
+    /// The copies of the delta layers of `arena`, opened on `device`.
+    pub(super) fn open(device: Alloc<'_>, arena: &Arena) -> Result<SnapBufs, SessionError> {
+        let lane_len = state_elems(1).ok_or_else(|| refuse("a lane of the state does not fit"))?;
+        let (mut lanes, mut rings) = (0usize, 0usize);
+        let mut at = Vec::with_capacity(arena.layers.len());
+        for layer in &arena.layers {
+            let MixerBufs::Delta(d) = &layer.mixer else {
+                at.push(None);
+                continue;
+            };
+            let ring_len = d.ring.len().get();
+            at.push(Some(SnapAt {
+                lane: lanes,
+                ring: rings,
+                ring_len,
+            }));
+            lanes = product(SNAPS, lane_len, "a layer's lane copies")?
+                .checked_add(lanes)
+                .ok_or_else(|| refuse("the lane copies do not fit"))?;
+            rings = product(SNAPS, ring_len, "a layer's ring copies")?
+                .checked_add(rings)
+                .ok_or_else(|| refuse("the ring copies do not fit"))?;
+        }
+        if lanes == 0 {
+            return Err(refuse("copies of a model with no delta layer"));
+        }
+        let lane = device.buffer(Elems(lanes))?;
+        let ring = device.buffer(Elems(rings))?;
+        Ok(SnapBufs {
+            lane,
+            ring,
+            at,
+            holds: [None; SNAPS],
+        })
+    }
 }
 
 impl RowsArena {
@@ -221,6 +290,7 @@ impl RowsArena {
             h,
             y,
             bytes,
+            snaps: None,
         })
     }
 }

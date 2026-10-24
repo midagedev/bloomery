@@ -74,9 +74,12 @@ pub(super) enum Feed {
     Device,
 }
 
-/// What a pass adds to a step's ops: the rows arena.
+/// What a pass adds to a step's ops: the rows arena, and the rows after
+/// which the delta layers leave copies of their stores (none for a pass that
+/// takes none).
 pub(super) struct RowsCtx<'a> {
     pub(super) arena: &'a mut RowsArena,
+    pub(super) after: &'a [u32],
 }
 
 /// The arm a unit of rows takes.

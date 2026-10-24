@@ -31,7 +31,9 @@
 //!
 //! A checkpoint copies each delta layer's state lane at the position's parity
 //! and its whole conv ring. [`Session::checkpoint`] takes one at the position
-//! the session stands at, with no token ahead and the stream idle.
+//! the session stands at, with no token ahead and the stream idle;
+//! [`Session::checkpoint_copy`] takes one at a position inside the last pass,
+//! from the copies that pass left ([`StateOut::after_rows`]).
 //! [`Session::cut`] back to a point copies that lane and ring back and stands
 //! there; a cut to 0 is a reset, which drops the points too. A cut the ledger
 //! refuses leaves the position and every store as they were.
@@ -44,7 +46,10 @@
 //! leaves is the lane a step at the position after it reads. A pass is a
 //! command buffer an op, the last one waited: there is no host wait inside the
 //! pass, and none past the last op's. A prompt call cuts its ids into passes
-//! at its checkpoint marks ([`Session::prefill`]).
+//! at its checkpoint marks ([`Session::prefill`]). A pass may also leave
+//! copies of the delta layers' lanes and rings after rows inside it: each is
+//! the state the pass held after that row, and the pass's own bits do not
+//! move.
 //!
 //! Every buffer the kernels bind is registered into the stream's residency
 //! set when the session allocates it, and the open waits for the set to be
@@ -69,7 +74,7 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use bloomery_device::fault::Fault;
-use bloomery_device::{DeviceError, Elem, Elems, Stream};
+use bloomery_device::{Buffer, DeviceError, Elem, Elems, Stream};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
 use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, SiteTy, kinds35};
@@ -82,13 +87,15 @@ use runtime::seqstate::{self, Kept};
 use super::arena::{Arena, LANES, MixerBufs, lane_of, slot_of};
 use super::count::{GroupBytes, GroupKind, Layer};
 use super::ops::{Feed, MetalOps, RowsCtx};
-use super::rows::RowsArena;
+use super::rows::{RowsArena, SnapBufs};
 use crate::buffer::MetalBuffer;
 use crate::checkpoint::{self, Checkpoints, Restore};
 use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
 use crate::handle::Handle;
-use crate::kernels::{EXPERT_SLOTS, HEAD_DIM, Kernels, PASS_ROWS, segments_for_keys, state_elems};
+use crate::kernels::{
+    EXPERT_SLOTS, HEAD_DIM, Kernels, PASS_ROWS, SNAPS, segments_for_keys, state_elems,
+};
 use crate::library::Library;
 use crate::residency::{Alloc, ResidencyStats};
 use crate::stream::{
@@ -593,12 +600,15 @@ pub enum PassOut {
     Last,
 }
 
-/// The per-row copies of the recurrent state a pass leaves, named by the
-/// rows they follow. A prefill pass takes none: its checkpoints fall between
-/// passes. The verify arm's rows are this argument's.
+/// The copies of the recurrent state a pass leaves, named by the rows they
+/// follow: each delta layer's state lane and conv ring after that row, the
+/// bits a pass ending there leaves in its stores, which
+/// [`Session::checkpoint_copy`] takes as the point at the position after the
+/// row. A prompt call names the message marks inside a pass here.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StateOut<'a> {
-    /// The rows after which a snapshot is taken; none for a prefill pass.
+    /// The rows after which a copy is taken, ascending, each a row of the
+    /// pass; at most [`SNAPS`]. None takes none.
     pub after_rows: &'a [u32],
 }
 
@@ -921,6 +931,12 @@ impl Session {
     /// they were; one in a later layer waits out the layers committed, and a
     /// failure at the settle leaves the stores as the buffers left them: the
     /// caller resets.
+    ///
+    /// `snaps` names the rows after which the delta layers' lanes and rings
+    /// are copied ([`StateOut`]); rows out of order, past the pass or more
+    /// than [`SNAPS`] are refused by name before anything runs. The copies
+    /// hold their positions once the pass settles clean, and until the next
+    /// pass, cut or reset.
     pub fn pass(
         &mut self,
         ids: &[u32],
@@ -956,12 +972,8 @@ impl Session {
         profile: Option<&mut Vec<PassSample>>,
     ) -> Result<Passed, SessionError> {
         self.ready()?;
-        if !snaps.after_rows.is_empty() {
-            return Err(refuse(
-                "a pass with per-row state snapshots: only the verify arm takes them",
-            ));
-        }
         let m = ids.len();
+        let after = snaps.after_rows;
         if m <= PASS_ROWS {
             return Err(refuse(format!(
                 "a pass of {m} ids; a step's window is {PASS_ROWS} and a pass is more"
@@ -970,6 +982,15 @@ impl Session {
         let cap = self.pass_rows();
         if m > cap {
             return Err(refuse(format!("a pass of {m} ids; a pass holds {cap}")));
+        }
+        if after.len() > SNAPS
+            || !after.windows(2).all(|w| w[0] < w[1])
+            || after.iter().any(|&r| r as usize >= m)
+        {
+            return Err(refuse(format!(
+                "a pass of {m} ids with copies after rows {after:?}: at most {SNAPS}, ascending, \
+                 each a row of the pass"
+            )));
         }
         let from = self.pos;
         let rows_n = u32::try_from(m).map_err(|_| refuse(format!("{m} ids do not fit u32")))?;
@@ -995,6 +1016,21 @@ impl Session {
             staged.commit();
             self.rows = Some(rows);
         }
+        if let Some(rows) = self.rows.as_mut() {
+            if !after.is_empty() && rows.snaps.is_none() {
+                let residency = self
+                    .stream
+                    .residency()
+                    .ok_or_else(|| refuse("the stream has no residency set"))?;
+                let staged = residency.stage();
+                let copies = SnapBufs::open(Alloc::new(&self.device, &staged), &self.arena)?;
+                staged.commit();
+                rows.snaps = Some(copies);
+            }
+            if let Some(copies) = rows.snaps.as_mut() {
+                copies.holds = [None; SNAPS];
+            }
+        }
         // Built before the first op commits, so a refused build leaves the
         // state, rings and cache as they were.
         self.kernels.prepare_prefill()?;
@@ -1013,6 +1049,7 @@ impl Session {
                     kernels: &self.kernels,
                     arena: &mut self.arena,
                     rows,
+                    after,
                     from,
                     head,
                 };
@@ -1038,6 +1075,7 @@ impl Session {
                     kernels: &self.kernels,
                     arena: &mut self.arena,
                     rows,
+                    after,
                     from,
                     head,
                     count: EncodeCount::default(),
@@ -1067,6 +1105,11 @@ impl Session {
         } else {
             ids[m - 1]
         };
+        if let Some(copies) = self.rows.as_mut().and_then(|r| r.snaps.as_mut()) {
+            for (held, &r) in copies.holds.iter_mut().zip(after) {
+                *held = Some(from + r + 1);
+            }
+        }
         self.pos = from + rows_n;
         Ok(Passed { id, count })
     }
@@ -1336,7 +1379,15 @@ impl Session {
         self.pos = 0;
         self.poisoned = None;
         self.checkpoints.clear();
+        self.drop_copies();
         Ok(())
+    }
+
+    /// The last pass's copies hold no position any more.
+    fn drop_copies(&mut self) {
+        if let Some(copies) = self.rows.as_mut().and_then(|r| r.snaps.as_mut()) {
+            copies.holds = [None; SNAPS];
+        }
     }
 
     /// The ledger's counts.
@@ -1387,35 +1438,90 @@ impl Session {
     /// pages straight into the point's slot. Refused while the session is
     /// poisoned.
     pub fn checkpoint(&mut self) -> Result<(), SessionError> {
+        self.take_point(self.pos, None)
+    }
+
+    /// A checkpoint at `at`, a position inside the last pass that pass left
+    /// a copy of ([`StateOut::after_rows`]): each delta layer's lane and ring
+    /// copied once from that copy into the point's slot, the stream idle. A
+    /// position no copy holds (another pass, a cut or a reset came since) is
+    /// refused by name, as is one past the position. Points go in ascending
+    /// order: a copy's point before the point at the pass's end.
+    pub fn checkpoint_copy(&mut self, at: u32) -> Result<(), SessionError> {
+        let held = self
+            .rows
+            .as_ref()
+            .and_then(|r| r.snaps.as_ref())
+            .and_then(|c| c.holds.iter().position(|&h| h == Some(at)));
+        match held {
+            Some(k) if at <= self.pos => self.take_point(at, Some(k)),
+            _ => Err(refuse(format!(
+                "a checkpoint at {at} from a pass's copy: no copy the last pass left holds it \
+                 (the session stands at {})",
+                self.pos
+            ))),
+        }
+    }
+
+    /// The point at `at` from each delta layer's live stores (`copy` none:
+    /// the lane at `at`'s parity, `at` the position) or from the last pass's
+    /// copy `copy`, after the stream is idle. Refused while poisoned.
+    fn take_point(&mut self, at: u32, copy: Option<usize>) -> Result<(), SessionError> {
         if let Some(fault) = self.poisoned {
             return Err(SessionError::Poisoned(fault));
         }
         self.quiesce()?;
         let lane_len = lane_len()?;
-        let start = lane_of(self.pos)
+        let live = lane_of(at)
             .checked_mul(lane_len)
             .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
+        let copies = match copy {
+            None => None,
+            Some(k) => Some((
+                k,
+                self.rows
+                    .as_ref()
+                    .and_then(|r| r.snaps.as_ref())
+                    .ok_or_else(|| refuse("a pass's copy with no copies open"))?,
+            )),
+        };
         let mut views = Vec::new();
-        for layer in &self.arena.layers {
+        for (l, layer) in self.arena.layers.iter().enumerate() {
             let MixerBufs::Delta(d) = &layer.mixer else {
                 continue;
             };
+            let (pages, lane_at, ring_at) = match copies {
+                None => ((&d.state, &d.ring), live, 0),
+                Some((k, c)) => {
+                    let at =
+                        c.at.get(l)
+                            .copied()
+                            .flatten()
+                            .ok_or_else(|| refuse(format!("delta layer {l} has no copies")))?;
+                    (
+                        (&c.lane, &c.ring),
+                        at.lane + k * lane_len,
+                        at.ring + k * at.ring_len,
+                    )
+                }
+            };
+            let ring_len = d.ring.len().get();
             // SAFETY: `quiesce` above left the stream idle (no token ahead,
-            // every committed buffer done), and the views borrow the arena,
-            // whose device work and host writes all go through `&mut self`,
-            // until the take below has copied them: nothing writes the pages
-            // while they are read.
-            let (state, ring) = unsafe { (d.state.pages().as_slice(), d.ring.pages().as_slice()) };
+            // every committed buffer done), and the views borrow the arena
+            // and the rows arena, whose device work and host writes all go
+            // through `&mut self`, until the take below has copied them:
+            // nothing writes the pages while they are read.
+            let (lane, ring) = unsafe { (pages.0.pages().as_slice(), pages.1.pages().as_slice()) };
             views.push(
-                state
-                    .get(start..start + lane_len)
+                lane.get(lane_at..lane_at + lane_len)
                     .ok_or_else(|| refuse("a delta state lane lies past its buffer"))?,
             );
-            views.push(ring);
+            views.push(
+                ring.get(ring_at..ring_at + ring_len)
+                    .ok_or_else(|| refuse("a delta conv ring lies past its buffer"))?,
+            );
         }
-        self.checkpoints
-            .take(self.pos, &views)
-            .map_err(checkpoint_error)
+        self.checkpoints.take(at, &views).map_err(checkpoint_error)
     }
 
     /// Cut to position `n`. A cut to 0 resets, which drops the checkpoints. A
@@ -1471,6 +1577,7 @@ impl Session {
             Err(e) => return Err(checkpoint_error(e)),
         }
         self.pos = n;
+        self.drop_copies();
         Ok(())
     }
 
@@ -1629,6 +1736,8 @@ struct PassLayers<'s> {
     kernels: &'s Kernels,
     arena: &'s mut Arena,
     rows: &'s mut RowsArena,
+    /// The rows the delta layers copy their stores after.
+    after: &'s [u32],
     from: u32,
     head: bool,
 }
@@ -1646,7 +1755,10 @@ impl PassLayers<'_> {
             f(&mut MetalOps::rows(
                 encoder,
                 self.arena,
-                RowsCtx { arena: self.rows },
+                RowsCtx {
+                    arena: self.rows,
+                    after: self.after,
+                },
                 self.kernels,
                 self.from,
                 self.head,
@@ -1782,6 +1894,8 @@ struct PassProfiler<'s> {
     kernels: &'s Kernels,
     arena: &'s mut Arena,
     rows: &'s mut RowsArena,
+    /// The rows the delta layers copy their stores after.
+    after: &'s [u32],
     from: u32,
     head: bool,
     count: EncodeCount,
@@ -1801,7 +1915,10 @@ impl PassProfiler<'_> {
         f(&mut MetalOps::rows(
             &mut enc,
             self.arena,
-            RowsCtx { arena: self.rows },
+            RowsCtx {
+                arena: self.rows,
+                after: self.after,
+            },
             self.kernels,
             self.from,
             self.head,
