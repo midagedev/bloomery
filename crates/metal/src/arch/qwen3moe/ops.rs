@@ -27,6 +27,7 @@ use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
 use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan};
 
 use super::arena::{Arena, LANES, MixerBufs, lane_of, layer_word, slot_before, slot_of};
+use super::rows::RowsArena;
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
@@ -35,9 +36,13 @@ use crate::kernels::router::RouterParams;
 use crate::kernels::{
     AttentionParams, AttnCache, CONV_TAPS, DeltaParams, EXPERT_K, EXPERT_SLOTS, EmbedParams,
     FoldParams, HEAD_COLS, HEAD_DIM, HEAD_SIMD_GROUPS, HeadNormParams, HeadParams, KV_HEADS,
-    Kernels, MatvecParams, Mode, NormOnLoad, PairParams, QUERY_HEADS, ROUTED_IDS, SegParams,
-    SharedPlan, VALUE_HEADS, partials_len, router, segments_for_keys,
+    Kernels, MatvecParams, Mode, NormOnLoad, PASS_ROWS, PairParams, QUERY_HEADS, ROUTED_IDS,
+    SegParams, SharedPlan, VALUE_HEADS, partials_len, router, segments_for_keys,
 };
+
+mod rows;
+
+pub(super) use rows::{AttnRun, attn_runs};
 
 const WHAT: &str = "qwen35moe ops";
 
@@ -71,10 +76,30 @@ pub(super) enum Feed {
     Device,
 }
 
+/// What a pass adds to a step's ops: the rows arena, and the launches the
+/// attention takes over the pass's positions.
+pub(super) struct RowsCtx<'a> {
+    pub(super) arena: &'a mut RowsArena,
+    pub(super) runs: &'a [AttnRun],
+}
+
+/// The arm a unit of rows takes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    /// One row: the token's mat-vecs.
+    Step,
+    /// More than a step's window: the GEMM arm over the rows arena.
+    Rows,
+}
+
 /// The ops of one token over the session's arena, encoding on `enc`. `pos`
 /// is the token's position: its cache row, its conv ring slot, its step
 /// record slot and its delta lanes. `head` names whether the token encodes
 /// the head: a step whose pick nobody reads skips it.
+///
+/// A pass over rows ([`MetalOps::rows`]) takes the rows arms: `pos` is the
+/// position of its first row, its step record slot is its last row's, and
+/// its delta lane words are the first row's lane and the lane after the last.
 pub(super) struct MetalOps<'a, 'e> {
     enc: &'a mut ComputeEncoder<'e>,
     arena: &'a mut Arena,
@@ -82,6 +107,7 @@ pub(super) struct MetalOps<'a, 'e> {
     pos: u32,
     feed: Feed,
     head: bool,
+    rows: Option<RowsCtx<'a>>,
 }
 
 impl<'a, 'e> MetalOps<'a, 'e> {
@@ -100,21 +126,47 @@ impl<'a, 'e> MetalOps<'a, 'e> {
             pos,
             feed,
             head,
+            rows: None,
+        }
+    }
+
+    /// The ops of a pass whose first row is at `from`, over `rows`.
+    pub(super) fn rows(
+        enc: &'a mut ComputeEncoder<'e>,
+        arena: &'a mut Arena,
+        rows: RowsCtx<'a>,
+        kernels: &'a Kernels,
+        from: u32,
+        head: bool,
+    ) -> Self {
+        Self {
+            enc,
+            arena,
+            kernels,
+            pos: from,
+            feed: Feed::Host,
+            head,
+            rows: Some(rows),
+        }
+    }
+
+    /// The arm a unit of `m` rows takes: a step runs one row, a pass more
+    /// than a step's window; any other count is refused by name.
+    fn arm(&self, m: usize) -> Result<Arm, SessionError> {
+        match (m, self.rows.is_some()) {
+            (1, false) => Ok(Arm::Step),
+            (m, true) if m > PASS_ROWS => Ok(Arm::Rows),
+            _ => Err(ChainError::shape(
+                WHAT,
+                format!("a unit of {m} rows; a step runs one and a pass more than {PASS_ROWS}"),
+            )
+            .into()),
         }
     }
 
     /// The group closes: the next op's dispatches see what this one wrote.
     fn close(&mut self) {
         self.enc.memory_barrier();
-    }
-
-    /// One row a step: the only unit this backend's ops encode.
-    fn one_row(m: usize) -> Result<(), SessionError> {
-        if m == 1 {
-            Ok(())
-        } else {
-            Err(ChainError::shape(WHAT, format!("a unit of {m} rows; a step runs one")).into())
-        }
     }
 
     /// Layer `l`'s P1: the norm on load, one dispatch per weight type, one
@@ -349,7 +401,9 @@ impl ChainOps for MetalOps<'_, '_> {
     type Error = SessionError;
 
     fn embed(&mut self, m: usize) -> Result<(), SessionError> {
-        Self::one_row(m)?;
+        if self.arm(m)? == Arm::Rows {
+            return self.rows_embed(m);
+        }
         let slot = slot_of(self.pos);
         let Arena {
             embed,
@@ -384,11 +438,16 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn attn_in(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
-        Self::one_row(l.m)?;
-        self.p1(l.layer)
+        match self.arm(l.m)? {
+            Arm::Step => self.p1(l.layer),
+            Arm::Rows => self.rows_p1(l.layer, l.m),
+        }
     }
 
     fn attn_core(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
+        if self.arm(l.m)? == Arm::Rows {
+            return self.rows_attn_core(l.layer, l.m);
+        }
         let n_keys = self.pos + 1;
         let segments = segments_for_keys(n_keys);
         // Live keys past one segment fold inside the flash: its last
@@ -397,6 +456,9 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn attn_out(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
+        if self.arm(l.m)? == Arm::Rows {
+            return self.rows_attn_out(l.layer, l.m);
+        }
         let Arena {
             layers,
             attn,
@@ -422,11 +484,16 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn delta_in(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
-        Self::one_row(l.m)?;
-        self.p1(l.layer)
+        match self.arm(l.m)? {
+            Arm::Step => self.p1(l.layer),
+            Arm::Rows => self.rows_p1(l.layer, l.m),
+        }
     }
 
     fn delta_core(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
+        if self.arm(l.m)? == Arm::Rows {
+            return self.rows_delta_core(l.layer, l.m);
+        }
         let pos = [self.pos];
         let slot = slot_of(self.pos);
         let Arena {
@@ -475,6 +542,9 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
+        if self.arm(l.m)? == Arm::Rows {
+            return self.rows_delta_out(l.layer, l.m);
+        }
         let slot = slot_of(self.pos);
         let Arena {
             layers,
@@ -507,6 +577,9 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn route(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), SessionError> {
+        if self.arm(l.m)? == Arm::Rows {
+            return self.rows_route(l.layer, l.m);
+        }
         let slot = slot_of(self.pos);
         let Arena {
             layers,
@@ -543,18 +616,24 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn experts(&mut self, l: LayerCtx<'_>, _: &FfnPlan) -> Result<(), SessionError> {
+        if self.arm(l.m)? == Arm::Rows {
+            return self.rows_experts(l.layer, l.m);
+        }
         self.experts_pair(l.layer)?;
         self.experts_fold(l.layer)
     }
 
     fn head(&mut self, m: usize) -> Result<(), SessionError> {
-        Self::one_row(m)?;
+        let arm = self.arm(m)?;
         if !self.head {
             // The call said nobody reads this token's pick: the head's
             // dispatch is the whole of what is skipped, and no later op
             // depends on it — the head closes no barrier and writes nothing
             // but its own outputs.
             return Ok(());
+        }
+        if arm == Arm::Rows {
+            return self.rows_head(m);
         }
         let slot = slot_of(self.pos);
         let Arena {

@@ -9,7 +9,8 @@
 //!   logits row bits, delta lanes, key and value rows and greedy picks as
 //!   the same ids stepped host-fed one at a time, on a session whose
 //!   checkpoints the prompt crosses (every second position) and one it does
-//!   not; `StepStats` shows the ids ahead all kept, their count the loop's
+//!   not, which steps its span (`PrefillMode::Steps`; a longer span is a pass
+//!   by default); `StepStats` shows the ids ahead all kept, their count the loop's
 //!   own rule (mirrored below for the expectation).
 //! - the checkpoint: the token ahead a mark's take waits out is dropped —
 //!   the rule the cut, fault and reset paths share — and the prompt on from
@@ -23,8 +24,8 @@ use bloomery_metal::arch::qwen3moe::count::{Layer, LiveKeys, Ticket, token_count
 use bloomery_metal::arch::qwen3moe::session::{Node, Session, StepMode, StepStats, Stepped};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::library::Library;
-use runtime::Target;
-use runtime::seqstate;
+use runtime::prompt::PrefillMode;
+use runtime::{Target, seqstate};
 
 use super::sets::{self, Set};
 use super::{CTX, says};
@@ -326,6 +327,10 @@ pub fn h_prompt(device: &MetalDevice, library: &Library, path: &Path) -> Clause 
         );
     }
     let mut wide = Session::open_with(device, library, path, CTX, WIDE).map_err(says)?;
+    // A span of more than a step's window is a pass by default; this clause
+    // holds the known-id run-ahead of the step loop, so the one span that is
+    // not cut at a mark steps. The pass has its own clauses (`pass.rs`).
+    wide.set_prefill(PrefillMode::Steps);
     let mut near = Session::open_with(device, library, path, CTX, EVERY).map_err(says)?;
 
     let reference = host_fed(&mut wide, &ids)?;

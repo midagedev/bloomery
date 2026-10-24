@@ -36,6 +36,16 @@
 //! there; a cut to 0 is a reset, which drops the points too. A cut the ledger
 //! refuses leaves the position and every store as they were.
 //!
+//! [`Session::pass`] runs more than a step's window of ids as one pass: every
+//! layer once over all the rows, its GEMMs and row kernels over the rows
+//! arena, opened on the first pass and kept. The pass is the token at its last
+//! position as far as the record goes: its faults land in, and its head writes
+//! its pick to, the step record slot of its last row, and the delta state it
+//! leaves is the lane a step at the position after it reads. A pass is a
+//! command buffer an op, the last one waited: there is no host wait inside the
+//! pass, and none past the last op's. A prompt call cuts its ids into passes
+//! at its checkpoint marks ([`Session::prefill`]).
+//!
 //! [`Session::step_traced`] is the instrument the gates read nodes through:
 //! the same ops of a host-fed step, each on a command buffer of its own,
 //! waited, with a hook after each. It encodes what [`Session::step`]
@@ -60,32 +70,49 @@ use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, GqaPlan, LayerPlan, SiteTy
 use chain::arch::qwen3moe::read::{PlanDims, Read35, Sites35, layer_plans};
 use chain::arch::qwen3moe::walk::Walk;
 use gguf::Split;
+use runtime::prompt::PrefillMode;
 use runtime::seqstate::{self, Kept};
 
 use super::arena::{Arena, LANES, MixerBufs, lane_of, slot_of};
 use super::count::{GroupBytes, GroupKind, Layer};
-use super::ops::{Feed, MetalOps};
+use super::ops::{AttnRun, Feed, MetalOps, RowsCtx, attn_runs};
+use super::rows::RowsArena;
 use crate::buffer::MetalBuffer;
 use crate::checkpoint::{self, Checkpoints};
 use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
-use crate::kernels::{HEAD_DIM, Kernels, segments_for_keys, state_elems};
+use crate::handle::Handle;
+use crate::kernels::{EXPERT_SLOTS, HEAD_DIM, Kernels, PASS_ROWS, segments_for_keys, state_elems};
 use crate::library::Library;
 use crate::stream::{GpuInterval, GpuStamps, MetalStream, Settled, Signalled, host_secs};
+use objc2_metal::MTLDevice;
 
 const WHAT: &str = "qwen35moe session";
 
-/// Positions between the inner checkpoints a prompt call takes
-/// ([`runtime::seqstate::marks`]).
+/// The most rows of one pass, and the spacing of a prompt call's inner
+/// checkpoints ([`runtime::seqstate::marks`]): a mark falls between two
+/// passes, so a pass never holds a position a checkpoint needs. The family's
+/// ubatch rule at nine slots a row over [`MAX_PASS_SLOTS`] slots
+/// ([`pass_rows_max`]).
 ///
 /// A point copies each delta layer's state lane and its conv ring.
 /// Qwen3.6-35B-A3B has 30 delta layers of 16 key heads and 32 value heads:
 /// a lane is 32·128·128 f32s (2_097_152 bytes) and a ring is
 /// 11·(2·16 + 32)·128 f32s (360_448 bytes), so a point is
-/// 30·(2_097_152 + 360_448) = 73_728_000 bytes. One copy every 256
-/// positions is 288_000 bytes beside each position of the prompt, and a
-/// cut between points re-feeds at most 255 positions.
-pub const CHECKPOINT_EVERY: u32 = 256;
+/// 30·(2_097_152 + 360_448) = 73_728_000 bytes. One copy every 2048
+/// positions is 36_000 bytes beside each position of the prompt, and a cut
+/// between points re-feeds at most 2047 positions.
+pub const CHECKPOINT_EVERY: u32 = 2048;
+
+/// The slots of one pass the rows arena holds: its experts' buffers are a row
+/// a slot.
+const MAX_PASS_SLOTS: usize = EXPERT_SLOTS * CHECKPOINT_EVERY as usize;
+
+/// The most rows of one pass, by the family's ubatch rule.
+#[must_use]
+pub fn pass_rows_max() -> usize {
+    chain::arch::qwen3moe::router::ubatch_at(EXPERT_SLOTS, MAX_PASS_SLOTS)
+}
 
 /// The site types Metal's mat-vecs launch: the kernels' quant set
 /// ([`Quant::of_ggml`](crate::kernels::Quant::of_ggml), held equal to this
@@ -405,6 +432,8 @@ pub enum Node {
     DeltaPartials,
     /// Layer `l`'s recurrent state.
     DeltaState(usize),
+    /// Layer `l`'s conv ring: every slot of the conv input rows.
+    DeltaRing(usize),
     /// The attention output after its gate.
     AttnOut,
     /// Layer `l`'s cache row `pos`, every key (or value) head, as f32.
@@ -472,6 +501,7 @@ impl Probe<'_> {
                 let at = self.lane * lane;
                 read(&delta(l)?.state, at..at + lane)
             }
+            Node::DeltaRing(l) => whole(&delta(l)?.ring),
             Node::AttnOut => whole(&a.attn),
             Node::KeyRow(l, pos) | Node::ValueRow(l, pos) => {
                 let at = attn(l)?;
@@ -531,6 +561,49 @@ pub struct Session {
     /// Each delta layer's state lane and conv ring, at the positions a
     /// prompt call takes.
     checkpoints: Checkpoints,
+    /// The device the rows arena is opened on, on the first pass.
+    device: Handle<dyn MTLDevice>,
+    /// The buffers of a pass, once a pass has run.
+    rows: Option<RowsArena>,
+    /// How a prompt call feeds its ids.
+    prefill: PrefillMode,
+}
+
+/// What a pass returns of its head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassOut {
+    /// No head: the rows' picks are nobody's. The pass returns the id it was
+    /// last fed.
+    None,
+    /// The head over the last row: its pick, and its logits row in
+    /// [`Session::logits_row`]. (The verify arm's every-row head is its own
+    /// variant.)
+    Last,
+}
+
+/// The per-row copies of the recurrent state a pass leaves, named by the
+/// rows they follow. A prefill pass takes none: its checkpoints fall between
+/// passes. The verify arm's rows are this argument's.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StateOut<'a> {
+    /// The rows after which a snapshot is taken; none for a prefill pass.
+    pub after_rows: &'a [u32],
+}
+
+/// One op of a profiled pass: the op, and the GPU seconds its own command
+/// buffer ran, waited before the next op's was committed.
+#[derive(Clone, Copy, Debug)]
+pub struct PassSample {
+    pub op: Op,
+    pub gpu_s: f64,
+}
+
+/// What a pass returns: the head's pick, or the id it was last fed, and what
+/// its ops encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Passed {
+    pub id: u32,
+    pub count: EncodeCount,
 }
 
 impl Session {
@@ -601,6 +674,9 @@ impl Session {
             stats: StepStats::default(),
             clock: None,
             checkpoints,
+            device: device.handle().clone(),
+            rows: None,
+            prefill: PrefillMode::Batch,
         })
     }
 
@@ -762,6 +838,153 @@ impl Session {
             _ => {}
         }
         stepped
+    }
+
+    /// How a prompt call feeds its ids: in passes, or a decode step each.
+    #[must_use]
+    pub fn prefill(&self) -> PrefillMode {
+        self.prefill
+    }
+
+    /// Feed prompt calls in passes ([`PrefillMode::Batch`], the default) or a
+    /// step each ([`PrefillMode::Steps`], the same-binary arm and the
+    /// oracle's).
+    pub fn set_prefill(&mut self, mode: PrefillMode) {
+        self.prefill = mode;
+    }
+
+    /// The most rows a pass of this session holds: the family's ubatch rule,
+    /// and no more than the cache's rows.
+    #[must_use]
+    pub fn pass_rows(&self) -> usize {
+        pass_rows_max().min(self.arena.ctx)
+    }
+
+    /// The bytes the rows arena holds, once a pass has opened it.
+    #[must_use]
+    pub fn rows_arena_bytes(&self) -> Option<u64> {
+        self.rows.as_ref().map(|r| r.bytes)
+    }
+
+    /// `ids` as one pass at the next positions: every layer once over all the
+    /// rows, the residual rows added into by GEMMs and row kernels. More than a
+    /// step's window ([`PASS_ROWS`]) and at most [`Session::pass_rows`] ids;
+    /// any other count is refused by name, with the position unmoved. A token
+    /// running ahead is waited out and dropped first. The pass is waited on
+    /// at its end: its fault word is read once, and a raise poisons the
+    /// session as a step's does. [`PassOut::Last`] runs the head over the last
+    /// row and returns its pick; [`PassOut::None`] returns the last id fed.
+    ///
+    /// A refusal or a failure inside the walk leaves the stores as the ops
+    /// that ran left them; the caller resets.
+    pub fn pass(
+        &mut self,
+        ids: &[u32],
+        out: PassOut,
+        snaps: StateOut<'_>,
+    ) -> Result<Passed, SessionError> {
+        self.pass_with(ids, out, snaps, None)
+    }
+
+    /// [`Session::pass`] with every op on a command buffer of its own,
+    /// waited before the next is committed, its GPU seconds read: one sample
+    /// an op, in the pass's order, appended to `samples` (cleared first). Each
+    /// buffer runs alone, so a sample is the op's own time and not a queued
+    /// buffer's overlap with the one before it.
+    pub fn pass_profile(
+        &mut self,
+        ids: &[u32],
+        out: PassOut,
+        samples: &mut Vec<PassSample>,
+    ) -> Result<Passed, SessionError> {
+        samples.clear();
+        self.pass_with(ids, out, StateOut::default(), Some(samples))
+    }
+
+    fn pass_with(
+        &mut self,
+        ids: &[u32],
+        out: PassOut,
+        snaps: StateOut<'_>,
+        profile: Option<&mut Vec<PassSample>>,
+    ) -> Result<Passed, SessionError> {
+        self.ready()?;
+        if !snaps.after_rows.is_empty() {
+            return Err(refuse(
+                "a pass with per-row state snapshots: only the verify arm takes them",
+            ));
+        }
+        let m = ids.len();
+        if m <= PASS_ROWS {
+            return Err(refuse(format!(
+                "a pass of {m} ids; a step's window is {PASS_ROWS} and a pass is more"
+            )));
+        }
+        let cap = self.pass_rows();
+        if m > cap {
+            return Err(refuse(format!("a pass of {m} ids; a pass holds {cap}")));
+        }
+        let from = self.pos;
+        let rows_n = u32::try_from(m).map_err(|_| refuse(format!("{m} ids do not fit u32")))?;
+        match from.checked_add(rows_n) {
+            Some(to) if to as usize <= self.arena.ctx => {}
+            _ => {
+                return Err(refuse(format!(
+                    "a pass of {m} ids at position {from}: the cache holds {} rows",
+                    self.arena.ctx
+                )));
+            }
+        }
+        if let Some(a) = self.ahead.take() {
+            self.drop_ahead(a)?;
+        }
+        if self.rows.is_none() {
+            self.rows = Some(RowsArena::open(&self.device, &self.arena, cap)?);
+        }
+        let rows = self
+            .rows
+            .as_mut()
+            .ok_or_else(|| refuse("the rows arena did not open"))?;
+        rows.ids.write_at(Elems(0), ids)?;
+        let slot = slot_of(from + rows_n - 1);
+        let head = out == PassOut::Last;
+        let runs = attn_runs(from, m);
+        let cap_rows = rows.cap;
+        let mut ops = PassOps {
+            stream: &self.stream,
+            kernels: &self.kernels,
+            arena: &mut self.arena,
+            rows,
+            runs: &runs,
+            from,
+            head,
+            count: EncodeCount::default(),
+            last: None,
+            profile,
+        };
+        let walked = Walk::new(&mut ops, &self.plans, m).run(cap_rows);
+        let (count, last) = (ops.count, ops.last.take());
+        if let Err(e) = walked {
+            if last.is_some() {
+                let _ = self.stream.sync();
+            }
+            return Err(e);
+        }
+        let settled = match last.ok_or_else(|| refuse("a pass settled no op"))? {
+            Waiting::Signalled(signalled) => self.stream.settle(signalled)?,
+            Waiting::Settled(settled) => settled,
+        };
+        if let Some(fault) = self.arena.faults[slot].read_settled(&settled)? {
+            self.poisoned = Some(fault);
+            return Err(SessionError::Fault(fault));
+        }
+        let id = if head {
+            self.arena.step_id.pages().load(slot, Ordering::Relaxed)?
+        } else {
+            ids[m - 1]
+        };
+        self.pos = from + rows_n;
+        Ok(Passed { id, count })
     }
 
     /// Commit the token ahead at `at` and register the promise `embeds`: the
@@ -1335,6 +1558,123 @@ where
     }
 }
 
+/// The pass's ops: each op of [`MetalOps`]'s rows arms on a command buffer
+/// of its own, committed with a signal and not waited; the last one's signal
+/// is what the pass settles. A buffer opens at the stream's token boundary,
+/// so each op sees what the one before it wrote.
+struct PassOps<'s> {
+    stream: &'s MetalStream,
+    kernels: &'s Kernels,
+    arena: &'s mut Arena,
+    rows: &'s mut RowsArena,
+    runs: &'s [AttnRun],
+    from: u32,
+    head: bool,
+    count: EncodeCount,
+    /// The last op's signal, or its settle in a profiled pass.
+    last: Option<Waiting>,
+    /// A profiled pass's samples: each op is waited and its GPU seconds read.
+    profile: Option<&'s mut Vec<PassSample>>,
+}
+
+/// The last op of a pass, as the pass waits on it.
+enum Waiting {
+    Signalled(Signalled),
+    Settled(Settled),
+}
+
+impl PassOps<'_> {
+    fn one(
+        &mut self,
+        op: Op,
+        f: impl FnOnce(&mut MetalOps<'_, '_>) -> Result<(), SessionError>,
+    ) -> Result<(), SessionError> {
+        let mut recording = self.stream.begin()?;
+        let mut enc = recording.token_encoder()?;
+        f(&mut MetalOps::rows(
+            &mut enc,
+            self.arena,
+            RowsCtx {
+                arena: self.rows,
+                runs: self.runs,
+            },
+            self.kernels,
+            self.from,
+            self.head,
+        ))?;
+        let c = enc.count();
+        enc.end();
+        // An op's own failure is named at the last op's settle: the driver
+        // reports a failed buffer there, whichever buffer it was.
+        let stamps = self.profile.is_some().then(|| recording.stamps());
+        let signalled = self.stream.submit_signalled(recording)?;
+        match (stamps, self.profile.as_mut()) {
+            (Some(stamps), Some(samples)) => {
+                let settled = self.stream.settle(signalled)?;
+                let gpu_s = match stamps.interval(STAMP_WAIT)? {
+                    GpuInterval::Ran(s) => s,
+                    GpuInterval::StillRunning => {
+                        return Err(refuse(format!(
+                            "{op:?}: its buffer still runs after its settle"
+                        )));
+                    }
+                };
+                samples.push(PassSample { op, gpu_s });
+                self.last = Some(Waiting::Settled(settled));
+            }
+            _ => self.last = Some(Waiting::Signalled(signalled)),
+        }
+        self.count.groups += c.groups;
+        self.count.dispatches += c.dispatches;
+        self.count.barriers += c.barriers;
+        Ok(())
+    }
+}
+
+impl ChainOps for PassOps<'_> {
+    type Error = SessionError;
+
+    fn embed(&mut self, m: usize) -> Result<(), SessionError> {
+        self.one(Op::Embed, |o| o.embed(m))
+    }
+
+    fn attn_in(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
+        self.one(Op::AttnIn(l.layer), |o| o.attn_in(l, g))
+    }
+
+    fn attn_core(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
+        self.one(Op::AttnCore(l.layer), |o| o.attn_core(l, g))
+    }
+
+    fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
+        self.one(Op::AttnOut(l.layer), |o| o.attn_out(l, g))
+    }
+
+    fn delta_in(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
+        self.one(Op::DeltaIn(l.layer), |o| o.delta_in(l, d))
+    }
+
+    fn delta_core(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
+        self.one(Op::DeltaCore(l.layer), |o| o.delta_core(l, d))
+    }
+
+    fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
+        self.one(Op::DeltaOut(l.layer), |o| o.delta_out(l, d))
+    }
+
+    fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
+        self.one(Op::Route(l.layer), |o| o.route(l, f))
+    }
+
+    fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
+        self.one(Op::Experts(l.layer), |o| o.experts(l, f))
+    }
+
+    fn head(&mut self, m: usize) -> Result<(), SessionError> {
+        self.one(Op::Head, |o| o.head(m))
+    }
+}
+
 /// The profiled step's groups: each group of [`MetalOps`] on its own command
 /// buffer, waited, its GPU interval read, one sample appended. The groups
 /// are the token's as the encoder counts them, so the walk's `attn_core`
@@ -1443,5 +1783,17 @@ impl ChainOps for Profiler<'_> {
 
     fn head(&mut self, m: usize) -> Result<(), SessionError> {
         self.one(GroupKind::Head, None, |o| o.head(m))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A prompt call's inner checkpoints fall between passes: their spacing
+    /// is the most rows of one pass.
+    #[test]
+    fn checkpoint_spacing_is_the_pass_rows() {
+        assert_eq!(pass_rows_max(), CHECKPOINT_EVERY as usize);
     }
 }

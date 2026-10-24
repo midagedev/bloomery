@@ -6,7 +6,7 @@
 //!
 //!     generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
 //!                    [--print-ids] [--profile [N]] [--profile-layers]
-//!                    [--step-times [N]]
+//!                    [--step-times [N]] [--prefill batch|steps] [--pass-times U]
 //!
 //! Defaults: N 32, C the smaller of 4096 and the file's `context_length`. A
 //! flag given twice takes its last value. `--prompt` tokenizes the text with
@@ -31,6 +31,14 @@
 //! The decode rate is the loop's passes over its wall: generated token 0
 //! comes from the prompt call and is in `decode_tokens`, not in the rate. A
 //! run of one token has no pass, and its rate prints `none`.
+//!
+//! `--pass-times U` times the ops of one pass of U prompt ids, each on a
+//! command buffer of its own waited before the next, as per-class sums.
+//!
+//! `--prefill steps` feeds the prompt a decode step an id, the same-binary arm
+//! of the default (`batch`: the prompt in passes of up to
+//! [`Session::pass_rows`] ids, a short one by steps); the summary prints the
+//! rows arena's bytes (`rows_arena_bytes`) once a pass has opened it.
 //!
 //! `--profile [N]` (default N 32; `--profile-layers` implies it) steps N
 //! more tokens after the summary, each group of each token on a command
@@ -72,8 +80,12 @@ mod cli {
     use bloomery_device::Device;
     use bloomery_metal::arch::qwen3moe::count::{GroupKind, KINDS};
     use bloomery_metal::arch::qwen3moe::generate::greedy;
-    use bloomery_metal::arch::qwen3moe::session::{ProfileGroup, Session, StepMode};
+    use bloomery_metal::arch::qwen3moe::session::{
+        Op, PassOut, PassSample, ProfileGroup, Session, StepMode,
+    };
     use bloomery_metal::device::MetalDevice;
+    use bloomery_metal::kernels::PASS_ROWS;
+    use runtime::prompt::PrefillMode;
 
     /// The model file, as the CUDA generate CLIs name it.
     const MODEL_ENV: &str = "BLOOMERY_REF_MODEL";
@@ -82,16 +94,25 @@ mod cli {
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]]
+generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U]
   the file is $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
   and the file's context_length; --print-ids prints the ids, not the text;
   --profile [N] (default 32) steps N more tokens after the summary, each
   group's GPU time and bytes printed; --profile-layers adds a layer each;
   --step-times [N] (default 32) steps N more tokens in each mode, the step
-  clock's phases a mode printed";
+  clock's phases a mode printed; --prefill steps feeds the prompt a step an
+  id, batch (the default) in passes; --pass-times U times the ops of one pass
+  of the first U prompt ids, one command buffer at a time";
 
     /// The flags that take a value.
-    const VALUE_FLAGS: [&str; 4] = ["--prompt", "--tokens", "-n", "--ctx"];
+    const VALUE_FLAGS: [&str; 6] = [
+        "--prompt",
+        "--tokens",
+        "-n",
+        "--ctx",
+        "--prefill",
+        "--pass-times",
+    ];
     /// The flags that stand alone.
     const BARE_FLAGS: [&str; 3] = ["--print-ids", "--help", "--profile-layers"];
     /// The profile tokens' default count, and the step-times' per mode.
@@ -120,6 +141,9 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         profile: Option<Profile>,
         /// `--step-times [N]`: the step clock's tokens a mode.
         step_times: Option<usize>,
+        prefill: PrefillMode,
+        /// `--pass-times U`: the rows of the pass whose ops are timed alone.
+        pass_times: Option<usize>,
         model: PathBuf,
     }
 
@@ -264,6 +288,23 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
                 "--step-times 0: a step-times run of no tokens; drop the flag to run none".into(),
             );
         }
+        let pass_times = match flag("--pass-times")? {
+            None => None,
+            Some(s) => {
+                let u: usize = s.parse().map_err(|e| format!("--pass-times {s}: {e}"))?;
+                if u <= PASS_ROWS {
+                    return Err(format!(
+                        "--pass-times {u}: a pass holds more than {PASS_ROWS} rows"
+                    ));
+                }
+                Some(u)
+            }
+        };
+        let prefill = match flag("--prefill")? {
+            None => PrefillMode::Batch,
+            Some(s) => PrefillMode::from_name(&s)
+                .ok_or_else(|| format!("--prefill {s}: batch or steps"))?,
+        };
         let model = match std::env::var_os(MODEL_ENV) {
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => {
@@ -279,6 +320,8 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             print_ids,
             profile,
             step_times,
+            prefill,
+            pass_times,
             model,
         })
     }
@@ -473,6 +516,83 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
     /// as one line, then the count. The lines are development-loop numbers,
     /// like the summary's: the three runs sit at three depths, a mode's
     /// attention reading a few keys more than the mode before it.
+    /// The pass over the first `u` ids of the prompt with every op on a
+    /// command buffer of its own, waited before the next is committed: the
+    /// op's GPU seconds are its own and never a queued buffer's overlap. One
+    /// warm pass and `PASS_TIMES_RUNS` timed ones from position 0, each op's
+    /// median; the sums per class print as lines, in milliseconds. The
+    /// session is reset before and after.
+    fn pass_times_run(s: &mut Session, prompt: &[u32], u: usize) -> Result<(), String> {
+        const PASS_TIMES_RUNS: usize = 3;
+        if prompt.len() < u {
+            return Err(format!(
+                "--pass-times {u}: the prompt holds {} ids",
+                prompt.len()
+            ));
+        }
+        let ids = &prompt[..u];
+        let mut runs: Vec<Vec<PassSample>> = Vec::new();
+        for run in 0..=PASS_TIMES_RUNS {
+            s.reset().map_err(|e| e.to_string())?;
+            let mut samples = Vec::new();
+            s.pass_profile(ids, PassOut::Last, &mut samples)
+                .map_err(|e| e.to_string())?;
+            if run > 0 {
+                runs.push(samples);
+            }
+        }
+        s.reset().map_err(|e| e.to_string())?;
+        let n = runs[0].len();
+        if runs.iter().any(|r| r.len() != n) {
+            return Err("the timed passes ran different op counts".into());
+        }
+        let mut classes: Vec<(&str, f64)> = [
+            "gemm",
+            "route",
+            "experts",
+            "delta",
+            "attention",
+            "embed_head",
+        ]
+        .into_iter()
+        .map(|c| (c, 0.0))
+        .collect();
+        let mut total = 0.0;
+        for i in 0..n {
+            let mut t: Vec<f64> = runs.iter().map(|r| r[i].gpu_s).collect();
+            t.sort_by(f64::total_cmp);
+            let med = t[t.len() / 2];
+            let class = match runs[0][i].op {
+                Op::AttnIn(_) | Op::AttnOut(_) | Op::DeltaIn(_) | Op::DeltaOut(_) => "gemm",
+                Op::Route(_) => "route",
+                Op::Experts(_) => "experts",
+                Op::DeltaCore(_) => "delta",
+                Op::AttnCore(_) => "attention",
+                Op::Embed | Op::Head => "embed_head",
+            };
+            if let Some(c) = classes.iter_mut().find(|c| c.0 == class) {
+                c.1 += med;
+            }
+            total += med;
+        }
+        eprintln!(
+            "pass_times rows={u} ops={n} runs={PASS_TIMES_RUNS} (median per op, one buffer at a time)"
+        );
+        for (c, t) in &classes {
+            eprintln!(
+                "pass_times class={c} ms={:.2} share={:.1}%",
+                t * 1e3,
+                t / total * 100.0
+            );
+        }
+        eprintln!(
+            "pass_times total_ms={:.2} rows_per_s={:.0}",
+            total * 1e3,
+            u as f64 / total
+        );
+        Ok(())
+    }
+
     fn step_times_run(s: &mut Session, n: usize, id: u32) -> Result<(), String> {
         let rows = s.ctx() - s.pos() as usize;
         let per = n.min(rows / 3);
@@ -563,6 +683,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         let t0 = Instant::now();
         let mut session =
             Session::open(&device, device.library(), &a.model, ctx).map_err(|e| e.to_string())?;
+        session.set_prefill(a.prefill);
         let open_s = t0.elapsed().as_secs_f64();
         // The census's free bytes are the working set less the driver's own
         // `currentAllocatedSize`, the one count of the live device buffers
@@ -588,6 +709,9 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         eprintln!("model={}", a.model.display());
         eprintln!("open_s={open_s:.3}");
         eprintln!("device_allocated_bytes={allocated}");
+        if let Some(bytes) = session.rows_arena_bytes() {
+            eprintln!("rows_arena_bytes={bytes}");
+        }
         eprintln!("prompt_ids={}", prompt.len());
         eprintln!("prompt_s={prompt_s:.3}");
         eprintln!("prompt_tok_s={:.1}", prompt.len() as f64 / prompt_s);
@@ -607,6 +731,9 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
                 .ok_or("a profile of no token: the run picked none")?;
             let decode_ms = (out.passes > 0).then(|| decode_s / out.passes as f64 * 1e3);
             profile_run(&mut session, p, id, decode_ms)?;
+        }
+        if let Some(u) = a.pass_times {
+            pass_times_run(&mut session, &prompt, u)?;
         }
         if let Some(n) = a.step_times {
             let id = *out

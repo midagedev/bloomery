@@ -11,6 +11,8 @@ pub mod generate;
 #[cfg(target_os = "macos")]
 mod ops;
 #[cfg(target_os = "macos")]
+mod rows;
+#[cfg(target_os = "macos")]
 pub mod session;
 #[cfg(target_os = "macos")]
 pub mod target;

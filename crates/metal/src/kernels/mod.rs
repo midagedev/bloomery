@@ -33,6 +33,7 @@ mod head;
 mod headnorm;
 mod matvec;
 mod norm;
+mod routed;
 pub mod router;
 mod router_geom;
 mod rows;
@@ -69,6 +70,11 @@ pub use head::{HEAD_GROUPS, HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HEAD_VOCAB, 
 pub use headnorm::HeadNormParams;
 pub use matvec::{MatvecParams, Mode, NormOnLoad, Quant};
 pub use norm::NormRowsParams;
+pub use routed::{
+    CombineParams, F32GemmParams, HeadNormRowsParams, LOGIT_STRIDE, ROUTE_TILE, ROUTED_ROWS,
+    RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, SLOTS_PER_ROW,
+    route_table_words, route_tiles,
+};
 pub use seg::{SegParams, Segment};
 
 use bloomery_device::DeviceError;
@@ -121,6 +127,9 @@ pub struct Kernels {
     router: Pipeline,
     /// The RMS norm over rows.
     norm_rows: Pipeline,
+    /// The pass's routing, grouped experts and row glue (`route.metal`,
+    /// `gemm_routed.metal`).
+    routed: routed::RoutedPipelines,
     experts: experts::Pipelines,
     /// The gated delta step.
     delta: Pipeline,
@@ -278,6 +287,7 @@ impl Kernels {
             embed_a4: library.pipeline("embed_a4")?,
             router: library.pipeline("router35")?,
             norm_rows: library.pipeline("norm_rows")?,
+            routed: routed::RoutedPipelines::new(library)?,
             experts: experts::Pipelines::new(library, count)?,
             delta: library.pipeline("gdn_step")?,
             delta_rows: delta::RowsPipelines::new(library)?,

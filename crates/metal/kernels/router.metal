@@ -57,13 +57,106 @@ inline float4 router_load4(device const float *p, uint f4)
     return *((device const float4 *)(p + f4 * 4u));
 }
 
+// The selection, from the logits and packed keys a threadgroup has published
+// in threadgroup memory: the first SIMD group alone, after the barrier that
+// published them. The group reduces the "bad" flags (a logit that is not
+// finite raises the router site and leaves NaN weights over the ids 0.. in
+// order); else its lanes take the keys their rows left, eight each at 32
+// lanes over the routed experts, and the selection runs in rounds of the
+// group's largest packed key reduced by two SIMD maximums, with no further
+// barrier. The weights stay on lane 0, serial, so their bits stay put. The
+// ticket, when the caller holds one, resets after the weights. The decode's
+// last threadgroup and the rows kernel both end here: the ids and weights
+// pointers are the row's.
+static void route_pick(device uint *ids,
+                       device float *weights,
+                       device atomic_uint *ticket,
+                       device atomic_uint *faults,
+                       uint top_k,
+                       uint layer,
+                       uint lane,
+                       threadgroup float *tg_logits,
+                       threadgroup ulong *tg_keys,
+                       threadgroup uint *tg_bad)
+{
+    uint bad = tg_bad[0];
+    for (uint g = 1u; g < ROUTER_SG; ++g) {
+        bad = max(bad, tg_bad[g]);
+    }
+    if (bad != 0u) {
+        if (lane == 0u) {
+            raise(faults, layer, BLOOMERY_FAULT_SITE_ROUTER);
+            for (uint s = 0u; s < top_k; ++s) {
+                ids[s] = s;
+                weights[s] = NAN;
+            }
+            ids[top_k] = ROUTER_EXPERTS;
+            weights[top_k] = NAN;
+            if (ticket != nullptr) {
+                ticket_reset(ticket);
+            }
+        }
+        return;
+    }
+    // The group's lanes take the keys their rows left, eight each at 32
+    // lanes over the routed experts.
+    ulong held[ROUTER_KEYS];
+    for (uint j = 0u; j < ROUTER_KEYS; ++j) {
+        held[j] = tg_keys[lane + ROUTER_LANES * j];
+    }
+    // One round per selected expert: the group's largest key names this
+    // round's selection, and the round's winner is keyed out of the next.
+    // The key's order is the old scan's: the larger value first, at an equal
+    // value the smaller id.
+    float chosen_v[ROUTER_TOPK_MAX];
+    for (uint s = 0u; s < top_k; ++s) {
+        ulong local = 0u;
+        for (uint j = 0u; j < ROUTER_KEYS; ++j) {
+            local = max(local, held[j]);
+        }
+        // The group's key, reduced as ticket_max_key reduces a group's: the
+        // high half's maximum, then the low halves' maximum of the lanes that
+        // hold it.
+        uint o = uint(local >> 32);
+        uint hi = simd_max(o);
+        uint lo = simd_max(o == hi ? uint(local) : 0u);
+        const ulong chosen_key = ((ulong)hi << 32) | (ulong)lo;
+        for (uint j = 0u; j < ROUTER_KEYS; ++j) {
+            if (held[j] == chosen_key) {
+                held[j] = 0u;
+            }
+        }
+        if (lane == 0u) {
+            uint best_i = ~uint(chosen_key);
+            ids[s] = best_i;
+            chosen_v[s] = tg_logits[best_i];
+        }
+    }
+    // The softmax and the shared expert's sigmoid stay on one thread, in the
+    // order the serial epilogue once used, so the weights' bits do not move.
+    if (lane == 0u) {
+        float l_max = chosen_v[0];
+        float term[ROUTER_TOPK_MAX];
+        float sum_exp = 0.f;
+        for (uint s = 0u; s < top_k; ++s) {
+            term[s] = exp(chosen_v[s] - l_max);
+            sum_exp += term[s];
+        }
+        for (uint s = 0u; s < top_k; ++s) {
+            weights[s] = term[s] / sum_exp;
+        }
+        ids[top_k] = ROUTER_EXPERTS;
+        weights[top_k] = 1.f / (1.f + exp(-tg_logits[ROUTER_EXPERTS]));
+        if (ticket != nullptr) {
+            ticket_reset(ticket);
+        }
+    }
+}
+
 // The last threadgroup's whole epilogue, after ticket_acquire: every thread
 // reads its one or two rows' partials (the whole threadgroup's loads at
 // once), writes the logits and the packed keys to threadgroup memory, and one
-// barrier publishes them; the first SIMD group's lanes then take their eight
-// keys each, and the selection runs in rounds of the group's largest packed
-// key reduced by two SIMD maximums, with no further barrier. The weights and
-// the reset stay on lane 0, serial, so the weights' bits stay put.
+// barrier publishes them; the first SIMD group then selects (route_pick).
 static void route_last(device coherent(device) float *partials,
                        device atomic_uint *ticket,
                        device float *logits,
@@ -102,74 +195,8 @@ static void route_last(device coherent(device) float *partials,
     if (sg_in_tg != 0u) {
         return;
     }
-    uint bad = tg_bad[0];
-    for (uint g = 1u; g < ROUTER_SG; ++g) {
-        bad = max(bad, tg_bad[g]);
-    }
-    if (bad != 0u) {
-        if (lane == 0u) {
-            raise(faults, args.layer, BLOOMERY_FAULT_SITE_ROUTER);
-            for (uint s = 0u; s < args.top_k; ++s) {
-                ids[s] = s;
-                weights[s] = NAN;
-            }
-            ids[args.top_k] = ROUTER_EXPERTS;
-            weights[args.top_k] = NAN;
-            ticket_reset(ticket);
-        }
-        return;
-    }
-    // The group's lanes take the keys their rows left, eight each at 32
-    // lanes over the routed experts.
-    ulong held[ROUTER_KEYS];
-    for (uint j = 0u; j < ROUTER_KEYS; ++j) {
-        held[j] = tg_keys[lane + ROUTER_LANES * j];
-    }
-    // One round per selected expert: the group's largest key names this
-    // round's selection, and the round's winner is keyed out of the next.
-    // The key's order is the old scan's: the larger value first, at an equal
-    // value the smaller id.
-    float chosen_v[ROUTER_TOPK_MAX];
-    for (uint s = 0u; s < args.top_k; ++s) {
-        ulong local = 0u;
-        for (uint j = 0u; j < ROUTER_KEYS; ++j) {
-            local = max(local, held[j]);
-        }
-        // The group's key, reduced as ticket_max_key reduces a group's: the
-        // high half's maximum, then the low halves' maximum of the lanes that
-        // hold it.
-        uint o = uint(local >> 32);
-        uint hi = simd_max(o);
-        uint lo = simd_max(o == hi ? uint(local) : 0u);
-        const ulong chosen_key = ((ulong)hi << 32) | (ulong)lo;
-        for (uint j = 0u; j < ROUTER_KEYS; ++j) {
-            if (held[j] == chosen_key) {
-                held[j] = 0u;
-            }
-        }
-        if (lane == 0u) {
-            uint best_i = ~uint(chosen_key);
-            ids[s] = best_i;
-            chosen_v[s] = tg_logits[best_i];
-        }
-    }
-    // The softmax and the shared expert's sigmoid stay on one thread, in the
-    // order the serial epilogue once used, so the weights' bits do not move.
-    if (lane == 0u) {
-        float l_max = chosen_v[0];
-        float term[ROUTER_TOPK_MAX];
-        float sum_exp = 0.f;
-        for (uint s = 0u; s < args.top_k; ++s) {
-            term[s] = exp(chosen_v[s] - l_max);
-            sum_exp += term[s];
-        }
-        for (uint s = 0u; s < args.top_k; ++s) {
-            weights[s] = term[s] / sum_exp;
-        }
-        ids[args.top_k] = ROUTER_EXPERTS;
-        weights[args.top_k] = 1.f / (1.f + exp(-tg_logits[ROUTER_EXPERTS]));
-        ticket_reset(ticket);
-    }
+    route_pick(ids, weights, ticket, faults, args.top_k, args.layer, lane, tg_logits, tg_keys,
+               tg_bad);
 }
 
 kernel void router35(device const float *routed [[buffer(0)]],

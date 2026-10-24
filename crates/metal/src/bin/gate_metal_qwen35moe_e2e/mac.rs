@@ -70,6 +70,14 @@
 //!   site lists — and `generate` over `Plain` emits the session's own
 //!   host-fed picks (`t_target`'s greedy pattern on that session).
 //!
+//! - `q_short`, `q_state`, `q_chunk`, `q_ref`, `q_free`, `q_fault`: the batched prompt
+//!   pass (`pass.rs`): a prompt of at most a step's window is the step path;
+//!   one pass against the stepped ids leaves layer 0's state and ring within a
+//!   derived band; the pass size moves no bit; the step at the prompt's depth
+//!   against ik's `l_out` and logits, the pass run's distance over the stepped
+//!   run's within a ratio; the greedy tokens teacher-forced through both; an
+//!   id past the vocabulary in a pass raises the token-id site and poisons.
+//!
 //! `--nodes` is a tool, not a clause: its set's prompt host-fed, then its
 //! step token traced, every named node against ik's, the first past its
 //! band printed (`--set d1k` walks the d1k set at its depth; the step set is
@@ -118,6 +126,8 @@ mod mlx_split;
 mod mutants;
 #[path = "nodes.rs"]
 mod nodes;
+#[path = "pass.rs"]
+mod pass;
 #[path = "profile.rs"]
 mod profile;
 #[path = "serve.rs"]
@@ -440,7 +450,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 13] = [
+    const NAMES: [&str; 19] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -454,6 +464,12 @@ pub fn main() -> ExitCode {
         "f_deep",
         "p_profile",
         "m_mlx",
+        "q_short",
+        "q_state",
+        "q_chunk",
+        "q_ref",
+        "q_free",
+        "q_fault",
     ];
     if args.iter().any(|a| a == "--list") {
         for name in NAMES {
@@ -572,6 +588,12 @@ pub fn main() -> ExitCode {
             "f_deep" => deep::f_deep(&device, library, &path),
             "p_profile" => profile::p_profile(&device, library, &path),
             "m_mlx" => mlx::m_mlx(&device, library),
+            "q_short" => pass::q_short(&device, library, &path),
+            "q_state" => pass::q_state(&device, library, &path),
+            "q_chunk" => pass::q_chunk(&device, library, &path),
+            "q_ref" => pass::q_ref(&device, library, &path),
+            "q_free" => pass::q_free(&device, library, &path),
+            "q_fault" => pass::q_fault(&device, library, &path),
             _ => free::a_free(&mut session),
         };
         report.clause(name, result);

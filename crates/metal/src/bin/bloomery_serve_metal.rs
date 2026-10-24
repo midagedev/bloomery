@@ -19,8 +19,10 @@
 //! checkpoint of the delta layers' recurrent state: a prompt call takes one
 //! at its start, every `CHECKPOINT_EVERY` positions and at its end, and a
 //! prompt split at each message start makes that start a call's end. Any
-//! other prefix runs from position 0. The prompt runs one host-fed step a
-//! id. No prompt cache, no slot files, no image input.
+//! other prefix runs from position 0. A prompt span of more than a step's
+//! window runs in passes of up to `Session::pass_rows` ids (`Target::prompt`),
+//! a shorter one a host-fed step an id. No prompt cache, no slot files, no
+//! image input.
 //!
 //! A bad flag or value is a named error and exit 64; a refusal of the file,
 //! the device or the session is a named error and exit 1; an engine failure

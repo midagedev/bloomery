@@ -30,8 +30,8 @@ struct Weights {
 
 pub(super) struct Out {
     pub(super) logits: Vec<f32>,
-    ids: Vec<u32>,
-    weights: Vec<f32>,
+    pub(super) ids: Vec<u32>,
+    pub(super) weights: Vec<f32>,
 }
 
 fn load_weights(fixture: &Fixture) -> Result<Weights, String> {

@@ -98,6 +98,28 @@ pub const MUTANTS: &[Mutant] = &[
             1,
         )],
     },
+    Mutant {
+        name: "prefill_ring_last_row",
+        clause: "q_state",
+        why: "the ring commit of a pass writes the rows before the last: the last row's \
+              conv input is missing from its slot",
+        edits: &[(
+            "uint r = args.rows - kept + i;",
+            "uint r = args.rows - kept + i - 1u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prefill_kv_offset",
+        clause: "q_ref",
+        why: "a pass appends and attends its rows one position after their own: the cache \
+              holds the prompt shifted by a row",
+        edits: &[(
+            "a.pos = args.from + row;",
+            "a.pos = args.from + row + 1u;",
+            1,
+        )],
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static Mutant> {

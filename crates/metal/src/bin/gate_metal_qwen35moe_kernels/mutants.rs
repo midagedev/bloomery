@@ -215,11 +215,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "router_nan",
         clause: "router_nan",
         why: "a non-finite logit raises nothing",
-        edits: &[(
-            "raise(faults, args.layer, BLOOMERY_FAULT_SITE_ROUTER);",
-            "",
-            1,
-        )],
+        edits: &[("raise(faults, layer, BLOOMERY_FAULT_SITE_ROUTER);", "", 1)],
     },
     Mutant {
         name: "router_bounds",
@@ -777,6 +773,162 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "const bool4 bad = !(fabs(v) <= 65504.f);",
             "const bool4 bad = bool4(false);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "route_rows_stride",
+        clause: "route_rows_select",
+        why: "a row's logits start a router's 257 rows on, ignoring the stride the pass keeps them at",
+        edits: &[(
+            "device const float *lr = logits + (ulong)row * args.stride;",
+            "device const float *lr = logits + (ulong)row * ROUTER_ROWS;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "route_rows_per_row",
+        clause: "route_rows_select",
+        why: "a row's ids and weights are written at the picks' stride, not the picks and the shared slot's",
+        edits: &[(
+            "const uint per_row = args.top_k + 1u;",
+            "const uint per_row = args.top_k;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "route_table_duplicate",
+        clause: "route_table",
+        why: "every slot of a group takes the group's first place, so the later slots are lost",
+        edits: &[(
+            "start[g] + atomic_fetch_add_explicit(&count[g], 1u, memory_order_relaxed);",
+            "start[g] + atomic_fetch_add_explicit(&count[g], 0u, memory_order_relaxed);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "route_table_tile_cut",
+        clause: "route_table",
+        why: "a group's last partial tile is not counted, so its slots are in no tile",
+        edits: &[(
+            "tile += (n + ROUTE_TILE - 1u) / ROUTE_TILE;",
+            "tile += n / ROUTE_TILE;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_expert_base",
+        clause: "grouped_gemm",
+        why: "a group reads the next expert's weights",
+        edits: &[(
+            ": W + (ulong)expert * args.stack_blocks;",
+            ": W + (ulong)(expert + 1u) * args.stack_blocks;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_shared_base",
+        clause: "grouped_gemm",
+        why: "the shared group reads the stack's first expert, not the shared tensors",
+        edits: &[("shared ? W_sh : W +", "shared ? W : W +", 1)],
+    },
+    Mutant {
+        name: "routed_no_weight",
+        clause: "grouped_gemm",
+        why: "the pair's output is not scaled by the slot's route weight",
+        edits: &[
+            (
+                "p[o] = pair_swiglu(c[i][j].x, c[i][j + 2].x) * rw;",
+                "p[o] = pair_swiglu(c[i][j].x, c[i][j + 2].x);",
+                1,
+            ),
+            (
+                "p[o + 1] = pair_swiglu(c[i][j].y, c[i][j + 2].y) * rw;",
+                "p[o + 1] = pair_swiglu(c[i][j].y, c[i][j + 2].y);",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "routed_silu_up",
+        clause: "grouped_gemm",
+        why: "the pair applies silu to the up projection and multiplies by the gate",
+        edits: &[
+            (
+                "p[o] = pair_swiglu(c[i][j].x, c[i][j + 2].x) * rw;",
+                "p[o] = pair_swiglu(c[i][j + 2].x, c[i][j].x) * rw;",
+                1,
+            ),
+            (
+                "p[o + 1] = pair_swiglu(c[i][j].y, c[i][j + 2].y) * rw;",
+                "p[o + 1] = pair_swiglu(c[i][j + 2].y, c[i][j].y) * rw;",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "routed_no_gather",
+        clause: "grouped_gemm",
+        why: "the pair's activation rows are the places' own, not the slots' pass rows",
+        edits: &[(
+            "const ulong src_row = args.gather != 0u ? (ulong)(sorted[place] / BLOOMERY_EXPERT_SLOTS) : (ulong)place;",
+            "const ulong src_row = (ulong)place;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_dead_fragment",
+        clause: "grouped_gemm",
+        why: "a fragment row-block that holds live rows but fewer than a block is treated as dead",
+        edits: &[(
+            "live[i] = gm + 16 * i < count;",
+            "live[i] = gm + 16 * i + 8 < count;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_range_off",
+        clause: "grouped_gemm",
+        why: "the grouped GEMM's f16 range check is gone, so an activation past the half range casts to inf",
+        edits: &[(
+            "const bool4 over = !(fabs(v) <= 65504.f);",
+            "const bool4 over = bool4(false);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "combine_skip_shared",
+        clause: "combine",
+        why: "the combine sums the picks and leaves the shared expert's slot out",
+        edits: &[(
+            "for (uint s = 0u; s < args.per_row; ++s) {",
+            "for (uint s = 0u; s + 1u < args.per_row; ++s) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "headnorm_rows_head",
+        clause: "headnorm_rows",
+        why: "a head's scale is taken from the next head's partials",
+        edits: &[(
+            "head * BLOOMERY_DELTA_COLUMN_BLOCKS;",
+            "((head + 1u) % BLOOMERY_DELTA_VALUE_HEADS) * BLOOMERY_DELTA_COLUMN_BLOCKS;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "headnorm_rows_no_raise",
+        clause: "headnorm_rows",
+        why: "a head the rows norm cannot take is NaN and raises nothing",
+        edits: &[("raise(faults, args.layer, site);", "", 1)],
+    },
+    Mutant {
+        name: "gemm_f32w_rotate",
+        clause: "gemm_f32w",
+        why: "an f32 weight block's sixteen values are staged rotated by one",
+        edits: &[(
+            "reg[i / 4][i % 4] = (T)blk.v[i];",
+            "reg[i / 4][i % 4] = (T)blk.v[(i + 1) % 16];",
             1,
         )],
     },

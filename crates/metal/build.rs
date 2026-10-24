@@ -264,6 +264,8 @@ fn main() {
         "ticket",
         "router",
         "experts",
+        "route",
+        "gemm_routed",
         "delta",
         "attention",
         "head",

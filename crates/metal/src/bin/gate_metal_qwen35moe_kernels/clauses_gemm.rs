@@ -50,11 +50,11 @@ use super::oracle::{self, U};
 use super::{Harness, SENTINEL_BITS};
 
 /// The half operand's cast rounds once, relatively.
-const HALF_ROUND: f64 = 1.0 / 2048.0;
+pub(super) const HALF_ROUND: f64 = 1.0 / 2048.0;
 
 /// The most absolute error of a cast into the f16 subnormal range: half the
 /// grid's spacing.
-const HALF_SUBNORMAL: f64 = 1.0 / 33_554_432.0;
+pub(super) const HALF_SUBNORMAL: f64 = 1.0 / 33_554_432.0;
 
 /// The words the output buffer holds before its window, so a store before
 /// the window's first row lands on them and the guard sees it.
@@ -234,7 +234,7 @@ fn check_guards(back: &[f32], y_len: usize) -> Result<(), String> {
 
 /// Σ|w_c| per output column, in f64 over the reader's dequantized row: the
 /// f16 operand's subnormal-cast absolute term's activation side.
-fn weight_abs_sums(
+pub(super) fn weight_abs_sums(
     quant: Quant,
     weights: &[u8],
     rows: usize,
@@ -253,7 +253,7 @@ fn weight_abs_sums(
 /// The GEMM's band: the relative factor over the oracle's magnitude sum and
 /// the operations of the longest path (the absolute floor's count). The
 /// derivation is this module's doc's.
-fn gemm_band(quant: Quant, cols: usize, operand: Operand) -> (f64, usize) {
+pub(super) fn gemm_band(quant: Quant, cols: usize, operand: Operand) -> (f64, usize) {
     let base = match quant {
         Quant::Q4K => 4,
         Quant::Q6K | Quant::A4 => 2,

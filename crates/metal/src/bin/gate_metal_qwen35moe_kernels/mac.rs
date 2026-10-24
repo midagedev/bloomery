@@ -51,6 +51,8 @@ mod clauses_head;
 mod clauses_matvec;
 #[path = "clauses_norm.rs"]
 mod clauses_norm;
+#[path = "clauses_route.rs"]
+mod clauses_route;
 #[path = "clauses_router.rs"]
 mod clauses_router;
 #[path = "clauses_rows.rs"]
@@ -644,6 +646,7 @@ pub fn main() -> ExitCode {
         .chain(clauses_attention::table(&ctx))
         .chain(clauses_head::table(&ctx))
         .chain(clauses_rows::table(&ctx))
+        .chain(clauses_route::table(&ctx, &mlx))
         .collect();
     if args.iter().any(|a| a == "--list") {
         for (name, _) in &clauses {

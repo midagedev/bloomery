@@ -19,15 +19,19 @@
 //!   committed. The row is the head's shared pages themselves, zero copy,
 //!   and the argmax is the row's own by the head's tie rule (the smaller id
 //!   at an equal value).
-//! - `prompt`, the ids one ahead step each where the next id is known and
-//!   inner — [`StepMode::Ahead`], no head on a row whose pick nobody reads —
-//!   and a checkpoint at each position [`runtime::seqstate::marks`] names:
+//! - `prompt`, the ids cut at the checkpoint marks ([`runtime::seqstate::marks`]:
 //!   the call's start when the session already holds one, every
-//!   [`CHECKPOINT_EVERY`](super::session::CHECKPOINT_EVERY) positions
-//!   inside, and the call's end, each take waiting out whatever token runs
-//!   ahead of it. The span's last row and the row before the prompt's last
-//!   commit nothing ahead — the mark's take, and the last row's own head,
-//!   the one pick read back after the last as asked.
+//!   [`CHECKPOINT_EVERY`](super::session::CHECKPOINT_EVERY) positions inside,
+//!   and the call's end) and each run between two marks cut by
+//!   [`runtime::prompt::call_batches`] at the session's pass rows. A batch of
+//!   more than a step's window is one [`Session::pass`]; a shorter one steps
+//!   its ids one ahead each where the next id is known and inner —
+//!   [`StepMode::Ahead`], no head on a row whose pick nobody reads — the
+//!   span's last row and the row before the prompt's last committing nothing
+//!   ahead, the mark's take and the last row's own head being the one pick
+//!   read back after the last as asked. Each mark's checkpoint waits out
+//!   whatever token runs ahead of it. A session in [`PrefillMode::Steps`]
+//!   steps every batch, the same-binary arm and the oracle's.
 //!
 //! What it refuses:
 //!
@@ -38,10 +42,12 @@
 //!   cut to 0 resets;
 //! - every mutating call of a session a fault poisoned, until `reset`.
 
+use runtime::prompt::{PrefillMode, call_batches};
 use runtime::seqstate::Kept;
 use runtime::{Out, Target, Want};
 
-use super::session::{Session, SessionError, StepMode};
+use super::session::{PassOut, Session, SessionError, StateOut, StepMode};
+use crate::kernels::PASS_ROWS;
 
 const WHAT: &str = "qwen35moe target";
 
@@ -90,28 +96,26 @@ impl Target for Session {
         // The id at an inner mark is stepped by the next span, after the take.
         let marks = self.checkpoint_marks(from, to);
         let last = ids.len() - 1;
+        let batch_rows = Session::pass_rows(self);
+        let steps = Session::prefill(self) == PrefillMode::Steps;
         let mut at = from;
         let mut last_pick = None;
         for m in marks {
-            let start = (at - from) as usize;
-            let end_i = (m - from) as usize;
-            for i in start..end_i {
-                // Every id but the last of the span steps the next id ahead,
-                // both tokens without the head: no inner pick is read. The
-                // span's last row commits nothing — the mark's take follows —
-                // and so does the row before the prompt's last, whose next
-                // runs the head on its own commit, the one pick the caller
-                // reads.
-                let mode = if i == last {
-                    StepMode::HostFed
-                } else if i + 1 < end_i && i + 1 != last {
-                    StepMode::Ahead {
-                        next: Some(ids[i + 1]),
-                    }
+            // The runs between two marks, each a pass or its ids' steps.
+            for batch in call_batches(at, m, &[m], batch_rows) {
+                let start = (batch.start - from) as usize;
+                let end_i = (batch.end - from) as usize;
+                if steps || end_i - start <= PASS_ROWS {
+                    last_pick = Some(step_batch(self, ids, start, end_i, last)?);
                 } else {
-                    StepMode::Ahead { next: None }
-                };
-                last_pick = Some(Session::step(self, ids[i], mode)?.id);
+                    let out = if end_i == ids.len() {
+                        PassOut::Last
+                    } else {
+                        PassOut::None
+                    };
+                    let passed = Session::pass(self, &ids[start..end_i], out, StateOut::default())?;
+                    last_pick = Some(passed.id);
+                }
             }
             Session::checkpoint(self)?;
             at = m;
@@ -152,6 +156,36 @@ impl Target for Session {
     fn reset(&mut self) -> Result<(), SessionError> {
         Session::reset(self)
     }
+}
+
+/// The ids `start..end_i` of a prompt stepped one ahead each where the next
+/// id is known and inner, none of them but the prompt's last carrying a
+/// head: every id but the batch's last steps the next id ahead, both tokens
+/// without the head, since no inner pick is read. The batch's last row
+/// commits nothing — the mark's take follows — and so does the row before the
+/// prompt's last (index `last`), whose next runs the head on its own commit,
+/// the one pick the caller reads. Returns the last step's pick.
+fn step_batch(
+    s: &mut Session,
+    ids: &[u32],
+    start: usize,
+    end_i: usize,
+    last: usize,
+) -> Result<u32, SessionError> {
+    let mut pick = None;
+    for i in start..end_i {
+        let mode = if i == last {
+            StepMode::HostFed
+        } else if i + 1 < end_i && i + 1 != last {
+            StepMode::Ahead {
+                next: Some(ids[i + 1]),
+            }
+        } else {
+            StepMode::Ahead { next: None }
+        };
+        pick = Some(Session::step(s, ids[i], mode)?.id);
+    }
+    pick.ok_or_else(|| refuse("a batch of no ids".to_string()))
 }
 
 /// `pick` as `want` asks: the pick alone, or beside the head's row of the

@@ -1,0 +1,321 @@
+// The grouped GEMM of the routed experts, and the dense GEMM over f32 weight
+// rows. The entry points, under their host names:
+//
+//   gemm_routed_{q4k,q6k,a4}_{pair,plain}_{f16,f32}
+//   gemm_f32w_store_f32
+//
+//   pair     y[p][o] = silu(gate_e[o] . x) * (up_e[o] . x) * w[p], the
+//            SwiGLU pair of the experts' gate and up, the route weight
+//            applied to the activation as the decode fold applies it
+//   plain    y[p][n] = down_e[n] . x[p]
+//   f32w     y = W . x over f32 weight rows (the router's), f32 operands
+//
+// The tile body is dense GEMM's (gemm.metal: the K loop, the staged rows, the
+// fragment loads and the serpentine multiply are its helpers' and its own
+// constants'); what differs is the tile's place. A threadgroup is one tile of
+// the route table (route.metal): the group (a routed expert, or the shared
+// expert after them), the group's run of places in the expert-sorted slot
+// list, and the run's length. The weight rows come from the group's tensors:
+// the stack's expert, or the shared tensors for the table's last group. The
+// activation rows are the run's places: gathered through the sorted slot
+// list to the pass's row (gate and up, whose input is the normed residual of
+// the slot's row), or the places' own rows (down, whose input is the pair's
+// output at the place). Outputs are written at the place.
+//
+// Geometry: 128 threads, four SIMD groups; 64 weight rows by ROUTED_ACTS (32)
+// activation rows, a K step of 32. The pair's 64 weight rows are 32 outputs of
+// the gate and the same 32 of the up, so the lane that holds an output's gate
+// accumulator holds its up accumulator, and the epilogue is the lane's own.
+// A group holds about 8 U / 256 rows at U rows a pass, so the tile is shorter
+// than the dense GEMM's 64: the fragments of a SIMD group whose eight rows
+// are past the run's length load and multiply nothing.
+//
+// This file comes after gemm.metal (the helpers and the instantiated tile
+// pieces), experts.metal (pair_swiglu) and route.metal (the table's shape).
+
+#include <metal_stdlib>
+
+using namespace metal;
+
+#pragma METAL fp contract(off)
+
+// F32W: rows of f32 weights, 16 values a block. The GEMM's weight type for
+// the router, whose rows are f32 in the arena.
+struct block_f32_16 {
+    float v[16];
+};
+
+struct F32W {
+    typedef block_f32_16 Block;
+
+    static inline int values_per_block() {
+        return 16;
+    }
+
+    template <typename T>
+    static inline void dequant16(device const Block & blk,
+                                 short il,
+                                 thread matrix<T, 4, 4> & reg) {
+        FOR_UNROLL(short i = 0; i < 16; ++i) {
+            reg[i / 4][i % 4] = (T)blk.v[i];
+        }
+    }
+};
+
+GEMM_ENTRY(f32w_store_f32, F32W, float, false, gemm_kernel)
+
+#define ROUTED_ROWS 64   // weight rows of a tile
+#define ROUTED_ACTS 32   // activation rows of a tile
+#define ROUTED_FRAGS_A (ROUTED_ACTS / 16)
+#define ROUTED_FRAGS_W (ROUTED_ROWS / 16)
+
+static_assert(ROUTED_ACTS == ROUTE_TILE, "a tile holds a table tile's slots");
+static_assert(ROUTED_ROWS * 2 == GEMM_THREADS,
+              "a thread stages one 16-value chunk of a weight row");
+
+template <typename T>
+constexpr int routed_shmem_bytes() {
+    return (ROUTED_ROWS + ROUTED_ACTS) * gemm_lda<T>() * (int)sizeof(T);
+}
+
+// Eight words, bound by value.
+struct RoutedArgs {
+    uint cols;          // the input columns K
+    uint x_stride;      // f32 elements between the activation rows
+    uint y_stride;      // f32 elements between the output rows
+    uint layer;
+    uint n_experts;     // the stack's experts; the table's group n_experts is shared
+    uint stack_blocks;  // blocks of one expert's rows in the stack
+    uint gather;        // 1: an activation row is the slot's pass row; 0: the place's
+    uint rows;          // outputs per expert: the pair's rows of gate, the down's rows
+};
+
+static_assert(sizeof(RoutedArgs) == 32, "RoutedArgs is eight words");
+
+template <typename Q, typename T, bool PAIR>
+kernel void gemm_routed_kernel(device const typename Q::Block * W [[buffer(0)]],
+                               device const typename Q::Block * W_up [[buffer(1)]],
+                               device const typename Q::Block * W_sh [[buffer(2)]],
+                               device const typename Q::Block * W_sh_up [[buffer(3)]],
+                               device const float      * x [[buffer(4)]],
+                               device float            * y [[buffer(5)]],
+                               device const uint4      * tiles [[buffer(6)]],
+                               device const uint       * sorted [[buffer(7)]],
+                               device const float      * route_w [[buffer(8)]],
+                               constant RoutedArgs     & args [[buffer(9)]],
+                               device atomic_uint      * faults [[buffer(10)]],
+                               uint2  tgpig [[threadgroup_position_in_grid]],
+                               ushort tiitg [[thread_index_in_threadgroup]],
+                               ushort sgitg [[simdgroup_index_in_threadgroup]],
+                               ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup char shmem[routed_shmem_bytes<T>()];
+    constexpr int BK = gemm_bk<T>();
+    constexpr int LDA = gemm_lda<T>();
+
+    if (tgpig.x >= tiles[0].x) {
+        return;
+    }
+    const uint4 tile = tiles[1 + tgpig.x];
+    const uint expert = tile.x;
+    const uint first = tile.y;
+    const short count = (short)tile.z;
+    if (expert > args.n_experts) {
+        if (tiitg == 0) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
+        }
+        return;
+    }
+    const bool shared = expert == args.n_experts;
+    device const typename Q::Block * wg = shared ? W_sh : W + (ulong)expert * args.stack_blocks;
+    device const typename Q::Block * wu = PAIR ? (shared ? W_sh_up : W_up + (ulong)expert * args.stack_blocks) : wg;
+    // The tile's first output: the pair's tile is 32 outputs (64 weight rows
+    // of two tensors), the plain tile 64 rows of one.
+    const uint r0 = tgpig.y * (PAIR ? ROUTED_ROWS / 2 : ROUTED_ROWS);
+
+    const uint nb = args.cols / (uint)Q::values_per_block();
+
+    threadgroup T * sa = (threadgroup T *)shmem;
+    threadgroup T * sb = sa + ROUTED_ROWS * LDA;
+
+    // A: a thread stages one 16-value chunk of a weight row a K step.
+    const short a_row = (short)(tiitg / 2);
+    const short a_koff = (short)((tiitg % 2) * 16);
+    device const typename Q::Block * a_src;
+    if (PAIR) {
+        a_src = (a_row < ROUTED_ROWS / 2 ? wg : wu) + (ulong)(r0 + (a_row % (ROUTED_ROWS / 2))) * nb;
+    } else {
+        a_src = wg + (ulong)(r0 + a_row) * nb;
+    }
+    threadgroup vec<T, 4> * a_dst = (threadgroup vec<T, 4> *)(sa + a_row * LDA + a_koff);
+
+    // B: the first 64 threads stage one 16-value chunk of an activation row;
+    // a row past the run's length takes the run's last (a defined access).
+    const bool b_live = tiitg < ROUTED_ACTS * 2;
+    const short b_row = (short)(tiitg / 2);
+    device const float * b_src = x;
+    threadgroup vec<T, 4> * b_dst = (threadgroup vec<T, 4> *)(sb);
+    if (b_live) {
+        const uint place = first + (uint)min(b_row, (short)(count - 1));
+        const ulong src_row = args.gather != 0u ? (ulong)(sorted[place] / BLOOMERY_EXPERT_SLOTS) : (ulong)place;
+        b_src = x + src_row * args.x_stride + a_koff;
+        b_dst = (threadgroup vec<T, 4> *)(sb + b_row * LDA + a_koff);
+    }
+
+    const short qid = (short)(tiisg >> 2);
+    const short fm = (qid & 4) + ((tiisg >> 1) & 3);
+    const short fn = ((qid & 2) << 1) + ((tiisg & 1) << 1);
+    const short gm = 8 * (sgitg >> 1);
+    const short gn = 8 * (sgitg & 1);
+
+    // A fragment row past the run's length is not loaded or multiplied.
+    bool live[ROUTED_FRAGS_A];
+    threadgroup const T * arow[ROUTED_FRAGS_A];
+    threadgroup const T * brow[ROUTED_FRAGS_W];
+    FOR_UNROLL(short i = 0; i < ROUTED_FRAGS_A; ++i) {
+        live[i] = gm + 16 * i < count;
+        arow[i] = sb + (gm + 16 * i + fm) * LDA + fn;
+    }
+    FOR_UNROLL(short j = 0; j < ROUTED_FRAGS_W; ++j) {
+        brow[j] = sa + (gn + 16 * j + fn) * LDA + fm;
+    }
+
+    vec<float, 2> c[ROUTED_FRAGS_A][ROUTED_FRAGS_W];
+    FOR_UNROLL(short i = 0; i < ROUTED_FRAGS_A; ++i) {
+        FOR_UNROLL(short j = 0; j < ROUTED_FRAGS_W; ++j) {
+            c[i][j] = vec<float, 2>(0.f);
+        }
+    }
+
+    for (int k0 = 0; k0 < (int)args.cols; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (b_live) {
+            device const float * xr = b_src + k0;
+            FOR_UNROLL(short g = 0; g < 4; ++g) {
+                const float4 v = float4(xr[4 * g], xr[4 * g + 1], xr[4 * g + 2], xr[4 * g + 3]);
+                if (sizeof(T) == 2) {
+                    const bool4 over = !(fabs(v) <= 65504.f);
+                    if (any(over)) {
+                        raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
+                        b_dst[g] = vec<T, 4>(select(v, float4(NAN), over));
+                    } else {
+                        b_dst[g] = vec<T, 4>(v);
+                    }
+                } else {
+                    b_dst[g] = vec<T, 4>(v);
+                }
+            }
+        }
+        {
+            const int pos = k0 + a_koff;
+            const int ib = pos / Q::values_per_block();
+            const short il = (short)((pos / 16) % (Q::values_per_block() / 16));
+            matrix<T, 4, 4> reg;
+            Q::template dequant16<T>(a_src[ib], il, reg);
+            FOR_UNROLL(short i = 0; i < 4; ++i) {
+                a_dst[i] = vec<T, 4>(reg[i][0], reg[i][1], reg[i][2], reg[i][3]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short kk = 0; kk < BK; kk += 8) {
+            simdgroup_barrier(mem_flags::mem_none);
+            vec<float, 2> af[ROUTED_FRAGS_A];
+            vec<float, 2> bf[ROUTED_FRAGS_W];
+            vec<half, 2> ah[ROUTED_FRAGS_A];
+            vec<half, 2> bh[ROUTED_FRAGS_W];
+            if (sizeof(T) == 2) {
+                FOR_UNROLL(short i = 0; i < ROUTED_FRAGS_A; ++i) {
+                    if (live[i]) {
+                        ah[i] = *(threadgroup const vec<half, 2> *)(arow[i] + kk);
+                    }
+                }
+                FOR_UNROLL(short j = 0; j < ROUTED_FRAGS_W; ++j) {
+                    threadgroup const T *w = brow[j];
+                    bh[j] = vec<half, 2>(w[kk], w[LDA + kk]);
+                }
+            } else {
+                FOR_UNROLL(short i = 0; i < ROUTED_FRAGS_A; ++i) {
+                    if (live[i]) {
+                        af[i] = *(threadgroup const vec<float, 2> *)(arow[i] + kk);
+                    }
+                }
+                FOR_UNROLL(short j = 0; j < ROUTED_FRAGS_W; ++j) {
+                    threadgroup const T *w = brow[j];
+                    bf[j] = vec<float, 2>(w[kk], w[LDA + kk]);
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL(short m = 0; m < ROUTED_FRAGS_A; ++m) {
+                if (live[m]) {
+                    FOR_UNROLL(short n = 0; n < ROUTED_FRAGS_W; ++n) {
+                        const short ns = (m % 2) ? ROUTED_FRAGS_W - 1 - n : n;
+                        if (sizeof(T) == 2) {
+                            frag_mma_half(c[m][ns], ah[m], bh[ns], c[m][ns]);
+                        } else {
+                            frag_mma(c[m][ns], af[m], bf[ns], c[m][ns]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The store, per element under the run's length. A pair's lane holds an
+    // output's gate in fragment column j (j < 2) and its up in j + 2.
+    FOR_UNROLL(short i = 0; i < ROUTED_FRAGS_A; ++i) {
+        const short m = gm + 16 * i + fm;
+        if (m >= count) {
+            continue;
+        }
+        const uint place = first + (uint)m;
+        device float * p = y + (ulong)place * args.y_stride;
+        if (PAIR) {
+            const float rw = route_w[sorted[place]];
+            FOR_UNROLL(short j = 0; j < ROUTED_FRAGS_W / 2; ++j) {
+                const uint o = r0 + (uint)(gn + 16 * j + fn);
+                p[o] = pair_swiglu(c[i][j].x, c[i][j + 2].x) * rw;
+                p[o + 1] = pair_swiglu(c[i][j].y, c[i][j + 2].y) * rw;
+            }
+        } else {
+            FOR_UNROLL(short j = 0; j < ROUTED_FRAGS_W; ++j) {
+                const uint n = r0 + (uint)(gn + 16 * j + fn);
+                p[n] = c[i][j].x;
+                p[n + 1] = c[i][j].y;
+            }
+        }
+    }
+}
+
+#define ROUTED_ENTRY(NAME, Q, T, PAIR)                                              \
+    template [[host_name("gemm_routed_" #NAME)]]                                    \
+    kernel void gemm_routed_kernel<Q, T, PAIR>(                                     \
+        device const Q::Block * W [[buffer(0)]],                                    \
+        device const Q::Block * W_up [[buffer(1)]],                                 \
+        device const Q::Block * W_sh [[buffer(2)]],                                 \
+        device const Q::Block * W_sh_up [[buffer(3)]],                              \
+        device const float    * x [[buffer(4)]],                                    \
+        device float          * y [[buffer(5)]],                                    \
+        device const uint4    * tiles [[buffer(6)]],                                \
+        device const uint     * sorted [[buffer(7)]],                               \
+        device const float    * route_w [[buffer(8)]],                              \
+        constant RoutedArgs   & args [[buffer(9)]],                                 \
+        device atomic_uint    * faults [[buffer(10)]],                              \
+        uint2  tgpig [[threadgroup_position_in_grid]],                              \
+        ushort tiitg [[thread_index_in_threadgroup]],                               \
+        ushort sgitg [[simdgroup_index_in_threadgroup]],                            \
+        ushort tiisg [[thread_index_in_simdgroup]]);
+
+ROUTED_ENTRY(q4k_pair_f16, Q4K, half, true)
+ROUTED_ENTRY(q4k_pair_f32, Q4K, float, true)
+ROUTED_ENTRY(q4k_plain_f16, Q4K, half, false)
+ROUTED_ENTRY(q4k_plain_f32, Q4K, float, false)
+ROUTED_ENTRY(q6k_pair_f16, Q6K, half, true)
+ROUTED_ENTRY(q6k_pair_f32, Q6K, float, true)
+ROUTED_ENTRY(q6k_plain_f16, Q6K, half, false)
+ROUTED_ENTRY(q6k_plain_f32, Q6K, float, false)
+ROUTED_ENTRY(a4_pair_f16, A4, half, true)
+ROUTED_ENTRY(a4_pair_f32, A4, float, true)
+ROUTED_ENTRY(a4_plain_f16, A4, half, false)
+ROUTED_ENTRY(a4_plain_f32, A4, float, false)
