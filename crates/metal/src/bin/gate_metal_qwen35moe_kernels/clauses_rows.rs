@@ -334,7 +334,7 @@ fn same_bits(what: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
     {
         None => Ok(()),
         Some(i) => Err(format!(
-            "{what}[{i}] is {:?} ({:#010x}), the stepped launch's {:?} ({:#010x})",
+            "{what}[{i}] is {:?} ({:#010x}), expected {:?} ({:#010x})",
             got[i],
             got[i].to_bits(),
             want[i],
@@ -422,26 +422,6 @@ fn head_of(c: &Chunk, rows: usize) -> Result<Chunk, String> {
     })
 }
 
-/// The first word of a copy that is not the bits of the chunk that ends at
-/// its row, named.
-fn same_copy(what: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
-    match got
-        .iter()
-        .zip(want)
-        .position(|(g, w)| g.to_bits() != w.to_bits())
-    {
-        None if got.len() == want.len() => Ok(()),
-        None => Err(format!("{what}: {} words, not {}", got.len(), want.len())),
-        Some(i) => Err(format!(
-            "{what}[{i}] is {:?} ({:#010x}), the chunk ending at its row leaves {:?} ({:#010x})",
-            got[i],
-            got[i].to_bits(),
-            want[i],
-            want[i].to_bits()
-        )),
-    }
-}
-
 /// A copies case: rows, first position, lane words, the copies' rows.
 type SnapCase = (usize, u32, (usize, usize), &'static [u32]);
 
@@ -449,12 +429,15 @@ type SnapCase = (usize, u32, (usize, usize), &'static [u32]);
 /// write lane word, and the rows the copies follow. A copy after row 0 takes
 /// every ring slot but one from the ring the chunk found; one after a row
 /// past the ring's length takes none; a first position of 0 has slots no
-/// position wrote; a copy after the last row is the chunk's own end.
-const SNAP_CASES: [SnapCase; 4] = [
+/// position wrote; a copy after the last row is the chunk's own end; a
+/// chunk ending at the last u32 position takes its ring slots without the
+/// slot arithmetic wrapping.
+const SNAP_CASES: [SnapCase; 5] = [
     (12, 7, (0, 1), &[3, 9]),
     (64, 5, (0, 0), &[0, 40]),
     (9, 0, (0, 1), &[1, 8]),
     (20, 3, (1, 0), &[12]),
+    (9, u32::MAX - 9, (0, 1), &[8]),
 ];
 
 /// A rows launch's copies are the bits a chunk ending at their rows leaves:
@@ -480,12 +463,12 @@ pub fn delta_rows_snap(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         for (k, &r) in after.iter().enumerate() {
             let end = run_rows(h, &fx, &head_of(&c, r as usize + 1)?)?;
             let lane = &end.state[c.lane_to * lane_len..(c.lane_to + 1) * lane_len];
-            same_copy(
+            same_bits(
                 &format!("{at}: copy {k}'s lane"),
                 &copies.lane[k * lane_len..(k + 1) * lane_len],
                 lane,
             )?;
-            same_copy(
+            same_bits(
                 &format!("{at}: copy {k}'s ring"),
                 &copies.ring[k * ring_len..(k + 1) * ring_len],
                 &end.ring,
