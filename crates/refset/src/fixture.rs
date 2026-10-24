@@ -322,20 +322,28 @@ pub fn first_shard_in(root: &str, arch: &str) -> Result<String, RefError> {
             ),
         ));
     };
-    let at = format!("{root}/{dir}");
-    let entries = std::fs::read_dir(&at)
-        .map_err(|e| RefError::missing(&at, format!("fixture: cannot list {at}: {e}")))?;
+    first_shard_at(&format!("{root}/{dir}"), "`fixture generate` writes it")
+}
+
+/// The one file of directory `at` whose name matches `*-00001-of-*.gguf`,
+/// joined as `"{at}/{file}"`: a fixture's first shard. A directory that
+/// cannot be listed, an entry that cannot be read, a first shard whose name
+/// is not UTF-8, and none or more than one are [`RefError::Missing`], naming
+/// the directory and what was found; `maker` says what writes the file.
+pub fn first_shard_at(at: &str, maker: &str) -> Result<String, RefError> {
+    let entries = std::fs::read_dir(at)
+        .map_err(|e| RefError::missing(at, format!("fixture: cannot list {at}: {e}")))?;
     let mut found: Vec<String> = Vec::new();
     for entry in entries {
         let name = entry
-            .map_err(|e| RefError::missing(&at, format!("fixture: cannot list {at}: {e}")))?
+            .map_err(|e| RefError::missing(at, format!("fixture: cannot list {at}: {e}")))?
             .file_name();
         if !is_first_shard(&name.to_string_lossy()) {
             continue;
         }
         let name = name.into_string().map_err(|name| {
             RefError::missing(
-                &at,
+                at,
                 format!("fixture: {at} holds a first shard whose name is not UTF-8: {name:?}"),
             )
         })?;
@@ -345,10 +353,10 @@ pub fn first_shard_in(root: &str, arch: &str) -> Result<String, RefError> {
     match found.as_slice() {
         [one] => Ok(format!("{at}/{one}")),
         _ => Err(RefError::missing(
-            &at,
+            at,
             format!(
                 "fixture: {at} holds {} first shards (*-00001-of-*.gguf): {found:?}, want one \
-                 (`fixture generate` writes it)",
+                 ({maker})",
                 found.len()
             ),
         )),

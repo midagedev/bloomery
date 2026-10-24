@@ -57,6 +57,8 @@ mod clauses_seg;
 mod common;
 #[path = "fixture.rs"]
 mod fixture;
+#[path = "../shared/qwen35moe_mlx_split.rs"]
+mod mlx_split;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "../shared/oracle.rs"]
@@ -404,36 +406,18 @@ fn fixture_path(args: &[String]) -> Result<PathBuf, String> {
         .map_err(|e| format!("{e} (name the fixture's trunk file with --fixture PATH)"))
 }
 
-/// Every mutant of the table, each in a child run of this gate
-/// (`--mutant NAME`): its clause must be red and the child's exit code not 0.
-/// One that stays green is a defect no clause catches.
 /// The MLX-format fixture split the A4 clauses read: `--mlx-fixture PATH`,
-/// else the one `*-00001-of-*.gguf` under the fixture root's
-/// `qwen35moe-mlxsplit` directory, resolved beside the gate's own fixture
-/// (`BLOOMERY_FIXTURE_ROOT`, the reference sets' root).
+/// else [`mlx_split::path`].
 fn mlx_fixture_path(args: &[String]) -> Result<PathBuf, String> {
     if let Some(path) = flag(args, "--mlx-fixture") {
         return Ok(PathBuf::from(path));
     }
-    let root = refset::fixture::root()
-        .map_err(|e| format!("the fixture root: {e} (name the split with --mlx-fixture PATH)"))?;
-    let at = format!("{root}/qwen35moe-mlxsplit");
-    let entries = std::fs::read_dir(&at)
-        .map_err(|e| format!("the MLX fixture {at}: {e} (name it with --mlx-fixture PATH)"))?;
-    let mut found: Vec<String> = entries
-        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-        .filter(|n| n.ends_with(".gguf") && n.contains("-00001-of-"))
-        .collect();
-    found.sort();
-    match found.as_slice() {
-        [one] => Ok(PathBuf::from(format!("{at}/{one}"))),
-        _ => Err(format!(
-            "the MLX fixture {at} holds {} first shards, not one (name it with --mlx-fixture PATH)",
-            found.len()
-        )),
-    }
+    mlx_split::path().map_err(|e| format!("{e} (name the split with --mlx-fixture PATH)"))
 }
 
+/// Every mutant of the table, each in a child run of this gate
+/// (`--mutant NAME`): its clause must be red and the child's exit code not 0.
+/// One that stays green is a defect no clause catches.
 fn mutants_all(args: &[String]) -> ExitCode {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
