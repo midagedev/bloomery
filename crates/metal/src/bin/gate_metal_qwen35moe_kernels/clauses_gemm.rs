@@ -27,7 +27,20 @@
 //!
 //! So the f32 arm's factor is `G(base + 1 + K/8 + 8)` and the f16 arm's is
 //! `(1 + 2^-11)² (1 + G(base + K/8 + 8)) − 1`, both over the oracle's
-//! magnitude sum. The f16 arm carries two absolute terms besides: a cast
+//! magnitude sum.
+//!
+//! The tensor-op kernels (`gemm_tensor.metal`, [`GemmPath::TensorOps`]) sum
+//! in the op's order, which no document fixes, at the op's defined
+//! precision (relaxed precision off): f32 accumulation, the f16 operands'
+//! products exact in it and the f32 operands' rounded once. Any order of a
+//! sum of K terms passes a term through at most K − 1 additions (every
+//! addition on its path to the root of the summation tree), so the
+//! accumulation term is K, whatever the order, in place of K/8 + 8: the f32
+//! arm's factor is `G(base + 1 + K)`, the f16 arm's
+//! `(1 + 2^-11)² (1 + G(base + K)) − 1` — at K = 2048 a G of 2052 terms,
+//! 1.2e-4 of the magnitude sum, at K = 512 3.1e-5. The casts, the subnormal
+//! terms, the staged round-trip and the residual's rounding are the
+//! simdgroup kernels' own. The f16 arm carries two absolute terms besides: a cast
 //! into the subnormal range rounds on the subnormal grid (spacing 2^-24),
 //! so its error is at most 2^-25 whatever the magnitude — the weights' side
 //! sums to `2^-25 Σ_c |x_c|` and the activations' to `2^-25 Σ_c |w_c|`. The
@@ -42,6 +55,7 @@ use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::kernels::{
     GEMM_ACTS, GemmMode, GemmParams, GemmSegParams, Operand, Quant, Segment,
 };
+use bloomery_metal::library::GemmPath;
 use gguf::quant::dequant_row;
 
 use super::common::{self, BadArg, Edit, LAYER};
@@ -251,14 +265,22 @@ pub(super) fn weight_abs_sums(
 }
 
 /// The GEMM's band: the relative factor over the oracle's magnitude sum and
-/// the operations of the longest path (the absolute floor's count). The
-/// derivation is this module's doc's.
-pub(super) fn gemm_band(quant: Quant, cols: usize, operand: Operand) -> (f64, usize) {
+/// the operations of the longest path (the absolute floor's count), for the
+/// program `path` runs. The derivation is this module's doc's.
+pub(super) fn gemm_band(
+    quant: Quant,
+    cols: usize,
+    operand: Operand,
+    path: GemmPath,
+) -> (f64, usize) {
     let base = match quant {
         Quant::Q4K => 4,
         Quant::Q6K | Quant::A4 => 2,
     };
-    let acc = cols / 8 + 8;
+    let acc = match path {
+        GemmPath::Simdgroup => cols / 8 + 8,
+        GemmPath::TensorOps => cols,
+    };
     match operand {
         Operand::F32 => {
             let n = base + 1 + acc;
@@ -280,7 +302,7 @@ pub(super) fn gemm_band(quant: Quant, cols: usize, operand: Operand) -> (f64, us
 fn run_checked(h: &Harness<'_>, launch: &GemmLaunch<'_>, w_abs: &[f64]) -> Result<f64, String> {
     let got = launch_gemm(h, launch)?;
     common::expect_clean(h, "the gemm launch")?;
-    check_rows(launch, &got, w_abs, None)
+    check_rows(launch, &got, w_abs, None, h.kernels.gemm_path())
 }
 
 /// The band check of `got` against the oracle, row by row: `skip` names the
@@ -291,8 +313,9 @@ fn check_rows(
     got: &[f32],
     w_abs: &[f64],
     skip: Option<usize>,
+    path: GemmPath,
 ) -> Result<f64, String> {
-    let (factor, ops) = gemm_band(launch.quant, launch.cols, launch.operand);
+    let (factor, ops) = gemm_band(launch.quant, launch.cols, launch.operand, path);
     let floor = ops as f64 * f64::from(f32::MIN_POSITIVE);
     let mut worst = 0f64;
     for r in 0..launch.acts {
@@ -633,6 +656,36 @@ pub fn gemm_a4_resid(h: &Harness<'_>, mlx: &Fixture) -> Clause {
     run_cases(h, GemmMode::Residual, &a4_cases(mlx)?)
 }
 
+/// Every dense arm of one weight type on `h`'s kernels (the tensor-op
+/// kernels, for the `tensor_gemm_*` clauses): both epilogues in both
+/// operands, every case within the band of `h`'s GEMM path.
+fn tensor_arms(h: &Harness<'_>, cases: &[Case<'_>]) -> Clause {
+    let mut notes = Vec::new();
+    for mode in [GemmMode::Store, GemmMode::Residual] {
+        let Verdict::Noted(note) = run_cases(h, mode, cases)? else {
+            return Err(format!("{mode:?}: the cases read no band"));
+        };
+        notes.push(format!("{mode:?} {note}"));
+    }
+    Ok(Verdict::Noted(format!(
+        "{} kernels: {}",
+        h.kernels.gemm_path().name(),
+        notes.join("; ")
+    )))
+}
+
+pub fn tensor_gemm_q4k(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    tensor_arms(h, &q4k_cases(fixture)?)
+}
+
+pub fn tensor_gemm_q6k(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    tensor_arms(h, &q6k_cases(fixture)?)
+}
+
+pub fn tensor_gemm_a4(h: &Harness<'_>, mlx: &Fixture) -> Clause {
+    tensor_arms(h, &a4_cases(mlx)?)
+}
+
 /// Every segment of a segmented dispatch is the same bits as the same tensor
 /// run alone: the kernel does not change the order of a row's sum, and a
 /// segment's tiles are the ones a launch of it alone would run. One group
@@ -866,7 +919,7 @@ pub fn gemm_range(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             }
         }
         // The other rows are finite and in band.
-        check_rows(&launch, &got, &w_abs, Some(bad_row))
+        check_rows(&launch, &got, &w_abs, Some(bad_row), h.kernels.gemm_path())
             .map_err(|e| format!("{what}, another row: {e}"))?;
     }
     // The boundary: the largest finite half is taken, not faulted.

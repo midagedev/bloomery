@@ -7,7 +7,13 @@
 //! same blocks with an f64 dot, held to the band `oracle.rs` derives.
 //! `--list` prints the clause names in the order the gate runs them: the
 //! mat-vec clauses, then the A4 ones, then the token's kernels (delta,
-//! router, experts, attention, head).
+//! router, experts, attention, head), then the prompt pass's, then the
+//! tensor-op GEMMs' (`clauses_tensor.rs`).
+//!
+//! The GEMM clauses outside `clauses_tensor.rs` run the simdgroup GEMMs on
+//! every device; the `tensor_*` clauses run the tensor-op GEMMs on every
+//! device that builds them. The header names the path the device's own rule
+//! picks for the engine.
 //!
 //! `--fixture PATH` names the fixture's trunk file (the Mac's cache copy
 //! otherwise); `--mlx-fixture PATH` names the MLX-format fixture split the
@@ -30,7 +36,7 @@ use bloomery_metal::device::MetalDevice;
 use bloomery_metal::kernels::{
     HeadNormParams, Kernels, MatvecParams, Mode, NormOnLoad, Quant, SegParams, Segment,
 };
-use bloomery_metal::library::{Library, SOURCE};
+use bloomery_metal::library::{Library, SOURCE, TENSOR_SOURCE};
 use bloomery_metal::stream::MetalStream;
 
 #[path = "clauses_a4.rs"]
@@ -59,6 +65,8 @@ mod clauses_router;
 mod clauses_rows;
 #[path = "clauses_seg.rs"]
 mod clauses_seg;
+#[path = "clauses_tensor.rs"]
+mod clauses_tensor;
 #[path = "common.rs"]
 mod common;
 #[path = "fixture.rs"]
@@ -401,6 +409,18 @@ fn kernels_of_text(device: &MetalDevice, text: &str) -> Result<(Library, Kernels
     Ok((library, kernels))
 }
 
+/// `base` with its GEMMs from the tensor-op program `text`, and its kernels.
+fn tensor_kernels_of_text(
+    device: &MetalDevice,
+    base: &Library,
+    text: &str,
+) -> Result<(Library, Kernels), String> {
+    let tensor = Library::tensor_from_source_text(device, text).map_err(why)?;
+    let library = base.with_tensor_gemms(tensor);
+    let kernels = Kernels::from_library(&library).map_err(why)?;
+    Ok((library, kernels))
+}
+
 /// The fixture path: `--fixture PATH`, else the qwen35moe fixture under the
 /// fixture root (`BLOOMERY_FIXTURE_ROOT`), as the reference sets resolve it.
 fn fixture_path(args: &[String]) -> Result<PathBuf, String> {
@@ -433,7 +453,9 @@ fn mutants_all(args: &[String]) -> ExitCode {
         }
     };
     let mut green = Vec::new();
-    for mutant in mutants::MUTANTS {
+    let mut count = 0usize;
+    for (mutant, _) in mutants::all() {
+        count += 1;
         let mut child = Command::new(&exe);
         child.args(["--mutant", mutant.name]);
         if let Some(path) = flag(args, "--fixture") {
@@ -464,8 +486,7 @@ fn mutants_all(args: &[String]) -> ExitCode {
     }
     if green.is_empty() {
         println!(
-            "gate_metal_qwen35moe_kernels --mutants-all: PASS ({} mutants, each red on its clause)",
-            mutants::MUTANTS.len()
+            "gate_metal_qwen35moe_kernels --mutants-all: PASS ({count} mutants, each red on its clause)"
         );
         return ExitCode::SUCCESS;
     }
@@ -506,7 +527,10 @@ pub fn main() -> ExitCode {
         }
     };
     let stream = device.stream();
-    let kernels = match Kernels::new(&device) {
+    // The simdgroup GEMMs, on every device: the tensor-op ones have clauses
+    // of their own.
+    let simdgroup = device.library().with_simdgroup_gemms();
+    let kernels = match Kernels::from_library(&simdgroup) {
         Ok(kernels) => kernels,
         Err(e) => {
             println!("clause open: FAIL ({e})");
@@ -526,6 +550,14 @@ pub fn main() -> ExitCode {
         info.name,
         <MetalDevice as Device>::BACKEND
     );
+    let units = device.library().matrix_units();
+    println!(
+        "gemm: architecture={} metal4={} matrix-units={} engine-path={}",
+        units.architecture,
+        units.metal4,
+        units.present(),
+        device.library().gemm_path().name()
+    );
     let mutant = match flag(&args, "--mutant") {
         Some(name) => match mutants::find(name) {
             Some(mutant) => Some(mutant),
@@ -537,32 +569,63 @@ pub fn main() -> ExitCode {
         None => None,
     };
     let (run_source, mutated) = match mutant {
-        Some(mutant) => match mutants::source_of(mutant) {
-            Ok(text) => match kernels_of_text(&device, &text) {
-                Ok(mutated) => (text, Some(mutated)),
+        Some((mutant, mutants::Program::Main)) => {
+            match mutants::source_of(mutant, mutants::Program::Main) {
+                Ok(text) => match kernels_of_text(&device, &text) {
+                    Ok(mutated) => (text, Some(mutated)),
+                    Err(e) => {
+                        println!("gate_metal_qwen35moe_kernels: the mutant does not build: {e}");
+                        return ExitCode::from(64);
+                    }
+                },
                 Err(e) => {
                     println!("gate_metal_qwen35moe_kernels: the mutant does not build: {e}");
                     return ExitCode::from(64);
                 }
-            },
-            Err(e) => {
-                println!("gate_metal_qwen35moe_kernels: the mutant does not build: {e}");
-                return ExitCode::from(64);
             }
-        },
-        None => (SOURCE.to_string(), None),
+        }
+        _ => (SOURCE.to_string(), None),
+    };
+    let tensor_source = match mutant {
+        Some((mutant, mutants::Program::Tensor)) => {
+            match mutants::source_of(mutant, mutants::Program::Tensor) {
+                Ok(text) => text,
+                Err(e) => {
+                    println!("gate_metal_qwen35moe_kernels: the mutant does not build: {e}");
+                    return ExitCode::from(64);
+                }
+            }
+        }
+        _ => TENSOR_SOURCE.to_string(),
     };
     let harness = Harness {
         device: &device,
         stream,
         kernels: mutated.as_ref().map_or(&kernels, |(_, k)| k),
-        library: mutated.as_ref().map_or(device.library(), |(l, _)| l),
+        library: mutated.as_ref().map_or(&simdgroup, |(l, _)| l),
     };
-    if let Some(mutant) = mutant {
+    let tensor_built = tensor_kernels_of_text(&device, harness.library, &tensor_source);
+    if let (Some((mutant, mutants::Program::Tensor)), Err(e)) = (mutant, &tensor_built) {
+        println!(
+            "gate_metal_qwen35moe_kernels: the mutant {} does not build: {e}",
+            mutant.name
+        );
+        return ExitCode::from(64);
+    }
+    let tensor = tensor_built
+        .as_ref()
+        .map_err(Clone::clone)
+        .map(|(l, k)| Harness {
+            device: &device,
+            stream,
+            kernels: k,
+            library: l,
+        });
+    if let Some((mutant, _)) = mutant {
         println!("mutant: {} ({})", mutant.name, mutant.why);
     }
     let only = flag(&args, "--child")
-        .or(mutant.map(|m| m.clause))
+        .or(mutant.map(|(m, _)| m.clause))
         .or(flag(&args, "--only"));
     let fixture = fixture_path(&args).and_then(|path| fixture::Fixture::open(&path));
     match &fixture {
@@ -647,6 +710,7 @@ pub fn main() -> ExitCode {
         .chain(clauses_head::table(&ctx))
         .chain(clauses_rows::table(&ctx))
         .chain(clauses_route::table(&ctx, &mlx))
+        .chain(clauses_tensor::table(&tensor, &fixture, &mlx))
         .collect();
     if args.iter().any(|a| a == "--list") {
         for (name, _) in &clauses {
@@ -667,7 +731,7 @@ pub fn main() -> ExitCode {
     }
 
     let scope = match (mutant, only) {
-        (Some(mutant), _) => format!(" (mutant {})", mutant.name),
+        (Some((mutant, _)), _) => format!(" (mutant {})", mutant.name),
         (None, Some(name)) => format!(" (only {name})"),
         (None, None) => String::new(),
     };
