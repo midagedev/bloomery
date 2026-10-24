@@ -48,7 +48,7 @@ const PREFIX: usize = 3;
 const STEADY: usize = 8;
 
 /// A [`PassSink`] that hears nothing.
-struct Quiet;
+pub(super) struct Quiet;
 
 impl PassSink<Session> for Quiet {
     type Error = SessionError;

@@ -298,7 +298,7 @@ pub fn headnorm_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
 
 /// The heads' partial sums of the squares of their values: positive, and of
 /// the size the values of a head have.
-fn head_partials() -> Vec<f32> {
+pub(super) fn head_partials() -> Vec<f32> {
     (0..VALUE_HEADS * PARTIALS_PER_HEAD)
         .map(|i| 0.5 + (i % 7) as f32 * 0.25)
         .collect()

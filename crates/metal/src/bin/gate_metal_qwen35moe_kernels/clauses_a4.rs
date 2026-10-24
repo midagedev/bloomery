@@ -10,12 +10,13 @@ use bloomery_metal::kernels::{
     VALUE_HEADS,
 };
 
-use super::clauses_embed::run_embed;
+use super::clauses_embed;
 use super::clauses_experts::{
     self, PairIn, check_fold_quant, check_pair_quant, ffn_norm, fold_bad_id, fold_weights_of,
     launch_pair,
 };
 use super::clauses_head;
+use super::clauses_norm::head_partials;
 use super::common::{self, LAYER};
 use super::fixture::Fixture;
 use super::oracle::{self, Kind};
@@ -385,13 +386,6 @@ pub fn a4_headnorm(h: &Harness<'_>, fix: &Fixture) -> Clause {
     Ok(Verdict::Noted(noted))
 }
 
-/// The heads' partial sums of the squares of their values: the Q4_K clause's.
-fn head_partials() -> Vec<f32> {
-    (0..VALUE_HEADS * PARTIALS_PER_HEAD)
-        .map(|i| 0.5 + (i % 7) as f32 * 0.25)
-        .collect()
-}
-
 /// The gate-up pair over the MLX stacks: the oracle band, an id past the
 /// stack, and the norm's fault inputs.
 pub fn a4_pair(h: &Harness<'_>, fix: &Fixture) -> Clause {
@@ -594,60 +588,15 @@ pub fn a4_head(h: &Harness<'_>, fix: &Fixture) -> Clause {
     )))
 }
 
-/// The embedding over the MLX table: the owner's value decode bit-equal to
-/// the host reader, row by row, and the ids past the vocabulary.
+/// The embedding clause over the MLX table: the fixture's table is MLX_A4,
+/// so `embed` holds the owner's value decode bit-equal to the host reader,
+/// row by row, and the ids past the vocabulary.
 pub fn a4_embed(h: &Harness<'_>, fix: &Fixture) -> Clause {
-    let (table, vocab, ty) = fix.table("token_embd.weight", HEAD_K)?;
+    let (_, _, ty) = fix.table("token_embd.weight", HEAD_K)?;
     if ty != gguf::quant::GgmlType::MLX_A4 {
         return Err(format!("token_embd.weight is {ty:?}, not MLX_A4"));
     }
-    let cols = HEAD_K;
-
-    let good = [0u32, 1, 5, 4095, (vocab - 1) as u32];
-    let rows = run_embed(h, Quant::A4, table, vocab, &good)?;
-    common::expect_clean(h, "ids in range")?;
-    for (t, &id) in good.iter().enumerate() {
-        let want = oracle::table_row(Quant::A4, table, cols, id as usize)?;
-        for (k, (g, w)) in rows[t * cols..(t + 1) * cols].iter().zip(&want).enumerate() {
-            if g.to_bits() != w.to_bits() {
-                return Err(format!(
-                    "id {id} value {k}: got {g:?}, the reader has {w:?}"
-                ));
-            }
-        }
-    }
-
-    let mixed = [7u32, vocab as u32, 9, u32::MAX, (vocab - 1) as u32];
-    let rows = run_embed(h, Quant::A4, table, vocab, &mixed)?;
-    common::expect_fault(h, "ids past the vocabulary", FaultSite::TokenId)?;
-    h.clear_fault()?;
-    for (t, &id) in mixed.iter().enumerate() {
-        let row = &rows[t * cols..(t + 1) * cols];
-        if (id as usize) < vocab {
-            let want = oracle::table_row(Quant::A4, table, cols, id as usize)?;
-            if let Some(k) = row
-                .iter()
-                .zip(&want)
-                .position(|(g, w)| g.to_bits() != w.to_bits())
-            {
-                return Err(format!(
-                    "id {id} beside a bad id, value {k}: got {:?}",
-                    row[k]
-                ));
-            }
-        } else if let Some(k) = row.iter().position(|v| !v.is_nan()) {
-            return Err(format!(
-                "id {id} (vocab {vocab}) value {k} is {:?}, not NaN",
-                row[k]
-            ));
-        }
-    }
-    Ok(Verdict::Noted(format!(
-        "{} ids bit-equal to the reader, ids {} and {} raised token_id with NaN rows",
-        good.len(),
-        vocab,
-        u32::MAX
-    )))
+    clauses_embed::embed(h, fix)
 }
 
 /// The clause table: one clause per entry, in the token's order.

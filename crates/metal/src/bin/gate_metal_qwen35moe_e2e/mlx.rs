@@ -10,72 +10,24 @@
 //! pins the split yet; the e2e pin against mlx-lm's own logits is another
 //! round's.
 
-use std::path::PathBuf;
-use std::time::Duration;
-
 use bloomery_device::conformance::{Clause, Verdict};
-use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
+use bloomery_metal::arch::qwen3moe::session::{Session, StepMode};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::library::Library;
-use runtime::{Advance, Committed, PassSink, Plain, Stop, StopReason, Target};
+use runtime::{Advance, Plain, Stop, StopReason, Target};
 
-use super::{CTX, SEED, says};
+use super::target::Quiet;
+use super::{CTX, SEED, mlx_split, says};
 
 /// The greedy tokens the loop and the host-fed reference run.
 const GREEDY: usize = 24;
-
-/// A [`PassSink`] that hears nothing.
-struct Quiet;
-
-impl PassSink<Session> for Quiet {
-    type Error = SessionError;
-
-    fn begin(&mut self, _t: &Session) -> Result<(), SessionError> {
-        Ok(())
-    }
-
-    fn pass(
-        &mut self,
-        _t: &Session,
-        _c: &Committed,
-        _tokens: &[u32],
-        _wall: Duration,
-    ) -> Result<(), SessionError> {
-        Ok(())
-    }
-}
-
-/// The MLX-format fixture split this clause reads: the one
-/// `*-00001-of-*.gguf` under the fixture root's `qwen35moe-mlxsplit`
-/// directory, resolved beside the gate's own fixture (`BLOOMERY_FIXTURE_ROOT`,
-/// the reference sets' root) — the kernels gate's `--mlx-fixture`
-/// resolution without its flag.
-fn mlx_fixture_path() -> Result<PathBuf, String> {
-    let root = refset::fixture::root().map_err(|e| format!("the fixture root: {e}"))?;
-    let at = format!("{root}/qwen35moe-mlxsplit");
-    let entries = std::fs::read_dir(&at).map_err(|e| {
-        format!("the MLX fixture {at}: {e} (`tools/mlx-fixture.py make` writes it from the qwen35moe fixture)")
-    })?;
-    let mut found: Vec<String> = entries
-        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-        .filter(|n| n.ends_with(".gguf") && n.contains("-00001-of-"))
-        .collect();
-    found.sort();
-    match found.as_slice() {
-        [one] => Ok(PathBuf::from(format!("{at}/{one}"))),
-        _ => Err(format!(
-            "the MLX fixture {at} holds {} first shards, not one",
-            found.len()
-        )),
-    }
-}
 
 /// `m_mlx`: the MLX split's session opens and generate over `Plain` emits
 /// the session's own host-fed picks — the open is the reader's admission of
 /// every MLX_A4 site through Metal's lists, the picks the session's first
 /// greedy steps.
 pub fn m_mlx(device: &MetalDevice, library: &Library) -> Clause {
-    let path = mlx_fixture_path()?;
+    let path = mlx_split::path()?;
     let mut s = Session::open(device, library, &path, CTX).map_err(says)?;
 
     // The reference: the first id and each pick host-fed, one step each.
