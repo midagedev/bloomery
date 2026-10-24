@@ -7,7 +7,7 @@ use crate::GpuError;
 use crate::graph::cu;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, sys};
 use std::marker::PhantomData;
-use std::mem::{ManuallyDrop, MaybeUninit, align_of, size_of, size_of_val};
+use std::mem::{ManuallyDrop, align_of, size_of};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -337,44 +337,13 @@ impl HostFill for u16 {
 /// reaches pageable memory through the host's page tables (GB10's unified
 /// memory) faults on each page a copy is the first to write, one page at a
 /// time; a new allocation nothing has written is such pages. A large one is
-/// advised onto huge pages first ([`advise_huge`]).
+/// advised onto huge pages first ([`os::advise_huge_within`]).
 #[must_use]
 pub fn host_filled<T: HostFill>(n: usize) -> Vec<T> {
     let mut host = Vec::with_capacity(n);
-    advise_huge(host.spare_capacity_mut());
+    os::advise_huge_within(host.spare_capacity_mut());
     host.resize(n, T::FILL);
     host
-}
-
-/// The huge page the advice asks for.
-const HUGE_PAGE: usize = 2 << 20;
-
-/// The size from which a new allocation is memory nothing has written:
-/// below it glibc's allocator mostly hands back heap memory it has written
-/// before, which the advice does not change.
-const ADVISE_FROM: usize = 32 << 20;
-
-/// Huge pages for the whole huge pages inside `spare`, a new allocation of
-/// at least [`ADVISE_FROM`] bytes, so that its fill faults once each huge
-/// page instead of once each base page.
-fn advise_huge<T>(spare: &mut [MaybeUninit<T>]) {
-    let bytes = size_of_val(spare);
-    if bytes < ADVISE_FROM {
-        return;
-    }
-    let at = spare.as_mut_ptr() as usize;
-    let (first, end) = (
-        at.next_multiple_of(HUGE_PAGE),
-        (at + bytes) / HUGE_PAGE * HUGE_PAGE,
-    );
-    if end > first {
-        // SAFETY: `first..end` is whole pages inside the allocation `spare`
-        // borrows, private anonymous memory its vector owns.
-        let advised = unsafe { os::advise_huge(first as *mut libc::c_void, end - first) };
-        // A refusal (a kernel without transparent huge pages) leaves base
-        // pages, which the fill writes the same.
-        drop(advised);
-    }
 }
 
 /// `src` read back into a new [`host_filled`] `Vec`: a readback the caller
@@ -1049,8 +1018,8 @@ mod tests {
     fn host_filled_memory_holds_the_fill_not_zero() {
         assert!(host_filled::<f32>(5).iter().all(|v| v.is_nan()));
         assert_eq!(host_filled::<u16>(5), [u16::MAX; 5]);
-        let advised = host_filled::<u16>(ADVISE_FROM / 2 + 3);
-        assert_eq!(advised.len(), ADVISE_FROM / 2 + 3);
+        let advised = host_filled::<u16>(os::ADVISE_FROM / 2 + 3);
+        assert_eq!(advised.len(), os::ADVISE_FROM / 2 + 3);
         assert!(advised.iter().all(|&v| v == u16::MAX), "the advised fill");
     }
 

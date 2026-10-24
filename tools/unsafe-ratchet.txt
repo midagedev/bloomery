@@ -528,7 +528,7 @@ gguf 7 2 0
 # copy, scale read and MMA instruction), `Mxfp8Cols` (refused, fetch, land, scale_word), the activations' MXFP8 form
 # body (`mxfp8_cols_body`: its load and its two plane stores) and the two kernel entries' body calls and shared-memory
 # view. Each block has its SAFETY line.
-gpu 2331 306 10
+gpu 2330 306 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -723,7 +723,9 @@ models 0 0 0
 # and sysctl reads; model and model-hf come down by the five that moved.
 # PIN(2026-10-24): os 30 -> 32 blocks, 5 -> 7 fns, new code, not old code relaxed: advise_huge
 # (madvise(MADV_HUGEPAGE), its Linux and macOS bodies) and its test, each with its SAFETY line.
-os 32 7 0
+# PIN(2026-10-25): os 32 -> 33 blocks, code moved in, not old code relaxed: advise_huge_within (moved from gpu's
+# host_filled advice, gpu comes down by the one that moved), with its SAFETY line.
+os 33 7 0
 placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row
 # lanes (pack_lanes_avx2, dot_lanes_avx2 and their helpers transpose8_epi32, transpose8_ps, lane_codes: five
