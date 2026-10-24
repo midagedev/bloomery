@@ -6,14 +6,16 @@
 //! What it maps:
 //!
 //! - `prefill` is the target's prompt call, its pick dropped, and one line
-//!   on stderr naming its positions, its ids and its wall; `next` is one
-//!   step, [`Want::Argmax`] for a greedy request (the session chains the
-//!   pick into the token ahead) and [`Want::Logits`] for one that samples,
-//!   the row copied into the server's buffer;
-//! - `prefill_splits` returns every mark. The target's prompt runs one
-//!   host-fed step a position, so a cut anywhere in the call is bit-neutral,
-//!   and each call's end becomes a checkpoint. Splitting at every mark makes
-//!   the start of each chat message a point;
+//!   on stderr naming its positions, its ids, the marks it kept and its
+//!   wall; `next` is one step, [`Want::Argmax`] for a greedy request (the
+//!   session chains the pick into the token ahead) and [`Want::Logits`] for
+//!   one that samples, the row copied into the server's buffer;
+//! - `prefill_marked` is that call with the server's marks handed to the
+//!   target ([`Target::prompt_marked`]), and `prefill_splits` cuts nowhere:
+//!   the target keeps each mark as a point inside the call, so the start of
+//!   each chat message is one without a call of its own. A cut is not
+//!   bit-neutral here — a part of at most a step's window steps where the
+//!   one call passes — so the server asks for none;
 //! - `keepable`, `cut`, `reset` and `ctx_max` are the target's own rules: a
 //!   prefix the target cannot keep is a reset, and why is the target's
 //!   [`runtime::seqstate::Why`] word.
@@ -27,6 +29,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use runtime::{Out, Target, Want};
+use serve::media::MediaFeed;
 use serve::{Engine, EngineError, EngineProps, Tokenizer};
 
 /// A target served with its vocabulary.
@@ -73,24 +76,40 @@ impl<T: Target + Send> Engine for TargetEngine<T> {
         Arc::clone(&self.vocab)
     }
 
-    /// Every mark, in order. The target's prompt is one host-fed step a
-    /// position, so ending a call at a mark is bit-neutral, and that end is
-    /// a checkpoint. A chat message's start, passed in as a mark, becomes one.
-    fn prefill_splits(&self, _first: usize, _end: usize, marks: &[usize]) -> Vec<usize> {
-        marks.to_vec()
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.prefill_marked(ids, &[], &[])
     }
 
-    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+    /// The prompt call with a point at each mark ([`Target::prompt_marked`]).
+    /// A mark that is no `u32` position is the server's error, by name; the
+    /// target refuses one out of order or outside the call. The default
+    /// refuses a call that carries images: this engine takes none.
+    fn prefill_marked(
+        &mut self,
+        ids: &[u32],
+        media: &[MediaFeed],
+        marks: &[usize],
+    ) -> Result<(), EngineError> {
+        if !media.is_empty() {
+            return self.prefill_media(ids, media);
+        }
         if ids.is_empty() {
             return Ok(());
         }
+        let at = marks
+            .iter()
+            .map(|&u| u32::try_from(u))
+            .collect::<Result<Vec<u32>, _>>()
+            .map_err(|_| {
+                EngineError(format!("{}: a prompt call marked at {marks:?}", self.what))
+            })?;
         let from = self.target.pos();
         let t0 = Instant::now();
         self.target
-            .prompt(ids, Want::Argmax)
+            .prompt_marked(ids, &at, Want::Argmax)
             .map_err(engine_error)?;
         eprintln!(
-            "{}: prompt call {from}..{}: {} ids in {:.1} ms",
+            "{}: prompt call {from}..{}: {} ids, points at {at:?}, in {:.1} ms",
             self.what,
             self.target.pos(),
             ids.len(),
@@ -171,10 +190,12 @@ mod tests {
     use super::TargetEngine;
 
     /// A target whose every step writes a row of `row` zeros and picks 0;
-    /// a prompt of no ids is refused, as the session's is.
+    /// a prompt of no ids is refused, as the session's is. `calls` holds
+    /// each prompt's id count.
     struct Rows {
         row: Vec<f32>,
         pos: u32,
+        calls: Vec<usize>,
     }
 
     impl Target for Rows {
@@ -193,6 +214,7 @@ mod tests {
                 return Err(io::Error::other("a prompt of no ids"));
             }
             self.pos += ids.len() as u32;
+            self.calls.push(ids.len());
             Ok(Out::Argmax(0))
         }
 
@@ -226,6 +248,7 @@ mod tests {
         let target = Rows {
             row: vec![0.0; row],
             pos: 0,
+            calls: Vec::new(),
         };
         TargetEngine::new(
             target,
@@ -253,11 +276,27 @@ mod tests {
     }
 
     #[test]
-    fn prefill_splits_returns_every_mark() {
+    fn marks_reach_the_target_in_one_call() {
         let n = MockTokenizer.n_vocab();
-        let e = engine(n, n).expect("a head of the vocabulary's rows");
+        let mut e = engine(n, n).expect("a head of the vocabulary's rows");
         let marks = [2usize, 7];
-        assert_eq!(Engine::prefill_splits(&e, 0, 10, &marks), marks);
-        assert_eq!(Engine::prefill_splits(&e, 1, 4, &[]), Vec::<usize>::new());
+        assert_eq!(
+            Engine::prefill_splits(&e, 0, 10, &marks),
+            Vec::<usize>::new()
+        );
+
+        // The engine hands the marks to the target's prompt; this target
+        // keeps them by the default, a prompt a part.
+        e.prefill_marked(&[1; 10], &[], &marks)
+            .expect("a call marked inside it");
+        assert_eq!(e.target.calls, [2, 5, 3]);
+        e.prefill(&[1; 4]).expect("a call with no marks");
+        assert_eq!(e.target.calls, [2, 5, 3, 4]);
+
+        // A mark that is no position of the target is the server's error.
+        let refused = e
+            .prefill_marked(&[1; 3], &[], &[usize::MAX])
+            .expect_err("a mark past u32");
+        assert!(refused.0.contains("marked at"), "{}", refused.0);
     }
 }
