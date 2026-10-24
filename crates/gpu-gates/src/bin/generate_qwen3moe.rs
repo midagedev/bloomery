@@ -391,6 +391,12 @@ fn dense_shortage_halves_the_default_context() {
     q3place::tests::dense_shortage_halves_the_default_context();
 }
 
+#[cfg(all(test, feature = "gpu"))]
+#[test]
+fn a_dense_header_plans_through_qwen35_on() {
+    q3place::tests::a_dense_header_plans_through_qwen35_on();
+}
+
 #[cfg(feature = "gpu")]
 #[path = "shared/qwen38_place.rs"]
 mod q38place;

@@ -1474,4 +1474,169 @@ pub(super) mod tests {
         let refused = Whole::Refused("unsupported tensor".into()).dense_refusal(TARGET as usize);
         assert!(short_or(refused).is_err());
     }
+
+    /// A dense qwen35 header of the body's smallest shapes, written to `path` over a sparse file
+    /// of its full length: hidden 256, three gated-delta layers (16 key and 32 value heads of
+    /// 128) and a gated attention layer (16 query and 2 key heads of 256), a SwiGLU FFN of 256 in
+    /// each and no expert key; every projection Q4_K, the head Q6_K, the norms, β, α and the
+    /// conv F32.
+    fn dense_header(path: &std::path::Path) -> Split {
+        use gguf::Value as V;
+        const H: u64 = 256;
+        const FF: u64 = 256;
+        const VOCAB: u64 = 256;
+        const CHANNELS: u64 = (2 * 16 + 32) * 128;
+        const ATTN: u64 = 32 * 128;
+        let u = |k: &str, v: u32| (format!("qwen35.{k}"), V::U32(v));
+        let kvs = vec![
+            (
+                gguf::GENERAL_ARCHITECTURE.to_owned(),
+                V::String("qwen35".to_owned()),
+            ),
+            u("block_count", 4),
+            u("embedding_length", H as u32),
+            u("context_length", 4096),
+            u("feed_forward_length", FF as u32),
+            u("attention.head_count", 16),
+            u("attention.head_count_kv", 2),
+            u("attention.key_length", 256),
+            u("attention.value_length", 256),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon".to_owned(),
+                V::F32(1e-6),
+            ),
+            u("rope.dimension_count", 64),
+            (
+                "qwen35.rope.dimension_sections".to_owned(),
+                V::Array([11, 11, 10, 0].map(V::I32).to_vec()),
+            ),
+            ("qwen35.rope.freq_base".to_owned(), V::F32(1e7)),
+            u("ssm.conv_kernel", 4),
+            u("ssm.state_size", 128),
+            u("ssm.group_count", 16),
+            u("ssm.time_step_rank", 32),
+            u("ssm.inner_size", ATTN as u32),
+            u("full_attention_interval", 4),
+            (
+                "tokenizer.ggml.model".to_owned(),
+                V::String("gpt2".to_owned()),
+            ),
+            (
+                "tokenizer.ggml.pre".to_owned(),
+                V::String("qwen35".to_owned()),
+            ),
+            (
+                "tokenizer.ggml.tokens".to_owned(),
+                V::Array((0..VOCAB).map(|i| V::String(i.to_string())).collect()),
+            ),
+        ];
+        let (q4, q6, f32) = (
+            gguf::GgmlType::Q4_K,
+            gguf::GgmlType::Q6_K,
+            gguf::GgmlType::F32,
+        );
+        let mut tensors = vec![
+            ("token_embd.weight".to_owned(), vec![H, VOCAB], q4),
+            ("output_norm.weight".to_owned(), vec![H], f32),
+            ("output.weight".to_owned(), vec![H, VOCAB], q6),
+        ];
+        for l in 0..4 {
+            let mixer: &[(&str, &[u64], gguf::GgmlType)] = if l < 3 {
+                &[
+                    ("attn_qkv.weight", &[H, CHANNELS], q4),
+                    ("attn_gate.weight", &[H, ATTN], q4),
+                    ("ssm_conv1d.weight", &[4, CHANNELS], f32),
+                    ("ssm_dt.bias", &[32], f32),
+                    ("ssm_a", &[32], f32),
+                    ("ssm_alpha.weight", &[H, 32], f32),
+                    ("ssm_beta.weight", &[H, 32], f32),
+                    ("ssm_norm.weight", &[128], f32),
+                    ("ssm_out.weight", &[ATTN, H], q4),
+                ]
+            } else {
+                &[
+                    ("attn_q.weight", &[H, 2 * ATTN], q4),
+                    ("attn_k.weight", &[H, 512], q4),
+                    ("attn_v.weight", &[H, 512], q4),
+                    ("attn_q_norm.weight", &[256], f32),
+                    ("attn_k_norm.weight", &[256], f32),
+                    ("attn_output.weight", &[ATTN, H], q4),
+                ]
+            };
+            let block: [(&str, &[u64], gguf::GgmlType); 5] = [
+                ("attn_norm.weight", &[H], f32),
+                ("post_attention_norm.weight", &[H], f32),
+                ("ffn_gate.weight", &[H, FF], q4),
+                ("ffn_up.weight", &[H, FF], q4),
+                ("ffn_down.weight", &[FF, H], q4),
+            ];
+            for &(stem, dims, ty) in mixer.iter().chain(&block) {
+                tensors.push((format!("blk.{l}.{stem}"), dims.to_vec(), ty));
+            }
+        }
+        let decls = tensors
+            .into_iter()
+            .map(|(name, dims, ty)| {
+                let (Some(blck), Some(tsz)) = (ty.blck_size(), ty.type_size()) else {
+                    panic!("{name}: {ty:?} has no block info");
+                };
+                let nbytes = gguf::tensor_bytes(blck, tsz, &dims).expect("small tensors");
+                gguf::write::TensorDecl {
+                    name,
+                    dims,
+                    type_id: ty.as_u32(),
+                    nbytes,
+                }
+            })
+            .collect();
+        let layout = gguf::write::Layout::new(&kvs, decls).expect("the dense layout");
+        let len = layout.file_len();
+        let mut file = std::fs::File::create(path).expect("the header file");
+        drop(gguf::write::Writer::new(&mut file, layout).expect("the header"));
+        file.set_len(len).expect("the file's length");
+        Split::open(path).expect("the dense header opens")
+    }
+
+    /// A dense qwen35 file (no router) plans through [`PlaceQ3::qwen35_on`]: its machine counts
+    /// the whole load's ubatch arena, as the load sizes it, not a placed arena, which a file with
+    /// no router refuses; and the plan answers at the load's context.
+    #[allow(
+        dead_code,
+        reason = "`generate_qwen3moe`'s test calls it; every other bin that includes this file leaves it unused"
+    )]
+    pub(crate) fn a_dense_header_plans_through_qwen35_on() {
+        let path =
+            std::env::temp_dir().join(format!("bloomery-q35-dense-{}.gguf", std::process::id()));
+        let split = dense_header(&path);
+        let o = Open35 {
+            ctx: 4096,
+            mma: false,
+            ubatch: 512,
+            kv: KvQ8::F16,
+            media: false,
+        };
+        let census = [DeviceInfo {
+            ordinal: 0,
+            name: "NVIDIA RTX A6000".to_owned(),
+            total_bytes: 50_952_536_064,
+            free_bytes: 50_000_000_000,
+            uuid: [1; 16],
+            pci_bus: "0000:41:00.0".to_owned(),
+            held_by: None,
+            integrated: false,
+        }];
+        let place = Place::parse("cuda0").expect("a card word");
+        let q = PlaceQ3::qwen35_on(&split, place, &census, o, Seqs::ONE, Beside::default())
+            .unwrap_or_else(|e| panic!("a dense file plans: {e}"));
+        let WholeLoad::Checked { arena, .. } =
+            Qwen35moeModel::whole_load(&split, o).expect("the whole load reads the file")
+        else {
+            panic!("a qwen35 whole load checks its arena");
+        };
+        assert_eq!(q.arch, "qwen35");
+        assert_eq!(workstation::counted_arena_bytes(&q.machine.cards[0]), arena);
+        q.plan(o.ctx, &PlanLevers::default())
+            .unwrap_or_else(|e| panic!("the dense plan at {}: {e}", o.ctx));
+        std::fs::remove_file(&path).expect("the header file");
+    }
 }
