@@ -340,6 +340,7 @@ name = "bloomery-hf"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-os",
  "bloomery-runtime",
  "bloomery-safetensors",
  "flate2",
@@ -405,6 +406,7 @@ dependencies = [
 name = "bloomery-model-hf"
 version = "0.1.0"
 dependencies = [
+ "bloomery-engram",
  "bloomery-gguf",
  "bloomery-hf",
  "bloomery-levers",

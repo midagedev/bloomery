@@ -620,7 +620,7 @@ impl Drop for Rank {
 /// ([`RankOf::take`]), in its type's card format.
 pub fn load(
     gpu: &Gpu,
-    source: &impl Source,
+    source: &(impl Source + Sync),
     at: RankOf,
     layers: usize,
     heads: usize,

@@ -809,6 +809,39 @@ pub unsafe fn advise_huge(_addr: *mut libc::c_void, _len: usize) -> Result<(), O
     })
 }
 
+/// The huge page [`advise_huge_within`] asks for.
+const HUGE_PAGE: usize = 2 << 20;
+
+/// The size from which a new allocation is memory nothing has written:
+/// below it glibc's allocator mostly hands back heap memory it has written
+/// before, which the advice does not change.
+pub const ADVISE_FROM: usize = 32 << 20;
+
+/// Huge pages for the whole huge pages inside `span`, a new heap allocation
+/// of at least [`ADVISE_FROM`] bytes nothing has written yet (a vector's
+/// spare capacity, or a new zeroed vector), so that its first writes fault
+/// once each huge page instead of once each base page, and its free unmaps
+/// huge pages. A refusal (a kernel without transparent huge pages, or a
+/// platform without the advice) leaves base pages, which the writes fill
+/// the same.
+pub fn advise_huge_within<T>(span: &mut [T]) {
+    let bytes = size_of_val(span);
+    if bytes < ADVISE_FROM {
+        return;
+    }
+    let at = span.as_mut_ptr().addr();
+    let (first, end) = (
+        at.next_multiple_of(HUGE_PAGE),
+        (at + bytes) / HUGE_PAGE * HUGE_PAGE,
+    );
+    if end > first {
+        // SAFETY: `first..end` is whole pages inside the allocation `span`
+        // borrows, private anonymous memory its owner holds.
+        let advised = unsafe { advise_huge(first as *mut libc::c_void, end - first) };
+        drop(advised);
+    }
+}
+
 /// Fault the pages of `addr .. addr + len` in.
 ///
 /// `advise` is the platform's populate advice call. A refusal that names the

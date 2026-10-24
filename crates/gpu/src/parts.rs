@@ -1,19 +1,19 @@
 //! The one load of a part source onto a card (`model::part::Source`: a GGUF file or a
 //! checkpoint folder). The caller's rule says which tensors the card holds, whole or the part
 //! of a rank, as the source plans them; every planned part's card format is checked before any
-//! is read; then each part is read and staged in turn through one staging ring, which one
-//! synchronize ends ([`load`]). A rank of a tensor-parallel load of N ranks passes its family's
+//! is read; then the parts are read a run at a time over the resident worker pool and staged in
+//! order through one staging ring, which one synchronize ends ([`load`]). A rank of a tensor-parallel load of N ranks passes its family's
 //! cut; a one-card load passes its placement plan's card ([`OnCard`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cuda_core::CudaStream;
 use gguf::{GgmlType, TensorInfo};
-use model::part::{Source, Take};
+use model::part::{Planned, Source, Take};
 use model::placement::{CardFormat, Device, Format, ModelTensor, Plan, Segment};
 
 use crate::GpuError;
-use crate::upload::UploadRing;
+use crate::upload::{UploadRing, pool_map};
 use crate::weights::{TensorPart, Weights, part_format, stage_parts};
 
 /// What the errors name.
@@ -21,13 +21,14 @@ const WHAT: &str = "parts::load";
 
 /// The parts of `source` that `rule` takes, each read and uploaded to the card of `stream` in
 /// the card format `card` names for it, else its type's ([`part_format`]). Every part is planned
-/// and its format checked, and refused by name, before any is read; then one part at a time is
-/// read and staged, so the load holds one part's bytes of its own beside the card (a file's
-/// parts are its mapping's and hold none). The weights are the caller's only once every copy
-/// has ended: a refusal at any part drops what was staged. Under `release` each part's file
-/// pages are dropped once it is staged ([`Source::release`]), as a split's placed load drops its
-/// card segments' (`BLOOMERY_CARD_DONTNEED`).
-pub fn load<S: Source, E: std::fmt::Display>(
+/// and its format checked, and refused by name, before any is read; then the parts are read a
+/// run at a time ([`read_ahead`]), the run's parts at once over the resident worker pool, and
+/// staged in order, so the load holds at most one run's bytes of its own beside the card. The
+/// weights are the caller's only once every copy has ended: a refusal at any part, the first in
+/// plan order, drops what was staged. Under `release` each part's file pages are dropped once
+/// its run is staged ([`Source::release`]), as a split's placed load drops its card segments'
+/// (`BLOOMERY_CARD_DONTNEED`).
+pub fn load<S: Source + Sync, E: std::fmt::Display>(
     stream: &CudaStream,
     source: &S,
     rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
@@ -46,23 +47,59 @@ pub fn load<S: Source, E: std::fmt::Display>(
     // Made after `staged` and dropped before it: its drop drains the copies, so no buffer of a
     // refused load is freed while a copy still writes it.
     let mut ring = UploadRing::new(stream, budget)?;
-    for p in &planned {
-        let part = source.read(p).map_err(|e| refused(e.to_string()))?;
-        let one = TensorPart {
-            info: part.info.clone(),
-            spans: part.spans(),
-            scale: part.scale.clone(),
-        };
-        let held = |name: &str| staged.contains_key(name);
-        let added = stage_parts(stream, &mut ring, &[one], held, &card)?;
-        staged.extend(added);
-        drop(part);
-        if release {
-            source.release(p).map_err(|e| refused(e.to_string()))?;
+    let mut planned = planned.as_slice();
+    while !planned.is_empty() {
+        let (run, rest) = planned.split_at(read_ahead(planned));
+        planned = rest;
+        let parts = pool_map(run.iter().collect(), |p| {
+            source.read(p).map_err(|e| e.to_string())
+        });
+        let mut done = Vec::with_capacity(run.len());
+        for (p, part) in run.iter().zip(parts) {
+            let part = part.map_err(refused)?;
+            let one = TensorPart {
+                info: part.info.clone(),
+                spans: part.spans(),
+                scale: part.scale.clone(),
+            };
+            let held = |name: &str| staged.contains_key(name);
+            let added = stage_parts(stream, &mut ring, &[one], held, &card)?;
+            staged.extend(added);
+            done.push((p, part));
         }
+        // The run's parts are freed, and their pages dropped, over the pool: on this thread the
+        // load would wait on each part's unmap in turn.
+        let released = pool_map(done, |(p, part)| {
+            drop(part);
+            match release {
+                true => source.release(p).map_err(|e| e.to_string()),
+                false => Ok(()),
+            }
+        });
+        released
+            .into_iter()
+            .collect::<Result<(), _>>()
+            .map_err(refused)?;
     }
     ring.finish(stream)?;
     Ok(Weights::of_staged(staged))
+}
+
+/// The most bytes of parts one read ahead of the staging holds ([`read_ahead`]).
+const READ_AHEAD: u64 = 8 << 30;
+
+/// How many parts from the front of `planned` one read takes: as many as fit in [`READ_AHEAD`]
+/// bytes, and at least one of a run that has one.
+fn read_ahead(planned: &[Planned]) -> usize {
+    let mut bytes = 0u64;
+    let fit = planned
+        .iter()
+        .take_while(|p| {
+            bytes = bytes.saturating_add(p.info.nbytes);
+            bytes <= READ_AHEAD
+        })
+        .count();
+    fit.max(1).min(planned.len())
 }
 
 /// Card `card` of `plan` as a load from a part source reads it ([`load`]): each tensor the plan
@@ -176,7 +213,7 @@ impl OnCard {
 
 /// Card `card` of `plan` from `source` ([`OnCard`], [`load`], each part's pages released under
 /// `release`), checked against the plan.
-pub fn load_placed<S: Source>(
+pub fn load_placed<S: Source + Sync>(
     stream: &CudaStream,
     source: &S,
     plan: &Plan<'_>,
@@ -203,6 +240,26 @@ fn refused(detail: String) -> GpuError {
 mod tests {
     use super::*;
     use model::placement::{ExpertList, Role};
+
+    /// A read takes the front parts that fit in [`READ_AHEAD`] bytes, and a part past it alone.
+    #[test]
+    fn a_read_takes_the_parts_that_fit_and_at_least_one() {
+        let part = |nbytes| Planned {
+            at: None,
+            info: TensorInfo {
+                name: "p".into(),
+                dims: vec![1],
+                ty: GgmlType::BF16,
+                offset: 0,
+                nbytes,
+            },
+        };
+        let gib = 1u64 << 30;
+        assert_eq!(read_ahead(&[part(3 * gib), part(5 * gib), part(1)]), 2);
+        assert_eq!(read_ahead(&[part(9 * gib), part(1)]), 1);
+        assert_eq!(read_ahead(&vec![part(gib); 3]), 3);
+        assert_eq!(read_ahead(&[]), 0);
+    }
 
     /// The rule a load from a part source plans by: a tensor whole on the card is taken in the
     /// plan's card format, an unused tensor and a row-gathered table on the NVMe tier are

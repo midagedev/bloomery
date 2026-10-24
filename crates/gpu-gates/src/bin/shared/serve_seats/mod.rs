@@ -87,13 +87,17 @@ pub mod tiered;
 #[cfg(feature = "clef")]
 pub mod decide;
 
-/// The header of the model at `path`, which the server seats it by: its GGUF split's first shard,
-/// or a checkpoint folder's when `path` is a directory (a Qwen3.8 checkpoint,
-/// [`qwen38_folder::open`]).
+/// `f` of the header of the model at `path`, which the server seats it by: its GGUF split's
+/// first shard, or a checkpoint folder's when `path` is a directory (a Qwen3.8 checkpoint,
+/// [`qwen38_folder::with_header`], which keeps the folder for the seat's load).
 #[cfg(feature = "deepseek41")]
-pub fn header(path: &std::path::Path) -> Result<gguf::Split, bloomery_gpu_gates::GateError> {
+pub fn with_header<R>(
+    path: &std::path::Path,
+    f: impl FnOnce(&gguf::Split) -> R,
+) -> Result<R, bloomery_gpu_gates::GateError> {
     if path.is_dir() {
-        return qwen38_folder::open(path).map(|f| f.header);
+        return qwen38_folder::with_header(path, f);
     }
-    gguf::Split::open(path).map_err(|e| format!("open {}: {e}", path.display()).into())
+    let split = gguf::Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    Ok(f(&split))
 }

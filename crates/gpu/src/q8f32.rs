@@ -95,6 +95,7 @@ use crate::gemm::{
 };
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
+use crate::upload::pack_planes;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::vector::{F32x4, as_vectors};
 use cuda_device::{
@@ -3610,45 +3611,48 @@ pub fn e4m3_planes(
             ),
         ));
     }
-    let mut qs = Vec::with_capacity(rows * k / 4);
-    let mut e = Vec::with_capacity(rows * k / 128);
-    for (r, row) in bytes.chunks_exact(row_bytes).enumerate() {
-        let checked = match scales {
-            E4m3Scales::Mxfp8 => check_mxfp8(row),
-            E4m3Scales::Fp8B128 => check_fp8_b128(row),
-        };
-        checked.map_err(|why| GpuError::shape(what, format!("row {r}: {why}")))?;
-        for group in row.as_chunks::<132>().0 {
-            match scales {
-                E4m3Scales::Mxfp8 => {
-                    let mut word = 0u32;
-                    for (i, blk) in group.as_chunks::<33>().0.iter().enumerate() {
-                        word |= u32::from(blk[0]) << (8 * i);
-                        qs.extend(
-                            blk[1..]
-                                .as_chunks::<4>()
-                                .0
-                                .iter()
-                                .map(|c| u32::from_le_bytes(*c)),
-                        );
+    pack_planes(
+        what,
+        bytes,
+        (rows, row_bytes),
+        [k / 4, k / 128],
+        |first, src, qs, e| {
+            for (r, row) in src.chunks_exact(row_bytes).enumerate() {
+                let checked = match scales {
+                    E4m3Scales::Mxfp8 => check_mxfp8(row),
+                    E4m3Scales::Fp8B128 => check_fp8_b128(row),
+                };
+                checked.map_err(|why| format!("row {}: {why}", first + r))?;
+                for (g, group) in row.as_chunks::<132>().0.iter().enumerate() {
+                    let at = r * (k / 128) + g;
+                    let words = &mut qs[32 * at..][..32];
+                    match scales {
+                        E4m3Scales::Mxfp8 => {
+                            let mut word = 0u32;
+                            for (i, blk) in group.as_chunks::<33>().0.iter().enumerate() {
+                                word |= u32::from(blk[0]) << (8 * i);
+                                for (w, c) in words[8 * i..][..8]
+                                    .iter_mut()
+                                    .zip(blk[1..].as_chunks::<4>().0)
+                                {
+                                    *w = u32::from_le_bytes(*c);
+                                }
+                            }
+                            e[at] = word;
+                        }
+                        E4m3Scales::Fp8B128 => {
+                            let (scale, values) = group.split_at(4);
+                            e[at] = u32::from_le_bytes([scale[0], scale[1], scale[2], scale[3]]);
+                            for (w, c) in words.iter_mut().zip(values.as_chunks::<4>().0) {
+                                *w = u32::from_le_bytes(*c);
+                            }
+                        }
                     }
-                    e.push(word);
-                }
-                E4m3Scales::Fp8B128 => {
-                    let (scale, values) = group.split_at(4);
-                    e.push(u32::from_le_bytes([scale[0], scale[1], scale[2], scale[3]]));
-                    qs.extend(
-                        values
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|c| u32::from_le_bytes(*c)),
-                    );
                 }
             }
-        }
-    }
-    Ok((qs, e))
+            Ok(())
+        },
+    )
 }
 
 /// [`Q8F32Kernels::enqueue_q8_0_gemv_heads_mcol`]'s arguments. The strides
@@ -3761,46 +3765,53 @@ pub(crate) fn bf16_mxfp8_planes(
             format!("{rows} rows of {k} do not match {} BF16 bytes", src.len()),
         ));
     }
-    let mut qs = vec![0u32; count / 4];
-    let mut scales = vec![0u32; count / 128];
-    for (block, bytes) in src.as_chunks::<64>().0.iter().enumerate() {
-        let values: [f32; 32] = std::array::from_fn(|i| {
-            f32::from_bits(u32::from(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])) << 16)
-        });
-        if !values.iter().all(|v| v.is_finite()) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("block {block} has a non-finite value"),
-            ));
-        }
-        let amax = values.iter().fold(f32::MIN_POSITIVE, |a, v| a.max(v.abs()));
-        let exponent = ((amax / 448.0).log2().ceil() as i32).clamp(-127, 127);
-        scales[block / 4] |= ((exponent + 127) as u32) << (8 * (block % 4));
-        let scale = 2.0f32.powi(exponent);
-        let inverse = 2.0f32.powi(-exponent);
-        for (i, value) in values.into_iter().enumerate() {
-            let magnitude = (value * inverse).abs();
-            let code = if magnitude < 1.0 / 64.0 {
-                (magnitude * 512.0).round_ties_even() as u32
-            } else {
-                let bits = magnitude.to_bits() - (120 << 23);
-                let kept = bits >> 20;
-                let tail = bits & 0x000f_ffff;
-                (kept + u32::from(tail > 0x0008_0000 || (tail == 0x0008_0000 && kept & 1 != 0)))
-                    .min(126)
-            };
-            if !(Mxfp8Bytes::value(code) * scale).is_finite() {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!("block {block} rounds a value past f32's range"),
-                ));
+    let row_blocks = k / 32;
+    pack_planes(
+        WHAT,
+        src,
+        (rows, 2 * k),
+        [k / 4, k / 128],
+        |first, src, qs, scales| {
+            for (local, bytes) in src.as_chunks::<64>().0.iter().enumerate() {
+                let block = first * row_blocks + local;
+                let values: [f32; 32] = std::array::from_fn(|i| {
+                    f32::from_bits(
+                        u32::from(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])) << 16,
+                    )
+                });
+                if !values.iter().all(|v| v.is_finite()) {
+                    return Err(format!("block {block} has a non-finite value"));
+                }
+                let amax = values.iter().fold(f32::MIN_POSITIVE, |a, v| a.max(v.abs()));
+                let exponent = ((amax / 448.0).log2().ceil() as i32).clamp(-127, 127);
+                scales[local / 4] |= ((exponent + 127) as u32) << (8 * (local % 4));
+                let scale = 2.0f32.powi(exponent);
+                let inverse = 2.0f32.powi(-exponent);
+                for (i, value) in values.into_iter().enumerate() {
+                    let magnitude = (value * inverse).abs();
+                    let code = if magnitude < 1.0 / 64.0 {
+                        (magnitude * 512.0).round_ties_even() as u32
+                    } else {
+                        let bits = magnitude.to_bits() - (120 << 23);
+                        let kept = bits >> 20;
+                        let tail = bits & 0x000f_ffff;
+                        (kept
+                            + u32::from(
+                                tail > 0x0008_0000 || (tail == 0x0008_0000 && kept & 1 != 0),
+                            ))
+                        .min(126)
+                    };
+                    if !(Mxfp8Bytes::value(code) * scale).is_finite() {
+                        return Err(format!("block {block} rounds a value past f32's range"));
+                    }
+                    let signed = code | ((value.to_bits() >> 24) & 0x80);
+                    let at = local * 32 + i;
+                    qs[at / 4] |= signed << (8 * (at % 4));
+                }
             }
-            let signed = code | ((value.to_bits() >> 24) & 0x80);
-            let at = block * 32 + i;
-            qs[at / 4] |= signed << (8 * (at % 4));
-        }
-    }
-    Ok((qs, scales))
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@
 //! expert at a time on the layer that holds the fewest so far, so the
 //! per-layer totals stay even ([`Plan::tier_n_l`]).
 
+use std::cell::RefCell;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -2124,29 +2125,160 @@ fn card_uploads<'m>(
     Ok(out)
 }
 
-/// The bytes of the granules `uploads` take with `n_l` experts on each layer:
-/// every upload's buffers, in order, through the card's allocator ([`Heap`]).
-fn footprint(
+/// The bytes of the granules a card's uploads take with `n_l` experts on each layer: every
+/// upload's buffers, in order, through the card's allocator ([`Heap`]). The expert rule asks it
+/// once an expert ([`spread`]), and each ask changes one layer's count, so each step of the
+/// uploads keeps what it worked out last: its buffers at its last rows, and what its small
+/// buffers did to the shared granules from the granules it found. A buffer of a granule or more
+/// takes whole granules of its own wherever it falls in the order, so only the small buffers
+/// depend on the granules a step finds; a step that finds them as it last found them, with the
+/// same small buffers, leaves them as it last left them.
+struct Footprint<'m> {
     granule: NonZeroU64,
-    uploads: &[(&ModelTensor, CardFormat, Held)],
-    n_l: &[u64],
-) -> Result<u64, PlacementError> {
-    let mut heap = Heap::new(granule);
-    for &(t, format, held) in uploads {
-        let rows = match held {
-            Held::Rows(rows) => rows,
-            Held::Experts {
-                layer,
-                rows_per_expert,
-            } => n_l[layer] * rows_per_expert,
-        };
-        if rows > 0 {
-            for b in card_buffers(t, format, rows)? {
-                heap.alloc(b);
-            }
+    steps: Vec<Step<'m>>,
+}
+
+struct Step<'m> {
+    what: What<'m>,
+    last: RefCell<Last>,
+}
+
+/// One step of [`Footprint`]'s uploads, in order.
+enum What<'m> {
+    /// Fixed uploads' buffers.
+    Fixed,
+    /// An upload whose buffers follow its layer's count: a routed stack, or one whose buffers
+    /// are refused, which each count refuses in its place.
+    Upload(&'m ModelTensor, CardFormat, Held),
+}
+
+/// What a step worked out last.
+#[derive(Default)]
+struct Last {
+    /// The rows its buffers are of; `None` before the first.
+    rows: Option<u64>,
+    /// The bytes of its buffers of a granule or more, rounded to whole granules.
+    large: u64,
+    /// Its smaller buffers, in order.
+    small: Vec<u64>,
+    /// The shared granules' bytes left as its small buffers found them, and what the buffers
+    /// did there; `None` until they are allocated.
+    effect: Option<(Vec<u64>, Effect)>,
+}
+
+/// What a run of small buffers did to the shared granules: the bytes left it set by index, the
+/// granules it opened (their bytes left), and the bytes of those granules.
+struct Effect {
+    set: Vec<(usize, u64)>,
+    opened: Vec<u64>,
+    took: u64,
+}
+
+impl Last {
+    fn of(granule: NonZeroU64, rows: u64, buffers: Vec<u64>) -> Last {
+        let (large, small): (Vec<u64>, Vec<u64>) =
+            buffers.into_iter().partition(|&b| b >= granule.get());
+        Last {
+            rows: Some(rows),
+            large: allocator_bytes(granule, large),
+            small,
+            effect: None,
         }
     }
-    Ok(heap.taken)
+}
+
+impl<'m> Footprint<'m> {
+    fn new(granule: NonZeroU64, uploads: &[(&'m ModelTensor, CardFormat, Held)]) -> Footprint<'m> {
+        let mut steps: Vec<Step<'m>> = Vec::new();
+        for &(t, format, held) in uploads {
+            let fixed = match held {
+                Held::Rows(0) => continue,
+                Held::Rows(rows) => card_buffers(t, format, rows).ok(),
+                Held::Experts { .. } => None,
+            };
+            let Some(buffers) = fixed else {
+                steps.push(Step {
+                    what: What::Upload(t, format, held),
+                    last: RefCell::default(),
+                });
+                continue;
+            };
+            let add = Last::of(granule, 0, buffers);
+            if let Some(Step {
+                what: What::Fixed,
+                last,
+            }) = steps.last_mut()
+            {
+                let last = last.get_mut();
+                last.large += add.large;
+                last.small.extend(add.small);
+            } else {
+                steps.push(Step {
+                    what: What::Fixed,
+                    last: RefCell::new(add),
+                });
+            }
+        }
+        Footprint { granule, steps }
+    }
+
+    fn at(&self, n_l: &[u64]) -> Result<u64, PlacementError> {
+        let mut heap = Heap::new(self.granule);
+        // Whether the shared granules are as the last ask found them at this step.
+        let mut same = true;
+        for step in &self.steps {
+            let mut last = step.last.borrow_mut();
+            if let What::Upload(t, format, held) = step.what {
+                let rows = match held {
+                    Held::Rows(rows) => rows,
+                    Held::Experts {
+                        layer,
+                        rows_per_expert,
+                    } => n_l[layer] * rows_per_expert,
+                };
+                if last.rows != Some(rows) {
+                    let buffers = if rows > 0 {
+                        card_buffers(t, format, rows)?
+                    } else {
+                        Vec::new()
+                    };
+                    let now = Last::of(self.granule, rows, buffers);
+                    let effect = last.effect.take().filter(|_| now.small == last.small);
+                    *last = Last { effect, ..now };
+                }
+            }
+            let last = &mut *last;
+            heap.taken += last.large;
+            match &last.effect {
+                Some((found, e)) if same || *found == heap.left => {
+                    for &(i, left) in &e.set {
+                        heap.left[i] = left;
+                    }
+                    heap.left.extend_from_slice(&e.opened);
+                    heap.taken += e.took;
+                    same = true;
+                }
+                _ => {
+                    let (found, open, taken) = (heap.left.clone(), heap.left.len(), heap.taken);
+                    for &b in &last.small {
+                        heap.alloc(b);
+                    }
+                    let set = (0..open)
+                        .filter(|&i| heap.left[i] != found[i])
+                        .map(|i| (i, heap.left[i]))
+                        .collect();
+                    let effect = Effect {
+                        set,
+                        opened: heap.left[open..].to_vec(),
+                        took: heap.taken - taken,
+                    };
+                    last.effect = Some((found, effect));
+                    same = false;
+                }
+            }
+        }
+        Ok(heap.taken)
+    }
 }
 
 /// The placement's levers, which a binary parses once
@@ -2572,6 +2704,7 @@ impl Fill<'_, '_> {
             .routed
             .unwrap_or(RoutedRule::PerType(CardFormat::of_routed));
         let uploads = card_uploads(self.model, self.c, self.rows, self.eligible, format)?;
+        let footprint = Footprint::new(card.granule_bytes, &uploads);
         let budget = i128::from(capped(card, self.card_budget))
             - i128::from(self.kv)
             - i128::from(
@@ -2581,19 +2714,17 @@ impl Fill<'_, '_> {
             - i128::from(card.margin_bytes)
             - i128::from(self.reserve);
         if let Some(b) = self.card_budget {
-            let dense = footprint(card.granule_bytes, &uploads, n_l)?;
+            let dense = footprint.at(n_l)?;
             check_floor(card, b, dense, self.kv, self.reserve)?;
         }
         if let Some(free) = card.free_bytes.filter(|&f| f < card.usable_bytes) {
-            let dense = footprint(card.granule_bytes, &uploads, n_l)?;
+            let dense = footprint.at(n_l)?;
             check_free_floor(card, free, dense, self.kv, self.reserve)?;
         }
         let caps: Vec<u64> = (0..n_l.len())
             .map(|l| self.model.layer_experts(l))
             .collect();
-        spread(n_l, held, self.eligible, &caps, budget, |n| {
-            footprint(card.granule_bytes, &uploads, n)
-        })
+        spread(n_l, held, self.eligible, &caps, budget, |n| footprint.at(n))
     }
 }
 
@@ -4574,6 +4705,102 @@ mod tests {
 
     const HEAD: u64 = 4_352;
     const EXPERT: u64 = 576;
+
+    /// The footprint the expert rule asks once an expert is the allocator's replay of every
+    /// buffer in order, whatever counts it is asked at and in whatever order: fixed tensors
+    /// below and above a granule between stacks whose buffers cross it as their counts grow.
+    #[test]
+    fn a_footprint_is_the_replay_of_every_buffer_at_any_counts() {
+        let tensor = |name: &str, layer, role, ty: GgmlType, dims: Vec<u64>| ModelTensor {
+            name: name.into(),
+            shard: 0,
+            layer,
+            role,
+            ty,
+            dims,
+            file_bytes: 0,
+            gathered_rows: None,
+        };
+        let (layers, granule) = (3, NonZeroU64::new(4096).expect("nonzero"));
+        let mut tensors = Vec::new();
+        for l in 0..layers {
+            tensors.push(tensor(
+                "norm",
+                Some(l),
+                Role::Attention,
+                GgmlType::F32,
+                vec![256],
+            ));
+            tensors.push(tensor(
+                "big",
+                Some(l),
+                Role::Attention,
+                GgmlType::Q8_0,
+                vec![256, 20],
+            ));
+            tensors.push(tensor(
+                "small",
+                Some(l),
+                Role::Attention,
+                GgmlType::Q8_0,
+                vec![256, 3],
+            ));
+            tensors.push(tensor(
+                "stack",
+                Some(l),
+                Role::RoutedExperts,
+                GgmlType::Q4_K,
+                vec![256, 8, 9],
+            ));
+        }
+        let uploads: Vec<_> = tensors
+            .iter()
+            .map(|t| {
+                let format = CardFormat::of(t.ty).expect("a card format");
+                let held = match t.role {
+                    Role::RoutedExperts => Held::Experts {
+                        layer: t.layer.expect("a layer"),
+                        rows_per_expert: 8,
+                    },
+                    _ => Held::Rows(rows_of(t)),
+                };
+                (t, format, held)
+            })
+            .collect();
+        let replay = |n_l: &[u64]| {
+            let buffers = uploads.iter().flat_map(|&(t, format, held)| {
+                let rows = match held {
+                    Held::Rows(rows) => rows,
+                    Held::Experts {
+                        layer,
+                        rows_per_expert,
+                    } => n_l[layer] * rows_per_expert,
+                };
+                if rows == 0 {
+                    Vec::new()
+                } else {
+                    card_buffers(t, format, rows).expect("buffers")
+                }
+            });
+            allocator_bytes(granule, buffers)
+        };
+        let footprint = Footprint::new(granule, &uploads);
+        let mut n_l = vec![0u64; layers];
+        let mut seed = 7u64;
+        for ask in 0..400 {
+            if ask < 27 {
+                n_l[ask % layers] += 1;
+            } else {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                n_l[(seed >> 33) as usize % layers] = (seed >> 40) % 10;
+            }
+            assert_eq!(
+                footprint.at(&n_l).expect("a footprint"),
+                replay(&n_l),
+                "{n_l:?}"
+            );
+        }
+    }
 
     /// A model of 4 layers with every role's bf16 tensor (an attention
     /// matrix, a hyper-connection, a shared expert and its one-row gate, a

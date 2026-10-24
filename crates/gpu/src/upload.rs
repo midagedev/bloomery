@@ -11,6 +11,8 @@ use crate::GpuError;
 use crate::tensor::window;
 use cuda_core::{CudaStream, DeviceCopy, PinnedHostBuffer, sys};
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 // The staged uploads are the file's bytes read as the device's little-endian
 // words; a target of another endianness would need a repacking path, not a
@@ -248,6 +250,79 @@ fn memcpy_pool(dst: &mut [u8], src: &[u8]) {
     });
 }
 
+/// `f` of each of `items` over the resident worker pool, the results in item
+/// order: every thread takes the next item as it finishes one, so items of
+/// uneven cost keep every core busy. `f` must not use the pool itself
+/// (`for_each_chunk` is not reentrant).
+pub(crate) fn pool_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let todo: Vec<Mutex<Option<T>>> = items.into_iter().map(|t| Mutex::new(Some(t))).collect();
+    let done: Vec<Mutex<Option<R>>> = todo.iter().map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let pool = threads::pool();
+    pool.for_each_chunk(pool.threads(), |_| {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(slot) = todo.get(i) else { break };
+            let item = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(item) = item {
+                let r = f(item);
+                *done[i].lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
+            }
+        }
+    });
+    done.into_iter()
+        .filter_map(|d| d.into_inner().unwrap_or_else(PoisonError::into_inner))
+        .collect()
+}
+
+/// A host packing of `rows` rows of `row_bytes` bytes each (`src`) into two
+/// word planes of `widths[0]` and `widths[1]` words a row, over the resident
+/// worker pool ([`pool_map`]): `pack(first, src, qs, e)` packs the run of
+/// whole rows from row `first` that its slices hold, into planes zeroed
+/// first (new memory on huge pages, [`os::advise_huge_within`]), and its first
+/// refusal in row order is `what`'s. A short input packs on the calling
+/// thread ([`TEAM_MIN`]).
+pub(crate) fn pack_planes(
+    what: &'static str,
+    src: &[u8],
+    (rows, row_bytes): (usize, usize),
+    widths: [usize; 2],
+    pack: impl Fn(usize, &[u8], &mut [u32], &mut [u32]) -> Result<(), String> + Sync,
+) -> Result<(Vec<u32>, Vec<u32>), GpuError> {
+    let words = |w: usize| {
+        rows.checked_mul(w)
+            .ok_or_else(|| GpuError::shape(what, format!("{rows} rows of {w} words pass usize")))
+    };
+    let (mut qs, mut e) = (vec![0u32; words(widths[0])?], vec![0u32; words(widths[1])?]);
+    os::advise_huge_within(&mut qs);
+    os::advise_huge_within(&mut e);
+    if rows.checked_mul(row_bytes) != Some(src.len()) {
+        return Err(GpuError::shape(
+            what,
+            format!("{} bytes are not {rows} rows of {row_bytes}", src.len()),
+        ));
+    }
+    let refused = if src.len() < TEAM_MIN {
+        pack(0, src, &mut qs, &mut e).err()
+    } else {
+        let run = rows.div_ceil(4 * threads::pool().threads()).max(1);
+        let tasks: Vec<_> = src
+            .chunks(run * row_bytes)
+            .zip(qs.chunks_mut((run * widths[0]).max(1)))
+            .zip(e.chunks_mut((run * widths[1]).max(1)))
+            .enumerate()
+            .map(|(i, ((src, qs), e))| (i * run, src, qs, e))
+            .collect();
+        pool_map(tasks, |(first, src, qs, e)| pack(first, src, qs, e))
+            .into_iter()
+            .find_map(Result::err)
+    };
+    match refused {
+        Some(detail) => Err(GpuError::shape(what, detail)),
+        None => Ok((qs, e)),
+    }
+}
+
 /// The destination of [`memcpy_pool`], shared with the pool's workers, each
 /// of which writes only its own chunk.
 struct SharedDst(*mut u8);
@@ -263,4 +338,76 @@ pub(crate) fn bytes_of<T: DeviceCopy>(data: &[T]) -> &[u8] {
     // SAFETY: the length covers exactly `data`'s initialized bytes and
     // reading bytes through a lower alignment is always sound.
     unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), std::mem::size_of_val(data)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TEAM_MIN;
+    use crate::GpuError;
+    use crate::mxfp4::{Mxfp4, Nvfp4, repack};
+    use crate::q8f32::{E4m3Scales, bf16_mxfp8_planes, e4m3_planes};
+
+    type Packed = Result<(Vec<u32>, Vec<u32>), GpuError>;
+
+    /// The planes `pack` makes of `rows` rows of `src` at once, past [`TEAM_MIN`] so its runs
+    /// go to the pool, are those of packing the rows one at a time.
+    fn pooled_as_by_rows(rows: usize, src: &[u8], pack: impl Fn(&[u8], usize) -> Packed) {
+        assert!(src.len() >= TEAM_MIN);
+        let (mut qs, mut e) = (Vec::new(), Vec::new());
+        for row in src.chunks(src.len() / rows) {
+            let (q, x) = pack(row, 1).unwrap_or_else(|err| panic!("{err}"));
+            qs.extend(q);
+            e.extend(x);
+        }
+        let whole = pack(src, rows).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(whole, (qs, e));
+    }
+
+    /// Every host packing over the pool (`pack_planes`) gives the planes of packing its rows one
+    /// at a time, and names the first refused row of the tensor, not of a run.
+    #[test]
+    fn pooled_packings_match_row_by_row_and_name_the_first_refused_row() {
+        let bytes = |n: usize, f: fn(usize) -> u8| (0..n).map(f).collect::<Vec<u8>>();
+        let fp4 = |i: usize| (i * 7 % 0x7F) as u8;
+        let rows = 16384;
+        let mut nv = bytes(rows * 72, fp4);
+        pooled_as_by_rows(rows, &nv, |b, r| {
+            repack::<Nvfp4>(b, r, 128).map(|p| (p.qs, p.e))
+        });
+        let mx4 = bytes(rows * 68, |i| {
+            if i % 17 == 0 {
+                127
+            } else {
+                (i * 7 % 0x7F) as u8
+            }
+        });
+        pooled_as_by_rows(rows, &mx4, |b, r| {
+            repack::<Mxfp4>(b, r, 128).map(|p| (p.qs, p.e))
+        });
+        let mx8 = bytes(
+            8192 * 132,
+            |i| if i % 33 == 0 { 127 } else { (i % 0x70) as u8 },
+        );
+        pooled_as_by_rows(8192, &mx8, |b, r| e4m3_planes(E4m3Scales::Mxfp8, b, r, 128));
+        let b128 = bytes(8192 * 132, |i| match i % 132 {
+            0..4 => 1.0f32.to_le_bytes()[i % 132],
+            _ => (i % 0x70) as u8,
+        });
+        pooled_as_by_rows(8192, &b128, |b, r| {
+            e4m3_planes(E4m3Scales::Fp8B128, b, r, 128)
+        });
+        let bf16 = bytes(4096 * 256, |i| (i % 0x7E) as u8);
+        pooled_as_by_rows(4096, &bf16, |b, r| bf16_mxfp8_planes(b, r, 128));
+        for row in [rows - 1, rows / 2] {
+            nv[row * 72 + 36 + 1] = 0xFF;
+        }
+        let err = repack::<Nvfp4>(&nv, rows, 128)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("row {} block 1 sub-block 1", rows / 2)),
+            "{err}"
+        );
+    }
 }
