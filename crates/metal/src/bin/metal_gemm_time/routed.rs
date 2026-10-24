@@ -15,8 +15,11 @@
 //! pass does.
 //!
 //! The arms (`--arm NAME`, repeatable; `ship` by default): `ship`, the
-//! shipped source, and every routed variant (`variants::ROUTED`), each
-//! launched with the engine's bindings and argument block. `--hot` sets the
+//! shipped source's simdgroup kernels, `tensor` and `tensor_relaxed`, the
+//! tensor-op program's (`gemm_tensor.metal`, the second with the op's
+//! relaxed precision on) over the shipped table, and every routed variant
+//! (`variants::ROUTED`), each launched with the engine's bindings and
+//! argument block. `--hot` sets the
 //! stack's per-expert stride to zero, so every group reads expert 0's rows:
 //! the same instructions over cache-resident weights.
 //!
@@ -60,10 +63,11 @@ pub struct Opts {
     pub hot: bool,
 }
 
-/// An arm: its name and its library.
+/// An arm: its name, the library of its table and of its grouped GEMMs.
 struct RArm<'l> {
     name: String,
     library: &'l Library,
+    gemms: &'l Library,
 }
 
 /// The weights of a layer: the stacks and the shared tensors, uploaded once.
@@ -385,12 +389,18 @@ fn hash(ctx: &Ctx<'_>, p: &Pass) -> Result<(u64, u64), String> {
 /// Time every arm at every row count and skew.
 pub fn run(ctx: &Ctx<'_>, opts: &Opts) -> Result<(), String> {
     let mut built: Vec<(&'static Variant, Library)> = Vec::new();
+    let mut tensors: Vec<(&str, Library)> = Vec::new();
     for name in &opts.arms {
-        if name != "ship" {
+        if name == "tensor" || name == "tensor_relaxed" {
+            tensors.push((
+                name,
+                super::tensor_library(ctx.device, name == "tensor_relaxed")?,
+            ));
+        } else if name != "ship" {
             let v = variants::find_routed(name).ok_or_else(|| {
                 let known: Vec<&str> = variants::ROUTED.iter().map(|v| v.name).collect();
                 format!(
-                    "no routed arm named {name}: ship, or one of {}",
+                    "no routed arm named {name}: ship, tensor, tensor_relaxed, or one of {}",
                     known.join(", ")
                 )
             })?;
@@ -407,6 +417,13 @@ pub fn run(ctx: &Ctx<'_>, opts: &Opts) -> Result<(), String> {
             arms.push(RArm {
                 name: name.clone(),
                 library: ctx.device.library(),
+                gemms: ctx.device.library(),
+            });
+        } else if let Some((_, library)) = tensors.iter().find(|(n, _)| n == name) {
+            arms.push(RArm {
+                name: name.clone(),
+                library: ctx.device.library(),
+                gemms: library,
             });
         } else {
             let (_, library) = built
@@ -416,6 +433,7 @@ pub fn run(ctx: &Ctx<'_>, opts: &Opts) -> Result<(), String> {
             arms.push(RArm {
                 name: name.clone(),
                 library,
+                gemms: library,
             });
         }
     }
@@ -426,12 +444,9 @@ pub fn run(ctx: &Ctx<'_>, opts: &Opts) -> Result<(), String> {
             let ids = picks(rows, skew, 0x7AB1E ^ rows as u64);
             for arm in &arms {
                 let mut p = pass(ctx, arm, rows, &ids)?;
-                let pair_p = arm
-                    .library
-                    .pipeline("gemm_routed_a4_pair_f16")
-                    .map_err(why)?;
+                let pair_p = arm.gemms.pipeline("gemm_routed_a4_pair_f16").map_err(why)?;
                 let down_p = arm
-                    .library
+                    .gemms
                     .pipeline("gemm_routed_a4_plain_f16")
                     .map_err(why)?;
                 // One pair and one down first, so the down reads the pair's
