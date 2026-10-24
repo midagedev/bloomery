@@ -92,11 +92,14 @@ pub(crate) struct RoutedPipelines {
 }
 
 impl RoutedPipelines {
+    /// The pipelines of `library`, the grouped GEMM's from its GEMMs' library
+    /// ([`Library::gemm_library`]).
     pub(crate) fn new(library: &Library) -> Result<Self, DeviceError> {
+        let gemm = library.gemm_library();
         Ok(Self {
-            q4k: RoutedFamily::new(library, "q4k")?,
-            q6k: RoutedFamily::new(library, "q6k")?,
-            a4: RoutedFamily::new(library, "a4")?,
+            q4k: RoutedFamily::new(gemm, "q4k")?,
+            q6k: RoutedFamily::new(gemm, "q6k")?,
+            a4: RoutedFamily::new(gemm, "a4")?,
             f32w: library.pipeline("gemm_f32w_store_f32")?,
             select: library.pipeline("route_rows_select")?,
             table: library.pipeline("route_table")?,

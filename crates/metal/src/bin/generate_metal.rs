@@ -22,7 +22,9 @@
 //! `--tokens` spelling, so a run's output feeds back as an input), for
 //! gates. The summary lines go to stderr, `key=value` one a line:
 //!
-//!     model=<path> open_s=<the open's wall> device_allocated_bytes=<the
+//!     model=<path> gemm_path=<simdgroup|tensor: the prompt pass's GEMMs,
+//!     the device's matrix-unit rule's pick> open_s=<the open's wall>
+//!     device_allocated_bytes=<the
 //!     driver's live device bytes after the open> prompt_ids=<count>
 //!     prompt_s=<the prompt's wall> prompt_tok_s=<rate> decode_tokens=<count>
 //!     decode_passes=<count> decode_s=<the loop's wall> decode_tok_s=<rate>
@@ -785,6 +787,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         let decode_s = out.decode_wall.as_secs_f64();
         eprintln!("# development-loop numbers: no lease, no witness");
         eprintln!("model={}", a.model.display());
+        eprintln!("gemm_path={}", device.library().gemm_path().name());
         eprintln!("open_s={open_s:.3}");
         eprintln!("device_allocated_bytes={allocated}");
         let resident = session.residency();
