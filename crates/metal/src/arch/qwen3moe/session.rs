@@ -1564,9 +1564,7 @@ where
         enc.end();
         let signalled = self.stream.submit_signalled(recording)?;
         self.settled = Some(self.stream.settle(signalled)?);
-        self.count.groups += c.groups;
-        self.count.dispatches += c.dispatches;
-        self.count.barriers += c.barriers;
+        self.count += c;
         let probe = Probe {
             arena: self.arena,
             lane: lane_of(self.pos + 1),
@@ -1644,14 +1642,16 @@ impl PassLayers<'_> {
         f: impl FnOnce(&mut MetalOps<'_, '_>) -> Result<(), SessionError>,
     ) -> Result<(), SessionError> {
         let open = self.buffers.at(layer)?;
-        f(&mut MetalOps::rows(
-            open.encoder(),
-            self.arena,
-            RowsCtx { arena: self.rows },
-            self.kernels,
-            self.from,
-            self.head,
-        ))
+        open.encoder(|encoder| {
+            f(&mut MetalOps::rows(
+                encoder,
+                self.arena,
+                RowsCtx { arena: self.rows },
+                self.kernels,
+                self.from,
+                self.head,
+            ))
+        })
     }
 }
 
@@ -1820,9 +1820,7 @@ impl PassProfiler<'_> {
             }
         };
         self.samples.push(PassSample { op, gpu_s });
-        self.count.groups += c.groups;
-        self.count.dispatches += c.dispatches;
-        self.count.barriers += c.barriers;
+        self.count += c;
         Ok(())
     }
 }
@@ -1909,9 +1907,7 @@ impl Profiler<'_> {
         let signalled = self.stream.submit_signalled(recording)?;
         let settled = self.stream.settle(signalled)?;
         self.settled = Some(settled);
-        self.count.groups += c.groups;
-        self.count.dispatches += c.dispatches;
-        self.count.barriers += c.barriers;
+        self.count += c;
         // The settle above waited the buffer out, so its stamps are the
         // driver's record of a completed run; anything else is a refusal.
         let gpu = match stamps.interval(STAMP_WAIT)? {

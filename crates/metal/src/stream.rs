@@ -209,9 +209,11 @@ pub struct TokenRecording<'s> {
 }
 
 impl<'s> TokenRecording<'s> {
-    /// The open encoder.
-    pub fn encoder(&mut self) -> &mut ComputeEncoder<'static> {
-        &mut self.encoder
+    /// `f` over the open encoder. The encoder reaches `f` at a lifetime of
+    /// its own, so it cannot leave the call or trade places with another
+    /// pair's: a pair's `finish` always ends its own encoder.
+    pub fn encoder<R>(&mut self, f: impl for<'e> FnOnce(&mut ComputeEncoder<'e>) -> R) -> R {
+        f(&mut self.encoder)
     }
 
     /// End the encoder: the recording, ready to commit, and what the encoder

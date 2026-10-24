@@ -168,9 +168,7 @@ impl ComputeEncoder<'_> {
     pub(crate) fn concurrent(
         buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<ComputeEncoder<'_>, DeviceError> {
-        Self::with_encoder(buffer, |buffer| {
-            buffer.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-        })
+        Self::concurrent_detached(buffer)
     }
 
     /// [`ComputeEncoder::concurrent`] with no borrow of the buffer: the
