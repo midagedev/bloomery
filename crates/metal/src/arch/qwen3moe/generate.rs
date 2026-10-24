@@ -63,6 +63,8 @@ pub struct Generated {
     pub prompt_wall: Duration,
     /// The wall of the loop proper: every pass after the prompt's argmax.
     pub decode_wall: Duration,
+    /// The completed passes counted by the runtime after the prompt.
+    pub passes: usize,
 }
 
 impl Generated {
@@ -70,13 +72,6 @@ impl Generated {
     #[must_use]
     pub fn tokens(&self) -> usize {
         self.ids.len()
-    }
-
-    /// The passes [`Generated::decode_wall`] holds: every token after
-    /// generated token 0, which the prompt call picks.
-    #[must_use]
-    pub fn passes(&self) -> usize {
-        self.ids.len().saturating_sub(1)
     }
 }
 
@@ -117,6 +112,7 @@ where
         stop: outcome.stop,
         prompt_wall,
         decode_wall: t1.elapsed(),
+        passes: outcome.passes,
     })
 }
 

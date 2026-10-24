@@ -592,12 +592,12 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         eprintln!("prompt_s={prompt_s:.3}");
         eprintln!("prompt_tok_s={:.1}", prompt.len() as f64 / prompt_s);
         eprintln!("decode_tokens={}", out.tokens());
-        eprintln!("decode_passes={}", out.passes());
+        eprintln!("decode_passes={}", out.passes);
         eprintln!("decode_s={decode_s:.3}");
-        if out.passes() == 0 {
+        if out.passes == 0 {
             eprintln!("decode_tok_s=none");
         } else {
-            eprintln!("decode_tok_s={:.1}", out.passes() as f64 / decode_s);
+            eprintln!("decode_tok_s={:.1}", out.passes as f64 / decode_s);
         }
         eprintln!("stop={}", out.stop.name());
         if let Some(p) = &a.profile {
@@ -605,7 +605,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
                 .ids
                 .last()
                 .ok_or("a profile of no token: the run picked none")?;
-            let decode_ms = (out.passes() > 0).then(|| decode_s / out.passes() as f64 * 1e3);
+            let decode_ms = (out.passes > 0).then(|| decode_s / out.passes as f64 * 1e3);
             profile_run(&mut session, p, id, decode_ms)?;
         }
         if let Some(n) = a.step_times {
