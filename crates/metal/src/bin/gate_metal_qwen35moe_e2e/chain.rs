@@ -74,6 +74,7 @@ pub fn moved(s: &Session, before: StepStats) -> StepStats {
     let now = s.stats();
     StepStats {
         waits: now.waits - before.waits,
+        submits: now.submits - before.submits,
         ahead: now.ahead - before.ahead,
         kept: now.kept - before.kept,
         discarded: now.discarded - before.discarded,

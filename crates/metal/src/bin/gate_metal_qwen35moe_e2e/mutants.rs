@@ -16,8 +16,11 @@
 //! past its id window (the adjacent record slot for a device-fed token), the
 //! head storing no pick (the last row's stale slot), and the delta step
 //! writing the lane it read (the token a mark's take drops leaving its
-//! update in the lane the point copies). The host edits themselves are
-//! one-off edits recorded in the round that proves the clause.
+//! update in the lane the point copies). `q_layers`'s defects — a pass that
+//! commits a command buffer an op, one buffer for the whole pass, and a layer's
+//! buffer that skips the token boundary's wait — are the host's too and have
+//! no kernel side. The host edits themselves are one-off edits recorded in the
+//! round that proves the clause.
 
 use bloomery_metal::library::SOURCE;
 

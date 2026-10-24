@@ -21,6 +21,9 @@
 //! - `q_fault`: an id past the vocabulary in a pass raises the token-id site
 //!   at layer 0, the position does not move, the next pass and the next step
 //!   are refused by poison, and after the reset a pass runs clean.
+//! - `q_layers`: an unprofiled pass is one command buffer a layer and one
+//!   host wait, and it leaves the profiled pass's pick, logits row and
+//!   stores bit for bit, the profiled pass committing a buffer an op.
 //! - `q_free`: the same N greedy tokens teacher-forced through the pass run
 //!   and the stepped run: every layer's output of every token within
 //!   [`FREE_BAND`] of the stepped run's, and the routers' picks differing in
@@ -39,6 +42,7 @@ use bloomery_metal::kernels::{CONV_TAPS, HEAD_COLS, HEAD_DIM, KV_HEADS, RING_ROW
 use bloomery_metal::library::Library;
 use runtime::prompt::PrefillMode;
 
+use super::chain;
 use super::flip;
 use super::free::{FREE_BAND, FREE_FLIPS_MAX};
 use super::keep;
@@ -87,6 +91,10 @@ const CONV_ROWS: usize = CONV_TAPS - 1;
 
 /// A row of the cache: one cell's key (or value) heads.
 const KV_ROW: usize = KV_HEADS * HEAD_DIM;
+
+/// The ids of `q_layers`'s pass: more than a step's window, so the pass runs
+/// every rows arm.
+const Q_LAYERS_IDS: usize = 100;
 
 /// The greedy tokens `q_free` teacher-forces: with the fixture's four layers,
 /// the sixteen router sites [`FREE_FLIPS_MAX`] is derived over.
@@ -672,5 +680,75 @@ pub fn q_fault(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     Ok(Verdict::Noted(format!(
         "a pass with id {bad} raised {fault} and left the position at 0; the next pass and step \
          were refused by poison; after the reset a pass of 12 ids ran clean"
+    )))
+}
+
+/// A pass of [`Q_LAYERS_IDS`] ids as the prompt runs it and as the profile runs
+/// it: what each left, and the buffers and waits each moved.
+pub fn q_layers(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
+    let both = prompt_ids(2 * Q_LAYERS_IDS)?;
+    let (ids, other) = both.split_at(Q_LAYERS_IDS);
+    let mut s = open(
+        device,
+        library,
+        path,
+        Q_LAYERS_IDS + 1,
+        2048,
+        PrefillMode::Batch,
+    )?;
+    // The rows arena opens at a first pass of other ids, outside the counted
+    // one: a row an op reads before the op ahead of it wrote holds those.
+    s.pass(other, PassOut::None, StateOut::default())
+        .map_err(says)?;
+    s.reset().map_err(says)?;
+    let before = s.stats();
+    let one = s
+        .pass(ids, PassOut::Last, StateOut::default())
+        .map_err(says)?;
+    let moved = chain::moved(&s, before);
+    let layers = s.layer_count() as u64;
+    if moved.submits != layers || moved.waits != 1 {
+        return Err(format!(
+            "a pass of {Q_LAYERS_IDS} ids committed {} command buffers and waited {} times; a \
+             buffer a layer ({layers}) and one wait are expected",
+            moved.submits, moved.waits
+        ));
+    }
+    let logits = bits(s.logits_row().map_err(says)?);
+    let one_stores = read_stores(&mut s, one.id, logits)?;
+    s.reset().map_err(says)?;
+    let mut samples = Vec::new();
+    let before = s.stats();
+    let per_op = s
+        .pass_profile(ids, PassOut::Last, &mut samples)
+        .map_err(says)?;
+    let moved = chain::moved(&s, before);
+    if moved.submits != samples.len() as u64 {
+        return Err(format!(
+            "the profiled pass committed {} command buffers for {} ops; one an op is expected",
+            moved.submits,
+            samples.len()
+        ));
+    }
+    let logits = bits(s.logits_row().map_err(says)?);
+    let per_op_stores = read_stores(&mut s, per_op.id, logits)?;
+    if let Some(why) = differs(
+        "a buffer a layer against a buffer an op",
+        &one_stores,
+        &per_op_stores,
+    ) {
+        return Err(why);
+    }
+    if one.count != per_op.count {
+        return Err(format!(
+            "the layers' buffers encoded {:?}; the ops' buffers {:?}",
+            one.count, per_op.count
+        ));
+    }
+    Ok(Verdict::Noted(format!(
+        "a pass of {Q_LAYERS_IDS} ids is {layers} command buffers (one a layer) and one wait, and \
+         leaves the pick, logits row, states, rings and cache rows of the profiled pass's {} \
+         buffers bit for bit",
+        samples.len()
     )))
 }

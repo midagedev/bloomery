@@ -70,13 +70,14 @@
 //!   site lists — and `generate` over `Plain` emits the session's own
 //!   host-fed picks (`t_target`'s greedy pattern on that session).
 //!
-//! - `q_short`, `q_state`, `q_chunk`, `q_ref`, `q_free`, `q_fault`: the batched prompt
-//!   pass (`pass.rs`): a prompt of at most a step's window is the step path;
-//!   one pass against the stepped ids leaves layer 0's state and ring within a
-//!   derived band; the pass size moves no bit; the step at the prompt's depth
-//!   against ik's `l_out` and logits, the pass run's distance over the stepped
-//!   run's within a ratio; the greedy tokens teacher-forced through both; an
-//!   id past the vocabulary in a pass raises the token-id site and poisons.
+//! - `q_short`, `q_state`, `q_chunk`, `q_ref`, `q_free`, `q_fault`, `q_layers`: the
+//!   batched prompt pass (`pass.rs`): a prompt of at most a step's window is the
+//!   step path; one pass against the stepped ids leaves layer 0's state and ring
+//!   within a derived band; the pass size moves no bit; the step at the prompt's
+//!   depth against ik's `l_out` and logits, the pass run's distance over the
+//!   stepped run's within a ratio; the greedy tokens teacher-forced through both;
+//!   an id past the vocabulary in a pass raises the token-id site and poisons; a
+//!   pass is one command buffer a layer and leaves the profiled pass's bits.
 //!
 //! - `r_resident`: the session's kernel buffers are held in one residency set
 //!   (`resident.rs`): the set holds every byte the open and the first pass
@@ -456,7 +457,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 20] = [
+    const NAMES: [&str; 21] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -476,6 +477,7 @@ pub fn main() -> ExitCode {
         "q_ref",
         "q_free",
         "q_fault",
+        "q_layers",
         "r_resident",
     ];
     if args.iter().any(|a| a == "--list") {
@@ -601,6 +603,7 @@ pub fn main() -> ExitCode {
             "q_ref" => pass::q_ref(&device, library, &path),
             "q_free" => pass::q_free(&device, library, &path),
             "q_fault" => pass::q_fault(&device, library, &path),
+            "q_layers" => pass::q_layers(&device, library, &path),
             "r_resident" => resident::r_resident(&device, library, &path),
             _ => free::a_free(&mut session),
         };
