@@ -138,14 +138,11 @@ impl SiteTy {
     /// outside the card kernel table whose table holds no row is a named
     /// panic, not a guessed type.
     fn row(self) -> (GgmlType, SiteTy, SiteAct) {
-        let mut i = 0;
-        while i < BACKEND_SITES.len() {
-            if BACKEND_SITES[i].1 == self {
-                return BACKEND_SITES[i];
-            }
-            i += 1;
-        }
-        panic!("a site family outside the card kernel table has no BACKEND_SITES row")
+        BACKEND_SITES
+            .iter()
+            .copied()
+            .find(|r| r.1 == self)
+            .expect("a site family outside the card kernel table has no BACKEND_SITES row")
     }
 }
 
@@ -155,7 +152,7 @@ impl SiteTy {
 /// reads the table, so a card's `allowed` — which holds no family here —
 /// refuses the type by name exactly as it did before the row, and
 /// [`SiteTy::of_ggml`], the card table's map, names each of the types none.
-const BACKEND_SITES: &[(GgmlType, SiteTy, SiteAct)] =
+pub const BACKEND_SITES: &[(GgmlType, SiteTy, SiteAct)] =
     &[(GgmlType::MLX_A4, SiteTy::MlxA4, SiteAct::F32)];
 
 /// The family's file type, its ggml name in upper case (`Q4_K`, `NVFP4`).
@@ -221,17 +218,7 @@ pub fn file_site(
 /// [`BACKEND_SITES`] row's for a type no card launch reads. The one map a
 /// site's family comes through.
 fn family_of(ty: GgmlType) -> Option<SiteTy> {
-    if let Some(s) = SiteTy::of_ggml(ty) {
-        return Some(s);
-    }
-    let mut i = 0;
-    while i < BACKEND_SITES.len() {
-        if BACKEND_SITES[i].0 == ty {
-            return Some(BACKEND_SITES[i].1);
-        }
-        i += 1;
-    }
-    None
+    SiteTy::of_ggml(ty).or_else(|| BACKEND_SITES.iter().find(|r| r.0 == ty).map(|r| r.1))
 }
 
 /// `allowed` as a list of names, the one a refusal of a site of the wrong type names.

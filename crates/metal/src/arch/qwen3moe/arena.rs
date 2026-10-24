@@ -1144,3 +1144,31 @@ fn ffn(
         ticket: zeroed(device, 1)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use chain::arch::qwen3moe::plan::SiteTy;
+    use chain::site::BACKEND_SITES;
+
+    use super::quant_of;
+    use crate::arch::qwen3moe::session::LAUNCHED;
+
+    /// The session's site list and the arena's quant set name the same
+    /// families, over the card's families and the backends' rows: a family
+    /// the plan admits has a launch, and a launch the plan never admits is
+    /// dead.
+    #[test]
+    fn launched_sites_are_the_arena_quants() {
+        let families = SiteTy::ALL
+            .iter()
+            .copied()
+            .chain(BACKEND_SITES.iter().map(|r| r.1));
+        for s in families {
+            assert_eq!(
+                LAUNCHED.contains(&s),
+                quant_of(s.ggml()).is_some(),
+                "{s:?}: the session's LAUNCHED and the arena's quant_of disagree"
+            );
+        }
+    }
+}
