@@ -574,8 +574,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         let mut total = 0.0;
         for i in 0..n {
             let mut t: Vec<f64> = runs.iter().map(|r| r[i].gpu_s).collect();
-            t.sort_by(f64::total_cmp);
-            let med = t[t.len() / 2];
+            let med = median(&mut t);
             let class = match runs[0][i].op {
                 Op::AttnIn(_) | Op::AttnOut(_) | Op::DeltaIn(_) | Op::DeltaOut(_) => "gemm",
                 Op::Route(_) => "route",
