@@ -1175,24 +1175,25 @@ impl Slot {
         }
     }
 
-    /// Where the engine cuts the prompt call `ids[from..to]` into calls
-    /// ([`Engine::prefill_splits`]) at the messages the prompt opens
-    /// ([`Tokenizer::user_start`]): its first and its last inside the range.
-    /// An answer not among those marks in order is the engine's error.
-    fn marked_cuts(&self, ids: &[u32], from: usize, to: usize) -> Result<Vec<usize>, EngineError> {
+    /// The marks of the prompt call `ids[from..to]`, the messages the prompt
+    /// opens ([`Tokenizer::user_start`]): its first and its last inside the
+    /// range; and where the engine cuts the call into calls among them
+    /// ([`Engine::prefill_splits`]). An answer not among those marks in
+    /// order is the engine's error.
+    fn marked_cuts(&self, ids: &[u32], from: usize, to: usize) -> Result<Marks, EngineError> {
         let marks = message_starts(&ids[..to], &self.vocab.user_start(), from);
-        let at = if marks.is_empty() {
+        let cuts = if marks.is_empty() {
             Vec::new()
         } else {
             self.engine.prefill_splits(from, to, &marks)
         };
-        if !at.iter().all(|u| marks.contains(u)) || !at.windows(2).all(|w| w[0] < w[1]) {
+        if !cuts.iter().all(|u| marks.contains(u)) || !cuts.windows(2).all(|w| w[0] < w[1]) {
             return Err(EngineError(format!(
-                "the engine cut the prompt call {from}..{to} at {at:?}, not among its marks \
+                "the engine cut the prompt call {from}..{to} at {cuts:?}, not among its marks \
                  {marks:?} in order"
             )));
         }
-        Ok(at)
+        Ok(Marks { marks, cuts })
     }
 
     /// The note of a prompt call `first..end` the engine cut at its marks
@@ -1203,17 +1204,18 @@ impl Slot {
         }
     }
 
-    /// `prefill` of the prompt's positions `at..at + ids.len()` that books
-    /// what it fed; a call that holds an image span (of `media`, the prompt's
-    /// feeds) is [`Engine::prefill_media`] with the feeds it holds, at its own
-    /// positions, and books their spans. A call that would cut a span is the
-    /// server's error: the cache and the prompt's last position never lie
-    /// inside one.
+    /// [`Engine::prefill_marked`] of the prompt's positions
+    /// `at..at + ids.len()` that books what it fed: the feeds of the image
+    /// spans it holds (of `media`, the prompt's feeds), at its own positions,
+    /// and the prompt call's `marks` that fall in it, past `at` and up to its
+    /// end. A call that would cut a span is the server's error: the cache and
+    /// the prompt's last position never lie inside one.
     fn prefill_range(
         &mut self,
         ids: &[u32],
         at: usize,
         media: &[MediaFeed],
+        marks: &[usize],
     ) -> Result<(), EngineError> {
         let end = at + ids.len();
         let mut feeds = Vec::new();
@@ -1234,12 +1236,13 @@ impl Slot {
                 ..f.clone()
             });
         }
+        let inside: Vec<usize> = marks
+            .iter()
+            .copied()
+            .filter(|&u| at < u && u <= end)
+            .collect();
         let held = std::mem::take(&mut self.held);
-        if feeds.is_empty() {
-            self.engine.prefill(ids)?;
-        } else {
-            self.engine.prefill_media(ids, &feeds)?;
-        }
+        self.engine.prefill_marked(ids, &feeds, &inside)?;
         self.held = held;
         self.held.ids.extend_from_slice(ids);
         self.held.media.extend(feeds.iter().map(|f| MediaSpan {
@@ -1276,19 +1279,17 @@ impl Slot {
     }
 
     /// The prompt call's last call `ids` at the prompt's positions `at..`
-    /// (`media`, the prompt's feeds) and the step of its last id, booked:
-    /// [`Slot::prefill_range`] of all but the last id and [`Slot::next`] of
-    /// the last. A prompt call takes the checkpoints of its marks, so it is
-    /// never an answer run's [`Engine::next_after`].
+    /// (`media`, the prompt's feeds; `marks`, the prompt call's) and the step
+    /// of its last id, booked: [`Slot::prefill_range`] of all but the last id
+    /// and [`Slot::next`] of the last. A prompt call takes the checkpoints of
+    /// its marks, so it is never an answer run's [`Engine::next_after`].
     fn close_call(
         &mut self,
-        ids: &[u32],
-        at: usize,
-        media: &[MediaFeed],
+        (ids, at, media, marks): Call<'_>,
         logits: Option<&mut [f32]>,
     ) -> Result<u32, EngineError> {
         let (&last, run) = ids.split_last().expect("the prompt's last id");
-        self.prefill_range(run, at, media)?;
+        self.prefill_range(run, at, media, marks)?;
         self.next(last, logits)
     }
 
@@ -1486,6 +1487,17 @@ impl Slot {
     }
 }
 
+/// The marks of a prompt call ([`Slot::marked_cuts`]): its message starts,
+/// ascending, and the engine's cuts among them.
+struct Marks {
+    marks: Vec<usize>,
+    cuts: Vec<usize>,
+}
+
+/// A call of a prompt: its ids, the position of the first, the prompt's
+/// feeds and the prompt call's marks.
+type Call<'a> = (&'a [u32], usize, &'a [MediaFeed], &'a [usize]);
+
 /// The positions in `from + 1 .. ids.len()` where `marker` starts: the first
 /// and the last of them (one when they are the same). An empty marker marks
 /// nothing.
@@ -1531,9 +1543,12 @@ pub(crate) struct Prompt {
     /// quantum's cut inside a span moves to the span's end.
     media: Vec<MediaFeed>,
     kept: Kept,
+    /// The prompt call's message starts, each call handed those that fall in
+    /// it ([`Engine::prefill_marked`]).
+    marks: Vec<usize>,
     /// The engine's cuts at the messages, which the prompt call's note names
     /// as an uninterrupted call's does: a quantum's cut keeps nothing more.
-    marks: Vec<usize>,
+    cuts: Vec<usize>,
     /// Every call's end, ascending; the last is the prompt call's, `n - 1`.
     ends: Vec<usize>,
     /// The calls run.
@@ -2013,16 +2028,16 @@ impl Gen {
             Cow::Owned([ids, &self.lead].concat())
         };
         let to = ids.len() - 1;
-        let at = slot.marked_cuts(&ids, kept.cache_n, to)?;
+        let Marks { marks, cuts } = slot.marked_cuts(&ids, kept.cache_n, to)?;
         let mut first = kept.cache_n;
-        for &u in &at {
-            slot.prefill_range(&ids[first..u], first, media)?;
+        for &u in &cuts {
+            slot.prefill_range(&ids[first..u], first, media, &marks)?;
             first = u;
         }
-        slot.note_split(kept.cache_n, to, at);
+        slot.note_split(kept.cache_n, to, cuts);
         self.close(
             slot,
-            (&ids[first..], first, media),
+            (&ids[first..], first, media, &marks),
             kept,
             t0,
             p.return_progress,
@@ -2085,8 +2100,8 @@ impl Gen {
         let t = Instant::now();
         ids.extend_from_slice(&self.lead);
         let to = ids.len() - 1;
-        let marks = slot.marked_cuts(&ids, kept.cache_n, to)?;
-        let ends = quantum_ends(kept.cache_n, to, &marks, &media, q.get());
+        let Marks { marks, cuts } = slot.marked_cuts(&ids, kept.cache_n, to)?;
+        let ends = quantum_ends(kept.cache_n, to, &cuts, &media, q.get());
         self.tim = Timings {
             prompt_ms: ms_since(t),
             n_ctx: self.ctx_max,
@@ -2101,6 +2116,7 @@ impl Gen {
             media,
             kept,
             marks,
+            cuts,
             ends,
             ran: 0,
             progress,
@@ -2127,16 +2143,16 @@ impl Gen {
         let t = Instant::now();
         p.ran += 1;
         if p.ran < p.ends.len() {
-            slot.prefill_range(&p.ids[from..to], from, &p.media)?;
+            slot.prefill_range(&p.ids[from..to], from, &p.media, &p.marks)?;
             self.tim.prompt_ms += ms_since(t);
             self.tim.prompt_n = to.min(self.n) - p.kept.cache_n;
             self.tim.n_past = to;
             return Ok(true);
         }
-        slot.note_split(p.kept.cache_n, to, std::mem::take(&mut p.marks));
+        slot.note_split(p.kept.cache_n, to, std::mem::take(&mut p.cuts));
         self.close(
             slot,
-            (&p.ids[from..], from, &p.media),
+            (&p.ids[from..], from, &p.media, &p.marks),
             p.kept,
             t,
             p.progress,
@@ -2145,24 +2161,24 @@ impl Gen {
         Ok(false)
     }
 
-    /// The prompt's end: its last call `call` (the ids, their first position
-    /// and the prompt's feeds) fed and its last id stepped
-    /// ([`Slot::close_call`]), and the first token's logits read, its timings, its event and the first token
-    /// in hand: the lead the call carried ([`Gen::take_lead`]) then the pick
-    /// from that row, in hand as a pass's tokens are. Its engine time is what
-    /// the timings hold of it (nothing for a prompt run in one go) and the
-    /// time since `t`.
+    /// The prompt's end: its last call `call` (the ids, their first position,
+    /// the prompt's feeds and the prompt call's marks) fed and its last id
+    /// stepped ([`Slot::close_call`]), and the first token's logits read, its
+    /// timings, its event and the first token in hand: the lead the call
+    /// carried ([`Gen::take_lead`]) then the pick from that row, in hand as a
+    /// pass's tokens are. Its engine time is what the timings hold of it
+    /// (nothing for a prompt run in one go) and the time since `t`.
     fn close(
         &mut self,
         slot: &mut Slot,
-        (ids, at, media): (&[u32], usize, &[MediaFeed]),
+        call: Call<'_>,
         kept: Kept,
         t: Instant,
         progress: bool,
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
     ) -> Result<(), GenError> {
         let n = self.n;
-        let greedy = slot.close_call(ids, at, media, self.logits_out())?;
+        let greedy = slot.close_call(call, self.logits_out())?;
         slot.prompts[slot.cur] = n;
         self.tim = Timings {
             prompt_n: n - kept.cache_n,
@@ -2447,7 +2463,7 @@ impl Gen {
             };
             Some(slot.next_after(ids, logits)?)
         } else {
-            slot.prefill_range(ids, slot.held.len(), &[])?;
+            slot.prefill_range(ids, slot.held.len(), &[], &[])?;
             None
         };
         span.fed = end;
@@ -2696,7 +2712,7 @@ mod cache_tests {
         CacheNote, Decoder, Engine, EngineError, SamplingParams, SaveInFlight, Saved, StateError,
         Tokenizer,
     };
-    use crate::media::Held;
+    use crate::media::{Held, MediaFeed};
     use crate::mock::{MockEngine, MockTokenizer, SaveStats};
     use crate::reasoning::{ThinkEntry, ThinkTags};
     use crate::sampling;
@@ -2738,11 +2754,13 @@ mod cache_tests {
     }
 
     /// What a [`Probe`] saw: its notes, the length of every prefill call,
-    /// and the states it took and took back.
+    /// the marks every prompt call's part was handed, and the states it took
+    /// and took back.
     #[derive(Default)]
     struct Log {
         notes: Vec<CacheNote>,
         calls: Vec<usize>,
+        marks: Vec<Vec<usize>>,
         /// What each request told [`Engine::will_reply`].
         replies: Vec<Option<usize>>,
         snapshots: usize,
@@ -2752,7 +2770,8 @@ mod cache_tests {
     /// The mock engine under a cut rule like V4.1's CED hole: a position
     /// strictly inside a prompt call is not kept, and a cut there falls to the
     /// call's start. It caches its states (`budget` bytes) and, with `split`,
-    /// cuts a prompt call at every mark it is offered.
+    /// cuts a prompt call at every mark it is offered; with `marked`, it
+    /// keeps the marks a call is handed as positions inside that one call.
     struct Probe {
         inner: MockEngine,
         tok: Arc<MarkTok>,
@@ -2762,6 +2781,8 @@ mod cache_tests {
         split: bool,
         /// Cut one position past each mark instead: a defective engine.
         off_mark: bool,
+        /// Keep the marks [`Engine::prefill_marked`] hands it.
+        marked: bool,
         /// Refuse every state it is handed back.
         refuse: bool,
         /// How long each snapshot sleeps.
@@ -2809,6 +2830,7 @@ mod cache_tests {
                 budget,
                 split,
                 off_mark: false,
+                marked: false,
                 refuse: false,
                 snapshot_takes: Duration::ZERO,
                 log: Arc::clone(log),
@@ -2906,6 +2928,34 @@ mod cache_tests {
                 (true, true) => marks.iter().map(|u| u + 1).collect(),
                 (false, _) => Vec::new(),
             }
+        }
+        fn prefill_marked(
+            &mut self,
+            ids: &[u32],
+            media: &[MediaFeed],
+            marks: &[usize],
+        ) -> Result<(), EngineError> {
+            self.log.lock().expect("the log").marks.push(marks.to_vec());
+            if !self.marked {
+                return if media.is_empty() {
+                    self.prefill(ids)
+                } else {
+                    self.prefill_media(ids, media)
+                };
+            }
+            self.prefill(ids)?;
+            let call = self.calls.pop().expect("the call just fed");
+            assert!(
+                marks.iter().all(|&u| call.start < u && u <= call.end),
+                "probe: marks {marks:?} outside the call {call:?}"
+            );
+            let mut start = call.start;
+            for &u in marks.iter().filter(|&&u| u < call.end) {
+                self.calls.push(start..u);
+                start = u;
+            }
+            self.calls.push(start..call.end);
+            Ok(())
         }
         fn note(&self, note: &CacheNote) {
             self.log.lock().expect("the log").notes.push(note.clone());
@@ -3030,10 +3080,48 @@ mod cache_tests {
             [u1, u2 - u1, a.len() - 1 - u2],
             "the prompt call's pieces"
         );
+        assert_eq!(
+            log.lock().expect("log").marks[..3],
+            [vec![u1], vec![u2], vec![]],
+            "each piece is handed the marks in it: its end"
+        );
         let mut b = system.clone();
         b.extend(enc("<｜User｜>a dog ran and the "));
         let (kept, tb) = run(&mut slot, &b);
         assert_eq!(kept, u1, "the system prompt, where the second call starts");
+        let (mut fresh, _) = Probe::slot(0, false);
+        assert_eq!(run(&mut fresh, &b).1, tb);
+    }
+
+    /// An engine that cuts nowhere and keeps the marks it is handed gets the
+    /// prompt call as one call with its first and last message starts, and a
+    /// request that shares the prompt up to the first keeps it — with the
+    /// same ids a fresh prefill gives.
+    #[test]
+    fn a_marked_engine_takes_one_call_with_its_marks() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let probe = Probe {
+            marked: true,
+            ..Probe::new(0, false, &log)
+        };
+        let mut slot = Slot::new(Box::new(probe));
+        let system = enc("be brief and kind. ");
+        let mut a = system.clone();
+        a.extend(enc(
+            "<｜User｜>the cat sat<｜Assistant｜>on the mat<｜User｜>and the ",
+        ));
+        run(&mut slot, &a);
+        let u1 = system.len();
+        let u2 = a.len() - enc("<｜User｜>and the ").len();
+        {
+            let log = log.lock().expect("log");
+            assert_eq!(log.calls[..1], [a.len() - 1], "one prompt call");
+            assert_eq!(log.marks[0], [u1, u2], "the call's marks");
+        }
+        let mut b = system.clone();
+        b.extend(enc("<｜User｜>a dog ran and the "));
+        let (kept, tb) = run(&mut slot, &b);
+        assert_eq!(kept, u1, "the system prompt, a mark inside the first call");
         let (mut fresh, _) = Probe::slot(0, false);
         assert_eq!(run(&mut fresh, &b).1, tb);
     }

@@ -44,6 +44,7 @@ use crate::engine::{
     CacheNote, Drafted, Engine, EngineError, EngineProps, ResidencyReset, Saved, SavedState,
     SlotRow, StateError, Tokenizer,
 };
+use crate::media::MediaFeed;
 
 /// Tokens a request takes on the engine before the next live request's turn:
 /// long enough that a turn's steps outweigh the two state copies that end it
@@ -186,6 +187,20 @@ impl Engine for SwapEngine {
     }
     fn prefill_splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
         self.inner.prefill_splits(first, end, marks)
+    }
+    /// The inner engine's call with its marks; a call that carries images is
+    /// this engine's [`Engine::prefill_media`], which takes none.
+    fn prefill_marked(
+        &mut self,
+        ids: &[u32],
+        media: &[MediaFeed],
+        marks: &[usize],
+    ) -> Result<(), EngineError> {
+        if media.is_empty() {
+            self.inner.prefill_marked(ids, media, marks)
+        } else {
+            self.prefill_media(ids, media)
+        }
     }
     fn note(&self, note: &CacheNote) {
         self.inner.note(note);

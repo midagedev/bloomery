@@ -15,8 +15,12 @@
 //! cache already holds and the engine can keep ([`Engine::keepable`]): `cut(k)`,
 //! or `reset` when `k` is 0; then `prefill(ids[k..n-1])`, and `next(ids[n-1])`
 //! yields the first generated token and every later `next(prev)` the one after
-//! it. An engine that names a prompt quantum `q` ([`Engine::prompt_quantum`])
-//! may see that `prefill` arrive instead as calls ending at `k + j·q`, the grid
+//! it. The server runs each prompt call as [`Engine::prefill_marked`] (whose
+//! default is that `prefill`), handing it the call's message starts, where a
+//! later request may be cut back to, and cutting the call where
+//! [`Engine::prefill_splits`] asks. An engine that names a prompt quantum `q`
+//! ([`Engine::prompt_quantum`]) may see that `prefill` arrive instead as calls
+//! ending at `k + j·q`, the grid
 //! starting again at each cut [`Engine::prefill_splits`] asks for, one a round
 //! between the other busy slots' decode rounds; the quantum's contract makes
 //! the request's bits those of the one call. `timings.cache_n` and `usage.prompt_tokens_details.cached_tokens` are
@@ -539,10 +543,36 @@ pub trait Engine: Send {
     /// that the `marks` (ascending, each inside the call) a later request may
     /// be cut back to stay keepable: a subset of `marks`, ascending. The
     /// default cuts nowhere: an engine whose cache keeps every position needs
-    /// no cut.
+    /// no cut, and one that keeps a mark inside a call takes it from
+    /// [`Engine::prefill_marked`].
     fn prefill_splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
         let _ = (first, end, marks);
         Vec::new()
+    }
+    /// The call the server runs for every part of a prompt call: `ids` from
+    /// the current position, carrying `media` as [`Engine::prefill_media`]'s
+    /// feeds, with the prompt call's `marks` that fall in this part (the
+    /// positions past its first and up to its end, ascending), each a
+    /// position a later request may be cut back to. A mark at the part's end
+    /// is that end: a cut [`Engine::prefill_splits`] asked for, or a quantum's.
+    /// The default is [`Engine::prefill`], or [`Engine::prefill_media`] when
+    /// `media` is not empty, the marks unread: an engine whose cache keeps
+    /// every position, or that cuts where a mark needs it, keeps them already.
+    /// An engine that keeps a position inside a call only where it is told
+    /// answers here instead and cuts nowhere: one call that keeps its marks
+    /// in place of a call a mark.
+    fn prefill_marked(
+        &mut self,
+        ids: &[u32],
+        media: &[MediaFeed],
+        marks: &[usize],
+    ) -> Result<(), EngineError> {
+        let _ = marks;
+        if media.is_empty() {
+            self.prefill(ids)
+        } else {
+            self.prefill_media(ids, media)
+        }
     }
     /// The call length `q` at which this engine's prompt work is bit-neutral
     /// to cut: the calls `ids[a..a + k·q]` then `ids[a + k·q..b]` leave the
