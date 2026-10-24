@@ -337,7 +337,8 @@ impl HostFill for u16 {
 /// reaches pageable memory through the host's page tables (GB10's unified
 /// memory) faults on each page a copy is the first to write, one page at a
 /// time; a new allocation nothing has written is such pages. A large one is
-/// advised onto huge pages first ([`advise_huge`]).
+/// advised onto huge pages first ([`advise_huge`]). `h2d_probe --arm readback`
+/// (`bloomery-gpu-gates`) times a readback into each kind of destination.
 #[must_use]
 pub fn host_filled<T: HostFill>(n: usize) -> Vec<T> {
     let mut host = Vec::with_capacity(n);

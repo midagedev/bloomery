@@ -45,7 +45,17 @@
 //!   interval_ms=<ms> bytes=<b> GB/s=<v>`, bytes counted when their copy is
 //!   known complete; then one `h2d loop arm=<a> summary …` line.
 //!
-//! Every copy arm samples each of its cards'
+//! - `readback`: the other direction, card to host, into host memory each
+//!   call allocates, as a request path's destination: `--reps` (8) calls of
+//!   `--bytes` (32 MiB) into memory nothing has written
+//!   (`DeviceBuffer::to_host_vec`), then as many into memory the host writes
+//!   first (`bloomery_gpu::to_host`), each timed on the host clock with its
+//!   fill: `h2d arm=readback … dest=fresh|filled bytes= calls= first_ms=
+//!   median_ms=`. A card that reaches pageable memory through the host's page
+//!   tables (GB10's unified memory) pays each fresh page's first touch inside
+//!   the copy.
+//!
+//! Every copy arm but `readback` samples each of its cards'
 //! `current_link_speed`/`current_link_width` from sysfs every `SAMPLE_EVERY` while
 //! its copies are in flight (an idle link trains down) and prints `h2d link
 //! arm=<a> card= bdf= samples=<n> [<speed> x<width>: <count>, …]`.
@@ -56,6 +66,8 @@
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
+    use bloomery_gpu_gates::record;
+    record::at_main("h2d_probe", record::H2D_PROBE);
     bloomery_gpu_gates::exit_with("h2d_probe", probe::run())
 }
 
@@ -80,6 +92,8 @@ mod probe {
     const PATH_BYTES: usize = 1 << 30;
     /// Timed copies of a one-shot path unless `--reps` says otherwise.
     const PATH_REPS: usize = 8;
+    /// Bytes of a readback unless `--bytes` says otherwise: 32 MiB.
+    const READBACK_BYTES: usize = 32 << 20;
     /// Bytes of a sustained copy and of a loop's source window: one Qwen3.8
     /// layer-batch's routed experts (a whole number of pages).
     const LAYER_BYTES: usize = 1_600_000_000;
@@ -107,10 +121,11 @@ mod probe {
         Attach,
         PageableLoop,
         StagedLoop,
+        Readback,
     }
 
     impl Arm {
-        const ALL: [(&'static str, Arm); 8] = [
+        const ALL: [(&'static str, Arm); 9] = [
             ("pinned", Arm::Pinned),
             ("pageable", Arm::Pageable),
             ("registered", Arm::Registered),
@@ -119,6 +134,7 @@ mod probe {
             ("attach", Arm::Attach),
             ("pageable-loop", Arm::PageableLoop),
             ("staged-loop", Arm::StagedLoop),
+            ("readback", Arm::Readback),
         ];
 
         fn parse(name: &str) -> Result<Arm, GateError> {
@@ -147,6 +163,7 @@ mod probe {
         fn default_bytes(self) -> usize {
             match self {
                 Arm::Pinned | Arm::Pageable | Arm::Registered => PATH_BYTES,
+                Arm::Readback => READBACK_BYTES,
                 _ => LAYER_BYTES,
             }
         }
@@ -549,6 +566,41 @@ mod probe {
             arm.name(),
             card.tag()
         );
+        Ok(())
+    }
+
+    /// The `readback` arm: each destination's calls, the first and the median.
+    fn readback(stream: &CudaStream, card: &Card, a: &Args) -> Result<(), GateError> {
+        use bloomery_gpu_gates::record::{H2D_READBACK, Record};
+
+        let bytes = a.bytes.unwrap_or(Arm::Readback.default_bytes());
+        let reps = a.reps.unwrap_or(Arm::Readback.default_reps());
+        let dev = DeviceBuffer::<f32>::zeroed(stream, bytes / size_of::<f32>())?;
+        stream.synchronize()?;
+        for dest in ["fresh", "filled"] {
+            let mut ms = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let t = Instant::now();
+                let host = if dest == "fresh" {
+                    dev.to_host_vec(stream)?
+                } else {
+                    bloomery_gpu::to_host(stream, &dev)?
+                };
+                ms.push(t.elapsed().as_secs_f64() * 1e3);
+                drop(host);
+            }
+            let first = ms[0];
+            ms.sort_by(f64::total_cmp);
+            Record::new(&H2D_READBACK)
+                .w("card", format_args!("{:?}", card.name))
+                .w("bdf", &card.bdf)
+                .w("dest", dest)
+                .u("bytes", bytes)
+                .u("calls", reps)
+                .f("first_ms", first)
+                .f("median_ms", ms[reps / 2])
+                .print();
+        }
         Ok(())
     }
 
@@ -977,6 +1029,8 @@ mod probe {
                     card.print()?;
                     if arm.is_loop() {
                         copy_loop(&ctx, &first, &card, arm, &a)?;
+                    } else if arm == Arm::Readback {
+                        readback(&first, &card, &a)?;
                     } else {
                         one_shot(&ctx, &first, &card, arm, &a)?;
                     }

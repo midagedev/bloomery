@@ -998,6 +998,22 @@ pub static NVREAD: Kind = Kind {
     ],
 };
 
+/// One destination kind's readback timings, including allocation and fill.
+pub static H2D_READBACK: Kind = Kind {
+    name: "h2d_readback",
+    head: "h2d arm=readback",
+    parts: &[
+        key("card", Text, ""),
+        key("bdf", Word, ""),
+        key("dest", Word, ""),
+        key("bytes", U64, "B"),
+        key("calls", U64, ""),
+        key("first_ms", F64(4), "ms"),
+        key("median_ms", F64(4), "ms"),
+    ],
+    doc: "Readback into a fresh or host-filled allocation, including allocation and fill time.",
+};
+
 /// One rank's line of `link_probe --gather`: its gather latency and checks.
 pub static LINK_GATHER: Kind = Kind {
     name: "link_gather",
@@ -3157,6 +3173,9 @@ pub static GATE_DEEPSEEK41_PREFILL: &[&Kind] = &[&STAT_PREFILL_SPLIT];
 /// The records `probe_nvread` prints: one row an arm and case.
 pub static PROBE_NVREAD: &[&Kind] = &[&NVREAD];
 
+/// The readback result that `h2d_probe` prints.
+pub static H2D_PROBE: &[&Kind] = &[&H2D_READBACK];
+
 /// The record `link_probe` prints under `--gather`: one line a rank.
 pub static LINK_PROBE: &[&Kind] = &[&LINK_GATHER];
 
@@ -4378,6 +4397,7 @@ mod tests {
             GENERATE_QWEN3MOE,
             GATE_DEEPSEEK41_PREFILL,
             PROBE_NVREAD,
+            H2D_PROBE,
             LINK_PROBE,
             GATE_NVTIER,
             groups::serve_client::SPAWN,
@@ -4813,6 +4833,7 @@ mod tests {
             CLEF_HIDDEN_BIN,
             GATE_DEEPSEEK41_PREFILL,
             PROBE_NVREAD,
+            H2D_PROBE,
             LINK_PROBE,
             GATE_NVTIER,
             groups::serve_client::SPAWN,
