@@ -40,7 +40,7 @@ using namespace metal;
 #pragma METAL fp contract(off)
 
 // Slots a tile of the grouped GEMM holds at most: the GEMM's activation tile.
-#define ROUTE_TILE 32
+#define ROUTE_TILE 64
 // Threads of the table's one threadgroup.
 #define ROUTE_THREADS 1024
 // Groups: the routed experts and the shared expert.

@@ -29,7 +29,7 @@ use super::{
 
 /// The slots a tile of the grouped GEMM holds at most: the route table's cut
 /// and the GEMM's activation tile (`ROUTE_TILE`, `ROUTED_ACTS`).
-pub const ROUTE_TILE: usize = 32;
+pub const ROUTE_TILE: usize = 64;
 
 /// The weight rows of a grouped GEMM's tile (`ROUTED_ROWS`): the plain tile's
 /// rows, and the pair's two tensors of half as many outputs.
