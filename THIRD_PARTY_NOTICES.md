@@ -49,6 +49,27 @@ reduction. The pair's gate and up rows, the slot select, the folded K' and the r
 load are this engine's. The licence is the one above, the ggml authors' MIT licence, whose text
 applies to that file.
 
+## MLX
+
+`crates/metal/src/bin/metal_gemm_time/probe_mlx_qmm.metal` is MLX's affine `qmm_t` kernel for 4-bit, group-64
+weights, reduced to the one instantiation the `metal_gemm_time` probe launches as its reference arm. It is taken from
+[ml-explore/mlx](https://github.com/ml-explore/mlx) v0.32.1 (`mlx/backend/metal/kernels/quantized.h`,
+`steel/gemm/mma.h`, `steel/gemm/loader.h`); the file's header names what was taken out. It is compiled by the probe
+only and never enters the engine's kernels. MLX is under the MIT licence, Copyright (c) 2023 Apple Inc.:
+
+> Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+> documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+> rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+> permit persons to whom the Software is furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+> the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+> WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+> COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+> OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 ## cuda-oxide
 
 `crates/oxide-ice-unroll` (a compiler-bug reproducer, excluded from the workspace) carries NVIDIA's
