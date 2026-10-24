@@ -1521,15 +1521,18 @@ def src_types(quant):
 
 
 def src_site_names(site, qtype):
-    """Join SiteTy::entry to the card! dense column of gguf's type rows."""
+    """Join SiteTy::entry to the card! dense column of gguf's type rows. A family whose arm is `None` sits outside
+    the card kernel table (a BACKEND_SITES row) and has no card name."""
     lo, hi = site.one_body("entry")
     entry = {}
     for pat, (a, b) in site.match_arms(lo, hi, r"\bmatch\s+self\b"):
         p = re.fullmatch(r"\s*SiteTy::(\w+)\s*", site.m[pat[0]:pat[1]])
-        v = re.fullmatch(r"\s*SiteEntry::(\w+)\s*", site.m[a:b])
-        if not p or not v:
-            raise site.err(a, f"an entry arm this tool cannot read: {site.m[a:b].strip()!r}")
-        entry[p.group(1)] = v.group(1)
+        arm = site.m[a:b].strip()
+        v = re.fullmatch(r"Some\(\s*SiteEntry::(\w+)\s*\)", arm)
+        if not p or not (v or arm == "None"):
+            raise site.err(a, f"an entry arm this tool cannot read: {arm!r}")
+        if v:
+            entry[p.group(1)] = v.group(1)
     dense = {}
     for row in re.finditer(r"\bQRow\s*\{\s*ty:\s*T::(\w+)\s*,", qtype.m):
         hi = qtype.close(qtype.m.index("{", row.start()))
@@ -1561,6 +1564,16 @@ def src_body35(bodies, site, qtype):
     names = src_site_names(site, qtype)
     lists, at = {}, {}
     calls = {}
+    # A call that reads `sites.<field>` reads the card's list for that field: the list `Sites35::CARD` names.
+    card = {}
+    for body in bodies:
+        hit = re.search(r"\bconst\s+CARD\s*:\s*Sites35\s*=\s*Sites35\s*\{", body.m)
+        if hit:
+            lo = hit.end() - 1
+            for x, y in body.split_top(lo + 1, body.close(lo), ","):
+                f = re.fullmatch(r"\s*(\w+)\s*:\s*(.*?)\s*", body.m[x:y], re.S)
+                if f:
+                    card[f.group(1)] = f.group(2)
     for body in bodies:
         for hit in re.finditer(r"\bconst\s+(\w+)\s*:\s*&\[SiteTy\]\s*=\s*&\[", body.m):
             lo = hit.end() - 1
@@ -1575,6 +1588,13 @@ def src_body35(bodies, site, qtype):
             open_at = hit.end() - 1
             args = [sp for sp in body.split_top(open_at + 1, body.close(open_at), ",") if body.m[sp[0]:sp[1]].strip()]
             last = body.m[args[-1][0]:args[-1][1]].strip()
+            field = re.fullmatch(r"sites\.(\w+)", last)
+            if field:
+                if field.group(1) not in card:
+                    raise body.err(args[-1][0], f"a site call reads {last!r}, which Sites35::CARD does not name")
+                last = card[field.group(1)]
+                if not re.fullmatch(r"[A-Z][A-Z_0-9]*", last):
+                    raise body.err(args[-1][0], f"Sites35::CARD's {field.group(1)} is no named list: {last!r}")
             if re.fullmatch(r"[A-Z][A-Z_0-9]*", last):
                 calls[last] = calls.get(last, 0) + 1
             elif not re.fullmatch(r"[a-z_]\w*", last):
@@ -1835,8 +1855,8 @@ def self_test():
         ("an id added to GgmlType::from_u32 is named", QUANT_RS, "            40 => GgmlType::NVFP4,\n",
          "            40 => GgmlType::NVFP4,\n            43 => GgmlType::Q1_0,\n", "'43'"),
         ("a new site read against a body35 list is named", BODY35_LAYERS_RS,
-         "v_ty: ty_of(file, what, &v, kv, h, PROJ)?,",
-         "v_ty: ty_of(file, what, &v, kv, h, PROJ)?, x_ty: ty_of(file, what, &v, kv, h, PROJ)?,",
+         "v_ty: ty_of(file, what, &v, kv, h, sites.proj)?,",
+         "v_ty: ty_of(file, what, &v, kv, h, sites.proj)?, x_ty: ty_of(file, what, &v, kv, h, sites.proj)?,",
          "sites per list PROJ"),
         ("a second backbone body of the decide seat is named", DECIDE_SEAT_RS,
          "&[(is_qwen35_body, open_qwen35)]", "&[(is_qwen35_body, open_qwen35), (is_other_body, open_other)]",
@@ -1862,6 +1882,21 @@ def self_test():
                 and body35_types(pair(1), lists)[0] is not None)
 
     check("a type added to a body35 list is followed from the source, not mirrored", followed)
+
+    def unnamed_field():
+        text = read_source(BODY35_LAYERS_RS)
+        old = "v_ty: ty_of(file, what, &v, kv, h, sites.proj)?,"
+        if old not in text:
+            raise SourceError(f"{BODY35_LAYERS_RS}: the self-test's doctoring text is gone: {old!r}")
+        doc = Src(BODY35_LAYERS_RS, text.replace(old, old.replace("sites.proj", "sites.nope"), 1))
+        try:
+            src_body35([doc, Src(BODY35_RS, read_source(BODY35_RS))], Src(SITE_RS, read_source(SITE_RS)),
+                       Src(QTYPE_RS, read_source(QTYPE_RS)))
+        except SourceError as e:
+            return "Sites35::CARD does not name" in str(e)
+        return False
+
+    check("a site call reading a field Sites35::CARD does not name is refused by name", unnamed_field)
     try:
         mirror_vs_source(doctored(SERVE_RS, 'Model::Qwen3 => matches!(arch, "qwen3moe" | "qwen35moe" | "qwen35"),',
                                   'Model::Qwen3 => arch.starts_with("qwen3"),'))
