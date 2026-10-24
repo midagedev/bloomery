@@ -102,6 +102,26 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "mark_row_late",
+        clause: "q_mark",
+        why: "a pass copies a delta layer's state lane one row after the row its copy names",
+        edits: &[(
+            "if (copy < copies && r == snaps->after[copy]) {",
+            "if (copy < copies && r == snaps->after[copy] + 1u) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mark_ring_dropped",
+        clause: "q_mark",
+        why: "a pass leaves a copy's conv ring unwritten",
+        edits: &[(
+            "    snap[(ulong)k * snaps.ring_len + s * args.ch + c] = v;",
+            "    (void)v;",
+            1,
+        )],
+    },
+    Mutant {
         name: "prefill_ring_last_row",
         clause: "q_state",
         why: "the ring commit of a pass writes the rows before the last: the last row's \

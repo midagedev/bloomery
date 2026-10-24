@@ -13,8 +13,9 @@
 //!   the next step the replay's;
 //! - the engine keeps a prefill's end, and a second request that shares it
 //!   matches a fresh run of that request;
-//! - `prefill_splits` returns every mark, and a call ending at one makes it
-//!   a point.
+//! - `prefill_splits` cuts at no mark, `prefill_marked` keeps each of its
+//!   marks as a point inside one call, and a call ending at a message start
+//!   makes it a point.
 //!
 //! The prompt is 16 ids. The conv ring has 11 rows, and position 4 reads the
 //! slot the token at 12 writes, so a cut that skips the ring is not the fresh
@@ -173,9 +174,20 @@ fn engine_keeps(
     )?;
     let marks = [3usize, 7];
     let splits = Engine::prefill_splits(&e, 0, ids.len(), &marks);
-    if splits != marks {
-        return Err(format!("prefill_splits of {marks:?} returned {splits:?}"));
+    if !splits.is_empty() {
+        return Err(format!("prefill_splits of {marks:?} cut at {splits:?}"));
     }
+    e.prefill_marked(&ids[..9], &[], &marks)
+        .map_err(engine_says)?;
+    for u in marks {
+        if e.keepable(u) != u {
+            return Err(format!(
+                "keepable({u}) is {} after a call marked at {marks:?}",
+                e.keepable(u)
+            ));
+        }
+    }
+    e.reset().map_err(engine_says)?;
 
     let lead = &ids[..4];
     e.prefill(lead).map_err(engine_says)?;
