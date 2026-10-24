@@ -90,6 +90,14 @@ impl Encoder {
                 bpe: encoder,
                 nfc,
             } => {
+                // The reference respells a fragment's spaces before it decodes the fragment, so
+                // an overlong U+0020 stays a space.
+                let text = if kind.spelling() == Spelling::Metaspace {
+                    escape_whitespace(text, escaped);
+                    escaped.as_slice()
+                } else {
+                    text
+                };
                 if kind.strict_utf8() {
                     unicode::decode_strict(text, cpts);
                     if *nfc {
@@ -108,13 +116,7 @@ impl Encoder {
                         unicode::encode_cpt(cpt, word);
                     }
                     at += n;
-                    let text = if kind.spelling() == Spelling::Metaspace {
-                        escape_whitespace(word, escaped);
-                        escaped.as_slice()
-                    } else {
-                        word.as_slice()
-                    };
-                    encoder.word(text, bpe, out, tokens);
+                    encoder.word(word, bpe, out, tokens);
                 }
             }
             Self::Spm {

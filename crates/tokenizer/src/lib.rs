@@ -1270,13 +1270,16 @@ mod tests {
     /// `<0xXX>` tokens, USER_DEFINED tokens (and `<|channel|>`, which the
     /// reference makes one) are cut out without special parsing while
     /// CONTROL ones are not, and BOS is added though the file does not ask.
-    /// Only U+0020 becomes U+2581; a literal U+2581 reads as a space, so it
-    /// does not round-trip; invalid UTF-8 is one U+FFFD per bad byte. A
+    /// Only U+0020 becomes U+2581, and before the text is decoded, so an
+    /// overlong one (C0 A0) stays a space and falls back to `<0x20>`; a
+    /// literal U+2581 reads as a space, so it does not round-trip; invalid
+    /// UTF-8 is one U+FFFD per bad byte. A
     /// header that asks for a BOS or an EOS it cannot name is refused, as the
     /// reference asserts one, and so is a vocabulary missing a byte token,
     /// where the fallback would drop that byte.
     ///
-    /// FAIL-first: without the U+2581 respelling "a b" is `a <0x20> b`;
+    /// FAIL-first: without the U+2581 respelling "a b" is `a <0x20> b`; with
+    /// the respelling after decoding, "a\xC0\xA0b" is `a ▁b`;
     /// without the newline-word lookup "\n\n\n" is three `\n`; with one symbol
     /// per byte "a b" falls back to the three bytes of U+2581; with the file's
     /// `add_bos_token` the BOS is missing; without the BOS-id, EOS-id or
@@ -1334,6 +1337,7 @@ mod tests {
         let cases: &[(&[u8], bool, &[&str])] = &[
             (b"a b", true, &["a", "\u{2581}b"]),
             ("a\u{2581}b".as_bytes(), true, &["a", "\u{2581}b"]),
+            (b"a\xC0\xA0b", true, &["a", "<0x20>", "b"]),
             (b"a\n\n\nb", true, &["a", "\n\n\n", "b"]),
             (b"\n\n", true, &["\n", "\n"]),
             (b"\n\n\n\n", true, &["\n", "\n", "\n", "\n"]),
