@@ -55,7 +55,16 @@ applies to that file.
 weights, reduced to the one instantiation the `metal_gemm_time` probe launches as its reference arm. It is taken from
 [ml-explore/mlx](https://github.com/ml-explore/mlx) v0.32.1 (`mlx/backend/metal/kernels/quantized.h`,
 `steel/gemm/mma.h`, `steel/gemm/loader.h`); the file's header names what was taken out. It is compiled by the probe
-only and never enters the engine's kernels. MLX is under the MIT licence, Copyright (c) 2023 Apple Inc.:
+only and never enters the engine's kernels.
+
+`crates/metal/kernels/gemm_tensor.metal` (the prompt pass's GEMMs on Metal 4's tensor ops) follows the design of MLX's
+NAX quantized matmul, v0.32.1 (`mlx/backend/metal/kernels/quantized_nax.h`, `steel/gemm/nax.h`): the weights
+dequantized into threadgroup memory a K step, the 64-by-64 tile over a 2-by-2 grid of SIMD groups, the `matmul2d`
+descriptor with the weight operand transposed. It is written anew over this crate's own staging and quant owners and
+copies no MLX code; the rule that picks it, `MatrixUnits` in `crates/metal/src/library.rs`, is MLX's
+`is_nax_available` (`mlx/backend/metal/device.cpp`). Both files' comments name the MLX lines they follow.
+
+MLX is under the MIT licence, Copyright (c) 2023 Apple Inc.:
 
 > Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 > documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
