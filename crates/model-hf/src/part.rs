@@ -8,14 +8,17 @@
 //! scale cut first, so a part reads only its own stored values; a tensor the model moves into its
 //! layout after normalizing is made whole, moved, and then cut.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 
+use engram::EngramError;
+use engram::direct::{DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::{GgmlType, TensorInfo};
 use hf::modelopt::{self, Normal, Use};
 use hf::quant_config::{Placed, Plan};
 use model::part::{self, Part, Planned, Source, Take};
 use model::placement::tp::{TpError, part_of};
-use safetensors::Folder;
+use safetensors::{Dtype, Folder, Raw};
 
 /// Why a part was refused.
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +35,8 @@ pub enum Error {
     Release(#[from] model::placement::PlacementError),
     #[error(transparent)]
     Tensors(#[from] safetensors::Error),
+    #[error(transparent)]
+    Direct(#[from] engram::EngramError),
 }
 
 impl From<TpError> for Error {
@@ -159,9 +164,22 @@ impl Source for Checkpoint {
             .made
             .get(name)
             .ok_or_else(|| refuse(name, "is not one the map makes"))?;
-        let get = |n: &str| self.folder.raw(n);
         let placed = self.placed(m);
         let ty = self.card_type(name, m)?;
+        // A whole tensor's stored bytes are read into memory of the read's own ([`read_whole`]);
+        // a part reads only its rows through the mapping.
+        let mut read = HashMap::new();
+        if p.at.is_none() || m.step.is_some() {
+            for n in stored(&placed) {
+                if let Some(w) = read_whole(&self.folder, n)? {
+                    read.insert(n, w);
+                }
+            }
+        }
+        let get = |n: &str| match read.get(n) {
+            Some(w) => Ok(w.raw()),
+            None => self.folder.raw(n),
+        };
         let n = match (&p.at, &m.step) {
             (Some(at), None) => {
                 modelopt::normalize_part(get, &placed, m.role, &m.dims, at.clone())?
@@ -220,17 +238,72 @@ impl Source for Checkpoint {
             .made
             .get(name)
             .ok_or_else(|| refuse(name, "is not one the map makes"))?;
-        for (source, placed) in self.placed(m) {
-            for stored in
-                std::iter::once(source).chain(placed.companions.iter().map(String::as_str))
-            {
-                let (path, map, at) = self.folder.mapped(stored)?;
-                // SAFETY: `Folder::mapped` gives the shard file's own read-only mapping whole.
-                unsafe { model::placement::host_lock::release_file_pages(&path, map, at) }?;
-            }
+        for stored in stored(&self.placed(m)) {
+            let (path, map, at) = self.folder.mapped(stored)?;
+            // SAFETY: `Folder::mapped` gives the shard file's own read-only mapping whole.
+            unsafe { model::placement::host_lock::release_file_pages(&path, map, at) }?;
         }
         Ok(())
     }
+}
+
+/// A stored tensor read whole into memory of its own ([`read_whole`]).
+struct Whole {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    buf: Vec<u8>,
+    /// The tensor's bytes in `buf`.
+    at: Range<usize>,
+}
+
+impl Whole {
+    fn raw(&self) -> Raw<'_> {
+        Raw {
+            dtype: self.dtype,
+            shape: &self.shape,
+            bytes: &self.buf[self.at.clone()],
+        }
+    }
+}
+
+/// Stored tensor `name` read whole from its shard past the page cache (engram's direct reader)
+/// into new memory advised onto huge pages, so the read takes the drive's rate, faults once each
+/// 2 MiB and leaves the page cache as it was. `None` where the shard cannot be opened for direct
+/// reads or its mount refuses them ([`DirectFile::open`]): the caller reads the tensor through
+/// the mapping.
+fn read_whole(folder: &Folder, name: &str) -> Result<Option<Whole>, Error> {
+    let (path, range) = folder.file_range(name)?;
+    let file = match DirectFile::open(&path) {
+        Ok(file) => file,
+        Err(EngramError::OpenDirect { .. } | EngramError::DirectProbe { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let raw = folder.raw(name)?;
+    let (start, span, need) = aligned_span(range.start, range.end - range.start);
+    let mut buf = vec![0u8; span + DIRECT_ALIGN];
+    os::advise_huge_within(&mut buf);
+    let lead = buf.as_ptr().align_offset(DIRECT_ALIGN);
+    if file.read_span(&mut buf[lead..lead + span], start)? < need {
+        return Err(refuse(
+            name,
+            format!("{} ends inside its bytes", path.display()),
+        ));
+    }
+    let skip = need - raw.bytes.len();
+    Ok(Some(Whole {
+        dtype: raw.dtype,
+        shape: raw.shape.to_vec(),
+        buf,
+        at: lead + skip..lead + need,
+    }))
+}
+
+/// The stored tensors a tensor placed as `placed` is made of: each source, then the companions
+/// its place names (scales, the packed shape).
+fn stored<'s>(placed: &[(&'s str, &'s Placed)]) -> impl Iterator<Item = &'s str> {
+    placed.iter().flat_map(|&(source, placed)| {
+        std::iter::once(source).chain(placed.companions.iter().map(String::as_str))
+    })
 }
 
 /// The whole tensor `name` of `ty` and `dims` as a header entry; dims that are not whole blocks

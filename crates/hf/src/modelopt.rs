@@ -931,6 +931,7 @@ fn fp8_append<'a>(
         .ok_or_else(|| refuse("block bytes size overflow".into()))?;
     out.try_reserve(more)
         .map_err(|e| refuse(format!("{more} block bytes: {e}")))?;
+    os::advise_huge_within(out.spare_capacity_mut());
     for (row, values) in w.bytes.chunks_exact(k).enumerate() {
         let at = out.len();
         for (j, block) in values.chunks_exact(blck).enumerate() {
@@ -1207,6 +1208,7 @@ fn append<'a>(
     out.blocks
         .try_reserve(bytes)
         .map_err(|e| shape(&wname, format!("cannot reserve {bytes} NVFP4 bytes: {e}")))?;
+    os::advise_huge_within(out.blocks.spare_capacity_mut());
     for (row, (w, s)) in w
         .bytes
         .chunks_exact(half)
