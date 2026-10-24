@@ -54,7 +54,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
@@ -62,9 +62,9 @@ use std::time::Instant;
 
 use bloomery_gpu_gates::record::{self, NVREAD, PROBE_NVREAD, Record};
 use bloomery_gpu_gates::{GateError, exit_with, ref_model_path};
-use engram::RowTable;
 use engram::direct::{DIRECT_ALIGN, DirectFile, aligned_span};
-use engram::rows::{PageAdvice, SplitTable};
+use engram::rows::{PageAdvice, PageCount, SplitTable};
+use engram::{EngramError, RowTable};
 use gguf::Split;
 
 /// The `general.architecture` the probe reads.
@@ -420,6 +420,56 @@ struct Part {
     id: u32,
 }
 
+/// A stack's eviction as [`drop_parts`] takes it: [`SplitTable`]'s.
+trait Evict {
+    fn path(&self) -> &Path;
+    fn evict_rows(&self, ids: &[u32]) -> Result<(), EngramError>;
+    fn resident_pages(&self, ids: &[u32]) -> Result<PageCount, EngramError>;
+    fn evict_shard(&self) -> Result<(), EngramError>;
+}
+
+impl Evict for SplitTable {
+    fn path(&self) -> &Path {
+        SplitTable::path(self)
+    }
+
+    fn evict_rows(&self, ids: &[u32]) -> Result<(), EngramError> {
+        SplitTable::evict_rows(self, ids)
+    }
+
+    fn resident_pages(&self, ids: &[u32]) -> Result<PageCount, EngramError> {
+        SplitTable::resident_pages(self, ids)
+    }
+
+    fn evict_shard(&self) -> Result<(), EngramError> {
+        SplitTable::evict_shard(self)
+    }
+}
+
+/// Drop the parts' pages from the process and the page cache: each part's
+/// rows, then the whole shard of a part that kept a page (an edge folio can
+/// cross a row or tensor boundary).
+fn drop_parts(tables: &[impl Evict], parts: &[Part]) -> Result<(), GateError> {
+    for p in parts {
+        tables[p.t].evict_rows(&[p.id])?;
+    }
+    for p in parts {
+        let table = &tables[p.t];
+        let pages = table.resident_pages(&[p.id])?;
+        if pages.resident != 0 {
+            eprintln!(
+                "probe_nvread: retrying eviction over whole shard {}: expert {} kept {} of {} pages",
+                table.path().display(),
+                p.id,
+                pages.resident,
+                pages.total
+            );
+            table.evict_shard()?;
+        }
+    }
+    Ok(())
+}
+
 /// A case's batches.
 #[derive(Clone, Copy)]
 enum Shape {
@@ -542,28 +592,6 @@ impl Rig {
         })
     }
 
-    /// Drop the parts' pages from the process and the page cache.
-    fn drop_parts(&self, parts: &[Part]) -> Result<(), GateError> {
-        for p in parts {
-            self.tables[p.t].evict_rows(&[p.id])?;
-        }
-        for p in parts {
-            let table = &self.tables[p.t];
-            let pages = table.resident_pages(&[p.id])?;
-            if pages.resident != 0 {
-                eprintln!(
-                    "probe_nvread: retrying eviction over whole shard {}: expert {} kept {} of {} pages",
-                    table.path().display(),
-                    p.id,
-                    pages.resident,
-                    pages.total
-                );
-                table.evict_shard()?;
-            }
-        }
-        Ok(())
-    }
-
     /// (resident pages, spanned pages) over the parts.
     fn pages(&self, parts: &[Part]) -> Result<(u64, u64), GateError> {
         let (mut resident, mut total) = (0, 0);
@@ -587,7 +615,7 @@ impl Rig {
             t: self.layers / 2 * STACKS.len(),
             id: id as u32,
         }];
-        self.drop_parts(&part)?;
+        drop_parts(&self.tables, &part)?;
         let (resident, total) = self.pages(&part)?;
         if resident != 0 {
             return Err(format!(
@@ -607,7 +635,7 @@ impl Rig {
             )
             .into());
         }
-        self.drop_parts(&part)
+        drop_parts(&self.tables, &part)
     }
 
     /// The drawn batch of `shape`, its picks as labels, its parts dropped and
@@ -652,7 +680,7 @@ impl Rig {
                     (parts, vec![layer.to_string()])
                 }
             };
-            self.drop_parts(&parts)?;
+            drop_parts(&self.tables, &parts)?;
             let (resident, _) = self.pages(&parts)?;
             if resident == 0 {
                 return Ok((parts, labels));
@@ -779,7 +807,7 @@ impl Rig {
             .into());
         }
         s.asked[0] = total * self.tables[parts[0].t].page_bytes();
-        self.drop_parts(parts)?;
+        drop_parts(&self.tables, parts)?;
         let reads = self.reads(parts)?;
         s.asked[1] = reads.iter().map(|r| r.span as u64).sum();
         s.asked[2] = s.asked[1];
@@ -863,7 +891,44 @@ impl Rig {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    /// A stack whose row eviction keeps one page of the row, as an edge folio
+    /// that crosses into a neighbour does; only its whole shard's eviction
+    /// drops it.
+    struct EdgeFolio(Cell<u64>);
+
+    impl Evict for EdgeFolio {
+        fn path(&self) -> &Path {
+            Path::new("edge.gguf")
+        }
+
+        fn evict_rows(&self, _: &[u32]) -> Result<(), EngramError> {
+            self.0.set(self.0.get().min(1));
+            Ok(())
+        }
+
+        fn resident_pages(&self, _: &[u32]) -> Result<PageCount, EngramError> {
+            Ok(PageCount {
+                resident: self.0.get(),
+                total: 4,
+            })
+        }
+
+        fn evict_shard(&self) -> Result<(), EngramError> {
+            self.0.set(0);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_retained_edge_folio_leaves_with_its_shard() {
+        let tables = [EdgeFolio(Cell::new(4))];
+        drop_parts(&tables, &[Part { t: 0, id: 3 }]).unwrap();
+        assert_eq!(tables[0].resident_pages(&[3]).unwrap().resident, 0);
+    }
 
     #[test]
     fn partition_covers_every_item_once_in_even_ranges() {
