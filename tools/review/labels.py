@@ -239,7 +239,8 @@ def run(repo, token, number=None, state="open", root=ROOT, dry=False, call=api, 
         want, unmapped = wanted(it["title"], paths, is_pr, dirs or ())
         have = [x["name"] for x in it.get("labels", [])]
         add, remove, kept = decide(have, want, events, card if it["state"] == "open" else None)
-        remove = [] if short or kind == "merged" else remove
+        held = short or (kind == "merged" and "merged")
+        remove = [] if held else remove
         if (add or remove) and not dry:
             if wrote:
                 time.sleep(PAUSE)
@@ -258,7 +259,7 @@ def run(repo, token, number=None, state="open", root=ROOT, dry=False, call=api, 
              + f" | has {','.join(sorted(have)) or '-'}"
              + (f" | kept off by a person: {','.join(kept)}" if kept else "")
              + (f" | {'crate' if is_pr else 'prefix'} not mapped: {','.join(unmapped)}" if unmapped else "")
-             + (f" | {short}: nothing removed, no card label decided" if short else "")
+             + (f" | {held}: nothing removed, no card label decided" if held else "")
              + f" | {it['title'][:90]}")
     note(f"labels: {n_add} added, {n_rm} removed{' (dry run: nothing sent)' if dry else ''}")
     return lines
@@ -352,20 +353,22 @@ def self_test():
                         apply_labels(out, "o/r", "5", "t", call)
             assert s["labels"] == final, (verdict, order, s["labels"])
 
-    # Each: the item, the run's device crates, the labels it ends with.
+    # Each: the item, the run's device crates, the labels it ends with, why removal was held (None: not held).
     stale = {"needs-gpu", "serve"}
-    for s, dirs, final in (
-            ({"title": "tools: old", "pr": None}, None, {"tools"}),
-            ({"listed": "tools: old", "title": "serve: new", "pr": None}, None, {"serve"}),  # edited during a backfill
-            ({"title": "x", "pr": pr(), "files": [{"filename": "tools/a.sh"}]}, [], {"tools", "needs-gpu"}),  # no dirs
-            ({"title": "x", "pr": pr(), "files": [{"filename": "tools/a.sh"}]}, None, {"tools"}),
-            ({"title": "x", "pr": pr(n=2), "files": [gpu_file]}, None, {"gpu"} | stale),  # a short file list
+    for s, dirs, final, held in (
+            ({"title": "tools: old", "pr": None}, None, {"tools"}, None),
+            ({"listed": "tools: old", "title": "serve: new", "pr": None}, None, {"serve"}, None),  # edited in a backfill
+            ({"title": "x", "pr": pr(), "files": [{"filename": "tools/a.sh"}]}, [], {"tools", "needs-gpu"}, None),
+            ({"title": "x", "pr": pr(), "files": [{"filename": "tools/a.sh"}]}, None, {"tools"}, None),
+            ({"title": "x", "pr": pr(n=2), "files": [gpu_file]}, None, {"gpu"} | stale, "1 of 2 files listed"),
             ({"title": "x", "pr": pr("closed", merged=True), "files": [gpu_file], "merged": [{"filename": "tools/a"}]},
-             None, {"tools"} | stale),
-            ({"title": "x", "pr": pr("closed"), "files": [gpu_file]}, None, stale)):
+             None, {"tools"} | stale, "merged"),
+            ({"title": "x", "pr": pr("closed"), "files": [gpu_file]}, None, stale, None)):
         s.update(labels=set(stale) if s["pr"] else set(), events=[ev("labeled", x, BOT) for x in stale])
-        run("o/r", "t", None, "all", call=github(s), dirs=dirs if dirs is not None else ["crates/gpu/"])
+        lines = run("o/r", "t", None, "all", call=github(s), dirs=dirs if dirs is not None else ["crates/gpu/"])
         assert s["labels"] == final, (s, s["labels"])
+        notes = [line for line in lines if "nothing removed" in line]
+        assert len(notes) == bool(held) and all(f"| {held}: nothing removed" in x for x in notes), (held, lines)
 
     def refuse(code):
         def call(method, url, token, payload=None):
