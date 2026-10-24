@@ -172,7 +172,7 @@ fn machine_of(
     slots: usize,
 ) -> Result<Machine, GateError> {
     let price = checkpoint_price(inputs)?;
-    let tier_batch = glmplace::tier_batch(place, &inputs.hp);
+    let tier_batch = glmplace::tier_batch(place, inputs)?;
     Ok(glm_machine(place, tier_batch, slots, price, ctx)?(
         inputs.model.layers,
     ))
@@ -242,7 +242,6 @@ fn place_of(p: &PlaceError) -> Outcome {
         PlaceError::Placement(e) => return refused_of(e),
         PlaceError::PastOracle { .. } => "past-oracle",
         PlaceError::FrontOver { .. } => "front-over",
-        PlaceError::TierLeg { .. } => "tier-leg",
         PlaceError::Broken(_) | PlaceError::NextnCards { .. } | PlaceError::Slots { .. } => {
             return Outcome::Red(p.to_string());
         }

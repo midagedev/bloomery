@@ -262,6 +262,7 @@ mod tests {
         let machine = Machine {
             cards: vec![Card {
                 name: "pool".into(),
+                tier_leg: None,
                 device: None,
                 usable_bytes: pool,
                 context_bytes: 0,

@@ -295,6 +295,7 @@ fn machine(usable: u64) -> Machine {
     Machine {
         cards: vec![Card {
             name: "card".to_string(),
+            tier_leg: None,
             device: None,
             usable_bytes: usable,
             context_bytes: CONTEXT,

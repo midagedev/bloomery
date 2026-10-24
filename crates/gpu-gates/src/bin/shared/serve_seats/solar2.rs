@@ -166,8 +166,13 @@ impl Family for Solar {
 
     /// The tier's prompt-batch bytes of the file's widths ([`place::tier_batch`]), reserved on
     /// the placement's tier card and the host.
-    fn tier_batch(place: Place, inputs: &PlanInputs<Self::H>) -> Option<TierBatchBytes> {
-        (!place.tier_cards().is_empty()).then(|| place::tier_batch(&inputs.hp))
+    fn tier_batch(
+        place: Place,
+        inputs: &PlanInputs<Self::H>,
+    ) -> Result<Option<TierBatchBytes>, bloomery_gpu_gates::GateError> {
+        Ok((!place.tier_cards().is_empty())
+            .then(|| place::tier_batch(inputs))
+            .transpose()?)
     }
 }
 

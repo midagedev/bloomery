@@ -227,6 +227,8 @@ pub struct Card {
     /// draft model's resident bytes, say): taken from the budget with the
     /// context and the scratch ([`Card::set_aside_bytes`]).
     pub reserves: Vec<(String, u64)>,
+    /// A tier leg's scratch, jointly selected with its resident experts.
+    pub tier_leg: Option<workstation::TierLegScratch>,
 }
 
 impl Card {
@@ -248,10 +250,55 @@ impl Card {
             .try_fold(0u64, |sum, (_, bytes)| sum.checked_add(*bytes))
     }
 
-    /// What the card sets aside before any tensor or cache: context,
-    /// scratch and reserves. The one owner of that sum: the expert rule's
-    /// budget, the budget floor, the headroom and [`Plan::violations`] all
-    /// take it from here. The margin is not in it. `None` past u64 bytes.
+    /// The tier leg's bound and selected scratch; absent on fixed-reserve paths.
+    fn selected_scratch(
+        &self,
+        model: &ModelTensors,
+        counts: &[u64],
+    ) -> Result<Option<(u64, u64)>, PlacementError> {
+        let Some(leg) = self.tier_leg else {
+            return Ok(None);
+        };
+        let forms = model
+            .tensors
+            .iter()
+            .filter(|t| {
+                t.role == Role::RoutedExperts
+                    && t.layer
+                        .is_some_and(|l| counts.get(l).is_some_and(|&n| n > 0))
+                    && ExpertPart::of_name(&t.name) == Some(ExpertPart::Down)
+            })
+            .filter_map(|t| crate::kernels::down(t.ty))
+            .fold(crate::kernels::DownForms::NONE, |forms, (_, act)| {
+                forms.with(act)
+            });
+        Ok(Some((leg.bytes(leg.downs)?, leg.bytes(forms)?)))
+    }
+
+    fn selected_reserve_bytes(
+        &self,
+        model: &ModelTensors,
+        counts: &[u64],
+    ) -> Result<u64, PlacementError> {
+        let fixed = self.reserve_bytes().ok_or_else(|| self.bytes_past_u64())?;
+        match self.selected_scratch(model, counts)? {
+            Some((bound, selected)) => fixed
+                .checked_sub(bound)
+                .and_then(|n| n.checked_add(selected))
+                .ok_or_else(|| self.bytes_past_u64()),
+            None => Ok(fixed),
+        }
+    }
+
+    fn floor_with_reserves(&self, dense: u64, kv: u64, past: u64, reserves: u64) -> Option<u64> {
+        [kv, self.context_bytes, self.scratch_bytes, reserves, past]
+            .into_iter()
+            .try_fold(dense, u64::checked_add)
+    }
+
+    /// The machine's context, scratch and reserve bound before uploads.
+    /// Placement replaces a tier leg's bound with its candidate's actual
+    /// scratch. The margin is not in it. `None` past u64 bytes.
     #[must_use]
     pub fn set_aside_bytes(&self) -> Option<u64> {
         self.context_bytes
@@ -259,18 +306,13 @@ impl Card {
             .checked_add(self.reserve_bytes()?)
     }
 
-    /// The card's floor under `dense` bytes of uploads and `kv` bytes of
-    /// cache: those, its set-aside, and `past` — what the load keeps beside
-    /// them: a plan's margin and what its caller holds beside the plan
-    /// (`plan_floor` sums those), or a whole load's own arena and reserve
-    /// ([`WholeLoad::past_bytes`]). The one owner of that sum: the budget
-    /// floor, the free floor and the whole fit ([`whole_need`]) all take it
-    /// from here. `None` past u64 bytes.
+    /// The fixed/bounded floor under `dense` upload bytes, `kv` cache bytes
+    /// and `past` bytes held beside them ([`WholeLoad::past_bytes`]).
+    /// Selected plans use the same sum with their actual reserves.
+    /// `None` past u64 bytes.
     #[must_use]
     pub fn floor_bytes(&self, dense: u64, kv: u64, past: u64) -> Option<u64> {
-        [kv, self.set_aside_bytes()?, past]
-            .into_iter()
-            .try_fold(dense, u64::checked_add)
+        self.floor_with_reserves(dense, kv, past, self.reserve_bytes()?)
     }
 
     fn bytes_past_u64(&self) -> PlacementError {
@@ -897,7 +939,8 @@ pub struct CardTotals {
     pub stage_rows_bytes: u64,
     pub scratch_bytes: u64,
     pub context_bytes: u64,
-    /// The card's reserves ([`Card::reserves`]).
+    /// The selected reserves; a tier leg's descriptor bound is replaced by
+    /// its actual resident layers' scratch.
     pub reserve_bytes: u64,
     /// usable − dense − experts − rounding − KV − stage rows − scratch −
     /// context − reserves, usable capped by the plan's card budget; the
@@ -2572,6 +2615,40 @@ impl Fill<'_, '_> {
             .routed
             .unwrap_or(RoutedRule::PerType(CardFormat::of_routed));
         let uploads = card_uploads(self.model, self.c, self.rows, self.eligible, format)?;
+        let mut down_acts = if card.tier_leg.is_some() {
+            vec![None; self.model.layers]
+        } else {
+            Vec::new()
+        };
+        if card.tier_leg.is_some() {
+            for t in &self.model.tensors {
+                if t.role == Role::RoutedExperts
+                    && ExpertPart::of_name(&t.name) == Some(ExpertPart::Down)
+                    && let Some(l) = t.layer
+                    && let Some((_, act)) = crate::kernels::down(t.ty)
+                {
+                    down_acts[l] = Some(act);
+                }
+            }
+        }
+        let scratch = |counts: &[u64]| {
+            card.tier_leg.map_or(Ok(0), |leg| {
+                let forms = counts
+                    .iter()
+                    .zip(&down_acts)
+                    .filter_map(|(&n, &act)| (n > 0).then_some(act).flatten())
+                    .fold(crate::kernels::DownForms::NONE, |forms, act| {
+                        forms.with(act)
+                    });
+                leg.bytes(forms)
+            })
+        };
+        let bound = card
+            .tier_leg
+            .map(|leg| leg.bytes(leg.downs))
+            .transpose()?
+            .unwrap_or(0);
+        let reserves = card.selected_reserve_bytes(self.model, n_l)?;
         let budget = i128::from(capped(card, self.card_budget))
             - i128::from(self.kv)
             - i128::from(
@@ -2579,20 +2656,23 @@ impl Fill<'_, '_> {
                     .ok_or_else(|| card.bytes_past_u64())?,
             )
             - i128::from(card.margin_bytes)
-            - i128::from(self.reserve);
+            - i128::from(self.reserve)
+            + i128::from(bound);
         if let Some(b) = self.card_budget {
             let dense = footprint(card.granule_bytes, &uploads, n_l)?;
-            check_floor(card, b, dense, self.kv, self.reserve)?;
+            check_floor(card, b, dense, self.kv, self.reserve, reserves)?;
         }
         if let Some(free) = card.free_bytes.filter(|&f| f < card.usable_bytes) {
             let dense = footprint(card.granule_bytes, &uploads, n_l)?;
-            check_free_floor(card, free, dense, self.kv, self.reserve)?;
+            check_free_floor(card, free, dense, self.kv, self.reserve, reserves)?;
         }
         let caps: Vec<u64> = (0..n_l.len())
             .map(|l| self.model.layer_experts(l))
             .collect();
         spread(n_l, held, self.eligible, &caps, budget, |n| {
-            footprint(card.granule_bytes, &uploads, n)
+            footprint(card.granule_bytes, &uploads, n)?
+                .checked_add(scratch(n)?)
+                .ok_or_else(|| card.bytes_past_u64())
         })
     }
 }
@@ -2604,10 +2684,10 @@ impl Fill<'_, '_> {
 /// least budget at which the expert rule's own budget (usable less KV,
 /// set-aside, margin and `beside`, in [`Fill::run`]) reaches the dense
 /// uploads. `None` past u64 bytes.
-fn plan_floor(card: &Card, dense: u64, kv: u64, beside: u64) -> Option<u64> {
+fn plan_floor(card: &Card, dense: u64, kv: u64, beside: u64, reserves: u64) -> Option<u64> {
     card.margin_bytes
         .checked_add(beside)
-        .and_then(|past| card.floor_bytes(dense, kv, past))
+        .and_then(|past| card.floor_with_reserves(dense, kv, past, reserves))
 }
 
 /// Refuse `card` under the card budget `budget` when its floor — the
@@ -2622,8 +2702,9 @@ fn check_floor(
     dense: u64,
     kv: u64,
     beside: u64,
+    reserves: u64,
 ) -> Result<(), PlacementError> {
-    let floor = plan_floor(card, dense, kv, beside);
+    let floor = plan_floor(card, dense, kv, beside, reserves);
     match floor {
         Some(floor) if floor <= budget => Ok(()),
         _ => Err(PlacementError::CardBudgetFloor {
@@ -2634,7 +2715,7 @@ fn check_floor(
             kv,
             context: card.context_bytes,
             scratch: card.scratch_bytes,
-            reserves: card.reserve_bytes().ok_or_else(|| card.bytes_past_u64())?,
+            reserves,
             margin: card.margin_bytes,
             beside,
         }),
@@ -2653,9 +2734,10 @@ fn check_free_floor(
     dense: u64,
     kv: u64,
     beside: u64,
+    reserves: u64,
 ) -> Result<(), PlacementError> {
     let context = card.context_bytes - card.context_in_free();
-    let floor = plan_floor(card, dense, kv, beside).map(|f| f - card.context_in_free());
+    let floor = plan_floor(card, dense, kv, beside, reserves).map(|f| f - card.context_in_free());
     match floor {
         Some(floor) if floor <= free => Ok(()),
         floor => Err(PlacementError::CardFreeFloor(Box::new(CardFreeFloor {
@@ -2668,7 +2750,7 @@ fn check_free_floor(
             kv,
             context,
             scratch: card.scratch_bytes,
-            reserves: card.reserve_bytes().ok_or_else(|| card.bytes_past_u64())?,
+            reserves,
             margin: card.margin_bytes,
             beside,
             held: card
@@ -3751,8 +3833,12 @@ fn totals<'a>(
         .map(|(c, (card, heap))| {
             let rounding = heap.taken - (card_dense[c] + card_experts[c]);
             let (kv, _, stage_rows) = kv_bytes[c];
+            let counts = c
+                .checked_sub(machine.cards.len())
+                .map_or(n_l.as_slice(), |t| tier_n_l[t].as_slice());
+            let reserve_bytes = card.selected_reserve_bytes(model, counts)?;
             let used = card
-                .floor_bytes(heap.taken, kv, stage_rows)
+                .floor_with_reserves(heap.taken, kv, stage_rows, reserve_bytes)
                 .ok_or_else(|| card.bytes_past_u64())?;
             if machine.unified().is_some()
                 && machine.on_this_node(c)
@@ -3772,9 +3858,7 @@ fn totals<'a>(
                 stage_rows_bytes: stage_rows,
                 scratch_bytes: card.scratch_bytes,
                 context_bytes: card.context_bytes,
-                reserve_bytes: card
-                    .reserve_bytes()
-                    .expect("the card floor checked its reserves"),
+                reserve_bytes,
                 headroom_bytes: i128::from(capped(card, card_budget)) - i128::from(used),
             })
         })
@@ -3843,11 +3927,50 @@ pub struct PoolNeed {
 /// `card`'s total against usable − margin: its uploads' granules, its KV,
 /// its stage rows and its set-aside.
 fn card_total(card: &Card, totals: &CardTotals, heap: &Heap) -> u64 {
-    card.floor_bytes(heap.taken, totals.kv_bytes, totals.stage_rows_bytes)
-        .expect("the plan's card totals fit u64")
+    card.floor_with_reserves(
+        heap.taken,
+        totals.kv_bytes,
+        totals.stage_rows_bytes,
+        totals.reserve_bytes,
+    )
+    .expect("the plan's card totals fit u64")
 }
 
 impl Plan<'_> {
+    /// One named reserve at its selected amount, not the machine's scratch
+    /// bound. Missing or duplicate rows and an invalid card return `None`;
+    /// invalid scratch descriptors propagate their named error.
+    pub fn card_reserve(&self, c: usize, name: &str) -> Result<Option<u64>, PlacementError> {
+        let Some(card) = self.machine.card(c) else {
+            return Ok(None);
+        };
+        let mut rows = card.reserves.iter().filter(|(n, _)| n == name);
+        let Some((_, bytes)) = rows.next() else {
+            return Ok(None);
+        };
+        if rows.next().is_some() {
+            return Ok(None);
+        }
+        if name != workstation::TIER_BATCH_RESERVE {
+            return Ok(Some(*bytes));
+        }
+        let counts = match c.checked_sub(self.machine.cards.len()) {
+            None => self.n_l.as_slice(),
+            Some(t) => match self.tier_n_l.get(t) {
+                Some(counts) => counts.as_slice(),
+                None => return Ok(None),
+            },
+        };
+        match card.selected_scratch(self.model, counts)? {
+            Some((bound, selected)) => bytes
+                .checked_sub(bound)
+                .and_then(|bytes| bytes.checked_add(selected))
+                .map(Some)
+                .ok_or_else(|| card.bytes_past_u64()),
+            None => Ok(Some(*bytes)),
+        }
+    }
+
     fn reserve_beside(&mut self, reserve: u64) -> Result<(), PlacementError> {
         if self.machine.unified().is_some() {
             let here = (0..self.machine.all_cards().count())
@@ -4469,6 +4592,7 @@ mod tests {
     fn card(name: &str, layers: Range<usize>, head: bool, token_embedding: bool) -> Card {
         Card {
             name: name.to_string(),
+            tier_leg: None,
             device: None,
             usable_bytes: 0,
             context_bytes: 0,
@@ -5572,6 +5696,169 @@ mod tests {
         let plan = plan_routed(&unnamed, &m1, 4096, &NoKv, &levers, union)
             .expect("the per-type rule places a stack of no part");
         assert_eq!(plan.n_l, vec![8]);
+    }
+
+    /// Scratch enters each expert candidate's footprint monotonically.
+    /// A boundary that admits one down form cannot pay for an unused second
+    /// form, and adding the first expert of that form pays its exact bytes.
+    #[test]
+    fn a_tier_jointly_selects_expert_rows_and_down_forms() {
+        use crate::accepts::{Program, routed_rule};
+        use crate::kernels::{DownAct, DownForms};
+        use GgmlType::{Q5_K, Q8_0};
+        use workstation::{TIER_BATCH_RESERVE, tier_leg_batch_bytes};
+
+        let both = DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32);
+        let batch = tier_leg_batch_bytes(256, 256, 1, 2, 3, both).expect("tier bytes");
+        let leg = batch.leg.expect("a tier leg descriptor");
+        let rule = routed_rule(Program::Qwen35Body);
+        for (downs, first) in [
+            ([Q5_K, Q8_0], DownAct::Q8Act),
+            ([Q8_0, Q5_K], DownAct::Q8Blocks32),
+        ] {
+            let mut model = legged(&[[Q5_K, Q5_K, downs[0]], [Q5_K, Q5_K, downs[1]]]);
+            model.experts = 1;
+            model.experts_used = 1;
+            for t in model
+                .tensors
+                .iter_mut()
+                .filter(|t| t.role == Role::RoutedExperts)
+            {
+                t.dims[1] = 256;
+                t.dims[2] = 1;
+                t.file_bytes *= 8;
+            }
+            let expert = |l| {
+                model
+                    .tensors
+                    .iter()
+                    .filter(|t| t.role == Role::RoutedExperts && t.layer == Some(l))
+                    .map(|t| t.file_bytes / model.experts)
+                    .sum::<u64>()
+            };
+            let one =
+                batch.staging + leg.bytes(DownForms::of(first)).expect("first scratch") + expert(0);
+            let two =
+                batch.staging + leg.bytes(both).expect("mixed scratch") + expert(0) + expert(1);
+            for (room, counts, forms) in [
+                (one - 1, [0, 0], DownForms::NONE),
+                (one, [1, 0], DownForms::of(first)),
+                (two - 1, [1, 0], DownForms::of(first)),
+                (two, [1, 1], both),
+            ] {
+                let mut tier = bytes_card("tier", room, 0..0);
+                tier.reserves
+                    .push((TIER_BATCH_RESERVE.into(), batch.card().unwrap()));
+                tier.tier_leg = batch.leg;
+                let machine = Machine {
+                    cards: vec![bytes_card("stage", HEAD, 0..2)],
+                    tiers: vec![tier],
+                    nodes: vec![Node {
+                        host: host(),
+                        unified: None,
+                    }],
+                };
+                let plan = plan_routed(&model, &machine, 1, &NoKv, &PlanLevers::default(), rule)
+                    .expect("the joint plan");
+                assert_eq!(plan.n_l, [0, 0]);
+                assert_eq!(plan.tier_n_l[0], counts, "{downs:?}, {room}");
+                let selected = batch.staging + leg.bytes(forms).expect("selected scratch");
+                assert_eq!(
+                    plan.card_reserve(1, TIER_BATCH_RESERVE)
+                        .expect("selected reserve"),
+                    Some(selected)
+                );
+                assert_eq!(plan.cards[1].reserve_bytes, selected);
+                let rows = expert(0) * counts[0] + expert(1) * counts[1];
+                assert_eq!(plan.cards[1].bytes(), selected + rows);
+                assert!(plan.violations().is_empty(), "{downs:?}, {room}");
+            }
+        }
+    }
+
+    /// A malformed descriptor must refuse a plan and a later selected-reserve
+    /// read, not wrap to a small scratch or masquerade as a fixed-reserve card.
+    #[test]
+    fn a_tier_refuses_invalid_scratch_descriptors_before_placement() {
+        use crate::accepts::{Program, routed_rule};
+        use crate::kernels::{DownAct, DownForms};
+        use workstation::{TIER_BATCH_RESERVE, TierLegScratch, tier_leg_batch_bytes};
+
+        let forms = DownForms::of(DownAct::Q8Act);
+        let batch = tier_leg_batch_bytes(256, 256, 1, 1, 1, forms).expect("valid batch");
+        let good = batch.leg.expect("a leg descriptor");
+        let mut model = legged(&[[GgmlType::Q5_K; 3]]);
+        model.experts_used = 1;
+        for t in model
+            .tensors
+            .iter_mut()
+            .filter(|t| t.role == Role::RoutedExperts)
+        {
+            t.dims[1] = 256;
+            t.file_bytes *= 64;
+        }
+        let machine = |leg| {
+            let mut tier = bytes_card("tier", 1 << 30, 0..0);
+            tier.reserves
+                .push((TIER_BATCH_RESERVE.into(), batch.card().unwrap()));
+            tier.tier_leg = Some(leg);
+            Machine {
+                cards: vec![bytes_card("stage", HEAD, 0..1)],
+                tiers: vec![tier],
+                nodes: vec![Node {
+                    host: host(),
+                    unified: None,
+                }],
+            }
+        };
+        let valid = machine(good);
+        let rule = routed_rule(Program::Qwen35Body);
+        let plan = plan_routed(&model, &valid, 1, &NoKv, &PlanLevers::default(), rule)
+            .expect("valid descriptor plans");
+        for leg in [
+            TierLegScratch {
+                chunk: 1 << 61,
+                n_used: 8,
+                ..good
+            },
+            TierLegScratch { chunk: 0, ..good },
+            TierLegScratch { ff: 0, ..good },
+            TierLegScratch { n_embd: 0, ..good },
+        ] {
+            let bad = machine(leg);
+            assert!(
+                matches!(
+                    plan_routed(&model, &bad, 1, &NoKv, &PlanLevers::default(), rule),
+                    Err(PlacementError::Metadata { key, .. }) if key == "tier leg scratch"
+                ),
+                "{leg:?}"
+            );
+            let mut stale = plan.clone();
+            stale.machine = &bad;
+            assert!(
+                matches!(
+                    stale.card_reserve(1, TIER_BATCH_RESERVE),
+                    Err(PlacementError::Metadata { key, .. }) if key == "tier leg scratch"
+                ),
+                "{leg:?}"
+            );
+            assert!(
+                matches!(
+                    tier_leg_batch_bytes(leg.n_embd, leg.ff, leg.n_used, leg.chunk, 1, leg.downs),
+                    Err(PlacementError::Metadata { key, .. }) if key == "tier leg scratch"
+                ),
+                "{leg:?}"
+            );
+        }
+        assert!(tier_leg_batch_bytes(256, 256, 8, 1, 1 << 61, forms).is_err());
+        let inconsistent = workstation::TierBatchBytes {
+            scratch: 0,
+            ..batch
+        };
+        assert!(matches!(
+            inconsistent.card(),
+            Err(PlacementError::Metadata { key, .. }) if key == "tier leg batch"
+        ));
     }
 
     // PIN(2026-10-22): the Qwen3.6 leg runs a Q8_0 down and (once the leg has the

@@ -79,12 +79,16 @@ pub trait Family: Sized + 'static {
     /// The expert tier's prompt-batch bytes the plan reserves on `place`'s
     /// tier card ([`Tiered::tier_batch`]); a body that serves no tier card
     /// reserves none (the default), and its plan refuses the card by name.
-    fn tier_batch(place: Place, _inputs: &PlanInputs<Self::H>) -> Option<TierBatchBytes> {
-        (!place.tier_cards().is_empty()).then_some(TierBatchBytes {
+    fn tier_batch(
+        place: Place,
+        _inputs: &PlanInputs<Self::H>,
+    ) -> Result<Option<TierBatchBytes>, GateError> {
+        Ok((!place.tier_cards().is_empty()).then_some(TierBatchBytes {
             staging: 0,
             scratch: 0,
             host: 0,
-        })
+            leg: None,
+        }))
     }
 
     /// The tags the model's description names for its think span, which the
@@ -324,7 +328,10 @@ impl<F: Family> Tiered for Hybrid<F> {
         F::think_tags(inputs).map(Some)
     }
 
-    fn tier_batch(place: Place, inputs: &PlanInputs<Self::H>) -> Option<TierBatchBytes> {
+    fn tier_batch(
+        place: Place,
+        inputs: &PlanInputs<Self::H>,
+    ) -> Result<Option<TierBatchBytes>, GateError> {
         F::tier_batch(place, inputs)
     }
 

@@ -66,6 +66,28 @@ Each device slice needs its numerical/fault gates and the maintainer's offered h
 Legacy metadata booleans share `RouterNorm::from_legacy_bool`: false keeps scores and true uses the
 existing epsilon-added selected sum. Flint's distinct floor mapping stays in its reader.
 
+### Selected expert arms and tier scratch
+
+Common card and tier wrappers resolve `LegArms` from their selected `Program`, rather than assuming
+every family has one gate/up type or one down activation form. Their resident layers determine the
+union of `Q8Act` and `Q8Blocks32` buffers. Plane layouts remain restricted to the selected program's
+arms; Solar's host-only triples do not enlarge its card scratch.
+
+Placement charges a tier's selected down forms jointly with its expert count. The same kernels-owned,
+checked sizing arithmetic is used by allocation and planning; malformed or overflowing public scratch
+descriptors are refused by name. The plan records the selected reserve, and loaders check that amount
+instead of the machine descriptor's upper bound. No always-both allocation or reserve-equality waiver
+is used.
+Host-only projections intentionally have no card totals: fixed reserves remain owned by their machine.
+Only a dynamic tier-leg descriptor requires the plan's selected card totals. The existing node paging
+budget regression exercises this distinction without a GPU, including OS reserve and constrained host room.
+
+A host-only public planner consumer exercised the one-byte boundaries before the first resident layer
+and before adding the other down form, plus descriptor overflow refusal. This proves planning behavior,
+not device allocation or expert arithmetic. The existing CUDA leg, batch and tier gates still need an
+exact-head NVIDIA run. Flint's `Program` admission and body/app/seat remain absent.
+
+
 
 ## 1. Sources and observed artifact
 

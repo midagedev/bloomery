@@ -30,7 +30,7 @@ mod gate {
         let file = Split::open(&path)?;
         let inputs = PlanInputs::describe(&file)?;
         let (mut machine, node) =
-            crate::node_history::machine(inputs.model.layers, tier_batch(&inputs.hp))?;
+            crate::node_history::machine(inputs.model.layers, tier_batch(&inputs)?)?;
         reserve_checkpoints(
             &mut machine,
             Seqs::priced(1, checkpoint_price(&inputs)?),

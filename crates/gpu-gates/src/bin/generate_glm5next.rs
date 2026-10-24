@@ -761,7 +761,7 @@ mod cli {
             Some(lane_at(placement)?)
         };
         let place = placement.name();
-        let tier_batch = glm_place::tier_batch(placement, &inputs.hp);
+        let tier_batch = glm_place::tier_batch(placement, &inputs)?;
         let machine = glm_machine(
             placement,
             tier_batch,

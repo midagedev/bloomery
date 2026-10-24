@@ -101,12 +101,16 @@ pub trait Tiered: Seat + Sized + 'static {
     /// The expert tier's prompt-batch bytes the plan reserves on `place`'s tier card, for the file
     /// `inputs` describes; `None` under a placement with no tier card. A body that serves no tier
     /// card reserves none (the default), and its plan refuses the card by name.
-    fn tier_batch(place: Place, _inputs: &PlanInputs<Self::H>) -> Option<TierBatchBytes> {
-        (!place.tier_cards().is_empty()).then_some(TierBatchBytes {
+    fn tier_batch(
+        place: Place,
+        _inputs: &PlanInputs<Self::H>,
+    ) -> Result<Option<TierBatchBytes>, GateError> {
+        Ok((!place.tier_cards().is_empty()).then_some(TierBatchBytes {
             staging: 0,
             scratch: 0,
             host: 0,
-        })
+            leg: None,
+        }))
     }
 
     /// The think tags the model's description names, if the family splits its reasoning on them.
@@ -214,7 +218,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     } else {
         Some(lane_at(place)?)
     };
-    let tier_batch = S::tier_batch(place, &inputs);
+    let tier_batch = S::tier_batch(place, &inputs)?;
     let machine = beside::with_reserve(
         place.machine(None, tier_batch)?,
         Beside {

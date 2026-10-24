@@ -8,8 +8,8 @@
 //!
 //! The tier's layer is the card leg ([`CardLeg::enqueue_rows`]) over the
 //! tier's stacks: the q8_1 of the activation, the gate·up `_sel` with the
-//! routed clamped SwiGLU, the q8_1 of the tier slots' columns and the down
-//! `_sel` into the tier's rows; over a prompt batch's block, the same run
+//! routed clamped SwiGLU, the selected down form of the tier slots' columns
+//! and the down `_sel` into the tier's rows; over a prompt batch's block, the same run
 //! chunk by chunk of `shape.cap` tokens. Each slot's down output is the one
 //! the stage card would write for it, so the card sum over both cards' slots
 //! in slot order is the one-card sum over their union. The row's tier image
@@ -26,6 +26,8 @@ use model::ModelError;
 use model::arch::models::{Ffn, LayerSpec};
 use model::arch::names::routed_stacks;
 use model::moe::HostLayer;
+use model::placement::accepts::{self, LegArms, Program};
+use model::placement::kernels::{self, DownForms};
 use model::placement::{ModelTensors, Plan};
 use model::r8file::R8Source;
 
@@ -45,6 +47,12 @@ const WHAT: &str = "LegTier";
 
 /// What the stage card's side of the tier layers names in its errors.
 const SIDE: &str = "TierSide";
+
+/// The selected program's launches admit the same stacks on both cards.
+const STACK_ROLES: (&str, &str) = (
+    "a resident routed gate or up stack the selected tier gate·up arm runs",
+    "a resident routed down stack the selected tier down arm runs",
+);
 
 /// The tier the stage card's tier entries serve: they hand one tier its
 /// image and join one tier's rows, so a load holds one tier card
@@ -173,6 +181,7 @@ pub struct LegTier {
     /// Per layer of `layers`, `None` off the tier.
     cfg: Vec<Option<TierLayer>>,
     shape: LegShape,
+    arms: LegArms,
 }
 
 impl LegTier {
@@ -188,7 +197,13 @@ impl LegTier {
         set: &TierSet,
         w: &Weights,
         shape: LegShape,
+        program: Program,
     ) -> Result<LegTier, GpuError> {
+        let arms = accepts::leg_arms(program).ok_or(GpuError::state(
+            WHAT,
+            "the selected program's card leg arms",
+        ))?;
+        let mut downs = DownForms::NONE;
         let run = set.layers();
         let mut cfg = Vec::with_capacity(run.len());
         for l in run.clone() {
@@ -216,15 +231,22 @@ impl LegTier {
                 limit: m.act.swiglu_limit(),
                 names,
             };
-            LegStacks::of(w, layer.names())?.check(k, shape)?;
+            let stacks = LegStacks::of_arms(w, layer.names(), arms, STACK_ROLES)?;
+            stacks.check(k, shape)?;
+            let (_, act) = kernels::down(stacks.down_ty()).ok_or(GpuError::state(
+                WHAT,
+                "the selected tier down's activation form",
+            ))?;
+            downs = downs.with(act);
             cfg.push(Some(layer));
         }
         Ok(LegTier {
             leg: CardLeg::load(gpu)?,
-            bufs: LegBufs::new(gpu.stream(), shape)?,
+            bufs: LegBufs::for_downs(gpu.stream(), shape, downs)?,
             layers: run,
             cfg,
             shape,
+            arms,
         })
     }
 }
@@ -270,6 +292,7 @@ impl TierExperts for LegTier {
             layers,
             cfg,
             shape,
+            arms,
         } = self;
         let LegShape {
             cap,
@@ -278,7 +301,7 @@ impl TierExperts for LegTier {
             ..
         } = *shape;
         let tl = layer_of(layers, cfg, layer, W)?;
-        let stacks = LegStacks::of(weights, tl.names())?;
+        let stacks = LegStacks::of_arms(weights, tl.names(), *arms, STACK_ROLES)?;
         for c0 in (0..io.cols).step_by(cap) {
             let cn = cap.min(io.cols - c0);
             let slots = cn * slots_per_col;
@@ -321,7 +344,7 @@ impl TierExperts for LegTier {
                     .to_string(),
             });
         };
-        let stacks = LegStacks::of(weights, tl.names())?;
+        let stacks = LegStacks::of_arms(weights, tl.names(), self.arms, STACK_ROLES)?;
         let run = LegRun {
             layer,
             stacks: &stacks,
@@ -432,6 +455,8 @@ pub struct LegWidths {
     pub n_embd: usize,
     /// A routed expert's width.
     pub ff: usize,
+    /// The program whose card leg runs these experts.
+    pub program: Program,
 }
 
 impl LegWidths {
@@ -523,13 +548,15 @@ fn node_experts<F: LegFamily>(
     open: &NodeOpen,
 ) -> Result<Box<dyn TierExperts>, GpuError> {
     let inputs = node_inputs::<F>(file, open)?;
-    let shape = F::widths(&inputs).shape(F::CHUNK);
+    let widths = F::widths(&inputs);
+    let shape = widths.shape(F::CHUNK);
     Ok(Box::new(LegTier::new(
         gpu,
         F::layers(&inputs),
         &open.set,
         w,
         shape,
+        widths.program,
     )?))
 }
 
@@ -603,5 +630,5 @@ pub fn hang_tiers(
     let planned: Vec<usize> = hang.tiers.iter().map(|t| t.card).collect();
     hybrid.attach_tiers(cards, gpu)?;
     hybrid.prepare_batch(gpu.context(), hang.cols)?;
-    hybrid.check_tier_reserves(plan.machine, &planned)
+    hybrid.check_tier_reserves(plan, &planned)
 }

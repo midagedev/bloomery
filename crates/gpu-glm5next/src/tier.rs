@@ -62,6 +62,7 @@ impl LegFamily for Glm {
             n_used: hp.n_used,
             n_embd: hp.n_embd,
             ff: hp.expert_ff,
+            program: model::placement::accepts::Program::Glm5nextBody,
         }
     }
 

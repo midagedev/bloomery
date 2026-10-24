@@ -1982,7 +1982,7 @@ impl Body38 {
         hybrid.prepare_batch(gpu.context(), host_cols)?;
         if tiered {
             let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
-            hybrid.check_tier_reserves(plan.machine, &cards)?;
+            hybrid.check_tier_reserves(plan, &cards)?;
         }
         // The PLE table's tier is the plan's: the host set built above holds
         // it on the host; on the NVMe tier its reader reads it.

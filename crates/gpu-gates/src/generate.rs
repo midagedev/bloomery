@@ -716,6 +716,7 @@ impl Place {
             staging: 0,
             scratch: 0,
             host: 0,
+            leg: None,
         };
         self.machine(None, (!self.tier_cards().is_empty()).then_some(none))
     }

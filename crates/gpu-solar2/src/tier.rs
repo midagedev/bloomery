@@ -64,6 +64,7 @@ impl LegFamily for Solar2 {
             n_used: experts.n_used,
             n_embd: inputs.hp.n_embd,
             ff: experts.ff,
+            program: model::placement::accepts::Program::Solar2Body,
         }
     }
 

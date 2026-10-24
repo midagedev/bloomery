@@ -313,7 +313,7 @@ mod gate {
         let layers = inputs.model.layers;
         let bp = Place::Bp
             .on_host()?
-            .machine(None, Some(place::tier_batch(&inputs.hp)))?;
+            .machine(None, Some(place::tier_batch(inputs)?))?;
         let two = bp(layers);
         let plan = inputs.plan(&two, u64::try_from(CTX)?, &cfg.place)?;
         let budget = cfg

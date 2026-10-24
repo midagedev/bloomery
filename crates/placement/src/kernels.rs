@@ -100,12 +100,30 @@ pub const fn embed(ty: GgmlType) -> Option<EmbedEntry> {
 /// it holds; a form whose last super-block is padded passes the padded width.
 #[must_use]
 pub const fn q8_act_bytes(cols: u64, k: u64) -> u64 {
-    let n_sb = k / 256;
-    8 * cols * 64 * n_sb.div_ceil(2)
-        + 4 * cols * 256 * n_sb.div_ceil(4)
-        + 4 * cols * 128 * n_sb.div_ceil(2)
-        + 4 * cols * 8 * n_sb
-        + 4 * cols * 2 * n_sb
+    match try_q8_act_bytes(cols, k) {
+        Some(bytes) => bytes,
+        None => panic!("q8_act_bytes: activation bytes overflow u64"),
+    }
+}
+
+/// [`q8_act_bytes`] with overflow returned to the placement boundary.
+#[must_use]
+pub(crate) const fn try_q8_act_bytes(cols: u64, k: u64) -> Option<u64> {
+    let n_sb = (k / 256) as u128;
+    // A u64 width's per-column count fits u128; its column product may not.
+    let per_col = 512 * n_sb.div_ceil(2)
+        + 1024 * n_sb.div_ceil(4)
+        + 512 * n_sb.div_ceil(2)
+        + 32 * n_sb
+        + 8 * n_sb;
+    let Some(bytes) = per_col.checked_mul(cols as u128) else {
+        return None;
+    };
+    if bytes > u64::MAX as u128 {
+        None
+    } else {
+        Some(bytes as u64)
+    }
 }
 
 /// The card bytes of the 32-value q8_1 activation of `cols` columns of `k`
@@ -114,8 +132,25 @@ pub const fn q8_act_bytes(cols: u64, k: u64) -> u64 {
 /// and scales, four bytes each, `k_blocks = k / 32`.
 #[must_use]
 pub const fn q8_blocks32_bytes(cols: u64, k: u64) -> u64 {
-    let k_blocks = k / 32;
-    cols * 4 * (256 * k_blocks.div_ceil(32) + 2 * k_blocks)
+    match try_q8_blocks32_bytes(cols, k) {
+        Some(bytes) => bytes,
+        None => panic!("q8_blocks32_bytes: activation bytes overflow u64"),
+    }
+}
+
+/// [`q8_blocks32_bytes`] with overflow returned to the placement boundary.
+#[must_use]
+const fn try_q8_blocks32_bytes(cols: u64, k: u64) -> Option<u64> {
+    let k_blocks = (k / 32) as u128;
+    let per_col = 4 * (256 * k_blocks.div_ceil(32) + 2 * k_blocks);
+    let Some(bytes) = per_col.checked_mul(cols as u128) else {
+        return None;
+    };
+    if bytes > u64::MAX as u128 {
+        None
+    } else {
+        Some(bytes as u64)
+    }
 }
 
 /// The down activation forms ([`DownAct`]) a card leg's buffers hold: the
@@ -174,30 +209,68 @@ impl DownForms {
 /// them read it.
 #[must_use]
 pub const fn leg_bytes(cap: u64, slots_per_col: u64, n: u64, ff: u64, downs: DownForms) -> u64 {
-    let slots = cap * slots_per_col;
+    match try_leg_bytes(cap, slots_per_col, n, ff, downs) {
+        Some(bytes) => bytes,
+        None => panic!("leg_bytes: scratch bytes overflow u64"),
+    }
+}
+
+/// [`leg_bytes`] with overflow returned to the placement boundary. This
+/// counts the same whole blocks and padded planes as the infallible sizing.
+#[must_use]
+pub(crate) const fn try_leg_bytes(
+    cap: u64,
+    slots_per_col: u64,
+    n: u64,
+    ff: u64,
+    downs: DownForms,
+) -> Option<u64> {
+    let Some(slots) = cap.checked_mul(slots_per_col) else {
+        return None;
+    };
+    let Some(row_bytes) = slots.checked_mul(4) else {
+        return None;
+    };
+    let Some(h) = row_bytes.checked_mul(ff) else {
+        return None;
+    };
+    let Some(down) = row_bytes.checked_mul(n) else {
+        return None;
+    };
+    let Some(input) = try_q8_act_bytes(cap, n) else {
+        return None;
+    };
     let q8 = if downs.q8_act {
-        q8_act_bytes(slots, ff)
+        let Some(bytes) = try_q8_act_bytes(slots, ff) else {
+            return None;
+        };
+        bytes
     } else {
         0
     };
     let b32 = if downs.blocks32 {
-        q8_blocks32_bytes(slots, ff)
+        let Some(bytes) = try_q8_blocks32_bytes(slots, ff) else {
+            return None;
+        };
+        bytes
     } else {
         0
     };
-    q8_act_bytes(cap, n) + 4 * slots * ff + q8 + b32 + 4 * slots * n
+    let bytes = input as u128 + h as u128 + q8 as u128 + b32 as u128 + down as u128;
+    if bytes > u64::MAX as u128 {
+        None
+    } else {
+        Some(bytes as u64)
+    }
 }
 
 /// Whether the common card leg (`crates/gpu/src/card_leg.rs`) launches the
 /// gate·up entry of a routed gate or up stack of type `ty` in the file's
 /// blocks ([`crate::placement::CardFormat::KQuant`]): the table's [`gate_up`]
 /// row, for the entries whose launchers read a `Q8Act` of more columns than a
-/// run uses. The Q8_0 row has a launcher of that shape and an arm in the leg
-/// (`CardLeg::launch`), which this set leaves out: the families that plan by
-/// it (GLM-5.3, MiMo, Solar-Open2, MiniMax-M3, Raon) hold `Q8Act` down buffers
-/// only, so a Q8_0 layer they planned on the card would fail at its first
-/// launch where it runs on the host today; a program whose buffers follow the
-/// down's form reads the arm through its own row ([`crate::accepts::prompt_leg_gate_up`]).
+/// run uses. The Q8_0 and Q6_K rows have launchers of that shape and arms in the
+/// leg, but only programs whose selected gate·up policy admits them read those
+/// arms ([`crate::accepts::prompt_leg_gate_up`]).
 /// A stack in its planes is [`card_planes_runs`]'.
 #[must_use]
 pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
@@ -322,6 +395,54 @@ pub const fn card_k_unit(ty: GgmlType, role: Role) -> u64 {
 mod tests {
     use super::*;
     use crate::placement::CardFormat;
+
+    /// Plane-padding transitions retain their byte counts, and both sizing
+    /// contracts share the last representable column and aggregate boundary.
+    #[test]
+    fn activation_and_leg_bytes_keep_padding_and_overflow_boundaries() {
+        for (k, bytes) in [(1024, 3232), (1280, 5320)] {
+            assert_eq!(try_q8_act_bytes(1, k), Some(bytes));
+            assert_eq!(q8_act_bytes(1, k), bytes);
+        }
+        for (k, bytes) in [(1024, 1280), (1056, 2312)] {
+            assert_eq!(try_q8_blocks32_bytes(1, k), Some(bytes));
+            assert_eq!(q8_blocks32_bytes(1, k), bytes);
+        }
+        let q8 = DownForms::of(DownAct::Q8Act);
+        let b32 = DownForms::of(DownAct::Q8Blocks32);
+        for (forms, bytes) in [
+            (DownForms::NONE, 4136),
+            (q8, 6224),
+            (b32, 5224),
+            (q8.with(DownAct::Q8Blocks32), 7312),
+        ] {
+            assert_eq!(try_leg_bytes(1, 1, 256, 256, forms), Some(bytes));
+            assert_eq!(leg_bytes(1, 1, 256, 256, forms), bytes);
+        }
+        assert_eq!(try_leg_bytes(1, 1, 64, 24, DownForms::NONE), Some(352));
+        let act_cols = u64::MAX / 2088;
+        assert_eq!(try_q8_act_bytes(act_cols, 256), Some(act_cols * 2088));
+        assert_eq!(q8_act_bytes(act_cols, 256), act_cols * 2088);
+        assert_eq!(try_q8_act_bytes(act_cols + 1, 256), None);
+        let block_cols = u64::MAX / 1088;
+        assert_eq!(
+            try_q8_blocks32_bytes(block_cols, 256),
+            Some(block_cols * 1088)
+        );
+        assert_eq!(q8_blocks32_bytes(block_cols, 256), block_cols * 1088);
+        assert_eq!(try_q8_blocks32_bytes(block_cols + 1, 256), None);
+        let cap = u64::MAX / 6224;
+        assert_eq!(try_leg_bytes(cap, 1, 256, 256, q8), Some(cap * 6224));
+        assert_eq!(leg_bytes(cap, 1, 256, 256, q8), cap * 6224);
+        assert_eq!(try_leg_bytes(cap + 1, 1, 256, 256, q8), None);
+        assert_eq!(try_leg_bytes(1 << 61, 8, 256, 256, q8), None);
+    }
+
+    #[test]
+    #[should_panic]
+    fn infallible_leg_sizing_refuses_overflow() {
+        let _ = leg_bytes(1 << 61, 8, 256, 256, DownForms::of(DownAct::Q8Act));
+    }
 
     /// Every `GgmlType` variant in declaration order, then one id the enum
     /// does not name.

@@ -10,7 +10,6 @@ use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::generate::{Place, TierRule, choose_ctx_of};
 use bloomery_gpu_gates::residency38::glm_machine;
 use bloomery_gpu_glm5next::checkpoint_price;
-use model::arch::glm5next::hparams::Hparams;
 use model::arch::glm5next::place::{
     KdaLanes, NextnInputs, ORACLE_POSITIONS, PlaceError, PlanInputs,
 };
@@ -41,10 +40,12 @@ pub fn parse(v: &str) -> Result<Place, GateError> {
 }
 
 /// The expert tier's prompt-batch bytes `place`'s plan reserves for the file
-/// of hyperparameters `hp` (`model::arch::glm5next::place::tier_batch`),
+/// described by `inputs` (`model::arch::glm5next::place::tier_batch`),
 /// which `Place::machine` takes; `None` under a placement with no tier card.
-pub fn tier_batch(place: Place, hp: &Hparams) -> Option<TierBatchBytes> {
-    (!place.tier_cards().is_empty()).then(|| model::arch::glm5next::place::tier_batch(hp))
+pub fn tier_batch(place: Place, inputs: &PlanInputs) -> Result<Option<TierBatchBytes>, GateError> {
+    Ok((!place.tier_cards().is_empty())
+        .then(|| model::arch::glm5next::place::tier_batch(inputs))
+        .transpose()?)
 }
 
 /// The experts `place`'s tier cards hold in its plan at `ctx` positions
@@ -65,7 +66,7 @@ pub fn tier_experts(
 ) -> Result<u64, GateError> {
     let machine = glm_machine(
         place,
-        tier_batch(place, &inputs.hp),
+        tier_batch(place, inputs)?,
         slots,
         checkpoint_price(inputs)?,
         ctx,

@@ -515,7 +515,7 @@ mod gate {
     fn bp_machine(inputs: &PlanInputs) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
         glm_machine(
             Place::Bp,
-            Some(place::tier_batch(&inputs.hp)),
+            Some(place::tier_batch(inputs)?),
             1,
             checkpoint_price(inputs)?,
             u64::try_from(CTX)?,

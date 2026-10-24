@@ -350,6 +350,7 @@ fn hw_solar_open2_plan_a() {
         staging: 0,
         scratch: 0,
         host: 0,
+        leg: None,
     };
     let bp = workstation::plan_bp(layers, None, tier_batch);
     let tiered = inputs

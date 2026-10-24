@@ -82,7 +82,7 @@ pub fn open(file: &Path, ctx: usize, arm: Arm) -> Result<Box<dyn Seat>, GateErro
     // prompt-batch bytes the file's widths give.
     let machine = match arm {
         Arm::A => crate::gate_card::plan_gate(inputs.model.layers),
-        Arm::Bp => workstation::plan_bp(inputs.model.layers, None, place::tier_batch(&inputs.hp)),
+        Arm::Bp => workstation::plan_bp(inputs.model.layers, None, place::tier_batch(&inputs)?),
     };
     let place = PlanLevers::from_levers(&levers)?;
     let plan = inputs.plan(&machine, u64::try_from(ctx)?, &place)?;

@@ -242,6 +242,7 @@ mod gate {
                         staging: 0,
                         scratch: 0,
                         host: 0,
+                        leg: None,
                     },
                 )
                 .map_err(|e| format!("plan (b): {e}"))?;

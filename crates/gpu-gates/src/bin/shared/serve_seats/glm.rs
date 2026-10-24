@@ -503,7 +503,7 @@ impl Placed {
         (set, slots): (Option<usize>, usize),
         (images, side): (&Images<'_>, Option<&Side>),
     ) -> Result<Placed, GateError> {
-        let tier_batch = glm_place::tier_batch(place, &inputs.hp);
+        let tier_batch = glm_place::tier_batch(place, inputs)?;
         // Every machine reserves its checkpoints at the slot context it is
         // laid for: the choice's probes each at their own, the load's at the
         // context it is granted; and the encoder's reserve, as the printed plan does.

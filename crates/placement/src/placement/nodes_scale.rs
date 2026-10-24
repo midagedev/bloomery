@@ -283,6 +283,7 @@ fn census_budgets_keep_each_node_and_stage_terms() {
             staging: 123,
             scratch: 456,
             host: 789,
+            leg: None,
         },
     )
     .expect("three independent nodes");
@@ -339,6 +340,7 @@ fn cases() -> &'static [Case] {
                     staging: 0,
                     scratch: 0,
                     host: 0,
+                    leg: None,
                 },
             )
             .expect("two nodes with no batch bytes");

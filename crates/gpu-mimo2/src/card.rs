@@ -26,6 +26,7 @@ fn stacks(l: usize) -> [String; 3] {
 /// MiMo's card experts: 256 routed experts, 8 a token.
 const FAMILY: CardFamily = CardFamily {
     what: "mimo2 CardExperts",
+    program: model::placement::accepts::Program::Mimo2Body,
     n_expert: N_EXPERT,
     n_used: N_USED,
     stacks,

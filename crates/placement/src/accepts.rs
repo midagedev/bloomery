@@ -416,6 +416,43 @@ pub fn leg_runs(p: Program, [gate, up, down]: [GgmlType; 3]) -> Option<bool> {
     leg_arms(p).map(|a| gate == up && (a.gate_up)(gate) && (a.down)(down))
 }
 
+/// The union of down activation forms of the complete routed layers that
+/// `p`'s placement rule admits, resolved from the file's descriptor at load.
+#[must_use]
+pub fn leg_down_forms(p: Program, model: &crate::placement::ModelTensors) -> kernels::DownForms {
+    use crate::placement::{ExpertPart, Role};
+
+    let RoutedRule::Leg { gate_up, down } = routed_rule(p) else {
+        return kernels::DownForms::NONE;
+    };
+    let mut forms = kernels::DownForms::NONE;
+    for l in 0..model.layers {
+        let mut parts = [None; 3];
+        for t in model
+            .tensors
+            .iter()
+            .filter(|t| t.role == Role::RoutedExperts && t.layer == Some(l))
+        {
+            let part = match ExpertPart::of_name(&t.name) {
+                Some(ExpertPart::Gate) => 0,
+                Some(ExpertPart::Up) => 1,
+                Some(ExpertPart::Down) => 2,
+                None => continue,
+            };
+            parts[part] = Some(t.ty);
+        }
+        if let [Some(g), Some(u), Some(d)] = parts
+            && g == u
+            && gate_up(g).is_some()
+            && down(d).is_some()
+            && let Some((_, act)) = kernels::down(d)
+        {
+            forms = forms.with(act);
+        }
+    }
+    forms
+}
+
 /// Program `p`'s plan rule for its routed stacks ([`RoutedRule`]): on a card
 /// leg, each part by the arm its load reads ([`leg_runs`]), so a layer the
 /// plan gives card experts is one the load runs. The common leg's plan, over

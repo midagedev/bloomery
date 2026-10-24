@@ -249,6 +249,7 @@ const CHECKPOINT_38: u64 = 36 * 3_596_288 + 17 * 4 * 2560 * 4;
 fn stage(spec: CardSpec) -> Card {
     Card {
         name: spec.name.to_string(),
+        tier_leg: None,
         device: spec.device,
         usable_bytes: spec.usable_bytes(),
         context_bytes: CONTEXT,
@@ -293,6 +294,7 @@ fn machine_bp(stage_spec: CardSpec, tier: CardSpec) -> Machine {
         cards: vec![s],
         tiers: vec![Card {
             name: tier.name.to_string(),
+            tier_leg: None,
             device: tier.device,
             usable_bytes: tier.usable_bytes(),
             context_bytes: CONTEXT,

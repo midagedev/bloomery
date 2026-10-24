@@ -137,15 +137,6 @@ fn card_leg_forms(model: &ModelTensors) -> DownForms {
         .fold(DownForms::NONE, |forms, (_, act)| forms.with(act))
 }
 
-/// The first routed layer of `model` the card experts run that the expert
-/// tier card's leg does not, with its stacks' types: that leg reads the
-/// common leg's types in every part ([`kernels::card_runs`]: the file's blocks
-/// over the 128-value form, the one its buffers and the plans' reserve hold),
-/// so a plan that hangs a tier card is refused it ([`PlaceError::TierLeg`]).
-fn off_tier_layer(model: &ModelTensors) -> Option<(usize, [GgmlType; 3])> {
-    carded_layers(model).find(|(_, tys)| !tys.iter().all(|&ty| kernels::card_runs(ty)))
-}
-
 /// Tokens a chunk of the tier's prompt-batch service runs at most: the
 /// stage card's chunk of the card experts' launches, which the body binds
 /// to its own constant.
@@ -156,14 +147,15 @@ pub const TIER_CHUNK: u64 = 8;
 /// path's scratch ([`workstation::tier_chunk_scratch_bytes`]) and the host's
 /// rows and places, which the plan reserves on the tier card and the host
 /// and the load checks its allocations against.
-#[must_use]
-pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
+pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
+    let hp = &inputs.hp;
     workstation::tier_leg_batch_bytes(
         hp.n_embd as u64,
         hp.expert_ff as u64,
         hp.n_used as u64,
         TIER_CHUNK,
         crate::moe::UNION_MAX_COLS as u64,
+        crate::placement::accepts::leg_down_forms(Program::Glm5nextBody, &inputs.model),
     )
 }
 
@@ -419,16 +411,6 @@ pub enum PlaceError {
     /// A plan of no resident sequence: a load serves at least one.
     #[error("a plan of {slots} resident sequences: a load serves at least one")]
     Slots { slots: usize },
-    /// A machine that hangs an expert tier card beside a file with a card
-    /// layer the tier's leg does not run (NVFP4's planes, a down over the
-    /// 32-value form): the tier card's buffers and reserve hold the file's
-    /// blocks over the 128-value form alone.
-    #[error(
-        "layer {layer}: routed stacks {tys:?} run on the stage card's leg, and the expert tier \
-         card's leg reads the file's blocks over 128-value q8_1 columns alone; plan it without \
-         the tier card"
-    )]
-    TierLeg { layer: usize, tys: [GgmlType; 3] },
 }
 
 impl PlanRefusal for PlaceError {
@@ -654,7 +636,6 @@ impl PlanInputs {
         if slots == 0 {
             return Err(PlaceError::Slots { slots });
         }
-        self.refuse_off_tier(machine)?;
         let kv = self.kv.with_lanes(lanes);
         let terms = self.seq_terms(&kv, None);
         let n = slots as u64;
@@ -699,18 +680,6 @@ impl PlanInputs {
             )?;
         }
         Ok(plan)
-    }
-
-    /// Refused by name ([`PlaceError::TierLeg`]) when `machine` hangs an
-    /// expert tier card and a card layer of the file is one the tier's leg
-    /// does not run.
-    fn refuse_off_tier(&self, machine: &Machine) -> Result<(), PlaceError> {
-        match off_tier_layer(&self.model) {
-            Some((layer, tys)) if !machine.tiers.is_empty() => {
-                Err(PlaceError::TierLeg { layer, tys })
-            }
-            _ => Ok(()),
-        }
     }
 }
 
@@ -832,6 +801,7 @@ fn nextn_machine() -> Machine {
     Machine {
         cards: vec![Card {
             name: "nextn".to_string(),
+            tier_leg: None,
             device: None,
             usable_bytes: u64::MAX,
             context_bytes: 0,
@@ -1015,7 +985,6 @@ impl PlanInputs {
         if slots == 0 {
             return Err(PlaceError::Slots { slots });
         }
-        self.refuse_off_tier(machine)?;
         let kv = self.kv.with_lanes(KdaLanes::Two);
         let terms = self.seq_terms(&kv, Some(nextn));
         let n = slots as u64;
@@ -1591,6 +1560,7 @@ mod tests {
             Machine {
                 cards: vec![Card {
                     name: "card".to_string(),
+                    tier_leg: None,
                     device: None,
                     usable_bytes: 1 << 40,
                     context_bytes: 1 << 20,
@@ -2155,44 +2125,74 @@ mod tests {
             }
         }
 
-        /// A machine that hangs an expert tier card is refused, by layer
-        /// and types, a file with a card layer the tier's leg does not run
-        /// (an NVFP4 layer: its planes and 32-value form); without the tier
-        /// card the same file plans, the NVFP4 layer's experts on the stage
-        /// card, and a K-quant file is not refused with it
-        /// ([`node_ranges_use_the_common_loaded_assignment`]). Mutants: the
-        /// refusal dropped, which leaves the tier's load to refuse the
-        /// layer's stacks; the body's plan rule left on the common leg's, which
-        /// keeps the NVFP4 layer on the host no kernel there reads.
+        /// The tier reserves precisely the selected layers' down forms,
+        /// including a mixed 128/32-value load; a gate/up mismatch remains
+        /// host-only and cannot add a form.
         #[test]
-        fn a_tier_card_is_refused_a_layer_its_leg_does_not_run() {
+        fn tier_scratch_follows_selected_mixed_layers() {
+            use super::super::TIER_CHUNK;
+            use crate::placement::kernels::{self, DownAct, DownForms};
+            use GgmlType::{IQ3_S, NVFP4, Q5_K, Q8_0};
             let mut inputs = routed(64 << 30);
-            for t in inputs
+            inputs
                 .model
                 .tensors
-                .iter_mut()
-                .filter(|t| t.role == Role::RoutedExperts && t.layer == Some(1))
-            {
-                t.ty = GgmlType::NVFP4;
-                t.file_bytes = t.dims.iter().product::<u64>() / 64 * 36;
-            }
-            let plain = unified(64 << 30);
-            let mut machine = plain.clone();
-            let mut tier = machine.cards[0].clone();
-            tier.name = "remote".into();
-            tier.head = false;
-            tier.layers = 0..0;
-            machine.tiers.push(tier);
-            match inputs.plan(&machine, CTX, &PlanLevers::default()) {
-                Err(PlaceError::TierLeg { layer, tys }) => {
-                    assert_eq!((layer, tys), (1, [GgmlType::NVFP4; 3]));
+                .retain(|t| t.role != Role::RoutedExperts || t.layer.is_some_and(|l| l < 2));
+            let set = |inputs: &mut PlanInputs, l, tys: [GgmlType; 3]| {
+                for t in inputs
+                    .model
+                    .tensors
+                    .iter_mut()
+                    .filter(|t| t.role == Role::RoutedExperts && t.layer == Some(l))
+                {
+                    let part = match crate::placement::ExpertPart::of_name(&t.name) {
+                        Some(crate::placement::ExpertPart::Gate) => 0,
+                        Some(crate::placement::ExpertPart::Up) => 1,
+                        Some(crate::placement::ExpertPart::Down) => 2,
+                        None => unreachable!(),
+                    };
+                    t.ty = tys[part];
                 }
-                other => panic!("{:?}", other.map(|p| p.n_l.clone())),
+            };
+            for (layers, forms) in [
+                (
+                    [[IQ3_S, IQ3_S, Q5_K], [Q5_K, Q5_K, Q5_K]],
+                    DownForms::of(DownAct::Q8Act),
+                ),
+                (
+                    [[Q5_K, Q5_K, Q8_0], [Q5_K, Q5_K, Q8_0]],
+                    DownForms::of(DownAct::Q8Blocks32),
+                ),
+                (
+                    [[IQ3_S, IQ3_S, Q5_K], [NVFP4; 3]],
+                    DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32),
+                ),
+                (
+                    [[IQ3_S, IQ3_S, Q5_K], [Q5_K, Q5_K, Q8_0]],
+                    DownForms::of(DownAct::Q8Act).with(DownAct::Q8Blocks32),
+                ),
+                (
+                    [[IQ3_S, IQ3_S, Q5_K], [IQ3_S, Q5_K, Q8_0]],
+                    DownForms::of(DownAct::Q8Act),
+                ),
+            ] {
+                for (l, tys) in layers.into_iter().enumerate() {
+                    set(&mut inputs, l, tys);
+                }
+                let bytes = super::super::tier_batch(&inputs).expect("tier bytes");
+                let hp = &inputs.hp;
+                assert_eq!(
+                    bytes.scratch,
+                    kernels::leg_bytes(
+                        TIER_CHUNK,
+                        hp.n_used as u64,
+                        hp.n_embd as u64,
+                        hp.expert_ff as u64,
+                        forms,
+                    ),
+                    "{layers:?}",
+                );
             }
-            let p = inputs
-                .plan(&plain, CTX, &PlanLevers::default())
-                .expect("the plan without the tier card");
-            assert!(p.n_l[1] > 0, "the NVFP4 layer on the card: {:?}", p.n_l);
         }
 
         #[test]

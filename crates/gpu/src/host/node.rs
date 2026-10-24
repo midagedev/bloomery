@@ -320,14 +320,23 @@ impl NodeOpen {
             .find(|d| self.device.is_some_and(|id| id.uuid == d.uuid))
             .ok_or_else(|| GpuError::shape(WHAT, "the projected tier is absent from the census"))?;
         let machine = workstation::plan_on(spec_of_device(device), self.layers);
-        let reserve = plan
-            .machine
-            .card(self.card)
-            .ok_or_else(|| {
+        let card = plan.machine.card(self.card).ok_or_else(|| {
+            GpuError::shape(WHAT, "the projected tier card is absent from the plan")
+        })?;
+        // Host-only projections have no card totals; their fixed reserves
+        // still belong to the machine. Dynamic scratch needs selected totals.
+        let reserve = if card.tier_leg.is_some() {
+            let totals = plan.cards.get(self.card).ok_or_else(|| {
                 GpuError::shape(WHAT, "the projected tier card is absent from the plan")
-            })?
-            .set_aside_bytes()
-            .ok_or_else(|| GpuError::shape(WHAT, "the projected tier reserve overflows"))?;
+            })?;
+            totals
+                .context_bytes
+                .checked_add(totals.scratch_bytes)
+                .and_then(|bytes| bytes.checked_add(totals.reserve_bytes))
+        } else {
+            card.set_aside_bytes()
+        }
+        .ok_or_else(|| GpuError::shape(WHAT, "the projected tier reserve overflows"))?;
         let mut projected = model::placement::nodes::routed_host(
             plan.model,
             &plan.rows,

@@ -17,6 +17,7 @@ pub use bloomery_gpu_deepseek41::shared_routed::{GATED_FROM, RoutedDims, back, f
 /// The card experts' family: the file's stack names and the router's counts.
 pub const CARD: CardFamily = CardFamily {
     what: "solar2 CardExperts",
+    program: model::placement::accepts::Program::Solar2Body,
     n_expert: N_EXPERT,
     n_used: N_USED,
     stacks: names::routed_stacks,

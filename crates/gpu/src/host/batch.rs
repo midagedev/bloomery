@@ -29,7 +29,7 @@ use crate::graph::{MappedHost, cu};
 use crate::tensor::WindowMut;
 use crate::{Gpu, GpuError, Q8Act};
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer, sys};
-use model::placement::Machine;
+use model::placement::Plan;
 use model::placement::workstation::{TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE};
 use model::{Tensor2, Tensor2View};
 use std::mem::size_of;
@@ -1079,18 +1079,19 @@ impl<H: HostExperts> HostTier<H> {
         Ok(())
     }
 
-    /// The expert tiers' prompt-batch bytes against the reserves `machine`'s
+    /// The expert tiers' prompt-batch bytes against the selected reserves the
     /// plan carries for them: on each tier's card — tier `t`'s is index
-    /// `cards[t]` of [`Machine::all_cards`] — its batch staging and the
+    /// `cards[t]` of [`model::placement::Machine::all_cards`] — its batch staging and the
     /// architecture's block scratch ([`TierCard::block_bytes`]) against that
-    /// card's [`TIER_BATCH_RESERVE`] row; on the host, the tier legs' rows and
+    /// card's selected [`TIER_BATCH_RESERVE`] row in `plan`; on the host, the tier legs' rows and
     /// places against the host's [`TIER_BATCH_HOST_RESERVE`] row. A card list
     /// that is not one card a tier, a missing row, a row named twice, or a
     /// difference is refused by name, naming the reserve. Load-time only, once
     /// [`HostTier::prepare_batch`] has made the legs. Step-only tiers make
     /// no batch leg ([`HostTier::prepare_tier_batch`]) and none is checked.
-    pub fn check_tier_reserves(&self, machine: &Machine, cards: &[usize]) -> Result<(), GpuError> {
+    pub fn check_tier_reserves(&self, plan: &Plan<'_>, cards: &[usize]) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::check_tier_reserves";
+        let machine = plan.machine;
         if self.tiers.iter().any(|t| !t.supports_blocks()) {
             return Ok(());
         }
@@ -1124,6 +1125,7 @@ impl<H: HostExperts> HostTier<H> {
                 &card.reserves,
                 TIER_BATCH_RESERVE,
                 port.tier_device_bytes(i) + t.block_bytes()?,
+                Some(index),
             ));
         }
         rows.push((
@@ -1131,15 +1133,27 @@ impl<H: HostExperts> HostTier<H> {
             &machine.host().reserves,
             TIER_BATCH_HOST_RESERVE,
             port.tier_host_bytes(),
+            None,
         ));
-        for (on, reserves, name, got) in rows {
+        for (on, reserves, name, got, card) in rows {
             let want = match reserves
                 .iter()
                 .filter(|(n, _)| n == name)
                 .collect::<Vec<_>>()
                 .as_slice()
             {
-                [(_, b)] => *b,
+                [(_, b)] => match card {
+                    Some(c) => plan
+                        .card_reserve(c, name)
+                        .map_err(|e| GpuError::plan(WHAT, e))?
+                        .ok_or_else(|| {
+                            GpuError::shape(
+                                WHAT,
+                                format!("the plan's selected reserve {name:?} on {on} is invalid"),
+                            )
+                        })?,
+                    None => *b,
+                },
                 named => {
                     return Err(GpuError::shape(
                         WHAT,

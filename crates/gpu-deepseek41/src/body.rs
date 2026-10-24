@@ -2563,7 +2563,7 @@ impl Body {
             // The tiers' batch staging is reserved on their cards by the plan,
             // so it is made at load, not at the first prompt.
             hybrid.prepare_batch(gpu.context(), prefill::T_MAX)?;
-            hybrid.check_tier_reserves(plan.machine, &cards)?;
+            hybrid.check_tier_reserves(plan, &cards)?;
             Some(TierPiece::new(gpu, hybrid.slots(), PAIR_ROWS)?)
         };
         let ced = ced::Ced::new(&CedLayer::table(hp), seq.ring_rows(), cfg.ced);
