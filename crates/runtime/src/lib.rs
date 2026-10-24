@@ -199,6 +199,41 @@ pub trait Target {
     /// read back after the last; the target stands `ids.len()` positions on.
     fn prompt(&mut self, ids: &[u32], want: Want) -> Result<Out<'_>, Self::Error>;
 
+    /// [`Target::prompt`] that leaves each of `marks` keepable: a later
+    /// [`Target::cut`] to one keeps it whole. The marks are positions,
+    /// ascending, each past [`Target::pos`] and at most the call's end. The
+    /// default runs a [`Target::prompt`] a part, cut at each mark before the
+    /// end: a target whose calls' ends are its points keeps a mark by ending a
+    /// call there. A target that keeps a position inside a call answers here
+    /// with one call. A mark out of order or outside the call is the caller's
+    /// breach: the default panics by name.
+    fn prompt_marked(
+        &mut self,
+        ids: &[u32],
+        marks: &[u32],
+        want: Want,
+    ) -> Result<Out<'_>, Self::Error> {
+        let from = u64::from(self.pos());
+        let to = from + ids.len() as u64;
+        let mut at = 0;
+        let mut prev = from;
+        for &u in marks {
+            let u = u64::from(u);
+            assert!(
+                prev < u && u <= to,
+                "a prompt of positions {from}..{to} marked at {marks:?}: marks go ascending, \
+                 past the call's start and at most its end"
+            );
+            prev = u;
+            let i = usize::try_from(u - from).expect("a mark inside the call is an index of it");
+            if i < ids.len() {
+                self.prompt(&ids[at..i], Want::Argmax)?;
+                at = i;
+            }
+        }
+        self.prompt(&ids[at..], want)
+    }
+
     /// Run `id` at [`Target::pos`], one position, and read back after it.
     fn step(&mut self, id: u32, want: Want) -> Result<Out<'_>, Self::Error>;
 
