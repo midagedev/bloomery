@@ -37,10 +37,11 @@ use bloomery_device::{Buffer, Device, Elem, Elems, Fault};
 use bloomery_metal::MetalBuffer;
 use bloomery_metal::kernels::router;
 use bloomery_metal::kernels::{
-    CombineParams, EXPERT_K, EXPERT_SLOTS, F32GemmParams, HEAD_COLS, HeadNormRowsParams,
+    CombineParams, EXPERT_K, EXPERT_SLOTS, F32GemmParams, HEAD_COLS, HeadNormRowsParams, Kernels,
     LOGIT_STRIDE, Operand, PARTIALS_PER_HEAD, Quant, ROUTE_TILE, RouteSelectParams,
     RouteTableParams, RoutedKind, RoutedParams, VALUE_HEADS, route_table_words, route_tiles,
 };
+use bloomery_metal::library::{Library, SOURCE};
 use gguf::quant::GgmlType;
 
 use super::clauses_gemm::{HALF_SUBNORMAL, gemm_band, weight_abs_sums};
@@ -559,13 +560,54 @@ fn grouped_run(
     sc: &Scene,
     operand: Operand,
 ) -> Result<Grouped, String> {
-    let slots = sc.rows * PER_ROW;
     let table = table_run(h, &sc.ids)?;
     if let Some(f) = table.fault {
         return Err(format!("the table raised {f}"));
     }
-    let tiles_b = upload(h, &table.tiles)?;
-    let sorted_b = upload(h, &table.sorted)?;
+    let over = OverTable {
+        kernels: h.kernels,
+        sorted: &table.sorted,
+        tiles: &table.tiles,
+        max_tiles: route_tiles(sc.rows * PER_ROW, EXPERTS),
+    };
+    let out = grouped_launch(h, ex, sc, operand, &over)?;
+    Ok(Grouped {
+        h: out.h,
+        y: out.y,
+        table,
+        pair_fault: out.pair_fault,
+        down_fault: out.down_fault,
+    })
+}
+
+/// The kernels a grouped launch runs and the table it runs over.
+struct OverTable<'a> {
+    kernels: &'a Kernels,
+    sorted: &'a [u32],
+    tiles: &'a [u32],
+    max_tiles: usize,
+}
+
+/// What a grouped launch wrote and raised.
+struct Outs {
+    h: Vec<f32>,
+    y: Vec<f32>,
+    pair_fault: Option<Fault>,
+    down_fault: Option<Fault>,
+}
+
+/// The pair, then the down on the pair's outputs, by `over`'s kernels over
+/// its table.
+fn grouped_launch(
+    h: &Harness<'_>,
+    ex: &Experts,
+    sc: &Scene,
+    operand: Operand,
+    over: &OverTable<'_>,
+) -> Result<Outs, String> {
+    let slots = sc.rows * PER_ROW;
+    let tiles_b = upload(h, over.tiles)?;
+    let sorted_b = upload(h, over.sorted)?;
     let w_b = upload(h, &sc.route_w)?;
     let x_b = upload(h, &sc.x)?;
     let gate = bytes(h, &ex.gate)?;
@@ -576,10 +618,10 @@ fn grouped_run(
     let sdown = bytes(h, &ex.shared_down)?;
     let mut hid = upload(h, &vec![sentinel(); slots * EXPERT_K])?;
     let mut out = upload(h, &vec![sentinel(); slots * HIDDEN])?;
-    let max_tiles = route_tiles(slots, EXPERTS);
+    let max_tiles = over.max_tiles;
     h.clear_fault()?;
     h.encode(|encoder| {
-        h.kernels.gemm_routed(
+        over.kernels.gemm_routed(
             encoder,
             RoutedParams {
                 quant: ex.quant,
@@ -602,7 +644,7 @@ fn grouped_run(
                 max_tiles,
                 sorted: sorted_b.window(Elems(0), Elems(slots))?,
                 route_w: w_b.window(Elems(0), Elems(slots))?,
-                tiles: tiles_b.window(Elems(0), Elems(table.tiles.len()))?,
+                tiles: tiles_b.window(Elems(0), Elems(over.tiles.len()))?,
                 fault: h.device.fault_word(),
                 layer: LAYER,
             },
@@ -611,7 +653,7 @@ fn grouped_run(
     let pair_fault = h.fault()?;
     h.clear_fault()?;
     h.encode(|encoder| {
-        h.kernels.gemm_routed(
+        over.kernels.gemm_routed(
             encoder,
             RoutedParams {
                 quant: ex.quant,
@@ -634,17 +676,16 @@ fn grouped_run(
                 max_tiles,
                 sorted: sorted_b.window(Elems(0), Elems(slots))?,
                 route_w: w_b.window(Elems(0), Elems(slots))?,
-                tiles: tiles_b.window(Elems(0), Elems(table.tiles.len()))?,
+                tiles: tiles_b.window(Elems(0), Elems(over.tiles.len()))?,
                 fault: h.device.fault_word(),
                 layer: LAYER,
             },
         )
     })?;
     let down_fault = h.fault()?;
-    Ok(Grouped {
+    Ok(Outs {
         h: read(h, &hid, slots * EXPERT_K)?,
         y: read(h, &out, slots * HIDDEN)?,
-        table,
         pair_fault,
         down_fault,
     })
@@ -811,9 +852,9 @@ fn grouped_quant(
     let ex = experts_of(fix, quant)?;
     let mut parts = Vec::new();
     for &operand in operands {
-        // 40 rows: every row picks the hot expert, so its group and the
-        // shared group both take two tiles (32 + 8).
-        let sc = scene(40, Some(5), 0x6A0);
+        // A tile and eight rows: every row picks the hot expert, so its
+        // group and the shared group both take two tiles.
+        let sc = scene(ROUTE_TILE + 8, Some(5), 0x6A0);
         let run = grouped_run(h, &ex, &sc, operand)?;
         for (what, fault) in [("pair", run.pair_fault), ("down", run.down_fault)] {
             if let Some(f) = fault {
@@ -851,6 +892,181 @@ pub fn grouped_gemm(h: &Harness<'_>, fixture: &Fixture, mlx: &Result<Fixture, St
     }
     Ok(Verdict::Noted(format!(
         "worst error over its band: {}",
+        notes.join(", ")
+    )))
+}
+
+// ------------------------------------------------------------ grouped oracle
+
+/// The routed tile the gate keeps as the oracle, from `#define ROUTED_ROWS` on.
+const ORACLE: &str = include_str!("routed_oracle.metal");
+
+/// The shipped routed GEMM's file, whose routed tile the oracle replaces.
+const SHIPPED: &str = include_str!("../../../kernels/gemm_routed.metal");
+
+/// The table tile the oracle's kernel takes.
+const ORACLE_TILE: usize = 32;
+
+/// Rows of the oracle scene, and the run lengths each of its eight lanes
+/// cuts them into: every A fragment count of a tile, the fragment boundaries
+/// 8 k and 8 k + 1, a full tile, and groups of two and three tiles (the
+/// shared group's three among them).
+const LANE_ROWS: usize = 136;
+const LANES: [&[usize]; TOP_K] = [
+    &[1, 7, 8, 9, 15, 16, 17, 63],
+    &[64, 65, 7],
+    &[23, 24, 25, 31, 33],
+    &[39, 40, 41, 16],
+    &[47, 48, 41],
+    &[55, 56, 25],
+    &[129, 7],
+    &[136],
+];
+
+/// The kernels compiled from the shipped source with the routed tile swapped
+/// for the oracle's and the table's tile at the oracle's.
+fn oracle_kernels(h: &Harness<'_>) -> Result<Kernels, String> {
+    let at = SHIPPED
+        .find("#define ROUTED_ROWS")
+        .ok_or("gemm_routed.metal has no `#define ROUTED_ROWS`; the tile's start moved")?;
+    let from = format!("#define ROUTE_TILE {ROUTE_TILE}\n");
+    let to = format!("#define ROUTE_TILE {ORACLE_TILE}\n");
+    let mut text = SOURCE.to_string();
+    for (find, with) in [(&SHIPPED[at..], ORACLE), (from.as_str(), to.as_str())] {
+        let found = text.matches(find).count();
+        if found != 1 {
+            return Err(format!(
+                "the oracle's edit finds {:?} {found} times, not 1",
+                find.lines().next().unwrap_or("")
+            ));
+        }
+        text = text.replacen(find, with, 1);
+    }
+    let library = Library::from_source_text(h.device, &text).map_err(why)?;
+    Kernels::from_library(&library).map_err(why)
+}
+
+/// The oracle scene: row r takes, in lane j, the expert 32 j + i of the run
+/// i its lane puts r in, then the shared expert.
+fn lane_scene() -> Result<Scene, String> {
+    if ROUTE_TILE != 64 {
+        return Err(format!(
+            "the oracle scene's runs are cut for a 64-slot tile, and the table's is {ROUTE_TILE}"
+        ));
+    }
+    let mut ids = Vec::with_capacity(LANE_ROWS * PER_ROW);
+    for r in 0..LANE_ROWS {
+        for (j, lane) in LANES.iter().enumerate() {
+            let mut end = 0;
+            let run = lane.iter().position(|&n| {
+                end += n;
+                r < end
+            });
+            let i = run.ok_or_else(|| format!("lane {j}'s runs end before row {r}"))?;
+            ids.push((32 * j + i) as u32);
+        }
+        ids.push(EXPERTS as u32);
+    }
+    if let Some(j) = LANES
+        .iter()
+        .position(|l| l.iter().sum::<usize>() != LANE_ROWS)
+    {
+        return Err(format!("lane {j}'s runs are not {LANE_ROWS} rows"));
+    }
+    let mut sc = scene(LANE_ROWS, None, 0x0AC);
+    sc.ids = ids;
+    Ok(sc)
+}
+
+/// The table cut again at the oracle's tile: each entry's run in pieces of
+/// `ORACLE_TILE`, in order.
+fn oracle_tiles(tiles: &[u32]) -> (Vec<u32>, usize) {
+    let n = tiles[0] as usize;
+    let mut out = vec![0u32; 4];
+    for i in 0..n {
+        let e = &tiles[4 * (1 + i)..4 * (1 + i) + 4];
+        let mut at = 0u32;
+        while at < e[2] {
+            let take = (e[2] - at).min(ORACLE_TILE as u32);
+            out.extend([e[0], e[1] + at, take, 0]);
+            at += take;
+        }
+    }
+    let pieces = out.len() / 4 - 1;
+    out[0] = pieces as u32;
+    (out, pieces)
+}
+
+/// Every output written, and each the oracle's bits.
+fn same_bits(what: &str, got: &[f32], want: &[f32], cols: usize) -> Result<(), String> {
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        if g.to_bits() == SENTINEL_BITS {
+            return Err(format!(
+                "{what}: place {} column {} is not written",
+                i / cols,
+                i % cols
+            ));
+        }
+        if g.to_bits() != w.to_bits() {
+            return Err(format!(
+                "{what}: place {} column {}: {g:?} ({:#x}), the oracle's {w:?} ({:#x})",
+                i / cols,
+                i % cols,
+                g.to_bits(),
+                w.to_bits()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The shipped tile's pair and down are the oracle tile's bit for bit, on
+/// runs of every A fragment count, its boundaries and groups of several
+/// tiles: a tile's height and its split over the SIMD groups do not move an
+/// output's K order.
+pub fn grouped_oracle(h: &Harness<'_>, fixture: &Fixture, mlx: &Result<Fixture, String>) -> Clause {
+    let oracle = oracle_kernels(h)?;
+    let sc = lane_scene()?;
+    let mlx = mlx.as_ref().map_err(|e| format!("the A4 fixture: {e}"))?;
+    let mut notes = Vec::new();
+    for (fix, quant, operands) in [
+        (fixture, Quant::Q4K, &[Operand::F16, Operand::F32][..]),
+        (mlx, Quant::A4, &[Operand::F16][..]),
+    ] {
+        let ex = experts_of(fix, quant)?;
+        for &operand in operands {
+            let ours = grouped_run(h, &ex, &sc, operand)?;
+            let (tiles, pieces) = oracle_tiles(&ours.table.tiles);
+            let theirs = grouped_launch(
+                h,
+                &ex,
+                &sc,
+                operand,
+                &OverTable {
+                    kernels: &oracle,
+                    sorted: &ours.table.sorted,
+                    tiles: &tiles,
+                    max_tiles: pieces,
+                },
+            )?;
+            for (what, fault) in [
+                ("pair", ours.pair_fault),
+                ("down", ours.down_fault),
+                ("oracle pair", theirs.pair_fault),
+                ("oracle down", theirs.down_fault),
+            ] {
+                if let Some(f) = fault {
+                    return Err(format!("the clean {what} launch raised {f}"));
+                }
+            }
+            let name = format!("{} {operand:?}", quant.name());
+            same_bits(&format!("{name} pair"), &ours.h, &theirs.h, EXPERT_K)?;
+            same_bits(&format!("{name} down"), &ours.y, &theirs.y, HIDDEN)?;
+            notes.push(format!("{name} {} tiles for {pieces}", ours.table.tiles[0]));
+        }
+    }
+    Ok(Verdict::Noted(format!(
+        "pair and down bit for bit the oracle tile's at {LANE_ROWS} rows: {}",
         notes.join(", ")
     )))
 }
@@ -1249,6 +1465,13 @@ pub fn table<'a>(
             "grouped_gemm",
             Box::new(|| match ctx.fixture {
                 Ok(fixture) => grouped_gemm(ctx.harness, fixture, mlx),
+                Err(e) => Err(e.clone()),
+            }),
+        ),
+        (
+            "grouped_oracle",
+            Box::new(|| match ctx.fixture {
+                Ok(fixture) => grouped_oracle(ctx.harness, fixture, mlx),
                 Err(e) => Err(e.clone()),
             }),
         ),

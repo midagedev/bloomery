@@ -956,13 +956,13 @@ pub const MUTANTS: &[Mutant] = &[
         why: "the pair's output is not scaled by the slot's route weight",
         edits: &[
             (
-                "p[o] = pair_swiglu(c[i][j].x, c[i][j + 2].x) * rw;",
-                "p[o] = pair_swiglu(c[i][j].x, c[i][j + 2].x);",
+                "p[o] = pair_swiglu(c[i][0].x, c[i][1].x) * rw;",
+                "p[o] = pair_swiglu(c[i][0].x, c[i][1].x);",
                 1,
             ),
             (
-                "p[o + 1] = pair_swiglu(c[i][j].y, c[i][j + 2].y) * rw;",
-                "p[o + 1] = pair_swiglu(c[i][j].y, c[i][j + 2].y);",
+                "p[o + 1] = pair_swiglu(c[i][0].y, c[i][1].y) * rw;",
+                "p[o + 1] = pair_swiglu(c[i][0].y, c[i][1].y);",
                 1,
             ),
         ],
@@ -973,13 +973,13 @@ pub const MUTANTS: &[Mutant] = &[
         why: "the pair applies silu to the up projection and multiplies by the gate",
         edits: &[
             (
-                "p[o] = pair_swiglu(c[i][j].x, c[i][j + 2].x) * rw;",
-                "p[o] = pair_swiglu(c[i][j + 2].x, c[i][j].x) * rw;",
+                "p[o] = pair_swiglu(c[i][0].x, c[i][1].x) * rw;",
+                "p[o] = pair_swiglu(c[i][1].x, c[i][0].x) * rw;",
                 1,
             ),
             (
-                "p[o + 1] = pair_swiglu(c[i][j].y, c[i][j + 2].y) * rw;",
-                "p[o + 1] = pair_swiglu(c[i][j + 2].y, c[i][j].y) * rw;",
+                "p[o + 1] = pair_swiglu(c[i][0].y, c[i][1].y) * rw;",
+                "p[o + 1] = pair_swiglu(c[i][1].y, c[i][0].y) * rw;",
                 1,
             ),
         ],
@@ -989,8 +989,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "grouped_gemm",
         why: "the pair's activation rows are the places' own, not the slots' pass rows",
         edits: &[(
-            "const ulong src_row = args.gather != 0u ? (ulong)(sorted[place] / BLOOMERY_EXPERT_SLOTS) : (ulong)place;",
-            "const ulong src_row = (ulong)place;",
+            "args.gather != 0u ? (ulong)(sorted[b_place] / BLOOMERY_EXPERT_SLOTS) : (ulong)b_place;",
+            "(ulong)b_place;",
             1,
         )],
     },
@@ -998,11 +998,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "routed_dead_fragment",
         clause: "grouped_gemm",
         why: "a fragment row-block that holds live rows but fewer than a block is treated as dead",
-        edits: &[(
-            "live[i] = gm + 16 * i < count;",
-            "live[i] = gm + 16 * i + 8 < count;",
-            1,
-        )],
+        edits: &[("switch ((count + 7) / 8) {", "switch (count / 8) {", 1)],
     },
     Mutant {
         name: "routed_range_off",
@@ -1011,6 +1007,26 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "const bool4 over = !(fabs(v) <= 65504.f);",
             "const bool4 over = bool4(false);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_upper_rows",
+        clause: "grouped_oracle",
+        why: "the tile's second half of activation rows multiplies the first half's",
+        edits: &[(
+            "arow[i] = sb + (8 * i + fm) * LDA + fn;",
+            "arow[i] = sb + ((8 * i) % (ROUTED_ACTS / 2) + fm) * LDA + fn;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "routed_last_row_unstaged",
+        clause: "grouped_oracle",
+        why: "a run that fills its last fragment leaves that fragment's last row unstaged",
+        edits: &[(
+            "const bool b_stage = (short)(tiitg / 2) < 8 * NA;",
+            "const bool b_stage = (short)(tiitg / 2) < 8 * NA - 1;",
             1,
         )],
     },
