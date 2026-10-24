@@ -772,6 +772,7 @@ pub(super) mod tests {
     const PROG: usize = 128;
     const IMAGE: usize = 192;
     const ROWS: usize = 256;
+    const SPAN: usize = 64;
     const TAIL: usize = 320;
     const GO_1: usize = 8;
     const CNT_1: usize = 72;
@@ -789,7 +790,7 @@ pub(super) mod tests {
     // The row's go, which publishes its image, and its done, which publishes
     // its rows and counts in the progress word.
     fn row() -> Vec<Crossing> {
-        let (image, rows) = (IMAGE..IMAGE + 64, ROWS..ROWS + 64);
+        let (image, rows) = (IMAGE..IMAGE + SPAN, ROWS..ROWS + SPAN);
         vec![
             Crossing {
                 counter: GO,
@@ -868,9 +869,24 @@ pub(super) mod tests {
 
     // The model cards run the tier protocol's ops: add one to the counter
     // each writes, wait for at least one on the counter each reads and take
-    // one back. Goes `ks` carry image k and dones rows k + ROWS_OF; the bytes
-    // are checked for every go up to `checked`, the ones before a release.
+    // one back. Goes `ks` carry image k and dones rows k + ROWS_OF in every
+    // word of the span; the bytes are checked for every go up to `checked`,
+    // the ones before a release.
     const ROWS_OF: u32 = 1 << 20;
+
+    fn fill(p: &Mem, at: usize, v: u32) {
+        for off in (at..at + SPAN).step_by(4) {
+            p.word(off).store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// The first word of the span at `at` that is not `v`, as (byte, word).
+    fn stray(p: &Mem, at: usize, v: u32) -> Option<(usize, u32)> {
+        (at..at + SPAN)
+            .step_by(4)
+            .map(|off| (off, p.word(off).load(Ordering::Relaxed)))
+            .find(|&(_, w)| w != v)
+    }
 
     fn tier_card(
         tier: Arc<Mem>,
@@ -883,11 +899,14 @@ pub(super) mod tests {
                 if !wait_take(&tier, GO, until) {
                     return Err(format!("the tier's go {k} never came"));
                 }
-                let img = tier.word(IMAGE).load(Ordering::Relaxed);
-                if k <= checked && img != k {
-                    return Err(format!("the tier's go {k} carried the image of go {img}"));
+                if k <= checked
+                    && let Some((off, img)) = stray(&tier, IMAGE, k)
+                {
+                    return Err(format!(
+                        "the tier's go {k} carried the image of go {img} at byte {off}"
+                    ));
                 }
-                tier.word(ROWS).store(k + ROWS_OF, Ordering::Relaxed);
+                fill(&tier, ROWS, k + ROWS_OF);
                 tier.word(CNT).fetch_add(1, Ordering::Release);
                 tier.word(PROG).fetch_add(1, Ordering::Release);
             }
@@ -902,14 +921,17 @@ pub(super) mod tests {
         until: Instant,
     ) -> Result<(), String> {
         for k in ks {
-            stage.word(IMAGE).store(k, Ordering::Relaxed);
+            fill(stage, IMAGE, k);
             stage.word(GO).fetch_add(1, Ordering::Release);
             if !wait_take(stage, CNT, until) {
                 return Err(format!("the stage's done {k} never came"));
             }
-            let rows = stage.word(ROWS).load(Ordering::Relaxed);
-            if k <= checked && rows != k + ROWS_OF {
-                return Err(format!("the stage's done {k} carried rows {rows:#x}"));
+            if k <= checked
+                && let Some((off, rows)) = stray(stage, ROWS, k + ROWS_OF)
+            {
+                return Err(format!(
+                    "the stage's done {k} carried rows {rows:#x} at byte {off}"
+                ));
             }
         }
         Ok(())
