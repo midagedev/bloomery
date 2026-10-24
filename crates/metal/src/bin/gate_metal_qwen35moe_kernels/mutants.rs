@@ -1038,8 +1038,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "grouped_gemm",
         why: "the grouped GEMM's f16 range check is gone, so an activation past the half range casts to inf",
         edits: &[(
-            "const bool4 over = !(fabs(v) <= 65504.f);",
-            "const bool4 over = bool4(false);",
+            "const bool4 bad = !(fabs(v) <= 65504.f);",
+            "const bool4 bad = bool4(false);",
             1,
         )],
     },

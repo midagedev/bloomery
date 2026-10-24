@@ -77,7 +77,8 @@
 // kernels' bits.
 //
 // This file comes after quant.metal (the quant owners), fault.metal (raise)
-// and gemm_shared.metal (the geometry, the argument blocks, pair_swiglu).
+// and gemm_shared.metal (the geometry, the argument blocks, pair_swiglu,
+// the activations' checked cast gemm_stage_x).
 
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -134,31 +135,6 @@ inline void tensor_stage_w(device const typename Q::Block * row, int pos,
     Q::template dequant16<T>(row[ib], il, reg);
     FOR_UNROLL(short i = 0; i < 4; ++i) {
         dst[i] = vec<T, 4>(reg[i][0], reg[i][1], reg[i][2], reg[i][3]);
-    }
-}
-
-// One 16-value run of an activation row, loaded as scalars (no window
-// alignment is assumed) and checked as float4s. The f16 arm's cast is the
-// activation quantizer's: a value that is not finite or past the half range
-// (one test: not at most the half maximum in magnitude, which a NaN fails
-// too) raises the quantizer's site and stages NaN, so the row's outputs are
-// NaN — never a silent inf.
-template <typename T>
-inline void tensor_stage_x(device const float * xr, threadgroup vec<T, 4> * dst,
-                           device atomic_uint * faults, uint layer) {
-    FOR_UNROLL(short g = 0; g < 4; ++g) {
-        const float4 v = float4(xr[4 * g], xr[4 * g + 1], xr[4 * g + 2], xr[4 * g + 3]);
-        if (sizeof(T) == 2) {
-            const bool4 bad = !(fabs(v) <= 65504.f);
-            if (any(bad)) {
-                raise(faults, layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
-                dst[g] = vec<T, 4>(select(v, float4(NAN), bad));
-            } else {
-                dst[g] = vec<T, 4>(v);
-            }
-        } else {
-            dst[g] = vec<T, 4>(v);
-        }
     }
 }
 
@@ -227,7 +203,7 @@ inline void tensor_tile(threadgroup char        * shmem,
         // The previous step's operands are read: the tiles may be written
         // over.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        tensor_stage_x<T>(b_src + k0, b_dst, faults, layer);
+        gemm_stage_x<T>(b_src + k0, b_dst, faults, layer);
         tensor_stage_w<Q, T>(a_src, k0 + koff, a_dst);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (live) {
@@ -431,7 +407,7 @@ kernel void tensor_routed_kernel(device const typename Q::Block * W [[buffer(0)]
         for (int k0 = 0; k0 < (int)args.cols; k0 += BK) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (b_stage) {
-                tensor_stage_x<T>(b_src + k0, b_dst, faults, args.layer);
+                gemm_stage_x<T>(b_src + k0, b_dst, faults, args.layer);
             }
             tensor_stage_w<Q, T>(a_src, k0 + koff, a_dst);
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -462,7 +438,7 @@ kernel void tensor_routed_kernel(device const typename Q::Block * W [[buffer(0)]
         for (int k0 = 0; k0 < (int)args.cols; k0 += BK) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (b_stage) {
-                tensor_stage_x<T>(b_src + k0, b_dst, faults, args.layer);
+                gemm_stage_x<T>(b_src + k0, b_dst, faults, args.layer);
             }
             tensor_stage_w<Q, T>(a_src, k0 + koff, a_dst);
             threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -64,8 +64,8 @@
 // epilogue reads, adds and writes back per element.
 //
 // This file comes after quant.metal and gemm_shared.metal: it reads the
-// quant owners, the fault site's table, the tile's geometry and the
-// argument blocks.
+// quant owners, the fault site's table, the tile's geometry, the argument
+// blocks and the activations' checked cast (gemm_stage_x).
 
 #include <metal_stdlib>
 
@@ -209,30 +209,12 @@ inline void gemm_tile(threadgroup char        * shmem,
         }
     }
 
-    // B: whole 16-value runs of the activation rows, loaded as scalars
-    // (no window alignment is assumed) and checked as float4s. The f16
-    // arm's cast is the activation quantizer's: a value that is not
-    // finite or past the half range (one test: not at most the half
-    // maximum in magnitude, which a NaN fails too) raises the
-    // quantizer's site and stages NaN, so the row's outputs are NaN —
-    // never a silent inf.
+    // B: whole 16-value runs of the activation rows, each through the
+    // checked cast (gemm_stage_x).
     auto stage_b = [&](int k0) {
         FOR_UNROLL(short b = 0; b < B_CHUNKS; ++b) {
             device const float * xr = b_src[b] + k0;
-            FOR_UNROLL(short g = 0; g < 4; ++g) {
-                const float4 v = float4(xr[4 * g], xr[4 * g + 1], xr[4 * g + 2], xr[4 * g + 3]);
-                if (sizeof(T) == 2) {
-                    const bool4 bad = !(fabs(v) <= 65504.f);
-                    if (any(bad)) {
-                        raise(faults, layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
-                        b_dst[b][g] = vec<T, 4>(select(v, float4(NAN), bad));
-                    } else {
-                        b_dst[b][g] = vec<T, 4>(v);
-                    }
-                } else {
-                    b_dst[b][g] = vec<T, 4>(v);
-                }
-            }
+            gemm_stage_x<T>(xr, b_dst[b], faults, layer);
         }
     };
 

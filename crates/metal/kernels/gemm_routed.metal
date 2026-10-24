@@ -36,8 +36,8 @@
 // not move it.
 //
 // This file comes after gemm_shared.metal (the routed tile's geometry, its
-// argument block and pair_swiglu), gemm.metal (the helpers and the
-// instantiated tile pieces) and route.metal (the table's shape).
+// argument block, pair_swiglu and gemm_stage_x), gemm.metal (the helpers
+// and the instantiated tile pieces) and route.metal (the table's shape).
 
 #include <metal_stdlib>
 
@@ -145,20 +145,7 @@ inline void routed_tile(threadgroup T                  * sa,
         if (b_stage) {
             device const float * xr = b_src + k0;
             threadgroup vec<T, 4> * bd = (threadgroup vec<T, 4> *)((threadgroup T *)b_dst + at);
-            FOR_UNROLL(short g = 0; g < 4; ++g) {
-                const float4 v = float4(xr[4 * g], xr[4 * g + 1], xr[4 * g + 2], xr[4 * g + 3]);
-                if (sizeof(T) == 2) {
-                    const bool4 over = !(fabs(v) <= 65504.f);
-                    if (any(over)) {
-                        raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
-                        bd[g] = vec<T, 4>(select(v, float4(NAN), over));
-                    } else {
-                        bd[g] = vec<T, 4>(v);
-                    }
-                } else {
-                    bd[g] = vec<T, 4>(v);
-                }
-            }
+            gemm_stage_x<T>(xr, bd, faults, args.layer);
         }
         const int pos = k0 + a_koff;
         const int ib = pos / Q::values_per_block();
