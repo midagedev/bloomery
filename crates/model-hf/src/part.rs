@@ -268,14 +268,20 @@ impl Whole {
 
 /// Stored tensor `name` read whole from its shard past the page cache (engram's direct reader)
 /// into new memory advised onto huge pages, so the read takes the drive's rate, faults once each
-/// 2 MiB and leaves the page cache as it was. `None` where the shard cannot be opened for direct
-/// reads or its mount refuses them ([`DirectFile::open`]): the caller reads the tensor through
-/// the mapping.
+/// 2 MiB and leaves the page cache as it was. `None` only when the shard's filesystem refuses
+/// direct reads as invalid or unsupported ([`DirectFile::open`]); other I/O errors propagate.
 fn read_whole(folder: &Folder, name: &str) -> Result<Option<Whole>, Error> {
     let (path, range) = folder.file_range(name)?;
     let file = match DirectFile::open(&path) {
         Ok(file) => file,
-        Err(EngramError::OpenDirect { .. } | EngramError::DirectProbe { .. }) => return Ok(None),
+        Err(EngramError::OpenDirect { source, .. } | EngramError::DirectProbe { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(e) => return Err(e.into()),
     };
     let raw = folder.raw(name)?;
@@ -777,6 +783,30 @@ pub(crate) mod tests {
             assert_eq!(after, before, "{name} read again after its pages' release");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mapped_shard_does_not_hide_a_direct_open_error() {
+        let dir = temp_dir("direct-error");
+        let c = checkpoint(&dir);
+        let (path, _) = c.folder.file_range("bf.w").unwrap();
+        std::fs::rename(&path, path.with_extension("moved")).unwrap();
+        let parts = c.plan(rule("bf.weight", 0, 0, 1)).unwrap();
+        assert_eq!(parts.len(), 1);
+        for p in parts {
+            match c.read(&p) {
+                Err(Error::Direct(EngramError::OpenDirect {
+                    path: found,
+                    source,
+                })) => {
+                    assert_eq!(found, path);
+                    assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+                Ok(_) => panic!("the mapping hid the missing shard"),
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Before any value is read, a source the plan does not place, a refusal of the rule and a
