@@ -206,7 +206,8 @@ blk_scancheck() { tool_selftest "check-$1.sh"; }
 # (a build.rs that is a link, and a broken one), no tree walk.
 blk_unsafecount() { blk_scancheck unsafe; }
 # check-arch.sh scans the tree for the architecture split's five rules: a scan whose grep or find cannot read ends the
-# check with no verdict. The architecture listing and each scan are tested here on a missing path.
+# check with no verdict. The architecture listing and each scan are tested here on a missing path, and rule 2's literal
+# scan on fixed lines.
 blk_archscan() { blk_scancheck arch; }
 # check-loads.sh scans crates/*/src for a generated module load outside the shared slot: a source file it cannot list
 # or read ends the check with 70. The family and load scans are tested here on fixed input and a missing file.

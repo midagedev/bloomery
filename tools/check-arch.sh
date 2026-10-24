@@ -21,7 +21,7 @@
 # ①·④는 어느 모드에서도 엄격하다.
 # Exit: 0 clean, 1 a violation, 2 no verdict: an unknown argument, no architecture directory, or a listing or scan whose
 # grep or find fails (a file it cannot read never passes as a file with no hit). `--self-test` runs the architecture
-# listing and each scan on a missing path and exits.
+# listing and each scan on a missing path, rule ②'s scan on fixed lines, and exits.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck source=tools/grep-answer.sh
@@ -133,8 +133,10 @@ scan_spawns() { # scan_spawns <path…>: rule ⑤'s spawn count per file into sp
 }
 
 # The listing and each scan on a missing path end with no verdict, and each scan on /dev/null (no hit) is clean.
+# Rule ②'s awk reads a key's dot as a dot: the bare "blk." beside a name that only starts like a key is clean, and a
+# key with its dot beside it is a hit.
 self_test() {
-  local fails=0 out rc n scan
+  local fails=0 out rc n scan d
   expect() {
     [ "$2" = "$3" ] || { echo "check-arch: self-test $1: got [$2], want [$3]" >&2; fails=$((fails + 1)); }
   }
@@ -156,6 +158,14 @@ self_test() {
     rc=0 out=$( ("scan_$scan" /dev/null && printf '%s' "${lits-}${archread-}${archpath-}${spawned-}") 2>&1) || rc=$?
     expect "$scan-clean" "$rc $out" "0 "
   done
+  d=$(mktemp -d)
+  printf '%s\n' 'let k = ("blk.", "deepseek2x");' > "$d/a.rs"
+  rc=0 out=$( (scan_lits "$d" && printf '%s' "$lits") 2>&1) || rc=$?
+  expect lits-dot "$rc $out" "0 "
+  printf '%s\n' 'let k = ("blk.", "deepseek2.expert_count");' > "$d/a.rs"
+  rc=0 out=$( (scan_lits "$d" && printf '%s' "$lits") 2>&1) || rc=$?
+  expect lits-key "$rc $out" "0 $d/a.rs:1:let k = (\"blk.\", \"deepseek2.expert_count\");"
+  rm -rf "$d"
   [ "$fails" = 0 ] || { echo "check-arch: self-test: $fails failed" >&2; return 1; }
   echo "check-arch: self-test ok"
 }
