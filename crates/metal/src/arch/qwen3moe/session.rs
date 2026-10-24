@@ -278,10 +278,6 @@ pub struct StepPhase {
 /// settled each token. [`Session::start_step_clock`] starts one; a session
 /// whose clock is off times nothing, and a step of it costs no read.
 pub struct StepClock {
-    /// The GPU clock's seconds minus the host clock's, as the start probe
-    /// read it: the stamps' epoch is the GPU's own, and no system call
-    /// names its difference from the host's.
-    offset: f64,
     /// The committed tokens whose settle has not come, the run-ahead one
     /// deep: two stand at once, the token a call settles and the one it
     /// committed ahead of it. The stamps' buffer handle is not `Sync`, so
@@ -293,9 +289,8 @@ pub struct StepClock {
 }
 
 impl StepClock {
-    fn new(offset: f64) -> Self {
+    fn new() -> Self {
         Self {
-            offset,
             // The run-ahead holds two; a step's commits never grow it.
             pending: Mutex::new(Vec::with_capacity(2)),
             rows: [Phases::default(); MODES],
@@ -343,9 +338,9 @@ impl StepClock {
         let stamps = token.stamps.times(STAMP_WAIT)?;
         let row = &mut self.rows[row_of(mode)];
         row.encode_s += token.encode_s;
-        row.start_s += (stamps.start - self.offset) - token.submitted;
+        row.start_s += stamps.start - token.submitted;
         row.gpu_s += stamps.end - stamps.start;
-        row.wake_s += wake - (stamps.end - self.offset);
+        row.wake_s += wake - stamps.end;
         self.steps[row_of(mode)] += 1;
         Ok(())
     }
@@ -678,19 +673,10 @@ impl Session {
     /// recorded, a row a mode, until the next start. The clock is a
     /// profiling run's instrument; it holds nothing back and clears nothing,
     /// not even at [`Session::reset`], which a caller that wants fresh rows
-    /// starts again past. Its first act is the offset probe: an empty
-    /// command buffer, settled, whose GPU stamps against the host clock at
-    /// its settle fix the difference between the two clocks.
-    pub fn start_step_clock(&mut self) -> Result<(), SessionError> {
-        let mut recording = self.stream.begin()?;
-        drop(recording.compute_encoder()?);
-        let stamps = recording.stamps();
-        let signalled = self.stream.submit_signalled(recording)?;
-        self.stream.settle(signalled)?;
-        let probe = stamps.times(STAMP_WAIT)?;
-        let offset = probe.end - host_secs();
-        self.clock = Some(StepClock::new(offset));
-        Ok(())
+    /// starts again past. The GPU's stamps and the host's reads share one
+    /// clock ([`host_secs`]), so the phases subtract them directly.
+    pub fn start_step_clock(&mut self) {
+        self.clock = Some(StepClock::new());
     }
 
     /// The step clock's phases, when one runs.

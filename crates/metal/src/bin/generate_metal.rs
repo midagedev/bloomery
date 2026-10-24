@@ -148,36 +148,59 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             .map_err(|e| format!("--tokens {s}: {e}"))
     }
 
-    /// A flag this CLI does not know, if one sits among the arguments.
-    /// `--profile` stands alone or takes its count, so it eats the next
-    /// argument only when that one names a count.
-    fn unknown_flag() -> Option<String> {
+    /// The flags that stand alone or take a count.
+    const COUNT_FLAGS: [&str; 2] = ["--profile", "--step-times"];
+
+    /// The flag words among the arguments, in order, each with the count it
+    /// took. A value flag's value is skipped, never read as a flag; a count
+    /// flag eats the next argument only when that one names a count.
+    fn flag_words() -> Vec<(String, Option<usize>)> {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut words = Vec::new();
         let mut i = 0;
         while i < args.len() {
             let a = &args[i];
             if VALUE_FLAGS.contains(&a.as_str()) {
                 i += 2;
-            } else if ["--profile", "--step-times"].contains(&a.as_str()) {
-                i += if args.get(i + 1).is_some_and(|v| v.parse::<usize>().is_ok()) {
-                    2
-                } else {
-                    1
-                };
-            } else if BARE_FLAGS.contains(&a.as_str()) {
-                i += 1;
-            } else {
-                return Some(a.clone());
+                continue;
             }
+            let count = COUNT_FLAGS
+                .contains(&a.as_str())
+                .then(|| args.get(i + 1).and_then(|v| v.parse::<usize>().ok()))
+                .flatten();
+            words.push((a.clone(), count));
+            i += if count.is_some() { 2 } else { 1 };
         }
-        None
+        words
+    }
+
+    /// A flag this CLI does not know, if one sits among the arguments.
+    fn unknown_flag() -> Option<String> {
+        flag_words()
+            .into_iter()
+            .map(|(a, _)| a)
+            .find(|a| !COUNT_FLAGS.contains(&a.as_str()) && !BARE_FLAGS.contains(&a.as_str()))
+    }
+
+    /// Whether the bare flag `name` stands among the flag words.
+    fn has_flag(name: &str) -> bool {
+        flag_words().iter().any(|(a, _)| a == name)
+    }
+
+    /// The count flag `name`'s count, its default when it stands alone; the
+    /// last one wins, as for every flag.
+    fn count_flag(name: &str) -> Option<usize> {
+        flag_words()
+            .into_iter()
+            .rfind(|(a, _)| a == name)
+            .map(|(_, n)| n.unwrap_or(PROFILE_DEFAULT))
     }
 
     fn parse() -> Result<Args, String> {
         if let Some(name) = unknown_flag() {
             return Err(format!("{name} is not a flag of this CLI"));
         }
-        if std::env::args().any(|a| a == "--help") {
+        if has_flag("--help") {
             print!("{USAGE}");
             std::process::exit(0);
         }
@@ -210,25 +233,10 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
                 Some(c)
             }
         };
-        let print_ids = std::env::args().any(|a| a == "--print-ids");
-        // `--profile` stands alone at its default count or takes one; a last
-        // value wins, as for every flag. `--profile-layers` alone implies
-        // the profile.
-        let mut profile_n: Option<usize> = None;
-        {
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            for (i, a) in args.iter().enumerate() {
-                if a != "--profile" {
-                    continue;
-                }
-                let n = args
-                    .get(i + 1)
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(PROFILE_DEFAULT);
-                profile_n = Some(n);
-            }
-        }
-        let layers = std::env::args().any(|a| a == "--profile-layers");
+        let print_ids = has_flag("--print-ids");
+        // `--profile-layers` alone implies the profile.
+        let profile_n = count_flag("--profile");
+        let layers = has_flag("--profile-layers");
         let profile = match (profile_n, layers) {
             (Some(n), l) => {
                 if n == 0 {
@@ -244,22 +252,7 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             }),
             (None, false) => None,
         };
-        // `--step-times` stands alone at its default count or takes one; a
-        // last value wins, as for every flag.
-        let mut step_times: Option<usize> = None;
-        {
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            for (i, a) in args.iter().enumerate() {
-                if a != "--step-times" {
-                    continue;
-                }
-                let n = args
-                    .get(i + 1)
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(PROFILE_DEFAULT);
-                step_times = Some(n);
-            }
-        }
+        let step_times = count_flag("--step-times");
         if step_times == Some(0) {
             return Err(
                 "--step-times 0: a step-times run of no tokens; drop the flag to run none".into(),
@@ -479,15 +472,13 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         let rows = s.ctx() - s.pos() as usize;
         let per = n.min(rows / 3);
         if per == 0 {
-            eprintln!(
-                "step_times: refused: {} rows past position {} hold no token of each of the \
-                 three modes; give --ctx more rows",
-                rows,
+            return Err(format!(
+                "step_times: {rows} rows past position {} hold no token of each of the three \
+                 modes; give --ctx more rows",
                 s.pos()
-            );
-            return Ok(());
+            ));
         }
-        s.start_step_clock().map_err(|e| e.to_string())?;
+        s.start_step_clock();
         let mut pick = id;
         for _ in 0..per {
             pick = s

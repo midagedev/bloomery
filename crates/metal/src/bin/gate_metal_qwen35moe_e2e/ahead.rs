@@ -23,8 +23,8 @@ use bloomery_metal::arch::qwen3moe::count::{Layer, LiveKeys, Ticket, token_count
 use bloomery_metal::arch::qwen3moe::session::{Node, Session, StepMode, StepStats, Stepped};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::library::Library;
+use runtime::Target;
 use runtime::seqstate;
-use runtime::{Out, Target, Want};
 
 use super::sets::{self, Set};
 use super::{CTX, says};
@@ -83,12 +83,7 @@ fn after(s: &mut Session, pick: u32, logits: Vec<u32>) -> Result<After, String> 
             }
         }
     }
-    let mut id = pick;
-    let mut picks = Vec::with_capacity(GREEDY);
-    for _ in 0..GREEDY {
-        id = Target::step(s, id, Want::Argmax).map_err(says)?.argmax();
-        picks.push(id);
-    }
+    let picks = super::keep::greedy(s, pick, GREEDY)?;
     Ok(After {
         pos,
         pick,
@@ -137,10 +132,7 @@ fn host_fed(s: &mut Session, ids: &[u32]) -> Result<After, String> {
 /// The prompt through the target from where the session stands: what it
 /// left.
 fn ahead_on(s: &mut Session, ids: &[u32]) -> Result<After, String> {
-    let (pick, logits) = match Target::prompt(s, ids, Want::Logits).map_err(says)? {
-        Out::Logits { argmax, row } => (argmax, bits(row)),
-        Out::Argmax(_) => return Err("a Want::Logits prompt returned the argmax alone".into()),
-    };
+    let (logits, pick) = super::keep::prompt_bits(s, ids)?;
     after(s, pick, logits)
 }
 
@@ -149,10 +141,7 @@ fn ahead_on(s: &mut Session, ids: &[u32]) -> Result<After, String> {
 fn ahead(s: &mut Session, ids: &[u32]) -> Result<(After, StepStats), String> {
     s.reset().map_err(says)?;
     let before = s.stats();
-    let (pick, logits) = match Target::prompt(s, ids, Want::Logits).map_err(says)? {
-        Out::Logits { argmax, row } => (argmax, bits(row)),
-        Out::Argmax(_) => return Err("a Want::Logits prompt returned the argmax alone".into()),
-    };
+    let (logits, pick) = super::keep::prompt_bits(s, ids)?;
     let moved = super::chain::moved(s, before);
     Ok((after(s, pick, logits)?, moved))
 }

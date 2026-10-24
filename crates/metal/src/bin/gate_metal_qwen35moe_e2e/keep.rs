@@ -56,14 +56,14 @@ fn engine_says(e: serve::EngineError) -> String {
     e.0
 }
 
-fn prompt_bits(s: &mut Session, ids: &[u32]) -> Result<(Vec<u32>, u32), String> {
+pub(super) fn prompt_bits(s: &mut Session, ids: &[u32]) -> Result<(Vec<u32>, u32), String> {
     match Target::prompt(s, ids, Want::Logits).map_err(says)? {
         Out::Logits { argmax, row } => Ok((row.iter().map(|v| v.to_bits()).collect(), argmax)),
         Out::Argmax(_) => Err("a Want::Logits prompt returned the argmax alone".into()),
     }
 }
 
-fn greedy(s: &mut Session, mut id: u32, n: usize) -> Result<Vec<u32>, String> {
+pub(super) fn greedy(s: &mut Session, mut id: u32, n: usize) -> Result<Vec<u32>, String> {
     let mut picks = Vec::with_capacity(n);
     for _ in 0..n {
         id = Target::step(s, id, Want::Argmax).map_err(says)?.argmax();

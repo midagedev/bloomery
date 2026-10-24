@@ -289,11 +289,10 @@ impl GpuStamps {
 /// on some machines and not on others. Read once.
 static TICK_S: OnceLock<f64> = OnceLock::new();
 
-/// The host's seconds on a monotonic clock: macOS's `mach_continuous_time`,
-/// ticks since boot on the continuous timebase — the one that keeps running
-/// through the machine's sleep — scaled by the timebase. The GPU's stamps
-/// are seconds on the GPU's own epoch, which no system call names the
-/// difference from, so the step clock fixes it with a probe.
+/// The host's seconds on the clock the GPU's stamps read: macOS's
+/// `mach_absolute_time`, scaled by the timebase. A command buffer's
+/// `GPUStartTime` and `GPUEndTime` are seconds on this clock, so a stamp and
+/// a host read subtract directly.
 pub(crate) fn host_secs() -> f64 {
     #[repr(C)]
     struct Timebase {
@@ -301,7 +300,7 @@ pub(crate) fn host_secs() -> f64 {
         denom: u32,
     }
     unsafe extern "C" {
-        fn mach_continuous_time() -> u64;
+        fn mach_absolute_time() -> u64;
         fn mach_timebase_info(info: *mut Timebase) -> i32;
     }
     let per_tick = *TICK_S.get_or_init(|| {
@@ -317,9 +316,9 @@ pub(crate) fn host_secs() -> f64 {
         );
         f64::from(tb.numer) / f64::from(tb.denom) / 1e9
     });
-    // SAFETY: `mach_continuous_time` is libSystem's clock read, declared
+    // SAFETY: `mach_absolute_time` is libSystem's clock read, declared
     // above; it takes no arguments and writes nothing.
-    (unsafe { mach_continuous_time() } as f64) * per_tick
+    (unsafe { mach_absolute_time() } as f64) * per_tick
 }
 
 impl MetalStream {
