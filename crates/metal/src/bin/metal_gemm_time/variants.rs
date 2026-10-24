@@ -237,6 +237,84 @@ pub const VARIANTS: &[Variant] = &[
     },
 ];
 
+/// The routed mode's variants: edits of the grouped GEMM (`gemm_routed.metal`)
+/// and its table (`route.metal`). `acts` is the table's tile height the
+/// edited source cuts; `rows` the tile's weight rows.
+pub const ROUTED: &[Variant] = &[
+    Variant {
+        name: "rnomma",
+        what: "no multiply: the staging and the barriers, each thread reading its own staged run back",
+        edits: &[(
+            "        for (short kk = 0; kk < BK; kk += 8) {\n            simdgroup_barrier(mem_flags::mem_none);\n            vec<float, 2> af[NA];",
+            "        FOR_UNROLL(short q = 0; q < 16; ++q) {\n            c[0][0].x += float(sa[(tiitg / 2) * LDA + (tiitg % 2) * 16 + q]);\n            c[0][0].y += float(sb[((tiitg / 2) % ROUTED_ACTS) * LDA + (tiitg % 2) * 16 + q]);\n        }\n        for (short kk = 0; kk < 0; kk += 8) {\n            simdgroup_barrier(mem_flags::mem_none);\n            vec<float, 2> af[NA];",
+        )],
+        swap_grid: false,
+        rows: 64,
+        acts: 64,
+    },
+    Variant {
+        name: "rnostage",
+        what: "no staging: the K loop's two barriers and the multiply, over a tile nobody refills",
+        edits: &[
+            (
+                "        if (b_stage) {\n            device const float * xr = b_src + k0;",
+                "        if (false) {\n            device const float * xr = b_src + k0;",
+            ),
+            (
+                "        FOR_UNROLL(short i = 0; i < 4; ++i) {\n            ad[i]",
+                "        FOR_UNROLL(short i = 0; i < 0; ++i) {\n            ad[i]",
+            ),
+        ],
+        swap_grid: false,
+        rows: 64,
+        acts: 64,
+    },
+    Variant {
+        name: "rnoa",
+        what: "no weight staging (the dequant and its loads gone); the activations still stage",
+        edits: &[(
+            "        FOR_UNROLL(short i = 0; i < 4; ++i) {\n            ad[i]",
+            "        FOR_UNROLL(short i = 0; i < 0; ++i) {\n            ad[i]",
+        )],
+        swap_grid: false,
+        rows: 64,
+        acts: 64,
+    },
+    Variant {
+        name: "rnob",
+        what: "no activation staging (the loads and the cast gone); the weights still stage",
+        edits: &[(
+            "        if (b_stage) {\n            device const float * xr = b_src + k0;",
+            "        if (false) {\n            device const float * xr = b_src + k0;",
+        )],
+        swap_grid: false,
+        rows: 64,
+        acts: 64,
+    },
+    Variant {
+        name: "rdb",
+        what: "two staged tiles: step k+1 stages while step k multiplies, one barrier a K step (f16 arm only: the f32 arm's two tiles pass 32 KB)",
+        edits: &[
+            (
+                "    return (ROUTED_ROWS + ROUTED_ACTS) * gemm_lda<T>() * (int)sizeof(T);",
+                "    return 2 * (ROUTED_ROWS + ROUTED_ACTS) * gemm_lda<T>() * (int)sizeof(T);",
+            ),
+            (
+                "    for (int k0 = 0; k0 < (int)args.cols; k0 += BK) {\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n        stage(k0, 0);\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n        multiply(0);\n    }",
+                "    constexpr int TILE = (ROUTED_ROWS + ROUTED_ACTS) * LDA;\n    stage(0, 0);\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n    int at = 0;\n    for (int k0 = 0; k0 < (int)args.cols; k0 += BK) {\n        if (k0 + BK < (int)args.cols) {\n            stage(k0 + BK, TILE - at);\n        }\n        multiply(at);\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n        at = TILE - at;\n    }",
+            ),
+        ],
+        swap_grid: false,
+        rows: 64,
+        acts: 64,
+    },
+];
+
+/// The routed variant named `name`.
+pub fn find_routed(name: &str) -> Option<&'static Variant> {
+    ROUTED.iter().find(|v| v.name == name)
+}
+
 /// The variant named `name`.
 pub fn find(name: &str) -> Option<&'static Variant> {
     VARIANTS.iter().find(|v| v.name == name)

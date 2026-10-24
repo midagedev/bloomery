@@ -53,6 +53,10 @@
 //! shapes, any N, K and R), `--pipelines` (print each pipeline's thread
 //! limit and exit), `--peak` (time the machine's own ruler,
 //! `probe_peak.metal`, and exit), `--help`.
+//!
+//! `--routed` times the experts' grouped GEMM over a route table instead of
+//! the dense shapes (`routed.rs`, with its own `--rows`, `--skew` and
+//! `--hot`).
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -81,6 +85,7 @@ mod oracle;
 mod synthetic;
 
 mod mlx;
+mod routed;
 mod variants;
 
 /// The ruler's kernels, compiled into a library of their own.
@@ -265,7 +270,8 @@ fn run() -> Result<(), String> {
     if args.iter().any(|a| a == "--help") {
         println!(
             "metal_gemm_time [--trials N] [--warmups N] [--gflop N] [--arm NAME]... \
-             [--only SUBSTRING]... [--quant NAME]... [--shape N:K:R]... [--copies N] [--trace] [--warm-ms N] [--hash] [--pipelines]"
+             [--only SUBSTRING]... [--quant NAME]... [--shape N:K:R]... [--copies N] [--trace] [--warm-ms N] [--hash] [--pipelines]\n\
+             metal_gemm_time --routed [--rows U]... [--skew S]... [--arm NAME]... [--hot] [--trials N] [--hash]"
         );
         return Ok(());
     }
@@ -279,6 +285,8 @@ fn run() -> Result<(), String> {
         "--arm",
         "--quant",
         "--shape",
+        "--rows",
+        "--skew",
     ] {
         if let Some(None) = flag(&args, name) {
             return Err(format!("{name} takes a value"));
@@ -328,12 +336,20 @@ fn run() -> Result<(), String> {
             }
         })
         .collect::<Result<_, _>>()?;
-    let mut arms: Vec<Arm> = args
-        .windows(2)
-        .filter(|w| w[0] == "--arm")
-        .map(|w| Arm::parse(&w[1]))
-        .collect::<Result<_, _>>()?;
-    if arms.is_empty() {
+    let routed = args
+        .iter()
+        .any(|a| a == "--routed")
+        .then(|| routed_opts(&args))
+        .transpose()?;
+    let mut arms: Vec<Arm> = if routed.is_some() {
+        Vec::new()
+    } else {
+        args.windows(2)
+            .filter(|w| w[0] == "--arm")
+            .map(|w| Arm::parse(&w[1]))
+            .collect::<Result<_, _>>()?
+    };
+    if arms.is_empty() && routed.is_none() {
         arms = vec![Arm::Engine(Operand::F16), Arm::Engine(Operand::F32)];
     }
 
@@ -376,6 +392,9 @@ fn run() -> Result<(), String> {
         kernels: &kernels,
         method,
     };
+    if let Some(opts) = &routed {
+        return routed::run(&ctx, opts);
+    }
     for quant in [Quant::Q4K, Quant::Q6K, Quant::A4] {
         if !quants.is_empty() && !quants.iter().any(|q| q == quant.name()) {
             continue;
@@ -401,6 +420,51 @@ fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The routed mode's flags: `--rows U` and `--skew S` (repeatable), the
+/// routed arms by `--arm`, `--hot`.
+fn routed_opts(args: &[String]) -> Result<routed::Opts, String> {
+    let values = |name: &str| -> Vec<&str> {
+        args.windows(2)
+            .filter(|w| w[0] == name)
+            .map(|w| w[1].as_str())
+            .collect()
+    };
+    let mut rows: Vec<usize> = values("--rows")
+        .iter()
+        .map(|v| {
+            v.parse()
+                .ok()
+                .filter(|&u: &usize| u > 0)
+                .ok_or(format!("--rows takes a positive whole number, not {v}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if rows.is_empty() {
+        rows = vec![512, 2048];
+    }
+    let mut skews: Vec<f64> = values("--skew")
+        .iter()
+        .map(|v| {
+            v.parse()
+                .ok()
+                .filter(|s: &f64| s.is_finite() && *s >= 0.0)
+                .ok_or(format!("--skew takes a number at least 0, not {v}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if skews.is_empty() {
+        skews = vec![0.0];
+    }
+    let mut arms: Vec<String> = values("--arm").iter().map(|v| (*v).to_string()).collect();
+    if arms.is_empty() {
+        arms = vec!["ship".to_string()];
+    }
+    Ok(routed::Opts {
+        rows,
+        skews,
+        arms,
+        hot: args.iter().any(|a| a == "--hot"),
+    })
 }
 
 /// Print each arm's pipeline thread limit: the register file's answer to
