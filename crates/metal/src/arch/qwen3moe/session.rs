@@ -657,8 +657,9 @@ impl Session {
         let residency = stream
             .residency()
             .ok_or_else(|| refuse("the stream made no residency set"))?;
+        let staged = residency.stage();
         let arena = Arena::open(
-            Alloc::new(device.metal(), residency),
+            Alloc::new(device.metal(), &staged),
             &split,
             &spec,
             &plans,
@@ -666,7 +667,7 @@ impl Session {
         )?;
         // The open waits for the driver to wire the arena, so the first token
         // finds it resident.
-        residency.commit();
+        staged.commit();
         let ctx_positions = u32::try_from(arena.ctx).map_err(|_| {
             refuse(format!(
                 "a cache of {} rows: more than a u32 position names",
@@ -973,13 +974,14 @@ impl Session {
                 .stream
                 .residency()
                 .ok_or_else(|| refuse("the stream has no residency set"))?;
-            self.rows = Some(RowsArena::open(
-                Alloc::new(&self.device, residency),
-                &self.arena,
-                cap,
-            )?);
-            residency.commit();
+            let staged = residency.stage();
+            let rows = RowsArena::open(Alloc::new(&self.device, &staged), &self.arena, cap)?;
+            staged.commit();
+            self.rows = Some(rows);
         }
+        // Built before the first op commits, so a refused build leaves the
+        // state, rings and cache as they were.
+        self.kernels.prepare_prefill()?;
         let rows = self
             .rows
             .as_mut()

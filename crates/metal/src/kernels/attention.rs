@@ -752,6 +752,13 @@ impl Kernels {
         encoder.dispatch_groups(groups, p.rows, FLASH_THREADS)
     }
 
+    /// Build the prefill attention's pipeline if no launch has built it yet. A
+    /// pass calls it before it commits its first op, so a refused build
+    /// leaves nothing of the pass on the device.
+    pub fn prepare_prefill(&self) -> Result<(), DeviceError> {
+        self.attention.prefill().map(|_| ())
+    }
+
     /// Encode the prefill attention over a chunk of rows: the append of every
     /// row's key and value (the rows launch's own), a memory barrier, and the
     /// simdgroup-matrix flash, one threadgroup a key head and
@@ -766,6 +773,7 @@ impl Kernels {
         p: AttentionPrefillParams<'_>,
     ) -> Result<(), DeviceError> {
         let args = checked_prefill(&p)?;
+        let flash = self.attention.prefill()?;
         let AttnCache::F16 {
             k: cache_k,
             v: cache_v,
@@ -785,7 +793,7 @@ impl Kernels {
         encoder.dispatch_groups(KV_HEADS, p.rows, SIMD_WIDTH)?;
 
         encoder.memory_barrier();
-        encoder.set_pipeline(self.attention.prefill()?);
+        encoder.set_pipeline(flash);
         encoder.set_binding(0, Binding::of(&p.q)?)?;
         encoder.set_binding(1, Binding::of(&p.q_gain)?)?;
         encoder.set_binding(2, Binding::of(&p.rope)?)?;

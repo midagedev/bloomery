@@ -512,12 +512,6 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
             .unwrap_or_else(|| panic!("generate_metal: the kind {kind:?} sits in no kind table"))
     }
 
-    /// The `step_times` lines: `n` tokens in each mode past the run —
-    /// host-fed and chain greedy, ahead on one id throughout, so every token
-    /// ahead is kept — the step clock's phases averaged a mode and printed
-    /// as one line, then the count. The lines are development-loop numbers,
-    /// like the summary's: the three runs sit at three depths, a mode's
-    /// attention reading a few keys more than the mode before it.
     /// The pass over the first `u` ids of the prompt with every op on a
     /// command buffer of its own, waited before the next is committed: the
     /// op's GPU seconds are its own and never a queued buffer's overlap. One
@@ -595,6 +589,12 @@ generate_metal (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids]
         Ok(())
     }
 
+    /// The `step_times` lines: `n` tokens in each mode past the run —
+    /// host-fed and chain greedy, ahead on one id throughout, so every token
+    /// ahead is kept — the step clock's phases averaged a mode and printed
+    /// as one line, then the count. The lines are development-loop numbers,
+    /// like the summary's: the three runs sit at three depths, a mode's
+    /// attention reading a few keys more than the mode before it.
     fn step_times_run(s: &mut Session, n: usize, id: u32) -> Result<(), String> {
         let rows = s.ctx() - s.pos() as usize;
         let per = n.min(rows / 3);

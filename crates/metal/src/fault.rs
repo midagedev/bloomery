@@ -39,7 +39,7 @@ impl MetalFaultWord {
         Ok(word)
     }
 
-    /// A fault word registered into the residency set `alloc` names, clean.
+    /// A fault word staged for the residency set through `alloc`, clean.
     pub(crate) fn registered(alloc: Alloc<'_>) -> Result<Self, DeviceError> {
         let word = Self {
             buffer: alloc.buffer(Elems(FAULT_WORDS))?,

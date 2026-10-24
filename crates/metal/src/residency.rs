@@ -16,16 +16,22 @@
 //! buffers are registered where a session allocates them ([`Alloc`]): a
 //! buffer a kernel binds that was made outside an [`Alloc`] is not in the
 //! set, which `Session::residency` shows as bytes short of what the device
-//! holds (the `r_resident` clause).
+//! holds (the `r_resident` clause). An [`Alloc`] stages its buffers
+//! ([`Staged`]) and they join the set only when the open that made them
+//! commits: an open that fails leaves the set as it was.
 
+use core::cell::RefCell;
 use core::time::Duration;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use objc2::Message;
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLAllocation, MTLCommandQueue, MTLDevice, MTLResidencySet, MTLResidencySetDescriptor,
+    MTLAllocation, MTLBuffer, MTLCommandQueue, MTLDevice, MTLResidencySet,
+    MTLResidencySetDescriptor,
 };
 
 use bloomery_device::{DeviceError, Elem, Elems};
@@ -89,19 +95,24 @@ impl Residency {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// `buffer` staged into the set; it is resident after the next
-    /// [`Residency::commit`].
-    fn add<T: Elem>(&self, buffer: &MetalBuffer<T>) {
-        let allocation: &ProtocolObject<dyn MTLAllocation> =
-            ProtocolObject::from_ref(buffer.metal());
-        self.set().0.addAllocation(allocation);
+    /// An empty staging list for an open's buffers.
+    pub(crate) fn stage(&self) -> Staged<'_> {
+        Staged {
+            residency: self,
+            buffers: RefCell::new(Vec::new()),
+        }
     }
 
-    /// The staged buffers made part of the set and the set requested
-    /// resident. This returns once the driver has wired them, which is what
-    /// an open waits for.
-    pub fn commit(&self) {
+    /// `buffers` made part of the set and the set requested resident. This
+    /// returns once the driver has wired them, which is what an open waits
+    /// for.
+    fn commit(&self, buffers: &[Retained<ProtocolObject<dyn MTLBuffer>>]) {
         let set = self.set();
+        for buffer in buffers {
+            let allocation: &ProtocolObject<dyn MTLAllocation> =
+                ProtocolObject::from_ref(&**buffer);
+            set.0.addAllocation(allocation);
+        }
         set.0.commit();
         set.0.requestResidency();
         drop(set);
@@ -149,24 +160,43 @@ impl Drop for Residency {
     }
 }
 
+/// The buffers an open has made, held back from the set until the open
+/// succeeds: [`Staged::commit`] adds them and requests the set resident, and
+/// a list dropped uncommitted adds nothing.
+pub(crate) struct Staged<'a> {
+    residency: &'a Residency,
+    buffers: RefCell<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+}
+
+impl Staged<'_> {
+    /// The staged buffers made part of the set, and the set requested
+    /// resident.
+    pub(crate) fn commit(self) {
+        self.residency.commit(&self.buffers.into_inner());
+    }
+}
+
 /// Where a session allocates the buffers its kernels bind: the device, and
-/// the stream's residency set each buffer is registered into.
+/// the staging list of the stream's residency set each buffer joins.
 #[derive(Clone, Copy)]
 pub(crate) struct Alloc<'a> {
     device: &'a ProtocolObject<dyn MTLDevice>,
-    residency: &'a Residency,
+    staged: &'a Staged<'a>,
 }
 
 impl<'a> Alloc<'a> {
-    pub(crate) fn new(device: &'a ProtocolObject<dyn MTLDevice>, residency: &'a Residency) -> Self {
-        Self { device, residency }
+    pub(crate) fn new(device: &'a ProtocolObject<dyn MTLDevice>, staged: &'a Staged<'a>) -> Self {
+        Self { device, staged }
     }
 
-    /// A buffer of `n` elements, contents undefined, registered into the set
-    /// (resident at the next [`Residency::commit`]).
+    /// A buffer of `n` elements, contents undefined, staged for the set
+    /// (resident once the open's [`Staged::commit`] runs).
     pub(crate) fn buffer<T: Elem>(&self, n: Elems) -> Result<MetalBuffer<T>, DeviceError> {
         let buffer = MetalBuffer::new(self.device, n)?;
-        self.residency.add(&buffer);
+        self.staged
+            .buffers
+            .borrow_mut()
+            .push(buffer.metal().retain());
         Ok(buffer)
     }
 }
