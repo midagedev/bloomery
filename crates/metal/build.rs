@@ -254,6 +254,7 @@ fn main() {
         "probe",
         "norm",
         "quant",
+        "gemm",
         "matvec_q4k",
         "matvec_q6k",
         "matvec_a4",

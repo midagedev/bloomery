@@ -684,6 +684,102 @@ pub const MUTANTS: &[Mutant] = &[
             1,
         )],
     },
+    Mutant {
+        name: "gemm_k_tail",
+        clause: "gemm_q6k_store",
+        why: "the tile loop's last K step is skipped, so a block pair of every row is missing",
+        edits: &[(
+            "for (int k0 = 0; k0 < cols; k0 += BK) {",
+            "for (int k0 = 0; k0 + BK < cols; k0 += BK) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_il_swap",
+        clause: "gemm_q4k_store",
+        why: "two 16-value halves of a Q4_K chunk are swapped in the dequant",
+        edits: &[(
+            "const uchar2 pair = as_type<uchar2>((ushort)(q[i] & mask));",
+            "const uchar2 pair = as_type<uchar2>((ushort)(q[(i + 4) % 8] & mask));",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_q4_mask",
+        clause: "gemm_q4k_store",
+        why: "a chunk's nibble side is the other one: the high-nibble chunks read the low nibbles and the reverse",
+        edits: &[(
+            "const ushort mask = (il & 2) == 0 ? 0x0F0F : 0xF0F0;",
+            "const ushort mask = (il & 2) == 0 ? 0xF0F0 : 0x0F0F;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_q6_hi_shift",
+        clause: "gemm_q6k_store",
+        why: "the 6-bit codes take their two high bits from the wrong field of qh: the shift of the chunk's field is dropped",
+        edits: &[(
+            "const ushort hi = (ushort)((qh[i] >> shift) & 0x0303);",
+            "const ushort hi = (ushort)((qh[i] >> 0) & 0x0303);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_q6_offset",
+        clause: "gemm_q6k_store",
+        why: "the 6-bit codes are centred on 31, not 32, so every weight is off by one scale step",
+        edits: &[(
+            "const float offset = -32.f * dsc;",
+            "const float offset = -31.f * dsc;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_row_edge",
+        clause: "gemm_a4_store",
+        why: "the bounded store ignores the weight-column bound, so a tail tile's dead columns are written",
+        edits: &[("if (n < nr0) {", "if (n < GEMM_ROWS) {", 1)],
+    },
+    Mutant {
+        name: "gemm_act_edge",
+        clause: "gemm_q4k_store",
+        why: "the activation rows past the last read past their window",
+        edits: &[(
+            "const short row = min((short)(c0 / CHUNKS), (short)(nr1 - 1));",
+            "const short row = (short)(c0 / CHUNKS);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_frag_swap",
+        clause: "gemm_q6k_store",
+        why: "a B fragment's two weight-row values swap places, so every product pairs w[r+1] with x's row r",
+        edits: &[(
+            "bh[j] = vec<half, 2>(brow[j][kk], (brow[j] + LDA)[kk]);",
+            "bh[j] = vec<half, 2>((brow[j] + LDA)[kk], brow[j][kk]);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_store_interleave",
+        clause: "gemm_q4k_store",
+        why: "the bounded store drops its SIMD group's across offset, so half the tile's columns land 8 places off and past the window",
+        edits: &[(
+            "const short n = gn + 16 * j + fn;",
+            "const short n = 16 * j + fn;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "gemm_range_off",
+        clause: "gemm_range",
+        why: "the f16 operand's range check is gone, so an activation past the half range casts to inf",
+        edits: &[(
+            "const bool4 bad = !(fabs(v) <= 65504.f);",
+            "const bool4 bad = bool4(false);",
+            1,
+        )],
+    },
 ];
 
 /// The mutant of this name.

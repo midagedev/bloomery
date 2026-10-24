@@ -1,0 +1,1348 @@
+//! The GEMM clauses: the dense quantized dot of R activation rows against
+//! the fixture's real tensors, every weight type, both operand arms and both
+//! epilogues, held to the f64 oracle's band; the segmented dispatch
+//! bit-equal to its segments' own single launches; the f16 operand's range
+//! fault; and the launch module's refusals.
+//!
+//! # The band
+//!
+//! The oracle is `crates/gguf`'s dequantization of the same blocks with an
+//! f64 dot, as the mat-vec clauses' (`super::oracle`); the band is the same
+//! model over the GEMM's own evaluation tree:
+//!
+//! - every weight value carries its owner's dequant arithmetic in f32: four
+//!   roundings for Q4_K (`d·sc`, `·q`, `dmin·min`, the subtraction), two for
+//!   Q6_K (`d·sc`, `·(q−32)`) and two for A4 (`s·q`, `+b`);
+//! - the f32 operand's product rounds once; the f16 operand's two casts
+//!   round once each into half (2^-11 relative) and their products are exact
+//!   in the f32 accumulator (two eleven-bit mantissas);
+//! - the accumulation is the tile's K/8 simdgroup instructions, each
+//!   accumulating its eight-product dot in f32: a term passes its own
+//!   instruction's dot (at worst eight roundings, the sequential order) and
+//!   every later instruction's accumulate, so K/8 + 8 roundings;
+//! - the staged round-trip through threadgroup memory is exact (the same
+//!   values), and the residual epilogue adds one rounding of the sum,
+//!   `U |y|`, as the mat-vec's residual kind. The path's operations are the
+//!   absolute floor's count, as the oracle's.
+//!
+//! So the f32 arm's factor is `G(base + 1 + K/8 + 8)` and the f16 arm's is
+//! `(1 + 2^-11)² (1 + G(base + K/8 + 8)) − 1`, both over the oracle's
+//! magnitude sum. The f16 arm carries two absolute terms besides: a cast
+//! into the subnormal range rounds on the subnormal grid (spacing 2^-24),
+//! so its error is at most 2^-25 whatever the magnitude — the weights' side
+//! sums to `2^-25 Σ_c |x_c|` and the activations' to `2^-25 Σ_c |w_c|`. The
+//! design's power-of-two prescale producer keeps the activations out of the
+//! subnormal range (their amax in [2^14, 2^15)); it is not here yet, so both
+//! sides are in the band. A value past the half range is a fault, not a band
+//! case.
+
+use bloomery_device::conformance::{Clause, Verdict, why};
+use bloomery_device::fault::FaultSite;
+use bloomery_device::{Buffer, Device, DeviceError, Elems};
+use bloomery_metal::kernels::{
+    GEMM_ACTS, GemmMode, GemmParams, GemmSegParams, Operand, Quant, Segment,
+};
+use gguf::quant::dequant_row;
+
+use super::common::{self, BadArg, Edit, LAYER};
+use super::fixture::Fixture;
+use super::oracle::{self, U};
+use super::{Harness, SENTINEL_BITS};
+
+/// The half operand's cast rounds once, relatively.
+const HALF_ROUND: f64 = 1.0 / 2048.0;
+
+/// The most absolute error of a cast into the f16 subnormal range: half the
+/// grid's spacing.
+const HALF_SUBNORMAL: f64 = 1.0 / 33_554_432.0;
+
+/// The words the output buffer holds before its window, so a store before
+/// the window's first row lands on them and the guard sees it.
+const Y_GUARD: usize = 8;
+
+/// The words the output buffer holds past its window: an edge tile's store
+/// can run up to a tile's width past the matrix's last column, so a store
+/// past the last column lands here, inside the buffer, and the guard sees
+/// it.
+const Y_TAIL: usize = 72;
+
+/// One GEMM launch of the gate: the shape, the windows' contents and the
+/// arm.
+pub struct GemmLaunch<'a> {
+    pub quant: Quant,
+    /// The weight rows N, the output's columns.
+    pub rows: usize,
+    /// The input columns K.
+    pub cols: usize,
+    /// The activation rows R, the output's rows.
+    pub acts: usize,
+    pub weights: &'a [u8],
+    /// The activations: `acts` rows of `x_stride`, `cols` live in each.
+    pub x: &'a [f32],
+    pub x_stride: usize,
+    /// The output before the launch: `acts` rows of `y_stride`, `rows` live
+    /// in each.
+    pub y0: &'a [f32],
+    pub y_stride: usize,
+    pub mode: GemmMode,
+    pub operand: Operand,
+}
+
+fn padded<T: Copy>(pad: T, before: usize, body: &[T], after: usize) -> Vec<T> {
+    let mut out = vec![pad; before];
+    out.extend_from_slice(body);
+    out.extend(std::iter::repeat_n(pad, after));
+    out
+}
+
+/// Run `launch` and read the output window back, after checking that the
+/// words around the window are as they were. The activation buffer carries
+/// a tile's worth of sentinel rows past its window: the staging clamp never
+/// reads them, and a read past the last row lands on them, not outside the
+/// buffer.
+pub fn launch_gemm(h: &Harness<'_>, launch: &GemmLaunch<'_>) -> Result<Vec<f32>, String> {
+    let (device, stream) = (h.device, h.stream);
+    let sentinel = f32::from_bits(SENTINEL_BITS);
+    let weights = padded(
+        0xFFu8,
+        super::WEIGHT_PAD,
+        launch.weights,
+        super::WEIGHT_TAIL,
+    );
+    let weights = device.upload(stream, &weights).map_err(why)?;
+    let x_pad = GEMM_ACTS * launch.x_stride + launch.cols;
+    let x_words = padded(sentinel, super::VALUE_PAD, launch.x, x_pad);
+    let x = device.upload(stream, &x_words).map_err(why)?;
+    let y_words = padded(sentinel, Y_GUARD, launch.y0, Y_TAIL);
+    let mut y = device.upload(stream, &y_words).map_err(why)?;
+    let x_len = (launch.acts - 1) * launch.x_stride + launch.cols;
+    let y_len = (launch.acts - 1) * launch.y_stride + launch.rows;
+    let params = GemmParams {
+        quant: launch.quant,
+        rows: launch.rows,
+        cols: launch.cols,
+        acts: launch.acts,
+        weights: weights
+            .window(Elems(super::WEIGHT_PAD), Elems(launch.weights.len()))
+            .map_err(why)?,
+        x: x.window(Elems(super::VALUE_PAD), Elems(x_len))
+            .map_err(why)?,
+        x_stride: launch.x_stride,
+        y: y.window_mut(Elems(Y_GUARD), Elems(y_len)).map_err(why)?,
+        y_stride: launch.y_stride,
+        mode: launch.mode,
+        operand: launch.operand,
+        fault: device.fault_word(),
+        layer: LAYER,
+    };
+    h.encode(|encoder| h.kernels.gemm(encoder, params))?;
+    let mut back = vec![0f32; y_len + Y_GUARD + Y_TAIL];
+    device
+        .read(stream, y.whole().map_err(why)?, &mut back)
+        .map_err(why)?;
+    check_guards(&back, y_len)?;
+    Ok(back[Y_GUARD..Y_GUARD + y_len].to_vec())
+}
+
+/// One segmented GEMM launch of the gate: the segments' weights side by side
+/// in one buffer, their rows at their own column offsets in one output.
+pub struct GemmSegLaunch<'a> {
+    pub quant: Quant,
+    /// The input columns, the same for every segment.
+    pub cols: usize,
+    /// The activation rows R, the output's rows.
+    pub acts: usize,
+    /// The segments: the weight rows of one tensor and the bytes of its
+    /// weights.
+    pub segments: Vec<(usize, &'a [u8])>,
+    pub x: &'a [f32],
+    pub y0: &'a [f32],
+    pub y_stride: usize,
+    pub mode: GemmMode,
+    pub operand: Operand,
+}
+
+/// Run `launch` and read the output window back, after checking the words
+/// around it are as they were ([`launch_gemm`]'s own guards).
+pub fn launch_gemm_seg(h: &Harness<'_>, launch: &GemmSegLaunch<'_>) -> Result<Vec<f32>, String> {
+    let (device, stream) = (h.device, h.stream);
+    let sentinel = f32::from_bits(SENTINEL_BITS);
+    let block = launch.quant.block_bytes();
+    let (cols, acts) = (launch.cols, launch.acts);
+    let mut weights: Vec<u8> = Vec::new();
+    let mut list: Vec<Segment> = Vec::new();
+    let mut out_offset = 0usize;
+    for (rows, bytes) in &launch.segments {
+        list.push(Segment {
+            cols,
+            rows: *rows,
+            weight_blocks: weights.len() / block,
+            out_offset,
+        });
+        weights.extend_from_slice(bytes);
+        out_offset += rows;
+    }
+    let weight_bytes = weights.len();
+    let x_len = acts * cols;
+    let y_len = (acts - 1) * launch.y_stride + out_offset;
+    let weights = padded(0xFFu8, super::WEIGHT_PAD, &weights, super::WEIGHT_TAIL);
+    let weights = device.upload(stream, &weights).map_err(why)?;
+    let x_pad = GEMM_ACTS * cols + cols;
+    let x_words = padded(sentinel, super::VALUE_PAD, launch.x, x_pad);
+    let x = device.upload(stream, &x_words).map_err(why)?;
+    let y_words = padded(sentinel, Y_GUARD, launch.y0, Y_TAIL);
+    let mut y = device.upload(stream, &y_words).map_err(why)?;
+    let params = GemmSegParams {
+        quant: launch.quant,
+        segments: &list,
+        weights: weights
+            .window(Elems(super::WEIGHT_PAD), Elems(weight_bytes))
+            .map_err(why)?,
+        x: x.window(Elems(super::VALUE_PAD), Elems(x_len))
+            .map_err(why)?,
+        x_stride: cols,
+        y: y.window_mut(Elems(Y_GUARD), Elems(y_len)).map_err(why)?,
+        y_stride: launch.y_stride,
+        acts,
+        mode: launch.mode,
+        operand: launch.operand,
+        fault: device.fault_word(),
+        layer: LAYER,
+    };
+    h.encode(|encoder| h.kernels.gemm_seg(encoder, params))?;
+    let mut back = vec![0f32; y_len + Y_GUARD + Y_TAIL];
+    device
+        .read(stream, y.whole().map_err(why)?, &mut back)
+        .map_err(why)?;
+    check_guards(&back, y_len)?;
+    Ok(back[Y_GUARD..Y_GUARD + y_len].to_vec())
+}
+
+/// The words either side of the output window are still the sentinel.
+fn check_guards(back: &[f32], y_len: usize) -> Result<(), String> {
+    let sides = back[..Y_GUARD].iter().chain(&back[Y_GUARD + y_len..]);
+    for (i, v) in sides.enumerate() {
+        if v.to_bits() != SENTINEL_BITS {
+            return Err(format!(
+                "a word {} the output window was written: {v:?}",
+                if i < Y_GUARD { "before" } else { "past" }
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Σ|w_c| per output column, in f64 over the reader's dequantized row: the
+/// f16 operand's subnormal-cast absolute term's activation side.
+fn weight_abs_sums(
+    quant: Quant,
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f64>, String> {
+    let row_bytes = cols / quant.values_per_block() * quant.block_bytes();
+    let mut w = vec![0f32; cols];
+    let mut out = Vec::with_capacity(rows);
+    for row in weights.chunks_exact(row_bytes) {
+        dequant_row(quant.ggml(), row, &mut w).map_err(|e| format!("dequantizing a row: {e}"))?;
+        out.push(w.iter().map(|&v| f64::from(v).abs()).sum());
+    }
+    Ok(out)
+}
+
+/// The GEMM's band: the relative factor over the oracle's magnitude sum and
+/// the operations of the longest path (the absolute floor's count). The
+/// derivation is this module's doc's.
+fn gemm_band(quant: Quant, cols: usize, operand: Operand) -> (f64, usize) {
+    let base = match quant {
+        Quant::Q4K => 4,
+        Quant::Q6K | Quant::A4 => 2,
+    };
+    let acc = cols / 8 + 8;
+    match operand {
+        Operand::F32 => {
+            let n = base + 1 + acc;
+            (oracle::gamma_bound(n), n)
+        }
+        Operand::F16 => {
+            let n = base + acc;
+            (
+                (1.0 + HALF_ROUND) * (1.0 + HALF_ROUND) * (1.0 + oracle::gamma_bound(n)) - 1.0,
+                n,
+            )
+        }
+    }
+}
+
+/// Run `launch`, hold every output element to the oracle's band, and return
+/// the worst ratio of the error to the band. `w_abs` is
+/// [`weight_abs_sums`]'s, over the same weights.
+fn run_checked(h: &Harness<'_>, launch: &GemmLaunch<'_>, w_abs: &[f64]) -> Result<f64, String> {
+    let got = launch_gemm(h, launch)?;
+    common::expect_clean(h, "the gemm launch")?;
+    check_rows(launch, &got, w_abs, None)
+}
+
+/// The band check of `got` against the oracle, row by row: `skip` names the
+/// one row whose band is not checked (the range clause's, whose outputs are
+/// NaN by contract).
+fn check_rows(
+    launch: &GemmLaunch<'_>,
+    got: &[f32],
+    w_abs: &[f64],
+    skip: Option<usize>,
+) -> Result<f64, String> {
+    let (factor, ops) = gemm_band(launch.quant, launch.cols, launch.operand);
+    let floor = ops as f64 * f64::from(f32::MIN_POSITIVE);
+    let mut worst = 0f64;
+    for r in 0..launch.acts {
+        if skip == Some(r) {
+            continue;
+        }
+        let row = &launch.x[r * launch.x_stride..r * launch.x_stride + launch.cols];
+        let x_f64: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+        let x_abs: f64 = x_f64.iter().map(|v| v.abs()).sum();
+        let reference = oracle::reference(
+            launch.quant,
+            launch.weights,
+            launch.rows,
+            launch.cols,
+            &x_f64,
+        )?;
+        for n in 0..launch.rows {
+            let at = r * launch.y_stride + n;
+            let carried = match launch.mode {
+                GemmMode::Store => 0.0,
+                GemmMode::Residual => f64::from(launch.y0[at]),
+            };
+            let want = carried + reference.y[n];
+            let resid = match launch.mode {
+                GemmMode::Store => 0.0,
+                GemmMode::Residual => U * want.abs(),
+            };
+            let width = factor * reference.magnitude[n] * (1.0 + U)
+                + HALF_SUBNORMAL * (x_abs + w_abs[n])
+                + resid
+                + floor;
+            let err = (f64::from(got[at]) - want).abs();
+            if !got[at].is_finite() || err > width {
+                return Err(format!(
+                    "row {r} column {n}: got {:e}, want {want:e}, error {err:e} over the band {width:e}",
+                    got[at]
+                ));
+            }
+            worst = worst.max(err / width);
+        }
+    }
+    Ok(worst)
+}
+
+/// One case of a store or resid clause: the tensor's bytes, its shape and
+/// the strides (the tight ones unless named).
+struct Case<'a> {
+    label: String,
+    weights: &'a [u8],
+    quant: Quant,
+    rows: usize,
+    cols: usize,
+    acts: usize,
+    x_stride: usize,
+    y_stride: usize,
+    seed: u64,
+}
+
+/// The cases one store or resid clause runs, both operand arms: the
+/// fixture's real tensors at the activation row counts that exercise the
+/// tile's edges — 9 and 33 leave activation rows past the last, 512 fills
+/// the tiles — and a weight-row tail no threadgroup divides.
+fn run_cases(h: &Harness<'_>, mode: GemmMode, cases: &[Case<'_>]) -> Clause {
+    let mut parts = Vec::new();
+    for case in cases {
+        let x = oracle::activations(case.acts * case.x_stride, case.seed, 1.0);
+        let y_len = (case.acts - 1) * case.y_stride + case.rows;
+        let y0 = oracle::activations(y_len, case.seed ^ 0x9E37, 1.0);
+        let w_abs = weight_abs_sums(case.quant, case.weights, case.rows, case.cols)
+            .map_err(|e| format!("{}: {e}", case.label))?;
+        for operand in [Operand::F16, Operand::F32] {
+            let worst = run_checked(
+                h,
+                &GemmLaunch {
+                    quant: case.quant,
+                    rows: case.rows,
+                    cols: case.cols,
+                    acts: case.acts,
+                    weights: case.weights,
+                    x: &x,
+                    x_stride: case.x_stride,
+                    y0: &y0,
+                    y_stride: case.y_stride,
+                    mode,
+                    operand,
+                },
+                &w_abs,
+            )
+            .map_err(|e| format!("{} {:?}: {e}", case.label, operand))?;
+            parts.push(format!("{} {:?} {worst:.3}", case.label, operand));
+        }
+    }
+    common::noted(parts)
+}
+
+/// The Q4_K cases, the main fixture's tensors.
+fn q4k_cases(fixture: &Fixture) -> Result<Vec<Case<'_>>, String> {
+    let tail = fixture.rows_at(
+        "blk.0.attn_qkv.weight",
+        gguf::quant::GgmlType::Q4_K,
+        2048,
+        100,
+        511,
+    )?;
+    Ok(vec![
+        Case {
+            label: "blk.0.attn_qkv.weight 8192x2048 r9".to_string(),
+            weights: fixture.rows(
+                "blk.0.attn_qkv.weight",
+                gguf::quant::GgmlType::Q4_K,
+                2048,
+                8192,
+            )?,
+            quant: Quant::Q4K,
+            rows: 8192,
+            cols: 2048,
+            acts: 9,
+            x_stride: 2048,
+            y_stride: 8192,
+            seed: 0x6E31,
+        },
+        Case {
+            label: "blk.0.ssm_out.weight 2048x4096 r33 strided".to_string(),
+            weights: fixture.rows(
+                "blk.0.ssm_out.weight",
+                gguf::quant::GgmlType::Q4_K,
+                4096,
+                2048,
+            )?,
+            quant: Quant::Q4K,
+            rows: 2048,
+            cols: 4096,
+            acts: 33,
+            x_stride: 4096 + 16,
+            y_stride: 2048 + 4,
+            seed: 0x6E32,
+        },
+        Case {
+            label: "blk.0.ffn_down_shexp.weight 2048x512 r512".to_string(),
+            weights: fixture.rows(
+                "blk.0.ffn_down_shexp.weight",
+                gguf::quant::GgmlType::Q4_K,
+                512,
+                2048,
+            )?,
+            quant: Quant::Q4K,
+            rows: 2048,
+            cols: 512,
+            acts: 512,
+            x_stride: 512,
+            y_stride: 2048,
+            seed: 0x6E33,
+        },
+        Case {
+            label: "blk.0.attn_qkv.weight tail 511x2048 r33".to_string(),
+            weights: tail,
+            quant: Quant::Q4K,
+            rows: 511,
+            cols: 2048,
+            acts: 33,
+            x_stride: 2048,
+            y_stride: 512,
+            seed: 0x6E34,
+        },
+    ])
+}
+
+/// The Q6_K cases, the main fixture's tensors, with the head's own tail.
+fn q6k_cases(fixture: &Fixture) -> Result<Vec<Case<'_>>, String> {
+    let tail_rows = 1153;
+    let tail = fixture.rows_at(
+        "output.weight",
+        gguf::quant::GgmlType::Q6_K,
+        2048,
+        248_320 - tail_rows,
+        tail_rows,
+    )?;
+    Ok(vec![
+        Case {
+            label: "blk.2.attn_qkv.weight 8192x2048 r9".to_string(),
+            weights: fixture.rows(
+                "blk.2.attn_qkv.weight",
+                gguf::quant::GgmlType::Q6_K,
+                2048,
+                8192,
+            )?,
+            quant: Quant::Q6K,
+            rows: 8192,
+            cols: 2048,
+            acts: 9,
+            x_stride: 2048,
+            y_stride: 8192,
+            seed: 0x6E41,
+        },
+        Case {
+            label: "blk.2.ffn_down_shexp.weight 2048x512 r33".to_string(),
+            weights: fixture.rows(
+                "blk.2.ffn_down_shexp.weight",
+                gguf::quant::GgmlType::Q6_K,
+                512,
+                2048,
+            )?,
+            quant: Quant::Q6K,
+            rows: 2048,
+            cols: 512,
+            acts: 33,
+            x_stride: 512,
+            y_stride: 2048,
+            seed: 0x6E42,
+        },
+        Case {
+            label: "blk.3.attn_v.weight 512x2048 r512".to_string(),
+            weights: fixture.rows(
+                "blk.3.attn_v.weight",
+                gguf::quant::GgmlType::Q6_K,
+                2048,
+                512,
+            )?,
+            quant: Quant::Q6K,
+            rows: 512,
+            cols: 2048,
+            acts: 512,
+            x_stride: 2048,
+            y_stride: 512,
+            seed: 0x6E43,
+        },
+        Case {
+            label: format!("output.weight tail {tail_rows}x2048 r9"),
+            weights: tail,
+            quant: Quant::Q6K,
+            rows: tail_rows,
+            cols: 2048,
+            acts: 9,
+            x_stride: 2048,
+            y_stride: 1156,
+            seed: 0x6E44,
+        },
+    ])
+}
+
+/// The A4 cases, the MLX-format fixture split's tensors.
+fn a4_cases(mlx: &Fixture) -> Result<Vec<Case<'_>>, String> {
+    let tail_rows = 1153;
+    let tail = mlx.rows_at(
+        "output.weight",
+        gguf::quant::GgmlType::MLX_A4,
+        2048,
+        248_320 - tail_rows,
+        tail_rows,
+    )?;
+    Ok(vec![
+        Case {
+            label: "blk.0.attn_qkv.weight 8192x2048 r9".to_string(),
+            weights: mlx.rows(
+                "blk.0.attn_qkv.weight",
+                gguf::quant::GgmlType::MLX_A4,
+                2048,
+                8192,
+            )?,
+            quant: Quant::A4,
+            rows: 8192,
+            cols: 2048,
+            acts: 9,
+            x_stride: 2048,
+            y_stride: 8192,
+            seed: 0x6E51,
+        },
+        Case {
+            label: "blk.0.ssm_out.weight 2048x4096 r33".to_string(),
+            weights: mlx.rows(
+                "blk.0.ssm_out.weight",
+                gguf::quant::GgmlType::MLX_A4,
+                4096,
+                2048,
+            )?,
+            quant: Quant::A4,
+            rows: 2048,
+            cols: 4096,
+            acts: 33,
+            x_stride: 4096,
+            y_stride: 2048,
+            seed: 0x6E52,
+        },
+        Case {
+            label: "blk.0.ffn_down_shexp.weight 2048x512 r512".to_string(),
+            weights: mlx.rows(
+                "blk.0.ffn_down_shexp.weight",
+                gguf::quant::GgmlType::MLX_A4,
+                512,
+                2048,
+            )?,
+            quant: Quant::A4,
+            rows: 2048,
+            cols: 512,
+            acts: 512,
+            x_stride: 512,
+            y_stride: 2048,
+            seed: 0x6E53,
+        },
+        Case {
+            label: format!("output.weight tail {tail_rows}x2048 r33"),
+            weights: tail,
+            quant: Quant::A4,
+            rows: tail_rows,
+            cols: 2048,
+            acts: 33,
+            x_stride: 2048,
+            y_stride: 1156,
+            seed: 0x6E54,
+        },
+    ])
+}
+
+/// The store dot at every weight type's cases, both operand arms: every
+/// element within the f64 oracle's band.
+pub fn gemm_q4k_store(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    run_cases(h, GemmMode::Store, &q4k_cases(fixture)?)
+}
+
+/// The residual epilogue at the same cases: `y = y + W . x`, in place.
+pub fn gemm_q4k_resid(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    run_cases(h, GemmMode::Residual, &q4k_cases(fixture)?)
+}
+
+pub fn gemm_q6k_store(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    run_cases(h, GemmMode::Store, &q6k_cases(fixture)?)
+}
+
+pub fn gemm_q6k_resid(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    run_cases(h, GemmMode::Residual, &q6k_cases(fixture)?)
+}
+
+pub fn gemm_a4_store(h: &Harness<'_>, mlx: &Fixture) -> Clause {
+    run_cases(h, GemmMode::Store, &a4_cases(mlx)?)
+}
+
+pub fn gemm_a4_resid(h: &Harness<'_>, mlx: &Fixture) -> Clause {
+    run_cases(h, GemmMode::Residual, &a4_cases(mlx)?)
+}
+
+/// Every segment of a segmented dispatch is the same bits as the same tensor
+/// run alone: the kernel does not change the order of a row's sum, and a
+/// segment's tiles are the ones a launch of it alone would run. One group
+/// per weight type, a tail segment in two of them, both operand arms and
+/// both epilogues.
+pub fn gemm_seg(h: &Harness<'_>, fixture: &Fixture, mlx: &Fixture) -> Clause {
+    let acts = 33;
+    let cols = 2048;
+    struct Group<'a> {
+        quant: Quant,
+        segments: Vec<(usize, &'a [u8])>,
+        mode: GemmMode,
+    }
+    let q4k_tail = fixture.rows_at(
+        "blk.0.attn_qkv.weight",
+        gguf::quant::GgmlType::Q4_K,
+        cols,
+        100,
+        511,
+    )?;
+    let groups = [
+        Group {
+            quant: Quant::Q4K,
+            segments: vec![
+                (
+                    8192,
+                    fixture.rows(
+                        "blk.0.attn_qkv.weight",
+                        gguf::quant::GgmlType::Q4_K,
+                        cols,
+                        8192,
+                    )?,
+                ),
+                (
+                    4096,
+                    fixture.rows(
+                        "blk.0.attn_gate.weight",
+                        gguf::quant::GgmlType::Q4_K,
+                        cols,
+                        4096,
+                    )?,
+                ),
+                (511, q4k_tail),
+            ],
+            mode: GemmMode::Store,
+        },
+        Group {
+            quant: Quant::Q6K,
+            segments: vec![(
+                8192,
+                fixture.rows(
+                    "blk.2.attn_qkv.weight",
+                    gguf::quant::GgmlType::Q6_K,
+                    cols,
+                    8192,
+                )?,
+            )],
+            mode: GemmMode::Residual,
+        },
+        Group {
+            quant: Quant::A4,
+            segments: vec![
+                (
+                    8192,
+                    mlx.rows(
+                        "blk.0.attn_qkv.weight",
+                        gguf::quant::GgmlType::MLX_A4,
+                        cols,
+                        8192,
+                    )?,
+                ),
+                (
+                    512,
+                    mlx.rows(
+                        "blk.1.attn_k.weight",
+                        gguf::quant::GgmlType::MLX_A4,
+                        cols,
+                        512,
+                    )?,
+                ),
+                (
+                    511,
+                    mlx.rows_at(
+                        "blk.1.attn_q.weight",
+                        gguf::quant::GgmlType::MLX_A4,
+                        cols,
+                        100,
+                        511,
+                    )?,
+                ),
+            ],
+            mode: GemmMode::Store,
+        },
+    ];
+    let mut parts = Vec::new();
+    for (g, group) in groups.iter().enumerate() {
+        let rows: usize = group.segments.iter().map(|(r, _)| r).sum();
+        // The edge store's stride rule: a whole number of float4s.
+        let stride = rows.div_ceil(4) * 4;
+        let x = oracle::activations(acts * cols, 0x6E61 + g as u64, 1.0);
+        let y_len = (acts - 1) * stride + rows;
+        let y0 = oracle::activations(y_len, 0x6E71 + g as u64, 1.0);
+        for operand in [Operand::F16, Operand::F32] {
+            let got = launch_gemm_seg(
+                h,
+                &GemmSegLaunch {
+                    quant: group.quant,
+                    cols,
+                    acts,
+                    segments: group.segments.clone(),
+                    x: &x,
+                    y0: &y0,
+                    y_stride: stride,
+                    mode: group.mode,
+                    operand,
+                },
+            )
+            .map_err(|e| format!("{:?} {:?}: {e}", group.quant, operand))?;
+            common::expect_clean(h, "the segmented launch")?;
+            if let Some(at) = got.iter().position(|v| v.to_bits() == SENTINEL_BITS) {
+                return Err(format!(
+                    "{:?} {:?}: column {at} of the output was not written",
+                    group.quant, operand
+                ));
+            }
+            // Each segment against its own single launch, bit for bit. The
+            // single launch's output rows hold the segment's own columns,
+            // and its residual input is the same values the segment's
+            // columns of the segmented launch's input hold.
+            let mut at = 0usize;
+            for (seg_rows, bytes) in &group.segments {
+                let alone_stride = seg_rows.div_ceil(4) * 4;
+                let mut alone_y0 = Vec::with_capacity((acts - 1) * alone_stride + seg_rows);
+                for r in 0..acts {
+                    alone_y0.extend_from_slice(&y0[r * stride + at..r * stride + at + seg_rows]);
+                    if r + 1 < acts {
+                        alone_y0.extend(std::iter::repeat_n(0f32, alone_stride - seg_rows));
+                    }
+                }
+                let alone = launch_gemm(
+                    h,
+                    &GemmLaunch {
+                        quant: group.quant,
+                        rows: *seg_rows,
+                        cols,
+                        acts,
+                        weights: bytes,
+                        x: &x,
+                        x_stride: cols,
+                        y0: &alone_y0,
+                        y_stride: alone_stride,
+                        mode: group.mode,
+                        operand,
+                    },
+                )
+                .map_err(|e| format!("a segment of {:?} alone: {e}", group.quant))?;
+                for r in 0..acts {
+                    for n in 0..*seg_rows {
+                        let seg_at = r * stride + at + n;
+                        let own_at = r * alone_stride + n;
+                        if got[seg_at].to_bits() != alone[own_at].to_bits() {
+                            return Err(format!(
+                                "{:?} {:?} segment at column {at} row {r} column {n}: \
+                                 the segment read {:?}, the tensor alone read {:?}",
+                                group.quant, operand, got[seg_at], alone[own_at]
+                            ));
+                        }
+                    }
+                }
+                at += seg_rows;
+            }
+            parts.push(format!(
+                "{:?} {} segments {:?}",
+                group.quant,
+                group.segments.len(),
+                operand
+            ));
+        }
+    }
+    Ok(Verdict::Noted(format!(
+        "every segment the same bits as its tensor alone: {}",
+        parts.join(", ")
+    )))
+}
+
+/// The f16 operand's range check: an activation that is not finite or past
+/// the half range raises the activation quantizer's site and its row's
+/// outputs are NaN — never a silent inf — and every other row stays in band.
+/// The boundary itself (the largest finite half) is taken, not faulted. The
+/// f32 arm takes the same activations as they are, like the plain mat-vec:
+/// no fault, and the non-finite row's outputs are the non-finite dot's.
+pub fn gemm_range(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let quant = Quant::Q4K;
+    let (rows, cols, acts) = (2048usize, 512, 33);
+    let weights = fixture.rows(
+        "blk.0.ffn_down_shexp.weight",
+        gguf::quant::GgmlType::Q4_K,
+        cols,
+        rows,
+    )?;
+    let w_abs = weight_abs_sums(quant, weights, rows, cols)?;
+    for (what, value, bad_row) in [
+        ("an activation past the half range", 65_536.0f32, 7),
+        ("a NaN activation", f32::NAN, 0),
+    ] {
+        let mut x = oracle::activations(acts * cols, 0x6E81, 1.0);
+        x[bad_row * cols + 11] = value;
+        let y0 = oracle::activations(acts * rows, 0x6E82, 1.0);
+        let launch = GemmLaunch {
+            quant,
+            rows,
+            cols,
+            acts,
+            weights,
+            x: &x,
+            x_stride: cols,
+            y0: &y0,
+            y_stride: rows,
+            mode: GemmMode::Store,
+            operand: Operand::F16,
+        };
+        h.clear_fault()?;
+        let got = launch_gemm(h, &launch)?;
+        common::expect_fault(h, what, FaultSite::QuantColumn)?;
+        for n in 0..rows {
+            if !got[bad_row * rows + n].is_nan() {
+                return Err(format!(
+                    "{what}: row {bad_row} column {n} is {:?}, not NaN",
+                    got[bad_row * rows + n]
+                ));
+            }
+        }
+        // The other rows are finite and in band.
+        check_rows(&launch, &got, &w_abs, Some(bad_row))
+            .map_err(|e| format!("{what}, another row: {e}"))?;
+    }
+    // The boundary: the largest finite half is taken, not faulted.
+    h.clear_fault()?;
+    let mut x = oracle::activations(acts * cols, 0x6E83, 1.0);
+    x[3 * cols + 100] = 65_504.0;
+    let y0 = oracle::activations(acts * rows, 0x6E84, 1.0);
+    let launch = GemmLaunch {
+        quant,
+        rows,
+        cols,
+        acts,
+        weights,
+        x: &x,
+        x_stride: cols,
+        y0: &y0,
+        y_stride: rows,
+        mode: GemmMode::Store,
+        operand: Operand::F16,
+    };
+    let worst = run_checked(h, &launch, &w_abs)?;
+    // The f32 arm: the same non-finite activation, no fault, its row the
+    // non-finite dot's.
+    h.clear_fault()?;
+    let mut x = oracle::activations(acts * cols, 0x6E85, 1.0);
+    x[7 * cols + 11] = 65_536.0;
+    let y0 = oracle::activations(acts * rows, 0x6E86, 1.0);
+    let launch = GemmLaunch {
+        quant,
+        rows,
+        cols,
+        acts,
+        weights,
+        x: &x,
+        x_stride: cols,
+        y0: &y0,
+        y_stride: rows,
+        mode: GemmMode::Store,
+        operand: Operand::F32,
+    };
+    let got = launch_gemm(h, &launch)?;
+    common::expect_clean(h, "a finite activation under the f32 arm")?;
+    for n in 0..rows {
+        if !got[7 * rows + n].is_finite() {
+            return Err(format!(
+                "the f32 arm's row 7 column {n} is {:?}, not the finite dot's",
+                got[7 * rows + n]
+            ));
+        }
+    }
+    Ok(Verdict::Noted(format!(
+        "the f16 arm's range fault on the half range and on NaN, \
+         the boundary taken, the f32 arm faultless; worst {worst:.3}"
+    )))
+}
+
+/// The buffers of the refusal table.
+struct Refusals {
+    cols: usize,
+    bytes: usize,
+    weights: bloomery_metal::MetalBuffer<u8>,
+    x: bloomery_metal::MetalBuffer<f32>,
+    y: bloomery_metal::MetalBuffer<f32>,
+}
+
+/// The launch of one case: the shape it is told and the lengths and offsets
+/// of its windows, one of them bad.
+#[derive(Clone, Copy)]
+struct Args {
+    rows: usize,
+    cols: usize,
+    acts: usize,
+    weights: usize,
+    weights_at: usize,
+    x: usize,
+    x_stride: usize,
+    y: usize,
+    y_at: usize,
+    y_stride: usize,
+}
+
+impl Args {
+    const fn whole(rows: usize, cols: usize, acts: usize, bytes: usize) -> Self {
+        Self {
+            rows,
+            cols,
+            acts,
+            weights: bytes,
+            weights_at: 0,
+            x: (acts - 1) * cols + cols,
+            x_stride: cols,
+            y: (acts - 1) * rows + rows,
+            y_at: 0,
+            y_stride: rows,
+        }
+    }
+}
+
+fn refuse(
+    h: &Harness<'_>,
+    b: &mut Refusals,
+    a: &Args,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), DeviceError> {
+    h.kernels.gemm(
+        encoder,
+        GemmParams {
+            quant: Quant::Q4K,
+            rows: a.rows,
+            cols: a.cols,
+            acts: a.acts,
+            weights: b.weights.window(Elems(a.weights_at), Elems(a.weights))?,
+            x: b.x.window(Elems(0), Elems(a.x))?,
+            x_stride: a.x_stride,
+            y: b.y.window_mut(Elems(a.y_at), Elems(a.y))?,
+            y_stride: a.y_stride,
+            mode: GemmMode::Store,
+            operand: Operand::F16,
+            fault: h.device.fault_word(),
+            layer: LAYER,
+        },
+    )
+}
+
+fn bad<'a>(
+    what: &'static str,
+    needle: &'static str,
+    edit: impl FnOnce(&mut Args) + 'a,
+    h: &'a Harness<'_>,
+    whole: Args,
+) -> BadArg<'a, Refusals> {
+    BadArg::new(
+        what,
+        needle,
+        Box::new(move |b, encoder| {
+            let mut a = whole;
+            edit(&mut a);
+            refuse(h, b, &a, encoder)
+        }),
+    )
+}
+
+/// The segment list of one seg case, one property of it bad.
+#[derive(Clone, Copy)]
+struct SegArgs {
+    segments: [Option<Segment>; 5],
+    weights_len: usize,
+    y_len: usize,
+}
+
+impl SegArgs {
+    /// The table's arguments: the y window spans the whole buffer, so a
+    /// case's own check refuses before the window check can. Every segment
+    /// is eight rows of the one width.
+    const fn whole(weights_len: usize, y_len: usize) -> Self {
+        Self {
+            segments: [
+                Some(Segment {
+                    cols: 2048,
+                    rows: 8,
+                    weight_blocks: 0,
+                    out_offset: 0,
+                }),
+                None,
+                None,
+                None,
+                None,
+            ],
+            weights_len,
+            y_len,
+        }
+    }
+
+    fn list(&self) -> Vec<Segment> {
+        self.segments.iter().filter_map(|s| *s).collect()
+    }
+}
+
+fn refuse_seg(
+    h: &Harness<'_>,
+    b: &mut Refusals,
+    a: &SegArgs,
+    encoder: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+) -> Result<(), DeviceError> {
+    let segments = a.list();
+    h.kernels.gemm_seg(
+        encoder,
+        GemmSegParams {
+            quant: Quant::Q4K,
+            segments: &segments,
+            weights: b.weights.window(Elems(0), Elems(a.weights_len))?,
+            x: b.x.window(Elems(0), Elems(b.cols * 33))?,
+            x_stride: b.cols,
+            acts: 33,
+            y: b.y.window_mut(Elems(0), Elems(a.y_len))?,
+            y_stride: a
+                .segments
+                .iter()
+                .filter_map(|s| *s)
+                .map(|s| s.out_offset + s.rows)
+                .max()
+                .unwrap_or(0),
+            mode: GemmMode::Store,
+            operand: Operand::F16,
+            fault: h.device.fault_word(),
+            layer: LAYER,
+        },
+    )
+}
+
+fn bad_seg<'a>(
+    what: &'static str,
+    needle: &'static str,
+    edit: impl FnOnce(&mut SegArgs) + 'a,
+    h: &'a Harness<'_>,
+    weights_len: usize,
+) -> BadArg<'a, Refusals> {
+    let whole = SegArgs::whole(weights_len, 264);
+    BadArg::new(
+        what,
+        needle,
+        Box::new(move |b, encoder| {
+            let mut a = whole;
+            edit(&mut a);
+            refuse_seg(h, b, &a, encoder)
+        }),
+    )
+}
+
+/// The launches the host module must refuse: the shape it is told and the
+/// length or offset of each window it is given, each refused naming the
+/// argument; and the segment lists it cannot run. The well-formed launch is
+/// accepted and writes.
+pub fn gemm_refusals(h: &Harness<'_>) -> Clause {
+    let (device, stream) = (h.device, h.stream);
+    let (rows, cols, acts) = (8usize, 512, 9);
+    let bytes = rows * cols / 256 * Quant::Q4K.block_bytes();
+    // The segment lists' weights: exactly the one well-formed segment's
+    // span (eight rows of the one width), so a block offset past it is
+    // refused by the window check.
+    let seg_bytes = 8 * 2048 / 256 * Quant::Q4K.block_bytes();
+    let mut bufs = Refusals {
+        cols: 2048,
+        bytes,
+        weights: device
+            .upload(stream, &vec![0u8; bytes.max(seg_bytes)])
+            .map_err(why)?,
+        x: device.upload(stream, &vec![0f32; 2048 * 64]).map_err(why)?,
+        y: device.upload(stream, &vec![1f32; 4096]).map_err(why)?,
+    };
+    let whole = Args::whole(rows, cols, acts, bytes);
+    let cases = vec![
+        bad(
+            "a short weights window",
+            "weights",
+            |a| a.weights -= 1,
+            h,
+            whole,
+        ),
+        bad(
+            "a long weights window",
+            "weights",
+            |a| a.weights += 1,
+            h,
+            whole,
+        ),
+        bad(
+            "weights at an odd byte offset",
+            "16-bit words",
+            |a| a.weights_at = 1,
+            h,
+            whole,
+        ),
+        bad("a short x window", "x window", |a| a.x -= 1, h, whole),
+        bad("a short y window", "y window", |a| a.y -= 1, h, whole),
+        bad(
+            "an x stride narrower than its row",
+            "x stride",
+            |a| a.x_stride = a.cols - 1,
+            h,
+            whole,
+        ),
+        bad(
+            "a y stride narrower than its row",
+            "y stride",
+            |a| {
+                a.y_stride = a.rows - 1;
+            },
+            h,
+            whole,
+        ),
+        bad(
+            "a y stride the edge store cannot write",
+            "multiple of the four elements",
+            |a| a.y_stride = a.rows + 2,
+            h,
+            whole,
+        ),
+        bad(
+            "a y window the edge store cannot write",
+            "float4",
+            |a| a.y_at = 1,
+            h,
+            whole,
+        ),
+        bad(
+            "no weight rows",
+            "empty",
+            |a| {
+                a.rows = 0;
+                a.weights = 0;
+                a.y = 0;
+                a.y_stride = 0;
+            },
+            h,
+            whole,
+        ),
+        bad(
+            "no columns",
+            "empty",
+            |a| {
+                a.cols = 0;
+                a.weights = 0;
+                a.x = 0;
+                a.x_stride = 0;
+            },
+            h,
+            whole,
+        ),
+        bad(
+            "no activation rows",
+            "empty",
+            |a| {
+                a.acts = 0;
+                a.x = 0;
+                a.y = 0;
+            },
+            h,
+            whole,
+        ),
+        bad(
+            "columns that are not whole blocks",
+            "whole blocks",
+            |a| {
+                a.cols = 500;
+                a.x = 8 * 500 + 500;
+                a.x_stride = 500;
+            },
+            h,
+            whole,
+        ),
+    ];
+    let unchanged = |h: &Harness<'_>, b: &Refusals| common::still(h, &b.y, |v| *v == 1.0);
+    let count = common::refuse_launches(h, "gemm", &mut bufs, cases, unchanged)?;
+
+    // The segment lists: a list the kernel cannot run.
+    let seg_cases = vec![
+        bad_seg(
+            "segments of different widths",
+            "columns",
+            |a| {
+                a.segments[1] = Some(Segment {
+                    cols: 2048 + 256,
+                    rows: 8,
+                    weight_blocks: 64,
+                    out_offset: 8,
+                });
+            },
+            h,
+            seg_bytes,
+        ),
+        bad_seg(
+            "a segment of no rows",
+            "no rows",
+            |a| {
+                a.segments[0] = Some(Segment {
+                    cols: 2048,
+                    rows: 0,
+                    weight_blocks: 0,
+                    out_offset: 0,
+                });
+            },
+            h,
+            seg_bytes,
+        ),
+        bad_seg(
+            "more segments than a dispatch runs",
+            "at most",
+            |a| {
+                for (i, slot) in a.segments.iter_mut().enumerate() {
+                    *slot = Some(Segment {
+                        cols: 2048,
+                        rows: 8,
+                        weight_blocks: i * 64,
+                        out_offset: i * 8,
+                    });
+                }
+            },
+            h,
+            seg_bytes,
+        ),
+        bad_seg(
+            "segments whose outputs overlap",
+            "overlap",
+            |a| {
+                a.segments[1] = Some(Segment {
+                    cols: 2048,
+                    rows: 8,
+                    weight_blocks: 64,
+                    out_offset: 4,
+                });
+            },
+            h,
+            seg_bytes,
+        ),
+        bad_seg(
+            "a segment past the weights",
+            "weights",
+            |a| {
+                a.segments[0] = Some(Segment {
+                    cols: 2048,
+                    rows: 8,
+                    weight_blocks: 200,
+                    out_offset: 0,
+                });
+            },
+            h,
+            seg_bytes,
+        ),
+    ];
+    let seg_count = common::refuse_launches(h, "gemm", &mut bufs, seg_cases, unchanged)?;
+    let good: Edit<'_, Refusals> = Box::new(|b, encoder| {
+        let a = Args::whole(8, 512, 9, b.bytes);
+        refuse(h, b, &a, encoder)
+    });
+    common::accepted_writes(h, &mut bufs, good, |h, b| {
+        common::moved(h, &b.y, |v| *v != 1.0)
+    })?;
+    Ok(Verdict::Noted(format!(
+        "{count} refusals and {seg_count} segment-list refusals, each by name, nothing written"
+    )))
+}
+
+/// The clause table: one clause per entry, after the mat-vec families.
+pub fn table<'a>(
+    h: &'a Harness<'a>,
+    fixture: &'a Result<Fixture, String>,
+    mlx: &'a Result<Fixture, String>,
+) -> Vec<(&'static str, super::ClauseRun<'a>)> {
+    let with = |f: fn(&Harness<'_>, &Fixture) -> Clause| {
+        Box::new(move || match fixture {
+            Ok(fix) => f(h, fix),
+            Err(e) => Err(e.clone()),
+        }) as super::ClauseRun<'a>
+    };
+    let with_mlx = |f: fn(&Harness<'_>, &Fixture) -> Clause| {
+        Box::new(move || match mlx {
+            Ok(fix) => f(h, fix),
+            Err(e) => Err(e.clone()),
+        }) as super::ClauseRun<'a>
+    };
+    vec![
+        ("gemm_q4k_store", with(gemm_q4k_store)),
+        ("gemm_q4k_resid", with(gemm_q4k_resid)),
+        ("gemm_q6k_store", with(gemm_q6k_store)),
+        ("gemm_q6k_resid", with(gemm_q6k_resid)),
+        ("gemm_a4_store", with_mlx(gemm_a4_store)),
+        ("gemm_a4_resid", with_mlx(gemm_a4_resid)),
+        (
+            "gemm_seg",
+            Box::new(move || match (fixture, mlx) {
+                (Ok(fix), Ok(split)) => gemm_seg(h, fix, split),
+                (Err(e), _) | (_, Err(e)) => Err(e.clone()),
+            }),
+        ),
+        ("gemm_range", with(gemm_range)),
+        ("gemm_refusals", Box::new(move || gemm_refusals(h))),
+    ]
+}

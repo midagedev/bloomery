@@ -43,6 +43,8 @@ mod clauses_delta;
 mod clauses_embed;
 #[path = "clauses_experts.rs"]
 mod clauses_experts;
+#[path = "clauses_gemm.rs"]
+mod clauses_gemm;
 #[path = "clauses_head.rs"]
 mod clauses_head;
 #[path = "clauses_matvec.rs"]
@@ -635,6 +637,7 @@ pub fn main() -> ExitCode {
     let clauses: Vec<_> = front
         .into_iter()
         .chain(clauses_a4::table(ctx.harness, &mlx))
+        .chain(clauses_gemm::table(ctx.harness, ctx.fixture, &mlx))
         .chain(clauses_delta::table(&ctx))
         .chain(clauses_router::table(&ctx))
         .chain(clauses_experts::table(&ctx))

@@ -12,6 +12,8 @@
 //! tensor ([`matvec`]), the segmented mat-vec of up to four tensors of one
 //! type and one width in one dispatch ([`seg`]), and the head-normed residual
 //! mat-vec of a gated delta net's out projection ([`headnorm`]).
+//! The dense GEMM of R activation rows ([`gemm`]) is one more family, plain
+//! and segmented the same way: `kernels/gemm.metal`.
 //! The router ([`router`]) is one more pipeline: `kernels/router.metal`, its ticket `kernels/ticket.metal`.
 //! The routed gate-up pair and the folded down are one dispatch each.
 //! The gated delta step ([`delta`]) writes the numerator and the partials that
@@ -25,6 +27,7 @@ mod delta_geom;
 mod embed;
 mod experts;
 mod experts_geom;
+mod gemm;
 mod geometry;
 mod head;
 mod headnorm;
@@ -57,6 +60,7 @@ pub use delta_geom::RING_ROWS;
 pub use embed::EmbedParams;
 pub use experts::{FoldParams, PairParams, SharedPlan};
 pub use experts_geom::{EXPERT_K, EXPERT_SLOTS, ROUTED_IDS, SHARED_SLOT};
+pub use gemm::{GEMM_ACTS, GEMM_ROWS, GEMM_THREADS, GemmMode, GemmParams, GemmSegParams, Operand};
 pub use geometry::{
     BLOCK_VALUES, HEAD_COLS, MAX_SEGMENTS, PARTIALS_PER_HEAD, ROWS_PER_GROUP, ROWS_PER_SIMD_GROUP,
     SIMD_GROUPS_PER_GROUP, THREADS_PER_GROUP, VALUE_HEADS,
@@ -103,6 +107,11 @@ pub struct Kernels {
     q4k: MatvecPipelines,
     q6k: MatvecPipelines,
     a4: MatvecPipelines,
+    /// The dense GEMM of each weight type: every epilogue and operand,
+    /// plain and segmented (`gemm.metal`).
+    q4k_gemm: gemm::GemmPipelines,
+    q6k_gemm: gemm::GemmPipelines,
+    a4_gemm: gemm::GemmPipelines,
     /// The gated delta net's out projection: the Q4_K entry (A4's is
     /// `headnorm_a4`; Q6_K has none).
     headnorm: Pipeline,
@@ -260,6 +269,9 @@ impl Kernels {
                 ],
                 count,
             )?,
+            q4k_gemm: gemm::GemmPipelines::new(library, "gemm_q4k")?,
+            q6k_gemm: gemm::GemmPipelines::new(library, "gemm_q6k")?,
+            a4_gemm: gemm::GemmPipelines::new(library, "gemm_a4")?,
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,
             headnorm_a4: library.pipeline_with_simdgroups("a4_matvec_headnorm_resid", count)?,
             embed_q4k: library.pipeline("embed_q4k")?,

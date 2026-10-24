@@ -279,6 +279,47 @@ struct Q4K {
     static inline int fold_slot(int ib) {
         return ib / (BLOOMERY_EXPERT_K / values_per_block());
     }
+
+    // Sixteen consecutive values of a block, [16*il, 16*il + 16) in natural
+    // order (value 16*il + j at reg[j/4][j%4]), the GEMM's A staging: the
+    // 4x4 of the operand type one thread holds. The scale and the min are
+    // the owner's unpack (the same sc16 words `partial` reads, over the u16
+    // window the chunk's 32-value group lives in), and the value is the
+    // owner's too: the group's scale times the nibble, less the dmin term.
+    // The group is `il >> 1`, its low nibbles under d and its high under
+    // d/16 — the layout the lane map above walks, which is llama.cpp's
+    // dequantize_q4_K's shape (dequantize.h); no second decode lives here.
+    template <typename T>
+    static inline void dequant16(device const Block & blk,
+                                 short il,
+                                 thread matrix<T, 4, 4> & reg) {
+        constexpr uint16_t kmask1 = 0x3f3f;
+        constexpr uint16_t kmask2 = 0x0f0f;
+        constexpr uint16_t kmask3 = 0xc0c0;
+
+        const short iq = (il >> 2) & 1;
+        uint16_t sc16[4];
+        thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+        device const uint16_t * sc = (device const uint16_t *)blk.scales + iq;
+        sc16[0] = sc[0] & kmask1;
+        sc16[1] = sc[2] & kmask1;
+        sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+        sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+        // sc8 holds the half's four scale/min pairs: [scale 2iq, scale 2iq+1,
+        // min 2iq, min 2iq+1, scale 2iq+4, scale 2iq+5, min 2iq+4, min 2iq+5].
+        const short at = (il >> 1 & 1) + 4 * (il >> 3);
+        const float d = (il & 2) == 0 ? (float)blk.d : (float)blk.d / 16.f;
+        const float dl = d * (float)sc8[at];
+        const float ml = (float)blk.dmin * (float)sc8[2 + at];
+
+        device const uint16_t * q = (device const uint16_t *)(blk.qs + 32 * (il >> 2) + 16 * (il & 1));
+        const ushort mask = (il & 2) == 0 ? 0x0F0F : 0xF0F0;
+        FOR_UNROLL(short i = 0; i < 8; ++i) {
+            const uchar2 pair = as_type<uchar2>((ushort)(q[i] & mask));
+            reg[(2 * i) / 4][(2 * i) % 4] = dl * (float)pair.x - ml;
+            reg[(2 * i + 1) / 4][(2 * i + 1) % 4] = dl * (float)pair.y - ml;
+        }
+    }
 };
 
 struct Q6K {
@@ -392,6 +433,41 @@ struct Q6K {
 
     static inline int fold_slot(int ib) {
         return ib / (BLOOMERY_EXPERT_K / values_per_block());
+    }
+
+    // Sixteen consecutive values of a block, [16*il, 16*il + 16) in natural
+    // order (value 16*il + j at reg[j/4][j%4]), the GEMM's A staging: the
+    // 4x4 of the operand type one thread holds. A chunk sits whole inside
+    // one nibble side of its 128-value half: its ql bytes are the half's
+    // (h0 & 63) run, low nibbles before value 64 of the half and high
+    // after; its high bits are the (h0 & 31) run of qh at twice the
+    // 32-value block's place; its scale is `scales[il]`, the same one word
+    // `partial` reads. The value is the owner's: d * sc * (q - 32), the
+    // product d * sc rounded once and the (q - 32) multiple of it rounded
+    // once, which `fma(q, d * sc, -32 * d * sc)` is exactly (the product of
+    // the integer and d * sc is the one rounding, the -32 term exact). The
+    // runs are read as 16-bit words (a block is 210 bytes, so two bytes is
+    // all the alignment a run has): two codes of six bits sit in the two
+    // bytes of the word the masks and the shift assemble.
+    template <typename T>
+    static inline void dequant16(device const Block & blk,
+                                 short il,
+                                 thread matrix<T, 4, 4> & reg) {
+        const short ip = il >> 3;
+        const short h0 = (il & 7) * 16;
+        device const uint16_t * ql = (device const uint16_t *)(blk.ql + 64 * ip + (h0 & 63));
+        device const uint16_t * qh = (device const uint16_t *)(blk.qh + 32 * ip + (h0 & 31));
+        const ushort shift = (ushort)(2 * (h0 >> 5));
+        const ushort low_shift = (h0 & 64) == 0 ? 0 : 4;
+        const float dsc = (float)blk.d * (float)blk.scales[il];
+        const float offset = -32.f * dsc;
+        FOR_UNROLL(short i = 0; i < 8; ++i) {
+            const ushort lo = (ushort)((ql[i] >> low_shift) & 0x0F0F);
+            const ushort hi = (ushort)((qh[i] >> shift) & 0x0303);
+            const uchar2 codes = as_type<uchar2>((ushort)(lo | (hi << 4)));
+            reg[(2 * i) / 4][(2 * i) % 4] = fma((float)codes.x, dsc, offset);
+            reg[(2 * i + 1) / 4][(2 * i + 1) % 4] = fma((float)codes.y, dsc, offset);
+        }
     }
 };
 
@@ -543,5 +619,19 @@ struct A4 {
         const uint word = (uint)w[2 * (j / 8)] | ((uint)w[2 * (j / 8) + 1] << 16);
         const float q = float((word >> (4 * (j % 8))) & 0xF);
         return scale_of(blk) * q + bias_of(blk);
+    }
+
+    // Sixteen consecutive values of a group, [16*il, 16*il + 16) in natural
+    // order (value 16*il + j at reg[j/4][j%4]), the GEMM's A staging: the
+    // 4x4 of the operand type one thread holds. The value is the owner's
+    // own `value` (a quarter of a group is whole inside its two code words),
+    // computed in f32 and rounded once into the operand type.
+    template <typename T>
+    static inline void dequant16(device const Block & blk,
+                                 short il,
+                                 thread matrix<T, 4, 4> & reg) {
+        for (short j = 0; j < 16; ++j) {
+            reg[j / 4][j % 4] = value(blk, (uint)(16 * il + j));
+        }
     }
 };
