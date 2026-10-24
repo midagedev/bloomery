@@ -84,14 +84,16 @@ use super::count::{GroupBytes, GroupKind, Layer};
 use super::ops::{Feed, MetalOps, RowsCtx};
 use super::rows::RowsArena;
 use crate::buffer::MetalBuffer;
-use crate::checkpoint::{self, Checkpoints};
+use crate::checkpoint::{self, Checkpoints, Restore};
 use crate::device::MetalDevice;
 use crate::encode::EncodeCount;
 use crate::handle::Handle;
 use crate::kernels::{EXPERT_SLOTS, HEAD_DIM, Kernels, PASS_ROWS, segments_for_keys, state_elems};
 use crate::library::Library;
 use crate::residency::{Alloc, ResidencyStats};
-use crate::stream::{GpuInterval, GpuStamps, MetalStream, Settled, Signalled, host_secs};
+use crate::stream::{
+    GpuInterval, GpuStamps, MetalStream, Settled, Signalled, TokenRecording, host_secs,
+};
 use objc2_metal::MTLDevice;
 
 const WHAT: &str = "qwen35moe session";
@@ -231,11 +233,14 @@ pub enum StepMode {
     Ahead { next: Option<u32> },
 }
 
-/// What the session's steps did with the token ahead, and the host's waits.
+/// What the session's steps did with the token ahead, the host's waits and
+/// the command buffers committed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StepStats {
     /// The host's waits on the session's stream: every settle and sync.
     pub waits: u64,
+    /// The command buffers committed on the session's stream.
+    pub submits: u64,
     /// Tokens committed ahead of the call that names them.
     pub ahead: u64,
     /// Tokens ahead a call kept: its id was their embedded pick.
@@ -757,11 +762,13 @@ impl Session {
         Ok(())
     }
 
-    /// What the steps did with the token ahead, and the host's waits so far.
+    /// What the steps did with the token ahead, the host's waits and the
+    /// command buffers committed so far.
     #[must_use]
     pub fn stats(&self) -> StepStats {
         StepStats {
             waits: self.stream.waits(),
+            submits: self.stream.submits(),
             ..self.stats
         }
     }
@@ -901,13 +908,19 @@ impl Session {
     /// rows, the residual rows added into by GEMMs and row kernels. More than a
     /// step's window ([`PASS_ROWS`]) and at most [`Session::pass_rows`] ids;
     /// any other count is refused by name, with the position unmoved. A token
-    /// running ahead is waited out and dropped first. The pass is waited on
-    /// at its end: its fault word is read once, and a raise poisons the
-    /// session as a step's does. [`PassOut::Last`] runs the head over the last
-    /// row and returns its pick; [`PassOut::None`] returns the last id fed.
+    /// running ahead is waited out and dropped first. The pass is one command
+    /// buffer a layer, its ops in the walk's order, each closed by the barrier
+    /// its last dispatch is followed by; the buffers are committed unwaited,
+    /// each after the one before it, and the pass waits on the last at its
+    /// end: a failed buffer is named there, its fault word is read once, and
+    /// a raise poisons the session as a step's does. [`PassOut::Last`] runs the head
+    /// over the last row and returns its pick; [`PassOut::None`] returns the
+    /// last id fed.
     ///
-    /// A refusal or a failure inside the walk leaves the stores as the ops
-    /// that ran left them; the caller resets.
+    /// A refusal inside the first layer commits nothing, so the stores stay as
+    /// they were; one in a later layer waits out the layers committed, and a
+    /// failure at the settle leaves the stores as the buffers left them: the
+    /// caller resets.
     pub fn pass(
         &mut self,
         ids: &[u32],
@@ -921,7 +934,10 @@ impl Session {
     /// waited before the next is committed, its GPU seconds read: one sample
     /// an op, in the pass's order, appended to `samples` (cleared first). Each
     /// buffer runs alone, so a sample is the op's own time and not a queued
-    /// buffer's overlap with the one before it.
+    /// buffer's overlap with the one before it. The ops are the unprofiled
+    /// pass's, in its order, so it leaves the same bits. A refusal or a
+    /// failure inside the walk leaves the stores as the ops that ran left
+    /// them; the caller resets.
     pub fn pass_profile(
         &mut self,
         ids: &[u32],
@@ -990,28 +1006,57 @@ impl Session {
         let slot = slot_of(from + rows_n - 1);
         let head = out == PassOut::Last;
         let cap_rows = rows.cap;
-        let mut ops = PassOps {
-            stream: &self.stream,
-            kernels: &self.kernels,
-            arena: &mut self.arena,
-            rows,
-            from,
-            head,
-            count: EncodeCount::default(),
-            last: None,
-            profile,
-        };
-        let walked = Walk::new(&mut ops, &self.plans, m).run(cap_rows);
-        let (count, last) = (ops.count, ops.last.take());
-        if let Err(e) = walked {
-            if last.is_some() {
-                let _ = self.stream.sync();
+        let (count, settled) = match profile {
+            None => {
+                let mut ops = PassLayers {
+                    buffers: LayerBuffers::new(&self.stream),
+                    kernels: &self.kernels,
+                    arena: &mut self.arena,
+                    rows,
+                    from,
+                    head,
+                };
+                let walked = Walk::new(&mut ops, &self.plans, m)
+                    .run(cap_rows)
+                    .and_then(|()| ops.buffers.finish());
+                let LayerBuffers { count, last, .. } = ops.buffers;
+                // A refusal after a layer was committed: that layer ran and
+                // wrote, so the stores are as it left them and the caller
+                // resets. Before the first commit nothing ran.
+                if let Err(e) = walked {
+                    if last.is_some() {
+                        let _ = self.stream.sync();
+                    }
+                    return Err(e);
+                }
+                let signalled = last.ok_or_else(|| refuse("a pass committed no buffer"))?;
+                (count, self.stream.settle(signalled)?)
             }
-            return Err(e);
-        }
-        let settled = match last.ok_or_else(|| refuse("a pass settled no op"))? {
-            Waiting::Signalled(signalled) => self.stream.settle(signalled)?,
-            Waiting::Settled(settled) => settled,
+            Some(samples) => {
+                let mut ops = PassProfiler {
+                    stream: &self.stream,
+                    kernels: &self.kernels,
+                    arena: &mut self.arena,
+                    rows,
+                    from,
+                    head,
+                    count: EncodeCount::default(),
+                    settled: None,
+                    samples,
+                };
+                let walked = Walk::new(&mut ops, &self.plans, m).run(cap_rows);
+                let (count, settled) = (ops.count, ops.settled.take());
+                if let Err(e) = walked {
+                    if settled.is_some() {
+                        let _ = self.stream.sync();
+                    }
+                    return Err(e);
+                }
+                (
+                    count,
+                    settled.ok_or_else(|| refuse("a pass settled no op"))?,
+                )
+            }
         };
         if let Some(fault) = self.arena.faults[slot].read_settled(&settled)? {
             self.poisoned = Some(fault);
@@ -1337,26 +1382,50 @@ impl Session {
     }
 
     /// A checkpoint at the position, the stream idle: the token ahead is
-    /// waited out and dropped first. Refused while the session is poisoned.
+    /// waited out and dropped first, then each delta layer's state lane at
+    /// the position's parity and its ring are copied once, from the shared
+    /// pages straight into the point's slot. Refused while the session is
+    /// poisoned.
     pub fn checkpoint(&mut self) -> Result<(), SessionError> {
         if let Some(fault) = self.poisoned {
             return Err(SessionError::Poisoned(fault));
         }
         self.quiesce()?;
-        let owned = self.snapshot_stores()?;
-        let refs: Vec<&[f32]> = owned.iter().map(Vec::as_slice).collect();
+        let lane_len = lane_len()?;
+        let start = lane_of(self.pos)
+            .checked_mul(lane_len)
+            .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
+        let mut views = Vec::new();
+        for layer in &self.arena.layers {
+            let MixerBufs::Delta(d) = &layer.mixer else {
+                continue;
+            };
+            // SAFETY: `quiesce` above left the stream idle (no token ahead,
+            // every committed buffer done), and the views borrow the arena,
+            // whose device work and host writes all go through `&mut self`,
+            // until the take below has copied them: nothing writes the pages
+            // while they are read.
+            let (state, ring) = unsafe { (d.state.pages().as_slice(), d.ring.pages().as_slice()) };
+            views.push(
+                state
+                    .get(start..start + lane_len)
+                    .ok_or_else(|| refuse("a delta state lane lies past its buffer"))?,
+            );
+            views.push(ring);
+        }
         self.checkpoints
-            .take(self.pos, &refs)
+            .take(self.pos, &views)
             .map_err(checkpoint_error)
     }
 
     /// Cut to position `n`. A cut to 0 resets, which drops the checkpoints. A
     /// cut to the position does nothing. A cut to a checkpoint waits out the
-    /// token ahead, copies that position's state lane and conv ring back, and
-    /// stands at `n`. Any other `n` is the ledger's refusal, by name, after
-    /// the token ahead is dropped: the position and every store stay. A copy
-    /// back that fails resets the session before the error returns.
-    /// Refused while the session is poisoned.
+    /// token ahead, copies that position's state lane and conv ring back once,
+    /// from the point's slot straight into the stores, and stands at `n`. Any
+    /// other `n` is the ledger's refusal, by name, after the token ahead is
+    /// dropped: the position and every store stay. A copy back that fails
+    /// resets the session before the error returns. Refused while the session
+    /// is poisoned.
     pub fn cut(&mut self, n: u32) -> Result<(), SessionError> {
         if let Some(fault) = self.poisoned {
             return Err(SessionError::Poisoned(fault));
@@ -1368,20 +1437,38 @@ impl Session {
             return Ok(());
         }
         self.quiesce()?;
-        let mut copied = vec_of(self.checkpoints.lens());
-        {
-            let mut refs: Vec<&mut [f32]> = copied.iter_mut().map(Vec::as_mut_slice).collect();
-            self.checkpoints
-                .cut(n, self.pos, &mut refs)
-                .map_err(checkpoint_error)?;
+        let lane_len = lane_len()?;
+        let start = lane_of(n)
+            .checked_mul(lane_len)
+            .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
+        // The lane `lane_of(n)` of each delta state and the whole ring. The
+        // other lane is the one the next token writes, so it is left as it is.
+        let mut dst = Vec::new();
+        for layer in &mut self.arena.layers {
+            let MixerBufs::Delta(d) = &mut layer.mixer else {
+                continue;
+            };
+            dst.push(Restore {
+                buf: &mut d.state,
+                at: Elems(start),
+            });
+            dst.push(Restore {
+                buf: &mut d.ring,
+                at: Elems(0),
+            });
         }
-        if let Err(e) = self.install_stores(n, &copied) {
+        match self.checkpoints.cut(n, self.pos, &mut dst) {
+            Ok(()) => {}
             // A copy that stopped midway leaves some layers at `n` and the
             // rest where they were: reset, so no step runs on mixed state.
-            return Err(match self.reset() {
-                Ok(()) => e,
-                Err(r) => refuse(format!("{e}; and the reset after it failed: {r}")),
-            });
+            Err(e @ checkpoint::Error::Device(_)) => {
+                let e = checkpoint_error(e);
+                return Err(match self.reset() {
+                    Ok(()) => e,
+                    Err(r) => refuse(format!("{e}; and the reset after it failed: {r}")),
+                });
+            }
+            Err(e) => return Err(checkpoint_error(e)),
         }
         self.pos = n;
         Ok(())
@@ -1396,63 +1483,6 @@ impl Session {
         self.stream.sync()?;
         Ok(())
     }
-
-    /// Each delta layer's state lane at the position's parity, then its ring.
-    fn snapshot_stores(&self) -> Result<Vec<Vec<f32>>, SessionError> {
-        let lane_len = lane_len()?;
-        let start = lane_of(self.pos)
-            .checked_mul(lane_len)
-            .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
-        let mut out = Vec::new();
-        for layer in &self.arena.layers {
-            let MixerBufs::Delta(d) = &layer.mixer else {
-                continue;
-            };
-            let mut lane = vec![0.0; lane_len];
-            d.state.pages().read_at(Elems(start), &mut lane)?;
-            out.push(lane);
-            out.push(d.ring.pages().to_vec());
-        }
-        Ok(out)
-    }
-
-    /// `copied` back into lane `lane_of(n)` of each delta state, and into the
-    /// whole ring. The other lane is the one the next token writes, so it is
-    /// left as it is.
-    fn install_stores(&mut self, n: u32, copied: &[Vec<f32>]) -> Result<(), SessionError> {
-        let lane_len = lane_len()?;
-        let start = lane_of(n)
-            .checked_mul(lane_len)
-            .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
-        let mut i = 0;
-        for layer in &mut self.arena.layers {
-            let MixerBufs::Delta(d) = &mut layer.mixer else {
-                continue;
-            };
-            let lane_src = copied
-                .get(i)
-                .ok_or_else(|| refuse("a restore is short a state lane"))?;
-            let ring_src = copied
-                .get(i + 1)
-                .ok_or_else(|| refuse("a restore is short a conv ring"))?;
-            i += 2;
-            if lane_src.len() != lane_len {
-                return Err(refuse(format!(
-                    "a restored state lane is {} f32s; a lane is {lane_len}",
-                    lane_src.len()
-                )));
-            }
-            d.state.write_at(Elems(start), lane_src)?;
-            d.ring.write(ring_src)?;
-        }
-        if i != copied.len() {
-            return Err(refuse(format!(
-                "a restore of {} stores; the delta layers take {i}",
-                copied.len()
-            )));
-        }
-        Ok(())
-    }
 }
 
 fn checkpoint_error(e: checkpoint::Error) -> SessionError {
@@ -1465,11 +1495,6 @@ fn checkpoint_error(e: checkpoint::Error) -> SessionError {
 /// f32s of one delta state lane.
 fn lane_len() -> Result<usize, SessionError> {
     state_elems(1).ok_or_else(|| refuse("a delta state lane's length overflowed"))
-}
-
-/// One zeroed buffer per copied store.
-fn vec_of(lens: &[usize]) -> Vec<Vec<f32>> {
-    lens.iter().map(|&n| vec![0.0; n]).collect()
 }
 
 /// Each delta layer's state lane, then its conv ring. The state buffer is
@@ -1597,11 +1622,162 @@ where
     }
 }
 
-/// The pass's ops: each op of [`MetalOps`]'s rows arms on a command buffer
-/// of its own, committed with a signal and not waited; the last one's signal
-/// is what the pass settles. A buffer opens at the stream's token boundary,
-/// so each op sees what the one before it wrote.
-struct PassOps<'s> {
+/// The pass's ops: [`MetalOps`]'s rows, encoded a layer to a command buffer.
+/// The embed rides with layer 0 and the head with the last layer, so the
+/// pass commits exactly its layer count of buffers and the longest is one
+/// layer's work.
+struct PassLayers<'s> {
+    buffers: LayerBuffers<'s>,
+    kernels: &'s Kernels,
+    arena: &'s mut Arena,
+    rows: &'s mut RowsArena,
+    from: u32,
+    head: bool,
+}
+
+impl PassLayers<'_> {
+    /// `f` over the ops of the buffer `layer` encodes on. The embed and the
+    /// head name no layer: they encode on the buffer open.
+    fn one(
+        &mut self,
+        layer: Option<usize>,
+        f: impl FnOnce(&mut MetalOps<'_, '_>) -> Result<(), SessionError>,
+    ) -> Result<(), SessionError> {
+        let open = self.buffers.at(layer)?;
+        f(&mut MetalOps::rows(
+            open.encoder(),
+            self.arena,
+            RowsCtx { arena: self.rows },
+            self.kernels,
+            self.from,
+            self.head,
+        ))
+    }
+}
+
+impl ChainOps for PassLayers<'_> {
+    type Error = SessionError;
+
+    fn embed(&mut self, m: usize) -> Result<(), SessionError> {
+        self.one(None, |o| o.embed(m))
+    }
+
+    fn attn_in(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.attn_in(l, g))
+    }
+
+    fn attn_core(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.attn_core(l, g))
+    }
+
+    fn attn_out(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.attn_out(l, g))
+    }
+
+    fn delta_in(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.delta_in(l, d))
+    }
+
+    fn delta_core(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.delta_core(l, d))
+    }
+
+    fn delta_out(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.delta_out(l, d))
+    }
+
+    fn route(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.route(l, f))
+    }
+
+    fn experts(&mut self, l: LayerCtx<'_>, f: &FfnPlan) -> Result<(), SessionError> {
+        self.one(Some(l.layer), |o| o.experts(l, f))
+    }
+
+    fn head(&mut self, m: usize) -> Result<(), SessionError> {
+        self.one(None, |o| o.head(m))
+    }
+}
+
+/// The command buffers of a pass, one a layer: the buffer being encoded, and
+/// the signal of the last one committed. A buffer is committed with a signal
+/// and not waited when the walk reaches the next layer, so the host encodes a
+/// layer while the card runs the one before it; each buffer opens at the
+/// stream's token boundary, which the buffer ahead signals at its end, so it
+/// sees what that one wrote. The pass settles the last signal once.
+struct LayerBuffers<'s> {
+    stream: &'s MetalStream,
+    /// The buffer being encoded, not yet committed.
+    open: Option<OpenLayer<'s>>,
+    /// The last committed buffer's signal.
+    last: Option<Signalled>,
+    /// What the committed buffers encoded.
+    count: EncodeCount,
+}
+
+/// A layer's buffer being encoded.
+struct OpenLayer<'s> {
+    /// The layer its ops name; the embed opens a buffer before one does.
+    layer: Option<usize>,
+    recording: TokenRecording<'s>,
+}
+
+impl<'s> LayerBuffers<'s> {
+    fn new(stream: &'s MetalStream) -> Self {
+        Self {
+            stream,
+            open: None,
+            last: None,
+            count: EncodeCount::default(),
+        }
+    }
+
+    /// The buffer an op of `layer` encodes on. The open one when it is
+    /// `layer`'s, or when either names no layer; otherwise the open buffer is
+    /// committed and the next one opened.
+    fn at(&mut self, layer: Option<usize>) -> Result<&mut TokenRecording<'s>, SessionError> {
+        let open = match self.open.take() {
+            Some(mut open) if layer.is_none() || open.layer.is_none() || open.layer == layer => {
+                open.layer = open.layer.or(layer);
+                open
+            }
+            behind => {
+                if let Some(behind) = behind {
+                    self.commit(behind)?;
+                }
+                OpenLayer {
+                    layer,
+                    recording: self.stream.begin()?.open_token_encoder()?,
+                }
+            }
+        };
+        Ok(&mut self.open.insert(open).recording)
+    }
+
+    /// Commit `open` with a signal, unwaited.
+    fn commit(&mut self, open: OpenLayer<'s>) -> Result<(), SessionError> {
+        let (recording, count) = open.recording.finish();
+        // A buffer's own failure is named at the last signal's settle: the
+        // driver reports a failed buffer there, whichever buffer it was.
+        self.last = Some(self.stream.submit_signalled(recording)?);
+        self.count += count;
+        Ok(())
+    }
+
+    /// Commit the buffer still open, the walk done.
+    fn finish(&mut self) -> Result<(), SessionError> {
+        match self.open.take() {
+            Some(open) => self.commit(open),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The profiled pass's ops: each op of [`MetalOps`]'s rows arms on a
+/// command buffer of its own, waited, its GPU seconds read and one sample
+/// appended. A buffer opens at the stream's token boundary, so each op sees
+/// what the one before it wrote.
+struct PassProfiler<'s> {
     stream: &'s MetalStream,
     kernels: &'s Kernels,
     arena: &'s mut Arena,
@@ -1609,19 +1785,12 @@ struct PassOps<'s> {
     from: u32,
     head: bool,
     count: EncodeCount,
-    /// The last op's signal, or its settle in a profiled pass.
-    last: Option<Waiting>,
-    /// A profiled pass's samples: each op is waited and its GPU seconds read.
-    profile: Option<&'s mut Vec<PassSample>>,
+    /// The last op's settle: the head's, once the walk is done.
+    settled: Option<Settled>,
+    samples: &'s mut Vec<PassSample>,
 }
 
-/// The last op of a pass, as the pass waits on it.
-enum Waiting {
-    Signalled(Signalled),
-    Settled(Settled),
-}
-
-impl PassOps<'_> {
+impl PassProfiler<'_> {
     fn one(
         &mut self,
         op: Op,
@@ -1639,26 +1808,18 @@ impl PassOps<'_> {
         ))?;
         let c = enc.count();
         enc.end();
-        // An op's own failure is named at the last op's settle: the driver
-        // reports a failed buffer there, whichever buffer it was.
-        let stamps = self.profile.is_some().then(|| recording.stamps());
+        let stamps = recording.stamps();
         let signalled = self.stream.submit_signalled(recording)?;
-        match (stamps, self.profile.as_mut()) {
-            (Some(stamps), Some(samples)) => {
-                let settled = self.stream.settle(signalled)?;
-                let gpu_s = match stamps.interval(STAMP_WAIT)? {
-                    GpuInterval::Ran(s) => s,
-                    GpuInterval::StillRunning => {
-                        return Err(refuse(format!(
-                            "{op:?}: its buffer still runs after its settle"
-                        )));
-                    }
-                };
-                samples.push(PassSample { op, gpu_s });
-                self.last = Some(Waiting::Settled(settled));
+        self.settled = Some(self.stream.settle(signalled)?);
+        let gpu_s = match stamps.interval(STAMP_WAIT)? {
+            GpuInterval::Ran(s) => s,
+            GpuInterval::StillRunning => {
+                return Err(refuse(format!(
+                    "{op:?}: its buffer still runs after its settle"
+                )));
             }
-            _ => self.last = Some(Waiting::Signalled(signalled)),
-        }
+        };
+        self.samples.push(PassSample { op, gpu_s });
         self.count.groups += c.groups;
         self.count.dispatches += c.dispatches;
         self.count.barriers += c.barriers;
@@ -1666,7 +1827,7 @@ impl PassOps<'_> {
     }
 }
 
-impl ChainOps for PassOps<'_> {
+impl ChainOps for PassProfiler<'_> {
     type Error = SessionError;
 
     fn embed(&mut self, m: usize) -> Result<(), SessionError> {

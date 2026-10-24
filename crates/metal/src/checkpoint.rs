@@ -32,6 +32,12 @@ struct Slot {
     holds: Option<u32>,
 }
 
+/// A store a restore writes: its buffer and the element its copy starts at.
+pub(crate) struct Restore<'a> {
+    pub(crate) buf: &'a mut MetalBuffer<f32>,
+    pub(crate) at: Elems,
+}
+
 /// One model's checkpoints: the ledger, the stores' lengths, the slots.
 pub(crate) struct Checkpoints {
     device: Handle<dyn MTLDevice>,
@@ -126,12 +132,6 @@ impl Checkpoints {
         })
     }
 
-    /// f32s of each copied store, in the body's order.
-    #[must_use]
-    pub(crate) fn lens(&self) -> &[usize] {
-        &self.lens
-    }
-
     /// Bytes one checkpoint copies.
     #[must_use]
     pub(crate) fn point_bytes(&self) -> u64 {
@@ -198,15 +198,35 @@ impl Checkpoints {
     }
 
     /// Plan a cut to `n` of the `held` positions and carry it out into `dst`,
-    /// one buffer per store in the body's order. A length that is not the
-    /// lens is refused before the ledger moves. [`Cut::Stay`] writes nothing.
-    pub(crate) fn cut(&mut self, n: u32, held: u32, dst: &mut [&mut [f32]]) -> Result<(), Error> {
-        self.check_lengths(dst.len(), dst.iter().map(|row| row.len()))?;
+    /// one store in the body's order, each copied once from the slot's pages
+    /// into the store's buffer at its start. A store list that is not the
+    /// lens, or a store whose buffer does not hold its length from its start,
+    /// is refused before the ledger moves. [`Cut::Stay`] writes nothing; a
+    /// write the device refuses partway is [`Error::Device`], the stores
+    /// before it already written.
+    pub(crate) fn cut(&mut self, n: u32, held: u32, dst: &mut [Restore<'_>]) -> Result<(), Error> {
+        if dst.len() != self.lens.len() {
+            return Err(shape(format!(
+                "a restore of {} stores; the checkpoint holds {}",
+                dst.len(),
+                self.lens.len()
+            )));
+        }
+        for (i, (d, &want)) in dst.iter().zip(&self.lens).enumerate() {
+            let room = d.buf.pages().len().get().saturating_sub(d.at.get());
+            if room < want {
+                return Err(shape(format!(
+                    "store {i} holds {room} f32s from its start; the checkpoint copies {want}"
+                )));
+            }
+        }
         match self.ledger.cut(n, held).map_err(Error::Rule)? {
             Cut::Stay => Ok(()),
             Cut::Empty => {
-                for row in dst.iter_mut() {
-                    row.fill(0.0);
+                for (d, &want) in dst.iter_mut().zip(&self.lens) {
+                    d.buf
+                        .write_at(d.at, &vec![0.0; want])
+                        .map_err(Error::Device)?;
                 }
                 self.ledger.applied();
                 Ok(())
@@ -278,14 +298,18 @@ impl Checkpoints {
         Ok(())
     }
 
-    fn restore(&self, slot: usize, at: u32, dst: &mut [&mut [f32]]) -> Result<(), Error> {
+    fn restore(&self, slot: usize, at: u32, dst: &mut [Restore<'_>]) -> Result<(), Error> {
         let kept = self
             .slots
             .get(slot)
             .ok_or_else(|| shape(format!("a restore from slot {slot}, which was never made")))?;
         seqstate::restorable(slot, kept.holds, at).map_err(Error::Rule)?;
-        for (buf, row) in kept.bufs.iter().zip(dst.iter_mut()) {
-            buf.pages().read(row).map_err(Error::Device)?;
+        for (buf, d) in kept.bufs.iter().zip(dst.iter_mut()) {
+            // SAFETY: no device work binds a slot's buffer, and the host
+            // writes one only through `&mut self` (a take's copy), so nothing
+            // writes these pages while `&self` reads them here.
+            let src = unsafe { buf.pages().as_slice() };
+            d.buf.write_at(d.at, src).map_err(Error::Device)?;
         }
         Ok(())
     }

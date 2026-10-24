@@ -691,7 +691,11 @@ levers 0 0 0
 # PIN(2026-10-24): metal 11 -> 12 impls, new code, not old code relaxed: handle.rs's ResidencySetHandle is Send so the
 # stream's residency set moves with its stream; the set sits behind the residency's lock, one thread at a time, as
 # CommandBufferHandle's impl does.
-metal 25 7 12
+# PIN(2026-10-25): metal 25 -> 27 blocks, new code, not old code relaxed: a checkpoint copies once between the stores
+# and a slot. session.rs's checkpoint reads each delta layer's state lane and ring as slices of their shared pages
+# with the stream idle (as logits_row does), and checkpoint.rs's restore reads a slot's pages, which no device work
+# binds, straight into the stores; each with its SAFETY line.
+metal 27 7 12
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.

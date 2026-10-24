@@ -148,6 +148,14 @@ pub struct EncodeCount {
     pub barriers: usize,
 }
 
+impl core::ops::AddAssign for EncodeCount {
+    fn add_assign(&mut self, other: Self) {
+        self.groups += other.groups;
+        self.dispatches += other.dispatches;
+        self.barriers += other.barriers;
+    }
+}
+
 impl ComputeEncoder<'_> {
     /// The serial compute encoder of a command buffer.
     pub(crate) fn new(
@@ -165,13 +173,24 @@ impl ComputeEncoder<'_> {
         })
     }
 
+    /// [`ComputeEncoder::concurrent`] with no borrow of the buffer: the
+    /// holder of the encoder ends it before the buffer is committed, as
+    /// [`TokenRecording`](crate::stream::TokenRecording) does.
+    pub(crate) fn concurrent_detached(
+        buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<ComputeEncoder<'static>, DeviceError> {
+        Self::with_encoder(buffer, |buffer| {
+            buffer.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+        })
+    }
+
     /// An encoder from `make`, refused by name when the command buffer makes none.
-    fn with_encoder<'a>(
-        buffer: &'a ProtocolObject<dyn MTLCommandBuffer>,
+    fn with_encoder<'r>(
+        buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         make: impl FnOnce(
             &ProtocolObject<dyn MTLCommandBuffer>,
         ) -> Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
-    ) -> Result<ComputeEncoder<'a>, DeviceError> {
+    ) -> Result<ComputeEncoder<'r>, DeviceError> {
         let encoder = make(buffer).ok_or_else(|| {
             DeviceError::backend(
                 "compute encoder",
