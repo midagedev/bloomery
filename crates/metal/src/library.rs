@@ -82,6 +82,22 @@ pub struct Library {
     library: Handle<dyn MTLLibrary>,
     device: Handle<dyn MTLDevice>,
     path: LibraryPath,
+    rows_per_simd_group: Option<usize>,
+    router_sg: Option<usize>,
+}
+
+/// The value of `#define NAME <n>` in `text`, when one such line names a
+/// whole number: the geometry the source's kernels were compiled with.
+fn define_of(text: &str, name: &str) -> Option<usize> {
+    let mut found = text.lines().filter_map(|line| {
+        line.trim()
+            .strip_prefix("#define ")?
+            .strip_prefix(name)?
+            .strip_prefix(' ')
+            .and_then(|n| n.trim().parse().ok())
+    });
+    let n = found.next()?;
+    found.next().is_none().then_some(n)
 }
 
 impl Library {
@@ -124,6 +140,8 @@ impl Library {
             library: Handle(library),
             device: device.clone(),
             path: LibraryPath::Source,
+            rows_per_simd_group: define_of(text, "BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP"),
+            router_sg: define_of(text, "BLOOMERY_ROUTER_SG"),
         })
     }
 
@@ -143,7 +161,17 @@ impl Library {
             library: Handle(library),
             device: device.clone(),
             path: LibraryPath::Metallib,
+            rows_per_simd_group: define_of(SOURCE, "BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP"),
+            router_sg: define_of(SOURCE, "BLOOMERY_ROUTER_SG"),
         })
+    }
+
+    /// The rows a SIMD group owns and the router's SIMD groups, as the
+    /// source's `#define`s name them; none when the source does not name a
+    /// count exactly once.
+    #[must_use]
+    pub fn geometry(&self) -> (Option<usize>, Option<usize>) {
+        (self.rows_per_simd_group, self.router_sg)
     }
 
     /// Which path the library came from.

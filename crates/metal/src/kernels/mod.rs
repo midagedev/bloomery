@@ -155,7 +155,8 @@ impl Kernels {
     /// `simdgroups` the function constant of the mat-vec pipelines, and
     /// `router_sg` the router's own SIMD-group count, another source
     /// constant. The probe compiles variant sources and names their counts
-    /// here; the launches' geometry follows what they name.
+    /// here; the launches' geometry follows what they name. A `rows` or
+    /// `router_sg` the library's source does not define is refused by name.
     pub fn with_geometry(
         library: &Library,
         rows: usize,
@@ -180,6 +181,25 @@ impl Kernels {
                 detail: format!(
                     "{simdgroups} SIMD groups in a threadgroup, the most is {}",
                     geometry::MAX_SIMD_GROUPS_PER_GROUP
+                ),
+            });
+        }
+        // The counts are the source's `#define`s: a count the library was not
+        // compiled with would launch threadgroups over rows no kernel writes.
+        let (built_rows, built_router_sg) = library.geometry();
+        if built_rows != Some(rows) {
+            return Err(DeviceError::Range {
+                what: "matvec",
+                detail: format!(
+                    "{rows} rows a SIMD group; the library's source defines {built_rows:?}"
+                ),
+            });
+        }
+        if built_router_sg != Some(router_sg) {
+            return Err(DeviceError::Range {
+                what: "router",
+                detail: format!(
+                    "{router_sg} SIMD groups; the library's source defines {built_router_sg:?}"
                 ),
             });
         }

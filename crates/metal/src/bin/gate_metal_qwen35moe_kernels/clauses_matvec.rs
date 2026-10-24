@@ -572,6 +572,15 @@ fn kernels_of_rows(h: &Harness<'_>, rows: usize) -> Result<Kernels, String> {
 /// and block order do not move, only which rows share a SIMD group.
 pub fn nrows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     let two = kernels_of_rows(h, 2)?;
+    // A row count the library's source does not define launches rows no
+    // kernel writes: the shipped library refuses two.
+    if Kernels::with_geometry(h.library, 2, SIMD_GROUPS_PER_GROUP, router::SG).is_ok() {
+        return Err(
+            "the shipped library took two rows a SIMD group; its source defines \
+             another count"
+                .to_string(),
+        );
+    }
     let few = Harness {
         device: h.device,
         stream: h.stream,
