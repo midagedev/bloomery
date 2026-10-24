@@ -342,7 +342,15 @@ models (the --model word is optional with a model file: the file's architecture 
     /// the seat words. A qwen35moe file (Qwen3.6) is the qwen3 seat's.
     fn seat_of_file(generative: bool) -> Result<(Model, String), GateError> {
         let path = ref_model_path()?;
-        let split = crate::serve_seats::header(&path)?;
+        crate::serve_seats::with_header(&path, |split| seat_of(&path, split, generative))?
+    }
+
+    /// [`seat_of_file`] of the header `split` of the model at `path`.
+    fn seat_of(
+        path: &std::path::Path,
+        split: &Split,
+        generative: bool,
+    ) -> Result<(Model, String), GateError> {
         let (seat, arch) = match split.architecture() {
             Some(a) if side_seat::row(a).is_some() => {
                 return Err(format!(
@@ -365,7 +373,7 @@ models (the --model word is optional with a model file: the file's architecture 
                     .iter()
                     .copied()
                     .find(|m| m.serves(a))
-                    .ok_or_else(|| no_seat(&path, &split, a))?,
+                    .ok_or_else(|| no_seat(path, split, a))?,
                 a.to_owned(),
             ),
             None => {
@@ -409,12 +417,13 @@ models (the --model word is optional with a model file: the file's architecture 
     /// ([`ref_model_path`]) and its `<arch>.decision.type`, when it has one.
     fn file_facts() -> Result<(String, Option<String>), GateError> {
         let path = ref_model_path()?;
-        let split = crate::serve_seats::header(&path)?;
-        let decision = bloomery_gpu_gates::model_file::decision_type(&split)?.map(str::to_owned);
-        Ok((
-            split.architecture().unwrap_or("<missing>").to_owned(),
-            decision,
-        ))
+        crate::serve_seats::with_header(&path, |split| {
+            let decision = bloomery_gpu_gates::model_file::decision_type(split)?.map(str::to_owned);
+            Ok((
+                split.architecture().unwrap_or("<missing>").to_owned(),
+                decision,
+            ))
+        })?
     }
 
     /// The head the arguments name ([`serve::decide::pick`]) and the rest:
