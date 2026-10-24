@@ -2175,11 +2175,12 @@ struct Effect {
 }
 
 impl Last {
-    fn of(granule: u64, rows: u64, buffers: Vec<u64>) -> Last {
-        let (large, small): (Vec<u64>, Vec<u64>) = buffers.into_iter().partition(|&b| b >= granule);
+    fn of(granule: NonZeroU64, rows: u64, buffers: Vec<u64>) -> Last {
+        let (large, small): (Vec<u64>, Vec<u64>) =
+            buffers.into_iter().partition(|&b| b >= granule.get());
         Last {
             rows: Some(rows),
-            large: large.iter().map(|b| b.div_ceil(granule) * granule).sum(),
+            large: allocator_bytes(granule, large),
             small,
             effect: None,
         }
@@ -2202,7 +2203,7 @@ impl<'m> Footprint<'m> {
                 });
                 continue;
             };
-            let add = Last::of(granule.get(), 0, buffers);
+            let add = Last::of(granule, 0, buffers);
             if let Some(Step {
                 what: What::Fixed,
                 last,
@@ -2222,18 +2223,6 @@ impl<'m> Footprint<'m> {
     }
 
     fn at(&self, n_l: &[u64]) -> Result<u64, PlacementError> {
-        let taken = self.walk(n_l);
-        if taken.is_err() {
-            // A walk cut short leaves later steps' granules from an older ask.
-            for step in &self.steps {
-                *step.last.borrow_mut() = Last::default();
-            }
-        }
-        taken
-    }
-
-    fn walk(&self, n_l: &[u64]) -> Result<u64, PlacementError> {
-        let granule = self.granule.get();
         let mut heap = Heap::new(self.granule);
         // Whether the shared granules are as the last ask found them at this step.
         let mut same = true;
@@ -2253,7 +2242,7 @@ impl<'m> Footprint<'m> {
                     } else {
                         Vec::new()
                     };
-                    let now = Last::of(granule, rows, buffers);
+                    let now = Last::of(self.granule, rows, buffers);
                     let effect = last.effect.take().filter(|_| now.small == last.small);
                     *last = Last { effect, ..now };
                 }
