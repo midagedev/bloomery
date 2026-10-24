@@ -674,6 +674,7 @@ mod tests {
             enc.pass(&[0, 1], true)?;
             assert_eq!(enc.readback.len(), 2 * hp.n_out);
             let at = enc.readback.as_ptr();
+            enc.readback.fill(f32::NAN);
             let pass = enc.pass(&[1], true)?;
             let rows = pass.taps.unwrap().result_embd;
             assert_eq!(rows.len(), hp.n_out);
