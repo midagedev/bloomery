@@ -1348,7 +1348,7 @@ pub struct Folder38 {
 impl Folder38 {
     /// The folder of header `header`, its card tensors read from `source` and its PLE rows at
     /// `ple`.
-    pub fn new<S: Source + Send + 'static>(
+    pub fn new<S: Source + Send + Sync + 'static>(
         header: Split,
         source: S,
         ple: Option<StoredRows>,
