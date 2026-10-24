@@ -11,7 +11,8 @@
 //!   across `Session::open` by the set's bytes, to within one page a buffer
 //!   (the two counts round a buffer differently), so a kernel buffer made
 //!   outside the set shows as bytes the set lacks;
-//! - the rows arena of the first pass joins the set the same way;
+//! - the open makes the rows arena too, so the first pass allocates nothing
+//!   on the device and adds nothing to the set;
 //! - a submit after a gap of [`KEEP`] renews the request once, and a submit
 //!   straight after another does not.
 
@@ -78,14 +79,13 @@ pub fn r_resident(device: &MetalDevice, library: &Library, path: &Path) -> Claus
     let before_pass = held(device)?;
     s.pass(&ids, PassOut::Last, StateOut::default())
         .map_err(says)?;
-    let rows = held(device)? - before_pass;
     let after_pass = s.residency();
-    let joined = after_pass.buffers - at_open.buffers;
-    if !agree(rows, after_pass.bytes - at_open.bytes, joined) || rows == 0 {
+    let grew = held(device)?.abs_diff(before_pass);
+    if grew != 0 || after_pass.buffers != at_open.buffers || after_pass.bytes != at_open.bytes {
         return Err(format!(
-            "the first pass allocated {rows} bytes on the device; the residency set grew by {} in \
-             {joined} buffers",
-            after_pass.bytes - at_open.bytes
+            "the first pass moved the device's bytes by {grew} and the residency set from {} \
+             buffers of {} bytes to {} of {}; the open makes every buffer a pass binds",
+            at_open.buffers, at_open.bytes, after_pass.buffers, after_pass.bytes
         ));
     }
 
@@ -112,9 +112,11 @@ pub fn r_resident(device: &MetalDevice, library: &Library, path: &Path) -> Claus
         ));
     }
     Ok(Verdict::Noted(format!(
-        "the open allocated {opened} bytes; the residency set holds {} buffers of them to within a \
-         page each; the first pass's rows arena added {rows} in {joined}; a step after {:?} idle renewed the request once, two \
-         steps straight after the pass renewed none",
+        "the open allocated {opened} bytes, the rows arena's {} among them; the residency set \
+         holds {} buffers of them to within a page each; the first pass allocated nothing and \
+         added nothing to the set; a step after {:?} idle renewed the request once, two steps \
+         straight after the pass renewed none",
+        s.rows_arena_bytes(),
         at_open.buffers,
         KEEP + GAP_MARGIN
     )))

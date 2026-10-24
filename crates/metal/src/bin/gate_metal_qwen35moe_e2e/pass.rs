@@ -5,7 +5,7 @@
 //! - `q_short` (p′): a prompt of at most a step's window of ids is the step
 //!   path: the batch session and the steps session leave the same pick, logits
 //!   row bits, delta lanes, conv rings and key and value rows, and the batch
-//!   session's rows arena was never opened.
+//!   session ran no pass.
 //! - `q_state` (u): the prompt as one pass against the same ids stepped one at
 //!   a time: layer 0's recurrent state and conv ring within [`U_L0_REL`] of
 //!   the stepped run's; every delta layer's state distance printed.
@@ -361,13 +361,14 @@ pub fn q_short(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
         }
         notes.push(n.to_string());
     }
-    if let Some(bytes) = batch.rows_arena_bytes() {
+    let passes = batch.stats().passes;
+    if passes != 0 {
         return Err(format!(
-            "a prompt of at most a step's window opened the rows arena ({bytes} bytes)"
+            "prompts of at most a step's window ran {passes} passes; they are steps"
         ));
     }
     Ok(Verdict::Noted(format!(
-        "prompts of {} ids leave the steps run's pick, logits, states, rings and cache rows bit for bit; no rows arena opened",
+        "prompts of {} ids leave the steps run's pick, logits, states, rings and cache rows bit for bit; no pass ran",
         notes.join(", ")
     )))
 }
@@ -378,7 +379,7 @@ pub fn q_state(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     let ctx = ids.len() + 1;
     let mut pass = open(device, library, path, ctx, 2048, PrefillMode::Batch)?;
     let a = run_prompt(&mut pass, &ids)?;
-    if pass.rows_arena_bytes().is_none() {
+    if pass.stats().passes == 0 {
         return Err("a prompt of 1,024 ids did not take the pass".to_string());
     }
     drop(pass);
@@ -718,8 +719,8 @@ pub fn q_layers(device: &MetalDevice, library: &Library, path: &Path) -> Clause 
         2048,
         PrefillMode::Batch,
     )?;
-    // The rows arena opens at a first pass of other ids, outside the counted
-    // one: a row an op reads before the op ahead of it wrote holds those.
+    // A first pass of other ids, outside the counted one, leaves its rows in
+    // the arena: a row an op reads before the op ahead of it wrote holds those.
     s.pass(other, PassOut::None, StateOut::default())
         .map_err(says)?;
     s.reset().map_err(says)?;
@@ -890,7 +891,7 @@ pub fn q_mark_cut(device: &MetalDevice, library: &Library, path: &Path) -> Claus
     let mut s = open(device, library, path, ctx, MARK_EVERY, PrefillMode::Batch)?;
     s.reset().map_err(says)?;
     Target::prompt_marked(&mut s, &ids, &MARK_CUTS, Want::Argmax).map_err(says)?;
-    if s.rows_arena_bytes().is_none() {
+    if s.stats().passes == 0 {
         return Err("a prompt of 1,024 ids did not take the pass".to_string());
     }
     let layers = s.layer_count();
