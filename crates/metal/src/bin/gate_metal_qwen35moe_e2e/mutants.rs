@@ -22,7 +22,20 @@
 //! no kernel side. The host edits themselves are one-off edits recorded in the
 //! round that proves the clause.
 
-include!("../shared/mutants.rs");
+#[path = "../shared/mutants.rs"]
+mod program;
+
+pub use program::{Mutant, Program, source_of};
+
+/// Every mutant of both tables, with the program it edits.
+pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
+    program::all(MUTANTS, TENSOR_MUTANTS)
+}
+
+/// The mutant of this name, and the program it edits.
+pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
+    all().find(|(m, _)| m.name == name)
+}
 
 pub const MUTANTS: &[Mutant] = &[
     Mutant {

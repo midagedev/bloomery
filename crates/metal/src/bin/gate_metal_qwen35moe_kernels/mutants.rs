@@ -19,7 +19,20 @@
 //! text ([`TENSOR_SOURCE`]) and are caught by the `tensor_*` clauses, which
 //! run those kernels on any device that compiles them.
 
-include!("../shared/mutants.rs");
+#[path = "../shared/mutants.rs"]
+mod program;
+
+pub use program::{Mutant, Program, source_of};
+
+/// Every mutant of both tables, with the program it edits.
+pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
+    program::all(MUTANTS, TENSOR_MUTANTS)
+}
+
+/// The mutant of this name, and the program it edits.
+pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
+    all().find(|(m, _)| m.name == name)
+}
 
 const TAIL_STORE_FIND: &str =
     "    for (short row = 0; row < NR0 && first_row + row < rows; ++row) {\n        float sum_all";

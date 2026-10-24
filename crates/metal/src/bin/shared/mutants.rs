@@ -1,4 +1,4 @@
-// The mutant support both Metal gates share: included into each gate's
+// The mutant support both Metal gates share: a module of each gate's
 // `mutants.rs`, whose own tables `MUTANTS` and `TENSOR_MUTANTS` it walks.
 
 use bloomery_metal::library::{SOURCE, TENSOR_SOURCE};
@@ -22,17 +22,15 @@ pub struct Mutant {
     pub edits: &'static [(&'static str, &'static str, usize)],
 }
 
-/// Every mutant of both tables, with the program it edits.
-pub fn all() -> impl Iterator<Item = (&'static Mutant, Program)> {
-    MUTANTS
-        .iter()
+/// Every mutant of a gate's two tables, with the program it edits: `main`
+/// edits the kernels' library, `tensor` the tensor-op GEMMs'.
+pub fn all(
+    main: &'static [Mutant],
+    tensor: &'static [Mutant],
+) -> impl Iterator<Item = (&'static Mutant, Program)> {
+    main.iter()
         .map(|m| (m, Program::Main))
-        .chain(TENSOR_MUTANTS.iter().map(|m| (m, Program::Tensor)))
-}
-
-/// The mutant of this name, and the program it edits.
-pub fn find(name: &str) -> Option<(&'static Mutant, Program)> {
-    all().find(|(m, _)| m.name == name)
+        .chain(tensor.iter().map(|m| (m, Program::Tensor)))
 }
 
 /// The source of `program` with the mutant's edits applied; an edit whose
