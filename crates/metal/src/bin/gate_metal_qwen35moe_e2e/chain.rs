@@ -79,6 +79,7 @@ pub fn moved(s: &Session, before: StepStats) -> StepStats {
         kept: now.kept - before.kept,
         discarded: now.discarded - before.discarded,
         last_row: now.last_row - before.last_row,
+        passes: now.passes - before.passes,
     }
 }
 

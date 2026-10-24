@@ -1,5 +1,5 @@
-//! The rows arena: the buffers a pass of up to `cap` rows touches, opened on
-//! the first pass and kept.
+//! The rows arena: the buffers a pass of up to `cap` rows touches, opened
+//! with the session and kept.
 //!
 //! A pass walks the chain at `m` rows with the residual stream, the normed
 //! input, the P1 projection, the delta numerator or the attention output,
@@ -13,8 +13,15 @@
 //! the down's output at their widths: they are most of the arena.
 //!
 //! The copies a pass leaves after rows inside it ([`SnapBufs`]) are opened
-//! on the first pass that takes one, apart from the arena: a pass that takes
-//! none never pays for them.
+//! apart from the arena, by the open of a session that marks or else by the
+//! first pass that takes one: a session that takes none never pays for them.
+//!
+//! No buffer is written by the host at its open. A new buffer's pages are
+//! zeros (Metal clears a buffer it makes), and no kernel of a pass reads a
+//! cell no earlier op of the same pass wrote: the GEMMs clamp their row
+//! loads to the pass's rows, the routed GEMMs theirs to the tile's places,
+//! the route table counts in threadgroup memory it clears, and the pick
+//! reads only the router's columns.
 
 use bloomery_device::{Buffer, Elems};
 
@@ -42,8 +49,8 @@ fn refuse(detail: impl Into<String>) -> SessionError {
     }
 }
 
-/// A buffer of `n` elements, zeroed.
-fn zeroed<T: bloomery_device::Elem>(
+/// A buffer of `n` elements, as Metal makes it.
+fn fresh<T: bloomery_device::Elem>(
     device: Alloc<'_>,
     n: usize,
     what: &str,
@@ -51,9 +58,7 @@ fn zeroed<T: bloomery_device::Elem>(
     if n == 0 {
         return Err(refuse(format!("{what} of no elements")));
     }
-    let mut buffer = device.buffer(Elems(n))?;
-    buffer.zero();
-    Ok(buffer)
+    Ok(device.buffer(Elems(n))?)
 }
 
 /// `a * b`, refused by name when it wraps.
@@ -187,28 +192,28 @@ impl RowsArena {
         // the GEMM's output rows are aligned to.
         let proj_stride = arena.proj.len().get().next_multiple_of(4);
         let words = route_table_words(slots, arena.n_experts);
-        let ids = zeroed(device, cap, "the ids")?;
-        let x = zeroed(
+        let ids = fresh(device, cap, "the ids")?;
+        let x = fresh(
             device,
             product(cap, hidden, "the residual rows")?,
             "the residual",
         )?;
-        let xn = zeroed(
+        let xn = fresh(
             device,
             product(cap, hidden, "the normed rows")?,
             "the normed input",
         )?;
-        let proj = zeroed(
+        let proj = fresh(
             device,
             product(cap, proj_stride, "the P1 rows")?,
             "the P1 output",
         )?;
-        let mix = zeroed(
+        let mix = fresh(
             device,
             product(cap, MIX_STRIDE, "the mixer rows")?,
             "the mixer rows",
         )?;
-        let delta_partials = zeroed(
+        let delta_partials = fresh(
             device,
             product(cap, DELTA_PARTIALS_STRIDE, "the delta partials")?,
             "the delta partials",
@@ -225,27 +230,27 @@ impl RowsArena {
                     .ok_or_else(|| refuse(format!("a delta layer of {n_k} key heads")))
             })
             .try_fold(0, |w, e| e.map(|e| w.max(e)))?;
-        let delta_prep = zeroed(
+        let delta_prep = fresh(
             device,
             product(cap, delta_prep_stride.max(1), "the delta's prepared rows")?,
             "the delta's prepared rows",
         )?;
-        let logits = zeroed(
+        let logits = fresh(
             device,
             product(cap, LOGIT_STRIDE, "the logit rows")?,
             "the logits",
         )?;
-        let pick_ids = zeroed(device, slots, "the picks")?;
-        let pick_weights = zeroed(device, slots, "the pick weights")?;
-        let sorted = zeroed(device, slots, "the sorted slots")?;
-        let inv = zeroed(device, slots, "the slots' places")?;
-        let tiles = zeroed(device, words, "the route table")?;
-        let h = zeroed(
+        let pick_ids = fresh(device, slots, "the picks")?;
+        let pick_weights = fresh(device, slots, "the pick weights")?;
+        let sorted = fresh(device, slots, "the sorted slots")?;
+        let inv = fresh(device, slots, "the slots' places")?;
+        let tiles = fresh(device, words, "the route table")?;
+        let h = fresh(
             device,
             product(slots, EXPERT_K, "the pair rows")?,
             "the pair outputs",
         )?;
-        let y = zeroed(
+        let y = fresh(
             device,
             product(slots, hidden, "the down rows")?,
             "the down outputs",
