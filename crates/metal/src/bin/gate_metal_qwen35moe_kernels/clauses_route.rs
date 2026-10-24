@@ -41,7 +41,7 @@ use bloomery_metal::kernels::{
     LOGIT_STRIDE, Operand, PARTIALS_PER_HEAD, Quant, ROUTE_TILE, RouteSelectParams,
     RouteTableParams, RoutedKind, RoutedParams, VALUE_HEADS, route_table_words, route_tiles,
 };
-use bloomery_metal::library::{Library, SOURCE};
+use bloomery_metal::library::{GemmPath, Library, SOURCE};
 use gguf::quant::GgmlType;
 
 use super::clauses_gemm::{HALF_SUBNORMAL, gemm_band, weight_abs_sums};
@@ -733,10 +733,11 @@ fn check_grouped(
     operand: Operand,
     stride: usize,
     every: Option<u32>,
+    path: GemmPath,
 ) -> Result<(f64, f64), String> {
     let slots = sc.rows * PER_ROW;
-    let (f_pair, ops_pair) = gemm_band(ex.quant, K, operand);
-    let (f_down, ops_down) = gemm_band(ex.quant, EXPERT_K, operand);
+    let (f_pair, ops_pair) = gemm_band(ex.quant, K, operand, path);
+    let (f_down, ops_down) = gemm_band(ex.quant, EXPERT_K, operand, path);
     // The f32 arm has no cast, so no subnormal term; its band is the dense
     // GEMM's own (`gemm_band`), and the subnormal terms are the f16 arm's.
     let sub = match operand {
@@ -843,32 +844,28 @@ fn range_fault(h: &Harness<'_>, ex: &Experts) -> Result<(), String> {
     Ok(())
 }
 
-fn grouped_quant(
-    h: &Harness<'_>,
-    fix: &Fixture,
-    quant: Quant,
-    operands: &[Operand],
-) -> Result<String, String> {
-    let ex = experts_of(fix, quant)?;
+fn grouped_quant(h: &Harness<'_>, ex: &Experts, operands: &[Operand]) -> Result<String, String> {
+    let quant = ex.quant;
     let mut parts = Vec::new();
     for &operand in operands {
         // A tile and eight rows: every row picks the hot expert, so its
         // group and the shared group both take two tiles.
         let sc = scene(ROUTE_TILE + 8, Some(5), 0x6A0);
-        let run = grouped_run(h, &ex, &sc, operand)?;
+        let run = grouped_run(h, ex, &sc, operand)?;
         for (what, fault) in [("pair", run.pair_fault), ("down", run.down_fault)] {
             if let Some(f) = fault {
                 return Err(format!("the clean {what} launch raised {f}"));
             }
         }
-        let (pair, down) = check_grouped(&ex, &sc, &run, operand, 7, Some(5))?;
+        let (pair, down) =
+            check_grouped(ex, &sc, &run, operand, 7, Some(5), h.kernels.gemm_path())?;
         parts.push(format!(
             "{} {operand:?} pair {pair:.3} down {down:.3}",
             quant.name()
         ));
     }
     if operands.contains(&Operand::F16) {
-        range_fault(h, &ex)?;
+        range_fault(h, ex)?;
         parts.push(format!(
             "{} an activation past the half range is the fault and NaN",
             quant.name()
@@ -882,12 +879,15 @@ fn grouped_quant(
 pub fn grouped_gemm(h: &Harness<'_>, fixture: &Fixture, mlx: &Result<Fixture, String>) -> Clause {
     let mut notes = vec![grouped_quant(
         h,
-        fixture,
-        Quant::Q4K,
+        &experts_of(fixture, Quant::Q4K)?,
         &[Operand::F16, Operand::F32],
     )?];
     match mlx {
-        Ok(m) => notes.push(grouped_quant(h, m, Quant::A4, &[Operand::F16])?),
+        Ok(m) => notes.push(grouped_quant(
+            h,
+            &experts_of(m, Quant::A4)?,
+            &[Operand::F16],
+        )?),
         Err(e) => return Err(format!("the A4 fixture: {e}")),
     }
     Ok(Verdict::Noted(format!(
@@ -896,9 +896,149 @@ pub fn grouped_gemm(h: &Harness<'_>, fixture: &Fixture, mlx: &Result<Fixture, St
     )))
 }
 
+/// The Q6_K family's stacks. The fixture's Q6_K experts are blk.2's down
+/// (and its shared down); its gate and up are Q4_K in every layer, so the
+/// pair's stacks are Q6_K rows of blk.2's attn_qkv (8192 rows of K columns)
+/// taken in turn through every expert's rows — real Q6_K blocks at the
+/// pair's shape, the gate's from row 0 on and the up's from row 4096 on.
+fn q6k_experts(fix: &Fixture) -> Result<Experts, String> {
+    let ty = GgmlType::Q6_K;
+    let qkv_rows = 8192;
+    let qkv = fix.rows("blk.2.attn_qkv.weight", ty, K, qkv_rows)?;
+    let row = qkv.len() / qkv_rows;
+    let cycled = |first: usize, rows: usize| {
+        let mut out = Vec::with_capacity(rows * row);
+        for r in 0..rows {
+            let at = (first + r) % qkv_rows;
+            out.extend_from_slice(&qkv[at * row..(at + 1) * row]);
+        }
+        out
+    };
+    Ok(Experts {
+        quant: Quant::Q6K,
+        gate: cycled(0, EXPERTS * EXPERT_K),
+        up: cycled(qkv_rows / 2, EXPERTS * EXPERT_K),
+        down: stack(fix, "blk.2.ffn_down_exps.weight", ty, EXPERT_K, HIDDEN)?,
+        shared_gate: cycled(1000, EXPERT_K),
+        shared_up: cycled(5000, EXPERT_K),
+        shared_down: fix
+            .rows("blk.2.ffn_down_shexp.weight", ty, EXPERT_K, HIDDEN)?
+            .to_vec(),
+    })
+}
+
+/// A tile the table cannot write — its run one slot longer than a tile —
+/// raises the expert-id site in the pair and in the down, and neither
+/// stores a word of its places; the table's other tiles are stored.
+fn bad_tile(h: &Harness<'_>, ex: &Experts) -> Result<(), String> {
+    let sc = scene(ROUTE_TILE + 8, Some(5), 0x6A1);
+    let table = table_run(h, &sc.ids)?;
+    if let Some(f) = table.fault {
+        return Err(format!("the table raised {f}"));
+    }
+    // Tile 0's words are (group, first place, run, unused).
+    let mut tiles = table.tiles.clone();
+    let first = tiles[4 + 1] as usize;
+    let count = tiles[4 + 2] as usize;
+    tiles[4 + 2] = (ROUTE_TILE + 1) as u32;
+    let over = OverTable {
+        kernels: h.kernels,
+        sorted: &table.sorted,
+        tiles: &tiles,
+        max_tiles: route_tiles(sc.rows * PER_ROW, EXPERTS),
+    };
+    let out = grouped_launch(h, ex, &sc, Operand::F16, &over)?;
+    expect_site(
+        out.pair_fault,
+        "the pair on a tile past the tile's slots",
+        FaultSite::ExpertId,
+    )?;
+    expect_site(
+        out.down_fault,
+        "the down on a tile past the tile's slots",
+        FaultSite::ExpertId,
+    )?;
+    for p in first..first + count {
+        for (what, row) in [
+            ("pair", &out.h[p * EXPERT_K..(p + 1) * EXPERT_K]),
+            ("down", &out.y[p * HIDDEN..(p + 1) * HIDDEN]),
+        ] {
+            if let Some(v) = row.iter().find(|v| v.to_bits() != SENTINEL_BITS) {
+                return Err(format!(
+                    "the {what} stored {v:?} at place {p} of the bad tile"
+                ));
+            }
+        }
+    }
+    let after = first + count;
+    if out.h[after * EXPERT_K..(after + 1) * EXPERT_K]
+        .iter()
+        .any(|v| v.to_bits() == SENTINEL_BITS)
+    {
+        return Err(format!(
+            "place {after}, the next tile's first, was not stored"
+        ));
+    }
+    Ok(())
+}
+
+/// The grouped GEMM's every arm of one weight type on `h`'s kernels (the
+/// tensor-op kernels, for the `tensor_grouped_*` clauses): the pair and the
+/// down in both operands, every checked place within the band of `h`'s
+/// GEMM path; runs of 20 and 40 places (the hot group's and the shared
+/// group's), which end inside a SIMD group's second block of places and
+/// inside the second group's first; an activation past the half range the
+/// fault and NaN; a tile past the tile's slots the expert-id site with
+/// nothing stored.
+fn grouped_arms(h: &Harness<'_>, ex: &Experts) -> Clause {
+    let note = grouped_quant(h, ex, &[Operand::F16, Operand::F32])?;
+    let mut runs = Vec::new();
+    for rows in [20usize, 40] {
+        let sc = scene(rows, Some(9), 0x6A2 + rows as u64);
+        let run = grouped_run(h, ex, &sc, Operand::F16)?;
+        for (what, fault) in [("pair", run.pair_fault), ("down", run.down_fault)] {
+            if let Some(f) = fault {
+                return Err(format!(
+                    "the clean {what} launch on runs of {rows} raised {f}"
+                ));
+            }
+        }
+        let (pair, down) = check_grouped(
+            ex,
+            &sc,
+            &run,
+            Operand::F16,
+            1,
+            Some(9),
+            h.kernels.gemm_path(),
+        )
+        .map_err(|e| format!("runs of {rows}: {e}"))?;
+        runs.push(format!("runs of {rows} pair {pair:.3} down {down:.3}"));
+    }
+    bad_tile(h, ex)?;
+    Ok(Verdict::Noted(format!(
+        "{} kernels, worst error over its band: {note}, {}; a tile past the tile's slots raises the expert-id site and stores nothing",
+        h.kernels.gemm_path().name(),
+        runs.join(", ")
+    )))
+}
+
+pub fn tensor_grouped_q4k(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    grouped_arms(h, &experts_of(fixture, Quant::Q4K)?)
+}
+
+pub fn tensor_grouped_q6k(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    grouped_arms(h, &q6k_experts(fixture)?)
+}
+
+pub fn tensor_grouped_a4(h: &Harness<'_>, mlx: &Fixture) -> Clause {
+    grouped_arms(h, &experts_of(mlx, Quant::A4)?)
+}
+
 // ------------------------------------------------------------ grouped oracle
 
-/// The routed tile the gate keeps as the oracle, from `#define ROUTED_ROWS` on.
+/// The routed tile the gate keeps as the oracle, from `#define ROUTED_FRAGS_A`
+/// on.
 const ORACLE: &str = include_str!("routed_oracle.metal");
 
 /// The shipped routed GEMM's file, whose routed tile the oracle replaces.
@@ -924,15 +1064,22 @@ const LANES: [&[usize]; TOP_K] = [
 ];
 
 /// The kernels compiled from the shipped source with the routed tile swapped
-/// for the oracle's and the table's tile at the oracle's.
+/// for the oracle's, and the table's tile and the routed tile's activation
+/// rows at the oracle's.
 fn oracle_kernels(h: &Harness<'_>) -> Result<Kernels, String> {
     let at = SHIPPED
-        .find("#define ROUTED_ROWS")
-        .ok_or("gemm_routed.metal has no `#define ROUTED_ROWS`; the tile's start moved")?;
+        .find("#define ROUTED_FRAGS_A")
+        .ok_or("gemm_routed.metal has no `#define ROUTED_FRAGS_A`; the tile's start moved")?;
     let from = format!("#define ROUTE_TILE {ROUTE_TILE}\n");
     let to = format!("#define ROUTE_TILE {ORACLE_TILE}\n");
+    let acts_from = format!("#define ROUTED_ACTS {ROUTE_TILE}   //");
+    let acts_to = format!("#define ROUTED_ACTS {ORACLE_TILE}   //");
     let mut text = SOURCE.to_string();
-    for (find, with) in [(&SHIPPED[at..], ORACLE), (from.as_str(), to.as_str())] {
+    for (find, with) in [
+        (&SHIPPED[at..], ORACLE),
+        (from.as_str(), to.as_str()),
+        (acts_from.as_str(), acts_to.as_str()),
+    ] {
         let found = text.matches(find).count();
         if found != 1 {
             return Err(format!(

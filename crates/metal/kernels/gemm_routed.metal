@@ -35,8 +35,9 @@
 // K loop's alone; the tile's height and its split over the SIMD groups do
 // not move it.
 //
-// This file comes after gemm.metal (the helpers and the instantiated tile
-// pieces), experts.metal (pair_swiglu) and route.metal (the table's shape).
+// This file comes after gemm_shared.metal (the routed tile's geometry, its
+// argument block, pair_swiglu and gemm_stage_x), gemm.metal (the helpers
+// and the instantiated tile pieces) and route.metal (the table's shape).
 
 #include <metal_stdlib>
 
@@ -69,8 +70,6 @@ struct F32W {
 
 GEMM_ENTRY(f32w_store_f32, F32W, float, false, gemm_kernel)
 
-#define ROUTED_ROWS 64   // weight rows of a tile
-#define ROUTED_ACTS 64   // activation rows of a tile
 #define ROUTED_FRAGS_A (ROUTED_ACTS / 8)
 #define ROUTED_FRAGS_W 2  // a SIMD group's 8-row weight fragments: its 16 weight rows
 
@@ -85,20 +84,6 @@ template <typename T>
 constexpr int routed_shmem_bytes() {
     return (ROUTED_ROWS + ROUTED_ACTS) * gemm_lda<T>() * (int)sizeof(T);
 }
-
-// Eight words, bound by value.
-struct RoutedArgs {
-    uint cols;          // the input columns K
-    uint x_stride;      // f32 elements between the activation rows
-    uint y_stride;      // f32 elements between the output rows
-    uint layer;
-    uint n_experts;     // the stack's experts; the table's group n_experts is shared
-    uint stack_blocks;  // blocks of one expert's rows in the stack
-    uint gather;        // 1: an activation row is the slot's pass row; 0: the place's
-    uint rows;          // outputs per expert: the pair's rows of gate, the down's rows
-};
-
-static_assert(sizeof(RoutedArgs) == 32, "RoutedArgs is eight words");
 
 // One tile's K loop and store over its first NA 8-row A fragments: the rows
 // under 8 NA, which hold the run. Every SIMD group multiplies the same NA
@@ -160,20 +145,7 @@ inline void routed_tile(threadgroup T                  * sa,
         if (b_stage) {
             device const float * xr = b_src + k0;
             threadgroup vec<T, 4> * bd = (threadgroup vec<T, 4> *)((threadgroup T *)b_dst + at);
-            FOR_UNROLL(short g = 0; g < 4; ++g) {
-                const float4 v = float4(xr[4 * g], xr[4 * g + 1], xr[4 * g + 2], xr[4 * g + 3]);
-                if (sizeof(T) == 2) {
-                    const bool4 over = !(fabs(v) <= 65504.f);
-                    if (any(over)) {
-                        raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
-                        bd[g] = vec<T, 4>(select(v, float4(NAN), over));
-                    } else {
-                        bd[g] = vec<T, 4>(v);
-                    }
-                } else {
-                    bd[g] = vec<T, 4>(v);
-                }
-            }
+            gemm_stage_x<T>(xr, bd, faults, args.layer);
         }
         const int pos = k0 + a_koff;
         const int ib = pos / Q::values_per_block();

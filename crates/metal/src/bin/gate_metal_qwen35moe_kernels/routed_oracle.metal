@@ -2,13 +2,12 @@
 // at a 32-slot table tile, each SIMD group multiplying two 16-row fragments
 // of activation rows (8 rows each, a test a fragment for the run's length)
 // against two 16-row fragments of weight rows. The gate compiles it in place
-// of gemm_routed.metal's routed tile, from `#define ROUTED_ROWS` on, with the
-// table's tile at 32, and holds the shipped tile to its outputs bit for bit:
-// a tile's height and its split over the SIMD groups leave every output's K
-// order as it is.
+// of gemm_routed.metal's routed tile, from `#define ROUTED_FRAGS_A` on, with
+// the table's tile and gemm_shared.metal's ROUTED_ACTS at 32 (the tile's
+// weight rows and its argument block are gemm_shared.metal's), and holds the
+// shipped tile to its outputs bit for bit: a tile's height and its split over
+// the SIMD groups leave every output's K order as it is.
 
-#define ROUTED_ROWS 64   // weight rows of a tile
-#define ROUTED_ACTS 32   // activation rows of a tile
 #define ROUTED_FRAGS_A (ROUTED_ACTS / 16)
 #define ROUTED_FRAGS_W (ROUTED_ROWS / 16)
 
@@ -20,20 +19,6 @@ template <typename T>
 constexpr int routed_shmem_bytes() {
     return (ROUTED_ROWS + ROUTED_ACTS) * gemm_lda<T>() * (int)sizeof(T);
 }
-
-// Eight words, bound by value.
-struct RoutedArgs {
-    uint cols;          // the input columns K
-    uint x_stride;      // f32 elements between the activation rows
-    uint y_stride;      // f32 elements between the output rows
-    uint layer;
-    uint n_experts;     // the stack's experts; the table's group n_experts is shared
-    uint stack_blocks;  // blocks of one expert's rows in the stack
-    uint gather;        // 1: an activation row is the slot's pass row; 0: the place's
-    uint rows;          // outputs per expert: the pair's rows of gate, the down's rows
-};
-
-static_assert(sizeof(RoutedArgs) == 32, "RoutedArgs is eight words");
 
 template <typename Q, typename T, bool PAIR>
 kernel void gemm_routed_kernel(device const typename Q::Block * W [[buffer(0)]],
